@@ -23,6 +23,7 @@ import {
   CONTROLLED_NODE_WINDOWS_UPGRADE_TRANSACTION_FILE,
   CONTROLLED_NODE_WINDOWS_UPGRADE_TRANSACTION_VERSION,
   CONTROLLED_NODE_LINUX_WATCHDOG_SEC,
+  CONTROLLED_NODE_LIVENESS_LEASE_FILE,
 } from '../../shared/controlled-node-service.js';
 import {
   CONTROLLED_NODE_HEALTH_LEASE_FILE,
@@ -215,6 +216,7 @@ function powershellSingleQuoted(value: string): string {
 export function windowsControlledNodeHealthPaths(exePath: string): {
   scriptPath: string;
   leasePath: string;
+  livenessPath: string;
   statePath: string;
   logPath: string;
   upgradeMarkerPath: string;
@@ -224,6 +226,7 @@ export function windowsControlledNodeHealthPaths(exePath: string): {
   return {
     scriptPath: win32.join(baseDir, WINDOWS_WATCHDOG_SCRIPT_NAME),
     leasePath: win32.join(baseDir, WINDOWS_HEALTH_LEASE_NAME),
+    livenessPath: win32.join(baseDir, CONTROLLED_NODE_LIVENESS_LEASE_FILE),
     statePath: win32.join(baseDir, CONTROLLED_NODE_HEALTH_WATCHDOG_STATE_FILE),
     logPath: win32.join(baseDir, 'health-watchdog.log'),
     upgradeMarkerPath: win32.join(baseDir, WINDOWS_UPGRADE_MARKER_NAME),
@@ -237,9 +240,11 @@ export function windowsControlledNodeHealthPaths(exePath: string): {
  * Task Scheduler's RestartOnFailure and IgnoreNew policy only prove that an
  * EXE process exists. They cannot detect the observed failure mode where the
  * process remains alive after its authenticated control channel has wedged.
- * The runtime therefore publishes a PID-bound lease only after a real server
- * heartbeat acknowledgement; this script restarts the node when that lease is
- * absent or stale for three minutes.
+ * The runtime therefore publishes a PID-bound liveness lease while its
+ * connection machinery works (an acknowledgement, or a connection attempt /
+ * failure / retry -- an unreachable server is not a wedged node); this script
+ * restarts the node when that lease (or, for a node that predates it, the
+ * authenticated health lease) is absent or stale for three minutes.
  */
 export function windowsControlledNodeHealthWatchdogScript(exePath: string): string {
   const paths = windowsControlledNodeHealthPaths(exePath);
@@ -247,6 +252,7 @@ export function windowsControlledNodeHealthWatchdogScript(exePath: string): stri
     + `$nodePath = ${powershellSingleQuoted(exePath)}\r\n`
     + `$nodeTask = ${powershellSingleQuoted(CONTROLLED_NODE_SERVICE.WINDOWS_TASK)}\r\n`
     + `$leasePath = ${powershellSingleQuoted(paths.leasePath)}\r\n`
+    + `$livenessPath = ${powershellSingleQuoted(paths.livenessPath)}\r\n`
     + `$statePath = ${powershellSingleQuoted(paths.statePath)}\r\n`
     + `$logPath = ${powershellSingleQuoted(paths.logPath)}\r\n`
     + `$upgradeMarkerPath = ${powershellSingleQuoted(paths.upgradeMarkerPath)}\r\n`
@@ -288,12 +294,19 @@ export function windowsControlledNodeHealthWatchdogScript(exePath: string): stri
     + `$reason = 'process_missing'\r\n`
     + `if ($process) {\r\n`
     + `  $reason = 'lease_missing'\r\n`
-    + `  if (Test-Path -LiteralPath $leasePath) {\r\n`
+    + `  $reasonFromLease = $false\r\n`
+    // The liveness lease (renewed while the node's connection machinery works, reachable server or not) first, then the
+    // authenticated health lease a node that predates it writes. Either fresh and bound to this process is healthy.
+    + `  foreach ($candidatePath in @($livenessPath, $leasePath)) {\r\n`
+    + `    if (-not (Test-Path -LiteralPath $candidatePath)) { continue }\r\n`
+    + `    $candidateReason = 'lease_invalid'\r\n`
     + `    try {\r\n`
-    + `      $lease = Get-Content -LiteralPath $leasePath -Raw | ConvertFrom-Json\r\n`
+    + `      $lease = Get-Content -LiteralPath $candidatePath -Raw | ConvertFrom-Json\r\n`
     + `      $ageMs = $nowMs - [int64]$lease.updatedAt\r\n`
-    + `      if ([int]$lease.version -ne 1) { $reason = 'lease_invalid' } elseif ([int]$lease.pid -ne [int]$process.ProcessId) { $reason = 'lease_pid_mismatch' } elseif ($ageMs -lt -60000) { $reason = 'lease_future' } elseif ($ageMs -le ($staleSeconds * 1000)) { $healthy = $true } else { $reason = 'lease_stale' }\r\n`
-    + `    } catch { $reason = 'lease_invalid' }\r\n`
+    + `      if ([int]$lease.version -ne 1) { $candidateReason = 'lease_invalid' } elseif ([int]$lease.pid -ne [int]$process.ProcessId) { $candidateReason = 'lease_pid_mismatch' } elseif ($ageMs -lt -60000) { $candidateReason = 'lease_future' } elseif ($ageMs -le ($staleSeconds * 1000)) { $healthy = $true } else { $candidateReason = 'lease_stale' }\r\n`
+    + `    } catch { $candidateReason = 'lease_invalid' }\r\n`
+    + `    if ($healthy) { break }\r\n`
+    + `    if (-not $reasonFromLease) { $reason = $candidateReason; $reasonFromLease = $true }\r\n`
     + `  }\r\n`
     + `  if (-not $healthy) {\r\n`
     + `    $processAgeSeconds = ((Get-Date) - $process.CreationDate).TotalSeconds\r\n`

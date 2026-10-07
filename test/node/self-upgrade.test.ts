@@ -41,6 +41,8 @@ import {
 } from '../../src/node/self-upgrade.js';
 import {
   REMOTE_DESKTOP_LINUX_WORKER_FILENAME,
+  REMOTE_DESKTOP_LINUX_WORKER_PLATFORM_DIR,
+  REMOTE_DESKTOP_WORKER_SIDECAR_DIR,
   REMOTE_DESKTOP_WORKER_FILENAME,
   REMOTE_DESKTOP_WORKER_MANIFEST_SUFFIX,
 } from '../../shared/remote-desktop-worker.js';
@@ -1904,18 +1906,19 @@ describe('controlled-node self-upgrade', () => {
   it('keeps the previous POSIX remote-desktop worker, and replaces nothing, when the staged copy fails', async () => {
     const root = await mkdtemp(join(tmpdir(), 'imcodes-worker-copy-rollback-'));
     dirs.push(root);
-    const stage = join(root, 'stage', 'remote-desktop-worker');
-    const destinationRoot = join(root, 'installed', 'remote-desktop-worker');
-    const destinationWorker = join(destinationRoot, REMOTE_DESKTOP_LINUX_WORKER_FILENAME);
+    const stage = join(root, 'stage', REMOTE_DESKTOP_WORKER_SIDECAR_DIR);
+    const destinationRoot = join(root, 'installed', REMOTE_DESKTOP_WORKER_SIDECAR_DIR);
+    const destinationWorker = join(destinationRoot, REMOTE_DESKTOP_LINUX_WORKER_PLATFORM_DIR, REMOTE_DESKTOP_LINUX_WORKER_FILENAME);
     const stagedArtifactPath = join(root, 'stage', 'imcodes-node');
     const stagedManifestPath = `${stagedArtifactPath}.manifest.json`;
     const destinationPath = join(root, 'installed', 'imcodes-node');
     const destinationManifestPath = `${destinationPath}.manifest.json`;
     const binDir = join(root, 'bin');
-    await mkdir(stage, { recursive: true });
-    await mkdir(destinationRoot, { recursive: true });
+    await mkdir(join(stage, REMOTE_DESKTOP_LINUX_WORKER_PLATFORM_DIR), { recursive: true });
+    await mkdir(join(destinationRoot, REMOTE_DESKTOP_LINUX_WORKER_PLATFORM_DIR), { recursive: true });
     await mkdir(binDir, { recursive: true });
-    await writeFile(join(stage, REMOTE_DESKTOP_LINUX_WORKER_FILENAME), 'new-worker');
+    await writeFile(join(stage, REMOTE_DESKTOP_LINUX_WORKER_PLATFORM_DIR, REMOTE_DESKTOP_LINUX_WORKER_FILENAME), 'new-worker');
+    await writeFile(join(stage, REMOTE_DESKTOP_LINUX_WORKER_PLATFORM_DIR, `${REMOTE_DESKTOP_LINUX_WORKER_FILENAME}${REMOTE_DESKTOP_WORKER_MANIFEST_SUFFIX}`), '{}');
     await writeFile(stagedArtifactPath, 'new-node', { mode: 0o755 });
     await writeFile(stagedManifestPath, JSON.stringify({ build: { version: 'new' } }));
     await writeFile(destinationWorker, 'old-worker', { mode: 0o755 });
@@ -1949,6 +1952,120 @@ describe('controlled-node self-upgrade', () => {
     expect(JSON.parse(await readFile(join(root, 'installed', 'last-upgrade-result.json'), 'utf8'))).toMatchObject({ status: 'preflight_failed' });
     await expect(lstat(`${destinationRoot}.new`)).rejects.toMatchObject({ code: 'ENOENT' });
     await expect(lstat(`${destinationRoot}.previous`)).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
+  it.runIf(process.platform === 'linux')('a Linux upgrade whose worker is staged exactly as the node downloads it publishes the worker where the installed node looks for it', async () => {
+    // The production flow end to end: the real downloader stages the worker, the real script builder gets the directory the
+    // upgrade hands it, the generated script runs under sh. A check one directory too high ("artifact set is incomplete")
+    // failed every Linux self-upgrade while each piece passed its own test with a hand-made flat layout.
+    const root = await mkdtemp(join(tmpdir(), 'imcodes-linux-worker-e2e-'));
+    dirs.push(root);
+    const installed = join(root, 'installed');
+    const binDir = join(root, 'bin');
+    await mkdir(installed, { recursive: true });
+    await mkdir(binDir, { recursive: true });
+    await mkdir(join(root, 'tmp'), { recursive: true });
+    const execPath = join(installed, 'imcodes-node-linux');
+    const journalPath = join(installed, 'install-journal.json');
+    await writeFile(execPath, 'old-node', { mode: 0o755 });
+    await writeFile(`${execPath}.manifest.json`, JSON.stringify({ build: { version: 'old' } }));
+    const oldWorkerDir = join(installed, REMOTE_DESKTOP_WORKER_SIDECAR_DIR, REMOTE_DESKTOP_LINUX_WORKER_PLATFORM_DIR);
+    await mkdir(oldWorkerDir, { recursive: true });
+    await writeFile(join(oldWorkerDir, REMOTE_DESKTOP_LINUX_WORKER_FILENAME), 'old-worker', { mode: 0o755 });
+
+    const version = '2026.10.5516-dev.5968';
+    const main = Buffer.from('new controlled node');
+    const worker = Buffer.from('new linux worker');
+    const workerManifest = Buffer.from(JSON.stringify({
+      schemaVersion: 1,
+      artifact: {
+        fileName: REMOTE_DESKTOP_LINUX_WORKER_FILENAME, os: 'linux', arch: 'x64',
+        size: worker.length, sha256: createHash('sha256').update(worker).digest('hex'),
+      },
+      build: { source: 'ci', version },
+    }));
+    const fetchImpl = (async (url: string) => {
+      if (url.includes('asset=computer-use-helper')) return new Response(null, { status: 404 });
+      const isManifest = url.includes('asset=remote-desktop-worker-manifest');
+      const isWorker = !isManifest && url.includes('asset=remote-desktop-worker');
+      const body = isManifest ? workerManifest : isWorker ? worker : main;
+      return new Response(body, {
+        status: 200,
+        headers: {
+          [CONTROLLED_NODE_ARTIFACT_HEADERS.SHA256]: createHash('sha256').update(body).digest('hex'),
+          [CONTROLLED_NODE_ARTIFACT_HEADERS.SIZE_BYTES]: String(body.length),
+          [CONTROLLED_NODE_ARTIFACT_HEADERS.FILENAME]: isManifest
+            ? `${REMOTE_DESKTOP_LINUX_WORKER_FILENAME}${REMOTE_DESKTOP_WORKER_MANIFEST_SUFFIX}`
+            : isWorker ? REMOTE_DESKTOP_LINUX_WORKER_FILENAME : 'imcodes-node-linux',
+          [CONTROLLED_NODE_ARTIFACT_HEADERS.VERSION]: version,
+        },
+      });
+    }) as unknown as typeof fetch;
+    let scriptToRun = '';
+    const result = await startControlledNodeSelfUpgrade(credential, version, {
+      fetchImpl,
+      platform: 'linux',
+      arch: 'x64',
+      execPath,
+      journalPath,
+      tmpdir: () => join(root, 'tmp'),
+      now: () => 9,
+      scheduleLinuxUpgrade: (_name, scriptPath) => { scriptToRun = scriptPath; },
+    });
+    expect(result).toMatchObject({ ok: true, targetVersion: version });
+    expect(scriptToRun).not.toBe('');
+
+    await installHealthyServiceStubs(binDir, join(installed, 'health-lease.json'));
+    await execFileAsync('/bin/sh', [scriptToRun], {
+      timeout: 30_000,
+      env: { ...process.env, PATH: `${binDir}:${process.env.PATH ?? ''}`, IMCODES_UPGRADE_TEST_LOG: join(root, 'service.log') },
+    });
+    expect(JSON.parse(await readFile(join(installed, 'last-upgrade-result.json'), 'utf8'))).toMatchObject({ status: 'success' });
+    expect(await readFile(execPath, 'utf8')).toBe('new controlled node');
+    // exactly the path the installed node resolves its worker from
+    const { resolveLinuxRemoteDesktopWorkerPath } = await import('../../src/node/linux-remote-desktop-worker-host.js');
+    const resolved = resolveLinuxRemoteDesktopWorkerPath(execPath);
+    expect(await readFile(resolved, 'utf8')).toBe('new linux worker');
+    expect((await lstat(resolved)).mode & 0o111).not.toBe(0);
+    expect(await readFile(`${resolved}${REMOTE_DESKTOP_WORKER_MANIFEST_SUFFIX}`, 'utf8')).toBe(workerManifest.toString());
+  });
+
+  it('a macOS upgrade stages no worker sidecar and its script does not check for one (its components arrive through their own bootstrap)', async () => {
+    // The Linux preflight looked for the staged worker one directory too high. macOS is the other POSIX user of the same
+    // script builder: it must neither request the Linux/Windows worker assets nor carry any worker staging step.
+    const root = await mkdtemp(join(tmpdir(), 'imcodes-macos-no-worker-'));
+    dirs.push(root);
+    await mkdir(join(root, 'tmp'), { recursive: true });
+    const installed = join(root, 'installed');
+    await mkdir(installed, { recursive: true });
+    const requested: string[] = [];
+    const main = Buffer.from('new macos node');
+    let scriptToRun = '';
+    const result = await startControlledNodeSelfUpgrade(credential, '2026.10.5516-dev.5968', {
+      fetchImpl: (async (url: string) => {
+        requested.push(url);
+        if (url.includes('asset=computer-use-helper')) return new Response(null, { status: 404 });
+        return new Response(main, {
+          status: 200,
+          headers: {
+            [CONTROLLED_NODE_ARTIFACT_HEADERS.SHA256]: createHash('sha256').update(main).digest('hex'),
+            [CONTROLLED_NODE_ARTIFACT_HEADERS.SIZE_BYTES]: String(main.length),
+            [CONTROLLED_NODE_ARTIFACT_HEADERS.FILENAME]: 'imcodes-node-macos',
+            [CONTROLLED_NODE_ARTIFACT_HEADERS.VERSION]: '2026.10.5516-dev.5968',
+          },
+        });
+      }) as unknown as typeof fetch,
+      platform: 'darwin',
+      arch: 'arm64',
+      execPath: join(installed, 'imcodes-node-macos'),
+      journalPath: join(installed, 'install-journal.json'),
+      tmpdir: () => join(root, 'tmp'),
+      spawnDetached: (_file, args) => { scriptToRun = String(args[0]); },
+    });
+    expect(result).toMatchObject({ ok: true });
+    expect(requested.filter((url) => url.includes('remote-desktop'))).toEqual([]);
+    const script = await readFile(scriptToRun, 'utf8');
+    expect(script).not.toContain('staged remote desktop worker');
   });
 
   it.runIf(process.platform === 'linux')('executes POSIX cleanup and removes the owned staging directory after handoff', async () => {

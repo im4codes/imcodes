@@ -4,7 +4,7 @@
  * Plain `sh` text so the same files run under dash, busybox ash and the BSD-style shim farm used for the
  * portability checks (evidence-posix/bsd), not only under the shell vitest happens to spawn.
  */
-export type NodeKind = 'healthy' | 'dead' | 'nolease' | 'badlease' | 'crashloop';
+export type NodeKind = 'healthy' | 'dead' | 'nolease' | 'badlease' | 'crashloop' | 'liveonly';
 export const marker = (kind: NodeKind, leaseAt = 5): string => `NODE kind=${kind} lease_at=${leaseAt}\n`;
 
 export const FAKE_STUBS = {
@@ -36,6 +36,8 @@ export const FAKE_SERVICE_MANAGER = [
   '    healthy) if [ "$el" -ge "$lease_at" ]; then printf \'{"version":1,"pid":%s,"updatedAt":%s}\\n\' "$PID" $(( (started + lease_at) * 1000 )) > "$LEASE"; fi;;',
   // a lease from a LIVE process that is not the service's pid (another process, a stale writer): only the pid-identity check rejects it
   '    badlease) if [ "$el" -ge "$lease_at" ]; then printf \'{"version":1,"pid":%s,"updatedAt":%s}\\n\' "$FAKE_PID_B" $(( (started + lease_at) * 1000 )) > "$LEASE"; fi;;',
+  // a node that is alive and feeds the watchdog / publishes its liveness lease but is never acknowledged by the server (an outage)
+  '    liveonly) printf \'{"version":1,"pid":%s,"updatedAt":%s}\\n\' "$PID" $(( (started + el) * 1000 )) > "$(dirname "$LEASE")/liveness-lease.json";;',
   '  esac',
   '}',
   'do_start() { echo "$(cat "$FAKE/clock")" > "$FAKE/started_at"; echo start >> "$FAKE/calls"; [ -f "$FAKE/on_start" ] && sh "$FAKE/on_start"; return 0; }',

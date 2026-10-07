@@ -59,12 +59,39 @@ export const CONTROLLED_NODE_UPGRADE_HEALTH = {
   CRASH_LOOP_RESTARTS: 3,
 } as const;
 
+/**
+ * Two different questions, two different signals:
+ *  - "did this process get an authenticated acknowledgement from the server?" is the health LEASE
+ *    (`health-lease.json`, written only on an authenticated heartbeat ack). A self-upgrade judges its new node by it:
+ *    the new node must be connected and authenticated to count as installed.
+ *  - "is this process alive and working, or wedged?" is the LIVENESS lease (`liveness-lease.json`) and, on Linux,
+ *    the systemd watchdog pulse. They are renewed while the node's connection machinery is making progress -- an
+ *    acknowledgement, OR a connection attempt / failure / scheduled retry. A server that cannot be reached is not a
+ *    wedged node: restarting it (SIGABRT every WatchdogSec, killing the remote-desktop worker) cures nothing, so an
+ *    outage must not look like a hang to the watchdog.
+ */
+export const CONTROLLED_NODE_LIVENESS_LEASE_FILE = 'liveness-lease.json' as const;
+export const CONTROLLED_NODE_LIVENESS_WRITE_INTERVAL_MS = 15_000 as const;
+/**
+ * Connection activity (or an ack) must have been seen within this long for the liveness signals to be renewed. A
+ * healthy node acks every 5 s and a node that cannot connect retries about every 25 s (20 s connect timeout + backoff
+ * of at most 5 s); a node with neither is stuck. It is shorter than every watchdog threshold (180 s), so a stuck
+ * node is still restarted no sooner than the threshold after its last renewal.
+ */
+export const CONTROLLED_NODE_LIVENESS_ACTIVITY_WINDOW_MS = 90_000 as const;
+/** A node that has had no authenticated ack for this long says so in its log (at most once per repeat interval). */
+export const CONTROLLED_NODE_UNREACHABLE_WARN_AFTER_MS = 5 * 60_000;
+export const CONTROLLED_NODE_UNREACHABLE_WARN_REPEAT_MS = 30 * 60_000;
+
 /** The systemd `WatchdogSec` of the Linux unit (also the survival proof for a lease-less target). */
 export const CONTROLLED_NODE_LINUX_WATCHDOG_SEC = 180 as const;
 /**
  * A Linux node that predates the health lease still proves authentication: the unit
  * kills a node that sent no authenticated `WATCHDOG=1` for WatchdogSec, so one that
- * lived this long under the SAME pid was acknowledged by the server.
+ * lived this long under the SAME pid was acknowledged by the server. A node that
+ * publishes the liveness lease (CONTROLLED_NODE_LIVENESS_LEASE_FILE) feeds the
+ * watchdog without being authenticated, so for it this proof does not exist: it
+ * must publish the health lease.
  */
 export const CONTROLLED_NODE_LINUX_WATCHDOG_SURVIVAL_MS = (CONTROLLED_NODE_LINUX_WATCHDOG_SEC + 30) * 1000;
 

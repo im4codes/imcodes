@@ -2,7 +2,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync } from 'no
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
-import { CONTROLLED_NODE_WATCHDOG_KEEP_DISABLED_MARKER } from '../../shared/controlled-node-service.js';
+import { CONTROLLED_NODE_LIVENESS_LEASE_FILE, CONTROLLED_NODE_WATCHDOG_KEEP_DISABLED_MARKER } from '../../shared/controlled-node-service.js';
 import { windowsControlledNodeHealthWatchdogScript } from '../../src/node/installer.js';
 import { findPowerShell, runPowerShell } from './powershell-test-helper.js';
 
@@ -18,7 +18,7 @@ interface Scenario {
   /** Start-ScheduledTask throws. */
   startThrows?: boolean;
   /** A node process exists, this many seconds old; with a lease of this age (null = no lease). */
-  process?: { ageSeconds: number; leaseAgeSeconds: number | null };
+  process?: { ageSeconds: number; leaseAgeSeconds: number | null; livenessAgeSeconds?: number | null };
   /** The machine owner's `watchdog-keep-disabled` file exists in the install directory. */
   keepDisabledMarker?: boolean;
 }
@@ -34,6 +34,7 @@ function tick(scenario: Scenario, runs: number, dir = mkdtempSync(join(tmpdir(),
   const paths = {
     nodePath: join(dir, 'imcodes-node.exe'),
     leasePath: join(dir, 'health-lease.json'),
+    livenessPath: join(dir, CONTROLLED_NODE_LIVENESS_LEASE_FILE),
     statePath: join(dir, 'health-watchdog-state.json'),
     logPath: join(dir, 'health-watchdog.log'),
     upgradeMarkerPath: join(dir, 'upgrade-in-progress.json'),
@@ -43,13 +44,16 @@ function tick(scenario: Scenario, runs: number, dir = mkdtempSync(join(tmpdir(),
   };
   writeFileSync(paths.scenario, JSON.stringify(scenario));
   let script = windowsControlledNodeHealthWatchdogScript('C:\\ProgramData\\imcodes-node\\imcodes-node.exe');
-  for (const key of ['nodePath', 'leasePath', 'statePath', 'logPath', 'upgradeMarkerPath', 'keepDisabledMarkerPath'] as const) {
+  for (const key of ['nodePath', 'leasePath', 'livenessPath', 'statePath', 'logPath', 'upgradeMarkerPath', 'keepDisabledMarkerPath'] as const) {
     script = script.replace(new RegExp(`^\\$${key} = '.*'\\r$`, 'm'), () => `$${key} = '${paths[key]}'\r`);
   }
   if (scenario.keepDisabledMarker) writeFileSync(paths.keepDisabledMarkerPath, '');
   else rmSync(paths.keepDisabledMarkerPath, { force: true });
   if (scenario.process?.leaseAgeSeconds != null) {
     writeFileSync(paths.leasePath, JSON.stringify({ version: 1, pid: 4242, updatedAt: Date.now() - scenario.process.leaseAgeSeconds * 1000 }));
+  }
+  if (scenario.process?.livenessAgeSeconds != null) {
+    writeFileSync(paths.livenessPath, JSON.stringify({ version: 1, pid: 4242, updatedAt: Date.now() - scenario.process.livenessAgeSeconds * 1000 }));
   }
   const prelude = `
 $scn = Get-Content -LiteralPath $env:IMC_SCN -Raw | ConvertFrom-Json
@@ -185,5 +189,34 @@ describe.skipIf(!pwsh)('Windows controlled-node watchdog (PowerShell)', () => {
     const first = tick({ task: 'ready', process: { ageSeconds: 3_600, leaseAgeSeconds: 600 } }, 1, dir);
     expect(first.log).toContain('grace_begin reason=lease_stale');
     expect(first.calls).toEqual([]);
+  });
+
+  describe('an unreachable server is not a wedged node', () => {
+    it('leaves a node alone whose authenticated lease is long stale while its liveness lease is fresh (offline, still retrying)', () => {
+      const result = tick({ task: 'ready', process: { ageSeconds: 7_200, leaseAgeSeconds: 7_000, livenessAgeSeconds: 10 } }, 4);
+      expect(result.calls).toEqual([]);
+      expect(result.log).not.toContain('restart');
+      expect(result.log).not.toContain('grace_begin');
+      expect(result.state?.reason).toBe('healthy');
+    });
+
+    it('still restarts a node whose liveness lease went stale as well (nothing is working), after the confirmation grace', () => {
+      const dir = mkdtempSync(join(tmpdir(), 'imcodes-watchdog-'));
+      const first = tick({ task: 'ready', process: { ageSeconds: 7_200, leaseAgeSeconds: 7_000, livenessAgeSeconds: 600 } }, 1, dir);
+      expect(first.log).toContain('grace_begin reason=lease_stale');
+      expect(first.calls).toEqual([]);
+    });
+
+    it('a node that predates the liveness lease (no such file) is judged by its authenticated lease exactly as before', () => {
+      expect(tick({ task: 'ready', process: { ageSeconds: 3_600, leaseAgeSeconds: 5 } }, 1).state?.reason).toBe('healthy');
+      expect(tick({ task: 'ready', process: { ageSeconds: 3_600, leaseAgeSeconds: 600 } }, 1).log).toContain('grace_begin reason=lease_stale');
+    });
+
+    it('a liveness lease of another process does not vouch for this one', () => {
+      const dir = mkdtempSync(join(tmpdir(), 'imcodes-watchdog-'));
+      writeFileSync(join(dir, CONTROLLED_NODE_LIVENESS_LEASE_FILE), JSON.stringify({ version: 1, pid: 9, updatedAt: Date.now() }));
+      const result = tick({ task: 'ready', process: { ageSeconds: 3_600, leaseAgeSeconds: null } }, 1, dir);
+      expect(result.log).toContain('grace_begin reason=lease_pid_mismatch');
+    });
   });
 });

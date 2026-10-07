@@ -143,6 +143,7 @@ describe('controlled-node installer artifacts (4.1-4.4)', () => {
     expect(healthPaths).toEqual({
       scriptPath: 'C:\\ProgramData\\imcodes-node\\imcodes-node-health-watchdog.ps1',
       leasePath: 'C:\\ProgramData\\imcodes-node\\health-lease.json',
+      livenessPath: 'C:\\ProgramData\\imcodes-node\\liveness-lease.json',
       statePath: 'C:\\ProgramData\\imcodes-node\\health-watchdog-state.json',
       logPath: 'C:\\ProgramData\\imcodes-node\\health-watchdog.log',
       upgradeMarkerPath: 'C:\\ProgramData\\imcodes-node\\upgrade-in-progress.json',

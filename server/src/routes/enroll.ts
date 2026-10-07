@@ -75,6 +75,8 @@ import {
   REMOTE_DESKTOP_WORKER_MANIFEST_SUFFIX,
   REMOTE_DESKTOP_VIRTUAL_DISPLAY_ARCHIVE_FILENAME,
   REMOTE_DESKTOP_LINUX_WORKER_FILENAME,
+  REMOTE_DESKTOP_LINUX_WORKER_PLATFORM_DIR,
+  REMOTE_DESKTOP_WORKER_SIDECAR_DIR,
   validateRemoteDesktopWorkerReleaseManifest,
   type RemoteDesktopMacosArchitecture,
   type RemoteDesktopMacosWorkerManifest,
@@ -1230,7 +1232,7 @@ async function openLinuxRemoteDesktopWorkerArtifact(
   sha256: string;
   version: string;
 } | null> {
-  const workerDir = join(dir, 'remote-desktop-worker', 'linux-x64');
+  const workerDir = join(dir, REMOTE_DESKTOP_WORKER_SIDECAR_DIR, REMOTE_DESKTOP_LINUX_WORKER_PLATFORM_DIR);
   const executablePath = join(workerDir, REMOTE_DESKTOP_LINUX_WORKER_FILENAME);
   const manifestFilename = `${REMOTE_DESKTOP_LINUX_WORKER_FILENAME}${REMOTE_DESKTOP_WORKER_MANIFEST_SUFFIX}`;
   const manifestPath = join(workerDir, manifestFilename);

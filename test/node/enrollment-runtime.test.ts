@@ -410,6 +410,34 @@ describe('controlled node enrollment and runtime', () => {
     expect(parseEnrollmentBlob(Buffer.concat([encoded, Buffer.from('trailing-garbage')]))).toBeNull();
   });
 
+  it('reports connection activity while the server cannot be reached, with no acknowledgement ever received', async () => {
+    // The platform watchdogs must tell "offline and still retrying" from "wedged": every attempt, failure and scheduled
+    // retry is a sign of life, and none of them is an authenticated acknowledgement.
+    vi.useFakeTimers();
+    try {
+      const sockets: MockSocket[] = [];
+      const onConnectionActivity = vi.fn();
+      const onHeartbeatAck = vi.fn();
+      const runtime = createControlledNodeRuntime({
+        serverUrl: 'https://im.example', serverId: 'unreachable-1', token: 'secret', nodeRole: NODE_ROLE.CONTROLLED,
+      }, () => { const socket = new MockSocket(); sockets.push(socket); return socket; }, { onConnectionActivity, onHeartbeatAck });
+      runtime.start();
+      expect(sockets).toHaveLength(1);
+      expect(onConnectionActivity).toHaveBeenCalled(); // the attempt itself
+      // the connect never completes: connect timeout, a retry is scheduled, a second attempt follows, and so on
+      for (let attempt = 0; attempt < 4; attempt += 1) {
+        const before = onConnectionActivity.mock.calls.length;
+        await vi.advanceTimersByTimeAsync(30_000);
+        expect(onConnectionActivity.mock.calls.length, `attempt ${attempt}`).toBeGreaterThan(before);
+      }
+      expect(sockets.length).toBeGreaterThanOrEqual(4);
+      expect(onHeartbeatAck).not.toHaveBeenCalled();
+      runtime.stop();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('authenticates, executes only machine.exec, and returns a correlated result', async () => {
     const socket = new MockSocket();
     const onAuthenticated = vi.fn();

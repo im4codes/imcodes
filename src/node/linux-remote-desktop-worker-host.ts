@@ -21,7 +21,11 @@ import {
   REMOTE_DESKTOP_LOCAL_DISCLOSURE_CAPABILITY,
   type RemoteDesktopAdapterCapability,
 } from '../../shared/remote-desktop-access.js';
-import { REMOTE_DESKTOP_LINUX_WORKER_FILENAME } from '../../shared/remote-desktop-worker.js';
+import {
+  REMOTE_DESKTOP_LINUX_WORKER_FILENAME,
+  REMOTE_DESKTOP_LINUX_WORKER_PLATFORM_DIR,
+  REMOTE_DESKTOP_WORKER_SIDECAR_DIR,
+} from '../../shared/remote-desktop-worker.js';
 import { RemoteDesktopWorkerHostCore } from './remote-desktop-worker-host-core.js';
 import {
   activeLocalRemoteDesktopConnections,
@@ -52,8 +56,8 @@ import {
  * own artifact, so replacing just that file never brings this along).
  */
 const WORKER_SIDECAR_RELATIVE_PATH = [
-  'remote-desktop-worker',
-  'linux-x64',
+  REMOTE_DESKTOP_WORKER_SIDECAR_DIR,
+  REMOTE_DESKTOP_LINUX_WORKER_PLATFORM_DIR,
   REMOTE_DESKTOP_LINUX_WORKER_FILENAME,
 ] as const;
 

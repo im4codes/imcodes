@@ -133,7 +133,7 @@ export function posixUpgradeHealthWaitScript(): string {
     `    if [ "$restarts" -lt "$pid_changes" ]; then restarts=$pid_changes; fi`,
     `    healthy=0`,
     `    if imcodes_lease_healthy; then healthy=1`,
-    `    elif [ "$IMCODES_LEGACY_SURVIVAL_MS" -gt 0 ] && [ "$alive" = "1" ] && [ ! -e "$IMCODES_LEASE" ] && [ $(( elapsed - pid_since )) -ge "$IMCODES_LEGACY_SURVIVAL_MS" ]; then healthy=2`,
+    `    elif [ "$IMCODES_LEGACY_SURVIVAL_MS" -gt 0 ] && [ "$alive" = "1" ] && [ ! -e "$IMCODES_LEASE" ] && [ ! -e "$IMCODES_LIVENESS" ] && [ $(( elapsed - pid_since )) -ge "$IMCODES_LEGACY_SURVIVAL_MS" ]; then healthy=2`,
     `    fi`,
     `    IMCODES_HEALTH_VERDICT=$(imcodes_upgrade_health_verdict "$elapsed" "$first_seen" "$alive" "$absent" "$healthy" "$restarts" "$IMCODES_INTERRUPTED")`,
     `    if [ "$IMCODES_HEALTH_VERDICT" != "wait" ]; then`,

@@ -1,6 +1,13 @@
 import { execFile } from 'node:child_process';
 import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
+import {
+  CONTROLLED_NODE_LIVENESS_ACTIVITY_WINDOW_MS,
+  CONTROLLED_NODE_LIVENESS_LEASE_FILE,
+  CONTROLLED_NODE_LIVENESS_WRITE_INTERVAL_MS,
+  CONTROLLED_NODE_UNREACHABLE_WARN_AFTER_MS,
+  CONTROLLED_NODE_UNREACHABLE_WARN_REPEAT_MS,
+} from '../../shared/controlled-node-service.js';
 
 export const CONTROLLED_NODE_HEALTH_LEASE_FILE = 'health-lease.json';
 export const CONTROLLED_NODE_HEALTH_LEASE_VERSION = 1 as const;
@@ -16,6 +23,11 @@ export interface ControlledNodeHealthLease {
 
 export function controlledNodeHealthLeasePath(journalPath: string): string {
   return join(dirname(journalPath), CONTROLLED_NODE_HEALTH_LEASE_FILE);
+}
+
+/** The process-liveness lease (renewed while the node is making progress, connected or not): see controlled-node-service.ts. */
+export function controlledNodeLivenessLeasePath(journalPath: string): string {
+  return join(dirname(journalPath), CONTROLLED_NODE_LIVENESS_LEASE_FILE);
 }
 
 export function controlledNodeHealthWatchdogStatePath(journalPath: string): string {
@@ -146,11 +158,30 @@ export interface ControlledNodeHealthWatchdogResult {
   reason: 'healthy' | 'lease_missing' | 'lease_invalid' | 'lease_future' | 'lease_pid_missing' | 'lease_stale';
 }
 
+type LeaseReading =
+  | { kind: 'missing' }
+  | { kind: 'invalid' }
+  | { kind: 'lease'; lease: ControlledNodeHealthLease };
+
+async function readLeaseFile(path: string): Promise<LeaseReading> {
+  try {
+    const parsed = await readJson(path);
+    return isControlledNodeHealthLease(parsed) ? { kind: 'lease', lease: parsed } : { kind: 'invalid' };
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'ENOENT' ? { kind: 'missing' } : { kind: 'invalid' };
+  }
+}
+
 /**
  * One-shot macOS health check, invoked by a separate periodic LaunchDaemon.
- * Missing/invalid leases receive a full grace window so first boot and normal
- * process replacement are not mistaken for a wedge. A stale lease whose exact
- * PID is still alive is decisive evidence of the observed fake-alive state and
+ *
+ * It judges whether the node PROCESS is alive and working, not whether the server is reachable: the liveness lease is
+ * renewed while the node's connection machinery makes progress (an ack, or a connection attempt / failure / retry), so
+ * an unreachable server is not a reason to restart it. The authenticated health lease is accepted as well (a node
+ * that predates the liveness lease only writes that one).
+ *
+ * Missing/invalid leases receive a full grace window so first boot and normal process replacement are not mistaken
+ * for a wedge. A stale lease whose exact PID is still alive is decisive evidence of the observed fake-alive state and
  * can be restarted immediately.
  */
 export async function runMacosControlledNodeHealthWatchdog(options: {
@@ -162,7 +193,6 @@ export async function runMacosControlledNodeHealthWatchdog(options: {
 }): Promise<ControlledNodeHealthWatchdogResult> {
   const now = options.now?.() ?? Date.now();
   const staleMs = options.staleMs ?? CONTROLLED_NODE_HEALTH_STALE_MS;
-  const leasePath = controlledNodeHealthLeasePath(options.journalPath);
   const statePath = controlledNodeHealthWatchdogStatePath(options.journalPath);
   const processExists = options.processExists ?? ((pid: number) => {
     try {
@@ -173,25 +203,34 @@ export async function runMacosControlledNodeHealthWatchdog(options: {
     }
   });
 
-  let lease: ControlledNodeHealthLease | null = null;
-  let reason: ControlledNodeHealthWatchdogResult['reason'] = 'lease_missing';
-  try {
-    const parsed = await readJson(leasePath);
-    if (isControlledNodeHealthLease(parsed)) lease = parsed;
-    else reason = 'lease_invalid';
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') reason = 'lease_invalid';
-  }
-
-  const ageMs = lease ? now - lease.updatedAt : Number.POSITIVE_INFINITY;
-  const pidAlive = lease ? processExists(lease.pid) : false;
-  if (lease && pidAlive && ageMs >= -60_000 && ageMs <= staleMs) {
+  // The liveness lease first: it is the one a current node renews through an outage. Either lease being fresh and
+  // bound to a live process is enough.
+  const readings = [
+    await readLeaseFile(controlledNodeLivenessLeasePath(options.journalPath)),
+    await readLeaseFile(controlledNodeHealthLeasePath(options.journalPath)),
+  ];
+  const judged = readings.map((reading) => {
+    if (reading.kind !== 'lease') return { reading, ageMs: Number.POSITIVE_INFINITY, pidAlive: false };
+    return {
+      reading,
+      ageMs: now - reading.lease.updatedAt,
+      pidAlive: processExists(reading.lease.pid),
+    };
+  });
+  if (judged.some((entry) => entry.reading.kind === 'lease' && entry.pidAlive && entry.ageMs >= -60_000 && entry.ageMs <= staleMs)) {
     await rm(statePath, { force: true }).catch(() => {});
     return { healthy: true, restarted: false, reason: 'healthy' };
   }
-  if (lease) {
-    if (ageMs < -60_000) reason = 'lease_future';
-    else if (!pidAlive) reason = 'lease_pid_missing';
+
+  // Not healthy: name the failure after the first lease that exists (the liveness lease, else the health lease).
+  let reason: ControlledNodeHealthWatchdogResult['reason'] = 'lease_missing';
+  let pidAlive = false;
+  const primary = judged.find((entry) => entry.reading.kind === 'lease') ?? judged.find((entry) => entry.reading.kind === 'invalid');
+  if (primary?.reading.kind === 'invalid') reason = 'lease_invalid';
+  else if (primary) {
+    pidAlive = primary.pidAlive;
+    if (primary.ageMs < -60_000) reason = 'lease_future';
+    else if (!primary.pidAlive) reason = 'lease_pid_missing';
     else reason = 'lease_stale';
   }
 
@@ -203,9 +242,8 @@ export async function runMacosControlledNodeHealthWatchdog(options: {
     // Missing/corrupt state starts a fresh bounded grace window.
   }
 
-  // A live process with an authenticated lease already stale for the full
-  // threshold is conclusive. Other states may simply be a fresh replacement,
-  // so require persistence across the grace window before restarting.
+  // A live process with a lease already stale for the full threshold is conclusive. Other states may simply be a
+  // fresh replacement, so require persistence across the grace window before restarting.
   const decisiveStaleProcess = reason === 'lease_stale' && pidAlive;
   const shouldRestart = decisiveStaleProcess || now - failureSince >= staleMs;
   await writeJsonAtomic(statePath, {
@@ -267,51 +305,107 @@ export function createControlledNodeHealthLeasePublisher(
   };
 }
 
-/** Publish systemd's native watchdog pulse only after an authenticated ack. */
-export function createSystemdWatchdogNotifier(options: {
-  now?: () => number;
-  pid?: number;
-  intervalMs?: number;
-  notify?: (pid: number) => Promise<void>;
-  onError?: (error: unknown) => void;
-} = {}): ControlledNodeHealthLeasePublisher {
-  const notify = options.notify ?? ((pid: number) => new Promise<void>((resolve, reject) => {
+/** `systemd-notify WATCHDOG=1` for one pid (the unit sets NotifyAccess=all). */
+export function notifySystemdWatchdog(pid: number): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
     execFile('systemd-notify', [`--pid=${pid}`, 'WATCHDOG=1'], { windowsHide: true }, (error) => {
       if (error) reject(error);
       else resolve();
     });
-  }));
-  return createControlledNodeHealthLeasePublisher('systemd-watchdog', {
-    now: options.now,
-    pid: options.pid,
-    intervalMs: options.intervalMs,
-    writeLease: async (_path, _now, pid) => notify(pid),
-    onError: options.onError,
   });
 }
 
+export interface ControlledNodeLivenessPublisher {
+  /** The connection machinery did something: a connection attempt, a failure, a scheduled retry, an opened socket, an ack. */
+  recordConnectionActivity(): void;
+  /** An authenticated heartbeat acknowledgement (also counts as activity). */
+  recordAuthenticatedHeartbeat(): void;
+  /** Starts the periodic renewal (idempotent); the timer never keeps the process alive. */
+  start(): void;
+  stop(): void;
+  /** One renewal decision; exposed for tests and for an immediate first pulse. */
+  tick(): Promise<void>;
+}
+
 /**
- * Linux: feed systemd's watchdog AND publish the lease. The lease is what the
- * self-upgrade's health wait reads on every platform; Linux used to publish only
- * the watchdog pulse, which nothing outside systemd can observe.
+ * Publishes "this node process is alive and working" for the platform watchdogs (the liveness lease file, and on Linux
+ * the systemd watchdog pulse), independently of whether the server is reachable.
+ *
+ * It renews only while the node's connection machinery has shown activity within the activity window. A healthy node
+ * acks every 5 s and a node that cannot reach the server keeps scheduling and failing connection attempts, so both are
+ * alive; a process whose event loop is blocked cannot run the timer at all, and one whose connection machinery has
+ * stopped doing anything stops being renewed -- the watchdog then restarts it. The process starting counts as activity,
+ * so a freshly started node is not restarted before it had a chance to connect.
  */
-export function createLinuxControlledNodeHealthPublisher(
-  leasePath: string,
-  options: {
-    onError?: (error: unknown) => void;
-    watchdog?: ControlledNodeHealthLeasePublisher;
-    lease?: ControlledNodeHealthLeasePublisher;
-  } = {},
-): ControlledNodeHealthLeasePublisher {
-  const watchdog = options.watchdog ?? createSystemdWatchdogNotifier({ onError: options.onError });
-  const lease = options.lease ?? createControlledNodeHealthLeasePublisher(leasePath, { onError: options.onError });
+export function createControlledNodeLivenessPublisher(options: {
+  path: string;
+  /** Linux: also feed the service manager's watchdog. */
+  notifyWatchdog?: (pid: number) => Promise<void>;
+  now?: () => number;
+  monotonicNow?: () => number;
+  pid?: number;
+  intervalMs?: number;
+  activityWindowMs?: number;
+  writeLease?: (path: string, now: number, pid: number) => Promise<void>;
+  onError?: (error: unknown) => void;
+  /** Called (at most once per repeat interval) while no authenticated ack was seen for the warn threshold. */
+  onUnreachable?: (silentForMs: number) => void;
+  unreachableWarnAfterMs?: number;
+  unreachableWarnRepeatMs?: number;
+}): ControlledNodeLivenessPublisher {
+  const now = options.now ?? Date.now;
+  const monotonicNow = options.monotonicNow ?? (() => performance.now());
+  const pid = options.pid ?? process.pid;
+  const intervalMs = options.intervalMs ?? CONTROLLED_NODE_LIVENESS_WRITE_INTERVAL_MS;
+  const activityWindowMs = options.activityWindowMs ?? CONTROLLED_NODE_LIVENESS_ACTIVITY_WINDOW_MS;
+  const writeLease = options.writeLease ?? writeControlledNodeHealthLease;
+  const warnAfterMs = options.unreachableWarnAfterMs ?? CONTROLLED_NODE_UNREACHABLE_WARN_AFTER_MS;
+  const warnRepeatMs = options.unreachableWarnRepeatMs ?? CONTROLLED_NODE_UNREACHABLE_WARN_REPEAT_MS;
+  const startedAt = monotonicNow();
+  let lastActivityAt = startedAt;
+  let lastAckAt = startedAt;
+  let lastWarnAt = Number.NEGATIVE_INFINITY;
+  let timer: ReturnType<typeof setInterval> | null = null;
+  let inFlight: Promise<void> | null = null;
+
+  const publish = async (): Promise<void> => {
+    const results = await Promise.allSettled([
+      writeLease(options.path, now(), pid),
+      options.notifyWatchdog ? options.notifyWatchdog(pid) : Promise.resolve(),
+    ]);
+    for (const result of results) if (result.status === 'rejected') options.onError?.(result.reason);
+  };
+
+  const tick = async (): Promise<void> => {
+    const at = monotonicNow();
+    if (options.onUnreachable && at - lastAckAt >= warnAfterMs && at - lastWarnAt >= warnRepeatMs) {
+      lastWarnAt = at;
+      options.onUnreachable(at - lastAckAt);
+    }
+    if (at - lastActivityAt > activityWindowMs) return; // stuck: let the watchdog act
+    if (inFlight) return inFlight;
+    inFlight = publish().finally(() => { inFlight = null; });
+    return inFlight;
+  };
+
   return {
+    recordConnectionActivity(): void {
+      lastActivityAt = monotonicNow();
+    },
     recordAuthenticatedHeartbeat(): void {
-      watchdog.recordAuthenticatedHeartbeat();
-      lease.recordAuthenticatedHeartbeat();
+      lastActivityAt = monotonicNow();
+      lastAckAt = lastActivityAt;
     },
-    async flush(): Promise<void> {
-      await Promise.all([watchdog.flush(), lease.flush()]);
+    start(): void {
+      if (timer) return;
+      void tick();
+      timer = setInterval(() => { void tick(); }, intervalMs);
+      timer.unref?.();
     },
+    stop(): void {
+      if (timer) clearInterval(timer);
+      timer = null;
+    },
+    tick,
   };
 }

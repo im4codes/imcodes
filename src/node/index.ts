@@ -14,7 +14,9 @@ import logger from '../util/logger.js';
 import {
   controlledNodeHealthLeasePath,
   createControlledNodeHealthLeasePublisher,
-  createLinuxControlledNodeHealthPublisher,
+  createControlledNodeLivenessPublisher,
+  notifySystemdWatchdog,
+  controlledNodeLivenessLeasePath,
   runMacosControlledNodeHealthWatchdog,
   waitForControlledNodeOnlineLease,
 } from './health-lease.js';
@@ -252,13 +254,25 @@ async function main(): Promise<void> {
     const message = err instanceof Error ? err.message : String(err);
     process.stderr.write(`imcodes-node: failed to publish authenticated health signal (${message})\n`);
   };
-  const healthLease = process.platform === 'linux'
-    ? createLinuxControlledNodeHealthPublisher(controlledNodeHealthLeasePath(deps.journalPath), { onError: reportHealthError })
-    : process.platform === 'win32' || process.platform === 'darwin'
-      ? createControlledNodeHealthLeasePublisher(controlledNodeHealthLeasePath(deps.journalPath), {
-        onError: reportHealthError,
-      })
-      : undefined;
+  // Two signals, deliberately separate. The health lease is written ONLY on an authenticated server acknowledgement:
+  // a self-upgrade judges its new node by it. The liveness publisher (the liveness lease file and, on Linux, the systemd
+  // watchdog pulse) says "this process is alive and its connection machinery is working" and keeps being renewed while
+  // the server is unreachable: a network outage must not make the platform watchdog kill and restart the node.
+  const supportsHealthSignals = process.platform === 'linux' || process.platform === 'win32' || process.platform === 'darwin';
+  const healthLease = supportsHealthSignals
+    ? createControlledNodeHealthLeasePublisher(controlledNodeHealthLeasePath(deps.journalPath), { onError: reportHealthError })
+    : undefined;
+  const liveness = supportsHealthSignals
+    ? createControlledNodeLivenessPublisher({
+      path: controlledNodeLivenessLeasePath(deps.journalPath),
+      ...(process.platform === 'linux' ? { notifyWatchdog: notifySystemdWatchdog } : {}),
+      onError: reportHealthError,
+      onUnreachable: (silentForMs) => {
+        logger.warn({ silentForMs }, 'controlled node has not been acknowledged by the server for a while (the node keeps retrying; the platform watchdog is not restarting it)');
+      },
+    })
+    : undefined;
+  liveness?.start();
   const signedShellArtifact = resolveRemoteDesktopAccountShellArtifact();
   const macosRemoteDesktopWorker = process.platform === 'darwin'
     && (process.arch === 'arm64' || process.arch === 'x64')
@@ -297,7 +311,11 @@ async function main(): Promise<void> {
       const message = err instanceof Error ? err.message : String(err);
       process.stderr.write(`imcodes-node: failed to record service_healthy (${message})\n`);
     },
-    onHeartbeatAck: healthLease?.recordAuthenticatedHeartbeat,
+    onHeartbeatAck: () => {
+      liveness?.recordAuthenticatedHeartbeat();
+      healthLease?.recordAuthenticatedHeartbeat();
+    },
+    onConnectionActivity: liveness?.recordConnectionActivity,
     ...(adoptAssignedNodeId ? { onAssignedIdentity: adoptAssignedNodeId } : {}),
     readPreviousUpgradeFailure: () => readPreviousUpgradeFailure(deps.journalPath),
     remoteDesktopAccessPaused,

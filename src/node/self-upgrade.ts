@@ -45,6 +45,8 @@ import {
   REMOTE_DESKTOP_VIRTUAL_DISPLAY_ARCHIVE_FILENAME,
   REMOTE_DESKTOP_VIRTUAL_DISPLAY_MANIFEST_FILENAME,
   REMOTE_DESKTOP_LINUX_WORKER_FILENAME,
+  REMOTE_DESKTOP_LINUX_WORKER_PLATFORM_DIR,
+  REMOTE_DESKTOP_WORKER_SIDECAR_DIR,
   decodeRemoteDesktopMacosComponentSetPrefix,
   remoteDesktopMacosComponentSetFilename,
   validateRemoteDesktopWorkerManifest,
@@ -1118,7 +1120,7 @@ export async function downloadControlledNodeLinuxRemoteDesktopWorker(input: {
   expectedVersion?: string;
 }): Promise<{ workerDir: string; artifactPath: string; manifestPath: string; sha256: string } | undefined> {
   if (input.target.os !== CONTROLLED_NODE_OS_LINUX || input.target.arch !== CONTROLLED_NODE_ARCH_X64) return undefined;
-  const workerDir = join(input.dir, 'remote-desktop-worker', 'linux-x64');
+  const workerDir = join(input.dir, REMOTE_DESKTOP_WORKER_SIDECAR_DIR, REMOTE_DESKTOP_LINUX_WORKER_PLATFORM_DIR);
   await mkdir(workerDir, { recursive: true });
   try {
     const executable = await downloadArtifact({
@@ -1728,7 +1730,7 @@ export async function refreshControlledNodeRemoteDesktopWorker(
   }
   const root = input.root ?? dirname(process.execPath);
   const finalRoot = join(root, 'remote-desktop-worker');
-  const finalPlatformRoot = join(finalRoot, platform === 'win32' ? 'win32-x64' : 'linux-x64');
+  const finalPlatformRoot = join(finalRoot, platform === 'win32' ? 'win32-x64' : REMOTE_DESKTOP_LINUX_WORKER_PLATFORM_DIR);
   const manifestPath = join(
     finalPlatformRoot,
     platform === 'win32'

@@ -1,5 +1,5 @@
 import { execFile, spawn, type ChildProcess } from 'node:child_process';
-import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
@@ -12,6 +12,12 @@ import {
   CONTROLLED_NODE_WINDOWS_UPGRADE_PREFLIGHT_FAILED as PREFLIGHT_FAILED,
 } from '../../shared/controlled-node-service.js';
 import { DAEMON_UPGRADE_BLOCK_REASON } from '../../shared/daemon-upgrade.js';
+import {
+  REMOTE_DESKTOP_LINUX_WORKER_FILENAME,
+  REMOTE_DESKTOP_LINUX_WORKER_PLATFORM_DIR,
+  REMOTE_DESKTOP_WORKER_MANIFEST_SUFFIX,
+  REMOTE_DESKTOP_WORKER_SIDECAR_DIR,
+} from '../../shared/remote-desktop-worker.js';
 import { buildPosixControlledNodeUpgradeScript } from '../../src/node/posix-upgrade-script.js';
 import { posixUpgradeHealthWaitScript } from '../../src/node/upgrade-health-script.js';
 import { reconcilePreviousUpgrade } from '../../src/node/upgrade-result.js';
@@ -200,6 +206,13 @@ async function expectRollbackVerdict(rig: Rig, verdict: string): Promise<Record<
 const readResult = async (rig: Rig): Promise<Record<string, unknown>> => JSON.parse(await readFile(rig.resultPath, 'utf8')) as Record<string, unknown>;
 const exists = async (path: string): Promise<boolean> => lstat(path).then(() => true, () => false);
 const text = (path: string): Promise<string> => readFile(path, 'utf8');
+/** The staged sidecar ROOT the way the node downloads it: <root>/<platform dir>/<worker + manifest>. */
+async function stageWorkerSet(root: string, contents: string): Promise<void> {
+  const platformDir = join(root, REMOTE_DESKTOP_LINUX_WORKER_PLATFORM_DIR);
+  await mkdir(platformDir, { recursive: true });
+  await writeFile(join(platformDir, REMOTE_DESKTOP_LINUX_WORKER_FILENAME), contents, { mode: 0o755 });
+  await writeFile(join(platformDir, `${REMOTE_DESKTOP_LINUX_WORKER_FILENAME}${REMOTE_DESKTOP_WORKER_MANIFEST_SUFFIX}`), '{}');
+}
 const elapsedVirtual = async (rig: Rig): Promise<number> => Number((await text(join(rig.fake, 'clock'))).trim()) - 1_800_000_000;
 
 /** A rig whose staged artifact hash is honest (the script verifies it before touching anything). */
@@ -317,6 +330,16 @@ describe.skipIf(posixOnly)('POSIX self-upgrade transaction (generated script und
     expect(await elapsedVirtual(rig)).toBeGreaterThanOrEqual(CONTROLLED_NODE_LINUX_WATCHDOG_SURVIVAL_MS / 1000);
   });
 
+  it('a Linux target that publishes the liveness lease but is never acknowledged is NOT accepted by survival: it is rolled back at the cap', async () => {
+    // A current node feeds the watchdog while the server is unreachable, so outliving the watchdog proves nothing about
+    // authentication any more: only the authenticated lease does.
+    const { rig, script } = await scenario({ newNode: marker('liveonly') });
+    const oldBytes = await text(rig.dst);
+    await run(rig, script, { scale: HARD_CAP_SCALE });
+    expect(await hardCapViolations(rig, oldBytes)).toEqual([]);
+    expect(await readResult(rig)).toMatchObject({ status: S.ROLLED_BACK });
+  });
+
   it('the macOS script has no lease-less shortcut: an alive node that never authenticates is rolled back at the cap', async () => {
     const { rig, script } = await scenario({ newNode: marker('nolease'), platform: 'darwin', extra: { serviceDefinitionPaths: [] } });
     const oldBytes = await text(rig.dst);
@@ -401,33 +424,49 @@ describe.skipIf(posixOnly)('POSIX self-upgrade transaction (generated script und
 
   it('puts the previous remote-desktop worker back when the upgrade is rolled back', async () => {
     const rig = await makeRig({ newNode: marker('dead') });
-    const worker = join(rig.root, 'installed', 'remote-desktop-worker');
-    const stagedWorker = join(rig.stage, 'remote-desktop-worker');
-    await mkdir(worker, { recursive: true });
-    await mkdir(stagedWorker, { recursive: true });
-    const { REMOTE_DESKTOP_LINUX_WORKER_FILENAME: workerName } = await import('../../shared/remote-desktop-worker.js');
-    await writeFile(join(worker, workerName), 'old-worker', { mode: 0o755 });
-    await writeFile(join(stagedWorker, workerName), 'new-worker', { mode: 0o755 });
+    const worker = join(rig.root, 'installed', REMOTE_DESKTOP_WORKER_SIDECAR_DIR);
+    const stagedWorker = join(rig.stage, REMOTE_DESKTOP_WORKER_SIDECAR_DIR);
+    const oldFile = join(worker, REMOTE_DESKTOP_LINUX_WORKER_PLATFORM_DIR, REMOTE_DESKTOP_LINUX_WORKER_FILENAME);
+    await mkdir(join(worker, REMOTE_DESKTOP_LINUX_WORKER_PLATFORM_DIR), { recursive: true });
+    await stageWorkerSet(stagedWorker, 'new-worker');
+    await writeFile(oldFile, 'old-worker', { mode: 0o755 });
     const staged = await text(rig.stagedArtifact);
     expect((await run(rig, scriptFor(rig, { artifactSha256: sha256(staged), stagedRemoteDesktopWorkerDir: stagedWorker }))).code).toBe(1);
-    expect(await text(join(worker, workerName))).toBe('old-worker');
+    expect(await text(oldFile)).toBe('old-worker');
     expect(await exists(`${worker}.upgrade-old`)).toBe(false);
     expect(await exists(`${worker}.new`)).toBe(false);
     expect(await readResult(rig)).toMatchObject({ status: S.ROLLED_BACK });
     expect((await readResult(rig)).rollbackProgress).toContain('restore_remote_desktop');
   });
 
-  it('a worker that cannot be staged ends in preflight: nothing is replaced and the service is never stopped', async () => {
+  it('publishes a complete staged worker set at the path the installed node resolves it from', async () => {
     const rig = await makeRig();
-    const stagedWorker = join(rig.stage, 'remote-desktop-worker');
-    await mkdir(stagedWorker, { recursive: true });
-    await writeFile(join(stagedWorker, 'not-the-worker'), 'x');
+    const stagedWorker = join(rig.stage, REMOTE_DESKTOP_WORKER_SIDECAR_DIR);
+    await stageWorkerSet(stagedWorker, 'new-worker');
+    const staged = await text(rig.stagedArtifact);
+    expect((await run(rig, scriptFor(rig, { artifactSha256: sha256(staged), stagedRemoteDesktopWorkerDir: stagedWorker }))).code).toBe(0);
+    const { resolveLinuxRemoteDesktopWorkerPath } = await import('../../src/node/linux-remote-desktop-worker-host.js');
+    expect(await text(resolveLinuxRemoteDesktopWorkerPath(rig.dst))).toBe('new-worker');
+    expect(await readResult(rig)).toMatchObject({ status: S.SUCCESS });
+  });
+
+  it.each([
+    ['the worker is missing', async (dir: string) => { await rm(join(dir, REMOTE_DESKTOP_LINUX_WORKER_PLATFORM_DIR, REMOTE_DESKTOP_LINUX_WORKER_FILENAME)); }],
+    ['its manifest is missing', async (dir: string) => { await rm(join(dir, REMOTE_DESKTOP_LINUX_WORKER_PLATFORM_DIR, `${REMOTE_DESKTOP_LINUX_WORKER_FILENAME}${REMOTE_DESKTOP_WORKER_MANIFEST_SUFFIX}`)); }],
+    ['the worker sits at the sidecar root instead of its platform directory', async (dir: string) => {
+      await rename(join(dir, REMOTE_DESKTOP_LINUX_WORKER_PLATFORM_DIR, REMOTE_DESKTOP_LINUX_WORKER_FILENAME), join(dir, REMOTE_DESKTOP_LINUX_WORKER_FILENAME));
+    }],
+  ])('an incomplete staged worker set ends in preflight: nothing is replaced and the service is never stopped (%s)', async (_name, damage) => {
+    const rig = await makeRig();
+    const stagedWorker = join(rig.stage, REMOTE_DESKTOP_WORKER_SIDECAR_DIR);
+    await stageWorkerSet(stagedWorker, 'new-worker');
+    await damage(stagedWorker);
     const staged = await text(rig.stagedArtifact);
     const oldBytes = await text(rig.dst);
     expect((await run(rig, scriptFor(rig, { artifactSha256: sha256(staged), stagedRemoteDesktopWorkerDir: stagedWorker }))).code).toBe(1);
     expect(await text(rig.dst)).toBe(oldBytes);
     expect(await rig.calls()).toEqual([]);
-    expect(await readResult(rig)).toMatchObject({ status: PREFLIGHT_FAILED });
+    expect(await readResult(rig)).toMatchObject({ status: PREFLIGHT_FAILED, error: 'staged remote desktop worker artifact set is incomplete' });
   });
 
   it('puts back a service definition (unit/plist) that the new node rewrote, and reloads the service manager', async () => {

@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { cp, mkdir, mkdtemp, readFile, rm, unlink, writeFile } from 'node:fs/promises';
+import { chmod, cp, mkdir, mkdtemp, readFile, rm, symlink, unlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -21,6 +21,10 @@ import {
   REMOTE_DESKTOP_WORKER_FILENAME,
   REMOTE_DESKTOP_VIRTUAL_DISPLAY_ARCHIVE_FILENAME,
   validateRemoteDesktopWorkerReleaseManifest,
+  REMOTE_DESKTOP_LINUX_WORKER_FILENAME as PACKAGING_LINUX_WORKER_FILENAME,
+  REMOTE_DESKTOP_LINUX_WORKER_PLATFORM_DIR as PACKAGING_LINUX_PLATFORM_DIR,
+  REMOTE_DESKTOP_WORKER_SIDECAR_DIR as PACKAGING_SIDECAR_DIR,
+  verifyLinuxRemoteDesktopWorkerArtifactSet,
   verifyRemoteDesktopWorkerArtifactSet,
 } from '../../scripts/remote-desktop-worker-artifacts.mjs';
 import {
@@ -32,6 +36,10 @@ import {
   type RemoteDesktopMacosWorkerManifest,
   REMOTE_DESKTOP_MACOS_TEAM_ID,
   REMOTE_DESKTOP_WORKER_IPC_VERSION,
+  REMOTE_DESKTOP_LINUX_WORKER_FILENAME,
+  REMOTE_DESKTOP_LINUX_WORKER_PLATFORM_DIR,
+  REMOTE_DESKTOP_WORKER_MANIFEST_SUFFIX,
+  REMOTE_DESKTOP_WORKER_SIDECAR_DIR,
 } from '../../shared/remote-desktop-worker.js';
 import { REMOTE_DESKTOP_PROTOCOL_VERSION } from '../../shared/remote-desktop.js';
 
@@ -481,5 +489,81 @@ describe('remote desktop worker release artifact verifier', () => {
     await expect(verifyRemoteDesktopWorkerArtifactSet(
       wrongArch.root, WORKER_VERSION, { os: 'darwin', arch: 'x64' },
     )).rejects.toThrow(/invalid remote desktop worker manifest/);
+  });
+});
+
+describe('Linux remote desktop worker release gate', () => {
+  const VERSION = '2026.10.5516-dev.5968';
+
+  it('names the worker and its directories exactly as the shared contract does', () => {
+    expect(PACKAGING_LINUX_WORKER_FILENAME).toBe(REMOTE_DESKTOP_LINUX_WORKER_FILENAME);
+    expect(PACKAGING_LINUX_PLATFORM_DIR).toBe(REMOTE_DESKTOP_LINUX_WORKER_PLATFORM_DIR);
+    expect(PACKAGING_SIDECAR_DIR).toBe(REMOTE_DESKTOP_WORKER_SIDECAR_DIR);
+  });
+
+  async function linuxSet(options: { version?: string; executable?: boolean } = {}) {
+    const root = await mkdtemp(join(tmpdir(), 'imcodes-linux-worker-gate-'));
+    dirs.push(root);
+    const platformDir = join(root, REMOTE_DESKTOP_WORKER_SIDECAR_DIR, REMOTE_DESKTOP_LINUX_WORKER_PLATFORM_DIR);
+    await mkdir(platformDir, { recursive: true });
+    const bytes = Buffer.from('linux worker bytes');
+    const executable = join(platformDir, REMOTE_DESKTOP_LINUX_WORKER_FILENAME);
+    const manifest = `${executable}${REMOTE_DESKTOP_WORKER_MANIFEST_SUFFIX}`;
+    await writeFile(executable, bytes);
+    await chmod(executable, options.executable === false ? 0o644 : 0o755);
+    await writeFile(manifest, JSON.stringify({
+      schemaVersion: 1,
+      artifact: { fileName: REMOTE_DESKTOP_LINUX_WORKER_FILENAME, os: 'linux', arch: 'x64', size: bytes.length, sha256: digest(bytes) },
+      build: { source: 'ci', version: options.version ?? VERSION },
+    }));
+    return { root, platformDir, executable, manifest, bytes };
+  }
+
+  it('accepts a complete, matching set', async () => {
+    const set = await linuxSet();
+    await expect(verifyLinuxRemoteDesktopWorkerArtifactSet(set.root, VERSION)).resolves.toMatchObject({ sha256: digest(set.bytes) });
+  });
+
+  it.each([
+    ['the worker is missing', async (set: Awaited<ReturnType<typeof linuxSet>>) => { await unlink(set.executable); }, /incomplete: missing imcodes-linux-remote-desktop-worker$/],
+    ['the manifest is missing', async (set: Awaited<ReturnType<typeof linuxSet>>) => { await unlink(set.manifest); }, /incomplete: missing .*manifest\.json$/],
+    ['the worker is not executable', async (set: Awaited<ReturnType<typeof linuxSet>>) => { await chmod(set.executable, 0o644); }, /not executable/],
+    ['the worker bytes differ from the manifest', async (set: Awaited<ReturnType<typeof linuxSet>>) => { await writeFile(set.executable, Buffer.from('linux worker bytez')); await chmod(set.executable, 0o755); }, /sha256 mismatch/],
+    ['the worker has another size than the manifest says', async (set: Awaited<ReturnType<typeof linuxSet>>) => { await writeFile(set.executable, Buffer.from('short')); await chmod(set.executable, 0o755); }, /size mismatch/],
+    ['the worker is a symlink', async (set: Awaited<ReturnType<typeof linuxSet>>) => { await unlink(set.executable); await writeFile(join(set.root, 'elsewhere'), set.bytes, { mode: 0o755 }); await symlink(join(set.root, 'elsewhere'), set.executable); }, /non-regular/],
+    ['the manifest is not the strict shape', async (set: Awaited<ReturnType<typeof linuxSet>>) => { await writeFile(set.manifest, JSON.stringify({ schemaVersion: 1, extra: true })); }, /invalid linux remote desktop worker manifest/],
+  ])('rejects a set where %s', async (_name, damage, message) => {
+    const set = await linuxSet();
+    await damage(set);
+    await expect(verifyLinuxRemoteDesktopWorkerArtifactSet(set.root, VERSION)).rejects.toThrow(message);
+  });
+
+  it('an extra entry beside the two files is not served and does not fail the gate', async () => {
+    const set = await linuxSet();
+    await mkdir(join(set.platformDir, 'aidesk-ui'));
+    await writeFile(join(set.platformDir, 'stray'), 'x');
+    await expect(verifyLinuxRemoteDesktopWorkerArtifactSet(set.root, VERSION)).resolves.toMatchObject({ sha256: digest(set.bytes) });
+  });
+
+  it('rejects a set built for another release, and a missing directory', async () => {
+    const set = await linuxSet({ version: '2026.10.5000-dev.1' });
+    await expect(verifyLinuxRemoteDesktopWorkerArtifactSet(set.root, VERSION)).rejects.toThrow(/version mismatch/);
+    const empty = await mkdtemp(join(tmpdir(), 'imcodes-linux-worker-gate-'));
+    dirs.push(empty);
+    await expect(verifyLinuxRemoteDesktopWorkerArtifactSet(empty, VERSION)).rejects.toThrow(/directory is missing/);
+  });
+
+  it('the command line verifies the Linux target too', async () => {
+    const set = await linuxSet();
+    const { execFile } = await import('node:child_process');
+    const run = (version: string) => new Promise<{ code: number; stdout: string; stderr: string }>((resolve) => {
+      execFile(process.execPath, ['scripts/remote-desktop-worker-artifacts.mjs', 'verify', set.root, version, 'linux', 'x64'], (error, stdout, stderr) => {
+        resolve({ code: error ? (error as NodeJS.ErrnoException & { code?: number }).code as number ?? 1 : 0, stdout, stderr });
+      });
+    });
+    expect((await run(VERSION)).code).toBe(0);
+    const bad = await run('2026.1.1');
+    expect(bad.code).not.toBe(0);
+    expect(bad.stderr).toMatch(/version mismatch/);
   });
 });

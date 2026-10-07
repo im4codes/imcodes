@@ -350,6 +350,12 @@ export interface ControlledNodeRuntimeOptions {
   onAuthenticationError?: (error: unknown) => void;
   /** Called for every authenticated server heartbeat acknowledgement. */
   onHeartbeatAck?: () => void | Promise<void>;
+  /**
+   * Called whenever the connection machinery does something: a connection attempt, an opened socket, a failure, a
+   * scheduled retry. It is the node's proof of life while the server cannot be reached (see
+   * CONTROLLED_NODE_LIVENESS_*): an outage keeps producing these, a wedged process does not.
+   */
+  onConnectionActivity?: () => void;
   /** Reads one durable failed Windows one-shot upgrade after rollback. */
   readPreviousUpgradeFailure?: () => Promise<{ targetVersion: string; reason?: string } | null>;
   /**
@@ -1545,6 +1551,7 @@ export function createControlledNodeRuntime(
     heartbeatMs: 5_000,
     silenceTimeoutMs: 30_000,
     onDiagnostic: (event) => {
+      options.onConnectionActivity?.();
       if (event.type === 'socket_opened') {
         logger.info({ lifecycle: event.type }, 'controlled-node transport connected');
         // The auth frame is sent synchronously by AuthenticatedWebSocketClient
@@ -1564,6 +1571,7 @@ export function createControlledNodeRuntime(
       }
     },
     createSocket: (url) => {
+      options.onConnectionActivity?.();
       // Auth is connection-generation scoped. Re-sample immediately before
       // each socket so a readiness downgrade cannot reconnect as stale Control.
       refreshRemoteDesktopCapabilityState();

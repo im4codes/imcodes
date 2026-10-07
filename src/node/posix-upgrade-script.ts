@@ -9,8 +9,14 @@ import {
   CONTROLLED_NODE_WINDOWS_UPGRADE_PREFLIGHT_FAILED,
   CONTROLLED_NODE_WINDOWS_UPGRADE_PRODUCT,
 } from '../../shared/controlled-node-service.js';
-import { REMOTE_DESKTOP_LINUX_WORKER_FILENAME } from '../../shared/remote-desktop-worker.js';
+import {
+  REMOTE_DESKTOP_LINUX_WORKER_FILENAME,
+  REMOTE_DESKTOP_LINUX_WORKER_PLATFORM_DIR,
+  REMOTE_DESKTOP_WORKER_MANIFEST_SUFFIX,
+  REMOTE_DESKTOP_WORKER_SIDECAR_DIR,
+} from '../../shared/remote-desktop-worker.js';
 import { CONTROLLED_NODE_HEALTH_LEASE_FILE } from './health-lease.js';
+import { CONTROLLED_NODE_LIVENESS_LEASE_FILE } from '../../shared/controlled-node-service.js';
 import { LINUX_UNIT_PATH, MACOS_PLIST_PATH, MACOS_WATCHDOG_PLIST_PATH } from './installer.js';
 import { posixUpgradeHealthWaitScript, posixUpgradePrimitivesScript } from './upgrade-health-script.js';
 
@@ -76,8 +82,10 @@ export function buildPosixControlledNodeUpgradeScript(input: PosixControlledNode
   const installDir = dirname(input.destinationJournalPath ?? input.destinationPath);
   const resultPath = join(installDir, CONTROLLED_NODE_UPGRADE_RESULT_FILE);
   const leasePath = join(installDir, CONTROLLED_NODE_HEALTH_LEASE_FILE);
+  const livenessPath = join(installDir, CONTROLLED_NODE_LIVENESS_LEASE_FILE);
   const helperDir = join(dirname(input.destinationPath), 'computer-use-helper');
-  const workerRoot = join(dirname(input.destinationPath), 'remote-desktop-worker');
+  const workerRoot = join(dirname(input.destinationPath), REMOTE_DESKTOP_WORKER_SIDECAR_DIR)
+  const stagedWorkerRelative = `${REMOTE_DESKTOP_LINUX_WORKER_PLATFORM_DIR}/${REMOTE_DESKTOP_LINUX_WORKER_FILENAME}`;
   const helperChmod = input.platform === 'darwin'
     ? `find "$IMCODES_HELPER_NEW" -type f -name 'open-computer-use.app.zip' -exec chmod 644 {} \\; 2>/dev/null`
     : `find "$IMCODES_HELPER_NEW" -type f -name 'open-computer-use' -exec chmod 755 {} \\; 2>/dev/null`;
@@ -134,6 +142,7 @@ export function buildPosixControlledNodeUpgradeScript(input: PosixControlledNode
     `IMCODES_BACKUP_MANIFEST=${shQuote(`${input.destinationManifestPath}${backup}`)}`,
     `IMCODES_RESULT=${shQuote(resultPath)}`,
     `IMCODES_LEASE=${shQuote(leasePath)}`,
+    `IMCODES_LIVENESS=${shQuote(livenessPath)}`,
     `IMCODES_TARGET_VERSION=${shQuote(input.targetVersion ?? '')}`,
     `IMCODES_ARTIFACT_SHA=${shQuote(input.artifactSha256 ?? '')}`,
     `IMCODES_LEGACY_SURVIVAL_MS=${input.platform === 'linux' ? CONTROLLED_NODE_LINUX_WATCHDOG_SURVIVAL_MS : 0}`,
@@ -234,7 +243,9 @@ export function buildPosixControlledNodeUpgradeScript(input: PosixControlledNode
     ...(input.stagedRemoteDesktopWorkerDir ? [
       `  mkdir -p "$IMCODES_WORKER_NEW" && cp -R ${shQuote(`${input.stagedRemoteDesktopWorkerDir}/.`)} "$IMCODES_WORKER_NEW/" || { IMCODES_FAILURE='staged remote desktop worker could not be copied'; return 1; }`,
       `  find "$IMCODES_WORKER_NEW" -type f -name '${REMOTE_DESKTOP_LINUX_WORKER_FILENAME}' -exec chmod 755 {} \\; 2>/dev/null || { IMCODES_FAILURE='staged remote desktop worker is not executable'; return 1; }`,
-      `  [ -f "$IMCODES_WORKER_NEW/${REMOTE_DESKTOP_LINUX_WORKER_FILENAME}" ] || { IMCODES_FAILURE='staged remote desktop worker artifact set is incomplete'; return 1; }`,
+      // The staged directory is the sidecar ROOT (it is swapped in as one directory): the worker and its manifest are one
+      // platform directory below it, exactly where the installed node looks. Checking the root itself failed every upgrade.
+      `  [ -f "$IMCODES_WORKER_NEW/${stagedWorkerRelative}" ] && [ -f "$IMCODES_WORKER_NEW/${stagedWorkerRelative}${REMOTE_DESKTOP_WORKER_MANIFEST_SUFFIX}" ] || { IMCODES_FAILURE='staged remote desktop worker artifact set is incomplete'; return 1; }`,
     ] : []),
     ...(hasJournal ? [
       `  cp -f "$IMCODES_SRC_JOURNAL" "$IMCODES_JOURNAL_NEW" 2>/dev/null || { IMCODES_FAILURE='staged install journal could not be copied'; return 1; }`,
@@ -414,7 +425,10 @@ export function buildPosixControlledNodeUpgradeScript(input: PosixControlledNode
     `  imcodes_defs_snapshot`,
     `  imcodes_service_stop`,
     `  if ! imcodes_install; then imcodes_rollback; return 1; fi`,
-    `  rm -f -- "$IMCODES_LEASE" 2>/dev/null`,
+    // Both signals of the previous generation go: a target that publishes the liveness lease feeds the watchdog without
+    // being authenticated, so the survival rule (a lease-less target that outlived the watchdog was acknowledged) must
+    // be able to tell such a target from a legacy one by the file it writes itself.
+    `  rm -f -- "$IMCODES_LEASE" "$IMCODES_LIVENESS" 2>/dev/null`,
     `  IMCODES_STARTED_AT_MS=$(imcodes_wall_ms)`,
     `  IMCODES_PHASE=restart_health`,
     `  if ! imcodes_service_start; then IMCODES_FAILURE='controlled node service could not be started'; imcodes_rollback; return 1; fi`,

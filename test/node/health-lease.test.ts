@@ -3,12 +3,16 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
+  CONTROLLED_NODE_LIVENESS_ACTIVITY_WINDOW_MS,
+  CONTROLLED_NODE_UNREACHABLE_WARN_AFTER_MS,
+} from '../../shared/controlled-node-service.js';
+import {
   CONTROLLED_NODE_HEALTH_LEASE_VERSION,
   controlledNodeHealthLeasePath,
   controlledNodeHealthWatchdogStatePath,
   createControlledNodeHealthLeasePublisher,
-  createLinuxControlledNodeHealthPublisher,
-  createSystemdWatchdogNotifier,
+  controlledNodeLivenessLeasePath,
+  createControlledNodeLivenessPublisher,
   runMacosControlledNodeHealthWatchdog,
   waitForControlledNodeOnlineLease,
   writeControlledNodeHealthLease,
@@ -201,60 +205,144 @@ describe('controlled-node authenticated health lease', () => {
     expect(restartService).toHaveBeenCalledOnce();
   });
 
-  it('notifies systemd only from throttled authenticated heartbeat acknowledgements', async () => {
-    let now = 50_000;
-    const notify = vi.fn(async () => {});
-    const notifier = createSystemdWatchdogNotifier({
-      now: () => now,
-      pid: 4242,
-      intervalMs: 15_000,
-      notify,
-    });
+  it('judges a macOS node by its liveness lease: a long-stale authenticated lease does not restart a node that is still retrying', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'imcodes-node-health-'));
+    temporaryDirs.push(dir);
+    const journalPath = join(dir, 'install-journal.json');
+    await writeControlledNodeHealthLease(controlledNodeHealthLeasePath(journalPath), 1_000, 55);
+    await writeControlledNodeHealthLease(controlledNodeLivenessLeasePath(journalPath), 999_000, 55);
+    const restartService = vi.fn();
+    await expect(runMacosControlledNodeHealthWatchdog({
+      journalPath, now: () => 1_000_000, processExists: () => true, restartService,
+    })).resolves.toEqual({ healthy: true, restarted: false, reason: 'healthy' });
+    expect(restartService).not.toHaveBeenCalled();
+  });
 
-    notifier.recordAuthenticatedHeartbeat();
-    notifier.recordAuthenticatedHeartbeat();
-    await notifier.flush();
-    expect(notify).toHaveBeenCalledOnce();
-    expect(notify).toHaveBeenCalledWith(4242);
+  it('still restarts a live macOS process when neither lease is fresh (the process is stuck, not offline)', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'imcodes-node-health-'));
+    temporaryDirs.push(dir);
+    const journalPath = join(dir, 'install-journal.json');
+    await writeControlledNodeHealthLease(controlledNodeHealthLeasePath(journalPath), 1_000, 55);
+    await writeControlledNodeHealthLease(controlledNodeLivenessLeasePath(journalPath), 700_000, 55);
+    const restartService = vi.fn();
+    await expect(runMacosControlledNodeHealthWatchdog({
+      journalPath, now: () => 1_000_000, processExists: () => true, restartService,
+    })).resolves.toEqual({ healthy: false, restarted: true, reason: 'lease_stale' });
+    expect(restartService).toHaveBeenCalledOnce();
+  });
 
-    now += 15_000;
-    notifier.recordAuthenticatedHeartbeat();
-    await notifier.flush();
-    expect(notify).toHaveBeenCalledTimes(2);
+  it('a node that predates the liveness lease is still judged by its authenticated lease', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'imcodes-node-health-'));
+    temporaryDirs.push(dir);
+    const journalPath = join(dir, 'install-journal.json');
+    await writeControlledNodeHealthLease(controlledNodeHealthLeasePath(journalPath), 999_000, 66);
+    const restartService = vi.fn();
+    await expect(runMacosControlledNodeHealthWatchdog({
+      journalPath, now: () => 1_000_000, processExists: (pid) => pid === 66, restartService,
+    })).resolves.toEqual({ healthy: true, restarted: false, reason: 'healthy' });
   });
 });
 
-describe('Linux health publisher', () => {
-  it('feeds the systemd watchdog AND publishes the lease the self-upgrade health wait reads', async () => {
-    const dir = await mkdtemp(join(tmpdir(), 'imcodes-node-linux-health-'));
-    temporaryDirs.push(dir);
-    const leasePath = controlledNodeHealthLeasePath(join(dir, 'install-journal.json'));
+describe('controlled-node liveness (the process is alive and working, whether or not the server answers)', () => {
+  function rig(extra: Partial<Parameters<typeof createControlledNodeLivenessPublisher>[0]> = {}) {
+    let mono = 0;
+    let wall = 1_700_000_000_000;
+    const written: Array<{ path: string; at: number; pid: number }> = [];
     const notify = vi.fn(async () => {});
-    const publisher = createLinuxControlledNodeHealthPublisher(leasePath, {
-      watchdog: createSystemdWatchdogNotifier({ pid: 777, notify }),
-      lease: createControlledNodeHealthLeasePublisher(leasePath, { pid: 777, now: () => 123_456 }),
+    const publisher = createControlledNodeLivenessPublisher({
+      path: 'liveness.json',
+      pid: 4242,
+      notifyWatchdog: notify,
+      now: () => wall,
+      monotonicNow: () => mono,
+      writeLease: async (path, at, pid) => { written.push({ path, at, pid }); },
+      ...extra,
     });
-    publisher.recordAuthenticatedHeartbeat();
-    await publisher.flush();
-    expect(notify).toHaveBeenCalledWith(777);
-    expect(JSON.parse(await readFile(leasePath, 'utf8'))).toEqual({
-      version: CONTROLLED_NODE_HEALTH_LEASE_VERSION, pid: 777, updatedAt: 123_456,
-    });
+    return { publisher, written, notify, advance: (ms: number) => { mono += ms; wall += ms; } };
+  }
+
+  it('keeps feeding the watchdog and the lease for as long as the node keeps trying to reach an unreachable server', async () => {
+    const { publisher, written, notify, advance } = rig();
+    // 3 hours of a server that never answers: a connection attempt / failure / retry about every 25 s, never an ack.
+    for (let elapsed = 0; elapsed < 3 * 3_600_000; elapsed += 15_000) {
+      advance(15_000);
+      if (elapsed % 25_000 < 15_000) publisher.recordConnectionActivity();
+      await publisher.tick();
+    }
+    expect(written.length).toBeGreaterThan(700);
+    expect(notify.mock.calls.length).toBe(written.length);
+    expect(notify).toHaveBeenCalledWith(4242);
   });
 
-  it('a failing lease write never stops the watchdog pulse (and is reported)', async () => {
-    const notify = vi.fn(async () => {});
-    const onError = vi.fn();
-    const publisher = createLinuxControlledNodeHealthPublisher('unused', {
-      onError,
-      watchdog: createSystemdWatchdogNotifier({ pid: 1, notify }),
-      lease: createControlledNodeHealthLeasePublisher('unused', {
-        writeLease: async () => { throw new Error('disk full'); }, onError,
-      }),
-    });
+  it('stops feeding when the connection machinery has been silent for longer than the activity window, so a wedged process is still restarted', async () => {
+    const { publisher, written, notify, advance } = rig();
     publisher.recordAuthenticatedHeartbeat();
-    await publisher.flush();
+    advance(CONTROLLED_NODE_LIVENESS_ACTIVITY_WINDOW_MS);
+    await publisher.tick();
+    expect(written).toHaveLength(1);
+    advance(1);
+    await publisher.tick();
+    await publisher.tick();
+    expect(written).toHaveLength(1);
+    expect(notify).toHaveBeenCalledTimes(1);
+    // any sign of life resumes it
+    publisher.recordConnectionActivity();
+    await publisher.tick();
+    expect(written).toHaveLength(2);
+  });
+
+  it('counts the start of the process as activity: a node that has just started is fed before it connects', async () => {
+    const { publisher, written, advance } = rig();
+    advance(20_000);
+    await publisher.tick();
+    expect(written).toHaveLength(1);
+    expect(written[0]).toMatchObject({ path: 'liveness.json', pid: 4242 });
+  });
+
+  it('a failing lease write never stops the watchdog pulse, nor the other way round (both are reported)', async () => {
+    const onError = vi.fn();
+    const { publisher, notify } = rig({
+      writeLease: async () => { throw new Error('disk full'); },
+      onError,
+    });
+    await publisher.tick();
     expect(notify).toHaveBeenCalledOnce();
     expect(onError).toHaveBeenCalledOnce();
+    const second = rig({ notifyWatchdog: async () => { throw new Error('no systemd'); }, onError });
+    await second.publisher.tick();
+    expect(second.written).toHaveLength(1);
+    expect(onError).toHaveBeenCalledTimes(2);
+  });
+
+  it('says in the log that the server has not acknowledged the node, at most once per repeat interval, without restarting anything', async () => {
+    const onUnreachable = vi.fn();
+    const { publisher, advance, notify } = rig({ onUnreachable });
+    for (let elapsed = 0; elapsed < 2 * 3_600_000; elapsed += 15_000) {
+      advance(15_000);
+      publisher.recordConnectionActivity();
+      await publisher.tick();
+    }
+    // first warning once 5 min passed, then every 30 min: 5, 35, 65, 95 min
+    expect(onUnreachable).toHaveBeenCalledTimes(4);
+    expect(onUnreachable.mock.calls[0]![0]).toBeGreaterThanOrEqual(CONTROLLED_NODE_UNREACHABLE_WARN_AFTER_MS);
+    expect(notify.mock.calls.length).toBeGreaterThan(400);
+    // an ack resets the clock
+    publisher.recordAuthenticatedHeartbeat();
+    onUnreachable.mockClear();
+    advance(60_000);
+    publisher.recordConnectionActivity();
+    await publisher.tick();
+    expect(onUnreachable).not.toHaveBeenCalled();
+  });
+
+  it('writes the lease file for real, bound to the exact process', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'imcodes-node-liveness-'));
+    temporaryDirs.push(dir);
+    const path = controlledNodeLivenessLeasePath(join(dir, 'install-journal.json'));
+    const publisher = createControlledNodeLivenessPublisher({ path, pid: 31337, now: () => 123_456 });
+    await publisher.tick();
+    expect(JSON.parse(await readFile(path, 'utf8'))).toEqual({
+      version: CONTROLLED_NODE_HEALTH_LEASE_VERSION, pid: 31337, updatedAt: 123_456,
+    });
   });
 });

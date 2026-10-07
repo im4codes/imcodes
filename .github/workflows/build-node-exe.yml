@@ -271,25 +271,9 @@ jobs:
           rm -rf "$download" "$sdk"
       - name: Verify the Linux remote-desktop worker artifact
         if: runner.os == 'Linux'
-        run: |
-          set -euo pipefail
-          ARTIFACT="dist-node-exe/remote-desktop-worker/linux-x64/imcodes-linux-remote-desktop-worker"
-          MANIFEST="$ARTIFACT.manifest.json"
-          [ -f "$ARTIFACT" ] || { echo "missing $ARTIFACT" >&2; exit 1; }
-          [ -x "$ARTIFACT" ] || { echo "$ARTIFACT is not executable" >&2; exit 1; }
-          [ -f "$MANIFEST" ] || { echo "missing $MANIFEST" >&2; exit 1; }
-          node -e "
-            const fs = require('node:fs');
-            const crypto = require('node:crypto');
-            const manifest = JSON.parse(fs.readFileSync('$MANIFEST', 'utf8'));
-            const bytes = fs.readFileSync('$ARTIFACT');
-            const sha256 = crypto.createHash('sha256').update(bytes).digest('hex');
-            if (manifest.artifact.fileName !== 'imcodes-linux-remote-desktop-worker') throw new Error('manifest fileName mismatch');
-            if (manifest.artifact.os !== 'linux' || manifest.artifact.arch !== 'x64') throw new Error('manifest os/arch mismatch');
-            if (manifest.artifact.size !== bytes.length) throw new Error('manifest size mismatch: ' + manifest.artifact.size + ' vs ' + bytes.length);
-            if (manifest.artifact.sha256 !== sha256) throw new Error('manifest sha256 mismatch');
-            console.log('Linux remote-desktop worker manifest matches artifact:', sha256);
-          "
+        # The full set check (worker + manifest, exact entries, executable bit, strict manifest, size, sha256, release version): the
+        # server serves the worker only with a matching manifest and a node's self-upgrade preflight fails without both.
+        run: node scripts/remote-desktop-worker-artifacts.mjs verify dist-node-exe "${{ env.IMCODES_BUILD_VERSION }}" linux x64
       - name: Resolve fixed libwebrtc SDK release
         if: runner.os == 'Windows'
         id: libwebrtc_sdk

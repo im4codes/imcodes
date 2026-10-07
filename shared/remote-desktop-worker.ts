@@ -72,6 +72,13 @@ export const REMOTE_DESKTOP_VIRTUAL_DISPLAY_MANIFEST_FILENAME = 'imcodes-virtual
 // Host resolves it at (src/node/linux-remote-desktop-worker-host.ts) both
 // derive from this rather than repeating the literal.
 export const REMOTE_DESKTOP_LINUX_WORKER_FILENAME = 'imcodes-linux-remote-desktop-worker' as const;
+// The directory the worker sidecar lives under next to the node executable, and
+// the platform directory below it. The installed layout, the staged layout a
+// self-upgrade copies, the layout the server serves from, and every check of
+// "is the staged set complete" derive from these -- a check that looked for the
+// worker one level too high stranded every Linux node on its current build.
+export const REMOTE_DESKTOP_WORKER_SIDECAR_DIR = 'remote-desktop-worker' as const;
+export const REMOTE_DESKTOP_LINUX_WORKER_PLATFORM_DIR = 'linux-x64' as const;
 export const REMOTE_DESKTOP_WORKER_HELLO_TYPE = 'remote_desktop.worker_hello' as const;
 // Last words of a worker that hit a structured exception. The worker writes one
 // bounded frame from its unhandled-exception filter and then terminates, so a

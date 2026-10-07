@@ -1127,25 +1127,9 @@ jobs:
           rm -rf "$sdk"
       - name: Verify the Linux remote-desktop worker artifact
         if: runner.os == 'Linux'
-        run: |
-          set -euo pipefail
-          ARTIFACT="dist-node-exe/remote-desktop-worker/linux-x64/imcodes-linux-remote-desktop-worker"
-          MANIFEST="$ARTIFACT.manifest.json"
-          [ -f "$ARTIFACT" ] || { echo "missing $ARTIFACT" >&2; exit 1; }
-          [ -x "$ARTIFACT" ] || { echo "$ARTIFACT is not executable" >&2; exit 1; }
-          [ -f "$MANIFEST" ] || { echo "missing $MANIFEST" >&2; exit 1; }
-          node -e "
-            const fs = require('node:fs');
-            const crypto = require('node:crypto');
-            const manifest = JSON.parse(fs.readFileSync('$MANIFEST', 'utf8'));
-            const bytes = fs.readFileSync('$ARTIFACT');
-            const sha256 = crypto.createHash('sha256').update(bytes).digest('hex');
-            if (manifest.artifact.fileName !== 'imcodes-linux-remote-desktop-worker') throw new Error('manifest fileName mismatch');
-            if (manifest.artifact.os !== 'linux' || manifest.artifact.arch !== 'x64') throw new Error('manifest os/arch mismatch');
-            if (manifest.artifact.size !== bytes.length) throw new Error('manifest size mismatch: ' + manifest.artifact.size + ' vs ' + bytes.length);
-            if (manifest.artifact.sha256 !== sha256) throw new Error('manifest sha256 mismatch');
-            console.log('Linux remote-desktop worker manifest matches artifact:', sha256);
-          "
+        # The full set check (worker + manifest, exact entries, executable bit, strict manifest, size, sha256, release version): the
+        # server serves the worker only with a matching manifest and a node's self-upgrade preflight fails without both.
+        run: node scripts/remote-desktop-worker-artifacts.mjs verify dist-node-exe "${{ env.IMCODES_BUILD_VERSION }}" linux x64
       - name: Resolve fixed libwebrtc SDK release
         if: runner.os == 'Windows'
         id: libwebrtc_sdk
@@ -1384,16 +1368,11 @@ jobs:
             node scripts/remote-desktop-worker-artifacts.mjs verify \
               server/controlled-node-artifacts "$IMCODES_BUILD_VERSION" darwin "$arch"
           done
-          # Same narrower gate as the post-build smoke test (see its own
-          # comment): remote-desktop-worker-artifacts.mjs has no linux
-          # schema yet, so this is presence+executable-bit rather than a
-          # full manifest verify -- checked here too, right after the chmod
-          # restore above, so a regression is caught in under a minute
-          # instead of the ~15 the smoke test takes to reach the same file.
-          LINUX_WORKER="server/controlled-node-artifacts/remote-desktop-worker/linux-x64/imcodes-linux-remote-desktop-worker"
-          [ -f "$LINUX_WORKER" ] || { echo "::error::missing $LINUX_WORKER after download-artifact" >&2; exit 1; }
-          [ -x "$LINUX_WORKER" ] || { echo "::error::$LINUX_WORKER is not executable after download-artifact" >&2; exit 1; }
-          echo "Linux remote-desktop worker present and executable on the runner: $LINUX_WORKER"
+          # The Linux worker is two files (the executable and its manifest); the server serves it only with a matching
+          # manifest and a node's self-upgrade preflight fails without both, so check the whole set here, right after the
+          # chmod restore above, instead of ~15 minutes later in the image smoke test.
+          node scripts/remote-desktop-worker-artifacts.mjs verify \
+            server/controlled-node-artifacts "$IMCODES_BUILD_VERSION" linux x64
 
       - name: Get build timestamp
         id: ts
@@ -1537,13 +1516,10 @@ jobs:
               scripts/remote-desktop-worker-artifacts.mjs verify \
               /app/controlled-node-executables "${{ needs.release_version.outputs.app_version }}" darwin "$arch"
           done
-          # Linux has no manifestVersion-2/component-set schema for
-          # remote-desktop-worker-artifacts.mjs to check yet, so this is a
-          # narrower presence+executable-bit gate rather than a full verify --
-          # still enough to catch the image shipping with no worker at all,
-          # which is the failure mode every check above exists to catch.
-          docker run --rm --entrypoint test imcodes-smoke:test \
-            -x /app/controlled-node-executables/remote-desktop-worker/linux-x64/imcodes-linux-remote-desktop-worker
+          # Linux: worker + manifest, exact entries, executable bit, strict manifest, size, sha256 and release version.
+          docker run --rm --entrypoint node imcodes-smoke:test \
+            scripts/remote-desktop-worker-artifacts.mjs verify \
+            /app/controlled-node-executables "${{ needs.release_version.outputs.app_version }}" linux x64
 
       - name: Build and push (cache hit — only pushes layers)
         id: build_push

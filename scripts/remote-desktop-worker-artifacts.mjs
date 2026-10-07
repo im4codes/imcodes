@@ -24,6 +24,9 @@ export const REMOTE_DESKTOP_MACOS_MANIFEST_FILENAME = 'imcodes-remote-desktop.ma
 export const REMOTE_DESKTOP_PROTOCOL_VERSION = 2;
 export const REMOTE_DESKTOP_WORKER_IPC_VERSION = 1;
 export const REMOTE_DESKTOP_MACOS_WORKER_FILENAME = 'imcodes-remote-desktop-worker';
+export const REMOTE_DESKTOP_LINUX_WORKER_FILENAME = 'imcodes-linux-remote-desktop-worker';
+export const REMOTE_DESKTOP_WORKER_SIDECAR_DIR = 'remote-desktop-worker';
+export const REMOTE_DESKTOP_LINUX_WORKER_PLATFORM_DIR = 'linux-x64';
 export const REMOTE_DESKTOP_MACOS_LAUNCH_AGENT_FILENAME = 'imcodes-remote-desktop-launch-agent';
 export const REMOTE_DESKTOP_MACOS_DISCLOSURE_FILENAME = 'imcodes-remote-desktop-disclosure';
 export const REMOTE_DESKTOP_MACOS_VIRTUAL_DISPLAY_HELPER_FILENAME = 'imcodes-virtual-display-helper';
@@ -372,6 +375,65 @@ export async function verifyRemoteDesktopWorkerArtifactSet(
   return { executablePath, componentPaths, manifestPath, archivePath, manifest };
 }
 
+/**
+ * The Linux worker is two files, the executable and its manifest, in remote-desktop-worker/linux-x64/ (the exact release version, size and sha256 included). The server serves
+ * the executable only together with a manifest that matches it (a missing or mismatching one answers "not published"),
+ * and a controlled-node self-upgrade fails its preflight without both, so a release that lacks either must fail HERE, at
+ * build time, not on every Linux node in the field. This is the full check -- both files present and regular, the
+ * executable bit, the strict manifest shape, size, sha256 and (when given) the release version -- used on the build
+ * runner, on the downloaded artifact and on the final image.
+ */
+export async function verifyLinuxRemoteDesktopWorkerArtifactSet(directory, expectedVersion) {
+  const platformDirectory = join(directory, REMOTE_DESKTOP_WORKER_SIDECAR_DIR, REMOTE_DESKTOP_LINUX_WORKER_PLATFORM_DIR);
+  const manifestName = `${REMOTE_DESKTOP_LINUX_WORKER_FILENAME}${REMOTE_DESKTOP_WORKER_MANIFEST_SUFFIX}`;
+  const executablePath = join(platformDirectory, REMOTE_DESKTOP_LINUX_WORKER_FILENAME);
+  const manifestPath = join(platformDirectory, manifestName);
+  let entries;
+  try {
+    entries = await readdir(platformDirectory, { withFileTypes: true });
+  } catch {
+    throw new Error(`linux remote desktop worker directory is missing: ${platformDirectory}`);
+  }
+  const names = new Set(entries.map((entry) => entry.name));
+  for (const required of [REMOTE_DESKTOP_LINUX_WORKER_FILENAME, manifestName]) {
+    if (!names.has(required)) throw new Error(`linux remote desktop worker artifact set is incomplete: missing ${required}`);
+  }
+  // Other entries (the build may put its own subdirectory beside them) are not served and do not fail the gate; the two
+  // names the server and a node's preflight depend on must be plain files.
+  if (entries.some((entry) => (entry.name === REMOTE_DESKTOP_LINUX_WORKER_FILENAME || entry.name === manifestName) && !entry.isFile())) {
+    throw new Error('linux remote desktop worker artifact set contains a non-regular file');
+  }
+  const [executableStat, manifestStat] = await Promise.all([lstat(executablePath), lstat(manifestPath)]);
+  if (executableStat.isSymbolicLink() || manifestStat.isSymbolicLink()) {
+    throw new Error('linux remote desktop worker artifact set contains a non-regular file');
+  }
+  if ((executableStat.mode & 0o111) === 0) throw new Error('linux remote desktop worker is not executable');
+  const manifest = JSON.parse(await readFile(manifestPath, 'utf8'));
+  if (!isRecord(manifest) || !exactKeys(manifest, ['schemaVersion', 'artifact', 'build'])
+    || manifest.schemaVersion !== 1
+    || !isRecord(manifest.artifact) || !exactKeys(manifest.artifact, ['fileName', 'os', 'arch', 'size', 'sha256'])
+    || manifest.artifact.fileName !== REMOTE_DESKTOP_LINUX_WORKER_FILENAME
+    || manifest.artifact.os !== 'linux' || manifest.artifact.arch !== 'x64'
+    || !Number.isSafeInteger(manifest.artifact.size) || manifest.artifact.size <= 0
+    || typeof manifest.artifact.sha256 !== 'string' || !SHA256_RE.test(manifest.artifact.sha256)
+    || !isRecord(manifest.build) || !exactKeys(manifest.build, ['source', 'version'])
+    || typeof manifest.build.source !== 'string' || manifest.build.source.length === 0
+    || typeof manifest.build.version !== 'string' || !VERSION_RE.test(manifest.build.version)) {
+    throw new Error('invalid linux remote desktop worker manifest');
+  }
+  if (expectedVersion !== undefined && manifest.build.version !== expectedVersion) {
+    throw new Error(`linux remote desktop worker version mismatch: expected ${expectedVersion}, got ${manifest.build.version}`);
+  }
+  if (manifest.artifact.size !== executableStat.size) {
+    throw new Error(`linux remote desktop worker size mismatch: expected ${manifest.artifact.size}, got ${executableStat.size}`);
+  }
+  const actualSha256 = await sha256File(executablePath);
+  if (actualSha256 !== manifest.artifact.sha256) {
+    throw new Error(`linux remote desktop worker sha256 mismatch: expected ${manifest.artifact.sha256}, got ${actualSha256}`);
+  }
+  return { executablePath, manifestPath, manifest, sha256: actualSha256 };
+}
+
 async function main() {
   const [, , command, directory, expectedVersion, os, arch] = process.argv;
   if (command !== 'verify' || !directory) {
@@ -379,6 +441,12 @@ async function main() {
   }
   if ((os === undefined) !== (arch === undefined)) {
     throw new Error('remote desktop worker artifact target requires both os and arch');
+  }
+  if (os === 'linux') {
+    if (arch !== 'x64') throw new Error('remote desktop worker artifact target linux requires arch x64');
+    const linux = await verifyLinuxRemoteDesktopWorkerArtifactSet(directory, expectedVersion);
+    process.stdout.write(`verified ${linux.executablePath} (${linux.sha256})\n`);
+    return;
   }
   const target = os === undefined ? WINDOWS_TARGET : { os, arch };
   const result = await verifyRemoteDesktopWorkerArtifactSet(directory, expectedVersion, target);
