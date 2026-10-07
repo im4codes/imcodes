@@ -125,9 +125,9 @@ export function isComplexSupervisionTaskBrief(brief: string | undefined): boolea
 }
 /** Every task entry point must carry a short title in the owner's UI locale. */
 export const TASK_PAIR_TITLE_RULE =
-  'TITLE RULE (required): every DISPATCH, QUEUE, and task-bound send_message '
-  + 'that creates a task MUST include title="<short specific title>" in the '
-  + 'owner\'s UI language (example: QUEUE tsk_demo title="Fix login retry"). '
+  'TITLE RULE (required): every pair_create, and every task-bound send_message '
+  + 'that creates a task, MUST include title="<short specific title>" in the '
+  + 'owner\'s UI language (example: pair_create title="Fix login retry"). '
   + 'Do not use a raw taskId, "Brain: …", or a copied message prefix; the '
   + 'daemon supplies a neutral localized placeholder and asks the project '
   + 'Brain for the final title asynchronously when omitted. On the pairs '
@@ -135,9 +135,9 @@ export const TASK_PAIR_TITLE_RULE =
   + 'task-bound send_message is continuation-only and cannot mint a pair.';
 /** Lifecycle semantics for title reminders sent as marker examples. */
 export const TASK_PAIR_TITLE_MARKER_RULE =
-  'A Brain DISPATCH with only title="..." is a metadata-only title update: '
+  'A Brain title update (pair_task_update with taskId and title) is a metadata-only update: '
   + 'it never reopens, requeues, or wakes an existing pair, including a '
-  + 'cancelled or done pair. A DISPATCH with lifecycle attributes cannot '
+  + 'cancelled or done pair. No lifecycle change can '
   + 'revive a cancelled or done pair; use a new taskId instead.';
 /**
  * Terminology (owner rule): a "sub-session", "sub-agent" or "agent" the user asks to create is ALWAYS an IM.codes sub-session. The long
@@ -150,7 +150,7 @@ export const TASK_PAIR_SUBSESSION_TERM_SHORT = '"Sub-session"/"sub-agent" means 
 /** Brain/provider-native boundary: routing authority lives in IM.codes pairs, not provider sub-agents. */
 export const TASK_PAIR_NATIVE_COLLABORATION_RULE =
   'Brain must never dispatch or perform pair/task work (implementation, repair, audit, PASS/REWORK, merges) through provider-native (built-in) sub-agents. '
-  + 'Dispatch it only through IM.codes sub-sessions and pair markers (pair_create, DISPATCH/QUEUE). Built-in sub-agents are only for read-only research and analysis. '
+  + 'Dispatch it only through IM.codes sub-sessions and pair MCP tools (pair_create, pair_dispatch). Built-in sub-agents are only for read-only research and analysis. '
   + TASK_PAIR_SUBSESSION_TERMINOLOGY;
 /** Automation kind stamped on daemon-authored pair messages. */
 export const TASK_PAIR_AUTOMATION_KIND = 'task-pair' as const;
@@ -474,7 +474,7 @@ export const TASK_PAIR_BRAIN_REPORTING_RULE: string =
 export const TASK_PAIR_ANALYZE_BEFORE_DISPATCH_RULE: string =
   'Direction before dispatch: Brain (usually the stronger model) owns '
   + 'analysis and decisions; the pair does the legwork and the verification. '
-  + 'Before a DISPATCH, Brain does only a QUICK analysis (read the actual '
+  + 'Before dispatching, Brain does only a QUICK analysis (read the actual '
   + 'failure, locate the likely code path, test a cheap hypothesis) and gives '
   + 'the pair a DIRECTION: what is proven, what is suspected, and what to find '
   + 'out. Executor and auditor gather the evidence along that direction and '
@@ -523,7 +523,7 @@ export const TASK_PAIR_EXECUTION_DISCIPLINE_RULE: string =
  * environments, unbounded acceptance and redundant merge verification.
  */
 export const TASK_PAIR_BRIEF_STRUCTURE_RULE: string =
-  'Brief structure (Brain): every DISPATCH brief states, in this order: Goal '
+  'Brief structure (Brain): every pair brief (pair_create) states, in this order: Goal '
   + '(the user-visible outcome, quoting the request); Proven (facts already '
   + 'verified, with evidence); Suspected (hypotheses to confirm or refute); '
   + 'Direction; Acceptance (numbered, checkable items); Boundary checks '
@@ -585,8 +585,8 @@ export const TASK_PAIR_NEXT_ROUND_RULE: string =
   'Multi-round delivery: split a task into rounds when each round is a '
   + 'separately auditable, mergeable deliverable (the first PASS can be '
   + 'integrated before the next round starts). Only Brain opens the next '
-  + 'round, on a PASSED pair that is not yet DONE: NEXT_ROUND <taskId> '
-  + '[base=<commit>] [note="what round N delivers"]. The pair returns to '
+  + 'round, on a PASSED pair that is not yet closed: pair_next_round '
+  + '(taskId, optional base=<commit>, optional note="what round N delivers"). The pair returns to '
   + 'working with the same workspace, executor and auditor; the delivery '
   + 'round number goes up. base defaults to the previous round\'s PASSed '
   + 'head; name base=<commit> (typically the dev tip that already contains '
@@ -596,11 +596,11 @@ export const TASK_PAIR_NEXT_ROUND_RULE: string =
   + 'base is rejected, and a head that does not descend from it is sent '
   + 'back); the auditor\'s PASS/REWORK then applies to that round only. '
   + 'An executor whose brief names further rounds reports the PASSed head to '
-  + 'Brain and waits for NEXT_ROUND instead of writing DONE. '
-  + 'Do not DONE a pair you still intend to continue: a DONE or CANCELled '
+  + 'Brain and waits for Brain\'s pair_next_round instead of writing DONE. '
+  + 'Do not close (DONE) a pair you still intend to continue: a DONE or CANCELled '
   + 'pair cannot open another round (use a new taskId), and nobody but '
-  + 'Brain may write NEXT_ROUND. Update the brief (pair_task_update) with '
-  + 'the new round\'s items before or with NEXT_ROUND.';
+  + 'Brain may open one. Update the brief (pair_task_update) with '
+  + 'the new round\'s items before or with pair_next_round.';
 
 /**
  * From the 2-hourly stall review: most READYs bounced within minutes for
@@ -710,6 +710,42 @@ export const TASK_PAIR_INTEGRATION_RULE: string =
   + 'Keep evidence, logs and scratch files out of the product commits Brain '
   + 'merges: leave them untracked in the workspace or put them in a separate '
   + 'commit whose subject starts with "evidence:".';
+
+/**
+ * Brain closes what it has dealt with. A pair left open keeps producing reminders (awaiting a decision, finished but
+ * not integrated, workspace kept) long after Brain decided, which is where the stale reminders come from. The contract
+ * states the rule and the exact way to close for each outcome; every reminder to Brain ends with the short form.
+ */
+export const TASK_PAIR_BRAIN_CLOSE_RULE: string =
+  'Brain: when you have dealt with a pair -- whatever the outcome (merged, decided not to merge, cancelled, its conclusion adopted) -- you MUST close it yourself. '
+  + 'The daemon keeps reminding you about every pair you leave open (awaiting your decision, finished but not integrated, workspace kept), and that is where stale reminders come from. '
+  + 'How to close, with the MCP tools only: merged or result accepted -> pair_close action=done; not going to merge -> pair_close action=done integration=dismiss; '
+  + 'abandoned -> pair_close action=cancel; more work wanted -> pair_next_round.';
+
+/** The last sentence of every reminder to Brain about an open pair (decision pending, finished but unintegrated, workspace kept). */
+export const TASK_PAIR_BRAIN_CLOSE_REMINDER: string =
+  'Once you have dealt with it, close it yourself with the MCP tools or this reminder keeps coming: merged -> pair_close action=done; not merging -> pair_close action=done integration=dismiss; abandoned -> pair_close action=cancel; more work -> pair_next_round.';
+
+/** One sentence for the Brain-facing MCP tool descriptions (pair_create / pair_close / pair_verdict / pair_next_round). */
+export const TASK_PAIR_BRAIN_CLOSE_TOOL_NOTE: string =
+  'Brain must close every pair it has dealt with (merged or accepted: pair_close action=done; not merging: action=done with integration=dismiss; abandoned: action=cancel; more work: pair_next_round) -- an open pair keeps generating reminders.';
+
+/** The short form for tool descriptions with a tight byte budget (pair_close carries the full note). */
+export const TASK_PAIR_BRAIN_CLOSE_TOOL_SHORT_NOTE: string = 'Close each handled pair yourself with pair_close.';
+
+/**
+ * Brain drives pairs with the MCP tools only. The daemon still PARSES a legacy IMCODES_TASK marker from a Brain (existing
+ * sessions keep working) but no Brain-facing text teaches or recommends one.
+ */
+export const TASK_PAIR_BRAIN_MCP_ONLY_RULE: string =
+  'Brain: close and advance pairs ONLY with the MCP tools; do not write IMCODES_TASK markers yourself (the daemon still parses a legacy marker for compatibility, but it is no longer taught or encouraged for Brain). '
+  + 'pair_create (with title) creates new work, then pair_dispatch if the result is queued; pair_reassign replaces the executor or auditor (or their models); pair_close (action=done, action=cancel) closes; '
+  + 'pair_next_round opens the next round of a passed pair; pair_task_update / pair_task_check edit the brief and its boxes; pair_set_max_concurrency sets your queue limit; pair_resource_claim claims a shared resource. '
+  + 'Never use send_message task metadata to create a pair. pair_dispatch auto-queues an existing pair when capacity is unavailable, so there is no need to defer work yourself. '
+  + 'A finished pair whose commits are not yet on any branch of the repository is reminded to you (one digest, then every 10-15 min; cherry-picked equivalents count as merged), and pair_close action=done integration=dismiss (or action=cancel) stops the reminders for one you will not merge. '
+  + 'pair_close action=done force=true (or accept=true) accepts/ends from any state and marks an audited unpassed pair unaudited; action=cancel ends from any state. '
+  + 'No-auditor DONE reports are open and hold their concurrency slot until you decide with pair_close (done or cancel); more work can return them to working. '
+  + 'Naming executor/auditor (pair_create, pair_reassign) replaces the current holder of that role immediately, ignoring the execution pool role config; executorModel/auditorModel steers the next automatic pick but does not replace a current role; a project with no execution pool configured must name the role models or sessions explicitly.';
 
 /**
  * Stated in the Brain contract for a project not enabled for pairs (owner
@@ -2417,9 +2453,10 @@ export function buildTaskPairMarkerContract(): string {
     'Supervised tasks are executor+auditor pairs driven by one-line markers you write on their own line in your reply (never inside code fences):',
     `<!-- ${TASK_PAIR_MARKER_TAG} <VERB> <taskId> [key=value | key="quoted value"] -->`,
     `A marker must be in your FINAL reply of the turn: only the last text segment is scanned, so one written before an earlier tool call in the same turn is silently lost. If you need to call a tool first, finish acting, then write the marker(s) in your closing reply. A long brief goes between QUEUE <taskId> ... and its <!-- ${TASK_PAIR_BRIEF_END_TAG} <taskId> --> line, not scattered across earlier turn text.`,
-    'Verbs: DISPATCH, QUEUE, STARTED, WORKING, READY_FOR_AUDIT, PASS, REWORK, DONE, BLOCKED, NEEDS_INPUT, REASSIGN, CANCEL, CLAIM, CHECK, NEXT_ROUND. CLAIM <taskId> resource=... mode=exclusive|shared ttl=... [renew=true] claims a shared external resource. CHECK <taskId> box=implemented|audited items=1,2,5|all [checked=false] updates numbered brief boxes; executor may update implemented, auditor audited, Brain either. taskId "-" means your single open task.',
-    'Executor: write STARTED once when you begin (never again on later turns; progress needs no marker) and work in the pair\'s workspace (below). When done, send the auditor your validation (full suites for code) with send_message and write READY_FOR_AUDIT naming material; the daemon relays it to the auditor. In a git workspace, commit locally before READY and name that commit as head= so the audit reads a fixed revision; REWORK fixes are new local commits. Only after the assigned auditor applies PASS in a material-backed audit round may the executor report the worktree path and HEAD to Brain (never push any branch) and write DONE (with output= when the result must be kept). DONE before PASS is recorded as unusual and cannot close or advance the pair. Write BLOCKED or NEEDS_INPUT with note="..." when stuck. auditor=none is a real choice, not a lesser one: no audit window is assigned and nothing auto-picks one for you. Do proportionate self-validation instead (full suites for code), commit locally in the worktree (never push any branch), then write DONE straight to Brain with no PASS required; this reports completion but leaves the pair open awaiting Brain\'s decision. The closing reply is relayed to Brain and must state what changed, the worktree path and HEAD or file paths, and your validation result before the DONE marker. Brain ends it with DONE (accept) or CANCEL; further Brain work returns it to working. Brain merges commits into dev and pushes dev.',
+    'Verbs: DISPATCH, QUEUE, STARTED, WORKING, READY_FOR_AUDIT, PASS, REWORK, DONE, BLOCKED, NEEDS_INPUT, REASSIGN, CANCEL, CLAIM, CHECK, NEXT_ROUND. CLAIM <taskId> resource=... mode=exclusive|shared ttl=... [renew=true] claims a shared external resource. CHECK <taskId> box=implemented|audited items=1,2,5|all [checked=false] updates numbered brief boxes; executor may update implemented, auditor audited (Brain uses pair_task_check). Brain does not write markers: see the Brain rule below. taskId "-" means your single open task.',
+    'Executor: write STARTED once when you begin (never again on later turns; progress needs no marker) and work in the pair\'s workspace (below). When done, send the auditor your validation (full suites for code) with send_message and write READY_FOR_AUDIT naming material; the daemon relays it to the auditor. In a git workspace, commit locally before READY and name that commit as head= so the audit reads a fixed revision; REWORK fixes are new local commits. Only after the assigned auditor applies PASS in a material-backed audit round may the executor report the worktree path and HEAD to Brain (never push any branch) and write DONE (with output= when the result must be kept). DONE before PASS is recorded as unusual and cannot close or advance the pair. Write BLOCKED or NEEDS_INPUT with note="..." when stuck. auditor=none is a real choice, not a lesser one: no audit window is assigned and nothing auto-picks one for you. Do proportionate self-validation instead (full suites for code), commit locally in the worktree (never push any branch), then write DONE straight to Brain with no PASS required; this reports completion but leaves the pair open awaiting Brain\'s decision. The closing reply is relayed to Brain and must state what changed, the worktree path and HEAD or file paths, and your validation result before the DONE marker. Brain ends it with pair_close (action=done to accept, action=cancel); further Brain work returns it to working. Brain merges commits into dev and pushes dev.',
     TASK_PAIR_INTEGRATION_RULE,
+    TASK_PAIR_BRAIN_CLOSE_RULE,
     TASK_PAIR_NEXT_ROUND_RULE,
     TASK_PAIR_WORKSPACE_RULES,
     'Pairs have no assignmentId, auditAttemptId, auditRevision, immutable bundle, scopeFiles or control-plane binding: never wait for, ask for or block on them.',
@@ -2437,7 +2474,7 @@ export function buildTaskPairMarkerContract(): string {
     TASK_PAIR_SELF_SUFFICIENCY_RULE,
     TASK_PAIR_SCOPE_DECISION_RULE,
     'Automatic pairing policy: multi-step, cross-file, test/real-machine, integration, performance, security or substantial tasks use an executor plus auditor and heartbeat; small edits and queries use one executor with no auditor. Explicit user choices always win. With an empty or unconfigured pool the daemon uses idle sub-sessions of the Brain in the SAME provider family that run the secondary model of that family (Anthropic Sonnet, OpenAI Sol, DeepSeek Pro; never another vendor, never the flagship, no session is created); executor and auditor are different sessions, and when none is available the daemon tells you how to fix it (create a sub-session, name executor/auditor, or execution_pool_set). Prefer configured Luna→Sol, then Haiku→Sonnet, then DeepSeek Flash→Pro tiers.',
-    `Brain: create new work only with pair_create (then pair_dispatch if the result is queued); do not use send_message task metadata or a new DISPATCH/QUEUE marker to create a pair. Lifecycle markers on an existing pair remain valid. Include title="<short specific title>" in pair_create; existing-pair DISPATCH is normally all you need, auto-queues it when capacity is unavailable, and urgent=true jumps the queue (executor=<session> auditor=<session>|none); there is no need to pick QUEUE just to defer work; QUEUE <taskId> title="..." ... always enqueues an existing pair for compatibility. QUEUE - max=<n> sets your queue limit; a finished pair whose commits are not yet on any branch of the repository is reminded to you (one digest, then every 10-15 min; cherry-picked equivalents count as merged), and DONE <taskId> integration=dismiss (or CANCEL <taskId>) stops the reminders for one you will not merge; REASSIGN <taskId> auditor=<session>; DONE <taskId> force=true accepts/ends from any state and marks an audited unpassed pair unaudited; CANCEL ends from any state. No-auditor DONE reports are open and hold their concurrency slot until you decide with DONE or CANCEL; more work can return them to working. Naming executor=/auditor=<session> replaces the current holder of that role immediately, ignoring the execution pool role config; naming executormodel=/auditormodel=<model> steers the next automatic pick but does not replace a current role; a project with no execution pool configured must name the role models or sessions explicitly.`,
+    TASK_PAIR_BRAIN_MCP_ONLY_RULE,
     TASK_PAIR_PROJECT_PRECEDENCE_CLAUSE,
     TASK_PAIR_BRAIN_REPORTING_RULE,
     TASK_PAIR_CHECKLIST_RULE,

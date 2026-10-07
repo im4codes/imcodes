@@ -1613,7 +1613,7 @@ export class TaskPairService {
             await sendTaskPairMessage(intent.to, pair.taskId, 'done-reminder', buildDoneReminderMessage(pair));
             break;
           case 'closed_pair_notice':
-            await sendTaskPairMessage(intent.to, pair.taskId, 'closed-pair', `${pair.taskId} is ${pair.status} -- only Brain can reopen it (DISPATCH or QUEUE). Your marker was recorded but not applied.`);
+            await sendTaskPairMessage(intent.to, pair.taskId, 'closed-pair', `${pair.taskId} is ${pair.status} -- only Brain can reopen it. Your marker was recorded but not applied.`);
             break;
           case 'rework_notice':
             await sendTaskPairMessage(intent.to, pair.taskId, 'rework', buildReworkNoticeMessage(pair, intent.counts));

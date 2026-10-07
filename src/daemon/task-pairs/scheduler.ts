@@ -635,7 +635,7 @@ export class TaskPairAutomation implements TaskPairScheduler {
     this.#queueLineNotice(
       pair,
       'executor-silent-followup',
-      `Executor ${pair.executor} remains silent on ${pair.taskId} for ${Math.round(silentFor / 60_000)} minutes after escalation; last material event was ${new Date(live.lastMaterialAt ?? escalatedAt).toISOString()}. Choose REASSIGN, DONE force=true only after commit, or CANCEL.`,
+      `Executor ${pair.executor} remains silent on ${pair.taskId} for ${Math.round(silentFor / 60_000)} minutes after escalation; last material event was ${new Date(live.lastMaterialAt ?? escalatedAt).toISOString()}. Choose pair_reassign, pair_close action=done force=true only after commit, or pair_close action=cancel.`,
     );
   }
 

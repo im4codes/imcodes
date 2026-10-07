@@ -290,7 +290,7 @@ describe('pairs that stopped driving themselves (215 / jdzj)', () => {
     expect(aggregated[0]!.text).not.toContain('P3');
     expect(pair('P3').flags).not.toContain('executor_silent');
     for (const id of escalatedIds) expect(pair(id).flags).toContain('executor_silent');
-    expect(aggregated[0]!.text).toContain('REASSIGN');
+    expect(aggregated[0]!.text).toContain('pair_reassign');
   });
 
   it('credits plain output to the only open pair, else to the pair the session was last messaged about', async () => {

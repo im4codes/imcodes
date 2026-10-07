@@ -17,7 +17,7 @@ export const SUPERVISION_MCP_TOOLS = Object.freeze({
   HOUSEKEEPING: 'supervision_task_housekeeping',
 } as const);
 export const SUPERVISION_MCP_RETIRED_MESSAGE =
-  'retired: use IMCODES_TASK pair markers, or plain send_message when pairs are not enabled' as const;
+  'retired: use the pair MCP tools (pair_create, pair_dispatch, pair_close, ...), or plain send_message when pairs are not enabled' as const;
 export type SupervisionMcpToolName = typeof SUPERVISION_MCP_TOOLS[keyof typeof SUPERVISION_MCP_TOOLS];
 
 export const SUPERVISION_MCP_TOOL_NAME_LIST: readonly SupervisionMcpToolName[] = Object.freeze([

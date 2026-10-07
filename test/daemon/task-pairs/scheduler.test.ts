@@ -457,7 +457,7 @@ describe('task-pair heartbeat, replacement and queue', () => {
     // The first reminder is constrained by the ten-minute inter-message gap;
     // later cadence is covered by the pure interval contract test above.
     expect(sentTo(BRAIN, 'brain-decision-reminder')).toHaveLength(1);
-    expect(sentTo(BRAIN, 'brain-decision-reminder')[0]?.text).toContain('CANCEL <taskId>');
+    expect(sentTo(BRAIN, 'brain-decision-reminder')[0]?.text).toContain('pair_close action=cancel');
 
     marker(BRAIN, '<!-- IMCODES_TASK DONE NO_AUD force=true -->');
     await flush();
@@ -1422,8 +1422,9 @@ describe('task-pair heartbeat, replacement and queue', () => {
     expect(digest[0]!.text).toContain('Q5');
     expect(digest[0]!.text).toContain('Q6');
     expect(digest[0]!.text).toContain('Q7');
-    // One example of the fix-up marker, not the same marker repeated per pair.
-    expect(digest[0]!.text.match(/IMCODES_TASK QUEUE/g)).toHaveLength(1);
+    // One example of the fix-up tools, not the same instruction repeated per pair -- and no marker.
+    expect(digest[0]!.text.match(/pair_task_update/g)).toHaveLength(1);
+    expect(digest[0]!.text).not.toMatch(/IMCODES_TASK/);
   });
 
   it('never lets brief-less queued pairs hold a slot: a briefed pair queued behind them still dispatches under max=1', async () => {

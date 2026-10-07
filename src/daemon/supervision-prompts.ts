@@ -295,7 +295,7 @@ export const BRAIN_PAIRS_SUPERVISED_WORK = {
   workspace: 'code_in_git_project_worktree_else_task_dir_DISPATCH_workspace=dir_for_non_code_removed_7d_after_end',
   deliverables: 'judge_by_task_type_keep_via_DONE_output=_copied_into_project_user_told_temporary_plain_DONE',
   legacyArtifacts: 'none_on_pairs_no_registry_step_assignmentId_auditAttemptId_auditRevision_bundle_scopeFiles_never_ask_or_explain_them',
-  notices: 'resolve_with_markers_REASSIGN_DONE_force_CANCEL',
+  notices: 'resolve_with_pair_mcp_tools_pair_reassign_pair_close_done_force_cancel',
   heartbeat: 'daemon_pair_heartbeat',
 } as const;
 

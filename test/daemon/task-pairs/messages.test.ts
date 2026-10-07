@@ -49,12 +49,14 @@ describe('daemon-authored marker examples parse when copied verbatim onto their 
     expect(text).toContain('latest head head-sha');
     expect(text).toContain('never use cwd or the project main checkout');
   });
-  it('a QUEUE marker extracted from buildNoBriefLine parses to the right verb and taskId', () => {
+  it('buildNoBriefLine teaches Brain the MCP tools, not a QUEUE marker (a legacy QUEUE marker still parses)', () => {
     const text = buildNoBriefLine('tsk_x');
-    const markerLine = text.match(/<!-- IMCODES_TASK\s.*?-->/)?.[0];
-    expect(markerLine).toBeTruthy();
-    const { markers } = scanTaskPairMarkers(markerLine!);
-    expect(markers).toHaveLength(1);
+    expect(text).toContain('pair_task_update');
+    expect(text).toContain('pair_dispatch');
+    expect(text).toContain('pair_create');
+    expect(text).not.toMatch(/<!--\s*IMCODES_TASK/);
+    // Compatibility: the daemon still accepts the old marker from an existing Brain.
+    const { markers } = scanTaskPairMarkers('<!-- IMCODES_TASK QUEUE tsk_x title="x" -->');
     expect(markers[0]).toMatchObject({ knownVerb: 'QUEUE', taskId: 'tsk_x' });
   });
 

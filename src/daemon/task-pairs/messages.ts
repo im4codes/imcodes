@@ -11,6 +11,7 @@ import {
   TASK_PAIR_NO_INTERMEDIATE_BRAIN_UPDATES_RULE,
   TASK_PAIR_VALIDATION_REPORT_RULE,
   TASK_PAIR_BRAIN_REPORTING_RULE,
+  TASK_PAIR_BRAIN_CLOSE_REMINDER,
   TASK_PAIR_BRAIN_REPLY_RESOLUTION_RULE,
   TASK_PAIR_BRIEF_END_TAG,
   TASK_PAIR_CONTRACT_ID,
@@ -58,7 +59,7 @@ export function buildUntitledTaskTitleRequest(
   const language = locale ? ` in the owner's UI language (${locale})` : ' in the owner\'s UI language';
   return [
     `[IM.codes task titles] Please assign short, specific titles${language} for: ${taskIds.join(', ')}.`,
-    'Reply with one title-only update per non-terminal task, preferably via pair_task_update({taskId,title}). If using a marker, use only <!-- IMCODES_TASK DISPATCH tsk_demo title="Fix login retry" -->; this updates metadata without changing the brief or lifecycle and never reopens a cancelled/done pair.',
+    'Reply with one title-only update per non-terminal task via pair_task_update({taskId,title}); this updates metadata without changing the brief or lifecycle and never reopens a cancelled/done pair.',
     TASK_PAIR_TITLE_RULE,
     TASK_PAIR_TITLE_MARKER_RULE,
     'This is one batched reminder; do not retry immediately. Use pair_task_update with {taskId, title} if preferred.',
@@ -210,7 +211,7 @@ export function buildRoundBaseMismatchExecutorMessage(pair: TaskPairState, head:
   return [
     header(pair),
     `READY_FOR_AUDIT for delivery round ${taskPairDeliveryRound(pair)} was not relayed: head ${head} does not descend from the round base ${base}.`,
-    `Rebase or merge your work onto ${base} (or ask Brain for NEXT_ROUND base=<commit> if the base is wrong), commit, and resend ${readyMarker(pair)} with the new head. PASS is held for this round until then.`,
+    `Rebase or merge your work onto ${base} (or ask Brain to open the round on the right base with pair_next_round base=<commit> if the base is wrong), commit, and resend ${readyMarker(pair)} with the new head. PASS is held for this round until then.`,
   ].join('\n');
 }
 
@@ -261,8 +262,8 @@ export function buildBrainNoticeMessage(pair: TaskPairState, flag: TaskPairFlag,
   // A passed pair only needs the executor's local commit and DONE: another
   // executor can finish it, while DONE force=true would close it uncommitted.
   const resolve = flag === 'executor_silent' && pair.status === 'passed'
-    ? `The audit already passed; only a local worktree commit and DONE remain (never push any branch). Report the worktree path and HEAD to Brain; Brain merges into dev and pushes dev. Wait for the executor, or hand it to another session with ${marker('REASSIGN', pair.taskId, 'executor=<session>')}. Use ${marker('DONE', pair.taskId, 'force=true')} only once the work is committed.`
-    : `Resolve with a marker, e.g. ${marker('REASSIGN', pair.taskId, 'auditor=<session>')}, ${marker('DONE', pair.taskId, 'force=true')}, or ${marker('CANCEL', pair.taskId)}.`;
+    ? `The audit already passed; only a local worktree commit and DONE remain (never push any branch). Report the worktree path and HEAD to Brain; Brain merges into dev and pushes dev. Wait for the executor, or hand it to another session with pair_reassign (taskId=${pair.taskId}, executor=<session>). Use pair_close action=done force=true only once the work is committed.`
+    : `Resolve with the MCP tools, e.g. pair_reassign (taskId=${pair.taskId}, auditor=<session>), pair_close action=done force=true (taskId=${pair.taskId}), or pair_close action=cancel (taskId=${pair.taskId}).`;
   // BLOCKED/NEEDS_INPUT is sent as an immediate `brain_notice` intent (no
   // explicit detail argument, unlike the heartbeat escalation path) -- fall
   // back to the pair's own recorded note so Brain still sees why.
@@ -273,6 +274,7 @@ export function buildBrainNoticeMessage(pair: TaskPairState, flag: TaskPairFlag,
     ...(resolvedDetail ? [`Why: ${resolvedDetail}.`] : []),
     TASK_PAIR_BRAIN_REPLY_RESOLUTION_RULE,
     resolve,
+    TASK_PAIR_BRAIN_CLOSE_REMINDER,
     `[Contract: ${TASK_PAIR_CONTRACT_ID}]`,
   ].join('\n');
 }
@@ -301,7 +303,8 @@ export function buildAggregatedBrainNoticeMessage(notices: readonly PendingBrain
     `[IM.codes task pairs] Needs your decision on ${notices.length} pairs:`,
     ...lines,
     TASK_PAIR_BRAIN_REPLY_RESOLUTION_RULE,
-    `Resolve each with a marker, e.g. ${marker('REASSIGN', '<taskId>', 'auditor=<session>')}, ${marker('DONE', '<taskId>', 'force=true')}, or ${marker('CANCEL', '<taskId>')}. No further reminders until each pair's state changes.`,
+    `Resolve each with the MCP tools, e.g. pair_reassign (taskId, auditor=<session>), pair_close action=done force=true, or pair_close action=cancel. No further reminders until each pair's state changes.`,
+    TASK_PAIR_BRAIN_CLOSE_REMINDER,
     `[Contract: ${TASK_PAIR_CONTRACT_ID}]`,
   ].join('\n');
 }
@@ -316,7 +319,7 @@ export function buildBrainHeartbeatMessage(pairs: readonly TaskPairState[]): str
     const reason = pair.status === 'passed'
       ? 'audit passed; commit locally and DONE'
       : pair.status === 'awaiting_brain_decision'
-        ? 'executor reported completion without an auditor; decide with DONE <taskId> force=true or CANCEL <taskId>'
+        ? 'executor reported completion without an auditor; decide with pair_close (action=done force=true, or action=cancel) for this taskId'
       : pair.flags.length > 0
         ? pair.flags.join(', ')
         : pair.status;
@@ -326,7 +329,8 @@ export function buildBrainHeartbeatMessage(pairs: readonly TaskPairState[]): str
     `[IM.codes task pairs] Brain heartbeat: ${pairs.length} pair(s) need action.`,
     ...lines,
     TASK_PAIR_BRAIN_REPLY_RESOLUTION_RULE,
-    `Resolve with the task marker for each pair (for example <!-- IMCODES_TASK DONE <taskId> force=true -->, REASSIGN, or CANCEL).`,
+    `Resolve each pair with the MCP tools (for example pair_close action=done force=true, pair_reassign, or pair_close action=cancel).`,
+    TASK_PAIR_BRAIN_CLOSE_REMINDER,
     `[Contract: ${TASK_PAIR_CONTRACT_ID}]`,
   ].join('\n');
 }
@@ -345,7 +349,7 @@ export function buildQueueStallNoticeMessage(pairs: readonly Pick<TaskPairState,
   return [
     `[IM.codes task pairs] ${pairs.length} queued pair(s) have been unable to start for a while:`,
     ...lines,
-    'Check Settings → execution pool (pool roles, capacity) if this persists, or name a session/model on the pair directly with REASSIGN.',
+    'Check Settings → execution pool (pool roles, capacity) if this persists, or name a session/model on the pair directly with pair_reassign.',
     `[Contract: ${TASK_PAIR_CONTRACT_ID}]`,
   ].join('\n');
 }
@@ -360,7 +364,7 @@ export function buildNoBriefDigestMessage(taskIds: readonly string[]): string {
   return [
     `[IM.codes task pairs] ${taskIds.length} pairs are queued without a brief: ${taskIds.join(', ')}.`,
     TASK_PAIR_TITLE_RULE,
-    `Give one a brief with ${marker('QUEUE', '<taskId>', 'title="..."')}, then its brief, then ${buildBriefEndHint('<taskId>')}; or dispatch it yourself with ${marker('DISPATCH', '<taskId>', 'executor=<session> auditor=<session>')}. No further reminders until each pair's state changes.`,
+    `Give one a brief with pair_task_update (taskId, markdown, title), then start it with pair_dispatch (taskId); or create it afresh with pair_create (title, brief, executor, auditor). No further reminders until each pair's state changes.`,
     `[Contract: ${TASK_PAIR_CONTRACT_ID}]`,
   ].join('\n');
 }
@@ -391,7 +395,7 @@ export function buildNoPoolAskMessage(project: string, pairs: readonly Pick<Task
 
 /** One queued pair with no brief: how Brain can give it one. */
 export function buildNoBriefLine(taskId: string): string {
-  return `${TASK_PAIR_TITLE_RULE} queued without a brief: give it one with ${marker('QUEUE', taskId, 'title="..."')}, then its brief, then ${buildBriefEndHint(taskId)}; or dispatch it yourself with ${marker('DISPATCH', taskId, 'title="..." executor=<session> auditor=<session>')}.`;
+  return `${TASK_PAIR_TITLE_RULE} ${taskId} is queued without a brief: give it one with pair_task_update (taskId=${taskId}, markdown, title), then start it with pair_dispatch (taskId=${taskId}); or create it afresh with pair_create (title, brief, executor, auditor).`;
 }
 
 /**
@@ -403,7 +407,7 @@ export function buildLegacyPlaceholderDigestMessage(taskIds: readonly string[]):
   return [
     `[IM.codes task pairs] ${taskIds.length} legacy task(s) were not imported as pairs: their only objective is the old wrapper's placeholder, so there is no real brief to recover: ${taskIds.join(', ')}.`,
     TASK_PAIR_TITLE_RULE,
-    `Give one a real brief and dispatch it yourself, e.g. ${marker('QUEUE', '<taskId>', 'title="..."')}, then its brief, then ${buildBriefEndHint('<taskId>')}; or ${marker('DISPATCH', '<taskId>', 'title="..." executor=<session> auditor=<session>')} if you already know who should do it.`,
+    `Give one a real brief with pair_task_update (taskId, markdown, title) and start it with pair_dispatch (taskId); or create it afresh with pair_create (title, brief, executor, auditor) if you already know who should do it.`,
   ].join('\n');
 }
 
@@ -755,6 +759,7 @@ export function buildWorkspaceKeptLine(pair: TaskPairState, reason: string, deta
   return [
     `${header(pair)} Its worktree ${path} ${why}, so the daemon kept it instead of deleting it (${facts}). Whether it matters is your call for this task; you are told once.`,
     `Options: (a) integrate it yourself (cherry-pick the HEAD into dev) -- it is removed on a later sweep once every commit is in a branch; (b) have ${pair.executor ?? 'the executor'} commit locally what should survive and report its worktree plus HEAD; (c) discard it yourself after checking it holds nothing you need (git worktree remove); (d) leave it: it stays on disk and the daemon never deletes unsaved work.`,
+    TASK_PAIR_BRAIN_CLOSE_REMINDER,
   ].join('\n');
 }
 
@@ -774,6 +779,7 @@ export function buildWorkspaceKeptDigestLine(input: {
     ...listed,
     ...(more > 0 ? [`- ... and ${more} more`] : []),
     ...(open.length > 0 ? ['Announced and still open:', ...open, ...(input.announcedOpen.length > open.length ? [`- ... and ${input.announcedOpen.length - open.length} more`] : [])] : []),
+    TASK_PAIR_BRAIN_CLOSE_REMINDER,
   ].join('\n');
 }
 
@@ -873,9 +879,9 @@ export function buildBrainLine(pair: TaskPairState, text: string): string {
  */
 export function buildNoAuditorDoneNotice(pair: TaskPairState, executorSummary: string): string {
   const summary = executorSummary.trim();
-  return `${header(pair)} Executor ${pair.executor ?? '(unknown)'} reported DONE; no auditor was assigned. The pair is open and awaiting your decision. Accept with DONE ${pair.taskId} force=true, cancel with CANCEL ${pair.taskId}, or dispatch/brief/message more work to return it to working.${
+  return `${header(pair)} Executor ${pair.executor ?? '(unknown)'} reported DONE; no auditor was assigned. The pair is open and awaiting your decision. Accept with pair_close (taskId=${pair.taskId}, action=done, force=true), cancel with pair_close (action=cancel), or dispatch/brief/message more work to return it to working.${
     summary ? `\n\n${summary}` : ' (no summary text in the closing reply)'
-  }`;
+  }\n${TASK_PAIR_BRAIN_CLOSE_REMINDER}`;
 }
 
 /**
@@ -915,7 +921,8 @@ export function buildPassDoneNoticeMessage(pair: TaskPairState): string {
     ...(pair.workspace?.path ? [`Worktree: ${pair.workspace.path}.${pair.workspace.lastHead ? ` Head: ${pair.workspace.lastHead}.` : ''}`] : []),
     ...(where ? [where] : []),
     'Brain merges the reported commit into dev and pushes dev; the executor never pushes any branch.',
-    ...(pair.status === 'passed' ? [`More rounds planned? Write ${marker('NEXT_ROUND', pair.taskId, '[base=<commit>] [note="..."]')} on this pair instead of letting it be DONE: it returns to working with the same workspace and participants. A DONE pair cannot open another round.`] : []),
+    ...(pair.status === 'passed' ? [`More rounds planned? Call pair_next_round (taskId=${pair.taskId}, optional base=<commit>, optional note="...") on this pair instead of closing it: it returns to working with the same workspace and participants. A closed (DONE) pair cannot open another round.`] : []),
+    TASK_PAIR_BRAIN_CLOSE_REMINDER,
   ].join('\n');
 }
 
@@ -958,7 +965,7 @@ export function buildIntegrationDriftDigest(lines: readonly IntegrationDriftLine
   const body = lines.map((line) => `- ${line.taskId}: head ${line.head.slice(0, 12)} (${line.missing} commit${line.missing === 1 ? '' : 's'} not found on any branch of this repository; checked ${describeCheckedBranches(line)}), worktree ${line.worktree}, finished ${formatDriftAge(line.ageMs)} ago`).join('\n');
   const example = lines[0]?.taskId ?? '<taskId>';
   return `Finished pair${lines.length === 1 ? '' : 's'} not yet merged into this repository (cherry-picked equivalents on any branch count as merged):\n${body}\n`
-    + `Merge ${lines.length === 1 ? 'it' : 'them'} (cherry-pick the PASSed head onto the branch you integrate on, then push that branch). A pair you will not merge: ${marker('DONE', example, 'integration=dismiss')} (or CANCEL ${example}) stops these reminders.`;
+    + `Merge ${lines.length === 1 ? 'it' : 'them'} (cherry-pick the PASSed head onto the branch you integrate on, then push that branch). A pair you will not merge: pair_close (taskId=${example}, action=done, integration=dismiss), or pair_close action=cancel, stops these reminders.\n${TASK_PAIR_BRAIN_CLOSE_REMINDER}`;
 }
 
 const STALE_STAGE_LABEL = { ready: 'READY_FOR_AUDIT', pass: 'PASS' } as const;

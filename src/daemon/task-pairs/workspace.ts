@@ -410,7 +410,6 @@ export async function describeKeptTaskPairWorkspace(
       : Promise.resolve(undefined),
     new Promise<string | undefined>((resolvePromise) => execFile(
       'git', ['-C', workspace.path, 'log', '-1', '--format=%h %s'], { timeout: GIT_PROBE_TIMEOUT_MS },
-      // eslint-disable-next-line no-control-regex -- a commit subject is untrusted text going into a message
       (error, stdout) => resolvePromise(error ? undefined : stdout.replace(/[\u0000-\u001f\u007f]/g, ' ').trim().slice(0, 120) || undefined),
     )),
   ]);

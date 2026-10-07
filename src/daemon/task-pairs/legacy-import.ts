@@ -28,7 +28,6 @@ import {
   buildLegacyImportCorrectionBrainLine,
   buildLegacyImportCorrectionMessage,
   buildLegacyPlaceholderDigestMessage,
-  formatTaskPairMarker,
 } from './messages.js';
 import { emitTaskPairDaemonEvent, taskPairService } from './service.js';
 
@@ -344,7 +343,7 @@ export function importLegacyTasks(
   }
   if (imported > 0) logger.info({ imported }, 'task-pair: imported in-flight legacy tasks');
   deliverLegacyDigests(store, notifyBrain, now, parkedByBrain, parkedNoticesInFlight, (tasks) => (
-    `[IM.codes task pairs] ${tasks.length} parked legacy task(s) were not imported: ${tasks.map((entry) => entry.label).join(', ')}. Re-dispatch any that are still wanted with ${formatTaskPairMarker('DISPATCH', '<taskId>', 'executor=<session> auditor=<session>')}.`
+    `[IM.codes task pairs] ${tasks.length} parked legacy task(s) were not imported: ${tasks.map((entry) => entry.label).join(', ')}. Re-create any that are still wanted with pair_create (title, brief, executor, auditor).`
   ));
   deliverLegacyDigests(store, notifyBrain, now, placeholderByBrain, placeholderNoticesInFlight, (tasks) => (
     buildLegacyPlaceholderDigestMessage(tasks.map((entry) => entry.taskId))

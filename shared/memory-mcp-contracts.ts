@@ -29,6 +29,7 @@ import {
   COMPUTER_USE_TOOLS,
 } from './computer-use.js';
 import { FILE_TRANSFER_PATH_MAX_BYTES } from './transport/file-transfer.js';
+import { TASK_PAIR_BRAIN_CLOSE_TOOL_NOTE, TASK_PAIR_BRAIN_CLOSE_TOOL_SHORT_NOTE } from './task-pair.js';
 import { MACHINE_FILE_TRANSFER_TRANSPORT } from './machine-direct-file-transfer.js';
 import { TRANSPORT_EFFORT_LEVELS } from './effort-levels.js';
 import {
@@ -776,7 +777,7 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
   },
   [MEMORY_MCP_TOOL_NAMES.PAIR_CREATE]: {
     name: MEMORY_MCP_TOOL_NAMES.PAIR_CREATE,
-    description: 'Brain-only structured creation of a task pair. Persists the brief and assignments atomically, then delivers participant briefs with durable delivery receipts. Retry with the same idempotencyKey to replay without duplicate creation or sends. Unnamed roles come from the pool; with no pool, from idle same-vendor secondary-tier sub-sessions, creating missing ones (capped, marked autoCreated). createExecutor/createAuditor create one. ' + TASK_PAIR_SUBSESSION_TERM_SHORT,
+    description: 'Brain-only structured creation of a task pair. Persists the brief and assignments atomically, then delivers participant briefs with durable delivery receipts. Retry with the same idempotencyKey to replay without duplicate creation or sends. Unnamed roles come from the pool; with no pool, from idle same-vendor secondary-tier sub-sessions, creating missing ones (capped, marked autoCreated). createExecutor/createAuditor create one. ' + TASK_PAIR_SUBSESSION_TERM_SHORT + ' ' + TASK_PAIR_BRAIN_CLOSE_TOOL_SHORT_NOTE,
     inputSchema: objectSchema({
       taskId: stringSchema('Optional stable task id. When omitted, idempotencyKey deterministically derives one.'),
       title: stringSchema('Short specific title in the owner UI language.'),
@@ -809,7 +810,7 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
   },
   [MEMORY_MCP_TOOL_NAMES.PAIR_CLOSE]: {
     name: MEMORY_MCP_TOOL_NAMES.PAIR_CLOSE,
-    description: 'Brain-only structured pair close. action=done accepts the audited result (force/accept) and optional output/dest; action=cancel preserves marker semantics. Replays with the same idempotencyKey are idempotent. Brief edits still use pair_task_update and checklist edits use pair_task_check; neither closes a pair.',
+    description: 'Brain-only structured pair close. action=done accepts the audited result (force/accept) and optional output/dest; action=cancel preserves marker semantics. Replays with the same idempotencyKey are idempotent. Brief edits still use pair_task_update and checklist edits use pair_task_check; neither closes a pair. ' + TASK_PAIR_BRAIN_CLOSE_TOOL_NOTE,
     inputSchema: objectSchema({
       taskId: stringSchema('Existing task-pair id.', { minLength: 1 }),
       action: { type: 'string', enum: [...MEMORY_MCP_PAIR_CLOSE_ACTIONS], description: 'Terminal action.' },
@@ -838,7 +839,7 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
   },
   [MEMORY_MCP_TOOL_NAMES.PAIR_NEXT_ROUND]: {
     name: MEMORY_MCP_TOOL_NAMES.PAIR_NEXT_ROUND,
-    description: 'Brain-only structured NEXT_ROUND. The pair must be passed, terminal pairs are rejected, and base/note are persisted by the marker state machine.',
+    description: 'Brain-only structured NEXT_ROUND. The pair must be passed, terminal pairs are rejected, and base/note are persisted by the marker state machine. ' + TASK_PAIR_BRAIN_CLOSE_TOOL_SHORT_NOTE,
     inputSchema: objectSchema({
       taskId: stringSchema('Existing passed task-pair id.', { minLength: 1 }),
       base: stringSchema('Optional 7-64 hex commit base.'),
@@ -849,7 +850,7 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
   },
   [MEMORY_MCP_TOOL_NAMES.PAIR_VERDICT]: {
     name: MEMORY_MCP_TOOL_NAMES.PAIR_VERDICT,
-    description: 'Assigned-auditor structured PASS/REWORK verdict for a material-backed in_audit round. blocking and p0..p4 counts reuse the audit-convergence judgement and receipt rules; this never substitutes for READY_FOR_AUDIT material.',
+    description: 'Assigned-auditor structured PASS/REWORK verdict for a material-backed in_audit round. blocking and p0..p4 counts reuse the audit-convergence judgement and receipt rules; this never substitutes for READY_FOR_AUDIT material. ' + TASK_PAIR_BRAIN_CLOSE_TOOL_SHORT_NOTE,
     inputSchema: objectSchema({
       taskId: stringSchema('Existing material-backed in-audit task-pair id.', { minLength: 1 }),
       verdict: { type: 'string', enum: ['PASS', 'REWORK'], description: 'Audit verdict.' },
@@ -865,7 +866,7 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
   },
   [MEMORY_MCP_TOOL_NAMES.PAIR_SET_MAX_CONCURRENCY]: {
     name: MEMORY_MCP_TOOL_NAMES.PAIR_SET_MAX_CONCURRENCY,
-    description: 'Set the caller Brain\'s durable task-pair concurrency limit. Pair writes otherwise remain marker-driven.',
+    description: 'Set the caller Brain\'s durable task-pair concurrency limit. Every other pair change uses the pair_* tools.',
     inputSchema: objectSchema({ maxConcurrency: numberSchema('Positive integer queue concurrency limit.') }, ['maxConcurrency']),
     outputSchema: objectSchema({ status: stringSchema('ok or error.'), maxConcurrency: numberSchema('Stored concurrency limit.') }),
   },
