@@ -1225,7 +1225,11 @@
       "shortcut": "ショートカット",
       "partial_download": "未完了のダウンロード"
     },
-    "notice_partial": "並び順の対象は先頭の {{limit}} 件、またはコンピュータの時間切れまでに読み取れた項目のみです。完全な結果を得るには絞り込みを狭めてください。"
+    "notice_partial": "並び順の対象は先頭の {{limit}} 件、またはコンピュータの時間切れまでに読み取れた項目のみです。完全な結果を得るには絞り込みを狭めてください。",
+    "columns": "列",
+    "columns_hidden": "{{n}} 件非表示",
+    "columns_show_all": "すべての列を表示",
+    "sorted_by": "並び順: {{column}}"
   },
   "toast": {
     "finished": "完了",

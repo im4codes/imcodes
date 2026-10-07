@@ -30,7 +30,7 @@ vi.mock('react-i18next', () => {
 import { FileBrowser, __resetFileBrowserSharedChangesForTests } from '../../src/components/FileBrowser.js';
 import type { WsClient, ServerMessage } from '../../src/ws-client.js';
 import { fileBrowserSortStorageKey } from '../../src/file-browser-list-view.js';
-import { FILE_BROWSER_NARROW_MAX_WIDTH_PX } from '../../src/file-browser-list-view.js';
+import { fileBrowserColumnsStorageKey, fileBrowserTableMinWidth, FILE_BROWSER_HIDEABLE_COLUMNS } from '../../src/file-browser-list-view.js';
 
 afterEach(() => { cleanup(); vi.useRealTimers(); });
 
@@ -414,20 +414,165 @@ describe('FileBrowser table view: other hosts and narrow panels', () => {
     expect(calls[0]!.options).toBeUndefined();
   });
 
-  it('folds the columns under the name on a narrow panel, with every piece of information still there', () => {
-    const width = vi.spyOn(HTMLElement.prototype, 'clientWidth', 'get').mockReturnValue(FILE_BROWSER_NARROW_MAX_WIDTH_PX - 100);
+  it('is a table at ANY width: the same aligned header and cells in a 360 px container, which scrolls sideways instead of folding', () => {
+    const width = vi.spyOn(HTMLElement.prototype, 'clientWidth', 'get').mockReturnValue(360);
     const { view, respond, calls } = mount({ directoryQuery: true });
     respond(calls[0]!.requestId, FILES, {});
     const container = view.container as HTMLElement;
-    expect(container.querySelector('.fb-list-chrome')?.classList.contains('is-narrow')).toBe(true);
-    expect(container.querySelector('.fb-node .fb-col')).toBeNull();
-    const metas = [...container.querySelectorAll('.fb-node-meta')];
-    const report = metas.find((meta) => meta.parentElement?.textContent?.includes('report.pdf'))!;
-    expect([...report.querySelectorAll('.fb-col')].map((cell) => cell.querySelector('.fb-col-label')?.textContent))
-      .toEqual(['file_browser.col.size', 'file_browser.col.kind', 'file_browser.col.modified', 'file_browser.col.created']);
-    // Still sortable.
+    // Nothing is folded into a second line, whatever the width.
+    expect(container.querySelector('.fb-node-meta')).toBeNull();
+    expect(container.querySelector('.is-narrow')).toBeNull();
+    const headers = [...container.querySelectorAll('.fb-list-header-cell')].map((cell) => cell.className.match(/fb-col-(\w+)/)![1]);
+    expect(headers).toEqual(['name', 'size', 'kind', 'modified', 'created']);
+    const report = [...container.querySelectorAll('.fb-node')].find((row) => row.textContent?.includes('report.pdf'))!;
+    expect([...report.querySelectorAll('.fb-col')].map((cell) => cell.className.match(/fb-col-(\w+)/)![1])).toEqual(['size', 'kind', 'modified', 'created']);
+    // The table is as wide as its columns need, in the scroll box that holds the header and the rows together.
+    const scroll = container.querySelector('.fb-table-scroll') as HTMLElement;
+    expect(scroll.contains(container.querySelector('.fb-list-header'))).toBe(true);
+    expect(scroll.contains(report)).toBe(true);
+    const all = new Set(['name', 'size', 'kind', 'modified', 'created']) as never;
+    expect(scroll.style.getPropertyValue('--fb-table-min')).toBe(`${fileBrowserTableMinWidth(all)}px`);
+    expect(fileBrowserTableMinWidth(all)).toBeGreaterThan(360);
+    // The toolbar (filter, columns) is outside the scroll box, so it does not slide away sideways.
+    expect(scroll.contains(container.querySelector('.fb-list-toolbar'))).toBe(false);
+    // Still sortable from the header.
     fireEvent.click(header(container, 'size'));
     expect(rowNames(container)[1]).toBe('big.zip');
     width.mockRestore();
+  });
+
+  it('every row has the cells of every visible column, in the header\'s order, including a row that is missing details', () => {
+    const { view, respond, calls } = mount({ directoryQuery: true });
+    respond(calls[0]!.requestId, [...FILES, { name: 'mystery.bin', isDir: false }], {});
+    const container = view.container as HTMLElement;
+    const rows = [...container.querySelectorAll('.fb-node')].slice(1);
+    for (const row of rows) {
+      expect([...row.querySelectorAll('.fb-col')].map((cell) => cell.className.match(/fb-col-(\w+)/)![1]), row.textContent ?? '').toEqual(['size', 'kind', 'modified', 'created']);
+    }
+    const mystery = rows.find((row) => row.textContent?.includes('mystery.bin'))!;
+    expect([...mystery.querySelectorAll('.fb-col-size, .fb-col-modified, .fb-col-created')].map((cell) => cell.textContent)).toEqual(['—', '—', '—']);
+  });
+});
+
+describe('FileBrowser table view: columns menu', () => {
+  const cells = (container: HTMLElement) => [...container.querySelectorAll('.fb-list-header-cell')].map((cell) => cell.className.match(/fb-col-(\w+)/)![1]);
+  const toggle = (container: HTMLElement, name: string) => {
+    const item = [...container.querySelectorAll('.fb-columns-item')].find((label) => label.textContent === name)!;
+    fireEvent.click(item.querySelector('input') as HTMLInputElement);
+  };
+
+  it('shows every column by default and offers all four hideable ones, but never the name', () => {
+    const { view, respond, calls } = mount({ directoryQuery: true });
+    respond(calls[0]!.requestId, FILES, {});
+    const container = view.container as HTMLElement;
+    expect(cells(container)).toEqual(['name', 'size', 'kind', 'modified', 'created']);
+    expect(container.querySelector('.fb-columns-badge')).toBeNull();
+    fireEvent.click(container.querySelector('.fb-columns-button') as HTMLButtonElement);
+    expect([...container.querySelectorAll('.fb-columns-item')].map((label) => label.textContent))
+      .toEqual(FILE_BROWSER_HIDEABLE_COLUMNS.map((column) => `file_browser.col.${column}`));
+    expect((container.querySelector('.fb-columns-reset') as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it('hides a column from the header and every row, says so on the button (never silently), and brings it back', () => {
+    const { view, respond, calls } = mount({ directoryQuery: true });
+    respond(calls[0]!.requestId, FILES, {});
+    const container = view.container as HTMLElement;
+    fireEvent.click(container.querySelector('.fb-columns-button') as HTMLButtonElement);
+    toggle(container, 'file_browser.col.kind');
+    toggle(container, 'file_browser.col.created');
+    expect(cells(container)).toEqual(['name', 'size', 'modified']);
+    const report = [...container.querySelectorAll('.fb-node')].find((row) => row.textContent?.includes('report.pdf'))!;
+    expect([...report.querySelectorAll('.fb-col')].map((cell) => cell.className.match(/fb-col-(\w+)/)![1])).toEqual(['size', 'modified']);
+    // The button itself says how many are hidden, in the closed state too.
+    fireEvent.click(container.querySelector('.fb-columns-button') as HTMLButtonElement);
+    expect(container.querySelector('.fb-columns-badge')?.textContent).toContain('file_browser.columns_hidden');
+    expect(container.querySelector('.fb-columns-badge')?.textContent).toContain('"n":2');
+    // The table gets narrower with its columns.
+    const scroll = container.querySelector('.fb-table-scroll') as HTMLElement;
+    expect(scroll.style.getPropertyValue('--fb-table-min')).toBe(`${fileBrowserTableMinWidth(new Set(['name', 'size', 'modified']) as never)}px`);
+
+    fireEvent.click(container.querySelector('.fb-columns-button') as HTMLButtonElement);
+    toggle(container, 'file_browser.col.kind');
+    expect(cells(container)).toEqual(['name', 'size', 'kind', 'modified']);
+    fireEvent.click(container.querySelector('.fb-columns-reset') as HTMLButtonElement);
+    expect(cells(container)).toEqual(['name', 'size', 'kind', 'modified', 'created']);
+    expect(container.querySelector('.fb-columns-badge')).toBeNull();
+  });
+
+  it('remembers the hidden columns per machine, survives a remount, and blocked or corrupt storage just shows everything', () => {
+    const first = mount({ directoryQuery: true }, 'srv-a');
+    first.respond(first.calls[0]!.requestId, FILES, {});
+    fireEvent.click((first.view.container as HTMLElement).querySelector('.fb-columns-button') as HTMLButtonElement);
+    toggle(first.view.container as HTMLElement, 'file_browser.col.modified');
+    expect(JSON.parse(localStorage.getItem(fileBrowserColumnsStorageKey('srv-a'))!)).toEqual(['modified']);
+    first.view.unmount();
+
+    const again = mount({ directoryQuery: true }, 'srv-a');
+    again.respond(again.calls[0]!.requestId, FILES, {});
+    expect(cells(again.view.container as HTMLElement)).toEqual(['name', 'size', 'kind', 'created']);
+    again.view.unmount();
+
+    const other = mount({ directoryQuery: true }, 'srv-b');
+    other.respond(other.calls[0]!.requestId, FILES, {});
+    expect(cells(other.view.container as HTMLElement)).toEqual(['name', 'size', 'kind', 'modified', 'created']);
+    other.view.unmount();
+
+    localStorage.setItem(fileBrowserColumnsStorageKey('srv-c'), '{"not":"an array"');
+    const corrupt = mount({ directoryQuery: true }, 'srv-c');
+    corrupt.respond(corrupt.calls[0]!.requestId, FILES, {});
+    expect(cells(corrupt.view.container as HTMLElement)).toEqual(['name', 'size', 'kind', 'modified', 'created']);
+    corrupt.view.unmount();
+
+    // Names that are not columns (or the name column) in storage are ignored.
+    localStorage.setItem(fileBrowserColumnsStorageKey('srv-d'), JSON.stringify(['name', 'owner', 'size']));
+    const junk = mount({ directoryQuery: true }, 'srv-d');
+    junk.respond(junk.calls[0]!.requestId, FILES, {});
+    expect(cells(junk.view.container as HTMLElement)).toEqual(['name', 'kind', 'modified', 'created']);
+    junk.view.unmount();
+
+    const blocked = vi.spyOn(Storage.prototype, 'setItem').mockImplementation(() => { throw new DOMException('full', 'QuotaExceededError'); });
+    const quiet = mount({ directoryQuery: true }, 'srv-e');
+    quiet.respond(quiet.calls[0]!.requestId, FILES, {});
+    fireEvent.click((quiet.view.container as HTMLElement).querySelector('.fb-columns-button') as HTMLButtonElement);
+    expect(() => toggle(quiet.view.container as HTMLElement, 'file_browser.col.size')).not.toThrow();
+    expect(cells(quiet.view.container as HTMLElement)).toEqual(['name', 'kind', 'modified', 'created']);
+    blocked.mockRestore();
+  });
+
+  it('keeps sorting by a column that is hidden and says what the list is sorted by', () => {
+    const { view, respond, calls } = mount({ directoryQuery: true });
+    respond(calls[0]!.requestId, FILES, {});
+    const container = view.container as HTMLElement;
+    fireEvent.click(header(container, 'modified'));
+    expect(container.querySelector('.fb-list-sorted-by')).toBeNull();
+    const order = rowNames(container);
+    fireEvent.click(container.querySelector('.fb-columns-button') as HTMLButtonElement);
+    toggle(container, 'file_browser.col.modified');
+    expect(rowNames(container)).toEqual(order);
+    expect(container.querySelector('.fb-list-sorted-by')?.textContent).toContain('file_browser.sorted_by');
+    expect(container.querySelector('.fb-list-sorted-by')?.textContent).toContain('file_browser.col.modified');
+  });
+
+  it('closes on Escape and on a click outside, and the filter and sorting still work with columns hidden', async () => {
+    const { view, respond, calls } = mount({ directoryQuery: true });
+    respond(calls[0]!.requestId, FILES, {});
+    const container = view.container as HTMLElement;
+    const open = () => fireEvent.click(container.querySelector('.fb-columns-button') as HTMLButtonElement);
+    const settled = () => act(async () => { await new Promise((resolve) => setTimeout(resolve, 30)); });
+    open();
+    expect(container.querySelector('.fb-columns-popover')).not.toBeNull();
+    await settled(); // the menu's own listeners attach after paint
+    fireEvent.keyDown(document, { key: 'Escape' });
+    await waitFor(() => expect(container.querySelector('.fb-columns-popover')).toBeNull());
+    open();
+    await waitFor(() => expect(container.querySelector('.fb-columns-popover')).not.toBeNull());
+    await settled();
+    document.body.dispatchEvent(new Event('pointerdown', { bubbles: true }));
+    await waitFor(() => expect(container.querySelector('.fb-columns-popover')).toBeNull());
+    open();
+    await waitFor(() => expect(container.querySelector('.fb-columns-popover')).not.toBeNull());
+    toggle(container, 'file_browser.col.size');
+    fireEvent.input(filterInput(container), { target: { value: 'notes' } });
+    await waitFor(() => expect(rowNames(container)).toEqual(['notes.md']));
   });
 });

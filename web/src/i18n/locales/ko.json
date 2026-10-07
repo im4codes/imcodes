@@ -1225,7 +1225,11 @@
       "shortcut": "바로가기",
       "partial_download": "미완료 다운로드"
     },
-    "notice_partial": "정렬은 처음 {{limit}}개 또는 컴퓨터가 시간 초과되기 전에 읽은 항목만 대상으로 합니다. 완전한 결과를 보려면 필터를 좁히세요."
+    "notice_partial": "정렬은 처음 {{limit}}개 또는 컴퓨터가 시간 초과되기 전에 읽은 항목만 대상으로 합니다. 완전한 결과를 보려면 필터를 좁히세요.",
+    "columns": "열",
+    "columns_hidden": "{{n}}개 숨김",
+    "columns_show_all": "모든 열 표시",
+    "sorted_by": "정렬 기준: {{column}}"
   },
   "toast": {
     "finished": "완료됨",

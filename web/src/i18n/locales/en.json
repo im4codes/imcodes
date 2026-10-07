@@ -1225,7 +1225,11 @@
       "shortcut": "Shortcut",
       "partial_download": "Incomplete Download"
     },
-    "notice_partial": "The order covers only the first {{limit}} items, or those read before the computer ran out of time; narrow the filter for a complete answer."
+    "notice_partial": "The order covers only the first {{limit}} items, or those read before the computer ran out of time; narrow the filter for a complete answer.",
+    "columns": "Columns",
+    "columns_hidden": "{{n}} hidden",
+    "columns_show_all": "Show all columns",
+    "sorted_by": "Sorted by {{column}}"
   },
   "toast": {
     "finished": "finished",

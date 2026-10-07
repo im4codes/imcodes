@@ -1,6 +1,14 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { DEFAULT_FILE_BROWSER_SORT, FILE_BROWSER_SORT_KEYS } from '@shared/file-browser-sort.js';
 import {
+  FILE_BROWSER_COLUMN_KEYS,
+  FILE_BROWSER_COLUMN_WIDTH_PX,
+  FILE_BROWSER_HIDEABLE_COLUMNS,
+  FILE_BROWSER_NAME_MIN_WIDTH_PX,
+  fileBrowserColumnsStorageKey,
+  fileBrowserTableMinWidth,
+  loadFileBrowserHiddenColumns,
+  saveFileBrowserHiddenColumns,
   fileBrowserSortStorageKey,
   fileKindLabel,
   formatFileBrowserDate,
@@ -78,9 +86,9 @@ describe('file browser list view: dates', () => {
   });
   it('shows a full local date and time for anything older, or in the future', () => {
     const older = formatFileBrowserDate(new Date(2026, 8, 12, 1, 4).getTime(), now, 'en', t);
-    expect(older.text).toMatch(/Sep 12, 2026/);
+    expect(older.text).toMatch(/9\/12\/26/);
     expect(older.text).toMatch(/1:04/);
-    expect(formatFileBrowserDate(new Date(2027, 0, 5, 12, 0).getTime(), now, 'en', t).text).toMatch(/Jan 5, 2027/);
+    expect(formatFileBrowserDate(new Date(2027, 0, 5, 12, 0).getTime(), now, "en", t).text).toMatch(/1\/5\/27/);
   });
   it('puts the exact time in the title', () => {
     const { title } = formatFileBrowserDate(new Date(2026, 9, 7, 9, 5, 7).getTime(), now, 'en', t);
@@ -90,7 +98,7 @@ describe('file browser list view: dates', () => {
   it('formats in the UI language', () => {
     const zh = formatFileBrowserDate(new Date(2026, 8, 12, 1, 4).getTime(), now, 'zh-CN', t);
     expect(zh.text).toMatch(/2026/);
-    expect(zh.text).toMatch(/9月/);
+    expect(zh.text).toMatch(/2026\/9\/12/);
     const yesterdayZh = formatFileBrowserDate(new Date(2026, 9, 6, 20, 0).getTime(), now, 'zh-CN', t);
     expect(yesterdayZh.text).toContain('昨天');
   });
@@ -104,5 +112,57 @@ describe('file browser list view: kind labels', () => {
     expect(fileKindLabel({ id: 'pdf' }, t)).toBe('file_browser.kind.pdf');
     expect(fileKindLabel({ id: 'ext', ext: 'WEIRD' }, t)).toBe('WEIRD file');
     expect(fileKindLabel({ id: 'folder' }, t)).toBe('file_browser.kind.folder');
+  });
+});
+
+describe('file browser list view: columns', () => {
+  it('has the five columns, name first and never hideable', () => {
+    expect(FILE_BROWSER_COLUMN_KEYS).toEqual(['name', 'size', 'kind', 'modified', 'created']);
+    expect(FILE_BROWSER_HIDEABLE_COLUMNS).toEqual(['size', 'kind', 'modified', 'created']);
+    for (const key of FILE_BROWSER_HIDEABLE_COLUMNS) expect(FILE_BROWSER_COLUMN_WIDTH_PX[key]).toBeGreaterThan(0);
+  });
+
+  it('the table is as wide as its visible columns need, and never squeezes the name below its minimum', () => {
+    const all = new Set(FILE_BROWSER_COLUMN_KEYS);
+    const onlyName = new Set(['name']) as never;
+    expect(fileBrowserTableMinWidth(onlyName)).toBeGreaterThanOrEqual(FILE_BROWSER_NAME_MIN_WIDTH_PX);
+    let previous = fileBrowserTableMinWidth(onlyName);
+    for (const key of FILE_BROWSER_HIDEABLE_COLUMNS) {
+      const next = fileBrowserTableMinWidth(new Set(['name', ...FILE_BROWSER_HIDEABLE_COLUMNS.slice(0, FILE_BROWSER_HIDEABLE_COLUMNS.indexOf(key) + 1)]) as never);
+      expect(next).toBeGreaterThan(previous);
+      previous = next;
+    }
+    expect(fileBrowserTableMinWidth(all)).toBe(previous);
+    // Even all five columns need no more than a window the panel can be given, so the sideways scroll is a short one.
+    expect(fileBrowserTableMinWidth(all)).toBeLessThan(900);
+  });
+
+  it('stores the hidden columns per machine and reads back only real, hideable ones', () => {
+    saveFileBrowserHiddenColumns('srv-a', new Set(['kind', 'created']));
+    saveFileBrowserHiddenColumns('srv-b', new Set(['size']));
+    expect([...loadFileBrowserHiddenColumns('srv-a')]).toEqual(['kind', 'created']);
+    expect([...loadFileBrowserHiddenColumns('srv-b')]).toEqual(['size']);
+    expect([...loadFileBrowserHiddenColumns('srv-c')]).toEqual([]);
+    expect(fileBrowserColumnsStorageKey('srv-a')).not.toBe(fileBrowserColumnsStorageKey('srv-b'));
+    window.localStorage.setItem(fileBrowserColumnsStorageKey('srv-d'), JSON.stringify(['name', 'owner', 7, 'modified']));
+    expect([...loadFileBrowserHiddenColumns('srv-d')]).toEqual(['modified']);
+    window.localStorage.setItem(fileBrowserColumnsStorageKey('srv-d'), '{oops');
+    expect([...loadFileBrowserHiddenColumns('srv-d')]).toEqual([]);
+  });
+
+  it('showing everything again removes the stored entry', () => {
+    saveFileBrowserHiddenColumns('srv-a', new Set(['kind']));
+    expect(window.localStorage.getItem(fileBrowserColumnsStorageKey('srv-a'))).not.toBeNull();
+    saveFileBrowserHiddenColumns('srv-a', new Set());
+    expect(window.localStorage.getItem(fileBrowserColumnsStorageKey('srv-a'))).toBeNull();
+  });
+
+  it('never throws when storage is blocked or full', () => {
+    vi.spyOn(Storage.prototype, 'getItem').mockImplementation(() => { throw new DOMException('denied', 'SecurityError'); });
+    vi.spyOn(Storage.prototype, 'setItem').mockImplementation(() => { throw new DOMException('full', 'QuotaExceededError'); });
+    vi.spyOn(Storage.prototype, 'removeItem').mockImplementation(() => { throw new DOMException('denied', 'SecurityError'); });
+    expect([...loadFileBrowserHiddenColumns('srv-a')]).toEqual([]);
+    expect(() => saveFileBrowserHiddenColumns('srv-a', new Set(['kind']))).not.toThrow();
+    expect(() => saveFileBrowserHiddenColumns('srv-a', new Set())).not.toThrow();
   });
 });

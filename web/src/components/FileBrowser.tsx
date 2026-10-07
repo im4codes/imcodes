@@ -16,13 +16,16 @@ import {
 import { fileKindOf } from '@shared/file-kind.js';
 import { FILE_TRANSFER_DIRECTORY_MAX_ENTRIES, FILE_TRANSFER_DIRECTORY_QUERY_MAX_STAT_ENTRIES, type FileDirectoryListQuery } from '@shared/transport/file-transfer.js';
 import {
-  FILE_BROWSER_NARROW_MAX_WIDTH_PX,
+  FILE_BROWSER_COLUMN_KEYS,
+  fileBrowserTableMinWidth,
   fileKindLabel,
   formatFileBrowserDate,
+  loadFileBrowserHiddenColumns,
   loadFileBrowserSortPreference,
+  saveFileBrowserHiddenColumns,
   saveFileBrowserSortPreference,
 } from '../file-browser-list-view.js';
-import { FileBrowserListChrome } from './FileBrowserListChrome.js';
+import { FileBrowserListHeader, FileBrowserListToolbar } from './FileBrowserListChrome.js';
 /**
  * FileBrowser — universal reusable file/directory browser.
  *
@@ -615,6 +618,8 @@ export function FileBrowser({
 
   // ── Table view: sort, quick filter ──────────────────────────────────────
   const [sort, setSort] = useState<FileBrowserSortState>(() => loadFileBrowserSortPreference(serverId));
+  // Columns the person hid (none by default), remembered per machine. The name column is never hideable.
+  const [hiddenColumns, setHiddenColumns] = useState<ReadonlySet<FileBrowserSortKey>>(() => loadFileBrowserHiddenColumns(serverId));
   const [filterInput, setFilterInput] = useState('');
   const [appliedFilter, setAppliedFilter] = useState('');
   // Read by fetchDir at request time, so a listing always carries the sort and
@@ -1976,22 +1981,23 @@ export function FileBrowser({
     walk(dataRef.current);
   }, [directoryQuery, listQueryKey, listView, refetchDir]);
 
-  const listContainerRef = useRef<HTMLDivElement | null>(null);
-  const [narrow, setNarrow] = useState(false);
-  useEffect(() => {
-    const element = listContainerRef.current;
-    if (!listView || !element) return;
-    // A hidden element reports 0: fall back to the window rather than folding.
-    const measure = () => setNarrow((element.clientWidth || window.innerWidth) < FILE_BROWSER_NARROW_MAX_WIDTH_PX);
-    measure();
-    if (typeof ResizeObserver === 'undefined') {
-      window.addEventListener('resize', measure);
-      return () => window.removeEventListener('resize', measure);
-    }
-    const observer = new ResizeObserver(measure);
-    observer.observe(element);
-    return () => observer.disconnect();
-  }, [listView]);
+  const visibleColumns = useMemo<ReadonlySet<FileBrowserSortKey>>(
+    () => new Set(FILE_BROWSER_COLUMN_KEYS.filter((key) => !hiddenColumns.has(key))),
+    [hiddenColumns],
+  );
+  const toggleColumn = useCallback((column: FileBrowserSortKey) => {
+    setHiddenColumns((previous) => {
+      const next = new Set(previous);
+      if (next.has(column)) next.delete(column); else next.add(column);
+      saveFileBrowserHiddenColumns(serverId, next);
+      return next;
+    });
+  }, [serverId]);
+  const showAllColumns = useCallback(() => {
+    const none = new Set<FileBrowserSortKey>();
+    saveFileBrowserHiddenColumns(serverId, none);
+    setHiddenColumns(none);
+  }, [serverId]);
 
   const listNotice = (() => {
     if (!listView || !rootNode) return undefined;
@@ -2017,7 +2023,7 @@ export function FileBrowser({
   const emptyFilterText = filterTerms.length > 0 ? t('file_browser.filter_empty', { query: appliedFilter.trim() }) : undefined;
   const forceExpanded = listViewResult?.forceExpanded;
   const listColumns = useMemo<FsListColumns | undefined>(() => (listView ? {
-    narrow,
+    visible: visibleColumns,
     nowMs: nowMinute * 60_000,
     locale: uiLocale,
     detailsPresent: listDetailsPresent,
@@ -2025,49 +2031,55 @@ export function FileBrowser({
     drivesList: showingDrives,
     forceExpanded,
     emptyText: emptyFilterText,
-  } : undefined), [createdUnavailable, emptyFilterText, forceExpanded, listDetailsPresent, listView, narrow, nowMinute, showingDrives, uiLocale]);
+  } : undefined), [createdUnavailable, emptyFilterText, forceExpanded, listDetailsPresent, listView, nowMinute, showingDrives, uiLocale, visibleColumns]);
 
-  const tree = (
-    <div
-      class={`fb-tree${layout !== 'panel' && hasInlinePreview ? ' fb-tree-split' : ''}${listView ? ' fb-tree-list' : ''}`}
-      ref={listView ? listContainerRef : undefined}
-    >
-      {listView && (
-        <FileBrowserListChrome
-          sort={sort}
-          onSortChange={handleSortChange}
-          unavailableReasons={unavailableReasons}
-          filterValue={filterInput}
-          onFilterInput={setFilterInput}
-          onFilterCompositionStart={() => { filterComposingRef.current = true; }}
-          onFilterCompositionEnd={(value) => {
-            filterComposingRef.current = false;
-            setFilterInput(value);
-            setAppliedFilter(value);
-          }}
-          onFilterClear={clearFilter}
-          narrow={narrow}
-          notice={listNotice}
-        />
-      )}
-      {viewData.map((root) => (
-        <FsTreeNode
-          key={root.id}
-          node={root}
-          listColumns={listColumns}
-          expandedPaths={expandedPaths}
-          selectedPaths={selectedPaths}
-          alreadySet={alreadySet}
-          mode={mode}
-          showHidden={showHidden}
-          modifiedFiles={modifiedFiles}
-          onToggleExpand={toggleExpand}
-          onSelect={handleSelect}
-          onPreview={handlePreview}
-          onContextMenu={handleNodeContextMenu}
-          previewPath={previewPath}
-        />
-      ))}
+  const treeRows = viewData.map((root) => (
+    <FsTreeNode
+      key={root.id}
+      node={root}
+      listColumns={listColumns}
+      expandedPaths={expandedPaths}
+      selectedPaths={selectedPaths}
+      alreadySet={alreadySet}
+      mode={mode}
+      showHidden={showHidden}
+      modifiedFiles={modifiedFiles}
+      onToggleExpand={toggleExpand}
+      onSelect={handleSelect}
+      onPreview={handlePreview}
+      onContextMenu={handleNodeContextMenu}
+      previewPath={previewPath}
+    />
+  ));
+  // The table: filter and column controls stay put; the header and the rows scroll together, sideways when the container is
+  // narrower than the columns need, and the header stays on top while the rows scroll down.
+  const tree = listView ? (
+    <div class={`fb-tree fb-tree-list${layout !== 'panel' && hasInlinePreview ? ' fb-tree-split' : ''}`}>
+      <FileBrowserListToolbar
+        sort={sort}
+        onSortChange={handleSortChange}
+        filterValue={filterInput}
+        onFilterInput={setFilterInput}
+        onFilterCompositionStart={() => { filterComposingRef.current = true; }}
+        onFilterCompositionEnd={(value) => {
+          filterComposingRef.current = false;
+          setFilterInput(value);
+          setAppliedFilter(value);
+        }}
+        onFilterClear={clearFilter}
+        hiddenColumns={hiddenColumns}
+        onToggleColumn={toggleColumn}
+        onShowAllColumns={showAllColumns}
+        notice={listNotice}
+      />
+      <div class="fb-table-scroll" style={{ '--fb-table-min': `${fileBrowserTableMinWidth(visibleColumns)}px` } as Record<string, string>}>
+        <FileBrowserListHeader sort={sort} onSortChange={handleSortChange} unavailableReasons={unavailableReasons} hiddenColumns={hiddenColumns} />
+        {treeRows}
+      </div>
+    </div>
+  ) : (
+    <div class={`fb-tree${layout !== 'panel' && hasInlinePreview ? ' fb-tree-split' : ''}`}>
+      {treeRows}
     </div>
   );
 
@@ -2897,7 +2909,8 @@ export function FileBrowser({
 
 /** What the table view needs to draw a row: how to lay it out and what to say about a missing value. */
 interface FsListColumns {
-  narrow: boolean;
+  /** The columns shown (name always; size, kind, modified, created unless hidden). */
+  visible: ReadonlySet<FileBrowserSortKey>;
   nowMs: number;
   locale: string;
   /** Any entry of the root listing came with file details (an older machine sends none). */
@@ -3011,13 +3024,8 @@ function FsTreeNode({
         )}
         {gitCode && gitClass && <span class={`fb-node-git-badge git-badge-${gitClass}`} title={`git: ${gitCode}`}>{gitStatusBadge(gitCode)}</span>}
         {isAlready && <span class="fb-node-badge">↑</span>}
-        {listColumns && depth > 0 && !listColumns.narrow && <FsListCells node={node} columns={listColumns} />}
+        {listColumns && depth > 0 && <FsListCells node={node} columns={listColumns} />}
       </div>
-      {listColumns && depth > 0 && listColumns.narrow && (
-        <div class="fb-node-meta" style={{ paddingLeft: 8 + depth * 16 + 40 }}>
-          <FsListCells node={node} columns={listColumns} stacked />
-        </div>
-      )}
       {node.isDir && isExpanded && node.children && (
         <>
           {node.children.length === 0 && !node.isLoading && (
@@ -3050,47 +3058,42 @@ function FsTreeNode({
 
 // ── Table cells ───────────────────────────────────────────────────────────────
 
-/**
- * Size, kind, modified and created of one row. Wide: four cells aligned under
- * the column headers. Stacked (narrow): one line of "label value" pieces under
- * the name, so nothing is dropped on a small screen.
- */
-const FsListCells = memo(function FsListCells({ node, columns, stacked = false }: { node: FsNode; columns: FsListColumns; stacked?: boolean }) {
+/** Size, kind, modified and created of one row: always cells, aligned under the column headers (the table scrolls, it never folds). */
+const FsListCells = memo(function FsListCells({ node, columns }: { node: FsNode; columns: FsListColumns }) {
   const { t } = useTranslation();
   const missingTitle = columns.drivesList
     ? undefined
     : !columns.detailsPresent ? t('file_browser.meta_unsupported') : t('file_browser.detail_unreadable');
-  const size = node.isDir
-    ? { text: '—', title: undefined as string | undefined }
-    : node.size !== undefined
-      ? { text: formatByteSize(node.size), title: `${node.size.toLocaleString(columns.locale)} B` as string | undefined }
-      : { text: '—', title: missingTitle };
-  const kind = fileKindLabel(fileKindOf(node.name, node.isDir), t);
-  const dateCell = (ms: number | undefined, unavailableTitle: string | undefined) => (
+  const cells: Array<{ key: string; text: string; title: string | undefined }> = [];
+  if (columns.visible.has(FILE_BROWSER_SORT_KEYS.SIZE)) {
+    cells.push(node.isDir
+      ? { key: 'size', text: '—', title: undefined }
+      : node.size !== undefined
+        ? { key: 'size', text: formatByteSize(node.size), title: `${node.size.toLocaleString(columns.locale)} B` }
+        : { key: 'size', text: '—', title: missingTitle });
+  }
+  if (columns.visible.has(FILE_BROWSER_SORT_KEYS.KIND)) {
+    const kind = fileKindLabel(fileKindOf(node.name, node.isDir), t);
+    cells.push({ key: 'kind', text: kind, title: kind });
+  }
+  const dateCell = (key: string, ms: number | undefined, unavailableTitle: string | undefined) => (
     ms === undefined
-      ? { text: '—', title: unavailableTitle }
-      : formatFileBrowserDate(ms, columns.nowMs, columns.locale, t)
+      ? { key, text: '—', title: unavailableTitle }
+      : { key, ...formatFileBrowserDate(ms, columns.nowMs, columns.locale, t) }
   );
-  const modified = dateCell(node.mtimeMs, missingTitle);
-  const created = dateCell(node.birthtimeMs, columns.detailsPresent && columns.createdUnavailable ? t('file_browser.created_unavailable') : missingTitle);
-  const cells = [
-    { key: 'size', label: t('file_browser.col.size'), ...size },
-    { key: 'kind', label: t('file_browser.col.kind'), text: kind, title: kind },
-    { key: 'modified', label: t('file_browser.col.modified'), ...modified },
-    { key: 'created', label: t('file_browser.col.created'), ...created },
-  ];
+  if (columns.visible.has(FILE_BROWSER_SORT_KEYS.MODIFIED)) cells.push(dateCell('modified', node.mtimeMs, missingTitle));
+  if (columns.visible.has(FILE_BROWSER_SORT_KEYS.CREATED)) {
+    cells.push(dateCell('created', node.birthtimeMs, columns.detailsPresent && columns.createdUnavailable ? t('file_browser.created_unavailable') : missingTitle));
+  }
   return (
     <>
       {cells.map((cell) => (
-        <span key={cell.key} class={`fb-col fb-col-${cell.key}${stacked ? ' is-stacked' : ''}`} title={cell.title}>
-          {stacked && <span class="fb-col-label">{cell.label}</span>}
-          {cell.text}
-        </span>
+        <span key={cell.key} class={`fb-col fb-col-${cell.key}`} title={cell.title}>{cell.text}</span>
       ))}
     </>
   );
 }, (previous, next) => previous.node === next.node
-  && previous.stacked === next.stacked
+  && previous.columns.visible === next.columns.visible
   && previous.columns.nowMs === next.columns.nowMs
   && previous.columns.locale === next.columns.locale
   && previous.columns.detailsPresent === next.columns.detailsPresent

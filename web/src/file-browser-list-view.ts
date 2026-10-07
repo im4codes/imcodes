@@ -11,8 +11,65 @@ import { safeLocalStorageSetItem } from './local-storage-quota.js';
 
 /** Where the list view's sort choice is kept: one entry per machine (the server id), `local` when there is none. */
 export const FILE_BROWSER_SORT_STORAGE_PREFIX = 'rcc_fb_sort_v1';
-/** Container width below which the columns fold into a second line under the name. */
-export const FILE_BROWSER_NARROW_MAX_WIDTH_PX = 860;
+/** Where the hidden-column choice is kept: also one entry per machine. */
+export const FILE_BROWSER_COLUMNS_STORAGE_PREFIX = 'rcc_fb_cols_v1';
+
+/**
+ * The table's columns, left to right. The list is ALWAYS a table: when the container is narrower than the columns need it scrolls
+ * sideways (header pinned on top), it never folds the cells into a line under the name.
+ */
+export const FILE_BROWSER_COLUMN_KEYS: readonly FileBrowserSortKey[] = [
+  FILE_BROWSER_SORT_KEYS.NAME,
+  FILE_BROWSER_SORT_KEYS.SIZE,
+  FILE_BROWSER_SORT_KEYS.KIND,
+  FILE_BROWSER_SORT_KEYS.MODIFIED,
+  FILE_BROWSER_SORT_KEYS.CREATED,
+];
+/** The columns a person may hide (the name column never goes). */
+export const FILE_BROWSER_HIDEABLE_COLUMNS: readonly FileBrowserSortKey[] = FILE_BROWSER_COLUMN_KEYS.slice(1);
+/** Width of each fixed column (CSS px), including its padding. The name column takes what is left, and never less than the minimum. */
+export const FILE_BROWSER_COLUMN_WIDTH_PX: Readonly<Record<string, number>> = Object.freeze({
+  [FILE_BROWSER_SORT_KEYS.SIZE]: 76,
+  [FILE_BROWSER_SORT_KEYS.KIND]: 124,
+  [FILE_BROWSER_SORT_KEYS.MODIFIED]: 140,
+  [FILE_BROWSER_SORT_KEYS.CREATED]: 140,
+});
+export const FILE_BROWSER_NAME_MIN_WIDTH_PX = 200;
+/** Left and right padding of a row plus the gaps between its cells. */
+const FILE_BROWSER_ROW_CHROME_PX = 16;
+const FILE_BROWSER_CELL_GAP_PX = 4;
+
+/** The narrowest the table can be without squeezing the name below its minimum: below this the container scrolls sideways. */
+export function fileBrowserTableMinWidth(visible: ReadonlySet<FileBrowserSortKey>): number {
+  let width = FILE_BROWSER_ROW_CHROME_PX + FILE_BROWSER_NAME_MIN_WIDTH_PX;
+  for (const key of FILE_BROWSER_HIDEABLE_COLUMNS) {
+    if (visible.has(key)) width += (FILE_BROWSER_COLUMN_WIDTH_PX[key] ?? 0) + FILE_BROWSER_CELL_GAP_PX;
+  }
+  return width;
+}
+
+export function fileBrowserColumnsStorageKey(serverId?: string): string {
+  return `${FILE_BROWSER_COLUMNS_STORAGE_PREFIX}:${serverId || 'local'}`;
+}
+
+/** The columns this machine's person chose to hide (none by default); a corrupt or blocked store reads as "none hidden". */
+export function loadFileBrowserHiddenColumns(serverId?: string): ReadonlySet<FileBrowserSortKey> {
+  try {
+    const raw = window.localStorage.getItem(fileBrowserColumnsStorageKey(serverId));
+    const parsed: unknown = raw ? JSON.parse(raw) : [];
+    return new Set(Array.isArray(parsed) ? FILE_BROWSER_HIDEABLE_COLUMNS.filter((key) => parsed.includes(key)) : []);
+  } catch {
+    return new Set();
+  }
+}
+
+export function saveFileBrowserHiddenColumns(serverId: string | undefined, hidden: ReadonlySet<FileBrowserSortKey>): void {
+  try {
+    const key = fileBrowserColumnsStorageKey(serverId);
+    if (hidden.size === 0) window.localStorage.removeItem(key);
+    else safeLocalStorageSetItem(key, JSON.stringify(FILE_BROWSER_HIDEABLE_COLUMNS.filter((column) => hidden.has(column))));
+  } catch { /* storage unavailable */ }
+}
 
 type Translate = (key: string, options?: Record<string, unknown>) => string;
 
@@ -93,7 +150,8 @@ function formattersFor(locale: string): { formatters: DateFormatters; locale: st
   const formatters: DateFormatters = {
     time: new Intl.DateTimeFormat(usable, { timeStyle: 'short' }),
     title: new Intl.DateTimeFormat(usable, { dateStyle: 'full', timeStyle: 'medium' }),
-    full: new Intl.DateTimeFormat(usable, { dateStyle: 'medium', timeStyle: 'short' }),
+    // Compact on purpose (a narrow column): 6/14/26, 3:21 PM; the hover title carries the full date and seconds.
+    full: new Intl.DateTimeFormat(usable, { dateStyle: 'short', timeStyle: 'short' }),
     relativeDay: new Intl.RelativeTimeFormat(usable, { numeric: 'auto' }),
   };
   formatterCache.set(locale, formatters);

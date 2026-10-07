@@ -1225,7 +1225,11 @@
       "shortcut": "Acceso directo",
       "partial_download": "Descarga incompleta"
     },
-    "notice_partial": "El orden abarca solo los primeros {{limit}} elementos, o los leídos antes de que el equipo se quedara sin tiempo; acota el filtro para un resultado completo."
+    "notice_partial": "El orden abarca solo los primeros {{limit}} elementos, o los leídos antes de que el equipo se quedara sin tiempo; acota el filtro para un resultado completo.",
+    "columns": "Columnas",
+    "columns_hidden": "{{n}} ocultas",
+    "columns_show_all": "Mostrar todas las columnas",
+    "sorted_by": "Ordenado por {{column}}"
   },
   "toast": {
     "finished": "terminó",

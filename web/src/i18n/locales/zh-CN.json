@@ -1225,7 +1225,11 @@
       "shortcut": "快捷方式",
       "partial_download": "未完成的下载"
     },
-    "notice_partial": "排序只覆盖前 {{limit}} 项，或这台电脑在超时前读取到的项目；缩小过滤范围可获得完整结果。"
+    "notice_partial": "排序只覆盖前 {{limit}} 项，或这台电脑在超时前读取到的项目；缩小过滤范围可获得完整结果。",
+    "columns": "列",
+    "columns_hidden": "已隐藏 {{n}}",
+    "columns_show_all": "显示全部列",
+    "sorted_by": "按{{column}}排序"
   },
   "toast": {
     "finished": "完成了",

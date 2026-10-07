@@ -1225,7 +1225,11 @@
       "shortcut": "捷徑",
       "partial_download": "未完成的下載"
     },
-    "notice_partial": "排序只涵蓋前 {{limit}} 項，或這台電腦在逾時前讀取到的項目；縮小篩選範圍可取得完整結果。"
+    "notice_partial": "排序只涵蓋前 {{limit}} 項，或這台電腦在逾時前讀取到的項目；縮小篩選範圍可取得完整結果。",
+    "columns": "欄位",
+    "columns_hidden": "已隱藏 {{n}}",
+    "columns_show_all": "顯示全部欄位",
+    "sorted_by": "依{{column}}排序"
   },
   "toast": {
     "finished": "已完成",
