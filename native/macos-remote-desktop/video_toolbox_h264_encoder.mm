@@ -21,6 +21,7 @@
 #include <vector>
 
 #include "../remote-desktop-common/encode_speed_governor.h"
+#include "../remote-desktop-common/static_refresh_policy.h"
 
 namespace imcodes::remote_desktop::macos {
 namespace {
@@ -937,6 +938,11 @@ struct DeliveryState {
   // than the encoder that is the intended steady state), and each frame's
   // submit-to-output time feeds the speed governor.
   bool latency_first = false;
+  // Latency-first: how many frames the encoder has coded since its last
+  // keyframe, and the one-per-static-run refresh decision built on it.
+  std::uint32_t frames_since_key = 0;
+  std::uint32_t bitrate_bps = 0;
+  imcodes::rd::StaticRefreshPolicy refresh;
   std::shared_ptr<SpeedControl> speed;
   // The size the session was configured for. A frame of another size (the
   // capture is still switching) takes the slow resample path and says nothing
@@ -965,15 +971,19 @@ struct DeliveryState {
       return std::nullopt;
     }
     if (pending.size() >= max_pending_frames) {
+      if (latency_first) {
+        // The intended steady state (see dropped_by_design_frames): not a
+        // fault, and not backlog pressure.
+        ++statistics.dropped_by_design_frames;
+        return std::nullopt;
+      }
       ++statistics.dropped_backpressure_frames;
       // Rises twice as fast as it decays: a genuinely struggling encoder
       // that drops most frames climbs quickly, while a handful of isolated
       // blips among mostly-successful submissions decays back to 0 rather
       // than lingering as a false "still behind" signal.
-      if (!latency_first) {
-        statistics.backlog_pressure = std::min(
-            statistics.backlog_pressure + 2, kMaxTrackedBacklogPressure);
-      }
+      statistics.backlog_pressure = std::min(
+          statistics.backlog_pressure + 2, kMaxTrackedBacklogPressure);
       return std::nullopt;
     }
     const std::uint64_t id = next_submission_id++;
@@ -984,7 +994,16 @@ struct DeliveryState {
     }
     statistics.pending_frames = static_cast<std::uint32_t>(pending.size());
     if (statistics.backlog_pressure > 0) --statistics.backlog_pressure;
-    const bool force = request_keyframe || force_next_keyframe;
+    bool refresh_now = false;
+    if (latency_first) {
+      const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                              std::chrono::steady_clock::now().time_since_epoch())
+                              .count();
+      refresh_now = refresh.OnFrame(frame.repeated_unchanged, frames_since_key,
+                                    bitrate_bps, now_ms);
+      if (refresh_now) ++statistics.refresh_keyframes;
+    }
+    const bool force = request_keyframe || force_next_keyframe || refresh_now;
     force_next_keyframe = false;
     return std::pair{id, force};
   }
@@ -1037,6 +1056,11 @@ struct DeliveryState {
       }
       ++statistics.emitted_access_units;
       statistics.emitted_access_unit_bytes += access_unit.bytes.size();
+      if (access_unit.keyframe) {
+        frames_since_key = 0;
+      } else if (frames_since_key < std::numeric_limits<std::uint32_t>::max()) {
+        ++frames_since_key;
+      }
       current_sink = sink;
     }
     // A keyframe carries its parameter sets and the session's warm-up cost; the
@@ -1068,6 +1092,8 @@ struct DeliveryState {
     force_next_keyframe = false;
     pending.clear();
     submitted_at.clear();
+    frames_since_key = 0;
+    refresh.Reset();
     statistics.pending_frames = 0;
     sink = {};
   }
@@ -1240,6 +1266,7 @@ class VideoToolboxH264Encoder::Impl {
       // Latency-first keeps one frame in flight: the encoder always works on
       // the newest frame and never on a queue of stale ones.
       state_->latency_first = configuration.latency_first;
+      state_->bitrate_bps = configuration.bitrate_bps;
       state_->expected_pixels = configuration.encoded_pixels;
       state_->max_pending_frames =
           configuration.latency_first ? 1U : limits_.max_pending_frames;
@@ -1460,6 +1487,7 @@ class VideoToolboxH264Encoder::Impl {
         .profile = profile,
         .latency_first = latency_first,
     };
+    bool bitrate_only = false;
     {
       std::lock_guard lock(mutex_);
       // Rebuilding the compression session costs a keyframe. A target that
@@ -1473,15 +1501,22 @@ class VideoToolboxH264Encoder::Impl {
         // top rung): the running session is the ladder's, so the governor may
         // start steering it.
         if (latency_first) speed_->armed.store(true, std::memory_order_relaxed);
-        return true;
-      }
-      // Validate before Configure(): it stops the running session first, and
-      // a refused configuration would leave the stream with no encoder at all.
-      if (!IsValidConfiguration(next, limits_)) {
+        bitrate_only = true;
+      } else if (!IsValidConfiguration(next, limits_)) {
+        // Validate before Configure(): it stops the running session first, and
+        // a refused configuration would leave the stream with no encoder at all.
         last_error_ = {VideoToolboxEncoderErrorCode::kInvalidConfiguration,
                        "quality selection outside encoder limits"};
         return false;
       }
+    }
+    if (bitrate_only) {
+      // The session keeps running, but the current target is what the static
+      // refresh weighs ("can the link carry a sharper keyframe?"). Taken after
+      // `mutex_` is released: LastError() nests the two the other way round.
+      std::lock_guard lock(state_->mutex);
+      state_->bitrate_bps = next.bitrate_bps;
+      return true;
     }
     if (!Configure(next, std::move(sink))) return false;
     if (latency_first) speed_->armed.store(true, std::memory_order_relaxed);

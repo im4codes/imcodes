@@ -108,6 +108,14 @@ struct VideoToolboxEncoderStatistics {
   // itself down a rung independently of whatever the network estimator
   // currently authorizes. 0 means the encoder is keeping up with capture.
   std::uint32_t backlog_pressure = 0;
+  // Latency-first mode: frames dropped because one was already in flight. That
+  // is the intended steady state of a capture faster than the encoder (the
+  // encoder always starts on the newest frame), so it is counted apart from
+  // dropped_backpressure_frames, which stays a fault signal.
+  std::uint64_t dropped_by_design_frames = 0;
+  // Latency-first mode: extra keyframes forced once a moving picture settled
+  // (see static_refresh_policy.h).
+  std::uint64_t refresh_keyframes = 0;
   // Latency-first mode only: how many steps the speed governor has taken the
   // output size below what the quality ladder asked for (0 = none).
   std::uint32_t speed_governor_level = 0;

@@ -109,6 +109,10 @@ struct CapturedFrame {
   std::int64_t capture_time_us = 0;
   ColorPrimaries color_primaries = ColorPrimaries::kUnspecified;
   std::shared_ptr<const FrameStorage> storage;
+  // The capture re-delivered the previous picture because nothing on the screen
+  // changed (a keep-alive), not a new capture. Lets an encoder tell "the screen
+  // has settled" from "still moving". False for every capture that does not say.
+  bool repeated_unchanged = false;
 
   [[nodiscard]] bool IsValid() const noexcept;
 };

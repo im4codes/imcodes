@@ -39,7 +39,8 @@ constexpr std::uint32_t kHeight = 720;
 
 common::CapturedFrame Frame(std::uint32_t width = kWidth,
                             std::uint32_t height = kHeight,
-                            std::int64_t timestamp = 10) {
+                            std::int64_t timestamp = 10,
+                            bool repeated_unchanged = false) {
   static const auto storage = std::make_shared<Bytes>(
       static_cast<std::size_t>(kWidth) * kHeight * 4);
   return common::CapturedFrame{
@@ -49,31 +50,34 @@ common::CapturedFrame Frame(std::uint32_t width = kWidth,
       .capture_time_us = timestamp,
       .color_primaries = common::ColorPrimaries::kDisplayP3,
       .storage = storage,
+      .repeated_unchanged = repeated_unchanged,
   };
 }
 
-common::EncoderConfiguration Configuration(bool latency_first) {
+common::EncoderConfiguration Configuration(bool latency_first,
+                                           std::uint32_t bitrate_bps = 3'000'000) {
   return common::EncoderConfiguration{
       .encoded_pixels = {kWidth, kHeight},
       .frame_rate = 30,
-      .bitrate_bps = 3'000'000,
+      .bitrate_bps = bitrate_bps,
       .profile = common::H264Profile::kConstrainedBaseline,
       .latency_first = latency_first,
   };
 }
 
 imcodes::rd::QualitySelection Selection(int width = static_cast<int>(kWidth),
-                                        int height = static_cast<int>(kHeight)) {
-  return imcodes::rd::QualitySelection{"720p30", width, height, 30, 3'000'000};
+                                        int height = static_cast<int>(kHeight),
+                                        std::uint32_t bitrate_bps = 3'000'000) {
+  return imcodes::rd::QualitySelection{"720p30", width, height, 30, bitrate_bps};
 }
 
-common::H264AccessUnit AccessUnit(std::int64_t timestamp) {
+common::H264AccessUnit AccessUnit(std::int64_t timestamp, bool keyframe) {
   return common::H264AccessUnit{
       .bytes = {std::byte{0}, std::byte{0}, std::byte{0}, std::byte{1},
                 std::byte{0x65}},
       .presentation_time_us = timestamp,
       .profile = common::H264Profile::kConstrainedBaseline,
-      .keyframe = false,
+      .keyframe = keyframe,
   };
 }
 
@@ -82,6 +86,7 @@ class FakeBackend final : public encoder::VideoToolboxEncoderBackend {
   struct Pending {
     std::uint64_t id;
     std::int64_t timestamp;
+    bool keyframe;
   };
   std::vector<common::EncoderConfiguration> configurations;
   std::vector<Pending> pending;
@@ -101,9 +106,12 @@ class FakeBackend final : public encoder::VideoToolboxEncoderBackend {
     output_sink = std::move(next_output_sink);
     return true;
   }
-  bool Encode(std::uint64_t id, const common::CapturedFrame& frame, bool,
+  std::vector<bool> keyframe_requests;
+  bool Encode(std::uint64_t id, const common::CapturedFrame& frame,
+              bool request_keyframe,
               encoder::VideoToolboxEncoderError*) override {
-    pending.push_back({id, frame.capture_time_us});
+    keyframe_requests.push_back(request_keyframe);
+    pending.push_back({id, frame.capture_time_us, request_keyframe});
     return true;
   }
   void Stop() noexcept override {}
@@ -111,7 +119,7 @@ class FakeBackend final : public encoder::VideoToolboxEncoderBackend {
   void CompleteFirst() {
     const Pending item = pending.front();
     pending.erase(pending.begin());
-    output_sink(item.id, AccessUnit(item.timestamp));
+    output_sink(item.id, AccessUnit(item.timestamp, item.keyframe));
   }
 };
 
@@ -122,7 +130,8 @@ struct Rig {
   std::atomic<int> emitted{0};
 };
 
-bool MakeRig(Rig* rig, bool latency_first, bool hardware = false) {
+bool MakeRig(Rig* rig, bool latency_first, bool hardware = false,
+             std::uint32_t bitrate_bps = 3'000'000) {
   auto backend = std::make_unique<FakeBackend>();
   backend->hardware = hardware;
   rig->backend = backend.get();
@@ -130,14 +139,15 @@ bool MakeRig(Rig* rig, bool latency_first, bool hardware = false) {
       std::move(backend));
   rig->encoder->SetConfigurationObserver([rig] { ++rig->observed; });
   return Check(rig->encoder->Configure(
-                   Configuration(latency_first),
+                   Configuration(latency_first, bitrate_bps),
                    [rig](common::H264AccessUnit) { ++rig->emitted; }),
                "configure");
 }
 
 // Submits one frame and completes it after `encode_ms`.
-bool EncodeOne(Rig& rig, int encode_ms, std::int64_t timestamp = 10) {
-  if (!rig.encoder->Encode(Frame(kWidth, kHeight, timestamp), false)) return false;
+bool EncodeOne(Rig& rig, int encode_ms, std::int64_t timestamp = 10,
+               bool repeated_unchanged = false) {
+  if (!rig.encoder->Encode(Frame(kWidth, kHeight, timestamp, repeated_unchanged), false)) return false;
   if (encode_ms > 0) std::this_thread::sleep_for(std::chrono::milliseconds(encode_ms));
   if (!rig.backend->pending.empty()) rig.backend->CompleteFirst();
   return true;
@@ -164,7 +174,9 @@ bool TestLatencyFirstKeepsOneFrameInFlightAndDropsTheRest() {
     ok = ok && Check(!rig.encoder->Encode(Frame(), false), "frames arriving while one is in flight are dropped");
   }
   auto stats = rig.encoder->Statistics();
-  ok = ok && Check(stats.dropped_backpressure_frames == 20, "all twenty counted as dropped");
+  ok = ok && Check(stats.dropped_by_design_frames == 20, "all twenty counted as dropped by design");
+  ok = ok && Check(stats.dropped_backpressure_frames == 0 && rig.encoder->DroppedFrames() == 0,
+                   "...and none of them as a fault, so the HUD's dropped-frame count stays meaningful");
   ok = ok && Check(stats.backlog_pressure == 0,
                    "drops are the intended steady state here, not backlog pressure");
   rig.backend->CompleteFirst();
@@ -271,6 +283,77 @@ bool TestEncoderClassAndDropsAreTruthful() {
                "stopped: unknown again");
 }
 
+bool Requested(const Rig& rig, std::size_t index) {
+  return index < rig.backend->keyframe_requests.size() && rig.backend->keyframe_requests[index];
+}
+
+bool TestASettledPictureGetsOneSharperKeyframe() {
+  Rig rig;
+  if (!MakeRig(&rig, true, false, 8'000'000)) return false;
+  // The session's first frame is the keyframe; then twelve moving frames.
+  for (int i = 0; i < 13; ++i) {
+    if (!EncodeOne(rig, 0, 100 + i)) return false;
+  }
+  const std::size_t before = rig.backend->keyframe_requests.size();
+  // The capture's keep-alive re-delivers the unchanged picture: it has settled.
+  bool ok = Check(EncodeOne(rig, 0, 200, /*repeated_unchanged=*/true), "settled frame accepted");
+  ok = ok && Check(Requested(rig, before), "the first unchanged frame after motion is forced to a keyframe");
+  ok = ok && Check(rig.encoder->Statistics().refresh_keyframes == 1, "one refresh counted");
+  for (int i = 0; i < 6; ++i) {
+    ok = ok && Check(EncodeOne(rig, 0, 300 + i, true), "more unchanged frames accepted");
+  }
+  ok = ok && Check(rig.encoder->Statistics().refresh_keyframes == 1, "no second refresh inside the same static run");
+  // Motion resumes and stops again straight away: spaced by at least 5 s.
+  ok = ok && Check(EncodeOne(rig, 0, 400), "motion");
+  ok = ok && Check(EncodeOne(rig, 0, 410, true), "settled again");
+  return ok && Check(rig.encoder->Statistics().refresh_keyframes == 1, "a second run inside the spacing is not refreshed");
+}
+
+bool TestRefreshNeedsEnoughFramesAndALinkThatCanCarryIt() {
+  {
+    Rig few;
+    if (!MakeRig(&few, true, false, 8'000'000)) return false;
+    for (int i = 0; i < 5; ++i) {
+      if (!EncodeOne(few, 0, 100 + i)) return false;
+    }
+    if (!EncodeOne(few, 0, 200, true)) return false;
+    if (!Check(few.encoder->Statistics().refresh_keyframes == 0,
+               "too few frames since the keyframe: a refresh would be worse than the keyframe it replaces")) {
+      return false;
+    }
+  }
+  Rig slow;
+  if (!MakeRig(&slow, true, false, 3'000'000)) return false;
+  for (int i = 0; i < 13; ++i) {
+    if (!EncodeOne(slow, 0, 100 + i)) return false;
+  }
+  if (!EncodeOne(slow, 0, 200, true)) return false;
+  if (!Check(slow.encoder->Statistics().refresh_keyframes == 0, "a 3 Mbps link is not asked to carry the burst")) return false;
+  // The link target rises (bitrate-only update keeps the session): refresh is allowed again.
+  // The link target rises (a bitrate-only update keeps the session): the next
+  // settled picture is refreshed.
+  if (!Check(slow.encoder->ReconfigureFromQualitySelection(
+                 Selection(static_cast<int>(kWidth), static_cast<int>(kHeight), 8'000'000)),
+             "ladder update with a higher target")) {
+    return false;
+  }
+  if (!EncodeOne(slow, 0, 300)) return false;
+  if (!EncodeOne(slow, 0, 310, true)) return false;
+  return Check(slow.encoder->Statistics().refresh_keyframes == 1,
+               "once the target can carry it, the settled picture is refreshed");
+}
+
+bool TestTheDefaultModeNeverRefreshes() {
+  Rig rig;
+  if (!MakeRig(&rig, /*latency_first=*/false, false, 8'000'000)) return false;
+  for (int i = 0; i < 13; ++i) {
+    if (!EncodeOne(rig, 0, 100 + i)) return false;
+  }
+  if (!EncodeOne(rig, 0, 200, true)) return false;
+  return Check(rig.encoder->Statistics().refresh_keyframes == 0, "the default mode never forces a refresh") &&
+         Check(!Requested(rig, rig.backend->keyframe_requests.size() - 1), "and does not request a keyframe for it");
+}
+
 }  // namespace
 
 int main() {
@@ -281,7 +364,10 @@ int main() {
                   TestSamplesBeforeAnyLadderSelectionAreIgnored() &&
                   TestResampledFramesAreNotTimed() &&
                   TestLadderDrivenSizeChangeTellsTheObserver() &&
-                  TestEncoderClassAndDropsAreTruthful();
+                  TestEncoderClassAndDropsAreTruthful() &&
+                  TestASettledPictureGetsOneSharperKeyframe() &&
+                  TestRefreshNeedsEnoughFramesAndALinkThatCanCarryIt() &&
+                  TestTheDefaultModeNeverRefreshes();
   if (ok) std::cout << "macos latency-first encoder counterfactuals passed\n";
   return ok ? 0 : 1;
 }

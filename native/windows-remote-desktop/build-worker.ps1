@@ -75,6 +75,7 @@ $ExpectedCommonSources = @(
   'quality_ladder.cc', 'quality_ladder.h',
   'session_core.cc', 'session_core.h',
   'signaling_types.h',
+  'static_refresh_policy.h',
   'transport_session_core.cc', 'transport_session_core.h',
   'value_types.cc', 'value_types.h',
   'video_sender_bitrate.h'

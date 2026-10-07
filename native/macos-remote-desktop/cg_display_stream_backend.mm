@@ -234,6 +234,9 @@ class CgDisplayStreamHandle final : public ScreenCaptureKitBackendStream {
     if (pending_.load(std::memory_order_relaxed) >= max_pending_) return;
     common::CapturedFrame frame = last_frame_;  // shares the immutable storage
     frame.capture_time_us = now;
+    // Nothing changed on screen: say so, so the encoder can tell that the
+    // picture has settled.
+    frame.repeated_unchanged = true;
     last_delivery_us_ = now;
     pending_.fetch_add(1, std::memory_order_relaxed);
     frame_sink_(std::move(frame));
