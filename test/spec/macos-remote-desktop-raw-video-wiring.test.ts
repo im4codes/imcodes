@@ -21,7 +21,11 @@ describe('macOS raw (libvpx) video path wiring', () => {
 
   it('turns raw codecs on only for a Mac with no hardware H.264 encoder', () => {
     expect(worker).toContain('DecideRawCodecs(');
-    expect(worker).toContain('HardwareH264EncoderAvailable(), capture_backend->SupportsOutputSize()');
+        // The kill switch is read for every route (so the next session sees an edit) and decides first.
+    expect(worker).toContain('ResolveRawCodecSettings(\n          ProcessEnvironmentLookup, ReadSmallRegularFile)');
+    expect(worker).toMatch(/HardwareH264EncoderAvailable\(\), capture_backend->SupportsOutputSize\(\),\s*raw_settings\.raw_codecs\)/);
+    expect(worker).toContain('S_ISREG(info.st_mode)');
+    expect(worker).toContain('info.st_size > kMaxBytes');
     expect(worker).toContain('AllowRawCodecs(raw_decision.allowed)');
     // Decided after the capture backend exists (and refused when it does not), never before.
     expect(worker.indexOf('DecideRawCodecs(')).toBeGreaterThan(worker.indexOf('macos_remote_desktop_worker_capture_backend_unavailable'));

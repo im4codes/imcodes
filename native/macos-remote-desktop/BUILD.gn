@@ -436,6 +436,9 @@ source_set("raw_video") {
   sources = [
     "codec_encoder_adapters.cc",
     "codec_encoder_adapters.h",
+    "raw_codec_policy.h",
+    "raw_codec_settings.cc",
+    "raw_codec_settings.h",
     "raw_video_path.h",
     "reconfigurable_encoder.h",
     "video_codec_selection.cc",
@@ -444,6 +447,8 @@ source_set("raw_video") {
 
   public = [
     "codec_encoder_adapters.h",
+    "raw_codec_policy.h",
+    "raw_codec_settings.h",
     "raw_video_path.h",
     "reconfigurable_encoder.h",
     "video_codec_selection.h",

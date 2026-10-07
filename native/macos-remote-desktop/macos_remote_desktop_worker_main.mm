@@ -39,7 +39,9 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <functional>
+#include <iterator>
 #include <iostream>
 #include <memory>
 #include <map>
@@ -78,6 +80,7 @@
 #include "ns_pasteboard_clipboard_adapter.h"
 #include "pinned_libwebrtc_transport_backend.h"
 #include "raw_codec_policy.h"
+#include "raw_codec_settings.h"
 #include "raw_frame_conversion.h"
 #include "video_toolbox_h264_encoder.h"
 
@@ -2169,6 +2172,22 @@ bool HardwareH264EncoderAvailable() {
   return available;
 }
 
+// The kill-switch file is tiny and plain: refuse anything that is not a small
+// regular file (a FIFO or a device would block, a huge file would be memory).
+std::optional<std::string> ReadSmallRegularFile(const std::string& path) {
+  constexpr off_t kMaxBytes = 4096;
+  struct stat info {};
+  if (::stat(path.c_str(), &info) != 0 || !S_ISREG(info.st_mode) ||
+      info.st_size > kMaxBytes) {
+    return std::nullopt;
+  }
+  std::ifstream input(path, std::ios::binary);
+  if (!input) return std::nullopt;
+  std::string text((std::istreambuf_iterator<char>(input)),
+                   std::istreambuf_iterator<char>());
+  return text;
+}
+
 // One viewer's composition. Members are declared in dependency order, so
 // they are destroyed in the order the single-viewer worker always tore down:
 // the command seam and session first, then the transport, then the sink and
@@ -2846,12 +2865,20 @@ int RunLaunchAgentSession(const macos::WorkerLaunchContext& context) {
     // libvpx the captured frame unscaled, so they are offered only where the
     // capture honours the encoder's size. Still before any negotiation.
     {
+      // Read for every route, so editing the kill-switch file takes effect on the
+      // next session without restarting the worker.
+      const macos::RawCodecSettings raw_settings = macos::ResolveRawCodecSettings(
+          ProcessEnvironmentLookup, ReadSmallRegularFile);
       const macos::RawCodecDecision raw_decision = macos::DecideRawCodecs(
-          HardwareH264EncoderAvailable(), capture_backend->SupportsOutputSize());
+          HardwareH264EncoderAvailable(), capture_backend->SupportsOutputSize(),
+          raw_settings.raw_codecs);
       media_binder->raw_video()->AllowRawCodecs(raw_decision.allowed);
       std::cerr << "macos_remote_desktop_worker_raw_codecs allowed="
                 << (raw_decision.allowed ? 1 : 0)
                 << " reason=" << macos::RawCodecReasonName(raw_decision.reason)
+                << " setting_source="
+                << macos::RawCodecSettingSourceName(raw_settings.source)
+                << (raw_settings.ignored_invalid_value ? " invalid_value_ignored=1" : "")
                 << "\n";
     }
 

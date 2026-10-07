@@ -77,6 +77,47 @@ Publishing is `scripts/publish-libwebrtc-sdk.mjs` followed by
 `scripts/promote-libwebrtc-sdk.mjs`, which creates the immutable release and
 advances the committed lock.
 
+## Video codec: VP9 on Macs with no hardware H.264 (and its kill switch)
+
+A Mac whose only H.264 encoder is Apple's software one (an Intel Mac Pro, say)
+encodes slowly and blurrily. On such a Mac a viewer is sent **VP9** (VP8 if the
+browser has no VP9), encoded by the libvpx that ships inside the pinned libwebrtc
+SDK, instead. Everything else -- packetization, RTCP, pacing, congestion control --
+is libwebrtc's, as for H.264.
+
+A route uses it only when **all** hold:
+
+- the setting below is `auto` (the default);
+- VideoToolbox cannot create a hardware H.264 session (a Mac that has one keeps it,
+  unchanged);
+- the capture honours the encoder's size (CGDisplayStream, macOS < 13). On the
+  ScreenCaptureKit path (macOS >= 13, e.g. a VM without a hardware encoder) the
+  route stays on H.264 exactly as before, because nothing scales raw frames.
+
+The worker logs one line per route: `macos_remote_desktop_worker_raw_codecs
+allowed=<0|1> reason=<allowed|hardware_h264|capture_cannot_scale|disabled_by_setting>`.
+
+### Kill switch
+
+`rawCodecs` is `auto` (default) or `off`; `off` restores the H.264 behaviour
+exactly. Read by the worker for every new route, so a change applies to the **next
+remote-desktop session** with no restart of the worker or of the OS session. First
+statement wins:
+
+1. environment variable `IMCODES_RD_RAW_CODECS=auto|off` of the worker;
+2. the line `rawCodecs=off` in `remote-desktop-video.conf` in the state directory of
+   the user the worker runs as (`$IMCODES_HOME`, else `$HOME/.imcodes`); blank lines
+   and `#` comments are allowed, nothing else in the file is read;
+3. the default, `auto`.
+
+An unrecognised value is ignored (and reported on the log line), never treated as
+`off`.
+
+```sh
+mkdir -p ~/.imcodes && printf 'rawCodecs=off\n' > ~/.imcodes/remote-desktop-video.conf   # back to H.264
+rm ~/.imcodes/remote-desktop-video.conf                                                  # back to auto
+```
+
 ## Supported baseline
 
 - Minimum deployment target: **macOS 12.3** (`mac_deployment_target="12.3"`).

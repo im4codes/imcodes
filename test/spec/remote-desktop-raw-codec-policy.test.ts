@@ -19,7 +19,7 @@ async function findCompiler(): Promise<string> {
 }
 
 describe('remote-desktop raw codec policy', () => {
-  it.skipIf(process.platform === 'win32')('offers raw codecs only to a no-hardware Mac whose capture honours the encoder size', async () => {
+  it.skipIf(process.platform === 'win32')('offers raw codecs only to a no-hardware Mac whose capture honours the encoder size, and the kill switch restores H.264', async () => {
     const compiler = await findCompiler();
     const temp = mkdtempSync(resolve(tmpdir(), 'imcodes-rd-rawpolicy-'));
     const executable = resolve(temp, 'raw-codec-policy');
@@ -29,6 +29,7 @@ describe('remote-desktop raw codec policy', () => {
         '-Wall', '-Wextra', '-Werror', '-pedantic',
         '-I', MACOS, '-I', COMMON,
         resolve(ROOT, 'test', 'spec', 'remote-desktop-raw-codec-policy.cc'),
+        resolve(MACOS, 'raw_codec_settings.cc'),
         '-o', executable,
       ], { encoding: 'utf8' });
       expect(compile.status, `compile failed\nstdout:\n${compile.stdout}\nstderr:\n${compile.stderr}`).toBe(0);
