@@ -1398,6 +1398,12 @@ export class TaskPairAutomation implements TaskPairScheduler {
     if (!stored) return false;
     const pair = stored.state;
     if (!TASK_PAIR_OPEN_STATUSES.includes(pair.status)) return false;
+    // A status with no side to act (awaiting Brain's decision) is not "both
+    // idle": the executor has reported and the ball is in Brain's court. The
+    // ordinary heartbeat already returns for it; without the same gate here the
+    // fast path fell back to the executor, which re-reported DONE on every nudge
+    // and kept resetting the idle spell (a nudge every ~2.5 minutes).
+    if (!taskPairSideToAct(pair)) return false;
     const executor = pair.executor;
     if (!executor) return false;
     const auditor = pair.auditor && pair.auditor !== TASK_PAIR_NO_AUDITOR ? pair.auditor : undefined;
@@ -1470,6 +1476,12 @@ export class TaskPairAutomation implements TaskPairScheduler {
   async #nudgeBothIdleTarget(project: string, pair: TaskPairState, liveness: TaskPairLiveness, now: number): Promise<boolean> {
     const executor = pair.executor;
     if (!executor) return false;
+    // Defence in depth for every caller: no acting side, no nudge target.
+    const side = taskPairSideToAct(pair);
+    if (!side) {
+      this.#recordLivenessDecision({ project, state: pair, liveness, queueOrder: 0 }, 'NUDGE', 'skipped', 'no_side_to_act', now);
+      return false;
+    }
     const auditor = pair.auditor && pair.auditor !== TASK_PAIR_NO_AUDITOR ? pair.auditor : undefined;
     if (pair.flagSides.blocked || pair.flagSides.needs_input) {
       this.#recordLivenessDecision({ project, state: pair, liveness, queueOrder: 0 }, 'NUDGE', 'skipped', 'participant_flagged', now);
@@ -1480,7 +1492,7 @@ export class TaskPairAutomation implements TaskPairScheduler {
       return false;
     }
 
-    const target = taskPairSideToAct(pair) === 'auditor' && auditor ? 'auditor' : 'executor';
+    const target = side === 'auditor' && auditor ? 'auditor' : 'executor';
     const targetSession = target === 'auditor' ? auditor! : executor;
     const silence = (target === 'executor' ? liveness.silenceExecutor : liveness.silenceAuditor) + 1;
     const nextLiveness: TaskPairLiveness = {

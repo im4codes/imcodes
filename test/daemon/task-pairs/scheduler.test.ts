@@ -682,6 +682,31 @@ describe('task-pair heartbeat, replacement and queue', () => {
       expect(sentTo(EXEC, 'nudge-executor')).toHaveLength(1);
     });
 
+    it('never nudges the executor of a pair that is awaiting Brain\'s decision: the executor has nothing left to do, and a nudge only makes it re-report DONE', async () => {
+      marker(BRAIN, `<!-- IMCODES_TASK DISPATCH AWAIT_NONUDGE executor=${EXEC} auditor=none -->`);
+      marker(EXEC, '<!-- IMCODES_TASK DONE AWAIT_NONUDGE -->');
+      await flush();
+      expect(pair('AWAIT_NONUDGE').status).toBe('awaiting_brain_decision');
+      sent = [];
+      // Two hours of fast polls plus several heartbeat ticks: no executor nudge at all.
+      await bothIdleCheck(240);
+      await tick(4);
+      expect(sentTo(EXEC)).toHaveLength(0);
+      expect(getTaskPairStore().listEvents(PROJECT, 'AWAIT_NONUDGE').filter((event) => event.verb === 'NUDGE')).toHaveLength(0);
+    });
+
+    it('the awaiting-decision exemption applies to the whole class of states with no acting side, and a passed pair (executor owes its DONE) is still nudged', async () => {
+      marker(BRAIN, `<!-- IMCODES_TASK DISPATCH AWAIT_PASSED executor=${EXEC} auditor=${AUD} -->`);
+      marker(EXEC, `<!-- IMCODES_TASK READY_FOR_AUDIT AWAIT_PASSED worktree=/ws/AWAIT_PASSED head=${'1'.repeat(40)} -->`);
+      await flush();
+      marker(AUD, '<!-- IMCODES_TASK PASS AWAIT_PASSED blocking=P0 -->');
+      await flush();
+      expect(pair('AWAIT_PASSED').status).toBe('passed');
+      sent = [];
+      await bothIdleCheck(4);
+      expect(sentTo(EXEC, 'nudge-executor')).toHaveLength(1);
+    });
+
     it('does not send a double nudge when both the fast check and the ordinary heartbeat tick fire for the same idle spell', async () => {
       marker(BRAIN, `<!-- IMCODES_TASK DISPATCH FAST8 executor=${EXEC} auditor=${AUD} -->`);
       await flush();
