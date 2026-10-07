@@ -42,7 +42,34 @@ describe('macOS output-size capture (CGDisplayStream scales in WindowServer)', (
     expect(firstFrame).toBeGreaterThan(start);
     expect(oldStop).toBeGreaterThan(firstFrame);
     // A failed switch keeps the running stream.
-    expect(retarget).toMatch(/if \(fresh\) fresh->Stop\([^)]*\);[\s\S]{0,200}requested_size = current_size;[\s\S]{0,40}return;/);
+    expect(retarget).toMatch(/if \(fresh\) fresh->Stop\([^)]*\);[\s\S]{0,200}if \(generation == run_generation\) requested_size = current_size;[\s\S]{0,40}return;/);
+  });
+
+  it('warms the new stream up without holding the stream mutex, so Stop()/Start() never wait for it', () => {
+    const retarget = adapter.slice(adapter.indexOf('void Retarget('), adapter.indexOf('const common::WorkerGeneration worker_generation;'));
+    const warm = retarget.indexOf('fresh->WaitForFirstFrame(');
+    const lock = retarget.indexOf('std::lock_guard stream_lock(stream_mutex);');
+    expect(warm).toBeGreaterThan(0);
+    expect(lock).toBeGreaterThan(warm);
+    // Only the swap runs under the lock, and it re-checks the capture is still the one it was started for.
+    expect(retarget).toMatch(/still_running = running && generation == run_generation;/);
+    // A stream that lost the race is stopped outside the lock.
+    expect(retarget.slice(retarget.indexOf('// Whichever stream lost'))).toContain('fresh->Stop(');
+  });
+
+  it('keeps a size requested before the capture runs and applies it when Start() finishes', () => {
+    expect(adapter).toMatch(/if \(!running\) \{[\s\S]{0,260}pending_request = size;\s*return false;/);
+    expect(adapter).toContain('early = pending_request;');
+    expect(adapter).toContain('if (early.has_value()) (void)SetOutputSize(*early);');
+    // Start() must not forget it; only Stop() does.
+    expect(adapter).toContain('StopLocked(/*forget_pending_request=*/false);');
+    expect(adapter).toContain('StopLocked(/*forget_pending_request=*/true);');
+  });
+
+  it('a stream only delivers while it belongs to the capture that created it', () => {
+    expect(adapter).toContain('FrameSinkFor(generation), ErrorSinkFor(generation)');
+    expect(adapter.match(/FrameSinkFor\(generation\), ErrorSinkFor\(generation\)/g)?.length).toBe(2);
+    expect(adapter).toContain('if (cell->load(std::memory_order_acquire) != generation) return;');
   });
 
   it('never blocks the caller of SetOutputSize and never upscales', () => {

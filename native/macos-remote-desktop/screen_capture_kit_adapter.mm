@@ -604,6 +604,12 @@ struct DeliveryState {
     }
   }
 
+  // A frame from a stream that no longer belongs to the running capture.
+  void CountLateFrame() {
+    std::lock_guard lock(mutex);
+    ++statistics.ignored_late_frames;
+  }
+
   void Fail(CaptureError error) {
     std::lock_guard lock(mutex);
     if (!accepting) {
@@ -641,6 +647,7 @@ class ScreenCaptureKitAdapter::Impl {
       std::lock_guard lock(request_mutex);
       running = false;
       ++run_generation;
+      generation_cell->store(run_generation, std::memory_order_release);
     }
     if (retarget_queue != nullptr) {
       dispatch_sync(retarget_queue, ^{
@@ -806,7 +813,8 @@ class ScreenCaptureKitAdapter::Impl {
           "capture start rejected stale display topology metadata"};
       return false;
     }
-    StopLocked();
+    // A size requested before the capture ran is kept (see SetOutputSize).
+    StopLocked(/*forget_pending_request=*/false);
     {
       std::lock_guard lock(delivery->mutex);
       delivery->accepting = true;
@@ -814,8 +822,12 @@ class ScreenCaptureKitAdapter::Impl {
       delivery->last_error = {};
     }
 
-    const auto shared_delivery = delivery;
     CaptureError create_error;
+    std::uint64_t generation = 0;
+    {
+      std::lock_guard lock(request_mutex);
+      generation = run_generation;
+    }
     stream = backend->CreateStream(
         ScreenCaptureKitStreamConfiguration{
             .native_display_id = found->second.native_display_id,
@@ -825,13 +837,7 @@ class ScreenCaptureKitAdapter::Impl {
             .max_pending_frames = limits.max_pending_frames,
             .show_cursor = found->second.cursor_supported,
         },
-        [shared_delivery](common::CapturedFrame frame) {
-          shared_delivery->Deliver(std::move(frame));
-        },
-        [shared_delivery](CaptureError error) {
-          shared_delivery->Fail(std::move(error));
-        },
-        &create_error);
+        FrameSinkFor(generation), ErrorSinkFor(generation), &create_error);
     if (!stream) {
       delivery->Fail(create_error.IsError()
                          ? std::move(create_error)
@@ -872,12 +878,21 @@ class ScreenCaptureKitAdapter::Impl {
       current_size = display.encoded_pixels;
     }
     output_size.store(0, std::memory_order_release);
+    // Apply a size requested while the capture was not yet running (the encoder
+    // can be reconfigured between its own Configure and this Start).
+    std::optional<common::PixelSize> early;
+    {
+      std::lock_guard lock(request_mutex);
+      early = pending_request;
+      pending_request.reset();
+    }
+    if (early.has_value()) (void)SetOutputSize(*early);
     return true;
   }
 
   void Stop() noexcept {
     std::lock_guard stream_lock(stream_mutex);
-    StopLocked();
+    StopLocked(/*forget_pending_request=*/true);
   }
 
   // --- Output-size capture -------------------------------------------------
@@ -900,7 +915,13 @@ class ScreenCaptureKitAdapter::Impl {
     std::uint64_t generation = 0;
     {
       std::lock_guard lock(request_mutex);
-      if (!running) return false;
+      if (!running) {
+        // Not capturing yet: remember the request and apply it when Start()
+        // finishes, so a ladder size chosen early is not lost until the next
+        // quality update (which a stable link may never send).
+        pending_request = size;
+        return false;
+      }
       // Never upscale: the native size is the ceiling in both dimensions.
       size.width = std::min(size.width, native_size.width);
       size.height = std::min(size.height, native_size.height);
@@ -924,8 +945,11 @@ class ScreenCaptureKitAdapter::Impl {
                              static_cast<std::uint32_t>(packed & 0xffffffffU)};
   }
 
+  // The new stream is created, started and given its first frame WITHOUT
+  // holding `stream_mutex`, so a Stop() or Start() arriving meanwhile never
+  // waits for it. Only the final swap takes the lock, and it re-checks that the
+  // capture it was started for is still the running one.
   void Retarget(std::uint64_t generation) {
-    std::lock_guard stream_lock(stream_mutex);
     common::PixelSize target;
     common::PixelSize current;
     common::PixelSize native;
@@ -940,10 +964,8 @@ class ScreenCaptureKitAdapter::Impl {
       display_id = native_display_id;
       show_cursor = cursor_supported;
     }
-    if (!stream) return;
     if (target.width == current.width && target.height == current.height) return;
 
-    const auto shared_delivery = delivery;
     CaptureError create_error;
     std::unique_ptr<ScreenCaptureKitBackendStream> fresh = backend->CreateStream(
         ScreenCaptureKitStreamConfiguration{
@@ -954,13 +976,7 @@ class ScreenCaptureKitAdapter::Impl {
             .max_pending_frames = limits.max_pending_frames,
             .show_cursor = show_cursor,
         },
-        [shared_delivery](common::CapturedFrame frame) {
-          shared_delivery->Deliver(std::move(frame));
-        },
-        [shared_delivery](CaptureError error) {
-          shared_delivery->Fail(std::move(error));
-        },
-        &create_error);
+        FrameSinkFor(generation), ErrorSinkFor(generation), &create_error);
     std::string error;
     const std::uint32_t start_ms =
         std::min(limits.stream_start_timeout_ms, kRetargetStreamTimeoutMs);
@@ -971,20 +987,35 @@ class ScreenCaptureKitAdapter::Impl {
       if (fresh) fresh->Stop(limits.stream_stop_timeout_ms);
       // Keep the running stream, and let a later request try again.
       std::lock_guard lock(request_mutex);
-      requested_size = current_size;
+      if (generation == run_generation) requested_size = current_size;
       return;
     }
-    std::unique_ptr<ScreenCaptureKitBackendStream> previous = std::move(stream);
-    stream = std::move(fresh);
+
+    std::unique_ptr<ScreenCaptureKitBackendStream> previous;
     {
-      std::lock_guard lock(request_mutex);
-      current_size = target;
+      std::lock_guard stream_lock(stream_mutex);
+      bool still_running = false;
+      {
+        std::lock_guard lock(request_mutex);
+        still_running = running && generation == run_generation;
+        if (still_running) current_size = target;
+      }
+      if (still_running && stream) {
+        previous = std::move(stream);
+        stream = std::move(fresh);
+        const bool is_native =
+            target.width == native.width && target.height == native.height;
+        output_size.store(is_native ? 0 : PackSize(target),
+                          std::memory_order_release);
+      }
     }
-    const bool is_native =
-        target.width == native.width && target.height == native.height;
-    output_size.store(is_native ? 0 : PackSize(target),
-                      std::memory_order_release);
-    previous->Stop(limits.stream_stop_timeout_ms);
+    // Whichever stream lost (the old one, or a fresh one the capture outlived)
+    // is stopped outside the lock.
+    if (previous) {
+      previous->Stop(limits.stream_stop_timeout_ms);
+    } else if (fresh) {
+      fresh->Stop(limits.stream_stop_timeout_ms);
+    }
   }
 
   const common::WorkerGeneration worker_generation;
@@ -1000,11 +1031,35 @@ class ScreenCaptureKitAdapter::Impl {
  private:
   static constexpr std::uint32_t kRetargetStreamTimeoutMs = 1'500;
 
-  void StopLocked() noexcept {
+  // A stream delivers only while it belongs to the capture that created it: a
+  // stream that outlives a Stop()/Start() (a retarget still warming up) must not
+  // feed the next session's sink.
+  ScreenCaptureKitBackendFrameSink FrameSinkFor(std::uint64_t generation) {
+    return [delivery = delivery, cell = generation_cell, generation](
+               common::CapturedFrame frame) {
+      if (cell->load(std::memory_order_acquire) != generation) {
+        delivery->CountLateFrame();
+        return;
+      }
+      delivery->Deliver(std::move(frame));
+    };
+  }
+
+  ScreenCaptureKitBackendErrorSink ErrorSinkFor(std::uint64_t generation) {
+    return [delivery = delivery, cell = generation_cell, generation](
+               CaptureError error) {
+      if (cell->load(std::memory_order_acquire) != generation) return;
+      delivery->Fail(std::move(error));
+    };
+  }
+
+  void StopLocked(bool forget_pending_request) noexcept {
     {
       std::lock_guard lock(request_mutex);
       running = false;
       ++run_generation;
+      generation_cell->store(run_generation, std::memory_order_release);
+      if (forget_pending_request) pending_request.reset();
     }
     output_size.store(0, std::memory_order_release);
     {
@@ -1024,6 +1079,11 @@ class ScreenCaptureKitAdapter::Impl {
   std::mutex request_mutex;
   bool running = false;
   std::uint64_t run_generation = 0;
+  // run_generation, readable by the stream callbacks without a lock.
+  std::shared_ptr<std::atomic<std::uint64_t>> generation_cell =
+      std::make_shared<std::atomic<std::uint64_t>>(0);
+  // An output size requested while not running; applied when Start() finishes.
+  std::optional<common::PixelSize> pending_request;
   common::PixelSize native_size;
   common::PixelSize requested_size;
   common::PixelSize current_size;

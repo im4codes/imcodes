@@ -68,13 +68,16 @@ class Log {
 
 class FakeStream final : public capture::ScreenCaptureKitBackendStream {
  public:
-  FakeStream(Log* log, common::PixelSize size, bool first_frame_ok)
-      : log_(log), size_(size), first_frame_ok_(first_frame_ok) {}
+  FakeStream(Log* log, common::PixelSize size, bool first_frame_ok, int block_ms)
+      : log_(log), size_(size), first_frame_ok_(first_frame_ok), block_ms_(block_ms) {}
   bool Start(std::uint32_t, std::string*) override {
     log_->Add("start " + Size(size_));
     return true;
   }
   bool WaitForFirstFrame(std::uint32_t, std::string* error) override {
+    log_->Add("first-frame-begin " + Size(size_));
+    // Stands in for a capture API that is slow to deliver its first frame.
+    if (block_ms_ > 0) std::this_thread::sleep_for(std::chrono::milliseconds(block_ms_));
     log_->Add("first-frame " + Size(size_));
     if (!first_frame_ok_ && error != nullptr) *error = "fake first-frame timeout";
     return first_frame_ok_;
@@ -85,6 +88,7 @@ class FakeStream final : public capture::ScreenCaptureKitBackendStream {
   Log* log_;
   common::PixelSize size_;
   bool first_frame_ok_;
+  int block_ms_;
 };
 
 class FakeBackend final : public capture::ScreenCaptureKitBackend {
@@ -92,6 +96,10 @@ class FakeBackend final : public capture::ScreenCaptureKitBackend {
   explicit FakeBackend(bool supports_output_size) : supports_(supports_output_size) {}
   Log log;
   std::atomic<bool> next_first_frame_ok{true};
+  // The next created stream takes this long to deliver its first frame.
+  std::atomic<int> next_block_first_frame_ms{0};
+  std::mutex sinks_mutex;
+  std::vector<capture::ScreenCaptureKitBackendFrameSink> frame_sinks;
 
   bool SupportsOutputSize() const noexcept override { return supports_; }
   common::ReadinessState ProbeReadiness() noexcept override { return common::ReadinessState::kReady; }
@@ -111,12 +119,18 @@ class FakeBackend final : public capture::ScreenCaptureKitBackend {
   }
   std::unique_ptr<capture::ScreenCaptureKitBackendStream> CreateStream(
       const capture::ScreenCaptureKitStreamConfiguration& configuration,
-      capture::ScreenCaptureKitBackendFrameSink, capture::ScreenCaptureKitBackendErrorSink,
+      capture::ScreenCaptureKitBackendFrameSink frame_sink,
+      capture::ScreenCaptureKitBackendErrorSink,
       capture::CaptureError* error) override {
     log.Add("create " + Size(configuration.encoded_pixels));
+    {
+      std::lock_guard lock(sinks_mutex);
+      frame_sinks.push_back(std::move(frame_sink));
+    }
     *error = {};
     return std::make_unique<FakeStream>(&log, configuration.encoded_pixels,
-                                        next_first_frame_ok.exchange(true));
+                                        next_first_frame_ok.exchange(true),
+                                        next_block_first_frame_ms.exchange(0));
   }
 
  private:
@@ -156,7 +170,7 @@ bool TestBackendWithoutSupportKeepsTheNativeStreamAlone() {
       Check(!rig.adapter->SetOutputSize({2560, 1350}), "SetOutputSize is refused") &&
       Check(!rig.adapter->OutputSize().has_value(), "output size stays native (empty)") &&
       Check(rig.backend->log.Count("create 5120x2700") == 1, "one native stream") &&
-      Check(rig.backend->log.Snapshot().size() == 3, "create/start/first-frame only: nothing else was created");
+      Check(rig.backend->log.Snapshot().size() == 4, "create/start/first-frame only: nothing else was created");
   rig.adapter->Stop();
   return ok;
 }
@@ -249,6 +263,101 @@ bool TestNotRunningRefusesAndStopCancelsAQueuedSwitch() {
          Check(!rig.adapter->SetOutputSize({2560, 1350}), "refused after Stop");
 }
 
+class Bytes final : public common::FrameStorage {
+ public:
+  Bytes() : bytes_(64, std::byte{0x2a}) {}
+  const std::byte* data() const noexcept override { return bytes_.data(); }
+  std::size_t size() const noexcept override { return bytes_.size(); }
+
+ private:
+  std::vector<std::byte> bytes_;
+};
+
+common::CapturedFrame TinyFrame() {
+  return common::CapturedFrame{
+      .encoded_pixels = {4, 4},
+      .pixel_format = common::PixelFormat::kBgra8888,
+      .row_bytes = 16,
+      .capture_time_us = 10,
+      .color_primaries = common::ColorPrimaries::kDisplayP3,
+      .storage = std::make_shared<Bytes>(),
+  };
+}
+
+bool TestStopDoesNotWaitForASlowRetarget() {
+  Rig rig;
+  if (!MakeRig(&rig, true)) return false;
+  rig.backend->next_block_first_frame_ms = 1500;
+  if (!Check(rig.adapter->SetOutputSize({2560, 1350}), "request accepted")) return false;
+  if (!Check(WaitFor([&] { return rig.backend->log.Count("first-frame-begin 2560x1350") == 1; }),
+             "the retarget is waiting for its first frame")) {
+    return false;
+  }
+  const auto before = std::chrono::steady_clock::now();
+  rig.adapter->Stop();
+  const auto waited = std::chrono::duration_cast<std::chrono::milliseconds>(
+                          std::chrono::steady_clock::now() - before).count();
+  bool ok = Check(waited < 700, "Stop() returns without waiting for the slow retarget");
+  ok = ok && Check(WaitFor([&] { return rig.backend->log.Count("stop 2560x1350") == 1; }, 5000),
+                   "the late stream is stopped, not installed");
+  ok = ok && Check(!rig.adapter->OutputSize().has_value(), "no output size after Stop");
+  return ok && Check(rig.backend->log.Count("stop 5120x2700") == 1, "the running stream was stopped once by Stop()");
+}
+
+bool TestARequestBeforeStartIsAppliedWhenTheCaptureStarts() {
+  Rig rig;
+  if (!MakeRig(&rig, true, /*start=*/false)) return false;
+  if (!Check(!rig.adapter->SetOutputSize({2560, 1350}), "refused while not running (but remembered)")) return false;
+  if (!Check(rig.adapter->Start(rig.display, [](common::CapturedFrame) {}), "start")) return false;
+  const bool ok =
+      Check(WaitFor([&] {
+              const auto size = rig.adapter->OutputSize();
+              return size.has_value() && size->width == 2560 && size->height == 1350;
+            }),
+            "the early request takes effect after Start without another request") &&
+      Check(rig.backend->log.Count("create 2560x1350") == 1, "exactly one retarget stream");
+  rig.adapter->Stop();
+  return ok;
+}
+
+bool TestAStoppedCapturesRequestIsNotCarriedIntoTheNextOne() {
+  Rig rig;
+  if (!MakeRig(&rig, true)) return false;
+  rig.adapter->Stop();
+  rig.adapter->SetOutputSize({2560, 1350});  // refused, but remembered...
+  rig.adapter->Stop();                       // ...and a Stop forgets it
+  if (!Check(rig.adapter->Start(rig.display, [](common::CapturedFrame) {}), "restart")) return false;
+  std::this_thread::sleep_for(std::chrono::milliseconds(150));
+  const bool ok = Check(!rig.adapter->OutputSize().has_value(), "a forgotten request is not applied to the next capture") &&
+                  Check(rig.backend->log.Count("create 2560x1350") == 0, "no retarget stream was made");
+  rig.adapter->Stop();
+  return ok;
+}
+
+bool TestAStaleStreamNeverFeedsTheNextSession() {
+  Rig rig;
+  if (!MakeRig(&rig, true)) return false;
+  rig.adapter->Stop();
+  std::atomic<int> received{0};
+  if (!Check(rig.adapter->Start(rig.display, [&](common::CapturedFrame) { ++received; }), "restart")) return false;
+  capture::ScreenCaptureKitBackendFrameSink first_session_sink;
+  capture::ScreenCaptureKitBackendFrameSink second_session_sink;
+  {
+    std::lock_guard lock(rig.backend->sinks_mutex);
+    if (!Check(rig.backend->frame_sinks.size() == 2, "two sessions created two streams")) return false;
+    first_session_sink = rig.backend->frame_sinks.front();
+    second_session_sink = rig.backend->frame_sinks.back();
+  }
+  first_session_sink(TinyFrame());
+  const bool stale_ignored = Check(received == 0, "a frame from the first session's stream is ignored") &&
+                             Check(rig.adapter->Statistics().ignored_late_frames >= 1,
+                                   "...and counted as a late frame");
+  second_session_sink(TinyFrame());
+  const bool current_delivered = Check(received == 1, "a frame from the current stream is delivered");
+  rig.adapter->Stop();
+  return stale_ignored && current_delivered;
+}
+
 }  // namespace
 
 int main() {
@@ -256,7 +365,11 @@ int main() {
                   TestSwitchIsMakeBeforeBreak() &&
                   TestSameSizeIsIdempotentAndNeverUpscales() &&
                   TestFailedSwitchKeepsTheRunningStream() &&
-                  TestNotRunningRefusesAndStopCancelsAQueuedSwitch();
+                  TestNotRunningRefusesAndStopCancelsAQueuedSwitch() &&
+                  TestStopDoesNotWaitForASlowRetarget() &&
+                  TestARequestBeforeStartIsAppliedWhenTheCaptureStarts() &&
+                  TestAStoppedCapturesRequestIsNotCarriedIntoTheNextOne() &&
+                  TestAStaleStreamNeverFeedsTheNextSession();
   if (ok) std::cout << "macos output-size capture counterfactuals passed\n";
   return ok ? 0 : 1;
 }
