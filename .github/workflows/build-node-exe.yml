@@ -29,6 +29,8 @@ jobs:
   build:
     name: build (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    # Ends a hung job itself instead of holding the concurrency group for the 6 h default (normal 1-7 min; the Windows leg may wait up to 250 min for the SDK producer (--wait-seconds 15000), then builds for up to 30).
+    timeout-minutes: 330
     strategy:
       fail-fast: false
       matrix:
@@ -224,6 +226,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           set -euo pipefail
+          ./scripts/ci-apt-hardening.sh
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             libx11-dev libxext-dev libxtst-dev libxfixes-dev libxrandr-dev xvfb pulseaudio

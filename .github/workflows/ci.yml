@@ -43,6 +43,8 @@ jobs:
   lint:
     name: Lint
     runs-on: ubuntu-latest
+    # Ends a hung job itself instead of holding the concurrency group for the 6 h default (normal 1 min, max 1.4).
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -57,6 +59,8 @@ jobs:
   typecheck:
     name: Typecheck
     runs-on: ubuntu-latest
+    # Ends a hung job itself instead of holding the concurrency group for the 6 h default (normal 1 min, max 1.2).
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -77,6 +81,8 @@ jobs:
   secret-scan:
     name: Secret Scan (gitleaks)
     runs-on: ubuntu-latest
+    # Ends a hung job itself instead of holding the concurrency group for the 6 h default (normal 0.2 min, max 0.4).
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
         with:
@@ -90,6 +96,8 @@ jobs:
   unit-tests:
     name: Unit Tests (Node ${{ matrix.node }})
     runs-on: ubuntu-latest
+    # Ends a hung job itself instead of holding the concurrency group for the 6 h default (normal 10 min, max 11.5).
+    timeout-minutes: 30
     strategy:
       matrix:
         node: ['22', '24']
@@ -143,6 +151,8 @@ jobs:
   preview-dist-smoke:
     name: Preview Dist Smoke
     runs-on: ubuntu-latest
+    # Ends a hung job itself instead of holding the concurrency group for the 6 h default (normal 1 min, max 1.1).
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -155,6 +165,8 @@ jobs:
   embedding-real-tests:
     name: Embedding Integration Tests
     runs-on: ubuntu-latest
+    # Ends a hung job itself instead of holding the concurrency group for the 6 h default (normal 1 min, max 1.0; downloads a model).
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -178,6 +190,8 @@ jobs:
   macos-unit-tests:
     name: Unit Tests (macOS)
     runs-on: macos-latest
+    # Ends a hung job itself instead of holding the concurrency group for the 6 h default (normal 17 min, max 19.3).
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -204,6 +218,8 @@ jobs:
   macos-remote-desktop-components:
     name: macOS Remote Desktop (from SDK)
     runs-on: macos-15
+    # Ends a hung job itself instead of holding the concurrency group for the 6 h default (normal 1.5 min, max 2.2).
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -281,6 +297,8 @@ jobs:
   windows-unit-tests:
     name: Unit Tests (Windows)
     runs-on: windows-latest
+    # Ends a hung job itself instead of holding the concurrency group for the 6 h default (normal 2 min, max 2.7).
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -313,6 +331,8 @@ jobs:
   aidesk-panel-host-windows:
     name: aiDesk panel window host (Windows build)
     runs-on: windows-latest
+    # Ends a hung job itself instead of holding the concurrency group for the 6 h default (normal 1.6 min, max 2.2).
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -334,6 +354,8 @@ jobs:
   windows-conpty-tests:
     name: Unit Tests (Windows ConPTY)
     runs-on: windows-latest
+    # Ends a hung job itself instead of holding the concurrency group for the 6 h default (normal 1.7 min, max 2.8).
+    timeout-minutes: 20
     steps:
       - name: Checkout
         id: checkout_1
@@ -391,6 +413,8 @@ jobs:
   web-tests-unit:
     name: Web Tests (Unit)
     runs-on: ubuntu-latest
+    # Ends a hung job itself instead of holding the concurrency group for the 6 h default (normal 3 min, max 3.3).
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -404,6 +428,8 @@ jobs:
   web-tests-components:
     name: Web Tests (Components)
     runs-on: ubuntu-latest
+    # Ends a hung job itself instead of holding the concurrency group for the 6 h default (normal 2 min, max 2.1).
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -417,6 +443,8 @@ jobs:
   web-chat-perf:
     name: Web Chat Timeline Perf Guard
     runs-on: ubuntu-latest
+    # Ends a hung job itself instead of holding the concurrency group for the 6 h default (normal 2-3 min; 12.9 once when apt stalled; the install step is retried 3 x 4 min below).
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -430,7 +458,17 @@ jobs:
       # performs no layout, so the work this guards is largely invisible there.
       # The assertion is a ratio of one session length against another, which
       # normalises away how fast the CI host happens to be.
-      - run: cd web && npx playwright install --with-deps chromium
+      # `--with-deps` drives apt-get, and an apt mirror that stalls does not fail,
+      # it waits: this one step took 9-11 min on two earlier runs (it is ~25 s)
+      # and on run 37664607739 it never finished, holding the push concurrency
+      # group for hours. Bound apt's own network waits, then bound and retry the
+      # whole install.
+      - name: Install Chromium and its system libraries (bounded and retried)
+        timeout-minutes: 15
+        run: |
+          ./scripts/ci-apt-hardening.sh
+          cd web
+          CI_RETRY_BETWEEN_ATTEMPTS='sudo dpkg --configure -a' ../scripts/ci-retry.sh 3 240 npx playwright install --with-deps chromium
       - run: cd web && npm run test:browser:perf
       - name: Upload perf report
         if: always()
@@ -449,6 +487,8 @@ jobs:
   server-tests:
     name: Server Unit Tests
     runs-on: ubuntu-latest
+    # Ends a hung job itself instead of holding the concurrency group for the 6 h default (normal 2.3 min, max 2.7).
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -474,6 +514,8 @@ jobs:
   server-db-tests:
     name: Server DB Integration Tests
     runs-on: ubuntu-latest
+    # Ends a hung job itself instead of holding the concurrency group for the 6 h default (normal 2 min, max 2.4; the image pull and the tests are each retried).
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -526,6 +568,8 @@ jobs:
   e2e-tests:
     name: E2E Tests
     runs-on: ubuntu-latest
+    # Ends a hung job itself instead of holding the concurrency group for the 6 h default (normal 2.2 min, max 2.7).
+    timeout-minutes: 15
     needs: [unit-tests]
     steps:
       - name: Checkout
@@ -588,7 +632,9 @@ jobs:
           node-version: ${{ env.NODE_VERSION_PRIMARY }}
           cache: 'npm'
       - name: Install tmux
-        run: sudo apt-get install -y tmux
+        run: |
+          ./scripts/ci-apt-hardening.sh
+          sudo apt-get install -y tmux
       - name: Prime tmux server (ensures socket dir exists)
         run: tmux new-session -d -s init && tmux kill-session -t init
       - run: ./scripts/ci-npm-ci.sh .
@@ -604,6 +650,8 @@ jobs:
   repo-integration-tests:
     name: Repo Provider Integration Tests
     runs-on: ubuntu-latest
+    # Ends a hung job itself instead of holding the concurrency group for the 6 h default (normal 1 min, max 1.3).
+    timeout-minutes: 10
     needs: [unit-tests]
     steps:
       - uses: actions/checkout@v4
@@ -632,6 +680,8 @@ jobs:
   coverage-shard:
     name: Coverage shard ${{ matrix.shard }}
     runs-on: ubuntu-latest
+    # Ends a hung job itself instead of holding the concurrency group for the 6 h default (normal 5-6 min, max 6.8).
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       max-parallel: 4
@@ -670,6 +720,8 @@ jobs:
   coverage:
     name: Coverage Report
     runs-on: ubuntu-latest
+    # Ends a hung job itself instead of holding the concurrency group for the 6 h default (normal 1.3 min, max 1.9).
+    timeout-minutes: 10
     needs: [coverage-shard]
     env:
       CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
@@ -731,6 +783,8 @@ jobs:
   publish:
     name: Publish to npm
     runs-on: ubuntu-latest
+    # Ends a hung job itself instead of holding the concurrency group for the 6 h default (normal 2 min).
+    timeout-minutes: 20
     needs: [docker]
     if: github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev'
     permissions:
@@ -810,6 +864,8 @@ jobs:
     name: Resolve release version
     if: github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev'
     runs-on: ubuntu-latest
+    # Ends a hung job itself instead of holding the concurrency group for the 6 h default (normal 0.2 min).
+    timeout-minutes: 5
     outputs:
       app_version: ${{ steps.version.outputs.app_version }}
     steps:
@@ -833,6 +889,8 @@ jobs:
     needs: [release_version]
     if: github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev'
     runs-on: ${{ matrix.runner }}
+    # Ends a hung job itself instead of holding the concurrency group for the 6 h default (normal 2-8 min; the Windows leg may wait up to 250 min for the SDK producer (--wait-seconds 15000), then builds for up to 30).
+    timeout-minutes: 330
     env:
       IMCODES_BUILD_VERSION: ${{ needs.release_version.outputs.app_version }}
     strategy:
@@ -1073,6 +1131,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           set -euo pipefail
+          ./scripts/ci-apt-hardening.sh
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             libx11-dev libxext-dev libxtst-dev libxfixes-dev libxrandr-dev xvfb pulseaudio
@@ -1256,6 +1315,8 @@ jobs:
   docker:
     name: Docker Build & Push
     runs-on: ubuntu-latest
+    # Ends a hung job itself instead of holding the concurrency group for the 6 h default (normal 4 min (2 runs seen); an image build + push).
+    timeout-minutes: 45
     needs: [lint, typecheck, secret-scan, unit-tests, macos-unit-tests, windows-unit-tests, windows-conpty-tests, web-tests-unit, web-tests-components, web-chat-perf, server-tests, server-db-tests, e2e-tests, release_version, controlled-node-executables]
     if: github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev'
     outputs:
@@ -1583,6 +1644,8 @@ jobs:
   android-release:
     name: Android Release Build
     runs-on: ubuntu-latest
+    # Ends a hung job itself instead of holding the concurrency group for the 6 h default (normal 5.3 min, max 5.7).
+    timeout-minutes: 30
     needs: [lint, typecheck, secret-scan, unit-tests, web-tests-unit, web-tests-components, server-tests, e2e-tests]
     if: github.ref == 'refs/heads/master' || github.ref == 'refs/heads/dev'
     permissions:
