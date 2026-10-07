@@ -73,6 +73,15 @@ class RawVideoPath {
     return raw_codecs_allowed_.load(std::memory_order_acquire);
   }
 
+  // Opt-in (default off): ask the capture for NV12 rather than BGRA while raw codecs
+  // are allowed. See raw_codec_settings.h for why BGRA is the default.
+  void PreferNv12Capture(bool prefer) noexcept {
+    prefer_nv12_capture_.store(prefer, std::memory_order_release);
+  }
+  [[nodiscard]] bool prefer_nv12_capture() const noexcept {
+    return prefer_nv12_capture_.load(std::memory_order_acquire);
+  }
+
   void SetNegotiatedCodec(NegotiatedVideoCodec codec) noexcept {
     negotiated_.store(codec, std::memory_order_release);
   }
@@ -141,6 +150,7 @@ class RawVideoPath {
  private:
   const std::shared_ptr<std::atomic<std::uint64_t>> accepted_bytes_;
   std::atomic<bool> raw_codecs_allowed_{false};
+  std::atomic<bool> prefer_nv12_capture_{false};
   std::atomic<NegotiatedVideoCodec> negotiated_{NegotiatedVideoCodec::kUnknown};
   std::atomic<std::uint64_t> no_sink_frames_{0};
   mutable std::mutex mutex_;

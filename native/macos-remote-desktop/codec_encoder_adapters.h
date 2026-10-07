@@ -86,9 +86,11 @@ class CodecSwitchingEncoderAdapter final : public ReconfigurableEncoder {
   void Stop() noexcept override;
   [[nodiscard]] common::EncoderClass ImplementationClass() const noexcept override;
   [[nodiscard]] std::uint64_t DroppedFrames() const noexcept override;
-  // NV12 only when this node may send a raw codec: a capture that already
-  // delivers 420v makes the VP9 conversion a plane split. The H.264 fallback then
-  // converts back (see Encode), which is the rare case.
+  // BGRA by default, so neither codec pays a conversion round trip. NV12 only when
+  // this node may send a raw codec AND NV12 capture was asked for (an opt-in for
+  // A/B measurement; RawVideoPath::PreferNv12Capture): a capture that already
+  // delivers 420v makes the VP9 conversion a plane split, and the H.264 fallback
+  // then converts back (see Encode).
   [[nodiscard]] common::PixelFormat PreferredInputFormat() const noexcept override;
 
   bool ReconfigureFromQualitySelection(

@@ -31,6 +31,13 @@ std::optional<RawCodecSetting> ParseRawCodecSetting(std::string_view text) {
   return std::nullopt;
 }
 
+std::optional<bool> ParseOnOff(std::string_view text) {
+  const std::string value = Lower(Trim(text));
+  if (value == "on") return true;
+  if (value == "off") return false;
+  return std::nullopt;
+}
+
 ParsedConfig ParseRawCodecConfig(std::string_view text) {
   ParsedConfig parsed;
   while (!text.empty()) {
@@ -40,15 +47,24 @@ ParsedConfig ParseRawCodecConfig(std::string_view text) {
     if (line.empty() || line.front() == '#') continue;
     const std::size_t equals = line.find('=');
     if (equals == std::string_view::npos) continue;
-    if (Trim(line.substr(0, equals)) != kRawCodecsConfigKey) continue;
-    const std::optional<RawCodecSetting> value =
-        ParseRawCodecSetting(line.substr(equals + 1));
-    if (value.has_value()) {
-      parsed.raw_codecs = value;
-      parsed.invalid = false;
-    } else {
-      // Remember that the LAST statement was unusable; an earlier valid one stays.
-      parsed.invalid = true;
+    const std::string_view key = Trim(line.substr(0, equals));
+    const std::string_view value_text = line.substr(equals + 1);
+    if (key == kRawCodecsConfigKey) {
+      const std::optional<RawCodecSetting> value = ParseRawCodecSetting(value_text);
+      if (value.has_value()) {
+        parsed.raw_codecs = value;
+        parsed.invalid = false;
+      } else {
+        // Remember that the LAST statement was unusable; an earlier valid one stays.
+        parsed.invalid = true;
+      }
+    } else if (key == kNv12CaptureConfigKey) {
+      const std::optional<bool> value = ParseOnOff(value_text);
+      if (value.has_value()) {
+        parsed.nv12_capture = value;
+      } else {
+        parsed.invalid = true;
+      }
     }
   }
   return parsed;
@@ -62,15 +78,29 @@ RawCodecSettings ResolveRawCodecSettings(const RawCodecEnvironmentLookup& enviro
     return value != nullptr ? std::string_view(value) : std::string_view{};
   };
 
-  const std::string_view from_env = env(kRawCodecsEnvVar);
-  if (!Trim(from_env).empty()) {
-    if (const std::optional<RawCodecSetting> value = ParseRawCodecSetting(from_env)) {
+  bool raw_decided = false;
+  bool nv12_decided = false;
+  const std::string_view raw_from_env = env(kRawCodecsEnvVar);
+  if (!Trim(raw_from_env).empty()) {
+    if (const std::optional<RawCodecSetting> value = ParseRawCodecSetting(raw_from_env)) {
       settings.raw_codecs = *value;
       settings.source = RawCodecSettingSource::kEnvironment;
-      return settings;
+      raw_decided = true;
+    } else {
+      settings.ignored_invalid_value = true;
     }
-    settings.ignored_invalid_value = true;
   }
+  const std::string_view nv12_from_env = env(kNv12CaptureEnvVar);
+  if (!Trim(nv12_from_env).empty()) {
+    if (const std::optional<bool> value = ParseOnOff(nv12_from_env)) {
+      settings.nv12_capture = *value;
+      settings.nv12_source = RawCodecSettingSource::kEnvironment;
+      nv12_decided = true;
+    } else {
+      settings.ignored_invalid_value = true;
+    }
+  }
+  if (raw_decided && nv12_decided) return settings;
 
   std::string directory(env("IMCODES_HOME"));
   if (directory.empty()) {
@@ -81,9 +111,13 @@ RawCodecSettings ResolveRawCodecSettings(const RawCodecEnvironmentLookup& enviro
     if (const std::optional<std::string> text =
             read_file(directory + "/" + kRawCodecsConfigFile)) {
       const ParsedConfig parsed = ParseRawCodecConfig(*text);
-      if (parsed.raw_codecs.has_value()) {
+      if (!raw_decided && parsed.raw_codecs.has_value()) {
         settings.raw_codecs = *parsed.raw_codecs;
         settings.source = RawCodecSettingSource::kFile;
+      }
+      if (!nv12_decided && parsed.nv12_capture.has_value()) {
+        settings.nv12_capture = *parsed.nv12_capture;
+        settings.nv12_source = RawCodecSettingSource::kFile;
       }
       if (parsed.invalid) settings.ignored_invalid_value = true;
     }

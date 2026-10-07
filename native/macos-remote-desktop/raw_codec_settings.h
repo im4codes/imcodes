@@ -30,11 +30,23 @@ inline constexpr char kRawCodecsEnvVar[] = "IMCODES_RD_RAW_CODECS";
 inline constexpr char kRawCodecsConfigFile[] = "remote-desktop-video.conf";
 inline constexpr char kRawCodecsConfigKey[] = "rawCodecs";
 
+// Second, independent switch (default off): ask the capture for NV12 (420v) instead
+// of BGRA while raw codecs are allowed. Off by default because the capture then
+// stays BGRA for both codecs: VP9 converts BGRA -> I420 with libyuv in a few
+// milliseconds, and an H.264 fallback needs no conversion back. NV12 saves capture
+// bandwidth but is unproven against a real capture (matrix, text edges), so it is
+// opt-in for A/B measurement: IMCODES_RD_NV12=on|off, or `nv12Capture=on` in the
+// same file, resolved exactly like rawCodecs.
+inline constexpr char kNv12CaptureEnvVar[] = "IMCODES_RD_NV12";
+inline constexpr char kNv12CaptureConfigKey[] = "nv12Capture";
+
 enum class RawCodecSettingSource { kDefault, kEnvironment, kFile };
 
 struct RawCodecSettings {
   RawCodecSetting raw_codecs = RawCodecSetting::kAuto;
   RawCodecSettingSource source = RawCodecSettingSource::kDefault;
+  bool nv12_capture = false;
+  RawCodecSettingSource nv12_source = RawCodecSettingSource::kDefault;
   // A value was present but not recognised (and therefore ignored).
   bool ignored_invalid_value = false;
 };
@@ -52,8 +64,12 @@ using RawCodecFileReader = std::function<std::optional<std::string>(const std::s
 // override earlier ones, like a shell would.
 struct ParsedConfig {
   std::optional<RawCodecSetting> raw_codecs;
+  std::optional<bool> nv12_capture;
   bool invalid = false;
 };
+
+// "on" / "off", ASCII case-insensitive, surrounding blanks ignored.
+[[nodiscard]] std::optional<bool> ParseOnOff(std::string_view text);
 [[nodiscard]] ParsedConfig ParseRawCodecConfig(std::string_view text);
 
 // Resolves the effective setting from the environment and the config file.

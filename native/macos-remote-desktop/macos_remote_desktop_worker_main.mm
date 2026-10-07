@@ -2873,11 +2873,13 @@ int RunLaunchAgentSession(const macos::WorkerLaunchContext& context) {
           HardwareH264EncoderAvailable(), capture_backend->SupportsOutputSize(),
           raw_settings.raw_codecs);
       media_binder->raw_video()->AllowRawCodecs(raw_decision.allowed);
+      media_binder->raw_video()->PreferNv12Capture(raw_settings.nv12_capture);
       std::cerr << "macos_remote_desktop_worker_raw_codecs allowed="
                 << (raw_decision.allowed ? 1 : 0)
                 << " reason=" << macos::RawCodecReasonName(raw_decision.reason)
                 << " setting_source="
                 << macos::RawCodecSettingSourceName(raw_settings.source)
+                << " nv12_capture=" << (raw_settings.nv12_capture ? 1 : 0)
                 << (raw_settings.ignored_invalid_value ? " invalid_value_ignored=1" : "")
                 << "\n";
     }

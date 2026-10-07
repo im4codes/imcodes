@@ -113,6 +113,16 @@ statement wins:
 An unrecognised value is ignored (and reported on the log line), never treated as
 `off`.
 
+### NV12 capture (opt-in)
+
+By default the capture stays BGRA for both codecs: VP9 converts BGRA to I420 once
+with libyuv (a few milliseconds), and an H.264 fallback is fed the capture directly,
+with no conversion back. Asking the capture for NV12 (420v, BT.709) instead saves
+capture bandwidth but is unproven against a real capture, so it is opt-in for A/B
+measurement: `IMCODES_RD_NV12=on|off`, or `nv12Capture=on` in the same file, resolved
+exactly like `rawCodecs` (each key on its own). With it on, an H.264 fallback converts
+each frame back to BGRA.
+
 ```sh
 mkdir -p ~/.imcodes && printf 'rawCodecs=off\n' > ~/.imcodes/remote-desktop-video.conf   # back to H.264
 rm ~/.imcodes/remote-desktop-video.conf                                                  # back to auto

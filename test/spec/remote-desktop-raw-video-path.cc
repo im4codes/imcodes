@@ -134,10 +134,12 @@ std::optional<common::CapturedFrame> StubNv12ToBgra(
   return out;
 }
 
-std::shared_ptr<macos::RawVideoPath> MakePath(bool allowed, bool converter = true) {
+std::shared_ptr<macos::RawVideoPath> MakePath(bool allowed, bool converter = true,
+                                              bool nv12 = true) {
   auto counter = std::make_shared<std::atomic<std::uint64_t>>(0);
   auto path = std::make_shared<macos::RawVideoPath>(counter);
   path->AllowRawCodecs(allowed);
+  path->PreferNv12Capture(nv12);
   if (converter) path->SetNv12ToBgraConverter(StubNv12ToBgra);
   return path;
 }
@@ -258,8 +260,8 @@ void RawAdapterReconfigureNotifiesOnlyOnASizeChangeAndOutsideItsLock() {
 }
 
 struct Rig {
-  explicit Rig(bool allowed, bool converter = true)
-      : path(MakePath(allowed, converter)), sink(std::make_shared<CountingSink>()),
+  explicit Rig(bool allowed, bool converter = true, bool nv12 = true)
+      : path(MakePath(allowed, converter, nv12)), sink(std::make_shared<CountingSink>()),
         sw(h264, raw_fake, path) {
     raw_fake.preferred = common::PixelFormat::kNv12;  // as the real raw adapter
     path->SetSink(sink);
@@ -307,6 +309,20 @@ void ANode_WithHardwareH264_NeverUsesTheRawPath() {
   Require(rig.h264.encodes == 1 && rig.raw_fake.encodes == 0, "always VideoToolbox");
   Require(rig.sw.PreferredInputFormat() == common::PixelFormat::kBgra8888, "BGRA capture, as before");
   Require(rig.sw.ImplementationClass() == rig.h264.ImplementationClass(), "reports the VideoToolbox encoder");
+}
+
+void ByDefaultNeitherCodecPaysAConversionRoundTrip() {
+  // Raw codecs allowed, NV12 NOT asked for (the default): the capture stays BGRA.
+  Rig rig(true, /*converter=*/true, /*nv12=*/false);
+  Require(rig.sw.PreferredInputFormat() == common::PixelFormat::kBgra8888, "BGRA capture by default");
+  Require(rig.sw.Configure(Config(1280, 720), {}), "configure");
+  rig.path->SetNegotiatedCodec(macos::NegotiatedVideoCodec::kH264);
+  Require(rig.sw.Encode(Bgra(1280, 720), false), "H.264");
+  Require(rig.h264.last_format == common::PixelFormat::kBgra8888 && rig.sw.fallback_conversions() == 0,
+          "the H.264 fallback is fed the capture directly: no NV12 -> BGRA round trip");
+  rig.path->SetNegotiatedCodec(macos::NegotiatedVideoCodec::kVp9);
+  Require(rig.sw.Encode(Bgra(1280, 720), false) && rig.raw_fake.last_format == common::PixelFormat::kBgra8888,
+          "VP9 is handed the BGRA frame; libyuv converts it once, on the libwebrtc side");
 }
 
 void H264FallbackConvertsNv12BackToBgra() {
@@ -388,6 +404,7 @@ int main() {
   SwitchSendsFramesByTheNegotiatedCodec();
   ARouteSwitchBackToH264AsksForAKeyframe();
   ANode_WithHardwareH264_NeverUsesTheRawPath();
+  ByDefaultNeitherCodecPaysAConversionRoundTrip();
   H264FallbackConvertsNv12BackToBgra();
   WithoutAConverterTheCaptureStaysBgra();
   SwitchConfigureSucceedsWithEitherEncoder();

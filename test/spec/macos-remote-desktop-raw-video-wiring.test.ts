@@ -27,6 +27,7 @@ describe('macOS raw (libvpx) video path wiring', () => {
     expect(worker).toContain('S_ISREG(info.st_mode)');
     expect(worker).toContain('info.st_size > kMaxBytes');
     expect(worker).toContain('AllowRawCodecs(raw_decision.allowed)');
+    expect(worker).toContain('PreferNv12Capture(raw_settings.nv12_capture)');
     // Decided after the capture backend exists (and refused when it does not), never before.
     expect(worker.indexOf('DecideRawCodecs(')).toBeGreaterThan(worker.indexOf('macos_remote_desktop_worker_capture_backend_unavailable'));
     expect(worker).toContain('macos_remote_desktop_worker_raw_codecs allowed=');

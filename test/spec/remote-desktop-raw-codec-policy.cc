@@ -155,6 +155,48 @@ void AnInvalidValueIsIgnoredNeverTreatedAsOff() {
   Require(t.raw_codecs == macos::RawCodecSetting::kAuto && t.ignored_invalid_value, "a typo in the file leaves the default");
 }
 
+void Nv12CaptureIsAnIndependentOptInSwitch() {
+  Require(macos::ParseOnOff("on") == std::optional<bool>(true) && macos::ParseOnOff(" OFF ") == std::optional<bool>(false), "on/off");
+  for (const char* bad : {"", "yes", "1", "auto", "true"}) Require(!macos::ParseOnOff(bad).has_value(), bad);
+
+  FakeFiles none;
+  std::map<std::string, std::string> empty;
+  const macos::RawCodecSettings d = macos::ResolveRawCodecSettings(Env(empty), none.Reader());
+  Require(!d.nv12_capture && d.nv12_source == macos::RawCodecSettingSource::kDefault, "NV12 capture is off by default");
+
+  std::map<std::string, std::string> env = {{"IMCODES_RD_NV12", "on"}};
+  const macos::RawCodecSettings e = macos::ResolveRawCodecSettings(Env(env), none.Reader());
+  Require(e.nv12_capture && e.nv12_source == macos::RawCodecSettingSource::kEnvironment &&
+              e.raw_codecs == macos::RawCodecSetting::kAuto, "environment on; rawCodecs untouched");
+
+  FakeFiles file;
+  file.files["/Users/u/.imcodes/remote-desktop-video.conf"] = "nv12Capture=on\nrawCodecs=off\n";
+  std::map<std::string, std::string> home = {{"HOME", "/Users/u"}};
+  const macos::RawCodecSettings f = macos::ResolveRawCodecSettings(Env(home), file.Reader());
+  Require(f.nv12_capture && f.nv12_source == macos::RawCodecSettingSource::kFile &&
+              f.raw_codecs == macos::RawCodecSetting::kOff, "both keys read from one file, independently");
+
+  // The environment decides one key, the file still decides the other.
+  std::map<std::string, std::string> mixed = {{"HOME", "/Users/u"}, {"IMCODES_RD_NV12", "off"}};
+  const macos::RawCodecSettings m = macos::ResolveRawCodecSettings(Env(mixed), file.Reader());
+  Require(!m.nv12_capture && m.nv12_source == macos::RawCodecSettingSource::kEnvironment &&
+              m.raw_codecs == macos::RawCodecSetting::kOff && m.source == macos::RawCodecSettingSource::kFile,
+          "environment nv12=off, file rawCodecs=off");
+
+  // The environment decides rawCodecs only; the file still supplies nv12Capture.
+  std::map<std::string, std::string> raw_env = {{"HOME", "/Users/u"}, {"IMCODES_RD_RAW_CODECS", "auto"}};
+  const macos::RawCodecSettings r = macos::ResolveRawCodecSettings(Env(raw_env), file.Reader());
+  Require(r.raw_codecs == macos::RawCodecSetting::kAuto && r.source == macos::RawCodecSettingSource::kEnvironment &&
+              r.nv12_capture && r.nv12_source == macos::RawCodecSettingSource::kFile,
+          "environment rawCodecs does not stop the file from supplying nv12Capture");
+
+  const macos::ParsedConfig typo = macos::ParseRawCodecConfig("nv12Capture=maybe\n");
+  Require(!typo.nv12_capture.has_value() && typo.invalid, "a typo is reported and leaves NV12 off");
+  std::map<std::string, std::string> badenv = {{"IMCODES_RD_NV12", "yes"}};
+  const macos::RawCodecSettings b = macos::ResolveRawCodecSettings(Env(badenv), none.Reader());
+  Require(!b.nv12_capture && b.ignored_invalid_value, "an invalid environment value is ignored");
+}
+
 void OffRestoresTheOldBehaviourWhateverTheMacIs() {
   using macos::RawCodecSetting;
   for (const bool hardware : {false, true})
@@ -195,6 +237,7 @@ int main() {
   TheConfigFileIsReadLikeAShellWould();
   ResolutionPrefersTheEnvironmentThenTheFileThenAuto();
   AnInvalidValueIsIgnoredNeverTreatedAsOff();
+  Nv12CaptureIsAnIndependentOptInSwitch();
   OffRestoresTheOldBehaviourWhateverTheMacIs();
   TheEncoderThreadCapFollowsTheMeasuredScaling();
   std::cout << "raw codec policy counterfactuals passed\n";

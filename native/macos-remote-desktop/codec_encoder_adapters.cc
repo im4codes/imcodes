@@ -142,10 +142,12 @@ std::uint64_t CodecSwitchingEncoderAdapter::DroppedFrames() const noexcept {
 
 common::PixelFormat CodecSwitchingEncoderAdapter::PreferredInputFormat()
     const noexcept {
-  // Only when the H.264 fallback can convert back: an NV12 capture with no way
-  // to feed VideoToolbox would leave H.264 unusable.
+  // BGRA unless NV12 was asked for: with BGRA the VP9 path converts once with libyuv
+  // and the H.264 fallback needs no conversion at all. When NV12 is asked for, only
+  // if the H.264 fallback can convert back; an NV12 capture with no way to feed
+  // VideoToolbox would leave H.264 unusable.
   return path_ != nullptr && path_->raw_codecs_allowed() &&
-                 path_->has_nv12_to_bgra()
+                 path_->prefer_nv12_capture() && path_->has_nv12_to_bgra()
              ? raw_.PreferredInputFormat()
              : h264_.PreferredInputFormat();
 }
