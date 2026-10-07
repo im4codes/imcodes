@@ -894,7 +894,7 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
   },
   [MEMORY_MCP_TOOL_NAMES.SESSION_CLOSE]: {
     name: MEMORY_MCP_TOOL_NAMES.SESSION_CLOSE,
-    description: 'Close one exact sub-session of this project (soft: reopenable by the user). Creator or project Brain only; never a Brain, main session, clone or yourself. Refused while a pair is open, a turn runs or messages are queued, unless the Brain forces. Idempotent.',
+    description: 'Close one exact sub-session of this project (soft: reopenable by the user). Creator or project Brain only; never a Brain, main session, clone or yourself. Refused while a pair is open, a turn runs (an unanswered question counts) or messages are queued; Brain-only force discards those, never unread receipts. Idempotent.',
     inputSchema: objectSchema({
       target: stringSchema('Exact sub-session name.'),
       force: booleanSchema('Brain only: close despite open pair, running turn or queued messages.'),
@@ -954,7 +954,7 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
             description: 'Explicit Brain-owned automatic-audit policy. Omit to inherit the creating Brain session snapshot.',
           },
           executionPool: { type: 'string', enum: ['primary', 'economy'], description: 'Configured execution pool.' },
-          autoProvision: { type: 'boolean', description: 'When true (target omitted), ALWAYS creates a new sub-session, never reuses one; the same top-level idempotencyKey (required) returns the same session. Type: requestedExecutionType (all required fields), else the configured pool\'s first executor entry, else your provider family\'s secondary model. Stays open until session_close.' },
+          autoProvision: { type: 'boolean', description: 'When true (target omitted), ALWAYS creates a new sub-session, never reuses one; the same top-level idempotencyKey (required) returns the same session while it is open (after session_close a repeat creates a new one). Type: requestedExecutionType (all required fields), else the configured pool\'s first executor entry, else your provider family\'s secondary model. Stays open until session_close.' },
           requestedExecutionType: objectSchema({
             capabilityId: stringSchema('Exact canonical capability id for the explicitly selected execution identity.'),
             agentType: stringSchema('Explicitly selected SDK agent type.'),

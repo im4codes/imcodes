@@ -9,7 +9,9 @@ import {
   PROVIDER_LIMIT_EVIDENCE_KINDS,
 } from '../../shared/delegation-availability.js';
 import {
+  autoCreatedSlotsInFlightForTests,
   clearSupervisionAutoProvisionStateForTests,
+  createPairSubSession,
   defaultCountActiveSupervisionAssignments,
   defaultHasActiveSupervisionLease,
   provisionSupervisionTarget,
@@ -17,6 +19,7 @@ import {
   type SupervisionAutoProvisionRequest,
 } from '../../src/daemon/supervision-auto-provision.js';
 import { SupervisionTaskRegistry } from '../../src/daemon/supervision-state-store.js';
+import { TASK_PAIR_AUTO_CREATED_SESSION_MAX_PER_PROJECT, TASK_PAIR_CREATED_SESSION_REASONS } from '../../shared/task-pair.js';
 import type { SubSessionRecord } from '../../src/daemon/subsession-manager.js';
 import type { SessionRecord } from '../../src/store/session-store.js';
 import {
@@ -1053,21 +1056,21 @@ describe('forced creation (explicit task.autoProvision)', () => {
 
   it('refuses beyond the per-project cap of auto-created sessions, but still answers a retry of an existing key', async () => {
     const marked = (index: number, patch: Partial<SessionRecord> = {}) => idleMatch(`deck_sub_marked_${index}`, {
-      pairCreatedMetadata: { autoCreated: true, createdBy: 'deck_proj_brain', source: 'send_auto_provision' }, ...patch,
+      pairCreatedMetadata: { autoCreated: true, createdBy: 'deck_proj_brain', source: 'send_auto_provision', reason: TASK_PAIR_CREATED_SESSION_REASONS.EXPLICIT, createdAt: 1 }, ...patch,
     });
-    const others = Array.from({ length: 5 }, (_unused, index) => marked(index));
+    const others = Array.from({ length: TASK_PAIR_AUTO_CREATED_SESSION_MAX_PER_PROJECT - 1 }, (_unused, index) => marked(index));
     const h = harness([parent([OPENAI]), ...others]);
     // Another project's marked sessions do not count against this project.
     h.sessions.push(session('deck_other_brain', { role: 'brain', projectName: 'other' }), idleMatch('deck_sub_foreign', {
       parentSession: 'deck_other_brain', projectName: 'other',
       pairCreatedMetadata: { autoCreated: true, createdBy: 'deck_other_brain' },
     }));
-    expect(await provisionSupervisionTarget(forced({ idempotencyKey: 'sixth' }), h.deps)).toMatchObject({ ok: true });
-    const seventh = await provisionSupervisionTarget(forced({ idempotencyKey: 'seventh' }), h.deps);
-    expect(seventh).toMatchObject({ ok: false, reason: 'auto_created_cap_reached' });
+    expect(await provisionSupervisionTarget(forced({ idempotencyKey: 'last-slot' }), h.deps)).toMatchObject({ ok: true });
+    const over = await provisionSupervisionTarget(forced({ idempotencyKey: 'over-the-cap' }), h.deps);
+    expect(over).toMatchObject({ ok: false, reason: 'auto_created_cap_reached' });
     expect(h.start).toHaveBeenCalledTimes(1);
-    // The session of the sixth key already exists: replaying that key is not a new creation.
-    expect(await provisionSupervisionTarget(forced({ idempotencyKey: 'sixth' }), h.deps)).toMatchObject({ ok: true });
+    // The session of the last-slot key already exists: replaying that key is not a new creation.
+    expect(await provisionSupervisionTarget(forced({ idempotencyKey: 'last-slot' }), h.deps)).toMatchObject({ ok: true });
   });
 
   it('removes a session whose launch threw or never became ready, and leaves no cooldown behind', async () => {
@@ -1109,5 +1112,147 @@ describe('forced creation (explicit task.autoProvision)', () => {
     expect(result).toMatchObject({ ok: true, evidence: { origin: 'spawned' } });
     expect(h.stop).not.toHaveBeenCalled();
     expect(h.sessions.some((candidate) => candidate.name === forcedSession.name)).toBe(true);
+  });
+});
+
+
+// A transport launch takes seconds and writes the creation marker only when it finishes, so the cap has to count launches still in flight.
+describe('the per-project cap of auto-created sessions under concurrency', () => {
+  beforeEach(() => clearSupervisionAutoProvisionStateForTests());
+
+  const MAX = TASK_PAIR_AUTO_CREATED_SESSION_MAX_PER_PROJECT;
+  const marker = { autoCreated: true as const, createdBy: 'deck_proj_brain', source: 'send_auto_provision' as const, reason: TASK_PAIR_CREATED_SESSION_REASONS.EXPLICIT, createdAt: 1 };
+  const forcedRequest = (key: string): SupervisionAutoProvisionRequest => request({
+    provenance: 'manual_explicit', forceCreate: true, idempotencyKey: key,
+    requestedCapabilityId: OPENAI.capabilityId, requestedExecutionConfig: OPENAI,
+  });
+  const markedSessions = (count: number) => Array.from({ length: count }, (_unused, index) => session(`deck_sub_marked_${index}`, {
+    parentSession: 'deck_proj_brain', role: 'w1', userCreated: false, label: 'Auto primary', pairCreatedMetadata: marker,
+  }));
+
+  /** A launch the test finishes by hand: until `finish()` the new session is absent from the list, as during a real transport launch. */
+  function slowLaunches() {
+    const sessions: SessionRecord[] = [parent([OPENAI]), ...markedSessions(MAX - 1)];
+    const pending: Array<{ sub: SubSessionRecord; finish: () => void; fail: (error: Error) => void }> = [];
+    const start = vi.fn((sub: SubSessionRecord) => new Promise<void>((resolve, reject) => {
+      pending.push({
+        sub,
+        finish: () => {
+          // The marker lands with the record, after the launch: exactly the window the cap used to miss.
+          sessions.push(session(`deck_sub_${sub.id}`, {
+            parentSession: sub.parentSession ?? undefined, role: 'w1', label: sub.label ?? undefined, agentType: sub.type, runtimeType: 'transport',
+            providerId: sub.providerId ?? sub.type, activeModel: sub.requestedModel ?? undefined, pairCreatedMetadata: sub.pairCreatedMetadata ?? undefined,
+          }));
+          resolve();
+        },
+        fail: (error) => reject(error),
+      });
+    }));
+    const stop = vi.fn(async (name: string) => {
+      const index = sessions.findIndex((candidate) => candidate.name === name);
+      if (index >= 0) sessions.splice(index, 1);
+      return index >= 0;
+    });
+    const deps: SupervisionAutoProvisionDeps = {
+      now: () => NOW, listSessions: () => [...sessions], getSession: (name) => sessions.find((candidate) => candidate.name === name),
+      startSubSession: start, stopSubSession: stop, hasActiveSupervisionLease: () => false, countActiveSupervisionAssignments: () => 0,
+      wait: async () => {}, readyTimeoutMs: 1, cooldownMs: 1,
+    };
+    return { sessions, pending, start, stop, deps };
+  }
+  const tick = () => new Promise<void>((resolve) => setImmediate(resolve));
+
+  it('lets exactly one of several parallel creations take the last slot, however slow its launch is', async () => {
+    const h = slowLaunches();
+    const calls = ['a', 'b', 'c', 'd'].map((key) => provisionSupervisionTarget(forcedRequest(key), h.deps));
+    await tick();
+    expect(h.start).toHaveBeenCalledTimes(1);
+    h.pending[0]!.finish();
+    const results = await Promise.all(calls);
+    expect(results.filter((result) => result.ok)).toHaveLength(1);
+    expect(results.filter((result) => !result.ok)).toHaveLength(3);
+    for (const result of results.filter((candidate) => !candidate.ok)) expect(result).toMatchObject({ reason: 'auto_created_cap_reached' });
+    expect(h.start).toHaveBeenCalledTimes(1);
+    expect(h.sessions.filter((candidate) => candidate.pairCreatedMetadata?.autoCreated === true)).toHaveLength(MAX);
+    expect(autoCreatedSlotsInFlightForTests()).toBe(0);
+  });
+
+  it('never overshoots when several launches are in flight at once with more room', async () => {
+    const h = slowLaunches();
+    h.sessions.splice(1, 3); // three more slots free: room for exactly 4 in total
+    const calls = Array.from({ length: 9 }, (_unused, index) => provisionSupervisionTarget(forcedRequest(`k${index}`), h.deps));
+    await tick();
+    expect(h.start).toHaveBeenCalledTimes(4);
+    for (const launch of [...h.pending]) launch.finish();
+    const results = await Promise.all(calls);
+    expect(results.filter((result) => result.ok)).toHaveLength(4);
+    expect(h.sessions.filter((candidate) => candidate.pairCreatedMetadata?.autoCreated === true)).toHaveLength(MAX);
+    expect(autoCreatedSlotsInFlightForTests()).toBe(0);
+  });
+
+  it('holds the slot while a launch is in flight and frees it when that launch fails (and the half-made session is gone)', async () => {
+    const h = slowLaunches();
+    const first = provisionSupervisionTarget(forcedRequest('doomed'), h.deps);
+    await tick();
+    expect(h.start).toHaveBeenCalledTimes(1);
+    expect(autoCreatedSlotsInFlightForTests()).toBe(1);
+    // While it is in flight the project is full for everyone else.
+    expect(await provisionSupervisionTarget(forcedRequest('blocked'), h.deps)).toMatchObject({ ok: false, reason: 'auto_created_cap_reached' });
+    h.pending[0]!.fail(new Error('quota exceeded'));
+    expect(await first).toMatchObject({ ok: false, reason: 'launch_failed' });
+    expect(autoCreatedSlotsInFlightForTests()).toBe(0);
+    // The slot is back: the next creation goes through.
+    const retry = provisionSupervisionTarget(forcedRequest('after'), h.deps);
+    await tick();
+    h.pending[1]!.finish();
+    expect(await retry).toMatchObject({ ok: true });
+  });
+
+  it('frees the slot when the launch never becomes ready and the session is discarded', async () => {
+    const h = slowLaunches();
+    h.deps.readyTimeoutMs = 0;
+    h.deps.now = (() => { let clock = NOW; return () => (clock += 5); })();
+    const attempt = provisionSupervisionTarget(forcedRequest('never-ready'), h.deps);
+    await tick();
+    // The record appears but is not usable yet; readiness times out; the session is stopped.
+    h.pending[0]!.finish();
+    h.sessions.find((candidate) => candidate.name.startsWith('deck_sub_send_auto_'))!.state = 'running';
+    const result = await attempt;
+    expect(result.ok).toBe(false);
+    expect(autoCreatedSlotsInFlightForTests()).toBe(0);
+    expect(h.sessions.filter((candidate) => candidate.pairCreatedMetadata?.autoCreated === true)).toHaveLength(MAX - 1);
+  });
+
+  it('counts the pair creator and task.autoProvision as one cap: parallel creations from both paths share the last slot', async () => {
+    const h = slowLaunches();
+    const pairRequest = {
+      parentSessionName: 'deck_proj_brain', config: OPENAI, label: 'pair executor', idempotencyKey: 'pair-1',
+      metadata: { createdBy: 'deck_proj_brain', pairTaskId: 'tsk_race', role: 'executor' as const, reason: TASK_PAIR_CREATED_SESSION_REASONS.DEFAULT },
+    };
+    const both = Promise.all([
+      createPairSubSession(pairRequest, h.deps),
+      provisionSupervisionTarget(forcedRequest('forced-1'), h.deps),
+    ]);
+    await tick();
+    expect(h.start).toHaveBeenCalledTimes(1);
+    h.pending[0]!.finish();
+    const [pairResult, forcedResult] = await both;
+    expect([pairResult.ok, forcedResult.ok].filter(Boolean)).toHaveLength(1);
+    const refused = pairResult.ok ? forcedResult : pairResult;
+    expect(refused).toMatchObject({ ok: false, reason: expect.stringMatching(/cap_reached/) });
+    expect(autoCreatedSlotsInFlightForTests()).toBe(0);
+  });
+
+  it('answers a retry of a key whose launch is still in flight with the same creation, not a second one', async () => {
+    const h = slowLaunches();
+    const first = provisionSupervisionTarget(forcedRequest('same'), h.deps);
+    const second = provisionSupervisionTarget(forcedRequest('same'), h.deps);
+    await tick();
+    expect(h.start).toHaveBeenCalledTimes(1);
+    h.pending[0]!.finish();
+    const [a, b] = await Promise.all([first, second]);
+    expect(a).toMatchObject({ ok: true });
+    expect(b).toMatchObject({ ok: true });
+    expect(h.start).toHaveBeenCalledTimes(1);
   });
 });

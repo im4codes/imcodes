@@ -45,15 +45,16 @@ export const MCP_INJECTED_EXECUTION_BLOCK = Object.freeze({ taskSupport: 'forbid
 // pair_create's createExecutor/createAuditor/executionSelection contract and the "sub-session means an IM.codes sub-session, never a
 // provider built-in agent" terminology on pair_create and send_message add about 1 KiB of authored schema (owner request, 2026-10);
 // the ceiling moves with it deliberately.
-// session_close (exact sub-session soft close, see shared/session-close.ts) adds one ~0.7 KiB contract to the full catalog; the ceilings
-// move by 1,000 bytes for it, deliberately and reviewably, rather than trimming unrelated safety text.
-export const MCP_TOOL_SURFACE_AUTHORED_BUDGET_BYTES = 49_000;
+// session_close (exact sub-session soft close, see shared/session-close.ts) adds one ~0.9 KiB contract to the full catalog on top of that
+// (measured 49,209 bytes together); the ceilings move by another 1,000 bytes for it, deliberately and reviewably, rather than trimming
+// unrelated safety text.
+export const MCP_TOOL_SURFACE_AUTHORED_BUDGET_BYTES = 50_000;
 // Raw = authored + the MCP SDK framing. The pair-resource-claim tool adds one
 // intentionally discoverable contract and `command` one published parameter;
 // the structured pair_create/pair_dispatch and pair lifecycle contracts add
 // about 4.3 KiB to that wire payload; retain a bounded ceiling for the
 // resulting surface.
-export const MCP_TOOL_SURFACE_RAW_BUDGET_BYTES = 56_000;
+export const MCP_TOOL_SURFACE_RAW_BUDGET_BYTES = 57_000;
 /**
  * Default model-visible surface: one discovery tool plus the stable minimal
  * delegation, supervision-task, basic-memory/source-expansion, scheduling,

@@ -4519,7 +4519,7 @@ const schemas = {
       integrationOwner: z.string().optional(), baseRevision: z.string().optional(), currentRevision: z.string().optional(), auditAttemptId: z.string().optional(), auditRevision: z.string().optional(),
       auditPolicy: z.enum(SUPERVISION_TASK_AUDIT_POLICIES).optional(),
       executionPool: z.enum(['primary', 'economy']).optional(),
-      autoProvision: z.literal(true).optional().describe('Create a NEW sub-session (never reuses one); the same top-level idempotencyKey (required) returns the same session. Stays open until session_close.'),
+      autoProvision: z.literal(true).optional().describe('Create a NEW sub-session (never reuses one); the same top-level idempotencyKey (required) returns the same session while it is open (after session_close a repeat creates a new one). Stays open until session_close.'),
       requestedExecutionType: z.object({
         capabilityId: z.string(),
         agentType: z.string(),

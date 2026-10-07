@@ -18,7 +18,7 @@ import {
   type TaskPairCreatedSessionReason,
 } from '../../../shared/task-pair.js';
 import { supervisionSecondaryLaunchModelOfFamily, type SupervisionExecutionConfig } from '../../../shared/supervision-execution-pool.js';
-import { configuredPools, createPairSubSession, listPairCreatedSessions, type PairSubSessionFailureReason, type PairSubSessionRequest, type PairSubSessionResult } from '../supervision-auto-provision.js';
+import { autoCreatedCount, configuredPools, createPairSubSession, type PairSubSessionFailureReason, type PairSubSessionRequest, type PairSubSessionResult } from '../supervision-auto-provision.js';
 import {
   describeNoPoolDefaultShortfall,
   listTaskPairCandidates,
@@ -118,7 +118,8 @@ export async function ensurePairSessions(input: EnsurePairSessionsInput, injecte
   const sessions = (deps.listSessions ?? (() => listSessions()))();
   const unconfigured = !configuredPools(parent);
   const maxPerProject = deps.maxPerProject ?? TASK_PAIR_AUTO_CREATED_SESSION_MAX_PER_PROJECT;
-  const capRoom = Math.max(0, maxPerProject - listPairCreatedSessions(input.project, sessions).length);
+  // Launches still in flight hold a slot too (the marker is written only when a launch finishes); createPairSubSession reserves atomically.
+  const capRoom = Math.max(0, maxPerProject - autoCreatedCount(input.project, sessions));
 
   const wanted: Array<{ role: PairSessionRole; spec: PairSessionCreateSpec | undefined; reason: TaskPairCreatedSessionReason }> = [];
   if (input.createExecutor) wanted.push({ role: 'executor', spec: input.createExecutor, reason: TASK_PAIR_CREATED_SESSION_REASONS.EXPLICIT });

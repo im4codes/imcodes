@@ -122,6 +122,7 @@ const cooldownUntil = new Map<string, number>();
 export function clearSupervisionAutoProvisionStateForTests(): void {
   inFlight.clear();
   cooldownUntil.clear();
+  creationsInFlight.clear();
 }
 
 export function configuredPools(parent: SessionRecord) {
@@ -588,7 +589,7 @@ async function provisionConfig(
 const creationsInFlight = new Map<string, string>();
 
 /** Every auto-created session of this project: those whose record carries the marker, plus those still being launched. */
-function autoCreatedCount(projectName: string, sessions: readonly SessionRecord[]): number {
+export function autoCreatedCount(projectName: string, sessions: readonly SessionRecord[]): number {
   const names = new Set(listPairCreatedSessions(projectName, sessions).map((session) => session.name));
   for (const [sessionName, project] of creationsInFlight) if (project === projectName) names.add(sessionName);
   return names.size;

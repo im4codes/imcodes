@@ -58,7 +58,7 @@ async function defaultStop(sessionName: string, link: { send(msg: object): void 
 
 const closing = new Map<string, Promise<CloseSubSessionOutcome>>();
 
-/** True while a close of this session is running. Pair assignment must not pick such a session. */
+/** True while a close of this session is running; a second close of it joins that one instead of stopping the runtime twice. */
 export function isSessionClosing(sessionName: string): boolean {
   return closing.has(sessionName);
 }
