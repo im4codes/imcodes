@@ -3,7 +3,7 @@
  * command lines are run, how the running window is found and focused. Real-device behavior is checked separately on real machines.
  */
 import { describe, expect, it } from 'vitest';
-import { LOCAL_PANEL_WINDOW_TITLE, localPanelUrl } from '../../shared/local-panel-window.js';
+import { LOCAL_PANEL_REFUSING_PROXY, LOCAL_PANEL_WARNING_BAR_FLAGS, LOCAL_PANEL_WINDOW_TITLE, localPanelUrl } from '../../shared/local-panel-window.js';
 import { createLinuxLocalPanelWindowPlatform } from '../../src/node/local-panel-window-linux.js';
 import { createMacosLocalPanelWindowPlatform } from '../../src/node/local-panel-window-macos.js';
 import {
@@ -204,7 +204,8 @@ describe('Windows adapter', () => {
     expect(embedded).toContain('C:\\Temp\\result.txt');
     const args = JSON.parse(embedded.find((value) => value.startsWith('[')) ?? '[]') as string[];
     expect(args).toContain(`--app=${localPanelUrl()}`);
-    expect(args.some((arg) => arg.startsWith('--host-resolver-rules=MAP * ~NOTFOUND , EXCLUDE 127.0.0.1'))).toBe(true);
+    expect(args).toContain(`--proxy-server=${LOCAL_PANEL_REFUSING_PROXY}`);
+    expect(args.map((arg) => arg.split('=')[0]!).filter((name) => LOCAL_PANEL_WARNING_BAR_FLAGS.includes(name))).toEqual([]);
     expect(args.some((arg) => arg.includes('__LOCAL_PANEL_PROFILE__'))).toBe(true);
   });
 

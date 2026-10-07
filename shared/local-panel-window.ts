@@ -57,7 +57,12 @@ export const LOCAL_PANEL_EXTERNAL_PATH = '/open-external';
  * and opens the browser while the node is still opening its window.
  */
 export const LOCAL_PANEL_OPEN_ANSWER_BUDGET_MS = 8_000;
-export const LOCAL_PANEL_WINDOW_SIZE = Object.freeze({ width: 520, height: 720 } as const);
+/**
+ * The window opens at this size and the user can resize it. The browser offers no minimum-size flag: the panel page itself must lay
+ * out from `LOCAL_PANEL_WINDOW_MIN_SIZE` up (a narrower or shorter window may scroll, never clip).
+ */
+export const LOCAL_PANEL_WINDOW_SIZE = Object.freeze({ width: 780, height: 560 } as const);
+export const LOCAL_PANEL_WINDOW_MIN_SIZE = Object.freeze({ width: 480, height: 400 } as const);
 
 /** The only address the app window may show or load: the loopback panel, exactly. */
 export function localPanelUrl(): string {
@@ -81,17 +86,32 @@ export const LOCAL_PANEL_APP_MODE_BROWSERS: Readonly<Record<LocalPanelPlatform, 
   linux: ['microsoft-edge', 'microsoft-edge-stable', 'google-chrome', 'google-chrome-stable', 'chromium', 'chromium-browser', 'brave-browser'],
 });
 
+/** Nothing listens here: an HTTP proxy at this address refuses every connection, so whatever it is asked to carry fails. */
+export const LOCAL_PANEL_REFUSING_PROXY = `http://${REMOTE_DESKTOP_LOCAL_MANAGEMENT.HOST}:1`;
+
+/**
+ * Command-line flags Chromium-family browsers answer with a yellow "unsupported command-line flag ... stability and security
+ * risks" bar in every window (chrome/browser/ui/startup/bad_flags_prompt.cc). The window is meant to look like an application, so
+ * none of these may ever be passed; a test pins the list against the arguments built here.
+ */
+export const LOCAL_PANEL_WARNING_BAR_FLAGS: readonly string[] = Object.freeze([
+  '--host-resolver-rules', '--no-sandbox', '--disable-web-security', '--ignore-certificate-errors', '--allow-running-insecure-content',
+  '--single-process', '--disable-site-isolation-trials', '--disable-gpu-sandbox', '--reduce-security-for-testing', '--enable-automation',
+  '--remote-debugging-port', '--remote-debugging-pipe', '--user-level-cache-dir', '--disable-popup-blocking-for-tests',
+]);
+
 /**
  * Arguments that make a Chromium-family browser show the panel as an application window: `--app` (no tabs/address bar), a profile
- * of its own, and a resolver that maps every host except the loopback to nothing, so the window cannot navigate to an external
- * site whatever the page does.
+ * of its own, and a proxy that refuses every connection except the loopback (bypassed), so the window cannot load an external
+ * site whatever the page does. (A host-resolver rule would do the same but makes the browser show a warning bar in every window.)
  */
 export function buildLocalPanelAppModeArgs(profileDir: string): string[] {
   return [
     `--app=${localPanelUrl()}`,
     `--user-data-dir=${profileDir}`,
     `--window-size=${LOCAL_PANEL_WINDOW_SIZE.width},${LOCAL_PANEL_WINDOW_SIZE.height}`,
-    `--host-resolver-rules=MAP * ~NOTFOUND , EXCLUDE ${REMOTE_DESKTOP_LOCAL_MANAGEMENT.HOST}`,
+    `--proxy-server=${LOCAL_PANEL_REFUSING_PROXY}`,
+    `--proxy-bypass-list=${REMOTE_DESKTOP_LOCAL_MANAGEMENT.HOST};localhost`,
     '--no-first-run',
     '--no-default-browser-check',
     '--disable-extensions',

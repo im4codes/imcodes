@@ -8,6 +8,8 @@ import {
   LOCAL_PANEL_APP_MODE_BROWSERS,
   LOCAL_PANEL_WINDOW_MECHANISM,
   LOCAL_PANEL_WINDOW_REASON,
+  LOCAL_PANEL_REFUSING_PROXY,
+  LOCAL_PANEL_WARNING_BAR_FLAGS,
   buildLocalPanelAppModeArgs,
   isAllowedLocalPanelUrl,
   isRecordedWindowAlive,
@@ -39,13 +41,26 @@ describe('the panel URL is the loopback panel and nothing else', () => {
     ]) expect(isAllowedLocalPanelUrl(bad), bad).toBe(false);
   });
 
-  it('app mode arguments: no tabs (--app), a dedicated profile, and a resolver that maps every host except the loopback to nothing', () => {
+  it('app mode arguments: no tabs (--app), a dedicated profile, and a refusing proxy that only the loopback bypasses', () => {
     const args = buildLocalPanelAppModeArgs('/home/u/.imcodes/local-panel/browser-profile');
     expect(args).toContain(`--app=${localPanelUrl()}`);
     expect(args).toContain('--user-data-dir=/home/u/.imcodes/local-panel/browser-profile');
-    expect(args).toContain('--host-resolver-rules=MAP * ~NOTFOUND , EXCLUDE 127.0.0.1');
+    expect(args).toContain('--window-size=780,560');
+    expect(args).toContain(`--proxy-server=${LOCAL_PANEL_REFUSING_PROXY}`);
+    expect(args).toContain('--proxy-bypass-list=127.0.0.1;localhost');
+    expect(new URL(LOCAL_PANEL_REFUSING_PROXY).hostname).toBe('127.0.0.1');
+    expect(new URL(LOCAL_PANEL_REFUSING_PROXY).port).not.toBe(String(REMOTE_DESKTOP_LOCAL_MANAGEMENT.PORT));
     expect(args.filter((arg) => arg.startsWith('--app='))).toHaveLength(1);
-    expect(args.some((arg) => /^https?:\/\/(?!127\.0\.0\.1:43751)/u.test(arg))).toBe(false);
+    expect(args.some((arg) => /^https?:\/\/(?!127\.0\.0\.1:(43751|1)\b)/u.test(arg))).toBe(false);
+  });
+
+  it('never passes a flag that makes the browser show its yellow "unsupported command-line flag" bar (a known-bad-flag guard)', () => {
+    const flagNames = (args: readonly string[]): string[] => args.map((arg) => arg.split('=')[0]!);
+    const names = flagNames(buildLocalPanelAppModeArgs('/home/u/profile'));
+    for (const bad of LOCAL_PANEL_WARNING_BAR_FLAGS) expect(names, bad).not.toContain(bad);
+    // The list itself must hold the flags known to raise the bar, so the guard cannot be emptied unnoticed.
+    for (const known of ['--host-resolver-rules', '--no-sandbox', '--disable-web-security', '--ignore-certificate-errors']) expect(LOCAL_PANEL_WARNING_BAR_FLAGS).toContain(known);
+    expect(flagNames(['--host-resolver-rules=MAP * ~NOTFOUND'])).toContain('--host-resolver-rules');
   });
 });
 
