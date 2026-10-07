@@ -47,6 +47,8 @@ describe('daemon upgrade reason labels', () => {
     for (const reason of [
       'p2p_active', 'auto_deliver_active', 'master_compaction_active', 'transport_busy', 'session_busy',
       'cooldown_active', 'already_in_progress', 'retry_backoff', 'install_failed', 'toolchain_unavailable',
+      // A daemon that has just started (or is recovering after a crash) names its own hold.
+      'starting_up', 'unclean_shutdown_recovery',
     ]) {
       expect(daemonUpgradeReasonLabelKey(reason)).toBe(`server.daemon_auto_upgrade_reason_${reason}`);
     }
@@ -57,3 +59,12 @@ describe('daemon upgrade reason labels', () => {
   });
 });
 
+
+describe('daemon upgrade deferral labels exist in every locale', () => {
+  it.each(['en', 'zh-CN', 'zh-TW', 'es', 'ru', 'ja', 'ko'])('%s', async (locale) => {
+    const messages = (await import(`../src/i18n/locales/${locale}.json`)).default as { server: Record<string, string> };
+    for (const reason of ['starting_up', 'unclean_shutdown_recovery']) {
+      expect(messages.server[`daemon_auto_upgrade_reason_${reason}`], `${locale} ${reason}`).toBeTruthy();
+    }
+  });
+});

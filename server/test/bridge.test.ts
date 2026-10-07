@@ -73,7 +73,11 @@ import {
   DAEMON_UPGRADE_BLOCK_REASON,
   DAEMON_UPGRADE_BUSY_RETRY_INTERVAL_MS,
   DAEMON_UPGRADE_COOLDOWN_RETRY_MIN_MS,
+  DAEMON_UPGRADE_DEFERRAL,
+  DAEMON_UPGRADE_DEFERRAL_FIELD,
+  DAEMON_UPGRADE_DEFERRAL_RETRY_MARGIN_MS,
   DAEMON_UPGRADE_DELIVERY_STATUS,
+  DAEMON_UPGRADE_RETRY_AFTER_FIELD,
   DAEMON_UPGRADE_IDLE_EDGE_MIN_INTERVAL_MS,
 } from '../../shared/daemon-upgrade.js';
 import { DAEMON_COMMAND_TYPES } from '../../shared/daemon-command-types.js';
@@ -1620,6 +1624,100 @@ describe('WsBridge', () => {
         expect(frames(ws)).toHaveLength(2);
         await advance(4_000);
         expect(frames(ws)).toHaveLength(3);
+      });
+
+      // A daemon that has just (re)started holds an automatic upgrade for its own reasons (settle window, restore,
+      // recovery after an unclean exit). On the wire it is a legacy busy reason plus the deferral fields.
+      describe.each([DAEMON_UPGRADE_DEFERRAL.STARTING_UP, DAEMON_UPGRADE_DEFERRAL.UNCLEAN_SHUTDOWN_RECOVERY])('daemon deferral %s', (deferral) => {
+        const receipt = (ws: MockWs, retryAfterMs: unknown) => blocked(ws, DAEMON_UPGRADE_BLOCK_REASON.SESSION_BUSY, {
+          [DAEMON_UPGRADE_DEFERRAL_FIELD]: deferral,
+          [DAEMON_UPGRADE_RETRY_AFTER_FIELD]: retryAfterMs,
+        });
+
+        it('shows the precise reason and asks again right after the daemon\'s own hold lapses', async () => {
+          boot();
+          const ws = new MockWs();
+          await authFull(ws);
+          await advance(FIRST_SEND);
+          expect(frames(ws)).toHaveLength(1);
+          await receipt(ws, 12 * 60_000);
+          expect(autoView()).toMatchObject({ status: 'deferred', reason: deferral });
+          await advance(12 * 60_000 + DAEMON_UPGRADE_DEFERRAL_RETRY_MARGIN_MS - 2_000);
+          expect(frames(ws)).toHaveLength(1);
+          await advance(4_000);
+          expect(frames(ws)).toHaveLength(2);
+          expect(frames(ws)[1]).toMatchObject({ source: 'auto', targetVersion: TARGET });
+        });
+
+        it('never retries faster than the shared floor (no storm from a tiny or bogus hint)', async () => {
+          boot();
+          const ws = new MockWs();
+          await authFull(ws);
+          await advance(FIRST_SEND);
+          for (const [index, tiny] of [5, -1].entries()) {
+            await receipt(ws, tiny);
+            await advance(DAEMON_UPGRADE_COOLDOWN_RETRY_MIN_MS - 2_000);
+            expect(frames(ws)).toHaveLength(1 + index);
+            await advance(4_000);
+            expect(frames(ws)).toHaveLength(2 + index);
+          }
+          // A hint that is not a number is no hint: the plain busy interval. (A negative number is a number: floored.)
+          for (const bogus of ['soon', null, Number.NaN]) {
+            await receipt(ws, bogus);
+            await advance(DAEMON_UPGRADE_BUSY_RETRY_INTERVAL_MS - 2_000);
+            const before = frames(ws).length;
+            await advance(4_000);
+            expect(frames(ws)).toHaveLength(before + 1);
+          }
+        });
+
+        it('is not asked again at an idle edge meanwhile: the hold ends by the daemon\'s clock, not a session edge', async () => {
+          boot();
+          const ws = new MockWs();
+          await authFull(ws);
+          await sessions(ws, 'running');
+          await advance(FIRST_SEND);
+          await receipt(ws, 10 * 60_000);
+          for (let i = 0; i < 4; i += 1) {
+            await advance(2 * DAEMON_UPGRADE_IDLE_EDGE_MIN_INTERVAL_MS);
+            await sessions(ws, 'idle');
+            await sessions(ws, 'running');
+          }
+          expect(frames(ws)).toHaveLength(1);
+        });
+
+        it('does not consume the failure backoff, and an older server\'s view of the same receipt (no deferral fields) is the plain busy retry', async () => {
+          boot();
+          const ws = new MockWs();
+          await authFull(ws);
+          await advance(FIRST_SEND);
+          await receipt(ws, 60_000);
+          await advance(60_000 + DAEMON_UPGRADE_DEFERRAL_RETRY_MARGIN_MS + 1_000);
+          expect(frames(ws)).toHaveLength(2);
+          // What a server without the deferral fields reads: a legacy busy reason, retried on the busy interval.
+          await blocked(ws, DAEMON_UPGRADE_BLOCK_REASON.SESSION_BUSY);
+          expect(autoView()).toMatchObject({ status: 'deferred', reason: DAEMON_UPGRADE_BLOCK_REASON.SESSION_BUSY });
+          await advance(DAEMON_UPGRADE_BUSY_RETRY_INTERVAL_MS + 1_000);
+          expect(frames(ws)).toHaveLength(3);
+          await blocked(ws, DAEMON_UPGRADE_BLOCK_REASON.INSTALL_FAILED, { targetVersion: TARGET });
+          await advance(9 * 60_000);
+          expect(frames(ws)).toHaveLength(3);
+          await advance(2 * 60_000);
+          expect(frames(ws)).toHaveLength(4);
+        });
+      });
+
+      it('ignores an unknown deferral value: the plain busy reason and interval stand', async () => {
+        boot();
+        const ws = new MockWs();
+        await authFull(ws);
+        await advance(FIRST_SEND);
+        await blocked(ws, DAEMON_UPGRADE_BLOCK_REASON.SESSION_BUSY, { [DAEMON_UPGRADE_DEFERRAL_FIELD]: 'from_the_future', [DAEMON_UPGRADE_RETRY_AFTER_FIELD]: 30_000 });
+        expect(autoView()).toMatchObject({ status: 'deferred', reason: DAEMON_UPGRADE_BLOCK_REASON.SESSION_BUSY });
+        await advance(DAEMON_UPGRADE_BUSY_RETRY_INTERVAL_MS - 2_000);
+        expect(frames(ws)).toHaveLength(1);
+        await advance(4_000);
+        expect(frames(ws)).toHaveLength(2);
       });
 
       it('retries at the next idle edge, spaced by the minimum interval, and only after a daemon receipt', async () => {
