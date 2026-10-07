@@ -133,6 +133,17 @@ export function isTaskPairEngineActive(project: string | undefined): boolean {
   return !!project && resolveTaskPairEngineState(project) !== 'off';
 }
 
+/**
+ * True when the LEGACY supervision registry must not dispatch anything (audit, rework, integration) for `project`: the
+ * pairs engine owns it, or neither engine is active. One predicate for every legacy dispatch loop. Without it a legacy
+ * task a pairs project left behind in `ready_for_integration` / `rework` was retried by every 60 s tick forever: on 215
+ * 26 such tasks applied integration bundles (hundreds of synchronous `git` forks of the 1 GB daemon) each minute, a
+ * 2.4 s main-thread freeze that held every keystroke echo.
+ */
+export function isLegacyDispatchInertProject(project: string | undefined): boolean {
+  return isPairsEngineProject(project) || !isTaskPairEngineActive(project);
+}
+
 /** Session-scoped counterpart of {@link isTaskPairEngineActive}. */
 export function isTaskPairEngineActiveForSession(sessionName: string): boolean {
   return isTaskPairEngineActive(projectOfSession(sessionName));

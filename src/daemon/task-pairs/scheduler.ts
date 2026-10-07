@@ -18,6 +18,7 @@ import {
   setSupervisionHeartbeatProjection,
 } from '../supervision-heartbeat-projection.js';
 import { SUPERVISION_EXECUTION_SELECTION_SOURCES } from '../../../shared/supervision-execution-pool.js';
+import { runPeriodicPass } from '../event-loop-watchdog.js';
 import logger from '../../util/logger.js';
 import { resolve as resolvePath } from 'node:path';
 import { getSession, listSessions, type SessionRecord } from '../../store/session-store.js';
@@ -238,7 +239,7 @@ export class TaskPairAutomation implements TaskPairScheduler {
     // for the first heartbeat interval.
     void this.#runQueueSweep().catch((error) => logger.warn({ err: error }, 'task-pair: initial queue sweep failed'));
     this.#timer = setInterval(() => {
-      void this.tick().catch((error) => logger.warn({ err: error }, 'task-pair: heartbeat tick failed'));
+      void runPeriodicPass('task-pair-heartbeat', () => this.tick()).catch((error) => logger.warn({ err: error }, 'task-pair: heartbeat tick failed'));
     }, intervalMs);
     this.#timer.unref?.();
     // Independent, much cheaper than a full tick: skips legacy import, queue
@@ -246,7 +247,7 @@ export class TaskPairAutomation implements TaskPairScheduler {
     // for the next full heartbeat to be nudged.
     this.#bothIdleTimer = setInterval(() => {
       void this.#runQueueSweep().catch((error) => logger.warn({ err: error }, 'task-pair: queue sweep failed'));
-      void this.checkBothIdlePairs().catch((error) => logger.warn({ err: error }, 'task-pair: both-idle check failed'));
+      void runPeriodicPass('task-pair-both-idle', () => this.checkBothIdlePairs()).catch((error) => logger.warn({ err: error }, 'task-pair: both-idle check failed'));
     }, TASK_PAIR_BOTH_IDLE_CHECK_INTERVAL_MS);
     this.#bothIdleTimer.unref?.();
   }
@@ -780,7 +781,7 @@ export class TaskPairAutomation implements TaskPairScheduler {
     // Finished pairs whose head never reached the integration branch: reminded to Brain (integration-drift.ts). In the
     // background and one pass at a time -- git must never hold the heartbeat -- and it asks git only for pairs whose
     // reminder is due.
-    void runIntegrationDriftPass(now).catch((error) => logger.warn({ err: error }, 'task-pair: integration drift pass failed'));
+    void runPeriodicPass('task-pair-integration-drift', () => runIntegrationDriftPass(now)).catch((error) => logger.warn({ err: error }, 'task-pair: integration drift pass failed'));
     const brains = new Map<string, string>();
     // One busy snapshot per tick: the nudge this tick queues for one pair must
     // not make the same idle session look busy for its other pairs.

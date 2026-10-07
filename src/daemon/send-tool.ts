@@ -1,6 +1,6 @@
 import { IMCODES_EXTERNAL_CLI_SENDER } from '../../shared/imcodes-send.js';
 import { CHAT_MESSAGE_ORIGINS } from '../../shared/chat-message-origin.js';
-import { isPairsEngineProject, isTaskPairEngineActive, projectBrainSession } from './task-pairs/engine.js';
+import { isLegacyDispatchInertProject, isPairsEngineProject, isTaskPairEngineActive, projectBrainSession } from './task-pairs/engine.js';
 import { taskPairService } from './task-pairs/service.js';
 import { getTaskPairStore } from './task-pairs/store.js';
 import {
@@ -4761,6 +4761,9 @@ export async function dispatchReadyRework(
   const registry = deps.registry ?? getSupervisionTaskRegistry();
   const task = registry.get(taskId);
   if (!task || task.status !== 'rework') return { status: 'ignored', reason: 'not_ready_for_rework' };
+  // Same scope as dispatchReadyAudit: the legacy registry dispatches nothing for a pairs (or inert) project.
+  if (isPairsEngineProject(task.projectName)) return { status: 'ignored', reason: 'pairs_engine' };
+  if (!isTaskPairEngineActive(task.projectName)) return { status: 'ignored', reason: 'task_pair_engine_off' };
   const revision = task.currentRevision?.trim();
   if (!revision) return { status: 'blocked', reason: 'missing_current_revision', reported: false };
   const candidates = task.assignments.filter((assignment) => (
@@ -4850,6 +4853,10 @@ export async function dispatchReadyIntegration(
   if (!task || task.status !== 'ready_for_integration' || task.finalization) {
     return { status: 'ignored', reason: 'not_ready_for_integration' };
   }
+  // Same scope as dispatchReadyAudit. Applying an integration bundle runs synchronous git per bundle file on the daemon
+  // main thread: for a task nobody will ever finish it was retried every tick, and froze the daemon for seconds.
+  if (isPairsEngineProject(task.projectName)) return { status: 'ignored', reason: 'pairs_engine' };
+  if (!isTaskPairEngineActive(task.projectName)) return { status: 'ignored', reason: 'task_pair_engine_off' };
   const revision = task.currentRevision?.trim();
   if (!revision) return { status: 'blocked', reason: 'missing_current_revision', reported: false };
   const exactPassOwners = task.assignments.filter((assignment) => (
@@ -5211,7 +5218,7 @@ export async function runSupervisionConvergenceTick(
     try {
       converged = await registry.convergeLifecycle(now, {
         ...(deps.limit ? { limit: deps.limit } : {}),
-        skipProject: (projectName) => isPairsEngineProject(projectName) || !isTaskPairEngineActive(projectName),
+        skipProject: isLegacyDispatchInertProject,
         resolveAuthoritativeBrain: (projectName, sessionName) => resolveAuthoritativeBrainIdentity(
           projectName,
           (deps.listSessions ?? listSessions)(),
@@ -5261,6 +5268,7 @@ export async function runSupervisionConvergenceTick(
     const audits: ReadyAuditDispatchResult[] = [];
     const reworks: DeterministicContinuationDispatchResult[] = [];
     for (const task of registry.list({ status: 'rework' })) {
+      if (isLegacyDispatchInertProject(task.projectName)) continue;
       reworks.push(await dispatchReadyRework(task.taskId, deps));
     }
     for (const task of ready) {
@@ -5268,6 +5276,7 @@ export async function runSupervisionConvergenceTick(
     }
     const integrations: DeterministicContinuationDispatchResult[] = [];
     for (const task of registry.list({ status: 'ready_for_integration' })) {
+      if (isLegacyDispatchInertProject(task.projectName)) continue;
       integrations.push(await dispatchReadyIntegration(task.taskId, { ...deps, registry }));
     }
     try {

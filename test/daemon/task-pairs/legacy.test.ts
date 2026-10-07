@@ -11,7 +11,7 @@ import {
   withPairsLegacyTools,
 } from '../../../src/daemon/task-pairs/legacy-tools.js';
 import { importLegacyTasks, mapLegacyStatus } from '../../../src/daemon/task-pairs/legacy-import.js';
-import { dispatchReadyAudit, runSupervisionConvergenceTick } from '../../../src/daemon/send-tool.js';
+import { dispatchReadyAudit, dispatchReadyIntegration, dispatchReadyRework, runSupervisionConvergenceTick } from '../../../src/daemon/send-tool.js';
 import { MEMORY_MCP_TOOL_NAMES } from '../../../shared/memory-mcp-contracts.js';
 import { SUPERVISION_MCP_TOOLS } from '../../../shared/supervision-mcp-tools.js';
 import { taskPairBindingId } from '../../../shared/task-pair.js';
@@ -217,6 +217,63 @@ describe('legacy supervision tools and migration on the pairs engine', () => {
     await runSupervisionConvergenceTick({ registry: { convergeLifecycle, list: () => [] } as never });
     const options = convergeLifecycle.mock.calls[0]?.[1] as { skipProject?: (project: string) => boolean };
     expect(options.skipProject?.(PROJECT)).toBe(true);
+  });
+
+  // 215, 2026-10-07: 26 legacy tasks of a pairs project sat in `ready_for_integration` (and 3 in `rework`). Every 60 s tick
+  // retried them: each retry applied an integration bundle, i.e. hundreds of synchronous `git` forks of the 1 GB daemon
+  // (830-1100 forks a minute, ~27 ms each), a 2.4 s main-thread freeze that held every keystroke echo. `dispatchReadyAudit`
+  // had the pairs/inert guard; rework and integration did not, and the tick loops did not filter by project at all.
+  describe('legacy rework / integration dispatch on a pairs or inert project (the 60 s main-thread freeze)', () => {
+    const legacyTask = (taskId: string, status: string, projectName = PROJECT) => ({ taskId, projectName, status, assignments: [] });
+
+    it('dispatchReadyRework and dispatchReadyIntegration ignore a pairs project, with the same reason as the audit dispatch', async () => {
+      const get = vi.fn((taskId: string) => legacyTask(taskId, taskId.startsWith('rw') ? 'rework' : 'ready_for_integration'));
+      const registry = { get } as never;
+      expect(await dispatchReadyRework('rw1', { registry })).toEqual({ status: 'ignored', reason: 'pairs_engine' });
+      expect(await dispatchReadyIntegration('ri1', { registry })).toEqual({ status: 'ignored', reason: 'pairs_engine' });
+    });
+
+    it('both ignore a project with no active engine too', async () => {
+      const inert = 'inertproj';
+      const registry = { get: (taskId: string) => legacyTask(taskId, taskId.startsWith('rw') ? 'rework' : 'ready_for_integration', inert) } as never;
+      // The suite pins the engine to `pairs` for every project; a legacy/off setting resolves to the inert state.
+      const pinned = process.env.IMCODES_SUPERVISION_ENGINE;
+      process.env.IMCODES_SUPERVISION_ENGINE = 'legacy';
+      try {
+        expect(await dispatchReadyRework('rw1', { registry })).toEqual({ status: 'ignored', reason: 'task_pair_engine_off' });
+        expect(await dispatchReadyIntegration('ri1', { registry })).toEqual({ status: 'ignored', reason: 'task_pair_engine_off' });
+      } finally {
+        if (pinned === undefined) delete process.env.IMCODES_SUPERVISION_ENGINE;
+        else process.env.IMCODES_SUPERVISION_ENGINE = pinned;
+      }
+    });
+
+    it('the tick does no per-task work at all for stuck legacy tasks of pairs/inert projects: no lookup, no bundle apply, no registry write', async () => {
+      const tasks = [
+        ...Array.from({ length: 26 }, (_, i) => legacyTask(`ri${i}`, 'ready_for_integration')),
+        ...Array.from({ length: 3 }, (_, i) => legacyTask(`rw${i}`, 'rework')),
+      ];
+      const get = vi.fn();
+      const applyIntegrationBundle = vi.fn();
+      const writes = vi.fn();
+      const registry = {
+        convergeLifecycle: vi.fn(async () => []),
+        list: (query?: { status?: string }) => (query?.status ? tasks.filter((task) => task.status === query.status) : []),
+        get,
+        // Anything a dispatch would record (blockers, assignments, events) goes through one of these.
+        recordIntegrationDispatchBlocker: writes, createAssignment: writes, updateAssignment: writes, bindIntegrationBundle: writes,
+      };
+      const result = await runSupervisionConvergenceTick({
+        registry: registry as never,
+        applyIntegrationBundle: applyIntegrationBundle as never,
+        runScheduledWorktreeGcBatch: async () => {},
+      });
+      expect(get).not.toHaveBeenCalled();
+      expect(applyIntegrationBundle).not.toHaveBeenCalled();
+      expect(writes).not.toHaveBeenCalled();
+      expect(result.integrations ?? []).toEqual([]);
+      expect(result.reworks ?? []).toEqual([]);
+    });
   });
 });
 

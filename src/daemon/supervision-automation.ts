@@ -40,6 +40,7 @@ import {
   getCachedSupervisorDefaults,
   overlayCachedExecutionPools,
 } from './supervisor-defaults-cache.js';
+import { runPeriodicPass } from './event-loop-watchdog.js';
 import logger from '../util/logger.js';
 import {
   PEER_AUDIT_REWORK_AUTOMATION_KIND,
@@ -1309,7 +1310,7 @@ class SupervisionAutomation {
       // pile-up of concurrent worktree inspections this change removes.
       if (this.implementationWatchdogRunning) return;
       this.implementationWatchdogRunning = true;
-      void this.checkImplementationAssignments(Date.now())
+      void runPeriodicPass('supervision-watchdog', () => this.checkImplementationAssignments(Date.now()))
         .catch((error) => { logger.warn({ err: error }, 'Supervision implementation watchdog failed'); })
         .finally(() => { this.implementationWatchdogRunning = false; });
     };
@@ -1737,7 +1738,7 @@ class SupervisionAutomation {
     // this module free of a static send-tool dependency. It is itself
     // re-entrancy guarded, so a slow dispatch never overlaps the next tick.
     void import('./send-tool.js')
-      .then(({ runSupervisionConvergenceTick }) => runSupervisionConvergenceTick())
+      .then(({ runSupervisionConvergenceTick }) => runPeriodicPass('supervision-convergence-dispatch', () => runSupervisionConvergenceTick()))
       .catch((error) => {
         logger.warn({ err: error }, 'Supervision audit re-dispatch tick failed');
       });

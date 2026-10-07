@@ -7,6 +7,11 @@ const WATCHDOG_THRESHOLD_MS = 75;
 export const EVENT_LOOP_WATCHDOG_IDLE_PHASE = 'daemon-main-loop';
 /** Drift (ms) above which a tick, or a scoped block, counts as a stall. */
 export const EVENT_LOOP_WATCHDOG_THRESHOLD_MS = WATCHDOG_THRESHOLD_MS;
+/** A periodic pass during which the main thread stalled this long in total is named in a warning (see {@link runPeriodicPass}). */
+export const PERIODIC_PASS_STALL_BUDGET_MS = 300;
+
+/** Periodic passes currently running (they overlap only through awaits), with the stall time seen while each one ran. */
+const activePeriodicPasses = new Map<symbol, { name: string; startedAt: number; stalledMs: number; stalls: number }>();
 
 /**
  * Every time source the watchdog reads. Production always uses the real clock;
@@ -111,8 +116,12 @@ export function startEventLoopWatchdog(): void {
     attributedScopedStalls = [];
     const driftMs = rawDriftMs - attributedMs;
     if (driftMs <= WATCHDOG_THRESHOLD_MS) return;
-    recordDaemonEventLoopStall({ stallMs: driftMs, phase });
-    logger.warn({ driftMs, phase }, 'daemon event loop stall detected');
+    // A stall that ends while a periodic pass is in flight is blamed on it when nothing narrower labelled it.
+    const passes = [...activePeriodicPasses.values()];
+    const blamed = phase === EVENT_LOOP_WATCHDOG_IDLE_PHASE && passes.length > 0 ? `pass:${passes.map((pass) => pass.name).join('+')}` : phase;
+    for (const pass of passes) { pass.stalledMs += driftMs; pass.stalls += 1; }
+    recordDaemonEventLoopStall({ stallMs: driftMs, phase: blamed });
+    logger.warn({ driftMs, phase: blamed }, 'daemon event loop stall detected');
   }, WATCHDOG_INTERVAL_MS);
   timer.unref?.();
 }
@@ -122,4 +131,38 @@ export function stopEventLoopWatchdog(): void {
   clock.clearInterval(timer);
   timer = undefined;
   attributedScopedStalls = [];
+}
+
+/**
+ * Runs one periodic background pass (a 60 s watchdog tick, a heartbeat, a sweep) and names it when it stalls the daemon.
+ *
+ * Why this exists: the stall detector is a timer, so it only sees a block after it ended and can say nothing about its
+ * cause; a stall nothing labelled reported as the anonymous `daemon-main-loop`, which is how a 2.4 s freeze every 60 s
+ * stayed unexplained on 215 for days (it was one pass forking hundreds of `git` children). A stall that ends while a pass
+ * is in flight is now reported as `pass:<name>`, and a pass that accumulated more than `budgetMs` of stall logs one line
+ * naming itself, with how long it took and how many stalls it saw. The pass itself is not changed, delayed or bounded.
+ */
+export async function runPeriodicPass<T>(name: string, fn: () => Promise<T> | T, budgetMs = PERIODIC_PASS_STALL_BUDGET_MS): Promise<T> {
+  const key = Symbol(name);
+  const entry = { name, startedAt: clock.monotonicNow(), stalledMs: 0, stalls: 0 };
+  activePeriodicPasses.set(key, entry);
+  try {
+    return await fn();
+  } finally {
+    activePeriodicPasses.delete(key);
+    if (entry.stalledMs >= budgetMs) {
+      logger.warn({
+        pass: name,
+        stalledMs: Math.round(entry.stalledMs),
+        stalls: entry.stalls,
+        wallMs: Math.round(clock.monotonicNow() - entry.startedAt),
+        budgetMs,
+      }, 'periodic pass stalled the daemon main thread');
+    }
+  }
+}
+
+/** Test seam: forget passes left in flight by a test. */
+export function __resetPeriodicPassesForTests(): void {
+  activePeriodicPasses.clear();
 }

@@ -4,7 +4,11 @@ const recordStall = vi.fn();
 vi.mock('../../src/util/daemon-status.js', () => ({ recordDaemonEventLoopStall: (arg: unknown) => recordStall(arg) }));
 vi.mock('../../src/util/logger.js', () => ({ default: { warn: vi.fn(), info: vi.fn(), debug: vi.fn(), error: vi.fn() } }));
 
+import logger from '../../src/util/logger.js';
 import {
+  __resetPeriodicPassesForTests,
+  PERIODIC_PASS_STALL_BUDGET_MS,
+  runPeriodicPass,
   EVENT_LOOP_WATCHDOG_IDLE_PHASE,
   EVENT_LOOP_WATCHDOG_THRESHOLD_MS,
   getEventLoopWatchdogPhase,
@@ -73,6 +77,7 @@ beforeEach(() => {
   setEventLoopWatchdogPhase(EVENT_LOOP_WATCHDOG_IDLE_PHASE);
 });
 afterEach(() => {
+  __resetPeriodicPassesForTests();
   stopEventLoopWatchdog();
   setEventLoopWatchdogClockForTests(null);
 });
@@ -193,5 +198,73 @@ describe('event-loop watchdog phase attribution (tsk_cd_send_spinner_console_syn
     withEventLoopWatchdogPhase('after-throw', () => busyWait(220));
     await sleep(350);
     expect(recordStall.mock.calls.map(([arg]) => (arg as { phase: string }).phase)).toContain('after-throw');
+  });
+});
+
+// 215, 2026-10-07: a 2.4 s freeze every 60 s reported as the anonymous `daemon-main-loop` for days, because the stall
+// detector is a timer that only sees a block after it ended. A periodic pass now names itself.
+describe('periodic pass stall budget', () => {
+  const warnings = () => (logger.warn as unknown as ReturnType<typeof vi.fn>).mock.calls
+    .filter(([, message]) => message === 'periodic pass stalled the daemon main thread')
+    .map(([fields]) => fields as { pass: string; stalledMs: number; stalls: number; wallMs: number; budgetMs: number });
+
+  beforeEach(() => { (logger.warn as unknown as ReturnType<typeof vi.fn>).mockClear(); });
+
+  it('names the pass for a stall that ends while it is in flight, and logs one line naming it when over budget', async () => {
+    startEventLoopWatchdog();
+    await sleep(120);
+    recordStall.mockReset();
+    await runPeriodicPass('supervision-convergence-dispatch', async () => {
+      busyWait(2400); // the synchronous work between awaits
+      await sleep(250);
+    });
+    const stalls = recordStall.mock.calls.map(([arg]) => arg as { phase: string; stallMs: number });
+    expect(stalls).toHaveLength(1);
+    expect(stalls[0]).toMatchObject({ phase: 'pass:supervision-convergence-dispatch' });
+    expect(stalls[0]!.stallMs).toBeGreaterThanOrEqual(2300);
+    const logged = warnings();
+    expect(logged).toHaveLength(1);
+    expect(logged[0]).toMatchObject({ pass: 'supervision-convergence-dispatch', stalls: 1, budgetMs: PERIODIC_PASS_STALL_BUDGET_MS });
+    expect(logged[0]!.stalledMs).toBeGreaterThanOrEqual(2300);
+  });
+
+  it('a quiet pass, and one below the budget, log nothing; a stall after it ended is anonymous again', async () => {
+    startEventLoopWatchdog();
+    await sleep(120);
+    await runPeriodicPass('quiet', async () => { await sleep(200); });
+    await runPeriodicPass('short', async () => { busyWait(PERIODIC_PASS_STALL_BUDGET_MS - 100); await sleep(250); });
+    expect(warnings()).toHaveLength(0);
+    recordStall.mockReset();
+    busyWait(400);
+    await sleep(250);
+    expect(recordStall.mock.calls.every(([arg]) => (arg as { phase: string }).phase === EVENT_LOOP_WATCHDOG_IDLE_PHASE)).toBe(true);
+  });
+
+  it('a narrower scoped label wins over the pass label, and overlapping passes are all named', async () => {
+    startEventLoopWatchdog();
+    await sleep(120);
+    recordStall.mockReset();
+    await runPeriodicPass('outer', async () => {
+      withEventLoopWatchdogPhase('inner-scope', () => busyWait(500));
+      await sleep(250);
+    });
+    expect(recordStall.mock.calls.map(([arg]) => (arg as { phase: string }).phase)).toEqual(['inner-scope']);
+    recordStall.mockReset();
+    await Promise.all([
+      runPeriodicPass('a', async () => { await Promise.resolve(); busyWait(600); await sleep(250); }),
+      runPeriodicPass('b', async () => { await Promise.resolve(); await Promise.resolve(); await Promise.resolve(); await Promise.resolve(); }),
+    ]);
+    expect(recordStall.mock.calls.some(([arg]) => (arg as { phase: string }).phase.startsWith('pass:'))).toBe(true);
+  });
+
+  it('returns the pass value, propagates its error, and always deregisters', async () => {
+    startEventLoopWatchdog();
+    await sleep(120);
+    await expect(runPeriodicPass('ok', async () => 42)).resolves.toBe(42);
+    await expect(runPeriodicPass('boom', async () => { throw new Error('x'); })).rejects.toThrow('x');
+    recordStall.mockReset();
+    busyWait(400);
+    await sleep(250);
+    expect(recordStall.mock.calls.every(([arg]) => (arg as { phase: string }).phase === EVENT_LOOP_WATCHDOG_IDLE_PHASE)).toBe(true);
   });
 });
