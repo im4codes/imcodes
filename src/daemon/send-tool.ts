@@ -1674,6 +1674,9 @@ export async function dispatchSendMessage(
       }
       forcedConfig = picked.config;
       forcedReason = picked.reason;
+      // What this call chose is, for everything downstream, the explicit selection: the pool gate after delivery admits a named
+      // execution type without a configured pool, and would otherwise reject (pool_unconfigured) a session we just created.
+      input = { ...input, task: { ...input.task, requestedExecutionType: forcedConfig } as SupervisionTaskMetadata };
     }
     const provision = await (deps?.provisionSupervisionTarget ?? defaultProvisionSupervisionTarget)({
       parentSessionName: caller.sessionName,
