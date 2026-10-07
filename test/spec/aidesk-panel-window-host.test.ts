@@ -61,9 +61,14 @@ describe('macOS panel window host', () => {
   });
 
   it('is compiled into the app with WebKit, and the Info.plist declares the marker the node reads plus local-network ATS', () => {
+    // The agent's source and framework list has ONE source of truth (aidesk-agent-build.json), read by the packager and by the
+    // tests that compile the agent.
+    const agentBuild = JSON.parse(read('native/macos-remote-desktop/aidesk-agent-build.json')) as { sources: string[]; frameworks: string[] };
+    expect(agentBuild.sources).toContain('aidesk_panel_window.mm');
+    expect(agentBuild.frameworks).toContain('WebKit');
     const packager = read('scripts/build-aidesk-app.mjs');
-    expect(packager).toContain("join(source, 'aidesk_panel_window.mm')");
-    expect(packager).toContain("'-framework', 'WebKit'");
+    expect(packager).toContain('AIDESK_AGENT_SOURCES');
+    expect(packager).toContain('AIDESK_AGENT_FRAMEWORKS');
     const plist = buildAideskInfoPlist({ version: '2026.10.1', minimumSystemVersion: '12.3' });
     expect(plist).toContain(`<key>${AIDESK_PANEL_HOST_PLIST_KEY}</key>\n  <true/>`);
     expect(plist).toContain('<key>NSAllowsLocalNetworking</key><true/>');
