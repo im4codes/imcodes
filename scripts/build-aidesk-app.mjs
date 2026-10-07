@@ -18,6 +18,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { AIDESK_ICONSET_ENTRIES } from './aidesk-icon.mjs';
 import { readMacosRemoteDesktopCodeIdentity } from './macos-remote-desktop-build.mjs';
 import product from '../shared/aidesk-product.json' with { type: 'json' };
 import fsDelegate from '../shared/macos-fs-delegate.json' with { type: 'json' };
@@ -161,28 +162,18 @@ export function copyAideskBrandLogo(bundlePath) {
 
 /** The file name (no extension) of the application icon in Contents/Resources, and the Info.plist's CFBundleIconFile value. */
 export const AIDESK_ICON_FILE = 'AppIcon';
-
-/** The images an .iconset needs, as [file name, pixel size]; every one is rendered from the one canonical brand logo. */
-export const AIDESK_ICONSET_ENTRIES = Object.freeze([
-  ['icon_16x16', 16], ['icon_16x16@2x', 32], ['icon_32x32', 32], ['icon_32x32@2x', 64],
-  ['icon_128x128', 128], ['icon_128x128@2x', 256], ['icon_256x256', 256], ['icon_256x256@2x', 512],
-  ['icon_512x512', 512], ['icon_512x512@2x', 1024],
-]);
+export { AIDESK_ICONSET_ENTRIES };
 
 /**
- * The application icon (.icns) from the canonical brand logo, with the system's own sips and iconutil. Without it the bundle has no icon
- * at all: the Dock, Cmd-Tab and Finder show the generic application icon, and the panel window would look like nobody's.
+ * The application icon (.icns) from the official IM.codes logo: scripts/aidesk-icon.mjs renders the iconset (one source for every
+ * platform's icons), the system's iconutil packs it. Without it the bundle has no icon at all: the Dock, Cmd-Tab and Finder show the
+ * generic application icon, and the panel window would look like nobody's.
  */
 export function buildAideskIcns(outPath) {
-  const source = join(root, 'web', 'public', AIDESK_BRAND_LOGO);
-  if (!existsSync(source)) throw new Error(`brand logo not found at ${source}`);
   const work = mkdtempSync(join(tmpdir(), 'imcodes-aidesk-icon-'));
   try {
     const iconset = join(work, `${AIDESK_ICON_FILE}.iconset`);
-    mkdirSync(iconset, { recursive: true });
-    for (const [name, size] of AIDESK_ICONSET_ENTRIES) {
-      sh('/usr/bin/sips', ['-z', String(size), String(size), source, '--out', join(iconset, `${name}.png`)]);
-    }
+    execFileSync(process.execPath, [join(root, 'scripts', 'aidesk-icon.mjs'), 'iconset', iconset], { stdio: ['ignore', 'inherit', 'inherit'] });
     mkdirSync(dirname(outPath), { recursive: true });
     sh('/usr/bin/iconutil', ['-c', 'icns', iconset, '-o', outPath]);
     return outPath;

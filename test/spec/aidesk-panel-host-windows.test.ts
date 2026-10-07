@@ -12,7 +12,8 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { AIDESK_LOCAL_UI_EXECUTABLE_NAME } from '../../shared/aidesk-product.js';
 import { LOCAL_PANEL_WINDOW_MIN_SIZE, LOCAL_PANEL_WINDOW_SIZE, LOCAL_PANEL_WINDOW_TITLE, LOCAL_PANEL_WINDOWS_HOST, localPanelUrl } from '../../shared/local-panel-window.js';
 import * as fetchSdk from '../../scripts/fetch-webview2-sdk.mjs';
-import { packIco } from '../../scripts/make-aidesk-ico.mjs';
+import { AIDESK_FAVICON_DATA_URI, AIDESK_FAVICON_SOURCE_SHA256 } from '../../shared/aidesk-favicon-generated.js';
+import { AIDESK_HICOLOR_SIZES, AIDESK_ICO_SIZES, AIDESK_LOGO_SOURCE, logoSha256, packIco, renderAideskIcon } from '../../scripts/aidesk-icon.mjs';
 
 const root = resolve(fileURLToPath(new URL('../..', import.meta.url)));
 const read = (path: string): string => readFileSync(resolve(root, path), 'utf8');
@@ -140,8 +141,8 @@ describe('WebView2 SDK pin', () => {
   });
 });
 
-describe('application icon', () => {
-  it('is an .ico directory of PNG images built from the one canonical logo', () => {
+describe('application icons (one official logo, every platform)', () => {
+  it('is an .ico directory of PNG images at the standard sizes', () => {
     const ico = packIco([{ size: 16, png: Buffer.from('p16') }, { size: 256, png: Buffer.from('p256') }]);
     expect(ico.readUInt16LE(2)).toBe(1);
     expect(ico.readUInt16LE(4)).toBe(2);
@@ -149,6 +150,38 @@ describe('application icon', () => {
     expect(ico.readUInt8(22)).toBe(0); // 256 is stored as 0
     expect(ico.readUInt32LE(6 + 12)).toBe(6 + 32);
     expect(ico.subarray(6 + 32, 6 + 32 + 3).toString()).toBe('p16');
-    expect(read('scripts/make-aidesk-ico.mjs')).toContain("'web', 'public', 'imcodes-robot-avatar.png'");
+    expect(AIDESK_ICO_SIZES).toEqual([16, 24, 32, 48, 64, 128, 256]);
+    expect(AIDESK_HICOLOR_SIZES).toEqual(expect.arrayContaining([16, 32, 48, 64, 128, 256, 512]));
+  });
+
+  it('is rendered from the official IM.codes logo (the shipped iOS app icon, same pixels as the landing page logo), never from the robot avatar', () => {
+    expect(AIDESK_LOGO_SOURCE.endsWith('web/ios/App/App/Assets.xcassets/AppIcon.appiconset/AppIcon-512@2x.png')).toBe(true);
+    const logo = readFileSync(AIDESK_LOGO_SOURCE);
+    expect(logo.readUInt32BE(16)).toBe(1024);
+    expect(logo.readUInt32BE(20)).toBe(1024);
+    // (the macOS app still ships the robot avatar as the remote-desktop INDICATOR's mark; that is not an application icon)
+    for (const path of ['scripts/aidesk-icon.mjs', 'native/aidesk-panel-host-windows/build.ps1']) {
+      expect(read(path), path).not.toContain('imcodes-robot-avatar');
+    }
+  });
+
+  it('keeps the dark logo visible: a transparent rounded tile with a light hairline, cropped to the wordmark when small', async () => {
+    const big = await renderAideskIcon(256);
+    const meta = await (await import('sharp')).default(big).metadata();
+    expect([meta.width, meta.height, meta.channels]).toEqual([256, 256, 4]);
+    const sharp = (await import('sharp')).default;
+    const corner = await sharp(big).extract({ left: 0, top: 0, width: 1, height: 1 }).raw().toBuffer();
+    expect(corner[3]).toBe(0); // the corner outside the rounded tile is transparent
+    const edge = await sharp(big).extract({ left: 128, top: 1, width: 1, height: 1 }).raw().toBuffer();
+    expect(edge[0]).toBeGreaterThan(20); // the hairline border is lighter than the black artwork
+    const mac = await renderAideskIcon(256, { contentRatio: 824 / 1024 });
+    const margin = await sharp(mac).extract({ left: 128, top: 2, width: 1, height: 1 }).raw().toBuffer();
+    expect(margin[3]).toBe(0); // macOS keeps Apple's transparent margin
+  });
+
+  it('the inline favicon of the panel page is generated from that logo (its recorded hash must match the logo)', () => {
+    expect(AIDESK_FAVICON_SOURCE_SHA256).toBe(logoSha256());
+    expect(AIDESK_FAVICON_DATA_URI.startsWith('data:image/png;base64,')).toBe(true);
+    expect(AIDESK_FAVICON_DATA_URI.length).toBeLessThan(12_000);
   });
 });

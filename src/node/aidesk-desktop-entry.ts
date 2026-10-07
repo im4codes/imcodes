@@ -23,6 +23,7 @@ import {
   AIDESK_MACOS_APP_NAME,
   AIDESK_PRODUCT_NAME,
   AIDESK_WINDOWS_SHORTCUT_FILE_NAME,
+  AIDESK_ICON_FILE_NAME,
 } from '../../shared/aidesk-product.js';
 import { LOCAL_PANEL_LINUX_WM_CLASS } from '../../shared/local-panel-window.js';
 import { REMOTE_DESKTOP_LOCAL_MANAGEMENT } from '../../shared/remote-desktop-local-management.js';
@@ -381,7 +382,7 @@ export async function ensureAideskDesktopEntry(
     const passwd = readFileSync('/etc/passwd', 'utf8');
     const user = pickLinuxDesktopUserProfile(passwd);
     if (!user) return 'unavailable';
-    const iconPath = resolve(dirname(process.execPath), 'imcodes-robot-avatar.png');
+    const iconPath = resolve(dirname(process.execPath), AIDESK_ICON_FILE_NAME);
     const nativeUi = resolveAideskLocalUiExecutable(platform);
     return ensureLinuxAideskDesktopEntry({
       ...user,

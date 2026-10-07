@@ -77,6 +77,8 @@ describe('macOS panel window host', () => {
     expect(new Set(AIDESK_ICONSET_ENTRIES.map(([name]) => name)).size).toBe(AIDESK_ICONSET_ENTRIES.length);
     const packager = read('scripts/build-aidesk-app.mjs');
     expect(packager).toContain("'/usr/bin/iconutil', ['-c', 'icns'");
+    expect(packager).toContain("'aidesk-icon.mjs'), 'iconset'");
+    expect(packager).not.toContain('/usr/bin/sips');
     expect(packager.indexOf('buildAideskIcns(join(bundlePath')).toBeLessThan(packager.indexOf('signAideskApp(bundlePath);\n  return bundlePath'));
   });
 });

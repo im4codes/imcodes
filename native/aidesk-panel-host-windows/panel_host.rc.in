@@ -1,6 +1,6 @@
 #include <windows.h>
 
-// Resource 1: the application icon (built from the canonical brand logo by scripts/make-aidesk-ico.mjs).
+// Resource 1: the application icon (built from the official IM.codes logo by scripts/aidesk-icon.mjs).
 1 ICON "@AIDESK_ICON_FOR_RC@"
 // The manifest: asInvoker, per-monitor DPI v2. Embedded here for every toolchain, so the linker must not add its own.
 1 RT_MANIFEST "@AIDESK_MANIFEST_FOR_RC@"

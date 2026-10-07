@@ -7,7 +7,7 @@ project(aidesk_local_ui_windows LANGUAGES CXX RC)
 # when it runs, and no WebView2Loader.dll ships next to it.
 #
 #   node scripts/fetch-webview2-sdk.mjs --out build/webview2          -> prints {"root": "..."}
-#   node scripts/make-aidesk-ico.mjs build/aidesk.ico
+#   node scripts/aidesk-icon.mjs ico build/aidesk.ico
 #   cmake -S native/aidesk-panel-host-windows -B build/host -DAIDESK_WEBVIEW2_ROOT=<root> -DAIDESK_ICON=<abs>/aidesk.ico
 #   cmake --build build/host --config Release
 
@@ -22,7 +22,7 @@ if(NOT AIDESK_WEBVIEW2_ROOT OR NOT EXISTS "${AIDESK_WEBVIEW2_ROOT}/build/native/
   message(FATAL_ERROR "AIDESK_WEBVIEW2_ROOT must point at the extracted WebView2 SDK (node scripts/fetch-webview2-sdk.mjs)")
 endif()
 if(NOT AIDESK_ICON OR NOT EXISTS "${AIDESK_ICON}")
-  message(FATAL_ERROR "AIDESK_ICON must point at the .ico built by scripts/make-aidesk-ico.mjs")
+  message(FATAL_ERROR "AIDESK_ICON must point at the .ico built by scripts/aidesk-icon.mjs ico")
 endif()
 set(AIDESK_WEBVIEW2_LOADER "${AIDESK_WEBVIEW2_ROOT}/build/native/${AIDESK_WEBVIEW2_ARCH}/WebView2LoaderStatic.lib")
 if(NOT EXISTS "${AIDESK_WEBVIEW2_LOADER}")
