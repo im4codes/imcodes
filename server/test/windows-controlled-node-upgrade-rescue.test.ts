@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { controlledNodeUpgradeRetryDelayMs } from '../../shared/daemon-upgrade.js';
 import { REMOTE_EXEC_MAX_COMMAND_BYTES, utf8ByteLength } from '../../shared/remote-exec.js';
 import {
   CONTROLLED_NODE_SERVICE,
@@ -13,10 +14,7 @@ import {
   LEGACY_WINDOWS_UPGRADE_RESCUE_GRACE_MS,
   LEGACY_WINDOWS_UPGRADE_RESCUE_READY_PREFIX,
   LEGACY_WINDOWS_UPGRADE_RESTART_READY_PREFIX,
-  LEGACY_WINDOWS_UPGRADE_RESTART_RETRY_BASE_MS,
-  LEGACY_WINDOWS_UPGRADE_RESTART_RETRY_MAX_MS,
   LEGACY_WINDOWS_UPGRADE_TASK_STALE_MINUTES,
-  legacyWindowsUpgradeRestartRetryDelayMs,
   resolveLegacyWindowsUpgradePublisherSignerSha256,
   resolveLegacyWindowsUpgradeRestartAttempt,
 } from '../src/ws/windows-controlled-node-upgrade-rescue.js';
@@ -256,13 +254,9 @@ describe('legacy Windows controlled-node upgrade rescue', () => {
 describe('legacy Windows upgrade restart cross-generation backoff', () => {
   const TARGET = '2026.9.4547-dev.5203';
 
-  it('grows the retry delay exponentially, capped by the exponent ceiling well under the max', () => {
-    expect(legacyWindowsUpgradeRestartRetryDelayMs(1)).toBe(LEGACY_WINDOWS_UPGRADE_RESTART_RETRY_BASE_MS);
-    expect(legacyWindowsUpgradeRestartRetryDelayMs(2)).toBe(LEGACY_WINDOWS_UPGRADE_RESTART_RETRY_BASE_MS * 2);
-    expect(legacyWindowsUpgradeRestartRetryDelayMs(3)).toBe(LEGACY_WINDOWS_UPGRADE_RESTART_RETRY_BASE_MS * 4);
-    expect(legacyWindowsUpgradeRestartRetryDelayMs(4)).toBe(LEGACY_WINDOWS_UPGRADE_RESTART_RETRY_BASE_MS * 4);
-    expect(legacyWindowsUpgradeRestartRetryDelayMs(50)).toBe(LEGACY_WINDOWS_UPGRADE_RESTART_RETRY_BASE_MS * 4);
-    expect(legacyWindowsUpgradeRestartRetryDelayMs(50)).toBeLessThanOrEqual(LEGACY_WINDOWS_UPGRADE_RESTART_RETRY_MAX_MS);
+  it('spaces restarts on the shared failed-upgrade schedule: 10m, 30m, 2h, then every 6h', () => {
+    expect([1, 2, 3, 4, 5, 50].map((attempts) => controlledNodeUpgradeRetryDelayMs(attempts)))
+      .toEqual([10 * 60_000, 30 * 60_000, 2 * 60 * 60_000, 6 * 60 * 60_000, 6 * 60 * 60_000, 6 * 60 * 60_000]);
   });
 
   it('dispatches immediately with no prior throttle', () => {
@@ -308,7 +302,7 @@ describe('legacy Windows upgrade restart cross-generation backoff', () => {
         throttle = {
           targetVersion: TARGET,
           attempts: resolved.attempts,
-          notBeforeMs: nowMs + legacyWindowsUpgradeRestartRetryDelayMs(resolved.attempts),
+          notBeforeMs: nowMs + controlledNodeUpgradeRetryDelayMs(resolved.attempts),
         };
       }
       // The reconnect that starts the next generation happens instantly.

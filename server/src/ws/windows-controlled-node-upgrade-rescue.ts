@@ -34,17 +34,12 @@ export const LEGACY_WINDOWS_UPGRADE_RESCUE_READY_PREFIX = 'IMCODES_UPGRADE_RESCU
 export const LEGACY_WINDOWS_UPGRADE_RESTART_EXEC_TIMEOUT_MS = 120_000;
 export const LEGACY_WINDOWS_UPGRADE_RESTART_READY_PREFIX = 'IMCODES_UPGRADE_RESTART_READY' as const;
 export const LEGACY_WINDOWS_UPGRADE_TASK_STALE_MINUTES = 15;
-export const LEGACY_WINDOWS_UPGRADE_RESTART_RETRY_BASE_MS = 60_000;
-export const LEGACY_WINDOWS_UPGRADE_RESTART_RETRY_MAX_MS = 5 * 60_000;
-
-export function legacyWindowsUpgradeRestartRetryDelayMs(attempts: number): number {
-  return Math.min(
-    LEGACY_WINDOWS_UPGRADE_RESTART_RETRY_MAX_MS,
-    LEGACY_WINDOWS_UPGRADE_RESTART_RETRY_BASE_MS * (2 ** Math.min(2, attempts - 1)),
-  );
-}
-
-/** A restart attempt count and the earliest time the next one may fire, scoped to one target version. */
+/**
+ * A restart attempt count and the earliest time the next one may fire, scoped to one target version.
+ * The delay after attempt N is the SAME schedule every other failed controlled-node upgrade uses
+ * (controlledNodeUpgradeRetryDelayMs: 10m/30m/2h/6h), so a latched node can never be restarted
+ * more often than any other failing node is retried.
+ */
 export interface LegacyWindowsUpgradeRestartThrottle {
   targetVersion: string;
   attempts: number;

@@ -225,7 +225,6 @@ import {
   buildLegacyWindowsUpgradeRestartCommand,
   LEGACY_WINDOWS_UPGRADE_RESCUE_EXEC_TIMEOUT_MS,
   LEGACY_WINDOWS_UPGRADE_RESTART_EXEC_TIMEOUT_MS,
-  legacyWindowsUpgradeRestartRetryDelayMs,
   type LegacyWindowsUpgradeRestartThrottle,
   resolveLegacyWindowsUpgradePublisherSignerSha256,
   resolveLegacyWindowsUpgradeRestartAttempt,
@@ -2189,7 +2188,6 @@ export class WsBridge {
     restartAttempts: number;
     restartInFlight: boolean;
     restartTimer: ReturnType<typeof setTimeout> | null;
-    restartCoordinatorPrepared: boolean;
   } | null = null;
   /** Restart backoff for the legacy Windows restart-nudge, kept outside
    *  `legacyUpgradeRescuePreparation` so it survives that per-generation
@@ -11155,7 +11153,6 @@ export class WsBridge {
         restartAttempts: 0,
         restartInFlight: false,
         restartTimer: null,
-        restartCoordinatorPrepared: false,
       };
     }
     this.ensureLegacyWindowsUpgradeRescue();
@@ -11179,7 +11176,6 @@ export class WsBridge {
         restartAttempts: 0,
         restartInFlight: false,
         restartTimer: null,
-        restartCoordinatorPrepared: false,
       }
       : null;
     this.legacyUpgradeRescuePreparedGeneration = this.requiresLegacyWindowsUpgradeRescue()
@@ -11362,6 +11358,13 @@ export class WsBridge {
     );
     if (waitMs > 0) {
       state.restartAttempts = attempts;
+      // The previous restart did not clear the latch: say why nothing happens until the schedule allows another.
+      this.setAutoUpgradeState(
+        CONTROLLED_NODE_UPGRADE_STATUS.DEFERRED,
+        targetVersion,
+        CONTROLLED_NODE_UPGRADE_WAIT_REASON.LEGACY_RESTART_BACKOFF,
+      );
+      this.logAutoUpgradeWait(targetVersion, CONTROLLED_NODE_UPGRADE_WAIT_REASON.LEGACY_RESTART_BACKOFF);
       state.restartTimer = setTimeout(() => {
         state.restartTimer = null;
         this.ensureLegacyWindowsUpgradeRestart(ws);
@@ -11372,10 +11375,17 @@ export class WsBridge {
 
     state.restartInFlight = true;
     state.restartAttempts = attempts;
+    logger.info({
+      serverId: this.serverId,
+      daemonVersion: this.daemonVersion,
+      targetVersion,
+      attempts,
+      nextAttemptNotBeforeInMs: controlledNodeUpgradeRetryDelayMs(attempts),
+    }, 'restarting a legacy Windows node to clear its stale upgrade-in-progress latch');
     this.legacyUpgradeRestartThrottle = {
       targetVersion,
       attempts,
-      notBeforeMs: Date.now() + legacyWindowsUpgradeRestartRetryDelayMs(attempts),
+      notBeforeMs: Date.now() + controlledNodeUpgradeRetryDelayMs(attempts),
     };
     const restartId = randomUUID();
     const correlationId = `upgrade-restart-${restartId}`;
@@ -11387,7 +11397,7 @@ export class WsBridge {
         || !this.authenticated
         || this.legacyUpgradeRescuePreparedGeneration !== generation
       ) return;
-      const retryMs = legacyWindowsUpgradeRestartRetryDelayMs(state.restartAttempts);
+      const retryMs = controlledNodeUpgradeRetryDelayMs(state.restartAttempts);
       if (this.legacyUpgradeRestartThrottle?.targetVersion === targetVersion) {
         this.legacyUpgradeRestartThrottle.notBeforeMs = Date.now() + retryMs;
       }
@@ -11427,11 +11437,10 @@ export class WsBridge {
         || !this.authenticated
         || this.legacyUpgradeRescuePreparedGeneration !== generation
       ) throw new Error('legacy_upgrade_restart_generation_changed_before_dispatch');
-      if (!state.restartCoordinatorPrepared) {
-        if (!this.daemonUpgradeCoordinator.prepareRetryAfterDaemonRestart()) {
-          throw new Error('legacy_upgrade_restart_lifecycle_not_sent');
-        }
-        state.restartCoordinatorPrepared = true;
+      // Idempotent: a retry in the same generation (or a daemon.upgrade re-sent to the still-latched
+      // node meanwhile) is put back to `pending_offline` again, never an error.
+      if (this.daemonUpgradeCoordinator.prepareForLatchRescueRestart() === 'blocked') {
+        throw new Error('legacy_upgrade_restart_target_blocked');
       }
       const pending = registerPendingExec(
         this.serverId,
@@ -11483,7 +11492,19 @@ export class WsBridge {
         outcome: 'failed',
         reason: error instanceof Error ? error.message : 'legacy_upgrade_restart_failed',
       }).catch((auditError) => logger.error({ auditError, serverId: this.serverId }, 'Legacy upgrade restart result audit failed'));
-      logger.warn({ error, serverId: this.serverId }, 'Legacy Windows upgrade restart failed; keeping old node online');
+      const retryInMs = controlledNodeUpgradeRetryDelayMs(state.restartAttempts);
+      logger.warn({
+        error,
+        serverId: this.serverId,
+        targetVersion,
+        attempts: state.restartAttempts,
+        retryInMs,
+      }, 'Legacy Windows upgrade restart failed; keeping old node online');
+      this.setAutoUpgradeState(
+        CONTROLLED_NODE_UPGRADE_STATUS.DEFERRED,
+        targetVersion,
+        CONTROLLED_NODE_UPGRADE_WAIT_REASON.LEGACY_RESTART_FAILED,
+      );
       scheduleRetry();
     });
   }

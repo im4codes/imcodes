@@ -68,6 +68,8 @@ import {
   controlledNodeUpgradeStaggerMs,
   DAEMON_UPGRADE_BLOCKED_ACK_DISPOSITION,
   DAEMON_UPGRADE_BLOCKED_SYNC_PROTOCOL,
+  CONTROLLED_NODE_UPGRADE_STATUS,
+  CONTROLLED_NODE_UPGRADE_WAIT_REASON,
   DAEMON_UPGRADE_BLOCK_REASON,
   DAEMON_UPGRADE_BUSY_RETRY_INTERVAL_MS,
   DAEMON_UPGRADE_COOLDOWN_RETRY_MIN_MS,
@@ -1853,6 +1855,179 @@ describe('WsBridge', () => {
         WsBridge.get(serverId).requestDaemonUpgrade({ targetVersion: TARGET, source: 'manual' });
         expect(frames(ws).length).toBeGreaterThan(0);
         for (const frame of frames(ws)) expect(frame).not.toHaveProperty('force');
+      });
+    });
+
+    describe('legacy Windows node whose old process still holds the upgrade-in-progress latch', () => {
+      // The 7064301582 incident: a node on 2026.9.4537 kept answering `already_in_progress` to every daemon.upgrade
+      // (a 9/22 attempt was killed after it set the process-local latch). The rescue restart must clear it.
+      const NODE_VERSION = '2026.9.4537-dev.5183';
+      const TARGET_VERSION = '2026.9.4544-dev.5197';
+      const MINUTE = 60_000;
+
+      const execFrames = (ws: MockWs, prefix: 'upgrade-rescue-' | 'upgrade-restart-') => ws.sentStrings
+        .map((message) => JSON.parse(message) as Record<string, unknown>)
+        .filter((frame) => frame.type === 'machine.exec' && String(frame.correlationId).startsWith(prefix));
+      const upgradeFrames = (ws: MockWs) => ws.sentStrings.filter((message) => message.includes('"type":"daemon.upgrade"'));
+      const answerExec = async (ws: MockWs, frame: Record<string, unknown>, readyPrefix: string) => {
+        const id = String(frame.correlationId).replace(/^upgrade-(rescue|restart)-/, '');
+        ws.emit('message', JSON.stringify({
+          type: DAEMON_MSG.MACHINE_EXEC_RESULT,
+          correlationId: frame.correlationId,
+          ok: true,
+          exitCode: 0,
+          stdout: `${readyPrefix}:${id}`,
+          stderr: '',
+          durationMs: 1,
+        }));
+        await flushAsync();
+      };
+      /** Controlled-upgrade state rows the bridge persisted (status, target, reason), in order. */
+      const persisted: Array<{ status: unknown; reason: unknown }> = [];
+      const recordingDb = () => {
+        const db = makeDb('valid-hash', 'controlled', CONTROLLED_NODE_OS_WIN) as unknown as {
+          execute: (sql: string, params?: unknown[]) => Promise<{ changes: number }>;
+        };
+        const execute = db.execute.bind(db);
+        db.execute = async (sql, params = []) => {
+          if (sql.includes('controlled_upgrade_status')) persisted.push({ status: params[0], reason: params[2] });
+          return execute(sql, params);
+        };
+        return db as unknown as import('../src/db/client.js').Database;
+      };
+      const connectLegacyNode = async (bridge: WsBridge, capabilities: string[] = []) => {
+        const ws = new MockWs();
+        bridge.handleDaemonConnection(ws as never, recordingDb(), {} as never);
+        ws.emit('message', JSON.stringify({ type: 'auth', serverId, token: 'my-token', daemonVersion: NODE_VERSION, capabilities }));
+        await flushAsync();
+        ws.emit('message', JSON.stringify({ type: 'session_list', sessions: [] }));
+        await flushAsync();
+        // past the post-auth stagger, but NOT `runOnlyPendingTimers`: that would also fire the exec deadline
+        await vi.advanceTimersByTimeAsync(CONTROLLED_NODE_UPGRADE_STAGGER_MAX_MS + 1_000);
+        await flushAsync();
+        return ws;
+      };
+      /** Connect, prepare the rescue, and let the server deliver the upgrade the latched node will refuse. */
+      const reachLatchedBlock = async (bridge: WsBridge) => {
+        const ws = await connectLegacyNode(bridge);
+        const [rescue] = execFrames(ws, 'upgrade-rescue-');
+        expect(rescue, 'the rescue is prepared before any upgrade is sent').toBeTruthy();
+        expect(upgradeFrames(ws)).toHaveLength(0);
+        await answerExec(ws, rescue!, LEGACY_WINDOWS_UPGRADE_RESCUE_READY_PREFIX);
+        expect(upgradeFrames(ws)).toHaveLength(1);
+        ws.emit('message', JSON.stringify({ type: DAEMON_MSG.UPGRADE_BLOCKED, reason: DAEMON_UPGRADE_BLOCK_REASON.ALREADY_IN_PROGRESS }));
+        await flushAsync();
+        return ws;
+      };
+      const reconnectLatchedNode = async (bridge: WsBridge, previous: MockWs) => {
+        previous.close();
+        await flushAsync();
+        return reachLatchedBlock(bridge);
+      };
+
+      beforeEach(() => {
+        vi.useFakeTimers();
+        process.env.APP_VERSION = TARGET_VERSION;
+        persisted.length = 0;
+      });
+
+      it('restarts the latched node process (once) instead of failing with legacy_upgrade_restart_lifecycle_not_sent', async () => {
+        const bridge = WsBridge.get(serverId);
+        const warn = vi.spyOn(logger, 'warn');
+        const ws = await reachLatchedBlock(bridge);
+        await vi.advanceTimersByTimeAsync(10_000);
+        await flushAsync();
+        const restarts = execFrames(ws, 'upgrade-restart-');
+        expect(restarts, 'the rescue restart runs right after the latch is reported').toHaveLength(1);
+        expect(JSON.stringify(warn.mock.calls)).not.toContain('legacy_upgrade_restart_lifecycle_not_sent');
+        // the restart verifies, and the node process is gone (the SYSTEM task replaced it): the server asks again
+        await answerExec(ws, restarts[0]!, LEGACY_WINDOWS_UPGRADE_RESTART_READY_PREFIX);
+        ws.close();
+        await flushAsync();
+        const replacement = await connectLegacyNode(bridge);
+        const [secondRescue] = execFrames(replacement, 'upgrade-rescue-');
+        await answerExec(replacement, secondRescue!, LEGACY_WINDOWS_UPGRADE_RESCUE_READY_PREFIX);
+        expect(upgradeFrames(replacement), 'the replacement generation is offered the upgrade at once').toHaveLength(1);
+        warn.mockRestore();
+      });
+
+      it('never restarts the same node more than the shared 10m/30m/2h/6h schedule allows, and says why it is waiting', async () => {
+        const bridge = WsBridge.get(serverId);
+        let ws = await reachLatchedBlock(bridge);
+        await vi.advanceTimersByTimeAsync(10_000);
+        await flushAsync();
+        expect(execFrames(ws, 'upgrade-restart-')).toHaveLength(1);
+        await answerExec(ws, execFrames(ws, 'upgrade-restart-')[0]!, LEGACY_WINDOWS_UPGRADE_RESTART_READY_PREFIX);
+
+        // The restart did not clear the latch: the node comes back and refuses again, every time.
+        const startedAt = Date.now();
+        const restartTimes: number[] = [startedAt];
+        for (const waitMinutes of [10, 30, 120, 360, 360]) {
+          ws = await reconnectLatchedNode(bridge, ws);
+          // not before the scheduled delay ...
+          await vi.advanceTimersByTimeAsync(waitMinutes * MINUTE - 20_000);
+          await flushAsync();
+          expect(execFrames(ws, 'upgrade-restart-'), `no restart before ${waitMinutes} minutes`).toHaveLength(0);
+          // ... and then exactly one
+          await vi.advanceTimersByTimeAsync(40_000);
+          await flushAsync();
+          const restarts = execFrames(ws, 'upgrade-restart-');
+          expect(restarts, `one restart at ${waitMinutes} minutes`).toHaveLength(1);
+          restartTimes.push(Date.now());
+          await answerExec(ws, restarts[0]!, LEGACY_WINDOWS_UPGRADE_RESTART_READY_PREFIX);
+        }
+        // while the schedule holds the next restart back, the node's persisted state says so (not a silent no-op)
+        expect(persisted.some((row) => row.reason === CONTROLLED_NODE_UPGRADE_WAIT_REASON.LEGACY_RESTART_BACKOFF
+          && row.status === CONTROLLED_NODE_UPGRADE_STATUS.DEFERRED)).toBe(true);
+        expect(restartTimes).toHaveLength(6);
+      });
+
+      it('a restart that cannot be verified is reported as legacy_restart_failed and retried on the same schedule, not every minute', async () => {
+        const bridge = WsBridge.get(serverId);
+        const ws = await reachLatchedBlock(bridge);
+        await vi.advanceTimersByTimeAsync(10_000);
+        await flushAsync();
+        const [first] = execFrames(ws, 'upgrade-restart-');
+        expect(first).toBeTruthy();
+        // the SYSTEM task ran but its verification output is wrong
+        ws.emit('message', JSON.stringify({
+          type: DAEMON_MSG.MACHINE_EXEC_RESULT, correlationId: first!.correlationId, ok: true, exitCode: 1,
+          stdout: '', stderr: 'access denied', durationMs: 1,
+        }));
+        await flushAsync();
+        expect(persisted.some((row) => row.reason === CONTROLLED_NODE_UPGRADE_WAIT_REASON.LEGACY_RESTART_FAILED)).toBe(true);
+        await vi.advanceTimersByTimeAsync(10 * MINUTE - 30_000);
+        await flushAsync();
+        expect(execFrames(ws, 'upgrade-restart-'), 'the old 1/2/4/5-minute cadence is gone').toHaveLength(1);
+        await vi.advanceTimersByTimeAsync(60_000);
+        await flushAsync();
+        expect(execFrames(ws, 'upgrade-restart-'), 'the second attempt follows the shared schedule').toHaveLength(2);
+      });
+
+      it('also reaches the restart for a latched node that advertises safe self-upgrade (rescue prepared after the receipt)', async () => {
+        const bridge = WsBridge.get(serverId);
+        const ws = await connectLegacyNode(bridge, [CONTROLLED_NODE_SAFE_SELF_UPGRADE_CAPABILITY]);
+        expect(execFrames(ws, 'upgrade-rescue-'), 'no rescue before the first upgrade: the node says it is safe').toHaveLength(0);
+        expect(upgradeFrames(ws)).toHaveLength(1);
+        ws.emit('message', JSON.stringify({ type: DAEMON_MSG.UPGRADE_BLOCKED, reason: DAEMON_UPGRADE_BLOCK_REASON.ALREADY_IN_PROGRESS }));
+        await flushAsync();
+        const [rescue] = execFrames(ws, 'upgrade-rescue-');
+        expect(rescue, 'the latch arms the rescue').toBeTruthy();
+        await answerExec(ws, rescue!, LEGACY_WINDOWS_UPGRADE_RESCUE_READY_PREFIX);
+        await vi.advanceTimersByTimeAsync(10_000);
+        await flushAsync();
+        expect(execFrames(ws, 'upgrade-restart-'), 'and the restart follows the prepared rescue').toHaveLength(1);
+      });
+
+      it('keeps offering nothing to a node that is not latched: a healthy legacy upgrade never triggers a restart', async () => {
+        const bridge = WsBridge.get(serverId);
+        const ws = await connectLegacyNode(bridge);
+        const [rescue] = execFrames(ws, 'upgrade-rescue-');
+        await answerExec(ws, rescue!, LEGACY_WINDOWS_UPGRADE_RESCUE_READY_PREFIX);
+        expect(upgradeFrames(ws)).toHaveLength(1);
+        await vi.advanceTimersByTimeAsync(30 * MINUTE);
+        await flushAsync();
+        expect(execFrames(ws, 'upgrade-restart-')).toHaveLength(0);
       });
     });
 

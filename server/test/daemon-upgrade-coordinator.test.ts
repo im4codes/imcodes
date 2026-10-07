@@ -438,3 +438,71 @@ describe('DaemonUpgradeCoordinator forced manual upgrades and automatic lifecycl
     expect(coordinator.releaseSentLifecycle()).toBe(false);
   });
 });
+
+describe('DaemonUpgradeCoordinator rescue-restart preparation (latched legacy node)', () => {
+  const TARGET = '2026.9.4544-dev.5197';
+  const input = (sent: Record<string, unknown>[], over: Record<string, unknown> = {}) => ({
+    targetVersion: TARGET,
+    source: 'auto' as const,
+    skipPublicationGate: true,
+    isDaemonReady: () => true,
+    isStillCurrent: () => true,
+    send: (message: Record<string, unknown>) => { sent.push(message); },
+    ...over,
+  });
+
+  it('is reachable after the latch receipt already deferred the lifecycle (the production order since 6054fcac7)', () => {
+    const coordinator = new DaemonUpgradeCoordinator();
+    const sent: Record<string, unknown>[] = [];
+    coordinator.request(input(sent));
+    expect(coordinator.snapshot()?.status).toBe('sent');
+    // the node answered already_in_progress: a retryable gate, so the lifecycle is deferred FIRST ...
+    expect(coordinator.deferAfterTransientBlock(1)).toBe(true);
+    expect(coordinator.snapshot()?.status).toBe('pending_offline');
+    // ... and the old precondition (`sent`) can no longer hold:
+    expect(coordinator.prepareRetryAfterDaemonRestart(2)).toBe(false);
+    // the rescue-restart preparation does not depend on it, and leaves the lifecycle pending for the replacement
+    expect(coordinator.prepareForLatchRescueRestart(3)).toBe('prepared');
+    expect(coordinator.snapshot()?.status).toBe('pending_offline');
+    const flushed = coordinator.flushPending({ ...input(sent), source: undefined, targetVersion: undefined } as never);
+    expect(flushed).toMatchObject({ deliveryStatus: DAEMON_UPGRADE_DELIVERY_STATUS.SENT, targetVersion: TARGET });
+    expect(sent).toHaveLength(2);
+  });
+
+  it('puts a delivered lifecycle back to pending so the replacement generation is offered the upgrade at once', () => {
+    const coordinator = new DaemonUpgradeCoordinator();
+    const sent: Record<string, unknown>[] = [];
+    const first = coordinator.request(input(sent));
+    expect(coordinator.prepareForLatchRescueRestart(5)).toBe('prepared');
+    expect(coordinator.snapshot()).toMatchObject({ upgradeId: first.upgradeId, status: 'pending_offline' });
+    expect(coordinator.sentLifecycleFor(TARGET)).toBeNull();
+  });
+
+  it('is idempotent: a retry in the same generation, or an already pending lifecycle, is still prepared', () => {
+    const coordinator = new DaemonUpgradeCoordinator();
+    const sent: Record<string, unknown>[] = [];
+    coordinator.request(input(sent, { isDaemonReady: () => false }));
+    expect(coordinator.snapshot()?.status).toBe('pending_offline');
+    for (let i = 0; i < 3; i += 1) expect(coordinator.prepareForLatchRescueRestart(i)).toBe('prepared');
+    expect(coordinator.snapshot()?.status).toBe('pending_offline');
+  });
+
+  it('has nothing to hold when there is no lifecycle: the automatic trigger creates one on re-authentication', () => {
+    expect(new DaemonUpgradeCoordinator().prepareForLatchRescueRestart(1)).toBe('prepared');
+  });
+
+  it('refuses only a terminally blocked target: its own failure backoff owns the next attempt', () => {
+    const coordinator = new DaemonUpgradeCoordinator();
+    coordinator.blockTargetAfterTerminalFailure(TARGET, 1);
+    expect(coordinator.prepareForLatchRescueRestart(2)).toBe('blocked');
+    expect(coordinator.snapshot()?.status).toBe('terminal_blocked');
+  });
+
+  it('is unchanged for the other callers: prepareRetryAfterDaemonRestart still needs a delivered lifecycle', () => {
+    const coordinator = new DaemonUpgradeCoordinator();
+    expect(coordinator.prepareRetryAfterDaemonRestart(1)).toBe(false);
+    coordinator.request(input([]));
+    expect(coordinator.prepareRetryAfterDaemonRestart(2)).toBe(true);
+    expect(coordinator.prepareRetryAfterDaemonRestart(3)).toBe(false);
+  });
+});

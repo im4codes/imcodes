@@ -281,6 +281,34 @@ export class DaemonUpgradeCoordinator {
   }
 
   /**
+   * Get the lifecycle ready for a rescue restart of a legacy node that reported its
+   * stale upgrade-in-progress latch (`already_in_progress`).
+   *
+   * The receipt itself already moved a delivered lifecycle to `pending_offline`
+   * (a node-side gate is not a failure), so the precondition cannot be `sent` --
+   * requiring it made the rescue restart unreachable for every latched node. What
+   * matters is that nothing stays marked "out": a `sent` or `pending_publication`
+   * lifecycle becomes `pending_offline` so the replacement generation is offered the
+   * upgrade at once; `pending_offline` and "no lifecycle" need nothing (the
+   * automatic trigger creates one on the replacement's authentication). Only a
+   * terminally blocked target refuses: its own backoff owns the next attempt.
+   */
+  prepareForLatchRescueRestart(now = Date.now()): 'prepared' | 'blocked' {
+    const state = this.current;
+    if (!state) return 'prepared';
+    if (state.status === 'terminal_blocked') return 'blocked';
+    if (state.status === 'sent' || state.status === 'pending_publication') {
+      if (state.timer) clearTimeout(state.timer);
+      state.timer = null;
+      state.status = 'pending_offline';
+      state.updatedAt = now;
+      state.publicationResumeInput = null;
+      state.publicationCallbackRegistered = false;
+    }
+    return 'prepared';
+  }
+
+  /**
    * Cancel any pending send and keep the failed target terminally blocked.
    * Auto/replay requests for the same target remain blocked; an explicit manual
    * request or a different target version creates a fresh lifecycle.

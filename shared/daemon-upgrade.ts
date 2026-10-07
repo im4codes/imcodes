@@ -147,6 +147,13 @@ export const CONTROLLED_NODE_UPGRADE_WAIT_REASON = {
   RETRY_BACKOFF: 'retry_backoff',
   /** The daemon authenticated again on the old version after an upgrade was delivered. */
   VERSION_UNCHANGED_AFTER_UPGRADE: 'version_unchanged_after_upgrade',
+  /**
+   * A legacy Windows node still holds its stale upgrade-in-progress latch and the
+   * next rescue restart (which clears it) is waiting out the shared retry schedule.
+   */
+  LEGACY_RESTART_BACKOFF: 'legacy_restart_backoff',
+  /** The last rescue restart of a latched legacy Windows node could not be run or verified. */
+  LEGACY_RESTART_FAILED: 'legacy_restart_failed',
 } as const;
 
 /**
