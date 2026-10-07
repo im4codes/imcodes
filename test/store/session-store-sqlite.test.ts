@@ -11,7 +11,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 import { mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -639,10 +639,19 @@ describe('readers without write authority', () => {
     upsertSession(record('deck_realproj_pair_b', { counter: 0 }));
     await flushStore();
     const stop = join(home, 'stop');
+    const progressFile = join(home, 'reader-progress.json');
+    const FLUSHES = 150;
+    const READS_INSIDE_EACH_TRANSACTION = 2;
+    // The reader publishes its running totals after EVERY read, atomically (tmp + rename). Everything the test
+    // waits for is one of those observations, never a duration: the work is fixed, how long it takes is not.
     const script = `
       const db = await import(process.env.DB_MODULE);
       const fs = await import('node:fs');
       let reads = 0, torn = 0, corrupt = 0, maxCounter = 0;
+      const publish = () => {
+        fs.writeFileSync(process.env.PROGRESS_FILE + '.tmp', JSON.stringify({ reads, torn, corrupt, maxCounter }));
+        fs.renameSync(process.env.PROGRESS_FILE + '.tmp', process.env.PROGRESS_FILE);
+      };
       while (!fs.existsSync(process.env.STOP_FILE)) {
         const handle = db.openSessionDbReadOnly(process.env.DB_FILE);
         try {
@@ -655,39 +664,104 @@ describe('readers without write authority', () => {
           if (rows.size < 102) corrupt += 1;
         } catch (error) { corrupt += 1; } finally { db.closeSessionDb(handle); }
         reads += 1;
-        if (reads === 1) console.log('READY');
+        publish();
+        // Yield between reads: a reader that never lets its own event loop turn starves every other process on a
+        // small CI runner (and could not flush anything it printed).
+        await new Promise((resolve) => setImmediate(resolve));
       }
-      console.log('RESULT' + JSON.stringify({ reads, torn, corrupt, maxCounter }));
+      publish();
     `;
     const child = spawn(process.execPath, ['--import', 'tsx', '--input-type=module', '--eval', script], {
       cwd: process.cwd(),
       env: {
         ...process.env, HOME: home, IMCODES_HOME: join(home, '.imcodes'), DB_MODULE: new URL('../../src/store/session-store-db.ts', import.meta.url).href,
-        DB_FILE: sessionDbPathForHome(home), STOP_FILE: stop,
+        DB_FILE: sessionDbPathForHome(home), STOP_FILE: stop, PROGRESS_FILE: progressFile,
       },
-      stdio: ['ignore', 'pipe', 'inherit'],
+      stdio: ['ignore', 'ignore', 'inherit'],
     });
-    let out = '';
-    child.stdout.on('data', (chunk) => { out += String(chunk); });
-    // Wait for the reader's first read instead of a fixed delay: under CPU load a fresh tsx process can take
-    // far longer than that to start, and the writer would finish before a single read happened.
-    const readyBy = Date.now() + 60_000;
-    while (!out.includes('READY') && Date.now() < readyBy) await sleep(25);
-    expect(out).toContain('READY');
-    for (let counter = 1; counter <= 150; counter += 1) {
-      // Both rows change in one flush = one transaction; a reader must see both or neither.
-      upsertSession(record('deck_realproj_pair_a', { counter }));
-      upsertSession(record('deck_realproj_pair_b', { counter }));
-      await flushStore();
+    // Attach the exit observer at spawn, not when it is needed: an 'exit' that fires before anybody listens is lost for
+    // good, and awaiting it later then hangs for the whole test timeout. (Creating the stop file with writeFile()
+    // and only then listening did exactly that whenever the reader exited before this process resumed.)
+    let exitInfo: { code: number | null; signal: NodeJS.Signals | null } | null = null;
+    const exited = new Promise<void>((resolve) => child.once('exit', (code, signal) => { exitInfo = { code, signal }; resolve(); }));
+    const describeExit = () => (exitInfo ? `exited with code ${exitInfo.code} signal ${exitInfo.signal}` : 'still running');
+    type Progress = { reads: number; torn: number; corrupt: number; maxCounter: number };
+    const readProgress = (): Progress | null => {
+      try { return JSON.parse(readFileSync(progressFile, 'utf8')) as Progress; } catch { return null; }
+    };
+    const snooze = (ms: number) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+    /**
+     * Wait for `done()` without a wall-clock budget: the wait fails only when the reader has stopped making
+     * progress (no new read for `stallMs`) or has died, and says which phase it was in and what it last reported.
+     */
+    const stalled = (phase: string, stallMs: number) => new Error(
+      `reader stalled while ${phase}: no new read for ${stallMs}ms; reader ${describeExit()}; last progress ${JSON.stringify(readProgress())}`,
+    );
+    const waitUntil = async (phase: string, done: (progress: Progress | null) => boolean, stallMs = 30_000): Promise<Progress | null> => {
+      let lastReads = -1;
+      let lastChangeAt = Date.now();
+      for (;;) {
+        const progress = readProgress();
+        if (done(progress)) return progress;
+        if (exitInfo) throw new Error(`reader ${describeExit()} while ${phase}; last progress ${JSON.stringify(progress)}`);
+        if ((progress?.reads ?? -1) !== lastReads) { lastReads = progress?.reads ?? -1; lastChangeAt = Date.now(); }
+        else if (Date.now() - lastChangeAt > stallMs) throw stalled(phase, stallMs);
+        await sleep(5);
+      }
+    };
+    // Same wait from inside the (synchronous) row-write hook, where this process's event loop is deliberately held.
+    const waitSyncForReads = (count: number): void => {
+      const target = (readProgress()?.reads ?? 0) + count;
+      let lastReads = -1;
+      let lastChangeAt = Date.now();
+      for (;;) {
+        const reads = readProgress()?.reads ?? 0;
+        if (reads >= target) return;
+        if (exitInfo) throw new Error(`reader ${describeExit()} during a write transaction`);
+        if (reads !== lastReads) { lastReads = reads; lastChangeAt = Date.now(); }
+        else if (Date.now() - lastChangeAt > 20_000) throw stalled('a write transaction was open', 20_000);
+        snooze(2);
+      }
+    };
+    try {
+      // A cold tsx start can take a long time on a loaded runner; what matters is that the reader gets going.
+      await waitUntil('waiting for the reader to start', (progress) => (progress?.reads ?? 0) >= 1, 60_000);
+      for (let counter = 1; counter <= FLUSHES; counter += 1) {
+        // Both rows change in one flush = one transaction; a reader must see both or neither. Hold EVERY
+        // transaction open, after its first row and before its second, until the reader has completed reads that
+        // began while it was open: the overlap is guaranteed by construction, not left to scheduling luck. With
+        // atomic commits those reads see the previous state of both rows; commit the rows separately and
+        // they see one new and one old row.
+        setSessionDbRowWriteHookForTests((writeInTransaction) => {
+          if (writeInTransaction === 2) waitSyncForReads(READS_INSIDE_EACH_TRANSACTION);
+        });
+        upsertSession(record('deck_realproj_pair_a', { counter }));
+        upsertSession(record('deck_realproj_pair_b', { counter }));
+        await flushStore();
+      }
+      setSessionDbRowWriteHookForTests(null);
+      // The reader must also have read the final state, however long that takes it.
+      await waitUntil('waiting for the reader to see the final state', (progress) => (progress?.maxCounter ?? 0) >= FLUSHES);
+      await writeFile(stop, '1');
+      const exitWaitMs = 30_000;
+      let exitTimer: ReturnType<typeof setTimeout> | undefined;
+      await Promise.race([
+        exited,
+        new Promise<void>((_resolve, reject) => { exitTimer = setTimeout(() => reject(new Error(`reader did not exit ${exitWaitMs}ms after the stop file was written; ${describeExit()}`)), exitWaitMs); }),
+      ]).finally(() => clearTimeout(exitTimer));
+      expect(exitInfo).toEqual({ code: 0, signal: null });
+      const result = readProgress()!;
+      expect(result.torn).toBe(0);
+      expect(result.corrupt).toBe(0);
+      expect(result.maxCounter).toBe(FLUSHES);
+      // Every transaction was held open until two reads had completed inside it.
+      expect(result.reads).toBeGreaterThanOrEqual(FLUSHES * READS_INSIDE_EACH_TRANSACTION);
+    } finally {
+      setSessionDbRowWriteHookForTests(null);
+      // A failing assertion must never leave a reader looping over the database after the test.
+      if (!exitInfo) child.kill('SIGKILL');
+      await exited;
     }
-    await sleep(200); // the reader keeps looping over the final state too
-    await writeFile(stop, '1');
-    await new Promise((resolve) => child.on('exit', resolve));
-    const result = JSON.parse(out.split('\n').find((line) => line.startsWith('RESULT'))!.slice(6)) as { reads: number; torn: number; corrupt: number; maxCounter: number };
-    expect(result.reads).toBeGreaterThan(20);
-    expect(result.torn).toBe(0);
-    expect(result.corrupt).toBe(0);
-    expect(result.maxCounter).toBeGreaterThan(0);
   }, 120_000);
 });
 
