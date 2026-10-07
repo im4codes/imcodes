@@ -54,21 +54,6 @@ export const SESSION_CLOSE_AUTHORITY = {
 } as const;
 export type SessionCloseAuthority = typeof SESSION_CLOSE_AUTHORITY[keyof typeof SESSION_CLOSE_AUTHORITY];
 
-/**
- * The marker a session carries when something other than the user created it (see `pairCreatedMetadata`). It decides who may close the
- * session (its creator), how it is shown, and how many such sessions a project may hold; it never triggers a close by itself.
- */
-export interface SessionCreationMarker {
-  autoCreated: true;
-  /** The Brain session that asked for the creation. */
-  createdBy: string;
-  /** Present when the session was created for a pair. */
-  pairTaskId?: string;
-  role?: 'executor' | 'auditor';
-  source?: string;
-  createdAt?: number;
-}
-
 /** What the close would throw away, reported to the caller whenever `force` overrides a refusal (never silent). */
 export interface SessionCloseDiscarded {
   openPairs: string[];

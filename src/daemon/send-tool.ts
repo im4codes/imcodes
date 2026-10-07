@@ -116,9 +116,12 @@ import {
 import type {
   SupervisionAuditDegradedReason,
   SupervisionAuditRoutingReason,
+  SupervisionExecutionConfig,
   SupervisionProvisionFailureReason,
   SupervisionProvisioningEvidence,
 } from '../../shared/supervision-execution-pool.js';
+import { resolveForcedProvisionConfig } from './forced-provision-config.js';
+import type { TaskPairCreatedSessionReason } from '../../shared/task-pair.js';
 import type { SupervisionAuditorRecoveryCrossVendorAvailability } from '../../shared/supervision-auditor-recovery.js';
 import { LOAD_VALIDATION_SAFETY_CLAUSE } from '../../shared/load-validation-safety.js';
 import type {
@@ -1652,16 +1655,37 @@ export async function dispatchSendMessage(
   let auditRoutingReason: SupervisionAuditRoutingReason | undefined;
   let auditDegradedReason: SupervisionAuditDegradedReason | undefined;
   if (autoProvision) {
+    // An explicit call (an agent or a person) always CREATES: a new session for this idempotency key, of a configuration that follows
+    // from the input alone (see resolveForcedProvisionConfig). Only the daemon's own automatic supervision keeps pool reuse/cooldown.
+    const forceCreate = !input.automaticSupervision;
+    let forcedConfig: SupervisionExecutionConfig | undefined;
+    let forcedReason: TaskPairCreatedSessionReason | undefined;
+    if (forceCreate && !input.audit && !input.task?.requestedExecutionType) {
+      const parentRecord = allSessions.find((session) => session.name === caller.sessionName);
+      const picked = parentRecord
+        ? resolveForcedProvisionConfig(parentRecord, input.task?.executionPool ?? 'primary', { getSession: (name) => allSessions.find((session) => session.name === name) })
+        : { ok: false as const, error: 'the calling session is unavailable' };
+      if (!picked.ok) {
+        return {
+          status: 'error',
+          reason: MCP_ERROR_REASONS.VALIDATION_FAILED,
+          error: `task.autoProvision cannot choose what to create: ${picked.error}`,
+        };
+      }
+      forcedConfig = picked.config;
+      forcedReason = picked.reason;
+    }
     const provision = await (deps?.provisionSupervisionTarget ?? defaultProvisionSupervisionTarget)({
       parentSessionName: caller.sessionName,
       pool: input.task?.executionPool ?? 'primary',
-      requestedCapabilityId: input.task?.requestedExecutionType?.capabilityId,
-      requestedExecutionConfig: input.task?.requestedExecutionType ?? undefined,
+      requestedCapabilityId: input.task?.requestedExecutionType?.capabilityId ?? forcedConfig?.capabilityId,
+      requestedExecutionConfig: input.task?.requestedExecutionType ?? forcedConfig,
       identityPrompt: input.identity?.content,
       idempotencyKey,
       auditedSessionName: input.audit?.auditedSessionName,
       strictCrossVendor: input.audit?.strictCrossVendor,
       provenance: input.automaticSupervision ? 'automatic_supervision' : 'manual_explicit',
+      ...(forceCreate ? { forceCreate: true, ...(forcedReason ? { createdReason: forcedReason } : {}) } : {}),
     });
     provisioning = provision.evidence;
     auditDegradedReason = provision.auditDegradedReason;

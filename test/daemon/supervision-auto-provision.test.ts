@@ -106,6 +106,7 @@ function harness(initial: SessionRecord[], override: Partial<SupervisionAutoProv
       ccPreset: sub.ccPreset ?? undefined,
       identityPrompt: sub.identityPrompt ?? undefined,
       provisionedIdentityHash: sub.provisionedIdentityHash ?? undefined,
+      pairCreatedMetadata: sub.pairCreatedMetadata ?? undefined,
       projectDir: sub.cwd ?? '/repo',
     }));
   });
@@ -947,5 +948,166 @@ describe('supervision auto provisioning', () => {
       ok: false,
       auditDegradedReason: 'no_independent_session',
     });
+  });
+});
+
+describe('forced creation (explicit task.autoProvision)', () => {
+  beforeEach(() => clearSupervisionAutoProvisionStateForTests());
+
+  const forced = (patch: Partial<SupervisionAutoProvisionRequest> = {}): SupervisionAutoProvisionRequest => request({
+    provenance: 'manual_explicit',
+    forceCreate: true,
+    requestedCapabilityId: OPENAI.capabilityId,
+    requestedExecutionConfig: OPENAI,
+    ...patch,
+  });
+  const idleMatch = (name: string, patch: Partial<SessionRecord> = {}) => session(name, {
+    parentSession: 'deck_proj_brain', role: 'w1', userCreated: false, label: 'Auto primary', ...patch,
+  });
+  const created = (h: ReturnType<typeof harness>) => h.sessions.filter((candidate) => candidate.name.startsWith('deck_sub_send_auto_'));
+
+  it('creates a new session even when an idle one of the same configuration exists (the automatic path would reuse it)', async () => {
+    const existing = idleMatch('deck_sub_sup_auto_old');
+    const h = harness([parent([OPENAI]), existing]);
+    const automatic = await provisionSupervisionTarget(request({ provenance: 'manual_explicit', requestedCapabilityId: OPENAI.capabilityId, requestedExecutionConfig: OPENAI }), h.deps);
+    expect(automatic).toMatchObject({ ok: true, evidence: { origin: 'reused' } });
+    expect(h.start).not.toHaveBeenCalled();
+
+    const result = await provisionSupervisionTarget(forced({ idempotencyKey: 'fresh-1' }), h.deps);
+    expect(result).toMatchObject({ ok: true, evidence: { origin: 'spawned' } });
+    expect(h.start).toHaveBeenCalledTimes(1);
+    expect((result as { target: SessionRecord }).target.name).toMatch(/^deck_sub_send_auto_[0-9a-f]{16}$/u);
+    expect((result as { target: SessionRecord }).target.name).not.toBe(existing.name);
+  });
+
+  it('returns the same session for the same idempotency key and a different one for another key', async () => {
+    const h = harness([parent([OPENAI])]);
+    const first = await provisionSupervisionTarget(forced({ idempotencyKey: 'k1' }), h.deps) as { ok: true; target: SessionRecord };
+    const replay = await provisionSupervisionTarget(forced({ idempotencyKey: 'k1' }), h.deps) as { ok: true; target: SessionRecord };
+    const other = await provisionSupervisionTarget(forced({ idempotencyKey: 'k2' }), h.deps) as { ok: true; target: SessionRecord };
+    expect(replay.target.name).toBe(first.target.name);
+    expect(other.target.name).not.toBe(first.target.name);
+    expect(h.start).toHaveBeenCalledTimes(2);
+    expect(created(h)).toHaveLength(2);
+  });
+
+  it('has no launch cooldown: a second call right after the first creates again (the automatic path answers cooldown)', async () => {
+    const h = harness([parent([OPENAI])], { cooldownMs: 10 * 60_000 });
+    expect(await provisionSupervisionTarget(forced({ idempotencyKey: 'a' }), h.deps)).toMatchObject({ ok: true });
+    expect(await provisionSupervisionTarget(forced({ idempotencyKey: 'b' }), h.deps)).toMatchObject({ ok: true });
+    expect(created(h)).toHaveLength(2);
+
+    clearSupervisionAutoProvisionStateForTests();
+    const control = harness([parent([OPENAI])], { cooldownMs: 10 * 60_000 });
+    const auto = (key: string) => request({ provenance: 'manual_explicit', idempotencyKey: key, requestedCapabilityId: OPENAI.capabilityId, requestedExecutionConfig: OPENAI });
+    expect(await provisionSupervisionTarget(auto('a'), control.deps)).toMatchObject({ ok: true });
+    // Make the first child busy so reuse cannot hide the cooldown.
+    control.sessions.forEach((candidate) => { if (candidate.name.startsWith('deck_sub_')) candidate.state = 'running'; });
+    expect(await provisionSupervisionTarget(auto('b'), control.deps)).toMatchObject({ ok: false, reason: 'cooldown' });
+  });
+
+  it('creates exactly one session per distinct key under concurrency, and one for concurrent retries of one key', async () => {
+    const distinct = harness([parent([OPENAI])]);
+    const results = await Promise.all(['c1', 'c2', 'c3'].map((key) => provisionSupervisionTarget(forced({ idempotencyKey: key }), distinct.deps)));
+    expect(results.every((entry) => entry.ok)).toBe(true);
+    expect(new Set(results.map((entry) => (entry as { target: SessionRecord }).target.name)).size).toBe(3);
+    expect(distinct.start).toHaveBeenCalledTimes(3);
+
+    const same = harness([parent([OPENAI])]);
+    const retried = await Promise.all([1, 2, 3].map(() => provisionSupervisionTarget(forced({ idempotencyKey: 'retry' }), same.deps)));
+    expect(new Set(retried.map((entry) => (entry as { target: SessionRecord }).target.name)).size).toBe(1);
+    expect(same.start).toHaveBeenCalledTimes(1);
+  });
+
+  it('never reaps another session and ignores the pool work-concurrency and spawn gates', async () => {
+    const stale = idleMatch('deck_sub_sup_auto_stale', { updatedAt: 1 });
+    const stale2 = idleMatch('deck_sub_sup_auto_stale2', { updatedAt: 2, activeModel: 'other' });
+    const h = harness([parent([OPENAI]), stale, stale2], { idleReapMs: 1, countActiveSupervisionAssignments: () => 99 });
+    const result = await provisionSupervisionTarget(forced({ idempotencyKey: 'no-gates' }), h.deps);
+    expect(result).toMatchObject({ ok: true, evidence: { origin: 'spawned' } });
+    expect(h.stop).not.toHaveBeenCalled();
+    expect(h.sessions.map((candidate) => candidate.name)).toEqual(expect.arrayContaining([stale.name, stale2.name]));
+
+    const control = harness([parent([OPENAI])], { countActiveSupervisionAssignments: () => 99 });
+    expect(await provisionSupervisionTarget(request({ provenance: 'manual_explicit', requestedCapabilityId: OPENAI.capabilityId, requestedExecutionConfig: OPENAI }), control.deps))
+      .toMatchObject({ ok: false, reason: 'max_concurrency' });
+  });
+
+  it('creates without any configured pool, since the configuration was already chosen', async () => {
+    const h = harness([session('deck_proj_brain', { role: 'brain' })]);
+    expect(await provisionSupervisionTarget(forced({ idempotencyKey: 'no-pool' }), h.deps)).toMatchObject({ ok: true, evidence: { origin: 'spawned' } });
+  });
+
+  it('stamps the creation marker (who created it) on the new session and on nothing the pool path makes', async () => {
+    const h = harness([parent([OPENAI])]);
+    await provisionSupervisionTarget(forced({ idempotencyKey: 'marked' }), h.deps);
+    expect(h.start).toHaveBeenCalledWith(expect.objectContaining({
+      pairCreatedMetadata: expect.objectContaining({ autoCreated: true, createdBy: 'deck_proj_brain', source: 'send_auto_provision', createdAt: NOW }),
+    }));
+    // The same configuration through the pool path (not forced) creates a session that carries no creation marker.
+    const pooled = harness([parent([OPENAI])]);
+    await provisionSupervisionTarget(request({ provenance: 'manual_explicit', idempotencyKey: 'pooled', requestedCapabilityId: OPENAI.capabilityId, requestedExecutionConfig: OPENAI }), pooled.deps);
+    expect(pooled.start).toHaveBeenCalledTimes(1);
+    expect(pooled.start.mock.calls[0]![0]).not.toHaveProperty('pairCreatedMetadata');
+  });
+
+  it('refuses beyond the per-project cap of auto-created sessions, but still answers a retry of an existing key', async () => {
+    const marked = (index: number, patch: Partial<SessionRecord> = {}) => idleMatch(`deck_sub_marked_${index}`, {
+      pairCreatedMetadata: { autoCreated: true, createdBy: 'deck_proj_brain', source: 'send_auto_provision' }, ...patch,
+    });
+    const others = Array.from({ length: 5 }, (_unused, index) => marked(index));
+    const h = harness([parent([OPENAI]), ...others]);
+    // Another project's marked sessions do not count against this project.
+    h.sessions.push(session('deck_other_brain', { role: 'brain', projectName: 'other' }), idleMatch('deck_sub_foreign', {
+      parentSession: 'deck_other_brain', projectName: 'other',
+      pairCreatedMetadata: { autoCreated: true, createdBy: 'deck_other_brain' },
+    }));
+    expect(await provisionSupervisionTarget(forced({ idempotencyKey: 'sixth' }), h.deps)).toMatchObject({ ok: true });
+    const seventh = await provisionSupervisionTarget(forced({ idempotencyKey: 'seventh' }), h.deps);
+    expect(seventh).toMatchObject({ ok: false, reason: 'auto_created_cap_reached' });
+    expect(h.start).toHaveBeenCalledTimes(1);
+    // The session of the sixth key already exists: replaying that key is not a new creation.
+    expect(await provisionSupervisionTarget(forced({ idempotencyKey: 'sixth' }), h.deps)).toMatchObject({ ok: true });
+  });
+
+  it('removes a session whose launch threw or never became ready, and leaves no cooldown behind', async () => {
+    const throwing = harness([parent([OPENAI])]);
+    throwing.deps.startSubSession = vi.fn(async (sub: SubSessionRecord) => {
+      throwing.sessions.push(session(`deck_sub_${sub.id}`, { parentSession: 'deck_proj_brain', role: 'w1' }));
+      throw new Error('launch exploded');
+    });
+    expect(await provisionSupervisionTarget(forced({ idempotencyKey: 'boom' }), throwing.deps)).toMatchObject({ ok: false, reason: 'launch_failed' });
+    expect(throwing.stop).toHaveBeenCalledTimes(1);
+    expect(created(throwing)).toHaveLength(0);
+
+    // A clock that moves on every read, so the readiness wait can run out.
+    let clock = NOW;
+    const never = harness([parent([OPENAI])], { now: () => (clock += 10), cooldownMs: 10 * 60_000 });
+    never.deps.startSubSession = vi.fn(async (sub: SubSessionRecord) => {
+      never.sessions.push(session(`deck_sub_${sub.id}`, { parentSession: 'deck_proj_brain', role: 'w1', state: 'running', sessionInstanceId: undefined }));
+    });
+    expect(await provisionSupervisionTarget(forced({ idempotencyKey: 'slow' }), never.deps)).toMatchObject({ ok: false, reason: 'readiness_timeout' });
+    expect(never.stop).toHaveBeenCalledTimes(1);
+    expect(created(never)).toHaveLength(0);
+
+    // No cooldown was set: the very next create (a working launch) goes ahead at once.
+    never.deps.startSubSession = vi.fn(async (sub: SubSessionRecord) => {
+      never.sessions.push(session(`deck_sub_${sub.id}`, { parentSession: 'deck_proj_brain', role: 'w1' }));
+    });
+    never.deps.now = () => NOW;
+    expect(await provisionSupervisionTarget(forced({ idempotencyKey: 'slow-2' }), never.deps)).toMatchObject({ ok: true });
+    expect(created(never)).toHaveLength(1);
+  });
+
+  it('keeps the automatic pool\'s spawn budget and reaping away from forced sessions (different id prefix)', async () => {
+    const forcedSession = idleMatch('deck_sub_send_auto_0123456789abcdef', { updatedAt: 1, label: 'Auto primary' });
+    const h = harness([parent([OPENAI, ANTHROPIC]), forcedSession], { idleReapMs: 1 });
+    // maxSpawned is 2; the automatic path must not count the forced session toward it, nor stop it to make room.
+    const result = await provisionSupervisionTarget(request({
+      provenance: 'manual_explicit', idempotencyKey: 'auto-other', requestedCapabilityId: ANTHROPIC.capabilityId, requestedExecutionConfig: ANTHROPIC,
+    }), h.deps);
+    expect(result).toMatchObject({ ok: true, evidence: { origin: 'spawned' } });
+    expect(h.stop).not.toHaveBeenCalled();
+    expect(h.sessions.some((candidate) => candidate.name === forcedSession.name)).toBe(true);
   });
 });

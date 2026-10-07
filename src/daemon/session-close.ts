@@ -19,6 +19,7 @@
 import logger from '../util/logger.js';
 import { getSession, listSessions, type SessionRecord } from '../store/session-store.js';
 import { resolveEffectiveProjectName } from '../../shared/session-scope.js';
+import type { TaskPairCreatedSessionMetadata } from '../../shared/task-pair.js';
 import {
   SESSION_CLOSE_AUTHORITY,
   SESSION_CLOSE_REFUSAL,
@@ -28,7 +29,6 @@ import {
   type SessionCloseRefusal,
   type SessionCloseRequest,
   type SessionCloseResult,
-  type SessionCreationMarker,
 } from '../../shared/session-close.js';
 import { getActiveServerLink, notifySubSessionClosed, type ActiveServerLink, type SubSessionClosedNotice } from './active-server-link.js';
 
@@ -124,10 +124,10 @@ export async function inspectSessionActivity(record: SessionRecord): Promise<Ses
 }
 
 /** The marker of a session something other than the user created, or undefined for a user's own session. */
-export function readCreationMarker(record: SessionRecord): SessionCreationMarker | undefined {
-  const marker = (record as SessionRecord & { pairCreatedMetadata?: Partial<SessionCreationMarker> | null }).pairCreatedMetadata;
+export function readCreationMarker(record: SessionRecord): TaskPairCreatedSessionMetadata | undefined {
+  const marker = record.pairCreatedMetadata as Partial<TaskPairCreatedSessionMetadata> | null | undefined;
   if (!marker || marker.autoCreated !== true || typeof marker.createdBy !== 'string' || !marker.createdBy) return undefined;
-  return marker as SessionCreationMarker;
+  return marker as TaskPairCreatedSessionMetadata;
 }
 
 function isExecutionClone(record: SessionRecord): boolean {

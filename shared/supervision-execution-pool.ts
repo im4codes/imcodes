@@ -143,6 +143,7 @@ export const SUPERVISION_PROVISION_FAILURE_REASONS = [
   'provider_offline',
   'max_concurrency',
   'max_spawned',
+  'auto_created_cap_reached',
   'cooldown',
   'launch_failed',
   'readiness_timeout',

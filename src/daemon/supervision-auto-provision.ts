@@ -30,6 +30,7 @@ import { resolvePeerAuditProviderFamily } from './peer-audit-candidates.js';
 import { delegationTargetInputs } from './delegation-admission.js';
 import { startSubSession, stopSubSession, type SubSessionRecord } from './subsession-manager.js';
 import { getActiveServerLink } from './active-server-link.js';
+import { closeSubSession } from './session-close.js';
 import { overlayCachedExecutionPools } from './supervisor-defaults-cache.js';
 import logger from '../util/logger.js';
 import {
@@ -38,12 +39,17 @@ import {
 } from '../../shared/session-identity.js';
 import type { SupervisionTaskRegistry } from './supervision-state-store.js';
 import {
+  SEND_AUTO_PROVISION_CREATED_SESSION_SOURCE,
   TASK_PAIR_AUTO_CREATED_SESSION_MAX_PER_PROJECT,
+  TASK_PAIR_CREATED_SESSION_REASONS,
   TASK_PAIR_CREATED_SESSION_SOURCE,
   type TaskPairCreatedSessionMetadata,
+  type TaskPairCreatedSessionReason,
 } from '../../shared/task-pair.js';
 
 const AUTO_SESSION_ID_PREFIX = 'sup_auto_';
+/** Sessions an explicit `task.autoProvision` call creates. Not `sup_auto_`: the automatic pool reaps its own children and must never touch these. */
+const FORCED_SESSION_ID_PREFIX = 'send_auto_';
 export const SUPERVISION_AUTO_PROVISION_COOLDOWN_MS = 30_000;
 export const SUPERVISION_AUTO_PROVISION_READY_TIMEOUT_MS = 15_000;
 export const SUPERVISION_AUTO_PROVISION_IDLE_REAP_MS = 30 * 60_000;
@@ -68,6 +74,14 @@ export interface SupervisionAutoProvisionRequest {
   strictCrossVendor?: boolean;
   /** Explicit tool calls are manual; daemon-owned callers must opt into this provenance. */
   provenance?: 'manual_explicit' | 'automatic_supervision';
+  /**
+   * An explicit `task.autoProvision` call: ALWAYS create a new session for this idempotency key, never reuse another one. No pool reuse,
+   * no cooldown, no idle reaping, no pool work-concurrency or spawn gate; only the per-project cap of auto-created sessions applies.
+   * The daemon's automatic supervision keeps its pool behaviour (it never sets this).
+   */
+  forceCreate?: boolean;
+  /** Why the created session exists, recorded in its creation marker (default: explicit_create). */
+  createdReason?: TaskPairCreatedSessionReason;
 }
 
 export type SupervisionAutoProvisionResult =
@@ -272,7 +286,7 @@ function attemptIdentity(request: SupervisionAutoProvisionRequest, config: Super
     identityHash: provisionedIdentityHash(request.identityPrompt) ?? null,
   })).digest('hex');
   const suffix = digest.slice(0, 16);
-  const subId = `${AUTO_SESSION_ID_PREFIX}${suffix}`;
+  const subId = `${request.forceCreate ? FORCED_SESSION_ID_PREFIX : AUTO_SESSION_ID_PREFIX}${suffix}`;
   return {
     attemptId: `supervision_provision_${digest.slice(0, 32)}`,
     sessionName: `deck_sub_${subId}`,
@@ -382,6 +396,15 @@ async function reapOneIdleAutomaticChild(
   }
 }
 
+async function discardHalfMade(
+  deps: Required<Pick<SupervisionAutoProvisionDeps, 'stopSubSession'>>,
+  sessionName: string,
+): Promise<void> {
+  try { await deps.stopSubSession(sessionName); } catch (error) {
+    logger.warn({ err: error, sessionName }, 'forced auto-provision: could not remove a half-made session');
+  }
+}
+
 async function provisionConfig(
   parent: SessionRecord,
   request: SupervisionAutoProvisionRequest,
@@ -392,13 +415,18 @@ async function provisionConfig(
   selectedPool: SupervisionProvisionPool,
 ): Promise<SupervisionAutoProvisionResult> {
   const requestedIdentityHash = provisionedIdentityHash(request.identityPrompt) ?? '';
-  const reservationKey = `${parent.name}\0${request.pool}\0${config.capabilityId}\0${requestedIdentityHash}`;
+  const force = request.forceCreate === true;
+  // Forced creations share an in-flight launch only with a retry of the SAME idempotency key; two different keys are two sessions.
+  const reservationKey = `${parent.name}\0${request.pool}\0${config.capabilityId}\0${requestedIdentityHash}${force ? `\0force:${request.idempotencyKey}` : ''}`;
   const existingReservation = inFlight.get(reservationKey);
   if (existingReservation) return existingReservation;
 
   const operation = (async (): Promise<SupervisionAutoProvisionResult> => {
     const now = deps.now();
-    const existingReady = readyChildren(deps.listSessions(), parent, config, now, request.identityPrompt)[0];
+    // Forced: only the session THIS key already made counts as ready; any other idle session is none of this call's business.
+    const forcedName = force ? attemptIdentity(request, config).sessionName : undefined;
+    const existingReady = readyChildren(deps.listSessions(), parent, config, now, request.identityPrompt)
+      .find((candidate) => forcedName === undefined || candidate.name === forcedName);
     if (existingReady) {
       return {
         ok: true,
@@ -407,7 +435,7 @@ async function provisionConfig(
       };
     }
 
-    const until = cooldownUntil.get(`${parent.name}\0${request.pool}`) ?? 0;
+    const until = force ? 0 : cooldownUntil.get(`${parent.name}\0${request.pool}`) ?? 0;
     if (until > now) {
       return { ok: false, reason: 'cooldown', evidence: failureEvidence(selectedPool, 'cooldown', config) };
     }
@@ -429,21 +457,30 @@ async function provisionConfig(
       };
     }
 
-    let spawnedCount = deps.listSessions().filter((session) => (
-      childConsumesPool(parent, session, request.pool)
-    )).length;
-    const controls = definition?.controls ?? DEFAULT_SUPERVISION_EXECUTION_POOL_CONTROLS[request.pool];
-    if (await deps.countActiveSupervisionAssignments(parent, request.pool) >= controls.maxConcurrency) {
-      return { ok: false, reason: 'max_concurrency', evidence: failureEvidence(selectedPool, 'max_concurrency', config) };
-    }
-    if (!existing && spawnedCount >= controls.maxSpawned) {
-      await reapOneIdleAutomaticChild(parent, request, deps);
-      spawnedCount = deps.listSessions().filter((session) => (
+    if (force) {
+      // An explicit creation is not pool work: the pool's work-concurrency and spawn gates, and reaping another session to make room,
+      // do not apply. The one bound is the per-project cap of auto-created sessions, counted with the launches still in flight and
+      // reserved right here (no await between the check and the reservation); a retry of the same key never counts against it.
+      if (!existing && !reserveAutoCreatedSlot(parent.projectName, identity.sessionName, deps.listSessions(), TASK_PAIR_AUTO_CREATED_SESSION_MAX_PER_PROJECT)) {
+        return { ok: false, reason: 'auto_created_cap_reached', evidence: failureEvidence(selectedPool, 'auto_created_cap_reached', config) };
+      }
+    } else {
+      let spawnedCount = deps.listSessions().filter((session) => (
         childConsumesPool(parent, session, request.pool)
       )).length;
-    }
-    if (!existing && spawnedCount >= controls.maxSpawned) {
-      return { ok: false, reason: 'max_spawned', evidence: failureEvidence(selectedPool, 'max_spawned', config) };
+      const controls = definition?.controls ?? DEFAULT_SUPERVISION_EXECUTION_POOL_CONTROLS[request.pool];
+      if (await deps.countActiveSupervisionAssignments(parent, request.pool) >= controls.maxConcurrency) {
+        return { ok: false, reason: 'max_concurrency', evidence: failureEvidence(selectedPool, 'max_concurrency', config) };
+      }
+      if (!existing && spawnedCount >= controls.maxSpawned) {
+        await reapOneIdleAutomaticChild(parent, request, deps);
+        spawnedCount = deps.listSessions().filter((session) => (
+          childConsumesPool(parent, session, request.pool)
+        )).length;
+      }
+      if (!existing && spawnedCount >= controls.maxSpawned) {
+        return { ok: false, reason: 'max_spawned', evidence: failureEvidence(selectedPool, 'max_spawned', config) };
+      }
     }
 
     if (!existing) {
@@ -461,7 +498,19 @@ async function provisionConfig(
           parentSession: parent.name,
           fresh: true,
           label: `Auto ${selectedPool}`,
+          ...(force
+            ? {
+              pairCreatedMetadata: {
+                autoCreated: true,
+                createdBy: parent.name,
+                source: SEND_AUTO_PROVISION_CREATED_SESSION_SOURCE,
+                reason: request.createdReason ?? TASK_PAIR_CREATED_SESSION_REASONS.EXPLICIT,
+                createdAt: deps.now(),
+              } satisfies TaskPairCreatedSessionMetadata,
+            }
+            : {}),
         });
+        releaseAutoCreatedSlot(identity.sessionName);
       } catch (error) {
         logger.warn({
           err: error,
@@ -472,7 +521,11 @@ async function provisionConfig(
           runtimeType: config.runtimeType,
           model: config.model,
         }, 'Supervision target auto-provision launch failed');
-        cooldownUntil.set(`${parent.name}\0${request.pool}`, deps.now() + deps.cooldownMs);
+        if (!force) cooldownUntil.set(`${parent.name}\0${request.pool}`, deps.now() + deps.cooldownMs);
+        // A launch that threw may still have left a record behind: no failure leaves a half-made session. The slot is released only
+        // after it is gone, so a half-made session never makes room for one more.
+        if (force) await discardHalfMade(deps, identity.sessionName);
+        releaseAutoCreatedSlot(identity.sessionName);
         return {
           ok: false,
           reason: 'launch_failed',
@@ -489,7 +542,7 @@ async function provisionConfig(
       const current = readyChildren(deps.listSessions(), parent, config, deps.now(), request.identityPrompt)
         .find((candidate) => candidate.name === identity.sessionName);
       if (current) {
-        cooldownUntil.set(`${parent.name}\0${request.pool}`, deps.now() + deps.cooldownMs);
+        if (!force) cooldownUntil.set(`${parent.name}\0${request.pool}`, deps.now() + deps.cooldownMs);
         return {
           ok: true,
           target: current,
@@ -504,7 +557,8 @@ async function provisionConfig(
       }
       await deps.wait(SUPERVISION_AUTO_PROVISION_POLL_MS);
     }
-    cooldownUntil.set(`${parent.name}\0${request.pool}`, deps.now() + deps.cooldownMs);
+    if (!force) cooldownUntil.set(`${parent.name}\0${request.pool}`, deps.now() + deps.cooldownMs);
+    if (force) await discardHalfMade(deps, identity.sessionName);
     return {
       ok: false,
       reason: 'readiness_timeout',
@@ -522,6 +576,38 @@ async function provisionConfig(
     if (inFlight.get(reservationKey) === operation) inFlight.delete(reservationKey);
   }
 }
+
+// ---- the per-project cap of auto-created sessions -------------------------------------------------------------------------------------
+
+/**
+ * Sessions an auto-creation has started whose creation marker is not on the session record yet, keyed by session name. A transport
+ * launch takes seconds and the marker is written only when it finishes, so counting marked sessions alone lets parallel creations all
+ * see the same room and overshoot the cap. Each creation reserves its slot here, in the same synchronous run as the cap check and
+ * before its first await, and releases it once the launch has settled (the marker is then on the record, or the half-made session is gone).
+ */
+const creationsInFlight = new Map<string, string>();
+
+/** Every auto-created session of this project: those whose record carries the marker, plus those still being launched. */
+function autoCreatedCount(projectName: string, sessions: readonly SessionRecord[]): number {
+  const names = new Set(listPairCreatedSessions(projectName, sessions).map((session) => session.name));
+  for (const [sessionName, project] of creationsInFlight) if (project === projectName) names.add(sessionName);
+  return names.size;
+}
+
+/** Check the cap and take a slot in one synchronous step; false means the project is full. A name already holding a slot keeps it. */
+function reserveAutoCreatedSlot(projectName: string, sessionName: string, sessions: readonly SessionRecord[], max: number): boolean {
+  if (creationsInFlight.has(sessionName)) return true;
+  if (autoCreatedCount(projectName, sessions) >= max) return false;
+  creationsInFlight.set(sessionName, projectName);
+  return true;
+}
+
+function releaseAutoCreatedSlot(sessionName: string): void {
+  creationsInFlight.delete(sessionName);
+}
+
+/** Test seam: how many creations currently hold a slot. */
+export function autoCreatedSlotsInFlightForTests(): number { return creationsInFlight.size; }
 
 // ---- sessions created by pair_create ------------------------------------------------------------------------------------------------
 
@@ -596,12 +682,15 @@ export async function createPairSubSession(
     }
     const availability = resolveDelegationTargets(delegationTargetInputs(sessions), deps.now());
     if (sessionIsReady(existing, availability.get(existing.name)?.availability)) return { ok: true, target: existing, created: false };
-  } else if (listPairCreatedSessions(parent.projectName, sessions).length >= deps.maxPerProject) {
-    return { ok: false, reason: 'cap_reached', detail: `${deps.maxPerProject}` };
   }
   const status = configurationAvailability(sessions, parent, request.config, deps.now());
   if (status === 'limited') return { ok: false, reason: 'provider_limited' };
   if (status === 'offline') return { ok: false, reason: 'provider_offline' };
+  // The slot is reserved here, in the same synchronous run as the cap check and before the first await: parallel creations (two
+  // pairs, or a pair and a task.autoProvision) must not all see the room that the launches still in flight are about to use.
+  if (!existing && !reserveAutoCreatedSlot(parent.projectName, sessionName, sessions, deps.maxPerProject)) {
+    return { ok: false, reason: 'cap_reached', detail: `${deps.maxPerProject}` };
+  }
 
   const discard = async (): Promise<void> => {
     try { await deps.stopSubSession(sessionName); } catch (error) {
@@ -623,9 +712,11 @@ export async function createPairSubSession(
         label: request.label,
         pairCreatedMetadata: { ...request.metadata, autoCreated: true, source: request.metadata.source ?? TASK_PAIR_CREATED_SESSION_SOURCE, createdAt: deps.now() },
       });
+      releaseAutoCreatedSlot(sessionName);
     } catch (error) {
       logger.warn({ err: error, parentSessionName: parent.name, sessionName, model: request.config.model }, 'pair session creation: launch failed');
       await discard();
+      releaseAutoCreatedSlot(sessionName);
       return { ok: false, reason: 'launch_failed', detail: error instanceof Error ? error.message : String(error) };
     }
   }
@@ -663,8 +754,9 @@ export async function provisionSupervisionTarget(
     listSessions: injected.listSessions ?? (() => listSessions()),
     getSession: injected.getSession ?? getSession,
     startSubSession: injected.startSubSession ?? startSubSession,
+    // The shared close also tells the server, so a discarded or reaped session leaves the browser's list too.
     stopSubSession: injected.stopSubSession ?? (async (sessionName: string) => (
-      await stopSubSession(sessionName)
+      await closeSubSession(sessionName)
     ).ok),
     hasActiveSupervisionLease: injected.hasActiveSupervisionLease ?? defaultHasActiveSupervisionLease,
     countActiveSupervisionAssignments: injected.countActiveSupervisionAssignments
@@ -705,7 +797,9 @@ export async function provisionSupervisionTarget(
     };
   }
   if (!audited) {
-    const ready = configs.flatMap((config) => readyChildren(sessions, parent, config, deps.now(), request.identityPrompt))[0];
+    const ready = request.forceCreate
+      ? undefined
+      : configs.flatMap((config) => readyChildren(sessions, parent, config, deps.now(), request.identityPrompt))[0];
     if (ready) {
       const config = configs.find((candidate) => configMatchesSession(candidate, ready, request.identityPrompt))!;
       return {
@@ -726,7 +820,9 @@ export async function provisionSupervisionTarget(
   const auditedFamily = resolvePeerAuditProviderFamily(audited);
   const crossConfigs = configs.filter((config) => config.providerFamily !== auditedFamily);
   const sameConfigs = configs.filter((config) => config.providerFamily === auditedFamily);
-  const crossReady = crossConfigs.flatMap((config) => readyChildren(sessions, parent, config, deps.now(), request.identityPrompt))[0];
+  const crossReady = request.forceCreate
+    ? undefined
+    : crossConfigs.flatMap((config) => readyChildren(sessions, parent, config, deps.now(), request.identityPrompt))[0];
   if (crossReady) {
     const config = crossConfigs.find((candidate) => configMatchesSession(candidate, crossReady, request.identityPrompt))!;
     return {
@@ -765,8 +861,10 @@ export async function provisionSupervisionTarget(
     };
   }
 
-  const sameReady = sameConfigs.flatMap((config) => readyChildren(deps.listSessions(), parent, config, deps.now(), request.identityPrompt))
-    .filter((session) => session.name !== audited.name)[0];
+  const sameReady = request.forceCreate
+    ? undefined
+    : sameConfigs.flatMap((config) => readyChildren(deps.listSessions(), parent, config, deps.now(), request.identityPrompt))
+      .filter((session) => session.name !== audited.name)[0];
   if (sameReady) {
     const config = sameConfigs.find((candidate) => configMatchesSession(candidate, sameReady, request.identityPrompt))!;
     return {
