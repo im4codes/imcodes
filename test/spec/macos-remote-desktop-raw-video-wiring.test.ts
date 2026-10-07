@@ -157,7 +157,8 @@ describe('macOS raw (libvpx) video path wiring', () => {
     });
 
     it('logs the decision and each change to a file the node can read, not to stderr', () => {
-      expect(worker).toContain('std::getenv(macos::kEnvRuntimeDirectory)');
+      // Through the single environment lookup helper (a test elsewhere pins getenv to exactly one use).
+      expect(worker).toContain('ProcessEnvironmentLookup(macos::kEnvRuntimeDirectory)');
       expect(worker).toContain('macos::WorkerVideoLogPath(');
       expect(worker).toContain('"decision"');
       const encoder = body('SendEncoderInfo');

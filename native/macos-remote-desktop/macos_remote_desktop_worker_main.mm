@@ -2957,7 +2957,8 @@ int RunLaunchAgentSession(const macos::WorkerLaunchContext& context) {
       media_binder->raw_video()->SetPolicyState(policy_state);
       // The worker's stderr is /dev/null: the decision goes to a file the node can
       // read, in the node's own per-user runtime directory.
-      const char* runtime_directory = std::getenv(macos::kEnvRuntimeDirectory);
+      const char* runtime_directory =
+          ProcessEnvironmentLookup(macos::kEnvRuntimeDirectory);
       video_log = std::make_shared<macos::WorkerVideoLog>(macos::WorkerVideoLogPath(
           runtime_directory != nullptr ? runtime_directory : ""));
       (void)video_log->Append(macos::FormatEncoderLogLine(
