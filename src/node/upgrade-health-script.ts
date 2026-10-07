@@ -1,6 +1,14 @@
 import { CONTROLLED_NODE_UPGRADE_HEALTH } from '../../shared/controlled-node-service.js';
 
 /**
+ * Comment line that ends the health-wait block inside the generated upgrade
+ * script. The qualification harness (scripts/windows-upgrade-qualification-stubs.ts)
+ * injects its virtual clock and stubbed process primitives right after it, so the
+ * stubs replace this block's own defaults without editing the script under test.
+ */
+export const WINDOWS_UPGRADE_HEALTH_WAIT_END_MARKER = '# imcodes-health-wait-end';
+
+/**
  * PowerShell for the authenticated-health wait of a Windows controlled-node
  * self-upgrade. Kept as plain functions so the generated upgrade script and the
  * script-level tests (which run it under PowerShell with stubbed process/lease
@@ -63,6 +71,7 @@ export function windowsUpgradeHealthWaitScript(): string {
     `    if ($verdict -ne 'wait') { return [pscustomobject]@{ Healthy = ($verdict -eq 'healthy'); Verdict = $verdict; ElapsedMs = $elapsedMs; FirstSeenMs = $firstSeenMs } }`,
     `  }`,
     `}`,
+    WINDOWS_UPGRADE_HEALTH_WAIT_END_MARKER,
   ].join('\r\n') + '\r\n';
 }
 

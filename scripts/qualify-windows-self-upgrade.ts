@@ -18,6 +18,7 @@ import {
   CONTROLLED_NODE_WINDOWS_LEGACY_UPGRADE_RESCUE_DIR,
 } from '../shared/controlled-node-service.js';
 import { cleanupLegacyWindowsUpgradeRescue } from '../src/node/legacy-upgrade-rescue.js';
+import { qualificationUpgradeHarnessScript } from './windows-upgrade-qualification-stubs.js';
 import {
   buildLegacyWindowsUpgradeRescueCommand,
   LEGACY_WINDOWS_UPGRADE_RESCUE_GRACE_MS,
@@ -135,53 +136,14 @@ async function runScenario(mode: 'success' | 'rollback'): Promise<void> {
       upgradeTaskName: `imcodes-node-upgrade-qualification-${mode}`,
     });
     const lease = join(dirname(installed), 'health-lease.json');
-    const harness = [
-      "$ErrorActionPreference = 'Stop'",
-      `$qualificationMode = ${psQuote(mode)}`,
-      `$qualificationNode = ${psQuote(installed)}`,
-      `$qualificationHelper = ${psQuote(installedHelper)}`,
-      `$qualificationLease = ${psQuote(lease)}`,
-      `$qualificationPublicationEvidence = ${psQuote(publicationEvidence)}`,
-      'function Start-Sleep { param([int]$Seconds) }',
-      'function Stop-ScheduledTask { param($TaskName, $ErrorAction) }',
-      'function Unregister-ScheduledTask { param($TaskName, $Confirm, $ErrorAction) }',
-      'function Stop-Process { param($Id, $Force, $ErrorAction) }',
-      'function Get-CimInstance { param($ClassName, $Filter, $ErrorAction); if ([string]$Filter -like "ProcessId=*") { [pscustomobject]@{ ProcessId = 42; ExecutablePath = $qualificationNode } } else { @() } }',
-      'function Get-QualificationAclEvidence {',
-      '  param([string]$Path)',
-      '  $acl = Get-Acl -LiteralPath $Path',
-      '  $rules = @($acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))',
-      '  $full = [System.Security.AccessControl.FileSystemRights]::FullControl',
-      '  $readExecute = [System.Security.AccessControl.FileSystemRights]::ReadAndExecute',
-      '  [pscustomobject]@{',
-      '    protected = [bool]$acl.AreAccessRulesProtected',
-      "    ownerSystem = $acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value -eq 'S-1-5-18'",
-      "    systemFull = @($rules | Where-Object { $_.IdentityReference.Value -eq 'S-1-5-18' -and $_.AccessControlType -eq 'Allow' -and ($_.FileSystemRights -band $full) -eq $full }).Count -gt 0",
-      "    administratorsFull = @($rules | Where-Object { $_.IdentityReference.Value -eq 'S-1-5-32-544' -and $_.AccessControlType -eq 'Allow' -and ($_.FileSystemRights -band $full) -eq $full }).Count -gt 0",
-      "    authenticatedUsersReadExecute = @($rules | Where-Object { $_.IdentityReference.Value -eq 'S-1-5-11' -and $_.AccessControlType -eq 'Allow' -and ($_.FileSystemRights -band $readExecute) -eq $readExecute }).Count -gt 0",
-      '  }',
-      '}',
-      'function Start-ScheduledTask {',
-      '  param($TaskName, $ErrorAction)',
-      '  if ($TaskName -eq "imcodes-node") {',
-      '    if (-not (Test-Path -LiteralPath $qualificationPublicationEvidence)) {',
-      '      $mainAcl = Get-QualificationAclEvidence -Path $qualificationNode',
-      '      $helperAcl = Get-QualificationAclEvidence -Path (Split-Path -Parent $qualificationHelper)',
-      '      @{',
-      '        mainSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $qualificationNode).Hash.ToLowerInvariant()',
-      '        helperSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $qualificationHelper).Hash.ToLowerInvariant()',
-      '        markerWasPresent = Test-Path -LiteralPath (Join-Path (Split-Path -Parent $qualificationNode) "upgrade-in-progress.json")',
-      '        mainAcl = $mainAcl',
-      '        helperRootAcl = $helperAcl',
-      '      } | ConvertTo-Json -Depth 4 -Compress | Set-Content -LiteralPath $qualificationPublicationEvidence -Encoding utf8',
-      '    }',
-      '    if ($qualificationMode -eq "success") {',
-      '      @{ version = 1; pid = 42; updatedAt = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() } | ConvertTo-Json -Compress | Set-Content -LiteralPath $qualificationLease -Encoding utf8',
-      '    }',
-      '  }',
-      '}',
-      generated,
-    ].join('\r\n');
+    const harness = qualificationUpgradeHarnessScript({
+      mode,
+      installed,
+      installedHelper,
+      lease,
+      publicationEvidence,
+      generatedScript: generated,
+    });
     const harnessPath = join(scenario, `upgrade-${mode}.ps1`);
     await writeFile(harnessPath, harness, 'utf8');
 
@@ -240,7 +202,8 @@ async function runScenario(mode: 'success' | 'rollback'): Promise<void> {
     if (mode === 'success' && result.recoveryFailures !== undefined) {
       throw new Error('success result unexpectedly reported rollback recoveryFailures');
     }
-    if (mode === 'rollback' && result.reason !== 'controlled node upgrade failed authenticated health verification') {
+    // The failure text names the verdict after the fixed prefix, e.g. "... health verification (fail_no_process after 180s)".
+    if (mode === 'rollback' && !String(result.reason).startsWith('controlled node upgrade failed authenticated health verification')) {
       throw new Error(`rollback was not triggered by the authenticated health-verification gate: ${String(result.reason)}`);
     }
     if (await exists(join(scenario, 'upgrade-in-progress.json'))) {
