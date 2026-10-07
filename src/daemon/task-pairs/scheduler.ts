@@ -44,6 +44,7 @@ import { getTaskPairStore, type StoredTaskPair, type TaskPairLiveness } from './
 import { isPairsEngineProject, projectBrainSession, resolveTaskPairMaxConcurrency } from './engine.js';
 import { runIntegrationDriftPass } from './integration-drift.js';
 import { sendTaskPairMessage } from './delivery.js';
+import { recordBrainNoticeOutcome } from './brain-notice.js';
 import { hasRecentTaskPairProviderError } from './provider-errors.js';
 import { mainCheckoutGuard } from './main-checkout-guard.js';
 import { ensureTaskPairWorkspaceAvailable, refreshTaskPairWorkspaceHead, taskPairService, type TaskPairScheduler } from './service.js';
@@ -1084,8 +1085,12 @@ export class TaskPairAutomation implements TaskPairScheduler {
       }
     };
     const onlyAwaitingDecision = deliveryPairs.length === 1 && deliveryPairs[0]!.state.status === TASK_PAIR_STATUS_AWAITING_BRAIN_DECISION;
-    void sendTaskPairMessage(brain, TASK_PAIR_AGGREGATE_NOTICE_ID, onlyAwaitingDecision ? 'brain-decision-reminder' : 'brain-heartbeat', buildBrainHeartbeatMessage(deliveryPairs.map((stored) => stored.state)))
+    const aggregateReason = onlyAwaitingDecision ? 'brain-decision-reminder' : 'brain-heartbeat';
+    void sendTaskPairMessage(brain, TASK_PAIR_AGGREGATE_NOTICE_ID, aggregateReason, buildBrainHeartbeatMessage(deliveryPairs.map((stored) => stored.state)))
       .then((result) => {
+        // An aggregate names no single pair, so the delivery layer cannot
+        // attribute it: record what became of it on every pair it covered.
+        for (const covered of deliveryPairs) recordBrainNoticeOutcome(covered, aggregateReason, result);
         if (result === 'sent' || result === 'queued' || result === 'skipped_pending') {
           const at = this.#now();
           const post = deliveryPairs.map((stored) => {

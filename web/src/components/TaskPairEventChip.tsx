@@ -3,6 +3,7 @@ import { useEffect, useRef, useState } from 'preact/hooks';
 import { createPortal } from 'preact/compat';
 import { AUDIT_SEVERITY_LEVELS } from '@shared/audit-convergence.js';
 import {
+  TASK_PAIR_BRAIN_NOTICE_STATUSES,
   TASK_PAIR_NOTICE_VERB,
   TASK_PAIR_STATUSES,
   TASK_PAIR_VERBS,
@@ -110,6 +111,16 @@ export function TaskPairEventChip({ eventId, payload, timestamp, sessions }: { e
   const payloadJson = JSON.stringify(safePayloadValue(payloadForDetails), null, 2) ?? '{}';
   const eventTime = typeof timestamp === 'number' && Number.isFinite(timestamp)
     ? new Intl.DateTimeFormat(i18n?.language || undefined, { hour: '2-digit', minute: '2-digit' }).format(new Date(timestamp))
+    : '';
+  // Only a daemon that records Brain notices sends this; its absence shows nothing.
+  const brainNotice = event.brainNotice;
+  const brainNoticeShown = !!brainNotice
+    && (TASK_PAIR_BRAIN_NOTICE_STATUSES as readonly unknown[]).includes(brainNotice.status)
+    && typeof brainNotice.at === 'number' && Number.isFinite(brainNotice.at);
+  const brainNoticeText = brainNoticeShown
+    ? t(`taskPair.brain_notice_${brainNotice!.status}`, {
+      time: new Intl.DateTimeFormat(i18n?.language || undefined, { hour: '2-digit', minute: '2-digit' }).format(new Date(brainNotice!.at)),
+    })
     : '';
   const noticeText = typeof (event as Record<string, unknown>).noticeText === 'string'
     ? (event as Record<string, unknown>).noticeText as string
@@ -317,6 +328,7 @@ export function TaskPairEventChip({ eventId, payload, timestamp, sessions }: { e
           <span class="task-pair-chip-task">
             <strong>{title}</strong>
           </span>
+          {brainNoticeText && <span class={`task-pair-card-brain-notice is-${brainNotice!.status}`} data-brain-notice={brainNotice!.status}>{brainNoticeText}</span>}
         </button>
       </header>
       {expanded && <>

@@ -48,6 +48,22 @@ describe('TaskPairEventChip', () => {
     };
   }
 
+  it('shows on a waiting-for-Brain card whether Brain was actually notified, and nothing when the daemon sends no notice state', () => {
+    const base = { taskId: 'wait-task', title: 'Waiting', writer: 'executor-1', verb: 'DONE', toStatus: 'awaiting_brain_decision' };
+    const at = Date.UTC(2026, 0, 2, 6, 18, 5);
+    for (const status of ['sent', 'queued', 'no_session', 'failed'] as const) {
+      const { container, unmount } = render(<TaskPairEventChip eventId={`brain-notice-${status}`} payload={{ ...base, brainNotice: { status, at, reason: 'brain-line-done-no-auditor' } }} />);
+      const line = container.querySelector('[data-brain-notice]');
+      expect(line?.getAttribute('data-brain-notice')).toBe(status);
+      expect(line?.textContent).toContain(`taskPair.brain_notice_${status}`);
+      unmount();
+    }
+    const { container: oldDaemon } = render(<TaskPairEventChip eventId="brain-notice-absent" payload={base} />);
+    expect(oldDaemon.querySelector('[data-brain-notice]')).toBeNull();
+    const { container: unknown } = render(<TaskPairEventChip eventId="brain-notice-unknown" payload={{ ...base, brainNotice: { status: 'future_status', at, reason: 'x' } }} />);
+    expect(unknown.querySelector('[data-brain-notice]')).toBeNull();
+  });
+
   it('opens a delayed desktop hover preview with readable details and closes after leaving', () => {
     const restoreMatchMedia = stubDesktopHover(true);
     vi.useFakeTimers();

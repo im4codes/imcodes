@@ -9,9 +9,11 @@ import { createRequire } from 'node:module';
 import { mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import {
+  TASK_PAIR_BRAIN_NOTICE_STATUSES,
   TASK_PAIR_DEFAULT_MAX_CONCURRENCY,
   TASK_PAIR_PARTICIPANT_STATUSES,
   TASK_PAIR_TERMINAL_STATUSES,
+  type TaskPairBrainNoticeStatus,
   type TaskPairEngine,
   type TaskPairEventSource,
   type TaskPairRole,
@@ -63,6 +65,10 @@ export interface TaskPairLiveness {
   brainReminderLastDecisionReason?: string;
   /** Last aggregate Brain heartbeat/reminder delivery for this Brain session. */
   brainGlobalLastDeliveryAt?: number;
+  /** Outcome of the last daemon notice addressed to Brain for this pair (what the pair card shows). */
+  brainNoticeStatus?: TaskPairBrainNoticeStatus;
+  brainNoticeAt?: number;
+  brainNoticeReason?: string;
   /** Last participant nudge shown in the task console. */
   lastNudgedAt?: number;
   lastTickAt: number;
@@ -746,6 +752,9 @@ function rowToPair(row: Record<string, unknown>): StoredTaskPair {
     ...(Number.isFinite(Number(raw.brainReminderLastDecisionAt)) ? { brainReminderLastDecisionAt: Number(raw.brainReminderLastDecisionAt) } : {}),
     ...(typeof raw.brainReminderLastDecisionReason === 'string' ? { brainReminderLastDecisionReason: raw.brainReminderLastDecisionReason } : {}),
     ...(Number.isFinite(Number(raw.brainGlobalLastDeliveryAt)) ? { brainGlobalLastDeliveryAt: Number(raw.brainGlobalLastDeliveryAt) } : {}),
+    ...((TASK_PAIR_BRAIN_NOTICE_STATUSES as readonly unknown[]).includes(raw.brainNoticeStatus) ? { brainNoticeStatus: raw.brainNoticeStatus } : {}),
+    ...(Number.isFinite(Number(raw.brainNoticeAt)) ? { brainNoticeAt: Number(raw.brainNoticeAt) } : {}),
+    ...(typeof raw.brainNoticeReason === 'string' ? { brainNoticeReason: raw.brainNoticeReason } : {}),
     ...(Number.isFinite(Number(raw.lastNudgedAt)) ? { lastNudgedAt: Number(raw.lastNudgedAt) } : {}),
     lastTickAt: Number(raw.lastTickAt ?? 0),
     notified: Array.isArray(raw.notified) ? raw.notified.map(String) : [],

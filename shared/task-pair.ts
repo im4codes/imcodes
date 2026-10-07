@@ -46,6 +46,29 @@ export const TASK_PAIR_CHECK_VERB = 'CHECK' as const;
 export const TASK_PAIR_MCP_DISPATCH_EVENT = 'PAIR_DISPATCH' as const;
 export const TASK_PAIR_MCP_DELIVERY_EVENT = 'PAIR_DELIVERY' as const;
 /**
+ * Every outcome of handing a daemon-authored message to a session. `skipped_pending`
+ * means an earlier identical message is still waiting in the target's queue.
+ */
+export const TASK_PAIR_DELIVERY_RESULTS = ['sent', 'queued', 'skipped_pending', 'no_session', 'failed'] as const;
+export type TaskPairDeliveryResult = typeof TASK_PAIR_DELIVERY_RESULTS[number];
+/** Durable event verb recording what became of a daemon notice addressed to Brain. */
+export const TASK_PAIR_BRAIN_NOTICE_EVENT = 'BRAIN_NOTICE' as const;
+/** Outcomes worth recording for a Brain notice (a pending duplicate changes nothing). */
+export const TASK_PAIR_BRAIN_NOTICE_STATUSES = ['sent', 'queued', 'no_session', 'failed'] as const;
+export type TaskPairBrainNoticeStatus = typeof TASK_PAIR_BRAIN_NOTICE_STATUSES[number];
+/** The last notice the daemon addressed to Brain for one pair, as the pair card shows it. */
+export interface TaskPairBrainNotice {
+  status: TaskPairBrainNoticeStatus;
+  /** Epoch ms at which the daemon handed the notice to Brain's session. */
+  at: number;
+  /** Reason id of the notice (e.g. `brain-line-done-no-auditor`). */
+  reason: string;
+}
+/** Daemon notices that ask Brain to decide a pair awaiting its decision; each earns at most one follow-up. */
+export const TASK_PAIR_BRAIN_DECISION_NOTICE_REASONS = ['brain-line-done-no-auditor', 'brain-decision-reminder', 'brain-heartbeat'] as const;
+/** The single short follow-up sent when Brain's turn ended without touching such a pair. */
+export const TASK_PAIR_BRAIN_DECISION_FOLLOWUP_REASON = 'brain-decision-followup' as const;
+/**
  * Verb of a daemon message card whose text names no lifecycle transition (the
  * dispatched brief, reminders, handoffs...). It carries no status: a pair's
  * status comes only from a structured event or an explicit marker/status field,
@@ -2318,6 +2341,8 @@ export interface TaskPairEventPayload {
   blockedNote?: string;
   /** Structured, display-safe audit context extracted from the notice. */
   auditDetails?: TaskPairAuditDetails;
+  /** For a pair awaiting Brain's decision: what became of the last daemon notice to Brain (absent on daemons that predate it). */
+  brainNotice?: TaskPairBrainNotice;
 }
 
 /** A finding shown in an expanded task-pair card. All fields are optional so

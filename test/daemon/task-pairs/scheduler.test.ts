@@ -7,6 +7,8 @@ import { taskPairService } from '../../../src/daemon/task-pairs/service.js';
 import { mainCheckoutGuard } from '../../../src/daemon/task-pairs/main-checkout-guard.js';
 import { TaskPairAutomation, isTaskPairBrainReminderDue, isTaskPairBrainReminderGapSatisfied, resolveTaskPairBrainReminderInterval } from '../../../src/daemon/task-pairs/scheduler.js';
 import { isSessionWorking } from '../../../src/daemon/session-working.js';
+import { timelineEmitter } from '../../../src/daemon/timeline-emitter.js';
+import { TASK_PAIR_BRAIN_NOTICE_EVENT, TASK_PAIR_TIMELINE_EVENT } from '../../../shared/task-pair.js';
 import { listTaskPairCandidates } from '../../../src/daemon/task-pairs/pool.js';
 import { getSupervisionTaskRegistry } from '../../../src/daemon/supervision-state-store.js';
 import {
@@ -461,6 +463,30 @@ describe('task-pair heartbeat, replacement and queue', () => {
     await flush();
     expect(pair('NO_AUD').status).toBe('done');
     expect(pair('NEXT').status).toBe('working');
+  });
+
+  it('records the Brain decision notice, and a repeated DONE card says Brain was already told instead of looking like a fresh undelivered notification', async () => {
+    const cards: Array<Record<string, unknown>> = [];
+    const off = timelineEmitter.on((event) => {
+      if (event.type === TASK_PAIR_TIMELINE_EVENT && event.sessionId === BRAIN) cards.push(event.payload as Record<string, unknown>);
+    });
+    try {
+      marker(BRAIN, `<!-- IMCODES_TASK DISPATCH REPEAT_DONE executor=${EXEC} auditor=none -->`);
+      marker(EXEC, '<!-- IMCODES_TASK DONE REPEAT_DONE -->');
+      await flush();
+      expect(sentTo(BRAIN, 'brain-line-done-no-auditor')).toHaveLength(1);
+      expect(getTaskPairStore().listEvents(PROJECT, 'REPEAT_DONE').filter((event) => event.verb === TASK_PAIR_BRAIN_NOTICE_EVENT && event.attrs.reason === 'brain-line-done-no-auditor'))
+        .toMatchObject([{ effect: 'sent' }]);
+      now += 60_000;
+      marker(EXEC, '<!-- IMCODES_TASK DONE REPEAT_DONE -->');
+      await flush();
+      const repeat = cards.filter((card) => card.taskId === 'REPEAT_DONE' && card.verb === 'DONE').at(-1)!;
+      expect(repeat).toMatchObject({ unusual: true, effect: 'recorded', brainNotice: { status: 'sent', reason: 'brain-line-done-no-auditor' } });
+      // The repeat was not a second delivery: still exactly one notice.
+      expect(sentTo(BRAIN, 'brain-line-done-no-auditor')).toHaveLength(1);
+    } finally {
+      off();
+    }
   });
 
   it('enforces the ten-minute Brain gap across two pairs sharing one Brain', async () => {

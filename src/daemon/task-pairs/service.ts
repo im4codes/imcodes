@@ -61,6 +61,7 @@ import { flushTaskPairStoreLiveness, getTaskPairStore, livenessChangedBeyondActi
 import { brainUiLocale, isPairsEngineProject, projectBrainSession, projectOfSession } from './engine.js';
 import { inspectToolCallForPairMainCheckoutWrite } from './main-checkout-write-guard.js';
 import { noteTaskPairFocus, sendTaskPairMessage, taskPairFocusOf, type TaskPairDeliveryResult } from './delivery.js';
+import { brainNoticeForCard } from './brain-notice.js';
 import { checkStaleBaseNotice } from './integration-drift.js';
 import { resolveTaskPairMaterial, verifyTaskPairRoundBase } from './material.js';
 import { formatPossibleSilentRevertWarning, inspectPossibleSilentRevert, isRewrittenHead } from './rebase-revert-guard.js';
@@ -2527,6 +2528,13 @@ export function emitTaskPairTimelineEvent(
       if (record?.effort) payload.auditorThinking = record.effort;
       if (record?.state) payload.auditorState = record.state;
     }
+  }
+  // A pair waiting on Brain: say what became of the last notice to Brain, so
+  // the card is not mistaken for a delivery (it only projects the event).
+  if (pair?.status === TASK_PAIR_STATUS_AWAITING_BRAIN_DECISION && pair.brain) {
+    const owner = getTaskPairStore().pairsForSession(pair.brain).find((stored) => stored.state.taskId === pair.taskId && stored.state.brain === pair.brain);
+    const brainNotice = brainNoticeForCard(owner);
+    if (brainNotice) payload.brainNotice = brainNotice;
   }
   const targets = new Set<string>(base.writer === 'daemon' ? [] : [base.writer]);
   for (const session of [pair?.executor, pair?.auditor, pair?.brain]) {

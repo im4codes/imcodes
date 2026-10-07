@@ -16,12 +16,13 @@ import { getTransportRuntime } from '../../agent/session-manager.js';
 import { dispatchSessionMessage } from '../session-dispatch.js';
 import { createSendDispatchId, type SendMessageId } from '../../../shared/send-message-id.js';
 import { MEMORY_MCP_SEND_DELIVERY_MODES } from '../../../shared/memory-mcp-contracts.js';
-import { TASK_PAIR_AUTOMATION_KIND, TASK_PAIR_NUDGE_ID_PREFIX, isTerminalTaskPairStatus } from '../../../shared/task-pair.js';
+import { TASK_PAIR_AUTOMATION_KIND, TASK_PAIR_NUDGE_ID_PREFIX, isTerminalTaskPairStatus, type TaskPairDeliveryResult } from '../../../shared/task-pair.js';
+import { recordBrainNoticeOutcome } from './brain-notice.js';
 import { getTaskPairStore } from './store.js';
 import { noteTaskPairFocus, resetTaskPairFocusForTests, taskPairFocusOf } from './focus.js';
 import logger from '../../util/logger.js';
 
-export type TaskPairDeliveryResult = 'sent' | 'queued' | 'skipped_pending' | 'no_session' | 'failed';
+export type { TaskPairDeliveryResult };
 
 export function taskPairMessageIdPrefix(taskId: string, reason: string, dedupeScope?: string): string {
   const prefix = `${TASK_PAIR_NUDGE_ID_PREFIX}${taskId}:${reason}:`;
@@ -68,6 +69,24 @@ export function resetTaskPairDeliveryInFlightForTests(): void {
 }
 
 export async function sendTaskPairMessage(
+  target: string,
+  taskId: string,
+  reason: string,
+  text: string,
+  dedupeScope?: string,
+): Promise<TaskPairDeliveryResult> {
+  const result = await deliverTaskPairMessage(target, taskId, reason, text, dedupeScope);
+  // Brain's side of a pair: remember what became of the notice. Aggregate
+  // notices (`__...` ids) name no single pair; their senders record per pair.
+  if (!taskId.startsWith('__')) {
+    for (const stored of getTaskPairStore().pairsForSession(target)) {
+      if (stored.state.taskId === taskId && stored.state.brain === target) recordBrainNoticeOutcome(stored, reason, result);
+    }
+  }
+  return result;
+}
+
+async function deliverTaskPairMessage(
   target: string,
   taskId: string,
   reason: string,
