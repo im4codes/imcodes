@@ -101,11 +101,17 @@ export const LOCAL_PANEL_WARNING_BAR_FLAGS: readonly string[] = Object.freeze([
 ]);
 
 /**
+ * The X11 WM_CLASS / Wayland app_id of the panel window on Linux, and the desktop entry's StartupWMClass: the desktop shell matches the
+ * window to that entry, so the taskbar/dock/Alt-Tab show aiDesk's own name and icon instead of the browser's.
+ */
+export const LOCAL_PANEL_LINUX_WM_CLASS = 'aidesk';
+
+/**
  * Arguments that make a Chromium-family browser show the panel as an application window: `--app` (no tabs/address bar), a profile
  * of its own, and a proxy that refuses every connection except the loopback (bypassed), so the window cannot load an external
  * site whatever the page does. (A host-resolver rule would do the same but makes the browser show a warning bar in every window.)
  */
-export function buildLocalPanelAppModeArgs(profileDir: string): string[] {
+export function buildLocalPanelAppModeArgs(profileDir: string, platform?: LocalPanelPlatform): string[] {
   return [
     `--app=${localPanelUrl()}`,
     `--user-data-dir=${profileDir}`,
@@ -116,6 +122,7 @@ export function buildLocalPanelAppModeArgs(profileDir: string): string[] {
     '--no-default-browser-check',
     '--disable-extensions',
     '--disable-features=Translate',
+    ...(platform === 'linux' ? [`--class=${LOCAL_PANEL_LINUX_WM_CLASS}`, `--name=${LOCAL_PANEL_LINUX_WM_CLASS}`] : []),
   ];
 }
 

@@ -1,3 +1,4 @@
+import { LOCAL_PANEL_LINUX_WM_CLASS } from '../../shared/local-panel-window.js';
 import { mkdtemp, mkdir, readFile, readlink, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -33,6 +34,12 @@ async function root(): Promise<string> {
 }
 
 describe('aiDesk desktop entries', () => {
+  it('the Linux desktop entry carries the panel window\'s WM_CLASS as StartupWMClass, so the shell shows its name and icon for the browser window', () => {
+    const entry = buildLinuxAideskDesktopEntry('/opt/imcodes/imcodes-node', '/opt/imcodes/icon.png');
+    expect(entry).toContain(`StartupWMClass=${LOCAL_PANEL_LINUX_WM_CLASS}\n`);
+    expect(entry).toContain('Icon="/opt/imcodes/icon.png"');
+  });
+
   it('resolves the packaged native UI beside the controlled-node executable on each desktop OS', () => {
     expect(resolveAideskLocalUiExecutable('win32', 'D:\\IM.codes\\node.exe')).toBe(
       'D:\\IM.codes\\aidesk-local-ui.exe',

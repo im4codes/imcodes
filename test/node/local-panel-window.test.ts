@@ -54,6 +54,13 @@ describe('the panel URL is the loopback panel and nothing else', () => {
     expect(args.some((arg) => /^https?:\/\/(?!127\.0\.0\.1:(43751|1)\b)/u.test(arg))).toBe(false);
   });
 
+  it('--class/--name (the window\'s WM_CLASS) are passed on Linux only', () => {
+    expect(buildLocalPanelAppModeArgs('/p', 'linux')).toEqual(expect.arrayContaining(['--class=aidesk', '--name=aidesk']));
+    for (const platform of ['win32', 'darwin', undefined] as const) {
+      expect(buildLocalPanelAppModeArgs('/p', platform).some((arg) => arg.startsWith('--class=') || arg.startsWith('--name='))).toBe(false);
+    }
+  });
+
   it('never passes a flag that makes the browser show its yellow "unsupported command-line flag" bar (a known-bad-flag guard)', () => {
     const flagNames = (args: readonly string[]): string[] => args.map((arg) => arg.split('=')[0]!);
     const names = flagNames(buildLocalPanelAppModeArgs('/home/u/profile'));

@@ -192,7 +192,7 @@ export function createLinuxLocalPanelWindowPlatform(overrides: Partial<LinuxPane
       const profile = profileDir();
       if (!env || !profile) return false;
       try { await deps.prepareProfileParent(join(profile, '..'), user); } catch { return false; }
-      return deps.spawnDetached(browser, buildLocalPanelAppModeArgs(profile), { env, ...(user ? { asUser: user } : {}) });
+      return deps.spawnDetached(browser, buildLocalPanelAppModeArgs(profile, 'linux'), { env, ...(user ? { asUser: user } : {}) });
     },
     async openDefaultBrowser(url) {
       const user = desktopUser();

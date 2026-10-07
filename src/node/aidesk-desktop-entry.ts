@@ -24,6 +24,7 @@ import {
   AIDESK_PRODUCT_NAME,
   AIDESK_WINDOWS_SHORTCUT_FILE_NAME,
 } from '../../shared/aidesk-product.js';
+import { LOCAL_PANEL_LINUX_WM_CLASS } from '../../shared/local-panel-window.js';
 import { REMOTE_DESKTOP_LOCAL_MANAGEMENT } from '../../shared/remote-desktop-local-management.js';
 import { pickLinuxDesktopUserProfile } from './linux-desktop-environment.js';
 import { MACOS_REMOTE_DESKTOP_RESPONSIBLE_APP_PATH } from './macos-remote-desktop-responsible-spawn.js';
@@ -66,7 +67,7 @@ function desktopExecQuote(value: string): string {
 }
 
 export function buildLinuxAideskDesktopEntry(executablePath: string, iconPath: string): string {
-  return `[Desktop Entry]\nType=Application\nVersion=1.0\nName=${AIDESK_PRODUCT_NAME}\nComment=${AIDESK_PRODUCT_NAME}\nExec=${desktopExecQuote(executablePath)} --open-local-panel\nIcon=${desktopExecQuote(iconPath)}\nTerminal=false\nCategories=Network;RemoteAccess;\nStartupNotify=true\n${MANAGED_MARKER}\n`;
+  return `[Desktop Entry]\nType=Application\nVersion=1.0\nName=${AIDESK_PRODUCT_NAME}\nComment=${AIDESK_PRODUCT_NAME}\nExec=${desktopExecQuote(executablePath)} --open-local-panel\nIcon=${desktopExecQuote(iconPath)}\nTerminal=false\nCategories=Network;RemoteAccess;\nStartupNotify=true\nStartupWMClass=${LOCAL_PANEL_LINUX_WM_CLASS}\n${MANAGED_MARKER}\n`;
 }
 
 function windowsEncodedCommand(script: string): string {

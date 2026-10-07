@@ -3,7 +3,7 @@
  * command lines are run, how the running window is found and focused. Real-device behavior is checked separately on real machines.
  */
 import { describe, expect, it } from 'vitest';
-import { LOCAL_PANEL_REFUSING_PROXY, LOCAL_PANEL_WARNING_BAR_FLAGS, LOCAL_PANEL_WINDOW_TITLE, localPanelUrl } from '../../shared/local-panel-window.js';
+import { LOCAL_PANEL_LINUX_WM_CLASS, LOCAL_PANEL_REFUSING_PROXY, LOCAL_PANEL_WARNING_BAR_FLAGS, LOCAL_PANEL_WINDOW_TITLE, localPanelUrl } from '../../shared/local-panel-window.js';
 import { createLinuxLocalPanelWindowPlatform } from '../../src/node/local-panel-window-linux.js';
 import { createMacosLocalPanelWindowPlatform } from '../../src/node/local-panel-window-macos.js';
 import {
@@ -53,6 +53,8 @@ describe('Linux adapter', () => {
     expect(spawned[0]!.env).toMatchObject({ DISPLAY: ':0', HOME: '/home/alice', USER: 'alice', XDG_RUNTIME_DIR: '/run/user/1000' });
     expect(spawned[0]!.args).toContain(`--app=${localPanelUrl()}`);
     expect(spawned[0]!.args.join(' ')).toContain('--user-data-dir=/home/alice/.imcodes/local-panel/browser-profile');
+    // the window's WM_CLASS / app_id is aiDesk's own, so the desktop shell maps it to the desktop entry's name and icon (not the browser's)
+    expect(spawned[0]!.args).toEqual(expect.arrayContaining([`--class=${LOCAL_PANEL_LINUX_WM_CLASS}`, `--name=${LOCAL_PANEL_LINUX_WM_CLASS}`]));
     expect(platform.profileDir()).toBe('/home/alice/.imcodes/local-panel/browser-profile');
   });
 
