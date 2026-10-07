@@ -8,7 +8,7 @@ import {
 import { identityPromptHash } from '../util/identity-prompt-hash.js';
 import { incrementCounter } from '../util/metrics.js';
 import logger from '../util/logger.js';
-import { listLocalSessionIdentityProfiles } from './session-identity-local-store.js';
+import { listLocalSessionIdentityProfiles, putLocalSessionIdentityProfile } from './session-identity-local-store.js';
 
 /**
  * The ONE place a session's effective identity prompt is derived.
@@ -34,6 +34,11 @@ export interface ResolvedIdentity {
   prompt: string | undefined;
   /** Digest of `prompt` (identityPromptHash); undefined with no prompt. This is all a session record keeps of it. */
   hash: string | undefined;
+}
+
+export interface IdentityPersistDeps {
+  putProfile?: typeof putLocalSessionIdentityProfile;
+  boundServerId?: () => Promise<string | undefined>;
 }
 
 export interface IdentityResolverDeps {
@@ -114,5 +119,36 @@ export async function resolveEffectiveIdentityPrompt(
       'Session identity could not be resolved; the session proceeds without an identity until the next identity sync',
     );
     return undefined;
+  }
+}
+
+/**
+ * An identity chosen when a session is CREATED (session.start: a selected file or inline text) is stored in the identity
+ * store's SESSION scope -- where every later launch, restart, restore and identity sync derives it from -- never in the session
+ * record. Without this the first prompt had it (it is handed to the launch) but a restart or the 60 s sync, which derive from
+ * the store, would drop it. Best effort by design: a failure is logged (names only) and counted, the session still launches with the
+ * identity it was created with, and the sync then applies what the store holds.
+ */
+export async function persistExplicitSessionIdentity(
+  sessionName: string,
+  content: string,
+  deps: IdentityPersistDeps = {},
+): Promise<boolean> {
+  try {
+    const serverId = (await (deps.boundServerId ?? defaultBoundServerId)()) ?? '';
+    await (deps.putProfile ?? putLocalSessionIdentityProfile)({
+      scope: SESSION_IDENTITY_SCOPES.SESSION,
+      scopeKey: sessionIdentitySessionKey(serverId, sessionName),
+      content,
+      source: 'web',
+    });
+    return true;
+  } catch (error) {
+    incrementCounter('identity.persist_failed');
+    logger.warn(
+      { session: sessionName, reason: error instanceof Error ? error.name : 'unknown' },
+      'The identity chosen at session start could not be saved to the identity store; it applies to this run only',
+    );
+    return false;
   }
 }

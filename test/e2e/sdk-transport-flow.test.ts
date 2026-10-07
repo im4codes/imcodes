@@ -9,6 +9,8 @@ import {
 } from '../../src/agent/providers/getDefaultMcpServers.js';
 import { writeProcessedProjection } from '../../src/store/context-store.js';
 import { timelineStore } from '../../src/daemon/timeline-store.js';
+import { getLocalSessionIdentityProfile, putLocalSessionIdentityProfile, removeLocalSessionIdentityProfileQuiet } from '../../src/daemon/session-identity-local-store.js';
+import { identityPromptHash } from '../../src/util/identity-prompt-hash.js';
 
 const SESSION_CC = `deck_ccsdk_${Math.random().toString(36).slice(2, 8)}_brain`;
 const SESSION_CX = `deck_cxsdk_${Math.random().toString(36).slice(2, 8)}_brain`;
@@ -159,6 +161,7 @@ vi.mock('../../src/daemon/cc-presets.js', () => ({
 
 vi.mock('node:child_process', async (importOriginal) => {
   const actual = await importOriginal<typeof import('node:child_process')>();
+  const { promisify } = await import('node:util');
   const { EventEmitter } = await import('node:events');
   const { PassThrough, Writable } = await import('node:stream');
   const spawn = vi.fn(() => {
@@ -218,7 +221,7 @@ vi.mock('node:child_process', async (importOriginal) => {
   return {
     ...actual,
     spawn,
-    execFile: vi.fn((
+    execFile: Object.assign(vi.fn((
       _file: string,
       _args: string[],
       optionsOrCb?: Record<string, unknown> | ((err: Error | null, stdout: string, stderr: string) => void),
@@ -227,6 +230,9 @@ vi.mock('node:child_process', async (importOriginal) => {
       const cb = typeof optionsOrCb === 'function' ? optionsOrCb : maybeCb;
       cb?.(null, 'ok\n', '');
       return {} as never;
+    }), {
+      // Like the real execFile, a promisified call resolves `{ stdout, stderr }` (not the bare first value).
+      [promisify.custom]: async () => ({ stdout: 'ok\n', stderr: '' }),
     }),
     exec: vi.fn((_cmd: string, cb?: (err: Error | null, stdout: string, stderr: string) => void) => {
       cb?.(null, '', '');
@@ -1302,34 +1308,143 @@ describe('sdk transport flow e2e', () => {
     expect(serverLink.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'session.error' }));
   });
 
-  it('carries a selected-file identity from session.start into the first SDK system prompt', async () => {
-    const serverLink = { send: vi.fn() } as any;
-    const sessionName = 'deck_identity_file_prompt_brain';
-    const identityDocument = '中'.repeat(49_323);
+  /**
+   * The identity prompt is not session state: it is stored in the identity store (SESSION scope for what session.start
+   * carries) and derived from there at every launch. Every path below goes through the real command handler, session
+   * manager and provider to the system prompt the SDK is handed.
+   */
+  describe('session identity through session.start (never in the session record, always in the prompt)', () => {
+    const identityKey = (sessionName: string) => `:${sessionName}`; // no server bound in this process: the SESSION key is `<serverId>:<name>`
+    const cleanupProfiles: Array<[('user' | 'project' | 'session'), string]> = [];
+    const track = (scope: 'user' | 'project' | 'session', scopeKey: string) => { cleanupProfiles.push([scope, scopeKey]); };
+    afterEach(async () => {
+      for (const [scope, scopeKey] of cleanupProfiles.splice(0)) await removeLocalSessionIdentityProfileQuiet(scope, scopeKey);
+    });
 
-    handleWebCommand({
-      type: 'session.start',
-      project: 'identity file prompt',
-      dir: '/tmp/identity-file-prompt-e2e',
-      agentType: 'claude-code-sdk',
-      identityPrompt: identityDocument,
-    }, serverLink);
-    await flushAsync();
-    await waitForCondition(() => !!mocks.store.get(sessionName));
+    async function promptAfterSend(serverLink: any, sessionName: string, commandId: string): Promise<string> {
+      const before = mocks.claudeCalls.length;
+      handleWebCommand({ type: 'session.send', session: sessionName, text: 'Report your identity.', commandId }, serverLink);
+      await flushAsync();
+      await waitForCondition(() => mocks.claudeCalls.length > before);
+      return claudePresetAppend(mocks.claudeCalls.at(-1)?.options);
+    }
+    async function startMain(serverLink: any, project: string, extra: Record<string, unknown> = {}): Promise<string> {
+      handleWebCommand({ type: 'session.start', project, dir: `/tmp/${project.replace(/ /g, '-')}-e2e`, agentType: 'claude-code-sdk', ...extra }, serverLink);
+      await flushAsync();
+      const sessionName = `deck_${project.replace(/ /g, '_')}_brain`;
+      await waitForCondition(() => !!mocks.store.get(sessionName));
+      return sessionName;
+    }
+    /** Run a restart command and wait until the session has a NEW runtime (the relaunch completed). */
+    async function restartAndWait(serverLink: any, sessionName: string, cmd: Record<string, unknown>): Promise<void> {
+      const before = getTransportRuntime(sessionName);
+      handleWebCommand({ ...cmd, sessionName }, serverLink);
+      await flushAsync();
+      await waitForCondition(() => {
+        const runtime = getTransportRuntime(sessionName);
+        return !!runtime && runtime !== before && !!runtime.providerSessionId;
+      }, 6000);
+    }
 
-    handleWebCommand({
-      type: 'session.send',
-      session: sessionName,
-      text: 'Report your identity.',
-      commandId: 'cmd-identity-file-first-turn',
-    }, serverLink);
-    await flushAsync();
-    await waitForCondition(() => mocks.claudeCalls.some((call) => (
-      claudePresetAppend(call.options).includes(identityDocument)
-    )));
+    it('carries a selected-file identity from session.start into the first SDK system prompt, stores it in the identity store, and keeps it out of the record', async () => {
+      const serverLink = { send: vi.fn() } as any;
+      const identityDocument = '中'.repeat(49_323);
+      const sessionName = 'deck_identity_file_prompt_brain';
+      track('session', identityKey(sessionName));
+      await startMain(serverLink, 'identity file prompt', { identityPrompt: identityDocument });
 
-    expect(mocks.store.get(sessionName)?.identityPrompt).toBe(identityDocument);
-    expect(claudePresetAppend(mocks.claudeCalls.at(-1)?.options)).toContain(identityDocument);
+      expect(await promptAfterSend(serverLink, sessionName, 'cmd-identity-file-first-turn')).toContain(identityDocument);
+
+      const record = mocks.store.get(sessionName)!;
+      expect(record).not.toHaveProperty('identityPrompt');
+      expect(JSON.stringify(record)).not.toContain(identityDocument);
+      expect(record.appliedIdentityHash).toBe(identityPromptHash(identityDocument));
+      const stored = await getLocalSessionIdentityProfile('session', identityKey(sessionName));
+      expect(stored?.content).toBe(identityDocument);
+    });
+
+    it('a restart derives the identity from the store: it survives, and an edit made while it was stopped applies', async () => {
+      const serverLink = { send: vi.fn() } as any;
+      const sessionName = 'deck_identity_restart_brain';
+      track('session', identityKey(sessionName));
+      await startMain(serverLink, 'identity restart', { identityPrompt: 'Inline identity v1: be terse.' });
+      expect(await promptAfterSend(serverLink, sessionName, 'cmd-identity-restart-1')).toContain('Inline identity v1: be terse.');
+
+      await restartAndWait(serverLink, sessionName, { type: 'session.restart', agentType: 'claude-code-sdk' });
+      const afterRestart = await promptAfterSend(serverLink, sessionName, 'cmd-identity-restart-2');
+      expect(afterRestart).toContain('Inline identity v1: be terse.');
+      expect(JSON.stringify(mocks.store.get(sessionName))).not.toContain('Inline identity v1');
+
+      await putLocalSessionIdentityProfile({ scope: 'session', scopeKey: identityKey(sessionName), content: 'Edited identity v2: be verbose.', source: 'mcp' });
+      await restartAndWait(serverLink, sessionName, { type: 'session.restart', agentType: 'claude-code-sdk' });
+      const afterEdit = await promptAfterSend(serverLink, sessionName, 'cmd-identity-restart-3');
+      expect(afterEdit).toContain('Edited identity v2: be verbose.');
+      expect(afterEdit).not.toContain('Inline identity v1');
+    });
+
+    it('session.identity.refresh applies an edited identity to the running session for its next turn', async () => {
+      const serverLink = { send: vi.fn() } as any;
+      const sessionName = 'deck_identity_refresh_brain';
+      track('session', identityKey(sessionName));
+      await startMain(serverLink, 'identity refresh', { identityPrompt: 'Refresh identity v1.' });
+      expect(await promptAfterSend(serverLink, sessionName, 'cmd-identity-refresh-1')).toContain('Refresh identity v1.');
+
+      await putLocalSessionIdentityProfile({ scope: 'session', scopeKey: identityKey(sessionName), content: 'Refresh identity v2.', source: 'mcp' });
+      handleWebCommand({ type: 'session.identity.refresh', sessionName, commandId: 'identity-refresh-cmd' }, serverLink);
+      await waitForCondition(() => serverLink.send.mock.calls.some((call: any[]) => call[0]?.commandId === 'identity-refresh-cmd' && call[0]?.status === 'ok'));
+      const next = await promptAfterSend(serverLink, sessionName, 'cmd-identity-refresh-2');
+      expect(next).toContain('Refresh identity v2.');
+      expect(next).not.toContain('Refresh identity v1.');
+      expect(mocks.store.get(sessionName)!.appliedIdentityHash).toBeDefined();
+      expect(JSON.stringify(mocks.store.get(sessionName))).not.toContain('Refresh identity');
+    });
+
+    it('a session started WITHOUT an identity still gets the user-scope identity in its first prompt', async () => {
+      const serverLink = { send: vi.fn() } as any;
+      track('user', '');
+      await putLocalSessionIdentityProfile({ scope: 'user', scopeKey: '', content: 'User-wide identity: answer in Chinese.', source: 'mcp' });
+      const sessionName = await startMain(serverLink, 'identity user scope');
+      expect(await promptAfterSend(serverLink, sessionName, 'cmd-identity-user-1')).toContain('User-wide identity: answer in Chinese.');
+      expect(JSON.stringify(mocks.store.get(sessionName))).not.toContain('User-wide identity');
+    });
+
+    it('a session started with no identity anywhere has none, and the launch is not disturbed', async () => {
+      const serverLink = { send: vi.fn() } as any;
+      const sessionName = await startMain(serverLink, 'identity none');
+      const prompt = await promptAfterSend(serverLink, sessionName, 'cmd-identity-none-1');
+      expect(prompt).not.toContain('<imcodes-agent-identity>');
+      expect(mocks.store.get(sessionName)!.appliedIdentityHash).toBeUndefined();
+    });
+
+    it('a sub-session gets its SESSION-scope identity at start and after a restart, like a main session', async () => {
+      const serverLink = { send: vi.fn() } as any;
+      const sessionName = 'deck_sub_identity_sub';
+      track('session', identityKey(sessionName));
+      await putLocalSessionIdentityProfile({ scope: 'session', scopeKey: identityKey(sessionName), content: 'Sub-session identity v1.', source: 'mcp' });
+      handleWebCommand({ type: 'subsession.start', id: 'identity_sub', sessionType: 'claude-code-sdk', cwd: '/tmp/identity-sub-e2e', parentSession: 'deck_parent_brain' }, serverLink);
+      await flushAsync();
+      await waitForCondition(() => !!mocks.store.get(sessionName));
+      expect(await promptAfterSend(serverLink, sessionName, 'cmd-identity-sub-1')).toContain('Sub-session identity v1.');
+      expect(JSON.stringify(mocks.store.get(sessionName))).not.toContain('Sub-session identity');
+
+      await putLocalSessionIdentityProfile({ scope: 'session', scopeKey: identityKey(sessionName), content: 'Sub-session identity v2.', source: 'mcp' });
+      await restartAndWait(serverLink, sessionName, { type: 'subsession.restart' });
+      const afterRestart = await promptAfterSend(serverLink, sessionName, 'cmd-identity-sub-2');
+      expect(afterRestart).toContain('Sub-session identity v2.');
+      expect(afterRestart).not.toContain('Sub-session identity v1.');
+    });
+
+    it('an identity that cannot be saved to the store does not stop the session from starting with it', async () => {
+      const serverLink = { send: vi.fn() } as any;
+      const localStore = await import('../../src/daemon/session-identity-local-store.js');
+      const spy = vi.spyOn(localStore, 'putLocalSessionIdentityProfile').mockRejectedValue(new Error('disk full'));
+      try {
+        const sessionName = await startMain(serverLink, 'identity unsaved', { identityPrompt: 'Unsaved identity: first run only.' });
+        expect(await promptAfterSend(serverLink, sessionName, 'cmd-identity-unsaved-1')).toContain('Unsaved identity: first run only.');
+      } finally {
+        spy.mockRestore();
+      }
+    });
   });
 
   it('starts a selected compatible model without duplicating the CC preset', async () => {

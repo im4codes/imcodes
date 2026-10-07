@@ -151,6 +151,7 @@ import { fetchCodexResetCredits, consumeCodexResetCredit } from '../agent/codex-
 import { supervisionAutomation } from './supervision-automation.js';
 import { refreshSupervisorDefaultsCache } from './supervisor-defaults-cache.js';
 import { syncSessionIdentitiesForCommand } from './session-identity-sync.js';
+import { persistExplicitSessionIdentity } from './session-identity-resolver.js';
 import { SESSION_IDENTITY_WS } from '../../shared/session-identity-ws.js';
 import {
   handleSessionIdentityLocalRequest,
@@ -2585,6 +2586,10 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
       clearResend(`deck_${project}_brain`, 'session_removed');
       removeSession(`deck_${project}_brain`);
     }
+    // The identity chosen at creation lives in the identity store (SESSION scope), not in the session record: that is what a
+    // restart, a restore and the identity sync derive it from. It is saved BEFORE the session exists, so nothing that follows can
+    // miss it; this run still gets it directly (below). The save never throws: a failure is logged and counted.
+    if (identityPrompt) await persistExplicitSessionIdentity(sessionName, identityPrompt);
     const config: ProjectConfig = {
       name: project,
       dir,

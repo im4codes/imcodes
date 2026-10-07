@@ -1936,11 +1936,34 @@ describe('handleWebCommand transport queue behavior', () => {
     }, serverLink as any);
     await flushAsync();
 
-    expect(launchTransportSessionMock).toHaveBeenCalledWith(expect.objectContaining({
+    // The identity is saved to the identity store first (a file write), then the session launches with it.
+    await vi.waitFor(() => expect(launchTransportSessionMock).toHaveBeenCalledWith(expect.objectContaining({
       name: 'deck_identity_startup_brain',
       agentType: 'codex-sdk',
       identityPrompt: 'Identity loaded from a selected file.',
-    }));
+    })));
+  });
+
+  it('saves the identity chosen at session.start into the SESSION scope of the identity store (what a restart and the sync derive it from), for transport AND process agents', async () => {
+    const { getLocalSessionIdentityProfile, removeLocalSessionIdentityProfileQuiet } = await import('../../src/daemon/session-identity-local-store.js');
+    const { startProject } = await import('../../src/agent/session-manager.js');
+    try {
+      handleWebCommand({ type: 'session.start', project: 'identity persist sdk', dir: '/proj', agentType: 'codex-sdk', identityPrompt: 'SDK identity to keep.' }, serverLink as any);
+      handleWebCommand({ type: 'session.start', project: 'identity persist proc', dir: '/proj', agentType: 'codex', identityPrompt: 'Process identity to keep.' }, serverLink as any);
+      handleWebCommand({ type: 'session.start', project: 'identity persist none', dir: '/proj', agentType: 'codex-sdk' }, serverLink as any);
+      await flushAsync();
+      await vi.waitFor(async () => {
+        expect((await getLocalSessionIdentityProfile('session', ':deck_identity_persist_sdk_brain'))?.content).toBe('SDK identity to keep.');
+        expect((await getLocalSessionIdentityProfile('session', ':deck_identity_persist_proc_brain'))?.content).toBe('Process identity to keep.');
+      });
+      // The launch still gets the identity directly (the first run does not wait on the store) ...
+      expect(launchTransportSessionMock).toHaveBeenCalledWith(expect.objectContaining({ name: 'deck_identity_persist_sdk_brain', identityPrompt: 'SDK identity to keep.' }));
+      expect(vi.mocked(startProject)).toHaveBeenCalledWith(expect.objectContaining({ name: 'identity_persist_proc', identityPrompt: 'Process identity to keep.' }));
+      // ... and a session started with none writes none.
+      expect(await getLocalSessionIdentityProfile('session', ':deck_identity_persist_none_brain')).toBeNull();
+    } finally {
+      for (const key of [':deck_identity_persist_sdk_brain', ':deck_identity_persist_proc_brain']) await removeLocalSessionIdentityProfileQuiet('session', key);
+    }
   });
 
   it('rejects an invalid startup identity before creating an SDK runtime', async () => {
@@ -1961,6 +1984,8 @@ describe('handleWebCommand transport queue behavior', () => {
       type: 'session.error',
       project: 'invalid_identity_startup',
     }));
+    const { getLocalSessionIdentityProfile } = await import('../../src/daemon/session-identity-local-store.js');
+    expect(await getLocalSessionIdentityProfile('session', ':deck_invalid_identity_startup_brain')).toBeNull(); // nothing invalid is stored
   });
 
   it('passes requestedModel when starting a cursor-headless main session', async () => {
