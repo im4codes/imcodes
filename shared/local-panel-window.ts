@@ -61,7 +61,7 @@ export const LOCAL_PANEL_OPEN_ANSWER_BUDGET_MS = 8_000;
  * The window opens at this size and the user can resize it. The browser offers no minimum-size flag: the panel page itself must lay
  * out from `LOCAL_PANEL_WINDOW_MIN_SIZE` up (a narrower or shorter window may scroll, never clip).
  */
-export const LOCAL_PANEL_WINDOW_SIZE = Object.freeze({ width: 780, height: 560 } as const);
+export const LOCAL_PANEL_WINDOW_SIZE = Object.freeze({ width: 960, height: 640 } as const);
 export const LOCAL_PANEL_WINDOW_MIN_SIZE = Object.freeze({ width: 480, height: 400 } as const);
 
 /** The only address the app window may show or load: the loopback panel, exactly. */

@@ -45,7 +45,7 @@ describe('the panel URL is the loopback panel and nothing else', () => {
     const args = buildLocalPanelAppModeArgs('/home/u/.imcodes/local-panel/browser-profile');
     expect(args).toContain(`--app=${localPanelUrl()}`);
     expect(args).toContain('--user-data-dir=/home/u/.imcodes/local-panel/browser-profile');
-    expect(args).toContain('--window-size=780,560');
+    expect(args).toContain('--window-size=960,640');
     expect(args).toContain(`--proxy-server=${LOCAL_PANEL_REFUSING_PROXY}`);
     expect(args).toContain('--proxy-bypass-list=127.0.0.1;localhost');
     expect(new URL(LOCAL_PANEL_REFUSING_PROXY).hostname).toBe('127.0.0.1');
