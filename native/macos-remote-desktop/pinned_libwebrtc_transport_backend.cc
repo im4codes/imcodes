@@ -455,8 +455,12 @@ class RawCodecEncoder final : public webrtc::VideoEncoder {
  public:
   RawCodecEncoder(std::unique_ptr<webrtc::VideoEncoder> inner,
                   std::shared_ptr<RawVideoPath> raw,
-                  MacosTransportSessionAdapter* adapter)
-      : inner_(std::move(inner)), raw_(std::move(raw)), adapter_(adapter) {}
+                  MacosTransportSessionAdapter* adapter,
+                  NegotiatedVideoCodec codec)
+      : inner_(std::move(inner)),
+        raw_(std::move(raw)),
+        adapter_(adapter),
+        codec_(codec) {}
 
   void SetFecControllerOverride(
       webrtc::FecControllerOverride* fec_controller_override) override {
@@ -473,7 +477,18 @@ class RawCodecEncoder final : public webrtc::VideoEncoder {
     // pool from the core count it is given.
     webrtc::VideoEncoder::Settings capped = settings;
     capped.number_of_cores = RawEncoderCoreBudget(settings.number_of_cores);
-    return inner_->InitEncode(codec_settings, capped);
+    const int result = inner_->InitEncode(codec_settings, capped);
+    if (result == WEBRTC_VIDEO_CODEC_OK && raw_ != nullptr) {
+      // What actually came up, for the viewer's status bar and the worker's log.
+      RawEncoderFacts facts;
+      facts.codec = codec_;
+      facts.implementation = inner_->GetEncoderInfo().implementation_name;
+      facts.cores = capped.number_of_cores;
+      facts.width = static_cast<std::uint32_t>(std::max(0, source_width_));
+      facts.height = static_cast<std::uint32_t>(std::max(0, source_height_));
+      raw_->SetEncoderFacts(std::move(facts));
+    }
+    return result;
   }
 
   int32_t RegisterEncodeCompleteCallback(
@@ -484,7 +499,10 @@ class RawCodecEncoder final : public webrtc::VideoEncoder {
         callback != nullptr ? &counting_callback_ : nullptr);
   }
 
-  int32_t Release() override { return inner_->Release(); }
+  int32_t Release() override {
+    if (raw_ != nullptr) raw_->ClearEncoderFacts();
+    return inner_->Release();
+  }
 
   int32_t Encode(
       const webrtc::VideoFrame& frame,
@@ -541,6 +559,7 @@ class RawCodecEncoder final : public webrtc::VideoEncoder {
   std::unique_ptr<webrtc::VideoEncoder> inner_;
   std::shared_ptr<RawVideoPath> raw_;
   MacosTransportSessionAdapter* adapter_;
+  const NegotiatedVideoCodec codec_;
   CountingCallback counting_callback_;
   int source_width_ = 0;
   int source_height_ = 0;
@@ -576,14 +595,17 @@ class PassthroughH264EncoderFactory final : public webrtc::VideoEncoderFactory {
       const webrtc::SdpVideoFormat& format) override {
     if (raw_codecs_allowed()) {
       std::unique_ptr<webrtc::VideoEncoder> inner;
+      NegotiatedVideoCodec codec = NegotiatedVideoCodec::kUnknown;
       if (format.name == "VP9") {
         inner = webrtc::CreateVp9Encoder(env, {});
+        codec = NegotiatedVideoCodec::kVp9;
       } else if (format.name == "VP8") {
         inner = webrtc::CreateVp8Encoder(env, {});
+        codec = NegotiatedVideoCodec::kVp8;
       }
       if (inner != nullptr) {
         return std::make_unique<RawCodecEncoder>(
-            std::move(inner), binder_->raw_video(), adapter_);
+            std::move(inner), binder_->raw_video(), adapter_, codec);
       }
     }
     return std::make_unique<PassthroughH264Encoder>(binder_, adapter_);

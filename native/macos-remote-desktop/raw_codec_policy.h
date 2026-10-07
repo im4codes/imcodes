@@ -1,6 +1,8 @@
 #ifndef IMCODES_MACOS_REMOTE_DESKTOP_RAW_CODEC_POLICY_H_
 #define IMCODES_MACOS_REMOTE_DESKTOP_RAW_CODEC_POLICY_H_
 
+#include "../remote-desktop-common/data_channel_constants.h"
+
 namespace imcodes::remote_desktop::macos {
 
 // Whether a route may offer the codecs libwebrtc encodes itself (VP9/VP8) instead
@@ -43,13 +45,17 @@ struct RawCodecDecision {
   return {true, RawCodecReason::kAllowed};
 }
 
-// Stable tokens for the worker's one-line decision log.
+// Stable tokens for the worker's one-line decision log AND the `rawCodecs` field of
+// the encoder message sent to the viewer: one vocabulary, defined once in
+// data_channel_constants.h.
 [[nodiscard]] constexpr const char* RawCodecReasonName(RawCodecReason reason) noexcept {
   switch (reason) {
-    case RawCodecReason::kAllowed: return "allowed";
-    case RawCodecReason::kHardwareH264: return "hardware_h264";
-    case RawCodecReason::kCaptureCannotScale: return "capture_cannot_scale";
-    case RawCodecReason::kDisabledBySetting: return "disabled_by_setting";
+    case RawCodecReason::kAllowed: return imcodes::rd::kRawCodecsAllowed;
+    case RawCodecReason::kHardwareH264: return imcodes::rd::kRawCodecsHardwareH264;
+    case RawCodecReason::kCaptureCannotScale:
+      return imcodes::rd::kRawCodecsCaptureCannotScale;
+    case RawCodecReason::kDisabledBySetting:
+      return imcodes::rd::kRawCodecsDisabledBySetting;
   }
   return "unknown";
 }

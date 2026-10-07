@@ -113,6 +113,28 @@ statement wins:
 An unrecognised value is ignored (and reported on the log line), never treated as
 `off`.
 
+### What is actually encoding (worker log and HUD)
+
+The viewer's status bar shows the real encoder, e.g. `Encoder: VP9 (software, libvpx)`,
+`Encoder: H.264 (hardware)` or `Encoder: H.264 (software)`, and says so when the kill
+switch (or a capture that cannot scale) is why it is H.264. It comes from a message of
+its own, `remote_desktop.data.encoder` (codec, implementation, name, threads, the
+raw-codec decision), sent when the control channel opens and again once the encoder is
+up, only when it changes. It is a separate message rather than extra keys on the quality
+message on purpose: every web validates the quality message with an exact key set, so an
+extra key would blank the status bar of an older web, whereas an older web silently
+ignores a data-message type it does not know. A node that does not send it (older macOS,
+Windows, Linux) leaves the old `Encoder: software` text.
+
+The worker's stderr goes to `/dev/null`, so the same facts are appended, one line each, to
+`worker-video.log` in the node's per-user runtime directory
+(`/private/var/run/imcodes-node/user-sessions/<uid>/remote-desktop/`, mode 0700, owned by
+the session's user; the node reads it as root). Lines are `<UTC timestamp> event=<decision|
+encoder|encoder_changed> codec= implementation= name= threads= size= raw_codecs=
+setting_source= nv12_capture= invalid_value_ignored=`: no secrets, nothing from the screen.
+The file is capped at 64 KiB (the previous one is kept as `worker-video.log.1`), opened
+`O_NOFOLLOW`, mode 0600.
+
 ### NV12 capture (opt-in)
 
 By default the capture stays BGRA for both codecs: VP9 converts BGRA to I420 once

@@ -436,6 +436,8 @@ source_set("raw_video") {
   sources = [
     "codec_encoder_adapters.cc",
     "codec_encoder_adapters.h",
+    "encoder_description.cc",
+    "encoder_description.h",
     "raw_codec_policy.h",
     "raw_codec_settings.cc",
     "raw_codec_settings.h",
@@ -443,15 +445,19 @@ source_set("raw_video") {
     "reconfigurable_encoder.h",
     "video_codec_selection.cc",
     "video_codec_selection.h",
+    "worker_video_log.cc",
+    "worker_video_log.h",
   ]
 
   public = [
     "codec_encoder_adapters.h",
+    "encoder_description.h",
     "raw_codec_policy.h",
     "raw_codec_settings.h",
     "raw_video_path.h",
     "reconfigurable_encoder.h",
     "video_codec_selection.h",
+    "worker_video_log.h",
   ]
   public_deps = [ "../remote-desktop-common:remote_desktop_common" ]
 }

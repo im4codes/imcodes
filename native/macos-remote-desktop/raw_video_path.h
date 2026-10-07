@@ -8,8 +8,11 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <string>
 
 #include "../remote-desktop-common/value_types.h"
+#include "raw_codec_policy.h"
+#include "raw_codec_settings.h"
 
 namespace imcodes::remote_desktop::macos {
 
@@ -30,6 +33,26 @@ enum class NegotiatedVideoCodec : std::uint8_t {
 // links libyuv, so the session-side code (and its tests) need no libyuv.
 using Nv12ToBgraConverter = std::function<std::optional<common::CapturedFrame>(
     const common::CapturedFrame&, std::size_t max_bytes)>;
+
+// What libwebrtc's libvpx encoder actually came up as. Written by the libwebrtc
+// side when it initialises the encoder, read by the worker to tell the viewer and
+// the log what is really encoding.
+struct RawEncoderFacts {
+  NegotiatedVideoCodec codec = NegotiatedVideoCodec::kUnknown;
+  std::string implementation;  // the encoder's own name, e.g. "libvpx"
+  int cores = 0;               // the capped core count libvpx was told it has
+  std::uint32_t width = 0;
+  std::uint32_t height = 0;
+};
+
+// The node's raw-codec decision for this route and where the setting came from,
+// kept beside the path so the viewer and the log can say what was decided and why.
+struct RawCodecPolicyState {
+  RawCodecReason reason = RawCodecReason::kHardwareH264;
+  RawCodecSettingSource setting_source = RawCodecSettingSource::kDefault;
+  bool nv12_capture = false;
+  bool invalid_value_ignored = false;
+};
 
 // Where a raw (not yet encoded) frame goes. Implemented by the libwebrtc side,
 // which converts it to I420 and hands it to the track source; kept as an
@@ -139,6 +162,27 @@ class RawVideoPath {
     return (*converter)(frame, max_bytes);
   }
 
+  void SetEncoderFacts(RawEncoderFacts facts) {
+    std::lock_guard lock(mutex_);
+    encoder_facts_ = std::move(facts);
+  }
+  void ClearEncoderFacts() {
+    std::lock_guard lock(mutex_);
+    encoder_facts_.reset();
+  }
+  [[nodiscard]] std::optional<RawEncoderFacts> encoder_facts() const {
+    std::lock_guard lock(mutex_);
+    return encoder_facts_;
+  }
+  void SetPolicyState(const RawCodecPolicyState& state) {
+    std::lock_guard lock(mutex_);
+    policy_state_ = state;
+  }
+  [[nodiscard]] RawCodecPolicyState policy_state() const {
+    std::lock_guard lock(mutex_);
+    return policy_state_;
+  }
+
   void AddAcceptedBytes(std::size_t bytes) noexcept {
     if (accepted_bytes_ != nullptr)
       accepted_bytes_->fetch_add(bytes, std::memory_order_relaxed);
@@ -156,6 +200,8 @@ class RawVideoPath {
   mutable std::mutex mutex_;
   std::shared_ptr<RawFrameSink> sink_;
   std::shared_ptr<const Nv12ToBgraConverter> nv12_to_bgra_;
+  std::optional<RawEncoderFacts> encoder_facts_;
+  RawCodecPolicyState policy_state_;
 };
 
 }  // namespace imcodes::remote_desktop::macos

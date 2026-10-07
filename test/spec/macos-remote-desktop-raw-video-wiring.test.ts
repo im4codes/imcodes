@@ -129,4 +129,57 @@ describe('macOS raw (libvpx) video path wiring', () => {
       expect(helper).not.toMatch(/return false|Fail\(/);
     });
   });
+
+  describe('encoder visibility (worker log, encoder message)', () => {
+    const body = (name: string) => worker.slice(worker.indexOf(`bool WorkerTransportSink::${name}(`), worker.indexOf('\nbool WorkerTransportSink::', worker.indexOf(`bool WorkerTransportSink::${name}(`) + 10));
+
+    it('sends the encoder facts as a message of their own and leaves the quality message alone', () => {
+      const quality = body('SendQuality');
+      expect(quality).not.toMatch(/root\["(codec|encoderName|implementation|threads|rawCodecs)"\]/);
+      expect(quality).toContain('root["encoderClass"]');
+      const encoder = body('SendEncoderInfo');
+      expect(encoder).toContain('root["type"] = imcodes::rd::kEncoderInfoType;');
+      for (const key of ['codec', 'implementation', 'name', 'threads', 'rawCodecs']) {
+        expect(encoder).toContain(`root["${key}"] = `);
+      }
+      // Nothing before a codec exists; and unchanged facts are not resent.
+      expect(encoder).toContain('description.codec == imcodes::rd::kEncoderCodecPending');
+      expect(encoder).toContain('*last_sent_encoder_ == description');
+      // Marked as sent only when the channel really took it, so a closed channel is retried.
+      expect(encoder).toMatch(/const bool sent = SendControl\(std::move\(root\)\);\s*if \(sent\)\s*last_sent_encoder_ = description;/);
+    });
+
+    it('tells the viewer when the channel opens and again once the encoder is up', () => {
+      const open = worker.slice(worker.indexOf('void WorkerTransportSink::HandleDataChannelState('), worker.indexOf('void WorkerTransportSink::OnQualityTarget('));
+      expect(open).toMatch(/\(void\)SendQuality\(\);\s*\(void\)SendEncoderInfo\(\);/);
+      const drain = worker.slice(worker.indexOf('void WorkerTransportSink::DrainQualityTarget()'), worker.indexOf('void WorkerTransportSink::HandleDataChannelMessage('));
+      expect(drain).toMatch(/\(void\)SendQuality\(\);[\s\S]*\(void\)SendEncoderInfo\(\);/);
+    });
+
+    it('logs the decision and each change to a file the node can read, not to stderr', () => {
+      expect(worker).toContain('std::getenv(macos::kEnvRuntimeDirectory)');
+      expect(worker).toContain('macos::WorkerVideoLogPath(');
+      expect(worker).toContain('"decision"');
+      const encoder = body('SendEncoderInfo');
+      expect(encoder).toContain('video_log_->Append(macos::FormatEncoderLogLine(');
+      expect(encoder).toContain('"encoder_changed" : "encoder"');
+      // The route hands the sink what it needs to describe the real encoder.
+      expect(worker).toContain('route->sink->BindVideo(route->media_binder->raw_video(), video_log);');
+      expect(worker).toContain('SetPolicyState(policy_state)');
+    });
+
+    it('records what libvpx actually came up as, and forgets it on release', () => {
+      expect(transport).toContain('raw_->SetEncoderFacts(std::move(facts));');
+      expect(transport).toContain('facts.implementation = inner_->GetEncoderInfo().implementation_name;');
+      expect(transport).toContain('facts.cores = capped.number_of_cores;');
+      expect(transport).toMatch(/int32_t Release\(\) override \{\s*if \(raw_ != nullptr\) raw_->ClearEncoderFacts\(\);/);
+    });
+
+    it('draws the real encoder in the status bar, keeping the class-only text for older nodes', () => {
+      const panel = read('web/src/components/RemoteDesktopPanel.tsx');
+      expect(panel).toContain('describeRemoteDesktopEncoder(snapshot.encoder, t)');
+      expect(panel).toContain("t('remote_desktop.encoder', { encoder: snapshot.quality.encoderClass })");
+      expect(panel).toContain('data-encoder-codec={actual.codec}');
+    });
+  });
 });

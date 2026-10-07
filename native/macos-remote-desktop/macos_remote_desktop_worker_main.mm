@@ -79,9 +79,11 @@
 #include "macos_worker_ipc_client.h"
 #include "ns_pasteboard_clipboard_adapter.h"
 #include "pinned_libwebrtc_transport_backend.h"
+#include "encoder_description.h"
 #include "raw_codec_policy.h"
 #include "raw_codec_settings.h"
 #include "raw_frame_conversion.h"
+#include "worker_video_log.h"
 #include "video_toolbox_h264_encoder.h"
 
 namespace {
@@ -671,6 +673,11 @@ class WorkerTransportSink final : public macos::MacosTransportCallbackSink {
             macos::MacosTransportSessionAdapter* transport,
             class WorkerSocketEmitter* emitter,
             RouteDisclosure* disclosure) noexcept;
+  // What this route needs to say what is actually encoding it: the raw-video
+  // rendezvous (negotiated codec, encoder facts, the raw-codec decision) and the
+  // log the node can read.
+  void BindVideo(std::shared_ptr<macos::RawVideoPath> raw_video,
+                 std::shared_ptr<macos::WorkerVideoLog> video_log) noexcept;
 
   WorkerTransportSink();
   ~WorkerTransportSink();
@@ -752,6 +759,10 @@ class WorkerTransportSink final : public macos::MacosTransportCallbackSink {
   [[nodiscard]] bool SendControl(Json::Value message);
   [[nodiscard]] bool SendTopology();
   [[nodiscard]] bool SendQuality();
+  // Tells the viewer which codec and encoder are really in use, and logs it. Only
+  // when the description changed since the last time; nothing before a codec has
+  // been negotiated.
+  [[nodiscard]] bool SendEncoderInfo();
   [[nodiscard]] bool SendInputAck(std::uint64_t sequence);
   [[nodiscard]] bool SendClipboard(std::string_view request_id,
                                    const std::optional<std::string>& text);
@@ -772,6 +783,10 @@ class WorkerTransportSink final : public macos::MacosTransportCallbackSink {
   macos::MacosTransportSessionAdapter* transport_ = nullptr;
   class WorkerSocketEmitter* emitter_ = nullptr;
   RouteDisclosure* disclosure_ = nullptr;
+  std::shared_ptr<macos::RawVideoPath> raw_video_;
+  std::shared_ptr<macos::WorkerVideoLog> video_log_;
+  std::optional<macos::EncoderDescription> last_logged_encoder_;
+  std::optional<macos::EncoderDescription> last_sent_encoder_;
   rd::common::TopologyRevision presented_layout_revision_ = 0;
   std::uint64_t outbound_sequence_ = 0;
   rd::common::ClipboardPasteAssembler clipboard_paste_assembler_;
@@ -1381,6 +1396,13 @@ void WorkerTransportSink::Bind(macos::MacosRemoteDesktopSession* session,
   disclosure_ = disclosure;
 }
 
+void WorkerTransportSink::BindVideo(
+    std::shared_ptr<macos::RawVideoPath> raw_video,
+    std::shared_ptr<macos::WorkerVideoLog> video_log) noexcept {
+  raw_video_ = std::move(raw_video);
+  video_log_ = std::move(video_log);
+}
+
 void WorkerTransportSink::ReconcileDisclosure() {
   if (session_ == nullptr || disclosure_ == nullptr)
     return;
@@ -1508,6 +1530,54 @@ bool WorkerTransportSink::SendQuality() {
   root["droppedFrames"] = Json::UInt64(session_->dropped_frames());
   root["rttMs"] = 0;
   return SendControl(std::move(root));
+}
+
+bool WorkerTransportSink::SendEncoderInfo() {
+  if (session_ == nullptr || emitter_ == nullptr || raw_video_ == nullptr)
+    return false;
+  const auto authority = emitter_->SnapshotAuthority();
+  if (!authority.has_value())
+    return false;
+  macos::EncoderDescriptionInput input;
+  input.negotiated = raw_video_->negotiated_codec();
+  input.raw_codecs_allowed = raw_video_->raw_codecs_allowed();
+  input.raw_facts = raw_video_->encoder_facts();
+  input.h264_class = session_->encoder_class();
+  input.policy = raw_video_->policy_state();
+  const macos::EncoderDescription description = macos::DescribeEncoder(input);
+
+  if (video_log_ != nullptr &&
+      (!last_logged_encoder_.has_value() || !(*last_logged_encoder_ == description))) {
+    const rd::common::TransportDiagnostics diagnostics =
+        session_->transport_diagnostics();
+    const std::uint32_t width =
+        diagnostics.quality.has_value() ? diagnostics.quality->encoded_pixels.width : 0;
+    const std::uint32_t height =
+        diagnostics.quality.has_value() ? diagnostics.quality->encoded_pixels.height : 0;
+    (void)video_log_->Append(macos::FormatEncoderLogLine(
+        last_logged_encoder_.has_value() ? "encoder_changed" : "encoder",
+        description, input.policy, width, height));
+    last_logged_encoder_ = description;
+  }
+  // Nothing useful to show before a codec exists; the viewer keeps its fallback.
+  if (description.codec == imcodes::rd::kEncoderCodecPending)
+    return true;
+  if (last_sent_encoder_.has_value() && *last_sent_encoder_ == description)
+    return true;
+  Json::Value root(Json::objectValue);
+  root["type"] = imcodes::rd::kEncoderInfoType;
+  root["protocolVersion"] = imcodes::rd::kProtocolVersion;
+  root["sessionId"] = authority->session_id;
+  root["sequence"] = Json::UInt64(outbound_sequence_++);
+  root["codec"] = description.codec;
+  root["implementation"] = description.implementation;
+  root["name"] = description.name;
+  root["threads"] = description.threads;
+  root["rawCodecs"] = description.raw_codecs;
+  const bool sent = SendControl(std::move(root));
+  if (sent)
+    last_sent_encoder_ = description;
+  return sent;
 }
 
 bool WorkerTransportSink::SendClipboard(
@@ -1713,6 +1783,7 @@ void WorkerTransportSink::HandleDataChannelState(
       state == rd::common::DataChannelState::kOpen) {
     (void)SendTopology();
     (void)SendQuality();
+    (void)SendEncoderInfo();
   }
   (void)EmitStatus();
 }
@@ -1766,6 +1837,9 @@ void WorkerTransportSink::DrainQualityTarget() {
   if (session_ != nullptr && target.has_value() &&
       session_->UpdateTransportQuality(target->first, target->second)) {
     (void)SendQuality();
+    // The first rate update arrives once the encoder is up, so this is when what
+    // is really encoding is known; it is sent again only if it changes.
+    (void)SendEncoderInfo();
   }
 }
 
@@ -2861,6 +2935,7 @@ int RunLaunchAgentSession(const macos::WorkerLaunchContext& context) {
     }
 
 
+    std::shared_ptr<macos::WorkerVideoLog> video_log;
     // Decided only now that the capture backend is known: the raw codecs hand
     // libvpx the captured frame unscaled, so they are offered only where the
     // capture honours the encoder's size. Still before any negotiation.
@@ -2874,6 +2949,19 @@ int RunLaunchAgentSession(const macos::WorkerLaunchContext& context) {
           raw_settings.raw_codecs);
       media_binder->raw_video()->AllowRawCodecs(raw_decision.allowed);
       media_binder->raw_video()->PreferNv12Capture(raw_settings.nv12_capture);
+      macos::RawCodecPolicyState policy_state;
+      policy_state.reason = raw_decision.reason;
+      policy_state.setting_source = raw_settings.source;
+      policy_state.nv12_capture = raw_settings.nv12_capture;
+      policy_state.invalid_value_ignored = raw_settings.ignored_invalid_value;
+      media_binder->raw_video()->SetPolicyState(policy_state);
+      // The worker's stderr is /dev/null: the decision goes to a file the node can
+      // read, in the node's own per-user runtime directory.
+      const char* runtime_directory = std::getenv(macos::kEnvRuntimeDirectory);
+      video_log = std::make_shared<macos::WorkerVideoLog>(macos::WorkerVideoLogPath(
+          runtime_directory != nullptr ? runtime_directory : ""));
+      (void)video_log->Append(macos::FormatEncoderLogLine(
+          "decision", macos::DescribeEncoder({.policy = policy_state}), policy_state, 0, 0));
       std::cerr << "macos_remote_desktop_worker_raw_codecs allowed="
                 << (raw_decision.allowed ? 1 : 0)
                 << " reason=" << macos::RawCodecReasonName(raw_decision.reason)
@@ -2942,6 +3030,7 @@ int RunLaunchAgentSession(const macos::WorkerLaunchContext& context) {
     }
     route->sink->Bind(route->session.get(), route->adapter.get(), emitter,
                       route->disclosure.get());
+    route->sink->BindVideo(route->media_binder->raw_video(), video_log);
     route->sink->SetUnlockRequester(send_unlock_request);
     SessionSeamAdapter::ReadinessAttestor readiness_attestor;
     if (session_binding.session_type == macos::kSessionTypeLoginWindow) {
