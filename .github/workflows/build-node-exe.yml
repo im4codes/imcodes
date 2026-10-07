@@ -117,6 +117,12 @@ jobs:
           printf '%s' "$IMCODES_MACOS_NOTARY_KEY_BASE64" | base64 --decode > "$KEY_PATH"
           chmod 600 "$KEY_PATH"
           echo "IMCODES_MACOS_NOTARY_KEY_PATH=$KEY_PATH" >> "$GITHUB_ENV"
+      - name: Build the native aiDesk window
+        uses: ./.github/actions/build-aidesk-ui
+        with:
+          version: ${{ env.IMCODES_BUILD_VERSION }}
+          windows-signing-cert-thumbprint: ${{ env.IMCODES_WINDOWS_SIGNING_CERT_THUMBPRINT }}
+          windows-signing-cert-sha256: ${{ env.IMCODES_WINDOWS_SIGNING_CERT_SHA256 }}
       - name: Build controlled-node executable
         run: npm run build:node-exe
       - name: Notarize macOS controlled-node executable
@@ -384,6 +390,7 @@ jobs:
             dist-node-exe/computer-use-helper/**
             dist-node-exe/*.dmg
             dist-node-exe/remote-desktop-worker/**
+            dist-node-exe/aidesk-local-ui/**
           if-no-files-found: error
           retention-days: 30
       - name: Remove macOS release-signing material

@@ -1,0 +1,100 @@
+name: Build the native aiDesk window
+description: >
+  Builds aidesk-local-ui (the native FLTK window of the local management panel) from the pinned, sha256-verified FLTK and jsoncpp
+  sources into dist-node-exe/aidesk-local-ui/<os>-<arch>/ with a manifest the controlled node verifies before it ever launches it
+  (Windows: signed first). On macOS it exports AIDESK_LOCAL_UI_EXECUTABLE so the aiDesk app bundle build copies the binary into
+  Contents/Helpers and signs it with the app. Build time only: nothing is downloaded when the product runs.
+inputs:
+  version:
+    description: The controlled-node build version recorded in the manifest.
+    required: true
+  windows-signing-cert-thumbprint:
+    description: Thumbprint of the imported Windows release-signing certificate (Windows only).
+    required: false
+    default: ''
+  windows-signing-cert-sha256:
+    description: sha256 of the release-signing certificate; recorded as the manifest's signer (Windows only).
+    required: false
+    default: ''
+runs:
+  using: composite
+  steps:
+    - name: Fetch the pinned FLTK and jsoncpp sources
+      shell: bash
+      run: |
+        set -euo pipefail
+        ROOTS="$(node scripts/fetch-aidesk-ui-deps.mjs --out "$RUNNER_TEMP/aidesk-ui-deps")"
+        {
+          echo "AIDESK_UI_FLTK_ROOT=$(node -p 'JSON.parse(process.argv[1]).fltkRoot' "$ROOTS")"
+          echo "AIDESK_UI_JSONCPP_ROOT=$(node -p 'JSON.parse(process.argv[1]).jsoncppRoot' "$ROOTS")"
+        } >> "$GITHUB_ENV"
+    - name: Build the native aiDesk window (Linux)
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        set -euo pipefail
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends ninja-build libx11-dev libxft-dev libxext-dev libxinerama-dev \
+          libxcursor-dev libxfixes-dev libxrender-dev libfontconfig1-dev libpng-dev libjpeg-dev zlib1g-dev
+        ART="dist-node-exe/aidesk-local-ui/linux-x64"
+        bash native/aidesk-ui/build-ui.sh --fltk-root "$AIDESK_UI_FLTK_ROOT" --jsoncpp-root "$AIDESK_UI_JSONCPP_ROOT" \
+          --artifact-root "$ART" --jobs 4
+        node scripts/aidesk-ui-artifact.mjs write "$ART" linux x64 "${{ inputs.version }}"
+        node scripts/aidesk-ui-artifact.mjs verify "$ART" linux x64 "${{ inputs.version }}"
+        echo "aiDesk native window (linux-x64): $(wc -c < "$ART/aidesk-local-ui") bytes" >> "$GITHUB_STEP_SUMMARY"
+    - name: Build the native aiDesk window (macOS)
+      if: runner.os == 'macOS'
+      shell: bash
+      env:
+        # One universal binary: the aiDesk app it goes into is universal (arm64 + x86_64).
+        CMAKE_OSX_ARCHITECTURES: arm64;x86_64
+      run: |
+        set -euo pipefail
+        command -v ninja >/dev/null || brew install ninja
+        ART="dist-node-exe/aidesk-local-ui/darwin-universal"
+        bash native/aidesk-ui/build-ui.sh --fltk-root "$AIDESK_UI_FLTK_ROOT" --jsoncpp-root "$AIDESK_UI_JSONCPP_ROOT" \
+          --artifact-root "$ART" --jobs 4
+        BIN="$PWD/$ART/aidesk-local-ui.app/Contents/MacOS/aidesk-local-ui"
+        [ -x "$BIN" ] || { echo "missing $BIN" >&2; exit 1; }
+        lipo -archs "$BIN" | tee /dev/stderr | grep -q arm64 && lipo -archs "$BIN" | grep -q x86_64
+        # scripts/build-aidesk-app.mjs copies this into Contents/Helpers and signs it before the bundle.
+        echo "AIDESK_LOCAL_UI_EXECUTABLE=$BIN" >> "$GITHUB_ENV"
+        echo "aiDesk native window (darwin-universal): $(wc -c < "$BIN") bytes" >> "$GITHUB_STEP_SUMMARY"
+    - name: Build, sign and describe the native aiDesk window (Windows)
+      if: runner.os == 'Windows'
+      shell: powershell
+      env:
+        AIDESK_VERSION: ${{ inputs.version }}
+        AIDESK_THUMBPRINT: ${{ inputs.windows-signing-cert-thumbprint }}
+        AIDESK_SIGNER_SHA256: ${{ inputs.windows-signing-cert-sha256 }}
+      run: |
+        $ErrorActionPreference = 'Stop'
+        if ([string]::IsNullOrWhiteSpace($env:AIDESK_THUMBPRINT) -or [string]::IsNullOrWhiteSpace($env:AIDESK_SIGNER_SHA256)) {
+          throw 'The Windows release-signing certificate must be imported before the native aiDesk window is built.'
+        }
+        # The window is statically linked with MinGW-w64 (native/aidesk-ui/CMakeLists.txt), which the hosted Windows image provides.
+        $gcc = Get-Command g++ -ErrorAction SilentlyContinue
+        if (-not $gcc) {
+          foreach ($candidate in @('C:\mingw64\bin', 'C:\msys64\mingw64\bin', 'C:\msys64\ucrt64\bin')) {
+            if (Test-Path (Join-Path $candidate 'g++.exe')) { $env:PATH = "$candidate;$env:PATH"; break }
+          }
+          $gcc = Get-Command g++ -ErrorAction SilentlyContinue
+        }
+        if (-not $gcc) { throw 'MinGW-w64 g++ was not found on this runner.' }
+        if (-not (Get-Command ninja -ErrorAction SilentlyContinue)) { choco install ninja -y --no-progress; if ($LASTEXITCODE -ne 0) { throw 'ninja is required' } }
+        $env:CC = 'gcc'; $env:CXX = 'g++'
+        $art = 'dist-node-exe\aidesk-local-ui\win32-x64'
+        & .\native\aidesk-ui\build-ui.ps1 -FltkRoot $env:AIDESK_UI_FLTK_ROOT -JsoncppRoot $env:AIDESK_UI_JSONCPP_ROOT -ArtifactRoot $art -Jobs 4
+        if ($LASTEXITCODE -ne 0) { throw 'native aiDesk window build failed' }
+        $exe = Join-Path $art 'aidesk-local-ui.exe'
+        & .\scripts\windows-sign-release-artifact.ps1 -Mode Sign -ArtifactPath $exe `
+          -CodeSigningCertificateThumbprint $env:AIDESK_THUMBPRINT -ExpectedSignerSha256 $env:AIDESK_SIGNER_SHA256 -TimestampUrl 'http://timestamp.digicert.com'
+        if ($LASTEXITCODE -ne 0) { throw 'signing the native aiDesk window failed' }
+        & .\scripts\windows-sign-release-artifact.ps1 -Mode Verify -ArtifactPath $exe -ExpectedSignerSha256 $env:AIDESK_SIGNER_SHA256
+        if ($LASTEXITCODE -ne 0) { throw 'the native aiDesk window does not verify against the release signer' }
+        # The manifest records the executable AS SIGNED.
+        node scripts/aidesk-ui-artifact.mjs write $art win32 x64 $env:AIDESK_VERSION $env:AIDESK_SIGNER_SHA256
+        if ($LASTEXITCODE -ne 0) { throw 'writing the native aiDesk window manifest failed' }
+        node scripts/aidesk-ui-artifact.mjs verify $art win32 x64 $env:AIDESK_VERSION
+        if ($LASTEXITCODE -ne 0) { throw 'verifying the native aiDesk window manifest failed' }
+        "aiDesk native window (win32-x64): $((Get-Item $exe).Length) bytes" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
