@@ -10,6 +10,8 @@ import { createSupervisionPairRefreshScheduler } from './supervision-pair-refres
 import { loadStore, flushStore, listSessions, getSession, upsertSession, removeSession, markSessionStoreAuthoritative, configureSessionStoreWriteAuthority, type SessionRecord } from '../store/session-store.js';
 import { markDaemonProcess } from './process-role.js';
 import { restoreFromStore, setSessionEventCallback, setSessionPersistCallback, setTransportSessionRestoredCallback, restartSession, respawnSession, initOnStartup, rebuildProviderRoutes, getTransportRuntime, unregisterProviderRoute, resyncTransportSessionStatesAfterLinkRestore, ensureTransportRuntimeForPendingResend } from '../agent/session-manager.js';
+import { beginUpgradeReadinessTracking, markGracefulShutdownStarted, markStartupPhaseDone } from './upgrade-readiness.js';
+import { DAEMON_STARTUP_PHASE } from '../../shared/daemon-upgrade.js';
 import { sessionExists, isPaneAlive, BACKEND, killSession, createTmuxHealthProbe, type TmuxHealthProbe } from '../agent/tmux.js';
 import { detectRepo } from '../repo/detector.js';
 import { repoCache, RepoCache } from '../repo/cache.js';
@@ -618,6 +620,9 @@ export async function startup(): Promise<DaemonContext> {
   // can schedule a migration/probe write, and a non-owner must never be able
   // to persist its transient (possibly empty) in-memory view.
   configureSessionStoreWriteAuthority(lockServer.identity, lockServer.metadataPath);
+  // Only the process that owns the lock records its start and reads how its predecessor ended: a server-driven
+  // upgrade is held back while this process is new or recovering from a crash (see upgrade-readiness.ts).
+  beginUpgradeReadinessTracking();
   markDaemonProcess();
   cgroupValidationProbes = startDaemonCgroupValidationProbes();
   installDaemonRuntimeDiagnosticsProvider();
@@ -775,6 +780,9 @@ export async function startup(): Promise<DaemonContext> {
     // restoreFromStore must NEVER crash the daemon — log and continue.
     // Sessions may not be restored, but daemon stays alive for WS/heartbeat.
     logger.error({ err }, 'restoreFromStore failed — daemon continues without session restore');
+  } finally {
+    // Done either way: a failed restore has nothing left running that an upgrade could wait for.
+    markStartupPhaseDone(DAEMON_STARTUP_PHASE.SESSIONS_RECONCILED);
   }
 
   // Initialize the command.ack outbox before serverLink connects so any
@@ -1770,6 +1778,7 @@ async function slowWarmRestoreTransportProviders(): Promise<void> {
     await task;
   } finally {
     if (slowTransportWarmRestoreInFlight === task) slowTransportWarmRestoreInFlight = null;
+    markStartupPhaseDone(DAEMON_STARTUP_PHASE.TRANSPORT_WARM_RESTORED);
   }
 }
 
@@ -1792,6 +1801,9 @@ async function autoReconnectProviders(): Promise<void> {
         logger.warn({ err, providerId }, 'Local transport provider auto-connect failed');
       }
     }
+    // The sessions that had queued/resend messages are restored and resumed. The OpenClaw reconnect below retries
+    // forever, so it must not be what an upgrade waits for.
+    markStartupPhaseDone(DAEMON_STARTUP_PHASE.TRANSPORT_RESUMED);
 
     const ocConfig = await loadOcConfig();
     if (ocConfig) {
@@ -1823,6 +1835,7 @@ async function autoReconnectProviders(): Promise<void> {
     }
   } catch (err) {
     logger.warn({ err }, 'Provider auto-reconnect check failed');
+    markStartupPhaseDone(DAEMON_STARTUP_PHASE.TRANSPORT_RESUMED);
   }
 }
 
@@ -1837,6 +1850,9 @@ export function shutdown(exitCode = 0): Promise<void> {
 
 async function performShutdown(exitCode: number): Promise<void> {
   logger.info('Daemon shutting down');
+  // First thing, before any teardown can be slow or fail: this exit is on purpose (SIGTERM from `systemctl restart`,
+  // which the upgrade script itself uses, included), so the next process is not "recovering from a crash".
+  markGracefulShutdownStarted();
   const orderedShutdown = await runOrderedDaemonShutdown({
     session: async () => {
       logger.info({ shutdownPhase: 'session' }, 'Daemon shutdown phase session started');

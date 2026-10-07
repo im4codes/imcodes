@@ -1073,6 +1073,8 @@
     "daemon_auto_upgrade_reason_master_compaction_active": "memory master-summary compaction is running",
     "daemon_auto_upgrade_reason_transport_busy": "an agent is still working on a turn",
     "daemon_auto_upgrade_reason_session_busy": "a session still has active work",
+    "daemon_auto_upgrade_reason_starting_up": "the daemon has just started and is still settling",
+    "daemon_auto_upgrade_reason_unclean_shutdown_recovery": "the daemon is recovering after an unexpected stop, so its work can resume first",
     "daemon_auto_upgrade_reason_cooldown_active": "the daemon was upgraded recently (cooldown)",
     "daemon_auto_upgrade_reason_already_in_progress": "an upgrade is already in progress",
     "daemon_auto_upgrade_reason_retry_backoff": "a previous attempt failed; waiting before retrying",

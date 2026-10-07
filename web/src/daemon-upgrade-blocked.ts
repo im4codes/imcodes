@@ -1,4 +1,4 @@
-import { CONTROLLED_NODE_UPGRADE_WAIT_REASON, DAEMON_UPGRADE_BLOCK_REASON } from '@shared/daemon-upgrade.js';
+import { CONTROLLED_NODE_UPGRADE_WAIT_REASON, DAEMON_UPGRADE_BLOCK_REASON, DAEMON_UPGRADE_DEFERRAL } from '@shared/daemon-upgrade.js';
 
 export const DAEMON_UPGRADE_BLOCKED_TOAST_THROTTLE_MS = 15 * 60_000;
 
@@ -57,6 +57,8 @@ export type DaemonUpgradeReasonLabelKey =
   | 'server.daemon_auto_upgrade_reason_master_compaction_active'
   | 'server.daemon_auto_upgrade_reason_transport_busy'
   | 'server.daemon_auto_upgrade_reason_session_busy'
+  | 'server.daemon_auto_upgrade_reason_starting_up'
+  | 'server.daemon_auto_upgrade_reason_unclean_shutdown_recovery'
   | 'server.daemon_auto_upgrade_reason_cooldown_active'
   | 'server.daemon_auto_upgrade_reason_already_in_progress'
   | 'server.daemon_auto_upgrade_reason_retry_backoff'
@@ -78,6 +80,8 @@ export function daemonUpgradeReasonLabelKey(reason: string | null | undefined): 
     case DAEMON_UPGRADE_BLOCK_REASON.MASTER_COMPACTION_ACTIVE: return 'server.daemon_auto_upgrade_reason_master_compaction_active';
     case DAEMON_UPGRADE_BLOCK_REASON.TRANSPORT_BUSY: return 'server.daemon_auto_upgrade_reason_transport_busy';
     case DAEMON_UPGRADE_BLOCK_REASON.SESSION_BUSY: return 'server.daemon_auto_upgrade_reason_session_busy';
+    case DAEMON_UPGRADE_DEFERRAL.STARTING_UP: return 'server.daemon_auto_upgrade_reason_starting_up';
+    case DAEMON_UPGRADE_DEFERRAL.UNCLEAN_SHUTDOWN_RECOVERY: return 'server.daemon_auto_upgrade_reason_unclean_shutdown_recovery';
     case DAEMON_UPGRADE_BLOCK_REASON.COOLDOWN_ACTIVE: return 'server.daemon_auto_upgrade_reason_cooldown_active';
     case DAEMON_UPGRADE_BLOCK_REASON.ALREADY_IN_PROGRESS: return 'server.daemon_auto_upgrade_reason_already_in_progress';
     case CONTROLLED_NODE_UPGRADE_WAIT_REASON.RETRY_BACKOFF: return 'server.daemon_auto_upgrade_reason_retry_backoff';

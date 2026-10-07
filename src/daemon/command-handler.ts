@@ -64,7 +64,7 @@ import { isUserDeletedTimelineEvent } from '../shared/timeline/merge.js';
 import { TIMELINE_HISTORY_CONTENT_TYPES, TIMELINE_HISTORY_STATE_TYPES, type MemoryContextTimelinePayload, type TimelineEvent, type TimelineEventType } from '../shared/timeline/types.js';
 import { emitSessionInlineError } from './session-error.js';
 import { attachDaemonUserNotice, DAEMON_USER_NOTICE_CODE } from '../../shared/daemon-user-notices.js';
-import { enqueueResend, getResendEntries, clearResend, recipientFromSessionRecord } from './transport-resend-queue.js';
+import { enqueueResend, getResendCount, getResendEntries, clearResend, recipientFromSessionRecord } from './transport-resend-queue.js';
 import { preserveTransportRuntimeQueuesToResend } from './transport-resend-preservation.js';
 import { buildTransportQueueSnapshotPayload, transportQueueSnapshotToPayload } from './transport-queue-projection.js';
 import { observeTransportQueueRevision, getTransportQueueRevision } from './transport-queue-revision.js';
@@ -82,6 +82,7 @@ import {
 import { resolveSubSessionCwd } from './subsession-cwd.js';
 import { sendSubSessionSync } from './subsession-sync.js';
 import logger from '../util/logger.js';
+import { getUpgradeReadiness } from './upgrade-readiness.js';
 import { terminalStageTrace } from '../util/terminal-stage-trace.js';
 import { maybeCloneGitRemoteToDirectory } from './git-remote-clone.js';
 import { getDefaultAckOutbox } from './ack-outbox.js';
@@ -233,7 +234,10 @@ import {
 } from '../../shared/codebuddy.js';
 import {
   DAEMON_UPGRADE_BLOCK_REASON,
+  DAEMON_UPGRADE_DEFERRAL_FIELD,
   DAEMON_UPGRADE_FORCE_FIELD,
+  DAEMON_UPGRADE_PENDING_PHASES_FIELD,
+  DAEMON_UPGRADE_RETRY_AFTER_FIELD,
   DAEMON_UPGRADE_SOURCE,
   DAEMON_UPGRADE_TARGET_LATEST,
   isDaemonAutoUpgradeDisabledByEnv,
@@ -8588,6 +8592,34 @@ async function handleDaemonUpgrade(
   // A forced (operator-confirmed) upgrade skips ONLY the busy gates below and
   // names what it is about to interrupt. Pre-flights (downgrade guard,
   // registry, toolchain) and the memory freeze still apply.
+  // A server-driven upgrade also waits for THIS PROCESS to be settled. The busy gates below read in-memory runtime
+  // state, which a process that has just started simply does not have yet (158, 2026-10-07: crash, restart, upgrade
+  // 10 s after boot, before the durable queue was rehydrated). Manual and forced upgrades are operator decisions and
+  // never consult it. The receipt rides a legacy busy reason so a server that predates the deferral fields still
+  // treats it as a retryable gate, never as a failed attempt.
+  if (source === DAEMON_UPGRADE_SOURCE.AUTO && !force) {
+    const readiness = getUpgradeReadiness();
+    if (!readiness.ready) {
+      logger.info({
+        targetVersion,
+        deferral: readiness.deferral,
+        retryAfterMs: readiness.retryAfterMs,
+        pendingStartupPhases: readiness.pendingPhases,
+        uptimeMs: readiness.uptimeMs,
+      }, `daemon.upgrade: deferred (${readiness.deferral}) — the daemon has not settled since it started`);
+      try {
+        serverLink?.send({
+          type: DAEMON_MSG.UPGRADE_BLOCKED,
+          reason: DAEMON_UPGRADE_BLOCK_REASON.SESSION_BUSY,
+          [DAEMON_UPGRADE_DEFERRAL_FIELD]: readiness.deferral,
+          [DAEMON_UPGRADE_RETRY_AFTER_FIELD]: readiness.retryAfterMs,
+          [DAEMON_UPGRADE_PENDING_PHASES_FIELD]: readiness.pendingPhases,
+        });
+      } catch { /* ignore */ }
+      return;
+    }
+  }
+
   const activeRuns = force ? [] : getActiveP2pRunsBlockingDaemonUpgrade();
   if (force) {
     const skippedBusy = {
@@ -8596,7 +8628,7 @@ async function handleDaemonUpgrade(
       activeMasterCompactions: getInflightMasterCompactionCount(),
       activeSessions: getActiveSessionsBlockingDaemonUpgrade().map((reason) => reason.name),
     };
-    logger.warn({ targetVersion, ...skippedBusy }, 'daemon.upgrade: FORCED by the operator — skipping the busy gates; running work will be interrupted');
+    logger.warn({ targetVersion, source, force: true, ...skippedBusy }, 'daemon.upgrade: FORCED by the operator (force=true) — skipping the busy gates; running work will be interrupted');
     upgradeSessionBusyDeferredSince = null;
   }
   if (activeRuns.length > 0) {
@@ -9316,7 +9348,7 @@ export interface TransportUpgradeBlockReason {
   sending: boolean;
   pendingCount: number;
   backgroundWorkCount?: number;
-  blockReason: 'status_thinking' | 'status_streaming' | 'sending' | 'pending' | 'background_work';
+  blockReason: 'status_thinking' | 'status_streaming' | 'sending' | 'pending' | 'background_work' | 'durable_queue' | 'resend_queue';
 }
 
 export function getTransportSessionUpgradeBlockReason(
@@ -9401,14 +9433,51 @@ export interface SessionUpgradeBlockReason {
   transport: TransportUpgradeBlockReason | null;
 }
 
+/**
+ * Messages that survive a restart on disk (the durable transport queue) or wait in the resend queue for a provider
+ * that is not connected, for a session with NO runtime yet. A runtime that exists already carries those messages in
+ * its own pending count (and its phantom-turn guard decides about them), so only the runtime-less gap is covered
+ * here: after a restart the queue is rehydrated when the runtime is rebuilt, which can be minutes after boot.
+ */
+export function getTransportSessionPendingWorkBlockReason(
+  session: { name: string; state?: string },
+  durablePendingBySession: ReadonlyMap<string, number>,
+): TransportUpgradeBlockReason | null {
+  // A stopped or errored session will not drain its queue by itself; it must not pin the version forever.
+  if (session.state === 'stopped' || session.state === 'error') return null;
+  if (getTransportRuntime(session.name)) return null;
+  const durable = durablePendingBySession.get(session.name) ?? 0;
+  if (durable > 0) {
+    return { status: 'no_runtime', sending: false, pendingCount: durable, blockReason: 'durable_queue' };
+  }
+  const resend = getResendCount(session.name);
+  if (resend > 0) {
+    return { status: 'no_runtime', sending: false, pendingCount: resend, blockReason: 'resend_queue' };
+  }
+  return null;
+}
+
+function readDurableTransportQueuePending(): Map<string, number> {
+  try {
+    return new Map(getTransportQueueStore().listLiveQueueSessions().map((queue) => [queue.sessionName, queue.pendingCount]));
+  } catch (err) {
+    // The store being unreadable must not block (or force) an upgrade by itself; the in-memory gates still apply.
+    logger.warn({ err }, 'daemon.upgrade: durable transport queue unreadable; relying on in-memory busy state');
+    return new Map();
+  }
+}
+
 export function getActiveSessionsBlockingDaemonUpgrade(
   sessions = listSessions(),
-  opts?: { now?: number; staleTurnMs?: number },
+  opts?: { now?: number; staleTurnMs?: number; durableQueuePending?: ReadonlyMap<string, number> },
 ): SessionUpgradeBlockReason[] {
   const reasons: SessionUpgradeBlockReason[] = [];
+  let durablePending: ReadonlyMap<string, number> | null = opts?.durableQueuePending ?? null;
   for (const session of sessions) {
     if (session.runtimeType === 'transport') {
-      const transport = getTransportSessionUpgradeBlockReason(session.name, opts);
+      durablePending ??= readDurableTransportQueuePending();
+      const transport = getTransportSessionUpgradeBlockReason(session.name, opts)
+        ?? getTransportSessionPendingWorkBlockReason(session, durablePending);
       if (transport) {
         reasons.push({
           name: session.name,

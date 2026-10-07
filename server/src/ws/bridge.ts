@@ -370,6 +370,11 @@ import {
   DAEMON_UPGRADE_BLOCKED_SYNC_PROTOCOL,
   DAEMON_UPGRADE_BLOCK_REASON,
   DAEMON_UPGRADE_BUSY_RETRY_INTERVAL_MS,
+  DAEMON_UPGRADE_DEFERRAL_FIELD,
+  DAEMON_UPGRADE_DEFERRAL_RETRY_MARGIN_MS,
+  DAEMON_UPGRADE_RETRY_AFTER_FIELD,
+  isDaemonUpgradeDeferral,
+  isTimeGatedDaemonUpgradeReason,
   DAEMON_UPGRADE_COOLDOWN_RETRY_MAX_MS,
   DAEMON_UPGRADE_COOLDOWN_RETRY_MIN_MS,
   DAEMON_UPGRADE_DELIVERY_STATUS,
@@ -8015,6 +8020,8 @@ export class WsBridge {
       if (this.autoUpgradeStatus !== CONTROLLED_NODE_UPGRADE_STATUS.DEFERRED
         || !this.autoUpgradeReason
         || !isRetryableDaemonUpgradeBlockReason(this.autoUpgradeReason)
+        // A settle/recovery hold ends by the daemon's clock, not at an idle edge: its own timer asks again.
+        || isTimeGatedDaemonUpgradeReason(this.autoUpgradeReason)
         || this.hasAuthoritativeBusySession()) return;
       const last = this.autoUpgradeLastAttemptAt;
       if (last !== null && Date.now() - last < DAEMON_UPGRADE_IDLE_EDGE_MIN_INTERVAL_MS) return;
@@ -10876,16 +10883,27 @@ export class WsBridge {
       countedAttempt();
       if (fromManual) this.daemonUpgradeCoordinator.releaseSentLifecycle(now);
       else this.daemonUpgradeCoordinator.deferAfterTransientBlock(now);
-      this.setAutoUpgradeState(CONTROLLED_NODE_UPGRADE_STATUS.DEFERRED, targetVersion, reason);
+      // A daemon that is settling or recovering names the precise hold and when it lapses (on the wire it rides a
+      // legacy busy reason, so an older server in the same position just uses the busy interval). Only the daemon's
+      // own words count: an unknown value is ignored and the plain busy reason stands.
+      const deferral = isDaemonUpgradeDeferral(msg[DAEMON_UPGRADE_DEFERRAL_FIELD]) ? msg[DAEMON_UPGRADE_DEFERRAL_FIELD] : null;
+      const shownReason = deferral ?? reason;
+      this.setAutoUpgradeState(CONTROLLED_NODE_UPGRADE_STATUS.DEFERRED, targetVersion, shownReason);
       const cooldownRemainingMs = typeof msg.cooldownRemainingMs === 'number' && Number.isFinite(msg.cooldownRemainingMs)
         ? msg.cooldownRemainingMs
+        : null;
+      const retryAfterMs = deferral && typeof msg[DAEMON_UPGRADE_RETRY_AFTER_FIELD] === 'number' && Number.isFinite(msg[DAEMON_UPGRADE_RETRY_AFTER_FIELD])
+        ? msg[DAEMON_UPGRADE_RETRY_AFTER_FIELD] as number
         : null;
       this.scheduleAutoUpgradeRetry(
         reason === DAEMON_UPGRADE_BLOCK_REASON.COOLDOWN_ACTIVE && cooldownRemainingMs !== null
           ? Math.min(Math.max(cooldownRemainingMs, DAEMON_UPGRADE_COOLDOWN_RETRY_MIN_MS), DAEMON_UPGRADE_COOLDOWN_RETRY_MAX_MS)
-          : DAEMON_UPGRADE_BUSY_RETRY_INTERVAL_MS,
+          : retryAfterMs !== null
+            // Ask again once the hold has lapsed, never faster than the shared floor (no retry storm) or later than the cap.
+            ? Math.min(Math.max(retryAfterMs + DAEMON_UPGRADE_DEFERRAL_RETRY_MARGIN_MS, DAEMON_UPGRADE_COOLDOWN_RETRY_MIN_MS), DAEMON_UPGRADE_COOLDOWN_RETRY_MAX_MS)
+            : DAEMON_UPGRADE_BUSY_RETRY_INTERVAL_MS,
       );
-      this.logAutoUpgradeWait(targetVersion, reason);
+      this.logAutoUpgradeWait(targetVersion, shownReason);
       return fromAuto ? 'absorbed' : 'relay';
     }
     this.recordAutoUpgradeFailure(targetVersion, reason, now);

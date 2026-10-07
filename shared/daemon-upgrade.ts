@@ -129,6 +129,70 @@ export function isDaemonUpgradeBusyBlockReason(reason: string): boolean {
 }
 
 /**
+ * Why a FULL daemon holds back a server-driven (source:auto) upgrade even though no turn is running yet:
+ * a process that has just started has no in-memory activity, which says nothing about being idle. After a crash
+ * (systemd restarts it within seconds) the work that was running is only about to resume from disk, and the
+ * server re-offers the upgrade on every reconnect. 158, 2026-10-07: the busy gate blocked 9 times for 20 min,
+ * the daemon was then ABRT-killed, and the fresh process upgraded 10 s after boot, before its durable queue was
+ * even rehydrated.
+ *
+ * On the wire these ride on a LEGACY busy reason ({@link DAEMON_UPGRADE_BLOCK_REASON.SESSION_BUSY}) plus the
+ * {@link DAEMON_UPGRADE_DEFERRAL_FIELD} and {@link DAEMON_UPGRADE_RETRY_AFTER_FIELD} fields: a server that
+ * predates them keeps treating the receipt as a retryable busy gate (never as a failed attempt), a current one
+ * reads the precise reason and the daemon's own retry hint.
+ */
+export const DAEMON_UPGRADE_DEFERRAL = {
+  /** Uptime is under the settle window, or startup restore (sessions, queues, resume) is not finished yet. */
+  STARTING_UP: 'starting_up',
+  /** The previous process did not exit on purpose (crash, OOM kill, power loss): its work is resuming. */
+  UNCLEAN_SHUTDOWN_RECOVERY: 'unclean_shutdown_recovery',
+} as const;
+export type DaemonUpgradeDeferral = (typeof DAEMON_UPGRADE_DEFERRAL)[keyof typeof DAEMON_UPGRADE_DEFERRAL];
+export const DAEMON_UPGRADE_DEFERRAL_FIELD = 'deferral';
+export const DAEMON_UPGRADE_RETRY_AFTER_FIELD = 'retryAfterMs';
+/** The server asks again this long AFTER the hold the daemon named lapses, so the retry never lands a moment early. */
+export const DAEMON_UPGRADE_DEFERRAL_RETRY_MARGIN_MS = 10_000;
+/** Names the unfinished startup phases on a STARTING_UP receipt (observability only). */
+export const DAEMON_UPGRADE_PENDING_PHASES_FIELD = 'pendingStartupPhases';
+
+/** A freshly started daemon takes no server-driven upgrade before this much uptime (any start, clean or not). */
+export const DAEMON_UPGRADE_STARTUP_SETTLE_MS = 5 * 60_000;
+/** After an UNCLEAN previous exit the daemon takes no server-driven upgrade before this much uptime. */
+export const DAEMON_UPGRADE_UNCLEAN_RECOVERY_MS = 15 * 60_000;
+/** Startup restore that has not reported done by this uptime stops holding the upgrade (a wedged phase must not pin the version forever). */
+export const DAEMON_UPGRADE_STARTUP_RESTORE_TIMEOUT_MS = 10 * 60_000;
+
+/** The restore phases a server-driven upgrade waits for. Each is reported by the daemon's own startup. */
+export const DAEMON_STARTUP_PHASE = {
+  /** `restoreFromStore`: stored sessions reconciled, missing tmux/process sessions re-created. */
+  SESSIONS_RECONCILED: 'sessions_reconciled',
+  /** Local transport runtimes with a pending resend restored: durable queue rehydrated and resumed. */
+  TRANSPORT_RESUMED: 'transport_resumed',
+  /** The delayed warm restore of the remaining transport runtimes finished. */
+  TRANSPORT_WARM_RESTORED: 'transport_warm_restored',
+} as const;
+export type DaemonStartupPhase = (typeof DAEMON_STARTUP_PHASE)[keyof typeof DAEMON_STARTUP_PHASE];
+export const DAEMON_STARTUP_PHASES: readonly DaemonStartupPhase[] = Object.values(DAEMON_STARTUP_PHASE);
+
+/** File (in the daemon state dir) recording whether the previous process exited on purpose. */
+export const DAEMON_RUN_STATE_FILE = 'daemon-run-state.json';
+export const DAEMON_RUN_STATE = {
+  RUNNING: 'running',
+  /** Written the moment a graceful shutdown starts (SIGTERM from systemctl restart / the upgrade script included). */
+  STOPPING: 'stopping',
+} as const;
+export type DaemonRunState = (typeof DAEMON_RUN_STATE)[keyof typeof DAEMON_RUN_STATE];
+
+export function isDaemonUpgradeDeferral(value: unknown): value is DaemonUpgradeDeferral {
+  return value === DAEMON_UPGRADE_DEFERRAL.STARTING_UP || value === DAEMON_UPGRADE_DEFERRAL.UNCLEAN_SHUTDOWN_RECOVERY;
+}
+
+/** Deferrals that end by themselves after a known time: the server waits for its own timer, not an idle edge. */
+export function isTimeGatedDaemonUpgradeReason(reason: string | null | undefined): boolean {
+  return isDaemonUpgradeDeferral(reason);
+}
+
+/**
  * Why the server is holding a controlled node's upgrade back. These are
  * surfaced as `controlled_upgrade_reason` and in the server log, so an operator
  * can tell "waiting for an idle edge" from "never going to be sent".
@@ -216,6 +280,7 @@ export type ControlledNodeUpgradeStatus =
 export function isRetryableDaemonUpgradeBlockReason(reason: string): boolean {
   return reason === DAEMON_UPGRADE_BLOCK_REASON.ALREADY_IN_PROGRESS
     || reason === DAEMON_UPGRADE_BLOCK_REASON.COOLDOWN_ACTIVE
+    || isDaemonUpgradeDeferral(reason)
     || isDaemonUpgradeBusyBlockReason(reason);
 }
 

@@ -1073,6 +1073,8 @@
     "daemon_auto_upgrade_reason_master_compaction_active": "メモリのマスター要約を圧縮中です",
     "daemon_auto_upgrade_reason_transport_busy": "エージェントがまだターンを実行中です",
     "daemon_auto_upgrade_reason_session_busy": "セッションにまだ作業が残っています",
+    "daemon_auto_upgrade_reason_starting_up": "daemon は起動直後で、まだ安定していません",
+    "daemon_auto_upgrade_reason_unclean_shutdown_recovery": "daemon は予期しない停止から復旧中で、先に作業の再開を待っています",
     "daemon_auto_upgrade_reason_cooldown_active": "daemon は最近アップグレードされました（クールダウン中）",
     "daemon_auto_upgrade_reason_already_in_progress": "アップグレードが既に進行中です",
     "daemon_auto_upgrade_reason_retry_backoff": "前回の試行が失敗したため、再試行まで待機中です",
