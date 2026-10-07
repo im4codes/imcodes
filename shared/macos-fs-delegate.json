@@ -1,0 +1,9 @@
+{
+  "protocolVersion": 1,
+  "infoPlistVersionKey": "AideskFsDelegateVersion",
+  "infoPlistOpsKey": "AideskFsDelegateOps",
+  "appOps": ["list"],
+  "requestFlag": "--aidesk-fs-request",
+  "runtimeRoot": "/private/var/run/imcodes-node/fs-delegate",
+  "trustedChainStart": "/private/var/run/imcodes-node"
+}

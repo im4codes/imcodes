@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { VerifiedMacosRemoteDesktopComponent } from '../../src/node/macos-remote-desktop-artifact.js';
 import {
+  executeMacosAideskAppCommand,
   executeMacosRemoteDesktopResponsibleCommand,
   MACOS_REMOTE_DESKTOP_RESPONSIBLE_APP_REQUIREMENT,
   macosRemoteDesktopResponsibleCommandInvocation,
@@ -203,5 +204,45 @@ describe('macOS responsibility-safe remote desktop command launcher', () => {
     ]));
     expect(invocation.args).not.toContain('/verified/release/imcodes-remote-desktop-launch-agent');
     expect(invocation.env).toEqual({});
+  });
+
+  describe('the app\'s own self-contained commands (executeMacosAideskAppCommand)', () => {
+    it('verifies only the app\'s signed identity, then launches the app through LaunchServices and returns what it printed', async () => {
+      const value = await fixture();
+      const calls: Array<{ executable: string; args: readonly string[] }> = [];
+      const executeFile = outputWriter({ stdout: 'IMCODES-FS-V1\nerror not_found\n', stderr: '' }, calls);
+
+      await expect(executeMacosAideskAppCommand({
+        user: value.user,
+        args: ['--aidesk-fs-request', '/private/var/run/imcodes-node/fs-delegate/501/x.req'],
+        appPath: value.appPath,
+        timeoutMs: 5_000,
+        maxBufferBytes: 16 * 1024,
+      }, { executeFile })).resolves.toEqual({ stdout: 'IMCODES-FS-V1\nerror not_found\n', stderr: '' });
+
+      // exactly one signature check (the app's), no component check, then the same LaunchServices launch the helpers use
+      expect(calls.map((call) => call.executable)).toEqual(['/usr/bin/codesign', '/bin/launchctl']);
+      expect(calls[0]!.args).toEqual(expect.arrayContaining([`-R=${MACOS_REMOTE_DESKTOP_RESPONSIBLE_APP_REQUIREMENT}`, value.appPath]));
+      expect(calls[1]!.args).toEqual(expect.arrayContaining([
+        '/usr/bin/open', '-W', '-n', '-g', value.appPath, '--args', '--aidesk-fs-request', '/private/var/run/imcodes-node/fs-delegate/501/x.req',
+      ]));
+    });
+
+    it('does not start anything when the app\'s signature does not match', async () => {
+      const value = await fixture();
+      const executeFile = vi.fn(async () => { throw new Error('requirement failed'); });
+      await expect(executeMacosAideskAppCommand({
+        user: value.user, args: ['--aidesk-fs-request', '/x'], appPath: value.appPath, timeoutMs: 5_000, maxBufferBytes: 16 * 1024,
+      }, { executeFile })).rejects.toThrow('macos_remote_desktop_responsible_app_identity_mismatch');
+      expect(executeFile).toHaveBeenCalledTimes(1);
+    });
+
+    it('refuses output larger than the cap', async () => {
+      const value = await fixture();
+      const executeFile = outputWriter({ stdout: 'x'.repeat(2_000), stderr: '' }, []);
+      await expect(executeMacosAideskAppCommand({
+        user: value.user, args: ['--aidesk-fs-request', '/x'], appPath: value.appPath, timeoutMs: 5_000, maxBufferBytes: 1_024,
+      }, { executeFile })).rejects.toThrow('macos_remote_desktop_native_command_output_too_large');
+    });
   });
 });

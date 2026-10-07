@@ -37,6 +37,11 @@ export interface DirectoryQueryInput {
   query: FileDirectoryListQuery;
   /** Test seams. */
   statEntry?: (fullPath: string) => Promise<{ size: number; mtimeMs: number; birthtimeMs: number } | null>;
+  /**
+   * The caller has no way to read entry metadata at all (the listing came from a source that does not supply it). A listing ordered by
+   * size or time then cannot be ordered by what it claims, so it is reported `partial` rather than passed off as ordered.
+   */
+  metadataUnavailable?: boolean;
   platform?: NodeJS.Platform;
   maxStatEntries?: number;
   budgetMs?: number;
@@ -111,6 +116,7 @@ export async function buildQueriedDirectoryListing(input: DirectoryQueryInput): 
   // returned need their metadata. Time and size decide the order, so every
   // match has to be stat'd before any can be dropped.
   const orderedByName = sort.key === FILE_BROWSER_SORT_KEYS.NAME || sort.key === FILE_BROWSER_SORT_KEYS.KIND;
+  if (input.metadataUnavailable && !orderedByName) partial = true;
   let ordered: FileDirectoryEntry[];
   if (orderedByName) {
     ordered = (await sortFileBrowserEntriesAsync(matched, sort, yieldToEventLoop)).slice(0, FILE_TRANSFER_DIRECTORY_MAX_ENTRIES);

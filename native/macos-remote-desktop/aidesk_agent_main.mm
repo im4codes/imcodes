@@ -26,6 +26,7 @@
 #include <cstring>
 #include <iostream>
 
+#include "aidesk_fs_delegate.h"
 #include "macos_permission_onboarding.h"
 #include "../remote-desktop-common/platform_interfaces.h"
 #include "../remote-desktop-common/aidesk_product_name.h"
@@ -246,6 +247,12 @@ NSDictionary *StatusPresentation(NSDictionary *state, NSInteger http_status) {
 @end
 
 int main(int argc, char* argv[]) {
+  // The node asks this app to do the one filesystem call its own bare executable is denied (Full Disk Access is granted to this app,
+  // the identity the user sees). Answers one request file and exits; see aidesk_fs_delegate.h. Before anything that registers an
+  // application identity or opens UI: it is a headless one-shot.
+  if (imcodes::aidesk::fs_delegate::IsFsDelegateInvocation(argc, argv)) {
+    return imcodes::aidesk::fs_delegate::FsDelegateMain(argc, argv);
+  }
   if (argc == 3 && std::strcmp(argv[1], "--aidesk-status-probe") == 0) {
     @autoreleasepool {
       NSURL *state_url = [NSURL URLWithString:[NSString stringWithUTF8String:argv[2]]];

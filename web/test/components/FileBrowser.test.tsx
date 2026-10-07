@@ -58,7 +58,7 @@ vi.mock('../../src/direct-file-transfer.js', () => directFileTransferMocks);
 import { FileBrowser, __resetFileBrowserSharedChangesForTests, mergePreviewState, getParentDir } from '../../src/components/FileBrowser.js';
 import type { WsClient, ServerMessage } from '../../src/ws-client.js';
 import { FS_READ_ERROR_CODES } from '../../../shared/fs-read-error-codes.js';
-import { FILE_TRANSFER_DIRECTORY_PATH } from '../../../shared/transport/file-transfer.js';
+import { FILE_TRANSFER_DIRECTORY_LIST_ERROR, FILE_TRANSFER_DIRECTORY_PATH } from '../../../shared/transport/file-transfer.js';
 import {
   __resetDownloadTransfersForTests,
   getDownloadTransfers,
@@ -570,6 +570,30 @@ describe('FileBrowser', () => {
     render(<FileBrowser ws={ws} mode="file-multi" layout="panel" initialPath="/home/user" onConfirm={vi.fn()} />);
 
     expect(fsListDir).toHaveBeenCalledWith('/home/user', true, false);
+  });
+
+  describe('macOS Full Disk Access prompt names the identity that is actually missing', () => {
+    const open = (error: string) => {
+      const { ws, respondError } = makeWsFactory();
+      render(<FileBrowser ws={ws} mode="file-multi" layout="panel" initialPath={FILE_TRANSFER_DIRECTORY_PATH.DOWNLOADS} serverId="srv-1" quickAccess onConfirm={vi.fn()} />);
+      act(() => respondError(error));
+    };
+
+    it('shows the node text for the long-standing node-denied code', () => {
+      open(FILE_TRANSFER_DIRECTORY_LIST_ERROR.MACOS_FULL_DISK_ACCESS_REQUIRED);
+      expect(screen.getByRole('alert').textContent).toContain('file_browser.macos_fda_prompt');
+      expect(screen.getByRole('alert').textContent).not.toContain('file_browser.macos_fda_prompt_app');
+    });
+
+    it('shows the app text when the aiDesk.to app (not the node) is the one macOS refused', () => {
+      open(FILE_TRANSFER_DIRECTORY_LIST_ERROR.MACOS_FULL_DISK_ACCESS_REQUIRED_APP);
+      expect(screen.getByRole('alert').textContent).toContain('file_browser.macos_fda_prompt_app');
+    });
+
+    it('shows no prompt for any other error', () => {
+      open('forbidden_path');
+      expect(screen.queryByRole('alert')).toBeNull();
+    });
   });
 
   it('renders modal overlay in modal layout', () => {

@@ -13,7 +13,6 @@ import logger from '../util/logger.js';
 import {
   FILE_TRANSFER_LIMITS,
   fileTransferStorageId,
-  FILE_TRANSFER_DIRECTORY_MAX_ENTRIES,
   FILE_TRANSFER_DIRECTORY_PATH,
   isFileTransferWellKnownDirectoryPath,
   FILE_TRANSFER_MSG,
@@ -37,6 +36,7 @@ import {
   type FilePathHandleErrorReason,
   type FileDirectoryEntry,
   type FileDirectoryListDone,
+  type FileDirectoryListQuery,
   type FileDirectoryListError,
   type FileDeleteDone,
   type FileDeleteError,
@@ -51,18 +51,28 @@ import {
 } from '../../shared/transport/file-transfer.js';
 import {
   resolveWellKnownDirectoryDetailed,
+  wellKnownDirectoryCandidates,
   isPermissionDeniedError,
   WELL_KNOWN_DIRECTORY,
   type WellKnownDirectoryKind,
 } from './well-known-directories.js';
-import { buildQueriedDirectoryListing } from './file-directory-query.js';
+import {
+  createDelegatedListingProvider,
+  createDirectListingProvider,
+  directoryListingErrorForAppAnswer,
+  resolvePermittedRequestedPath,
+  listDirectoryUnderPolicy,
+  type DirectoryListing,
+} from './directory-listing-policy.js';
+import { MACOS_FS_DELEGATE_REASON } from '../../shared/macos-fs-delegate.js';
+import { listDirectoryViaMacosApp, type MacosFsDelegateClientDeps } from '../node/macos-fs-delegate-client.js';
 import { resolveMacosUserSession, launchMacosUserSessionCommand } from '../node/user-session-launcher.js';
 import { DIRECT_FILE_TRANSFER_COMMIT_INTENT_SUFFIX } from '../../shared/direct-file-transfer.js';
 import { FS_GENERIC_ERROR_CODES } from '../../shared/fs-error-codes.js';
 import { MACHINE_DIRECT_RESUME_FILE_PREFIX } from '../../shared/machine-direct-file-transfer.js';
 import { sanitizeUploadFilename } from '../../shared/upload-filename.js';
 import { isPreConnectNetworkError, withPreConnectRetry } from '../util/pre-connect-retry.js';
-import { resolveCanonical, validateCanonicalRealPath } from './file-preview-path-policy.js';
+import { validateCanonicalRealPath } from './file-preview-path-policy.js';
 import type { ValidatedRealPath } from './file-preview-path-policy.js';
 export type { ValidatedRealPath } from './file-preview-path-policy.js';
 
@@ -1199,6 +1209,46 @@ async function volumeCapacity(target: string): Promise<{ totalBytes?: number; fr
   }
 }
 
+/** Test seam for the macOS app delegation (see listDirectoryViaMacosAppOrThrow). */
+let macosFsDelegateDepsForTests: MacosFsDelegateClientDeps | undefined;
+export function setMacosFsDelegateDepsForTests(deps: MacosFsDelegateClientDeps | undefined): void { macosFsDelegateDepsForTests = deps; }
+
+/**
+ * The node was refused a directory for permission. Ask the aiDesk.to app to read it and return the listing, judged by the same policy
+ * as the node's own reads. Otherwise THROW what the node would have thrown without delegation: the original permission error (the
+ * caller turns that into the long-standing Full Disk Access error for a well-known folder), a not-found/not-a-directory answer, or the
+ * app-specific Full Disk Access error when the app answered and macOS refused the app itself.
+ *
+ * `sentinelKind` is set when the node could not even stat the well-known folder, so which of its candidate paths exists is unknown:
+ * the app is asked for each in turn.
+ */
+async function listDirectoryViaMacosAppOrThrow(
+  requestedPath: string,
+  sentinelKind: WellKnownDirectoryKind | undefined,
+  originalError: unknown,
+  query?: FileDirectoryListQuery,
+): Promise<DirectoryListing> {
+  const candidates = sentinelKind ? await wellKnownDirectoryCandidates(sentinelKind).catch(() => []) : [requestedPath];
+  for (const candidate of candidates) {
+    // The policy applied to the path as written (made absolute), before the app is asked to read it.
+    const absolute = await resolvePermittedRequestedPath(candidate);
+    if (absolute === null) continue;
+    const outcome = await listDirectoryViaMacosApp(absolute, macosFsDelegateDepsForTests);
+    if (outcome.kind === 'ok') {
+      return await listDirectoryUnderPolicy(candidate, createDelegatedListingProvider(outcome), {}, query);
+    }
+    if (outcome.kind === 'app_denied') {
+      throw new Error(FILE_TRANSFER_DIRECTORY_LIST_ERROR.MACOS_FULL_DISK_ACCESS_REQUIRED_APP);
+    }
+    if (outcome.kind === 'unavailable') break; // no usable app: the node's own behaviour stands
+    // refused: not_found / not_directory. For a sentinel try the next candidate; for a typed path that is the answer.
+    if (!sentinelKind) {
+      throw directoryListingErrorForAppAnswer(outcome.reason === MACOS_FS_DELEGATE_REASON.NOT_DIRECTORY ? 'not_directory' : 'not_found');
+    }
+  }
+  throw originalError;
+}
+
 export async function handleFileDirectoryList(cmd: Record<string, unknown>, sender: FileTransferSender): Promise<void> {
   const parsed = validateFileDirectoryListRequest(cmd);
   const requestId = typeof cmd.requestId === 'string' ? cmd.requestId : '';
@@ -1235,54 +1285,41 @@ export async function handleFileDirectoryList(cmd: Record<string, unknown>, send
     // still decide whether the resolved directory may be listed, so a shortcut
     // can only ever reach somewhere the user could already have typed.
     let requestedPath = parsed.value.path;
+    let sentinelKind: WellKnownDirectoryKind | undefined;
+    let sentinelDenied = false;
     if (isFileTransferWellKnownDirectoryPath(parsed.value.path)) {
-      const resolved = await resolveWellKnownDirectoryDetailed(WELL_KNOWN_DIRECTORY_BY_SENTINEL[parsed.value.path]);
+      sentinelKind = WELL_KNOWN_DIRECTORY_BY_SENTINEL[parsed.value.path];
+      const resolved = await resolveWellKnownDirectoryDetailed(sentinelKind);
       // Access to the well-known folder itself was denied (the macOS Full
       // Disk Access signature): report that distinctly rather than silently
       // listing the fallback home directory mislabeled as the folder the
       // user actually asked for -- the bug this whole branch exists to fix.
-      if (resolved.permissionDenied) {
-        throw new Error(FILE_TRANSFER_DIRECTORY_LIST_ERROR.MACOS_FULL_DISK_ACCESS_REQUIRED);
-      }
-      requestedPath = resolved.path;
+      if (resolved.permissionDenied) sentinelDenied = true;
+      else requestedPath = resolved.path;
     }
 
-    const canonical = await resolveCanonical(requestedPath, 'strict');
-    if (!canonical) throw new Error(FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH);
-    const directoryStat = await lstat(canonical.realPath);
-    if (directoryStat.isSymbolicLink() || !directoryStat.isDirectory()) {
-      throw new Error('not_directory');
+    // The node's own reads first, exactly as before. On macOS a refusal for permission (the node's bare executable lacks Full Disk
+    // Access) is retried through the signed aiDesk.to app, whose identity the user can see and grant; the SAME policy decision judges
+    // what the app returns (directory-listing-policy.ts).
+    let listing: DirectoryListing | undefined;
+    let permissionError: unknown = sentinelDenied ? new Error(FILE_TRANSFER_DIRECTORY_LIST_ERROR.MACOS_FULL_DISK_ACCESS_REQUIRED) : undefined;
+    if (!sentinelDenied) {
+      try {
+        listing = await listDirectoryUnderPolicy(requestedPath, createDirectListingProvider({ surfacePermissionErrors: process.platform === 'darwin' }), {}, parsed.value.query);
+      } catch (error) {
+        if (process.platform !== 'darwin' || !isPermissionDeniedError(error)) throw error;
+        permissionError = error;
+      }
     }
-    const dirents = (await readdir(canonical.realPath, { withFileTypes: true }))
-      .filter((entry) => entry.isDirectory() || entry.isFile());
-    // A request WITH a query is from a peer that advertised the capability and
-    // gets the ordered/filtered/metadata form; one without gets the plain
-    // listing exactly as before.
-    const queried = parsed.value.query
-      ? await buildQueriedDirectoryListing({ realPath: canonical.realPath, dirents, query: parsed.value.query })
-      : null;
-    const entries = queried
-      ? queried.entries
-      : dirents
-        .map((entry): FileDirectoryEntry => ({
-          name: entry.name,
-          path: path.join(canonical.realPath, entry.name),
-          isDir: entry.isDirectory(),
-          hidden: entry.name.startsWith('.'),
-        }))
-        .sort((a, b) => {
-          if (a.isDir !== b.isDir) return a.isDir ? -1 : 1;
-          return a.name === b.name ? 0 : a.name < b.name ? -1 : 1;
-        })
-        .slice(0, FILE_TRANSFER_DIRECTORY_MAX_ENTRIES);
+    if (!listing) listing = await listDirectoryViaMacosAppOrThrow(requestedPath, sentinelDenied ? sentinelKind : undefined, permissionError, parsed.value.query);
     sender.send({
       type: FILE_TRANSFER_MSG.DIRECTORY_LIST_DONE,
       requestId: parsed.value.requestId,
       path: parsed.value.path,
-      resolvedPath: canonical.realPath,
-      entries,
-      ...(queried?.truncated ? { truncated: true as const, total: queried.total as number } : {}),
-      ...(queried?.partial ? { partial: true as const } : {}),
+      resolvedPath: listing.realPath,
+      entries: listing.entries,
+      ...(listing.truncated ? { truncated: true as const, total: listing.total as number } : {}),
+      ...(listing.partial ? { partial: true as const } : {}),
     } satisfies FileDirectoryListDone);
   } catch (error) {
     // Covers both the explicit throw above (well-known resolution already
@@ -1296,7 +1333,9 @@ export async function handleFileDirectoryList(cmd: Record<string, unknown>, send
         (error instanceof Error && error.message === FILE_TRANSFER_DIRECTORY_LIST_ERROR.MACOS_FULL_DISK_ACCESS_REQUIRED)
         || isPermissionDeniedError(error)
       );
-    const code = isMacosFdaDenial
+    const code = error instanceof Error && error.message === FILE_TRANSFER_DIRECTORY_LIST_ERROR.MACOS_FULL_DISK_ACCESS_REQUIRED_APP
+      ? FILE_TRANSFER_DIRECTORY_LIST_ERROR.MACOS_FULL_DISK_ACCESS_REQUIRED_APP
+      : isMacosFdaDenial
       ? FILE_TRANSFER_DIRECTORY_LIST_ERROR.MACOS_FULL_DISK_ACCESS_REQUIRED
       : isNotFoundError(error)
         ? 'not_found'

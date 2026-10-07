@@ -352,10 +352,26 @@ export const FILE_TRANSFER_DIRECTORY_LIST_ERROR = {
    * falling back to the home directory.
    */
   MACOS_FULL_DISK_ACCESS_REQUIRED: 'macos_full_disk_access_required',
+  /**
+   * Same condition, but the node asked the signed aiDesk.to app to read the folder (shared/macos-fs-delegate.ts) and macOS refused
+   * THE APP: the app, not the node's bare executable, is the entry to enable under Full Disk Access. A browser that predates this
+   * code shows its generic error text for it (and no prompt); a daemon that predates it never sends it.
+   */
+  MACOS_FULL_DISK_ACCESS_REQUIRED_APP: 'macos_full_disk_access_required_app',
 } as const;
 
 export type FileTransferDirectoryListErrorReason =
   typeof FILE_TRANSFER_DIRECTORY_LIST_ERROR[keyof typeof FILE_TRANSFER_DIRECTORY_LIST_ERROR];
+
+/** Which identity is missing Full Disk Access: the aiDesk.to app (`app`), or the node's own executable (`node`, the long-standing case). */
+export type MacosFullDiskAccessTarget = 'app' | 'node';
+
+/** The identity a `file.directory_list_error` code says needs Full Disk Access, or `null` when the code is not about it. */
+export function macosFullDiskAccessTargetOfError(code: unknown): MacosFullDiskAccessTarget | null {
+  if (code === FILE_TRANSFER_DIRECTORY_LIST_ERROR.MACOS_FULL_DISK_ACCESS_REQUIRED) return 'node';
+  if (code === FILE_TRANSFER_DIRECTORY_LIST_ERROR.MACOS_FULL_DISK_ACCESS_REQUIRED_APP) return 'app';
+  return null;
+}
 
 /** Why the daemon could not reveal the native Full Disk Access settings pane. */
 export const MACOS_OPEN_FULL_DISK_ACCESS_ERROR = {

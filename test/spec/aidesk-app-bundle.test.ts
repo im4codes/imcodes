@@ -19,6 +19,13 @@ import {
   resolveAideskMinimumSystemVersion,
 } from '../../scripts/build-aidesk-app.mjs';
 import { macosArtifactSupportsStapling } from '../../scripts/macos-release-signing.mjs';
+import {
+  MACOS_FS_DELEGATE_APP_OPS,
+  MACOS_FS_DELEGATE_INFO_PLIST_OPS_KEY,
+  MACOS_FS_DELEGATE_INFO_PLIST_VERSION_KEY,
+  MACOS_FS_DELEGATE_PROTOCOL_VERSION,
+} from '../../shared/macos-fs-delegate.js';
+import { readMacosFsDelegateCapabilityFromInfoPlist } from '../../src/node/macos-fs-delegate-client.js';
 
 import {
   MACOS_AIDESK_APP_NAME,
@@ -49,6 +56,14 @@ describe('aiDesk application bundle', () => {
     // The same signed app is now the user's explicit local-management entry;
     // it must be visible in Dock while running, not hidden as an LSUIElement.
     expect(plist).not.toContain('<key>LSUIElement</key>');
+  });
+
+  it('advertises the filesystem delegation capability the node looks for (an app without it is an older app)', () => {
+    const plist = buildAideskInfoPlist({ version: '2026.9.1', minimumSystemVersion: '12.3' });
+    expect(plist).toContain(`<key>${MACOS_FS_DELEGATE_INFO_PLIST_VERSION_KEY}</key>\n  <integer>${MACOS_FS_DELEGATE_PROTOCOL_VERSION}</integer>`);
+    expect(plist).toContain(`<key>${MACOS_FS_DELEGATE_INFO_PLIST_OPS_KEY}</key>\n  <string>${MACOS_FS_DELEGATE_APP_OPS.join(' ')}</string>`);
+    // and the node's own reader of those keys agrees with what the packaging wrote
+    expect(readMacosFsDelegateCapabilityFromInfoPlist(plist)).toEqual(['list']);
   });
 
   it('refuses a version or system floor it cannot describe', () => {

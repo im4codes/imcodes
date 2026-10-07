@@ -428,31 +428,85 @@ export async function executeMacosRemoteDesktopResponsibleCommand(
     options.component,
     executeFile,
   );
-  const output = await createCommandOutputPaths(options.user);
+  return await runResponsibleApplicationCommand({
+    user: options.user,
+    appPath: launch.appPath,
+    args: [...launch.arguments, ...options.args],
+    timeoutMs: options.timeoutMs,
+    maxBufferBytes: options.maxBufferBytes,
+    detached: options.detached === true,
+  }, executeFile);
+}
+
+async function runResponsibleApplicationCommand(
+  run: {
+    user: MacosUserSession;
+    appPath: string;
+    args: readonly string[];
+    timeoutMs: number;
+    maxBufferBytes: number;
+    detached: boolean;
+  },
+  executeFile: typeof execFileText,
+): Promise<MacosRemoteDesktopResponsibleCommandResult> {
+  const output = await createCommandOutputPaths(run.user);
   try {
     const invocation = macosRemoteDesktopResponsibleCommandInvocation(
-      options.user,
-      launch.appPath,
-      [...launch.arguments, ...options.args],
+      run.user,
+      run.appPath,
+      run.args,
       output,
-      { detached: options.detached === true },
+      { detached: run.detached },
     );
     await executeFile(invocation.executable, invocation.args, {
       env: invocation.env,
-      timeoutMs: options.timeoutMs,
-      maxBufferBytes: options.maxBufferBytes,
+      timeoutMs: run.timeoutMs,
+      maxBufferBytes: run.maxBufferBytes,
     });
-    if (options.detached) return { stdout: '', stderr: '' };
+    if (run.detached) return { stdout: '', stderr: '' };
     const [stdout, stderr] = await Promise.all([
       readFile(output.stdout, 'utf8'),
       readFile(output.stderr, 'utf8'),
     ]);
-    if (Buffer.byteLength(stdout) > options.maxBufferBytes
-      || Buffer.byteLength(stderr) > options.maxBufferBytes) {
+    if (Buffer.byteLength(stdout) > run.maxBufferBytes
+      || Buffer.byteLength(stderr) > run.maxBufferBytes) {
       throw new Error('macos_remote_desktop_native_command_output_too_large');
     }
     return { stdout, stderr };
   } finally {
     await rm(output.directory, { recursive: true, force: true }).catch(() => {});
   }
+}
+
+export interface MacosAideskAppCommandOptions {
+  user: MacosUserSession;
+  args: readonly string[];
+  appPath?: string;
+  timeoutMs: number;
+  maxBufferBytes: number;
+}
+
+/**
+ * Run one of aiDesk.to by IM.codes.app's own self-contained commands (an argument vector its main executable answers itself, with no
+ * helper from the component store) and return what it printed. The same LaunchServices launch as the remote-desktop helpers, so the
+ * app is the responsible process for it: a permission granted to the app (Full Disk Access, say) is the one that applies. Only the
+ * app's signed identity is verified; there is no component set to vouch for.
+ */
+export async function executeMacosAideskAppCommand(
+  options: MacosAideskAppCommandOptions,
+  dependencies: MacosRemoteDesktopResponsibleSpawnDependencies = {},
+): Promise<MacosRemoteDesktopResponsibleCommandResult> {
+  const executeFile = dependencies.executeFile ?? execFileText;
+  const appPath = await verifyApplicationIdentity(
+    options.appPath ?? MACOS_REMOTE_DESKTOP_RESPONSIBLE_APP_PATH,
+    executeFile,
+  );
+  return await runResponsibleApplicationCommand({
+    user: options.user,
+    appPath,
+    args: options.args,
+    timeoutMs: options.timeoutMs,
+    maxBufferBytes: options.maxBufferBytes,
+    detached: false,
+  }, executeFile);
 }

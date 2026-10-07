@@ -1,6 +1,6 @@
 import { DAEMON_MSG } from '@shared/daemon-events.js';
 import { FS_TRANSPORT_MSG } from '@shared/fs-transport-messages.js';
-import { FILE_TRANSFER_DIRECTORY_PATH, FILE_TRANSFER_DIRECTORY_LIST_ERROR } from '@shared/transport/file-transfer.js';
+import { FILE_TRANSFER_DIRECTORY_PATH, macosFullDiskAccessTargetOfError, type MacosFullDiskAccessTarget } from '@shared/transport/file-transfer.js';
 import { openMacosFullDiskAccessSettings } from '../api/machines.js';
 import { formatByteSize } from '../util/byte-size.js';
 import {
@@ -630,7 +630,7 @@ export function FileBrowser({
   // are TCC-blocked" signal, never for generic errors -- those keep using
   // the small ⚠ nav-button indicator. Cleared on the next successful fetch
   // and whenever the user dismisses or acts on it.
-  const [macosFdaPrompt, setMacosFdaPrompt] = useState<{ requesting: boolean; requestFailed: boolean } | null>(null);
+  const [macosFdaPrompt, setMacosFdaPrompt] = useState<{ requesting: boolean; requestFailed: boolean; target: MacosFullDiskAccessTarget } | null>(null);
   const [showHidden, setShowHidden] = useState(DEFAULT_SHOW_HIDDEN_FILES);
   const [preview, setPreview] = useState<FileBrowserPreviewState>(() => initialPreview ?? { status: 'idle' });
   const previewRef = useRef<FileBrowserPreviewState>(preview);
@@ -960,11 +960,8 @@ export function FileBrowser({
 
         if (msg.status === 'error') {
           setError(msg.error ?? 'Unknown error');
-          setMacosFdaPrompt(
-            msg.error === FILE_TRANSFER_DIRECTORY_LIST_ERROR.MACOS_FULL_DISK_ACCESS_REQUIRED
-              ? { requesting: false, requestFailed: false }
-              : null,
-          );
+          const fdaTarget = macosFullDiskAccessTargetOfError(msg.error);
+          setMacosFdaPrompt(fdaTarget ? { requesting: false, requestFailed: false, target: fdaTarget } : null);
           // A failed fetch for the CURRENT root location (as opposed to one
           // nested child the user expanded deeper in the tree) must not
           // leave the browser stuck showing a fake, unresolved location with
@@ -1566,17 +1563,18 @@ export function FileBrowser({
 
   // Only ever invoked from the `macosFdaPrompt` banner below, which only
   // renders after a `file.directory_list_error` carrying
-  // FILE_TRANSFER_DIRECTORY_LIST_ERROR.MACOS_FULL_DISK_ACCESS_REQUIRED --
+  // FILE_TRANSFER_DIRECTORY_LIST_ERROR.MACOS_FULL_DISK_ACCESS_REQUIRED (or its `_APP` form) --
   // meaning `serverId` is guaranteed present (the sentinel came from a
   // remote machine, not this browser).
   const requestMacosFullDiskAccess = useCallback(() => {
     if (!serverId) return;
-    setMacosFdaPrompt({ requesting: true, requestFailed: false });
+    const target = macosFdaPrompt?.target ?? 'node';
+    setMacosFdaPrompt({ requesting: true, requestFailed: false, target });
     void openMacosFullDiskAccessSettings(serverId).then(
-      () => { if (mountedRef.current) setMacosFdaPrompt({ requesting: false, requestFailed: false }); },
-      () => { if (mountedRef.current) setMacosFdaPrompt({ requesting: false, requestFailed: true }); },
+      () => { if (mountedRef.current) setMacosFdaPrompt({ requesting: false, requestFailed: false, target }); },
+      () => { if (mountedRef.current) setMacosFdaPrompt({ requesting: false, requestFailed: true, target }); },
     );
-  }, [serverId]);
+  }, [serverId, macosFdaPrompt?.target]);
 
   // Load root on mount and re-load when ws changes (server switch).
   // fetchDir changes when ws changes (useCallback dep), so this also re-runs on server switch.
@@ -2680,7 +2678,9 @@ export function FileBrowser({
       {quickAccess && macosFdaPrompt && (
         <div class="fb-macos-fda-prompt" role="alert">
           <span class="fb-macos-fda-prompt-text">
-            {t(macosFdaPrompt.requestFailed ? 'file_browser.macos_fda_prompt_open_failed' : 'file_browser.macos_fda_prompt')}
+            {t(macosFdaPrompt.requestFailed
+              ? 'file_browser.macos_fda_prompt_open_failed'
+              : macosFdaPrompt.target === 'app' ? 'file_browser.macos_fda_prompt_app' : 'file_browser.macos_fda_prompt')}
           </span>
           <button
             type="button"

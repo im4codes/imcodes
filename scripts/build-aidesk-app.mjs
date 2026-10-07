@@ -20,6 +20,7 @@ import { fileURLToPath } from 'node:url';
 
 import { readMacosRemoteDesktopCodeIdentity } from './macos-remote-desktop-build.mjs';
 import product from '../shared/aidesk-product.json' with { type: 'json' };
+import fsDelegate from '../shared/macos-fs-delegate.json' with { type: 'json' };
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -84,9 +85,13 @@ export function buildAideskInfoPlist(input) {
     ['CFBundleShortVersionString', String(version)],
     ['CFBundleVersion', String(version)],
     ['LSMinimumSystemVersion', String(minimumSystemVersion)],
+    // What the node may ask this app to do for it (see shared/macos-fs-delegate.ts): a node that finds neither key keeps reading with
+    // its own identity, so an app without them is simply an older app.
+    [fsDelegate.infoPlistVersionKey, fsDelegate.protocolVersion, 'integer'],
+    [fsDelegate.infoPlistOpsKey, fsDelegate.appOps.join(' ')],
   ];
   const body = entries
-    .map(([key, value]) => `  <key>${key}</key>\n  <string>${value}</string>`)
+    .map(([key, value, type = 'string']) => `  <key>${key}</key>\n  <${type}>${value}</${type}>`)
     .join('\n');
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -192,6 +197,7 @@ function compileAgentSlice(arch, outPath, minimumSystemVersion) {
     `-I${source}`,
     join(source, 'aidesk_agent_main.mm'),
     join(source, 'macos_permission_onboarding.mm'),
+    join(source, 'aidesk_fs_delegate.cc'),
     '-framework', 'AppKit',
     '-framework', 'ApplicationServices',
     '-framework', 'CoreGraphics',
