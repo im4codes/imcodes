@@ -438,6 +438,53 @@ describe('controlled node enrollment and runtime', () => {
     }
   });
 
+  it('tells the liveness publisher what kind of activity it saw (an opened socket starts the unacknowledged-open clock)', () => {
+    const kinds: Array<string | undefined> = [];
+    const socket = new MockSocket();
+    const runtime = createControlledNodeRuntime({
+      serverUrl: 'https://im.example', serverId: 'kinds-1', token: 'secret', nodeRole: NODE_ROLE.CONTROLLED,
+    }, () => socket, { onConnectionActivity: (kind) => { kinds.push(kind); } });
+    runtime.start();
+    socket.open();
+    runtime.stop();
+    expect(kinds).toContain('attempt');
+    expect(kinds).toContain('socket_opened');
+  });
+
+  it('moves to the server\'s advertised address when the enrolled one cannot be reached, and sends nothing to an address it was not given', async () => {
+    vi.useFakeTimers();
+    try {
+      const urls: string[] = [];
+      const sockets: MockSocket[] = [];
+      const { ControlledNodeEndpointSelector, emptyEndpointState } = await import('../../src/node/server-endpoints.js');
+      const persisted: Array<{ lastGood?: string; advertised: string[] }> = [];
+      const endpoints = new ControlledNodeEndpointSelector('https://im.example', { ...emptyEndpointState(), advertised: ['https://proxy.example'] }, {
+        persist: (state) => { persisted.push(state); },
+      });
+      const runtime = createControlledNodeRuntime({
+        serverUrl: 'https://im.example', serverId: 'fallback-1', token: 'secret', nodeRole: NODE_ROLE.CONTROLLED,
+      }, (url) => { urls.push(url); const socket = new MockSocket(); sockets.push(socket); return socket; }, { endpoints });
+      runtime.start();
+      // three connection timeouts on the enrolled address (20 s each plus the retry delay)
+      for (let guard = 0; guard < 40 && urls.length < 4; guard += 1) await vi.advanceTimersByTimeAsync(5_000);
+      expect(urls.slice(0, 3).every((url) => url.startsWith('wss://im.example/'))).toBe(true);
+      expect(urls[3]).toBe('wss://proxy.example/api/server/fallback-1/ws');
+      expect(runtime.connectionStatus()).toMatchObject({ state: 'unreachable', target: 'proxy.example', failureClass: 'tcp_timeout' });
+      // the alternate answers: authenticated, remembered
+      const alternate = sockets[3]!;
+      alternate.open();
+      expect(JSON.parse(alternate.sent[0]!)).toMatchObject({ type: 'auth', serverId: 'fallback-1' });
+      alternate.emit('message', JSON.stringify({ type: 'heartbeat_ack', serverUrls: ['https://proxy.example', 'https://other.example'] }));
+      expect(runtime.connectionStatus()).toMatchObject({ state: 'connected', target: 'proxy.example' });
+      expect(persisted.at(-1)).toMatchObject({ lastGood: 'https://proxy.example', advertised: ['https://proxy.example', 'https://other.example'] });
+      // the sockets that never opened were never sent a credential
+      for (const socket of sockets.slice(0, 3)) expect(socket.sent).toEqual([]);
+      runtime.stop();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('authenticates, executes only machine.exec, and returns a correlated result', async () => {
     const socket = new MockSocket();
     const onAuthenticated = vi.fn();

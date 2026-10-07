@@ -12,6 +12,11 @@
  * terminal.stream_reset and unsubscribes the browser from that session.
  */
 
+import {
+  CONTROLLED_NODE_ACK_SERVER_URLS_FIELD,
+  CONTROLLED_NODE_PUBLIC_URLS_ENV,
+  parseControlledNodePublicUrls,
+} from '../../../shared/controlled-node-endpoints.js';
 import { AGENT_SKILLS_MESSAGE_PREFIX, AGENT_SKILLS_MSG } from '../../../shared/agent-skills.js';
 import { AGENT_MCP_MESSAGE_PREFIX, AGENT_MCP_MSG } from '../../../shared/agent-mcp.js';
 import { DaemonRequestTracker } from './daemon-request-tracker.js';
@@ -2066,15 +2071,33 @@ function toCapabilityManageJournalFrame(
  * deadlines on its local clock (shared/clock-sync.ts). Peers that send no
  * timestamp get the Server time alone, which older peers ignore.
  */
+let advertisedUrlsRaw: string | undefined;
+let advertisedUrls: string[] = [];
+
+/**
+ * The public origins of this deployment a controlled node may fall back to (IMCODES_PUBLIC_URLS, comma separated). Empty/unset =
+ * advertise nothing, the node keeps using only the address it was enrolled with. Parsed once per distinct value.
+ */
+export function controlledNodeAdvertisedUrls(raw: string | undefined = process.env[CONTROLLED_NODE_PUBLIC_URLS_ENV]): string[] {
+  if (raw !== advertisedUrlsRaw) {
+    advertisedUrlsRaw = raw;
+    advertisedUrls = parseControlledNodePublicUrls(raw);
+  }
+  return advertisedUrls;
+}
+
 function heartbeatAckWithClock(
   heartbeat: Record<string, unknown>,
   /** Controlled nodes only: their own public ID, so a node enrolled before it existed can adopt it. */
   controlledNodeId?: ControlledNodeId | null,
   serverId?: string,
+  /** Controlled nodes only: the deployment's public origins (see controlledNodeAdvertisedUrls). */
+  publicUrls?: readonly string[],
 ): Record<string, unknown> {
   const sentAt = heartbeat[CLOCK_SYNC_FIELD.SENT_AT];
   return {
     type: 'heartbeat_ack',
+    ...(publicUrls && publicUrls.length > 0 ? { [CONTROLLED_NODE_ACK_SERVER_URLS_FIELD]: publicUrls } : {}),
     ...(controlledNodeId && serverId
       ? { [CONTROLLED_NODE_ACK_NODE_ID_FIELD]: controlledNodeId, [CONTROLLED_NODE_ACK_SERVER_ID_FIELD]: serverId }
       : {}),
@@ -2201,7 +2224,12 @@ export class WsBridge {
     updateServerHeartbeat(db, this.serverId, hbVersion).catch((err) =>
       logger.error({ err }, 'Failed to update heartbeat'),
     );
-    try { ws.send(JSON.stringify(heartbeatAckWithClock(msg, this.daemonControlledNodeId, this.serverId))); } catch { /* ignore */ }
+    try { ws.send(JSON.stringify(heartbeatAckWithClock(
+      msg,
+      this.daemonControlledNodeId,
+      this.serverId,
+      this.daemonNodeRole === NODE_ROLE.CONTROLLED ? controlledNodeAdvertisedUrls() : undefined,
+    ))); } catch { /* ignore */ }
     void this.sendRemoteDesktopNodeContext(db, ws, connectionGeneration);
   }
 

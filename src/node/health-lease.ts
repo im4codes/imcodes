@@ -4,6 +4,8 @@ import { dirname, join } from 'node:path';
 import {
   CONTROLLED_NODE_LIVENESS_ACTIVITY_WINDOW_MS,
   CONTROLLED_NODE_LIVENESS_LEASE_FILE,
+  CONTROLLED_NODE_LIVENESS_BACKSTOP_STATE_FILE,
+  controlledNodeLivenessBackstopMs,
   CONTROLLED_NODE_LIVENESS_WRITE_INTERVAL_MS,
   CONTROLLED_NODE_UNREACHABLE_WARN_AFTER_MS,
   CONTROLLED_NODE_UNREACHABLE_WARN_REPEAT_MS,
@@ -316,8 +318,11 @@ export function notifySystemdWatchdog(pid: number): Promise<void> {
 }
 
 export interface ControlledNodeLivenessPublisher {
-  /** The connection machinery did something: a connection attempt, a failure, a scheduled retry, an opened socket, an ack. */
-  recordConnectionActivity(): void;
+  /**
+   * The connection machinery did something: a connection attempt, a failure, a scheduled retry, an opened socket, an ack.
+   * `socket_opened` also starts the clock of the unacknowledged-open backstop.
+   */
+  recordConnectionActivity(kind?: string): void;
   /** An authenticated heartbeat acknowledgement (also counts as activity). */
   recordAuthenticatedHeartbeat(): void;
   /** Starts the periodic renewal (idempotent); the timer never keeps the process alive. */
@@ -352,6 +357,14 @@ export function createControlledNodeLivenessPublisher(options: {
   onUnreachable?: (silentForMs: number) => void;
   unreachableWarnAfterMs?: number;
   unreachableWarnRepeatMs?: number;
+  /** Backstop level carried over from earlier restarts that no ack followed (0 = none); see controlledNodeLivenessBackstopMs. */
+  backstopLevel?: number;
+  /** Overrides the period of the level (tests). */
+  unackedOpenBackstopMs?: number;
+  /** Called once when the backstop stops the renewal; the level the NEXT process should start at is `nextLevel`. */
+  onBackstop?: (unackedForMs: number, nextLevel: number) => void;
+  /** Called on the first authenticated ack after a backstop level was in force (the level is back to 0). */
+  onBackstopCleared?: () => void;
 }): ControlledNodeLivenessPublisher {
   const now = options.now ?? Date.now;
   const monotonicNow = options.monotonicNow ?? (() => performance.now());
@@ -365,6 +378,11 @@ export function createControlledNodeLivenessPublisher(options: {
   let lastActivityAt = startedAt;
   let lastAckAt = startedAt;
   let lastWarnAt = Number.NEGATIVE_INFINITY;
+  let firstOpenedUnackedAt: number | undefined;
+  let backstopReported = false;
+  let backstopCleared = false;
+  const backstopLevel = options.backstopLevel ?? 0;
+  const backstopMs = options.unackedOpenBackstopMs ?? controlledNodeLivenessBackstopMs(backstopLevel);
   let timer: ReturnType<typeof setInterval> | null = null;
   let inFlight: Promise<void> | null = null;
 
@@ -383,18 +401,33 @@ export function createControlledNodeLivenessPublisher(options: {
       options.onUnreachable(at - lastAckAt);
     }
     if (at - lastActivityAt > activityWindowMs) return; // stuck: let the watchdog act
+    if (firstOpenedUnackedAt !== undefined && at - firstOpenedUnackedAt >= backstopMs) {
+      // Sockets keep opening, nothing ever acknowledges this node: stuck inside the connection handling, not offline.
+      if (!backstopReported) {
+        backstopReported = true;
+        options.onBackstop?.(at - firstOpenedUnackedAt, backstopLevel + 1);
+      }
+      return;
+    }
     if (inFlight) return inFlight;
     inFlight = publish().finally(() => { inFlight = null; });
     return inFlight;
   };
 
   return {
-    recordConnectionActivity(): void {
+    recordConnectionActivity(kind?: string): void {
       lastActivityAt = monotonicNow();
+      if (kind === 'socket_opened' && firstOpenedUnackedAt === undefined) firstOpenedUnackedAt = lastActivityAt;
     },
     recordAuthenticatedHeartbeat(): void {
       lastActivityAt = monotonicNow();
       lastAckAt = lastActivityAt;
+      firstOpenedUnackedAt = undefined;
+      backstopReported = false;
+      if (backstopLevel > 0 && !backstopCleared) {
+        backstopCleared = true;
+        options.onBackstopCleared?.();
+      }
     },
     start(): void {
       if (timer) return;
@@ -408,4 +441,28 @@ export function createControlledNodeLivenessPublisher(options: {
     },
     tick,
   };
+}
+
+export function controlledNodeLivenessBackstopStatePath(journalPath: string): string {
+  return join(dirname(journalPath), CONTROLLED_NODE_LIVENESS_BACKSTOP_STATE_FILE);
+}
+
+/** The backstop level of earlier processes; a missing or damaged file is level 0. */
+export async function readLivenessBackstopLevel(path: string): Promise<number> {
+  try {
+    const parsed = await readJson(path) as { version?: unknown; level?: unknown };
+    return parsed.version === 1 && typeof parsed.level === 'number' && Number.isSafeInteger(parsed.level) && parsed.level > 0
+      ? Math.min(parsed.level, 20)
+      : 0;
+  } catch {
+    return 0;
+  }
+}
+
+export async function writeLivenessBackstopLevel(path: string, level: number): Promise<void> {
+  if (level <= 0) {
+    await rm(path, { force: true });
+    return;
+  }
+  await writeJsonAtomic(path, { version: 1, level: Math.min(level, 20) });
 }

@@ -105,6 +105,13 @@ export const LOCAL_PANEL_PAGE_SCRIPT = String.raw`
     $('statusText').textContent = offline ? T('statusOffline') : paused ? T('statusPaused') : live ? T('statusBusy') : T('statusOnline');
     $('pausedBanner').hidden = !paused || offline;
     $('offlineBanner').hidden = !offline;
+    // The node is fine but cannot reach its server: say which address and why (host and reason only; the node sends nothing else).
+    var serverConnection = state && state.serverConnection ? state.serverConnection : null;
+    $('serverBanner').hidden = !serverConnection || offline;
+    if (serverConnection) {
+      var reasonKeys = { tcp_timeout: 'reasonTimeout', refused: 'reasonRefused', dns: 'reasonDns', tls: 'reasonTls', reset: 'reasonReset', rejected: 'reasonRejected' };
+      $('serverText').textContent = T('serverText', { host: serverConnection.target, reason: T(reasonKeys[serverConnection.reason] || 'reasonOther') });
+    }
     var sw = $('allowSwitch');
     sw.setAttribute('aria-checked', String(!paused));
     // Never disabled while an action runs: a disabled button loses keyboard focus. The click handler ignores clicks meanwhile.

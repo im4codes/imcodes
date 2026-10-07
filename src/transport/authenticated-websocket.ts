@@ -22,11 +22,13 @@ export type AuthenticatedWebSocketLossReason =
 
 export type AuthenticatedWebSocketDiagnostic =
   | { type: 'socket_opened' }
-  | { type: 'socket_lost'; reason: AuthenticatedWebSocketLossReason }
+  /** `errorCode` is the socket error's own short code (ECONNREFUSED, ENOTFOUND, ETIMEDOUT, CERT_HAS_EXPIRED, ...), when there is one. */
+  | { type: 'socket_lost'; reason: AuthenticatedWebSocketLossReason; errorCode?: string }
   | { type: 'reconnect_scheduled'; delayMs: number };
 
 export interface AuthenticatedWebSocketOptions {
-  url: string;
+  /** A function is evaluated for every connection attempt, so the owner can move to another address between attempts. */
+  url: string | (() => string);
   auth: Record<string, unknown>;
   createSocket: AuthenticatedWebSocketFactory;
   onMessage: (data: unknown) => void | Promise<void>;
@@ -121,7 +123,7 @@ export class AuthenticatedWebSocketClient {
     if (this.stopped) return;
     let socket: AuthenticatedWebSocketLike;
     try {
-      socket = this.options.createSocket(this.options.url);
+      socket = this.options.createSocket(typeof this.options.url === 'function' ? this.options.url() : this.options.url);
     } catch {
       this.emitDiagnostic({ type: 'socket_lost', reason: 'socket_create_error' });
       this.scheduleReconnect();
@@ -155,7 +157,7 @@ export class AuthenticatedWebSocketClient {
       }
       void Promise.resolve(this.options.onMessage(data)).catch(() => {});
     });
-    socket.on('error', () => this.failSocket(socket, 'socket_error'));
+    socket.on('error', (error?: unknown) => this.failSocket(socket, 'socket_error', safeErrorCode(error)));
     socket.on('close', (code?: number) => {
       const reason: AuthenticatedWebSocketLossReason = code === 4001
         ? 'authentication_failed'
@@ -172,6 +174,7 @@ export class AuthenticatedWebSocketClient {
   private handleSocketLoss(
     socket: AuthenticatedWebSocketLike,
     reason: AuthenticatedWebSocketLossReason,
+    errorCode?: string,
   ): boolean {
     if (this.socket !== socket) return false;
     this.socket = null;
@@ -184,14 +187,14 @@ export class AuthenticatedWebSocketClient {
     } catch {
       // A lifecycle observer must not disable the reconnect owner.
     }
-    this.emitDiagnostic({ type: 'socket_lost', reason });
+    this.emitDiagnostic({ type: 'socket_lost', reason, ...(errorCode ? { errorCode } : {}) });
     this.scheduleReconnect();
     return true;
   }
 
   /** Force a failed socket closed even when its implementation never emits close. */
-  private failSocket(socket: AuthenticatedWebSocketLike, reason: AuthenticatedWebSocketLossReason): void {
-    if (!this.handleSocketLoss(socket, reason)) return;
+  private failSocket(socket: AuthenticatedWebSocketLike, reason: AuthenticatedWebSocketLossReason, errorCode?: string): void {
+    if (!this.handleSocketLoss(socket, reason, errorCode)) return;
     try {
       if (socket.terminate) socket.terminate();
       else socket.close();
@@ -263,4 +266,10 @@ export class AuthenticatedWebSocketClient {
       // Observability must never take ownership of transport recovery.
     }
   }
+}
+
+/** The short machine code of a socket error (never its message, which may name the address). */
+function safeErrorCode(error: unknown): string | undefined {
+  const code = error && typeof error === 'object' ? (error as { code?: unknown }).code : undefined;
+  return typeof code === 'string' && /^[A-Z0-9_]{2,48}$/.test(code) ? code : undefined;
 }

@@ -744,6 +744,28 @@ describe('WsBridge', () => {
         expect(full).not.toHaveProperty('nodeId');
         expect(full).not.toHaveProperty('serverId');
       });
+
+      describe('the deployment\'s public origins (IMCODES_PUBLIC_URLS) for a controlled node\'s fallback', () => {
+        const original = process.env.IMCODES_PUBLIC_URLS;
+        afterEach(() => {
+          if (original === undefined) delete process.env.IMCODES_PUBLIC_URLS; else process.env.IMCODES_PUBLIC_URLS = original;
+        });
+
+        it('are advertised to an authenticated controlled node, validated and normalized', async () => {
+          process.env.IMCODES_PUBLIC_URLS = 'https://im.example, https://proxy.example http://plain.example https://u:p@x.example/p';
+          const ack = await ackAfterHeartbeat(makeDb('valid-hash', 'controlled', CONTROLLED_NODE_OS_WIN));
+          expect(ack.serverUrls).toEqual(['https://im.example', 'https://proxy.example']);
+        });
+
+        it('advertise nothing by default (unset or empty = the old behaviour), and never to a full daemon', async () => {
+          delete process.env.IMCODES_PUBLIC_URLS;
+          expect(await ackAfterHeartbeat(makeDb('valid-hash', 'controlled', CONTROLLED_NODE_OS_WIN))).not.toHaveProperty('serverUrls');
+          process.env.IMCODES_PUBLIC_URLS = '';
+          expect(await ackAfterHeartbeat(makeDb('valid-hash', 'controlled', CONTROLLED_NODE_OS_WIN))).not.toHaveProperty('serverUrls');
+          process.env.IMCODES_PUBLIC_URLS = 'https://im.example';
+          expect(await ackAfterHeartbeat(makeDb('valid-hash', 'full', null))).not.toHaveProperty('serverUrls');
+        });
+      });
     });
 
     it('sends an exact generation-bound worker repair request to an installable controlled node', async () => {

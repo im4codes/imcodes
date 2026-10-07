@@ -80,6 +80,23 @@ export const CONTROLLED_NODE_LIVENESS_WRITE_INTERVAL_MS = 15_000 as const;
  */
 export const CONTROLLED_NODE_LIVENESS_ACTIVITY_WINDOW_MS = 90_000 as const;
 /** A node that has had no authenticated ack for this long says so in its log (at most once per repeat interval). */
+/**
+ * Backstop for a process that is stuck INSIDE its connection handling: a server that accepts the connection (so sockets keep
+ * opening) but never acknowledges this node cannot be told from a server that is unreachable by connection activity alone. When
+ * sockets have been opening for this long without a single authenticated ack, renewal stops and the platform watchdog restarts the
+ * node. Each time that happens WITHOUT an ack in between, the next period doubles (45 min, 90 min, ... up to 12 h; the level is kept
+ * in a small file because the restart is a new process), so a node that is permanently refused (a revoked credential) is restarted a
+ * handful of times a day at most; the first authenticated ack resets it. A server that cannot be reached at all never opens a socket
+ * and is never restarted.
+ */
+export const CONTROLLED_NODE_LIVENESS_UNACKED_OPEN_BACKSTOP_MS = 45 * 60_000;
+export const CONTROLLED_NODE_LIVENESS_UNACKED_OPEN_BACKSTOP_MAX_MS = 12 * 60 * 60_000;
+export const CONTROLLED_NODE_LIVENESS_BACKSTOP_STATE_FILE = 'liveness-backstop.json' as const;
+/** The backstop period at a given level (0 = the first restart). */
+export function controlledNodeLivenessBackstopMs(level: number): number {
+  const safe = Number.isSafeInteger(level) && level > 0 ? Math.min(level, 20) : 0;
+  return Math.min(CONTROLLED_NODE_LIVENESS_UNACKED_OPEN_BACKSTOP_MS * 2 ** safe, CONTROLLED_NODE_LIVENESS_UNACKED_OPEN_BACKSTOP_MAX_MS);
+}
 export const CONTROLLED_NODE_UNREACHABLE_WARN_AFTER_MS = 5 * 60_000;
 export const CONTROLLED_NODE_UNREACHABLE_WARN_REPEAT_MS = 30 * 60_000;
 

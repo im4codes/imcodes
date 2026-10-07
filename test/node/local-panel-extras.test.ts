@@ -65,3 +65,23 @@ describe('sanitizeRemoteDesktopLocalExtras', () => {
     expect(sanitizeRemoteDesktopLocalExtras({ deviceName: '<img src=x onerror=alert(1)>' }).deviceName).toBe('<img src=x onerror=alert(1)>');
   });
 });
+
+describe('the server-connection line of the panel', () => {
+  it('keeps a well-formed host[:port] with a known reason', () => {
+    expect(sanitizeRemoteDesktopLocalExtras({ serverConnection: { target: 'im.zhinet.work', reason: 'tcp_timeout' } }))
+      .toEqual({ serverConnection: { target: 'im.zhinet.work', reason: 'tcp_timeout' } });
+    expect(sanitizeRemoteDesktopLocalExtras({ serverConnection: { target: 'im-proxy.koca.win:8443', reason: 'dns' } }).serverConnection)
+      .toEqual({ target: 'im-proxy.koca.win:8443', reason: 'dns' });
+  });
+
+  it.each([
+    [{ target: 'https://im.example/path?token=1', reason: 'dns' }],
+    [{ target: 'im.example', reason: 'because I said so' }],
+    [{ target: '<script>alert(1)</script>', reason: 'dns' }],
+    [{ target: 'a'.repeat(300), reason: 'dns' }],
+    [{ target: 'im.example:99999999', reason: 'dns' }],
+    [['im.example', 'dns']], ['im.example'], [null],
+  ])('drops %j', (value) => {
+    expect(sanitizeRemoteDesktopLocalExtras({ serverConnection: value })).toEqual({});
+  });
+});

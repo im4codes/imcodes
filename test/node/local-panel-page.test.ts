@@ -123,3 +123,25 @@ describe('the embedded shared code is the shared code', () => {
     expect(evaluate(source, 'localPanelText("xx","share")')).toBe('Share');
   });
 });
+
+describe('the server-connection banner', () => {
+  it('is part of the page, hidden until the node reports an unreachable server, and filled with textContent only', () => {
+    expect(page).toContain('id="serverBanner"');
+    expect(page).toMatch(/id="serverBanner"[^>]*\shidden>/u);
+    expect(LOCAL_PANEL_PAGE_SCRIPT).toContain("$('serverText').textContent = T('serverText'");
+    expect(LOCAL_PANEL_PAGE_SCRIPT).not.toMatch(/serverText'\)\.innerHTML/u);
+  });
+
+  it('every language has a title, a sentence with {{host}} and {{reason}}, and every reason', () => {
+    for (const locale of UI_LOCALES) {
+      const text = LOCAL_PANEL_STRINGS[locale].serverText;
+      expect(text, locale).toContain('{{host}}');
+      expect(text, locale).toContain('{{reason}}');
+      expect(localPanelText(locale, 'serverText', { host: 'im.example:443', reason: localPanelText(locale, 'reasonTimeout') }), locale)
+        .not.toContain('{{');
+      for (const key of ['serverTitle', 'reasonTimeout', 'reasonRefused', 'reasonDns', 'reasonTls', 'reasonReset', 'reasonRejected', 'reasonOther'] as const) {
+        expect(LOCAL_PANEL_STRINGS[locale][key].length, `${locale}.${key}`).toBeGreaterThan(2);
+      }
+    }
+  });
+});

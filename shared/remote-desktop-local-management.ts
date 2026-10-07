@@ -1,3 +1,4 @@
+import { CONTROLLED_NODE_FAILURE_CLASS, type ControlledNodeFailureClass } from './controlled-node-endpoints.js';
 import { REMOTE_DESKTOP_ACCESS_MODE, type RemoteDesktopAccessMode } from './remote-desktop.js';
 
 /** Local-only management surface shared by every controlled-node platform. */
@@ -80,8 +81,16 @@ export function isRemoteDesktopLocalPermissionTarget(value: unknown): value is R
   return typeof value === 'string' && Object.prototype.hasOwnProperty.call(MACOS_PRIVACY_PANE_URL, value);
 }
 
+/** The node cannot reach its server: which address (host[:port], no scheme or path) and why. Shown by the panel; carries no secret. */
+export interface RemoteDesktopLocalServerConnection {
+  target: string;
+  reason: ControlledNodeFailureClass;
+}
+
 export interface RemoteDesktopLocalExtras {
   deviceName?: string;
+  /** Present only while the node cannot reach its server. */
+  serverConnection?: RemoteDesktopLocalServerConnection;
   /** The node's own version, shown on the About page. */
   version?: string;
   permissions?: RemoteDesktopLocalPermissions;
@@ -96,6 +105,14 @@ export function sanitizeRemoteDesktopLocalExtras(value: unknown): RemoteDesktopL
     // eslint-disable-next-line no-control-regex
     const name = raw.deviceName.replace(/[\u0000-\u001f\u007f]+/gu, ' ').trim().slice(0, REMOTE_DESKTOP_LOCAL_DEVICE_NAME_MAX_CHARS);
     if (name) out.deviceName = name;
+  }
+  const connection = (value as { serverConnection?: unknown }).serverConnection;
+  if (connection && typeof connection === 'object' && !Array.isArray(connection)) {
+    const { target, reason } = connection as { target?: unknown; reason?: unknown };
+    if (typeof target === 'string' && /^[A-Za-z0-9.-]{1,253}(?::\d{1,5})?$/u.test(target)
+      && typeof reason === 'string' && (Object.values(CONTROLLED_NODE_FAILURE_CLASS) as string[]).includes(reason)) {
+      out.serverConnection = { target, reason: reason as ControlledNodeFailureClass };
+    }
   }
   if (typeof raw.version === 'string') {
     const version = raw.version.trim();

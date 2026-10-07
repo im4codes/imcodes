@@ -11,16 +11,26 @@ import {
 } from './remote-desktop-signed-shell-host.js';
 import { DAEMON_VERSION } from '../util/version.js';
 import logger from '../util/logger.js';
+import { warnOncePerHour } from '../util/rate-limited-warn.js';
 import {
   controlledNodeHealthLeasePath,
   createControlledNodeHealthLeasePublisher,
   createControlledNodeLivenessPublisher,
+  controlledNodeLivenessBackstopStatePath,
+  readLivenessBackstopLevel,
+  writeLivenessBackstopLevel,
   notifySystemdWatchdog,
   controlledNodeLivenessLeasePath,
   runMacosControlledNodeHealthWatchdog,
   waitForControlledNodeOnlineLease,
 } from './health-lease.js';
-import { CONTROLLED_NODE_SERVICE } from './installer.js';
+import { CONTROLLED_NODE_SERVICE, isProcessElevated } from './installer.js';
+import {
+  ControlledNodeEndpointSelector,
+  controlledNodeEndpointsPath,
+  readEndpointState,
+  writeEndpointState,
+} from './server-endpoints.js';
 import { defaultCredentialPath, defaultStagedExecutablePath, persistCredential, readEnrollmentBlob } from './enrollment.js';
 import { createControlledNodeIdAdopter } from './controlled-node-id-adoption.js';
 import { REMOTE_DESKTOP_LOCAL_MANAGEMENT, type RemoteDesktopLocalPermissionTarget } from '../../shared/remote-desktop-local-management.js';
@@ -208,6 +218,16 @@ async function main(): Promise<void> {
     }
     return;
   }
+  if (process.argv[2] === 'set-server-url') {
+    const { runServerUrlCommand } = await import('./server-url-cli.js');
+    process.exitCode = await runServerUrlCommand(process.argv.slice(3), {
+      isElevated: () => isProcessElevated(),
+      endpointsPath: controlledNodeEndpointsPath(journalPathFor()),
+      stdout: (text) => { process.stdout.write(text); },
+      stderr: (text) => { process.stderr.write(text); },
+    });
+    return;
+  }
   if (process.argv[2] === '--open-local-panel') {
     await openAideskLocalPanel();
     return;
@@ -250,9 +270,12 @@ async function main(): Promise<void> {
     await holdConsoleForReader();
     return;
   }
+  // A failing health-signal write repeats every 15 s for as long as it fails: report it once an hour, not 5,760 times a day.
   const reportHealthError = (err: unknown): void => {
     const message = err instanceof Error ? err.message : String(err);
-    process.stderr.write(`imcodes-node: failed to publish authenticated health signal (${message})\n`);
+    if (warnOncePerHour('node_health_signal_publish_failed', { message })) {
+      process.stderr.write(`imcodes-node: failed to publish authenticated health signal (${message})\n`);
+    }
   };
   // Two signals, deliberately separate. The health lease is written ONLY on an authenticated server acknowledgement:
   // a self-upgrade judges its new node by it. The liveness publisher (the liveness lease file and, on Linux, the systemd
@@ -262,17 +285,48 @@ async function main(): Promise<void> {
   const healthLease = supportsHealthSignals
     ? createControlledNodeHealthLeasePublisher(controlledNodeHealthLeasePath(deps.journalPath), { onError: reportHealthError })
     : undefined;
+  const backstopStatePath = controlledNodeLivenessBackstopStatePath(deps.journalPath);
   const liveness = supportsHealthSignals
     ? createControlledNodeLivenessPublisher({
+      backstopLevel: await readLivenessBackstopLevel(backstopStatePath),
       path: controlledNodeLivenessLeasePath(deps.journalPath),
       ...(process.platform === 'linux' ? { notifyWatchdog: notifySystemdWatchdog } : {}),
       onError: reportHealthError,
+      onBackstop: (unackedForMs, nextLevel) => {
+        logger.error({ unackedForMs, nextLevel }, 'controlled node: sockets keep opening but the server never acknowledged this node; the watchdog will restart it');
+        void writeLivenessBackstopLevel(backstopStatePath, nextLevel).catch(() => {});
+      },
+      onBackstopCleared: () => { void writeLivenessBackstopLevel(backstopStatePath, 0).catch(() => {}); },
       onUnreachable: (silentForMs) => {
-        logger.warn({ silentForMs }, 'controlled node has not been acknowledged by the server for a while (the node keeps retrying; the platform watchdog is not restarting it)');
+        // `runtime` exists by the time this fires (minutes after start).
+        const status = runtime.connectionStatus();
+        logger.warn({
+          silentForMs,
+          target: status.target,
+          failureClass: status.failureClass,
+          consecutiveFailures: status.consecutiveFailures,
+        }, 'controlled node has not been acknowledged by the server for a while (the node keeps retrying; the platform watchdog is not restarting it)');
       },
     })
     : undefined;
   liveness?.start();
+  // The addresses the node may dial: its enrolled one, plus root-pinned and server-advertised alternates (a damaged file = none).
+  const endpointsPath = controlledNodeEndpointsPath(deps.journalPath);
+  const endpoints = new ControlledNodeEndpointSelector(
+    bootstrap.credential.serverUrl,
+    await readEndpointState(endpointsPath),
+    {
+      reload: () => readEndpointState(endpointsPath),
+      // The node owns advertised/lastGood/dropped; the root's pinned list is re-read from disk so a concurrent edit is never lost.
+      persist: async (state) => {
+        const onDisk = await readEndpointState(endpointsPath);
+        await writeEndpointState(endpointsPath, { ...state, pinned: onDisk.pinned });
+      },
+      onRotate: ({ from, to, reason }) => {
+        logger.warn({ from, to, reason }, 'controlled node switches to another server address');
+      },
+    },
+  );
   const signedShellArtifact = resolveRemoteDesktopAccountShellArtifact();
   const macosRemoteDesktopWorker = process.platform === 'darwin'
     && (process.arch === 'arm64' || process.arch === 'x64')
@@ -316,6 +370,7 @@ async function main(): Promise<void> {
       healthLease?.recordAuthenticatedHeartbeat();
     },
     onConnectionActivity: liveness?.recordConnectionActivity,
+    endpoints,
     ...(adoptAssignedNodeId ? { onAssignedIdentity: adoptAssignedNodeId } : {}),
     readPreviousUpgradeFailure: () => readPreviousUpgradeFailure(deps.journalPath),
     remoteDesktopAccessPaused,
@@ -329,7 +384,16 @@ async function main(): Promise<void> {
       publicNodeId: nodeId,
       serverUrl: bootstrap.credential.serverUrl,
       status: () => runtime.remoteDesktopAccessStatus(),
-      extras: () => ({ ...runtime.remoteDesktopLocalExtras(), version: DAEMON_VERSION }),
+      extras: () => {
+        const connection = runtime.connectionStatus();
+        return {
+          ...runtime.remoteDesktopLocalExtras(),
+          version: DAEMON_VERSION,
+          ...(connection.state === 'unreachable' && connection.failureClass
+            ? { serverConnection: { target: connection.target, reason: connection.failureClass } }
+            : {}),
+        };
+      },
       ...(process.platform === 'darwin' ? { openSettings: (target: RemoteDesktopLocalPermissionTarget) => openMacosPrivacyPane(target) } : {}),
       setPaused: (paused) => applyRemoteDesktopAccessPaused(
         paused,

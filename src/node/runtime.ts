@@ -122,6 +122,8 @@ import {
 } from '../../shared/controlled-node-auto-unlock.js';
 import { incrementCounter } from '../util/metrics.js';
 import logger from '../util/logger.js';
+import { ControlledNodeConnectionTracker, type ControlledNodeConnectionStatus } from './connection-status.js';
+import type { ControlledNodeEndpointSelector } from './server-endpoints.js';
 import {
   REMOTE_DESKTOP_ADAPTER_CAPABILITIES,
   REMOTE_DESKTOP_CAPTURE_PRIVACY_CAPABILITY,
@@ -355,7 +357,12 @@ export interface ControlledNodeRuntimeOptions {
    * scheduled retry. It is the node's proof of life while the server cannot be reached (see
    * CONTROLLED_NODE_LIVENESS_*): an outage keeps producing these, a wedged process does not.
    */
-  onConnectionActivity?: () => void;
+  onConnectionActivity?: (kind?: string) => void;
+  /**
+   * The addresses this node may dial: its credential's origin first, then root-pinned and server-advertised alternates, with
+   * rotation after repeated failures (src/node/server-endpoints.ts). Absent = the credential's origin only.
+   */
+  endpoints?: ControlledNodeEndpointSelector | null;
   /** Reads one durable failed Windows one-shot upgrade after rollback. */
   readPreviousUpgradeFailure?: () => Promise<{ targetVersion: string; reason?: string } | null>;
   /**
@@ -416,6 +423,8 @@ export interface ControlledNodeRuntimeClient extends AuthenticatedWebSocketClien
   remoteDesktopAccessStatus(): { paused: boolean; connections: readonly RemoteDesktopLocalConnection[] };
   /** Host name and (macOS) permission state for the local panel; read off state the node already keeps, never probed. */
   remoteDesktopLocalExtras(): RemoteDesktopLocalExtras;
+  /** Which server address the node dials and, when it cannot reach it, why. No secret. */
+  connectionStatus(): ControlledNodeConnectionStatus;
   setRemoteDesktopAccessPaused(paused: boolean): Promise<void>;
   stopAllRemoteDesktopConnections(): Promise<void>;
   stopRemoteDesktopConnection(publicId: string): Promise<boolean>;
@@ -1540,8 +1549,15 @@ export function createControlledNodeRuntime(
     });
     return run;
   };
+  const connection = new ControlledNodeConnectionTracker({
+    primary: credential.serverUrl,
+    serverId: credential.serverId,
+    selector: options.endpoints ?? null,
+    log: logger,
+  });
   const clientOptions: AuthenticatedWebSocketOptions = {
-    url: controlledNodeWebSocketUrl(credential.serverUrl, credential.serverId),
+    // Evaluated for every attempt: after repeated failures the node moves on to the next trusted origin.
+    url: () => controlledNodeWebSocketUrl(connection.currentOrigin(), credential.serverId),
     auth: authFrame,
     heartbeatMessage: () => ({
       type: 'heartbeat',
@@ -1551,7 +1567,8 @@ export function createControlledNodeRuntime(
     heartbeatMs: 5_000,
     silenceTimeoutMs: 30_000,
     onDiagnostic: (event) => {
-      options.onConnectionActivity?.();
+      options.onConnectionActivity?.(event.type);
+      connection.onDiagnostic(event);
       if (event.type === 'socket_opened') {
         logger.info({ lifecycle: event.type }, 'controlled-node transport connected');
         // The auth frame is sent synchronously by AuthenticatedWebSocketClient
@@ -1571,7 +1588,7 @@ export function createControlledNodeRuntime(
       }
     },
     createSocket: (url) => {
-      options.onConnectionActivity?.();
+      options.onConnectionActivity?.('attempt');
       // Auth is connection-generation scoped. Re-sample immediately before
       // each socket so a readiness downgrade cannot reconnect as stale Control.
       refreshRemoteDesktopCapabilityState();
@@ -1617,6 +1634,7 @@ export function createControlledNodeRuntime(
         return;
       }
       if (isControlledNodeAuthAck(message)) {
+        connection.onAuthenticatedAck(message);
         // `heartbeat_ack` doubles as the auth-ack signal and repeats every
         // 5s for the life of the connection. Diagnostics only cares about the
         // FIRST one (the startup handshake); recording every repeat would
@@ -2127,6 +2145,7 @@ export function createControlledNodeRuntime(
     client = new AuthenticatedWebSocketClient(clientOptions);
   }
   const runtimeClient = client as ControlledNodeRuntimeClient;
+  runtimeClient.connectionStatus = () => connection.status();
   runtimeClient.remoteDesktopAccessStatus = () => ({
     paused: remoteDesktopAccessPaused,
     connections: remoteDesktopWorker.activeConnections?.() ?? [],

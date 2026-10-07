@@ -4,6 +4,9 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   CONTROLLED_NODE_LIVENESS_ACTIVITY_WINDOW_MS,
+  CONTROLLED_NODE_LIVENESS_UNACKED_OPEN_BACKSTOP_MAX_MS,
+  CONTROLLED_NODE_LIVENESS_UNACKED_OPEN_BACKSTOP_MS,
+  controlledNodeLivenessBackstopMs,
   CONTROLLED_NODE_UNREACHABLE_WARN_AFTER_MS,
 } from '../../shared/controlled-node-service.js';
 import {
@@ -11,8 +14,11 @@ import {
   controlledNodeHealthLeasePath,
   controlledNodeHealthWatchdogStatePath,
   createControlledNodeHealthLeasePublisher,
+  controlledNodeLivenessBackstopStatePath,
   controlledNodeLivenessLeasePath,
   createControlledNodeLivenessPublisher,
+  readLivenessBackstopLevel,
+  writeLivenessBackstopLevel,
   runMacosControlledNodeHealthWatchdog,
   waitForControlledNodeOnlineLease,
   writeControlledNodeHealthLease,
@@ -333,6 +339,88 @@ describe('controlled-node liveness (the process is alive and working, whether or
     publisher.recordConnectionActivity();
     await publisher.tick();
     expect(onUnreachable).not.toHaveBeenCalled();
+  });
+
+  it('stops renewing (once) when sockets keep opening for 45 minutes without a single ack: stuck in the connection handling, not offline', async () => {
+    const onBackstop = vi.fn();
+    const { publisher, written, notify, advance } = rig({ onBackstop });
+    const period = CONTROLLED_NODE_LIVENESS_UNACKED_OPEN_BACKSTOP_MS;
+    for (let elapsed = 0; elapsed < period - 15_000; elapsed += 15_000) {
+      advance(15_000);
+      publisher.recordConnectionActivity(elapsed % 30_000 === 0 ? 'socket_opened' : 'attempt');
+      await publisher.tick();
+    }
+    const before = written.length;
+    expect(before).toBeGreaterThan(150);
+    expect(onBackstop).not.toHaveBeenCalled();
+    advance(30_000);
+    publisher.recordConnectionActivity('socket_opened');
+    await publisher.tick();
+    await publisher.tick();
+    expect(written).toHaveLength(before);
+    expect(notify.mock.calls.length).toBe(before);
+    expect(onBackstop).toHaveBeenCalledTimes(1);
+    expect(onBackstop.mock.calls[0]![1]).toBe(1); // the next process starts one level up
+    // an acknowledgement ends it
+    publisher.recordAuthenticatedHeartbeat();
+    await publisher.tick();
+    expect(written).toHaveLength(before + 1);
+  });
+
+  it('each restart that no ack followed doubles the period, up to the cap; an ack clears the level', async () => {
+    expect([0, 1, 2, 3, 4, 5, 6, 7, 99].map(controlledNodeLivenessBackstopMs)).toEqual([
+      45 * 60_000, 90 * 60_000, 180 * 60_000, 360 * 60_000, CONTROLLED_NODE_LIVENESS_UNACKED_OPEN_BACKSTOP_MAX_MS,
+      CONTROLLED_NODE_LIVENESS_UNACKED_OPEN_BACKSTOP_MAX_MS, CONTROLLED_NODE_LIVENESS_UNACKED_OPEN_BACKSTOP_MAX_MS,
+      CONTROLLED_NODE_LIVENESS_UNACKED_OPEN_BACKSTOP_MAX_MS, CONTROLLED_NODE_LIVENESS_UNACKED_OPEN_BACKSTOP_MAX_MS,
+    ]);
+    const onBackstop = vi.fn();
+    const onBackstopCleared = vi.fn();
+    const { publisher, written, advance } = rig({ backstopLevel: 2, onBackstop, onBackstopCleared });
+    // level 2 = 3 hours: nothing happens at 2 h 59 min
+    for (let elapsed = 0; elapsed < 3 * 3_600_000 - 30_000; elapsed += 15_000) {
+      advance(15_000);
+      publisher.recordConnectionActivity('socket_opened');
+      await publisher.tick();
+    }
+    expect(onBackstop).not.toHaveBeenCalled();
+    const renewed = written.length;
+    advance(60_000);
+    publisher.recordConnectionActivity('socket_opened');
+    await publisher.tick();
+    expect(onBackstop).toHaveBeenCalledWith(expect.any(Number), 3);
+    expect(written).toHaveLength(renewed);
+    publisher.recordAuthenticatedHeartbeat();
+    publisher.recordAuthenticatedHeartbeat();
+    expect(onBackstopCleared).toHaveBeenCalledTimes(1);
+  });
+
+  it('the level survives the restart in a small file, and a missing or damaged file is level 0', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'imcodes-node-backstop-'));
+    temporaryDirs.push(dir);
+    const path = controlledNodeLivenessBackstopStatePath(join(dir, 'install-journal.json'));
+    expect(await readLivenessBackstopLevel(path)).toBe(0);
+    await writeLivenessBackstopLevel(path, 3);
+    expect(await readLivenessBackstopLevel(path)).toBe(3);
+    await writeLivenessBackstopLevel(path, 500);
+    expect(await readLivenessBackstopLevel(path)).toBe(20);
+    await writeFile(path, 'not json');
+    expect(await readLivenessBackstopLevel(path)).toBe(0);
+    await writeFile(path, JSON.stringify({ version: 1, level: -4 }));
+    expect(await readLivenessBackstopLevel(path)).toBe(0);
+    await writeLivenessBackstopLevel(path, 0);
+    await expect(readFile(path, 'utf8')).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
+  it('a server that cannot be reached at all never opens a socket and is never restarted, however long it lasts', async () => {
+    const onBackstop = vi.fn();
+    const { publisher, written, advance } = rig({ onBackstop });
+    for (let elapsed = 0; elapsed < 24 * 3_600_000; elapsed += 15_000) {
+      advance(15_000);
+      publisher.recordConnectionActivity('attempt');
+      await publisher.tick();
+    }
+    expect(onBackstop).not.toHaveBeenCalled();
+    expect(written.length).toBe(24 * 3_600_000 / 15_000);
   });
 
   it('writes the lease file for real, bound to the exact process', async () => {

@@ -85,6 +85,17 @@ describe('previous upgrade outcome (last-upgrade-result.json)', () => {
     });
   });
 
+  it('a preflight failure (nothing was replaced) is reported as a failed install of that exact target, on every start until the node runs it', async () => {
+    const path = await journalWith({ status: 'preflight_failed', phase: 'preflight', targetVersion: TARGET, error: 'staged remote desktop worker artifact set is incomplete', recordedAt: NOW - 1 });
+    expect(await reconcile(path)).toEqual({ targetVersion: TARGET, reason: DAEMON_UPGRADE_BLOCK_REASON.INSTALL_FAILED });
+    expect(await reconcile(path)).toEqual({ targetVersion: TARGET, reason: DAEMON_UPGRADE_BLOCK_REASON.INSTALL_FAILED });
+    // another target later: that is the record now, not this one
+    expect(await readUpgradeResult(path)).toMatchObject({ status: 'preflight_failed' });
+    // the node that finally runs the target repairs the record to success and reports nothing
+    expect(await reconcile(path, TARGET)).toBeNull();
+    expect(await readUpgradeResult(path)).toMatchObject({ status: S.SUCCESS, recordedBy: 'node' });
+  });
+
   it('an in_progress record is inert while a transaction can still be running, and an abandoned one is a failed install', async () => {
     const window = CONTROLLED_NODE_UPGRADE_HEALTH.HARD_CAP_MS + CONTROLLED_NODE_UPGRADE_ROLLBACK_STALL_MS;
     const live = await journalWith({ status: S.IN_PROGRESS, targetVersion: TARGET, recordedAt: NOW - window + 1_000 });
@@ -96,7 +107,6 @@ describe('previous upgrade outcome (last-upgrade-result.json)', () => {
 
   it.each([
     ['success', { status: S.SUCCESS, targetVersion: TARGET }],
-    ['a preflight failure (nothing was replaced)', { status: 'preflight_failed', targetVersion: TARGET }],
     ['an unknown status from a newer build', { status: 'something_new', targetVersion: TARGET, recordedAt: 1 }],
     ['a record without a target', { status: S.ROLLED_BACK }],
     ['a target that is not a version', { status: S.ROLLED_BACK, targetVersion: 'latest; rm -rf /' }],

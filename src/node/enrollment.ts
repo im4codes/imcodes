@@ -19,6 +19,7 @@ import {
   type EnrollmentTrailerRange,
 } from '../../shared/remote-exec.js';
 import { isControlledNodeId } from '../../shared/controlled-node-identity.js';
+import { normalizeControlledNodeEndpointOrigin } from '../../shared/controlled-node-endpoints.js';
 import {
   inspectWindowsAuthenticodeEnrollmentContainer,
   WINDOWS_AUTHENTICODE_ENROLLMENT_OVERHEAD_MAX,
@@ -768,18 +769,12 @@ export function assertProductionServerUrl(serverUrl: string): void {
   allowedEnrollmentServerOrigin(serverUrl);
 }
 
-function isLocalDevelopmentHostname(hostname: string): boolean {
-  const normalized = hostname.toLowerCase();
-  return normalized === 'localhost'
-    || normalized.endsWith('.localhost')
-    || normalized === '127.0.0.1'
-    || normalized === '[::1]';
-}
-
 /**
  * Validate and canonicalize the enrollment server URL to a single trusted
  * origin. Plain HTTP is available only for explicitly-enabled loopback dev
  * servers; credentials, paths, queries, and fragments are never accepted.
+ * The rules themselves live in shared/controlled-node-endpoints.ts (the same
+ * ones the node's alternate-address list and the server's advertised list use).
  */
 export function allowedEnrollmentServerOrigin(serverUrl: string): string {
   let url: URL;
@@ -791,12 +786,11 @@ export function allowedEnrollmentServerOrigin(serverUrl: string): string {
   if (url.username || url.password || url.pathname !== '/' || url.search || url.hash) {
     throw new Error('enrollment_server_url_must_be_origin');
   }
-  const secure = url.protocol === 'https:';
-  const localDev = url.protocol === 'http:'
-    && process.env.IMCODES_NODE_ALLOW_HTTP_ENROLL === '1'
-    && isLocalDevelopmentHostname(url.hostname);
-  if (!secure && !localDev) throw new Error('enrollment_server_url_must_be_https');
-  return url.origin;
+  const origin = normalizeControlledNodeEndpointOrigin(serverUrl, {
+    allowLoopbackHttp: process.env.IMCODES_NODE_ALLOW_HTTP_ENROLL === '1',
+  });
+  if (!origin) throw new Error('enrollment_server_url_must_be_https');
+  return origin;
 }
 
 export function isValidNodeTokenHash(value: string): boolean {

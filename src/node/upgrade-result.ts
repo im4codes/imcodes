@@ -6,6 +6,7 @@ import {
   CONTROLLED_NODE_UPGRADE_RESULT_STATUS,
   CONTROLLED_NODE_UPGRADE_ROLLBACK_STALL_MS,
   CONTROLLED_NODE_UPGRADE_BACKUP_SUFFIX,
+  CONTROLLED_NODE_WINDOWS_UPGRADE_PREFLIGHT_FAILED,
 } from '../../shared/controlled-node-service.js';
 import { DAEMON_UPGRADE_BLOCK_REASON } from '../../shared/daemon-upgrade.js';
 
@@ -86,7 +87,8 @@ const IN_PROGRESS_ABANDONED_MS = CONTROLLED_NODE_UPGRADE_HEALTH.HARD_CAP_MS + CO
  *   instead of staying invisible forever.
  * - `in_progress` that outlived any possible transaction: the script died before
  *   any outcome; the target never got installed.
- * Anything else (`success`, preflight failures, unparseable files, a record still
+ * - `preflight_failed`: nothing was replaced, but that target cannot be installed here: reported like a failed install.
+ * Anything else (`success`, unparseable files, a record still
  * being advanced by a live script) is inert.
  */
 export async function reconcilePreviousUpgrade(input: {
@@ -121,6 +123,11 @@ export async function reconcilePreviousUpgrade(input: {
       return { targetVersion, reason: DAEMON_UPGRADE_BLOCK_REASON.ROLLBACK_FAILED };
     case S.ROLLBACK_INTERRUPTED:
       return { targetVersion, reason: DAEMON_UPGRADE_BLOCK_REASON.ROLLBACK_INTERRUPTED };
+    case CONTROLLED_NODE_WINDOWS_UPGRADE_PREFLIGHT_FAILED:
+      // Nothing was replaced, but the target could not be installed here: tell the server so its backoff for this exact target
+      // does not depend on its own memory (a server restart would otherwise re-offer, and the node re-download, the same
+      // target at once; the staged-worker preflight bug did exactly that every time the node reconnected).
+      return { targetVersion, reason: DAEMON_UPGRADE_BLOCK_REASON.INSTALL_FAILED };
     case S.ROLLBACK_STARTED:
       if (age < CONTROLLED_NODE_UPGRADE_ROLLBACK_STALL_MS) return null;
       await writeUpgradeResult(input.journalPath, {

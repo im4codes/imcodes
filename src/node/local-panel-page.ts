@@ -42,6 +42,7 @@ function pageBody(): string {
 <section class="page" data-page="home" aria-live="off">
 <div class="banner" id="pausedBanner" role="status" hidden>${ICON.pause}<div class="grow"><b data-t="pausedTitle"></b><p data-t="pausedText"></p></div><button class="btn primary" id="resume" type="button" data-t="resume"></button></div>
 <div class="banner offline" id="offlineBanner" role="alert" hidden>${ICON.alert}<div class="grow"><b data-t="offlineTitle"></b><p data-t="offlineText"></p></div></div>
+<div class="banner offline" id="serverBanner" role="status" hidden>${ICON.alert}<div class="grow"><b data-t="serverTitle"></b><p id="serverText"></p></div></div>
 <div class="top" id="topGrid">
 <section class="card hero" aria-labelledby="idLabel">
 <div><p class="eyebrow"><span class="devname" id="deviceName"></span><span class="pill" id="statusPill"><i class="dot"></i><span id="statusText"></span></span></p>
