@@ -127,6 +127,17 @@
     }
   },
   "share": {
+    "cancel_failed": {
+      "title": "No se aplicó la detención",
+      "reason": {
+        "rate_limited": "Demasiadas solicitudes de detención para esta sesión. Espera un minuto e inténtalo de nuevo.",
+        "dispatch_changed": "El turno en curso cambió desde la última vez que lo viste. Pulsa Detener otra vez para detener el actual.",
+        "unsupported": "Los participantes no pueden detener este tipo de sesión.",
+        "role_denied": "Tu rol en este acceso compartido no permite detener.",
+        "access_ended": "Tu acceso a esta sesión ha terminado.",
+        "generic": "No se pudo aplicar la detención. Inténtalo de nuevo."
+      }
+    },
     "menu": {
       "shareTab": "Compartir"
     },

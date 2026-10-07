@@ -73,6 +73,7 @@ vi.mock('../../src/components/SessionControls.js', () => ({
   SessionControls: (props: any) => sessionControlsSpy(props),
 }));
 
+import { takeTrackedShareCancel } from '../../src/share-cancel-feedback.js';
 import { SubSessionCard } from '../../src/components/SubSessionCard.js';
 import type { SubSession } from '../../src/hooks/useSubSessions.js';
 
@@ -625,6 +626,9 @@ describe('SubSessionCard', () => {
     // Stop must not be represented as a chat send.
     expect(ws.sendSessionCommandUrgent).not.toHaveBeenCalledWith('send', expect.objectContaining({ text: '/stop' }));
     expect(ws.sendSessionCommand).not.toHaveBeenCalledWith('send', expect.objectContaining({ text: '/stop' }));
+    // The cancel is registered, so a refusal (rate limit, turn changed...) is reported to the user instead of vanishing.
+    const sentCommandId = (ws.sendSessionCommandUrgent.mock.calls[0]![1] as { commandId: string }).commandId;
+    expect(takeTrackedShareCancel(sentCommandId)).toBe(true);
   });
 
   it('uses SessionControls\' queue-aware Stop instead of a duplicate card Stop in compact mode', async () => {

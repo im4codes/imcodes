@@ -2616,7 +2616,7 @@ describe('WsBridge share-scoped sockets', () => {
     shared.emit('message', JSON.stringify({ type: 'session.cancel', commandId: 'cancel-stale', sessionName: 'deck_proj_brain', observedDispatchId: 'wrong' }));
     await flushAsync();
     expect(shared.sentJson).toEqual(expect.arrayContaining([
-      expect.objectContaining({ type: 'command.failed', commandId: 'cancel-stale', reason: SHARE_REASONS.TARGET_UNAVAILABLE }),
+      expect.objectContaining({ type: 'command.failed', commandId: 'cancel-stale', reason: SHARE_REASONS.DISPATCH_CHANGED, activeDispatchId: 'cmd-active' }),
     ]));
     expect(daemon.sentJson.some((msg) => msg.commandId === 'cancel-stale')).toBe(false);
 

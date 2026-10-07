@@ -127,6 +127,17 @@
     }
   },
   "share": {
+    "cancel_failed": {
+      "title": "停止未生效",
+      "reason": {
+        "rate_limited": "此会话的停止请求过于频繁，请等待一分钟后再试。",
+        "dispatch_changed": "当前运行的轮次已变化，请再点一次停止以停止最新的轮次。",
+        "unsupported": "参与者无法停止这类会话。",
+        "role_denied": "你在此分享中的角色不允许停止。",
+        "access_ended": "你对该会话的访问已结束。",
+        "generic": "停止未能生效，请重试。"
+      }
+    },
     "menu": {
       "shareTab": "共享"
     },

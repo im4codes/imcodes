@@ -23,6 +23,7 @@ import { randomUUID, createHash } from 'node:crypto';
 import type { Database } from '../db/client.js';
 import type { Env } from '../env.js';
 import { MemoryRateLimiter } from './rate-limiter.js';
+import { SHARE_MESSAGE_LANE, SHARE_MESSAGE_LANE_MAX_PENDING, shareBrowserMessageLane, type ShareMessageLane } from './share-lanes.js';
 import { randomHex, sha256Hex } from '../security/crypto.js';
 import { issueSharedMachineAuthorityForSession } from '../share/shared-machine-authority.js';
 import { SHARED_MACHINE_AUTHORITY_FIELD } from '../../../shared/shared-machine-authority.js';
@@ -1968,6 +1969,17 @@ export function __setShareBridgeClockForTests(clock: (() => number) | null): voi
  * snapshot. Shares without an expiry produce no recheck deadline of their own.
  */
 const SHARE_COVERAGE_MAX_STALENESS_MS = 60_000;
+/**
+ * How long a share socket's resolved coverage serves the commands it sends
+ * (keystrokes, resize, stop...) before it is re-read from the DB. Any share
+ * grant change (create, update, revoke, sub-session close) bumps
+ * `shareCoverageEpoch` and so ends every socket's window at once, so a
+ * revocation never waits for this TTL; the TTL only bounds how long a change
+ * that never reached this process can go unseen.
+ */
+const SHARE_HOT_PATH_COVERAGE_TTL_MS = 5_000;
+/** Share-command audit rows that may be waiting to be written; beyond it new ones are dropped and counted. */
+const SHARE_AUDIT_MAX_PENDING = 500;
 
 function capabilityOpaqueId(value: unknown): string | null {
   return typeof value === 'string' && value.trim() && value.length <= 128 ? value : null;
@@ -2246,6 +2258,13 @@ export class WsBridge {
   private upgradeBlockedSyncCompleteGeneration: number | null = null;
   private seenUpgradeBlockedFailures = new Map<string, number>();
   private browserRateLimiter = new MemoryRateLimiter();
+  /** Per share socket, per lane: the tail of the ordered command chain and how many wait in it. */
+  private shareMessageLanes = new WeakMap<WebSocket, Map<ShareMessageLane, { tail: Promise<void>; pending: number }>>();
+  /** Bumped on every share grant change; a socket whose coverage predates it is re-read before its next command. */
+  private shareCoverageEpoch = 0;
+  /** The coverage re-read in progress for a socket; concurrent commands wait on it instead of each querying. */
+  private shareCoverageRefreshes = new WeakMap<WebSocket, Promise<ShareScopedSocketState | null>>();
+  private pendingShareAudits = 0;
   private browserDataReadRateLimiter = new MemoryRateLimiter();
 
   /** browser socket → session name → raw-enabled flag */
@@ -6423,6 +6442,8 @@ export class WsBridge {
   }
 
   async revalidateShareSocketsForUser(userId: string): Promise<void> {
+    // Synchronous, before any await: from here no socket's cached coverage serves a command.
+    this.shareCoverageEpoch += 1;
     // Controlled-node desktop sessions use the same server_shares grant but are
     // not ordinary shared-tab sockets. Revalidate them independently so a
     // Viewer downgrade/revoke ends only that user's peers immediately.
@@ -6548,6 +6569,8 @@ export class WsBridge {
   }
 
   async revalidateShareSocketsForTarget(target: ShareTarget): Promise<void> {
+    // Synchronous, before any await: from here no socket's cached coverage serves a command.
+    this.shareCoverageEpoch += 1;
     const sockets = [...this.browserShareStates]
       .filter(([, state]) => (
         state.target.serverId === target.serverId
@@ -6631,7 +6654,7 @@ export class WsBridge {
       }));
     }
 
-    ws.on('message', async (data) => {
+    const processBrowserMessage = async (data: unknown): Promise<void> => {
       let raw = (data as Buffer).toString();
       if (Buffer.byteLength(raw, 'utf8') > MAX_BROWSER_PAYLOAD) {
         logger.warn({ serverId: this.serverId }, 'Browser message too large — dropped');
@@ -7144,6 +7167,16 @@ export class WsBridge {
         this.trackBrowserConsoleSubscription(ws, msg);
       }
       this.sendToDaemon(raw);
+    };
+    // An owner socket runs each message straight away. A share-scoped socket
+    // is checked against the DB before each command, so its messages go
+    // through per-socket ordered lanes (see scheduleShareBrowserMessage).
+    ws.on('message', (data) => {
+      if (!this.browserShareStates.has(ws)) {
+        void processBrowserMessage(data);
+        return;
+      }
+      this.scheduleShareBrowserMessage(ws, data, processBrowserMessage);
     });
 
     ws.on('close', () => {
@@ -7157,31 +7190,75 @@ export class WsBridge {
     });
   }
 
+  /**
+   * Order a share-scoped socket's commands. Each one awaits a coverage check
+   * (possibly a DB round trip), and unordered awaits let a later keystroke
+   * overtake an earlier one. Messages are therefore chained per socket and per
+   * lane: keyboard input and resize in one lane, every other command in
+   * another, so a slow `session.send` never delays typing and typing never
+   * delays it. Stop, approval answers and pings take no lane at all, so they
+   * are never queued behind anything.
+   */
+  private scheduleShareBrowserMessage(
+    ws: WebSocket,
+    data: unknown,
+    run: (data: unknown) => Promise<void>,
+  ): void {
+    const lane = shareBrowserMessageLane(data);
+    if (lane === SHARE_MESSAGE_LANE.PRIORITY) {
+      void run(data).catch((err) => logger.warn({ err, serverId: this.serverId }, 'Share priority command failed'));
+      return;
+    }
+    let lanes = this.shareMessageLanes.get(ws);
+    if (!lanes) {
+      lanes = new Map();
+      this.shareMessageLanes.set(ws, lanes);
+    }
+    const current = lanes.get(lane) ?? { tail: Promise.resolve(), pending: 0 };
+    if (current.pending >= SHARE_MESSAGE_LANE_MAX_PENDING) {
+      incrementCounter('ws_bridge_share_lane_overflow', { lane });
+      logger.warn({ serverId: this.serverId, lane, pending: current.pending }, 'Share command lane overflow — message dropped');
+      return;
+    }
+    current.pending += 1;
+    current.tail = current.tail
+      .then(() => run(data))
+      .catch((err) => logger.warn({ err, serverId: this.serverId, lane }, 'Share command failed'))
+      .finally(() => { current.pending -= 1; });
+    lanes.set(lane, current);
+  }
+
   private async evaluateShareScopedBrowserCommand(
     ws: WebSocket,
     msg: Record<string, unknown>,
   ): Promise<ShareCommandDecision> {
     const state = this.browserShareStates.get(ws);
     if (!state) return { allowed: true };
-    const coverage = await this.resolveLiveShareCoverage(state);
-    if (!coverage) {
+    // Commands arrive at keystroke rate, so the grant is not re-read from the
+    // DB for each one: the socket's coverage serves them until it is older than
+    // the TTL or a grant changed (epoch). Anything not fresh is re-resolved
+    // from the DB (single flight), and a failed re-resolution denies.
+    const current = this.shareCoverageIsFresh(state)
+      ? state
+      : await this.refreshShareCoverage(ws, state);
+    if (!current) {
       const decision: ShareCommandDecision = {
         allowed: false,
         reason: this.shareStateLooksExpired(state) ? SHARE_REASONS.EXPIRED : SHARE_REASONS.REVOKED,
         closeSocket: true,
       };
-      await this.auditShareScopedBrowserCommand(state, msg, decision);
+      this.queueShareCommandAudit(state, msg, decision);
       return {
         allowed: false,
         reason: decision.reason,
         closeSocket: true,
       };
     }
-    await this.refreshShareActorDisplayName(ws);
-    const refreshedState = this.browserShareStates.get(ws) ?? state;
-    const current = await this.applyShareCoverage(ws, refreshedState, coverage);
     const sessionName = commandSessionName(msg);
-    const runtimeType = sessionName ? await this.resolveSessionRuntimeType(sessionName) : 'unknown';
+    // Only a cancel depends on the runtime type, so a keystroke never waits on it.
+    const runtimeType = sessionName && msg.type === DAEMON_COMMAND_TYPES.SESSION_CANCEL
+      ? await this.resolveSessionRuntimeType(sessionName)
+      : 'unknown';
     const decision = evaluateShareCommand({
       msg,
       state: current,
@@ -7204,7 +7281,7 @@ export class WsBridge {
         : null;
       if (!token) {
         const denied: ShareCommandDecision = { allowed: false, reason: SHARE_REASONS.TARGET_UNAVAILABLE };
-        await this.auditShareScopedBrowserCommand(current, msg, denied);
+        this.queueShareCommandAudit(current, msg, denied);
         return denied;
       }
       decision.stampedMessage = {
@@ -7216,12 +7293,66 @@ export class WsBridge {
       const rateLimitReason = this.evaluateShareScopedRateLimit(current, msg, sessionName, shareClockNow());
       if (rateLimitReason) {
         const rateLimitedDecision: ShareCommandDecision = { allowed: false, reason: rateLimitReason };
-        await this.auditShareScopedBrowserCommand(current, msg, rateLimitedDecision);
+        this.queueShareCommandAudit(current, msg, rateLimitedDecision);
         return rateLimitedDecision;
       }
     }
-    await this.auditShareScopedBrowserCommand(current, msg, decision);
+    this.queueShareCommandAudit(current, msg, decision);
     return decision;
+  }
+
+  private shareCoverageIsFresh(state: ShareScopedSocketState): boolean {
+    if (state.coverageEpoch !== this.shareCoverageEpoch) return false;
+    const checkedAt = state.coverageCheckedAt;
+    if (checkedAt === undefined) return false;
+    const now = shareClockNow();
+    // A clock that went backwards never extends the window.
+    if (now < checkedAt || now - checkedAt >= SHARE_HOT_PATH_COVERAGE_TTL_MS) return false;
+    // A grant with an expiry stops serving commands at it, whatever the TTL.
+    const expiresAt = state.snapshot.nextCoverageRecheckAt;
+    return !(typeof expiresAt === 'number' && now >= expiresAt);
+  }
+
+  /**
+   * Re-read a share socket's coverage from the DB (one read in flight per socket;
+   * a command that arrives meanwhile waits for it). Resolves to the new state, or
+   * null when the grant is gone, so every failure path denies.
+   */
+  private refreshShareCoverage(ws: WebSocket, state: ShareScopedSocketState): Promise<ShareScopedSocketState | null> {
+    const inFlight = this.shareCoverageRefreshes.get(ws);
+    if (inFlight) return inFlight;
+    const epoch = this.shareCoverageEpoch;
+    const run = (async (): Promise<ShareScopedSocketState | null> => {
+      const coverage = await this.resolveLiveShareCoverage(state);
+      if (!coverage) return null;
+      await this.refreshShareActorDisplayName(ws);
+      const refreshedState = this.browserShareStates.get(ws) ?? state;
+      return this.applyShareCoverage(ws, refreshedState, coverage, epoch);
+    })().finally(() => { this.shareCoverageRefreshes.delete(ws); });
+    this.shareCoverageRefreshes.set(ws, run);
+    return run;
+  }
+
+  /**
+   * Write a share-command audit row without holding the command back. The queue
+   * is bounded: past SHARE_AUDIT_MAX_PENDING waiting writes (a slow or failing
+   * DB) further rows are dropped, counted and logged rather than piling up.
+   * A failed write is logged by auditShareScopedBrowserCommand.
+   */
+  private queueShareCommandAudit(
+    state: ShareScopedSocketState,
+    msg: Record<string, unknown>,
+    decision: ShareCommandDecision,
+  ): void {
+    if (this.pendingShareAudits >= SHARE_AUDIT_MAX_PENDING) {
+      incrementCounter('ws_bridge_share_audit_dropped', { reason: 'queue_full' });
+      logger.warn({ serverId: this.serverId, pending: this.pendingShareAudits }, 'Share command audit queue full — audit row dropped');
+      return;
+    }
+    this.pendingShareAudits += 1;
+    void this.auditShareScopedBrowserCommand(state, msg, decision)
+      .catch((err) => logger.warn({ err, serverId: this.serverId }, 'Share command audit failed'))
+      .finally(() => { this.pendingShareAudits -= 1; });
   }
 
   private async handleShareDiscussionCommentCommand(ws: WebSocket, msg: Record<string, unknown>): Promise<void> {
@@ -7440,7 +7571,12 @@ export class WsBridge {
     const sessionName = commandSessionName(msg);
     const commandId = typeof msg.commandId === 'string' ? msg.commandId.trim() : '';
     if ((msg.type === 'session.send' || msg.type === DAEMON_COMMAND_TYPES.SESSION_CANCEL) && commandId && sessionName) {
-      this.emitCommandFailed(ws, commandId, sessionName, reason);
+      // A cancel refused because the turn changed names the turn that is running now,
+      // so the participant's browser can show it and tap Stop again on the right one.
+      const extra = msg.type === DAEMON_COMMAND_TYPES.SESSION_CANCEL && reason === SHARE_REASONS.DISPATCH_CHANGED
+        ? { activeDispatchId: this.activeDispatchIds.get(sessionName) ?? null }
+        : {};
+      this.emitCommandFailed(ws, commandId, sessionName, reason, extra);
       return;
     }
     if (commandId) {
@@ -7482,6 +7618,7 @@ export class WsBridge {
     ws: WebSocket,
     state: ShareScopedSocketState,
     coverage: EffectiveCoverage,
+    epoch: number = this.shareCoverageEpoch,
   ): Promise<ShareScopedSocketState> {
     const effectiveTarget = coverage.serverParticipantAuthority === true
       ? { kind: 'server' as const, serverId: coverage.target.serverId }
@@ -7501,6 +7638,7 @@ export class WsBridge {
       }));
     }
     next.coverageCheckedAt = shareClockNow();
+    next.coverageEpoch = epoch;
     this.browserShareStates.set(ws, next);
     return next;
   }
@@ -7561,6 +7699,7 @@ export class WsBridge {
     // let the staleness bound in sweepShareSockets retry within a minute,
     // rather than leaving the socket un-revalidated with no second chance.
     let coverage: EffectiveCoverage | null;
+    const epoch = this.shareCoverageEpoch;
     try {
       coverage = await this.resolveLiveShareCoverage(state);
     } catch (err) {
@@ -7571,7 +7710,7 @@ export class WsBridge {
       this.teardownShareSocket(ws, this.shareStateLooksExpired(state) ? SHARE_REASONS.EXPIRED : SHARE_REASONS.REVOKED);
       return;
     }
-    await this.applyShareCoverage(ws, state, coverage);
+    await this.applyShareCoverage(ws, state, coverage, epoch);
   }
 
   private async sweepShareSockets(): Promise<void> {
@@ -10301,6 +10440,7 @@ export class WsBridge {
     commandId: string,
     sessionName: string,
     reason: AckFailureReason | ShareReason,
+    extra: Record<string, unknown> = {},
   ): void {
     const payload = {
       type: MSG_COMMAND_FAILED,
@@ -10308,6 +10448,7 @@ export class WsBridge {
       session: sessionName,
       reason,
       retryable: true,
+      ...extra,
     };
     try {
       if (browser.readyState === WebSocket.OPEN) {

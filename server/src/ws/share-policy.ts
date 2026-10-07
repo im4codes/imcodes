@@ -13,6 +13,7 @@ import {
   isSharedServerParticipant,
   rawSubSessionIdFromDisplayName,
   getShareScopedCommandPolicy,
+  shareCancelDispatchDenial,
   shareTargetKey,
   type EffectiveCoverage,
   type ShareAuthorizationSnapshot,
@@ -57,6 +58,7 @@ export type ShareReason = Extract<
   | 'share-role-changed'
   | 'share-ticket-invalid'
   | 'share-cancel-unsupported'
+  | 'share-dispatch-changed'
   | 'share-comment-invalid'
 >;
 
@@ -72,6 +74,8 @@ export type ShareScopedSocketState = {
   coveredSessionNames?: readonly string[];
   /** When coverage was last re-resolved from the DB; bounds snapshot staleness. */
   coverageCheckedAt?: number;
+  /** The bridge's share-change epoch when `snapshot` was read; an older value means a grant changed since. */
+  coverageEpoch?: number;
 };
 
 export type ShareCoverageResolver = (input: {
@@ -126,6 +130,7 @@ export const SHARE_REASONS = {
   ROLE_CHANGED: 'share-role-changed',
   TICKET_INVALID: 'share-ticket-invalid',
   CANCEL_UNSUPPORTED: 'share-cancel-unsupported',
+  DISPATCH_CHANGED: 'share-dispatch-changed',
   COMMENT_INVALID: 'share-comment-invalid',
 } as const satisfies Record<string, ShareReason>;
 
@@ -755,9 +760,8 @@ export function evaluateShareCommand(input: {
     return { allowed: false, reason: SHARE_REASONS.CANCEL_UNSUPPORTED };
   }
   const observedDispatchId = typeof input.msg.observedDispatchId === 'string' ? input.msg.observedDispatchId.trim() : '';
-  if (!observedDispatchId || !input.activeDispatchId || observedDispatchId !== input.activeDispatchId) {
-    return { allowed: false, reason: SHARE_REASONS.TARGET_UNAVAILABLE };
-  }
+  const dispatchDenial = shareCancelDispatchDenial(observedDispatchId, input.activeDispatchId);
+  if (dispatchDenial) return { allowed: false, reason: SHARE_REASONS.DISPATCH_CHANGED };
   const actionId = typeof input.msg.actionId === 'string' && input.msg.actionId.trim()
     ? input.msg.actionId.trim()
     : typeof input.msg.commandId === 'string' && input.msg.commandId.trim()

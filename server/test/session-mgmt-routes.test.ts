@@ -1860,7 +1860,7 @@ describe('session-mgmt persistence routes', () => {
     expect(sendToDaemonMock).not.toHaveBeenCalled();
   });
 
-  it('POST /session/cancel rejects shared transport cancel without observedDispatchId', async () => {
+  it('POST /session/cancel relays a shared transport cancel when the server knows no running dispatch (turn started outside the bridge)', async () => {
     mockResolveServerRole.mockResolvedValue('none');
     mockResolveHttpShareAccess.mockResolvedValue({
       membership: 'none',
@@ -1879,6 +1879,39 @@ describe('session-mgmt persistence routes', () => {
       },
     });
     mockDbQueryOne.mockResolvedValue({ runtime_type: 'transport' });
+    getActiveDispatchIdForSessionMock.mockReturnValue(null);
+    const app = await buildApp();
+
+    const res = await app.request('/api/server/srv-1/session/cancel', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sessionName: 'deck_proj_brain', commandId: 'cancel-queued-turn' }),
+    });
+
+    expect(res.status).toBe(200);
+    expect(sendToDaemonMock).toHaveBeenCalled();
+  });
+
+  it('POST /session/cancel rejects shared transport cancel without observedDispatchId while a dispatch is running, naming it', async () => {
+    mockResolveServerRole.mockResolvedValue('none');
+    mockResolveHttpShareAccess.mockResolvedValue({
+      membership: 'none',
+      actor: {
+        kind: 'share',
+        effectiveActorRole: 'participant',
+        coverage: {
+          target: { kind: 'main', serverId: 'srv-1', sessionName: 'deck_proj_brain' },
+          effectiveRole: 'participant',
+          historyCutoffAt: 1_000,
+          nextCoverageRecheckAt: null,
+          coveringShareIds: ['share-1'],
+          primaryShareId: 'share-1',
+          authorizedAt: 2_000,
+        },
+      },
+    });
+    mockDbQueryOne.mockResolvedValue({ runtime_type: 'transport' });
+    getActiveDispatchIdForSessionMock.mockReturnValue('dispatch-current');
     const app = await buildApp();
 
     const res = await app.request('/api/server/srv-1/session/cancel', {
@@ -1891,7 +1924,7 @@ describe('session-mgmt persistence routes', () => {
     });
 
     expect(res.status).toBe(409);
-    await expect(res.json()).resolves.toEqual({ error: 'not_canceled', reason: 'share-target-unavailable' });
+    await expect(res.json()).resolves.toEqual({ error: 'not_canceled', reason: 'share-dispatch-changed', activeDispatchId: 'dispatch-current' });
     expect(sendToDaemonMock).not.toHaveBeenCalled();
   });
 
@@ -1928,7 +1961,7 @@ describe('session-mgmt persistence routes', () => {
     });
 
     expect(res.status).toBe(409);
-    await expect(res.json()).resolves.toEqual({ error: 'not_canceled', reason: 'share-target-unavailable' });
+    await expect(res.json()).resolves.toEqual({ error: 'not_canceled', reason: 'share-dispatch-changed', activeDispatchId: 'dispatch-current' });
     expect(sendToDaemonMock).not.toHaveBeenCalled();
     expect(mockDbExecute).toHaveBeenCalled();
   });

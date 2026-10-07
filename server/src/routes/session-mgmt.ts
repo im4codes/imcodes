@@ -61,7 +61,7 @@ import {
   type SessionGroupCloneErrorCode,
 } from '../../../shared/session-group-clone.js';
 import { GIT_REMOTE_CLONE_CAPABILITY_V1 } from '../../../shared/git-remote-url.js';
-import type { SharedActorEnvelope } from '../../../shared/tab-sharing.js';
+import { shareCancelDispatchDenial, type SharedActorEnvelope } from '../../../shared/tab-sharing.js';
 import { SHARED_MACHINE_AUTHORITY_FIELD } from '../../../shared/shared-machine-authority.js';
 import { issueSharedMachineAuthorityForSession } from '../share/shared-machine-authority.js';
 import {
@@ -1070,10 +1070,6 @@ sessionMgmtRoutes.post('/:id/session/cancel', async (c) => {
         return c.json({ error: 'forbidden', reason: 'share-role-denied' }, 403);
       }
       const observedDispatchId = typeof body.observedDispatchId === 'string' ? body.observedDispatchId.trim() : '';
-      if (!observedDispatchId) {
-        await auditHttpShareCommand(c, { userId, target, coverage: access.actor.coverage, actionType: 'session.cancel', decision: 'rejected', reason: 'share-target-unavailable', actionId, now });
-        return c.json({ error: 'not_canceled', reason: 'share-target-unavailable' }, 409);
-      }
       const runtimeType = await getTrustedRuntimeType(c.env.DB, serverId, target);
       if (runtimeType !== 'transport') {
         await auditHttpShareCommand(c, { userId, target, coverage: access.actor.coverage, actionType: 'session.cancel', decision: 'rejected', reason: 'share-cancel-unsupported', actionId, now });
@@ -1081,9 +1077,10 @@ sessionMgmtRoutes.post('/:id/session/cancel', async (c) => {
       }
       const bridge = WsBridge.get(serverId);
       const activeDispatchId = bridge.getActiveDispatchIdForSession(targetSessionName ?? '');
-      if (!activeDispatchId || activeDispatchId !== observedDispatchId) {
-        await auditHttpShareCommand(c, { userId, target, coverage: access.actor.coverage, actionType: 'session.cancel', decision: 'rejected', reason: 'share-target-unavailable', actionId, now });
-        return c.json({ error: 'not_canceled', reason: 'share-target-unavailable' }, 409);
+      const dispatchDenial = shareCancelDispatchDenial(observedDispatchId, activeDispatchId);
+      if (dispatchDenial) {
+        await auditHttpShareCommand(c, { userId, target, coverage: access.actor.coverage, actionType: 'session.cancel', decision: 'rejected', reason: dispatchDenial, actionId, now });
+        return c.json({ error: 'not_canceled', reason: dispatchDenial, activeDispatchId }, 409);
       }
       const rateLimitReason = evaluateHttpShareRateLimit({ bridge, userId, serverId, sessionName: targetSessionName ?? '', commandType: DAEMON_COMMAND_TYPES.SESSION_CANCEL, now });
       if (rateLimitReason) {

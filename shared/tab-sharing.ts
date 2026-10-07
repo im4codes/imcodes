@@ -87,11 +87,29 @@ export const SHARE_DENIAL_REASONS = [
   'share-role-changed',
   'share-ticket-invalid',
   'share-cancel-unsupported',
+  /** A cancel named a turn other than the one the server knows is running. */
+  'share-dispatch-changed',
   'share-audit-duplicate',
   'share-comment-invalid',
 ] as const;
 
 export type ShareDenialReason = (typeof SHARE_DENIAL_REASONS)[number];
+
+/**
+ * A shared participant's cancel names the turn they saw (`observedDispatchId`)
+ * so it cannot stop a different, newer one. It is refused only when the server
+ * positively knows a running turn that is not the one named. When the server
+ * knows none (the turn was started by a queue drain, a pair/agent send or cron,
+ * none of which pass through the bridge) there is nothing to disagree with, so
+ * the stop goes through instead of failing for a turn nobody could observe.
+ */
+export function shareCancelDispatchDenial(
+  observedDispatchId: string | null | undefined,
+  activeDispatchId: string | null | undefined,
+): 'share-dispatch-changed' | null {
+  if (!activeDispatchId) return null;
+  return (observedDispatchId ?? '').trim() === activeDispatchId ? null : 'share-dispatch-changed';
+}
 
 export const SHARE_ROLE_ORDER: Record<ShareRole, number> = {
   viewer: 1,

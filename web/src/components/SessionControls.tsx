@@ -74,6 +74,7 @@ import { useSupervisorDefaults } from '../hooks/useSupervisorDefaults.js';
 import { PREF_KEY_P2P_COMBO_CONFIRM_SKIP, PREF_KEY_P2P_DROPDOWN_TAB, p2pSessionConfigLegacyPrefKeys, p2pSessionConfigPrefKey } from '../constants/prefs.js';
 import { parseP2pSavedConfig, serializeP2pSavedConfig } from '../preferences/p2p-config-pref.js';
 import { sendSessionViaHttp, cancelSessionViaHttp, deleteAttachment } from '../api.js';
+import { notifyShareCancelFailure, shareCancelFailureFromHttpError, trackShareCancelCommand } from '../share-cancel-feedback.js';
 import { ComposerAttachmentBadge } from './ComposerAttachmentBadge.js';
 import { forgetAttachmentPreview, rememberAttachmentPreview } from '../attachment-preview-cache.js';
 import { safeSessionStorageGetItem, safeSessionStorageRemoveItem, safeSessionStorageSetItem } from '../local-storage-quota.js';
@@ -4081,6 +4082,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
 
   const cancelActiveTransportTurn = useCallback((commandId = makeCommandId()): string | null => {
     if (!activeSession) return null;
+    trackShareCancelCommand(commandId);
     const payload = {
       sessionName: activeSession.name,
       commandId,
@@ -4089,6 +4091,8 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     if (!ws) {
       if (!serverId) return null;
       void cancelSessionViaHttp(serverId, payload).catch((fallbackErr) => {
+        const refusal = shareCancelFailureFromHttpError(fallbackErr);
+        if (refusal) notifyShareCancelFailure({ ...refusal, session: activeSession.name });
         console.warn('session.cancel HTTP fallback failed', fallbackErr);
       });
       requestActiveTimelineRefreshAfterUserAction();
@@ -4100,6 +4104,8 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     } catch (err) {
       if (!serverId) throw err;
       void cancelSessionViaHttp(serverId, payload).catch((fallbackErr) => {
+        const refusal = shareCancelFailureFromHttpError(fallbackErr);
+        if (refusal) notifyShareCancelFailure({ ...refusal, session: activeSession.name });
         console.warn('session.cancel HTTP fallback failed', fallbackErr);
       });
       requestActiveTimelineRefreshAfterUserAction();

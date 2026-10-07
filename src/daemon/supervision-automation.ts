@@ -1,5 +1,5 @@
 import { CHAT_MESSAGE_ORIGINS } from '../../shared/chat-message-origin.js';
-import { isPairsEngineProject, isPairsEngineSession, isSessionCoveredByPairHeartbeat, isTaskPairEngineActive } from './task-pairs/engine.js';
+import { isLegacySupervisionInertProject, isPairsEngineProject, isPairsEngineSession, isSessionCoveredByPairHeartbeat } from './task-pairs/engine.js';
 import { readFile, readdir, stat } from 'node:fs/promises';
 import path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
@@ -270,6 +270,8 @@ const IMPLEMENTATION_REMINDER_MAX_BACKOFF_MS = 60 * 60_000;
 /** Four quiet continuations span 80 minutes with the exponential schedule. */
 const IMPLEMENTATION_CONTINUATION_ATTEMPT_LIMIT = 4;
 const IMPLEMENTATION_WATCHDOG_TICK_MS = 60_000;
+/** A convergence pass at least this long is logged, naming itself as the cause of the stall. */
+const SUPERVISION_SLOW_TICK_LOG_MS = 500;
 
 function implementationActivitySignal(event: TimelineEvent):
   SupervisionImplementationActivitySignal | undefined {
@@ -1698,8 +1700,14 @@ class SupervisionAutomation {
     // or a parent can consume a slice's delivery evidence, at any time.
     // Convergence is called directly (the registry is already in hand) so it
     // cannot be silently skipped if the send path fails to load.
+    const convergenceStartedAt = Date.now();
     try {
       await registry.convergeLifecycle(now, {
+        // Same scope as the watchdog loop below and the send-path tick: a project
+        // on the pairs engine (or with no engine) never has its legacy tasks
+        // scanned. Without this, every minute walked every live legacy task of a
+        // pairs project -- ~2.7 s of synchronous SQLite reads on the main thread.
+        skipProject: isLegacySupervisionInertProject,
         // Production wiring: a stale coordinator epoch is repaired against the
         // daemon's own live session registry, with no model or heartbeat.
         resolveAuthoritativeBrain: (projectName, sessionName) => resolveAuthoritativeBrainIdentity(
@@ -1719,6 +1727,12 @@ class SupervisionAutomation {
     } catch (error) {
       logger.warn({ err: error }, 'Supervision lifecycle convergence failed');
     }
+    const convergenceMs = Date.now() - convergenceStartedAt;
+    if (convergenceMs >= SUPERVISION_SLOW_TICK_LOG_MS) {
+      // Name the cause: a stall that nothing labels shows up as an anonymous
+      // `daemon-main-loop` drift, which is how this one stayed hidden.
+      logger.warn({ convergenceMs }, 'Supervision lifecycle convergence tick is slow (it blocks the daemon main thread between awaits)');
+    }
     // The audit re-dispatch needs the send path, which is loaded lazily to keep
     // this module free of a static send-tool dependency. It is itself
     // re-entrancy guarded, so a slow dispatch never overlaps the next tick.
@@ -1733,7 +1747,7 @@ class SupervisionAutomation {
       // too: it must not fall through into this legacy watchdog just because
       // it isn't `pairs`, or the daemon nudges/escalates over a task the
       // project's own workflow is already covering.
-      if (isPairsEngineProject(task.projectName) || !isTaskPairEngineActive(task.projectName)) continue;
+      if (isLegacySupervisionInertProject(task.projectName)) continue;
       const events = registry.listEvents(task.taskId);
       for (const assignment of task.assignments) {
         const watchdogKind = assignment.role === 'implementer'

@@ -295,7 +295,8 @@ import { installNativeAppResumeRefresh } from './app-resume-refresh.js';
 import { resumeDirectFileTransfers } from './direct-file-transfer.js';
 import { isImeComposingKeyEvent } from './ime-keyboard.js';
 import { markServerDaemonActivity, markServerOffline, touchServerHeartbeat } from './server-online-state.js';
-import { MSG_DAEMON_ONLINE, MSG_DAEMON_OFFLINE } from '@shared/ack-protocol.js';
+import { MSG_DAEMON_ONLINE, MSG_DAEMON_OFFLINE, MSG_COMMAND_FAILED } from '@shared/ack-protocol.js';
+import { SHARE_CANCEL_FAILED_EVENT, notifyShareCancelFailure, shareCancelFailureReasonKey, takeTrackedShareCancel, type ShareCancelFailure } from './share-cancel-feedback.js';
 import {
   REMOTE_DESKTOP_LOCAL_MANAGEMENT,
   REMOTE_DESKTOP_LOCAL_WEB_ACTION,
@@ -3136,6 +3137,28 @@ export function App() {
     setTimeout(() => setToasts((prev) => prev.filter((x) => x.id !== id)), 8000);
   }, []);
 
+  // A shared participant's Stop was refused: say why, and when the cause is that
+  // the turn changed, adopt the running turn so the next tap names the right one.
+  useEffect(() => {
+    const onShareCancelFailed = (event: Event) => {
+      const failure = (event as CustomEvent<ShareCancelFailure>).detail;
+      const t = transRef.current;
+      if (failure.session && failure.activeDispatchId) {
+        const { session, activeDispatchId } = failure;
+        setSharedActiveDispatchIds((previous) => new Map(previous).set(session, activeDispatchId));
+      }
+      const id = Date.now() + Math.random();
+      setToasts((prev) => [...prev, {
+        id, sessionName: '', project: '', kind: 'notification',
+        title: t('share.cancel_failed.title'),
+        message: t(`share.cancel_failed.reason.${shareCancelFailureReasonKey(failure.reason)}`),
+      }]);
+      setTimeout(() => setToasts((prev) => prev.filter((x) => x.id !== id)), 8000);
+    };
+    window.addEventListener(SHARE_CANCEL_FAILED_EVENT, onShareCancelFailed);
+    return () => window.removeEventListener(SHARE_CANCEL_FAILED_EVENT, onShareCancelFailed);
+  }, []);
+
   // App owns the optimistic launch state and mints the requestId so the
   // pending card is inserted BEFORE the (synchronously-throwing) send.
   const handleStartDiscussion = useCallback((payload: {
@@ -4899,6 +4922,11 @@ export function App() {
           }]);
           setTimeout(() => setToasts((prev) => prev.filter((x) => x.id !== id)), 8000);
         }
+      }
+      // A refused Stop must never look like nothing happened (shared participants:
+      // rate limit, the turn changed, access ended...).
+      if (msg.type === MSG_COMMAND_FAILED && takeTrackedShareCancel(msg.commandId)) {
+        notifyShareCancelFailure({ reason: msg.reason, activeDispatchId: msg.activeDispatchId, session: msg.session });
       }
       if (msg.type === 'command.ack' && selectedShareTarget) {
         setSharedActiveDispatchIds((previous) => {

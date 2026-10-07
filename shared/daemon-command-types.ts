@@ -2,6 +2,10 @@ export const DAEMON_COMMAND_TYPES = {
   DAEMON_UPGRADE: 'daemon.upgrade',
   SERVER_DELETE: 'server.delete',
   SESSION_CANCEL: 'session.cancel',
+  /** Browser → daemon: raw keyboard input for a terminal session. */
+  SESSION_INPUT: 'session.input',
+  /** Browser → daemon: terminal viewport resize. */
+  SESSION_RESIZE: 'session.resize',
   SESSION_EXECUTION_CLONES: 'session.execution_clones',
   SESSION_UPDATE_TRANSPORT_CONFIG: 'session.update_transport_config',
   /** Browser/server → daemon: fetch online identity profiles and refresh live runtimes. */

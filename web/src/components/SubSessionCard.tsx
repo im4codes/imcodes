@@ -16,6 +16,7 @@ import { TerminalView } from './TerminalView.js';
 import { TerminalTextPreview } from './TerminalTextPreview.js';
 import { requestActiveTimelineRefreshAfterUserAction, useTimeline } from '../hooks/useTimeline.js';
 import { cancelSessionViaHttp } from '../api.js';
+import { notifyShareCancelFailure, shareCancelFailureFromHttpError, trackShareCancelCommand } from '../share-cancel-feedback.js';
 import type { WsClient } from '../ws-client.js';
 import type { TerminalDiff } from '../types.js';
 import type { SubSession } from '../hooks/useSubSessions.js';
@@ -321,6 +322,7 @@ function SubSessionCardImpl({ sub, ws, connected, isOpen, isFocused, idleFlashTo
       commandId: globalThis.crypto?.randomUUID?.() ?? `cancel-${Date.now()}-${Math.random().toString(16).slice(2)}`,
       ...(sharedState?.activeDispatchId ? { observedDispatchId: sharedState.activeDispatchId } : {}),
     };
+    trackShareCancelCommand(payload.commandId);
     let wsThrown: unknown = null;
     if (ws) {
       try {
@@ -333,6 +335,8 @@ function SubSessionCardImpl({ sub, ws, connected, isOpen, isFocused, idleFlashTo
     }
     if (serverId) {
       void cancelSessionViaHttp(serverId, payload).catch((httpErr) => {
+        const refusal = shareCancelFailureFromHttpError(httpErr);
+        if (refusal) notifyShareCancelFailure({ ...refusal, session: sub.sessionName });
         // eslint-disable-next-line no-console
         console.warn('handleTransportStop: WS + HTTP both failed', { wsThrown, httpErr });
       });

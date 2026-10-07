@@ -11001,6 +11001,12 @@ export class SupervisionTaskRegistry {
     for (const candidateId of this.#listConvergenceCandidateIds(limit * 4)) {
       if (actions.length >= limit || scanned >= limit * 4) break;
       scanned += 1;
+      // Each candidate runs synchronous SQLite reads (several steps, each parsing
+      // the task's whole event log). Awaiting only microtasks lets the whole pass
+      // run back to back, so on a large history it held the daemon main thread for
+      // seconds -- Stop and keystrokes queued behind it. A macrotask turn between
+      // candidates lets the loop serve pending I/O after each one.
+      await new Promise<void>((resolve) => setImmediate(resolve));
       const task = this.getTaskRecord(candidateId);
       // A terminal task (pushed/finalized/blocked/cancelled) is never advanced:
       // `blocked` in particular is an operator decision, not a derivable fact.

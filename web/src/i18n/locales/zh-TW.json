@@ -127,6 +127,17 @@
     }
   },
   "share": {
+    "cancel_failed": {
+      "title": "停止未生效",
+      "reason": {
+        "rate_limited": "此工作階段的停止請求過於頻繁，請等待一分鐘後再試。",
+        "dispatch_changed": "目前執行的輪次已變更，請再點一次停止以停止最新的輪次。",
+        "unsupported": "參與者無法停止這類工作階段。",
+        "role_denied": "你在此分享中的角色不允許停止。",
+        "access_ended": "你對該工作階段的存取已結束。",
+        "generic": "停止未能生效，請重試。"
+      }
+    },
     "menu": {
       "shareTab": "分享"
     },

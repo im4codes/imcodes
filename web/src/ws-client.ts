@@ -30,7 +30,7 @@ import { TERMINAL_CONTROL } from '@shared/terminal-protocol.js';
 import { CLAUDE_QUOTA_MSG } from '@shared/claude-quota.js';
 import { CODEX_RESET_CREDITS_MSG, type CodexResetCredit, type CodexConsumeOutcome } from '@shared/codex-reset-credits.js';
 import { CODEX_CREDIT_HISTORY_MSG, type CodexCreditSnapshot } from '@shared/codex-credit-history.js';
-import type { SharedActorEnvelope } from '@shared/tab-sharing.js';
+import type { ShareDenialReason, SharedActorEnvelope } from '@shared/tab-sharing.js';
 import type { ShareTarget } from './tab-sharing-ui.js';
 import {
   SESSION_GROUP_CLONE_MSG,
@@ -246,7 +246,7 @@ export type ServerMessage =
   | { type: typeof PEER_AUDIT_MESSAGES.CANDIDATES; commandId: string; ok: boolean; list?: import('../../shared/peer-audit.js').PeerAuditCandidateList; error?: string }
   | { type: typeof PEER_AUDIT_MESSAGES.QUICK_RESULT; commandId: string; ok: boolean; attemptId?: string; resultEventId?: string; error?: string }
   | { type: typeof PEER_AUDIT_MESSAGES.CANCEL_RESULT; commandId: string; ok: boolean; error?: string }
-  | { type: typeof MSG_COMMAND_FAILED; commandId: string; session: string; reason: AckFailureReason; retryable: boolean }
+  | { type: typeof MSG_COMMAND_FAILED; commandId: string; session: string; reason: AckFailureReason | ShareDenialReason; retryable: boolean; /** Set when a shared participant's cancel was refused because the turn changed. */ activeDispatchId?: string | null }
   | { type: typeof MSG_DAEMON_ONLINE }
   | { type: typeof MSG_DAEMON_OFFLINE }
   | { type: 'error'; message: string }

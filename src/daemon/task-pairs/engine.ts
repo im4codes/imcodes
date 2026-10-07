@@ -133,6 +133,18 @@ export function isTaskPairEngineActive(project: string | undefined): boolean {
   return !!project && resolveTaskPairEngineState(project) !== 'off';
 }
 
+/**
+ * True when the LEGACY supervision automation (watchdogs, lifecycle convergence,
+ * audit re-dispatch) must leave `project` alone: the pairs engine owns it, or
+ * neither engine is active. One predicate for every legacy periodic pass, so a
+ * pass can not scan a project the others skip -- a minute-by-minute convergence
+ * scan of a pairs project's leftover legacy tasks once froze the daemon main
+ * thread for ~2.7 s every 60 s on a machine with a large supervision history.
+ */
+export function isLegacySupervisionInertProject(project: string | undefined): boolean {
+  return isPairsEngineProject(project) || !isTaskPairEngineActive(project);
+}
+
 /** Session-scoped counterpart of {@link isTaskPairEngineActive}. */
 export function isTaskPairEngineActiveForSession(sessionName: string): boolean {
   return isTaskPairEngineActive(projectOfSession(sessionName));

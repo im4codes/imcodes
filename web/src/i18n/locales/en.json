@@ -127,6 +127,17 @@
     }
   },
   "share": {
+    "cancel_failed": {
+      "title": "Stop was not applied",
+      "reason": {
+        "rate_limited": "Too many Stop requests for this session. Wait a minute and try again.",
+        "dispatch_changed": "The running turn changed since you last looked. Tap Stop again to stop the current one.",
+        "unsupported": "Participants cannot stop this kind of session.",
+        "role_denied": "Your role on this share does not allow stopping.",
+        "access_ended": "Your access to this session has ended.",
+        "generic": "Stop could not be applied. Try again."
+      }
+    },
     "menu": {
       "shareTab": "Share"
     },
