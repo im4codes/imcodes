@@ -108,8 +108,11 @@ export class ControlledNodeConnectionTracker {
     this.deps.selector?.recordFailure(event.reason);
   }
 
-  /** The server acknowledged this node (an authenticated heartbeat ack). */
-  onAuthenticatedAck(message: Record<string, unknown>): void {
+  /**
+   * The server acknowledged this node (an authenticated heartbeat ack). Returns false when the ack is for another server ID: the
+   * caller must then not treat the connection as authenticated and must drop the socket.
+   */
+  onAuthenticatedAck(message: Record<string, unknown>): boolean {
     // The ack names the server ID it is for (controlled nodes with a public ID). Another ID means this address belongs to a
     // different deployment: it is not used again for a day (never the enrolled address), and the ack counts for nothing.
     const ackedServerId = message[CONTROLLED_NODE_ACK_SERVER_ID_FIELD];
@@ -120,7 +123,7 @@ export class ControlledNodeConnectionTracker {
       this.since ??= this.now();
       this.failureClass = CONTROLLED_NODE_FAILURE_CLASS.REJECTED;
       this.deps.selector?.recordRejected('server_id_mismatch');
-      return;
+      return false;
     }
     this.authenticatedOnThisSocket = true;
     this.connected = true;
@@ -133,6 +136,7 @@ export class ControlledNodeConnectionTracker {
     this.deps.selector?.recordSuccess();
     const advertised = message[CONTROLLED_NODE_ACK_SERVER_URLS_FIELD];
     if (Array.isArray(advertised)) this.deps.selector?.setAdvertised(advertised as string[]);
+    return true;
   }
 
   status(): ControlledNodeConnectionStatus {

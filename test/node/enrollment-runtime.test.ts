@@ -485,6 +485,37 @@ describe('controlled node enrollment and runtime', () => {
     }
   });
 
+  it('an ack that names another server ID authenticates nothing: no lease, no healthy service, the socket is dropped and the address is not used again', async () => {
+    vi.useFakeTimers();
+    try {
+      const urls: string[] = [];
+      const sockets: MockSocket[] = [];
+      const { ControlledNodeEndpointSelector, emptyEndpointState } = await import('../../src/node/server-endpoints.js');
+      const endpoints = new ControlledNodeEndpointSelector('https://im.example', { ...emptyEndpointState(), advertised: ['https://proxy.example'] });
+      const onAuthenticated = vi.fn();
+      const onHeartbeatAck = vi.fn();
+      const runtime = createControlledNodeRuntime({
+        serverUrl: 'https://im.example', serverId: 'mismatch-1', token: 'secret', nodeRole: NODE_ROLE.CONTROLLED,
+      }, (url) => { urls.push(url); const socket = new MockSocket(); sockets.push(socket); return socket; }, { endpoints, onAuthenticated, onHeartbeatAck });
+      runtime.start();
+      for (let guard = 0; guard < 40 && urls.length < 4; guard += 1) await vi.advanceTimersByTimeAsync(5_000);
+      expect(urls[3]).toContain('proxy.example');
+      const alternate = sockets[3]!;
+      alternate.open();
+      alternate.emit('message', JSON.stringify({ type: 'heartbeat_ack', serverId: 'a-different-server' }));
+      expect(onAuthenticated).not.toHaveBeenCalled();
+      expect(onHeartbeatAck).not.toHaveBeenCalled();
+      expect(alternate.readyState).toBe(3);
+      expect(runtime.connectionStatus().state).not.toBe('connected');
+      expect(endpoints.candidates()).toEqual(['https://im.example']);
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(urls.at(-1)).toContain('im.example');
+      runtime.stop();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('authenticates, executes only machine.exec, and returns a correlated result', async () => {
     const socket = new MockSocket();
     const onAuthenticated = vi.fn();

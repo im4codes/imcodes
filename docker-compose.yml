@@ -37,8 +37,9 @@ services:
       IMCODES_NODE_EXE_VERSION_DIR: /var/lib/imcodes/node-exe-versions
       # Other public https origins of THIS deployment (a proxy domain next to DOMAIN), comma separated. Controlled nodes
       # learn them from their authenticated connection and fall back to them when the address they were enrolled with is
-      # blocked. Every listed origin must reach this same server, pass WebSocket upgrades on /api/server/<id>/ws and keep
-      # the ?serverId= routing. Empty = advertise nothing (a node keeps using only its enrolled address).
+      # blocked. A node sends its credential to every listed origin it connects to, so every listed origin MUST reach this
+      # same server, pass WebSocket upgrades on /api/server/<id>/ws and keep the ?serverId= routing.
+      # Empty = advertise nothing (a node keeps using only its enrolled address).
       IMCODES_PUBLIC_URLS: "${IMCODES_PUBLIC_URLS:-}"
     volumes:
       - node_exe_versions:/var/lib/imcodes/node-exe-versions

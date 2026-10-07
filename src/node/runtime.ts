@@ -1634,7 +1634,13 @@ export function createControlledNodeRuntime(
         return;
       }
       if (isControlledNodeAuthAck(message)) {
-        connection.onAuthenticatedAck(message);
+        // An ack that names another server ID does not authenticate this node here: nothing below runs (no lease, no
+        // "service healthy", no adoption) and the socket is dropped; the address is not used again for a day.
+        if (!connection.onAuthenticatedAck(message)) {
+          logger.warn({ target: connection.status().target }, 'controlled node: the server answered as a different server ID; dropping this connection');
+          client.reconnect();
+          return;
+        }
         // `heartbeat_ack` doubles as the auth-ack signal and repeats every
         // 5s for the life of the connection. Diagnostics only cares about the
         // FIRST one (the startup handshake); recording every repeat would

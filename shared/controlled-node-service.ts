@@ -79,7 +79,6 @@ export const CONTROLLED_NODE_LIVENESS_WRITE_INTERVAL_MS = 15_000 as const;
  * node is still restarted no sooner than the threshold after its last renewal.
  */
 export const CONTROLLED_NODE_LIVENESS_ACTIVITY_WINDOW_MS = 90_000 as const;
-/** A node that has had no authenticated ack for this long says so in its log (at most once per repeat interval). */
 /**
  * Backstop for a process that is stuck INSIDE its connection handling: a server that accepts the connection (so sockets keep
  * opening) but never acknowledges this node cannot be told from a server that is unreachable by connection activity alone. When
@@ -97,6 +96,7 @@ export function controlledNodeLivenessBackstopMs(level: number): number {
   const safe = Number.isSafeInteger(level) && level > 0 ? Math.min(level, 20) : 0;
   return Math.min(CONTROLLED_NODE_LIVENESS_UNACKED_OPEN_BACKSTOP_MS * 2 ** safe, CONTROLLED_NODE_LIVENESS_UNACKED_OPEN_BACKSTOP_MAX_MS);
 }
+/** A node that has had no authenticated ack for this long says so in its log (at most once per repeat interval). */
 export const CONTROLLED_NODE_UNREACHABLE_WARN_AFTER_MS = 5 * 60_000;
 export const CONTROLLED_NODE_UNREACHABLE_WARN_REPEAT_MS = 30 * 60_000;
 

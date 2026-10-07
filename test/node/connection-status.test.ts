@@ -116,7 +116,7 @@ describe('connection tracker', () => {
     const tracker = new ControlledNodeConnectionTracker({ primary: PRIMARY, serverId: 'srv-1', selector, now: () => clock });
     for (let i = 0; i < 3; i += 1) tracker.onDiagnostic(lost('connect_timeout'));
     expect(tracker.currentOrigin()).toBe(PROXY);
-    tracker.onAuthenticatedAck({ type: 'heartbeat_ack', serverId: 'someone-else', serverUrls: ['https://elsewhere.example'] });
+    expect(tracker.onAuthenticatedAck({ type: 'heartbeat_ack', serverId: 'someone-else', serverUrls: ['https://elsewhere.example'] })).toBe(false);
     expect(tracker.currentOrigin()).toBe(PRIMARY);
     expect(tracker.status().state).not.toBe('connected');
     expect(selector.candidates()).toEqual([PRIMARY]);
@@ -128,9 +128,9 @@ describe('connection tracker', () => {
   it('an ack with this server ID (or none: nodes without a public ID get none) is accepted', () => {
     const selector = new ControlledNodeEndpointSelector(PRIMARY, emptyEndpointState(), {});
     const tracker = new ControlledNodeConnectionTracker({ primary: PRIMARY, serverId: 'srv-1', selector });
-    tracker.onAuthenticatedAck({ type: 'heartbeat_ack', serverId: 'srv-1' });
+    expect(tracker.onAuthenticatedAck({ type: 'heartbeat_ack', serverId: 'srv-1' })).toBe(true);
     expect(tracker.status().state).toBe('connected');
-    tracker.onAuthenticatedAck({ type: 'heartbeat_ack' });
+    expect(tracker.onAuthenticatedAck({ type: 'heartbeat_ack' })).toBe(true);
     expect(tracker.status().state).toBe('connected');
   });
 
