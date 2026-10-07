@@ -30,6 +30,11 @@ import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { userInfo } from 'node:os';
 import { join } from 'node:path';
 import { ISOLATED_HOME_RUN_ROOT_ENV, isolatedHomeTmpBase } from './isolated-home-global.js';
+import { EVENT_LOOP_BACKPRESSURE_ENV } from '../../shared/event-loop-backpressure.js';
+
+// Test workers block their own loops on purpose (fake timers, synchronous fixtures): the daemon's back pressure would
+// pause the fake children they drive. The back-pressure tests build their own EventLoopHealth instead.
+process.env[EVENT_LOOP_BACKPRESSURE_ENV] = '0';
 
 /**
  * A fresh home for THIS setup-file invocation, i.e. for this test file.

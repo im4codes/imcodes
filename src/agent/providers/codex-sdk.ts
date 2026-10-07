@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { gateChildStream } from '../../util/event-loop-backpressure.js';
 import { capContextPreservingPriority, joinSpanned, type PriorityPreservingCapMarkers, type SpannedText } from '../priority-preserving-context-cap.js';
 import {
   readDelegationDispatchFact,
@@ -3467,7 +3468,7 @@ export class CodexSdkProvider implements TransportProvider {
       windowsHide: true,
     });
     this.child = child;
-    this.rl = readline.createInterface({ input: child.stdout });
+    this.rl = readline.createInterface({ input: gateChildStream(child.stdout) });
     this.rl.on('line', (line) => this.handleLine(child, line));
     this.rl.on('close', () => {
       if (this.child !== child) return;

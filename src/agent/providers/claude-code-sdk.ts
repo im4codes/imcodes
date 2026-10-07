@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { backpressureYield } from '../../util/event-loop-backpressure.js';
 import { access } from 'node:fs/promises';
 import { constants as fsConstants, statSync } from 'node:fs';
 import { spawn, type ChildProcess } from 'node:child_process';
@@ -1169,6 +1170,9 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     try {
       for await (const msg of q) {
         this.handleMessage(sessionId, state, msg, turnGeneration);
+        // Past the SDK's own reader: not pulling the next message while the loop is overloaded lets the SDK's stdout
+        // reader fill and the `claude` child wait (nothing is dropped), instead of queueing messages in this heap.
+        await backpressureYield();
       }
       if (!pendingError && state.pendingError) {
         pendingError = state.pendingError;

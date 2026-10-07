@@ -1,0 +1,205 @@
+/**
+ * 158 (2026-10-07): the main thread was blocked ~100 % of the time (1.2 s drifts every 1.3 s, a 10 s stall at the
+ * end) while child processes kept writing and the in-process readers kept decoding, until the heap was gone.
+ * While the loop is overloaded the daemon stops READING from children (their pipes fill and they wait - nothing is
+ * dropped), holds back optional loops and paces a warm restore; all of it resumes on recovery, and none of it can
+ * starve a child for good.
+ */
+import { afterEach, describe, expect, it } from 'vitest';
+import { spawn } from 'node:child_process';
+import { readdirSync, readFileSync } from 'node:fs';
+import { join, resolve } from 'node:path';
+import { PassThrough } from 'node:stream';
+import {
+  BACKPRESSURE_MAX_PAUSE_MS,
+  BACKPRESSURE_RESUME_GRACE_MS,
+  EVENT_LOOP_BACKPRESSURE_ENV,
+  EVENT_LOOP_HEALTHY_LAG_MS,
+  EVENT_LOOP_LAG_WINDOW_MS,
+  EVENT_LOOP_OVERLOADED_LAG_MS,
+} from '../../shared/event-loop-backpressure.js';
+import {
+  EventLoopHealth,
+  backpressureYield,
+  eventLoopHealth,
+  gateChildStream,
+  resetEventLoopHealthForTests,
+} from '../../src/util/event-loop-backpressure.js';
+
+const ROOT = resolve(__dirname, '..', '..');
+
+/** Real time plus a jump: the wait loops still end, and the window can be "waited out" instantly. */
+function clocked() {
+  let offset = 0;
+  const health = new EventLoopHealth({ now: () => performance.now() + offset, autoStart: false });
+  return { health, advance: (ms: number) => { offset += ms; } };
+}
+const nextTick = () => new Promise<void>((resolve) => setImmediate(resolve));
+
+afterEach(() => resetEventLoopHealthForTests());
+
+describe('event-loop health', () => {
+  it('is overloaded at the high line and healthy only below the low line, after the window forgets the spike (no flapping)', () => {
+    const { health, advance } = clocked();
+    health.recordProbe(20);
+    expect(health.isOverloaded()).toBe(false);
+    health.recordProbe(EVENT_LOOP_OVERLOADED_LAG_MS);
+    expect(health.isOverloaded()).toBe(true);
+    advance(500); health.recordProbe(EVENT_LOOP_HEALTHY_LAG_MS + 20); // lower, but not under the healthy line
+    expect(health.isOverloaded()).toBe(true);
+    advance(500); health.recordProbe(5);
+    expect(health.isOverloaded()).toBe(true); // the 400 ms spike is still inside the window
+    advance(EVENT_LOOP_LAG_WINDOW_MS); health.recordProbe(5);
+    expect(health.isOverloaded()).toBe(false);
+  });
+});
+
+describe('a gated child stream', () => {
+  it('is paused while the loop is overloaded, loses nothing, and flows again on recovery', async () => {
+    const { health, advance } = clocked();
+    const stream = new PassThrough();
+    const received: string[] = [];
+    stream.on('data', (chunk: Buffer) => received.push(chunk.toString()));
+    health.gate(stream);
+    stream.write('one');
+    await nextTick();
+    expect(received).toEqual(['one']);
+
+    health.recordProbe(1_000);
+    expect(stream.isPaused()).toBe(true);
+    stream.write('two'); stream.write('three');
+    expect(received).toEqual(['one']); // held back, not dropped
+
+    advance(EVENT_LOOP_LAG_WINDOW_MS + 100); health.recordProbe(0);
+    expect(stream.isPaused()).toBe(false);
+    stream.write('four');
+    await nextTick();
+    expect(received.join('')).toBe('onetwothreefour'); // everything, in order
+    health.stop();
+  });
+
+  it('is never held longer than the pause cap, then gets a grace period before it can be paused again', () => {
+    const { health, advance } = clocked();
+    const stream = new PassThrough();
+    stream.on('data', () => undefined);
+    health.gate(stream);
+    health.recordProbe(1_000);
+    expect(stream.isPaused()).toBe(true);
+    advance(BACKPRESSURE_MAX_PAUSE_MS + 1); health.recordProbe(1_000); // still overloaded
+    expect(stream.isPaused()).toBe(false);
+    advance(100); health.recordProbe(1_000);
+    expect(stream.isPaused()).toBe(false); // inside the grace
+    advance(BACKPRESSURE_RESUME_GRACE_MS + 1); health.recordProbe(1_000);
+    expect(stream.isPaused()).toBe(true);
+    health.stop();
+  });
+
+  it('never resumes a stream somebody else paused, and forgets a closed stream', async () => {
+    const { health, advance } = clocked();
+    const mine = new PassThrough();
+    mine.on('data', () => undefined);
+    mine.pause(); // paused by its owner
+    health.gate(mine);
+    health.recordProbe(1_000);
+    advance(EVENT_LOOP_LAG_WINDOW_MS + 100); health.recordProbe(0);
+    expect(mine.isPaused()).toBe(true);
+    mine.destroy();
+    await nextTick();
+    expect(health.stats().gatedStreams).toBe(0);
+    health.stop();
+  });
+
+  it('REAL CHILD: a child writing 24 MB is held back while overloaded (the pipe fills, the child waits) and delivers every byte afterwards', async () => {
+    const { health, advance } = clocked();
+    const child = spawn(process.execPath, ['-e', "const chunk = Buffer.alloc(64 * 1024, 97); let left = 384; const write = () => { while (left > 0) { left -= 1; if (!process.stdout.write(chunk)) { process.stdout.once('drain', write); return; } } process.exit(0); }; write();"], { stdio: ['ignore', 'pipe', 'ignore'] });
+    let received = 0;
+    child.stdout.on('data', (chunk: Buffer) => { received += chunk.length; });
+    health.gate(child.stdout);
+    health.recordProbe(1_000); // overloaded from the start
+    await new Promise((r) => setTimeout(r, 400));
+    const heldAt = received;
+    await new Promise((r) => setTimeout(r, 400));
+    expect(received).toBe(heldAt); // nothing more was read: the child is blocked on its pipe
+    expect(heldAt).toBeLessThan(8 * 1024 * 1024); // at most what the pipe and stream buffers hold
+    advance(EVENT_LOOP_LAG_WINDOW_MS + 100); health.recordProbe(0);
+    await new Promise<void>((resolve) => child.once('close', () => resolve()));
+    expect(received).toBe(384 * 64 * 1024);
+    health.stop();
+  }, 30_000);
+});
+
+describe('waiting for a healthy loop', () => {
+  it('returns at once while healthy, waits while overloaded, and gives up at the cap', async () => {
+    const { health, advance } = clocked();
+    const healthyStart = Date.now();
+    await health.waitUntilHealthy();
+    expect(Date.now() - healthyStart).toBeLessThan(50);
+
+    health.recordProbe(1_000);
+    let released = false;
+    const waiting = health.waitUntilHealthy({ maxWaitMs: 60_000 }).then(() => { released = true; });
+    await new Promise((r) => setTimeout(r, 450));
+    expect(released).toBe(false);
+    advance(EVENT_LOOP_LAG_WINDOW_MS + 100); health.recordProbe(0);
+    await waiting;
+    expect(released).toBe(true);
+
+    health.recordProbe(1_000);
+    const capped = Date.now();
+    advance(0);
+    await health.waitUntilHealthy({ maxWaitMs: 0 });
+    expect(Date.now() - capped).toBeLessThan(100); // the cap, not the recovery, ended the wait
+    health.stop();
+  });
+
+  it('the shared yield used by provider message loops is free while healthy', async () => {
+    const started = Date.now();
+    for (let i = 0; i < 1_000; i += 1) await backpressureYield();
+    expect(Date.now() - started).toBeLessThan(200);
+    expect(eventLoopHealth().isOverloaded()).toBe(false);
+  });
+});
+
+describe('the kill switch', () => {
+  it('IMCODES_EVENT_LOOP_BACKPRESSURE=0 turns the process-wide helpers into no-ops (test workers run with it)', () => {
+    const previous = process.env[EVENT_LOOP_BACKPRESSURE_ENV];
+    try {
+      process.env[EVENT_LOOP_BACKPRESSURE_ENV] = '0';
+      resetEventLoopHealthForTests();
+      const off = new PassThrough();
+      expect(gateChildStream(off)).toBe(off);
+      expect(eventLoopHealth().stats().gatedStreams).toBe(0);
+      delete process.env[EVENT_LOOP_BACKPRESSURE_ENV];
+      const on = new PassThrough();
+      gateChildStream(on);
+      expect(eventLoopHealth().stats().gatedStreams).toBe(1);
+      on.destroy();
+    } finally {
+      if (previous === undefined) delete process.env[EVENT_LOOP_BACKPRESSURE_ENV]; else process.env[EVENT_LOOP_BACKPRESSURE_ENV] = previous;
+    }
+  });
+});
+
+describe('wiring (a class guard for every provider that reads a child process)', () => {
+  const providers = join(ROOT, 'src/agent/providers');
+  const READS_CHILD = /createInterface\(\{\s*input:\s*child\.stdout|child\.stdout\??\.on\('data'|filterAcpJsonLines\(\s*child\.stdout/;
+
+  it('every provider that reads child.stdout wraps it in gateChildStream', () => {
+    const offenders: string[] = [];
+    for (const file of readdirSync(providers).filter((name) => name.endsWith('.ts'))) {
+      const lines = readFileSync(join(providers, file), 'utf8').split('\n');
+      lines.forEach((line, index) => {
+        if (READS_CHILD.test(line) && !line.includes('gateChildStream(')) offenders.push(`${file}:${index + 1}: ${line.trim()}`);
+      });
+    }
+    expect(offenders).toEqual([]);
+  });
+
+  it('the Claude SDK message loop yields to the loop, and the warm restore is paced by it with no fixed gap', () => {
+    const claude = readFileSync(join(providers, 'claude-code-sdk.ts'), 'utf8');
+    expect(claude).toMatch(/for await \(const msg of q\) \{\s*this\.handleMessage\(sessionId, state, msg, turnGeneration\);[^}]*await backpressureYield\(\);/);
+    const lifecycle = readFileSync(join(ROOT, 'src/daemon/lifecycle.ts'), 'utf8');
+    expect(lifecycle).toMatch(/interSessionDelayMs: 0,\s*paceByEventLoopHealth: true,/);
+    expect(lifecycle).not.toMatch(/TRANSPORT_SLOW_RESTORE_INTER_SESSION_DELAY_MS/);
+  });
+});

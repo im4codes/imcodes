@@ -294,7 +294,6 @@ const STARTUP_SESSION_DB_PUSH_DELAY_MS = 210_000;
 const STARTUP_EMBEDDING_BACKFILL_DELAY_MS = 240_000;
 const STARTUP_TRANSPORT_RESTORE_DELAY_MS = 45_000;
 const STARTUP_TRANSPORT_SLOW_RESTORE_DELAY_MS = 90_000;
-const TRANSPORT_SLOW_RESTORE_INTER_SESSION_DELAY_MS = 2_000;
 const TRANSPORT_SLOW_RESTORE_PROVIDER_PAUSE_MS = 5_000;
 const STARTUP_CONTEXT_BACKFILL_PAUSE_MS = 25;
 const STARTUP_CONTEXT_BACKFILL_PAUSE_EVERY = 5;
@@ -1771,7 +1770,9 @@ async function slowWarmRestoreTransportProviders(): Promise<void> {
         await ensureProviderConnected(providerId, {});
         await restoreTransportSessions(providerId, {
           concurrency: 1,
-          interSessionDelayMs: TRANSPORT_SLOW_RESTORE_INTER_SESSION_DELAY_MS,
+          // No fixed gap: the floor is RESTORE_PACING_MIN_GAP_MS, then each restore waits for the event loop to recover.
+          interSessionDelayMs: 0,
+          paceByEventLoopHealth: true,
         });
       } catch (err) {
         logger.warn({ err, providerId }, 'Delayed transport runtime warm restore failed');

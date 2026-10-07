@@ -1,4 +1,5 @@
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { gateChildStream } from '../../util/event-loop-backpressure.js';
 import os from 'node:os';
 import path from 'node:path';
 import { execFile, spawn, type ChildProcess } from 'node:child_process';
@@ -1173,7 +1174,7 @@ export class QwenProvider implements TransportProvider {
       emitTool(qwenRuntimeSubagentToolFromPayload(sessionId, state, record));
     };
 
-    const rl = readline.createInterface({ input: child.stdout! });
+    const rl = readline.createInterface({ input: gateChildStream(child.stdout!) });
     rl.on('line', (line) => {
       const trimmed = line.trim();
       if (!trimmed) return;

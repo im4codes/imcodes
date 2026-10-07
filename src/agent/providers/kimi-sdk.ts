@@ -40,6 +40,7 @@
  *   auth can be added later by wiring the `AUTHENTICATE` path.
  */
 
+import { gateChildStream } from '../../util/event-loop-backpressure.js';
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { Readable, Writable } from 'node:stream';
 import { createHash, randomUUID } from 'node:crypto';
@@ -853,7 +854,7 @@ export class KimiSdkProvider implements TransportProvider {
     // the SDK's ndjson reader console.error-spam on every unparseable line.
     const writable = Writable.toWeb(child.stdin) as WritableStream<Uint8Array>;
     const readable = Readable.toWeb(
-      filterAcpJsonLines(child.stdout, (line, n) => {
+      filterAcpJsonLines(gateChildStream(child.stdout), (line, n) => {
         if (n === 1 || n % 200 === 0) {
           logger.debug(
             {

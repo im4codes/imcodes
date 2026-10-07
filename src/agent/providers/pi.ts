@@ -7,6 +7,7 @@
  * child is retained per IM.codes session so uploads, tools, prompt cache and
  * conversation state all remain warm across turns.
  */
+import { gateChildStream } from '../../util/event-loop-backpressure.js';
 import { spawn, type ChildProcess } from 'node:child_process';
 import {
   agentResourceOwner,
@@ -454,7 +455,7 @@ export class PiProvider implements TransportProvider {
     child.stdin?.on('error', (error) => {
       logger.debug({ provider: this.id, session: state.sessionName, error }, 'Pi stdin error');
     });
-    child.stdout?.on('data', (chunk: Buffer) => this.handleChunk(state, chunk));
+    gateChildStream(child.stdout)?.on('data', (chunk: Buffer) => this.handleChunk(state, chunk));
     child.stderr?.on('data', (chunk: Buffer) => {
       const line = chunk.toString('utf8').trim();
       if (line) logger.debug({ provider: this.id, session: state.sessionName, line: line.slice(0, 500) }, 'Pi stderr');

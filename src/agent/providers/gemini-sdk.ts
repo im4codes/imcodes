@@ -43,6 +43,7 @@
  *   auth can be added later by wiring the `AUTHENTICATE` path.
  */
 
+import { gateChildStream } from '../../util/event-loop-backpressure.js';
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { Readable, Writable } from 'node:stream';
 import { randomUUID } from 'node:crypto';
@@ -775,7 +776,7 @@ export class GeminiSdkProvider implements TransportProvider {
     // event loop. Drop non-JSON lines before they reach the parser.
     const writable = Writable.toWeb(child.stdin) as WritableStream<Uint8Array>;
     const readable = Readable.toWeb(
-      filterAcpJsonLines(child.stdout, (line, n) => {
+      filterAcpJsonLines(gateChildStream(child.stdout), (line, n) => {
         if (n === 1 || n % 200 === 0) {
           logger.debug(
             { provider: this.id, droppedCount: n, sample: line.slice(0, 200) },

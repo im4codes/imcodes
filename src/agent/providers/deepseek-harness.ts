@@ -17,6 +17,7 @@
  * agent, so prompt-cache prefixes survive and a turn costs one round trip
  * instead of a process start.
  */
+import { gateChildStream } from '../../util/event-loop-backpressure.js';
 import { spawn, type ChildProcess } from 'node:child_process';
 import {
   agentResourceOwner,
@@ -572,7 +573,7 @@ export class DeepseekHarnessProvider implements TransportProvider {
     });
 
     if (child.stdout) {
-      const reader = createInterface({ input: child.stdout });
+      const reader = createInterface({ input: gateChildStream(child.stdout) });
       state.reader = reader;
       reader.on('line', (line) => this.handleLine(state, line));
     }

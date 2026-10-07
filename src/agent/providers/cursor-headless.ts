@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { gateChildStream } from '../../util/event-loop-backpressure.js';
 import path from 'node:path';
 import type { ChildProcess } from 'node:child_process';
 import {
@@ -551,7 +552,7 @@ export class CursorHeadlessProvider implements TransportProvider {
       this.emitSessionInfo(sessionKey, info);
     };
 
-    const rl = readline.createInterface({ input: child.stdout! });
+    const rl = readline.createInterface({ input: gateChildStream(child.stdout!) });
     rl.on('line', (line) => {
       const event = parseCursorStreamLine(line);
       if (!event) return;

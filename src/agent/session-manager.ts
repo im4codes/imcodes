@@ -1,4 +1,6 @@
 import { queuedUserMessageAttribution } from './transport-queued-user-message.js';
+import { paceByEventLoopHealth } from '../util/event-loop-backpressure.js';
+import { RESTORE_PACING_MIN_GAP_MS } from '../../shared/event-loop-backpressure.js';
 import { newSession, killSession, sessionExists, isPaneAlive, respawnPane, listSessions as tmuxListSessions, sendKeys, sendKey, capturePane, showBuffer, getPaneId, getPaneCwd, getPaneStartCommand, cleanupOrphanFifos, BACKEND } from './tmux.js';
 import { randomUUID } from 'node:crypto';
 import { existsSync } from 'node:fs';
@@ -1527,8 +1529,15 @@ const TRANSPORT_RESTORE_SDK_SUBAGENT_SCAN_LIMIT = (() => {
 })();
 const transportErrorRecoveryTimestamps = new Map<string, number[]>();
 
-function pauseBetweenTransportRestores(index: number, delayMs = TRANSPORT_RESTORE_INTER_SESSION_DELAY_MS): Promise<void> {
+async function pauseBetweenTransportRestores(
+  index: number,
+  delayMs = TRANSPORT_RESTORE_INTER_SESSION_DELAY_MS,
+  paceByHealth = false,
+): Promise<void> {
   if (index <= 0) return new Promise((resolve) => setImmediate(resolve));
+  // A warm restore of dozens of sessions is paced by what the daemon can take (158: 53 restores into a loop blocked
+  // 1.2 s at a time), not by a fixed gap: the gap is a floor, and the next restore waits for the loop to recover.
+  if (paceByHealth) return paceByEventLoopHealth(Math.max(delayMs, RESTORE_PACING_MIN_GAP_MS));
   return new Promise((resolve) => setTimeout(resolve, delayMs));
 }
 
@@ -2700,6 +2709,8 @@ export async function restoreTransportSessions(
     sessionName?: string;
     concurrency?: number;
     interSessionDelayMs?: number;
+    /** Wait for the event loop to be healthy between two restores (the delay is then only the minimum gap). */
+    paceByEventLoopHealth?: boolean;
   } = {},
 ): Promise<void> {
   // Only the daemon owns transport runtimes. A helper process (MCP server, CLI)
@@ -2843,7 +2854,7 @@ export async function restoreTransportSessions(
       }, 'Transport restore stopped because the session authority changed');
       return true;
     };
-    await pauseBetweenTransportRestores(index, restoreInterSessionDelayMs);
+    await pauseBetweenTransportRestores(index, restoreInterSessionDelayMs, options.paceByEventLoopHealth === true);
     if (rejectStaleRestoreInstance('restore_start')) return;
     const latestPersistedResumeId = getSession(s.name)?.providerResumeId?.trim()
       || s.providerResumeId?.trim();
