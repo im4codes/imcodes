@@ -59,6 +59,9 @@ describe('aiDesk local management launchers', () => {
     const builder = header.slice(header.indexOf('LocalManagementOpenWindowRequest()'), header.indexOf('LocalManagementHttpStatus(std::string_view'));
     expect(builder).not.toMatch(/Origin/u);
     expect(read('native/remote-desktop-common/BUILD.gn').match(/local_management_open_window\.h/gu)).toHaveLength(2);
+    // the OS-neutral contract carries no compile switches or socket code (remote-desktop-common-build.test.ts); POSIX sockets live beside it
+    expect(header).not.toMatch(/_WIN32|sys\/socket\.h/u);
+    expect(read('native/posix-shared/local_management_open_window_posix.h')).toContain('RequestLocalManagementWindow(');
   });
 
   it('every platform asks the node to open the window first and keeps its previous open only as the fallback', () => {
@@ -69,6 +72,7 @@ describe('aiDesk local management launchers', () => {
     expect(windows.indexOf('#include <winsock2.h>')).toBeLessThan(windows.indexOf('local_indicator.h"'));
 
     const linux = read('native/linux-remote-desktop/linux_x11_backend.cc');
+    expect(linux).toContain('posix-shared/local_management_open_window_posix.h');
     expect(linux.indexOf('common::RequestLocalManagementWindow()')).toBeGreaterThan(-1);
     expect(linux.indexOf('common::RequestLocalManagementWindow()')).toBeLessThan(linux.indexOf('execlp("xdg-open"'));
 

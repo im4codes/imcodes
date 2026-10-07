@@ -30,7 +30,7 @@
 #include "macos_permission_onboarding.h"
 #include "../remote-desktop-common/platform_interfaces.h"
 #include "../remote-desktop-common/aidesk_product_name.h"
-#include "../remote-desktop-common/local_management_open_window.h"
+#include "../posix-shared/local_management_open_window_posix.h"
 #include "../remote-desktop-common/local_indicator_visuals.h"
 
 namespace macos = imcodes::remote_desktop::macos;

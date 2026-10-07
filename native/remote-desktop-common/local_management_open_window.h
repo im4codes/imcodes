@@ -10,20 +10,11 @@
 // The request carries a custom header and no Origin: a web page can do neither (a custom header forces a preflight the panel never
 // answers, and every cross-site POST carries an Origin), so no site can make the node open windows.
 //
-// Must match REMOTE_DESKTOP_LOCAL_MANAGEMENT in shared/remote-desktop-local-management.ts (pinned by a spec test).
+// Must match REMOTE_DESKTOP_LOCAL_MANAGEMENT in shared/remote-desktop-local-management.ts (pinned by a spec test). This header is the
+// OS-neutral contract; the blocking socket client for Linux and macOS lives in native/posix-shared/ and the Windows one beside the indicator.
 
 #include <string>
 #include <string_view>
-
-#if !defined(_WIN32)
-#include <arpa/inet.h>
-#include <fcntl.h>
-#include <netinet/in.h>
-#include <poll.h>
-#include <sys/socket.h>
-#include <sys/time.h>
-#include <unistd.h>
-#endif
 
 namespace imcodes::remote_desktop::common {
 
@@ -65,57 +56,6 @@ inline int LocalManagementHttpStatus(std::string_view head) {
 inline bool LocalManagementOpenWindowAccepted(std::string_view response) {
   return LocalManagementHttpStatus(response) == 200;
 }
-
-#if !defined(_WIN32)
-/**
- * Blocking POSIX implementation (Linux and macOS). Call it from a context that may block for a few seconds (a forked child, a
- * background queue); never from a UI thread. `port` is a parameter only so tests can use their own listener.
- */
-inline bool RequestLocalManagementWindow(unsigned short port = kLocalManagementPort,
-                                         int answer_timeout_ms = kLocalManagementOpenWindowAnswerTimeoutMs) {
-  const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
-  if (fd < 0) return false;
-  bool accepted = false;
-  do {
-    sockaddr_in address{};
-    address.sin_family = AF_INET;
-    address.sin_port = htons(port);
-    if (::inet_pton(AF_INET, kLocalManagementHost, &address.sin_addr) != 1) break;
-    const int flags = ::fcntl(fd, F_GETFL, 0);
-    if (flags < 0 || ::fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) break;
-    const int connected = ::connect(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address));
-    if (connected != 0) {
-      pollfd wait{fd, POLLOUT, 0};
-      if (::poll(&wait, 1, kLocalManagementConnectTimeoutMs) != 1) break;
-      int error = 0;
-      socklen_t length = sizeof(error);
-      if (::getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &length) != 0 || error != 0) break;
-    }
-    if (::fcntl(fd, F_SETFL, flags) < 0) break;
-    timeval timeout{answer_timeout_ms / 1000, (answer_timeout_ms % 1000) * 1000};
-    ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
-    ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
-    const std::string request = LocalManagementOpenWindowRequest();
-    size_t sent = 0;
-    while (sent < request.size()) {
-      const ssize_t written = ::send(fd, request.data() + sent, request.size() - sent, 0);
-      if (written <= 0) { sent = request.size() + 1; break; }
-      sent += static_cast<size_t>(written);
-    }
-    if (sent != request.size()) break;
-    char buffer[64];
-    size_t received = 0;
-    while (received < 12) {
-      const ssize_t read = ::recv(fd, buffer + received, sizeof(buffer) - received, 0);
-      if (read <= 0) break;
-      received += static_cast<size_t>(read);
-    }
-    accepted = LocalManagementOpenWindowAccepted(std::string_view(buffer, received));
-  } while (false);
-  ::close(fd);
-  return accepted;
-}
-#endif  // !_WIN32
 
 }  // namespace imcodes::remote_desktop::common
 

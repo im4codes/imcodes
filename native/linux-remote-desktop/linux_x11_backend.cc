@@ -2,7 +2,7 @@
 #include "../remote-desktop-common/aidesk_product_name.h"
 #include "../remote-desktop-common/data_channel_constants.h"
 #include "../remote-desktop-common/local_indicator_visuals.h"
-#include "../remote-desktop-common/local_management_open_window.h"
+#include "../posix-shared/local_management_open_window_posix.h"
 
 #include <chrono>
 #include <algorithm>

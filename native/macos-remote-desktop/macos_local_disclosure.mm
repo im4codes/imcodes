@@ -1,7 +1,7 @@
 #include "macos_local_disclosure.h"
 #include "../remote-desktop-common/aidesk_product_name.h"
 #include "../remote-desktop-common/local_indicator_visuals.h"
-#include "../remote-desktop-common/local_management_open_window.h"
+#include "../posix-shared/local_management_open_window_posix.h"
 
 #import <AppKit/AppKit.h>
 

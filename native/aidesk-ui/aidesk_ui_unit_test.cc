@@ -6,6 +6,7 @@
 #include <iostream>
 #include <string>
 #if !defined(_WIN32)
+#include "../posix-shared/local_management_open_window_posix.h"
 #include <cstring>
 #include <thread>
 #include <netinet/in.h>
