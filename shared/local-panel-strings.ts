@@ -16,7 +16,7 @@ export const LOCAL_PANEL_STRING_KEYS = [
   'connections', 'connectionsActive', 'stopAll', 'user', 'view', 'control', 'since', 'disconnect',
   'emptyTitle', 'emptySub', 'offlineTitle', 'offlineText',
   'permissions', 'permScreen', 'permAccessibility', 'permDisk', 'permGranted', 'permDenied', 'permUnknown',
-  'permHelpScreen', 'permHelpAccessibility', 'permHelpDisk',
+  'permHelpScreen', 'permHelpAccessibility', 'permHelpDisk', 'openSettings',
   'cancel', 'confirm', 'disconnectTitle', 'disconnectText', 'stopTitle', 'stopText',
   'settingsTitle', 'language', 'languageSystem', 'languageHelp', 'appearanceNote',
   'aboutTitle', 'version', 'actionFailed',
@@ -54,6 +54,7 @@ const en: LocalPanelStrings = {
   permHelpScreen: 'Turn on aiDesk.to in System Settings → Privacy & Security → Screen Recording.',
   permHelpAccessibility: 'Turn on aiDesk.to in System Settings → Privacy & Security → Accessibility.',
   permHelpDisk: 'Turn on aiDesk.to in System Settings → Privacy & Security → Full Disk Access (add it with + if it is not listed).',
+  openSettings: 'Open settings',
   cancel: 'Cancel', confirm: 'Confirm',
   disconnectTitle: 'Disconnect this connection?', disconnectText: 'Only this connection will end.',
   stopTitle: 'Disconnect everyone?', stopText: 'Click confirm once more to disconnect every current viewer and controller. Remote access remains enabled for future connections.',
@@ -82,6 +83,7 @@ const zhCN: LocalPanelStrings = {
   permHelpScreen: '请在“系统设置 → 隐私与安全性 → 屏幕录制”中打开 aiDesk.to。',
   permHelpAccessibility: '请在“系统设置 → 隐私与安全性 → 辅助功能”中打开 aiDesk.to。',
   permHelpDisk: '请在“系统设置 → 隐私与安全性 → 完全磁盘访问”中打开 aiDesk.to（若未列出，请用 + 添加）。',
+  openSettings: '去设置',
   cancel: '取消', confirm: '确认',
   disconnectTitle: '断开此连接？', disconnectText: '仅会结束这一条连接。',
   stopTitle: '断开所有人？', stopText: '再次确认后将断开全部当前查看者和控制者；以后仍可重新连接。',
@@ -110,6 +112,7 @@ const zhTW: LocalPanelStrings = {
   permHelpScreen: '請在「系統設定 → 隱私權與安全性 → 螢幕錄製」中開啟 aiDesk.to。',
   permHelpAccessibility: '請在「系統設定 → 隱私權與安全性 → 輔助使用」中開啟 aiDesk.to。',
   permHelpDisk: '請在「系統設定 → 隱私權與安全性 → 完整磁碟取用權」中開啟 aiDesk.to（若未列出，請用 + 加入）。',
+  openSettings: '前往設定',
   cancel: '取消', confirm: '確認',
   disconnectTitle: '中斷此連線？', disconnectText: '只會結束這一條連線。',
   stopTitle: '中斷所有人？', stopText: '再次確認後將中斷全部目前檢視者和控制者；之後仍可重新連線。',
@@ -138,6 +141,7 @@ const es: LocalPanelStrings = {
   permHelpScreen: 'Activa aiDesk.to en Ajustes del Sistema → Privacidad y seguridad → Grabación de pantalla.',
   permHelpAccessibility: 'Activa aiDesk.to en Ajustes del Sistema → Privacidad y seguridad → Accesibilidad.',
   permHelpDisk: 'Activa aiDesk.to en Ajustes del Sistema → Privacidad y seguridad → Acceso total al disco (añádelo con + si no aparece).',
+  openSettings: 'Abrir ajustes',
   cancel: 'Cancelar', confirm: 'Confirmar',
   disconnectTitle: '¿Desconectar esta conexión?', disconnectText: 'Solo finalizará esta conexión.',
   stopTitle: '¿Desconectar a todos?', stopText: 'Confirma de nuevo para desconectar a todos los que ven o controlan ahora. El acceso seguirá habilitado para futuras conexiones.',
@@ -166,6 +170,7 @@ const ru: LocalPanelStrings = {
   permHelpScreen: 'Включите aiDesk.to в «Системные настройки → Конфиденциальность и безопасность → Запись экрана».',
   permHelpAccessibility: 'Включите aiDesk.to в «Системные настройки → Конфиденциальность и безопасность → Универсальный доступ».',
   permHelpDisk: 'Включите aiDesk.to в «Системные настройки → Конфиденциальность и безопасность → Полный доступ к диску» (если его нет в списке, добавьте через +).',
+  openSettings: 'Открыть настройки',
   cancel: 'Отмена', confirm: 'Подтвердить',
   disconnectTitle: 'Отключить это подключение?', disconnectText: 'Будет завершено только это подключение.',
   stopTitle: 'Отключить всех?', stopText: 'Подтвердите ещё раз, чтобы отключить всех, кто сейчас просматривает или управляет. Доступ останется включён для будущих подключений.',
@@ -194,6 +199,7 @@ const ja: LocalPanelStrings = {
   permHelpScreen: '「システム設定 → プライバシーとセキュリティ → 画面収録」で aiDesk.to をオンにしてください。',
   permHelpAccessibility: '「システム設定 → プライバシーとセキュリティ → アクセシビリティ」で aiDesk.to をオンにしてください。',
   permHelpDisk: '「システム設定 → プライバシーとセキュリティ → フルディスクアクセス」で aiDesk.to をオンにしてください（一覧にない場合は + で追加）。',
+  openSettings: '設定を開く',
   cancel: 'キャンセル', confirm: '確認',
   disconnectTitle: 'この接続を切断しますか？', disconnectText: 'この接続だけを終了します。',
   stopTitle: '全員を切断しますか？', stopText: 'もう一度確認すると、現在の閲覧者と操作者をすべて切断します。今後の接続は引き続き許可されます。',
@@ -222,6 +228,7 @@ const ko: LocalPanelStrings = {
   permHelpScreen: '“시스템 설정 → 개인정보 보호 및 보안 → 화면 기록”에서 aiDesk.to를 켜세요.',
   permHelpAccessibility: '“시스템 설정 → 개인정보 보호 및 보안 → 손쉬운 사용”에서 aiDesk.to를 켜세요.',
   permHelpDisk: '“시스템 설정 → 개인정보 보호 및 보안 → 전체 디스크 접근”에서 aiDesk.to를 켜세요(목록에 없으면 +로 추가).',
+  openSettings: '설정 열기',
   cancel: '취소', confirm: '확인',
   disconnectTitle: '이 연결을 끊을까요?', disconnectText: '이 연결만 종료합니다.',
   stopTitle: '모두 연결을 끊을까요?', stopText: '다시 확인하면 현재 보고 있거나 제어 중인 모두의 연결을 끊습니다. 이후 연결은 계속 허용됩니다.',
@@ -246,3 +253,15 @@ export function localPanelText(
 }
 
 export const LOCAL_PANEL_LOCALES = UI_LOCALES;
+
+/**
+ * The strings table and its lookup as plain JavaScript source for the self-contained panel page (see uiLocaleEmbedSource): the
+ * very same table and function, evaluated in the page, so the page cannot drift from this module.
+ */
+export function localPanelStringsEmbedSource(): string {
+  return [
+    `var LOCAL_PANEL_STRINGS=${JSON.stringify(LOCAL_PANEL_STRINGS)};`,
+    `var UI_LOCALE_AUTONYMS=${JSON.stringify(UI_LOCALE_AUTONYMS)};`,
+    localPanelText.toString(),
+  ].join('\n');
+}

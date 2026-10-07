@@ -6,6 +6,8 @@ export const REMOTE_DESKTOP_LOCAL_MANAGEMENT = Object.freeze({
   PORT: 43751,
   ROOT_PATH: '/',
   STATE_PATH: '/api/state',
+  /** POST {target: a REMOTE_DESKTOP_LOCAL_PERMISSION value}: open that pane of macOS System Settings in the signed-in user's session (a fixed mapping; the page never names a URL). */
+  OPEN_SETTINGS_PATH: '/open-settings',
   ACTION_PATH: '/api/action',
   /** Native clients (indicator, app) POST here, with OPEN_WINDOW_HEADER and no Origin, to have the node open or focus the panel window. */
   OPEN_WINDOW_PATH: '/open-window',
@@ -67,20 +69,37 @@ export type RemoteDesktopLocalPermissions = Partial<Record<
 /** Longest host name the panel shows (it is cut with an ellipsis and carried in full in the hover title). */
 export const REMOTE_DESKTOP_LOCAL_DEVICE_NAME_MAX_CHARS = 128;
 
+/** The System Settings pane each permission lives in (macOS). The node opens exactly these, chosen by key, never by anything the page sends. */
+export const MACOS_PRIVACY_PANE_URL: Readonly<Record<string, string>> = Object.freeze({
+  [REMOTE_DESKTOP_LOCAL_PERMISSION.SCREEN_RECORDING]: 'x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture',
+  [REMOTE_DESKTOP_LOCAL_PERMISSION.ACCESSIBILITY]: 'x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility',
+  [REMOTE_DESKTOP_LOCAL_PERMISSION.FULL_DISK_ACCESS]: 'x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles',
+});
+export type RemoteDesktopLocalPermissionTarget = typeof REMOTE_DESKTOP_LOCAL_PERMISSION[keyof typeof REMOTE_DESKTOP_LOCAL_PERMISSION];
+export function isRemoteDesktopLocalPermissionTarget(value: unknown): value is RemoteDesktopLocalPermissionTarget {
+  return typeof value === 'string' && Object.prototype.hasOwnProperty.call(MACOS_PRIVACY_PANE_URL, value);
+}
+
 export interface RemoteDesktopLocalExtras {
   deviceName?: string;
+  /** The node's own version, shown on the About page. */
+  version?: string;
   permissions?: RemoteDesktopLocalPermissions;
 }
 
 /** Keep only what is well formed: a trimmed printable host name, known permission keys with known states. Anything else is dropped. */
 export function sanitizeRemoteDesktopLocalExtras(value: unknown): RemoteDesktopLocalExtras {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
-  const raw = value as { deviceName?: unknown; permissions?: unknown };
+  const raw = value as { deviceName?: unknown; permissions?: unknown; version?: unknown };
   const out: RemoteDesktopLocalExtras = {};
   if (typeof raw.deviceName === 'string') {
     // eslint-disable-next-line no-control-regex
     const name = raw.deviceName.replace(/[\u0000-\u001f\u007f]+/gu, ' ').trim().slice(0, REMOTE_DESKTOP_LOCAL_DEVICE_NAME_MAX_CHARS);
     if (name) out.deviceName = name;
+  }
+  if (typeof raw.version === 'string') {
+    const version = raw.version.trim();
+    if (/^[\w.+-]{1,64}$/u.test(version)) out.version = version;
   }
   if (raw.permissions && typeof raw.permissions === 'object' && !Array.isArray(raw.permissions)) {
     const states = new Set<unknown>(Object.values(REMOTE_DESKTOP_LOCAL_PERMISSION_STATE));

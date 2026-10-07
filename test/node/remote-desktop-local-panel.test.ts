@@ -169,7 +169,14 @@ describe('remote desktop local panel', () => {
     }
   });
 
-  it('contains a two-step stop confirmation and live duration refresh in the shared client', async () => {
+  /** The real page, with its real script, in jsdom: `fetch` is the test's own node. */
+  async function openPageInDom(options: {
+    state?: () => Record<string, unknown>;
+    languages?: string[];
+    extraFetch?: (url: string, init?: RequestInit) => { ok: boolean } | undefined;
+    storage?: Record<string, string>;
+    beforeParse?: (window: import('jsdom').DOMWindow) => void;
+  } = {}) {
     const panel = await startRemoteDesktopLocalPanel({
       publicNodeId: '1234567890', serverUrl: 'https://example.test/',
       status: () => ({ paused: false, connections: [] }),
@@ -178,87 +185,239 @@ describe('remote desktop local panel', () => {
     });
     panels.push(panel);
     const html = await (await fetch(panel.url)).text();
-    expect(html).toContain('E.stop.onclick=()=>ask(B.actions.STOP_ALL)');
-    expect(html).toContain('E.confirmAction.onclick=()=>');
-    expect(html).toContain('setInterval(tick,1000)');
-  });
-
-  it('runs the rendered client without relying on named-window element globals', async () => {
-    const panel = await startRemoteDesktopLocalPanel({
-      publicNodeId: '1234567890', serverUrl: 'https://example.test/',
-      status: () => ({ paused: false, connections: [] }),
-      setPaused: async () => {}, stopAll: async () => {}, disconnect: async () => false,
-      port: 0,
+    const baseState = { publicNodeId: '1234567890', paused: false, connections: [] as unknown[] };
+    const fetchClient = vi.fn(async (url: string, init?: RequestInit) => {
+      const custom = options.extraFetch?.(url, init);
+      if (custom) return custom;
+      if (url === REMOTE_DESKTOP_LOCAL_MANAGEMENT.STATE_PATH) return { ok: true, json: async () => ({ ...baseState, ...(options.state?.() ?? {}) }) };
+      return { ok: true, json: async () => ({ ok: true }) };
     });
-    panels.push(panel);
-    const html = await (await fetch(panel.url)).text();
-    const clientConnections = [{
-      id: 'opaque-one', label: '#1', connectedAt: Date.now() - 2_000,
-      mode: REMOTE_DESKTOP_ACCESS_MODE.VIEW,
-    }];
-    const fetchClient = vi.fn(async () => ({
-      ok: true,
-      json: async () => ({ publicNodeId: '1234567890', paused: false, connections: clientConnections }),
-    }));
+    const storage = { ...(options.storage ?? {}) };
     const dom = new JSDOM(html, {
       url: panel.url,
       runScripts: 'dangerously',
       beforeParse(window) {
         Object.defineProperty(window, 'fetch', { configurable: true, value: fetchClient });
-        Object.defineProperty(window.navigator, 'clipboard', {
+        Object.defineProperty(window.navigator, 'languages', { configurable: true, value: options.languages ?? ['en-US'] });
+        Object.defineProperty(window.navigator, 'language', { configurable: true, value: (options.languages ?? ['en-US'])[0] });
+        Object.defineProperty(window.navigator, 'clipboard', { configurable: true, value: { writeText: vi.fn(async () => {}) } });
+        Object.defineProperty(window, 'localStorage', {
           configurable: true,
-          value: { writeText: vi.fn(async () => {}) },
+          value: {
+            getItem: (key: string) => (key in storage ? storage[key]! : null),
+            setItem: (key: string, value: string) => { storage[key] = value; },
+            removeItem: (key: string) => { delete storage[key]; },
+          },
         });
-        window.HTMLDialogElement.prototype.showModal = function showModal() {
-          this.setAttribute('open', '');
-        };
-        window.HTMLDialogElement.prototype.close = function close() {
-          this.removeAttribute('open');
-        };
+        options.beforeParse?.(window);
+      },
+    });
+    return { dom, fetchClient, storage, panel, html };
+  }
+  const byId = (dom: JSDOM, id: string) => dom.window.document.getElementById(id) as HTMLElement;
+  const posts = (fetchClient: ReturnType<typeof vi.fn>) => fetchClient.mock.calls
+    .filter(([, init]) => (init as RequestInit | undefined)?.method === 'POST')
+    .map(([url, init]) => ({ url: url as string, body: JSON.parse(String((init as RequestInit).body)) as Record<string, unknown> }));
+
+  it('asks twice before disconnecting one connection or everyone, shows live durations, and refreshes after each action', async () => {
+    const connections = [{ id: 'opaque-one', label: '1', connectedAt: Date.now() - 2_000, mode: REMOTE_DESKTOP_ACCESS_MODE.VIEW }];
+    const { dom, fetchClient } = await openPageInDom({ state: () => ({ connections }) });
+    try {
+      await vi.waitFor(() => expect(byId(dom, 'statusText').textContent).toBe('In use'));
+      expect(byId(dom, 'count').textContent).toBe('1');
+      const duration = dom.window.document.querySelector('[data-since]') as HTMLElement;
+      expect(duration.textContent).toBe('00:02');
+      dom.window.Date.now = () => connections[0]!.connectedAt + 65_000;
+      await vi.waitFor(() => expect(duration.textContent).toBe('01:05'), { timeout: 3_000 });
+
+      const disconnect = dom.window.document.querySelector('.conn button') as HTMLButtonElement;
+      disconnect.click();
+      expect(byId(dom, 'modal').hidden).toBe(false);
+      expect(posts(fetchClient)).toEqual([]);
+      byId(dom, 'cancel').click();
+      expect(byId(dom, 'modal').hidden).toBe(true);
+      expect(posts(fetchClient)).toEqual([]);
+      disconnect.click();
+      byId(dom, 'confirmAction').click();
+      await vi.waitFor(() => expect(posts(fetchClient)).toEqual([{ url: '/api/action', body: { action: REMOTE_DESKTOP_LOCAL_ACTION.DISCONNECT, id: 'opaque-one' } }]));
+      const statePolls = () => fetchClient.mock.calls.filter(([url, init]) => url === REMOTE_DESKTOP_LOCAL_MANAGEMENT.STATE_PATH && (init as RequestInit).method === undefined).length;
+      await vi.waitFor(() => expect(statePolls()).toBeGreaterThanOrEqual(2));
+
+      byId(dom, 'stopAll').click();
+      expect(byId(dom, 'modal').hidden).toBe(false);
+      expect(posts(fetchClient)).toHaveLength(1);
+      byId(dom, 'confirmAction').click();
+      await vi.waitFor(() => expect(posts(fetchClient)).toHaveLength(2));
+      expect(posts(fetchClient)[1]!.body.action).toBe(REMOTE_DESKTOP_LOCAL_ACTION.STOP_ALL);
+      expect(fetchClient).toHaveBeenCalledWith('/api/state', { cache: 'no-store' });
+    } finally { dom.window.close(); }
+  });
+
+  it('the dialog is modal: Escape closes it, Tab stays inside it and focus returns to the opener', async () => {
+    const connections = [{ id: 'a', label: '1', connectedAt: Date.now() - 1_000, mode: REMOTE_DESKTOP_ACCESS_MODE.CONTROL }];
+    const { dom, fetchClient } = await openPageInDom({ state: () => ({ connections }) });
+    try {
+      await vi.waitFor(() => expect(byId(dom, 'count').textContent).toBe('1'));
+      const opener = byId(dom, 'stopAll');
+      opener.focus();
+      opener.click();
+      expect(dom.window.document.activeElement).toBe(byId(dom, 'cancel'));
+      const press = (init: KeyboardEventInit) => dom.window.document.dispatchEvent(new dom.window.KeyboardEvent('keydown', { bubbles: true, cancelable: true, ...init }));
+      byId(dom, 'confirmAction').focus();
+      press({ key: 'Tab' });
+      expect(dom.window.document.activeElement).toBe(byId(dom, 'cancel'));
+      press({ key: 'Tab', shiftKey: true });
+      expect(dom.window.document.activeElement).toBe(byId(dom, 'confirmAction'));
+      press({ key: 'Escape' });
+      expect(byId(dom, 'modal').hidden).toBe(true);
+      expect(dom.window.document.activeElement).toBe(opener);
+      expect(posts(fetchClient)).toEqual([]);
+    } finally { dom.window.close(); }
+  });
+
+  it('the switch says On/Off in words, is allowed-vs-paused consistently with the banner and pill, and toggles the right action', async () => {
+    let paused = false;
+    const { dom, fetchClient } = await openPageInDom({ state: () => ({ paused }) });
+    try {
+      const sw = byId(dom, 'allowSwitch');
+      await vi.waitFor(() => expect(byId(dom, 'statusPill').hidden).toBe(false));
+      expect(byId(dom, 'statusText').textContent).toBe('Online');
+      expect(sw.getAttribute('aria-checked')).toBe('true');
+      expect(byId(dom, 'swOn').textContent).toBe('On');
+      expect(byId(dom, 'pausedBanner').hidden).toBe(true);
+      sw.click();
+      await vi.waitFor(() => expect(posts(fetchClient).map((p) => p.body.action)).toEqual([REMOTE_DESKTOP_LOCAL_ACTION.PAUSE]));
+      paused = true;
+      await vi.waitFor(() => expect(sw.getAttribute('aria-checked')).toBe('false'), { timeout: 3_000 });
+      expect(byId(dom, 'swOff').textContent).toBe('Off');
+      expect(byId(dom, 'pausedBanner').hidden).toBe(false);
+      expect(byId(dom, 'statusText').textContent).toBe('Paused');
+      expect(byId(dom, 'allowHelp').textContent).toBe('Nobody can connect until you turn this on.');
+      byId(dom, 'resume').click();
+      await vi.waitFor(() => expect(posts(fetchClient).map((p) => p.body.action)).toEqual([REMOTE_DESKTOP_LOCAL_ACTION.PAUSE, REMOTE_DESKTOP_LOCAL_ACTION.RESUME]));
+    } finally { dom.window.close(); }
+  });
+
+  it('shows the node unreachable and recovers, without losing the last state', async () => {
+    let down = false;
+    const { dom } = await openPageInDom({
+      state: () => ({ connections: [{ id: 'a', label: '1', connectedAt: Date.now(), mode: REMOTE_DESKTOP_ACCESS_MODE.VIEW }] }),
+      extraFetch: (url) => (down && url === REMOTE_DESKTOP_LOCAL_MANAGEMENT.STATE_PATH ? { ok: false } : undefined),
+    });
+    try {
+      await vi.waitFor(() => expect(byId(dom, 'count').textContent).toBe('1'));
+      expect(byId(dom, 'offlineBanner').hidden).toBe(true);
+      down = true;
+      await vi.waitFor(() => expect(byId(dom, 'offlineBanner').hidden).toBe(false), { timeout: 3_000 });
+      expect(byId(dom, 'statusText').textContent).toBe('Offline');
+      expect(byId(dom, 'count').textContent).toBe('1');
+      down = false;
+      await vi.waitFor(() => expect(byId(dom, 'offlineBanner').hidden).toBe(true), { timeout: 3_000 });
+    } finally { dom.window.close(); }
+  });
+
+  it('shows the host name and permission tiles only when the node sends them, and the tile button asks for that pane only', async () => {
+    let extras: Record<string, unknown> = {};
+    const { dom, fetchClient } = await openPageInDom({ state: () => extras });
+    try {
+      await vi.waitFor(() => expect(byId(dom, 'statusText').textContent).toBe('Online'));
+      expect(byId(dom, 'permsCard').hidden).toBe(true);
+      expect(byId(dom, 'deviceName').textContent).toBe('This computer');
+      extras = { deviceName: '<img src=x onerror=alert(1)>', permissions: { screenRecording: 'granted', accessibility: 'unknown', fullDiskAccess: 'denied' } };
+      await vi.waitFor(() => expect(byId(dom, 'permsCard').hidden).toBe(false), { timeout: 3_000 });
+      expect(byId(dom, 'deviceName').textContent).toBe('<img src=x onerror=alert(1)>');
+      expect(byId(dom, 'deviceName').querySelector('img')).toBeNull();
+      expect(dom.window.document.querySelectorAll('.perm')).toHaveLength(3);
+      expect(dom.window.document.querySelectorAll('.perm.ok')).toHaveLength(1);
+      const buttons = [...dom.window.document.querySelectorAll('.perm button')] as HTMLButtonElement[];
+      expect(buttons.map((b) => b.getAttribute('data-target'))).toEqual(['accessibility', 'fullDiskAccess']);
+      buttons[1]!.click();
+      await vi.waitFor(() => expect(posts(fetchClient)).toEqual([{ url: REMOTE_DESKTOP_LOCAL_MANAGEMENT.OPEN_SETTINGS_PATH, body: { target: 'fullDiskAccess' } }]));
+    } finally { dom.window.close(); }
+  });
+
+  it('follows the system language, lets the person pick another that sticks, and "Follow system" goes back', async () => {
+    const { dom, storage } = await openPageInDom({ languages: ['de-DE', 'zh-Hant-TW', 'en'] });
+    try {
+      await vi.waitFor(() => expect(byId(dom, 'statusText').textContent).toBe('上線'));
+      expect(dom.window.document.documentElement.lang).toBe('zh-TW');
+      expect(dom.window.document.title).toBe(LOCAL_PANEL_WINDOW_TITLE);
+      const select = byId(dom, 'langSelect') as HTMLSelectElement;
+      expect(select.value).toBe('system');
+      expect([...select.options].map((o) => o.value)).toEqual(['system', 'en', 'zh-CN', 'zh-TW', 'es', 'ru', 'ja', 'ko']);
+      select.value = 'ru';
+      select.dispatchEvent(new dom.window.Event('change', { bubbles: true }));
+      expect(byId(dom, 'statusText').textContent).toBe('В сети');
+      expect(dom.window.document.documentElement.lang).toBe('ru');
+      expect(storage['aidesk-local-lang']).toBe('ru');
+      select.value = 'system';
+      select.dispatchEvent(new dom.window.Event('change', { bubbles: true }));
+      expect(byId(dom, 'statusText').textContent).toBe('上線');
+      expect('aidesk-local-lang' in storage).toBe(false);
+    } finally { dom.window.close(); }
+  });
+
+  it('a remembered choice beats the system language; junk in storage is ignored; blocked storage does not break the page', async () => {
+    const remembered = await openPageInDom({ languages: ['en-US'], storage: { 'aidesk-local-lang': 'ko' } });
+    try {
+      await vi.waitFor(() => expect(byId(remembered.dom, 'statusText').textContent).toBe('온라인'));
+      expect((byId(remembered.dom, 'langSelect') as HTMLSelectElement).value).toBe('ko');
+    } finally { remembered.dom.window.close(); }
+    const junk = await openPageInDom({ languages: ['es-ES'], storage: { 'aidesk-local-lang': 'klingon' } });
+    try {
+      await vi.waitFor(() => expect(byId(junk.dom, 'statusText').textContent).toBe('En línea'));
+    } finally { junk.dom.window.close(); }
+    const blocked = await openPageInDom({
+      languages: ['ja'],
+      beforeParse(window) {
+        Object.defineProperty(window, 'localStorage', { configurable: true, get() { throw new window.DOMException('denied', 'SecurityError'); } });
       },
     });
     try {
-      await vi.waitFor(() => expect(dom.window.document.getElementById('status')?.textContent)
-        .toBe('1 active connection(s)'));
-      const duration = dom.window.document.querySelector('[data-since]') as HTMLElement;
-      expect(duration.textContent).toBe('00:02');
-      dom.window.Date.now = () => clientConnections[0]!.connectedAt + 65_000;
-      dom.window.eval('tick()');
-      expect(duration.textContent).toBe('01:05');
+      await vi.waitFor(() => expect(byId(blocked.dom, 'statusText').textContent).toBe('オンライン'));
+      const select = byId(blocked.dom, 'langSelect') as HTMLSelectElement;
+      select.value = 'en';
+      expect(() => select.dispatchEvent(new blocked.dom.window.Event('change', { bubbles: true }))).not.toThrow();
+      expect(byId(blocked.dom, 'statusText').textContent).toBe('Online');
+    } finally { blocked.dom.window.close(); }
+  });
 
-      const disconnect = dom.window.document.querySelector('.connection button') as HTMLButtonElement;
-      disconnect.click();
-      expect(dom.window.document.getElementById('confirm')?.hasAttribute('open')).toBe(true);
-      expect(fetchClient.mock.calls.some(([, init]) => init?.method === 'POST')).toBe(false);
-      (dom.window.document.getElementById('cancel') as HTMLButtonElement).click();
-      disconnect.click();
-      (dom.window.document.getElementById('confirmAction') as HTMLButtonElement).click();
-      await vi.waitFor(() => expect(fetchClient.mock.calls.some(([, init]) => (
-        init?.method === 'POST'
-        && JSON.parse(String(init.body)).action === REMOTE_DESKTOP_LOCAL_ACTION.DISCONNECT
-        && JSON.parse(String(init.body)).id === 'opaque-one'
-      ))).toBe(true));
-      await vi.waitFor(() => expect(fetchClient.mock.calls.filter(([url, init]) => (
-        url === REMOTE_DESKTOP_LOCAL_MANAGEMENT.STATE_PATH && init?.method === undefined
-      ))).toHaveLength(2));
-      (dom.window.document.getElementById('stop') as HTMLButtonElement).click();
-      expect(dom.window.document.getElementById('confirm')?.hasAttribute('open')).toBe(true);
-      expect(fetchClient.mock.calls.some(([, init]) => (
-        init?.method === 'POST'
-        && JSON.parse(String(init.body)).action === REMOTE_DESKTOP_LOCAL_ACTION.STOP_ALL
-      ))).toBe(false);
-      (dom.window.document.getElementById('confirmAction') as HTMLButtonElement).click();
-      await vi.waitFor(() => expect(fetchClient.mock.calls.some(([, init]) => (
-        init?.method === 'POST'
-        && JSON.parse(String(init.body)).action === REMOTE_DESKTOP_LOCAL_ACTION.STOP_ALL
-      ))).toBe(true));
-      await vi.waitFor(() => expect(fetchClient.mock.calls.filter(([url, init]) => (
-        url === REMOTE_DESKTOP_LOCAL_MANAGEMENT.STATE_PATH && init?.method === undefined
-      ))).toHaveLength(3));
-      expect(fetchClient).toHaveBeenCalledWith('/api/state', { cache: 'no-store' });
-    } finally {
-      dom.window.close();
-    }
+  it('copies the raw ID (the display is grouped 3-3-4) and falls back when the async clipboard is missing', async () => {
+    const written: string[] = [];
+    const { dom } = await openPageInDom({
+      beforeParse(window) {
+        Object.defineProperty(window.navigator, 'clipboard', { configurable: true, value: { writeText: async (text: string) => { written.push(text); } } });
+      },
+    });
+    try {
+      expect(byId(dom, 'nodeId').textContent).toBe('123 456 7890');
+      byId(dom, 'copy').click();
+      await vi.waitFor(() => expect(written).toEqual(['1234567890']));
+      await vi.waitFor(() => expect(byId(dom, 'toast').textContent).toBe('Copied'));
+    } finally { dom.window.close(); }
+    const execCalls: string[] = [];
+    const fallback = await openPageInDom({
+      beforeParse(window) {
+        Object.defineProperty(window.navigator, 'clipboard', { configurable: true, value: undefined });
+        (window.document as unknown as { execCommand: (c: string) => boolean }).execCommand = (command: string) => { execCalls.push(command); return true; };
+      },
+    });
+    try {
+      byId(fallback.dom, 'copy').click();
+      expect(execCalls).toEqual(['copy']);
+    } finally { fallback.dom.window.close(); }
+  });
+
+  it('keeps one section visible at a time and marks the current one', async () => {
+    const { dom } = await openPageInDom();
+    try {
+      const pages = () => ['home', 'settings', 'about'].map((name) => !(dom.window.document.querySelector(`.page[data-page="${name}"]`) as HTMLElement).hidden);
+      expect(pages()).toEqual([true, false, false]);
+      (dom.window.document.querySelector('.nav[data-page="about"]') as HTMLButtonElement).click();
+      expect(pages()).toEqual([false, false, true]);
+      expect(dom.window.document.querySelector('.nav[aria-current="page"]')?.getAttribute('data-page')).toBe('about');
+      expect(byId(dom, 'aboutId').textContent).toBe('123 456 7890');
+    } finally { dom.window.close(); }
   });
 });
 
@@ -370,11 +529,101 @@ describe('remote desktop local panel: independent window entry', () => {
     expect((await fetch(new URL(LOCAL_PANEL_EXTERNAL_PATH, refused.url), { method: 'POST', headers: { cookie: refusedCookie, origin: new URL(refused.url).origin, 'content-type': 'application/json', [REMOTE_DESKTOP_LOCAL_MANAGEMENT.CSRF_HEADER]: refusedCsrf }, body: '{"target":"share"}' })).status).toBe(502);
   });
 
-  it('the page sends its two links through open-external and keeps a plain-link fallback', async () => {
+  it('the page sends Share and Web management through open-external, and only opens a window itself when that is refused', async () => {
     const panel = await startPanel({ openExternal: async () => true });
     const html = await (await fetch(panel.url)).text();
-    expect(html).toContain(`"externalPath":"${LOCAL_PANEL_EXTERNAL_PATH}"`);
-    expect(html).toContain('el.onclick=async(ev)=>{ev.preventDefault()');
-    expect(html).toContain("window.open(el.href,'_blank','noopener,noreferrer')");
+    for (const accepting of [true, false]) {
+      const opened: string[] = [];
+      const fetchClient = vi.fn(async (url: string, init?: RequestInit) => {
+        if (url === LOCAL_PANEL_EXTERNAL_PATH) return { ok: accepting };
+        return { ok: true, json: async () => ({ publicNodeId: '1234567890', paused: false, connections: [] }), init };
+      });
+      const dom = new JSDOM(html, {
+        url: panel.url, runScripts: 'dangerously',
+        beforeParse(window) {
+          Object.defineProperty(window, 'fetch', { configurable: true, value: fetchClient });
+          window.open = ((url: string) => { opened.push(url); return null; }) as never;
+        },
+      });
+      try {
+        (dom.window.document.getElementById('share') as HTMLButtonElement).click();
+        (dom.window.document.getElementById('manage') as HTMLButtonElement).click();
+        const sent = () => fetchClient.mock.calls.filter(([url]) => url === LOCAL_PANEL_EXTERNAL_PATH).map(([, init]) => JSON.parse(String((init as RequestInit).body)).target);
+        await vi.waitFor(() => expect(sent()).toEqual(['share', 'manage']));
+        if (accepting) {
+          await new Promise((resolve) => setTimeout(resolve, 50));
+          expect(opened).toEqual([]);
+        } else {
+          await vi.waitFor(() => expect(opened).toHaveLength(2));
+          expect(opened.every((url) => url.startsWith('https://example.test/'))).toBe(true);
+        }
+        // Never a link in the document itself.
+        expect(dom.window.document.querySelectorAll('a[href]')).toHaveLength(0);
+      } finally { dom.window.close(); }
+    }
   });
 });
+
+describe('remote desktop local panel: open-settings', () => {
+  async function start(extra: Partial<Parameters<typeof startRemoteDesktopLocalPanel>[0]> = {}) {
+    const panel = await startRemoteDesktopLocalPanel({
+      publicNodeId: '1234567890', serverUrl: 'https://example.test/',
+      status: () => ({ paused: false, connections: [] }),
+      setPaused: async () => {}, stopAll: async () => {}, disconnect: async () => true, port: 0, ...extra,
+    });
+    panels.push(panel);
+    const page = await fetch(panel.url);
+    const html = await page.text();
+    return {
+      panel,
+      cookie: (page.headers.get('set-cookie') ?? '').split(';')[0]!,
+      csrf: /"csrf":"([^"]+)"/u.exec(html)![1]!,
+      origin: new URL(panel.url).origin,
+      post: (body: unknown, headers: Record<string, string>) => fetch(new URL(REMOTE_DESKTOP_LOCAL_MANAGEMENT.OPEN_SETTINGS_PATH, panel.url), {
+        method: 'POST', headers: { 'content-type': 'application/json', ...headers }, body: JSON.stringify(body),
+      }),
+    };
+  }
+
+  it('opens only a fixed pane chosen by key, behind the same gate as every other mutation', async () => {
+    const openSettings = vi.fn(async () => true);
+    const { cookie, csrf, origin, post } = await start({ openSettings });
+    const good = { cookie, origin, [REMOTE_DESKTOP_LOCAL_MANAGEMENT.CSRF_HEADER]: csrf };
+    for (const target of ['screenRecording', 'accessibility', 'fullDiskAccess']) {
+      expect((await post({ target }, good)).status).toBe(200);
+    }
+    expect(openSettings.mock.calls.map((call) => call[0])).toEqual(['screenRecording', 'accessibility', 'fullDiskAccess']);
+
+    openSettings.mockClear();
+    // No cookie / wrong origin / missing or wrong CSRF -> refused before the handler is reached.
+    expect((await post({ target: 'accessibility' }, { origin, [REMOTE_DESKTOP_LOCAL_MANAGEMENT.CSRF_HEADER]: csrf })).status).toBe(401);
+    expect((await post({ target: 'accessibility' }, { cookie, origin: 'https://evil.test', [REMOTE_DESKTOP_LOCAL_MANAGEMENT.CSRF_HEADER]: csrf })).status).toBe(403);
+    expect((await post({ target: 'accessibility' }, { cookie, origin })).status).toBe(403);
+    expect((await post({ target: 'accessibility' }, { cookie, origin, [REMOTE_DESKTOP_LOCAL_MANAGEMENT.CSRF_HEADER]: 'wrong' })).status).toBe(403);
+    // The page cannot name a URL, a path, a pane of its own invention, or anything that is not exactly one of the three keys.
+    for (const body of [{ target: 'x-apple.systempreferences:com.apple.preference.security?Privacy_Camera' }, { target: '../etc' }, { target: 'camera' }, { target: 7 }, { url: 'https://evil.test' }, {}, { target: 'toString' }, { target: '__proto__' }]) {
+      expect((await post(body, good)).status, JSON.stringify(body)).toBe(400);
+    }
+    expect(openSettings).not.toHaveBeenCalled();
+  });
+
+  it('answers 501 without a handler (not macOS), 502 when the pane could not be opened, 502 when the handler throws', async () => {
+    const none = await start();
+    expect((await none.post({ target: 'accessibility' }, { cookie: none.cookie, origin: none.origin, [REMOTE_DESKTOP_LOCAL_MANAGEMENT.CSRF_HEADER]: none.csrf })).status).toBe(501);
+    const refuses = await start({ openSettings: async () => false });
+    expect((await refuses.post({ target: 'accessibility' }, { cookie: refuses.cookie, origin: refuses.origin, [REMOTE_DESKTOP_LOCAL_MANAGEMENT.CSRF_HEADER]: refuses.csrf })).status).toBe(502);
+    const throws = await start({ openSettings: async () => { throw new Error('boom'); } });
+    expect((await throws.post({ target: 'accessibility' }, { cookie: throws.cookie, origin: throws.origin, [REMOTE_DESKTOP_LOCAL_MANAGEMENT.CSRF_HEADER]: throws.csrf })).status).toBe(502);
+  });
+
+  it('keeps the page headers exactly as they were: same CSP, loopback Host only', async () => {
+    const { panel } = await start();
+    const response = await fetch(panel.url);
+    expect(response.headers.get('content-security-policy'))
+      .toBe("default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; form-action 'none'; frame-ancestors 'none'; base-uri 'none'");
+    expect(response.headers.get('cache-control')).toBe('no-store');
+    const url = new URL(panel.url);
+    expect(url.hostname).toBe('127.0.0.1');
+  });
+});
+

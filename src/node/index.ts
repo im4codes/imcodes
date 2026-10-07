@@ -21,7 +21,8 @@ import {
 import { CONTROLLED_NODE_SERVICE } from './installer.js';
 import { defaultCredentialPath, defaultStagedExecutablePath, persistCredential, readEnrollmentBlob } from './enrollment.js';
 import { createControlledNodeIdAdopter } from './controlled-node-id-adoption.js';
-import { REMOTE_DESKTOP_LOCAL_MANAGEMENT } from '../../shared/remote-desktop-local-management.js';
+import { REMOTE_DESKTOP_LOCAL_MANAGEMENT, type RemoteDesktopLocalPermissionTarget } from '../../shared/remote-desktop-local-management.js';
+import { openMacosPrivacyPane } from './macos-privacy-settings.js';
 import {
   applyRemoteDesktopAccessPaused,
   loadRemoteDesktopAccessPaused,
@@ -309,7 +310,8 @@ async function main(): Promise<void> {
       publicNodeId: nodeId,
       serverUrl: bootstrap.credential.serverUrl,
       status: () => runtime.remoteDesktopAccessStatus(),
-      extras: () => runtime.remoteDesktopLocalExtras(),
+      extras: () => ({ ...runtime.remoteDesktopLocalExtras(), version: DAEMON_VERSION }),
+      ...(process.platform === 'darwin' ? { openSettings: (target: RemoteDesktopLocalPermissionTarget) => openMacosPrivacyPane(target) } : {}),
       setPaused: (paused) => applyRemoteDesktopAccessPaused(
         paused,
         (next) => runtime.setRemoteDesktopAccessPaused(next),

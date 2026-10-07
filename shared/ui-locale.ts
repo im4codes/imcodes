@@ -24,7 +24,7 @@ export function isUiLocale(value: unknown): value is UiLocale {
 // Chinese is the one language whose variant matters: Traditional is used in
 // Taiwan, Hong Kong and Macao; everything else (mainland, Singapore, a bare
 // "zh") reads Simplified. A script subtag says it outright and beats the region.
-const TRADITIONAL_REGIONS: ReadonlySet<string> = new Set(['tw', 'hk', 'mo']);
+const TRADITIONAL_REGIONS: readonly string[] = ['tw', 'hk', 'mo'];
 
 /** The locale a single BCP-47 language tag maps to, or null when it is not one of ours. */
 export function matchUiLocale(tag: unknown): UiLocale | null {
@@ -42,7 +42,10 @@ export function matchUiLocale(tag: unknown): UiLocale | null {
       const subtags = parts.slice(1);
       if (subtags.includes('hant')) return 'zh-TW';
       if (subtags.includes('hans')) return 'zh-CN';
-      return subtags.some((subtag) => TRADITIONAL_REGIONS.has(subtag)) ? 'zh-TW' : 'zh-CN';
+      for (const subtag of subtags) {
+        if (TRADITIONAL_REGIONS.indexOf(subtag) >= 0) return 'zh-TW';
+      }
+      return 'zh-CN';
     }
     default: return null;
   }
@@ -76,4 +79,24 @@ export function systemLanguagesOf(navigatorLike: { languages?: readonly string[]
   if (!navigatorLike) return [];
   if (navigatorLike.languages && navigatorLike.languages.length > 0) return navigatorLike.languages;
   return navigatorLike.language ? [navigatorLike.language] : [];
+}
+
+/**
+ * The resolver as plain JavaScript source, for a page that is served as one self-contained document (the controlled node's local
+ * panel has no bundler and loads nothing external). It is these very functions, not a second implementation: they are written
+ * without imports or closures so their own source is complete, and a test runs this text in an empty sandbox and compares it
+ * with the module on many inputs. Keep them to plain ES2019.
+ */
+export function uiLocaleEmbedSource(): string {
+  return [
+    `var UI_LOCALES=${JSON.stringify(UI_LOCALES)};`,
+    `var UI_LOCALE_DEFAULT=${JSON.stringify(UI_LOCALE_DEFAULT)};`,
+    `var UI_LOCALE_FOLLOW_SYSTEM=${JSON.stringify(UI_LOCALE_FOLLOW_SYSTEM)};`,
+    `var TRADITIONAL_REGIONS=${JSON.stringify(TRADITIONAL_REGIONS)};`,
+    isUiLocale.toString(),
+    matchUiLocale.toString(),
+    resolveUiLocale.toString(),
+    uiLocaleFromPreference.toString(),
+    systemLanguagesOf.toString(),
+  ].join('\n');
 }
