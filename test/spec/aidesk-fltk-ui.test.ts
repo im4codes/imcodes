@@ -64,8 +64,8 @@ describe('aiDesk FLTK native management window', () => {
       source('scripts/build-aidesk-app.mjs'),
       source('shared/aidesk-product.json'),
     ]);
-    expect(entry).toContain('resolveAideskLocalUiExecutable');
-    expect(entry).toContain('if (existsSync(nativeUi))');
+    // launchers point at the node itself; the shared decision layer verifies any native host before it starts one
+    expect(entry).not.toContain('resolveAideskLocalUiExecutable');
     expect(entry).toContain('const url = localPanelUrl()');
     // The macOS app no longer launches the FLTK helper or the browser: the panel is its own WKWebView window (aidesk_panel_window.mm).
     expect(agent).toContain('ShowLocalPanelWindow()');

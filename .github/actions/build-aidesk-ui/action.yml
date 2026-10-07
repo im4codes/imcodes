@@ -37,6 +37,7 @@ runs:
         if ($LASTEXITCODE -ne 0) { throw 'building the panel window host failed' }
         $exe = Join-Path $art 'aidesk-local-ui.exe'
         if (-not (Test-Path $exe)) { throw "The panel window host was not built at $exe." }
+        if (-not (Test-Path (Join-Path $art 'THIRD-PARTY-NOTICES.txt'))) { throw 'The panel window host third-party notices are missing.' }
         & .\scripts\windows-sign-release-artifact.ps1 -Mode Sign -ArtifactPath $exe `
           -CodeSigningCertificateThumbprint $env:AIDESK_THUMBPRINT -ExpectedSignerSha256 $env:AIDESK_SIGNER_SHA256 -TimestampUrl 'http://timestamp.digicert.com'
         if ($LASTEXITCODE -ne 0) { throw 'signing the panel window host failed' }

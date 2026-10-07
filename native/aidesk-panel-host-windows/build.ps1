@@ -31,9 +31,9 @@ try {
   if (-not $exe) { throw 'the panel window host was not produced' }
   New-Item -ItemType Directory -Force -Path $ArtifactRoot | Out-Null
   Copy-Item -LiteralPath $exe.FullName -Destination (Join-Path $ArtifactRoot 'aidesk-local-ui.exe') -Force
-  # The third-party licence text the static loader requires travels with the binary.
-  Copy-Item -LiteralPath (Join-Path $sdkRoot 'LICENSE.txt') -Destination (Join-Path $ArtifactRoot 'WEBVIEW2-LICENSE.txt') -Force
-  Copy-Item -LiteralPath (Join-Path $sdkRoot 'NOTICE.txt') -Destination (Join-Path $ArtifactRoot 'WEBVIEW2-NOTICE.txt') -Force
+  # The third-party licence text the static loader requires travels with the binary, as ONE file (the server serves exactly three files).
+  $notices = @("aiDesk.to by IM.codes -- window host: third-party software", "", "Microsoft.Web.WebView2 SDK (statically linked loader and headers)", "", (Get-Content -LiteralPath (Join-Path $sdkRoot 'LICENSE.txt') -Raw), "", "-----", "", (Get-Content -LiteralPath (Join-Path $sdkRoot 'NOTICE.txt') -Raw)) -join "`r`n"
+  Set-Content -LiteralPath (Join-Path $ArtifactRoot 'THIRD-PARTY-NOTICES.txt') -Value $notices -Encoding UTF8
   "aidesk-local-ui.exe ($Arch): $((Get-Item (Join-Path $ArtifactRoot 'aidesk-local-ui.exe')).Length) bytes"
 } finally {
   Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue

@@ -2,6 +2,7 @@ import { AIDESK_HICOLOR_ICONS_BASE64, AIDESK_ICON_SOURCE_SHA256 } from '../../sh
 import { logoSha256 } from '../../scripts/aidesk-icon.mjs';
 import { LOCAL_PANEL_LINUX_WM_CLASS } from '../../shared/local-panel-window.js';
 import { mkdtemp, mkdir, readFile, readlink, rm, stat, writeFile } from 'node:fs/promises';
+import { readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -14,7 +15,6 @@ import {
   writeLinuxAideskIcons,
   ensureMacosAideskApplicationEntry,
   isMacosAideskAgentRunning,
-  resolveAideskLocalUiExecutable,
   resolveWindowsPowerShellExecutable,
   removeLinuxAideskDesktopEntry,
   removeMacosAideskApplicationEntry,
@@ -43,13 +43,11 @@ describe('aiDesk desktop entries', () => {
     expect(entry).toContain('Icon=aidesk\n');
   });
 
-  it('resolves the packaged native UI beside the controlled-node executable on each desktop OS', () => {
-    expect(resolveAideskLocalUiExecutable('win32', 'D:\\IM.codes\\node.exe')).toBe(
-      'D:\\IM.codes\\aidesk-local-ui.exe',
-    );
-    expect(resolveAideskLocalUiExecutable('linux', '/opt/imcodes/node')).toBe(
-      '/opt/imcodes/aidesk-local-ui',
-    );
+  it('user launchers point at the node itself, never at an unverified executable found beside it', () => {
+    const source = readFileSync(join(process.cwd(), 'src/node/aidesk-desktop-entry.ts'), 'utf8');
+    expect(source).not.toContain('resolveAideskLocalUiExecutable');
+    expect(source).toContain('executablePath: process.execPath');
+    expect(source).not.toMatch(/existsSync\(nativeUi\)/u);
   });
 
   it('uses the existing signed macOS bundle through an idempotent user Applications link', async () => {

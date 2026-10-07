@@ -19,7 +19,6 @@ import { tmpdir } from 'node:os';
 import { setTimeout as delay } from 'node:timers/promises';
 import {
   AIDESK_LINUX_DESKTOP_FILE_NAME,
-  AIDESK_LOCAL_UI_EXECUTABLE_NAME,
   AIDESK_MACOS_APP_NAME,
   AIDESK_PRODUCT_NAME,
   AIDESK_WINDOWS_SHORTCUT_FILE_NAME,
@@ -424,17 +423,17 @@ export async function ensureAideskDesktopEntry(
     const passwd = readFileSync('/etc/passwd', 'utf8');
     const user = pickLinuxDesktopUserProfile(passwd);
     if (!user) return 'unavailable';
-    const nativeUi = resolveAideskLocalUiExecutable(platform);
+    // Always the node itself (`--open-local-panel`): the shared window decision verifies any native host before it starts one. An
+    // unverified executable found beside the node is never what a user's launcher points at.
     return ensureLinuxAideskDesktopEntry({
       ...user,
-      executablePath: existsSync(nativeUi) ? nativeUi : process.execPath,
+      executablePath: process.execPath,
       runUpdateDatabase: runUpdateDesktopDatabase,
     });
   }
   if (platform === 'win32') {
-    const nativeUi = resolveAideskLocalUiExecutable(platform);
     return ensureWindowsAideskShortcut({
-      executablePath: existsSync(nativeUi) ? nativeUi : process.execPath,
+      executablePath: process.execPath,
     });
   }
   return 'unavailable';
@@ -444,32 +443,12 @@ export function localPanelUrl(): string {
   return `http://${REMOTE_DESKTOP_LOCAL_MANAGEMENT.HOST}:${REMOTE_DESKTOP_LOCAL_MANAGEMENT.PORT}/`;
 }
 
-export function resolveAideskLocalUiExecutable(
-  platform: NodeJS.Platform = process.platform,
-  executablePath = process.execPath,
-): string {
-  if (platform === 'win32') {
-    return win32.join(
-      win32.dirname(executablePath),
-      `${AIDESK_LOCAL_UI_EXECUTABLE_NAME}.exe`,
-    );
-  }
-  return resolve(
-    dirname(executablePath),
-    AIDESK_LOCAL_UI_EXECUTABLE_NAME,
-  );
-}
-
 /**
- * The pre-window way of opening the panel: the native aiDesk window when installed next to this executable, else the default
- * browser. Kept as the last resort behind the shared window decision (local-panel-window-run.ts), so there is always an entry.
+ * The pre-window way of opening the panel: the default browser. Kept as the last resort behind the shared window decision
+ * (local-panel-window-run.ts), so there is always an entry. (It no longer starts an executable it found beside the node: only the
+ * decision layer starts a native host, and only after verifying it.)
  */
 export function openAideskLocalPanelLegacy(platform = process.platform): void {
-  const nativeUi = resolveAideskLocalUiExecutable(platform);
-  if (existsSync(nativeUi)) {
-    execFile(nativeUi, [], { windowsHide: false }, () => undefined);
-    return;
-  }
   const url = localPanelUrl();
   if (platform === 'darwin') {
     execFile('/usr/bin/open', [url], { windowsHide: true }, () => undefined);

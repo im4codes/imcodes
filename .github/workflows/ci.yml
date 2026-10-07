@@ -914,6 +914,12 @@ jobs:
           printf '%s' "$IMCODES_MACOS_NOTARY_KEY_BASE64" | base64 --decode > "$KEY_PATH"
           chmod 600 "$KEY_PATH"
           echo "IMCODES_MACOS_NOTARY_KEY_PATH=$KEY_PATH" >> "$GITHUB_ENV"
+      - name: Build, sign and describe the aiDesk panel window host
+        uses: ./.github/actions/build-aidesk-ui
+        with:
+          version: ${{ env.IMCODES_BUILD_VERSION }}
+          windows-signing-cert-thumbprint: ${{ env.IMCODES_WINDOWS_SIGNING_CERT_THUMBPRINT }}
+          windows-signing-cert-sha256: ${{ env.IMCODES_WINDOWS_SIGNING_CERT_SHA256 }}
       - name: Build controlled-node executable
         run: npm run build:node-exe
       - name: Notarize macOS controlled-node executable
@@ -1234,6 +1240,7 @@ jobs:
             dist-node-exe/computer-use-helper/**
             dist-node-exe/*.dmg
             dist-node-exe/remote-desktop-worker/**
+            dist-node-exe/aidesk-local-ui/**
           if-no-files-found: error
           retention-days: 30
       - name: Remove macOS release-signing material
@@ -1368,6 +1375,11 @@ jobs:
           set -euo pipefail
           node scripts/remote-desktop-worker-artifacts.mjs verify \
             server/controlled-node-artifacts "$IMCODES_BUILD_VERSION" win32 x64
+          # The Windows panel window host sidecar (its own manifest, signed exe and third-party notices; the server serves exactly these
+          # three files and answers 404 -- nodes skip -- when they are missing, so a missing one must fail HERE, not in the field).
+          node scripts/aidesk-ui-artifact.mjs verify \
+            server/controlled-node-artifacts/aidesk-local-ui/win32-x64 win32 x64 "$IMCODES_BUILD_VERSION"
+          test -s server/controlled-node-artifacts/aidesk-local-ui/win32-x64/THIRD-PARTY-NOTICES.txt
           for arch in arm64 x64; do
             node scripts/remote-desktop-worker-artifacts.mjs verify \
               server/controlled-node-artifacts "$IMCODES_BUILD_VERSION" darwin "$arch"
@@ -1517,6 +1529,9 @@ jobs:
           docker run --rm --entrypoint node imcodes-smoke:test \
             scripts/remote-desktop-worker-artifacts.mjs verify \
             /app/controlled-node-executables "${{ needs.release_version.outputs.app_version }}" win32 x64
+          for f in aidesk-local-ui.exe aidesk-local-ui.manifest.json THIRD-PARTY-NOTICES.txt; do
+            docker run --rm --entrypoint test imcodes-smoke:test -s "/app/controlled-node-executables/aidesk-local-ui/win32-x64/$f"
+          done
           for arch in arm64 x64; do
             docker run --rm --entrypoint node imcodes-smoke:test \
               scripts/remote-desktop-worker-artifacts.mjs verify \
