@@ -720,11 +720,30 @@ export const TASK_PAIR_BRAIN_CLOSE_RULE: string =
   'Brain: when you have dealt with a pair -- whatever the outcome (merged, decided not to merge, cancelled, its conclusion adopted) -- you MUST close it yourself. '
   + 'The daemon keeps reminding you about every pair you leave open (awaiting your decision, finished but not integrated, workspace kept), and that is where stale reminders come from. '
   + 'How to close, with the MCP tools only: merged or result accepted -> pair_close action=done; not going to merge -> pair_close action=done integration=dismiss; '
-  + 'abandoned -> pair_close action=cancel; more work wanted -> pair_next_round.';
+  + 'abandoned -> pair_close action=cancel; more work wanted -> pair_next_round. '
+  + 'A pair that is already closed (done or cancelled) needs no pair_close: only pair_close action=done integration=dismiss on a done pair still works, to stop its not-yet-merged reminders.';
 
-/** The last sentence of every reminder to Brain about an open pair (decision pending, finished but unintegrated, workspace kept). */
+/**
+ * The last sentence of every reminder to Brain about an OPEN pair (decision pending, passed, awaiting its decision).
+ * Never for a pair that has already ended: pair_close / pair_next_round on a terminal pair are rejected (the one
+ * exception is integration=dismiss on a done pair), so a notice about an ended pair uses
+ * {@link taskPairBrainEndedPairNote} instead.
+ */
 export const TASK_PAIR_BRAIN_CLOSE_REMINDER: string =
   'Once you have dealt with it, close it yourself with the MCP tools or this reminder keeps coming: merged -> pair_close action=done; not merging -> pair_close action=done integration=dismiss; abandoned -> pair_close action=cancel; more work -> pair_next_round.';
+
+/**
+ * What Brain is told about a pair that has ALREADY ended (workspace kept, finished-but-unintegrated, a done report):
+ * there is nothing left to close, and the only call that still works on it is integration=dismiss on a done pair.
+ * 'mixed' is for a summary that lists done and cancelled pairs together.
+ */
+export function taskPairBrainEndedPairNote(status: 'done' | 'cancelled' | 'mixed'): string {
+  const worktree = 'its worktree is removed once it is clean or integrated into a branch';
+  const dismiss = 'pair_close action=done integration=dismiss stops the not-yet-merged reminders';
+  if (status === 'done') return `This pair is already closed, so there is nothing more to close; ${worktree}. If you will not merge its commits, ${dismiss}.`;
+  if (status === 'cancelled') return `This pair is already closed (cancelled), so there is nothing more to close; ${worktree}.`;
+  return `These pairs are already closed, so there is nothing more to close; each worktree is removed once it is clean or integrated into a branch. For a done pair you will not merge, ${dismiss}.`;
+}
 
 /** One sentence for the Brain-facing MCP tool descriptions (pair_create / pair_close / pair_verdict / pair_next_round). */
 export const TASK_PAIR_BRAIN_CLOSE_TOOL_NOTE: string =

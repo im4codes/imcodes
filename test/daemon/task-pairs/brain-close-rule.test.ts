@@ -17,10 +17,16 @@ import {
   TASK_PAIR_TITLE_MARKER_RULE,
   TASK_PAIR_TITLE_RULE,
   buildTaskPairMarkerContract,
+  taskPairBrainEndedPairNote,
   scanTaskPairMarkers,
   type TaskPairState,
 } from '../../../shared/task-pair.js';
 import { MEMORY_MCP_TOOL_CONTRACTS, MEMORY_MCP_TOOL_NAMES } from '../../../shared/memory-mcp-contracts.js';
+import type { ContextNamespace } from '../../../shared/context-types.js';
+import type { McpRuntimeCaller } from '../../../src/daemon/memory-mcp-caller.js';
+import { createMemoryMcpToolHandlers } from '../../../src/daemon/memory-mcp-tools.js';
+import { removeSession, upsertSession, type SessionRecord } from '../../../src/store/session-store.js';
+import { getTaskPairStore, setTaskPairStoreForTests, TaskPairStore } from '../../../src/daemon/task-pairs/store.js';
 import {
   buildAggregatedBrainNoticeMessage,
   buildBrainDecisionFollowUpMessage,
@@ -36,6 +42,13 @@ import {
   buildWorkspaceKeptDigestLine,
   buildWorkspaceKeptLine,
 } from '../../../src/daemon/task-pairs/messages.js';
+
+const MCP_PROJECT = 'brain-close-rule-project';
+const MCP_BRAIN = 'deck_brain_close_rule_brain';
+const mcpCaller: McpRuntimeCaller = {
+  userId: 'u', namespace: { scope: 'user_private', userId: 'u', projectId: MCP_PROJECT } as ContextNamespace,
+  sessionName: MCP_BRAIN, projectName: MCP_PROJECT, projectRoot: '/tmp/brain-close-rule', serverId: 'srv', transport: 'in_process',
+};
 
 function pair(overrides: Partial<TaskPairState> = {}): TaskPairState {
   return {
@@ -102,16 +115,14 @@ describe('the Brain contract: Brain closes what it has dealt with, with the MCP 
   });
 });
 
-describe('every reminder to Brain about an open pair ends with how to close it', () => {
+describe('a reminder about an OPEN pair ends with how to close it', () => {
   const reminders: Array<[string, string]> = [
     ['decision pending: one pair', buildBrainNoticeMessage(pair({ status: 'blocked' }), 'blocked', 'stuck')],
     ['decision pending: several pairs', buildAggregatedBrainNoticeMessage([{ pair: pair(), flag: 'blocked' }, { pair: pair({ taskId: 'tsk_y' }), flag: 'needs_input' }])],
     ['decision pending: heartbeat', buildBrainHeartbeatMessage([pair({ status: 'awaiting_brain_decision' })])],
+    ['decision pending: follow-up', buildBrainDecisionFollowUpMessage([pair({ status: 'awaiting_brain_decision' })])],
     ['no-auditor DONE report', buildNoAuditorDoneNotice(pair({ status: 'awaiting_brain_decision' }), 'did it')],
-    ['PASS / DONE report', buildPassDoneNoticeMessage(pair())],
-    ['finished but not integrated', buildIntegrationDriftDigest([{ taskId: 'tsk_x', head: 'abcdef1234567890', worktree: '/w', ageMs: 3_600_000, ref: 'origin/dev', missing: 2 }])],
-    ['workspace kept', buildWorkspaceKeptLine(pair({ status: 'done' }), 'unpushed', { now: 8 * 24 * 3_600_000, unintegratedCommits: 2, lastCommit: 'abc1234 feature' })],
-    ['workspace kept: summary', buildWorkspaceKeptDigestLine({ deferred: [{ taskId: 'tsk_y', reason: 'unpushed', endedDays: 8 }], announcedOpen: [{ taskId: 'tsk_x' }], maxListed: 10 })],
+    ['PASS report (pair passed, still open)', buildPassDoneNoticeMessage(pair({ status: 'passed' }))],
   ];
   for (const [label, text] of reminders) {
     it(label, () => {
@@ -121,13 +132,69 @@ describe('every reminder to Brain about an open pair ends with how to close it',
       expect(text).not.toMatch(BRAIN_MARKER_TEACHING);
     });
   }
+});
 
-  it('the other Brain-facing notices name the MCP tools too (no-brief digest, queue stall, legacy import, title request)', () => {
+describe('a notice about a pair that has ALREADY ended advises only calls that still work', () => {
+  const doneKept = buildWorkspaceKeptLine(pair({ status: 'done' }), 'unpushed', { now: 8 * 24 * 3_600_000, unintegratedCommits: 2, lastCommit: 'abc1234 feature' });
+  const cancelledKept = buildWorkspaceKeptLine(pair({ status: 'cancelled' }), 'unpushed', { now: 8 * 24 * 3_600_000 });
+  const notices: Array<[string, string, 'done' | 'cancelled' | 'mixed']> = [
+    ['workspace kept (done pair)', doneKept, 'done'],
+    ['workspace kept (cancelled pair)', cancelledKept, 'cancelled'],
+    ['workspace kept: summary', buildWorkspaceKeptDigestLine({ deferred: [{ taskId: 'tsk_y', reason: 'unpushed', endedDays: 8 }], announcedOpen: [{ taskId: 'tsk_x' }], maxListed: 10 }), 'mixed'],
+    ['finished but not integrated (one)', buildIntegrationDriftDigest([{ taskId: 'tsk_x', head: 'abcdef1234567890', worktree: '/w', ageMs: 3_600_000, ref: 'origin/dev', missing: 2 }]), 'done'],
+    ['finished but not integrated (several)', buildIntegrationDriftDigest([
+      { taskId: 'tsk_x', head: 'abcdef1234567890', worktree: '/w', ageMs: 3_600_000, ref: 'origin/dev', missing: 2 },
+      { taskId: 'tsk_y', head: 'fedcba0987654321', worktree: '/w2', ageMs: 7_200_000, ref: 'origin/dev', missing: 1 },
+    ]), 'mixed'],
+    ['DONE report (backstop, pair already done)', buildPassDoneNoticeMessage(pair({ status: 'done' })), 'done'],
+  ];
+  for (const [label, text, kind] of notices) {
+    it(label, () => {
+      expect(text).toContain(taskPairBrainEndedPairNote(kind));
+      // Nothing advised that a terminal pair rejects: no cancel, no next round, no plain done, no "keeps coming".
+      expect(text).not.toContain('pair_close action=cancel');
+      expect(text).not.toContain('pair_next_round');
+      expect(text).not.toContain(TASK_PAIR_BRAIN_CLOSE_REMINDER);
+      expect(text).not.toContain('keeps coming');
+      for (const match of text.matchAll(/pair_close action=done(?! integration=dismiss)/g)) expect.fail(`plain pair_close action=done advised on an ended pair at ${match.index}`);
+      expect(text).not.toMatch(BRAIN_MARKER_TEACHING);
+    });
+  }
+
+  it('the advised call shapes work against the real pair_close guard, and the old advice did not', async () => {
+    setTaskPairStoreForTests(new TaskPairStore(':memory:'));
+    try {
+      getTaskPairStore().savePair(MCP_PROJECT, pair({ taskId: 'ended_done', status: 'done', brain: MCP_BRAIN }));
+      getTaskPairStore().savePair(MCP_PROJECT, pair({ taskId: 'ended_cancelled', status: 'cancelled', brain: MCP_BRAIN }));
+      const brainSession = { name: MCP_BRAIN, projectName: MCP_PROJECT, role: 'brain', agentType: 'codex-sdk', projectDir: '/tmp/brain-close-rule', state: 'idle', restarts: 0, restartTimestamps: [], createdAt: 1, updatedAt: 2 } as SessionRecord;
+      upsertSession(brainSession);
+      const handlers = createMemoryMcpToolHandlers(mcpCaller, { sendDeps: { listSessions: () => [brainSession] } });
+      const close = handlers[MEMORY_MCP_TOOL_NAMES.PAIR_CLOSE]!;
+      // Every pair_close shape any ended-pair notice advises, taken from the notice texts themselves.
+      const advised = new Set<string>();
+      for (const [, text] of notices) for (const match of text.matchAll(/pair_close action=(done|cancel)( integration=dismiss)?/g)) advised.add(match[0]);
+      expect([...advised]).toEqual(['pair_close action=done integration=dismiss']);
+      const shape = (taskId: string, dismiss: boolean) => ({ taskId, action: 'done', ...(dismiss ? { integration: 'dismiss' } : {}) });
+      // Advised: accepted for a done pair.
+      await expect(close(shape('ended_done', true))).resolves.toMatchObject({ status: 'ok' });
+      // The advice the notices used to carry: rejected as terminal, for done and for cancelled pairs.
+      await expect(close({ taskId: 'ended_done', action: 'cancel', idempotencyKey: 'old-advice-1' })).resolves.toMatchObject({ status: 'error', reason: 'validation_failed' });
+      await expect(close(shape('ended_done', false))).resolves.toMatchObject({ status: 'error', reason: 'validation_failed' });
+      await expect(close({ taskId: 'ended_cancelled', action: 'cancel', idempotencyKey: 'old-advice-2' })).resolves.toMatchObject({ status: 'error', reason: 'validation_failed' });
+      await expect(handlers[MEMORY_MCP_TOOL_NAMES.PAIR_NEXT_ROUND]!({ taskId: 'ended_done' })).resolves.toMatchObject({ status: 'error', reason: 'validation_failed' });
+    } finally {
+      removeSession(MCP_BRAIN);
+      setTaskPairStoreForTests(undefined);
+    }
+  });
+});
+
+describe('the other Brain-facing notices name the MCP tools too', () => {
+  it('no-brief digest, queue stall, title request', () => {
     for (const text of [
       buildNoBriefLine('tsk_x'),
       buildNoBriefDigestMessage(['tsk_x', 'tsk_y']),
       buildQueueStallNoticeMessage([pair({ status: 'queued' })], 10 * 60_000),
-      buildBrainDecisionFollowUpMessage([pair({ status: 'awaiting_brain_decision' })]),
       buildUntitledTaskTitleRequest(['tsk_x'], 'en'),
     ]) expect(text).not.toMatch(BRAIN_MARKER_TEACHING);
   });

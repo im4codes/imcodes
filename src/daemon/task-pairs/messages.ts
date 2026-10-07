@@ -12,6 +12,7 @@ import {
   TASK_PAIR_VALIDATION_REPORT_RULE,
   TASK_PAIR_BRAIN_REPORTING_RULE,
   TASK_PAIR_BRAIN_CLOSE_REMINDER,
+  taskPairBrainEndedPairNote,
   TASK_PAIR_BRAIN_REPLY_RESOLUTION_RULE,
   TASK_PAIR_BRIEF_END_TAG,
   TASK_PAIR_CONTRACT_ID,
@@ -759,7 +760,7 @@ export function buildWorkspaceKeptLine(pair: TaskPairState, reason: string, deta
   return [
     `${header(pair)} Its worktree ${path} ${why}, so the daemon kept it instead of deleting it (${facts}). Whether it matters is your call for this task; you are told once.`,
     `Options: (a) integrate it yourself (cherry-pick the HEAD into dev) -- it is removed on a later sweep once every commit is in a branch; (b) have ${pair.executor ?? 'the executor'} commit locally what should survive and report its worktree plus HEAD; (c) discard it yourself after checking it holds nothing you need (git worktree remove); (d) leave it: it stays on disk and the daemon never deletes unsaved work.`,
-    TASK_PAIR_BRAIN_CLOSE_REMINDER,
+    taskPairBrainEndedPairNote(pair.status === 'cancelled' ? 'cancelled' : 'done'),
   ].join('\n');
 }
 
@@ -779,7 +780,7 @@ export function buildWorkspaceKeptDigestLine(input: {
     ...listed,
     ...(more > 0 ? [`- ... and ${more} more`] : []),
     ...(open.length > 0 ? ['Announced and still open:', ...open, ...(input.announcedOpen.length > open.length ? [`- ... and ${input.announcedOpen.length - open.length} more`] : [])] : []),
-    TASK_PAIR_BRAIN_CLOSE_REMINDER,
+    taskPairBrainEndedPairNote('mixed'),
   ].join('\n');
 }
 
@@ -924,7 +925,8 @@ export function buildPassDoneNoticeMessage(pair: TaskPairState): string {
     ...(where ? [where] : []),
     'Brain merges the reported commit into dev and pushes dev; the executor never pushes any branch.',
     ...(pair.status === 'passed' ? [`More rounds planned? Call pair_next_round (taskId=${pair.taskId}, optional base=<commit>, optional note="...") on this pair instead of closing it: it returns to working with the same workspace and participants. A closed (DONE) pair cannot open another round.`] : []),
-    TASK_PAIR_BRAIN_CLOSE_REMINDER,
+    // A done pair is already closed (the backstop report): only an open (passed) pair still has something to close.
+    pair.status === 'done' ? taskPairBrainEndedPairNote('done') : TASK_PAIR_BRAIN_CLOSE_REMINDER,
   ].join('\n');
 }
 
@@ -965,9 +967,8 @@ function describeCheckedBranches(line: IntegrationDriftLine): string {
  */
 export function buildIntegrationDriftDigest(lines: readonly IntegrationDriftLine[]): string {
   const body = lines.map((line) => `- ${line.taskId}: head ${line.head.slice(0, 12)} (${line.missing} commit${line.missing === 1 ? '' : 's'} not found on any branch of this repository; checked ${describeCheckedBranches(line)}), worktree ${line.worktree}, finished ${formatDriftAge(line.ageMs)} ago`).join('\n');
-  const example = lines[0]?.taskId ?? '<taskId>';
   return `Finished pair${lines.length === 1 ? '' : 's'} not yet merged into this repository (cherry-picked equivalents on any branch count as merged):\n${body}\n`
-    + `Merge ${lines.length === 1 ? 'it' : 'them'} (cherry-pick the PASSed head onto the branch you integrate on, then push that branch). A pair you will not merge: pair_close (taskId=${example}, action=done, integration=dismiss), or pair_close action=cancel, stops these reminders.\n${TASK_PAIR_BRAIN_CLOSE_REMINDER}`;
+    + `Merge ${lines.length === 1 ? 'it' : 'them'} (cherry-pick the PASSed head onto the branch you integrate on, then push that branch). ${taskPairBrainEndedPairNote(lines.length === 1 ? 'done' : 'mixed')}`;
 }
 
 const STALE_STAGE_LABEL = { ready: 'READY_FOR_AUDIT', pass: 'PASS' } as const;
