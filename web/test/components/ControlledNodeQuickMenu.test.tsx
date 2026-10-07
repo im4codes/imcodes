@@ -29,6 +29,8 @@ vi.mock('../../src/hooks/useMachines.js', () => ({
 import { ControlledNodeQuickMenu } from '../../src/components/ControlledNodeQuickMenu.js';
 import { ControlledNodeMachineMenu } from '../../src/components/ControlledNodeMachineMenu.js';
 import { MACHINE_GROUP_STORAGE_KEY } from '../../src/machine-grouping.js';
+import { RemoteDesktopWindowBlockedNotice } from '../../src/components/RemoteDesktopWindowBlockedNotice.js';
+import { resetRemoteDesktopWindowNoticeForTests } from '../../src/remote-desktop-window-notice.js';
 
 afterEach(() => {
   cleanup();
@@ -107,6 +109,20 @@ describe('ControlledNodeQuickMenu', () => {
     expect(onOpenRemoteDesktop).toHaveBeenCalledWith(online);
     await waitFor(() => expect(screen.queryByRole('menu')).toBeNull());
     expect(trigger.getAttribute('aria-expanded')).toBe('false');
+  });
+
+  it('tells the user when the browser blocks the machine\'s window (the button used to do nothing, silently)', async () => {
+    resetRemoteDesktopWindowNoticeForTests();
+    machines = [node({})];
+    const opened = vi.spyOn(window, 'open').mockReturnValue(null);
+    render(<><ControlledNodeQuickMenu onOpenRemoteDesktop={vi.fn()} /><RemoteDesktopWindowBlockedNotice /></>);
+    fireEvent.click(screen.getByRole('button', { name: 'controlled_nodes.machines_title' }));
+    await screen.findByText('Desktop One');
+    expect(screen.queryByTestId('remote-desktop-window-blocked')).toBeNull();
+
+    fireEvent.click(screen.getAllByRole('menuitem', { name: 'remote_desktop.open_new_window' })[0]!);
+    expect(opened).toHaveBeenCalledTimes(1);
+    expect((await screen.findByTestId('remote-desktop-window-blocked')).textContent).toContain('remote_desktop.window_blocked');
   });
 
   it('gives every row an open-in-a-new-window button on its right that opens that machine in its own window', async () => {

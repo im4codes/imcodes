@@ -305,6 +305,7 @@ import { looselyEqual, markSessionRunningIfNeeded, updateSessionIfChanged } from
 import { createMapUpdateBatcher, type MapUpdateBatcher } from './map-update-batcher.js';
 import { useStructuralIdentity } from './hooks/useStructuralIdentity.js';
 import { CapabilityOperationNotice } from './components/CapabilityOperationNotice.js';
+import { RemoteDesktopWindowBlockedNotice } from './components/RemoteDesktopWindowBlockedNotice.js';
 import {
   APP_UPDATE_REQUIRED_EVENT,
   fetchCurrentAppBuildInfo,
@@ -8402,6 +8403,8 @@ export function App() {
       <DownloadTransferCenter />
 
       <CapabilityOperationNotice serverId={selectedServerId} />
+
+      <RemoteDesktopWindowBlockedNotice />
 
       {/* Toasts: idle completions + CC notifications */}
       {toasts.length > 0 && (

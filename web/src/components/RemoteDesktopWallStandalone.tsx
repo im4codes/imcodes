@@ -14,6 +14,7 @@ import {
 import { RemoteDesktopWall } from './RemoteDesktopWall.js';
 import { RemoteDesktopWorkspace } from './RemoteDesktopWorkspace.js';
 import { useQuickData } from './QuickInputPanel.js';
+import { RemoteDesktopWindowBlockedNotice } from './RemoteDesktopWindowBlockedNotice.js';
 
 export function RemoteDesktopWallStandalone() {
   const { t } = useTranslation();
@@ -46,6 +47,7 @@ export function RemoteDesktopWallStandalone() {
 
   return (
     <>
+      <RemoteDesktopWindowBlockedNotice />
       <RemoteDesktopWall
         standalone
         manager={manager}

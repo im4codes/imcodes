@@ -54,6 +54,7 @@ vi.mock('../src/components/RemoteDesktopWallTile.js', () => ({
 }));
 
 import { RemoteDesktopWall } from '../src/components/RemoteDesktopWall.js';
+import { stubDisplayMode } from './support/display-mode.js';
 import type { RemoteDesktopConnectionManager } from '../src/remote-desktop-connection-manager.js';
 
 const wallCss = readFileSync(
@@ -94,6 +95,27 @@ describe('RemoteDesktopWall', () => {
     api.listControllableMachines.mockResolvedValue([machine('a'), machine('b')]);
   });
   afterEach(() => { cleanup(); vi.clearAllMocks(); });
+
+  it('puts the install-as-app entry in the wall header (icon only), and drops it inside the installed app', async () => {
+    const manager = { stop: vi.fn() } as unknown as RemoteDesktopConnectionManager;
+    const displayMode = stubDisplayMode('browser');
+    try {
+      const inTab = render(<RemoteDesktopWall manager={manager} retainedHostKeys={new Set()} onOpenHost={vi.fn()} onHostKeysChange={vi.fn()} onClose={vi.fn()} />);
+      await waitFor(() => expect(screen.getAllByRole('button', { name: 'remote_desktop.wall_add' })).toHaveLength(4));
+      const entry = inTab.container.querySelector('.remote-desktop-workspace-actions [data-testid="remote-desktop-install-app"]') as HTMLButtonElement;
+      expect(entry).not.toBeNull();
+      expect(entry.className).toContain('remote-desktop-workspace-chrome-button');
+      expect(entry.getAttribute('aria-label')).toBe('remote_desktop.install_app');
+      expect(entry.textContent).not.toContain('remote_desktop.install_app');
+      cleanup();
+      displayMode.set('standalone');
+      const inApp = render(<RemoteDesktopWall manager={manager} retainedHostKeys={new Set()} onOpenHost={vi.fn()} onHostKeysChange={vi.fn()} onClose={vi.fn()} />);
+      await waitFor(() => expect(screen.getAllByRole('button', { name: 'remote_desktop.wall_add' })).toHaveLength(4));
+      expect(inApp.container.querySelector('[data-testid="remote-desktop-install-app"]')).toBeNull();
+    } finally {
+      displayMode.restore();
+    }
+  });
 
   it('starts as an independent four-slot canvas and always reserves one add slot', async () => {
     const manager = { stop: vi.fn() } as unknown as RemoteDesktopConnectionManager;

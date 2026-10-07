@@ -13,6 +13,9 @@ import type { ControlledNodeAvailability, MachineListItem } from '../src/api/mac
 import { REMOTE_DESKTOP_CAPABILITY } from '@shared/remote-desktop.js';
 import { CONTROLLED_NODE_ID_MIN } from '@shared/controlled-node-identity.js';
 import { installClipboardStub, removeClipboardStub } from './support/clipboard-stub.js';
+import { stubDisplayMode } from './support/display-mode.js';
+import { RemoteDesktopWindowBlockedNotice } from '../src/components/RemoteDesktopWindowBlockedNotice.js';
+import { resetRemoteDesktopWindowNoticeForTests } from '../src/remote-desktop-window-notice.js';
 import { CONTROLLED_NODE_AUTO_UNLOCK_CAPABILITY } from '@shared/controlled-node-auto-unlock.js';
 import { REMOTE_DESKTOP_INSTALLABLE_CAPABILITY } from '@shared/remote-desktop-install.js';
 import { REMOTE_DESKTOP_LOCAL_DISCLOSURE_CAPABILITY } from '@shared/remote-desktop-access.js';
@@ -1045,6 +1048,42 @@ describe('ControlledNodesPanel (12.3)', () => {
     expect(onOpenRemoteDesktop).toHaveBeenCalledTimes(1);
     expect(opened).toHaveBeenCalledTimes(1);
     opened.mockRestore();
+  });
+
+  it('tells the user when the browser blocks the machine\'s own window, instead of doing nothing', async () => {
+    machines = [
+      machine({ serverId: 'owner-ready', displayName: 'Owner Ready', os: 'win', accessRole: 'owner', execEnabled: true, capabilities: [REMOTE_DESKTOP_CAPABILITY] }),
+    ];
+    resetRemoteDesktopWindowNoticeForTests();
+    const opened = vi.spyOn(window, 'open').mockReturnValue(null);
+    const { container } = render(<><ControlledNodesPanel onOpenRemoteDesktop={vi.fn()} /><RemoteDesktopWindowBlockedNotice /></>);
+    await waitFor(() => expect(container.querySelectorAll('.controlled-nodes-rd-window')).toHaveLength(1));
+    expect(container.querySelector('[data-testid="remote-desktop-window-blocked"]')).toBeNull();
+
+    fireEvent.click(container.querySelector('.controlled-nodes-rd-window') as HTMLButtonElement);
+    expect(opened).toHaveBeenCalledTimes(1);
+    await waitFor(() => expect(container.querySelector('[data-testid="remote-desktop-window-blocked"]')?.textContent).toContain('remote_desktop.window_blocked'));
+    opened.mockRestore();
+  });
+
+  it('offers installing the remote desktop as an app next to the wall button, and hides it inside the installed app', async () => {
+    machines = [
+      machine({ serverId: 'owner-ready', displayName: 'Owner Ready', os: 'win', accessRole: 'owner', execEnabled: true, capabilities: [REMOTE_DESKTOP_CAPABILITY] }),
+    ];
+    const displayMode = stubDisplayMode('browser');
+    try {
+      const { container, unmount } = render(<ControlledNodesPanel onOpenRemoteDesktopWall={vi.fn()} />);
+      await waitFor(() => expect(container.querySelectorAll('.controlled-nodes-rd-split')).toHaveLength(1));
+      const actions = container.querySelector('.controlled-nodes-machines-actions') as HTMLElement;
+      expect(actions.querySelector('[data-testid="remote-desktop-install-app"]')).not.toBeNull();
+      unmount();
+      displayMode.set('standalone');
+      const inApp = render(<ControlledNodesPanel onOpenRemoteDesktopWall={vi.fn()} />);
+      await waitFor(() => expect(inApp.container.querySelectorAll('.controlled-nodes-rd-split')).toHaveLength(1));
+      expect(inApp.container.querySelector('[data-testid="remote-desktop-install-app"]')).toBeNull();
+    } finally {
+      displayMode.restore();
+    }
   });
 
   it('lays an owner\'s actions out as two aligned rows of three, keeping an empty slot for an action a machine lacks', async () => {

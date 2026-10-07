@@ -15,6 +15,7 @@ import {
 } from '../remote-desktop-workspace-state.js';
 import { RemoteDesktopWorkspace } from './RemoteDesktopWorkspace.js';
 import { useQuickData } from './QuickInputPanel.js';
+import { RemoteDesktopWindowBlockedNotice } from './RemoteDesktopWindowBlockedNotice.js';
 
 /** How long a freshly opened tab keeps looking for a usable host. */
 export const REMOTE_DESKTOP_STANDALONE_RETRY_WINDOW_MS = 20_000;
@@ -149,18 +150,21 @@ export function RemoteDesktopStandalone({
     return <div class="remote-desktop-standalone-status" role="status">{t('controlled_nodes.loading')}</div>;
   }
   return (
-    <RemoteDesktopWorkspace
-      state={workspace}
-      manager={manager}
-      standalone
-      quickData={quickData}
-      onOpenHost={(added) => setWorkspace((current) => openRemoteDesktopWorkspaceHost(current, added))}
-      onActivateTab={(tabId) => setWorkspace((current) => activateRemoteDesktopWorkspaceTab(current, tabId))}
-      onCloseHost={(hostKey) => setWorkspace((current) => closeRemoteDesktopWorkspaceHost(current, hostKey))}
-      onReorderHost={(hostKey, direction) => setWorkspace((current) => (
-        reorderRemoteDesktopWorkspaceHost(current, hostKey, direction)
-      ))}
-      onCloseWorkspace={() => setWorkspace((current) => closeRemoteDesktopWorkspace(current))}
-    />
+    <>
+      <RemoteDesktopWindowBlockedNotice />
+      <RemoteDesktopWorkspace
+        state={workspace}
+        manager={manager}
+        standalone
+        quickData={quickData}
+        onOpenHost={(added) => setWorkspace((current) => openRemoteDesktopWorkspaceHost(current, added))}
+        onActivateTab={(tabId) => setWorkspace((current) => activateRemoteDesktopWorkspaceTab(current, tabId))}
+        onCloseHost={(hostKey) => setWorkspace((current) => closeRemoteDesktopWorkspaceHost(current, hostKey))}
+        onReorderHost={(hostKey, direction) => setWorkspace((current) => (
+          reorderRemoteDesktopWorkspaceHost(current, hostKey, direction)
+        ))}
+        onCloseWorkspace={() => setWorkspace((current) => closeRemoteDesktopWorkspace(current))}
+      />
+    </>
   );
 }

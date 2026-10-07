@@ -2,6 +2,7 @@ import { defineConfig } from 'vite';
 import preact from '@preact/preset-vite';
 import path from 'path';
 import { createHash } from 'node:crypto';
+import { remoteDesktopAppManifestPlugin } from './vite-plugin-remote-desktop-app';
 
 // VITE_REGION selects the regional push channel at compile time:
 //   - 'global' (default) — FCM on Android via @capacitor/push-notifications
@@ -24,6 +25,7 @@ export default defineConfig(({ mode }) => ({
   },
   plugins: [
     preact(),
+    remoteDesktopAppManifestPlugin(),
     {
       name: 'imcodes-app-build-manifest',
       generateBundle() {

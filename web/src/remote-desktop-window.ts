@@ -1,11 +1,29 @@
+import { isPlausibleServerId } from '@shared/controlled-node-host-link.js';
+import {
+  buildRemoteDesktopAppUrl,
+  isRemoteDesktopAppPath,
+  readRemoteDesktopAppMachineId,
+} from '@shared/remote-desktop-app.js';
+import { isStandaloneDisplayMode } from './pwa-install.js';
+import { publishRemoteDesktopWindowBlocked } from './remote-desktop-window-notice.js';
+
 export const REMOTE_DESKTOP_WINDOW_SERVER_QUERY = 'remoteDesktopServer';
 export const REMOTE_DESKTOP_WALL_WINDOW_QUERY = 'remoteDesktopWall';
 
-const REMOTE_DESKTOP_WINDOW_SERVER_ID = /^[A-Za-z0-9_-]{1,128}$/;
-
 export function readRemoteDesktopWindowServerId(search = window.location.search): string | null {
   const value = new URLSearchParams(search).get(REMOTE_DESKTOP_WINDOW_SERVER_QUERY);
-  return value && REMOTE_DESKTOP_WINDOW_SERVER_ID.test(value) ? value : null;
+  return isPlausibleServerId(value) ? value : null;
+}
+
+/**
+ * The installed-app entry (`/remote-desktop/app/`, see shared/remote-desktop-app.ts): the machine wall, or one machine when the link names
+ * it (`?machine=<serverId>`). Null for every other page. A machine id that is not a plausible server id is ignored (the wall opens).
+ */
+export function resolveRemoteDesktopAppEntry(
+  pathname: string,
+  search: string,
+): { machineId: string | null } | null {
+  return isRemoteDesktopAppPath(pathname) ? { machineId: readRemoteDesktopAppMachineId(search) } : null;
 }
 
 export function isRemoteDesktopWallWindow(search = window.location.search): boolean {
@@ -16,7 +34,7 @@ export function buildRemoteDesktopWindowUrl(
   serverId: string,
   currentUrl = window.location.href,
 ): string {
-  if (!REMOTE_DESKTOP_WINDOW_SERVER_ID.test(serverId)) {
+  if (!isPlausibleServerId(serverId)) {
     throw new Error('invalid_remote_desktop_server_id');
   }
   const url = new URL(currentUrl);
@@ -64,10 +82,12 @@ interface WindowBounds {
 }
 
 /**
- * A remote desktop wants every pixel: open the window over the whole usable
+ * A remote desktop wants every pixel: ask for a window over the whole usable
  * screen area (what a maximized window covers) instead of a fixed small size
  * the user then has to drag larger. Falls back to the fixed size only when the
- * screen cannot be measured.
+ * screen cannot be measured. It is only a request: Firefox honours it, but in
+ * the measurements behind the install-as-app work Chrome gave every popup the
+ * size of the window that opened it. Nothing may depend on the size arriving.
  */
 export function remoteDesktopWindowBounds(fallbackWidth: number, fallbackHeight: number): WindowBounds {
   const scr = typeof window !== 'undefined' ? window.screen as Screen & { availLeft?: number; availTop?: number } : undefined;
@@ -110,14 +130,36 @@ function openDetachedWindow(url: string, fallbackWidth: number, fallbackHeight: 
   ));
   if (opened) {
     try { opened.opener = null; } catch { /* Browser policy may already isolate the popup. */ }
+  } else {
+    // Blocked (pop-up blocker, or a call that was not a user gesture). The caller gets null, and the user gets told, from here, so no
+    // button that opens a window can fail in silence.
+    publishRemoteDesktopWindowBlocked();
+  }
+  return opened;
+}
+
+/**
+ * From inside the installed app a pop-up would leave the app's scope (and bring the address strip back), so another window is another
+ * app window: the app's own URL, opened with no window features. Blocked the same way as a pop-up, and reported the same way.
+ */
+function openInstalledAppWindow(url: string): Window | null {
+  const opened = window.open(url, '_blank');
+  if (opened) {
+    try { opened.opener = null; } catch { /* Browser policy may already isolate the window. */ }
+  } else {
+    publishRemoteDesktopWindowBlocked();
   }
   return opened;
 }
 
 export function openRemoteDesktopWallWindow(): Window | null {
+  if (isStandaloneDisplayMode()) return openInstalledAppWindow(buildRemoteDesktopAppUrl(undefined, window.location.origin));
   return openDetachedWindow(buildRemoteDesktopWallWindowUrl(), 1440, 900);
 }
 
 export function openRemoteDesktopWindow(serverId: string): Window | null {
+  if (isStandaloneDisplayMode() && isPlausibleServerId(serverId)) {
+    return openInstalledAppWindow(buildRemoteDesktopAppUrl(serverId, window.location.origin));
+  }
   return openDetachedWindow(buildRemoteDesktopWindowUrl(serverId), 1280, 800);
 }

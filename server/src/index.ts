@@ -101,6 +101,7 @@ import { verifyJwt } from './security/crypto.js';
 import { resolveServerWebSocketAccess } from './security/authorization.js';
 import logger from './util/logger.js';
 import { getPodIdentity } from './util/pod-identity.js';
+import { REMOTE_DESKTOP_APP_MANIFEST_MIME, isRemoteDesktopAppAssetPath } from '../../shared/remote-desktop-app.js';
 import { RemoteDesktopGuestDueWorker } from './services/remote-desktop-guest-due-worker.js';
 import {
   PostgresRemoteDesktopGuestOutboxDeliveryAdapter,
@@ -407,13 +408,20 @@ export function buildApp(env: Env, options: BuildAppOptions = {}) {
           html: 'text/html', js: 'application/javascript', css: 'text/css',
           png: 'image/png', jpg: 'image/jpeg', svg: 'image/svg+xml',
           woff2: 'font/woff2', ico: 'image/x-icon', json: 'application/json',
+          webmanifest: REMOTE_DESKTOP_APP_MANIFEST_MIME,
         };
         const content = await readFile(filePath);
         const headers: Record<string, string> = { 'Content-Type': mime[ext] ?? 'application/octet-stream' };
         if (ext === 'html') Object.assign(headers, SECURITY_HEADERS);
+        // The installable remote-desktop app's manifest is revalidated on every use, so a change to it reaches installed apps promptly.
+        if (ext === 'webmanifest') headers['Cache-Control'] = 'no-cache';
         return new Response(content, { headers });
       }
     } catch { /* fall through */ }
+
+    // The remote-desktop app's manifest and icons: a missing file is a 404. Falling through to index.html would hand the browser an HTML
+    // page as a manifest or an icon (a silent install failure), so these paths never reach the SPA fallback.
+    if (isRemoteDesktopAppAssetPath(reqPath)) return c.text('Not found', 404);
 
     // SPA fallback
     try {
