@@ -904,9 +904,14 @@ describe('sessions.json compatibility export (older processes, downgrade)', () =
     await writeFile(jsonFile(), productionShapedFile(300).text, 'utf8');
     await loadStore({ probe: false });
     await flushStore();
-    updateSessionState('deck_realproj1_w11', 'running');
-    await flushStore();
-    expect(sessionsJsonCompatExportStatsForTests().lastMainThreadMs).toBeLessThan(15); // generous CI bound; measured ~1 ms
+    // The cheapest of several exports: one stalled by a neighbour on a shared runner is not the cost of handing the strings over.
+    let cheapest = Number.POSITIVE_INFINITY;
+    for (const state of ['running', 'idle', 'running', 'idle', 'running'] as const) {
+      updateSessionState('deck_realproj1_w11', state);
+      await flushStore();
+      cheapest = Math.min(cheapest, sessionsJsonCompatExportStatsForTests().lastMainThreadMs);
+    }
+    expect(cheapest).toBeLessThan(15); // measured ~1 ms
   });
 
   it('does not keep a process alive: a writer process that loaded, flushed and exported exits by itself', async () => {

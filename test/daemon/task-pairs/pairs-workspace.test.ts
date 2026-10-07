@@ -746,20 +746,22 @@ describe('pair workspaces', () => {
     git(path, 'add', '-A');
     git(path, '-c', 'user.email=t@e.invalid', '-c', 'user.name=T', 'commit', '-qm', 'rebased stale resolution');
 
+    // The guard is held until the test lets it go: the refresh must finish while it is still pending (no wall-clock bound to tune).
+    let releaseGuard: () => void = () => {};
+    const guardGate = new Promise<void>((resolve) => { releaseGuard = resolve; });
     setRebaseRevertGuardDepsForTests({
       isRewrittenHead: async () => {
-        await new Promise((resolve) => setTimeout(resolve, 1_000));
+        await guardGate;
         return true;
       },
       inspectPossibleSilentRevert: async () => ({
         files: [{ path: 'rebase.txt', removedLines: 1, origins: [{ commit: oldHead, subject: 'foreign fix: preserve state', count: 1 }] }],
       }),
     });
-    const started = Date.now();
-    await refreshTaskPairWorkspaceHead(PROJECT, 'R10-delay');
-    const elapsed = Date.now() - started;
-    expect(elapsed).toBeLessThan(500);
+    await refreshTaskPairWorkspaceHead(PROJECT, 'R10-delay'); // returns although the guard has not answered
     expect(pair('R10-delay').workspace?.lastHead).toBe(git(path, 'rev-parse', 'HEAD'));
+    expect(sentTo(AUD, 'rebase-revert-warning')).toHaveLength(0);
+    releaseGuard();
     await vi.waitFor(() => expect(sentTo(AUD, 'rebase-revert-warning')).toHaveLength(1), { timeout: 10_000 });
   });
 

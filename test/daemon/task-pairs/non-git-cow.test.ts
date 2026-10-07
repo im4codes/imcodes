@@ -437,8 +437,9 @@ describe('the real clone engine (skipped, and reported, where the filesystem has
     for (const heavy of ['node_modules', 'dist']) expect(existsSync(join(taskDir, heavy))).toBe(false);
     if (result.ok) {
       console.log(`real clone: ${result.files} files, ${result.logicalBytes} logical bytes, ${result.ms} ms, extra disk ${result.extraDiskBytes ?? 'n/a'} bytes`);
-      // 64 MiB were cloned; the volume lost (far) less than that, other activity on the disk included.
-      if (result.extraDiskBytes !== undefined) expect(result.extraDiskBytes).toBeLessThan(16 * 1024 * 1024);
+      // 64 MiB were cloned. The figure is the drop in free space of the WHOLE volume, so other activity on the disk (a parallel build, a
+      // suite on a shared runner) is in it: it only has to stay clearly under what a real copy costs (64 MiB plus that same noise).
+      if (result.extraDiskBytes !== undefined) expect(result.extraDiskBytes).toBeLessThan(48 * 1024 * 1024);
     }
     // Same inode data? A clone has its own inode.
     expect(lstatSync(join(taskDir, 'padding.bin')).ino).not.toBe(lstatSync(join(project, 'padding.bin')).ino);

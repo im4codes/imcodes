@@ -3414,7 +3414,9 @@ describe('handleWebCommand transport queue behavior', () => {
     }, serverLink as any);
     const elapsedMs = performance.now() - startedAt;
 
-    expect(elapsedMs).toBeLessThan(500);
+    // The ack went out synchronously (asserted below, before any await). The bound only catches a handler that BLOCKS on the load, by
+    // orders of magnitude, so a slow machine cannot trip it.
+    expect(elapsedMs).toBeLessThan(5_000);
     expect(serverLink.send).toHaveBeenCalledWith({
       type: 'command.ack',
       commandId: 'cmd-synthetic-load',

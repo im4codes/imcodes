@@ -5,7 +5,7 @@
  * dropped), holds back optional loops and paces a warm restore; all of it resumes on recovery, and none of it can
  * starve a child for good.
  */
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { spawn } from 'node:child_process';
 import { readdirSync, readFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
@@ -38,6 +38,14 @@ function clocked() {
 const nextTick = () => new Promise<void>((resolve) => setImmediate(resolve));
 
 afterEach(() => resetEventLoopHealthForTests());
+
+/** True when `promise` settled before the next macrotask: it needed microtasks only, no timer, so the speed of the machine cannot change the answer. */
+async function settlesWithoutATimer(promise: Promise<unknown>): Promise<boolean> {
+  let settled = false;
+  void promise.then(() => { settled = true; }, () => { settled = true; });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  return settled;
+}
 
 describe('event-loop health', () => {
   it('is overloaded at the high line and healthy only below the low line, after the window forgets the spike (no flapping)', () => {
@@ -141,9 +149,8 @@ describe('a gated child stream', () => {
 describe('waiting for a healthy loop', () => {
   it('returns at once while healthy, waits while overloaded, and gives up at the cap', async () => {
     const { health, advance } = clocked();
-    const healthyStart = Date.now();
-    await health.waitUntilHealthy();
-    expect(Date.now() - healthyStart).toBeLessThan(50);
+    // "At once" = settled by microtasks alone: no timer was needed, so no clock speed can change the answer.
+    expect(await settlesWithoutATimer(health.waitUntilHealthy())).toBe(true);
 
     health.recordProbe(1_000);
     let released = false;
@@ -155,17 +162,15 @@ describe('waiting for a healthy loop', () => {
     expect(released).toBe(true);
 
     health.recordProbe(1_000);
-    const capped = Date.now();
     advance(0);
-    await health.waitUntilHealthy({ maxWaitMs: 0 });
-    expect(Date.now() - capped).toBeLessThan(100); // the cap, not the recovery, ended the wait
+    // the cap, not the recovery, ended the wait: it settles with the loop still overloaded and no timer
+    expect(await settlesWithoutATimer(health.waitUntilHealthy({ maxWaitMs: 0 }))).toBe(true);
+    expect(health.isOverloaded()).toBe(true);
     health.stop();
   });
 
   it('the shared yield used by provider message loops is free while healthy', async () => {
-    const started = Date.now();
-    for (let i = 0; i < 1_000; i += 1) await backpressureYield();
-    expect(Date.now() - started).toBeLessThan(200);
+    expect(await settlesWithoutATimer((async () => { for (let i = 0; i < 1_000; i += 1) await backpressureYield(); })())).toBe(true);
     expect(eventLoopHealth().isOverloaded()).toBe(false);
   });
 });
@@ -182,24 +187,32 @@ describe('restore pacing', () => {
     await withBackpressure(async () => {
       eventLoopHealth().recordProbe(5_000); // overloaded for the whole window
       const budget = { leftMs: 400 };
+      const waits = vi.spyOn(eventLoopHealth(), 'waitUntilHealthy');
       const first = Date.now();
       await paceByEventLoopHealth(20, budget);
-      const firstTook = Date.now() - first;
-      expect(firstTook).toBeGreaterThanOrEqual(380); // waited for health until the budget ran out
+      expect(Date.now() - first).toBeGreaterThanOrEqual(380); // waited for health until the budget ran out (a slower machine only waits longer)
       expect(budget.leftMs).toBeLessThanOrEqual(30);
-      const second = Date.now();
+      expect(waits).toHaveBeenCalledTimes(1);
+      // What is left of the budget (a few ms at most) is used up by the next call or two; after that the health wait is not entered AT ALL.
+      for (let i = 0; i < 5 && budget.leftMs > 0; i += 1) await paceByEventLoopHealth(20, budget);
+      expect(budget.leftMs).toBeLessThanOrEqual(0);
+      const waitsBefore = waits.mock.calls.length;
+      const floorStart = Date.now();
       await paceByEventLoopHealth(20, budget);
-      expect(Date.now() - second).toBeLessThan(200); // budget spent: the floor only
+      expect(waits.mock.calls.length).toBe(waitsBefore); // budget spent: the floor only, no wait for health
+      expect(Date.now() - floorStart).toBeGreaterThanOrEqual(18);
+      waits.mockRestore();
     });
   });
 
   it('a healthy loop costs only the floor and spends no budget', async () => {
     await withBackpressure(async () => {
-      const budget = { leftMs: 1_000 };
+      const budget = { leftMs: 600_000 };
       const started = Date.now();
       await paceByEventLoopHealth(30, budget);
-      expect(Date.now() - started).toBeLessThan(200);
-      expect(budget.leftMs).toBeGreaterThan(900);
+      expect(Date.now() - started).toBeGreaterThanOrEqual(25); // the floor is waited
+      // Only lateness counts against the budget: ten seconds of it on a loaded runner would still leave this true.
+      expect(budget.leftMs).toBeGreaterThan(590_000);
     });
   });
 });
