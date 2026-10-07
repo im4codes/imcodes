@@ -13,6 +13,7 @@ import { installRecoveryUnits } from '../util/systemd-recovery-install.js';
 import { resolveImcodesHome } from '../util/windows-daemon-lock.js';
 import { resolvePosixDaemonServicePaths } from '../util/posix-daemon-service.js';
 import { daemonFatalReportNodeOptions } from '../../shared/daemon-memory-guard.js';
+import { reportExcludeEnvFlagUsable } from '../util/report-privacy.js';
 
 /** Resolve the instance state directory lazily so scoped daemons never read or
  * write the default user's credentials when IMCODES_HOME is overridden. */
@@ -324,7 +325,7 @@ ${service.scoped ? `    <key>IMCODES_HOME</key>
     <!-- See bind-flow.ts.installSystemdService for rationale on these flags
          (V8 lazy-GC + heap-limit OOM cascade observed on production daemons). -->
     <key>NODE_OPTIONS</key>
-    <string>--expose-gc --max-old-space-size=8192 ${daemonFatalReportNodeOptions(service.stateHome)}</string>
+    <string>--expose-gc --max-old-space-size=8192 ${daemonFatalReportNodeOptions(service.stateHome, 'plain', reportExcludeEnvFlagUsable(target.program))}</string>
   </dict>
   <key>RunAtLoad</key>
   <true/>
@@ -396,7 +397,7 @@ Environment=IMCODES_DEFAULT_HOME=${dirname(service.defaultHome)}
 # default so transient working-set spikes (transformers tokenizer,
 # large timeline batches) cannot OOM during the GC poll interval.
 # Both can be overridden via a drop-in.
-Environment="NODE_OPTIONS=--expose-gc --max-old-space-size=8192 ${daemonFatalReportNodeOptions(service.stateHome)}"
+Environment="NODE_OPTIONS=--expose-gc --max-old-space-size=8192 ${daemonFatalReportNodeOptions(service.stateHome, 'systemd', reportExcludeEnvFlagUsable(target.program))}"
 # MALLOC_ARENA_MAX=2 caps glibc's per-thread malloc arenas. On multi-core
 # hosts glibc permits up to 8×cores arenas; native thread pools
 # (onnxruntime embedding inference, sharp/libvips image work) scatter

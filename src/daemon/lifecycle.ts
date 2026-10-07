@@ -56,7 +56,7 @@ import logger from '../util/logger.js';
 import { startMemoryGuard, stopMemoryGuard } from './memory-guard.js';
 import { imcodesStateDir } from '../util/imcodes-state-dir.js';
 import { registerMemoryProbe } from './memory-probes.js';
-import { DAEMON_MEMORY_GUARD_EXIT_CODE } from '../../shared/daemon-memory-guard.js';
+import { DAEMON_MEMORY_GUARD_EXIT_CODE, DAEMON_MEMORY_GUARD_HARD_EXIT_MS } from '../../shared/daemon-memory-guard.js';
 import { recordDaemonStart } from '../util/daemon-status.js';
 import { installDaemonRuntimeDiagnosticsProvider } from './runtime-diagnostics.js';
 import { P2P_TERMINAL_RUN_STATUSES } from '../../shared/p2p-status.js';
@@ -2701,7 +2701,7 @@ function startDaemonMemoryGuard(): void {
     stateDir: imcodesStateDir(),
     log: logger,
     shutdown: async (exitCode) => {
-      setTimeout(() => process.exit(DAEMON_MEMORY_GUARD_EXIT_CODE), 40_000).unref?.();
+      setTimeout(() => process.exit(DAEMON_MEMORY_GUARD_EXIT_CODE), DAEMON_MEMORY_GUARD_HARD_EXIT_MS).unref?.();
       await shutdown(exitCode);
     },
   });

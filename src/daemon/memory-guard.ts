@@ -14,7 +14,7 @@
  */
 import v8 from 'node:v8';
 import { loadavg } from 'node:os';
-import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import {
   DAEMON_DIAGNOSTICS_DIR,
@@ -24,7 +24,12 @@ import {
   DAEMON_MEMORY_GUARD_DIAGNOSTIC_MIN_INTERVAL_MS,
   DAEMON_MEMORY_GUARD_EXIT_CODE,
   DAEMON_MEMORY_GUARD_FAST_INTERVAL_MS,
+  DAEMON_MEMORY_GUARD_GC_MAX_INTERVAL_MS,
   DAEMON_MEMORY_GUARD_GC_MIN_INTERVAL_MS,
+  DAEMON_MEMORY_GUARD_HARD_EXIT_MS,
+  DAEMON_FATAL_REPORT_FILE_PATTERN,
+  DAEMON_FATAL_REPORT_HEADER_FIELDS_REMOVED,
+  DAEMON_FATAL_REPORT_SANITIZED_KEY,
   DAEMON_MEMORY_GUARD_INTERVAL_MS,
   DAEMON_MEMORY_GUARD_MAX_RESTARTS_IN_WINDOW,
   DAEMON_MEMORY_GUARD_RESTART_WINDOW_MS,
@@ -51,6 +56,8 @@ export interface MemoryGuardDeps {
   probes(): Record<string, Record<string, number>>;
   /** Flush what must survive and exit so the service manager restarts the daemon. */
   restart(reason: string): Promise<void>;
+  /** False when nothing would bring the daemon back (a dev run): the guard then only sheds. Default: true. */
+  canRestart?(): boolean;
   /** Timestamps of earlier guard restarts, newest last, and a way to add one. */
   readRestarts(): number[];
   recordRestart(at: number): void;
@@ -75,6 +82,7 @@ export function createMemoryGuard(deps: MemoryGuardDeps): MemoryGuard {
   let restartSuppressed = false;
   let restarting = false;
   let lastGcAt = 0;
+  let gcIntervalMs = DAEMON_MEMORY_GUARD_GC_MIN_INTERVAL_MS;
   let lastDiagnosticAt = 0;
   let lastSuppressedAlertAt = 0;
   let timer: ReturnType<typeof setTimeout> | null = null;
@@ -101,13 +109,17 @@ export function createMemoryGuard(deps: MemoryGuardDeps): MemoryGuard {
   async function tick(): Promise<DaemonMemoryLevel> {
     let { usedBytes, limitBytes } = deps.heap();
     let next = classifyDaemonHeap(usedBytes, limitBytes);
-    if (next !== 'ok' && deps.gc && deps.now() - lastGcAt >= DAEMON_MEMORY_GUARD_GC_MIN_INTERVAL_MS) {
+    if (next !== 'ok' && deps.gc && deps.now() - lastGcAt >= gcIntervalMs) {
       // Heap used counts garbage not collected yet: only live data justifies shedding or a restart.
       lastGcAt = deps.now();
       try { deps.gc(); } catch { /* a failed collection leaves the reading as it was */ }
       ({ usedBytes, limitBytes } = deps.heap());
       next = classifyDaemonHeap(usedBytes, limitBytes);
+      // A full collection on a multi-GB heap costs the main thread hundreds of ms: when it did not bring the heap
+      // under the warn line the data is live, so the next one waits twice as long (reset once the heap is healthy).
+      gcIntervalMs = next === 'ok' ? DAEMON_MEMORY_GUARD_GC_MIN_INTERVAL_MS : Math.min(gcIntervalMs * 2, DAEMON_MEMORY_GUARD_GC_MAX_INTERVAL_MS);
     }
+    if (next === 'ok') gcIntervalMs = DAEMON_MEMORY_GUARD_GC_MIN_INTERVAL_MS;
     const previous = level;
     level = next;
     // Leave the shedding state only well below the warn line, so the edge cannot flap.
@@ -123,7 +135,14 @@ export function createMemoryGuard(deps: MemoryGuardDeps): MemoryGuard {
       }
     }
     if (next === 'critical' && !restarting) {
-      if (recentRestarts().length >= DAEMON_MEMORY_GUARD_MAX_RESTARTS_IN_WINDOW) {
+      if (deps.canRestart && !deps.canRestart()) {
+        // Exiting would leave nothing running (no service manager): keep serving, refuse heavy load, say so once in a while.
+        restartSuppressed = true;
+        if (deps.now() - lastSuppressedAlertAt >= DAEMON_MEMORY_GUARD_DIAGNOSTIC_MIN_INTERVAL_MS) {
+          lastSuppressedAlertAt = deps.now();
+          deps.log.error({ usedBytes, limitBytes }, 'daemon heap is critical but no service manager would restart it: NOT exiting; heavy load is refused');
+        }
+      } else if (recentRestarts().length >= DAEMON_MEMORY_GUARD_MAX_RESTARTS_IN_WINDOW) {
         restartSuppressed = true;
         if (deps.now() - lastSuppressedAlertAt >= DAEMON_MEMORY_GUARD_DIAGNOSTIC_MIN_INTERVAL_MS) {
           lastSuppressedAlertAt = deps.now();
@@ -229,6 +248,57 @@ export interface StartMemoryGuardOptions {
   shutdown(exitCode: number): Promise<void>;
 }
 
+/**
+ * A fatal-error report is raw runtime output: the whole environment (provider keys), network addresses, the command line.
+ * A restart sweeps every report left by the previous process: the secrets and addresses are removed, the heap numbers, resource
+ * usage and stacks (code locations) stay, the file becomes 0600, a report that cannot be parsed (cut short by the crash) is
+ * deleted rather than left unsanitised, and only the newest few are kept.
+ */
+export function sanitizeFatalReports(stateDir: string): { sanitized: number; removed: number } {
+  const dir = diagnosticsDirOf(stateDir);
+  const result = { sanitized: 0, removed: 0 };
+  let names: string[];
+  try {
+    names = readdirSync(dir).filter((name) => DAEMON_FATAL_REPORT_FILE_PATTERN.test(name)).sort();
+  } catch {
+    return result;
+  }
+  const kept: string[] = [];
+  for (const name of names) {
+    const file = join(dir, name);
+    try {
+      if (!lstatSync(file).isFile()) continue; // never follow a link planted in the directory
+      const report = JSON.parse(readFileSync(file, 'utf8')) as Record<string, unknown>;
+      if (report[DAEMON_FATAL_REPORT_SANITIZED_KEY] !== true) {
+        delete report['environmentVariables'];
+        const header = report['header'];
+        if (header && typeof header === 'object') for (const field of DAEMON_FATAL_REPORT_HEADER_FIELDS_REMOVED) delete (header as Record<string, unknown>)[field];
+        report[DAEMON_FATAL_REPORT_SANITIZED_KEY] = true;
+        const temporary = `${file}.tmp`;
+        writeFileSync(temporary, JSON.stringify(report), { mode: 0o600 });
+        renameSync(temporary, file);
+        result.sanitized += 1;
+      }
+      try { chmodSync(file, 0o600); } catch { /* best effort */ }
+      kept.push(name);
+    } catch {
+      try { unlinkSync(file); result.removed += 1; } catch { /* already gone */ }
+    }
+  }
+  for (const stale of kept.slice(0, Math.max(0, kept.length - DAEMON_MEMORY_DIAGNOSTIC_KEEP))) {
+    try { unlinkSync(join(dir, stale)); result.removed += 1; } catch { /* already gone */ }
+  }
+  return result;
+}
+
+/** Something would bring the daemon back after an exit: systemd, launchd, or the Windows scheduled task. */
+export function isRunningUnderSupervisor(env: NodeJS.ProcessEnv = process.env, platform: NodeJS.Platform = process.platform): boolean {
+  if (env['IMCODES_SUPERVISED'] === '1') return true;
+  if (platform === 'win32') return true;
+  if (env['INVOCATION_ID'] || env['JOURNAL_STREAM']) return true; // systemd
+  return Boolean(env['XPC_SERVICE_NAME'] && env['XPC_SERVICE_NAME'] !== '0'); // launchd
+}
+
 export function startMemoryGuard(options: StartMemoryGuardOptions): MemoryGuard {
   activeGuard?.stop();
   const gc = (globalThis as { gc?: () => void }).gc;
@@ -245,12 +315,17 @@ export function startMemoryGuard(options: StartMemoryGuardOptions): MemoryGuard 
       options.log.error({ reason }, 'memory guard: shutting the daemon down for a controlled restart');
       return options.shutdown(DAEMON_MEMORY_GUARD_EXIT_CODE);
     },
+    canRestart: () => isRunningUnderSupervisor(),
     readRestarts: () => readGuardRestarts(options.stateDir),
     recordRestart: (at) => recordGuardRestart(options.stateDir, at),
     log: options.log,
   });
   activeGuard = guard;
-  mkdirSync(diagnosticsDirOf(options.stateDir), { recursive: true, mode: 0o700 });
+  const dir = diagnosticsDirOf(options.stateDir);
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  try { chmodSync(dir, 0o700); } catch { /* best effort */ }
+  const swept = sanitizeFatalReports(options.stateDir);
+  if (swept.sanitized > 0 || swept.removed > 0) options.log.info({ ...swept }, 'memory guard: fatal-error reports of earlier runs sanitised');
   guard.start();
   return guard;
 }

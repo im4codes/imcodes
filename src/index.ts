@@ -1,4 +1,6 @@
 #!/usr/bin/env node
+// First: tell the runtime to keep the environment (provider keys) out of any diagnostic report, before anything can die.
+import './util/report-privacy.js';
 import { realpathSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';

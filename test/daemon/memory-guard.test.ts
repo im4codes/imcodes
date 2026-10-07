@@ -7,6 +7,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
+import { spawnSync } from 'node:child_process';
+import { chmodSync } from 'node:fs';
 import { join } from 'node:path';
 import v8 from 'node:v8';
 import {
@@ -15,7 +17,10 @@ import {
   DAEMON_HEAP_WARN_RATIO,
   DAEMON_MEMORY_DIAGNOSTIC_KEEP,
   DAEMON_MEMORY_GUARD_DIAGNOSTIC_MIN_INTERVAL_MS,
+  DAEMON_FATAL_REPORT_SANITIZED_KEY,
   DAEMON_MEMORY_GUARD_EXIT_CODE,
+  DAEMON_MEMORY_GUARD_GC_MAX_INTERVAL_MS,
+  DAEMON_MEMORY_GUARD_GC_MIN_INTERVAL_MS,
   DAEMON_MEMORY_GUARD_MAX_RESTARTS_IN_WINDOW,
   DAEMON_MEMORY_GUARD_RESTART_WINDOW_MS,
   classifyDaemonHeap,
@@ -24,6 +29,8 @@ import {
 import {
   createMemoryGuard,
   isMemoryPressureShedding,
+  isRunningUnderSupervisor,
+  sanitizeFatalReports,
   readGuardRestarts,
   recordGuardRestart,
   setActiveMemoryGuardForTests,
@@ -33,6 +40,7 @@ import {
   type MemoryGuardDeps,
 } from '../../src/daemon/memory-guard.js';
 import { collectMemoryProbes, registerMemoryProbe, resetMemoryProbesForTests } from '../../src/daemon/memory-probes.js';
+import { excludeEnvironmentFromReports, reportExcludeEnvFlagUsable } from '../../src/util/report-privacy.js';
 
 const LIMIT = 8_000_000_000;
 const at = (ratio: number) => Math.round(LIMIT * ratio);
@@ -234,5 +242,165 @@ describe('production wiring', () => {
   it('the exit status is the shared guard code, and generated units ask the runtime for a fatal-error report', () => {
     expect(DAEMON_MEMORY_GUARD_EXIT_CODE).toBe(75);
     expect(daemonFatalReportNodeOptions('/home/u/.imcodes')).toBe('--report-on-fatalerror --report-compact --report-directory=/home/u/.imcodes/diagnostics');
+  });
+});
+
+describe('collection back-off and supervision', () => {
+  it('a collection that does not bring the heap down means live data: the next one waits twice as long, up to a cap, and resets when healthy', async () => {
+    const gc = vi.fn();
+    const h = harness({ gc });
+    h.setUsed(0.7);
+    await h.guard.tick(); // 1st collection
+    expect(gc).toHaveBeenCalledTimes(1);
+    h.advance(DAEMON_MEMORY_GUARD_GC_MIN_INTERVAL_MS + 1); await h.guard.tick();
+    expect(gc).toHaveBeenCalledTimes(1); // the interval is 20 s now
+    h.advance(DAEMON_MEMORY_GUARD_GC_MIN_INTERVAL_MS + 1); await h.guard.tick();
+    expect(gc).toHaveBeenCalledTimes(2);
+    for (let i = 0; i < 12; i += 1) { h.advance(DAEMON_MEMORY_GUARD_GC_MAX_INTERVAL_MS + 1); await h.guard.tick(); }
+    const before = gc.mock.calls.length;
+    h.advance(DAEMON_MEMORY_GUARD_GC_MAX_INTERVAL_MS - 1_000); await h.guard.tick();
+    expect(gc.mock.calls.length).toBe(before); // capped, never longer than the max
+    h.setUsed(0.2); h.advance(DAEMON_MEMORY_GUARD_GC_MAX_INTERVAL_MS + 1); await h.guard.tick();
+    h.setUsed(0.7); h.advance(DAEMON_MEMORY_GUARD_GC_MIN_INTERVAL_MS + 1); await h.guard.tick();
+    expect(gc.mock.calls.length).toBe(before + 1); // healthy in between reset it to the minimum
+  });
+
+  it('without a supervisor that would restart it the guard does not exit at 85 %: it keeps serving, refuses heavy load, and says so', async () => {
+    const h = harness({ canRestart: () => false });
+    h.setUsed(0.95);
+    await h.guard.tick();
+    expect(h.state.restartReasons).toHaveLength(0);
+    expect(h.guard.isRestartSuppressed()).toBe(true);
+    expect(h.guard.isShedding()).toBe(true);
+    expect(h.state.log.error).toHaveBeenCalledTimes(1);
+  });
+
+  it('knows a supervisor from the environment (systemd, launchd, Windows, explicit) and a bare run from none', () => {
+    expect(isRunningUnderSupervisor({ INVOCATION_ID: 'abc' } as NodeJS.ProcessEnv, 'linux')).toBe(true);
+    expect(isRunningUnderSupervisor({ JOURNAL_STREAM: '8:123' } as NodeJS.ProcessEnv, 'linux')).toBe(true);
+    expect(isRunningUnderSupervisor({ XPC_SERVICE_NAME: 'com.imcodes.daemon' } as NodeJS.ProcessEnv, 'darwin')).toBe(true);
+    expect(isRunningUnderSupervisor({ XPC_SERVICE_NAME: '0' } as NodeJS.ProcessEnv, 'darwin')).toBe(false);
+    expect(isRunningUnderSupervisor({} as NodeJS.ProcessEnv, 'win32')).toBe(true);
+    expect(isRunningUnderSupervisor({ IMCODES_SUPERVISED: '1' } as NodeJS.ProcessEnv, 'linux')).toBe(true);
+    expect(isRunningUnderSupervisor({} as NodeJS.ProcessEnv, 'linux')).toBe(false);
+  });
+});
+
+describe('the runtime fatal-error report is made safe (it holds the whole environment)', () => {
+  const CANARY = 'sk-test-DO-NOT-LEAK-123';
+  let dir = '';
+  let stateDir = '';
+  beforeEach(() => {
+    stateDir = mkdtempSync(join(tmpdir(), 'imcodes-fatal-report-'));
+    dir = join(stateDir, DAEMON_DIAGNOSTICS_DIR);
+    mkdirSync(dir, { recursive: true });
+  });
+  afterEach(() => rmSync(stateDir, { recursive: true, force: true }));
+
+  const rawReport = () => ({
+    header: { event: 'Allocation failed - JavaScript heap out of memory', trigger: 'FatalError', host: 'zjq-158', cwd: '/home/ai', commandLine: ['node', '--token', CANARY], networkInterfaces: [{ name: 'eth0', mac: 'aa:bb', address: '10.0.0.1' }], nodejsVersion: 'v24' },
+    javascriptStack: { message: 'x', stack: ['at f (file.js:1:1)'] },
+    javascriptHeap: { totalMemory: 8_589_934_592, usedMemory: 8_500_000_000 },
+    resourceUsage: { userCpuSeconds: 1.5 },
+    environmentVariables: { SECRET_API_KEY: CANARY },
+  });
+
+  it('removes the environment and the addresses/command line, keeps the heap numbers and stacks, makes the file 0600, and is idempotent', () => {
+    const file = join(dir, 'report.20261007.171746.1.0.001.json');
+    writeFileSync(file, JSON.stringify(rawReport()), { mode: 0o664 });
+    chmodSync(file, 0o664);
+    expect(sanitizeFatalReports(stateDir)).toEqual({ sanitized: 1, removed: 0 });
+    const text = readFileSync(file, 'utf8');
+    expect(text).not.toContain(CANARY);
+    expect(text).not.toContain('networkInterfaces');
+    expect(text).not.toContain('commandLine');
+    const parsed = JSON.parse(text) as Record<string, any>;
+    expect(parsed.environmentVariables).toBeUndefined();
+    expect(parsed.header).toMatchObject({ event: expect.stringContaining('heap out of memory'), trigger: 'FatalError', nodejsVersion: 'v24' });
+    expect(parsed.header.host).toBeUndefined();
+    expect(parsed.javascriptHeap).toEqual({ totalMemory: 8_589_934_592, usedMemory: 8_500_000_000 });
+    expect(parsed.javascriptStack.stack).toEqual(['at f (file.js:1:1)']);
+    expect(parsed[DAEMON_FATAL_REPORT_SANITIZED_KEY]).toBe(true);
+    expect(statSync(file).mode & 0o777).toBe(0o600);
+    expect(sanitizeFatalReports(stateDir)).toEqual({ sanitized: 0, removed: 0 });
+  });
+
+  it('deletes a report the crash cut short instead of leaving it unsanitised, keeps only the newest few, and ignores other files', () => {
+    writeFileSync(join(dir, 'report.truncated.json'), `{"header":{"event":"x"},"environmentVariables":{"SECRET":"${CANARY}"`);
+    for (let i = 0; i < DAEMON_MEMORY_DIAGNOSTIC_KEEP + 3; i += 1) writeFileSync(join(dir, `report.2026100${String(i).padStart(2, '0')}.json`), JSON.stringify(rawReport()));
+    writeFileSync(join(dir, 'memory-guard-state.json'), '{"restarts":[]}');
+    const result = sanitizeFatalReports(stateDir);
+    expect(result.removed).toBe(1 + 3);
+    const left = readdirSync(dir);
+    expect(left.filter((name) => name.startsWith('report.'))).toHaveLength(DAEMON_MEMORY_DIAGNOSTIC_KEEP);
+    expect(left).toContain('memory-guard-state.json');
+    expect(left.some((name) => name.includes('truncated'))).toBe(false);
+    for (const name of left.filter((entry) => entry.startsWith('report.'))) expect(readFileSync(join(dir, name), 'utf8')).not.toContain(CANARY);
+  });
+
+  it('REAL ABORT: a node process that dies of heap exhaustion with the daemon\'s report flags leaves a report that is safe after the sweep', () => {
+    const run = spawnSync(process.execPath, [
+      '--max-old-space-size=48', '--report-on-fatalerror', '--report-compact', `--report-directory=${dir}`,
+      '-e', "const keep = []; for (;;) keep.push(new Array(100000).fill('x' + Math.random()));",
+    ], { env: { ...process.env, SECRET_API_KEY: CANARY }, encoding: 'utf8', timeout: 60_000 });
+    expect(run.status === null || run.status !== 0).toBe(true);
+    const reports = readdirSync(dir).filter((name) => name.startsWith('report.'));
+    expect(reports.length).toBeGreaterThan(0);
+    expect(readFileSync(join(dir, reports[0]!), 'utf8')).toContain(CANARY); // raw: the whole environment is in it (why the sweep exists)
+    sanitizeFatalReports(stateDir);
+    const text = readFileSync(join(dir, reports[0]!), 'utf8');
+    expect(text).not.toContain(CANARY);
+    expect(text).not.toContain('networkInterfaces');
+    expect(text).toContain('javascriptHeap');
+    expect(statSync(join(dir, reports[0]!)).mode & 0o777).toBe(0o600);
+  }, 90_000);
+
+  it('excludeEnv is switched on where the runtime has it and is a harmless no-op where it does not', () => {
+    const fake = { excludeEnv: false };
+    expect(excludeEnvironmentFromReports(fake)).toBe(true);
+    expect(fake.excludeEnv).toBe(true);
+    expect(excludeEnvironmentFromReports({})).toBe(false); // an older runtime: no such property
+    expect(excludeEnvironmentFromReports(null)).toBe(false);
+    expect(excludeEnvironmentFromReports({ get excludeEnv() { return false; }, set excludeEnv(_value: boolean) { throw new Error('read only'); } })).toBe(false);
+    const real = (process as unknown as { report?: { excludeEnv?: boolean; getReport(): unknown } }).report;
+    if (real && 'excludeEnv' in real) {
+      const previous = real.excludeEnv;
+      process.env.IMCODES_REPORT_CANARY = CANARY;
+      try {
+        expect(excludeEnvironmentFromReports()).toBe(true);
+        expect(JSON.stringify(real.getReport())).not.toContain(CANARY);
+      } finally {
+        real.excludeEnv = previous;
+        delete process.env.IMCODES_REPORT_CANARY;
+      }
+    }
+  });
+
+  it('--report-exclude-env is in the options iff the caller proves the node knows it; the generators prove it only for a direct launch of THIS node', () => {
+    const known = new Set(['--report-exclude-env']);
+    expect(daemonFatalReportNodeOptions('/home/u/.imcodes')).not.toContain('--report-exclude-env');
+    expect(daemonFatalReportNodeOptions('/home/u/.imcodes', 'plain', true)).toContain('--report-exclude-env');
+    expect(reportExcludeEnvFlagUsable('/usr/bin/node', '/usr/bin/node', known)).toBe(true);
+    expect(reportExcludeEnvFlagUsable('/usr/bin/node', '/usr/bin/node', new Set())).toBe(false); // node 22.0-22.12: refuses to start with it
+    expect(reportExcludeEnvFlagUsable('/opt/imcodes/bin/imcodes-launch.sh', '/usr/bin/node', known)).toBe(false); // the launcher picks node at start
+    expect(reportExcludeEnvFlagUsable('/usr/local/bin/node', '/usr/bin/node', known)).toBe(false);
+  });
+
+  it('REAL ABORT with --report-exclude-env: the raw report already has no environment (on a node that knows the flag)', () => {
+    if (!process.allowedNodeEnvironmentFlags.has('--report-exclude-env')) return;
+    const run = spawnSync(process.execPath, [
+      '--max-old-space-size=48', ...daemonFatalReportNodeOptions(stateDir, 'plain', true).split(' ').filter((arg) => !arg.startsWith('--report-directory')), `--report-directory=${dir}`,
+      '-e', "const keep = []; for (;;) keep.push(new Array(100000).fill('x' + Math.random()));",
+    ], { env: { ...process.env, SECRET_API_KEY: CANARY }, encoding: 'utf8', timeout: 60_000 });
+    expect(run.status === null || run.status !== 0).toBe(true);
+    const reports = readdirSync(dir).filter((name) => name.startsWith('report.'));
+    expect(reports.length).toBeGreaterThan(0);
+    expect(readFileSync(join(dir, reports[0]!), 'utf8')).not.toContain(CANARY);
+  }, 90_000);
+
+  it('the unit options quote a state directory with a space', () => {
+    expect(daemonFatalReportNodeOptions('/Users/Jane Doe/.imcodes')).toBe(`--report-on-fatalerror --report-compact --report-directory="/Users/Jane Doe/.imcodes/diagnostics"`);
+    expect(daemonFatalReportNodeOptions('/Users/Jane Doe/.imcodes', 'systemd')).toBe('--report-on-fatalerror --report-compact --report-directory=\\"/Users/Jane Doe/.imcodes/diagnostics\\"');
+    expect(daemonFatalReportNodeOptions('/srv/100%/home', 'systemd')).toContain('100%%');
   });
 });

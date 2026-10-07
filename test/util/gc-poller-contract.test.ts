@@ -67,7 +67,7 @@ describe('GC poller wiring', () => {
     // (native stack, heap statistics) into the state directory's diagnostics folder when it dies of a fatal error.
     it(`${rel} asks the runtime for a fatal-error report in the unit's NODE_OPTIONS`, () => {
       const src = readFileSync(resolve(REPO_ROOT, rel), 'utf8');
-      expect(src).toMatch(/NODE_OPTIONS=--expose-gc --max-old-space-size=8192 \$\{daemonFatalReportNodeOptions\(service\.stateHome\)\}/);
+      expect(src).toMatch(/NODE_OPTIONS=--expose-gc --max-old-space-size=8192 \$\{daemonFatalReportNodeOptions\(service\.stateHome(?:, '(?:systemd|plain)', reportExcludeEnvFlagUsable\(target\.program\))?\)\}/);
     });
 
     it(`${rel} sets MALLOC_ARENA_MAX=2 in the systemd unit template`, () => {
@@ -81,6 +81,6 @@ describe('GC poller wiring', () => {
     // The plist template must register NODE_OPTIONS as a <key>/<string>
     // pair inside <key>EnvironmentVariables</key><dict>...</dict>.
     expect(src).toMatch(/<key>NODE_OPTIONS<\/key>[\s\S]*--expose-gc/);
-    expect(src).toMatch(/<key>NODE_OPTIONS<\/key>[\s\S]*daemonFatalReportNodeOptions\(service\.stateHome\)/);
+    expect(src).toMatch(/<key>NODE_OPTIONS<\/key>[\s\S]*daemonFatalReportNodeOptions\(service\.stateHome, 'plain', reportExcludeEnvFlagUsable\(target\.program\)\)/);
   });
 });
