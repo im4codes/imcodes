@@ -27,9 +27,12 @@ const PROFILE_RELATIVE = 'IM.codes\\local-panel\\browser-profile';
 export type WindowsPanelOp =
   | { kind: 'launch_app'; browser: string }
   | { kind: 'focus'; pid: number }
+  /** Look for the panel window in the user's session; answers `ok:<pid>:<startedAtMs>` or not_found. */
+  | { kind: 'find' }
   | { kind: 'default_browser'; url: string };
 
-const WINDOWS_PANEL_RESULTS = ['ok', 'not_found', 'failed'] as const;
+/** What a script may answer: one of the words, or `ok:<pid>:<startedAtMs>` from the find operation. */
+const WINDOWS_PANEL_RESULT_RE = /^(?:ok|not_found|failed|ok:\d+:\d+)$/u;
 
 function b64(value: string): string {
   return Buffer.from(value, 'utf8').toString('base64');
@@ -89,6 +92,10 @@ public static class PanelWin{
 '@
 Add-Type -TypeDefinition $src
 if([PanelWin]::Focus(${op.pid},(D '${b64(LOCAL_PANEL_WINDOW_TITLE)}'))){Report 'ok'}else{Report 'not_found'}`;
+  } else if (op.kind === 'find') {
+    body = String.raw`$title=D '${b64(LOCAL_PANEL_WINDOW_TITLE)}'
+$p=Get-Process | Where-Object{$_.MainWindowHandle -ne 0 -and $_.MainWindowTitle -eq $title} | Sort-Object Id | Select-Object -First 1
+if($p){Report ('ok:{0}:{1}' -f $p.Id,([DateTimeOffset]$p.StartTime).ToUnixTimeMilliseconds())}else{Report 'not_found'}`;
   } else {
     body = String.raw`Start-Process -FilePath (D '${b64(op.url)}')
 Report 'ok'`;
@@ -97,17 +104,11 @@ Report 'ok'`;
   return `-NoProfile -NonInteractive -EncodedCommand ${Buffer.from(script, 'utf16le').toString('base64')}`;
 }
 
-/** The PowerShell that lists the panel window process: the app-mode browser carrying our profile, or the native window. */
-export function buildWindowsPanelProcessQuery(): string {
-  return `$p=Get-CimInstance Win32_Process | Where-Object{($_.CommandLine -and $_.CommandLine -like '*local-panel*browser-profile*') -or $_.Name -eq '${AIDESK_LOCAL_UI_EXECUTABLE_NAME}.exe'} | Sort-Object ProcessId | Select-Object -First 1
-if($p){'{0} {1}' -f $p.ProcessId,([DateTimeOffset]$p.CreationDate).ToUnixTimeMilliseconds()}`;
-}
-
 export interface WindowsPanelWindowDeps {
   env: NodeJS.ProcessEnv;
   exists: (path: string) => boolean;
-  /** Runs PowerShell to completion and returns its stdout (read-only process queries). */
-  powershell: (script: string) => Promise<string>;
+  /** Runs a system tool (tasklist) to completion and returns its stdout: quick read-only process queries that never touch WMI. */
+  tasklist: (args: readonly string[]) => Promise<string>;
   /** Run one operation in the active user's session (service) or directly (user): the script's result word. */
   runOp: (op: WindowsPanelOp) => Promise<string | undefined>;
   launchNative: (path: string) => Promise<boolean>;
@@ -122,30 +123,32 @@ function isServiceAccount(env: NodeJS.ProcessEnv): boolean {
 
 const realDeps = (): WindowsPanelWindowDeps => {
   const env = process.env;
-  const powershell = (script: string): Promise<string> => new Promise((resolve) => {
-    execFile(resolveWindowsPowerShellExecutable(env), ['-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')],
-      { timeout: 10_000, encoding: 'utf8', windowsHide: true }, (_error, stdout) => resolve(String(stdout ?? '')));
+  const tasklist = (args: readonly string[]): Promise<string> => new Promise((resolve) => {
+    const systemRoot = (env.SystemRoot ?? env.WINDIR ?? 'C:\\Windows').replace(/"/gu, '');
+    execFile(win32.join(systemRoot, 'System32', 'tasklist.exe'), [...args],
+      { timeout: 20_000, encoding: 'utf8', windowsHide: true }, (_error, stdout) => resolve(String(stdout ?? '')));
   });
   return {
     env,
     exists: existsSync,
-    powershell,
+    tasklist,
     runOp: async (op) => {
       if (isServiceAccount(env)) {
         return runWindowsUserSessionScript({
           buildCommand: (resultPath) => buildWindowsPanelWindowCommand(op, resultPath),
-          accept: (value) => (WINDOWS_PANEL_RESULTS as readonly string[]).includes(value),
+          accept: (value) => WINDOWS_PANEL_RESULT_RE.test(value),
           resultPrefix: 'local-panel-window',
-          timeoutMs: 12_000,
+          // A user-session PowerShell cold start takes a minute on a slow machine; the node answers the click before then.
+          timeoutMs: 90_000,
           windowsEnvironment: env,
         });
       }
       const out = await new Promise<string>((resolve) => {
         execFile(resolveWindowsPowerShellExecutable(env), buildWindowsPanelWindowCommand(op).split(' '),
-          { timeout: 12_000, encoding: 'utf8', windowsHide: true }, (_error, stdout) => resolve(String(stdout ?? '')));
+          { timeout: 90_000, encoding: 'utf8', windowsHide: true }, (_error, stdout) => resolve(String(stdout ?? '')));
       });
       const word = out.trim().split(/\s+/u).pop() ?? '';
-      return (WINDOWS_PANEL_RESULTS as readonly string[]).includes(word) ? word : undefined;
+      return WINDOWS_PANEL_RESULT_RE.test(word) ? word : undefined;
     },
     launchNative: (path) => new Promise((resolve) => {
       if (isServiceAccount(env)) {
@@ -166,8 +169,9 @@ const realDeps = (): WindowsPanelWindowDeps => {
 
 export function createWindowsLocalPanelWindowPlatform(overrides: Partial<WindowsPanelWindowDeps> = {}): LocalPanelWindowPlatform {
   const deps = { ...realDeps(), ...overrides };
-  const parseProcess = (text: string): LocalPanelWindowProcess | undefined => {
-    const match = /^(\d+)\s+(\d+)$/mu.exec(text.trim());
+  /** `ok:<pid>:<startedAtMs>` from the find operation. */
+  const parseFound = (answer: string | undefined): LocalPanelWindowProcess | undefined => {
+    const match = /^ok:(\d+):(\d+)$/u.exec(answer ?? '');
     if (!match) return undefined;
     const pid = Number(match[1]);
     const startedAtMs = Number(match[2]);
@@ -178,9 +182,9 @@ export function createWindowsLocalPanelWindowPlatform(overrides: Partial<Windows
     canFocus: true,
     async hasDesktop() {
       if (!isServiceAccount(deps.env)) return true;
-      // The service sees an interactive desktop when a user session (>= 1) runs explorer.exe.
-      const out = await deps.powershell("(Get-Process -Name explorer -ErrorAction SilentlyContinue | Where-Object{$_.SessionId -ge 1} | Select-Object -First 1).SessionId");
-      return /^\d+$/mu.test(out.trim());
+      // The service sees an interactive desktop when a user session (>= 1) runs explorer.exe: `"explorer.exe","<pid>","<session name>","<session #>",...`
+      const out = await deps.tasklist(['/FI', 'IMAGENAME eq explorer.exe', '/FO', 'CSV', '/NH']);
+      return out.split(/\r?\n/u).some((line) => Number(/^"[^"]*","\d+","[^"]*","(\d+)"/u.exec(line)?.[1] ?? -1) >= 1);
     },
     async nativeUiPath() {
       const path = await deps.nativeUiPath();
@@ -191,13 +195,13 @@ export function createWindowsLocalPanelWindowPlatform(overrides: Partial<Windows
       return [...LOCAL_PANEL_APP_MODE_BROWSERS.win32];
     },
     async findWindowProcess() {
-      return parseProcess(await deps.powershell(buildWindowsPanelProcessQuery()));
+      return parseFound(await deps.runOp({ kind: 'find' }));
     },
     async probePid(pid) {
-      const out = await deps.powershell(`$p=Get-Process -Id ${Math.trunc(pid)} -ErrorAction SilentlyContinue
-if($p){([DateTimeOffset]$p.StartTime).ToUnixTimeMilliseconds()}`);
-      const startedAtMs = Number(out.trim());
-      return Number.isFinite(startedAtMs) && startedAtMs > 0 ? { alive: true, startedAtMs } : { alive: false };
+      // Alive AND still one of the window's own images: a recycled pid belonging to anything else is not our window.
+      const out = await deps.tasklist(['/FI', `PID eq ${Math.trunc(pid)}`, '/FO', 'CSV', '/NH']);
+      const alive = out.split(/\r?\n/u).some((line) => new RegExp(`^"(?:msedge|chrome|brave|${AIDESK_LOCAL_UI_EXECUTABLE_NAME})\\.exe","${Math.trunc(pid)}"`, 'iu').test(line));
+      return alive ? { alive: true } : { alive: false };
     },
     async focusWindow(window) {
       return (await deps.runOp({ kind: 'focus', pid: window.pid })) === 'ok';

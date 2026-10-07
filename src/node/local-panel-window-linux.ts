@@ -8,9 +8,10 @@
 import { spawn, execFile } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
 import { chown, mkdir } from 'node:fs/promises';
-import { delimiter, join } from 'node:path';
+import { delimiter, isAbsolute, join } from 'node:path';
 import {
   LOCAL_PANEL_APP_MODE_BROWSERS,
+  LOCAL_PANEL_PROFILE_DIR_ENV,
   LOCAL_PANEL_WINDOW_TITLE,
   buildLocalPanelAppModeArgs,
 } from '../../shared/local-panel-window.js';
@@ -86,6 +87,8 @@ export function createLinuxLocalPanelWindowPlatform(overrides: Partial<LinuxPane
   };
   const homeOf = (user: LinuxDesktopUserProfile | undefined): string | undefined => user?.home ?? deps.env.HOME;
   const profileDir = (): string | undefined => {
+    const override = deps.env[LOCAL_PANEL_PROFILE_DIR_ENV]?.trim();
+    if (override && isAbsolute(override)) return override;
     const home = homeOf(desktopUser());
     return home ? join(imcodesStateDirForHome(home, deps.env), 'local-panel', 'browser-profile') : undefined;
   };

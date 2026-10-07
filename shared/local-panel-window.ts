@@ -47,8 +47,16 @@ export const LOCAL_PANEL_WINDOW_TITLE = AIDESK_PRODUCT_NAME;
 export const LOCAL_PANEL_WINDOW_STATE_FILE = 'local-panel-window.json';
 /** Directory (inside the state dir) of the dedicated browser profile used for app mode, so it never touches the user's own profile. */
 export const LOCAL_PANEL_WINDOW_PROFILE_DIR = 'local-panel-browser-profile';
+/** Absolute path that replaces the app-mode browser profile directory (isolated verification and operators; unset = the desktop user's own state directory). */
+export const LOCAL_PANEL_PROFILE_DIR_ENV = 'IMCODES_LOCAL_PANEL_PROFILE_DIR' as const;
 /** Query value used by the panel's external links: they go to the default browser through the node, never inside the app window. */
 export const LOCAL_PANEL_EXTERNAL_PATH = '/open-external';
+/**
+ * How long the panel's open-window endpoint waits for the node to finish opening before it answers anyway (`in_progress`, still 200).
+ * Shorter than the native clients' wait (local_management_open_window.h: 10 s), so on a slow machine a native client never gives up
+ * and opens the browser while the node is still opening its window.
+ */
+export const LOCAL_PANEL_OPEN_ANSWER_BUDGET_MS = 8_000;
 export const LOCAL_PANEL_WINDOW_SIZE = Object.freeze({ width: 520, height: 720 } as const);
 
 /** The only address the app window may show or load: the loopback panel, exactly. */

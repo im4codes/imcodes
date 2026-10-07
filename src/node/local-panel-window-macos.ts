@@ -6,9 +6,10 @@
 import { execFile, spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { chown, mkdir } from 'node:fs/promises';
-import { join } from 'node:path';
+import { isAbsolute, join } from 'node:path';
 import {
   LOCAL_PANEL_APP_MODE_BROWSERS,
+  LOCAL_PANEL_PROFILE_DIR_ENV,
   buildLocalPanelAppModeArgs,
 } from '../../shared/local-panel-window.js';
 import { AIDESK_LOCAL_UI_EXECUTABLE_NAME } from '../../shared/aidesk-product.js';
@@ -89,6 +90,8 @@ export function createMacosLocalPanelWindowPlatform(overrides: Partial<MacosPane
   };
   const homeOf = async (): Promise<string | undefined> => (await sessionUser())?.home ?? deps.env.HOME;
   const profileDir = async (): Promise<string | undefined> => {
+    const override = deps.env[LOCAL_PANEL_PROFILE_DIR_ENV]?.trim();
+    if (override && isAbsolute(override)) return override;
     const home = await homeOf();
     return home ? join(imcodesStateDirForHome(home, deps.env), 'local-panel', 'browser-profile') : undefined;
   };

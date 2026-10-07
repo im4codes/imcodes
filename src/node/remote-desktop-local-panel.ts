@@ -1,7 +1,7 @@
 import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { REMOTE_DESKTOP_ACCESS_MODE } from '../../shared/remote-desktop.js';
-import { LOCAL_PANEL_EXTERNAL_PATH, LOCAL_PANEL_WINDOW_TITLE } from '../../shared/local-panel-window.js';
+import { LOCAL_PANEL_EXTERNAL_PATH, LOCAL_PANEL_OPEN_ANSWER_BUDGET_MS, LOCAL_PANEL_WINDOW_TITLE } from '../../shared/local-panel-window.js';
 import {
   REMOTE_DESKTOP_LOCAL_ACTION,
   REMOTE_DESKTOP_LOCAL_MANAGEMENT,
@@ -32,6 +32,8 @@ export interface RemoteDesktopLocalPanelOptions {
    * answer is the decision layer's reason code; `ok:false` means nothing could be opened, so the caller keeps its own fallback.
    */
   openWindow?(): Promise<{ ok: boolean; reason: string }>;
+  /** Test seam: how long /open-window waits for the open before answering `in_progress` (default LOCAL_PANEL_OPEN_ANSWER_BUDGET_MS). */
+  openWindowAnswerBudgetMs?: number;
   host?: string;
   port?: number;
 }
@@ -164,7 +166,15 @@ export async function startRemoteDesktopLocalPanel(
       }
       if (!options.openWindow) return reply(response, 501, 'not_implemented');
       openWindowInFlight ??= options.openWindow().catch(() => ({ ok: false, reason: 'launch_failed' })).finally(() => { openWindowInFlight = undefined; });
-      const outcome = await openWindowInFlight;
+      // A slow machine may take longer than the client is willing to wait; the open keeps going and the client is told so (200), not left
+      // to time out and open the browser as well.
+      const budget = options.openWindowAnswerBudgetMs ?? LOCAL_PANEL_OPEN_ANSWER_BUDGET_MS;
+      let budgetTimer: NodeJS.Timeout | undefined;
+      const outcome = await Promise.race([
+        openWindowInFlight,
+        new Promise<{ ok: boolean; reason: string }>((resolve) => { budgetTimer = setTimeout(() => resolve({ ok: true, reason: 'in_progress' }), budget); }),
+      ]);
+      if (budgetTimer) clearTimeout(budgetTimer);
       return reply(response, outcome.ok ? 200 : 502, JSON.stringify(outcome), 'application/json; charset=utf-8');
     }
     const session = typeof cookie === 'string' ? sessions.get(cookie) : undefined;

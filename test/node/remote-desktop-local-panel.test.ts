@@ -276,6 +276,20 @@ describe('remote desktop local panel: independent window entry', () => {
     expect(openWindow).toHaveBeenCalledTimes(1);
   });
 
+  it('open-window: when the open outlasts the answer budget the client is told it is in progress (200), once, and the open continues', async () => {
+    let release: () => void = () => {};
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const openWindow = vi.fn(async () => { await gate; return { ok: true, reason: 'opened_app_mode_window' }; });
+    const panel = await startPanel({ openWindow, openWindowAnswerBudgetMs: 60 });
+    const started = Date.now();
+    const answer = await fetch(openUrl(panel), { method: 'POST', headers: nativeHeaders });
+    expect(Date.now() - started).toBeLessThan(2_000);
+    expect(answer.status).toBe(200);
+    expect(await answer.json()).toEqual({ ok: true, reason: 'in_progress' });
+    expect(openWindow).toHaveBeenCalledTimes(1);
+    release();
+  });
+
   it('open-window is refused for a request whose Host is not exactly the panel', async () => {
     const panel = await startPanel({ openWindow: async () => ({ ok: true, reason: 'x' }) });
     const { request } = await import('node:http');
