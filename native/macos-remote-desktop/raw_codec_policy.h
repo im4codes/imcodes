@@ -54,6 +54,26 @@ struct RawCodecDecision {
   return "unknown";
 }
 
+// How many cores the libvpx encoder is told it has. libwebrtc derives the encoder's
+// thread count from the core count it is handed, so this is the thread cap.
+//
+// Measured on a 12-core / 24-thread Intel Mac Pro (VP9 real-time, 2560x1350 text,
+// tiles on, 8 Mbps), encode time per frame:
+//     2 threads 21-35 ms | 4: 13.8-20 | 6: 11.8-17 | 8: 9.8-13 | 12: 9-12 | 24: no gain.
+// So more than 12 is never useful (the cap), and a machine reporting more cores than
+// that gets 12. A low-core Mac keeps what it has: 4 threads still encode in 14-20 ms,
+// and the encoder is bursty (about 0.4-0.7 of one core on average at 10 frames/s), so
+// no core is held back for the capture. The floor is 2: a report of 0 or 1 core is
+// almost always a misreport, and a single thread is about two to three times slower.
+inline constexpr int kRawEncoderMaxCores = 12;
+inline constexpr int kRawEncoderMinCores = 2;
+
+[[nodiscard]] constexpr int RawEncoderCoreBudget(int reported_cores) noexcept {
+  if (reported_cores < kRawEncoderMinCores) return kRawEncoderMinCores;
+  if (reported_cores > kRawEncoderMaxCores) return kRawEncoderMaxCores;
+  return reported_cores;
+}
+
 }  // namespace imcodes::remote_desktop::macos
 
 #endif  // IMCODES_MACOS_REMOTE_DESKTOP_RAW_CODEC_POLICY_H_

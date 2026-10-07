@@ -49,6 +49,7 @@
 #include "modules/video_coding/codecs/vp9/include/vp9.h"
 #include "modules/video_coding/include/video_error_codes.h"
 #include "pinned_libwebrtc_h264_sender.h"
+#include "raw_codec_policy.h"
 #include "raw_frame_conversion.h"
 #include "raw_video_path.h"
 #include "video_codec_selection.h"
@@ -468,7 +469,11 @@ class RawCodecEncoder final : public webrtc::VideoEncoder {
       source_width_ = codec_settings->width;
       source_height_ = codec_settings->height;
     }
-    return inner_->InitEncode(codec_settings, settings);
+    // The thread cap (raw_codec_policy.h): libwebrtc sizes the encoder's thread
+    // pool from the core count it is given.
+    webrtc::VideoEncoder::Settings capped = settings;
+    capped.number_of_cores = RawEncoderCoreBudget(settings.number_of_cores);
+    return inner_->InitEncode(codec_settings, capped);
   }
 
   int32_t RegisterEncodeCompleteCallback(

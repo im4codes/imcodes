@@ -88,6 +88,13 @@ describe('macOS raw (libvpx) video path wiring', () => {
       expect(create.indexOf('CreateVp8Encoder')).toBeLessThan(create.lastIndexOf('std::make_unique<PassthroughH264Encoder>'));
     });
 
+    it('tells libvpx the capped core count, which is what sizes its thread pool', () => {
+      const init = tap.slice(tap.indexOf('int InitEncode('), tap.indexOf('int32_t RegisterEncodeCompleteCallback'));
+      expect(init).toContain('capped.number_of_cores = RawEncoderCoreBudget(settings.number_of_cores);');
+      expect(init).toContain('inner_->InitEncode(codec_settings, capped)');
+      expect(init).not.toContain('inner_->InitEncode(codec_settings, settings)');
+    });
+
     it('reports the network target to the session after upstream applied it, and counts encoded bytes', () => {
       const setRates = tap.slice(tap.indexOf('void SetRates('), tap.indexOf('void OnPacketLossRateUpdate'));
       expect(setRates.indexOf('inner_->SetRates(parameters)')).toBeGreaterThanOrEqual(0);

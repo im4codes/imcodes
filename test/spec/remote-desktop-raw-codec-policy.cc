@@ -169,6 +169,23 @@ void OffRestoresTheOldBehaviourWhateverTheMacIs() {
   Require(std::string_view(macos::RawCodecSettingSourceName(macos::RawCodecSettingSource::kFile)) == "file", "source token");
 }
 
+void TheEncoderThreadCapFollowsTheMeasuredScaling() {
+  using macos::RawEncoderCoreBudget;
+  Require(RawEncoderCoreBudget(24) == 12, "a 24-thread Mac gets the cap: nothing is gained beyond 12");
+  Require(RawEncoderCoreBudget(1000) == 12, "absurd report still capped");
+  Require(RawEncoderCoreBudget(12) == 12, "exactly the cap");
+  Require(RawEncoderCoreBudget(8) == 8 && RawEncoderCoreBudget(6) == 6 && RawEncoderCoreBudget(4) == 4,
+          "a low-core Mac keeps what it has");
+  Require(RawEncoderCoreBudget(2) == 2, "two cores stay two");
+  Require(RawEncoderCoreBudget(1) == 2 && RawEncoderCoreBudget(0) == 2 && RawEncoderCoreBudget(-5) == 2,
+          "a misreport floors at two");
+  for (int cores = -2; cores < 64; ++cores) {
+    const int budget = RawEncoderCoreBudget(cores);
+    Require(budget >= macos::kRawEncoderMinCores && budget <= macos::kRawEncoderMaxCores, "always within [2, 12]");
+    Require(cores < macos::kRawEncoderMinCores || budget <= cores, "never more than the machine reports");
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -179,6 +196,7 @@ int main() {
   ResolutionPrefersTheEnvironmentThenTheFileThenAuto();
   AnInvalidValueIsIgnoredNeverTreatedAsOff();
   OffRestoresTheOldBehaviourWhateverTheMacIs();
+  TheEncoderThreadCapFollowsTheMeasuredScaling();
   std::cout << "raw codec policy counterfactuals passed\n";
   return 0;
 }
