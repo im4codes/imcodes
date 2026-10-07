@@ -160,6 +160,60 @@ export function sortFileBrowserEntries<T extends FileBrowserSortable>(entries: r
     .map(({ entry }) => entry);
 }
 
+/** Entries sorted per slice before the next yield; ~10 ms of comparisons on a slow host. */
+export const FILE_BROWSER_ASYNC_SORT_SLICE = 4096;
+
+/**
+ * The same order as `sortFileBrowserEntries`, built without holding the thread:
+ * sorted slices, then merged pairwise, awaiting `yieldToLoop` between slices and
+ * every few thousand merged entries. For a host that must keep serving other
+ * traffic while it orders a very large listing (a controlled node ordering
+ * 50,000 entries). A single sort of that size blocks for hundreds of ms.
+ */
+export async function sortFileBrowserEntriesAsync<T extends FileBrowserSortable>(
+  entries: readonly T[],
+  sort: FileBrowserSortState,
+  yieldToLoop: () => Promise<void>,
+  sliceSize: number = FILE_BROWSER_ASYNC_SORT_SLICE,
+): Promise<T[]> {
+  if (entries.length <= sliceSize) return sortFileBrowserEntries(entries, sort);
+  const byKind = sort.key === FILE_BROWSER_SORT_KEYS.KIND;
+  type Item = { entry: T; index: number; kind: string };
+  const compare = (a: Item, b: Item): number => compareEntries(a.entry, b.entry, sort, [a.kind, b.kind]) || a.index - b.index;
+  let runs: Item[][] = [];
+  for (let start = 0; start < entries.length; start += sliceSize) {
+    const slice: Item[] = [];
+    for (let index = start; index < Math.min(start + sliceSize, entries.length); index += 1) {
+      const entry = entries[index]!;
+      slice.push({ entry, index, kind: byKind ? fileKindSortKey(entry.name, entry.isDir) : '' });
+    }
+    runs.push(slice.sort(compare));
+    await yieldToLoop();
+  }
+  while (runs.length > 1) {
+    const merged: Item[][] = [];
+    for (let i = 0; i < runs.length; i += 2) {
+      const left = runs[i]!;
+      const right = runs[i + 1];
+      if (!right) { merged.push(left); continue; }
+      const out: Item[] = new Array<Item>(left.length + right.length);
+      let l = 0;
+      let r = 0;
+      let o = 0;
+      while (l < left.length && r < right.length) {
+        out[o++] = compare(left[l]!, right[r]!) <= 0 ? left[l++]! : right[r++]!;
+        if ((o & (sliceSize * 2 - 1)) === 0) await yieldToLoop();
+      }
+      while (l < left.length) out[o++] = left[l++]!;
+      while (r < right.length) out[o++] = right[r++]!;
+      merged.push(out);
+      await yieldToLoop();
+    }
+    runs = merged;
+  }
+  return (runs[0] ?? []).map((item) => item.entry);
+}
+
 /** The terms of a quick-filter query: NFC-normalized, lower-cased, split on whitespace. Empty means "no filter". */
 export function parseFileBrowserFilter(query: string): string[] {
   return query

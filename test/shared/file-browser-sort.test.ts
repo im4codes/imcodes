@@ -11,6 +11,7 @@ import {
   normalizeFileBrowserSortState,
   parseFileBrowserFilter,
   sortFileBrowserEntries,
+  sortFileBrowserEntriesAsync,
   type FileBrowserSortState,
   type FileBrowserTreeLike,
 } from '../../shared/file-browser-sort.js';
@@ -231,5 +232,49 @@ describe('file browser sort and filter at scale', () => {
     expect(filterTen).toBeLessThan(1_000);
     expect(sortFifty).toBeLessThan(6_000);
     expect(sortFifty / Math.max(sortTen, 1)).toBeLessThan(15);
+  });
+});
+
+describe('file browser sort without holding the thread', () => {
+  const entries = (count: number): FileBrowserTreeLike[] => Array.from({ length: count }, (_, index) => (index % 11 === 0
+    ? dir(`dir-${index % 37}`, { mtimeMs: index % 5 })
+    : file(`File-${index % 97}.${['pdf', 'txt', 'zip', 'png', 'weird'][index % 5]}`, { size: index % 13 === 0 ? undefined : index % 29, mtimeMs: index % 53, birthtimeMs: index % 7 === 0 ? undefined : index % 17 })));
+
+  it('gives exactly the order of the synchronous sort for every key, direction and folders-first setting, ties included', async () => {
+    const input = entries(1_000);
+    const identities = new Map(input.map((entry, index) => [entry, index]));
+    for (const key of ['name', 'modified', 'created', 'size', 'kind'] as const) {
+      for (const direction of ['asc', 'desc'] as const) {
+        for (const dirsFirst of [true, false]) {
+          const sort = sortBy(key, direction, dirsFirst);
+          const expected = sortFileBrowserEntries(input, sort).map((entry) => identities.get(entry));
+          // A slice of 64 forces many slices and several merge passes.
+          const actual = (await sortFileBrowserEntriesAsync(input, sort, async () => {}, 64)).map((entry) => identities.get(entry));
+          expect(actual, `${key} ${direction} dirsFirst=${dirsFirst}`).toEqual(expected);
+        }
+      }
+    }
+  });
+
+  it('yields to the event loop many times for a big listing, never for a small one, and does not mutate its input', async () => {
+    let yields = 0;
+    const input = entries(50_000);
+    const snapshot = input.slice(0, 50);
+    const sorted = await sortFileBrowserEntriesAsync(input, sortBy('modified', 'desc'), async () => { yields += 1; });
+    expect(sorted).toHaveLength(50_000);
+    expect(yields).toBeGreaterThan(25);
+    expect(input.slice(0, 50)).toEqual(snapshot);
+
+    let smallYields = 0;
+    await sortFileBrowserEntriesAsync(entries(100), sortBy('name'), async () => { smallYields += 1; });
+    expect(smallYields).toBe(0);
+  });
+
+  it('a yield between slices lets other work run: a timer scheduled during the sort fires before it ends', async () => {
+    const order: string[] = [];
+    setTimeout(() => order.push('timer'), 0);
+    await sortFileBrowserEntriesAsync(entries(30_000), sortBy('name'), () => new Promise((resolve) => setImmediate(resolve)));
+    order.push('sorted');
+    expect(order).toEqual(['timer', 'sorted']);
   });
 });

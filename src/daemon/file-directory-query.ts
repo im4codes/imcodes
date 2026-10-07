@@ -5,7 +5,7 @@ import {
   FILE_BROWSER_SORT_KEYS,
   fileBrowserNameMatches,
   parseFileBrowserFilter,
-  sortFileBrowserEntries,
+  sortFileBrowserEntriesAsync,
 } from '../../shared/file-browser-sort.js';
 import {
   FILE_TRANSFER_DIRECTORY_MAX_ENTRIES,
@@ -16,6 +16,9 @@ import {
   type FileDirectoryListQuery,
 } from '../../shared/transport/file-transfer.js';
 import { mapWithConcurrency } from '../util/concurrency.js';
+
+/** A turn of the event loop, so a big directory's ordering never holds up the node's other traffic. */
+const yieldToEventLoop = (): Promise<void> => new Promise((resolve) => setImmediate(resolve));
 
 /** Stat calls in flight at once: enough to overlap disk waits, few enough not to starve the node's other work. */
 const QUERY_STAT_CONCURRENCY = 32;
@@ -110,13 +113,13 @@ export async function buildQueriedDirectoryListing(input: DirectoryQueryInput): 
   const orderedByName = sort.key === FILE_BROWSER_SORT_KEYS.NAME || sort.key === FILE_BROWSER_SORT_KEYS.KIND;
   let ordered: FileDirectoryEntry[];
   if (orderedByName) {
-    ordered = sortFileBrowserEntries(matched, sort).slice(0, FILE_TRANSFER_DIRECTORY_MAX_ENTRIES);
+    ordered = (await sortFileBrowserEntriesAsync(matched, sort, yieldToEventLoop)).slice(0, FILE_TRANSFER_DIRECTORY_MAX_ENTRIES);
     await withMetadata(ordered);
   } else {
     const candidates = matched.length > maxStat ? matched.slice(0, maxStat) : matched;
     if (candidates.length < matched.length) partial = true;
     await withMetadata(candidates);
-    ordered = sortFileBrowserEntries(candidates, sort).slice(0, FILE_TRANSFER_DIRECTORY_MAX_ENTRIES);
+    ordered = (await sortFileBrowserEntriesAsync(candidates, sort, yieldToEventLoop)).slice(0, FILE_TRANSFER_DIRECTORY_MAX_ENTRIES);
   }
 
   const truncated = matched.length > ordered.length;
