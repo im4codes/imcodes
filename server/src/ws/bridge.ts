@@ -410,6 +410,13 @@ import {
 import { DaemonUpgradeCoordinator, type RequestDaemonUpgradeResult } from './daemon-upgrade-coordinator.js';
 import type { DaemonUpgradeSource } from '../../../shared/daemon-upgrade.js';
 import {
+  DAEMON_AUTH_RECONCILE_BUDGET_MS,
+  DAEMON_AUTH_RECONCILE_RETRY_DELAYS_MS,
+  DAEMON_AUTH_SLOW_PHASE_MS,
+  DAEMON_CONNECTION_DUEL_REPLACEMENTS,
+  DAEMON_CONNECTION_DUEL_WINDOW_MS,
+} from '../../../shared/daemon-auth.js';
+import {
   SHARE_REASONS,
   buildSharedActorEnvelope,
   commandSessionName,
@@ -2174,6 +2181,123 @@ export class WsBridge {
       sendUnavailable();
     }
   }
+  /**
+   * A controlled node's heartbeat is acknowledged and its server-side bookkeeping updated. Shared by the ordinary
+   * path (after authentication) and the early path (credentials verified, remote-desktop tail still running).
+   */
+  private acknowledgeControlledNodeHeartbeat(
+    msg: Record<string, unknown>,
+    ws: WebSocket,
+    db: Database,
+    connectionGeneration: number,
+  ): void {
+    const hbVersion = typeof msg.daemonVersion === 'string' ? msg.daemonVersion : this.daemonVersion;
+    if (typeof hbVersion === 'string') this.daemonVersion = hbVersion;
+    updateServerHeartbeat(db, this.serverId, hbVersion).catch((err) =>
+      logger.error({ err }, 'Failed to update heartbeat'),
+    );
+    try { ws.send(JSON.stringify(heartbeatAckWithClock(msg, this.daemonControlledNodeId, this.serverId))); } catch { /* ignore */ }
+    void this.sendRemoteDesktopNodeContext(db, ws, connectionGeneration);
+  }
+
+  /**
+   * Remote-desktop reconcile + revalidate for a freshly authenticated connection, with a bounded wait.
+   *
+   * The pair of steps can legitimately take ~35 s (a restarted node with a live route must cold-start its worker
+   * and ack the replacement route), but nothing else on the connection may wait that long: the node gives a socket
+   * up after 30 s of silence. Authentication therefore continues after DAEMON_AUTH_RECONCILE_BUDGET_MS while the
+   * steps keep running in the background, and remote desktop stays unavailable for this generation
+   * (`remoteDesktopAuthorityReadyGeneration` unset: fail closed) until they really finish. A failure is retried and
+   * finally reported -- never left as a silent half-aligned state.
+   */
+  private async awaitRemoteDesktopReconcileForAuth(
+    generation: number,
+    isCurrent: () => boolean,
+    phases: { reconcileMs: number | null; revalidateMs: number | null },
+  ): Promise<boolean> {
+    const tail = this.runRemoteDesktopReconcileWithRetry(generation, isCurrent, phases);
+    let budgetTimer: ReturnType<typeof setTimeout> | null = null;
+    const outcome = await Promise.race([
+      tail.then(() => 'done' as const),
+      new Promise<'budget'>((resolve) => {
+        budgetTimer = setTimeout(() => resolve('budget'), DAEMON_AUTH_RECONCILE_BUDGET_MS);
+        (budgetTimer as { unref?: () => void }).unref?.();
+      }),
+    ]);
+    if (budgetTimer) clearTimeout(budgetTimer);
+    if (outcome === 'budget') {
+      logger.warn({
+        serverId: this.serverId,
+        generation,
+        budgetMs: DAEMON_AUTH_RECONCILE_BUDGET_MS,
+      }, 'remote desktop reconcile is still running; authentication continues and remote desktop stays unavailable on this connection until it finishes');
+    }
+    return outcome === 'done';
+  }
+
+  private async runRemoteDesktopReconcileWithRetry(
+    generation: number,
+    isCurrent: () => boolean,
+    phases: { reconcileMs: number | null; revalidateMs: number | null },
+  ): Promise<void> {
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        const startedAt = Date.now();
+        const recovered = await this.remoteDesktopRouter.reconcileDaemonReplacement(generation);
+        const reconciledAt = Date.now();
+        // The legacy reconciler closes every process-lost route. Running it after a
+        // privacy-fenced transparent replacement would immediately destroy that
+        // replacement, so it is used only when no in-memory route was recovered.
+        if (recovered === 0) await WsBridge.remoteDesktopReconnectRevalidator?.(this.serverId);
+        if (attempt === 0) {
+          phases.reconcileMs = reconciledAt - startedAt;
+          phases.revalidateMs = recovered === 0 ? Date.now() - reconciledAt : 0;
+        }
+        if (isCurrent()) this.remoteDesktopAuthorityReadyGeneration = generation;
+        return;
+      } catch (error) {
+        if (!isCurrent()) return;
+        const retryDelay = DAEMON_AUTH_RECONCILE_RETRY_DELAYS_MS[attempt];
+        if (retryDelay === undefined) {
+          incrementCounter('remote_desktop.reconcile_gave_up');
+          logger.error({ error, serverId: this.serverId, generation, attempts: attempt + 1 },
+            'remote desktop reconcile gave up; remote desktop stays unavailable on this connection until the node reconnects');
+          return;
+        }
+        // Keep the daemon available for unrelated services but fail closed for remote desktop;
+        // do not replay process-local remote authority.
+        logger.warn({ error, serverId: this.serverId, generation, attempt: attempt + 1, retryInMs: retryDelay },
+          'Remote desktop reconnect authority reconciliation failed; it will be retried');
+        await new Promise<void>((resolve) => {
+          const timer = setTimeout(resolve, retryDelay);
+          (timer as { unref?: () => void }).unref?.();
+        });
+        if (!isCurrent()) return;
+      }
+    }
+  }
+
+  /**
+   * An authenticated daemon connection was just replaced. One replacement is a normal reconnect; several within
+   * a minute mean two processes are using the same credential (a duplicated service, a misconfigured copy) and are
+   * kicking each other. The per-daemon connect limiter bounds the rate; this makes the situation visible.
+   */
+  private noteAuthenticatedConnectionReplaced(now = Date.now()): void {
+    if (!this.authenticated) return;
+    this.authenticatedReplacementTimes = this.authenticatedReplacementTimes
+      .filter((at) => now - at < DAEMON_CONNECTION_DUEL_WINDOW_MS);
+    this.authenticatedReplacementTimes.push(now);
+    if (this.authenticatedReplacementTimes.length >= DAEMON_CONNECTION_DUEL_REPLACEMENTS
+      && now - this.lastDuelWarnAt >= DAEMON_CONNECTION_DUEL_WINDOW_MS) {
+      this.lastDuelWarnAt = now;
+      logger.warn({
+        serverId: this.serverId,
+        replacements: this.authenticatedReplacementTimes.length,
+        windowMs: DAEMON_CONNECTION_DUEL_WINDOW_MS,
+      }, 'daemon connection replaced repeatedly');
+    }
+  }
+
   private legacyUpgradeRescuePreparedGeneration: number | null = null;
   /** A safe-self-upgrade node can still retain its process-local latch when a
    *  detached task fails before replacing the process. Arm the same verified
@@ -2250,6 +2374,16 @@ export class WsBridge {
    * auth check has settled.
    */
   private authPromise: Promise<void> | null = null;
+  /**
+   * The FIRST half of `authPromise`: resolved as soon as this connection's own credentials are verified (one
+   * `servers` row lookup) or authentication failed. A controlled node's heartbeat -- the frame its watchdog
+   * counts as the auth ack -- waits only for this, never for the slow remote-desktop tail behind `authPromise`:
+   * a node gives a socket up after 30 s without any server frame.
+   */
+  private credentialPromise: Promise<void> | null = null;
+  /** When authenticated connections were replaced by a newer one; two processes sharing a credential show up here. */
+  private authenticatedReplacementTimes: number[] = [];
+  private lastDuelWarnAt = 0;
   /** Connection generation that advertised outbox-sync support during auth. */
   private upgradeBlockedSyncRequiredGeneration: number | null = null;
   /** Connection generation whose persisted blocker replay has completed. */
@@ -5457,6 +5591,7 @@ export class WsBridge {
       : null;
     // Replace existing daemon connection
     if (this.daemonWs) {
+      this.noteAuthenticatedConnectionReplaced();
       const replacedGeneration = this.daemonGeneration;
       void remoteDesktopConsentCancellation.endpointReplaced(
         db,
@@ -5509,6 +5644,7 @@ export class WsBridge {
     // late-arriving messages don't await a stale (and possibly resolved
     // for a different `ws`) auth.
     this.authPromise = null;
+    this.credentialPromise = null;
     this.upgradeBlockedSyncRequiredGeneration = null;
     this.upgradeBlockedSyncCompleteGeneration = null;
 
@@ -5552,6 +5688,20 @@ export class WsBridge {
       // daemon) raced the auth DB lookup and was rejected with
       // `ws.close(4001, 'auth_required')` even though auth was about to
       // succeed milliseconds later. See `authPromise` field doc above.
+      // A controlled node's heartbeat is what its watchdog counts as the auth ack, and the node gives a socket up
+      // after 30 s without any server frame. It therefore waits only for THIS connection's own credential check,
+      // never for the remote-desktop tail behind `authPromise` (up to 35 s on a restarted node with a live route).
+      // Every other frame still waits for the complete chain below, and a connection that was replaced or whose
+      // credentials failed falls through to the unchanged paths: it is never acknowledged.
+      if (msg.type === 'heartbeat' && this.credentialPromise && this.authPromise) {
+        const pendingCredential = this.credentialPromise;
+        try { await pendingCredential; } catch { /* resolves, never rejects */ }
+        if (this.daemonWs !== ws || this.daemonGeneration !== connectionGeneration) return;
+        if (this.authenticated && this.daemonNodeRole === NODE_ROLE.CONTROLLED) {
+          this.acknowledgeControlledNodeHeartbeat(msg, ws, db, connectionGeneration);
+          return;
+        }
+      }
       if (this.authPromise) {
         const pendingAuth = this.authPromise;
         try { await pendingAuth; } catch { /* ignore — closed below */ }
@@ -5578,9 +5728,16 @@ export class WsBridge {
         let resolveAuth!: () => void;
         const localAuthPromise = new Promise<void>((res) => { resolveAuth = res; });
         this.authPromise = localAuthPromise;
+        // First half of the barrier (see `credentialPromise`): created synchronously, with `authPromise`, so a
+        // heartbeat sent in the same breath as the auth frame can find it.
+        let resolveCredential!: () => void;
+        const localCredentialPromise = new Promise<void>((res) => { resolveCredential = res; });
+        this.credentialPromise = localCredentialPromise;
+        const authStartedAt = Date.now();
         const isCurrentAuthConnection = (): boolean =>
           this.daemonWs === ws && this.daemonGeneration === connectionGeneration;
         const finishLocalAuth = (): void => {
+          resolveCredential();
           resolveAuth();
           // A replacement connection owns a different auth promise. A stale
           // continuation may release only its own waiters; it must never clear
@@ -5588,9 +5745,13 @@ export class WsBridge {
           if (this.authPromise === localAuthPromise) {
             this.authPromise = null;
           }
+          if (this.credentialPromise === localCredentialPromise) {
+            this.credentialPromise = null;
+          }
         };
 
         const tokenHash = sha256Hex(msg.token);
+        const lookupStartedAt = Date.now();
         let server: {
           token_hash: string;
           user_id?: string;
@@ -5632,6 +5793,7 @@ export class WsBridge {
           if (!stillCurrent) return;
           throw err;
         }
+        const lookupMs = Date.now() - lookupStartedAt;
         // The DB lookup is the first asynchronous auth boundary. A replacement
         // may have installed a new socket and auth promise while it was pending.
         // Never let the stale continuation overwrite generation-bound state.
@@ -5726,32 +5888,41 @@ export class WsBridge {
         this.clearPendingIdlePushes();
         this.activeMainSessions.clear();
         this.hasActiveMainSessionSnapshot = false;
-        try {
-          const recovered = await this.remoteDesktopRouter.reconcileDaemonReplacement(connectionGeneration);
-          // The legacy reconciler closes every process-lost route.  Running it
-          // after a privacy-fenced transparent replacement would immediately
-          // destroy that replacement, so it is used only when no in-memory
-          // route was recovered.  Failed replacements are already terminated
-          // and durably closed by the Router.
-          if (recovered === 0) {
-            await WsBridge.remoteDesktopReconnectRevalidator?.(this.serverId);
-          }
-          if (isCurrentAuthConnection()) {
-            this.remoteDesktopAuthorityReadyGeneration = connectionGeneration;
-          }
-        } catch (error) {
-          // Keep the daemon available for unrelated services, but fail closed
-          // for remote desktop until a later reconnect can reconcile durable
-          // authority. Do not replay process-local remote authority.
-          logger.warn({ error, serverId: this.serverId },
-            'Remote desktop reconnect authority reconciliation failed');
-        }
+        // This connection's own credentials are verified: a controlled node's heartbeat may be acknowledged now.
+        const credentialMs = Date.now() - authStartedAt;
+        resolveCredential();
+        // The legacy reconciler closes every process-lost route. It runs only when no in-memory route was
+        // recovered by a privacy-fenced transparent replacement (which it would destroy). Bounded wait, background
+        // completion and retry: see awaitRemoteDesktopReconcileForAuth.
+        const phases: { reconcileMs: number | null; revalidateMs: number | null } = { reconcileMs: null, revalidateMs: null };
+        const reconcileStartedAt = Date.now();
+        const reconcileDone = await this.awaitRemoteDesktopReconcileForAuth(connectionGeneration, isCurrentAuthConnection, phases);
+        const reconcileWaitedMs = Date.now() - reconcileStartedAt;
+        const contextStartedAt = Date.now();
         await this.sendRemoteDesktopNodeContext(db, ws, connectionGeneration);
+        const contextMs = Date.now() - contextStartedAt;
         if (!isCurrentAuthConnection()) {
           finishLocalAuth();
           return;
         }
-        logger.info({ serverId: this.serverId, daemonVersion: this.daemonVersion }, 'Daemon authenticated');
+        const authTimings = {
+          lookupMs,
+          credentialMs,
+          // A step that is still running when authentication completes is reported as the time waited so far.
+          reconcileMs: phases.reconcileMs ?? reconcileWaitedMs,
+          revalidateMs: phases.revalidateMs ?? (phases.reconcileMs === null ? 0 : Math.max(0, reconcileWaitedMs - phases.reconcileMs)),
+          reconcilePending: !reconcileDone,
+          contextMs,
+          totalMs: Date.now() - authStartedAt,
+        };
+        logger.info({ serverId: this.serverId, daemonVersion: this.daemonVersion, ...authTimings }, 'Daemon authenticated');
+        if (authTimings.totalMs > DAEMON_AUTH_SLOW_PHASE_MS
+          || authTimings.lookupMs > DAEMON_AUTH_SLOW_PHASE_MS
+          || authTimings.reconcileMs > DAEMON_AUTH_SLOW_PHASE_MS
+          || authTimings.revalidateMs > DAEMON_AUTH_SLOW_PHASE_MS
+          || authTimings.contextMs > DAEMON_AUTH_SLOW_PHASE_MS) {
+          logger.warn({ serverId: this.serverId, daemonVersion: this.daemonVersion, ...authTimings }, 'slow daemon auth');
+        }
         onAuthenticated?.();
 
         updateServerHeartbeat(
@@ -6158,13 +6329,7 @@ export class WsBridge {
           return;
         }
         if (msg.type === 'heartbeat') {
-          const hbVersion = typeof msg.daemonVersion === 'string' ? msg.daemonVersion : this.daemonVersion;
-          if (typeof hbVersion === 'string') this.daemonVersion = hbVersion;
-          updateServerHeartbeat(db, this.serverId, hbVersion).catch((err) =>
-            logger.error({ err }, 'Failed to update heartbeat'),
-          );
-          try { ws.send(JSON.stringify(heartbeatAckWithClock(msg, this.daemonControlledNodeId, this.serverId))); } catch { /* ignore */ }
-          void this.sendRemoteDesktopNodeContext(db, ws, connectionGeneration);
+          this.acknowledgeControlledNodeHeartbeat(msg, ws, db, connectionGeneration);
           return;
         }
         WsBridge.controlledInboundDropped++;
@@ -6308,6 +6473,7 @@ export class WsBridge {
         // closed, the awaiting handlers will fall through and observe
         // `this.daemonWs !== ws` and bail out.
         this.authPromise = null;
+        this.credentialPromise = null;
         this.upgradeBlockedSyncRequiredGeneration = null;
         this.upgradeBlockedSyncCompleteGeneration = null;
         this.recentTextBySession.clear();
@@ -11538,6 +11704,7 @@ export class WsBridge {
       this.daemonWs = null;
       this.authenticated = false;
       this.authPromise = null;
+      this.credentialPromise = null;
       this.upgradeBlockedSyncRequiredGeneration = null;
       this.upgradeBlockedSyncCompleteGeneration = null;
       this.daemonP2pWorkflowCapabilities = null;

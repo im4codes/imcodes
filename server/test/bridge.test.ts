@@ -77,6 +77,8 @@ import {
   DAEMON_UPGRADE_IDLE_EDGE_MIN_INTERVAL_MS,
 } from '../../shared/daemon-upgrade.js';
 import { DAEMON_COMMAND_TYPES } from '../../shared/daemon-command-types.js';
+import { CLOCK_SYNC_FIELD } from '../../shared/clock-sync.js';
+import { DAEMON_AUTH_RECONCILE_BUDGET_MS, DAEMON_AUTH_RECONCILE_RETRY_DELAYS_MS } from '../../shared/daemon-auth.js';
 import { PEER_AUDIT_COMMAND_ERRORS, PEER_AUDIT_MESSAGES } from '../../shared/peer-audit.js';
 import {
   REMOTE_EXEC_MAX_CHUNK_BYTES,
@@ -1855,6 +1857,257 @@ describe('WsBridge', () => {
         WsBridge.get(serverId).requestDaemonUpgrade({ targetVersion: TARGET, source: 'manual' });
         expect(frames(ws).length).toBeGreaterThan(0);
         for (const frame of frames(ws)) expect(frame).not.toHaveProperty('force');
+      });
+    });
+
+    describe('controlled-node authentication latency (the fixed ~30 s before the first heartbeat_ack)', () => {
+      // 34f0bb11 (win-201): five restarts, process_start -> first heartbeat_ack 30.25-30.29 s every time. The node's
+      // silence watchdog gives a socket up after 30 s without ANY server frame; the server held its first heartbeat_ack
+      // behind the whole post-auth chain, whose remote-desktop route-replacement wait is up to 35 s (a restarted node
+      // with a live route has to cold-start its worker first).
+      const NODE_VERSION = '2026.10.5479-dev.5940';
+      const SLOW_RECONCILE_MS = 35_000;
+      const heartbeatAcks = (ws: MockWs) => ws.sentStrings
+        .map((message) => JSON.parse(message) as Record<string, unknown>)
+        .filter((frame) => frame.type === 'heartbeat_ack');
+      const authFrame = { type: 'auth', serverId: '', token: 'my-token', daemonVersion: NODE_VERSION, capabilities: [CONTROLLED_NODE_SAFE_SELF_UPGRADE_CAPABILITY] };
+      const heartbeatFrame = { type: 'heartbeat', daemonVersion: NODE_VERSION, [CLOCK_SYNC_FIELD.SENT_AT]: 1234 };
+      /** A node that connects the way the real one does: auth, then a heartbeat in the same breath. */
+      const connectNode = async (bridge: WsBridge, options: { db?: ReturnType<typeof makeDb>; nodeId?: string } = {}) => {
+        const ws = new MockWs();
+        bridge.handleDaemonConnection(ws as never, options.db ?? makeDb('valid-hash', 'controlled', CONTROLLED_NODE_OS_WIN, undefined, undefined, options.nodeId), {} as never);
+        ws.emit('message', JSON.stringify({ ...authFrame, serverId }));
+        ws.emit('message', JSON.stringify(heartbeatFrame));
+        return ws;
+      };
+      const blockRevalidatorFor = (ms: number) => {
+        const calls: number[] = [];
+        WsBridge.setRemoteDesktopReconnectRevalidator(async () => {
+          calls.push(Date.now());
+          await new Promise((resolve) => setTimeout(resolve, ms));
+        });
+        return calls;
+      };
+
+      beforeEach(() => { vi.useFakeTimers(); });
+
+      it('acknowledges the first heartbeat within a second even when the remote-desktop reconcile takes 35 s', async () => {
+        const bridge = WsBridge.get(serverId);
+        const revalidations = blockRevalidatorFor(SLOW_RECONCILE_MS);
+        const ws = await connectNode(bridge);
+        await vi.advanceTimersByTimeAsync(1_000);
+        await flushAsync();
+        expect(revalidations).toHaveLength(1);
+        expect(heartbeatAcks(ws), 'the ack must not wait for the reconcile tail (the node gives up after 30 s of silence)').toHaveLength(1);
+      });
+
+      it('keeps what the ack carries: the node id, the server id and the clock echo', async () => {
+        const bridge = WsBridge.get(serverId);
+        blockRevalidatorFor(SLOW_RECONCILE_MS);
+        const nodeId = '9909368908';
+        const ws = await connectNode(bridge, { nodeId });
+        await vi.advanceTimersByTimeAsync(1_000);
+        await flushAsync();
+        const [ack] = heartbeatAcks(ws);
+        expect(ack).toMatchObject({ [CLOCK_SYNC_FIELD.SENT_AT]: 1234 });
+        expect(typeof ack![CLOCK_SYNC_FIELD.SERVER_TIME]).toBe('number');
+        expect(JSON.stringify(ack)).toContain(serverId);
+        expect(JSON.stringify(ack)).toContain(nodeId);
+      });
+
+      it('a connection replaced while its credentials are still being checked never acknowledges or authenticates', async () => {
+        const bridge = WsBridge.get(serverId);
+        // Only the credential lookup (the FIRST query of the connection) is held back; the connection's own close
+        // handler queries the same database later and must not be mistaken for it.
+        const heldLookups: Array<() => void> = [];
+        const slowDb = makeDb('valid-hash', 'controlled', CONTROLLED_NODE_OS_WIN) as unknown as {
+          queryOne: (...args: unknown[]) => Promise<unknown>;
+        };
+        const realQueryOne = slowDb.queryOne.bind(slowDb);
+        slowDb.queryOne = (...args: unknown[]) => (heldLookups.length === 0
+          ? new Promise((resolve) => { heldLookups.push(() => resolve(realQueryOne(...args))); })
+          : realQueryOne(...args));
+        const releaseLookup = () => heldLookups[0]!();
+        const first = await connectNode(bridge, { db: slowDb as never });
+        const firstSends = vi.spyOn(first, 'send');
+        const second = await connectNode(bridge);
+        await flushAsync();
+        releaseLookup();
+        await vi.advanceTimersByTimeAsync(1_000);
+        await flushAsync();
+        expect(heartbeatAcks(first), 'the replaced connection must not be acknowledged').toHaveLength(0);
+        // not even an attempt: a closed socket swallows the send, so look at the attempts themselves
+        expect(firstSends.mock.calls.some(([data]) => String(data).includes('heartbeat_ack'))).toBe(false);
+        expect(heartbeatAcks(second)).toHaveLength(1);
+        expect(first.closed).toBe(true);
+        expect(bridge.isAuthenticated).toBe(true);
+      });
+
+      it('does not acknowledge a heartbeat whose credentials are wrong', async () => {
+        const bridge = WsBridge.get(serverId);
+        const ws = new MockWs();
+        bridge.handleDaemonConnection(ws as never, makeDb('another-hash', 'controlled', CONTROLLED_NODE_OS_WIN), {} as never);
+        ws.emit('message', JSON.stringify({ ...authFrame, serverId }));
+        ws.emit('message', JSON.stringify(heartbeatFrame));
+        await vi.advanceTimersByTimeAsync(1_000);
+        await flushAsync();
+        expect(heartbeatAcks(ws)).toHaveLength(0);
+        expect(ws.closed).toBe(true);
+        expect(ws.closeCode).toBe(4001);
+      });
+
+      it('every other frame type still waits for the complete authentication chain', async () => {
+        const bridge = WsBridge.get(serverId);
+        blockRevalidatorFor(SLOW_RECONCILE_MS);
+        const ws = await connectNode(bridge);
+        const generation = bridge.daemonConnectionGeneration();
+        const pending = registerPendingExec(serverId, 'exec-after-auth', generation, 120_000);
+        let resolved = false;
+        void pending.then(() => { resolved = true; });
+        ws.emit('message', JSON.stringify({
+          type: DAEMON_MSG.MACHINE_EXEC_RESULT, correlationId: 'exec-after-auth', ok: true, exitCode: 0, stdout: '', stderr: '', durationMs: 1,
+        }));
+        await vi.advanceTimersByTimeAsync(1_000);
+        await flushAsync();
+        expect(heartbeatAcks(ws)).toHaveLength(1);
+        expect(resolved, 'an exec result is only accepted once authentication has completed').toBe(false);
+        // the chain is bounded: it completes at the reconcile budget, not at 35 s
+        await vi.advanceTimersByTimeAsync(DAEMON_AUTH_RECONCILE_BUDGET_MS);
+        await flushAsync();
+        expect(resolved).toBe(true);
+        expect(Date.now()).toBeLessThan(Date.now() + 1); // (clock sanity; budget asserted by the line above)
+      });
+
+      it('the bounded wait does not turn into a pass: remote desktop stays unavailable until the reconcile really finishes', async () => {
+        const bridge = WsBridge.get(serverId);
+        blockRevalidatorFor(SLOW_RECONCILE_MS);
+        const warn = vi.spyOn(logger, 'warn');
+        await connectNode(bridge);
+        const generation = bridge.daemonConnectionGeneration();
+        const readyGeneration = () => (bridge as unknown as { remoteDesktopAuthorityReadyGeneration: number | null }).remoteDesktopAuthorityReadyGeneration;
+        await vi.advanceTimersByTimeAsync(DAEMON_AUTH_RECONCILE_BUDGET_MS + 1_000);
+        await flushAsync();
+        expect(bridge.isAuthenticated).toBe(true);
+        expect(readyGeneration(), 'still reconciling: fail closed').not.toBe(generation);
+        expect(JSON.stringify(warn.mock.calls)).toContain('remote desktop reconcile is still running');
+        await vi.advanceTimersByTimeAsync(SLOW_RECONCILE_MS);
+        await flushAsync();
+        expect(readyGeneration()).toBe(generation);
+        warn.mockRestore();
+      });
+
+      it('a failing reconcile is retried in the background and then reported, never silently left half-done', async () => {
+        const bridge = WsBridge.get(serverId);
+        let attempts = 0;
+        WsBridge.setRemoteDesktopReconnectRevalidator(async () => {
+          attempts += 1;
+          if (attempts <= 2) throw new Error('database unavailable');
+        });
+        const warn = vi.spyOn(logger, 'warn');
+        await connectNode(bridge);
+        const generation = bridge.daemonConnectionGeneration();
+        const readyGeneration = () => (bridge as unknown as { remoteDesktopAuthorityReadyGeneration: number | null }).remoteDesktopAuthorityReadyGeneration;
+        await vi.advanceTimersByTimeAsync(1_000);
+        expect(readyGeneration()).not.toBe(generation);
+        for (const delay of DAEMON_AUTH_RECONCILE_RETRY_DELAYS_MS) await vi.advanceTimersByTimeAsync(delay + 100);
+        await flushAsync();
+        expect(attempts).toBe(3);
+        expect(readyGeneration(), 'the third attempt succeeded: authority is aligned').toBe(generation);
+        expect(JSON.stringify(warn.mock.calls)).toContain('will be retried');
+        warn.mockRestore();
+      });
+
+      it('gives up visibly after the bounded retries (error log + counter) and stays fail-closed', async () => {
+        const bridge = WsBridge.get(serverId);
+        WsBridge.setRemoteDesktopReconnectRevalidator(async () => { throw new Error('database unavailable'); });
+        const error = vi.spyOn(logger, 'error');
+        await connectNode(bridge);
+        const generation = bridge.daemonConnectionGeneration();
+        for (const delay of DAEMON_AUTH_RECONCILE_RETRY_DELAYS_MS) await vi.advanceTimersByTimeAsync(delay + 100);
+        await vi.advanceTimersByTimeAsync(1_000);
+        await flushAsync();
+        expect((bridge as unknown as { remoteDesktopAuthorityReadyGeneration: number | null }).remoteDesktopAuthorityReadyGeneration).not.toBe(generation);
+        expect(JSON.stringify(error.mock.calls)).toContain('remote desktop reconcile gave up');
+        expect(getCounter('remote_desktop.reconcile_gave_up')).toBe(1);
+        error.mockRestore();
+      });
+
+      it('logs the per-phase timing of every authentication (and warns on a slow one) without ever logging the token', async () => {
+        const bridge = WsBridge.get(serverId);
+        blockRevalidatorFor(3_000);
+        const info = vi.spyOn(logger, 'info');
+        const warn = vi.spyOn(logger, 'warn');
+        await connectNode(bridge);
+        await vi.advanceTimersByTimeAsync(5_000);
+        await flushAsync();
+        const authenticated = info.mock.calls.find((call) => call[1] === 'Daemon authenticated');
+        expect(authenticated).toBeTruthy();
+        expect(authenticated![0]).toEqual(expect.objectContaining({
+          lookupMs: expect.any(Number), credentialMs: expect.any(Number), reconcileMs: expect.any(Number),
+          revalidateMs: expect.any(Number), contextMs: expect.any(Number), totalMs: expect.any(Number),
+        }));
+        expect((authenticated![0] as { revalidateMs: number }).revalidateMs).toBeGreaterThanOrEqual(3_000);
+        const slow = warn.mock.calls.find((call) => call[1] === 'slow daemon auth');
+        expect(slow, 'a phase above 2 s is a warning').toBeTruthy();
+        expect(JSON.stringify([...info.mock.calls, ...warn.mock.calls])).not.toContain('my-token');
+        info.mockRestore();
+        warn.mockRestore();
+      });
+
+      it('a normal fast authentication does not warn', async () => {
+        const bridge = WsBridge.get(serverId);
+        WsBridge.setRemoteDesktopReconnectRevalidator(async () => {});
+        const warn = vi.spyOn(logger, 'warn');
+        await connectNode(bridge);
+        await vi.advanceTimersByTimeAsync(1_000);
+        await flushAsync();
+        expect(warn.mock.calls.find((call) => call[1] === 'slow daemon auth')).toBeUndefined();
+        warn.mockRestore();
+      });
+
+      it('a reconnect storm (60 nodes at once, 200 ms revalidation each) is acknowledged in under a second each', async () => {
+        WsBridge.setRemoteDesktopReconnectRevalidator(async () => { await new Promise((resolve) => setTimeout(resolve, 200)); });
+        const sockets: MockWs[] = [];
+        for (let i = 0; i < 60; i += 1) {
+          const id = `${serverId}-storm-${i}`;
+          const bridge = WsBridge.get(id);
+          const ws = new MockWs();
+          bridge.handleDaemonConnection(ws as never, makeDb('valid-hash', 'controlled', CONTROLLED_NODE_OS_WIN), {} as never);
+          ws.emit('message', JSON.stringify({ ...authFrame, serverId: id }));
+          ws.emit('message', JSON.stringify(heartbeatFrame));
+          sockets.push(ws);
+        }
+        await vi.advanceTimersByTimeAsync(900);
+        await flushAsync();
+        expect(sockets.filter((ws) => heartbeatAcks(ws).length === 1)).toHaveLength(60);
+      });
+
+      it('two processes using one credential are detected, not kicked silently in a loop', async () => {
+        const bridge = WsBridge.get(serverId);
+        WsBridge.setRemoteDesktopReconnectRevalidator(async () => {});
+        const warn = vi.spyOn(logger, 'warn');
+        for (let i = 0; i < 4; i += 1) {
+          await connectNode(bridge);
+          await vi.advanceTimersByTimeAsync(600);
+          await flushAsync();
+        }
+        const duel = warn.mock.calls.find((call) => call[1] === 'daemon connection replaced repeatedly');
+        expect(duel, 'three authenticated connections replaced within a minute is a duel').toBeTruthy();
+        expect(duel![0]).toEqual(expect.objectContaining({ serverId, replacements: expect.any(Number) }));
+        warn.mockRestore();
+      });
+
+      it('an ordinary single reconnect does not look like a duel', async () => {
+        const bridge = WsBridge.get(serverId);
+        WsBridge.setRemoteDesktopReconnectRevalidator(async () => {});
+        const warn = vi.spyOn(logger, 'warn');
+        await connectNode(bridge);
+        await vi.advanceTimersByTimeAsync(600);
+        await connectNode(bridge);
+        await vi.advanceTimersByTimeAsync(600);
+        await flushAsync();
+        expect(warn.mock.calls.find((call) => call[1] === 'daemon connection replaced repeatedly')).toBeUndefined();
+        warn.mockRestore();
       });
     });
 
