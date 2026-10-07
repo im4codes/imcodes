@@ -2,6 +2,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync } from 'no
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
+import { CONTROLLED_NODE_WATCHDOG_KEEP_DISABLED_MARKER } from '../../shared/controlled-node-service.js';
 import { windowsControlledNodeHealthWatchdogScript } from '../../src/node/installer.js';
 import { findPowerShell, runPowerShell } from './powershell-test-helper.js';
 
@@ -18,6 +19,8 @@ interface Scenario {
   startThrows?: boolean;
   /** A node process exists, this many seconds old; with a lease of this age (null = no lease). */
   process?: { ageSeconds: number; leaseAgeSeconds: number | null };
+  /** The machine owner's `watchdog-keep-disabled` file exists in the install directory. */
+  keepDisabledMarker?: boolean;
 }
 
 /**
@@ -34,14 +37,17 @@ function tick(scenario: Scenario, runs: number, dir = mkdtempSync(join(tmpdir(),
     statePath: join(dir, 'health-watchdog-state.json'),
     logPath: join(dir, 'health-watchdog.log'),
     upgradeMarkerPath: join(dir, 'upgrade-in-progress.json'),
+    keepDisabledMarkerPath: join(dir, CONTROLLED_NODE_WATCHDOG_KEEP_DISABLED_MARKER),
     calls: join(dir, 'calls.log'),
     scenario: join(dir, 'scenario.json'),
   };
   writeFileSync(paths.scenario, JSON.stringify(scenario));
   let script = windowsControlledNodeHealthWatchdogScript('C:\\ProgramData\\imcodes-node\\imcodes-node.exe');
-  for (const key of ['nodePath', 'leasePath', 'statePath', 'logPath', 'upgradeMarkerPath'] as const) {
+  for (const key of ['nodePath', 'leasePath', 'statePath', 'logPath', 'upgradeMarkerPath', 'keepDisabledMarkerPath'] as const) {
     script = script.replace(new RegExp(`^\\$${key} = '.*'\\r$`, 'm'), () => `$${key} = '${paths[key]}'\r`);
   }
+  if (scenario.keepDisabledMarker) writeFileSync(paths.keepDisabledMarkerPath, '');
+  else rmSync(paths.keepDisabledMarkerPath, { force: true });
   if (scenario.process?.leaseAgeSeconds != null) {
     writeFileSync(paths.leasePath, JSON.stringify({ version: 1, pid: 4242, updatedAt: Date.now() - scenario.process.leaseAgeSeconds * 1000 }));
   }
@@ -94,6 +100,45 @@ describe.skipIf(!pwsh)('Windows controlled-node watchdog (PowerShell)', () => {
     expect(result.logLines.filter((l) => l.includes('restart_blocked reason=task_disabled'))).toHaveLength(1);
     expect(result.log).not.toContain('restart_begin');
     expect(result.state?.reason).toBe('task_disabled');
+  });
+
+  it('honours the owner\'s watchdog-keep-disabled file: no re-enable, no restart, one task_disabled_kept line', () => {
+    const result = tick({ task: 'disabled', keepDisabledMarker: true }, 4);
+    expect(result.outcomes).toEqual([0, 0, 0, 0]);
+    expect(result.calls).toEqual([]); // never enabled, never started, never stopped
+    expect(result.logLines.filter((l) => l.includes('task_disabled_kept'))).toHaveLength(1);
+    expect(result.log).not.toContain('task_disabled_reenabled');
+    expect(result.log).not.toContain('restart_begin');
+    expect(result.log).not.toContain('restart_blocked');
+    expect(result.state?.reason).toBe('task_disabled_kept');
+  });
+
+  it('without the file the disabled task is re-enabled (default), and removing the file later restores that', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'imcodes-watchdog-'));
+    const kept = tick({ task: 'disabled', keepDisabledMarker: true }, 2, dir);
+    expect(kept.calls).toEqual([]);
+    expect(kept.state?.reason).toBe('task_disabled_kept');
+    // The owner deletes the file: the next tick re-enables and restarts, and the kept-state is gone.
+    const released = tick({ task: 'disabled' }, 1, dir);
+    expect(released.calls).toEqual(['enable', 'stop', 'start']);
+    expect(released.log).toContain('task_disabled_reenabled');
+    expect(released.log).toContain('restart_requested');
+    expect(released.state).toBeNull();
+  });
+
+  it('the file matters only for a Disabled task: an enabled task whose node died is still restarted', () => {
+    const result = tick({ task: 'ready', keepDisabledMarker: true }, 1);
+    expect(result.calls).toEqual(['stop', 'start']);
+    expect(result.log).toContain('restart_requested');
+    expect(result.log).not.toContain('task_disabled_kept');
+  });
+
+  it('keeps the dedupe when the opt-out is set and a missing task is reported: the two reasons do not mask each other', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'imcodes-watchdog-'));
+    tick({ task: 'disabled', keepDisabledMarker: true }, 2, dir);
+    const missing = tick({ task: 'missing', keepDisabledMarker: true }, 2, dir);
+    expect(missing.logLines.filter((l) => l.includes('restart_blocked reason=task_missing'))).toHaveLength(1);
+    expect(missing.calls).toEqual([]);
   });
 
   it('a task that no longer exists is reported once, not restarted every tick', () => {

@@ -16,6 +16,7 @@ import { dirname, join, win32 } from 'node:path';
 import type { ServiceReceipt } from './install-journal.js';
 import {
   CONTROLLED_NODE_SERVICE,
+  CONTROLLED_NODE_WATCHDOG_KEEP_DISABLED_MARKER,
   CONTROLLED_NODE_WATCHDOG_REENABLE_DISABLED_TASK,
   CONTROLLED_NODE_WINDOWS_UPGRADE_TASK_PREFIX,
   CONTROLLED_NODE_WINDOWS_UPGRADE_PRODUCT,
@@ -217,6 +218,7 @@ export function windowsControlledNodeHealthPaths(exePath: string): {
   statePath: string;
   logPath: string;
   upgradeMarkerPath: string;
+  keepDisabledMarkerPath: string;
 } {
   const baseDir = win32.dirname(exePath);
   return {
@@ -225,6 +227,7 @@ export function windowsControlledNodeHealthPaths(exePath: string): {
     statePath: win32.join(baseDir, CONTROLLED_NODE_HEALTH_WATCHDOG_STATE_FILE),
     logPath: win32.join(baseDir, 'health-watchdog.log'),
     upgradeMarkerPath: win32.join(baseDir, WINDOWS_UPGRADE_MARKER_NAME),
+    keepDisabledMarkerPath: win32.join(baseDir, CONTROLLED_NODE_WATCHDOG_KEEP_DISABLED_MARKER),
   };
 }
 
@@ -247,6 +250,7 @@ export function windowsControlledNodeHealthWatchdogScript(exePath: string): stri
     + `$statePath = ${powershellSingleQuoted(paths.statePath)}\r\n`
     + `$logPath = ${powershellSingleQuoted(paths.logPath)}\r\n`
     + `$upgradeMarkerPath = ${powershellSingleQuoted(paths.upgradeMarkerPath)}\r\n`
+    + `$keepDisabledMarkerPath = ${powershellSingleQuoted(paths.keepDisabledMarkerPath)}\r\n`
     + `$upgradeMarkerMaxAgeMs = ${WINDOWS_UPGRADE_MARKER_MAX_AGE_MS}\r\n`
     + `$staleSeconds = ${WINDOWS_HEALTH_STALE_SECONDS}\r\n`
     + `$minimumConfirmMs = 45000\r\n`
@@ -316,6 +320,12 @@ export function windowsControlledNodeHealthWatchdogScript(exePath: string): stri
     + `$nodeTaskInfo = Get-ScheduledTask -TaskName $nodeTask -ErrorAction SilentlyContinue\r\n`
     + `$taskBlock = $null\r\n`
     + `if (-not $nodeTaskInfo) { $taskBlock = 'task_missing' } elseif ([int]$nodeTaskInfo.State -eq 1 -or $nodeTaskInfo.Settings.Enabled -eq $false) { $taskBlock = 'task_disabled' }\r\n`
+    // The owner's explicit opt-out wins over the default re-enable: say so once and leave the task alone.
+    + `if ($taskBlock -eq 'task_disabled' -and (Test-Path -LiteralPath $keepDisabledMarkerPath)) {\r\n`
+    + `  if (-not ($previousValid -and [string]$previousState.reason -ceq 'task_disabled_kept')) { Write-HealthLog 'task_disabled_kept' }\r\n`
+    + `  Write-WatchdogState 'task_disabled_kept' 0 $nowMs\r\n`
+    + `  exit 0\r\n`
+    + `}\r\n`
     + `if ($taskBlock -eq 'task_disabled' -and $reenableDisabledTask) {\r\n`
     + `  try { Enable-ScheduledTask -TaskName $nodeTask -ErrorAction Stop | Out-Null; Write-HealthLog 'task_disabled_reenabled'; $taskBlock = $null } catch { $enableFailure = [string]$_.Exception.Message; if ($enableFailure.Length -gt 200) { $enableFailure = $enableFailure.Substring(0, 200) }; if (-not ($previousValid -and [string]$previousState.reason -ceq 'task_disabled')) { Write-HealthLog ('task_enable_failed {0}' -f $enableFailure) } }\r\n`
     + `}\r\n`

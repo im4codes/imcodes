@@ -146,6 +146,7 @@ describe('controlled-node installer artifacts (4.1-4.4)', () => {
       statePath: 'C:\\ProgramData\\imcodes-node\\health-watchdog-state.json',
       logPath: 'C:\\ProgramData\\imcodes-node\\health-watchdog.log',
       upgradeMarkerPath: 'C:\\ProgramData\\imcodes-node\\upgrade-in-progress.json',
+      keepDisabledMarkerPath: 'C:\\ProgramData\\imcodes-node\\watchdog-keep-disabled',
     });
     const watchdogXml = windowsControlledNodeHealthWatchdogTaskXml(
       healthPaths.scriptPath,

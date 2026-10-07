@@ -105,6 +105,13 @@ export const CONTROLLED_NODE_UPGRADE_ROLLBACK_STALL_MS = 10 * 60_000;
  * minutes, silently failing each time, and the node stayed offline for hours.
  */
 export const CONTROLLED_NODE_WATCHDOG_REENABLE_DISABLED_TASK = true as const;
+/**
+ * The machine owner's explicit opt-out: a file with this name in the node's
+ * install directory (beside the executable) makes the watchdog leave a Disabled
+ * node task disabled. It logs `task_disabled_kept` once and does nothing else;
+ * removing the file restores the default (re-enable).
+ */
+export const CONTROLLED_NODE_WATCHDOG_KEEP_DISABLED_MARKER = 'watchdog-keep-disabled' as const;
 
 /** New nodes advertise that their own self-upgrade script has backup/health rollback semantics. */
 export const CONTROLLED_NODE_SAFE_SELF_UPGRADE_CAPABILITY = 'controlled-node.safe-self-upgrade.v2' as const;
