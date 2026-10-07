@@ -172,6 +172,27 @@ async function createOwnedUpgradeDir(input: {
   return path;
 }
 
+/**
+ * Service-manager and sleep stubs for tests that execute the generated POSIX upgrade
+ * script: the "new node" is the running test process, and it publishes its lease the
+ * moment the script asks the service manager about it, so the health wait ends at once.
+ */
+async function installHealthyServiceStubs(binDir: string, leasePath: string): Promise<void> {
+  const lease = `printf '{"version":1,"pid":${process.pid},"updatedAt":%s}\\n' "$(( ($(date +%s) + 1) * 1000 ))" > '${leasePath}'`;
+  const log = 'printf "%s\\n" "$*" >> "${IMCODES_UPGRADE_TEST_LOG:-/dev/null}"';
+  await writeFile(join(binDir, 'sleep'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+  await writeFile(join(binDir, 'systemctl'), [
+    '#!/bin/sh', log,
+    `if [ "$1" = show ]; then ${lease}; case "$3" in MainPID) echo MainPID=${process.pid};; NRestarts) echo NRestarts=0;; esac; fi`,
+    'exit 0', '',
+  ].join('\n'), { mode: 0o755 });
+  await writeFile(join(binDir, 'launchctl'), [
+    '#!/bin/sh', log,
+    `if [ "$1" = print ]; then ${lease}; printf '\\tpid = ${process.pid}\\n'; fi`,
+    'exit 0', '',
+  ].join('\n'), { mode: 0o755 });
+}
+
 describe('controlled-node self-upgrade', () => {
   it('refreshes an independently published Linux worker and rejects same, older, and unknown targets', async () => {
     const root = await mkdtemp(join(tmpdir(), 'imcodes-worker-refresh-test-'));
@@ -1642,7 +1663,9 @@ describe('controlled-node self-upgrade', () => {
         '--collect',
         '--no-block',
         '--property=Type=oneshot',
-        '--property=TimeoutStartSec=10min',
+        // the script hosts the whole health window (15 min cap) plus a rollback
+        '--property=TimeoutStartSec=25min',
+        '--property=TimeoutStopSec=5min',
         '/bin/sh',
         '/tmp/upgrade.sh',
       ],
@@ -1663,27 +1686,33 @@ describe('controlled-node self-upgrade', () => {
       destinationJournalPath: '/opt/imcodes-node/install-journal.json',
     });
     expect(script).toContain(stop);
-    expect(script).toContain("cp -f '/tmp/update-");
     expect(script).toContain(start);
+    expect(script).toContain(`IMCODES_SRC='/tmp/update-${platform}/imcodes-node'`);
 
     // The destination MUST be published by rename(2), never overwritten in
     // place: `cp -f` rewrites the existing inode, and macOS binds code-signing
     // state to it, so an in-place overwrite of the still-mapped running node
     // leaves bytes that no longer match the validated signature — every exec is
     // then SIGKILLed (OS_REASON_CODESIGNING) and launchd respawns forever.
-    expect(script).toContain("mv -f '/opt/imcodes-node/imcodes-node.new' '/opt/imcodes-node/imcodes-node'");
-    expect(script).toContain("cp -f '/tmp/update-" + platform + "/imcodes-node' '/opt/imcodes-node/imcodes-node.new'");
+    expect(script).toContain(`IMCODES_PENDING='/opt/imcodes-node/imcodes-node.new'`);
+    expect(script).toContain('mv -f "$IMCODES_PENDING" "$IMCODES_DST"');
+    expect(script).toContain('cp -f "$IMCODES_SRC" "$IMCODES_PENDING"');
     // The live binary is never a `cp` target.
-    expect(script).not.toContain("cp -f '/tmp/update-" + platform + "/imcodes-node' '/opt/imcodes-node/imcodes-node'");
+    expect(script).not.toMatch(/cp -f [^\n]*"\$IMCODES_DST"( |$)/m);
     // chmod applies to the pending file, before it is published.
-    expect(script).toContain("chmod 755 '/opt/imcodes-node/imcodes-node.new'");
+    expect(script).toContain('chmod 755 "$IMCODES_PENDING"');
+    expect(script.indexOf('chmod 755 "$IMCODES_PENDING"')).toBeLessThan(script.indexOf('mv -f "$IMCODES_PENDING" "$IMCODES_DST"'));
     // The manifest must not vouch for a binary that never got published.
-    expect(script.indexOf('mv -f')).toBeLessThan(script.indexOf('imcodes-node.manifest.json'));
+    expect(script.indexOf('mv -f "$IMCODES_PENDING" "$IMCODES_DST"')).toBeLessThan(script.indexOf('mv -f "$IMCODES_DST_MANIFEST_NEW" "$IMCODES_DST_MANIFEST"'));
+    // A transaction: backup, health wait, rollback, durable result.
+    expect(script).toContain('imcodes_wait_node_healthy');
+    expect(script).toContain('imcodes_rollback');
+    expect(script).toContain('last-upgrade-result.json');
     if (platform === 'darwin') {
       expect(script).toContain('launchctl bootout system/cc.imcodes.node.watchdog');
       expect(script).toContain("launchctl bootstrap system '/Library/LaunchDaemons/cc.imcodes.node.watchdog.plist'");
       expect(script.indexOf('bootout system/cc.imcodes.node.watchdog'))
-        .toBeLessThan(script.indexOf('bootout system/cc.imcodes.node\n'));
+        .toBeLessThan(script.indexOf('bootout system/cc.imcodes.node;'));
     }
   });
 
@@ -1748,13 +1777,14 @@ describe('controlled-node self-upgrade', () => {
       }
       const binDir = join(root, 'bin');
       await mkdir(binDir);
-      await writeFile(join(binDir, 'systemctl'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+      await installHealthyServiceStubs(binDir, join(root, 'health-lease.json'));
       const scriptPath = join(root, 'upgrade.sh');
       await writeFile(scriptPath, buildPosixControlledNodeUpgradeScript({
         platform: 'linux', stagedArtifactPath, stagedManifestPath, destinationPath, destinationManifestPath,
         stagingOwnership: { directoryPath: stage, markerPath, ownerToken: '12345678-1234-4123-8123-123456789abc' },
       }), { mode: 0o755 });
-      await execFileAsync('/bin/sh', [scriptPath], { timeout: 15_000, env: { ...process.env, PATH: `${binDir}:${process.env.PATH ?? ''}` } });
+      // a symlinked staging directory leaves no artifact to install: the script ends in preflight (non-zero) and still runs its cleanup trap
+      await execFileAsync('/bin/sh', [scriptPath], { timeout: 15_000, env: { ...process.env, PATH: `${binDir}:${process.env.PATH ?? ''}` } }).catch(() => undefined);
       try { await lstat(stage); return true; } catch { return false; }
     };
     expect(await runCase('valid', '12345678-1234-4123-8123-123456789abc', 'valid')).toBe(false);
@@ -1772,12 +1802,13 @@ describe('controlled-node self-upgrade', () => {
       destinationManifestPath: '/opt/imcodes-node/imcodes-node-macos.manifest.json',
     });
     // Verify BEFORE the rename, so a bad artifact never becomes the live binary.
-    expect(script).toContain("codesign --verify '/opt/imcodes-node/imcodes-node-macos.new'");
+    expect(script).toContain('codesign --verify "$IMCODES_PENDING"');
     expect(script).toContain("grep -q 'Mach-O'");
-    expect(script.indexOf('codesign --verify')).toBeLessThan(script.indexOf('mv -f'));
-    // A failed verify drops the pending file and skips publishing; the untouched
-    // previous binary is then simply bootstrapped back = free rollback.
-    expect(script).toContain("rm -f '/opt/imcodes-node/imcodes-node-macos.new'; SKIP=1");
+    expect(script.indexOf('codesign --verify')).toBeLessThan(script.indexOf('mv -f "$IMCODES_PENDING"'));
+    // A failed verify ends in preflight, before the service is stopped: the old
+    // node keeps running and nothing live was replaced.
+    expect(script).toContain('rm -f -- "$IMCODES_PENDING"; return 1');
+    expect(script.indexOf('codesign --verify')).toBeLessThan(script.indexOf('imcodes_service_stop\n'));
     expect(script).toContain('launchctl bootstrap system');
   });
 
@@ -1792,7 +1823,8 @@ describe('controlled-node self-upgrade', () => {
     expect(script).not.toContain('codesign');
     // rename(2) still matters on linux: writing a running binary fails ETXTBSY,
     // which `set +e` would otherwise swallow into a silently skipped upgrade.
-    expect(script).toContain("mv -f '/opt/imcodes-node/imcodes-node-linux.new' '/opt/imcodes-node/imcodes-node-linux'");
+    expect(script).toContain(`IMCODES_PENDING='/opt/imcodes-node/imcodes-node-linux.new'`);
+    expect(script).toContain('mv -f "$IMCODES_PENDING" "$IMCODES_DST"');
   });
 
   it.runIf(['win32', 'darwin', 'linux'].includes(process.platform))('executes the native replacement script against an isolated destination and service-manager stub', async () => {
@@ -1834,11 +1866,7 @@ describe('controlled-node self-upgrade', () => {
     } else {
       const binDir = join(dir, 'bin');
       await mkdir(binDir);
-      await writeFile(join(binDir, 'sleep'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
-      const manager = process.platform === 'darwin' ? 'launchctl' : 'systemctl';
-      await writeFile(join(binDir, manager), '#!/bin/sh\nprintf "%s\\n" "$*" >> "$IMCODES_UPGRADE_TEST_LOG"\n', { mode: 0o755 });
-      await chmod(join(binDir, 'sleep'), 0o755);
-      await chmod(join(binDir, manager), 0o755);
+      await installHealthyServiceStubs(binDir, join(dir, 'health-lease.json'));
       const scriptPath = join(dir, 'upgrade.sh');
       await writeFile(scriptPath, buildPosixControlledNodeUpgradeScript({
         platform: process.platform,
@@ -1873,7 +1901,7 @@ describe('controlled-node self-upgrade', () => {
     }
   });
 
-  it('keeps the previous POSIX remote-desktop worker when staged copy fails', async () => {
+  it('keeps the previous POSIX remote-desktop worker, and replaces nothing, when the staged copy fails', async () => {
     const root = await mkdtemp(join(tmpdir(), 'imcodes-worker-copy-rollback-'));
     dirs.push(root);
     const stage = join(root, 'stage', 'remote-desktop-worker');
@@ -1891,9 +1919,11 @@ describe('controlled-node self-upgrade', () => {
     await writeFile(stagedArtifactPath, 'new-node', { mode: 0o755 });
     await writeFile(stagedManifestPath, JSON.stringify({ build: { version: 'new' } }));
     await writeFile(destinationWorker, 'old-worker', { mode: 0o755 });
-    await writeFile(join(binDir, 'systemctl'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
-    // Fail only for the remote-desktop worker copy; the main daemon copy still
-    // succeeds, proving the worker transaction itself preserves its old root.
+    await writeFile(destinationPath, 'old-node', { mode: 0o755 });
+    await installHealthyServiceStubs(binDir, join(root, 'installed', 'health-lease.json'));
+    // Fail only for the remote-desktop worker copy. The release is one publication
+    // unit: the failure now ends the upgrade in preflight, before the service is
+    // stopped, so the old node, manifest and worker all stay in place.
     await writeFile(join(binDir, 'cp'), [
       '#!/bin/sh',
       'for arg in "$@"; do case "$arg" in *remote-desktop-worker*) exit 1;; esac; done',
@@ -1909,11 +1939,14 @@ describe('controlled-node self-upgrade', () => {
       destinationManifestPath,
       stagedRemoteDesktopWorkerDir: stage,
     }), { mode: 0o755 });
-    await execFileAsync('/bin/sh', [scriptPath], {
+    // exits non-zero: the preflight failure is the upgrade's outcome
+    await expect(execFileAsync('/bin/sh', [scriptPath], {
       timeout: 15_000,
       env: { ...process.env, PATH: `${binDir}:${process.env.PATH ?? ''}` },
-    });
+    })).rejects.toMatchObject({ code: 1 });
     expect(await readFile(destinationWorker, 'utf8')).toBe('old-worker');
+    expect(await readFile(destinationPath, 'utf8')).toBe('old-node');
+    expect(JSON.parse(await readFile(join(root, 'installed', 'last-upgrade-result.json'), 'utf8'))).toMatchObject({ status: 'preflight_failed' });
     await expect(lstat(`${destinationRoot}.new`)).rejects.toMatchObject({ code: 'ENOENT' });
     await expect(lstat(`${destinationRoot}.previous`)).rejects.toMatchObject({ code: 'ENOENT' });
   });
@@ -1929,7 +1962,7 @@ describe('controlled-node self-upgrade', () => {
     const binDir = join(root, 'bin');
     await mkdir(stage, { recursive: true });
     await mkdir(binDir);
-    await writeFile(join(binDir, 'systemctl'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+    await installHealthyServiceStubs(binDir, join(root, 'health-lease.json'));
     await writeFile(stagedArtifactPath, 'staged-artifact', { mode: 0o755 });
     await writeFile(stagedManifestPath, JSON.stringify({ build: { version: 'test' } }));
     await writeFile(destinationPath, 'old-artifact', { mode: 0o755 });

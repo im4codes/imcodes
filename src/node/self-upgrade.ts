@@ -21,6 +21,8 @@ import { DAEMON_UPGRADE_TARGET_LATEST, normalizeDaemonUpgradeTargetVersion } fro
 import { isTransientRequestFailure } from '../../shared/request-failure.js';
 import { compareImcodesVersions } from '../../shared/imcodes-version.js';
 import {
+  CONTROLLED_NODE_POSIX_UPGRADE_SCRIPT_STOP_TIMEOUT_MIN,
+  CONTROLLED_NODE_POSIX_UPGRADE_SCRIPT_TIMEOUT_MIN,
   CONTROLLED_NODE_UPGRADE_RESULT_FILE,
   CONTROLLED_NODE_UPGRADE_RESULT_STATUS,
   CONTROLLED_NODE_WINDOWS_RELEASE_TRUST_PREFLIGHT_FAILURE,
@@ -65,6 +67,7 @@ import {
   windowsPowerShellExecutablePath,
 } from './installer.js';
 import { defaultCredentialPath, defaultStagedExecutablePath, type ControlledNodeCredential } from './enrollment.js';
+import { buildPosixControlledNodeUpgradeScript } from './posix-upgrade-script.js';
 import { windowsUpgradeHealthWaitScript } from './upgrade-health-script.js';
 import { reconcilePreviousUpgrade, type PreviousUpgradeFailure } from './upgrade-result.js';
 import { DAEMON_VERSION } from '../util/version.js';
@@ -92,13 +95,14 @@ const execFileAsync = promisify(execFile);
  * after it reconnects. See reconcilePreviousUpgrade for what each recorded state
  * amounts to (including an upgrade/rollback script that died without a terminal
  * state, and a stale record next to a node that is in fact running the target).
+ * The record is the same on every platform: the Windows and the POSIX upgrade
+ * scripts both write it.
  */
-export async function readPreviousWindowsUpgradeFailure(
+export async function readPreviousUpgradeFailure(
   journalPath: string,
   runningVersion: string = DAEMON_VERSION,
   now: number = Date.now(),
 ): Promise<PreviousUpgradeFailure | null> {
-  if (process.platform !== 'win32') return null;
   try {
     return await reconcilePreviousUpgrade({ journalPath, runningVersion, now });
   } catch {
@@ -1567,118 +1571,7 @@ export function windowsControlledNodeUpgradeTaskXml(scriptPath: string): string 
 `;
 }
 
-export function buildPosixControlledNodeUpgradeScript(input: {
-  platform: 'darwin' | 'linux';
-  stagedArtifactPath: string;
-  stagedManifestPath: string;
-  stagedComputerUseHelperDir?: string;
-  // Swap the platform-root as one directory, matching Windows' own
-  // stagedRemoteDesktopWorkerDir convention, so the installed layout stays
-  // remote-desktop-worker/linux-x64/<worker+manifest> -- the exact path
-  // resolveLinuxRemoteDesktopWorkerPath (linux-remote-desktop-worker-host.ts)
-  // expects next to the main executable. darwin never passes this: its
-  // remote-desktop component set is fetched by its own always-running
-  // bootstrap coordinator (macos-remote-desktop-production.ts), not staged
-  // through this upgrade script.
-  stagedRemoteDesktopWorkerDir?: string;
-  stagedJournalPath?: string;
-  destinationPath: string;
-  destinationManifestPath: string;
-  destinationJournalPath?: string;
-  stagingOwnership?: {
-    directoryPath: string;
-    markerPath: string;
-    ownerToken: string;
-  };
-}): string {
-  const journalCopy = input.stagedJournalPath && input.destinationJournalPath
-    ? `cp -f ${shQuote(input.stagedJournalPath)} ${shQuote(input.destinationJournalPath)} 2>/dev/null || true\n`
-    : '';
-  const helperDir = join(dirname(input.destinationPath), 'computer-use-helper');
-  const helperPermissions = input.platform === 'darwin'
-    ? `find ${shQuote(helperDir)} -type f -name 'open-computer-use.app.zip' -exec chmod 644 {} \\; 2>/dev/null || true\n`
-    : `find ${shQuote(helperDir)} -type f -name 'open-computer-use' -exec chmod 755 {} \\; 2>/dev/null || true\n`;
-  const helperCopy = input.stagedComputerUseHelperDir
-    ? `rm -rf ${shQuote(helperDir)}\nmkdir -p ${shQuote(helperDir)}\ncp -R ${shQuote(`${input.stagedComputerUseHelperDir}/.`)} ${shQuote(helperDir)}/ 2>/dev/null || true\n${helperPermissions}`
-    : '';
-  const remoteDesktopWorkerRoot = join(dirname(input.destinationPath), 'remote-desktop-worker');
-  const remoteDesktopWorkerCopy = input.stagedRemoteDesktopWorkerDir
-    ? `worker_stage=${shQuote(`${remoteDesktopWorkerRoot}.new`)}\n`
-      + `worker_backup=${shQuote(`${remoteDesktopWorkerRoot}.previous`)}\n`
-      + `rm -rf -- "$worker_stage" "$worker_backup" || SKIP=1\n`
-      + `if [ "$SKIP" = "0" ]; then\n`
-      + `  mkdir -p -- "$worker_stage" || SKIP=1\n`
-      + `  if [ "$SKIP" = "0" ] && ! cp -R -- ${shQuote(`${input.stagedRemoteDesktopWorkerDir}/.`)} "$worker_stage/"; then SKIP=1; fi\n`
-      + `  find "$worker_stage" -type f -name '${REMOTE_DESKTOP_LINUX_WORKER_FILENAME}' -exec chmod 755 {} \\; 2>/dev/null || SKIP=1\n`
-      + `  if [ "$SKIP" = "0" ] && [ ! -f "$worker_stage/${REMOTE_DESKTOP_LINUX_WORKER_FILENAME}" ]; then SKIP=1; fi\n`
-      + `  if [ "$SKIP" = "0" ] && [ -e ${shQuote(remoteDesktopWorkerRoot)} ]; then mv -- ${shQuote(remoteDesktopWorkerRoot)} "$worker_backup" || SKIP=1; fi\n`
-      + `  if [ "$SKIP" = "0" ] && ! mv -- "$worker_stage" ${shQuote(remoteDesktopWorkerRoot)}; then SKIP=1; fi\n`
-      + `  if [ "$SKIP" != "0" ]; then\n`
-      + `    rm -rf -- "$worker_stage"\n`
-      + `    if [ -e "$worker_backup" ] && [ ! -e ${shQuote(remoteDesktopWorkerRoot)} ]; then mv -- "$worker_backup" ${shQuote(remoteDesktopWorkerRoot)} || true; fi\n`
-      + `  else\n`
-      + `    rm -rf -- "$worker_backup" || SKIP=1\n`
-      + `  fi\n`
-      + `fi\n`
-    : '';
-  // Publish the new executable through a temp file + rename(2), NEVER `cp -f`
-  // straight onto the destination.
-  //
-  // `cp -f` rewrites the EXISTING inode in place. macOS binds code-signing state
-  // to that inode, and the outgoing node's image may still be mapped, so an
-  // in-place overwrite leaves a file whose bytes no longer match the signature
-  // the kernel validated: every later exec is SIGKILLed with
-  // OS_REASON_CODESIGNING and launchd respawns it forever — a bricked node with
-  // no rollback (observed: 340 respawns, on-disk sha256 diverged from the
-  // manifest the upgrade had just verified). Linux fails the same write with
-  // ETXTBSY, which `set +e` then swallows into a silently skipped upgrade.
-  //
-  // rename(2) publishes a NEW inode atomically: the running image is untouched,
-  // and the landed file keeps the exact bytes (and signature) that were verified.
-  // It also makes rollback free — every check below runs BEFORE the rename, so
-  // any failure leaves the previous working binary in place and we simply
-  // restart it.
-  const pending = `${input.destinationPath}.new`;
-  // Fail-closed: refuse to publish a Mach-O the kernel would SIGKILL on exec.
-  // Scoped to actual Mach-O files because `codesign` is meaningless for anything
-  // else — on arm64 macOS every executable must carry at least an ad-hoc
-  // signature, so a Mach-O that fails this check is guaranteed to be unbootable.
-  const verify = input.platform === 'darwin'
-    ? `if file -b ${shQuote(pending)} 2>/dev/null | grep -q 'Mach-O'; then\n`
-      + `  codesign --verify ${shQuote(pending)} 2>/dev/null || { rm -f ${shQuote(pending)}; SKIP=1; }\n`
-      + `fi\n`
-    : '';
-  const copy = `SKIP=0\n`
-    + `cp -f ${shQuote(input.stagedArtifactPath)} ${shQuote(pending)} || SKIP=1\n`
-    + `chmod 755 ${shQuote(pending)} 2>/dev/null || true\n`
-    + verify
-    + `if [ "$SKIP" = "0" ]; then\n`
-    + `  mv -f ${shQuote(pending)} ${shQuote(input.destinationPath)} || SKIP=1\n`
-    + `fi\n`
-    + `if [ "$SKIP" = "0" ]; then\n`
-    + `  cp -f ${shQuote(input.stagedManifestPath)} ${shQuote(input.destinationManifestPath)} 2>/dev/null || true\n`
-    + `${helperCopy}${remoteDesktopWorkerCopy}${journalCopy}`.split('\n').filter(Boolean).map((line) => `  ${line}`).join('\n')
-    + (helperCopy || remoteDesktopWorkerCopy || journalCopy ? '\n' : '')
-    + `fi\n`
-    + `rm -f ${shQuote(pending)} 2>/dev/null || true\n`;
-  const stagingCleanup = input.stagingOwnership
-    ? `\ncleanup_staging() {\n`
-      + `  [ -d ${shQuote(input.stagingOwnership.directoryPath)} ] || return 0\n`
-      + `  [ ! -L ${shQuote(input.stagingOwnership.directoryPath)} ] || return 0\n`
-      + `  marker=${shQuote(input.stagingOwnership.markerPath)}\n`
-      + `  [ -f \"$marker\" ] || return 0\n`
-      + `  [ ! -L \"$marker\" ] || return 0\n`
-      + `  grep -Fq ${shQuote(`\"product\":\"${CONTROLLED_NODE_UPGRADE_PRODUCT}\"`)} \"$marker\" || return 0\n`
-      + `  grep -Fq ${shQuote(`\"directoryName\":\"${basename(input.stagingOwnership.directoryPath)}\"`)} \"$marker\" || return 0\n`
-      + `  grep -Fq ${shQuote(`\"ownerToken\":\"${input.stagingOwnership.ownerToken}\"`)} \"$marker\" || return 0\n`
-      + `  rm -rf -- ${shQuote(input.stagingOwnership.directoryPath)}\n`
-      + `}\ntrap cleanup_staging EXIT\n`
-    : '';
-  if (input.platform === 'linux') {
-    return `#!/bin/sh\nset +e${stagingCleanup}\nsleep 3\nsystemctl stop ${CONTROLLED_NODE_SERVICE.LINUX_UNIT}\n${copy}systemctl start ${CONTROLLED_NODE_SERVICE.LINUX_UNIT}\n`;
-  }
-  return `#!/bin/sh\nset +e${stagingCleanup}\nlaunchctl bootout system/${CONTROLLED_NODE_SERVICE.MACOS_WATCHDOG_LABEL}\nsleep 3\nlaunchctl bootout system/${CONTROLLED_NODE_SERVICE.MACOS_LABEL}\n${copy}launchctl bootstrap system ${shQuote(MACOS_PLIST_PATH)}\nlaunchctl kickstart -k system/${CONTROLLED_NODE_SERVICE.MACOS_LABEL}\nlaunchctl bootstrap system ${shQuote(MACOS_WATCHDOG_PLIST_PATH)}\n`;
-}
+export { buildPosixControlledNodeUpgradeScript } from './posix-upgrade-script.js';
 
 async function prepareUpgradeJournal(input: {
   currentJournalPath: string;
@@ -1912,7 +1805,9 @@ export function scheduleLinuxControlledNodeUpgrade(
     '--collect',
     '--no-block',
     '--property=Type=oneshot',
-    '--property=TimeoutStartSec=10min',
+    // The script hosts the whole health window and a rollback: it must outlive both.
+    `--property=TimeoutStartSec=${CONTROLLED_NODE_POSIX_UPGRADE_SCRIPT_TIMEOUT_MIN}min`,
+    `--property=TimeoutStopSec=${CONTROLLED_NODE_POSIX_UPGRADE_SCRIPT_STOP_TIMEOUT_MIN}min`,
     '/bin/sh',
     scriptPath,
   ]);
@@ -2075,6 +1970,8 @@ export async function startControlledNodeSelfUpgrade(
         destinationPath,
         destinationManifestPath,
         destinationJournalPath,
+        targetVersion: downloaded.version,
+        artifactSha256: downloaded.sha256,
         stagingOwnership: {
           directoryPath: updateDir,
           markerPath: ownershipMarkerPath,

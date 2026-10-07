@@ -923,7 +923,7 @@ export function createControlledNodeRuntime(
     }
   };
   const reportPreviousUpgradeFailure = (): void => {
-    if (previousUpgradeFailureReported || platform !== 'win32' || !options.readPreviousUpgradeFailure) return;
+    if (previousUpgradeFailureReported || !options.readPreviousUpgradeFailure) return;
     previousUpgradeFailureReported = true;
     void options.readPreviousUpgradeFailure().then((failure) => {
       if (!failure) return;

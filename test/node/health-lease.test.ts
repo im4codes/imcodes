@@ -7,6 +7,7 @@ import {
   controlledNodeHealthLeasePath,
   controlledNodeHealthWatchdogStatePath,
   createControlledNodeHealthLeasePublisher,
+  createLinuxControlledNodeHealthPublisher,
   createSystemdWatchdogNotifier,
   runMacosControlledNodeHealthWatchdog,
   waitForControlledNodeOnlineLease,
@@ -220,5 +221,40 @@ describe('controlled-node authenticated health lease', () => {
     notifier.recordAuthenticatedHeartbeat();
     await notifier.flush();
     expect(notify).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('Linux health publisher', () => {
+  it('feeds the systemd watchdog AND publishes the lease the self-upgrade health wait reads', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'imcodes-node-linux-health-'));
+    temporaryDirs.push(dir);
+    const leasePath = controlledNodeHealthLeasePath(join(dir, 'install-journal.json'));
+    const notify = vi.fn(async () => {});
+    const publisher = createLinuxControlledNodeHealthPublisher(leasePath, {
+      watchdog: createSystemdWatchdogNotifier({ pid: 777, notify }),
+      lease: createControlledNodeHealthLeasePublisher(leasePath, { pid: 777, now: () => 123_456 }),
+    });
+    publisher.recordAuthenticatedHeartbeat();
+    await publisher.flush();
+    expect(notify).toHaveBeenCalledWith(777);
+    expect(JSON.parse(await readFile(leasePath, 'utf8'))).toEqual({
+      version: CONTROLLED_NODE_HEALTH_LEASE_VERSION, pid: 777, updatedAt: 123_456,
+    });
+  });
+
+  it('a failing lease write never stops the watchdog pulse (and is reported)', async () => {
+    const notify = vi.fn(async () => {});
+    const onError = vi.fn();
+    const publisher = createLinuxControlledNodeHealthPublisher('unused', {
+      onError,
+      watchdog: createSystemdWatchdogNotifier({ pid: 1, notify }),
+      lease: createControlledNodeHealthLeasePublisher('unused', {
+        writeLease: async () => { throw new Error('disk full'); }, onError,
+      }),
+    });
+    publisher.recordAuthenticatedHeartbeat();
+    await publisher.flush();
+    expect(notify).toHaveBeenCalledOnce();
+    expect(onError).toHaveBeenCalledOnce();
   });
 });

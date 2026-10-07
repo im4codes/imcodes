@@ -21,6 +21,7 @@ import {
   CONTROLLED_NODE_WINDOWS_UPGRADE_PRODUCT,
   CONTROLLED_NODE_WINDOWS_UPGRADE_TRANSACTION_FILE,
   CONTROLLED_NODE_WINDOWS_UPGRADE_TRANSACTION_VERSION,
+  CONTROLLED_NODE_LINUX_WATCHDOG_SEC,
 } from '../../shared/controlled-node-service.js';
 import {
   CONTROLLED_NODE_HEALTH_LEASE_FILE,
@@ -564,7 +565,7 @@ Wants=network-online.target
 Type=simple
 ExecStart=${exePath}
 NotifyAccess=all
-WatchdogSec=180
+WatchdogSec=${CONTROLLED_NODE_LINUX_WATCHDOG_SEC}
 Restart=on-failure
 RestartSec=5
 

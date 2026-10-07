@@ -51,9 +51,35 @@ export const CONTROLLED_NODE_UPGRADE_HEALTH = {
   HARD_CAP_MS: 15 * 60_000,
   POLL_MS: 2_000,
   ABSENT_POLLS_AFTER_FLOOR: 3,
+  /**
+   * POSIX only: the service manager respawned the node this many times inside the
+   * window without it ever publishing a lease. A node that keeps dying is not
+   * "starting" however often a poll happens to catch it alive between restarts.
+   */
+  CRASH_LOOP_RESTARTS: 3,
 } as const;
 
-/** Durable outcome of the last Windows self-upgrade, written beside the executable. */
+/** The systemd `WatchdogSec` of the Linux unit (also the survival proof for a lease-less target). */
+export const CONTROLLED_NODE_LINUX_WATCHDOG_SEC = 180 as const;
+/**
+ * A Linux node that predates the health lease still proves authentication: the unit
+ * kills a node that sent no authenticated `WATCHDOG=1` for WatchdogSec, so one that
+ * lived this long under the SAME pid was acknowledged by the server.
+ */
+export const CONTROLLED_NODE_LINUX_WATCHDOG_SURVIVAL_MS = (CONTROLLED_NODE_LINUX_WATCHDOG_SEC + 30) * 1000;
+
+/** Rollback image kept beside each replaced artifact until the new node is healthy. */
+export const CONTROLLED_NODE_UPGRADE_BACKUP_SUFFIX = '.upgrade-old' as const;
+/**
+ * A POSIX upgrade script runs the whole health window plus a rollback, so the
+ * transient unit that hosts it must outlive both (it was 10 minutes, shorter than
+ * the 15-minute health cap).
+ */
+export const CONTROLLED_NODE_POSIX_UPGRADE_SCRIPT_TIMEOUT_MIN = 25 as const;
+/** Time the transient unit gets to finish a rollback after systemd asks it to stop. */
+export const CONTROLLED_NODE_POSIX_UPGRADE_SCRIPT_STOP_TIMEOUT_MIN = 5 as const;
+
+/** Durable outcome of the last controlled-node self-upgrade, written beside the install journal. */
 export const CONTROLLED_NODE_UPGRADE_RESULT_FILE = 'last-upgrade-result.json' as const;
 export const CONTROLLED_NODE_UPGRADE_RESULT_STATUS = {
   /** An upgrade transaction began for `targetVersion` and has no outcome yet. */

@@ -289,3 +289,29 @@ export function createSystemdWatchdogNotifier(options: {
     onError: options.onError,
   });
 }
+
+/**
+ * Linux: feed systemd's watchdog AND publish the lease. The lease is what the
+ * self-upgrade's health wait reads on every platform; Linux used to publish only
+ * the watchdog pulse, which nothing outside systemd can observe.
+ */
+export function createLinuxControlledNodeHealthPublisher(
+  leasePath: string,
+  options: {
+    onError?: (error: unknown) => void;
+    watchdog?: ControlledNodeHealthLeasePublisher;
+    lease?: ControlledNodeHealthLeasePublisher;
+  } = {},
+): ControlledNodeHealthLeasePublisher {
+  const watchdog = options.watchdog ?? createSystemdWatchdogNotifier({ onError: options.onError });
+  const lease = options.lease ?? createControlledNodeHealthLeasePublisher(leasePath, { onError: options.onError });
+  return {
+    recordAuthenticatedHeartbeat(): void {
+      watchdog.recordAuthenticatedHeartbeat();
+      lease.recordAuthenticatedHeartbeat();
+    },
+    async flush(): Promise<void> {
+      await Promise.all([watchdog.flush(), lease.flush()]);
+    },
+  };
+}
