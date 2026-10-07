@@ -45,11 +45,23 @@ import {
   isControlledNodeRuntimePair,
   isControlledNodeOs,
   isControlledNodeTicketDelivery,
+  isAideskLocalUiArtifactAsset,
   isRemoteDesktopArtifactAsset,
   normalizeControlledNodeArtifactPair,
+  type AideskLocalUiArtifactAsset,
   type ControlledNodeArtifactArch,
   type ControlledNodeOs,
 } from '../../../shared/controlled-node-artifacts.js';
+import {
+  AIDESK_LOCAL_UI_MANIFEST_FILENAME,
+  AIDESK_LOCAL_UI_MANIFEST_MAX_BYTES,
+  AIDESK_LOCAL_UI_MAX_BYTES,
+  AIDESK_LOCAL_UI_NOTICES_FILENAME,
+  AIDESK_LOCAL_UI_NOTICES_MAX_BYTES,
+  AIDESK_LOCAL_UI_SIDECAR_TARGET,
+  aideskLocalUiArtifactRelativeDirectory,
+  aideskLocalUiExecutableFileName,
+} from '../../../shared/aidesk-local-ui-artifact.js';
 import {
   REMOTE_DESKTOP_LEGACY_UPGRADE_PROTOCOL_VERSION,
   REMOTE_DESKTOP_MACOS_ARCHITECTURES,
@@ -925,6 +937,9 @@ const NODE_ARTIFACT_QUERY = z.object({
     CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_WORKER_MANIFEST,
     CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_VIRTUAL_DISPLAY,
     CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_MACOS_COMPONENT_SET,
+    CONTROLLED_NODE_ARTIFACT_ASSETS.AIDESK_LOCAL_UI,
+    CONTROLLED_NODE_ARTIFACT_ASSETS.AIDESK_LOCAL_UI_MANIFEST,
+    CONTROLLED_NODE_ARTIFACT_ASSETS.AIDESK_LOCAL_UI_NOTICES,
   ])
     .default(CONTROLLED_NODE_ARTIFACT_ASSETS.NODE),
 }).strict();
@@ -935,10 +950,14 @@ function controlledNodeRuntimePlatform(os: ControlledNodeOs): 'win32' | 'darwin'
   return 'linux';
 }
 
-async function openComputerUseHelperArtifact(
-  dir: string,
-  os: ControlledNodeOs,
-  arch: ControlledNodeArtifactArch,
+/**
+ * Opens one regular file (never a symlink, never one that changes while it is opened) and hashes it through the pinned handle, so the
+ * hash that is announced is the content that is streamed. `maxBytes` bounds what the route will ever serve for this asset.
+ */
+async function openPinnedArtifactFile(
+  path: string,
+  filename: string,
+  maxBytes = Number.MAX_SAFE_INTEGER,
 ): Promise<{
   handle: FileHandle;
   close: () => Promise<void>;
@@ -946,12 +965,10 @@ async function openComputerUseHelperArtifact(
   sizeBytes: number;
   sha256: string;
 } | null> {
-  const filename = controlledNodeComputerUseHelperFilename(os);
-  const path = join(dir, 'computer-use-helper', `${controlledNodeRuntimePlatform(os)}-${arch}`, filename);
   let handle: FileHandle | null = null;
   try {
     const pathStat = await lstat(path);
-    if (!pathStat.isFile() || pathStat.isSymbolicLink()) return null;
+    if (!pathStat.isFile() || pathStat.isSymbolicLink() || pathStat.size <= 0 || pathStat.size > maxBytes) return null;
     handle = await open(path, 'r');
     const stat = await handle.stat();
     if (!stat.isFile() || stat.size !== pathStat.size || stat.mtimeMs !== pathStat.mtimeMs || stat.ctimeMs !== pathStat.ctimeMs) {
@@ -986,6 +1003,35 @@ async function openComputerUseHelperArtifact(
     await handle?.close().catch(() => {});
     return null;
   }
+}
+
+async function openComputerUseHelperArtifact(
+  dir: string,
+  os: ControlledNodeOs,
+  arch: ControlledNodeArtifactArch,
+) {
+  const filename = controlledNodeComputerUseHelperFilename(os);
+  return await openPinnedArtifactFile(join(dir, 'computer-use-helper', `${controlledNodeRuntimePlatform(os)}-${arch}`, filename), filename);
+}
+
+/**
+ * The Windows panel window host and its two small companions, from `<dir>/aidesk-local-ui/win32-x64/`. The route serves exactly these
+ * three fixed names for exactly that target: the asset picks the file, nothing in the request names a path, so it cannot be used to fetch
+ * anything else. Anything missing (or oversize, or a link) is simply "not published".
+ */
+async function openAideskLocalUiArtifact(dir: string, asset: AideskLocalUiArtifactAsset) {
+  const { os, arch } = AIDESK_LOCAL_UI_SIDECAR_TARGET;
+  const filename = asset === CONTROLLED_NODE_ARTIFACT_ASSETS.AIDESK_LOCAL_UI
+    ? aideskLocalUiExecutableFileName(os)
+    : asset === CONTROLLED_NODE_ARTIFACT_ASSETS.AIDESK_LOCAL_UI_MANIFEST
+      ? AIDESK_LOCAL_UI_MANIFEST_FILENAME
+      : AIDESK_LOCAL_UI_NOTICES_FILENAME;
+  const maxBytes = asset === CONTROLLED_NODE_ARTIFACT_ASSETS.AIDESK_LOCAL_UI
+    ? AIDESK_LOCAL_UI_MAX_BYTES
+    : asset === CONTROLLED_NODE_ARTIFACT_ASSETS.AIDESK_LOCAL_UI_MANIFEST
+      ? AIDESK_LOCAL_UI_MANIFEST_MAX_BYTES
+      : AIDESK_LOCAL_UI_NOTICES_MAX_BYTES;
+  return await openPinnedArtifactFile(join(dir, aideskLocalUiArtifactRelativeDirectory(os, arch), filename), filename, maxBytes);
 }
 
 async function openRemoteDesktopWorkerArtifact(
@@ -1543,6 +1589,25 @@ enrollRoutes.get('/v2/node-artifact', async (c) => {
 
   const dir = process.env.IMCODES_NODE_EXE_DIR;
   if (!dir) return c.json({ error: 'executable_dir_not_configured' }, 503);
+  if (isAideskLocalUiArtifactAsset(asset)) {
+    // Only the Windows x64 host exists; every other target (and anything not published) is "nothing to fetch", never an error to retry.
+    const target = AIDESK_LOCAL_UI_SIDECAR_TARGET;
+    const opened = artifactTarget.os === CONTROLLED_NODE_OS_WIN && artifactTarget.arch === target.arch
+      ? await openAideskLocalUiArtifact(dir, asset)
+      : null;
+    if (!opened) return c.json({ error: 'aidesk_local_ui_not_published' }, 404);
+    c.header('Content-Length', String(opened.sizeBytes));
+    c.header('Content-Type', 'application/octet-stream');
+    c.header('Content-Disposition', `attachment; filename="${opened.filename}"`);
+    c.header('Cache-Control', 'private, no-store');
+    c.header('Referrer-Policy', 'no-referrer');
+    c.header('X-Content-Type-Options', 'nosniff');
+    c.header('Accept-Ranges', 'none');
+    c.header(CONTROLLED_NODE_ARTIFACT_HEADERS.SHA256, opened.sha256);
+    c.header(CONTROLLED_NODE_ARTIFACT_HEADERS.SIZE_BYTES, String(opened.sizeBytes));
+    c.header(CONTROLLED_NODE_ARTIFACT_HEADERS.FILENAME, opened.filename);
+    return c.body(buildBareArtifactStream(opened.handle, opened.sizeBytes, opened.close) as unknown as ReadableStream, 200);
+  }
   if (asset === CONTROLLED_NODE_ARTIFACT_ASSETS.COMPUTER_USE_HELPER) {
     const openedHelper = await openComputerUseHelperArtifact(dir, artifactTarget.os, artifactTarget.arch);
     if (!openedHelper) return c.json({ error: 'computer_use_helper_not_built', os: artifactTarget.os, arch: artifactTarget.arch }, 503);

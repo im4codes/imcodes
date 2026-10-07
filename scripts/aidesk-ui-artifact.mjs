@@ -15,6 +15,7 @@ import { join } from 'node:path';
 
 export const AIDESK_LOCAL_UI_MANIFEST_FILENAME = 'aidesk-local-ui.manifest.json';
 export const AIDESK_LOCAL_UI_MANIFEST_SCHEMA_VERSION = 1;
+export const AIDESK_LOCAL_UI_NOTICES_FILENAME = 'THIRD-PARTY-NOTICES.txt';
 const EXECUTABLE_BASE_NAME = 'aidesk-local-ui';
 const OS = ['win32', 'darwin', 'linux'];
 const ARCH = ['x64', 'arm64'];

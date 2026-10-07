@@ -13,6 +13,14 @@ import { AIDESK_LOCAL_UI_EXECUTABLE_NAME } from './aidesk-product.js';
 export const AIDESK_LOCAL_UI_ARTIFACT_DIRECTORY = 'aidesk-local-ui' as const;
 export const AIDESK_LOCAL_UI_MANIFEST_FILENAME = 'aidesk-local-ui.manifest.json' as const;
 export const AIDESK_LOCAL_UI_MANIFEST_SCHEMA_VERSION = 1 as const;
+/** The licence/notice text of the third-party code linked into the window host (WebView2 SDK), shipped beside the executable. */
+export const AIDESK_LOCAL_UI_NOTICES_FILENAME = 'THIRD-PARTY-NOTICES.txt' as const;
+/** The notices are plain text; far above any real file, far below anything a corrupt server reply could make the node keep. */
+export const AIDESK_LOCAL_UI_NOTICES_MAX_BYTES = 256 * 1024;
+/** The manifest is a few hundred bytes. */
+export const AIDESK_LOCAL_UI_MANIFEST_MAX_BYTES = 16 * 1024;
+/** The one platform/architecture the window host is built and shipped for (Windows x64; macOS ships it inside the app, Linux uses the browser). */
+export const AIDESK_LOCAL_UI_SIDECAR_TARGET = Object.freeze({ os: 'win32', arch: 'x64' } as const);
 export const AIDESK_LOCAL_UI_PLATFORMS = ['win32', 'darwin', 'linux'] as const;
 export const AIDESK_LOCAL_UI_ARCHITECTURES = ['x64', 'arm64'] as const;
 export type AideskLocalUiPlatform = typeof AIDESK_LOCAL_UI_PLATFORMS[number];

@@ -109,7 +109,25 @@ export const CONTROLLED_NODE_ARTIFACT_ASSETS = {
   REMOTE_DESKTOP_WORKER_MANIFEST: 'remote-desktop-worker-manifest',
   REMOTE_DESKTOP_VIRTUAL_DISPLAY: 'remote-desktop-virtual-display',
   REMOTE_DESKTOP_MACOS_COMPONENT_SET: 'remote-desktop-macos-component-set',
+  /**
+   * The Windows panel window host (aidesk-local-ui.exe), its manifest and its third-party notices: an independent sidecar, refreshed by
+   * the node itself (never part of the transactional self-upgrade set). A missing file answers 404 and means "not published": the node skips.
+   */
+  AIDESK_LOCAL_UI: 'aidesk-local-ui',
+  AIDESK_LOCAL_UI_MANIFEST: 'aidesk-local-ui-manifest',
+  AIDESK_LOCAL_UI_NOTICES: 'aidesk-local-ui-notices',
 } as const;
+
+export type AideskLocalUiArtifactAsset =
+  | typeof CONTROLLED_NODE_ARTIFACT_ASSETS.AIDESK_LOCAL_UI
+  | typeof CONTROLLED_NODE_ARTIFACT_ASSETS.AIDESK_LOCAL_UI_MANIFEST
+  | typeof CONTROLLED_NODE_ARTIFACT_ASSETS.AIDESK_LOCAL_UI_NOTICES;
+
+export function isAideskLocalUiArtifactAsset(asset: string): asset is AideskLocalUiArtifactAsset {
+  return asset === CONTROLLED_NODE_ARTIFACT_ASSETS.AIDESK_LOCAL_UI
+    || asset === CONTROLLED_NODE_ARTIFACT_ASSETS.AIDESK_LOCAL_UI_MANIFEST
+    || asset === CONTROLLED_NODE_ARTIFACT_ASSETS.AIDESK_LOCAL_UI_NOTICES;
+}
 
 /**
  * Whether `asset` is part of the remote-desktop worker bundle.

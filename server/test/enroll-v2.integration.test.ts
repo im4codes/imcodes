@@ -302,7 +302,7 @@ beforeEach(async () => {
   for (const e of entries) {
     if (e.endsWith('.manifest.json')) {
       await rm(join(exeDir, e), { force: true });
-    } else if (e === 'computer-use-helper' || e === 'remote-desktop-worker') {
+    } else if (e === 'computer-use-helper' || e === 'remote-desktop-worker' || e === 'aidesk-local-ui') {
       await rm(join(exeDir, e), { recursive: true, force: true });
     }
   }
@@ -2796,6 +2796,91 @@ describe('GET /api/enroll/v2/node-artifact (controlled-node self-upgrade)', () =
     expect(response.headers.get(CONTROLLED_NODE_ARTIFACT_HEADERS.SIZE_BYTES)).toBe(String(COMPRESSIBLE_FAKE_BINARY.length));
     expect(response.headers.get(CONTROLLED_NODE_ARTIFACT_HEADERS.SHA256)).toBe(sha256(COMPRESSIBLE_FAKE_BINARY));
     expect(gunzipSync(Buffer.from(await response.arrayBuffer()))).toEqual(COMPRESSIBLE_FAKE_BINARY);
+  });
+
+  describe('the Windows panel window host sidecar (aidesk-local-ui)', () => {
+    const hostDir = () => join(exeDir, 'aidesk-local-ui', 'win32-x64');
+    const hostFiles = {
+      exe: Buffer.from('MZ-fake-aidesk-local-ui'),
+      manifest: Buffer.from('{"schemaVersion":1}'),
+      notices: Buffer.from('WebView2 licence text'),
+    };
+    async function controlledWindowsNode(role: string = NODE_ROLE.CONTROLLED, os = 'win', arch = 'x64') {
+      const userId = `u_${hex(4)}`;
+      await createUser(db, userId);
+      const token = hex(16);
+      const serverId = hex(8);
+      await db.execute(
+        `INSERT INTO servers (id, user_id, name, token_hash, status, created_at, node_role, exec_enabled, os, arch, node_id)
+         VALUES ($1, $2, 'host-node', $3, 'online', $4, $5, TRUE, $6, $7, $8)`,
+        // a controlled node carries a node id; any other role must not (a table constraint)
+        [serverId, userId, sha256(token), Date.now(), role, os, arch, role === NODE_ROLE.CONTROLLED ? generateControlledNodeId() : null],
+      );
+      return { serverId, token };
+    }
+    const fetchAsset = (app: ReturnType<typeof buildApp>, node: { serverId: string; token: string }, asset: string, os = 'win', arch = 'x64') =>
+      app.request(`/api/enroll/v2/node-artifact?serverId=${node.serverId}&os=${os}&arch=${arch}&asset=${asset}`, { headers: { authorization: `Bearer ${node.token}` } });
+    async function publish() {
+      await mkdir(hostDir(), { recursive: true });
+      await writeFile(join(hostDir(), 'aidesk-local-ui.exe'), hostFiles.exe);
+      await writeFile(join(hostDir(), 'aidesk-local-ui.manifest.json'), hostFiles.manifest);
+      await writeFile(join(hostDir(), 'THIRD-PARTY-NOTICES.txt'), hostFiles.notices);
+    }
+
+    it('answers 404 (not published: the node skips) until the sidecar exists, then serves exactly the three fixed files with their hashes', async () => {
+      const app = buildApp();
+      const node = await controlledWindowsNode();
+      for (const asset of ['aidesk-local-ui', 'aidesk-local-ui-manifest', 'aidesk-local-ui-notices']) {
+        const missing = await fetchAsset(app, node, asset);
+        expect(missing.status, asset).toBe(404);
+        expect(await missing.json()).toEqual({ error: 'aidesk_local_ui_not_published' });
+      }
+      await publish();
+      const expected: Array<[string, Buffer, string]> = [
+        ['aidesk-local-ui', hostFiles.exe, 'aidesk-local-ui.exe'],
+        ['aidesk-local-ui-manifest', hostFiles.manifest, 'aidesk-local-ui.manifest.json'],
+        ['aidesk-local-ui-notices', hostFiles.notices, 'THIRD-PARTY-NOTICES.txt'],
+      ];
+      for (const [asset, bytes, filename] of expected) {
+        const response = await fetchAsset(app, node, asset);
+        expect(response.status, asset).toBe(200);
+        expect(response.headers.get('x-imcodes-node-artifact-filename')).toBe(filename);
+        expect(response.headers.get('x-imcodes-node-artifact-sha256')).toBe(sha256(bytes));
+        expect(response.headers.get('x-imcodes-node-artifact-size-bytes')).toBe(String(bytes.length));
+        expect(response.headers.get('cache-control')).toBe('private, no-store');
+        expect(Buffer.from(await response.arrayBuffer())).toEqual(bytes);
+      }
+    });
+
+    it('is for controlled nodes only, for Windows x64 only, and only with the node\'s own token; unknown assets and path-like names are refused', async () => {
+      const app = buildApp();
+      await publish();
+      const controlled = await controlledWindowsNode();
+      const full = await controlledWindowsNode(NODE_ROLE.FULL);
+      expect((await fetchAsset(app, full, 'aidesk-local-ui')).status).toBe(403);
+      expect((await fetchAsset(app, { ...controlled, token: 'wrong-token' }, 'aidesk-local-ui')).status).toBe(401);
+      const linux = await controlledWindowsNode(NODE_ROLE.CONTROLLED, 'linux', 'x64');
+      expect((await fetchAsset(app, linux, 'aidesk-local-ui', 'linux', 'x64')).status).toBe(404);
+      const arm = await controlledWindowsNode(NODE_ROLE.CONTROLLED, 'win', 'arm64');
+      // Windows arm64 is not an artifact target at all (the route's own pair check answers first)
+      expect((await fetchAsset(app, arm, 'aidesk-local-ui', 'win', 'arm64')).status).toBe(400);
+      for (const asset of ['aidesk-local-ui-evil', '../aidesk-local-ui', 'aidesk-local-ui/../../etc/passwd', 'aidesk-local-ui-file']) {
+        expect((await fetchAsset(app, controlled, encodeURIComponent(asset))).status, asset).toBe(400);
+      }
+    });
+
+    it('never serves a link or an oversize file in the sidecar directory', async () => {
+      const app = buildApp();
+      const node = await controlledWindowsNode();
+      await mkdir(hostDir(), { recursive: true });
+      await writeFile(join(hostDir(), 'real.bin'), hostFiles.exe);
+      await symlink(join(hostDir(), 'real.bin'), join(hostDir(), 'aidesk-local-ui.exe'));
+      expect((await fetchAsset(app, node, 'aidesk-local-ui')).status).toBe(404);
+      await writeFile(join(hostDir(), 'THIRD-PARTY-NOTICES.txt'), Buffer.alloc(300 * 1024, 65));
+      expect((await fetchAsset(app, node, 'aidesk-local-ui-notices')).status).toBe(404);
+      await writeFile(join(hostDir(), 'aidesk-local-ui.manifest.json'), Buffer.alloc(0));
+      expect((await fetchAsset(app, node, 'aidesk-local-ui-manifest')).status).toBe(404);
+    });
   });
 
   it('streams the bare pinned artifact to an authenticated controlled node', async () => {
