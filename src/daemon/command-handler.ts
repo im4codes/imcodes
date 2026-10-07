@@ -81,6 +81,8 @@ import {
 } from './subsession-manager.js';
 import { resolveSubSessionCwd } from './subsession-cwd.js';
 import { sendSubSessionSync } from './subsession-sync.js';
+import { isMemoryPressureShedding } from './memory-guard.js';
+import { DAEMON_MEMORY_PRESSURE_HISTORY_BUDGET_BYTES } from '../../shared/daemon-memory-guard.js';
 import logger from '../util/logger.js';
 import { getUpgradeReadiness } from './upgrade-readiness.js';
 import { terminalStageTrace } from '../util/terminal-stage-trace.js';
@@ -7237,9 +7239,14 @@ async function handleTimelineHistory(cmd: Record<string, unknown>, serverLink: S
   // it. Serve a smaller page instead; the response already reports
   // hasMore/droppedEvents, so the client pages for the rest.
   const boundedBudgetBytes = clampTimelineHistoryBudget(cmd.budgetBytes);
-  const maxResponseBytes = serverLink.isUplinkCongested?.()
+  const unpressuredBytes = serverLink.isUplinkCongested?.()
     ? Math.min(boundedBudgetBytes, CONGESTED_TIMELINE_RESPONSE_BUDGET_BYTES)
     : Math.min(resolveTimelineHistoryBudgetBytes(cmd), TIMELINE_HISTORY_LIMITS.MAX_BYTES);
+  // Past the heap warn line a full page is the kind of load that tips the daemon over: serve small pages (the reply
+  // reports hasMore/droppedEvents, so the client pages for the rest -- nothing is silently lost).
+  const maxResponseBytes = isMemoryPressureShedding()
+    ? Math.min(unpressuredBytes, DAEMON_MEMORY_PRESSURE_HISTORY_BUDGET_BYTES)
+    : unpressuredBytes;
 
   if (!sessionName) {
     logger.warn({ requestId }, 'timeline.history_request: missing sessionName');

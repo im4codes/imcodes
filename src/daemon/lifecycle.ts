@@ -53,6 +53,10 @@ import { monitorEventLoopDelay } from 'node:perf_hooks';
 import { loadConfig, type Config } from '../config.js';
 import { loadCredentials } from '../bind/bind-flow.js';
 import logger from '../util/logger.js';
+import { startMemoryGuard, stopMemoryGuard } from './memory-guard.js';
+import { imcodesStateDir } from '../util/imcodes-state-dir.js';
+import { registerMemoryProbe } from './memory-probes.js';
+import { DAEMON_MEMORY_GUARD_EXIT_CODE } from '../../shared/daemon-memory-guard.js';
 import { recordDaemonStart } from '../util/daemon-status.js';
 import { installDaemonRuntimeDiagnosticsProvider } from './runtime-diagnostics.js';
 import { P2P_TERMINAL_RUN_STATUSES } from '../../shared/p2p-status.js';
@@ -1619,6 +1623,7 @@ export async function startup(): Promise<DaemonContext> {
   });
   startContextMaterializationPoller(liveContextIngestion);
   startGcPoller();
+  startDaemonMemoryGuard();
   startEventLoopDelayMonitor();
   startEventLoopWatchdog();
   startLatencyTracer();
@@ -2044,6 +2049,7 @@ async function performShutdown(exitCode: number): Promise<void> {
     stopSessionIdentitySync();
     if (contextMaterializationTimer) clearInterval(contextMaterializationTimer);
     if (gcTimer) clearInterval(gcTimer);
+    stopMemoryGuard();
     if (eventLoopDelayTimer) clearInterval(eventLoopDelayTimer);
     stopEventLoopWatchdog();
     if (capabilityCandidateCleanupTimer) {
@@ -2679,6 +2685,27 @@ function startContextMaterializationPoller(liveContextIngestion: LiveContextInge
  * the poller is a silent no-op (so this is safe to ship without
  * mandating the flag — the worst case is we don't get the speedup).
  */
+/**
+ * Watch the V8 heap against its limit and restart in a controlled way before it is exhausted (see memory-guard.ts).
+ * The hard-exit timer is the last resort when the ordered shutdown itself hangs on a nearly full heap.
+ */
+function startDaemonMemoryGuard(): void {
+  registerMemoryProbe('timeline', () => timelineEmitter.memoryStats());
+  registerMemoryProbe('process', () => {
+    const resources: Record<string, number> = {};
+    for (const type of process.getActiveResourcesInfo()) resources[type] = (resources[type] ?? 0) + 1;
+    return { ...resources, sessions: listSessions().length };
+  });
+  startMemoryGuard({
+    stateDir: imcodesStateDir(),
+    log: logger,
+    shutdown: async (exitCode) => {
+      setTimeout(() => process.exit(DAEMON_MEMORY_GUARD_EXIT_CODE), 40_000).unref?.();
+      await shutdown(exitCode);
+    },
+  });
+}
+
 function startGcPoller(): void {
   const gc = (globalThis as { gc?: () => void }).gc;
   if (typeof gc !== 'function') {

@@ -55,6 +55,7 @@ import { renderRecoveryExecStart, renderSystemdStartLimitBlock, renderSystemdTer
 import { installRecoveryUnits } from '../util/systemd-recovery-install.js';
 import { resolveImcodesHome } from '../util/windows-daemon-lock.js';
 import { resolvePosixDaemonServicePaths } from '../util/posix-daemon-service.js';
+import { daemonFatalReportNodeOptions } from '../../shared/daemon-memory-guard.js';
 
 function credentialsDir(): string { return resolveImcodesHome(); }
 function credentialsPath(): string { return join(credentialsDir(), 'server.json'); }
@@ -1217,7 +1218,7 @@ Environment=IMCODES_DEFAULT_HOME=${dirname(service.defaultHome)}
 # See bind-flow.ts.installSystemdService for rationale on these two.
 # Mirrors the flags there so the one-click setup and the manual bind
 # install produce equivalent units.
-Environment="NODE_OPTIONS=--expose-gc --max-old-space-size=8192"
+Environment="NODE_OPTIONS=--expose-gc --max-old-space-size=8192 ${daemonFatalReportNodeOptions(service.stateHome)}"
 # Caps glibc malloc arenas — see bind-flow.ts for the full rationale.
 # Mirrors that unit so one-click setup and manual bind behave identically.
 # Bounds the ~730 MB of off-heap arena RSS that onnxruntime/sharp native

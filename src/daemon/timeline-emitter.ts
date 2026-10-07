@@ -456,6 +456,14 @@ export class TimelineEmitter {
 
   /** Return a copy of the live in-memory buffer for readers that need the
    * just-emitted event before the async timeline projection catches up. */
+  /** Numbers only (diagnostics): how much the in-memory per-session rings hold. */
+  memoryStats(): { sessions: number; bufferedEvents: number; maxSessionEvents: number } {
+    let events = 0;
+    let max = 0;
+    for (const ring of this.buffer.values()) { events += ring.length; if (ring.length > max) max = ring.length; }
+    return { sessions: this.buffer.size, bufferedEvents: events, maxSessionEvents: max };
+  }
+
   getBufferedEvents(sessionId: string): TimelineEvent[] {
     return [...(this.buffer.get(sessionId) ?? [])];
   }

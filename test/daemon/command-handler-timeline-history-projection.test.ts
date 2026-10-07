@@ -120,6 +120,8 @@ vi.mock('../../src/daemon/opencode-history.js', () => ({
 }));
 
 import { handleWebCommand } from '../../src/daemon/command-handler.js';
+import { setActiveMemoryGuardForTests } from '../../src/daemon/memory-guard.js';
+import { DAEMON_MEMORY_PRESSURE_HISTORY_BUDGET_BYTES } from '../../shared/daemon-memory-guard.js';
 
 const flushAsync = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
 
@@ -234,6 +236,32 @@ describe('command-handler timeline history with SQLite-preferred reads', () => {
       expect.objectContaining({ maxResponseBytes: 64 * 1024 }),
       expect.anything(),
     );
+  });
+
+  it('serves small history pages while the daemon heap is past its warn line, and full pages again once it is not', async () => {
+    shouldUseHistoryWorkerMock.mockReturnValue(true);
+    getSessionMock.mockReturnValue({ name: 'deck_worker', agentType: 'codex' });
+    historyWorkerDispatchMock.mockResolvedValue({
+      events: [], detailCandidates: [], eventsRead: 0, payloadBytes: 2,
+      droppedEvents: 0, truncatedEvents: 0, readMs: 1, sanitizeMs: 0,
+    });
+    const guard = { tick: async () => 'warn' as const, level: () => 'warn' as const, isShedding: () => true, isRestartSuppressed: () => false, start() {}, stop() {} };
+    setActiveMemoryGuardForTests(guard);
+    try {
+      handleWebCommand({ type: 'timeline.history_request', sessionName: 'deck_worker', requestId: 'hist-pressure', limit: 300, budgetBytes: 1024 * 1024 }, serverLink as any);
+      await flushAsync();
+      expect(historyWorkerDispatchMock).toHaveBeenLastCalledWith(
+        expect.objectContaining({ maxResponseBytes: DAEMON_MEMORY_PRESSURE_HISTORY_BUDGET_BYTES }),
+        expect.anything(),
+      );
+      setActiveMemoryGuardForTests({ ...guard, isShedding: () => false });
+      handleWebCommand({ type: 'timeline.history_request', sessionName: 'deck_worker', requestId: 'hist-relaxed', limit: 300, budgetBytes: 1024 * 1024 }, serverLink as any);
+      await flushAsync();
+      const lastCall = historyWorkerDispatchMock.mock.calls.at(-1)![0] as { maxResponseBytes: number };
+      expect(lastCall.maxResponseBytes).toBeGreaterThan(DAEMON_MEMORY_PRESSURE_HISTORY_BUDGET_BYTES);
+    } finally {
+      setActiveMemoryGuardForTests(null);
+    }
   });
 
   it('routes a server history cancel to the link so an unsent reply is dropped', () => {

@@ -56,6 +56,7 @@ import { readInstanceLockMetadata, isRecordedProcessIdentityCurrent, type Daemon
 import logger from '../util/logger.js';
 import { SESSION_ERROR_WORKING_DIRECTORY_NOT_FOUND } from '../../shared/session-errors.js';
 import { SESSIONS_JSON_COMPAT_EXPORT_MAX_BYTES } from '../../shared/session-store-compat.js';
+import { registerMemoryProbe } from '../daemon/memory-probes.js';
 import { blobHashesOfPayload, externalizeSessionRecord, hasGenericBlobRefs, hydrateSessionRecord, identityRefOfPayload } from './session-record-blobs.js';
 import { imcodesStateDir } from '../util/imcodes-state-dir.js';
 
@@ -1257,6 +1258,14 @@ function resetCompatExportForTests(): void {
 }
 
 /** Test seam: resolves when every requested export has been written. */
+registerMemoryProbe('sessionStore', () => {
+  let payloadBytes = 0;
+  for (const payload of committedPayloads.values()) payloadBytes += payload.length;
+  let blobChars = 0;
+  for (const text of blobTextByHash.values()) blobChars += text.length;
+  return { rows: committedPayloads.size, payloadBytes, blobs: blobTextByHash.size, blobChars, inMemorySessions: Object.keys(store.sessions).length, dirtyNames: dirtyNames.size };
+});
+
 /** Test seam: what the next sweep / export has to serialise and compare (the committed row payloads), and the distinct blobs held. */
 export function sessionStoreCommittedBytesForTests(): { payloadBytes: number; rows: number; blobs: number } {
   let payloadBytes = 0;
