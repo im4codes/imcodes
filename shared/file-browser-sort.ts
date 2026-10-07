@@ -116,11 +116,18 @@ function compareNames(a: string, b: string): number {
   return a < b ? -1 : a > b ? 1 : 0;
 }
 
-export function compareFileBrowserEntries(a: FileBrowserSortable, b: FileBrowserSortable, sort: FileBrowserSortState): number {
+function compareEntries(
+  a: FileBrowserSortable,
+  b: FileBrowserSortable,
+  sort: FileBrowserSortState,
+  kindKeys?: readonly [string, string],
+): number {
   if (sort.dirsFirst && a.isDir !== b.isDir) return a.isDir ? -1 : 1;
   const sign = sort.direction === FILE_BROWSER_SORT_DIRECTIONS.DESC ? -1 : 1;
   if (sort.key === FILE_BROWSER_SORT_KEYS.KIND) {
-    const byKind = compareNames(fileKindSortKey(a.name, a.isDir), fileKindSortKey(b.name, b.isDir));
+    const byKind = kindKeys
+      ? compareNames(kindKeys[0], kindKeys[1])
+      : compareNames(fileKindSortKey(a.name, a.isDir), fileKindSortKey(b.name, b.isDir));
     // Equal kinds fall back to the name, ascending, as with the other keys.
     return byKind !== 0 ? sign * byKind : compareNames(a.name, b.name);
   }
@@ -139,11 +146,17 @@ export function compareFileBrowserEntries(a: FileBrowserSortable, b: FileBrowser
   return sign * compareNames(a.name, b.name);
 }
 
+export function compareFileBrowserEntries(a: FileBrowserSortable, b: FileBrowserSortable, sort: FileBrowserSortState): number {
+  return compareEntries(a, b, sort);
+}
+
 /** A new array in the requested order. Stable: entries that compare equal keep their input order. */
 export function sortFileBrowserEntries<T extends FileBrowserSortable>(entries: readonly T[], sort: FileBrowserSortState): T[] {
+  // The kind is worked out once per entry, not once per comparison.
+  const byKind = sort.key === FILE_BROWSER_SORT_KEYS.KIND;
   return entries
-    .map((entry, index) => ({ entry, index }))
-    .sort((a, b) => compareFileBrowserEntries(a.entry, b.entry, sort) || a.index - b.index)
+    .map((entry, index) => ({ entry, index, kind: byKind ? fileKindSortKey(entry.name, entry.isDir) : '' }))
+    .sort((a, b) => compareEntries(a.entry, b.entry, sort, [a.kind, b.kind]) || a.index - b.index)
     .map(({ entry }) => entry);
 }
 

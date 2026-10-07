@@ -14,6 +14,7 @@ import {
 } from '@shared/remote-desktop.js';
 import {
   FILE_TRANSFER_DIRECTORY_CAPABILITY,
+  FILE_TRANSFER_DIRECTORY_QUERY_CAPABILITY,
   FILE_TRANSFER_PATH_HANDLE_CAPABILITY,
 } from '@shared/transport/file-transfer.js';
 import { SESSION_STOP_COMMAND } from '@shared/session-control-commands.js';
@@ -82,8 +83,10 @@ const fileApiMocks = vi.hoisted(() => ({
 }));
 const directoryAdapters = vi.hoisted(() => [] as Array<{
   serverId: string;
+  options?: { supportsQuery?: boolean };
   destroy: ReturnType<typeof vi.fn>;
 }>);
+const fileBrowserProps = vi.hoisted(() => [] as Array<{ listView?: boolean; directoryQuery?: boolean }>);
 const clientHooks: Array<{ onSnapshot(value: unknown): void }> = [];
 const clientStarts: number[] = [];
 let atomicButtonClickAdvertised = true;
@@ -205,7 +208,7 @@ vi.mock('../src/api/machines.js', () => ({
 vi.mock('../src/machine-directory-ws-adapter.js', () => ({
   MachineDirectoryWsAdapter: class {
     readonly destroy = vi.fn();
-    constructor(readonly serverId: string) {
+    constructor(readonly serverId: string, readonly options?: { supportsQuery?: boolean }) {
       directoryAdapters.push(this);
     }
     asWsClient() { return {}; }
@@ -214,9 +217,13 @@ vi.mock('../src/machine-directory-ws-adapter.js', () => ({
 
 vi.mock('../src/components/FileBrowser.js', () => ({
   FileBrowser: (props: {
+    listView?: boolean;
+    directoryQuery?: boolean;
     onCurrentPathChange?(path: string): void;
     onSelectedPathChange?(path: string | null, isDirectory: boolean): void;
-  }) => (
+  }) => {
+    fileBrowserProps.push({ listView: props.listView, directoryQuery: props.directoryQuery });
+    return (
     <div data-testid="remote-file-browser">
       <button
         type="button"
@@ -226,7 +233,8 @@ vi.mock('../src/components/FileBrowser.js', () => ({
         }}
       >select-remote-file</button>
     </div>
-  ),
+    );
+  },
 }));
 
 import { RemoteDesktopPanel } from '../src/components/RemoteDesktopPanel.js';
@@ -257,6 +265,7 @@ afterEach(() => {
   clientHooks.length = 0;
   clientStarts.length = 0;
   directoryAdapters.length = 0;
+  fileBrowserProps.length = 0;
   atomicButtonClickAdvertised = true;
   localStorage.removeItem('rcc_float_remote-desktop-server-1');
   localStorage.removeItem('imcodes.web.remote-desktop.zoom.v1.server-1');
@@ -895,6 +904,21 @@ describe('RemoteDesktopPanel mobile gestures', () => {
     act(() => (getByRole('button', { name: 'remote_desktop.send_to_remote' }) as HTMLButtonElement).click());
     await vi.waitFor(() => expect(container.textContent).toContain('upload.transport.relay'));
     await vi.waitFor(() => expect(container.textContent).toContain('remote_desktop.transfer_status_done'));
+  });
+
+  it('lists the remote folder as a table, and asks the node to filter/order it only when the node can', async () => {
+    const withQuery = await renderPanel(undefined, [REMOTE_DESKTOP_CAPABILITY, FILE_TRANSFER_DIRECTORY_CAPABILITY, FILE_TRANSFER_DIRECTORY_QUERY_CAPABILITY]);
+    act(() => { (withQuery.getByRole('button', { name: 'remote_desktop.files' }) as HTMLButtonElement).click(); });
+    expect(fileBrowserProps.at(-1)).toEqual({ listView: true, directoryQuery: true });
+    expect(directoryAdapters.at(-1)?.options).toEqual({ supportsQuery: true });
+    cleanup();
+    directoryAdapters.length = 0;
+    fileBrowserProps.length = 0;
+
+    const older = await renderPanel(undefined, [REMOTE_DESKTOP_CAPABILITY, FILE_TRANSFER_DIRECTORY_CAPABILITY]);
+    act(() => { (older.getByRole('button', { name: 'remote_desktop.files' }) as HTMLButtonElement).click(); });
+    expect(fileBrowserProps.at(-1)).toEqual({ listView: true, directoryQuery: false });
+    expect(directoryAdapters.at(-1)?.options).toEqual({ supportsQuery: false });
   });
 
   it('uses the embedded remote file selection for an explicit fetch action', async () => {

@@ -118,6 +118,12 @@ export interface FsListDirOptions {
   includeOpenSpecTaskStats?: boolean;
   /** Session whose project directory scopes this request. */
   sessionName?: string;
+  /**
+   * Filter/order the listing on the machine before it is cut to its entry
+   * limit. Only the controlled-node directory adapter honours it (it asks the
+   * node, which must advertise the capability); a daemon socket ignores it.
+   */
+  query?: import('@shared/transport/file-transfer.js').FileDirectoryListQuery;
 }
 
 /** Snapshot of the most recent `daemon.hello` capability handshake the browser

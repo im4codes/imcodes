@@ -3,6 +3,26 @@ import { FS_TRANSPORT_MSG } from '@shared/fs-transport-messages.js';
 import { FILE_TRANSFER_DIRECTORY_PATH, FILE_TRANSFER_DIRECTORY_LIST_ERROR } from '@shared/transport/file-transfer.js';
 import { openMacosFullDiskAccessSettings } from '../api/machines.js';
 import { formatByteSize } from '../util/byte-size.js';
+import {
+  FILE_BROWSER_FILTER_DEBOUNCE_MS,
+  FILE_BROWSER_SORT_DIRECTIONS,
+  FILE_BROWSER_SORT_KEYS,
+  applyFileBrowserView,
+  isFileBrowserSortKeyAvailable,
+  parseFileBrowserFilter,
+  type FileBrowserSortKey,
+  type FileBrowserSortState,
+} from '@shared/file-browser-sort.js';
+import { fileKindOf } from '@shared/file-kind.js';
+import { FILE_TRANSFER_DIRECTORY_MAX_ENTRIES, type FileDirectoryListQuery } from '@shared/transport/file-transfer.js';
+import {
+  FILE_BROWSER_NARROW_MAX_WIDTH_PX,
+  fileKindLabel,
+  formatFileBrowserDate,
+  loadFileBrowserSortPreference,
+  saveFileBrowserSortPreference,
+} from '../file-browser-list-view.js';
+import { FileBrowserListChrome } from './FileBrowserListChrome.js';
 /**
  * FileBrowser — universal reusable file/directory browser.
  *
@@ -18,7 +38,7 @@ import { formatByteSize } from '../util/byte-size.js';
 import { useState, useRef, useEffect, useCallback, useMemo, useLayoutEffect } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import type { WsClient, ServerMessage } from '../ws-client.js';
-import { lazy, Suspense } from 'preact/compat';
+import { lazy, memo, Suspense } from 'preact/compat';
 import { parseUnifiedDiff } from '@shared/unified-diff.js';
 import { isHtmlPreviewPath, type HtmlPreviewViewMode } from '@shared/html-preview.js';
 import { FS_SESSION_ROOT_PATH, FS_WRITE_ERROR } from '../../../src/shared/transport/fs.js';
@@ -167,6 +187,19 @@ export interface FileBrowserProps {
    * browser pointed at anything else would navigate to a literal ":desktop:".
    */
   quickAccess?: boolean;
+  /**
+   * Show the list as a table (name / size / kind / modified / created) with
+   * sortable column headers and a quick name filter. Opt-in: only a listing
+   * that carries file details (a controlled node's) fills the columns, so the
+   * other hosts keep the plain tree.
+   */
+  listView?: boolean;
+  /**
+   * `ws.fsListDir` honours a `query` (the machine filters and orders the
+   * listing before cutting it to its entry limit). Only meaningful with
+   * `listView`; without it the browser sorts and filters what it has.
+   */
+  directoryQuery?: boolean;
   /** The second argument exposes the already-loaded single-file preview so a
    * host can consume explicitly selected text without issuing a duplicate read. */
   onConfirm: (paths: string[], preview?: FileBrowserPreviewState) => void;
@@ -203,6 +236,17 @@ type FsNode = {
   /** Volume capacity, present only on volume roots the daemon could measure. */
   totalBytes?: number;
   freeBytes?: number;
+  /** File details a controlled node's listing carries (absent from an older node's). */
+  size?: number;
+  mtimeMs?: number;
+  birthtimeMs?: number;
+  /**
+   * How the children of this directory were obtained. `complete`: every entry
+   * of the directory is here (an unfiltered listing that was not cut), so the
+   * browser can sort and filter it with no request. Otherwise the machine
+   * filtered or cut it, and a different sort or filter needs a new request.
+   */
+  listing?: { complete: boolean; truncated?: { total: number; partial?: boolean } };
 };
 
 interface FileBrowserSnapshot {
@@ -521,8 +565,11 @@ export function FileBrowser({
   onCurrentPathChange,
   hideBreadcrumbConfirm = false,
   quickAccess = false,
+  listView = false,
+  directoryQuery = false,
 }: FileBrowserProps) {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
+  const uiLocale = i18n?.language || 'en';
   const includeFiles = mode !== 'dir-only';
   const scopedSessionName = scopeToSessionRoot ? sessionName : undefined;
   const isMulti = mode === 'file-multi';
@@ -533,7 +580,10 @@ export function FileBrowser({
   const markdownReferenceRoot = [changesRootPath, startPath].find((path) => (
     !!path && path !== '~' && path !== FS_SESSION_ROOT_PATH && path !== WINDOWS_DRIVES_PATH
   ));
-  const initialTreeSnapshot = loadFileBrowserSnapshot(startPath, includeFiles, DEFAULT_SHOW_HIDDEN_FILES, serverId);
+  // A cached tree has no file details and no record of how it was listed, so
+  // the table view always lists afresh.
+  const loadSnapshot: typeof loadFileBrowserSnapshot = (...args) => (listView ? null : loadFileBrowserSnapshot(...args));
+  const initialTreeSnapshot = loadSnapshot(startPath, includeFiles, DEFAULT_SHOW_HIDDEN_FILES, serverId);
   const [data, setData] = useState<FsNode[]>([
     {
       id: startPath,
@@ -562,6 +612,19 @@ export function FileBrowser({
   useEffect(() => { onCurrentPathChange?.(currentLabel); }, [currentLabel, onCurrentPathChange]);
   const dataRef = useRef(data);
   useEffect(() => { dataRef.current = data; }, [data]);
+
+  // ── Table view: sort, quick filter ──────────────────────────────────────
+  const [sort, setSort] = useState<FileBrowserSortState>(() => loadFileBrowserSortPreference(serverId));
+  const [filterInput, setFilterInput] = useState('');
+  const [appliedFilter, setAppliedFilter] = useState('');
+  // Read by fetchDir at request time, so a listing always carries the sort and
+  // filter in force when it was asked for, without re-creating fetchDir.
+  const sortRef = useRef(sort);
+  sortRef.current = sort;
+  const appliedFilterRef = useRef(appliedFilter);
+  appliedFilterRef.current = appliedFilter;
+  const filterComposingRef = useRef(false);
+  const pendingQueryRef = useRef(new Map<string, { hadQuery: boolean; filter: string }>());
   const [error, setError] = useState<string | null>(null);
   // Set only for the specific "this machine's Downloads/Desktop/Documents
   // are TCC-blocked" signal, never for generic errors -- those keep using
@@ -722,8 +785,8 @@ export function FileBrowser({
   useEffect(() => {
     const root = data[0];
     if (!root || root.isLoading || !root.children) return;
-    saveFileBrowserSnapshot(startPath, includeFiles, showHidden, currentLabel, root.children, serverId);
-  }, [currentLabel, data, includeFiles, serverId, showHidden, startPath]);
+    if (!listView) saveFileBrowserSnapshot(startPath, includeFiles, showHidden, currentLabel, root.children, serverId);
+  }, [currentLabel, data, includeFiles, listView, serverId, showHidden, startPath]);
 
   const getActivePreviewCycle = useCallback((path?: string): PendingPreviewRequest | null => {
     const active = activePreviewCycleRef.current;
@@ -785,35 +848,50 @@ export function FileBrowser({
     pendingPreviewTimersRef.current.set(requestId, timer);
   }, [clearPendingPreviewRequest, handlePreviewRequestTimeout]);
 
-  const fetchDir = useCallback((nodePath: string) => {
+  const fetchDir = useCallback((nodePath: string, fetchOptions?: { skipGitStatus?: boolean }) => {
     if (loadedRef.current.has(nodePath)) return;
     const inFlight = [...pendingRef.current.values()].includes(nodePath);
     if (inFlight) return;
 
     setData((prev) => updateNode(prev, nodePath, { isLoading: true }));
+    // The table view asks the machine to filter and order the listing before
+    // it cuts it to its entry limit (only where the machine can). The sort and
+    // filter are the ones in force right now.
+    const query: FileDirectoryListQuery | undefined = listView && directoryQuery
+      ? {
+        sort: sortRef.current,
+        ...(appliedFilterRef.current.trim() ? { nameFilter: appliedFilterRef.current.trim() } : {}),
+      }
+      : undefined;
     let requestId: string;
     try {
       // Keep the initial directory list lightweight. The tree currently only
       // renders names/dir flags, so per-file metadata (size/mime/downloadId)
       // just adds avoidable stat work on first open, especially on mobile.
-      requestId = scopedSessionName
-        ? ws.fsListDir(nodePath, includeFiles, false, { sessionName: scopedSessionName })
-        : ws.fsListDir(nodePath, includeFiles, false);
+      requestId = query
+        ? ws.fsListDir(nodePath, includeFiles, false, { ...(scopedSessionName ? { sessionName: scopedSessionName } : {}), query })
+        : scopedSessionName
+          ? ws.fsListDir(nodePath, includeFiles, false, { sessionName: scopedSessionName })
+          : ws.fsListDir(nodePath, includeFiles, false);
     } catch {
       setData((prev) => updateNode(prev, nodePath, { isLoading: false }));
       return;
     }
     pendingRef.current.set(requestId, nodePath);
+    pendingQueryRef.current.set(requestId, { hadQuery: Boolean(query), filter: query?.nameFilter ?? '' });
     // Tree/subtree refreshes only need lightweight status without includeStats.
-    try {
-      const gitId = scopedSessionName ? ws.fsGitStatus(nodePath, { sessionName: scopedSessionName }) : ws.fsGitStatus(nodePath);
-      pendingGitStatusRef.current.set(gitId, nodePath);
-    } catch { /* ws disconnected — skip git status */ }
+    if (!fetchOptions?.skipGitStatus) {
+      try {
+        const gitId = scopedSessionName ? ws.fsGitStatus(nodePath, { sessionName: scopedSessionName }) : ws.fsGitStatus(nodePath);
+        pendingGitStatusRef.current.set(gitId, nodePath);
+      } catch { /* ws disconnected — skip git status */ }
+    }
 
     const timer = setTimeout(() => {
       if (!mountedRef.current) return;
       if (pendingRef.current.has(requestId)) {
         pendingRef.current.delete(requestId);
+        pendingQueryRef.current.delete(requestId);
         timersRef.current.delete(requestId);
         // Without this, ws-client's owned-data-request dedup keeps this
         // path's requestId parked for up to its own TTL: retrying right
@@ -825,7 +903,23 @@ export function FileBrowser({
       }
     }, REQUEST_TIMEOUT_MS);
     timersRef.current.set(requestId, timer);
-  }, [includeFiles, scopedSessionName, showHidden, t, ws]);
+  }, [directoryQuery, includeFiles, listView, scopedSessionName, showHidden, t, ws]);
+
+  // Ask for a directory again with the sort/filter now in force, replacing a
+  // request still in flight for it: only the answer to the LAST ask is ever
+  // used (a superseded request's response finds no pending entry and is dropped).
+  const refetchDir = useCallback((nodePath: string) => {
+    for (const [requestId, pendingPath] of [...pendingRef.current]) {
+      if (pendingPath !== nodePath) continue;
+      pendingRef.current.delete(requestId);
+      pendingQueryRef.current.delete(requestId);
+      const timer = timersRef.current.get(requestId);
+      if (timer) { clearTimeout(timer); timersRef.current.delete(requestId); }
+      ws.forgetOwnedDataRequest(requestId);
+    }
+    loadedRef.current.delete(nodePath);
+    fetchDir(nodePath, { skipGitStatus: true });
+  }, [fetchDir, ws]);
 
   // Listen for fs.ls_response and fs.read_response
   // IMPORTANT: Every setState call is guarded by mountedRef to prevent crashes
@@ -856,6 +950,8 @@ export function FileBrowser({
         const nodeId = pendingRef.current.get(msg.requestId);
         if (!nodeId) return;
         pendingRef.current.delete(msg.requestId);
+        const queryUsed = pendingQueryRef.current.get(msg.requestId);
+        pendingQueryRef.current.delete(msg.requestId);
 
         const timer = timersRef.current.get(msg.requestId);
         if (timer) { clearTimeout(timer); timersRef.current.delete(msg.requestId); }
@@ -904,7 +1000,20 @@ export function FileBrowser({
             children: e.isDir ? [] : undefined,
             ...(typeof e.totalBytes === 'number' ? { totalBytes: e.totalBytes } : {}),
             ...(typeof e.freeBytes === 'number' ? { freeBytes: e.freeBytes } : {}),
+            ...(typeof e.size === 'number' ? { size: e.size } : {}),
+            ...(typeof e.mtimeMs === 'number' ? { mtimeMs: e.mtimeMs } : {}),
+            ...(typeof e.birthtimeMs === 'number' ? { birthtimeMs: e.birthtimeMs } : {}),
           }));
+        const truncated = msg.truncated === true && typeof msg.total === 'number'
+          ? { total: msg.total, ...(msg.partial === true ? { partial: true } : {}) }
+          : undefined;
+        // Everything is here only when the machine neither cut the listing nor
+        // narrowed it by name. (A machine that cannot be queried returns what
+        // it returns, and that is all the browser can go on.)
+        const listing: FsNode['listing'] = {
+          complete: !truncated && (!queryUsed?.hadQuery || !queryUsed.filter),
+          ...(truncated ? { truncated } : {}),
+        };
 
         loadedRef.current.add(nodeId);
         if (resolvedParent !== nodeId) loadedRef.current.add(resolvedParent);
@@ -914,6 +1023,7 @@ export function FileBrowser({
           name: resolvedParent === WINDOWS_DRIVES_ROOT ? t('file_browser.this_pc') : resolvedParent.split(/[/\\]/).pop() || resolvedParent,
           children,
           isLoading: false,
+          listing,
         }));
         // Keep the node expanded after its ID changes from alias (e.g. '~') to resolved path
         if (resolvedParent !== nodeId) {
@@ -1411,6 +1521,10 @@ export function FileBrowser({
 
   // Navigate to a path and push to history
   const jumpTo = useCallback((newPath: string) => {
+    // A filter belongs to the directory it was typed in; the sort stays.
+    setFilterInput('');
+    setAppliedFilter('');
+    appliedFilterRef.current = '';
     loadedRef.current.clear();
     setData([{ id: newPath, name: newPath, isDir: true, children: [] }]);
     setExpandedPaths(new Set([newPath]));
@@ -1478,13 +1592,13 @@ export function FileBrowser({
       activePreviewCycleRef.current = null;
       for (const timer of timersRef.current.values()) clearTimeout(timer);
       timersRef.current.clear();
-      const cached = loadFileBrowserSnapshot(startPath, includeFiles, showHidden, serverId);
+      const cached = loadSnapshot(startPath, includeFiles, showHidden, serverId);
       setData([{ id: startPath, name: startPath, isDir: true, children: cached?.rootChildren ?? [] }]);
       setCurrentLabel(cached?.currentLabel ?? startPath);
       setError(null);
     }
     fetchDir(startPath);
-  }, [clearAllPendingPreviewRequests, fetchDir, includeFiles, serverId, showHidden, startPath]);
+  }, [clearAllPendingPreviewRequests, fetchDir, includeFiles, listView, serverId, showHidden, startPath]);
 
   // Opening a File Browser is the only eager direct-file action.  This creates
   // an inert tab+daemon lease (no path, handle, session scope, or file
@@ -1683,11 +1797,11 @@ export function FileBrowser({
   // Reload tree when showHidden changes
   useEffect(() => {
     loadedRef.current.clear();
-    const cached = loadFileBrowserSnapshot(startPath, includeFiles, showHidden, serverId);
+    const cached = loadSnapshot(startPath, includeFiles, showHidden, serverId);
     setData([{ id: startPath, name: startPath, isDir: true, children: cached?.rootChildren ?? [] }]);
     setCurrentLabel(cached?.currentLabel ?? startPath);
     fetchDir(startPath);
-  }, [fetchDir, includeFiles, serverId, showHidden, startPath]);
+  }, [fetchDir, includeFiles, listView, serverId, showHidden, startPath]);
 
   const toggleExpand = useCallback((nodeId: string) => {
     setExpandedPaths((prev) => {
@@ -1792,12 +1906,150 @@ export function FileBrowser({
     </div>
   ) : null;
 
+  // ── Table view (name / size / kind / modified / created) ───────────────
+  const filterTerms = useMemo(() => parseFileBrowserFilter(appliedFilter), [appliedFilter]);
+  const rootNode = data[0];
+  const rootChildren = rootNode?.children;
+  const listDetailsPresent = Boolean(rootChildren?.some((child) => child.mtimeMs !== undefined));
+  // A column the machine cannot fill is not sortable, and says why.
+  const unavailableReasons: Partial<Record<FileBrowserSortKey, string>> = {};
+  if (listView && rootChildren && rootChildren.length > 0) {
+    if (!listDetailsPresent) {
+      for (const key of [FILE_BROWSER_SORT_KEYS.SIZE, FILE_BROWSER_SORT_KEYS.MODIFIED, FILE_BROWSER_SORT_KEYS.CREATED]) {
+        unavailableReasons[key] = t('file_browser.meta_unsupported');
+      }
+    } else if (!isFileBrowserSortKeyAvailable(rootChildren, FILE_BROWSER_SORT_KEYS.CREATED)) {
+      unavailableReasons[FILE_BROWSER_SORT_KEYS.CREATED] = t('file_browser.created_unavailable');
+    }
+  }
+  const sortKeyUnavailable = Boolean(unavailableReasons[sort.key]);
+  // A remembered key this machine cannot serve falls back to the name rather than sorting on nothing.
+  const effectiveSort = useMemo<FileBrowserSortState>(
+    () => (sortKeyUnavailable ? { ...sort, key: FILE_BROWSER_SORT_KEYS.NAME, direction: FILE_BROWSER_SORT_DIRECTIONS.ASC } : sort),
+    [sort, sortKeyUnavailable],
+  );
+  const listViewResult = useMemo(() => {
+    if (!listView || !rootNode) return null;
+    // Filter first, then sort, at every loaded level.
+    const { nodes, forceExpanded } = applyFileBrowserView(rootNode.children ?? [], filterTerms, effectiveSort, (node) => node.id);
+    return { data: [{ ...rootNode, children: nodes }] as FsNode[], forceExpanded };
+  }, [effectiveSort, filterTerms, listView, rootNode]);
+  const viewData = listViewResult?.data ?? data;
+
+  const handleSortChange = useCallback((next: FileBrowserSortState) => {
+    setSort(next);
+    saveFileBrowserSortPreference(serverId, next);
+  }, [serverId]);
+  const clearFilter = useCallback(() => {
+    filterComposingRef.current = false;
+    setFilterInput('');
+    setAppliedFilter('');
+  }, []);
+  // The text follows every keystroke; what is filtered by waits for a pause,
+  // and never happens in the middle of an IME composition.
+  useEffect(() => {
+    if (filterComposingRef.current || filterInput === appliedFilter) return;
+    const timer = setTimeout(() => setAppliedFilter(filterInput), FILE_BROWSER_FILTER_DEBOUNCE_MS);
+    return () => clearTimeout(timer);
+  }, [filterInput, appliedFilter]);
+
+  // A listing the machine filtered or cut cannot be re-sorted or re-filtered
+  // here, so a change of sort/filter asks for it again; a complete one just
+  // re-renders. Asking again replaces any request still in flight.
+  const listQueryKey = `${sort.key}:${sort.direction}:${sort.dirsFirst}:${appliedFilter}`;
+  const prevListQueryKeyRef = useRef(listQueryKey);
+  useEffect(() => {
+    if (prevListQueryKeyRef.current === listQueryKey) return;
+    prevListQueryKeyRef.current = listQueryKey;
+    if (!listView || !directoryQuery) return;
+    const inFlightPaths = new Set(pendingRef.current.values());
+    const walk = (nodes: FsNode[]) => {
+      for (const node of nodes) {
+        // Loaded, or being re-asked right now (that ask used the previous sort/filter).
+        const known = loadedRef.current.has(node.id) || inFlightPaths.has(node.id);
+        if (node.isDir && node.listing && !node.listing.complete && known) refetchDir(node.id);
+        if (node.children?.length) walk(node.children);
+      }
+    };
+    walk(dataRef.current);
+  }, [directoryQuery, listQueryKey, listView, refetchDir]);
+
+  const listContainerRef = useRef<HTMLDivElement | null>(null);
+  const [narrow, setNarrow] = useState(false);
+  useEffect(() => {
+    const element = listContainerRef.current;
+    if (!listView || !element) return;
+    // A hidden element reports 0: fall back to the window rather than folding.
+    const measure = () => setNarrow((element.clientWidth || window.innerWidth) < FILE_BROWSER_NARROW_MAX_WIDTH_PX);
+    measure();
+    if (typeof ResizeObserver === 'undefined') {
+      window.addEventListener('resize', measure);
+      return () => window.removeEventListener('resize', measure);
+    }
+    const observer = new ResizeObserver(measure);
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, [listView]);
+
+  const listNotice = (() => {
+    if (!listView || !rootNode) return undefined;
+    const listing = rootNode.listing;
+    if (listing?.truncated) {
+      const shown = rootChildren?.length ?? 0;
+      return listing.truncated.partial
+        ? t('file_browser.notice_truncated_partial', { shown, total: listing.truncated.total })
+        : t('file_browser.notice_truncated', { shown, total: listing.truncated.total });
+    }
+    // An older machine cut the listing to its entry limit by name and said nothing.
+    if (!directoryQuery && (rootChildren?.length ?? 0) >= FILE_TRANSFER_DIRECTORY_MAX_ENTRIES) {
+      return t('file_browser.notice_capped', { count: FILE_TRANSFER_DIRECTORY_MAX_ENTRIES });
+    }
+    return undefined;
+  })();
+  // "Today"/"yesterday" only change at midnight, so the clock is read once a
+  // minute; that also keeps the row cells' props equal between renders.
+  const nowMinute = Math.floor(Date.now() / 60_000);
+  const createdUnavailable = Boolean(unavailableReasons[FILE_BROWSER_SORT_KEYS.CREATED]);
+  const emptyFilterText = filterTerms.length > 0 ? t('file_browser.filter_empty', { query: appliedFilter.trim() }) : undefined;
+  const forceExpanded = listViewResult?.forceExpanded;
+  const listColumns = useMemo<FsListColumns | undefined>(() => (listView ? {
+    narrow,
+    nowMs: nowMinute * 60_000,
+    locale: uiLocale,
+    detailsPresent: listDetailsPresent,
+    createdUnavailable,
+    forceExpanded,
+    emptyText: emptyFilterText,
+  } : undefined), [createdUnavailable, emptyFilterText, forceExpanded, listDetailsPresent, listView, narrow, nowMinute, uiLocale]);
+
   const tree = (
-    <div class={`fb-tree${layout !== 'panel' && hasInlinePreview ? ' fb-tree-split' : ''}`}>
-      {data.map((root) => (
+    <div
+      class={`fb-tree${layout !== 'panel' && hasInlinePreview ? ' fb-tree-split' : ''}${listView ? ' fb-tree-list' : ''}`}
+      ref={listView ? listContainerRef : undefined}
+    >
+      {listView && (
+        <FileBrowserListChrome
+          sort={sort}
+          onSortChange={handleSortChange}
+          unavailableReasons={unavailableReasons}
+          filterValue={filterInput}
+          onFilterInput={setFilterInput}
+          onFilterCompositionStart={() => { filterComposingRef.current = true; }}
+          onFilterCompositionEnd={(value) => {
+            filterComposingRef.current = false;
+            setFilterInput(value);
+            setAppliedFilter(value);
+          }}
+          onFilterClear={clearFilter}
+          narrow={narrow}
+          notice={listNotice}
+        />
+      )}
+      {viewData.map((root) => (
         <FsTreeNode
           key={root.id}
           node={root}
+          listColumns={listColumns}
           expandedPaths={expandedPaths}
           selectedPaths={selectedPaths}
           alreadySet={alreadySet}
@@ -2636,8 +2888,23 @@ export function FileBrowser({
 
 // ── Tree node ─────────────────────────────────────────────────────────────────
 
+/** What the table view needs to draw a row: how to lay it out and what to say about a missing value. */
+interface FsListColumns {
+  narrow: boolean;
+  nowMs: number;
+  locale: string;
+  /** Any entry of the root listing came with file details (an older machine sends none). */
+  detailsPresent: boolean;
+  createdUnavailable: boolean;
+  /** Directories shown open only because something below them matched the filter. */
+  forceExpanded?: Set<string>;
+  /** Shown instead of the empty-directory dash when the filter matched nothing. */
+  emptyText?: string;
+}
+
 function FsTreeNode({
   node,
+  listColumns,
   expandedPaths,
   selectedPaths,
   alreadySet,
@@ -2652,6 +2919,7 @@ function FsTreeNode({
   depth = 0,
 }: {
   node: FsNode;
+  listColumns?: FsListColumns;
   expandedPaths: Set<string>;
   selectedPaths: Set<string>;
   alreadySet: Set<string>;
@@ -2666,7 +2934,7 @@ function FsTreeNode({
   depth?: number;
 }) {
   const { t } = useTranslation();
-  const isExpanded = expandedPaths.has(node.id);
+  const isExpanded = expandedPaths.has(node.id) || Boolean(listColumns?.forceExpanded?.has(node.id));
   const isSelected = selectedPaths.has(node.id);
   const isAlready = alreadySet.has(node.id);
   const isMulti = mode === 'file-multi';
@@ -2734,16 +3002,23 @@ function FsTreeNode({
         )}
         {gitCode && gitClass && <span class={`fb-node-git-badge git-badge-${gitClass}`} title={`git: ${gitCode}`}>{gitStatusBadge(gitCode)}</span>}
         {isAlready && <span class="fb-node-badge">↑</span>}
+        {listColumns && depth > 0 && !listColumns.narrow && <FsListCells node={node} columns={listColumns} />}
       </div>
+      {listColumns && depth > 0 && listColumns.narrow && (
+        <div class="fb-node-meta" style={{ paddingLeft: 8 + depth * 16 + 40 }}>
+          <FsListCells node={node} columns={listColumns} stacked />
+        </div>
+      )}
       {node.isDir && isExpanded && node.children && (
         <>
           {node.children.length === 0 && !node.isLoading && (
-            <div class="fb-node-empty" style={{ paddingLeft: 8 + (depth + 1) * 16 }}>—</div>
+            <div class="fb-node-empty" style={{ paddingLeft: 8 + (depth + 1) * 16 }}>{depth === 0 && listColumns?.emptyText ? listColumns.emptyText : '—'}</div>
           )}
           {node.children.map((child) => (
             <FsTreeNode
               key={child.id}
               node={child}
+              listColumns={listColumns}
               expandedPaths={expandedPaths}
               selectedPaths={selectedPaths}
               alreadySet={alreadySet}
@@ -2763,3 +3038,49 @@ function FsTreeNode({
     </div>
   );
 }
+
+// ── Table cells ───────────────────────────────────────────────────────────────
+
+/**
+ * Size, kind, modified and created of one row. Wide: four cells aligned under
+ * the column headers. Stacked (narrow): one line of "label value" pieces under
+ * the name, so nothing is dropped on a small screen.
+ */
+const FsListCells = memo(function FsListCells({ node, columns, stacked = false }: { node: FsNode; columns: FsListColumns; stacked?: boolean }) {
+  const { t } = useTranslation();
+  const missingTitle = !columns.detailsPresent ? t('file_browser.meta_unsupported') : t('file_browser.detail_unreadable');
+  const size = node.isDir
+    ? { text: '—', title: undefined as string | undefined }
+    : node.size !== undefined
+      ? { text: formatByteSize(node.size), title: `${node.size.toLocaleString(columns.locale)} B` as string | undefined }
+      : { text: '—', title: missingTitle };
+  const kind = fileKindLabel(fileKindOf(node.name, node.isDir), t);
+  const dateCell = (ms: number | undefined, unavailableTitle: string) => (
+    ms === undefined
+      ? { text: '—', title: unavailableTitle }
+      : formatFileBrowserDate(ms, columns.nowMs, columns.locale, t)
+  );
+  const modified = dateCell(node.mtimeMs, missingTitle);
+  const created = dateCell(node.birthtimeMs, columns.detailsPresent && columns.createdUnavailable ? t('file_browser.created_unavailable') : missingTitle);
+  const cells = [
+    { key: 'size', label: t('file_browser.col.size'), ...size },
+    { key: 'kind', label: t('file_browser.col.kind'), text: kind, title: kind },
+    { key: 'modified', label: t('file_browser.col.modified'), ...modified },
+    { key: 'created', label: t('file_browser.col.created'), ...created },
+  ];
+  return (
+    <>
+      {cells.map((cell) => (
+        <span key={cell.key} class={`fb-col fb-col-${cell.key}${stacked ? ' is-stacked' : ''}`} title={cell.title}>
+          {stacked && <span class="fb-col-label">{cell.label}</span>}
+          {cell.text}
+        </span>
+      ))}
+    </>
+  );
+}, (previous, next) => previous.node === next.node
+  && previous.stacked === next.stacked
+  && previous.columns.nowMs === next.columns.nowMs
+  && previous.columns.locale === next.columns.locale
+  && previous.columns.detailsPresent === next.columns.detailsPresent
+  && previous.columns.createdUnavailable === next.columns.createdUnavailable);

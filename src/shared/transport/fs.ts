@@ -12,6 +12,9 @@ export interface FsEntry {
   hidden: boolean;
   /** File size in bytes (only when includeMetadata requested). */
   size?: number;
+  /** Last-modified / creation time in epoch ms; only a controlled node's listing query supplies them. */
+  mtimeMs?: number;
+  birthtimeMs?: number;
   /** MIME type inferred from extension (only for files with includeMetadata). */
   mime?: string;
   /** Controlled download handle ID (only when includeMetadata requested). */
@@ -55,6 +58,12 @@ interface FsBaseResponse {
 export interface FsLsResponse extends FsBaseResponse {
   type: 'fs.ls_response';
   entries?: FsEntry[];
+  /** A controlled node's listing query matched more entries than `entries` carries. */
+  truncated?: boolean;
+  /** How many entries matched, when `truncated`. */
+  total?: number;
+  /** The order was computed over only part of the matches. */
+  partial?: boolean;
 }
 
 export interface FsReadResponse extends FsBaseResponse {

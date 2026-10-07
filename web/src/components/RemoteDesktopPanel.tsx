@@ -22,6 +22,7 @@ import {
 } from '@shared/remote-desktop.js';
 import {
   FILE_TRANSFER_DIRECTORY_CAPABILITY,
+  FILE_TRANSFER_DIRECTORY_QUERY_CAPABILITY,
   FILE_TRANSFER_DIRECTORY_PATH,
   isFileTransferWellKnownDirectoryPath,
   FILE_TRANSFER_PATH_HANDLE_CAPABILITY,
@@ -612,9 +613,13 @@ export function RemoteDesktopPanel({
   const mobileTextComposingRef = useRef(false);
   const mobileEditingKeySentRef = useRef<{ code: string; at: number } | null>(null);
   const mobileTextLastCompositionCommitRef = useRef<string | null>(null);
+  // The node can filter and order a directory itself (so a folder with
+  // thousands of files sorts by what is really newest, not by the first 512
+  // names). Without it the listing is plain and the browser works with it.
+  const supportsDirectoryQuery = Boolean(machine.capabilities?.includes(FILE_TRANSFER_DIRECTORY_QUERY_CAPABILITY));
   const machineDirectoryAdapter = useMemo(
-    () => new MachineDirectoryWsAdapter(machine.serverId),
-    [machine.serverId],
+    () => new MachineDirectoryWsAdapter(machine.serverId, { supportsQuery: supportsDirectoryQuery }),
+    [machine.serverId, supportsDirectoryQuery],
   );
   const displayModeMenuRef = useRef<HTMLDivElement | null>(null);
   // Seeded from viewport's own (possibly restored) initial value, not the
@@ -4251,6 +4256,8 @@ export function RemoteDesktopPanel({
                       hideFooter
                       hideBreadcrumbConfirm
                       quickAccess
+                      listView
+                      directoryQuery={supportsDirectoryQuery}
                       onCurrentPathChange={handleRemotePathChange}
                       onSelectedPathChange={handleRemoteSelectionChange}
                       onPreviewFile={() => {}}

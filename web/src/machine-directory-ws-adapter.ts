@@ -1,6 +1,6 @@
 import { listMachineDirectories } from './api/machines.js';
 import { ApiError } from './api.js';
-import type { ServerMessage, WsClient } from './ws-client.js';
+import type { FsListDirOptions, ServerMessage, WsClient } from './ws-client.js';
 
 type MessageListener = (message: ServerMessage) => void;
 
@@ -13,7 +13,13 @@ export class MachineDirectoryWsAdapter {
   private readonly listeners = new Set<MessageListener>();
   private readonly controllers = new Set<AbortController>();
 
-  constructor(private readonly serverId: string) {}
+  /**
+   * `supportsQuery` is whether the node advertises the directory-query
+   * capability. Only then is a `query` forwarded: the server would drop it for
+   * an older node anyway, but never sending it keeps an older server (which
+   * rejects a body with extra fields) working too.
+   */
+  constructor(private readonly serverId: string, private readonly options: { supportsQuery?: boolean } = {}) {}
 
   /**
    * Hand this to components that want a `WsClient`.
@@ -50,11 +56,12 @@ export class MachineDirectoryWsAdapter {
     return () => this.listeners.delete(listener);
   }
 
-  fsListDir(path: string): string {
+  fsListDir(path: string, _includeFiles?: boolean, _includeMetadata?: boolean, options?: FsListDirOptions): string {
     const requestId = crypto.randomUUID();
     const controller = new AbortController();
     this.controllers.add(controller);
-    void listMachineDirectories(this.serverId, path, controller.signal).then((result) => {
+    const query = this.options.supportsQuery ? options?.query : undefined;
+    void listMachineDirectories(this.serverId, path, controller.signal, query).then((result) => {
       this.emit({
         type: 'fs.ls_response',
         requestId,
@@ -62,7 +69,9 @@ export class MachineDirectoryWsAdapter {
         resolvedPath: result.resolvedPath,
         status: 'ok',
         entries: result.entries,
-      });
+        ...(result.truncated ? { truncated: true, total: result.total } : {}),
+        ...(result.partial ? { partial: true } : {}),
+      } as ServerMessage);
     }, (error) => {
       if (controller.signal.aborted) return;
       // An HTTP-level failure (4xx/5xx) throws an `ApiError` whose `.code` is

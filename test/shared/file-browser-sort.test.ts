@@ -202,3 +202,34 @@ describe('file browser view (filter, then sort, over the loaded tree)', () => {
     expect(JSON.stringify(original)).toBe(snapshot);
   });
 });
+
+describe('file browser sort and filter at scale', () => {
+  const big = (count: number): FileBrowserTreeLike[] => Array.from({ length: count }, (_, index) => file(
+    `项目-${(index * 7919) % count}-Report ${index % 13}.${['pdf', 'txt', 'zip', 'png'][index % 4]}`,
+    { size: (index * 104_729) % 9_000_000, mtimeMs: 1_700_000_000_000 + ((index * 7919) % count) * 60_000, birthtimeMs: 1_600_000_000_000 + index },
+  ));
+  const time = (label: string, run: () => unknown): number => {
+    run();
+    const started = performance.now();
+    for (let i = 0; i < 3; i += 1) run();
+    const ms = (performance.now() - started) / 3;
+    console.log(`PERF ${label}: ${ms.toFixed(1)} ms`);
+    return ms;
+  };
+
+  it('sorts and filters 10,000 and 50,000 entries without a visible stall (and linearly, not quadratically)', () => {
+    const ten = big(10_000);
+    const fifty = big(50_000);
+    const sortTen = time('sort 10k by name', () => sortFileBrowserEntries(ten, sortBy('name')));
+    time('sort 10k by modified', () => sortFileBrowserEntries(ten, sortBy('modified', 'desc')));
+    time('sort 10k by kind', () => sortFileBrowserEntries(ten, sortBy('kind')));
+    const filterTen = time('filter+sort 10k (2 words)', () => applyFileBrowserView(ten, parseFileBrowserFilter('report pdf'), sortBy('modified', 'desc'), (n) => n.name));
+    const sortFifty = time('sort 50k by name', () => sortFileBrowserEntries(fifty, sortBy('name')));
+    time('filter+sort 50k (2 words)', () => applyFileBrowserView(fifty, parseFileBrowserFilter('report pdf'), sortBy('modified', 'desc'), (n) => n.name));
+    // Generous ceilings: they catch an accidental O(n^2) or a per-comparison allocation, not machine speed.
+    expect(sortTen).toBeLessThan(1_000);
+    expect(filterTen).toBeLessThan(1_000);
+    expect(sortFifty).toBeLessThan(6_000);
+    expect(sortFifty / Math.max(sortTen, 1)).toBeLessThan(15);
+  });
+});

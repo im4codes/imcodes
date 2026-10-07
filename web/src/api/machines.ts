@@ -12,6 +12,7 @@ import {
   FILE_TRANSFER_DIRECTORY_MAX_ENTRIES,
   FILE_TRANSFER_PATH_MAX_BYTES,
   type FileDirectoryEntry,
+  type FileDirectoryListQuery,
 } from '@shared/transport/file-transfer.js';
 import {
   compareControlledNodeArtifactPairs,
@@ -189,16 +190,27 @@ export async function createMachineFileHandle(
 export interface MachineDirectoryList {
   resolvedPath: string;
   entries: FileDirectoryEntry[];
+  /** More entries matched the query than `entries` carries; only a node that answers queries says so. */
+  truncated?: true;
+  total?: number;
+  /** The order was computed over only part of the matches (stat limit / time budget). */
+  partial?: true;
+}
+
+/** A finite, non-negative number or nothing: a malformed metadata field is dropped, never shown as 0 or NaN. */
+function metadataNumber(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : undefined;
 }
 
 export async function listMachineDirectories(
   serverId: string,
   path: string,
   signal?: AbortSignal,
+  query?: FileDirectoryListQuery,
 ): Promise<MachineDirectoryList> {
-  const result = await apiFetch<{ ok?: boolean; resolvedPath?: unknown; entries?: unknown }>(
+  const result = await apiFetch<{ ok?: boolean; resolvedPath?: unknown; entries?: unknown; truncated?: unknown; total?: unknown; partial?: unknown }>(
     `/api/server/${encodeURIComponent(serverId)}/machine-file-list`,
-    { method: 'POST', body: JSON.stringify({ path }), signal },
+    { method: 'POST', body: JSON.stringify(query ? { path, query } : { path }), signal },
   );
   if (result.ok !== true
     || typeof result.resolvedPath !== 'string'
@@ -216,7 +228,23 @@ export async function listMachineDirectories(
       && typeof candidate.hidden === 'boolean';
   });
   if (entries.length !== result.entries.length) throw new Error('machine_file_list_failed');
-  return { resolvedPath: result.resolvedPath, entries };
+  const sanitized = entries.map((entry): FileDirectoryEntry => {
+    const { size, mtimeMs, birthtimeMs, ...base } = entry;
+    return {
+      ...base,
+      ...(metadataNumber(size) !== undefined ? { size: size as number } : {}),
+      ...(metadataNumber(mtimeMs) !== undefined ? { mtimeMs: mtimeMs as number } : {}),
+      ...(metadataNumber(birthtimeMs) !== undefined ? { birthtimeMs: birthtimeMs as number } : {}),
+    };
+  });
+  const total = metadataNumber(result.total);
+  const truncated = result.truncated === true && total !== undefined && Number.isSafeInteger(total);
+  return {
+    resolvedPath: result.resolvedPath,
+    entries: sanitized,
+    ...(truncated ? { truncated: true as const, total } : {}),
+    ...(truncated && result.partial === true ? { partial: true as const } : {}),
+  };
 }
 
 /**
