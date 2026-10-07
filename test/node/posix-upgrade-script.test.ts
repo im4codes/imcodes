@@ -16,6 +16,7 @@ import { buildPosixControlledNodeUpgradeScript } from '../../src/node/posix-upgr
 import { posixUpgradeHealthWaitScript } from '../../src/node/upgrade-health-script.js';
 import { reconcilePreviousUpgrade } from '../../src/node/upgrade-result.js';
 import { createHash } from 'node:crypto';
+import { FAKE_STUBS, LAUNCHCTL, SYSTEMCTL, marker } from './posix-upgrade-fakes.js';
 
 const execFileAsync = promisify(execFile);
 const sha256 = (value: string): string => createHash('sha256').update(value).digest('hex');
@@ -54,64 +55,6 @@ describe.skipIf(posixOnly)('POSIX health verdict (shared numbers with the Window
 
 // ---- the real generated script, under sh, with a virtual clock and a scripted node --------------
 
-type NodeKind = 'healthy' | 'dead' | 'nolease' | 'badlease' | 'crashloop';
-const marker = (kind: NodeKind, leaseAt = 5): string => `NODE kind=${kind} lease_at=${leaseAt}\n`;
-
-const FAKE_STUBS = {
-  date: '#!/bin/sh\ncat "$FAKE/clock"\n',
-  sleep: [
-    '#!/bin/sh',
-    'now=$(cat "$FAKE/clock"); now=$((now + $1)); echo "$now" > "$FAKE/clock"',
-    // Scripted signal: deliver $SIG to the script (our parent) once the virtual clock passes $AT.
-    'if [ -f "$FAKE/signal_at" ]; then at=$(cat "$FAKE/signal_at"); sig=$(cat "$FAKE/signal_name"); if [ "$now" -ge "$at" ]; then rm -f "$FAKE/signal_at"; kill -"$sig" "$PPID"; fi; fi',
-    'exit 0',
-    '',
-  ].join('\n'),
-};
-
-/** The fake service manager: derives the node's pid/lease from how long it has been "running". */
-const FAKE_SERVICE_MANAGER = [
-  'node_state() {',
-  '  [ -f "$FAKE/started_at" ] || { PID=0; RESTARTS=0; return; }',
-  '  started=$(cat "$FAKE/started_at"); now=$(cat "$FAKE/clock"); el=$((now - started))',
-  '  kind=$(sed -n "s/.*kind=\\([a-z]*\\).*/\\1/p" "$DST" | head -n 1); lease_at=$(sed -n "s/.*lease_at=\\([0-9]*\\).*/\\1/p" "$DST" | head -n 1)',
-  '  PID=$FAKE_PID_A; RESTARTS=0',
-  '  case "$kind" in',
-  '    dead) PID=0;;',
-  '    crashloop) RESTARTS=$((el / 5)); if [ $((RESTARTS % 2)) = 1 ]; then PID=$FAKE_PID_B; fi;;',
-  '    healthy) if [ "$el" -ge "$lease_at" ]; then printf \'{"version":1,"pid":%s,"updatedAt":%s}\\n\' "$PID" $(( (started + lease_at) * 1000 )) > "$LEASE"; fi;;',
-  '    badlease) if [ "$el" -ge "$lease_at" ]; then printf \'{"version":1,"pid":999999,"updatedAt":%s}\\n\' $(( (started + lease_at) * 1000 )) > "$LEASE"; fi;;',
-  '  esac',
-  '}',
-  'do_start() { echo "$(cat "$FAKE/clock")" > "$FAKE/started_at"; echo start >> "$FAKE/calls"; [ -f "$FAKE/on_start" ] && sh "$FAKE/on_start"; return 0; }',
-  'do_stop() { rm -f "$FAKE/started_at"; echo stop >> "$FAKE/calls"; }',
-  '',
-].join('\n');
-
-const SYSTEMCTL = `#!/bin/sh
-${FAKE_SERVICE_MANAGER}
-case "$1" in
-  stop) do_stop;;
-  start) do_start;;
-  reset-failed) echo reset-failed >> "$FAKE/calls";;
-  daemon-reload) echo daemon-reload >> "$FAKE/calls";;
-  show)
-    node_state
-    case "$3" in MainPID) echo "MainPID=$PID";; NRestarts) echo "NRestarts=$RESTARTS";; esac;;
-esac
-exit 0
-`;
-
-const LAUNCHCTL = `#!/bin/sh
-${FAKE_SERVICE_MANAGER}
-case "$1" in
-  bootout) echo "bootout $2" >> "$FAKE/calls"; case "$2" in *watchdog) ;; *) rm -f "$FAKE/started_at";; esac;;
-  bootstrap) echo "bootstrap $3" >> "$FAKE/calls";;
-  kickstart) echo "kickstart $3" >> "$FAKE/calls"; do_start;;
-  print) node_state; if [ "$PID" != "0" ]; then printf 'system/cc.imcodes.node = {\\n\\tpid = %s\\n}\\n' "$PID"; fi;;
-esac
-exit 0
-`;
 
 interface Rig {
   root: string;
@@ -214,25 +157,44 @@ function scriptFor(rig: Rig, extra: Partial<Parameters<typeof buildPosixControll
   });
 }
 
-async function run(rig: Rig, script: string, env: Record<string, string> = {}): Promise<{ code: number; stderr: string }> {
+interface RunOptions { scale?: number; env?: Record<string, string>; allowRunaway?: boolean }
+
+/**
+ * Runs the generated script. There is deliberately NO wall-clock timeout that could signal it: the script
+ * traps TERM as "stop requested" and rolls back (fail_interrupted), so a harness timeout on a slow runner
+ * used to surface as a wrong verdict. Time is virtual; the runaway guard in the sleep stub bounds a loop.
+ */
+async function run(rig: Rig, script: string, options: RunOptions = {}): Promise<{ code: number; stderr: string; runaway: boolean }> {
   const path = join(rig.root, 'upgrade.sh');
   await writeFile(path, script, { mode: 0o755 });
+  let result: { code: number; stderr: string };
   try {
     await execFileAsync('/bin/sh', [path], {
-      timeout: 60_000,
       env: {
         ...process.env,
         PATH: `${rig.bin}:${process.env.PATH ?? ''}`,
         FAKE: rig.fake, DST: rig.dst, LEASE: rig.lease,
         FAKE_PID_A: String(pidA), FAKE_PID_B: String(pidB),
-        ...env,
+        FAKE_SLEEP_SCALE: String(options.scale ?? 1),
+        ...options.env,
       },
     });
-    return { code: 0, stderr: '' };
+    result = { code: 0, stderr: '' };
   } catch (error) {
     const e = error as { code?: number | string; stderr?: string; signal?: string };
-    return { code: typeof e.code === 'number' ? e.code : -1, stderr: e.stderr ?? String(e.signal ?? '') };
+    result = { code: typeof e.code === 'number' ? e.code : -1, stderr: e.stderr ?? String(e.signal ?? '') };
   }
+  const runaway = await exists(join(rig.fake, 'runaway'));
+  if (runaway && !options.allowRunaway) throw new Error('the script never reached a verdict (runaway guard fired)');
+  return { ...result, runaway };
+}
+
+/** The recorded rollback names exactly one health verdict: assert it, not a substring of whatever text there is. */
+async function expectRollbackVerdict(rig: Rig, verdict: string): Promise<Record<string, unknown>> {
+  const result = await readResult(rig);
+  expect(result.status).toBe(S.ROLLED_BACK);
+  expect(String(result.error)).toMatch(new RegExp(`^controlled node upgrade failed authenticated health verification \\(${verdict} after \\d+s\\)$`));
+  return result;
 }
 
 const readResult = async (rig: Rig): Promise<Record<string, unknown>> => JSON.parse(await readFile(rig.resultPath, 'utf8')) as Record<string, unknown>;
@@ -247,6 +209,31 @@ async function scenario(options: { newNode?: string; oldNode?: string; platform?
   const platform = options.platform ?? 'linux';
   const script = scriptFor(rig, { artifactSha256: sha256(staged), platform, ...(options.extra ?? {}) });
   return { rig, script, staged };
+}
+
+
+/** Virtual seconds per poll multiplied for the scenarios that span the 15-minute cap: 15 polls instead of 450. */
+const HARD_CAP_SCALE = 30;
+
+/**
+ * Everything the "rolled back at the hard cap, and only then" intent says, as a list of violations (empty = holds):
+ * rolled back with exactly the hard-cap verdict, the old node is back, and the verdict came at the cap, not before
+ * and not more than two (scaled) polls after it.
+ */
+async function hardCapViolations(rig: Rig, oldBytes: string): Promise<string[]> {
+  const violations: string[] = [];
+  const result = await readResult(rig).catch(() => ({} as Record<string, unknown>));
+  if (result.status !== S.ROLLED_BACK) violations.push(`status ${String(result.status)} is not rolled_back`);
+  const verdictMatch = /\((fail_[a-z_]+|healthy) after (\d+)s\)/.exec(String(result.error ?? ''));
+  if (verdictMatch?.[1] !== 'fail_hard_cap') violations.push(`verdict ${verdictMatch?.[1] ?? 'none'} is not fail_hard_cap`);
+  const cap = H.HARD_CAP_MS / 1000;
+  const pollStep = (H.POLL_MS / 1000) * HARD_CAP_SCALE;
+  const reported = Number(verdictMatch?.[2] ?? NaN);
+  if (!(reported >= cap)) violations.push(`verdict after ${reported}s, before the ${cap}s cap`);
+  if (!(reported <= cap + 2 * pollStep)) violations.push(`verdict after ${reported}s, long after the ${cap}s cap`);
+  if ((await text(rig.dst)) !== oldBytes) violations.push('the old node was not restored');
+  if (await exists(join(rig.fake, 'runaway'))) violations.push('the script never reached a verdict (runaway)');
+  return violations;
 }
 
 describe.skipIf(posixOnly)('POSIX self-upgrade transaction (generated script under sh)', { timeout: 120_000 }, () => {
@@ -276,7 +263,7 @@ describe.skipIf(posixOnly)('POSIX self-upgrade transaction (generated script und
 
   it('a slow node (180 s to authenticate) is waited for, not rolled back', async () => {
     const { rig, script, staged } = await scenario({ newNode: marker('healthy', 180) });
-    const { code, stderr } = await run(rig, script);
+    const { code, stderr } = await run(rig, script, { scale: 10 });
     expect(code, stderr).toBe(0);
     expect(await text(rig.dst)).toBe(staged);
     expect(await readResult(rig)).toMatchObject({ status: S.SUCCESS });
@@ -286,20 +273,19 @@ describe.skipIf(posixOnly)('POSIX self-upgrade transaction (generated script und
   it('a new node that never starts is rolled back within the spawn allowance; the old node is back and the failure is recorded', async () => {
     const { rig, script } = await scenario({ newNode: marker('dead') });
     const oldBytes = await text(rig.dst);
-    const { code } = await run(rig, script);
+    const { code } = await run(rig, script, { scale: 10 });
     expect(code).toBe(1);
     expect(await text(rig.dst)).toBe(oldBytes);
     expect(JSON.parse(await text(rig.manifest))).toMatchObject({ build: { version: 'old' } });
     expect(JSON.parse(await text(rig.journal))).toMatchObject({ stagedReceipt: { sha256: 'old' } });
-    const result = await readResult(rig);
-    expect(result).toMatchObject({ status: S.ROLLED_BACK, phase: 'rollback', failedPhase: 'restart_health', targetVersion: TARGET });
-    expect(String(result.error)).toContain('fail_no_process');
+    const result = await expectRollbackVerdict(rig, 'fail_no_process');
+    expect(result).toMatchObject({ phase: 'rollback', failedPhase: 'restart_health', targetVersion: TARGET });
     expect(result.rollbackProgress).toEqual(expect.arrayContaining(['stop_new_node', 'restore_main', 'restore_manifest', 'restore_journal', 'start_previous_node']));
     expect(await rig.calls()).toEqual(['stop', 'start', 'stop', 'start']);
     expect(await exists(`${rig.dst}.upgrade-old`)).toBe(false);
     const elapsed = await elapsedVirtual(rig);
     expect(elapsed).toBeGreaterThanOrEqual(H.SPAWN_ALLOWANCE_MS / 1000);
-    expect(elapsed).toBeLessThan((H.SPAWN_ALLOWANCE_MS + 60_000) / 1000);
+    expect(elapsed).toBeLessThan((H.SPAWN_ALLOWANCE_MS + 2 * 10 * 20_000) / 1000);
     // the node reports it: a rolled_back record is a failure of exactly this target
     expect(await reconcilePreviousUpgrade({ journalPath: rig.journal, runningVersion: 'old-version', now: Date.now() }))
       .toEqual({ targetVersion: TARGET, reason: DAEMON_UPGRADE_BLOCK_REASON.INSTALL_FAILED });
@@ -311,26 +297,20 @@ describe.skipIf(posixOnly)('POSIX self-upgrade transaction (generated script und
     const { code } = await run(rig, script);
     expect(code).toBe(1);
     expect(await text(rig.dst)).toBe(oldBytes);
-    const result = await readResult(rig);
-    expect(result).toMatchObject({ status: S.ROLLED_BACK });
-    expect(String(result.error)).toContain('fail_crash_loop');
+    await expectRollbackVerdict(rig, 'fail_crash_loop');
     expect(await elapsedVirtual(rig)).toBeLessThan(H.HARD_CAP_MS / 1000 / 4);
   });
 
   it('a node that stays up but whose lease names the wrong pid is rolled back at the hard cap, and only then', async () => {
     const { rig, script } = await scenario({ newNode: marker('badlease', 3) });
     const oldBytes = await text(rig.dst);
-    expect((await run(rig, script)).code).toBe(1);
-    expect(await text(rig.dst)).toBe(oldBytes);
-    expect(String((await readResult(rig)).error)).toContain('fail_hard_cap');
-    const elapsed = await elapsedVirtual(rig);
-    expect(elapsed).toBeGreaterThanOrEqual(H.HARD_CAP_MS / 1000);
-    expect(elapsed).toBeLessThan(H.HARD_CAP_MS / 1000 + 120);
+    await run(rig, script, { scale: HARD_CAP_SCALE });
+    expect(await hardCapViolations(rig, oldBytes)).toEqual([]);
   });
 
   it('a Linux target that predates the lease is accepted once it survived the watchdog window under one pid', async () => {
     const { rig, script, staged } = await scenario({ newNode: marker('nolease') });
-    const { code, stderr } = await run(rig, script);
+    const { code, stderr } = await run(rig, script, { scale: 10 });
     expect(code, stderr).toBe(0);
     expect(await text(rig.dst)).toBe(staged);
     expect(await readResult(rig)).toMatchObject({ status: S.SUCCESS });
@@ -340,9 +320,8 @@ describe.skipIf(posixOnly)('POSIX self-upgrade transaction (generated script und
   it('the macOS script has no lease-less shortcut: an alive node that never authenticates is rolled back at the cap', async () => {
     const { rig, script } = await scenario({ newNode: marker('nolease'), platform: 'darwin', extra: { serviceDefinitionPaths: [] } });
     const oldBytes = await text(rig.dst);
-    expect((await run(rig, script)).code).toBe(1);
-    expect(await text(rig.dst)).toBe(oldBytes);
-    expect(String((await readResult(rig)).error)).toContain('fail_hard_cap');
+    await run(rig, script, { scale: HARD_CAP_SCALE });
+    expect(await hardCapViolations(rig, oldBytes)).toEqual([]);
   });
 
   it('a stop request (SIGTERM) during the health wait rolls back instead of leaving the new node unverified', async () => {
@@ -353,9 +332,7 @@ describe.skipIf(posixOnly)('POSIX self-upgrade transaction (generated script und
     const { code } = await run(rig, script);
     expect(code).toBe(1);
     expect(await text(rig.dst)).toBe(oldBytes);
-    const result = await readResult(rig);
-    expect(result).toMatchObject({ status: S.ROLLED_BACK });
-    expect(String(result.error)).toContain('fail_interrupted');
+    await expectRollbackVerdict(rig, 'fail_interrupted');
   });
 
   it('a script killed outright (SIGKILL / reboot) leaves in_progress and the rollback images; a re-run adopts them, and the node reconciles the record', async () => {
@@ -512,5 +489,28 @@ describe.skipIf(posixOnly)('POSIX self-upgrade transaction (generated script und
     expect((await run(rig, script)).code).toBe(0);
     expect(await text(rig.unit)).toBe(before);
     expect(script).not.toMatch(/systemctl (enable|disable|edit|mask)/);
+  });
+});
+
+// ---- mutation guard: the hard-cap assertions must FAIL when the logic they protect is broken -----
+
+describe.skipIf(posixOnly)('mutation guard for the hard-cap behaviour', { timeout: 120_000 }, () => {
+  const capLine = `  if [ "$1" -ge ${H.HARD_CAP_MS} ]; then echo fail_hard_cap; return 0; fi`;
+  const leasePidLine = `  [ "$lease_pid" = "$(imcodes_service_pid)" ] || return 1`;
+  const mutants: Array<[string, (script: string) => string]> = [
+    ['the cap fires after 5 minutes instead of 15', (script) => script.replace(capLine, capLine.replace(String(H.HARD_CAP_MS), '300000'))],
+    ['there is no hard cap at all (the wait would never end)', (script) => script.replace(`${capLine}\n`, '')],
+    ['the cap is reported as a different verdict', (script) => script.replace(capLine, capLine.replace('echo fail_hard_cap', 'echo fail_interrupted'))],
+    ['a lease naming a pid that is not the service pid is accepted', (script) => script.replace(`${leasePidLine}\n`, '')],
+  ];
+  it.each(mutants)('is caught when %s', async (_name, mutate) => {
+    const { rig, script } = await scenario({ newNode: marker('badlease', 3) });
+    expect(script).toContain(capLine);
+    expect(script).toContain(leasePidLine);
+    const mutated = mutate(script);
+    expect(mutated).not.toBe(script);
+    const oldBytes = await text(rig.dst);
+    await run(rig, mutated, { scale: HARD_CAP_SCALE, allowRunaway: true });
+    expect(await hardCapViolations(rig, oldBytes)).not.toEqual([]);
   });
 });
