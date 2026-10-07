@@ -2037,4 +2037,24 @@ describe('recovered Windows upgrade failure reporting', () => {
     expect(readPreviousUpgradeFailure).toHaveBeenCalledTimes(1);
     runtime.stop();
   });
+
+  it.each([
+    DAEMON_UPGRADE_BLOCK_REASON.ROLLBACK_INTERRUPTED,
+    DAEMON_UPGRADE_BLOCK_REASON.ROLLBACK_FAILED,
+  ])('reports an abandoned or failed rollback under its own reason (%s), not as a plain install failure', async (reason) => {
+    const socket = new MockSocket();
+    const readPreviousUpgradeFailure = vi.fn(async () => ({ targetVersion: '2026.9.4544-dev.5197', reason }));
+    const runtime = createControlledNodeRuntime({
+      serverUrl: 'https://im.example', serverId: 'controlled-1', token: 'secret', nodeRole: NODE_ROLE.CONTROLLED,
+    }, () => socket, { platform: 'win32', readPreviousUpgradeFailure });
+    runtime.start();
+    socket.open();
+    socket.emit('message', JSON.stringify({ type: 'heartbeat_ack' }));
+    await vi.waitFor(() => expect(socket.sent.map(JSON.parse)).toContainEqual({
+      type: DAEMON_MSG.UPGRADE_BLOCKED,
+      reason,
+      targetVersion: '2026.9.4544-dev.5197',
+    }));
+    runtime.stop();
+  });
 });

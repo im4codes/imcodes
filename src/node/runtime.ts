@@ -342,7 +342,7 @@ export interface ControlledNodeRuntimeOptions {
   /** Called for every authenticated server heartbeat acknowledgement. */
   onHeartbeatAck?: () => void | Promise<void>;
   /** Reads one durable failed Windows one-shot upgrade after rollback. */
-  readPreviousUpgradeFailure?: () => Promise<{ targetVersion: string } | null>;
+  readPreviousUpgradeFailure?: () => Promise<{ targetVersion: string; reason?: string } | null>;
   /**
    * Pure observability seam (test injection only in production it always
    * defaults to the process-wide singleton). Never used for any
@@ -929,7 +929,7 @@ export function createControlledNodeRuntime(
       if (!failure) return;
       client.send({
         type: DAEMON_MSG.UPGRADE_BLOCKED,
-        reason: DAEMON_UPGRADE_BLOCK_REASON.INSTALL_FAILED,
+        reason: failure.reason ?? DAEMON_UPGRADE_BLOCK_REASON.INSTALL_FAILED,
         targetVersion: failure.targetVersion,
       });
     }).catch(() => {

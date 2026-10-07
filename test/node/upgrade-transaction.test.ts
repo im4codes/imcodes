@@ -237,3 +237,47 @@ describe('Windows controlled-node interrupted upgrade recovery', () => {
     await expect(loadInstallJournal(state.journalPath)).rejects.toThrow();
   });
 });
+
+describe('Windows controlled-node upgrade success record (written by the node)', () => {
+  const resultPath = (dir: string) => join(dir, 'last-upgrade-result.json');
+
+  it('records success for the target BEFORE it deletes the upgrade task, replacing a stale rollback record', async () => {
+    const state = await setup('target', 'target');
+    await writeFile(resultPath(state.dir), JSON.stringify({
+      status: 'rollback_started', phase: 'rollback', failedPhase: 'restart_health', targetVersion: '2026.9.0', recordedAt: 1,
+    }));
+    let resultWhenTaskDeleted: Record<string, unknown> | null = null;
+    const cleanupTask = vi.fn(async () => {
+      resultWhenTaskDeleted = JSON.parse(await readFile(resultPath(state.dir), 'utf8'));
+    });
+    await expect(finalizeWindowsUpgradeTransaction({
+      journal: state.journal, journalPath: state.journalPath, executablePath: state.exePath, cleanupTask, now: 1234,
+    })).resolves.toBe(true);
+    // The one-shot task hosts the script that used to be the only writer of success: deleting it first
+    // is exactly how the stale record survived a successful upgrade.
+    expect(resultWhenTaskDeleted).toMatchObject({ status: 'success', targetVersion: '2026.9.1', recordedBy: 'node', completedAt: 1234 });
+    expect(JSON.parse(await readFile(resultPath(state.dir), 'utf8'))).toMatchObject({ status: 'success', targetVersion: '2026.9.1' });
+  });
+
+  it('records nothing when the executable is not the transaction target (a rollback must not look like success)', async () => {
+    const state = await setup('old', 'old');
+    await writeFile(resultPath(state.dir), JSON.stringify({ status: 'in_progress', targetVersion: '2026.9.1', recordedAt: 1 }));
+    await expect(finalizeWindowsUpgradeTransaction({
+      journal: state.journal, journalPath: state.journalPath, executablePath: state.exePath, now: 5,
+    })).resolves.toBe(false);
+    expect(JSON.parse(await readFile(resultPath(state.dir), 'utf8')).status).toBe('in_progress');
+  });
+
+  it('still finishes the cleanup when the result file cannot be written', async () => {
+    const state = await setup('target', 'target');
+    // A directory where the file belongs: the write fails, the finalize must not.
+    const { mkdir } = await import('node:fs/promises');
+    await mkdir(resultPath(state.dir));
+    const cleanupTask = vi.fn();
+    await expect(finalizeWindowsUpgradeTransaction({
+      journal: state.journal, journalPath: state.journalPath, executablePath: state.exePath, cleanupTask,
+    })).resolves.toBe(true);
+    expect(cleanupTask).toHaveBeenCalledTimes(1);
+  });
+});
+

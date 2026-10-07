@@ -104,6 +104,10 @@ export const DAEMON_UPGRADE_BLOCK_REASON = {
   COMPRESSION_ACTIVE: 'compression_active',
   /** The daemon's own opt-out (config `daemon.autoUpgrade=false` or env) refused a source:auto upgrade. */
   AUTO_UPGRADE_DISABLED: 'auto_upgrade_disabled',
+  /** A controlled node found its own rollback script dead before it finished. */
+  ROLLBACK_INTERRUPTED: 'rollback_interrupted',
+  /** A controlled node's rollback finished with failures: it may be running an unexpected build. */
+  ROLLBACK_FAILED: 'rollback_failed',
 } as const;
 
 /**

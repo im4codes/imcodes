@@ -21,6 +21,8 @@ import { DAEMON_UPGRADE_TARGET_LATEST, normalizeDaemonUpgradeTargetVersion } fro
 import { isTransientRequestFailure } from '../../shared/request-failure.js';
 import { compareImcodesVersions } from '../../shared/imcodes-version.js';
 import {
+  CONTROLLED_NODE_UPGRADE_RESULT_FILE,
+  CONTROLLED_NODE_UPGRADE_RESULT_STATUS,
   CONTROLLED_NODE_WINDOWS_RELEASE_TRUST_PREFLIGHT_FAILURE,
   CONTROLLED_NODE_WINDOWS_RELEASE_MANIFEST_PREFLIGHT_FAILURE,
   CONTROLLED_NODE_WINDOWS_UPGRADE_PREFLIGHT_FAILED,
@@ -63,6 +65,9 @@ import {
   windowsPowerShellExecutablePath,
 } from './installer.js';
 import { defaultCredentialPath, defaultStagedExecutablePath, type ControlledNodeCredential } from './enrollment.js';
+import { windowsUpgradeHealthWaitScript } from './upgrade-health-script.js';
+import { reconcilePreviousUpgrade, type PreviousUpgradeFailure } from './upgrade-result.js';
+import { DAEMON_VERSION } from '../util/version.js';
 import { loadInstallJournal, INSTALL_JOURNAL_VERSION } from './install-journal.js';
 import { WINDOWS_COMPILED_RELEASE_SIGNER_SHA256 } from './windows-artifact-trust.js';
 import { verifyRemoteDesktopWorkerArtifact } from './remote-desktop-worker-host.js';
@@ -83,20 +88,19 @@ const CONTROLLED_NODE_ARTIFACT_IO_BUFFER_BYTES = 64 * 1024;
 const execFileAsync = promisify(execFile);
 
 /**
- * Rollback runs outside the node process, so the old generation reports the
- * durable result after it reconnects. Only a completed authenticated-health
- * rollback for a concrete version is terminal; malformed/stale diagnostics
- * remain inert.
+ * Rollback runs outside the node process, so the node reports the durable result
+ * after it reconnects. See reconcilePreviousUpgrade for what each recorded state
+ * amounts to (including an upgrade/rollback script that died without a terminal
+ * state, and a stale record next to a node that is in fact running the target).
  */
-export async function readPreviousWindowsUpgradeFailure(journalPath: string): Promise<{ targetVersion: string } | null> {
+export async function readPreviousWindowsUpgradeFailure(
+  journalPath: string,
+  runningVersion: string = DAEMON_VERSION,
+  now: number = Date.now(),
+): Promise<PreviousUpgradeFailure | null> {
   if (process.platform !== 'win32') return null;
   try {
-    const raw = JSON.parse(await readFile(join(dirname(journalPath), 'last-upgrade-result.json'), 'utf8')) as Record<string, unknown>;
-    if (raw.status !== 'rolled_back' || raw.failedPhase !== 'restart_health' || typeof raw.targetVersion !== 'string') return null;
-    const targetVersion = raw.targetVersion.trim();
-    return /^[0-9]+(?:\.[0-9]+){1,3}(?:-[0-9A-Za-z]+(?:\.[0-9A-Za-z]+)*)?$/.test(targetVersion)
-      ? { targetVersion }
-      : null;
+    return await reconcilePreviousUpgrade({ journalPath, runningVersion, now });
   } catch {
     return null;
   }
@@ -1377,7 +1381,7 @@ export function buildWindowsControlledNodeUpgradeScript(input: {
       : '')
     + `$upgradeResult = "$src.upgrade-result.json"\r\n`
     + `Remove-Item -Force $upgradeResult -ErrorAction SilentlyContinue\r\n`
-    + `$persistentUpgradeResult = Join-Path (Split-Path -Parent $dst) 'last-upgrade-result.json'\r\n`
+    + `$persistentUpgradeResult = Join-Path (Split-Path -Parent $dst) '${CONTROLLED_NODE_UPGRADE_RESULT_FILE}'\r\n`
     + `$upgradeResultPersisted = $false\r\n`
     + `$mainArtifactVerified = $false\r\n`
     + `$helperArtifactVerified = $false\r\n`
@@ -1399,6 +1403,7 @@ export function buildWindowsControlledNodeUpgradeScript(input: {
     + `    return $true\r\n`
     + `  } finally { Remove-Item -Force -LiteralPath $persistentUpgradeResultTemp -ErrorAction SilentlyContinue }\r\n`
     + `}\r\n`
+    + windowsUpgradeHealthWaitScript()
     + `$upgradePhase = 'preflight'\r\n`
     + `$healthLease = Join-Path (Split-Path -Parent $dst) 'health-lease.json'\r\n`
     + `$upgradeMarker = Join-Path (Split-Path -Parent $dst) ${psQuote(WINDOWS_UPGRADE_MARKER_NAME)}\r\n`
@@ -1421,25 +1426,35 @@ export function buildWindowsControlledNodeUpgradeScript(input: {
     + remoteDesktopVariables
     + journalVariables
     + `$recoveryFailures = [System.Collections.Generic.List[string]]::new()\r\n`
-    + `$runRecovery = { param([string]$label,[scriptblock]$action) try { & $action } catch { $recoveryFailure = ('{0}: {1}' -f $label, [string]$_.Exception.Message); if ($recoveryFailure.Length -gt 240) { $recoveryFailure = $recoveryFailure.Substring(0, 240) }; [void]$recoveryFailures.Add($recoveryFailure) } }\r\n`
+    + `$rollbackProgress = [System.Collections.Generic.List[string]]::new()\r\n`
+    + `$runRecovery = { param([string]$label,[scriptblock]$action) try { & $action; [void]$rollbackProgress.Add($label); try { [void](& $writeUpgradeResult @{ status = '${CONTROLLED_NODE_UPGRADE_RESULT_STATUS.ROLLBACK_STARTED}'; phase = 'rollback'; failedPhase = $upgradePhase; error = $failureMessage; reason = $failureMessage; rollbackProgress = @($rollbackProgress) }) } catch { } } catch { $recoveryFailure = ('{0}: {1}' -f $label, [string]$_.Exception.Message); if ($recoveryFailure.Length -gt 240) { $recoveryFailure = $recoveryFailure.Substring(0, 240) }; [void]$recoveryFailures.Add($recoveryFailure) } }\r\n`
     + `$waitForNodeExecutableRelease = { param([int]$timeoutMs = 30000)\r\n`
     + `  $deadline = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() + $timeoutMs\r\n`
+    + `  $passes = 0\r\n`
     + `  do {\r\n`
-    + `    $matchingProcesses = @(Get-CimInstance Win32_Process -Filter 'name="imcodes-node.exe"' -ErrorAction SilentlyContinue | Where-Object { $_.ExecutablePath -and [string]::Equals($_.ExecutablePath, $dst, [StringComparison]::OrdinalIgnoreCase) })\r\n`
-    + `    foreach ($matchingProcess in $matchingProcesses) { Stop-Process -Id $matchingProcess.ProcessId -Force -ErrorAction SilentlyContinue }\r\n`
+    + `    $passes++\r\n`
+    // Get-Process, not WMI: a single WMI query took 3 minutes on a loaded real node, blowing the whole
+    // deadline in one pass and failing a stop that had in fact succeeded.
+    + `    $matchingProcesses = @(Get-Process -Name imcodes-node -ErrorAction SilentlyContinue | Where-Object { $_.Path -and [string]::Equals($_.Path, $dst, [StringComparison]::OrdinalIgnoreCase) })\r\n`
+    + `    foreach ($matchingProcess in $matchingProcesses) { Stop-Process -Id $matchingProcess.Id -Force -ErrorAction SilentlyContinue }\r\n`
     + `    $exclusiveHandle = $null\r\n`
     + `    try {\r\n`
     + `      if (Test-Path -LiteralPath $dst) { $exclusiveHandle = [IO.File]::Open($dst, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None) }\r\n`
     + `      if ($matchingProcesses.Count -eq 0) { return }\r\n`
     + `    } catch [IO.IOException] { } finally { if ($exclusiveHandle) { $exclusiveHandle.Dispose() } }\r\n`
     + `    [Threading.Thread]::Sleep(250)\r\n`
-    + `  } while ([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() -lt $deadline)\r\n`
+    // Always one verification pass AFTER the kill, however slow the first pass was.
+    + `  } while ($passes -lt 2 -or [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() -lt $deadline)\r\n`
     + `  throw 'controlled node executable remained locked after stop'\r\n`
     + `}\r\n`
     + releasePreflightGuard
     + `$upgradePhase = 'install'\r\n`
     + `try {\r\n`
     + transactionIntent
+    // The previous attempt's outcome is replaced the moment this one begins: a
+    // stale rolled_back/rollback_started record must never outlive a transaction
+    // that has since succeeded, and `in_progress` is what a killed script leaves.
+    + `try { [void](& $writeUpgradeResult @{ status = '${CONTROLLED_NODE_UPGRADE_RESULT_STATUS.IN_PROGRESS}'; phase = 'install' }) } catch { Write-Warning 'IMCODES_UPGRADE_RESULT_PERSIST_FAILED phase=in_progress' }\r\n`
     + `$rollbackMainHash = $currentMainHash\r\n`
     + `try { $durableTransaction = Get-Content -LiteralPath $upgradeMarker -Raw | ConvertFrom-Json; if ([int]$durableTransaction.version -eq ${CONTROLLED_NODE_WINDOWS_UPGRADE_TRANSACTION_VERSION} -and [string]$durableTransaction.previousReceipt.sha256 -cmatch '^[a-f0-9]{64}$') { $rollbackMainHash = [string]$durableTransaction.previousReceipt.sha256 } } catch { }\r\n`
     + `Stop-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue\r\n`
@@ -1478,17 +1493,9 @@ export function buildWindowsControlledNodeUpgradeScript(input: {
     + `$upgradeStartedAt = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()\r\n`
     + `$upgradePhase = 'restart_health'\r\n`
     + `Start-ScheduledTask -TaskName $task\r\n`
-    + `for ($attempt = 0; $attempt -lt 60 -and -not $healthy; $attempt++) {\r\n`
-    + `  Start-Sleep -Seconds 2\r\n`
-    + `  try {\r\n`
-    + `    $lease = Get-Content -LiteralPath $healthLease -Raw | ConvertFrom-Json\r\n`
-    + `    if ([int64]$lease.updatedAt -ge $upgradeStartedAt -and [int]$lease.pid -gt 0) {\r\n`
-    + `      $process = Get-CimInstance Win32_Process -Filter ("ProcessId=" + [int]$lease.pid) -ErrorAction SilentlyContinue\r\n`
-    + `      $healthy = $process -and $process.ExecutablePath -and [string]::Equals($process.ExecutablePath, $dst, [StringComparison]::OrdinalIgnoreCase)\r\n`
-    + `    }\r\n`
-    + `  } catch { $healthy = $false }\r\n`
-    + `}\r\n`
-    + `if (-not $healthy) { throw 'controlled node upgrade failed authenticated health verification' }\r\n`
+    + `$healthResult = Wait-IMCodesNodeHealthy -LeasePath $healthLease -NodePath $dst -StartedAtMs $upgradeStartedAt\r\n`
+    + `$healthy = [bool]$healthResult.Healthy\r\n`
+    + `if (-not $healthy) { throw ('controlled node upgrade failed authenticated health verification (' + [string]$healthResult.Verdict + ' after ' + [int]([int64]$healthResult.ElapsedMs / 1000) + 's)') }\r\n`
     + `$transactionTerminal = $true\r\n`
     + `Remove-Item -Force $backupDst,$backupManifest -ErrorAction SilentlyContinue\r\n`
     + helperCleanup

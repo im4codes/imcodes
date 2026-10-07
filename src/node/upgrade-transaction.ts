@@ -10,6 +10,8 @@ import {
 } from '../../shared/controlled-node-service.js';
 import type { StagedExecutableReceipt } from './enrollment.js';
 import { loadInstallJournal, writeInstallPhase, type InstallJournal } from './install-journal.js';
+import { writeUpgradeResult } from './upgrade-result.js';
+import { CONTROLLED_NODE_UPGRADE_RESULT_STATUS } from '../../shared/controlled-node-service.js';
 
 export interface WindowsUpgradeTransaction {
   version: typeof CONTROLLED_NODE_WINDOWS_UPGRADE_TRANSACTION_VERSION;
@@ -238,6 +240,8 @@ export async function finalizeWindowsUpgradeTransaction(input: {
   journalPath: string;
   executablePath: string;
   cleanupTask?: (taskName: string) => void | Promise<void>;
+  /** Test seam for the success timestamp. */
+  now?: number;
 }): Promise<boolean> {
   const markerPath = join(dirname(input.executablePath), CONTROLLED_NODE_WINDOWS_UPGRADE_TRANSACTION_FILE);
   let transaction: WindowsUpgradeTransaction | null = null;
@@ -247,6 +251,21 @@ export async function finalizeWindowsUpgradeTransaction(input: {
     || input.journal.stagedReceipt?.sha256 !== transaction.targetReceipt.sha256) return false;
   const current = await sha256File(input.executablePath);
   if (!matches(current, transaction.targetReceipt)) return false;
+  // The node, not the upgrade script, is the authority for success. Cleanup below
+  // deletes the one-shot task the script runs in, so the script can be gone before
+  // it writes its own `success`; the record would then keep an old rollback and
+  // report a long-installed target as failed at the next start. Written BEFORE the
+  // cleanup, and a write failure must not leave the rollback authority half-deleted
+  // either way: the record is repaired from the running version on the next start.
+  const completedAt = input.now ?? Date.now();
+  await writeUpgradeResult(input.journalPath, {
+    status: CONTROLLED_NODE_UPGRADE_RESULT_STATUS.SUCCESS,
+    phase: 'complete',
+    targetVersion: transaction.targetVersion,
+    completedAt,
+    recordedAt: completedAt,
+    recordedBy: 'node',
+  }).catch(() => {});
   await cleanupCompletedTransaction(markerPath, transaction, input.cleanupTask);
   return true;
 }

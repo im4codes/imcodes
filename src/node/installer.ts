@@ -16,6 +16,7 @@ import { dirname, join, win32 } from 'node:path';
 import type { ServiceReceipt } from './install-journal.js';
 import {
   CONTROLLED_NODE_SERVICE,
+  CONTROLLED_NODE_WATCHDOG_REENABLE_DISABLED_TASK,
   CONTROLLED_NODE_WINDOWS_UPGRADE_TASK_PREFIX,
   CONTROLLED_NODE_WINDOWS_UPGRADE_PRODUCT,
   CONTROLLED_NODE_WINDOWS_UPGRADE_TRANSACTION_FILE,
@@ -249,6 +250,7 @@ export function windowsControlledNodeHealthWatchdogScript(exePath: string): stri
     + `$staleSeconds = ${WINDOWS_HEALTH_STALE_SECONDS}\r\n`
     + `$minimumConfirmMs = 45000\r\n`
     + `$resumeGapMs = 120000\r\n`
+    + `$reenableDisabledTask = ${CONTROLLED_NODE_WATCHDOG_REENABLE_DISABLED_TASK ? '$true' : '$false'}\r\n`
     + `function Write-HealthLog([string]$message) {\r\n`
     + `  if ((Test-Path -LiteralPath $logPath) -and (Get-Item -LiteralPath $logPath).Length -gt 2MB) { Move-Item -Force -LiteralPath $logPath -Destination ($logPath + '.1') }\r\n`
     + `  Add-Content -LiteralPath $logPath -Encoding UTF8 -Value (('{0} {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $message))\r\n`
@@ -306,11 +308,32 @@ export function windowsControlledNodeHealthWatchdogScript(exePath: string): stri
     + `    exit 0\r\n`
     + `  }\r\n`
     + `}\r\n`
+    // A restart that cannot work must not be attempted every two minutes forever:
+    // a node task that something outside the product disabled (or removed) used to
+    // fail `Start-ScheduledTask` silently each time, filling the log with
+    // restart_begin lines while the node stayed offline for hours.
+    + `$nodeTaskInfo = Get-ScheduledTask -TaskName $nodeTask -ErrorAction SilentlyContinue\r\n`
+    + `$taskBlock = $null\r\n`
+    + `if (-not $nodeTaskInfo) { $taskBlock = 'task_missing' } elseif ([int]$nodeTaskInfo.State -eq 1 -or $nodeTaskInfo.Settings.Enabled -eq $false) { $taskBlock = 'task_disabled' }\r\n`
+    + `if ($taskBlock -eq 'task_disabled' -and $reenableDisabledTask) {\r\n`
+    + `  try { Enable-ScheduledTask -TaskName $nodeTask -ErrorAction Stop | Out-Null; Write-HealthLog 'task_disabled_reenabled'; $taskBlock = $null } catch { $enableFailure = [string]$_.Exception.Message; if ($enableFailure.Length -gt 200) { $enableFailure = $enableFailure.Substring(0, 200) }; if (-not ($previousValid -and [string]$previousState.reason -ceq 'task_disabled')) { Write-HealthLog ('task_enable_failed {0}' -f $enableFailure) } }\r\n`
+    + `}\r\n`
+    + `if ($taskBlock) {\r\n`
+    + `  if (-not ($previousValid -and [string]$previousState.reason -ceq $taskBlock)) { Write-HealthLog ('restart_blocked reason={0}' -f $taskBlock) }\r\n`
+    + `  Write-WatchdogState $taskBlock 0 $nowMs\r\n`
+    + `  exit 0\r\n`
+    + `}\r\n`
     + `Write-HealthLog ('restart_begin reason={0} pid={1}' -f $reason, $(if ($process) { $process.ProcessId } else { 0 }))\r\n`
     + `Stop-ScheduledTask -TaskName $nodeTask -ErrorAction SilentlyContinue\r\n`
     + `if ($process) { Stop-Process -Id $process.ProcessId -Force -ErrorAction SilentlyContinue }\r\n`
     + `Start-Sleep -Seconds 2\r\n`
-    + `Start-ScheduledTask -TaskName $nodeTask\r\n`
+    + `try { Start-ScheduledTask -TaskName $nodeTask -ErrorAction Stop } catch {\r\n`
+    + `  $startFailure = [string]$_.Exception.Message\r\n`
+    + `  if ($startFailure.Length -gt 200) { $startFailure = $startFailure.Substring(0, 200) }\r\n`
+    + `  if (-not ($previousValid -and [string]$previousState.reason -ceq 'start_failed')) { Write-HealthLog ('restart_failed {0}' -f $startFailure) }\r\n`
+    + `  Write-WatchdogState 'start_failed' 0 $nowMs\r\n`
+    + `  exit 0\r\n`
+    + `}\r\n`
     + `Remove-Item -Force -LiteralPath $statePath -ErrorAction SilentlyContinue\r\n`
     + `Write-HealthLog 'restart_requested'\r\n`;
 }

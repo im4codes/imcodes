@@ -1135,6 +1135,28 @@ describe('WsBridge', () => {
       expect(bridge.getControlledNodeUpgradeStatus()).toMatchObject({ status: 'upgrading' });
     });
 
+    it.each([
+      DAEMON_UPGRADE_BLOCK_REASON.ROLLBACK_INTERRUPTED,
+      DAEMON_UPGRADE_BLOCK_REASON.ROLLBACK_FAILED,
+    ])('treats a node-reported %s as a failure of that target with the normal backoff', async (reason) => {
+      vi.useFakeTimers();
+      process.env.APP_VERSION = '2026.7.1234-dev.5';
+      const bridge = WsBridge.get(serverId);
+      const ws = new MockWs();
+      await authControlled(ws);
+      await vi.advanceTimersByTimeAsync(STAGGER_MS);
+      expect(upgradeFrames(ws)).toHaveLength(1);
+      ws.emit('message', JSON.stringify({ type: DAEMON_MSG.UPGRADE_BLOCKED, reason, targetVersion: process.env.APP_VERSION }));
+      await flushAsync();
+      expect(bridge.getControlledNodeUpgradeStatus()).toMatchObject({ status: 'failed', reason });
+      await vi.advanceTimersByTimeAsync(9 * 60_000);
+      await flushAsync();
+      expect(upgradeFrames(ws)).toHaveLength(1);
+      await vi.advanceTimersByTimeAsync(2 * 60_000);
+      await flushAsync();
+      expect(upgradeFrames(ws)).toHaveLength(2);
+    });
+
     it('offers the target again when a node that was sent an upgrade reconnects still on the old version', async () => {
       vi.useFakeTimers();
       process.env.APP_VERSION = '2026.7.1234-dev.5';

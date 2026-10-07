@@ -5,6 +5,7 @@ import {
   rm,
   stat,
 } from 'node:fs/promises';
+import { CONTROLLED_NODE_UPGRADE_HEALTH } from '../../shared/controlled-node-service.js';
 import { dirname, join, win32, posix } from 'node:path';
 import { redactObject, type Redactable } from '../../shared/logging/redact.js';
 import { windowsCredentialDir } from './installer.js';
@@ -31,8 +32,12 @@ export const STARTUP_DIAGNOSTICS_MAX_FILES = 3;
 export const STARTUP_DIAGNOSTICS_MAX_AGE_MS = 14 * 24 * 60 * 60_000;
 export const STARTUP_DIAGNOSTICS_RETRY_MS = 30_000;
 export const STARTUP_DIAGNOSTICS_QUEUE_CAPACITY = 512;
-/** Matches the real incident: the server's authenticated-health gate. */
-export const STARTUP_DIAGNOSTICS_HEALTH_LEASE_TIMEOUT_MS = 120_000;
+/**
+ * Marks a slow start in the log: no authenticated lease within the upgrade's BASE
+ * health window. It is evidence, not a verdict — the upgrade keeps waiting for a
+ * node that is still starting, up to CONTROLLED_NODE_UPGRADE_HEALTH.HARD_CAP_MS.
+ */
+export const STARTUP_DIAGNOSTICS_HEALTH_LEASE_TIMEOUT_MS = CONTROLLED_NODE_UPGRADE_HEALTH.BASE_WINDOW_MS;
 
 export const STARTUP_DIAGNOSTIC_EVENT = {
   PROCESS_START: 'process_start',

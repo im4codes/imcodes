@@ -6,6 +6,7 @@ import { execFile, spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { promisify } from 'node:util';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { CONTROLLED_NODE_UPGRADE_HEALTH } from '../../shared/controlled-node-service.js';
 import { NODE_ROLE } from '../../shared/remote-exec.js';
 import { REMOTE_DESKTOP_PROTOCOL_VERSION } from '../../shared/remote-desktop.js';
 import {
@@ -1134,8 +1135,9 @@ describe('controlled-node self-upgrade', () => {
     expect(script).toContain("status = 'preflight_failed'; phase = 'preflight'");
     expect(script).toContain("status = 'success'; phase = 'complete'");
     expect(script).toContain("status = $rollbackStatus; phase = 'rollback'");
-    expect(script.match(/error = \$failureMessage/g)).toHaveLength(3);
-    expect(script.match(/failedPhase = \$upgradePhase/g)).toHaveLength(2);
+    // preflight, rollback progress (per step), rollback_started, rollback terminal
+    expect(script.match(/error = \$failureMessage/g)).toHaveLength(4);
+    expect(script.match(/failedPhase = \$upgradePhase/g)).toHaveLength(3);
     expect(script).toContain("$upgradePhase = 'restart_health'");
     expect(script).toContain('if ($recoveryFailure.Length -gt 240)');
     const preflightPersist = script.indexOf("status = 'preflight_failed'; phase = 'preflight'");
@@ -1143,6 +1145,43 @@ describe('controlled-node self-upgrade', () => {
     expect(preflightPersist).toBeGreaterThan(0);
     expect(preflightCleanup).toBeGreaterThan(preflightPersist);
     expect(script).not.toContain('IMCODES_UPGRADE_CLEANUP_SKIPPED');
+  });
+
+  it('records the attempt as in_progress, waits for health with the progress-aware window, and journals every rollback step', () => {
+    const script = buildWindowsControlledNodeUpgradeScript({
+      stagedArtifactPath: 'C:\\Windows\\Temp\\imcodes-node-upgrade-ABC123\\imcodes-node.exe',
+      stagedManifestPath: 'C:\\Windows\\Temp\\imcodes-node-upgrade-ABC123\\imcodes-node.exe.manifest.json',
+      destinationPath: 'C:\\ProgramData\\imcodes-node\\imcodes-node.exe',
+      destinationManifestPath: 'C:\\ProgramData\\imcodes-node\\imcodes-node.exe.manifest.json',
+      targetVersion: '2026.9.9999',
+      artifactSha256: 'd'.repeat(64),
+      upgradeTaskName: 'imcodes-node-upgrade-test',
+    });
+
+    // The old fixed 60 x 2 s poll from Start-ScheduledTask is gone.
+    expect(script).not.toMatch(/\$attempt\s*-lt\s*60/);
+    expect(script).toContain('function Get-IMCodesUpgradeHealthVerdict');
+    expect(script).toContain(`-ge ${CONTROLLED_NODE_UPGRADE_HEALTH.HARD_CAP_MS}`);
+    const start = script.indexOf('Start-ScheduledTask -TaskName $task\r\n');
+    expect(start).toBeGreaterThan(0);
+    expect(script.indexOf('Wait-IMCodesNodeHealthy -LeasePath $healthLease', start)).toBeGreaterThan(start);
+
+    // A killed script leaves `in_progress` (target named) instead of the previous attempt's outcome,
+    // and it is written before anything is stopped or replaced.
+    const inProgress = script.indexOf("status = 'in_progress'; phase = 'install'");
+    expect(inProgress).toBeGreaterThan(0);
+    expect(inProgress).toBeLessThan(script.indexOf('Stop-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue\r\n& $waitForNodeExecutableRelease\r\n'));
+    expect(inProgress).toBeLessThan(script.indexOf("$upgradePhase = 'restart_health'"));
+
+    // Every completed rollback step is persisted, so an interrupted rollback says how far it got.
+    expect(script).toContain('$rollbackProgress = [System.Collections.Generic.List[string]]::new()');
+    expect(script).toMatch(/& \$action; \[void\]\$rollbackProgress\.Add\(\$label\); try \{ \[void\]\(& \$writeUpgradeResult @\{ status = 'rollback_started'; phase = 'rollback'; failedPhase = \$upgradePhase; error = \$failureMessage; reason = \$failureMessage; rollbackProgress = @\(\$rollbackProgress\)/);
+    // Neither wait asks WMI (3 minutes for one query on a loaded real node) and the executable-release
+    // wait always makes a verification pass after the kill, however slow the first pass was.
+    expect(script).not.toContain('Get-CimInstance');
+    expect(script).toContain('while ($passes -lt 2 -or [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() -lt $deadline)');
+    // The failure text names the verdict so the diagnosis is not just "failed health verification".
+    expect(script).toContain("'controlled node upgrade failed authenticated health verification ('");
   });
 
   it('scavenges only old direct owned non-reparse staging directories and preserves live/new/unowned entries', async () => {
@@ -1528,7 +1567,8 @@ describe('controlled-node self-upgrade', () => {
     expect(script.indexOf("Unregister-ScheduledTask -TaskName 'imcodes-node-upgrade-test'"))
       .toBeLessThan(script.indexOf('Stop-ScheduledTask -TaskName $task'));
     expect(script).toContain('if ($failureMessage.Length -gt 240)');
-    expect(script).toContain('[int64]$lease.updatedAt -ge $upgradeStartedAt');
+    expect(script).toContain('[int64]$lease.updatedAt -ge $StartedAtMs');
+    expect(script).toContain('Wait-IMCodesNodeHealthy -LeasePath $healthLease -NodePath $dst -StartedAtMs $upgradeStartedAt');
     expect(script).toContain('if ($remoteDesktopPublished -and (Test-Path $dstRemoteDesktop))');
     expect(script).toContain('Move-Item -Force $backupRemoteDesktop $dstRemoteDesktop');
     expect(script).toContain("Get-WindowsDriver -Online -All | Where-Object { [IO.Path]::GetFileName([string]$_.OriginalFileName) -ceq 'imcodes-virtual-display.inf'");
