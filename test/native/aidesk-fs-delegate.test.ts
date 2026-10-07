@@ -3,6 +3,7 @@ import { chmodSync, linkSync, mkdirSync, mkdtempSync, readFileSync, realpathSync
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
+import { AIDESK_AGENT_SOURCES, aideskAgentCompileArgs } from '../../scripts/build-aidesk-app.mjs';
 import {
   MACOS_FS_DELEGATE_ANSWER_MAGIC,
   MACOS_FS_DELEGATE_LIMITS,
@@ -334,7 +335,9 @@ describe('aidesk fs delegate: native constants mirror the shared protocol', () =
     const main = readFileSync(join(SOURCE, 'aidesk_agent_main.mm'), 'utf8');
     expect(main.indexOf('IsFsDelegateInvocation(argc, argv)')).toBeGreaterThan(-1);
     expect(main.indexOf('IsFsDelegateInvocation(argc, argv)')).toBeLessThan(main.indexOf('IsMacosPermissionResponsibleApplication'));
-    expect(readFileSync(resolve(SOURCE, '../../scripts/build-aidesk-app.mjs'), 'utf8')).toContain("join(source, 'aidesk_fs_delegate.cc')");
+    // in the app build: the sources every agent build compiles (aidesk-agent-build.json, read by the packaging script)
+    expect(AIDESK_AGENT_SOURCES).toContain('aidesk_fs_delegate.cc');
+    expect(aideskAgentCompileArgs({ arch: 'arm64', minimumSystemVersion: '12.3', outPath: '/out/agent' }).some((arg) => arg.endsWith('/aidesk_fs_delegate.cc'))).toBe(true);
   });
 
   it('has no way to move the request directory at run time: no getenv, no argument, no define in the shipped build', () => {
