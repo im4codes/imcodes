@@ -62,21 +62,28 @@ describe('aiDesk desktop entries', () => {
     await expect(removeMacosAideskApplicationEntry(input)).resolves.toBe(true);
   });
 
-  it('treats a pgrep match as the background aiDesk agent already running', async () => {
+  it('treats the menu-bar process (no arguments or --aidesk-background) of this user as the app already running', async () => {
     const user = { name: 'ci', uid: 501, gid: 20, home: '/Users/ci', tempDir: '/tmp' };
+    const exe = '/Library/Application Support/aidesk/aiDesk.to by IM.codes.app/Contents/MacOS/aidesk-agent';
     const execFileText = async (file: string, args: readonly string[]) => {
-      expect(file).toBe('/usr/bin/pgrep');
-      expect(args).toEqual(['-u', '501', '-f', expect.stringContaining('aidesk')]);
-      return '4242\n';
+      expect(file).toBe('/bin/ps');
+      expect(args).toEqual(['-axo', 'pid=,uid=,command=']);
+      return `  986     501 ${exe} --aidesk-background\n`;
     };
     await expect(isMacosAideskAgentRunning(user, execFileText)).resolves.toBe(true);
   });
 
-  it('treats pgrep finding nothing (or failing) as the agent not running, fail-safe', async () => {
+  it('the launch agent and its helpers (same executable path, other arguments) or another user\'s app are NOT the running app', async () => {
     const user = { name: 'ci', uid: 501, gid: 20, home: '/Users/ci', tempDir: '/tmp' };
-    // pgrep exits non-zero with empty output when nothing matches.
-    const notFound = async () => { throw new Error('exit 1'); };
-    await expect(isMacosAideskAgentRunning(user, notFound)).resolves.toBe(false);
+    const exe = '/Library/Application Support/aidesk/aiDesk.to by IM.codes.app/Contents/MacOS/aidesk-agent';
+    const helpers = async () => `10322 501 ${exe} --aidesk-component-dir=/Library/Application Support/imcodes-node/remote-desktop-worker/x --macos-remote-desktop-launch-agent\n77 502 ${exe} --aidesk-background\n`;
+    await expect(isMacosAideskAgentRunning(user, helpers)).resolves.toBe(false);
+  });
+
+  it('treats ps failing or finding nothing as the agent not running, fail-safe', async () => {
+    const user = { name: 'ci', uid: 501, gid: 20, home: '/Users/ci', tempDir: '/tmp' };
+    const failed = async () => { throw new Error('exit 1'); };
+    await expect(isMacosAideskAgentRunning(user, failed)).resolves.toBe(false);
     const blankOutput = async () => '';
     await expect(isMacosAideskAgentRunning(user, blankOutput)).resolves.toBe(false);
   });

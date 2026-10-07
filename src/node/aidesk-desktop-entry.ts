@@ -24,6 +24,8 @@ import {
   AIDESK_WINDOWS_SHORTCUT_FILE_NAME,
 } from '../../shared/aidesk-product.js';
 import { AIDESK_HICOLOR_ICONS_BASE64 } from '../../shared/aidesk-icon-generated.js';
+import { parseAideskMenuBarProcesses } from '../../shared/aidesk-app-refresh.js';
+import { MACOS_AIDESK_EXECUTABLE } from './macos-computer-use.js';
 import { LOCAL_PANEL_LINUX_WM_CLASS } from '../../shared/local-panel-window.js';
 import { REMOTE_DESKTOP_LOCAL_MANAGEMENT } from '../../shared/remote-desktop-local-management.js';
 import { pickLinuxDesktopUserProfile } from './linux-desktop-environment.js';
@@ -381,19 +383,22 @@ function runUpdateDesktopDatabase(directory: string): Promise<void> {
 /**
  * `open -g <app> --args --aidesk-background` only spawns a fresh process the
  * first time; once the background agent is already running, macOS instead
- * delivers a "reopen" Apple Event to it, which the agent (correctly, for a
- * real Dock click) answers by opening the 127.0.0.1 management panel in the
- * browser. ensureAideskDesktopEntry runs on every controlled-node startup --
- * including every post-upgrade restart -- so without this check the daemon
- * itself became an unwanted source of "reopen" events, popping that panel
- * open on every upgrade even though nobody asked to see it.
+ * delivers a "reopen" Apple Event to it (which opens the aiDesk window), so
+ * ensureAideskDesktopEntry -- which runs on every controlled-node startup,
+ * including every post-upgrade restart -- must not start it again.
+ *
+ * "Running" means the MENU-BAR process only (no arguments or `--aidesk-background`):
+ * the same executable path is also used by the remote-desktop launch agent and
+ * its helpers, which run for days with other arguments and used to be taken for
+ * the app, so a Mac whose menu-bar app had quit was never given a new one.
  */
 export async function isMacosAideskAgentRunning(
   user: MacosUserSession,
   execFileText: MacosExecFileText,
 ): Promise<boolean> {
-  return execFileText('/usr/bin/pgrep', ['-u', String(user.uid), '-f', MACOS_REMOTE_DESKTOP_RESPONSIBLE_APP_PATH])
-    .then((stdout) => stdout.trim().length > 0)
+  const executable = join(MACOS_REMOTE_DESKTOP_RESPONSIBLE_APP_PATH, 'Contents', 'MacOS', MACOS_AIDESK_EXECUTABLE);
+  return execFileText('/bin/ps', ['-axo', 'pid=,uid=,command='])
+    .then((stdout) => parseAideskMenuBarProcesses(stdout, executable, user.uid).length > 0)
     .catch(() => false);
 }
 
