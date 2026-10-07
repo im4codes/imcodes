@@ -12,6 +12,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <pwd.h>
 #include <string>
 #include <vector>
 
@@ -234,7 +235,16 @@ const char* ReadRequestFile(const std::string& path, const Options& options, std
   return nullptr;
 }
 
+// True when the probe file may be read, or when the probe cannot tell (the file is absent). False only for a refusal for permission.
+bool FullDiskAccessProbeAllows(const std::string& probe_path) {
+  if (probe_path.empty()) return true;
+  const int fd = open(probe_path.c_str(), O_RDONLY | O_CLOEXEC | O_NONBLOCK);
+  if (fd >= 0) { close(fd); return true; }
+  return !(errno == EPERM || errno == EACCES);
+}
+
 std::string ListDirectory(const std::string& requested, const Options& options) {
+  if (!FullDiskAccessProbeAllows(options.full_disk_access_probe_path)) return ErrorAnswer(kPermissionDenied);
   char resolved[PATH_MAX];
   if (realpath(requested.c_str(), resolved) == nullptr) return ErrorAnswer(ReasonForErrno(errno));
   const std::string real_path = resolved;
@@ -337,6 +347,11 @@ int FsDelegateMain(int argc, char** argv) {
 #endif
   options.request_dir = runtime_root + "/" + std::to_string(static_cast<unsigned long>(getuid()));
   options.trusted_owner_uid = 0;
+  if (const struct passwd* entry = getpwuid(getuid())) {
+    options.full_disk_access_probe_path = std::string(entry->pw_dir) + "/Library/Application Support/com.apple.TCC/TCC.db";
+  }
+  // Never outlive the node's own timeout, whatever the helper is blocked on.
+  alarm(kSelfTimeoutSeconds);
   options.now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
   std::string answer;
   RunFsDelegateRequest(argv[2], options, &answer);

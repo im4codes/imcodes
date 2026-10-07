@@ -68,6 +68,8 @@ export const MACOS_FS_DELEGATE_LIMITS = {
   RUN_TIMEOUT_MS: 10_000,
   /** Stdout the node accepts from one run. */
   MAX_STDOUT_BYTES: 4 * 1024 * 1024,
+  /** The helper ends itself after this long however it is stuck; strictly less than RUN_TIMEOUT_MS. */
+  HELPER_SELF_TIMEOUT_MS: 8_000,
   /** Entries the helper emits (the node trims to its own wire limit afterwards). */
   MAX_ENTRIES: 20_000,
   /** Longest absolute path accepted in a request. */

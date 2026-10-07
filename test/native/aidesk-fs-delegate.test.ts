@@ -33,13 +33,14 @@ let requestDir = '';
 let fixtureDir = '';
 let seq = 0;
 
-function run(requestFile: string, options: { dir?: string; chainStart?: string; trustedUid?: number; now?: number } = {}): MacosFsDelegateAnswer {
+function run(requestFile: string, options: { dir?: string; chainStart?: string; trustedUid?: number; now?: number; probe?: string } = {}): MacosFsDelegateAnswer {
   const result = spawnSync(binary, [
     requestFile,
     options.dir ?? requestDir,
     options.chainStart ?? root,
     String(options.trustedUid ?? uid),
     String(options.now ?? NOW),
+    ...(options.probe === undefined ? [] : [options.probe]),
   ], { encoding: 'utf8' });
   expect(result.status).toBe(0);
   const answer = parseMacosFsDelegateAnswer(result.stdout);
@@ -202,6 +203,22 @@ describe.skipIf(!HAVE_COMPILER)('aidesk fs delegate (native core)', () => {
     });
   });
 
+  describe('Full Disk Access probe (answer at once instead of stopping on a per-folder consent prompt)', () => {
+    it.skipIf(uid === 0)('answers permission_denied without touching the path when the probe file cannot be read', () => {
+      writeFileSync(join(fixtureDir, 'a.txt'), 'x');
+      const probe = join(root, 'tcc.db');
+      writeFileSync(probe, 'x');
+      chmodSync(probe, 0o000);
+      expectRefused(run(writeRequest(), { probe }), MACOS_FS_DELEGATE_REASON.PERMISSION_DENIED);
+      chmodSync(probe, 0o644);
+      expect(run(writeRequest({}, 'second.req'), { probe }).ok).toBe(true);
+    });
+
+    it('carries on when the probe file does not exist (cannot tell: not macOS, or a test host)', () => {
+      expect(run(writeRequest(), { probe: join(root, 'no-such-tcc.db') }).ok).toBe(true);
+    });
+  });
+
   describe('malformed requests', () => {
     const base = (extra: string[] = [], drop: string[] = []): string => {
       const lines = [
@@ -252,6 +269,8 @@ describe('aidesk fs delegate: native constants mirror the shared protocol', () =
     expect(num('kMaxClockSkewMs')).toBe(MACOS_FS_DELEGATE_LIMITS.MAX_CLOCK_SKEW_MS);
     expect(num('kMaxPathBytes')).toBe(MACOS_FS_DELEGATE_LIMITS.MAX_PATH_BYTES);
     expect(num('kMaxEntries')).toBe(MACOS_FS_DELEGATE_LIMITS.MAX_ENTRIES);
+    expect(num('kSelfTimeoutSeconds') * 1000).toBe(MACOS_FS_DELEGATE_LIMITS.HELPER_SELF_TIMEOUT_MS);
+    expect(MACOS_FS_DELEGATE_LIMITS.HELPER_SELF_TIMEOUT_MS).toBeLessThan(MACOS_FS_DELEGATE_LIMITS.RUN_TIMEOUT_MS);
   });
   it('has the same flag, runtime root and answer magic', () => {
     expect(header).toContain(`"${MACOS_FS_DELEGATE_REQUEST_FLAG}"`);
@@ -259,6 +278,12 @@ describe('aidesk fs delegate: native constants mirror the shared protocol', () =
     const source = readFileSync(join(SOURCE, 'aidesk_fs_delegate.cc'), 'utf8');
     expect(source).toContain(`"${MACOS_FS_DELEGATE_ANSWER_MAGIC}"`);
     expect(source).toContain(`"${MACOS_FS_DELEGATE_TRUSTED_CHAIN_START}"`);
+  });
+  it('the shipped entry point arms the self-timeout and probes Full Disk Access before reading', () => {
+    const source = readFileSync(join(SOURCE, 'aidesk_fs_delegate.cc'), 'utf8');
+    expect(source).toMatch(/alarm\(kSelfTimeoutSeconds\)/u);
+    expect(source).toContain('/Library/Application Support/com.apple.TCC/TCC.db');
+    expect(source.indexOf('FullDiskAccessProbeAllows(options.full_disk_access_probe_path)')).toBeLessThan(source.indexOf('realpath(requested.c_str()'));
   });
   it('uses every helper reason code the shared module names, spelled the same', () => {
     const source = readFileSync(join(SOURCE, 'aidesk_fs_delegate.cc'), 'utf8');

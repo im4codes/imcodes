@@ -36,6 +36,9 @@ inline constexpr std::int64_t kMaxClockSkewMs = 1'000;
 inline constexpr std::size_t kMaxPathBytes = 4096;
 inline constexpr std::size_t kMaxEntries = 20'000;
 inline constexpr std::size_t kMaxAnswerBytes = 3'500'000;
+// The helper ends itself after this long however it is stuck (a blocked TCC prompt, a hung volume): it must not outlive the node's
+// own timeout (RUN_TIMEOUT_MS = 10 s) as an orphan.
+inline constexpr unsigned kSelfTimeoutSeconds = 8;
 
 struct Options {
   // The only directory a request file may live in.
@@ -46,6 +49,12 @@ struct Options {
   // Who may own the directories and the request file. Production: 0 (root); tests use the test's own uid.
   uid_t trusted_owner_uid = 0;
   std::int64_t now_ms = 0;
+  // When non-empty: before touching the requested path, try to open THIS file for reading (the user's TCC database, readable only by a
+  // process that holds Full Disk Access) and answer `permission_denied` at once if the open is refused (EPERM/EACCES). Without Full Disk
+  // Access macOS would otherwise stop the helper on a per-folder consent prompt (Documents, Desktop, Downloads) that nobody at a remote
+  // Mac can answer. A missing file (ENOENT: not macOS, or a test host) means "cannot tell": carry on. Production: the console user's
+  // ~/Library/Application Support/com.apple.TCC/TCC.db.
+  std::string full_disk_access_probe_path;
   std::size_t max_entries = kMaxEntries;
   std::size_t max_answer_bytes = kMaxAnswerBytes;
 };
