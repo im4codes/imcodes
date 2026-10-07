@@ -130,6 +130,10 @@
     "cancel_failed": {
       "title": "停止未生效",
       "reason": {
+        "daemon_offline": "此工作階段所在的機器已離線，停止指令未能送達。",
+        "ack_timeout": "機器未在規定時間內確認停止，可能正忙，請重試。",
+        "daemon_error": "機器在停止時回報了錯誤，請重試。",
+        "outside_share": "此工作階段不在分享給你的範圍內，無法停止。",
         "rate_limited": "此工作階段的停止請求過於頻繁，請等待一分鐘後再試。",
         "dispatch_changed": "目前執行的輪次已變更，請再點一次停止以停止最新的輪次。",
         "unsupported": "參與者無法停止這類工作階段。",

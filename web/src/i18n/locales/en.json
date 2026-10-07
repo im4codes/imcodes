@@ -130,6 +130,10 @@
     "cancel_failed": {
       "title": "Stop was not applied",
       "reason": {
+        "daemon_offline": "The machine this session runs on is offline, so Stop could not be delivered.",
+        "ack_timeout": "The machine did not confirm Stop in time. It may be busy; try again.",
+        "daemon_error": "The machine reported an error while stopping. Try again.",
+        "outside_share": "This session is outside what was shared with you, so you cannot stop it.",
         "rate_limited": "Too many Stop requests for this session. Wait a minute and try again.",
         "dispatch_changed": "The running turn changed since you last looked. Tap Stop again to stop the current one.",
         "unsupported": "Participants cannot stop this kind of session.",

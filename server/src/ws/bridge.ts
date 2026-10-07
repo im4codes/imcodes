@@ -7206,7 +7206,10 @@ export class WsBridge {
   ): void {
     const lane = shareBrowserMessageLane(data);
     if (lane === SHARE_MESSAGE_LANE.PRIORITY) {
-      void run(data).catch((err) => logger.warn({ err, serverId: this.serverId }, 'Share priority command failed'));
+      void run(data).catch((err) => {
+        logger.warn({ err, serverId: this.serverId }, 'Share priority command failed');
+        this.rejectShareCommandFailure(ws, data);
+      });
       return;
     }
     let lanes = this.shareMessageLanes.get(ws);
@@ -7218,14 +7221,34 @@ export class WsBridge {
     if (current.pending >= SHARE_MESSAGE_LANE_MAX_PENDING) {
       incrementCounter('ws_bridge_share_lane_overflow', { lane });
       logger.warn({ serverId: this.serverId, lane, pending: current.pending }, 'Share command lane overflow — message dropped');
+      this.rejectShareCommandFailure(ws, data, SHARE_REASONS.RATE_LIMITED);
       return;
     }
     current.pending += 1;
     current.tail = current.tail
       .then(() => run(data))
-      .catch((err) => logger.warn({ err, serverId: this.serverId, lane }, 'Share command failed'))
+      .catch((err) => {
+        logger.warn({ err, serverId: this.serverId, lane }, 'Share command failed');
+        this.rejectShareCommandFailure(ws, data);
+      })
       .finally(() => { current.pending -= 1; });
     lanes.set(lane, current);
+  }
+
+  /**
+   * A share command that could not be processed (the DB was unavailable while its
+   * grant was re-read, the lane was full...) is answered, never just logged: the
+   * participant's browser gets the same `command.failed` / error frame as any other
+   * refusal, so a tap that did nothing says so.
+   */
+  private rejectShareCommandFailure(ws: WebSocket, data: unknown, reason: ShareReason = SHARE_REASONS.TARGET_UNAVAILABLE): void {
+    let msg: Record<string, unknown> | null = null;
+    try {
+      const parsed = JSON.parse((data as Buffer).toString()) as unknown;
+      if (parsed && typeof parsed === 'object') msg = parsed as Record<string, unknown>;
+    } catch { /* not JSON: nothing to answer */ }
+    if (!msg || msg.type === 'ping') return;
+    this.rejectShareScopedBrowserCommand(ws, msg, reason);
   }
 
   private async evaluateShareScopedBrowserCommand(
@@ -7618,7 +7641,7 @@ export class WsBridge {
     ws: WebSocket,
     state: ShareScopedSocketState,
     coverage: EffectiveCoverage,
-    epoch: number = this.shareCoverageEpoch,
+    epoch: number,
   ): Promise<ShareScopedSocketState> {
     const effectiveTarget = coverage.serverParticipantAuthority === true
       ? { kind: 'server' as const, serverId: coverage.target.serverId }
@@ -10306,13 +10329,23 @@ export class WsBridge {
       this.removeInflight(entry.commandId);
       return false;
     }
-    const coverage = await this.resolveLiveShareCoverage(state);
-    if (!coverage) {
-      this.emitInflightFailure(entry, this.shareStateLooksExpired(state) ? SHARE_REASONS.EXPIRED : SHARE_REASONS.REVOKED);
-      this.removeInflight(entry.commandId);
-      return false;
+    // The command was just authorized against this socket's coverage (that check
+    // re-reads the DB whenever the coverage is older than the TTL or a grant
+    // changed), so an entry dispatched straight away needs no second DB round trip:
+    // for a Stop that was four more sequential queries between the tap and the
+    // daemon. Only an entry that waited (buffered across a reconnect, or retried
+    // after an ack timeout) re-reads, and then through the same single-flight path.
+    let current: ShareScopedSocketState | null;
+    if (this.shareCoverageIsFresh(state)) {
+      current = state;
+    } else {
+      current = await this.refreshShareCoverage(entry.browser, state);
+      if (!current) {
+        this.emitInflightFailure(entry, this.shareStateLooksExpired(state) ? SHARE_REASONS.EXPIRED : SHARE_REASONS.REVOKED);
+        this.removeInflight(entry.commandId);
+        return false;
+      }
     }
-    const current = await this.applyShareCoverage(entry.browser, state, coverage);
     if (!shareStateCoversSession(current, entry.sessionName)) {
       this.emitInflightFailure(entry, SHARE_REASONS.TARGET_UNAVAILABLE);
       this.removeInflight(entry.commandId);

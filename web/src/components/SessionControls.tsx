@@ -74,7 +74,7 @@ import { useSupervisorDefaults } from '../hooks/useSupervisorDefaults.js';
 import { PREF_KEY_P2P_COMBO_CONFIRM_SKIP, PREF_KEY_P2P_DROPDOWN_TAB, p2pSessionConfigLegacyPrefKeys, p2pSessionConfigPrefKey } from '../constants/prefs.js';
 import { parseP2pSavedConfig, serializeP2pSavedConfig } from '../preferences/p2p-config-pref.js';
 import { sendSessionViaHttp, cancelSessionViaHttp, deleteAttachment } from '../api.js';
-import { notifyShareCancelFailure, shareCancelFailureFromHttpError, trackShareCancelCommand } from '../share-cancel-feedback.js';
+import { SHARE_CANCEL_FAILED_EVENT, notifyShareCancelFailure, shareCancelFailureFromHttpError, trackShareCancelCommand } from '../share-cancel-feedback.js';
 import { ComposerAttachmentBadge } from './ComposerAttachmentBadge.js';
 import { forgetAttachmentPreview, rememberAttachmentPreview } from '../attachment-preview-cache.js';
 import { safeSessionStorageGetItem, safeSessionStorageRemoveItem, safeSessionStorageSetItem } from '../local-storage-quota.js';
@@ -4133,6 +4133,17 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     stopPressGuardRef.current = Date.now();
     setStopRequested(true);
   }, []);
+
+  // A refused Stop must not keep the optimistic "stopping" pulse: the toast says
+  // why, and the button is ready for another tap.
+  useEffect(() => {
+    const onRefused = (event: Event) => {
+      const failedSession = (event as CustomEvent<{ session?: string }>).detail?.session;
+      if (!failedSession || failedSession === activeSession?.name) setStopRequested(false);
+    };
+    window.addEventListener(SHARE_CANCEL_FAILED_EVENT, onRefused);
+    return () => window.removeEventListener(SHARE_CANCEL_FAILED_EVENT, onRefused);
+  }, [activeSession?.name]);
 
   const handleStopPress = useCallback(() => {
     const now = Date.now();

@@ -130,6 +130,10 @@
     "cancel_failed": {
       "title": "停止未生效",
       "reason": {
+        "daemon_offline": "此会话所在的机器已离线，停止指令未能送达。",
+        "ack_timeout": "机器未在规定时间内确认停止，可能正忙，请重试。",
+        "daemon_error": "机器在停止时报告了错误，请重试。",
+        "outside_share": "此会话不在分享给你的范围内，无法停止。",
         "rate_limited": "此会话的停止请求过于频繁，请等待一分钟后再试。",
         "dispatch_changed": "当前运行的轮次已变化，请再点一次停止以停止最新的轮次。",
         "unsupported": "参与者无法停止这类会话。",

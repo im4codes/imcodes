@@ -130,6 +130,10 @@
     "cancel_failed": {
       "title": "No se aplicó la detención",
       "reason": {
+        "daemon_offline": "La máquina donde se ejecuta esta sesión está sin conexión, así que no se pudo entregar la detención.",
+        "ack_timeout": "La máquina no confirmó la detención a tiempo. Puede estar ocupada; inténtalo de nuevo.",
+        "daemon_error": "La máquina informó de un error al detener. Inténtalo de nuevo.",
+        "outside_share": "Esta sesión está fuera de lo que se compartió contigo, así que no puedes detenerla.",
         "rate_limited": "Demasiadas solicitudes de detención para esta sesión. Espera un minuto e inténtalo de nuevo.",
         "dispatch_changed": "El turno en curso cambió desde la última vez que lo viste. Pulsa Detener otra vez para detener el actual.",
         "unsupported": "Los participantes no pueden detener este tipo de sesión.",

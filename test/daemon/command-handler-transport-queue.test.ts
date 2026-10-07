@@ -2433,6 +2433,43 @@ describe('handleWebCommand transport queue behavior', () => {
     await flushAsync();
   });
 
+  it('a shared participant\'s Stop (sharedActor envelope, observedDispatchId) runs on the same priority lane: provider cancel and accepted ack while the send lock is held', async () => {
+    let resolveRuntimeConfig: ((value: unknown) => void) | null = null;
+    getQwenRuntimeConfigMock.mockReturnValueOnce(new Promise((resolve) => {
+      resolveRuntimeConfig = resolve;
+    }));
+    const cancel = vi.fn().mockResolvedValue(undefined);
+    getSessionMock.mockReturnValue({
+      name: 'deck_transport_brain', projectName: 'transport', role: 'brain', agentType: 'qwen', runtimeType: 'transport',
+      state: 'running', qwenAvailableModels: ['qwen-plus', 'qwen-max'],
+    });
+    getTransportRuntimeMock.mockReturnValue({
+      providerSessionId: 'route-transport', setAgentId: vi.fn(), cancel, send: vi.fn(() => 'sent'), pendingCount: 0, pendingMessages: [],
+    });
+    handleWebCommand({ type: 'session.send', session: 'deck_transport_brain', text: '/model qwen-max', commandId: 'cmd-share-stop-model' }, serverLink as any);
+    await flushAsync();
+
+    handleWebCommand({
+      type: DAEMON_COMMAND_TYPES.SESSION_CANCEL,
+      sessionName: 'deck_transport_brain',
+      commandId: 'cmd-share-stop',
+      observedDispatchId: 'turn-1',
+      sharedActor: {
+        actorUserId: 'participant-1', actorDisplayName: 'P', effectiveActorRole: 'participant', actionId: 'cmd-share-stop',
+        origin: 'shared-tab', primaryShareId: 'share-1', authorizedAt: 1,
+        snapshot: { target: { kind: 'main', serverId: 's', sessionName: 'deck_transport_brain' }, effectiveRole: 'participant', historyCutoffAt: 0, nextCoverageRecheckAt: null, coveringShareIds: ['share-1'], primaryShareId: 'share-1', authorizedAt: 1 },
+      },
+    }, serverLink as any);
+
+    // Synchronously, before the stuck send settles: the provider was told to stop and the browser got its confirmation.
+    expect(cancel).toHaveBeenCalledTimes(1);
+    expect(emitMock).toHaveBeenCalledWith('deck_transport_brain', 'command.ack', { commandId: 'cmd-share-stop', status: 'accepted' });
+
+    resolveRuntimeConfig?.({ availableModels: ['qwen-plus', 'qwen-max'] });
+    await flushAsync();
+    await flushAsync();
+  });
+
   it('keeps legacy /stop on the priority lane while a transport model switch holds the send lock', async () => {
     let resolveRuntimeConfig: ((value: unknown) => void) | null = null;
     getQwenRuntimeConfigMock.mockReturnValueOnce(new Promise((resolve) => {

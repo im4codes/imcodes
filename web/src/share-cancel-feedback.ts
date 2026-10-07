@@ -1,3 +1,4 @@
+import { ACK_FAILURE_ACK_TIMEOUT, ACK_FAILURE_DAEMON_ERROR, ACK_FAILURE_DAEMON_OFFLINE } from '@shared/ack-protocol.js';
 import { SHARE_DENIAL_REASONS } from '@shared/tab-sharing.js';
 
 /**
@@ -37,7 +38,9 @@ export function notifyShareCancelFailure(failure: ShareCancelFailure): void {
   window.dispatchEvent(new CustomEvent<ShareCancelFailure>(SHARE_CANCEL_FAILED_EVENT, { detail: failure }));
 }
 
-const KNOWN_REASONS: ReadonlySet<string> = new Set(SHARE_DENIAL_REASONS);
+const KNOWN_REASONS: ReadonlySet<string> = new Set<string>([
+  ...SHARE_DENIAL_REASONS, ACK_FAILURE_ACK_TIMEOUT, ACK_FAILURE_DAEMON_ERROR, ACK_FAILURE_DAEMON_OFFLINE,
+]);
 
 /** i18n key (under `share.cancel_failed.reason`) for a refusal; an unknown reason reads as the generic one. */
 export function shareCancelFailureReasonKey(reason: string | null | undefined): string {
@@ -47,6 +50,11 @@ export function shareCancelFailureReasonKey(reason: string | null | undefined): 
     case 'share-dispatch-changed': return 'dispatch_changed';
     case 'share-cancel-unsupported': return 'unsupported';
     case 'share-role-denied': return 'role_denied';
+    case ACK_FAILURE_DAEMON_OFFLINE: return 'daemon_offline';
+    case ACK_FAILURE_ACK_TIMEOUT: return 'ack_timeout';
+    case ACK_FAILURE_DAEMON_ERROR: return 'daemon_error';
+    case 'share-direct-surface-denied':
+    case 'share-target-unavailable': return 'outside_share';
     case 'share-revoked':
     case 'share-expired':
     case 'share-role-changed': return 'access_ended';
