@@ -10333,10 +10333,13 @@ export class WsBridge {
     // re-reads the DB whenever the coverage is older than the TTL or a grant
     // changed), so an entry dispatched straight away needs no second DB round trip:
     // for a Stop that was four more sequential queries between the tap and the
-    // daemon. Only an entry that waited (buffered across a reconnect, or retried
-    // after an ack timeout) re-reads, and then through the same single-flight path.
+    // daemon.
     let current: ShareScopedSocketState | null;
-    if (this.shareCoverageIsFresh(state)) {
+    // Only the first, immediate dispatch of an entry. One that waited (state
+    // `buffered`: replayed after a daemon reconnect) or is being retried
+    // (dispatchAttempts > 0) always re-reads the grant.
+    const dispatchedImmediately = entry.state === 'dispatched' && entry.dispatchAttempts === 0;
+    if (dispatchedImmediately && this.shareCoverageIsFresh(state)) {
       current = state;
     } else {
       current = await this.refreshShareCoverage(entry.browser, state);

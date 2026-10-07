@@ -1,6 +1,6 @@
 import { IMCODES_EXTERNAL_CLI_SENDER } from '../../shared/imcodes-send.js';
 import { CHAT_MESSAGE_ORIGINS } from '../../shared/chat-message-origin.js';
-import { isLegacySupervisionInertProject, isPairsEngineProject, isTaskPairEngineActive, projectBrainSession } from './task-pairs/engine.js';
+import { isPairsEngineProject, isTaskPairEngineActive, projectBrainSession } from './task-pairs/engine.js';
 import { taskPairService } from './task-pairs/service.js';
 import { getTaskPairStore } from './task-pairs/store.js';
 import {
@@ -5211,7 +5211,7 @@ export async function runSupervisionConvergenceTick(
     try {
       converged = await registry.convergeLifecycle(now, {
         ...(deps.limit ? { limit: deps.limit } : {}),
-        skipProject: isLegacySupervisionInertProject,
+        skipProject: (projectName) => isPairsEngineProject(projectName) || !isTaskPairEngineActive(projectName),
         resolveAuthoritativeBrain: (projectName, sessionName) => resolveAuthoritativeBrainIdentity(
           projectName,
           (deps.listSessions ?? listSessions)(),

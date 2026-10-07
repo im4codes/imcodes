@@ -83,6 +83,8 @@ describe('shared daemon/server/web wire protocol contracts', () => {
       DAEMON_UPGRADE: 'daemon.upgrade',
       SERVER_DELETE: 'server.delete',
       SESSION_CANCEL: 'session.cancel',
+      SESSION_INPUT: 'session.input',
+      SESSION_RESIZE: 'session.resize',
       SESSION_EXECUTION_CLONES: 'session.execution_clones',
       SESSION_IDENTITY_REFRESH: 'session.identity.refresh',
       SESSION_UPDATE_TRANSPORT_CONFIG: 'session.update_transport_config',

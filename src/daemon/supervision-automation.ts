@@ -1,5 +1,5 @@
 import { CHAT_MESSAGE_ORIGINS } from '../../shared/chat-message-origin.js';
-import { isLegacySupervisionInertProject, isPairsEngineProject, isPairsEngineSession, isSessionCoveredByPairHeartbeat } from './task-pairs/engine.js';
+import { isPairsEngineProject, isPairsEngineSession, isSessionCoveredByPairHeartbeat, isTaskPairEngineActive } from './task-pairs/engine.js';
 import { readFile, readdir, stat } from 'node:fs/promises';
 import path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
@@ -1703,11 +1703,11 @@ class SupervisionAutomation {
     const convergenceStartedAt = Date.now();
     try {
       await registry.convergeLifecycle(now, {
-        // Same scope as the watchdog loop below and the send-path tick: a project
-        // on the pairs engine (or with no engine) never has its legacy tasks
+        // A project the pairs engine owns never has its leftover legacy tasks
         // scanned. Without this, every minute walked every live legacy task of a
         // pairs project -- ~2.7 s of synchronous SQLite reads on the main thread.
-        skipProject: isLegacySupervisionInertProject,
+        // (A project with no engine still converges: that is the boot repair.)
+        skipProject: isPairsEngineProject,
         // Production wiring: a stale coordinator epoch is repaired against the
         // daemon's own live session registry, with no model or heartbeat.
         resolveAuthoritativeBrain: (projectName, sessionName) => resolveAuthoritativeBrainIdentity(
@@ -1747,7 +1747,7 @@ class SupervisionAutomation {
       // too: it must not fall through into this legacy watchdog just because
       // it isn't `pairs`, or the daemon nudges/escalates over a task the
       // project's own workflow is already covering.
-      if (isLegacySupervisionInertProject(task.projectName)) continue;
+      if (isPairsEngineProject(task.projectName) || !isTaskPairEngineActive(task.projectName)) continue;
       const events = registry.listEvents(task.taskId);
       for (const assignment of task.assignments) {
         const watchdogKind = assignment.role === 'implementer'

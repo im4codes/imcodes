@@ -1,8 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { supervisionAutomation } from '../../src/daemon/supervision-automation.js';
 import { getSupervisionTaskRegistry, resetSupervisionTaskRegistryForTests } from '../../src/daemon/supervision-state-store.js';
-import { isLegacySupervisionInertProject } from '../../src/daemon/task-pairs/engine.js';
-import { runSupervisionConvergenceTick } from '../../src/daemon/send-tool.js';
+import { isPairsEngineProject } from '../../src/daemon/task-pairs/engine.js';
 
 const PAIRS_PROJECT = 'scopeproj';
 
@@ -36,29 +35,16 @@ describe('supervision watchdog tick scope', () => {
     expect(options.skipProject!(PAIRS_PROJECT)).toBe(true);
   });
 
-  it('the send-path tick and the watchdog tick share one predicate, so neither can scan what the other skips', async () => {
+  it('a project with no pairs engine is still converged by the watchdog tick (boot repair), only pairs projects are skipped', async () => {
     const registry = getSupervisionTaskRegistry();
     const converge = vi.spyOn(registry, 'convergeLifecycle').mockResolvedValue([]);
     await (supervisionAutomation as unknown as { checkImplementationAssignments(now: number): Promise<void> }).checkImplementationAssignments(Date.now());
-    const watchdogSkip = (converge.mock.calls[0]![1] as { skipProject: (p: string) => boolean }).skipProject;
-    // The watchdog tick also starts the send-path pass in the background; let it finish.
-    await new Promise((resolve) => setTimeout(resolve, 100));
-    converge.mockClear();
-    await runSupervisionConvergenceTick({ registry: registry as never });
-    expect(converge).toHaveBeenCalled();
-    const sendSkip = (converge.mock.calls[0]![1] as { skipProject: (p: string) => boolean }).skipProject;
-    for (const project of [PAIRS_PROJECT, 'other', undefined as unknown as string]) {
-      expect(watchdogSkip(project)).toBe(isLegacySupervisionInertProject(project));
-      expect(sendSkip(project)).toBe(isLegacySupervisionInertProject(project));
-    }
-  });
-
-  it('legacy supervision is inert under either engine value (legacy resolves to off), so no project is converged by the legacy pass', () => {
-    for (const engine of ['pairs', 'legacy']) {
-      process.env.IMCODES_SUPERVISION_ENGINE = engine;
-      expect(isLegacySupervisionInertProject(PAIRS_PROJECT)).toBe(true);
-    }
-    expect(isLegacySupervisionInertProject(undefined)).toBe(true);
+    const skip = (converge.mock.calls[0]![1] as { skipProject: (p: string) => boolean }).skipProject;
+    process.env.IMCODES_SUPERVISION_ENGINE = 'legacy'; // resolves to the inert/off engine
+    expect(isPairsEngineProject(PAIRS_PROJECT)).toBe(false);
+    expect(skip(PAIRS_PROJECT)).toBe(false);
+    process.env.IMCODES_SUPERVISION_ENGINE = 'pairs';
+    expect(skip(PAIRS_PROJECT)).toBe(true);
   });
 });
 
