@@ -14,6 +14,7 @@ import { mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from 'node:fs/
 import { existsSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { identityPromptHash } from '../../src/util/identity-prompt-hash.js';
 import {
   authorizeEmptySessionStoreWrite,
   configureSessionStoreWriteAuthority,
@@ -92,7 +93,8 @@ function productionShapedFile(count: number): { text: string; expected: Record<s
     const withPrompt = i % 3 === 0 ? { ...base, identityPromptRef: i % 2 === 0 ? 'p0' : 'p1' } : base;
     sessions[name] = withPrompt;
     const { identityPromptRef, ...rest } = withPrompt;
-    expected[name] = JSON.parse(JSON.stringify({ ...rest, ...(identityPromptRef ? { identityPrompt: identityPrompts[identityPromptRef as string] } : {}) }));
+    // The prompt is not session state: an import keeps only the digest that replaces it.
+    expected[name] = JSON.parse(JSON.stringify({ ...rest, ...(identityPromptRef ? { appliedIdentityHash: identityPromptHash(identityPrompts[identityPromptRef as string]) } : {}) }));
   }
   return { text: JSON.stringify({ version: 2, sessions, identityPrompts }, null, 2), expected };
 }
@@ -145,7 +147,8 @@ describe('one-time migration from sessions.json', () => {
   it('imports legacy v1 snapshots (inline identity prompts, no version)', async () => {
     await writeFile(jsonFile(), JSON.stringify({ sessions: { deck_realproj_brain: record('deck_realproj_brain', { identityPrompt: 'inline' }) } }), 'utf8');
     await loadStore({ probe: false });
-    expect(persistedSessions(home).deck_realproj_brain).toMatchObject({ identityPrompt: 'inline' });
+    expect(persistedSessions(home).deck_realproj_brain).toMatchObject({ appliedIdentityHash: identityPromptHash('inline') });
+    expect(persistedSessions(home).deck_realproj_brain).not.toHaveProperty('identityPrompt');
   });
 
   it('is idempotent: a later start never re-reads sessions.json, even one an older daemon recreated', async () => {
@@ -469,10 +472,10 @@ describe('writes are incremental', () => {
   });
 
   it('a restart with a flush pending loses nothing', async () => {
-    upsertSession(record('deck_realproj_pending', { identityPrompt: 'kept' }));
+    upsertSession(record('deck_realproj_pending', { description: 'kept' }));
     await flushStore(); // shutdown path, before the 500 ms debounce fired
     await fresh();
-    expect(getSession('deck_realproj_pending')?.identityPrompt).toBe('kept');
+    expect(getSession('deck_realproj_pending')?.description).toBe('kept');
     expect(listSessions()).toHaveLength(301);
   });
 
@@ -617,13 +620,13 @@ describe('readers without write authority', () => {
   it('a separate process (the cli / memory MCP server) reads the database through the store API', async () => {
     await writeFile(jsonFile(), productionShapedFile(60).text, 'utf8');
     await loadStore({ probe: false });
-    upsertSession(record('deck_realproj_fresh', { identityPrompt: 'exact ✓' }));
+    upsertSession(record('deck_realproj_fresh', { description: 'exact ✓' }));
     await flushStore();
     const script = `
       const store = await import(process.env.STORE_MODULE);
       await store.loadStore({ probe: false });
       const s = store.getSession('deck_realproj_fresh');
-      console.log('RESULT' + JSON.stringify({ count: store.listSessions().length, prompt: s?.identityPrompt }));
+      console.log('RESULT' + JSON.stringify({ count: store.listSessions().length, prompt: s?.description }));
     `;
     const { stdout } = await execFileAsync(process.execPath, ['--import', 'tsx', '--input-type=module', '--eval', script], {
       cwd: process.cwd(),
@@ -809,11 +812,11 @@ describe('sessions.json compatibility export (older processes, downgrade)', () =
     await finishedExports();
     expect(Object.keys(await oldBuildReadsSessions())).toHaveLength(40); // right after migration, not a stale .1-.5
 
-    upsertSession(record('deck_realproj_after_upgrade', { identityPrompt: 'p ✓' }));
+    upsertSession(record('deck_realproj_after_upgrade', { description: 'p ✓' }));
     updateSessionState('deck_realproj0_brain0', 'error', 'boom');
     await flushStore();
     const seen = await oldBuildReadsSessions();
-    expect(seen.deck_realproj_after_upgrade).toMatchObject({ projectName: 'realproj', identityPrompt: 'p ✓' });
+    expect(seen.deck_realproj_after_upgrade).toMatchObject({ projectName: 'realproj', description: 'p ✓' });
     expect(seen.deck_realproj0_brain0).toMatchObject({ state: 'error', error: 'boom' });
     expect(Object.keys(seen)).toHaveLength(41);
   });

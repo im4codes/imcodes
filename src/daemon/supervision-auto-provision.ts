@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { identityContentHash } from '../util/identity-prompt-hash.js';
 import {
   DELEGATION_AVAILABILITY,
   resolveDelegationTargets,
@@ -33,10 +34,6 @@ import { getActiveServerLink } from './active-server-link.js';
 import { closeSubSession } from './session-close.js';
 import { overlayCachedExecutionPools } from './supervisor-defaults-cache.js';
 import logger from '../util/logger.js';
-import {
-  SESSION_IDENTITY_SCOPES,
-  renderSessionIdentityProfileSection,
-} from '../../shared/session-identity.js';
 import type { SupervisionTaskRegistry } from './supervision-state-store.js';
 import {
   SEND_AUTO_PROVISION_CREATED_SESSION_SOURCE,
@@ -191,18 +188,13 @@ function hasManualExplicitConfig(request: SupervisionAutoProvisionRequest): bool
 }
 
 function provisionedIdentityHash(identityPrompt?: string): string | undefined {
-  return identityPrompt ? createHash('sha256').update(identityPrompt).digest('hex') : undefined;
+  return identityPrompt ? identityContentHash(identityPrompt) : undefined;
 }
 
+/** A session is the Agent for this identity when it was provisioned with it (the hash is stamped at creation; the text is never stored). */
 function sessionMatchesProvisionedIdentity(session: SessionRecord, identityPrompt?: string): boolean {
   if (identityPrompt === undefined) return true;
-  if (session.provisionedIdentityHash === provisionedIdentityHash(identityPrompt)) return true;
-  if (session.identityPrompt === identityPrompt) return true;
-  const persistedSection = renderSessionIdentityProfileSection(
-    SESSION_IDENTITY_SCOPES.SESSION,
-    identityPrompt,
-  );
-  return Boolean(persistedSection && session.identityPrompt?.includes(persistedSection));
+  return session.provisionedIdentityHash === provisionedIdentityHash(identityPrompt);
 }
 
 export function configMatchesSession(

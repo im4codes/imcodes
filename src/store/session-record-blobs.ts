@@ -4,16 +4,20 @@
  * `externalizeSessionRecord` turns a record into the small JSON payload that is stored in its row plus the
  * blobs (hash -> text) that payload refers to; `hydrateSessionRecord` is the inverse. Identical texts (the
  * same user identity contract on 117 sessions) hash to the same blob and, once loaded, are one shared string
- * in memory. `identityPrompt` keeps the legacy sessions.json reference name (`identityPromptRef`) so the
- * compatibility export can hand it to older readers as the `identityPrompts` table they already understand.
+ * in memory. The identity prompt is NOT one of these fields: it is derived data and is never stored with a
+ * session (`removeStoredIdentity` strips it from anything that still carries it).
  */
 import { createHash } from 'node:crypto';
-import { SESSION_RECORD_INLINE_STRING_MAX_CHARS } from '../../shared/session-store-compat.js';
+import {
+  SESSION_IDENTITY_PROMPT_FIELD,
+  SESSION_IDENTITY_PROMPT_REF_FIELD,
+  SESSION_RECORD_INLINE_STRING_MAX_CHARS,
+} from '../../shared/session-store-compat.js';
 import { SESSION_BLOB_CACHE_MAX_CHARS } from '../../shared/daemon-memory-guard.js';
+import { SESSION_IDENTITY_SCOPES } from '../../shared/session-identity.js';
+import { identityContentHash, identityPromptHash } from '../util/identity-prompt-hash.js';
 
-export const SESSION_IDENTITY_REF_FIELD = 'identityPromptRef';
 export const SESSION_BLOB_REFS_FIELD = 'blobRefs';
-const IDENTITY_FIELD = 'identityPrompt';
 const HASH_CACHE_MAX = 512;
 const INTERN_MAX = 1024;
 
@@ -69,12 +73,12 @@ export function externalizeSessionRecord(record: object): ExternalizedSessionRec
   const out: Record<string, unknown> = {};
   let refs: Record<string, string> | undefined;
   for (const [key, value] of Object.entries(record as Record<string, unknown>)) {
-    if (key === SESSION_IDENTITY_REF_FIELD || key === SESSION_BLOB_REFS_FIELD) continue; // never carry stale references forward
+    // Never carry stale references forward, and never store the identity prompt (even if a caller still sets one).
+    if (key === SESSION_BLOB_REFS_FIELD || key === SESSION_IDENTITY_PROMPT_FIELD || key === SESSION_IDENTITY_PROMPT_REF_FIELD) continue;
     if (isLargeString(value)) {
       const hash = hashSessionBlob(value);
       blobs.push({ hash, text: value });
-      if (key === IDENTITY_FIELD) out[SESSION_IDENTITY_REF_FIELD] = hash;
-      else (refs ??= {})[key] = hash;
+      (refs ??= {})[key] = hash;
       continue;
     }
     out[key] = value;
@@ -85,9 +89,8 @@ export function externalizeSessionRecord(record: object): ExternalizedSessionRec
 
 /** The hashes a payload string refers to, without parsing it (cheap enough for every committed row). */
 export function blobHashesOfPayload(payload: string): string[] {
-  if (!payload.includes(SESSION_IDENTITY_REF_FIELD) && !payload.includes(SESSION_BLOB_REFS_FIELD)) return [];
+  if (!payload.includes(SESSION_BLOB_REFS_FIELD)) return [];
   const hashes = new Set<string>();
-  for (const match of payload.matchAll(/"identityPromptRef":"([0-9a-f]{32})"/g)) hashes.add(match[1]!);
   const refsAt = payload.indexOf(`"${SESSION_BLOB_REFS_FIELD}":{`);
   if (refsAt >= 0) {
     const end = payload.indexOf('}', refsAt);
@@ -106,13 +109,9 @@ export function hydrateSessionRecord(
   onMissing?: (field: string, hash: string) => void,
 ): Record<string, unknown> {
   const record = { ...parsed };
-  const identityRef = record[SESSION_IDENTITY_REF_FIELD];
-  delete record[SESSION_IDENTITY_REF_FIELD];
-  if (typeof identityRef === 'string') {
-    const text = lookup(identityRef);
-    if (text !== undefined) record[IDENTITY_FIELD] = internSessionText(text);
-    else onMissing?.(IDENTITY_FIELD, identityRef);
-  }
+  // A row written by an older build may still carry the prompt (inline or by reference): it is not session state, drop it.
+  delete record[SESSION_IDENTITY_PROMPT_FIELD];
+  delete record[SESSION_IDENTITY_PROMPT_REF_FIELD];
   const refs = record[SESSION_BLOB_REFS_FIELD];
   delete record[SESSION_BLOB_REFS_FIELD];
   if (refs && typeof refs === 'object' && !Array.isArray(refs)) {
@@ -129,13 +128,32 @@ export function hydrateSessionRecord(
   return record;
 }
 
-/** The identity blob a payload refers to (what the export's `identityPrompts` table is keyed by). */
-export function identityRefOfPayload(payload: string): string | undefined {
-  if (!payload.includes(SESSION_IDENTITY_REF_FIELD)) return undefined;
-  return /"identityPromptRef":"([0-9a-f]{32})"/.exec(payload)?.[1];
+/** The text of the session section of a rendered identity (what an Agent is provisioned with), if it has one. */
+function sessionSectionOf(prompt: string): string | undefined {
+  const tag = SESSION_IDENTITY_SCOPES.SESSION;
+  return new RegExp(`<${tag}>\\n([\\s\\S]*)\\n</${tag}>`).exec(prompt)?.[1];
 }
 
-/** True when a payload refers to blobs other than the identity (those are inlined into the compatibility export). */
+/**
+ * Remove a stored identity prompt from a record in place, leaving the two short digests that replace it:
+ * `appliedIdentityHash` (so the first identity sync does not see a drift and refresh every session) and, for an Agent
+ * provisioned with an explicit identity, `provisionedIdentityHash` (so the same request still finds the same Agent).
+ * Returns true when the record carried a prompt field.
+ */
+export function removeStoredIdentity(record: Record<string, unknown>, text: string | undefined): boolean {
+  const had = SESSION_IDENTITY_PROMPT_FIELD in record || SESSION_IDENTITY_PROMPT_REF_FIELD in record;
+  delete record[SESSION_IDENTITY_PROMPT_FIELD];
+  delete record[SESSION_IDENTITY_PROMPT_REF_FIELD];
+  if (text) {
+    const applied = identityPromptHash(text);
+    if (applied && record['appliedIdentityHash'] === undefined) record['appliedIdentityHash'] = applied;
+    const section = record['provisionedIdentityHash'] === undefined ? sessionSectionOf(text) : undefined;
+    if (section) record['provisionedIdentityHash'] = identityContentHash(section);
+  }
+  return had;
+}
+
+/** True when a payload refers to blobs (those are inlined into the compatibility export). */
 export function hasGenericBlobRefs(payload: string): boolean {
   return payload.includes(`"${SESSION_BLOB_REFS_FIELD}":{`);
 }

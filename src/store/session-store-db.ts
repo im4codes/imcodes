@@ -15,8 +15,15 @@ import { existsSync, mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { suppressSqliteExperimentalWarning } from '../util/suppress-sqlite-warning.js';
 
-import { SESSION_DB_VACUUM_MIN_FREE_BYTES, SESSION_DB_WAL_SIZE_LIMIT_BYTES } from '../../shared/session-store-compat.js';
-import type { SessionBlob } from './session-record-blobs.js';
+import {
+  SESSION_DB_META_IDENTITY_SCRUB,
+  SESSION_DB_VACUUM_MIN_FREE_BYTES,
+  SESSION_DB_WAL_SIZE_LIMIT_BYTES,
+  SESSION_IDENTITY_PROMPT_FIELD,
+  SESSION_IDENTITY_PROMPT_MARKER,
+  SESSION_IDENTITY_PROMPT_REF_FIELD,
+} from '../../shared/session-store-compat.js';
+import { removeStoredIdentity, type SessionBlob } from './session-record-blobs.js';
 const require = createRequire(import.meta.url);
 suppressSqliteExperimentalWarning();
 const sqlite = require('node:sqlite') as typeof import('node:sqlite');
@@ -186,16 +193,84 @@ function insertBlobs(handle: SessionDbHandle, rows: readonly SessionDbRow[]): vo
   for (const row of rows) for (const blob of row.blobs ?? []) insert.run(blob.hash, blob.text);
 }
 
-/** Drop blobs no row refers to any more (identity edited, session removed). Uses SQLite's JSON functions on the small payloads. */
+/** Drop blobs no row refers to any more (a field edited, a session removed). Uses SQLite's JSON functions on the small payloads. */
 function collectUnreferencedBlobs(handle: SessionDbHandle): void {
   try {
     handle.db.exec(`
       DELETE FROM session_blobs WHERE hash NOT IN (
-        SELECT json_extract(payload, '$.identityPromptRef') FROM sessions WHERE json_extract(payload, '$.identityPromptRef') IS NOT NULL
-        UNION SELECT je.value FROM sessions, json_each(sessions.payload, '$.blobRefs') AS je
+        SELECT je.value FROM sessions, json_each(sessions.payload, '$.blobRefs') AS je
       )`);
   } catch {
     // No JSON functions or an unreadable payload: keep every blob (a leak of a few MB, never a lost reference).
+  }
+}
+
+const SCRUB_PENDING_VACUUM = 'vacuum_pending';
+const SCRUB_DONE = 'done';
+
+/**
+ * Remove every stored identity prompt from the database (the previous builds kept one per session, inline and later as a
+ * blob reference). The prompt is derived data -- see session-identity-resolver.ts -- so the rows keep only two short digests.
+ *
+ * ONE transaction: all rows and the blobs only they referred to, or nothing (a crash or a full disk rolls it back and
+ * the next start repeats it). Idempotent, and repeated on EVERY start by a cheap substring scan, so rows an older build
+ * wrote after a downgrade are cleaned too. The freed pages still hold the old text, so the file is compacted at once
+ * (VACUUM, then the log is truncated); when that cannot run (disk space) the marker stays `vacuum_pending` and the next
+ * start retries, instead of leaving the text on disk unannounced.
+ */
+export function scrubStoredIdentityRows(handle: SessionDbHandle): { scrubbedRows: number; compacted: boolean } {
+  if (handle.readOnly) return { scrubbedRows: 0, compacted: false };
+  const { db } = handle;
+  const marker = readSessionDbMeta(handle, SESSION_DB_META_IDENTITY_SCRUB);
+  const names = (db.prepare('SELECT name FROM sessions WHERE instr(payload, ?) > 0').all(SESSION_IDENTITY_PROMPT_MARKER) as Array<{ name: string }>)
+    .map((row) => row.name);
+  let scrubbedRows = 0;
+  if (names.length > 0) {
+    const read = db.prepare('SELECT payload FROM sessions WHERE name = ?');
+    const readBlob = db.prepare('SELECT text FROM session_blobs WHERE hash = ?');
+    const write = db.prepare('UPDATE sessions SET payload = ? WHERE name = ?');
+    rowWritesThisTransaction = 0;
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      for (const name of names) {
+        const payload = (read.get(name) as { payload?: string } | undefined)?.payload;
+        if (typeof payload !== 'string') continue;
+        let record: Record<string, unknown>;
+        try { record = JSON.parse(payload) as Record<string, unknown>; } catch { continue; } // not ours to repair
+        const inline = record[SESSION_IDENTITY_PROMPT_FIELD];
+        const reference = record[SESSION_IDENTITY_PROMPT_REF_FIELD];
+        const text = typeof inline === 'string'
+          ? inline
+          : typeof reference === 'string' ? (readBlob.get(reference) as { text?: string } | undefined)?.text : undefined;
+        if (!removeStoredIdentity(record, text)) continue; // the marker was inside some other text
+        noteRowWrite();
+        write.run(JSON.stringify(record), name);
+        scrubbedRows += 1;
+      }
+      if (scrubbedRows > 0) {
+        collectUnreferencedBlobs(handle);
+        db.prepare('INSERT OR REPLACE INTO session_store_meta (key, value) VALUES (?, ?)').run(SESSION_DB_META_IDENTITY_SCRUB, SCRUB_PENDING_VACUUM);
+      }
+      db.exec('COMMIT');
+    } catch (error) {
+      try { db.exec('ROLLBACK'); } catch { /* the failure already ended the transaction */ }
+      throw error;
+    }
+  }
+  if (scrubbedRows === 0 && marker !== SCRUB_PENDING_VACUUM) return { scrubbedRows: 0, compacted: false };
+  const compacted = compactSessionDb(handle);
+  if (compacted) db.prepare('INSERT OR REPLACE INTO session_store_meta (key, value) VALUES (?, ?)').run(SESSION_DB_META_IDENTITY_SCRUB, SCRUB_DONE);
+  return { scrubbedRows, compacted };
+}
+
+/** VACUUM and truncate the log, whatever the free-page thresholds; false when it could not run (the caller retries later). */
+function compactSessionDb(handle: SessionDbHandle): boolean {
+  try {
+    handle.db.exec('VACUUM');
+    handle.db.exec('PRAGMA wal_checkpoint(TRUNCATE)');
+    return true;
+  } catch {
+    return false;
   }
 }
 

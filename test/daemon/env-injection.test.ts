@@ -3,6 +3,8 @@
  * Verifies that session-manager and subsession-manager both inject the env var.
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { identityPromptHash } from '../../src/util/identity-prompt-hash.js';
+import { putLocalSessionIdentityProfile, removeLocalSessionIdentityProfileQuiet } from '../../src/daemon/session-identity-local-store.js';
 
 // ── Mocks ─────────────────────────────────────────────────────────────────────
 
@@ -180,13 +182,41 @@ describe('IMCODES_SESSION env injection', () => {
     });
     await new Promise((resolve) => setTimeout(resolve, 1_600));
 
+    // The text is injected into the agent, but the session record keeps only its digest (never the prompt).
     expect(mocks.upsertSession).toHaveBeenCalledWith(expect.objectContaining({
-      identityPrompt: 'Identity loaded from the selected document.',
+      appliedIdentityHash: identityPromptHash('Identity loaded from the selected document.'),
     }));
+    for (const [record] of mocks.upsertSession.mock.calls) {
+      expect(JSON.stringify(record)).not.toContain('Identity loaded from the selected document.');
+    }
     expect(mocks.sendKeys).toHaveBeenCalledWith(
       'deck_proj_brain',
       expect.stringContaining('Identity loaded from the selected document.'),
     );
+  });
+
+  it('a launch with no explicit identity derives it from the identity store (the text is not in the session record)', async () => {
+    await putLocalSessionIdentityProfile({ scope: 'user', scopeKey: '', content: 'Derived user identity contract.', source: 'mcp' });
+    try {
+      await launchSession({
+        name: 'deck_proj_brain',
+        projectName: 'proj',
+        role: 'brain',
+        agentType: 'codex',
+        projectDir: '/proj',
+      });
+      await new Promise((resolve) => setTimeout(resolve, 1_600));
+    } finally {
+      await removeLocalSessionIdentityProfileQuiet('user', '');
+    }
+
+    expect(mocks.sendKeys).toHaveBeenCalledWith(
+      'deck_proj_brain',
+      expect.stringContaining('Derived user identity contract.'),
+    );
+    for (const [record] of mocks.upsertSession.mock.calls) {
+      expect(JSON.stringify(record)).not.toContain('Derived user identity contract.');
+    }
   });
 
   it('does not call newSession when tmux session already exists', async () => {

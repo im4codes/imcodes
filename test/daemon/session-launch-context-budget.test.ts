@@ -22,6 +22,8 @@ const mocks = vi.hoisted(() => ({
   contextStoreCalls: [] as string[],
   /** When set, `getCodexRuntimeConfig` (an early step of every codex launch) waits on it. */
   runtimeConfigGate: null as Promise<void> | null,
+  /** The identity store cannot be read (every list call rejects). */
+  identityStoreThrows: false,
 }));
 
 vi.mock('node:child_process', async (importOriginal) => {
@@ -109,6 +111,17 @@ vi.mock('../../src/store/context-store-worker-client.js', async (importOriginal)
   };
 });
 
+vi.mock('../../src/daemon/session-identity-local-store.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../src/daemon/session-identity-local-store.js')>();
+  return {
+    ...actual,
+    listLocalSessionIdentityProfiles: vi.fn(async () => {
+      if (mocks.identityStoreThrows) throw new Error('identity store unavailable');
+      return actual.listLocalSessionIdentityProfiles();
+    }),
+  };
+});
+
 vi.mock('../../src/daemon/session-resource-service.js', () => ({
   registerTmuxSessionResource: vi.fn().mockResolvedValue(undefined),
   releaseSessionChildResources: vi.fn().mockResolvedValue({ released: 0, failed: 0 }),
@@ -146,6 +159,7 @@ vi.mock('../../src/agent/brain-dispatcher.js', () => ({ BrainDispatcher: vi.fn()
 
 import { connectProvider, disconnectAll, getProvider } from '../../src/agent/provider-registry.js';
 import {
+  applyEffectiveSessionIdentity,
   getTransportRuntime,
   launchTransportSession,
   setSessionEventCallback,
@@ -154,6 +168,10 @@ import {
 } from '../../src/agent/session-manager.js';
 import { resetTransportQueueStoreForTests } from '../../src/daemon/transport-queue-store.js';
 import { clearAllResend } from '../../src/daemon/transport-resend-queue.js';
+
+import { putLocalSessionIdentityProfile, removeLocalSessionIdentityProfileQuiet } from '../../src/daemon/session-identity-local-store.js';
+import { identityPromptHash } from '../../src/util/identity-prompt-hash.js';
+import { renderSessionIdentityProfiles } from '../../shared/session-identity.js';
 
 const STORE_STALL_MS = 30_000;
 
@@ -336,5 +354,100 @@ describe('session launch is never gated by context/memory enrichment', () => {
     await stuck;
     expect(getTransportRuntime('deck_launch_wedged_brain')?.providerSessionId).toBeTruthy();
     await stopTransportRuntimeSession('deck_launch_wedged_brain');
+  });
+});
+
+/**
+ * The identity prompt is derived from the identity store when a session launches, restarts or is refreshed: never stored
+ * with the session, never a stale copy. Main sessions and sub-sessions go through the same launch path.
+ */
+describe('a session identity is derived at launch, not stored', () => {
+  let projectDir: string;
+  let sharedDbDir: string;
+  const USER_TEXT_V1 = `用户身份契约 v1 ${'中'.repeat(20_000)}`;
+  const USER_TEXT_V2 = `用户身份契约 v2 ${'中'.repeat(20_000)}`;
+  const identityOf = (name: string) => (getTransportRuntime(name) as unknown as { _identityPrompt?: string } | undefined)?._identityPrompt;
+  const userProfile = (content: string) => ({ scope: 'user' as const, scopeKey: '', content, contentHash: content, revision: 1, updatedAt: 1, source: 'mcp' as const });
+
+  beforeEach(async () => {
+    mocks.store.clear();
+    mocks.received.length = 0;
+    mocks.identityStoreThrows = false;
+    clearAllResend();
+    resetTransportQueueStoreForTests();
+    setSessionEventCallback(() => {});
+    setSessionPersistCallback(async () => {});
+    sharedDbDir = await createIsolatedSharedContextDb('session-launch-identity');
+    projectDir = await mkdtemp(path.join(os.tmpdir(), 'imc-launch-identity-'));
+    await putLocalSessionIdentityProfile({ scope: 'user', scopeKey: '', content: USER_TEXT_V1, source: 'mcp' });
+  });
+
+  afterEach(async () => {
+    mocks.identityStoreThrows = false;
+    await removeLocalSessionIdentityProfileQuiet('user', '');
+    await disconnectAll();
+    resetTransportQueueStoreForTests();
+    await cleanupIsolatedSharedContextDb(sharedDbDir);
+    await rm(projectDir, { recursive: true, force: true });
+  });
+
+  it('a main session and a sub-session launched with no identity get it from the store; the record keeps only its digest', async () => {
+    const expected = renderSessionIdentityProfiles([userProfile(USER_TEXT_V1)])!;
+    await launchCodexMain('deck_ident_main_brain', projectDir);
+    await launchCodexMain('deck_sub_identsub', projectDir, { role: 'w1', parentSession: 'deck_ident_main_brain' });
+    for (const name of ['deck_ident_main_brain', 'deck_sub_identsub']) {
+      expect(identityOf(name), name).toBe(expected);
+      const record = mocks.store.get(name)!;
+      expect(record.appliedIdentityHash, name).toBe(identityPromptHash(expected));
+      expect(JSON.stringify(record), name).not.toContain('用户身份契约');
+      expect(record).not.toHaveProperty('identityPrompt');
+      await stopTransportRuntimeSession(name);
+    }
+  });
+
+  it('a restart after the identity was edited runs with the NEW text (nothing stale is kept anywhere)', async () => {
+    await launchCodexMain('deck_ident_restart_brain', projectDir);
+    expect(identityOf('deck_ident_restart_brain')).toContain('v1');
+    await stopTransportRuntimeSession('deck_ident_restart_brain');
+
+    await putLocalSessionIdentityProfile({ scope: 'user', scopeKey: '', content: USER_TEXT_V2, source: 'mcp' });
+    await launchCodexMain('deck_ident_restart_brain', projectDir, { fresh: false });
+    const after = identityOf('deck_ident_restart_brain')!;
+    expect(after).toContain('v2');
+    expect(after).not.toContain('v1');
+    expect(mocks.store.get('deck_ident_restart_brain')!.appliedIdentityHash).toBe(identityPromptHash(after));
+    await stopTransportRuntimeSession('deck_ident_restart_brain');
+  });
+
+  it('an explicit identity handed to a session being created is used as given, and still not stored', async () => {
+    await launchCodexMain('deck_ident_explicit_brain', projectDir, { identityPrompt: 'Explicit creation identity.' });
+    expect(identityOf('deck_ident_explicit_brain')).toBe('Explicit creation identity.');
+    expect(JSON.stringify(mocks.store.get('deck_ident_explicit_brain'))).not.toContain('Explicit creation identity.');
+    await stopTransportRuntimeSession('deck_ident_explicit_brain');
+  });
+
+  it('an identity refresh updates the running session and records only the new digest', async () => {
+    await launchCodexMain('deck_ident_refresh_brain', projectDir);
+    const next = renderSessionIdentityProfiles([userProfile(USER_TEXT_V2)])!;
+    const applied = applyEffectiveSessionIdentity('deck_ident_refresh_brain', next, { refresh: true });
+    expect(applied).toMatchObject({ applied: true, runtimeType: 'transport' });
+    expect(identityOf('deck_ident_refresh_brain')).toBe(next);
+    const record = mocks.store.get('deck_ident_refresh_brain')!;
+    expect(record.appliedIdentityHash).toBe(identityPromptHash(next));
+    expect(JSON.stringify(record)).not.toContain('用户身份契约');
+    // Refreshing to "no identity" clears the digest.
+    applyEffectiveSessionIdentity('deck_ident_refresh_brain', undefined, { refresh: false });
+    expect(identityOf('deck_ident_refresh_brain')).toBeUndefined();
+    expect(mocks.store.get('deck_ident_refresh_brain')!.appliedIdentityHash).toBeUndefined();
+    await stopTransportRuntimeSession('deck_ident_refresh_brain');
+  });
+
+  it('an unavailable identity store never fails the launch: the session starts without an identity, not with a stale one', async () => {
+    mocks.identityStoreThrows = true;
+    await launchCodexMain('deck_ident_down_brain', projectDir);
+    expect(getTransportRuntime('deck_ident_down_brain')?.providerSessionId).toBeTruthy();
+    expect(identityOf('deck_ident_down_brain')).toBeUndefined();
+    expect(mocks.store.get('deck_ident_down_brain')!.appliedIdentityHash).toBeUndefined(); // so the next sync applies the real one
+    await stopTransportRuntimeSession('deck_ident_down_brain');
   });
 });

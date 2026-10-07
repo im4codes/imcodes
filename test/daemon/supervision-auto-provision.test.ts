@@ -1,3 +1,4 @@
+import { identityContentHash } from '../../src/util/identity-prompt-hash.js';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   buildSupervisionExecutionCapabilityId,
@@ -22,10 +23,6 @@ import { SupervisionTaskRegistry } from '../../src/daemon/supervision-state-stor
 import { TASK_PAIR_AUTO_CREATED_SESSION_MAX_PER_PROJECT, TASK_PAIR_CREATED_SESSION_REASONS } from '../../shared/task-pair.js';
 import type { SubSessionRecord } from '../../src/daemon/subsession-manager.js';
 import type { SessionRecord } from '../../src/store/session-store.js';
-import {
-  SESSION_IDENTITY_SCOPES,
-  renderSessionIdentityProfileSection,
-} from '../../shared/session-identity.js';
 
 const NOW = 1_800_000_000_000;
 
@@ -107,7 +104,6 @@ function harness(initial: SessionRecord[], override: Partial<SupervisionAutoProv
       providerId: sub.providerId ?? sub.type,
       activeModel: sub.requestedModel ?? undefined,
       ccPreset: sub.ccPreset ?? undefined,
-      identityPrompt: sub.identityPrompt ?? undefined,
       provisionedIdentityHash: sub.provisionedIdentityHash ?? undefined,
       pairCreatedMetadata: sub.pairCreatedMetadata ?? undefined,
       projectDir: sub.cwd ?? '/repo',
@@ -237,7 +233,7 @@ describe('supervision auto provisioning', () => {
         projectDir: brain.projectDir,
         role: 'w1',
         agentType: 'claude-code-sdk',
-        identityPrompt: 'You are the release engineer.',
+        provisionedIdentityHash: identityContentHash('You are the release engineer.'),
       },
       evidence: { selectedConfig: { ...ANTHROPIC, model: 'opus[1M]' }, origin: 'spawned' },
     });
@@ -261,17 +257,6 @@ describe('supervision auto provisioning', () => {
     expect(second.ok && first.ok && second.target.name).not.toBe(first.ok ? first.target.name : '');
     expect(h.start).toHaveBeenCalledTimes(2);
 
-    if (first.ok) {
-      first.target.provisionedIdentityHash = undefined;
-      first.target.identityPrompt = [
-        '<imcodes-agent-identity>',
-        renderSessionIdentityProfileSection(
-          SESSION_IDENTITY_SCOPES.SESSION,
-          'You are the release engineer.',
-        ),
-        '</imcodes-agent-identity>',
-      ].filter(Boolean).join('\n');
-    }
     clock += 2;
     const firstIdentityAgain = await provisionSupervisionTarget(request({
       provenance: 'manual_explicit',

@@ -28,6 +28,8 @@ import { registerTmuxSessionResource, releaseSessionResources, resourceOwnerEnv 
 import { markSessionLaunchIdentity } from '../../shared/session-resource-lifecycle.js';
 import { isNativeAgentFenceRequiredForLaunch } from './native-collaboration-guard.js';
 import { processLaunchFence } from '../agent/native-agent-fence.js';
+import { resolveEffectiveIdentityPrompt } from './session-identity-resolver.js';
+import { identityPromptHash } from '../util/identity-prompt-hash.js';
 import type { TaskPairCreatedSessionMetadata } from '../../shared/task-pair.js';
 
 export interface SubSessionRecord {
@@ -340,7 +342,8 @@ export async function startSubSession(sub: SubSessionRecord): Promise<void> {
   // Auto-dismiss startup prompts, then inject init message
   const initParts: string[] = [];
   if (sub.description) initParts.push(sub.description);
-  if (sub.identityPrompt) initParts.push(sub.identityPrompt);
+  const initIdentity = sub.identityPrompt ?? await resolveEffectiveIdentityPrompt({ name: sessionName, projectName });
+  if (initIdentity) initParts.push(initIdentity);
   if (presetInitMessage) initParts.push(presetInitMessage);
   if (sub.ccInitPrompt) initParts.push(sub.ccInitPrompt);
   const injectInit = async () => {
@@ -376,7 +379,7 @@ export async function startSubSession(sub: SubSessionRecord): Promise<void> {
     parentSession: sub.parentSession ?? undefined,
     ccPreset: sub.ccPreset ?? undefined,
     description: sub.description ?? undefined,
-    identityPrompt: sub.identityPrompt ?? undefined,
+    ...(sub.identityPrompt ? { appliedIdentityHash: identityPromptHash(sub.identityPrompt) } : {}),
     provisionedIdentityHash: sub.provisionedIdentityHash ?? undefined,
     ...(sub.pairCreatedMetadata ? { pairCreatedMetadata: sub.pairCreatedMetadata } : {}),
     // shellBin (already host-normalized above) persisted for shell/script so a

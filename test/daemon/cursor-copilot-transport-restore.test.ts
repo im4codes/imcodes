@@ -326,6 +326,39 @@ describe("cursor/copilot transport restore", { timeout: 10_000 }, () => {
     expect(spawned?.args).toContain("cursor-chat-restore");
   });
 
+  it("a restored session gets its identity from the identity store (it is not in the stored record)", async () => {
+    const { putLocalSessionIdentityProfile, removeLocalSessionIdentityProfileQuiet } = await import("../../src/daemon/session-identity-local-store.js");
+    await putLocalSessionIdentityProfile({ scope: "user", scopeKey: "", content: "Restore-time user identity.", source: "mcp" });
+    try {
+      mocks.store.set("deck_cursor_identity_brain", {
+        name: "deck_cursor_identity_brain",
+        projectName: "cursoridentity",
+        role: "brain",
+        agentType: "cursor-headless",
+        projectDir: "/tmp/cursor-identity",
+        state: "idle",
+        restarts: 0,
+        restartTimestamps: [],
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        runtimeType: "transport",
+        providerId: "cursor-headless",
+        providerSessionId: "route-cursor-identity",
+        providerResumeId: "cursor-chat-identity",
+        requestedModel: "gpt-5.2",
+        activeModel: "gpt-5.2",
+      });
+      await connectProvider("cursor-headless", {});
+      await restoreTransportSessions("cursor-headless");
+      await flush();
+      const runtime = getTransportRuntime("deck_cursor_identity_brain") as unknown as { _identityPrompt?: string } | undefined;
+      expect(runtime?._identityPrompt).toContain("Restore-time user identity.");
+      expect(JSON.stringify(mocks.store.get("deck_cursor_identity_brain"))).not.toContain("Restore-time user identity.");
+    } finally {
+      await removeLocalSessionIdentityProfileQuiet("user", "");
+    }
+  });
+
   it("restores copilot-sdk sessions with persisted provider resume ids and sends on resumed continuity", async () => {
     mocks.store.set("deck_copilot_restore_brain", {
       name: "deck_copilot_restore_brain",

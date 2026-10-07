@@ -136,6 +136,7 @@ vi.mock('../../src/daemon/session-error.js', () => ({
   emitSessionInlineError: emitSessionInlineErrorMock,
 }));
 
+import { identityPromptHash } from '../../src/util/identity-prompt-hash.js';
 import { subSessionName, detectShells, startSubSession, stopSubSession, rebuildSubSessions, readSubSessionResponse, normalizeShellBinForHost } from '../../src/daemon/subsession-manager.js';
 import { resolveSubSessionCwd } from '../../src/daemon/subsession-cwd.js';
 import { upsertSession } from '../../src/store/session-store.js';
@@ -242,7 +243,7 @@ describe('startSubSession — ccSessionId stored in session-store', () => {
     );
   });
 
-  it('persists a process sub-session startup identity for restart reinjection', async () => {
+  it('persists a process sub-session startup identity digest (never the text); a restart derives the text from the identity store', async () => {
     await startSubSession({
       id: 'identity-contract',
       type: 'claude-code',
@@ -252,9 +253,10 @@ describe('startSubSession — ccSessionId stored in session-store', () => {
     });
 
     expect(upsertSession).toHaveBeenCalledWith(expect.objectContaining({
-      identityPrompt: 'You are the release engineer.',
+      appliedIdentityHash: identityPromptHash('You are the release engineer.'),
       provisionedIdentityHash: 'identity-sha256',
     }));
+    for (const [record] of upsertSession.mock.calls) expect(JSON.stringify(record)).not.toContain('You are the release engineer.');
   });
 
   it('calls startWatchingFile (not startWatching) for cc sub-session with ccSessionId', async () => {

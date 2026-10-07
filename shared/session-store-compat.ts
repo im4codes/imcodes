@@ -32,12 +32,39 @@ export function isSessionsJsonCompatExportEnabled(nowMs: number = Date.now()): b
 
 /**
  * A top-level string field of a session record longer than this many UTF-16 units is stored ONCE in the
- * database's blob table (keyed by its hash) and the record keeps only a reference. 158 (2026-10-07): 117 of
- * 180 records each carried their own 250-550 KB copy of one of nine user identity contracts (`identityPrompt`),
- * so the store grew from 8.4 MB (sessions.json, which de-duplicated them in `identityPrompts`) to 84 MB after the
- * SQLite migration (payload per row, no de-duplication), and every sweep / export serialised 45 MB.
+ * database's blob table (keyed by its hash) and the record keeps only a reference. This is a bound for any large
+ * field; the identity prompt is NOT one of them any more: it is not stored at all (see SESSION_IDENTITY_PROMPT_FIELD).
+ * 158 (2026-10-07): 117 of 180 records each carried their own 250-550 KB copy of one of nine user identity contracts, so
+ * the store grew from 8.4 MB to 84 MB after the SQLite migration, and every sweep / export serialised 45 MB.
  */
 export const SESSION_RECORD_INLINE_STRING_MAX_CHARS = 4096;
+
+/**
+ * The rendered identity contract is derived data (user / project / session profiles, rendered at the moment a session
+ * launches or its identity is refreshed), never session state: a session record carries none of these fields, a row that
+ * still has one is migrated (SESSION_DB_META_IDENTITY_SCRUB) and a record that is read never exposes one.
+ */
+export const SESSION_IDENTITY_PROMPT_FIELD = 'identityPrompt';
+/** The reference name the previous build stored the prompt's blob under. */
+export const SESSION_IDENTITY_PROMPT_REF_FIELD = 'identityPromptRef';
+/** Substring that is in every payload / file that still holds a stored prompt (inline, reference, or the sessions.json table). */
+export const SESSION_IDENTITY_PROMPT_MARKER = `"${SESSION_IDENTITY_PROMPT_FIELD}`;
+/** Recorded in session_store_meta once the stored prompts were removed (a rescan on every start still catches an older build's writes). */
+export const SESSION_DB_META_IDENTITY_SCRUB = 'identity_prompt_scrub';
+
+// --- Files the daemon itself rotates beside the database ---------------------------------------------------------
+// ONLY names built from these are ever deleted by the identity cleanup; every other file is listed, never touched.
+/** `sessions.sqlite.bak.1` .. `.bak.N`: online snapshots of the database (newest = 1). */
+export const SESSION_DB_BACKUP_INFIX = '.bak.';
+export const SESSION_DB_BACKUP_COUNT = 3;
+/** A snapshot being written; renamed to `.bak.1` when complete. */
+export const SESSION_DB_BACKUP_TMP_SUFFIX = '.bak.tmp';
+/** `sessions.json.1` .. `.N`: the pre-SQLite whole-file rotation (newest = 1). */
+export const LEGACY_JSON_BACKUP_COUNT = 5;
+/** The one-time freeze of the migrated sessions.json. Not a rotation: never deleted automatically. */
+export const LEGACY_JSON_FROZEN_SUFFIX = '.migrated-to-sqlite';
+/** `sessions.json.<pid>.<uuid>.tmp`: the compatibility export's temporary file (left behind only by a crash mid-write). */
+export const SESSIONS_JSON_COMPAT_EXPORT_TMP_PATTERN = /^sessions\.json\.\d+\.[0-9a-f-]{36}\.tmp$/;
 
 /** The session database is compacted (VACUUM) once its free pages exceed this and are at least half the file. */
 export const SESSION_DB_VACUUM_MIN_FREE_BYTES = 16 * 1024 * 1024;

@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { syncSessionIdentities, syncSessionIdentity, syncSessionIdentitiesForCommand } from '../../src/daemon/session-identity-sync.js';
+import { identityPromptHash } from '../../src/util/identity-prompt-hash.js';
 import type { SessionRecord } from '../../src/store/session-store.js';
 import {
   renderSessionIdentityProfiles,
@@ -39,9 +40,9 @@ describe('local-only session identity reconciliation', () => {
   it('reads one local snapshot and refreshes only sessions whose effective identity changed', async () => {
     const unchangedPrompt = renderSessionIdentityProfiles([profile('user', '', 'global')]);
     const sessions = [
-      session({ name: 'deck_proj_brain', identityPrompt: unchangedPrompt }),
+      session({ name: 'deck_proj_brain', appliedIdentityHash: identityPromptHash(unchangedPrompt) }),
       session({ name: 'deck_proj_cc1' }),
-      session({ name: 'deck_other_brain', projectName: 'other', identityPrompt: unchangedPrompt, contextNamespace: { scope: 'user_private', userId: 'u1', projectId: 'repo-2' } }),
+      session({ name: 'deck_other_brain', projectName: 'other', appliedIdentityHash: identityPromptHash(unchangedPrompt), contextNamespace: { scope: 'user_private', userId: 'u1', projectId: 'repo-2' } }),
       session({ name: 'deck_stopped', state: 'stopped' }),
     ];
     const listLocalProfiles = vi.fn(async () => [
@@ -68,13 +69,36 @@ describe('local-only session identity reconciliation', () => {
     expect(applyIdentity).not.toHaveBeenCalledWith('deck_stopped', expect.anything(), expect.anything());
   });
 
+  it('an unreadable identity store applies NOTHING (it is not "no identity") and the session keeps what it runs with', async () => {
+    const applyIdentity = vi.fn(() => ({ applied: true }));
+    const sessions = [session({ appliedIdentityHash: 'running-with-this' })];
+    await expect(syncSessionIdentities({
+      listLocalProfiles: async () => { throw new Error('identity store unreadable'); },
+      listLocalSessions: () => sessions,
+      applyIdentity,
+      boundServerId: async () => 'srv-9',
+    })).rejects.toThrow('identity store unreadable');
+    expect(applyIdentity).not.toHaveBeenCalled();
+    expect(sessions[0]!.appliedIdentityHash).toBe('running-with-this');
+  });
+
+  it('a session whose identity was removed is applied once (to nothing), then stays quiet', async () => {
+    const applyIdentity = vi.fn(() => ({ applied: true }));
+    const running = session({ appliedIdentityHash: identityPromptHash('old identity') });
+    const deps = { listLocalProfiles: async () => [], listLocalSessions: () => [running], applyIdentity, boundServerId: async () => 'srv-9' };
+    await expect(syncSessionIdentities(deps)).resolves.toEqual({ status: 'ok', checked: 1, changed: 1 });
+    expect(applyIdentity).toHaveBeenCalledWith('deck_proj_brain', undefined, { refresh: true });
+    running.appliedIdentityHash = undefined; // what applyEffectiveSessionIdentity records for "no identity"
+    await expect(syncSessionIdentities(deps)).resolves.toEqual({ status: 'ok', checked: 1, changed: 0 });
+  });
+
   it('joins a concurrent periodic sync instead of falsely reporting skipped before apply completes', async () => {
     let releaseSnapshot!: (value: SessionIdentityProfile[]) => void;
     const listLocalProfiles = vi.fn(() => new Promise<SessionIdentityProfile[]>((resolve) => { releaseSnapshot = resolve; }));
     const applyIdentity = vi.fn(() => ({ applied: true }));
     const deps = {
       listLocalProfiles,
-      listLocalSessions: () => [session({ identityPrompt: undefined })],
+      listLocalSessions: () => [session({})],
       applyIdentity,
       boundServerId: async () => 'srv-9',
     };
@@ -97,7 +121,7 @@ describe('local-only session identity reconciliation', () => {
     try {
       await syncSessionIdentities({
         listLocalProfiles,
-        listLocalSessions: () => [session({ identityPrompt: undefined })],
+        listLocalSessions: () => [session({})],
         applyIdentity: () => ({ applied: true }),
         boundServerId: async () => 'srv-9',
       });

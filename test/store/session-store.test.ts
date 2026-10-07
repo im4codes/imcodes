@@ -8,6 +8,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { vi } from 'vitest';
 import { markSessionLaunchIdentity } from '../../shared/session-resource-lifecycle.js';
+import { identityContentHash, identityPromptHash } from '../../src/util/identity-prompt-hash.js';
 import {
   SESSION_IDENTITY_PROJECT_MAX_CHARS,
   SESSION_IDENTITY_SESSION_MAX_CHARS,
@@ -28,7 +29,8 @@ const execFileAsync = promisify(execFile);
 async function loadStoreInFreshProcess(sessionName: string): Promise<{
   sessionInstanceId?: string;
   runtimeEpoch?: string;
-  identityPrompt?: string;
+  appliedIdentityHash?: string;
+  provisionedIdentityHash?: string;
 }> {
   const resultMarker = '__IMCODES_SESSION_STORE_RESULT__';
   const moduleUrl = new URL('../../src/store/session-store.ts', import.meta.url).href;
@@ -127,7 +129,8 @@ async function loadStoreInFreshProcess(sessionName: string): Promise<{
   return payload.session as {
     sessionInstanceId?: string;
     runtimeEpoch?: string;
-    identityPrompt?: string;
+    appliedIdentityHash?: string;
+    provisionedIdentityHash?: string;
   };
 }
 
@@ -289,7 +292,7 @@ describe('session-store', () => {
       expect(persisted.deck_real_brain).toBeDefined();
     });
 
-    it('persists a large shared identity prompt exactly on every row and hydrates it on reload', async () => {
+    it('never persists an identity prompt: 60 sessions that carry a 80 KB one store none of it', async () => {
       const prompt = `shared identity\n${'provider-safe instructions\n'.repeat(3_000)}`;
       const store = await importSessionStore();
       for (let index = 0; index < 60; index += 1) {
@@ -305,26 +308,24 @@ describe('session-store', () => {
           createdAt: index + 1,
           updatedAt: index + 1,
           identityPrompt: prompt,
-        });
+        } as Parameters<typeof store.upsertSession>[0]);
       }
 
       await store.flushStore();
       const persisted = persistedSessions(tempDir);
       expect(Object.keys(persisted)).toHaveLength(60);
-      // One copy of the shared prompt in the database, a short reference on every row (the per-row copy was the 84 MB store).
-      const refs = new Set(Object.values(persisted).map((entry) => entry.identityPromptRef));
-      expect(refs.size).toBe(1);
-      expect(Object.values(persisted).every((entry) => entry.identityPrompt === undefined && typeof entry.identityPromptRef === 'string')).toBe(true);
+      expect(Object.values(persisted).every((entry) => !('identityPrompt' in entry) && !('identityPromptRef' in entry))).toBe(true);
       expect(Object.values(persisted).every((entry) => JSON.stringify(entry).length < 1_000)).toBe(true);
-      expect([...persistedSessionBlobs(tempDir).values()]).toEqual([prompt]);
+      expect(persistedSessionBlobs(tempDir).size).toBe(0);
 
       vi.resetModules();
       const reloaded = await importSessionStore();
       await reloaded.loadStore({ probe: false });
-      expect(reloaded.getSession('deck_dedup_37_brain')?.identityPrompt).toBe(prompt);
+      expect(reloaded.getSession('deck_dedup_37_brain')).toBeDefined();
+      expect(reloaded.getSession('deck_dedup_37_brain')).not.toHaveProperty('identityPrompt');
     });
 
-    it('migrates legacy inline identity prompts from sessions.json without changing content', async () => {
+    it('migrates legacy inline identity prompts from sessions.json: the text is dropped, a digest replaces it', async () => {
       const prompt = 'legacy identity\nwith exact content';
       await writeSessionsFixture({
         sessions: {
@@ -338,11 +339,14 @@ describe('session-store', () => {
 
       const store = await importSessionStore();
       await store.loadStore();
-      expect(store.getSession('deck_legacy_prompt_brain')?.identityPrompt).toBe(prompt);
+      expect(store.getSession('deck_legacy_prompt_brain')).not.toHaveProperty('identityPrompt');
+      expect(store.getSession('deck_legacy_prompt_brain')?.appliedIdentityHash).toBe(identityPromptHash(prompt));
       await store.flushStore();
 
-      expect(persistedSessions(tempDir).deck_legacy_prompt_brain).toMatchObject({ identityPrompt: prompt });
-      expect(persistedSessions(tempDir).deck_legacy_prompt_brain).not.toHaveProperty('identityPromptRef');
+      const row = persistedSessions(tempDir).deck_legacy_prompt_brain!;
+      expect(row).toMatchObject({ appliedIdentityHash: identityPromptHash(prompt) });
+      expect(row).not.toHaveProperty('identityPrompt');
+      expect(row).not.toHaveProperty('identityPromptRef');
     });
 
     it('fails closed when a compact snapshot contains a missing identity prompt reference', async () => {
@@ -379,7 +383,7 @@ describe('session-store', () => {
       }
     });
 
-    it('restores a filled three-scope multibyte identity byte-for-byte in a fresh process', async () => {
+    it('a legacy filled three-scope multibyte identity is reduced to its digest in a fresh process (the text itself comes from the identity store: session-identity-resolver.test.ts)', async () => {
       const profile = (scope: 'user' | 'project' | 'session', content: string) => ({
         scope, scopeKey: scope === 'user' ? '' : `${scope}-key`, content, contentHash: scope, revision: 1, updatedAt: 1, source: 'web' as const,
       });
@@ -401,8 +405,10 @@ describe('session-store', () => {
 
       const restored = await loadStoreInFreshProcess('deck_identitycap_brain');
 
-      expect(restored.identityPrompt).toBe(identityPrompt);
-      expect(Array.from(restored.identityPrompt ?? '').length).toBe(Array.from(identityPrompt).length);
+      expect(restored).not.toHaveProperty('identityPrompt');
+      expect(restored.appliedIdentityHash).toBe(identityPromptHash(identityPrompt));
+      // An Agent provisioned with a session identity is still found by it: the hash of the session section is stamped.
+      expect(restored.provisionedIdentityHash).toBe(identityContentHash(`${'é'.repeat(SESSION_IDENTITY_SESSION_MAX_CHARS - 2)}\n!`));
     });
 
     it('reports child and disk evidence when a fresh process cannot find the requested session', async () => {

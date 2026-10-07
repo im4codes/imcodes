@@ -131,6 +131,8 @@ import { beginCrossVendorHandoffState, isCrossVendorHandoffLaunchCurrent, normal
 import { buildCrossVendorHandoffPack, resolveCrossVendorHandoffPack, shouldCreateCrossVendorHandoff } from '../daemon/cross-vendor-handoff.js';
 import { SESSION_ERROR_WORKING_DIRECTORY_NOT_FOUND } from '../../shared/session-errors.js';
 import { isKnownTestSessionLike } from '../../shared/test-session-guard.js';
+import { resolveEffectiveIdentityPrompt } from '../daemon/session-identity-resolver.js';
+import { identityPromptHash } from '../util/identity-prompt-hash.js';
 
 function isStoredTransportSession(record: Pick<SessionRecord, 'runtimeType' | 'agentType'>): boolean {
   return record.runtimeType === RUNTIME_TYPES.TRANSPORT
@@ -1132,7 +1134,8 @@ export async function respawnSession(record: SessionRecord): Promise<boolean> {
     }
     const initParts: string[] = [];
     if (record.description) initParts.push(record.description);
-    if (record.identityPrompt) initParts.push(record.identityPrompt);
+    const identityPrompt = await resolveEffectiveIdentityPrompt(record);
+    if (identityPrompt) initParts.push(identityPrompt);
     if (record.ccPreset && record.agentType === 'claude-code') {
       const { getPreset, getPresetInitMessage } = await import('../daemon/cc-presets.js');
       const preset = await getPreset(record.ccPreset);
@@ -1263,7 +1266,7 @@ export async function relaunchSessionWithSettings(
   const targetProjectDir = overrides.projectDir ?? record.projectDir;
   const targetLabel = overrides.label !== undefined ? overrides.label : (record.label ?? null);
   const targetDescription = overrides.description !== undefined ? overrides.description : (record.description ?? null);
-  const targetIdentityPrompt = overrides.identityPrompt !== undefined ? overrides.identityPrompt : (record.identityPrompt ?? null);
+  const targetIdentityPrompt = overrides.identityPrompt !== undefined ? overrides.identityPrompt : ((await resolveEffectiveIdentityPrompt(record)) ?? null);
   const targetRequestedModel = overrides.requestedModel !== undefined ? overrides.requestedModel : (record.requestedModel ?? null);
   const targetEffort = overrides.effort !== undefined ? overrides.effort : (record.effort ?? null);
   const targetTransportConfig = overrides.transportConfig !== undefined ? overrides.transportConfig : (record.transportConfig ?? null);
@@ -2510,7 +2513,8 @@ export function applyEffectiveSessionIdentity(
   const record = getSession(sessionName);
   if (!record) return { applied: false };
   const normalized = identityPrompt?.trim() || undefined;
-  upsertSession({ ...record, identityPrompt: normalized, updatedAt: Date.now() });
+  // The text is not stored: the record keeps only the digest that says which identity this session runs with.
+  upsertSession({ ...record, appliedIdentityHash: identityPromptHash(normalized), updatedAt: Date.now() });
   const runtime = transportRuntimes.get(sessionName);
   if (!runtime) {
     return { applied: true, runtimeType: 'process', refreshPending: true };
@@ -3185,7 +3189,7 @@ export async function restoreTransportSessions(
         cwd: providerRestoreDirectory ?? s.projectDir,
         label: s.label ?? s.name,
         description: s.description,
-        identityPrompt: s.identityPrompt,
+        identityPrompt: await resolveEffectiveIdentityPrompt(s),
         // User-authored systemPrompt only; the IM.codes identity block and
         // Generated Image Reporting protocol are injected at the assembly
         // layer (peer-level with `MCP_MEMORY_SEARCH_SYSTEM_GUIDANCE`) via
@@ -3428,8 +3432,11 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
 }
 
 async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
-  const { name, projectName, role, agentType, projectDir, skipStore, label, description, identityPrompt, bindExistingKey, skipCreate } = opts;
+  const { name, projectName, role, agentType, projectDir, skipStore, label, description, bindExistingKey, skipCreate } = opts;
   const existing = getSession(name);
+  // An identity handed in by the caller (a session being created) wins; every other launch -- restart, resume, a sub-session
+  // that carries none -- derives it from the identity store, the same as a restore.
+  const identityPrompt = opts.identityPrompt ?? await resolveEffectiveIdentityPrompt({ name, projectName, contextNamespace: existing?.contextNamespace });
   const resourceSessionInstanceId = existing?.sessionInstanceId ?? randomUUID();
   const resourceRuntimeEpoch = randomUUID();
   if (opts.fresh || !existing) clearSummarySyncHistory(name);
@@ -3797,7 +3804,7 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
         ...(sdkDisplay ?? {}),
         ...(effectiveEffort ? { effort: effectiveEffort } : {}),
         description,
-        identityPrompt,
+        appliedIdentityHash: identityPromptHash(identityPrompt),
         ...(effectiveCcPreset ? { ccPreset: effectiveCcPreset } : {}),
         ...(presetContextWindow ? { presetContextWindow } : {}),
         label,
@@ -4171,7 +4178,7 @@ export async function launchSession(opts: LaunchOpts): Promise<void> {
       ...(opts.ccPreset ? { ccPreset: opts.ccPreset } : {}),
       ...(label ? { label } : {}),
       ...(opts.description ? { description: opts.description } : {}),
-      ...(opts.identityPrompt ? { identityPrompt: opts.identityPrompt } : {}),
+      ...(opts.identityPrompt ? { appliedIdentityHash: identityPromptHash(opts.identityPrompt) } : {}),
       ...(opts.parentSession ? { parentSession: opts.parentSession } : {}),
       ...(opts.userCreated ? { userCreated: true } : {}),
       ...(existing?.crossVendorHandoff ? { crossVendorHandoff: existing.crossVendorHandoff } : {}),
@@ -4201,7 +4208,7 @@ export async function launchSession(opts: LaunchOpts): Promise<void> {
         ...(opencodeSessionId ? { opencodeSessionId } : {}),
         ...(opts.qwenModel ? { qwenModel: opts.qwenModel } : {}),
         ...(opts.description ? { description: opts.description } : {}),
-        ...(opts.identityPrompt ? { identityPrompt: opts.identityPrompt } : {}),
+        ...(opts.identityPrompt ? { appliedIdentityHash: identityPromptHash(opts.identityPrompt) } : {}),
         ...(opts.parentSession ? { parentSession: opts.parentSession } : {}),
         ...(opts.userCreated ? { userCreated: true } : {}),
         ...(launchedNativeAgentFence ? { nativeAgentLaunchFence: launchedNativeAgentFence } : {}),
@@ -4257,8 +4264,10 @@ export async function launchSession(opts: LaunchOpts): Promise<void> {
         incrementCounter('handoff.injection_failed', { runtime: RUNTIME_TYPES.PROCESS, source: 'restart' });
       }
     }
-    const initialContext = [opts.description, opts.identityPrompt].filter(Boolean).join('\n\n');
-    if (!initialContext || agentType === 'shell' || agentType === 'script') return;
+    if (agentType === 'shell' || agentType === 'script') return;
+    const launchIdentity = opts.identityPrompt ?? await resolveEffectiveIdentityPrompt({ name, projectName });
+    const initialContext = [opts.description, launchIdentity].filter(Boolean).join('\n\n');
+    if (!initialContext) return;
     try {
       await sendKeys(name, `[Context — absorb silently, do not respond to this message]\n${initialContext}`);
     } catch (error) {

@@ -45,6 +45,7 @@ import {
   readSessionBlobs,
   readSessionPayloads,
   readSessionStoreSnapshot,
+  scrubStoredIdentityRows,
   vacuumSessionDbIfFragmented,
   readSnapshotBlobs,
   readSnapshotPayloads,
@@ -57,18 +58,24 @@ import { assertNotRealImcodesPathInTests, isRealImcodesPath, isUnderTestRunner }
 import { readInstanceLockMetadata, isRecordedProcessIdentityCurrent, type DaemonProcessIdentity } from '../daemon/instance-lock.js';
 import logger from '../util/logger.js';
 import { SESSION_ERROR_WORKING_DIRECTORY_NOT_FOUND } from '../../shared/session-errors.js';
-import { SESSIONS_JSON_COMPAT_EXPORT_MAX_BYTES } from '../../shared/session-store-compat.js';
-import { SESSION_BLOB_CACHE_MAX_CHARS } from '../../shared/daemon-memory-guard.js';
+import {
+  LEGACY_JSON_BACKUP_COUNT,
+  LEGACY_JSON_FROZEN_SUFFIX,
+  SESSIONS_JSON_COMPAT_EXPORT_MAX_BYTES,
+  SESSION_DB_BACKUP_COUNT,
+  SESSION_DB_BACKUP_TMP_SUFFIX,
+  SESSION_IDENTITY_PROMPT_FIELD,
+  SESSION_IDENTITY_PROMPT_REF_FIELD,
+} from '../../shared/session-store-compat.js';
 import { registerMemoryProbe } from '../daemon/memory-probes.js';
-import { blobHashesOfPayload, externalizeSessionRecord, hasGenericBlobRefs, hydrateSessionRecord, identityRefOfPayload } from './session-record-blobs.js';
+import { blobHashesOfPayload, externalizeSessionRecord, hasGenericBlobRefs, hydrateSessionRecord, removeStoredIdentity } from './session-record-blobs.js';
 import { imcodesStateDir } from '../util/imcodes-state-dir.js';
+import { cleanupIdentityBackups, type IdentityBackupCleanupDeps } from './session-identity-backups.js';
 
 const DEBOUNCE_MS = 500;
 const SESSION_STORE_DISK_VERSION = 2;
 /** The pre-SQLite snapshot: read once by the migration, then frozen under this suffix. */
 const LEGACY_JSON_FILE = 'sessions.json';
-const LEGACY_JSON_FROZEN_SUFFIX = '.migrated-to-sqlite';
-const LEGACY_JSON_BACKUP_COUNT = 5;
 /**
  * Records mutated in place through getSession() (no store call announces them)
  * are picked up by a full compare of every row against what was last written.
@@ -80,7 +87,6 @@ const FULL_SWEEP_INTERVAL_MS = 5_000;
 let sweepSliceMs = 2;
 /** An online snapshot of the database is taken at most this often; the newest few are kept. */
 let backupIntervalMs = 60 * 60 * 1000;
-const SESSION_DB_BACKUP_COUNT = 3;
 
 /** Test seams. */
 export function setSessionStoreSweepSliceMsForTests(ms: number | undefined): void {
@@ -227,8 +233,11 @@ export interface SessionRecord extends SessionContextBootstrapState {
   providerResumeId?: string;
   /** Session description — used for persona/system prompt injection. */
   description?: string;
-  /** Effective synchronized user/project/session identity contract. */
-  identityPrompt?: string;
+  /**
+   * Digest of the identity prompt this session last launched with or was refreshed to (identityPromptHash) -- NOT the
+   * prompt: that is derived from the identity store when needed and is never stored with the session.
+   */
+  appliedIdentityHash?: string;
   /** SHA-256 of the explicit startup identity used for deterministic Agent reuse. */
   provisionedIdentityHash?: string;
   /** CC env preset name — persisted so respawn can re-inject the same env vars. */
@@ -302,17 +311,6 @@ export interface SessionRecord extends SessionContextBootstrapState {
 
 export interface SessionStore {
   sessions: Record<string, SessionRecord>;
-}
-
-interface PersistedSessionRecord extends Omit<SessionRecord, 'identityPrompt'> {
-  identityPromptRef?: string;
-}
-
-/** The pre-SQLite sessions.json shape, read only by the one-time migration and the unmigrated read-only fallback. */
-interface PersistedSessionStoreV2 {
-  version: typeof SESSION_STORE_DISK_VERSION;
-  sessions: Record<string, PersistedSessionRecord>;
-  identityPrompts: Record<string, string>;
 }
 
 export interface LoadStoreOptions {
@@ -544,33 +542,24 @@ function isObjectRecord(value: unknown): value is Record<string, unknown> {
 
 function hydrateStore(value: unknown): { store: SessionStore; legacy: boolean } | null {
   if (!isObjectRecord(value) || !isObjectRecord(value.sessions)) return null;
-
-  if (value.version === SESSION_STORE_DISK_VERSION && isObjectRecord(value.identityPrompts)) {
-    const sessions: Record<string, SessionRecord> = {};
-    for (const [name, rawRecord] of Object.entries(value.sessions)) {
-      if (!isObjectRecord(rawRecord)) continue;
-      const { identityPromptRef, identityPrompt: inlineIdentityPrompt, ...record } = rawRecord;
-      const hydratedRecord = { ...record } as unknown as SessionRecord;
-      // Accept an inline value only for a mixed transitional snapshot. A
-      // missing or malformed reference must never become an identity prompt.
-      if (typeof inlineIdentityPrompt === 'string') {
-        hydratedRecord.identityPrompt = inlineIdentityPrompt;
-      } else if (
-        typeof identityPromptRef === 'string'
-        && Object.prototype.hasOwnProperty.call(value.identityPrompts, identityPromptRef)
-        && typeof value.identityPrompts[identityPromptRef] === 'string'
-      ) {
-        hydratedRecord.identityPrompt = value.identityPrompts[identityPromptRef];
-      }
-      sessions[name] = hydratedRecord;
-    }
-    return { store: { sessions }, legacy: false };
+  // A pre-SQLite sessions.json carried the identity prompt inline on every session (legacy) or by reference into
+  // its own `identityPrompts` table (v2). It is not session state: it is dropped here, leaving only the short digests.
+  const table = isObjectRecord(value.identityPrompts) ? value.identityPrompts : null;
+  const sessions: Record<string, SessionRecord> = {};
+  for (const [name, rawRecord] of Object.entries(value.sessions)) {
+    if (!isObjectRecord(rawRecord)) continue;
+    const record: Record<string, unknown> = { ...rawRecord };
+    const reference = record[SESSION_IDENTITY_PROMPT_REF_FIELD];
+    const inline = record[SESSION_IDENTITY_PROMPT_FIELD];
+    const text = typeof inline === 'string'
+      ? inline
+      : table && typeof reference === 'string' && Object.prototype.hasOwnProperty.call(table, reference) && typeof table[reference] === 'string'
+        ? table[reference] as string
+        : undefined;
+    removeStoredIdentity(record, text);
+    sessions[name] = record as unknown as SessionRecord;
   }
-
-  // Legacy snapshots stored identityPrompt inline on every session. Keep
-  // them readable and rewrite them to the compact schema on the daemon-owned
-  // load path. Read-only consumers (probe:false) remain strictly read-only.
-  return { store: { sessions: value.sessions as Record<string, SessionRecord> }, legacy: true };
+  return { store: { sessions }, legacy: table === null };
 }
 
 function pruneNonPersistableSessions(): boolean {
@@ -674,6 +663,55 @@ function legacyImportDone(handle: SessionDbHandle | null): boolean {
   return handle !== null && readSessionDbMeta(handle, SESSION_DB_META_LEGACY_IMPORT) === SESSION_DB_LEGACY_IMPORT_DONE;
 }
 
+/** Remove stored identity prompts from the database; null when that failed (the rows stay as they were, the next start retries). */
+function removeStoredIdentityFromDatabase(handle: SessionDbHandle): { scrubbedRows: number; compacted: boolean } | null {
+  try {
+    const result = scrubStoredIdentityRows(handle);
+    if (result.scrubbedRows > 0) {
+      logger.info({ rows: result.scrubbedRows, compacted: result.compacted }, 'Removed stored identity prompts from the session database (they are derived from the identity store when a session launches)');
+    }
+    if (!result.compacted && result.scrubbedRows > 0) {
+      logger.warn('Session database could not be compacted after the identity prompts were removed; their bytes stay in the free pages until the next start compacts it');
+    }
+    return result;
+  } catch (error) {
+    logger.error({ err: error }, 'Stored identity prompts could not be removed from the session database; the next start retries');
+    return null;
+  }
+}
+
+/** Databases whose rotation products this process already cleaned (a process never writes a prompt, so once is enough). */
+const identityBackupCleanupStarted = new Set<string>();
+let identityBackupCleanup: Promise<void> = Promise.resolve();
+let identityBackupCleanupDeps: IdentityBackupCleanupDeps = {};
+
+/** In the background: loading must not wait for scanning up to eight old files, and nothing here may fail a start. */
+function startIdentityBackupCleanup(targetPath: string): void {
+  if (identityBackupCleanupStarted.has(targetPath)) return;
+  identityBackupCleanupStarted.add(targetPath);
+  identityBackupCleanup = cleanupIdentityBackups(targetPath, join(dirname(targetPath), LEGACY_JSON_FILE), identityBackupCleanupDeps)
+    .then((result) => {
+      if (result.removed.length > 0) {
+        // The newest snapshot may be gone: let the next flush write a clean one instead of waiting out the interval.
+        if (dbPath() === targetPath) lastBackupAt = 0;
+        logger.info({ removed: result.removed }, 'Removed old session backups that held a copy of the identity prompt; clean ones are written on the normal schedule');
+      }
+      if (result.failed.length > 0) logger.warn({ failed: result.failed }, 'Old session backups holding a copy of the identity prompt could not be removed; the next start retries');
+      if (result.untouched.length > 0 && (result.removed.length > 0 || result.failed.length > 0)) {
+        logger.info({ files: result.untouched }, 'Other session files in the state directory were left untouched (not made by the daemon rotation); delete them if they are not needed');
+      }
+    })
+    .catch((error) => { logger.warn({ err: error }, 'Cleaning old session backups failed; the next start retries'); });
+}
+
+/** Test seams: wait for the background cleanup; forget which databases were cleaned; inject the file removal. */
+export async function waitForIdentityBackupCleanupForTests(): Promise<void> { await identityBackupCleanup; }
+export function resetIdentityBackupCleanupForTests(deps: IdentityBackupCleanupDeps = {}): void {
+  identityBackupCleanupStarted.clear();
+  identityBackupCleanup = Promise.resolve();
+  identityBackupCleanupDeps = deps;
+}
+
 /** An empty database with a usable snapshot beside it: restore the newest non-empty one. */
 function restoreFromDatabaseSnapshot(handle: SessionDbHandle, targetPath: string): Map<string, string> | null {
   for (let index = 1; index <= SESSION_DB_BACKUP_COUNT; index += 1) {
@@ -749,6 +787,8 @@ export async function loadStore(options: LoadStoreOptions = {}): Promise<Session
       // sessions.json, so a late file replacement can never land between its read and its rename.
       await settleCompatExportBeforeMigration();
       await migrateLegacyJson(handle);
+      // The identity prompt is not session state: rows an older build stored it in are cleaned BEFORE they are read.
+      const identityScrub = removeStoredIdentityFromDatabase(handle);
       let payloads = readSessionPayloads(handle);
       if (payloads.size === 0) {
         const restored = restoreFromDatabaseSnapshot(handle, targetPath);
@@ -758,6 +798,8 @@ export async function loadStore(options: LoadStoreOptions = {}): Promise<Session
       store = { sessions: recordsFromPayloads(payloads, readSessionBlobs(handle)) };
       // Older processes see the migrated sessions at once -- but only once they ARE migrated.
       if (legacyImportDone(handle)) scheduleCompatExport(targetPath, true);
+      // Only once the live database is clean AND the import of sessions.json is done (those backups are its source until then).
+      if (identityScrub && legacyImportDone(handle)) startIdentityBackupCleanup(targetPath);
     } else {
       const sessions = await readWithoutAuthority(targetPath);
       if (sessions) store = { sessions };
@@ -1019,7 +1061,7 @@ function maybeStartSnapshot(handle: SessionDbHandle, targetPath: string): void {
   }
   if (Date.now() - lastBackupAt < backupIntervalMs) return;
   lastBackupAt = Date.now();
-  const temporary = `${targetPath}.bak.tmp`;
+  const temporary = `${targetPath}${SESSION_DB_BACKUP_TMP_SUFFIX}`;
   const inFlight: Promise<void> = (async () => {
     try {
       await rm(temporary, { force: true });
@@ -1128,22 +1170,13 @@ function scheduleCompatExport(targetPath: string, immediate = false): void {
   compatExportTimer.unref?.();
 }
 
-/** JSON text of identity blobs already serialised for an export (a 550 KB prompt is escaped once, not per export). */
-const compatIdentityJson = new Map<string, string>();
-let compatIdentityJsonChars = 0;
 let lastCompatSkipWarnAt = 0;
 
-/** A payload with generic blob refs, rebuilt with those fields inline (the identity stays a reference). */
+/** A payload with blob refs, rebuilt with those fields inline (older readers know no blob table). */
 function compatInlinePayload(name: string, payload: string): string {
   try {
     const parsed = JSON.parse(payload) as Record<string, unknown>;
-    const identityRef = parsed['identityPromptRef'];
-    const hydrated = hydrateSessionRecord(parsed, (hash) => blobTextByHash.get(hash));
-    if (typeof identityRef === 'string') {
-      delete hydrated['identityPrompt'];
-      hydrated['identityPromptRef'] = identityRef;
-    }
-    return JSON.stringify(hydrated);
+    return JSON.stringify(hydrateSessionRecord(parsed, (hash) => blobTextByHash.get(hash)));
   } catch (error) {
     logger.warn({ err: error, session: name }, 'sessions.json compatibility export: row kept as stored');
     return payload;
@@ -1175,29 +1208,12 @@ function runCompatExport(targetPath: string): Promise<void> {
       const mainStart = performance.now();
       const parts: string[] = [];
       let estimatedBytes = 0;
-      const identityHashes = new Set<string>();
       for (const [name, payload] of committedPayloads) {
-        // Rows carry large fields by reference; older readers expect them inline, except the identity prompt, which
-        // sessions.json always kept in its own de-duplicated `identityPrompts` table.
+        // Rows carry large fields by reference; older readers expect them inline. The identity prompt is in neither
+        // form: it is not stored, so the file an older build reads has no `identityPrompts` table and no prompt.
         const inline = hasGenericBlobRefs(payload) ? compatInlinePayload(name, payload) : payload;
         parts.push(`${JSON.stringify(name)}:${inline}`);
         estimatedBytes += inline.length;
-        const identity = identityRefOfPayload(inline);
-        if (identity) identityHashes.add(identity);
-      }
-      const identityEntries: string[] = [];
-      for (const hash of identityHashes) {
-        const text = blobTextByHash.get(hash);
-        if (text === undefined) continue; // an unresolvable reference leaves that session without an identity for the older reader, never a wrong one
-        let json = compatIdentityJson.get(hash);
-        if (json === undefined) {
-          json = JSON.stringify(text);
-          if (compatIdentityJson.size >= 256 || compatIdentityJsonChars + json.length > SESSION_BLOB_CACHE_MAX_CHARS) { compatIdentityJson.clear(); compatIdentityJsonChars = 0; }
-          compatIdentityJson.set(hash, json);
-          compatIdentityJsonChars += json.length;
-        }
-        estimatedBytes += json.length;
-        identityEntries.push(`"${hash}":${json}`);
       }
       if (estimatedBytes > SESSIONS_JSON_COMPAT_EXPORT_MAX_BYTES) {
         // The file is write-only for older builds; past the budget the main thread is worth more than a fresher copy of it.
@@ -1217,7 +1233,7 @@ function runCompatExport(targetPath: string): Promise<void> {
         tmp: `${jsonPath}.${process.pid}.${randomUUID()}.tmp`,
         head: `{"version":${SESSION_STORE_DISK_VERSION},"${SESSIONS_JSON_COMPAT_EXPORT_MARKER_KEY}":${marker},"sessions":{`,
         parts,
-        tail: `},"identityPrompts":{${identityEntries.join(',')}}}`,
+        tail: '}}',
       });
       compatExportStats.lastMainThreadMs = performance.now() - mainStart; // building + handing over; the write is in the worker
       const result = await pending;

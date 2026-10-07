@@ -1,14 +1,7 @@
 import { applyEffectiveSessionIdentity } from '../agent/session-manager.js';
-import { listSessions, type SessionRecord } from '../store/session-store.js';
-import {
-  SESSION_IDENTITY_SCOPES,
-  renderSessionIdentityProfiles,
-  sessionIdentityProjectKey,
-  sessionIdentitySessionKey,
-  type SessionIdentityProfile,
-} from '../../shared/session-identity.js';
+import { listSessions } from '../store/session-store.js';
 import { listLocalSessionIdentityProfiles } from './session-identity-local-store.js';
-import { loadCredentials } from '../bind/bind-flow.js';
+import { resolveEffectiveIdentities, type IdentityResolverDeps } from './session-identity-resolver.js';
 
 /**
  * Periodic LOCAL reconciliation only -- a safety net that recomputes every
@@ -37,12 +30,11 @@ export interface SessionIdentitySyncDeps {
   boundServerId?: () => Promise<string | undefined>;
 }
 
-async function defaultBoundServerId(): Promise<string | undefined> {
-  try {
-    return (await loadCredentials())?.serverId;
-  } catch {
-    return undefined;
-  }
+function resolverDeps(deps: SessionIdentitySyncDeps): IdentityResolverDeps {
+  return {
+    listProfiles: deps.listLocalProfiles ?? listLocalSessionIdentityProfiles,
+    ...(deps.boundServerId ? { boundServerId: deps.boundServerId } : {}),
+  };
 }
 
 export interface SessionIdentityRefreshAck {
@@ -55,23 +47,6 @@ export interface SessionIdentityRefreshAck {
 let syncInFlight: Promise<SessionIdentitySyncResult> | null = null;
 let syncTimer: ReturnType<typeof setInterval> | null = null;
 
-function profilesForSession(
-  profiles: readonly SessionIdentityProfile[],
-  session: SessionRecord,
-  serverId: string,
-): SessionIdentityProfile[] {
-  const sessionKey = sessionIdentitySessionKey(serverId, session.name);
-  const projectKey = sessionIdentityProjectKey({
-    contextNamespace: session.contextNamespace,
-    project: session.projectName,
-  });
-  return profiles.filter((profile) => (
-    (profile.scope === SESSION_IDENTITY_SCOPES.USER && profile.scopeKey === '')
-    || (profile.scope === SESSION_IDENTITY_SCOPES.PROJECT && profile.scopeKey === projectKey)
-    || (profile.scope === SESSION_IDENTITY_SCOPES.SESSION && profile.scopeKey === sessionKey)
-  ));
-}
-
 /** Recompute every live session's identity prompt from the local cache and apply on drift. */
 export async function syncSessionIdentities(
   deps: SessionIdentitySyncDeps = {},
@@ -80,14 +55,14 @@ export async function syncSessionIdentities(
   // rather than report a false success before that sync has applied anything.
   if (syncInFlight) return syncInFlight;
   syncInFlight = (async () => {
-    const profiles = await (deps.listLocalProfiles ?? listLocalSessionIdentityProfiles)();
     const sessions = (deps.listLocalSessions ?? listSessions)().filter((session) => session.state !== 'stopped');
-    const serverId = (await (deps.boundServerId ?? defaultBoundServerId)()) ?? '';
+    // Throws when the identity store is unreadable: nothing is applied on a failed read (never "no identity").
+    const resolved = await resolveEffectiveIdentities(sessions, resolverDeps(deps));
     let changed = 0;
     for (const session of sessions) {
-      const prompt = renderSessionIdentityProfiles(profilesForSession(profiles, session, serverId));
-      if ((session.identityPrompt?.trim() || undefined) === prompt) continue;
-      (deps.applyIdentity ?? applyEffectiveSessionIdentity)(session.name, prompt, { refresh: true });
+      const identity = resolved.get(session.name);
+      if (!identity || session.appliedIdentityHash === identity.hash) continue;
+      (deps.applyIdentity ?? applyEffectiveSessionIdentity)(session.name, identity.prompt, { refresh: true });
       changed += 1;
     }
     return { status: 'ok', checked: sessions.length, changed };
@@ -107,13 +82,11 @@ export async function syncSessionIdentity(
   const session = (deps.listLocalSessions ?? listSessions)()
     .find((candidate) => candidate.name === sessionName && candidate.state !== 'stopped');
   if (!session) return { status: 'error', checked: 0, changed: 0, message: 'session identity target is unavailable' };
-  const profiles = await (deps.listLocalProfiles ?? listLocalSessionIdentityProfiles)();
-  const serverId = (await (deps.boundServerId ?? defaultBoundServerId)()) ?? '';
-  const prompt = renderSessionIdentityProfiles(profilesForSession(profiles, session, serverId));
-  if ((session.identityPrompt?.trim() || undefined) === prompt) {
+  const identity = (await resolveEffectiveIdentities([session], resolverDeps(deps))).get(session.name);
+  if (!identity || session.appliedIdentityHash === identity.hash) {
     return { status: 'ok', checked: 1, changed: 0 };
   }
-  (deps.applyIdentity ?? applyEffectiveSessionIdentity)(session.name, prompt, { refresh: true });
+  (deps.applyIdentity ?? applyEffectiveSessionIdentity)(session.name, identity.prompt, { refresh: true });
   return { status: 'ok', checked: 1, changed: 1 };
 }
 
