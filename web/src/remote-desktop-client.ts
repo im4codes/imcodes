@@ -1,3 +1,11 @@
+import {
+  DecodeTimeMonitor,
+  browserDecodeFallbackStore,
+  isRawVideoCodecMime,
+  markPreferH264,
+  shouldPreferH264,
+  type DecodeFallbackStore,
+} from './remote-desktop-decode-fallback.js';
 import { oneWayServerOffsetMs } from '@shared/clock-sync.js';
 import {
   REMOTE_DESKTOP_ACCESS_MODE,
@@ -209,6 +217,9 @@ export interface RemoteDesktopClientDependencies {
   /** Anonymous guest bootstrap proof. It is sent as the bounded first WebSocket
    * frame and cleared from this dependency object immediately afterwards. */
   guestBootstrapProof?: RemoteDesktopBootstrapProof;
+  /** Where "VP8/VP9 decoded too slowly here" is remembered. Defaults to localStorage;
+   *  null disables the fallback. */
+  decodeFallbackStore?: DecodeFallbackStore | null;
 }
 
 function isOpen(channel: RTCDataChannel | null): channel is RTCDataChannel {
@@ -253,20 +264,27 @@ function decodeDataChannelPayload(value: unknown): string | null {
   return null;
 }
 
-export function prioritizeH264ReceiveCodecs(codecs: readonly RTCRtpCodec[]): RTCRtpCodec[] | null {
+export function prioritizeH264ReceiveCodecs(
+  codecs: readonly RTCRtpCodec[],
+  options: { dropVp8Vp9?: boolean } = {},
+): RTCRtpCodec[] | null {
   const h264 = codecs.filter((codec) => codec.mimeType.toLowerCase() === 'video/h264');
   if (h264.length === 0) return null;
+  const rest = codecs.filter((codec) => codec.mimeType.toLowerCase() !== 'video/h264');
   return [
     ...h264,
-    ...codecs.filter((codec) => codec.mimeType.toLowerCase() !== 'video/h264'),
+    // After a session found VP8/VP9 too slow to decode here, leave them out of the
+    // offer so the node can only answer H.264 (see remote-desktop-decode-fallback.ts).
+    ...(options.dropVp8Vp9 ? rest.filter((codec) => !isRawVideoCodecMime(codec.mimeType)) : rest),
   ];
 }
 
 export function applyH264ReceiveCodecPreference(
   transceiver: RTCRtpTransceiver,
   codecs: readonly RTCRtpCodec[],
+  options: { dropVp8Vp9?: boolean } = {},
 ): void {
-  const preferred = prioritizeH264ReceiveCodecs(codecs);
+  const preferred = prioritizeH264ReceiveCodecs(codecs, options);
   if (!preferred || typeof transceiver.setCodecPreferences !== 'function') return;
   try {
     transceiver.setCodecPreferences(preferred);
@@ -1461,7 +1479,12 @@ export class RemoteDesktopClient {
     const capabilities = typeof RTCRtpReceiver !== 'undefined'
       ? RTCRtpReceiver.getCapabilities?.('video')
       : null;
-    if (capabilities) applyH264ReceiveCodecPreference(transceiver, capabilities.codecs);
+    this.decodeMonitor = new DecodeTimeMonitor();
+    if (capabilities) {
+      applyH264ReceiveCodecPreference(transceiver, capabilities.codecs, {
+        dropVp8Vp9: shouldPreferH264(this.decodeFallbackStore(), this.deps.now?.() ?? Date.now()),
+      });
+    }
     // Non-standard, Chromium-only: hints the jitter buffer to minimize
     // buffering rather than smooth over network jitter, the same tradeoff
     // cloud-gaming/remote-control WebRTC products make. Chrome's default
@@ -1816,6 +1839,7 @@ export class RemoteDesktopClient {
       });
       const inbound = entries.find((value) => value.type === 'inbound-rtp'
         && (value.kind === 'video' || value.mediaType === 'video'));
+      if (inbound) this.observeDecodeTime(entries, inbound);
       if (inbound) {
         const diagnosticNumber = (name: string, multiplier = 1): number | undefined => {
           const value = inbound[name];
@@ -1970,6 +1994,37 @@ export class RemoteDesktopClient {
     } finally {
       this.statsInFlight = false;
     }
+  }
+
+  private decodeMonitor = new DecodeTimeMonitor();
+
+  private decodeFallbackStore(): DecodeFallbackStore | null {
+    return this.deps.decodeFallbackStore !== undefined
+      ? this.deps.decodeFallbackStore
+      : browserDecodeFallbackStore();
+  }
+
+  /** VP9/VP8 that this browser decodes slowly is remembered for the NEXT offer. */
+  private observeDecodeTime(
+    entries: ReadonlyArray<Record<string, unknown>>,
+    inbound: Record<string, unknown>,
+  ): void {
+    const store = this.decodeFallbackStore();
+    if (!store) return;
+    const codecId = inbound.codecId;
+    const codec = typeof codecId === 'string'
+      ? entries.find((value) => value.type === 'codec' && value.id === codecId)
+      : undefined;
+    const number = (value: unknown): number | undefined =>
+      typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+    const verdict = this.decodeMonitor.observe({
+      visible: this.deps.isDocumentVisible?.()
+        ?? (typeof document === 'undefined' || document.visibilityState === 'visible'),
+      mimeType: typeof codec?.mimeType === 'string' ? codec.mimeType : undefined,
+      framesDecoded: number(inbound.framesDecoded),
+      totalDecodeTimeSeconds: number(inbound.totalDecodeTime),
+    });
+    if (verdict === 'slow') markPreferH264(store, this.deps.now?.() ?? Date.now());
   }
 
   private async restartIce(peer: RTCPeerConnection): Promise<void> {

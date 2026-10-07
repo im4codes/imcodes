@@ -2389,6 +2389,114 @@ describe('RemoteDesktopClient', () => {
     intervalSpy.mockRestore();
   });
 
+  describe('VP9 decode-time fallback', () => {
+    const receiverCodecs = [
+      videoCodec('video/VP8'), videoCodec('video/H264', 'packetization-mode=1'),
+      videoCodec('video/VP9', 'profile-id=0'), videoCodec('video/rtx', 'apt=96'),
+    ];
+
+    async function startClient(store: { value: string | null }, mime: string, visible = true, startAt = 0) {
+      const intervalSpy = vi.spyOn(globalThis, 'setInterval');
+      vi.stubGlobal('RTCRtpReceiver', { getCapabilities: () => ({ codecs: receiverCodecs }) });
+      let socket!: FakeSocket;
+      let peer!: FakePeer;
+      let transceiver: { setCodecPreferences: ReturnType<typeof vi.fn> } | undefined;
+      let now = startAt;
+      const client = new RemoteDesktopClient('controlled-mac', { onSnapshot: vi.fn() }, {
+        fetchTicket: async () => 'ticket-decode',
+        createSocket: () => {
+          socket = new FakeSocket();
+          queueMicrotask(() => socket.open());
+          return socket as unknown as WebSocket;
+        },
+        createPeer: () => {
+          peer = new FakePeer();
+          const original = peer.addTransceiver.bind(peer);
+          peer.addTransceiver = (() => {
+            const created = original();
+            transceiver = created as unknown as { setCodecPreferences: ReturnType<typeof vi.fn> };
+            return created;
+          }) as FakePeer['addTransceiver'];
+          return peer as unknown as RTCPeerConnection;
+        },
+        now: () => now,
+        isDocumentVisible: () => visible,
+        decodeFallbackStore: {
+          get: () => store.value,
+          set: (value: string) => { store.value = value; },
+          remove: () => { store.value = null; },
+        },
+      });
+      await client.start();
+      const start = JSON.parse(socket.sent[0]!) as { requestId: string };
+      socket.receive({
+        type: REMOTE_DESKTOP_MSG.AUTHORIZED,
+        requestId: start.requestId, sessionId: 'session_decode01', capability: 'd'.repeat(43),
+        expiresAt: 3_600_000, leaseExpiresAt: 3_600_000, daemonGeneration: 1,
+        mode: REMOTE_DESKTOP_ACCESS_MODE.CONTROL, inputEpoch: 1,
+        iceServers: ['stun:stun.example.test:3478'],
+      });
+      await vi.waitFor(() => expect(peer).toBeDefined());
+      peer.connect();
+      const statsTick = intervalSpy.mock.calls.find((call) => call[1] === 1_000)?.[0] as (() => void);
+      expect(statsTick).toBeTypeOf('function');
+      let frames = 0;
+      let decodeSeconds = 0;
+      let bytes = 0;
+      const sample = async (msPerFrame: number) => {
+        now += 1_000;
+        frames += 10;
+        decodeSeconds += (10 * msPerFrame) / 1_000;
+        bytes += 100_000;
+        peer.stats = [
+          { type: 'inbound-rtp', kind: 'video', codecId: 'C1', bytesReceived: bytes, timestamp: now,
+            frameWidth: 2560, frameHeight: 1350, framesPerSecond: 10, framesDecoded: frames, totalDecodeTime: decodeSeconds },
+          { type: 'codec', id: 'C1', mimeType: mime },
+        ];
+        statsTick();
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      };
+      return { client, sample, transceiver: () => transceiver!, intervalSpy, now: () => now };
+    }
+
+    it('remembers a slow VP9 decode for the next offer, which then leaves VP8/VP9 out', async () => {
+      const store: { value: string | null } = { value: null };
+      const first = await startClient(store, 'video/VP9');
+      // The first offer still carries VP9: nothing is known yet.
+      expect(first.transceiver().setCodecPreferences).toHaveBeenCalledTimes(1);
+      expect((first.transceiver().setCodecPreferences.mock.calls[0]![0] as RTCRtpCodec[]).map((c) => c.mimeType))
+        .toContain('video/VP9');
+      for (let i = 0; i < 6; i += 1) await first.sample(70);
+      expect(store.value).toBeNull();
+      for (let i = 0; i < 8; i += 1) await first.sample(70);
+      expect(store.value).not.toBeNull();
+      first.client.stop();
+      first.intervalSpy.mockRestore();
+
+      // The same wall clock, a moment later: the preference is a few days long.
+      const second = await startClient(store, 'video/VP9', true, first.now() + 60_000);
+      const offered = (second.transceiver().setCodecPreferences.mock.calls[0]![0] as RTCRtpCodec[]).map((c) => c.mimeType);
+      expect(offered).toEqual(['video/H264', 'video/rtx']);
+      second.client.stop();
+      second.intervalSpy.mockRestore();
+    });
+
+    it('does not flag a fast VP9 decode, an H.264 stream, or a hidden tab', async () => {
+      for (const scenario of [
+        { mime: 'video/VP9', ms: 10, visible: true },
+        { mime: 'video/H264', ms: 90, visible: true },
+        { mime: 'video/VP9', ms: 90, visible: false },
+      ]) {
+        const store: { value: string | null } = { value: null };
+        const run = await startClient(store, scenario.mime, scenario.visible);
+        for (let i = 0; i < 20; i += 1) await run.sample(scenario.ms);
+        expect(store.value).toBeNull();
+        run.client.stop();
+        run.intervalSpy.mockRestore();
+      }
+    });
+  });
+
   // The ICE-candidate flood cap is a per-negotiation guard: `renegotiate()`
   // already rezeroes it for each new generation. The client-initiated restart
   // path does not, so candidates accumulate across generations until a
