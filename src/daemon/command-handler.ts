@@ -233,10 +233,12 @@ import {
 } from '../../shared/codebuddy.js';
 import {
   DAEMON_UPGRADE_BLOCK_REASON,
+  DAEMON_UPGRADE_FORCE_FIELD,
   DAEMON_UPGRADE_SOURCE,
   DAEMON_UPGRADE_TARGET_LATEST,
   isDaemonAutoUpgradeDisabledByEnv,
   normalizeDaemonUpgradeTargetVersion,
+  resolveDaemonUpgradeForce,
   resolveDaemonUpgradeSource,
   type DaemonUpgradeSource,
 } from '../../shared/daemon-upgrade.js';
@@ -2130,6 +2132,7 @@ function dispatchWebCommand(cmd: Record<string, unknown>, serverLink: ServerLink
           upgradeId,
           typeof cmd.registry === 'string' ? cmd.registry : undefined,
           source,
+          resolveDaemonUpgradeForce(cmd[DAEMON_UPGRADE_FORCE_FIELD], source),
         );
       } catch {
         logger.warn({ targetVersion: cmd.targetVersion }, 'daemon.upgrade rejected invalid targetVersion');
@@ -8551,6 +8554,8 @@ async function handleDaemonUpgrade(
   upgradeId?: string,
   registryOverride?: string,
   source: DaemonUpgradeSource = DAEMON_UPGRADE_SOURCE.MANUAL,
+  /** Operator-confirmed forced upgrade: skip the busy gates (never the safety pre-flights). */
+  force = false,
 ): Promise<void> {
   const UPGRADE_MEMORY_FREEZE_TTL_MS = 15 * 60 * 1000;
 
@@ -8567,10 +8572,33 @@ async function handleDaemonUpgrade(
       { targetVersion, reason: envDisabled ? 'env' : 'config' },
       'daemon.upgrade: auto-upgrade disabled — skipping',
     );
+    // Say so explicitly: silence made the server believe the command was
+    // accepted and retry on its failure backoff. This reason is not retryable
+    // and is not a failure; manual upgrades are unaffected.
+    try {
+      serverLink?.send({
+        type: DAEMON_MSG.UPGRADE_BLOCKED,
+        reason: DAEMON_UPGRADE_BLOCK_REASON.AUTO_UPGRADE_DISABLED,
+        disabledBy: envDisabled ? 'env' : 'config',
+      });
+    } catch { /* ignore */ }
     return;
   }
 
-  const activeRuns = getActiveP2pRunsBlockingDaemonUpgrade();
+  // A forced (operator-confirmed) upgrade skips ONLY the busy gates below and
+  // names what it is about to interrupt. Pre-flights (downgrade guard,
+  // registry, toolchain) and the memory freeze still apply.
+  const activeRuns = force ? [] : getActiveP2pRunsBlockingDaemonUpgrade();
+  if (force) {
+    const skippedBusy = {
+      p2pRunIds: getActiveP2pRunsBlockingDaemonUpgrade().map((run) => run.id),
+      autoDeliverRunIds: getActiveOpenSpecAutoDeliverRunsBlockingDaemonUpgrade().map((run) => run.runId),
+      activeMasterCompactions: getInflightMasterCompactionCount(),
+      activeSessions: getActiveSessionsBlockingDaemonUpgrade().map((reason) => reason.name),
+    };
+    logger.warn({ targetVersion, ...skippedBusy }, 'daemon.upgrade: FORCED by the operator — skipping the busy gates; running work will be interrupted');
+    upgradeSessionBusyDeferredSince = null;
+  }
   if (activeRuns.length > 0) {
     logger.warn({
       targetVersion,
@@ -8580,14 +8608,14 @@ async function handleDaemonUpgrade(
     try {
       serverLink?.send({
         type: DAEMON_MSG.UPGRADE_BLOCKED,
-        reason: 'p2p_active',
+        reason: DAEMON_UPGRADE_BLOCK_REASON.P2P_ACTIVE,
         activeRunIds: activeRuns.map((run) => run.id),
       });
     } catch { /* ignore */ }
     return;
   }
 
-  const activeOpenSpecAutoDeliverRuns = getActiveOpenSpecAutoDeliverRunsBlockingDaemonUpgrade();
+  const activeOpenSpecAutoDeliverRuns = force ? [] : getActiveOpenSpecAutoDeliverRunsBlockingDaemonUpgrade();
   if (activeOpenSpecAutoDeliverRuns.length > 0) {
     logger.warn({
       targetVersion,
@@ -8598,7 +8626,7 @@ async function handleDaemonUpgrade(
     try {
       serverLink?.send({
         type: DAEMON_MSG.UPGRADE_BLOCKED,
-        reason: 'auto_deliver_active',
+        reason: DAEMON_UPGRADE_BLOCK_REASON.AUTO_DELIVER_ACTIVE,
         activeRunIds: activeOpenSpecAutoDeliverRuns.map((run) => run.runId),
         activeOpenSpecAutoDeliverRuns,
       });
@@ -8606,13 +8634,13 @@ async function handleDaemonUpgrade(
     return;
   }
 
-  const activeMasterCompactions = getInflightMasterCompactionCount();
+  const activeMasterCompactions = force ? 0 : getInflightMasterCompactionCount();
   if (activeMasterCompactions > 0) {
     logger.warn({ targetVersion, activeMasterCompactions }, 'daemon.upgrade: blocked because master compaction is active');
     try {
       serverLink?.send({
         type: DAEMON_MSG.UPGRADE_BLOCKED,
-        reason: 'master_compaction_active',
+        reason: DAEMON_UPGRADE_BLOCK_REASON.MASTER_COMPACTION_ACTIVE,
         activeMasterCompactions,
       });
     } catch { /* ignore */ }
@@ -8632,7 +8660,7 @@ async function handleDaemonUpgrade(
   // gate only checked transport runtimes, so a `claude-code` CLI in tmux
   // mid-turn would silently get killed by self-upgrade restart, throwing
   // away the in-flight generation.
-  const activeSessions = getActiveSessionsBlockingDaemonUpgrade();
+  const activeSessions = force ? [] : getActiveSessionsBlockingDaemonUpgrade();
   const deferralBackstop = evaluateUpgradeDeferralBackstop({
     blocked: activeSessions.length > 0,
     deferredSince: upgradeSessionBusyDeferredSince,
@@ -8650,7 +8678,7 @@ async function handleDaemonUpgrade(
     try {
       serverLink?.send({
         type: DAEMON_MSG.UPGRADE_BLOCKED,
-        reason: activeSessions.every((reason) => reason.runtimeType === 'transport') ? 'transport_busy' : 'session_busy',
+        reason: activeSessions.every((reason) => reason.runtimeType === 'transport') ? DAEMON_UPGRADE_BLOCK_REASON.TRANSPORT_BUSY : DAEMON_UPGRADE_BLOCK_REASON.SESSION_BUSY,
         activeSessionNames: activeSessions.map((reason) => reason.name),
         blockedSessions: activeSessions,
       });
@@ -8690,7 +8718,7 @@ async function handleDaemonUpgrade(
       try {
         serverLink?.send({
           type: DAEMON_MSG.UPGRADE_BLOCKED,
-          reason: 'cooldown_active',
+          reason: DAEMON_UPGRADE_BLOCK_REASON.COOLDOWN_ACTIVE,
           cooldownRemainingMs: verdict.remainingMs,
           lastUpgradeAt: verdict.lastAt,
         });
@@ -8785,7 +8813,7 @@ async function handleDaemonUpgrade(
       try {
         serverLink?.send({
           type: DAEMON_MSG.UPGRADE_BLOCKED,
-          reason: 'toolchain_unavailable',
+          reason: DAEMON_UPGRADE_BLOCK_REASON.TOOLCHAIN_UNAVAILABLE,
           nodeBinPresent: false,
           npmAvailable: toolchain.npmCli !== null,
         });
@@ -8870,13 +8898,13 @@ async function handleDaemonUpgrade(
   };
 
   try {
-    const postFreezeMasterCompactions = getInflightMasterCompactionCount();
+    const postFreezeMasterCompactions = force ? 0 : getInflightMasterCompactionCount();
     if (postFreezeMasterCompactions > 0) {
       logger.warn({ targetVersion, activeMasterCompactions: postFreezeMasterCompactions }, 'daemon.upgrade: blocked because master compaction became active after freeze');
       try {
         serverLink?.send({
           type: DAEMON_MSG.UPGRADE_BLOCKED,
-          reason: 'master_compaction_active',
+          reason: DAEMON_UPGRADE_BLOCK_REASON.MASTER_COMPACTION_ACTIVE,
           activeMasterCompactions: postFreezeMasterCompactions,
         });
       } catch { /* ignore */ }

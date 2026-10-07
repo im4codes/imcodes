@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { DAEMON_COMMAND_TYPES } from '../../shared/daemon-command-types.js';
-import { DAEMON_UPGRADE_DELIVERY_STATUS } from '../../shared/daemon-upgrade.js';
+import { DAEMON_UPGRADE_DELIVERY_STATUS, DAEMON_UPGRADE_FORCE_FIELD } from '../../shared/daemon-upgrade.js';
 import { DaemonUpgradeCoordinator } from '../src/ws/daemon-upgrade-coordinator.js';
 import {
   DaemonUpgradePublicationGate,
@@ -350,5 +350,91 @@ describe('DaemonUpgradeCoordinator npm publication gate', () => {
     expect(coordinator.sentLifecycleFor(undefined)).toBeNull();
     coordinator.prepareRetryAfterDaemonRestart(50);
     expect(coordinator.sentLifecycleFor('2026.7.3192-dev.3593')).toBeNull();
+  });
+});
+
+describe('DaemonUpgradeCoordinator forced manual upgrades and automatic lifecycles', () => {
+  const TARGET = '2026.7.3192-dev.3593';
+  const send = (sent: Record<string, unknown>[], extra: Record<string, unknown> = {}) => ({
+    targetVersion: TARGET,
+    skipPublicationGate: true,
+    isDaemonReady: () => true,
+    isStillCurrent: () => true,
+    send: (message: Record<string, unknown>) => { sent.push(message); },
+    ...extra,
+  });
+
+  it('puts force on the wire only for a manual request that asked for it', () => {
+    const forced: Record<string, unknown>[] = [];
+    new DaemonUpgradeCoordinator().request({ ...send(forced), source: 'manual', force: true });
+    expect(forced[0]).toMatchObject({ source: 'manual', [DAEMON_UPGRADE_FORCE_FIELD]: true });
+
+    const plain: Record<string, unknown>[] = [];
+    new DaemonUpgradeCoordinator().request({ ...send(plain), source: 'manual' });
+    expect(plain[0]).not.toHaveProperty(DAEMON_UPGRADE_FORCE_FIELD);
+
+    const auto: Record<string, unknown>[] = [];
+    new DaemonUpgradeCoordinator().request({ ...send(auto), source: 'auto', force: true });
+    expect(auto[0]).toMatchObject({ source: 'auto' });
+    expect(auto[0]).not.toHaveProperty(DAEMON_UPGRADE_FORCE_FIELD);
+  });
+
+  it('keeps an offline forced request forced when it is flushed later, and when an auto request is promoted onto it', () => {
+    const coordinator = new DaemonUpgradeCoordinator();
+    const sent: Record<string, unknown>[] = [];
+    expect(coordinator.request({ ...send(sent, { isDaemonReady: () => false }), source: 'manual', force: true }).deliveryStatus)
+      .toBe(DAEMON_UPGRADE_DELIVERY_STATUS.PENDING_OFFLINE);
+    // The reconnect-driven auto probe must not demote it (source) nor strip the operator's force.
+    coordinator.request({ ...send(sent, { isDaemonReady: () => false }), source: 'auto' });
+    coordinator.flushPending({ ...send(sent), targetVersion: undefined } as never);
+    expect(sent).toHaveLength(1);
+    expect(sent[0]).toMatchObject({ source: 'manual', [DAEMON_UPGRADE_FORCE_FIELD]: true });
+  });
+
+  it('lets a manual request supersede an automatic command that is already out, instead of answering already_in_progress', () => {
+    const coordinator = new DaemonUpgradeCoordinator();
+    const sent: Record<string, unknown>[] = [];
+    expect(coordinator.request({ ...send(sent), source: 'auto' }).deliveryStatus).toBe(DAEMON_UPGRADE_DELIVERY_STATUS.SENT);
+    expect(coordinator.request({ ...send(sent), source: 'auto' }).deliveryStatus).toBe(DAEMON_UPGRADE_DELIVERY_STATUS.ALREADY_IN_PROGRESS);
+    expect(coordinator.request({ ...send(sent), source: 'manual', force: true }).deliveryStatus).toBe(DAEMON_UPGRADE_DELIVERY_STATUS.SENT);
+    expect(sent.map((m) => m.source)).toEqual(['auto', 'manual']);
+    expect(coordinator.snapshot()).toMatchObject({ source: 'manual', status: 'sent' });
+    // ...and automatic traffic can never take a manual lifecycle back.
+    expect(coordinator.request({ ...send(sent), source: 'auto' }).deliveryStatus).toBe(DAEMON_UPGRADE_DELIVERY_STATUS.ALREADY_IN_PROGRESS);
+    expect(coordinator.snapshot()).toMatchObject({ source: 'manual' });
+  });
+
+  it('lets a forced request outrank an unforced manual one that is already out, but not repeat an equal one', () => {
+    const coordinator = new DaemonUpgradeCoordinator();
+    const sent: Record<string, unknown>[] = [];
+    coordinator.request({ ...send(sent), source: 'manual' });
+    expect(coordinator.request({ ...send(sent), source: 'manual' }).deliveryStatus).toBe(DAEMON_UPGRADE_DELIVERY_STATUS.ALREADY_IN_PROGRESS);
+    expect(coordinator.request({ ...send(sent), source: 'manual', force: true }).deliveryStatus).toBe(DAEMON_UPGRADE_DELIVERY_STATUS.SENT);
+    expect(coordinator.request({ ...send(sent), source: 'manual', force: true }).deliveryStatus).toBe(DAEMON_UPGRADE_DELIVERY_STATUS.ALREADY_IN_PROGRESS);
+    expect(sent).toHaveLength(2);
+  });
+
+  it('sends a deferred (pending_offline) lifecycle at the next request when the daemon is ready', () => {
+    const coordinator = new DaemonUpgradeCoordinator();
+    const sent: Record<string, unknown>[] = [];
+    coordinator.request({ ...send(sent), source: 'auto' });
+    expect(coordinator.deferAfterTransientBlock()).toBe(true);
+    expect(coordinator.snapshot()).toMatchObject({ status: 'pending_offline' });
+    expect(coordinator.request({ ...send(sent), source: 'auto' }).deliveryStatus).toBe(DAEMON_UPGRADE_DELIVERY_STATUS.SENT);
+    expect(sent).toHaveLength(2);
+  });
+
+  it('releases only a sent lifecycle after the daemon refused it', () => {
+    const coordinator = new DaemonUpgradeCoordinator();
+    expect(coordinator.releaseSentLifecycle()).toBe(false);
+    const sent: Record<string, unknown>[] = [];
+    coordinator.request({ ...send(sent), source: 'manual' });
+    expect(coordinator.releaseSentLifecycle()).toBe(true);
+    expect(coordinator.snapshot()).toBeNull();
+    // A fresh request now starts a new lifecycle with a new id.
+    expect(coordinator.request({ ...send(sent), source: 'manual' }).deliveryStatus).toBe(DAEMON_UPGRADE_DELIVERY_STATUS.SENT);
+    expect(new Set(sent.map((m) => m.upgradeId)).size).toBe(2);
+    coordinator.deferAfterTransientBlock();
+    expect(coordinator.releaseSentLifecycle()).toBe(false);
   });
 });

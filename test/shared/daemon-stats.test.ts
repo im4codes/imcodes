@@ -101,3 +101,21 @@ describe('daemon status frame merging', () => {
     expect(isDaemonMainLoopBusy(null)).toBe(false);
   });
 });
+
+describe('automatic-upgrade status on the stats frame', () => {
+  const frame = { cpu: 1, memUsed: 1, memTotal: 2, load1: 0, load5: 0, load15: 0, uptime: 1 };
+  const auto = { status: 'deferred', reason: 'session_busy', targetVersion: '2.0.0', nextRetryAt: 123 };
+
+  it('shows the pending automatic upgrade and clears it as soon as a full frame omits it', () => {
+    const waiting = mergeDaemonStats<DaemonStatsView>(null, { ...frame, autoUpgrade: auto });
+    expect(waiting.autoUpgrade).toEqual(auto);
+    expect(mergeDaemonStats<DaemonStatsView>(waiting, { ...frame }).autoUpgrade).toBeNull();
+  });
+
+  it('ignores a malformed value and never lets a number-less frame blank it', () => {
+    const waiting = mergeDaemonStats<DaemonStatsView>(null, { ...frame, autoUpgrade: auto });
+    expect(mergeDaemonStats<DaemonStatsView>(waiting, { ...frame, autoUpgrade: 'junk' }).autoUpgrade).toBeNull();
+    expect(mergeDaemonStats<DaemonStatsView>(waiting, { daemonVersion: '1.0.1' }).autoUpgrade).toEqual(auto);
+  });
+});
+

@@ -30,7 +30,7 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { DAEMON_MSG } from '../../shared/daemon-events.js';
-import { DAEMON_UPGRADE_BLOCK_REASON } from '../../shared/daemon-upgrade.js';
+import { DAEMON_UPGRADE_BLOCK_REASON, DAEMON_UPGRADE_FORCE_FIELD } from '../../shared/daemon-upgrade.js';
 
 const mocks = vi.hoisted(() => {
   const store = new Map<string, Record<string, any>>();
@@ -43,7 +43,12 @@ const mocks = vi.hoisted(() => {
   const writeCalls: Array<{ path: string; data: string }> = [];
   const upgradeBlockedReport = vi.fn(async () => false);
   let compressionState = { active: false, activeCount: 0, queued: 0, idle: true };
+  // The other busy gates: P2P runs and OpenSpec Auto Deliver runs.
+  const p2pRuns: Array<{ id: string; status: string }> = [];
+  const autoDeliverRuns: Array<Record<string, unknown>> = [];
   return {
+    p2pRuns,
+    autoDeliverRuns,
     store,
     runtimes,
     spawnCalls,
@@ -272,7 +277,21 @@ vi.mock('../../src/context/summary-compressor.js', async (importOriginal) => {
   };
 });
 
+vi.mock('../../src/daemon/p2p-orchestrator.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../src/daemon/p2p-orchestrator.js')>();
+  return { ...actual, listP2pRuns: vi.fn(() => mocks.p2pRuns) };
+});
+
+vi.mock('../../src/daemon/openspec-auto-deliver-orchestrator.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../src/daemon/openspec-auto-deliver-orchestrator.js')>();
+  return {
+    ...actual,
+    getActiveOpenSpecAutoDeliverRunsBlockingDaemonUpgrade: vi.fn(() => mocks.autoDeliverRuns),
+  };
+});
+
 import { handleWebCommand } from '../../src/daemon/command-handler.js';
+import { registerMasterCompaction, resumeAcceptingMasterCompactions } from '../../src/daemon/master-compaction-registry.js';
 
 // ── Helpers ──────────────────────────────────────────────────────────────
 
@@ -577,6 +596,172 @@ describe('daemon.upgrade gate (e2e regression for 3389fab2)', () => {
 
     expect(getBlockedMessage(serverLink)).toBeUndefined();
     expect(mocks.spawnCalls.length).toBeGreaterThan(0);
+  });
+});
+
+// ── Forced manual upgrade vs. the daemon's own busy gates ───────────────────
+//
+// The daemon owns the idle decision. An automatic (or ordinary manual) upgrade
+// is held back by every busy gate and says which one; only an operator-confirmed
+// manual upgrade carrying `force: true` skips them. Auto/replay ignore `force`.
+
+describe('daemon.upgrade: forced manual upgrade skips only the busy gates', () => {
+  type Busy = { name: string; reason: string; arrange: () => void | (() => void) };
+  const busyStates: Busy[] = [
+    {
+      name: 'a running transport turn',
+      reason: DAEMON_UPGRADE_BLOCK_REASON.TRANSPORT_BUSY,
+      arrange: () => addTransportSession('deck_force_brain', { status: 'thinking' }),
+    },
+    {
+      name: 'a queued transport message',
+      reason: DAEMON_UPGRADE_BLOCK_REASON.TRANSPORT_BUSY,
+      arrange: () => addTransportSession('deck_force_brain', { status: 'idle', pendingCount: 2 }),
+    },
+    {
+      name: 'a process (tmux) session mid-turn',
+      reason: DAEMON_UPGRADE_BLOCK_REASON.SESSION_BUSY,
+      arrange: () => {
+        mocks.store.set('deck_force_cli', {
+          name: 'deck_force_cli', projectName: 'deck_force_cli', role: 'brain', agentType: 'claude-code',
+          projectDir: '/tmp/upgrade-gate-e2e', state: 'running', runtimeType: 'process',
+          restarts: 0, restartTimestamps: [], createdAt: 1, updatedAt: 1,
+        });
+      },
+    },
+    {
+      name: 'an active P2P run',
+      reason: DAEMON_UPGRADE_BLOCK_REASON.P2P_ACTIVE,
+      arrange: () => { mocks.p2pRuns.push({ id: 'run-1', status: 'running' }); },
+    },
+    {
+      name: 'an active OpenSpec Auto Deliver run',
+      reason: DAEMON_UPGRADE_BLOCK_REASON.AUTO_DELIVER_ACTIVE,
+      arrange: () => {
+        mocks.autoDeliverRuns.push({
+          runId: 'ad-1', changeName: 'c', status: 'running', stage: 'implementation',
+          owningMainSessionName: 'deck_a_brain', launchedFromSessionName: 'deck_a_brain', targetImplementationSessionName: 'deck_a_w1',
+        });
+      },
+    },
+    {
+      name: 'a master compaction in flight',
+      reason: DAEMON_UPGRADE_BLOCK_REASON.MASTER_COMPACTION_ACTIVE,
+      arrange: () => {
+        // An earlier upgrade in this file froze admission; reopen it so the compaction registers.
+        resumeAcceptingMasterCompactions();
+        let release: () => void = () => {};
+        registerMasterCompaction(() => new Promise<void>((resolve) => { release = resolve; }), { sessionName: 'deck_force_brain' } as never);
+        return () => release();
+      },
+    },
+  ];
+
+  let cleanups: Array<() => void> = [];
+  beforeEach(() => {
+    mocks.store.clear();
+    mocks.runtimes.clear();
+    mocks.spawnCalls.length = 0;
+    mocks.spawnedChildren.length = 0;
+    mocks.p2pRuns.length = 0;
+    mocks.autoDeliverRuns.length = 0;
+    mocks.setCompressionState({ active: false, activeCount: 0, queued: 0, idle: true });
+    cleanups = [];
+  });
+  afterEach(() => {
+    for (const cleanup of cleanups) cleanup();
+    delete process.env.IMCODES_DISABLE_AUTO_UPGRADE;
+    vi.clearAllMocks();
+  });
+
+  const run = async (command: Record<string, unknown>) => {
+    const serverLink = { send: vi.fn() } as { send: ReturnType<typeof vi.fn> };
+    handleWebCommand({ type: 'daemon.upgrade', targetVersion: '99.99.99-test', ...command }, serverLink as any);
+    await flushAsync();
+    return serverLink;
+  };
+  const arrange = (busy: Busy) => {
+    const cleanup = busy.arrange();
+    if (cleanup) cleanups.push(cleanup);
+  };
+
+  describe.each(busyStates)('with $name', (busy) => {
+    it('holds back an automatic upgrade and names the gate', async () => {
+      arrange(busy);
+      const link = await run({ source: 'auto' });
+      expect(getBlockedMessage(link)).toMatchObject({ reason: busy.reason });
+      expect(mocks.spawnCalls).toEqual([]);
+    });
+
+    it('holds back a source-less (legacy server) upgrade the same way', async () => {
+      arrange(busy);
+      const link = await run({});
+      expect(getBlockedMessage(link)).toMatchObject({ reason: busy.reason });
+      expect(mocks.spawnCalls).toEqual([]);
+    });
+
+    it('holds back an ordinary manual upgrade that did not ask to force', async () => {
+      arrange(busy);
+      const link = await run({ source: 'manual' });
+      expect(getBlockedMessage(link)).toMatchObject({ reason: busy.reason });
+      expect(mocks.spawnCalls).toEqual([]);
+    });
+
+    it.each(['auto', 'replay'])('ignores force on a %s upgrade', async (source) => {
+      arrange(busy);
+      const link = await run({ source, [DAEMON_UPGRADE_FORCE_FIELD]: true });
+      expect(getBlockedMessage(link)).toMatchObject({ reason: busy.reason });
+      expect(mocks.spawnCalls).toEqual([]);
+    });
+
+    it('ignores a force that is not literally true', async () => {
+      arrange(busy);
+      for (const force of ['true', 1, 'yes']) {
+        const link = await run({ source: 'manual', [DAEMON_UPGRADE_FORCE_FIELD]: force });
+        expect(getBlockedMessage(link)).toMatchObject({ reason: busy.reason });
+      }
+      expect(mocks.spawnCalls).toEqual([]);
+    });
+
+    it('goes through for a confirmed manual upgrade with force:true, and logs what it interrupts', async () => {
+      arrange(busy);
+      const link = await run({ source: 'manual', [DAEMON_UPGRADE_FORCE_FIELD]: true });
+      await waitForCondition(() => mocks.spawnCalls.length > 0, 5000).catch(() => {});
+      expect(getBlockedMessage(link)).toBeUndefined();
+      expect(mocks.spawnCalls.length).toBeGreaterThan(0);
+    });
+  });
+
+  it('a forced upgrade is not a way around the daemon\'s own opt-out for automatic upgrades', async () => {
+    process.env.IMCODES_DISABLE_AUTO_UPGRADE = '1';
+    const auto = await run({ source: 'auto', [DAEMON_UPGRADE_FORCE_FIELD]: true });
+    expect(getBlockedMessage(auto)).toMatchObject({ reason: DAEMON_UPGRADE_BLOCK_REASON.AUTO_UPGRADE_DISABLED });
+    expect(mocks.spawnCalls).toEqual([]);
+    // ...while manual is unaffected by the opt-out.
+    const manual = await run({ source: 'manual' });
+    await waitForCondition(() => mocks.spawnCalls.length > 0, 5000).catch(() => {});
+    expect(getBlockedMessage(manual)).toBeUndefined();
+    expect(mocks.spawnCalls.length).toBeGreaterThan(0);
+  });
+
+  it('answers a disabled automatic upgrade with an explicit non-retryable receipt instead of silence', async () => {
+    process.env.IMCODES_DISABLE_AUTO_UPGRADE = '1';
+    const link = await run({});
+    expect(getBlockedMessage(link)).toEqual({
+      type: DAEMON_MSG.UPGRADE_BLOCKED,
+      reason: DAEMON_UPGRADE_BLOCK_REASON.AUTO_UPGRADE_DISABLED,
+      disabledBy: 'env',
+    });
+    expect(mocks.spawnCalls).toEqual([]);
+  });
+
+  it('keeps the safety pre-flights for a forced upgrade: it never downgrades', async () => {
+    addTransportSession('deck_force_brain', { status: 'thinking' });
+    // 0.0.1 is older than the running daemon: refused with or without force.
+    const link = await run({ source: 'manual', targetVersion: '0.0.1', [DAEMON_UPGRADE_FORCE_FIELD]: true });
+    await flushAsync();
+    expect(mocks.spawnCalls).toEqual([]);
+    expect(getBlockedMessage(link)).toBeUndefined();
   });
 });
 

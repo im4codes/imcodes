@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { DAEMON_COMMAND_TYPES } from '../../../shared/daemon-command-types.js';
 import {
   DAEMON_UPGRADE_DELIVERY_STATUS,
+  DAEMON_UPGRADE_FORCE_FIELD,
   DAEMON_UPGRADE_SOURCE,
   normalizeDaemonUpgradeTargetVersion,
   shouldSendDaemonUpgradeTargetVersion,
@@ -25,6 +26,8 @@ interface UpgradeState {
   upgradeId: string;
   targetVersion: string;
   source: DaemonUpgradeSource;
+  /** Operator-confirmed forced upgrade; only ever true for a manual lifecycle. */
+  force: boolean;
   status: UpgradeLifecycleState;
   createdAt: number;
   updatedAt: number;
@@ -45,6 +48,8 @@ export interface DaemonUpgradeLifecycleSnapshot {
 export interface RequestDaemonUpgradeInput {
   targetVersion?: unknown;
   source: DaemonUpgradeSource;
+  /** Forced manual upgrade (the confirmation dialog path); ignored for auto/replay. */
+  force?: boolean;
   /** Controlled nodes consume image-embedded native artifacts, not npm. */
   skipPublicationGate?: boolean;
   isDaemonReady: () => boolean;
@@ -80,6 +85,25 @@ export class DaemonUpgradeCoordinator {
       updatedAt: state.updatedAt,
       lastSentAt: state.lastSentAt,
     };
+  }
+
+  /** The operator's latest manual request decides force; a promoted auto/replay request keeps it. */
+  private applyForce(state: UpgradeState, input: RequestDaemonUpgradeInput): void {
+    if (input.source === DAEMON_UPGRADE_SOURCE.MANUAL) state.force = input.force === true;
+    else if (state.source !== DAEMON_UPGRADE_SOURCE.MANUAL) state.force = false;
+  }
+
+  /**
+   * The daemon answered a delivered command with a block receipt and will not
+   * act on it. Forget that delivery so the next request starts a fresh
+   * lifecycle (a later manual click must not be answered `already_in_progress`
+   * for a command the daemon already refused). No-op unless the lifecycle is
+   * `sent`.
+   */
+  releaseSentLifecycle(now = Date.now()): boolean {
+    if (this.current?.status !== 'sent') return false;
+    this.supersedeCurrent(now);
+    return true;
   }
 
   /** Keep a sent lifecycle pending after a transient node-side safety gate. */
@@ -127,6 +151,19 @@ export class DaemonUpgradeCoordinator {
       current = null;
     }
 
+    // A confirmed manual request outranks a server-driven attempt that is
+    // already out (and a forced one outranks an unforced manual one): the
+    // operator must never be answered "already in progress" for a command the
+    // daemon is holding back or ignoring.
+    if (
+      input.source === DAEMON_UPGRADE_SOURCE.MANUAL
+      && current?.status === 'sent'
+      && (current.source !== DAEMON_UPGRADE_SOURCE.MANUAL || (input.force === true && !current.force))
+    ) {
+      this.supersedeCurrent(now);
+      current = null;
+    }
+
     // A user-issued manual request is authoritative over reconnect-driven
     // auto/replay traffic for the same target. In particular, an offline
     // manual request remains pending while auth is incomplete; the auth
@@ -137,6 +174,7 @@ export class DaemonUpgradeCoordinator {
 
     if (current?.status === 'pending_publication') {
       current.source = effectiveInput.source;
+      this.applyForce(current, input);
       current.updatedAt = now;
       if (!effectiveInput.isDaemonReady()) {
         current.status = 'pending_offline';
@@ -149,11 +187,10 @@ export class DaemonUpgradeCoordinator {
       }
       const publication = this.ensureTargetPublished(current, effectiveInput, now);
       if (publication) return publication;
-    } else if (
-      current
-      && current.status !== 'superseded'
-      && !(current.status === 'pending_offline' && !effectiveInput.isDaemonReady())
-    ) {
+    } else if (current && current.status !== 'superseded' && current.status !== 'pending_offline') {
+      // A pending_offline lifecycle is not "in progress": nothing is out. It is
+      // sent below once the daemon is ready (the daemon may be ready right now,
+      // e.g. after a gate receipt deferred an automatic attempt).
       return {
         ok: true,
         upgradeId: current.upgradeId,
@@ -166,6 +203,7 @@ export class DaemonUpgradeCoordinator {
       upgradeId: randomUUID(),
       targetVersion,
       source: effectiveInput.source,
+      force: false,
       status: 'pending_offline' as UpgradeLifecycleState,
       createdAt: now,
       updatedAt: now,
@@ -175,6 +213,7 @@ export class DaemonUpgradeCoordinator {
       publicationCallbackRegistered: false,
     };
     state.source = effectiveInput.source;
+    this.applyForce(state, input);
     state.updatedAt = now;
     this.current = state;
 
@@ -261,6 +300,7 @@ export class DaemonUpgradeCoordinator {
       upgradeId: randomUUID(),
       targetVersion: normalized,
       source: DAEMON_UPGRADE_SOURCE.REPLAY,
+      force: false,
       status: 'terminal_blocked' as UpgradeLifecycleState,
       createdAt: now,
       updatedAt: now,
@@ -427,6 +467,7 @@ export class DaemonUpgradeCoordinator {
       type: DAEMON_COMMAND_TYPES.DAEMON_UPGRADE,
       upgradeId: state.upgradeId,
       source: state.source,
+      ...(state.source === DAEMON_UPGRADE_SOURCE.MANUAL && state.force ? { [DAEMON_UPGRADE_FORCE_FIELD]: true } : {}),
       ...(shouldSendDaemonUpgradeTargetVersion(state.targetVersion) ? { targetVersion: state.targetVersion } : {}),
     };
   }

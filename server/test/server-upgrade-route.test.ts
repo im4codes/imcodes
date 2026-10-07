@@ -202,6 +202,56 @@ describe('server routes', () => {
     });
   });
 
+  it('passes force through only for an explicit force:true in the confirmation body', async () => {
+    process.env.APP_VERSION = '2026.4.905-dev.877';
+    const app = await buildTestApp();
+    const post = (body?: BodyInit) => app.request('/api/server/srv-1/upgrade', {
+      method: 'POST',
+      ...(body === undefined ? {} : { body, headers: { 'content-type': 'application/json' } }),
+    });
+
+    expect((await post(JSON.stringify({ force: true }))).status).toBe(200);
+    expect(mockRequestDaemonUpgrade).toHaveBeenLastCalledWith({
+      targetVersion: '2026.4.905-dev.877',
+      source: 'manual',
+      force: true,
+    });
+
+    for (const body of [JSON.stringify({ force: false }), JSON.stringify({ force: 'true' }), JSON.stringify({ force: 1 }), '{not json', JSON.stringify(['force'])]) {
+      mockRequestDaemonUpgrade.mockClear();
+      await post(body);
+      expect(mockRequestDaemonUpgrade).toHaveBeenLastCalledWith({
+        targetVersion: '2026.4.905-dev.877',
+        source: 'manual',
+      });
+    }
+  });
+
+  it('does not let a user without a server role force an upgrade', async () => {
+    mockResolveServerRole.mockResolvedValueOnce('none');
+    const app = await buildTestApp();
+    const res = await app.request('/api/server/srv-1/upgrade', {
+      method: 'POST',
+      body: JSON.stringify({ force: true }),
+      headers: { 'content-type': 'application/json' },
+    });
+    expect(res.status).toBe(404);
+    expect(mockRequestDaemonUpgrade).not.toHaveBeenCalled();
+  });
+
+  it('exposes the automatic-upgrade status to the card', async () => {
+    mockDaemonUpgradeStatus.mockReturnValueOnce({
+      currentVersion: '2026.4.904-dev.876',
+      upgrade: null,
+      autoUpgrade: { status: 'deferred', reason: 'session_busy', targetVersion: '2026.4.905-dev.877', nextRetryAt: 123 },
+    });
+    const app = await buildTestApp();
+    const res = await app.request('/api/server/srv-1/upgrade');
+    expect(await res.json()).toMatchObject({
+      autoUpgrade: { status: 'deferred', reason: 'session_busy', nextRetryAt: 123 },
+    });
+  });
+
   it('rejects a user with neither membership nor a shared-server operator grant', async () => {
     mockResolveServerRole.mockResolvedValueOnce('none');
     const app = await buildTestApp();

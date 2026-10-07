@@ -183,6 +183,7 @@ import { clearMessagePinsCache } from './hooks/useMessagePins.js';
 import type { ChatLocalWebPreviewOpenHandler } from './components/ChatLoopbackLink.js';
 import { formatDaemonVersionShort } from './util/format-version.js';
 import { DaemonStatusCard, DaemonUpgradeConfirmDialog, type DaemonUpgradeRequestState } from './components/DaemonStatusCard.js';
+import { DAEMON_UPGRADE_FORCED_REQUEST_BODY, isDaemonUpgradeBusyBlockReason } from '@shared/daemon-upgrade.js';
 import { nextDaemonUpgradingState, daemonUpgradingLabel, type DaemonUpgradingState } from './util/daemon-upgrade-status.js';
 import {
   daemonUpgradeBlockedToastKey,
@@ -1553,7 +1554,7 @@ export function App() {
   const performDaemonUpgrade = useCallback(async (server: ServerInfo) => {
     setDaemonUpgradeRequests((previous) => ({ ...previous, [server.id]: { phase: 'requesting' } }));
     try {
-      await apiFetch(`/api/server/${server.id}/upgrade`, { method: 'POST' });
+      await apiFetch(`/api/server/${server.id}/upgrade`, { method: 'POST', body: JSON.stringify(DAEMON_UPGRADE_FORCED_REQUEST_BODY) });
       setDaemonUpgradeRequests((previous) => ({ ...previous, [server.id]: { phase: 'sent' } }));
     } catch {
       setDaemonUpgradeRequests((previous) => ({ ...previous, [server.id]: { phase: 'failed', message: trans('server.upgrade_failed') } }));
@@ -1575,7 +1576,7 @@ export function App() {
         return next;
       });
       const results = await Promise.allSettled(servers.map(async (server) => {
-        await apiFetch(`/api/server/${server.id}/upgrade`, { method: 'POST' });
+        await apiFetch(`/api/server/${server.id}/upgrade`, { method: 'POST', body: JSON.stringify(DAEMON_UPGRADE_FORCED_REQUEST_BODY) });
         return server.id;
       }));
       setDaemonUpgradeRequests((previous) => {
@@ -4738,7 +4739,11 @@ export function App() {
         if (selectedServerId) {
           setDaemonUpgradeRequests((previous) => ({
             ...previous,
-            [selectedServerId]: { phase: 'failed', blockedReason: msg.reason },
+            [selectedServerId]: {
+              phase: 'failed',
+              blockedReason: msg.reason,
+              ...(msg.activeSessionNames?.length ? { blockedSessionNames: msg.activeSessionNames.slice(0, 5) } : {}),
+            },
           }));
         }
         const now = Date.now();
@@ -6329,6 +6334,17 @@ export function App() {
   const daemonUpgradeRequest = selectedServerId
     ? daemonUpgradeRequests[selectedServerId] ?? { phase: 'idle' as const }
     : { phase: 'idle' as const };
+  // What a confirmed upgrade will interrupt: the daemon's most recent block
+  // receipt for this server (a manual attempt) or, failing that, the reason the
+  // automatic trigger is currently waiting on one of the daemon's busy gates.
+  const daemonUpgradeConfirmBlocked = {
+    reason: daemonUpgradeRequest.phase === 'failed' && daemonUpgradeRequest.blockedReason
+      ? daemonUpgradeRequest.blockedReason
+      : (daemonStats?.autoUpgrade?.reason && isDaemonUpgradeBusyBlockReason(daemonStats.autoUpgrade.reason)
+        ? daemonStats.autoUpgrade.reason
+        : null),
+    sessionNames: daemonUpgradeRequest.phase === 'failed' ? daemonUpgradeRequest.blockedSessionNames : undefined,
+  };
   const busyDaemonSessionCount = sessions.filter((session) => session.state === 'running' || session.state === 'queued').length;
   const daemonBadgeState = getDaemonBadgeState(connected, connecting, daemonOnline, selectedServerInfo);
 
@@ -6668,6 +6684,7 @@ export function App() {
               busySessions={busyDaemonSessionCount}
               upgrading={Boolean(daemonUpgrading)}
               requestState={daemonUpgradeRequest}
+              autoUpgrade={daemonStats?.autoUpgrade ?? null}
               onUpgrade={() => handleUpgradeDaemon(selectedServerInfo)}
             />
             {daemonVersionForDisplay && (
@@ -7476,6 +7493,7 @@ export function App() {
                     busySessions={busyDaemonSessionCount}
                     upgrading={Boolean(daemonUpgrading)}
                     requestState={daemonUpgradeRequest}
+                    autoUpgrade={daemonStats?.autoUpgrade ?? null}
                     onUpgrade={() => handleUpgradeDaemon(selectedServerInfo)}
                     compact
                   />
@@ -8128,6 +8146,8 @@ export function App() {
         <DaemonUpgradeConfirmDialog
           busySessions={busyDaemonSessionCount}
           targetCount={daemonUpgradeConfirmTarget === 'all' ? servers.length : 1}
+          blockedReason={daemonUpgradeConfirmTarget === 'all' ? null : daemonUpgradeConfirmBlocked.reason}
+          blockedSessionNames={daemonUpgradeConfirmBlocked.sessionNames}
           onCancel={() => setDaemonUpgradeConfirmTarget(null)}
           onConfirm={() => void confirmDaemonUpgrade()}
         />

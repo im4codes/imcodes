@@ -1,6 +1,7 @@
 import { Hono } from 'hono';
 import { authenticateDaemonServer, daemonAuthFailure } from '../security/daemon-auth.js';
 import type { Env } from '../env.js';
+import { DAEMON_UPGRADE_FORCE_FIELD, DAEMON_UPGRADE_SOURCE } from '../../../shared/daemon-upgrade.js';
 import {
   getFullServersByUserId,
   updateServerHeartbeat,
@@ -419,6 +420,7 @@ serverRoutes.get('/:id/upgrade', requireAuth(), async (c) => {
     currentVersion: status.currentVersion,
     latestVersion: process.env.APP_VERSION ?? null,
     ...(status.upgrade ? { upgrade: status.upgrade } : {}),
+    ...(status.autoUpgrade ? { autoUpgrade: status.autoUpgrade } : {}),
   });
 });
 
@@ -431,9 +433,14 @@ serverRoutes.post('/:id/upgrade', requireAuth(), async (c) => {
   if (!role || role === 'none') {
     return c.json({ error: 'not_found' }, 404);
   }
+  // `force` is the operator's explicit "interrupt running work" confirmation
+  // (the dialog path). Absent or anything but `true` means an ordinary manual
+  // request, which still goes through the daemon's busy gates.
+  const body = await c.req.json().catch(() => null) as Record<string, unknown> | null;
   const result = WsBridge.get(serverId).requestDaemonUpgrade({
     targetVersion: process.env.APP_VERSION,
-    source: 'manual',
+    source: DAEMON_UPGRADE_SOURCE.MANUAL,
+    ...(body?.[DAEMON_UPGRADE_FORCE_FIELD] === true ? { [DAEMON_UPGRADE_FORCE_FIELD]: true } : {}),
   });
   if (!result.ok) {
     return c.json({ error: result.reason ?? 'upgrade_request_failed', deliveryStatus: result.deliveryStatus }, 400);

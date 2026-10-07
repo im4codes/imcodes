@@ -187,14 +187,15 @@ export type ServerMessage =
   | {
     type: typeof DAEMON_MSG.UPGRADE_BLOCKED;
     reason:
-      | 'p2p_active'
-      | 'auto_deliver_active'
-      | 'master_compaction_active'
-      | 'compression_active'
-      | 'transport_busy'
-      | 'session_busy'
-      | 'cooldown_active'
-      | 'toolchain_unavailable'
+      | typeof DAEMON_UPGRADE_BLOCK_REASON.P2P_ACTIVE
+      | typeof DAEMON_UPGRADE_BLOCK_REASON.AUTO_DELIVER_ACTIVE
+      | typeof DAEMON_UPGRADE_BLOCK_REASON.MASTER_COMPACTION_ACTIVE
+      | typeof DAEMON_UPGRADE_BLOCK_REASON.COMPRESSION_ACTIVE
+      | typeof DAEMON_UPGRADE_BLOCK_REASON.TRANSPORT_BUSY
+      | typeof DAEMON_UPGRADE_BLOCK_REASON.SESSION_BUSY
+      | typeof DAEMON_UPGRADE_BLOCK_REASON.COOLDOWN_ACTIVE
+      | typeof DAEMON_UPGRADE_BLOCK_REASON.TOOLCHAIN_UNAVAILABLE
+      | typeof DAEMON_UPGRADE_BLOCK_REASON.AUTO_UPGRADE_DISABLED
       | typeof DAEMON_UPGRADE_BLOCK_REASON.INSTALL_FAILED;
     activeRunIds?: string[];
     activeSessionNames?: string[];
@@ -258,7 +259,7 @@ export type ServerMessage =
   | { type: 'discussion.error'; discussionId?: string; requestId?: string; error: string }
   | { type: 'discussion.list'; discussions: Array<{ id: string; requestId?: string; topic: string; state: string; currentRound: number; maxRounds: number; completedHops?: number; totalHops?: number; currentSpeaker?: string; conclusion?: string; filePath?: string }> }
   | { type: typeof DAEMON_LIVENESS_MSG; daemonVersion?: string | null; mainEventLoopLagMs?: number; mainEventLoopBlockedMs?: number; mainEventLoopBusy?: boolean }
-  | { type: typeof DAEMON_STATS_MSG; daemonVersion?: string | null; latestDaemonVersion?: string | null; cpu: number; memUsed: number; memTotal: number; load1: number; load5: number; load15: number; uptime: number; embedding?: EmbeddingStatus; disks?: DiskUsage[]; shortRefHealth?: MemoryShortRefHealth; directConnectivity?: import('@shared/direct-file-transfer.js').DirectConnectivityRuntimeStatus; mainEventLoopLagMs?: number; mainEventLoopBlockedMs?: number; mainEventLoopBusy?: boolean }
+  | { type: typeof DAEMON_STATS_MSG; daemonVersion?: string | null; latestDaemonVersion?: string | null; autoUpgrade?: import('@shared/daemon-upgrade.js').DaemonAutoUpgradeView; cpu: number; memUsed: number; memTotal: number; load1: number; load5: number; load15: number; uptime: number; embedding?: EmbeddingStatus; disks?: DiskUsage[]; shortRefHealth?: MemoryShortRefHealth; directConnectivity?: import('@shared/direct-file-transfer.js').DirectConnectivityRuntimeStatus; mainEventLoopLagMs?: number; mainEventLoopBlockedMs?: number; mainEventLoopBusy?: boolean }
   | FsLsResponse
   | FsReadResponse
   | FsGitStatusResponse

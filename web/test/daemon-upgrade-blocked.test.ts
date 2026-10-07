@@ -3,6 +3,7 @@ import { DAEMON_UPGRADE_BLOCK_REASON } from '../../shared/daemon-upgrade.js';
 import {
   DAEMON_UPGRADE_BLOCKED_TOAST_THROTTLE_MS,
   daemonUpgradeBlockedToastKey,
+  daemonUpgradeReasonLabelKey,
   shouldShowDaemonUpgradeBlockedToast,
 } from '../src/daemon-upgrade-blocked.js';
 
@@ -40,3 +41,19 @@ describe('daemon upgrade blocked toast', () => {
     )).toBe(true);
   });
 });
+
+describe('daemon upgrade reason labels', () => {
+  it('gives every known reason its own label and unknown ones a generic one', () => {
+    for (const reason of [
+      'p2p_active', 'auto_deliver_active', 'master_compaction_active', 'transport_busy', 'session_busy',
+      'cooldown_active', 'already_in_progress', 'retry_backoff', 'install_failed', 'toolchain_unavailable',
+    ]) {
+      expect(daemonUpgradeReasonLabelKey(reason)).toBe(`server.daemon_auto_upgrade_reason_${reason}`);
+    }
+    expect(daemonUpgradeReasonLabelKey('version_unchanged_after_upgrade')).toBe('server.daemon_auto_upgrade_reason_version_unchanged');
+    expect(daemonUpgradeReasonLabelKey('something_new')).toBe('server.daemon_auto_upgrade_reason_unknown');
+    expect(daemonUpgradeReasonLabelKey(null)).toBe('server.daemon_auto_upgrade_reason_unknown');
+    expect(daemonUpgradeReasonLabelKey(undefined)).toBe('server.daemon_auto_upgrade_reason_unknown');
+  });
+});
+

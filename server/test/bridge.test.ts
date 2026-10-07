@@ -50,6 +50,7 @@ import { TIMELINE_PAYLOAD_BUDGET_BYTES } from '../../shared/timeline-payload-bud
 import { OPENSPEC_AUTO_DELIVER_MSG } from '../../shared/openspec-auto-deliver-constants.js';
 import { EXECUTION_CLONE_KIND } from '../../shared/execution-clone.js';
 import { DAEMON_MSG } from '../../shared/daemon-events.js';
+import { DAEMON_STATS_MSG } from '../../shared/daemon-stats.js';
 import {
   CONTROLLED_NODE_WORKER_REFRESH_CAPABILITY,
   CONTROLLED_NODE_WORKER_REFRESH_MSG,
@@ -64,10 +65,14 @@ import {
 } from '../../shared/direct-file-transfer.js';
 import {
   CONTROLLED_NODE_UPGRADE_STAGGER_MAX_MS,
+  controlledNodeUpgradeStaggerMs,
   DAEMON_UPGRADE_BLOCKED_ACK_DISPOSITION,
   DAEMON_UPGRADE_BLOCKED_SYNC_PROTOCOL,
   DAEMON_UPGRADE_BLOCK_REASON,
+  DAEMON_UPGRADE_BUSY_RETRY_INTERVAL_MS,
+  DAEMON_UPGRADE_COOLDOWN_RETRY_MIN_MS,
   DAEMON_UPGRADE_DELIVERY_STATUS,
+  DAEMON_UPGRADE_IDLE_EDGE_MIN_INTERVAL_MS,
 } from '../../shared/daemon-upgrade.js';
 import { DAEMON_COMMAND_TYPES } from '../../shared/daemon-command-types.js';
 import { PEER_AUDIT_COMMAND_ERRORS, PEER_AUDIT_MESSAGES } from '../../shared/peer-audit.js';
@@ -894,22 +899,6 @@ describe('WsBridge', () => {
       expect(helloIndex).toBeGreaterThan(reconnectedIndex);
     });
 
-    it('does not auto-upgrade when daemon is older than server version', async () => {
-      vi.useFakeTimers();
-      process.env.APP_VERSION = '2026.4.905-dev.877';
-
-      const bridge = WsBridge.get(serverId);
-      const ws = new MockWs();
-      bridge.handleDaemonConnection(ws as never, makeDb('valid-hash'), {} as never);
-
-      ws.emit('message', JSON.stringify({ type: 'auth', serverId, token: 'my-token', daemonVersion: '2026.4.904-dev.100' }));
-      await flushAsync();
-      await vi.advanceTimersByTimeAsync(5000);
-      await flushAsync();
-
-      expect(ws.sentStrings.some((msg) => msg.includes('"type":"daemon.upgrade"') && msg.includes('2026.4.905-dev.877'))).toBe(false);
-    });
-
     it('persists, broadcasts, restores, and projects controlled worker refresh status', async () => {
       const persisted: Record<string, unknown> = {};
       const writes: Array<{ sql: string; params: unknown[] }> = [];
@@ -1172,7 +1161,7 @@ describe('WsBridge', () => {
     it('says why a controlled node is not upgraded on every early-return path', async () => {
       vi.useFakeTimers();
       const heldBack = () => infoSpy.mock.calls
-        .filter(([, message]) => message === 'controlled node upgrade is being held back')
+        .filter(([, message]) => message === 'daemon auto-upgrade is being held back')
         .map(([fields]) => (fields as { reason?: string }).reason);
       const infoSpy = vi.spyOn(logger, 'info');
       try {
@@ -1218,7 +1207,7 @@ describe('WsBridge', () => {
         }));
         await vi.advanceTimersByTimeAsync(STAGGER_MS);
         expect(upgradeFrames(again)).toHaveLength(0);
-        expect(infoSpy.mock.calls.some(([fields, message]) => message === 'controlled node upgrade is being held back'
+        expect(infoSpy.mock.calls.some(([fields, message]) => message === 'daemon auto-upgrade is being held back'
           && (fields as { reason?: string }).reason === 'retry_backoff')).toBe(true);
       } finally {
         infoSpy.mockRestore();
@@ -1464,19 +1453,352 @@ describe('WsBridge', () => {
       expect(ws.sentStrings.some((msg) => msg.includes('"type":"daemon.upgrade"') && msg.includes('2026.4.905'))).toBe(false);
     });
 
-    it('does not schedule repeated automatic daemon upgrades on reconnect', async () => {
-      vi.useFakeTimers();
-      process.env.APP_VERSION = '2026.4.905-dev.877';
-      const bridge = WsBridge.get(serverId);
-      for (const daemonVersion of ['2026.4.904-dev.100', '2026.4.904-dev.100', '2026.4.904-dev.100']) {
+    describe('full daemon automatic upgrade (the daemon decides when it is idle)', () => {
+      const TARGET = '2026.4.905-dev.877';
+      const OLD = '2026.4.904-dev.100';
+      const frames = (ws: MockWs) => upgradeFrames(ws).map((raw) => JSON.parse(raw) as Record<string, unknown>);
+      const authFull = async (ws: MockWs, daemonVersion = OLD, extra: Record<string, unknown> = {}) => {
+        WsBridge.get(serverId).handleDaemonConnection(ws as never, makeDb('valid-hash'), {} as never);
+        ws.emit('message', JSON.stringify({ type: 'auth', serverId, token: 'my-token', daemonVersion, ...extra }));
+        await flushAsync();
+      };
+      const boot = () => {
+        vi.useFakeTimers();
+        process.env.APP_VERSION = TARGET;
+        markDaemonUpgradeTargetVersionPublishedForTest(TARGET);
+      };
+      const blocked = async (ws: MockWs, reason: string, extra: Record<string, unknown> = {}) => {
+        ws.emit('message', JSON.stringify({ type: DAEMON_MSG.UPGRADE_BLOCKED, reason, ...extra }));
+        await flushAsync();
+      };
+      const advance = async (ms: number) => {
+        await vi.advanceTimersByTimeAsync(ms);
+        await flushAsync();
+      };
+      const sessions = async (ws: MockWs, state: string) => {
+        ws.emit('message', JSON.stringify({ type: 'session_list', sessions: [{ name: 'deck_a_brain', state }] }));
+        await flushAsync();
+        await vi.advanceTimersByTimeAsync(0);
+      };
+      const autoView = () => WsBridge.get(serverId).daemonUpgradeStatus().autoUpgrade;
+      const FIRST_SEND = STAGGER_MS;
+
+      it('sends source:auto to a lagging full daemon and never gates it on the server\'s own view of busy', async () => {
+        boot();
         const ws = new MockWs();
-        bridge.handleDaemonConnection(ws as never, makeDb('valid-hash'), {} as never);
-        ws.emit('message', JSON.stringify({ type: 'auth', serverId, token: 'my-token', daemonVersion }));
+        await authFull(ws);
+        // The server sees a running session, yet still asks: the daemon's own
+        // gates are the only definition of "busy".
+        await sessions(ws, 'running');
+        await advance(FIRST_SEND);
+        expect(frames(ws)).toEqual([expect.objectContaining({ type: 'daemon.upgrade', source: 'auto', targetVersion: TARGET })]);
+        expect(frames(ws)[0]).not.toHaveProperty('force');
+        expect(autoView()).toMatchObject({ status: 'upgrading', targetVersion: TARGET });
+      });
+
+      it('does nothing for a current daemon', async () => {
+        boot();
+        const ws = new MockWs();
+        await authFull(ws, TARGET);
+        await advance(FIRST_SEND);
+        expect(frames(ws)).toHaveLength(0);
+        expect(autoView()).toBeNull();
+      });
+
+      it('honors the deployment opt-out and says why, while manual stays available', async () => {
+        boot();
+        process.env.IMCODES_DISABLE_AUTO_UPGRADE = '1';
+        const infoSpy = vi.spyOn(logger, 'info');
+        try {
+          const ws = new MockWs();
+          await authFull(ws);
+          await advance(FIRST_SEND);
+          expect(frames(ws)).toHaveLength(0);
+          expect(infoSpy.mock.calls.some(([fields, message]) => message === 'daemon auto-upgrade is being held back'
+            && (fields as { reason?: string }).reason === 'auto_upgrade_disabled_by_env')).toBe(true);
+          expect(WsBridge.get(serverId).requestDaemonUpgrade({ targetVersion: TARGET, source: 'manual' }))
+            .toMatchObject({ deliveryStatus: DAEMON_UPGRADE_DELIVERY_STATUS.SENT });
+        } finally {
+          infoSpy.mockRestore();
+          delete process.env.IMCODES_DISABLE_AUTO_UPGRADE;
+        }
+      });
+
+      it.each([
+        DAEMON_UPGRADE_BLOCK_REASON.P2P_ACTIVE,
+        DAEMON_UPGRADE_BLOCK_REASON.AUTO_DELIVER_ACTIVE,
+        DAEMON_UPGRADE_BLOCK_REASON.MASTER_COMPACTION_ACTIVE,
+        DAEMON_UPGRADE_BLOCK_REASON.TRANSPORT_BUSY,
+        DAEMON_UPGRADE_BLOCK_REASON.SESSION_BUSY,
+      ])('asks again after a bounded interval, not in a tight loop, when the daemon reports %s', async (reason) => {
+        boot();
+        const ws = new MockWs();
+        await authFull(ws);
+        await advance(FIRST_SEND);
+        expect(frames(ws)).toHaveLength(1);
+        await blocked(ws, reason);
+        expect(autoView()).toMatchObject({ status: 'deferred', reason });
+        await advance(DAEMON_UPGRADE_BUSY_RETRY_INTERVAL_MS - 1_000);
+        expect(frames(ws)).toHaveLength(1);
+        await advance(2_000);
+        expect(frames(ws)).toHaveLength(2);
+        expect(frames(ws)[1]).toMatchObject({ source: 'auto', targetVersion: TARGET });
+      });
+
+      it('schedules the retry from the daemon\'s own cooldown remainder (bounded)', async () => {
+        boot();
+        const ws = new MockWs();
+        await authFull(ws);
+        await advance(FIRST_SEND);
+        await blocked(ws, DAEMON_UPGRADE_BLOCK_REASON.COOLDOWN_ACTIVE, { cooldownRemainingMs: 3 * 60_000 });
+        await advance(3 * 60_000 - 2_000);
+        expect(frames(ws)).toHaveLength(1);
+        await advance(4_000);
+        expect(frames(ws)).toHaveLength(2);
+        // A tiny remainder is clamped up so it cannot become a tight loop.
+        await blocked(ws, DAEMON_UPGRADE_BLOCK_REASON.COOLDOWN_ACTIVE, { cooldownRemainingMs: 5 });
+        await advance(DAEMON_UPGRADE_COOLDOWN_RETRY_MIN_MS - 2_000);
+        expect(frames(ws)).toHaveLength(2);
+        await advance(4_000);
+        expect(frames(ws)).toHaveLength(3);
+      });
+
+      it('retries at the next idle edge, spaced by the minimum interval, and only after a daemon receipt', async () => {
+        boot();
+        const ws = new MockWs();
+        await authFull(ws);
+        await sessions(ws, 'running');
+        await advance(FIRST_SEND);
+        await blocked(ws, DAEMON_UPGRADE_BLOCK_REASON.SESSION_BUSY);
+        // Edge inside the minimum interval: nothing (the timer still covers it).
+        await advance(10_000);
+        await sessions(ws, 'idle');
+        expect(frames(ws)).toHaveLength(1);
+        // A later edge, server view quiet: the daemon is asked again, long before the 5 minute timer.
+        await sessions(ws, 'running');
+        await advance(DAEMON_UPGRADE_IDLE_EDGE_MIN_INTERVAL_MS);
+        await sessions(ws, 'running');
+        expect(frames(ws)).toHaveLength(1);
+        await sessions(ws, 'idle');
+        expect(frames(ws)).toHaveLength(2);
+        expect(frames(ws)[1]).toMatchObject({ source: 'auto' });
+      });
+
+      it('an idle edge is a trigger, not a gate: with no daemon receipt it never sends', async () => {
+        boot();
+        const ws = new MockWs();
+        await authFull(ws);
+        await sessions(ws, 'running');
+        await advance(FIRST_SEND);
+        expect(frames(ws)).toHaveLength(1);
+        // The daemon accepted (no receipt) — sessions flapping idle/busy must not resend.
+        for (let i = 0; i < 3; i += 1) {
+          await advance(2 * DAEMON_UPGRADE_IDLE_EDGE_MIN_INTERVAL_MS);
+          await sessions(ws, 'idle');
+          await sessions(ws, 'running');
+        }
+        expect(frames(ws)).toHaveLength(1);
+      });
+
+      it('a gate receipt that answers nothing we delivered schedules nothing', async () => {
+        boot();
+        const ws = new MockWs();
+        await authFull(ws);
+        // Before the stagger elapsed no command was delivered.
+        await blocked(ws, DAEMON_UPGRADE_BLOCK_REASON.SESSION_BUSY);
+        expect(autoView()?.reason ?? null).not.toBe(DAEMON_UPGRADE_BLOCK_REASON.SESSION_BUSY);
+        await advance(FIRST_SEND);
+        expect(frames(ws)).toHaveLength(1);
+        // Repeated receipts for the one delivered command arm one retry, not several.
+        await blocked(ws, DAEMON_UPGRADE_BLOCK_REASON.SESSION_BUSY);
+        await blocked(ws, DAEMON_UPGRADE_BLOCK_REASON.SESSION_BUSY);
+        await blocked(ws, DAEMON_UPGRADE_BLOCK_REASON.SESSION_BUSY);
+        await advance(DAEMON_UPGRADE_BUSY_RETRY_INTERVAL_MS + 1_000);
+        expect(frames(ws)).toHaveLength(2);
+      });
+
+      it('busy waits do not consume the failure backoff: the first failure still waits only 10 minutes', async () => {
+        boot();
+        const ws = new MockWs();
+        await authFull(ws);
+        await advance(FIRST_SEND);
+        await blocked(ws, DAEMON_UPGRADE_BLOCK_REASON.SESSION_BUSY);
+        await advance(DAEMON_UPGRADE_BUSY_RETRY_INTERVAL_MS + 1_000);
+        await blocked(ws, DAEMON_UPGRADE_BLOCK_REASON.SESSION_BUSY);
+        await advance(DAEMON_UPGRADE_BUSY_RETRY_INTERVAL_MS + 1_000);
+        expect(frames(ws)).toHaveLength(3);
+        await blocked(ws, DAEMON_UPGRADE_BLOCK_REASON.INSTALL_FAILED, { targetVersion: TARGET });
+        expect(autoView()).toMatchObject({ status: 'failed', reason: DAEMON_UPGRADE_BLOCK_REASON.INSTALL_FAILED });
+        await advance(9 * 60_000);
+        expect(frames(ws)).toHaveLength(3);
+        await advance(2 * 60_000);
+        expect(frames(ws)).toHaveLength(4);
+      });
+
+      it('a failed target backs off 10m, then 30m, and only blocks that target', async () => {
+        boot();
+        const ws = new MockWs();
+        await authFull(ws);
+        await advance(FIRST_SEND);
+        await blocked(ws, DAEMON_UPGRADE_BLOCK_REASON.INSTALL_FAILED, { targetVersion: TARGET });
+        await advance(9 * 60_000);
+        expect(frames(ws)).toHaveLength(1);
+        await advance(2 * 60_000);
+        expect(frames(ws)).toHaveLength(2);
+        await blocked(ws, DAEMON_UPGRADE_BLOCK_REASON.INSTALL_FAILED, { targetVersion: TARGET });
+        await advance(29 * 60_000);
+        expect(frames(ws)).toHaveLength(2);
+        await advance(2 * 60_000);
+        expect(frames(ws)).toHaveLength(3);
+        // A different (newer) server target is a fresh lifecycle, never blocked by the old failure.
+        await blocked(ws, DAEMON_UPGRADE_BLOCK_REASON.TOOLCHAIN_UNAVAILABLE);
+        process.env.APP_VERSION = '2026.4.906-dev.1';
+        markDaemonUpgradeTargetVersionPublishedForTest(process.env.APP_VERSION);
+        const next = new MockWs();
+        await authFull(next);
+        await advance(FIRST_SEND);
+        expect(frames(next)).toEqual([expect.objectContaining({ targetVersion: '2026.4.906-dev.1' })]);
+      });
+
+      it('an old daemon that never answers is not asked on every reconnect (version unchanged after delivery)', async () => {
+        boot();
+        const first = new MockWs();
+        await authFull(first);
+        await advance(FIRST_SEND);
+        expect(frames(first)).toHaveLength(1);
+
+        await advance(60_000);
+        const second = new MockWs();
+        await authFull(second);
+        await advance(FIRST_SEND);
+        expect(frames(second)).toHaveLength(0);
+        expect(autoView()).toMatchObject({ status: 'failed', reason: 'version_unchanged_after_upgrade' });
+        expect(autoView()?.nextRetryAt).toEqual(expect.any(Number));
+
+        // Still connected when the backoff ends: it is asked once more, by the server's own timer.
+        await advance(10 * 60_000);
+        expect(frames(second)).toHaveLength(1);
+      });
+
+      it('the daemon\'s own opt-out receipt stops the automatic trigger without a failure backoff, manual still forced', async () => {
+        boot();
+        const browser = new MockWs();
+        WsBridge.get(serverId).handleBrowserConnection(browser as never, 'test-user', makeDb('valid-hash'));
+        const ws = new MockWs();
+        await authFull(ws);
+        await advance(FIRST_SEND);
+        await blocked(ws, DAEMON_UPGRADE_BLOCK_REASON.AUTO_UPGRADE_DISABLED, { disabledBy: 'config' });
+        expect(autoView()).toMatchObject({ status: 'deferred', reason: DAEMON_UPGRADE_BLOCK_REASON.AUTO_UPGRADE_DISABLED });
+        // Not an operator-facing failure.
+        expect(browser.sentStrings.some((raw) => raw.includes(DAEMON_MSG.UPGRADE_BLOCKED))).toBe(false);
+        // No further asks for as long as the connection lives, however long that is.
+        await advance(7 * 60 * 60_000);
+        expect(frames(ws)).toHaveLength(1);
+        // A manual forced upgrade is unaffected.
+        expect(WsBridge.get(serverId).requestDaemonUpgrade({ targetVersion: TARGET, source: 'manual', force: true }))
+          .toMatchObject({ deliveryStatus: DAEMON_UPGRADE_DELIVERY_STATUS.SENT });
+        expect(frames(ws)[1]).toMatchObject({ source: 'manual', force: true, targetVersion: TARGET });
+        // The daemon re-reads its config on reconnect, so the next connection is asked again.
+        const reconnected = new MockWs();
+        await authFull(reconnected);
+        await advance(FIRST_SEND);
+        expect(frames(reconnected).filter((frame) => frame.source === 'auto')).toHaveLength(1);
+      });
+
+      it('an automatic gate receipt is shown on the card, not toasted; a manual one is relayed', async () => {
+        boot();
+        const browser = new MockWs();
+        WsBridge.get(serverId).handleBrowserConnection(browser as never, 'test-user', makeDb('valid-hash'));
+        const ws = new MockWs();
+        await authFull(ws);
+        await advance(FIRST_SEND);
+        await blocked(ws, DAEMON_UPGRADE_BLOCK_REASON.TRANSPORT_BUSY);
+        const relayed = () => browser.sentStrings.filter((raw) => raw.includes(DAEMON_MSG.UPGRADE_BLOCKED));
+        expect(relayed()).toHaveLength(0);
+
+        // The browser learns the wait from the daemon.stats frame.
+        ws.emit('message', JSON.stringify({
+          type: DAEMON_STATS_MSG, cpu: 1, memUsed: 1, memTotal: 2, load1: 0, load5: 0, load15: 0, uptime: 1,
+        }));
         await flushAsync();
-        await vi.advanceTimersByTimeAsync(15 * 60 * 1000);
-        await flushAsync();
-        expect(ws.sentStrings.filter((msg) => msg.includes('\"type\":\"daemon.upgrade\"'))).toHaveLength(0);
-      }
+        const stats = browser.sentStrings.map((raw) => JSON.parse(raw) as Record<string, unknown>)
+          .filter((frame) => frame.type === DAEMON_STATS_MSG);
+        expect(stats[stats.length - 1]).toMatchObject({
+          autoUpgrade: { status: 'deferred', reason: DAEMON_UPGRADE_BLOCK_REASON.TRANSPORT_BUSY, targetVersion: TARGET },
+        });
+
+        // A manual request (an old daemon that predates `force`) answers with a visible block.
+        expect(WsBridge.get(serverId).requestDaemonUpgrade({ targetVersion: TARGET, source: 'manual' }))
+          .toMatchObject({ deliveryStatus: DAEMON_UPGRADE_DELIVERY_STATUS.SENT });
+        await blocked(ws, DAEMON_UPGRADE_BLOCK_REASON.TRANSPORT_BUSY);
+        expect(relayed()).toHaveLength(1);
+      });
+
+      it('a blocked manual request can be confirmed again at once, and never moves the automatic failure counter', async () => {
+        boot();
+        const ws = new MockWs();
+        await authFull(ws);
+        await advance(FIRST_SEND);
+        await blocked(ws, DAEMON_UPGRADE_BLOCK_REASON.SESSION_BUSY);
+        const bridge = WsBridge.get(serverId);
+        expect(bridge.requestDaemonUpgrade({ targetVersion: TARGET, source: 'manual' }).deliveryStatus)
+          .toBe(DAEMON_UPGRADE_DELIVERY_STATUS.SENT);
+        await blocked(ws, DAEMON_UPGRADE_BLOCK_REASON.SESSION_BUSY);
+        // Not "already in progress": the daemon refused the first manual command.
+        expect(bridge.requestDaemonUpgrade({ targetVersion: TARGET, source: 'manual', force: true }).deliveryStatus)
+          .toBe(DAEMON_UPGRADE_DELIVERY_STATUS.SENT);
+        const sent = frames(ws);
+        expect(sent[sent.length - 1]).toMatchObject({ source: 'manual', force: true });
+        expect(sent.filter((frame) => frame.source === 'manual' && !('force' in frame))).toHaveLength(1);
+      });
+
+      it('a forced manual request outranks an automatic command that is already out', async () => {
+        boot();
+        const ws = new MockWs();
+        await authFull(ws);
+        await advance(FIRST_SEND);
+        expect(frames(ws)).toHaveLength(1);
+        const forced = WsBridge.get(serverId).requestDaemonUpgrade({ targetVersion: TARGET, source: 'manual', force: true });
+        expect(forced.deliveryStatus).toBe(DAEMON_UPGRADE_DELIVERY_STATUS.SENT);
+        expect(frames(ws)[1]).toMatchObject({ source: 'manual', force: true });
+      });
+
+      it('a server restart forgets the counters: one fresh attempt, not a permanent block', async () => {
+        boot();
+        const ws = new MockWs();
+        await authFull(ws);
+        await advance(FIRST_SEND);
+        await blocked(ws, DAEMON_UPGRADE_BLOCK_REASON.INSTALL_FAILED, { targetVersion: TARGET });
+        WsBridge.getAll().clear();
+        const restarted = new MockWs();
+        await authFull(restarted);
+        await advance(FIRST_SEND);
+        expect(frames(restarted)).toHaveLength(1);
+      });
+
+      it('spreads the post-auth trigger: nothing is sent before the stagger window starts to elapse', async () => {
+        boot();
+        const ws = new MockWs();
+        await authFull(ws);
+        expect(frames(ws)).toHaveLength(0);
+        const stagger = controlledNodeUpgradeStaggerMs(serverId);
+        if (stagger > 1) {
+          await advance(stagger - 1);
+          expect(frames(ws)).toHaveLength(0);
+        }
+        await advance(STAGGER_MS);
+        expect(frames(ws)).toHaveLength(1);
+      });
+
+      it('a controlled node never receives force, and a manual upgrade without force stays an ordinary manual one', async () => {
+        boot();
+        const ws = new MockWs();
+        await authControlled(ws);
+        await advance(FIRST_SEND);
+        WsBridge.get(serverId).requestDaemonUpgrade({ targetVersion: TARGET, source: 'manual' });
+        expect(frames(ws).length).toBeGreaterThan(0);
+        for (const frame of frames(ws)) expect(frame).not.toHaveProperty('force');
+      });
     });
 
     it('fences an exact rolled-back controlled-node target instead of retrying the destructive upgrade loop', async () => {
@@ -1495,20 +1817,6 @@ describe('WsBridge', () => {
       await flushAsync();
       expect(bridge.requestDaemonUpgrade({ targetVersion: process.env.APP_VERSION, source: 'manual' }))
         .toMatchObject({ deliveryStatus: DAEMON_UPGRADE_DELIVERY_STATUS.PREPARING_RESCUE });
-    });
-
-    it('does not retry automatic daemon upgrades after transient blockers', async () => {
-      vi.useFakeTimers();
-      process.env.APP_VERSION = '2026.4.905-dev.877';
-      const bridge = WsBridge.get(serverId);
-      const ws = new MockWs();
-      bridge.handleDaemonConnection(ws as never, makeDb('valid-hash'), {} as never);
-      ws.emit('message', JSON.stringify({ type: 'auth', serverId, token: 'my-token', daemonVersion: '2026.4.904-dev.100' }));
-      await flushAsync();
-      ws.emit('message', JSON.stringify({ type: DAEMON_MSG.UPGRADE_BLOCKED, reason: 'auto_deliver_active' }));
-      await vi.advanceTimersByTimeAsync(60_000);
-      await flushAsync();
-      expect(ws.sentStrings.filter((msg) => msg.includes('\"type\":\"daemon.upgrade\"'))).toHaveLength(0);
     });
 
     it.each([
@@ -1763,10 +2071,12 @@ describe('WsBridge', () => {
         targetVersion: '2026.7.3192-dev.3593',
       }));
       await flushAsync();
-      await vi.advanceTimersByTimeAsync(5_000);
+      await vi.advanceTimersByTimeAsync(CONTROLLED_NODE_UPGRADE_STAGGER_MAX_MS);
       await flushAsync();
 
-      expect(ws.sentStrings.filter((msg) => msg.includes('"type":"daemon.upgrade"'))).toHaveLength(0);
+      // The failure belonged to an older target: it is acked as obsolete and the
+      // NEW target is still offered (a failure only ever blocks its own target).
+      expect(ws.sentStrings.filter((msg) => msg.includes('"type":"daemon.upgrade"'))).toHaveLength(1);
       expect(ws.sentStrings.some((raw) => {
         const message = JSON.parse(raw) as Record<string, unknown>;
         return message.type === DAEMON_MSG.UPGRADE_BLOCKED_ACK

@@ -4,7 +4,13 @@ import { cleanup, fireEvent, render, screen } from '@testing-library/preact';
 import { DaemonStatusCard, DaemonUpgradeConfirmDialog } from '../../src/components/DaemonStatusCard.js';
 
 vi.mock('react-i18next', () => ({
-  useTranslation: () => ({ t: (key: string, values?: Record<string, unknown>) => values?.count ? `${key}:${values.count}` : key }),
+  useTranslation: () => ({
+    t: (key: string, values?: Record<string, unknown>) => (
+      values?.count ? `${key}:${values.count}`
+        : values?.reason ? `${key}:${values.reason}`
+          : values?.names ? `${key}:${values.names}` : key
+    ),
+  }),
 }));
 
 afterEach(cleanup);
@@ -62,3 +68,72 @@ describe('DaemonStatusCard', () => {
     expect(onConfirm).toHaveBeenCalledTimes(1);
   });
 });
+
+describe('automatic upgrade line on the card', () => {
+  const open = () => fireEvent.click(screen.getByRole('button', { name: 'server.daemon_upgrade_available' }));
+  const view = (over: Record<string, unknown>) => ({
+    status: 'deferred' as const, reason: 'session_busy', targetVersion: '2026.4.905-dev.877', nextRetryAt: null, ...over,
+  });
+
+  it('says what the automatic upgrade is waiting for, from the daemon\'s own reason', () => {
+    render(<DaemonStatusCard {...baseProps} autoUpgrade={view({ reason: 'p2p_active' })} />);
+    open();
+    expect(screen.getByText('server.daemon_auto_upgrade_waiting:server.daemon_auto_upgrade_reason_p2p_active')).toBeTruthy();
+  });
+
+  it.each([
+    ['transport_busy'], ['session_busy'], ['auto_deliver_active'], ['master_compaction_active'], ['cooldown_active'],
+  ])('maps the busy gate %s to its own label', (reason) => {
+    render(<DaemonStatusCard {...baseProps} autoUpgrade={view({ reason })} />);
+    open();
+    expect(screen.getByText(`server.daemon_auto_upgrade_waiting:server.daemon_auto_upgrade_reason_${reason}`)).toBeTruthy();
+  });
+
+  it('falls back to a generic label for a reason this build does not know', () => {
+    render(<DaemonStatusCard {...baseProps} autoUpgrade={view({ reason: 'some_future_reason' })} />);
+    open();
+    expect(screen.getByText('server.daemon_auto_upgrade_waiting:server.daemon_auto_upgrade_reason_unknown')).toBeTruthy();
+  });
+
+  it('shows a failed attempt as retrying, and the daemon opt-out as turned off', () => {
+    const { rerender } = render(<DaemonStatusCard {...baseProps} autoUpgrade={view({ status: 'failed', reason: 'install_failed' })} />);
+    open();
+    expect(screen.getByText('server.daemon_auto_upgrade_retrying:server.daemon_auto_upgrade_reason_install_failed')).toBeTruthy();
+    rerender(<DaemonStatusCard {...baseProps} autoUpgrade={view({ reason: 'auto_upgrade_disabled' })} />);
+    expect(screen.getByText('server.daemon_auto_upgrade_disabled')).toBeTruthy();
+  });
+
+  it('shows nothing when no automatic upgrade is pending, when it is simply under way, or the daemon is current', () => {
+    const { rerender } = render(<DaemonStatusCard {...baseProps} autoUpgrade={null} />);
+    open();
+    expect(document.querySelector('.daemon-auto-upgrade-state')).toBeNull();
+    rerender(<DaemonStatusCard {...baseProps} autoUpgrade={view({ status: 'upgrading', reason: null })} />);
+    expect(document.querySelector('.daemon-auto-upgrade-state')).toBeNull();
+    rerender(<DaemonStatusCard {...baseProps} currentVersion="2026.4.905-dev.877" autoUpgrade={view({})} />);
+    expect(document.querySelector('.daemon-auto-upgrade-state')).toBeNull();
+  });
+});
+
+describe('forced-upgrade confirmation', () => {
+  it('lists what the daemon last held the upgrade back for, so the operator knows what will be interrupted', () => {
+    render(<DaemonUpgradeConfirmDialog
+      busySessions={0}
+      blockedReason="auto_deliver_active"
+      blockedSessionNames={['deck_a_brain', 'deck_a_w1']}
+      onCancel={vi.fn()}
+      onConfirm={vi.fn()}
+    />);
+    const text = screen.getByRole('dialog').textContent ?? '';
+    expect(text).toContain('server.daemon_upgrade_confirm_warning');
+    expect(text).toContain('server.daemon_upgrade_confirm_blocked:server.daemon_auto_upgrade_reason_auto_deliver_active');
+    expect(text).toContain('server.daemon_upgrade_confirm_blocked_sessions:deck_a_brain, deck_a_w1');
+  });
+
+  it('keeps the plain warning when there is no recent block receipt', () => {
+    render(<DaemonUpgradeConfirmDialog busySessions={0} onCancel={vi.fn()} onConfirm={vi.fn()} />);
+    const text = screen.getByRole('dialog').textContent ?? '';
+    expect(text).toContain('server.daemon_upgrade_confirm_warning');
+    expect(text).not.toContain('server.daemon_upgrade_confirm_blocked');
+  });
+});
+

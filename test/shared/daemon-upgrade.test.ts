@@ -4,9 +4,15 @@ import {
   CONTROLLED_NODE_UPGRADE_RETRY_DELAYS_MS,
   CONTROLLED_NODE_UPGRADE_STAGGER_MAX_MS,
   DAEMON_UPGRADE_BLOCK_REASON,
+  DAEMON_UPGRADE_BUSY_BLOCK_REASONS,
+  DAEMON_UPGRADE_SOURCE,
   controlledNodeUpgradeRetryDelayMs,
   controlledNodeUpgradeStaggerMs,
+  isDaemonAutoUpgradeAvailable,
   isDaemonAutoUpgradeDisabledByEnv,
+  isDaemonUpgradeBusyBlockReason,
+  isRetryableDaemonUpgradeBlockReason,
+  resolveDaemonUpgradeForce,
   normalizeDaemonUpgradeTargetVersion,
   validateControlledNodeUpgradeBlockedMessage,
 } from '../../shared/daemon-upgrade.js';
@@ -141,5 +147,60 @@ describe('controlled-node upgrade stagger', () => {
     // A fleet must not all land on one instant (the thundering herd this prevents).
     expect(new Set(delays).size).toBeGreaterThan(ids.length / 2);
     expect(controlledNodeUpgradeStaggerMs('')).toBe(0);
+  });
+});
+
+describe('forced manual upgrade', () => {
+  it('forces only an explicit force:true on a manual upgrade', () => {
+    expect(resolveDaemonUpgradeForce(true, DAEMON_UPGRADE_SOURCE.MANUAL)).toBe(true);
+    for (const raw of [false, undefined, null, 'true', 1, {}, []]) {
+      expect(resolveDaemonUpgradeForce(raw, DAEMON_UPGRADE_SOURCE.MANUAL)).toBe(false);
+    }
+    // Auto and replay always ignore it, so a stray field can never bypass the idle gates.
+    expect(resolveDaemonUpgradeForce(true, DAEMON_UPGRADE_SOURCE.AUTO)).toBe(false);
+    expect(resolveDaemonUpgradeForce(true, DAEMON_UPGRADE_SOURCE.REPLAY)).toBe(false);
+  });
+});
+
+describe('the daemon\'s busy gates', () => {
+  it('names exactly the five gates and treats each as retryable, never as a failure', () => {
+    expect([...DAEMON_UPGRADE_BUSY_BLOCK_REASONS].sort()).toEqual([
+      'auto_deliver_active', 'master_compaction_active', 'p2p_active', 'session_busy', 'transport_busy',
+    ]);
+    for (const reason of DAEMON_UPGRADE_BUSY_BLOCK_REASONS) {
+      expect(isDaemonUpgradeBusyBlockReason(reason)).toBe(true);
+      expect(isRetryableDaemonUpgradeBlockReason(reason)).toBe(true);
+    }
+    expect(isRetryableDaemonUpgradeBlockReason(DAEMON_UPGRADE_BLOCK_REASON.COOLDOWN_ACTIVE)).toBe(true);
+    expect(isRetryableDaemonUpgradeBlockReason(DAEMON_UPGRADE_BLOCK_REASON.ALREADY_IN_PROGRESS)).toBe(true);
+  });
+
+  it('keeps failures and the daemon opt-out out of the retryable set', () => {
+    for (const reason of [
+      DAEMON_UPGRADE_BLOCK_REASON.INSTALL_FAILED,
+      DAEMON_UPGRADE_BLOCK_REASON.TOOLCHAIN_UNAVAILABLE,
+      DAEMON_UPGRADE_BLOCK_REASON.AUTO_UPGRADE_DISABLED,
+      'artifact_download_failed',
+      'native_quiesce_failed',
+    ]) {
+      expect(isRetryableDaemonUpgradeBlockReason(reason)).toBe(false);
+    }
+  });
+});
+
+describe('what the server may upgrade on its own', () => {
+  it('moves only a strictly older daemon on the same release channel', () => {
+    expect(isDaemonAutoUpgradeAvailable('2026.4.904-dev.100', '2026.4.905-dev.877')).toBe(true);
+    expect(isDaemonAutoUpgradeAvailable('2026.4.904', '2026.4.905')).toBe(true);
+    // current, newer daemon, unknown versions
+    expect(isDaemonAutoUpgradeAvailable('2026.4.905-dev.877', '2026.4.905-dev.877')).toBe(false);
+    expect(isDaemonAutoUpgradeAvailable('2026.4.906-dev.1', '2026.4.905-dev.877')).toBe(false);
+    expect(isDaemonAutoUpgradeAvailable(null, '2026.4.905')).toBe(false);
+    expect(isDaemonAutoUpgradeAvailable('2026.4.904', undefined)).toBe(false);
+    expect(isDaemonAutoUpgradeAvailable('not-a-version', '2026.4.905')).toBe(false);
+    // cross-channel stays an operator decision
+    expect(isDaemonAutoUpgradeAvailable('2026.4.905', '2026.4.905-dev.877')).toBe(false);
+    expect(isDaemonAutoUpgradeAvailable('2026.4.905-dev.877', '2026.4.905')).toBe(false);
+    expect(isDaemonAutoUpgradeAvailable('2026.4.800', '2026.4.905-dev.877')).toBe(false);
   });
 });

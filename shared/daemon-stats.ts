@@ -12,6 +12,7 @@
  * a partial or malformed frame can only ever add information.
  */
 import { isCoreLaneStatus } from './core-lane-status.js';
+import type { DaemonAutoUpgradeView } from './daemon-upgrade.js';
 
 export const DAEMON_STATS_MSG = 'daemon.stats' as const;
 export const DAEMON_LIVENESS_MSG = 'daemon.liveness' as const;
@@ -37,6 +38,8 @@ export interface DaemonLivenessView {
 export interface DaemonStatsView extends DaemonLivenessView {
   daemonVersion?: string | null;
   latestDaemonVersion?: string | null;
+  /** What the server's automatic upgrade trigger is doing for this daemon; null/absent when nothing is pending. */
+  autoUpgrade?: DaemonAutoUpgradeView | null;
   cpu?: number;
   memUsed?: number;
   memTotal?: number;
@@ -128,6 +131,8 @@ export function mergeDaemonStats<S extends DaemonStatsView>(
     next.disks = Array.isArray(frame.disks) ? frame.disks : null;
     next.shortRefHealth = isRecord(frame.shortRefHealth) ? frame.shortRefHealth : null;
     next.directConnectivity = isRecord(frame.directConnectivity) ? frame.directConnectivity : null;
+    // Present only while an automatic upgrade is pending, so its absence clears the line.
+    next.autoUpgrade = isRecord(frame.autoUpgrade) ? frame.autoUpgrade : null;
   }
   next = mergeLiveness(next as DaemonLivenessView, frame, now) as Record<string, unknown>;
   return next as S;

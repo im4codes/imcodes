@@ -363,17 +363,23 @@ import {
   DAEMON_UPGRADE_BLOCKED_ACK_DISPOSITION,
   DAEMON_UPGRADE_BLOCKED_SYNC_PROTOCOL,
   DAEMON_UPGRADE_BLOCK_REASON,
+  DAEMON_UPGRADE_BUSY_RETRY_INTERVAL_MS,
+  DAEMON_UPGRADE_COOLDOWN_RETRY_MAX_MS,
+  DAEMON_UPGRADE_COOLDOWN_RETRY_MIN_MS,
   DAEMON_UPGRADE_DELIVERY_STATUS,
+  DAEMON_UPGRADE_IDLE_EDGE_MIN_INTERVAL_MS,
   DAEMON_UPGRADE_SOURCE,
   CONTROLLED_NODE_UPGRADE_STATUS,
   CONTROLLED_NODE_UPGRADE_WAIT_REASON,
   controlledNodeUpgradeRetryDelayMs,
   controlledNodeUpgradeStaggerMs,
   isDaemonUpgradeAvailable,
+  isDaemonAutoUpgradeAvailable,
   isDaemonAutoUpgradeDisabledByEnv,
   isRetryableDaemonUpgradeBlockReason,
   validateControlledNodeUpgradeBlockedMessage,
   type ControlledNodeUpgradeStatus,
+  type DaemonAutoUpgradeView,
   type DaemonUpgradeBlockedAckDisposition,
 } from '../../../shared/daemon-upgrade.js';
 import {
@@ -2164,17 +2170,23 @@ export class WsBridge {
    *  experiences the exponential backoff — see resolveLegacyWindowsUpgradeRestartAttempt. */
   private legacyUpgradeRestartThrottle: LegacyWindowsUpgradeRestartThrottle | null = null;
   private daemonUpgradeCoordinator = new DaemonUpgradeCoordinator();
-  private controlledNodeUpgradeStatus: ControlledNodeUpgradeStatus = CONTROLLED_NODE_UPGRADE_STATUS.CURRENT;
-  private controlledNodeUpgradeReason: string | null = null;
-  private controlledNodeUpgradeTargetVersion: string | null = null;
+  private autoUpgradeStatus: ControlledNodeUpgradeStatus = CONTROLLED_NODE_UPGRADE_STATUS.CURRENT;
+  private autoUpgradeReason: string | null = null;
+  private autoUpgradeTargetVersion: string | null = null;
   /** Attempt bookkeeping for ONE target; in memory only, so a pod restart
    *  grants a failed node one fresh retry instead of a permanent block. */
-  private controlledNodeUpgradeAttemptTarget: string | null = null;
-  private controlledNodeUpgradeAttempts = 0;
-  private controlledNodeUpgradeLastAttemptAt: number | null = null;
-  private controlledNodeUpgradeRetryTimer: ReturnType<typeof setTimeout> | null = null;
-  private lastLoggedControlledUpgradeWait: string | null = null;
-  private controlledNodeUpgradePersistence: Promise<void> = Promise.resolve();
+  private autoUpgradeAttemptTarget: string | null = null;
+  private autoUpgradeAttempts = 0;
+  private autoUpgradeLastAttemptAt: number | null = null;
+  private autoUpgradeRetryTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Epoch ms the armed retry fires at (surfaced to the card), or null. */
+  private autoUpgradeNextRetryAt: number | null = null;
+  /** The full daemon told us its own opt-out refused source:auto; reset per connection. */
+  private autoUpgradeDisabledOnDaemon = false;
+  /** Daemon connection generation the last upgrade command was written to. */
+  private daemonUpgradeSentGeneration: number | null = null;
+  private lastLoggedAutoUpgradeWait: string | null = null;
+  private autoUpgradePersistence: Promise<void> = Promise.resolve();
   private controlledNodeWorkerRefreshStatus: ControlledNodeWorkerRefreshStatusMessage | null = null;
   private controlledNodeWorkerRefreshPersistence: Promise<void> = Promise.resolve();
   private browserSockets = new Set<WebSocket>();
@@ -2636,9 +2648,9 @@ export class WsBridge {
     reason?: string;
   } {
     return {
-      status: this.controlledNodeUpgradeStatus,
-      ...(this.controlledNodeUpgradeTargetVersion ? { targetVersion: this.controlledNodeUpgradeTargetVersion } : {}),
-      ...(this.controlledNodeUpgradeReason ? { reason: this.controlledNodeUpgradeReason } : {}),
+      status: this.autoUpgradeStatus,
+      ...(this.autoUpgradeTargetVersion ? { targetVersion: this.autoUpgradeTargetVersion } : {}),
+      ...(this.autoUpgradeReason ? { reason: this.autoUpgradeReason } : {}),
     };
   }
 
@@ -2682,20 +2694,20 @@ export class WsBridge {
     this.broadcastToBrowsers(JSON.stringify(status));
   }
 
-  private setControlledNodeUpgradeState(
+  private setAutoUpgradeState(
     status: ControlledNodeUpgradeStatus,
-    targetVersion: string | null = this.controlledNodeUpgradeTargetVersion,
+    targetVersion: string | null = this.autoUpgradeTargetVersion,
     reason: string | null = null,
   ): void {
-    this.controlledNodeUpgradeStatus = status;
-    this.controlledNodeUpgradeTargetVersion = targetVersion;
-    this.controlledNodeUpgradeReason = reason;
+    this.autoUpgradeStatus = status;
+    this.autoUpgradeTargetVersion = targetVersion;
+    this.autoUpgradeReason = reason;
     // Discovery is served by any API pod, so persist the bounded state rather
     // than exposing a process-local WS snapshot as the authority. A stale or
     // unavailable DB must never block the live daemon transition.
     if (this.db && this.daemonNodeRole === NODE_ROLE.CONTROLLED) {
       const db = this.db;
-      this.controlledNodeUpgradePersistence = this.controlledNodeUpgradePersistence
+      this.autoUpgradePersistence = this.autoUpgradePersistence
         .catch(() => {})
         .then(() => db.execute(
           `UPDATE servers
@@ -5647,13 +5659,13 @@ export class WsBridge {
           // An UPGRADING marker is only a durable observation of the previous
           // socket. A fresh auth with the old version must be allowed to retry
           // once at this new authoritative idle boundary.
-          this.controlledNodeUpgradeStatus = persistedStatus === CONTROLLED_NODE_UPGRADE_STATUS.UPGRADING
+          this.autoUpgradeStatus = persistedStatus === CONTROLLED_NODE_UPGRADE_STATUS.UPGRADING
             ? CONTROLLED_NODE_UPGRADE_STATUS.AVAILABLE
             : persistedStatus;
-          this.controlledNodeUpgradeTargetVersion = typeof server.controlled_upgrade_target_version === 'string'
+          this.autoUpgradeTargetVersion = typeof server.controlled_upgrade_target_version === 'string'
             ? server.controlled_upgrade_target_version
             : null;
-          this.controlledNodeUpgradeReason = typeof server.controlled_upgrade_reason === 'string'
+          this.autoUpgradeReason = typeof server.controlled_upgrade_reason === 'string'
             ? server.controlled_upgrade_reason
             : null;
           this.controlledNodeWorkerRefreshStatus = server.controlled_worker_refresh_attempt_id
@@ -5861,23 +5873,28 @@ export class WsBridge {
         // reconnecting daemon, and its handler was waiting on authPromise. A
         // next-turn flush lets that persisted terminal blocker run first,
         // regardless of how long replayInflightToDaemon() made auth take.
-        const runPostAuthUpgrade = () => {
+        const runPostAuthUpgrade = (autoTrigger: boolean) => {
           if (
             this.daemonWs !== ws
             || this.daemonGeneration !== connectionGeneration
             || !this.authenticated
           ) return;
-          if (this.daemonNodeRole === NODE_ROLE.CONTROLLED) {
-            this.maybeAutoUpgradeControlledNode();
-          }
+          if (autoTrigger) this.maybeAutoUpgradeDaemon();
           this.flushPendingDaemonUpgrade(ws);
         };
-        if (this.daemonNodeRole === NODE_ROLE.CONTROLLED) {
-          // Per-node stagger: see CONTROLLED_NODE_UPGRADE_STAGGER_MAX_MS.
-          const timer = setTimeout(runPostAuthUpgrade, controlledNodeUpgradeStaggerMs(this.serverId));
-          (timer as { unref?: () => void }).unref?.();
-        } else {
-          setImmediate(runPostAuthUpgrade);
+        // A new connection restarts the daemon's own opt-out evaluation and
+        // owns the retry schedule: a timer armed for an earlier socket must
+        // not keep this one from arming its own.
+        this.autoUpgradeDisabledOnDaemon = false;
+        this.clearAutoUpgradeRetryTimer();
+        // Per-daemon stagger: see CONTROLLED_NODE_UPGRADE_STAGGER_MAX_MS. A
+        // server restart reconnects everything at once; the automatic trigger
+        // is spread, while a request already pending (an offline manual
+        // upgrade) still flushes immediately on a full daemon.
+        const staggerTimer = setTimeout(() => runPostAuthUpgrade(true), controlledNodeUpgradeStaggerMs(this.serverId));
+        (staggerTimer as { unref?: () => void }).unref?.();
+        if (this.daemonNodeRole !== NODE_ROLE.CONTROLLED) {
+          setImmediate(() => runPostAuthUpgrade(false));
         }
         return;
       }
@@ -6006,7 +6023,7 @@ export class WsBridge {
             WsBridge.controlledInboundDropped++;
             return;
           }
-          this.setControlledNodeUpgradeState(
+          this.setAutoUpgradeState(
             CONTROLLED_NODE_UPGRADE_STATUS.UPGRADING,
             targetVersion,
             null,
@@ -6262,7 +6279,7 @@ export class WsBridge {
         this.activeMainSessions.clear();
         this.activeSubSessions.clear();
         this.hasActiveMainSessionSnapshot = false;
-        this.clearControlledNodeUpgradeRetryTimer();
+        this.clearAutoUpgradeRetryTimer();
         this.rejectAllPendingFileTransfers('daemon_disconnected');
         this.rejectAllPendingMemorySourcesRequests('daemon_disconnected');
         this.rejectAllPendingHttpTimelineRequests('daemon_disconnected');
@@ -7602,12 +7619,12 @@ export class WsBridge {
     }
     if (msg.type === 'chat.status' && msg.status === 'idle') {
       this.activeDispatchIds.delete(sessionId);
-      this.scheduleControlledUpgradeFlushAtIdleBoundary();
+      this.scheduleAutoUpgradeFlushAtIdleBoundary();
       return;
     }
     if (msg.type === 'chat.complete' || msg.type === 'chat.error') {
       this.activeDispatchIds.delete(sessionId);
-      this.scheduleControlledUpgradeFlushAtIdleBoundary();
+      this.scheduleAutoUpgradeFlushAtIdleBoundary();
     }
   }
 
@@ -7617,7 +7634,7 @@ export class WsBridge {
     const sub = this.activeSubSessions.get(sessionName);
     if (sub) this.activeSubSessions.set(sessionName, { ...sub, state });
     if (state === 'idle' || state === 'stopped') this.activeDispatchIds.delete(sessionName);
-    this.scheduleControlledUpgradeFlushAtIdleBoundary();
+    this.scheduleAutoUpgradeFlushAtIdleBoundary();
   }
 
   private hasAuthoritativeBusySession(): boolean {
@@ -7632,16 +7649,43 @@ export class WsBridge {
   }
 
   /**
-   * A live authenticated socket is necessary but not sufficient for a safe
-   * controlled-node upgrade: an active dispatch must reach its idle/terminal
-   * edge first. The coordinator still deduplicates sends; this hook only
-   * provides the next safe edge for a request that was deferred while busy.
+   * Next safe edge for a deferred upgrade.
+   *
+   * CONTROLLED node: a live authenticated socket is necessary but not
+   * sufficient; an active dispatch must reach its idle/terminal edge first, so
+   * the request that was deferred while busy is flushed at that edge.
+   *
+   * FULL daemon: the daemon owns the idle decision (its own busy gates). This
+   * edge is only a TRIGGER: it is armed solely after the daemon answered a
+   * delivered command with a retryable block receipt (status DEFERRED), it
+   * never sends without such a receipt, it waits for the server's own view of
+   * the sessions to be quiet purely to avoid a pointless round trip, and it is
+   * spaced by DAEMON_UPGRADE_IDLE_EDGE_MIN_INTERVAL_MS. The daemon then decides
+   * again; a still-busy daemon simply answers another block receipt.
    */
-  private scheduleControlledUpgradeFlushAtIdleBoundary(): void {
-    if (this.daemonNodeRole !== NODE_ROLE.CONTROLLED
-      || !this.authenticated
-      || this.activeDispatchIds.size > 0
-      || !this.daemonWs) return;
+  private scheduleAutoUpgradeFlushAtIdleBoundary(): void {
+    if (!this.authenticated || !this.daemonWs) return;
+    if (this.daemonNodeRole === NODE_ROLE.FULL) {
+      if (this.autoUpgradeStatus !== CONTROLLED_NODE_UPGRADE_STATUS.DEFERRED
+        || !this.autoUpgradeReason
+        || !isRetryableDaemonUpgradeBlockReason(this.autoUpgradeReason)
+        || this.hasAuthoritativeBusySession()) return;
+      const last = this.autoUpgradeLastAttemptAt;
+      if (last !== null && Date.now() - last < DAEMON_UPGRADE_IDLE_EDGE_MIN_INTERVAL_MS) return;
+      const fullWs = this.daemonWs;
+      const fullGeneration = this.daemonGeneration;
+      setImmediate(() => {
+        if (this.daemonWs !== fullWs
+          || this.daemonGeneration !== fullGeneration
+          || !this.authenticated
+          || this.autoUpgradeStatus !== CONTROLLED_NODE_UPGRADE_STATUS.DEFERRED
+          || this.hasAuthoritativeBusySession()) return;
+        this.maybeAutoUpgradeDaemon();
+        this.flushPendingDaemonUpgrade(fullWs);
+      });
+      return;
+    }
+    if (this.daemonNodeRole !== NODE_ROLE.CONTROLLED || this.activeDispatchIds.size > 0) return;
     const ws = this.daemonWs;
     const generation = this.daemonGeneration;
     setImmediate(() => {
@@ -8857,6 +8901,7 @@ export class WsBridge {
         type: DAEMON_STATS_MSG,
         daemonVersion: typeof msg.daemonVersion === 'string' ? msg.daemonVersion : this.daemonVersion,
         latestDaemonVersion: process.env.APP_VERSION ?? null,
+        ...(this.daemonAutoUpgradeView() ? { autoUpgrade: this.daemonAutoUpgradeView() } : {}),
         cpu: msg.cpu, memUsed: msg.memUsed, memTotal: msg.memTotal,
         load1: msg.load1, load5: msg.load5, load15: msg.load15, uptime: msg.uptime,
         // The bridge rebuilds daemon.stats from an explicit allowlist. Keep
@@ -9085,7 +9130,7 @@ export class WsBridge {
       this.sessionRuntimeTypes.set(name, this.normalizeRuntimeType(runtimeType));
       if (state === 'idle' || state === 'stopped') this.activeDispatchIds.delete(name);
     }
-    this.scheduleControlledUpgradeFlushAtIdleBoundary();
+    this.scheduleAutoUpgradeFlushAtIdleBoundary();
   }
 
   private pruneMainSessionRecentText(rawSessions: unknown): void {
@@ -10360,17 +10405,25 @@ export class WsBridge {
         // checksum, disk space, ...): the node gave up on this attempt. Leaving
         // the lifecycle in `sent` made every later request answer
         // `already_in_progress`, so the node was never offered the target again.
-        this.recordControlledNodeUpgradeFailure(targetVersion, blockedReason);
+        this.recordAutoUpgradeFailure(targetVersion, blockedReason);
       } else {
         // A node-side safety gate is recoverable, but must not turn into a
         // restart loop. Keep the same coordinator lifecycle pending and retry
         // once after a bounded idle edge/reconnect window.
         this.daemonUpgradeCoordinator.deferAfterTransientBlock();
-        this.setControlledNodeUpgradeState(
+        this.setAutoUpgradeState(
           CONTROLLED_NODE_UPGRADE_STATUS.DEFERRED,
           targetVersion,
           blockedReason,
         );
+      }
+    } else {
+      const handled = this.handleFullDaemonUpgradeBlocked(blockedReason, failedTargetVersion ?? serverVersion, msg);
+      if (handled === 'absorbed') {
+        // An automatic attempt the daemon held back for its own reasons is
+        // server-managed (retry/backoff) and shown on the status card; it is
+        // not an operator-facing "failure", so it is not relayed as a toast.
+        return false;
       }
     }
 
@@ -10386,11 +10439,10 @@ export class WsBridge {
       }
     }
 
-    // A blocked upgrade is now an operator-visible terminal state. The old
-    // bridge retried transient blockers automatically, which could restart a
-    // daemon repeatedly while a user was still working. Keep the blocker
-    // envelope/ack path so the UI can show the existing toast and card state;
-    // the user can explicitly confirm another POST when ready.
+    // Receipts that reach this point (manual requests, install failures) are
+    // operator-visible: keep the blocker envelope/ack path so the UI can show
+    // the existing toast and card state. Automatic gate receipts were absorbed
+    // above and are shown on the card from the auto-upgrade status instead.
     const duplicate = failureId ? this.hasSeenUpgradeBlockedFailure(failureId) : false;
     if (failureId) {
       this.rememberUpgradeBlockedFailure(failureId);
@@ -10407,159 +10459,275 @@ export class WsBridge {
       reason: blockedReason,
       failedTargetVersion,
       failureUpgradeId,
-    }, 'daemon.upgrade blocked; waiting for explicit manual retry');
+    }, 'daemon.upgrade blocked');
     return !duplicate;
+  }
+
+  /**
+   * A FULL daemon answered a delivered daemon.upgrade with a block receipt.
+   * The daemon's gates are the only definition of "busy": the server never
+   * second-guesses them, it only schedules the next ask.
+   *
+   * - `auto_upgrade_disabled`: the daemon's own opt-out. Stop asking on this
+   *   connection; not a failure, no backoff.
+   * - a retryable reason (busy gates, cooldown, already in progress): ask again
+   *   at the next session idle edge or after a bounded interval. This is not a
+   *   failed attempt, so it is taken back out of the attempt count.
+   * - anything else (install_failed, toolchain_unavailable, ...): a failure of
+   *   this exact target, retried on the 10m/30m/2h/6h schedule.
+   *
+   * A manual lifecycle that was blocked (an unforced request, or a daemon that
+   * predates `force`) is released instead of retried as manual: the operator
+   * can click again, and the automatic path takes over for the same target.
+   * Returns 'absorbed' when the receipt belonged to an automatic attempt and
+   * must not be relayed to browsers.
+   */
+  private handleFullDaemonUpgradeBlocked(
+    reason: string,
+    targetVersion: string,
+    msg: Record<string, unknown>,
+    now = Date.now(),
+  ): 'absorbed' | 'relay' {
+    const lifecycle = this.daemonUpgradeCoordinator.snapshot();
+    const fromAuto = lifecycle?.status === 'sent' && lifecycle.source === DAEMON_UPGRADE_SOURCE.AUTO;
+    const fromManual = lifecycle?.status === 'sent' && lifecycle.source === DAEMON_UPGRADE_SOURCE.MANUAL;
+    const countedAttempt = (): void => {
+      if (fromAuto && this.autoUpgradeAttempts > 0) this.autoUpgradeAttempts -= 1;
+    };
+    // Gate receipts answer a command this server delivered. One that matches no
+    // delivered lifecycle (already handled, superseded, or not ours) schedules
+    // nothing, so a stray or repeated receipt can never arm a retry by itself.
+    const isGateReceipt = reason === DAEMON_UPGRADE_BLOCK_REASON.AUTO_UPGRADE_DISABLED
+      || isRetryableDaemonUpgradeBlockReason(reason);
+    if (isGateReceipt && lifecycle?.status !== 'sent') {
+      return lifecycle?.source === DAEMON_UPGRADE_SOURCE.AUTO ? 'absorbed' : 'relay';
+    }
+    if (reason === DAEMON_UPGRADE_BLOCK_REASON.AUTO_UPGRADE_DISABLED) {
+      this.autoUpgradeDisabledOnDaemon = true;
+      countedAttempt();
+      this.daemonUpgradeCoordinator.releaseSentLifecycle(now);
+      this.clearAutoUpgradeRetryTimer();
+      this.setAutoUpgradeState(CONTROLLED_NODE_UPGRADE_STATUS.DEFERRED, targetVersion, reason);
+      this.logAutoUpgradeWait(targetVersion, reason);
+      return fromAuto ? 'absorbed' : 'relay';
+    }
+    if (isRetryableDaemonUpgradeBlockReason(reason)) {
+      countedAttempt();
+      if (fromManual) this.daemonUpgradeCoordinator.releaseSentLifecycle(now);
+      else this.daemonUpgradeCoordinator.deferAfterTransientBlock(now);
+      this.setAutoUpgradeState(CONTROLLED_NODE_UPGRADE_STATUS.DEFERRED, targetVersion, reason);
+      const cooldownRemainingMs = typeof msg.cooldownRemainingMs === 'number' && Number.isFinite(msg.cooldownRemainingMs)
+        ? msg.cooldownRemainingMs
+        : null;
+      this.scheduleAutoUpgradeRetry(
+        reason === DAEMON_UPGRADE_BLOCK_REASON.COOLDOWN_ACTIVE && cooldownRemainingMs !== null
+          ? Math.min(Math.max(cooldownRemainingMs, DAEMON_UPGRADE_COOLDOWN_RETRY_MIN_MS), DAEMON_UPGRADE_COOLDOWN_RETRY_MAX_MS)
+          : DAEMON_UPGRADE_BUSY_RETRY_INTERVAL_MS,
+      );
+      this.logAutoUpgradeWait(targetVersion, reason);
+      return fromAuto ? 'absorbed' : 'relay';
+    }
+    this.recordAutoUpgradeFailure(targetVersion, reason, now);
+    return 'relay';
   }
 
   /** Controlled nodes are passive workers: auth + a live socket is the
    * authoritative idle/ready boundary. Full daemons intentionally never use
    * this path and retain the explicit operator-confirmation policy. */
-  private maybeAutoUpgradeControlledNode(now = Date.now()): RequestDaemonUpgradeResult | null {
-    if (this.daemonNodeRole !== NODE_ROLE.CONTROLLED || !this.authenticated) return null;
+  /**
+   * The server-driven automatic upgrade trigger, shared by controlled nodes and
+   * full daemons. It decides only WHETHER to ask (version lag, opt-out, failure
+   * backoff for this exact target); a full daemon then decides WHEN it can
+   * safely act through its own busy gates and answers with a block receipt
+   * that handleDaemonUpgradeBlocked turns into a bounded retry.
+   */
+  private maybeAutoUpgradeDaemon(now = Date.now()): RequestDaemonUpgradeResult | null {
+    if (!this.authenticated) return null;
+    this.releaseManualUpgradeSentToEarlierConnection();
     // An operator may explicitly hold the server-driven trigger closed while
     // retaining manual upgrades. The published image does not set this value.
     if (isDaemonAutoUpgradeDisabledByEnv()) {
-      this.logControlledNodeUpgradeWait(process.env.APP_VERSION ?? null, CONTROLLED_NODE_UPGRADE_WAIT_REASON.DISABLED_BY_ENV);
+      this.logAutoUpgradeWait(process.env.APP_VERSION ?? null, CONTROLLED_NODE_UPGRADE_WAIT_REASON.DISABLED_BY_ENV);
       return null;
     }
     const targetVersion = process.env.APP_VERSION;
     if (!targetVersion || targetVersion === '0.0.0') {
-      this.logControlledNodeUpgradeWait(null, CONTROLLED_NODE_UPGRADE_WAIT_REASON.SERVER_VERSION_UNKNOWN);
+      this.logAutoUpgradeWait(null, CONTROLLED_NODE_UPGRADE_WAIT_REASON.SERVER_VERSION_UNKNOWN);
       return null;
     }
     if (!this.daemonVersion) {
-      this.logControlledNodeUpgradeWait(targetVersion, CONTROLLED_NODE_UPGRADE_WAIT_REASON.DAEMON_VERSION_UNKNOWN);
+      this.logAutoUpgradeWait(targetVersion, CONTROLLED_NODE_UPGRADE_WAIT_REASON.DAEMON_VERSION_UNKNOWN);
       return null;
     }
-    this.controlledNodeUpgradeTargetVersion = targetVersion;
-    if (!isDaemonUpgradeAvailable(this.daemonVersion, targetVersion)) {
-      this.setControlledNodeUpgradeState(CONTROLLED_NODE_UPGRADE_STATUS.CURRENT, null, null);
+    this.autoUpgradeTargetVersion = targetVersion;
+    if (this.daemonNodeRole === NODE_ROLE.FULL && this.autoUpgradeDisabledOnDaemon
+      && isDaemonAutoUpgradeAvailable(this.daemonVersion, targetVersion)) {
+      // The daemon's own opt-out refused source:auto on this connection. Do not
+      // ask again until it reconnects (config/env are re-read then); a manual
+      // upgrade is unaffected.
+      this.logAutoUpgradeWait(targetVersion, DAEMON_UPGRADE_BLOCK_REASON.AUTO_UPGRADE_DISABLED);
+      return null;
+    }
+    // A full daemon is only moved automatically along its own release channel;
+    // a controlled node keeps converging to the server's exact version.
+    const upgradeApplies = this.daemonNodeRole === NODE_ROLE.FULL
+      ? isDaemonAutoUpgradeAvailable(this.daemonVersion, targetVersion)
+      : isDaemonUpgradeAvailable(this.daemonVersion, targetVersion);
+    if (!upgradeApplies) {
+      this.setAutoUpgradeState(CONTROLLED_NODE_UPGRADE_STATUS.CURRENT, null, null);
       this.daemonUpgradeCoordinator.clearIfTargetVersionMatches(this.daemonVersion);
-      this.resetControlledNodeUpgradeAttempts(null);
+      this.resetAutoUpgradeAttempts(null);
       return null;
     }
     // Attempt bookkeeping belongs to one target: a new server version is a new
     // lifecycle, whatever happened to the previous one.
-    if (this.controlledNodeUpgradeAttemptTarget !== targetVersion) {
-      this.resetControlledNodeUpgradeAttempts(targetVersion);
+    if (this.autoUpgradeAttemptTarget !== targetVersion) {
+      this.resetAutoUpgradeAttempts(targetVersion);
     }
-    const attempts = this.controlledNodeUpgradeAttempts;
-    const lastAttemptAt = this.controlledNodeUpgradeLastAttemptAt;
+    const attempts = this.autoUpgradeAttempts;
+    const lastAttemptAt = this.autoUpgradeLastAttemptAt;
     const retryAfterMs = attempts > 0 ? controlledNodeUpgradeRetryDelayMs(attempts) : 0;
     const retryRemainingMs = lastAttemptAt === null ? 0 : lastAttemptAt + retryAfterMs - now;
-    if (this.controlledNodeUpgradeStatus === CONTROLLED_NODE_UPGRADE_STATUS.FAILED) {
+    if (this.autoUpgradeStatus === CONTROLLED_NODE_UPGRADE_STATUS.FAILED) {
       // A persisted failure blocks only this exact target, and only until the
       // bounded retry is due. Loaded from the DB (no in-memory attempt) it is
       // due immediately, so a node can never be stranded by an old failure.
       if (retryRemainingMs > 0) {
-        this.scheduleControlledNodeUpgradeRetry(retryRemainingMs);
-        this.logControlledNodeUpgradeWait(targetVersion, CONTROLLED_NODE_UPGRADE_WAIT_REASON.RETRY_BACKOFF);
+        this.scheduleAutoUpgradeRetry(retryRemainingMs);
+        this.logAutoUpgradeWait(targetVersion, CONTROLLED_NODE_UPGRADE_WAIT_REASON.RETRY_BACKOFF);
         return null;
       }
       this.daemonUpgradeCoordinator.releaseTerminalBlock(targetVersion, now);
-    } else if (retryRemainingMs <= 0 && attempts > 0
-      && this.daemonUpgradeCoordinator.sentLifecycleFor(targetVersion)) {
-      // Delivered earlier, yet the node authenticated again still on the old
-      // version: the install did not complete. Offer it again, bounded.
+      // A delivered-but-never-completed attempt leaves a `sent` lifecycle
+      // instead of a terminal block; its backoff is over too (no-op otherwise).
       this.daemonUpgradeCoordinator.prepareRetryAfterDaemonRestart(now);
+    } else if (attempts > 0 && this.daemonUpgradeCoordinator.sentLifecycleFor(targetVersion)) {
+      // Delivered earlier, yet the daemon authenticated again still on the old
+      // version: the install did not complete. Offer it again, but only after
+      // the bounded backoff for this attempt count, so a daemon that restarts
+      // without upgrading cannot be asked on every reconnect.
+      if (retryRemainingMs > 0) {
+        // A controlled node keeps its established behavior (offered again on its
+        // next reconnect after the backoff); a full daemon, which may stay
+        // connected for days, gets the retry scheduled for it.
+        if (this.daemonNodeRole === NODE_ROLE.FULL) {
+          this.scheduleAutoUpgradeRetry(retryRemainingMs);
+          this.setAutoUpgradeState(
+            CONTROLLED_NODE_UPGRADE_STATUS.FAILED,
+            targetVersion,
+            CONTROLLED_NODE_UPGRADE_WAIT_REASON.VERSION_UNCHANGED_AFTER_UPGRADE,
+          );
+          this.logAutoUpgradeWait(targetVersion, CONTROLLED_NODE_UPGRADE_WAIT_REASON.VERSION_UNCHANGED_AFTER_UPGRADE);
+          return null;
+        }
+      } else {
+        this.daemonUpgradeCoordinator.prepareRetryAfterDaemonRestart(now);
+      }
     }
-    this.setControlledNodeUpgradeState(
-      this.controlledNodeUpgradeStatus === CONTROLLED_NODE_UPGRADE_STATUS.DEFERRED
+    this.setAutoUpgradeState(
+      this.autoUpgradeStatus === CONTROLLED_NODE_UPGRADE_STATUS.DEFERRED
         ? CONTROLLED_NODE_UPGRADE_STATUS.DEFERRED
         : CONTROLLED_NODE_UPGRADE_STATUS.AVAILABLE,
       targetVersion,
-      this.controlledNodeUpgradeReason,
+      this.autoUpgradeReason,
     );
     const result = this.requestDaemonUpgrade({
       targetVersion,
       source: DAEMON_UPGRADE_SOURCE.AUTO,
     });
     if (result.deliveryStatus === DAEMON_UPGRADE_DELIVERY_STATUS.SENT) {
-      this.lastLoggedControlledUpgradeWait = null;
-      this.setControlledNodeUpgradeState(CONTROLLED_NODE_UPGRADE_STATUS.UPGRADING, targetVersion, null);
+      this.lastLoggedAutoUpgradeWait = null;
+      this.setAutoUpgradeState(CONTROLLED_NODE_UPGRADE_STATUS.UPGRADING, targetVersion, null);
     } else if (result.deliveryStatus === DAEMON_UPGRADE_DELIVERY_STATUS.PENDING_OFFLINE
       || result.deliveryStatus === DAEMON_UPGRADE_DELIVERY_STATUS.BACKOFF) {
       const failed = result.deliveryStatus === DAEMON_UPGRADE_DELIVERY_STATUS.BACKOFF;
       const reason = result.reason ?? this.daemonUpgradeNotReadyReason() ?? null;
-      this.setControlledNodeUpgradeState(
+      this.setAutoUpgradeState(
         failed ? CONTROLLED_NODE_UPGRADE_STATUS.FAILED : CONTROLLED_NODE_UPGRADE_STATUS.DEFERRED,
         targetVersion,
         reason,
       );
-      this.logControlledNodeUpgradeWait(targetVersion, reason);
+      this.logAutoUpgradeWait(targetVersion, reason);
     } else {
       // already_in_progress / suppressed / anything else: still say why nothing was sent.
-      this.logControlledNodeUpgradeWait(targetVersion, result.reason ?? result.deliveryStatus);
+      this.logAutoUpgradeWait(targetVersion, result.reason ?? result.deliveryStatus);
     }
     return result;
   }
 
   /** Log a held-back upgrade once per distinct reason, never per flush. */
-  private logControlledNodeUpgradeWait(targetVersion: string | null, reason: string | null): void {
+  private logAutoUpgradeWait(targetVersion: string | null, reason: string | null): void {
     const key = `${targetVersion ?? 'none'}:${reason ?? 'unknown'}`;
-    if (this.lastLoggedControlledUpgradeWait === key) return;
-    this.lastLoggedControlledUpgradeWait = key;
+    if (this.lastLoggedAutoUpgradeWait === key) return;
+    this.lastLoggedAutoUpgradeWait = key;
     logger.info({
       serverId: this.serverId,
       daemonVersion: this.daemonVersion,
       targetVersion,
       reason,
-    }, 'controlled node upgrade is being held back');
+    }, 'daemon auto-upgrade is being held back');
   }
 
-  private resetControlledNodeUpgradeAttempts(targetVersion: string | null): void {
-    this.controlledNodeUpgradeAttemptTarget = targetVersion;
-    this.controlledNodeUpgradeAttempts = 0;
-    this.controlledNodeUpgradeLastAttemptAt = null;
-    if (targetVersion === null) this.clearControlledNodeUpgradeRetryTimer();
+  private resetAutoUpgradeAttempts(targetVersion: string | null): void {
+    this.autoUpgradeAttemptTarget = targetVersion;
+    this.autoUpgradeAttempts = 0;
+    this.autoUpgradeLastAttemptAt = null;
+    if (targetVersion === null) this.clearAutoUpgradeRetryTimer();
   }
 
-  private clearControlledNodeUpgradeRetryTimer(): void {
-    if (this.controlledNodeUpgradeRetryTimer) clearTimeout(this.controlledNodeUpgradeRetryTimer);
-    this.controlledNodeUpgradeRetryTimer = null;
+  private clearAutoUpgradeRetryTimer(): void {
+    if (this.autoUpgradeRetryTimer) clearTimeout(this.autoUpgradeRetryTimer);
+    this.autoUpgradeRetryTimer = null;
+    this.autoUpgradeNextRetryAt = null;
   }
 
   /** Count one delivered upgrade command for the current target. */
-  private noteControlledNodeUpgradeSent(message: Record<string, unknown>, now = Date.now()): void {
-    if (this.daemonNodeRole !== NODE_ROLE.CONTROLLED) return;
-    const target = typeof message.targetVersion === 'string' ? message.targetVersion : this.controlledNodeUpgradeTargetVersion;
+  private noteAutoUpgradeSent(message: Record<string, unknown>, now = Date.now()): void {
+    this.daemonUpgradeSentGeneration = this.daemonGeneration;
+    // A full daemon's manual upgrade is the operator's own action and must not
+    // advance the automatic trigger's failure backoff (and vice versa).
+    if (this.daemonNodeRole !== NODE_ROLE.CONTROLLED && message.source === DAEMON_UPGRADE_SOURCE.MANUAL) return;
+    const target = typeof message.targetVersion === 'string' ? message.targetVersion : this.autoUpgradeTargetVersion;
     if (!target) return;
-    if (this.controlledNodeUpgradeAttemptTarget !== target) this.resetControlledNodeUpgradeAttempts(target);
-    this.controlledNodeUpgradeAttempts += 1;
-    this.controlledNodeUpgradeLastAttemptAt = now;
+    if (this.autoUpgradeAttemptTarget !== target) this.resetAutoUpgradeAttempts(target);
+    this.autoUpgradeAttempts += 1;
+    this.autoUpgradeLastAttemptAt = now;
   }
 
-  private recordControlledNodeUpgradeFailure(targetVersion: string, reason: string, now = Date.now()): void {
+  private recordAutoUpgradeFailure(targetVersion: string, reason: string, now = Date.now()): void {
     this.daemonUpgradeCoordinator.blockTargetAfterTerminalFailure(targetVersion, now);
-    if (this.controlledNodeUpgradeAttemptTarget !== targetVersion) {
-      this.resetControlledNodeUpgradeAttempts(targetVersion);
-      this.controlledNodeUpgradeAttempts = 1;
+    if (this.autoUpgradeAttemptTarget !== targetVersion) {
+      this.resetAutoUpgradeAttempts(targetVersion);
+      this.autoUpgradeAttempts = 1;
     }
-    this.controlledNodeUpgradeLastAttemptAt = now;
-    const retryInMs = controlledNodeUpgradeRetryDelayMs(Math.max(this.controlledNodeUpgradeAttempts, 1));
-    this.setControlledNodeUpgradeState(CONTROLLED_NODE_UPGRADE_STATUS.FAILED, targetVersion, reason);
+    this.autoUpgradeLastAttemptAt = now;
+    const retryInMs = controlledNodeUpgradeRetryDelayMs(Math.max(this.autoUpgradeAttempts, 1));
+    this.setAutoUpgradeState(CONTROLLED_NODE_UPGRADE_STATUS.FAILED, targetVersion, reason);
     logger.warn({
       serverId: this.serverId,
       daemonVersion: this.daemonVersion,
       targetVersion,
       reason,
-      attempts: this.controlledNodeUpgradeAttempts,
+      attempts: this.autoUpgradeAttempts,
       retryInMs,
-    }, 'controlled node upgrade failed; the same target is retried after a backoff');
-    this.scheduleControlledNodeUpgradeRetry(retryInMs);
+    }, 'daemon upgrade failed; the same target is retried after a backoff');
+    this.scheduleAutoUpgradeRetry(retryInMs);
   }
 
-  private scheduleControlledNodeUpgradeRetry(delayMs: number): void {
-    if (this.controlledNodeUpgradeRetryTimer || !this.daemonWs) return;
+  private scheduleAutoUpgradeRetry(delayMs: number): void {
+    if (this.autoUpgradeRetryTimer || !this.daemonWs) return;
     const ws = this.daemonWs;
     const generation = this.daemonGeneration;
-    this.controlledNodeUpgradeRetryTimer = setTimeout(() => {
-      this.controlledNodeUpgradeRetryTimer = null;
+    const waitMs = Math.max(1_000, delayMs);
+    this.autoUpgradeNextRetryAt = Date.now() + waitMs;
+    this.autoUpgradeRetryTimer = setTimeout(() => {
+      this.autoUpgradeRetryTimer = null;
+      this.autoUpgradeNextRetryAt = null;
       if (this.daemonWs !== ws || this.daemonGeneration !== generation || !this.authenticated) return;
-      this.maybeAutoUpgradeControlledNode();
+      this.maybeAutoUpgradeDaemon();
       this.flushPendingDaemonUpgrade(ws);
-    }, Math.max(1_000, delayMs));
-    (this.controlledNodeUpgradeRetryTimer as { unref?: () => void }).unref?.();
+    }, waitMs);
+    (this.autoUpgradeRetryTimer as { unref?: () => void }).unref?.();
   }
 
   private sendDaemonUpgradeBlockedAck(
@@ -10599,30 +10767,52 @@ export class WsBridge {
     }
   }
 
+  /**
+   * A manual command was written to an earlier connection and the daemon is
+   * back on this one, still lagging: it did not (or could not) upgrade. Leaving
+   * that lifecycle `sent` answered every later request `already_in_progress`
+   * forever, so release it; the operator can confirm again and the automatic
+   * trigger (with its own attempt/backoff counters) takes over meanwhile.
+   */
+  private releaseManualUpgradeSentToEarlierConnection(): void {
+    if (this.daemonNodeRole !== NODE_ROLE.FULL) return;
+    const lifecycle = this.daemonUpgradeCoordinator.snapshot();
+    if (lifecycle?.status === 'sent'
+      && lifecycle.source === DAEMON_UPGRADE_SOURCE.MANUAL
+      && this.daemonUpgradeSentGeneration !== null
+      && this.daemonUpgradeSentGeneration !== this.daemonGeneration) {
+      this.daemonUpgradeCoordinator.releaseSentLifecycle();
+    }
+  }
+
   requestDaemonUpgrade(input: {
     targetVersion?: unknown;
     source?: DaemonUpgradeSource;
+    /** Operator-confirmed forced upgrade; only honored for source manual. */
+    force?: boolean;
     isStillCurrent?: () => boolean;
   } = {}): RequestDaemonUpgradeResult {
+    this.releaseManualUpgradeSentToEarlierConnection();
     const result = this.daemonUpgradeCoordinator.request({
       targetVersion: input.targetVersion,
       source: input.source ?? 'manual',
+      force: input.force === true,
       skipPublicationGate: this.daemonNodeRole === NODE_ROLE.CONTROLLED,
       isDaemonReady: () => this.isDaemonReadyForUpgrade(),
       isStillCurrent: input.isStillCurrent,
       send: (message) => {
-        this.noteControlledNodeUpgradeSent(message);
+        this.noteAutoUpgradeSent(message);
         this.sendDirectToDaemon(message);
       },
     });
     if (this.daemonNodeRole === NODE_ROLE.CONTROLLED && (input.source ?? DAEMON_UPGRADE_SOURCE.MANUAL) === DAEMON_UPGRADE_SOURCE.MANUAL) {
-      this.setControlledNodeUpgradeState(
+      this.setAutoUpgradeState(
         result.deliveryStatus === DAEMON_UPGRADE_DELIVERY_STATUS.SENT
           ? CONTROLLED_NODE_UPGRADE_STATUS.UPGRADING
           : result.deliveryStatus === DAEMON_UPGRADE_DELIVERY_STATUS.BACKOFF
             ? CONTROLLED_NODE_UPGRADE_STATUS.FAILED
             : CONTROLLED_NODE_UPGRADE_STATUS.DEFERRED,
-        result.targetVersion ?? this.controlledNodeUpgradeTargetVersion,
+        result.targetVersion ?? this.autoUpgradeTargetVersion,
         result.reason ?? null,
       );
     }
@@ -10641,6 +10831,24 @@ export class WsBridge {
     return {
       currentVersion: this.daemonVersion,
       upgrade: this.daemonUpgradeCoordinator.snapshot(),
+      autoUpgrade: this.daemonAutoUpgradeView(),
+    };
+  }
+
+  /**
+   * Server-driven upgrade status of a FULL daemon for the status card: what the
+   * automatic trigger is doing and why it is waiting. Null while the daemon is
+   * current or the role has its own surface (controlled nodes persist theirs).
+   */
+  private daemonAutoUpgradeView(): DaemonAutoUpgradeView | null {
+    if (this.daemonNodeRole !== NODE_ROLE.FULL || !this.authenticated) return null;
+    if (this.autoUpgradeStatus === CONTROLLED_NODE_UPGRADE_STATUS.CURRENT
+      || !isDaemonAutoUpgradeAvailable(this.daemonVersion, process.env.APP_VERSION)) return null;
+    return {
+      status: this.autoUpgradeStatus,
+      reason: this.autoUpgradeReason,
+      targetVersion: this.autoUpgradeTargetVersion,
+      nextRetryAt: this.autoUpgradeNextRetryAt,
     };
   }
 
@@ -10650,7 +10858,7 @@ export class WsBridge {
       isDaemonReady: () => this.isDaemonReadyForUpgrade(),
       isStillCurrent: () => this.daemonWs === ws && this.authenticated,
       send: (message) => {
-        this.noteControlledNodeUpgradeSent(message);
+        this.noteAutoUpgradeSent(message);
         this.sendDirectToDaemon(message);
       },
     });
@@ -10664,9 +10872,9 @@ export class WsBridge {
     }
     if (result?.deliveryStatus === DAEMON_UPGRADE_DELIVERY_STATUS.SENT) {
       if (this.daemonNodeRole === NODE_ROLE.CONTROLLED) {
-        this.setControlledNodeUpgradeState(
+        this.setAutoUpgradeState(
           CONTROLLED_NODE_UPGRADE_STATUS.UPGRADING,
-          result.targetVersion ?? this.controlledNodeUpgradeTargetVersion,
+          result.targetVersion ?? this.autoUpgradeTargetVersion,
           null,
         );
       }
@@ -10680,9 +10888,9 @@ export class WsBridge {
       && this.daemonNodeRole === NODE_ROLE.CONTROLLED
     ) {
       const reason = this.daemonUpgradeNotReadyReason();
-      const target = result.targetVersion ?? this.controlledNodeUpgradeTargetVersion;
-      this.setControlledNodeUpgradeState(CONTROLLED_NODE_UPGRADE_STATUS.DEFERRED, target, reason);
-      if (target) this.logControlledNodeUpgradeWait(target, reason);
+      const target = result.targetVersion ?? this.autoUpgradeTargetVersion;
+      this.setAutoUpgradeState(CONTROLLED_NODE_UPGRADE_STATUS.DEFERRED, target, reason);
+      if (target) this.logAutoUpgradeWait(target, reason);
     } else if (result?.deliveryStatus === DAEMON_UPGRADE_DELIVERY_STATUS.PENDING_PUBLICATION) {
       logger.info({
         serverId: this.serverId,
