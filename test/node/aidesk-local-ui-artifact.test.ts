@@ -15,7 +15,7 @@ import {
   aideskLocalUiExecutableFileName,
   validateAideskLocalUiManifest,
 } from '../../shared/aidesk-local-ui-artifact.js';
-import { resolveVerifiedAideskLocalUi } from '../../src/node/aidesk-local-ui-artifact.js';
+import { readAideskLocalUiExpectedSha256, resolveVerifiedAideskLocalUi } from '../../src/node/aidesk-local-ui-artifact.js';
 // @ts-expect-error plain .mjs build script
 import * as artifactScript from '../../scripts/aidesk-ui-artifact.mjs';
 // @ts-expect-error plain .mjs build script
@@ -72,6 +72,18 @@ describe('manifest contract', () => {
     writeFileSync(join(linkDirectory, 'real'), 'x');
     symlinkSync(join(linkDirectory, 'real'), join(linkDirectory, 'aidesk-local-ui'));
     expect(() => artifactScript.buildManifest({ dir: linkDirectory, os: 'linux', arch: 'x64', version: '1' })).toThrow();
+  });
+});
+
+describe('the hash the launch script re-checks', () => {
+  it('is the manifest\'s sha256 for the installed executable, and nothing when the manifest is missing, unreadable or invalid', () => {
+    const ok = install('win32');
+    const wanted = createHash('sha256').update('MZ-fake-executable').digest('hex');
+    expect(readAideskLocalUiExpectedSha256(ok.executable, { platform: 'win32', arch: 'x64' })).toBe(wanted);
+    expect(readAideskLocalUiExpectedSha256(ok.executable, { platform: 'linux', arch: 'x64' })).toBeUndefined(); // a manifest of another platform
+    expect(readAideskLocalUiExpectedSha256(join(temp(), 'aidesk-local-ui.exe'), { platform: 'win32', arch: 'x64' })).toBeUndefined();
+    writeFileSync(join(ok.directory, 'aidesk-local-ui.manifest.json'), '{"not":"a manifest"}');
+    expect(readAideskLocalUiExpectedSha256(ok.executable, { platform: 'win32', arch: 'x64' })).toBeUndefined();
   });
 });
 

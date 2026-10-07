@@ -121,6 +121,8 @@ export const LOCAL_PANEL_WINDOWS_HOST = Object.freeze({
   /** Exit code of the host when the WebView2 runtime is not installed. */
   exitRuntimeMissing: 3,
   retryMilliseconds: 2000,
+  /** How long the node waits, after starting the host, for it to die (non-zero exit) before it counts as started. */
+  launchWaitMilliseconds: 8000,
 } as const);
 
 /**

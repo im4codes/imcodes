@@ -5,11 +5,12 @@
  * the CLI is started by the user (a shortcut). Finding the window and its start time only reads the process table, so the service
  * does that itself. Decisions live in shared/local-panel-window.ts.
  */
-import { execFile, spawn } from 'node:child_process';
+import { execFile } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { win32 } from 'node:path';
 import {
   LOCAL_PANEL_APP_MODE_BROWSERS,
+  LOCAL_PANEL_WINDOWS_HOST,
   LOCAL_PANEL_WINDOW_REASON,
   LOCAL_PANEL_WINDOW_PROCESS_NAMES_WIN32,
   LOCAL_PANEL_WINDOW_TITLE,
@@ -17,8 +18,7 @@ import {
 } from '../../shared/local-panel-window.js';
 import { AIDESK_LOCAL_UI_EXECUTABLE_NAME } from '../../shared/aidesk-product.js';
 import { resolveWindowsPowerShellExecutable, runWindowsUserSessionScript } from './aidesk-desktop-entry.js';
-import { resolveVerifiedAideskLocalUi } from './aidesk-local-ui-artifact.js';
-import { launchWindowsActiveUserCommand } from './windows-user-session.js';
+import { readAideskLocalUiExpectedSha256, resolveVerifiedAideskLocalUi } from './aidesk-local-ui-artifact.js';
 import type { LocalPanelWindowPlatform, LocalPanelWindowProcess } from './local-panel-window.js';
 
 /** The profile sentinel the script replaces with the user's own LOCALAPPDATA path (the service does not know it). */
@@ -32,11 +32,17 @@ export type WindowsPanelOp =
   /** Look for the panel window in the user's session; answers `ok:<pid>:<startedAtMs>` or not_found. */
   | { kind: 'find' }
   | { kind: 'default_browser'; url: string }
+  /**
+   * Start the native window host in the user's session and wait up to 8 s: it is up (still running, or a second start that raised the
+   * window and exited 0) -> `ok`; it exited with a failure -> `exited:<code>` (3 = the WebView2 runtime is missing); the file no longer
+   * has the recorded hash -> `failed`.
+   */
+  | { kind: 'launch_host'; path: string; sha256?: string }
   /** Is the WebView2 runtime the native window host renders with installed (for the user, or machine-wide)? `ok` or `not_found`. */
   | { kind: 'webview2_runtime' };
 
 /** What a script may answer: one of the words, or `ok:<pid>:<startedAtMs>` from the find operation. */
-const WINDOWS_PANEL_RESULT_RE = /^(?:ok|not_found|failed|ok:\d+:\d+)$/u;
+const WINDOWS_PANEL_RESULT_RE = /^(?:ok|not_found|failed|ok:\d+:\d+|exited:-?\d+)$/u;
 
 function b64(value: string): string {
   return Buffer.from(value, 'utf8').toString('base64');
@@ -107,6 +113,13 @@ if([PanelWin]::Focus(${op.pid},(D '${b64(LOCAL_PANEL_WINDOW_TITLE)}'),[string[]]
 $images=(D '${b64(JSON.stringify(LOCAL_PANEL_WINDOW_PROCESS_NAMES_WIN32))}') | ConvertFrom-Json
 $p=Get-Process | Where-Object{$_.MainWindowHandle -ne 0 -and $_.MainWindowTitle -eq $title -and ($images -contains $_.ProcessName.ToLowerInvariant())} | Sort-Object Id | Select-Object -First 1
 if($p){Report ('ok:{0}:{1}' -f $p.Id,([DateTimeOffset]$p.StartTime).ToUnixTimeMilliseconds())}else{Report 'not_found'}`;
+  } else if (op.kind === 'launch_host') {
+    body = String.raw`$exe=D '${b64(op.path)}'
+$expected=D '${b64(op.sha256 ?? '')}'
+if(-not (Test-Path -LiteralPath $exe -PathType Leaf)){Report 'failed';exit 0}
+if($expected -and ((Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash.ToLowerInvariant() -ne $expected)){Report 'failed';exit 0}
+$p=Start-Process -FilePath $exe -PassThru
+if($p.WaitForExit(${LOCAL_PANEL_WINDOWS_HOST.launchWaitMilliseconds})){if($p.ExitCode -eq 0){Report 'ok'}else{Report ('exited:'+$p.ExitCode)}}else{Report 'ok'}`;
   } else if (op.kind === 'webview2_runtime') {
     // The Evergreen runtime registers its version under this client id, per machine (both registry views) or per user; 0.0.0.0 = removed.
     body = String.raw`$id='{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}'
@@ -135,9 +148,10 @@ export interface WindowsPanelWindowDeps {
   tasklist: (args: readonly string[]) => Promise<string | undefined>;
   /** Run one operation in the active user's session (service) or directly (user): the script's result word. */
   runOp: (op: WindowsPanelOp) => Promise<string | undefined>;
-  launchNative: (path: string) => Promise<boolean>;
   /** The verified native window (manifest, hash and Authenticode signer), or undefined. */
   nativeUiPath: () => Promise<string | undefined>;
+  /** The sha256 the verified host's manifest records (re-checked by the launch script right before it starts the file). */
+  expectedSha256: (path: string) => string | undefined;
 }
 
 function isServiceAccount(env: NodeJS.ProcessEnv): boolean {
@@ -175,20 +189,8 @@ const realDeps = (): WindowsPanelWindowDeps => {
       const word = out.trim().split(/\s+/u).pop() ?? '';
       return WINDOWS_PANEL_RESULT_RE.test(word) ? word : undefined;
     },
-    launchNative: (path) => new Promise((resolve) => {
-      if (isServiceAccount(env)) {
-        let failed = false;
-        launchWindowsActiveUserCommand(path, '', undefined, false, false, false, () => { failed = true; });
-        setTimeout(() => resolve(!failed), 1_500);
-        return;
-      }
-      try {
-        const child = spawn(path, [], { detached: true, stdio: 'ignore', windowsHide: false });
-        child.once('error', () => resolve(false));
-        child.once('spawn', () => { child.unref(); setTimeout(() => resolve(true), 600); });
-      } catch { resolve(false); }
-    }),
     nativeUiPath: () => resolveVerifiedAideskLocalUi(),
+    expectedSha256: (path) => readAideskLocalUiExpectedSha256(path),
   };
 };
 
@@ -248,7 +250,13 @@ export function createWindowsLocalPanelWindowPlatform(overrides: Partial<Windows
     async focusWindow(window) {
       return (await deps.runOp({ kind: 'focus', pid: window.pid })) === 'ok';
     },
-    launchNative: (path) => deps.launchNative(path),
+    async launchNative(path) {
+      // The user's session starts it and reports how it went (see launch_host): a host that dies at once is a failed attempt, so the chain
+      // falls back to the browser window instead of leaving the user with nothing.
+      const answer = await deps.runOp({ kind: 'launch_host', path, ...(deps.expectedSha256(path) ? { sha256: deps.expectedSha256(path) as string } : {}) });
+      if (answer === 'exited:' + LOCAL_PANEL_WINDOWS_HOST.exitRuntimeMissing) { runtimePresent = false; runtimeMissing = true; }
+      return answer === 'ok';
+    },
     async launchAppMode(browser) {
       return (await deps.runOp({ kind: 'launch_app', browser })) === 'ok';
     },

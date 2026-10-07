@@ -3,7 +3,7 @@
  * command lines are run, how the running window is found and focused. Real-device behavior is checked separately on real machines.
  */
 import { describe, expect, it } from 'vitest';
-import { LOCAL_PANEL_LINUX_WM_CLASS, LOCAL_PANEL_WINDOW_PROCESS_NAMES_WIN32, LOCAL_PANEL_WINDOW_REASON, LOCAL_PANEL_REFUSING_PROXY, LOCAL_PANEL_WARNING_BAR_FLAGS, LOCAL_PANEL_WINDOW_TITLE, localPanelUrl } from '../../shared/local-panel-window.js';
+import { LOCAL_PANEL_LINUX_WM_CLASS, LOCAL_PANEL_WINDOWS_HOST, LOCAL_PANEL_WINDOW_PROCESS_NAMES_WIN32, LOCAL_PANEL_WINDOW_REASON, LOCAL_PANEL_REFUSING_PROXY, LOCAL_PANEL_WARNING_BAR_FLAGS, LOCAL_PANEL_WINDOW_TITLE, localPanelUrl } from '../../shared/local-panel-window.js';
 import { createLinuxLocalPanelWindowPlatform } from '../../src/node/local-panel-window-linux.js';
 import { createMacosLocalPanelWindowPlatform } from '../../src/node/local-panel-window-macos.js';
 import {
@@ -268,7 +268,7 @@ describe('Windows adapter', () => {
 
   it('as SYSTEM, a desktop exists only while a user session runs explorer (read from tasklist, never WMI); the window comes from the find script and its pid is checked against the window images', async () => {
     const env = { USERNAME: 'DESKTOP-1$' };
-    const base = { env, exists: () => false, runOp: async () => 'ok', launchNative: async () => true, nativeUiPath: async () => 'C:\\Program Files\\IM.codes\\aidesk-local-ui.exe' };
+    const base = { env, exists: () => false, runOp: async () => 'ok', nativeUiPath: async () => 'C:\\Program Files\\IM.codes\\aidesk-local-ui.exe' };
     const explorer = (session: string) => async () => `"explorer.exe","4242","Console","${session}","80,000 K"\r\n`;
     expect(await createWindowsLocalPanelWindowPlatform({ ...base, tasklist: explorer('1') }).hasDesktop()).toBe(true);
     expect(await createWindowsLocalPanelWindowPlatform({ ...base, tasklist: explorer('0') }).hasDesktop()).toBe(false);
@@ -293,7 +293,7 @@ describe('Windows adapter', () => {
   it('operations map the script word to success; only an absolute existing native path is offered; browsers are the shared list', async () => {
     const ops: string[] = [];
     const platform = createWindowsLocalPanelWindowPlatform({
-      env: { USERNAME: 'alice' }, tasklist: async () => '', launchNative: async () => true,
+      env: { USERNAME: 'alice' }, tasklist: async () => '',
       runOp: async (op) => { ops.push(op.kind); return op.kind === 'webview2_runtime' || (op.kind === 'launch_app' && op.browser === 'msedge.exe') ? 'ok' : 'not_found'; },
       exists: () => true, nativeUiPath: async () => 'C:\\Program Files\\IM.codes\\aidesk-local-ui.exe',
     });
@@ -302,7 +302,7 @@ describe('Windows adapter', () => {
     expect(await platform.focusWindow({ pid: 1, startedAtMs: 1 })).toBe(false);
     expect(await platform.findAppModeBrowsers()).toEqual(['msedge.exe', 'chrome.exe', 'brave.exe']);
     expect(await platform.nativeUiPath()).toBe('C:\\Program Files\\IM.codes\\aidesk-local-ui.exe');
-    expect(await createWindowsLocalPanelWindowPlatform({ env: {}, tasklist: async () => '', runOp: async () => 'ok', launchNative: async () => true, exists: () => true, nativeUiPath: async () => 'relative\\aidesk-local-ui.exe' }).nativeUiPath()).toBeUndefined();
+    expect(await createWindowsLocalPanelWindowPlatform({ env: {}, tasklist: async () => '', runOp: async () => 'ok', exists: () => true, nativeUiPath: async () => 'relative\\aidesk-local-ui.exe' }).nativeUiPath()).toBeUndefined();
     expect(ops).toEqual(['launch_app', 'launch_app', 'focus', 'webview2_runtime']);
   });
 
@@ -310,7 +310,7 @@ describe('Windows adapter', () => {
     const calls: string[] = [];
     let runtime = 'not_found';
     const platform = createWindowsLocalPanelWindowPlatform({
-      env: { USERNAME: 'alice' }, tasklist: async () => '', launchNative: async () => true, exists: () => true,
+      env: { USERNAME: 'alice' }, tasklist: async () => '', exists: () => true,
       runOp: async (op) => { calls.push(op.kind); return op.kind === 'webview2_runtime' ? runtime : 'ok'; },
       nativeUiPath: async () => 'C:\\Program Files\\IM.codes\\aidesk-local-ui.exe',
     });
@@ -324,9 +324,52 @@ describe('Windows adapter', () => {
     expect(await platform.nativeUiPath()).toBeDefined();
     expect(calls.filter((kind) => kind === 'webview2_runtime')).toHaveLength(2);
     // no host installed at all: no runtime probe, and not reported as a missing runtime
-    const none = createWindowsLocalPanelWindowPlatform({ env: { USERNAME: 'alice' }, tasklist: async () => '', launchNative: async () => true, exists: () => true, runOp: async () => 'ok', nativeUiPath: async () => undefined });
+    const none = createWindowsLocalPanelWindowPlatform({ env: { USERNAME: 'alice' }, tasklist: async () => '', exists: () => true, runOp: async () => 'ok', nativeUiPath: async () => undefined });
     expect(await none.nativeUiPath()).toBeUndefined();
     expect(none.nativeUnavailableReason?.()).toBeUndefined();
+  });
+
+  it('starting the host reports how it went: running or a raised second instance is started; a host that exits non-zero within the wait is a failed attempt; exit 3 means the runtime is missing', async () => {
+    const exePath = 'C:\\Program Files\\IM.codes\\aidesk-local-ui\\win32-x64\\aidesk-local-ui.exe';
+    const sha = 'ab'.repeat(32);
+    let answer = 'ok';
+    const ops: Array<Record<string, unknown>> = [];
+    const platform = createWindowsLocalPanelWindowPlatform({
+      env: { USERNAME: 'alice' }, tasklist: async () => '', exists: () => true, nativeUiPath: async () => exePath, expectedSha256: () => sha,
+      runOp: async (op) => { ops.push(op as unknown as Record<string, unknown>); return op.kind === 'webview2_runtime' ? 'ok' : answer; },
+    });
+    expect(await platform.nativeUiPath()).toBe(exePath);
+    expect(await platform.launchNative(exePath)).toBe(true);
+    expect(ops.at(-1)).toEqual({ kind: 'launch_host', path: exePath, sha256: sha });
+    answer = 'exited:1';
+    expect(await platform.launchNative(exePath)).toBe(false);
+    expect(await platform.nativeUnavailableReason?.()).toBeUndefined();
+    answer = 'failed';
+    expect(await platform.launchNative(exePath)).toBe(false);
+    answer = 'exited:3';
+    expect(await platform.launchNative(exePath)).toBe(false);
+    // the runtime vanished after the probe said ok: the next click probes again and the trail says why
+    expect(platform.nativeUnavailableReason?.()).toBe(LOCAL_PANEL_WINDOW_REASON.NATIVE_RUNTIME_MISSING);
+    answer = 'ok';
+    expect(await platform.nativeUiPath()).toBe(exePath);
+    expect(ops.filter((op) => op.kind === 'webview2_runtime')).toHaveLength(2);
+    // unreadable answers (a timed-out user session) are not "started"
+    expect(await createWindowsLocalPanelWindowPlatform({ env: {}, tasklist: async () => '', exists: () => true, nativeUiPath: async () => exePath, expectedSha256: () => undefined, runOp: async () => undefined }).launchNative(exePath)).toBe(false);
+  });
+
+  it('the launch script re-hashes the file against the manifest right before starting it, waits for an early exit, and only ever starts the path it was given as data', () => {
+    const script = decodePowerShell(buildWindowsPanelWindowCommand({ kind: 'launch_host', path: 'C:\\x y\\aidesk-local-ui.exe', sha256: 'cd'.repeat(32) }));
+    const embedded = [...script.matchAll(/D '([A-Za-z0-9+/=]*)'/gu)].map((match) => decodeB64(match[1]!));
+    expect(embedded).toContain('C:\\x y\\aidesk-local-ui.exe');
+    expect(embedded).toContain('cd'.repeat(32));
+    expect(script.indexOf('Get-FileHash')).toBeGreaterThan(-1);
+    expect(script.indexOf('Get-FileHash')).toBeLessThan(script.indexOf('Start-Process'));
+    expect(script).toContain(`WaitForExit(${LOCAL_PANEL_WINDOWS_HOST.launchWaitMilliseconds})`);
+    expect(script).toContain("Report ('exited:'+$p.ExitCode)");
+    expect(script).not.toContain('cmd /c');
+    // a node without a recorded hash still launches (no check to make), never with an empty comparison
+    const none = decodePowerShell(buildWindowsPanelWindowCommand({ kind: 'launch_host', path: 'C:\\a.exe' }));
+    expect(none).toContain('if($expected -and');
   });
 
   it('focus and find only ever adopt the panel window when its owner is one of aiDesk\'s own images (browser in app mode or the native host), never a same-titled window of anything else', () => {

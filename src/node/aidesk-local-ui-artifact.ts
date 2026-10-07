@@ -79,3 +79,20 @@ export async function resolveVerifiedAideskLocalUi(overrides: Partial<AideskLoca
     return undefined;
   }
 }
+
+/**
+ * The sha256 the manifest next to a verified executable records, read again right before the executable is started: the launch script
+ * re-hashes the file against it, which narrows the window between "verified" and "started" to the launch itself (the directory is not
+ * writable by ordinary users either, see the sidecar refresh). Undefined when the manifest cannot be read or does not validate.
+ */
+export function readAideskLocalUiExpectedSha256(executablePath: string, overrides: Partial<Pick<AideskLocalUiVerifyDeps, 'platform' | 'arch' | 'readFile'>> = {}): string | undefined {
+  const platform = (overrides.platform ?? process.platform) as AideskLocalUiPlatform;
+  const arch = (overrides.arch ?? process.arch) as AideskLocalUiArchitecture;
+  const read = overrides.readFile ?? ((path: string) => readFileSync(path));
+  try {
+    const manifest = validateAideskLocalUiManifest(JSON.parse(read(join(dirname(executablePath), AIDESK_LOCAL_UI_MANIFEST_FILENAME)).toString('utf8')), { os: platform, arch });
+    return manifest?.sha256;
+  } catch {
+    return undefined;
+  }
+}
