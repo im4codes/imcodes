@@ -14,6 +14,15 @@ export function isControlledNodeId(value: unknown): value is ControlledNodeId {
   return typeof value === 'string' && CONTROLLED_NODE_ID_PATTERN.test(value);
 }
 
+/**
+ * The field of a controlled node's `heartbeat_ack` that carries the node's own public ID. A credential written before the public ID
+ * existed has none, and a node cannot work its ID out for itself; the server (which backfilled it) tells the node on every ack, and
+ * the node adopts it once. Peers that do not know the field ignore it.
+ */
+export const CONTROLLED_NODE_ACK_NODE_ID_FIELD = 'nodeId' as const;
+/** The internal server ID the ack is for: the node adopts a public ID only when this is its own. */
+export const CONTROLLED_NODE_ACK_SERVER_ID_FIELD = 'serverId' as const;
+
 export function parseControlledNodeId(value: unknown): ControlledNodeId | null {
   return isControlledNodeId(value) ? value : null;
 }

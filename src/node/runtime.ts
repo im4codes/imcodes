@@ -136,6 +136,7 @@ import {
   validateRemoteDesktopShellMessage,
   type RemoteDesktopAdapterCapability,
 } from '../../shared/remote-desktop-access.js';
+import { assignedIdentityOfAck } from './controlled-node-id-adoption.js';
 import {
   LocalRemoteDesktopConsentProvider,
 } from '../daemon/remote-desktop-consent-provider.js';
@@ -338,6 +339,11 @@ export interface ControlledNodeRuntimeOptions {
   /** Injected for the same reason: raising a real TCC prompt needs a real Mac. */
   requestMacosRemoteDesktopPermissions?: () => Promise<boolean>;
   onAuthenticated?: () => void | Promise<void>;
+  /**
+   * Called with the identity the server puts in every authenticated heartbeat ack. Wired only for a node whose credential has no public
+   * ID (a pre-migration enrollment), so a modern node pays nothing; the callee must never throw into the ack path.
+   */
+  onAssignedIdentity?: (identity: { nodeId: unknown; serverId: unknown }) => void | Promise<void>;
   onAuthenticationError?: (error: unknown) => void;
   /** Called for every authenticated server heartbeat acknowledgement. */
   onHeartbeatAck?: () => void | Promise<void>;
@@ -1612,6 +1618,11 @@ export function createControlledNodeRuntime(
         reportStalledUpgradeHandoff();
         reportPreviousUpgradeFailure();
         persistAuthentication();
+        if (options.onAssignedIdentity) {
+          void Promise.resolve(options.onAssignedIdentity(assignedIdentityOfAck(message))).catch(() => {
+            // The adopter reports its own failures; an ack must always be processed to the end.
+          });
+        }
         reportLocalDaemonsIfDue();
         if (remoteDesktopWorkerRepairEligibleAt === null) {
           remoteDesktopWorkerRepairEligibleAt = (options.now?.() ?? Date.now())

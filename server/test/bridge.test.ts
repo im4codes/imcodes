@@ -231,6 +231,7 @@ function makeDb(
   os: ControlledNodeOs | null = nodeRole === 'controlled' ? CONTROLLED_NODE_OS_LINUX : null,
   ownerUserId?: string,
   controlledUpgrade?: { status: string; target: string | null; reason?: string | null },
+  nodeId?: string | null,
 ) {
   const db = {
     queryOne: async () => ({
@@ -238,6 +239,7 @@ function makeDb(
       node_role: nodeRole,
       revoked_at: null,
       os,
+      ...(nodeId !== undefined ? { node_id: nodeId } : {}),
       ...(ownerUserId ? { user_id: ownerUserId } : {}),
       ...(controlledUpgrade
         ? {
@@ -703,6 +705,37 @@ describe('WsBridge', () => {
       releases.shift()?.();
       await flushAsync();
       expect(WsBridge.remoteDesktopGuestOutboxTarget(serverId)?.isAvailable()).toBe(true);
+    });
+
+    describe('the public node ID in a controlled node\'s heartbeat ack', () => {
+      async function ackAfterHeartbeat(db: import('../src/db/client.js').Database) {
+        const bridge = WsBridge.get(serverId);
+        const ws = new MockWs();
+        bridge.handleDaemonConnection(ws as never, db, {} as never);
+        ws.emit('message', JSON.stringify({ type: 'auth', serverId, token: 'my-token', capabilities: [] }));
+        await flushAsync();
+        ws.emit('message', JSON.stringify({ type: 'heartbeat' }));
+        await flushAsync();
+        const acks = ws.sentStrings.map((value) => JSON.parse(value)).filter((frame) => frame.type === 'heartbeat_ack');
+        expect(acks.length).toBeGreaterThan(0);
+        return acks[acks.length - 1] as Record<string, unknown>;
+      }
+
+      it('carries the node\'s own public ID and the server ID it is for, so a node enrolled before IDs existed can adopt it', async () => {
+        const ack = await ackAfterHeartbeat(makeDb('valid-hash', 'controlled', CONTROLLED_NODE_OS_WIN, undefined, undefined, '9909368908'));
+        expect(ack).toMatchObject({ type: 'heartbeat_ack', nodeId: '9909368908', serverId });
+      });
+
+      it('carries nothing for a controlled node with no usable ID, and nothing for a full daemon (no change for either)', async () => {
+        for (const nodeId of [null, '', 'not-an-id', '99093689', '0909368908']) {
+          const ack = await ackAfterHeartbeat(makeDb('valid-hash', 'controlled', CONTROLLED_NODE_OS_WIN, undefined, undefined, nodeId));
+          expect(ack).not.toHaveProperty('nodeId');
+          expect(ack).not.toHaveProperty('serverId');
+        }
+        const full = await ackAfterHeartbeat(makeDb('valid-hash', 'full', null, undefined, undefined, '9909368908'));
+        expect(full).not.toHaveProperty('nodeId');
+        expect(full).not.toHaveProperty('serverId');
+      });
     });
 
     it('sends an exact generation-bound worker repair request to an installable controlled node', async () => {

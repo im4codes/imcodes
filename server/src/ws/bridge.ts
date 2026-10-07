@@ -83,6 +83,12 @@ import { resolvePendingAutoUnlock } from './auto-unlock-registry.js';
 import { notifyRemoteDesktopAutoUnlock } from '../services/remote-desktop-auto-unlock-notification.js';
 import { validateControlledNodeAutoUnlockResult } from '../../../shared/controlled-node-auto-unlock.js';
 import {
+  CONTROLLED_NODE_ACK_NODE_ID_FIELD,
+  CONTROLLED_NODE_ACK_SERVER_ID_FIELD,
+  parseControlledNodeId,
+  type ControlledNodeId,
+} from '../../../shared/controlled-node-identity.js';
+import {
   NODE_ROLE,
   REMOTE_EXEC_MAX_ERROR_BYTES,
   REMOTE_EXEC_MAX_OUTPUT_BYTES,
@@ -2037,10 +2043,18 @@ function toCapabilityManageJournalFrame(
  * deadlines on its local clock (shared/clock-sync.ts). Peers that send no
  * timestamp get the Server time alone, which older peers ignore.
  */
-function heartbeatAckWithClock(heartbeat: Record<string, unknown>): Record<string, unknown> {
+function heartbeatAckWithClock(
+  heartbeat: Record<string, unknown>,
+  /** Controlled nodes only: their own public ID, so a node enrolled before it existed can adopt it. */
+  controlledNodeId?: ControlledNodeId | null,
+  serverId?: string,
+): Record<string, unknown> {
   const sentAt = heartbeat[CLOCK_SYNC_FIELD.SENT_AT];
   return {
     type: 'heartbeat_ack',
+    ...(controlledNodeId && serverId
+      ? { [CONTROLLED_NODE_ACK_NODE_ID_FIELD]: controlledNodeId, [CONTROLLED_NODE_ACK_SERVER_ID_FIELD]: serverId }
+      : {}),
     [CLOCK_SYNC_FIELD.SERVER_TIME]: Date.now(),
     ...(typeof sentAt === 'number' && Number.isFinite(sentAt) ? { [CLOCK_SYNC_FIELD.SENT_AT]: sentAt } : {}),
   };
@@ -2093,6 +2107,8 @@ export class WsBridge {
   private remoteDesktopAuthorityReadyGeneration: number | null = null;
   private daemonVersion: string | null = null;
   private daemonControlledOs: ControlledNodeOs | null = null;
+  /** The authenticated controlled node's public ID (from `servers.node_id`), sent back in its heartbeat acks. */
+  private daemonControlledNodeId: ControlledNodeId | null = null;
   private daemonOwnerUserId: string | null = null;
   private lastCapabilityRevisionSent = 0;
   private capabilitySyncInitialized = false;
@@ -5564,6 +5580,7 @@ export class WsBridge {
           node_role?: string | null;
           revoked_at?: number | null;
           os?: string | null;
+          node_id?: string | null;
           controlled_upgrade_status?: string | null;
           controlled_upgrade_target_version?: string | null;
           controlled_upgrade_reason?: string | null;
@@ -5582,8 +5599,9 @@ export class WsBridge {
             node_role?: string | null;
             revoked_at?: number | null;
             os?: string | null;
+            node_id?: string | null;
           }>(
-            `SELECT token_hash, user_id, node_role, revoked_at, os,
+            `SELECT token_hash, user_id, node_role, revoked_at, os, node_id,
                     controlled_worker_refresh_attempt_id, controlled_worker_refresh_phase,
                     controlled_worker_refresh_installed_version, controlled_worker_refresh_target_version,
                     controlled_worker_refresh_artifact_sha256, controlled_worker_refresh_reason,
@@ -5630,6 +5648,7 @@ export class WsBridge {
           && isControlledNodeOs(server.os)
           ? server.os
           : null;
+        this.daemonControlledNodeId = this.daemonNodeRole === NODE_ROLE.CONTROLLED ? parseControlledNodeId(server.node_id) : null;
         const supportsUpgradeBlockedSync = this.daemonNodeRole === NODE_ROLE.FULL
           && msg[DAEMON_UPGRADE_BLOCKED_SYNC_PROTOCOL.AUTH_REVISION_FIELD]
             === DAEMON_UPGRADE_BLOCKED_SYNC_PROTOCOL.REVISION;
@@ -6127,7 +6146,7 @@ export class WsBridge {
           updateServerHeartbeat(db, this.serverId, hbVersion).catch((err) =>
             logger.error({ err }, 'Failed to update heartbeat'),
           );
-          try { ws.send(JSON.stringify(heartbeatAckWithClock(msg))); } catch { /* ignore */ }
+          try { ws.send(JSON.stringify(heartbeatAckWithClock(msg, this.daemonControlledNodeId, this.serverId))); } catch { /* ignore */ }
           void this.sendRemoteDesktopNodeContext(db, ws, connectionGeneration);
           return;
         }
@@ -6295,6 +6314,7 @@ export class WsBridge {
         this.daemonP2pWorkflowCapabilities = null;
         this.controlledNodeCapabilities.clear();
         this.daemonControlledOs = null;
+        this.daemonControlledNodeId = null;
         this.daemonOwnerUserId = null;
         if (disconnectedOwnerUserId) {
           this.failDisconnectedCapabilityOperations(db, disconnectedOwnerUserId);
@@ -11325,6 +11345,7 @@ export class WsBridge {
       this.daemonP2pWorkflowCapabilities = null;
       this.controlledNodeCapabilities.clear();
       this.daemonControlledOs = null;
+      this.daemonControlledNodeId = null;
       this.daemonOwnerUserId = null;
       this.resetLegacyUpgradeRescueForGeneration(this.daemonGeneration);
       this.remoteDesktopRouter.stopAll(REMOTE_DESKTOP_TERMINAL_REASON.DAEMON_REPLACED);

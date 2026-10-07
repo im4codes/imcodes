@@ -200,6 +200,34 @@ describe('controlled node enrollment and runtime', () => {
     expect(runtime.remoteDesktopAccessStatus().paused).toBe(true);
     runtime.stop();
   });
+  it('hands the identity the server puts in a heartbeat ack to the adopter, and only when one was wired', async () => {
+    const credential = { serverUrl: 'https://im.example', serverId: 'controlled-1', token: 'secret', nodeRole: NODE_ROLE.CONTROLLED } as const;
+    const socket = new MockSocket();
+    const onAssignedIdentity = vi.fn(async () => { throw new Error('the adopter reports its own failures'); });
+    const runtime = createControlledNodeRuntime(credential, () => socket, { platform: 'linux', arch: 'x64', onAssignedIdentity });
+    runtime.start();
+    socket.open();
+    socket.emit('message', JSON.stringify({ type: 'heartbeat_ack', nodeId: '9909368908', serverId: 'controlled-1' }));
+    await vi.waitFor(() => expect(onAssignedIdentity).toHaveBeenCalledWith({ nodeId: '9909368908', serverId: 'controlled-1' }));
+    // A failing adopter never stops the ack from being processed: the next ack still arrives.
+    socket.emit('message', JSON.stringify({ type: 'heartbeat_ack' }));
+    await vi.waitFor(() => expect(onAssignedIdentity).toHaveBeenCalledTimes(2));
+    expect(onAssignedIdentity).toHaveBeenLastCalledWith({ nodeId: undefined, serverId: undefined });
+    // Other frames are not acks.
+    socket.emit('message', JSON.stringify({ type: 'something_else', nodeId: '9909368908', serverId: 'controlled-1' }));
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(onAssignedIdentity).toHaveBeenCalledTimes(2);
+    runtime.stop();
+
+    // A node with a modern credential wires nothing: acks (old server or new) behave exactly as before.
+    const plainSocket = new MockSocket();
+    const plain = createControlledNodeRuntime(credential, () => plainSocket, { platform: 'linux', arch: 'x64' });
+    plain.start();
+    plainSocket.open();
+    expect(() => plainSocket.emit('message', JSON.stringify({ type: 'heartbeat_ack', nodeId: '9909368908', serverId: 'controlled-1' }))).not.toThrow();
+    plain.stop();
+  });
+
   it('reports one bounded blocker when a staged Windows upgrade never hands off', async () => {
     const socket = new MockSocket();
     let now = 10_000;

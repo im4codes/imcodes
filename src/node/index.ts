@@ -19,7 +19,9 @@ import {
   waitForControlledNodeOnlineLease,
 } from './health-lease.js';
 import { CONTROLLED_NODE_SERVICE } from './installer.js';
-import { defaultStagedExecutablePath, readEnrollmentBlob } from './enrollment.js';
+import { defaultCredentialPath, defaultStagedExecutablePath, persistCredential, readEnrollmentBlob } from './enrollment.js';
+import { createControlledNodeIdAdopter } from './controlled-node-id-adoption.js';
+import { REMOTE_DESKTOP_LOCAL_MANAGEMENT } from '../../shared/remote-desktop-local-management.js';
 import {
   applyRemoteDesktopAccessPaused,
   loadRemoteDesktopAccessPaused,
@@ -272,6 +274,14 @@ async function main(): Promise<void> {
     })
     : undefined;
   const remoteDesktopAccessPaused = await loadRemoteDesktopAccessPaused();
+  const adoptAssignedNodeId = bootstrap.credential.nodeId
+    ? undefined
+    : createControlledNodeIdAdopter({
+      credential: bootstrap.credential,
+      persist: (credential) => persistCredential(credential, defaultCredentialPath()),
+      start: (nodeId) => startLocalManagement(nodeId),
+      log: logger,
+    });
   const runtime = createControlledNodeRuntime(bootstrap.credential, undefined, {
     macosRemoteDesktopWorker,
     remoteDesktopSignedShell: signedShellArtifact ? {
@@ -288,12 +298,17 @@ async function main(): Promise<void> {
       process.stderr.write(`imcodes-node: failed to record service_healthy (${message})\n`);
     },
     onHeartbeatAck: healthLease?.recordAuthenticatedHeartbeat,
+    ...(adoptAssignedNodeId ? { onAssignedIdentity: adoptAssignedNodeId } : {}),
     readPreviousUpgradeFailure: () => readPreviousUpgradeFailure(deps.journalPath),
     remoteDesktopAccessPaused,
   });
-  const localPanel = bootstrap.credential.nodeId
-    ? await startRemoteDesktopLocalPanel({
-      publicNodeId: bootstrap.credential.nodeId,
+  // The local management surface (the panel the indicator opens, and the local aiDesk IPC) is keyed by the node's public ID. A node
+  // enrolled before that ID existed learns it from the server's heartbeat ack and starts the surface then, in this very process.
+  let localPanel: Awaited<ReturnType<typeof startRemoteDesktopLocalPanel>> | null = null;
+  let localIpc: Awaited<ReturnType<typeof startAideskLocalIpcServer>> | null = null;
+  async function startLocalManagement(nodeId: string): Promise<void> {
+    localPanel = await startRemoteDesktopLocalPanel({
+      publicNodeId: nodeId,
       serverUrl: bootstrap.credential.serverUrl,
       status: () => runtime.remoteDesktopAccessStatus(),
       setPaused: (paused) => applyRemoteDesktopAccessPaused(
@@ -303,23 +318,14 @@ async function main(): Promise<void> {
       stopAll: () => runtime.stopAllRemoteDesktopConnections(),
       disconnect: (publicId) => runtime.stopRemoteDesktopConnection(publicId),
     }).catch((error) => {
-      logger.warn({ err: error }, 'local remote-desktop management panel unavailable');
+      logger.warn({ err: error, host: REMOTE_DESKTOP_LOCAL_MANAGEMENT.HOST, port: REMOTE_DESKTOP_LOCAL_MANAGEMENT.PORT },
+        'local remote-desktop management panel unavailable (the indicator will not be able to open it)');
       return null;
-    })
-    : null;
-  const localIpc = bootstrap.credential.nodeId
-    ? await startAideskLocalIpcServer({
-      publicNodeId: bootstrap.credential.nodeId,
-      managementUrl: remoteDesktopManagementUrl(
-        bootstrap.credential.serverUrl,
-        bootstrap.credential.nodeId,
-        'manage',
-      ),
-      shareUrl: remoteDesktopManagementUrl(
-        bootstrap.credential.serverUrl,
-        bootstrap.credential.nodeId,
-        'share',
-      ),
+    });
+    localIpc = await startAideskLocalIpcServer({
+      publicNodeId: nodeId,
+      managementUrl: remoteDesktopManagementUrl(bootstrap.credential.serverUrl, nodeId, 'manage'),
+      shareUrl: remoteDesktopManagementUrl(bootstrap.credential.serverUrl, nodeId, 'share'),
       runtimeVersion: DAEMON_VERSION,
       productVersion: DAEMON_VERSION,
       status: () => runtime.remoteDesktopAccessStatus(),
@@ -334,8 +340,9 @@ async function main(): Promise<void> {
       // optional native-UI IPC surface cannot be created.
       logger.warn({ err: error }, 'local aiDesk IPC service unavailable');
       return null;
-    })
-    : null;
+    });
+  }
+  if (bootstrap.credential.nodeId) await startLocalManagement(bootstrap.credential.nodeId);
   void ensureAideskDesktopEntry().then((result) => {
     if (result === 'preserved') {
       logger.warn('existing user-created aiDesk desktop entry was preserved');
