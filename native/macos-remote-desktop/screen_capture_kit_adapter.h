@@ -84,6 +84,9 @@ struct ScreenCaptureKitStreamConfiguration {
   std::uint32_t frame_rate = 30;
   std::uint32_t max_pending_frames = 2;
   bool show_cursor = true;
+  // What the stream delivers. Only a backend that reports
+  // SupportsPixelFormat(format) is asked for anything but BGRA.
+  common::PixelFormat pixel_format = common::PixelFormat::kBgra8888;
 };
 
 using ScreenCaptureKitBackendFrameSink =
@@ -109,6 +112,12 @@ class ScreenCaptureKitBackend {
   // size and encoded_pixels only names it.
   [[nodiscard]] virtual bool SupportsOutputSize() const noexcept {
     return false;
+  }
+  // True when streams this backend creates can deliver `format`. BGRA is always
+  // available; a backend that converts in the compositor/GPU can offer more.
+  [[nodiscard]] virtual bool SupportsPixelFormat(
+      common::PixelFormat format) const noexcept {
+    return format == common::PixelFormat::kBgra8888;
   }
   [[nodiscard]] virtual common::ReadinessState ProbeReadiness() noexcept = 0;
   virtual bool EnumerateDisplays(
@@ -170,6 +179,11 @@ class ScreenCaptureKitAdapter final : public common::CaptureAdapter,
   bool SetOutputSize(common::PixelSize size) override;
   [[nodiscard]] std::optional<common::PixelSize> OutputSize()
       const noexcept override;
+
+  // The delivered pixel format (see common::CaptureAdapter::SetPixelFormat).
+  // Only before Start(): a running stream's format does not change. A backend
+  // without the format keeps delivering BGRA and this returns false.
+  bool SetPixelFormat(common::PixelFormat format) override;
 
   [[nodiscard]] bool CursorCaptureSupported(
       std::string_view display_id) const noexcept;

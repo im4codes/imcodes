@@ -47,6 +47,41 @@ class SurfaceStorage final : public common::FrameStorage {
 }
 
 /**
+ * Copies a two-plane 4:2:0 (420v) surface into one owned buffer: the luma plane
+ * followed by the interleaved Cb/Cr plane, each with its own stride preserved.
+ * The surface is already locked by the caller.
+ */
+[[nodiscard]] bool CopyNv12Planes(IOSurfaceRef surface, common::CapturedFrame* out) {
+  if (IOSurfaceGetPlaneCount(surface) != 2) return false;
+  const std::size_t width = IOSurfaceGetWidthOfPlane(surface, 0);
+  const std::size_t height = IOSurfaceGetHeightOfPlane(surface, 0);
+  const std::size_t luma_stride = IOSurfaceGetBytesPerRowOfPlane(surface, 0);
+  const std::size_t chroma_height = IOSurfaceGetHeightOfPlane(surface, 1);
+  const std::size_t chroma_stride = IOSurfaceGetBytesPerRowOfPlane(surface, 1);
+  const auto* luma = static_cast<const std::byte*>(IOSurfaceGetBaseAddressOfPlane(surface, 0));
+  const auto* chroma = static_cast<const std::byte*>(IOSurfaceGetBaseAddressOfPlane(surface, 1));
+  if (luma == nullptr || chroma == nullptr || width == 0 || height == 0 ||
+      (width & 1U) != 0 || (height & 1U) != 0 || luma_stride < width ||
+      chroma_stride < width || chroma_height != height / 2) {
+    return false;
+  }
+  const std::size_t luma_bytes = luma_stride * height;
+  const std::size_t chroma_bytes = chroma_stride * chroma_height;
+  std::unique_ptr<std::byte[]> bytes(new std::byte[luma_bytes + chroma_bytes]);
+  std::memcpy(bytes.get(), luma, luma_bytes);
+  std::memcpy(bytes.get() + luma_bytes, chroma, chroma_bytes);
+  out->encoded_pixels = common::PixelSize{static_cast<std::uint32_t>(width),
+                                          static_cast<std::uint32_t>(height)};
+  out->pixel_format = common::PixelFormat::kNv12;
+  out->row_bytes = static_cast<std::uint32_t>(luma_stride);
+  out->uv_offset = static_cast<std::uint32_t>(luma_bytes);
+  out->uv_row_bytes = static_cast<std::uint32_t>(chroma_stride);
+  out->capture_time_us = NowMicroseconds();
+  out->storage = std::make_shared<SurfaceStorage>(std::move(bytes), luma_bytes + chroma_bytes);
+  return true;
+}
+
+/**
  * Copies one IOSurface into an owned buffer.
  *
  * A copy rather than a retained surface on purpose: CGDisplayStream recycles
@@ -55,10 +90,16 @@ class SurfaceStorage final : public common::FrameStorage {
  * The row stride is preserved so the encoder sees the same geometry the SCK
  * path produces.
  */
-[[nodiscard]] bool CopySurface(IOSurfaceRef surface, common::CapturedFrame* out) {
+[[nodiscard]] bool CopySurface(IOSurfaceRef surface, common::PixelFormat format,
+                               common::CapturedFrame* out) {
   if (surface == nullptr || out == nullptr) return false;
   if (IOSurfaceLock(surface, kIOSurfaceLockReadOnly, nullptr) != kIOReturnSuccess) {
     return false;
+  }
+  if (format == common::PixelFormat::kNv12) {
+    const bool copied = CopyNv12Planes(surface, out);
+    (void)IOSurfaceUnlock(surface, kIOSurfaceLockReadOnly, nullptr);
+    return copied;
   }
   const std::size_t width = IOSurfaceGetWidth(surface);
   const std::size_t height = IOSurfaceGetHeight(surface);
@@ -93,6 +134,7 @@ class CgDisplayStreamHandle final : public ScreenCaptureKitBackendStream {
                         ScreenCaptureKitBackendErrorSink error_sink)
       : display_(display),
         max_pending_(configuration.max_pending_frames),
+        pixel_format_(configuration.pixel_format),
         frame_sink_(std::move(frame_sink)),
         error_sink_(std::move(error_sink)) {
     queue_ = dispatch_queue_create("to.aidesk.remote-desktop.cgdisplaystream",
@@ -123,23 +165,33 @@ class CgDisplayStreamHandle final : public ScreenCaptureKitBackendStream {
 
     // The login window draws its own cursor; compositing a second one would be
     // a visible artifact rather than a feature.
+    const bool nv12 = config.pixel_format == common::PixelFormat::kNv12;
+    // Keys/values: the last pair, the YCbCr matrix, is only for YUV output. It
+    // is stated explicitly (BT.601, which is what libyuv's I420 conversions and
+    // the colour space declared downstream assume) rather than left to the
+    // compositor's default.
     const void* keys[] = {kCGDisplayStreamShowCursor,
-                          kCGDisplayStreamMinimumFrameTime};
+                          kCGDisplayStreamMinimumFrameTime,
+                          kCGDisplayStreamYCbCrMatrix};
     const double minimum_frame_time =
         config.frame_rate > 0 ? 1.0 / static_cast<double>(config.frame_rate) : 0.0;
     CFNumberRef frame_time = CFNumberCreate(kCFAllocatorDefault,
                                             kCFNumberDoubleType,
                                             &minimum_frame_time);
     const void* values[] = {config.show_cursor ? kCFBooleanTrue : kCFBooleanFalse,
-                            frame_time};
+                            frame_time,
+                            kCGDisplayStreamYCbCrMatrix_ITU_R_601_4};
     CFDictionaryRef properties =
-        CFDictionaryCreate(kCFAllocatorDefault, keys, values, 2,
+        CFDictionaryCreate(kCFAllocatorDefault, keys, values, nv12 ? 3 : 2,
                            &kCFTypeDictionaryKeyCallBacks,
                            &kCFTypeDictionaryValueCallBacks);
     if (frame_time != nullptr) CFRelease(frame_time);
 
     stream_ = CGDisplayStreamCreateWithDispatchQueue(
-        display_, width, height, kCVPixelFormatType_32BGRA, properties, queue_,
+        display_, width, height,
+        nv12 ? kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+             : kCVPixelFormatType_32BGRA,
+        properties, queue_,
         ^(CGDisplayStreamFrameStatus status, uint64_t /*display_time*/,
           IOSurfaceRef surface, CGDisplayStreamUpdateRef /*update*/) {
           HandleFrame(status, surface);
@@ -261,7 +313,7 @@ class CgDisplayStreamHandle final : public ScreenCaptureKitBackendStream {
     if (pending_.load(std::memory_order_relaxed) >= max_pending_) return;
 
     common::CapturedFrame frame;
-    if (!CopySurface(surface, &frame) || !frame.IsValid()) {
+    if (!CopySurface(surface, pixel_format_, &frame) || !frame.IsValid()) {
       Fail("cgdisplaystream_unreadable_surface");
       return;
     }
@@ -295,6 +347,7 @@ class CgDisplayStreamHandle final : public ScreenCaptureKitBackendStream {
 
   CGDirectDisplayID display_ = 0;
   std::uint32_t max_pending_ = 2;
+  common::PixelFormat pixel_format_ = common::PixelFormat::kBgra8888;
   ScreenCaptureKitBackendFrameSink frame_sink_;
   ScreenCaptureKitBackendErrorSink error_sink_;
   dispatch_queue_t queue_ = nullptr;
@@ -318,6 +371,14 @@ class CgDisplayStreamBackend final : public ScreenCaptureKitBackend {
   // encoder will use, instead of a native-size frame the worker would have to
   // copy and resample on the CPU.
   bool SupportsOutputSize() const noexcept override { return true; }
+
+  // 420v: the compositor converts on the GPU, so the capture hands over 1.5
+  // bytes per pixel instead of 4 and an encoder that wants YUV needs no BGRA
+  // conversion.
+  bool SupportsPixelFormat(common::PixelFormat format) const noexcept override {
+    return format == common::PixelFormat::kBgra8888 ||
+           format == common::PixelFormat::kNv12;
+  }
 
   common::ReadinessState ProbeReadiness() noexcept override {
     // Preflight, never request: a backend that triggered a TCC prompt at the

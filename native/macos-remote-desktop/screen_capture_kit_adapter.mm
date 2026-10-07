@@ -824,9 +824,11 @@ class ScreenCaptureKitAdapter::Impl {
 
     CaptureError create_error;
     std::uint64_t generation = 0;
+    common::PixelFormat format = common::PixelFormat::kBgra8888;
     {
       std::lock_guard lock(request_mutex);
       generation = run_generation;
+      format = pixel_format;
     }
     stream = backend->CreateStream(
         ScreenCaptureKitStreamConfiguration{
@@ -836,6 +838,7 @@ class ScreenCaptureKitAdapter::Impl {
             .frame_rate = limits.frame_rate,
             .max_pending_frames = limits.max_pending_frames,
             .show_cursor = found->second.cursor_supported,
+            .pixel_format = format,
         },
         FrameSinkFor(generation), ErrorSinkFor(generation), &create_error);
     if (!stream) {
@@ -906,6 +909,15 @@ class ScreenCaptureKitAdapter::Impl {
     return backend != nullptr && backend->SupportsOutputSize();
   }
 
+  bool SetPixelFormat(common::PixelFormat format) {
+    if (backend == nullptr || !backend->SupportsPixelFormat(format)) return false;
+    std::lock_guard lock(request_mutex);
+    // A running stream keeps the format it was created with.
+    if (running) return false;
+    pixel_format = format;
+    return true;
+  }
+
   [[nodiscard]] static std::uint64_t PackSize(common::PixelSize size) noexcept {
     return (static_cast<std::uint64_t>(size.width) << 32) | size.height;
   }
@@ -955,6 +967,7 @@ class ScreenCaptureKitAdapter::Impl {
     common::PixelSize native;
     std::uint32_t display_id = 0;
     bool show_cursor = false;
+    common::PixelFormat format = common::PixelFormat::kBgra8888;
     {
       std::lock_guard lock(request_mutex);
       if (!running || generation != run_generation) return;
@@ -963,6 +976,7 @@ class ScreenCaptureKitAdapter::Impl {
       native = native_size;
       display_id = native_display_id;
       show_cursor = cursor_supported;
+      format = pixel_format;
     }
     if (target.width == current.width && target.height == current.height) return;
 
@@ -975,6 +989,7 @@ class ScreenCaptureKitAdapter::Impl {
             .frame_rate = limits.frame_rate,
             .max_pending_frames = limits.max_pending_frames,
             .show_cursor = show_cursor,
+            .pixel_format = format,
         },
         FrameSinkFor(generation), ErrorSinkFor(generation), &create_error);
     std::string error;
@@ -1084,6 +1099,8 @@ class ScreenCaptureKitAdapter::Impl {
       std::make_shared<std::atomic<std::uint64_t>>(0);
   // An output size requested while not running; applied when Start() finishes.
   std::optional<common::PixelSize> pending_request;
+  // What the streams deliver; changed only while not running.
+  common::PixelFormat pixel_format = common::PixelFormat::kBgra8888;
   common::PixelSize native_size;
   common::PixelSize requested_size;
   common::PixelSize current_size;
@@ -1161,6 +1178,10 @@ bool ScreenCaptureKitAdapter::SetOutputSize(common::PixelSize size) {
 std::optional<common::PixelSize> ScreenCaptureKitAdapter::OutputSize()
     const noexcept {
   return impl_->OutputSize();
+}
+
+bool ScreenCaptureKitAdapter::SetPixelFormat(common::PixelFormat format) {
+  return impl_->SetPixelFormat(format);
 }
 
 bool ScreenCaptureKitAdapter::CursorCaptureSupported(

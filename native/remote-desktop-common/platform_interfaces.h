@@ -70,6 +70,17 @@ class CaptureAdapter {
   [[nodiscard]] virtual std::optional<PixelSize> OutputSize() const noexcept {
     return std::nullopt;
   }
+
+  // The pixel format of the frames this capture delivers. Asked for before
+  // Start(); returns whether the capture will deliver `format` (and from then
+  // on does). Only BGRA is promised by default, so every capture that does not
+  // override this keeps delivering BGRA, exactly as before. A capture that can
+  // convert in the compositor/GPU (CGDisplayStream's 420v) overrides it, which
+  // saves the BGRA->YUV conversion and 2.7x the memory traffic per frame for an
+  // encoder that wants YUV.
+  virtual bool SetPixelFormat(PixelFormat format) {
+    return format == PixelFormat::kBgra8888;
+  }
 };
 
 struct EncoderConfiguration {
@@ -112,6 +123,11 @@ class EncoderAdapter {
   // older one), since it was configured.
   [[nodiscard]] virtual std::uint64_t DroppedFrames() const noexcept {
     return 0;
+  }
+  // The pixel format this encoder would rather be fed (the session asks the
+  // capture for it before it starts). BGRA unless an adapter says otherwise.
+  [[nodiscard]] virtual PixelFormat PreferredInputFormat() const noexcept {
+    return PixelFormat::kBgra8888;
   }
 };
 

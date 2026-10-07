@@ -96,6 +96,21 @@ bool CapturedFrame::IsValid() const noexcept {
       return row_bytes >= minimum_row && required > 0 &&
              required <= storage->size();
     }
+    case PixelFormat::kNv12: {
+      // 4:2:0 needs even dimensions. The chroma plane follows the luma plane
+      // and carries width bytes (width/2 interleaved Cb,Cr pairs) per row.
+      if ((encoded_pixels.width & 1U) != 0 || (encoded_pixels.height & 1U) != 0) {
+        return false;
+      }
+      const std::uint64_t luma =
+          static_cast<std::uint64_t>(row_bytes) * encoded_pixels.height;
+      const std::uint64_t chroma_end =
+          static_cast<std::uint64_t>(uv_offset) +
+          static_cast<std::uint64_t>(uv_row_bytes) * (encoded_pixels.height / 2);
+      return row_bytes >= encoded_pixels.width &&
+             uv_row_bytes >= encoded_pixels.width && luma > 0 &&
+             uv_offset >= luma && chroma_end <= storage->size();
+    }
   }
   return false;
 }

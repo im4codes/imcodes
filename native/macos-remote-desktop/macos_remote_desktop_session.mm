@@ -1153,6 +1153,13 @@ class MacosRemoteDesktopSession::Impl final
       dependencies_.media_sender.Stop();
       return false;
     }
+    // Feed the capture in the format the encoder prefers; a capture that cannot
+    // convert keeps delivering BGRA, which every encoder accepts.
+    if (!dependencies_.adapters.capture.SetPixelFormat(
+            dependencies_.adapters.encoder.PreferredInputFormat())) {
+      (void)dependencies_.adapters.capture.SetPixelFormat(
+          common::PixelFormat::kBgra8888);
+    }
     if (!dependencies_.adapters.capture.Start(
             *display, [weak, epoch](common::CapturedFrame frame) {
               if (const auto self = weak.lock())

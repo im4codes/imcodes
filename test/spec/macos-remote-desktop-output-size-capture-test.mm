@@ -100,8 +100,16 @@ class FakeBackend final : public capture::ScreenCaptureKitBackend {
   std::atomic<int> next_block_first_frame_ms{0};
   std::mutex sinks_mutex;
   std::vector<capture::ScreenCaptureKitBackendFrameSink> frame_sinks;
+  // Whether this backend can deliver NV12, and the pixel format of every stream
+  // it was asked to create (in order).
+  bool supports_nv12 = false;
+  std::vector<common::PixelFormat> requested_formats;
 
   bool SupportsOutputSize() const noexcept override { return supports_; }
+  bool SupportsPixelFormat(common::PixelFormat format) const noexcept override {
+    return format == common::PixelFormat::kBgra8888 ||
+           (supports_nv12 && format == common::PixelFormat::kNv12);
+  }
   common::ReadinessState ProbeReadiness() noexcept override { return common::ReadinessState::kReady; }
   bool EnumerateDisplays(std::uint32_t, std::uint32_t,
                          std::vector<capture::ScreenCaptureKitBackendDisplay>* out,
@@ -126,6 +134,7 @@ class FakeBackend final : public capture::ScreenCaptureKitBackend {
     {
       std::lock_guard lock(sinks_mutex);
       frame_sinks.push_back(std::move(frame_sink));
+      requested_formats.push_back(configuration.pixel_format);
     }
     *error = {};
     return std::make_unique<FakeStream>(&log, configuration.encoded_pixels,
@@ -358,6 +367,49 @@ bool TestAStaleStreamNeverFeedsTheNextSession() {
   return stale_ignored && current_delivered;
 }
 
+std::vector<common::PixelFormat> Formats(Rig& rig) {
+  std::lock_guard lock(rig.backend->sinks_mutex);
+  return rig.backend->requested_formats;
+}
+
+bool TestAFormatTheBackendCanDeliverReachesEveryStream() {
+  Rig rig;
+  if (!MakeRig(&rig, true, /*start=*/false)) return false;
+  rig.backend->supports_nv12 = true;
+  if (!Check(rig.adapter->SetPixelFormat(common::PixelFormat::kNv12), "NV12 accepted before Start")) return false;
+  if (!Check(rig.adapter->Start(rig.display, [](common::CapturedFrame) {}), "start")) return false;
+  if (!Check(rig.adapter->SetOutputSize({2560, 1350}), "retarget")) return false;
+  if (!Check(WaitFor([&] { return rig.adapter->OutputSize().has_value(); }), "retargeted")) return false;
+  const auto formats = Formats(rig);
+  const bool ok = Check(formats.size() == 2, "the initial and the retarget stream") &&
+                  Check(formats[0] == common::PixelFormat::kNv12 && formats[1] == common::PixelFormat::kNv12,
+                        "both streams are asked for NV12");
+  rig.adapter->Stop();
+  return ok;
+}
+
+bool TestABackendWithoutTheFormatKeepsDeliveringBgra() {
+  Rig rig;
+  if (!MakeRig(&rig, true, /*start=*/false)) return false;
+  const bool ok = Check(!rig.adapter->SetPixelFormat(common::PixelFormat::kNv12), "NV12 refused: the backend cannot deliver it") &&
+                  Check(rig.adapter->SetPixelFormat(common::PixelFormat::kBgra8888), "BGRA is always available") &&
+                  Check(rig.adapter->Start(rig.display, [](common::CapturedFrame) {}), "start") &&
+                  Check(Formats(rig).size() == 1 && Formats(rig)[0] == common::PixelFormat::kBgra8888, "BGRA stream");
+  rig.adapter->Stop();
+  return ok;
+}
+
+bool TestTheDefaultIsBgraAndARunningStreamKeepsItsFormat() {
+  Rig rig;
+  if (!MakeRig(&rig, true)) return false;  // started without ever asking for a format
+  rig.backend->supports_nv12 = true;
+  const bool ok = Check(Formats(rig).size() == 1 && Formats(rig)[0] == common::PixelFormat::kBgra8888, "default is BGRA") &&
+                  Check(!rig.adapter->SetPixelFormat(common::PixelFormat::kNv12), "a running stream's format does not change");
+  rig.adapter->Stop();
+  // Stopped: the next Start may take another format.
+  return ok && Check(rig.adapter->SetPixelFormat(common::PixelFormat::kNv12), "accepted again once stopped");
+}
+
 }  // namespace
 
 int main() {
@@ -369,7 +421,10 @@ int main() {
                   TestStopDoesNotWaitForASlowRetarget() &&
                   TestARequestBeforeStartIsAppliedWhenTheCaptureStarts() &&
                   TestAStoppedCapturesRequestIsNotCarriedIntoTheNextOne() &&
-                  TestAStaleStreamNeverFeedsTheNextSession();
+                  TestAStaleStreamNeverFeedsTheNextSession() &&
+                  TestAFormatTheBackendCanDeliverReachesEveryStream() &&
+                  TestABackendWithoutTheFormatKeepsDeliveringBgra() &&
+                  TestTheDefaultIsBgraAndARunningStreamKeepsItsFormat();
   if (ok) std::cout << "macos output-size capture counterfactuals passed\n";
   return ok ? 0 : 1;
 }

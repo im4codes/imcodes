@@ -93,6 +93,12 @@ enum class ColorPrimaries : std::uint8_t {
 // to assume width * 4 contiguous bytes.
 enum class PixelFormat : std::uint8_t {
   kBgra8888,
+  // 4:2:0, video range: a full-resolution luma plane followed by one interleaved
+  // Cb/Cr plane at half the width and height. `row_bytes` is the luma stride;
+  // the chroma plane starts at `uv_offset` with stride `uv_row_bytes`. Produced
+  // only by a capture asked for it (CaptureAdapter::SetPixelFormat); BGRA is the
+  // default everywhere.
+  kNv12,
 };
 
 class FrameStorage {
@@ -106,6 +112,10 @@ struct CapturedFrame {
   PixelSize encoded_pixels;
   PixelFormat pixel_format = PixelFormat::kBgra8888;
   std::uint32_t row_bytes = 0;
+  // kNv12 only: where the interleaved Cb/Cr plane starts in the storage, and its
+  // stride. Zero for BGRA.
+  std::uint32_t uv_offset = 0;
+  std::uint32_t uv_row_bytes = 0;
   std::int64_t capture_time_us = 0;
   ColorPrimaries color_primaries = ColorPrimaries::kUnspecified;
   std::shared_ptr<const FrameStorage> storage;
