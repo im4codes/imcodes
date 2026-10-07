@@ -1,10 +1,11 @@
-import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
-import { dirname, join } from 'node:path';
+import { mkdir, readdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
+import { basename, dirname, join } from 'node:path';
 import {
   CONTROLLED_NODE_UPGRADE_HEALTH,
   CONTROLLED_NODE_UPGRADE_RESULT_FILE,
   CONTROLLED_NODE_UPGRADE_RESULT_STATUS,
   CONTROLLED_NODE_UPGRADE_ROLLBACK_STALL_MS,
+  CONTROLLED_NODE_UPGRADE_BACKUP_SUFFIX,
 } from '../../shared/controlled-node-service.js';
 import { DAEMON_UPGRADE_BLOCK_REASON } from '../../shared/daemon-upgrade.js';
 
@@ -134,5 +135,29 @@ export async function reconcilePreviousUpgrade(input: {
       return { targetVersion, reason: DAEMON_UPGRADE_BLOCK_REASON.INSTALL_FAILED };
     default:
       return null;
+  }
+}
+
+/**
+ * Rollback images and half-staged files a POSIX upgrade script leaves beside the
+ * installed node when it is killed (SIGKILL, reboot) after the new node already
+ * took over: they are a full copy of the previous executable. Removed only for an
+ * upgrade whose record says it finished (`success`), never while one may still
+ * need them to roll back. Only exact names the script creates are touched.
+ */
+export async function removeStalePosixUpgradeFiles(executablePath: string, journalPath: string): Promise<void> {
+  const dir = dirname(executablePath);
+  const exe = basename(executablePath);
+  const backup = CONTROLLED_NODE_UPGRADE_BACKUP_SUFFIX;
+  const exact = new Set([
+    `${exe}${backup}`, `${exe}.manifest.json${backup}`, `${basename(journalPath)}${backup}`,
+    `computer-use-helper${backup}`, `remote-desktop-worker${backup}`,
+    `${exe}.new`, `${exe}.manifest.json.new`, `${basename(journalPath)}.new`,
+    'computer-use-helper.new', 'remote-desktop-worker.new',
+  ]);
+  const names = await readdir(dir).catch(() => [] as string[]);
+  for (const name of names) {
+    const serviceDefinitionImage = name.startsWith(`${exe}.service-def-`) && name.endsWith(backup);
+    if (exact.has(name) || serviceDefinitionImage) await rm(join(dir, name), { recursive: true, force: true }).catch(() => {});
   }
 }

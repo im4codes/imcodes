@@ -58,8 +58,6 @@ import {
 import {
   CONTROLLED_NODE_SERVICE,
   encodeWindowsScheduledTaskXml,
-  MACOS_PLIST_PATH,
-  MACOS_WATCHDOG_PLIST_PATH,
   windowsComputerUseHelperAclCommands,
   windowsCredentialAclCommands,
   windowsExecutableFileAclCommands,
@@ -69,7 +67,7 @@ import {
 import { defaultCredentialPath, defaultStagedExecutablePath, type ControlledNodeCredential } from './enrollment.js';
 import { buildPosixControlledNodeUpgradeScript } from './posix-upgrade-script.js';
 import { windowsUpgradeHealthWaitScript } from './upgrade-health-script.js';
-import { reconcilePreviousUpgrade, type PreviousUpgradeFailure } from './upgrade-result.js';
+import { readUpgradeResult, reconcilePreviousUpgrade, removeStalePosixUpgradeFiles, type PreviousUpgradeFailure } from './upgrade-result.js';
 import { DAEMON_VERSION } from '../util/version.js';
 import { loadInstallJournal, INSTALL_JOURNAL_VERSION } from './install-journal.js';
 import { WINDOWS_COMPILED_RELEASE_SIGNER_SHA256 } from './windows-artifact-trust.js';
@@ -102,9 +100,17 @@ export async function readPreviousUpgradeFailure(
   journalPath: string,
   runningVersion: string = DAEMON_VERSION,
   now: number = Date.now(),
+  executablePath: string = defaultStagedExecutablePath(),
 ): Promise<PreviousUpgradeFailure | null> {
   try {
-    return await reconcilePreviousUpgrade({ journalPath, runningVersion, now });
+    const recorded = process.platform === 'win32' ? null : await readUpgradeResult(journalPath);
+    const failure = await reconcilePreviousUpgrade({ journalPath, runningVersion, now });
+    // A finished upgrade (record `success` for the version this node runs) no longer needs the rollback
+    // images a killed POSIX script may have left: each is a full copy of the previous executable.
+    if (recorded?.status === CONTROLLED_NODE_UPGRADE_RESULT_STATUS.SUCCESS && recorded.targetVersion === runningVersion) {
+      await removeStalePosixUpgradeFiles(executablePath, journalPath);
+    }
+    return failure;
   } catch {
     return null;
   }
@@ -242,10 +248,6 @@ export function startControlledNodeUpgradeScavenger(
 
 function psQuote(value: string): string {
   return `'${value.replaceAll("'", "''")}'`;
-}
-
-function shQuote(value: string): string {
-  return `'${value.replaceAll("'", `'"'"'`)}'`;
 }
 
 interface ControlledNodeUpgradeOwnershipMarker {

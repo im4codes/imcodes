@@ -126,3 +126,59 @@ describe('previous upgrade outcome (last-upgrade-result.json)', () => {
     expect(upgradeResultPathFor(path).endsWith(CONTROLLED_NODE_UPGRADE_RESULT_FILE)).toBe(true);
   });
 });
+
+describe('stale POSIX upgrade files', () => {
+  it('removes exactly the rollback images and half-staged files the upgrade script creates, nothing else', async () => {
+    const { mkdir: mk, readdir: rd } = await import('node:fs/promises');
+    const { removeStalePosixUpgradeFiles } = await import('../../src/node/upgrade-result.js');
+    const dir = await mkdtemp(join(tmpdir(), 'imcodes-stale-upgrade-'));
+    dirs.push(dir);
+    const exe = join(dir, 'imcodes-node-linux');
+    const journal = join(dir, 'install-journal.json');
+    const stale = [
+      'imcodes-node-linux.upgrade-old', 'imcodes-node-linux.manifest.json.upgrade-old', 'install-journal.json.upgrade-old',
+      'imcodes-node-linux.service-def-0.upgrade-old', 'imcodes-node-linux.new', 'imcodes-node-linux.manifest.json.new',
+      'install-journal.json.new',
+    ];
+    const keep = [
+      'imcodes-node-linux', 'imcodes-node-linux.manifest.json', 'install-journal.json', 'credential.json',
+      'health-lease.json', 'last-upgrade-result.json', 'unrelated.upgrade-old', 'other-node.upgrade-old',
+    ];
+    for (const name of [...stale, ...keep]) await writeFile(join(dir, name), 'x');
+    for (const name of ['computer-use-helper.upgrade-old', 'remote-desktop-worker.upgrade-old', 'remote-desktop-worker.new']) {
+      await mk(join(dir, name));
+      await writeFile(join(dir, name, 'file'), 'x');
+    }
+    await mk(join(dir, 'remote-desktop-worker'));
+    await removeStalePosixUpgradeFiles(exe, journal);
+    expect((await rd(dir)).sort()).toEqual([...keep, 'remote-desktop-worker'].sort());
+    // a missing directory is not an error
+    await expect(removeStalePosixUpgradeFiles(join(dir, 'gone', 'node'), journal)).resolves.toBeUndefined();
+  });
+});
+
+describe.skipIf(process.platform === 'win32')('readPreviousUpgradeFailure on POSIX', () => {
+  it('reports a rolled-back target, and clears the images a killed script left only once its upgrade is recorded as finished', async () => {
+    const { readPreviousUpgradeFailure } = await import('../../src/node/self-upgrade.js');
+    const journalPath = await journalWith({ status: S.ROLLED_BACK, targetVersion: TARGET, recordedAt: NOW - 1 });
+    const exe = join(journalPath, '..', 'imcodes-node-linux');
+    await writeFile(`${exe}.upgrade-old`, 'previous image');
+    expect(await readPreviousUpgradeFailure(journalPath, OLD, NOW, exe))
+      .toEqual({ targetVersion: TARGET, reason: DAEMON_UPGRADE_BLOCK_REASON.INSTALL_FAILED });
+    // a failed attempt may still need its images: untouched
+    expect(await readFile(`${exe}.upgrade-old`, 'utf8')).toBe('previous image');
+
+    await writeUpgradeResult(journalPath, { status: S.SUCCESS, targetVersion: TARGET, recordedAt: NOW });
+    expect(await readPreviousUpgradeFailure(journalPath, TARGET, NOW, exe)).toBeNull();
+    await expect(readFile(`${exe}.upgrade-old`, 'utf8')).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
+  it('keeps the images while the record is still in_progress for the running version (the script may be alive)', async () => {
+    const { readPreviousUpgradeFailure } = await import('../../src/node/self-upgrade.js');
+    const journalPath = await journalWith({ status: S.IN_PROGRESS, targetVersion: TARGET, recordedAt: NOW - 1 });
+    const exe = join(journalPath, '..', 'imcodes-node-linux');
+    await writeFile(`${exe}.upgrade-old`, 'previous image');
+    expect(await readPreviousUpgradeFailure(journalPath, TARGET, NOW, exe)).toBeNull();
+    expect(await readFile(`${exe}.upgrade-old`, 'utf8')).toBe('previous image');
+  });
+});

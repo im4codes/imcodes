@@ -1,4 +1,5 @@
 import { basename, dirname, join } from 'node:path';
+import { shellQuote as shQuote } from '../util/shell-quote.js';
 import {
   CONTROLLED_NODE_LINUX_WATCHDOG_SURVIVAL_MS,
   CONTROLLED_NODE_SERVICE,
@@ -13,9 +14,6 @@ import { CONTROLLED_NODE_HEALTH_LEASE_FILE } from './health-lease.js';
 import { LINUX_UNIT_PATH, MACOS_PLIST_PATH, MACOS_WATCHDOG_PLIST_PATH } from './installer.js';
 import { posixUpgradeHealthWaitScript, posixUpgradePrimitivesScript } from './upgrade-health-script.js';
 
-function shQuote(value: string): string {
-  return `'${value.replaceAll("'", `'"'"'`)}'`;
-}
 
 export interface PosixControlledNodeUpgradeScriptInput {
   platform: 'darwin' | 'linux';
