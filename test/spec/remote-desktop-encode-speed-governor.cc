@@ -151,6 +151,64 @@ void NonFiniteSamplesAreRejected() {
   Require(governor.level() == 0, "unchanged");
 }
 
+// Deterministic pseudo-random jitter (no <random>: the sequence is the same on
+// every platform and stdlib).
+class Jitter {
+ public:
+  explicit Jitter(std::uint32_t seed) : state_(seed) {}
+  double Between(double low, double high) {
+    state_ = state_ * 1664525u + 1013904223u;
+    return low + (high - low) * ((state_ >> 8) / 16777216.0);
+  }
+
+ private:
+  std::uint32_t state_;
+};
+
+void AJitteryNetworkCannotMakeTheSizeFlipFlop() {
+  // Worst case for flip-flopping: encode times scattered across the threshold,
+  // for half an hour. The size may change, but never faster than the holds allow
+  // (a step down after 4 s, a step up only after 20 s), and the quiet case
+  // below proves the bound is not just a loose ceiling.
+  rd::EncodeSpeedGovernor governor;
+  Jitter jitter(12345);
+  std::int64_t now = 0;
+  int changes = 0;
+  int last_level = governor.level();
+  std::int64_t last_change = -1'000'000'000;  // before the first change the governor has no hold
+  const std::int64_t duration_ms = 30LL * 60 * 1000;
+  while (now < duration_ms) {
+    now += 100;
+    const double raw = jitter.Between(40.0, 230.0);
+    const double ms = governor.level() == 0 ? raw : raw * rd::kEncodeLevelPixelRatio;
+    if (governor.OnFrameEncoded(now, ms)) {
+      ++changes;
+      const bool down = governor.level() > last_level;
+      // A change never comes sooner than the hold of the direction it takes:
+      // a step down 4 s after the previous change, a step up 20 s after it.
+      Require(now - last_change >= (down ? rd::kEncodeStepDownHoldMs : rd::kEncodeStepUpHoldMs),
+              "a change respects its hold");
+      last_level = governor.level();
+      last_change = now;
+    }
+  }
+  // At most one step down and one step up per 24 s cycle.
+  Require(changes <= static_cast<int>(2 * (duration_ms / 24'000) + 2), "bounded by the holds, whatever the jitter");
+  Require(governor.level() >= 0 && governor.level() <= rd::kEncodeMaxLevel, "level stays in range");
+}
+
+void AQuietLinkDoesNotChangeTheSizeAtAll() {
+  rd::EncodeSpeedGovernor governor;
+  Jitter jitter(777);
+  std::int64_t now = 0;
+  int changes = 0;
+  for (int i = 0; i < 18000; ++i) {  // 30 minutes at 10 frames/s
+    now += 100;
+    if (governor.OnFrameEncoded(now, jitter.Between(40.0, 118.0))) ++changes;
+  }
+  Require(changes == 0, "jitter that stays below the threshold never steps the size");
+}
+
 }  // namespace
 
 int main() {
@@ -164,6 +222,8 @@ int main() {
   SlowWarmupFramesAreOutvoted();
   MaxLevelClampsAndClears();
   NonFiniteSamplesAreRejected();
+  AJitteryNetworkCannotMakeTheSizeFlipFlop();
+  AQuietLinkDoesNotChangeTheSizeAtAll();
   std::cout << "encode speed governor counterfactuals passed\n";
   return 0;
 }

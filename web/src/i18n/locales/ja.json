@@ -4169,6 +4169,7 @@
     "nerd_stats_hide": "Nerd 統計を非表示",
     "route": "経路: {{route}}",
     "encoder": "エンコーダー: {{encoder}}",
+    "rtt_definition": "このブラウザと操作対象マシンの間の往復遅延（WebRTC、片道ではなく往復全体。他のツールはこの半分を表示することがあります）。",
     "quality": "画質: {{preset}}",
     "dropped_frames": "ドロップ: {{count}}",
     "duration": "時間: {{seconds}} 秒",

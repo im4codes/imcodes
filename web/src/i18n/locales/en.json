@@ -4170,6 +4170,7 @@
     "nerd_stats_hide": "Hide Nerd stats",
     "route": "Route: {{route}}",
     "encoder": "Encoder: {{encoder}}",
+    "rtt_definition": "Round-trip time between this browser and the controlled machine (WebRTC, the full round trip, not one-way; other tools may show half of this).",
     "quality": "Quality: {{preset}}",
     "dropped_frames": "Dropped: {{count}}",
     "duration": "Duration: {{seconds}}s",

@@ -4169,6 +4169,7 @@
     "nerd_stats_hide": "Nerd 통계 숨기기",
     "route": "경로: {{route}}",
     "encoder": "인코더: {{encoder}}",
+    "rtt_definition": "이 브라우저와 제어 대상 머신 사이의 왕복 지연(WebRTC, 편도가 아닌 전체 왕복. 다른 도구는 이 값의 절반을 표시할 수 있음).",
     "quality": "화질: {{preset}}",
     "dropped_frames": "누락 프레임: {{count}}",
     "duration": "시간: {{seconds}}초",

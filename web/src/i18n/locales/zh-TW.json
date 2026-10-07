@@ -4170,6 +4170,7 @@
     "nerd_stats_hide": "隱藏 Nerd 統計",
     "route": "路徑：{{route}}",
     "encoder": "編碼器：{{encoder}}",
+    "rtt_definition": "此瀏覽器與受控機器之間的往返延遲（WebRTC，完整往返，非單程；其他工具可能顯示其一半）。",
     "quality": "畫質：{{preset}}",
     "dropped_frames": "遺失幀：{{count}}",
     "duration": "時長：{{seconds}} 秒",

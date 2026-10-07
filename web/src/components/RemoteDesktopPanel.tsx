@@ -4370,7 +4370,7 @@ export function RemoteDesktopPanel({
               {snapshot.quality && (
                 <>
                   <span>{snapshot.quality.width}×{snapshot.quality.height} · {snapshot.quality.fps.toFixed(0)} FPS</span>
-                  <span>{(snapshot.quality.bitrateBps / 1_000_000).toFixed(1)} Mbps · {snapshot.quality.rttMs.toFixed(0)} ms</span>
+                  <span title={t('remote_desktop.rtt_definition')} data-rtt-ms={snapshot.quality.rttMs.toFixed(0)}>{(snapshot.quality.bitrateBps / 1_000_000).toFixed(1)} Mbps · {snapshot.quality.rttMs.toFixed(0)} ms</span>
                   {snapshot.quality.encoderClass && (
                     <span>{t('remote_desktop.encoder', { encoder: snapshot.quality.encoderClass })}</span>
                   )}

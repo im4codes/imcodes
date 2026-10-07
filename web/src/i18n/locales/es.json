@@ -4170,6 +4170,7 @@
     "nerd_stats_hide": "Ocultar estadísticas Nerd",
     "route": "Ruta: {{route}}",
     "encoder": "Codificador: {{encoder}}",
+    "rtt_definition": "Tiempo de ida y vuelta entre este navegador y el equipo controlado (WebRTC, ida y vuelta completa, no solo ida; otras herramientas pueden mostrar la mitad).",
     "quality": "Calidad: {{preset}}",
     "dropped_frames": "Fotogramas perdidos: {{count}}",
     "duration": "Duración: {{seconds}} s",

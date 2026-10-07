@@ -1157,6 +1157,10 @@ describe('RemoteDesktopPanel mobile gestures', () => {
     expect(stats?.textContent).toContain('1920×1080');
     expect(stats?.textContent).toContain('29 FPS');
     expect(stats?.textContent).toContain('4.2 Mbps · 24 ms');
+    // The latency figure says what it is: a full round trip, not one-way.
+    const rtt = container.querySelector('.remote-desktop-stats [data-rtt-ms]');
+    expect(rtt?.getAttribute('title')).toBe('remote_desktop.rtt_definition');
+    expect(rtt?.getAttribute('data-rtt-ms')).toBe('24');
     expect(stats?.textContent).toContain('remote_desktop.encoder');
     expect(stats?.textContent).toContain('remote_desktop.quality');
     expect(stats?.textContent).toContain('remote_desktop.dropped_frames');
