@@ -9,7 +9,6 @@
 export const LOCAL_PANEL_PAGE_SCRIPT = String.raw`
 (function () {
   'use strict';
-  var LANG_KEY = 'aidesk-local-lang';
   var state = null;
   var offline = false;
   var pref = 'system';
@@ -33,12 +32,12 @@ export const LOCAL_PANEL_PAGE_SCRIPT = String.raw`
 
   // ---- language ---------------------------------------------------------
   function readPref() {
-    try { return localStorage.getItem(B.langKey || LANG_KEY) || UI_LOCALE_FOLLOW_SYSTEM; } catch (e) { return UI_LOCALE_FOLLOW_SYSTEM; }
+    try { return localStorage.getItem(B.langKey) || UI_LOCALE_FOLLOW_SYSTEM; } catch (e) { return UI_LOCALE_FOLLOW_SYSTEM; }
   }
   function writePref(value) {
     try {
-      if (value === UI_LOCALE_FOLLOW_SYSTEM) localStorage.removeItem(B.langKey || LANG_KEY);
-      else localStorage.setItem(B.langKey || LANG_KEY, value);
+      if (value === UI_LOCALE_FOLLOW_SYSTEM) localStorage.removeItem(B.langKey);
+      else localStorage.setItem(B.langKey, value);
     } catch (e) { /* storage unavailable: the choice just is not remembered */ }
   }
   function resolveLocale() { return uiLocaleFromPreference(pref, systemLanguagesOf(navigator)); }
@@ -108,7 +107,9 @@ export const LOCAL_PANEL_PAGE_SCRIPT = String.raw`
     $('offlineBanner').hidden = !offline;
     var sw = $('allowSwitch');
     sw.setAttribute('aria-checked', String(!paused));
-    sw.disabled = busy || !state;
+    // Never disabled while an action runs: a disabled button loses keyboard focus. The click handler ignores clicks meanwhile.
+    sw.disabled = !state;
+    sw.setAttribute('aria-busy', String(busy));
     $('swOn').textContent = T('switchOn');
     $('swOff').textContent = T('switchOff');
     $('allowHelp').textContent = paused ? T('allowOff') : T('allowOn');

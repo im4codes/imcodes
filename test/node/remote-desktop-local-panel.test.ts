@@ -173,7 +173,7 @@ describe('remote desktop local panel', () => {
   async function openPageInDom(options: {
     state?: () => Record<string, unknown>;
     languages?: string[];
-    extraFetch?: (url: string, init?: RequestInit) => { ok: boolean } | undefined;
+    extraFetch?: (url: string, init?: RequestInit) => unknown;
     storage?: Record<string, string>;
     beforeParse?: (window: import('jsdom').DOMWindow) => void;
   } = {}) {
@@ -188,7 +188,7 @@ describe('remote desktop local panel', () => {
     const baseState = { publicNodeId: '1234567890', paused: false, connections: [] as unknown[] };
     const fetchClient = vi.fn(async (url: string, init?: RequestInit) => {
       const custom = options.extraFetch?.(url, init);
-      if (custom) return custom;
+      if (custom) return custom as { ok: boolean; json: () => Promise<unknown> };
       if (url === REMOTE_DESKTOP_LOCAL_MANAGEMENT.STATE_PATH) return { ok: true, json: async () => ({ ...baseState, ...(options.state?.() ?? {}) }) };
       return { ok: true, json: async () => ({ ok: true }) };
     });
@@ -295,6 +295,33 @@ describe('remote desktop local panel', () => {
       expect(byId(dom, 'allowHelp').textContent).toBe('Nobody can connect until you turn this on.');
       byId(dom, 'resume').click();
       await vi.waitFor(() => expect(posts(fetchClient).map((p) => p.body.action)).toEqual([REMOTE_DESKTOP_LOCAL_ACTION.PAUSE, REMOTE_DESKTOP_LOCAL_ACTION.RESUME]));
+    } finally { dom.window.close(); }
+  });
+
+  it('keeps keyboard focus on the switch while its action runs and after it completes', async () => {
+    let paused = false;
+    let release: (() => void) | undefined;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const { dom, fetchClient } = await openPageInDom({
+      state: () => ({ paused }),
+      extraFetch: (url) => (url === REMOTE_DESKTOP_LOCAL_MANAGEMENT.ACTION_PATH ? gate.then(() => ({ ok: true, json: async () => ({ ok: true }) })) : undefined),
+    });
+    try {
+      const sw = byId(dom, 'allowSwitch') as HTMLButtonElement;
+      await vi.waitFor(() => expect(byId(dom, 'statusPill').hidden).toBe(false));
+      sw.focus();
+      sw.click();
+      await vi.waitFor(() => expect(posts(fetchClient)).toHaveLength(1));
+      // While the request is in flight: still focused, not disabled, marked busy, and a second press does nothing.
+      expect(dom.window.document.activeElement).toBe(sw);
+      expect(sw.disabled).toBe(false);
+      sw.click();
+      expect(posts(fetchClient)).toHaveLength(1);
+      release?.();
+      paused = true;
+      await vi.waitFor(() => expect(sw.getAttribute('aria-checked')).toBe('false'), { timeout: 3_000 });
+      expect(dom.window.document.activeElement).toBe(sw);
+      expect(sw.getAttribute('aria-busy')).toBe('false');
     } finally { dom.window.close(); }
   });
 
