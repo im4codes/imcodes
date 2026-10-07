@@ -33,6 +33,8 @@ export interface LocalPanelWindowPlatform {
   findWindowProcess(): Promise<LocalPanelWindowProcess | undefined>;
   probePid(pid: number): Promise<{ alive: boolean; startedAtMs?: number }>;
   readonly canFocus: boolean;
+  /** The native host (when installed) keeps its own single instance: it is simply asked each time, never looked for or focused from outside. */
+  readonly nativeHostsOwnInstance?: boolean;
   focusWindow(window: LocalPanelWindowProcess): Promise<boolean>;
   launchNative(path: string): Promise<boolean>;
   launchAppMode(browser: string): Promise<boolean>;
@@ -125,14 +127,16 @@ export async function openLocalPanelWindow(input: OpenLocalPanelWindowInput): Pr
   try {
     const panelRunning = await input.panelRunning();
     const hasDesktop = panelRunning ? await input.platform.hasDesktop() : false;
-    const existing = panelRunning && hasDesktop ? await resolveExistingWindow(input) : undefined;
     const nativePath = panelRunning && hasDesktop ? await input.platform.nativeUiPath() : undefined;
+    const selfManagedNative = nativePath !== undefined && input.platform.nativeHostsOwnInstance === true;
+    const existing = panelRunning && hasDesktop && !selfManagedNative ? await resolveExistingWindow(input) : undefined;
     const appModeBrowsers = panelRunning && hasDesktop && !existing ? await input.platform.findAppModeBrowsers() : [];
     const plan = planLocalPanelWindow({
       platform: input.platform.platform,
       panelRunning,
       hasDesktop,
       nativeUiInstalled: nativePath !== undefined,
+      nativeHostsOwnInstance: input.platform.nativeHostsOwnInstance === true,
       appModeBrowsers,
       existingWindowAlive: existing !== undefined,
       canFocusExisting: input.platform.canFocus,
@@ -150,7 +154,8 @@ export async function openLocalPanelWindow(input: OpenLocalPanelWindowInput): Pr
       let ok = false;
       try { ok = await runAttempt(input, attempt); } catch { ok = false; }
       if (ok) {
-        if (attempt.mechanism !== LOCAL_PANEL_WINDOW_MECHANISM.DEFAULT_BROWSER) await locateLaunchedWindow(input, attempt.mechanism);
+        const selfManaged = attempt.mechanism === LOCAL_PANEL_WINDOW_MECHANISM.NATIVE && input.platform.nativeHostsOwnInstance === true;
+        if (attempt.mechanism !== LOCAL_PANEL_WINDOW_MECHANISM.DEFAULT_BROWSER && !selfManaged) await locateLaunchedWindow(input, attempt.mechanism);
         return finish({ reason: openedReasonOf(attempt.mechanism), mechanism: attempt.mechanism });
       }
       trail.push(LOCAL_PANEL_WINDOW_REASON.LAUNCH_FAILED);

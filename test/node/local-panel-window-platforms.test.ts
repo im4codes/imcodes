@@ -143,7 +143,7 @@ describe('macOS adapter', () => {
       runInSession: async (_user, file, args) => { inSession.push({ file, args }); return true; },
       startInSession: async (u, file, args) => { started.push({ ...(u ? { user: u.name } : {}), file, args }); return true; },
       prepareProfileParent: async () => undefined,
-      nativeUiPath: async () => '/Applications/aiDesk.app/Contents/Helpers/aidesk-local-ui',
+      panelHostApp: async () => '/Library/Application Support/aidesk/aiDesk.to by IM.codes.app',
       ...over,
     });
     return { platform, started, inSession, runs };
@@ -186,9 +186,22 @@ describe('macOS adapter', () => {
     expect(inSession[1]).toEqual({ file: '/usr/bin/open', args: [localPanelUrl()] });
   });
 
-  it('the native window is the verified helper inside the signed app, or nothing', async () => {
-    expect(await mac().platform.nativeUiPath()).toBe('/Applications/aiDesk.app/Contents/Helpers/aidesk-local-ui');
-    expect(await mac({ nativeUiPath: async () => undefined }).platform.nativeUiPath()).toBeUndefined();
+  it('the native host is the installed aiDesk app that declares it shows the panel itself, or nothing; it keeps its own single instance', async () => {
+    const { platform } = mac();
+    expect(platform.nativeHostsOwnInstance).toBe(true);
+    expect(await platform.nativeUiPath()).toBe('/Library/Application Support/aidesk/aiDesk.to by IM.codes.app');
+    expect(await mac({ panelHostApp: async () => undefined }).platform.nativeUiPath()).toBeUndefined();
+  });
+
+  it('starting the host is `open <app>` in the user\'s session with the open-panel arguments (a running app just gets the reopen); as the user it is a plain open', async () => {
+    const app = '/Library/Application Support/aidesk/aiDesk.to by IM.codes.app';
+    const asRoot = mac();
+    expect(await asRoot.platform.launchNative(app)).toBe(true);
+    expect(asRoot.inSession[0]).toEqual({ file: '/usr/bin/open', args: [app, '--args', '--aidesk-background', '--aidesk-open-panel'] });
+    expect(asRoot.started).toEqual([]);
+    const asUser = mac({ uid: () => 501, env: { HOME: '/Users/k' }, resolveUser: async () => { throw new Error('unused'); } });
+    expect(await asUser.platform.launchNative(app)).toBe(true);
+    expect(asUser.runs.some((run) => run.file === '/usr/bin/open' && run.args.join(' ').includes('--aidesk-open-panel'))).toBe(true);
   });
 });
 

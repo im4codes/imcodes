@@ -18,8 +18,9 @@ describe('aiDesk local management launchers', () => {
   it('opens the shared panel from the macOS app and collapsed disclosure badge', () => {
     const app = read('native/macos-remote-desktop/aidesk_agent_main.mm');
     const disclosure = read('native/macos-remote-desktop/macos_local_disclosure.mm');
-    expect(app).toContain('kLocalManagementUrl');
-    expect(app).toContain('openURL:url');
+    // the app shows the panel as its own window; the disclosure (a separate helper process) asks the node, then the browser
+    expect(app).toContain('ShowLocalPanelWindow()');
+    expect(read('native/macos-remote-desktop/aidesk_panel_window.mm')).toContain('kLocalManagementUrl');
     expect(disclosure).toContain('[owner openManagement]');
     expect(disclosure).toContain('kLocalManagementUrl');
   });
@@ -76,13 +77,9 @@ describe('aiDesk local management launchers', () => {
     expect(linux.indexOf('common::RequestLocalManagementWindow()')).toBeGreaterThan(-1);
     expect(linux.indexOf('common::RequestLocalManagementWindow()')).toBeLessThan(linux.indexOf('execlp("xdg-open"'));
 
-    const app = read('native/macos-remote-desktop/aidesk_agent_main.mm');
     const disclosure = read('native/macos-remote-desktop/macos_local_disclosure.mm');
-    for (const source of [app, disclosure]) {
-      expect(source).toContain('RequestLocalManagementWindow()');
-      expect(source).toContain('dispatch_get_global_queue');
-    }
-    expect(app.indexOf('RequestLocalManagementWindow()')).toBeLessThan(app.indexOf('OpenLocalManagementPanelDirectly(); });'));
+    expect(disclosure).toContain('RequestLocalManagementWindow()');
+    expect(disclosure).toContain('dispatch_get_global_queue');
     expect(disclosure.indexOf('RequestLocalManagementWindow()')).toBeLessThan(disclosure.indexOf('openURL:url'));
   });
 });

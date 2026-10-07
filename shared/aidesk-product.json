@@ -4,5 +4,6 @@
   "macosBundleId": "to.aidesk.app",
   "linuxDesktopFileName": "aidesk.desktop",
   "windowsShortcutFileName": "aiDesk.to by IM.codes.lnk",
-  "localUiExecutableName": "aidesk-local-ui"
+  "localUiExecutableName": "aidesk-local-ui",
+  "panelHostPlistKey": "AiDeskHostsPanelWindow"
 }

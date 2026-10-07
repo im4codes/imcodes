@@ -9,3 +9,5 @@ export const AIDESK_MACOS_BUNDLE_ID = AIDESK_PRODUCT.macosBundleId;
 export const AIDESK_LINUX_DESKTOP_FILE_NAME = AIDESK_PRODUCT.linuxDesktopFileName;
 export const AIDESK_WINDOWS_SHORTCUT_FILE_NAME = AIDESK_PRODUCT.windowsShortcutFileName;
 export const AIDESK_LOCAL_UI_EXECUTABLE_NAME = AIDESK_PRODUCT.localUiExecutableName;
+/** Info.plist key (boolean) the aiDesk app carries when it shows the local management panel in its own window; the node reads it before asking. */
+export const AIDESK_PANEL_HOST_PLIST_KEY = AIDESK_PRODUCT.panelHostPlistKey;

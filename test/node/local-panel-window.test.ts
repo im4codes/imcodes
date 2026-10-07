@@ -74,6 +74,8 @@ describe('planLocalPanelWindow', () => {
   });
 
   it('an open window is focused (or kept when the platform cannot focus), never duplicated', () => {
+    expect(planLocalPanelWindow(facts({ existingWindowAlive: true, nativeUiInstalled: true, nativeHostsOwnInstance: true, appModeBrowsers: [] })).action).toBe('open');
+    expect(planLocalPanelWindow(facts({ existingWindowAlive: true, nativeUiInstalled: false, nativeHostsOwnInstance: true, appModeBrowsers: [] })).action).toBe('focus');
     expect(planLocalPanelWindow(facts({ existingWindowAlive: true, nativeUiInstalled: true, appModeBrowsers: ['chromium'] })))
       .toEqual({ action: 'focus', reason: LOCAL_PANEL_WINDOW_REASON.FOCUSED_EXISTING });
     expect(planLocalPanelWindow(facts({ existingWindowAlive: true, canFocusExisting: false })))
@@ -125,12 +127,12 @@ describe('the single-instance record', () => {
 function machine(over: Partial<{
   hasDesktop: boolean; native: string | undefined; browsers: string[]; running: LocalPanelWindowProcess | undefined;
   alive: Record<number, { alive: boolean; startedAtMs?: number }>; canFocus: boolean; focusOk: boolean;
-  launchNativeOk: boolean; appModeOk: Record<string, boolean>; defaultOk: boolean; panelRunning: boolean; record: string | undefined;
+  launchNativeOk: boolean; appModeOk: Record<string, boolean>; defaultOk: boolean; panelRunning: boolean; record: string | undefined; selfManaged: boolean;
 }> = {}) {
   const state = {
     hasDesktop: true, native: undefined as string | undefined, browsers: [] as string[], running: undefined as LocalPanelWindowProcess | undefined,
     alive: {} as Record<number, { alive: boolean; startedAtMs?: number }>, canFocus: true, focusOk: true, launchNativeOk: true,
-    appModeOk: {} as Record<string, boolean>, defaultOk: true, panelRunning: true, record: undefined as string | undefined, ...over,
+    appModeOk: {} as Record<string, boolean>, defaultOk: true, panelRunning: true, record: undefined as string | undefined, selfManaged: false, ...over,
   };
   const calls: string[] = [];
   const logs: Array<{ level: string; fields: Record<string, unknown> }> = [];
@@ -142,6 +144,7 @@ function machine(over: Partial<{
     findWindowProcess: async () => state.running,
     probePid: async (pid) => state.alive[pid] ?? { alive: false },
     canFocus: state.canFocus,
+    nativeHostsOwnInstance: state.selfManaged,
     focusWindow: async () => { calls.push('focus'); return state.focusOk; },
     launchNative: async (path) => { calls.push(`native:${path}`); if (state.launchNativeOk) state.running = { pid: 77, startedAtMs: 5_000 }; return state.launchNativeOk; },
     launchAppMode: async (browser) => {
@@ -171,6 +174,23 @@ describe('openLocalPanelWindow', () => {
     expect(out).toMatchObject({ reason: LOCAL_PANEL_WINDOW_REASON.OPENED_NATIVE, mechanism: LOCAL_PANEL_WINDOW_MECHANISM.NATIVE });
     expect(m.calls).toEqual(['native:/opt/aidesk-local-ui']);
     expect(parseLocalPanelWindowRecord(m.state.record ?? '')).toMatchObject({ pid: 77, mechanism: 'native' });
+  });
+
+  it('a native host that keeps its own single instance (the macOS app) is simply asked every time: no window lookup, no focus from outside, no record', async () => {
+    const m = machine({ native: '/Library/aidesk.app', selfManaged: true, browsers: ['chrome'], running: { pid: 5, startedAtMs: 1 }, alive: { 5: { alive: true } }, record: JSON.stringify({ pid: 5, startedAtMs: 1, mechanism: 'app_mode' }) });
+    const first = await m.run();
+    const second = await m.run();
+    expect(first).toMatchObject({ reason: LOCAL_PANEL_WINDOW_REASON.OPENED_NATIVE, mechanism: LOCAL_PANEL_WINDOW_MECHANISM.NATIVE });
+    expect(second.reason).toBe(LOCAL_PANEL_WINDOW_REASON.OPENED_NATIVE);
+    expect(m.calls).toEqual(['native:/Library/aidesk.app', 'native:/Library/aidesk.app']);
+  });
+
+  it('when the self-managed host cannot be started the browser app window is the fallback, with the reason logged', async () => {
+    const m = machine({ native: '/Library/aidesk.app', selfManaged: true, browsers: ['chrome'], launchNativeOk: false });
+    const out = await m.run();
+    expect(out).toMatchObject({ reason: LOCAL_PANEL_WINDOW_REASON.OPENED_APP_MODE, mechanism: LOCAL_PANEL_WINDOW_MECHANISM.APP_MODE });
+    expect(out.trail).toEqual([LOCAL_PANEL_WINDOW_REASON.LAUNCH_FAILED]);
+    expect(m.calls).toEqual(['native:/Library/aidesk.app', 'app:chrome']);
   });
 
   it('falls back native -> app mode (second browser) -> default browser, logging each failure', async () => {

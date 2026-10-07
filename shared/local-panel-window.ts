@@ -156,6 +156,11 @@ export interface LocalPanelWindowFacts {
   /** An interactive desktop exists: Windows/macOS an active user session, Linux a DISPLAY/WAYLAND_DISPLAY. */
   hasDesktop: boolean;
   nativeUiInstalled: boolean;
+  /**
+   * The native host keeps its own single instance (the macOS app: a second request activates the window it already has). Asking it
+   * is always right -- there is no window of ours to look for or to focus from outside.
+   */
+  nativeHostsOwnInstance?: boolean;
   /** App-mode browsers found on this machine, in the order of LOCAL_PANEL_APP_MODE_BROWSERS. */
   appModeBrowsers: readonly string[];
   /** The window opened earlier is still alive. */
@@ -189,7 +194,7 @@ export function planLocalPanelWindow(facts: LocalPanelWindowFacts): LocalPanelWi
   if (!facts.hasDesktop) {
     return { action: 'none', reason: facts.platform === 'linux' ? LOCAL_PANEL_WINDOW_REASON.NO_DESKTOP : LOCAL_PANEL_WINDOW_REASON.NO_USER_SESSION };
   }
-  if (facts.existingWindowAlive) {
+  if (facts.existingWindowAlive && !(facts.nativeUiInstalled && facts.nativeHostsOwnInstance)) {
     return { action: 'focus', reason: facts.canFocusExisting ? LOCAL_PANEL_WINDOW_REASON.FOCUSED_EXISTING : LOCAL_PANEL_WINDOW_REASON.KEPT_EXISTING };
   }
   const attempts: LocalPanelWindowAttempt[] = [];

@@ -25,6 +25,14 @@ namespace imcodes::remote_desktop::common {
 inline constexpr char kLocalManagementUrl[] = "http://127.0.0.1:43751/";
 inline constexpr char kLocalManagementStateUrl[] =
     "http://127.0.0.1:43751/api/state";
+// Must match LOCAL_PANEL_WINDOW_SIZE / LOCAL_PANEL_WINDOW_MIN_SIZE in
+// shared/local-panel-window.ts (test/spec/aidesk-panel-window-host.test.ts
+// binds them). The window opens at the size and may be resized down to the
+// minimum.
+inline constexpr int kLocalPanelWindowWidth = 960;
+inline constexpr int kLocalPanelWindowHeight = 640;
+inline constexpr int kLocalPanelWindowMinWidth = 480;
+inline constexpr int kLocalPanelWindowMinHeight = 400;
 
 using CapturedFrameSink = std::function<void(CapturedFrame)>;
 using H264AccessUnitSink = std::function<void(H264AccessUnit)>;

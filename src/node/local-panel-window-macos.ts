@@ -12,9 +12,9 @@ import {
   LOCAL_PANEL_PROFILE_DIR_ENV,
   buildLocalPanelAppModeArgs,
 } from '../../shared/local-panel-window.js';
-import { AIDESK_LOCAL_UI_EXECUTABLE_NAME } from '../../shared/aidesk-product.js';
+import { AIDESK_PANEL_HOST_PLIST_KEY } from '../../shared/aidesk-product.js';
 import { imcodesStateDirForHome } from '../util/imcodes-state-dir.js';
-import { resolveVerifiedAideskLocalUi } from './aidesk-local-ui-artifact.js';
+import { MACOS_REMOTE_DESKTOP_RESPONSIBLE_APP_PATH } from './macos-remote-desktop-responsible-spawn.js';
 import {
   resolveMacosUserSession,
   runMacosUserSessionCommand,
@@ -35,9 +35,12 @@ export interface MacosPanelWindowDeps {
   /** Starts a long-lived GUI process in the user's session (or directly when already the user); true once it started. */
   startInSession: (user: MacosUserSession | undefined, file: string, args: readonly string[]) => Promise<boolean>;
   prepareProfileParent: (dir: string, user: MacosUserSession | undefined) => Promise<void>;
-  /** The verified native window (inside the signed app), or undefined. */
-  nativeUiPath: () => Promise<string | undefined>;
+  /** The installed aiDesk app, when it declares that it shows the panel in its own window (Info.plist marker); else undefined. */
+  panelHostApp: () => Promise<string | undefined>;
 }
+
+/** What the app is told when the node starts it just to show the panel; a running app only receives the "reopen" and shows it. */
+export const MACOS_PANEL_HOST_LAUNCH_ARGS = Object.freeze(['--args', '--aidesk-background', '--aidesk-open-panel']);
 
 const realDeps = (): MacosPanelWindowDeps => ({
   uid: () => process.getuid?.() ?? -1,
@@ -76,7 +79,15 @@ const realDeps = (): MacosPanelWindowDeps => ({
     await mkdir(dir, { recursive: true, mode: 0o700 });
     if (user && process.getuid?.() === 0) await chown(dir, user.uid, user.gid);
   },
-  nativeUiPath: () => resolveVerifiedAideskLocalUi(),
+  panelHostApp: async () => {
+    const app = MACOS_REMOTE_DESKTOP_RESPONSIBLE_APP_PATH;
+    const plist = join(app, 'Contents', 'Info.plist');
+    if (!existsSync(plist)) return undefined;
+    return new Promise<string | undefined>((resolve) => {
+      execFile('/usr/bin/plutil', ['-extract', AIDESK_PANEL_HOST_PLIST_KEY, 'raw', '-o', '-', plist], { timeout: 5_000, encoding: 'utf8' },
+        (error, stdout) => resolve(!error && String(stdout).trim() === 'true' ? app : undefined));
+    });
+  },
 });
 
 export function createMacosLocalPanelWindowPlatform(overrides: Partial<MacosPanelWindowDeps> = {}): LocalPanelWindowPlatform & { profileDir(): Promise<string | undefined> } {
@@ -120,19 +131,21 @@ export function createMacosLocalPanelWindowPlatform(overrides: Partial<MacosPane
     platform: 'darwin',
     profileDir,
     canFocus: true,
+    // The app shows the panel in its own window and keeps it single: asking it again activates that window.
+    nativeHostsOwnInstance: true,
     async hasDesktop() {
       // As root there must be a console user with a graphical (Aqua) session; started by the user, there is one by definition.
       return asRoot() ? (await sessionUser()) !== undefined : true;
     },
     nativeUiPath() {
-      return deps.nativeUiPath();
+      return deps.panelHostApp();
     },
     async findAppModeBrowsers() {
       const found = await Promise.all(LOCAL_PANEL_APP_MODE_BROWSERS.darwin.map(browserExecutable));
       return found.filter((path): path is string => path !== undefined);
     },
     async findWindowProcess() {
-      const patterns = [await profileDir(), `/${AIDESK_LOCAL_UI_EXECUTABLE_NAME}`].filter((value): value is string => !!value);
+      const patterns = [await profileDir()].filter((value): value is string => !!value);
       for (const pattern of patterns) {
         const out = await deps.run('/usr/bin/pgrep', ['-f', '--', pattern]);
         const pid = out.stdout.split(/\s+/u).map(Number).filter((value) => Number.isSafeInteger(value) && value > 0).sort((a, b) => a - b)[0];
@@ -153,7 +166,11 @@ export function createMacosLocalPanelWindowPlatform(overrides: Partial<MacosPane
       return (await deps.run('/usr/bin/osascript', ['-e', script])).code === 0;
     },
     async launchNative(path) {
-      return deps.startInSession(await sessionUser(), path, []);
+      // LaunchServices starts the app (with the open-panel argument) or, when it already runs, delivers "reopen" to it: either way
+      // the app shows its panel window or activates the one it has.
+      const user = await sessionUser();
+      if (user) return deps.runInSession(user, '/usr/bin/open', [path, ...MACOS_PANEL_HOST_LAUNCH_ARGS]);
+      return (await deps.run('/usr/bin/open', [path, ...MACOS_PANEL_HOST_LAUNCH_ARGS])).code === 0;
     },
     async launchAppMode(browser) {
       const profile = await profileDir();

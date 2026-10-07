@@ -67,9 +67,9 @@ describe('aiDesk FLTK native management window', () => {
     expect(entry).toContain('resolveAideskLocalUiExecutable');
     expect(entry).toContain('if (existsSync(nativeUi))');
     expect(entry).toContain('const url = localPanelUrl()');
-    expect(agent).toContain('Contents/Helpers');
-    expect(agent).toContain('kLocalManagementUrl');
-    expect(agent).toContain('openURL:url');
+    // The macOS app no longer launches the FLTK helper or the browser: the panel is its own WKWebView window (aidesk_panel_window.mm).
+    expect(agent).toContain('ShowLocalPanelWindow()');
+    expect(agent).not.toContain('Contents/Helpers');
     expect(packager).toContain('AIDESK_LOCAL_UI_EXECUTABLE');
     expect(product).toContain('"localUiExecutableName": "aidesk-local-ui"');
   });

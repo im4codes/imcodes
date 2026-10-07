@@ -90,9 +90,20 @@ export function buildAideskInfoPlist(input) {
     // its own identity, so an app without them is simply an older app.
     [fsDelegate.infoPlistVersionKey, fsDelegate.protocolVersion, 'integer'],
     [fsDelegate.infoPlistOpsKey, fsDelegate.appOps.join(' ')],
+    // The node reads this before it asks the app to show the panel: an older app (no marker) is not asked, so it can never be
+    // told to open a panel through a node that would open it again.
+    [product.panelHostPlistKey, true],
+    // The panel is on the loopback over plain http; allow exactly that, without loosening transport security for anything else.
+    ['NSAppTransportSecurity', { NSAllowsLocalNetworking: true }],
   ];
+  // Strings by default; an explicit type ('integer') for typed scalars, true for booleans, an object for a nested dictionary.
+  const plistValue = (value, type = 'string') => value === true
+    ? '<true/>'
+    : typeof value === 'object'
+      ? `<dict>${Object.entries(value).map(([k, v]) => `<key>${k}</key>${plistValue(v)}`).join('')}</dict>`
+      : `<${type}>${value}</${type}>`;
   const body = entries
-    .map(([key, value, type = 'string']) => `  <key>${key}</key>\n  <${type}>${value}</${type}>`)
+    .map(([key, value, type]) => `  <key>${key}</key>\n  ${plistValue(value, type)}`)
     .join('\n');
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">

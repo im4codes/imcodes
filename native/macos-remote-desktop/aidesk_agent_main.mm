@@ -30,34 +30,19 @@
 #include "macos_permission_onboarding.h"
 #include "../remote-desktop-common/platform_interfaces.h"
 #include "../remote-desktop-common/aidesk_product_name.h"
-#include "../posix-shared/local_management_open_window_posix.h"
+#include "aidesk_panel_window.h"
 #include "../remote-desktop-common/local_indicator_visuals.h"
 
 namespace macos = imcodes::remote_desktop::macos;
 
 namespace {
-// The previous way of opening the panel: the bundled native window, else the default browser. Now only the fallback.
-bool OpenLocalManagementPanelDirectly() {
-  NSString *native_ui = [[[NSBundle mainBundle] bundlePath]
-      stringByAppendingPathComponent:@"Contents/Helpers/aidesk-local-ui"];
-  if (![[NSFileManager defaultManager] isExecutableFileAtPath:native_ui]) native_ui = nil;
-  if (native_ui != nil) {
-    NSTask *task = [[NSTask alloc] init];
-    task.executableURL = [NSURL fileURLWithPath:native_ui];
-    NSError *launch_error = nil;
-    if ([task launchAndReturnError:&launch_error]) return true;
-  }
-  NSURL *url = [NSURL URLWithString:@(imcodes::remote_desktop::common::kLocalManagementUrl)];
-  return url != nil && [[NSWorkspace sharedWorkspace] openURL:url];
-}
+// Set by `--aidesk-open-panel`: the node started this application to show the panel, and nothing is running yet to be asked.
+bool g_open_panel_on_launch = false;
 
-// The node decides how the panel opens (native window, app-mode browser, default browser, single instance); this only asks it, off
-// the main thread (the answer can take a few seconds), and opens directly only when the node cannot (an older node, a failure).
+// The panel is this application's own window (a web view): the Dock, Cmd-Tab and the menu bar show aiDesk.to's icon and name, and a
+// second request activates the window that exists. Nothing goes through the node, so an older node works as well as a new one.
 bool OpenLocalManagementPanel() {
-  dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-    if (imcodes::remote_desktop::common::RequestLocalManagementWindow()) return;
-    dispatch_async(dispatch_get_main_queue(), ^{ OpenLocalManagementPanelDirectly(); });
-  });
+  dispatch_async(dispatch_get_main_queue(), ^{ macos::ShowLocalPanelWindow(); });
   return true;
 }
 
@@ -204,6 +189,7 @@ NSDictionary *StatusPresentation(NSDictionary *state, NSInteger http_status) {
       initWithStateURL:[NSURL URLWithString:@(
           imcodes::remote_desktop::common::kLocalManagementStateUrl)]];
   [self refreshStatus:nil];
+  if (g_open_panel_on_launch) OpenLocalManagementPanel();
   self.statusTimer = [NSTimer scheduledTimerWithTimeInterval:2.0
       target:self selector:@selector(refreshStatus:) userInfo:nil repeats:YES];
 }
@@ -296,8 +282,10 @@ int main(int argc, char* argv[]) {
   if (macos::IsMacosPermissionResponsibleApplication())
     macos::PrepareMacosPermissionResponsibleApplication();
 
-  const bool background_launch = argc == 2 &&
-      std::strcmp(argv[1], "--aidesk-background") == 0;
+  const bool background_launch = (argc == 2 || argc == 3) &&
+      std::strcmp(argv[1], "--aidesk-background") == 0 &&
+      (argc == 2 || std::strcmp(argv[2], "--aidesk-open-panel") == 0);
+  g_open_panel_on_launch = background_launch && argc == 3;
   if (background_launch || macos::IsLocalOnboardingAppLaunch(argc, argv)) {
     [NSApplication sharedApplication];
     [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
