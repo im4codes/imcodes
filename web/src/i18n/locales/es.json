@@ -4443,6 +4443,7 @@
     "card_auditor": "Auditor",
     "card_unassigned": "Sin asignar",
     "card_unknown_status": "Estado desconocido",
+    "card_notice_status": "Aviso",
     "card_cancel_actor": "Actor de cancelación: {{value}}",
     "card_cancel_source": "Origen de cancelación: {{value}}",
     "card_cancel_reason": "Motivo de cancelación: {{value}}",
@@ -4478,6 +4479,7 @@
       "next_round": "siguiente ronda abierta",
       "send": "materiales enviados",
       "import": "importada",
+      "notice": "aviso",
       "other": "registrada"
     },
     "status": {
@@ -4486,7 +4488,7 @@
       "in_audit": "En auditoría",
       "awaiting_audit": "Esperando auditoría",
       "rework": "Rehacer",
-      "passed": "Aprobada",
+      "passed": "Auditoría aprobada",
       "done": "Terminada",
       "cancelled": "Cancelada",
       "rework_round": "Revisión ronda {{round}}",

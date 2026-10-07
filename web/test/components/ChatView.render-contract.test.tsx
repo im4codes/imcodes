@@ -17,7 +17,8 @@ import {
   SUPERVISION_EXECUTION_STATUS_MARKERS,
   parseSupervisionExecutionStateDetailsFromText,
 } from '../../../shared/supervision-config.js';
-import { TASK_PAIR_AUTOMATION_KIND } from '../../../shared/task-pair.js';
+import { TASK_PAIR_AUTOMATION_KIND, TASK_PAIR_NO_AUDITOR } from '../../../shared/task-pair.js';
+import { buildExecutorPairBrief } from '../../../src/daemon/task-pairs/messages.js';
 
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({ t: (key: string) => key }),
@@ -346,6 +347,31 @@ describe('ChatView render capability contract', () => {
     expect(items.filter((item) => item.type === 'event')).toHaveLength(1);
     expect(items.filter((item) => item.type === 'assistant-block')).toHaveLength(0);
     expect(items[0]).toMatchObject({ type: 'event', event: structured });
+  });
+
+  it('an auditor=none pair that is still running never shows a "passed" card: the delivered brief is a neutral notice', () => {
+    const pair = {
+      taskId: 'tsk_no_audit', title: 'Urgent fix', brain: 'deck_p_brain', executor: 'deck_sub_x', auditor: TASK_PAIR_NO_AUDITOR,
+      status: 'working', round: 0, flags: [], flagSides: {}, blocking: ['P0'], brief: 'Fix it. Tests must PASS.',
+    };
+    const dispatched = {
+      ...ev('task_pair.event'), eventId: 'np-dispatch', ts: 1,
+      payload: { taskId: 'tsk_no_audit', title: 'Urgent fix', verb: 'DISPATCH', toStatus: 'working', writer: 'deck_p_brain', role: 'brain', source: 'mcp', effect: 'created', unusual: false, auditor: TASK_PAIR_NO_AUDITOR },
+    } as unknown as TimelineEvent;
+    const brief = {
+      ...ev('user.message'), eventId: 'np-brief', ts: 2,
+      payload: { text: buildExecutorPairBrief(pair as never), automation: true, automationKind: TASK_PAIR_AUTOMATION_KIND },
+    } as unknown as TimelineEvent;
+    const tools = [1, 2, 3].map((n) => ({ ...ev('tool.call'), eventId: `np-tool-${n}`, ts: 2 + n, payload: { tool: 'Bash', input: { command: `echo ${n}` } } })) as unknown as TimelineEvent[];
+    const items = __buildViewItemsForTests([dispatched, brief, ...tools], true);
+    const cards = items.filter((item) => item.type === 'assistant-block' && item.taskPairNotification);
+    expect(cards).toHaveLength(1);
+    expect((cards[0] as { taskPairNotification: Record<string, unknown> }).taskPairNotification.toStatus).toBeUndefined();
+    const { container } = render(<ChatView events={[dispatched, brief, ...tools]} loading={false} ws={{} as never} workdir="/repo" sessionId="session-a" />);
+    const statuses = [...container.querySelectorAll('.task-pair-event-card')].map((card) => card.getAttribute('data-task-status'));
+    expect(statuses).toEqual(['working', null]);
+    expect(container.querySelector('.task-pair-chip--passed')).toBeNull();
+    expect(container.querySelector('.status-passed')).toBeNull();
   });
 
   it('cards audited PASS summaries and keeps task metadata in the expandable payload', () => {

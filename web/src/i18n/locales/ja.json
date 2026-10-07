@@ -4442,6 +4442,7 @@
     "card_auditor": "監査担当",
     "card_unassigned": "未割り当て",
     "card_unknown_status": "不明な状態",
+    "card_notice_status": "通知",
     "card_cancel_actor": "キャンセル実行者: {{value}}",
     "card_cancel_source": "キャンセル元: {{value}}",
     "card_cancel_reason": "キャンセル理由: {{value}}",
@@ -4477,6 +4478,7 @@
       "next_round": "次のラウンドを開始",
       "send": "資料送付",
       "import": "インポート",
+      "notice": "通知",
       "other": "記録"
     },
     "status": {
@@ -4485,7 +4487,7 @@
       "in_audit": "監査中",
       "awaiting_audit": "監査待ち",
       "rework": "差し戻し",
-      "passed": "合格",
+      "passed": "監査合格",
       "done": "完了",
       "cancelled": "キャンセル",
       "rework_round": "再作業 第{{round}}ラウンド",

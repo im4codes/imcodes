@@ -3,6 +3,7 @@ import { useEffect, useRef, useState } from 'preact/hooks';
 import { createPortal } from 'preact/compat';
 import { AUDIT_SEVERITY_LEVELS } from '@shared/audit-convergence.js';
 import {
+  TASK_PAIR_NOTICE_VERB,
   TASK_PAIR_STATUSES,
   TASK_PAIR_VERBS,
   TASK_PAIR_WORKSPACE_EFFECTS,
@@ -23,6 +24,7 @@ function isStatus(value: unknown): value is TaskPairStatus {
 }
 
 function verbKey(verb: unknown): string {
+  if (verb === TASK_PAIR_NOTICE_VERB) return 'notice';
   return typeof verb === 'string' && (TASK_PAIR_VERBS as readonly string[]).includes(verb) ? verb.toLowerCase() : 'other';
 }
 
@@ -90,7 +92,10 @@ export function TaskPairEventChip({ eventId, payload, timestamp, sessions }: { e
     ? event.cancelReason.trim()
     : t('taskPair.card_cancel_reason_unknown');
   const verb = t(`taskPair.verb.${verbKey(event.verb)}`);
-  const status = isStatus(event.toStatus) ? t(`taskPair.status.${event.toStatus}`) : t('taskPair.card_unknown_status');
+  // A notice that states no lifecycle shows a neutral badge, never a guessed status.
+  const status = isStatus(event.toStatus)
+    ? t(`taskPair.status.${event.toStatus}`)
+    : event.verb === TASK_PAIR_NOTICE_VERB ? t('taskPair.card_notice_status') : t('taskPair.card_unknown_status');
   const counts = event.severityCounts
     ? AUDIT_SEVERITY_LEVELS
       .filter((level) => (event.severityCounts?.[level] ?? 0) > 0)

@@ -3,6 +3,7 @@ import {
 } from './supervision-task-identity.js';
 import {
   scanTaskPairMarkers,
+  TASK_PAIR_NOTICE_VERB,
   TASK_PAIR_STATUSES,
   TASK_PAIR_VERBS,
   type TaskPairStatus,
@@ -49,7 +50,30 @@ function knownStatus(value: string | undefined): TaskPairStatus | undefined {
     : undefined;
 }
 
-function inferVerb(text: string, status: TaskPairStatus | undefined): TaskPairVerb {
+/**
+ * A bare lifecycle word that opens the notice body and is followed by nothing,
+ * a `status` field or a `key=value` attribute (`DISPATCH executor=x`,
+ * `QUEUE status queued`). Prose that merely starts with such a word
+ * (`DONE without a PASS is not complete`) is not a lifecycle statement.
+ */
+const LEADING_VERB_RE = /^\s*(?:[-*]\s*)?(PASS(?:ED)?|REWORK|QUEUED?|READY(?:_FOR_AUDIT)?|STARTED|WORKING|BLOCKED|NEEDS_INPUT|CANCEL(?:LED|ED)?|DONE|DISPATCH)\b(?=\s*(?:$|status\b|[A-Za-z_]+=))/imu;
+
+const LEADING_VERBS: Record<string, TaskPairVerb> = {
+  PASS: 'PASS', PASSED: 'PASS', REWORK: 'REWORK', QUEUE: 'QUEUE', QUEUED: 'QUEUE',
+  READY: 'READY_FOR_AUDIT', READY_FOR_AUDIT: 'READY_FOR_AUDIT', STARTED: 'STARTED', WORKING: 'WORKING',
+  BLOCKED: 'BLOCKED', NEEDS_INPUT: 'NEEDS_INPUT', CANCEL: 'CANCEL', CANCELLED: 'CANCEL', CANCELED: 'CANCEL',
+  DONE: 'DONE', DISPATCH: 'DISPATCH',
+};
+
+/**
+ * The lifecycle verb a text notice states, or undefined. Only explicit
+ * statements count: the daemon's `Audited pair <verb>` summary, a structured
+ * `status` field, the queue-dispatch phrase, or a leading bare verb. Words
+ * elsewhere in the body never count: the dispatched brief and every reminder
+ * quote the whole PASS/REWORK/DONE contract, and guessing from that showed an
+ * unaudited, still-running pair as "passed".
+ */
+function inferVerb(text: string, status: TaskPairStatus | undefined): TaskPairVerb | undefined {
   // A daemon PASS notice for a completed pair contains both lifecycle words
   // ("Audited pair done") and the auditor's verdict ("PASS"). The lifecycle
   // stage is authoritative; otherwise DONE would be downgraded to PASS.
@@ -61,26 +85,19 @@ function inferVerb(text: string, status: TaskPairStatus | undefined): TaskPairVe
   if (auditVerb === 'blocked' || auditVerb?.startsWith('needs')) return 'NEEDS_INPUT';
   if (auditVerb?.startsWith('cancel')) return 'CANCEL';
 
-  // A structured status is also stronger than incidental words in the
-  // explanatory body (for example `DONE status done ... verdict PASS`).
+  // A structured status is stronger than incidental words in the body.
   if (status === 'done') return 'DONE';
   if (status === 'passed') return 'PASS';
   if (status === 'rework') return 'REWORK';
   if (status === 'in_audit') return 'READY_FOR_AUDIT';
   if (status === 'cancelled') return 'CANCEL';
   if (status === 'queued') return 'QUEUE';
+  if (status === 'awaiting_brain_decision') return 'NEEDS_INPUT';
 
   if (QUEUE_DISPATCH_RE.test(text)) return 'DISPATCH';
-  if (/\bPASS(?:ED)?\b/iu.test(text)) return 'PASS';
-  if (/\bREWORK\b/iu.test(text)) return 'REWORK';
-  if (/\b(?:queued|queue)\b/iu.test(text)) return 'QUEUE';
-  if (/\bREADY(?:_FOR_AUDIT)?\b/iu.test(text)) return 'READY_FOR_AUDIT';
-  if (/\b(?:STARTED|WORKING)\b/iu.test(text)) return 'WORKING';
-  if (/\b(?:BLOCKED|NEEDS_INPUT|NEEDS YOUR DECISION|AWAITING)\b/iu.test(text)) return 'NEEDS_INPUT';
-  if (/\b(?:needs your decision|needs input|awaiting)\b/iu.test(text)) return 'NEEDS_INPUT';
-  if (/\b(?:CANCEL|cancelled|canceled)\b/iu.test(text)) return 'CANCEL';
-  if (/\bDONE\b/iu.test(text)) return 'DONE';
-  return 'DISPATCH';
+  if (status === 'working') return 'WORKING';
+  const leading = text.match(LEADING_VERB_RE)?.[1]?.toUpperCase();
+  return leading ? LEADING_VERBS[leading] : undefined;
 }
 
 function inferStatus(verb: TaskPairVerb, status: TaskPairStatus | undefined): TaskPairStatus | undefined {
@@ -238,6 +255,9 @@ export function taskPairNotificationKey(payload: Record<string, unknown>): strin
   if (!taskId) return undefined;
   const rawStatus = typeof payload.toStatus === 'string' ? payload.toStatus.trim().toLowerCase() : '';
   const rawVerb = typeof payload.verb === 'string' ? payload.verb.trim().toUpperCase() : '';
+  // A neutral notice states no lifecycle, so it is never merged with (or
+  // hidden behind) a lifecycle event of the same task.
+  if (rawVerb === TASK_PAIR_NOTICE_VERB && !rawStatus) return undefined;
   // Structured events normally carry toStatus while assistant notices often
   // only carry a verb. Normalize both forms to the same lifecycle identity so
   // cross-source delivery (for example DISPATCH + working) collapses safely.
@@ -315,8 +335,13 @@ export function parseTaskPairNotification(text: unknown): ParsedTaskPairNotifica
     ?? deriveSupervisionTaskTitleFromBrief(marker?.brief);
   const status = knownStatus(body.match(STATUS_RE)?.[1] ?? body.match(STATUS_RE)?.[2])
     ?? knownStatus(marker?.attrs.status);
-  const verb = marker?.knownVerb ?? inferVerb(body, status);
-  const effectiveStatus = inferStatus(verb, status ?? (QUEUE_DISPATCH_RE.test(body) ? 'working' : undefined));
+  const stated = marker?.knownVerb ?? inferVerb(body, status);
+  // No explicit lifecycle statement: a neutral notice that carries no status
+  // (an explicit `status` field, e.g. awaiting_audit, is still shown).
+  const verb: TaskPairVerb | typeof TASK_PAIR_NOTICE_VERB = stated ?? TASK_PAIR_NOTICE_VERB;
+  const effectiveStatus = stated
+    ? inferStatus(stated, status ?? (QUEUE_DISPATCH_RE.test(body) ? 'working' : undefined))
+    : status;
   const cancellationReason = effectiveStatus === 'cancelled'
     ? (body.match(WHY_RE)?.[1]?.trim() ?? (() => {
       const match = body.match(CANCEL_REASON_RE);
@@ -352,6 +377,6 @@ export function parseTaskPairNotification(text: unknown): ParsedTaskPairNotifica
   };
   // Keep unknown statuses as an ordinary notice with a safe card fallback;
   // known verbs are still constrained to the shared protocol vocabulary.
-  if (!TASK_PAIR_VERBS.includes(verb)) return undefined;
+  if (verb !== TASK_PAIR_NOTICE_VERB && !TASK_PAIR_VERBS.includes(verb)) return undefined;
   return { taskId, ...(title ? { title } : {}), payload, rawText: text };
 }

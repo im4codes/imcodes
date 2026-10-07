@@ -597,6 +597,22 @@ describe('task-pair state machine', () => {
     expect(apply(reported, BRAIN, '<!-- IMCODES_TASK DONE T42 -->').pair?.status).toBe('done');
   });
 
+  it('never moves an auditor=none pair to passed, whoever writes PASS and whatever the order', () => {
+    const none = run([[BRAIN, `<!-- IMCODES_TASK DISPATCH T44 executor=${EXEC} auditor=none -->`], ['daemon', '<!-- IMCODES_TASK DISPATCH T44 -->'], [EXEC, '<!-- IMCODES_TASK STARTED T44 -->']]).pair;
+    expect(none.status).toBe('working');
+    for (const writer of [EXEC, AUD, BRAIN, 'daemon']) {
+      const result = apply(none, writer, '<!-- IMCODES_TASK PASS T44 -->');
+      expect(result.pair?.status ?? none.status).toBe('working');
+      expect(result.toStatus).not.toBe('passed');
+    }
+    // READY then PASS (the sequence an audited pair would pass through) still cannot pass it.
+    const ready = apply(none, EXEC, '<!-- IMCODES_TASK READY_FOR_AUDIT T44 path=/workspace -->').pair ?? none;
+    for (const writer of [AUD, BRAIN]) {
+      expect(apply(ready, writer, '<!-- IMCODES_TASK PASS T44 -->').pair?.status ?? ready.status).not.toBe('passed');
+    }
+    expect(none.passRound).toBeUndefined();
+  });
+
   it('does not let an unrelated participant resume a no-auditor pair awaiting Brain', () => {
     const none = run([[BRAIN, `<!-- IMCODES_TASK DISPATCH T43 executor=${EXEC} auditor=none -->`]]).pair;
     const reported = apply(none, EXEC, '<!-- IMCODES_TASK DONE T43 -->').pair!;

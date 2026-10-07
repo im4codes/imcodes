@@ -4442,6 +4442,7 @@
     "card_auditor": "Аудитор",
     "card_unassigned": "Не назначен",
     "card_unknown_status": "Неизвестный статус",
+    "card_notice_status": "Уведомление",
     "card_cancel_actor": "Инициатор отмены: {{value}}",
     "card_cancel_source": "Источник отмены: {{value}}",
     "card_cancel_reason": "Причина отмены: {{value}}",
@@ -4477,6 +4478,7 @@
       "next_round": "открыт следующий раунд",
       "send": "материалы отправлены",
       "import": "импортирована",
+      "notice": "уведомление",
       "other": "записано"
     },
     "status": {
@@ -4485,7 +4487,7 @@
       "in_audit": "На аудите",
       "awaiting_audit": "Ждёт аудита",
       "rework": "Доработка",
-      "passed": "Принята",
+      "passed": "Аудит пройден",
       "done": "Готово",
       "cancelled": "Отменена",
       "rework_round": "Доработка, раунд {{round}}",

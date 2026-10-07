@@ -4442,6 +4442,7 @@
     "card_auditor": "감사자",
     "card_unassigned": "할당되지 않음",
     "card_unknown_status": "알 수 없는 상태",
+    "card_notice_status": "알림",
     "card_cancel_actor": "취소 실행자: {{value}}",
     "card_cancel_source": "취소 출처: {{value}}",
     "card_cancel_reason": "취소 사유: {{value}}",
@@ -4477,6 +4478,7 @@
       "next_round": "다음 라운드 시작",
       "send": "자료 전송",
       "import": "가져옴",
+      "notice": "알림",
       "other": "기록됨"
     },
     "status": {
@@ -4485,7 +4487,7 @@
       "in_audit": "감사 중",
       "awaiting_audit": "감사 대기",
       "rework": "재작업",
-      "passed": "통과",
+      "passed": "감사 통과",
       "done": "완료",
       "cancelled": "취소됨",
       "rework_round": "재작업 {{round}}차",

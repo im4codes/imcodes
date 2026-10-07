@@ -4443,6 +4443,7 @@
     "card_auditor": "审计者",
     "card_unassigned": "未分配",
     "card_unknown_status": "未知状态",
+    "card_notice_status": "通知",
     "card_cancel_actor": "取消发起者：{{value}}",
     "card_cancel_source": "取消来源：{{value}}",
     "card_cancel_reason": "取消原因：{{value}}",
@@ -4478,6 +4479,7 @@
       "next_round": "开启下一轮",
       "send": "已发送材料",
       "import": "已导入",
+      "notice": "通知",
       "other": "已记录"
     },
     "status": {
@@ -4486,7 +4488,7 @@
       "in_audit": "审计中",
       "awaiting_audit": "等待审计",
       "rework": "返工",
-      "passed": "已通过",
+      "passed": "审核通过",
       "done": "已完成",
       "cancelled": "已取消",
       "rework_round": "返工第{{round}}轮",

@@ -45,6 +45,13 @@ export const TASK_PAIR_CHECK_VERB = 'CHECK' as const;
 /** Durable event verb emitted by the structured MCP dispatch surface. */
 export const TASK_PAIR_MCP_DISPATCH_EVENT = 'PAIR_DISPATCH' as const;
 export const TASK_PAIR_MCP_DELIVERY_EVENT = 'PAIR_DELIVERY' as const;
+/**
+ * Verb of a daemon message card whose text names no lifecycle transition (the
+ * dispatched brief, reminders, handoffs...). It carries no status: a pair's
+ * status comes only from a structured event or an explicit marker/status field,
+ * never from words that merely occur in the message body.
+ */
+export const TASK_PAIR_NOTICE_VERB = 'NOTICE' as const;
 /** Brain-only: opens the next delivery round on a passed (not yet done) pair. */
 export const TASK_PAIR_NEXT_ROUND_VERB = 'NEXT_ROUND' as const;
 export const TASK_PAIR_CHECKLIST_AUTO_TICK_VERB = 'CHECKLIST_AUTO_TICK' as const;
