@@ -408,6 +408,29 @@ describe('remote desktop local panel', () => {
     } finally { fallback.dom.window.close(); }
   });
 
+  it('renders hundreds of connections quickly and does not rebuild the list (or steal focus) when nothing changed', async () => {
+    const many = Array.from({ length: 300 }, (_, index) => ({
+      id: `id-${index}`, label: String(index + 1), connectedAt: Date.now() - index * 1_000,
+      mode: index % 7 === 0 ? REMOTE_DESKTOP_ACCESS_MODE.CONTROL : REMOTE_DESKTOP_ACCESS_MODE.VIEW,
+    }));
+    const { dom, fetchClient } = await openPageInDom({ state: () => ({ connections: many }) });
+    try {
+      const started = Date.now();
+      await vi.waitFor(() => expect(dom.window.document.querySelectorAll('.conn')).toHaveLength(300));
+      expect(Date.now() - started).toBeLessThan(3_000);
+      expect(byId(dom, 'count').textContent).toBe('300');
+      expect(byId(dom, 'navBadge').className).toBe('badge ctl');
+      const first = dom.window.document.querySelector('.conn button') as HTMLButtonElement;
+      first.focus();
+      const polls = () => fetchClient.mock.calls.filter(([url]) => url === REMOTE_DESKTOP_LOCAL_MANAGEMENT.STATE_PATH).length;
+      const before = polls();
+      await vi.waitFor(() => expect(polls()).toBeGreaterThan(before), { timeout: 3_000 });
+      // The same state came back: the same elements are still there and the focused button still has focus.
+      expect(dom.window.document.querySelector('.conn button')).toBe(first);
+      expect(dom.window.document.activeElement).toBe(first);
+    } finally { dom.window.close(); }
+  });
+
   it('keeps one section visible at a time and marks the current one', async () => {
     const { dom } = await openPageInDom();
     try {
