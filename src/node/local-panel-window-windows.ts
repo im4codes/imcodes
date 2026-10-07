@@ -253,7 +253,11 @@ export function createWindowsLocalPanelWindowPlatform(overrides: Partial<Windows
     async launchNative(path) {
       // The user's session starts it and reports how it went (see launch_host): a host that dies at once is a failed attempt, so the chain
       // falls back to the browser window instead of leaving the user with nothing.
-      const answer = await deps.runOp({ kind: 'launch_host', path, ...(deps.expectedSha256(path) ? { sha256: deps.expectedSha256(path) as string } : {}) });
+      // The hash the manifest records is what the launch script re-checks the file against. The verification that just offered this path
+      // read the same manifest, so being unable to read it now means something changed underneath: do not start the file.
+      const sha256 = deps.expectedSha256(path);
+      if (!sha256) return false;
+      const answer = await deps.runOp({ kind: 'launch_host', path, sha256 });
       if (answer === 'exited:' + LOCAL_PANEL_WINDOWS_HOST.exitRuntimeMissing) { runtimePresent = false; runtimeMissing = true; }
       return answer === 'ok';
     },

@@ -353,8 +353,13 @@ describe('Windows adapter', () => {
     answer = 'ok';
     expect(await platform.nativeUiPath()).toBe(exePath);
     expect(ops.filter((op) => op.kind === 'webview2_runtime')).toHaveLength(2);
+    // no recorded hash to re-check against: the file is NOT started (fail closed), and no script runs at all
+    const before = ops.length;
+    const noHash = createWindowsLocalPanelWindowPlatform({ env: { USERNAME: 'alice' }, tasklist: async () => '', exists: () => true, nativeUiPath: async () => exePath, expectedSha256: () => undefined, runOp: async (op) => { ops.push(op as unknown as Record<string, unknown>); return 'ok'; } });
+    expect(await noHash.launchNative(exePath)).toBe(false);
+    expect(ops.length).toBe(before);
     // unreadable answers (a timed-out user session) are not "started"
-    expect(await createWindowsLocalPanelWindowPlatform({ env: {}, tasklist: async () => '', exists: () => true, nativeUiPath: async () => exePath, expectedSha256: () => undefined, runOp: async () => undefined }).launchNative(exePath)).toBe(false);
+    expect(await createWindowsLocalPanelWindowPlatform({ env: {}, tasklist: async () => '', exists: () => true, nativeUiPath: async () => exePath, expectedSha256: () => sha, runOp: async () => undefined }).launchNative(exePath)).toBe(false);
   });
 
   it('the launch script re-hashes the file against the manifest right before starting it, waits for an early exit, and only ever starts the path it was given as data', () => {

@@ -203,6 +203,8 @@ const SETTLED: ReadonlySet<AideskLocalUiRefreshReason> = new Set([
 export const AIDESK_LOCAL_UI_REFRESH_SCHEDULE = Object.freeze({
   /** After the node started: never in the way of startup. */
   initialDelayMs: 90_000,
+  /** The first check is moved by up to this much either way, so a fleet restarted together does not ask the server at the same moment. */
+  initialJitterMs: 30_000,
   /** A settled outcome (updated, current, nothing published) is re-checked this often. */
   settledIntervalMs: 6 * 60 * 60 * 1000,
   /** A failure retries after this and doubles each time, up to the settled interval: no tight loops, no restarts. */
@@ -219,7 +221,7 @@ export function nextAideskLocalUiRefreshDelayMs(reason: AideskLocalUiRefreshReas
 /** Starts the periodic refresh (Windows x64 only; elsewhere it does nothing). Returns the function that stops it. */
 export function startAideskLocalUiSidecarRefresh(
   deps: AideskLocalUiRefreshDeps,
-  options: { refresh?: typeof refreshAideskLocalUiSidecar; schedule?: (callback: () => void, ms: number) => { unref?: () => void }; clear?: (handle: unknown) => void } = {},
+  options: { refresh?: typeof refreshAideskLocalUiSidecar; schedule?: (callback: () => void, ms: number) => { unref?: () => void }; clear?: (handle: unknown) => void; random?: () => number } = {},
 ): () => void {
   const platform = deps.platform ?? process.platform;
   const arch = deps.arch ?? process.arch;
@@ -249,6 +251,7 @@ export function startAideskLocalUiSidecarRefresh(
     failures = SETTLED.has(reason) ? 0 : failures + 1;
     arm(nextAideskLocalUiRefreshDelayMs(reason, failures));
   };
-  arm(AIDESK_LOCAL_UI_REFRESH_SCHEDULE.initialDelayMs);
+  const random = options.random ?? Math.random;
+  arm(AIDESK_LOCAL_UI_REFRESH_SCHEDULE.initialDelayMs + Math.round((random() * 2 - 1) * AIDESK_LOCAL_UI_REFRESH_SCHEDULE.initialJitterMs));
   return () => { stopped = true; if (handle) clear(handle); };
 }

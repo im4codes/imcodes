@@ -242,14 +242,22 @@ describe('the refresh schedule', () => {
       return next === 'fail' ? { updated: false, reason: 'download_failed' as const } : { updated: true, reason: 'updated' as const };
     };
     const deps = { credential: { serverId: 's', token: 't', serverUrl: 'https://example.test' }, platform: 'win32' as NodeJS.Platform, arch: 'x64' };
-    const stop = startAideskLocalUiSidecarRefresh(deps, { refresh: refresh as never, schedule, clear: (handle) => cleared.push(handle) });
-    expect(armed.map((entry) => entry.ms)).toEqual([AIDESK_LOCAL_UI_REFRESH_SCHEDULE.initialDelayMs]);
+    const stop = startAideskLocalUiSidecarRefresh(deps, { refresh: refresh as never, schedule, clear: (handle) => cleared.push(handle), random: () => 0.5 });
+    expect(armed.map((entry) => entry.ms)).toEqual([AIDESK_LOCAL_UI_REFRESH_SCHEDULE.initialDelayMs]); // random() = 0.5 => no jitter
     armed[0]!.run(); await new Promise((r) => setTimeout(r, 0));
     armed[1]!.run(); await new Promise((r) => setTimeout(r, 0));
     armed[2]!.run(); await new Promise((r) => setTimeout(r, 0));
     expect(armed.map((entry) => entry.ms / 60_000)).toEqual([1.5, 15, 30, 360]); // throw -> 15, second failure -> 30, success -> 6 h
     stop();
     expect(cleared.length).toBe(1);
+    // the first check is moved by at most +-30 s around the base delay, so a fleet restarted together spreads out
+    const firstDelays: number[] = [];
+    for (const random of [0, 0.25, 0.5, 1]) {
+      const spread: number[] = [];
+      startAideskLocalUiSidecarRefresh(deps, { refresh: refresh as never, schedule: (_run, ms) => { spread.push(ms); return { unref() {} }; }, random: () => random })();
+      firstDelays.push(spread[0]!);
+    }
+    expect(firstDelays).toEqual([60_000, 75_000, 90_000, 120_000]);
     const other = startAideskLocalUiSidecarRefresh({ ...deps, platform: 'linux' }, { refresh: refresh as never, schedule });
     expect(armed.length).toBe(4); // nothing armed for another platform
     other();
