@@ -58,4 +58,58 @@ describe('macOS raw (libvpx) video path wiring', () => {
     // Installed once in Open, cleared in both teardown paths (Close and CloseLocked).
     expect(transport.match(/raw_video\(\)->SetSink\(nullptr\)/g)?.length).toBe(2);
   });
+
+  describe('libwebrtc side (VP9/VP8 offer, answer order, rate and byte taps)', () => {
+    const factory = transport.slice(
+      transport.indexOf('class PassthroughH264EncoderFactory'),
+      transport.indexOf('// One negotiation attempt, shared by the three upstream observers.'),
+    );
+    const tap = transport.slice(
+      transport.indexOf('class RawCodecEncoder final'),
+      transport.indexOf('class PassthroughH264EncoderFactory'),
+    );
+
+    it('offers VP9/VP8 only on a Mac that may send them; every other Mac still offers exactly H.264', () => {
+      expect(factory).toMatch(/if \(!raw_codecs_allowed\(\)\) return \{h264\};/);
+      expect(factory).toContain('return {webrtc::SdpVideoFormat::VP9Profile0(), webrtc::SdpVideoFormat::VP8(),\n            h264};');
+      expect(factory).toContain('binder_->raw_video()->raw_codecs_allowed()');
+      // The libvpx encoders are only created inside the allowed branch; the default is the passthrough.
+      const create = factory.slice(factory.indexOf('Create('));
+      expect(create.indexOf('if (raw_codecs_allowed())')).toBeLessThan(create.indexOf('CreateVp9Encoder'));
+      expect(create.indexOf('CreateVp8Encoder')).toBeLessThan(create.lastIndexOf('std::make_unique<PassthroughH264Encoder>'));
+    });
+
+    it('reports the network target to the session after upstream applied it, and counts encoded bytes', () => {
+      const setRates = tap.slice(tap.indexOf('void SetRates('), tap.indexOf('void OnPacketLossRateUpdate'));
+      expect(setRates.indexOf('inner_->SetRates(parameters)')).toBeGreaterThanOrEqual(0);
+      expect(setRates.indexOf('inner_->SetRates(parameters)')).toBeLessThan(setRates.indexOf('adapter_->ReportQualityTarget('));
+      expect(setRates).toContain('parameters.bitrate.get_sum_bps()');
+      expect(tap).toContain('raw->AddAcceptedBytes(encoded_image.size())');
+      // Every other call is forwarded untouched, so libwebrtc keeps owning the encode.
+      for (const call of ['inner_->Encode(frame, frame_types)', 'inner_->Release()', 'inner_->OnRttUpdate(rtt_ms)',
+        'inner_->OnPacketLossRateUpdate(packet_loss_rate)', 'inner_->GetEncoderInfo()', 'downstream->OnFrameDropped(']) {
+        expect(tap).toContain(call);
+      }
+    });
+
+    it('sets the answer order only for a raw-capable Mac, and records the codec before the stream can start', () => {
+      expect(transport).toMatch(/if \(raw->raw_codecs_allowed\(\) && factory_ != nullptr\) \{\s*state->prepare_answer =/);
+      expect(transport).toContain('raw->SetNegotiatedCodec(ParseAnsweredVideoCodec(answer))');
+      const remote = transport.slice(transport.indexOf('class SetRemoteObserver'));
+      expect(remote.indexOf('prepare_answer(*peer)')).toBeLessThan(remote.indexOf('peer->CreateAnswer('));
+      const answer = transport.slice(transport.indexOf('class CreateAnswerObserver'), transport.indexOf('class SetRemoteObserver'));
+      expect(answer.indexOf('on_answer(serialized)')).toBeGreaterThanOrEqual(0);
+      expect(answer.indexOf('on_answer(serialized)')).toBeLessThan(answer.indexOf('peer->SetLocalDescription('));
+    });
+
+    it('answers VP9, VP8, H.264 then the utility codecs, and survives a refused preference', () => {
+      const helper = transport.slice(transport.indexOf('void ApplyRawCodecAnswerOrder'), transport.indexOf('// Upper bound on one negotiation.'));
+      expect(helper).toContain('GetRtpSenderCapabilities(webrtc::MediaType::VIDEO)');
+      expect(helper).toContain('SortByAnswerPreference(');
+      expect(helper).toContain('transceiver->SetCodecPreferences(codecs).ok()');
+      // A refusal is logged and negotiation continues in the offer's order (H.264 first).
+      expect(helper).toContain('macos_remote_desktop_transport_codec_preferences_refused');
+      expect(helper).not.toMatch(/return false|Fail\(/);
+    });
+  });
 });
