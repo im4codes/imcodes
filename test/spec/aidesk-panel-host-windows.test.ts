@@ -81,6 +81,13 @@ describe('Windows panel window host source', () => {
     expect(host).toContain('PostQuitMessage(0)');
   });
 
+  it('keeps a small event log (names and HRESULTs only, no URLs) next to its profile, because the node cannot see why a window did not appear', () => {
+    expect(host).toContain('host.log');
+    expect(host).toContain('kMaxLogBytes');
+    for (const event of ['starting', 'environment_created', 'controller_created', 'runtime_missing', 'window_closed']) expect(host).toContain(`Log("${event}"`);
+    expect(host.match(/Log\("[a-z_]+"/gu)?.every((call) => !/uri|url/iu.test(call))).toBe(true);
+  });
+
   it('keeps its profile per user inside aiDesk\'s own directory, never the browser\'s', () => {
     expect(host).toContain('FOLDERID_LocalAppData');
     expect(host).toContain('L"\\\\IM.codes"');

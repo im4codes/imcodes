@@ -97,6 +97,32 @@ Interface* MakeHandler(Callable fn) {
   return new Handler<Interface, Args...>(std::function<HRESULT(Args...)>(std::move(fn)));
 }
 
+// A one-line-per-event log next to the web view's profile (%LOCALAPPDATA%\IM.codes\local-panel\host.log), because the node starts this
+// process in the user's session and cannot see why a window did not appear. Only event names and HRESULTs: no URLs, no page content.
+// Kept small: when it grows past kMaxLogBytes it starts over.
+constexpr DWORD kMaxLogBytes = 64 * 1024;
+std::wstring g_log_path;
+
+void Log(const char* event, HRESULT result = S_OK) {
+  if (g_log_path.empty()) return;
+  HANDLE file = CreateFileW(g_log_path.c_str(), FILE_APPEND_DATA | GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS,
+                            FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (file == INVALID_HANDLE_VALUE) return;
+  if (GetFileSize(file, nullptr) > kMaxLogBytes) {
+    CloseHandle(file);
+    file = CreateFileW(g_log_path.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) return;
+  }
+  SYSTEMTIME now;
+  GetSystemTime(&now);
+  char line[160];
+  const int length = wsprintfA(line, "%04u-%02u-%02uT%02u:%02u:%02uZ pid=%lu %s hr=0x%08lx\r\n", now.wYear, now.wMonth, now.wDay, now.wHour,
+                               now.wMinute, now.wSecond, GetCurrentProcessId(), event, static_cast<unsigned long>(result));
+  DWORD written = 0;
+  if (length > 0) WriteFile(file, line, static_cast<DWORD>(length), &written, nullptr);
+  CloseHandle(file);
+}
+
 struct HostState {
   HWND window = nullptr;
   ICoreWebView2Controller* controller = nullptr;
@@ -167,7 +193,7 @@ void ConfigureView(ICoreWebView2* view) {
             LPWSTR uri = nullptr;
             const bool allowed = SUCCEEDED(args->get_Uri(&uri)) && IsPanelUri(uri);
             if (uri != nullptr) CoTaskMemFree(uri);
-            if (!allowed) args->put_Cancel(TRUE);
+            if (!allowed) { args->put_Cancel(TRUE); Log("navigation_refused"); }
             return S_OK;
           }),
       &token);
@@ -199,6 +225,7 @@ void ConfigureView(ICoreWebView2* view) {
 }
 
 HRESULT OnControllerCreated(HRESULT result, ICoreWebView2Controller* controller) {
+  Log("controller_created", result);
   if (FAILED(result) || controller == nullptr) {
     // Nothing to show: close, the node falls back to the browser window the next time.
     if (g_host.window != nullptr) PostMessageW(g_host.window, WM_CLOSE, 0, 0);
@@ -215,6 +242,7 @@ HRESULT OnControllerCreated(HRESULT result, ICoreWebView2Controller* controller)
 }
 
 HRESULT OnEnvironmentCreated(HRESULT result, ICoreWebView2Environment* environment) {
+  Log("environment_created", result);
   if (FAILED(result) || environment == nullptr) {
     if (g_host.window != nullptr) PostMessageW(g_host.window, WM_CLOSE, 0, 0);
     return result;
@@ -257,6 +285,7 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam, LPARAM lpa
       DestroyWindow(window);
       return 0;
     case WM_DESTROY:
+      Log("window_closed");
       KillTimer(window, kRetryTimer);
       if (g_host.controller != nullptr) { g_host.controller->Close(); g_host.controller->Release(); g_host.controller = nullptr; }
       if (g_host.view != nullptr) { g_host.view->Release(); g_host.view = nullptr; }
@@ -277,6 +306,7 @@ std::wstring UserDataFolder() {
     CreateDirectoryW(folder.c_str(), nullptr);
     folder += L"\\local-panel";
     CreateDirectoryW(folder.c_str(), nullptr);
+    g_log_path = folder + L"\\host.log";
     folder += L"\\webview2";
     CreateDirectoryW(folder.c_str(), nullptr);
   }
@@ -309,6 +339,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
   // No runtime, no window: exit at once with the code the node reads as "use the browser window".
   PWSTR runtime_version = nullptr;
   if (FAILED(GetAvailableCoreWebView2BrowserVersionString(nullptr, &runtime_version)) || runtime_version == nullptr) {
+    UserDataFolder();
+    Log("runtime_missing");
     return ids::kExitRuntimeMissing;
   }
   CoTaskMemFree(runtime_version);
@@ -341,10 +373,12 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
   Raise(g_host.window);
 
   const std::wstring user_data = UserDataFolder();
+  Log("starting");
   const HRESULT started = CreateCoreWebView2EnvironmentWithOptions(
       nullptr, user_data.empty() ? nullptr : user_data.c_str(), nullptr,
       MakeHandler<ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler, HRESULT, ICoreWebView2Environment*>(OnEnvironmentCreated));
   if (FAILED(started)) {
+    Log("environment_start_failed", started);
     DestroyWindow(g_host.window);
     return 1;
   }
