@@ -1,3 +1,5 @@
+import { fileKindSortKey } from './file-kind.js';
+
 /**
  * Sorting and quick name filtering for the file browser's directory listings.
  *
@@ -11,6 +13,8 @@ export const FILE_BROWSER_SORT_KEYS = {
   MODIFIED: 'modified',
   CREATED: 'created',
   SIZE: 'size',
+  /** By the kind's identity (see fileKindSortKey), so files of one kind are grouped. */
+  KIND: 'kind',
 } as const;
 export type FileBrowserSortKey = (typeof FILE_BROWSER_SORT_KEYS)[keyof typeof FILE_BROWSER_SORT_KEYS];
 export const FILE_BROWSER_SORT_KEY_LIST: readonly FileBrowserSortKey[] = Object.values(FILE_BROWSER_SORT_KEYS);
@@ -73,7 +77,7 @@ function finiteOrUndefined(value: unknown): number | undefined {
 }
 
 /** The value an entry is ordered by under `key`, or undefined when the entry has none. */
-export function fileBrowserSortValue(entry: FileBrowserSortable, key: Exclude<FileBrowserSortKey, 'name'>): number | undefined {
+export function fileBrowserSortValue(entry: FileBrowserSortable, key: Exclude<FileBrowserSortKey, 'name' | 'kind'>): number | undefined {
   switch (key) {
     case FILE_BROWSER_SORT_KEYS.MODIFIED: return finiteOrUndefined(entry.mtimeMs);
     case FILE_BROWSER_SORT_KEYS.CREATED: return finiteOrUndefined(entry.birthtimeMs);
@@ -88,7 +92,8 @@ export function fileBrowserSortValue(entry: FileBrowserSortable, key: Exclude<Fi
  * cannot report it, so those keys stay unavailable rather than sorting by 0.
  */
 export function isFileBrowserSortKeyAvailable(entries: readonly FileBrowserSortable[], key: FileBrowserSortKey): boolean {
-  if (key === FILE_BROWSER_SORT_KEYS.NAME) return true;
+  // The kind comes from the name, so it is never missing.
+  if (key === FILE_BROWSER_SORT_KEYS.NAME || key === FILE_BROWSER_SORT_KEYS.KIND) return true;
   return entries.some((entry) => fileBrowserSortValue(entry, key) !== undefined);
 }
 
@@ -114,6 +119,11 @@ function compareNames(a: string, b: string): number {
 export function compareFileBrowserEntries(a: FileBrowserSortable, b: FileBrowserSortable, sort: FileBrowserSortState): number {
   if (sort.dirsFirst && a.isDir !== b.isDir) return a.isDir ? -1 : 1;
   const sign = sort.direction === FILE_BROWSER_SORT_DIRECTIONS.DESC ? -1 : 1;
+  if (sort.key === FILE_BROWSER_SORT_KEYS.KIND) {
+    const byKind = compareNames(fileKindSortKey(a.name, a.isDir), fileKindSortKey(b.name, b.isDir));
+    // Equal kinds fall back to the name, ascending, as with the other keys.
+    return byKind !== 0 ? sign * byKind : compareNames(a.name, b.name);
+  }
   if (sort.key !== FILE_BROWSER_SORT_KEYS.NAME) {
     const left = fileBrowserSortValue(a, sort.key);
     const right = fileBrowserSortValue(b, sort.key);

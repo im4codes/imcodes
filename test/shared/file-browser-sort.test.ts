@@ -99,6 +99,21 @@ describe('file browser sort: metadata keys', () => {
   });
 });
 
+describe('file browser sort: kind', () => {
+  it('groups files of one kind together and orders each group by name', () => {
+    const entries = [file('b.pdf'), file('a.png'), file('a.pdf'), file('c.png'), file('notes.weird'), file('Makefile')];
+    expect(names(sortFileBrowserEntries(entries, sortBy('kind', 'asc')))).toEqual(['notes.weird', 'Makefile', 'a.pdf', 'b.pdf', 'a.png', 'c.png']);
+    expect(names(sortFileBrowserEntries(entries, sortBy('kind', 'desc')))).toEqual(['a.png', 'c.png', 'a.pdf', 'b.pdf', 'Makefile', 'notes.weird']);
+  });
+  it('is available for any listing, since it needs only the name', () => {
+    expect(isFileBrowserSortKeyAvailable([file('a')], FILE_BROWSER_SORT_KEYS.KIND)).toBe(true);
+    expect(isFileBrowserSortKeyAvailable([], FILE_BROWSER_SORT_KEYS.KIND)).toBe(true);
+  });
+  it('keeps directories first by default', () => {
+    expect(names(sortFileBrowserEntries([file('a.pdf'), dir('zdir')], sortBy('kind', 'asc')))).toEqual(['zdir', 'a.pdf']);
+  });
+});
+
 describe('file browser sort: availability and stored state', () => {
   it('a metadata key is unavailable when no entry carries it, the name key always is', () => {
     const plain = [file('a'), file('b')];
