@@ -67,6 +67,7 @@ import {
 import { defaultCredentialPath, defaultStagedExecutablePath, type ControlledNodeCredential } from './enrollment.js';
 import { buildPosixControlledNodeUpgradeScript } from './posix-upgrade-script.js';
 import { windowsUpgradeHealthWaitScript } from './upgrade-health-script.js';
+import { windowsManifestBackupScript, windowsManifestRestoreScript } from './upgrade-manifest-script.js';
 import { readUpgradeResult, reconcilePreviousUpgrade, removeStalePosixUpgradeFiles, type PreviousUpgradeFailure } from './upgrade-result.js';
 import { DAEMON_VERSION } from '../util/version.js';
 import { loadInstallJournal, INSTALL_JOURNAL_VERSION } from './install-journal.js';
@@ -1418,6 +1419,7 @@ export function buildWindowsControlledNodeUpgradeScript(input: {
     + `$mainBackedUp = $false\r\n`
     + `$mainPublished = $false\r\n`
     + `$manifestBackedUp = $false\r\n`
+    + `$rollbackManifestHash = ''\r\n`
     + `$manifestPublished = $false\r\n`
     + `$helperBackedUp = $false\r\n`
     + `$helperPublished = $false\r\n`
@@ -1476,7 +1478,7 @@ export function buildWindowsControlledNodeUpgradeScript(input: {
     + `$mainBackedUp = Test-Path -LiteralPath $backupDst\r\n`
     + `$mainPublished = $true\r\n`
     + `& $verifyReleaseArtifact $dst\r\n`
-    + `if ((Test-Path -LiteralPath $dstManifest) -and -not (Test-Path -LiteralPath $backupManifest)) { Copy-Item -Force -LiteralPath $dstManifest -Destination $backupManifest }\r\n`
+    + windowsManifestBackupScript()
     + `$pendingManifest = "$dstManifest.pending-$PID"; $manifestSwapBackup = "$dstManifest.swap-old-$PID"; Remove-Item -Force $manifestSwapBackup -ErrorAction SilentlyContinue; Copy-Item -Force -LiteralPath $srcManifest -Destination $pendingManifest; if (Test-Path -LiteralPath $dstManifest) { [IO.File]::Replace($pendingManifest, $dstManifest, $manifestSwapBackup, $true); Remove-Item -Force $manifestSwapBackup -ErrorAction SilentlyContinue } else { Move-Item -LiteralPath $pendingManifest -Destination $dstManifest }\r\n`
     + `if ((Get-FileHash -Algorithm SHA256 -LiteralPath $dstManifest).Hash.ToLowerInvariant() -cne $srcManifestHash) { throw 'controlled node published manifest hash mismatch' }\r\n`
     + `$manifestPublished = $true\r\n`
@@ -1517,7 +1519,7 @@ export function buildWindowsControlledNodeUpgradeScript(input: {
     + `$rollbackExecutableReleased = [bool](& $runRecovery 'stop_new_node' { Stop-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue; & $waitForNodeExecutableRelease; return $true })\r\n`
     + `if ($rollbackExecutableReleased) {\r\n`
     + `& $runRecovery 'restore_main' { if ($mainBackedUp -and (Test-Path $backupDst)) { if ((Get-FileHash -Algorithm SHA256 -LiteralPath $backupDst).Hash.ToLowerInvariant() -cne $rollbackMainHash) { throw 'controlled node rollback source hash mismatch' }; Copy-Item -Force $backupDst $dst; if ((Get-FileHash -Algorithm SHA256 -LiteralPath $dst).Hash.ToLowerInvariant() -cne $rollbackMainHash) { throw 'controlled node restored hash mismatch' } } elseif ($mainPublished) { Remove-Item -Force $dst -ErrorAction Stop } }\r\n`
-    + `& $runRecovery 'restore_manifest' { if ($manifestBackedUp -and (Test-Path $backupManifest)) { if ((Get-FileHash -Algorithm SHA256 -LiteralPath $backupManifest).Hash.ToLowerInvariant() -cne $currentManifestHash) { throw 'controlled node manifest rollback source hash mismatch' }; Copy-Item -Force $backupManifest $dstManifest; if ((Get-FileHash -Algorithm SHA256 -LiteralPath $dstManifest).Hash.ToLowerInvariant() -cne $currentManifestHash) { throw 'controlled node restored manifest hash mismatch' } } elseif ($manifestPublished) { Remove-Item -Force $dstManifest -ErrorAction Stop } }\r\n`
+    + windowsManifestRestoreScript()
     + (helperRollback ? `& $runRecovery 'restore_helper' { ${helperRollback.replaceAll('\r\n', '; ')} }\r\n` : '')
     + (remoteDesktopRollback ? `& $runRecovery 'restore_remote_desktop' { ${remoteDesktopRollback.replaceAll('\r\n', '; ')} }\r\n` : '')
     + (input.stagedRemoteDesktopWorkerDir
