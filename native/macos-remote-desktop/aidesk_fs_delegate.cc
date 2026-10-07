@@ -321,8 +321,17 @@ int RunFsDelegateRequest(const std::string& request_file, const Options& options
 int FsDelegateMain(int argc, char** argv) {
   if (!IsFsDelegateInvocation(argc, argv)) return 64;  // EX_USAGE
   Options options;
-  options.request_dir = std::string(kProductionRuntimeRoot) + "/" + std::to_string(static_cast<unsigned long>(getuid()));
+#ifdef IMCODES_FS_DELEGATE_TEST_RUNTIME_ROOT
+  // A compile-time constant that exists ONLY in a throw-away test build (scripts/build-aidesk-app.mjs never defines it; a test asserts
+  // that). It lets a scoped test app use its own trust tree instead of the default node's /private/var/run/imcodes-node. There is no
+  // environment variable or argument that moves the directory: a process of the same user could set those.
+  const std::string runtime_root = IMCODES_FS_DELEGATE_TEST_RUNTIME_ROOT;
+  options.trusted_chain_start = DirName(runtime_root);
+#else
+  const std::string runtime_root = kProductionRuntimeRoot;
   options.trusted_chain_start = "/private/var/run/imcodes-node";
+#endif
+  options.request_dir = runtime_root + "/" + std::to_string(static_cast<unsigned long>(getuid()));
   options.trusted_owner_uid = 0;
   options.now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
   std::string answer;

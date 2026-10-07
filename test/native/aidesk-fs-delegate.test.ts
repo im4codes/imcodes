@@ -273,4 +273,25 @@ describe('aidesk fs delegate: native constants mirror the shared protocol', () =
     expect(main.indexOf('IsFsDelegateInvocation(argc, argv)')).toBeLessThan(main.indexOf('IsMacosPermissionResponsibleApplication'));
     expect(readFileSync(resolve(SOURCE, '../../scripts/build-aidesk-app.mjs'), 'utf8')).toContain("join(source, 'aidesk_fs_delegate.cc')");
   });
+
+  it('has no way to move the request directory at run time: no getenv, no argument, no define in the shipped build', () => {
+    const source = readFileSync(join(SOURCE, 'aidesk_fs_delegate.cc'), 'utf8');
+    expect(source).not.toMatch(/\b(?:getenv|setenv|secure_getenv)\s*\(|\benviron\b/u);
+    // the only override is a compile-time constant, used by a throw-away test build and never by the packaging script
+    expect(source).toContain('IMCODES_FS_DELEGATE_TEST_RUNTIME_ROOT');
+    expect(readFileSync(resolve(SOURCE, '../../scripts/build-aidesk-app.mjs'), 'utf8')).not.toContain('IMCODES_FS_DELEGATE_TEST');
+    for (const file of ['aidesk_agent_main.mm']) {
+      expect(readFileSync(join(SOURCE, file), 'utf8')).not.toContain('IMCODES_FS_DELEGATE_TEST');
+    }
+  });
+
+  it.skipIf(!HAVE_COMPILER)('the test-only build (compile-time root) still compiles warning-free', () => {
+    const built = spawnSync('g++', [
+      '-std=c++20', '-Wall', '-Wextra', '-Werror', '-fsyntax-only',
+      '-DIMCODES_FS_DELEGATE_TEST_RUNTIME_ROOT="/private/var/run/imcodes-fsd-cc8-test/fs-delegate"',
+      `-I${SOURCE}`, join(SOURCE, 'aidesk_fs_delegate.cc'),
+    ], { encoding: 'utf8' });
+    expect(built.stderr).toBe('');
+    expect(built.status).toBe(0);
+  });
 });
