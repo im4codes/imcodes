@@ -22,7 +22,14 @@ import {
   AGENT_DELEGATION_REPLY_STATUSES,
   AGENT_DELEGATION_REPLY_TIMELINE_EVENT,
 } from '../../shared/agent-delegation.js';
-import { taskPairBindingId, type TaskPairState, type TaskPairStatus } from '../../shared/task-pair.js';
+import {
+  TASK_PAIR_ENDED_PAIR_NOTICE_REASONS,
+  taskPairBindingId,
+  taskPairNudgeReasonFromId,
+  type TaskPairState,
+  type TaskPairStatus,
+} from '../../shared/task-pair.js';
+import { taskPairMessageIdPrefix } from '../../src/daemon/task-pairs/delivery.js';
 
 const mocks = vi.hoisted(() => ({
   sessions: new Map<string, Record<string, unknown>>(),
@@ -322,6 +329,27 @@ describe('task-bound delegation replies across a daemon restart', () => {
     // Aggregate heartbeat notices do not bind to a pair row and remain
     // conservative/authorized.
     expect(resolveTransportQueueEntryAdmission(brain.sessionName, queued('__integration__'))).toBe('authorized');
+  });
+
+  it('keeps a queued Brain notice ABOUT an ended pair (workspace kept, output not copied): it is only ever sent after the pair ended', () => {
+    // 215: every `brain-workspace-kept` message waited in Brain's queue and was dropped here as "pair already
+    // ended" (60 drops in 3 days) while the timeline had already shown it -- Brain never saw one.
+    mocks.sessions.set(brain.sessionName, { name: brain.sessionName, projectName: PROJECT });
+    pairs.savePair(PROJECT, pairState('tsk_kept_done', 'done'));
+    pairs.savePair(PROJECT, pairState('tsk_kept_cancelled', 'cancelled'));
+    for (const taskId of ['tsk_kept_done', 'tsk_kept_cancelled']) {
+      for (const reason of TASK_PAIR_ENDED_PAIR_NOTICE_REASONS) {
+        // The id exactly as the sender builds it (same prefix, same reason segment).
+        const id = `${taskPairMessageIdPrefix(taskId, reason)}uuid-1`;
+        expect(resolveTransportQueueEntryAdmission(brain.sessionName, { commandId: id, clientMessageId: id, text: 'notice' }), `${taskId} ${reason}`).toBe('authorized');
+      }
+      // The class stays narrow: a nudge to a participant of the same ended pair is still dropped.
+      const nudge = `${taskPairMessageIdPrefix(taskId, 'nudge-executor')}uuid-2`;
+      expect(resolveTransportQueueEntryAdmission(brain.sessionName, { commandId: nudge, clientMessageId: nudge, text: 'keep going' })).toBe('stale');
+    }
+    expect(taskPairNudgeReasonFromId(`${taskPairMessageIdPrefix('T1', 'brain-workspace-kept')}x`)).toBe('brain-workspace-kept');
+    expect(taskPairNudgeReasonFromId(`${taskPairMessageIdPrefix('T1', 'nudge-executor', 'round 2')}x`)).toBe('nudge-executor');
+    expect(taskPairNudgeReasonFromId('client-1')).toBeUndefined();
   });
 
   it('drops a queued aggregate integration reminder after every listed pair is integrated or dismissed', () => {

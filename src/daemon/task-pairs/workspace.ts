@@ -397,6 +397,26 @@ export async function provisionTaskPairWorkspace(
   };
 }
 
+/** Read-only facts about a kept worktree, for the notice Brain judges it by. Every field is best effort. */
+export async function describeKeptTaskPairWorkspace(
+  pair: TaskPairState,
+  deps: TaskPairWorkspaceDeps = testDeps ?? {},
+): Promise<{ unintegratedCommits?: number; lastCommit?: string }> {
+  const workspace = pair.workspace;
+  if (!workspace || workspace.kind !== 'worktree') return {};
+  const [unintegratedCommits, lastCommit] = await Promise.all([
+    workspace.base
+      ? Promise.resolve((deps.countCommitsNotInAnyBranch ?? deps.countCommitsNotInDev ?? countTaskPairCommitsNotInAnyBranch)(workspace.path, workspace.base)).catch(() => undefined)
+      : Promise.resolve(undefined),
+    new Promise<string | undefined>((resolvePromise) => execFile(
+      'git', ['-C', workspace.path, 'log', '-1', '--format=%h %s'], { timeout: GIT_PROBE_TIMEOUT_MS },
+      // eslint-disable-next-line no-control-regex -- a commit subject is untrusted text going into a message
+      (error, stdout) => resolvePromise(error ? undefined : stdout.replace(/[\u0000-\u001f\u007f]/g, ' ').trim().slice(0, 120) || undefined),
+    )),
+  ]);
+  return { ...(unintegratedCommits !== undefined ? { unintegratedCommits } : {}), ...(lastCommit ? { lastCommit } : {}) };
+}
+
 /**
  * Remove the pair's workspace (its retention elapsed). A task directory always
  * goes; a worktree is kept while that would lose work.

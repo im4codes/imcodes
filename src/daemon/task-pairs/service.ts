@@ -34,6 +34,15 @@ import {
   TASK_PAIR_WORKSPACE_REPAIR_STATUSES,
   TASK_PAIR_WORKSPACE_EVENT_VERB,
   TASK_PAIR_WORKSPACE_RETENTION_MS,
+  TASK_PAIR_WORKSPACE_KEPT_DIGEST_INTERVAL_MS,
+  TASK_PAIR_WORKSPACE_KEPT_DIGEST_MAX_LISTED,
+  TASK_PAIR_WORKSPACE_KEPT_DIGEST_REASON,
+  TASK_PAIR_WORKSPACE_KEPT_DIGEST_TASK_ID,
+  TASK_PAIR_WORKSPACE_KEPT_MAX_OUTSTANDING,
+  TASK_PAIR_WORKSPACE_KEPT_MAX_PER_SWEEP,
+  TASK_PAIR_WORKSPACE_KEPT_NOTICE_VERSION,
+  TASK_PAIR_WORKSPACE_KEPT_REASON,
+  taskPairWorkspaceKeptDigestMetaKey,
   TASK_PAIR_TERMINAL_FLUSH_FIELD,
   isComplexSupervisionTaskBrief,
   applyTaskPairMarker,
@@ -68,7 +77,7 @@ import { resolveTaskPairMaterial, verifyTaskPairRoundBase } from './material.js'
 import { formatPossibleSilentRevertWarning, inspectPossibleSilentRevert, isRewrittenHead } from './rebase-revert-guard.js';
 import { applyBackCow, hasUnfinishedApplyBack, rollbackApplyBack, undoApplyBack } from './non-git.js';
 import { mergePairIntoProject } from './git-init.js';
-import { copyTaskPairOutput, gitBranch as gitBranchOf, listTaskPairSiblingWorktrees, provisionTaskPairWorkspace, releaseTaskPairWorkspace, rehomeTaskPairWorkspace, type TaskPairWorkspaceRevisionSource } from './workspace.js';
+import { copyTaskPairOutput, describeKeptTaskPairWorkspace, gitBranch as gitBranchOf, listTaskPairSiblingWorktrees, provisionTaskPairWorkspace, releaseTaskPairWorkspace, rehomeTaskPairWorkspace, type TaskPairWorkspaceRevisionSource } from './workspace.js';
 import { clearTaskPairProviderError, noteTaskPairProviderError } from './provider-errors.js';
 import {
   classifyDiskLevel, diskLevelRank, isDiskLevel, readWorktreeVolumeSpace, stripHeavyIgnoredDirs, stripHeavyNamedDirs, taskPairHygieneDeps,
@@ -84,6 +93,7 @@ import {
   buildExecutorPairBrief,
   buildOutputFailedLine,
   buildWorkspaceDuplicateNotice,
+  buildWorkspaceKeptDigestLine,
   buildWorkspaceKeptLine,
   buildWorkspaceMoveFailedLine,
   buildWorkspaceMovedNotice,
@@ -2025,35 +2035,90 @@ export class TaskPairService {
 
   #lastSweepAt = 0;
 
+  /** The retention event itself, so a restart cannot re-arm a delivered notice and a later pair/retention event cannot inherit its suppression. */
+  #workspaceKeptKey(pair: TaskPairState, reason: string): string {
+    const workspace = pair.workspace!;
+    return `${workspace.path}\u0000${workspace.endedAt ?? pair.updatedAt}\u0000${reason}\u0000${TASK_PAIR_WORKSPACE_KEPT_NOTICE_VERSION}`;
+  }
+
+  /** Has this kept workspace still to be announced (never delivered, attempts left, retry interval over)? */
+  #workspaceKeptNoticeDue(project: string, pair: TaskPairState, now: number, reason: string): boolean {
+    if (!pair.workspace) return false;
+    const current = getTaskPairStore().getPair(project, pair.taskId);
+    if (!current) return false;
+    const previous = current.liveness;
+    const same = previous.workspaceKeptReminderKey === this.#workspaceKeptKey(pair, reason);
+    if (same && previous.workspaceKeptReminderDeliveredAt !== undefined) return false;
+    if ((same ? (previous.workspaceKeptReminderCount ?? 0) : 0) >= TASK_PAIR_WORKSPACE_KEPT_REMINDER_MAX_ATTEMPTS) return false;
+    return !(same && previous.workspaceKeptReminderLastAt !== undefined
+      && now - previous.workspaceKeptReminderLastAt < TASK_PAIR_WORKSPACE_KEPT_REMINDER_RETRY_MS);
+  }
+
   /**
-   * Deliver a retained-workspace notice once, with bounded retry when the
-   * Brain was offline/unreadable.  The key is the retention event itself, so
-   * a restart cannot re-arm a successful notice and a later pair/retention
-   * event cannot inherit an old suppression watermark.
+   * Deliver one retained-workspace notice, with bounded retry when the Brain was offline/unreadable. What to do with
+   * the workspace is Brain's judgement for this task: the message carries what it needs and lists the options.
    */
   async #notifyWorkspaceKept(project: string, pair: TaskPairState, now: number, reason: string): Promise<void> {
-    const workspace = pair.workspace;
-    if (!workspace) return;
+    if (!this.#workspaceKeptNoticeDue(project, pair, now, reason)) return;
     const store = getTaskPairStore();
-    const current = store.getPair(project, pair.taskId);
-    if (!current) return;
-    const key = `${workspace.path}\u0000${workspace.endedAt ?? pair.updatedAt}\u0000${reason}`;
-    const previous = current.liveness;
+    const previous = store.getPair(project, pair.taskId)!.liveness;
+    const key = this.#workspaceKeptKey(pair, reason);
     const same = previous.workspaceKeptReminderKey === key;
-    if (same && previous.workspaceKeptReminderDeliveredAt !== undefined) return;
     const count = same ? (previous.workspaceKeptReminderCount ?? 0) : 0;
-    if (count >= TASK_PAIR_WORKSPACE_KEPT_REMINDER_MAX_ATTEMPTS) return;
-    if (same && previous.workspaceKeptReminderLastAt !== undefined
-      && now - previous.workspaceKeptReminderLastAt < TASK_PAIR_WORKSPACE_KEPT_REMINDER_RETRY_MS) return;
-    const result = await sendTaskPairMessage(pair.brain, pair.taskId, 'brain-workspace-kept', buildWorkspaceKeptLine(pair, reason));
+    const detail = await describeKeptTaskPairWorkspace(pair).catch(() => ({}));
+    const result = await sendTaskPairMessage(pair.brain, pair.taskId, TASK_PAIR_WORKSPACE_KEPT_REASON, buildWorkspaceKeptLine(pair, reason, { now, ...detail }));
     const delivered = result === 'sent' || result === 'queued' || result === 'skipped_pending';
     store.saveLiveness(project, pair.taskId, {
-      ...previous,
+      ...store.getPair(project, pair.taskId)?.liveness ?? previous,
       workspaceKeptReminderKey: key,
       workspaceKeptReminderCount: count + 1,
       workspaceKeptReminderLastAt: now,
       ...(delivered ? { workspaceKeptReminderDeliveredAt: now } : { workspaceKeptReminderDeliveredAt: undefined }),
     });
+  }
+
+  /**
+   * Announce the workspaces this sweep kept, without flooding Brain. Each is a decision for Brain, so each keeps its
+   * own message -- but a sweep sends a Brain at most MAX_PER_SWEEP of them, and none while MAX_OUTSTANDING announced
+   * ones are still open (a Brain that has not acted on those is not given more). The rest wait for later sweeps and
+   * are summarised in one message, at most once a day.
+   */
+  async #announceKeptWorkspaces(kept: ReadonlyArray<{ project: string; pair: TaskPairState; reason: string }>, now: number): Promise<void> {
+    if (kept.length === 0) return;
+    const store = getTaskPairStore();
+    const groups = new Map<string, { project: string; brain: string; items: Array<{ pair: TaskPairState; reason: string }> }>();
+    for (const entry of kept) {
+      if (!this.#workspaceKeptNoticeDue(entry.project, entry.pair, now, entry.reason)) continue;
+      const key = `${entry.project}\u0000${entry.pair.brain}`;
+      const group = groups.get(key) ?? { project: entry.project, brain: entry.pair.brain, items: [] };
+      group.items.push({ pair: entry.pair, reason: entry.reason });
+      groups.set(key, group);
+    }
+    const endedAt = (pair: TaskPairState): number => pair.workspace?.endedAt ?? pair.updatedAt;
+    for (const group of groups.values()) {
+      const open = store.listEndedWorkspacePairs().filter((stored) => {
+        const workspace = stored.state.workspace;
+        return stored.project === group.project && stored.state.brain === group.brain && workspace?.status === 'kept'
+          && stored.liveness.workspaceKeptReminderDeliveredAt !== undefined
+          && stored.liveness.workspaceKeptReminderKey?.endsWith(`\u0000${TASK_PAIR_WORKSPACE_KEPT_NOTICE_VERSION}`) === true;
+      });
+      const allowance = Math.max(0, Math.min(TASK_PAIR_WORKSPACE_KEPT_MAX_PER_SWEEP, TASK_PAIR_WORKSPACE_KEPT_MAX_OUTSTANDING - open.length));
+      const due = group.items.sort((a, b) => endedAt(a.pair) - endedAt(b.pair));
+      for (const item of due.slice(0, allowance)) await this.#notifyWorkspaceKept(group.project, item.pair, now, item.reason);
+      const deferred = due.slice(allowance);
+      if (deferred.length === 0) continue;
+      const metaKey = taskPairWorkspaceKeptDigestMetaKey(group.project, group.brain);
+      const last = Number(store.getMeta(metaKey));
+      if (Number.isFinite(last) && last > 0 && now - last < TASK_PAIR_WORKSPACE_KEPT_DIGEST_INTERVAL_MS) continue;
+      const result = await sendTaskPairMessage(group.brain, TASK_PAIR_WORKSPACE_KEPT_DIGEST_TASK_ID, TASK_PAIR_WORKSPACE_KEPT_DIGEST_REASON, buildWorkspaceKeptDigestLine({
+        deferred: deferred.map((item) => ({
+          taskId: item.pair.taskId, title: item.pair.title, reason: item.reason, endedDays: Math.max(0, Math.floor((now - endedAt(item.pair)) / (24 * 60 * 60_000))),
+        })),
+        announcedOpen: open.map((stored) => ({ taskId: stored.state.taskId, title: stored.state.title })),
+        maxListed: TASK_PAIR_WORKSPACE_KEPT_DIGEST_MAX_LISTED,
+      }));
+      if (result === 'sent' || result === 'queued' || result === 'skipped_pending') store.setMeta(metaKey, String(now));
+    }
   }
 
   /**
@@ -2070,6 +2135,7 @@ export class TaskPairService {
     // interrupted by a restart, are stripped now -- in the background: a
     // backlog of large trees must not hold the heartbeat.
     this.#stripBacklogInBackground();
+    const keptThisSweep: Array<{ project: string; pair: TaskPairState; reason: string }> = [];
     for (const stored of store.listEndedWorkspacePairs()) {
       const pair = stored.state;
       const workspace = pair.workspace;
@@ -2106,10 +2172,15 @@ export class TaskPairService {
           const { getSupervisionTaskRegistry } = await import('../supervision-state-store.js');
           getSupervisionTaskRegistry().requestWorktreeGc(stored.project);
         }
-        if (released.action === 'kept') await this.#notifyWorkspaceKept(stored.project, next, now, released.reason);
+        if (released.action === 'kept') keptThisSweep.push({ project: stored.project, pair: next, reason: released.reason });
       } catch (error) {
         logger.warn({ err: error, taskId: pair.taskId }, 'task-pair: workspace sweep failed');
       }
+    }
+    try {
+      await this.#announceKeptWorkspaces(keptThisSweep, now);
+    } catch (error) {
+      logger.warn({ err: error }, 'task-pair: kept-workspace announcement failed');
     }
   }
 

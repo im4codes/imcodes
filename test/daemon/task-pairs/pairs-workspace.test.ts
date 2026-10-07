@@ -387,7 +387,7 @@ describe('pair workspaces', () => {
     expect(pair('K2').workspace).toMatchObject({ status: 'kept', keptReason: 'unpushed' });
     expect(existsSync(join(dirtyPath, 'wip.txt'))).toBe(true);
     await vi.waitFor(() => expect(sentTo(BRAIN, 'brain-workspace-kept')).toHaveLength(2));
-    expect(sentTo(BRAIN, 'brain-workspace-kept').map((entry) => entry.text).join('\n')).toContain('has untracked files, so it was kept instead of deleted');
+    expect(sentTo(BRAIN, 'brain-workspace-kept').map((entry) => entry.text).join('\n')).toContain('has untracked files, so the daemon kept it instead of deleting it');
     // A later sweep retries silently.
     await taskPairService.sweepWorkspaces(at + TASK_PAIR_WORKSPACE_RETENTION_MS + MINUTE, { force: true });
     expect(sentTo(BRAIN, 'brain-workspace-kept')).toHaveLength(2);
@@ -410,6 +410,94 @@ describe('pair workspaces', () => {
     expect(after.deleted, JSON.stringify(after.entries)).toBe(2);
     expect(existsSync(join(dirtyPath, '..'))).toBe(false);
     expect(existsSync(join(unpushedPath, '..'))).toBe(false);
+  });
+
+  it('a backlog of kept workspaces reaches Brain a few at a time, stops while Brain has too many open, and is summarised once a day', async () => {
+    // 215: 31 workspaces were kept at once and every notice was sent in one go. Each is Brain's own decision, so each
+    // keeps its own message -- but a sweep sends at most K, none while MAX_OUTSTANDING are still open, plus one summary/day.
+    const OTHER_BRAIN = 'deck_wtproj_other_brain';
+    const ids = Array.from({ length: 8 }, (_, index) => `B${index + 1}`);
+    const worktrees = new Map<string, string>();
+    for (const id of ids) {
+      const path = await opened(id);
+      worktrees.set(id, path);
+      writeFileSync(join(path, `${id}.txt`), `${id}\n`);
+      git(path, 'add', '-A');
+      git(path, '-c', 'user.email=t@e.invalid', '-c', 'user.name=T', 'commit', '-qm', `feature ${id}`);
+      marker(BRAIN, `<!-- IMCODES_TASK DONE ${id} force=true -->`);
+      await endedAt(id);
+    }
+    // One pair belongs to ANOTHER Brain (another project's pair in the same daemon): its budget is its own.
+    getTaskPairStore().savePair(PROJECT, { ...pair('B8'), brain: OTHER_BRAIN });
+    const at = Math.max(...await Promise.all(ids.map((id) => endedAt(id)))) + TASK_PAIR_WORKSPACE_RETENTION_MS;
+    const kept = (target: string) => sentTo(target, 'brain-workspace-kept');
+    const digests = (target: string) => sentTo(target, 'brain-workspace-kept-digest');
+    const HOUR = 60 * MINUTE;
+
+    await taskPairService.sweepWorkspaces(at, { force: true });
+    for (const id of ids) expect(pair(id).workspace?.status, id).toBe('kept');
+    // Brain A: K=3 announced (the longest-waiting first), one summary naming the 4 others. Brain B: its only one, no summary.
+    expect(kept(BRAIN).map((entry) => entry.id.split(':')[1])).toEqual(['B1', 'B2', 'B3']);
+    expect(digests(BRAIN)).toHaveLength(1);
+    expect(digests(BRAIN)[0]!.text).toContain('4 more');
+    for (const id of ['B4', 'B5', 'B6', 'B7']) expect(digests(BRAIN)[0]!.text).toContain(id);
+    expect(kept(OTHER_BRAIN).map((entry) => entry.id.split(':')[1])).toEqual(['B8']);
+    expect(digests(OTHER_BRAIN)).toHaveLength(0);
+    // What Brain needs to judge, and the options -- none taken for it.
+    const first = kept(BRAIN)[0]!.text;
+    expect(first).toContain('has commits not yet integrated into any branch');
+    expect(first).toContain('1 commit not in any branch');
+    expect(first).toMatch(/HEAD [0-9a-f]{7,} feature B1/);
+    expect(first).toContain('ended 7 days ago');
+    for (const option of ['(a) integrate it yourself', '(b) have', '(c) discard it yourself', '(d) leave it']) expect(first).toContain(option);
+
+    // Later sweeps: up to the open budget (6), then nothing more -- and no second summary within the day.
+    await taskPairService.sweepWorkspaces(at + HOUR, { force: true });
+    expect(kept(BRAIN)).toHaveLength(6);
+    await taskPairService.sweepWorkspaces(at + 2 * HOUR, { force: true });
+    expect(kept(BRAIN)).toHaveLength(6);
+    expect(digests(BRAIN)).toHaveLength(1);
+    // The next day Brain is told once more that the rest still wait.
+    await taskPairService.sweepWorkspaces(at + 25 * HOUR, { force: true });
+    expect(kept(BRAIN)).toHaveLength(6);
+    expect(digests(BRAIN)).toHaveLength(2);
+    expect(digests(BRAIN)[1]!.text).toContain('1 more');
+
+    // Brain integrates two (cherry-pick + push): they are removed, the budget frees, the last one is announced.
+    for (const id of ['B1', 'B2']) git(project, 'cherry-pick', git(worktrees.get(id)!, 'rev-parse', 'HEAD'));
+    git(project, 'push', '-q', 'origin', 'HEAD:refs/heads/dev');
+    await taskPairService.sweepWorkspaces(at + 26 * HOUR, { force: true });
+    expect(pair('B1').workspace?.status).toBe('removed');
+    expect(pair('B2').workspace?.status).toBe('removed');
+    expect(kept(BRAIN).map((entry) => entry.id.split(':')[1])).toEqual(['B1', 'B2', 'B3', 'B4', 'B5', 'B6', 'B7']);
+    // Nothing is announced twice, whatever the sweep count (a restart keeps the delivered marks in the store).
+    await taskPairService.sweepWorkspaces(at + 27 * HOUR, { force: true });
+    expect(kept(BRAIN)).toHaveLength(7);
+    expect(kept(OTHER_BRAIN)).toHaveLength(1);
+    // The unsaved work of the rest is still there.
+    for (const id of ['B3', 'B4', 'B8']) expect(existsSync(join(worktrees.get(id)!, `${id}.txt`))).toBe(true);
+  }, 120_000);
+
+  it('a notice delivered by the old daemon (whose queue dropped it) is announced again under the current key', async () => {
+    const path = await opened('OLD');
+    writeFileSync(join(path, 'old.txt'), 'x\n');
+    git(path, 'add', '-A');
+    git(path, '-c', 'user.email=t@e.invalid', '-c', 'user.name=T', 'commit', '-qm', 'old');
+    marker(BRAIN, '<!-- IMCODES_TASK DONE OLD force=true -->');
+    const at = await endedAt('OLD') + TASK_PAIR_WORKSPACE_RETENTION_MS;
+    const stored = getTaskPairStore().getPair(PROJECT, 'OLD')!;
+    // What v1 left behind: the old key shape, marked delivered.
+    getTaskPairStore().saveLiveness(PROJECT, 'OLD', {
+      ...stored.liveness,
+      workspaceKeptReminderKey: `${path}\u0000${stored.state.workspace!.endedAt}\u0000unpushed`,
+      workspaceKeptReminderCount: 1,
+      workspaceKeptReminderLastAt: at - 1,
+      workspaceKeptReminderDeliveredAt: at - 1,
+    });
+    await taskPairService.sweepWorkspaces(at, { force: true });
+    expect(sentTo(BRAIN, 'brain-workspace-kept')).toHaveLength(1);
+    await taskPairService.sweepWorkspaces(at + MINUTE, { force: true });
+    expect(sentTo(BRAIN, 'brain-workspace-kept')).toHaveLength(1);
   });
 
   it('removes a clean worktree once Brain cherry-picked its commit into origin/dev', async () => {

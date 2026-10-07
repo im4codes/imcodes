@@ -2,7 +2,9 @@ import { isEndedSupervisionTaskStatus } from '../../shared/supervision-config.js
 import {
   isTerminalTaskPairStatus,
   parseTaskPairBindingId,
+  TASK_PAIR_ENDED_PAIR_NOTICE_REASONS,
   TASK_PAIR_NUDGE_ID_PREFIX,
+  taskPairNudgeReasonFromId,
 } from '../../shared/task-pair.js';
 import type { QueueSupervisionAdmission } from '../../shared/transport-queue-types.js';
 import { getSession } from '../store/session-store.js';
@@ -115,6 +117,9 @@ function resolveQueuedTaskPairNudgeAdmission(
   const taskId = taskPairIdFromNudgeId(entry.commandId)
     ?? taskPairIdFromNudgeId(entry.clientMessageId);
   if (!taskId) return 'authorized';
+  // A notice ABOUT the end of a pair (its workspace was kept) is only ever sent after the pair ended.
+  const reason = taskPairNudgeReasonFromId(entry.commandId) ?? taskPairNudgeReasonFromId(entry.clientMessageId);
+  if (reason && TASK_PAIR_ENDED_PAIR_NOTICE_REASONS.includes(reason)) return 'authorized';
   const project = getSession(sessionName)?.projectName;
   if (!project) return 'authorized';
   try {

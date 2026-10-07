@@ -167,6 +167,43 @@ export const TASK_PAIR_WORKS_ROOT_ENV = 'IMCODES_WORKS_ROOT' as const;
 export const TASK_PAIR_WORKSPACE_RETENTION_MS = 7 * 24 * 60 * 60_000;
 
 /**
+ * Brain notices whose SUBJECT is a pair that has already ended (its workspace was kept, its deliverable was not
+ * copied). A daemon-authored pair message that waits in a transport queue is dropped at drain time once its pair is
+ * terminal -- right for a nudge to a participant, wrong for these: they are only ever sent after the pair ended, so the
+ * drop ate every one while the timeline had already shown it (215: 60 drops, Brain never saw one and never acted).
+ * The value is the `reason` segment of the message id (`task-pair-nudge:<taskId>:<reason>:...`).
+ */
+export const TASK_PAIR_ENDED_PAIR_NOTICE_REASONS: readonly string[] = ['brain-workspace-kept', 'brain-output-failed'];
+
+/** The `reason` segment of a daemon-authored pair message id, or undefined when `id` is not one. */
+export function taskPairNudgeReasonFromId(id: string | undefined): string | undefined {
+  if (!id?.startsWith(TASK_PAIR_NUDGE_ID_PREFIX)) return undefined;
+  const parts = id.slice(TASK_PAIR_NUDGE_ID_PREFIX.length).split(':');
+  return parts.length >= 3 && parts[1] ? parts[1] : undefined;
+}
+
+/** Reason of the per-pair "workspace kept with unsaved work" Brain notice, and of its one summary. */
+export const TASK_PAIR_WORKSPACE_KEPT_REASON = 'brain-workspace-kept' as const;
+export const TASK_PAIR_WORKSPACE_KEPT_DIGEST_REASON = 'brain-workspace-kept-digest' as const;
+/** Pseudo task id of the summary: an aggregate notice, never a pair's durable instruction. */
+export const TASK_PAIR_WORKSPACE_KEPT_DIGEST_TASK_ID = '__workspace_kept' as const;
+/** New kept-workspace notices one sweep may send to one Brain; the rest wait for a later sweep. */
+export const TASK_PAIR_WORKSPACE_KEPT_MAX_PER_SWEEP = 3;
+/** Announced-and-still-kept workspaces one Brain may have open: past this nothing more is announced until some resolve. */
+export const TASK_PAIR_WORKSPACE_KEPT_MAX_OUTSTANDING = 6;
+/** At most one "M more are waiting" summary per Brain per this long. */
+export const TASK_PAIR_WORKSPACE_KEPT_DIGEST_INTERVAL_MS = 24 * 60 * 60_000;
+/** Pairs a summary lists by name (the rest are counted). */
+export const TASK_PAIR_WORKSPACE_KEPT_DIGEST_MAX_LISTED = 10;
+/**
+ * Bump to re-arm every kept-workspace notice: the key of a delivered notice carries it. v2: the notices of v1 were
+ * all dropped by the queue admission above, so a v1 "delivered" mark means Brain never heard of that workspace.
+ */
+export const TASK_PAIR_WORKSPACE_KEPT_NOTICE_VERSION = 'v2' as const;
+/** Store meta key of the last summary sent to one Brain. */
+export const taskPairWorkspaceKeptDigestMetaKey = (project: string, brain: string): string => `task_pair_workspace_kept_digest:${project}:${brain}`;
+
+/**
  * Integration drift (owner rule: Brain merges every PASSed pair; tsk_cd_pair_integration_drift). A finished pair whose final
  * head is not in the integration branch is reminded to Brain after this grace, then on the Brain-reminder pacing.
  */

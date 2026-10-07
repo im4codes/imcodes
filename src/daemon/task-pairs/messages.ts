@@ -721,10 +721,60 @@ export function buildWorkspaceMoveFailedLine(pair: TaskPairState, detail: string
   return `${header(pair)} The daemon could not move the worktree ${pair.workspace?.path ?? ''} under executor ${pair.executor ?? ''}: ${detail}. The recorded path stays authoritative and unchanged; the executor can keep using it.`;
 }
 
-/** Brain: a finished pair's worktree still held unsaved work at removal time, so it was kept. */
-export function buildWorkspaceKeptLine(pair: TaskPairState, reason: string): string {
+/** What the daemon read from a kept worktree (read-only) so Brain can judge without opening it. */
+export interface WorkspaceKeptDetail {
+  now: number;
+  /** Commits after the pair's base that no local or remote branch has (patch-equivalent copies count as integrated). */
+  unintegratedCommits?: number;
+  /** `<short sha> <subject>` of the worktree HEAD. */
+  lastCommit?: string;
+}
+
+const DAY_MS = 24 * 60 * 60_000;
+
+function endedAgo(pair: TaskPairState, now: number): string {
+  const endedAt = pair.workspace?.endedAt ?? pair.updatedAt;
+  const days = Math.max(0, Math.floor((now - endedAt) / DAY_MS));
+  return days === 1 ? '1 day' : `${days} days`;
+}
+
+/**
+ * Brain: a finished pair's worktree still held unsaved work at removal time, so it was kept. What to do with it is
+ * Brain's call for each task: the options are listed, none is taken for it.
+ */
+export function buildWorkspaceKeptLine(pair: TaskPairState, reason: string, detail?: WorkspaceKeptDetail): string {
   const why = reason === 'unapplied' ? 'holds work that never reached the project (see the merge / copy-back notice)' : reason === 'unpushed' ? 'has commits not yet integrated into any branch' : reason === 'dirty' ? 'has uncommitted changes' : reason === 'untracked' ? 'has untracked files' : `could not be checked (${reason})`;
-  return `${header(pair)} The pair ended 7 days ago but its worktree ${pair.workspace?.path ?? ''} ${why}, so it was kept instead of deleted. Have ${pair.executor ?? 'the executor'} commit locally what should survive and report its worktree plus HEAD; it is removed once clean or integrated into any branch.`;
+  const facts = [
+    `status ${pair.status}`,
+    detail ? `ended ${endedAgo(pair, detail.now)} ago` : undefined,
+    detail?.unintegratedCommits !== undefined ? `${detail.unintegratedCommits} commit${detail.unintegratedCommits === 1 ? '' : 's'} not in any branch` : undefined,
+    detail?.lastCommit ? `HEAD ${detail.lastCommit}` : undefined,
+    pair.executor ? `executor ${pair.executor}` : undefined,
+  ].filter(Boolean).join('; ');
+  const path = pair.workspace?.path ?? '';
+  return [
+    `${header(pair)} Its worktree ${path} ${why}, so the daemon kept it instead of deleting it (${facts}). Whether it matters is your call for this task; you are told once.`,
+    `Options: (a) integrate it yourself (cherry-pick the HEAD into dev) -- it is removed on a later sweep once every commit is in a branch; (b) have ${pair.executor ?? 'the executor'} commit locally what should survive and report its worktree plus HEAD; (c) discard it yourself after checking it holds nothing you need (git worktree remove); (d) leave it: it stays on disk and the daemon never deletes unsaved work.`,
+  ].join('\n');
+}
+
+/** Brain: more kept workspaces exist than the daemon announces at once; one summary instead of one message each. */
+export function buildWorkspaceKeptDigestLine(input: {
+  deferred: ReadonlyArray<{ taskId: string; title?: string; reason: string; endedDays: number }>;
+  announcedOpen: ReadonlyArray<{ taskId: string; title?: string }>;
+  maxListed: number;
+}): string {
+  const line = (entry: { taskId: string; title?: string }, suffix = '') => `- ${entry.taskId}${entry.title ? ` "${entry.title}"` : ''}${suffix}`;
+  const listed = input.deferred.slice(0, input.maxListed).map((entry) => line(entry, `: ${entry.reason}, ended ${entry.endedDays}d ago`));
+  const more = input.deferred.length - listed.length;
+  const open = input.announcedOpen.slice(0, input.maxListed).map((entry) => line(entry));
+  return [
+    `[IM.codes workspaces] ${input.deferred.length} more finished pair${input.deferred.length === 1 ? ' has' : 's have'} a worktree kept with unsaved work that the daemon has not announced one by one yet: you already have ${input.announcedOpen.length} announced workspace${input.announcedOpen.length === 1 ? '' : 's'} still open, and it will not queue more messages for you until some of them are resolved (integrated, committed by the executor, or discarded). Each is announced with its own options when its turn comes; nothing is deleted meanwhile.`,
+    'Waiting:',
+    ...listed,
+    ...(more > 0 ? [`- ... and ${more} more`] : []),
+    ...(open.length > 0 ? ['Announced and still open:', ...open, ...(input.announcedOpen.length > open.length ? [`- ... and ${input.announcedOpen.length - open.length} more`] : [])] : []),
+  ].join('\n');
 }
 
 const OUTPUT_FAILURES: Record<string, string> = {
