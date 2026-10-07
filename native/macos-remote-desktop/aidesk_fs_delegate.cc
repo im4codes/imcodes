@@ -258,8 +258,13 @@ std::string ListDirectory(const std::string& requested, const Options& options) 
   std::string body = std::string(kAnswerMagic) + "\nrealpath " + Hex(real_path) + "\n";
   std::size_t count = 0;
   bool truncated = false;
-  errno = 0;
-  while (struct dirent* entry = readdir(dir)) {
+  int read_error = 0;
+  while (true) {
+    // errno is judged ONLY for the readdir call itself: a failed fstatat below (an entry removed between readdir and fstatat) must not
+    // turn a finished listing into an error answer.
+    errno = 0;
+    struct dirent* entry = readdir(dir);
+    if (entry == nullptr) { read_error = errno; break; }
     const std::string name = entry->d_name;
     if (name == "." || name == "..") continue;
     if (count >= options.max_entries || body.size() >= options.max_answer_bytes) {
@@ -279,7 +284,6 @@ std::string ListDirectory(const std::string& requested, const Options& options) 
     body.push_back('\n');
     ++count;
   }
-  const int read_error = errno;
   closedir(dir);
   if (read_error != 0) return ErrorAnswer(ReasonForErrno(read_error));
   body += "end " + std::to_string(count) + (truncated ? " 1\n" : " 0\n");
