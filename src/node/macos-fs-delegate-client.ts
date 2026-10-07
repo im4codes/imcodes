@@ -179,8 +179,9 @@ export async function listDirectoryViaMacosApp(
     if (!answer) return unavailable(MACOS_FS_DELEGATE_REASON.BAD_ANSWER, requestedPath);
     if (!answer.ok) {
       logger.info({ reason: answer.reason, path: requestedPath }, 'macos fs delegate refused');
-      // macOS refused the app itself: the app lacks Full Disk Access.
-      if (answer.reason === MACOS_FS_DELEGATE_REASON.PERMISSION_DENIED) return { kind: 'app_denied' };
+      // macOS refused the app itself (the app lacks Full Disk Access), or the helper could not verify that it holds it and refused to risk a
+      // consent prompt nobody can answer: either way the visible state is "enable the app under Full Disk Access".
+      if (answer.reason === MACOS_FS_DELEGATE_REASON.PERMISSION_DENIED || answer.reason === MACOS_FS_DELEGATE_REASON.PERMISSION_UNKNOWN) return { kind: 'app_denied' };
       // A definite answer about the path: report it as the node's own read would have.
       if (answer.reason === MACOS_FS_DELEGATE_REASON.NOT_FOUND || answer.reason === MACOS_FS_DELEGATE_REASON.NOT_DIRECTORY) {
         return { kind: 'refused', reason: answer.reason };

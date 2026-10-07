@@ -49,11 +49,16 @@ struct Options {
   // Who may own the directories and the request file. Production: 0 (root); tests use the test's own uid.
   uid_t trusted_owner_uid = 0;
   std::int64_t now_ms = 0;
-  // When non-empty: before touching the requested path, try to open THIS file for reading (the user's TCC database, readable only by a
-  // process that holds Full Disk Access) and answer `permission_denied` at once if the open is refused (EPERM/EACCES). Without Full Disk
-  // Access macOS would otherwise stop the helper on a per-folder consent prompt (Documents, Desktop, Downloads) that nobody at a remote
-  // Mac can answer. A missing file (ENOENT: not macOS, or a test host) means "cannot tell": carry on. Production: the console user's
-  // ~/Library/Application Support/com.apple.TCC/TCC.db.
+  // The Full Disk Access probe: before touching the requested path, try to open THIS file for reading (the user's TCC database, which
+  // only a process holding Full Disk Access may open). Three outcomes, none of which reads the requested path:
+  //   opened                 -> carry on (the app holds Full Disk Access, so no consent prompt can appear);
+  //   EPERM/EACCES           -> answer `permission_denied` at once (no Full Disk Access);
+  //   anything else (ENOENT: the file is not where this macOS keeps it) -> answer `permission_unknown`: the probe cannot tell, and
+  //                             without Full Disk Access macOS would stop the helper on a per-folder consent prompt (Documents, Desktop,
+  //                             Downloads) that nobody at a remote Mac can answer. A visible "enable the app" answer beats a silent
+  //                             timeout. Production: the console user's ~/Library/Application Support/com.apple.TCC/TCC.db.
+  // An empty path skips the probe unless `require_full_disk_access_probe` is set, in which case it counts as "cannot tell".
+  bool require_full_disk_access_probe = false;
   std::string full_disk_access_probe_path;
   std::size_t max_entries = kMaxEntries;
   std::size_t max_answer_bytes = kMaxAnswerBytes;

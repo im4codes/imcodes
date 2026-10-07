@@ -150,6 +150,8 @@ describe('macOS fs delegate client', () => {
 
   it('tells "macOS refused the app" (the app lacks Full Disk Access) from every other answer', async () => {
     expect(await listDirectoryViaMacosApp('/Users/tester/Documents', deps({ runApp: async () => ({ stdout: answerText('error permission_denied') }) }))).toEqual({ kind: 'app_denied' });
+    // the helper could not verify Full Disk Access and refused to risk a consent prompt: the same visible state
+    expect(await listDirectoryViaMacosApp('/Users/tester/Documents', deps({ runApp: async () => ({ stdout: answerText('error permission_unknown') }) }))).toEqual({ kind: 'app_denied' });
     expect(await listDirectoryViaMacosApp('/Users/tester/x', deps({ runApp: async () => ({ stdout: answerText('error not_found') }) }))).toEqual({ kind: 'refused', reason: 'not_found' });
     expect(await listDirectoryViaMacosApp('/Users/tester/x', deps({ runApp: async () => ({ stdout: answerText('error not_directory') }) }))).toEqual({ kind: 'refused', reason: 'not_directory' });
   });

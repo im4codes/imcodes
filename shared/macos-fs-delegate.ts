@@ -92,6 +92,8 @@ export const MACOS_FS_DELEGATE_REASON = {
   UNSUPPORTED_OP: 'unsupported_op',
   BAD_PATH: 'bad_path',
   PERMISSION_DENIED: 'permission_denied',
+  /** The Full Disk Access probe could not tell (the TCC database is not where it was expected): ask the user to confirm the app's switch. */
+  PERMISSION_UNKNOWN: 'permission_unknown',
   NOT_FOUND: 'not_found',
   NOT_DIRECTORY: 'not_directory',
   SYMLINK_REFUSED: 'symlink_refused',

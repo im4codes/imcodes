@@ -33,14 +33,14 @@ let requestDir = '';
 let fixtureDir = '';
 let seq = 0;
 
-function run(requestFile: string, options: { dir?: string; chainStart?: string; trustedUid?: number; now?: number; probe?: string } = {}): MacosFsDelegateAnswer {
+function run(requestFile: string, options: { dir?: string; chainStart?: string; trustedUid?: number; now?: number; probe?: string; requireProbe?: boolean } = {}): MacosFsDelegateAnswer {
   const result = spawnSync(binary, [
     requestFile,
     options.dir ?? requestDir,
     options.chainStart ?? root,
     String(options.trustedUid ?? uid),
     String(options.now ?? NOW),
-    ...(options.probe === undefined ? [] : [options.probe]),
+    ...(options.probe === undefined ? [] : [options.probe, ...(options.requireProbe ? ['require'] : [])]),
   ], { encoding: 'utf8' });
   expect(result.status).toBe(0);
   const answer = parseMacosFsDelegateAnswer(result.stdout);
@@ -214,8 +214,15 @@ describe.skipIf(!HAVE_COMPILER)('aidesk fs delegate (native core)', () => {
       expect(run(writeRequest({}, 'second.req'), { probe }).ok).toBe(true);
     });
 
-    it('carries on when the probe file does not exist (cannot tell: not macOS, or a test host)', () => {
-      expect(run(writeRequest(), { probe: join(root, 'no-such-tcc.db') }).ok).toBe(true);
+    it('answers permission_unknown (a visible state, not a silent timeout) when the probe file is not where expected', () => {
+      expectRefused(run(writeRequest(), { probe: join(root, 'no-such-tcc.db') }), MACOS_FS_DELEGATE_REASON.PERMISSION_UNKNOWN);
+      writeFileSync(join(root, 'plain-file'), 'x');
+      expectRefused(run(writeRequest({}, 'second.req'), { probe: join(root, 'plain-file', 'under-a-file') }), MACOS_FS_DELEGATE_REASON.PERMISSION_UNKNOWN);
+    });
+
+    it('with the probe required (production) an unusable probe path is "cannot tell", not "carry on"; unrequired it is skipped', () => {
+      expectRefused(run(writeRequest(), { probe: '', requireProbe: true }), MACOS_FS_DELEGATE_REASON.PERMISSION_UNKNOWN);
+      expect(run(writeRequest({}, 'second.req'), { probe: '' }).ok).toBe(true);
     });
   });
 

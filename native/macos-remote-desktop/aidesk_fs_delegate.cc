@@ -30,6 +30,7 @@ constexpr char kUnsupportedVersion[] = "unsupported_version";
 constexpr char kUnsupportedOp[] = "unsupported_op";
 constexpr char kBadPath[] = "bad_path";
 constexpr char kPermissionDenied[] = "permission_denied";
+constexpr char kPermissionUnknown[] = "permission_unknown";
 constexpr char kNotFound[] = "not_found";
 constexpr char kNotDirectory[] = "not_directory";
 constexpr char kSymlinkRefused[] = "symlink_refused";
@@ -235,16 +236,16 @@ const char* ReadRequestFile(const std::string& path, const Options& options, std
   return nullptr;
 }
 
-// True when the probe file may be read, or when the probe cannot tell (the file is absent). False only for a refusal for permission.
-bool FullDiskAccessProbeAllows(const std::string& probe_path) {
-  if (probe_path.empty()) return true;
-  const int fd = open(probe_path.c_str(), O_RDONLY | O_CLOEXEC | O_NONBLOCK);
-  if (fd >= 0) { close(fd); return true; }
-  return !(errno == EPERM || errno == EACCES);
+// nullptr when the helper may carry on (the probe opened, or there is no probe and none is required); otherwise the reason to answer.
+const char* FullDiskAccessProbeRefusal(const Options& options) {
+  if (options.full_disk_access_probe_path.empty()) return options.require_full_disk_access_probe ? kPermissionUnknown : nullptr;
+  const int fd = open(options.full_disk_access_probe_path.c_str(), O_RDONLY | O_CLOEXEC | O_NONBLOCK);
+  if (fd >= 0) { close(fd); return nullptr; }
+  return (errno == EPERM || errno == EACCES) ? kPermissionDenied : kPermissionUnknown;
 }
 
 std::string ListDirectory(const std::string& requested, const Options& options) {
-  if (!FullDiskAccessProbeAllows(options.full_disk_access_probe_path)) return ErrorAnswer(kPermissionDenied);
+  if (const char* refusal = FullDiskAccessProbeRefusal(options)) return ErrorAnswer(refusal);
   char resolved[PATH_MAX];
   if (realpath(requested.c_str(), resolved) == nullptr) return ErrorAnswer(ReasonForErrno(errno));
   const std::string real_path = resolved;
@@ -347,6 +348,7 @@ int FsDelegateMain(int argc, char** argv) {
 #endif
   options.request_dir = runtime_root + "/" + std::to_string(static_cast<unsigned long>(getuid()));
   options.trusted_owner_uid = 0;
+  options.require_full_disk_access_probe = true;
   if (const struct passwd* entry = getpwuid(getuid())) {
     options.full_disk_access_probe_path = std::string(entry->pw_dir) + "/Library/Application Support/com.apple.TCC/TCC.db";
   }
