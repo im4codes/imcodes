@@ -209,29 +209,60 @@ describe('file browser sort and filter at scale', () => {
     `项目-${(index * 7919) % count}-Report ${index % 13}.${['pdf', 'txt', 'zip', 'png'][index % 4]}`,
     { size: (index * 104_729) % 9_000_000, mtimeMs: 1_700_000_000_000 + ((index * 7919) % count) * 60_000, birthtimeMs: 1_600_000_000_000 + index },
   ));
-  const time = (label: string, run: () => unknown): number => {
+  // A shared CI runner is noisy in one direction only (a run can be slowed down by a neighbour, never sped up), so the cost of an
+  // operation is its FASTEST of several runs, not a mean that one stalled run can inflate.
+  const best = (label: string, run: () => unknown, rounds = 7): number => {
     run();
-    const started = performance.now();
-    for (let i = 0; i < 3; i += 1) run();
-    const ms = (performance.now() - started) / 3;
-    console.log(`PERF ${label}: ${ms.toFixed(1)} ms`);
-    return ms;
+    let fastest = Number.POSITIVE_INFINITY;
+    for (let i = 0; i < rounds; i += 1) {
+      const started = performance.now();
+      run();
+      fastest = Math.min(fastest, performance.now() - started);
+    }
+    console.log(`PERF ${label}: ${fastest.toFixed(1)} ms`);
+    return fastest;
   };
+  /** How much slower `run` gets when its input grows `large / small` times. n log n grows a little faster than the input, n^2 as its square. */
+  const growth = (label: string, run: (size: number) => unknown, small: number, large: number): number => {
+    const smallCost = best(`${label} ${small}`, () => run(small));
+    return best(`${label} ${large}`, () => run(large)) / Math.max(smallCost, 0.05);
+  };
+  // The ratio that separates the two: for a 5x input n log n is ~6x and n^2 is 25x. 15 sits well clear of both, which holds only because
+  // each side is the best of several runs (one run of the smaller side that took 3x its normal time used to produce 15.6 on a loaded runner).
+  const GROWTH_LIMIT_FOR_FIVE_TIMES_THE_INPUT = 15;
 
   it('sorts and filters 10,000 and 50,000 entries without a visible stall (and linearly, not quadratically)', () => {
     const ten = big(10_000);
     const fifty = big(50_000);
-    const sortTen = time('sort 10k by name', () => sortFileBrowserEntries(ten, sortBy('name')));
-    time('sort 10k by modified', () => sortFileBrowserEntries(ten, sortBy('modified', 'desc')));
-    time('sort 10k by kind', () => sortFileBrowserEntries(ten, sortBy('kind')));
-    const filterTen = time('filter+sort 10k (2 words)', () => applyFileBrowserView(ten, parseFileBrowserFilter('report pdf'), sortBy('modified', 'desc'), (n) => n.name));
-    const sortFifty = time('sort 50k by name', () => sortFileBrowserEntries(fifty, sortBy('name')));
-    time('filter+sort 50k (2 words)', () => applyFileBrowserView(fifty, parseFileBrowserFilter('report pdf'), sortBy('modified', 'desc'), (n) => n.name));
+    const sortTen = best('sort 10k by name', () => sortFileBrowserEntries(ten, sortBy('name')));
+    best('sort 10k by modified', () => sortFileBrowserEntries(ten, sortBy('modified', 'desc')));
+    best('sort 10k by kind', () => sortFileBrowserEntries(ten, sortBy('kind')));
+    const filterTen = best('filter+sort 10k (2 words)', () => applyFileBrowserView(ten, parseFileBrowserFilter('report pdf'), sortBy('modified', 'desc'), (n) => n.name));
+    const sortFifty = best('sort 50k by name', () => sortFileBrowserEntries(fifty, sortBy('name')));
+    best('filter+sort 50k (2 words)', () => applyFileBrowserView(fifty, parseFileBrowserFilter('report pdf'), sortBy('modified', 'desc'), (n) => n.name));
     // Generous ceilings: they catch an accidental O(n^2) or a per-comparison allocation, not machine speed.
     expect(sortTen).toBeLessThan(1_000);
     expect(filterTen).toBeLessThan(1_000);
     expect(sortFifty).toBeLessThan(6_000);
-    expect(sortFifty / Math.max(sortTen, 1)).toBeLessThan(15);
+    // The growth, not the absolute time, is what a slow runner cannot fake.
+    expect(sortFifty / Math.max(sortTen, 0.05)).toBeLessThan(GROWTH_LIMIT_FOR_FIVE_TIMES_THE_INPUT);
+  });
+
+  it('the growth check tells a quadratic algorithm from an n log n one (it would catch an O(n^2) regression)', () => {
+    const numbers = (size: number) => Array.from({ length: size }, (_, index) => (index * 7919) % size);
+    // A quadratic ordering (selection sort) and the library sort, over the same kind of input, at 5x the size.
+    const quadratic = growth('selection sort', (size) => {
+      const values = numbers(size);
+      for (let i = 0; i < values.length; i += 1) {
+        let lowest = i;
+        for (let j = i + 1; j < values.length; j += 1) if (values[j]! < values[lowest]!) lowest = j;
+        [values[i], values[lowest]] = [values[lowest]!, values[i]!];
+      }
+      return values;
+    }, 3_000, 15_000);
+    const linearithmic = growth('library sort', (size) => numbers(size).sort((a, b) => a - b), 20_000, 100_000);
+    expect(quadratic).toBeGreaterThan(GROWTH_LIMIT_FOR_FIVE_TIMES_THE_INPUT);
+    expect(linearithmic).toBeLessThan(GROWTH_LIMIT_FOR_FIVE_TIMES_THE_INPUT);
   });
 });
 

@@ -21,6 +21,7 @@ import { fileURLToPath } from 'node:url';
 import { readMacosRemoteDesktopCodeIdentity } from './macos-remote-desktop-build.mjs';
 import product from '../shared/aidesk-product.json' with { type: 'json' };
 import fsDelegate from '../shared/macos-fs-delegate.json' with { type: 'json' };
+import agentBuild from '../native/macos-remote-desktop/aidesk-agent-build.json' with { type: 'json' };
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -179,33 +180,44 @@ export function machoMinimumSystemVersion(path) {
   return match ? match[1] : null;
 }
 
-/** Compile the agent for one architecture. */
-function compileAgentSlice(arch, outPath, minimumSystemVersion) {
+/** The agent's translation units and frameworks: written once, in aidesk-agent-build.json, so no second compile command can miss one. */
+export const AIDESK_AGENT_SOURCES = Object.freeze([...agentBuild.sources]);
+export const AIDESK_AGENT_FRAMEWORKS = Object.freeze([...agentBuild.frameworks]);
+
+/**
+ * The `clang++` arguments that build the agent. The release build and the tests that compile the agent themselves both use this, so a
+ * source added to the agent (a new .mm/.cc in aidesk-agent-build.json) is in every build at once.
+ */
+export function aideskAgentCompileArgs({ arch, minimumSystemVersion, outPath, optimization = '-O2', extraFlags = [] }) {
   const source = join(root, 'native', 'macos-remote-desktop');
-  sh('clang++', [
+  return [
     '-std=c++20',
     '-fobjc-arc',
-    '-O2',
+    optimization,
     '-arch', arch,
     // Without it clang targets the build machine's SDK: the agent announced
     // macOS 15 while Info.plist said 12.3, so LaunchServices refused to start
     // it on every older Mac (kLSIncompatibleSystemVersionErr) and remote
     // desktop could never become ready there.
     `-mmacosx-version-min=${minimumSystemVersion}`,
-    // Anything newer than the floor has to sit behind an availability check.
-    '-Werror=unguarded-availability-new',
+    ...extraFlags,
     `-I${source}`,
-    join(source, 'aidesk_agent_main.mm'),
-    join(source, 'macos_permission_onboarding.mm'),
-    join(source, 'aidesk_fs_delegate.cc'),
-    '-framework', 'AppKit',
-    '-framework', 'ApplicationServices',
-    '-framework', 'CoreGraphics',
-    '-framework', 'Foundation',
-    // Signature checks on helpers launched from the node's component store.
-    '-framework', 'Security',
+    ...AIDESK_AGENT_SOURCES.map((file) => join(source, file)),
+    // Signature checks on helpers launched from the node's component store need Security.
+    ...AIDESK_AGENT_FRAMEWORKS.flatMap((framework) => ['-framework', framework]),
     '-o', outPath,
-  ]);
+  ];
+}
+
+/** Compile the agent for one architecture. */
+function compileAgentSlice(arch, outPath, minimumSystemVersion) {
+  sh('clang++', aideskAgentCompileArgs({
+    arch,
+    minimumSystemVersion,
+    outPath,
+    // Anything newer than the floor has to sit behind an availability check.
+    extraFlags: ['-Werror=unguarded-availability-new'],
+  }));
   const announced = machoMinimumSystemVersion(outPath);
   if (announced !== minimumSystemVersion) {
     throw new Error(

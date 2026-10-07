@@ -1,9 +1,10 @@
 import { execFile, execFileSync } from 'node:child_process';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { join } from 'node:path';
 import { promisify } from 'node:util';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { aideskAgentCompileArgs } from '../../scripts/build-aidesk-app.mjs';
 import { REMOTE_DESKTOP_ACCESS_MODE } from '../../shared/remote-desktop.js';
 import { REMOTE_DESKTOP_LOCAL_MANAGEMENT } from '../../shared/remote-desktop-local-management.js';
 import {
@@ -29,16 +30,11 @@ mac('macOS aiDesk status client against the real local panel', () => {
   beforeAll(async () => {
     root = await mkdtemp(join(tmpdir(), 'imcodes-aidesk-status-client-'));
     agent = join(root, 'aidesk-agent');
-    const source = resolve('native/macos-remote-desktop');
-    execFileSync('/usr/bin/clang++', [
-      '-std=c++20', '-fobjc-arc', '-O0', '-arch', process.arch,
-      '-mmacosx-version-min=12.3', `-I${source}`,
-      join(source, 'aidesk_agent_main.mm'),
-      join(source, 'macos_permission_onboarding.mm'),
-      '-framework', 'AppKit', '-framework', 'ApplicationServices',
-      '-framework', 'CoreGraphics', '-framework', 'Foundation',
-      '-framework', 'Security', '-o', agent,
-    ], { stdio: 'pipe' });
+    // The release build's own compile arguments (every source and framework of the agent), not a second hand-written list that can
+    // fall behind the first: a source added to the agent once left this link without it.
+    execFileSync('/usr/bin/clang++', aideskAgentCompileArgs({
+      arch: process.arch, minimumSystemVersion: '12.3', optimization: '-O0', outPath: agent,
+    }), { stdio: 'pipe' });
     panel = await startRemoteDesktopLocalPanel({
       publicNodeId: '1234567890',
       serverUrl: 'https://example.test/',

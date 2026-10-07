@@ -10,6 +10,7 @@ import {
   listDirectoryUnderPolicy,
   type DirectoryListingProvider,
 } from '../../src/daemon/directory-listing-policy.js';
+import { buildQueriedDirectoryListing } from '../../src/daemon/file-directory-query.js';
 import { FILE_TRANSFER_DIRECTORY_MAX_ENTRIES, type FileDirectoryListQuery } from '../../shared/transport/file-transfer.js';
 import { FS_GENERIC_ERROR_CODES } from '../../shared/fs-error-codes.js';
 
@@ -186,7 +187,7 @@ describe('query shaping is identical through the direct and the delegated provid
       entries.push({
         name: dirent.name,
         kind: (dirent.isDirectory() ? 'd' : dirent.isFile() ? 'f' : 'o') as 'd' | 'f' | 'o',
-        ...(withMetadata ? { meta: { size: stat.isFile() ? stat.size : 0, mtimeMs: Math.floor(stat.mtimeMs) } } : {}),
+        ...(withMetadata ? { meta: { size: stat.isFile() ? stat.size : 0, mtimeMs: Math.floor(stat.mtimeMs), birthtimeMs: Math.floor(stat.birthtimeMs) } } : {}),
       });
     }
     return { realPath: dir, entries, hasMetadata: withMetadata };
@@ -219,6 +220,28 @@ describe('query shaping is identical through the direct and the delegated provid
     const sizes = delegated.entries.map((entry) => entry.size ?? -1);
     expect(sizes[0]).toBeGreaterThanOrEqual(sizes[sizes.length - 1]!);
     expect(delegated.entries.every((entry) => typeof entry.mtimeMs === 'number')).toBe(true);
+  });
+
+  // On Linux the shaping never reports a creation time, so a helper answer that left one out looked identical to the direct read there and
+  // the difference only showed on macOS (where the direct read has a real creation time). This pins it on every platform: what the helper
+  // answers per entry (size, modified, created) must reach the entries the browser gets, creation time included, on the platforms that show it.
+  it.each(['darwin', 'win32'] as const)('the created time the app answers reaches the listing on %s, and an unknown one is left out (not shown as 1970)', async (platform) => {
+    const provider = createDelegatedListingProvider({
+      realPath: '/Users/tester/Documents',
+      hasMetadata: true,
+      entries: [
+        { name: 'known.txt', kind: 'f', meta: { size: 5, mtimeMs: 2_000, birthtimeMs: 1_000 } },
+        { name: 'unknown.txt', kind: 'f', meta: { size: 6, mtimeMs: 3_000 } },
+      ],
+    });
+    const dirents = await provider.readEntries('/Users/tester/Documents');
+    const queried = await buildQueriedDirectoryListing({
+      realPath: '/Users/tester/Documents', dirents, query: query('created'), platform, ...provider.queryInputs!(),
+    });
+    const byName = new Map(queried.entries.map((entry) => [entry.name, entry]));
+    expect(byName.get('known.txt')).toMatchObject({ size: 5, mtimeMs: 2_000, birthtimeMs: 1_000 });
+    expect(byName.get('unknown.txt')?.birthtimeMs).toBeUndefined();
+    expect(byName.get('unknown.txt')).toMatchObject({ size: 6, mtimeMs: 3_000 });
   });
 
   it('an app without metadata (older app): a size/time ordering is reported partial and never passed off as ordered; a name ordering is exact', async () => {

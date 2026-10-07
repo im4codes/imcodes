@@ -1,10 +1,12 @@
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
 import {
+  AIDESK_AGENT_FRAMEWORKS,
+  AIDESK_AGENT_SOURCES,
   AIDESK_APP_NAME,
   AIDESK_ARCHITECTURES,
   AIDESK_BUNDLE_ID,
@@ -12,6 +14,7 @@ import {
   AIDESK_THIRD_PARTY_LICENSE,
   AIDESK_MAIN_EXECUTABLE,
   AIDESK_LOCAL_UI_EXECUTABLE,
+  aideskAgentCompileArgs,
   aideskSigningOrder,
   buildAideskAgent,
   buildAideskInfoPlist,
@@ -251,5 +254,55 @@ describe('aiDesk disk image', () => {
 
   it('refuses to build an image around an app that is not there', () => {
     expect(source).toMatch(/app bundle not found/u);
+  });
+});
+
+/**
+ * The agent is compiled in more than one place (the release build, and the macOS tests that build and run the real agent). A source
+ * added to the agent that one of them does not know about fails only at link time, and only on a Mac: `aidesk_fs_delegate.cc` once
+ * broke the macOS CI job that way while every Linux run was green. These checks are platform independent.
+ */
+describe('the aiDesk agent has one list of sources', () => {
+  const nativeDirectory = join('native', 'macos-remote-desktop');
+  const IMPLEMENTATION_EXTENSIONS = ['.cc', '.mm', '.cpp', '.c', '.m'];
+  const localIncludes = (file: string): string[] => [...readFileSync(file, 'utf8').matchAll(/^\s*#\s*include\s+"([^"]+)"/gmu)]
+    .map((match) => join(dirname(file), match[1]!));
+
+  it('lists existing files, and the compile arguments carry every one of them and every framework', () => {
+    expect(AIDESK_AGENT_SOURCES.length).toBeGreaterThan(0);
+    const args = aideskAgentCompileArgs({ arch: 'arm64', minimumSystemVersion: '12.3', outPath: '/out/agent' });
+    for (const source of AIDESK_AGENT_SOURCES) {
+      expect(existsSync(join(nativeDirectory, source)), source).toBe(true);
+      expect(args.some((arg) => arg.endsWith(`/${source}`) || arg === join(nativeDirectory, source)), source).toBe(true);
+    }
+    for (const framework of AIDESK_AGENT_FRAMEWORKS) {
+      expect(args.slice(args.indexOf('-framework')).join(' ')).toContain(`-framework ${framework}`);
+    }
+    expect(args.slice(-2)).toEqual(['-o', '/out/agent']);
+  });
+
+  it('lists the implementation of every header a listed source includes directly (a header with a .cc/.mm beside it is not header-only)', () => {
+    // Direct includes only: a header reached through another header may declare things this agent never calls (value_types.h has a
+    // .cc the agent does not link and does not need), so it cannot be told from a missing source without linking. The link itself
+    // (the macOS status-client test) is the backstop for those.
+    const listed = new Set(AIDESK_AGENT_SOURCES.map((source) => resolve(nativeDirectory, source)));
+    const missing: string[] = [];
+    for (const source of AIDESK_AGENT_SOURCES) {
+      for (const included of localIncludes(join(nativeDirectory, source))) {
+        if (!existsSync(included)) continue;
+        const stem = included.replace(/\.[^./]+$/u, '');
+        for (const extension of IMPLEMENTATION_EXTENSIONS) {
+          const implementation = resolve(`${stem}${extension}`);
+          if (existsSync(implementation) && !listed.has(implementation)) missing.push(`${source} includes ${included}, implemented in ${implementation}`);
+        }
+      }
+    }
+    expect(missing, 'add these to native/macos-remote-desktop/aidesk-agent-build.json').toEqual([]);
+  });
+
+  it('the tests that compile the agent use the release build\'s arguments, not a list of their own', () => {
+    const source = readFileSync('test/node/macos-aidesk-status-client.test.ts', 'utf8');
+    expect(source).toContain('aideskAgentCompileArgs(');
+    expect(source).not.toMatch(/\.(?:mm|cc)['"]/u);
   });
 });

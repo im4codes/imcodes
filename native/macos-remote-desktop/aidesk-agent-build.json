@@ -1,0 +1,4 @@
+{
+  "sources": ["aidesk_agent_main.mm", "macos_permission_onboarding.mm", "aidesk_fs_delegate.cc"],
+  "frameworks": ["AppKit", "ApplicationServices", "CoreGraphics", "Foundation", "Security"]
+}
