@@ -22,6 +22,7 @@ import {
   startAideskLocalUiSidecarRefresh,
 } from '../../src/node/aidesk-local-ui-sidecar.js';
 import { resolveVerifiedAideskLocalUi } from '../../src/node/aidesk-local-ui-artifact.js';
+import { windowsComputerUseHelperAclCommands } from '../../src/node/installer.js';
 
 const SIGNER = 'cd'.repeat(32);
 const temps: string[] = [];
@@ -189,6 +190,36 @@ describe('refreshAideskLocalUiSidecar', () => {
     const result = await refreshAideskLocalUiSidecar({ ...base.deps, download: (async () => { throw new Error('download_failed_500'); }) as never });
     expect(result).toMatchObject({ updated: false, reason: 'download_failed' });
     expect(readdirSync(base.root).filter((name) => name.startsWith('.aidesk-local-ui-refresh-'))).toEqual([]);
+  });
+});
+
+describe('who may change the installed host', () => {
+  it('only SYSTEM and Administrators can write the directory; ordinary users get read+execute (the user-session launch needs it), inheritance is cut and SYSTEM owns it', () => {
+    const joined = windowsComputerUseHelperAclCommands('C:\\ProgramData\\imcodes-node\\aidesk-local-ui\\win32-x64').map((args) => args.join(' '));
+    expect(joined.some((line) => line.includes('/grant:r') && line.includes(':(OI)(CI)F') && line.includes('S-1-5-18'))).toBe(true); // SYSTEM full
+    expect(joined.some((line) => line.includes(':(OI)(CI)F') && line.includes('S-1-5-32-544'))).toBe(true); // Administrators full
+    expect(joined.filter((line) => /S-1-5-11/u.test(line))).toEqual([expect.stringContaining(':(OI)(CI)RX')]); // Authenticated Users: read+execute only
+    expect(joined.some((line) => line.includes('/inheritance:r'))).toBe(true);
+    expect(joined.some((line) => line.includes('/setowner') && line.includes('S-1-5-18'))).toBe(true);
+    // no grant of write/modify/full to Users, Everyone or Authenticated Users anywhere
+    expect(joined.some((line) => /S-1-1-0|S-1-5-32-545/u.test(line))).toBe(false);
+  });
+
+  it('the staged directory is locked BEFORE it is swapped in, and so is the parent', async () => {
+    const order: string[] = [];
+    const v1: Published = { exe: Buffer.from('MZ-host-v1'), version: '2026.10.1' };
+    const { deps, root } = setup(v1);
+    await refreshAideskLocalUiSidecar({
+      ...deps,
+      lockDown: async (directory: string) => { order.push(`lock:${directory.replace(root, '<root>').replace(/\.aidesk-local-ui-refresh-[^\\/]+/u, '<staging>')}`); },
+      rename: (async (from: string, to: string) => {
+        order.push('rename');
+        const { rename } = await import('node:fs/promises');
+        return rename(from, to);
+      }) as never,
+    });
+    expect(order.indexOf('rename')).toBeGreaterThan(order.findIndex((entry) => entry.startsWith('lock:') && entry.includes('<staging>')));
+    expect(order.filter((entry) => entry === 'rename')).toHaveLength(1);
   });
 });
 
