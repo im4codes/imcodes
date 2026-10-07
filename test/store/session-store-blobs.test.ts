@@ -26,7 +26,11 @@ import {
   type SessionRecord,
 } from '../../src/store/session-store.js';
 import { currentDaemonProcessIdentity } from '../../src/daemon/instance-lock.js';
-import { resetSessionBlobCachesForTests } from '../../src/store/session-record-blobs.js';
+import { hashSessionBlob, internSessionText, resetSessionBlobCachesForTests, sessionBlobCacheStatsForTests } from '../../src/store/session-record-blobs.js';
+import { SESSION_BLOB_CACHE_MAX_CHARS } from '../../shared/daemon-memory-guard.js';
+import { SESSION_DB_VACUUM_MIN_FREE_BYTES } from '../../shared/session-store-compat.js';
+import { closeSessionDb, commitSessionChanges, openSessionDbForWrite, openSessionDbReadOnly, readSessionStoreSnapshot, vacuumSessionDbIfFragmented } from '../../src/store/session-store-db.js';
+import { existsSync, statSync } from 'node:fs';
 import { SESSION_RECORD_INLINE_STRING_MAX_CHARS } from '../../shared/session-store-compat.js';
 import { persistedSessionBlobs, persistedSessions, replacePersistedSessions, sessionDbPathForHome } from '../helpers/session-store-db.js';
 
@@ -192,5 +196,117 @@ describe('the older-build export stays small and readable', () => {
       expect(entry.blobRefs, name).toBeUndefined(); // other large fields are inlined for older readers
     }
     expect(exported.sessions[NAMES(30)[0]!]!['description']).toBe(cjk(9_000, 9));
+  });
+});
+
+describe('the migration corners', () => {
+  it('(i) a blob freed by collection and then taken again by another session with the same text is stored again and survives a reload', async () => {
+    await freshStore();
+    const text = cjk(40_000, 31);
+    upsertSession(record('deck_first_brain', { identityPrompt: text }));
+    upsertSession(record('deck_keep_brain'));
+    await flushStore();
+    upsertSession({ ...getSession('deck_first_brain')!, identityPrompt: undefined });
+    await flushStore();
+    expect(persistedSessionBlobs(home).size).toBe(0); // freed
+    upsertSession(record('deck_second_brain', { identityPrompt: text }));
+    await flushStore();
+    expect([...persistedSessionBlobs(home).values()]).toEqual([text]);
+    resetSessionStoreAuthorityForTests();
+    await freshStore();
+    expect(getSession('deck_second_brain')?.identityPrompt === text).toBe(true);
+  });
+
+  it('(ii) in ONE flush where session A drops hash H and session B takes it, H is kept', async () => {
+    await freshStore();
+    const shared = cjk(40_000, 41);
+    upsertSession(record('deck_a_brain', { identityPrompt: shared }));
+    upsertSession(record('deck_b_brain'));
+    await flushStore();
+    upsertSession({ ...getSession('deck_a_brain')!, identityPrompt: undefined });
+    upsertSession({ ...getSession('deck_b_brain')!, identityPrompt: shared });
+    await flushStore();
+    expect([...persistedSessionBlobs(home).values()]).toEqual([shared]);
+    resetSessionStoreAuthorityForTests();
+    await freshStore();
+    expect(getSession('deck_b_brain')?.identityPrompt === shared).toBe(true);
+    expect(getSession('deck_a_brain')?.identityPrompt).toBeUndefined();
+  });
+
+  it('(iii) restoring from a snapshot after the live rows and blobs are gone brings back the identity and a long non-identity field, and persists them again', async () => {
+    await freshStore();
+    const identity = cjk(60_000, 51);
+    const description = cjk(20_000, 52);
+    upsertSession(record('deck_snap_brain', { identityPrompt: identity, description }));
+    await flushStore();
+    await waitForSessionStoreSnapshotForTests();
+    // The live database loses everything (an empty store beside a usable snapshot).
+    const live = openSessionDbForWrite(sessionDbPathForHome(home));
+    live.db.exec('DELETE FROM sessions; DELETE FROM session_blobs;');
+    closeSessionDb(live);
+    const backup = `${sessionDbPathForHome(home)}.bak.1`;
+    expect(existsSync(backup)).toBe(true);
+    resetSessionStoreAuthorityForTests();
+    await freshStore();
+    expect(getSession('deck_snap_brain')?.identityPrompt === identity).toBe(true);
+    expect(getSession('deck_snap_brain')?.description === description).toBe(true);
+    await flushStore();
+    expect(persistedSessionBlobs(home).size).toBe(2);
+    resetSessionStoreAuthorityForTests();
+    await freshStore();
+    expect(getSession('deck_snap_brain')?.identityPrompt === identity).toBe(true);
+  });
+
+  it('a reader sees rows and blobs from ONE point in time', () => {
+    const path = sessionDbPathForHome(home);
+    const writer = openSessionDbForWrite(path);
+    try {
+      const blob = { hash: 'a'.repeat(32), text: cjk(10_000, 61) };
+      commitSessionChanges(writer, { upserts: [{ name: 'deck_x', projectName: 'p', parentSession: null, agentType: 'codex-sdk', state: 'idle', updatedAt: 1, payload: JSON.stringify({ name: 'deck_x', identityPromptRef: blob.hash }), blobs: [blob] }], deletes: [], allowEmpty: true });
+      const reader = openSessionDbReadOnly(path)!;
+      try {
+        const first = readSessionStoreSnapshot(reader);
+        // The daemon collects the blob while the reader still holds nothing: a LATER snapshot is consistent too.
+        commitSessionChanges(writer, { upserts: [], deletes: ['deck_x'], allowEmpty: true });
+        const second = readSessionStoreSnapshot(reader);
+        expect(first.payloads.size).toBe(1);
+        expect(first.blobs.get(blob.hash)).toBe(blob.text);
+        expect(second.payloads.size).toBe(0);
+        expect(second.blobs.size).toBe(0);
+      } finally { closeSessionDb(reader); }
+    } finally { closeSessionDb(writer); }
+  });
+});
+
+describe('disk and cache footprint', () => {
+  it('a database whose rows shrank is compacted once its free pages are large, and the file shrinks', () => {
+    const path = sessionDbPathForHome(home);
+    const handle = openSessionDbForWrite(path);
+    try {
+      const rows = Array.from({ length: 6 }, (_, index) => ({
+        name: `deck_big_${index}`, projectName: 'p', parentSession: null, agentType: 'codex-sdk', state: 'idle', updatedAt: 1,
+        payload: JSON.stringify({ name: `deck_big_${index}`, filler: 'x'.repeat(Math.ceil(SESSION_DB_VACUUM_MIN_FREE_BYTES / 4)) }),
+      }));
+      commitSessionChanges(handle, { upserts: rows, deletes: [], allowEmpty: true });
+      expect(vacuumSessionDbIfFragmented(handle).vacuumed).toBe(false); // nothing free yet
+      commitSessionChanges(handle, { upserts: [], deletes: rows.map((row) => row.name), allowEmpty: true });
+      const before = statSync(path).size;
+      const result = vacuumSessionDbIfFragmented(handle);
+      expect(result.vacuumed).toBe(true);
+      expect(result.freeBytes).toBeGreaterThanOrEqual(SESSION_DB_VACUUM_MIN_FREE_BYTES);
+      expect(statSync(path).size).toBeLessThan(before / 4);
+    } finally { closeSessionDb(handle); }
+  });
+
+  it('the hash and intern caches are bounded by the characters they hold, and still answer correctly', () => {
+    resetSessionBlobCachesForTests();
+    const unit = 'y'.repeat(1_000_000);
+    const texts = Array.from({ length: Math.ceil(SESSION_BLOB_CACHE_MAX_CHARS / 1_000_000) + 20 }, (_, index) => `${index}:${unit}`);
+    for (const text of texts) { hashSessionBlob(text); internSessionText(text); }
+    const stats = sessionBlobCacheStatsForTests();
+    expect(stats.hashChars).toBeLessThanOrEqual(SESSION_BLOB_CACHE_MAX_CHARS);
+    expect(stats.internChars).toBeLessThanOrEqual(SESSION_BLOB_CACHE_MAX_CHARS);
+    expect(hashSessionBlob(texts[0]!)).toBe(hashSessionBlob(`${0}:${unit}`)); // cleared entries are simply recomputed
+    expect(internSessionText(texts[1]!)).toBe(texts[1]);
   });
 });

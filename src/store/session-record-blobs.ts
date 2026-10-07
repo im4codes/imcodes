@@ -9,6 +9,7 @@
  */
 import { createHash } from 'node:crypto';
 import { SESSION_RECORD_INLINE_STRING_MAX_CHARS } from '../../shared/session-store-compat.js';
+import { SESSION_BLOB_CACHE_MAX_CHARS } from '../../shared/daemon-memory-guard.js';
 
 export const SESSION_IDENTITY_REF_FIELD = 'identityPromptRef';
 export const SESSION_BLOB_REFS_FIELD = 'blobRefs';
@@ -23,13 +24,22 @@ export interface ExternalizedSessionRecord { payload: string; blobs: SessionBlob
 // so re-serialising a record whose 550 KB prompt did not change costs a lookup, not a 550 KB hash.
 const hashByText = new Map<string, string>();
 const internedByText = new Map<string, string>();
+// Both caches are keyed by the large strings themselves: bounded by characters held, not only by entry count, so
+// stale versions of an edited prompt cannot pile up (the whole cache is dropped when the budget would be crossed).
+let hashChars = 0;
+let internChars = 0;
+
+export function sessionBlobCacheStatsForTests(): { hashChars: number; internChars: number; hashEntries: number; internEntries: number } {
+  return { hashChars, internChars, hashEntries: hashByText.size, internEntries: internedByText.size };
+}
 
 export function hashSessionBlob(text: string): string {
   const known = hashByText.get(text);
   if (known) return known;
   const hash = createHash('sha256').update(text, 'utf8').digest('hex').slice(0, 32);
-  if (hashByText.size >= HASH_CACHE_MAX) hashByText.clear();
+  if (hashByText.size >= HASH_CACHE_MAX || hashChars + text.length > SESSION_BLOB_CACHE_MAX_CHARS) { hashByText.clear(); hashChars = 0; }
   hashByText.set(text, hash);
+  hashChars += text.length;
   return hash;
 }
 
@@ -37,14 +47,17 @@ export function hashSessionBlob(text: string): string {
 export function internSessionText(text: string): string {
   const known = internedByText.get(text);
   if (known !== undefined) return known;
-  if (internedByText.size >= INTERN_MAX) internedByText.clear();
+  if (internedByText.size >= INTERN_MAX || internChars + text.length > SESSION_BLOB_CACHE_MAX_CHARS) { internedByText.clear(); internChars = 0; }
   internedByText.set(text, text);
+  internChars += text.length;
   return text;
 }
 
 export function resetSessionBlobCachesForTests(): void {
   hashByText.clear();
   internedByText.clear();
+  hashChars = 0;
+  internChars = 0;
 }
 
 function isLargeString(value: unknown): value is string {

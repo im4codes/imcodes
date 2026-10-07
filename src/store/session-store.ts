@@ -44,6 +44,8 @@ import {
   listSessionBlobHashes,
   readSessionBlobs,
   readSessionPayloads,
+  readSessionStoreSnapshot,
+  vacuumSessionDbIfFragmented,
   readSnapshotBlobs,
   readSnapshotPayloads,
   snapshotSessionDb,
@@ -56,6 +58,7 @@ import { readInstanceLockMetadata, isRecordedProcessIdentityCurrent, type Daemon
 import logger from '../util/logger.js';
 import { SESSION_ERROR_WORKING_DIRECTORY_NOT_FOUND } from '../../shared/session-errors.js';
 import { SESSIONS_JSON_COMPAT_EXPORT_MAX_BYTES } from '../../shared/session-store-compat.js';
+import { SESSION_BLOB_CACHE_MAX_CHARS } from '../../shared/daemon-memory-guard.js';
 import { registerMemoryProbe } from '../daemon/memory-probes.js';
 import { blobHashesOfPayload, externalizeSessionRecord, hasGenericBlobRefs, hydrateSessionRecord, identityRefOfPayload } from './session-record-blobs.js';
 import { imcodesStateDir } from '../util/imcodes-state-dir.js';
@@ -481,6 +484,7 @@ async function readNewestLegacyJsonBackup(jsonPath: string): Promise<{ store: Se
 const blobTextByHash = new Map<string, string>();
 /** Hashes the database already holds, so a row write sends only blobs it does not have. */
 let knownBlobHashes = new Set<string>();
+let lastVacuumCheckAt = 0;
 
 /** Forget the text of blobs no committed row refers to. */
 function pruneBlobTexts(): void {
@@ -701,7 +705,8 @@ async function readWithoutAuthority(targetPath: string): Promise<Record<string, 
   const reader = openSessionDbReadOnly(targetPath);
   try {
     if (reader && readSessionDbMeta(reader, SESSION_DB_META_LEGACY_IMPORT) === SESSION_DB_LEGACY_IMPORT_DONE) {
-      return recordsFromPayloads(readSessionPayloads(reader), readSessionBlobs(reader));
+      const snapshot = readSessionStoreSnapshot(reader);
+      return recordsFromPayloads(snapshot.payloads, snapshot.blobs);
     }
   } finally {
     closeSessionDb(reader);
@@ -976,6 +981,12 @@ async function writeStoreToDisk(bestEffort: boolean, targetPath = dbPath(), forc
         knownBlobHashes = listSessionBlobHashes(handle);
         pruneBlobTexts();
       }
+      // Rows that shrank leave free pages behind (and in every snapshot): compact once, at most every 10 minutes.
+      if (Date.now() - lastVacuumCheckAt >= 10 * 60_000) {
+        lastVacuumCheckAt = Date.now();
+        const compacted = vacuumSessionDbIfFragmented(handle);
+        if (compacted.vacuumed) logger.info({ freedBytes: compacted.freeBytes }, 'Session database compacted');
+      }
       allowEmptyStoreWrite = false;
       scheduleCompatExport(targetPath);
     }
@@ -1119,6 +1130,7 @@ function scheduleCompatExport(targetPath: string, immediate = false): void {
 
 /** JSON text of identity blobs already serialised for an export (a 550 KB prompt is escaped once, not per export). */
 const compatIdentityJson = new Map<string, string>();
+let compatIdentityJsonChars = 0;
 let lastCompatSkipWarnAt = 0;
 
 /** A payload with generic blob refs, rebuilt with those fields inline (the identity stays a reference). */
@@ -1180,8 +1192,9 @@ function runCompatExport(targetPath: string): Promise<void> {
         let json = compatIdentityJson.get(hash);
         if (json === undefined) {
           json = JSON.stringify(text);
-          if (compatIdentityJson.size >= 256) compatIdentityJson.clear();
+          if (compatIdentityJson.size >= 256 || compatIdentityJsonChars + json.length > SESSION_BLOB_CACHE_MAX_CHARS) { compatIdentityJson.clear(); compatIdentityJsonChars = 0; }
           compatIdentityJson.set(hash, json);
+          compatIdentityJsonChars += json.length;
         }
         estimatedBytes += json.length;
         identityEntries.push(`"${hash}":${json}`);

@@ -21,5 +21,7 @@ export const BACKPRESSURE_MAX_PAUSE_MS = 5_000;
 /** ...and is then allowed to flow for at least this long before it can be paused again (no starvation of the child). */
 export const BACKPRESSURE_RESUME_GRACE_MS = 1_000;
 /** Between two session restores: at least this long, then until the loop is healthy, but never longer than the cap. */
-export const RESTORE_PACING_MIN_GAP_MS = 500;
+export const RESTORE_PACING_MIN_GAP_MS = 1_000;
 export const RESTORE_PACING_MAX_WAIT_MS = 30_000;
+/** Across one whole restore the waiting for health adds up to at most this; after it the restore is paced by the floor alone. */
+export const RESTORE_PACING_TOTAL_WAIT_BUDGET_MS = 5 * 60_000;

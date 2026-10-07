@@ -39,6 +39,9 @@ export function isSessionsJsonCompatExportEnabled(nowMs: number = Date.now()): b
  */
 export const SESSION_RECORD_INLINE_STRING_MAX_CHARS = 4096;
 
+/** The session database is compacted (VACUUM) once its free pages exceed this and are at least half the file. */
+export const SESSION_DB_VACUUM_MIN_FREE_BYTES = 16 * 1024 * 1024;
+
 /** The compatibility export is skipped (the file stays as it was) past this size; its cost is main-thread time. */
 export const SESSIONS_JSON_COMPAT_EXPORT_MAX_BYTES = 64 * 1024 * 1024;
 

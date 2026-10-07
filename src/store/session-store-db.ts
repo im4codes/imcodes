@@ -15,7 +15,7 @@ import { existsSync, mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { suppressSqliteExperimentalWarning } from '../util/suppress-sqlite-warning.js';
 
-import { SESSION_DB_WAL_SIZE_LIMIT_BYTES } from '../../shared/session-store-compat.js';
+import { SESSION_DB_VACUUM_MIN_FREE_BYTES, SESSION_DB_WAL_SIZE_LIMIT_BYTES } from '../../shared/session-store-compat.js';
 import type { SessionBlob } from './session-record-blobs.js';
 const require = createRequire(import.meta.url);
 suppressSqliteExperimentalWarning();
@@ -196,6 +196,45 @@ function collectUnreferencedBlobs(handle: SessionDbHandle): void {
       )`);
   } catch {
     // No JSON functions or an unreadable payload: keep every blob (a leak of a few MB, never a lost reference).
+  }
+}
+
+/**
+ * Rows and blobs in ONE read transaction: a reader racing the daemon's blob collection must not see rows from before
+ * a commit and blobs from after it (a session would transiently lose its identity text).
+ */
+export function readSessionStoreSnapshot(handle: SessionDbHandle): { payloads: Map<string, string>; blobs: Map<string, string> } {
+  let began = false;
+  try {
+    handle.db.exec('BEGIN');
+    began = true;
+  } catch {
+    // Without a transaction the two reads below are merely two reads, as before.
+  }
+  try {
+    return { payloads: readSessionPayloads(handle), blobs: readSessionBlobs(handle) };
+  } finally {
+    if (began) { try { handle.db.exec('COMMIT'); } catch { /* read only: nothing to commit */ } }
+  }
+}
+
+/**
+ * After the rows shrink (a store rewritten from 0.5 MB payloads to references) the file keeps its size as free pages, and
+ * so does every snapshot taken from it. Compact once the free pages are large and are most of the file.
+ */
+export function vacuumSessionDbIfFragmented(handle: SessionDbHandle): { vacuumed: boolean; freeBytes: number } {
+  if (handle.readOnly) return { vacuumed: false, freeBytes: 0 };
+  try {
+    const pageSize = Number((handle.db.prepare('PRAGMA page_size').get() as { page_size: number | bigint }).page_size);
+    const pages = Number((handle.db.prepare('PRAGMA page_count').get() as { page_count: number | bigint }).page_count);
+    const free = Number((handle.db.prepare('PRAGMA freelist_count').get() as { freelist_count: number | bigint }).freelist_count);
+    const freeBytes = free * pageSize;
+    if (freeBytes < SESSION_DB_VACUUM_MIN_FREE_BYTES || free * 2 < pages) return { vacuumed: false, freeBytes };
+    handle.db.exec('VACUUM');
+    handle.db.exec('PRAGMA wal_checkpoint(TRUNCATE)');
+    return { vacuumed: true, freeBytes };
+  } catch {
+    return { vacuumed: false, freeBytes: 0 }; // compaction is an optimisation: never a reason to fail a flush
   }
 }
 

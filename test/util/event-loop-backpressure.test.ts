@@ -23,6 +23,7 @@ import {
   backpressureYield,
   eventLoopHealth,
   gateChildStream,
+  paceByEventLoopHealth,
   resetEventLoopHealthForTests,
 } from '../../src/util/event-loop-backpressure.js';
 
@@ -94,6 +95,15 @@ describe('a gated child stream', () => {
     health.stop();
   });
 
+  it('adds no error listener: an unhandled stream error still surfaces to its owner instead of being swallowed by the gate', () => {
+    const { health } = clocked();
+    const stream = new PassThrough();
+    expect(stream.listenerCount('error')).toBe(0);
+    health.gate(stream);
+    expect(stream.listenerCount('error')).toBe(0);
+    health.stop();
+  });
+
   it('never resumes a stream somebody else paused, and forgets a closed stream', async () => {
     const { health, advance } = clocked();
     const mine = new PassThrough();
@@ -160,6 +170,40 @@ describe('waiting for a healthy loop', () => {
   });
 });
 
+describe('restore pacing', () => {
+  const withBackpressure = async (run: () => Promise<void>) => {
+    const previous = process.env[EVENT_LOOP_BACKPRESSURE_ENV];
+    delete process.env[EVENT_LOOP_BACKPRESSURE_ENV];
+    resetEventLoopHealthForTests();
+    try { await run(); } finally { if (previous === undefined) delete process.env[EVENT_LOOP_BACKPRESSURE_ENV]; else process.env[EVENT_LOOP_BACKPRESSURE_ENV] = previous; }
+  };
+
+  it('under persistent overload the waits add up to a budget, after which only the floor applies', async () => {
+    await withBackpressure(async () => {
+      eventLoopHealth().recordProbe(5_000); // overloaded for the whole window
+      const budget = { leftMs: 400 };
+      const first = Date.now();
+      await paceByEventLoopHealth(20, budget);
+      const firstTook = Date.now() - first;
+      expect(firstTook).toBeGreaterThanOrEqual(380); // waited for health until the budget ran out
+      expect(budget.leftMs).toBeLessThanOrEqual(30);
+      const second = Date.now();
+      await paceByEventLoopHealth(20, budget);
+      expect(Date.now() - second).toBeLessThan(200); // budget spent: the floor only
+    });
+  });
+
+  it('a healthy loop costs only the floor and spends no budget', async () => {
+    await withBackpressure(async () => {
+      const budget = { leftMs: 1_000 };
+      const started = Date.now();
+      await paceByEventLoopHealth(30, budget);
+      expect(Date.now() - started).toBeLessThan(200);
+      expect(budget.leftMs).toBeGreaterThan(900);
+    });
+  });
+});
+
 describe('the kill switch', () => {
   it('IMCODES_EVENT_LOOP_BACKPRESSURE=0 turns the process-wide helpers into no-ops (test workers run with it)', () => {
     const previous = process.env[EVENT_LOOP_BACKPRESSURE_ENV];
@@ -182,14 +226,17 @@ describe('the kill switch', () => {
 
 describe('wiring (a class guard for every provider that reads a child process)', () => {
   const providers = join(ROOT, 'src/agent/providers');
-  const READS_CHILD = /createInterface\(\{\s*input:\s*child\.stdout|child\.stdout\??\.on\('data'|filterAcpJsonLines\(\s*child\.stdout/;
+  const READS_CHILD = /createInterface\(\{\s*input:\s*(?:child|proc|processHandle)\.stdout|(?:child|proc|processHandle)\.stdout\??\.on\('data'|filterAcpJsonLines\(\s*(?:child|proc|processHandle)\.stdout/;
+  const providerFiles = (dir: string): string[] => readdirSync(dir, { withFileTypes: true }).flatMap((entry) => (
+    entry.isDirectory() ? providerFiles(join(dir, entry.name)) : entry.name.endsWith('.ts') ? [join(dir, entry.name)] : []
+  ));
 
   it('every provider that reads child.stdout wraps it in gateChildStream', () => {
     const offenders: string[] = [];
-    for (const file of readdirSync(providers).filter((name) => name.endsWith('.ts'))) {
-      const lines = readFileSync(join(providers, file), 'utf8').split('\n');
+    for (const file of providerFiles(providers)) {
+      const lines = readFileSync(file, 'utf8').split('\n');
       lines.forEach((line, index) => {
-        if (READS_CHILD.test(line) && !line.includes('gateChildStream(')) offenders.push(`${file}:${index + 1}: ${line.trim()}`);
+        if (READS_CHILD.test(line) && !line.includes('gateChildStream(')) offenders.push(`${file.slice(providers.length + 1)}:${index + 1}: ${line.trim()}`);
       });
     }
     expect(offenders).toEqual([]);

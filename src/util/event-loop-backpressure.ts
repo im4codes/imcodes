@@ -104,9 +104,10 @@ export class EventLoopHealth {
     const entry: GatedStream = { stream, pausedByUsAt: null, graceUntil: 0, pauses: 0 };
     this.gated.add(entry);
     const dispose = (): void => { this.release(entry); this.gated.delete(entry); };
+    // No 'error' listener on purpose: one would swallow an unhandled stream error the owner relies on to surface.
+    // A failed stream is always followed by 'close' (autoDestroy), which releases it.
     stream.once('close', dispose);
     stream.once('end', dispose);
-    stream.once('error', dispose);
     return dispose;
   }
 
@@ -198,7 +199,14 @@ export async function backpressureYield(): Promise<void> {
 }
 
 /** Between two session restores: the minimum gap, then until the loop is healthy (never longer than the cap). */
-export function paceByEventLoopHealth(minGapMs = RESTORE_PACING_MIN_GAP_MS): Promise<void> {
-  if (!backpressureEnabled()) return new Promise((resolve) => { const timer = setTimeout(resolve, minGapMs); timer.unref?.(); });
-  return eventLoopHealth().waitUntilHealthy({ minGapMs, maxWaitMs: RESTORE_PACING_MAX_WAIT_MS });
+export async function paceByEventLoopHealth(minGapMs = RESTORE_PACING_MIN_GAP_MS, budget?: { leftMs: number }): Promise<void> {
+  // One restore may wait for health for RESTORE_PACING_TOTAL_WAIT_BUDGET_MS in all; past it only the floor applies.
+  const spent = budget && budget.leftMs <= 0;
+  if (!backpressureEnabled() || spent) {
+    await new Promise<void>((resolve) => { const timer = setTimeout(resolve, minGapMs); timer.unref?.(); });
+    return;
+  }
+  const startedAt = monotonicNowMs();
+  await eventLoopHealth().waitUntilHealthy({ minGapMs, maxWaitMs: Math.min(RESTORE_PACING_MAX_WAIT_MS, budget?.leftMs ?? RESTORE_PACING_MAX_WAIT_MS) });
+  if (budget) budget.leftMs -= Math.max(0, monotonicNowMs() - startedAt - minGapMs);
 }

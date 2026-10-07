@@ -1,6 +1,6 @@
 import { queuedUserMessageAttribution } from './transport-queued-user-message.js';
 import { paceByEventLoopHealth } from '../util/event-loop-backpressure.js';
-import { RESTORE_PACING_MIN_GAP_MS } from '../../shared/event-loop-backpressure.js';
+import { RESTORE_PACING_MIN_GAP_MS, RESTORE_PACING_TOTAL_WAIT_BUDGET_MS } from '../../shared/event-loop-backpressure.js';
 import { newSession, killSession, sessionExists, isPaneAlive, respawnPane, listSessions as tmuxListSessions, sendKeys, sendKey, capturePane, showBuffer, getPaneId, getPaneCwd, getPaneStartCommand, cleanupOrphanFifos, BACKEND } from './tmux.js';
 import { randomUUID } from 'node:crypto';
 import { existsSync } from 'node:fs';
@@ -1532,12 +1532,12 @@ const transportErrorRecoveryTimestamps = new Map<string, number[]>();
 async function pauseBetweenTransportRestores(
   index: number,
   delayMs = TRANSPORT_RESTORE_INTER_SESSION_DELAY_MS,
-  paceByHealth = false,
+  paceBudget?: { leftMs: number },
 ): Promise<void> {
   if (index <= 0) return new Promise((resolve) => setImmediate(resolve));
   // A warm restore of dozens of sessions is paced by what the daemon can take (158: 53 restores into a loop blocked
   // 1.2 s at a time), not by a fixed gap: the gap is a floor, and the next restore waits for the loop to recover.
-  if (paceByHealth) return paceByEventLoopHealth(Math.max(delayMs, RESTORE_PACING_MIN_GAP_MS));
+  if (paceBudget) return paceByEventLoopHealth(Math.max(delayMs, RESTORE_PACING_MIN_GAP_MS), paceBudget);
   return new Promise((resolve) => setTimeout(resolve, delayMs));
 }
 
@@ -2726,6 +2726,8 @@ export async function restoreTransportSessions(
   const restoreConcurrency = Number.isFinite(options.concurrency) && (options.concurrency ?? 0) >= 1
     ? Math.trunc(options.concurrency!)
     : TRANSPORT_RESTORE_CONCURRENCY;
+  // One restore waits for event-loop health for at most this long in all (then only the floor between sessions applies).
+  const restorePaceBudget = options.paceByEventLoopHealth === true ? { leftMs: RESTORE_PACING_TOTAL_WAIT_BUDGET_MS } : undefined;
   const restoreInterSessionDelayMs = Number.isFinite(options.interSessionDelayMs) && (options.interSessionDelayMs ?? -1) >= 0
     ? Math.trunc(options.interSessionDelayMs!)
     : TRANSPORT_RESTORE_INTER_SESSION_DELAY_MS;
@@ -2854,7 +2856,7 @@ export async function restoreTransportSessions(
       }, 'Transport restore stopped because the session authority changed');
       return true;
     };
-    await pauseBetweenTransportRestores(index, restoreInterSessionDelayMs, options.paceByEventLoopHealth === true);
+    await pauseBetweenTransportRestores(index, restoreInterSessionDelayMs, restorePaceBudget);
     if (rejectStaleRestoreInstance('restore_start')) return;
     const latestPersistedResumeId = getSession(s.name)?.providerResumeId?.trim()
       || s.providerResumeId?.trim();
