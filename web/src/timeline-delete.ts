@@ -1,7 +1,14 @@
-import { MSG_COMMAND_ACK, MSG_COMMAND_FAILED } from '@shared/ack-protocol.js';
+import {
+  ACK_FAILURE_ACK_TIMEOUT,
+  ACK_FAILURE_DAEMON_OFFLINE,
+  MSG_COMMAND_ACK,
+  MSG_COMMAND_FAILED,
+} from '@shared/ack-protocol.js';
+import { SHARE_DENIAL_REASONS } from '@shared/tab-sharing.js';
 import {
   TIMELINE_DELETE_ACK_TIMEOUT_MS,
   TIMELINE_DELETE_ERROR_CODES,
+  TIMELINE_DELETE_LEGACY_DAEMON_ERRORS,
   type TimelineDeleteErrorCode,
 } from '@shared/timeline-protocol.js';
 import type { WsClient } from './ws-client.js';
@@ -23,10 +30,22 @@ export class TimelineDeleteError extends Error {
 }
 
 const KNOWN_CODES: ReadonlySet<string> = new Set(Object.values(TIMELINE_DELETE_ERROR_CODES));
+const SHARE_DENIAL_REASON_SET: ReadonlySet<string> = new Set(SHARE_DENIAL_REASONS);
 
-/** Map whatever the daemon answered (incl. an older daemon's free text) onto a stable code. */
+/**
+ * Map whatever answered the delete onto a stable code: the current daemon's codes, the
+ * server's share denial (a shared viewer may not delete), a command.failed reason, and
+ * an older daemon's free text - which a current daemon never sends, so it means "upgrade".
+ */
 export function normalizeTimelineDeleteError(raw: unknown): TimelineDeleteErrorCode {
-  return typeof raw === 'string' && KNOWN_CODES.has(raw) ? raw as TimelineDeleteErrorCode : TIMELINE_DELETE_ERROR_CODES.FAILED;
+  if (typeof raw !== 'string') return TIMELINE_DELETE_ERROR_CODES.FAILED;
+  if (KNOWN_CODES.has(raw)) return raw as TimelineDeleteErrorCode;
+  if (SHARE_DENIAL_REASON_SET.has(raw)) return TIMELINE_DELETE_ERROR_CODES.PERMISSION_DENIED;
+  if (raw === ACK_FAILURE_DAEMON_OFFLINE) return TIMELINE_DELETE_ERROR_CODES.DAEMON_UNREACHABLE;
+  if (raw === ACK_FAILURE_ACK_TIMEOUT) return TIMELINE_DELETE_ERROR_CODES.TIMEOUT;
+  if (raw === TIMELINE_DELETE_LEGACY_DAEMON_ERRORS.SESSION_NOT_FOUND) return TIMELINE_DELETE_ERROR_CODES.SESSION_NOT_FOUND;
+  if (raw === TIMELINE_DELETE_LEGACY_DAEMON_ERRORS.MESSAGE_NOT_FOUND) return TIMELINE_DELETE_ERROR_CODES.DAEMON_OUTDATED;
+  return TIMELINE_DELETE_ERROR_CODES.FAILED;
 }
 
 /** i18n key for a delete failure (all seven locales carry these). */
@@ -34,6 +53,9 @@ export function timelineDeleteErrorKey(code: TimelineDeleteErrorCode): string {
   switch (code) {
     case TIMELINE_DELETE_ERROR_CODES.TIMEOUT: return 'chat.delete_message_error_timeout';
     case TIMELINE_DELETE_ERROR_CODES.SESSION_NOT_FOUND: return 'chat.delete_message_error_session';
+    case TIMELINE_DELETE_ERROR_CODES.PERMISSION_DENIED: return 'chat.delete_message_error_permission';
+    case TIMELINE_DELETE_ERROR_CODES.DAEMON_UNREACHABLE: return 'chat.delete_message_error_unreachable';
+    case TIMELINE_DELETE_ERROR_CODES.DAEMON_OUTDATED: return 'chat.delete_message_error_outdated';
     default: return 'chat.delete_message_error';
   }
 }
@@ -74,7 +96,7 @@ export function requestTimelineMessageDelete(
         if (message.status === 'error') finish(new TimelineDeleteError(normalizeTimelineDeleteError(message.error)));
         else finish();
       } else if (message.type === MSG_COMMAND_FAILED && message.commandId === commandId) {
-        finish(new TimelineDeleteError(TIMELINE_DELETE_ERROR_CODES.FAILED));
+        finish(new TimelineDeleteError(normalizeTimelineDeleteError(message.reason)));
       }
     });
     try {

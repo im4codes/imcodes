@@ -342,6 +342,9 @@
     "delete_message_error": "메시지를 삭제하지 못했습니다. 메시지를 복원했으니 다시 시도해 주세요.",
     "delete_message_error_timeout": "데몬이 제시간에 응답하지 않아 메시지를 복원했습니다. 연결을 확인한 뒤 다시 시도해 주세요.",
     "delete_message_error_session": "연결된 데몬에서 이 세션을 찾을 수 없어 메시지를 복원했습니다.",
+    "delete_message_error_permission": "공유 접근에서는 소유자만 메시지를 삭제할 수 있어 메시지를 복원했습니다.",
+    "delete_message_error_unreachable": "서버가 데몬에 연결하지 못해 메시지를 복원했습니다. 데몬이 온라인인지 확인한 뒤 다시 시도하세요.",
+    "delete_message_error_outdated": "이 데몬은 너무 오래되어 이 메시지를 삭제할 수 없어(최근 메시지만 인식) 메시지를 복원했습니다. 데몬을 업그레이드한 뒤 다시 시도하세요.",
     "dpad": {
       "title": "방향키 — 드래그하여 이동"
     },
@@ -2994,6 +2997,22 @@
         "registry_file_too_large": "스킬 레지스트리 파일이 너무 큽니다.",
         "registry_entry_limit_exceeded": "스킬 레지스트리 항목이 너무 많습니다.",
         "store_unavailable": "로컬 메모리 저장소가 시작 중이거나 일시적으로 사용할 수 없습니다. 잠시 후 다시 시도해 주세요."
+      },
+      "loadSection": {
+        "teams": "조직 목록",
+        "enterprise": "조직 데이터",
+        "policy": "프로젝트 정책",
+        "runtimeConfig": "이 서버의 처리 설정",
+        "cloudMemory": "개인 클라우드 메모리",
+        "enterpriseMemory": "조직 공유 메모리"
+      },
+      "loadError": {
+        "not_found": "{{section}}을(를) 불러오지 못했습니다. 서버가 \"찾을 수 없음\"으로 응답했습니다(HTTP {{status}}). 서버 버전이 오래되어 이 기능이 아직 없거나, 이 계정에 선택한 서버/조직에 대한 접근 권한이 없을 수 있습니다. 서버를 업데이트하거나 다른 서버/조직을 선택하세요.",
+        "forbidden": "{{section}}을(를) 불러오지 못했습니다. 접근이 거부되었습니다(HTTP {{status}}). 이 계정에는 선택한 서버 또는 조직에 대한 권한이 없습니다.",
+        "unauthorized": "{{section}}을(를) 불러오지 못했습니다. 로그인이 만료되었습니다(HTTP {{status}}). 페이지를 새로고침한 뒤 다시 로그인하세요.",
+        "unavailable": "{{section}}을(를) 불러오지 못했습니다. 서버를 사용할 수 없습니다(HTTP {{status}}). 잠시 후 다시 시도하세요.",
+        "network": "{{section}}을(를) 불러오지 못했습니다. 서버에 연결할 수 없습니다. 연결을 확인하세요.",
+        "other": "{{section}}을(를) 불러오지 못했습니다: {{detail}}"
       },
       "memoryToolsTitle": "Memory tools",
       "memoryToolsDescription": "Manage preferences, skills, markdown ingest, observations, and daemon memory feature status with the selected project identity.",

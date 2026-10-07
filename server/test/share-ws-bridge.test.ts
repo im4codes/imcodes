@@ -1128,6 +1128,88 @@ describe('WsBridge share-scoped sockets', () => {
     expect(daemon.sentJson.some((msg) => msg.type === TRANSPORT_QUEUE_COMMANDS.APPEND_MESSAGES)).toBe(false);
   });
 
+  it('timeline.delete is the owner\'s: a shared participant or viewer gets a coded ack (not a silent drop) and the daemon never sees it', async () => {
+    const bridge = WsBridge.get(serverId);
+    const target: ShareTarget = { kind: 'main', serverId, sessionName: 'deck_proj_brain' };
+    const daemon = new MockWs();
+    bridge.handleDaemonConnection(daemon as never, makeDb(), { JWT_SIGNING_KEY: 'share-ws-test-signing-key' } as never);
+    daemon.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+    await flushAsync();
+
+    for (const role of ['participant', 'viewer'] as const) {
+      bridge.setShareCoverageResolverForTests(async () => coverage(target, role, now));
+      const shared = new MockWs();
+      bridge.handleShareBrowserConnection(shared as never, `${role}-user`, makeDb(), {
+        ticketId: `share-ticket-delete-${role}`,
+        target,
+        snapshot: coverage(target, role, now),
+      });
+      daemon.sent.length = 0;
+      shared.emit('message', JSON.stringify({
+        type: TIMELINE_MESSAGES.DELETE,
+        sessionName: 'deck_proj_brain',
+        eventId: 'evt-1',
+        eventIds: ['evt-1', 'evt-2'],
+        commandId: `cmd-delete-${role}`,
+      }));
+      await flushAsync();
+
+      // The web maps this `error` (a SHARE_DENIAL_REASONS member) to a readable
+      // "only the owner can delete" text instead of the generic "please retry".
+      expect(shared.sentJson).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          type: MSG_COMMAND_ACK,
+          commandId: `cmd-delete-${role}`,
+          status: 'error',
+          error: SHARE_REASONS.DIRECT_SURFACE_DENIED,
+        }),
+      ]));
+      expect(daemon.sentJson.some((msg) => msg.type === TIMELINE_MESSAGES.DELETE)).toBe(false);
+    }
+  });
+
+  it('timeline.delete from the owner reaches the daemon whole and the daemon\'s ack comes back to the sender', async () => {
+    const bridge = WsBridge.get(serverId);
+    const daemon = new MockWs();
+    bridge.handleDaemonConnection(daemon as never, makeDb(), { JWT_SIGNING_KEY: 'share-ws-test-signing-key' } as never);
+    daemon.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+    await flushAsync();
+    daemon.sent.length = 0;
+
+    const owner = new MockWs();
+    bridge.handleBrowserConnection(owner as never, 'owner-user', makeDb());
+    owner.emit('message', JSON.stringify({
+      type: TIMELINE_MESSAGES.DELETE,
+      sessionName: 'deck_proj_brain',
+      eventId: 'evt-1',
+      eventIds: ['evt-1', 'evt-2'],
+      eventTypes: { 'evt-1': 'assistant.text', 'evt-2': 'assistant.text' },
+      commandId: 'cmd-delete-owner',
+    }));
+    await flushAsync();
+
+    expect(daemon.sentJson).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        type: TIMELINE_MESSAGES.DELETE,
+        sessionName: 'deck_proj_brain',
+        eventIds: ['evt-1', 'evt-2'],
+        commandId: 'cmd-delete-owner',
+      }),
+    ]));
+
+    // The sender never subscribed to the session; the ack must still find it.
+    daemon.emit('message', JSON.stringify({
+      type: MSG_COMMAND_ACK,
+      session: 'deck_proj_brain',
+      commandId: 'cmd-delete-owner',
+      status: 'accepted',
+    }));
+    await flushAsync();
+    expect(owner.sentJson).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: MSG_COMMAND_ACK, commandId: 'cmd-delete-owner', status: 'accepted' }),
+    ]));
+  });
+
   it('forwards identity refresh for a covered participant and rejects a viewer', async () => {
     const bridge = WsBridge.get(serverId);
     const target: ShareTarget = { kind: 'main', serverId, sessionName: 'deck_proj_brain' };

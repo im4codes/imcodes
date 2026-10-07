@@ -342,6 +342,9 @@
     "delete_message_error": "メッセージを削除できませんでした。元に戻しました。もう一度お試しください。",
     "delete_message_error_timeout": "デーモンが時間内に応答しなかったため、メッセージを元に戻しました。接続を確認してもう一度お試しください。",
     "delete_message_error_session": "接続中のデーモンにこのセッションが見つからないため、メッセージを元に戻しました。",
+    "delete_message_error_permission": "共有アクセスではオーナーのみがメッセージを削除できるため、メッセージを元に戻しました。",
+    "delete_message_error_unreachable": "サーバーがデーモンに接続できなかったため、メッセージを元に戻しました。デーモンがオンラインか確認してからやり直してください。",
+    "delete_message_error_outdated": "このデーモンは古すぎてこのメッセージを削除できない（最近のメッセージしか扱えない）ため、メッセージを元に戻しました。デーモンをアップグレードしてからやり直してください。",
     "dpad": {
       "title": "矢印キー — ドラッグで移動"
     },
@@ -2994,6 +2997,22 @@
         "registry_file_too_large": "スキルレジストリファイルが大きすぎます。",
         "registry_entry_limit_exceeded": "スキルレジストリの項目が多すぎます。",
         "store_unavailable": "ローカルメモリーストアを起動中、または一時的に利用できません。しばらくしてから再試行してください。"
+      },
+      "loadSection": {
+        "teams": "組織の一覧",
+        "enterprise": "組織のデータ",
+        "policy": "プロジェクトポリシー",
+        "runtimeConfig": "このサーバーの処理設定",
+        "cloudMemory": "個人クラウドメモリ",
+        "enterpriseMemory": "組織の共有メモリ"
+      },
+      "loadError": {
+        "not_found": "{{section}}を読み込めませんでした。サーバーが「見つかりません」と応答しました（HTTP {{status}}）。サーバーのバージョンが古くこの機能がまだない、または選択したサーバー／組織へのアクセス権がない可能性があります。サーバーを更新するか、別のサーバー／組織を選んでください。",
+        "forbidden": "{{section}}を読み込めませんでした。アクセスが拒否されました（HTTP {{status}}）。このアカウントには選択したサーバーまたは組織の権限がありません。",
+        "unauthorized": "{{section}}を読み込めませんでした。サインインが切れています（HTTP {{status}}）。ページを再読み込みして、もう一度サインインしてください。",
+        "unavailable": "{{section}}を読み込めませんでした。サーバーが利用できません（HTTP {{status}}）。しばらくしてからやり直してください。",
+        "network": "{{section}}を読み込めませんでした。サーバーに接続できません。接続を確認してください。",
+        "other": "{{section}}を読み込めませんでした：{{detail}}"
       },
       "memoryToolsTitle": "Memory tools",
       "memoryToolsDescription": "Manage preferences, skills, markdown ingest, observations, and daemon memory feature status with the selected project identity.",

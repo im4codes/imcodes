@@ -103,6 +103,15 @@ import { AgentSkillsPanel } from './AgentSkillsPanel.js';
 import { AgentMcpPanel } from './AgentMcpPanel.js';
 import { ChatMarkdown } from './ChatMarkdown.js';
 import type { WsClient } from '../ws-client.js';
+import {
+  PANEL_LOAD_SECTIONS,
+  PANEL_LOAD_SECTION_TABS,
+  classifyPanelLoadError,
+  panelLoadErrorKey,
+  panelLoadSectionKey,
+  PANEL_LOAD_ERROR_KINDS,
+  type PanelLoadSection,
+} from '../shared-context-load-errors.js';
 import { supportsDynamicTransportModels, useTransportModels } from '../hooks/useTransportModels.js';
 import { CLAUDE_CODE_MODEL_IDS, CODEX_MODEL_IDS, mergeModelSuggestions } from '../../../src/shared/models/options.js';
 import type { MemoryScoringWeights } from '@shared/memory-scoring.js';
@@ -1332,6 +1341,10 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
   const [loading, setLoading] = useState(false);
   const [policyLoading, setPolicyLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  /** One failed load per section, so an unrelated request neither hides nor shows another's failure. */
+  const [loadErrors, setLoadErrors] = useState<Partial<Record<PanelLoadSection, unknown>>>({});
+  /** Ids of the enterprises the account belongs to; null until the list has loaded (a ref: reading it must not re-run the memory load). */
+  const knownTeamIdsRef = useRef<ReadonlySet<string> | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<ManagementTab>('enterprise');
 
@@ -1820,6 +1833,23 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
   }), [t]);
   const currentScopePresentation = scopePresentation[scope];
 
+  const panelLoadErrorLines = useMemo(() => (
+    (Object.entries(loadErrors) as Array<[PanelLoadSection, unknown]>)
+      .filter(([section]) => PANEL_LOAD_SECTION_TABS[section].includes(activeTab))
+      .map(([section, err]) => {
+        const info = classifyPanelLoadError(err);
+        const fallbackToDetail = info.kind === PANEL_LOAD_ERROR_KINDS.OTHER;
+        return {
+          section,
+          text: t(panelLoadErrorKey(info.kind), {
+            section: t(panelLoadSectionKey(section)),
+            status: info.status ?? '',
+            detail: fallbackToDetail ? info.detail : '',
+          }),
+        };
+      })
+  ), [activeTab, loadErrors, t]);
+
   const tabs = useMemo<TabDef[]>(() => [
     { id: 'enterprise', label: t('sharedContext.management.tabs.enterprise') },
     { id: 'members', label: t('sharedContext.management.tabs.members') },
@@ -2009,6 +2039,17 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
     });
   }, [markMemoryAdminRequest, resolvingMemoryProjectIds, ws]);
 
+  const reportLoadError = useCallback((section: PanelLoadSection, err: unknown) => {
+    setLoadErrors((current) => ({ ...current, [section]: err }));
+  }, []);
+  const clearLoadError = useCallback((section: PanelLoadSection) => {
+    setLoadErrors((current) => {
+      if (!(section in current)) return current;
+      const next = { ...current };
+      delete next[section];
+      return next;
+    });
+  }, []);
   const refreshEnterpriseData = useCallback(async (nextEnterpriseId = enterpriseId) => {
     if (!nextEnterpriseId) {
       setTeam(null);
@@ -2024,7 +2065,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
       return;
     }
     setLoading(true);
-    setError(null);
+    clearLoadError(PANEL_LOAD_SECTIONS.ENTERPRISE);
     try {
       const [teamDetail, nextWorkspaces, nextProjects, nextDocuments, nextBindings] = await Promise.all([
         getTeam(nextEnterpriseId),
@@ -2054,21 +2095,27 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
           : (nextDocuments[0]?.id ?? '')
       ));
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      reportLoadError(PANEL_LOAD_SECTIONS.ENTERPRISE, err);
     } finally {
       setLoading(false);
     }
-  }, [enterpriseId]);
+  }, [clearLoadError, enterpriseId, reportLoadError]);
 
   useEffect(() => {
     void listTeams()
       .then((nextTeams) => {
         setTeams(nextTeams);
-        if (!enterpriseId && nextTeams[0]) {
+        knownTeamIdsRef.current = new Set(nextTeams.map((candidate) => candidate.id));
+        clearLoadError(PANEL_LOAD_SECTIONS.TEAMS);
+        // A remembered enterprise (pinned panel props) the account has since left or that
+        // was deleted only answers 404: fall back to one the account really belongs to.
+        if ((!enterpriseId || !nextTeams.some((candidate) => candidate.id === enterpriseId)) && nextTeams[0]) {
           setEnterpriseId(nextTeams[0].id);
+        } else if (enterpriseId && !nextTeams.some((candidate) => candidate.id === enterpriseId)) {
+          setEnterpriseId('');
         }
       })
-      .catch((err) => setError(err instanceof Error ? err.message : String(err)));
+      .catch((err) => reportLoadError(PANEL_LOAD_SECTIONS.TEAMS, err));
   }, []);
 
   useEffect(() => {
@@ -2096,12 +2143,12 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
       return;
     }
     setPolicyLoading(true);
-    setError(null);
+    clearLoadError(PANEL_LOAD_SECTIONS.POLICY);
     void getSharedProjectPolicy(selectedEnrollmentId)
       .then((nextPolicy) => setPolicy(nextPolicy))
       .catch((err) => {
         setPolicy(defaultPolicyState);
-        setError(err instanceof Error ? err.message : String(err));
+        reportLoadError(PANEL_LOAD_SECTIONS.POLICY, err);
       })
       .finally(() => setPolicyLoading(false));
   }, [selectedEnrollmentId]);
@@ -2150,6 +2197,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
 
   const reloadProcessingConfig = useCallback(async () => {
     if (!serverId) {
+      clearLoadError(PANEL_LOAD_SECTIONS.RUNTIME_CONFIG);
       setProcessingSnapshot(null);
       setProcessingPrimaryBackend(DEFAULT_PRIMARY_CONTEXT_BACKEND);
       setProcessingPrimaryModel(DEFAULT_PRIMARY_CONTEXT_RUNTIME_MODEL);
@@ -2163,16 +2211,18 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
       return;
     }
     setProcessingLoading(true);
-    setError(null);
+    clearLoadError(PANEL_LOAD_SECTIONS.RUNTIME_CONFIG);
     try {
       const view = await fetchSharedContextRuntimeConfig(serverId);
       applyProcessingSnapshot(view);
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      // 404 here is the server not being the account's own (or being unknown): the
+      // processing defaults stay on screen and the line below says why.
+      reportLoadError(PANEL_LOAD_SECTIONS.RUNTIME_CONFIG, err);
     } finally {
       setProcessingLoading(false);
     }
-  }, [applyProcessingSnapshot, serverId]);
+  }, [applyProcessingSnapshot, clearLoadError, reportLoadError, serverId]);
 
   useEffect(() => {
     if (activeTab !== 'processing' && activeTab !== 'memory') return;
@@ -2236,31 +2286,50 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
         setLocalPersonalMemoryStatus('unavailable');
       }
 
-      const cloudView = normalizeMemoryView(await getPersonalCloudMemory(queryInput));
-      if (memoryViewGenerationRef.current !== generation) return;
-      rememberMemoryProjectIndex(cloudView.projects ?? []);
-      setCloudPersonalMemory(cloudView);
-
-      if (enterpriseId) {
-        const enterpriseView = normalizeMemoryView(await getEnterpriseSharedMemory(enterpriseId, {
-          ...(browseCanonicalRepoId ? { canonicalRepoId: browseCanonicalRepoId } : {}),
-          projectionClass: memoryProjectionClass || undefined,
-          query: memoryQuery.trim() || undefined,
-          limit: 25,
-        }));
+      // The cloud and enterprise views are independent requests: one answering 404 (a server
+      // older than this page, or an enterprise the account is no longer in) must not blank
+      // the other, nor the local memory above, nor surface as a bare "API 404: not_found".
+      clearLoadError(PANEL_LOAD_SECTIONS.CLOUD_MEMORY);
+      clearLoadError(PANEL_LOAD_SECTIONS.ENTERPRISE_MEMORY);
+      try {
+        const cloudView = normalizeMemoryView(await getPersonalCloudMemory(queryInput));
         if (memoryViewGenerationRef.current !== generation) return;
-        rememberMemoryProjectIndex(enterpriseView.projects ?? []);
-        setSharedMemory(enterpriseView);
+        rememberMemoryProjectIndex(cloudView.projects ?? []);
+        setCloudPersonalMemory(cloudView);
+      } catch (err) {
+        if (memoryViewGenerationRef.current !== generation) return;
+        reportLoadError(PANEL_LOAD_SECTIONS.CLOUD_MEMORY, err);
+      }
+
+      // Skip an enterprise the account's own team list says it does not belong to: that request
+      // can only answer 404 (same-shape not-found, by design).
+      const enterpriseKnown = !knownTeamIdsRef.current || knownTeamIdsRef.current.has(enterpriseId);
+      if (enterpriseId && enterpriseKnown) {
+        try {
+          const enterpriseView = normalizeMemoryView(await getEnterpriseSharedMemory(enterpriseId, {
+            ...(browseCanonicalRepoId ? { canonicalRepoId: browseCanonicalRepoId } : {}),
+            projectionClass: memoryProjectionClass || undefined,
+            query: memoryQuery.trim() || undefined,
+            limit: 25,
+          }));
+          if (memoryViewGenerationRef.current !== generation) return;
+          rememberMemoryProjectIndex(enterpriseView.projects ?? []);
+          setSharedMemory(enterpriseView);
+        } catch (err) {
+          if (memoryViewGenerationRef.current !== generation) return;
+          reportLoadError(PANEL_LOAD_SECTIONS.ENTERPRISE_MEMORY, err);
+        }
       } else {
         if (memoryViewGenerationRef.current !== generation) return;
         setSharedMemory(EMPTY_MEMORY_VIEW);
       }
     } catch (err) {
+      // Only the local query setup can throw out here (sending on a dead socket).
       if (memoryViewGenerationRef.current === generation) setError(err instanceof Error ? err.message : String(err));
     } finally {
       if (memoryViewGenerationRef.current === generation) setMemoryLoading(false);
     }
-  }, [browseCanonicalRepoId, enterpriseId, memoryProjectionClass, memoryQuery, rememberMemoryProjectIndex, ws, showArchived]);
+  }, [browseCanonicalRepoId, clearLoadError, enterpriseId, memoryProjectionClass, memoryQuery, rememberMemoryProjectIndex, reportLoadError, showArchived, ws]);
 
   const loadMemoryAdminViews = useCallback(() => {
     if (!ws) {
@@ -3129,6 +3198,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
       </div>
       {loading && <div style={helperTextStyle}>{t('sharedContext.loading')}</div>}
       {error && <div style={{ color: '#fca5a5' }}>{error}</div>}
+      {panelLoadErrorLines.map((line) => <div key={line.section} data-load-error={line.section} style={{ color: '#fca5a5' }}>{line.text}</div>)}
       {notice && <div style={{ color: '#86efac' }}>{notice}</div>}
 
       {activeTab === 'enterprise' && (

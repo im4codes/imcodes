@@ -1,6 +1,13 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { MSG_COMMAND_ACK, MSG_COMMAND_FAILED } from '../../shared/ack-protocol.js';
-import { TIMELINE_DELETE_ERROR_CODES } from '../../shared/timeline-protocol.js';
+import {
+  ACK_FAILURE_ACK_TIMEOUT,
+  ACK_FAILURE_DAEMON_ERROR,
+  ACK_FAILURE_DAEMON_OFFLINE,
+  MSG_COMMAND_ACK,
+  MSG_COMMAND_FAILED,
+} from '../../shared/ack-protocol.js';
+import { SHARE_DENIAL_REASONS } from '../../shared/tab-sharing.js';
+import { TIMELINE_DELETE_ERROR_CODES, TIMELINE_DELETE_LEGACY_DAEMON_ERRORS } from '../../shared/timeline-protocol.js';
 import {
   TimelineDeleteError,
   normalizeTimelineDeleteError,
@@ -42,16 +49,46 @@ describe('requestTimelineMessageDelete', () => {
     await expect(promise).rejects.toMatchObject({ code: TIMELINE_DELETE_ERROR_CODES.SESSION_NOT_FOUND });
   });
 
-  it('maps an older daemon\'s free-text error and a command.failed to the generic failure', async () => {
+  it('tells an older daemon\'s free-text error from a generic failure: it means "upgrade the daemon"', async () => {
     const old = harness();
     const p1 = requestTimelineMessageDelete(old.ws as never, 'sess', targets);
-    old.deliver({ type: MSG_COMMAND_ACK, commandId: old.commandId(), status: 'error', error: 'Message not found' });
-    await expect(p1).rejects.toMatchObject({ code: TIMELINE_DELETE_ERROR_CODES.FAILED });
+    // A pre-structured daemon answers this for every message older than its ring buffer.
+    old.deliver({ type: MSG_COMMAND_ACK, commandId: old.commandId(), status: 'error', error: TIMELINE_DELETE_LEGACY_DAEMON_ERRORS.MESSAGE_NOT_FOUND });
+    await expect(p1).rejects.toMatchObject({ code: TIMELINE_DELETE_ERROR_CODES.DAEMON_OUTDATED });
 
-    const failed = harness();
-    const p2 = requestTimelineMessageDelete(failed.ws as never, 'sess', targets);
-    failed.deliver({ type: MSG_COMMAND_FAILED, commandId: failed.commandId(), session: 'sess', reason: 'daemon_offline', retryable: true });
-    await expect(p2).rejects.toMatchObject({ code: TIMELINE_DELETE_ERROR_CODES.FAILED });
+    const oldSession = harness();
+    const p2 = requestTimelineMessageDelete(oldSession.ws as never, 'sess', targets);
+    oldSession.deliver({ type: MSG_COMMAND_ACK, commandId: oldSession.commandId(), status: 'error', error: TIMELINE_DELETE_LEGACY_DAEMON_ERRORS.SESSION_NOT_FOUND });
+    await expect(p2).rejects.toMatchObject({ code: TIMELINE_DELETE_ERROR_CODES.SESSION_NOT_FOUND });
+
+    const unknown = harness();
+    const p3 = requestTimelineMessageDelete(unknown.ws as never, 'sess', targets);
+    unknown.deliver({ type: MSG_COMMAND_ACK, commandId: unknown.commandId(), status: 'error', error: 'something new' });
+    await expect(p3).rejects.toMatchObject({ code: TIMELINE_DELETE_ERROR_CODES.FAILED });
+  });
+
+  it('tells a share denial (the server refused a shared viewer) from a daemon failure', async () => {
+    for (const reason of SHARE_DENIAL_REASONS) {
+      const h = harness();
+      const promise = requestTimelineMessageDelete(h.ws as never, 'sess', targets);
+      // What `rejectShareScopedBrowserCommand` sends for a command outside the share policy.
+      h.deliver({ type: MSG_COMMAND_ACK, commandId: h.commandId(), session: 'sess', sessionName: 'sess', status: 'error', error: reason });
+      await expect(promise).rejects.toMatchObject({ code: TIMELINE_DELETE_ERROR_CODES.PERMISSION_DENIED });
+    }
+  });
+
+  it('maps a command.failed reason: daemon offline / ack timeout / anything else', async () => {
+    const cases: Array<[string, string]> = [
+      [ACK_FAILURE_DAEMON_OFFLINE, TIMELINE_DELETE_ERROR_CODES.DAEMON_UNREACHABLE],
+      [ACK_FAILURE_ACK_TIMEOUT, TIMELINE_DELETE_ERROR_CODES.TIMEOUT],
+      [ACK_FAILURE_DAEMON_ERROR, TIMELINE_DELETE_ERROR_CODES.FAILED],
+    ];
+    for (const [reason, code] of cases) {
+      const failed = harness();
+      const promise = requestTimelineMessageDelete(failed.ws as never, 'sess', targets);
+      failed.deliver({ type: MSG_COMMAND_FAILED, commandId: failed.commandId(), session: 'sess', reason, retryable: true });
+      await expect(promise).rejects.toMatchObject({ code });
+    }
   });
 
   it('times out with a coded error instead of waiting forever', async () => {
@@ -73,6 +110,9 @@ describe('requestTimelineMessageDelete', () => {
   it('maps codes to locale keys', () => {
     expect(timelineDeleteErrorKey(TIMELINE_DELETE_ERROR_CODES.TIMEOUT)).toBe('chat.delete_message_error_timeout');
     expect(timelineDeleteErrorKey(TIMELINE_DELETE_ERROR_CODES.SESSION_NOT_FOUND)).toBe('chat.delete_message_error_session');
+    expect(timelineDeleteErrorKey(TIMELINE_DELETE_ERROR_CODES.PERMISSION_DENIED)).toBe('chat.delete_message_error_permission');
+    expect(timelineDeleteErrorKey(TIMELINE_DELETE_ERROR_CODES.DAEMON_UNREACHABLE)).toBe('chat.delete_message_error_unreachable');
+    expect(timelineDeleteErrorKey(TIMELINE_DELETE_ERROR_CODES.DAEMON_OUTDATED)).toBe('chat.delete_message_error_outdated');
     expect(timelineDeleteErrorKey(TIMELINE_DELETE_ERROR_CODES.FAILED)).toBe('chat.delete_message_error');
     expect(normalizeTimelineDeleteError(undefined)).toBe(TIMELINE_DELETE_ERROR_CODES.FAILED);
   });

@@ -49,6 +49,23 @@ export const TIMELINE_DELETE_ERROR_CODES = {
   FAILED: 'delete_failed',
   /** Client-side only: no ack arrived in time. */
   TIMEOUT: 'timeout',
+  /** Client-side only: the server refused the command for this (shared) viewer; see `SHARE_DENIAL_REASONS`. */
+  PERMISSION_DENIED: 'permission_denied',
+  /** Client-side only: the server could not reach the daemon (`command.failed`). */
+  DAEMON_UNREACHABLE: 'daemon_unreachable',
+  /** Client-side only: the daemon answered with a pre-structured free-text error, i.e. it predates this protocol. */
+  DAEMON_OUTDATED: 'daemon_outdated',
+} as const;
+
+/**
+ * Free-text `error`s a daemon older than the structured delete protocol answers with.
+ * That daemon looked a single id up in its ring buffer plus a bounded JSONL tail and
+ * answered "Message not found" for everything older - a message a current daemon would
+ * tombstone. A current daemon never answers these, so seeing one means "upgrade the daemon".
+ */
+export const TIMELINE_DELETE_LEGACY_DAEMON_ERRORS = {
+  SESSION_NOT_FOUND: 'Session not found',
+  MESSAGE_NOT_FOUND: 'Message not found',
 } as const;
 export type TimelineDeleteErrorCode = (typeof TIMELINE_DELETE_ERROR_CODES)[keyof typeof TIMELINE_DELETE_ERROR_CODES];
 

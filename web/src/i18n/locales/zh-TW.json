@@ -342,6 +342,9 @@
     "delete_message_error": "刪除訊息失敗，已還原該訊息，請重試。",
     "delete_message_error_timeout": "守護程序未及時回應，已還原該訊息。請檢查連線後重試。",
     "delete_message_error_session": "已連線的守護程序上找不到該工作階段，已還原該訊息。",
+    "delete_message_error_permission": "共享存取下只有擁有者可以刪除訊息，已恢復該訊息。",
+    "delete_message_error_unreachable": "伺服器連不上守護程序，已恢復該訊息。請確認守護程序在線後重試。",
+    "delete_message_error_outdated": "該守護程序版本過舊，無法刪除這則訊息（它只認得最近的訊息），已恢復該訊息。請升級守護程序後重試。",
     "dpad": {
       "title": "方向鍵 — 拖曳發送方向鍵"
     },
@@ -2995,6 +2998,22 @@
         "registry_file_too_large": "技能註冊表檔案過大。",
         "registry_entry_limit_exceeded": "技能註冊表條目過多。",
         "store_unavailable": "本機記憶儲存正在啟動或暫時無法使用，請稍後重試。"
+      },
+      "loadSection": {
+        "teams": "企業清單",
+        "enterprise": "企業資料",
+        "policy": "專案策略",
+        "runtimeConfig": "此伺服器的處理設定",
+        "cloudMemory": "個人雲端記憶",
+        "enterpriseMemory": "企業共享記憶"
+      },
+      "loadError": {
+        "not_found": "無法載入{{section}}：伺服器回應「找不到」（HTTP {{status}}）。可能是伺服器版本較舊、尚未提供此功能，也可能是目前帳號對所選伺服器或企業沒有存取權限。請升級伺服器，或改選其他伺服器/企業。",
+        "forbidden": "無法載入{{section}}：存取被拒絕（HTTP {{status}}）。目前帳號對所選伺服器或企業沒有權限。",
+        "unauthorized": "無法載入{{section}}：登入已失效（HTTP {{status}}）。請重新整理頁面後重新登入。",
+        "unavailable": "無法載入{{section}}：伺服器暫時無法使用（HTTP {{status}}）。請稍後重試。",
+        "network": "無法載入{{section}}：連不上伺服器。請檢查網路。",
+        "other": "無法載入{{section}}：{{detail}}"
       },
       "memoryToolsTitle": "记忆工具",
       "memoryToolsDescription": "基于已选择的项目身份管理偏好、技能、Markdown 导入、观察记录和 daemon 记忆功能状态。",

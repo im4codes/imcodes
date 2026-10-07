@@ -342,6 +342,9 @@
     "delete_message_error": "No se pudo eliminar el mensaje. Se ha restaurado; inténtalo de nuevo.",
     "delete_message_error_timeout": "El daemon no respondió a tiempo y el mensaje se ha restaurado. Comprueba la conexión e inténtalo de nuevo.",
     "delete_message_error_session": "Esta sesión no está disponible en el daemon conectado, así que el mensaje se ha restaurado.",
+    "delete_message_error_permission": "En el acceso compartido solo el propietario puede eliminar mensajes, así que se restauró el mensaje.",
+    "delete_message_error_unreachable": "El servidor no pudo contactar con el daemon, así que se restauró el mensaje. Comprueba que el daemon esté en línea e inténtalo de nuevo.",
+    "delete_message_error_outdated": "Este daemon es demasiado antiguo para eliminar este mensaje (solo conoce los recientes), así que se restauró. Actualiza el daemon e inténtalo de nuevo.",
     "dpad": {
       "title": "Teclas de flecha: arrastra para mover"
     },
@@ -2995,6 +2998,22 @@
         "registry_file_too_large": "El archivo de registro de habilidades es demasiado grande.",
         "registry_entry_limit_exceeded": "El registro de habilidades tiene demasiadas entradas.",
         "store_unavailable": "El almacén de memoria local se está iniciando o no está disponible temporalmente. Vuelve a intentarlo en un momento."
+      },
+      "loadSection": {
+        "teams": "Lista de empresas",
+        "enterprise": "Datos de la empresa",
+        "policy": "Política del proyecto",
+        "runtimeConfig": "Ajustes de procesamiento de este servidor",
+        "cloudMemory": "Memoria personal en la nube",
+        "enterpriseMemory": "Memoria compartida de la empresa"
+      },
+      "loadError": {
+        "not_found": "No se pudo cargar: {{section}}. El servidor respondió «no encontrado» (HTTP {{status}}). Puede ser una versión antigua del servidor sin esta función, o que esta cuenta no tenga acceso al servidor o a la empresa seleccionados. Actualiza el servidor o elige otro servidor o empresa.",
+        "forbidden": "No se pudo cargar: {{section}}. Acceso denegado (HTTP {{status}}). Esta cuenta no tiene permiso sobre el servidor o la empresa seleccionados.",
+        "unauthorized": "No se pudo cargar: {{section}}. La sesión ha caducado (HTTP {{status}}). Recarga la página e inicia sesión de nuevo.",
+        "unavailable": "No se pudo cargar: {{section}}. El servidor no está disponible (HTTP {{status}}). Inténtalo de nuevo en un momento.",
+        "network": "No se pudo cargar: {{section}}. No se pudo contactar con el servidor. Revisa tu conexión.",
+        "other": "No se pudo cargar: {{section}}. {{detail}}"
       },
       "memoryToolsTitle": "Memory tools",
       "memoryToolsDescription": "Manage preferences, skills, markdown ingest, observations, and daemon memory feature status with the selected project identity.",

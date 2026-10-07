@@ -342,6 +342,9 @@
     "delete_message_error": "Couldn't delete the message. It has been restored — please try again.",
     "delete_message_error_timeout": "The daemon didn't answer in time, so the message was restored. Check the connection and try again.",
     "delete_message_error_session": "This session is not available on the connected daemon, so the message was restored.",
+    "delete_message_error_permission": "Only the owner can delete messages in shared access, so the message was restored.",
+    "delete_message_error_unreachable": "The server could not reach the daemon, so the message was restored. Check that the daemon is online and try again.",
+    "delete_message_error_outdated": "This daemon is too old to delete this message (it only knows recent ones), so the message was restored. Upgrade the daemon and try again.",
     "dpad": {
       "title": "Arrow keys — drag to move"
     },
@@ -2995,6 +2998,22 @@
         "registry_file_too_large": "The skill registry file is too large.",
         "registry_entry_limit_exceeded": "The skill registry has too many entries.",
         "store_unavailable": "Local memory store is starting or unavailable. Please retry in a moment."
+      },
+      "loadSection": {
+        "teams": "Enterprise list",
+        "enterprise": "Enterprise data",
+        "policy": "Project policy",
+        "runtimeConfig": "This server's processing settings",
+        "cloudMemory": "Personal cloud memory",
+        "enterpriseMemory": "Enterprise shared memory"
+      },
+      "loadError": {
+        "not_found": "{{section}} could not be loaded: the server answered \"not found\" (HTTP {{status}}). The server may be an older version that does not have this feature yet, or this account has no access to the selected server or enterprise. Update the server, or pick another server or enterprise.",
+        "forbidden": "{{section}} could not be loaded: access denied (HTTP {{status}}). This account has no permission for the selected server or enterprise.",
+        "unauthorized": "{{section}} could not be loaded: you are signed out (HTTP {{status}}). Reload the page and sign in again.",
+        "unavailable": "{{section}} could not be loaded: the server is unavailable (HTTP {{status}}). Try again shortly.",
+        "network": "{{section}} could not be loaded: the server could not be reached. Check your connection.",
+        "other": "{{section}} could not be loaded: {{detail}}"
       },
       "memoryToolsTitle": "Memory tools",
       "memoryToolsDescription": "Manage preferences, skills, markdown ingest, observations, and daemon memory feature status with the selected project identity.",

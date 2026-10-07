@@ -76,6 +76,7 @@ vi.mock('../../src/api.js', () => ({
   deleteEnterpriseSharedMemory: (...args: unknown[]) => deleteEnterpriseSharedMemoryMock(...args),
 }));
 
+import { ApiError } from '../../src/api.js';
 import { SharedContextManagementPanel } from '../../src/components/SharedContextManagementPanel.js';
 
 async function flush() {
@@ -1046,6 +1047,81 @@ describe('SharedContextManagementPanel', () => {
       fireEvent.click(screen.getByText('sharedContext.management.memoryToolTabPreferences'));
     });
     expect((await screen.findAllByText('sharedContext.management.memoryToolDisabledNoDaemon')).length).toBeGreaterThan(0);
+  });
+
+  describe('a failed load names the request and its cause instead of a bare "API 404: not_found"', () => {
+    const notFound = () => new ApiError(404, 'not_found');
+    const makeWs = () => {
+      const sent: Array<Record<string, unknown>> = [];
+      return {
+        sent,
+        ws: {
+          send(message: Record<string, unknown>) { sent.push(message); },
+          onMessage() { return () => undefined; },
+        },
+      };
+    };
+
+    it('the memory tab keeps every section that loaded when the others answer 404 (older server / server the account does not own / left enterprise)', async () => {
+      fetchSharedContextRuntimeConfigMock.mockRejectedValue(notFound());
+      getEnterpriseSharedMemoryMock.mockRejectedValue(notFound());
+      const { ws, sent } = makeWs();
+      render(<SharedContextManagementPanel serverId="srv-1" ws={ws as never} />);
+      await flush();
+      await act(async () => { fireEvent.click(screen.getByText('sharedContext.management.tabs.memory')); });
+
+      // Each failed request is its own line, in the cause's words, never the raw code.
+      await waitFor(() => {
+        const sections = [...document.querySelectorAll('[data-load-error]')].map((node) => node.getAttribute('data-load-error')).sort();
+        expect(sections).toEqual(['enterpriseMemory', 'runtimeConfig']);
+      });
+      expect(screen.getAllByText('sharedContext.management.loadError.not_found')).toHaveLength(2);
+      expect(document.body.textContent).not.toContain('API 404');
+      // The requests that did not fail still ran and rendered: the local query was sent
+      // and the personal cloud memory (called BEFORE the failing enterprise one) is on screen.
+      expect(sent.some((message) => message.type === MEMORY_WS.PERSONAL_QUERY)).toBe(true);
+      expect(getPersonalCloudMemoryMock).toHaveBeenCalled();
+      expect(document.querySelector('[data-load-error="cloudMemory"]')).toBeNull();
+    });
+
+    it('a failing personal cloud request does not stop the enterprise memory from loading', async () => {
+      getPersonalCloudMemoryMock.mockRejectedValue(notFound());
+      const { ws } = makeWs();
+      render(<SharedContextManagementPanel serverId="srv-1" ws={ws as never} />);
+      await flush();
+      await act(async () => { fireEvent.click(screen.getByText('sharedContext.management.tabs.memory')); });
+      await waitFor(() => expect(getEnterpriseSharedMemoryMock).toHaveBeenCalledWith('team-1', expect.any(Object)));
+      await waitFor(() => expect(document.querySelector('[data-load-error="cloudMemory"]')).not.toBeNull());
+      expect(document.querySelector('[data-load-error="enterpriseMemory"]')).toBeNull();
+    });
+
+    it('a load error is shown only on the tabs that display what failed', async () => {
+      fetchSharedContextRuntimeConfigMock.mockRejectedValue(notFound());
+      const { ws } = makeWs();
+      render(<SharedContextManagementPanel serverId="srv-1" ws={ws as never} />);
+      await flush();
+      await act(async () => { fireEvent.click(screen.getByText('sharedContext.management.tabs.processing')); });
+      await waitFor(() => expect(document.querySelector('[data-load-error="runtimeConfig"]')).not.toBeNull());
+      await act(async () => { fireEvent.click(screen.getByText('sharedContext.management.tabs.enterprise')); });
+      expect(document.querySelector('[data-load-error]')).toBeNull();
+    });
+
+    it('a remembered enterprise the account no longer belongs to is replaced, not queried (it can only answer 404)', async () => {
+      getTeamMock.mockImplementation(async (id: string) => {
+        if (id === 'gone-team') throw notFound();
+        return { id, name: 'Acme', myRole: 'owner', members: [] };
+      });
+      const { ws } = makeWs();
+      render(<SharedContextManagementPanel enterpriseId="gone-team" serverId="srv-1" ws={ws as never} />);
+      await flush();
+      await flush();
+      await act(async () => { fireEvent.click(screen.getByText('sharedContext.management.tabs.memory')); });
+      await waitFor(() => expect(getEnterpriseSharedMemoryMock).toHaveBeenCalledWith('team-1', expect.any(Object)));
+      expect(getEnterpriseSharedMemoryMock.mock.calls.some((call) => call[0] === 'gone-team')).toBe(false);
+      await act(async () => { fireEvent.click(screen.getByText('sharedContext.management.tabs.enterprise')); });
+      await waitFor(() => expect(getTeamMock).toHaveBeenCalledWith('team-1'));
+      expect(document.querySelector('[data-load-error]')).toBeNull();
+    });
   });
 
   it('shows local memory as unavailable instead of rendering zero counts', async () => {
