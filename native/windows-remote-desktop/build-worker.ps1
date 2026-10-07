@@ -66,6 +66,7 @@ $ExpectedCommonSources = @(
   'data_channel_constants.h',
   'data_channel_payload.cc', 'data_channel_payload.h',
   'clipboard_paste_assembler.h',
+  'encode_speed_governor.h',
   'input_ledger.cc', 'input_ledger.h',
   'json_protocol.cc', 'json_protocol.h',
   'local_management_ipc.cc', 'local_management_ipc.h',
