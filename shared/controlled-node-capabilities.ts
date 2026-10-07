@@ -1,6 +1,7 @@
 import {
   FILE_TRANSFER_DOWNLOAD_STREAM_CAPABILITY,
   FILE_TRANSFER_DIRECTORY_CAPABILITY,
+  FILE_TRANSFER_DIRECTORY_QUERY_CAPABILITY,
   FILE_TRANSFER_PATH_HANDLE_CAPABILITY,
   FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY,
 } from './transport/file-transfer.js';
@@ -33,6 +34,7 @@ export const CONTROLLED_NODE_CAPABILITIES = [
   FILE_TRANSFER_DOWNLOAD_STREAM_CAPABILITY,
   FILE_TRANSFER_PATH_HANDLE_CAPABILITY,
   FILE_TRANSFER_DIRECTORY_CAPABILITY,
+  FILE_TRANSFER_DIRECTORY_QUERY_CAPABILITY,
   MACHINE_DIRECT_FILE_TRANSFER_CAPABILITY,
   MACHINE_DIRECT_FILE_FETCH_CAPABILITY,
   REMOTE_DESKTOP_CAPABILITY,
@@ -66,7 +68,14 @@ export type ControlledNodeCapability = typeof CONTROLLED_NODE_CAPABILITIES[numbe
 // input, lock-screen, branding and local disclosure independently. Keep the
 // envelope bounded while leaving room for that explicit feature matrix and
 // future non-Windows adapters; 16 would reject the already-specified set.
-export const CONTROLLED_NODE_CAPABILITY_MAX_ITEMS = 32;
+//
+// This is the bound a RECEIVER enforces. It was 32 and is 40 now that the
+// known registry (which lists every platform's mutually exclusive entries)
+// outgrew 32. A node never advertises the whole registry: a server that still
+// enforces 32 only sees what one machine advertises, and
+// `test/shared/file-transfer-directory-query.test.ts` pins that no platform's
+// advertisement exceeds 32.
+export const CONTROLLED_NODE_CAPABILITY_MAX_ITEMS = 40;
 export const CONTROLLED_NODE_CAPABILITY_MAX_LENGTH = 128;
 const CONTROLLED_NODE_CAPABILITY_ADVERTISEMENT_PATTERN = /^[a-z0-9][a-z0-9._-]*$/;
 

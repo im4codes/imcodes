@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdir, mkdtemp, readFile, realpath, rm, stat, symlink, unlink, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, realpath, rm, stat, symlink, unlink, utimes, writeFile } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -737,6 +737,47 @@ describe('file-transfer local handle hardening', () => {
         { name: 'report.txt', path: path.join(await realpath(parent), 'report.txt'), isDir: false, hidden: false },
       ],
     }]);
+  });
+
+  it('answers a listing query with metadata and a truncation report, ordered before the cut', async () => {
+    const parent = path.join(rootDir, 'directory-query');
+    await mkdir(parent, { recursive: true });
+    for (let index = 0; index < 600; index += 1) await writeFile(path.join(parent, `f-${String(index).padStart(4, '0')}.txt`), 'x');
+    const newest = path.join(parent, 'zz-newest.txt');
+    await writeFile(newest, 'abcd');
+    await utimes(newest, new Date('2031-01-01T00:00:00Z'), new Date('2031-01-01T00:00:00Z'));
+    const transfer = await loadFileTransferHandler(fakeHome);
+    const result = createServerLinkMock();
+
+    await transfer.handleFileDirectoryList({
+      type: FILE_TRANSFER_MSG.DIRECTORY_LIST,
+      requestId: 'directory-query-1',
+      path: parent,
+      query: { sort: { key: 'modified', direction: 'desc', dirsFirst: true } },
+    }, result.serverLink);
+
+    const message = result.sent[0] as { entries: Array<Record<string, unknown>>; truncated?: boolean; total?: number };
+    expect(message.entries).toHaveLength(512);
+    expect(message.entries[0]).toMatchObject({ name: 'zz-newest.txt', size: 4, mtimeMs: Date.parse('2031-01-01T00:00:00Z') });
+    expect(message.truncated).toBe(true);
+    expect(message.total).toBe(601);
+  });
+
+  it('answers a malformed listing query with an error, never a listing', async () => {
+    const parent = path.join(rootDir, 'directory-query-bad');
+    await mkdir(parent, { recursive: true });
+    const transfer = await loadFileTransferHandler(fakeHome);
+    const result = createServerLinkMock();
+
+    await transfer.handleFileDirectoryList({
+      type: FILE_TRANSFER_MSG.DIRECTORY_LIST,
+      requestId: 'directory-query-2',
+      path: parent,
+      query: { sort: { key: 'modified', direction: 'desc', dirsFirst: true }, nameFilter: 'x'.repeat(300) },
+    }, result.serverLink);
+
+    expect(result.sent).toHaveLength(1);
+    expect(result.sent[0]).toMatchObject({ type: FILE_TRANSFER_MSG.DIRECTORY_LIST_ERROR, requestId: 'directory-query-2' });
   });
 
   it('commits a relay upload into the selected existing directory without overwrite', async () => {

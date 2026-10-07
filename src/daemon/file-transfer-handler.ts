@@ -55,6 +55,7 @@ import {
   WELL_KNOWN_DIRECTORY,
   type WellKnownDirectoryKind,
 } from './well-known-directories.js';
+import { buildQueriedDirectoryListing } from './file-directory-query.js';
 import { resolveMacosUserSession, launchMacosUserSessionCommand } from '../node/user-session-launcher.js';
 import { DIRECT_FILE_TRANSFER_COMMIT_INTENT_SUFFIX } from '../../shared/direct-file-transfer.js';
 import { FS_GENERIC_ERROR_CODES } from '../../shared/fs-error-codes.js';
@@ -1252,25 +1253,36 @@ export async function handleFileDirectoryList(cmd: Record<string, unknown>, send
     if (directoryStat.isSymbolicLink() || !directoryStat.isDirectory()) {
       throw new Error('not_directory');
     }
-    const entries = (await readdir(canonical.realPath, { withFileTypes: true }))
-      .filter((entry) => entry.isDirectory() || entry.isFile())
-      .map((entry): FileDirectoryEntry => ({
-        name: entry.name,
-        path: path.join(canonical.realPath, entry.name),
-        isDir: entry.isDirectory(),
-        hidden: entry.name.startsWith('.'),
-      }))
-      .sort((a, b) => {
-        if (a.isDir !== b.isDir) return a.isDir ? -1 : 1;
-        return a.name === b.name ? 0 : a.name < b.name ? -1 : 1;
-      })
-      .slice(0, FILE_TRANSFER_DIRECTORY_MAX_ENTRIES);
+    const dirents = (await readdir(canonical.realPath, { withFileTypes: true }))
+      .filter((entry) => entry.isDirectory() || entry.isFile());
+    // A request WITH a query is from a peer that advertised the capability and
+    // gets the ordered/filtered/metadata form; one without gets the plain
+    // listing exactly as before.
+    const queried = parsed.value.query
+      ? await buildQueriedDirectoryListing({ realPath: canonical.realPath, dirents, query: parsed.value.query })
+      : null;
+    const entries = queried
+      ? queried.entries
+      : dirents
+        .map((entry): FileDirectoryEntry => ({
+          name: entry.name,
+          path: path.join(canonical.realPath, entry.name),
+          isDir: entry.isDirectory(),
+          hidden: entry.name.startsWith('.'),
+        }))
+        .sort((a, b) => {
+          if (a.isDir !== b.isDir) return a.isDir ? -1 : 1;
+          return a.name === b.name ? 0 : a.name < b.name ? -1 : 1;
+        })
+        .slice(0, FILE_TRANSFER_DIRECTORY_MAX_ENTRIES);
     sender.send({
       type: FILE_TRANSFER_MSG.DIRECTORY_LIST_DONE,
       requestId: parsed.value.requestId,
       path: parsed.value.path,
       resolvedPath: canonical.realPath,
       entries,
+      ...(queried?.truncated ? { truncated: true as const, total: queried.total as number } : {}),
+      ...(queried?.partial ? { partial: true as const } : {}),
     } satisfies FileDirectoryListDone);
   } catch (error) {
     // Covers both the explicit throw above (well-known resolution already

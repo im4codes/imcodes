@@ -3,6 +3,13 @@
  * Used by server, daemon, and web.
  */
 
+import {
+  FILE_BROWSER_FILTER_MAX_QUERY_CHARS,
+  FILE_BROWSER_SORT_DIRECTIONS,
+  FILE_BROWSER_SORT_KEY_LIST,
+  type FileBrowserSortState,
+} from '../file-browser-sort.js';
+
 // ── Object model ──────────────────────────────────────────────────────────────
 
 export type AttachmentSource = 'upload' | 'camera' | 'paste' | 'local' | 'generated';
@@ -222,6 +229,16 @@ export function parseFileTransferContentRange(
   return { start, end, total };
 }
 export const FILE_TRANSFER_DIRECTORY_CAPABILITY = 'file.transfer.directory.v1' as const;
+/**
+ * The node can filter and order a directory listing itself (`query` on the list
+ * request) and report size/mtime/birthtime per entry plus `truncated`/`total`.
+ * Peers that do not advertise it get the plain listing, byte for byte.
+ */
+export const FILE_TRANSFER_DIRECTORY_QUERY_CAPABILITY = 'file.transfer.directory.query.v1' as const;
+/** A query stats at most this many entries; a larger match set is ordered over its first ones and reported `partial`. */
+export const FILE_TRANSFER_DIRECTORY_QUERY_MAX_STAT_ENTRIES = 50_000;
+/** Wall-clock budget of one query's stat pass; entries not stat'd by then sort last and the answer is `partial`. */
+export const FILE_TRANSFER_DIRECTORY_QUERY_BUDGET_MS = 8_000;
 export const FILE_TRANSFER_PATH_MAX_BYTES = 4 * 1024;
 export const FILE_TRANSFER_ERROR_MAX_BYTES = 256;
 export const FILE_TRANSFER_DIRECTORY_MAX_ENTRIES = 512;
@@ -403,10 +420,24 @@ export interface FilePathHandleRequest {
   path: string;
 }
 
+/**
+ * What a node does to a listing before it truncates it to
+ * FILE_TRANSFER_DIRECTORY_MAX_ENTRIES: keep the entries whose name matches
+ * `nameFilter` (every whitespace-separated term, case-insensitive substring;
+ * never a pattern, never applied to the path), then order them by `sort`.
+ * Only sent to a node that advertises FILE_TRANSFER_DIRECTORY_QUERY_CAPABILITY.
+ */
+export interface FileDirectoryListQuery {
+  sort: FileBrowserSortState;
+  nameFilter?: string;
+}
+
 export interface FileDirectoryListRequest {
   type: typeof FILE_TRANSFER_MSG.DIRECTORY_LIST;
   requestId: string;
   path: string;
+  /** Absent for a plain listing (every peer that predates the query capability). */
+  query?: FileDirectoryListQuery;
 }
 
 export interface FileDirectoryEntry {
@@ -422,6 +453,14 @@ export interface FileDirectoryEntry {
    */
   totalBytes?: number;
   freeBytes?: number;
+  /**
+   * Present only in answer to a `query`. Bytes (files only); last-modified and
+   * creation time in epoch ms. `birthtimeMs` is left out where the platform
+   * cannot report a creation time (Linux): a ctime is never sent in its place.
+   */
+  size?: number;
+  mtimeMs?: number;
+  birthtimeMs?: number;
 }
 
 /** Non-negative, finite, and small enough to be a real byte count. */
@@ -430,12 +469,27 @@ function isByteCount(value: unknown): value is number {
     && value <= Number.MAX_SAFE_INTEGER;
 }
 
+/** A timestamp in epoch milliseconds: finite, non-negative, within the range a Date can hold. */
+function isEpochMs(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= 8.64e15;
+}
+
 export interface FileDirectoryListDone {
   type: typeof FILE_TRANSFER_MSG.DIRECTORY_LIST_DONE;
   requestId: string;
   path: string;
   resolvedPath: string;
   entries: FileDirectoryEntry[];
+  /** Present (true) only when a query matched more entries than `entries` carries. */
+  truncated?: true;
+  /** Entries that matched the query (before truncation); only present with `truncated`. */
+  total?: number;
+  /**
+   * The order was computed over only part of the matching entries: more matched
+   * than the stat limit allows, or the time budget ran out before every one
+   * had been stat'd. `total` is still the full count of matches.
+   */
+  partial?: true;
 }
 
 export interface FileDirectoryListError {
@@ -678,12 +732,27 @@ export function validateFilePathHandleRequest(value: unknown): FileTransferValid
   return { ok: true, value: value as unknown as FilePathHandleRequest };
 }
 
+/** Exact shape only: unknown keys, an unknown sort key, or a name filter over the length limit are all rejected. */
+export function isFileDirectoryListQuery(value: unknown): value is FileDirectoryListQuery {
+  if (!isObject(value) || !hasOnlyKeys(value, new Set(['sort', 'nameFilter']))) return false;
+  const sort = value.sort;
+  if (!isObject(sort) || !hasOnlyKeys(sort, new Set(['key', 'direction', 'dirsFirst']))) return false;
+  if (!FILE_BROWSER_SORT_KEY_LIST.includes(sort.key as never)
+    || (sort.direction !== FILE_BROWSER_SORT_DIRECTIONS.ASC && sort.direction !== FILE_BROWSER_SORT_DIRECTIONS.DESC)
+    || typeof sort.dirsFirst !== 'boolean') return false;
+  if (value.nameFilter === undefined) return true;
+  return typeof value.nameFilter === 'string'
+    && value.nameFilter.length <= FILE_BROWSER_FILTER_MAX_QUERY_CHARS
+    && utf8Bytes(value.nameFilter) <= FILE_BROWSER_FILTER_MAX_QUERY_CHARS * 4;
+}
+
 export function validateFileDirectoryListRequest(value: unknown): FileTransferValidationResult<FileDirectoryListRequest> {
   if (!isObject(value)) return { ok: false, error: 'invalid_object' };
-  if (!hasOnlyKeys(value, new Set(['type', 'requestId', 'path']))) return { ok: false, error: 'unknown_field' };
+  if (!hasOnlyKeys(value, new Set(['type', 'requestId', 'path', 'query']))) return { ok: false, error: 'unknown_field' };
   if (value.type !== FILE_TRANSFER_MSG.DIRECTORY_LIST) return { ok: false, error: 'invalid_type' };
   if (!isTransferId(value.requestId)) return { ok: false, error: 'invalid_request_id' };
   if (!isBoundedString(value.path, FILE_TRANSFER_PATH_MAX_BYTES)) return { ok: false, error: 'invalid_path' };
+  if (value.query !== undefined && !isFileDirectoryListQuery(value.query)) return { ok: false, error: 'invalid_query' };
   return { ok: true, value: value as unknown as FileDirectoryListRequest };
 }
 
@@ -830,7 +899,7 @@ export function validateControlledFileTransferResponse(
     return { ok: true, value: v as unknown as FilePathHandleError };
   }
   if (v.type === FILE_TRANSFER_MSG.DIRECTORY_LIST_DONE) {
-    if (!hasOnlyKeys(v, new Set(['type', 'requestId', 'path', 'resolvedPath', 'entries']))
+    if (!hasOnlyKeys(v, new Set(['type', 'requestId', 'path', 'resolvedPath', 'entries', 'truncated', 'total', 'partial']))
       || !isTransferId(v.requestId)
       || !isBoundedString(v.path, FILE_TRANSFER_PATH_MAX_BYTES)
       || !isBoundedString(v.resolvedPath, FILE_TRANSFER_PATH_MAX_BYTES)
@@ -838,16 +907,27 @@ export function validateControlledFileTransferResponse(
       || v.entries.length > FILE_TRANSFER_DIRECTORY_MAX_ENTRIES) {
       return { ok: false, error: 'invalid_directory_list_done' };
     }
+    // `total` and `partial` mean something only next to `truncated`,
+    // and a total below what was actually delivered is a lie.
+    const truncatedFlags = v.truncated === undefined
+      ? v.total === undefined && v.partial === undefined
+      : v.truncated === true
+        && Number.isSafeInteger(v.total) && (v.total as number) >= v.entries.length
+        && (v.partial === undefined || v.partial === true);
+    if (!truncatedFlags) return { ok: false, error: 'invalid_directory_list_done' };
     const entries: FileDirectoryEntry[] = [];
     for (const entry of v.entries) {
       if (!isObject(entry)
-        || !hasOnlyKeys(entry, new Set(['name', 'path', 'isDir', 'hidden', 'totalBytes', 'freeBytes']))
+        || !hasOnlyKeys(entry, new Set(['name', 'path', 'isDir', 'hidden', 'totalBytes', 'freeBytes', 'size', 'mtimeMs', 'birthtimeMs']))
         || !isBoundedString(entry.name, 1024)
         || !isBoundedString(entry.path, FILE_TRANSFER_PATH_MAX_BYTES)
         || typeof entry.isDir !== 'boolean'
         || typeof entry.hidden !== 'boolean'
         || (entry.totalBytes !== undefined && !isByteCount(entry.totalBytes))
-        || (entry.freeBytes !== undefined && !isByteCount(entry.freeBytes))) {
+        || (entry.freeBytes !== undefined && !isByteCount(entry.freeBytes))
+        || (entry.size !== undefined && !isByteCount(entry.size))
+        || (entry.mtimeMs !== undefined && !isEpochMs(entry.mtimeMs))
+        || (entry.birthtimeMs !== undefined && !isEpochMs(entry.birthtimeMs))) {
         return { ok: false, error: 'invalid_directory_entry' };
       }
       // Rebuilt field by field, so anything not listed here is dropped rather
@@ -859,6 +939,9 @@ export function validateControlledFileTransferResponse(
         hidden: entry.hidden,
         ...(entry.totalBytes !== undefined ? { totalBytes: entry.totalBytes } : {}),
         ...(entry.freeBytes !== undefined ? { freeBytes: entry.freeBytes } : {}),
+        ...(entry.size !== undefined ? { size: entry.size } : {}),
+        ...(entry.mtimeMs !== undefined ? { mtimeMs: entry.mtimeMs } : {}),
+        ...(entry.birthtimeMs !== undefined ? { birthtimeMs: entry.birthtimeMs } : {}),
       } as FileDirectoryEntry);
     }
     return {
@@ -869,6 +952,11 @@ export function validateControlledFileTransferResponse(
         path: v.path,
         resolvedPath: v.resolvedPath,
         entries,
+        ...(v.truncated === true ? {
+          truncated: true as const,
+          total: v.total as number,
+          ...(v.partial === true ? { partial: true as const } : {}),
+        } : {}),
       },
     };
   }
