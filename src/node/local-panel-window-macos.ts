@@ -14,6 +14,7 @@ import {
 } from '../../shared/local-panel-window.js';
 import { AIDESK_PANEL_HOST_PLIST_KEY } from '../../shared/aidesk-product.js';
 import { imcodesStateDirForHome } from '../util/imcodes-state-dir.js';
+import { ensureMacosAideskAppInstalled } from './macos-remote-desktop-production.js';
 import { MACOS_REMOTE_DESKTOP_RESPONSIBLE_APP_PATH } from './macos-remote-desktop-responsible-spawn.js';
 import {
   resolveMacosUserSession,
@@ -37,6 +38,11 @@ export interface MacosPanelWindowDeps {
   prepareProfileParent: (dir: string, user: MacosUserSession | undefined) => Promise<void>;
   /** The installed aiDesk app, when it declares that it shows the panel in its own window (Info.plist marker); else undefined. */
   panelHostApp: () => Promise<string | undefined>;
+  /**
+   * Installs (or confirms) the app from the archive the node was upgraded with. The install is otherwise lazy -- it happens when the
+   * first remote-desktop command needs the app -- so right after an upgrade the OLD app could still be there when the panel is asked for.
+   */
+  ensureAppInstalled: () => Promise<void>;
 }
 
 /** What the app is told when the node starts it just to show the panel; a running app only receives the "reopen" and shows it. */
@@ -79,6 +85,7 @@ const realDeps = (): MacosPanelWindowDeps => ({
     await mkdir(dir, { recursive: true, mode: 0o700 });
     if (user && process.getuid?.() === 0) await chown(dir, user.uid, user.gid);
   },
+  ensureAppInstalled: () => ensureMacosAideskAppInstalled(),
   panelHostApp: async () => {
     const app = MACOS_REMOTE_DESKTOP_RESPONSIBLE_APP_PATH;
     const plist = join(app, 'Contents', 'Info.plist');
@@ -137,7 +144,9 @@ export function createMacosLocalPanelWindowPlatform(overrides: Partial<MacosPane
       // As root there must be a console user with a graphical (Aqua) session; started by the user, there is one by definition.
       return asRoot() ? (await sessionUser()) !== undefined : true;
     },
-    nativeUiPath() {
+    async nativeUiPath() {
+      // Never let a failing install turn into a failing click: the app that is there (or none) is what the marker check sees.
+      await deps.ensureAppInstalled().catch(() => undefined);
       return deps.panelHostApp();
     },
     async findAppModeBrowsers() {

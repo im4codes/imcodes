@@ -850,6 +850,17 @@ function createMacosAideskAppInstaller(
   };
 }
 
+let sharedAideskAppInstaller: (() => Promise<void>) | undefined;
+
+/**
+ * The one installer instance of this process (the responsible-command path and the panel-window check share it, so two callers never
+ * publish the app at the same time). Install-or-confirm; errors are reported through `onError` and retried on the next call.
+ */
+export function ensureMacosAideskAppInstalled(onError?: (error: unknown) => void): Promise<void> {
+  sharedAideskAppInstaller ??= createMacosAideskAppInstaller(onError);
+  return sharedAideskAppInstaller();
+}
+
 async function defaultExecuteNativeCommand(
   user: MacosUserSession,
   component: VerifiedMacosRemoteDesktopComponent,
@@ -997,7 +1008,7 @@ export function createMacosRemoteDesktopProductionDependencies(
   const installResponsibleApp = dependencies.installResponsibleApp
     ?? (dependencies.responsibleAppPath
       ? async () => {}
-      : createMacosAideskAppInstaller(dependencies.onBackgroundError));
+      : () => ensureMacosAideskAppInstalled(dependencies.onBackgroundError));
   const executeResponsibleCommand: MacosRemoteDesktopResponsibleCommandRunner = async (options) => {
     await installResponsibleApp();
     return await (dependencies.executeResponsibleCommand ?? executeMacosRemoteDesktopResponsibleCommand)(options);

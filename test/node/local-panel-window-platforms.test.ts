@@ -195,6 +195,18 @@ describe('macOS adapter', () => {
     expect(await mac({ panelHostApp: async () => undefined }).platform.nativeUiPath()).toBeUndefined();
   });
 
+  it('the app is installed (or confirmed) from the upgrade archive BEFORE the marker is read, and a failing install never fails the click', async () => {
+    const order: string[] = [];
+    const { platform } = mac({
+      ensureAppInstalled: async () => { order.push('install'); },
+      panelHostApp: async () => { order.push('probe'); return '/Library/Application Support/aidesk/aiDesk.to by IM.codes.app'; },
+    });
+    expect(await platform.nativeUiPath()).toBe('/Library/Application Support/aidesk/aiDesk.to by IM.codes.app');
+    expect(order).toEqual(['install', 'probe']);
+    const broken = mac({ ensureAppInstalled: async () => { throw new Error('archive unreadable'); } });
+    expect(await broken.platform.nativeUiPath()).toBe('/Library/Application Support/aidesk/aiDesk.to by IM.codes.app');
+  });
+
   it('starting the host is `open <app>` in the user\'s session with the open-panel arguments (a running app just gets the reopen); as the user it is a plain open', async () => {
     const app = '/Library/Application Support/aidesk/aiDesk.to by IM.codes.app';
     const asRoot = mac();
