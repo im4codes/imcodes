@@ -786,7 +786,7 @@ class WorkerTransportSink final : public macos::MacosTransportCallbackSink {
   std::shared_ptr<macos::RawVideoPath> raw_video_;
   std::shared_ptr<macos::WorkerVideoLog> video_log_;
   std::optional<macos::EncoderDescription> last_logged_encoder_;
-  std::optional<macos::EncoderDescription> last_sent_encoder_;
+  macos::EncoderAnnouncement encoder_announcement_;
   rd::common::TopologyRevision presented_layout_revision_ = 0;
   std::uint64_t outbound_sequence_ = 0;
   rd::common::ClipboardPasteAssembler clipboard_paste_assembler_;
@@ -1559,10 +1559,10 @@ bool WorkerTransportSink::SendEncoderInfo() {
         description, input.policy, width, height));
     last_logged_encoder_ = description;
   }
-  // Nothing useful to show before a codec exists; the viewer keeps its fallback.
-  if (description.codec == imcodes::rd::kEncoderCodecPending)
-    return true;
-  if (last_sent_encoder_.has_value() && *last_sent_encoder_ == description)
+  // Nothing before a codec exists (the viewer keeps its fallback), and nothing a
+  // viewer already has; a freshly opened control channel has nothing (see
+  // HandleDataChannelState).
+  if (!encoder_announcement_.Needed(description))
     return true;
   Json::Value root(Json::objectValue);
   root["type"] = imcodes::rd::kEncoderInfoType;
@@ -1576,7 +1576,7 @@ bool WorkerTransportSink::SendEncoderInfo() {
   root["rawCodecs"] = description.raw_codecs;
   const bool sent = SendControl(std::move(root));
   if (sent)
-    last_sent_encoder_ = description;
+    encoder_announcement_.Sent(description);
   return sent;
 }
 
@@ -1783,6 +1783,10 @@ void WorkerTransportSink::HandleDataChannelState(
       state == rd::common::DataChannelState::kOpen) {
     (void)SendTopology();
     (void)SendQuality();
+    // Topology and quality go out on every open; the encoder message is deduplicated,
+    // so a re-opened channel (new peer, another viewer) must first be marked as
+    // knowing nothing or it would never be told.
+    encoder_announcement_.ChannelOpened();
     (void)SendEncoderInfo();
   }
   (void)EmitStatus();

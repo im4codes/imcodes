@@ -33,6 +33,25 @@ struct EncoderDescriptionInput {
 
 [[nodiscard]] EncoderDescription DescribeEncoder(const EncoderDescriptionInput& input);
 
+// When to tell a viewer what is encoding. A viewer that has just opened its control
+// channel (a new peer after renegotiation or an ICE restart, another viewer on the same
+// route) has been told nothing yet and must be told again even if the description has
+// not changed; an unchanged description is not repeated to a viewer that already has it;
+// nothing is said before a codec exists; and a message the channel did not take stays
+// owed. Pure, so the whole rule is tested without a worker.
+class EncoderAnnouncement {
+ public:
+  // True when `description` should be sent now.
+  [[nodiscard]] bool Needed(const EncoderDescription& description) const;
+  // The channel took the message.
+  void Sent(const EncoderDescription& description);
+  // A (re)opened control channel: whoever is on the other end knows nothing yet.
+  void ChannelOpened() { last_sent_.reset(); }
+
+ private:
+  std::optional<EncoderDescription> last_sent_;
+};
+
 // One log line of key=value pairs, no free text and nothing from the user's
 // content. `event` names why it is written (decision, started, changed).
 [[nodiscard]] std::string FormatEncoderLogLine(

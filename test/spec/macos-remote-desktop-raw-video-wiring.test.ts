@@ -143,15 +143,15 @@ describe('macOS raw (libvpx) video path wiring', () => {
         expect(encoder).toContain(`root["${key}"] = `);
       }
       // Nothing before a codec exists; and unchanged facts are not resent.
-      expect(encoder).toContain('description.codec == imcodes::rd::kEncoderCodecPending');
-      expect(encoder).toContain('*last_sent_encoder_ == description');
+      expect(encoder).toContain('!encoder_announcement_.Needed(description)');
       // Marked as sent only when the channel really took it, so a closed channel is retried.
-      expect(encoder).toMatch(/const bool sent = SendControl\(std::move\(root\)\);\s*if \(sent\)\s*last_sent_encoder_ = description;/);
+      expect(encoder).toMatch(/const bool sent = SendControl\(std::move\(root\)\);\s*if \(sent\)\s*encoder_announcement_\.Sent\(description\);/);
     });
 
     it('tells the viewer when the channel opens and again once the encoder is up', () => {
       const open = worker.slice(worker.indexOf('void WorkerTransportSink::HandleDataChannelState('), worker.indexOf('void WorkerTransportSink::OnQualityTarget('));
-      expect(open).toMatch(/\(void\)SendQuality\(\);\s*\(void\)SendEncoderInfo\(\);/);
+      // A re-opened control channel knows nothing yet: it is marked so BEFORE the (deduplicated) send.
+      expect(open).toMatch(/\(void\)SendQuality\(\);[\s\S]*encoder_announcement_\.ChannelOpened\(\);\s*\(void\)SendEncoderInfo\(\);/);
       const drain = worker.slice(worker.indexOf('void WorkerTransportSink::DrainQualityTarget()'), worker.indexOf('void WorkerTransportSink::HandleDataChannelMessage('));
       expect(drain).toMatch(/\(void\)SendQuality\(\);[\s\S]*\(void\)SendEncoderInfo\(\);/);
     });

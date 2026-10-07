@@ -45,6 +45,15 @@ EncoderDescription DescribeEncoder(const EncoderDescriptionInput& input) {
   return description;
 }
 
+bool EncoderAnnouncement::Needed(const EncoderDescription& description) const {
+  if (description.codec == imcodes::rd::kEncoderCodecPending) return false;
+  return !last_sent_.has_value() || !(*last_sent_ == description);
+}
+
+void EncoderAnnouncement::Sent(const EncoderDescription& description) {
+  last_sent_ = description;
+}
+
 std::string FormatEncoderLogLine(const char* event,
                                  const EncoderDescription& description,
                                  const RawCodecPolicyState& policy,

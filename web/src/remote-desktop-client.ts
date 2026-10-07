@@ -2449,6 +2449,7 @@ export class RemoteDesktopClient {
       controllerCount: 0,
       route: undefined,
       quality: undefined,
+      encoder: undefined,
       signInScreen: false,
       unlockAvailable: false,
       inputBlocked: undefined,

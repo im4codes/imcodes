@@ -2568,6 +2568,16 @@ describe('RemoteDesktopClient', () => {
       client.stop();
     });
 
+    it('forgets the encoder when the session ends, so a reused client never shows a stale one', async () => {
+      const { client, control } = await startConnected();
+      control.receive(quality);
+      control.receive(encoder);
+      expect(client.current().encoder).toBeDefined();
+      client.stop();
+      expect(client.current().encoder).toBeUndefined();
+      expect(client.current().quality).toBeUndefined();
+    });
+
     // Skew, web newer than node: an older macOS node, Windows or Linux never send the
     // message. Nothing breaks, there is simply no encoder: the status bar falls back to
     // the class-only text.

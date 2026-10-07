@@ -117,6 +117,34 @@ void TheLogLineHasNoFreeTextAndNoNewline() {
   Require(line.find('\n') == std::string::npos, "one line");
 }
 
+void AViewerWhoJustOpenedItsChannelIsTold() {
+  macos::EncoderDescriptionInput input = Input(macos::NegotiatedVideoCodec::kVp9, true);
+  const macos::EncoderDescription vp9 = macos::DescribeEncoder(input);
+  const macos::EncoderDescription pending = macos::DescribeEncoder(Input(macos::NegotiatedVideoCodec::kUnknown, true));
+  macos::EncoderAnnouncement announcement;
+  Require(!announcement.Needed(pending), "nothing before a codec exists");
+  Require(announcement.Needed(vp9), "the first description is owed");
+  Require(announcement.Needed(vp9), "and stays owed until the channel took it");
+  announcement.Sent(vp9);
+  Require(!announcement.Needed(vp9), "an unchanged description is not repeated to a viewer that has it");
+  // The control channel re-opens (a new peer, another viewer): the same description is owed again.
+  announcement.ChannelOpened();
+  Require(announcement.Needed(vp9), "a re-opened channel is told again although nothing changed");
+  announcement.Sent(vp9);
+  announcement.ChannelOpened();
+  Require(announcement.Needed(vp9), "every open, not only the second");
+  announcement.Sent(vp9);
+  // A change is sent; the same change is not repeated.
+  macos::EncoderDescriptionInput h264_input = Input(macos::NegotiatedVideoCodec::kH264, false);
+  h264_input.h264_class = common::EncoderClass::kSoftware;
+  const macos::EncoderDescription h264 = macos::DescribeEncoder(h264_input);
+  Require(announcement.Needed(h264), "a change is owed");
+  announcement.Sent(h264);
+  Require(!announcement.Needed(h264), "and sent once");
+  // Pending after a codec was announced (the encoder was released) is still not announced.
+  Require(!announcement.Needed(pending), "pending is never announced");
+}
+
 fs::path MakeTemp() {
   std::string pattern = (fs::temp_directory_path() / "imcodes-rd-vlog-XXXXXX").string();
   std::vector<char> buffer(pattern.begin(), pattern.end());
@@ -208,6 +236,7 @@ int main() {
   ARawCodecIsOnlyClaimedWhenBothThePolicyAndTheNegotiationSayYes();
   TheKillSwitchIsVisibleOnAnH264Route();
   TheLogLineHasNoFreeTextAndNoNewline();
+  AViewerWhoJustOpenedItsChannelIsTold();
   TheLogAppendsTimestampedSanitisedLinesWithMode0600();
   ALongLineIsCutAndTheFileIsBoundedByRotation();
   ASymlinkIsRefused();

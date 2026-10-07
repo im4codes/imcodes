@@ -133,7 +133,12 @@ the session's user; the node reads it as root). Lines are `<UTC timestamp> event
 encoder|encoder_changed> codec= implementation= name= threads= size= raw_codecs=
 setting_source= nv12_capture= invalid_value_ignored=`: no secrets, nothing from the screen.
 The file is capped at 64 KiB (the previous one is kept as `worker-video.log.1`), opened
-`O_NOFOLLOW`, mode 0600.
+`O_NOFOLLOW`, mode 0600. Exact paths, for a reader written without reading the C++:
+`/private/var/run/imcodes-node/user-sessions/<uid>/remote-desktop/worker-video.log` and
+`...worker-video.log.1` (the runtime directory is `IMCODES_REMOTE_DESKTOP_RUNTIME_DIR` in
+the worker's environment). When the live file would pass 64 KiB it is renamed over `.1` and
+a fresh one is started, so the pair holds the last 64-128 KiB, newest in the live file.
+A line is at most 512 bytes; fields never contain spaces except inside the quoted `name`.
 
 ### NV12 capture (opt-in)
 
