@@ -14,7 +14,8 @@ import {
   buildLocalPanelAppModeArgs,
 } from '../../shared/local-panel-window.js';
 import { AIDESK_LOCAL_UI_EXECUTABLE_NAME } from '../../shared/aidesk-product.js';
-import { resolveAideskLocalUiExecutable, resolveWindowsPowerShellExecutable, runWindowsUserSessionScript } from './aidesk-desktop-entry.js';
+import { resolveWindowsPowerShellExecutable, runWindowsUserSessionScript } from './aidesk-desktop-entry.js';
+import { resolveVerifiedAideskLocalUi } from './aidesk-local-ui-artifact.js';
 import { launchWindowsActiveUserCommand } from './windows-user-session.js';
 import type { LocalPanelWindowPlatform, LocalPanelWindowProcess } from './local-panel-window.js';
 
@@ -110,7 +111,8 @@ export interface WindowsPanelWindowDeps {
   /** Run one operation in the active user's session (service) or directly (user): the script's result word. */
   runOp: (op: WindowsPanelOp) => Promise<string | undefined>;
   launchNative: (path: string) => Promise<boolean>;
-  nativeUiPath: () => string;
+  /** The verified native window (manifest, hash and Authenticode signer), or undefined. */
+  nativeUiPath: () => Promise<string | undefined>;
 }
 
 function isServiceAccount(env: NodeJS.ProcessEnv): boolean {
@@ -158,7 +160,7 @@ const realDeps = (): WindowsPanelWindowDeps => {
         child.once('spawn', () => { child.unref(); setTimeout(() => resolve(true), 600); });
       } catch { resolve(false); }
     }),
-    nativeUiPath: () => resolveAideskLocalUiExecutable('win32'),
+    nativeUiPath: () => resolveVerifiedAideskLocalUi(),
   };
 };
 
@@ -180,9 +182,9 @@ export function createWindowsLocalPanelWindowPlatform(overrides: Partial<Windows
       const out = await deps.powershell("(Get-Process -Name explorer -ErrorAction SilentlyContinue | Where-Object{$_.SessionId -ge 1} | Select-Object -First 1).SessionId");
       return /^\d+$/mu.test(out.trim());
     },
-    nativeUiPath() {
-      const path = deps.nativeUiPath();
-      return win32.isAbsolute(path) && deps.exists(path) ? path : undefined;
+    async nativeUiPath() {
+      const path = await deps.nativeUiPath();
+      return path !== undefined && win32.isAbsolute(path) ? path : undefined;
     },
     async findAppModeBrowsers() {
       // The user's own session resolves each (their App Paths, their LOCALAPPDATA); the script answers not_found per browser.

@@ -122,7 +122,7 @@ function machine(over: Partial<{
   const platform: LocalPanelWindowPlatform = {
     platform: 'linux',
     hasDesktop: async () => state.hasDesktop,
-    nativeUiPath: () => state.native,
+    nativeUiPath: async () => state.native,
     findAppModeBrowsers: async () => state.browsers,
     findWindowProcess: async () => state.running,
     probePid: async (pid) => state.alive[pid] ?? { alive: false },
@@ -232,10 +232,21 @@ describe('openLocalPanelWindow', () => {
     expect(m.calls).toEqual(['focus']);
   });
 
+  it('a logger that throws never turns an opened window into a failure', async () => {
+    const m = machine({ browsers: ['chromium'] });
+    const out = await openLocalPanelWindow({
+      platform: { ...({} as LocalPanelWindowPlatform), platform: 'linux', hasDesktop: async () => true, nativeUiPath: async () => undefined, findAppModeBrowsers: async () => ['chromium'], findWindowProcess: async () => undefined, probePid: async () => ({ alive: false }), canFocus: true, launchAppMode: async () => true, openDefaultBrowser: async () => true, launchNative: async () => false, focusWindow: async () => true },
+      store: { read: () => undefined, write: () => undefined, clear: () => undefined },
+      panelRunning: async () => true, log: () => { throw new Error('log file is not writable'); }, sleep: async () => undefined, locateTimeoutMs: 0,
+    });
+    expect(out.reason).toBe(LOCAL_PANEL_WINDOW_REASON.OPENED_APP_MODE);
+    expect(m.calls).toEqual([]);
+  });
+
   it('a throwing adapter never escapes the executor', async () => {
     const m = machine({ browsers: ['chromium'] });
     const run = () => openLocalPanelWindow({
-      platform: { ...({} as LocalPanelWindowPlatform), platform: 'linux', hasDesktop: async () => { throw new Error('boom'); }, nativeUiPath: () => undefined },
+      platform: { ...({} as LocalPanelWindowPlatform), platform: 'linux', hasDesktop: async () => { throw new Error('boom'); }, nativeUiPath: async () => undefined },
       store: { read: () => undefined, write: () => undefined, clear: () => undefined },
       panelRunning: async () => true, log: () => undefined,
     });

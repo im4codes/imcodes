@@ -25,8 +25,8 @@ export interface LocalPanelWindowPlatform {
   readonly platform: NodeJS.Platform;
   /** An interactive desktop exists for a user (Windows/macOS: an active session; Linux: a reachable X/Wayland display). */
   hasDesktop(): Promise<boolean>;
-  /** Absolute path of the installed native aiDesk window, when there is one. */
-  nativeUiPath(): string | undefined;
+  /** Absolute path of the native aiDesk window, when it is installed AND verified (see aidesk-local-ui-artifact.ts). */
+  nativeUiPath(): Promise<string | undefined>;
   /** App-mode capable browsers that can be tried, in preference order (identifiers the platform's launchAppMode understands). */
   findAppModeBrowsers(): Promise<string[]>;
   /** A running panel window (native or app-mode), found by what it is -- not by a record. */
@@ -103,7 +103,7 @@ async function locateLaunchedWindow(input: OpenLocalPanelWindowInput, mechanism:
 async function runAttempt(input: OpenLocalPanelWindowInput, attempt: LocalPanelWindowAttempt): Promise<boolean> {
   const { platform } = input;
   if (attempt.mechanism === LOCAL_PANEL_WINDOW_MECHANISM.NATIVE) {
-    const path = platform.nativeUiPath();
+    const path = await platform.nativeUiPath();
     return path !== undefined && platform.launchNative(path);
   }
   if (attempt.mechanism === LOCAL_PANEL_WINDOW_MECHANISM.APP_MODE) return platform.launchAppMode(attempt.browser);
@@ -115,16 +115,18 @@ async function runAttempt(input: OpenLocalPanelWindowInput, attempt: LocalPanelW
 /** One click on "local management": open the panel as an independent window, or focus the one already open. Never throws. */
 export async function openLocalPanelWindow(input: OpenLocalPanelWindowInput): Promise<LocalPanelWindowOutcome> {
   const trail: LocalPanelWindowReason[] = [];
+  // A logger that cannot write (unwritable log file, closed stream) must never turn a window that opened into a failure.
+  const log: OpenLocalPanelWindowInput['log'] = (level, fields, message) => { try { input.log(level, fields, message); } catch { /* logging is best effort */ } };
   const finish = (outcome: Omit<LocalPanelWindowOutcome, 'trail'>, level: 'info' | 'warn' = 'info'): LocalPanelWindowOutcome => {
     const result = { ...outcome, trail };
-    input.log(level, { reason: result.reason, mechanism: result.mechanism, trail, url: localPanelUrl() }, 'local panel window');
+    log(level, { reason: result.reason, mechanism: result.mechanism, trail, url: localPanelUrl() }, 'local panel window');
     return result;
   };
   try {
     const panelRunning = await input.panelRunning();
     const hasDesktop = panelRunning ? await input.platform.hasDesktop() : false;
     const existing = panelRunning && hasDesktop ? await resolveExistingWindow(input) : undefined;
-    const nativePath = input.platform.nativeUiPath();
+    const nativePath = panelRunning && hasDesktop ? await input.platform.nativeUiPath() : undefined;
     const appModeBrowsers = panelRunning && hasDesktop && !existing ? await input.platform.findAppModeBrowsers() : [];
     const plan = planLocalPanelWindow({
       platform: input.platform.platform,
@@ -155,7 +157,7 @@ export async function openLocalPanelWindow(input: OpenLocalPanelWindowInput): Pr
     }
     return finish({ reason: LOCAL_PANEL_WINDOW_REASON.LAUNCH_FAILED }, 'warn');
   } catch (error) {
-    input.log('warn', { reason: LOCAL_PANEL_WINDOW_REASON.LAUNCH_FAILED, error: error instanceof Error ? error.message : String(error) }, 'local panel window failed');
+    log('warn', { reason: LOCAL_PANEL_WINDOW_REASON.LAUNCH_FAILED, error: error instanceof Error ? error.message : String(error) }, 'local panel window failed');
     return { reason: LOCAL_PANEL_WINDOW_REASON.LAUNCH_FAILED, trail };
   }
 }

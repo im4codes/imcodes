@@ -16,7 +16,7 @@ import {
 } from '../../shared/local-panel-window.js';
 import { AIDESK_LOCAL_UI_EXECUTABLE_NAME } from '../../shared/aidesk-product.js';
 import { imcodesStateDirForHome } from '../util/imcodes-state-dir.js';
-import { resolveAideskLocalUiExecutable } from './aidesk-desktop-entry.js';
+import { resolveVerifiedAideskLocalUi } from './aidesk-local-ui-artifact.js';
 import { listX11DisplayNumbers, X11_SOCKET_DIR } from './linux-x11-display.js';
 import { pickLinuxDesktopUserProfile, type LinuxDesktopUserProfile } from './linux-desktop-environment.js';
 import type { LocalPanelWindowPlatform, LocalPanelWindowProcess } from './local-panel-window.js';
@@ -33,7 +33,8 @@ export interface LinuxPanelWindowDeps {
   /** Starts a long-lived GUI process detached from the node; true once it has really started. */
   spawnDetached: (file: string, args: readonly string[], options: { asUser?: LinuxDesktopUserProfile; env: NodeJS.ProcessEnv }) => Promise<boolean>;
   prepareProfileParent: (dir: string, user: LinuxDesktopUserProfile | undefined) => Promise<void>;
-  nativeUiPath: () => string;
+  /** The verified native window path (manifest + hash), or undefined. */
+  nativeUiPath: () => Promise<string | undefined>;
 }
 
 const realDeps = (): LinuxPanelWindowDeps => ({
@@ -70,7 +71,7 @@ const realDeps = (): LinuxPanelWindowDeps => ({
     await mkdir(dir, { recursive: true, mode: 0o700 });
     if (user && process.getuid?.() === 0) await chown(dir, user.uid, user.gid);
   },
-  nativeUiPath: () => resolveAideskLocalUiExecutable('linux'),
+  nativeUiPath: () => resolveVerifiedAideskLocalUi(),
 });
 
 export function createLinuxLocalPanelWindowPlatform(overrides: Partial<LinuxPanelWindowDeps> = {}): LocalPanelWindowPlatform & {
@@ -134,8 +135,7 @@ export function createLinuxLocalPanelWindowPlatform(overrides: Partial<LinuxPane
       return sessionEnv(user) !== undefined;
     },
     nativeUiPath() {
-      const path = deps.nativeUiPath();
-      return deps.exists(path) ? path : undefined;
+      return deps.nativeUiPath();
     },
     async findAppModeBrowsers() {
       const found = LOCAL_PANEL_APP_MODE_BROWSERS.linux.map(which).filter((path): path is string => path !== undefined);
@@ -157,16 +157,22 @@ export function createLinuxLocalPanelWindowPlatform(overrides: Partial<LinuxPane
       const startedAtMs = await startedAtOf(pid);
       return startedAtMs === undefined ? { alive: false } : { alive: true, startedAtMs };
     },
-    async focusWindow() {
+    async focusWindow(window) {
       const user = desktopUser();
       const env = sessionEnv(user);
       if (!env?.DISPLAY) return false; // Wayland-only: no X tool can raise a window; the existing one is kept
-      const exact = `^${LOCAL_PANEL_WINDOW_TITLE.replaceAll('.', '\\.')}$`;
+      const exact = `^${LOCAL_PANEL_WINDOW_TITLE.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&')}$`;
       const asUser = user ? { asUser: user } : {};
       const xdotool = which('xdotool');
       if (xdotool) {
-        const out = await deps.run(xdotool, ['search', '--name', exact, 'windowactivate'], { env, ...asUser });
-        if (out.code === 0) return true;
+        // By process first (the recorded window, whichever mechanism opened it), then by the one window title.
+        for (const selector of [['--pid', String(window.pid)], ['--name', exact]]) {
+          const out = await deps.run(xdotool, ['search', ...selector, 'windowactivate'], { env, ...asUser });
+          if (out.code === 0) return true;
+          // No EWMH window manager (a bare X server, some minimal desktops) cannot "activate"; raising and focusing still works.
+          const plain = await deps.run(xdotool, ['search', ...selector, 'windowraise', 'windowfocus'], { env, ...asUser });
+          if (plain.code === 0) return true;
+        }
       }
       const wmctrl = which('wmctrl');
       if (wmctrl) return (await deps.run(wmctrl, ['-a', LOCAL_PANEL_WINDOW_TITLE], { env, ...asUser })).code === 0;

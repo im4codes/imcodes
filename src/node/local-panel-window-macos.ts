@@ -13,8 +13,7 @@ import {
 } from '../../shared/local-panel-window.js';
 import { AIDESK_LOCAL_UI_EXECUTABLE_NAME } from '../../shared/aidesk-product.js';
 import { imcodesStateDirForHome } from '../util/imcodes-state-dir.js';
-import { resolveAideskLocalUiExecutable } from './aidesk-desktop-entry.js';
-import { MACOS_REMOTE_DESKTOP_RESPONSIBLE_APP_PATH } from './macos-remote-desktop-responsible-spawn.js';
+import { resolveVerifiedAideskLocalUi } from './aidesk-local-ui-artifact.js';
 import {
   resolveMacosUserSession,
   runMacosUserSessionCommand,
@@ -35,7 +34,8 @@ export interface MacosPanelWindowDeps {
   /** Starts a long-lived GUI process in the user's session (or directly when already the user); true once it started. */
   startInSession: (user: MacosUserSession | undefined, file: string, args: readonly string[]) => Promise<boolean>;
   prepareProfileParent: (dir: string, user: MacosUserSession | undefined) => Promise<void>;
-  nativeUiPaths: () => string[];
+  /** The verified native window (inside the signed app), or undefined. */
+  nativeUiPath: () => Promise<string | undefined>;
 }
 
 const realDeps = (): MacosPanelWindowDeps => ({
@@ -75,10 +75,7 @@ const realDeps = (): MacosPanelWindowDeps => ({
     await mkdir(dir, { recursive: true, mode: 0o700 });
     if (user && process.getuid?.() === 0) await chown(dir, user.uid, user.gid);
   },
-  nativeUiPaths: () => [
-    join(MACOS_REMOTE_DESKTOP_RESPONSIBLE_APP_PATH, 'Contents', 'Helpers', AIDESK_LOCAL_UI_EXECUTABLE_NAME),
-    resolveAideskLocalUiExecutable('darwin'),
-  ],
+  nativeUiPath: () => resolveVerifiedAideskLocalUi(),
 });
 
 export function createMacosLocalPanelWindowPlatform(overrides: Partial<MacosPanelWindowDeps> = {}): LocalPanelWindowPlatform & { profileDir(): Promise<string | undefined> } {
@@ -125,7 +122,7 @@ export function createMacosLocalPanelWindowPlatform(overrides: Partial<MacosPane
       return asRoot() ? (await sessionUser()) !== undefined : true;
     },
     nativeUiPath() {
-      return deps.nativeUiPaths().find((path) => deps.exists(path));
+      return deps.nativeUiPath();
     },
     async findAppModeBrowsers() {
       const found = await Promise.all(LOCAL_PANEL_APP_MODE_BROWSERS.darwin.map(browserExecutable));

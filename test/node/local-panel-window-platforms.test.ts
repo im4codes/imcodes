@@ -39,7 +39,7 @@ describe('Linux adapter', () => {
       },
       spawnDetached: async (file, args, options) => { spawned.push({ file, args, ...(options.asUser ? { asUser: options.asUser.name } : {}), env: options.env }); return true; },
       prepareProfileParent: async () => undefined,
-      nativeUiPath: () => '/opt/imcodes/aidesk-local-ui',
+      nativeUiPath: async () => '/opt/imcodes/aidesk-local-ui',
       ...over,
     });
     return { platform, commands, spawned };
@@ -94,6 +94,9 @@ describe('Linux adapter', () => {
     const { platform, commands } = linux();
     expect(await platform.focusWindow({ pid: 1, startedAtMs: 1 })).toBe(true);
     expect(commands.at(-1)).toMatchObject({ file: '/usr/bin/xdotool', asUser: 'alice', display: ':0' });
+    // a bare X server (no window manager) refuses windowactivate: raising + focusing is the fallback
+    const bare = linux({ run: async (file, args) => ({ code: args.includes('windowactivate') ? 1 : 0, stdout: file === 'pgrep' ? '1\n' : '' }) });
+    expect(await bare.platform.focusWindow({ pid: 1, startedAtMs: 1 })).toBe(true);
     const none = linux({ listDisplays: () => [] });
     expect(await none.platform.focusWindow({ pid: 1, startedAtMs: 1 })).toBe(false);
     const wm = linux({ exists: (path) => ['/home/alice', '/usr/bin/wmctrl'].includes(path) });
@@ -109,9 +112,9 @@ describe('Linux adapter', () => {
     expect(commands.at(-1)).toMatchObject({ file: 'xdg-open', args: [localPanelUrl()], asUser: 'alice' });
   });
 
-  it('the native window is reported only when installed', () => {
-    expect(linux({ exists: () => false }).platform.nativeUiPath()).toBeUndefined();
-    expect(linux({ exists: (path) => path === '/opt/imcodes/aidesk-local-ui' }).platform.nativeUiPath()).toBe('/opt/imcodes/aidesk-local-ui');
+  it('the native window is whatever the verifier returned (nothing when it did not verify)', async () => {
+    expect(await linux({ nativeUiPath: async () => undefined }).platform.nativeUiPath()).toBeUndefined();
+    expect(await linux().platform.nativeUiPath()).toBe('/opt/imcodes/aidesk-local-ui');
   });
 });
 
@@ -133,7 +136,7 @@ describe('macOS adapter', () => {
       runInSession: async (_user, file, args) => { inSession.push({ file, args }); return true; },
       startInSession: async (u, file, args) => { started.push({ ...(u ? { user: u.name } : {}), file, args }); return true; },
       prepareProfileParent: async () => undefined,
-      nativeUiPaths: () => ['/Applications/aiDesk.app/Contents/Helpers/aidesk-local-ui'],
+      nativeUiPath: async () => '/Applications/aiDesk.app/Contents/Helpers/aidesk-local-ui',
       ...over,
     });
     return { platform, started, inSession, runs };
@@ -169,9 +172,9 @@ describe('macOS adapter', () => {
     expect(inSession[1]).toEqual({ file: '/usr/bin/open', args: [localPanelUrl()] });
   });
 
-  it('the native window comes from the app bundle helper when present', () => {
-    expect(mac({ exists: (path) => path.endsWith('/aidesk-local-ui') }).platform.nativeUiPath()).toBe('/Applications/aiDesk.app/Contents/Helpers/aidesk-local-ui');
-    expect(mac({ exists: () => false }).platform.nativeUiPath()).toBeUndefined();
+  it('the native window is the verified helper inside the signed app, or nothing', async () => {
+    expect(await mac().platform.nativeUiPath()).toBe('/Applications/aiDesk.app/Contents/Helpers/aidesk-local-ui');
+    expect(await mac({ nativeUiPath: async () => undefined }).platform.nativeUiPath()).toBeUndefined();
   });
 });
 
@@ -222,7 +225,7 @@ describe('Windows adapter', () => {
 
   it('as SYSTEM, a desktop exists only while a user session runs explorer; the window process is parsed from the query output', async () => {
     const env = { USERNAME: 'DESKTOP-1$' };
-    const base = { env, exists: () => false, runOp: async () => 'ok', launchNative: async () => true, nativeUiPath: () => 'C:\\Program Files\\IM.codes\\aidesk-local-ui.exe' };
+    const base = { env, exists: () => false, runOp: async () => 'ok', launchNative: async () => true, nativeUiPath: async () => 'C:\\Program Files\\IM.codes\\aidesk-local-ui.exe' };
     expect(await createWindowsLocalPanelWindowPlatform({ ...base, powershell: async () => '1\r\n' }).hasDesktop()).toBe(true);
     expect(await createWindowsLocalPanelWindowPlatform({ ...base, powershell: async () => '' }).hasDesktop()).toBe(false);
     expect(await createWindowsLocalPanelWindowPlatform({ ...base, env: { USERNAME: 'alice' }, powershell: async () => '' }).hasDesktop()).toBe(true);
@@ -237,14 +240,14 @@ describe('Windows adapter', () => {
     const platform = createWindowsLocalPanelWindowPlatform({
       env: { USERNAME: 'alice' }, powershell: async () => '', launchNative: async () => true,
       runOp: async (op) => { ops.push(op.kind); return op.kind === 'launch_app' && op.browser === 'msedge.exe' ? 'ok' : 'not_found'; },
-      exists: (path) => path.endsWith('aidesk-local-ui.exe'), nativeUiPath: () => 'C:\\Program Files\\IM.codes\\aidesk-local-ui.exe',
+      exists: () => true, nativeUiPath: async () => 'C:\\Program Files\\IM.codes\\aidesk-local-ui.exe',
     });
     expect(await platform.launchAppMode('msedge.exe')).toBe(true);
     expect(await platform.launchAppMode('chrome.exe')).toBe(false);
     expect(await platform.focusWindow({ pid: 1, startedAtMs: 1 })).toBe(false);
     expect(await platform.findAppModeBrowsers()).toEqual(['msedge.exe', 'chrome.exe', 'brave.exe']);
-    expect(platform.nativeUiPath()).toBe('C:\\Program Files\\IM.codes\\aidesk-local-ui.exe');
-    expect(createWindowsLocalPanelWindowPlatform({ env: {}, powershell: async () => '', runOp: async () => 'ok', launchNative: async () => true, exists: () => true, nativeUiPath: () => 'relative\\aidesk-local-ui.exe' }).nativeUiPath()).toBeUndefined();
+    expect(await platform.nativeUiPath()).toBe('C:\\Program Files\\IM.codes\\aidesk-local-ui.exe');
+    expect(await createWindowsLocalPanelWindowPlatform({ env: {}, powershell: async () => '', runOp: async () => 'ok', launchNative: async () => true, exists: () => true, nativeUiPath: async () => 'relative\\aidesk-local-ui.exe' }).nativeUiPath()).toBeUndefined();
     expect(ops).toEqual(['launch_app', 'launch_app', 'focus']);
   });
 });

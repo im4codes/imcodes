@@ -65,8 +65,8 @@ export async function runLocalPanelWindow(options: { platform?: LocalPanelWindow
     store: options.store ?? createLocalPanelWindowRecordStore(options.stateDir ?? startupDiagnosticsDir()),
     panelRunning: options.panelRunning ?? (() => probeLocalPanel()),
     log: (level, fields, message) => {
-      logger[level](fields, message);
-      if (level === 'warn') process.stderr.write(`imcodes-node: ${message}: ${String(fields.reason)} (${localPanelUrl()})\n`);
+      try { logger[level](fields, message); } catch { /* an unwritable log file must not stop the window */ }
+      if (level === 'warn') process.stderr.write(`imcodes-node: ${message}: ${String(fields.reason)}${fields.error ? ` [${String(fields.error)}]` : ''} (${localPanelUrl()})\n`);
     },
   });
 }

@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { JSDOM } from 'jsdom';
 import { REMOTE_DESKTOP_ACCESS_MODE } from '../../shared/remote-desktop.js';
+import { AIDESK_PRODUCT_NAME } from '../../shared/aidesk-product.js';
 import { LOCAL_PANEL_EXTERNAL_PATH, LOCAL_PANEL_WINDOW_TITLE } from '../../shared/local-panel-window.js';
 import {
   REMOTE_DESKTOP_LOCAL_ACTION,
@@ -237,6 +238,7 @@ describe('remote desktop local panel: independent window entry', () => {
     const panel = await startPanel();
     const html = await (await fetch(panel.url)).text();
     expect(html).toContain(`<title>${LOCAL_PANEL_WINDOW_TITLE}</title>`);
+    expect(LOCAL_PANEL_WINDOW_TITLE).toBe(AIDESK_PRODUCT_NAME);
   });
 
   it('open-window: a native client (custom header, no Origin) gets the decision; a web page cannot trigger it', async () => {

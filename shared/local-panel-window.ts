@@ -8,6 +8,7 @@
  * address bar, own window) -> the default browser. A machine without a desktop gets no window attempt at all: the panel stays
  * reachable and the URL is logged.
  */
+import { AIDESK_PRODUCT_NAME } from './aidesk-product.js';
 import { REMOTE_DESKTOP_LOCAL_MANAGEMENT } from './remote-desktop-local-management.js';
 
 export type LocalPanelPlatform = 'win32' | 'darwin' | 'linux';
@@ -37,8 +38,11 @@ export const LOCAL_PANEL_WINDOW_MECHANISM = Object.freeze({
 } as const);
 export type LocalPanelWindowMechanism = typeof LOCAL_PANEL_WINDOW_MECHANISM[keyof typeof LOCAL_PANEL_WINDOW_MECHANISM];
 
-/** Window title the panel page sets; also what the single-instance focus helpers look for. */
-export const LOCAL_PANEL_WINDOW_TITLE = 'aiDesk.to';
+/**
+ * The one window title, native or app-mode: the product name (also the native window's title and the panel's heading). The panel page
+ * sets it as its <title>, which is what an app-mode window shows; the single-instance focus helpers look for it.
+ */
+export const LOCAL_PANEL_WINDOW_TITLE = AIDESK_PRODUCT_NAME;
 /** Per-user record of the open window (pid + process start time), kept in the node state directory. */
 export const LOCAL_PANEL_WINDOW_STATE_FILE = 'local-panel-window.json';
 /** Directory (inside the state dir) of the dedicated browser profile used for app mode, so it never touches the user's own profile. */
