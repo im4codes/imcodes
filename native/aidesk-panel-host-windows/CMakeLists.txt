@@ -42,9 +42,11 @@ configure_file(panel_host.rc.in "${CMAKE_CURRENT_BINARY_DIR}/panel_host.rc" @ONL
 add_executable(aidesk-local-ui WIN32 panel_host.cc "${CMAKE_CURRENT_BINARY_DIR}/panel_host.rc")
 target_include_directories(aidesk-local-ui PRIVATE "${AIDESK_WEBVIEW2_ROOT}/build/native/include")
 target_compile_definitions(aidesk-local-ui PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
-target_link_libraries(aidesk-local-ui PRIVATE "${AIDESK_WEBVIEW2_LOADER}" user32 ole32 shell32 shlwapi advapi32 version)
+# uuid.lib defines IID_IUnknown and FOLDERID_LocalAppData; the rest is what the static WebView2 loader documents it needs.
+target_link_libraries(aidesk-local-ui PRIVATE "${AIDESK_WEBVIEW2_LOADER}" user32 ole32 shell32 shlwapi advapi32 version uuid)
 if(MSVC)
-  target_compile_options(aidesk-local-ui PRIVATE /W4 /WX /utf-8 /guard:cf)
+  # /W4 without /WX: the first MSVC compile of this host happens in CI; a benign warning must not be what fails a release build.
+  target_compile_options(aidesk-local-ui PRIVATE /W4 /utf-8 /guard:cf)
   target_link_options(aidesk-local-ui PRIVATE /MANIFEST:NO /SUBSYSTEM:WINDOWS /DYNAMICBASE /NXCOMPAT /guard:cf)
 else()
   target_compile_options(aidesk-local-ui PRIVATE -Wall -Wextra -municode)

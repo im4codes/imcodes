@@ -100,6 +100,8 @@ describe('Windows panel window host source', () => {
     expect(cmake).toContain('WebView2LoaderStatic.lib');
     expect(cmake.split('\n').filter((line) => !line.trimStart().startsWith('#')).join('\n')).not.toMatch(/WebView2Loader\.dll/u);
     expect(cmake).toContain('MultiThreaded');
+    // IID_IUnknown / FOLDERID_LocalAppData come from uuid.lib
+    expect(cmake).toMatch(/target_link_libraries\(aidesk-local-ui PRIVATE[^)]*\buuid\b/u);
     expect(cmake).toContain('/MANIFEST:NO');
     expect(read('native/aidesk-panel-host-windows/panel_host.rc.in')).toContain('RT_MANIFEST');
     const manifest = read('native/aidesk-panel-host-windows/panel_host.manifest');
