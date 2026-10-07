@@ -60,8 +60,9 @@ import { parseTaskPairAuditDetails } from '../../../shared/task-pair-notificatio
 import { flushTaskPairStoreLiveness, getTaskPairStore, livenessChangedBeyondActivityTimestamps, type StoredTaskPair, type TaskPairLiveness } from './store.js';
 import { brainUiLocale, isPairsEngineProject, projectBrainSession, projectOfSession } from './engine.js';
 import { inspectToolCallForPairMainCheckoutWrite } from './main-checkout-write-guard.js';
-import { noteTaskPairFocus, sendTaskPairMessage, taskPairFocusOf, type TaskPairDeliveryResult } from './delivery.js';
+import { noteTaskPairFocus, sendTaskPairMessage, taskPairFocusOf, taskPairMessageIdPrefix, type TaskPairDeliveryResult } from './delivery.js';
 import { brainNoticeForCard } from './brain-notice.js';
+import type { ArmBrainDecisionFollowUp } from './brain-decision-followup.js';
 import { checkStaleBaseNotice } from './integration-drift.js';
 import { resolveTaskPairMaterial, verifyTaskPairRoundBase } from './material.js';
 import { formatPossibleSilentRevertWarning, inspectPossibleSilentRevert, isRewrittenHead } from './rebase-revert-guard.js';
@@ -121,6 +122,8 @@ export interface TaskPairScheduler {
    * a fresh wait only moves the activity clocks.
    */
   brainReplyLiveness?(stored: StoredTaskPair, at: number): TaskPairLiveness;
+  /** A notice asking Brain to decide `taskIds` was handed to its session: follow up once if the turn that gets it decides nothing. */
+  armBrainDecisionFollowUp?(input: ArmBrainDecisionFollowUp): void;
 }
 
 export interface ApplyMarkerInput {
@@ -916,10 +919,12 @@ export class TaskPairService {
       && transition.fromStatus !== TASK_PAIR_STATUS_AWAITING_BRAIN_DECISION && stored.state.auditor === TASK_PAIR_NO_AUDITOR
       && input.writer !== stored.state.brain) {
       const summary = input.turnText ? stripTaskPairMarkersForDisplay(input.turnText) : '';
-      this.#track(sendTaskPairMessage(
-        stored.state.brain, stored.state.taskId, 'brain-line-done-no-auditor',
-        buildNoAuditorDoneNotice(stored.state, summary),
-      ));
+      const brain = stored.state.brain;
+      const taskId = stored.state.taskId;
+      this.#track(sendTaskPairMessage(brain, taskId, 'brain-line-done-no-auditor', buildNoAuditorDoneNotice(stored.state, summary))
+        .then((result) => this.#scheduler?.armBrainDecisionFollowUp?.({
+          brain, taskIds: [taskId], messageIdPrefix: taskPairMessageIdPrefix(taskId, 'brain-line-done-no-auditor'), result,
+        })));
     }
     // An audited pair's PASS (and, as a backstop, its later DONE) gets Brain
     // a notice with the verdict and material by itself -- owner report: two

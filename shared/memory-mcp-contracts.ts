@@ -289,6 +289,20 @@ export function advertisedMcpToolNames(role: NodeRole): readonly MemoryMcpToolNa
   return MEMORY_MCP_TOOL_NAME_LIST.filter((name) => isToolAvailableForRole(name, role));
 }
 
+/**
+ * The pair tools through which Brain acts on a pair (decide, continue, re-brief
+ * it). Read-only tools (`pair_get`, `pair_list`, `pair_task_get`) are not here:
+ * looking at a pair is not deciding it.
+ */
+export const PAIR_BRAIN_ACTION_TOOL_NAMES: readonly string[] = [
+  MEMORY_MCP_TOOL_NAMES.PAIR_DISPATCH,
+  MEMORY_MCP_TOOL_NAMES.PAIR_CLOSE,
+  MEMORY_MCP_TOOL_NAMES.PAIR_REASSIGN,
+  MEMORY_MCP_TOOL_NAMES.PAIR_NEXT_ROUND,
+  MEMORY_MCP_TOOL_NAMES.PAIR_TASK_UPDATE,
+  MEMORY_MCP_TOOL_NAMES.PAIR_TASK_CHECK,
+];
+
 export const MEMORY_MCP_CAPS = {
   SEARCH_MEMORY_DEFAULT_LIMIT: 20,
   SEARCH_MEMORY_MAX_LIMIT: 100,

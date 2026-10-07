@@ -829,6 +829,23 @@ export function buildNoAuditorDoneNotice(pair: TaskPairState, executorSummary: s
 }
 
 /**
+ * Sent once when Brain's turn ended without deciding a pair that awaits its
+ * decision (see brain-decision-followup.ts). Says plainly that a reply, or a
+ * no-op marker, is not an answer.
+ */
+export function buildBrainDecisionFollowUpMessage(pairs: readonly TaskPairState[]): string {
+  const lines = pairs.map((pair) => (
+    `- ${pair.taskId}${pair.title ? ` "${pair.title}"` : ''}: executor ${pair.executor ?? '-'} reported completion${pair.auditor === TASK_PAIR_NO_AUDITOR ? ' without an auditor' : ''}`
+  ));
+  return [
+    `[IM.codes task pairs] Your last turn ended and ${pairs.length} pair(s) still await YOUR decision:`,
+    ...lines,
+    `Decide each now: accept with ${marker('DONE', '<taskId>', 'force=true')}, end it with ${marker('CANCEL', '<taskId>')}, or continue it with NEXT_ROUND, REASSIGN or a new DISPATCH. A plain reply or <!-- IMCODES_TASK_NOOP --> is NOT an answer for a pair that awaits your decision: it stays open and holds its slot.`,
+    `[Contract: ${TASK_PAIR_CONTRACT_ID}]`,
+  ].join('\n');
+}
+
+/**
  * Relayed to Brain the moment an audited pair PASSes (or, as a backstop if
  * that notice was somehow missed, again when it reaches DONE): owner report,
  * two PASSed pairs sat unintegrated for hours because Brain relied on the

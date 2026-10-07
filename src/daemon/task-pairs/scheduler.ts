@@ -43,7 +43,8 @@ import {
 import { getTaskPairStore, type StoredTaskPair, type TaskPairLiveness } from './store.js';
 import { isPairsEngineProject, projectBrainSession, resolveTaskPairMaxConcurrency } from './engine.js';
 import { runIntegrationDriftPass } from './integration-drift.js';
-import { sendTaskPairMessage } from './delivery.js';
+import { sendTaskPairMessage, taskPairMessageIdPrefix } from './delivery.js';
+import { BrainDecisionFollowUps, type ArmBrainDecisionFollowUp } from './brain-decision-followup.js';
 import { recordBrainNoticeOutcome } from './brain-notice.js';
 import { hasRecentTaskPairProviderError } from './provider-errors.js';
 import { mainCheckoutGuard } from './main-checkout-guard.js';
@@ -210,6 +211,14 @@ export class TaskPairAutomation implements TaskPairScheduler {
     this.#pairsProjectMemo.set(project, { value, at: now });
     return value;
   }
+  /** One follow-up when Brain's turn ends without deciding a pair awaiting its decision. */
+  readonly #decisionFollowUps = new BrainDecisionFollowUps({
+    now: () => this.#now(),
+    send: (brain, reason, text) => sendTaskPairMessage(brain, TASK_PAIR_AGGREGATE_NOTICE_ID, reason, text),
+  });
+  armBrainDecisionFollowUp(input: ArmBrainDecisionFollowUp): void {
+    this.#decisionFollowUps.arm(input);
+  }
   #mainHeartbeatPauseCleared = new Set<string>();
   #mainHeartbeatDelivered = new Map<string, string>();
   #mainHeartbeatPending = new Set<string>();
@@ -302,6 +311,7 @@ export class TaskPairAutomation implements TaskPairScheduler {
    * projection without reviving the retired legacy supervision engine.
    */
   observeTimelineEvent(event: { sessionId: string; type: string; payload: Record<string, unknown> }): void {
+    this.#decisionFollowUps.observe(event);
     // Called for every timeline event of every session (streamed deltas
     // included): only the pairs this session takes part in are looked at, from
     // the store's in-memory index, so an unrelated session costs one Map lookup.
@@ -1091,6 +1101,12 @@ export class TaskPairAutomation implements TaskPairScheduler {
         // An aggregate names no single pair, so the delivery layer cannot
         // attribute it: record what became of it on every pair it covered.
         for (const covered of deliveryPairs) recordBrainNoticeOutcome(covered, aggregateReason, result);
+        this.armBrainDecisionFollowUp({
+          brain,
+          taskIds: deliveryPairs.filter((covered) => covered.state.status === TASK_PAIR_STATUS_AWAITING_BRAIN_DECISION).map((covered) => covered.state.taskId),
+          messageIdPrefix: taskPairMessageIdPrefix(TASK_PAIR_AGGREGATE_NOTICE_ID, aggregateReason),
+          result,
+        });
         if (result === 'sent' || result === 'queued' || result === 'skipped_pending') {
           const at = this.#now();
           const post = deliveryPairs.map((stored) => {

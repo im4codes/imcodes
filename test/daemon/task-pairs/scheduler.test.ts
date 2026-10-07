@@ -489,6 +489,141 @@ describe('task-pair heartbeat, replacement and queue', () => {
     }
   });
 
+  describe("a pair awaiting Brain's decision is followed up once when Brain's turn ends without deciding it", () => {
+    function brainEvent(type: string, payload: Record<string, unknown>) {
+      automation.observeTimelineEvent({ sessionId: BRAIN, type, payload });
+    }
+    /** One Brain turn: the notice is consumed at its start, optional tool calls, then the turn ends idle. */
+    async function brainTurn(opts: { noticeId?: string; toolCalls?: Array<Record<string, unknown>>; others?: boolean } = {}) {
+      brainEvent('session.state', { state: 'running' });
+      if (opts.noticeId) brainEvent('transport.queue.delivery', { clientMessageId: opts.noticeId });
+      for (const input of opts.toolCalls ?? []) brainEvent('tool.call', { tool: 'mcp__imcodes-memory__pair_get', input });
+      brainEvent('assistant.text', { text: 'ok <!-- IMCODES_TASK_NOOP -->' });
+      brainEvent('session.state', { state: 'idle' });
+      await flush();
+    }
+    function lastNoticeId(reason: string) { return sentTo(BRAIN, reason).at(-1)!.id; }
+    async function awaitingPair(taskId: string) {
+      marker(BRAIN, `<!-- IMCODES_TASK DISPATCH ${taskId} executor=${EXEC} auditor=none -->`);
+      marker(EXEC, `<!-- IMCODES_TASK DONE ${taskId} -->`);
+      await flush();
+      expect(pair(taskId).status).toBe('awaiting_brain_decision');
+      now += 1_000; // Brain's own earlier DISPATCH must not look like an action in the notice's turn
+    }
+
+    it('Brain worked on something else and ended with a no-op: one follow-up that says a reply is not an answer', async () => {
+      await awaitingPair('FU_NOOP');
+      const noticeId = lastNoticeId('brain-line-done-no-auditor');
+      sent = [];
+      await brainTurn({ noticeId });
+      const followUps = sentTo(BRAIN, 'brain-decision-followup');
+      expect(followUps).toHaveLength(1);
+      expect(followUps[0]!.text).toContain('FU_NOOP');
+      expect(followUps[0]!.text).toContain('IMCODES_TASK_NOOP');
+      expect(followUps[0]!.text).toContain('is NOT an answer');
+      expect(getTaskPairStore().listEvents(PROJECT, 'FU_NOOP').some((event) => event.verb === TASK_PAIR_BRAIN_NOTICE_EVENT && event.attrs.reason === 'brain-decision-followup')).toBe(true);
+    });
+
+    it('at most once per notice: the turn that answers the follow-up ending the same way sends nothing more', async () => {
+      await awaitingPair('FU_ONCE');
+      const noticeId = lastNoticeId('brain-line-done-no-auditor');
+      await brainTurn({ noticeId });
+      const followUpId = lastNoticeId('brain-decision-followup');
+      sent = [];
+      await brainTurn({ noticeId: followUpId });
+      await brainTurn();
+      expect(sent).toHaveLength(0);
+    });
+
+    it('a Brain that decides the pair in that turn (a lifecycle marker) is not followed up', async () => {
+      await awaitingPair('FU_ACTED');
+      const noticeId = lastNoticeId('brain-line-done-no-auditor');
+      sent = [];
+      marker(BRAIN, '<!-- IMCODES_TASK DONE FU_ACTED force=true -->');
+      await flush();
+      await brainTurn({ noticeId });
+      expect(sentTo(BRAIN, 'brain-decision-followup')).toHaveLength(0);
+    });
+
+    it('a Brain that touched the pair without changing its status (an event of its own on it) is not followed up either', async () => {
+      await awaitingPair('FU_EVENT');
+      const noticeId = lastNoticeId('brain-line-done-no-auditor');
+      sent = [];
+      // Brain wrote to the pair (a brief edit/CHECK-style event) but left it awaiting.
+      getTaskPairStore().recordEvent({
+        id: 'fu-event-brain-touch', project: PROJECT, taskId: 'FU_EVENT', writer: BRAIN, role: 'brain', verb: 'CHECK',
+        attrs: {}, effect: 'applied', unusual: false, source: 'mcp', fromStatus: 'awaiting_brain_decision', toStatus: 'awaiting_brain_decision', at: now + 10,
+      });
+      await brainTurn({ noticeId });
+      expect(sentTo(BRAIN, 'brain-decision-followup')).toHaveLength(0);
+    });
+
+    it('a pair Brain acted on through a pair tool is left alone, reading a pair or merely naming it in a shell command is not an action, and the rest come in one merged message', async () => {
+      await awaitingPair('FU_MERGE_A');
+      const idA = lastNoticeId('brain-line-done-no-auditor');
+      await awaitingPair('FU_MERGE_B');
+      const idB = lastNoticeId('brain-line-done-no-auditor');
+      await awaitingPair('FU_MERGE_C');
+      const idC = lastNoticeId('brain-line-done-no-auditor');
+      sent = [];
+      brainEvent('session.state', { state: 'running' });
+      for (const id of [idA, idB, idC]) brainEvent('transport.queue.delivery', { clientMessageId: id });
+      brainEvent('tool.call', { tool: 'mcp__imcodes-memory__pair_task_update', input: { taskId: 'FU_MERGE_A', markdown: 'continue' } });
+      brainEvent('tool.call', { tool: 'mcp__imcodes-memory__pair_get', input: { taskId: 'FU_MERGE_B' } });
+      brainEvent('tool.call', { tool: 'Bash', input: { command: 'cd /w/pair_FU_MERGE_C/repo && git log' } });
+      brainEvent('session.state', { state: 'idle' });
+      await flush();
+      const followUps = sentTo(BRAIN, 'brain-decision-followup');
+      expect(followUps).toHaveLength(1);
+      expect(followUps[0]!.text).not.toContain('FU_MERGE_A');
+      expect(followUps[0]!.text).toContain('FU_MERGE_B');
+      expect(followUps[0]!.text).toContain('FU_MERGE_C');
+    });
+
+    it('a notice armed as queued is not answered by an unrelated turn, only by the turn that receives it', async () => {
+      await awaitingPair('FU_Q2');
+      const noticeId = lastNoticeId('brain-line-done-no-auditor');
+      // A scheduler that knows only the queued notice (the service armed the original on `automation`).
+      const queuedOnly = new TaskPairAutomation({ now: () => now, isBusy: () => false, importLegacy: () => undefined });
+      queuedOnly.armBrainDecisionFollowUp({ brain: BRAIN, taskIds: ['FU_Q2'], messageIdPrefix: noticeId.slice(0, noticeId.lastIndexOf(':') + 1), result: 'queued' });
+      const observe = (type: string, payload: Record<string, unknown>) => queuedOnly.observeTimelineEvent({ sessionId: BRAIN, type, payload });
+      sent = [];
+      observe('session.state', { state: 'running' });
+      observe('session.state', { state: 'idle' });
+      await flush();
+      expect(sentTo(BRAIN, 'brain-decision-followup')).toHaveLength(0);
+      observe('session.state', { state: 'running' });
+      observe('transport.queue.delivery', { clientMessageId: noticeId });
+      observe('session.state', { state: 'idle' });
+      await flush();
+      expect(sentTo(BRAIN, 'brain-decision-followup')).toHaveLength(1);
+    });
+
+    it('a pair that already ended, or never awaited a decision, or belongs to another Brain, gets no follow-up', async () => {
+      await awaitingPair('FU_ENDED');
+      const noticeId = lastNoticeId('brain-line-done-no-auditor');
+      marker(BRAIN, '<!-- IMCODES_TASK CANCEL FU_ENDED -->');
+      await flush();
+      sent = [];
+      await brainTurn({ noticeId });
+      automation.observeTimelineEvent({ sessionId: SPARE, type: 'session.state', payload: { state: 'idle' } });
+      await flush();
+      expect(sentTo(BRAIN, 'brain-decision-followup')).toHaveLength(0);
+      expect(sent).toHaveLength(0);
+    });
+
+    it('a follow-up is a Brain delivery: the ordinary reminder keeps its ten-minute gap after it', async () => {
+      await awaitingPair('FU_GAP');
+      await brainTurn({ noticeId: lastNoticeId('brain-line-done-no-auditor') });
+      expect(sentTo(BRAIN, 'brain-decision-followup')).toHaveLength(1);
+      sent = [];
+      await tick(1); // six minutes: still inside the shared gap
+      expect(sentTo(BRAIN, 'brain-decision-reminder')).toHaveLength(0);
+      await tick(2);
+      expect(sentTo(BRAIN, 'brain-decision-reminder')).toHaveLength(1);
+    });
+  });
+
   it('enforces the ten-minute Brain gap across two pairs sharing one Brain', async () => {
     marker(BRAIN, `<!-- IMCODES_TASK DISPATCH GAP_A executor=${EXEC} auditor=none -->`);
     marker(EXEC, '<!-- IMCODES_TASK DONE GAP_A -->');
