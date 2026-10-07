@@ -4,6 +4,7 @@
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { identityPromptHash } from '../../src/util/identity-prompt-hash.js';
+import { SESSION_IDENTITY_SCOPES } from '../../shared/session-identity.js';
 import { putLocalSessionIdentityProfile, removeLocalSessionIdentityProfileQuiet } from '../../src/daemon/session-identity-local-store.js';
 
 // ── Mocks ─────────────────────────────────────────────────────────────────────
@@ -102,6 +103,15 @@ vi.mock('../../src/daemon/session-resource-service.js', () => ({
 
 import { launchSession } from '../../src/agent/session-manager.js';
 
+/**
+ * The identity is typed into the agent after its startup poll (codex polls every 1.5 s) and, when derived, after reading the
+ * identity store. A fixed 1.6 s wait left 100 ms for all of that and failed on the Windows runner (no call yet); wait for the
+ * call itself instead, with a bound far beyond the work.
+ */
+const waitForIdentityInjection = (text: string) => vi.waitFor(() => {
+  expect(mocks.sendKeys).toHaveBeenCalledWith('deck_proj_brain', expect.stringContaining(text));
+}, { timeout: 20_000, interval: 50 });
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 describe('IMCODES_SESSION env injection', () => {
@@ -180,7 +190,8 @@ describe('IMCODES_SESSION env injection', () => {
       projectDir: '/proj',
       identityPrompt: 'Identity loaded from the selected document.',
     });
-    await new Promise((resolve) => setTimeout(resolve, 1_600));
+    // The agent's startup poll (1.5 s) comes first, then the identity is typed in: wait for that, not for a clock.
+    await waitForIdentityInjection('Identity loaded from the selected document.');
 
     // The text is injected into the agent, but the session record keeps only its digest (never the prompt).
     expect(mocks.upsertSession).toHaveBeenCalledWith(expect.objectContaining({
@@ -205,7 +216,7 @@ describe('IMCODES_SESSION env injection', () => {
         agentType: 'codex',
         projectDir: '/proj',
       });
-      await new Promise((resolve) => setTimeout(resolve, 1_600));
+      await waitForIdentityInjection('Derived user identity contract.');
     } finally {
       await removeLocalSessionIdentityProfileQuiet('user', '');
     }
@@ -216,6 +227,27 @@ describe('IMCODES_SESSION env injection', () => {
     );
     for (const [record] of mocks.upsertSession.mock.calls) {
       expect(JSON.stringify(record)).not.toContain('Derived user identity contract.');
+    }
+  });
+
+  it('a derived PROJECT identity is looked up by the context namespace project id (as a restore does), not by the project name', async () => {
+    const projectId = 'project-uuid-7a1c';
+    await putLocalSessionIdentityProfile({ scope: SESSION_IDENTITY_SCOPES.PROJECT, scopeKey: projectId, content: 'Project identity keyed by id.', source: 'mcp' });
+    // A different profile under the project NAME: the lookup that ignored the namespace would have found this one instead.
+    await putLocalSessionIdentityProfile({ scope: SESSION_IDENTITY_SCOPES.PROJECT, scopeKey: 'proj', content: 'Project identity keyed by name.', source: 'mcp' });
+    mocks.getSession.mockReturnValue({
+      name: 'deck_proj_brain', projectName: 'proj', role: 'brain', agentType: 'codex', projectDir: '/proj', state: 'idle',
+      contextNamespace: { projectId }, restarts: 0, restartTimestamps: [], createdAt: 1, updatedAt: 1,
+    } as never);
+    try {
+      await launchSession({ name: 'deck_proj_brain', projectName: 'proj', role: 'brain', agentType: 'codex', projectDir: '/proj' });
+      await waitForIdentityInjection('Project identity keyed by id.');
+      const typed = mocks.sendKeys.mock.calls.map(([, keys]) => String(keys)).join('\n');
+      expect(typed).not.toContain('Project identity keyed by name.');
+    } finally {
+      mocks.getSession.mockReturnValue(null as never);
+      await removeLocalSessionIdentityProfileQuiet(SESSION_IDENTITY_SCOPES.PROJECT, projectId);
+      await removeLocalSessionIdentityProfileQuiet(SESSION_IDENTITY_SCOPES.PROJECT, 'proj');
     }
   });
 

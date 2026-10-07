@@ -4265,7 +4265,9 @@ export async function launchSession(opts: LaunchOpts): Promise<void> {
       }
     }
     if (agentType === 'shell' || agentType === 'script') return;
-    const launchIdentity = opts.identityPrompt ?? await resolveEffectiveIdentityPrompt({ name, projectName });
+    // The same session reference as a restore uses: its PROJECT-scope identity is keyed by the context namespace's project id
+    // when the session has one, so leaving it out would look up the project NAME and miss that profile.
+    const launchIdentity = opts.identityPrompt ?? await resolveEffectiveIdentityPrompt({ name, projectName, contextNamespace: storedBeforeLaunch?.contextNamespace });
     const initialContext = [opts.description, launchIdentity].filter(Boolean).join('\n\n');
     if (!initialContext) return;
     try {
