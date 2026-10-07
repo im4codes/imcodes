@@ -1128,6 +1128,11 @@ class MacosRemoteDesktopSession::Impl final
         .frame_rate = video_.frame_rate,
         .bitrate_bps = video_.bitrate_bps,
         .profile = video_.profile,
+        // A capture that scales in the compositor is the macOS 12 CGDisplayStream
+        // path, where the encoder may be Apple's software one: keep the picture
+        // current rather than smooth. Every other capture keeps the old
+        // behaviour.
+        .latency_first = dependencies_.adapters.capture.SupportsOutputSize(),
     };
     const std::weak_ptr<Impl> weak = weak_from_this();
     if (!dependencies_.adapters.encoder.Configure(
@@ -1608,7 +1613,12 @@ class OwnedProductionAdapters final {
         readiness_(permissions_,
                    CapabilityProfileFor(configuration.session_type)),
         transport_(configuration.transport),
-        negotiate_offer_(std::move(configuration.negotiate_offer)) {}
+        negotiate_offer_(std::move(configuration.negotiate_offer)) {
+    // A reconfiguration the encoder makes on its own (the speed governor
+    // stepping the size) must carry the capture along, exactly like one the
+    // quality ladder asks for.
+    encoder_.SetConfigurationObserver([this] { RetargetCaptureToEncoder(); });
+  }
 
   MacosRemoteDesktopSessionDependencies Dependencies() {
     return {

@@ -68,6 +68,13 @@ struct EncoderConfiguration {
   std::uint32_t frame_rate = 0;
   std::uint32_t bitrate_bps = 0;
   H264Profile profile = H264Profile::kConstrainedBaseline;
+  // Favour a current picture over a smooth one. The encoder keeps one frame in
+  // flight and drops whatever arrives while it is busy (so it always works on
+  // the newest frame instead of a queue), and a measured encode time that is
+  // too slow for that to keep latency low steps the output size down (see
+  // encode_speed_governor.h). Off by default: every existing path keeps its
+  // behaviour.
+  bool latency_first = false;
 };
 
 class EncoderAdapter {

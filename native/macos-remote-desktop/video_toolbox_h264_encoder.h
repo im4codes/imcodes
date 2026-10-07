@@ -108,6 +108,9 @@ struct VideoToolboxEncoderStatistics {
   // itself down a rung independently of whatever the network estimator
   // currently authorizes. 0 means the encoder is keeping up with capture.
   std::uint32_t backlog_pressure = 0;
+  // Latency-first mode only: how many steps the speed governor has taken the
+  // output size below what the quality ladder asked for (0 = none).
+  std::uint32_t speed_governor_level = 0;
 };
 
 using VideoToolboxBackendOutputSink =
@@ -191,6 +194,11 @@ class VideoToolboxH264Encoder final : public common::EncoderAdapter {
   // a keyframe; it never estimates bandwidth itself.
   bool ReconfigureFromQualitySelection(
       const imcodes::rd::QualitySelection& selection);
+
+  // Called, outside every encoder lock, after a quality reconfiguration (from
+  // the ladder or from the speed governor) has changed the encoded size. Used
+  // to make a capture that can scale follow the encoder. Set before use.
+  void SetConfigurationObserver(std::function<void()> observer);
 
   [[nodiscard]] VideoToolboxEncoderKind ActiveEncoderKind() const noexcept;
   [[nodiscard]] std::optional<common::EncoderConfiguration> Configuration()

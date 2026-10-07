@@ -7,13 +7,20 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstring>
+#include <functional>
 #include <limits>
+#include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
+#include <unordered_map>
 #include <utility>
 #include <vector>
+
+#include "../remote-desktop-common/encode_speed_governor.h"
 
 namespace imcodes::remote_desktop::macos {
 namespace {
@@ -895,11 +902,48 @@ class AppleVideoToolboxEncoderBackend final
   VideoToolboxBackendErrorSink error_sink_;
 };
 
+// The speed governor and its per-frame readable level. Shared (not owned) by the
+// delivery state so the VideoToolbox callback thread can feed it without ever
+// holding a pointer to the encoder.
+struct SpeedControl {
+  std::mutex mutex;
+  imcodes::rd::EncodeSpeedGovernor governor;
+  // Mirrors governor.level(): read on the capture thread for every frame.
+  std::atomic<int> level{0};
+  // Only samples taken under a ladder-chosen configuration describe the size
+  // the governor is steering: the session's first configuration (the display's
+  // native size, before any quality selection) is not one of them.
+  std::atomic<bool> armed{false};
+
+  void OnEncoded(double encode_ms) {
+    if (!armed.load(std::memory_order_relaxed)) return;
+    const auto now_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count();
+    std::lock_guard lock(mutex);
+    governor.OnFrameEncoded(now_ms, encode_ms);
+    level.store(governor.level(), std::memory_order_relaxed);
+  }
+};
+
 struct DeliveryState {
   mutable std::mutex mutex;
   std::uint64_t generation = 0;
   bool accepting = false;
   bool force_next_keyframe = false;
+  // Latency-first mode: a frame that arrives while one is in flight is simply
+  // dropped (not counted as backlog pressure: with the capture running faster
+  // than the encoder that is the intended steady state), and each frame's
+  // submit-to-output time feeds the speed governor.
+  bool latency_first = false;
+  std::shared_ptr<SpeedControl> speed;
+  // The size the session was configured for. A frame of another size (the
+  // capture is still switching) takes the slow resample path and says nothing
+  // about how fast the encoder is, so it is not timed.
+  common::PixelSize expected_pixels;
+  std::unordered_map<std::uint64_t, std::chrono::steady_clock::time_point>
+      submitted_at;
   std::uint32_t max_pending_frames = 0;
   std::size_t max_access_unit_bytes = 0;
   std::uint64_t next_submission_id = 1;
@@ -926,12 +970,18 @@ struct DeliveryState {
       // that drops most frames climbs quickly, while a handful of isolated
       // blips among mostly-successful submissions decays back to 0 rather
       // than lingering as a false "still behind" signal.
-      statistics.backlog_pressure =
-          std::min(statistics.backlog_pressure + 2, kMaxTrackedBacklogPressure);
+      if (!latency_first) {
+        statistics.backlog_pressure = std::min(
+            statistics.backlog_pressure + 2, kMaxTrackedBacklogPressure);
+      }
       return std::nullopt;
     }
     const std::uint64_t id = next_submission_id++;
     pending.insert(id);
+    if (latency_first && frame.encoded_pixels.width == expected_pixels.width &&
+        frame.encoded_pixels.height == expected_pixels.height) {
+      submitted_at[id] = std::chrono::steady_clock::now();
+    }
     statistics.pending_frames = static_cast<std::uint32_t>(pending.size());
     if (statistics.backlog_pressure > 0) --statistics.backlog_pressure;
     const bool force = request_keyframe || force_next_keyframe;
@@ -946,6 +996,7 @@ struct DeliveryState {
 
   void Reject(std::uint64_t id, VideoToolboxEncoderError error) {
     std::lock_guard lock(mutex);
+    submitted_at.erase(id);
     if (pending.erase(id) == 0) {
       return;
     }
@@ -959,8 +1010,16 @@ struct DeliveryState {
             std::uint64_t id,
             common::H264AccessUnit access_unit) {
     common::H264AccessUnitSink current_sink;
+    std::optional<double> encode_ms;
     {
       std::lock_guard lock(mutex);
+      const auto submitted = submitted_at.find(id);
+      if (submitted != submitted_at.end()) {
+        encode_ms = std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - submitted->second)
+                        .count();
+        submitted_at.erase(submitted);
+      }
       if (!accepting || generation != callback_generation ||
           pending.erase(id) == 0) {
         ++statistics.ignored_late_outputs;
@@ -980,6 +1039,9 @@ struct DeliveryState {
       statistics.emitted_access_unit_bytes += access_unit.bytes.size();
       current_sink = sink;
     }
+    // A keyframe carries its parameter sets and the session's warm-up cost; the
+    // governor's median ignores the odd slow frame, so it is fed unfiltered.
+    if (encode_ms.has_value() && speed != nullptr) speed->OnEncoded(*encode_ms);
     current_sink(std::move(access_unit));
   }
 
@@ -987,6 +1049,7 @@ struct DeliveryState {
             std::uint64_t id,
             VideoToolboxEncoderError error) {
     std::lock_guard lock(mutex);
+    submitted_at.erase(id);
     if (!accepting || generation != callback_generation ||
         pending.erase(id) == 0) {
       ++statistics.ignored_late_outputs;
@@ -1004,6 +1067,7 @@ struct DeliveryState {
     accepting = false;
     force_next_keyframe = false;
     pending.clear();
+    submitted_at.clear();
     statistics.pending_frames = 0;
     sink = {};
   }
@@ -1137,6 +1201,7 @@ class VideoToolboxH264Encoder::Impl {
       : backend_(std::move(backend)), policy_(policy), limits_(limits) {
     state_->max_pending_frames = limits_.max_pending_frames;
     state_->max_access_unit_bytes = limits_.max_access_unit_bytes;
+    state_->speed = speed_;
   }
 
   common::ReadinessState ProbeReadiness() {
@@ -1155,6 +1220,10 @@ class VideoToolboxH264Encoder::Impl {
 
   bool Configure(const common::EncoderConfiguration& configuration,
                  common::H264AccessUnitSink sink) {
+    // One rebuild at a time: the quality ladder (rate-update thread) and the
+    // speed governor (capture thread) can both ask for one, and two overlapping
+    // rebuilds would race on the backend's session.
+    std::lock_guard<std::recursive_mutex> rebuild(rebuild_mutex_);
     Stop();
     if (!backend_ || !limits_.IsValid() || !sink ||
         !IsValidConfiguration(configuration, limits_)) {
@@ -1168,6 +1237,22 @@ class VideoToolboxH264Encoder::Impl {
     {
       std::lock_guard lock(state_->mutex);
       generation = ++state_->generation;
+      // Latency-first keeps one frame in flight: the encoder always works on
+      // the newest frame and never on a queue of stale ones.
+      state_->latency_first = configuration.latency_first;
+      state_->expected_pixels = configuration.encoded_pixels;
+      state_->max_pending_frames =
+          configuration.latency_first ? 1U : limits_.max_pending_frames;
+    }
+    latency_first_.store(configuration.latency_first,
+                         std::memory_order_relaxed);
+    // Disarmed until Reconfigure() proves the configuration came from a ladder
+    // selection; it re-arms the governor after a successful rebuild.
+    speed_->armed.store(false, std::memory_order_relaxed);
+    if (configuration.latency_first) {
+      // A new session: the old one's timings no longer describe it.
+      std::lock_guard lock(speed_->mutex);
+      speed_->governor.ClearWindow();
     }
     const auto state = state_;
     auto output_sink = [state, generation](std::uint64_t id,
@@ -1249,6 +1334,9 @@ class VideoToolboxH264Encoder::Impl {
   }
 
   bool Encode(common::CapturedFrame frame, bool request_keyframe) {
+    if (latency_first_.load(std::memory_order_relaxed)) {
+      ApplyGovernorIfChanged();
+    }
     auto submission = state_->Begin(frame, request_keyframe);
     if (!submission.has_value()) {
       return false;
@@ -1271,8 +1359,10 @@ class VideoToolboxH264Encoder::Impl {
   }
 
   bool Reconfigure(const imcodes::rd::QualitySelection& selection) {
+    std::lock_guard<std::recursive_mutex> rebuild(rebuild_mutex_);
     common::H264AccessUnitSink sink;
     common::H264Profile profile = common::H264Profile::kConstrainedBaseline;
+    bool latency_first = false;
     {
       std::lock_guard lock(mutex_);
       if (!configuration_.has_value() || !sink_) {
@@ -1282,6 +1372,14 @@ class VideoToolboxH264Encoder::Impl {
       }
       sink = sink_;
       profile = configuration_->profile;
+      latency_first = configuration_->latency_first;
+      // What the ladder asked for, before any speed-governor step: the
+      // governor re-applies it with a new level without waiting for the
+      // network estimator to speak again.
+      requested_selection_ = selection;
+      // The caller's id string does not outlive this call; nothing here reads
+      // it, so never keep a pointer to it.
+      requested_selection_->id = "requested";
     }
     if (selection.width <= 0 || selection.height <= 0 || selection.fps <= 0) {
       std::lock_guard lock(mutex_);
@@ -1332,6 +1430,24 @@ class VideoToolboxH264Encoder::Impl {
         }
       }
     }
+    if (latency_first) {
+      // Resolution is the last thing given up: the governor asks for a smaller
+      // size only when one frame alone takes too long for the picture to stay
+      // current (see encode_speed_governor.h).
+      int level = 0;
+      {
+        std::lock_guard lock(speed_->mutex);
+        speed_->governor.SetMaxLevel(
+            imcodes::rd::MaxEncodeSpeedLevel(effective.width, effective.height));
+        level = speed_->governor.level();
+        speed_->level.store(level, std::memory_order_relaxed);
+      }
+      const imcodes::rd::EncodeSize sized = imcodes::rd::ApplyEncodeSpeedLevel(
+          effective.width, effective.height, level);
+      effective.width = sized.width;
+      effective.height = sized.height;
+      applied_level_.store(level, std::memory_order_relaxed);
+    }
     common::EncoderConfiguration next{
         .encoded_pixels = {static_cast<std::uint32_t>(effective.width),
                            static_cast<std::uint32_t>(effective.height)},
@@ -1342,6 +1458,7 @@ class VideoToolboxH264Encoder::Impl {
         .bitrate_bps = std::clamp(effective.bitrate_bps, kMinimumBitrateBps,
                                   kMaximumBitrateBps),
         .profile = profile,
+        .latency_first = latency_first,
     };
     {
       std::lock_guard lock(mutex_);
@@ -1352,6 +1469,10 @@ class VideoToolboxH264Encoder::Impl {
           configuration_->encoded_pixels.width == next.encoded_pixels.width &&
           configuration_->encoded_pixels.height == next.encoded_pixels.height &&
           configuration_->frame_rate == next.frame_rate) {
+        // Already the size the ladder wants (e.g. a display smaller than the
+        // top rung): the running session is the ladder's, so the governor may
+        // start steering it.
+        if (latency_first) speed_->armed.store(true, std::memory_order_relaxed);
         return true;
       }
       // Validate before Configure(): it stops the running session first, and
@@ -1362,7 +1483,22 @@ class VideoToolboxH264Encoder::Impl {
         return false;
       }
     }
-    return Configure(next, std::move(sink));
+    if (!Configure(next, std::move(sink))) return false;
+    if (latency_first) speed_->armed.store(true, std::memory_order_relaxed);
+    // The encoded size changed: let a capture that can scale follow it. Outside
+    // every lock; the observer must not block.
+    std::function<void()> observer;
+    {
+      std::lock_guard lock(mutex_);
+      observer = observer_;
+    }
+    if (observer) observer();
+    return true;
+  }
+
+  void SetConfigurationObserver(std::function<void()> observer) {
+    std::lock_guard lock(mutex_);
+    observer_ = std::move(observer);
   }
 
   void Stop() noexcept {
@@ -1396,14 +1532,45 @@ class VideoToolboxH264Encoder::Impl {
   }
 
   VideoToolboxEncoderStatistics Statistics() const {
-    std::lock_guard lock(state_->mutex);
-    return state_->statistics;
+    VideoToolboxEncoderStatistics statistics;
+    {
+      std::lock_guard lock(state_->mutex);
+      statistics = state_->statistics;
+    }
+    statistics.speed_governor_level = static_cast<std::uint32_t>(
+        std::max(0, speed_->level.load(std::memory_order_relaxed)));
+    return statistics;
   }
 
  private:
+  // Called at the start of every latency-first Encode(): if the speed governor
+  // has moved since the last configuration, re-apply the ladder's request with
+  // the new level. Runs on the capture thread, which is the one thread that
+  // knows frames are flowing; the session rebuild costs one dropped keyframe.
+  void ApplyGovernorIfChanged() {
+    const int level = speed_->level.load(std::memory_order_relaxed);
+    if (level == applied_level_.load(std::memory_order_relaxed)) return;
+    std::optional<imcodes::rd::QualitySelection> requested;
+    {
+      std::lock_guard lock(mutex_);
+      requested = requested_selection_;
+    }
+    if (!requested.has_value()) {
+      applied_level_.store(level, std::memory_order_relaxed);
+      return;
+    }
+    (void)Reconfigure(*requested);
+  }
+
   std::unique_ptr<VideoToolboxEncoderBackend> backend_;
   VideoToolboxEncoderPolicy policy_;
   VideoToolboxEncoderLimits limits_;
+  std::recursive_mutex rebuild_mutex_;  // Configure/Reconfigure; Reconfigure calls Configure.
+  std::shared_ptr<SpeedControl> speed_ = std::make_shared<SpeedControl>();
+  std::atomic<bool> latency_first_{false};
+  std::atomic<int> applied_level_{0};
+  std::optional<imcodes::rd::QualitySelection> requested_selection_;
+  std::function<void()> observer_;
   std::shared_ptr<DeliveryState> state_ = std::make_shared<DeliveryState>();
   mutable std::mutex mutex_;
   std::optional<common::EncoderConfiguration> configuration_;
@@ -1456,6 +1623,11 @@ void VideoToolboxH264Encoder::Stop() noexcept {
 bool VideoToolboxH264Encoder::ReconfigureFromQualitySelection(
     const imcodes::rd::QualitySelection& selection) {
   return impl_->Reconfigure(selection);
+}
+
+void VideoToolboxH264Encoder::SetConfigurationObserver(
+    std::function<void()> observer) {
+  impl_->SetConfigurationObserver(std::move(observer));
 }
 
 VideoToolboxEncoderKind VideoToolboxH264Encoder::ActiveEncoderKind()
