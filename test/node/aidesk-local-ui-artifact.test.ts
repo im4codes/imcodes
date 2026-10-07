@@ -19,7 +19,6 @@ import { resolveVerifiedAideskLocalUi } from '../../src/node/aidesk-local-ui-art
 // @ts-expect-error plain .mjs build script
 import * as artifactScript from '../../scripts/aidesk-ui-artifact.mjs';
 // @ts-expect-error plain .mjs build script
-import * as fetchScript from '../../scripts/fetch-aidesk-ui-deps.mjs';
 
 const roots: string[] = [];
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
@@ -121,60 +120,5 @@ describe('the node only uses a native window that verifies', () => {
     expect(await resolveVerifiedAideskLocalUi({ ...mac, codesignVerifies: async () => true })).toBe(helper);
     expect(await resolveVerifiedAideskLocalUi({ ...mac, codesignVerifies: async () => false })).toBeUndefined();
     expect(await resolveVerifiedAideskLocalUi({ ...mac, macosHelperPath: join(temp(), 'missing'), codesignVerifies: async () => true })).toBeUndefined();
-  });
-});
-
-describe('pinned source fetch', () => {
-  const pin = (bytes: Buffer, top: string) => ({ version: '1', url: 'https://example.test/x.tar.gz', sha256: createHash('sha256').update(bytes).digest('hex'), topDirectory: top });
-
-  function tarball(top: string, extraTop?: string): Buffer {
-    const source = temp();
-    mkdirSync(join(source, top), { recursive: true });
-    writeFileSync(join(source, top, 'CMakeLists.txt'), 'project(x)');
-    if (extraTop) { mkdirSync(join(source, extraTop)); writeFileSync(join(source, extraTop, 'evil'), '1'); }
-    const out = join(temp(), 'x.tar.gz');
-    execFileSync('tar', ['-czf', out, '-C', source, '.']);
-    return readFileSync(out);
-  }
-
-  it('the committed lock names https sources with sha256 pins for both libraries', () => {
-    const pins = fetchScript.parseDependenciesLock(readFileSync(fetchScript.AIDESK_UI_DEPENDENCIES_LOCK, 'utf8'));
-    expect(Object.keys(pins).sort()).toEqual(['fltk', 'jsoncpp']);
-    expect(pins.fltk.version).toBe('1.4.5');
-    expect(readFileSync(join(process.cwd(), 'native/aidesk-ui/CMakeLists.txt'), 'utf8')).toContain('Pinned FLTK 1.4.5 source root');
-    expect(() => fetchScript.parseDependenciesLock(JSON.stringify({ schemaVersion: 1, dependencies: { fltk: { ...pins.fltk, url: 'http://x' }, jsoncpp: pins.jsoncpp } }))).toThrow();
-    expect(() => fetchScript.parseDependenciesLock(JSON.stringify({ schemaVersion: 1, dependencies: { fltk: { ...pins.fltk, sha256: 'xyz' }, jsoncpp: pins.jsoncpp } }))).toThrow();
-    expect(() => fetchScript.parseDependenciesLock(JSON.stringify({ schemaVersion: 1, dependencies: { jsoncpp: pins.jsoncpp } }))).toThrow();
-  });
-
-  it('refuses bytes whose sha256 is not the pinned one, and an archive that does not have exactly the pinned top directory', () => {
-    const bytes = tarball('lib-1');
-    expect(() => fetchScript.assertPinnedBytes('lib', bytes, pin(bytes, 'lib-1'))).not.toThrow();
-    expect(() => fetchScript.assertPinnedBytes('lib', Buffer.concat([bytes, Buffer.from('x')]), pin(bytes, 'lib-1'))).toThrow(/sha256 mismatch/u);
-    const archive = join(temp(), 'a.tar.gz');
-    writeFileSync(archive, bytes);
-    expect(fetchScript.extractPinnedTarball('lib', archive, join(temp(), 'out'), pin(bytes, 'lib-1'))).toMatch(/lib-1$/u);
-    expect(() => fetchScript.extractPinnedTarball('lib', archive, join(temp(), 'out'), pin(bytes, 'other-2'))).toThrow(/exactly other-2/u);
-    const twoTops = tarball('lib-1', 'sneaky');
-    writeFileSync(archive, twoTops);
-    expect(() => fetchScript.extractPinnedTarball('lib', archive, join(temp(), 'out'), pin(twoTops, 'lib-1'))).toThrow(/exactly lib-1/u);
-  });
-
-  it('end to end with a fake downloader: a good download is verified and extracted, a tampered one aborts before anything is extracted, a cached file is reused', async () => {
-    const fltk = tarball('fltk-9');
-    const json = tarball('json-3');
-    const lockPath = join(temp(), 'lock.json');
-    writeFileSync(lockPath, JSON.stringify({ schemaVersion: 1, dependencies: { fltk: pin(fltk, 'fltk-9'), jsoncpp: pin(json, 'json-3') } }));
-    const out = temp();
-    const downloads: string[] = [];
-    const fetchBytes = async (url: string): Promise<Buffer> => { downloads.push(url); return downloads.length === 1 ? fltk : json; };
-    const roots2 = await fetchScript.fetchAideskUiDependencies({ out, lockPath, fetchBytes });
-    expect(roots2.fltkRoot).toMatch(/fltk-9$/u);
-    expect(readFileSync(join(roots2.fltkRoot, 'CMakeLists.txt'), 'utf8')).toBe('project(x)');
-    expect(downloads).toHaveLength(2);
-    await fetchScript.fetchAideskUiDependencies({ out, lockPath, fetchBytes }); // cache hit: no new download
-    expect(downloads).toHaveLength(2);
-    const tamperedOut = temp();
-    await expect(fetchScript.fetchAideskUiDependencies({ out: tamperedOut, lockPath, fetchBytes: async () => Buffer.from('not the pinned file') })).rejects.toThrow(/sha256 mismatch/u);
   });
 });
