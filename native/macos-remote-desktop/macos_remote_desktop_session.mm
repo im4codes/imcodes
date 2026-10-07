@@ -11,6 +11,7 @@
 #include <utility>
 
 #include "cg_event_input_adapter.h"
+#include "codec_encoder_adapters.h"
 #include "macos_permission_readiness.h"
 #include "macos_session_monitor.h"
 #include "macos_virtual_display_adapter.h"
@@ -1589,6 +1590,9 @@ class OwnedProductionAdapters final {
                      CaptureErrorCode::kNoPresentableDisplay;
             }),
         encoder_(configuration.encoder_policy, configuration.encoder_limits),
+        raw_encoder_(configuration.raw_video),
+        switching_encoder_(encoder_, raw_encoder_, configuration.raw_video),
+        raw_enabled_(configuration.raw_video != nullptr),
         input_(configuration.worker_generation),
         clipboard_(configuration.request_copy
                        ? std::move(configuration.request_copy)
@@ -1633,12 +1637,14 @@ class OwnedProductionAdapters final {
     // A reconfiguration the encoder makes on its own (the speed governor
     // stepping the size) must carry the capture along, exactly like one the
     // quality ladder asks for.
-    encoder_.SetConfigurationObserver([this] { RetargetCaptureToEncoder(); });
+    encoder_view().SetConfigurationObserver(
+        [this] { RetargetCaptureToEncoder(); });
   }
 
   MacosRemoteDesktopSessionDependencies Dependencies() {
     return {
-        .adapters = {capture_, encoder_, input_, clipboard_, virtual_display_,
+        .adapters = {capture_, encoder_view(), input_, clipboard_,
+                     virtual_display_,
                      disclosure_, monitor_},
         .media_sender = sender_,
         .lifecycle = lifecycle_,
@@ -1647,7 +1653,7 @@ class OwnedProductionAdapters final {
         .negotiate_offer = negotiate_offer_,
         .apply_quality =
             [this](const common::QualitySelection& selection) {
-              const bool applied = encoder_.ReconfigureFromQualitySelection(
+              const bool applied = encoder_view().ReconfigureFromQualitySelection(
                   imcodes::rd::QualitySelection{
                       selection.preset_id.c_str(),
                       static_cast<int>(selection.encoded_pixels.width),
@@ -1669,14 +1675,25 @@ class OwnedProductionAdapters final {
   // output-size support. Never blocks: the adapter switches in the background.
   void RetargetCaptureToEncoder() {
     if (!capture_.SupportsOutputSize()) return;
-    if (const auto configuration = encoder_.Configuration()) {
+    if (const auto configuration = encoder_view().Configuration()) {
       (void)capture_.SetOutputSize(configuration->encoded_pixels);
     }
   }
 
   ScreenCaptureKitAdapter capture_;
   MacosVirtualDisplayAdapter virtual_display_;
+  // The encoder the session talks to: the VideoToolbox one itself, or -- when
+  // the route carries a raw-frame rendezvous -- the switch that sends frames to
+  // libvpx instead once the transport negotiated VP9/VP8.
+  ReconfigurableEncoder& encoder_view() {
+    return raw_enabled_ ? static_cast<ReconfigurableEncoder&>(switching_encoder_)
+                        : static_cast<ReconfigurableEncoder&>(encoder_);
+  }
+
   VideoToolboxH264Encoder encoder_;
+  RawFrameEncoderAdapter raw_encoder_;
+  CodecSwitchingEncoderAdapter switching_encoder_;
+  const bool raw_enabled_;
   CGEventInputAdapter input_;
   NSPasteboardClipboardAdapter clipboard_;
   MacosLocalDisclosureAdapter local_disclosure_;

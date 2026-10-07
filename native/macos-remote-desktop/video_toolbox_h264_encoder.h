@@ -12,6 +12,7 @@
 
 #include "../remote-desktop-common/platform_interfaces.h"
 #include "../remote-desktop-common/quality_ladder.h"
+#include "reconfigurable_encoder.h"
 
 namespace imcodes::remote_desktop::macos {
 
@@ -179,7 +180,7 @@ bool ConvertAvccPayloadToAnnexB(
 // keyframe access unit includes its current SPS/PPS before VCL NAL units, so it
 // can be handed to the pinned libwebrtc bridge without inventing RTP, RTCP,
 // pacing or congestion-control behavior in this adapter.
-class VideoToolboxH264Encoder final : public common::EncoderAdapter {
+class VideoToolboxH264Encoder final : public ReconfigurableEncoder {
  public:
   explicit VideoToolboxH264Encoder(VideoToolboxEncoderPolicy policy = {},
                                    VideoToolboxEncoderLimits limits = {});
@@ -192,6 +193,10 @@ class VideoToolboxH264Encoder final : public common::EncoderAdapter {
   VideoToolboxH264Encoder& operator=(const VideoToolboxH264Encoder&) = delete;
 
   [[nodiscard]] common::ReadinessState ProbeReadiness() override;
+  // Whether VideoToolbox can create a HARDWARE H.264 session here right now.
+  // Opens (and tears down) a tiny real session, so call it once and keep the
+  // answer rather than asking per frame.
+  [[nodiscard]] bool HardwareEncoderAvailable();
   bool Configure(const common::EncoderConfiguration& configuration,
                  common::H264AccessUnitSink sink) override;
   bool Encode(common::CapturedFrame frame, bool request_keyframe) override;
@@ -203,16 +208,16 @@ class VideoToolboxH264Encoder final : public common::EncoderAdapter {
   // VideoToolbox session when needed and forces the first accepted frame to be
   // a keyframe; it never estimates bandwidth itself.
   bool ReconfigureFromQualitySelection(
-      const imcodes::rd::QualitySelection& selection);
+      const imcodes::rd::QualitySelection& selection) override;
 
   // Called, outside every encoder lock, after a quality reconfiguration (from
   // the ladder or from the speed governor) has changed the encoded size. Used
   // to make a capture that can scale follow the encoder. Set before use.
-  void SetConfigurationObserver(std::function<void()> observer);
+  void SetConfigurationObserver(std::function<void()> observer) override;
 
   [[nodiscard]] VideoToolboxEncoderKind ActiveEncoderKind() const noexcept;
   [[nodiscard]] std::optional<common::EncoderConfiguration> Configuration()
-      const;
+      const override;
   [[nodiscard]] VideoToolboxEncoderError LastError() const;
   [[nodiscard]] VideoToolboxEncoderStatistics Statistics() const;
 

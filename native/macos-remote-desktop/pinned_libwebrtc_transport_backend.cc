@@ -30,6 +30,7 @@
 #include "api/scoped_refptr.h"
 #include "api/set_local_description_observer_interface.h"
 #include "api/set_remote_description_observer_interface.h"
+#include "api/video/color_space.h"
 #include "api/video/i420_buffer.h"
 #include "api/video/video_frame.h"
 #include "rtc_base/time_utils.h"
@@ -42,6 +43,8 @@
 #include "modules/audio_device/include/audio_device_default.h"
 #include "modules/video_coding/include/video_error_codes.h"
 #include "pinned_libwebrtc_h264_sender.h"
+#include "raw_frame_conversion.h"
+#include "raw_video_path.h"
 #include "rtc_base/ref_counted_object.h"
 #include "rtc_base/thread.h"
 
@@ -132,11 +135,17 @@ class ChannelObserver final : public webrtc::DataChannelObserver {
 // it into the session's MacosMediaSenderBinder; from then on every access unit
 // travels upstream's encoded-image path, which owns packetization, RTCP, PLI
 // and pacing. Nothing here implements RTP.
-// Upstream requires a source object to build a track, but this project never
-// hands it a raw frame: capture output goes to VideoToolbox and reaches the
-// wire already encoded. The source therefore stays live and silent — it exists
-// so a track (and hence an encoder) can be created at all.
-class ImcodesVideoTrackSource : public webrtc::VideoTrackSourceInterface {
+// Upstream requires a source object to build a track. On the H.264 path this
+// project never hands it a raw frame: capture output goes to VideoToolbox and
+// reaches the wire already encoded, so the source stays live and silent -- it
+// exists so a track (and hence an encoder) can be created at all.
+//
+// On the raw path (a Mac with no hardware H.264 encoder, VP9 negotiated) it is
+// the opposite: the session pushes every captured frame here (it is the route's
+// RawFrameSink), the frame is converted to I420 and delivered to the track, and
+// libwebrtc's own libvpx encoder compresses it and its own RTP stack sends it.
+class ImcodesVideoTrackSource : public webrtc::VideoTrackSourceInterface,
+                                public RawFrameSink {
  public:
   // libwebrtc creates, initialises and keeps calling a video encoder only while
   // its send stream receives frames. A silent source meant the passthrough
@@ -149,7 +158,9 @@ class ImcodesVideoTrackSource : public webrtc::VideoTrackSourceInterface {
   // pixels; they only drive encoder setup and the Encode cadence, while the
   // real H.264 arrives through the binder.
   explicit ImcodesVideoTrackSource(MacosMediaSenderBinder* binder)
-      : binder_(binder), pump_([this] { Pump(); }) {}
+      : binder_(binder),
+        raw_(binder != nullptr ? binder->raw_video() : nullptr),
+        pump_([this] { Pump(); }) {}
 
   ~ImcodesVideoTrackSource() override { StopPump(); }
 
@@ -162,6 +173,43 @@ class ImcodesVideoTrackSource : public webrtc::VideoTrackSourceInterface {
     stop_.store(true);
     if (pump_.joinable() && pump_.get_id() != std::this_thread::get_id())
       pump_.join();
+  }
+
+  // RawFrameSink. Converts the captured frame to I420 and delivers it. The
+  // colour space is stated on the frame (BT.709, limited range) because that is
+  // how the conversion was done; a viewer left to guess would pick by size.
+  bool Push(const common::CapturedFrame& frame) override {
+    if (stop_.load()) return false;
+    const int width = static_cast<int>(frame.encoded_pixels.width);
+    const int height = static_cast<int>(frame.encoded_pixels.height);
+    if (width <= 0 || height <= 0 || (width & 1) != 0 || (height & 1) != 0)
+      return false;
+    webrtc::scoped_refptr<webrtc::I420Buffer> buffer =
+        webrtc::I420Buffer::Create(width, height);
+    if (buffer == nullptr) return false;
+    I420Planes planes;
+    planes.y = buffer->MutableDataY();
+    planes.y_stride = buffer->StrideY();
+    planes.u = buffer->MutableDataU();
+    planes.u_stride = buffer->StrideU();
+    planes.v = buffer->MutableDataV();
+    planes.v_stride = buffer->StrideV();
+    planes.width = width;
+    planes.height = height;
+    if (!ConvertFrameToI420(frame, planes)) return false;
+    const webrtc::VideoFrame video_frame =
+        webrtc::VideoFrame::Builder()
+            .set_video_frame_buffer(buffer)
+            .set_timestamp_us(webrtc::TimeMicros())
+            .set_color_space(webrtc::ColorSpace(
+                webrtc::ColorSpace::PrimaryID::kBT709,
+                webrtc::ColorSpace::TransferID::kBT709,
+                webrtc::ColorSpace::MatrixID::kBT709,
+                webrtc::ColorSpace::RangeID::kLimited))
+            .build();
+    std::lock_guard lock(sinks_mutex_);
+    for (auto* sink : sinks_) sink->OnFrame(video_frame);
+    return true;
   }
 
   void AddOrUpdateSink(webrtc::VideoSinkInterface<webrtc::VideoFrame>* sink,
@@ -213,6 +261,9 @@ class ImcodesVideoTrackSource : public webrtc::VideoTrackSourceInterface {
     while (!stop_.load()) {
       std::this_thread::sleep_for(kPlaceholderInterval);
       if (stop_.load()) break;
+      // On the raw path real frames flow; a black placeholder interleaved with
+      // them would be encoded as a flash of black.
+      if (raw_ != nullptr && raw_->raw_active()) continue;
       common::PixelSize size =
           binder_ != nullptr ? binder_->configured_pixels() : common::PixelSize{};
       // Before the session configures an encode size there is nothing real to
@@ -239,11 +290,27 @@ class ImcodesVideoTrackSource : public webrtc::VideoTrackSourceInterface {
   }
 
   MacosMediaSenderBinder* binder_;
+  const std::shared_ptr<RawVideoPath> raw_;
   std::atomic<bool> stop_{false};
   std::mutex sinks_mutex_;
   std::vector<webrtc::VideoSinkInterface<webrtc::VideoFrame>*> sinks_;
   // Declared last: the thread must start after every member it reads exists.
   std::thread pump_;
+};
+
+// The route's RawFrameSink: forwards to the track source. Holds a reference to
+// the source, so the backend clears it from the RawVideoPath when it closes.
+class TrackSourceRawSink final : public RawFrameSink {
+ public:
+  explicit TrackSourceRawSink(
+      webrtc::scoped_refptr<ImcodesVideoTrackSource> source)
+      : source_(std::move(source)) {}
+  bool Push(const common::CapturedFrame& frame) override {
+    return source_ != nullptr && source_->Push(frame);
+  }
+
+ private:
+  webrtc::scoped_refptr<ImcodesVideoTrackSource> source_;
 };
 
 class PassthroughH264Encoder final : public webrtc::VideoEncoder {
@@ -633,6 +700,8 @@ class PinnedLibwebrtcTransportBackend final
     // encoder is never created and the binder never binds.
     auto source = webrtc::make_ref_counted<ImcodesVideoTrackSource>(media_binder_);
     video_source_ = source;
+    media_binder_->raw_video()->SetSink(
+        std::make_shared<TrackSourceRawSink>(source));
     video_track_ = factory_->CreateVideoTrack(source, "imcodes-screen");
     if (video_track_ == nullptr) {
       CloseLocked();
@@ -936,6 +1005,8 @@ class PinnedLibwebrtcTransportBackend final
 
   ClosedResources TakeResourcesLocked() noexcept {
     ClosedResources closed;
+    // The raw sink holds the track source: drop it before the source goes.
+    if (media_binder_ != nullptr) media_binder_->raw_video()->SetSink(nullptr);
     closed.channels = std::move(channels_);
     channels_.clear();
     closed.video_track = std::move(video_track_);
@@ -963,6 +1034,7 @@ class PinnedLibwebrtcTransportBackend final
       entry.handle = nullptr;
     }
     channels_.clear();
+    if (media_binder_ != nullptr) media_binder_->raw_video()->SetSink(nullptr);
     if (video_source_ != nullptr)
       video_source_->StopPump();
     video_source_ = nullptr;

@@ -1230,6 +1230,10 @@ class VideoToolboxH264Encoder::Impl {
     state_->speed = speed_;
   }
 
+  bool HardwareEncoderAvailable() {
+    return backend_ != nullptr && backend_->HardwareEncoderAvailable();
+  }
+
   common::ReadinessState ProbeReadiness() {
     if (!backend_ || !limits_.IsValid()) {
       return common::ReadinessState::kUnavailable;
@@ -1638,6 +1642,10 @@ VideoToolboxH264Encoder::~VideoToolboxH264Encoder() {
 
 common::ReadinessState VideoToolboxH264Encoder::ProbeReadiness() {
   return impl_->ProbeReadiness();
+}
+
+bool VideoToolboxH264Encoder::HardwareEncoderAvailable() {
+  return impl_->HardwareEncoderAvailable();
 }
 
 bool VideoToolboxH264Encoder::Configure(

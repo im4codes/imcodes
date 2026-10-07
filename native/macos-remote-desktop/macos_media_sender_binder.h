@@ -7,6 +7,7 @@
 #include <mutex>
 
 #include "h264_sender_bridge.h"
+#include "raw_video_path.h"
 
 namespace imcodes::remote_desktop::macos {
 
@@ -84,6 +85,12 @@ class MacosMediaSenderBinder final : public H264SenderBackend {
   [[nodiscard]] std::uint64_t accepted_bytes() const noexcept {
     return accepted_bytes_->load(std::memory_order_relaxed);
   }
+  // The raw-frame rendezvous for this route (see raw_video_path.h). Always
+  // present; inert unless a no-hardware-H.264 Mac enables raw codecs. Its encoded
+  // bytes land in the same counter accepted_bytes() reads.
+  [[nodiscard]] const std::shared_ptr<RawVideoPath>& raw_video() const noexcept {
+    return raw_video_;
+  }
   // The encode size the session configured, or {0,0} before it has.
   [[nodiscard]] common::PixelSize configured_pixels() const noexcept;
 
@@ -114,6 +121,8 @@ class MacosMediaSenderBinder final : public H264SenderBackend {
   // Shared so a completion that lands after the binder is gone stays safe.
   std::shared_ptr<std::atomic<std::uint64_t>> accepted_bytes_ =
       std::make_shared<std::atomic<std::uint64_t>>(0);
+  std::shared_ptr<RawVideoPath> raw_video_ =
+      std::make_shared<RawVideoPath>(accepted_bytes_);
 };
 
 }  // namespace imcodes::remote_desktop::macos

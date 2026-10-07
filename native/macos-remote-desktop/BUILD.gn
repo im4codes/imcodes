@@ -428,6 +428,39 @@ rtc_executable("imcodes_remote_desktop_launch_agent") {
   libs = [ "bsm" ]
 }
 
+# The raw (libvpx) video path's session-side pieces: the rendezvous between the
+# session and the transport, the encoder interface both encoders implement, and
+# the raw-frame encoder and codec switch. No libwebrtc, no Apple types and no
+# libyuv, so the session and its tests build without any of them.
+source_set("raw_video") {
+  sources = [
+    "codec_encoder_adapters.cc",
+    "codec_encoder_adapters.h",
+    "raw_video_path.h",
+    "reconfigurable_encoder.h",
+  ]
+
+  public = [
+    "codec_encoder_adapters.h",
+    "raw_video_path.h",
+    "reconfigurable_encoder.h",
+  ]
+  public_deps = [ "../remote-desktop-common:remote_desktop_common" ]
+}
+
+# BGRA/NV12 -> I420 (and NV12 -> BGRA for the H.264 fallback) on libyuv, which
+# the pinned libwebrtc SDK already ships.
+source_set("raw_frame_conversion") {
+  sources = [
+    "raw_frame_conversion.cc",
+    "raw_frame_conversion.h",
+  ]
+
+  public = [ "raw_frame_conversion.h" ]
+  public_deps = [ "../remote-desktop-common:remote_desktop_common" ]
+  deps = [ "//third_party/libyuv" ]
+}
+
 source_set("video_toolbox_h264_encoder") {
   sources = [
     "video_toolbox_h264_encoder.h",
@@ -435,7 +468,10 @@ source_set("video_toolbox_h264_encoder") {
   ]
 
   public = [ "video_toolbox_h264_encoder.h" ]
-  public_deps = [ "../remote-desktop-common:remote_desktop_common" ]
+  public_deps = [
+    ":raw_video",
+    "../remote-desktop-common:remote_desktop_common",
+  ]
 
   cflags_objcc = [
     "-fobjc-arc",
@@ -506,6 +542,7 @@ source_set("macos_remote_desktop_session") {
   ]
   public_deps = [
     ":macos_login_window_capture",
+    ":raw_video",
     "../remote-desktop-common:remote_desktop_common",
   ]
 
@@ -546,6 +583,7 @@ source_set("pinned_libwebrtc_transport_backend") {
     ":macos_transport_session_adapter",
   ]
   deps = [
+    ":raw_frame_conversion",
     "//api:create_modular_peer_connection_factory",
     "//api:data_channel_interface",
     "//api:jsep",
@@ -974,7 +1012,10 @@ source_set("macos_media_sender_binder") {
   ]
 
   public = [ "macos_media_sender_binder.h" ]
-  public_deps = [ ":pinned_libwebrtc_h264_sender_bridge" ]
+  public_deps = [
+    ":pinned_libwebrtc_h264_sender_bridge",
+    ":raw_video",
+  ]
 }
 
 # Signed active-user worker. This is the component that composes the capture,
@@ -1004,6 +1045,7 @@ rtc_executable("imcodes_remote_desktop_worker") {
     ":macos_worker_ipc_client",
     ":macos_local_curtain",
     ":pinned_libwebrtc_transport_backend",
+    ":raw_frame_conversion",
   ]
 
   cflags_objcc = [

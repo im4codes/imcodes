@@ -36,9 +36,9 @@ describe('macOS NV12 capture (CGDisplayStream 420v)', () => {
     expect(values).toContain('std::uint32_t uv_row_bytes = 0;');
   });
 
-  it('asks CGDisplayStream for 420v with an explicit BT.601 matrix, only when NV12 was requested', () => {
+  it('asks CGDisplayStream for 420v with an explicit BT.709 matrix, only when NV12 was requested', () => {
     expect(cg).toContain('kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange');
-    expect(cg).toContain('kCGDisplayStreamYCbCrMatrix_ITU_R_601_4');
+    expect(cg).toContain('kCGDisplayStreamYCbCrMatrix_ITU_R_709_2');
     expect(cg).toMatch(/nv12 \? 3 : 2/);
     expect(cg).toMatch(/nv12 \? kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange\s*:\s*kCVPixelFormatType_32BGRA/);
   });

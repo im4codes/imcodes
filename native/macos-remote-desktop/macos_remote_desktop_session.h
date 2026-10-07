@@ -13,6 +13,7 @@
 #include "h264_sender_bridge.h"
 #include "macos_local_disclosure.h"
 #include "macos_virtual_display_adapter.h"
+#include "raw_video_path.h"
 #include "ns_pasteboard_clipboard_adapter.h"
 #include "macos_login_window_capture.h"
 #include "screen_capture_kit_adapter.h"
@@ -136,6 +137,11 @@ using MacosDisclosureBeginGeneration =
 struct MacosRemoteDesktopProductionConfiguration {
   common::WorkerGeneration worker_generation = 0;
   std::unique_ptr<H264SenderBackend> pinned_libwebrtc_sender_backend;
+  // The route's raw-frame rendezvous (MacosMediaSenderBinder::raw_video()). Null
+  // keeps the encoder exactly the VideoToolbox one; supplied, the session can
+  // hand frames to libwebrtc's libvpx when the transport negotiates VP9/VP8 (and
+  // only when raw codecs are allowed -- a Mac with no hardware H.264 encoder).
+  std::shared_ptr<RawVideoPath> raw_video;
   ClipboardAction request_copy;
   ClipboardAction request_paste;
   MacosDisclosureStopAllRoutes stop_all_routes;

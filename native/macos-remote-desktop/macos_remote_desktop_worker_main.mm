@@ -77,6 +77,7 @@
 #include "macos_worker_ipc_client.h"
 #include "ns_pasteboard_clipboard_adapter.h"
 #include "pinned_libwebrtc_transport_backend.h"
+#include "raw_frame_conversion.h"
 #include "video_toolbox_h264_encoder.h"
 
 namespace {
@@ -2153,6 +2154,20 @@ class SessionSeamAdapter final : public macos::HostCommandSessionSeam {
   bool active_ = false;
 };
 
+// Whether this Mac can create a HARDWARE H.264 session. Asked once per worker
+// process (it opens, and closes, a tiny real VideoToolbox session) and shared by
+// every route. A Mac that cannot -- an Intel Mac Pro running Apple's software
+// encoder, say -- lets a route send VP9 through libwebrtc's libvpx instead,
+// which encodes the same picture several times faster; a Mac that can never
+// does, and behaves exactly as before.
+bool HardwareH264EncoderAvailable() {
+  static const bool available = [] {
+    macos::VideoToolboxH264Encoder probe;
+    return probe.HardwareEncoderAvailable();
+  }();
+  return available;
+}
+
 // One viewer's composition. Members are declared in dependency order, so
 // they are destroyed in the order the single-viewer worker always tore down:
 // the command seam and session first, then the transport, then the sink and
@@ -2776,6 +2791,9 @@ int RunLaunchAgentSession(const macos::WorkerLaunchContext& context) {
     auto media_binder = std::make_unique<macos::MacosMediaSenderBinder>();
     backend_view->BindMediaSender(media_binder.get());
     route->media_binder = media_binder.get();
+    media_binder->raw_video()->AllowRawCodecs(!HardwareH264EncoderAvailable());
+    media_binder->raw_video()->SetNv12ToBgraConverter(
+        macos::ConvertNv12FrameToBgra);
     route->disclosure = std::make_unique<RouteDisclosure>(&roster);
 
     // Wake the display before choosing and starting capture, so the first frames
@@ -2856,6 +2874,7 @@ int RunLaunchAgentSession(const macos::WorkerLaunchContext& context) {
       return adapter_view != nullptr &&
              adapter_view->NegotiateOffer(offer_sdp, answer_sdp);
     };
+    configuration.raw_video = media_binder->raw_video();
     configuration.pinned_libwebrtc_sender_backend = std::move(media_binder);
     configuration.disclosure = route->disclosure.get();
     configuration.begin_disclosure =

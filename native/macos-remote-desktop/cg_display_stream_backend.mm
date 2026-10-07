@@ -167,9 +167,10 @@ class CgDisplayStreamHandle final : public ScreenCaptureKitBackendStream {
     // a visible artifact rather than a feature.
     const bool nv12 = config.pixel_format == common::PixelFormat::kNv12;
     // Keys/values: the last pair, the YCbCr matrix, is only for YUV output. It
-    // is stated explicitly (BT.601, which is what libyuv's I420 conversions and
-    // the colour space declared downstream assume) rather than left to the
-    // compositor's default.
+    // is stated explicitly (BT.709, which is what libyuv's I420 conversions and
+    // the colour space declared downstream use) rather than left to the
+    // compositor's default. 709 because that is what a viewer assumes for an HD
+    // picture when nothing says otherwise.
     const void* keys[] = {kCGDisplayStreamShowCursor,
                           kCGDisplayStreamMinimumFrameTime,
                           kCGDisplayStreamYCbCrMatrix};
@@ -180,7 +181,7 @@ class CgDisplayStreamHandle final : public ScreenCaptureKitBackendStream {
                                             &minimum_frame_time);
     const void* values[] = {config.show_cursor ? kCFBooleanTrue : kCFBooleanFalse,
                             frame_time,
-                            kCGDisplayStreamYCbCrMatrix_ITU_R_601_4};
+                            kCGDisplayStreamYCbCrMatrix_ITU_R_709_2};
     CFDictionaryRef properties =
         CFDictionaryCreate(kCFAllocatorDefault, keys, values, nv12 ? 3 : 2,
                            &kCFTypeDictionaryKeyCallBacks,

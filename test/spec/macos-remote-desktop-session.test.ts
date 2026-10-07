@@ -104,6 +104,7 @@ describe('macOS SessionCore composition', () => {
           'native/macos-remote-desktop/macos_virtual_display_adapter.cc',
           'native/macos-remote-desktop/apple_virtual_display_backend.mm',
           'native/macos-remote-desktop/video_toolbox_h264_encoder.mm',
+          'native/macos-remote-desktop/codec_encoder_adapters.cc',
           'native/macos-remote-desktop/h264_sender_bridge.cc',
           'native/macos-remote-desktop/cg_event_input_adapter.mm',
           'native/macos-remote-desktop/ns_pasteboard_clipboard_adapter.mm',
