@@ -7,7 +7,9 @@ import {
   REMOTE_DESKTOP_LOCAL_MANAGEMENT,
   REMOTE_DESKTOP_LOCAL_WEB_ACTION,
   type RemoteDesktopLocalAction,
+  type RemoteDesktopLocalExtras,
   type RemoteDesktopLocalStatus,
+  sanitizeRemoteDesktopLocalExtras,
   type RemoteDesktopLocalWebAction,
 } from '../../shared/remote-desktop-local-management.js';
 
@@ -19,6 +21,8 @@ export interface RemoteDesktopLocalPanelOptions {
   publicNodeId: string;
   serverUrl: string;
   status(): Omit<RemoteDesktopLocalStatus, 'publicNodeId'>;
+  /** Optional host name and permission state for the panel; absent or malformed values are simply not shown. */
+  extras?(): RemoteDesktopLocalExtras;
   setPaused(paused: boolean): Promise<void>;
   stopAll(): Promise<void>;
   disconnect(publicId: string): Promise<boolean>;
@@ -183,7 +187,9 @@ export async function startRemoteDesktopLocalPanel(
       return reply(response, 401, 'unauthorized');
     }
     if (request.method === 'GET' && url.pathname === REMOTE_DESKTOP_LOCAL_MANAGEMENT.STATE_PATH) {
-      return reply(response, 200, JSON.stringify({ publicNodeId: options.publicNodeId, ...options.status() }), 'application/json; charset=utf-8');
+      let extras: RemoteDesktopLocalExtras = {};
+      try { extras = sanitizeRemoteDesktopLocalExtras(options.extras?.()); } catch { /* the panel works without them */ }
+      return reply(response, 200, JSON.stringify({ publicNodeId: options.publicNodeId, ...options.status(), ...extras }), 'application/json; charset=utf-8');
     }
     if (request.method === 'POST' && url.pathname === REMOTE_DESKTOP_LOCAL_MANAGEMENT.ACTION_PATH) {
       const csrfHeader = request.headers[REMOTE_DESKTOP_LOCAL_MANAGEMENT.CSRF_HEADER];

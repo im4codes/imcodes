@@ -309,6 +309,7 @@ async function main(): Promise<void> {
       publicNodeId: nodeId,
       serverUrl: bootstrap.credential.serverUrl,
       status: () => runtime.remoteDesktopAccessStatus(),
+      extras: () => runtime.remoteDesktopLocalExtras(),
       setPaused: (paused) => applyRemoteDesktopAccessPaused(
         paused,
         (next) => runtime.setRemoteDesktopAccessPaused(next),

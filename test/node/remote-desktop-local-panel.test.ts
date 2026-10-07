@@ -128,6 +128,47 @@ describe('remote desktop local panel', () => {
     expect(setPaused).toHaveBeenCalledWith(false);
   });
 
+  it('adds the host name and permission state to /api/state when the node supplies them, and only well formed ones', async () => {
+    const extras = vi.fn(() => ({
+      deviceName: 'work-mac.local',
+      permissions: { screenRecording: 'granted', accessibility: 'bogus', fullDiskAccess: 'unknown' },
+      secret: 'never forwarded',
+    }));
+    const panel = await startRemoteDesktopLocalPanel({
+      publicNodeId: '1234567890', serverUrl: 'https://example.test/',
+      status: () => ({ paused: false, connections: [] }),
+      extras: extras as never,
+      setPaused: async () => {}, stopAll: async () => {}, disconnect: async () => false,
+      port: 0,
+    });
+    panels.push(panel);
+    const page = await fetch(panel.url);
+    const cookie = (page.headers.get('set-cookie') ?? '').split(';')[0]!;
+    const state = await fetch(new URL(REMOTE_DESKTOP_LOCAL_MANAGEMENT.STATE_PATH, panel.url), { headers: { cookie } });
+    expect(await state.json()).toEqual({
+      publicNodeId: '1234567890', paused: false, connections: [],
+      deviceName: 'work-mac.local',
+      permissions: { screenRecording: 'granted', fullDiskAccess: 'unknown' },
+    });
+  });
+
+  it('keeps /api/state exactly as before when the node supplies no extras, or its extras throw', async () => {
+    for (const extras of [undefined, () => { throw new Error('boom'); }]) {
+      const panel = await startRemoteDesktopLocalPanel({
+        publicNodeId: '1234567890', serverUrl: 'https://example.test/',
+        status: () => ({ paused: true, connections: [] }),
+        ...(extras ? { extras } : {}),
+        setPaused: async () => {}, stopAll: async () => {}, disconnect: async () => false,
+        port: 0,
+      });
+      panels.push(panel);
+      const page = await fetch(panel.url);
+      const cookie = (page.headers.get('set-cookie') ?? '').split(';')[0]!;
+      const state = await fetch(new URL(REMOTE_DESKTOP_LOCAL_MANAGEMENT.STATE_PATH, panel.url), { headers: { cookie } });
+      expect(await state.json()).toEqual({ publicNodeId: '1234567890', paused: true, connections: [] });
+    }
+  });
+
   it('contains a two-step stop confirmation and live duration refresh in the shared client', async () => {
     const panel = await startRemoteDesktopLocalPanel({
       publicNodeId: '1234567890', serverUrl: 'https://example.test/',

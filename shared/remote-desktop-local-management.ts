@@ -41,6 +41,59 @@ export type RemoteDesktopLocalAction = typeof REMOTE_DESKTOP_LOCAL_ACTION[
   keyof typeof REMOTE_DESKTOP_LOCAL_ACTION
 ];
 
+/**
+ * What the local panel may additionally show: the node's host name and, on macOS, the state of the permissions remote
+ * desktop depends on. Both are OPTIONAL and additive: a node that does not send them (an older one) just shows less, and
+ * the panel never treats absence as "denied".
+ */
+export const REMOTE_DESKTOP_LOCAL_PERMISSION = Object.freeze({
+  SCREEN_RECORDING: 'screenRecording',
+  ACCESSIBILITY: 'accessibility',
+  FULL_DISK_ACCESS: 'fullDiskAccess',
+} as const);
+export const REMOTE_DESKTOP_LOCAL_PERMISSION_STATE = Object.freeze({
+  GRANTED: 'granted',
+  DENIED: 'denied',
+  /** The node cannot tell (it has no probe for it, or the probe was inconclusive). Never shown as a failure. */
+  UNKNOWN: 'unknown',
+} as const);
+export type RemoteDesktopLocalPermissionState = typeof REMOTE_DESKTOP_LOCAL_PERMISSION_STATE[
+  keyof typeof REMOTE_DESKTOP_LOCAL_PERMISSION_STATE
+];
+export type RemoteDesktopLocalPermissions = Partial<Record<
+  typeof REMOTE_DESKTOP_LOCAL_PERMISSION[keyof typeof REMOTE_DESKTOP_LOCAL_PERMISSION],
+  RemoteDesktopLocalPermissionState
+>>;
+/** Longest host name the panel shows (it is cut with an ellipsis and carried in full in the hover title). */
+export const REMOTE_DESKTOP_LOCAL_DEVICE_NAME_MAX_CHARS = 128;
+
+export interface RemoteDesktopLocalExtras {
+  deviceName?: string;
+  permissions?: RemoteDesktopLocalPermissions;
+}
+
+/** Keep only what is well formed: a trimmed printable host name, known permission keys with known states. Anything else is dropped. */
+export function sanitizeRemoteDesktopLocalExtras(value: unknown): RemoteDesktopLocalExtras {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
+  const raw = value as { deviceName?: unknown; permissions?: unknown };
+  const out: RemoteDesktopLocalExtras = {};
+  if (typeof raw.deviceName === 'string') {
+    // eslint-disable-next-line no-control-regex
+    const name = raw.deviceName.replace(/[\u0000-\u001f\u007f]+/gu, ' ').trim().slice(0, REMOTE_DESKTOP_LOCAL_DEVICE_NAME_MAX_CHARS);
+    if (name) out.deviceName = name;
+  }
+  if (raw.permissions && typeof raw.permissions === 'object' && !Array.isArray(raw.permissions)) {
+    const states = new Set<unknown>(Object.values(REMOTE_DESKTOP_LOCAL_PERMISSION_STATE));
+    const permissions: RemoteDesktopLocalPermissions = {};
+    for (const key of Object.values(REMOTE_DESKTOP_LOCAL_PERMISSION)) {
+      const state = (raw.permissions as Record<string, unknown>)[key];
+      if (states.has(state)) permissions[key] = state as RemoteDesktopLocalPermissionState;
+    }
+    if (Object.keys(permissions).length > 0) out.permissions = permissions;
+  }
+  return out;
+}
+
 export interface RemoteDesktopLocalConnection {
   /** Random panel-local handle. Never a route/session/capability identifier. */
   id: string;

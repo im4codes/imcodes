@@ -98,7 +98,8 @@ import {
 } from '../../shared/remote-desktop-platform.js';
 import { dispatchRemoteDesktopCommand } from './remote-desktop-dispatch.js';
 import { isRemoteDesktopFeatureEnabled } from '../../shared/remote-desktop-feature.js';
-import { REMOTE_DESKTOP_LOCAL_MANAGEMENT, type RemoteDesktopLocalConnection } from '../../shared/remote-desktop-local-management.js';
+import { REMOTE_DESKTOP_LOCAL_MANAGEMENT, type RemoteDesktopLocalConnection, type RemoteDesktopLocalExtras } from '../../shared/remote-desktop-local-management.js';
+import { buildLocalPanelExtras } from './local-panel-extras.js';
 import { CLOCK_SYNC_FIELD, ServerClockEstimator } from '../../shared/clock-sync.js';
 import {
   REMOTE_DESKTOP_CAPTURE_CAPABILITY,
@@ -128,6 +129,7 @@ import {
   REMOTE_DESKTOP_RELAY_CAP_CAPABILITY,
   REMOTE_DESKTOP_CONSENT_MSG,
   REMOTE_DESKTOP_LOCAL_CONSENT_CAPABILITY,
+  REMOTE_DESKTOP_INPUT_CAPABILITY,
   REMOTE_DESKTOP_LOCAL_DISCLOSURE_CAPABILITY,
   REMOTE_DESKTOP_NODE_CONTEXT_MSG,
   REMOTE_DESKTOP_PRIVACY_MSG,
@@ -406,6 +408,8 @@ export interface ControlledNodeRuntimeOptions {
 
 export interface ControlledNodeRuntimeClient extends AuthenticatedWebSocketClient {
   remoteDesktopAccessStatus(): { paused: boolean; connections: readonly RemoteDesktopLocalConnection[] };
+  /** Host name and (macOS) permission state for the local panel; read off state the node already keeps, never probed. */
+  remoteDesktopLocalExtras(): RemoteDesktopLocalExtras;
   setRemoteDesktopAccessPaused(paused: boolean): Promise<void>;
   stopAllRemoteDesktopConnections(): Promise<void>;
   stopRemoteDesktopConnection(publicId: string): Promise<boolean>;
@@ -2118,6 +2122,12 @@ export function createControlledNodeRuntime(
   runtimeClient.remoteDesktopAccessStatus = () => ({
     paused: remoteDesktopAccessPaused,
     connections: remoteDesktopWorker.activeConnections?.() ?? [],
+  });
+  runtimeClient.remoteDesktopLocalExtras = () => buildLocalPanelExtras({
+    platform,
+    remoteDesktopEnabled,
+    screenRecordingRequired: permissionRequiredCapabilities.length > 0,
+    inputAvailable: advertisedAdapterCapabilities.includes(REMOTE_DESKTOP_INPUT_CAPABILITY),
   });
   runtimeClient.stopAllRemoteDesktopConnections = async () => {
     await remoteDesktopWorker.stopAllConnections?.();
