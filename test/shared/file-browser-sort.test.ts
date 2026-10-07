@@ -222,16 +222,7 @@ describe('file browser sort and filter at scale', () => {
     console.log(`PERF ${label}: ${fastest.toFixed(1)} ms`);
     return fastest;
   };
-  /** How much slower `run` gets when its input grows `large / small` times. n log n grows a little faster than the input, n^2 as its square. */
-  const growth = (label: string, run: (size: number) => unknown, small: number, large: number): number => {
-    const smallCost = best(`${label} ${small}`, () => run(small));
-    return best(`${label} ${large}`, () => run(large)) / Math.max(smallCost, 0.05);
-  };
-  // The ratio that separates the two: for a 5x input n log n is ~6x and n^2 is 25x. 15 sits well clear of both, which holds only because
-  // each side is the best of several runs (one run of the smaller side that took 3x its normal time used to produce 15.6 on a loaded runner).
-  const GROWTH_LIMIT_FOR_FIVE_TIMES_THE_INPUT = 15;
-
-  it('sorts and filters 10,000 and 50,000 entries without a visible stall (and linearly, not quadratically)', () => {
+  it('sorts and filters 10,000 and 50,000 entries without a visible stall (ceilings with an order of magnitude to spare; growth is counted below)', () => {
     const ten = big(10_000);
     const fifty = big(50_000);
     const sortTen = best('sort 10k by name', () => sortFileBrowserEntries(ten, sortBy('name')));
@@ -240,29 +231,92 @@ describe('file browser sort and filter at scale', () => {
     const filterTen = best('filter+sort 10k (2 words)', () => applyFileBrowserView(ten, parseFileBrowserFilter('report pdf'), sortBy('modified', 'desc'), (n) => n.name));
     const sortFifty = best('sort 50k by name', () => sortFileBrowserEntries(fifty, sortBy('name')));
     best('filter+sort 50k (2 words)', () => applyFileBrowserView(fifty, parseFileBrowserFilter('report pdf'), sortBy('modified', 'desc'), (n) => n.name));
-    // Generous ceilings: they catch an accidental O(n^2) or a per-comparison allocation, not machine speed.
+    // Generous ceilings (measured: 40 ms / 5 ms / 290 ms): they catch a per-comparison allocation or a stall of seconds, not machine speed.
     expect(sortTen).toBeLessThan(1_000);
     expect(filterTen).toBeLessThan(1_000);
     expect(sortFifty).toBeLessThan(6_000);
-    // The growth, not the absolute time, is what a slow runner cannot fake.
-    expect(sortFifty / Math.max(sortTen, 0.05)).toBeLessThan(GROWTH_LIMIT_FOR_FIVE_TIMES_THE_INPUT);
   });
 
-  it('the growth check tells a quadratic algorithm from an n log n one (it would catch an O(n^2) regression)', () => {
-    const numbers = (size: number) => Array.from({ length: size }, (_, index) => (index * 7919) % size);
-    // A quadratic ordering (selection sort) and the library sort, over the same kind of input, at 5x the size.
-    const quadratic = growth('selection sort', (size) => {
-      const values = numbers(size);
-      for (let i = 0; i < values.length; i += 1) {
-        let lowest = i;
-        for (let j = i + 1; j < values.length; j += 1) if (values[j]! < values[lowest]!) lowest = j;
-        [values[i], values[lowest]] = [values[lowest]!, values[i]!];
+  // Work is COUNTED, never timed. A comparison reads the ordering value of both entries, so a getter on that value counts them, and
+  // the filter reads each name once, so a getter on the name counts those. The numbers depend only on the input, so they are the same on
+  // every machine, and they grow as n log n for a sound algorithm and as n^2 for a quadratic one. (A wall-clock calibration of a
+  // quadratic reference used to be the check here; on two different CI runners it settled near 14 where it was expected above 15.)
+  interface Work { reads: number }
+  /** Entries with distinct sizes in a scrambled order (7919 is prime, so `index * 7919 % count` is a permutation for these counts). */
+  const counted = (count: number, work: Work, options: { countNames?: boolean } = {}): FileBrowserTreeLike[] => Array.from({ length: count }, (_, index) => {
+    const name = `item-${index}.${['pdf', 'txt', 'zip', 'png'][index % 4]}`;
+    const entry: FileBrowserTreeLike = {
+      isDir: false,
+      get name() { if (options.countNames) work.reads += 1; return name; },
+      get size() { work.reads += 1; return (index * 7919) % count; },
+    };
+    return entry;
+  });
+  const opsOf = (count: number, run: (entries: FileBrowserTreeLike[]) => unknown, options: { countNames?: boolean } = {}): { n: number; ops: number } => {
+    const work: Work = { reads: 0 };
+    run(counted(count, work, options));
+    return { n: count, ops: work.reads };
+  };
+  /** True when the work grew no faster than n log n (with a quarter of slack) between the two sizes: 5x the input is ~5.9x the work, n^2 would be 25x. */
+  const growsAsLinearithmicOrBetter = (small: { n: number; ops: number }, large: { n: number; ops: number }): boolean => {
+    const inputGrowth = large.n / small.n;
+    const logFactor = Math.log(large.n) / Math.log(small.n);
+    return large.ops / small.ops <= inputGrowth * logFactor * 1.25;
+  };
+  const linearOrBetter = (small: { n: number; ops: number }, large: { n: number; ops: number }): boolean =>
+    large.ops / small.ops <= (large.n / small.n) * 1.1;
+
+  it('the real sort does n log n work: 5x the entries cost well under the 25x of a quadratic algorithm (counted, not timed)', () => {
+    const sort = (entries: FileBrowserTreeLike[]) => sortFileBrowserEntries(entries, sortBy('size'));
+    const ten = opsOf(10_000, sort);
+    const fifty = opsOf(50_000, sort);
+    expect(ten.ops).toBeGreaterThan(10_000); // it did compare (the counting is live)
+    expect(growsAsLinearithmicOrBetter(ten, fifty)).toBe(true);
+    // and in absolute terms: at most ~1 comparison (2 reads) per n log2 n step
+    expect(fifty.ops).toBeLessThanOrEqual(2 * 1.1 * 50_000 * Math.log2(50_000));
+  });
+
+  it('the filter reads every name once: work is linear in the entries, and a sort of the survivors on top stays n log n', () => {
+    const nothingMatches = (entries: FileBrowserTreeLike[]) => applyFileBrowserView(entries, parseFileBrowserFilter('no-such-name'), sortBy('size'), (n) => n.name);
+    const tenNone = opsOf(10_000, nothingMatches, { countNames: true });
+    const fiftyNone = opsOf(50_000, nothingMatches, { countNames: true });
+    expect(tenNone.ops).toBe(10_000); // exactly one name read per entry, nothing survives to be sorted
+    expect(fiftyNone.ops).toBe(50_000);
+    expect(linearOrBetter(tenNone, fiftyNone)).toBe(true);
+    const aQuarterMatches = (entries: FileBrowserTreeLike[]) => applyFileBrowserView(entries, parseFileBrowserFilter('pdf'), sortBy('size'), (n) => n.name);
+    const ten = opsOf(10_000, aQuarterMatches, { countNames: true });
+    const fifty = opsOf(50_000, aQuarterMatches, { countNames: true });
+    expect(ten.ops).toBeGreaterThan(10_000); // the survivors were compared as well
+    expect(growsAsLinearithmicOrBetter(ten, fifty)).toBe(true);
+  });
+
+  it('the same check rejects a quadratic algorithm: an insertion sort over the same counted entries (and accepts a correct merge sort)', () => {
+    const byInsertion = (entries: FileBrowserTreeLike[]) => {
+      const out = entries.slice();
+      for (let i = 1; i < out.length; i += 1) {
+        const item = out[i]!;
+        let j = i - 1;
+        while (j >= 0 && compareFileBrowserEntries(out[j]!, item, sortBy('size')) > 0) { out[j + 1] = out[j]!; j -= 1; }
+        out[j + 1] = item;
       }
-      return values;
-    }, 3_000, 15_000);
-    const linearithmic = growth('library sort', (size) => numbers(size).sort((a, b) => a - b), 20_000, 100_000);
-    expect(quadratic).toBeGreaterThan(GROWTH_LIMIT_FOR_FIVE_TIMES_THE_INPUT);
-    expect(linearithmic).toBeLessThan(GROWTH_LIMIT_FOR_FIVE_TIMES_THE_INPUT);
+      return out;
+    };
+    const mergeSort = (entries: FileBrowserTreeLike[]): FileBrowserTreeLike[] => {
+      if (entries.length < 2) return entries;
+      const middle = entries.length >> 1;
+      const left = mergeSort(entries.slice(0, middle));
+      const right = mergeSort(entries.slice(middle));
+      const out: FileBrowserTreeLike[] = [];
+      let l = 0;
+      let r = 0;
+      while (l < left.length && r < right.length) out.push(compareFileBrowserEntries(left[l]!, right[r]!, sortBy('size')) <= 0 ? left[l++]! : right[r++]!);
+      return out.concat(left.slice(l), right.slice(r));
+    };
+    const insertionSmall = opsOf(800, byInsertion);
+    const insertionLarge = opsOf(4_000, byInsertion);
+    expect(insertionLarge.ops / insertionSmall.ops).toBeGreaterThan(20); // ~25x for 5x the input: the algorithm really is quadratic
+    expect(growsAsLinearithmicOrBetter(insertionSmall, insertionLarge)).toBe(false); // ...and the check says so
+    expect(growsAsLinearithmicOrBetter(opsOf(2_000, mergeSort), opsOf(10_000, mergeSort))).toBe(true);
   });
 });
 

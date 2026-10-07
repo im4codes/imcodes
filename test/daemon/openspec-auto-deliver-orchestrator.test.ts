@@ -1062,10 +1062,8 @@ exec "${realGit}" "$@"
     expect(sendMock).toHaveBeenCalledTimes(2);
     expect(String(sendMock.mock.calls[1]?.[0] ?? '')).toContain('Reason: implementation_marker_missing');
 
-    const start = Date.now();
-    while (cancelStaleActiveTurnWithPending.mock.calls.length === 0 && Date.now() - start < 1000) {
-      await new Promise((resolve) => setTimeout(resolve, 10));
-    }
+    // Not a one-second wall-clock cap: on a saturated runner the work is merely descheduled (see SEND_WAIT_MIN_POLLS above).
+    await vi.waitFor(() => expect(cancelStaleActiveTurnWithPending.mock.calls.length).toBeGreaterThan(0), { timeout: SEND_WAIT_MS, interval: 10 });
     expect(cancelStaleActiveTurnWithPending).toHaveBeenCalledWith(expect.objectContaining({
       reason: 'openspec-auto-deliver-implementation_task_loop',
       staleMs: 40,
@@ -1158,10 +1156,7 @@ exec "${realGit}" "$@"
         clientMessageId: commandId,
       });
       timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
-      const start = Date.now();
-      while (queuedRuntime.send.mock.calls.length < 2 && Date.now() - start < 1000) {
-        await new Promise((resolve) => setTimeout(resolve, 10));
-      }
+      await vi.waitFor(() => expect(queuedRuntime.send.mock.calls.length).toBeGreaterThanOrEqual(2), { timeout: SEND_WAIT_MS, interval: 10 });
       expect(queuedRuntime.send).toHaveBeenCalledTimes(2);
       expect(String(queuedRuntime.send.mock.calls[1]?.[0] ?? '')).toContain('Reason: implementation_marker_missing');
     } finally {
@@ -3012,10 +3007,8 @@ exec "${realGit}" "$@"
       SEND_WAIT_MS,
     );
 
-    const start = Date.now();
-    while (cancelStaleActiveTurnWithPending.mock.calls.length === 0 && Date.now() - start < 1000) {
-      await new Promise((resolve) => setTimeout(resolve, 10));
-    }
+    // Not a one-second wall-clock cap: on a saturated runner the work is merely descheduled (see SEND_WAIT_MIN_POLLS above).
+    await vi.waitFor(() => expect(cancelStaleActiveTurnWithPending.mock.calls.length).toBeGreaterThan(0), { timeout: SEND_WAIT_MS, interval: 10 });
 
     expect(cancelStaleActiveTurnWithPending).toHaveBeenCalledWith(expect.objectContaining({
       reason: 'openspec-auto-deliver-implementation_audit_repair',
