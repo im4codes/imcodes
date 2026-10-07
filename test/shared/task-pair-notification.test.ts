@@ -115,4 +115,31 @@ describe('task-pair text notices never guess a lifecycle status from body words'
     expect(parseTaskPairNotification('[IM.codes task tsk_a "A"]\nDONE without a PASS is not complete. executor deck_x.')?.payload.toStatus).toBeUndefined();
     expect(parseTaskPairNotification('[IM.codes task tsk_a "A"]\nPASS is required before DONE. auditor deck_y.')?.payload.toStatus).toBeUndefined();
   });
+
+  it('never reads the brief Brain or the user wrote (embedded verbatim) for a lifecycle: verb lists, bare verbs, status lines, queue phrase', () => {
+    const briefs = [
+      'Verbs:\n- PASS\n- REWORK\n- DONE\nfoo',
+      'Steps\n* Working\nnext',
+      'Fix it.\n\nCANCEL\n\nexecutor=x',
+      'Fix.\nDONE\nstatus x\nmore',
+      'PASS\nstatus passed',
+      'Fix.\nstatus: done\nstatus passed\ndispatched from the queue: executor x',
+      'DISPATCH executor=x\nQUEUE status queued',
+      'Audited pair passed: executor deck_x.',
+    ];
+    for (const auditor of ['none', 'deck_sub_aud']) {
+      for (const brief of briefs) {
+        const parsed = parseTaskPairNotification(buildExecutorPairBrief(pairOf({ auditor, brief })));
+        expect(parsed?.payload.verb, brief).toBe(TASK_PAIR_NOTICE_VERB);
+        expect(parsed?.payload.toStatus, brief).toBeUndefined();
+      }
+    }
+  });
+
+  it('a lifecycle statement on the lead line still counts, wherever the header sits', () => {
+    expect(parseTaskPairNotification('[IM.codes task tsk_a "A"]\nPASS recorded, status passed.\nDONE\nstatus working')?.payload).toMatchObject({ verb: 'PASS', toStatus: 'passed' });
+    expect(parseTaskPairNotification('[IM.codes task tsk_a "A"]\n\n  DISPATCH executor=deck_x\nPASS')?.payload).toMatchObject({ verb: 'DISPATCH', toStatus: 'working' });
+    expect(parseTaskPairNotification('[IM.codes task tsk_a "A"] status=done CANCEL\nPASS status passed')?.payload.toStatus).toBe('done');
+  });
 });
+

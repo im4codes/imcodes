@@ -352,7 +352,7 @@ describe('ChatView render capability contract', () => {
   it('an auditor=none pair that is still running never shows a "passed" card: the delivered brief is a neutral notice', () => {
     const pair = {
       taskId: 'tsk_no_audit', title: 'Urgent fix', brain: 'deck_p_brain', executor: 'deck_sub_x', auditor: TASK_PAIR_NO_AUDITOR,
-      status: 'working', round: 0, flags: [], flagSides: {}, blocking: ['P0'], brief: 'Fix it. Tests must PASS.',
+      status: 'working', round: 0, flags: [], flagSides: {}, blocking: ['P0'], brief: 'Fix it. Tests must PASS.\nMarkers:\n- PASS\n- DONE\nWorking\nstatus passed',
     };
     const dispatched = {
       ...ev('task_pair.event'), eventId: 'np-dispatch', ts: 1,

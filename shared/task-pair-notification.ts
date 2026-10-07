@@ -51,12 +51,12 @@ function knownStatus(value: string | undefined): TaskPairStatus | undefined {
 }
 
 /**
- * A bare lifecycle word that opens the notice body and is followed by nothing,
+ * A bare lifecycle word that opens the notice's lead line and is followed by nothing,
  * a `status` field or a `key=value` attribute (`DISPATCH executor=x`,
  * `QUEUE status queued`). Prose that merely starts with such a word
  * (`DONE without a PASS is not complete`) is not a lifecycle statement.
  */
-const LEADING_VERB_RE = /^\s*(?:[-*]\s*)?(PASS(?:ED)?|REWORK|QUEUED?|READY(?:_FOR_AUDIT)?|STARTED|WORKING|BLOCKED|NEEDS_INPUT|CANCEL(?:LED|ED)?|DONE|DISPATCH)\b(?=\s*(?:$|status\b|[A-Za-z_]+=))/imu;
+const LEADING_VERB_RE = /^[ \t]*(?:[-*][ \t]*)?(PASS(?:ED)?|REWORK|QUEUED?|READY(?:_FOR_AUDIT)?|STARTED|WORKING|BLOCKED|NEEDS_INPUT|CANCEL(?:LED|ED)?|DONE|DISPATCH)\b(?=[ \t]*(?:$|status\b|[A-Za-z_]+=))/iu;
 
 const LEADING_VERBS: Record<string, TaskPairVerb> = {
   PASS: 'PASS', PASSED: 'PASS', REWORK: 'REWORK', QUEUE: 'QUEUE', QUEUED: 'QUEUE',
@@ -333,14 +333,18 @@ export function parseTaskPairNotification(text: unknown): ParsedTaskPairNotifica
     ?? unescapeQuotedTitle(summaryTitle)
     ?? unescapeQuotedTitle(marker?.attrs.title)
     ?? deriveSupervisionTaskTitleFromBrief(marker?.brief);
-  const status = knownStatus(body.match(STATUS_RE)?.[1] ?? body.match(STATUS_RE)?.[2])
+  // Only the notice's lead line may state a lifecycle. The rest of the body is
+  // free text (the dispatched brief is Brain's or the user's own words, verbatim:
+  // a bullet list of markers, a `status done` line...) and is never read for one.
+  const lead = body.split('\n', 1)[0]!;
+  const status = knownStatus(lead.match(STATUS_RE)?.[1] ?? lead.match(STATUS_RE)?.[2])
     ?? knownStatus(marker?.attrs.status);
-  const stated = marker?.knownVerb ?? inferVerb(body, status);
+  const stated = marker?.knownVerb ?? inferVerb(lead, status);
   // No explicit lifecycle statement: a neutral notice that carries no status
   // (an explicit `status` field, e.g. awaiting_audit, is still shown).
   const verb: TaskPairVerb | typeof TASK_PAIR_NOTICE_VERB = stated ?? TASK_PAIR_NOTICE_VERB;
   const effectiveStatus = stated
-    ? inferStatus(stated, status ?? (QUEUE_DISPATCH_RE.test(body) ? 'working' : undefined))
+    ? inferStatus(stated, status ?? (QUEUE_DISPATCH_RE.test(lead) ? 'working' : undefined))
     : status;
   const cancellationReason = effectiveStatus === 'cancelled'
     ? (body.match(WHY_RE)?.[1]?.trim() ?? (() => {
