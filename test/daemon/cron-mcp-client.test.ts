@@ -374,14 +374,23 @@ describe('cron MCP client', () => {
     expect(fetchImpl).not.toHaveBeenCalled();
   });
 
-  it.each([401, 403])('says plainly that the server rejected the daemon credential (HTTP %i), without leaking the token', async (status) => {
-    const fetchImpl = vi.fn(async () => new Response(JSON.stringify({ error: 'unauthorized' }), { status, headers: { 'Content-Type': 'application/json' } }));
+  it('says plainly that the server rejected the daemon credential (HTTP 401), without leaking the token', async () => {
+    const fetchImpl = vi.fn(async () => new Response(JSON.stringify({ error: 'unauthorized' }), { status: 401, headers: { 'Content-Type': 'application/json' } }));
 
     const result = await cronMcpList({}, { ...boundIdentity, fetchImpl });
 
     expect(result).toMatchObject({ status: 'error', reason: MCP_ERROR_REASONS.IDENTITY_REJECTED });
-    expect(JSON.stringify(result)).toContain(String(status));
+    expect(JSON.stringify(result)).toContain('401');
     expect(JSON.stringify(result)).not.toContain('tok-bound');
+  });
+
+  it('keeps the reason of a 403 scope denial instead of reporting it as a bad credential', async () => {
+    const fetchImpl = vi.fn(async () => new Response(JSON.stringify({ error: 'forbidden', reason: 'share-direct-surface-denied' }), { status: 403, headers: { 'Content-Type': 'application/json' } }));
+
+    const result = await cronMcpList({}, { ...boundIdentity, fetchImpl });
+
+    expect(result).toMatchObject({ status: 'error', reason: MCP_ERROR_REASONS.INTERNAL_ERROR, message: 'forbidden' });
+    expect(JSON.stringify(result)).not.toContain('re-bind');
   });
 
   it('sanitizes HTTP and thrown errors', async () => {

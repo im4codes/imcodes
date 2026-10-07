@@ -216,10 +216,11 @@ async function requestCron(
       signal: controller.signal,
     });
     const body = await parseJsonResponse(res);
-    if (res.status === 401 || res.status === 403) {
-      // The server did not accept this daemon's credential (revoked or re-bound server token, or a server that has not
-      // been updated to this daemon yet). Say so: it is not a transient failure and retrying will not help.
-      return error(MCP_ERROR_REASONS.IDENTITY_REJECTED, `The server rejected this daemon's credential for the cron API (HTTP ${res.status}); re-bind the daemon (imcodes bind) or update the server`);
+    if (res.status === 401) {
+      // The server did not authenticate this daemon (revoked or re-bound server token, or a server that has not been
+      // updated to this daemon yet). Say so: it is not a transient failure and retrying will not help. A 403 is NOT this:
+      // the cron API answers 403 for a legitimate scope denial and its reason must reach the caller (handled below).
+      return error(MCP_ERROR_REASONS.IDENTITY_REJECTED, "The server rejected this daemon's credential for the cron API (HTTP 401); re-bind the daemon (imcodes bind) or update the server");
     }
     if (!res.ok) {
       return error(MCP_ERROR_REASONS.INTERNAL_ERROR, responseMessage(body, `Cron request failed with status ${res.status}`));
