@@ -31,10 +31,8 @@ import {
   startRemoteDesktopLocalPanel,
 } from './remote-desktop-local-panel.js';
 import { startAideskLocalIpcServer } from './aidesk-local-ipc-server.js';
-import {
-  ensureAideskDesktopEntry,
-  openAideskLocalPanel,
-} from './aidesk-desktop-entry.js';
+import { ensureAideskDesktopEntry } from './aidesk-desktop-entry.js';
+import { localPanelWindowHandlers, openAideskLocalPanel } from './local-panel-window-run.js';
 import {
   CONSOLE_HOLD,
   consoleHoldCountdown,
@@ -207,7 +205,7 @@ async function main(): Promise<void> {
     return;
   }
   if (process.argv[2] === '--open-local-panel') {
-    openAideskLocalPanel();
+    await openAideskLocalPanel();
     return;
   }
   // Decided before any other install work, so that a failure raised while
@@ -317,6 +315,7 @@ async function main(): Promise<void> {
       ),
       stopAll: () => runtime.stopAllRemoteDesktopConnections(),
       disconnect: (publicId) => runtime.stopRemoteDesktopConnection(publicId),
+      ...localPanelWindowHandlers(bootstrap.credential.serverUrl, nodeId),
     }).catch((error) => {
       logger.warn({ err: error, host: REMOTE_DESKTOP_LOCAL_MANAGEMENT.HOST, port: REMOTE_DESKTOP_LOCAL_MANAGEMENT.PORT },
         'local remote-desktop management panel unavailable (the indicator will not be able to open it)');

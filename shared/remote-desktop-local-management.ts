@@ -7,6 +7,9 @@ export const REMOTE_DESKTOP_LOCAL_MANAGEMENT = Object.freeze({
   ROOT_PATH: '/',
   STATE_PATH: '/api/state',
   ACTION_PATH: '/api/action',
+  /** Native clients (indicator, app) POST here, with OPEN_WINDOW_HEADER and no Origin, to have the node open or focus the panel window. */
+  OPEN_WINDOW_PATH: '/open-window',
+  OPEN_WINDOW_HEADER: 'x-aidesk-open-window',
   COOKIE_NAME: 'aidesk-local-session',
   CSRF_HEADER: 'x-aidesk-csrf',
   PAUSED_CAPABILITY: 'remote.desktop.access_paused.v1',
@@ -19,6 +22,8 @@ export const REMOTE_DESKTOP_LOCAL_WEB_ACTION = Object.freeze({
   MANAGE: 'manage',
   SHARE: 'share',
 } as const);
+
+export type RemoteDesktopLocalWebAction = typeof REMOTE_DESKTOP_LOCAL_WEB_ACTION[keyof typeof REMOTE_DESKTOP_LOCAL_WEB_ACTION];
 
 export const REMOTE_DESKTOP_LOCAL_ACTION = Object.freeze({
   PAUSE: 'pause',

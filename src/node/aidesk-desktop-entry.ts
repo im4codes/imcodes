@@ -136,13 +136,15 @@ export function resolveWindowsPowerShellExecutable(
 }
 
 /**
- * The active-user launcher is intentionally asynchronous, but shortcut setup
- * is not reported as successful until the user-session PowerShell writes its
- * bounded outcome. The result file carries diagnostics only (never authority),
- * and its random name plus strict result vocabulary prevent stale reuse.
+ * Run a PowerShell script in the ACTIVE USER's session and read its bounded outcome. The launcher is asynchronous, so success is not
+ * reported until the script writes `accept`-able text into a result file the user session can reach (random name, strict vocabulary,
+ * so a stale file is never mistaken for an answer). `undefined` = the launcher failed, timed out, or answered with something else.
+ * Shared by the aiDesk shortcut setup and the local-panel window adapter.
  */
-export async function ensureWindowsAideskShortcut(input: {
-  executablePath: string;
+export async function runWindowsUserSessionScript(input: {
+  /** Builds the powershell arguments (an -EncodedCommand line) once the result file path is known. */
+  buildCommand: (resultPath: string) => string;
+  accept: (value: string) => boolean;
   launch?: WindowsShortcutLaunch;
   launchActiveUserProcess?: WindowsActiveUserProcessLaunch;
   windowsEnvironment?: Readonly<Record<string, string | undefined>>;
@@ -150,10 +152,11 @@ export async function ensureWindowsAideskShortcut(input: {
   resultRoot?: string;
   timeoutMs?: number;
   pollMs?: number;
-}): Promise<AideskDesktopEntryResult> {
+  resultPrefix?: string;
+}): Promise<string | undefined> {
   const resultPath = join(
     input.resultRoot ?? tmpdir(),
-    `aidesk-entry-${process.pid}-${randomUUID()}.result`,
+    `${input.resultPrefix ?? 'aidesk-entry'}-${process.pid}-${randomUUID()}.result`,
   );
   await writeFile(resultPath, '', { mode: 0o600, flag: 'wx' });
   let launchFailure = false;
@@ -170,25 +173,50 @@ export async function ensureWindowsAideskShortcut(input: {
         });
       await launchActiveUserProcess(executable, command, onFailure);
     });
-    await launch(buildWindowsAideskShortcutCommand(input.executablePath, resultPath), () => {
+    await launch(input.buildCommand(resultPath), () => {
       launchFailure = true;
     });
     const deadline = Date.now() + (input.timeoutMs ?? 15_000);
-    const accepted = new Set<AideskDesktopEntryResult>([
-      'created', 'repaired', 'unchanged', 'preserved', 'failed',
-    ]);
     while (!launchFailure && Date.now() < deadline) {
-      const value = (await readFile(resultPath, 'utf8').catch(() => '')).trim() as
-        AideskDesktopEntryResult;
-      if (accepted.has(value)) return value;
+      const value = (await readFile(resultPath, 'utf8').catch(() => '')).trim();
+      if (input.accept(value)) return value;
       await delay(input.pollMs ?? 50);
     }
-    return 'failed';
+    return undefined;
   } catch {
-    return 'failed';
+    return undefined;
   } finally {
     await rm(resultPath, { force: true }).catch(() => {});
   }
+}
+
+/**
+ * Shortcut setup is not reported as successful until the user-session PowerShell writes its bounded outcome (see
+ * runWindowsUserSessionScript); the result carries diagnostics only, never authority.
+ */
+export async function ensureWindowsAideskShortcut(input: {
+  executablePath: string;
+  launch?: WindowsShortcutLaunch;
+  launchActiveUserProcess?: WindowsActiveUserProcessLaunch;
+  windowsEnvironment?: Readonly<Record<string, string | undefined>>;
+  grantResultAccess?: (path: string) => Promise<void>;
+  resultRoot?: string;
+  timeoutMs?: number;
+  pollMs?: number;
+}): Promise<AideskDesktopEntryResult> {
+  const accepted = new Set<string>(['created', 'repaired', 'unchanged', 'preserved', 'failed']);
+  const value = await runWindowsUserSessionScript({
+    buildCommand: (resultPath) => buildWindowsAideskShortcutCommand(input.executablePath, resultPath),
+    accept: (text) => accepted.has(text),
+    ...(input.launch ? { launch: input.launch } : {}),
+    ...(input.launchActiveUserProcess ? { launchActiveUserProcess: input.launchActiveUserProcess } : {}),
+    ...(input.windowsEnvironment ? { windowsEnvironment: input.windowsEnvironment } : {}),
+    ...(input.grantResultAccess ? { grantResultAccess: input.grantResultAccess } : {}),
+    ...(input.resultRoot ? { resultRoot: input.resultRoot } : {}),
+    ...(input.timeoutMs !== undefined ? { timeoutMs: input.timeoutMs } : {}),
+    ...(input.pollMs !== undefined ? { pollMs: input.pollMs } : {}),
+  });
+  return (value as AideskDesktopEntryResult | undefined) ?? 'failed';
 }
 
 export function buildWindowsAideskShortcutRemovalCommand(): string {
@@ -390,7 +418,11 @@ export function resolveAideskLocalUiExecutable(
   );
 }
 
-export function openAideskLocalPanel(platform = process.platform): void {
+/**
+ * The pre-window way of opening the panel: the native aiDesk window when installed next to this executable, else the default
+ * browser. Kept as the last resort behind the shared window decision (local-panel-window-run.ts), so there is always an entry.
+ */
+export function openAideskLocalPanelLegacy(platform = process.platform): void {
   const nativeUi = resolveAideskLocalUiExecutable(platform);
   if (existsSync(nativeUi)) {
     execFile(nativeUi, [], { windowsHide: false }, () => undefined);

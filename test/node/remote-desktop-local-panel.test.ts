@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { JSDOM } from 'jsdom';
 import { REMOTE_DESKTOP_ACCESS_MODE } from '../../shared/remote-desktop.js';
+import { LOCAL_PANEL_EXTERNAL_PATH, LOCAL_PANEL_WINDOW_TITLE } from '../../shared/local-panel-window.js';
 import {
   REMOTE_DESKTOP_LOCAL_ACTION,
   REMOTE_DESKTOP_LOCAL_MANAGEMENT,
@@ -216,5 +217,107 @@ describe('remote desktop local panel', () => {
     } finally {
       dom.window.close();
     }
+  });
+});
+
+describe('remote desktop local panel: independent window entry', () => {
+  async function startPanel(extra: Partial<Parameters<typeof startRemoteDesktopLocalPanel>[0]> = {}) {
+    const panel = await startRemoteDesktopLocalPanel({
+      publicNodeId: '1234567890', serverUrl: 'https://example.test/',
+      status: () => ({ paused: false, connections: [] }),
+      setPaused: async () => {}, stopAll: async () => {}, disconnect: async () => true, port: 0, ...extra,
+    });
+    panels.push(panel);
+    return panel;
+  }
+  const openUrl = (panel: RemoteDesktopLocalPanel) => new URL(REMOTE_DESKTOP_LOCAL_MANAGEMENT.OPEN_WINDOW_PATH, panel.url);
+  const nativeHeaders = { [REMOTE_DESKTOP_LOCAL_MANAGEMENT.OPEN_WINDOW_HEADER]: '1' };
+
+  it('the page title is the window title the single-instance focus looks for', async () => {
+    const panel = await startPanel();
+    const html = await (await fetch(panel.url)).text();
+    expect(html).toContain(`<title>${LOCAL_PANEL_WINDOW_TITLE}</title>`);
+  });
+
+  it('open-window: a native client (custom header, no Origin) gets the decision; a web page cannot trigger it', async () => {
+    const openWindow = vi.fn(async () => ({ ok: true, reason: 'opened_app_mode_window' }));
+    const panel = await startPanel({ openWindow });
+    const ok = await fetch(openUrl(panel), { method: 'POST', headers: nativeHeaders });
+    expect(ok.status).toBe(200);
+    expect(await ok.json()).toEqual({ ok: true, reason: 'opened_app_mode_window' });
+    expect(openWindow).toHaveBeenCalledTimes(1);
+    // no custom header (a plain cross-site form post), a wrong header value, or any Origin (every browser cross-site POST) -> refused
+    for (const headers of [{}, { [REMOTE_DESKTOP_LOCAL_MANAGEMENT.OPEN_WINDOW_HEADER]: '0' }, { ...nativeHeaders, origin: 'https://evil.test' }, { ...nativeHeaders, origin: new URL(panel.url).origin }]) {
+      expect((await fetch(openUrl(panel), { method: 'POST', headers })).status).toBe(403);
+    }
+    expect((await fetch(openUrl(panel), { method: 'GET', headers: nativeHeaders })).status).not.toBe(200);
+    expect(openWindow).toHaveBeenCalledTimes(1);
+  });
+
+  it('open-window: nothing could be opened is a 502 (the native client then uses its own fallback); an older panel without the handler is a 501; concurrent clicks share one open', async () => {
+    const failing = await startPanel({ openWindow: async () => ({ ok: false, reason: 'launch_failed' }) });
+    expect((await fetch(openUrl(failing), { method: 'POST', headers: nativeHeaders })).status).toBe(502);
+    const throwing = await startPanel({ openWindow: async () => { throw new Error('boom'); } });
+    expect((await fetch(openUrl(throwing), { method: 'POST', headers: nativeHeaders })).status).toBe(502);
+    const absent = await startPanel();
+    expect((await fetch(openUrl(absent), { method: 'POST', headers: nativeHeaders })).status).toBe(501);
+    let release: () => void = () => {};
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const openWindow = vi.fn(async () => { await gate; return { ok: true, reason: 'focused_existing_window' }; });
+    const shared = await startPanel({ openWindow });
+    const first = fetch(openUrl(shared), { method: 'POST', headers: nativeHeaders });
+    const second = fetch(openUrl(shared), { method: 'POST', headers: nativeHeaders });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    release();
+    expect((await first).status).toBe(200);
+    expect((await second).status).toBe(200);
+    expect(openWindow).toHaveBeenCalledTimes(1);
+  });
+
+  it('open-window is refused for a request whose Host is not exactly the panel', async () => {
+    const panel = await startPanel({ openWindow: async () => ({ ok: true, reason: 'x' }) });
+    const { request } = await import('node:http');
+    const status = await new Promise<number>((resolve, reject) => {
+      const req = request({ host: '127.0.0.1', port: Number(new URL(panel.url).port), path: REMOTE_DESKTOP_LOCAL_MANAGEMENT.OPEN_WINDOW_PATH, method: 'POST', headers: { host: 'evil.test', ...nativeHeaders } }, (response) => { response.resume(); resolve(response.statusCode ?? 0); });
+      req.once('error', reject);
+      req.end();
+    });
+    expect(status).toBe(421);
+  });
+
+  it('open-external: only the two fixed targets, only with the session, CSRF and the panel\'s own Origin; never a URL from the request', async () => {
+    const openExternal = vi.fn(async () => true);
+    const panel = await startPanel({ openExternal });
+    const page = await fetch(panel.url);
+    const cookie = page.headers.get('set-cookie')!.split(';')[0]!;
+    const csrf = /"csrf":"([^"]+)"/.exec(await page.text())![1]!;
+    const url = new URL(LOCAL_PANEL_EXTERNAL_PATH, panel.url);
+    const origin = new URL(panel.url).origin;
+    const post = (body: unknown, headers: Record<string, string> = {}) => fetch(url, {
+      method: 'POST', headers: { cookie, origin, 'content-type': 'application/json', [REMOTE_DESKTOP_LOCAL_MANAGEMENT.CSRF_HEADER]: csrf, ...headers }, body: JSON.stringify(body),
+    });
+    expect((await post({ target: 'manage' })).status).toBe(200);
+    expect((await post({ target: 'share' })).status).toBe(200);
+    expect(openExternal.mock.calls.map((call) => call[0])).toEqual(['manage', 'share']);
+    for (const bad of [{ target: 'https://evil.test/' }, { target: 'ftp' }, { url: 'https://evil.test/' }, {}, { target: 7 }]) {
+      expect((await post(bad)).status, JSON.stringify(bad)).toBe(400);
+    }
+    expect((await post({ target: 'manage' }, { origin: 'https://evil.test' })).status).toBe(403);
+    expect((await post({ target: 'manage' }, { [REMOTE_DESKTOP_LOCAL_MANAGEMENT.CSRF_HEADER]: 'wrong' })).status).toBe(403);
+    expect((await fetch(url, { method: 'POST', headers: { origin, 'content-type': 'application/json', [REMOTE_DESKTOP_LOCAL_MANAGEMENT.CSRF_HEADER]: csrf }, body: '{"target":"manage"}' })).status).toBe(401);
+    expect(openExternal).toHaveBeenCalledTimes(2);
+    const refused = await startPanel({ openExternal: async () => false });
+    const refusedPage = await fetch(refused.url);
+    const refusedCookie = refusedPage.headers.get('set-cookie')!.split(';')[0]!;
+    const refusedCsrf = /"csrf":"([^"]+)"/.exec(await refusedPage.text())![1]!;
+    expect((await fetch(new URL(LOCAL_PANEL_EXTERNAL_PATH, refused.url), { method: 'POST', headers: { cookie: refusedCookie, origin: new URL(refused.url).origin, 'content-type': 'application/json', [REMOTE_DESKTOP_LOCAL_MANAGEMENT.CSRF_HEADER]: refusedCsrf }, body: '{"target":"share"}' })).status).toBe(502);
+  });
+
+  it('the page sends its two links through open-external and keeps a plain-link fallback', async () => {
+    const panel = await startPanel({ openExternal: async () => true });
+    const html = await (await fetch(panel.url)).text();
+    expect(html).toContain(`"externalPath":"${LOCAL_PANEL_EXTERNAL_PATH}"`);
+    expect(html).toContain('el.onclick=async(ev)=>{ev.preventDefault()');
+    expect(html).toContain("window.open(el.href,'_blank','noopener,noreferrer')");
   });
 });
