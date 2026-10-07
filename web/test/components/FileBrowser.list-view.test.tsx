@@ -34,7 +34,9 @@ import { fileBrowserColumnsStorageKey, fileBrowserTableMinWidth, FILE_BROWSER_HI
 
 afterEach(() => { cleanup(); vi.useRealTimers(); });
 
-const NOW = Date.now();
+// A fixed clock at local noon: "2 hours ago" and "1 day ago" must land on today and yesterday whatever time the suite runs (between
+// midnight and 2 a.m. the real clock put "2 hours ago" on yesterday and failed CI).
+const NOW = new Date(2026, 5, 15, 12, 0, 0).getTime();
 const HOUR = 3_600_000;
 const DAY = 24 * HOUR;
 
@@ -105,6 +107,8 @@ const header = (container: HTMLElement, key: string) => container.querySelector(
 const filterInput = (container: HTMLElement) => container.querySelector('.fb-list-filter-input') as HTMLInputElement;
 
 beforeEach(() => {
+  vi.useFakeTimers({ toFake: ['Date'] });
+  vi.setSystemTime(NOW);
   localStorage.clear();
   __resetFileBrowserSharedChangesForTests();
 });
