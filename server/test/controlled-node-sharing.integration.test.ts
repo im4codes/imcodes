@@ -9,8 +9,9 @@ import { createDatabase, type Database } from '../src/db/client.js';
 import { runMigrations } from '../src/db/migrate.js';
 import { createServer, createUser } from '../src/db/queries.js';
 import { createOrUpdateShare } from '../src/db/tab-sharing.js';
+import { issueSharedMachineAuthorityForSession } from '../src/share/shared-machine-authority.js';
 import { machinesRoutes } from '../src/routes/machines.js';
-import { createMachineExecRoutes } from '../src/routes/machine-exec.js';
+import { createMachineExecRoutes, machineExecAuditIntentStore } from '../src/routes/machine-exec.js';
 import { createMachineComputerUseRoutes } from '../src/routes/machine-computer-use.js';
 import { tabSharingRoutes } from '../src/routes/tab-sharing.js';
 import { sessionMgmtRoutes } from '../src/routes/session-mgmt.js';
@@ -24,6 +25,7 @@ import { generateControlledNodeId } from '../src/services/controlled-node-identi
 import {
   FILE_TRANSFER_MSG,
   FILE_TRANSFER_PATH_HANDLE_CAPABILITY,
+  FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY,
 } from '../../shared/transport/file-transfer.js';
 import {
   SHARED_MACHINE_AUTHORITY_HEADER,
@@ -393,7 +395,7 @@ describe('controlled-node version reporting', () => {
 });
 
 describe('controlled-node shared action admission', () => {
-  it('lets a participant in the owner shared session operate an owner node without a direct device share', async () => {
+  it('lets a participant in the owner shared session operate an owner node only once the node is shared with them', async () => {
     const app = buildApp();
     const ownerId = `owner-${hex(4)}`;
     const participantId = `participant-${hex(4)}`;
@@ -525,6 +527,22 @@ describe('controlled-node shared action admission', () => {
       capabilities: [FILE_TRANSFER_PATH_HANDLE_CAPABILITY],
     })), false);
     await waitFor(() => targetBridge.isDaemonConnected());
+
+    // A session share grants no device access: with no share of the node to the
+    // participant, the owner's agent must not act on it for them, and must not
+    // even list it (tsk_d5053704ad).
+    const noDeviceShare = await app.request('/api/machines', { headers });
+    expect(noDeviceShare.status).toBe(200);
+    expect(await noDeviceShare.json()).toEqual({ machines: [] });
+    for (const [path, body] of [
+      [`/api/machine/exec?serverId=${targetId}`, { command: 'echo no-share' }],
+      [`/api/machine/computer-use?serverId=${targetId}`, { tool: 'list_apps', arguments: {} }],
+      [`/api/server/${targetId}/machine-file-handle`, { path: 'C:\\Temp\\shared.txt' }],
+    ] as const) {
+      const denied = await app.request(path, { method: 'POST', headers, body: JSON.stringify(body) });
+      expect(denied.status, path).toBe(403);
+    }
+    await createMachineGrant({ ownerId, recipientId: participantId, serverId: targetId, role: 'participant' });
 
     const list = await app.request('/api/machines', { headers });
     expect(list.status).toBe(200);
@@ -854,3 +872,213 @@ describe('putting a machine in groups, and taking it back out', () => {
     expect(await groupsOf(serverId)).toEqual([ownDesk]);
   });
 });
+
+describe('a shared-session participant reaches only the machines shared with them (tsk_d5053704ad)', () => {
+  /**
+   * The owner's agent, driven by a participant of one shared session. Four
+   * nodes of the owner's: none shared with the participant, shared as
+   * participant, shared as viewer, and in a group the participant belongs to.
+   */
+  async function scene() {
+    const app = buildApp();
+    const ownerId = `owner-${hex(4)}`;
+    const participantId = `participant-${hex(4)}`;
+    await Promise.all([createUser(db, ownerId), createUser(db, participantId)]);
+    const source = await fullCredential(ownerId);
+    const sessionName = `deck_actor_${hex(4)}`;
+    await db.execute(
+      `INSERT INTO sessions (id, server_id, name, project_name, role, agent_type, project_dir, state, created_at, updated_at)
+       VALUES ($1,$2,$3,$4,'executor','codex-sdk','/tmp/shared','idle',$5,$5)`,
+      [hex(16), source.serverId, sessionName, `actor-project-${hex(4)}`, Date.now()],
+    );
+    const shareTarget = { kind: 'main' as const, serverId: source.serverId, sessionName };
+    const sessionShare = await createOrUpdateShare(db, {
+      id: `share_${hex(8)}`, target: shareTarget, targetUserId: participantId,
+      role: 'participant', createdBy: ownerId, expiresAt: null, now: Date.now(),
+    });
+    const authority = await issueSharedMachineAuthorityForSession(db, {
+      actorUserId: participantId, sourceServerId: source.serverId, sessionName,
+      shareTarget, actionId: `action-${hex(4)}`, signingKey: JWT_KEY,
+    });
+    expect(authority).toEqual(expect.any(String));
+    const delegated = {
+      'X-Server-Id': source.serverId,
+      authorization: `Bearer ${source.token}`,
+      'content-type': 'application/json',
+      [SHARED_MACHINE_AUTHORITY_HEADER]: authority as string,
+    };
+    const ownerTurn = {
+      'X-Server-Id': source.serverId,
+      authorization: `Bearer ${source.token}`,
+      'content-type': 'application/json',
+    };
+    const unshared = await controlledNode(ownerId);
+    const participantShared = await controlledNode(ownerId);
+    const viewerShared = await controlledNode(ownerId);
+    const grouped = await controlledNode(ownerId);
+    await createMachineGrant({ ownerId, recipientId: participantId, serverId: participantShared, role: 'participant' });
+    await createMachineGrant({ ownerId, recipientId: participantId, serverId: viewerShared, role: 'viewer' });
+    const desk = await createDesk(ownerId);
+    await joinDesk(desk, participantId);
+    expect((await bindDesk(app, ownerId, grouped, desk)).status).toBe(200);
+    return { app, ownerId, participantId, source, delegated, ownerTurn, unshared, participantShared, viewerShared, grouped, sessionShare };
+  }
+
+  const listed = async (app: ReturnType<typeof buildApp>, headers: Record<string, string>) => {
+    const response = await app.request('/api/machines', { headers });
+    expect(response.status).toBe(200);
+    return ((await response.json()) as { machines: Array<{ serverId: string }> }).machines.map((m) => m.serverId).sort();
+  };
+  const exec = (app: ReturnType<typeof buildApp>, headers: Record<string, string>, target: string) => app.request(
+    `/api/machine/exec?serverId=${target}`,
+    { method: 'POST', headers, body: JSON.stringify({ command: 'echo x' }) },
+  );
+  const computerUse = (app: ReturnType<typeof buildApp>, headers: Record<string, string>, target: string) => app.request(
+    `/api/machine/computer-use?serverId=${target}`,
+    { method: 'POST', headers, body: JSON.stringify({ tool: 'list_apps', arguments: {} }) },
+  );
+  const fileHandle = (app: ReturnType<typeof buildApp>, headers: Record<string, string>, target: string) => app.request(
+    `/api/server/${target}/machine-file-handle`,
+    { method: 'POST', headers, body: JSON.stringify({ path: '/tmp/x.txt' }) },
+  );
+
+  it('hides and denies every owner node that is not shared with the participant, on every device surface', async () => {
+    const t = await scene();
+    expect(await listed(t.app, t.delegated)).toEqual([t.grouped, t.participantShared].sort());
+    for (const [name, target] of [['unshared', t.unshared], ['viewer share', t.viewerShared]] as const) {
+      const execDenied = await exec(t.app, t.delegated, target);
+      expect(execDenied.status, `exec ${name}`).toBe(403);
+      expect(await execDenied.json()).toMatchObject({ reason: 'target_forbidden' });
+      expect((await computerUse(t.app, t.delegated, target)).status, `computer-use ${name}`).toBe(403);
+      expect((await fileHandle(t.app, t.delegated, target)).status, `file ${name}`).toBe(403);
+    }
+  });
+
+  it('keeps working for a participant who also has a machine share or group access (positive control)', async () => {
+    const t = await scene();
+    for (const target of [t.participantShared, t.grouped]) {
+      expect((await exec(t.app, t.delegated, target)).status, `exec ${target}`).toBe(200);
+      expect((await computerUse(t.app, t.delegated, target)).status, `computer-use ${target}`).toBe(200);
+      // Admission passed: the node has no live socket here, so the gate answers daemon_offline, not target_forbidden.
+      const file = await fileHandle(t.app, t.delegated, target);
+      expect(file.status, `file ${target}`).toBe(503);
+      expect(await file.json()).toMatchObject({ error: 'daemon_offline' });
+    }
+  });
+
+  it('leaves the owner\'s own turns unchanged: every node, no participant involved', async () => {
+    const t = await scene();
+    expect(await listed(t.app, t.ownerTurn)).toEqual([t.grouped, t.participantShared, t.unshared, t.viewerShared].sort());
+    for (const target of [t.unshared, t.viewerShared, t.participantShared, t.grouped]) {
+      expect((await exec(t.app, t.ownerTurn, target)).status, `owner exec ${target}`).toBe(200);
+      expect((await computerUse(t.app, t.ownerTurn, target)).status, `owner computer-use ${target}`).toBe(200);
+    }
+  });
+
+  it('denies again as soon as the participant\'s own access ends, with no fallback to the owner', async () => {
+    const t = await scene();
+    expect((await exec(t.app, t.delegated, t.participantShared)).status).toBe(200);
+    // Expired, then revoked, then downgraded: each is read live on the next action.
+    await db.execute('UPDATE server_shares SET expires_at = $3 WHERE server_id = $1 AND target_user_id = $2', [t.participantShared, t.participantId, Date.now() - 1]);
+    expect((await exec(t.app, t.delegated, t.participantShared)).status).toBe(403);
+    expect(await listed(t.app, t.delegated)).toEqual([t.grouped]);
+    await db.execute('UPDATE server_shares SET expires_at = NULL, revoked_at = $3 WHERE server_id = $1 AND target_user_id = $2', [t.participantShared, t.participantId, Date.now()]);
+    expect((await computerUse(t.app, t.delegated, t.participantShared)).status).toBe(403);
+    await db.execute('UPDATE server_shares SET revoked_at = NULL, role = $3 WHERE server_id = $1 AND target_user_id = $2', [t.participantShared, t.participantId, 'viewer']);
+    expect((await fileHandle(t.app, t.delegated, t.participantShared)).status).toBe(403);
+    // Leaving the group removes the group path too.
+    await db.execute('DELETE FROM team_members WHERE user_id = $1', [t.participantId]);
+    expect((await exec(t.app, t.delegated, t.grouped)).status).toBe(403);
+    expect(await listed(t.app, t.delegated)).toEqual([]);
+    // The owner turn is untouched by any of it.
+    expect((await exec(t.app, t.ownerTurn, t.participantShared)).status).toBe(200);
+  });
+
+  it('still refuses a forged, foreign or revoked-session authority even on a node shared with the participant', async () => {
+    const t = await scene();
+    const forged = { ...t.delegated, [SHARED_MACHINE_AUTHORITY_HEADER]: `${t.delegated[SHARED_MACHINE_AUTHORITY_HEADER]}x` };
+    expect((await exec(t.app, forged, t.participantShared)).status).toBe(403);
+    expect((await app403List(t.app, forged))).toBe(403);
+    await db.execute('UPDATE session_shares SET revoked_at = $2 WHERE id = $1', [t.sessionShare.id, Date.now()]);
+    expect((await exec(t.app, t.delegated, t.participantShared)).status).toBe(403);
+    expect((await app403List(t.app, t.delegated))).toBe(403);
+  });
+
+  it('records the participant, not the owner, as the actor of an admitted exec', async () => {
+    const t = await scene();
+    const audited = new Hono();
+    audited.use('*', async (c, next) => {
+      (c as unknown as { env: unknown }).env = { DB: db, JWT_SIGNING_KEY: JWT_KEY, SERVER_URL: 'https://relay.example' };
+      await next();
+    });
+    audited.route('/api/machine/exec', createMachineExecRoutes(async () => ({
+      online: true,
+      result: { requestId: 'exec', ok: true, exitCode: 0, stdout: 'ok', stderr: '', durationMs: 1 },
+    }), machineExecAuditIntentStore));
+    const response = await exec(audited as never, t.delegated, t.participantShared);
+    expect(response.status).toBe(200);
+    const row = await db.queryOne<{ user_id: string }>(
+      'SELECT user_id FROM machine_exec_audit WHERE source_server_id = $1 AND target_server_id = $2',
+      [t.source.serverId, t.participantShared],
+    );
+    expect(row?.user_id).toBe(t.participantId);
+    // And an admission that is refused leaves no audit row behind.
+    expect((await exec(audited as never, t.delegated, t.unshared)).status).toBe(403);
+    expect(await db.queryOne('SELECT 1 FROM machine_exec_audit WHERE target_server_id = $1', [t.unshared])).toBeNull();
+  });
+
+  it('re-reads the participant\'s own access when a staged upload is redeemed', async () => {
+    const t = await scene();
+    const targetToken = hex(16);
+    await db.execute('UPDATE servers SET token_hash = $2 WHERE id = $1', [t.participantShared, sha256(targetToken)]);
+    const redeemed: number[] = [];
+    let revokeBeforeRedeem = false;
+    // The daemon redeems a staged file with the one-time URL alone: an app with only the file routes, as the daemon sees it.
+    const redeemApp = new Hono();
+    redeemApp.use('*', async (c, next) => {
+      (c as unknown as { env: unknown }).env = { DB: db, JWT_SIGNING_KEY: JWT_KEY, SERVER_URL: 'https://relay.example' };
+      await next();
+    });
+    redeemApp.route('/api/server', fileTransferRoutes);
+    const targetSocket = new CaptureDaemonSocket((message) => {
+      if (message.type !== FILE_TRANSFER_MSG.UPLOAD_FETCH) return;
+      const url = new URL(String(message.downloadUrl));
+      void (async () => {
+        if (revokeBeforeRedeem) {
+          await db.execute('UPDATE server_shares SET revoked_at = $3 WHERE server_id = $1 AND target_user_id = $2', [t.participantShared, t.participantId, Date.now()]);
+        }
+        const staged = await redeemApp.request(`${url.pathname}${url.search}`);
+        redeemed.push(staged.status);
+        await staged.arrayBuffer().catch(() => undefined);
+        targetSocket.emit('message', Buffer.from(JSON.stringify({
+          type: FILE_TRANSFER_MSG.UPLOAD_ERROR, uploadId: message.uploadId, message: 'stop',
+        })), false);
+      })();
+    });
+    const targetBridge = WsBridge.get(t.participantShared);
+    targetBridge.handleDaemonConnection(targetSocket as never, db, { JWT_SIGNING_KEY: JWT_KEY } as never);
+    targetSocket.emit('message', Buffer.from(JSON.stringify({
+      type: 'auth', serverId: t.participantShared, token: targetToken,
+      capabilities: [FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY],
+    })), false);
+    await waitFor(() => targetBridge.isDaemonConnected());
+    const upload = async () => {
+      const form = new FormData();
+      form.append('file', new File(['payload'], 'payload.txt', { type: 'text/plain' }));
+      const { 'content-type': _ignored, ...headers } = t.delegated;
+      await t.app.request(`/api/server/${t.participantShared}/upload`, { method: 'POST', headers, body: form });
+    };
+    await upload();
+    await waitFor(() => redeemed.length === 1);
+    expect(redeemed[0], 'control: access still held, the daemon redeems the staged file').toBe(200);
+    revokeBeforeRedeem = true;
+    await upload();
+    await waitFor(() => redeemed.length === 2);
+    expect(redeemed[1], 'participant share revoked between staging and redeem').toBe(403);
+    targetSocket.close();
+  });
+});
+
+async function app403List(app: ReturnType<typeof buildApp>, headers: Record<string, string>): Promise<number> {
+  return (await app.request('/api/machines', { headers })).status;
+}

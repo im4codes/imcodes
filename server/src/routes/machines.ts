@@ -57,7 +57,7 @@ import {
 } from '../services/controlled-node-host-link.js';
 import { isControlledNodeId } from '../../../shared/controlled-node-identity.js';
 import { SHARED_MACHINE_AUTHORITY_HEADER } from '../../../shared/shared-machine-authority.js';
-import { resolveMachineOperationalUser } from '../share/shared-machine-authority.js';
+import { listActorOperableMachineIds, resolveMachineOperationalUser } from '../share/shared-machine-authority.js';
 import {
   CONTROLLED_NODE_UPGRADE_STATUS,
   DAEMON_UPGRADE_DELIVERY_STATUS,
@@ -115,6 +115,8 @@ export async function listControlledMachines(
   db: Database,
   userId: string,
   nowMs: number,
+  /** A shared-session participant driving the owner's agent: only machines they can operate themselves are listed. */
+  delegatedActorUserId?: string,
 ): Promise<{ machines: (MachineSummary & {
   nodeId: string;
   refName: string;
@@ -127,13 +129,20 @@ export async function listControlledMachines(
   // the whole machine list as malformed.
   hostServerId?: string;
 })[]; overLimit: boolean }> {
-  const rows: ControlledRow[] = await listAccessibleControlledMachines(
+  let rows: ControlledRow[] = await listAccessibleControlledMachines(
     db,
     userId,
     nowMs,
     MACHINE_LIST_MAX_ITEMS + 1,
   );
+  // The bound applies to the owner's fleet before any narrowing, so a participant never gets a silently truncated list.
   const overLimit = rows.length > MACHINE_LIST_MAX_ITEMS;
+  if (delegatedActorUserId) {
+    // The same rule as action admission (actorMayOperateMachine): the owner's
+    // fleet intersected with what the participant is themselves allowed to operate.
+    const actorOperable = await listActorOperableMachineIds(db, delegatedActorUserId, nowMs, MACHINE_LIST_MAX_ITEMS + 1);
+    rows = rows.filter((row) => actorOperable.has(row.id));
+  }
   const machines = rows.slice(0, MACHINE_LIST_MAX_ITEMS).map((r) => {
     if (!isControlledNodeId(r.node_id)) {
       throw new Error(`controlled_node_missing_canonical_node_id:${r.id}`);
@@ -242,6 +251,7 @@ export async function listControlledMachines(
 // GET /api/machines — owned + actively shared controlled machines with DB-backed presence.
 machinesRoutes.get('/', requireAuth(), async (c) => {
   let userId = c.get('userId' as never) as string;
+  let delegatedActorUserId: string | undefined;
   const now = Date.now();
   // Browser discovery is also the bounded, resumable provisioning seam for an
   // Owner whose remote-desktop node predates canonical host identity. This is
@@ -260,6 +270,7 @@ machinesRoutes.get('/', requireAuth(), async (c) => {
     });
     if (!operational) return c.json({ error: 'forbidden' }, 403);
     userId = operational.userId;
+    delegatedActorUserId = operational.delegatedActorUserId;
   }
   if (!authenticatedDaemon) {
     await backfillCanonicalHosts({
@@ -269,7 +280,7 @@ machinesRoutes.get('/', requireAuth(), async (c) => {
       now,
     });
   }
-  const { machines, overLimit } = await listControlledMachines(c.env.DB, userId, now);
+  const { machines, overLimit } = await listControlledMachines(c.env.DB, userId, now, delegatedActorUserId);
   if (overLimit) {
     return c.json({ error: 'machine_list_over_limit', maxItems: MACHINE_LIST_MAX_ITEMS }, 413);
   }

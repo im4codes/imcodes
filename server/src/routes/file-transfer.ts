@@ -51,7 +51,7 @@ import {
 import {
   resolveControlledMachineOperatorAccess,
 } from '../share/machine-access.js';
-import { resolveMachineOperationalAccess } from '../share/shared-machine-authority.js';
+import { actorMayOperateMachine, resolveMachineOperationalAccess } from '../share/shared-machine-authority.js';
 import { SHARED_MACHINE_AUTHORITY_HEADER } from '../../../shared/shared-machine-authority.js';
 import { sanitizeUploadFilename } from '../../../shared/upload-filename.js';
 import { FS_GENERIC_ERROR_CODES } from '../../../shared/fs-error-codes.js';
@@ -99,6 +99,8 @@ const downloadTokens = new Map<string, {
 const stagedUploads = new Map<string, {
   serverId: string;
   controlledAccessUserId?: string;
+  /** The shared-session participant behind the owner's agent: their own access is re-read with the owner's. */
+  controlledActorUserId?: string;
   token: string;
   dir: string;
   filePath: string;
@@ -112,6 +114,7 @@ const stagedUploads = new Map<string, {
 const stagedDownloads = new Map<string, {
   serverId: string;
   controlledAccessUserId?: string;
+  controlledActorUserId?: string;
   token: string;
   stream: PassThrough;
   ready: Promise<Record<string, unknown>>;
@@ -140,16 +143,18 @@ function rangeNotSatisfiable(c: Context, total: number): Response {
 
 async function hasCurrentControlledStageAccess(
   db: Env['DB'],
-  entry: { serverId: string; controlledAccessUserId?: string },
+  entry: { serverId: string; controlledAccessUserId?: string; controlledActorUserId?: string },
 ): Promise<boolean> {
   if (!entry.controlledAccessUserId) return true;
+  const now = Date.now();
   const access = await resolveControlledMachineOperatorAccess(
     db,
     entry.controlledAccessUserId,
     entry.serverId,
-    Date.now(),
+    now,
   );
-  return access != null && access.exec_enabled;
+  return access != null && access.exec_enabled
+    && await actorMayOperateMachine(db, entry.controlledActorUserId, entry.serverId, now);
 }
 
 function settleStagedDownloadReady(downloadId: string, settle: (entry: NonNullable<ReturnType<typeof stagedDownloads.get>>) => void): void {
@@ -485,6 +490,7 @@ async function attemptStreamedDownload(
   serverId: string,
   attachmentId: string,
   controlledAccessUserId?: string,
+  controlledActorUserId?: string,
   offset = 0,
 ): Promise<{ kind: 'done'; response: Response } | { kind: 'retry' }> {
   const downloadId = randomHex(16);
@@ -506,6 +512,7 @@ async function attemptStreamedDownload(
   stagedDownloads.set(downloadId, {
     serverId,
     ...(controlledAccessUserId ? { controlledAccessUserId } : {}),
+    ...(controlledActorUserId ? { controlledActorUserId } : {}),
     token,
     stream,
     ready,
@@ -640,7 +647,7 @@ fileTransferRoutes.use('/:id/uploads/:attachmentId/download', async (c, next) =>
 });
 
 type ControlledTargetGate =
-  | { ok: true; bridge: ReturnType<typeof WsBridge.get>; controlled: boolean; daemonGeneration?: number }
+  | { ok: true; bridge: ReturnType<typeof WsBridge.get>; controlled: boolean; daemonGeneration?: number; delegatedActorUserId?: string }
   | { ok: false; reason: 'scoped_auth' | 'target_forbidden' | 'exec_disabled' | 'daemon_offline' | 'capability_unavailable' };
 
 async function authorizeControlledFileTarget(
@@ -678,7 +685,7 @@ async function authorizeControlledFileTarget(
     return { ok: false, reason: 'scoped_auth' };
   }
   const now = Date.now();
-  const access = authenticatedFullDaemon
+  const operational = authenticatedFullDaemon
     ? (await resolveMachineOperationalAccess(c.env.DB, {
         token: c.req.header(SHARED_MACHINE_AUTHORITY_HEADER),
         signingKey: c.env.JWT_SIGNING_KEY,
@@ -686,7 +693,10 @@ async function authorizeControlledFileTarget(
         sourceOwnerUserId: userId,
         targetServerId: serverId,
         now,
-      }))?.target ?? null
+      }))
+    : null;
+  const access = authenticatedFullDaemon
+    ? operational?.target ?? null
     : await resolveControlledMachineOperatorAccess(c.env.DB, userId, serverId, now);
   if (!access) {
     return { ok: false, reason: 'target_forbidden' };
@@ -698,7 +708,10 @@ async function authorizeControlledFileTarget(
   // must never dispatch the authorized command to a replacement generation.
   const daemonGeneration = bridge.daemonConnectionGeneration();
   if (!bridge.hasDaemonCapability(capability)) return { ok: false, reason: 'capability_unavailable' };
-  return { ok: true, bridge, controlled: true, daemonGeneration };
+  return {
+    ok: true, bridge, controlled: true, daemonGeneration,
+    ...(operational?.delegatedActorUserId ? { delegatedActorUserId: operational.delegatedActorUserId } : {}),
+  };
 }
 
 function controlledTargetGateError(c: Context, reason: Exclude<ControlledTargetGate, { ok: true }>['reason']): Response {
@@ -1318,6 +1331,7 @@ fileTransferRoutes.post('/:id/upload', async (c) => {
     stagedUploads.set(uploadId, {
       serverId,
       ...(controlledGate.controlled ? { controlledAccessUserId: userId } : {}),
+      ...(controlledGate.delegatedActorUserId ? { controlledActorUserId: controlledGate.delegatedActorUserId } : {}),
       token,
       dir: stagedDir,
       filePath: stagedPath,
@@ -1616,6 +1630,7 @@ fileTransferRoutes.get('/:id/uploads/:attachmentId/download', async (c) => {
           serverId,
           attachmentId,
           controlledGate.controlled ? userId : undefined,
+          controlledGate.delegatedActorUserId,
           offset,
         );
         if (outcome.kind === 'done') return outcome.response;

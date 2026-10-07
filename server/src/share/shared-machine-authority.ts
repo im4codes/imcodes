@@ -7,6 +7,8 @@ import {
 } from '../../../shared/shared-machine-authority.js';
 import type { ShareTarget } from '../../../shared/tab-sharing.js';
 import {
+  canOperateControlledMachine,
+  listAccessibleControlledMachines,
   resolveControlledMachineOperatorAccess,
   type ControlledMachineOperatorAccessRow,
 } from './machine-access.js';
@@ -163,11 +165,41 @@ export async function resolveMachineOperationalUser(
 }
 
 /**
+ * A shared-session turn runs on the owner's daemon with the owner's agent, but
+ * a session share grants no machine access. The participant must hold their OWN
+ * Owner/Participant access to the exact target (a machine share or a group
+ * membership), read live from the DB, in addition to the owner's access. An
+ * owner turn has no delegated actor and is unchanged.
+ */
+export async function actorMayOperateMachine(
+  db: Database,
+  delegatedActorUserId: string | undefined,
+  targetServerId: string,
+  now: number,
+): Promise<boolean> {
+  if (!delegatedActorUserId) return true;
+  return (await resolveControlledMachineOperatorAccess(db, delegatedActorUserId, targetServerId, now)) !== null;
+}
+
+/** The list form of actorMayOperateMachine: ids of the controlled machines the participant can operate themselves. */
+export async function listActorOperableMachineIds(
+  db: Database,
+  delegatedActorUserId: string,
+  now: number,
+  limit: number,
+): Promise<Set<string>> {
+  const rows = await listAccessibleControlledMachines(db, delegatedActorUserId, now, limit);
+  return new Set(rows.filter((row) => canOperateControlledMachine(row.access_role)).map((row) => row.id));
+}
+
+/**
  * Single action-admission boundary for daemon-originated controlled-device
  * operations. The signed shared-turn context is verified against its exact
  * source session/project and live participant grant, then the exact target is
- * resolved as the source owner's current controlled device. A present but
- * invalid delegated context never falls back to owner authority.
+ * resolved as the source owner's current controlled device AND, for a
+ * delegated turn, as the participant's own current controlled device. A
+ * present but invalid delegated context never falls back to owner authority,
+ * and a valid one never widens a participant beyond what they were given.
  */
 export async function resolveMachineOperationalAccess(
   db: Database,
@@ -192,6 +224,9 @@ export async function resolveMachineOperationalAccess(
     input.now,
   );
   if (!target) return null;
+  if (!await actorMayOperateMachine(db, operational.delegatedActorUserId, input.targetServerId, input.now)) {
+    return null;
+  }
   return {
     target,
     ...(operational.delegatedActorUserId
