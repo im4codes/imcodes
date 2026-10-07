@@ -19,7 +19,7 @@
  * It also reads free space on the worktree volume and classifies it, so the
  * scheduler can reclaim closed pairs oldest-first before the volume fills.
  */
-import { execFile } from 'node:child_process';
+import { execFileOffMainCallback as execFile } from '../../util/exec-helper.js';
 import { lstat, readdir, realpath, rm, statfs, unlink } from 'node:fs/promises';
 import path, { dirname, isAbsolute, sep } from 'node:path';
 import {

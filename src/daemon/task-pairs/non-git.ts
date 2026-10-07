@@ -12,7 +12,7 @@
  *
  * Symlinks are cloned as links and never followed. The project is only read until an apply-back.
  */
-import { execFile } from 'node:child_process';
+import { execFileOffMainCallback as execFile } from '../../util/exec-helper.js';
 import { createHash, randomBytes } from 'node:crypto';
 import {
   chmod, constants as fsConstants, copyFile, lstat, lutimes, mkdir, readFile, readdir, readlink, rename, rm, rmdir, statfs, symlink, unlink, utimes, writeFile,

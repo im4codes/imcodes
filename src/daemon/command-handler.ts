@@ -133,9 +133,6 @@ import {
 import { homedir } from 'os';
 import { lstat as fsLstat, open as fsOpen, readdir as fsReaddir, realpath as fsRealpath, readFile as fsReadFileRaw, rename as fsRename, rm as fsRm, stat as fsStat, unlink as fsUnlink, writeFile as fsWriteFile } from 'node:fs/promises';
 import * as nodePath from 'node:path';
-import { exec as execCb } from 'node:child_process';
-import { promisify } from 'node:util';
-const execAsync = promisify(execCb);
 import { startP2pRun, cancelP2pRun, getP2pRun, listP2pRuns, serializeP2pRun, type P2pTarget, type SharedP2pRunScope } from './p2p-orchestrator.js';
 import {
   expandP2pTargets as expandP2pTargetsShared,
@@ -10443,7 +10440,7 @@ function toGitPath(relativePath: string): string {
 }
 
 async function loadRepoGitStatusSnapshot(repoRoot: string, repoSignature: string): Promise<GitStatusSnapshot> {
-  const { stdout } = await execAsync('git status --porcelain=v1 -z -u', { cwd: repoRoot, timeout: 5000, encoding: 'utf8', maxBuffer: 10 * 1024 * 1024 });
+  const { stdout } = await execFileAsync('git', ['status', '--porcelain=v1', '-z', '-u'], { cwd: repoRoot, timeout: 5000, encoding: 'utf8', maxBuffer: 10 * 1024 * 1024 });
   const files: GitStatusFile[] = [];
   const records = parseZRecords(stdout);
   for (let idx = 0; idx < records.length; idx++) {
@@ -10522,10 +10519,10 @@ async function getRepoGitStatusSnapshot(startPath: string): Promise<GitStatusSna
 async function loadRepoGitNumstatSnapshot(repoRoot: string, repoSignature: string): Promise<GitNumstatSnapshot> {
   let stdout = '';
   try {
-    ({ stdout } = await execAsync('git diff --numstat -z HEAD', { cwd: repoRoot, timeout: 5000, encoding: 'utf8', maxBuffer: 10 * 1024 * 1024 }));
+    ({ stdout } = await execFileAsync('git', ['diff', '--numstat', '-z', 'HEAD'], { cwd: repoRoot, timeout: 5000, encoding: 'utf8', maxBuffer: 10 * 1024 * 1024 }));
   } catch {
     try {
-      ({ stdout } = await execAsync('git diff --numstat -z', { cwd: repoRoot, timeout: 5000, encoding: 'utf8', maxBuffer: 10 * 1024 * 1024 }));
+      ({ stdout } = await execFileAsync('git', ['diff', '--numstat', '-z'], { cwd: repoRoot, timeout: 5000, encoding: 'utf8', maxBuffer: 10 * 1024 * 1024 }));
     } catch {
       stdout = '';
     }

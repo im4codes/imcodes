@@ -11,7 +11,7 @@
  * At DONE {@link mergePairIntoProject} brings the pair's commits into the project: it refuses to touch any file the user has
  * uncommitted edits in, and never overwrites.
  */
-import { execFile } from 'node:child_process';
+import { execFileOffMainCallback as execFile } from '../../util/exec-helper.js';
 import { lstat, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { dirname, join, resolve, sep } from 'node:path';

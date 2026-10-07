@@ -1,4 +1,4 @@
-import { execFile as execFileCb, type ExecFileOptions } from 'node:child_process';
+import { execFile as execFileCb, type ExecFileException, type ExecFileOptions } from 'node:child_process';
 import { promisify } from 'node:util';
 import {
   EXEC_HELPER_ENV_SWITCH,
@@ -306,3 +306,24 @@ export const execFileOffMain: typeof directExecFile = ((file: string, args?: rea
   if (args !== undefined) return call(file, args);
   return call(file);
 }) as never;
+
+type ExecFileCallback = (error: ExecFileException | null, stdout: string, stderr: string) => void;
+
+/**
+ * Callback-style drop-in for `child_process.execFile(file, args, options, callback)` that spawns through the exec helper
+ * (see above). Many call sites predate `execFileOffMain` and use the callback form; swapping the import is enough to stop
+ * them paying a fork of the multi-GB daemon (~27 ms of main thread each, measured on 215) per git call. Output is always
+ * text and no ChildProcess is returned: a call that needs stdin or a binary stdout stays on `child_process`.
+ */
+export function execFileOffMainCallback(
+  file: string,
+  args: readonly string[],
+  options: ExecFileOptions,
+  callback: ExecFileCallback,
+): void {
+  const call = execFileOffMain as unknown as (f: string, a: readonly string[], o: ExecFileOptions) => Promise<{ stdout: string; stderr: string }>;
+  call(file, args, { ...options, encoding: 'utf8' }).then(
+    ({ stdout, stderr }) => callback(null, String(stdout ?? ''), String(stderr ?? '')),
+    (error: ExecFileException & { stdout?: unknown; stderr?: unknown }) => callback(error, String(error?.stdout ?? ''), String(error?.stderr ?? '')),
+  );
+}

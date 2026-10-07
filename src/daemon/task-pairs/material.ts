@@ -13,7 +13,7 @@
  * executor to resend rather than hand the auditor a project-wide checkout
  * that was never scoped to this task.
  */
-import { execFile } from 'node:child_process';
+import { execFileOffMainCallback as execFile } from '../../util/exec-helper.js';
 import { existsSync } from 'node:fs';
 import { redirectTaskPairWorkspacePath, sameTaskPairCommit, type TaskPairState } from '../../../shared/task-pair.js';
 import { buildCowReview } from './non-git.js';

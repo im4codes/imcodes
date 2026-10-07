@@ -5,9 +5,7 @@
 import { watch, readdir, stat, open, mkdir, writeFile } from 'fs/promises';
 import { join, basename } from 'path';
 import { homedir } from 'os';
-import { exec } from 'node:child_process';
-import { promisify } from 'node:util';
-const execAsync = promisify(exec);
+import { execFileOffMain } from '../util/exec-helper.js';
 import { timelineEmitter } from './timeline-emitter.js';
 import { buildSessionBootstrapContextWithItems, buildCodexMemoryEntry } from './memory-inject.js';
 import { recentSummaryFingerprintsFromItems } from '../context/summary-sync.js';
@@ -51,7 +49,7 @@ async function upsertCodexThread(uuid: string, cwd: string, rolloutPath: string,
     `  cwd = '${esc(cwd)}', model_provider = 'openai', source = 'cli',`,
     `  rollout_path = '${esc(rolloutPath)}', updated_at = ${now}, cli_version = '${esc(cliVersion)}';`,
   ].join(' ');
-  await execAsync(`sqlite3 ${JSON.stringify(dbPath)} ${JSON.stringify(sql)}`);
+  await execFileOffMain('sqlite3', [dbPath, sql]);
   logger.info({ uuid, cwd }, 'codex-watcher: upserted thread into SQLite');
 }
 
@@ -60,7 +58,7 @@ let _codexVersion: string | null = null;
 async function getCodexVersion(): Promise<string> {
   if (_codexVersion) return _codexVersion;
   try {
-    const { stdout } = await execAsync('codex --version');
+    const { stdout } = await execFileOffMain('codex', ['--version']);
     _codexVersion = stdout.trim().replace(/^codex-cli\s+/, '');
   } catch {
     _codexVersion = '0.113.0';

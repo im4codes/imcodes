@@ -19,6 +19,7 @@ import {
   ExecHelperClient,
   __resetExecHelperForTests,
   execFileOffMain,
+  execFileOffMainCallback,
   execFileOffMainIdempotent,
   getExecHelperStats,
   shutdownExecHelper,
@@ -549,5 +550,57 @@ describe('kill switch and default state', () => {
     expect(imports.sort()).toEqual(['../../shared/exec-helper-protocol.js', './worker-runtime-port.js', 'node:child_process'].sort());
     const bootstrap = readFileSync(new URL('../../src/util/exec-helper-worker-bootstrap.mjs', import.meta.url), 'utf8');
     expect(bootstrap).not.toMatch(/session-store|logger|lifecycle/);
+  });
+});
+
+// Callback-style call sites (task-pair git probes, workspace hygiene, ...) used `child_process.execFile` directly and so forked
+// the multi-GB daemon for every git call; the adapter gives them the helper behind the same signature.
+describe('execFileOffMainCallback (drop-in for the callback form of execFile)', () => {
+  afterEach(() => { __resetExecHelperForTests(); });
+
+  const call = (file: string, args: string[], options: Record<string, unknown> = {}) => new Promise<{ error: any; stdout: string; stderr: string }>((resolve) => {
+    execFileOffMainCallback(file, args, options as never, (error, stdout, stderr) => resolve({ error, stdout, stderr }));
+  });
+
+  it('delivers text stdout and no error on success, with the options honoured', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'imc-cb-'));
+    try {
+      const out = await call(node, ['-e', 'process.stdout.write(process.cwd())'], { cwd: dir });
+      expect(out.error).toBeNull();
+      expect(out.stdout.replace(/\\/g, '/')).toContain(dir.replace(/\\/g, '/').split('/').pop()!);
+      expect(typeof out.stdout).toBe('string');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('delivers the exit code, stdout and stderr of a failing command the way execFile does', async () => {
+    const out = await call(node, ['-e', 'process.stdout.write("partial");process.stderr.write("boom");process.exit(3)']);
+    expect(out.error).toBeTruthy();
+    expect(out.error.code).toBe(3);
+    expect(out.stdout).toBe('partial');
+    expect(out.stderr).toBe('boom');
+  });
+
+  it('reports a missing binary as an error with a code, never as a thrown exception', async () => {
+    const out = await call('imcodes-definitely-not-a-binary', []);
+    expect(out.error?.code).toBe('ENOENT');
+  });
+
+  it('goes through the helper process once it is running (no fork of this process)', async () => {
+    process.env[EXEC_HELPER_ENV_SWITCH] = '1';
+    try {
+      startExecHelper();
+      const deadline = Date.now() + 15_000;
+      while (!getExecHelperStats()?.ready && Date.now() < deadline) await new Promise((r) => setTimeout(r, 25));
+      expect(getExecHelperStats()?.ready).toBe(true);
+      const before = getExecHelperStats()!.viaHelper;
+      const out = await call(node, ['-e', 'process.stdout.write("ok")']);
+      expect(out.stdout).toBe('ok');
+      expect(getExecHelperStats()!.viaHelper).toBe(before + 1);
+    } finally {
+      await shutdownExecHelper();
+      delete process.env[EXEC_HELPER_ENV_SWITCH];
+    }
   });
 });

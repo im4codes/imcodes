@@ -25,7 +25,7 @@
  * first. A pair reopened afterwards keeps its worktree but not that weight: its
  * executor reinstalls what it needs.
  */
-import { execFile } from 'node:child_process';
+import { execFileOffMainCallback as execFile } from '../../util/exec-helper.js';
 import { cp, lstat, mkdir, readFile, readdir, readlink, realpath, rm, rmdir, stat, writeFile } from 'node:fs/promises';
 import { rmSync } from 'node:fs';
 import { homedir } from 'node:os';

@@ -1,3 +1,4 @@
+import { withEventLoopWatchdogPhase } from './event-loop-watchdog.js';
 import { createHash, randomUUID } from 'node:crypto';
 import {
   chmodSync,
@@ -492,7 +493,7 @@ function sameFingerprint(
   return left?.gitBlobOid === right?.gitBlobOid && left?.mode === right?.mode;
 }
 
-export function compareSupervisionIntegrationBundleFile(input: {
+function compareSupervisionIntegrationBundleFileUnscoped(input: {
   bundle: SupervisionIntegrationBundle;
   worktreePath: string;
   file: SupervisionIntegrationBundleFile;
@@ -530,7 +531,7 @@ function gitChangedPaths(worktreePath: string): string[] {
   }).split('\n').map((path) => path.trim()).filter(Boolean)))].sort();
 }
 
-export function applySupervisionIntegrationBundle(input: {
+function applySupervisionIntegrationBundleUnscoped(input: {
   bundle: SupervisionIntegrationBundle;
   worktreePath: string;
 }): SupervisionIntegrationBundleResult<{ replay: boolean }> {
@@ -632,7 +633,7 @@ export function applySupervisionIntegrationBundle(input: {
 }
 
 /** Verify the durable Git object before finalization retires mutable worktrees. */
-export function verifySupervisionIntegrationCommit(input: {
+function verifySupervisionIntegrationCommitUnscoped(input: {
   bundle: SupervisionIntegrationBundle;
   worktreePath: string;
   commitSha: string;
@@ -696,3 +697,15 @@ export function verifySupervisionIntegrationCommit(input: {
     ...(mergedWithNewerBase.length > 0 ? { mergedWithNewerBase } : {}),
   };
 }
+
+// The git calls above are synchronous (`spawnSync`/`execFileSync`): each forks the whole daemon process, ~27 ms apiece on a
+// 1 GB daemon, and a bundle of a few hundred files is hundreds of them. They are only reachable from an explicit action
+// (an agent's MCP call, or a legacy task being integrated) and never from a periodic pass -- that is enforced where the
+// pass dispatches (`isLegacyDispatchInertProject`, send-tool.ts). Whatever still reaches them names itself to the stall
+// detector instead of showing up as an anonymous freeze (215 had a 2.4 s one every 60 s for days).
+export const compareSupervisionIntegrationBundleFile: typeof compareSupervisionIntegrationBundleFileUnscoped = (...args) =>
+  withEventLoopWatchdogPhase('supervision-integration-bundle.compare', () => compareSupervisionIntegrationBundleFileUnscoped(...args));
+export const applySupervisionIntegrationBundle: typeof applySupervisionIntegrationBundleUnscoped = (...args) =>
+  withEventLoopWatchdogPhase('supervision-integration-bundle.apply', () => applySupervisionIntegrationBundleUnscoped(...args));
+export const verifySupervisionIntegrationCommit: typeof verifySupervisionIntegrationCommitUnscoped = (...args) =>
+  withEventLoopWatchdogPhase('supervision-integration-bundle.verify-commit', () => verifySupervisionIntegrationCommitUnscoped(...args));
