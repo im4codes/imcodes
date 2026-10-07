@@ -160,24 +160,11 @@ async function startFlickerProbe(page) {
       chosen = [...document.querySelectorAll('.chat-view:not(.chat-view-preview)')].find((el) => el.getClientRects().length > 0 && el.textContent.includes('stream-')) ?? null;
       return chosen;
     };
-    // The fake daemon's markdown content opens every message with 'stream-msg-N': the streaming message is identified by
-    // that marker, and its row is whatever row currently shows it (merged blocks hold several messages).
-    const markerRe = /stream-msg-\d+(?!\d)/g;
     window.__flickerStreamKey = () => {
       const root = window.__flickerRoot();
       if (!root) return null;
-      const all = (root.textContent ?? '').match(markerRe);
-      return all?.at(-1) ?? null;
-    };
-    window.__flickerAllKeys = () => {
-      const root = window.__flickerRoot();
-      return root ? [...new Set((root.textContent ?? '').match(markerRe) ?? [])] : [];
-    };
-    window.__flickerFindRow = (key) => {
-      const root = window.__flickerRoot();
-      if (!root) return null;
-      const re = new RegExp(`${key}(?!\\d)`);
-      return [...root.querySelectorAll('.chat-assistant[data-event-id]')].find((el) => re.test(el.textContent ?? '')) ?? null;
+      const rows = [...root.querySelectorAll('.chat-assistant[data-event-id]')].filter((el) => el.textContent.includes('stream-'));
+      return rows.at(-1)?.getAttribute('data-event-id') ?? null;
     };
   });
   await page.evaluate(() => window.__flicker.begin());

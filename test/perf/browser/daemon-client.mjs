@@ -4,7 +4,6 @@ import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { createRequire } from 'node:module';
 import { burstyGaps, nextMarkdownPiece } from './stream-script.mjs';
-import { STALE_SESSION_NAME, buildStaleTimeline } from './stale-timeline.mjs';
 
 const require = createRequire(new URL('../../../server/package.json', import.meta.url));
 let Client;

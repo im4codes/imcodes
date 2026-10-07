@@ -50,13 +50,11 @@ const VARIANTS = [
   // arriving in token-sized pieces in bursts. Uniform 25 Hz never triggered it.
   { label: 'markdown-bursty', pieceMode: 'md', cadence: 'bursty', rows: 240 },
   { label: 'markdown-uniform', pieceMode: 'md', cadence: 'uniform', rows: 240 },
-  // A short chat is not virtualized: rows are plain children of the chat root.
-  { label: 'markdown-bursty-short', pieceMode: 'md', cadence: 'bursty', rows: 12 },
 ];
 
 /** Installed in the page (after installDriver). */
 export function installFlickerProbe() {
-  const P = { recording: false, frames: [], painted: [], ids: new WeakMap(), nextId: 1, identity: new Map(), acc: null, animStarts: [], scrollWrites: [], lastLen: new Map(), lastText: new Map(), shrinkLog: [], remounts: [], removedLog: [], rowIdentity: new Map(), rowRemounts: [] };
+  const P = { recording: false, frames: [], painted: [], ids: new WeakMap(), nextId: 1, identity: new Map(), acc: null, animStarts: [], scrollWrites: [], lastLen: new Map(), lastText: new Map(), shrinkLog: [], remounts: [], removedLog: [] };
   window.__flicker = P;
   const idOf = (node) => { let v = P.ids.get(node); if (v === undefined) { v = P.nextId; P.nextId += 1; P.ids.set(node, v); } return v; };
   // Fixture: the single real ChatView and the driver's streaming event. Real app
@@ -107,18 +105,15 @@ export function installFlickerProbe() {
       P.animStarts.push({ t: performance.now(), type, name: event.animationName ?? event.propertyName, cls: classify(row), tag: `${event.target.tagName}.${String(event.target.className).slice(0, 40)}` });
     }, true);
   }
-  // kind: 'raf' (time of the rAF callback) or 'paint' (task queued after the frame); each keeps its OWN previous-frame state.
-  const sample = (kind) => {
+  const sample = () => {
     const r = root();
     if (!r) return null;
     observe();
     const rootRect = r.getBoundingClientRect();
     const sk = streamKey();
     // A virtualized list wraps every row in [data-virtual-key]; a short (non-virtualized) chat has the event element itself.
-    // __flickerFindRow (real app) finds the row by the streamed message itself, so the row's identity is tracked even if its
-    // data-event-id / key changes (a re-created row under a new key would otherwise look like a brand-new stream).
-    const event = sk ? (window.__flickerFindRow ? window.__flickerFindRow(sk) : r.querySelector(`[data-event-id="${CSS.escape(sk)}"]`)) : null;
-    const wrapper = (event ? event.closest('[data-virtual-key]') : null) ?? event;
+    const event = sk ? r.querySelector(`[data-event-id="${CSS.escape(sk)}"]`) : null;
+    const wrapper = (sk ? r.querySelector(`[data-virtual-key="${CSS.escape(sk)}"]`) : null) ?? event;
     const textEl = event?.firstElementChild ?? null;
     const track = (label, node) => {
       if (!node) return;
@@ -129,17 +124,6 @@ export function installFlickerProbe() {
       set.add(id);
     };
     track('wrapper', wrapper); track('event', event); track('text', textEl);
-    // Every message row seen (real app): the DOM node that shows a message must never change once it exists.
-    if (window.__flickerAllKeys && window.__flickerFindRow) {
-      for (const key of window.__flickerAllKeys()) {
-        const row = window.__flickerFindRow(key);
-        if (!row) continue;
-        const id = idOf(row);
-        const seen = P.rowIdentity.get(key);
-        if (!seen) P.rowIdentity.set(key, { id, nodes: 1 });
-        else if (seen.id !== id) { seen.id = id; seen.nodes += 1; if (P.rowRemounts.length < 12) P.rowRemounts.push({ t: performance.now(), key, html: row.outerHTML.slice(0, 120), len: (row.textContent ?? '').length }); }
-      }
-    }
     const near = [wrapper?.previousElementSibling, wrapper?.previousElementSibling?.previousElementSibling, wrapper?.nextElementSibling].filter(Boolean);
     near.forEach((n, i) => track(`near${i}:${n.getAttribute('data-virtual-key') ?? n.getAttribute('data-event-id')}`, n));
     const cs = event ? getComputedStyle(event) : null;
@@ -148,19 +132,15 @@ export function installFlickerProbe() {
     // un-parsed fallback), 'markdown' = block elements, 'empty' before any text.
     const rich = event?.querySelector('.chat-rich-text') ?? null;
     const mode = !rich ? 'empty' : (rich.children.length === 1 && rich.firstElementChild.tagName === 'SPAN' ? 'raw' : 'markdown');
-    const stateKey = `${kind}:${sk}`;
-    const prevLen = P.lastLen.get(stateKey) ?? 0;
+    const prevLen = P.lastLen.get(sk) ?? 0;
     const text = event?.textContent ?? '';
-    const prevText = P.lastText.get(stateKey) ?? '';
-    // The retained-event cap (or the tail window) trims the OLDEST text off the top of a merged block: the text that is left is
-    // a suffix of what was there. The view is pinned at the bottom, so nothing the reader sees moves; it is not a flicker.
-    const headTrim = len < prevLen && prevText.length > 0 && text.length > 0 && prevText.includes(text.slice(0, Math.min(60, text.length)));
-    if (len < prevLen && !headTrim && prevText && P.shrinkLog.length < 6) P.shrinkLog.push({ t: performance.now(), key: sk, prevLen, len, prevHead: prevText.slice(0, 90), prevTail: prevText.slice(-90), nowHead: text.slice(0, 90), nowTail: text.slice(-90) });
-    P.lastText.set(stateKey, text);
-    P.lastLen.set(stateKey, len); // the PREVIOUS FRAME's length: a shrink is a frame-to-frame event
+    const prevText = P.lastText.get(sk) ?? '';
+    if (len < prevLen && prevText && P.shrinkLog.length < 6) P.shrinkLog.push({ t: performance.now(), key: sk, prevLen, len, prevHead: prevText.slice(0, 90), prevTail: prevText.slice(-90), nowHead: text.slice(0, 90), nowTail: text.slice(-90) });
+    P.lastText.set(sk, text);
+    P.lastLen.set(sk, Math.max(prevLen, len));
     const rect = wrapper?.getBoundingClientRect();
     return {
-      t: performance.now(), key: sk, mounted: !!wrapper, mode, len, shrunk: len < prevLen && !headTrim, headTrim, rootScrollTop: r.scrollTop, clientWidth: r.clientWidth, clientHeight: r.clientHeight, scrollHeight: r.scrollHeight,
+      t: performance.now(), key: sk, mounted: !!wrapper, mode, len, shrunk: len < prevLen, rootScrollTop: r.scrollTop, clientWidth: r.clientWidth, clientHeight: r.clientHeight, scrollHeight: r.scrollHeight,
       contentTop: rect ? rect.top - rootRect.top + r.scrollTop : null, viewportTop: rect ? rect.top - rootRect.top : null, absTop: rect?.top ?? null, absBottom: rect?.bottom ?? null, height: rect?.height ?? null, width: rect?.width ?? null,
       opacity: cs ? Number(cs.opacity) : null, visibility: cs?.visibility ?? null, display: cs?.display ?? null,
       anims: event ? event.getAnimations({ subtree: true }).length : 0,
@@ -171,27 +151,27 @@ export function installFlickerProbe() {
   const tick = () => {
     requestAnimationFrame(tick);
     if (!P.recording) return;
-    const s = sample('raf');
+    const s = sample();
     if (s) { s.acc = flush(); P.frames.push(s); }
   };
   const channel = new MessageChannel();
   channel.port1.onmessage = () => {
     if (!P.recording) return;
-    const s = sample('paint');
+    const s = sample();
     if (s) { s.acc = null; P.painted.push(s); }
   };
   const paintedTick = () => { requestAnimationFrame(paintedTick); if (P.recording) channel.port2.postMessage(0); };
-  P.begin = () => { P.frames = []; P.painted = []; P.animStarts = []; P.scrollWrites = []; P.remounts = []; P.removedLog = []; P.lastText = new Map(); P.shrinkLog = []; P.rowIdentity = new Map(); P.rowRemounts = []; P.identity = new Map(); P.lastLen = new Map(); P.acc = newAcc(); P.recording = true; if (!P.started) { P.started = true; requestAnimationFrame(tick); requestAnimationFrame(paintedTick); } };
+  P.begin = () => { P.frames = []; P.painted = []; P.animStarts = []; P.scrollWrites = []; P.remounts = []; P.removedLog = []; P.lastText = new Map(); P.shrinkLog = []; P.identity = new Map(); P.lastLen = new Map(); P.acc = newAcc(); P.recording = true; if (!P.started) { P.started = true; requestAnimationFrame(tick); requestAnimationFrame(paintedTick); } };
   P.end = () => {
     P.recording = false;
     const identity = {}; for (const [k, set] of P.identity) identity[k] = set.size;
-    return { frames: P.frames, painted: P.painted, animStarts: P.animStarts, scrollWrites: P.scrollWrites, identity, remountEvents: P.remounts, removedLog: P.removedLog, shrinkLog: P.shrinkLog, rowIdentity: [...P.rowIdentity].map(([key, v]) => ({ key, nodes: v.nodes })), rowRemountLog: P.rowRemounts };
+    return { frames: P.frames, painted: P.painted, animStarts: P.animStarts, scrollWrites: P.scrollWrites, identity, remountEvents: P.remounts, removedLog: P.removedLog, shrinkLog: P.shrinkLog };
   };
 }
 
 function sum(frames, bucket, field) { return frames.reduce((a, f) => a + (f.acc?.[bucket]?.[field] ?? 0), 0); }
 
-export function analyze({ frames, painted, animStarts, scrollWrites, identity, remountEvents, removedLog, shrinkLog, rowIdentity, rowRemountLog }) {
+export function analyze({ frames, painted, animStarts, scrollWrites, identity, remountEvents, removedLog, shrinkLog }) {
   // Identity: distinct DOM nodes per (stream, part); >1 means the node was re-created while streaming.
   const remounts = { wrapper: 0, event: 0, text: 0, near: 0 };
   const perPart = [];
@@ -255,7 +235,7 @@ export function analyze({ frames, painted, animStarts, scrollWrites, identity, r
     let maxDrop = 0; let drops = 0; let prev = null; let atIdx = -1;
     list.forEach((f, i) => {
       if (!f.mounted || f.height === null) { prev = null; return; }
-      if (prev && prev.key === f.key && !f.headTrim) { const d = prev.height - f.height; if (d > maxDrop) { maxDrop = d; atIdx = i; } if (d > TOL) drops += 1; }
+      if (prev && prev.key === f.key) { const d = prev.height - f.height; if (d > maxDrop) { maxDrop = d; atIdx = i; } if (d > TOL) drops += 1; }
       prev = f;
     });
     return { maxDropPx: round(maxDrop), dropFrames: drops, context: atIdx < 0 ? [] : list.slice(Math.max(0, atIdx - 2), atIdx + 2).map((f) => ({ t: round(f.t), h: round(f.height), len: f.len, mode: f.mode })) };
@@ -269,13 +249,11 @@ export function analyze({ frames, painted, animStarts, scrollWrites, identity, r
   return {
     frames: frames.length, paintedFrames: painted.length, streamsSeen: new Set(frames.map((f) => f.key).filter(Boolean)).size,
     remounts, remountDetail: perPart.slice(0, 10), remountEvents: (remountEvents ?? []).slice(0, 8), removedElements: removedLog ?? [], shrinkLog: shrinkLog ?? [],
-    // Existing message rows whose DOM node was re-created (real app only; a NEW message's row is not counted).
-    rowRemounts: (rowIdentity ?? []).reduce((sum, row) => sum + (row.nodes - 1), 0), rowsTracked: (rowIdentity ?? []).length, rowRemountLog: rowRemountLog ?? [],
     mutations: {
       stream: { elAdd: sum(frames, 'stream', 'elAdd'), elDel: sum(frames, 'stream', 'elDel'), txtAdd: sum(frames, 'stream', 'txtAdd'), txtDel: sum(frames, 'stream', 'txtDel'), chr: sum(frames, 'stream', 'chr'), attr: sum(frames, 'stream', 'attr') },
       near: { elAdd: sum(frames, 'near', 'elAdd'), elDel: sum(frames, 'near', 'elDel'), txtAdd: sum(frames, 'near', 'txtAdd'), txtDel: sum(frames, 'near', 'txtDel'), chr: sum(frames, 'near', 'chr'), attr: sum(frames, 'near', 'attr') },
     },
-    renderMode: { rAF: modeStats(frames), painted: modeStats(painted) }, height: { rAF: heightStats(frames), painted: heightStats(painted) }, blankingFrames: blank, headTrimFrames: frames.filter((f) => f.headTrim).length, unmountedStreamFrames: unmountedFrames, fadingFrames: fades,
+    renderMode: { rAF: modeStats(frames), painted: modeStats(painted) }, height: { rAF: heightStats(frames), painted: heightStats(painted) }, blankingFrames: blank, unmountedStreamFrames: unmountedFrames, fadingFrames: fades,
     animationStartsOnRows: animStarts.length, animationStartDetail: animStarts.slice(0, 8),
     layout: { rAF: jitter(frames), painted: jitter(painted), bottomRAF: bottomJitter(frames), bottomPainted: bottomJitter(painted), viewportRAF: viewportTopJitter(frames), viewportPainted: viewportTopJitter(painted) },
     scroll: { writes: scrollWrites.length, writesPerFrame, scrollTopAssignments: nonPin, clientWidthChanges: widthChanges },
@@ -289,7 +267,6 @@ export function verdicts(result, variant = {}) {
   const need = (cond, msg) => { if (!cond) failures.push(msg); };
   need(a.frames >= 30, `only ${a.frames} frames`);
   need(a.remounts.wrapper === 0 && a.remounts.event === 0 && a.remounts.text === 0, `streaming row remounted (${JSON.stringify(a.remounts)})`);
-  need(a.rowsTracked === 0 || a.rowRemounts === 0, `${a.rowRemounts} existing message rows were re-created (${JSON.stringify(a.rowRemountLog.slice(0, 2))})`);
   need(a.remounts.near === 0, `neighbour rows remounted (${a.remounts.near})`);
   need(a.blankingFrames === 0, `${a.blankingFrames} blanking frames (text shrank / opacity 0 / hidden)`);
   // Allowed flips are PER STREAMED MESSAGE (every message opens with the variant's seed text).

@@ -22,7 +22,7 @@ import {
 import { splitTextByHttpUrls, trimDetectedUrl } from '../link-detection.js';
 import { copyToClipboard } from '../util/clipboard.js';
 import { shouldSkipRichTextEnhancement } from '../chat-render-limits.js';
-import { repairStreamingMarkdown, STREAMING_MARKDOWN_REFRESH_MS } from '../streaming-markdown.js';
+import { repairStreamingMarkdown } from '../streaming-markdown.js';
 import {
   isImagePreviewPath,
   renderChatPathActions,
@@ -33,6 +33,9 @@ import {
   ChatLoopbackLink,
   type ChatLocalWebPreviewOpenHandler,
 } from './ChatLoopbackLink.js';
+
+/** Streaming blocks re-parse their Markdown at most this often (10 Hz). */
+const STREAMING_MARKDOWN_REFRESH_MS = 100;
 
 interface Props {
   text: string;
