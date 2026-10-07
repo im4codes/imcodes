@@ -653,6 +653,7 @@ describe('memory MCP interface e2e', () => {
         endpoint: {
           serverId: SERVER_ID,
           workerUrl: 'https://worker.invalid/root/',
+          token: 'daemon-server-token',
         },
         fetchImpl,
         nowMs: () => Date.now(),
@@ -724,8 +725,9 @@ describe('memory MCP interface e2e', () => {
     });
     expect(cronCreated).toMatchObject({ status: 'ok' });
     expect(fetches.at(-1)?.url).toBe(`https://worker.invalid/root/api/server/${SERVER_ID}/cron`);
-    expect(fetches.at(-1)?.init.headers).toMatchObject({ 'X-Server-Id': SERVER_ID });
-    expect(fetches.at(-1)?.init.headers).not.toHaveProperty('Authorization');
+    // The cron API acts as the server owner: it needs the daemon's own server token, never the caller-supplied one.
+    expect(fetches.at(-1)?.init.headers).toMatchObject({ 'X-Server-Id': SERVER_ID, Authorization: 'Bearer daemon-server-token' });
+    expect(JSON.stringify(fetches.at(-1)?.init.headers)).not.toContain('evil-token');
     expect(fetches.at(-1)?.body).toMatchObject({
       serverId: SERVER_ID,
       projectName: PROJECT_NAME,
