@@ -194,7 +194,7 @@ const char* ParseRequestText(const std::string& text, const Options& options, Pa
     if (fields.count(key) == 0) return kBadRequestFile;
   }
   if (fields["v"] != "1") return kUnsupportedVersion;
-  if (fields["op"] != "list") return kUnsupportedOp;
+  if (fields["op"] != "list" && fields["op"] != "list_meta") return kUnsupportedOp;
   parsed->op = fields["op"];
   const std::string& nonce = fields["nonce"];
   if (nonce.size() < 16 || nonce.size() > 128) return kBadRequestFile;
@@ -244,7 +244,25 @@ const char* FullDiskAccessProbeRefusal(const Options& options) {
   return (errno == EPERM || errno == EACCES) ? kPermissionDenied : kPermissionUnknown;
 }
 
-std::string ListDirectory(const std::string& requested, const Options& options) {
+// `list_meta`: size / modified time / created time per entry, each a non-negative integer or `-` when the helper could not read it.
+// Milliseconds since the epoch. The created time exists only where the filesystem API reports one (macOS); elsewhere it is `-`.
+std::string MetadataFields(const struct stat& st, bool is_regular) {
+  const auto ms = [](const struct timespec& ts) -> std::string {
+    const long long value = static_cast<long long>(ts.tv_sec) * 1000LL + static_cast<long long>(ts.tv_nsec) / 1000000LL;
+    return value < 0 ? "-" : std::to_string(value);
+  };
+#if defined(__APPLE__)
+  const std::string birth = ms(st.st_birthtimespec);
+  const std::string mtime = ms(st.st_mtimespec);
+#else
+  const std::string birth = "-";
+  const std::string mtime = ms(st.st_mtim);
+#endif
+  const std::string size = is_regular && st.st_size >= 0 ? std::to_string(static_cast<long long>(st.st_size)) : "0";
+  return " " + size + " " + mtime + " " + birth;
+}
+
+std::string ListDirectory(const std::string& requested, const Options& options, bool with_metadata) {
   if (const char* refusal = FullDiskAccessProbeRefusal(options)) return ErrorAnswer(refusal);
   char resolved[PATH_MAX];
   if (realpath(requested.c_str(), resolved) == nullptr) return ErrorAnswer(ReasonForErrno(errno));
@@ -284,7 +302,8 @@ std::string ListDirectory(const std::string& requested, const Options& options) 
     }
     char kind = 'o';
     struct stat entry_stat;
-    if (fstatat(dirfd(dir), name.c_str(), &entry_stat, AT_SYMLINK_NOFOLLOW) == 0) {
+    const bool statted = fstatat(dirfd(dir), name.c_str(), &entry_stat, AT_SYMLINK_NOFOLLOW) == 0;
+    if (statted) {
       if (S_ISDIR(entry_stat.st_mode)) kind = 'd';
       else if (S_ISREG(entry_stat.st_mode)) kind = 'f';
     }
@@ -292,6 +311,7 @@ std::string ListDirectory(const std::string& requested, const Options& options) 
     body.push_back(kind);
     body.push_back(' ');
     body += Hex(name);
+    if (with_metadata) body += statted ? MetadataFields(entry_stat, kind == 'f') : std::string(" - - -");
     body.push_back('\n');
     ++count;
   }
@@ -329,7 +349,7 @@ int RunFsDelegateRequest(const std::string& request_file, const Options& options
     *answer = ErrorAnswer(reason);
     return 0;
   }
-  *answer = ListDirectory(parsed.path, options);
+  *answer = ListDirectory(parsed.path, options, parsed.op == "list_meta");
   return 0;
 }
 

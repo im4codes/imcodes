@@ -1233,7 +1233,7 @@ async function listDirectoryViaMacosAppOrThrow(
     // The policy applied to the path as written (made absolute), before the app is asked to read it.
     const absolute = await resolvePermittedRequestedPath(candidate);
     if (absolute === null) continue;
-    const outcome = await listDirectoryViaMacosApp(absolute, macosFsDelegateDepsForTests);
+    const outcome = await listDirectoryViaMacosApp(absolute, macosFsDelegateDepsForTests, { withMetadata: query !== undefined });
     if (outcome.kind === 'ok') {
       return await listDirectoryUnderPolicy(candidate, createDelegatedListingProvider(outcome), {}, query);
     }

@@ -1,5 +1,5 @@
 import { spawnSync } from 'node:child_process';
-import { chmodSync, linkSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, linkSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
@@ -200,6 +200,37 @@ describe.skipIf(!HAVE_COMPILER)('aidesk fs delegate (native core)', () => {
 
     it('refuses a chain start that is not an ancestor of the request directory', () => {
       expectRefused(run(writeRequest(), { chainStart: join(tmpdir(), 'not-an-ancestor') }), MACOS_FS_DELEGATE_REASON.REQUEST_DIR_UNTRUSTED);
+    });
+  });
+
+  describe('list_meta (size / modified / created time per entry)', () => {
+    it('answers the numbers the filesystem has, exactly, and plain `list` stays without them', () => {
+      const known = new Date(1_700_000_000_123);
+      writeFileSync(join(fixtureDir, 'a.txt'), 'x'.repeat(120));
+      utimesSync(join(fixtureDir, 'a.txt'), known, known);
+      mkdirSync(join(fixtureDir, 'sub'));
+      writeFileSync(join(fixtureDir, 'empty'), '');
+      const meta = run(writeRequest({ op: MACOS_FS_DELEGATE_OP.LIST_META }, 'meta.req'));
+      expect(meta.ok).toBe(true);
+      if (!meta.ok) return;
+      const byName = Object.fromEntries(meta.entries.map((entry) => [entry.name, entry]));
+      expect(byName['a.txt']!.meta!.size).toBe(120);
+      expect(Math.abs(byName['a.txt']!.meta!.mtimeMs! - 1_700_000_000_123)).toBeLessThanOrEqual(1); // sub-millisecond is cut, not rounded
+      expect(byName['empty']!.meta!.size).toBe(0);
+      expect(byName['sub']!.kind).toBe('d');
+      expect(byName['sub']!.meta!.size).toBe(0); // a directory's own byte size is not reported
+      expect(byName['sub']!.meta!.mtimeMs).toBe(Math.floor(statSync(join(fixtureDir, 'sub')).mtimeMs));
+      for (const entry of meta.entries) expect(entry.meta, entry.name).toBeDefined();
+      const plain = run(writeRequest({ op: MACOS_FS_DELEGATE_OP.LIST }, 'plain.req'));
+      expect(plain.ok && plain.entries.every((entry) => entry.meta === undefined)).toBe(true);
+    });
+
+    it('a symlink entry is `o` with metadata of the link itself, and the entry count/truncation rules are unchanged', () => {
+      writeFileSync(join(fixtureDir, 'target'), 'abc');
+      symlinkSync(join(fixtureDir, 'target'), join(fixtureDir, 'link'));
+      const meta = run(writeRequest({ op: MACOS_FS_DELEGATE_OP.LIST_META }, 'link.req'));
+      expect(meta.ok && meta.entries.find((entry) => entry.name === 'link')!.kind).toBe('o');
+      expect(meta.ok && meta.entries.find((entry) => entry.name === 'target')!.meta!.size).toBe(3);
     });
   });
 

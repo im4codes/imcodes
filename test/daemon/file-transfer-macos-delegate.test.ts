@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { FILE_TRANSFER_DIRECTORY_LIST_ERROR, FILE_TRANSFER_DIRECTORY_PATH, FILE_TRANSFER_MSG } from '../../shared/transport/file-transfer.js';
+import { FILE_TRANSFER_DIRECTORY_LIST_ERROR, FILE_TRANSFER_DIRECTORY_MAX_ENTRIES, FILE_TRANSFER_DIRECTORY_PATH, FILE_TRANSFER_MSG, type FileDirectoryListQuery } from '../../shared/transport/file-transfer.js';
 import { FS_GENERIC_ERROR_CODES } from '../../shared/fs-error-codes.js';
 import { MACOS_FS_DELEGATE_ANSWER_MAGIC, hexEncodeUtf8 } from '../../shared/macos-fs-delegate.js';
 import type { MacosFsDelegateClientDeps } from '../../src/node/macos-fs-delegate-client.js';
@@ -17,6 +17,7 @@ let rootDir = '';
 let fakeHome = '';
 let protectedDir = '';
 let appCalls: string[] = [];
+let appOps: string[] = [];
 
 const eperm = (p: string) => Object.assign(new Error(`EPERM: operation not permitted, scandir '${p}'`), { code: 'EPERM' });
 const answer = (...lines: string[]) => `${[MACOS_FS_DELEGATE_ANSWER_MAGIC, ...lines].join('\n')}\n`;
@@ -65,7 +66,7 @@ async function load(options: {
     runtimeRoot: path.join(rootDir, 'fs-delegate'),
     resolveUser: async () => ({ name: 'tester', uid: 501, gid: 20, home: fakeHome, tempDir: '/tmp/' }),
     readInfoPlist: async () => options.plist === undefined
-      ? '<key>AideskFsDelegateVersion</key><integer>1</integer><key>AideskFsDelegateOps</key><string>list</string>'
+      ? '<key>AideskFsDelegateVersion</key><integer>1</integer><key>AideskFsDelegateOps</key><string>list list_meta</string>'
       : options.plist,
     getuid: () => process.getuid?.() ?? 0,
     runApp: async ({ args }) => {
@@ -73,6 +74,7 @@ async function load(options: {
       const body = await readFile(args[1]!, 'utf8');
       const requested = Buffer.from(/path_hex=([0-9a-f]+)/.exec(body)![1]!, 'hex').toString('utf8');
       appCalls.push(requested);
+      appOps.push(/op=(\w+)/u.exec(body)![1]!);
       const reply = options.app ? options.app(requested) : answer('error permission_denied');
       if (reply instanceof Error) throw reply;
       return { stdout: reply };
@@ -82,9 +84,9 @@ async function load(options: {
   return handler;
 }
 
-async function list(handler: Awaited<ReturnType<typeof load>>, requested: string): Promise<Record<string, unknown>> {
+async function list(handler: Awaited<ReturnType<typeof load>>, requested: string, query?: FileDirectoryListQuery): Promise<Record<string, unknown>> {
   const sent: Array<Record<string, unknown>> = [];
-  await handler.handleFileDirectoryList({ type: FILE_TRANSFER_MSG.DIRECTORY_LIST, requestId: 'req-1', path: requested }, { send: (message: unknown) => { sent.push(message as Record<string, unknown>); } } as never);
+  await handler.handleFileDirectoryList({ type: FILE_TRANSFER_MSG.DIRECTORY_LIST, requestId: 'req-1', path: requested, ...(query ? { query } : {}) }, { send: (message: unknown) => { sent.push(message as Record<string, unknown>); } } as never);
   expect(sent).toHaveLength(1);
   return sent[0]!;
 }
@@ -97,6 +99,7 @@ describe('directory list: macOS Full Disk Access delegation to the aiDesk.to app
     await mkdir(path.join(fakeHome, 'Public'), { recursive: true });
     await writeFile(path.join(fakeHome, 'Public', 'visible.txt'), 'x');
     appCalls = [];
+    appOps = [];
   });
   afterEach(async () => {
     Object.defineProperty(process, 'platform', platformDescriptor);
@@ -216,6 +219,94 @@ describe('directory list: macOS Full Disk Access delegation to the aiDesk.to app
       const handler = await load({ sentinel: { permissionDenied: false, path: path.join(fakeHome, 'Public') } });
       expect((await list(handler, FILE_TRANSFER_DIRECTORY_PATH.DOWNLOADS)).type).toBe(FILE_TRANSFER_MSG.DIRECTORY_LIST_DONE);
       expect(appCalls).toEqual([]);
+    });
+  });
+
+  describe('a request WITH a query (CC15\'s node-side filter -> order -> truncate) through the app', () => {
+    const query = (key: FileDirectoryListQuery['sort']['key'], direction: 'asc' | 'desc' = 'asc', nameFilter?: string): FileDirectoryListQuery => ({
+      sort: { key, direction, dirsFirst: true },
+      ...(nameFilter === undefined ? {} : { nameFilter }),
+    });
+    const COUNT = FILE_TRANSFER_DIRECTORY_MAX_ENTRIES + 88;
+    /** `file-0000.txt`..: size = index, modified = 1.7e12 + index * 1000 ms, a few directories; as the helper's list_meta answers it. */
+    const metaAnswer = (target: string) => {
+      const files = Array.from({ length: COUNT }, (_, index) => `entry f ${hexEncodeUtf8(`file-${String(index).padStart(4, '0')}${index % 2 === 0 ? '.txt' : '.log'}`)} ${index} ${1_700_000_000_000 + index * 1000} -`);
+      const dirs = ['sub-a', 'sub-b'].map((name, index) => `entry d ${hexEncodeUtf8(name)} 0 ${1_800_000_000_000 + index} -`);
+      return answer(`realpath ${hexEncodeUtf8(target)}`, ...files, ...dirs, `end ${COUNT + 2} 0`);
+    };
+
+    it('orders by the app\'s sizes, filters by name, cuts to the entry cap and says so (truncated/total), exactly as the node\'s own reads would', async () => {
+      const target = path.join(protectedDir, 'proj');
+      const handler = await load({ app: () => metaAnswer(target) });
+      const reply = await list(handler, target, query('size', 'desc', 'file-'));
+      const entries = reply.entries as Array<{ name: string; size?: number; mtimeMs?: number; isDir: boolean }>;
+      expect(appOps).toEqual(['list_meta']);
+      expect(entries).toHaveLength(FILE_TRANSFER_DIRECTORY_MAX_ENTRIES);
+      expect(reply).toMatchObject({ type: FILE_TRANSFER_MSG.DIRECTORY_LIST_DONE, resolvedPath: target, truncated: true, total: COUNT });
+      expect(reply.partial).toBeUndefined();
+      // the filter matched no directory ('file-'), so the largest files lead
+      expect(entries.every((entry) => !entry.isDir)).toBe(true);
+      expect(entries[0]).toMatchObject({ name: `file-${String(COUNT - 1).padStart(4, '0')}.log`, size: COUNT - 1 });
+      expect(entries.map((entry) => entry.size)).toEqual([...entries.map((entry) => entry.size!)].sort((a, b) => b - a));
+      expect(entries[0]!.mtimeMs).toBe(1_700_000_000_000 + (COUNT - 1) * 1000);
+    });
+
+    it('orders by modified time, and directories lead when the filter lets them through', async () => {
+      const target = path.join(protectedDir, 'proj');
+      const handler = await load({ app: () => metaAnswer(target) });
+      const reply = await list(handler, target, query('modified', 'desc', 'sub'));
+      expect((reply.entries as Array<{ name: string }>).map((entry) => entry.name)).toEqual(['sub-b', 'sub-a']);
+      expect(reply.truncated).toBeUndefined();
+    });
+
+    it('a name ordering through the app, cut at the cap', async () => {
+      const target = path.join(protectedDir, 'proj');
+      const handler = await load({ app: () => metaAnswer(target) });
+      const reply = await list(handler, target, query('name'));
+      const names = (reply.entries as Array<{ name: string }>).map((entry) => entry.name);
+      expect(names.slice(0, 3)).toEqual(['sub-a', 'sub-b', 'file-0000.txt']);
+      expect(reply).toMatchObject({ truncated: true, total: COUNT + 2 });
+      expect(names).toHaveLength(FILE_TRANSFER_DIRECTORY_MAX_ENTRIES);
+    });
+
+    it('an OLDER app (no list_meta): asked for plain `list`, the ordering that needs size/time is reported partial and never passed off as ordered', async () => {
+      const target = path.join(protectedDir, 'proj');
+      const handler = await load({
+        plist: '<key>AideskFsDelegateVersion</key><integer>1</integer><key>AideskFsDelegateOps</key><string>list</string>',
+        app: () => answer(`realpath ${hexEncodeUtf8(target)}`, `entry f ${hexEncodeUtf8('b.txt')}`, `entry f ${hexEncodeUtf8('a.txt')}`, `entry d ${hexEncodeUtf8('d')}`, 'end 3 0'),
+      });
+      const bySize = await list(handler, target, query('size', 'desc'));
+      expect(appOps).toEqual(['list']);
+      expect(bySize.partial).toBe(true);
+      expect((bySize.entries as Array<{ size?: number }>).every((entry) => entry.size === undefined)).toBe(true);
+      const byName = await list(handler, target, query('name'));
+      expect(byName.partial).toBeUndefined();
+      expect((byName.entries as Array<{ name: string }>).map((entry) => entry.name)).toEqual(['d', 'a.txt', 'b.txt']);
+    });
+
+    it('a request without a query never asks for metadata and keeps the plain reply shape', async () => {
+      const target = path.join(protectedDir, 'proj');
+      const handler = await load({ app: () => listing(target, [['b.txt', 'f'], ['a.txt', 'f']]) });
+      const reply = await list(handler, target);
+      expect(appOps).toEqual(['list']);
+      expect(Object.keys(reply).sort()).toEqual(['entries', 'path', 'requestId', 'resolvedPath', 'type']);
+    });
+
+    it('a well-known folder the node cannot stat, with a query: the candidates are asked with list_meta and the answer is shaped', async () => {
+      const [first, second] = [path.join(protectedDir, 'Downloads-primary'), path.join(protectedDir, 'Downloads-fallback')];
+      const handler = await load({
+        sentinel: { permissionDenied: true, candidates: [first, second] },
+        app: (requested) => requested === first ? answer('error not_found') : metaAnswer(second),
+      });
+      const reply = await list(handler, FILE_TRANSFER_DIRECTORY_PATH.DOWNLOADS, query('size', 'asc'));
+      expect(appOps).toEqual(['list_meta', 'list_meta']);
+      expect(reply).toMatchObject({ type: FILE_TRANSFER_MSG.DIRECTORY_LIST_DONE, resolvedPath: second, truncated: true });
+    });
+
+    it('the policy still applies to the app\'s real path with a query', async () => {
+      const target = path.join(protectedDir, 'innocent');
+      const handler = await load({ app: () => metaAnswer(path.join(fakeHome, '.ssh')) });
+      expect(await list(handler, target, query('size', 'desc'))).toMatchObject({ type: FILE_TRANSFER_MSG.DIRECTORY_LIST_ERROR, error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH });
     });
   });
 

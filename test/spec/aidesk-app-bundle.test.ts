@@ -63,7 +63,7 @@ describe('aiDesk application bundle', () => {
     expect(plist).toContain(`<key>${MACOS_FS_DELEGATE_INFO_PLIST_VERSION_KEY}</key>\n  <integer>${MACOS_FS_DELEGATE_PROTOCOL_VERSION}</integer>`);
     expect(plist).toContain(`<key>${MACOS_FS_DELEGATE_INFO_PLIST_OPS_KEY}</key>\n  <string>${MACOS_FS_DELEGATE_APP_OPS.join(' ')}</string>`);
     // and the node's own reader of those keys agrees with what the packaging wrote
-    expect(readMacosFsDelegateCapabilityFromInfoPlist(plist)).toEqual(['list']);
+    expect(readMacosFsDelegateCapabilityFromInfoPlist(plist)).toEqual([...MACOS_FS_DELEGATE_APP_OPS]);
   });
 
   it('refuses a version or system floor it cannot describe', () => {

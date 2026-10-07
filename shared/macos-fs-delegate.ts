@@ -22,6 +22,8 @@
  *   IMCODES-FS-V1
  *   realpath <hex>
  *   entry <d|f|o> <hex name>      (list; `o` = neither a regular file nor a directory)
+ *   entry <d|f|o> <hex name> <size> <mtime ms> <birthtime ms>      (list_meta; each of the three is a non-negative integer or `-`
+ *                                 for "unknown"; size is the byte size of a regular file, 0 for anything else)
  *   end <entry count> <truncated 0|1>
  * or
  *   IMCODES-FS-V1
@@ -40,12 +42,14 @@ export const MACOS_FS_DELEGATE_INFO_PLIST_OPS_KEY: string = protocol.infoPlistOp
 
 export const MACOS_FS_DELEGATE_OP = {
   LIST: 'list',
+  /** `list` plus size / modified / created time per entry, so the node can order and display a listing it cannot stat itself. */
+  LIST_META: 'list_meta',
 } as const;
 export type MacosFsDelegateOp = typeof MACOS_FS_DELEGATE_OP[keyof typeof MACOS_FS_DELEGATE_OP];
 /** Operations the shipped app implements (what its Info.plist advertises; shared with the packaging script through the JSON). */
 export const MACOS_FS_DELEGATE_APP_OPS: readonly string[] = protocol.appOps;
 /** Operations this node knows how to request (the app advertises the ones it implements). */
-export const MACOS_FS_DELEGATE_NODE_OPS: readonly MacosFsDelegateOp[] = [MACOS_FS_DELEGATE_OP.LIST];
+export const MACOS_FS_DELEGATE_NODE_OPS: readonly MacosFsDelegateOp[] = [MACOS_FS_DELEGATE_OP.LIST, MACOS_FS_DELEGATE_OP.LIST_META];
 
 /** The app executable inside the aiDesk bundle, and the flag that makes it answer one request. */
 export const MACOS_FS_DELEGATE_REQUEST_FLAG: string = protocol.requestFlag;
@@ -115,10 +119,16 @@ export const MACOS_FS_DELEGATE_ANSWER_MAGIC = 'IMCODES-FS-V1';
 
 export type MacosFsDelegateEntryKind = 'd' | 'f' | 'o';
 
+/** What a `list_meta` answer says about one entry; a field the app could not read is absent. */
+export interface MacosFsDelegateEntryMetadata {
+  size?: number;
+  mtimeMs?: number;
+  birthtimeMs?: number;
+}
 export interface MacosFsDelegateListAnswer {
   ok: true;
   realPath: string;
-  entries: Array<{ name: string; kind: MacosFsDelegateEntryKind }>;
+  entries: Array<{ name: string; kind: MacosFsDelegateEntryKind; meta?: MacosFsDelegateEntryMetadata }>;
   truncated: boolean;
 }
 export interface MacosFsDelegateErrorAnswer {
@@ -179,11 +189,16 @@ export function parseMacosFsDelegateAnswer(stdout: string): MacosFsDelegateAnswe
       realPath = hexDecodeUtf8(line.slice('realpath '.length));
       if (realPath === null || realPath.length === 0) return null;
     } else if (line.startsWith('entry ')) {
-      const match = /^entry ([dfo]) ([0-9a-f]+)$/u.exec(line);
+      const match = /^entry ([dfo]) ([0-9a-f]+)(?: (-|\d{1,16}) (-|\d{1,16}) (-|\d{1,16}))?$/u.exec(line);
       if (!match) return null;
       const name = hexDecodeUtf8(match[2]!);
       if (name === null || name.length === 0 || name.includes('/') || name.includes('\0')) return null;
-      entries.push({ name, kind: match[1] as MacosFsDelegateEntryKind });
+      const metaField = (token: string | undefined): number | undefined => (token === undefined || token === '-' ? undefined : Number(token));
+      entries.push({
+        name,
+        kind: match[1] as MacosFsDelegateEntryKind,
+        ...(match[3] === undefined ? {} : { meta: { size: metaField(match[3]), mtimeMs: metaField(match[4]), birthtimeMs: metaField(match[5]) } }),
+      });
     } else if (line.startsWith('end ')) {
       const match = /^end (\d{1,9}) ([01])$/u.exec(line);
       if (!match) return null;
@@ -193,6 +208,7 @@ export function parseMacosFsDelegateAnswer(stdout: string): MacosFsDelegateAnswe
     }
   }
   if (realPath === null || end === null || end.count !== entries.length) return null;
+  if (entries.some((entry) => (entry.meta === undefined) !== (entries[0]!.meta === undefined))) return null; // all entries carry metadata, or none
   return { ok: true, realPath, entries, truncated: end.truncated };
 }
 

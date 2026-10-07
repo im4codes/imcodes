@@ -26,6 +26,7 @@ import {
   parseMacosFsDelegateAnswer,
   parseMacosFsDelegateOps,
   serializeMacosFsDelegateRequest,
+  type MacosFsDelegateEntryMetadata,
   type MacosFsDelegateOp,
   type MacosFsDelegateReason,
 } from '../../shared/macos-fs-delegate.js';
@@ -36,7 +37,14 @@ import {
 } from './macos-remote-desktop-responsible-spawn.js';
 
 export type MacosFsDelegateListResult =
-  | { kind: 'ok'; realPath: string; entries: Array<{ name: string; kind: 'd' | 'f' | 'o' }>; truncated: boolean }
+  | {
+    kind: 'ok';
+    realPath: string;
+    entries: Array<{ name: string; kind: 'd' | 'f' | 'o'; meta?: MacosFsDelegateEntryMetadata }>;
+    truncated: boolean;
+    /** The answer carries size/time per entry (the app implements `list_meta` and was asked for it). Otherwise the node has none to order by. */
+    hasMetadata: boolean;
+  }
   /** The app ran and macOS refused IT: the app lacks Full Disk Access (the user must enable the app, not the node). */
   | { kind: 'app_denied' }
   /** The app ran and answered another definite error (not_found, not_directory, ...). */
@@ -76,7 +84,7 @@ async function defaultReadInfoPlist(appPath: string): Promise<string | null> {
 /** The two capability keys, read from the XML Info.plist the packaging script writes. Anything else (binary plist, missing keys) = no capability. */
 export function readMacosFsDelegateCapabilityFromInfoPlist(plist: string): readonly MacosFsDelegateOp[] {
   const version = new RegExp(`<key>${MACOS_FS_DELEGATE_INFO_PLIST_VERSION_KEY}</key>\\s*<integer>(\\d{1,4})</integer>`, 'u').exec(plist);
-  const ops = new RegExp(`<key>${MACOS_FS_DELEGATE_INFO_PLIST_OPS_KEY}</key>\\s*<string>([a-z ]{1,64})</string>`, 'u').exec(plist);
+  const ops = new RegExp(`<key>${MACOS_FS_DELEGATE_INFO_PLIST_OPS_KEY}</key>\\s*<string>([a-z_ ]{1,64})</string>`, 'u').exec(plist);
   return parseMacosFsDelegateOps(version ? Number(version[1]) : undefined, ops ? ops[1] : undefined);
 }
 
@@ -125,6 +133,7 @@ function unavailable(reason: MacosFsDelegateReason, path: string): MacosFsDelega
 export async function listDirectoryViaMacosApp(
   requestedPath: string,
   deps: MacosFsDelegateClientDeps = {},
+  options: { withMetadata?: boolean } = {},
 ): Promise<MacosFsDelegateListResult> {
   if ((deps.platform ?? process.platform) !== 'darwin') return { kind: 'unavailable', reason: MACOS_FS_DELEGATE_REASON.APP_UNAVAILABLE };
   if (Buffer.byteLength(requestedPath) > MACOS_FS_DELEGATE_LIMITS.MAX_PATH_BYTES || !requestedPath.startsWith('/')) {
@@ -133,9 +142,12 @@ export async function listDirectoryViaMacosApp(
   const appPath = deps.appPath ?? MACOS_REMOTE_DESKTOP_RESPONSIBLE_APP_PATH;
   const plist = await (deps.readInfoPlist ?? defaultReadInfoPlist)(appPath);
   if (plist === null) return unavailable(MACOS_FS_DELEGATE_REASON.APP_UNAVAILABLE, requestedPath);
-  if (!readMacosFsDelegateCapabilityFromInfoPlist(plist).includes(MACOS_FS_DELEGATE_OP.LIST)) {
+  const capability = readMacosFsDelegateCapabilityFromInfoPlist(plist);
+  if (!capability.includes(MACOS_FS_DELEGATE_OP.LIST)) {
     return unavailable(MACOS_FS_DELEGATE_REASON.APP_TOO_OLD, requestedPath);
   }
+  // Metadata only when asked for AND the app implements it; an older app lists without it and the caller says so truthfully.
+  const op = options.withMetadata && capability.includes(MACOS_FS_DELEGATE_OP.LIST_META) ? MACOS_FS_DELEGATE_OP.LIST_META : MACOS_FS_DELEGATE_OP.LIST;
   if (activeRuns >= MACOS_FS_DELEGATE_LIMITS.MAX_CONCURRENT_RUNS) return unavailable(MACOS_FS_DELEGATE_REASON.BUSY, requestedPath);
   activeRuns += 1;
   let requestFile: string | null = null;
@@ -154,7 +166,7 @@ export async function listDirectoryViaMacosApp(
     const nonce = (deps.randomHex ?? ((bytes) => randomBytes(bytes).toString('hex')))(16);
     requestFile = join(directory, `${nonce}.req`);
     await writeFile(requestFile, serializeMacosFsDelegateRequest({
-      op: MACOS_FS_DELEGATE_OP.LIST,
+      op,
       path: requestedPath,
       nonce,
       createdMs: now,
@@ -191,7 +203,14 @@ export async function listDirectoryViaMacosApp(
       const known = (Object.values(MACOS_FS_DELEGATE_REASON) as string[]).includes(answer.reason);
       return { kind: 'unavailable', reason: known ? answer.reason as MacosFsDelegateReason : MACOS_FS_DELEGATE_REASON.BAD_ANSWER };
     }
-    return { kind: 'ok', realPath: answer.realPath, entries: answer.entries, truncated: answer.truncated };
+    // An app that was asked for metadata must send it for every entry (an empty listing has none to send); anything else is a broken app.
+    if (op === MACOS_FS_DELEGATE_OP.LIST_META && answer.entries.some((entry) => entry.meta === undefined)) {
+      return unavailable(MACOS_FS_DELEGATE_REASON.BAD_ANSWER, requestedPath);
+    }
+    if (op === MACOS_FS_DELEGATE_OP.LIST && answer.entries.some((entry) => entry.meta !== undefined)) {
+      return unavailable(MACOS_FS_DELEGATE_REASON.BAD_ANSWER, requestedPath);
+    }
+    return { kind: 'ok', realPath: answer.realPath, entries: answer.entries, truncated: answer.truncated, hasMetadata: op === MACOS_FS_DELEGATE_OP.LIST_META };
   } finally {
     activeRuns -= 1;
     if (requestFile) await rm(requestFile, { force: true }).catch(() => {});

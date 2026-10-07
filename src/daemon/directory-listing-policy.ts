@@ -100,8 +100,20 @@ export function createDirectListingProvider(options: { surfacePermissionErrors?:
 /** A listing the aiDesk.to app already produced, offered to the same decision as if it were a filesystem. */
 export function createDelegatedListingProvider(answer: {
   realPath: string;
-  entries: ReadonlyArray<{ name: string; kind: 'd' | 'f' | 'o' }>;
+  entries: ReadonlyArray<{ name: string; kind: 'd' | 'f' | 'o'; meta?: { size?: number; mtimeMs?: number; birthtimeMs?: number } }>;
+  /** The app supplied size/time per entry. When it did not (an older app), a metadata-dependent ordering is reported `partial`. */
+  hasMetadata?: boolean;
 }): DirectoryListingProvider {
+  const metaByPath = new Map<string, { size: number; mtimeMs: number; birthtimeMs: number }>();
+  for (const entry of answer.entries) {
+    if (!entry.meta) continue;
+    // NaN = "unknown": the shared query shaping only records finite values.
+    metaByPath.set(path.join(answer.realPath, entry.name), {
+      size: entry.meta.size ?? Number.NaN,
+      mtimeMs: entry.meta.mtimeMs ?? Number.NaN,
+      birthtimeMs: entry.meta.birthtimeMs ?? 0,
+    });
+  }
   return {
     async realpath() {
       return answer.realPath;
@@ -114,6 +126,11 @@ export function createDelegatedListingProvider(answer: {
         isFile: () => entry.kind === 'f',
       }));
     },
+    // The node cannot stat what the app read for it (that is why the app was asked): the shared shaping gets the app's numbers instead.
+    queryInputs: () => ({
+      statEntry: async (fullPath) => metaByPath.get(fullPath) ?? null,
+      metadataUnavailable: answer.hasMetadata !== true,
+    }),
   };
 }
 

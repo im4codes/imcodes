@@ -64,6 +64,7 @@ describe('macOS fs delegate client', () => {
   it('reads the capability keys from the Info.plist; anything else is no capability', () => {
     expect(readMacosFsDelegateCapabilityFromInfoPlist(plistWith(1, 'list'))).toEqual(['list']);
     expect(readMacosFsDelegateCapabilityFromInfoPlist(plistWith(1, 'list read'))).toEqual(['list']); // an op this node does not know is ignored
+    expect(readMacosFsDelegateCapabilityFromInfoPlist(plistWith(1, 'list list_meta'))).toEqual(['list', 'list_meta']);
     expect(readMacosFsDelegateCapabilityFromInfoPlist(plistWith(null, null))).toEqual([]);
     expect(readMacosFsDelegateCapabilityFromInfoPlist(plistWith(1, null))).toEqual([]);
     expect(readMacosFsDelegateCapabilityFromInfoPlist(plistWith(null, 'list'))).toEqual([]);
@@ -80,7 +81,7 @@ describe('macOS fs delegate client', () => {
         return { stdout: answerText(`realpath ${hexEncodeUtf8('/Users/tester/Documents')}`, `entry d ${hexEncodeUtf8('proj')}`, 'end 1 0') };
       },
     }));
-    expect(result).toEqual({ kind: 'ok', realPath: '/Users/tester/Documents', entries: [{ name: 'proj', kind: 'd' }], truncated: false });
+    expect(result).toEqual({ kind: 'ok', realPath: '/Users/tester/Documents', entries: [{ name: 'proj', kind: 'd' }], truncated: false, hasMetadata: false });
     expect(seen).toHaveLength(1);
     expect(seen[0]!.args[0]).toBe(MACOS_FS_DELEGATE_REQUEST_FLAG);
     expect(seen[0]!.args[1]).toBe(join(runtimeRoot, String(user.uid), 'a1b2c3d4e5f60718a1b2c3d4e5f60718.req'));
@@ -186,5 +187,61 @@ describe('macOS fs delegate client', () => {
       answerText('error Bad-Reason'),
       'IMCODES-FS-V2\nerror x\n',
     ]) expect(parseMacosFsDelegateAnswer(bad)).toBeNull();
+  });
+
+  describe('entry metadata (list_meta) for a listing the node must order or show by size/time', () => {
+    const metaPlist = plistWith(1, 'list list_meta');
+    const metaAnswer = answerText(
+      `realpath ${hexEncodeUtf8('/Users/tester/Documents')}`,
+      `entry f ${hexEncodeUtf8('a.txt')} 120 1700000000123 1690000000000`,
+      `entry d ${hexEncodeUtf8('sub')} 0 1700000001000 -`,
+      `entry f ${hexEncodeUtf8('b.bin')} - - -`,
+      'end 3 0',
+    );
+    const requestedOp = async (override: Partial<MacosFsDelegateClientDeps>, withMetadata: boolean) => {
+      let op = '';
+      const result = await listDirectoryViaMacosApp('/Users/tester/Documents', deps({
+        runApp: async ({ args }) => { op = /op=(\w+)/u.exec(readFileSync(args[1]!, 'utf8'))![1]!; return { stdout: answerText(`realpath ${hexEncodeUtf8('/Users/tester/Documents')}`, 'end 0 0') }; },
+        ...override,
+      }), { withMetadata });
+      return { op, result };
+    };
+
+    it('asks for list_meta only when the caller wants metadata AND the app implements it', async () => {
+      expect((await requestedOp({ readInfoPlist: async () => metaPlist }, true)).op).toBe('list_meta');
+      expect((await requestedOp({ readInfoPlist: async () => metaPlist }, false)).op).toBe('list');
+      // an app that implements only `list` is asked for `list` and the result says it has no metadata
+      const older = await requestedOp({ readInfoPlist: async () => plistWith(1, 'list') }, true);
+      expect(older.op).toBe('list');
+      expect(older.result).toMatchObject({ kind: 'ok', hasMetadata: false });
+    });
+
+    it('returns the per-entry numbers, with `-` as unknown', async () => {
+      const result = await listDirectoryViaMacosApp('/Users/tester/Documents', deps({ readInfoPlist: async () => metaPlist, runApp: async () => ({ stdout: metaAnswer }) }), { withMetadata: true });
+      expect(result).toEqual({
+        kind: 'ok', realPath: '/Users/tester/Documents', truncated: false, hasMetadata: true,
+        entries: [
+          { name: 'a.txt', kind: 'f', meta: { size: 120, mtimeMs: 1700000000123, birthtimeMs: 1690000000000 } },
+          { name: 'sub', kind: 'd', meta: { size: 0, mtimeMs: 1700000001000, birthtimeMs: undefined } },
+          { name: 'b.bin', kind: 'f', meta: { size: undefined, mtimeMs: undefined, birthtimeMs: undefined } },
+        ],
+      });
+    });
+
+    it('treats an app that was asked for metadata but answers without it (or the other way round) as a broken app', async () => {
+      const plain = answerText(`realpath ${hexEncodeUtf8('/Users/tester/Documents')}`, `entry f ${hexEncodeUtf8('a.txt')}`, 'end 1 0');
+      expect(await listDirectoryViaMacosApp('/Users/tester/Documents', deps({ readInfoPlist: async () => metaPlist, runApp: async () => ({ stdout: plain }) }), { withMetadata: true }))
+        .toEqual({ kind: 'unavailable', reason: MACOS_FS_DELEGATE_REASON.BAD_ANSWER });
+      expect(await listDirectoryViaMacosApp('/Users/tester/Documents', deps({ readInfoPlist: async () => metaPlist, runApp: async () => ({ stdout: metaAnswer }) }), { withMetadata: false }))
+        .toEqual({ kind: 'unavailable', reason: MACOS_FS_DELEGATE_REASON.BAD_ANSWER });
+    });
+
+    it('the framing parser accepts both entry forms, never a mixture, and rejects malformed numbers', () => {
+      const mixed = answerText(`realpath ${hexEncodeUtf8('/x')}`, `entry f ${hexEncodeUtf8('a')} 1 2 3`, `entry f ${hexEncodeUtf8('b')}`, 'end 2 0');
+      expect(parseMacosFsDelegateAnswer(mixed)).toBeNull();
+      for (const bad of ['1 2', '1 2 3 4', 'x 2 3', '1 -5 3', '1 2 1e3', '12345678901234567 2 3']) {
+        expect(parseMacosFsDelegateAnswer(answerText(`realpath ${hexEncodeUtf8('/x')}`, `entry f ${hexEncodeUtf8('a')} ${bad}`, 'end 1 0')), bad).toBeNull();
+      }
+    });
   });
 });

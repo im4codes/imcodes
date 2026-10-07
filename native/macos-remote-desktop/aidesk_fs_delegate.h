@@ -13,7 +13,8 @@
 //
 // Plain POSIX C++17 (no Objective-C, no AppKit) so the logic builds and is tested on any POSIX host.
 //
-// Request file (`key=value` lines): v=1, op=list, path_hex=<hex UTF-8 path>, created_ms, expires_ms, nonce=<hex>.
+// Request file (`key=value` lines): v=1, op=list|list_meta, path_hex=<hex UTF-8 path>, created_ms, expires_ms, nonce=<hex>.
+// list_meta also answers size / modified time / created time per entry, which the node needs to order or show a listing it cannot stat.
 // Answer (stdout): see shared/macos-fs-delegate.ts, the single description of the framing.
 
 #ifndef IMCODES_MACOS_REMOTE_DESKTOP_AIDESK_FS_DELEGATE_H_

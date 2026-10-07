@@ -1,12 +1,16 @@
-import { describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { lstat, mkdir, mkdtemp, readdir, realpath, rm, utimes, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import * as nodePath from 'node:path';
 import {
+  createDirectListingProvider,
   createDelegatedListingProvider,
   directoryListingErrorForAppAnswer,
   resolvePermittedRequestedPath,
   listDirectoryUnderPolicy,
   type DirectoryListingProvider,
 } from '../../src/daemon/directory-listing-policy.js';
-import { FILE_TRANSFER_DIRECTORY_MAX_ENTRIES } from '../../shared/transport/file-transfer.js';
+import { FILE_TRANSFER_DIRECTORY_MAX_ENTRIES, type FileDirectoryListQuery } from '../../shared/transport/file-transfer.js';
 import { FS_GENERIC_ERROR_CODES } from '../../shared/fs-error-codes.js';
 
 // The node can read a directory itself, or (macOS, when the node's own executable lacks Full Disk Access) ask the aiDesk.to app to.
@@ -140,5 +144,103 @@ describe('directory listing: direct reads and app-delegated reads share one deci
   it('refuses an app answer for a real path other than the one it reported (it cannot smuggle a second directory)', async () => {
     const provider = createDelegatedListingProvider({ realPath: `${HOME}/Documents`, entries: [dirEntry('x', 'f')] });
     await expect(provider.readEntries(`${HOME}/Documents/other`)).rejects.toThrow(FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH);
+  });
+});
+
+// CC15's node-side query (filter -> order -> truncate, with size/time metadata) must give the SAME answer whether the node read the
+// directory itself or the aiDesk.to app did. Real files, real direct provider, and a delegated provider fed with what the app's helper
+// would answer (integer milliseconds, sizes of regular files): every query below must produce identical entries, truncated/total/partial.
+describe('query shaping is identical through the direct and the delegated provider', () => {
+  const query = (key: FileDirectoryListQuery['sort']['key'], direction: 'asc' | 'desc' = 'asc', nameFilter?: string): FileDirectoryListQuery => ({
+    sort: { key, direction, dirsFirst: true },
+    ...(nameFilter === undefined ? {} : { nameFilter }),
+  });
+  let dir = '';
+
+  beforeAll(async () => {
+    dir = await realpath(await mkdtemp(nodePath.join(tmpdir(), 'imcodes-query-parity-')));
+    const base = Date.UTC(2026, 0, 1) / 1000;
+    const total = FILE_TRANSFER_DIRECTORY_MAX_ENTRIES + 90;
+    for (let start = 0; start < total; start += 200) {
+      await Promise.all(Array.from({ length: Math.min(200, total - start) }, async (_, offset) => {
+        const index = start + offset;
+        const file = nodePath.join(dir, `item-${String(index).padStart(4, '0')}${index % 5 === 0 ? '.md' : '.txt'}`);
+        await writeFile(file, 'x'.repeat((index * 7) % 113));
+        await utimes(file, base + ((index * 31) % 997), base + ((index * 31) % 997));
+      }));
+    }
+    // Whole-second times everywhere: the app reports integer milliseconds, so a sub-millisecond fraction (which only a freshly created
+    // directory has) is the one thing the two reads could legitimately differ on.
+    for (const [index, name] of ['alpha-dir', 'zeta-dir'].entries()) {
+      await mkdir(nodePath.join(dir, name));
+      await utimes(nodePath.join(dir, name), base + 2000 + index, base + 2000 + index);
+    }
+  });
+  afterAll(async () => { await rm(dir, { recursive: true, force: true }); });
+
+  /** What the helper's `list_meta` would answer for this directory. */
+  async function appAnswer(withMetadata: boolean) {
+    const entries = [];
+    for (const dirent of await readdir(dir, { withFileTypes: true })) {
+      const stat = await lstat(nodePath.join(dir, dirent.name));
+      entries.push({
+        name: dirent.name,
+        kind: (dirent.isDirectory() ? 'd' : dirent.isFile() ? 'f' : 'o') as 'd' | 'f' | 'o',
+        ...(withMetadata ? { meta: { size: stat.isFile() ? stat.size : 0, mtimeMs: Math.floor(stat.mtimeMs) } } : {}),
+      });
+    }
+    return { realPath: dir, entries, hasMetadata: withMetadata };
+  }
+
+  const queries: Array<[string, FileDirectoryListQuery]> = [
+    ['name ascending', query('name')],
+    ['name descending', query('name', 'desc')],
+    ['newest first', query('modified', 'desc')],
+    ['oldest first', query('modified')],
+    ['largest first', query('size', 'desc')],
+    ['smallest first', query('size')],
+    ['by kind', query('kind')],
+    ['name filter that matches many (then truncated)', query('modified', 'desc', 'item')],
+    ['name filter that matches few', query('size', 'desc', '.md 00')],
+    ['name filter that matches nothing', query('name', 'asc', 'no-such-name')],
+  ];
+
+  it.each(queries)('identical for %s', async (_label, q) => {
+    const direct = await listDirectoryUnderPolicy(dir, createDirectListingProvider(), {}, q);
+    const delegated = await listDirectoryUnderPolicy(dir, createDelegatedListingProvider(await appAnswer(true)), {}, q);
+    expect(delegated).toEqual(direct);
+  });
+
+  it('the comparison is not vacuous: ordering, truncation and metadata are really there', async () => {
+    const delegated = await listDirectoryUnderPolicy(dir, createDelegatedListingProvider(await appAnswer(true)), {}, query('size', 'desc', 'item'));
+    expect(delegated.entries).toHaveLength(FILE_TRANSFER_DIRECTORY_MAX_ENTRIES);
+    expect(delegated.truncated).toBe(true);
+    expect(delegated.total).toBe(FILE_TRANSFER_DIRECTORY_MAX_ENTRIES + 90);
+    const sizes = delegated.entries.map((entry) => entry.size ?? -1);
+    expect(sizes[0]).toBeGreaterThanOrEqual(sizes[sizes.length - 1]!);
+    expect(delegated.entries.every((entry) => typeof entry.mtimeMs === 'number')).toBe(true);
+  });
+
+  it('an app without metadata (older app): a size/time ordering is reported partial and never passed off as ordered; a name ordering is exact', async () => {
+    const noMeta = createDelegatedListingProvider(await appAnswer(false));
+    const bySize = await listDirectoryUnderPolicy(dir, noMeta, {}, query('size', 'desc'));
+    expect(bySize.partial).toBe(true);
+    expect(bySize.entries.every((entry) => entry.size === undefined && entry.mtimeMs === undefined)).toBe(true);
+    const byTime = await listDirectoryUnderPolicy(dir, noMeta, {}, query('modified', 'desc'));
+    expect(byTime.partial).toBe(true);
+    // a name ordering needs no metadata: same names in the same order as the direct read, nothing flagged
+    const byName = await listDirectoryUnderPolicy(dir, noMeta, {}, query('name'));
+    const direct = await listDirectoryUnderPolicy(dir, createDirectListingProvider(), {}, query('name'));
+    expect(byName.partial).toBeUndefined();
+    expect(byName.entries.map((entry) => entry.name)).toEqual(direct.entries.map((entry) => entry.name));
+    expect(byName.truncated).toBe(direct.truncated);
+    expect(byName.total).toBe(direct.total);
+  });
+
+  it('without a query nothing changes: the plain listing, no truncated/total/partial', async () => {
+    const delegated = await listDirectoryUnderPolicy(dir, createDelegatedListingProvider(await appAnswer(true)));
+    const direct = await listDirectoryUnderPolicy(dir, createDirectListingProvider());
+    expect(delegated).toEqual(direct);
+    expect(Object.keys(delegated).sort()).toEqual(['entries', 'realPath']);
   });
 });
