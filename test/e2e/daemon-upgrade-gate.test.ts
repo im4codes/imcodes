@@ -30,7 +30,18 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { DAEMON_MSG } from '../../shared/daemon-events.js';
-import { DAEMON_UPGRADE_BLOCK_REASON, DAEMON_UPGRADE_FORCE_FIELD } from '../../shared/daemon-upgrade.js';
+import {
+  DAEMON_STARTUP_PHASES,
+  DAEMON_UPGRADE_BLOCK_REASON,
+  DAEMON_UPGRADE_DEFERRAL,
+  DAEMON_UPGRADE_DEFERRAL_FIELD,
+  DAEMON_UPGRADE_FORCE_FIELD,
+  DAEMON_UPGRADE_PENDING_PHASES_FIELD,
+  DAEMON_UPGRADE_RETRY_AFTER_FIELD,
+  DAEMON_UPGRADE_STARTUP_RESTORE_TIMEOUT_MS,
+  DAEMON_UPGRADE_STARTUP_SETTLE_MS,
+  DAEMON_UPGRADE_UNCLEAN_RECOVERY_MS,
+} from '../../shared/daemon-upgrade.js';
 
 const mocks = vi.hoisted(() => {
   const store = new Map<string, Record<string, any>>();
@@ -292,6 +303,8 @@ vi.mock('../../src/daemon/openspec-auto-deliver-orchestrator.js', async (importO
 
 import { handleWebCommand } from '../../src/daemon/command-handler.js';
 import { registerMasterCompaction, resumeAcceptingMasterCompactions } from '../../src/daemon/master-compaction-registry.js';
+import { getTransportQueueStore } from '../../src/daemon/transport-queue-store.js';
+import { __beginUpgradeReadinessTrackingForTests, __resetUpgradeReadinessForTests } from '../../src/daemon/upgrade-readiness.js';
 
 // ── Helpers ──────────────────────────────────────────────────────────────
 
@@ -617,6 +630,19 @@ describe('daemon.upgrade: forced manual upgrade skips only the busy gates', () =
       name: 'a queued transport message',
       reason: DAEMON_UPGRADE_BLOCK_REASON.TRANSPORT_BUSY,
       arrange: () => addTransportSession('deck_force_brain', { status: 'idle', pendingCount: 2 }),
+    },
+    {
+      // 158, 2026-10-07: after a restart the durable queue is rehydrated when the runtime is rebuilt, which is AFTER
+      // the first upgrade decision. A session with queued messages and no runtime yet is work waiting to resume.
+      name: 'queued messages of a session whose runtime is not rebuilt yet',
+      reason: DAEMON_UPGRADE_BLOCK_REASON.TRANSPORT_BUSY,
+      arrange: () => {
+        addTransportSession('deck_force_brain', { status: 'idle' });
+        mocks.runtimes.delete('deck_force_brain');
+        const spy = vi.spyOn(getTransportQueueStore(), 'listLiveQueueSessions')
+          .mockReturnValue([{ sessionName: 'deck_force_brain', pendingCount: 2, oldestQueuedAt: 1 }]);
+        return () => spy.mockRestore();
+      },
     },
     {
       name: 'a process (tmux) session mid-turn',
@@ -987,5 +1013,136 @@ skipOnWindows('daemon.upgrade — Linux/macOS upgrade.sh contract', () => {
     } finally {
       realFs.rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+
+// ── A process that has just started is not an idle process ──────────────────
+//
+// 158, 2026-10-07: the busy gate held an automatic upgrade 9 times in 20 minutes, the daemon was then killed (ABRT),
+// systemd restarted it, and the fresh process upgraded 10 s after boot: it had no in-memory activity yet, and its
+// durable queue was rehydrated 2 s AFTER the decision. The restart of the service then killed the sessions that
+// were resuming. A server-driven (auto) upgrade now waits for the daemon to settle; manual/forced never do.
+
+describe('daemon.upgrade: a freshly started or crash-recovered daemon takes no automatic upgrade', () => {
+  const MINUTE = 60_000;
+  const begin = (input: { uptimeMs: number; unclean: boolean; phases?: 'all' | 'none' | readonly string[] }) => {
+    __beginUpgradeReadinessTrackingForTests({
+      startedAt: Date.now() - input.uptimeMs,
+      uncleanPreviousExit: input.unclean,
+      phasesDone: input.phases === 'none' ? [] : (input.phases === 'all' || !input.phases ? DAEMON_STARTUP_PHASES : input.phases as never[]),
+    });
+  };
+  const run = async (command: Record<string, unknown> = {}) => {
+    const serverLink = { send: vi.fn() } as { send: ReturnType<typeof vi.fn> };
+    handleWebCommand({ type: 'daemon.upgrade', targetVersion: '99.99.99-test', ...command }, serverLink as any);
+    await flushAsync();
+    return serverLink;
+  };
+  const proceeded = async (link: { send: ReturnType<typeof vi.fn> }) => {
+    await waitForCondition(() => mocks.spawnCalls.length > 0, 5000).catch(() => {});
+    expect(getBlockedMessage(link)).toBeUndefined();
+    expect(mocks.spawnCalls.length).toBeGreaterThan(0);
+  };
+
+  beforeEach(() => {
+    mocks.store.clear();
+    mocks.runtimes.clear();
+    mocks.spawnCalls.length = 0;
+    mocks.spawnedChildren.length = 0;
+    mocks.p2pRuns.length = 0;
+    mocks.autoDeliverRuns.length = 0;
+    mocks.setCompressionState({ active: false, activeCount: 0, queued: 0, idle: true });
+    __resetUpgradeReadinessForTests();
+  });
+  afterEach(() => {
+    __resetUpgradeReadinessForTests();
+    vi.clearAllMocks();
+  });
+
+  it('158: crash, restart, and the fresh idle-looking process is asked 10 s after boot -> deferred, nothing spawned', async () => {
+    // Every session looks idle (nothing has resumed yet): only the process age says otherwise.
+    addTransportSession('deck_jdzs_brain', { status: 'idle' });
+    begin({ uptimeMs: 10_000, unclean: true, phases: 'none' });
+    const link = await run({ source: 'auto' });
+    const blocked = getBlockedMessage(link);
+    expect(blocked).toMatchObject({
+      reason: DAEMON_UPGRADE_BLOCK_REASON.SESSION_BUSY,
+      [DAEMON_UPGRADE_DEFERRAL_FIELD]: DAEMON_UPGRADE_DEFERRAL.STARTING_UP,
+    });
+    expect(blocked?.[DAEMON_UPGRADE_RETRY_AFTER_FIELD]).toBeGreaterThan(0);
+    expect(blocked?.[DAEMON_UPGRADE_PENDING_PHASES_FIELD]).toEqual([...DAEMON_STARTUP_PHASES]);
+    expect(mocks.spawnCalls).toEqual([]);
+  });
+
+  it('a legacy (source-less) server request is held back too: an older server cannot bypass the daemon', async () => {
+    begin({ uptimeMs: 10_000, unclean: true, phases: 'none' });
+    const link = await run({});
+    expect(getBlockedMessage(link)).toMatchObject({ [DAEMON_UPGRADE_DEFERRAL_FIELD]: DAEMON_UPGRADE_DEFERRAL.STARTING_UP });
+    expect(mocks.spawnCalls).toEqual([]);
+  });
+
+  it('the receipt rides a legacy retryable busy reason, so a server without the deferral fields never counts it as a failure', async () => {
+    begin({ uptimeMs: 1_000, unclean: false, phases: 'none' });
+    const link = await run({ source: 'auto' });
+    expect(getBlockedMessage(link)?.reason).toBe(DAEMON_UPGRADE_BLOCK_REASON.SESSION_BUSY);
+  });
+
+  it('holds for the settle window even on a CLEAN restart, then proceeds', async () => {
+    begin({ uptimeMs: DAEMON_UPGRADE_STARTUP_SETTLE_MS - 5_000, unclean: false, phases: 'all' });
+    expect(getBlockedMessage(await run({ source: 'auto' }))).toMatchObject({ [DAEMON_UPGRADE_DEFERRAL_FIELD]: DAEMON_UPGRADE_DEFERRAL.STARTING_UP });
+    expect(mocks.spawnCalls).toEqual([]);
+    // 5 min + a bit, restore done, previous exit clean: the 15 min recovery window does NOT apply.
+    begin({ uptimeMs: DAEMON_UPGRADE_STARTUP_SETTLE_MS + 5_000, unclean: false, phases: 'all' });
+    await proceeded(await run({ source: 'auto' }));
+  });
+
+  it('waits for the startup restore phases past the settle window, and names the unfinished ones', async () => {
+    begin({ uptimeMs: 6 * MINUTE, unclean: false, phases: ['sessions_reconciled'] });
+    const blocked = getBlockedMessage(await run({ source: 'auto' }));
+    expect(blocked).toMatchObject({ [DAEMON_UPGRADE_DEFERRAL_FIELD]: DAEMON_UPGRADE_DEFERRAL.STARTING_UP });
+    expect(blocked?.[DAEMON_UPGRADE_PENDING_PHASES_FIELD]).toEqual(DAEMON_STARTUP_PHASES.filter((phase) => phase !== 'sessions_reconciled'));
+    expect(mocks.spawnCalls).toEqual([]);
+  });
+
+  it('a wedged restore phase stops holding after its timeout: the version is never pinned forever', async () => {
+    begin({ uptimeMs: DAEMON_UPGRADE_STARTUP_RESTORE_TIMEOUT_MS + 5_000, unclean: false, phases: 'none' });
+    await proceeded(await run({ source: 'auto' }));
+  });
+
+  it('after an UNCLEAN exit it holds for the recovery window, then proceeds (a stale marker cannot refuse forever)', async () => {
+    begin({ uptimeMs: 10 * MINUTE, unclean: true, phases: 'all' });
+    expect(getBlockedMessage(await run({ source: 'auto' }))).toMatchObject({
+      reason: DAEMON_UPGRADE_BLOCK_REASON.SESSION_BUSY,
+      [DAEMON_UPGRADE_DEFERRAL_FIELD]: DAEMON_UPGRADE_DEFERRAL.UNCLEAN_SHUTDOWN_RECOVERY,
+    });
+    expect(mocks.spawnCalls).toEqual([]);
+    begin({ uptimeMs: DAEMON_UPGRADE_UNCLEAN_RECOVERY_MS + 5_000, unclean: true, phases: 'all' });
+    await proceeded(await run({ source: 'auto' }));
+  });
+
+  it('a settled daemon still obeys every busy gate (the new hold is in addition to them)', async () => {
+    addTransportSession('deck_jdzs_brain', { status: 'thinking' });
+    begin({ uptimeMs: 30 * MINUTE, unclean: false, phases: 'all' });
+    expect(getBlockedMessage(await run({ source: 'auto' }))).toMatchObject({ reason: DAEMON_UPGRADE_BLOCK_REASON.TRANSPORT_BUSY });
+    expect(mocks.spawnCalls).toEqual([]);
+  });
+
+  it('manual and forced upgrades are operator decisions: they never consult the settle window', async () => {
+    begin({ uptimeMs: 5_000, unclean: true, phases: 'none' });
+    await proceeded(await run({ source: 'manual' }));
+    mocks.spawnCalls.length = 0;
+    await proceeded(await run({ source: 'manual', [DAEMON_UPGRADE_FORCE_FIELD]: true }));
+  });
+
+  it('force on an auto request does not skip the settle window', async () => {
+    begin({ uptimeMs: 5_000, unclean: true, phases: 'none' });
+    const link = await run({ source: 'auto', [DAEMON_UPGRADE_FORCE_FIELD]: true });
+    expect(getBlockedMessage(link)).toMatchObject({ [DAEMON_UPGRADE_DEFERRAL_FIELD]: DAEMON_UPGRADE_DEFERRAL.STARTING_UP });
+    expect(mocks.spawnCalls).toEqual([]);
+  });
+
+  it('a process that never began tracking (CLI, tools, tests) is not held', async () => {
+    await proceeded(await run({ source: 'auto' }));
   });
 });
