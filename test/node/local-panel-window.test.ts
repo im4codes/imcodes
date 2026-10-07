@@ -14,6 +14,8 @@ import {
   isAllowedLocalPanelUrl,
   isRecordedWindowAlive,
   localPanelUrl,
+  LOCAL_PANEL_PENDING_LAUNCH_MS,
+  parseLocalPanelPendingLaunch,
   parseLocalPanelWindowRecord,
   planLocalPanelWindow,
   type LocalPanelWindowFacts,
@@ -134,12 +136,12 @@ describe('the single-instance record', () => {
 function machine(over: Partial<{
   hasDesktop: boolean; native: string | undefined; browsers: string[]; running: LocalPanelWindowProcess | undefined;
   alive: Record<number, { alive: boolean; startedAtMs?: number }>; canFocus: boolean; focusOk: boolean;
-  launchNativeOk: boolean; appModeOk: Record<string, boolean>; defaultOk: boolean; panelRunning: boolean; record: string | undefined; selfManaged: boolean;
+  launchNativeOk: boolean; appModeOk: Record<string, boolean>; defaultOk: boolean; panelRunning: boolean; record: string | undefined; selfManaged: boolean; invisible: boolean; now: number; unavailable: boolean;
 }> = {}) {
   const state = {
     hasDesktop: true, native: undefined as string | undefined, browsers: [] as string[], running: undefined as LocalPanelWindowProcess | undefined,
     alive: {} as Record<number, { alive: boolean; startedAtMs?: number }>, canFocus: true, focusOk: true, launchNativeOk: true,
-    appModeOk: {} as Record<string, boolean>, defaultOk: true, panelRunning: true, record: undefined as string | undefined, selfManaged: false, ...over,
+    appModeOk: {} as Record<string, boolean>, defaultOk: true, panelRunning: true, record: undefined as string | undefined, selfManaged: false, invisible: false, now: 1_000_000, unavailable: false, ...over,
   };
   const calls: string[] = [];
   const logs: Array<{ level: string; fields: Record<string, unknown> }> = [];
@@ -152,12 +154,13 @@ function machine(over: Partial<{
     probePid: async (pid) => state.alive[pid] ?? { alive: false },
     canFocus: state.canFocus,
     nativeHostsOwnInstance: state.selfManaged,
+    nativeUnavailableReason: () => (state.unavailable ? LOCAL_PANEL_WINDOW_REASON.NATIVE_RUNTIME_MISSING : undefined),
     focusWindow: async () => { calls.push('focus'); return state.focusOk; },
     launchNative: async (path) => { calls.push(`native:${path}`); if (state.launchNativeOk) state.running = { pid: 77, startedAtMs: 5_000 }; return state.launchNativeOk; },
     launchAppMode: async (browser) => {
       calls.push(`app:${browser}`);
       const ok = state.appModeOk[browser] ?? true;
-      if (ok) state.running = { pid: 88, startedAtMs: 6_000 };
+      if (ok && !state.invisible) state.running = { pid: 88, startedAtMs: 6_000 };
       return ok;
     },
     openDefaultBrowser: async (url) => { calls.push(`default:${url}`); return state.defaultOk; },
@@ -169,7 +172,7 @@ function machine(over: Partial<{
   };
   const run = () => openLocalPanelWindow({
     platform, store, panelRunning: async () => state.panelRunning,
-    log: (level, fields) => { logs.push({ level, fields }); }, sleep: async () => undefined, locateTimeoutMs: 400,
+    log: (level, fields) => { logs.push({ level, fields }); }, sleep: async () => undefined, locateTimeoutMs: 400, now: () => state.now,
   });
   return { state, calls, logs, run };
 }
@@ -198,6 +201,37 @@ describe('openLocalPanelWindow', () => {
     expect(out).toMatchObject({ reason: LOCAL_PANEL_WINDOW_REASON.OPENED_APP_MODE, mechanism: LOCAL_PANEL_WINDOW_MECHANISM.APP_MODE });
     expect(out.trail).toEqual([LOCAL_PANEL_WINDOW_REASON.LAUNCH_FAILED]);
     expect(m.calls).toEqual(['native:/Library/aidesk.app', 'app:chrome']);
+  });
+
+  it('a window started but not visible yet (a slow machine) blocks a quick second start; the wait ends, and a window that shows up is adopted', async () => {
+    const m = machine({ browsers: ['chrome'], invisible: true });
+    expect((await m.run()).reason).toBe(LOCAL_PANEL_WINDOW_REASON.OPENED_APP_MODE);
+    expect(parseLocalPanelPendingLaunch(m.state.record ?? '')).toMatchObject({ mechanism: 'app_mode' });
+    // the double click: no second window is started
+    m.state.now += 5_000;
+    expect((await m.run()).reason).toBe(LOCAL_PANEL_WINDOW_REASON.LAUNCH_IN_PROGRESS);
+    expect(m.calls).toEqual(['app:chrome']);
+    // the window finally appears: adopted (recorded), and the next click focuses it
+    m.state.running = { pid: 88, startedAtMs: 6_000 };
+    m.state.alive[88] = { alive: true, startedAtMs: 6_000 };
+    expect((await m.run()).reason).toBe(LOCAL_PANEL_WINDOW_REASON.FOCUSED_EXISTING);
+    expect(parseLocalPanelWindowRecord(m.state.record ?? '')).toMatchObject({ pid: 88 });
+    expect(m.calls).toEqual(['app:chrome', 'focus']);
+  });
+
+  it('a start that never produced a window does not block for long: after the wait the next click starts again', async () => {
+    const m = machine({ browsers: ['chrome'], invisible: true });
+    await m.run();
+    m.state.now += LOCAL_PANEL_PENDING_LAUNCH_MS + 1;
+    expect((await m.run()).reason).toBe(LOCAL_PANEL_WINDOW_REASON.OPENED_APP_MODE);
+    expect(m.calls).toEqual(['app:chrome', 'app:chrome']);
+  });
+
+  it('a native host that is installed but cannot run (no WebView2 runtime) is reported as such in the trail, then the browser window opens', async () => {
+    const m = machine({ native: undefined, unavailable: true, selfManaged: true, browsers: ['chrome'] });
+    const out = await m.run();
+    expect(out.reason).toBe(LOCAL_PANEL_WINDOW_REASON.OPENED_APP_MODE);
+    expect(out.trail).toEqual([LOCAL_PANEL_WINDOW_REASON.NATIVE_RUNTIME_MISSING]);
   });
 
   it('falls back native -> app mode (second browser) -> default browser, logging each failure', async () => {

@@ -3,7 +3,7 @@
  * command lines are run, how the running window is found and focused. Real-device behavior is checked separately on real machines.
  */
 import { describe, expect, it } from 'vitest';
-import { LOCAL_PANEL_LINUX_WM_CLASS, LOCAL_PANEL_REFUSING_PROXY, LOCAL_PANEL_WARNING_BAR_FLAGS, LOCAL_PANEL_WINDOW_TITLE, localPanelUrl } from '../../shared/local-panel-window.js';
+import { LOCAL_PANEL_LINUX_WM_CLASS, LOCAL_PANEL_WINDOW_PROCESS_NAMES_WIN32, LOCAL_PANEL_WINDOW_REASON, LOCAL_PANEL_REFUSING_PROXY, LOCAL_PANEL_WARNING_BAR_FLAGS, LOCAL_PANEL_WINDOW_TITLE, localPanelUrl } from '../../shared/local-panel-window.js';
 import { createLinuxLocalPanelWindowPlatform } from '../../src/node/local-panel-window-linux.js';
 import { createMacosLocalPanelWindowPlatform } from '../../src/node/local-panel-window-macos.js';
 import {
@@ -282,7 +282,7 @@ describe('Windows adapter', () => {
     const ops: string[] = [];
     const platform = createWindowsLocalPanelWindowPlatform({
       env: { USERNAME: 'alice' }, tasklist: async () => '', launchNative: async () => true,
-      runOp: async (op) => { ops.push(op.kind); return op.kind === 'launch_app' && op.browser === 'msedge.exe' ? 'ok' : 'not_found'; },
+      runOp: async (op) => { ops.push(op.kind); return op.kind === 'webview2_runtime' || (op.kind === 'launch_app' && op.browser === 'msedge.exe') ? 'ok' : 'not_found'; },
       exists: () => true, nativeUiPath: async () => 'C:\\Program Files\\IM.codes\\aidesk-local-ui.exe',
     });
     expect(await platform.launchAppMode('msedge.exe')).toBe(true);
@@ -291,6 +291,49 @@ describe('Windows adapter', () => {
     expect(await platform.findAppModeBrowsers()).toEqual(['msedge.exe', 'chrome.exe', 'brave.exe']);
     expect(await platform.nativeUiPath()).toBe('C:\\Program Files\\IM.codes\\aidesk-local-ui.exe');
     expect(await createWindowsLocalPanelWindowPlatform({ env: {}, tasklist: async () => '', runOp: async () => 'ok', launchNative: async () => true, exists: () => true, nativeUiPath: async () => 'relative\\aidesk-local-ui.exe' }).nativeUiPath()).toBeUndefined();
-    expect(ops).toEqual(['launch_app', 'launch_app', 'focus']);
+    expect(ops).toEqual(['launch_app', 'launch_app', 'focus', 'webview2_runtime']);
+  });
+
+  it('the native host (a small exe rendering with WebView2) is offered only when the WebView2 runtime is present; otherwise the reason says so and the browser window is used', async () => {
+    const calls: string[] = [];
+    let runtime = 'not_found';
+    const platform = createWindowsLocalPanelWindowPlatform({
+      env: { USERNAME: 'alice' }, tasklist: async () => '', launchNative: async () => true, exists: () => true,
+      runOp: async (op) => { calls.push(op.kind); return op.kind === 'webview2_runtime' ? runtime : 'ok'; },
+      nativeUiPath: async () => 'C:\\Program Files\\IM.codes\\aidesk-local-ui.exe',
+    });
+    expect(platform.nativeHostsOwnInstance).toBe(true);
+    expect(await platform.nativeUiPath()).toBeUndefined();
+    expect(platform.nativeUnavailableReason?.()).toBe(LOCAL_PANEL_WINDOW_REASON.NATIVE_RUNTIME_MISSING);
+    // a runtime installed later is noticed (the missing answer is not cached) and then remembered
+    runtime = 'ok';
+    expect(await platform.nativeUiPath()).toBe('C:\\Program Files\\IM.codes\\aidesk-local-ui.exe');
+    expect(platform.nativeUnavailableReason?.()).toBeUndefined();
+    expect(await platform.nativeUiPath()).toBeDefined();
+    expect(calls.filter((kind) => kind === 'webview2_runtime')).toHaveLength(2);
+    // no host installed at all: no runtime probe, and not reported as a missing runtime
+    const none = createWindowsLocalPanelWindowPlatform({ env: { USERNAME: 'alice' }, tasklist: async () => '', launchNative: async () => true, exists: () => true, runOp: async () => 'ok', nativeUiPath: async () => undefined });
+    expect(await none.nativeUiPath()).toBeUndefined();
+    expect(none.nativeUnavailableReason?.()).toBeUndefined();
+  });
+
+  it('focus and find only ever adopt the panel window when its owner is one of aiDesk\'s own images (browser in app mode or the native host), never a same-titled window of anything else', () => {
+    const focus = decodePowerShell(buildWindowsPanelWindowCommand({ kind: 'focus', pid: 4321 }));
+    const find = decodePowerShell(buildWindowsPanelWindowCommand({ kind: 'find' }));
+    const images = JSON.stringify(LOCAL_PANEL_WINDOW_PROCESS_NAMES_WIN32);
+    const embedded = (script: string): string[] => [...script.matchAll(/D '([A-Za-z0-9+/=]+)'/gu)].map((match) => decodeB64(match[1]!));
+    expect(embedded(focus)).toContain(images);
+    expect(embedded(find)).toContain(images);
+    expect(LOCAL_PANEL_WINDOW_PROCESS_NAMES_WIN32).toEqual(['msedge', 'chrome', 'brave', 'aidesk-local-ui']);
+    expect(focus).toContain('Ours(owner,images)');
+    expect(focus).toContain('owner==pid||(sb.ToString()==title&&Ours(owner,images))');
+    expect(find).toContain('$images -contains $_.ProcessName.ToLowerInvariant()');
+  });
+
+  it('the WebView2 runtime probe reads the Evergreen client id in both machine registry views and the user hive', () => {
+    const script = decodePowerShell(buildWindowsPanelWindowCommand({ kind: 'webview2_runtime' }));
+    expect(script).toContain('{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}');
+    for (const hive of ['HKLM:\\SOFTWARE\\WOW6432Node\\Microsoft\\EdgeUpdate\\Clients', 'HKLM:\\SOFTWARE\\Microsoft\\EdgeUpdate\\Clients', 'HKCU:\\SOFTWARE\\Microsoft\\EdgeUpdate\\Clients']) expect(script).toContain(hive);
+    expect(script).toContain("0.0.0.0");
   });
 });

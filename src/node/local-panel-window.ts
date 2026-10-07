@@ -10,6 +10,8 @@ import {
   isRecordedWindowAlive,
   localPanelUrl,
   openedReasonOf,
+  LOCAL_PANEL_PENDING_LAUNCH_MS,
+  parseLocalPanelPendingLaunch,
   parseLocalPanelWindowRecord,
   planLocalPanelWindow,
   type LocalPanelWindowAttempt,
@@ -35,6 +37,8 @@ export interface LocalPanelWindowPlatform {
   readonly canFocus: boolean;
   /** The native host (when installed) keeps its own single instance: it is simply asked each time, never looked for or focused from outside. */
   readonly nativeHostsOwnInstance?: boolean;
+  /** Why the native host could not be offered (installed but its runtime is missing), read right after `nativeUiPath()` answered undefined. */
+  nativeUnavailableReason?(): LocalPanelWindowReason | undefined;
   focusWindow(window: LocalPanelWindowProcess): Promise<boolean>;
   launchNative(path: string): Promise<boolean>;
   launchAppMode(browser: string): Promise<boolean>;
@@ -65,26 +69,38 @@ export interface OpenLocalPanelWindowInput {
   /** How long to look for the window process after launching it (for the record). Default 3 s in 200 ms steps. */
   locateTimeoutMs?: number;
   sleep?: (ms: number) => Promise<void>;
+  now?: () => number;
 }
 
 const defaultSleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
+/** What is known about the window: it is there, or one was started a moment ago and has not shown up yet. */
+interface ExistingWindow { window?: LocalPanelWindowProcess; launchInProgress?: boolean }
+
 /** The window opened earlier, if it is still there: the record when it still matches a live process, else a fresh look. */
-async function resolveExistingWindow(input: OpenLocalPanelWindowInput): Promise<LocalPanelWindowProcess | undefined> {
-  const record = parseLocalPanelWindowRecord(input.store.read() ?? '');
+async function resolveExistingWindow(input: OpenLocalPanelWindowInput): Promise<ExistingWindow> {
+  const now = input.now ?? Date.now;
+  const raw = input.store.read();
+  const record = parseLocalPanelWindowRecord(raw ?? '');
+  const pending = record ? undefined : parseLocalPanelPendingLaunch(raw ?? '');
   if (record) {
     const probe = await input.platform.probePid(record.pid);
-    if (isRecordedWindowAlive(record, probe)) return { pid: record.pid, startedAtMs: record.startedAtMs };
+    if (isRecordedWindowAlive(record, probe)) return { window: { pid: record.pid, startedAtMs: record.startedAtMs } };
     // The pid is gone, or was recycled by another process: the record is stale.
     input.store.clear();
     input.log('info', { reason: 'stale_window_record_cleared', pid: record.pid }, 'local panel window: stale record removed');
-  } else if (input.store.read() !== undefined) {
+  } else if (raw !== undefined && !pending) {
     input.store.clear();
     input.log('info', { reason: 'unreadable_window_record_cleared' }, 'local panel window: unreadable record removed');
   }
   const found = await input.platform.findWindowProcess();
-  if (found) rememberWindow(input.store, found, LOCAL_PANEL_WINDOW_MECHANISM.APP_MODE);
-  return found;
+  if (found) { rememberWindow(input.store, found, pending?.mechanism ?? LOCAL_PANEL_WINDOW_MECHANISM.APP_MODE); return { window: found }; }
+  if (pending) {
+    // A window was started a moment ago and is not visible yet: do not start another; once the wait is over the start is forgotten.
+    if (now() - pending.atMs < LOCAL_PANEL_PENDING_LAUNCH_MS) return { launchInProgress: true };
+    input.store.clear();
+  }
+  return {};
 }
 
 function rememberWindow(store: LocalPanelWindowRecordStore, window: LocalPanelWindowProcess, mechanism: LocalPanelWindowMechanism): void {
@@ -100,6 +116,8 @@ async function locateLaunchedWindow(input: OpenLocalPanelWindowInput, mechanism:
     if (found) { rememberWindow(input.store, found, mechanism); return; }
     await sleep(200);
   }
+  // Started but not visible yet (a slow machine): remember that, so a quick second click does not start a second window.
+  input.store.write(JSON.stringify({ pendingLaunch: { atMs: (input.now ?? Date.now)(), mechanism } }));
 }
 
 async function runAttempt(input: OpenLocalPanelWindowInput, attempt: LocalPanelWindowAttempt): Promise<boolean> {
@@ -129,7 +147,9 @@ export async function openLocalPanelWindow(input: OpenLocalPanelWindowInput): Pr
     const hasDesktop = panelRunning ? await input.platform.hasDesktop() : false;
     const nativePath = panelRunning && hasDesktop ? await input.platform.nativeUiPath() : undefined;
     const selfManagedNative = nativePath !== undefined && input.platform.nativeHostsOwnInstance === true;
-    const existing = panelRunning && hasDesktop && !selfManagedNative ? await resolveExistingWindow(input) : undefined;
+    const known: ExistingWindow = panelRunning && hasDesktop && !selfManagedNative ? await resolveExistingWindow(input) : {};
+    const existing = known.window;
+    if (known.launchInProgress) return finish({ reason: LOCAL_PANEL_WINDOW_REASON.LAUNCH_IN_PROGRESS });
     const appModeBrowsers = panelRunning && hasDesktop && !existing ? await input.platform.findAppModeBrowsers() : [];
     const plan = planLocalPanelWindow({
       platform: input.platform.platform,
@@ -149,7 +169,9 @@ export async function openLocalPanelWindow(input: OpenLocalPanelWindowInput): Pr
       }
       return finish({ reason: plan.reason });
     }
-    trail.push(...plan.skipped);
+    // The host is installed but cannot run here (e.g. no WebView2 runtime): say so instead of "not installed".
+    const unavailable = nativePath === undefined ? input.platform.nativeUnavailableReason?.() : undefined;
+    trail.push(...plan.skipped.map((reason) => (reason === LOCAL_PANEL_WINDOW_REASON.NATIVE_UI_MISSING && unavailable ? unavailable : reason)));
     for (const attempt of plan.attempts) {
       let ok = false;
       try { ok = await runAttempt(input, attempt); } catch { ok = false; }

@@ -10,6 +10,8 @@ import { existsSync } from 'node:fs';
 import { win32 } from 'node:path';
 import {
   LOCAL_PANEL_APP_MODE_BROWSERS,
+  LOCAL_PANEL_WINDOW_REASON,
+  LOCAL_PANEL_WINDOW_PROCESS_NAMES_WIN32,
   LOCAL_PANEL_WINDOW_TITLE,
   buildLocalPanelAppModeArgs,
 } from '../../shared/local-panel-window.js';
@@ -29,7 +31,9 @@ export type WindowsPanelOp =
   | { kind: 'focus'; pid: number }
   /** Look for the panel window in the user's session; answers `ok:<pid>:<startedAtMs>` or not_found. */
   | { kind: 'find' }
-  | { kind: 'default_browser'; url: string };
+  | { kind: 'default_browser'; url: string }
+  /** Is the WebView2 runtime the native window host renders with installed (for the user, or machine-wide)? `ok` or `not_found`. */
+  | { kind: 'webview2_runtime' };
 
 /** What a script may answer: one of the words, or `ok:<pid>:<startedAtMs>` from the find operation. */
 const WINDOWS_PANEL_RESULT_RE = /^(?:ok|not_found|failed|ok:\d+:\d+)$/u;
@@ -75,13 +79,18 @@ public static class PanelWin{
  [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
  [DllImport("user32.dll",CharSet=CharSet.Unicode)] public static extern int GetWindowText(IntPtr h,StringBuilder s,int n);
  [DllImport("user32.dll")] public static extern void keybd_event(byte vk,byte scan,uint flags,UIntPtr extra);
- public static bool Focus(uint pid,string title){
+ static bool Ours(uint pid,string[] images){
+  try{var name=System.Diagnostics.Process.GetProcessById((int)pid).ProcessName;foreach(var n in images){if(string.Equals(n,name,StringComparison.OrdinalIgnoreCase)) return true;}}catch{}
+  return false;
+ }
+ public static bool Focus(uint pid,string title,string[] images){
   IntPtr found=IntPtr.Zero;
   EnumWindows((h,l)=>{
    if(!IsWindowVisible(h)) return true;
    uint owner;GetWindowThreadProcessId(h,out owner);
    var sb=new StringBuilder(256);GetWindowText(h,sb,256);
-   if(owner==pid||sb.ToString()==title){found=h;return false;}
+   // the recorded process, or a window with the panel's title that belongs to one of our own images (a same-titled window of anything else is not ours)
+   if(owner==pid||(sb.ToString()==title&&Ours(owner,images))){found=h;return false;}
    return true;},IntPtr.Zero);
   if(found==IntPtr.Zero) return false;
   if(IsIconic(found)) ShowWindow(found,9);
@@ -91,11 +100,21 @@ public static class PanelWin{
 }
 '@
 Add-Type -TypeDefinition $src
-if([PanelWin]::Focus(${op.pid},(D '${b64(LOCAL_PANEL_WINDOW_TITLE)}'))){Report 'ok'}else{Report 'not_found'}`;
+$images=(D '${b64(JSON.stringify(LOCAL_PANEL_WINDOW_PROCESS_NAMES_WIN32))}') | ConvertFrom-Json
+if([PanelWin]::Focus(${op.pid},(D '${b64(LOCAL_PANEL_WINDOW_TITLE)}'),[string[]]@($images))){Report 'ok'}else{Report 'not_found'}`;
   } else if (op.kind === 'find') {
     body = String.raw`$title=D '${b64(LOCAL_PANEL_WINDOW_TITLE)}'
-$p=Get-Process | Where-Object{$_.MainWindowHandle -ne 0 -and $_.MainWindowTitle -eq $title} | Sort-Object Id | Select-Object -First 1
+$images=(D '${b64(JSON.stringify(LOCAL_PANEL_WINDOW_PROCESS_NAMES_WIN32))}') | ConvertFrom-Json
+$p=Get-Process | Where-Object{$_.MainWindowHandle -ne 0 -and $_.MainWindowTitle -eq $title -and ($images -contains $_.ProcessName.ToLowerInvariant())} | Sort-Object Id | Select-Object -First 1
 if($p){Report ('ok:{0}:{1}' -f $p.Id,([DateTimeOffset]$p.StartTime).ToUnixTimeMilliseconds())}else{Report 'not_found'}`;
+  } else if (op.kind === 'webview2_runtime') {
+    // The Evergreen runtime registers its version under this client id, per machine (both registry views) or per user; 0.0.0.0 = removed.
+    body = String.raw`$id='{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}'
+$ok=$false
+foreach($key in @("HKLM:\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\$id","HKLM:\SOFTWARE\Microsoft\EdgeUpdate\Clients\$id","HKCU:\SOFTWARE\Microsoft\EdgeUpdate\Clients\$id")){
+  if(Test-Path -LiteralPath $key){$pv=(Get-ItemProperty -LiteralPath $key).pv;if($pv -and $pv -ne '0.0.0.0'){$ok=$true;break}}
+}
+if($ok){Report 'ok'}else{Report 'not_found'}`;
   } else {
     body = String.raw`Start-Process -FilePath (D '${b64(op.url)}')
 Report 'ok'`;
@@ -175,6 +194,8 @@ const realDeps = (): WindowsPanelWindowDeps => {
 
 export function createWindowsLocalPanelWindowPlatform(overrides: Partial<WindowsPanelWindowDeps> = {}): LocalPanelWindowPlatform {
   const deps = { ...realDeps(), ...overrides };
+  let runtimePresent = false;
+  let runtimeMissing = false;
   /** `ok:<pid>:<startedAtMs>` from the find operation. */
   const parseFound = (answer: string | undefined): LocalPanelWindowProcess | undefined => {
     const match = /^ok:(\d+):(\d+)$/u.exec(answer ?? '');
@@ -194,9 +215,21 @@ export function createWindowsLocalPanelWindowPlatform(overrides: Partial<Windows
       if (out === undefined || out.trim() === '') return true;
       return out.split(/\r?\n/u).some((line) => Number(/^"[^"]*","\d+","[^"]*","(\d+)"/u.exec(line)?.[1] ?? -1) >= 1);
     },
+    // The native host keeps its own single instance (a named mutex; a second start restores and raises the window), so the decision
+    // layer simply starts it each time.
+    nativeHostsOwnInstance: true,
+    nativeUnavailableReason: () => runtimeMissing ? LOCAL_PANEL_WINDOW_REASON.NATIVE_RUNTIME_MISSING : undefined,
     async nativeUiPath() {
+      runtimeMissing = false;
       const path = await deps.nativeUiPath();
-      return path !== undefined && win32.isAbsolute(path) ? path : undefined;
+      if (path === undefined || !win32.isAbsolute(path)) return undefined;
+      // The host renders with WebView2: without its runtime the host would only exit, so the browser window is used instead.
+      // (A present runtime is remembered; a missing one is looked for again on the next click, the user may install it.)
+      if (!runtimePresent) {
+        runtimePresent = (await deps.runOp({ kind: 'webview2_runtime' })) === 'ok';
+        if (!runtimePresent) { runtimeMissing = true; return undefined; }
+      }
+      return path;
     },
     async findAppModeBrowsers() {
       // The user's own session resolves each (their App Paths, their LOCALAPPDATA); the script answers not_found per browser.

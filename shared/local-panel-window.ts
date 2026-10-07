@@ -8,7 +8,7 @@
  * address bar, own window) -> the default browser. A machine without a desktop gets no window attempt at all: the panel stays
  * reachable and the URL is logged.
  */
-import { AIDESK_PRODUCT_NAME } from './aidesk-product.js';
+import { AIDESK_LOCAL_UI_EXECUTABLE_NAME, AIDESK_PRODUCT_NAME } from './aidesk-product.js';
 import { REMOTE_DESKTOP_LOCAL_MANAGEMENT } from './remote-desktop-local-management.js';
 
 export type LocalPanelPlatform = 'win32' | 'darwin' | 'linux';
@@ -24,6 +24,10 @@ export const LOCAL_PANEL_WINDOW_REASON = Object.freeze({
   NO_DESKTOP: 'no_desktop_session',
   NO_USER_SESSION: 'no_user_session',
   NATIVE_UI_MISSING: 'native_window_not_installed',
+  /** The native window host is installed but the runtime it renders with (Windows: WebView2) is not: the browser window is used. */
+  NATIVE_RUNTIME_MISSING: 'native_runtime_missing',
+  /** A window was just started and cannot be found yet (a slow machine): this click does not start another one. */
+  LAUNCH_IN_PROGRESS: 'launch_in_progress',
   NO_APP_MODE_BROWSER: 'no_app_mode_browser_found',
   LAUNCH_FAILED: 'launch_failed',
   URL_REJECTED: 'url_not_allowed',
@@ -101,6 +105,12 @@ export const LOCAL_PANEL_WARNING_BAR_FLAGS: readonly string[] = Object.freeze([
 ]);
 
 /**
+ * Process image names (no extension) that may own the panel window on Windows: the browsers used in app mode and aiDesk's own
+ * window host. A window that merely has the same title but belongs to anything else is never ours to focus or to adopt.
+ */
+export const LOCAL_PANEL_WINDOW_PROCESS_NAMES_WIN32: readonly string[] = Object.freeze(['msedge', 'chrome', 'brave', AIDESK_LOCAL_UI_EXECUTABLE_NAME]);
+
+/**
  * The X11 WM_CLASS / Wayland app_id of the panel window on Linux, and the desktop entry's StartupWMClass: the desktop shell matches the
  * window to that entry, so the taskbar/dock/Alt-Tab show aiDesk's own name and icon instead of the browser's.
  */
@@ -124,6 +134,25 @@ export function buildLocalPanelAppModeArgs(profileDir: string, platform?: LocalP
     '--disable-features=Translate',
     ...(platform === 'linux' ? [`--class=${LOCAL_PANEL_LINUX_WM_CLASS}`, `--name=${LOCAL_PANEL_LINUX_WM_CLASS}`] : []),
   ];
+}
+
+/** How long a started-but-not-yet-visible window blocks a second start (a slow machine needs this; a dead start must not block for long). */
+export const LOCAL_PANEL_PENDING_LAUNCH_MS = 20_000;
+
+/** Left in the record file when a window was started but could not be located yet, so a quick second click does not start another. */
+export interface LocalPanelPendingLaunch {
+  atMs: number;
+  mechanism: LocalPanelWindowMechanism;
+}
+
+export function parseLocalPanelPendingLaunch(raw: string): LocalPanelPendingLaunch | undefined {
+  try {
+    const value = (JSON.parse(raw) as Record<string, unknown> | null)?.pendingLaunch as Record<string, unknown> | undefined;
+    const mechanisms = Object.values(LOCAL_PANEL_WINDOW_MECHANISM) as string[];
+    if (!value || typeof value.atMs !== 'number' || !Number.isFinite(value.atMs)) return undefined;
+    if (typeof value.mechanism !== 'string' || !mechanisms.includes(value.mechanism)) return undefined;
+    return { atMs: value.atMs, mechanism: value.mechanism as LocalPanelWindowMechanism };
+  } catch { return undefined; }
 }
 
 export interface LocalPanelWindowRecord {
