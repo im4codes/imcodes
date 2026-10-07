@@ -16,6 +16,9 @@
  * test must never touch a real ~/.imcodes.
  */
 import { execFileSync } from 'node:child_process';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('../../src/store/session-store.js', () => ({
@@ -56,11 +59,19 @@ class BrowserModel {
   /** While true every raw byte is discarded, as the real view does until a full frame. */
   dropping = false;
   fullFrames = 0;
+  /** A browser that is slow to apply what it received: raw bytes reach xterm this many ms after they arrived. */
+  constructor(private readonly rawLagMs = 0) {}
 
   private write(data: string | Uint8Array): void {
     this.chain = this.chain.then(() => new Promise<void>((resolve) => this.term.write(data, resolve)));
   }
-  raw(data: Buffer): void { if (!this.dropping) this.write(new Uint8Array(data)); }
+  raw(data: Buffer): void {
+    if (this.dropping) return;
+    const bytes = new Uint8Array(data);
+    if (this.rawLagMs <= 0) { this.write(bytes); return; }
+    // Queued in arrival order behind the lag, so the order of writes is the order of arrival.
+    this.chain = this.chain.then(() => sleep(this.rawLagMs)).then(() => new Promise<void>((resolve) => this.term.write(bytes, resolve)));
+  }
   diff(diff: TerminalDiff): void {
     if (!diff.fullFrame) return;
     this.lines = applyDiffToRows(this.lines, diff);
@@ -77,15 +88,21 @@ class BrowserModel {
   cursor(): [number, number] { return [this.term.buffer.active.cursorX, this.term.buffer.active.cursorY]; }
 }
 
-function paneScreen(session: string): string[] {
-  const rows = tmux('capture-pane', '-p', '-t', session).split('\n').slice(0, ROWS).map((line) => line.trimEnd());
+/**
+ * The pane's screen and cursor in ONE tmux invocation: tmux runs the commands of one invocation back to back, so the two describe the
+ * same instant. Two separate calls (what this used to be) can straddle a byte of output and pair a screen with a cursor that never
+ * existed together.
+ */
+function paneObservation(session: string): { screen: string[]; cursor: [number, number]; title: string } {
+  const marker = '@@IMCODES-PANE-META@@';
+  const out = tmux('capture-pane', '-p', '-t', session, ';', 'display-message', '-p', '-t', session, `${marker}#{cursor_x},#{cursor_y},#{pane_title}`);
+  const at = out.indexOf(marker);
+  const rows = out.slice(0, at).split('\n').slice(0, ROWS).map((line) => line.trimEnd());
   while (rows.length < ROWS) rows.push('');
-  return rows;
+  const [x, y, ...title] = out.slice(at + marker.length).trim().split(',');
+  return { screen: rows, cursor: [Number(x), Number(y)], title: title.join(',') };
 }
-function paneCursor(session: string): [number, number] {
-  const [x, y] = tmux('display-message', '-p', '-t', session, '#{cursor_x},#{cursor_y}').trim().split(',').map(Number);
-  return [x!, y!];
-}
+const paneScreen = (session: string): string[] => paneObservation(session).screen;
 
 describe.skipIf(SKIP)('terminal resync fidelity (real tmux, real streamer, real xterm)', { timeout: 90_000, retry: 2 }, () => {
   let session: string;
@@ -93,11 +110,10 @@ describe.skipIf(SKIP)('terminal resync fidelity (real tmux, real streamer, real 
   let model: BrowserModel;
   let unsubscribe: () => void;
 
-  const start = async (command: string) => {
+  const start = async (command: string, rawLagMs = 0) => {
     tmux('new-session', '-d', '-s', session, '-x', String(COLS), '-y', String(ROWS), command);
-    await sleep(250);
     streamer = new TerminalStreamer();
-    model = new BrowserModel();
+    model = new BrowserModel(rawLagMs);
     unsubscribe = streamer.subscribe({
       sessionName: session,
       send: (diff) => model.diff(diff),
@@ -115,24 +131,34 @@ describe.skipIf(SKIP)('terminal resync fidelity (real tmux, real streamer, real 
     await until(() => model.fullFrames > before, 20_000, 'the resync snapshot');
   };
   /**
-   * The model must END UP equal to the pane (screen and cursor). Polled with a
-   * bounded timeout rather than after a fixed sleep: how long the last bytes and
-   * the settle snapshot take depends on the machine (a one-core CI runner running
-   * tmux, the flood and node together is an order of magnitude slower than a
-   * laptop), and a fixed sleep turned that into a flaky test.
+   * The model must END UP equal to the pane (screen and cursor). Polled with a bounded timeout rather than after a fixed sleep (how
+   * long the last bytes and the settle snapshot take depends on the machine).
+   *
+   * Every verdict is on ONE atomic pane observation, taken after the model has applied everything it was handed, and the assertion
+   * reads that same observation. Comparing a first reading and then asserting on a second one (the old shape) let the pane move on
+   * between the two: with the last output a newline that arrives after a pause, the check passed on the state before the newline and
+   * the assertion failed on the state after it.
    */
   const expectSameAsPane = async () => {
-    const equal = () => JSON.stringify([model.screen(), model.cursor()]) === JSON.stringify([paneScreen(session), paneCursor(session)]);
     const deadline = Date.now() + 20_000;
-    while (Date.now() < deadline) {
+    for (;;) {
       await model.settled();
-      if (equal()) break;
+      const observed = paneObservation(session);
+      const sameNow = JSON.stringify([model.screen(), model.cursor()]) === JSON.stringify([observed.screen, observed.cursor]);
+      if (sameNow || Date.now() >= deadline) {
+        expect(model.screen()).toEqual(observed.screen);
+        expect(model.cursor()).toEqual(observed.cursor);
+        return;
+      }
       await sleep(100);
     }
-    await model.settled();
-    expect(model.screen()).toEqual(paneScreen(session));
-    expect(model.cursor()).toEqual(paneCursor(session));
   };
+  /**
+   * An in-band barrier: the program sets the pane title as its LAST output. tmux parses the stream in order, so once the title is
+   * `title` every byte before it has been applied to the pane's screen and cursor - unlike "the last text is visible", which holds
+   * while a newline that follows it is still on its way.
+   */
+  const untilPaneTitle = (title: string) => until(() => paneObservation(session).title === title, 20_000, `the program to set the pane title to ${title}`);
 
   beforeEach(() => { session = `deck_e2eresync${RUN_ID}${++sequence}_w1`; });
   afterEach(async () => {
@@ -145,22 +171,46 @@ describe.skipIf(SKIP)('terminal resync fidelity (real tmux, real streamer, real 
     await start(`bash --norc --noprofile -c 'PS1="$ " bash --norc --noprofile -i'`);
     typeLiteral('echo hello');
     tmux('send-keys', '-t', session, 'Enter');
-    await sleep(300);
+    await until(() => paneScreen(session).includes('hello'), 20_000, 'the first command to print its output');
     await loseBytesAndResync();
     typeLiteral('echo typed-after-resync');
-    await sleep(300);
+    await until(() => paneScreen(session).join('\n').includes('$ echo typed-after-resync'), 20_000, 'the typed text to be echoed at the prompt');
     await expectSameAsPane();
     expect(model.screen().join('\n')).toContain('$ echo typed-after-resync');
   });
 
-  it('a carriage-return counter keeps updating on its own row after a resync', async () => {
-    await start(`bash --norc --noprofile -c 'echo header; for i in $(seq 1 60); do printf "\\rcount %d   " $i; sleep 0.05; done; echo; sleep 30'`);
-    await sleep(600);
-    await loseBytesAndResync();
-    await until(async () => paneScreen(session).join('\n').includes('count 60'), 20_000, 'the counter to finish');
-    await expectSameAsPane();
-    expect(model.screen().join('\n')).toContain('count 60');
-  });
+  /**
+   * The counter's last output is a newline that comes AFTER everything the browser and the pane agree on: "count 60" is on screen
+   * (cursor right after it) and the program then waits at a gate. The gate is opened right after a moment at which model and pane
+   * were seen to agree - exactly when a verdict that reads the pane twice would pass on the first reading and fail on the second, as
+   * happened on CI (`expected [ 11, 1 ] to deeply equal [ 0, 2 ]`, three attempts in a row, each ending the moment the counter did).
+   * `rawLagMs` is a browser that applies bytes that long after receiving them.
+   */
+  const counterAfterResync = async (rawLagMs: number) => {
+    const gateDir = mkdtempSync(join(tmpdir(), 'imcodes-resync-gate-'));
+    const gate = join(gateDir, 'open');
+    try {
+      await start(`bash --norc --noprofile -c 'echo header; for i in $(seq 1 60); do printf "\\rcount %d   " $i; sleep 0.05; done; while [ ! -e ${gate} ]; do sleep 0.005; done; echo; printf "\\033]2;COUNTER-DONE\\007"; sleep 30'`, rawLagMs);
+      await until(() => Number(/count (\d+)/.exec(paneScreen(session).join('\n'))?.[1] ?? 0) >= 10, 20_000, 'the counter to be running'); // a value stays on screen for 50 ms: "reached", not "equal to"
+      await loseBytesAndResync();
+      // Everything but the final newline is out: wait until the model shows exactly what the pane shows, cursor right after "count 60".
+      await until(async () => {
+        await model.settled();
+        const observed = paneObservation(session);
+        return observed.cursor[0] === 11 && observed.cursor[1] === 1
+          && JSON.stringify([model.screen(), model.cursor()]) === JSON.stringify([observed.screen, observed.cursor]);
+      }, 30_000, 'model and pane to agree with the counter finished and the program at its gate');
+      writeFileSync(gate, ''); // the newline is now in flight
+      await untilPaneTitle('COUNTER-DONE');
+      await expectSameAsPane();
+      expect(model.screen().join('\n')).toContain('count 60');
+      expect(model.cursor()).toEqual([0, 2]); // on the row below the counter, where the final newline left it
+    } finally {
+      rmSync(gateDir, { recursive: true, force: true });
+    }
+  };
+  it('a carriage-return counter keeps updating on its own row after a resync (the final newline follows a moment of agreement)', () => counterAfterResync(0));
+  it('... also when the browser applies bytes 40 ms after it received them', () => counterAfterResync(40));
 
   it('leaving a full-screen application after a resync restores the shell screen', async () => {
     const app = [
@@ -206,7 +256,7 @@ describe.skipIf(SKIP)('terminal resync fidelity (real tmux, real streamer, real 
     await start(`bash --norc --noprofile -c 'PS1="$ " bash --norc --noprofile -i'`);
     typeLiteral('yes flood-line');
     tmux('send-keys', '-t', session, 'Enter');
-    await sleep(800);
+    await until(() => paneScreen(session).filter(Boolean).length >= ROWS - 1, 20_000, 'the flood to fill the screen');
     const requestedAt = Date.now();
     model.dropping = true;
     streamer.requestSnapshot(session);
@@ -217,7 +267,8 @@ describe.skipIf(SKIP)('terminal resync fidelity (real tmux, real streamer, real 
     await until(() => model.fullFrames >= 2, 30_000, 'a snapshot while the flood runs');
     console.log(JSON.stringify({ msToSnapshotUnderFlood: Date.now() - requestedAt }));
     tmux('send-keys', '-t', session, 'C-c');
-    await sleep(500);
+    // The prompt is the last thing the shell prints after the flood, and tmux parses in order: once it is the last row, nothing of the flood is left.
+    await until(() => paneScreen(session).filter(Boolean).at(-1) === '$', 20_000, 'the shell prompt after the flood');
     model.dropping = false;
     await expectSameAsPane();
   });

@@ -2,7 +2,7 @@ import { execFileSync } from 'node:child_process';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { EXEC_HELPER_ENV_SWITCH } from '../../shared/exec-helper-protocol.js';
 import { ProcessStartReader } from '../../src/util/process-start.js';
 import { __resetExecHelperForTests, getExecHelperStats, shutdownExecHelper, startExecHelper } from '../../src/util/exec-helper.js';
@@ -59,7 +59,8 @@ describe.skipIf(!RUN)('tmux and process-start through the exec helper', () => {
   it('keeps send-keys in issue order for one session (per-session write ordering)', async () => {
     const lines = Array.from({ length: 30 }, (_, i) => `line-${String(i).padStart(2, '0')}`);
     for (const line of lines) await tmux.sendKeys(session, line);
-    await new Promise((resolve) => setTimeout(resolve, 300));
+    // The terminal echoes in order, so the last line on screen means every earlier one has been echoed (no fixed wait for a slow machine).
+    await vi.waitFor(async () => { expect((await tmux.capturePane(session, 200)).join('\n')).toContain('line-29'); }, { timeout: 20_000, interval: 25 });
     const pane = (await tmux.capturePane(session, 200)).join('\n');
     const seen = [...pane.matchAll(/line-(\d{2})/g)].map((m) => Number(m[1]));
     const firstOfEach = seen.filter((n, i) => seen.indexOf(n) === i);
