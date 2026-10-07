@@ -111,6 +111,19 @@ export const LOCAL_PANEL_WARNING_BAR_FLAGS: readonly string[] = Object.freeze([
 export const LOCAL_PANEL_WINDOW_PROCESS_NAMES_WIN32: readonly string[] = Object.freeze(['msedge', 'chrome', 'brave', AIDESK_LOCAL_UI_EXECUTABLE_NAME]);
 
 /**
+ * Names the Windows panel window host (native/aidesk-panel-host-windows) and the node agree on; panel_host_ids.h carries the same
+ * values and test/spec/aidesk-panel-host-windows.test.ts binds the two.
+ */
+export const LOCAL_PANEL_WINDOWS_HOST = Object.freeze({
+  singleInstanceMutex: 'Local\\to.aidesk.localpanel',
+  windowClass: 'AideskLocalPanelWindow',
+  appUserModelId: 'to.aidesk.localpanel',
+  /** Exit code of the host when the WebView2 runtime is not installed. */
+  exitRuntimeMissing: 3,
+  retryMilliseconds: 2000,
+} as const);
+
+/**
  * The X11 WM_CLASS / Wayland app_id of the panel window on Linux, and the desktop entry's StartupWMClass: the desktop shell matches the
  * window to that entry, so the taskbar/dock/Alt-Tab show aiDesk's own name and icon instead of the browser's.
  */

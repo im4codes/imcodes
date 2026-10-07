@@ -1,5 +1,6 @@
 /**
- * The panel window host packaging skeleton is DEFERRED: the panel page is the one UI, shown in the app window and in the browser fallback.
+ * The Windows panel window host (WebView2) is BUILT in CI by its own job (ci.yml: aidesk-panel-host-windows) and the release action can
+ * build, sign and describe it, but shipping it to installed nodes is DEFERRED: the panel page is the one UI, shown in the app window and in the browser fallback.
  * The FLTK window and its pinned sources are gone; the signing + manifest skeleton (and node-side verified discovery) is kept for the
  * Windows WebView2 host. It is NOT wired into either release workflow and nothing is added to the artifact set; the checks below
  * keep it internally consistent (signing order) and pin that nothing wires it by accident.
@@ -34,7 +35,10 @@ describe('native aiDesk window release wiring', () => {
     expect(action).toContain("throw 'The Windows release-signing certificate must be imported");
   });
 
-  it('builds nothing itself and carries no FLTK / jsoncpp sources or fetch step (the window host is the app\'s own WebView)', () => {
+  it('builds the WebView2 host with the shared build script BEFORE signing it, and carries no FLTK / jsoncpp sources or ad-hoc downloads', () => {
+    const buildAt = action.indexOf('native\\aidesk-panel-host-windows\\build.ps1');
+    expect(buildAt).toBeGreaterThan(-1);
+    expect(buildAt).toBeLessThan(action.indexOf('-Mode Sign'));
     expect(action).not.toMatch(/fltk|jsoncpp|fetch-aidesk-ui-deps|build-ui\.(sh|ps1)/iu);
     expect(action).not.toMatch(/curl|wget|Invoke-WebRequest/iu);
   });

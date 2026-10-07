@@ -310,6 +310,27 @@ jobs:
         env:
           IMCODES_MUX: wezterm
 
+  aidesk-panel-host-windows:
+    name: aiDesk panel window host (Windows build)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION_PRIMARY }}
+          cache: 'npm'
+      - run: bash ./scripts/ci-npm-ci.sh .
+      - name: Panel window host contract tests
+        run: npx vitest run test/spec/aidesk-panel-host-windows.test.ts test/spec/aidesk-local-ui-release-wiring.test.ts
+      - name: Build the panel window host (MSVC, pinned WebView2 SDK, static loader)
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $out = .\native\aidesk-panel-host-windows\build.ps1 -ArtifactRoot "$env:RUNNER_TEMP\aidesk-local-ui\win32-x64"
+          if ($LASTEXITCODE -ne 0) { throw 'building the panel window host failed' }
+          $out | Select-Object -Last 1 | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+          Get-Item "$env:RUNNER_TEMP\aidesk-local-ui\win32-x64\aidesk-local-ui.exe" | Select-Object Name, Length
+
   windows-conpty-tests:
     name: Unit Tests (Windows ConPTY)
     runs-on: windows-latest

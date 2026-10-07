@@ -1,9 +1,9 @@
-name: Package and sign the aiDesk panel window host
+name: Build, sign and describe the aiDesk panel window host
 description: >
-  The reusable release skeleton for a native panel-window host executable (Windows: signed with the release certificate, THEN described
-  by a manifest the controlled node verifies before it ever launches it; see scripts/aidesk-ui-artifact.mjs and
-  src/node/aidesk-local-ui-artifact.ts). It builds nothing itself: the step that compiles the host (a WebView2 window) writes the
-  executable to dist-node-exe/aidesk-local-ui/<os>-<arch>/ first. NOT wired into any workflow yet (see
+  Builds the Windows panel window host (aidesk-local-ui.exe, a WebView2 window: native/aidesk-panel-host-windows/build.ps1), signs it
+  with the release certificate, THEN describes it by a manifest the controlled node verifies before it ever launches it (see
+  scripts/aidesk-ui-artifact.mjs and src/node/aidesk-local-ui-artifact.ts). Output: dist-node-exe/aidesk-local-ui/win32-x64/. NOT wired
+  into the release workflows yet -- shipping it to installed nodes is the distribution round (see
   test/spec/aidesk-local-ui-release-wiring.test.ts). Build time only: nothing is downloaded when the product runs.
 inputs:
   version:
@@ -20,7 +20,7 @@ inputs:
 runs:
   using: composite
   steps:
-    - name: Sign and describe the panel window host (Windows)
+    - name: Build, sign and describe the panel window host (Windows)
       if: runner.os == 'Windows'
       shell: powershell
       env:
@@ -33,6 +33,8 @@ runs:
           throw 'The Windows release-signing certificate must be imported before the panel window host is signed.'
         }
         $art = 'dist-node-exe\aidesk-local-ui\win32-x64'
+        & .\native\aidesk-panel-host-windows\build.ps1 -ArtifactRoot $art
+        if ($LASTEXITCODE -ne 0) { throw 'building the panel window host failed' }
         $exe = Join-Path $art 'aidesk-local-ui.exe'
         if (-not (Test-Path $exe)) { throw "The panel window host was not built at $exe." }
         & .\scripts\windows-sign-release-artifact.ps1 -Mode Sign -ArtifactPath $exe `
