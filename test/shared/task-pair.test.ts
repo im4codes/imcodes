@@ -375,15 +375,14 @@ describe('task-pair marker grammar', () => {
     expect(body).toContain('what changed, the worktree path and HEAD or file paths, and your validation result');
   });
 
-  it('ships a contract telling Brain DISPATCH is normally enough on its own, auto-queuing over the limit instead of needing QUEUE first', () => {
+  it('ships a contract telling Brain pair_dispatch is normally enough on its own, auto-queuing over the limit, and teaches no QUEUE/DISPATCH marker', () => {
     const body = buildTaskPairMarkerContract();
-    expect(body).toContain('DISPATCH is normally all you need');
-    expect(body).toContain('auto-queues it');
-    expect(body).toContain('urgent=true jumps the queue');
-    expect(body).toContain('no need to pick QUEUE just to defer work');
-    // QUEUE stays documented for compatibility, not removed from the contract.
-    expect(body).toContain('QUEUE <taskId> title="..." ...');
-    expect(body).toContain('always enqueues');
+    expect(body).toContain('pair_dispatch auto-queues an existing pair when capacity is unavailable');
+    expect(body).toContain('no need to defer work yourself');
+    // Brain drives pairs with the MCP tools only: the marker forms are no longer taught (the daemon still parses them).
+    expect(body).not.toContain('DISPATCH is normally all you need');
+    expect(body).not.toContain('QUEUE <taskId> title="..." ...');
+    expect(body).not.toContain('urgent=true');
   });
 
   it('ships a contract telling both roles to ask (send a message) instead of leaving a question only in their own reply', () => {
