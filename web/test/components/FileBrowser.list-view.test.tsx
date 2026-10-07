@@ -379,6 +379,19 @@ describe('FileBrowser table view: an older machine', () => {
     expect((view.container as HTMLElement).querySelector('.fb-list-notice')?.textContent).toContain('file_browser.notice_capped');
   });
 
+  it('the Windows drive list is not "an older machine": its entries have no details by nature, so no column is disabled or explained away', () => {
+    const { view, respond, calls } = mount({ directoryQuery: true });
+    respond(calls[0]!.requestId, [{ name: 'C:\\', isDir: true }, { name: 'D:\\', isDir: true }], {}, '__imcodes_windows_drives__');
+    const container = view.container as HTMLElement;
+    for (const key of ['size', 'modified', 'created']) {
+      expect(header(container, key).disabled).toBe(false);
+      expect(header(container, key).title).not.toBe('file_browser.meta_unsupported');
+    }
+    const row = [...container.querySelectorAll('.fb-node')].find((el) => el.textContent?.includes('C:'))!;
+    expect((row.querySelector('.fb-col-modified') as HTMLElement).title).toBe('');
+    expect(container.textContent).not.toContain('file_browser.meta_unsupported');
+  });
+
   it('a machine that reports no creation time (Linux) disables only that column', () => {
     const { view, respond, calls } = mount({ directoryQuery: true });
     respond(calls[0]!.requestId, FILES.map(({ birthtimeMs: _drop, ...rest }) => rest), {});

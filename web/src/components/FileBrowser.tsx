@@ -1914,7 +1914,10 @@ export function FileBrowser({
   const listDetailsPresent = Boolean(rootChildren?.some((child) => child.mtimeMs !== undefined));
   // A column the machine cannot fill is not sortable, and says why.
   const unavailableReasons: Partial<Record<FileBrowserSortKey, string>> = {};
-  if (listView && rootChildren && rootChildren.length > 0) {
+  // The Windows drive list has no sizes or times to report (a drive is a volume,
+  // shown with its capacity): that is not an older machine, so say nothing.
+  const showingDrives = rootNode?.id === WINDOWS_DRIVES_ROOT;
+  if (listView && !showingDrives && rootChildren && rootChildren.length > 0) {
     if (!listDetailsPresent) {
       for (const key of [FILE_BROWSER_SORT_KEYS.SIZE, FILE_BROWSER_SORT_KEYS.MODIFIED, FILE_BROWSER_SORT_KEYS.CREATED]) {
         unavailableReasons[key] = t('file_browser.meta_unsupported');
@@ -2021,9 +2024,10 @@ export function FileBrowser({
     locale: uiLocale,
     detailsPresent: listDetailsPresent,
     createdUnavailable,
+    drivesList: showingDrives,
     forceExpanded,
     emptyText: emptyFilterText,
-  } : undefined), [createdUnavailable, emptyFilterText, forceExpanded, listDetailsPresent, listView, narrow, nowMinute, uiLocale]);
+  } : undefined), [createdUnavailable, emptyFilterText, forceExpanded, listDetailsPresent, listView, narrow, nowMinute, showingDrives, uiLocale]);
 
   const tree = (
     <div
@@ -2899,6 +2903,8 @@ interface FsListColumns {
   /** Any entry of the root listing came with file details (an older machine sends none). */
   detailsPresent: boolean;
   createdUnavailable: boolean;
+  /** The listing is the Windows drive list, which carries no file details by nature. */
+  drivesList?: boolean;
   /** Directories shown open only because something below them matched the filter. */
   forceExpanded?: Set<string>;
   /** Shown instead of the empty-directory dash when the filter matched nothing. */
@@ -3051,14 +3057,16 @@ function FsTreeNode({
  */
 const FsListCells = memo(function FsListCells({ node, columns, stacked = false }: { node: FsNode; columns: FsListColumns; stacked?: boolean }) {
   const { t } = useTranslation();
-  const missingTitle = !columns.detailsPresent ? t('file_browser.meta_unsupported') : t('file_browser.detail_unreadable');
+  const missingTitle = columns.drivesList
+    ? undefined
+    : !columns.detailsPresent ? t('file_browser.meta_unsupported') : t('file_browser.detail_unreadable');
   const size = node.isDir
     ? { text: '—', title: undefined as string | undefined }
     : node.size !== undefined
       ? { text: formatByteSize(node.size), title: `${node.size.toLocaleString(columns.locale)} B` as string | undefined }
       : { text: '—', title: missingTitle };
   const kind = fileKindLabel(fileKindOf(node.name, node.isDir), t);
-  const dateCell = (ms: number | undefined, unavailableTitle: string) => (
+  const dateCell = (ms: number | undefined, unavailableTitle: string | undefined) => (
     ms === undefined
       ? { text: '—', title: unavailableTitle }
       : formatFileBrowserDate(ms, columns.nowMs, columns.locale, t)
@@ -3086,4 +3094,5 @@ const FsListCells = memo(function FsListCells({ node, columns, stacked = false }
   && previous.columns.nowMs === next.columns.nowMs
   && previous.columns.locale === next.columns.locale
   && previous.columns.detailsPresent === next.columns.detailsPresent
+  && previous.columns.drivesList === next.columns.drivesList
   && previous.columns.createdUnavailable === next.columns.createdUnavailable);
