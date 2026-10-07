@@ -24,6 +24,23 @@ inline constexpr char kQualityType[] = "remote_desktop.data.quality";
 // encoder hides exactly the machines where the picture needs explaining.
 inline constexpr char kEncoderClassHardware[] = "hardware";
 inline constexpr char kEncoderClassSoftware[] = "software";
+// Worker to browser: which codec/encoder is actually producing the picture. A
+// message type of its own, NOT extra keys on kQualityType: a viewer validates
+// kQualityType with an exact key set, so an extra key would blank the status bar
+// of every older web, whereas an older web silently ignores an unknown data
+// message type. Pinned to REMOTE_DESKTOP_DATA_MSG.ENCODER, _ENCODER_CODEC and
+// _ENCODER_RAW_CODECS in shared/remote-desktop.ts by the cross-layer test.
+inline constexpr char kEncoderInfoType[] = "remote_desktop.data.encoder";
+inline constexpr char kEncoderCodecVp9[] = "vp9";
+inline constexpr char kEncoderCodecVp8[] = "vp8";
+inline constexpr char kEncoderCodecH264[] = "h264";
+inline constexpr char kEncoderCodecPending[] = "pending";
+// `rawCodecs` of a kEncoderInfoType message: the node's decision on whether this
+// route may send VP9/VP8, and why not when it may not.
+inline constexpr char kRawCodecsAllowed[] = "allowed";
+inline constexpr char kRawCodecsHardwareH264[] = "hardware_h264";
+inline constexpr char kRawCodecsCaptureCannotScale[] = "capture_cannot_scale";
+inline constexpr char kRawCodecsDisabledBySetting[] = "disabled_by_setting";
 inline constexpr char kClipboardType[] = "remote_desktop.data.clipboard";
 inline constexpr char kPointerType[] = "remote_desktop.data.pointer";
 inline constexpr char kKeyboardType[] = "remote_desktop.data.keyboard";

@@ -72,6 +72,14 @@ export const REMOTE_DESKTOP_DATA_MSG = {
   // carried out. Success is already visible through the topology and status
   // frames; without this, a refusal looks exactly like a lost click.
   CONTROL_REJECTED: 'remote_desktop.data.control_rejected',
+  // Worker → browser: which codec and encoder are ACTUALLY producing the
+  // picture. A message of its own rather than extra keys on QUALITY on purpose:
+  // every viewer validates QUALITY with an exact key set and drops the whole
+  // message on an unknown key, so adding keys there would blank the status bar
+  // of every older web. An older web drops an unknown data-message TYPE silently
+  // (handleData ignores what does not validate), and a newer web simply never
+  // receives it from an older node.
+  ENCODER: 'remote_desktop.data.encoder',
 } as const;
 
 export const REMOTE_DESKTOP_CHANNEL = {
@@ -394,6 +402,24 @@ export const REMOTE_DESKTOP_QUALITY_BITRATE_CAP = {
 export const REMOTE_DESKTOP_ENCODER_CLASS = {
   HARDWARE: 'hardware',
   SOFTWARE: 'software',
+} as const;
+
+/** `codec` of an ENCODER data message: what the picture is encoded with. `pending`
+ *  until a codec has been negotiated for the route. */
+export const REMOTE_DESKTOP_ENCODER_CODEC = {
+  VP9: 'vp9',
+  VP8: 'vp8',
+  H264: 'h264',
+  PENDING: 'pending',
+} as const;
+
+/** Why a route may or may not send VP9/VP8 (the node's raw-codec decision), so a
+ *  viewer can say "H.264, forced by the setting" rather than guess. */
+export const REMOTE_DESKTOP_ENCODER_RAW_CODECS = {
+  ALLOWED: 'allowed',
+  HARDWARE_H264: 'hardware_h264',
+  CAPTURE_CANNOT_SCALE: 'capture_cannot_scale',
+  DISABLED_BY_SETTING: 'disabled_by_setting',
 } as const;
 
 export const REMOTE_DESKTOP_AUDIT_EVENT = {
@@ -832,6 +858,20 @@ export interface RemoteDesktopQuality {
   rttMs: number;
 }
 
+export interface RemoteDesktopEncoderInfo {
+  type: typeof REMOTE_DESKTOP_DATA_MSG.ENCODER;
+  protocolVersion: typeof REMOTE_DESKTOP_PROTOCOL_VERSION;
+  sessionId: string;
+  sequence: number;
+  codec: typeof REMOTE_DESKTOP_ENCODER_CODEC[keyof typeof REMOTE_DESKTOP_ENCODER_CODEC];
+  implementation: typeof REMOTE_DESKTOP_ENCODER_CLASS[keyof typeof REMOTE_DESKTOP_ENCODER_CLASS];
+  /** The encoder's own name, e.g. "libvpx" or "Apple H.264 (SW)". Display only. */
+  name: string;
+  /** Encoder threads (0 when it does not say). */
+  threads: number;
+  rawCodecs: typeof REMOTE_DESKTOP_ENCODER_RAW_CODECS[keyof typeof REMOTE_DESKTOP_ENCODER_RAW_CODECS];
+}
+
 export interface RemoteDesktopClipboard {
   type: typeof REMOTE_DESKTOP_DATA_MSG.CLIPBOARD;
   protocolVersion: typeof REMOTE_DESKTOP_PROTOCOL_VERSION;
@@ -914,7 +954,7 @@ export type RemoteDesktopBrowserMessage = RemoteDesktopStart | RemoteDesktopResu
 export type RemoteDesktopDaemonCommand = RemoteDesktopPrepare | RemoteDesktopOffer | RemoteDesktopIce | RemoteDesktopLease | RemoteDesktopModeState | RemoteDesktopCancel | RemoteDesktopDaemonStop;
 export type RemoteDesktopDaemonMessage = RemoteDesktopAnswer | RemoteDesktopIce | RemoteDesktopModeState | RemoteDesktopStatus | RemoteDesktopRenegotiate | RemoteDesktopTerminal;
 export type RemoteDesktopServerMessage = RemoteDesktopBootstrapRedeemed | RemoteDesktopAuthorized | RemoteDesktopResumed | RemoteDesktopAnswer | RemoteDesktopIce | RemoteDesktopModeState | RemoteDesktopStatus | RemoteDesktopRenegotiate | RemoteDesktopTerminal | RemoteDesktopError;
-export type RemoteDesktopDataMessage = RemoteDesktopDisplayTopology | RemoteDesktopQuality | RemoteDesktopClipboard | RemoteDesktopPointer | RemoteDesktopKeyboard | RemoteDesktopControl | RemoteDesktopReleaseAll | RemoteDesktopControlRejected;
+export type RemoteDesktopDataMessage = RemoteDesktopDisplayTopology | RemoteDesktopQuality | RemoteDesktopEncoderInfo | RemoteDesktopClipboard | RemoteDesktopPointer | RemoteDesktopKeyboard | RemoteDesktopControl | RemoteDesktopReleaseAll | RemoteDesktopControlRejected;
 
 export type RemoteDesktopValidationResult<T> = { ok: true; value: T } | { ok: false; error: typeof REMOTE_DESKTOP_ERROR.INVALID_REQUEST };
 
@@ -975,6 +1015,10 @@ const MODE_REASONS = new Set<string>(Object.values(REMOTE_DESKTOP_MODE_REASON));
 const ROTATIONS = new Set<number>(Object.values(REMOTE_DESKTOP_DISPLAY_ROTATION));
 const QUALITY_PRESETS = new Set<string>(Object.values(REMOTE_DESKTOP_QUALITY_PRESET));
 const ENCODER_CLASSES = new Set<string>(Object.values(REMOTE_DESKTOP_ENCODER_CLASS));
+const ENCODER_CODECS = new Set<string>(Object.values(REMOTE_DESKTOP_ENCODER_CODEC));
+const ENCODER_RAW_CODECS = new Set<string>(Object.values(REMOTE_DESKTOP_ENCODER_RAW_CODECS));
+/** Longest encoder name a worker may report (bytes); it is only ever displayed. */
+export const REMOTE_DESKTOP_ENCODER_NAME_BYTES = 64;
 const POINTER_KINDS = new Set<string>(Object.values(REMOTE_DESKTOP_POINTER_KIND));
 const POINTER_BUTTONS = new Set<string>(Object.values(REMOTE_DESKTOP_POINTER_BUTTON));
 const KEYBOARD_KINDS = new Set<string>(Object.values(REMOTE_DESKTOP_KEYBOARD_KIND));
@@ -1382,6 +1426,18 @@ function validateQuality(value: Record<string, unknown>): boolean {
     && isFiniteRange(value.rttMs, 0, 3_600_000);
 }
 
+function validateEncoderInfo(value: Record<string, unknown>): boolean {
+  return hasExactKeys(value, ['type', 'protocolVersion', 'sessionId', 'sequence', 'codec', 'implementation', 'name', 'threads', 'rawCodecs'])
+    && value.protocolVersion === REMOTE_DESKTOP_PROTOCOL_VERSION
+    && isId(value.sessionId)
+    && isSafeNonNegative(value.sequence)
+    && typeof value.codec === 'string' && ENCODER_CODECS.has(value.codec)
+    && typeof value.implementation === 'string' && ENCODER_CLASSES.has(value.implementation)
+    && isBoundedString(value.name, REMOTE_DESKTOP_ENCODER_NAME_BYTES)
+    && isSafeNonNegative(value.threads) && value.threads <= 256
+    && typeof value.rawCodecs === 'string' && ENCODER_RAW_CODECS.has(value.rawCodecs);
+}
+
 /** Wire-shape check for a viewer quality preference (also used by the web). */
 export function isRemoteDesktopQualityPreference(value: unknown): value is RemoteDesktopQualityPreference {
   if (!isRecord(value)) return false;
@@ -1596,6 +1652,9 @@ export function validateRemoteDesktopDataMessage(value: unknown): RemoteDesktopV
   }
   if (value.type === REMOTE_DESKTOP_DATA_MSG.QUALITY && validateQuality(value)) {
     return { ok: true, value: value as unknown as RemoteDesktopQuality };
+  }
+  if (value.type === REMOTE_DESKTOP_DATA_MSG.ENCODER && validateEncoderInfo(value)) {
+    return { ok: true, value: value as unknown as RemoteDesktopEncoderInfo };
   }
   if (value.type === REMOTE_DESKTOP_DATA_MSG.CLIPBOARD && validateClipboard(value)) {
     return { ok: true, value: value as unknown as RemoteDesktopClipboard };

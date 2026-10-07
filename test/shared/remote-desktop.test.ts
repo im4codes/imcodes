@@ -8,6 +8,9 @@ import {
   REMOTE_DESKTOP_CONTROL_REJECTION,
   REMOTE_DESKTOP_DISPLAY_MODE_LIMITS,
   REMOTE_DESKTOP_DATA_MSG,
+  REMOTE_DESKTOP_ENCODER_CODEC,
+  REMOTE_DESKTOP_ENCODER_NAME_BYTES,
+  REMOTE_DESKTOP_ENCODER_RAW_CODECS,
   REMOTE_DESKTOP_DPI_SCALE_PERCENTS,
   REMOTE_DESKTOP_DISPLAY_ROTATION,
   REMOTE_DESKTOP_ENCODER_CLASS,
@@ -949,5 +952,82 @@ describe('remote desktop production contract', () => {
       inputEpoch: 0,
       state: REMOTE_DESKTOP_STATE.DIRECT,
     })).toEqual({ ok: false, error: REMOTE_DESKTOP_ERROR.INVALID_REQUEST });
+  });
+
+  describe('encoder message (which codec and encoder are really in use)', () => {
+    const encoder = {
+      type: REMOTE_DESKTOP_DATA_MSG.ENCODER,
+      protocolVersion: REMOTE_DESKTOP_PROTOCOL_VERSION,
+      sessionId,
+      sequence: 7,
+      codec: REMOTE_DESKTOP_ENCODER_CODEC.VP9,
+      implementation: REMOTE_DESKTOP_ENCODER_CLASS.SOFTWARE,
+      name: 'libvpx',
+      threads: 12,
+      rawCodecs: REMOTE_DESKTOP_ENCODER_RAW_CODECS.ALLOWED,
+    };
+
+    it('validates every codec, implementation and raw-codec reason', () => {
+      expect(validateRemoteDesktopDataMessage(encoder)).toMatchObject({ ok: true });
+      for (const codec of Object.values(REMOTE_DESKTOP_ENCODER_CODEC)) {
+        for (const implementation of Object.values(REMOTE_DESKTOP_ENCODER_CLASS)) {
+          for (const rawCodecs of Object.values(REMOTE_DESKTOP_ENCODER_RAW_CODECS)) {
+            expect(validateRemoteDesktopDataMessage({ ...encoder, codec, implementation, rawCodecs }).ok).toBe(true);
+          }
+        }
+      }
+    });
+
+    it('rejects unknown tokens, bad bounds and any extra or missing key', () => {
+      for (const bad of [
+        { ...encoder, codec: 'av1' },
+        { ...encoder, implementation: 'gpu' },
+        { ...encoder, rawCodecs: 'maybe' },
+        { ...encoder, name: '' },
+        { ...encoder, name: 'x'.repeat(REMOTE_DESKTOP_ENCODER_NAME_BYTES + 1) },
+        { ...encoder, threads: -1 },
+        { ...encoder, threads: 257 },
+        { ...encoder, threads: 1.5 },
+        { ...encoder, sequence: -1 },
+        { ...encoder, sessionId: 'bad id' },
+        { ...encoder, protocolVersion: 99 },
+        { ...encoder, extra: true },
+      ]) {
+        expect(validateRemoteDesktopDataMessage(bad as unknown)).toEqual({ ok: false, error: REMOTE_DESKTOP_ERROR.INVALID_REQUEST });
+      }
+      const { name: _name, ...missing } = encoder;
+      expect(validateRemoteDesktopDataMessage(missing)).toEqual({ ok: false, error: REMOTE_DESKTOP_ERROR.INVALID_REQUEST });
+      // exactly the bound is fine
+      expect(validateRemoteDesktopDataMessage({ ...encoder, name: 'x'.repeat(REMOTE_DESKTOP_ENCODER_NAME_BYTES) }).ok).toBe(true);
+    });
+
+    // Skew, node newer than web: every web validates the quality message with an
+    // exact key set and drops the WHOLE message on an unknown key, which blanks its
+    // status bar. So the encoder facts are a message of their own, and the quality
+    // message must not grow.
+    it('keeps the quality message exactly as older viewers validate it', () => {
+      const quality = {
+        type: REMOTE_DESKTOP_DATA_MSG.QUALITY, protocolVersion: REMOTE_DESKTOP_PROTOCOL_VERSION, sessionId, sequence: 4,
+        preset: REMOTE_DESKTOP_QUALITY_PRESET.P1080_30, encoderClass: REMOTE_DESKTOP_ENCODER_CLASS.SOFTWARE,
+        width: 1920, height: 1080, fps: 15, bitrateBps: 300_000, droppedFrames: 0, rttMs: 0,
+      };
+      expect(validateRemoteDesktopDataMessage(quality).ok).toBe(true);
+      // The failure mode this design avoids: an extra key on the quality message.
+      for (const extra of [{ codec: 'vp9' }, { encoderName: 'libvpx' }, { encoder: 'x' }]) {
+        expect(validateRemoteDesktopDataMessage({ ...quality, ...extra }).ok).toBe(false);
+      }
+      expect(Object.keys(quality).sort()).toEqual(
+        ['bitrateBps', 'droppedFrames', 'encoderClass', 'fps', 'height', 'preset', 'protocolVersion', 'rttMs', 'sequence', 'sessionId', 'type', 'width'].sort(),
+      );
+    });
+
+    it('is not mistaken for a quality message, nor the reverse', () => {
+      expect(validateRemoteDesktopDataMessage({ ...encoder, type: REMOTE_DESKTOP_DATA_MSG.QUALITY }).ok).toBe(false);
+      expect(validateRemoteDesktopDataMessage({
+        type: REMOTE_DESKTOP_DATA_MSG.ENCODER, protocolVersion: REMOTE_DESKTOP_PROTOCOL_VERSION, sessionId, sequence: 1,
+        preset: REMOTE_DESKTOP_QUALITY_PRESET.P1080_30, encoderClass: REMOTE_DESKTOP_ENCODER_CLASS.SOFTWARE,
+        width: 1, height: 1, fps: 1, bitrateBps: 1, droppedFrames: 0, rttMs: 0,
+      }).ok).toBe(false);
+    });
   });
 });
