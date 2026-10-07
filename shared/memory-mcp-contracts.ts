@@ -954,7 +954,7 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
             description: 'Explicit Brain-owned automatic-audit policy. Omit to inherit the creating Brain session snapshot.',
           },
           executionPool: { type: 'string', enum: ['primary', 'economy'], description: 'Configured execution pool.' },
-          autoProvision: { type: 'boolean', description: 'When true, reuse or provision a sub-session if target is omitted. The top-level idempotencyKey is required; when requestedExecutionType is supplied, all required execution identity fields must be present. Without it, the configured execution pool is used.' },
+          autoProvision: { type: 'boolean', description: 'When true (target omitted), ALWAYS creates a new sub-session, never reuses one; the same top-level idempotencyKey (required) returns the same session. Type: requestedExecutionType (all required fields), else the configured pool\'s first executor entry, else your provider family\'s secondary model. Stays open until session_close.' },
           requestedExecutionType: objectSchema({
             capabilityId: stringSchema('Exact canonical capability id for the explicitly selected execution identity.'),
             agentType: stringSchema('Explicitly selected SDK agent type.'),
