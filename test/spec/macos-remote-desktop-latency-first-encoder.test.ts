@@ -78,8 +78,10 @@ describe('macOS latency-first encoder mode', () => {
   it('applies a governor step on the capture thread, outside every lock, and tells the observer', () => {
     expect(encoder).toMatch(/if \(latency_first_\.load\(std::memory_order_relaxed\)\) \{\s*ApplyGovernorIfChanged\(\);/);
     expect(encoder).toMatch(/observer = observer_;\s*\}\s*if \(observer\) observer\(\);/);
-    expect(header).toContain('void SetConfigurationObserver(std::function<void()> observer);');
-    expect(session).toContain('encoder_.SetConfigurationObserver([this] { RetargetCaptureToEncoder(); });');
+    expect(header).toContain('void SetConfigurationObserver(std::function<void()> observer) override;');
+    // Through the one encoder view, which is the plain VideoToolbox encoder unless the route carries a raw rendezvous.
+    expect(session).toContain('encoder_view().SetConfigurationObserver(');
+    expect(session).toContain('[this] { RetargetCaptureToEncoder(); }');
   });
 
   it('gives up resolution last: the governor thresholds favour latency, then sharpness', () => {

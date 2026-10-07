@@ -46,7 +46,9 @@ describe('macOS VideoToolbox H.264 encoder adapter', () => {
   });
 
   it('keeps Apple types behind an injectable common EncoderAdapter boundary', async () => {
-    expect(header).toContain('public common::EncoderAdapter');
+    // ReconfigurableEncoder is itself a common::EncoderAdapter (reconfigurable_encoder.h).
+    expect(header).toContain('public ReconfigurableEncoder');
+    expect(read('native/macos-remote-desktop/reconfigurable_encoder.h')).toContain('public common::EncoderAdapter');
     expect(header).toContain('class VideoToolboxEncoderBackend');
     expect(header).toContain('class Impl;');
     expect(header).not.toMatch(/#import|CVPixelBuffer|CMSampleBuffer|VTCompressionSession/);
