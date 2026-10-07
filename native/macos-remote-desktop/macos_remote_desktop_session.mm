@@ -957,6 +957,15 @@ class MacosRemoteDesktopSession::Impl final
     return transport_core_.diagnostics();
   }
 
+  // The encoder adapter answers from its own state; no session lock is needed.
+  common::EncoderClass encoder_class() const noexcept {
+    return dependencies_.adapters.encoder.ImplementationClass();
+  }
+
+  std::uint64_t dropped_frames() const noexcept {
+    return dependencies_.adapters.encoder.DroppedFrames();
+  }
+
   common::TransportTerminalReason transport_terminal_reason() const noexcept {
     std::lock_guard lock(mutex_);
     return transport_core_.terminal_reason();
@@ -1953,6 +1962,14 @@ std::string MacosRemoteDesktopSession::selected_display_id() const {
 
 common::TerminalError MacosRemoteDesktopSession::terminal_error() const {
   return impl_->terminal_error();
+}
+
+common::EncoderClass MacosRemoteDesktopSession::encoder_class() const noexcept {
+  return impl_->encoder_class();
+}
+
+std::uint64_t MacosRemoteDesktopSession::dropped_frames() const noexcept {
+  return impl_->dropped_frames();
 }
 
 common::TransportDiagnostics MacosRemoteDesktopSession::transport_diagnostics()

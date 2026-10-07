@@ -17,6 +17,7 @@ import {
   REMOTE_DESKTOP_CHANNEL,
   REMOTE_DESKTOP_CONTROL_KIND,
   REMOTE_DESKTOP_DATA_MSG,
+  REMOTE_DESKTOP_ENCODER_CLASS,
   REMOTE_DESKTOP_LIMITS,
   REMOTE_DESKTOP_MSG,
 } from '../../shared/remote-desktop.js';
@@ -150,6 +151,8 @@ describe('macOS remote-desktop cross-layer token agreement', () => {
     const expected: Record<string, string> = {
       kTopologyType: REMOTE_DESKTOP_DATA_MSG.DISPLAY_TOPOLOGY,
       kQualityType: REMOTE_DESKTOP_DATA_MSG.QUALITY,
+      kEncoderClassHardware: REMOTE_DESKTOP_ENCODER_CLASS.HARDWARE,
+      kEncoderClassSoftware: REMOTE_DESKTOP_ENCODER_CLASS.SOFTWARE,
       kClipboardType: REMOTE_DESKTOP_DATA_MSG.CLIPBOARD,
       kPointerType: REMOTE_DESKTOP_DATA_MSG.POINTER,
       kKeyboardType: REMOTE_DESKTOP_DATA_MSG.KEYBOARD,

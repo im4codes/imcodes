@@ -3,6 +3,7 @@
 
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -77,6 +78,14 @@ struct EncoderConfiguration {
   bool latency_first = false;
 };
 
+// What the encoder in use really is. kUnknown until one has been configured (or
+// when an adapter does not say); callers must not read it as hardware.
+enum class EncoderClass : std::uint8_t {
+  kUnknown,
+  kHardware,
+  kSoftware,
+};
+
 class EncoderAdapter {
  public:
   virtual ~EncoderAdapter() = default;
@@ -85,6 +94,17 @@ class EncoderAdapter {
                          H264AccessUnitSink sink) = 0;
   virtual bool Encode(CapturedFrame frame, bool request_keyframe) = 0;
   virtual void Stop() noexcept = 0;
+
+  // Telemetry for the viewer's quality report. The defaults are "don't know" and
+  // "none dropped", so an adapter that does not implement them changes nothing.
+  [[nodiscard]] virtual EncoderClass ImplementationClass() const noexcept {
+    return EncoderClass::kUnknown;
+  }
+  // Frames the encoder dropped instead of encoding (it was busy with a newer or
+  // older one), since it was configured.
+  [[nodiscard]] virtual std::uint64_t DroppedFrames() const noexcept {
+    return 0;
+  }
 };
 
 // There are two lossless media delivery models behind the common platform

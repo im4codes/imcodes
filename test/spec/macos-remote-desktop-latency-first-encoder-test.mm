@@ -86,8 +86,9 @@ class FakeBackend final : public encoder::VideoToolboxEncoderBackend {
   std::vector<common::EncoderConfiguration> configurations;
   std::vector<Pending> pending;
   encoder::VideoToolboxBackendOutputSink output_sink;
+  bool hardware = false;
 
-  bool HardwareEncoderAvailable() noexcept override { return false; }
+  bool HardwareEncoderAvailable() noexcept override { return hardware; }
   bool AppleSoftwareEncoderAvailable() noexcept override { return true; }
   bool Configure(const common::EncoderConfiguration& configuration,
                  encoder::VideoToolboxEncoderKind,
@@ -121,8 +122,9 @@ struct Rig {
   std::atomic<int> emitted{0};
 };
 
-bool MakeRig(Rig* rig, bool latency_first) {
+bool MakeRig(Rig* rig, bool latency_first, bool hardware = false) {
   auto backend = std::make_unique<FakeBackend>();
+  backend->hardware = hardware;
   rig->backend = backend.get();
   rig->encoder = std::make_unique<encoder::VideoToolboxH264Encoder>(
       std::move(backend));
@@ -237,6 +239,38 @@ bool TestLadderDrivenSizeChangeTellsTheObserver() {
          Check(rig.encoder->Configuration()->encoded_pixels.width == 960, "reconfigured");
 }
 
+bool TestEncoderClassAndDropsAreTruthful() {
+  {
+    Rig unconfigured;
+    auto backend = std::make_unique<FakeBackend>();
+    encoder::VideoToolboxH264Encoder encoder(std::move(backend));
+    if (!Check(encoder.ImplementationClass() == common::EncoderClass::kUnknown,
+               "nothing configured yet: unknown, never hardware") ||
+        !Check(encoder.DroppedFrames() == 0, "no drops yet")) {
+      return false;
+    }
+  }
+  Rig software;
+  if (!MakeRig(&software, false, /*hardware=*/false)) return false;
+  Rig hardware;
+  if (!MakeRig(&hardware, false, /*hardware=*/true)) return false;
+  if (!Check(software.encoder->ImplementationClass() == common::EncoderClass::kSoftware,
+             "a software session reports software") ||
+      !Check(hardware.encoder->ImplementationClass() == common::EncoderClass::kHardware,
+             "a hardware session reports hardware")) {
+    return false;
+  }
+  // Drops are reported as the encoder counted them.
+  Rig busy;
+  if (!MakeRig(&busy, true)) return false;
+  (void)busy.encoder->Encode(Frame(), false);
+  (void)busy.encoder->Encode(Frame(), false);
+  (void)busy.encoder->Encode(Frame(), false);
+  busy.encoder->Stop();
+  return Check(busy.encoder->ImplementationClass() == common::EncoderClass::kUnknown,
+               "stopped: unknown again");
+}
+
 }  // namespace
 
 int main() {
@@ -246,7 +280,8 @@ int main() {
                   TestSlowEncoderStepsDownOnceAndTheCaptureIsTold() &&
                   TestSamplesBeforeAnyLadderSelectionAreIgnored() &&
                   TestResampledFramesAreNotTimed() &&
-                  TestLadderDrivenSizeChangeTellsTheObserver();
+                  TestLadderDrivenSizeChangeTellsTheObserver() &&
+                  TestEncoderClassAndDropsAreTruthful();
   if (ok) std::cout << "macos latency-first encoder counterfactuals passed\n";
   return ok ? 0 : 1;
 }

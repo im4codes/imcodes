@@ -1488,12 +1488,19 @@ bool WorkerTransportSink::SendQuality() {
   root["sessionId"] = authority->session_id;
   root["sequence"] = Json::UInt64(outbound_sequence_++);
   root["preset"] = quality.preset_id;
-  root["encoderClass"] = "hardware";
+  // What the encoder really is. Unknown (none configured yet) is reported as
+  // software: hardware is never claimed without proof.
+  root["encoderClass"] =
+      session_->encoder_class() == rd::common::EncoderClass::kHardware
+          ? imcodes::rd::kEncoderClassHardware
+          : imcodes::rd::kEncoderClassSoftware;
   root["width"] = quality.encoded_pixels.width;
   root["height"] = quality.encoded_pixels.height;
   root["fps"] = quality.frame_rate;
   root["bitrateBps"] = quality.bitrate_bps;
-  root["droppedFrames"] = Json::UInt64(0);
+  // Frames the encoder dropped because it was busy: the sender-side count the
+  // viewer cannot see (its own framesDropped is the decoder's).
+  root["droppedFrames"] = Json::UInt64(session_->dropped_frames());
   root["rttMs"] = 0;
   return SendControl(std::move(root));
 }

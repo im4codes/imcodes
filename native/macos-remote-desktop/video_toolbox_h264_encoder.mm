@@ -1625,6 +1625,23 @@ bool VideoToolboxH264Encoder::ReconfigureFromQualitySelection(
   return impl_->Reconfigure(selection);
 }
 
+common::EncoderClass VideoToolboxH264Encoder::ImplementationClass()
+    const noexcept {
+  switch (impl_->ActiveEncoderKind()) {
+    case VideoToolboxEncoderKind::kHardware:
+      return common::EncoderClass::kHardware;
+    case VideoToolboxEncoderKind::kQualifiedAppleSoftware:
+      return common::EncoderClass::kSoftware;
+    case VideoToolboxEncoderKind::kNone:
+      break;
+  }
+  return common::EncoderClass::kUnknown;
+}
+
+std::uint64_t VideoToolboxH264Encoder::DroppedFrames() const noexcept {
+  return impl_->Statistics().dropped_backpressure_frames;
+}
+
 void VideoToolboxH264Encoder::SetConfigurationObserver(
     std::function<void()> observer) {
   impl_->SetConfigurationObserver(std::move(observer));

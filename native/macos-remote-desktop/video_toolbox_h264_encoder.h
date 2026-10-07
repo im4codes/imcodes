@@ -188,6 +188,8 @@ class VideoToolboxH264Encoder final : public common::EncoderAdapter {
                  common::H264AccessUnitSink sink) override;
   bool Encode(common::CapturedFrame frame, bool request_keyframe) override;
   void Stop() noexcept override;
+  [[nodiscard]] common::EncoderClass ImplementationClass() const noexcept override;
+  [[nodiscard]] std::uint64_t DroppedFrames() const noexcept override;
 
   // Applies the existing common quality ladder. Reconfiguration recreates the
   // VideoToolbox session when needed and forces the first accepted frame to be

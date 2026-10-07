@@ -18,6 +18,12 @@ inline constexpr char kPointerChannel[] = "imcodes-rd-pointer";
 // test.
 inline constexpr char kTopologyType[] = "remote_desktop.data.display_topology";
 inline constexpr char kQualityType[] = "remote_desktop.data.quality";
+// `encoderClass` of a kQualityType message, pinned to
+// REMOTE_DESKTOP_ENCODER_CLASS in shared/remote-desktop.ts by the same test. A
+// worker reports what its encoder really is: claiming hardware for a software
+// encoder hides exactly the machines where the picture needs explaining.
+inline constexpr char kEncoderClassHardware[] = "hardware";
+inline constexpr char kEncoderClassSoftware[] = "software";
 inline constexpr char kClipboardType[] = "remote_desktop.data.clipboard";
 inline constexpr char kPointerType[] = "remote_desktop.data.pointer";
 inline constexpr char kKeyboardType[] = "remote_desktop.data.keyboard";

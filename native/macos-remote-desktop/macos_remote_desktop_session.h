@@ -283,6 +283,10 @@ class MacosRemoteDesktopSession final {
   [[nodiscard]] std::string selected_display_id() const;
   [[nodiscard]] common::TerminalError terminal_error() const;
   [[nodiscard]] common::TransportDiagnostics transport_diagnostics() const;
+  // What the encoder really is, and how many frames it has dropped: telemetry
+  // for the viewer's quality report, never inferred or defaulted to hardware.
+  [[nodiscard]] common::EncoderClass encoder_class() const noexcept;
+  [[nodiscard]] std::uint64_t dropped_frames() const noexcept;
   [[nodiscard]] common::TransportTerminalReason transport_terminal_reason()
       const noexcept;
   [[nodiscard]] bool has_transport_adapter() const noexcept;
