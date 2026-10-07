@@ -58,9 +58,11 @@ import {
   SUPERVISION_TASK_CLASSIFICATIONS,
   SUPERVISION_TASK_FILE_OPERATIONS,
 } from './supervision-config.js';
+import { TASK_PAIR_SUBSESSION_TERM_SHORT } from './task-pair.js';
 import {
   SUPERVISION_EXECUTION_CONFIG_REQUIRED_FIELDS,
   SUPERVISION_EXECUTION_POOL_KINDS,
+  SUPERVISION_NO_POOL_DEFAULT_EXECUTION,
 } from './supervision-execution-pool.js';
 import {
   MEMORY_MCP_SEND_DELIVERY_MODES,
@@ -726,7 +728,12 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
           dispatchMode: {
             type: 'string',
             enum: ['new_work', 'queue_only', 'unavailable'],
-            description: 'Configured-caller new-work disposition derived from availability.',
+            description: 'New-work disposition derived from availability.',
+          },
+          defaultExecution: {
+            type: 'string',
+            enum: [SUPERVISION_NO_POOL_DEFAULT_EXECUTION],
+            description: 'No-pool default candidate (same family, secondary tier).',
           },
           limitGroup: stringSchema('Provider quota group shared by sibling sessions.'),
           replyCapable: booleanSchema('Whether the runtime supports structured replies.'),
@@ -751,19 +758,27 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
   },
   [MEMORY_MCP_TOOL_NAMES.PAIR_CREATE]: {
     name: MEMORY_MCP_TOOL_NAMES.PAIR_CREATE,
-    description: 'Brain-only structured creation of a task pair. Persists the brief and assignments atomically, then delivers participant briefs with durable delivery receipts. Retry with the same idempotencyKey to replay without duplicate creation or sends.',
+    description: 'Brain-only structured creation of a task pair. Persists the brief and assignments atomically, then delivers participant briefs with durable delivery receipts. Retry with the same idempotencyKey to replay without duplicate creation or sends. Unnamed roles come from the pool; with no pool, from idle same-vendor secondary-tier sub-sessions, creating missing ones (capped, marked autoCreated). createExecutor/createAuditor create one. ' + TASK_PAIR_SUBSESSION_TERM_SHORT,
     inputSchema: objectSchema({
       taskId: stringSchema('Optional stable task id. When omitted, idempotencyKey deterministically derives one.'),
       title: stringSchema('Short specific title in the owner UI language.'),
       brief: stringSchema('Complete Markdown task brief, including checkable acceptance and boundaries.'),
-      executor: stringSchema('Exact executor session name.'),
-      auditor: stringSchema('Exact auditor session name, or the literal none to disable audit.'),
+      executor: stringSchema('Exact executor session name. Optional: when omitted the daemon picks or creates one.'),
+      auditor: stringSchema('Exact auditor session name, or none to disable audit. Optional: when omitted the daemon picks or creates a different session.'),
       executorModel: stringSchema('Optional explicit executor model.'),
       auditorModel: stringSchema('Optional explicit auditor model.'),
+      createExecutor: objectSchema({ providerFamily: stringSchema('Provider family; default: Brain\'s.'), model: stringSchema('Model; default: the family secondary model.') }),
+      createAuditor: objectSchema({ providerFamily: stringSchema('Provider family; default: Brain\'s.'), model: stringSchema('Model; default: the family secondary model.') }),
       executionPool: { type: 'string', enum: ['primary', 'economy'], description: 'Optional executor execution pool.' },
       idempotencyKey: stringSchema('Stable retry key for this create request.'),
-    }, ['brief', 'executor']),
-    outputSchema: objectSchema({ status: stringSchema('ok or error.'), taskId: stringSchema('Created task id.'), state: stringSchema('Current pair state.'), deliveries: { type: 'array', items: { type: 'object' } } }),
+    }, ['brief']),
+    outputSchema: objectSchema({
+      status: stringSchema('ok or error.'),
+      taskId: stringSchema('Created task id.'),
+      state: stringSchema('Current pair state.'),
+      executionSelection: { type: 'object' },
+      deliveries: { type: 'array', items: { type: 'object' } },
+    }),
   },
   [MEMORY_MCP_TOOL_NAMES.PAIR_DISPATCH]: {
     name: MEMORY_MCP_TOOL_NAMES.PAIR_DISPATCH,
@@ -885,7 +900,7 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
   },
   [MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE]: {
     name: MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE,
-    description: 'Send to an exact send_list_targets target; Callers and labels are invalid targets. Inter-session sends append by default; busy turns use provider append with durable FIFO fallback, idle turns start immediately. queue is opt-in FIFO only. Returns status.',
+    description: 'Send to an exact send_list_targets target; Callers and labels are invalid targets. Inter-session sends append by default; busy turns use provider append with durable FIFO fallback, idle turns start immediately. queue is opt-in FIFO only. Returns status. ' + TASK_PAIR_SUBSESSION_TERM_SHORT,
     inputSchema: objectSchema({
       target: stringSchema('Exact target session. May be omitted only when task.autoProvision=true; auto-provision requests also require a top-level idempotencyKey.'),
       message: stringSchema(`Required complete task/request text to deliver, up to ${MEMORY_MCP_CAPS.SEND_MESSAGE_MAX_BYTES} UTF-8 bytes. Include the desired role and output, such as audit findings, discussion input, plan, implementation request, or verification result.`),

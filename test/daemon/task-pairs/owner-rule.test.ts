@@ -32,15 +32,15 @@ describe('owner rule: pool-role bypass by requested model', () => {
   it('lists a session as an auditor candidate once its exact model is requested, even with no pool configured at all', () => {
     const records = [
       session(BRAIN, 'brain'),
-      // No pool is configured, so an automatic pick returns nothing at all
-      // (no built-in default) -- only the named-model bypass can find this session.
+      // No pool is configured: the automatic pick is the same-vendor secondary-tier default (this sonnet session qualifies for an
+      // anthropic Brain); a named model matches by exact id regardless of tier.
       session('deck_sub_sonnet', 'w1', { parentSession: BRAIN, activeModel: 'claude-sonnet-5', updatedAt: 1 }),
     ];
     const deps = { listSessions: () => records, hasPendingMessages: () => false };
-    // Unchanged baseline: an automatic pick with no pool configured finds nothing.
+    // The automatic pick with no pool configured is the same-vendor secondary-tier default.
     expect(listTaskPairCandidates({
       brain: BRAIN, role: 'auditor', pool: 'primary', exclude: new Set(),
-    }, deps)).toEqual([]);
+    }, deps).map((entry) => entry.name)).toEqual(['deck_sub_sonnet']);
     // Owner rule: an explicit requested model bypasses "no pool = nothing" entirely.
     const picked = listTaskPairCandidates({
       brain: BRAIN, role: 'auditor', pool: 'primary', exclude: new Set(),

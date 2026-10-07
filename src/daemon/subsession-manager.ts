@@ -28,6 +28,7 @@ import { registerTmuxSessionResource, releaseSessionResources, resourceOwnerEnv 
 import { markSessionLaunchIdentity } from '../../shared/session-resource-lifecycle.js';
 import { isNativeAgentFenceRequiredForLaunch } from './native-collaboration-guard.js';
 import { processLaunchFence } from '../agent/native-agent-fence.js';
+import type { TaskPairCreatedSessionMetadata } from '../../shared/task-pair.js';
 
 export interface SubSessionRecord {
   id: string;
@@ -64,6 +65,8 @@ export interface SubSessionRecord {
   identityPrompt?: string | null;
   /** Stable digest used to keep auto-provisioned Agent identity associations disjoint. */
   provisionedIdentityHash?: string | null;
+  /** Marker for a sub-session that pair_create created (creator, pair, role); stored on the session record at launch. */
+  pairCreatedMetadata?: TaskPairCreatedSessionMetadata | null;
   effort?: TransportEffortLevel;
   fresh?: boolean;
   _fileSnapshot?: Set<string>;
@@ -71,6 +74,19 @@ export interface SubSessionRecord {
 }
 
 export function subSessionName(id: string): string { return `deck_sub_${id}`; }
+
+/** After a transport launch: the record fields the launch layer does not carry (provisioned identity digest, pair-created marker). */
+function stampProvisionedSession(sessionName: string, sub: SubSessionRecord): void {
+  if (!sub.provisionedIdentityHash && !sub.pairCreatedMetadata) return;
+  const created = getSession(sessionName);
+  if (!created) return;
+  upsertSession({
+    ...created,
+    ...(sub.provisionedIdentityHash ? { provisionedIdentityHash: sub.provisionedIdentityHash } : {}),
+    ...(sub.pairCreatedMetadata ? { pairCreatedMetadata: sub.pairCreatedMetadata } : {}),
+    updatedAt: Date.now(),
+  });
+}
 
 function parentProjectName(sub: SubSessionRecord, fallbackSessionName: string): string {
   const parentName = typeof sub.parentSession === 'string' && sub.parentSession.trim()
@@ -160,10 +176,7 @@ export async function startSubSession(sub: SubSessionRecord): Promise<void> {
         userCreated: true,
         parentSession: sub.parentSession ?? undefined,
       });
-      if (sub.provisionedIdentityHash) {
-        const created = getSession(sessionName);
-        if (created) upsertSession({ ...created, provisionedIdentityHash: sub.provisionedIdentityHash, updatedAt: Date.now() });
-      }
+      stampProvisionedSession(sessionName, sub);
       return;
     }
     await launchTransportSession({
@@ -198,10 +211,7 @@ export async function startSubSession(sub: SubSessionRecord): Promise<void> {
       userCreated: true,
       parentSession: sub.parentSession ?? undefined,
     });
-    if (sub.provisionedIdentityHash) {
-      const created = getSession(sessionName);
-      if (created) upsertSession({ ...created, provisionedIdentityHash: sub.provisionedIdentityHash, updatedAt: Date.now() });
-    }
+    stampProvisionedSession(sessionName, sub);
     return;
   }
 
@@ -368,6 +378,7 @@ export async function startSubSession(sub: SubSessionRecord): Promise<void> {
     description: sub.description ?? undefined,
     identityPrompt: sub.identityPrompt ?? undefined,
     provisionedIdentityHash: sub.provisionedIdentityHash ?? undefined,
+    ...(sub.pairCreatedMetadata ? { pairCreatedMetadata: sub.pairCreatedMetadata } : {}),
     // shellBin (already host-normalized above) persisted for shell/script so a
     // clone/restore that inherited it keeps a runnable launch binary. Config,
     // not identity.

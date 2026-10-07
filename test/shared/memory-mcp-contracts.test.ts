@@ -143,9 +143,9 @@ describe('memory MCP shared contracts', () => {
     const reassign = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.PAIR_REASSIGN].inputSchema;
     const nextRound = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.PAIR_NEXT_ROUND].inputSchema;
     const verdict = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.PAIR_VERDICT].inputSchema;
-    expect(create.required).toEqual(['brief', 'executor']);
+    expect(create.required).toEqual(['brief']);
     expect(Object.keys(create.properties ?? {})).toEqual(expect.arrayContaining([
-      'taskId', 'title', 'brief', 'executor', 'auditor', 'executorModel', 'auditorModel', 'executionPool', 'idempotencyKey',
+      'taskId', 'title', 'brief', 'executor', 'auditor', 'executorModel', 'auditorModel', 'createExecutor', 'createAuditor', 'executionPool', 'idempotencyKey',
     ]));
     expect(dispatch.required).toEqual(['taskId']);
     expect(Object.keys(dispatch.properties ?? {})).toEqual(expect.arrayContaining(['taskId', 'idempotencyKey']));

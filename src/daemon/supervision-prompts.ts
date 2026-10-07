@@ -253,6 +253,8 @@ export function buildSupervisionOrchestratorContext(_locale?: SupervisionUiLocal
  */
 const BRAIN_NATIVE_COLLABORATION_BOUNDARY = {
   allowed: 'ephemeral_read_only_analysis',
+  // "Create a sub-session / sub-agent" is never a built-in agent: it is an IM.codes sub-session (TASK_PAIR_SUBSESSION_TERMINOLOGY).
+  userRequestedSubAgentMeans: 'imcodes_sub_session',
   neverAs: [
     'task_participant',
     'implementer',

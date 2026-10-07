@@ -17,6 +17,7 @@ import {
   clearSupervisionHeartbeatProjectionSource,
   setSupervisionHeartbeatProjection,
 } from '../supervision-heartbeat-projection.js';
+import { SUPERVISION_EXECUTION_SELECTION_SOURCES } from '../../../shared/supervision-execution-pool.js';
 import logger from '../../util/logger.js';
 import { resolve as resolvePath } from 'node:path';
 import { getSession, listSessions, type SessionRecord } from '../../store/session-store.js';
@@ -50,6 +51,9 @@ import {
   roleEligibleProvisionConfig,
   brainHasConfiguredPools,
   describeAuditorPoolGap,
+  describeDefaultPoolGap,
+  describeDefaultSelection,
+  listDefaultPoolSessions,
   describeLimitedProviderFamilies,
   describePoolSyncGap,
   describeRequestedModelMiss,
@@ -1607,7 +1611,7 @@ export class TaskPairAutomation implements TaskPairScheduler {
     // provisioned at all -- ask the user instead of guessing. A dueToLimit
     // replacement of an auditor that DID exist is a different case (that
     // session was bound somehow before) and is unaffected.
-    if (!hadRealAuditor && this.#needsUserPoolChoice(pair.brain, pair.auditorModel)) {
+    if (!hadRealAuditor && this.#needsUserPoolChoice(pair.brain, pair.auditorModel, 1, new Set([pair.brain, ...(pair.executor ? [pair.executor] : [])]))) {
       await this.#flagNoPoolAndNotify(project, taskId, pair.brain);
       return false;
     }
@@ -1679,7 +1683,9 @@ export class TaskPairAutomation implements TaskPairScheduler {
     }
     await sendTaskPairMessage(next, taskId, 'handoff', buildAuditorHandoffMessage(updated));
     if (updated.executor) await sendTaskPairMessage(updated.executor, taskId, 'resend', buildExecutorResendMessage(updated, previousAuditor));
-    await sendTaskPairMessage(updated.brain, taskId, 'brain-line-reassign', buildBrainLine(updated, `auditor ${previousAuditor ?? '(none)'} → ${next}: ${reason}.`));
+    const defaultNote = this.#defaultSelectionNote(updated.brain, [{ session: next, named: !!requestedModel }]);
+    if (defaultNote) logger.info({ project, taskId, auditor: next, source: SUPERVISION_EXECUTION_SELECTION_SOURCES.DEFAULT_SAME_VENDOR_SECONDARY }, 'task-pair: auditor picked by the no-pool default');
+    await sendTaskPairMessage(updated.brain, taskId, 'brain-line-reassign', buildBrainLine(updated, `auditor ${previousAuditor ?? '(none)'} → ${next}: ${reason}.${defaultNote}`));
     return true;
   }
 
@@ -1759,7 +1765,7 @@ export class TaskPairAutomation implements TaskPairScheduler {
     if (!stored || stored.state.executor) return;
     const pair = stored.state;
     const requestedModel = pair.executorModel;
-    if (this.#needsUserPoolChoice(pair.brain, requestedModel)) {
+    if (this.#needsUserPoolChoice(pair.brain, requestedModel, 1, new Set([pair.brain, ...(pair.auditor && pair.auditor !== TASK_PAIR_NO_AUDITOR ? [pair.auditor] : [])]))) {
       await this.#flagNoPoolAndNotify(project, taskId, pair.brain);
       return;
     }
@@ -1782,6 +1788,8 @@ export class TaskPairAutomation implements TaskPairScheduler {
       now: this.#now(),
       eventId: `heartbeat:${project}:${taskId}:executor:${next}:${this.#now()}`,
     });
+    const defaultNote = this.#defaultSelectionNote(pair.brain, [{ session: next, named: !!requestedModel }]);
+    if (defaultNote) logger.info({ project, taskId, executor: next, source: SUPERVISION_EXECUTION_SELECTION_SOURCES.DEFAULT_SAME_VENDOR_SECONDARY }, 'task-pair: executor picked by the no-pool default');
     // A dispatch that named no executor briefs the one picked for it.
     await taskPairService.briefParticipants(project, taskId);
   }
@@ -1819,17 +1827,33 @@ export class TaskPairAutomation implements TaskPairScheduler {
   }
 
   /**
-   * Owner rule: a project with no execution pool configured has no built-in
-   * default. A role with neither a named session nor a named model there
-   * cannot be picked or provisioned at all -- ask the user instead of
-   * guessing. Injected `pickCandidate`/`provision` deps stand in for a real
-   * pool (the seam every other pool-backed pick test already relies on), so
-   * this never fires while either is overridden.
+   * Owner rule: a project with no execution pool configured uses the
+   * no-pool default -- its idle same-vendor secondary-tier sub-sessions (see
+   * pool.ts isDefaultSecondarySession). Only when fewer of those exist than
+   * the roles still to fill (`need`, not counting `exclude`: the Brain and
+   * the sessions already named) can nothing be picked at all -- ask the user.
+   * A busy default session is an ordinary capacity wait, not a question.
+   * Injected `pickCandidate`/`provision` deps stand in for a real pool (the
+   * seam every other pool-backed pick test already relies on), so this never
+   * fires while either is overridden.
    */
-  #needsUserPoolChoice(brain: string, requestedModel: string | undefined): boolean {
-    if (requestedModel) return false;
+  #needsUserPoolChoice(brain: string, requestedModel: string | undefined, need = 1, exclude: ReadonlySet<string> = new Set([brain])): boolean {
+    if (requestedModel || need <= 0) return false;
     if (this.#deps.pickCandidate || this.#deps.provision) return false;
-    return !brainHasConfiguredPools(brain);
+    if (brainHasConfiguredPools(brain)) return false;
+    return listDefaultPoolSessions(brain, new Set([brain, ...exclude])).length < need;
+  }
+
+  /**
+   * When the daemon (not the user) picked a participant while no pool is configured, the visible reason: which session and why it
+   * qualified (idle, same vendor, secondary tier). Empty when the pick came from a configured pool, a named session or a named model.
+   */
+  #defaultSelectionNote(brain: string, picks: ReadonlyArray<{ session: string | undefined; named: boolean }>): string {
+    if (this.#deps.pickCandidate || this.#deps.provision || brainHasConfiguredPools(brain)) return '';
+    const reasons = picks
+      .filter((pick): pick is { session: string; named: boolean } => !!pick.session && pick.session !== TASK_PAIR_NO_AUDITOR && !pick.named)
+      .map((pick) => describeDefaultSelection(brain, pick.session));
+    return reasons.length ? ` Selected by default (${SUPERVISION_EXECUTION_SELECTION_SOURCES.DEFAULT_SAME_VENDOR_SECONDARY}): ${reasons.join('; ')}.` : '';
   }
 
   /** Flags the pair (idempotent) and tries the one combined, rate-limited ask-the-user notice for its project. */
@@ -1859,7 +1883,7 @@ export class TaskPairAutomation implements TaskPairScheduler {
     store.setMeta(key, String(now));
     await sendTaskPairMessage(
       brain, TASK_PAIR_AGGREGATE_NOTICE_ID, 'brain-no-pool-ask',
-      buildNoPoolAskMessage(project, waiting.map((stored) => stored.state)),
+      buildNoPoolAskMessage(project, waiting.map((stored) => stored.state), describeDefaultPoolGap(brain, 2, listDefaultPoolSessions(brain).length)),
     );
   }
 
@@ -1994,9 +2018,11 @@ export class TaskPairAutomation implements TaskPairScheduler {
       // for it, and it cannot resolve on its own. Unlike an ordinary
       // capacity miss, this pair never blocks pairs behind it: it cannot
       // start regardless of order, so later queued pairs are still tried.
-      const executorNeedsUser = !pair.executor && this.#needsUserPoolChoice(brain, pair.executorModel);
-      const auditorNeedsUser = !pair.auditor && pair.auditor !== TASK_PAIR_NO_AUDITOR && this.#needsUserPoolChoice(brain, pair.auditorModel);
-      if (executorNeedsUser || auditorNeedsUser) {
+      // The default needs one distinct session per role still to fill (an executor and an auditor are never the same session).
+      const defaultNeed = (!pair.executor && !pair.executorModel ? 1 : 0)
+        + (!pair.auditor && pair.auditor !== TASK_PAIR_NO_AUDITOR && !pair.auditorModel ? 1 : 0);
+      const named = new Set<string>([brain, ...[pair.executor, pair.auditor].filter((entry): entry is string => !!entry && entry !== TASK_PAIR_NO_AUDITOR)]);
+      if (this.#needsUserPoolChoice(brain, undefined, defaultNeed, named)) {
         await this.#flagNoPoolAndNotify(project, pair.taskId, brain);
         this.#logQueueSkip(project, pair, 'no execution pool configured');
         continue;
@@ -2057,7 +2083,12 @@ export class TaskPairAutomation implements TaskPairScheduler {
         // always was, instead of stalling for a brief it was never going to get.
         await taskPairService.briefParticipants(project, pair.taskId);
       }
-      await sendTaskPairMessage(brain, pair.taskId, 'brain-line-dispatch', buildBrainLine(cleaned, `dispatched from the queue: executor ${executor}, auditor ${auditor}.`));
+      const defaultNote = this.#defaultSelectionNote(brain, [
+        { session: executor, named: !!pair.executor || !!pair.executorModel },
+        { session: auditor, named: !!pair.auditor || !!pair.auditorModel },
+      ]);
+      if (defaultNote) logger.info({ project, taskId: pair.taskId, executor, auditor, source: SUPERVISION_EXECUTION_SELECTION_SOURCES.DEFAULT_SAME_VENDOR_SECONDARY }, 'task-pair: participants picked by the no-pool default');
+      await sendTaskPairMessage(brain, pair.taskId, 'brain-line-dispatch', buildBrainLine(cleaned, `dispatched from the queue: executor ${executor}, auditor ${auditor}.${defaultNote}`));
     }
   }
 

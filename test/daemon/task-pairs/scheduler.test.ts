@@ -1454,7 +1454,7 @@ describe('task-pair pool candidates', () => {
     else process.env.IMCODES_SUPERVISION_ENGINE = previousEngine;
   });
 
-  it('picks nothing for an automatic (unnamed) role when no execution pool is configured -- no built-in default', () => {
+  it('with no execution pool configured an automatic (unnamed) role picks only idle same-vendor secondary-tier sub-sessions (sonnet for an anthropic Brain)', () => {
     const sessions = [
       session(BRAIN, 'brain'),
       session('deck_sub_codex', 'w1', { parentSession: BRAIN, agentType: 'codex-sdk', activeModel: 'gpt-5.5', updatedAt: 1 }),
@@ -1470,9 +1470,10 @@ describe('task-pair pool candidates', () => {
     const picked = listTaskPairCandidates({
       brain: BRAIN, role: 'auditor', pool: 'primary', exclude: new Set(),
     }, { listSessions: () => sessions, hasPendingMessages: () => false });
-    // Owner rule: with no execution pool configured, an automatic (unnamed)
-    // pick returns nothing at all -- there is no built-in default anymore.
-    expect(picked).toEqual([]);
+    // Owner rule (2026-10): with no execution pool configured the default is the Brain's idle sub-sessions of the SAME provider family
+    // running that family's secondary model: sonnet for an anthropic Brain. Not the flagship (opus), not the small model (haiku), not
+    // another vendor (codex), not a busy, foreign-project, non-sub-session or model-less session.
+    expect(picked.map((entry) => entry.name)).toEqual(['deck_sub_sonnet']);
     // A named model still wins regardless (unaffected by this owner rule).
     const namedPick = listTaskPairCandidates({
       brain: BRAIN, role: 'auditor', pool: 'primary', exclude: new Set(), requestedModel: 'claude-opus-4-8',

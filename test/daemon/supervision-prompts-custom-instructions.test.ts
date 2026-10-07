@@ -71,6 +71,7 @@ describe('supervision prompt custom-instructions merge', () => {
           forbid: ['provider_native_task_participation'],
           nativeCollaboration: {
             allowed: 'ephemeral_read_only_analysis',
+            userRequestedSubAgentMeans: 'imcodes_sub_session',
             neverAs: [
               'task_participant',
               'implementer',

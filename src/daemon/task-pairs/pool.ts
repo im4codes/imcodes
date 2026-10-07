@@ -8,10 +8,13 @@
  * auditor replacement (no named session/model), filtered by pool membership
  * and the matching entry's role.
  *
- * Owner rule: a project with no execution pool configured at all has NO
- * built-in default -- an automatic pick there returns nothing (see
- * `brainHasConfiguredPools`); the scheduler asks the user instead of
- * guessing (shared/task-pair.ts's marker contract states the same rule).
+ * Owner rule (2026-10): a project with no execution pool configured does not
+ * wait for the user. Its automatic picks use the Brain's idle sub-sessions of
+ * the SAME provider family that run that family's secondary model (sonnet,
+ * gpt-6-sol, deepseek-pro: the `auditor` column of SUPERVISION_TIER_PAIRS) --
+ * never another vendor, never the family's flagship, and no session is created
+ * for it (see `isDefaultSecondarySession`). With none of those the scheduler
+ * asks the user (`brainHasConfiguredPools`, `describeDefaultPoolGap`).
  * What the user or Brain names explicitly (an exact session, or
  * `executormodel=`/`auditormodel=`) is used as-is and provisioned if it does
  * not exist yet, even outside the pool and regardless of any entry's role --
@@ -28,8 +31,12 @@ import { getSessionRuntimeType } from '../../../shared/agent-types.js';
 import { inferSharedContextRuntimeBackend } from '../../../shared/shared-context-runtime-config.js';
 import {
   SUPERVISION_DEFAULT_EXCLUDED_DEVELOPMENT_SESSIONS,
+  SUPERVISION_EXECUTION_SELECTION_SOURCES,
+  type SupervisionExecutionSelectionSource,
   buildSupervisionExecutionCapabilityId,
   isExcludedDevelopmentModel,
+  isDefaultSecondaryTierTarget,
+  supervisionSecondaryModelOfFamily,
   normalizeSupervisionExecutionModel,
   supervisionTierPriority,
   supervisionExecutionConfigAllowsRole,
@@ -42,7 +49,7 @@ import { describeSupervisorDefaultsSyncGap } from '../supervisor-defaults-cache.
 import { getTransportRuntime } from '../../agent/session-manager.js';
 import { describeSessionWork, isSessionWorking } from '../session-working.js';
 import type { TransportRuntimeDiagnosticSnapshot } from '../../agent/transport-session-runtime.js';
-import { TASK_PAIR_STALE_RESIDUAL_WORK_MS } from '../../../shared/task-pair.js';
+import { TASK_PAIR_CREATED_SESSION_REASONS, TASK_PAIR_NO_AUDITOR, TASK_PAIR_STALE_RESIDUAL_WORK_MS, type TaskPairState } from '../../../shared/task-pair.js';
 import { getTaskPairStore } from './store.js';
 
 export type TaskPairPickRole = 'executor' | 'auditor';
@@ -81,6 +88,111 @@ export function brainHasConfiguredPools(brain: string, deps: TaskPairPoolDeps = 
 }
 
 /**
+ * The no-pool default: a sub-session of this Brain that runs the SECONDARY model of the Brain's own provider family (anthropic ->
+ * sonnet, openai -> gpt-6-sol, deepseek -> deepseek-pro). Same vendor, secondary tier -- a different vendor or the family's flagship
+ * would spend quota the owner did not name.
+ */
+export function isDefaultSecondarySession(parent: SessionRecord, session: SessionRecord): boolean {
+  if (session.parentSession !== parent.name || session.role === 'brain' || session.executionCloneMetadata) return false;
+  return isDefaultSecondaryTierTarget({
+    brainFamily: sessionProviderFamily(parent),
+    targetFamily: sessionProviderFamily(session),
+    targetModel: resolveEffectiveSessionModel(session),
+  });
+}
+
+/** The Brain's default-eligible sub-sessions (busy ones included: availability is the pick's concern, not the default's), minus `exclude`. */
+export function listDefaultPoolSessions(brain: string, exclude: ReadonlySet<string> = new Set(), deps: TaskPairPoolDeps = {}): SessionRecord[] {
+  const sessions = (deps.listSessions ?? (() => listSessions()))();
+  const parent = sessions.find((session) => session.name === brain) ?? (deps.getSession ?? getSession)(brain);
+  if (!parent) return [];
+  return sessions.filter((session) => !exclude.has(session.name) && isDefaultSecondarySession(parent, session));
+}
+
+/**
+ * Why a project with no pool cannot start a pair on its default, with the fix. `needed` is how many distinct default sessions the
+ * pair needs (an executor and an auditor are two); `found` how many exist.
+ */
+export function describeDefaultPoolGap(brain: string, needed: number, found: number, deps: TaskPairPoolDeps = {}): string {
+  const parent = (deps.getSession ?? getSession)(brain);
+  const family = parent ? sessionProviderFamily(parent) : undefined;
+  const model = family ? supervisionSecondaryModelOfFamily(family) : undefined;
+  const fix = 'Fix: create the missing sub-session(s), name executor/auditor (or executormodel=/auditormodel=) on the task, or configure the pool with execution_pool_set (Settings → execution pool).';
+  if (!family || !model) {
+    return `no execution pool is configured and the Brain's provider family${family ? ` (${family})` : ''} has no default secondary model. ${fix}`;
+  }
+  return `no execution pool is configured, so the default is idle ${family} sub-sessions running ${model} (same vendor, secondary tier); a pair needs ${needed} distinct one(s) (executor and auditor are different sessions) and ${found} exist. ${fix}`;
+}
+
+/** The recorded reason for a default pick: which session, and why it qualified. */
+export function describeDefaultSelection(brain: string, sessionName: string, deps: TaskPairPoolDeps = {}): string {
+  const parent = (deps.getSession ?? getSession)(brain);
+  const session = (deps.getSession ?? getSession)(sessionName);
+  const family = parent ? sessionProviderFamily(parent) : 'unknown';
+  const model = session ? resolveEffectiveSessionModel(session) : undefined;
+  return `${sessionName}: no execution pool configured, so the default applies (idle, same vendor ${family}, secondary tier ${model ?? supervisionSecondaryModelOfFamily(family) ?? 'unknown'})`;
+}
+
+/**
+ * With no execution pool configured, whether the roles a pair_create leaves to the daemon can be filled by the no-pool default at all
+ * (busy sessions count: they free up). `undefined` when they can, or when a pool is configured; otherwise the reason and the fix.
+ * An executor and an auditor are always two different sessions, so a single default session cannot fill both.
+ */
+export function describeNoPoolDefaultShortfall(input: {
+  brain: string;
+  /** The role is settled by the caller: a named session or a named model. */
+  executorNamed: boolean;
+  auditorNamed: boolean;
+  /** Sessions the caller named (they are not available to the default). */
+  named: readonly string[];
+}, deps: TaskPairPoolDeps = {}): string | undefined {
+  const parent = (deps.getSession ?? getSession)(input.brain);
+  if (!parent || configuredPools(parent)) return undefined;
+  const needed = (input.executorNamed ? 0 : 1) + (input.auditorNamed ? 0 : 1);
+  if (needed === 0) return undefined;
+  const found = listDefaultPoolSessions(input.brain, new Set([input.brain, ...input.named]), deps).length;
+  return found >= needed ? undefined : describeDefaultPoolGap(input.brain, needed, found, deps);
+}
+
+export interface TaskPairParticipantSelection {
+  session?: string;
+  source: SupervisionExecutionSelectionSource;
+  reason: string;
+}
+
+/**
+ * What a pair_create resolved for each role and why: `explicit` (a named session or model), `configured_pool`, or
+ * `default_same_vendor_secondary` (no pool configured: the daemon took an idle same-vendor secondary-tier sub-session). A role still
+ * unfilled reports no session and says what it waits for.
+ */
+export function describeExecutionSelection(
+  brain: string,
+  pair: Pick<TaskPairState, 'executor' | 'auditor'>,
+  named: { executorNamed: boolean; auditorNamed: boolean },
+  deps: TaskPairPoolDeps = {},
+  created: ReadonlyArray<{ session: string; role: TaskPairPickRole; reason: string }> = [],
+): { executor: TaskPairParticipantSelection; auditor: TaskPairParticipantSelection } {
+  const unconfigured = !brainHasConfiguredPools(brain, deps);
+  const select = (session: string | undefined, isNamed: boolean, role: TaskPairPickRole): TaskPairParticipantSelection => {
+    // A session pair_create created for this pair: the reason says so (default rule, or the caller asked for it).
+    const made = created.find((entry) => entry.role === role && entry.session === session);
+    if (made) {
+      const source = made.reason === TASK_PAIR_CREATED_SESSION_REASONS.EXPLICIT ? SUPERVISION_EXECUTION_SELECTION_SOURCES.EXPLICIT : SUPERVISION_EXECUTION_SELECTION_SOURCES.DEFAULT_SAME_VENDOR_SECONDARY;
+      return { session: made.session, source, reason: `${made.session}: created for this pair (${made.reason}: ${describeDefaultSelection(brain, made.session, deps).replace(/^[^:]+: /u, '')}), recorded as autoCreated by ${brain}` };
+    }
+    if (isNamed) return { ...(session ? { session } : {}), source: SUPERVISION_EXECUTION_SELECTION_SOURCES.EXPLICIT, reason: session ? `${session}: named by the caller` : 'named model, session still being picked' };
+    const source = unconfigured ? SUPERVISION_EXECUTION_SELECTION_SOURCES.DEFAULT_SAME_VENDOR_SECONDARY : SUPERVISION_EXECUTION_SELECTION_SOURCES.CONFIGURED_POOL;
+    if (!session) return { source, reason: `${role} not assigned yet: waiting for an idle ${unconfigured ? 'same-vendor secondary-tier sub-session' : 'pool session'}` };
+    if (session === TASK_PAIR_NO_AUDITOR) return { session, source: SUPERVISION_EXECUTION_SELECTION_SOURCES.EXPLICIT, reason: 'audit disabled by the caller' };
+    return { session, source, reason: unconfigured ? describeDefaultSelection(brain, session, deps) : `${session}: configured ${poolOfSession(brain, session, deps) ?? 'execution'} pool member` };
+  };
+  return {
+    executor: select(pair.executor, named.executorNamed, 'executor'),
+    auditor: select(pair.auditor, named.auditorNamed, 'auditor'),
+  };
+}
+
+/**
  * The account-pool sync gap, but only worth surfacing once there IS a
  * configured pool to have possibly gone stale -- a project that never
  * configured pools at all (mirror or cache) has nothing to sync, so showing
@@ -110,8 +222,8 @@ function sameModelId(a: string | null | undefined, b: string): boolean {
 
 /**
  * Idle, eligible pool members for a role, longest idle first. When the Brain
- * has no configured pools, its own sub-sessions stand in for the pool and the
- * allowlist alone decides eligibility.
+ * has no configured pools, its idle same-vendor secondary-tier sub-sessions
+ * stand in for the pool (isDefaultSecondarySession).
  */
 export function listTaskPairCandidates(input: {
   brain: string;
@@ -151,11 +263,11 @@ export function listTaskPairCandidates(input: {
   );
   // Owner rule: a named model is never confined to the pool at all -- not
   // just its role. Only an AUTOMATIC pick (no requestedModel) is filtered by
-  // pool membership and role, and has no built-in default when no pool is
-  // configured at all -- see brainHasConfiguredPools in the exclusion filter.
+  // pool membership and role; with no pool configured it falls back to the
+  // same-vendor secondary-tier default (isDefaultSecondarySession).
   const eligibleForRole = (session: SessionRecord): boolean => {
     if (input.requestedModel) return sameModelId(resolveEffectiveSessionModel(session), input.requestedModel);
-    if (!pools) return false;
+    if (!pools) return isDefaultSecondarySession(parent, session);
     const config = poolConfigOf(session);
     return !!config && supervisionExecutionConfigAllowsRole(config, input.role);
   };
@@ -219,6 +331,7 @@ export function describeAuditorPoolGap(input: {
 }, deps: TaskPairPoolDeps = {}): string | undefined {
   const parent = (deps.getSession ?? getSession)(input.brain);
   const definition = parent ? poolDefinition(parent, 'primary') : undefined;
+  if (parent && !configuredPools(parent)) return describeDefaultPoolGap(input.brain, 2, listDefaultPoolSessions(input.brain, new Set(), deps).length, deps);
   if (!definition) return undefined;
   const syncGap = describeSupervisorDefaultsSyncGap();
   const suffix = syncGap ? ` (${syncGap})` : '';
@@ -312,7 +425,7 @@ export function describeLimitedProviderFamilies(input: {
   const availability = resolveDelegationTargets(delegationTargetInputs(sessions), (deps.now ?? Date.now)());
   const eligibleForRole = (session: SessionRecord): boolean => {
     if (input.requestedModel) return sameModelId(resolveEffectiveSessionModel(session), input.requestedModel);
-    if (!pools) return false;
+    if (!pools) return isDefaultSecondarySession(parent, session);
     const config = definition?.configs.find((candidate: SupervisionExecutionConfig) => configMatchesSession(candidate, session));
     return !!config && supervisionExecutionConfigAllowsRole(config, input.role);
   };

@@ -29,6 +29,7 @@ import { getSession, listSessions } from '../store/session-store.js';
 import { resolvePeerAuditProviderFamily } from './peer-audit-candidates.js';
 import { delegationTargetInputs } from './delegation-admission.js';
 import { startSubSession, stopSubSession, type SubSessionRecord } from './subsession-manager.js';
+import { getActiveServerLink } from './active-server-link.js';
 import { overlayCachedExecutionPools } from './supervisor-defaults-cache.js';
 import logger from '../util/logger.js';
 import {
@@ -36,6 +37,11 @@ import {
   renderSessionIdentityProfileSection,
 } from '../../shared/session-identity.js';
 import type { SupervisionTaskRegistry } from './supervision-state-store.js';
+import {
+  TASK_PAIR_AUTO_CREATED_SESSION_MAX_PER_PROJECT,
+  TASK_PAIR_CREATED_SESSION_SOURCE,
+  type TaskPairCreatedSessionMetadata,
+} from '../../shared/task-pair.js';
 
 const AUTO_SESSION_ID_PREFIX = 'sup_auto_';
 export const SUPERVISION_AUTO_PROVISION_COOLDOWN_MS = 30_000;
@@ -222,11 +228,16 @@ function readyChildren(
 ): SessionRecord[] {
   const availability = resolveDelegationTargets(delegationTargetInputs(sessions), now);
   return matchingChildren(sessions, parent, config, identityPrompt)
-    .filter((session) => session.state === 'idle'
-      && Boolean(session.sessionInstanceId)
-      && Boolean(session.runtimeEpoch)
-      && availability.get(session.name)?.availability === DELEGATION_AVAILABILITY.READY)
+    .filter((session) => sessionIsReady(session, availability.get(session.name)?.availability))
     .sort((a, b) => a.name.localeCompare(b.name));
+}
+
+/** A launched session that can take work now: idle, with a logical identity and runtime epoch, and its provider not limited. */
+function sessionIsReady(session: SessionRecord, availability: string | undefined): boolean {
+  return session.state === 'idle'
+    && Boolean(session.sessionInstanceId)
+    && Boolean(session.runtimeEpoch)
+    && availability === DELEGATION_AVAILABILITY.READY;
 }
 
 function configurationAvailability(
@@ -510,6 +521,124 @@ async function provisionConfig(
   } finally {
     if (inFlight.get(reservationKey) === operation) inFlight.delete(reservationKey);
   }
+}
+
+// ---- sessions created by pair_create ------------------------------------------------------------------------------------------------
+
+const PAIR_SESSION_ID_PREFIX = 'pair_auto_';
+
+export type PairSubSessionFailureReason =
+  | 'parent_unavailable' | 'cap_reached' | 'provider_limited' | 'provider_offline' | 'launch_failed' | 'readiness_timeout' | 'identity_collision';
+
+export interface PairSubSessionRequest {
+  parentSessionName: string;
+  config: SupervisionExecutionConfig;
+  /** Marker stored on the new session record: who created it for which pair and role. `autoCreated` and `createdAt` are stamped here; `source` defaults to pair_create. */
+  metadata: Omit<TaskPairCreatedSessionMetadata, 'autoCreated' | 'source' | 'createdAt'> & { source?: TaskPairCreatedSessionMetadata['source'] };
+  label: string;
+  /** Stable per pair and role: a retry derives the same session name and reuses the session instead of creating a second. */
+  idempotencyKey: string;
+}
+
+export type PairSubSessionResult =
+  | { ok: true; target: SessionRecord; created: boolean }
+  | { ok: false; reason: PairSubSessionFailureReason; detail?: string };
+
+/** Every sub-session of this project that pair_create created (the recycling selector, and the cap's count). */
+export function listPairCreatedSessions(projectName: string, sessions: readonly SessionRecord[]): SessionRecord[] {
+  return sessions.filter((session) => session.projectName === projectName && session.pairCreatedMetadata?.autoCreated === true);
+}
+
+function pairSessionIdentity(request: PairSubSessionRequest): { subId: string; sessionName: string } {
+  const digest = createHash('sha256').update(JSON.stringify({
+    parent: request.parentSessionName,
+    capabilityId: request.config.capabilityId,
+    idempotencyKey: request.idempotencyKey,
+    role: request.metadata.role ?? null,
+  })).digest('hex');
+  const subId = `${PAIR_SESSION_ID_PREFIX}${digest.slice(0, 16)}`;
+  return { subId, sessionName: `deck_sub_${subId}` };
+}
+
+/**
+ * Create ONE sub-session for a pair (deterministic, never "decide whether to": the caller's rule already did). Shares the supervision
+ * auto-provision launch path (`startSubSession`), its readiness test and its provider-availability check, but none of its policy that
+ * assumes a daemon-owned automatic pool: no cooldown (a pair needs two sessions back to back), no in-flight sharing (two pairs must
+ * never be handed one session), no idle reaping (closing is the recycling feature's job) and no pool controls. The session carries
+ * `pairCreatedMetadata` from its first write. A failed launch or a readiness timeout stops the half-made session, so no failure leaves
+ * one behind; the project cap (TASK_PAIR_AUTO_CREATED_SESSION_MAX_PER_PROJECT) is checked before anything is launched.
+ */
+export async function createPairSubSession(
+  request: PairSubSessionRequest,
+  injected: SupervisionAutoProvisionDeps & { maxPerProject?: number } = {},
+): Promise<PairSubSessionResult> {
+  const deps = {
+    now: injected.now ?? Date.now,
+    listSessions: injected.listSessions ?? (() => listSessions()),
+    getSession: injected.getSession ?? getSession,
+    startSubSession: injected.startSubSession ?? startSubSession,
+    // The server link is passed so the server and browsers hear `subsession.closed` for a half-made session (it was already announced).
+    stopSubSession: injected.stopSubSession ?? (async (sessionName: string) => (await stopSubSession(sessionName, getActiveServerLink())).ok),
+    wait: injected.wait ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms))),
+    readyTimeoutMs: injected.readyTimeoutMs ?? SUPERVISION_AUTO_PROVISION_READY_TIMEOUT_MS,
+    maxPerProject: injected.maxPerProject ?? TASK_PAIR_AUTO_CREATED_SESSION_MAX_PER_PROJECT,
+  };
+  const parent = deps.getSession(request.parentSessionName);
+  if (!parent || parent.role !== 'brain') return { ok: false, reason: 'parent_unavailable' };
+  const { subId, sessionName } = pairSessionIdentity(request);
+  const sessions = deps.listSessions();
+  const existing = deps.getSession(sessionName);
+  if (existing) {
+    // A retry of the same create: the same pair and role already made this session.
+    if (existing.parentSession !== parent.name || existing.role === 'brain'
+      || existing.pairCreatedMetadata?.pairTaskId !== request.metadata.pairTaskId) {
+      return { ok: false, reason: 'identity_collision', detail: sessionName };
+    }
+    const availability = resolveDelegationTargets(delegationTargetInputs(sessions), deps.now());
+    if (sessionIsReady(existing, availability.get(existing.name)?.availability)) return { ok: true, target: existing, created: false };
+  } else if (listPairCreatedSessions(parent.projectName, sessions).length >= deps.maxPerProject) {
+    return { ok: false, reason: 'cap_reached', detail: `${deps.maxPerProject}` };
+  }
+  const status = configurationAvailability(sessions, parent, request.config, deps.now());
+  if (status === 'limited') return { ok: false, reason: 'provider_limited' };
+  if (status === 'offline') return { ok: false, reason: 'provider_offline' };
+
+  const discard = async (): Promise<void> => {
+    try { await deps.stopSubSession(sessionName); } catch (error) {
+      logger.warn({ err: error, sessionName }, 'pair session creation: could not remove a half-made session');
+    }
+  };
+  if (!existing) {
+    try {
+      await deps.startSubSession({
+        id: subId,
+        type: request.config.agentType,
+        cwd: parent.projectDir,
+        runtimeType: request.config.runtimeType,
+        providerId: request.config.agentType,
+        requestedModel: request.config.model,
+        ...(request.config.ccPresetId ? { ccPreset: request.config.ccPresetId } : {}),
+        parentSession: parent.name,
+        fresh: true,
+        label: request.label,
+        pairCreatedMetadata: { ...request.metadata, autoCreated: true, source: request.metadata.source ?? TASK_PAIR_CREATED_SESSION_SOURCE, createdAt: deps.now() },
+      });
+    } catch (error) {
+      logger.warn({ err: error, parentSessionName: parent.name, sessionName, model: request.config.model }, 'pair session creation: launch failed');
+      await discard();
+      return { ok: false, reason: 'launch_failed', detail: error instanceof Error ? error.message : String(error) };
+    }
+  }
+  const deadline = deps.now() + deps.readyTimeoutMs;
+  while (deps.now() <= deadline) {
+    const current = deps.getSession(sessionName);
+    if (current && sessionIsReady(current, resolveDelegationTargets(delegationTargetInputs(deps.listSessions()), deps.now()).get(sessionName)?.availability)) {
+      return { ok: true, target: current, created: !existing };
+    }
+    await deps.wait(SUPERVISION_AUTO_PROVISION_POLL_MS);
+  }
+  await discard();
+  return { ok: false, reason: 'readiness_timeout', detail: sessionName };
 }
 
 function degradationFor(

@@ -99,6 +99,8 @@ import {
   evaluateSupervisionExecutionBinding,
   evaluateSupervisionObservedIdentity,
   normalizeSupervisionExecutionModel,
+  isDefaultSecondaryTierTarget,
+  SUPERVISION_NO_POOL_DEFAULT_EXECUTION,
   supervisionSelectedExecutionBindingMatches,
   type SupervisionExecutionBinding,
   type SupervisionExecutionPoolKind,
@@ -281,6 +283,8 @@ export interface SendTargetInfo {
   eligiblePools?: SupervisionExecutionPoolKind[];
   /** New supervised work may start now, queue behind a busy turn, or not use it. */
   dispatchMode?: 'new_work' | 'queue_only' | 'unavailable';
+  /** Present only while no execution pool is configured: this target is a default candidate (same vendor, secondary tier). */
+  defaultExecution?: typeof SUPERVISION_NO_POOL_DEFAULT_EXECUTION;
   /** Sessions sharing one upstream account share a group, and share its limit. */
   limitGroup: DelegationLimitGroup;
   replyCapable: boolean;
@@ -1119,6 +1123,8 @@ export function listSendTargets(
         limitGroup: delegationLimitGroup(target.agentType),
       },
       executionPools.state === 'configured' ? eligiblePools : undefined,
+      // No pool configured: a sub-session of the Brain that the no-pool default would use (same provider family, secondary tier).
+      executionPools.state !== 'configured' && isNoPoolDefaultTarget(allSessions, callerProjectName, target),
     )),
   };
 }
@@ -5979,10 +5985,30 @@ function resolveDeliveryExecution(
   });
 }
 
+/** True when `target` is what a project with NO execution pool uses by default: a sub-session of the project's Brain, same provider family, secondary tier. */
+function dispatchModeOf(availability: DelegationTargetAvailability): 'new_work' | 'queue_only' | 'unavailable' {
+  return availability.availability === DELEGATION_AVAILABILITY.READY
+    ? 'new_work'
+    : availability.availability === DELEGATION_AVAILABILITY.BUSY
+      ? 'queue_only'
+      : 'unavailable';
+}
+
+function isNoPoolDefaultTarget(sessions: readonly SessionRecord[], projectName: string, target: SessionRecord): boolean {
+  const brain = sessions.find((session) => session.role === 'brain' && session.projectName === projectName);
+  if (!brain || target.parentSession !== brain.name || target.role === 'brain' || target.executionCloneMetadata) return false;
+  return isDefaultSecondaryTierTarget({
+    brainFamily: resolvePeerAuditProviderFamily(brain),
+    targetFamily: resolvePeerAuditProviderFamily(target),
+    targetModel: resolveEffectiveSessionModel(target),
+  });
+}
+
 function toTargetInfo(
   s: SessionRecord,
   availability: DelegationTargetAvailability,
   eligiblePools?: SupervisionExecutionPoolKind[],
+  defaultExecution = false,
 ): SendTargetInfo {
   const model = resolveEffectiveSessionModel(s);
   const activeModel = optionalModelField(s.activeModel);
@@ -6021,12 +6047,12 @@ function toTargetInfo(
       eligiblePools,
       dispatchMode: eligiblePools.length === 0
         ? 'unavailable' as const
-        : availability.availability === DELEGATION_AVAILABILITY.READY
-          ? 'new_work' as const
-          : availability.availability === DELEGATION_AVAILABILITY.BUSY
-            ? 'queue_only' as const
-            : 'unavailable' as const,
+        : dispatchModeOf(availability),
     }),
+    // eligiblePools stays absent (no pool is configured): this only marks the no-pool default candidates and how they can be dispatched.
+    ...(eligiblePools === undefined && defaultExecution
+      ? { defaultExecution: SUPERVISION_NO_POOL_DEFAULT_EXECUTION, dispatchMode: dispatchModeOf(availability) }
+      : {}),
     limitGroup: availability.limitGroup,
     replyCapable: isDelegationReplyCapableAgentType(s.agentType),
     ...(availability.limitedAt === undefined ? {} : { limitedAt: availability.limitedAt }),

@@ -14,13 +14,30 @@ export const SUPERVISION_EXECUTION_POOL_ROLES = ['executor', 'auditor', 'both'] 
 export type SupervisionExecutionPoolRole = typeof SUPERVISION_EXECUTION_POOL_ROLES[number];
 
 /** Ordered automatic pairing policy.  Keep this as data so daemon, server and
- * settings can resolve the same preference without provider-specific branches. */
+ * settings can resolve the same preference without provider-specific branches.
+ * `providerFamily` is the family (see resolvePeerAuditProviderFamily) a tier belongs to; the `auditor` column is the family's
+ * SECONDARY model: what a project with no execution pool configured uses by default (see SUPERVISION_DEFAULT_EXECUTION_SOURCE). */
 export const SUPERVISION_TIER_PAIRS = [
-  { executor: 'gpt-6-luna', auditor: 'gpt-6-sol' },
-  { executor: 'claude-haiku', auditor: 'claude-sonnet' },
-  { executor: 'deepseek-flash', auditor: 'deepseek-pro' },
+  { providerFamily: 'openai', executor: 'gpt-6-luna', auditor: 'gpt-6-sol', secondaryLaunchModel: 'gpt-6-sol' },
+  { providerFamily: 'anthropic', executor: 'claude-haiku', auditor: 'claude-sonnet', secondaryLaunchModel: 'sonnet' },
+  // No launchable id can be inferred for DeepSeek's secondary model, so a session for it cannot be created automatically.
+  { providerFamily: 'deepseek', executor: 'deepseek-flash', auditor: 'deepseek-pro', secondaryLaunchModel: undefined },
 ] as const;
 export type SupervisionTierPair = typeof SUPERVISION_TIER_PAIRS[number];
+
+/**
+ * Where an automatic executor/auditor pick came from. With no execution pool configured a pair does not wait for the user: its
+ * participants are the Brain's idle sub-sessions of the SAME provider family running that family's secondary model (sonnet, sol, pro).
+ */
+/** `send_list_targets` marker (`defaultExecution`) of a no-pool default candidate. */
+export const SUPERVISION_NO_POOL_DEFAULT_EXECUTION = 'same_vendor_secondary' as const;
+
+export const SUPERVISION_EXECUTION_SELECTION_SOURCES = {
+  EXPLICIT: 'explicit',
+  CONFIGURED_POOL: 'configured_pool',
+  DEFAULT_SAME_VENDOR_SECONDARY: 'default_same_vendor_secondary',
+} as const;
+export type SupervisionExecutionSelectionSource = typeof SUPERVISION_EXECUTION_SELECTION_SOURCES[keyof typeof SUPERVISION_EXECUTION_SELECTION_SOURCES];
 
 function modelFamily(model: string): string {
   return model.toLowerCase().replace(/[^a-z0-9]+/g, '-');
@@ -56,6 +73,38 @@ export function resolveSupervisionTierPair(
 export function supervisionTierPriority(config: SupervisionExecutionConfig, role: 'executor' | 'auditor'): number {
   const index = SUPERVISION_TIER_PAIRS.findIndex((tier) => matchesTierModel(config.model, role === 'executor' ? tier.executor : tier.auditor));
   return index < 0 ? SUPERVISION_TIER_PAIRS.length : index;
+}
+
+/** The tier row of a provider family, or undefined for a family without one. */
+export function supervisionTierOfFamily(providerFamily: string): SupervisionTierPair | undefined {
+  return SUPERVISION_TIER_PAIRS.find((tier) => tier.providerFamily === providerFamily);
+}
+
+/**
+ * The no-pool default test, on plain values (daemon pool picks and send_list_targets share it): same provider family as the Brain, and
+ * running that family's secondary model (never a flagship, never a development-excluded model).
+ */
+export function isDefaultSecondaryTierTarget(input: { brainFamily: string; targetFamily: string; targetModel: string | null | undefined }): boolean {
+  return input.targetFamily === input.brainFamily
+    && !!input.targetModel
+    && !isExcludedDevelopmentModel(input.targetModel)
+    && isSecondaryTierModelOfFamily(input.brainFamily, input.targetModel);
+}
+
+/** The model id a new session of the family's secondary tier is launched with (`sonnet`, `gpt-6-sol`), or undefined when none is launchable. */
+export function supervisionSecondaryLaunchModelOfFamily(providerFamily: string): string | undefined {
+  return supervisionTierOfFamily(providerFamily)?.secondaryLaunchModel;
+}
+
+/** The family's secondary model (the `auditor` column: sonnet, gpt-6-sol, deepseek-pro), or undefined. */
+export function supervisionSecondaryModelOfFamily(providerFamily: string): string | undefined {
+  return supervisionTierOfFamily(providerFamily)?.auditor;
+}
+
+/** True when `model` is the secondary model of `providerFamily`. Matching is by the stable family token, so versions and suffixes still match. */
+export function isSecondaryTierModelOfFamily(providerFamily: string, model: string | null | undefined): boolean {
+  const tier = supervisionTierOfFamily(providerFamily);
+  return !!tier && !!model && matchesTierModel(model, tier.auditor);
 }
 
 export const SUPERVISION_EXECUTION_POOL_CONFIG_STATES = ['configured', 'legacy_unconfigured'] as const;

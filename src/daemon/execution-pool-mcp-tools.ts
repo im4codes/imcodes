@@ -113,7 +113,7 @@ export function createExecutionPoolMcpToolHandlers(caller: McpRuntimeCaller, dep
 export function registerExecutionPoolMcpTools(server: McpServer, caller: McpRuntimeCaller, deps: ExecutionPoolMcpToolDeps = {}): ReadonlyMap<string, RegisteredTool> {
   const handlers = createExecutionPoolMcpToolHandlers(caller, deps);
   const descriptions = {
-    [EXECUTION_POOL_MCP_TOOLS.GET]: 'Read the project execution pool, auto-pairing and audit-by-default policy. If unconfigured, ask the user which models to use.',
+    [EXECUTION_POOL_MCP_TOOLS.GET]: 'Read the project execution pool, auto-pairing and audit-by-default policy. If unconfigured, pairs use same-vendor secondary-tier sub-sessions (sonnet, sol); set a pool to choose.',
     [EXECUTION_POOL_MCP_TOOLS.SET]: 'Update the project execution pool and pairing policy. Only the project Brain/owner may change it.',
   };
   const registered = new Map<string, RegisteredTool>();

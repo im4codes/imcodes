@@ -3,7 +3,8 @@
  *
  * Provider-native agents (Claude `Agent`/`Workflow`/`SendMessage`, Codex
  * multi-agent, Copilot `task`/`write_agent`, ACP/runtime sub-agents) are useful
- * for ephemeral parallel reasoning and read-only analysis. The pair contract
+ * for ephemeral parallel reasoning and read-only analysis. They are NOT what a user means by "create a sub-session / sub-agent": that
+ * always means an IM.codes sub-session (TASK_PAIR_SUBSESSION_TERMINOLOGY in ./task-pair.ts). The pair contract
  * defines where project task work is dispatched, but this module deliberately
  * does not block or rewrite provider-native calls. Every runtime keeps its
  * provider defaults; classification is advisory telemetry only.

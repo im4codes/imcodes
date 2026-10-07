@@ -111,4 +111,27 @@ describe('send_list_targets delegation-eligibility projection', () => {
     expect(byName.get('deck_alpha_oc')?.providerFamily).toBe('opencode');
     expect(byName.get('deck_alpha_override')?.providerFamily).toBe('anthropic');
   });
+
+  describe('no execution pool configured: the same-vendor secondary-tier default candidates are marked, nothing else changes', () => {
+    it('marks defaultExecution + dispatchMode on the Brain\'s own sonnet sub-sessions, leaves eligiblePools absent, and does not mark the rest', () => {
+      const result = listSendTargets(caller, {}, { listSessions: () => [
+        session('deck_alpha_brain', { role: 'brain' }),
+        session('deck_alpha_sonnet', { parentSession: 'deck_alpha_brain', activeModel: 'claude-sonnet-5' }),
+        session('deck_alpha_sonnet_busy', { parentSession: 'deck_alpha_brain', activeModel: 'claude-sonnet-5', state: 'running' }),
+        session('deck_alpha_opus', { parentSession: 'deck_alpha_brain', activeModel: 'claude-opus-5-5' }),
+        session('deck_alpha_gpt', { parentSession: 'deck_alpha_brain', agentType: 'codex-sdk', activeModel: 'gpt-6-sol' }),
+        session('deck_alpha_peer', { activeModel: 'claude-sonnet-5' }),
+      ] });
+      if (result.status !== 'ok') throw new Error('expected ok');
+      expect(result.executionPoolsState).toBe('legacy_unconfigured');
+      const byName = new Map(result.items.map((item) => [item.sessionName, item]));
+      expect(byName.get('deck_alpha_sonnet')).toMatchObject({ defaultExecution: 'same_vendor_secondary', dispatchMode: 'new_work' });
+      expect(byName.get('deck_alpha_sonnet_busy')).toMatchObject({ defaultExecution: 'same_vendor_secondary', dispatchMode: 'queue_only' });
+      for (const item of result.items) expect(item).not.toHaveProperty('eligiblePools');
+      for (const name of ['deck_alpha_opus', 'deck_alpha_gpt', 'deck_alpha_peer']) {
+        expect(byName.get(name)).not.toHaveProperty('defaultExecution');
+        expect(byName.get(name)).not.toHaveProperty('dispatchMode');
+      }
+    });
+  });
 });

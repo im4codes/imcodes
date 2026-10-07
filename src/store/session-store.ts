@@ -23,6 +23,7 @@ import {
   isSessionsJsonCompatExportEnabled,
 } from '../../shared/session-store-compat.js';
 import { getSessionRuntimeType } from '../../shared/agent-types.js';
+import type { TaskPairCreatedSessionMetadata } from '../../shared/task-pair.js';
 import { EXECUTION_CLONE_KIND, type ExecutionCloneMetadata } from '../../shared/execution-clone.js';
 import { isMarkedSessionLaunchIdentity } from '../../shared/session-resource-lifecycle.js';
 import { emitSessionStateProbeCorrection } from './session-state-probe-events.js';
@@ -267,6 +268,8 @@ export interface SessionRecord extends SessionContextBootstrapState {
    *  Persisted in the FIRST session-store upsert so a crash between create and
    *  sync still leaves a sweepable record. */
   executionCloneMetadata?: ExecutionCloneMetadata;
+  /** Present on a sub-session that pair_create itself created (creator, pair, role): what a recycling feature selects on. Sticky across upserts. */
+  pairCreatedMetadata?: TaskPairCreatedSessionMetadata;
   /**
    * Durable, instance-bound demand that every runtime serving this session
    * withholds provider-native agent tools (shared/native-collaboration-policy.ts
@@ -1257,6 +1260,8 @@ export function upsertSession(record: SessionRecord): void {
     ?? (existing?.executionCloneMetadata?.kind === EXECUTION_CLONE_KIND
       ? existing.executionCloneMetadata
       : undefined);
+  // The pair-created marker is sticky for the same reason: incidental rebuilds omit it.
+  const pairCreatedMetadata = record.pairCreatedMetadata ?? existing?.pairCreatedMetadata;
   // The native-agent fence demand is sticky exactly like the clone marker: an
   // incidental rebuild that omits it must not silently re-open native agents.
   const normalizedError = record.state === 'error' && typeof record.error === 'string' && record.error.trim()
@@ -1296,6 +1301,7 @@ export function upsertSession(record: SessionRecord): void {
     ...(nativeAgentLaunchFence ? { nativeAgentLaunchFence } : {}),
     ...(normalizedError ? { error: normalizedError } : { error: undefined }),
     ...(executionCloneMetadata !== undefined ? { executionCloneMetadata } : {}),
+    ...(pairCreatedMetadata !== undefined ? { pairCreatedMetadata } : {}),
     updatedAt: Date.now(),
   };
   sessionValuesCache = null;

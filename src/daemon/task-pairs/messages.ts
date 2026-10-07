@@ -367,11 +367,13 @@ export function buildNoBriefDigestMessage(taskIds: readonly string[]): string {
 
 /**
  * One combined, rate-limited notice per project: no execution pool is
- * configured and one or more pairs have a role with no named model either,
- * so nothing was picked or provisioned for it (owner rule: no built-in
- * default). Every such pair is listed together, not one message per pair.
+ * configured, one or more pairs have a role with no named model either, and
+ * the no-pool default (idle same-vendor secondary-tier sub-sessions) has no
+ * session left for it, so nothing was picked or provisioned. `gap` says what
+ * is missing and how to fix it. Every such pair is listed together, not one
+ * message per pair.
  */
-export function buildNoPoolAskMessage(project: string, pairs: readonly Pick<TaskPairState, 'taskId' | 'title' | 'executor' | 'executorModel' | 'auditor' | 'auditorModel'>[]): string {
+export function buildNoPoolAskMessage(project: string, pairs: readonly Pick<TaskPairState, 'taskId' | 'title' | 'executor' | 'executorModel' | 'auditor' | 'auditorModel'>[], gap?: string): string {
   const lines = pairs.map((pair) => {
     const needs: string[] = [];
     if (!pair.executor && !pair.executorModel) needs.push('an executor model');
@@ -379,10 +381,10 @@ export function buildNoPoolAskMessage(project: string, pairs: readonly Pick<Task
     return `- ${pair.taskId}${pair.title ? ` "${pair.title}"` : ''}: needs ${needs.join(' and ') || 'a model'}.`;
   });
   return [
-    `[IM.codes task pairs] project ${project} has no execution pool: ask the user which executor/auditor models to use (Settings → execution pool, or name executormodel=/auditormodel= on the task). ${pairs.length} pair(s) are waiting:`,
+    `[IM.codes task pairs] project ${project} cannot start ${pairs.length} pair(s): ${gap ?? 'no execution pool is configured and no default same-vendor secondary-tier sub-session is available'}`,
     TASK_PAIR_TITLE_RULE,
     ...lines,
-    'Each starts automatically once a pool is configured or the missing model is named on it -- no further reminders until then.',
+    'Each starts automatically once a pool is configured, a matching sub-session exists, or the missing model is named on it -- no further reminders until then.',
     `[Contract: ${TASK_PAIR_CONTRACT_ID}]`,
   ].join('\n');
 }

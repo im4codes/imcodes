@@ -107,10 +107,19 @@ export const TASK_PAIR_TITLE_MARKER_RULE =
   + 'it never reopens, requeues, or wakes an existing pair, including a '
   + 'cancelled or done pair. A DISPATCH with lifecycle attributes cannot '
   + 'revive a cancelled or done pair; use a new taskId instead.';
+/**
+ * Terminology (owner rule): a "sub-session", "sub-agent" or "agent" the user asks to create is ALWAYS an IM.codes sub-session. The long
+ * form goes in the Brain contract; MCP tool descriptions carry the short one (their byte budget is tight).
+ */
+export const TASK_PAIR_SUBSESSION_TERMINOLOGY =
+  'Terminology: when the user says "create a sub-session", "create a sub-agent" or "open an agent / sub-agent", it ALWAYS means creating an IM.codes sub-session '
+  + '(pair_create createExecutor/createAuditor, or send_message task.autoProvision), NEVER a provider built-in agent (Claude Agent/Task tool, Codex spawn_agent, any native sub-agent).';
+export const TASK_PAIR_SUBSESSION_TERM_SHORT = '"Sub-session"/"sub-agent" means an IM.codes sub-session, never a provider built-in agent.';
 /** Brain/provider-native boundary: routing authority lives in IM.codes pairs, not provider sub-agents. */
 export const TASK_PAIR_NATIVE_COLLABORATION_RULE =
-  'Brain must never dispatch pair/task work (implementation, repair, audit, PASS/REWORK, merges) through provider-native sub-agents. '
-  + 'Dispatch it only through IM.codes pair markers (DISPATCH/QUEUE). Native sub-agents are fine for read-only research and analysis.';
+  'Brain must never dispatch or perform pair/task work (implementation, repair, audit, PASS/REWORK, merges) through provider-native (built-in) sub-agents. '
+  + 'Dispatch it only through IM.codes sub-sessions and pair markers (pair_create, DISPATCH/QUEUE). Built-in sub-agents are only for read-only research and analysis. '
+  + TASK_PAIR_SUBSESSION_TERMINOLOGY;
 /** Automation kind stamped on daemon-authored pair messages. */
 export const TASK_PAIR_AUTOMATION_KIND = 'task-pair' as const;
 /** Directory-name prefix of a pair's executor worktree, beside legacy `asg_…` assignment worktrees. */
@@ -144,6 +153,36 @@ export const TASK_PAIR_INTEGRATION_MAX_EXTRA_BRANCHES = 6;
 export const TASK_PAIR_INTEGRATION_MAX_BRANCH_REFS = 2_000;
 /** How many of the checked branch names an integration reminder spells out; the rest are counted. */
 export const TASK_PAIR_INTEGRATION_LISTED_BRANCHES = 4;
+/**
+ * Sub-sessions the daemon creates for work (pair_create's no-pool default rule or an explicit createExecutor/createAuditor; the
+ * send_message task.autoProvision creation) carry `pairCreatedMetadata` on the session record, so a recycling feature can find and
+ * close them and authorize on `createdBy`. pair_create never closes a session it created.
+ */
+export const TASK_PAIR_CREATED_SESSION_SOURCE = 'pair_create' as const;
+export const SEND_AUTO_PROVISION_CREATED_SESSION_SOURCE = 'send_auto_provision' as const;
+export const TASK_PAIR_CREATED_SESSION_SOURCES = [TASK_PAIR_CREATED_SESSION_SOURCE, SEND_AUTO_PROVISION_CREATED_SESSION_SOURCE] as const;
+export type TaskPairCreatedSessionSource = typeof TASK_PAIR_CREATED_SESSION_SOURCES[number];
+/**
+ * At most this many PAIRS' worth of sub-sessions (an executor plus an auditor each) are created automatically per project. Counted as
+ * sessions carrying the marker (<= 2 x this), not as open pairs: the marker is what holds quota, a created session outlives its pair
+ * until it is recycled, a pair that created only its executor (the auditor was a reused idle session) uses one slot, and a recycled
+ * (removed) session frees its slot with nothing to reconcile.
+ */
+export const TASK_PAIR_AUTO_CREATED_PAIR_MAX_PER_PROJECT = 10;
+export const TASK_PAIR_AUTO_CREATED_SESSION_MAX_PER_PROJECT = TASK_PAIR_AUTO_CREATED_PAIR_MAX_PER_PROJECT * 2;
+export const TASK_PAIR_CREATED_SESSION_REASONS = { DEFAULT: 'default_same_vendor_secondary', EXPLICIT: 'explicit_create' } as const;
+export type TaskPairCreatedSessionReason = typeof TASK_PAIR_CREATED_SESSION_REASONS[keyof typeof TASK_PAIR_CREATED_SESSION_REASONS];
+export interface TaskPairCreatedSessionMetadata {
+  autoCreated: true;
+  source: TaskPairCreatedSessionSource;
+  /** The Brain session that asked for it (recycling and authorization read this). */
+  createdBy: string;
+  /** The pair it was created for; absent for a session created without a pair (task.autoProvision). */
+  pairTaskId?: string;
+  role?: 'executor' | 'auditor';
+  reason: TaskPairCreatedSessionReason;
+  createdAt: number;
+}
 /** A head whose merge-base is more than this many commits or hours behind the integration ref draws the rebase warning. */
 export const TASK_PAIR_STALE_BASE_MAX_COMMITS = 50;
 export const TASK_PAIR_STALE_BASE_MAX_AGE_MS = 48 * 60 * 60_000;
@@ -2326,7 +2365,7 @@ export function buildTaskPairMarkerContract(): string {
     TASK_PAIR_READY_SELF_CHECK_RULE,
     TASK_PAIR_SELF_SUFFICIENCY_RULE,
     TASK_PAIR_SCOPE_DECISION_RULE,
-    'Automatic pairing policy: multi-step, cross-file, test/real-machine, integration, performance, security or substantial tasks use an executor plus auditor and heartbeat; small edits and queries use one executor with no auditor. Explicit user choices always win. An empty or unconfigured pool asks the user which models to use; never invent a default. Prefer configured Luna→Sol, then Haiku→Sonnet, then DeepSeek Flash→Pro tiers.',
+    'Automatic pairing policy: multi-step, cross-file, test/real-machine, integration, performance, security or substantial tasks use an executor plus auditor and heartbeat; small edits and queries use one executor with no auditor. Explicit user choices always win. With an empty or unconfigured pool the daemon uses idle sub-sessions of the Brain in the SAME provider family that run the secondary model of that family (Anthropic Sonnet, OpenAI Sol, DeepSeek Pro; never another vendor, never the flagship, no session is created); executor and auditor are different sessions, and when none is available the daemon tells you how to fix it (create a sub-session, name executor/auditor, or execution_pool_set). Prefer configured Luna→Sol, then Haiku→Sonnet, then DeepSeek Flash→Pro tiers.',
     `Brain: create new work only with pair_create (then pair_dispatch if the result is queued); do not use send_message task metadata or a new DISPATCH/QUEUE marker to create a pair. Lifecycle markers on an existing pair remain valid. Include title="<short specific title>" in pair_create; existing-pair DISPATCH is normally all you need, auto-queues it when capacity is unavailable, and urgent=true jumps the queue (executor=<session> auditor=<session>|none); there is no need to pick QUEUE just to defer work; QUEUE <taskId> title="..." ... always enqueues an existing pair for compatibility. QUEUE - max=<n> sets your queue limit; a finished pair whose commits are not yet on any branch of the repository is reminded to you (one digest, then every 10-15 min; cherry-picked equivalents count as merged), and DONE <taskId> integration=dismiss (or CANCEL <taskId>) stops the reminders for one you will not merge; REASSIGN <taskId> auditor=<session>; DONE <taskId> force=true accepts/ends from any state and marks an audited unpassed pair unaudited; CANCEL ends from any state. No-auditor DONE reports are open and hold their concurrency slot until you decide with DONE or CANCEL; more work can return them to working. Naming executor=/auditor=<session> replaces the current holder of that role immediately, ignoring the execution pool role config; naming executormodel=/auditormodel=<model> steers the next automatic pick but does not replace a current role; a project with no execution pool configured must name the role models or sessions explicitly.`,
     TASK_PAIR_PROJECT_PRECEDENCE_CLAUSE,
     TASK_PAIR_BRAIN_REPORTING_RULE,

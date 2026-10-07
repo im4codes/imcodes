@@ -3,6 +3,9 @@ import { SEND_COMMAND_DESCRIPTION, SEND_COMMAND_FIELD } from '../../shared/send-
 import { emitTaskPairDaemonEvent, taskPairService } from './task-pairs/service.js';
 import { isPairsEngineProject, projectBrainSession, projectOfSession, resolveTaskPairMaxConcurrency } from './task-pairs/engine.js';
 import { taskPairAutomation } from './task-pairs/scheduler.js';
+import { describeExecutionSelection } from './task-pairs/pool.js';
+import { ensurePairSessions, type PairSessionCreateSpec } from './task-pairs/session-creation.js';
+import { runExclusive } from '../util/keyed-mutex.js';
 import { randomUUID } from 'node:crypto';
 import { parseTaskPairChecklist, taskPairChecklistCounts, updateTaskPairChecklist } from '../../shared/task-pair-checklist.js';
 import { isTerminalTaskPairStatus, TASK_PAIR_CREATE_REQUIRED_MESSAGE, TASK_PAIR_MCP_DELIVERY_EVENT, TASK_PAIR_MCP_DISPATCH_EVENT, TASK_PAIR_NO_AUDITOR, taskPairRoleOf } from '../../shared/task-pair.js';
@@ -154,7 +157,7 @@ import { publishRuntimeMemoryCacheInvalidation } from '../context/runtime-memory
 import { isMemoryInjectionEnabled, setMemoryInjectionEnabled } from '../context/memory-injection-toggle.js';
 import { getMemoryFeatureConfigStoreDiagnostics, getPersistedMemoryFeatureFlagValues, getRuntimeMemoryFeatureFlagValues } from '../store/memory-feature-config-store.js';
 import { getContextStoreClient } from '../store/context-store-worker-client.js';
-import { listSessions as listStoredSessions, loadStore, type SessionRecord } from '../store/session-store.js';
+import { getSession, listSessions as listStoredSessions, loadStore, type SessionRecord } from '../store/session-store.js';
 import { dispatchDestroyExecutionClone, dispatchSendMessage, dispatchSendStop, listSendTargets, resolveProjectAuthoritativeSupervisionSnapshot, type SendMessageAgentIdentity, type SendMessageCloneRequest, type SendToolDeps } from './send-tool.js';
 import {
   getSupervisionTaskRegistry,
@@ -921,6 +924,15 @@ function replyIngressErrorReason(value: unknown): MCPErrorReason {
     return MCP_ERROR_REASONS.CONTROL_PLANE_UNAVAILABLE;
   }
   return MCP_ERROR_REASONS.VALIDATION_FAILED;
+}
+
+/** An explicit create request (`createExecutor` / `createAuditor`): `{ providerFamily?, model? }`, or `{}` for the Brain's own family secondary tier. */
+function createSpecArg(args: Record<string, unknown>, key: string): PairSessionCreateSpec | undefined {
+  const value = args[key];
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const record = value as Record<string, unknown>;
+  const text = (field: string): string | undefined => (typeof record[field] === 'string' && (record[field] as string).trim() ? (record[field] as string).trim() : undefined);
+  return { ...(text('providerFamily') ? { providerFamily: text('providerFamily') } : {}), ...(text('model') ? { model: text('model') } : {}) };
 }
 
 function stringArg(args: Record<string, unknown>, key: string): string | undefined {
@@ -2862,12 +2874,13 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       if (!isPairsEngineProject(context.project)) {
         return error(MCP_ERROR_REASONS.CONTROL_PLANE_UNAVAILABLE, `pairs engine is off for project '${context.project}' — enable it in supervision settings (set supervision mode to supervised in the Brain session) before calling pair_create`);
       }
-      const args = pickAllowedMcpArgs(input, ['taskId', 'title', 'brief', 'executor', 'auditor', 'executorModel', 'auditorModel', 'executionPool', 'idempotencyKey']);
-      const executor = stringArg(args, 'executor');
+      const brainName = caller.sessionName;
+      const args = pickAllowedMcpArgs(input, ['taskId', 'title', 'brief', 'executor', 'auditor', 'executorModel', 'auditorModel', 'createExecutor', 'createAuditor', 'executionPool', 'idempotencyKey']);
+      const executorArg = stringArg(args, 'executor');
       const brief = stringArg(args, 'brief');
-      if (!executor || !brief) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'brief and executor are required');
-      const auditor = stringArg(args, 'auditor');
-      if (auditor === executor || executor === caller.sessionName || (auditor && auditor !== TASK_PAIR_NO_AUDITOR && auditor === caller.sessionName)) {
+      if (!brief) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'brief is required');
+      const auditorArg = stringArg(args, 'auditor');
+      if ((auditorArg !== undefined && auditorArg === executorArg) || (executorArg && executorArg === caller.sessionName) || (auditorArg && auditorArg !== TASK_PAIR_NO_AUDITOR && auditorArg === caller.sessionName)) {
         return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'executor, auditor, and Brain must be distinct');
       }
       const idempotencyKey = stringArg(args, 'idempotencyKey');
@@ -2884,66 +2897,88 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       if (store.getPair(context.project, taskId)) {
         return error(MCP_ERROR_REASONS.REVISION_CONFLICT, 'taskId already belongs to a different persisted pair; use its existing lifecycle');
       }
-      const byName = new Map(context.sessions.map((session) => [session.name, session]));
-      const executorRecord = byName.get(executor);
-      if (!executorRecord) return error(MCP_ERROR_REASONS.PROJECTION_UNAVAILABLE, 'executor session not found');
-      if (executorRecord.projectName !== context.project) return error(MCP_ERROR_REASONS.SCOPE_FORBIDDEN, 'executor is outside the caller project');
-      if (executorRecord.state === 'stopped' || executorRecord.state === 'error') {
-        return error(MCP_ERROR_REASONS.CONTROL_PLANE_UNAVAILABLE, `executor is ${executorRecord.state}`);
-      }
-      if (auditor && auditor !== TASK_PAIR_NO_AUDITOR) {
-        const auditorRecord = byName.get(auditor);
-        if (!auditorRecord) return error(MCP_ERROR_REASONS.PROJECTION_UNAVAILABLE, 'auditor session not found');
-        if (auditorRecord.projectName !== context.project) return error(MCP_ERROR_REASONS.SCOPE_FORBIDDEN, 'auditor is outside the caller project');
-        if (auditorRecord.state === 'stopped' || auditorRecord.state === 'error') {
-          return error(MCP_ERROR_REASONS.CONTROL_PLANE_UNAVAILABLE, `auditor is ${auditorRecord.state}`);
+      return runExclusive(`pair-create:${context.project}:${brainName}`, async () => {
+        const title = stringArg(args, 'title');
+        const executorModel = stringArg(args, 'executorModel');
+        const auditorModel = stringArg(args, 'auditorModel');
+        const executionPool = stringArg(args, 'executionPool') as 'primary' | 'economy' | undefined;
+        // Settle every role the caller did not name: reuse idle sessions, or create the missing ones (the no-pool default rule, or an
+        // explicit createExecutor/createAuditor). Failure creates nothing and persists nothing.
+        const ensured = await ensurePairSessions({
+          brain: brainName, project: context.project, taskId, title,
+          executor: executorArg, auditor: auditorArg, executorModel, auditorModel,
+          createExecutor: createSpecArg(args, 'createExecutor'), createAuditor: createSpecArg(args, 'createAuditor'),
+        });
+        if (!ensured.ok) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, `pair_create did nothing: ${ensured.error}`);
+        const executor = executorArg ?? ensured.executor;
+        const auditor = auditorArg ?? ensured.auditor;
+        if ((auditor !== undefined && auditor === executor) || (executor && executor === brainName) || (auditor && auditor !== TASK_PAIR_NO_AUDITOR && auditor === brainName)) {
+          return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'executor, auditor, and Brain must be distinct');
         }
-      }
-      const busyTarget = executorRecord.state === 'running'
-        || (auditor && auditor !== TASK_PAIR_NO_AUDITOR && byName.get(auditor)?.state === 'running');
-      const title = stringArg(args, 'title');
-      const executorModel = stringArg(args, 'executorModel');
-      const auditorModel = stringArg(args, 'auditorModel');
-      const executionPool = stringArg(args, 'executionPool') as 'primary' | 'economy' | undefined;
-      const transition = busyTarget
-        ? taskPairService.applyMarker({
-            project: context.project,
-            writer: caller.sessionName,
-            marker: {
-              verb: 'QUEUE', knownVerb: 'QUEUE', taskId,
-              attrs: {
-                executor,
-                ...(auditor ? { auditor } : {}),
-                ...(title ? { title } : {}),
-                ...(executorModel ? { executormodel: executorModel } : {}),
-                ...(auditorModel ? { auditormodel: auditorModel } : {}),
-                ...(executionPool ? { pool: executionPool } : {}),
+        const byName = new Map(context.sessions.map((session) => [session.name, getSession(session.name) ?? session]));
+        for (const entry of ensured.created) { const record = getSession(entry.session); if (record) byName.set(entry.session, record); }
+        const executorRecord = executor ? byName.get(executor) : undefined;
+        if (executor) {
+          if (!executorRecord) return error(MCP_ERROR_REASONS.PROJECTION_UNAVAILABLE, 'executor session not found');
+          if (executorRecord.projectName !== context.project) return error(MCP_ERROR_REASONS.SCOPE_FORBIDDEN, 'executor is outside the caller project');
+          if (executorRecord.state === 'stopped' || executorRecord.state === 'error') {
+            return error(MCP_ERROR_REASONS.CONTROL_PLANE_UNAVAILABLE, `executor is ${executorRecord.state}`);
+          }
+        }
+        if (auditor && auditor !== TASK_PAIR_NO_AUDITOR) {
+          const auditorRecord = byName.get(auditor);
+          if (!auditorRecord) return error(MCP_ERROR_REASONS.PROJECTION_UNAVAILABLE, 'auditor session not found');
+          if (auditorRecord.projectName !== context.project) return error(MCP_ERROR_REASONS.SCOPE_FORBIDDEN, 'auditor is outside the caller project');
+          if (auditorRecord.state === 'stopped' || auditorRecord.state === 'error') {
+            return error(MCP_ERROR_REASONS.CONTROL_PLANE_UNAVAILABLE, `auditor is ${auditorRecord.state}`);
+          }
+        }
+        const busyTarget = executorRecord?.state === 'running'
+          || (auditor && auditor !== TASK_PAIR_NO_AUDITOR && byName.get(auditor)?.state === 'running');
+        const transition = busyTarget || !executor
+          ? taskPairService.applyMarker({
+              project: context.project,
+              writer: brainName,
+              marker: {
+                verb: 'QUEUE', knownVerb: 'QUEUE', taskId,
+                attrs: {
+                  ...(executor ? { executor } : {}),
+                  ...(auditor ? { auditor } : {}),
+                  ...(title ? { title } : {}),
+                  ...(executorModel ? { executormodel: executorModel } : {}),
+                  ...(auditorModel ? { auditormodel: auditorModel } : {}),
+                  ...(executionPool ? { pool: executionPool } : {}),
+                },
+                brief,
               },
+              source: 'mcp', eventId,
+            })
+          : taskPairService.implicitDispatch({
+              project: context.project,
+              sender: brainName,
+              target: executor,
+              taskId,
+              auditor,
+              title,
+              titleExplicit: args.title !== undefined,
+              executorModel,
+              auditorModel,
+              executionPool,
               brief,
-            },
-            source: 'mcp', eventId,
-          })
-        : taskPairService.implicitDispatch({
-            project: context.project,
-            sender: caller.sessionName,
-            target: executor,
-            taskId,
-            auditor,
-            title,
-            titleExplicit: args.title !== undefined,
-            executorModel,
-            auditorModel,
-            executionPool,
-            brief,
-            hasObjective: true,
-            structuredPairCreate: true,
-            eventId,
-            suppressAutomaticBrief: true,
-          });
-      const stored = store.getPair(context.project, taskId);
-      if (!transition || !stored) return error(MCP_ERROR_REASONS.CONTROL_PLANE_UNAVAILABLE, 'pair creation was not persisted');
-      const deliveries = await deliverStructuredPairBriefs(context.project, taskId, eventId);
-      return { status: 'ok', taskId, idempotentReplay: false, created: transition.effect === 'created', state: stored.state.status, deliveries };
+              hasObjective: true,
+              structuredPairCreate: true,
+              eventId,
+              suppressAutomaticBrief: true,
+            });
+        // A pair with no named executor starts through the queue right away (the daemon picks from the pool, or the no-pool default).
+        if (!executor && transition) await taskPairAutomation.runQueue(context.project, brainName);
+        const stored = store.getPair(context.project, taskId);
+        if (!transition || !stored) return error(MCP_ERROR_REASONS.CONTROL_PLANE_UNAVAILABLE, 'pair creation was not persisted');
+        const deliveries = await deliverStructuredPairBriefs(context.project, taskId, eventId);
+        const latest = store.getPair(context.project, taskId) ?? stored;
+        const executionSelection = describeExecutionSelection(brainName, latest.state, { executorNamed: !!executorArg || !!executorModel, auditorNamed: !!auditorArg || !!auditorModel }, {}, ensured.created);
+        return { status: 'ok', taskId, idempotentReplay: false, created: transition.effect === 'created', state: latest.state.status, executionSelection, deliveries };
+      });
     },
     [MEMORY_MCP_TOOL_NAMES.PAIR_DISPATCH]: async (input) => {
       const context = await pairCallerContext();
@@ -4362,10 +4397,12 @@ const schemas = {
     taskId: z.string().trim().min(1).optional(),
     title: z.string().trim().min(1).optional(),
     brief: z.string().min(1),
-    executor: z.string().trim().min(1),
+    executor: z.string().trim().min(1).optional(),
     auditor: z.string().trim().min(1).optional(),
     executorModel: z.string().trim().min(1).optional(),
     auditorModel: z.string().trim().min(1).optional(),
+    createExecutor: z.object({ providerFamily: z.string().trim().min(1).optional(), model: z.string().trim().min(1).optional() }).strict().optional(),
+    createAuditor: z.object({ providerFamily: z.string().trim().min(1).optional(), model: z.string().trim().min(1).optional() }).strict().optional(),
     executionPool: z.enum(['primary', 'economy']).optional(),
     idempotencyKey: z.string().trim().min(1).optional(),
   }).strict(),
