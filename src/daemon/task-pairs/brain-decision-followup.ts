@@ -18,7 +18,10 @@
 import { PAIR_BRAIN_ACTION_TOOL_NAMES } from '../../../shared/memory-mcp-contracts.js';
 import {
   TASK_PAIR_BRAIN_DECISION_FOLLOWUP_REASON,
+  TASK_PAIR_BRAIN_DECISION_VERBS,
+  TASK_PAIR_MARKER_TAG,
   TASK_PAIR_STATUS_AWAITING_BRAIN_DECISION,
+  scanTaskPairMarkers,
   type TaskPairDeliveryResult,
 } from '../../../shared/task-pair.js';
 import logger from '../../util/logger.js';
@@ -110,6 +113,13 @@ export class BrainDecisionFollowUps {
       }
       return;
     }
+    if (event.type === 'assistant.text') {
+      // Brain's closing reply is emitted BEFORE the idle state, but the service parses
+      // its markers one macrotask later. A decision written as a marker in this very
+      // text must therefore be seen here, not only on the event log.
+      this.#noteReplyMarkers(entries, event.payload);
+      return;
+    }
     if (event.type !== 'session.state') return;
     const state = String(event.payload.state ?? '').toLowerCase();
     if (state === 'running') {
@@ -119,9 +129,25 @@ export class BrainDecisionFollowUps {
     if (state !== 'idle') return;
     const turnStartedAt = this.#turnStartedAt.get(event.sessionId);
     this.#turnStartedAt.delete(event.sessionId);
-    void this.#turnEnded(event.sessionId, turnStartedAt, now).catch((error) => {
-      logger.warn({ err: error, brain: event.sessionId }, 'task-pair: Brain decision follow-up failed');
+    // Evaluate one macrotask later: the closing reply's markers are applied from a
+    // setImmediate queued by the (earlier) assistant.text event, and callbacks run FIFO.
+    setImmediate(() => {
+      void this.#turnEnded(event.sessionId, turnStartedAt, this.#deps.now()).catch((error) => {
+        logger.warn({ err: error, brain: event.sessionId }, 'task-pair: Brain decision follow-up failed');
+      });
     });
+  }
+
+  #noteReplyMarkers(entries: readonly ArmedNotice[], payload: Record<string, unknown>): void {
+    if (payload.streaming === true || payload.automation === true) return;
+    const text = typeof payload.text === 'string' ? payload.text : '';
+    if (!text.includes(TASK_PAIR_MARKER_TAG)) return;
+    const delivered = entries.filter((entry) => entry.deliveredAt !== undefined);
+    if (delivered.length === 0) return;
+    for (const marker of scanTaskPairMarkers(text).markers) {
+      if (!marker.knownVerb || !(TASK_PAIR_BRAIN_DECISION_VERBS as readonly string[]).includes(marker.knownVerb)) continue;
+      for (const entry of delivered) if (entry.taskIds.includes(marker.taskId)) entry.touched.add(marker.taskId);
+    }
   }
 
   async #turnEnded(brain: string, turnStartedAt: number | undefined, now: number): Promise<void> {

@@ -599,6 +599,55 @@ describe('task-pair heartbeat, replacement and queue', () => {
       expect(sentTo(BRAIN, 'brain-decision-followup')).toHaveLength(1);
     });
 
+    for (const [verb, line] of [['DONE', 'DONE FU_MARKER force=true'], ['CANCEL', 'CANCEL FU_MARKER']] as const) {
+      it(`a ${verb} marker in Brain's closing reply is a decision even though the service applies it after the idle event (real ingest order)`, async () => {
+        taskPairService.init();
+        const off = timelineEmitter.on((event) => automation.observeTimelineEvent(event));
+        const emit = (type: string, payload: Record<string, unknown>) => timelineEmitter.emit(BRAIN, type, payload, { source: 'daemon', confidence: 'high', eventId: `fu-${verb}-${type}-${turn += 1}` });
+        try {
+          await awaitingPair('FU_MARKER');
+          const noticeId = lastNoticeId('brain-line-done-no-auditor');
+          sent = [];
+          emit('session.state', { state: 'running' });
+          emit('transport.queue.delivery', { clientMessageId: noticeId });
+          // Exactly the provider's order: the final text, then idle, in one synchronous segment.
+          emit('assistant.text', { text: `decided\n<!-- IMCODES_TASK ${line} -->`, streaming: false });
+          emit('session.state', { state: 'idle' });
+          expect(pair('FU_MARKER').status).toBe('awaiting_brain_decision'); // the marker is not applied yet
+          await flush();
+          await new Promise<void>((resolve) => setImmediate(resolve));
+          await flush();
+          expect(pair('FU_MARKER').status).toBe(verb === 'DONE' ? 'done' : 'cancelled');
+          expect(sentTo(BRAIN, 'brain-decision-followup')).toHaveLength(0);
+        } finally {
+          off();
+          await taskPairService.dispose();
+        }
+      });
+    }
+
+    it('a marker naming another pair does not suppress the follow-up', async () => {
+      taskPairService.init();
+      const off = timelineEmitter.on((event) => automation.observeTimelineEvent(event));
+      const emit = (type: string, payload: Record<string, unknown>) => timelineEmitter.emit(BRAIN, type, payload, { source: 'daemon', confidence: 'high', eventId: `fu-other-${type}-${turn += 1}` });
+      try {
+        await awaitingPair('FU_MARKER_A');
+        const noticeId = lastNoticeId('brain-line-done-no-auditor');
+        sent = [];
+        emit('session.state', { state: 'running' });
+        emit('transport.queue.delivery', { clientMessageId: noticeId });
+        emit('assistant.text', { text: 'ok\n<!-- IMCODES_TASK DONE SOME_OTHER_PAIR force=true -->', streaming: false });
+        emit('session.state', { state: 'idle' });
+        await flush();
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        await flush();
+        expect(sentTo(BRAIN, 'brain-decision-followup')).toHaveLength(1);
+      } finally {
+        off();
+        await taskPairService.dispose();
+      }
+    });
+
     it('a pair that already ended, or never awaited a decision, or belongs to another Brain, gets no follow-up', async () => {
       await awaitingPair('FU_ENDED');
       const noticeId = lastNoticeId('brain-line-done-no-auditor');

@@ -66,6 +66,8 @@ export interface TaskPairBrainNotice {
 }
 /** Daemon notices that ask Brain to decide a pair awaiting its decision; each earns at most one follow-up. */
 export const TASK_PAIR_BRAIN_DECISION_NOTICE_REASONS = ['brain-line-done-no-auditor', 'brain-decision-reminder', 'brain-heartbeat'] as const;
+/** Marker verbs through which Brain decides or continues a pair; naming a pair with one in its reply is an action on it. */
+export const TASK_PAIR_BRAIN_DECISION_VERBS = ['DONE', 'CANCEL', 'NEXT_ROUND', 'REASSIGN', 'DISPATCH', 'QUEUE'] as const;
 /** The single short follow-up sent when Brain's turn ended without touching such a pair. */
 export const TASK_PAIR_BRAIN_DECISION_FOLLOWUP_REASON = 'brain-decision-followup' as const;
 /**
