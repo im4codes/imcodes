@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { SessionRecord } from '../../src/store/session-store.js';
-import { clearSendIdempotencyCacheForTests, dispatchSendMessage } from '../../src/daemon/send-tool.js';
+import { clearSendIdempotencyCacheForTests, dispatchSendMessage, listSendTargets } from '../../src/daemon/send-tool.js';
 import { TaskPairStore, setTaskPairStoreForTests } from '../../src/daemon/task-pairs/store.js';
 import { resolveForcedProvisionConfig } from '../../src/daemon/forced-provision-config.js';
 import type { SupervisionAutoProvisionRequest } from '../../src/daemon/supervision-auto-provision.js';
@@ -157,5 +157,29 @@ describe('resolveForcedProvisionConfig', () => {
     expect(resolveForcedProvisionConfig(anthropicBrain(), 'primary')).toMatchObject({ ok: true, source: 'default_same_family_secondary' });
     const pooled = poolConfig('codex-sdk', 'openai', 'gpt-5.6-sol');
     expect(resolveForcedProvisionConfig(brainWithPool(anthropicBrain(), [pooled]), 'primary')).toMatchObject({ ok: true, source: 'configured_pool', config: pooled });
+  });
+});
+
+describe('send_list_targets: auto-created sessions are recognisable', () => {
+  beforeEach(() => setTaskPairStoreForTests(new TaskPairStore(':memory:')));
+  afterEach(() => setTaskPairStoreForTests(undefined));
+
+  it('shows who created a session something other than the user made, and nothing for the user\'s own', () => {
+    const brain = anthropicBrain();
+    const made = session({
+      name: 'deck_sub_send_auto_a', projectName: 'alpha', role: 'w1', parentSession: brain.name, agentType: 'claude-code-sdk',
+      pairCreatedMetadata: { autoCreated: true, createdBy: brain.name, source: 'send_auto_provision', createdAt: 1 },
+    });
+    const forPair = session({
+      name: 'deck_sub_pair_auto_b', projectName: 'alpha', role: 'w2', parentSession: brain.name, agentType: 'claude-code-sdk',
+      pairCreatedMetadata: { autoCreated: true, createdBy: brain.name, source: 'pair_create', pairTaskId: 'tsk_7', role: 'executor', createdAt: 1 },
+    });
+    const own = session({ name: 'deck_sub_mine', projectName: 'alpha', role: 'w3', parentSession: brain.name, agentType: 'claude-code-sdk', userCreated: true });
+    const result = listSendTargets(caller, {}, { listSessions: () => [brain, made, forPair, own] }) as { status: string; items: Array<Record<string, unknown>> };
+    const byName = new Map(result.items.map((target) => [target.sessionName as string, target]));
+    expect(byName.get('deck_sub_send_auto_a')).toMatchObject({ autoCreated: { createdBy: 'deck_alpha_brain' } });
+    expect(byName.get('deck_sub_send_auto_a')!.autoCreated).not.toHaveProperty('pairTaskId');
+    expect(byName.get('deck_sub_pair_auto_b')).toMatchObject({ autoCreated: { createdBy: 'deck_alpha_brain', pairTaskId: 'tsk_7' } });
+    expect(byName.get('deck_sub_mine')).not.toHaveProperty('autoCreated');
   });
 });

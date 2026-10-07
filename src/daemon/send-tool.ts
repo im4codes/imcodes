@@ -122,6 +122,7 @@ import type {
 } from '../../shared/supervision-execution-pool.js';
 import { resolveForcedProvisionConfig } from './forced-provision-config.js';
 import type { TaskPairCreatedSessionReason } from '../../shared/task-pair.js';
+import { readCreationMarker } from './session-close.js';
 import type { SupervisionAuditorRecoveryCrossVendorAvailability } from '../../shared/supervision-auditor-recovery.js';
 import { LOAD_VALIDATION_SAFETY_CLAUSE } from '../../shared/load-validation-safety.js';
 import type {
@@ -266,6 +267,11 @@ export interface SendTargetInfo {
   lastToolCallAt?: number;
   /** Open task-pair memberships, projected without provider calls. */
   openPairs?: Array<{ taskId: string; role: 'brain' | 'executor' | 'auditor'; status: string; round: number; title?: string }>;
+  /**
+   * Present when something other than the user created this session (a pair, or task.autoProvision): who asked for it. Nothing
+   * closes such a session by itself; its creator or the Brain closes it with session_close when it is no longer needed.
+   */
+  autoCreated?: { createdBy: string; pairTaskId?: string };
   /**
    * Whether this target can actually take work right now.
    *
@@ -6043,6 +6049,7 @@ function toTargetInfo(
   const modelDisplay = optionalModelField(s.modelDisplay);
   const qwenModel = optionalModelField(s.qwenModel);
   const activity = sessionActivityOf(s.name);
+  const creationMarker = readCreationMarker(s);
   const openPairs = getTaskPairStore().pairsForSession(s.name)
     .filter((pair) => pair.state.brain === s.name || pair.state.executor === s.name || pair.state.auditor === s.name)
     .map((pair) => ({
@@ -6068,6 +6075,7 @@ function toTargetInfo(
     ...(activity?.lastMessageAt === undefined ? {} : { lastMessageAt: activity.lastMessageAt }),
     ...(activity?.lastToolCallAt === undefined ? {} : { lastToolCallAt: activity.lastToolCallAt }),
     ...(openPairs.length === 0 ? {} : { openPairs }),
+    ...(creationMarker ? { autoCreated: { createdBy: creationMarker.createdBy, ...(creationMarker.pairTaskId ? { pairTaskId: creationMarker.pairTaskId } : {}) } } : {}),
     providerFamily: resolvePeerAuditProviderFamily(s),
     availability: availability.availability,
     ...(eligiblePools === undefined ? {} : {
