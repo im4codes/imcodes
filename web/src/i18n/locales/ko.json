@@ -1185,7 +1185,7 @@
     "created_unavailable": "이 시스템은 만든 날짜를 기록하지 않습니다.",
     "detail_unreadable": "이 항목의 상세 정보를 읽을 수 없습니다.",
     "notice_truncated": "일치하는 {{total}}개 중 {{shown}}개를 표시합니다. 정렬과 필터는 컴퓨터에서 전체 항목에 대해 수행되었습니다. 나머지를 보려면 필터를 좁히세요.",
-    "notice_truncated_partial": "일치하는 {{total}}개 중 {{shown}}개를 표시합니다. 이 폴더는 매우 커서 정렬이 일부만 대상으로 합니다. 완전한 결과를 보려면 필터를 좁히세요.",
+    "notice_truncated_partial": "일치하는 {{total}}개 중 {{shown}}개를 표시합니다. 정렬은 처음 {{limit}}개 또는 컴퓨터가 시간 초과되기 전에 읽은 항목만 대상으로 합니다. 완전한 결과를 보려면 필터를 좁히세요.",
     "notice_capped": "이 컴퓨터는 이름순으로 처음 {{count}}개 항목만 표시합니다. IM.codes를 업데이트하면 모든 항목을 정렬하고 필터링할 수 있습니다.",
     "date_relative": "{{day}} {{time}}",
     "kind": {
@@ -1223,7 +1223,8 @@
       "torrent": "토런트 파일",
       "shortcut": "바로가기",
       "partial_download": "미완료 다운로드"
-    }
+    },
+    "notice_partial": "정렬은 처음 {{limit}}개 또는 컴퓨터가 시간 초과되기 전에 읽은 항목만 대상으로 합니다. 완전한 결과를 보려면 필터를 좁히세요."
   },
   "toast": {
     "finished": "완료됨",

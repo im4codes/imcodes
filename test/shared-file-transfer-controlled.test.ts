@@ -118,8 +118,16 @@ describe('controlled file-transfer trust boundary', () => {
       requestId: 'directory-1',
       path: 'C:\\Users',
       resolvedPath: 'C:\\Users',
-      entries: [{ name: 'Public', path: 'C:\\Users\\Public', isDir: true, hidden: false, size: 1 }],
+      entries: [{ name: 'Public', path: 'C:\\Users\\Public', isDir: true, hidden: false, owner: 'root' }],
     }).ok).toBe(false);
+    // File details are a known extension (answers to a listing query), not an unknown field.
+    expect(validateControlledFileTransferResponse({
+      type: FILE_TRANSFER_MSG.DIRECTORY_LIST_DONE,
+      requestId: 'directory-1',
+      path: 'C:\\Users',
+      resolvedPath: 'C:\\Users',
+      entries: [{ name: 'report.txt', path: 'C:\\Users\\report.txt', isDir: false, hidden: false, size: 1, mtimeMs: 2 }],
+    }).ok).toBe(true);
   });
 
   it('accepts a bounded selected destination only on the upload-fetch shape', () => {

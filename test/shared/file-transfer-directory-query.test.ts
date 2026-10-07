@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { CONTROLLED_NODE_CAPABILITIES, parseAdvertisedControlledNodeCapabilities } from '../../shared/controlled-node-capabilities.js';
 import {
   FILE_TRANSFER_DIRECTORY_CAPABILITY,
+  FILE_TRANSFER_DIRECTORY_MAX_ENTRIES,
   FILE_TRANSFER_DIRECTORY_QUERY_CAPABILITY,
   FILE_TRANSFER_MSG,
   isFileDirectoryListQuery,
@@ -22,19 +23,25 @@ const done = (extra: Record<string, unknown> = {}, entries: unknown[] = [entry])
   type: FILE_TRANSFER_MSG.DIRECTORY_LIST_DONE, requestId: 'req-1', path: '/d', resolvedPath: '/d', entries, ...extra,
 });
 
+describe('directory listing protocol: the 512-entry bound the table view relies on', () => {
+  // The browser's table view renders every row of a directory without windowing
+  // (10,000 rows take seconds to draw). That is safe only because no listing
+  // can carry more than FILE_TRANSFER_DIRECTORY_MAX_ENTRIES entries. If a path
+  // with more rows per directory is ever added, it needs a render window first
+  // (for example 1,000 rows plus a "show more" row); do not just raise this.
+  it('no peer can deliver more than FILE_TRANSFER_DIRECTORY_MAX_ENTRIES entries in one listing', () => {
+    expect(FILE_TRANSFER_DIRECTORY_MAX_ENTRIES).toBe(512);
+    const entries = (count: number) => Array.from({ length: count }, (_, index) => ({ name: `f${index}`, path: `/d/f${index}`, isDir: false, hidden: false }));
+    expect(validateControlledFileTransferResponse(done({}, entries(FILE_TRANSFER_DIRECTORY_MAX_ENTRIES))).ok).toBe(true);
+    expect(validateControlledFileTransferResponse(done({}, entries(FILE_TRANSFER_DIRECTORY_MAX_ENTRIES + 1))).ok).toBe(false);
+  });
+});
+
 describe('directory listing protocol: the query capability', () => {
   it('is advertised as a controlled-node capability and survives an old server\'s advertisement filter', () => {
     expect(CONTROLLED_NODE_CAPABILITIES).toContain(FILE_TRANSFER_DIRECTORY_QUERY_CAPABILITY);
     const parsed = parseAdvertisedControlledNodeCapabilities([FILE_TRANSFER_DIRECTORY_CAPABILITY, FILE_TRANSFER_DIRECTORY_QUERY_CAPABILITY, 'some.future.capability.v9']);
     expect(parsed).toEqual({ ok: true, value: [FILE_TRANSFER_DIRECTORY_CAPABILITY, FILE_TRANSFER_DIRECTORY_QUERY_CAPABILITY] });
-  });
-
-  it('no platform advertises more than the 32 capabilities an older server accepts (older servers close the connection past it)', () => {
-    const exclusive = { windows: ['.macos.', '.linux.', 'macos', 'linux'], macos: ['.windows.', '.linux.', 'windows', 'linux'], linux: ['.windows.', '.macos.', 'windows', 'macos'] };
-    for (const [platform, other] of Object.entries(exclusive)) {
-      const advertised = CONTROLLED_NODE_CAPABILITIES.filter((capability) => !other.some((marker) => capability.includes(marker)));
-      expect(advertised.length, platform).toBeLessThanOrEqual(32);
-    }
   });
 
   it('a plain request is exactly the legacy shape and still validates', () => {
@@ -88,14 +95,24 @@ describe('directory listing protocol: the query capability', () => {
     }
   });
 
+  it('accepts `partial` on its own: a listing that was not cut can still have been ordered over only part of itself', () => {
+    const checked = validateControlledFileTransferResponse(done({ partial: true }));
+    expect(checked.ok).toBe(true);
+    if (checked.ok) {
+      expect(checked.value).toMatchObject({ partial: true });
+      expect(checked.value).not.toHaveProperty('truncated');
+    }
+  });
+
   it('rejects flags that contradict each other or the delivered entries', () => {
     expect(validateControlledFileTransferResponse(done({ total: 9 })).ok).toBe(false);
-    expect(validateControlledFileTransferResponse(done({ partial: true })).ok).toBe(false);
+    expect(validateControlledFileTransferResponse(done({ partial: false })).ok).toBe(false);
     expect(validateControlledFileTransferResponse(done({ truncated: false, total: 9 })).ok).toBe(false);
     expect(validateControlledFileTransferResponse(done({ truncated: true })).ok).toBe(false);
     expect(validateControlledFileTransferResponse(done({ truncated: true, total: 0 })).ok).toBe(false);
     expect(validateControlledFileTransferResponse(done({ truncated: true, total: 1.5 })).ok).toBe(false);
     expect(validateControlledFileTransferResponse(done({ truncated: true, total: 1, partial: false })).ok).toBe(false);
+    expect(validateControlledFileTransferResponse(done({ truncated: true, total: 1, partial: true })).ok).toBe(true);
   });
 
   it('rejects bad entry metadata instead of passing NaN, negatives or strings on', () => {

@@ -531,6 +531,14 @@ describe('file-transfer upload route', () => {
       expect(sendFileTransferRequestMock).not.toHaveBeenCalled();
     });
 
+    it('echoes partial without truncated', async () => {
+      sendFileTransferRequestMock.mockResolvedValueOnce(listDone({ partial: true }));
+      const res = await post({ path: '/d', query: { sort: querySort } });
+      const body = await res.json() as Record<string, unknown>;
+      expect(body).toMatchObject({ ok: true, partial: true });
+      expect(body).not.toHaveProperty('truncated');
+    });
+
     it('a plain request is forwarded without a query and answered without truncation fields', async () => {
       sendFileTransferRequestMock.mockResolvedValueOnce(listDone({}));
       const res = await post({ path: '/d' });

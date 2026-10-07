@@ -1185,7 +1185,7 @@
     "created_unavailable": "This system does not record creation times.",
     "detail_unreadable": "The details of this item could not be read.",
     "notice_truncated": "Showing {{shown}} of {{total}} matching items. The computer sorted and filtered them all; narrow the filter to see the rest.",
-    "notice_truncated_partial": "Showing {{shown}} of {{total}} matching items. This folder is very large, so the order covers only part of it; narrow the filter for a complete answer.",
+    "notice_truncated_partial": "Showing {{shown}} of {{total}} matching items. The order covers only the first {{limit}} items, or those read before the computer ran out of time; narrow the filter for a complete answer.",
     "notice_capped": "This computer lists only the first {{count}} items, in name order. Update its IM.codes to sort and filter every item.",
     "date_relative": "{{day}} at {{time}}",
     "kind": {
@@ -1223,7 +1223,8 @@
       "torrent": "Torrent File",
       "shortcut": "Shortcut",
       "partial_download": "Incomplete Download"
-    }
+    },
+    "notice_partial": "The order covers only the first {{limit}} items, or those read before the computer ran out of time; narrow the filter for a complete answer."
   },
   "toast": {
     "finished": "finished",

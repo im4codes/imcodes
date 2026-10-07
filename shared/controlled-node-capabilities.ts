@@ -76,6 +76,15 @@ export type ControlledNodeCapability = typeof CONTROLLED_NODE_CAPABILITIES[numbe
 // `test/shared/file-transfer-directory-query.test.ts` pins that no platform's
 // advertisement exceeds 32.
 export const CONTROLLED_NODE_CAPABILITY_MAX_ITEMS = 40;
+/**
+ * What ONE node may advertise while any server that predates the 40 bound is
+ * still deployed: those servers answer a longer list by closing the connection
+ * (`invalid_capabilities`, close code 4002), which locks the node out entirely.
+ * The registry above lists every platform's entries, so it is longer than any
+ * single node's advertisement; `test/shared/controlled-node-capability-bound.test.ts`
+ * fails the moment some platform's share of it passes this number.
+ */
+export const CONTROLLED_NODE_ADVERTISED_MAX_ITEMS_FOR_OLDER_SERVERS = 32;
 export const CONTROLLED_NODE_CAPABILITY_MAX_LENGTH = 128;
 const CONTROLLED_NODE_CAPABILITY_ADVERTISEMENT_PATTERN = /^[a-z0-9][a-z0-9._-]*$/;
 

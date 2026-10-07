@@ -277,6 +277,22 @@ describe('FileBrowser table view: a listing the machine cut', () => {
     expect(last().requestId).toBe(calls[2]!.requestId);
   });
 
+  it('says when the order covers only part of the matches, cut or not', async () => {
+    const cut = mount({ directoryQuery: true });
+    cut.respond(cut.calls[0]!.requestId, FILES, { truncated: true, total: 90_000, partial: true });
+    expect((cut.view.container as HTMLElement).querySelector('.fb-list-notice')?.textContent).toContain('file_browser.notice_truncated_partial');
+    expect((cut.view.container as HTMLElement).querySelector('.fb-list-notice')?.textContent).toContain('50,000');
+    cut.view.unmount();
+
+    const notCut = mount({ directoryQuery: true });
+    notCut.respond(notCut.calls[0]!.requestId, FILES, { partial: true });
+    const container = notCut.view.container as HTMLElement;
+    expect(container.querySelector('.fb-list-notice')?.textContent).toContain('file_browser.notice_partial');
+    // An order built from only part of the matches is re-asked, not re-sorted here.
+    fireEvent.click(header(container, 'size'));
+    await waitFor(() => expect(notCut.calls).toHaveLength(2));
+  });
+
   it('only the answer to the LAST ask is used; a superseded request is forgotten and its late answer dropped', async () => {
     const { view, respond, calls, forgetOwnedDataRequest } = mount({ directoryQuery: true });
     respond(calls[0]!.requestId, FILES, { truncated: true, total: 900 });

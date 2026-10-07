@@ -487,7 +487,8 @@ export interface FileDirectoryListDone {
   /**
    * The order was computed over only part of the matching entries: more matched
    * than the stat limit allows, or the time budget ran out before every one
-   * had been stat'd. `total` is still the full count of matches.
+   * had been stat'd. Independent of `truncated`; `total` is still the full
+   * count of matches.
    */
   partial?: true;
 }
@@ -907,13 +908,14 @@ export function validateControlledFileTransferResponse(
       || v.entries.length > FILE_TRANSFER_DIRECTORY_MAX_ENTRIES) {
       return { ok: false, error: 'invalid_directory_list_done' };
     }
-    // `total` and `partial` mean something only next to `truncated`,
-    // and a total below what was actually delivered is a lie.
-    const truncatedFlags = v.truncated === undefined
-      ? v.total === undefined && v.partial === undefined
-      : v.truncated === true
-        && Number.isSafeInteger(v.total) && (v.total as number) >= v.entries.length
-        && (v.partial === undefined || v.partial === true);
+    // `total` means something only next to `truncated`, and a total below what
+    // was actually delivered is a lie. `partial` stands on its own: a listing
+    // that was not cut can still have been ordered over only part of itself
+    // (the time budget ran out before every entry was stat'd).
+    const truncatedFlags = (v.truncated === undefined
+      ? v.total === undefined
+      : v.truncated === true && Number.isSafeInteger(v.total) && (v.total as number) >= v.entries.length)
+      && (v.partial === undefined || v.partial === true);
     if (!truncatedFlags) return { ok: false, error: 'invalid_directory_list_done' };
     const entries: FileDirectoryEntry[] = [];
     for (const entry of v.entries) {
@@ -952,11 +954,8 @@ export function validateControlledFileTransferResponse(
         path: v.path,
         resolvedPath: v.resolvedPath,
         entries,
-        ...(v.truncated === true ? {
-          truncated: true as const,
-          total: v.total as number,
-          ...(v.partial === true ? { partial: true as const } : {}),
-        } : {}),
+        ...(v.truncated === true ? { truncated: true as const, total: v.total as number } : {}),
+        ...(v.partial === true ? { partial: true as const } : {}),
       },
     };
   }

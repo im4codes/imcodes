@@ -1185,7 +1185,7 @@
     "created_unavailable": "Este sistema no registra la fecha de creación.",
     "detail_unreadable": "No se pudieron leer los detalles de este elemento.",
     "notice_truncated": "Mostrando {{shown}} de {{total}} elementos coincidentes. El equipo los ordenó y filtró todos; acota el filtro para ver el resto.",
-    "notice_truncated_partial": "Mostrando {{shown}} de {{total}} elementos coincidentes. Esta carpeta es muy grande, así que el orden solo abarca una parte; acota el filtro para un resultado completo.",
+    "notice_truncated_partial": "Mostrando {{shown}} de {{total}} elementos coincidentes. El orden abarca solo los primeros {{limit}} elementos, o los leídos antes de que el equipo se quedara sin tiempo; acota el filtro para un resultado completo.",
     "notice_capped": "Este equipo solo lista los primeros {{count}} elementos, por nombre. Actualiza su IM.codes para ordenar y filtrar todos los elementos.",
     "date_relative": "{{day}} a las {{time}}",
     "kind": {
@@ -1223,7 +1223,8 @@
       "torrent": "Archivo torrent",
       "shortcut": "Acceso directo",
       "partial_download": "Descarga incompleta"
-    }
+    },
+    "notice_partial": "El orden abarca solo los primeros {{limit}} elementos, o los leídos antes de que el equipo se quedara sin tiempo; acota el filtro para un resultado completo."
   },
   "toast": {
     "finished": "terminó",

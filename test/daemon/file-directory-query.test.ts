@@ -129,6 +129,8 @@ describe('node-side directory query (filter, order, THEN truncate)', () => {
       statEntry: async () => { clock += 30; return { size: 1, mtimeMs: 1, birthtimeMs: 1 }; },
     });
     expect(result.partial).toBe(true);
+    // Partial is not the same as truncated: all 40 are listed, only the order is incomplete.
+    expect(result.truncated).toBeUndefined();
     expect(result.entries.filter((e) => e.size !== undefined).length).toBeLessThan(40);
   });
 

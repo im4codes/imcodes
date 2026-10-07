@@ -54,8 +54,11 @@ describe('listMachineDirectories', () => {
   });
 
   it('ignores a truncation flag without a usable total, and an answer from an older server has no extra fields at all', async () => {
-    apiFetch.mockResolvedValue({ ok: true, resolvedPath: '/d', entries: [entry], truncated: true, total: 'many', partial: true });
+    apiFetch.mockResolvedValue({ ok: true, resolvedPath: '/d', entries: [entry], truncated: true, total: 'many' });
     expect(await listMachineDirectories('srv', '/d')).toEqual({ resolvedPath: '/d', entries: [entry] });
+    // A listing that was not cut can still have been ordered over only part of itself.
+    apiFetch.mockResolvedValue({ ok: true, resolvedPath: '/d', entries: [entry], partial: true });
+    expect(await listMachineDirectories('srv', '/d')).toEqual({ resolvedPath: '/d', entries: [entry], partial: true });
     apiFetch.mockResolvedValue({ ok: true, resolvedPath: '/d', entries: [entry] });
     expect(await listMachineDirectories('srv', '/d')).toEqual({ resolvedPath: '/d', entries: [entry] });
   });

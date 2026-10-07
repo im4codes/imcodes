@@ -14,7 +14,7 @@ import {
   type FileBrowserSortState,
 } from '@shared/file-browser-sort.js';
 import { fileKindOf } from '@shared/file-kind.js';
-import { FILE_TRANSFER_DIRECTORY_MAX_ENTRIES, type FileDirectoryListQuery } from '@shared/transport/file-transfer.js';
+import { FILE_TRANSFER_DIRECTORY_MAX_ENTRIES, FILE_TRANSFER_DIRECTORY_QUERY_MAX_STAT_ENTRIES, type FileDirectoryListQuery } from '@shared/transport/file-transfer.js';
 import {
   FILE_BROWSER_NARROW_MAX_WIDTH_PX,
   fileKindLabel,
@@ -246,7 +246,7 @@ type FsNode = {
    * browser can sort and filter it with no request. Otherwise the machine
    * filtered or cut it, and a different sort or filter needs a new request.
    */
-  listing?: { complete: boolean; truncated?: { total: number; partial?: boolean } };
+  listing?: { complete: boolean; truncated?: { total: number }; partial?: true };
 };
 
 interface FileBrowserSnapshot {
@@ -1004,15 +1004,16 @@ export function FileBrowser({
             ...(typeof e.mtimeMs === 'number' ? { mtimeMs: e.mtimeMs } : {}),
             ...(typeof e.birthtimeMs === 'number' ? { birthtimeMs: e.birthtimeMs } : {}),
           }));
-        const truncated = msg.truncated === true && typeof msg.total === 'number'
-          ? { total: msg.total, ...(msg.partial === true ? { partial: true } : {}) }
-          : undefined;
+        const truncated = msg.truncated === true && typeof msg.total === 'number' ? { total: msg.total } : undefined;
+        const partial = msg.partial === true;
         // Everything is here only when the machine neither cut the listing nor
         // narrowed it by name. (A machine that cannot be queried returns what
         // it returns, and that is all the browser can go on.)
         const listing: FsNode['listing'] = {
-          complete: !truncated && (!queryUsed?.hadQuery || !queryUsed.filter),
+          // An order built from only part of the matches is not the order of the whole.
+          complete: !truncated && !partial && (!queryUsed?.hadQuery || !queryUsed.filter),
           ...(truncated ? { truncated } : {}),
+          ...(partial ? { partial: true as const } : {}),
         };
 
         loadedRef.current.add(nodeId);
@@ -1994,12 +1995,14 @@ export function FileBrowser({
   const listNotice = (() => {
     if (!listView || !rootNode) return undefined;
     const listing = rootNode.listing;
+    const shown = rootChildren?.length ?? 0;
+    const limit = FILE_TRANSFER_DIRECTORY_QUERY_MAX_STAT_ENTRIES.toLocaleString(uiLocale);
     if (listing?.truncated) {
-      const shown = rootChildren?.length ?? 0;
-      return listing.truncated.partial
-        ? t('file_browser.notice_truncated_partial', { shown, total: listing.truncated.total })
+      return listing.partial
+        ? t('file_browser.notice_truncated_partial', { shown, total: listing.truncated.total, limit })
         : t('file_browser.notice_truncated', { shown, total: listing.truncated.total });
     }
+    if (listing?.partial) return t('file_browser.notice_partial', { limit });
     // An older machine cut the listing to its entry limit by name and said nothing.
     if (!directoryQuery && (rootChildren?.length ?? 0) >= FILE_TRANSFER_DIRECTORY_MAX_ENTRIES) {
       return t('file_browser.notice_capped', { count: FILE_TRANSFER_DIRECTORY_MAX_ENTRIES });

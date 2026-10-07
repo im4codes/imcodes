@@ -1185,7 +1185,7 @@
     "created_unavailable": "此系統不記錄建立時間。",
     "detail_unreadable": "無法讀取此項目的詳細資訊。",
     "notice_truncated": "顯示 {{total}} 個符合項目中的 {{shown}} 個。排序與篩選已在這台電腦上對全部項目完成；縮小篩選範圍可查看其餘項目。",
-    "notice_truncated_partial": "顯示 {{total}} 個符合項目中的 {{shown}} 個。此資料夾非常大，排序只涵蓋其中一部分；縮小篩選範圍可取得完整結果。",
+    "notice_truncated_partial": "顯示 {{total}} 個符合項目中的 {{shown}} 個。排序只涵蓋前 {{limit}} 項，或這台電腦在逾時前讀取到的項目；縮小篩選範圍可取得完整結果。",
     "notice_capped": "這台電腦只列出依名稱排列的前 {{count}} 項。更新它的 IM.codes 後才能對所有項目排序與篩選。",
     "date_relative": "{{day}} {{time}}",
     "kind": {
@@ -1223,7 +1223,8 @@
       "torrent": "種子檔案",
       "shortcut": "捷徑",
       "partial_download": "未完成的下載"
-    }
+    },
+    "notice_partial": "排序只涵蓋前 {{limit}} 項，或這台電腦在逾時前讀取到的項目；縮小篩選範圍可取得完整結果。"
   },
   "toast": {
     "finished": "已完成",

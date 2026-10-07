@@ -193,7 +193,7 @@ export interface MachineDirectoryList {
   /** More entries matched the query than `entries` carries; only a node that answers queries says so. */
   truncated?: true;
   total?: number;
-  /** The order was computed over only part of the matches (stat limit / time budget). */
+  /** The order was computed over only part of the matches (stat limit / time budget), cut or not. */
   partial?: true;
 }
 
@@ -243,7 +243,7 @@ export async function listMachineDirectories(
     resolvedPath: result.resolvedPath,
     entries: sanitized,
     ...(truncated ? { truncated: true as const, total } : {}),
-    ...(truncated && result.partial === true ? { partial: true as const } : {}),
+    ...(result.partial === true ? { partial: true as const } : {}),
   };
 }
 

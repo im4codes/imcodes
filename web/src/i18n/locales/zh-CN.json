@@ -1185,7 +1185,7 @@
     "created_unavailable": "此系统不记录创建时间。",
     "detail_unreadable": "无法读取此项目的详细信息。",
     "notice_truncated": "显示 {{total}} 个匹配项中的 {{shown}} 个。排序和过滤已在这台电脑上对全部项目完成；缩小过滤范围可查看其余项目。",
-    "notice_truncated_partial": "显示 {{total}} 个匹配项中的 {{shown}} 个。此文件夹非常大，排序只覆盖其中一部分；缩小过滤范围可获得完整结果。",
+    "notice_truncated_partial": "显示 {{total}} 个匹配项中的 {{shown}} 个。排序只覆盖前 {{limit}} 项，或这台电脑在超时前读取到的项目；缩小过滤范围可获得完整结果。",
     "notice_capped": "这台电脑只列出按名称排列的前 {{count}} 项。升级它的 IM.codes 后才能对所有项目排序和过滤。",
     "date_relative": "{{day}} {{time}}",
     "kind": {
@@ -1223,7 +1223,8 @@
       "torrent": "种子文件",
       "shortcut": "快捷方式",
       "partial_download": "未完成的下载"
-    }
+    },
+    "notice_partial": "排序只覆盖前 {{limit}} 项，或这台电脑在超时前读取到的项目；缩小过滤范围可获得完整结果。"
   },
   "toast": {
     "finished": "完成了",
