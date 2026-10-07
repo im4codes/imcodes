@@ -13,7 +13,7 @@ import { logAudit } from '../security/audit.js';
 import { requireAuth } from '../security/authorization.js';
 import logger from '../util/logger.js';
 import { AUTH_IDENTITY_ERRORS } from '../../../shared/auth-identity.js';
-import { EXPECTED_USER_ID_HEADER } from '../../../shared/http-header-names.js';
+import { EXPECTED_USER_ID_HEADER, SERVER_ID_HEADER } from '../../../shared/http-header-names.js';
 import { ENROLLMENT_OWNER_NAME_MAX_CHARS, NODE_ROLE, encodeEnrollmentTrailer, isEnrollmentNodeTokenHash } from '../../../shared/remote-exec.js';
 import { REMOTE_DESKTOP_PROTOCOL_VERSION } from '../../../shared/remote-desktop.js';
 import { buildWindowsAuthenticodeEnrollmentPlan } from '../../../shared/windows-authenticode-enrollment.js';
@@ -1500,7 +1500,7 @@ enrollRoutes.get('/v2/node-artifact', async (c) => {
   if (!m || !m[1]) return c.json({ error: 'missing_or_invalid_token' }, 401);
 
   const parsed = NODE_ARTIFACT_QUERY.safeParse({
-    serverId: c.req.query('serverId') ?? c.req.header('X-Server-Id') ?? '',
+    serverId: c.req.query('serverId') ?? c.req.header(SERVER_ID_HEADER) ?? '',
     os: c.req.query('os') ?? '',
     arch: c.req.query('arch') ?? '',
     asset: c.req.query('asset') ?? CONTROLLED_NODE_ARTIFACT_ASSETS.NODE,

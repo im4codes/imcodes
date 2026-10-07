@@ -10,6 +10,7 @@ import {
   type CapabilityErrorCode,
 } from '../../shared/capability-management.js';
 import type { ServerCapabilityCredentials } from './server-capability-service.js';
+import { daemonServerAuthHeaders } from '../../shared/daemon-server-auth.js';
 
 const DEFAULT_BLOB_REQUEST_TIMEOUT_MS = 20_000;
 const SHA256_PATTERN = /^[a-f0-9]{64}$/;
@@ -162,8 +163,7 @@ export class CapabilityBlobHttpClient {
         method: 'POST',
         signal: controller.signal,
         headers: {
-          Authorization: `Bearer ${credentials.token}`,
-          'X-Server-Id': credentials.serverId,
+          ...daemonServerAuthHeaders(credentials),
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({ capabilityId, action }),
@@ -219,8 +219,7 @@ export class CapabilityBlobHttpClient {
         ...init,
         signal: controller.signal,
         headers: {
-          Authorization: `Bearer ${credentials.token}`,
-          'X-Server-Id': credentials.serverId,
+          ...daemonServerAuthHeaders(credentials),
           [CAPABILITY_BLOB_TOKEN_HEADER]: access.singleUseToken,
           ...init.headers,
         },

@@ -9,13 +9,14 @@ import {
   handleSessionIdentityGet,
   handleSessionIdentityPut,
 } from './session-identity-http.js';
+import { SERVER_ID_HEADER } from '../../../shared/http-header-names.js';
 
 export const sessionIdentityRoutes = new Hono<{ Bindings: Env; Variables: { userId: string } }>();
 sessionIdentityRoutes.use('/*', requireAuth());
 
 /** A bounded snapshot lets one daemon synchronize only its live sessions. */
 sessionIdentityRoutes.get('/all', async (c) => {
-  const serverId = c.req.query('serverId') || c.req.header('X-Server-Id') || undefined;
+  const serverId = c.req.query('serverId') || c.req.header(SERVER_ID_HEADER) || undefined;
   const snapshot = await listSessionIdentityProfiles(
     c.env.DB,
     c.get('userId' as never) as string,

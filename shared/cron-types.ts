@@ -4,6 +4,15 @@ import type { MemoryMcpSourceProvenance } from './memory-mcp-provenance.js';
 
 export type CronActionType = 'command' | 'p2p' | 'send';
 
+/**
+ * Body `error` of a cron API 401 for a request that names a server (`X-Server-Id`) but carries no credential at all: a
+ * daemon that predates the credential the cron API now requires. Daemons print the body's `error`, so the code is the
+ * message the owner reads in the MCP tool result.
+ */
+export const CRON_API_AUTH_ERRORS = {
+  DAEMON_CREDENTIAL_REQUIRED: 'daemon_credential_required_upgrade_the_daemon',
+} as const;
+
 export const CRON_COMPLETION_POLICY = {
   /** Each dispatch completes one occurrence; the schedule remains active. */
   RECURRING: 'recurring',

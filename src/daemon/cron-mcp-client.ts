@@ -10,6 +10,7 @@ import type { MCPFeatureFlagValues } from '../../shared/memory-mcp-feature-flags
 import { validateMcpCronAction } from './cron-action-validator.js';
 import { DEVICE_TIMEZONE_HEADER } from '../../shared/http-header-names.js';
 import { normalizeClientTimezone } from '../../shared/client-timezone.js';
+import { daemonServerAuthHeaders } from '../../shared/daemon-server-auth.js';
 
 const CRON_EXPIRES_AT_MAX_MS = 90 * 24 * 60 * 60 * 1000;
 const CRON_LIST_LIMIT_MAX = 100;
@@ -18,6 +19,8 @@ const DEFAULT_TIMEOUT_MS = 15_000;
 export interface CronServerEndpoint {
   serverId: string;
   workerUrl: string;
+  /** The daemon's server token: the cron API refuses a request that does not present it. */
+  token: string;
 }
 
 export interface CronMcpClientOptions {
@@ -106,10 +109,11 @@ async function loadBoundEndpoint(): Promise<CronServerEndpoint | null> {
   try {
     const { loadCredentials } = await import('../bind/bind-flow.js');
     const creds = await loadCredentials();
-    if (!creds) return null;
+    if (!creds?.serverId || !creds.workerUrl || !creds.token) return null;
     return {
       serverId: creds.serverId,
       workerUrl: creds.workerUrl,
+      token: creds.token,
     };
   } catch {
     return null;
@@ -145,8 +149,8 @@ async function getEndpoint(
   options: CronMcpClientOptions,
 ): Promise<{ endpoint: CronServerEndpoint; runtimeServerId: string } | CronMcpFailure> {
   const endpoint = options.endpoint !== undefined ? options.endpoint : await loadBoundEndpoint();
-  if (!endpoint?.serverId || !endpoint.workerUrl) {
-    return error(MCP_ERROR_REASONS.IDENTITY_REJECTED, 'Cron MCP requires a local daemon cron endpoint');
+  if (!endpoint?.serverId || !endpoint.workerUrl || !endpoint.token) {
+    return error(MCP_ERROR_REASONS.IDENTITY_REJECTED, 'Cron MCP requires a bound daemon server credential');
   }
   const runtimeServerId = cleanRuntimeServerId(options.runtimeServerId) ?? cleanRuntimeServerId(endpoint.serverId);
   if (!runtimeServerId) return error(MCP_ERROR_REASONS.IDENTITY_REJECTED, 'Cron MCP requires local server identity');
@@ -203,7 +207,8 @@ async function requestCron(
     const res = await fetchImpl(cronUrl(endpoint, runtimeServerId, pathSuffix), {
       ...init,
       headers: {
-        'X-Server-Id': runtimeServerId,
+        // The credential names the BOUND server (the token belongs to it); the route names the server the job is for.
+        ...daemonServerAuthHeaders(endpoint),
         'Content-Type': 'application/json',
         ...(deviceTimezone ? { [DEVICE_TIMEZONE_HEADER]: deviceTimezone } : {}),
         ...init.headers,
@@ -211,6 +216,11 @@ async function requestCron(
       signal: controller.signal,
     });
     const body = await parseJsonResponse(res);
+    if (res.status === 401 || res.status === 403) {
+      // The server did not accept this daemon's credential (revoked or re-bound server token, or a server that has not
+      // been updated to this daemon yet). Say so: it is not a transient failure and retrying will not help.
+      return error(MCP_ERROR_REASONS.IDENTITY_REJECTED, `The server rejected this daemon's credential for the cron API (HTTP ${res.status}); re-bind the daemon (imcodes bind) or update the server`);
+    }
     if (!res.ok) {
       return error(MCP_ERROR_REASONS.INTERNAL_ERROR, responseMessage(body, `Cron request failed with status ${res.status}`));
     }

@@ -26,6 +26,7 @@ import {
   verificationMachineTargetError,
   type VerificationMachineScope,
 } from '../../../shared/verification-machine.js';
+import { SERVER_ID_HEADER } from '../../../shared/http-header-names.js';
 
 export const verificationMachineRoutes = new Hono<{
   Bindings: Env;
@@ -93,7 +94,7 @@ verificationMachineRoutes.put('/', async (c) => {
     kind,
     target: normalizeVerificationMachineTarget(String(body.target)),
     enabled: body.enabled !== false,
-    source: c.req.header('X-Server-Id') ? 'mcp' : 'web',
+    source: c.req.header(SERVER_ID_HEADER) ? 'mcp' : 'web',
     expectedRevision,
   });
   if (result === 'revision_conflict' || result === 'alias_conflict') {

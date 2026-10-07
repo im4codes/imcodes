@@ -24,6 +24,7 @@ import {
   type CapabilityStatusResult,
   type CapabilitySummary,
 } from '../../shared/capability-management.js';
+import { daemonServerAuthHeaders } from '../../shared/daemon-server-auth.js';
 
 export interface ServerCapabilityCredentials {
   serverId: string;
@@ -322,8 +323,7 @@ export class ServerCapabilityService implements CapabilityService {
         ...init,
         signal: controller.signal,
         headers: {
-          Authorization: `Bearer ${credentials.token}`,
-          'X-Server-Id': credentials.serverId,
+          ...daemonServerAuthHeaders(credentials),
           ...(init.body ? { 'Content-Type': 'application/json' } : {}),
           ...init.headers,
         },

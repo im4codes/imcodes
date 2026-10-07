@@ -227,13 +227,16 @@ async function buildTestApp(env: Env) {
   return app;
 }
 
-function jsonReq(method: string, path: string, body?: unknown): RequestInit {
+function jsonReq(method: string, path: string, body?: unknown, headers: Record<string, string> = {}): RequestInit {
   return {
     method,
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', ...headers },
     ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
   };
 }
+
+/** What the daemon presents: its server token plus the server it belongs to. (Auth itself is mocked in this file; cron-api-auth.test.ts runs the real middleware.) */
+const DAEMON_AUTH = { Authorization: 'Bearer server-token', 'X-Server-Id': 'srv-1' };
 
 // ── Tests ────────────────────────────────────────────────────────────────────
 
@@ -721,7 +724,7 @@ describe('Cron API routes', () => {
     it('does not let an agent bypass force by weakening recurring to until_complete first', async () => {
       const res = await app.request(
         '/api/server/srv-1/cron/job-update',
-        jsonReq('PUT', '', { completionPolicy: CRON_COMPLETION_POLICY.UNTIL_COMPLETE }),
+        jsonReq('PUT', '', { completionPolicy: CRON_COMPLETION_POLICY.UNTIL_COMPLETE }, DAEMON_AUTH),
       );
       expect(res.status).toBe(409);
       await expect(res.json()).resolves.toMatchObject({
@@ -731,7 +734,7 @@ describe('Cron API routes', () => {
 
       const forced = await app.request(
         '/api/server/srv-1/cron/job-update?force=true',
-        jsonReq('PUT', '', { completionPolicy: CRON_COMPLETION_POLICY.UNTIL_COMPLETE }),
+        jsonReq('PUT', '', { completionPolicy: CRON_COMPLETION_POLICY.UNTIL_COMPLETE }, DAEMON_AUTH),
       );
       expect(forced.status).toBe(200);
     });
@@ -805,7 +808,7 @@ describe('Cron API routes', () => {
           completion_policy: completionPolicy,
         });
 
-        const blocked = await app.request(`/api/server/srv-1/cron/${id}`, { method: 'DELETE' });
+        const blocked = await app.request(`/api/server/srv-1/cron/${id}`, { method: 'DELETE', headers: DAEMON_AUTH });
         expect(blocked.status).toBe(409);
         await expect(blocked.json()).resolves.toMatchObject({
           error: 'cron_force_required',
@@ -813,7 +816,7 @@ describe('Cron API routes', () => {
         });
         expect(mockDb.cronJobs.has(id)).toBe(true);
 
-        const forced = await app.request(`/api/server/srv-1/cron/${id}?force=true`, { method: 'DELETE' });
+        const forced = await app.request(`/api/server/srv-1/cron/${id}?force=true`, { method: 'DELETE', headers: DAEMON_AUTH });
         expect(forced.status).toBe(200);
         expect(mockDb.cronJobs.has(id)).toBe(false);
       }

@@ -33,6 +33,7 @@ import {
   deleteAlias,
   listAliases,
 } from '../db/alias-queries.js';
+import { SERVER_ID_HEADER } from '../../../shared/http-header-names.js';
 
 export const aliasRoutes = new Hono<{ Bindings: Env; Variables: { userId: string } }>();
 
@@ -101,7 +102,7 @@ aliasRoutes.post('/', async (c) => {
 
   // Provenance: the daemon (MCP agent write) authenticates with X-Server-Id +
   // Bearer; a browser (web app) uses the session cookie and never sends it.
-  const source = c.req.header('X-Server-Id') ? 'mcp' : 'web';
+  const source = c.req.header(SERVER_ID_HEADER) ? 'mcp' : 'web';
 
   const entry = await upsertAlias(c.env.DB, {
     id: randomHex(16),

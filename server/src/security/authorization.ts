@@ -8,7 +8,7 @@ import type { Database } from '../db/client.js';
 import { sha256Hex, verifyJwt } from './crypto.js';
 import { COOKIE_SESSION } from '../../../shared/cookie-names.js';
 import { AUTH_IDENTITY_ERRORS } from '../../../shared/auth-identity.js';
-import { EXPECTED_USER_ID_HEADER } from '../../../shared/http-header-names.js';
+import { EXPECTED_USER_ID_HEADER, SERVER_ID_HEADER } from '../../../shared/http-header-names.js';
 import { NODE_ROLE, type NodeRole, NODE_ROLE_REFUSAL } from '../../../shared/remote-exec.js';
 import {
   resolveControlledMachineOperatorAccess,
@@ -64,7 +64,7 @@ export async function resolveBearerAuth(
 
   // Try daemon server-token auth: X-Server-Id header + Bearer <server-token>
   // Allows the daemon to call REST endpoints without a user JWT.
-  const daemonServerId = c.req.header('X-Server-Id');
+  const daemonServerId = c.req.header(SERVER_ID_HEADER);
   if (daemonServerId) {
     // Read node_role + revoked_at authoritatively from the DB (never from the
     // client). A revoked credential is denied everywhere; a `controlled` node's

@@ -14,6 +14,7 @@ import { CRON_COMPLETION_POLICY } from '../../shared/cron-types.js';
 const endpoint = {
   serverId: 'srv-bound',
   workerUrl: 'https://worker.test/',
+  token: 'tok-bound',
 };
 
 const boundIdentity = {
@@ -44,7 +45,7 @@ describe('cron MCP client', () => {
     vi.clearAllMocks();
   });
 
-  it('uses pod-sticky /api/server/:serverId/cron without auth headers and strips forged identity fields', async () => {
+  it('uses pod-sticky /api/server/:serverId/cron with the daemon credential and strips forged identity fields', async () => {
     const fetchImpl = vi.fn(async () => okJson({ id: 'job-1' }));
 
     const result = await cronMcpCreate(makeCreateInput({
@@ -59,9 +60,10 @@ describe('cron MCP client', () => {
     const [url, init] = fetchImpl.mock.calls[0] as [string, RequestInit];
     expect(url).toBe('https://worker.test/api/server/srv-bound/cron');
     expect(url).not.toContain('/api/cron');
-    expect(init.headers).toMatchObject({ 'X-Server-Id': 'srv-bound' });
+    // The cron API acts as the owner of the server it names, so it needs the daemon's own credential (never a forged one).
+    expect(init.headers).toMatchObject({ Authorization: 'Bearer tok-bound', 'X-Server-Id': 'srv-bound' });
+    expect(JSON.stringify(init.headers)).not.toContain('tok-forged');
     expect(init.headers).toMatchObject({ [DEVICE_TIMEZONE_HEADER]: 'America/Denver' });
-    expect(init.headers).not.toHaveProperty('Authorization');
     const body = JSON.parse(String(init.body)) as Record<string, unknown>;
     expect(body.serverId).toBe('srv-bound');
     expect(body.userId).toBeUndefined();
@@ -355,21 +357,31 @@ describe('cron MCP client', () => {
 
     expect((fetchImpl.mock.calls[0] as [string, RequestInit])[0]).toBe('https://worker.test/api/server/srv-bound/cron?limit=100');
     expect((fetchImpl.mock.calls[1] as [string, RequestInit])[0]).toBe('https://worker.test/api/server/srv-runtime/cron?limit=100');
-    expect((fetchImpl.mock.calls[1] as [string, RequestInit])[1].headers).toMatchObject({ 'X-Server-Id': 'srv-runtime' });
-    expect((fetchImpl.mock.calls[1] as [string, RequestInit])[1].headers).not.toHaveProperty('Authorization');
+    // The credential always names the BOUND server (the token belongs to it); only the route names the runtime server.
+    expect((fetchImpl.mock.calls[1] as [string, RequestInit])[1].headers).toMatchObject({ Authorization: 'Bearer tok-bound', 'X-Server-Id': 'srv-bound' });
   });
 
-  it('does not require or forward a token from the local endpoint config', async () => {
-    const fetchImpl = vi.fn(async () => okJson({ jobs: [] }));
+  it('refuses to call the cron API without the daemon server credential, and never sends the request', async () => {
+    const fetchImpl = vi.fn();
 
-    await expect(cronMcpList({}, {
-      endpoint: { serverId: 'srv-local', workerUrl: 'http://127.0.0.1:19138' },
-      fetchImpl,
-    })).resolves.toMatchObject({ status: 'ok' });
+    for (const unbound of [
+      { serverId: 'srv-local', workerUrl: 'http://127.0.0.1:19138' },
+      { serverId: 'srv-local', workerUrl: 'http://127.0.0.1:19138', token: '' },
+    ]) {
+      const result = await cronMcpList({}, { endpoint: unbound as never, fetchImpl });
+      expect(result).toMatchObject({ status: 'error', reason: MCP_ERROR_REASONS.IDENTITY_REJECTED });
+    }
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
 
-    const [, init] = fetchImpl.mock.calls[0] as [string, RequestInit];
-    expect(init.headers).toMatchObject({ 'X-Server-Id': 'srv-local' });
-    expect(init.headers).not.toHaveProperty('Authorization');
+  it.each([401, 403])('says plainly that the server rejected the daemon credential (HTTP %i), without leaking the token', async (status) => {
+    const fetchImpl = vi.fn(async () => new Response(JSON.stringify({ error: 'unauthorized' }), { status, headers: { 'Content-Type': 'application/json' } }));
+
+    const result = await cronMcpList({}, { ...boundIdentity, fetchImpl });
+
+    expect(result).toMatchObject({ status: 'error', reason: MCP_ERROR_REASONS.IDENTITY_REJECTED });
+    expect(JSON.stringify(result)).toContain(String(status));
+    expect(JSON.stringify(result)).not.toContain('tok-bound');
   });
 
   it('sanitizes HTTP and thrown errors', async () => {

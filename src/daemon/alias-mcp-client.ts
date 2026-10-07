@@ -27,6 +27,7 @@ import {
 } from '../../shared/alias-types.js';
 import { MCP_ERROR_REASONS, type MCPErrorReason } from '../../shared/memory-mcp-errors.js';
 import { sanitizeMcpErrorMessage } from '../../shared/mcp-error-sanitize.js';
+import { daemonServerAuthHeaders } from '../../shared/daemon-server-auth.js';
 
 const DEFAULT_TIMEOUT_MS = 15_000;
 const ALIAS_LIST_LIMIT_MAX = 500;
@@ -170,8 +171,7 @@ async function requestAliases(
     const res = await fetchImpl(aliasUrl(endpoint, query), {
       method: 'GET',
       headers: {
-        Authorization: `Bearer ${endpoint.token}`,
-        'X-Server-Id': endpoint.serverId,
+        ...daemonServerAuthHeaders(endpoint),
       },
       signal: controller.signal,
     });
@@ -261,8 +261,7 @@ async function aliasWrite(
   timer.unref?.();
   try {
     const headers: Record<string, string> = {
-      Authorization: `Bearer ${endpoint.token}`,
-      'X-Server-Id': endpoint.serverId,
+      ...daemonServerAuthHeaders(endpoint),
     };
     if (body !== undefined) headers['Content-Type'] = 'application/json';
     const res = await fetchImpl(aliasUrl(endpoint, pathSuffix), {
