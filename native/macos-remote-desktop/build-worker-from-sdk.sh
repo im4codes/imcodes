@@ -233,9 +233,13 @@ MAIN_SOURCES=(
   macos_remote_desktop_disclosure_main.mm
   macos_virtual_display_helper_main.mm
 )
-# Not components of the remote desktop: the build spike is a probe, and the
-# aiDesk agent is the app bundle's entry point and links none of this.
-EXCLUDED_SOURCES=( build_spike.mm aidesk_agent_main.mm )
+# Not components of the remote desktop: the build spike is a probe, the aiDesk agent is the app
+# bundle's entry point and links none of this, and the panel window is the app's own WebKit window
+# (compiled only by scripts/build-aidesk-app.mjs, with -fobjc-arc, from aidesk-agent-build.json).
+# This list is checked against the directory's *.mm by test/spec/macos-libwebrtc-sdk-consumer.test.ts:
+# an ARC-only source that is not one of BUILD.gn's ARC targets must be named here, or this glob
+# compiles it without ARC.
+EXCLUDED_SOURCES=( build_spike.mm aidesk_agent_main.mm aidesk_panel_window.mm )
 
 is_excluded() {
   local candidate="$1" entry

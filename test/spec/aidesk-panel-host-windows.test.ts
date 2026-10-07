@@ -162,7 +162,8 @@ describe('application icons (one official logo, every platform)', () => {
   });
 
   it('is rendered from the official IM.codes logo (the shipped iOS app icon, same pixels as the landing page logo), never from the robot avatar', () => {
-    expect(AIDESK_LOGO_SOURCE.endsWith('web/ios/App/App/Assets.xcassets/AppIcon.appiconset/AppIcon-512@2x.png')).toBe(true);
+    // (path separators differ per OS: this also runs on Windows CI)
+    expect(AIDESK_LOGO_SOURCE.replaceAll('\\', '/').endsWith('web/ios/App/App/Assets.xcassets/AppIcon.appiconset/AppIcon-512@2x.png')).toBe(true);
     const logo = readFileSync(AIDESK_LOGO_SOURCE);
     expect(logo.readUInt32BE(16)).toBe(1024);
     expect(logo.readUInt32BE(20)).toBe(1024);

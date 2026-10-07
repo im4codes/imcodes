@@ -1,3 +1,9 @@
+// Compiled only by scripts/build-aidesk-app.mjs (native/macos-remote-desktop/aidesk-agent-build.json), always with -fobjc-arc: the
+// remote-desktop worker build (build-worker-from-sdk.sh) excludes it.
+#if !__has_feature(objc_arc)
+#error "aidesk_panel_window.mm requires Objective-C ARC"
+#endif
+
 #import <AppKit/AppKit.h>
 #import <WebKit/WebKit.h>
 

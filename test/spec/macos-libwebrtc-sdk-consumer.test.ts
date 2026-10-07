@@ -1,4 +1,4 @@
-import { readFileSync } from 'node:fs';
+import { readdirSync, readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 
 import { libwebrtcSdkTarget } from '../../scripts/libwebrtc-sdk-targets.mjs';
@@ -111,5 +111,34 @@ describe('macOS remote-desktop consumer', () => {
     expect(consumer).toContain('build_spike.mm');
     expect(consumer).toContain('aidesk_agent_main.mm');
     expect(consumer).toMatch(/EXCLUDED_SOURCES=\(/u);
+  });
+
+  it('never compiles an ARC-only source without ARC: it is a BUILD.gn ARC target, or excluded from the worker glob', () => {
+    // The worker script globs native/macos-remote-desktop/*.mm. A file that needs ARC (the aiDesk panel window uses __weak) and is not one
+    // of BUILD.gn's -fobjc-arc sources would be compiled without it there and fail the whole worker build -- which is how a source that
+    // belongs only to the app bundle once broke the macOS CI.
+    const directory = 'native/macos-remote-desktop';
+    const arc = new Set<string>();
+    for (const match of componentsBuild.matchAll(/^\w+\("([^"]+)"\) \{([\s\S]*?)\n\}/gmu)) {
+      if (!match[2]!.includes('fobjc-arc')) continue;
+      const sources = /sources = \[([\s\S]*?)\]/u.exec(match[2]!);
+      for (const name of sources?.[1]!.match(/"([^"]+)"/gu) ?? []) if (name.endsWith('.mm"')) arc.add(name.slice(1, -1));
+    }
+    expect(arc.size).toBeGreaterThan(10);
+    const excluded = new Set(/EXCLUDED_SOURCES=\(([^)]*)\)/u.exec(consumer)?.[1]?.split(/\s+/u).filter(Boolean));
+    // A source that REQUIRES ARC (__weak, __bridge_transfer, an explicit #error) and is not a BUILD.gn ARC target would be compiled
+    // without it by the glob; the older manual-retain/release sources outside BUILD.gn's list are written for that and unaffected.
+    const needsArc = /__weak|__bridge_transfer|__autoreleasing|requires Objective-C ARC/u;
+    const wronglyCompiled = readdirSync(directory)
+      .filter((name) => name.endsWith('.mm') && !arc.has(name) && !excluded.has(name))
+      .filter((name) => needsArc.test(readFileSync(`${directory}/${name}`, 'utf8')));
+    expect(wronglyCompiled, 'needs ARC but build-worker-from-sdk.sh compiles it without: add to BUILD.gn (with -fobjc-arc) or to EXCLUDED_SOURCES').toEqual([]);
+    // every source of the aiDesk app build that the worker does not own must be excluded from the worker build
+    const agent = JSON.parse(readFileSync(`${directory}/aidesk-agent-build.json`, 'utf8')) as { sources: string[] };
+    const appOnly = agent.sources.filter((name) => name.endsWith('.mm') && !arc.has(name));
+    expect(appOnly.filter((name) => !excluded.has(name))).toEqual([]);
+    expect(appOnly).toContain('aidesk_panel_window.mm');
+    // and the app-only source says itself that it needs ARC, so no other path can compile it silently wrong
+    expect(readFileSync(`${directory}/aidesk_panel_window.mm`, 'utf8')).toContain('#error "aidesk_panel_window.mm requires Objective-C ARC"');
   });
 });
