@@ -23,6 +23,7 @@ import {
 import { MEMORY_MCP_TOOL_CONTRACTS, MEMORY_MCP_TOOL_NAMES } from '../../../shared/memory-mcp-contracts.js';
 import {
   buildAggregatedBrainNoticeMessage,
+  buildBrainDecisionFollowUpMessage,
   buildBrainHeartbeatMessage,
   buildBrainNoticeMessage,
   buildIntegrationDriftDigest,
@@ -71,7 +72,7 @@ describe('the Brain contract: Brain closes what it has dealt with, with the MCP 
   it('teaches Brain no marker: the Brain-only rules carry none', () => {
     for (const [name, text] of Object.entries({
       TASK_PAIR_BRAIN_CLOSE_RULE, TASK_PAIR_BRAIN_CLOSE_REMINDER, TASK_PAIR_BRAIN_CLOSE_TOOL_NOTE,
-      TASK_PAIR_BRAIN_MCP_ONLY_RULE: TASK_PAIR_BRAIN_MCP_ONLY_RULE.replace('do not write IMCODES_TASK markers yourself', ''),
+      TASK_PAIR_BRAIN_MCP_ONLY_RULE: TASK_PAIR_BRAIN_MCP_ONLY_RULE.replace('do not write IMCODES_TASK markers yourself', '').replace('Do not add any IMCODES_TASK marker to a reply', ''),
       TASK_PAIR_TITLE_RULE, TASK_PAIR_TITLE_MARKER_RULE, TASK_PAIR_NATIVE_COLLABORATION_RULE, TASK_PAIR_BRIEF_STRUCTURE_RULE,
       TASK_PAIR_ANALYZE_BEFORE_DISPATCH_RULE, TASK_PAIR_NEXT_ROUND_RULE,
     })) expect(text, name).not.toMatch(BRAIN_MARKER_TEACHING);
@@ -126,7 +127,37 @@ describe('every reminder to Brain about an open pair ends with how to close it',
       buildNoBriefLine('tsk_x'),
       buildNoBriefDigestMessage(['tsk_x', 'tsk_y']),
       buildQueueStallNoticeMessage([pair({ status: 'queued' })], 10 * 60_000),
+      buildBrainDecisionFollowUpMessage([pair({ status: 'awaiting_brain_decision' })]),
       buildUntitledTaskTitleRequest(['tsk_x'], 'en'),
     ]) expect(text).not.toMatch(BRAIN_MARKER_TEACHING);
+  });
+});
+
+describe('no "nothing to do" marker is taught to Brain, and one written anyway does nothing', () => {
+  // Brain 215/158 ended replies with <!-- IMCODES_TASK_NOOP -->: not a marker the daemon knows, learned from our own reminder text.
+  const NOOP = 'IMCODES_TASK_NOOP';
+
+  it('the contract says not to add markers to replies and never names a no-op marker', () => {
+    const contract = buildTaskPairMarkerContract();
+    expect(contract).toContain('Do not add any IMCODES_TASK marker to a reply -- not even an empty or "no-op" one');
+    expect(contract).toContain('With nothing to handle, just answer.');
+    expect(contract).not.toContain(NOOP);
+  });
+
+  it('no reminder, follow-up or tool description carries it', () => {
+    const texts = [
+      buildBrainDecisionFollowUpMessage([pair({ status: 'awaiting_brain_decision' }), pair({ taskId: 'tsk_y', status: 'awaiting_brain_decision' })]),
+      buildBrainHeartbeatMessage([pair({ status: 'awaiting_brain_decision' })]),
+      buildBrainNoticeMessage(pair({ status: 'blocked' }), 'blocked', 'stuck'),
+      buildWorkspaceKeptLine(pair({ status: 'done' }), 'unpushed'),
+      ...Object.values(MEMORY_MCP_TOOL_CONTRACTS).map((tool) => tool.description),
+    ];
+    for (const text of texts) expect(text).not.toContain(NOOP);
+    expect(buildBrainDecisionFollowUpMessage([pair({ status: 'awaiting_brain_decision' })])).toContain('A plain text reply is NOT an answer');
+  });
+
+  it('the daemon does not treat it as a marker or an action', () => {
+    const { markers } = scanTaskPairMarkers(`ok <!-- ${NOOP} -->\n<!-- ${NOOP} tsk_x -->\n<!--IMCODES_TASK_EMPTY-->`);
+    expect(markers).toEqual([]);
   });
 });

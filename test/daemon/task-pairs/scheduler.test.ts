@@ -498,7 +498,7 @@ describe('task-pair heartbeat, replacement and queue', () => {
       brainEvent('session.state', { state: 'running' });
       if (opts.noticeId) brainEvent('transport.queue.delivery', { clientMessageId: opts.noticeId });
       for (const input of opts.toolCalls ?? []) brainEvent('tool.call', { tool: 'mcp__imcodes-memory__pair_get', input });
-      brainEvent('assistant.text', { text: 'ok <!-- IMCODES_TASK_NOOP -->' });
+      brainEvent('assistant.text', { text: 'ok' });
       brainEvent('session.state', { state: 'idle' });
       await flush();
     }
@@ -519,9 +519,19 @@ describe('task-pair heartbeat, replacement and queue', () => {
       const followUps = sentTo(BRAIN, 'brain-decision-followup');
       expect(followUps).toHaveLength(1);
       expect(followUps[0]!.text).toContain('FU_NOOP');
-      expect(followUps[0]!.text).toContain('IMCODES_TASK_NOOP');
+      expect(followUps[0]!.text).toContain('pair_close action=done force=true');
+      expect(followUps[0]!.text).not.toContain('IMCODES_TASK');
       expect(followUps[0]!.text).toContain('is NOT an answer');
       expect(getTaskPairStore().listEvents(PROJECT, 'FU_NOOP').some((event) => event.verb === TASK_PAIR_BRAIN_NOTICE_EVENT && event.attrs.reason === 'brain-decision-followup')).toBe(true);
+    });
+
+    it('a legacy "nothing to do" text in Brain\'s reply is not a marker: no transition, no unusual event, the pair is untouched', async () => {
+      await awaitingPair('FU_LEGACY');
+      const before = pair('FU_LEGACY');
+      const eventsBefore = getTaskPairStore().listEvents(PROJECT, 'FU_LEGACY').length;
+      expect(marker(BRAIN, 'ok <!-- IMCODES_TASK_NOOP -->')).toEqual([]);
+      expect(pair('FU_LEGACY')).toEqual(before);
+      expect(getTaskPairStore().listEvents(PROJECT, 'FU_LEGACY')).toHaveLength(eventsBefore);
     });
 
     it('at most once per notice: the turn that answers the follow-up ending the same way sends nothing more', async () => {

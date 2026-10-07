@@ -741,6 +741,7 @@ export const TASK_PAIR_BRAIN_MCP_ONLY_RULE: string =
   'Brain: close and advance pairs ONLY with the MCP tools; do not write IMCODES_TASK markers yourself (the daemon still parses a legacy marker for compatibility, but it is no longer taught or encouraged for Brain). '
   + 'pair_create (with title) creates new work, then pair_dispatch if the result is queued; pair_reassign replaces the executor or auditor (or their models); pair_close (action=done, action=cancel) closes; '
   + 'pair_next_round opens the next round of a passed pair; pair_task_update / pair_task_check edit the brief and its boxes; pair_set_max_concurrency sets your queue limit; pair_resource_claim claims a shared resource. '
+  + 'Do not add any IMCODES_TASK marker to a reply -- not even an empty or "no-op" one (there is no such marker; it only clutters the main session). With nothing to handle, just answer. '
   + 'Never use send_message task metadata to create a pair. pair_dispatch auto-queues an existing pair when capacity is unavailable, so there is no need to defer work yourself. '
   + 'A finished pair whose commits are not yet on any branch of the repository is reminded to you (one digest, then every 10-15 min; cherry-picked equivalents count as merged), and pair_close action=done integration=dismiss (or action=cancel) stops the reminders for one you will not merge. '
   + 'pair_close action=done force=true (or accept=true) accepts/ends from any state and marks an audited unpassed pair unaudited; action=cancel ends from any state. '

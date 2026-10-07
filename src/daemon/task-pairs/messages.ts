@@ -886,8 +886,9 @@ export function buildNoAuditorDoneNotice(pair: TaskPairState, executorSummary: s
 
 /**
  * Sent once when Brain's turn ended without deciding a pair that awaits its
- * decision (see brain-decision-followup.ts). Says plainly that a reply, or a
- * no-op marker, is not an answer.
+ * decision (see brain-decision-followup.ts). Says plainly that a plain reply
+ * is not an answer. It names the MCP tools only: a marker -- above all a
+ * "nothing to do" one, which is not a marker at all -- is never taught here.
  */
 export function buildBrainDecisionFollowUpMessage(pairs: readonly TaskPairState[]): string {
   const lines = pairs.map((pair) => (
@@ -896,7 +897,8 @@ export function buildBrainDecisionFollowUpMessage(pairs: readonly TaskPairState[
   return [
     `[IM.codes task pairs] Your last turn ended and ${pairs.length} pair(s) still await YOUR decision:`,
     ...lines,
-    `Decide each now: accept with ${marker('DONE', '<taskId>', 'force=true')}, end it with ${marker('CANCEL', '<taskId>')}, or continue it with NEXT_ROUND, REASSIGN or a new DISPATCH. A plain reply or <!-- IMCODES_TASK_NOOP --> is NOT an answer for a pair that awaits your decision: it stays open and holds its slot.`,
+    'Decide each now with the MCP tools: accept with pair_close action=done force=true, end it with pair_close action=cancel, or continue it with pair_next_round or pair_reassign (new work: pair_create). A plain text reply is NOT an answer for a pair that awaits your decision: it stays open and holds its slot.',
+    TASK_PAIR_BRAIN_CLOSE_REMINDER,
     `[Contract: ${TASK_PAIR_CONTRACT_ID}]`,
   ].join('\n');
 }
