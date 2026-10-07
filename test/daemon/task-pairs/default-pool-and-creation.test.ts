@@ -150,16 +150,30 @@ describe('queue admission with no pool uses the default, with distinct sessions 
   };
   const queue = (taskId: string, attrs = '') => marker(`<!-- IMCODES_TASK QUEUE ${taskId}${attrs ? ` ${attrs}` : ''} -->\nbrief\n<!-- IMCODES_TASK_END ${taskId} -->`);
   const pairOf = (taskId: string) => getTaskPairStore().getPair(PROJECT, taskId)!.state;
+  /**
+   * One heartbeat, then every background operation the service tracked (the QUEUE marker starts the queue run in the background, and the
+   * Brain line is the last thing that run sends). The heartbeat alone only waits for a run it finds in flight; the assertions below must not
+   * depend on which side of that the clock fell, so they wait for the service to be idle -- an event, never a wall-clock budget.
+   */
+  const settle = async () => {
+    await automation.tick();
+    await taskPairService.waitForIdle();
+  };
+  /** The message the scheduler sent to `target` for `reason`, once the background work is done. */
+  const sentTo = async (target: string, reason: string) => {
+    await vi.waitFor(() => { expect(sent.some((entry) => entry.target === target && entry.id.includes(reason))).toBe(true); }, { timeout: 20_000, interval: 20 });
+    return sent.find((entry) => entry.target === target && entry.id.includes(reason))!;
+  };
 
   it('two default sessions: executor and auditor are different sessions, and the Brain line names the default and the reason', async () => {
     upsertSession(sonnet('deck_sub_a')); upsertSession(sonnet('deck_sub_b', { updatedAt: 2 }));
     await queue('D1');
-    await automation.tick();
+    await settle();
     const pair = pairOf('D1');
     expect(pair.status).toBe('working');
     expect(new Set([pair.executor, pair.auditor]).size).toBe(2);
     expect([pair.executor, pair.auditor].sort()).toEqual(['deck_sub_a', 'deck_sub_b']);
-    const line = sent.find((entry) => entry.target === BRAIN && entry.id.includes('brain-line-dispatch'))!;
+    const line = await sentTo(BRAIN, 'brain-line-dispatch');
     expect(line.text).toContain('default_same_vendor_secondary');
     expect(line.text).toMatch(/idle, same vendor anthropic, secondary tier/);
   });
@@ -168,11 +182,11 @@ describe('queue admission with no pool uses the default, with distinct sessions 
     upsertSession(sonnet('deck_sub_a'));
     upsertSession(session('deck_sub_b', { parentSession: BRAIN, agentType: 'codex-sdk', activeModel: 'gpt-6-sol' }));
     await queue('D2');
-    await automation.tick();
+    await settle();
     const pair = pairOf('D2');
     expect(pair.status).toBe('queued');
     expect(pair.flags).toContain('no_pool_configured');
-    const ask = sent.find((entry) => entry.id.includes('brain-no-pool-ask'))!;
+    const ask = await sentTo(BRAIN, 'brain-no-pool-ask');
     expect(ask.text).toContain('2 distinct');
     expect(ask.text).toContain('execution_pool_set');
     expect(pair.executor).toBeUndefined();
@@ -182,14 +196,14 @@ describe('queue admission with no pool uses the default, with distinct sessions 
     upsertSession(sonnet('deck_sub_a'));
     upsertSession(session('deck_sub_b', { parentSession: BRAIN, agentType: 'codex-sdk', activeModel: 'gpt-5.5' }));
     await queue('D3', 'auditor=deck_sub_b');
-    await automation.tick();
+    await settle();
     expect(pairOf('D3')).toMatchObject({ status: 'working', executor: 'deck_sub_a', auditor: 'deck_sub_b' });
   });
 
   it('concurrent pairs never share a session: three default sessions fill one pair, the second waits for capacity', async () => {
     for (const name of names.slice(0, 3)) upsertSession(sonnet(name));
     await Promise.all([queue('C1'), queue('C2')]);
-    await automation.tick();
+    await settle();
     const [c1, c2] = [pairOf('C1'), pairOf('C2')];
     const working = [c1, c2].filter((pair) => pair.status === 'working');
     expect(working).toHaveLength(1);

@@ -564,6 +564,48 @@ describe('LiveContextIngestion', () => {
     ingestion.dispose();
   });
 
+  it('bounds the sessions draining at once across the backoff timers too, not only within one sweep', async () => {
+    // Many sessions failing for the same reason have their backoff timers fall due together. Each timer drains its own session, so without
+    // a bound that is shared with the sweep, all of them hit the overloaded store at once.
+    vi.useFakeTimers();
+    try {
+      const ingestion = new LiveContextIngestion({ compressor: localOnlyCompressor,
+        thresholds: { eventCount: 99, idleMs: 60_000, scheduleMs: 60_000 },
+        sessionLookup: (sessionName) => ({ ...session, name: sessionName }),
+        resolveBootstrap: async () => ({ namespace, diagnostics: ['test'] }),
+      });
+      let active = 0;
+      let maxActive = 0;
+      let started = 0;
+      vi.spyOn(ingestion.coordinator, 'ingestEvent').mockImplementation(async () => {
+        active += 1;
+        started += 1;
+        maxActive = Math.max(maxActive, active);
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        active -= 1;
+        throw new ContextStoreError(CONTEXT_STORE_RPC_ERROR.overloaded, 'worker saturated');
+      });
+      for (let index = 0; index < 10; index += 1) {
+        const sessionName = `${session.name}_timers_${index}`;
+        enqueuePreparedRetryableEventForTest(
+          ingestion,
+          makePreparedIngest(makeEvent('user.message', 2_000 + index, { text: `buffered ${index}` }, sessionName), namespace, sessionName, `timers:${index}`),
+          new ContextStoreError(CONTEXT_STORE_RPC_ERROR.unavailable, 'initial outage'),
+          0,
+        );
+      }
+      // Every session's first backoff timer (250 ms) falls due in this one step.
+      await vi.advanceTimersByTimeAsync(300);
+      await vi.advanceTimersByTimeAsync(50);
+      expect(started).toBeGreaterThanOrEqual(10);
+      expect(maxActive).toBeGreaterThan(1);
+      expect(maxActive).toBeLessThanOrEqual(8);
+      ingestion.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('does not stage a duplicate when backfill replays the same logical live event', async () => {
     const ingestion = new LiveContextIngestion({ compressor: localOnlyCompressor,
       thresholds: { eventCount: 99, idleMs: 60_000, scheduleMs: 60_000 },

@@ -69,9 +69,15 @@ export interface MacosFsDelegateClientDeps {
 }
 
 let activeRuns = 0;
+/**
+ * Request files a run of THIS process has written and not yet removed. The stale-request sweep never removes one of them: a concurrent run
+ * sweeping the shared directory must not delete a file whose owner is still using it (judged by the file's mtime against the sweeper's
+ * clock, a live request can look stale -- under a clock that is ahead of the file system's, or a very slow run).
+ */
+const inFlightRequestFiles = new Set<string>();
 
 /** Test seam. */
-export function resetMacosFsDelegateClientForTests(): void { activeRuns = 0; }
+export function resetMacosFsDelegateClientForTests(): void { activeRuns = 0; inFlightRequestFiles.clear(); }
 
 async function defaultReadInfoPlist(appPath: string): Promise<string | null> {
   try {
@@ -116,6 +122,7 @@ async function sweepStaleRequests(directory: string, now: number): Promise<void>
   for (const name of names) {
     if (!name.endsWith('.req')) continue;
     const path = join(directory, name);
+    if (inFlightRequestFiles.has(path)) continue;
     const stat = await lstat(path).catch(() => null);
     if (stat?.isFile() && now - stat.mtimeMs > STALE_REQUEST_MS) await rm(path, { force: true }).catch(() => {});
   }
@@ -165,6 +172,7 @@ export async function listDirectoryViaMacosApp(
     await sweepStaleRequests(directory, now);
     const nonce = (deps.randomHex ?? ((bytes) => randomBytes(bytes).toString('hex')))(16);
     requestFile = join(directory, `${nonce}.req`);
+    inFlightRequestFiles.add(requestFile);
     await writeFile(requestFile, serializeMacosFsDelegateRequest({
       op,
       path: requestedPath,
@@ -213,6 +221,9 @@ export async function listDirectoryViaMacosApp(
     return { kind: 'ok', realPath: answer.realPath, entries: answer.entries, truncated: answer.truncated, hasMetadata: op === MACOS_FS_DELEGATE_OP.LIST_META };
   } finally {
     activeRuns -= 1;
-    if (requestFile) await rm(requestFile, { force: true }).catch(() => {});
+    if (requestFile) {
+      await rm(requestFile, { force: true }).catch(() => {});
+      inFlightRequestFiles.delete(requestFile);
+    }
   }
 }

@@ -160,18 +160,60 @@ describe('macOS fs delegate client', () => {
   it('runs at most MAX_CONCURRENT_RUNS helpers at once; the rest fall back', async () => {
     let release: () => void = () => {};
     const gate = new Promise<void>((resolve) => { release = resolve; });
+    // Each run announces itself when it reaches the helper (it is then counted as running), so the test waits for that event instead of a
+    // pause: a pause is not long enough on a starved runner, and the third call would then become a run of its own and wait for the gate.
+    let started = 0;
+    let bothStarted: () => void = () => {};
+    const twoRunning = new Promise<void>((resolve) => { bothStarted = resolve; });
     const slow = deps({
-      runApp: async () => { await gate; return { stdout: answerText(`realpath ${hexEncodeUtf8('/Users/tester/Documents')}`, 'end 0 0') }; },
+      runApp: async () => {
+        started += 1;
+        if (started === MACOS_FS_DELEGATE_LIMITS.MAX_CONCURRENT_RUNS) bothStarted();
+        await gate;
+        return { stdout: answerText(`realpath ${hexEncodeUtf8('/Users/tester/Documents')}`, 'end 0 0') };
+      },
       randomHex: (() => { let n = 0; return () => `${String(++n).padStart(32, '0')}`; })(),
     });
     const first = listDirectoryViaMacosApp('/Users/tester/a', slow);
     const second = listDirectoryViaMacosApp('/Users/tester/b', slow);
-    await new Promise((resolve) => setTimeout(resolve, 20));
+    await twoRunning;
     expect(await listDirectoryViaMacosApp('/Users/tester/c', slow)).toEqual({ kind: 'unavailable', reason: MACOS_FS_DELEGATE_REASON.BUSY });
     release();
     expect((await first).kind).toBe('ok');
     expect((await second).kind).toBe('ok');
     expect((await listDirectoryViaMacosApp('/Users/tester/d', deps())).kind).toBe('ok');
+  });
+
+  it('a run sweeping stale requests never deletes the request of a run that is still going (even when its clock says that request is old)', async () => {
+    // The injected clock is far ahead of the file system's, so by mtime every request file looks stale to the sweeper.
+    let release: () => void = () => {};
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let started = 0;
+    let bothStarted: () => void = () => {};
+    const twoRunning = new Promise<void>((resolve) => { bothStarted = resolve; });
+    const requestFiles: string[] = [];
+    const slow = deps({
+      now: () => NOW + 10 * 365 * 24 * 3_600_000,
+      runApp: async ({ args }) => {
+        requestFiles.push(args[1]!);
+        started += 1;
+        if (started === 2) bothStarted();
+        await gate;
+        return { stdout: answerText(`realpath ${hexEncodeUtf8('/Users/tester/Documents')}`, 'end 0 0') };
+      },
+      randomHex: (() => { let n = 0; return () => `${String(++n).padStart(32, '0')}`; })(),
+    });
+    const first = listDirectoryViaMacosApp('/Users/tester/a', slow);
+    // The second run starts while the first holds its request file: its sweep runs over a directory with the first one's live file in it.
+    await vi.waitFor(() => { expect(started).toBe(1); });
+    const second = listDirectoryViaMacosApp('/Users/tester/b', slow);
+    await twoRunning;
+    expect(requestFiles).toHaveLength(2);
+    for (const file of requestFiles) expect(existsSync(file)).toBe(true);
+    release();
+    expect((await first).kind).toBe('ok');
+    expect((await second).kind).toBe('ok');
+    expect(readdirSync(join(runtimeRoot, String(user.uid)))).toEqual([]);
   });
 
   it('answers the framing parser exactly (hex names, count check, nothing after end)', () => {

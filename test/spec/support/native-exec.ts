@@ -19,6 +19,16 @@
 // / exit-status semantics the callers already assert on.
 
 import { execFile } from 'node:child_process';
+import { vi } from 'vitest';
+
+/**
+ * Every test file that imports this module compiles and runs native code (`xcrun clang++`, sanitizer builds), which takes tens of seconds
+ * on a cold or contended machine -- far past the suite's 20 s default, and the compile is the point of those tests, not a hang to catch.
+ * Importing it therefore raises the per-test timeout for the importing file (a test's own explicit timeout still wins), so a new native
+ * spec cannot forget it. Guarded by test/spec/native-exec-timeout.test.ts.
+ */
+export const NATIVE_COMPILE_TEST_TIMEOUT_MS = 120_000;
+vi.setConfig({ testTimeout: NATIVE_COMPILE_TEST_TIMEOUT_MS });
 
 export interface NativeExecResult {
   /** Exit code, or null when the child was killed by a signal. */

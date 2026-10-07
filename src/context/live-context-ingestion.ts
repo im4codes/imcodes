@@ -13,6 +13,7 @@ import { scheduleMarkdownMemoryIngest } from './md-ingest-worker.js';
 import { subscribeRuntimeMemoryCacheInvalidation } from './runtime-memory-cache-bus.js';
 import { serializeContextTarget } from './context-keys.js';
 import { incrementCounter } from '../util/metrics.js';
+import { createConcurrencyGate } from '../util/concurrency.js';
 import { isSessionModelSwitchCommandText } from '../../shared/session-control-commands.js';
 
 const BOOTSTRAP_CACHE_MS = 30_000;
@@ -201,14 +202,18 @@ export class LiveContextIngestion {
     await this.coordinator.materializeDueMasterSummaries(now);
   }
 
+  /**
+   * Retry drains of different sessions that run in the background (this sweep and every session's own backoff timer) share ONE bound: when
+   * many sessions are failing for the same reason (a saturated or restarting store) their timers fall due together, and without a shared
+   * bound each would drain at once, which is exactly the load that keeps the store overloaded.
+   */
+  private readonly retryDrainGate = createConcurrencyGate(INGEST_RETRY_DRAIN_MAX_SESSIONS_CONCURRENT);
+
   async flushAllRetryBuffers(options: { forceDue?: boolean } = {}): Promise<void> {
     const sessionIds = [...this.retryBuffer.keys()];
-    for (let index = 0; index < sessionIds.length; index += INGEST_RETRY_DRAIN_MAX_SESSIONS_CONCURRENT) {
-      const batch = sessionIds.slice(index, index + INGEST_RETRY_DRAIN_MAX_SESSIONS_CONCURRENT);
-      await Promise.all(batch.map((sessionId) => this.enqueueSessionWork(sessionId, async () => {
-        await this.flushRetryBuffer(sessionId, { forceDue: options.forceDue });
-      })));
-    }
+    await Promise.all(sessionIds.map((sessionId) => this.enqueueSessionWork(sessionId, async () => {
+      await this.retryDrainGate.run(() => this.flushRetryBuffer(sessionId, { forceDue: options.forceDue }));
+    })));
   }
 
   async backfillSessionFromEvents(sessionName: string, events: TimelineEvent[]): Promise<void> {
@@ -498,7 +503,7 @@ export class LiveContextIngestion {
     const timer = setTimeout(() => {
       this.retryDrainTimers.delete(sessionId);
       void this.enqueueSessionWork(sessionId, async () => {
-        await this.flushRetryBuffer(sessionId);
+        await this.retryDrainGate.run(() => this.flushRetryBuffer(sessionId));
       });
     }, Math.max(0, delayMs));
     timer.unref?.();
