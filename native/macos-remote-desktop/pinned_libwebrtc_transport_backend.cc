@@ -5,6 +5,8 @@
 #include <thread>
 #include <chrono>
 #include <condition_variable>
+#include <cstdio>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -33,6 +35,8 @@
 #include "api/video/color_space.h"
 #include "api/video/i420_buffer.h"
 #include "api/video/video_frame.h"
+#include "api/rtp_parameters.h"
+#include "api/rtp_transceiver_interface.h"
 #include "rtc_base/time_utils.h"
 #include "api/video_codecs/sdp_video_format.h"
 #include "api/video_codecs/video_encoder.h"
@@ -41,10 +45,13 @@
 #include "api/video_codecs/video_encoder_factory.h"
 #include "macos_media_sender_binder.h"
 #include "modules/audio_device/include/audio_device_default.h"
+#include "modules/video_coding/codecs/vp8/include/vp8.h"
+#include "modules/video_coding/codecs/vp9/include/vp9.h"
 #include "modules/video_coding/include/video_error_codes.h"
 #include "pinned_libwebrtc_h264_sender.h"
 #include "raw_frame_conversion.h"
 #include "raw_video_path.h"
+#include "video_codec_selection.h"
 #include "rtc_base/ref_counted_object.h"
 #include "rtc_base/thread.h"
 
@@ -433,27 +440,147 @@ class SilentAudioDeviceModule
     : public webrtc::webrtc_impl::AudioDeviceModuleDefault<
           webrtc::AudioDeviceModule> {};
 
+// libwebrtc's own libvpx encoder (VP9/VP8), wrapped for two jobs and nothing else.
+//
+// Everything about producing and sending the video -- encoding, packetization,
+// RTCP, pacing, congestion control -- is upstream's. This wrapper only
+//   * forwards every VideoEncoder call to the libvpx encoder it owns, and
+//   * taps what upstream already decides: the target bitrate (SetRates) is
+//     reported to the session exactly as the H.264 passthrough encoder does, so
+//     the quality ladder (and with it the capture size) keeps following the
+//     network; and the size of each encoded image is added to the media-progress
+//     counter, so the transport watchdog reads a healthy stream as healthy.
+class RawCodecEncoder final : public webrtc::VideoEncoder {
+ public:
+  RawCodecEncoder(std::unique_ptr<webrtc::VideoEncoder> inner,
+                  std::shared_ptr<RawVideoPath> raw,
+                  MacosTransportSessionAdapter* adapter)
+      : inner_(std::move(inner)), raw_(std::move(raw)), adapter_(adapter) {}
+
+  void SetFecControllerOverride(
+      webrtc::FecControllerOverride* fec_controller_override) override {
+    inner_->SetFecControllerOverride(fec_controller_override);
+  }
+
+  int InitEncode(const webrtc::VideoCodec* codec_settings,
+                 const webrtc::VideoEncoder::Settings& settings) override {
+    if (codec_settings != nullptr) {
+      source_width_ = codec_settings->width;
+      source_height_ = codec_settings->height;
+    }
+    return inner_->InitEncode(codec_settings, settings);
+  }
+
+  int32_t RegisterEncodeCompleteCallback(
+      webrtc::EncodedImageCallback* callback) override {
+    counting_callback_.downstream = callback;
+    counting_callback_.raw = raw_.get();
+    return inner_->RegisterEncodeCompleteCallback(
+        callback != nullptr ? &counting_callback_ : nullptr);
+  }
+
+  int32_t Release() override { return inner_->Release(); }
+
+  int32_t Encode(
+      const webrtc::VideoFrame& frame,
+      const std::vector<webrtc::VideoFrameType>* frame_types) override {
+    return inner_->Encode(frame, frame_types);
+  }
+
+  void SetRates(const RateControlParameters& parameters) override {
+    inner_->SetRates(parameters);
+    if (adapter_ == nullptr || source_width_ <= 0 || source_height_ <= 0)
+      return;
+    const std::uint32_t target_bps = parameters.bitrate.get_sum_bps();
+    if (target_bps == 0 || target_bps == last_target_bps_)
+      return;
+    last_target_bps_ = target_bps;
+    adapter_->ReportQualityTarget(
+        adapter_->stamp(),
+        common::QualityTarget{
+            target_bps,
+            common::PixelSize{static_cast<std::uint32_t>(source_width_),
+                              static_cast<std::uint32_t>(source_height_)}});
+  }
+
+  void OnPacketLossRateUpdate(float packet_loss_rate) override {
+    inner_->OnPacketLossRateUpdate(packet_loss_rate);
+  }
+  void OnRttUpdate(int64_t rtt_ms) override { inner_->OnRttUpdate(rtt_ms); }
+  void OnLossNotification(const LossNotification& loss_notification) override {
+    inner_->OnLossNotification(loss_notification);
+  }
+  EncoderInfo GetEncoderInfo() const override { return inner_->GetEncoderInfo(); }
+
+ private:
+  class CountingCallback final : public webrtc::EncodedImageCallback {
+   public:
+    Result OnEncodedImage(
+        const webrtc::EncodedImage& encoded_image,
+        const webrtc::CodecSpecificInfo* codec_specific_info) override {
+      if (raw != nullptr) raw->AddAcceptedBytes(encoded_image.size());
+      return downstream != nullptr
+                 ? downstream->OnEncodedImage(encoded_image, codec_specific_info)
+                 : Result(Result::ERROR_SEND_FAILED);
+    }
+    void OnFrameDropped(uint32_t rtp_timestamp, int spatial_id,
+                        bool is_end_of_temporal_unit) override {
+      if (downstream != nullptr)
+        downstream->OnFrameDropped(rtp_timestamp, spatial_id,
+                                   is_end_of_temporal_unit);
+    }
+    webrtc::EncodedImageCallback* downstream = nullptr;
+    RawVideoPath* raw = nullptr;
+  };
+
+  std::unique_ptr<webrtc::VideoEncoder> inner_;
+  std::shared_ptr<RawVideoPath> raw_;
+  MacosTransportSessionAdapter* adapter_;
+  CountingCallback counting_callback_;
+  int source_width_ = 0;
+  int source_height_ = 0;
+  std::uint32_t last_target_bps_ = 0;
+};
+
 class PassthroughH264EncoderFactory final : public webrtc::VideoEncoderFactory {
  public:
   PassthroughH264EncoderFactory(MacosMediaSenderBinder* binder,
                                 MacosTransportSessionAdapter* adapter)
       : binder_(binder), adapter_(adapter) {}
 
+  bool raw_codecs_allowed() const {
+    return binder_ != nullptr && binder_->raw_video()->raw_codecs_allowed();
+  }
+
   std::vector<webrtc::SdpVideoFormat> GetSupportedFormats() const override {
-    // One format only. Advertising more would let SDP negotiate a codec this
-    // project cannot actually produce.
-    webrtc::SdpVideoFormat format("H264");
-    format.parameters["level-asymmetry-allowed"] = "1";
-    format.parameters["packetization-mode"] = "1";
-    format.parameters["profile-level-id"] = "42e01f";
-    return {format};
+    webrtc::SdpVideoFormat h264("H264");
+    h264.parameters["level-asymmetry-allowed"] = "1";
+    h264.parameters["packetization-mode"] = "1";
+    h264.parameters["profile-level-id"] = "42e01f";
+    // Only a Mac with no hardware H.264 encoder also offers the codecs libwebrtc
+    // encodes itself. Every other Mac advertises exactly one format, as before:
+    // advertising more would let SDP negotiate a codec this project cannot
+    // actually produce.
+    if (!raw_codecs_allowed()) return {h264};
+    return {webrtc::SdpVideoFormat::VP9Profile0(), webrtc::SdpVideoFormat::VP8(),
+            h264};
   }
 
   std::unique_ptr<webrtc::VideoEncoder> Create(
       const webrtc::Environment& env,
       const webrtc::SdpVideoFormat& format) override {
-    (void)env;
-    (void)format;
+    if (raw_codecs_allowed()) {
+      std::unique_ptr<webrtc::VideoEncoder> inner;
+      if (format.name == "VP9") {
+        inner = webrtc::CreateVp9Encoder(env, {});
+      } else if (format.name == "VP8") {
+        inner = webrtc::CreateVp8Encoder(env, {});
+      }
+      if (inner != nullptr) {
+        return std::make_unique<RawCodecEncoder>(
+            std::move(inner), binder_->raw_video(), adapter_);
+      }
+    }
     return std::make_unique<PassthroughH264Encoder>(binder_, adapter_);
   }
 
@@ -475,6 +602,13 @@ struct NegotiationState {
   bool cancelled = false;
   std::string answer_sdp;
   webrtc::scoped_refptr<webrtc::PeerConnectionInterface> peer;
+  // Run on the signaling thread, between SetRemoteDescription and CreateAnswer:
+  // choose the codec order this node answers in.
+  std::function<void(webrtc::PeerConnectionInterface&)> prepare_answer;
+  // Run with the produced answer, BEFORE SetLocalDescription: from then on
+  // libwebrtc may start the send stream, and the session must already know which
+  // codec its frames are for.
+  std::function<void(const std::string&)> on_answer;
 
   void Fail() {
     {
@@ -551,16 +685,19 @@ class CreateAnswerObserver : public webrtc::CreateSessionDescriptionObserver {
       return;
     }
     webrtc::scoped_refptr<webrtc::PeerConnectionInterface> peer;
+    std::function<void(const std::string&)> on_answer;
     {
       std::lock_guard lock(state_->mutex);
       if (state_->finished)
         return;
       peer = state_->peer;
+      on_answer = state_->on_answer;
     }
     if (peer == nullptr) {
       state_->Fail();
       return;
     }
+    if (on_answer) on_answer(serialized);
     peer->SetLocalDescription(std::move(answer),
                               webrtc::make_ref_counted<SetLocalObserver>(
                                   state_, std::move(serialized)));
@@ -588,16 +725,19 @@ class SetRemoteObserver : public webrtc::SetRemoteDescriptionObserverInterface {
       return;
     }
     webrtc::scoped_refptr<webrtc::PeerConnectionInterface> peer;
+    std::function<void(webrtc::PeerConnectionInterface&)> prepare_answer;
     {
       std::lock_guard lock(state_->mutex);
       if (state_->finished)
         return;
       peer = state_->peer;
+      prepare_answer = state_->prepare_answer;
     }
     if (peer == nullptr) {
       state_->Fail();
       return;
     }
+    if (prepare_answer) prepare_answer(*peer);
     peer->CreateAnswer(
         webrtc::make_ref_counted<CreateAnswerObserver>(state_).release(),
         webrtc::PeerConnectionInterface::RTCOfferAnswerOptions());
@@ -606,6 +746,36 @@ class SetRemoteObserver : public webrtc::SetRemoteDescriptionObserverInterface {
  private:
   std::shared_ptr<NegotiationState> state_;
 };
+
+// Puts the codecs this node can produce in answer order (VP9, VP8, H.264, then
+// the RTX/RED/FEC entries), so the answer -- and with it the codec libwebrtc
+// sends -- is VP9 whenever the offer carries it. Only called for a Mac with no
+// hardware H.264 encoder; any other node never touches codec preferences.
+//
+// A refusal is not fatal: without preferences libwebrtc answers in the offer's
+// order, which is H.264 first, i.e. the path that worked before this existed.
+void ApplyRawCodecAnswerOrder(webrtc::PeerConnectionInterface& peer,
+                              webrtc::PeerConnectionFactoryInterface& factory) {
+  const std::vector<webrtc::RtpCodecCapability> capabilities =
+      factory.GetRtpSenderCapabilities(webrtc::MediaType::VIDEO).codecs;
+  // Sort positions, then copy-construct in that order: a capability has no usable
+  // copy assignment, which an element sort would need.
+  std::vector<std::size_t> order(capabilities.size());
+  for (std::size_t i = 0; i < order.size(); ++i) order[i] = i;
+  SortByAnswerPreference(
+      order, [&](std::size_t index) { return capabilities[index].name; },
+      /*raw_allowed=*/true);
+  std::vector<webrtc::RtpCodecCapability> codecs;
+  codecs.reserve(order.size());
+  for (const std::size_t index : order) codecs.push_back(capabilities[index]);
+  for (const auto& transceiver : peer.GetTransceivers()) {
+    if (transceiver->media_type() != webrtc::MediaType::VIDEO) continue;
+    if (!transceiver->SetCodecPreferences(codecs).ok()) {
+      std::fprintf(stderr,
+                   "macos_remote_desktop_transport_codec_preferences_refused\n");
+    }
+  }
+}
 
 // Upper bound on one negotiation. Long enough for a real DTLS/ICE-capable
 // peer on a slow link, short enough that a peer which never answers cannot
@@ -831,6 +1001,21 @@ class PinnedLibwebrtcTransportBackend final
         return false;
       state->peer = peer_;
       negotiation_ = state;
+      if (media_binder_ != nullptr) {
+        const std::shared_ptr<RawVideoPath> raw = media_binder_->raw_video();
+        // Both hooks exist for every route; only a Mac that may send a raw codec
+        // changes the answer order. The negotiated codec is recorded for every
+        // route, so the session knows H.264 from "not negotiated yet".
+        if (raw->raw_codecs_allowed() && factory_ != nullptr) {
+          state->prepare_answer =
+              [factory = factory_](webrtc::PeerConnectionInterface& peer) {
+                ApplyRawCodecAnswerOrder(peer, *factory);
+              };
+        }
+        state->on_answer = [raw](const std::string& answer) {
+          raw->SetNegotiatedCodec(ParseAnsweredVideoCodec(answer));
+        };
+      }
     }
 
     webrtc::SdpParseError parse_error;

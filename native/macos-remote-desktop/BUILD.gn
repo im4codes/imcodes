@@ -438,12 +438,15 @@ source_set("raw_video") {
     "codec_encoder_adapters.h",
     "raw_video_path.h",
     "reconfigurable_encoder.h",
+    "video_codec_selection.cc",
+    "video_codec_selection.h",
   ]
 
   public = [
     "codec_encoder_adapters.h",
     "raw_video_path.h",
     "reconfigurable_encoder.h",
+    "video_codec_selection.h",
   ]
   public_deps = [ "../remote-desktop-common:remote_desktop_common" ]
 }
@@ -584,11 +587,14 @@ source_set("pinned_libwebrtc_transport_backend") {
   ]
   deps = [
     ":raw_frame_conversion",
+    ":raw_video",
     "//api:create_modular_peer_connection_factory",
     "//api:data_channel_interface",
     "//api:jsep",
     "//api:peer_connection_interface",
     "//api:scoped_refptr",
+    "//modules/video_coding:webrtc_vp8",
+    "//modules/video_coding:webrtc_vp9",
     "//rtc_base:threading",
   ]
 
