@@ -104,11 +104,16 @@ Report 'ok'`;
   return `-NoProfile -NonInteractive -EncodedCommand ${Buffer.from(script, 'utf16le').toString('base64')}`;
 }
 
+const TASKLIST_TIMEOUT_MS = 60_000;
+
 export interface WindowsPanelWindowDeps {
   env: NodeJS.ProcessEnv;
   exists: (path: string) => boolean;
-  /** Runs a system tool (tasklist) to completion and returns its stdout: quick read-only process queries that never touch WMI. */
-  tasklist: (args: readonly string[]) => Promise<string>;
+  /**
+   * Runs a system tool (tasklist) to completion and returns its stdout: quick read-only process queries that never touch WMI.
+   * Undefined when the tool did not run to completion (timeout, spawn error): "could not tell", which is not "nothing found".
+   */
+  tasklist: (args: readonly string[]) => Promise<string | undefined>;
   /** Run one operation in the active user's session (service) or directly (user): the script's result word. */
   runOp: (op: WindowsPanelOp) => Promise<string | undefined>;
   launchNative: (path: string) => Promise<boolean>;
@@ -123,10 +128,11 @@ function isServiceAccount(env: NodeJS.ProcessEnv): boolean {
 
 const realDeps = (): WindowsPanelWindowDeps => {
   const env = process.env;
-  const tasklist = (args: readonly string[]): Promise<string> => new Promise((resolve) => {
+  const tasklist = (args: readonly string[]): Promise<string | undefined> => new Promise((resolve) => {
     const systemRoot = (env.SystemRoot ?? env.WINDIR ?? 'C:\\Windows').replace(/"/gu, '');
+    // A loaded or slow machine takes tens of seconds to list processes (measured on a Windows 10 node: well over 20 s).
     execFile(win32.join(systemRoot, 'System32', 'tasklist.exe'), [...args],
-      { timeout: 20_000, encoding: 'utf8', windowsHide: true }, (_error, stdout) => resolve(String(stdout ?? '')));
+      { timeout: TASKLIST_TIMEOUT_MS, encoding: 'utf8', windowsHide: true }, (error, stdout) => resolve(error ? undefined : String(stdout ?? '')));
   });
   return {
     env,
@@ -184,6 +190,8 @@ export function createWindowsLocalPanelWindowPlatform(overrides: Partial<Windows
       if (!isServiceAccount(deps.env)) return true;
       // The service sees an interactive desktop when a user session (>= 1) runs explorer.exe: `"explorer.exe","<pid>","<session name>","<session #>",...`
       const out = await deps.tasklist(['/FI', 'IMAGENAME eq explorer.exe', '/FO', 'CSV', '/NH']);
+      // The listing did not complete: not knowing is not "no desktop" -- try, and let the user-session launch report a missing desktop.
+      if (out === undefined || out.trim() === '') return true;
       return out.split(/\r?\n/u).some((line) => Number(/^"[^"]*","\d+","[^"]*","(\d+)"/u.exec(line)?.[1] ?? -1) >= 1);
     },
     async nativeUiPath() {
@@ -199,7 +207,8 @@ export function createWindowsLocalPanelWindowPlatform(overrides: Partial<Windows
     },
     async probePid(pid) {
       // Alive AND still one of the window's own images: a recycled pid belonging to anything else is not our window.
-      const out = await deps.tasklist(['/FI', `PID eq ${Math.trunc(pid)}`, '/FO', 'CSV', '/NH']);
+      // Not knowing counts as not alive: the record is dropped and the window is found again by its title (the authoritative look).
+      const out = (await deps.tasklist(['/FI', `PID eq ${Math.trunc(pid)}`, '/FO', 'CSV', '/NH'])) ?? '';
       const alive = out.split(/\r?\n/u).some((line) => new RegExp(`^"(?:msedge|chrome|brave|${AIDESK_LOCAL_UI_EXECUTABLE_NAME})\\.exe","${Math.trunc(pid)}"`, 'iu').test(line));
       return alive ? { alive: true } : { alive: false };
     },

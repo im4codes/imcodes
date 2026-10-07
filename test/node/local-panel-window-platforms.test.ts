@@ -246,6 +246,10 @@ describe('Windows adapter', () => {
     expect(await createWindowsLocalPanelWindowPlatform({ ...base, tasklist: explorer('0') }).hasDesktop()).toBe(false);
     expect(await createWindowsLocalPanelWindowPlatform({ ...base, tasklist: async () => 'INFO: No tasks are running which match the specified criteria.\r\n' }).hasDesktop()).toBe(false);
     expect(await createWindowsLocalPanelWindowPlatform({ ...base, env: { USERNAME: 'alice' }, tasklist: async () => '' }).hasDesktop()).toBe(true);
+    // A listing that never completed (a slow node: tasklist timed out) is "could not tell", never "no desktop": the launch is still attempted.
+    expect(await createWindowsLocalPanelWindowPlatform({ ...base, tasklist: async () => undefined }).hasDesktop()).toBe(true);
+    expect(await createWindowsLocalPanelWindowPlatform({ ...base, tasklist: async () => '' }).hasDesktop()).toBe(true);
+    expect(await createWindowsLocalPanelWindowPlatform({ ...base, tasklist: async () => undefined }).probePid(5120)).toEqual({ alive: false });
     const found = createWindowsLocalPanelWindowPlatform({ ...base, tasklist: async () => '', runOp: async () => 'ok:5120:1790000000123' });
     expect(await found.findWindowProcess()).toEqual({ pid: 5120, startedAtMs: 1_790_000_000_123 });
     for (const answer of ['not_found', 'failed', undefined, 'ok:1', 'ok:0:5']) {
