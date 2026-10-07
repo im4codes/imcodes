@@ -14,6 +14,7 @@ import {
   CONTROLLED_NODE_OS_LINUX,
   CONTROLLED_NODE_OS_MAC,
   CONTROLLED_NODE_OS_WIN,
+  type AideskLocalUiArtifactAsset,
   type ControlledNodeArtifactArch,
   type ControlledNodeOs,
 } from '../../shared/controlled-node-artifacts.js';
@@ -656,6 +657,10 @@ async function downloadArtifact(input: {
   expectedFileName?: string;
   expectedVersion?: string;
   fileMode?: number;
+  /** Upper bound for the declared size: a response without a size, or a larger one, is refused before a byte is written. */
+  maxBytes?: number;
+  /** Default true: the generic `<file>.manifest.json` record beside the download. Assets that have their own manifest turn it off. */
+  writeManifest?: boolean;
   onProgress?: (phase: ControlledNodeArtifactDownloadPhase) => Promise<void>;
 }): Promise<{ artifactPath: string; manifestPath: string; sha256: string; sizeBytes: number; filename: string; version?: string }> {
   const asset = input.asset ?? CONTROLLED_NODE_ARTIFACT_ASSETS.NODE;
@@ -680,6 +685,7 @@ async function downloadArtifact(input: {
   if (!expectedSha || !/^[0-9a-f]{64}$/i.test(expectedSha)) throw new Error('missing_artifact_sha256');
   const expectedSize = sizeHeader && /^\d+$/.test(sizeHeader) ? Number(sizeHeader) : null;
   if (expectedSize !== null && !Number.isSafeInteger(expectedSize)) throw new Error('artifact_size_mismatch');
+  if (input.maxBytes !== undefined && (expectedSize === null || expectedSize > input.maxBytes)) throw new Error('artifact_too_large');
   const artifactPath = join(input.dir, basename(filename));
   const partialArtifactPath = `${artifactPath}.download-${randomUUID()}`;
   const manifestPath = `${artifactPath}.manifest.json`;
@@ -713,6 +719,16 @@ async function downloadArtifact(input: {
   } catch (error) {
     await rm(partialArtifactPath, { force: true }).catch(() => {});
     throw error;
+  }
+  if (input.writeManifest === false) {
+    return {
+      artifactPath,
+      manifestPath,
+      sha256: downloaded.sha256,
+      sizeBytes: downloaded.sizeBytes,
+      filename: basename(filename),
+      ...(versionHeader ? { version: versionHeader } : {}),
+    };
   }
   await writeFile(manifestPath, `${JSON.stringify({
     schemaVersion: 1,
@@ -788,6 +804,40 @@ export async function downloadControlledNodeExecutable(input: {
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     if (/^download_failed_(403|404|503)$/.test(message)) return undefined;
+    throw error;
+  }
+}
+
+/**
+ * One file of the Windows panel window host sidecar (executable, manifest or third-party notices) into `dir`, under its fixed name.
+ * `undefined` means "not published": the server has none (404/503) or this target has none -- the caller skips, it is not an error.
+ */
+export async function downloadControlledNodeAideskLocalUiFile(input: {
+  credential: ArtifactDownloadCredential;
+  dir: string;
+  fetchImpl: typeof fetch;
+  asset: AideskLocalUiArtifactAsset;
+  expectedFileName: string;
+  maxBytes: number;
+}): Promise<{ artifactPath: string; sha256: string; sizeBytes: number } | undefined> {
+  await mkdir(input.dir, { recursive: true });
+  try {
+    const downloaded = await downloadArtifact({
+      credential: input.credential,
+      target: { os: CONTROLLED_NODE_OS_WIN, arch: CONTROLLED_NODE_ARCH_X64 },
+      dir: input.dir,
+      fetchImpl: input.fetchImpl,
+      asset: input.asset,
+      expectedFileName: input.expectedFileName,
+      maxBytes: input.maxBytes,
+      writeManifest: false,
+      fileMode: 0o644,
+    });
+    return { artifactPath: downloaded.artifactPath, sha256: downloaded.sha256, sizeBytes: downloaded.sizeBytes };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    // 400 = a server that does not know this asset yet (older than this node); 404/503 = not published here.
+    if (/^download_failed_(400|404|503)$/.test(message)) return undefined;
     throw error;
   }
 }

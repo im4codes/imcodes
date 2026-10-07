@@ -33,6 +33,7 @@ import {
 } from './remote-desktop-local-panel.js';
 import { startAideskLocalIpcServer } from './aidesk-local-ipc-server.js';
 import { ensureAideskDesktopEntry } from './aidesk-desktop-entry.js';
+import { startAideskLocalUiSidecarRefresh } from './aidesk-local-ui-sidecar.js';
 import { localPanelWindowHandlers, openAideskLocalPanel } from './local-panel-window-run.js';
 import {
   CONSOLE_HOLD,
@@ -356,8 +357,12 @@ async function main(): Promise<void> {
   }).catch((error) => {
     logger.warn({ err: error }, 'aiDesk desktop entry unavailable');
   });
+  // The Windows panel window host (a signed WebView2 exe) is its own sidecar: refreshed here, apart from the node's upgrade, and never
+  // able to fail the node (every outcome is a logged reason; failures back off).
+  const stopAideskLocalUiRefresh = startAideskLocalUiSidecarRefresh({ credential: bootstrap.credential });
   runtime.start();
   const stop = () => {
+    stopAideskLocalUiRefresh();
     void localIpc?.close().catch(() => {});
     void localPanel?.close().catch(() => {});
     runtime.stop();
