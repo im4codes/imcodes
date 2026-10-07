@@ -48,4 +48,37 @@ describe('aiDesk local management launchers', () => {
       windows.indexOf('if (stop_all_) stop_all_()'),
     );
   });
+
+  it('keeps the native open-window request byte-identical with the TypeScript contract', () => {
+    const header = read('native/remote-desktop-common/local_management_open_window.h');
+    expect(header).toContain(`kLocalManagementHost[] = "${REMOTE_DESKTOP_LOCAL_MANAGEMENT.HOST}"`);
+    expect(header).toContain(`kLocalManagementPort = ${REMOTE_DESKTOP_LOCAL_MANAGEMENT.PORT}`);
+    expect(header).toContain(`kLocalManagementOpenWindowPath[] = "${REMOTE_DESKTOP_LOCAL_MANAGEMENT.OPEN_WINDOW_PATH}"`);
+    expect(header).toContain(`kLocalManagementOpenWindowHeader[] = "${REMOTE_DESKTOP_LOCAL_MANAGEMENT.OPEN_WINDOW_HEADER}"`);
+    // no Origin: that is what tells a native client from a web page
+    const builder = header.slice(header.indexOf('LocalManagementOpenWindowRequest()'), header.indexOf('LocalManagementHttpStatus(std::string_view'));
+    expect(builder).not.toMatch(/Origin/u);
+    expect(read('native/remote-desktop-common/BUILD.gn').match(/local_management_open_window\.h/gu)).toHaveLength(2);
+  });
+
+  it('every platform asks the node to open the window first and keeps its previous open only as the fallback', () => {
+    const windows = read('native/windows-remote-desktop/local_indicator.cc');
+    expect(windows.indexOf('RequestNodeOpenPanelWindow()')).toBeGreaterThan(-1);
+    expect(windows.indexOf('if (RequestNodeOpenPanelWindow()) return;')).toBeLessThan(windows.indexOf('ShellExecuteW(nullptr, L"open"'));
+    expect(windows).toContain('std::thread([] {');
+    expect(windows.indexOf('#include <winsock2.h>')).toBeLessThan(windows.indexOf('local_indicator.h"'));
+
+    const linux = read('native/linux-remote-desktop/linux_x11_backend.cc');
+    expect(linux.indexOf('common::RequestLocalManagementWindow()')).toBeGreaterThan(-1);
+    expect(linux.indexOf('common::RequestLocalManagementWindow()')).toBeLessThan(linux.indexOf('execlp("xdg-open"'));
+
+    const app = read('native/macos-remote-desktop/aidesk_agent_main.mm');
+    const disclosure = read('native/macos-remote-desktop/macos_local_disclosure.mm');
+    for (const source of [app, disclosure]) {
+      expect(source).toContain('RequestLocalManagementWindow()');
+      expect(source).toContain('dispatch_get_global_queue');
+    }
+    expect(app.indexOf('RequestLocalManagementWindow()')).toBeLessThan(app.indexOf('OpenLocalManagementPanelDirectly(); });'));
+    expect(disclosure.indexOf('RequestLocalManagementWindow()')).toBeLessThan(disclosure.indexOf('openURL:url'));
+  });
 });

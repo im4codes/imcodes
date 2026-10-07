@@ -2,6 +2,7 @@
 #include "../remote-desktop-common/aidesk_product_name.h"
 #include "../remote-desktop-common/data_channel_constants.h"
 #include "../remote-desktop-common/local_indicator_visuals.h"
+#include "../remote-desktop-common/local_management_open_window.h"
 
 #include <chrono>
 #include <algorithm>
@@ -1144,6 +1145,9 @@ void X11DisclosureAdapter::RedrawLoop() {
         if (child == 0) {
           const pid_t launcher = fork();
           if (launcher == 0) {
+            // The node decides how the panel opens (native window, app-mode browser, single instance); only when it cannot
+            // (older node, failure, no answer) does the indicator open the URL itself, as it always did.
+            if (common::RequestLocalManagementWindow()) _exit(0);
             execlp("xdg-open", "xdg-open", common::kLocalManagementUrl,
                    static_cast<char*>(nullptr));
             _exit(127);

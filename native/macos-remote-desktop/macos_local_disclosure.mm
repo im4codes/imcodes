@@ -1,6 +1,7 @@
 #include "macos_local_disclosure.h"
 #include "../remote-desktop-common/aidesk_product_name.h"
 #include "../remote-desktop-common/local_indicator_visuals.h"
+#include "../remote-desktop-common/local_management_open_window.h"
 
 #import <AppKit/AppKit.h>
 
@@ -119,8 +120,14 @@ static NSImage *IMCodesIndicatorLogo() {
 }
 
 - (void)openManagement {
-  NSURL *url = [NSURL URLWithString:@(imcodes::remote_desktop::common::kLocalManagementUrl)];
-  if (url != nil) [[NSWorkspace sharedWorkspace] openURL:url];
+  // The node decides how the panel opens; ask it off the main thread and open the URL only when it cannot.
+  dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+    if (imcodes::remote_desktop::common::RequestLocalManagementWindow()) return;
+    dispatch_async(dispatch_get_main_queue(), ^{
+      NSURL *url = [NSURL URLWithString:@(imcodes::remote_desktop::common::kLocalManagementUrl)];
+      if (url != nil) [[NSWorkspace sharedWorkspace] openURL:url];
+    });
+  });
 }
 
 

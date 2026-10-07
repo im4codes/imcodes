@@ -30,12 +30,14 @@
 #include "macos_permission_onboarding.h"
 #include "../remote-desktop-common/platform_interfaces.h"
 #include "../remote-desktop-common/aidesk_product_name.h"
+#include "../remote-desktop-common/local_management_open_window.h"
 #include "../remote-desktop-common/local_indicator_visuals.h"
 
 namespace macos = imcodes::remote_desktop::macos;
 
 namespace {
-bool OpenLocalManagementPanel() {
+// The previous way of opening the panel: the bundled native window, else the default browser. Now only the fallback.
+bool OpenLocalManagementPanelDirectly() {
   NSString *native_ui = [[[NSBundle mainBundle] bundlePath]
       stringByAppendingPathComponent:@"Contents/Helpers/aidesk-local-ui"];
   if (![[NSFileManager defaultManager] isExecutableFileAtPath:native_ui]) native_ui = nil;
@@ -47,6 +49,16 @@ bool OpenLocalManagementPanel() {
   }
   NSURL *url = [NSURL URLWithString:@(imcodes::remote_desktop::common::kLocalManagementUrl)];
   return url != nil && [[NSWorkspace sharedWorkspace] openURL:url];
+}
+
+// The node decides how the panel opens (native window, app-mode browser, default browser, single instance); this only asks it, off
+// the main thread (the answer can take a few seconds), and opens directly only when the node cannot (an older node, a failure).
+bool OpenLocalManagementPanel() {
+  dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+    if (imcodes::remote_desktop::common::RequestLocalManagementWindow()) return;
+    dispatch_async(dispatch_get_main_queue(), ^{ OpenLocalManagementPanelDirectly(); });
+  });
+  return true;
 }
 
 bool IsLoopbackStatusUrl(NSURL *url) {

@@ -1,12 +1,18 @@
+// Winsock must precede windows.h (local_indicator.h includes it) to avoid the winsock.h redefinitions.
+#include <winsock2.h>
+#include <ws2tcpip.h>
+
 #include "third_party/imcodes_remote_desktop/local_indicator.h"
 #include "third_party/imcodes_remote_desktop/common/platform_interfaces.h"
 #include "third_party/imcodes_remote_desktop/common/aidesk_product_name.h"
 #include "third_party/imcodes_remote_desktop/common/local_indicator_visuals.h"
+#include "third_party/imcodes_remote_desktop/common/local_management_open_window.h"
 
 #include <algorithm>
 #include <cstring>
 #include <string>
 #include <string_view>
+#include <thread>
 
 #include <windowsx.h>
 #include <shellapi.h>
@@ -42,6 +48,54 @@ constexpr int kLogoLogicalSize = 20;
 // The product name is a compile-time constant on purpose. Nothing a remote
 // requester sends may ever reach this window -- see the note on Update().
 constexpr wchar_t kSurfaceName[] = L"Remote Desktop";
+
+/**
+ * Asks the node to open (or focus) the local management panel as an independent window -- the one place that decides how (native
+ * window, app-mode browser, default browser, single instance). Blocking: runs on its own thread. True only when the node answered
+ * 200; an older node (404/501), a node failure (502), no node, or a timeout is false and the caller opens the URL as before.
+ */
+bool RequestNodeOpenPanelWindow() {
+  WSADATA data{};
+  if (WSAStartup(MAKEWORD(2, 2), &data) != 0) return false;
+  bool accepted = false;
+  SOCKET sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+  if (sock != INVALID_SOCKET) {
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_port = htons(common::kLocalManagementPort);
+    if (InetPtonA(AF_INET, common::kLocalManagementHost, &address.sin_addr) == 1) {
+      const DWORD answer_timeout = common::kLocalManagementOpenWindowAnswerTimeoutMs;
+      setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&answer_timeout), sizeof(answer_timeout));
+      setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&answer_timeout), sizeof(answer_timeout));
+      if (connect(sock, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0) {
+        const std::string request = common::LocalManagementOpenWindowRequest();
+        if (send(sock, request.data(), static_cast<int>(request.size()), 0) == static_cast<int>(request.size())) {
+          char buffer[64];
+          int received = 0;
+          while (received < 12) {
+            const int read = recv(sock, buffer + received, static_cast<int>(sizeof(buffer)) - received, 0);
+            if (read <= 0) break;
+            received += read;
+          }
+          accepted = common::LocalManagementOpenWindowAccepted(std::string_view(buffer, static_cast<size_t>(received)));
+        }
+      }
+    }
+    closesocket(sock);
+  }
+  WSACleanup();
+  return accepted;
+}
+
+/** Click on the indicator: the node opens the window; only if it cannot, the browser opens the panel URL (the previous behaviour). */
+void OpenLocalManagement() {
+  std::thread([] {
+    if (RequestNodeOpenPanelWindow()) return;
+    const std::string_view url = common::kLocalManagementUrl;
+    const std::wstring wide(url.begin(), url.end());
+    ShellExecuteW(nullptr, L"open", wide.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+  }).detach();
+}
 
 int Scaled(UINT dpi, int logical) {
   return MulDiv(logical, dpi > 0 ? static_cast<int>(dpi) : 96, 96);
@@ -391,10 +445,7 @@ LRESULT LocalIndicator::HandleMessage(HWND window, UINT message,
       } else if (Contains(StopRect(client, WindowDpi(window)), x, y)) {
         RequestStopAll();
       } else {
-        const std::string_view url = common::kLocalManagementUrl;
-        const std::wstring wide(url.begin(), url.end());
-        ShellExecuteW(nullptr, L"open", wide.c_str(), nullptr, nullptr,
-                      SW_SHOWNORMAL);
+        OpenLocalManagement();
       }
       return 0;
     }

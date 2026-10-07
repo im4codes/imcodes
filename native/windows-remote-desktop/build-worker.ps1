@@ -60,6 +60,7 @@ $ExpectedSources = @(
 $ExpectedCommonSources = @(
   'aidesk_product_name.h',
   'local_management_types.h',
+  'local_management_open_window.h',
   'local_indicator_visuals.h',
   'BUILD.gn',
   'data_channel_constants.h',
