@@ -12,6 +12,7 @@ import {
   FILE_TRANSFER_LIMITS,
   fileTransferLegacyFilename,
   FILE_TRANSFER_DIRECTORY_CAPABILITY,
+  FILE_TRANSFER_DIRECTORY_QUERY_CAPABILITY,
   FILE_TRANSFER_UPLOAD_ERROR_CODE,
   FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY,
   FILE_TRANSFER_DOWNLOAD_STREAM_CAPABILITY,
@@ -968,7 +969,10 @@ fileTransferRoutes.post('/:id/machine-file-list', async (c) => {
       : c.json({ error: 'invalid_body' }, 400);
   }
   const body = boundedBody.value;
-  if (Object.keys(body).length !== 1 || !Object.prototype.hasOwnProperty.call(body, 'path')) {
+  // `path` is required; `query` is optional and is only ever forwarded to a node
+  // that advertises it (below). Anything else is rejected, as before.
+  if (!Object.prototype.hasOwnProperty.call(body, 'path')
+    || !Object.keys(body).every((key) => key === 'path' || key === 'query')) {
     return c.json({ error: FS_GENERIC_ERROR_CODES.INVALID_REQUEST }, 400);
   }
   const requestId = randomHex(16);
@@ -978,6 +982,12 @@ fileTransferRoutes.post('/:id/machine-file-list', async (c) => {
     requestId,
   });
   if (!parsed.ok) return c.json({ error: FS_GENERIC_ERROR_CODES.INVALID_REQUEST }, 400);
+  // A node that predates the query capability would reject a request carrying
+  // one. Dropping it answers the plain listing, which the browser shows with
+  // the metadata columns marked unavailable.
+  if (parsed.value.query && !gate.bridge.hasDaemonCapability(FILE_TRANSFER_DIRECTORY_QUERY_CAPABILITY)) {
+    delete parsed.value.query;
+  }
 
   try {
     const result = await gate.bridge.sendFileTransferRequest(
@@ -995,7 +1005,13 @@ fileTransferRoutes.post('/:id/machine-file-list', async (c) => {
       || typeof result.resolvedPath !== 'string') {
       return c.json({ error: 'invalid_daemon_response' }, 502);
     }
-    return c.json({ ok: true, resolvedPath: result.resolvedPath, entries: result.entries });
+    return c.json({
+      ok: true,
+      resolvedPath: result.resolvedPath,
+      entries: result.entries,
+      ...(result.truncated === true ? { truncated: true, total: result.total } : {}),
+      ...(result.partial === true ? { partial: true } : {}),
+    });
   } catch (error) {
     const reason = error instanceof Error ? error.message : 'directory_list_failed';
     if (reason === 'daemon_offline' || reason === 'daemon_disconnected' || reason === 'daemon_generation_changed') {

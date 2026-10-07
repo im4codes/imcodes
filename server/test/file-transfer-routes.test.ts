@@ -3,6 +3,7 @@ import { Hono } from 'hono';
 import {
   FILE_TRANSFER_LIMITS,
   FILE_TRANSFER_DIRECTORY_CAPABILITY,
+  FILE_TRANSFER_DIRECTORY_QUERY_CAPABILITY,
   FILE_TRANSFER_DOWNLOAD_STREAM_CAPABILITY,
   FILE_TRANSFER_PATH_HANDLE_CAPABILITY,
   FILE_TRANSFER_PATH_MAX_BYTES,
@@ -470,6 +471,74 @@ describe('file-transfer upload route', () => {
       undefined,
       1,
     );
+  });
+
+  describe('controlled-node directory listing query', () => {
+    const querySort = { key: 'modified', direction: 'desc', dirsFirst: true } as const;
+    const listDone = (extra: Record<string, unknown> = {}) => ({
+      type: FILE_TRANSFER_MSG.DIRECTORY_LIST_DONE,
+      requestId: 'a'.repeat(32),
+      path: '/d',
+      resolvedPath: '/d',
+      entries: [{ name: 'new.txt', path: '/d/new.txt', isDir: false, hidden: false, size: 4, mtimeMs: 1_700_000_000_000 }],
+      ...extra,
+    });
+    const post = (body: unknown) => makeApp().request('/api/server/controlled-1/machine-file-list', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer browser', 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    beforeEach(() => {
+      queryOneMock.mockResolvedValue({ user_id: 'user-1', node_role: 'controlled', exec_enabled: true, revoked_at: null, access_role: 'owner' });
+    });
+
+    it('forwards the query to a node that advertises the capability and passes truncation through', async () => {
+      sendFileTransferRequestMock.mockResolvedValueOnce(listDone({ truncated: true, total: 5002, partial: true }));
+      const res = await post({ path: '/d', query: { sort: querySort, nameFilter: 'new' } });
+      expect(res.status).toBe(200);
+      await expect(res.json()).resolves.toEqual({
+        ok: true,
+        resolvedPath: '/d',
+        entries: [{ name: 'new.txt', path: '/d/new.txt', isDir: false, hidden: false, size: 4, mtimeMs: 1_700_000_000_000 }],
+        truncated: true,
+        total: 5002,
+        partial: true,
+      });
+      expect(hasDaemonCapabilityMock).toHaveBeenCalledWith(FILE_TRANSFER_DIRECTORY_QUERY_CAPABILITY);
+      expect(sendFileTransferRequestMock.mock.calls[0]?.[1]).toMatchObject({ query: { sort: querySort, nameFilter: 'new' } });
+    });
+
+    it('drops the query for a node without the capability, so an older node is never sent a field it rejects', async () => {
+      hasDaemonCapabilityMock.mockImplementation((capability: string) => capability !== FILE_TRANSFER_DIRECTORY_QUERY_CAPABILITY);
+      sendFileTransferRequestMock.mockResolvedValueOnce(listDone());
+      const res = await post({ path: '/d', query: { sort: querySort } });
+      expect(res.status).toBe(200);
+      expect(sendFileTransferRequestMock.mock.calls[0]?.[1]).not.toHaveProperty('query');
+      expect(sendFileTransferRequestMock.mock.calls[0]?.[1]).toMatchObject({ type: FILE_TRANSFER_MSG.DIRECTORY_LIST, path: '/d' });
+    });
+
+    it('rejects a malformed query and any other extra field before dispatch', async () => {
+      for (const body of [
+        { path: '/d', query: { sort: { ...querySort, key: 'owner' } } },
+        { path: '/d', query: { sort: querySort, nameFilter: 'x'.repeat(300) } },
+        { path: '/d', query: { sort: querySort, pattern: '.*' } },
+        { path: '/d', extra: 1 },
+        { query: { sort: querySort } },
+      ]) {
+        const res = await post(body);
+        expect(res.status, JSON.stringify(body)).toBe(400);
+      }
+      expect(sendFileTransferRequestMock).not.toHaveBeenCalled();
+    });
+
+    it('a plain request is forwarded without a query and answered without truncation fields', async () => {
+      sendFileTransferRequestMock.mockResolvedValueOnce(listDone({}));
+      const res = await post({ path: '/d' });
+      const body = await res.json() as Record<string, unknown>;
+      expect(body).not.toHaveProperty('truncated');
+      expect(body).not.toHaveProperty('partial');
+      expect(sendFileTransferRequestMock.mock.calls[0]?.[1]).not.toHaveProperty('query');
+    });
   });
 
   it('uses controlled Owner/Participant grants for interactive uploads instead of ordinary server membership', async () => {
