@@ -41,7 +41,10 @@ import {
   openSessionDbForWrite,
   openSessionDbReadOnly,
   readSessionDbMeta,
+  listSessionBlobHashes,
+  readSessionBlobs,
   readSessionPayloads,
+  readSnapshotBlobs,
   readSnapshotPayloads,
   snapshotSessionDb,
   type SessionDbHandle,
@@ -52,6 +55,8 @@ import { assertNotRealImcodesPathInTests, isRealImcodesPath, isUnderTestRunner }
 import { readInstanceLockMetadata, isRecordedProcessIdentityCurrent, type DaemonProcessIdentity } from '../daemon/instance-lock.js';
 import logger from '../util/logger.js';
 import { SESSION_ERROR_WORKING_DIRECTORY_NOT_FOUND } from '../../shared/session-errors.js';
+import { SESSIONS_JSON_COMPAT_EXPORT_MAX_BYTES } from '../../shared/session-store-compat.js';
+import { blobHashesOfPayload, externalizeSessionRecord, hasGenericBlobRefs, hydrateSessionRecord, identityRefOfPayload } from './session-record-blobs.js';
 import { imcodesStateDir } from '../util/imcodes-state-dir.js';
 
 const DEBOUNCE_MS = 500;
@@ -468,10 +473,29 @@ async function readNewestLegacyJsonBackup(jsonPath: string): Promise<{ store: Se
 }
 
 /** One session as a database row. The record is stored whole, as compact JSON. */
+/**
+ * Hash -> text of every large field this process has seen (loaded or externalised): the export's identity
+ * table, and the one shared string per distinct text. Pruned to what committed rows still refer to.
+ */
+const blobTextByHash = new Map<string, string>();
+/** Hashes the database already holds, so a row write sends only blobs it does not have. */
+let knownBlobHashes = new Set<string>();
+
+/** Forget the text of blobs no committed row refers to. */
+function pruneBlobTexts(): void {
+  const referenced = new Set<string>();
+  for (const payload of committedPayloads.values()) for (const hash of blobHashesOfPayload(payload)) referenced.add(hash);
+  for (const hash of [...blobTextByHash.keys()]) if (!referenced.has(hash)) blobTextByHash.delete(hash);
+}
+
 function rowFromRecord(name: string, record: SessionRecord): SessionDbRow | null {
   let payload: string;
+  let blobs: SessionDbRow['blobs'];
   try {
-    payload = JSON.stringify(record);
+    const externalized = externalizeSessionRecord(record);
+    payload = externalized.payload;
+    blobs = externalized.blobs;
+    for (const blob of blobs) blobTextByHash.set(blob.hash, blob.text);
   } catch (error) {
     // One unserialisable record must not stop every other session persisting.
     logger.error({ err: error, session: name }, 'Session record cannot be serialised; skipped');
@@ -485,20 +509,27 @@ function rowFromRecord(name: string, record: SessionRecord): SessionDbRow | null
     state: typeof record.state === 'string' ? record.state : '',
     updatedAt: typeof record.updatedAt === 'number' && Number.isFinite(record.updatedAt) ? record.updatedAt : 0,
     payload,
+    ...(blobs && blobs.length > 0 ? { blobs } : {}),
   };
 }
 
 /** Rows read from the database, as records. A row that no longer parses is skipped, never fatal. */
-function recordsFromPayloads(payloads: Map<string, string>): Record<string, SessionRecord> {
+function recordsFromPayloads(payloads: Map<string, string>, blobs: ReadonlyMap<string, string> = new Map()): Record<string, SessionRecord> {
   const sessions: Record<string, SessionRecord> = {};
+  const lookup = (hash: string): string | undefined => blobs.get(hash) ?? blobTextByHash.get(hash);
   for (const [name, payload] of payloads) {
     try {
       const parsed = JSON.parse(payload) as unknown;
-      if (isObjectRecord(parsed)) sessions[name] = parsed as unknown as SessionRecord;
+      if (!isObjectRecord(parsed)) continue;
+      const hydrated = hydrateSessionRecord(parsed, lookup, (field, hash) => {
+        logger.warn({ session: name, field, hash }, 'Session row refers to a missing blob; the field is left unset');
+      });
+      sessions[name] = hydrated as unknown as SessionRecord;
     } catch (error) {
       logger.error({ err: error, session: name }, 'Session row is not valid JSON; skipped');
     }
   }
+  for (const [hash, text] of blobs) blobTextByHash.set(hash, text);
   return sessions;
 }
 
@@ -552,10 +583,13 @@ function writerHandle(targetPath: string): SessionDbHandle {
   closeSessionDb(writerDb);
   writerDb = null;
   committedPayloads = new Map();
+  knownBlobHashes = new Set();
+  blobTextByHash.clear();
   dirtyNames.clear();
   fullSweepRequested = true;
   lastBackupAt = 0;
   writerDb = openSessionDbForWrite(targetPath);
+  knownBlobHashes = listSessionBlobHashes(writerDb);
   return writerDb;
 }
 
@@ -642,10 +676,14 @@ function restoreFromDatabaseSnapshot(handle: SessionDbHandle, targetPath: string
     if (!countSnapshotRows(snapshot)) continue;
     const payloads = readSnapshotPayloads(snapshot);
     if (!payloads || payloads.size === 0) continue;
+    const snapshotBlobs = readSnapshotBlobs(snapshot);
+    const snapshotRecords = recordsFromPayloads(payloads, snapshotBlobs);
     const upserts: SessionDbRow[] = [];
-    for (const [name, payload] of payloads) {
+    for (const name of payloads.keys()) {
       try {
-        const row = rowFromRecord(name, JSON.parse(payload) as SessionRecord);
+        const record = snapshotRecords[name];
+        if (!record) continue;
+        const row = rowFromRecord(name, record);
         if (row) upserts.push(row);
       } catch { /* a bad row in an old snapshot is skipped */ }
     }
@@ -662,7 +700,7 @@ async function readWithoutAuthority(targetPath: string): Promise<Record<string, 
   const reader = openSessionDbReadOnly(targetPath);
   try {
     if (reader && readSessionDbMeta(reader, SESSION_DB_META_LEGACY_IMPORT) === SESSION_DB_LEGACY_IMPORT_DONE) {
-      return recordsFromPayloads(readSessionPayloads(reader));
+      return recordsFromPayloads(readSessionPayloads(reader), readSessionBlobs(reader));
     }
   } finally {
     closeSessionDb(reader);
@@ -711,7 +749,7 @@ export async function loadStore(options: LoadStoreOptions = {}): Promise<Session
         if (restored) { payloads = restored; dirty = true; }
       }
       committedPayloads = payloads;
-      store = { sessions: recordsFromPayloads(payloads) };
+      store = { sessions: recordsFromPayloads(payloads, readSessionBlobs(handle)) };
       // Older processes see the migrated sessions at once -- but only once they ARE migrated.
       if (legacyImportDone(handle)) scheduleCompatExport(targetPath, true);
     } else {
@@ -917,9 +955,26 @@ async function writeStoreToDisk(bestEffort: boolean, targetPath = dbPath(), forc
       }
     }
     if (upserts.length > 0 || deletes.length > 0) {
-      commitSessionChanges(handle, { upserts, deletes, allowEmpty: allowEmptyStoreWrite });
-      for (const row of upserts) committedPayloads.set(row.name, row.payload);
+      // A row that stopped referring to a blob (identity edited) lets that blob go; so does a deleted row.
+      let collectBlobs = false;
+      for (const row of upserts) {
+        const previous = committedPayloads.get(row.name);
+        if (previous !== undefined) {
+          const next = new Set(blobHashesOfPayload(row.payload));
+          if (blobHashesOfPayload(previous).some((hash) => !next.has(hash))) collectBlobs = true;
+        }
+        if (row.blobs) row.blobs = row.blobs.filter((blob) => !knownBlobHashes.has(blob.hash));
+      }
+      commitSessionChanges(handle, { upserts, deletes, allowEmpty: allowEmptyStoreWrite, collectBlobs });
+      for (const row of upserts) {
+        committedPayloads.set(row.name, row.payload);
+        for (const blob of row.blobs ?? []) knownBlobHashes.add(blob.hash);
+      }
       for (const name of deletes) committedPayloads.delete(name);
+      if (collectBlobs || deletes.length > 0) {
+        knownBlobHashes = listSessionBlobHashes(handle);
+        pruneBlobTexts();
+      }
       allowEmptyStoreWrite = false;
       scheduleCompatExport(targetPath);
     }
@@ -1061,6 +1116,27 @@ function scheduleCompatExport(targetPath: string, immediate = false): void {
   compatExportTimer.unref?.();
 }
 
+/** JSON text of identity blobs already serialised for an export (a 550 KB prompt is escaped once, not per export). */
+const compatIdentityJson = new Map<string, string>();
+let lastCompatSkipWarnAt = 0;
+
+/** A payload with generic blob refs, rebuilt with those fields inline (the identity stays a reference). */
+function compatInlinePayload(name: string, payload: string): string {
+  try {
+    const parsed = JSON.parse(payload) as Record<string, unknown>;
+    const identityRef = parsed['identityPromptRef'];
+    const hydrated = hydrateSessionRecord(parsed, (hash) => blobTextByHash.get(hash));
+    if (typeof identityRef === 'string') {
+      delete hydrated['identityPrompt'];
+      hydrated['identityPromptRef'] = identityRef;
+    }
+    return JSON.stringify(hydrated);
+  } catch (error) {
+    logger.warn({ err: error, session: name }, 'sessions.json compatibility export: row kept as stored');
+    return payload;
+  }
+}
+
 function runCompatExport(targetPath: string): Promise<void> {
   const run = async (): Promise<void> => {
     if (!compatExportPending) return;
@@ -1085,7 +1161,38 @@ function runCompatExport(targetPath: string): Promise<void> {
       lastCompatExportAt = Date.now();
       const mainStart = performance.now();
       const parts: string[] = [];
-      for (const [name, payload] of committedPayloads) parts.push(`${JSON.stringify(name)}:${payload}`);
+      let estimatedBytes = 0;
+      const identityHashes = new Set<string>();
+      for (const [name, payload] of committedPayloads) {
+        // Rows carry large fields by reference; older readers expect them inline, except the identity prompt, which
+        // sessions.json always kept in its own de-duplicated `identityPrompts` table.
+        const inline = hasGenericBlobRefs(payload) ? compatInlinePayload(name, payload) : payload;
+        parts.push(`${JSON.stringify(name)}:${inline}`);
+        estimatedBytes += inline.length;
+        const identity = identityRefOfPayload(inline);
+        if (identity) identityHashes.add(identity);
+      }
+      const identityEntries: string[] = [];
+      for (const hash of identityHashes) {
+        const text = blobTextByHash.get(hash);
+        if (text === undefined) continue; // an unresolvable reference leaves that session without an identity for the older reader, never a wrong one
+        let json = compatIdentityJson.get(hash);
+        if (json === undefined) {
+          json = JSON.stringify(text);
+          if (compatIdentityJson.size >= 256) compatIdentityJson.clear();
+          compatIdentityJson.set(hash, json);
+        }
+        estimatedBytes += json.length;
+        identityEntries.push(`"${hash}":${json}`);
+      }
+      if (estimatedBytes > SESSIONS_JSON_COMPAT_EXPORT_MAX_BYTES) {
+        // The file is write-only for older builds; past the budget the main thread is worth more than a fresher copy of it.
+        if (Date.now() - lastCompatSkipWarnAt >= 60_000) {
+          lastCompatSkipWarnAt = Date.now();
+          logger.warn({ estimatedBytes, budgetBytes: SESSIONS_JSON_COMPAT_EXPORT_MAX_BYTES }, 'sessions.json compatibility export skipped: over its size budget');
+        }
+        return;
+      }
       const marker = JSON.stringify({
         format: SESSIONS_JSON_COMPAT_EXPORT_FORMAT_VERSION,
         source: SESSION_DB_FILE,
@@ -1096,7 +1203,7 @@ function runCompatExport(targetPath: string): Promise<void> {
         tmp: `${jsonPath}.${process.pid}.${randomUUID()}.tmp`,
         head: `{"version":${SESSION_STORE_DISK_VERSION},"${SESSIONS_JSON_COMPAT_EXPORT_MARKER_KEY}":${marker},"sessions":{`,
         parts,
-        tail: '},"identityPrompts":{}}',
+        tail: `},"identityPrompts":{${identityEntries.join(',')}}}`,
       });
       compatExportStats.lastMainThreadMs = performance.now() - mainStart; // building + handing over; the write is in the worker
       const result = await pending;
@@ -1150,6 +1257,13 @@ function resetCompatExportForTests(): void {
 }
 
 /** Test seam: resolves when every requested export has been written. */
+/** Test seam: what the next sweep / export has to serialise and compare (the committed row payloads), and the distinct blobs held. */
+export function sessionStoreCommittedBytesForTests(): { payloadBytes: number; rows: number; blobs: number } {
+  let payloadBytes = 0;
+  for (const payload of committedPayloads.values()) payloadBytes += payload.length;
+  return { payloadBytes, rows: committedPayloads.size, blobs: blobTextByHash.size };
+}
+
 export async function waitForCompatExportForTests(): Promise<void> {
   if (compatExportTimer) { clearTimeout(compatExportTimer); compatExportTimer = null; await runCompatExport(dbPath()); }
   await compatExportChain;

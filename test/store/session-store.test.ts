@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { readFile } from 'node:fs/promises';
-import { persistedSessions } from '../helpers/session-store-db.js';
+import { persistedSessionBlobs, persistedSessions } from '../helpers/session-store-db.js';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { vi } from 'vitest';
@@ -311,7 +311,12 @@ describe('session-store', () => {
       await store.flushStore();
       const persisted = persistedSessions(tempDir);
       expect(Object.keys(persisted)).toHaveLength(60);
-      expect(Object.values(persisted).every((entry) => entry.identityPrompt === prompt)).toBe(true);
+      // One copy of the shared prompt in the database, a short reference on every row (the per-row copy was the 84 MB store).
+      const refs = new Set(Object.values(persisted).map((entry) => entry.identityPromptRef));
+      expect(refs.size).toBe(1);
+      expect(Object.values(persisted).every((entry) => entry.identityPrompt === undefined && typeof entry.identityPromptRef === 'string')).toBe(true);
+      expect(Object.values(persisted).every((entry) => JSON.stringify(entry).length < 1_000)).toBe(true);
+      expect([...persistedSessionBlobs(tempDir).values()]).toEqual([prompt]);
 
       vi.resetModules();
       const reloaded = await importSessionStore();

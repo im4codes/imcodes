@@ -9,6 +9,7 @@ import {
   commitSessionChanges,
   openSessionDbForWrite,
   openSessionDbReadOnly,
+  readSessionBlobs,
   readSessionPayloads,
 } from '../../src/store/session-store-db.js';
 
@@ -47,6 +48,17 @@ export function replacePersistedSessions(home: string, records: Array<Record<str
       deletes: existing.filter((name) => !records.some((record) => record.name === name)),
       allowEmpty: true,
     });
+  } finally {
+    closeSessionDb(handle);
+  }
+}
+
+/** The large-field blobs persisted beside the rows (hash -> text); empty when there is no database. */
+export function persistedSessionBlobs(home: string): Map<string, string> {
+  const handle = openSessionDbReadOnly(sessionDbPathForHome(home));
+  if (!handle) return new Map();
+  try {
+    return readSessionBlobs(handle);
   } finally {
     closeSessionDb(handle);
   }

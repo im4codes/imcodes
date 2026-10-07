@@ -15,6 +15,8 @@ import { existsSync, mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { suppressSqliteExperimentalWarning } from '../util/suppress-sqlite-warning.js';
 
+import { SESSION_DB_WAL_SIZE_LIMIT_BYTES } from '../../shared/session-store-compat.js';
+import type { SessionBlob } from './session-record-blobs.js';
 const require = createRequire(import.meta.url);
 suppressSqliteExperimentalWarning();
 const sqlite = require('node:sqlite') as typeof import('node:sqlite');
@@ -23,6 +25,7 @@ type DatabaseSyncInstance = InstanceType<typeof DatabaseSync>;
 
 export const SESSION_DB_FILE = 'sessions.sqlite';
 export const SESSION_DB_SCHEMA_VERSION = 1;
+export const SESSION_DB_BLOB_TABLE = 'session_blobs';
 export const SESSION_DB_META_LEGACY_IMPORT = 'legacy_json_import';
 export const SESSION_DB_LEGACY_IMPORT_DONE = 'done';
 const BUSY_TIMEOUT_MS = 5_000;
@@ -36,6 +39,8 @@ export interface SessionDbRow {
   updatedAt: number;
   /** The whole record as compact JSON: the one source of truth for the fields. */
   payload: string;
+  /** Large string fields the payload refers to by hash (see session-record-blobs.ts); stored once, not per row. */
+  blobs?: SessionBlob[];
 }
 
 export interface SessionDbHandle {
@@ -81,6 +86,10 @@ const SCHEMA_SQL = `
     key TEXT PRIMARY KEY NOT NULL,
     value TEXT NOT NULL
   ) WITHOUT ROWID;
+  CREATE TABLE IF NOT EXISTS session_blobs (
+    hash TEXT PRIMARY KEY NOT NULL,
+    text TEXT NOT NULL
+  ) WITHOUT ROWID;
 `;
 
 /** Open the writer connection, creating the file and schema. */
@@ -91,6 +100,8 @@ export function openSessionDbForWrite(path: string): SessionDbHandle {
     db.exec(`PRAGMA busy_timeout = ${BUSY_TIMEOUT_MS}`);
     db.exec('PRAGMA journal_mode = WAL');
     db.exec('PRAGMA synchronous = NORMAL');
+    // A checkpoint can only reuse the log; this bounds what is left on disk afterwards.
+    db.exec(`PRAGMA journal_size_limit = ${SESSION_DB_WAL_SIZE_LIMIT_BYTES}`);
     db.exec(SCHEMA_SQL);
     db.prepare('INSERT OR IGNORE INTO session_store_meta (key, value) VALUES (?, ?)').run('schema_version', String(SESSION_DB_SCHEMA_VERSION));
   } catch (error) {
@@ -148,6 +159,46 @@ export function readSessionPayloads(handle: SessionDbHandle): Map<string, string
   return out;
 }
 
+/** Every stored blob as hash -> text (empty on a database written before blobs existed). */
+export function readSessionBlobs(handle: SessionDbHandle): Map<string, string> {
+  const out = new Map<string, string>();
+  try {
+    const rows = handle.db.prepare('SELECT hash, text FROM session_blobs').all() as Array<{ hash: string; text: string }>;
+    for (const row of rows) out.set(row.hash, row.text);
+  } catch {
+    // An older database has no blob table: its rows are inline.
+  }
+  return out;
+}
+
+/** The hashes currently in the blob table (so a row write only sends blobs the database does not have yet). */
+export function listSessionBlobHashes(handle: SessionDbHandle): Set<string> {
+  try {
+    const rows = handle.db.prepare('SELECT hash FROM session_blobs').all() as Array<{ hash: string }>;
+    return new Set(rows.map((row) => row.hash));
+  } catch {
+    return new Set();
+  }
+}
+
+function insertBlobs(handle: SessionDbHandle, rows: readonly SessionDbRow[]): void {
+  const insert = handle.db.prepare('INSERT OR IGNORE INTO session_blobs (hash, text) VALUES (?, ?)');
+  for (const row of rows) for (const blob of row.blobs ?? []) insert.run(blob.hash, blob.text);
+}
+
+/** Drop blobs no row refers to any more (identity edited, session removed). Uses SQLite's JSON functions on the small payloads. */
+function collectUnreferencedBlobs(handle: SessionDbHandle): void {
+  try {
+    handle.db.exec(`
+      DELETE FROM session_blobs WHERE hash NOT IN (
+        SELECT json_extract(payload, '$.identityPromptRef') FROM sessions WHERE json_extract(payload, '$.identityPromptRef') IS NOT NULL
+        UNION SELECT je.value FROM sessions, json_each(sessions.payload, '$.blobRefs') AS je
+      )`);
+  } catch {
+    // No JSON functions or an unreadable payload: keep every blob (a leak of a few MB, never a lost reference).
+  }
+}
+
 function upsertStatement(handle: SessionDbHandle) {
   return handle.db.prepare(
     `INSERT INTO sessions (name, project_name, parent_session, agent_type, state, updated_at, payload)
@@ -170,7 +221,7 @@ function bindRow(row: SessionDbRow): [string, string, string | null, string, str
  */
 export function commitSessionChanges(
   handle: SessionDbHandle,
-  changes: { upserts: SessionDbRow[]; deletes: string[]; allowEmpty: boolean },
+  changes: { upserts: SessionDbRow[]; deletes: string[]; allowEmpty: boolean; /** Some row stopped referring to a blob it had. */ collectBlobs?: boolean },
 ): void {
   if (handle.readOnly) throw new Error('session store connection is read-only');
   const { db } = handle;
@@ -179,8 +230,10 @@ export function commitSessionChanges(
   try {
     const upsert = upsertStatement(handle);
     const remove = db.prepare('DELETE FROM sessions WHERE name = ?');
+    insertBlobs(handle, changes.upserts);
     for (const row of changes.upserts) { noteRowWrite(); upsert.run(...bindRow(row)); }
     for (const name of changes.deletes) { noteRowWrite(); remove.run(name); }
+    if (changes.collectBlobs || changes.deletes.length > 0) collectUnreferencedBlobs(handle);
     if (!changes.allowEmpty && changes.deletes.length > 0 && countSessionRows(handle) === 0) {
       // Emptying the store is an explicit administrative act, never a side effect.
       throw new EmptyStoreRefusal();
@@ -227,6 +280,7 @@ export function importLegacySessions(
        VALUES (?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(name) DO NOTHING`,
     );
+    insertBlobs(handle, rows);
     let imported = 0;
     for (const row of rows) {
       noteRowWrite();
@@ -267,6 +321,18 @@ export function countSnapshotRows(path: string): number | null {
     return handle ? countSessionRows(handle) : null;
   } catch {
     return null;
+  } finally {
+    closeSessionDb(handle);
+  }
+}
+
+export function readSnapshotBlobs(path: string): Map<string, string> {
+  let handle: SessionDbHandle | null = null;
+  try {
+    handle = openSessionDbReadOnly(path);
+    return handle ? readSessionBlobs(handle) : new Map();
+  } catch {
+    return new Map();
   } finally {
     closeSessionDb(handle);
   }

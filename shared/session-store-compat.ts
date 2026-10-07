@@ -29,3 +29,18 @@ export const SESSIONS_JSON_COMPAT_EXPORT_SUNSET_AT_MS = Date.UTC(2027, 0, 1);
 export function isSessionsJsonCompatExportEnabled(nowMs: number = Date.now()): boolean {
   return nowMs < SESSIONS_JSON_COMPAT_EXPORT_SUNSET_AT_MS;
 }
+
+/**
+ * A top-level string field of a session record longer than this many UTF-16 units is stored ONCE in the
+ * database's blob table (keyed by its hash) and the record keeps only a reference. 158 (2026-10-07): 117 of
+ * 180 records each carried their own 250-550 KB copy of one of nine user identity contracts (`identityPrompt`),
+ * so the store grew from 8.4 MB (sessions.json, which de-duplicated them in `identityPrompts`) to 84 MB after the
+ * SQLite migration (payload per row, no de-duplication), and every sweep / export serialised 45 MB.
+ */
+export const SESSION_RECORD_INLINE_STRING_MAX_CHARS = 4096;
+
+/** The compatibility export is skipped (the file stays as it was) past this size; its cost is main-thread time. */
+export const SESSIONS_JSON_COMPAT_EXPORT_MAX_BYTES = 64 * 1024 * 1024;
+
+/** After a checkpoint the write-ahead log is truncated to at most this much (it sat at 84 MB beside an 86 MB database). */
+export const SESSION_DB_WAL_SIZE_LIMIT_BYTES = 32 * 1024 * 1024;
