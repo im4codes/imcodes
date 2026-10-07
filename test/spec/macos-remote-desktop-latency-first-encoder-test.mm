@@ -294,19 +294,64 @@ bool TestASettledPictureGetsOneSharperKeyframe() {
   for (int i = 0; i < 13; ++i) {
     if (!EncodeOne(rig, 0, 100 + i)) return false;
   }
+  // The capture's keep-alive re-delivers the unchanged picture every 500 ms. A
+  // short pause (one or two of them) is not settled; the third is.
   const std::size_t before = rig.backend->keyframe_requests.size();
-  // The capture's keep-alive re-delivers the unchanged picture: it has settled.
-  bool ok = Check(EncodeOne(rig, 0, 200, /*repeated_unchanged=*/true), "settled frame accepted");
-  ok = ok && Check(Requested(rig, before), "the first unchanged frame after motion is forced to a keyframe");
+  bool ok = Check(EncodeOne(rig, 0, 200, /*repeated_unchanged=*/true), "1st unchanged frame accepted");
+  ok = ok && Check(!Requested(rig, before), "after about 0.5 s of quiet: no refresh yet");
+  ok = ok && Check(EncodeOne(rig, 0, 201, true), "2nd unchanged frame accepted");
+  ok = ok && Check(!Requested(rig, before + 1), "after about 1 s of quiet: no refresh yet");
+  ok = ok && Check(EncodeOne(rig, 0, 202, true), "3rd unchanged frame accepted");
+  ok = ok && Check(Requested(rig, before + 2), "the picture has settled (3rd unchanged frame): forced to a keyframe");
   ok = ok && Check(rig.encoder->Statistics().refresh_keyframes == 1, "one refresh counted");
   for (int i = 0; i < 6; ++i) {
     ok = ok && Check(EncodeOne(rig, 0, 300 + i, true), "more unchanged frames accepted");
   }
   ok = ok && Check(rig.encoder->Statistics().refresh_keyframes == 1, "no second refresh inside the same static run");
-  // Motion resumes and stops again straight away: spaced by at least 5 s.
+  // Motion resumes and settles again straight away: spaced by at least 5 s.
   ok = ok && Check(EncodeOne(rig, 0, 400), "motion");
-  ok = ok && Check(EncodeOne(rig, 0, 410, true), "settled again");
+  for (int i = 0; i < 3; ++i) ok = ok && Check(EncodeOne(rig, 0, 410 + i, true), "settled again");
   return ok && Check(rig.encoder->Statistics().refresh_keyframes == 1, "a second run inside the spacing is not refreshed");
+}
+
+bool TestAShortPauseNeverRefreshes() {
+  Rig rig;
+  if (!MakeRig(&rig, true, false, 8'000'000)) return false;
+  for (int i = 0; i < 13; ++i) {
+    if (!EncodeOne(rig, 0, 100 + i)) return false;
+  }
+  // Typing with short pauses: one or two keep-alive frames between bursts.
+  for (int pause = 0; pause < 10; ++pause) {
+    if (!EncodeOne(rig, 0, 200 + pause * 10)) return false;
+    if (!EncodeOne(rig, 0, 201 + pause * 10, true)) return false;
+    if (!EncodeOne(rig, 0, 202 + pause * 10, true)) return false;
+  }
+  return Check(rig.encoder->Statistics().refresh_keyframes == 0,
+               "pauses shorter than three keep-alive frames never cost a refresh");
+}
+
+bool TestNewMotionIsNeverQueuedBehindARefresh() {
+  Rig rig;
+  if (!MakeRig(&rig, true, false, 8'000'000)) return false;
+  for (int i = 0; i < 13; ++i) {
+    if (!EncodeOne(rig, 0, 100 + i)) return false;
+  }
+  if (!EncodeOne(rig, 0, 200, true) || !EncodeOne(rig, 0, 201, true)) return false;
+  // The refresh keyframe is submitted and still encoding...
+  if (!Check(rig.encoder->Encode(Frame(kWidth, kHeight, 202, true), false), "refresh frame accepted")) return false;
+  if (!Check(rig.encoder->Statistics().refresh_keyframes == 1, "it is the refresh")) return false;
+  // ...when the screen changes. The new picture is not queued behind it (there is
+  // one frame in flight, never two): it is dropped by design, and the very next
+  // frame after the keyframe completes is encoded at once.
+  const std::uint64_t by_design = rig.encoder->Statistics().dropped_by_design_frames;
+  bool ok = Check(!rig.encoder->Encode(Frame(kWidth, kHeight, 203, false), false),
+                  "new motion while the refresh encodes waits for nothing but the keyframe itself");
+  ok = ok && Check(rig.encoder->Statistics().dropped_by_design_frames == by_design + 1, "counted as dropped by design");
+  ok = ok && Check(rig.backend->pending.size() == 1, "exactly one frame (the keyframe) in flight");
+  rig.backend->CompleteFirst();
+  ok = ok && Check(rig.encoder->Encode(Frame(kWidth, kHeight, 204, false), false),
+                   "the next new frame is accepted the moment the keyframe is out");
+  return ok && Check(!Requested(rig, rig.backend->keyframe_requests.size() - 1), "and is an ordinary frame, not another keyframe");
 }
 
 bool TestRefreshNeedsEnoughFramesAndALinkThatCanCarryIt() {
@@ -316,20 +361,23 @@ bool TestRefreshNeedsEnoughFramesAndALinkThatCanCarryIt() {
     for (int i = 0; i < 5; ++i) {
       if (!EncodeOne(few, 0, 100 + i)) return false;
     }
-    if (!EncodeOne(few, 0, 200, true)) return false;
+    for (int i = 0; i < 3; ++i) {
+      if (!EncodeOne(few, 0, 200 + i, true)) return false;
+    }
     if (!Check(few.encoder->Statistics().refresh_keyframes == 0,
                "too few frames since the keyframe: a refresh would be worse than the keyframe it replaces")) {
       return false;
     }
   }
   Rig slow;
-  if (!MakeRig(&slow, true, false, 3'000'000)) return false;
+  if (!MakeRig(&slow, true, false, 5'000'000)) return false;
   for (int i = 0; i < 13; ++i) {
     if (!EncodeOne(slow, 0, 100 + i)) return false;
   }
-  if (!EncodeOne(slow, 0, 200, true)) return false;
-  if (!Check(slow.encoder->Statistics().refresh_keyframes == 0, "a 3 Mbps link is not asked to carry the burst")) return false;
-  // The link target rises (bitrate-only update keeps the session): refresh is allowed again.
+  for (int i = 0; i < 3; ++i) {
+    if (!EncodeOne(slow, 0, 200 + i, true)) return false;
+  }
+  if (!Check(slow.encoder->Statistics().refresh_keyframes == 0, "a 5 Mbps link is not asked to carry the burst")) return false;
   // The link target rises (a bitrate-only update keeps the session): the next
   // settled picture is refreshed.
   if (!Check(slow.encoder->ReconfigureFromQualitySelection(
@@ -338,7 +386,9 @@ bool TestRefreshNeedsEnoughFramesAndALinkThatCanCarryIt() {
     return false;
   }
   if (!EncodeOne(slow, 0, 300)) return false;
-  if (!EncodeOne(slow, 0, 310, true)) return false;
+  for (int i = 0; i < 3; ++i) {
+    if (!EncodeOne(slow, 0, 310 + i, true)) return false;
+  }
   return Check(slow.encoder->Statistics().refresh_keyframes == 1,
                "once the target can carry it, the settled picture is refreshed");
 }
@@ -349,7 +399,9 @@ bool TestTheDefaultModeNeverRefreshes() {
   for (int i = 0; i < 13; ++i) {
     if (!EncodeOne(rig, 0, 100 + i)) return false;
   }
-  if (!EncodeOne(rig, 0, 200, true)) return false;
+  for (int i = 0; i < 4; ++i) {
+    if (!EncodeOne(rig, 0, 200 + i, true)) return false;
+  }
   return Check(rig.encoder->Statistics().refresh_keyframes == 0, "the default mode never forces a refresh") &&
          Check(!Requested(rig, rig.backend->keyframe_requests.size() - 1), "and does not request a keyframe for it");
 }
@@ -366,6 +418,8 @@ int main() {
                   TestLadderDrivenSizeChangeTellsTheObserver() &&
                   TestEncoderClassAndDropsAreTruthful() &&
                   TestASettledPictureGetsOneSharperKeyframe() &&
+                  TestAShortPauseNeverRefreshes() &&
+                  TestNewMotionIsNeverQueuedBehindARefresh() &&
                   TestRefreshNeedsEnoughFramesAndALinkThatCanCarryIt() &&
                   TestTheDefaultModeNeverRefreshes();
   if (ok) std::cout << "macos latency-first encoder counterfactuals passed\n";

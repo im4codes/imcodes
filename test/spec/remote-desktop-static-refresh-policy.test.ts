@@ -33,8 +33,9 @@ describe('remote-desktop static refresh policy', () => {
 
   it('keeps the measured thresholds', () => {
     const header = readFileSync(resolve(COMMON, 'static_refresh_policy.h'), 'utf8');
+    expect(header).toContain('kStaticRefreshMinUnchangedRun = 3;');
     expect(header).toContain('kStaticRefreshMinFramesSinceKey = 10;');
-    expect(header).toContain("kStaticRefreshMinBitrateBps = 4'000'000;");
+    expect(header).toContain("kStaticRefreshMinBitrateBps = 6'000'000;");
     expect(header).toContain("kStaticRefreshMinIntervalMs = 5'000;");
   });
 

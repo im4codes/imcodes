@@ -18,6 +18,17 @@ void Require(bool condition, std::string_view message) {
 constexpr std::uint32_t kPlenty = 30;
 constexpr std::uint32_t kFast = 8'000'000;
 
+// The capture's keep-alive: one unchanged frame every 500 ms.
+bool Still(rd::StaticRefreshPolicy& policy, std::int64_t& now, int frames,
+           std::uint32_t since_key = kPlenty, std::uint32_t bitrate = kFast) {
+  bool fired = false;
+  for (int i = 0; i < frames; ++i) {
+    now += 500;
+    fired = policy.OnFrame(true, since_key, bitrate, now) || fired;
+  }
+  return fired;
+}
+
 void AMovingPictureNeverRefreshes() {
   rd::StaticRefreshPolicy policy;
   for (int i = 0; i < 200; ++i) {
@@ -25,78 +36,102 @@ void AMovingPictureNeverRefreshes() {
   }
 }
 
-void TheFirstUnchangedFrameOfARunRefreshesOnce() {
+void OnlyAGenuinelySettledPictureRefreshes() {
+  // A short pause (typing, reading) is one or two keep-alive frames: not still enough.
   rd::StaticRefreshPolicy policy;
-  Require(!policy.OnFrame(false, kPlenty, kFast, 0), "motion");
-  Require(policy.OnFrame(true, kPlenty, kFast, 500), "the picture settled: refresh");
-  for (int i = 1; i <= 20; ++i) {
-    Require(!policy.OnFrame(true, kPlenty, kFast, 500 + i * 500), "no second refresh within the same static run");
+  std::int64_t now = 0;
+  policy.OnFrame(false, kPlenty, kFast, now);
+  Require(!Still(policy, now, 1), "after 0.5 s of quiet: no refresh");
+  Require(!Still(policy, now, 1), "after 1.0 s of quiet: no refresh");
+  Require(Still(policy, now, 1), "after 1.5 s of quiet (the 3rd unchanged frame): refresh");
+}
+
+void ARefreshHappensOncePerStaticRun() {
+  rd::StaticRefreshPolicy policy;
+  std::int64_t now = 0;
+  policy.OnFrame(false, kPlenty, kFast, now);
+  Require(Still(policy, now, 3), "the run settles and refreshes");
+  Require(!Still(policy, now, 40), "no second refresh within the same static run");
+}
+
+void APauseThatEndsBeforeSettlingDoesNothing() {
+  rd::StaticRefreshPolicy policy;
+  std::int64_t now = 0;
+  for (int pause = 0; pause < 50; ++pause) {
+    policy.OnFrame(false, kPlenty, kFast, now);
+    Require(!Still(policy, now, 2), "a 1 s pause never refreshes");
   }
 }
 
 void ARefreshNeedsEnoughCodedFramesSinceTheKeyframe() {
   rd::StaticRefreshPolicy policy;
-  policy.OnFrame(false, 3, kFast, 0);
-  Require(!policy.OnFrame(true, 3, kFast, 500), "3 coded frames: the refresh would be worse than the keyframe it replaces");
-  policy.OnFrame(false, 9, kFast, 1000);
-  Require(!policy.OnFrame(true, 9, kFast, 1500), "9 coded frames: still too few");
-  policy.OnFrame(false, 10, kFast, 2000);
-  Require(policy.OnFrame(true, 10, kFast, 2500), "10 coded frames: allowed");
+  std::int64_t now = 0;
+  policy.OnFrame(false, 3, kFast, now);
+  Require(!Still(policy, now, 3, 3), "3 coded frames: the refresh would be worse than the keyframe it replaces");
+  policy.OnFrame(false, 9, kFast, now);
+  Require(!Still(policy, now, 3, 9), "9 coded frames: still too few");
+  policy.OnFrame(false, 10, kFast, now);
+  Require(Still(policy, now, 3, 10), "10 coded frames: allowed");
 }
 
 void ASlowLinkNeverRefreshes() {
   rd::StaticRefreshPolicy policy;
-  policy.OnFrame(false, kPlenty, 3'999'999, 0);
-  Require(!policy.OnFrame(true, kPlenty, 3'999'999, 500), "below 4 Mbps the burst would take too long");
-  policy.OnFrame(false, kPlenty, 4'000'000, 1000);
-  Require(policy.OnFrame(true, kPlenty, 4'000'000, 1500), "exactly 4 Mbps is enough");
+  std::int64_t now = 0;
+  policy.OnFrame(false, kPlenty, 5'999'999, now);
+  Require(!Still(policy, now, 3, kPlenty, 5'999'999), "below 6 Mbps the burst would take too long");
+  policy.OnFrame(false, kPlenty, 6'000'000, now);
+  Require(Still(policy, now, 3, kPlenty, 6'000'000), "exactly 6 Mbps is enough");
 }
 
 void RefreshesAreSpacedAtLeastFiveSeconds() {
   rd::StaticRefreshPolicy policy;
-  policy.OnFrame(false, kPlenty, kFast, 0);
-  Require(policy.OnFrame(true, kPlenty, kFast, 1000), "first refresh");
-  // Motion resumes and stops again right away.
-  policy.OnFrame(false, kPlenty, kFast, 1200);
-  Require(!policy.OnFrame(true, kPlenty, kFast, 1800), "a second static run inside 5 s is not refreshed");
-  policy.OnFrame(false, kPlenty, kFast, 5000);
-  Require(!policy.OnFrame(true, kPlenty, kFast, 5900), "4.9 s after the first: still too soon");
-  policy.OnFrame(false, kPlenty, kFast, 6100);
-  Require(policy.OnFrame(true, kPlenty, kFast, 6400), "5.4 s after the first: allowed");
+  std::int64_t now = 0;
+  policy.OnFrame(false, kPlenty, kFast, now);
+  Require(Still(policy, now, 3), "first refresh");
+  const std::int64_t first = now;
+  // Motion resumes and settles again straight away.
+  now += 200;
+  policy.OnFrame(false, kPlenty, kFast, now);
+  Require(!Still(policy, now, 3), "a second static run inside 5 s is not refreshed");
+  Require(now - first < rd::kStaticRefreshMinIntervalMs, "(that run really was inside the spacing)");
+  now = first + 6'000;
+  policy.OnFrame(false, kPlenty, kFast, now);
+  Require(Still(policy, now, 3), "6 s after the first: allowed");
 }
 
-void AnUnrefreshedRunCanStillRefreshLater() {
-  // A run that was refused (too few frames) leaves no state behind that blocks
-  // the next one.
+void ARefusedRunLeavesNothingBehind() {
   rd::StaticRefreshPolicy policy;
-  policy.OnFrame(false, 2, kFast, 0);
-  Require(!policy.OnFrame(true, 2, kFast, 500), "refused");
-  policy.OnFrame(false, kPlenty, kFast, 900);
-  Require(policy.OnFrame(true, kPlenty, kFast, 1400), "the next run refreshes");
+  std::int64_t now = 0;
+  policy.OnFrame(false, 2, kFast, now);
+  Require(!Still(policy, now, 3, 2), "refused (too few frames)");
+  policy.OnFrame(false, kPlenty, kFast, now);
+  Require(Still(policy, now, 3), "the next run refreshes");
 }
 
-void ResetForgetsTheRun() {
+void ResetForgetsTheRunButNotTheSpacing() {
   rd::StaticRefreshPolicy policy;
-  policy.OnFrame(false, kPlenty, kFast, 0);
-  policy.OnFrame(true, kPlenty, kFast, 500);  // refreshed
+  std::int64_t now = 0;
+  policy.OnFrame(false, kPlenty, kFast, now);
+  Require(Still(policy, now, 3), "refreshed");
   policy.Reset();
-  // After a rebuild the encoder's first picture may already be unchanged: the
-  // run counts as new, but the interval rule still holds.
-  Require(!policy.OnFrame(true, kPlenty, kFast, 1000), "interval rule survives a reset");
-  policy.OnFrame(false, kPlenty, kFast, 7000);
-  Require(policy.OnFrame(true, kPlenty, kFast, 7500), "refresh allowed again after the interval");
+  Require(!Still(policy, now, 3), "interval rule survives a reset");
+  policy.OnFrame(false, kPlenty, kFast, now);
+  now += 6'000;
+  Require(Still(policy, now, 3), "refresh allowed again after the interval");
 }
 
 }  // namespace
 
 int main() {
   AMovingPictureNeverRefreshes();
-  TheFirstUnchangedFrameOfARunRefreshesOnce();
+  OnlyAGenuinelySettledPictureRefreshes();
+  ARefreshHappensOncePerStaticRun();
+  APauseThatEndsBeforeSettlingDoesNothing();
   ARefreshNeedsEnoughCodedFramesSinceTheKeyframe();
   ASlowLinkNeverRefreshes();
   RefreshesAreSpacedAtLeastFiveSeconds();
-  AnUnrefreshedRunCanStillRefreshLater();
-  ResetForgetsTheRun();
+  ARefusedRunLeavesNothingBehind();
+  ResetForgetsTheRunButNotTheSpacing();
   std::cout << "static refresh policy counterfactuals passed\n";
   return 0;
 }
