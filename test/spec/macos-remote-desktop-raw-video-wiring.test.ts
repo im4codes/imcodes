@@ -20,7 +20,12 @@ describe('macOS raw (libvpx) video path wiring', () => {
   const vt = read('native/macos-remote-desktop/video_toolbox_h264_encoder.h');
 
   it('turns raw codecs on only for a Mac with no hardware H.264 encoder', () => {
-    expect(worker).toContain('AllowRawCodecs(!HardwareH264EncoderAvailable())');
+    expect(worker).toContain('DecideRawCodecs(');
+    expect(worker).toContain('HardwareH264EncoderAvailable(), capture_backend->SupportsOutputSize()');
+    expect(worker).toContain('AllowRawCodecs(raw_decision.allowed)');
+    // Decided after the capture backend exists (and refused when it does not), never before.
+    expect(worker.indexOf('DecideRawCodecs(')).toBeGreaterThan(worker.indexOf('macos_remote_desktop_worker_capture_backend_unavailable'));
+    expect(worker).toContain('macos_remote_desktop_worker_raw_codecs allowed=');
     expect(worker).toContain('probe.HardwareEncoderAvailable()');
     // Asked once per process, not per route: it opens a real VideoToolbox session.
     expect(worker).toMatch(/static const bool available = \[\] \{/);

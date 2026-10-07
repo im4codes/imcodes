@@ -77,6 +77,7 @@
 #include "macos_worker_ipc_client.h"
 #include "ns_pasteboard_clipboard_adapter.h"
 #include "pinned_libwebrtc_transport_backend.h"
+#include "raw_codec_policy.h"
 #include "raw_frame_conversion.h"
 #include "video_toolbox_h264_encoder.h"
 
@@ -2791,7 +2792,6 @@ int RunLaunchAgentSession(const macos::WorkerLaunchContext& context) {
     auto media_binder = std::make_unique<macos::MacosMediaSenderBinder>();
     backend_view->BindMediaSender(media_binder.get());
     route->media_binder = media_binder.get();
-    media_binder->raw_video()->AllowRawCodecs(!HardwareH264EncoderAvailable());
     media_binder->raw_video()->SetNv12ToBgraConverter(
         macos::ConvertNv12FrameToBgra);
     route->disclosure = std::make_unique<RouteDisclosure>(&roster);
@@ -2841,6 +2841,19 @@ int RunLaunchAgentSession(const macos::WorkerLaunchContext& context) {
       }
     }
 
+
+    // Decided only now that the capture backend is known: the raw codecs hand
+    // libvpx the captured frame unscaled, so they are offered only where the
+    // capture honours the encoder's size. Still before any negotiation.
+    {
+      const macos::RawCodecDecision raw_decision = macos::DecideRawCodecs(
+          HardwareH264EncoderAvailable(), capture_backend->SupportsOutputSize());
+      media_binder->raw_video()->AllowRawCodecs(raw_decision.allowed);
+      std::cerr << "macos_remote_desktop_worker_raw_codecs allowed="
+                << (raw_decision.allowed ? 1 : 0)
+                << " reason=" << macos::RawCodecReasonName(raw_decision.reason)
+                << "\n";
+    }
 
     macos::MacosRemoteDesktopProductionConfiguration configuration;
     configuration.worker_generation = context.worker_generation;
