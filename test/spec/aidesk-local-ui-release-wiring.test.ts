@@ -1,6 +1,8 @@
 /**
- * The native aiDesk window is built, described and uploaded by the SAME release steps in both workflows (one composite action), from
- * pinned sources, and signed (Windows) before its manifest records it. The Linux build below was also run for real in a container.
+ * The native aiDesk window (Layer 2) is DEFERRED: the panel page is the one UI, shown in the app window and in the browser fallback.
+ * Its pinned-source build action and scripts are kept, ready, but are NOT wired into either release workflow and nothing is added to
+ * the artifact set; the checks below keep the unwired action internally consistent (pinned sources, signing order, macOS packaging)
+ * so wiring it later is a two-step change (one step per workflow + the upload glob), and pin that nothing wires it by accident.
  */
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
@@ -13,18 +15,11 @@ const read = (path: string): string => readFileSync(resolve(root, path), 'utf8')
 describe('native aiDesk window release wiring', () => {
   const action = read('.github/actions/build-aidesk-ui/action.yml');
 
-  it('both release workflows run the one composite action right before the node executable build and upload its output', () => {
+  it('is not wired into either release workflow and adds nothing to the artifact set (deferred; the panel page is the only UI)', () => {
     for (const path of ['.github/workflows/build-node-exe.yml', '.github/workflows/ci.yml']) {
       const workflow = read(path);
-      const stepAt = workflow.indexOf('uses: ./.github/actions/build-aidesk-ui');
-      const buildAt = workflow.indexOf('run: npm run build:node-exe');
-      expect(stepAt, path).toBeGreaterThan(-1);
-      expect(stepAt, path).toBeLessThan(buildAt);
-      expect(workflow.match(/build-aidesk-ui/gu), path).toHaveLength(1);
-      expect(workflow, path).toContain('dist-node-exe/aidesk-local-ui/**');
-      expect(workflow, path).toContain('windows-signing-cert-thumbprint: ${{ env.IMCODES_WINDOWS_SIGNING_CERT_THUMBPRINT }}');
-      // the Windows signing identity is imported by an earlier step of the same job
-      expect(workflow.indexOf('Import Windows release-signing certificate'), path).toBeLessThan(stepAt);
+      expect(workflow, path).not.toContain('build-aidesk-ui');
+      expect(workflow, path).not.toContain('aidesk-local-ui/**');
     }
   });
 
