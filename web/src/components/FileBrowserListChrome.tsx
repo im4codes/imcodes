@@ -17,6 +17,8 @@ export interface FileBrowserListToolbarProps {
   onFilterCompositionEnd: (value: string) => void;
   onFilterClear: () => void;
   hiddenColumns: ReadonlySet<FileBrowserSortKey>;
+  /** The key the list is really ordered by (the remembered one falls back to the name when this machine cannot serve it). */
+  effectiveSortKey: FileBrowserSortKey;
   onToggleColumn: (column: FileBrowserSortKey) => void;
   onShowAllColumns: () => void;
   /** One line under the controls: truncation, or "only the loaded items are filtered". */
@@ -26,7 +28,7 @@ export interface FileBrowserListToolbarProps {
 /** Filter box, "folders first", the columns menu, and a note when the sorted column is not on screen. Never scrolls sideways with the table. */
 export function FileBrowserListToolbar({
   sort, onSortChange, filterValue, onFilterInput, onFilterCompositionStart, onFilterCompositionEnd, onFilterClear,
-  hiddenColumns, onToggleColumn, onShowAllColumns, notice,
+  hiddenColumns, effectiveSortKey, onToggleColumn, onShowAllColumns, notice,
 }: FileBrowserListToolbarProps) {
   const { t } = useTranslation();
   const [menuOpen, setMenuOpen] = useState(false);
@@ -48,7 +50,7 @@ export function FileBrowserListToolbar({
     };
   }, [menuOpen]);
 
-  const sortHidden = hiddenColumns.has(sort.key);
+  const sortHidden = hiddenColumns.has(effectiveSortKey);
   const ascending = sort.direction === FILE_BROWSER_SORT_DIRECTIONS.ASC;
   return (
     <div class="fb-list-toolbar">
@@ -123,7 +125,7 @@ export function FileBrowserListToolbar({
       </div>
       {sortHidden && (
         <div class="fb-list-sorted-by">
-          {t('file_browser.sorted_by', { column: t(`file_browser.col.${sort.key}`) })} <span aria-hidden="true">{ascending ? '▲' : '▼'}</span>
+          {t('file_browser.sorted_by', { column: t(`file_browser.col.${effectiveSortKey}`) })} <span aria-hidden="true">{ascending ? '▲' : '▼'}</span>
         </div>
       )}
       {notice && <div class="fb-list-notice" role="status">{notice}</div>}

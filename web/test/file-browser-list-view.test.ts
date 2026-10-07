@@ -7,6 +7,8 @@ import {
   FILE_BROWSER_NAME_MIN_WIDTH_PX,
   fileBrowserColumnsStorageKey,
   fileBrowserTableMinWidth,
+  fileBrowserMaxVisibleDepth,
+  FILE_BROWSER_INDENT_PX,
   loadFileBrowserHiddenColumns,
   saveFileBrowserHiddenColumns,
   fileBrowserSortStorageKey,
@@ -135,6 +137,38 @@ describe('file browser list view: columns', () => {
     expect(fileBrowserTableMinWidth(all)).toBe(previous);
     // Even all five columns need no more than a window the panel can be given, so the sideways scroll is a short one.
     expect(fileBrowserTableMinWidth(all)).toBeLessThan(900);
+  });
+
+  it('the table grows by one indent for every level of nesting past the ones the name column absorbs', () => {
+    const all = new Set(FILE_BROWSER_COLUMN_KEYS) as never;
+    const flat = fileBrowserTableMinWidth(all, 0);
+    expect(fileBrowserTableMinWidth(all, 1)).toBe(flat);
+    expect(fileBrowserTableMinWidth(all, 2)).toBe(flat);
+    for (let depth = 3; depth <= 12; depth += 1) {
+      expect(fileBrowserTableMinWidth(all, depth)).toBe(flat + FILE_BROWSER_INDENT_PX * (depth - 2));
+    }
+    expect(fileBrowserTableMinWidth(all)).toBe(flat);
+  });
+
+  it('finds the deepest row on screen: only expanded, loaded and shown folders count', () => {
+    interface N { id: string; hidden?: boolean; children?: N[] }
+    const leaf = (id: string, extra: Partial<N> = {}): N => ({ id, ...extra });
+    const tree: N[] = [{ id: 'root', children: [
+      { id: 'a', children: [{ id: 'a1', children: [{ id: 'a2', children: [leaf('a3')] }] }] },
+      { id: 'collapsed', children: [{ id: 'c1', children: [{ id: 'c2' }] }] },
+      { id: 'hid', hidden: true, children: [{ id: 'h1', children: [{ id: 'h2' }] }] },
+      { id: 'unloaded', children: [] },
+    ] }];
+    const open = new Set(['root', 'a', 'a1', 'a2', 'hid', 'unloaded']);
+    const depth = (shown?: (n: N) => boolean) => fileBrowserMaxVisibleDepth(tree, (n) => n.children, (n) => open.has(n.id), shown);
+    expect(depth()).toBe(4);
+    open.delete('a2');
+    expect(depth()).toBe(3);
+    // A collapsed folder hides its subtree; a hidden folder that is not shown hides its own.
+    open.delete('a');
+    expect(depth()).toBe(2);
+    expect(depth((n) => !n.hidden)).toBe(1);
+    expect(fileBrowserMaxVisibleDepth<N>([], (n) => n.children, () => true)).toBe(0);
   });
 
   it('stores the hidden columns per machine and reads back only real, hideable ones', () => {

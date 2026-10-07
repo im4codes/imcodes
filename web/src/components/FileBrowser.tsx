@@ -18,6 +18,8 @@ import { FILE_TRANSFER_DIRECTORY_MAX_ENTRIES, FILE_TRANSFER_DIRECTORY_QUERY_MAX_
 import {
   FILE_BROWSER_COLUMN_KEYS,
   fileBrowserTableMinWidth,
+  fileBrowserMaxVisibleDepth,
+  FILE_BROWSER_INDENT_PX,
   fileKindLabel,
   formatFileBrowserDate,
   loadFileBrowserHiddenColumns,
@@ -2022,6 +2024,16 @@ export function FileBrowser({
   const createdUnavailable = Boolean(unavailableReasons[FILE_BROWSER_SORT_KEYS.CREATED]);
   const emptyFilterText = filterTerms.length > 0 ? t('file_browser.filter_empty', { query: appliedFilter.trim() }) : undefined;
   const forceExpanded = listViewResult?.forceExpanded;
+  const tableMinWidth = useMemo(() => {
+    if (!listView) return 0;
+    const deepest = fileBrowserMaxVisibleDepth(
+      viewData,
+      (node) => node.children,
+      (node) => expandedPaths.has(node.id) || Boolean(forceExpanded?.has(node.id)),
+      (node) => showHidden || !node.hidden,
+    );
+    return fileBrowserTableMinWidth(visibleColumns, deepest);
+  }, [expandedPaths, forceExpanded, listView, showHidden, viewData, visibleColumns]);
   const listColumns = useMemo<FsListColumns | undefined>(() => (listView ? {
     visible: visibleColumns,
     nowMs: nowMinute * 60_000,
@@ -2068,11 +2080,12 @@ export function FileBrowser({
         }}
         onFilterClear={clearFilter}
         hiddenColumns={hiddenColumns}
+        effectiveSortKey={effectiveSort.key}
         onToggleColumn={toggleColumn}
         onShowAllColumns={showAllColumns}
         notice={listNotice}
       />
-      <div class="fb-table-scroll" style={{ '--fb-table-min': `${fileBrowserTableMinWidth(visibleColumns)}px` } as Record<string, string>}>
+      <div class="fb-table-scroll" style={{ '--fb-table-min': `${tableMinWidth}px` } as Record<string, string>}>
         <FileBrowserListHeader sort={sort} onSortChange={handleSortChange} unavailableReasons={unavailableReasons} hiddenColumns={hiddenColumns} />
         {treeRows}
       </div>
@@ -2971,7 +2984,7 @@ function FsTreeNode({
     <div>
       <div
         class={`fb-node${isSelected ? ' selected' : ''}${isAlready ? ' already' : ''}${isDisabled ? ' disabled' : ''}${isPreviewing ? ' previewing' : ''}${gitClass ? ` git-${gitClass}` : ''}`}
-        style={{ paddingLeft: 8 + depth * 16 }}
+        style={{ paddingLeft: 8 + depth * FILE_BROWSER_INDENT_PX }}
         onClick={() => {
           if (!isMulti && !isDisabled) onSelect(node.id, node.isDir);
           if (node.isDir) onToggleExpand(node.id);
@@ -3029,7 +3042,7 @@ function FsTreeNode({
       {node.isDir && isExpanded && node.children && (
         <>
           {node.children.length === 0 && !node.isLoading && (
-            <div class="fb-node-empty" style={{ paddingLeft: 8 + (depth + 1) * 16 }}>{depth === 0 && listColumns?.emptyText ? listColumns.emptyText : '—'}</div>
+            <div class="fb-node-empty" style={{ paddingLeft: 8 + (depth + 1) * FILE_BROWSER_INDENT_PX }}>{depth === 0 && listColumns?.emptyText ? listColumns.emptyText : '—'}</div>
           )}
           {node.children.map((child) => (
             <FsTreeNode

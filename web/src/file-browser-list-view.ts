@@ -39,9 +39,38 @@ export const FILE_BROWSER_NAME_MIN_WIDTH_PX = 200;
 const FILE_BROWSER_ROW_CHROME_PX = 16;
 const FILE_BROWSER_CELL_GAP_PX = 4;
 
-/** The narrowest the table can be without squeezing the name below its minimum: below this the container scrolls sideways. */
-export function fileBrowserTableMinWidth(visible: ReadonlySet<FileBrowserSortKey>): number {
-  let width = FILE_BROWSER_ROW_CHROME_PX + FILE_BROWSER_NAME_MIN_WIDTH_PX;
+/** Indent per nesting level of a row (CSS px); the row component pads by this too. */
+export const FILE_BROWSER_INDENT_PX = 16;
+/** Depth up to which the name column's minimum already absorbs the indent (expander + icon + a readable name still fit). */
+const FILE_BROWSER_ABSORBED_DEPTH = 2;
+
+/** Depth of the deepest row on screen (the root is 0, its children 1). `children` and `expanded` are the tree's own accessors. */
+export function fileBrowserMaxVisibleDepth<T>(
+  roots: readonly T[],
+  children: (node: T) => readonly T[] | undefined,
+  expanded: (node: T) => boolean,
+  isShown: (node: T) => boolean = () => true,
+): number {
+  let deepest = 0;
+  const walk = (nodes: readonly T[], depth: number) => {
+    for (const node of nodes) {
+      if (!isShown(node)) continue;
+      if (depth > deepest) deepest = depth;
+      const kids = children(node);
+      if (kids && kids.length > 0 && expanded(node)) walk(kids, depth + 1);
+    }
+  };
+  walk(roots, 0);
+  return deepest;
+}
+
+/**
+ * The narrowest the table can be without squeezing the name below its minimum: below this the container scrolls sideways.
+ * Header and rows share this width, so deeper nesting widens both and the columns stay aligned.
+ */
+export function fileBrowserTableMinWidth(visible: ReadonlySet<FileBrowserSortKey>, maxDepth = 0): number {
+  let width = FILE_BROWSER_ROW_CHROME_PX + FILE_BROWSER_NAME_MIN_WIDTH_PX
+    + FILE_BROWSER_INDENT_PX * Math.max(0, maxDepth - FILE_BROWSER_ABSORBED_DEPTH);
   for (const key of FILE_BROWSER_HIDEABLE_COLUMNS) {
     if (visible.has(key)) width += (FILE_BROWSER_COLUMN_WIDTH_PX[key] ?? 0) + FILE_BROWSER_CELL_GAP_PX;
   }

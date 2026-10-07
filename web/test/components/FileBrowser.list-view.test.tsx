@@ -414,6 +414,28 @@ describe('FileBrowser table view: other hosts and narrow panels', () => {
     expect(calls[0]!.options).toBeUndefined();
   });
 
+  it('widens the table (header and rows share it) for every level of nested folders it shows', () => {
+    const { view, respond, calls, last } = mount({ directoryQuery: true });
+    respond(calls[0]!.requestId, [{ name: 'd1', isDir: true, mtimeMs: NOW }, { name: 'f.txt', isDir: false, size: 1, mtimeMs: NOW }], {});
+    const container = view.container as HTMLElement;
+    const tableMin = () => parseInt((container.querySelector('.fb-table-scroll') as HTMLElement).style.getPropertyValue('--fb-table-min'), 10);
+    const flat = tableMin();
+    expect(flat).toBe(fileBrowserTableMinWidth(new Set(['name', ...FILE_BROWSER_HIDEABLE_COLUMNS]) as never));
+    let path = '/data';
+    for (let level = 1; level <= 5; level += 1) {
+      const name = `d${level}`;
+      const row = [...container.querySelectorAll('.fb-node')].find((el) => el.querySelector('.fb-node-name')?.textContent === name)!;
+      fireEvent.click(row);
+      path = `${path}/${name}`;
+      respond(last().requestId, [{ name: `d${level + 1}`, isDir: true, mtimeMs: NOW }], {}, path);
+    }
+    // d1..d5 are expanded and d6 is shown: six levels below the root, four of them past the ones the name column absorbs.
+    expect(tableMin()).toBe(flat + 16 * 4);
+    // Collapsing the deepest folders takes the extra width away again.
+    fireEvent.click([...container.querySelectorAll('.fb-node')].find((el) => el.querySelector('.fb-node-name')?.textContent === 'd1')!);
+    expect(tableMin()).toBe(flat);
+  });
+
   it('is a table at ANY width: the same aligned header and cells in a 360 px container, which scrolls sideways instead of folding', () => {
     const width = vi.spyOn(HTMLElement.prototype, 'clientWidth', 'get').mockReturnValue(360);
     const { view, respond, calls } = mount({ directoryQuery: true });
@@ -537,6 +559,21 @@ describe('FileBrowser table view: columns menu', () => {
     expect(() => toggle(quiet.view.container as HTMLElement, 'file_browser.col.size')).not.toThrow();
     expect(cells(quiet.view.container as HTMLElement)).toEqual(['name', 'kind', 'modified', 'created']);
     blocked.mockRestore();
+  });
+
+  it('says the list is ordered by the name when the remembered column is one this machine cannot serve', () => {
+    const { view, respond, calls } = mount({ directoryQuery: true });
+    // An older machine: no creation times, so a remembered "created" order falls back to the name.
+    localStorage.setItem(fileBrowserSortStorageKey('srv-1'), JSON.stringify({ key: 'created', direction: 'asc', dirsFirst: true }));
+    view.unmount();
+    const again = mount({ directoryQuery: true });
+    respond(calls[0]!.requestId, FILES, {});
+    again.respond(again.calls[0]!.requestId, FILES.map(({ birthtimeMs: _drop, ...rest }) => rest), {});
+    const container = again.view.container as HTMLElement;
+    fireEvent.click(container.querySelector('.fb-columns-button') as HTMLButtonElement);
+    toggle(container, 'file_browser.col.created');
+    const label = container.querySelector('.fb-list-sorted-by')?.textContent ?? '';
+    expect(label).not.toContain('file_browser.col.created');
   });
 
   it('keeps sorting by a column that is hidden and says what the list is sorted by', () => {

@@ -9175,7 +9175,7 @@ html.native-ios-mac .chat-dl-btn {
 .fb-list-header .fb-col-modified { flex: none; width: var(--fb-col-modified); }
 .fb-list-header .fb-col-created { flex: none; width: var(--fb-col-created); }
 .fb-tree-list .fb-node { min-width: var(--fb-table-min, 0); }
-.fb-tree-list .fb-node-name { min-width: 120px; }
+.fb-tree-list .fb-node-name { min-width: 0; }
 .fb-col { flex: none; font-size: 12px; color: #94a3b8; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding: 0 4px; }
 .fb-node .fb-col-size { width: var(--fb-col-size); text-align: right; font-variant-numeric: tabular-nums; }
 .fb-node .fb-col-kind { width: var(--fb-col-kind); }
