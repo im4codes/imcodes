@@ -1,5 +1,6 @@
 import { TASK_PAIR_LEGACY_TOOL_HOOK_PATH } from '../../shared/task-pair.js';
 import { SEND_COMMAND_ERRORS, SEND_COMMAND_HOOK_PATH } from '../../shared/send-command-mode.js';
+import type { SessionCloseResult } from '../../shared/session-close.js';
 import { stat } from 'node:fs/promises';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
@@ -50,6 +51,7 @@ import {
   MEMORY_MCP_SEND_DELIVERY_MODES,
   MEMORY_MCP_SESSION_RESTART_HOOK_PATH,
   MEMORY_MCP_SESSION_RESTART_BATCH_HOOK_PATH,
+  MEMORY_MCP_SESSION_CLOSE_HOOK_PATH,
   MEMORY_MCP_SESSION_MODEL_LIST_HOOK_PATH,
   MEMORY_MCP_SESSION_MODEL_SET_HOOK_PATH,
   MEMORY_MCP_TOOL_NAMES,
@@ -725,6 +727,27 @@ export function mergeDefaultToolDeps(
         targets: targets.map((item) => ({ target: item.target.name, reset: item.reset, ...(item.idempotencyKey ? { idempotencyKey: item.idempotencyKey } : {}) })),
       }, MEMORY_MCP_SESSION_RESTART_BATCH_HOOK_PATH, caller.sessionName);
       return response;
+    }),
+    closeSession: toolDeps.closeSession ?? (async (request) => {
+      const port = await resolveHookPort();
+      if (!port) throw new Error('daemon session close control is unavailable');
+      if (!caller.sessionName) throw new Error('session_close requires a scoped caller');
+      try {
+        const response = await postHookSend(port, {
+          from: caller.sessionName,
+          target: request.target,
+          ...(request.force ? { force: true } : {}),
+          ...(request.confirmUserCreated ? { confirmUserCreated: true } : {}),
+        }, MEMORY_MCP_SESSION_CLOSE_HOOK_PATH, caller.sessionName);
+        const { ok: _ok, ...result } = response;
+        return result as unknown as SessionCloseResult;
+      } catch (hookError) {
+        // A daemon older than this tool answers an unknown path with an empty 404.
+        if (hookError instanceof Error && /status 404\b/u.test(hookError.message)) {
+          throw new Error('this daemon does not support session_close; upgrade the daemon');
+        }
+        throw hookError;
+      }
     }),
     listSessionModels: toolDeps.listSessionModels ?? (async (target) => {
       const port = await resolveHookPort();

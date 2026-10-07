@@ -86,6 +86,7 @@ import { isControlledNodeId } from '../../shared/controlled-node-identity.js';
 import { MEMORY_PROJECT_SCOPE_REASON } from '../../shared/memory-project-scope.js';
 import { sanitizeMcpErrorMessage } from '../../shared/mcp-error-sanitize.js';
 import { resolveEffectiveProjectName, resolveRuntimeScope } from '../../shared/session-scope.js';
+import { SESSION_CLOSE_REFUSAL, SESSION_CLOSE_STATUS, type SessionCloseRequest, type SessionCloseResult } from '../../shared/session-close.js';
 import { isDiscoverableInterAgentSession } from '../../shared/session-scope.js';
 import { isDelegationReplyCapableAgentType } from '../../shared/agent-delegation.js';
 import { getSessionRuntimeType } from '../../shared/agent-types.js';
@@ -395,6 +396,11 @@ export interface MemoryMcpToolDeps {
     options: { reset: boolean },
   ) => Promise<boolean> | boolean;
   restartSessionBatch?: (targets: Array<{ target: SessionRecord; reset: boolean; idempotencyKey?: string }>) => Promise<Record<string, unknown>> | Record<string, unknown>;
+  /**
+   * Daemon-owned close of one exact sub-session. The daemon enforces who may close what (creator or Brain, never a Brain/main/clone,
+   * nothing in flight without force), so this child only forwards the request.
+   */
+  closeSession?: (request: SessionCloseRequest) => Promise<SessionCloseResult> | SessionCloseResult;
   /** Daemon-owned model control by exact session name (no ownership check). */
   listSessionModels?: (target: string) => Promise<Record<string, unknown>>;
   setSessionModel?: (target: string, model?: string, thinking?: string) => Promise<Record<string, unknown>>;
@@ -2569,6 +2575,49 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
         return error(MCP_ERROR_REASONS.CONTROL_PLANE_UNAVAILABLE, sanitizeMcpErrorMessage(restartError));
       }
     },
+    [MEMORY_MCP_TOOL_NAMES.SESSION_CLOSE]: async (input) => {
+      const args = pickAllowedMcpArgs(input, ['target', 'force', 'confirmUserCreated']);
+      const target = stringArg(args, 'target')?.trim();
+      if (!target) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'target is required');
+      if (!caller.sessionName) return error(MCP_ERROR_REASONS.IDENTITY_REJECTED, 'session_close requires a scoped caller');
+      if (!deps.closeSession) {
+        return error(MCP_ERROR_REASONS.CONTROL_PLANE_UNAVAILABLE, 'daemon session close control is unavailable');
+      }
+      const request: SessionCloseRequest = {
+        target,
+        ...(boolArg(args, 'force') === true ? { force: true } : {}),
+        ...(boolArg(args, 'confirmUserCreated') === true ? { confirmUserCreated: true } : {}),
+      };
+      try {
+        const result = await deps.closeSession(request);
+        if (result.status === SESSION_CLOSE_STATUS.REFUSED) {
+          // Authority and kind refusals are scope problems; the rest are work in flight or a missing confirmation.
+          const scope = result.reason === SESSION_CLOSE_REFUSAL.NOT_AUTHORIZED
+            || result.reason === SESSION_CLOSE_REFUSAL.NOT_A_SUB_SESSION
+            || result.reason === SESSION_CLOSE_REFUSAL.EXECUTION_CLONE
+            || result.reason === SESSION_CLOSE_REFUSAL.SELF
+            || result.reason === SESSION_CLOSE_REFUSAL.FORCE_NOT_PERMITTED;
+          return {
+            ...error(scope ? MCP_ERROR_REASONS.SCOPE_FORBIDDEN : MCP_ERROR_REASONS.VALIDATION_FAILED, `session_close refused: ${result.detail}`),
+            target: result.target,
+            closeReason: result.reason,
+          };
+        }
+        if (result.status === SESSION_CLOSE_STATUS.FAILED) {
+          return { ...error(MCP_ERROR_REASONS.INTERNAL_ERROR, sanitizeMcpErrorMessage(result.error)), target: result.target, closeReason: SESSION_CLOSE_STATUS.FAILED };
+        }
+        const { status: closeStatus, ...details } = result;
+        return { status: 'ok', result: closeStatus, ...details };
+      } catch (closeError) {
+        if (isMcpRateLimitError(closeError)) {
+          return error(MCP_ERROR_REASONS.RATE_LIMITED, sanitizeMcpErrorMessage(closeError), {
+            retryAfterMs: closeError.retryAfterMs,
+            retryAt: closeError.retryAt,
+          });
+        }
+        return error(MCP_ERROR_REASONS.CONTROL_PLANE_UNAVAILABLE, sanitizeMcpErrorMessage(closeError));
+      }
+    },
     [MEMORY_MCP_TOOL_NAMES.SESSION_MODEL]: async (input) => {
       const args = pickAllowedMcpArgs(input, ['target', 'model', 'thinking']);
       const target = stringArg(args, 'target')?.trim() || caller.sessionName;
@@ -4336,6 +4385,11 @@ const schemas = {
       context.addIssue({ code: z.ZodIssueCode.custom, message: 'provide exactly one of target or targets' });
     }
   }),
+  [MEMORY_MCP_TOOL_NAMES.SESSION_CLOSE]: z.object({
+    target: z.string().trim().min(1).describe('Exact sub-session name.'),
+    force: z.boolean().optional().describe('Brain only: close despite open pair, running turn or queued messages.'),
+    confirmUserCreated: z.boolean().optional().describe('Brain only: required for a user-created session.'),
+  }).strict(),
   [MEMORY_MCP_TOOL_NAMES.SESSION_MODEL]: z.object({
     target: z.string().trim().min(1).optional().describe('Exact session name; default caller.'),
     model: z.string().trim().max(200).optional().describe('Model id to switch to; empty/omitted keeps the current model.'),

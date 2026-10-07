@@ -123,6 +123,7 @@ export const MEMORY_MCP_TOOL_NAMES = {
   PAIR_GET_MAX_CONCURRENCY: 'pair_get_max_concurrency',
   SESSION_RUNTIME_IDENTITY_GET: 'session_runtime_identity_get',
   SESSION_RESTART: 'session_restart',
+  SESSION_CLOSE: 'session_close',
   SESSION_MODEL: 'session_model',
   SEND_MESSAGE: 'send_message',
   SUPERVISION_TASK_START: 'supervision_task_start',
@@ -197,6 +198,7 @@ export const MEMORY_MCP_TOOL_NAME_LIST = [
   MEMORY_MCP_TOOL_NAMES.PAIR_GET_MAX_CONCURRENCY,
   MEMORY_MCP_TOOL_NAMES.SESSION_RUNTIME_IDENTITY_GET,
   MEMORY_MCP_TOOL_NAMES.SESSION_RESTART,
+  MEMORY_MCP_TOOL_NAMES.SESSION_CLOSE,
   MEMORY_MCP_TOOL_NAMES.SESSION_MODEL,
   MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE,
   MEMORY_MCP_TOOL_NAMES.PAIR_TASK_GET,
@@ -308,6 +310,8 @@ export const MEMORY_MCP_CAPS = {
 /** Local daemon ingress used by the stdio MCP child for exact-session restart. */
 export const MEMORY_MCP_SESSION_RESTART_HOOK_PATH = '/session/restart' as const;
 export const MEMORY_MCP_SESSION_RESTART_BATCH_HOOK_PATH = '/session/restart-batch' as const;
+/** Local daemon ingress for `session_close`; the daemon, not the MCP child, enforces who may close what. */
+export const MEMORY_MCP_SESSION_CLOSE_HOOK_PATH = '/session/close' as const;
 /** Local daemon ingress for the model tools (list / switch by exact session name). */
 export const MEMORY_MCP_SESSION_MODEL_LIST_HOOK_PATH = '/session/models' as const;
 export const MEMORY_MCP_SESSION_MODEL_SET_HOOK_PATH = '/session/model' as const;
@@ -887,6 +891,16 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
       reset: booleanSchema('True for start-over.'),
       scheduled: booleanSchema('True when accepted.'),
     }, ['status', 'target', 'reset', 'scheduled']),
+  },
+  [MEMORY_MCP_TOOL_NAMES.SESSION_CLOSE]: {
+    name: MEMORY_MCP_TOOL_NAMES.SESSION_CLOSE,
+    description: 'Close one exact sub-session of this project (soft: reopenable by the user). Creator or project Brain only; never a Brain, main session, clone or yourself. Refused while a pair is open, a turn runs or messages are queued, unless the Brain forces. Idempotent.',
+    inputSchema: objectSchema({
+      target: stringSchema('Exact sub-session name.'),
+      force: booleanSchema('Brain only: close despite open pair, running turn or queued messages.'),
+      confirmUserCreated: booleanSchema('Brain only: required for a user-created session.'),
+    }, ['target']),
+    outputSchema: statusSchema,
   },
   [MEMORY_MCP_TOOL_NAMES.SESSION_MODEL]: {
     name: MEMORY_MCP_TOOL_NAMES.SESSION_MODEL,

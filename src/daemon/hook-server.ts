@@ -58,6 +58,7 @@ import type { ContextNamespace } from '../../shared/context-types.js';
 import {
   MEMORY_MCP_SESSION_RESTART_HOOK_PATH,
   MEMORY_MCP_SESSION_RESTART_BATCH_HOOK_PATH,
+  MEMORY_MCP_SESSION_CLOSE_HOOK_PATH,
   MEMORY_MCP_SESSION_MODEL_LIST_HOOK_PATH,
   MEMORY_MCP_SESSION_MODEL_SET_HOOK_PATH,
   MEMORY_MCP_SEND_DELIVERY_MODES,
@@ -918,6 +919,8 @@ export interface HookServerOptions {
   ) => Promise<Record<string, unknown>>;
   /** Exact ServerLink identity injected by the daemon, never by the MCP child. */
   memoryMcpServerId?: string;
+  /** Test seam; production is closeSessionOnBehalf (the daemon decides who may close what). */
+  closeSession?: (callerSessionName: string, request: import('../../shared/session-close.js').SessionCloseRequest) => Promise<import('../../shared/session-close.js').SessionCloseResult>;
   /** Test seam; production schedules the command-handler's exclusive relaunch. */
   restartSession?: (sessionName: string, options: { reset: boolean }) => Promise<boolean> | boolean;
   /** Test seams for the session model MCP tools. */
@@ -1507,6 +1510,45 @@ export async function startHookServer(
         } else {
           res.end(JSON.stringify({ ok: true, accepted: true, target: targetRecords[0]!.name, reset: items[0]!.reset, ...(queued.length ? { queued: true } : {}) }));
         }
+      } catch (err) {
+        const status = (err as Error).message === 'body too large' ? 413 : 400;
+        res.writeHead(status, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: status === 413 ? 'request body too large' : 'bad request' }));
+      }
+      return;
+    }
+
+    if (url === MEMORY_MCP_SESSION_CLOSE_HOOK_PATH) {
+      const contentType = req.headers['content-type'] ?? '';
+      if (!contentType.includes('application/json')) {
+        res.writeHead(415, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'Content-Type must be application/json' }));
+        return;
+      }
+      try {
+        const body = JSON.parse(await readBody(req, 16 * 1024)) as Record<string, unknown>;
+        const senderHeader = req.headers['x-imcodes-session'];
+        const authenticatedSender = Array.isArray(senderHeader) ? senderHeader[0] : senderHeader;
+        const from = typeof body.from === 'string' ? body.from.trim() : '';
+        const target = typeof body.target === 'string' ? body.target.trim() : '';
+        // The caller is the authenticated MCP session, never a name the body claims: the whole authority model rests on it.
+        if (!from || authenticatedSender !== from || !target) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'invalid exact-session close request' }));
+          return;
+        }
+        const close = options.closeSession ?? (async (callerName, request) => {
+          const { closeSessionOnBehalf } = await import('./session-close.js');
+          return closeSessionOnBehalf(callerName, request);
+        });
+        const result = await close(from, {
+          target,
+          ...(body.force === true ? { force: true } : {}),
+          ...(body.confirmUserCreated === true ? { confirmUserCreated: true } : {}),
+        });
+        // A refusal is an answer, not a transport failure: it travels as a structured 200 so the tool can explain it.
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, ...result }));
       } catch (err) {
         const status = (err as Error).message === 'body too large' ? 413 : 400;
         res.writeHead(status, { 'Content-Type': 'application/json' });

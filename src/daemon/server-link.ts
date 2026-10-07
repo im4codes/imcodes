@@ -12,7 +12,7 @@ import {
 } from '../../shared/daemon-upgrade.js';
 import { setTransportRelaySend } from './transport-relay.js';
 import { setProviderRegistryServerLink } from '../agent/provider-registry.js';
-import { setActiveServerLink } from './active-server-link.js';
+import { flushPendingSubSessionClosedNotices, setActiveServerLink } from './active-server-link.js';
 import { getDefaultAckOutbox } from './ack-outbox.js';
 import { getDefaultUpgradeBlockedOutbox } from './upgrade-blocked-outbox.js';
 import { getEmbeddingStatus } from '../context/embedding.js';
@@ -722,7 +722,9 @@ export class ServerLink {
         }
       });
       setProviderRegistryServerLink(this);
+      // Same link for code that is not handed one, plus a replay of any sub-session close the server missed while we were offline.
       setActiveServerLink(this);
+      flushPendingSubSessionClosedNotices(this);
       this.startHeartbeat(useCoreLaneWorker);
       this.startWatchdog(useCoreLaneWorker);
       this.scheduleTestMainThreadBlock();

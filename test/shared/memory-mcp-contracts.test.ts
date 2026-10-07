@@ -109,6 +109,7 @@ describe('memory MCP shared contracts', () => {
       'pair_get_max_concurrency',
       'session_runtime_identity_get',
       'session_restart',
+      'session_close',
       'session_model',
       'send_message',
       'pair_task_get',
