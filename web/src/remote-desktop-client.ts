@@ -1,3 +1,4 @@
+import type { RemoteDesktopEncoderSummary } from './remote-desktop-encoder-label.js';
 import {
   DecodeTimeMonitor,
   browserDecodeFallbackStore,
@@ -149,6 +150,11 @@ export interface RemoteDesktopSnapshot {
    */
   quality?: Omit<RemoteDesktopQuality, 'type' | 'protocolVersion' | 'sessionId' | 'sequence' | 'preset' | 'encoderClass'>
     & Partial<Pick<RemoteDesktopQuality, 'preset' | 'encoderClass'>>;
+  /** What is ACTUALLY encoding the picture (codec, implementation, encoder name),
+   *  from the worker's encoder message. Absent for a node that does not send it
+   *  (Windows, Linux, an older macOS node): the status bar then keeps its
+   *  `quality.encoderClass` text. */
+  encoder?: RemoteDesktopEncoderSummary;
   stream: MediaStream | null;
   terminalReason?: string;
   error?: string;
@@ -1689,6 +1695,9 @@ export class RemoteDesktopClient {
     } else if (parsed.value.type === REMOTE_DESKTOP_DATA_MSG.QUALITY) {
       const { type: _type, protocolVersion: _protocol, sessionId: _session, sequence: _sequence, ...quality } = parsed.value;
       this.publish({ quality });
+    } else if (parsed.value.type === REMOTE_DESKTOP_DATA_MSG.ENCODER) {
+      const { type: _type, protocolVersion: _protocol, sessionId: _session, sequence: _sequence, ...encoder } = parsed.value;
+      this.publish({ encoder });
     } else if (parsed.value.type === REMOTE_DESKTOP_DATA_MSG.CLIPBOARD) {
       const pending = this.pendingClipboardRequests.get(parsed.value.requestId);
       if (!pending) return;

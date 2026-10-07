@@ -2497,6 +2497,101 @@ describe('RemoteDesktopClient', () => {
     });
   });
 
+  describe('encoder message (what is really encoding)', () => {
+    async function startConnected() {
+      let socket!: FakeSocket;
+      let peer!: FakePeer;
+      const snapshots: Array<Record<string, unknown>> = [];
+      const client = new RemoteDesktopClient('controlled-mac', { onSnapshot: (value) => snapshots.push(value as unknown as Record<string, unknown>) }, {
+        fetchTicket: async () => 'ticket-encoder',
+        createSocket: () => {
+          socket = new FakeSocket();
+          queueMicrotask(() => socket.open());
+          return socket as unknown as WebSocket;
+        },
+        createPeer: () => {
+          peer = new FakePeer();
+          return peer as unknown as RTCPeerConnection;
+        },
+        now: () => 0,
+        isDocumentVisible: () => true,
+        decodeFallbackStore: null,
+      });
+      await client.start();
+      const start = JSON.parse(socket.sent[0]!) as { requestId: string };
+      socket.receive({
+        type: REMOTE_DESKTOP_MSG.AUTHORIZED,
+        requestId: start.requestId, sessionId: 'session_encoder01', capability: 'e'.repeat(43),
+        expiresAt: 3_600_000, leaseExpiresAt: 3_600_000, daemonGeneration: 1,
+        mode: REMOTE_DESKTOP_ACCESS_MODE.CONTROL, inputEpoch: 1,
+        iceServers: ['stun:stun.example.test:3478'],
+      });
+      await vi.waitFor(() => expect(peer).toBeDefined());
+      const control = peer.channels.get(REMOTE_DESKTOP_CHANNEL.CONTROL)!;
+      return { client, control, snapshots };
+    }
+
+    const quality = {
+      type: REMOTE_DESKTOP_DATA_MSG.QUALITY, protocolVersion: REMOTE_DESKTOP_PROTOCOL_VERSION, sessionId: 'session_encoder01',
+      sequence: 1, preset: '1440p30', encoderClass: 'software', width: 2560, height: 1350, fps: 15,
+      bitrateBps: 300_000, droppedFrames: 0, rttMs: 0,
+    };
+    const encoder = {
+      type: REMOTE_DESKTOP_DATA_MSG.ENCODER, protocolVersion: REMOTE_DESKTOP_PROTOCOL_VERSION, sessionId: 'session_encoder01',
+      sequence: 2, codec: 'vp9', implementation: 'software', name: 'libvpx', threads: 12, rawCodecs: 'allowed',
+    };
+
+    it('shows the encoder the node reports, next to an unchanged quality report', async () => {
+      const { client, control } = await startConnected();
+      control.receive(quality);
+      expect(client.current().quality?.encoderClass).toBe('software');
+      expect(client.current().encoder).toBeUndefined();
+      control.receive(encoder);
+      expect(client.current().encoder).toEqual({ codec: 'vp9', implementation: 'software', name: 'libvpx', threads: 12, rawCodecs: 'allowed' });
+      // The quality report is untouched by it.
+      expect(client.current().quality).toMatchObject({ width: 2560, height: 1350, fps: 15, encoderClass: 'software' });
+      // A later message replaces it (the codec changed, say).
+      control.receive({ ...encoder, sequence: 3, codec: 'h264', name: 'Apple H.264 (SW)', threads: 0, rawCodecs: 'disabled_by_setting' });
+      expect(client.current().encoder).toMatchObject({ codec: 'h264', rawCodecs: 'disabled_by_setting' });
+      client.stop();
+    });
+
+    it('ignores a malformed encoder message, one for another session, and keeps the session up', async () => {
+      const { client, control } = await startConnected();
+      control.receive({ ...encoder, codec: 'av1' });
+      control.receive({ ...encoder, extra: 1 });
+      control.receive({ ...encoder, sessionId: 'session_other001' });
+      expect(client.current().encoder).toBeUndefined();
+      expect(client.current().state).not.toBe(REMOTE_DESKTOP_STATE.FAILED);
+      control.receive(quality);
+      expect(client.current().quality).toBeDefined();
+      client.stop();
+    });
+
+    // Skew, web newer than node: an older macOS node, Windows or Linux never send the
+    // message. Nothing breaks, there is simply no encoder: the status bar falls back to
+    // the class-only text.
+    it('works against a node that never sends it', async () => {
+      const { client, control } = await startConnected();
+      control.receive(quality);
+      expect(client.current().quality?.encoderClass).toBe('software');
+      expect(client.current().encoder).toBeUndefined();
+      client.stop();
+    });
+
+    // Skew, node newer than web: an older web has never heard of this message type. It
+    // drops what it cannot validate and carries on; the same path is exercised here with
+    // a type no client knows, followed by a quality report that must still be applied.
+    it('drops a data-message type it does not know without touching the session or the quality report', async () => {
+      const { client, control } = await startConnected();
+      control.receive({ type: 'remote_desktop.data.encoder_from_the_future', protocolVersion: REMOTE_DESKTOP_PROTOCOL_VERSION, sessionId: 'session_encoder01', sequence: 5, codec: 'vp9' });
+      expect(client.current().state).not.toBe(REMOTE_DESKTOP_STATE.FAILED);
+      control.receive(quality);
+      expect(client.current().quality).toMatchObject({ width: 2560, droppedFrames: 0 });
+      client.stop();
+    });
+  });
+
   // The ICE-candidate flood cap is a per-negotiation guard: `renegotiate()`
   // already rezeroes it for each new generation. The client-initiated restart
   // path does not, so candidates accumulate across generations until a

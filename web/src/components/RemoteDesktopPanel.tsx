@@ -52,6 +52,7 @@ import {
   type FileUploadTransportMode,
 } from '../direct-file-transfer.js';
 import type { RemoteDesktopSnapshot } from '../remote-desktop-client.js';
+import { describeRemoteDesktopEncoder } from '../remote-desktop-encoder-label.js';
 import {
   RemoteDesktopConnectionManager,
   remoteDesktopHostKey,
@@ -4371,9 +4372,22 @@ export function RemoteDesktopPanel({
                 <>
                   <span>{snapshot.quality.width}×{snapshot.quality.height} · {snapshot.quality.fps.toFixed(0)} FPS</span>
                   <span title={t('remote_desktop.rtt_definition')} data-rtt-ms={snapshot.quality.rttMs.toFixed(0)}>{(snapshot.quality.bitrateBps / 1_000_000).toFixed(1)} Mbps · {snapshot.quality.rttMs.toFixed(0)} ms</span>
-                  {snapshot.quality.encoderClass && (
-                    <span>{t('remote_desktop.encoder', { encoder: snapshot.quality.encoderClass })}</span>
-                  )}
+                  {(() => {
+                    // The REAL encoder when the node says it (codec, software or
+                    // hardware, encoder name, and why H.264 if the setting forced it);
+                    // otherwise the older class-only text.
+                    const actual = describeRemoteDesktopEncoder(snapshot.encoder, t);
+                    if (actual) {
+                      return (
+                        <span data-encoder-codec={actual.codec}>
+                          {actual.text}{actual.note ? ` · ${actual.note}` : ''}
+                        </span>
+                      );
+                    }
+                    return snapshot.quality.encoderClass
+                      ? <span>{t('remote_desktop.encoder', { encoder: snapshot.quality.encoderClass })}</span>
+                      : null;
+                  })()}
                   {snapshot.quality.preset && (
                     <span>{t('remote_desktop.quality', { preset: snapshot.quality.preset })}</span>
                   )}
