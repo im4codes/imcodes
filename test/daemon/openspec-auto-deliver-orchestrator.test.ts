@@ -1998,16 +1998,39 @@ exec "${realGit}" "$@"
     expect(implementationReminderCount()).toBe(2);
   });
 
-  it('asks the implementation LLM to commit&push, then verifies product changes after final implementation audit PASS when opted in', async () => {
+  /**
+   * The implementation session's runtime as the orchestrator sees it once the
+   * 'commit&push' prompt has been handed over: busy (a turn is in flight) until
+   * the test says that turn is over. The default mock reports an idle runtime
+   * forever, which is not what a real runtime does after a send, and it is what
+   * let a stale idle edge be mistaken for the end of the commit&push turn.
+   */
+  function useRuntimeThatIsBusyWhileCommitPushTurnRuns(): { finishCommitPushTurn: () => void } {
+    let commitPushTurnInFlight = false;
+    getTransportRuntimeMock.mockImplementation(() => ({
+      send: (text: string, ...rest: unknown[]) => {
+        const result = (transportSendMock as unknown as (...args: unknown[]) => unknown)(text, ...rest);
+        if (text === 'commit&push') commitPushTurnInFlight = true;
+        return result;
+      },
+      get sending() { return commitPushTurnInFlight; },
+      settleActiveDispatchFromExternalCompletion: transportSettleExternalMock,
+    }));
+    return { finishCommitPushTurn: () => { commitPushTurnInFlight = false; } };
+  }
+
+  /** Drives an opted-in run up to the moment the daemon hands 'commit&push' to the implementation LLM. */
+  async function driveRunToCommitPushPrompt(requestId: string): Promise<{ remoteDir: string; finishCommitPushTurn: () => void }> {
     await makeChange('demo-change', '- [x] first\n- [x] second\n');
     await writeFile(join(projectDir, '.gitignore'), '.imc/\n', 'utf8');
     const remoteDir = await initializeGitWithRemote();
     await mkdir(join(projectDir, 'src'), { recursive: true });
     await writeFile(join(projectDir, 'src', 'preexisting.ts'), 'export const preexisting = true;\n', 'utf8');
+    const { finishCommitPushTurn } = useRuntimeThatIsBusyWhileCommitPushTurnRuns();
 
     await handleOpenSpecAutoDeliverCommand({
       type: OPENSPEC_AUTO_DELIVER_MSG.LAUNCH,
-      requestId: 'req-auto-commit',
+      requestId,
       sessionName: 'deck_demo_brain',
       changeName: 'demo-change',
       presetId: 'fast',
@@ -2036,22 +2059,33 @@ exec "${realGit}" "$@"
     await completeAcceptanceAuditFromPrompt(acceptancePrompt, {
       repairs_applied: [{ files: ['src/feature.ts'], reason: 'Implemented the product change.' }],
     });
+    // The acceptance audit turn's own idle edge. The daemon also polls for the
+    // audit result file, so it can dispatch 'commit&push' BEFORE or AFTER this
+    // edge is delivered -- on a slow runner the poll wins. Either order must
+    // reach the same state; the runtime mock above keeps the later-arriving edge
+    // from being taken for the end of the commit&push turn.
     await emitDeckDemoIdle();
     const prompt = await waitForTransportSend((text) => text === 'commit&push', SEND_WAIT_MS);
     expect(prompt).toBe('commit&push');
-    const commitMessage = 'Implement delivered feature';
+    return { remoteDir, finishCommitPushTurn };
+  }
+
+  const commitFeature = async (message: string): Promise<void> => {
     await git(['add', '--', 'src/feature.ts']);
-    await git(['commit', '-m', commitMessage]);
+    await git(['commit', '-m', message]);
     await git(['push']);
+  };
+
+  it('asks the implementation LLM to commit&push, then verifies product changes after final implementation audit PASS when opted in', async () => {
+    const { remoteDir, finishCommitPushTurn } = await driveRunToCommitPushPrompt('req-auto-commit');
+    const commitMessage = 'Implement delivered feature';
+    await commitFeature(commitMessage);
+    // The commit&push turn is over: only now does its idle edge mean "verify".
+    finishCommitPushTurn();
     await emitDeckDemoIdle();
     // verifyAutoCommitPushCompleted spawns several sequential real `git`
-    // subprocesses (rev-parse, diff, rev-list, log) before the terminal send.
-    // A hardcoded 8000ms budget (below even the file's normal SEND_WAIT_MS)
-    // raced that under full-suite/coverage CI load: the run had already
-    // reached its own conclusion, but the send observed here simply hadn't
-    // landed inside the tight window yet. Use the same generous budget every
-    // other wait in this file relies on, and give the surrounding test (which
-    // also spawns real git processes) matching headroom below.
+    // subprocesses (rev-parse, diff, rev-list, log) before the terminal send,
+    // so wait for the send itself rather than assuming how long that takes.
     const terminal = await waitForSend(
       (msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL && msg.projection?.status === 'passed',
       SEND_WAIT_MS,
@@ -2067,6 +2101,39 @@ exec "${realGit}" "$@"
       maxBuffer: 1024 * 1024,
     });
     expect(remoteLog.stdout?.toString?.() ?? '').toContain(commitMessage);
+  }, 60_000);
+
+  it('does not verify commit&push on an idle edge that arrives while the commit&push turn is still running', async () => {
+    const { finishCommitPushTurn } = await driveRunToCommitPushPrompt('req-auto-commit-stale-idle');
+    // Stale / duplicate idle edges (the acceptance turn's, a reconnect replay)
+    // while the implementation LLM is still working must not be taken for its
+    // completion: nothing is committed yet, so verifying now would wrongly end
+    // the run as incomplete.
+    await emitDeckDemoIdle();
+    await emitDeckDemoIdle();
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    expect(serverLinkMock.send.mock.calls.some((call) => (call[0] as { type?: string })?.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL)).toBe(false);
+    expect(describeOpenSpecAutoDeliverRunsForTests().map((run) => run.status)).toEqual(['commit_push']);
+
+    await commitFeature('Implement delivered feature');
+    finishCommitPushTurn();
+    await emitDeckDemoIdle();
+    const terminal = await waitForSend(
+      (msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL && msg.projection?.status === 'passed',
+      SEND_WAIT_MS,
+    );
+    expect(terminal?.projection.status).toBe('passed');
+  }, 60_000);
+
+  it('ends the run as needs_human when the commit&push turn finishes without committing the product files', async () => {
+    const { finishCommitPushTurn } = await driveRunToCommitPushPrompt('req-auto-commit-not-committed');
+    finishCommitPushTurn();
+    await emitDeckDemoIdle();
+    const terminal = await waitForSend(
+      (msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL && msg.projection?.status === 'needs_human',
+      SEND_WAIT_MS,
+    );
+    expect(terminal?.projection.terminalReason).toBe('auto_commit_push_incomplete:src/feature.ts');
   }, 60_000);
 
   it('runs the Standard preset from spec audit through implementation audit PASS', async () => {

@@ -6,26 +6,75 @@ vi.mock('../../src/util/logger.js', () => ({ default: { warn: vi.fn(), info: vi.
 
 import {
   EVENT_LOOP_WATCHDOG_IDLE_PHASE,
+  EVENT_LOOP_WATCHDOG_THRESHOLD_MS,
   getEventLoopWatchdogPhase,
+  setEventLoopWatchdogClockForTests,
   setEventLoopWatchdogPhase,
   startEventLoopWatchdog,
   stopEventLoopWatchdog,
   withEventLoopWatchdogPhase,
+  type EventLoopWatchdogClock,
 } from '../../src/daemon/event-loop-watchdog.js';
 
-/** Blocks the event loop for real: the watchdog's timer can only run afterwards. */
-function busyWait(ms: number): void {
-  const until = performance.now() + ms;
-  while (performance.now() < until) { /* spin */ }
+/**
+ * A clock the test fully controls. The watchdog compares timestamps, so the only
+ * thing that matters is WHEN time passes relative to its interval tick -- not how
+ * fast the machine is. `block` is "the event loop was busy for N ms" (time moves,
+ * no timer can run); `run` is "the loop is free for N ms" (due ticks fire, once
+ * each, exactly like an overdue Node interval). Nothing here reads the real time.
+ */
+class ManualClock implements EventLoopWatchdogClock {
+  wall = 1_000_000;
+  mono = 0;
+  private callback: (() => void) | undefined;
+  private intervalMs = 0;
+  private due = 0;
+  wallNow = (): number => this.wall;
+  monotonicNow = (): number => this.mono;
+  setInterval = (callback: () => void, ms: number): ReturnType<typeof setInterval> => {
+    this.callback = callback;
+    this.intervalMs = ms;
+    this.due = this.wall + ms;
+    return { unref: () => undefined } as unknown as ReturnType<typeof setInterval>;
+  };
+  clearInterval = (): void => { this.callback = undefined; };
+  /** The loop is busy: time passes and nothing else runs. */
+  block(ms: number): void {
+    this.wall += ms;
+    this.mono += ms;
+  }
+  /** The loop is busy just long enough for the next tick to run exactly `lateMs` late. */
+  blockUntilTickIsLate(lateMs: number): void {
+    this.block(this.due - this.wall + lateMs);
+  }
+  /** The loop is free: let `ms` pass, firing the interval whenever it is due. */
+  run(ms: number): void {
+    const end = this.wall + ms;
+    while (this.callback && this.due <= end) {
+      const at = Math.max(this.due, this.wall);
+      this.mono += at - this.wall;
+      this.wall = at;
+      this.callback();
+      this.due = this.wall + this.intervalMs;
+    }
+    this.mono += end - this.wall;
+    this.wall = end;
+  }
 }
-const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+let clock: ManualClock;
+const busyWait = (ms: number): void => clock.block(ms);
+const sleep = async (ms: number): Promise<void> => { clock.run(ms); };
 
 beforeEach(() => {
+  clock = new ManualClock();
+  setEventLoopWatchdogClockForTests(clock);
   recordStall.mockReset();
   setEventLoopWatchdogPhase(EVENT_LOOP_WATCHDOG_IDLE_PHASE);
 });
 afterEach(() => {
   stopEventLoopWatchdog();
+  setEventLoopWatchdogClockForTests(null);
 });
 
 describe('event-loop watchdog phase attribution (tsk_cd_send_spinner_console_sync)', () => {
@@ -41,7 +90,8 @@ describe('event-loop watchdog phase attribution (tsk_cd_send_spinner_console_syn
   });
 
   // The stall timer fires AFTER the blocking work returns, i.e. after the scope
-  // restored the phase. These use real timers and a real busy-wait for that reason.
+  // restored the phase. The manual clock reproduces exactly that ordering
+  // (block, then let the tick run) without depending on real time.
   it('names the scope for a stall that was really caused inside it -- and counts it once', async () => {
     startEventLoopWatchdog();
     await sleep(120);
@@ -74,6 +124,34 @@ describe('event-loop watchdog phase attribution (tsk_cd_send_spinner_console_syn
     withEventLoopWatchdogPhase('short', () => busyWait(20));
     await sleep(250);
     expect(recordStall).not.toHaveBeenCalled();
+  });
+
+  // The threshold is the whole contract of the detector, so pin both sides of it.
+  it('treats a tick exactly at the threshold as quiet and one just above it as a stall', async () => {
+    startEventLoopWatchdog();
+    await sleep(120);
+    recordStall.mockReset();
+    clock.blockUntilTickIsLate(EVENT_LOOP_WATCHDOG_THRESHOLD_MS); // the tick lands exactly at the limit
+    await sleep(250);
+    expect(recordStall).not.toHaveBeenCalled();
+    clock.blockUntilTickIsLate(EVENT_LOOP_WATCHDOG_THRESHOLD_MS + 1);
+    await sleep(250);
+    expect(recordStall).toHaveBeenCalledTimes(1);
+    expect(recordStall.mock.calls[0]![0]).toMatchObject({
+      phase: EVENT_LOOP_WATCHDOG_IDLE_PHASE,
+      stallMs: EVENT_LOOP_WATCHDOG_THRESHOLD_MS + 1,
+    });
+  });
+
+  it('a scope exactly at the threshold reports nothing; one just above reports under its own name', async () => {
+    startEventLoopWatchdog();
+    await sleep(120);
+    recordStall.mockReset();
+    withEventLoopWatchdogPhase('at-limit', () => busyWait(EVENT_LOOP_WATCHDOG_THRESHOLD_MS));
+    expect(recordStall).not.toHaveBeenCalled();
+    withEventLoopWatchdogPhase('over-limit', () => busyWait(EVENT_LOOP_WATCHDOG_THRESHOLD_MS + 1));
+    expect(recordStall).toHaveBeenCalledTimes(1);
+    expect(recordStall.mock.calls[0]![0]).toMatchObject({ phase: 'over-limit' });
   });
 
   // A nested over-threshold scope's milliseconds are already inside its

@@ -5,6 +5,37 @@ import { recordDaemonEventLoopStall } from '../util/daemon-status.js';
 const WATCHDOG_INTERVAL_MS = 100;
 const WATCHDOG_THRESHOLD_MS = 75;
 export const EVENT_LOOP_WATCHDOG_IDLE_PHASE = 'daemon-main-loop';
+/** Drift (ms) above which a tick, or a scoped block, counts as a stall. */
+export const EVENT_LOOP_WATCHDOG_THRESHOLD_MS = WATCHDOG_THRESHOLD_MS;
+
+/**
+ * Every time source the watchdog reads. Production always uses the real clock;
+ * a test can install its own so the stall arithmetic never depends on how fast
+ * or how loaded the machine running the test is.
+ */
+export interface EventLoopWatchdogClock {
+  /** Wall clock (drives the tick drift). */
+  wallNow(): number;
+  /** Monotonic clock (measures how long a scoped block ran). */
+  monotonicNow(): number;
+  setInterval(callback: () => void, ms: number): ReturnType<typeof setInterval>;
+  clearInterval(handle: ReturnType<typeof setInterval>): void;
+}
+
+const REAL_CLOCK: EventLoopWatchdogClock = {
+  wallNow: () => Date.now(),
+  monotonicNow: () => performance.now(),
+  setInterval: (callback, ms) => setInterval(callback, ms),
+  clearInterval: (handle) => clearInterval(handle),
+};
+
+let clock: EventLoopWatchdogClock = REAL_CLOCK;
+
+/** Test seam: install a controllable clock (or `null` for the real one). Stops a running watchdog first. */
+export function setEventLoopWatchdogClockForTests(next: EventLoopWatchdogClock | null): void {
+  stopEventLoopWatchdog();
+  clock = next ?? REAL_CLOCK;
+}
 
 let timer: ReturnType<typeof setInterval> | undefined;
 let expectedAt = 0;
@@ -50,11 +81,11 @@ export function withEventLoopWatchdogPhase<T>(name: string, fn: () => T): T {
   const previous = phase;
   setEventLoopWatchdogPhase(name);
   scopeDepth += 1;
-  const startedAt = performance.now();
+  const startedAt = clock.monotonicNow();
   try {
     return fn();
   } finally {
-    const durationMs = performance.now() - startedAt;
+    const durationMs = clock.monotonicNow() - startedAt;
     phase = previous;
     scopeDepth -= 1;
     if (scopeDepth === 0 && timer && durationMs > WATCHDOG_THRESHOLD_MS) {
@@ -69,10 +100,10 @@ export function withEventLoopWatchdogPhase<T>(name: string, fn: () => T): T {
 /** Always-on, allocation-light stall detector; detailed traces remain opt-in. */
 export function startEventLoopWatchdog(): void {
   if (timer) return;
-  expectedAt = Date.now() + WATCHDOG_INTERVAL_MS;
+  expectedAt = clock.wallNow() + WATCHDOG_INTERVAL_MS;
   attributedScopedStalls = [];
-  timer = setInterval(() => {
-    const now = Date.now();
+  timer = clock.setInterval(() => {
+    const now = clock.wallNow();
     const rawDriftMs = now - expectedAt;
     expectedAt = now + WATCHDOG_INTERVAL_MS;
     // Every scoped block reported since the previous tick is part of this drift.
@@ -88,7 +119,7 @@ export function startEventLoopWatchdog(): void {
 
 export function stopEventLoopWatchdog(): void {
   if (!timer) return;
-  clearInterval(timer);
+  clock.clearInterval(timer);
   timer = undefined;
   attributedScopedStalls = [];
 }
