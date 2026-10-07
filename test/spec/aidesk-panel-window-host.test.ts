@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import { LOCAL_PANEL_WINDOW_MIN_SIZE, LOCAL_PANEL_WINDOW_SIZE } from '../../shared/local-panel-window.js';
 import { AIDESK_PANEL_HOST_PLIST_KEY } from '../../shared/aidesk-product.js';
-import { buildAideskInfoPlist } from '../../scripts/build-aidesk-app.mjs';
+import { AIDESK_ICONSET_ENTRIES, AIDESK_ICON_FILE, buildAideskInfoPlist } from '../../scripts/build-aidesk-app.mjs';
 
 const root = resolve(fileURLToPath(new URL('../..', import.meta.url)));
 const read = (path: string): string => readFileSync(resolve(root, path), 'utf8');
@@ -68,5 +68,15 @@ describe('macOS panel window host', () => {
     expect(plist).toContain(`<key>${AIDESK_PANEL_HOST_PLIST_KEY}</key>\n  <true/>`);
     expect(plist).toContain('<key>NSAllowsLocalNetworking</key><true/>');
     expect(plist).not.toContain('NSAllowsArbitraryLoads');
+  });
+
+  it('the bundle has an application icon (CFBundleIconFile + an .icns made from the canonical logo), so the Dock shows aiDesk\'s mark and not the generic icon', () => {
+    const plist = buildAideskInfoPlist({ version: '2026.10.1', minimumSystemVersion: '12.3' });
+    expect(plist).toContain(`<key>CFBundleIconFile</key>\n  <string>${AIDESK_ICON_FILE}</string>`);
+    expect(AIDESK_ICONSET_ENTRIES.map(([name]) => name)).toEqual(expect.arrayContaining(['icon_16x16', 'icon_512x512@2x']));
+    expect(new Set(AIDESK_ICONSET_ENTRIES.map(([name]) => name)).size).toBe(AIDESK_ICONSET_ENTRIES.length);
+    const packager = read('scripts/build-aidesk-app.mjs');
+    expect(packager).toContain("'/usr/bin/iconutil', ['-c', 'icns'");
+    expect(packager.indexOf('buildAideskIcns(join(bundlePath')).toBeLessThan(packager.indexOf('signAideskApp(bundlePath);\n  return bundlePath'));
   });
 });

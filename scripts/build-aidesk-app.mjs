@@ -82,6 +82,7 @@ export function buildAideskInfoPlist(input) {
     ['CFBundleName', 'aiDesk.to'],
     ['CFBundleDisplayName', product.displayName],
     ['CFBundleExecutable', AIDESK_MAIN_EXECUTABLE],
+    ['CFBundleIconFile', AIDESK_ICON_FILE],
     ['CFBundlePackageType', 'APPL'],
     ['CFBundleShortVersionString', String(version)],
     ['CFBundleVersion', String(version)],
@@ -156,6 +157,38 @@ export function copyAideskBrandLogo(bundlePath) {
   mkdirSync(dirname(out), { recursive: true });
   cpSync(source, out);
   return out;
+}
+
+/** The file name (no extension) of the application icon in Contents/Resources, and the Info.plist's CFBundleIconFile value. */
+export const AIDESK_ICON_FILE = 'AppIcon';
+
+/** The images an .iconset needs, as [file name, pixel size]; every one is rendered from the one canonical brand logo. */
+export const AIDESK_ICONSET_ENTRIES = Object.freeze([
+  ['icon_16x16', 16], ['icon_16x16@2x', 32], ['icon_32x32', 32], ['icon_32x32@2x', 64],
+  ['icon_128x128', 128], ['icon_128x128@2x', 256], ['icon_256x256', 256], ['icon_256x256@2x', 512],
+  ['icon_512x512', 512], ['icon_512x512@2x', 1024],
+]);
+
+/**
+ * The application icon (.icns) from the canonical brand logo, with the system's own sips and iconutil. Without it the bundle has no icon
+ * at all: the Dock, Cmd-Tab and Finder show the generic application icon, and the panel window would look like nobody's.
+ */
+export function buildAideskIcns(outPath) {
+  const source = join(root, 'web', 'public', AIDESK_BRAND_LOGO);
+  if (!existsSync(source)) throw new Error(`brand logo not found at ${source}`);
+  const work = mkdtempSync(join(tmpdir(), 'imcodes-aidesk-icon-'));
+  try {
+    const iconset = join(work, `${AIDESK_ICON_FILE}.iconset`);
+    mkdirSync(iconset, { recursive: true });
+    for (const [name, size] of AIDESK_ICONSET_ENTRIES) {
+      sh('/usr/bin/sips', ['-z', String(size), String(size), source, '--out', join(iconset, `${name}.png`)]);
+    }
+    mkdirSync(dirname(outPath), { recursive: true });
+    sh('/usr/bin/iconutil', ['-c', 'icns', iconset, '-o', outPath]);
+    return outPath;
+  } finally {
+    rmSync(work, { recursive: true, force: true });
+  }
 }
 
 export function copyComputerUseLicense(outPath) {
@@ -418,6 +451,7 @@ export async function buildAideskApp(input) {
   }
   copyComputerUseLicense(join(bundlePath, 'Contents', 'Resources', AIDESK_THIRD_PARTY_LICENSE));
   copyAideskBrandLogo(bundlePath);
+  buildAideskIcns(join(bundlePath, 'Contents', 'Resources', `${AIDESK_ICON_FILE}.icns`));
   signAideskApp(bundlePath);
   return bundlePath;
 }
