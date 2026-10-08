@@ -8857,7 +8857,13 @@ html.native-ios-mac .chat-dl-btn {
 .server-icon:hover { background: linear-gradient(180deg, rgba(8,145,178,0.24), rgba(15,23,42,0.88)); color: #e2e8f0; border-color: rgba(34,211,238,0.42); border-radius: 11px; box-shadow: 0 0 16px rgba(34,211,238,0.16), inset 0 1px 0 rgba(255,255,255,0.06); transform: translateY(-1px); }
 .server-icon-active { background: linear-gradient(180deg, rgba(34,211,238,0.28), rgba(29,78,216,0.30)); color: #fff; border-color: rgba(34,211,238,0.68); border-radius: 11px; box-shadow: 0 0 0 1px rgba(34,211,238,0.16), 0 0 18px rgba(34,211,238,0.22), inset 0 1px 0 rgba(255,255,255,0.08); }
 .server-icon-active:hover { background: linear-gradient(180deg, rgba(34,211,238,0.32), rgba(29,78,216,0.34)); border-radius: 11px; }
-.server-icon-letter { line-height: 1; pointer-events: none; }
+.server-icon-letter { display: flex; flex-direction: column; align-items: center; justify-content: center; max-width: 100%; line-height: 1; pointer-events: none; }
+/* Servers carry a short one- or two-line label (see shared/server-icon-label.ts) instead of one letter; the room is a little taller than the utility icons. */
+.server-icon.server-icon-server { height: 40px; }
+.server-icon-line { display: block; max-width: 34px; overflow: hidden; text-overflow: clip; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.server-icon-label-lg .server-icon-line { font-size: 15px; }
+.server-icon-label-md .server-icon-line { font-size: 13px; }
+.server-icon-label-sm .server-icon-line { font-size: 9.5px; line-height: 1.15; letter-spacing: -0.2px; }
 .server-icon > .share-state-indicator { position: absolute; top: -6px; right: -7px; z-index: 2; margin-left: 0; }
 .server-icon-dot { position: absolute; bottom: 3px; right: 3px; width: 7px; height: 7px; border-radius: 50%; border: 1.5px solid #080d16; pointer-events: none; box-shadow: 0 0 8px currentColor; z-index: 1; }
 
