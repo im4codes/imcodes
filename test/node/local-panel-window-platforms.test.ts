@@ -414,7 +414,7 @@ describe('Windows adapter', () => {
     // the numbers are data, never script text taken from anywhere else
     const hostile = decodePowerShell(buildWindowsPanelWindowCommand({ kind: 'launch_host', path: 'C:\\a.exe', size: 1.9, mtimeMs: 2.9 }));
     expect(hostile).toContain('$item.Length -ne 1');
-    expect(hostile).toContain('-ne 2)');
+    expect(hostile).toContain('.ToUnixTimeMilliseconds() -ne 2)');
     // no identity to compare (none recorded): the file is still started, never with an empty comparison
     const none = decodePowerShell(buildWindowsPanelWindowCommand({ kind: 'launch_host', path: 'C:\\a.exe' }));
     expect(none).not.toContain('$item.Length');

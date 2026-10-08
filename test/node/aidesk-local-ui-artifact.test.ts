@@ -13,11 +13,12 @@ import {
   AIDESK_LOCAL_UI_MANIFEST_SCHEMA_VERSION,
   AIDESK_LOCAL_UI_VERIFIED_FILENAME,
   validateAideskLocalUiVerifiedRecord,
+  wholeMillisecondsOfNanoseconds,
   aideskLocalUiArtifactRelativeDirectory,
   aideskLocalUiExecutableFileName,
   validateAideskLocalUiManifest,
 } from '../../shared/aidesk-local-ui-artifact.js';
-import { resolveVerifiedAideskLocalUi, resolveVerifiedAideskLocalUiDetailed } from '../../src/node/aidesk-local-ui-artifact.js';
+import { lstatFileIdentity, resolveVerifiedAideskLocalUi, resolveVerifiedAideskLocalUiDetailed } from '../../src/node/aidesk-local-ui-artifact.js';
 // @ts-expect-error plain .mjs build script
 import * as artifactScript from '../../scripts/aidesk-ui-artifact.mjs';
 // @ts-expect-error plain .mjs build script
@@ -255,5 +256,34 @@ describe('the proof of a full verification (not repeated on every open)', () => 
     });
     expect(swapped).toBeUndefined();
     expect(existsSync(join(installed.directory, AIDESK_LOCAL_UI_VERIFIED_FILENAME))).toBe(false);
+  });
+});
+
+describe('a file\'s write time is the same whole milliseconds for the node and for the launch script', () => {
+  it('truncates the exact nanoseconds (like PowerShell truncates 100 ns ticks), never rounding up to the next millisecond', () => {
+    // 123 ms and 999 999 ns: a floating-point millisecond (or a Number of the nanoseconds) rounds this to ...124, truncation does not.
+    const justBelow = 1_790_000_000_123_999_999n;
+    expect(wholeMillisecondsOfNanoseconds(justBelow)).toBe(1_790_000_000_123);
+    expect(Math.floor(Number(justBelow) / 1e6)).toBe(1_790_000_000_124); // what the earlier, floating-point reduction produced
+    // The same file as Windows stores it (100 ns ticks): ticks -> ms by integer division is exactly what ToUnixTimeMilliseconds does.
+    const ticksOfFile = 17_900_000_001_239_999n; // 100 ns units since the epoch
+    expect(wholeMillisecondsOfNanoseconds(ticksOfFile * 100n)).toBe(Number(ticksOfFile / 10_000n));
+    expect(wholeMillisecondsOfNanoseconds(0n)).toBe(0);
+    expect(wholeMillisecondsOfNanoseconds(999_999n)).toBe(0);
+    expect(wholeMillisecondsOfNanoseconds(1_000_000n)).toBe(1);
+  });
+
+  it('lstat reports an integer millisecond taken from the exact stat of a real file with a sub-millisecond write time', () => {
+    const dir = temp();
+    const path = join(dir, 'f');
+    writeFileSync(path, 'x');
+    utimesSync(path, 1_790_000_000, 1_790_000_000.1239996);
+    const exact = statSync(path, { bigint: true });
+    const identity = lstatFileIdentity(path)!;
+    expect(Number.isInteger(identity.mtimeMs)).toBe(true);
+    expect(identity.mtimeMs).toBe(Number(exact.mtimeNs / 1_000_000n));
+    expect(identity.size).toBe(1);
+    expect(identity.isFile()).toBe(true);
+    expect(lstatFileIdentity(join(dir, 'missing'))).toBeUndefined();
   });
 });

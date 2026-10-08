@@ -6,7 +6,7 @@
  * does that itself. Decisions live in shared/local-panel-window.ts.
  */
 import { execFile, spawn } from 'node:child_process';
-import { existsSync, lstatSync } from 'node:fs';
+import { existsSync } from 'node:fs';
 import { win32 } from 'node:path';
 import {
   LOCAL_PANEL_APP_MODE_BROWSERS,
@@ -18,7 +18,7 @@ import {
 } from '../../shared/local-panel-window.js';
 import { AIDESK_LOCAL_UI_EXECUTABLE_NAME } from '../../shared/aidesk-product.js';
 import { resolveWindowsPowerShellExecutable, runWindowsUserSessionScript } from './aidesk-desktop-entry.js';
-import { resolveVerifiedAideskLocalUiDetailed, type VerifiedAideskLocalUi } from './aidesk-local-ui-artifact.js';
+import { lstatFileIdentity, resolveVerifiedAideskLocalUiDetailed, type VerifiedAideskLocalUi } from './aidesk-local-ui-artifact.js';
 import type { LocalPanelWindowPlatform, LocalPanelWindowProcess } from './local-panel-window.js';
 
 /** The profile sentinel the script replaces with the user's own LOCALAPPDATA path (the service does not know it). */
@@ -113,7 +113,8 @@ $p=Get-Process | Where-Object{$_.MainWindowHandle -ne 0 -and $_.MainWindowTitle 
 if($p){Report ('ok:{0}:{1}' -f $p.Id,([DateTimeOffset]$p.StartTime).ToUnixTimeMilliseconds())}else{Report 'not_found'}`;
   } else if (op.kind === 'launch_host') {
     // The verification happened in the node (and is remembered by size + last write time); here the file is only checked to still be
-    // the very file that was verified, which costs a stat, not a hash.
+    // the very file that was verified, which costs a stat, not a hash. Both sides reduce the write time the same way: whole
+    // milliseconds by truncating the 100 ns ticks (the node: integer division of the exact nanoseconds; PowerShell: ToUnixTimeMilliseconds).
     const identity = op.size !== undefined && op.mtimeMs !== undefined
       ? String.raw`
 $item=Get-Item -LiteralPath $exe
@@ -191,7 +192,7 @@ const realDeps = (): WindowsPanelWindowDeps => {
       return WINDOWS_PANEL_RESULT_RE.test(word) ? word : undefined;
     },
     nativeUi: () => resolveVerifiedAideskLocalUiDetailed(),
-    statFile: (path) => { try { const stat = lstatSync(path); return stat.isFile() ? { size: stat.size, mtimeMs: Math.floor(stat.mtimeMs) } : undefined; } catch { return undefined; } },
+    statFile: (path) => { const stat = lstatFileIdentity(path); return stat?.isFile() ? { size: stat.size, mtimeMs: stat.mtimeMs } : undefined; },
     spawnHost: (path, watchMs) => new Promise((resolve) => {
       let settled = false;
       let timer: NodeJS.Timeout | undefined;

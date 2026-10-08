@@ -20,6 +20,7 @@ import {
   aideskLocalUiVerifiedRecordCovers,
   validateAideskLocalUiManifest,
   validateAideskLocalUiVerifiedRecord,
+  wholeMillisecondsOfNanoseconds,
   type AideskLocalUiVerifiedRecord,
   type AideskLocalUiArchitecture,
   type AideskLocalUiPlatform,
@@ -46,6 +47,14 @@ export interface AideskLocalUiVerifyDeps {
   macosHelperPath: string;
 }
 
+/** `lstat` with the exact write time, reduced to whole milliseconds the way the launch script reduces it (see wholeMillisecondsOfNanoseconds). */
+export function lstatFileIdentity(path: string): { isFile(): boolean; isSymbolicLink(): boolean; size: number; mtimeMs: number } | undefined {
+  try {
+    const stat = lstatSync(path, { bigint: true });
+    return { isFile: () => stat.isFile(), isSymbolicLink: () => stat.isSymbolicLink(), size: Number(stat.size), mtimeMs: wholeMillisecondsOfNanoseconds(stat.mtimeNs) };
+  } catch { return undefined; }
+}
+
 const defaults = (): AideskLocalUiVerifyDeps => ({
   platform: process.platform,
   arch: process.arch,
@@ -56,7 +65,7 @@ const defaults = (): AideskLocalUiVerifyDeps => ({
     execFile('/usr/bin/codesign', ['--verify', '--strict', path], { timeout: 8_000 }, (error) => resolveVerified(!error));
   }),
   readFile: (path) => readFileSync(path),
-  lstat: (path) => { try { return lstatSync(path); } catch { return undefined; } },
+  lstat: lstatFileIdentity,
   hashFile: hashFileStreaming,
   writeVerifiedRecord: (path, record) => { try { writeFileSync(path, JSON.stringify(record), { mode: 0o644 }); } catch { /* cache only: a user process cannot write here */ } },
   now: () => Date.now(),

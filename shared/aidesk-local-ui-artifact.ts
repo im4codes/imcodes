@@ -126,3 +126,13 @@ export function aideskLocalUiVerifiedRecordCovers(
     && record.mtimeMs === Math.floor(current.mtimeMs)
     && record.signerSha256 === (current.trustedSignerSha256 ?? current.manifest.signerSha256);
 }
+
+/**
+ * A file's last write time as WHOLE milliseconds, computed from the exact nanosecond value with integer division: the same truncation
+ * of Windows' 100 ns ticks that PowerShell's `ToUnixTimeMilliseconds()` performs, so the node and the launch script describe a file
+ * identically. (A floating-point millisecond near 1.8e12 only resolves ~0.0002 ms, so rounding it could land on the next whole
+ * millisecond for a file whose ticks sit just below a boundary.)
+ */
+export function wholeMillisecondsOfNanoseconds(nanoseconds: bigint): number {
+  return Number(nanoseconds / 1_000_000n);
+}
