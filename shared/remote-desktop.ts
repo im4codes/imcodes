@@ -90,7 +90,7 @@ export const REMOTE_DESKTOP_DATA_MSG = {
 } as const;
 
 /** Timing of the held-input declaration; the worker side is pinned to these by the
- *  cross-layer test (kHeldInput* in native/remote-desktop-common/data_channel_constants.h). */
+ *  cross-layer test (the kHeldInput constants of the native data-channel constants header). */
 export const REMOTE_DESKTOP_HELD_INPUT = {
   /** After a key or button changes, wait this long (collapsing a burst of
    *  keystrokes into one message) before declaring what is held. */
