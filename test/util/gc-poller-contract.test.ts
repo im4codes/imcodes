@@ -76,11 +76,12 @@ describe('GC poller wiring', () => {
     });
   }
 
-  it('bind-flow.ts plist includes NODE_OPTIONS in EnvironmentVariables (macOS path)', () => {
+  it('the macOS plist registers NODE_OPTIONS in EnvironmentVariables, with the flags the install flow computes', () => {
+    // The template moved to renderMacosLaunchAgentPlist (shared by the install flow); the flags are still decided in bind-flow.ts.
+    const template = readFileSync(resolve(REPO_ROOT, 'src/util/macos-launch-agent.ts'), 'utf8');
+    expect(template).toMatch(/<key>NODE_OPTIONS<\/key>[\s\S]*input\.nodeOptions/);
     const src = readFileSync(resolve(REPO_ROOT, 'src/bind/bind-flow.ts'), 'utf8');
-    // The plist template must register NODE_OPTIONS as a <key>/<string>
-    // pair inside <key>EnvironmentVariables</key><dict>...</dict>.
-    expect(src).toMatch(/<key>NODE_OPTIONS<\/key>[\s\S]*--expose-gc/);
-    expect(src).toMatch(/<key>NODE_OPTIONS<\/key>[\s\S]*daemonFatalReportNodeOptions\(service\.stateHome, 'plain', reportExcludeEnvFlagUsable\(target\.program\)\)/);
+    expect(src).toMatch(/nodeOptions: `--expose-gc/);
+    expect(src).toMatch(/daemonFatalReportNodeOptions\(service\.stateHome, 'plain', reportExcludeEnvFlagUsable\(launchProgram\)\)/);
   });
 });
