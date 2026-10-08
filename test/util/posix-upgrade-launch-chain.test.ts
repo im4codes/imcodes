@@ -33,7 +33,15 @@ function functionBody(text: string): string {
 }
 
 let runs = 0;
-function runChain(options: { os: 'Darwin' | 'Linux'; withCli: boolean; withLauncher?: boolean }): { calls: string[]; plist: string; unit: string } {
+/**
+ * The node the generated script is told to use. The stand-in helper is a JavaScript file the script RUNS with it, so it has to be a real
+ * node on whatever machine this runs on (a Mac has no /usr/local/bin/node; a runner may keep node anywhere) and the tmp directory is
+ * realpath'd (macOS tmpdir is /var -> /private/var) so the paths the script prints are the ones compared.
+ */
+const NODE_UNDER_TEST = process.execPath;
+
+function runChain(options: { os: 'Darwin' | 'Linux'; withCli: boolean; withLauncher?: boolean; node?: string }): { calls: string[]; plist: string; unit: string } {
+  const node = options.node ?? NODE_UNDER_TEST;
   runs += 1;
   const base = join(root, `run${runs}`);
   mkdirSync(base, { recursive: true });
@@ -62,15 +70,15 @@ function runChain(options: { os: 'Darwin' | 'Linux'; withCli: boolean; withLaunc
   const body = functionBody(generated());
   const run = spawnSync('/bin/bash', ['-c', `LOG="$1"; SKIP_LAUNCH_CHAIN=0
 log() { echo "$*" >> "$LOG"; }
-NODE=/usr/local/bin/node
+NODE="$3"
 GLOBAL_ROOT="$2"
 NEW_IMCODES_SCRIPT="$GLOBAL_ROOT/imcodes/dist/src/index.js"
 NEW_LAUNCHER="$GLOBAL_ROOT/imcodes/bin/imcodes-launch.sh"
 NEW_LAUNCH_AGENT_CLI="$GLOBAL_ROOT/imcodes/dist/src/util/macos-launch-agent-cli.js"
 ${body}
-regenerate_launch_chain`, 'bash', join(base, 'chain.log'), global], {
+regenerate_launch_chain`, 'bash', join(base, 'chain.log'), global, node], {
     encoding: 'utf8',
-    env: { ...process.env, HOME: home, PATH: `${shims}:${process.env.PATH}`, NODE: process.execPath },
+    env: { ...process.env, HOME: home, PATH: `${shims}:${process.env.PATH}` },
   });
   expect(run.status).toBe(0);
   return {
@@ -81,6 +89,16 @@ regenerate_launch_chain`, 'bash', join(base, 'chain.log'), global], {
 }
 
 describeUnix('upgrade script step 3.5', () => {
+  it('runs the helper with whatever node it was given, wherever that lives (not only /usr/local/bin/node), including a path with a space', () => {
+    const odd = join(root, 'odd dir');
+    mkdirSync(odd, { recursive: true });
+    const wrapper = join(odd, 'node');
+    writeFileSync(wrapper, `#!/bin/sh\nexec "${process.execPath}" "$@"\n`, { mode: 0o755 });
+    const result = runChain({ os: 'Darwin', withCli: true, node: wrapper });
+    expect(result.calls).toHaveLength(1);
+    expect(result.calls[0]).toContain(`--node ${wrapper} `);
+  });
+
   it('macOS with a package that ships the helper: the helper decides (regenerate mode, this package\'s entry, this node); no plutil, no script', () => {
     const result = runChain({ os: 'Darwin', withCli: true });
     expect(result.calls).toHaveLength(1);
@@ -92,13 +110,15 @@ describeUnix('upgrade script step 3.5', () => {
     const result = runChain({ os: 'Darwin', withCli: false, withLauncher: true });
     expect(result.calls).toHaveLength(1);
     expect(result.calls[0]).toContain('plutil -replace ProgramArguments -json');
-    expect(result.calls[0]).toContain('/usr/local/bin/node');
+    expect(result.calls[0]).toContain(NODE_UNDER_TEST);
     expect(result.calls[0]).toContain('/dist/src/index.js');
     expect(result.calls[0]).not.toContain('imcodes-launch.sh');
   });
 
   it('Linux is unchanged: the systemd ExecStart still points at the shell supervisor when the package ships it, node + entry when not', () => {
     expect(runChain({ os: 'Linux', withCli: true }).unit).toMatch(/ExecStart=.*\/imcodes\/bin\/imcodes-launch\.sh start --foreground/u);
-    expect(runChain({ os: 'Linux', withCli: true, withLauncher: false }).unit).toMatch(/ExecStart=\/usr\/local\/bin\/node .*\/dist\/src\/index\.js start --foreground/u);
+    const direct = runChain({ os: 'Linux', withCli: true, withLauncher: false }).unit;
+    expect(direct).toContain(`ExecStart=${NODE_UNDER_TEST} `);
+    expect(direct).toMatch(/\/dist\/src\/index\.js start --foreground/u);
   });
 });
