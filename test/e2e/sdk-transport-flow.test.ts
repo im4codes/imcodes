@@ -849,7 +849,8 @@ describe('sdk transport flow e2e', () => {
     const record = mocks.store.get(SESSION_CC);
     const usage = mocks.emitted.find((e) => e.session === SESSION_CC && e.type === 'usage.update' && e.payload.model === 'haiku');
     expect(record?.modelDisplay).toBe('haiku');
-    expect(usage?.payload.contextWindow).toBe(200000);
+    // The `haiku` alias is Haiku 5.5 since Agent SDK 0.3.293, whose runtime reports a 1M window (CLAUDE_CONTEXT_WINDOWS.HAIKU_5_FAMILY).
+    expect(usage?.payload.contextWindow).toBe(1_000_000);
   });
 
   it('accepts /model opus as an alias for opus[1M] on claude-code-sdk', async () => {
