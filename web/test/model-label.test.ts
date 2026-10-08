@@ -39,6 +39,8 @@ describe('shortModelLabel', () => {
 
   it('labels Claude Fable 5 / Mythos 5 (Mythos-class) with their version', () => {
     expect(shortModelLabel('claude-fable-5')).toBe('fable-5');
+    expect(shortModelLabel('claude-haiku-5-5')).toBe('haiku-5.5');
+    expect(shortModelLabel('claude-haiku-4-5-20251001')).toBe('haiku-4.5');
     expect(shortModelLabel('claude-fable-5-20260609')).toBe('fable-5');
     expect(shortModelLabel('claude-mythos-5')).toBe('mythos-5');
     expect(shortModelLabel('fable')).toBe('fable');
