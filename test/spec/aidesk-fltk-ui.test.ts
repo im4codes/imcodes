@@ -1,8 +1,8 @@
-import { readFile } from 'node:fs/promises';
 import { describe, expect, it } from 'vitest';
+import { readSourceAsync } from '../helpers/read-source.js';
 
 const root = new URL('../../', import.meta.url);
-const source = async (path: string) => await readFile(new URL(path, root), 'utf8');
+const source = async (path: string) => await readSourceAsync(new URL(path, root));
 
 describe('aiDesk FLTK native management window', () => {
   it('uses one toolkit-neutral IPC authority and keeps browser/webview code out of the UI', async () => {

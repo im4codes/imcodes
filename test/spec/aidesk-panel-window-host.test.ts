@@ -2,16 +2,17 @@
  * The macOS aiDesk app shows the local management panel in its own window (a WKWebView), so the Dock, Cmd-Tab and the menu bar show
  * aiDesk's icon and name instead of a browser's. These checks pin the contract the native source (built only on macOS) must keep.
  */
-import { readFileSync } from 'node:fs';
+
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import { LOCAL_PANEL_WINDOW_MIN_SIZE, LOCAL_PANEL_WINDOW_SIZE } from '../../shared/local-panel-window.js';
 import { AIDESK_PANEL_HOST_PLIST_KEY } from '../../shared/aidesk-product.js';
 import { AIDESK_ICONSET_ENTRIES, AIDESK_ICON_FILE, buildAideskInfoPlist } from '../../scripts/build-aidesk-app.mjs';
+import { readSource } from '../helpers/read-source.js';
 
 const root = resolve(fileURLToPath(new URL('../..', import.meta.url)));
-const read = (path: string): string => readFileSync(resolve(root, path), 'utf8');
+const read = (path: string): string => readSource(resolve(root, path));
 
 describe('macOS panel window host', () => {
   const host = read('native/macos-remote-desktop/aidesk_panel_window.mm');

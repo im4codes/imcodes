@@ -1,4 +1,3 @@
-import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
@@ -26,11 +25,12 @@ import {
   REMOTE_DESKTOP_MSG,
 } from '../../shared/remote-desktop.js';
 import { REMOTE_DESKTOP_WORKER_IPC_VERSION } from '../../shared/remote-desktop-worker.js';
+import { readSource } from '../helpers/read-source.js';
 
 const ROOT = resolve(__dirname, '..', '..');
 
 function read(path: string): string {
-  return readFileSync(resolve(ROOT, path), 'utf8');
+  return readSource(resolve(ROOT, path));
 }
 
 /** Extracts `inline constexpr char NAME[] = "value";` (single or wrapped line). */

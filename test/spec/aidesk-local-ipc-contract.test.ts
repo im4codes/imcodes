@@ -1,4 +1,3 @@
-import { readFile } from 'node:fs/promises';
 import { describe, expect, it } from 'vitest';
 import {
   AIDESK_LOCAL_IPC,
@@ -8,11 +7,12 @@ import {
   AIDESK_LOCAL_IPC_SERVICE_STATE,
 } from '../../shared/aidesk-local-ipc.js';
 import { REMOTE_DESKTOP_LOCAL_ACTION } from '../../shared/remote-desktop-local-management.js';
+import { readSourceAsync } from '../helpers/read-source.js';
 
 const root = new URL('../../', import.meta.url);
 
 async function source(path: string): Promise<string> {
-  return await readFile(new URL(path, root), 'utf8');
+  return await readSourceAsync(new URL(path, root));
 }
 
 describe('aiDesk local IPC cross-language contract', () => {

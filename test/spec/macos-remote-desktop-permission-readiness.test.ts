@@ -1,13 +1,14 @@
 import { runNative } from './support/native-exec.js';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
+import { readSource } from '../helpers/read-source.js';
 
 const ROOT = resolve(__dirname, '..', '..');
 
 function read(path: string): string {
-  return readFileSync(resolve(ROOT, path), 'utf8');
+  return readSource(resolve(ROOT, path));
 }
 
 describe('macOS local permission readiness and onboarding contract', () => {

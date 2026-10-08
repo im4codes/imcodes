@@ -1,9 +1,10 @@
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
+import { readSource } from '../helpers/read-source.js';
 
 /**
  * Compiles and runs the Linux capability counterexamples.
@@ -63,7 +64,7 @@ describe('linux remote desktop capability probe', () => {
       // Replace the single decision point so every capability reports ready.
       // This compiles cleanly, so only behavior can catch it.
       const mutant = join(directory, 'mutant.cc');
-      const original = readFileSync(PROBE, 'utf8');
+      const original = readSource(PROBE);
       const mutated = original.replace(
         'return proven ? ReadinessState::kReady : ReadinessState::kUnavailable;',
         '(void)proven; return ReadinessState::kReady;',

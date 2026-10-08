@@ -1,5 +1,5 @@
 import { runNative } from './support/native-exec.js';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
@@ -8,13 +8,14 @@ import {
   MACOS_LOGIN_WINDOW_SCREEN_CAPTURE_KIT_MINIMUM,
   MACOS_REMOTE_DESKTOP_SESSION_TYPE,
 } from '../../src/node/macos-remote-desktop-session-type.js';
+import { readSource } from '../helpers/read-source.js';
 
 const ROOT = resolve(__dirname, '..', '..');
 const NATIVE = resolve(ROOT, 'native/macos-remote-desktop');
 const COMMON = resolve(ROOT, 'native/remote-desktop-common');
 
 function read(path: string): string {
-  return readFileSync(resolve(ROOT, path), 'utf8');
+  return readSource(resolve(ROOT, path));
 }
 
 describe('macOS LoginWindow capture supervision', () => {

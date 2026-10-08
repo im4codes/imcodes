@@ -1,14 +1,15 @@
-import { readdirSync, readFileSync } from 'node:fs';
+import { readdirSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
+import { readSource } from '../helpers/read-source.js';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 const COMMON = resolve(ROOT, 'native', 'remote-desktop-common');
 const MACOS = resolve(ROOT, 'native', 'macos-remote-desktop');
 
 function source(name: string): string {
-  return readFileSync(resolve(COMMON, name), 'utf8');
+  return readSource(resolve(COMMON, name));
 }
 
 describe('remote-desktop common native target', () => {
@@ -40,7 +41,7 @@ describe('remote-desktop common native target', () => {
     );
     const macosSources = readdirSync(MACOS)
       .filter((name) => /\.(?:cc|h|mm)$/.test(name))
-      .map((name) => ({ name, text: readFileSync(resolve(MACOS, name), 'utf8') }));
+      .map((name) => ({ name, text: readSource(resolve(MACOS, name)) }));
     for (const { name, text } of macosSources) {
       for (const header of commonHeaders) {
         expect(

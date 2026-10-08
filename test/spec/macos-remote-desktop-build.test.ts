@@ -1,24 +1,18 @@
 import { execFileSync } from 'node:child_process';
 import { runNative, runNativeOrThrow } from './support/native-exec.js';
 import { spawn } from 'node:child_process';
-import {
-  chmodSync,
-  mkdtempSync,
-  readFileSync,
-  rmSync,
-  statSync,
-  writeFileSync,
-} from 'node:fs';
+import { chmodSync, mkdtempSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
+import { readSource } from '../helpers/read-source.js';
 
 const ROOT = resolve(__dirname, '..', '..');
 const NATIVE = resolve(ROOT, 'native', 'macos-remote-desktop');
 const SCRIPT = resolve(ROOT, 'scripts', 'macos-remote-desktop-build-spike.sh');
 
 function read(path: string): string {
-  return readFileSync(resolve(ROOT, path), 'utf8');
+  return readSource(resolve(ROOT, path));
 }
 
 /**

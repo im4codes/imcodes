@@ -1,13 +1,14 @@
 import { runNative } from './support/native-exec.js';
-import { readFileSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { resolve, join } from 'node:path';
 import { describe, expect, it } from 'vitest';
+import { readSource } from '../helpers/read-source.js';
 
 const ROOT = resolve(__dirname, '..', '..');
 const SCRIPT_PATH = resolve(ROOT, 'scripts/macos-remote-desktop-build-spike.sh');
 const COMMON = resolve(ROOT, 'native', 'remote-desktop-common');
-const script = readFileSync(SCRIPT_PATH, 'utf8');
+const script = readSource(SCRIPT_PATH);
 
 /**
  * The two seams the overlay patch rewrites, reproduced exactly as they appear
@@ -95,7 +96,7 @@ async function runOverlaySection(componentsOnly: boolean, autoUnlockVerify = fal
     return {
       status: run.status,
       stderr: `${run.stdout}\n${run.stderr}`,
-      rootBuild: readFileSync(rootBuild, 'utf8'),
+      rootBuild: readSource(rootBuild),
     };
   } finally {
     rmSync(directory, { recursive: true, force: true });
@@ -126,7 +127,7 @@ const AUTO_UNLOCK_GROUP_LABEL = `//${scriptLabel('AUTO_UNLOCK_GROUP_LABEL')}`;
 
 describe('macOS build spike root BUILD.gn overlay', () => {
   it('copies the exact common foundation manifest into a clean overlay', async () => {
-    const commonBuild = readFileSync(resolve(COMMON, 'BUILD.gn'), 'utf8');
+    const commonBuild = readSource(resolve(COMMON, 'BUILD.gn'));
     const declared = [...new Set(
       [...commonBuild.matchAll(/"([^"\n]+\.(?:cc|h))"/gu)].map((match) => match[1]!),
     )].sort();
@@ -268,7 +269,7 @@ describe('macOS build spike root BUILD.gn overlay', () => {
       });
       expect(run.status).not.toBe(0);
       expect(run.stderr).toContain('inject no targets at all');
-      expect(readFileSync(rootBuild, 'utf8')).toBe(ROOT_BUILD_FIXTURE);
+      expect(readSource(rootBuild)).toBe(ROOT_BUILD_FIXTURE);
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }

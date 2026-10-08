@@ -1,8 +1,9 @@
 import { runNativeOrThrow } from './support/native-exec.js';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
+import { readSource } from '../helpers/read-source.js';
 
 const ROOT = resolve(import.meta.dirname, '../..');
 
@@ -35,10 +36,7 @@ describe('macOS graphical-session monitor', () => {
   );
 
   it('binds the production source to the complete lifecycle notification set', async () => {
-    const source = readFileSync(
-      join(ROOT, 'native/macos-remote-desktop/macos_session_monitor.mm'),
-      'utf8',
-    );
+    const source = readSource(join(ROOT, 'native/macos-remote-desktop/macos_session_monitor.mm'));
     for (const token of [
       'NSWorkspaceWillSleepNotification',
       'NSWorkspaceDidWakeNotification',
@@ -51,10 +49,7 @@ describe('macOS graphical-session monitor', () => {
       expect(source).toContain(token);
     }
     expect(source).toContain('event_generation != generation_');
-    const build = readFileSync(
-      join(ROOT, 'native/macos-remote-desktop/BUILD.gn'),
-      'utf8',
-    );
+    const build = readSource(join(ROOT, 'native/macos-remote-desktop/BUILD.gn'));
     expect(build).toContain('source_set("macos_session_monitor")');
     expect(build).toContain('"macos_session_monitor.mm"');
     expect(build).toContain('"AppKit.framework"');

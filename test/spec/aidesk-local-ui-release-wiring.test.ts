@@ -4,13 +4,14 @@
  * imported the signing certificate), uploaded as dist-node-exe/aidesk-local-ui/**, gated in the server image (manifest verify + the three
  * files the server serves), and refreshed on installed nodes by the node itself -- never part of the transactional self-upgrade set.
  */
-import { readFileSync } from 'node:fs';
+
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
+import { readSource } from '../helpers/read-source.js';
 
 const root = resolve(fileURLToPath(new URL('../..', import.meta.url)));
-const read = (path: string): string => readFileSync(resolve(root, path), 'utf8');
+const read = (path: string): string => readSource(resolve(root, path));
 
 describe('native aiDesk window release wiring', () => {
   const action = read('.github/actions/build-aidesk-ui/action.yml');

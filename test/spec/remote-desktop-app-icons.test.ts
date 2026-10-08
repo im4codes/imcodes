@@ -1,4 +1,4 @@
-import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
+import { existsSync, readdirSync, statSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import sharp from 'sharp';
@@ -11,6 +11,7 @@ import {
   REMOTE_DESKTOP_APP_MASKABLE_SAFE_ZONE_RATIO,
   buildRemoteDesktopAppManifest,
 } from '../../shared/remote-desktop-app.js';
+import { readSource } from '../helpers/read-source.js';
 
 const root = resolve(fileURLToPath(new URL('../..', import.meta.url)));
 const iconDir = join(root, REMOTE_DESKTOP_APP_ICON_SOURCE_DIR);
@@ -32,7 +33,7 @@ describe('the installable remote desktop app: icons', () => {
   });
 
   it('are bound to the official logo: the recorded hash is the hash of the logo they were rendered from', () => {
-    expect(readFileSync(join(iconDir, REMOTE_DESKTOP_APP_ICON_SOURCE_HASH_FILE), 'utf8').trim()).toBe(logoSha256());
+    expect(readSource(join(iconDir, REMOTE_DESKTOP_APP_ICON_SOURCE_HASH_FILE)).trim()).toBe(logoSha256());
   });
 
   it.each(REMOTE_DESKTOP_APP_ICON_FILES.map((icon) => [icon.file, icon.size] as const))('%s is a square PNG of exactly %i px', async (file, size) => {

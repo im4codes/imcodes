@@ -1,10 +1,11 @@
-import { readdirSync, readFileSync } from 'node:fs';
+import { readdirSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 
 import { libwebrtcSdkTarget } from '../../scripts/libwebrtc-sdk-targets.mjs';
+import { readSource } from '../helpers/read-source.js';
 
-const consumer = readFileSync('native/macos-remote-desktop/build-worker-from-sdk.sh', 'utf8');
-const componentsBuild = readFileSync('native/macos-remote-desktop/BUILD.gn', 'utf8');
+const consumer = readSource('native/macos-remote-desktop/build-worker-from-sdk.sh');
+const componentsBuild = readSource('native/macos-remote-desktop/BUILD.gn');
 
 /**
  * The consumer is what makes the SDK worth producing: it builds the shipped
@@ -131,14 +132,14 @@ describe('macOS remote-desktop consumer', () => {
     const needsArc = /__weak|__bridge_transfer|__autoreleasing|requires Objective-C ARC/u;
     const wronglyCompiled = readdirSync(directory)
       .filter((name) => name.endsWith('.mm') && !arc.has(name) && !excluded.has(name))
-      .filter((name) => needsArc.test(readFileSync(`${directory}/${name}`, 'utf8')));
+      .filter((name) => needsArc.test(readSource(`${directory}/${name}`)));
     expect(wronglyCompiled, 'needs ARC but build-worker-from-sdk.sh compiles it without: add to BUILD.gn (with -fobjc-arc) or to EXCLUDED_SOURCES').toEqual([]);
     // every source of the aiDesk app build that the worker does not own must be excluded from the worker build
-    const agent = JSON.parse(readFileSync(`${directory}/aidesk-agent-build.json`, 'utf8')) as { sources: string[] };
+    const agent = JSON.parse(readSource(`${directory}/aidesk-agent-build.json`)) as { sources: string[] };
     const appOnly = agent.sources.filter((name) => name.endsWith('.mm') && !arc.has(name));
     expect(appOnly.filter((name) => !excluded.has(name))).toEqual([]);
     expect(appOnly).toContain('aidesk_panel_window.mm');
     // and the app-only source says itself that it needs ARC, so no other path can compile it silently wrong
-    expect(readFileSync(`${directory}/aidesk_panel_window.mm`, 'utf8')).toContain('#error "aidesk_panel_window.mm requires Objective-C ARC"');
+    expect(readSource(`${directory}/aidesk_panel_window.mm`)).toContain('#error "aidesk_panel_window.mm requires Objective-C ARC"');
   });
 });

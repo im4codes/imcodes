@@ -1,11 +1,12 @@
 import { runNative } from './support/native-exec.js';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
+import { readSource } from '../helpers/read-source.js';
 
 const ROOT = resolve(__dirname, '..', '..');
-const read = (path: string): string => readFileSync(resolve(ROOT, path), 'utf8');
+const read = (path: string): string => readSource(resolve(ROOT, path));
 
 describe('macOS generation-owned virtual display', () => {
   const header = read('native/macos-remote-desktop/macos_virtual_display_adapter.h');

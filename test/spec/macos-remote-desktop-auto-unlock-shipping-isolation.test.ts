@@ -13,9 +13,10 @@
  * standalone clang did not reproduce.
  */
 import { runNativeOrThrow } from './support/native-exec.js';
-import { readFileSync } from 'node:fs';
+
 import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
+import { readSource } from '../helpers/read-source.js';
 
 const BUILD_GN = resolve(__dirname, '../../native/macos-remote-desktop/BUILD.gn');
 
@@ -56,7 +57,7 @@ const isAutoUnlock = (name: string): boolean =>
   name.startsWith('macos_auto_unlock') || name === 'aiDeskAutoUnlock';
 
 describe('macOS auto-unlock shipping isolation', () => {
-  const source = readFileSync(BUILD_GN, 'utf8');
+  const source = readSource(BUILD_GN);
   const graph = parseTargets(source);
 
   it('parses a non-trivial graph (guards against a vacuous pass)', async () => {
@@ -80,7 +81,7 @@ describe('macOS auto-unlock shipping isolation', () => {
   });
 
   it('a default build purges any stale auto-unlock bundle from a reused out dir', async () => {
-    const spike = readFileSync(resolve(__dirname, '../../scripts/macos-remote-desktop-build-spike.sh'), 'utf8');
+    const spike = readSource(resolve(__dirname, '../../scripts/macos-remote-desktop-build-spike.sh'));
     // Ninja keeps outputs of targets that left the graph. Without an explicit
     // purge, a bundle from an earlier verification run survives in a reused out
     // dir and reads as a shipped artifact to anything checking existence.
@@ -111,7 +112,7 @@ describe('macOS auto-unlock shipping isolation', () => {
   ] as const;
 
   it.each(CONTRACT_SURFACES)('%s claims nothing that contradicts non-shipping', async (relative) => {
-    const text = readFileSync(resolve(__dirname, '../../', relative), 'utf8').toLowerCase();
+    const text = readSource(resolve(__dirname, '../../', relative)).toLowerCase();
     for (const phrase of CONTRADICTORY) {
       expect(text, `${relative} still claims: "${phrase}"`).not.toContain(phrase);
     }
@@ -149,10 +150,7 @@ describe('macOS auto-unlock shipping isolation', () => {
   });
 
   it('the worker no longer carries any auto-unlock call site', async () => {
-    const worker = readFileSync(
-      resolve(__dirname, '../../native/macos-remote-desktop/macos_remote_desktop_worker_main.mm'),
-      'utf8',
-    );
+    const worker = readSource(resolve(__dirname, '../../native/macos-remote-desktop/macos_remote_desktop_worker_main.mm'));
     expect(worker).not.toContain('AutoUnlock');
     expect(worker).not.toContain('macos_auto_unlock');
   });

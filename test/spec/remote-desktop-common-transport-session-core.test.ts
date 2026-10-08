@@ -1,10 +1,11 @@
 import { runNative } from './support/native-exec.js';
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
+import { readSource } from '../helpers/read-source.js';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const COMMON = resolve(ROOT, "native", "remote-desktop-common");
@@ -23,7 +24,7 @@ const SANITIZER_FLAGS = [
 ];
 
 function source(name: string): string {
-  return readFileSync(resolve(COMMON, name), "utf8");
+  return readSource(resolve(COMMON, name));
 }
 
 async function findCompiler(): Promise<string> {
@@ -148,7 +149,7 @@ describe("remote-desktop common transport/session core contract", () => {
       `(?:const (?:imcodes::rd::)?Authority (\\w+)\\s*=\\s*)?(?:imcodes::rd::)?BindOmittedAuthorityFields\\(authority_, ${method.param}\\)`,
     ).exec(method.body);
 
-    const files = { windows: readFileSync(WINDOWS_PEER, "utf8"), macos: readFileSync(MACOS_WORKER, "utf8") };
+    const files = { windows: readSource(WINDOWS_PEER), macos: readSource(MACOS_WORKER) };
     // The paths that must bind today. A new path is covered by the class rule
     // below without editing this table; removing or unbinding one of these fails.
     const intended: Record<keyof typeof files, Record<string, RegExp>> = {
@@ -209,7 +210,7 @@ describe("remote-desktop common transport/session core contract", () => {
   });
 
   it("pins every requested executable counterfactual", async () => {
-    const counterfactual = readFileSync(COUNTERFACTUAL, "utf8").replace(
+    const counterfactual = readSource(COUNTERFACTUAL).replace(
       /"\s*"/g,
       "",
     );

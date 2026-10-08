@@ -14,9 +14,10 @@ import { LOCAL_PANEL_WINDOW_MIN_SIZE, LOCAL_PANEL_WINDOW_SIZE, LOCAL_PANEL_WINDO
 import * as fetchSdk from '../../scripts/fetch-webview2-sdk.mjs';
 import { AIDESK_FAVICON_DATA_URI, AIDESK_FAVICON_SOURCE_SHA256 } from '../../shared/aidesk-favicon-generated.js';
 import { AIDESK_HICOLOR_SIZES, AIDESK_ICO_SIZES, AIDESK_LOGO_SOURCE, logoSha256, packIco, renderAideskIcon } from '../../scripts/aidesk-icon.mjs';
+import { readSource } from '../helpers/read-source.js';
 
 const root = resolve(fileURLToPath(new URL('../..', import.meta.url)));
-const read = (path: string): string => readFileSync(resolve(root, path), 'utf8');
+const read = (path: string): string => readSource(resolve(root, path));
 const temps: string[] = [];
 const temp = (): string => { const dir = mkdtempSync(join(tmpdir(), 'aidesk-host-test-')); temps.push(dir); return dir; };
 afterEach(() => { for (const dir of temps.splice(0)) rmSync(dir, { recursive: true, force: true }); });
@@ -130,7 +131,7 @@ describe('Windows panel window host source', () => {
 });
 
 describe('WebView2 SDK pin', () => {
-  const pin = fetchSdk.parseWebview2Lock(readFileSync(fetchSdk.WEBVIEW2_SDK_LOCK, 'utf8'));
+  const pin = fetchSdk.parseWebview2Lock(readSource(fetchSdk.WEBVIEW2_SDK_LOCK));
 
   it('names one https package version with a sha256 and exactly the files the build uses', () => {
     expect(pin.name).toBe('Microsoft.Web.WebView2');
@@ -138,7 +139,7 @@ describe('WebView2 SDK pin', () => {
     expect(pin.sha256).toMatch(/^[a-f0-9]{64}$/u);
     expect(pin.files).toEqual(expect.arrayContaining(['build/native/include/WebView2.h', 'build/native/x64/WebView2LoaderStatic.lib', 'LICENSE.txt']));
     const bad = (mutate: (value: Record<string, unknown>) => void): string => {
-      const lock = JSON.parse(readFileSync(fetchSdk.WEBVIEW2_SDK_LOCK, 'utf8')) as { package: Record<string, unknown> };
+      const lock = JSON.parse(readSource(fetchSdk.WEBVIEW2_SDK_LOCK)) as { package: Record<string, unknown> };
       mutate(lock.package);
       return JSON.stringify(lock);
     };

@@ -1,6 +1,7 @@
-import { readFileSync, readdirSync, statSync } from 'node:fs';
+import { readdirSync, statSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
+import { readSource } from '../helpers/read-source.js';
 
 // The platform sessions (macOS .mm, Linux .cc, Windows) are compiled only by the
 // platform CI jobs, never by the unit suites. A call from one of them to a member
@@ -67,12 +68,12 @@ const CORES = [
 describe('native platform sessions only call the public API of the common cores', () => {
   for (const { instance, header, className } of CORES) {
     it(`every ${instance}.Method() in a platform file is public on ${className}`, () => {
-      const exposed = publicMemberNames(readFileSync(join(COMMON, header), 'utf8'), className);
+      const exposed = publicMemberNames(readSource(join(COMMON, header)), className);
       expect(exposed.size).toBeGreaterThan(5);
       const offenders: string[] = [];
       let checked = 0;
       for (const file of platformSources()) {
-        for (const method of callsOn(readFileSync(file, 'utf8'), instance)) {
+        for (const method of callsOn(readSource(file), instance)) {
           checked += 1;
           if (!exposed.has(method)) offenders.push(`${file.slice(ROOT.length + 1)}: ${instance}.${method}()`);
         }
@@ -84,10 +85,10 @@ describe('native platform sessions only call the public API of the common cores'
 
   it('the macOS worker only calls the public API of MacosRemoteDesktopSession', () => {
     const exposed = publicMemberNames(
-      readFileSync(join(NATIVE, 'macos-remote-desktop', 'macos_remote_desktop_session.h'), 'utf8'),
+      readSource(join(NATIVE, 'macos-remote-desktop', 'macos_remote_desktop_session.h')),
       'MacosRemoteDesktopSession',
     );
-    const worker = readFileSync(join(NATIVE, 'macos-remote-desktop', 'macos_remote_desktop_worker_main.mm'), 'utf8');
+    const worker = readSource(join(NATIVE, 'macos-remote-desktop', 'macos_remote_desktop_worker_main.mm'));
     const called = callsOn(worker, 'session_', '->');
     expect(called.size).toBeGreaterThan(0);
     expect([...called].filter((method) => !exposed.has(method))).toEqual([]);
@@ -95,7 +96,7 @@ describe('native platform sessions only call the public API of the common cores'
   });
 
   it('sees the held-input reconcile that the platform sessions rely on as public', () => {
-    const exposed = publicMemberNames(readFileSync(join(COMMON, 'session_core.h'), 'utf8'), 'SessionCore');
+    const exposed = publicMemberNames(readSource(join(COMMON, 'session_core.h')), 'SessionCore');
     expect(exposed.has('ReconcileHeldInput')).toBe(true);
     expect(exposed.has('HoldsInput')).toBe(true);
   });

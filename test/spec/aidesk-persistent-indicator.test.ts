@@ -1,20 +1,20 @@
-import { readFile } from 'node:fs/promises';
 import { describe, expect, it } from 'vitest';
 import { AIDESK_PRODUCT_NAME } from '../../shared/aidesk-product.js';
 import { REMOTE_DESKTOP_LOCAL_WORKER_MSG } from '../../shared/remote-desktop-local-management.js';
+import { readSourceAsync } from '../helpers/read-source.js';
 
 describe('aiDesk persistent local affordance', () => {
   it('binds native surfaces to the shared product name', async () => {
-    const header = await readFile('native/remote-desktop-common/aidesk_product_name.h', 'utf8');
+    const header = await readSourceAsync('native/remote-desktop-common/aidesk_product_name.h');
     expect(header).toContain(`"${AIDESK_PRODUCT_NAME}"`);
   });
 
   it('binds the service-owned pause frame across TypeScript and native workers', async () => {
-    const header = await readFile('native/remote-desktop-common/local_management_types.h', 'utf8');
+    const header = await readSourceAsync('native/remote-desktop-common/local_management_types.h');
     expect(header).toContain(`"${REMOTE_DESKTOP_LOCAL_WORKER_MSG.ACCESS_STATE}"`);
   });
   it('keeps Windows visible at zero viewers and distinguishes idle/view/control colors', async () => {
-    const source = await readFile('native/windows-remote-desktop/local_indicator.cc', 'utf8');
+    const source = await readSourceAsync('native/windows-remote-desktop/local_indicator.cc');
     const refresh = source.slice(source.indexOf('void LocalIndicator::RefreshWindow()'), source.indexOf('void LocalIndicator::AnchorToCorner'));
     expect(refresh).not.toContain('SW_HIDE');
     expect(refresh).toContain('SW_SHOWNOACTIVATE');
@@ -30,8 +30,8 @@ describe('aiDesk persistent local affordance', () => {
   });
 
   it('starts Linux with an idle edge corner and returns to it after sessions', async () => {
-    const main = await readFile('native/linux-remote-desktop/linux_remote_desktop_worker_main.cc', 'utf8');
-    const source = await readFile('native/linux-remote-desktop/linux_x11_backend.cc', 'utf8');
+    const main = await readSourceAsync('native/linux-remote-desktop/linux_remote_desktop_worker_main.cc');
+    const source = await readSourceAsync('native/linux-remote-desktop/linux_x11_backend.cc');
     expect(main).toContain('adapters->disclosure().Show(0, 0)');
     expect(source).toContain('kIdleDisclosureWidth = 54');
     expect(source).toContain('(void)Show(0, 0)');
@@ -46,8 +46,8 @@ describe('aiDesk persistent local affordance', () => {
   });
 
   it('keeps the signed macOS app in Dock and uses background launch without opening the panel', async () => {
-    const app = await readFile('native/macos-remote-desktop/aidesk_agent_main.mm', 'utf8');
-    const build = await readFile('scripts/build-aidesk-app.mjs', 'utf8');
+    const app = await readSourceAsync('native/macos-remote-desktop/aidesk_agent_main.mm');
+    const build = await readSourceAsync('scripts/build-aidesk-app.mjs');
     expect(app).toContain('NSApplicationActivationPolicyRegular');
     expect(app).toContain('--aidesk-background');
     expect(app).toContain('applicationShouldHandleReopen');
@@ -59,12 +59,8 @@ describe('aiDesk persistent local affordance', () => {
   });
 
   it('keeps compact badges, cap and edge-direction arrows shared across platforms', async () => {
-    const shared = await readFile(
-      'native/remote-desktop-common/local_indicator_visuals.h', 'utf8',
-    );
-    const mac = await readFile(
-      'native/macos-remote-desktop/macos_local_disclosure.mm', 'utf8',
-    );
+    const shared = await readSourceAsync('native/remote-desktop-common/local_indicator_visuals.h');
+    const mac = await readSourceAsync('native/macos-remote-desktop/macos_local_disclosure.mm');
     expect(shared).toContain('kLocalIndicatorBadgeLimit = 9;');
     expect(shared).toContain('if (connections == 0) return {}');
     expect(shared).toContain('return "9+"');

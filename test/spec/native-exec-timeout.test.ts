@@ -1,9 +1,10 @@
-import { readdirSync, readFileSync } from 'node:fs';
+import { readdirSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { getCurrentTest } from 'vitest/suite';
 
 import { NATIVE_COMPILE_TEST_TIMEOUT_MS } from './support/native-exec.js';
+import { readSource } from '../helpers/read-source.js';
 
 const SPEC_DIRS = ['test/spec', 'test/node', 'test/util'].map((dir) => resolve(__dirname, '..', '..', dir));
 
@@ -18,7 +19,7 @@ describe('native compile specs are not held to the default 20 s per-test timeout
     const offenders: string[] = [];
     for (const dir of SPEC_DIRS) {
       for (const name of readdirSync(dir).filter((entry) => entry.endsWith('.test.ts') && entry !== 'native-exec-timeout.test.ts')) {
-        const source = readFileSync(join(dir, name), 'utf8');
+        const source = readSource(join(dir, name));
         const compilesNatively = /-fsanitize|(?:spawnSync|execFileSync|execFile|runNative|runNativeOrThrow)\(\s*['"`](?:xcrun|clang\+\+|clang|g\+\+|\/usr\/bin\/clang\+\+)['"`]/.test(source);
         if (!compilesNatively) continue;
         const importsHelper = /support\/native-exec/.test(source);

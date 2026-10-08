@@ -1,42 +1,15 @@
-import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
+import { readSource } from '../helpers/read-source.js';
 
-const policyHeader = readFileSync(
-  new URL('../../native/windows-remote-desktop/account_shell_policy.h', import.meta.url),
-  'utf8',
-);
-const policySource = readFileSync(
-  new URL('../../native/windows-remote-desktop/account_shell_policy.cc', import.meta.url),
-  'utf8',
-);
-const shellHeader = readFileSync(
-  new URL('../../native/windows-remote-desktop/account_shell.h', import.meta.url),
-  'utf8',
-);
-const shellSource = readFileSync(
-  new URL('../../native/windows-remote-desktop/account_shell.cc', import.meta.url),
-  'utf8',
-);
-const shellUi = readFileSync(
-  new URL('../../native/windows-remote-desktop/account_shell_ui.cc', import.meta.url),
-  'utf8',
-);
-const shellMain = readFileSync(
-  new URL('../../native/windows-remote-desktop/account_shell_main.cc', import.meta.url),
-  'utf8',
-);
-const buildScript = readFileSync(
-  new URL('../../native/windows-remote-desktop/build-account-shell.ps1', import.meta.url),
-  'utf8',
-);
-const selftest = readFileSync(
-  new URL('../../native/windows-remote-desktop/account_shell_policy_selftest.cc', import.meta.url),
-  'utf8',
-);
-const guestLinksIntegration = readFileSync(
-  new URL('../../server/test/remote-desktop-guest-links.integration.test.ts', import.meta.url),
-  'utf8',
-);
+const policyHeader = readSource(new URL('../../native/windows-remote-desktop/account_shell_policy.h', import.meta.url));
+const policySource = readSource(new URL('../../native/windows-remote-desktop/account_shell_policy.cc', import.meta.url));
+const shellHeader = readSource(new URL('../../native/windows-remote-desktop/account_shell.h', import.meta.url));
+const shellSource = readSource(new URL('../../native/windows-remote-desktop/account_shell.cc', import.meta.url));
+const shellUi = readSource(new URL('../../native/windows-remote-desktop/account_shell_ui.cc', import.meta.url));
+const shellMain = readSource(new URL('../../native/windows-remote-desktop/account_shell_main.cc', import.meta.url));
+const buildScript = readSource(new URL('../../native/windows-remote-desktop/build-account-shell.ps1', import.meta.url));
+const selftest = readSource(new URL('../../native/windows-remote-desktop/account_shell_policy_selftest.cc', import.meta.url));
+const guestLinksIntegration = readSource(new URL('../../server/test/remote-desktop-guest-links.integration.test.ts', import.meta.url));
 
 function functionBody(source: string, signature: string): string {
   const start = source.indexOf(signature);

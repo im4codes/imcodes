@@ -10,6 +10,7 @@ import {
   validateMacosLibwebrtcNotices,
 } from '../../scripts/libwebrtc-sdk-artifacts.mjs';
 import { PINNED_LIBWEBRTC_REVISION } from '../../shared/remote-desktop-native-pins.js';
+import { readSourceAsync } from '../helpers/read-source.js';
 
 const execute = promisify(execFile);
 const repositoryRoot = resolve(import.meta.dirname, '../..');
@@ -56,7 +57,7 @@ describe('macOS pinned libwebrtc notices', () => {
       ...MACOS_LIBWEBRTC_NOTICE_TARGETS.flatMap((target) => ['--target', target]),
       '--output', value.output,
     ]);
-    const notices = await readFile(value.output, 'utf8');
+    const notices = await readSourceAsync(value.output);
     expect(validateMacosLibwebrtcNotices(notices, PINNED_LIBWEBRTC_REVISION)).toBe(notices);
     expect(notices).toContain('libraries=webrtc,example');
     expect(notices).not.toContain('# imcodes_macos_remote_desktop');
@@ -88,7 +89,7 @@ describe('macOS pinned libwebrtc notices', () => {
       '--output', value.output,
     ];
     await execute('python3', args);
-    const arm = await readFile(value.output, 'utf8');
+    const arm = await readSourceAsync(value.output);
     const x64 = join(value.root, 'x64.md');
     const merged = join(value.root, 'merged.md');
     await writeFile(x64, arm
@@ -100,11 +101,11 @@ describe('macOS pinned libwebrtc notices', () => {
       '--merge-input', x64,
       '--output', merged,
     ]);
-    const notices = await readFile(merged, 'utf8');
+    const notices = await readSourceAsync(merged);
     expect(validateMacosLibwebrtcNotices(notices, PINNED_LIBWEBRTC_REVISION)).toBe(notices);
     expect(notices).toContain('libraries=webrtc,example,nasm');
 
-    await writeFile(x64, (await readFile(x64, 'utf8')).replace('Example license', 'conflict'));
+    await writeFile(x64, (await readSourceAsync(x64)).replace('Example license', 'conflict'));
     await expect(execute('python3', [
       generator,
       '--merge-input', value.output,
@@ -114,7 +115,7 @@ describe('macOS pinned libwebrtc notices', () => {
   });
 
   it('keeps notice generation in the native build gate', async () => {
-    const script = await readFile(join(repositoryRoot, 'scripts/macos-remote-desktop-build-spike.sh'), 'utf8');
+    const script = await readSourceAsync(join(repositoryRoot, 'scripts/macos-remote-desktop-build-spike.sh'));
     expect(script).toContain('generate-macos-libwebrtc-notices.py');
     expect(script).toContain('THIRD_PARTY_NOTICES.webrtc.md');
     for (const target of MACOS_LIBWEBRTC_NOTICE_TARGETS) {

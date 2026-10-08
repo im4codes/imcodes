@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
@@ -20,6 +20,7 @@ import {
   REMOTE_DESKTOP_MACOS_MANIFEST_FILENAME,
   validateRemoteDesktopWorkerReleaseManifest,
 } from '../../shared/remote-desktop-worker.js';
+import { readSourceAsync } from '../helpers/read-source.js';
 
 const TEAM_ID = 'M675E26Q67';
 const SIGNING_IDENTITY = 'A'.repeat(40);
@@ -213,7 +214,7 @@ describe('macOS remote-desktop release driver', () => {
   it('emits a manifest the shared strict validator accepts', async () => {
     const { result, artifactRoot } = await runDriver();
     const written = JSON.parse(
-      await readFile(join(artifactRoot, REMOTE_DESKTOP_MACOS_MANIFEST_FILENAME), 'utf8'),
+      await readSourceAsync(join(artifactRoot, REMOTE_DESKTOP_MACOS_MANIFEST_FILENAME)),
     );
     expect(written).toEqual(JSON.parse(JSON.stringify(result.manifest)));
     const validated = validateRemoteDesktopWorkerReleaseManifest(written, {

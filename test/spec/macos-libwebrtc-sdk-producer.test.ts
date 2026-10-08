@@ -1,4 +1,3 @@
-import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 
 import {
@@ -6,9 +5,10 @@ import {
   PINNED_LIBWEBRTC_REVISION,
 } from '../../scripts/remote-desktop-worker-artifacts.mjs';
 import { libwebrtcSdkTarget } from '../../scripts/libwebrtc-sdk-targets.mjs';
+import { readSource } from '../helpers/read-source.js';
 
-const producer = readFileSync('native/macos-remote-desktop/build-libwebrtc-sdk.sh', 'utf8');
-const registry = readFileSync('scripts/libwebrtc-sdk-targets.mjs', 'utf8');
+const producer = readSource('native/macos-remote-desktop/build-libwebrtc-sdk.sh');
+const registry = readSource('scripts/libwebrtc-sdk-targets.mjs');
 const NOTICES_GENERATOR = 'scripts/generate-macos-libwebrtc-notices.py';
 
 /**
@@ -201,7 +201,7 @@ describe('macOS libwebrtc SDK producer', () => {
     // drift -- the SDK would compile for one floor while the product promised
     // another, and every component's LC_BUILD_VERSION comes from the SDK side.
     const identity = JSON.parse(
-      readFileSync('native/macos-remote-desktop/code-identity.json', 'utf8'),
+      readSource('native/macos-remote-desktop/code-identity.json'),
     ) as { minimumMacosVersion: string };
     const declared = producer.match(/^MINIMUM_MACOS_VERSION="([^"]+)"$/mu);
     expect(declared).not.toBeNull();

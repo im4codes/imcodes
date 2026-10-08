@@ -11,6 +11,7 @@ import {
 } from '../../scripts/libwebrtc-sdk-artifacts.mjs';
 import { libwebrtcSdkTarget } from '../../scripts/libwebrtc-sdk-targets.mjs';
 import { PINNED_LIBWEBRTC_REVISION } from '../../shared/remote-desktop-native-pins.js';
+import { readSourceAsync } from '../helpers/read-source.js';
 
 const execute = promisify(execFile);
 const repositoryRoot = resolve(import.meta.dirname, '../..');
@@ -97,7 +98,7 @@ describe('macOS SDK pinned libwebrtc notices', () => {
     expect(sdkNoticeTargets).toEqual(['//:webrtc']);
     const value = await fixture();
     await execute('python3', [...graphArguments(value, sdkNoticeTargets), '--target-set', 'sdk']);
-    const notices = await readFile(value.output, 'utf8');
+    const notices = await readSourceAsync(value.output);
     expect(notices).toContain('targets=//:webrtc');
     expect(validateMacosLibwebrtcNotices(notices, PINNED_LIBWEBRTC_REVISION, sdkNoticeTargets))
       .toBe(notices);
@@ -111,7 +112,7 @@ describe('macOS SDK pinned libwebrtc notices', () => {
     // the Windows SDK generator closes with REQUIRED_REDISTRIBUTED_LIBRARIES.
     const value = await fixture();
     await execute('python3', [...graphArguments(value, sdkNoticeTargets), '--target-set', 'sdk']);
-    const notices = await readFile(value.output, 'utf8');
+    const notices = await readSourceAsync(value.output);
     expect(notices).toContain('libraries=webrtc,compiler-rt,example,googletest,libc++,llvm-toolchain');
     for (const section of ['compiler-rt', 'googletest', 'libc++', 'llvm-toolchain']) {
       expect(notices).toContain(`# ${section}\n`);
@@ -163,7 +164,7 @@ describe('macOS SDK pinned libwebrtc notices', () => {
     // notice file dropped into an SDK would pass.
     const value = await fixture();
     await execute('python3', [...graphArguments(value, sdkNoticeTargets), '--target-set', 'sdk']);
-    const notices = await readFile(value.output, 'utf8');
+    const notices = await readSourceAsync(value.output);
     expect(() => validateMacosLibwebrtcNotices(notices, PINNED_LIBWEBRTC_REVISION))
       .toThrow(/target inventory mismatch/u);
     expect(() => validateMacosLibwebrtcNotices(notices, PINNED_LIBWEBRTC_REVISION, []))
@@ -176,7 +177,7 @@ describe('macOS SDK pinned libwebrtc notices', () => {
     // would break the shipped product notices rather than the new SDK ones.
     const value = await fixture();
     await execute('python3', graphArguments(value, MACOS_LIBWEBRTC_NOTICE_TARGETS));
-    const notices = await readFile(value.output, 'utf8');
+    const notices = await readSourceAsync(value.output);
     expect(validateMacosLibwebrtcNotices(notices, PINNED_LIBWEBRTC_REVISION)).toBe(notices);
     expect(notices).toContain(`targets=${MACOS_LIBWEBRTC_NOTICE_TARGETS.join(',')}`);
     // And the product inventory must not silently acquire the SDK's

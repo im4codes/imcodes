@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
@@ -35,6 +35,7 @@ import {
   MACOS_AIDESK_BUNDLE_ID,
   MACOS_AIDESK_TEAM_ID,
 } from '../../src/node/macos-computer-use.js';
+import { readSource } from '../helpers/read-source.js';
 
 /**
  * The bundle exists so that macOS attributes Screen Recording and
@@ -100,9 +101,7 @@ describe('aiDesk application bundle', () => {
   it('puts helpers at the exact path the native dispatcher builds', () => {
     // Read from the source of truth rather than restated here, so a change on
     // either side has to be made on both.
-    const dispatcher = readFileSync(
-      'native/macos-remote-desktop/macos_permission_onboarding.mm', 'utf8',
-    );
+    const dispatcher = readSource('native/macos-remote-desktop/macos_permission_onboarding.mm');
     expect(dispatcher).toContain('Contents/Helpers/%s');
     expect(aideskSigningOrder('/x')[0]).toContain('/Contents/Helpers/');
   });
@@ -130,7 +129,7 @@ describe('aiDesk application bundle', () => {
 
   it('takes its macOS floor from the remote-desktop components', async () => {
     const identity = JSON.parse(
-      readFileSync('native/macos-remote-desktop/code-identity.json', 'utf8'),
+      readSource('native/macos-remote-desktop/code-identity.json'),
     ) as { minimumMacosVersion: string };
     await expect(resolveAideskMinimumSystemVersion()).resolves.toBe(identity.minimumMacosVersion);
     await expect(resolveAideskMinimumSystemVersion('13.0')).resolves.toBe('13.0');
@@ -158,7 +157,7 @@ describe('aiDesk application bundle', () => {
   }, 120_000);
 
   it('carries the Computer Use executable, never the upstream bundle', () => {
-    const source = readFileSync('scripts/build-aidesk-app.mjs', 'utf8');
+    const source = readSource('scripts/build-aidesk-app.mjs');
     expect(AIDESK_COMPUTER_USE_EXECUTABLE).toBe('OpenComputerUse');
     // Nesting the upstream .app would put a second application, with its own
     // identifier and its own grants, inside ours -- the exact thing one
@@ -172,12 +171,12 @@ describe('aiDesk application bundle', () => {
     // signed bundle that breaks the seal, and the permissions granted to the
     // bundle can go with it -- so upgrades would cost the user their grants,
     // several times a day.
-    const source = readFileSync('scripts/build-aidesk-app.mjs', 'utf8');
+    const source = readSource('scripts/build-aidesk-app.mjs');
     expect(source).not.toContain('imcodes-node-macos');
   });
 
   it('pins the signing identity by fingerprint and hardens the runtime', () => {
-    const source = readFileSync('scripts/build-aidesk-app.mjs', 'utf8');
+    const source = readSource('scripts/build-aidesk-app.mjs');
     expect(source).toContain("'--options', 'runtime'");
     expect(source).toContain('must be a SHA-1 fingerprint');
     // Verified with `--deep`, or the nested signatures the order above exists
@@ -193,7 +192,7 @@ describe('aiDesk application bundle', () => {
     // condition that its copyright and permission notice accompany every copy.
     // The upstream .app carries no licence file, so extracting just the
     // executable would drop the notice; this is what puts it back.
-    const source = readFileSync('scripts/build-aidesk-app.mjs', 'utf8');
+    const source = readSource('scripts/build-aidesk-app.mjs');
     expect(AIDESK_THIRD_PARTY_LICENSE).toBe('LICENSE-open-computer-use.txt');
     expect(source).toContain("join(root, 'node_modules', 'open-computer-use', 'LICENSE')");
     // Read from the pinned package, never transcribed, so the notice always
@@ -204,7 +203,7 @@ describe('aiDesk application bundle', () => {
   });
 
   it('credits the upstream project where a reader will look', () => {
-    const readme = readFileSync('README.md', 'utf8');
+    const readme = readSource('README.md');
     expect(readme).toContain('open-codex-computer-use');
     expect(readme).toContain('MIT');
   });
@@ -222,7 +221,7 @@ describe('aiDesk application bundle', () => {
  * be dragged from, and whether a first launch needs the network.
  */
 describe('aiDesk disk image', () => {
-  const source = readFileSync('scripts/build-aidesk-app.mjs', 'utf8');
+  const source = readSource('scripts/build-aidesk-app.mjs');
 
   it('is a format that can carry its notarization ticket', () => {
     // UDZO is a UDIF image, which `stapler` accepts. A sparse or raw image
@@ -265,7 +264,7 @@ describe('aiDesk disk image', () => {
 describe('the aiDesk agent has one list of sources', () => {
   const nativeDirectory = join('native', 'macos-remote-desktop');
   const IMPLEMENTATION_EXTENSIONS = ['.cc', '.mm', '.cpp', '.c', '.m'];
-  const localIncludes = (file: string): string[] => [...readFileSync(file, 'utf8').matchAll(/^\s*#\s*include\s+"([^"]+)"/gmu)]
+  const localIncludes = (file: string): string[] => [...readSource(file).matchAll(/^\s*#\s*include\s+"([^"]+)"/gmu)]
     .map((match) => join(dirname(file), match[1]!));
 
   it('lists existing files, and the compile arguments carry every one of them and every framework', () => {
@@ -301,7 +300,7 @@ describe('the aiDesk agent has one list of sources', () => {
   });
 
   it('the tests that compile the agent use the release build\'s arguments, not a list of their own', () => {
-    const source = readFileSync('test/node/macos-aidesk-status-client.test.ts', 'utf8');
+    const source = readSource('test/node/macos-aidesk-status-client.test.ts');
     expect(source).toContain('aideskAgentCompileArgs(');
     expect(source).not.toMatch(/\.(?:mm|cc)['"]/u);
   });

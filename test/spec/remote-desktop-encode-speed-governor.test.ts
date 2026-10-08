@@ -1,9 +1,10 @@
 import { runNative } from './support/native-exec.js';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
+import { readSource } from '../helpers/read-source.js';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 const COMMON = resolve(ROOT, 'native', 'remote-desktop-common');
@@ -20,10 +21,10 @@ async function findCompiler(): Promise<string> {
 
 describe('remote-desktop encode speed governor', () => {
   it('is a public, header-only part of the common GN target and stays platform neutral', () => {
-    const build = readFileSync(resolve(COMMON, 'BUILD.gn'), 'utf8');
+    const build = readSource(resolve(COMMON, 'BUILD.gn'));
     expect(build).toContain('"encode_speed_governor.h"');
     expect(build).toMatch(/public\s*=\s*\[[\s\S]*"encode_speed_governor\.h"[\s\S]*\]/);
-    const header = readFileSync(resolve(COMMON, 'encode_speed_governor.h'), 'utf8');
+    const header = readSource(resolve(COMMON, 'encode_speed_governor.h'));
     for (const token of ['VideoToolbox', 'CoreVideo', 'dispatch', 'windows.h', 'webrtc::', '__APPLE__', '_WIN32']) {
       expect(header, `${token} stays out of the pure policy`).not.toContain(token);
     }

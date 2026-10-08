@@ -1,8 +1,9 @@
 import { runNative, type NativeExecResult } from './support/native-exec.js';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
+import { readSource } from '../helpers/read-source.js';
 
 const ROOT = resolve(__dirname, '..', '..');
 const NATIVE = resolve(ROOT, 'native', 'macos-remote-desktop');
@@ -248,12 +249,8 @@ async function runArchitecture(
 }
 
 describe('SLVirtualDisplay exact-instance destroy backend', () => {
-  const production = readFileSync(
-    resolve(NATIVE, 'macos_slvirtual_display_backend.cc'), 'utf8',
-  );
-  const runtime = readFileSync(
-    resolve(NATIVE, 'macos_slvirtual_display_runtime.mm'), 'utf8',
-  );
+  const production = readSource(resolve(NATIVE, 'macos_slvirtual_display_backend.cc'));
+  const runtime = readSource(resolve(NATIVE, 'macos_slvirtual_display_runtime.mm'));
 
   it('passes exact-instance counterfactuals under ASan and UBSan', async () => {
     const run = await compileAndRun(production);

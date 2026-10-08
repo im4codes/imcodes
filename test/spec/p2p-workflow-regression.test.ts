@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
-import { readFileSync, existsSync } from 'node:fs';
+import { existsSync } from 'node:fs';
 import { resolve } from 'node:path';
+import { readSource } from '../helpers/read-source.js';
 
 // Static reverse-regression guard for the smart-p2p-upgrade change.
 //
@@ -22,7 +23,7 @@ interface FileText {
 
 function read(rel: string): FileText {
   const abs = resolve(ROOT, rel);
-  const text = readFileSync(abs, 'utf8');
+  const text = readSource(abs);
   return { path: rel, text, lines: text.split('\n') };
 }
 

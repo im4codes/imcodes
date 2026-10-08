@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, readdirSync } from 'node:fs';
+import { existsSync, readdirSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
@@ -13,6 +13,7 @@ import {
   LOGO_SIZES,
   renderHeader,
 } from '../../scripts/generate-remote-desktop-brand-asset.mjs';
+import { readSource } from '../helpers/read-source.js';
 
 /**
  * The worker's source list lives in three places -- BUILD.gn for the pinned
@@ -27,11 +28,11 @@ const NATIVE = resolve(__dirname, '..', '..', 'native', 'windows-remote-desktop'
 const COMMON = resolve(__dirname, '..', '..', 'native', 'remote-desktop-common');
 
 function read(name: string): string {
-  return readFileSync(resolve(NATIVE, name), 'utf8');
+  return readSource(resolve(NATIVE, name));
 }
 
 function readCommon(name: string): string {
-  return readFileSync(resolve(COMMON, name), 'utf8');
+  return readSource(resolve(COMMON, name));
 }
 
 function gnTargetSources(gn: string, target: string): string[] {
@@ -145,7 +146,7 @@ describe('windows remote-desktop build manifests', () => {
         if (visited.has(file)) continue;
         visited.add(file);
         const directory = file.startsWith(COMMON) ? COMMON : NATIVE;
-        for (const [, include] of readFileSync(file, 'utf8').matchAll(/#include "([^"]+)"/g)) {
+        for (const [, include] of readSource(file).matchAll(/#include "([^"]+)"/g)) {
           const common = /^third_party\/imcodes_remote_desktop\/common\/(\w+\.h)$/.exec(include!)?.[1];
           const local = /^third_party\/imcodes_remote_desktop\/(\w+\.h)$/.exec(include!)?.[1];
           const relative = /^(\w+\.h)$/.exec(include!)?.[1];
@@ -197,7 +198,7 @@ describe('windows remote-desktop build manifests', () => {
     };
     for (const entry of packaged) {
       expect(existsSync(entry.path), `${entry.name} exists in its source manifest`).toBe(true);
-      const source = readFileSync(entry.path, 'utf8');
+      const source = readSource(entry.path);
       for (const [, include] of source.matchAll(/#include\s+"([^"]+)"/g)) {
         let target: { name: string; namespace: 'worker' | 'common' } | undefined;
         const common = /^third_party\/imcodes_remote_desktop\/common\/(.+)$/.exec(include!);
@@ -347,7 +348,7 @@ describe('windows remote-desktop indicator branding', () => {
     // the other, which is what keeps this from becoming a second logo.
     expect(CANONICAL_LOGO.endsWith('imcodes-robot-avatar.png')).toBe(true);
     expect(GENERATED_HEADER.endsWith('brand_logo_generated.h')).toBe(true);
-    expect(readFileSync(GENERATED_HEADER, 'utf8')).toBe(await renderHeader());
+    expect(readSource(GENERATED_HEADER)).toBe(await renderHeader());
   });
 
   it('compiles a bitmap for every DPI bucket the indicator selects from', () => {

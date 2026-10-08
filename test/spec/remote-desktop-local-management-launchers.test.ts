@@ -1,11 +1,11 @@
-import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import { REMOTE_DESKTOP_LOCAL_MANAGEMENT } from '../../shared/remote-desktop-local-management.js';
+import { readSource } from '../helpers/read-source.js';
 
 const root = resolve(fileURLToPath(new URL('../..', import.meta.url)));
-const read = (path: string) => readFileSync(resolve(root, path), 'utf8');
+const read = (path: string) => readSource(resolve(root, path));
 
 describe('aiDesk local management launchers', () => {
   it('keeps one C++ URL and the TypeScript loopback endpoint byte-identical', () => {

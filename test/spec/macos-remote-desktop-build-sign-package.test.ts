@@ -27,6 +27,7 @@ import {
   validateRemoteDesktopWorkerReleaseManifest,
   REMOTE_DESKTOP_MACOS_TEAM_ID,
 } from '../../shared/remote-desktop-worker.js';
+import { readSourceAsync } from '../helpers/read-source.js';
 
 const REPOSITORY_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 const NATIVE_DIR = join(REPOSITORY_ROOT, 'native', 'macos-remote-desktop');
@@ -213,7 +214,7 @@ describe('macOS remote-desktop deterministic build plan', () => {
 describe('macOS remote-desktop build graph honesty', () => {
   it('keeps the declared executable-target state consistent with BUILD.gn', async () => {
     const identity = await readMacosRemoteDesktopCodeIdentity(REPOSITORY_ROOT);
-    const buildGn = await readFile(join(NATIVE_DIR, 'BUILD.gn'), 'utf8');
+    const buildGn = await readSourceAsync(join(NATIVE_DIR, 'BUILD.gn'));
     const defined = new Set(
       [...buildGn.matchAll(/^\s*(?:rtc_executable|executable)\("([A-Za-z0-9_]+)"\)?\s*\{/gmu)]
         .map((match) => match[1]),
@@ -228,7 +229,7 @@ describe('macOS remote-desktop build graph honesty', () => {
   });
 
   it('routes every component through the single pinned libwebrtc sender bridge', async () => {
-    const buildGn = await readFile(join(NATIVE_DIR, 'BUILD.gn'), 'utf8');
+    const buildGn = await readSourceAsync(join(NATIVE_DIR, 'BUILD.gn'));
     expect(buildGn).toContain('source_set("pinned_libwebrtc_h264_sender_bridge")');
     // A second WebRTC stack would show up as an independent PeerConnection or
     // RTP implementation dependency alongside the pinned checkout.
@@ -246,10 +247,7 @@ describe('macOS remote-desktop build graph honesty', () => {
 describe('macOS remote-desktop code identity', () => {
   it('uses the same launch-agent bundle identifier as the daemon launch agent', async () => {
     const identity = await readMacosRemoteDesktopCodeIdentity(REPOSITORY_ROOT);
-    const userSession = await readFile(
-      join(REPOSITORY_ROOT, 'src', 'node', 'macos-user-session.ts'),
-      'utf8',
-    );
+    const userSession = await readSourceAsync(join(REPOSITORY_ROOT, 'src', 'node', 'macos-user-session.ts'));
     // Two files must not be allowed to disagree about the identity TCC grants
     // are bound to; an upgrade that changes it silently drops every grant.
     expect(userSession).toContain(`bundleIdentifier: '${identity.components.launchAgent.bundleIdentifier}'`);
@@ -312,7 +310,7 @@ describe('macOS remote-desktop entitlements', () => {
     try {
       await cp(NATIVE_DIR, nativeDir, { recursive: true });
       const identityPath = join(nativeDir, 'code-identity.json');
-      const identity = JSON.parse(await readFile(identityPath, 'utf8'));
+      const identity = JSON.parse(await readSourceAsync(identityPath));
       identity.components.launchAgent.entitlements = identity.components.worker.entitlements;
       await writeFile(identityPath, `${JSON.stringify(identity, null, 2)}\n`);
       await expect(readMacosRemoteDesktopCodeIdentity(repositoryRoot))
@@ -325,7 +323,7 @@ describe('macOS remote-desktop entitlements', () => {
   it('ships hardened-runtime entitlements with no exception for any component', async () => {
     const identity = await readMacosRemoteDesktopCodeIdentity(REPOSITORY_ROOT);
     for (const kind of MACOS_REMOTE_DESKTOP_BUILD_COMPONENT_ORDER) {
-      const text = await readFile(join(NATIVE_DIR, identity.components[kind].entitlements), 'utf8');
+      const text = await readSourceAsync(join(NATIVE_DIR, identity.components[kind].entitlements));
       const parsed = parseMacosRemoteDesktopEntitlements(text);
       expect(parsed).toEqual({ 'com.apple.security.get-task-allow': false });
     }
@@ -395,12 +393,10 @@ describe('macOS remote-desktop entitlements', () => {
     expect(macosRemoteDesktopBuildPlanSha256(plan)).toMatch(/^[a-f0-9]{64}$/);
     const identity = await readMacosRemoteDesktopCodeIdentity(REPOSITORY_ROOT);
     for (const component of plan.components) {
-      const text = await readFile(
-        join(NATIVE_DIR, identity.components[component.kind].entitlements),
-        'utf8',
-      );
+      // The plan hashes the file's BYTES, so this spec hashes the same bytes (not the LF-normalised text readSource gives).
+      const bytes = await readFile(join(NATIVE_DIR, identity.components[component.kind].entitlements));
       expect(component.entitlementsSha256)
-        .toBe(createHash('sha256').update(text).digest('hex'));
+        .toBe(createHash('sha256').update(bytes).digest('hex'));
     }
   });
 });

@@ -1,16 +1,17 @@
 import { runNative } from './support/native-exec.js';
 import { spawn } from 'node:child_process';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
+import { readSource } from '../helpers/read-source.js';
 
 const ROOT = resolve(import.meta.dirname, '../..');
 const NATIVE = resolve(ROOT, 'native/macos-remote-desktop');
 const COMMON = resolve(ROOT, 'native/remote-desktop-common');
 
 function read(relative: string): string {
-  return readFileSync(resolve(ROOT, relative), 'utf8');
+  return readSource(resolve(ROOT, relative));
 }
 
 /**

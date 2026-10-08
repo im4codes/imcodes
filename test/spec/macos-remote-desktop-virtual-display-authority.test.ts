@@ -1,7 +1,5 @@
 import { runNative } from './support/native-exec.js';
-import {
-  existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync,
-} from 'node:fs';
+import { existsSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
@@ -13,10 +11,11 @@ import {
   canonicalDesignatedRequirement,
   serializeMacosVirtualDisplayAuthority,
 } from '../../shared/macos-virtual-display-authority.js';
+import { readSource } from '../helpers/read-source.js';
 
 const ROOT = resolve(__dirname, '..', '..');
 const NATIVE = 'native/macos-remote-desktop';
-const read = (path: string): string => readFileSync(resolve(ROOT, path), 'utf8');
+const read = (path: string): string => readSource(resolve(ROOT, path));
 
 /**
  * Suites this file compiles against the shared pre-built object set.
@@ -1424,7 +1423,7 @@ describe('macOS virtual-display authority', () => {
 
     // The delegated ones must really be delegated, not just declared.
     for (const [name, owner] of ELSEWHERE_SUITES) {
-      const spec = readFileSync(resolve(ROOT, owner), 'utf8');
+      const spec = readSource(resolve(ROOT, owner));
       expect(spec, `${owner} does not actually run ${name}`)
         .toContain(`macos-remote-desktop-virtual-display-${name}-test.cc`);
     }

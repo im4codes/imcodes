@@ -1,4 +1,3 @@
-import { readFileSync } from 'node:fs';
 import { describe, it, expect } from 'vitest';
 import {
   assertSigningMaterialRemoved,
@@ -9,6 +8,7 @@ import {
   parseNotarizationSubmission,
   selectDeveloperIdSigningIdentity,
 } from '../../scripts/macos-release-signing.mjs';
+import { readSource } from '../helpers/read-source.js';
 
 const TEAM = 'M675E26Q67';
 const DEV_ID_LINE = `  1) ${'A'.repeat(40)} "Developer ID Application: Lei Sun (${TEAM})"`;
@@ -222,7 +222,7 @@ describe('what may be submitted versus what may be stapled', () => {
   it('packs a bundle for submission and staples the bundle, never the archive', () => {
     // The archive is a transport detail that gets deleted; a ticket stapled to
     // it would be thrown away with it.
-    const source = readFileSync('scripts/macos-release-signing.mjs', 'utf8');
+    const source = readSource('scripts/macos-release-signing.mjs');
     expect(source).toContain("'-c', '-k', '--keepParent'");
     expect(source).toContain("run(MACOS_RELEASE_SIGNING_TOOLS.xcrun, ['stapler', 'staple', artifactPath])");
     expect(source).toContain('rmSync(uploadPath, { force: true })');

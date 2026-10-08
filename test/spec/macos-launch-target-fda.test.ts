@@ -18,6 +18,7 @@ import {
   renderMacosLaunchAgentPlist,
   resolveMacosDaemonLaunchFacts,
 } from '../../src/util/macos-launch-agent.js';
+import { readSource } from '../helpers/read-source.js';
 
 const REPO = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 let root: string;
@@ -54,7 +55,7 @@ function expectNotAScript(program: string): void {
 describe('spec: a macOS plist never points at an env-shebang script', () => {
   it('the shipped supervisor really is such a script (so the check below means something)', () => {
     const { launcher } = fixture();
-    expect(readFileSync(launcher, 'utf8').startsWith('#!/usr/bin/env bash')).toBe(true);
+    expect(readSource(launcher).startsWith('#!/usr/bin/env bash')).toBe(true);
   });
 
   it('install / re-bind: the rendered plist runs node', () => {
@@ -70,12 +71,12 @@ describe('spec: a macOS plist never points at an env-shebang script', () => {
       const plist = join(root, `${mode}.plist`);
       writeFileSync(plist, `<plist><dict><key>ProgramArguments</key><array><string>${launcher}</string><string>start</string><string>--foreground</string></array></dict></plist>`);
       ensureMacosLaunchAgentTarget({ plistPath: plist, mode, entry, node, pathEnv: '' });
-      expectNotAScript(programOf(readFileSync(plist, 'utf8')));
+      expectNotAScript(programOf(readSource(plist)));
     }
   });
 
   it('the install flow does not take its macOS program from the Linux launch target', () => {
-    const source = readFileSync(join(REPO, 'src', 'bind', 'bind-flow.ts'), 'utf8');
+    const source = readSource(join(REPO, 'src', 'bind', 'bind-flow.ts'));
     const start = source.indexOf('async function installLaunchAgent()');
     const end = source.indexOf('async function installSystemdService()');
     expect(start).toBeGreaterThan(0);
@@ -86,7 +87,7 @@ describe('spec: a macOS plist never points at an env-shebang script', () => {
   });
 
   it('the upgrade script\'s macOS branch never points ProgramArguments at the supervisor', () => {
-    const source = readFileSync(join(REPO, 'src', 'util', 'posix-upgrade-script.ts'), 'utf8');
+    const source = readSource(join(REPO, 'src', 'util', 'posix-upgrade-script.ts'));
     const start = source.indexOf('elif [ "$(uname)" = "Darwin" ]; then');
     const end = source.indexOf('regenerate_launch_chain\n', start);
     expect(start).toBeGreaterThan(0);

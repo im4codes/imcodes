@@ -1,13 +1,13 @@
-import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
 import { REMOTE_DESKTOP_ENCODER_CLASS } from '../../shared/remote-desktop.js';
+import { readSource } from '../helpers/read-source.js';
 
 const ROOT = resolve(__dirname, '..', '..');
 
 function read(path: string): string {
-  return readFileSync(resolve(ROOT, path), 'utf8');
+  return readSource(resolve(ROOT, path));
 }
 
 describe('macOS worker quality report tells the truth about the encoder', () => {

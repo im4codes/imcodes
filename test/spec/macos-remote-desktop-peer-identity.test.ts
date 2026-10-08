@@ -1,8 +1,9 @@
 import { runNativeOrThrow } from './support/native-exec.js';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
+import { readSource } from '../helpers/read-source.js';
 
 const ROOT = resolve(import.meta.dirname, '../..');
 
@@ -112,22 +113,10 @@ describe('macOS remote-desktop native peer identity', async () => {
   );
 
   it('wires only Darwin kernel credentials and Security.framework identity', async () => {
-    const header = readFileSync(
-      join(ROOT, 'native/macos-remote-desktop/macos_peer_identity.h'),
-      'utf8',
-    );
-    const source = readFileSync(
-      join(ROOT, 'native/macos-remote-desktop/macos_peer_identity.mm'),
-      'utf8',
-    );
-    const build = readFileSync(
-      join(ROOT, 'native/macos-remote-desktop/BUILD.gn'),
-      'utf8',
-    );
-    const verifier = readFileSync(
-      join(ROOT, 'native/macos-remote-desktop/macos_peer_verifier_command.mm'),
-      'utf8',
-    );
+    const header = readSource(join(ROOT, 'native/macos-remote-desktop/macos_peer_identity.h'));
+    const source = readSource(join(ROOT, 'native/macos-remote-desktop/macos_peer_identity.mm'));
+    const build = readSource(join(ROOT, 'native/macos-remote-desktop/BUILD.gn'));
+    const verifier = readSource(join(ROOT, 'native/macos-remote-desktop/macos_peer_verifier_command.mm'));
 
     for (const kernelBoundary of [
       'getpeereid(',

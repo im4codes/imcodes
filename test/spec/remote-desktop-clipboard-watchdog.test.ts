@@ -1,8 +1,8 @@
-import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
 import { REMOTE_DESKTOP_PRIVACY_LIMITS } from '../../shared/remote-desktop-access.js';
+import { readSource } from '../helpers/read-source.js';
 
 const ROOT = resolve(__dirname, '..', '..');
 const NATIVE = resolve(ROOT, 'native', 'windows-remote-desktop');
@@ -10,7 +10,7 @@ const NATIVE = resolve(ROOT, 'native', 'windows-remote-desktop');
 function native(name: string): string {
   // PowerShell files are checked out as CRLF on CI. Normalize source text so
   // ordering/trust guards verify semantics rather than checkout line endings.
-  return readFileSync(resolve(NATIVE, name), 'utf8').replaceAll('\r\n', '\n');
+  return readSource(resolve(NATIVE, name)).replaceAll('\r\n', '\n');
 }
 
 const sources = {
@@ -25,8 +25,8 @@ const sources = {
   shellUi: native('account_shell_ui.cc'),
   build: native('build-clipboard-watchdog.ps1'),
   install: native('install-clipboard-watchdog-lifecycle.ps1'),
-  workerHost: readFileSync(resolve(ROOT, 'src/node/remote-desktop-worker-host.ts'), 'utf8'),
-  nodeRuntime: readFileSync(resolve(ROOT, 'src/node/runtime.ts'), 'utf8'),
+  workerHost: readSource(resolve(ROOT, 'src/node/remote-desktop-worker-host.ts')),
+  nodeRuntime: readSource(resolve(ROOT, 'src/node/runtime.ts')),
 };
 
 interface Guard {

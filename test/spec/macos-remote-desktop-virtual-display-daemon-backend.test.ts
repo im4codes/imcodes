@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { resolve, join } from 'node:path';
 import { describe, expect, it } from 'vitest';
+import { readSource } from '../helpers/read-source.js';
 
 const ROOT = resolve(__dirname, '..', '..');
 const NATIVE = resolve(ROOT, 'native/macos-remote-desktop');
@@ -59,6 +60,5 @@ describe('macOS virtual-display daemon-proxy backend', () => {
 });
 
 function readFileSyncSafe(path: string): string {
-  // eslint-disable-next-line @typescript-eslint/no-var-requires
-  return require('node:fs').readFileSync(path, 'utf8') as string;
+  return readSource(path);
 }

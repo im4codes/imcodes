@@ -1,9 +1,10 @@
 import { runNative } from './support/native-exec.js';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
+import { readSource } from '../helpers/read-source.js';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 const COMMON = resolve(ROOT, 'native', 'remote-desktop-common');
@@ -89,7 +90,7 @@ describe.skipIf(process.platform === 'win32')('remote-desktop common conformance
   }, NATIVE_CONFORMANCE_TIMEOUT_MS);
 
   it('pins every requested failure-mode assertion in the executable fake', async () => {
-    const fake = readFileSync(FAKE, 'utf8');
+    const fake = readSource(FAKE);
     for (const assertion of [
       'encoded width remains video pixels',
       'logical width remains input coordinates',
