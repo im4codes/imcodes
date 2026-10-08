@@ -1944,25 +1944,40 @@ describe('handleWebCommand transport queue behavior', () => {
     })));
   });
 
-  it('saves the identity chosen at session.start into the SESSION scope of the identity store (what a restart and the sync derive it from), for transport AND process agents', async () => {
+  it('saves the identity chosen at session.start into the SESSION scope of the identity store BEFORE the session launches (what a restart and the sync derive it from), for transport AND process agents', async () => {
     const { getLocalSessionIdentityProfile, removeLocalSessionIdentityProfileQuiet } = await import('../../src/daemon/session-identity-local-store.js');
     const { startProject } = await import('../../src/agent/session-manager.js');
+    const keyOf = (sessionName: string) => `:${sessionName}`;
+    // What the store held at the moment the launch was called. Observing "the profile exists" is NOT proof that the handler has
+    // moved on to the launch (the write is visible a few I/O callbacks before the handler resumes), so nothing here races it:
+    // each launch records the store itself, and the test waits for that record.
+    const storedAtLaunch = new Map<string, string | null>();
+    const recordStoreAtLaunch = (sessionName: string) => async () => {
+      storedAtLaunch.set(sessionName, (await getLocalSessionIdentityProfile('session', keyOf(sessionName)))?.content ?? null);
+    };
+    const launched = (sessionName: string) => vi.waitFor(() => expect(storedAtLaunch.has(sessionName)).toBe(true));
+    const names = { sdk: 'deck_identity_persist_sdk_brain', proc: 'deck_identity_persist_proc_brain', none: 'deck_identity_persist_none_brain' };
     try {
+      launchTransportSessionMock.mockImplementationOnce(recordStoreAtLaunch(names.sdk));
       handleWebCommand({ type: 'session.start', project: 'identity persist sdk', dir: '/proj', agentType: 'codex-sdk', identityPrompt: 'SDK identity to keep.' }, serverLink as any);
+      await launched(names.sdk);
+      expect(storedAtLaunch.get(names.sdk)).toBe('SDK identity to keep.'); // saved before the launch ...
+      expect(launchTransportSessionMock).toHaveBeenCalledWith(expect.objectContaining({ name: names.sdk, identityPrompt: 'SDK identity to keep.' })); // ... and the launch still gets it directly
+
+      vi.mocked(startProject).mockImplementationOnce(recordStoreAtLaunch(names.proc) as never);
       handleWebCommand({ type: 'session.start', project: 'identity persist proc', dir: '/proj', agentType: 'codex', identityPrompt: 'Process identity to keep.' }, serverLink as any);
-      handleWebCommand({ type: 'session.start', project: 'identity persist none', dir: '/proj', agentType: 'codex-sdk' }, serverLink as any);
-      await flushAsync();
-      await vi.waitFor(async () => {
-        expect((await getLocalSessionIdentityProfile('session', ':deck_identity_persist_sdk_brain'))?.content).toBe('SDK identity to keep.');
-        expect((await getLocalSessionIdentityProfile('session', ':deck_identity_persist_proc_brain'))?.content).toBe('Process identity to keep.');
-      });
-      // The launch still gets the identity directly (the first run does not wait on the store) ...
-      expect(launchTransportSessionMock).toHaveBeenCalledWith(expect.objectContaining({ name: 'deck_identity_persist_sdk_brain', identityPrompt: 'SDK identity to keep.' }));
+      await launched(names.proc);
+      expect(storedAtLaunch.get(names.proc)).toBe('Process identity to keep.');
       expect(vi.mocked(startProject)).toHaveBeenCalledWith(expect.objectContaining({ name: 'identity_persist_proc', identityPrompt: 'Process identity to keep.' }));
-      // ... and a session started with none writes none.
-      expect(await getLocalSessionIdentityProfile('session', ':deck_identity_persist_none_brain')).toBeNull();
+
+      // A session started with none writes none (waited for the launch, so a write that was going to happen has happened).
+      launchTransportSessionMock.mockImplementationOnce(recordStoreAtLaunch(names.none));
+      handleWebCommand({ type: 'session.start', project: 'identity persist none', dir: '/proj', agentType: 'codex-sdk' }, serverLink as any);
+      await launched(names.none);
+      expect(storedAtLaunch.get(names.none)).toBeNull();
+      expect(await getLocalSessionIdentityProfile('session', keyOf(names.none))).toBeNull();
     } finally {
-      for (const key of [':deck_identity_persist_sdk_brain', ':deck_identity_persist_proc_brain']) await removeLocalSessionIdentityProfileQuiet('session', key);
+      for (const name of [names.sdk, names.proc, names.none]) await removeLocalSessionIdentityProfileQuiet('session', keyOf(name));
     }
   });
 
