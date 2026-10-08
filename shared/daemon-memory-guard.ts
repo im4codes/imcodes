@@ -73,3 +73,17 @@ export function classifyDaemonHeap(usedBytes: number, limitBytes: number): Daemo
   if (ratio >= DAEMON_HEAP_WARN_RATIO) return 'warn';
   return 'ok';
 }
+
+/**
+ * "Largest retained allocations" section of the guard's diagnostic (158, 2026-10-08: seven GB in the large-object space,
+ * one-line numbers could not say which code allocated it). V8's sampling heap profiler records, for every ~interval bytes
+ * allocated, the call stack of the allocation, and reports only the samples still alive. Sizes and code locations only,
+ * never a value.
+ */
+export const DAEMON_HEAP_SAMPLER_INTERVAL_BYTES = 512 * 1024;
+/** Entries of the section, the frames kept per entry (innermost first), and the profile nodes walked at most. */
+export const DAEMON_HEAP_RETAINED_TOP_N = 15;
+export const DAEMON_HEAP_RETAINED_FRAMES = 6;
+export const DAEMON_HEAP_RETAINED_MAX_NODES = 200_000;
+/** Environment switch: `0` keeps the sampler off (it costs a stack capture per ~interval bytes allocated, a few percent at most). */
+export const DAEMON_HEAP_SAMPLER_ENV = 'IMCODES_HEAP_SAMPLER';

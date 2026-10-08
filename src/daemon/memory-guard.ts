@@ -38,6 +38,7 @@ import {
   type DaemonMemoryLevel,
 } from '../../shared/daemon-memory-guard.js';
 import { collectMemoryProbes } from './memory-probes.js';
+import { largestRetainedAllocations, startHeapRetentionSampler, stopHeapRetentionSampler } from './heap-retention-sampler.js';
 
 export interface MemoryGuardLogger {
   info(obj: Record<string, unknown>, msg: string): void;
@@ -54,6 +55,8 @@ export interface MemoryGuardDeps {
   writeDiagnostic(summary: Record<string, unknown>): string | undefined;
   /** Numbers-only per-subsystem sizes. */
   probes(): Record<string, Record<string, number>>;
+  /** Bounded "largest retained allocations" (sizes and code locations only); absent when nothing samples allocations. */
+  retained?(): unknown;
   /** Flush what must survive and exit so the service manager restarts the daemon. */
   restart(reason: string): Promise<void>;
   /** False when nothing would bring the daemon back (a dev run): the guard then only sheds. Default: true. */
@@ -88,6 +91,10 @@ export function createMemoryGuard(deps: MemoryGuardDeps): MemoryGuard {
   let timer: ReturnType<typeof setTimeout> | null = null;
   let stopped = true;
 
+  const safeRetained = (read: () => unknown): unknown => {
+    try { return read(); } catch { return { status: 'unavailable', top: [] }; }
+  };
+
   const summary = (reason: string, used: number, limit: number): Record<string, unknown> => ({
     reason,
     at: new Date(deps.now()).toISOString(),
@@ -98,6 +105,7 @@ export function createMemoryGuard(deps: MemoryGuardDeps): MemoryGuard {
     heapSpaces: v8.getHeapSpaceStatistics().map((space) => ({ name: space.space_name, sizeBytes: space.space_size, usedBytes: space.space_used_size })),
     loadavg: loadavg(),
     subsystems: deps.probes(),
+    ...(deps.retained ? { largestRetained: safeRetained(deps.retained) } : {}),
     restartsInWindow: recentRestarts().length,
   });
 
@@ -311,6 +319,7 @@ export function startMemoryGuard(options: StartMemoryGuardOptions): MemoryGuard 
     ...(typeof gc === 'function' ? { gc: () => gc() } : {}),
     writeDiagnostic: (data) => writeMemoryDiagnostic(options.stateDir, data),
     probes: collectMemoryProbes,
+    retained: () => largestRetainedAllocations(),
     restart: (reason) => {
       options.log.error({ reason }, 'memory guard: shutting the daemon down for a controlled restart');
       return options.shutdown(DAEMON_MEMORY_GUARD_EXIT_CODE);
@@ -321,6 +330,7 @@ export function startMemoryGuard(options: StartMemoryGuardOptions): MemoryGuard 
     log: options.log,
   });
   activeGuard = guard;
+  startHeapRetentionSampler();
   const dir = diagnosticsDirOf(options.stateDir);
   mkdirSync(dir, { recursive: true, mode: 0o700 });
   try { chmodSync(dir, 0o700); } catch { /* best effort */ }
@@ -333,6 +343,7 @@ export function startMemoryGuard(options: StartMemoryGuardOptions): MemoryGuard 
 export function stopMemoryGuard(): void {
   activeGuard?.stop();
   activeGuard = null;
+  stopHeapRetentionSampler();
 }
 
 /** Test seam: install a guard built with fake dependencies as the process-wide one. */
