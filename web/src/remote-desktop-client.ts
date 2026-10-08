@@ -18,6 +18,7 @@ import {
   REMOTE_DESKTOP_DATA_MSG,
   REMOTE_DESKTOP_DPI_SCALE_PERCENTS,
   REMOTE_DESKTOP_ERROR,
+  REMOTE_DESKTOP_HELD_INPUT,
   REMOTE_DESKTOP_INPUT_BLOCKED,
   REMOTE_DESKTOP_KEYBOARD_KIND,
   REMOTE_DESKTOP_LIMITS,
@@ -609,6 +610,10 @@ export class RemoteDesktopClient {
    */
   private liftedModifiers = new Set<string>();
   private pressedButtons = new Set<string>();
+  /** Throttle for the next held-input declaration after a key or button changed. */
+  private heldInputSettleTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Re-declares what is held while anything is, so a legitimate long hold survives. */
+  private heldInputRefreshTimer: ReturnType<typeof setTimeout> | null = null;
   private pendingClipboardRequests = new Map<string, {
     resolve(value: string | null): void;
     timer: ReturnType<typeof setTimeout>;
@@ -994,6 +999,7 @@ export class RemoteDesktopClient {
     if (sent) {
       if (down) this.pressedButtons.add(button);
       else this.pressedButtons.delete(button);
+      this.noteHeldInputChanged();
     }
     return sent;
   }
@@ -1186,6 +1192,11 @@ export class RemoteDesktopClient {
     this.pressedCodes.clear();
     this.pressedWhileMeta.clear();
     this.pressedButtons.clear();
+    // Whatever the worker still holds that this viewer no longer tracks (a key it
+    // forgot, or one whose release was never sent because nothing was tracked) is
+    // let go by this declaration of "nothing is held" -- immediately, not after the
+    // settle delay. RELEASE_ALL above only ever fired when something was tracked.
+    this.declareHeldInput();
   }
 
   /** Release captured pointer buttons without disturbing held modifiers. */
@@ -1204,6 +1215,7 @@ export class RemoteDesktopClient {
         return;
       }
       this.pressedButtons.delete(button);
+      this.noteHeldInputChanged();
     }
   }
 
@@ -2185,6 +2197,59 @@ export class RemoteDesktopClient {
     }
   }
 
+  /**
+   * Something this viewer holds changed: say what it holds soon. Throttled, not
+   * debounced, so continuous typing still declares at least once per settle
+   * period.
+   */
+  private noteHeldInputChanged(): void {
+    if (this.stopped || this.heldInputSettleTimer) return;
+    this.heldInputSettleTimer = setTimeout(() => {
+      this.heldInputSettleTimer = null;
+      this.declareHeldInput();
+    }, REMOTE_DESKTOP_HELD_INPUT.SETTLE_MS);
+  }
+
+  /**
+   * Tell the worker exactly which keys and buttons this viewer holds. The worker
+   * releases whatever it holds that is not listed (and was pressed before this
+   * declaration), which heals a key-up that was lost on the way and that this
+   * viewer has therefore forgotten. Unacknowledged on purpose: an unanswered
+   * declaration must never fail the session, and an older worker simply drops
+   * the unknown message.
+   */
+  private declareHeldInput(): void {
+    this.clearHeldInputTimers();
+    if (this.stopped || !this.sessionId
+      || this.snapshot.mode !== REMOTE_DESKTOP_ACCESS_MODE.CONTROL
+      || this.snapshot.inputEpoch <= 0) return;
+    // A held code the wire cannot express must never turn into "not held": the
+    // worker would release a key the operator is still pressing.
+    const keys = [...this.pressedCodes].sort();
+    if (keys.length > REMOTE_DESKTOP_LIMITS.HELD_INPUT_KEYS) return;
+    const sent = this.sendReliablePointerSync({
+      type: REMOTE_DESKTOP_DATA_MSG.HELD_INPUT,
+      ...this.inputBase(),
+      keys: keys.join(','),
+      buttons: [...this.pressedButtons].sort().join(','),
+    });
+    // Keep declaring while anything is held (a long drag with Shift down), and
+    // retry a declaration that could not be sent.
+    if (!sent || this.pressedCodes.size > 0 || this.pressedButtons.size > 0) {
+      this.heldInputRefreshTimer = setTimeout(() => {
+        this.heldInputRefreshTimer = null;
+        this.declareHeldInput();
+      }, REMOTE_DESKTOP_HELD_INPUT.REFRESH_MS);
+    }
+  }
+
+  private clearHeldInputTimers(): void {
+    if (this.heldInputSettleTimer) clearTimeout(this.heldInputSettleTimer);
+    if (this.heldInputRefreshTimer) clearTimeout(this.heldInputRefreshTimer);
+    this.heldInputSettleTimer = null;
+    this.heldInputRefreshTimer = null;
+  }
+
   private inputBase() {
     return {
       protocolVersion: REMOTE_DESKTOP_PROTOCOL_VERSION,
@@ -2211,6 +2276,7 @@ export class RemoteDesktopClient {
     if (sent) {
       if (down) this.pressedCodes.add(code);
       else this.pressedCodes.delete(code);
+      this.noteHeldInputChanged();
     }
     return sent;
   }
@@ -2372,7 +2438,11 @@ export class RemoteDesktopClient {
   }
 
   private publish(patch: Partial<RemoteDesktopSnapshot>): void {
+    const inputBecameEnabled = patch.inputEnabled === true && !this.snapshot.inputEnabled;
     this.snapshot = { ...this.snapshot, ...patch };
+    // A new route (control channel reopened, session started, input re-enabled)
+    // may face a worker that still holds keys from before: baseline it.
+    if (inputBecameEnabled) this.noteHeldInputChanged();
     this.hooks.onSnapshot(this.snapshot);
   }
 
@@ -2396,6 +2466,7 @@ export class RemoteDesktopClient {
     this.signalingDisconnectedAt = null;
     this.pendingIceRestart = false;
     this.releaseAll();
+    this.clearHeldInputTimers();
     try { this.controlChannel?.close(); } catch { /* closed */ }
     try { this.keyboardChannel?.close(); } catch { /* closed */ }
     try { this.pointerChannel?.close(); } catch { /* closed */ }

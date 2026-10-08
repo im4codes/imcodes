@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   REMOTE_DESKTOP_ACCESS_MODE,
   REMOTE_DESKTOP_CHANNEL,
@@ -8,6 +8,7 @@ import {
   REMOTE_DESKTOP_ERROR,
   REMOTE_DESKTOP_INPUT_BLOCKED,
   REMOTE_DESKTOP_KEYBOARD_KIND,
+  REMOTE_DESKTOP_HELD_INPUT,
   REMOTE_DESKTOP_LIMITS,
   REMOTE_DESKTOP_MSG,
   REMOTE_DESKTOP_MODE_REASON,
@@ -771,18 +772,30 @@ describe('RemoteDesktopClient', () => {
     keyboard.failNextSend = true;
     expect(client.key('KeyA', 'a', false, false, { control: false, alt: false })).toBe(false);
     client.releaseAll();
-    expect(JSON.parse(control.sent.at(-1)!)).toMatchObject({
+    // RELEASE_ALL first, then the unacknowledged "I hold nothing" declaration.
+    expect(JSON.parse(control.sent.at(-2)!)).toMatchObject({
       type: REMOTE_DESKTOP_DATA_MSG.RELEASE_ALL,
       inputEpoch: 1,
+    });
+    expect(JSON.parse(control.sent.at(-1)!)).toMatchObject({
+      type: REMOTE_DESKTOP_DATA_MSG.HELD_INPUT,
+      keys: '',
+      buttons: '',
     });
 
     expect(client.pointerButton('left', true, 0.4, 0.6)).toBe(true);
     control.failNextSend = true;
     expect(client.pointerButton('left', false, 0.4, 0.6)).toBe(false);
     client.releaseAll();
-    expect(JSON.parse(control.sent.at(-1)!)).toMatchObject({
+    // RELEASE_ALL first, then the unacknowledged "I hold nothing" declaration.
+    expect(JSON.parse(control.sent.at(-2)!)).toMatchObject({
       type: REMOTE_DESKTOP_DATA_MSG.RELEASE_ALL,
       inputEpoch: 1,
+    });
+    expect(JSON.parse(control.sent.at(-1)!)).toMatchObject({
+      type: REMOTE_DESKTOP_DATA_MSG.HELD_INPUT,
+      keys: '',
+      buttons: '',
     });
     control.receive({
       type: REMOTE_DESKTOP_DATA_MSG.CONTROL,
@@ -3224,6 +3237,199 @@ describe('RemoteDesktopClient translated shortcuts and paste', () => {
     expect(client.tapChords([[{ code: 'Home', key: 'Home' }]])).toBe(false);
     expect(control.sent.map((raw) => JSON.parse(raw).type)).toContain(REMOTE_DESKTOP_DATA_MSG.RELEASE_ALL);
     client.stop(REMOTE_DESKTOP_STOP_ORIGIN.USER_CLOSE);
+  });
+
+  describe('held-input declaration (what the viewer says it holds)', () => {
+    type HeldMessage = { type: string; keys: string; buttons: string; sequence: number; inputEpoch: number };
+
+    async function heldReadyClient() {
+      vi.useFakeTimers();
+      const ready = await inputReadyClient();
+      // The worker acknowledges every key and button transition; without that the
+      // viewer (rightly) fails the session after INPUT_ACK_TIMEOUT_MS.
+      let ackSequence = 1_000;
+      const ack = () => {
+        const newest = Math.max(0, ...[...ready.keyboard.sent, ...ready.control.sent]
+          .map((raw) => (JSON.parse(raw) as { sequence: number }).sequence));
+        ready.control.receive({
+          type: REMOTE_DESKTOP_DATA_MSG.CONTROL,
+          protocolVersion: REMOTE_DESKTOP_PROTOCOL_VERSION,
+          sessionId: 'session_12345678',
+          sequence: ackSequence += 1,
+          layoutRevision: 1,
+          inputEpoch: 1,
+          kind: 'input_ack',
+          acknowledgedSequence: newest,
+        });
+      };
+      const declarations = () => ready.control.sent
+        .map((raw) => JSON.parse(raw) as HeldMessage)
+        .filter((message) => message.type === REMOTE_DESKTOP_DATA_MSG.HELD_INPUT);
+      // Setup itself declares once (input just became enabled): that is the baseline.
+      vi.advanceTimersByTime(REMOTE_DESKTOP_HELD_INPUT.SETTLE_MS);
+      const baseline = declarations();
+      ready.control.sent.length = 0;
+      ready.keyboard.sent.length = 0;
+      return { ...ready, declarations, ack, baseline };
+    }
+    afterEach(() => { vi.useRealTimers(); });
+
+    it('declares a held modifier after the settle delay and keeps declaring it for as long as it is held', async () => {
+      const { client, declarations, ack } = await heldReadyClient();
+      expect(client.key('ShiftLeft', 'Shift', true, false, { control: false, alt: false })).toBe(true);
+      ack();
+      expect(declarations()).toHaveLength(0);
+      vi.advanceTimersByTime(REMOTE_DESKTOP_HELD_INPUT.SETTLE_MS);
+      expect(declarations().map((message) => message.keys)).toEqual(['ShiftLeft']);
+
+      // A legitimately long hold (Shift through a long drag) is re-declared, not abandoned.
+      vi.advanceTimersByTime(REMOTE_DESKTOP_HELD_INPUT.REFRESH_MS * 10);
+      const held = declarations();
+      expect(held).toHaveLength(11);
+      expect(held.every((message) => message.keys === 'ShiftLeft' && message.buttons === '')).toBe(true);
+      // Every declaration carries a fresh, increasing sequence (the worker orders by it).
+      const sequences = held.map((message) => message.sequence);
+      expect([...sequences].sort((a, b) => a - b)).toEqual(sequences);
+      expect(new Set(sequences).size).toBe(sequences.length);
+
+      expect(client.key('ShiftLeft', 'Shift', false, false, { control: false, alt: false })).toBe(true);
+      ack();
+      vi.advanceTimersByTime(REMOTE_DESKTOP_HELD_INPUT.SETTLE_MS);
+      expect(declarations().at(-1)).toMatchObject({ keys: '', buttons: '' });
+      const settled = declarations().length;
+      vi.advanceTimersByTime(REMOTE_DESKTOP_HELD_INPUT.REFRESH_MS * 20);
+      expect(declarations()).toHaveLength(settled);
+      client.stop(REMOTE_DESKTOP_STOP_ORIGIN.USER_CLOSE);
+    });
+
+    it('declares held pointer buttons next to held keys, sorted, and drops them on release', async () => {
+      const { client, declarations, ack } = await heldReadyClient();
+      client.key('ControlLeft', 'Control', true, false, { control: true, alt: false });
+      expect(client.pointerButton('right', true, 0.5, 0.5)).toBe(true);
+      expect(client.pointerButton('left', true, 0.5, 0.5)).toBe(true);
+      ack();
+      vi.advanceTimersByTime(REMOTE_DESKTOP_HELD_INPUT.SETTLE_MS);
+      expect(declarations().at(-1)).toMatchObject({ keys: 'ControlLeft', buttons: 'left,right' });
+      client.releasePointerButtons();
+      ack();
+      vi.advanceTimersByTime(REMOTE_DESKTOP_HELD_INPUT.SETTLE_MS);
+      expect(declarations().at(-1)).toMatchObject({ keys: 'ControlLeft', buttons: '' });
+      client.stop(REMOTE_DESKTOP_STOP_ORIGIN.USER_CLOSE);
+    });
+
+    it('a key-up the worker lost (and the viewer forgot) is healed by the next declaration, later keys included', async () => {
+      const { client, declarations, ack } = await heldReadyClient();
+      // MetaLeft down and up both left this viewer; suppose the worker never saw the up.
+      client.key('MetaLeft', 'Meta', true, false, { control: false, alt: false });
+      client.key('MetaLeft', 'Meta', false, false, { control: false, alt: false });
+      // Later events keep arriving.
+      client.key('KeyA', 'a', true, false, { control: false, alt: false });
+      ack();
+      vi.advanceTimersByTime(REMOTE_DESKTOP_HELD_INPUT.SETTLE_MS);
+      // The declaration names only what the viewer holds: the worker may release the rest.
+      expect(declarations().at(-1)).toMatchObject({ keys: 'KeyA', buttons: '' });
+      expect(declarations().every((message) => !message.keys.split(',').includes('MetaLeft'))).toBe(true);
+      client.stop(REMOTE_DESKTOP_STOP_ORIGIN.USER_CLOSE);
+    });
+
+    it('a lifted modifier (up on the remote on purpose) is never declared as held', async () => {
+      const { client, declarations, ack } = await heldReadyClient();
+      client.key('ControlLeft', 'Control', true, false, { control: true, alt: false });
+      expect(client.tapChords([[{ code: 'Home', key: 'Home' }]])).toBe(true);
+      ack();
+      vi.advanceTimersByTime(REMOTE_DESKTOP_HELD_INPUT.SETTLE_MS);
+      expect(declarations().at(-1)).toMatchObject({ keys: '', buttons: '' });
+      client.stop(REMOTE_DESKTOP_STOP_ORIGIN.USER_CLOSE);
+    });
+
+    it('releaseAll (blur, pagehide, hidden tab) declares "nothing held" at once even when the viewer tracks nothing', async () => {
+      const { client, control, declarations } = await heldReadyClient();
+      // Nothing tracked: the conditional RELEASE_ALL does not fire, which is exactly how
+      // a key the viewer forgot used to stay down on the worker after a blur.
+      client.releaseAll();
+      expect(control.sent.map((raw) => JSON.parse(raw).type)).toEqual([REMOTE_DESKTOP_DATA_MSG.HELD_INPUT]);
+      expect(declarations().at(-1)).toMatchObject({ keys: '', buttons: '', inputEpoch: 1 });
+      client.stop(REMOTE_DESKTOP_STOP_ORIGIN.USER_CLOSE);
+    });
+
+    it('releaseAll with something held sends RELEASE_ALL and then the empty declaration, and cancels the refresh', async () => {
+      const { client, control, declarations, ack } = await heldReadyClient();
+      client.key('AltLeft', 'Alt', true, false, { control: false, alt: true });
+      ack();
+      vi.advanceTimersByTime(REMOTE_DESKTOP_HELD_INPUT.SETTLE_MS);
+      control.sent.length = 0;
+      client.releaseAll();
+      ack();
+      expect(control.sent.map((raw) => JSON.parse(raw).type)).toEqual([
+        REMOTE_DESKTOP_DATA_MSG.RELEASE_ALL,
+        REMOTE_DESKTOP_DATA_MSG.HELD_INPUT,
+      ]);
+      vi.advanceTimersByTime(REMOTE_DESKTOP_HELD_INPUT.REFRESH_MS * 10);
+      expect(declarations()).toHaveLength(1);
+      expect(declarations()[0]).toMatchObject({ keys: '' });
+      client.stop(REMOTE_DESKTOP_STOP_ORIGIN.USER_CLOSE);
+    });
+
+    it('a new connection baselines the worker with the empty set as soon as input is enabled', async () => {
+      const { baseline } = await heldReadyClient();
+      // A worker that kept anything from before this connection hears "nothing held".
+      expect(baseline).toHaveLength(1);
+      expect(baseline[0]).toMatchObject({ keys: '', buttons: '', inputEpoch: 1 });
+    });
+
+    it('a control channel that closes fails the session; the held set is not re-sent into a dead channel and no timer outlives it', async () => {
+      const { client, control, declarations, ack } = await heldReadyClient();
+      client.key('ShiftLeft', 'Shift', true, false, { control: false, alt: false });
+      ack();
+      vi.advanceTimersByTime(REMOTE_DESKTOP_HELD_INPUT.SETTLE_MS);
+      const before = declarations().length;
+      control.close();
+      expect(client.current().state).toBe(REMOTE_DESKTOP_STATE.FAILED);
+      vi.advanceTimersByTime(REMOTE_DESKTOP_HELD_INPUT.REFRESH_MS * 10);
+      expect(declarations()).toHaveLength(before);
+      expect(vi.getTimerCount()).toBe(0);
+    });
+
+    it('stop releases, declares empty once, and leaves no timer behind that could send later', async () => {
+      const { client, control, declarations, ack } = await heldReadyClient();
+      client.key('ShiftLeft', 'Shift', true, false, { control: false, alt: false });
+      ack();
+      client.stop(REMOTE_DESKTOP_STOP_ORIGIN.USER_CLOSE);
+      const sent = control.sent.length;
+      expect(declarations().at(-1)).toMatchObject({ keys: '' });
+      vi.advanceTimersByTime(REMOTE_DESKTOP_HELD_INPUT.REFRESH_MS * 20);
+      expect(control.sent).toHaveLength(sent);
+      expect(vi.getTimerCount()).toBe(0);
+    });
+
+    it('a new session starts with its own empty state: nothing the previous session held is declared', async () => {
+      const first = await heldReadyClient();
+      first.client.key('MetaLeft', 'Meta', true, false, { control: false, alt: false });
+      first.client.stop(REMOTE_DESKTOP_STOP_ORIGIN.USER_CLOSE);
+      const second = await heldReadyClient();
+      second.client.releaseAll();
+      expect(second.declarations().at(-1)).toMatchObject({ keys: '', buttons: '' });
+      second.client.stop(REMOTE_DESKTOP_STOP_ORIGIN.USER_CLOSE);
+    });
+
+    it('a declaration is never acknowledged and never fails the session when nothing answers it', async () => {
+      const { client, declarations } = await heldReadyClient();
+      client.releaseAll();
+      expect(declarations()).toHaveLength(1);
+      // An older worker drops the unknown message and never answers: the viewer carries on.
+      vi.advanceTimersByTime(5 * 60_000);
+      expect(client.current().state).not.toBe(REMOTE_DESKTOP_STATE.FAILED);
+      expect(client.current().terminalReason).toBeUndefined();
+      client.stop(REMOTE_DESKTOP_STOP_ORIGIN.USER_CLOSE);
+    });
+
+    it('does not declare outside Control mode or without an input epoch', async () => {
+      const { client, control } = await heldReadyClient();
+      client.stop(REMOTE_DESKTOP_STOP_ORIGIN.USER_CLOSE);
+      control.sent.length = 0;
+      client.releaseAll();
+      expect(control.sent).toHaveLength(0);
+    });
   });
 });
 
