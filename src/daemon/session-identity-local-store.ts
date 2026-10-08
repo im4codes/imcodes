@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
+import { mkdir, open, rename, stat, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { resolveImcodesHome } from '../util/windows-daemon-lock.js';
 import {
@@ -10,6 +10,7 @@ import {
   type SessionIdentityScope,
 } from '../../shared/session-identity.js';
 import { SESSION_IDENTITY_WS } from '../../shared/session-identity-ws.js';
+import { registerMemoryProbe } from './memory-probes.js';
 
 /**
  * Set once at daemon startup (lifecycle.ts, where the server WS connection
@@ -60,20 +61,131 @@ function contentHash(content: string): string {
   return createHash('sha256').update(content, 'utf8').digest('hex');
 }
 
+function emptyStore(): DiskStore {
+  return { version: STORE_VERSION, profiles: {} };
+}
+
+function normalizeParsedStore(parsed: Partial<DiskStore>): DiskStore {
+  if (parsed.version !== STORE_VERSION || !parsed.profiles || typeof parsed.profiles !== 'object') return emptyStore();
+  return {
+    version: STORE_VERSION,
+    profiles: parsed.profiles as Record<string, DiskProfile>,
+    ...(typeof parsed.migratedAt === 'number' ? { migratedAt: parsed.migratedAt } : {}),
+  };
+}
+
+/**
+ * The file is the whole repository: 33.5 MB on 158 (184 sessions, prompts of 250-550 KB), and every list/get used to read and parse
+ * all of it. `fs.promises.readFile(path, 'utf8')` of a big file decodes it in 512 KB chunks into one growing string, so N concurrent
+ * readers hold N half-built copies at once: 20 readers of that file peak at 2 GB of heap, ~200 of them (one per session: a server
+ * `get`, an MCP call, a launch each) exhausted the 8 GB heap, in a few seconds, in `StringDecoder::DecodeData`
+ * (158, 2026-10-08, four guard restarts). Readers now share ONE in-flight read and then the parsed store, as long as the file is
+ * unchanged (identity: inode, size, mtime, taken from the very handle the bytes came from); the bytes are read into one flat
+ * buffer and decoded once.
+ */
+interface StoreSnapshot {
+  signature: string;
+  bytes: number;
+  store: DiskStore;
+}
+
+let cachedSnapshot: StoreSnapshot | null = null;
+let inFlightLoad: { signature: string; promise: Promise<StoreSnapshot | null> } | null = null;
+const readStats = { loads: 0, cacheHits: 0, sharedLoads: 0, inFlightLoads: 0 };
+
+registerMemoryProbe('identityStore', () => ({
+  loads: readStats.loads,
+  cacheHits: readStats.cacheHits,
+  sharedLoads: readStats.sharedLoads,
+  inFlightLoads: readStats.inFlightLoads,
+  cachedBytes: cachedSnapshot?.bytes ?? 0,
+}));
+
+function fileSignature(info: { ino: number; size: number; mtimeMs: number }): string {
+  return `${storePath()}:${info.ino}:${info.size}:${info.mtimeMs}`;
+}
+
+/** Read and parse the file once. Resolves null when the file does not exist; rejects on any other read error. */
+async function loadSnapshot(): Promise<StoreSnapshot | null> {
+  let handle;
+  try {
+    handle = await open(storePath(), 'r');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    throw error;
+  }
+  try {
+    const info = await handle.stat();
+    // No encoding: one Buffer of the file's size, decoded in one call (an encoding makes the runtime build the string chunk by chunk).
+    const bytes = await handle.readFile();
+    readStats.loads += 1;
+    const text = bytes.toString('utf8');
+    let store: DiskStore;
+    try {
+      store = normalizeParsedStore(JSON.parse(text) as Partial<DiskStore>);
+    } catch {
+      // A file that is not JSON holds nothing usable; the next write replaces it.
+      store = emptyStore();
+    }
+    return { signature: fileSignature(info), bytes: bytes.length, store };
+  } finally {
+    await handle.close().catch(() => undefined);
+  }
+}
+
+/** The store as of the file's current content. Shared and read-only: never mutate what this returns (mutators use readStoreForUpdate). */
+async function readSnapshot(): Promise<StoreSnapshot | null> {
+  let signature: string | undefined;
+  try {
+    signature = fileSignature(await stat(storePath()));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') { cachedSnapshot = null; return null; }
+    throw error;
+  }
+  if (cachedSnapshot && cachedSnapshot.signature === signature) {
+    readStats.cacheHits += 1;
+    return cachedSnapshot;
+  }
+  // Only a read of THIS version of the file is shared: a read that started before a write finished must not answer the next
+  // read-modify-write, or that write's change would be lost.
+  if (inFlightLoad && inFlightLoad.signature === signature) {
+    readStats.sharedLoads += 1;
+    return inFlightLoad.promise;
+  }
+  readStats.inFlightLoads += 1;
+  const entry = {
+    signature,
+    promise: loadSnapshot().then((snapshot) => {
+      cachedSnapshot = snapshot;
+      return snapshot;
+    }),
+  };
+  inFlightLoad = entry;
+  try {
+    return await entry.promise;
+  } finally {
+    readStats.inFlightLoads -= 1;
+    if (inFlightLoad === entry) inFlightLoad = null;
+  }
+}
+
+/** Read-only view for list/get. An unreadable store reads as empty, as it always did. */
 async function readStore(): Promise<DiskStore> {
   try {
-    const parsed = JSON.parse(await readFile(storePath(), 'utf8')) as Partial<DiskStore>;
-    if (parsed.version !== STORE_VERSION || !parsed.profiles || typeof parsed.profiles !== 'object') {
-      return { version: STORE_VERSION, profiles: {} };
-    }
-    return {
-      version: STORE_VERSION,
-      profiles: parsed.profiles as Record<string, DiskProfile>,
-      ...(typeof parsed.migratedAt === 'number' ? { migratedAt: parsed.migratedAt } : {}),
-    };
+    return (await readSnapshot())?.store ?? emptyStore();
   } catch {
-    return { version: STORE_VERSION, profiles: {} };
+    return emptyStore();
   }
+}
+
+/**
+ * The store for a read-modify-write: a private copy of the profile map (the profiles themselves are replaced, never edited, so the
+ * copy is cheap and the shared snapshot stays untouched when the write fails). A store that cannot be READ (I/O error) rejects the
+ * mutation instead of reading as empty: writing back "empty + one change" over a store that merely failed to open would wipe it.
+ */
+async function readStoreForUpdate(): Promise<DiskStore> {
+  const store = (await readSnapshot())?.store ?? emptyStore();
+  return { ...store, profiles: { ...store.profiles } };
 }
 
 /** Whether the one-time server->daemon content migration has already run here. */
@@ -83,7 +195,7 @@ export async function isSessionIdentityMigrated(): Promise<boolean> {
 
 export async function markSessionIdentityMigrated(now = Date.now()): Promise<void> {
   return enqueueMutation(async () => {
-    const store = await readStore();
+    const store = await readStoreForUpdate();
     if (typeof store.migratedAt === 'number') return;
     store.migratedAt = now;
     await writeStore(store);
@@ -96,6 +208,8 @@ async function writeStore(store: DiskStore): Promise<void> {
   await mkdir(dirname(target), { recursive: true });
   await writeFile(temporary, `${JSON.stringify(store)}\n`, { mode: 0o600 });
   await rename(temporary, target);
+  // The next reader compares the file's signature with the cached one: the rename changed it, so it loads the new content once.
+  cachedSnapshot = null;
 }
 
 /**
@@ -151,7 +265,7 @@ export async function putLocalSessionIdentityProfile(input: LocalIdentityWrite):
   const error = sessionIdentityContentError(content, input.scope);
   if (error) throw new Error(error);
   const profile = await enqueueMutation(async () => {
-    const store = await readStore();
+    const store = await readStoreForUpdate();
     const previous = store.profiles[key(input.scope, input.scopeKey)];
     const next: DiskProfile = {
       scope: input.scope,
@@ -201,7 +315,7 @@ export async function putLocalSessionIdentityProfileExact(input: {
 }): Promise<SessionIdentityProfile> {
   const content = normalizeSessionIdentityContent(input.content);
   return enqueueMutation(async () => {
-    const store = await readStore();
+    const store = await readStoreForUpdate();
     const profile: DiskProfile = {
       scope: input.scope,
       scopeKey: input.scopeKey,
@@ -224,7 +338,7 @@ export async function removeLocalSessionIdentityProfileQuiet(
   scopeKey: string,
 ): Promise<boolean> {
   return enqueueMutation(async () => {
-    const store = await readStore();
+    const store = await readStoreForUpdate();
     const existed = delete store.profiles[key(scope, scopeKey)];
     if (existed) await writeStore(store);
     return existed;
@@ -236,7 +350,7 @@ export async function removeLocalSessionIdentityProfile(
   scopeKey: string,
 ): Promise<boolean> {
   const existed = await enqueueMutation(async () => {
-    const store = await readStore();
+    const store = await readStoreForUpdate();
     const found = delete store.profiles[key(scope, scopeKey)];
     if (found) await writeStore(store);
     return found;
@@ -247,6 +361,19 @@ export async function removeLocalSessionIdentityProfile(
       : { type: SESSION_IDENTITY_WS.LOCAL_REPORT, scope, scopeKey, deleted: true });
   }
   return existed;
+}
+
+/** Test seam: how the reads were served (counters never include content), and a way to start from a cold cache. */
+export function identityStoreReadStatsForTests(): { loads: number; cacheHits: number; sharedLoads: number } {
+  return { loads: readStats.loads, cacheHits: readStats.cacheHits, sharedLoads: readStats.sharedLoads };
+}
+
+export function resetIdentityStoreCacheForTests(): void {
+  cachedSnapshot = null;
+  inFlightLoad = null;
+  readStats.loads = 0;
+  readStats.cacheHits = 0;
+  readStats.sharedLoads = 0;
 }
 
 export function localSessionIdentityStorePath(): string {
