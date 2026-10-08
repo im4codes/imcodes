@@ -63,6 +63,14 @@ class SessionCore {
   InputResult ApplyText(const TextInput& input);
 
   void ReleaseController(std::string_view controller_id) noexcept;
+  // The viewer's declaration of what it holds: releases whatever this session
+  // holds that the viewer does not (see InputLedger::ReconcileHeld).
+  InputResult ReconcileHeldInput(const std::vector<std::string>& keys,
+                                 const std::vector<std::string>& buttons,
+                                 InputSequence declaration_sequence);
+  [[nodiscard]] bool HoldsInput() const noexcept {
+    return input_ledger_.HoldsInput();
+  }
   void ReportAdapterFailure(TerminalError error) noexcept;
   void Stop(TerminalError error) noexcept;
 
@@ -82,14 +90,6 @@ class SessionCore {
   InputResult HandleLedgerResult(InputResult result,
                                  std::string_view operation);
   void ReleaseAllControllers() noexcept;
-  // The viewer's declaration of what it holds: releases whatever this session
-  // holds that the viewer does not (see InputLedger::ReconcileHeld).
-  InputResult ReconcileHeldInput(const std::vector<std::string>& keys,
-                                 const std::vector<std::string>& buttons,
-                                 InputSequence declaration_sequence);
-  [[nodiscard]] bool HoldsInput() const noexcept {
-    return input_ledger_.HoldsInput();
-  }
   void StopPlatformResources() noexcept;
 
   PlatformAdapters adapters_;

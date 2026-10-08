@@ -698,6 +698,22 @@ int main() {
   Require(input.key_events.size() == 2 && !input.key_events[1].second,
           "last controller release emits key up");
 
+  // The platform sessions (macOS, Linux) reach the held-input reconcile through
+  // SessionCore's PUBLIC API; calling it from here is what keeps a private
+  // member from reaching the platform-only CI compile again.
+  Require(!core.HoldsInput(), "no input is held before the reconcile fixture");
+  Require(core.ApplyKey({Stamp("keyboard", 10), "MetaLeft", true}) ==
+              common::InputResult::kApplied &&
+              core.HoldsInput(),
+          "reconcile fixture holds a key");
+  Require(core.ReconcileHeldInput({"MetaLeft"}, {}, 11) ==
+              common::InputResult::kApplied && core.HoldsInput(),
+          "a declared key stays held through SessionCore");
+  Require(core.ReconcileHeldInput({}, {}, 12) ==
+              common::InputResult::kApplied && !core.HoldsInput() &&
+              !input.key_events.empty() && !input.key_events.back().second,
+          "an empty declaration releases the key through SessionCore");
+
   Require(core.ApplyKey({Stamp("controller-a", 4), "KeyQ", true}) ==
               common::InputResult::kApplied,
           "terminal fixture holds a key");
