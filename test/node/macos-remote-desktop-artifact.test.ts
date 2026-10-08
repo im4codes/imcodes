@@ -6,9 +6,11 @@ import {
   mkdir,
   mkdtemp,
   readFile,
+  readdir,
   rm,
   symlink,
   unlink,
+  utimes,
   writeFile,
 } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -32,6 +34,7 @@ import { REMOTE_DESKTOP_PROTOCOL_VERSION } from '../../shared/remote-desktop.js'
 import {
   MACOS_REMOTE_DESKTOP_APPLE_TOOLS,
   promoteMacosRemoteDesktopArtifact,
+  pruneMacosRemoteDesktopArtifactStoreBacklog,
   rollbackMacosRemoteDesktopArtifact,
   selectMacosRemoteDesktopArtifact,
   upgradeMacosRemoteDesktopArtifact,
@@ -832,5 +835,48 @@ describe('macOS remote-desktop multi-component artifact adapter', () => {
       storeRoot: linkedReleases.storeRoot,
     }, dependencies(trustedExecutor().execute)))
       .rejects.toThrow(/macos_remote_desktop_artifact_releases_(?:not_directory|untrusted)/);
+  });
+  it('pruning real promoted releases keeps rollback and selection working, and a pruned set can be promoted again', async () => {
+    const versions = ['2026.8.4000', '2026.8.4001', '2026.8.4002', '2026.8.4003', '2026.8.4004', '2026.8.4005'];
+    const candidates = [];
+    for (const version of versions) candidates.push(await fixture('arm64', version));
+    const storeRoot = candidates[0]!.storeRoot;
+    const deps = dependencies(trustedExecutor().execute);
+    for (const candidate of candidates) {
+      await promoteMacosRemoteDesktopArtifact({ ...candidate, storeRoot, expectedWorkerVersion: candidate.manifest.workerVersion }, deps);
+    }
+    const releases = join(storeRoot, 'releases');
+    expect((await readdir(releases)).filter((name) => name.startsWith('sha256-'))).toHaveLength(6);
+    // age every release, the oldest first, as a Mac that has been updating for weeks would have them
+    const base = Date.UTC(2026, 8, 1);
+    const releaseOfVersion = new Map<string, string>();
+    for (const name of (await readdir(releases)).filter((entry) => entry.startsWith('sha256-'))) {
+      const manifest = JSON.parse(await readFile(join(releases, name, REMOTE_DESKTOP_MACOS_MANIFEST_FILENAME), 'utf8'));
+      releaseOfVersion.set(manifest.workerVersion, name);
+    }
+    await Promise.all(versions.map((version, index) => {
+      const when = new Date(base + index * 86_400_000);
+      return utimes(join(releases, releaseOfVersion.get(version)!), when, when);
+    }));
+
+    const summary = await pruneMacosRemoteDesktopArtifactStoreBacklog(storeRoot, {
+      ...deps,
+      now: () => base + 60 * 86_400_000,
+      releasesInUse: async () => new Set(),
+      limits: { KEEP_NEWEST_RELEASES: 2 },
+    }, { sleep: async () => {} });
+    expect(summary.removed).toBe(4);
+    const left = (await readdir(releases)).filter((name) => name.startsWith('sha256-')).sort();
+    expect(left).toEqual([releaseOfVersion.get(versions[4]!)!, releaseOfVersion.get(versions[5]!)!].sort());
+
+    // rollback target is intact and verifies; current still selects the newest set
+    expect((await selectMacosRemoteDesktopArtifact(storeRoot, 'current', deps))?.manifest.workerVersion).toBe(versions[5]);
+    expect((await selectMacosRemoteDesktopArtifact(storeRoot, 'lastKnownGood', deps))?.manifest.workerVersion).toBe(versions[4]);
+    expect((await rollbackMacosRemoteDesktopArtifact({ storeRoot }, deps)).manifest.workerVersion).toBe(versions[4]);
+
+    // a pruned set that comes back (a downgrade or a re-release of the same bytes) is published again as a fresh release
+    const again = await promoteMacosRemoteDesktopArtifact({ ...candidates[0]!, storeRoot }, deps);
+    expect(again.manifest.workerVersion).toBe(versions[0]);
+    expect((await readdir(releases)).filter((name) => name.startsWith('.'))).toEqual([]);
   });
 });

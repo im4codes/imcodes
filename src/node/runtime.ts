@@ -38,7 +38,11 @@ import {
   type ControlledNodeRemoteDesktopWorkerRefreshContext,
   type ControlledNodeRemoteDesktopWorkerRefreshResult,
 } from './self-upgrade.js';
-import { promoteMacosRemoteDesktopArtifact, selectMacosRemoteDesktopArtifact } from './macos-remote-desktop-artifact.js';
+import {
+  promoteMacosRemoteDesktopArtifact,
+  pruneMacosRemoteDesktopArtifactStoreBacklog,
+  selectMacosRemoteDesktopArtifact,
+} from './macos-remote-desktop-artifact.js';
 import { defaultMacosRemoteDesktopArtifactStoreRoot } from './macos-remote-desktop-production.js';
 import type { ControlledNodeCredential } from './enrollment.js';
 import {
@@ -341,6 +345,8 @@ export interface ControlledNodeRuntimeOptions {
   serverClock?: ServerClockEstimator;
   /** Test seam: whether the store already holds a verified set for this release. */
   macosRemoteDesktopComponentsInstalled?: () => Promise<boolean>;
+  /** Test seam: the removal of old macOS worker releases (default: the store's bounded prune, drained over short passes). */
+  pruneMacosRemoteDesktopReleases?: (input: { isBusy: () => boolean }) => Promise<unknown>;
   /** Injected for the same reason: raising a real TCC prompt needs a real Mac. */
   requestMacosRemoteDesktopPermissions?: () => Promise<boolean>;
   onAuthenticated?: () => void | Promise<void>;
@@ -983,6 +989,27 @@ export function createControlledNodeRuntime(
   };
   const componentArch = arch === 'arm64' ? 'arm64' : 'x64';
   const storeRoot = defaultMacosRemoteDesktopArtifactStoreRoot(componentArch);
+  /**
+   * Old worker releases are removed from the store: every worker build publishes a new 15-17 MB release directory and nothing
+   * removed one (334 of them, 4.9 GB, on one Mac). Once at start (the first authenticated heartbeat) and after every promotion;
+   * never while an install is running, short bounded passes, a failure is logged and changes nothing.
+   */
+  let macosReleasePruneInFlight = false;
+  let macosReleasePruneStartedOnce = false;
+  const pruneMacosRemoteDesktopReleases = (): void => {
+    if (platform !== 'darwin' || (arch !== 'arm64' && arch !== 'x64') || macosReleasePruneInFlight) return;
+    macosReleasePruneInFlight = true;
+    const isBusy = (): boolean => macosRemoteDesktopInstallInFlight;
+    void Promise.resolve()
+      .then(() => (options.pruneMacosRemoteDesktopReleases ?? ((input: { isBusy: () => boolean }) =>
+        pruneMacosRemoteDesktopArtifactStoreBacklog(storeRoot, { runtime: { platform, arch: componentArch }, isBusy })))({ isBusy }))
+      .then((summary) => {
+        const removed = (summary as { removed?: number } | undefined)?.removed ?? 0;
+        if (removed > 0) logger.info({ summary }, 'removed old macOS remote-desktop worker releases');
+      })
+      .catch((error) => { logger.warn({ err: error }, 'macOS remote-desktop worker release cleanup failed'); })
+      .finally(() => { macosReleasePruneInFlight = false; });
+  };
   /** Whether the store's selected macOS component set is THIS release's. */
   const isInstalledForThisRelease = options.macosRemoteDesktopComponentsInstalled
     ?? (options.installMacosRemoteDesktopComponents ? async () => false : async () => {
@@ -1156,6 +1183,7 @@ export function createControlledNodeRuntime(
       if (installed) {
         logger.info('installed the macOS remote-desktop component set');
         macosRemoteDesktopInstalledForRelease = true;
+        pruneMacosRemoteDesktopReleases();
         // START what was just installed. The adapter's startup runs once,
         // before the socket connects -- on a machine installing for the first
         // time that is exactly when there is nothing to start, so it failed,
@@ -1676,6 +1704,10 @@ export function createControlledNodeRuntime(
         // fetch them is asking them to do what the node can do unprompted. The
         // manual request remains as a retry for when this fails.
         void installMacosRemoteDesktopComponents();
+        if (!macosReleasePruneStartedOnce) {
+          macosReleasePruneStartedOnce = true;
+          pruneMacosRemoteDesktopReleases();
+        }
         try {
           void Promise.resolve(options.onHeartbeatAck?.()).then(async () => {
             // `onHeartbeatAck` is what triggers the health-lease publisher's

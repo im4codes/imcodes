@@ -138,4 +138,65 @@ describe('macOS worker refresh runtime', () => {
     expect(promoteMacSet).not.toHaveBeenCalled();
     runtime.stop();
   });
+  describe('old worker release cleanup', () => {
+    const open = (runtimeOptions: Record<string, unknown>, serverId: string) => {
+      const socket = new MockSocket();
+      const runtime = createControlledNodeRuntime({
+        serverUrl: 'https://im.example', serverId, token: 'secret', nodeRole: NODE_ROLE.CONTROLLED,
+      }, () => socket, {
+        remoteDesktopWorker: { available: vi.fn(() => true), sessionCapabilities: vi.fn(() => [REMOTE_DESKTOP_CAPABILITY]), close: vi.fn() },
+        macosRemoteDesktopComponentsInstalled: async () => true,
+        now: () => 10_000,
+        ...runtimeOptions,
+      } as never);
+      runtime.start();
+      socket.open();
+      return { socket, runtime };
+    };
+
+    it('starts once on the first authenticated heartbeat, not again on later ones, and waits while an install runs', async () => {
+      const prune = vi.fn(async (_input: { isBusy: () => boolean }) => ({ removed: 3 }));
+      selectMacSet.mockResolvedValue({ manifest: { workerVersion: '2026.9.5113-dev.5644' } });
+      downloadMacSet.mockResolvedValue(undefined);
+      const { socket, runtime } = open({ platform: 'darwin', arch: 'arm64', pruneMacosRemoteDesktopReleases: prune }, 'prune-start');
+      expect(prune).not.toHaveBeenCalled();
+      socket.emit('message', JSON.stringify({ type: 'heartbeat_ack' }));
+      await vi.waitFor(() => expect(prune).toHaveBeenCalledOnce());
+      socket.emit('message', JSON.stringify({ type: 'heartbeat_ack' }));
+      socket.emit('message', JSON.stringify({ type: 'heartbeat_ack' }));
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(prune).toHaveBeenCalledOnce();
+      expect(typeof prune.mock.calls[0]![0].isBusy).toBe('function');
+      runtime.stop();
+    });
+
+    it('runs again after a worker set was installed, and a failing cleanup changes nothing else', async () => {
+      const root = await mkdtemp(join(tmpdir(), 'imcodes-mac-worker-prune-'));
+      tempDirs.push(root);
+      const manifestPath = join(root, 'manifest.json');
+      await writeFile(manifestPath, JSON.stringify({ workerVersion: '2026.10.5371-dev.5816' }));
+      downloadMacSet.mockResolvedValue({ componentDirectory: join(root, 'components'), manifestPath, artifactSha256: 'a'.repeat(64) });
+      selectMacSet.mockResolvedValue({ manifest: { workerVersion: '2026.9.5113-dev.5644' } });
+      promoteMacSet.mockResolvedValue({ setSha256: 'b'.repeat(64) });
+      const prune = vi.fn(async (_input: { isBusy: () => boolean }) => { throw new Error('disk exploded'); });
+      const { socket, runtime } = open({ platform: 'darwin', arch: 'arm64', pruneMacosRemoteDesktopReleases: prune }, 'prune-after-install');
+      socket.emit('message', JSON.stringify({ type: 'heartbeat_ack' }));
+      await vi.waitFor(() => expect(promoteMacSet).toHaveBeenCalledOnce());
+      await vi.waitFor(() => expect(prune.mock.calls.length).toBeGreaterThanOrEqual(1));
+      await vi.waitFor(() => {
+        const statuses = socket.sent.map((raw) => JSON.parse(raw)).filter((frame) => frame.type === DAEMON_MSG.CONTROLLED_NODE_WORKER_REFRESH_STATUS);
+        expect(statuses.at(-1)).toEqual(expect.objectContaining({ phase: 'succeeded' }));
+      });
+      runtime.stop();
+    });
+
+    it('never runs on a platform without this store', async () => {
+      const prune = vi.fn(async () => ({ removed: 1 }));
+      const { socket, runtime } = open({ platform: 'linux', arch: 'x64', pruneMacosRemoteDesktopReleases: prune }, 'prune-linux');
+      socket.emit('message', JSON.stringify({ type: 'heartbeat_ack' }));
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      expect(prune).not.toHaveBeenCalled();
+      runtime.stop();
+    });
+  });
 });

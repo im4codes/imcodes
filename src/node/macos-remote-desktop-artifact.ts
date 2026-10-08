@@ -7,6 +7,7 @@ import {
   mkdir,
   mkdtemp,
   open,
+  opendir,
   readFile,
   readdir,
   rename,
@@ -22,6 +23,13 @@ import {
   type RemoteDesktopMacosWorkerManifest,
   validateRemoteDesktopWorkerReleaseManifest,
 } from '../../shared/remote-desktop-worker.js';
+import {
+  REMOTE_DESKTOP_WORKER_ENTRY_KIND,
+  REMOTE_DESKTOP_WORKER_RETENTION,
+  planRemoteDesktopWorkerPrune,
+  type RemoteDesktopWorkerStoreEntry,
+} from '../../shared/remote-desktop-worker-retention.js';
+import { MACOS_REMOTE_DESKTOP_GLOBAL_LAUNCH_AGENT_PATH } from './macos-user-session.js';
 import {
   MACOS_APPLE_TOOLS,
   macosAppleCommandFailed,
@@ -897,4 +905,285 @@ export async function upgradeMacosRemoteDesktopArtifact(
     }
     throw primaryError;
   }
+}
+
+// ---------------------------------------------------------------------------------------------------------------------------
+// Retention. Every distinct worker build publishes a new `releases/sha256-*` directory (15-17 MB) and nothing ever removed one:
+// a Mac that updates often held 334 of them (4.9 GB) while only `current` and `last-known-good` are ever read. The decision of what
+// may go is the shared policy (shared/remote-desktop-worker-retention.ts); this is the macOS half that lists the store, says what
+// is in use, and removes safely.
+// ---------------------------------------------------------------------------------------------------------------------------
+
+/** A release is renamed to this before it is deleted: a crash mid-delete can then never leave a half-removed `sha256-*` that a
+ * later promotion of the same set would find, fail to verify, and keep failing on. */
+const PRUNING_PREFIX = '.pruning-';
+const STAGING_PREFIX = '.staging-';
+const RELEASE_NAME_ANYWHERE_RE = /sha256-[a-f0-9]{64}/gu;
+const MAX_INUSE_PLIST_BYTES = 256 * 1024;
+const MAX_PROCESS_LIST_BYTES = 16 * 1024 * 1024;
+
+export type MacosRemoteDesktopPruneSkip =
+  | 'no_store'
+  | 'busy'
+  | 'already_running'
+  | 'untrusted_store'
+  | 'selector_invalid'
+  | 'in_use_probe_failed';
+
+export interface MacosRemoteDesktopPruneResult {
+  removed: number;
+  failed: number;
+  /** More removable entries exist than this pass may remove (or the pass had to wait): run another. */
+  moreWork: boolean;
+  skipped?: MacosRemoteDesktopPruneSkip;
+}
+
+export interface MacosRemoteDesktopPruneDependencies extends MacosRemoteDesktopArtifactDependencies {
+  now?: () => number;
+  /**
+   * Names of the releases a running worker or an installed launchd job still points at. If it throws the pass changes nothing: an
+   * unknown is treated as in use.
+   */
+  releasesInUse?: (storeRoot: string) => Promise<ReadonlySet<string>>;
+  /** True while a promotion or upgrade of this process is in flight; the pass then waits. */
+  isBusy?: () => boolean;
+  /** Test seams for a locked or failing entry. */
+  renameEntry?: (from: string, to: string) => Promise<void>;
+  removeEntry?: (path: string) => Promise<void>;
+  limits?: Partial<typeof REMOTE_DESKTOP_WORKER_RETENTION>;
+}
+
+const pruneRunning = new Set<string>();
+/** store root -> entry name -> passes left to leave it alone after it could not be removed. */
+const pruneSkips = new Map<string, Map<string, number>>();
+
+/** Releases named by the installed launchd plist and by running processes' command lines. Deliberately generous: any release hash
+ * that appears is kept, because keeping one too many costs 15 MB and removing one in use costs the remote desktop. */
+export async function defaultMacosRemoteDesktopReleasesInUse(): Promise<ReadonlySet<string>> {
+  const names = new Set<string>();
+  const collect = (text: string): void => {
+    for (const match of text.matchAll(RELEASE_NAME_ANYWHERE_RE)) names.add(match[0]);
+  };
+  try {
+    const info = await lstat(MACOS_REMOTE_DESKTOP_GLOBAL_LAUNCH_AGENT_PATH);
+    if (info.isFile() && info.size <= MAX_INUSE_PLIST_BYTES) {
+      collect(await readFile(MACOS_REMOTE_DESKTOP_GLOBAL_LAUNCH_AGENT_PATH, 'utf8'));
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+  }
+  const processList = await new Promise<string>((resolveOutput, reject) => {
+    execFile('/bin/ps', ['-axo', 'command='], {
+      encoding: 'utf8', timeout: COMMAND_TIMEOUT_MS, maxBuffer: MAX_PROCESS_LIST_BYTES,
+    }, (error, stdout) => (error ? reject(error) : resolveOutput(String(stdout))));
+  });
+  collect(processList);
+  return names;
+}
+
+function takeSkippedNames(storeRoot: string): Set<string> {
+  const skips = pruneSkips.get(storeRoot);
+  const active = new Set<string>();
+  if (!skips) return active;
+  for (const [name, left] of skips) {
+    if (left <= 0) { skips.delete(name); continue; }
+    active.add(name);
+    skips.set(name, left - 1);
+  }
+  return active;
+}
+
+function rememberFailure(storeRoot: string, name: string, passes: number): void {
+  let skips = pruneSkips.get(storeRoot);
+  if (!skips) { skips = new Map(); pruneSkips.set(storeRoot, skips); }
+  skips.set(name, passes);
+}
+
+async function readSelectorsForPrune(storeRoot: string): Promise<Set<string>> {
+  const names = new Set<string>();
+  for (const selector of Object.values(MACOS_REMOTE_DESKTOP_ARTIFACT_SELECTORS)) {
+    const name = await readSelector(storeRoot, selector);
+    if (name !== null) names.add(name);
+  }
+  return names;
+}
+
+/**
+ * One bounded pass over the release store. Costs: names are read without a stat (up to the scan cap), only names shaped like ours
+ * are examined (candidate cap), at most `MAX_REMOVALS_PER_PASS` directories are removed. Never removed: the selected releases (read
+ * again right before each removal), anything a running worker or the launchd plist names, the newest few releases, anything younger
+ * than the minimum age, and anything that is not a plain directory owned by the daemon's user or root. Nothing outside the
+ * `releases` directory is touched, and nothing is created.
+ */
+export async function pruneMacosRemoteDesktopArtifactStore(
+  storeRoot: string,
+  dependencies: MacosRemoteDesktopPruneDependencies = {},
+): Promise<MacosRemoteDesktopPruneResult> {
+  runtimeTarget(dependencies.runtime ?? { platform: process.platform, arch: process.arch });
+  const root = resolve(storeRoot);
+  const limits = { ...REMOTE_DESKTOP_WORKER_RETENTION, ...dependencies.limits };
+  if (pruneRunning.has(root)) return { removed: 0, failed: 0, moreWork: false, skipped: 'already_running' };
+  if (dependencies.isBusy?.()) return { removed: 0, failed: 0, moreWork: true, skipped: 'busy' };
+  pruneRunning.add(root);
+  try {
+    const expectedUid = storeOwnerUid(dependencies.runtime);
+    const releasesDirectory = join(root, RELEASES_DIRECTORY);
+    try {
+      await lstat(releasesDirectory);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { removed: 0, failed: 0, moreWork: false, skipped: 'no_store' };
+      return { removed: 0, failed: 0, moreWork: false, skipped: 'untrusted_store' };
+    }
+    try {
+      // Read-only trust: unlike `requireTrustedStoreForRead` this never chmods anything.
+      await requireTrustedStoreDirectory(root, 'store', expectedUid);
+      await requireTrustedStoreDirectory(releasesDirectory, 'releases', expectedUid);
+    } catch {
+      return { removed: 0, failed: 0, moreWork: false, skipped: 'untrusted_store' };
+    }
+
+    let selected: Set<string>;
+    try {
+      selected = await readSelectorsForPrune(root);
+    } catch {
+      return { removed: 0, failed: 0, moreWork: false, skipped: 'selector_invalid' };
+    }
+    let inUse: ReadonlySet<string>;
+    try {
+      inUse = await (dependencies.releasesInUse ?? defaultMacosRemoteDesktopReleasesInUse)(root);
+    } catch {
+      return { removed: 0, failed: 0, moreWork: false, skipped: 'in_use_probe_failed' };
+    }
+
+    // Names only: a store that grew a backlog is exactly the case where a stat per entry would be the cost.
+    const names: string[] = [];
+    let scanned = 0;
+    const directory = await opendir(releasesDirectory);
+    try {
+      for await (const entry of directory) {
+        scanned += 1;
+        if (RELEASE_NAME_RE.test(entry.name)
+          || entry.name.startsWith(STAGING_PREFIX) || entry.name.startsWith(PRUNING_PREFIX)) {
+          names.push(entry.name);
+          if (names.length >= limits.MAX_CANDIDATES_PER_PASS) break;
+        }
+        if (scanned >= limits.MAX_ENTRIES_SCANNED) break;
+      }
+    } finally {
+      await directory.close().catch(() => {});
+    }
+
+    const identities = new Map<string, { dev: number; ino: number; mtimeMs: number }>();
+    const entries: RemoteDesktopWorkerStoreEntry[] = [];
+    for (const name of names) {
+      let info;
+      try {
+        info = await lstat(join(releasesDirectory, name));
+      } catch {
+        continue; // gone since the listing
+      }
+      if (!info.isDirectory() || info.isSymbolicLink()) continue; // never follow or remove what is not a plain directory
+      if (expectedUid !== undefined && info.uid !== 0 && info.uid !== expectedUid) continue;
+      identities.set(name, { dev: info.dev, ino: info.ino, mtimeMs: info.mtimeMs });
+      entries.push({
+        name,
+        kind: RELEASE_NAME_RE.test(name)
+          ? REMOTE_DESKTOP_WORKER_ENTRY_KIND.RELEASE
+          : REMOTE_DESKTOP_WORKER_ENTRY_KIND.TEMPORARY,
+        mtimeMs: info.mtimeMs,
+      });
+    }
+
+    const plan = planRemoteDesktopWorkerPrune({
+      entries,
+      protectedNames: new Set([...selected, ...inUse]),
+      skipNames: takeSkippedNames(root),
+      nowMs: (dependencies.now ?? Date.now)(),
+      keepNewest: limits.KEEP_NEWEST_RELEASES,
+      minReleaseAgeMs: limits.MIN_RELEASE_AGE_MS,
+      minTemporaryAgeMs: limits.MIN_TEMPORARY_AGE_MS,
+      maxRemovals: limits.MAX_REMOVALS_PER_PASS,
+    });
+
+    const renameEntry = dependencies.renameEntry ?? ((from: string, to: string) => rename(from, to));
+    const removeEntry = dependencies.removeEntry ?? ((path: string) => rm(path, { recursive: true, force: true }));
+    let removed = 0;
+    let failed = 0;
+    for (const entry of plan.remove) {
+      const path = join(releasesDirectory, entry.name);
+      try {
+        if (entry.kind === REMOTE_DESKTOP_WORKER_ENTRY_KIND.RELEASE) {
+          // The selectors are read AGAIN for every removal: a promotion that selected this release since the plan was made wins.
+          const current = await readSelectorsForPrune(root);
+          if (current.has(entry.name)) continue;
+        }
+        const info = await lstat(path);
+        const identity = identities.get(entry.name);
+        if (!identity || !info.isDirectory() || info.isSymbolicLink()
+          || info.dev !== identity.dev || info.ino !== identity.ino || info.mtimeMs !== identity.mtimeMs) continue;
+        if (entry.kind === REMOTE_DESKTOP_WORKER_ENTRY_KIND.RELEASE) {
+          const doomed = join(releasesDirectory, `${PRUNING_PREFIX}${randomUUID()}`);
+          await renameEntry(path, doomed);
+          removed += 1;
+          try {
+            await removeEntry(doomed);
+          } catch {
+            // Already invisible as a release; a later pass removes the leftover `.pruning-*` directory.
+          }
+        } else {
+          await removeEntry(path);
+          removed += 1;
+        }
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue;
+        failed += 1;
+        rememberFailure(root, entry.name, limits.FAILED_ENTRY_SKIP_PASSES);
+      }
+    }
+    return { removed, failed, moreWork: plan.moreWork };
+  } finally {
+    pruneRunning.delete(root);
+  }
+}
+
+export interface MacosRemoteDesktopPruneBacklogSummary {
+  passes: number;
+  removed: number;
+  failed: number;
+  moreWork: boolean;
+  lastSkipped?: MacosRemoteDesktopPruneSkip;
+}
+
+/**
+ * Drain a backlog as short passes with a pause between them (each pass is bounded; together they empty a store of any size), and
+ * stop after a bounded number of passes whatever is left: the next start continues.
+ */
+export async function pruneMacosRemoteDesktopArtifactStoreBacklog(
+  storeRoot: string,
+  dependencies: MacosRemoteDesktopPruneDependencies = {},
+  options: {
+    delayMs?: number;
+    maxPasses?: number;
+    sleep?: (ms: number) => Promise<void>;
+    onPass?: (result: MacosRemoteDesktopPruneResult, pass: number) => void;
+  } = {},
+): Promise<MacosRemoteDesktopPruneBacklogSummary> {
+  const delayMs = options.delayMs ?? REMOTE_DESKTOP_WORKER_RETENTION.BACKLOG_PASS_DELAY_MS;
+  const maxPasses = options.maxPasses ?? REMOTE_DESKTOP_WORKER_RETENTION.BACKLOG_MAX_PASSES;
+  const sleep = options.sleep ?? ((ms: number) => new Promise<void>((resolveSleep) => {
+    setTimeout(resolveSleep, ms).unref?.();
+  }));
+  const summary: MacosRemoteDesktopPruneBacklogSummary = { passes: 0, removed: 0, failed: 0, moreWork: false };
+  while (summary.passes < maxPasses) {
+    const result = await pruneMacosRemoteDesktopArtifactStore(storeRoot, dependencies);
+    summary.passes += 1;
+    summary.removed += result.removed;
+    summary.failed += result.failed;
+    summary.moreWork = result.moreWork;
+    if (result.skipped) summary.lastSkipped = result.skipped;
+    options.onPass?.(result, summary.passes);
+    if (!result.moreWork) break;
+    if (summary.passes < maxPasses) await sleep(delayMs);
+  }
+  return summary;
 }
