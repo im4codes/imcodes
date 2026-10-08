@@ -25,6 +25,7 @@
  * daemon tests order-dependent and can false-pass or false-fail them. Only the
  * environment was ever repaired per file; the filesystem was not.
  */
+import { LEGACY_SUPERVISION_PERIODIC_ENV } from '../../shared/legacy-supervision.js';
 import { afterAll } from 'vitest';
 import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { userInfo } from 'node:os';
@@ -71,6 +72,9 @@ process.env.USERPROFILE = ISOLATED_HOME;
 // supervision-worktree-gc, which prefer it over homedir(). Pointed at the same
 // place so both routes resolve identically.
 process.env.IMCODES_HOME = ISOLATED_IMCODES_HOME;
+// The legacy supervision periodic passes are OFF by default in production (shared/legacy-supervision.ts). The legacy code still exists,
+// so its tests run with the switch on; a test of the default behaviour deletes this variable itself.
+process.env[LEGACY_SUPERVISION_PERIODIC_ENV] = '1';
 
 let cleaned = false;
 

@@ -41,6 +41,7 @@ import {
   overlayCachedExecutionPools,
 } from './supervisor-defaults-cache.js';
 import { runPeriodicPass } from './event-loop-watchdog.js';
+import { isLegacySupervisionPeriodicEnabled } from '../../shared/legacy-supervision.js';
 import logger from '../util/logger.js';
 import {
   PEER_AUDIT_REWORK_AUTOMATION_KIND,
@@ -1304,6 +1305,13 @@ class SupervisionAutomation {
       if (!canSessionRoleOwnAutomaticSupervision(session.role)) continue;
       this.applyPersistedSnapshot(session.name);
     }
+    // The legacy implementation watchdog (its per-minute pass reads and parses the whole legacy task registry, housekeeps and converges it,
+    // and re-dispatches audits) only runs when the legacy periodic switch is on; the default is off (shared/legacy-supervision.ts).
+    // Browsers then see no assignment deadline, which is the same state as a session with nothing to wake.
+    if (!isLegacySupervisionPeriodicEnabled()) {
+      queueMicrotask(() => this.flushAllProjectBrainModeStates());
+      return;
+    }
     const runImplementationWatchdogTick = () => {
       // The tick is asynchronous now, so it can outlive its interval. Guard
       // re-entry: overlapping watchdog passes would re-create exactly the
@@ -1664,6 +1672,7 @@ class SupervisionAutomation {
   }
 
   private async checkImplementationAssignments(now: number): Promise<void> {
+    if (!isLegacySupervisionPeriodicEnabled()) return;
     const registry = getSupervisionTaskRegistry();
     const assignmentSchedules = new Map<string, {
       kind: typeof SUPERVISION_HEARTBEAT_KIND.AUDIT | typeof SUPERVISION_HEARTBEAT_KIND.IMPLEMENTATION;

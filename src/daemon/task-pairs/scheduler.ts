@@ -19,6 +19,7 @@ import {
 } from '../supervision-heartbeat-projection.js';
 import { SUPERVISION_EXECUTION_SELECTION_SOURCES } from '../../../shared/supervision-execution-pool.js';
 import { runPeriodicPass } from '../event-loop-watchdog.js';
+import { isLegacySupervisionPeriodicEnabled } from '../../../shared/legacy-supervision.js';
 import logger from '../../util/logger.js';
 import { resolve as resolvePath } from 'node:path';
 import { getSession, listSessions, type SessionRecord } from '../../store/session-store.js';
@@ -178,6 +179,10 @@ export function isTaskPairBrainReminderGapSatisfied(now: number, lastDeliveryAt 
 }
 
 async function defaultImportLegacy(now: number): Promise<void> {
+  // The per-heartbeat re-import pages through the WHOLE legacy registry (every task hydrated) to pick up a project that was switched to
+  // `pairs` while the daemon runs. With the legacy periodic switch off (shared/legacy-supervision.ts, the default) that scan does not run
+  // on every tick; the one-time import at daemon start (lifecycle.ts) still does.
+  if (!isLegacySupervisionPeriodicEnabled()) return;
   const [{ importLegacyTasks }, { getSupervisionTaskRegistry }] = await Promise.all([
     import('./legacy-import.js'),
     import('../supervision-state-store.js'),

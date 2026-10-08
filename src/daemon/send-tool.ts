@@ -1,6 +1,7 @@
 import { IMCODES_EXTERNAL_CLI_SENDER } from '../../shared/imcodes-send.js';
 import { CHAT_MESSAGE_ORIGINS } from '../../shared/chat-message-origin.js';
 import { isLegacyDispatchInertProject, isPairsEngineProject, isTaskPairEngineActive, projectBrainSession } from './task-pairs/engine.js';
+import { isLegacySupervisionPeriodicEnabled } from '../../shared/legacy-supervision.js';
 import { taskPairService } from './task-pairs/service.js';
 import { getTaskPairStore } from './task-pairs/store.js';
 import {
@@ -5210,6 +5211,9 @@ export async function runSupervisionConvergenceTick(
   deps: ReadyAuditDispatchDeps & { limit?: number } = {},
 ): Promise<SupervisionConvergenceTickResult> {
   if (supervisionConvergenceTickRunning) return { converged: [], audits: [], skipped: true };
+  // The legacy periodic switch (shared/legacy-supervision.ts): off by default, and then nothing here touches the legacy registry -- no
+  // lifecycle convergence, no re-dispatch, no worktree GC -- whether the caller is the watchdog, the boot sweep or a finish/receipt wire.
+  if (!isLegacySupervisionPeriodicEnabled()) return { converged: [], audits: [], skipped: true };
   supervisionConvergenceTickRunning = true;
   try {
     const registry = deps.registry ?? getSupervisionTaskRegistry();
