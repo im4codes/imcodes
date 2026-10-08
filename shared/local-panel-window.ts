@@ -121,8 +121,12 @@ export const LOCAL_PANEL_WINDOWS_HOST = Object.freeze({
   /** Exit code of the host when the WebView2 runtime is not installed. */
   exitRuntimeMissing: 3,
   retryMilliseconds: 2000,
-  /** How long the node waits, after starting the host, for it to die (non-zero exit) before it counts as started. */
-  launchWaitMilliseconds: 8000,
+  /**
+   * How long the node waits, after starting the host, for it to die (non-zero exit) before it counts as started. The host checks its
+   * runtime before it shows anything, so the failure it reports ("runtime missing") arrives within a moment; the answer to a click, and
+   * the guard against a second start, are held for this long, so it is kept short.
+   */
+  launchWaitMilliseconds: 2000,
   /**
    * A node running as the desktop user (a shortcut) starts the host itself and watches it this long for an early non-zero exit: the
    * host checks for its runtime before it shows anything, so "runtime missing" arrives at once; a window that is still up has started.

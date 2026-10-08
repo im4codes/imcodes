@@ -88,6 +88,25 @@ describe('Windows panel window host source', () => {
     expect(host.match(/Log\("[a-z_]+"/gu)?.every((call) => !/uri|url/iu.test(call))).toBe(true);
   });
 
+  it('shows a skeleton the moment the window exists (the page\'s own background and the product name) and logs how long each start-up step took', () => {
+    // The window is created and shown before anything slow (profile folder, WebView2 environment, navigation); until the page has
+    // painted it is the same background as the page, in the system\'s light or dark choice, instead of a white rectangle.
+    expect(host).toContain('AppsUseLightTheme');
+    expect(host).toContain('window_class.hbrBackground = CreateSolidBrush(g_skeleton.background)');
+    expect(host).toContain('case WM_PAINT');
+    expect(host).toContain('DrawTextW(context, label.c_str()');
+    expect(host).toContain('put_DefaultBackgroundColor(background)');
+    expect(host.indexOf('ShowWindow(g_host.window, SW_SHOW)')).toBeLessThan(host.indexOf('CreateCoreWebView2EnvironmentWithOptions'));
+    expect(host.indexOf('ShowWindow(g_host.window, SW_SHOW)')).toBeLessThan(host.indexOf('UserDataFolder();\n  Log("window_shown"'));
+    // The start-up timeline: every line carries the milliseconds since the process started; the page load is an event too.
+    expect(host).toContain('g_started_tick = GetTickCount64()');
+    expect(host).toContain('+%lums');
+    expect(host).toContain('Log("window_shown"');
+    expect(host).toContain('"navigation_completed"');
+    expect(host).toContain('"navigation_failed"');
+    expect(host).not.toMatch(/Log\([^)]*(uri|url)/iu);
+  });
+
   it('keeps its profile per user inside aiDesk\'s own directory, never the browser\'s', () => {
     expect(host).toContain('FOLDERID_LocalAppData');
     expect(host).toContain('L"\\\\IM.codes"');

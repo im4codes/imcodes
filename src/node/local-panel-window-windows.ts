@@ -33,7 +33,7 @@ export type WindowsPanelOp =
   | { kind: 'find' }
   | { kind: 'default_browser'; url: string }
   /**
-   * Start the native window host in the user's session and wait up to 8 s: it is up (still running, or a second start that raised the
+   * Start the native window host in the user's session and wait up to LOCAL_PANEL_WINDOWS_HOST.launchWaitMilliseconds: it is up (still running, or a second start that raised the
    * window and exited 0) -> `ok`; it exited with a failure -> `exited:<code>` (3 = the WebView2 runtime is missing); the file is no
    * longer the one that was verified (size or last write time differ) -> `failed`.
    */

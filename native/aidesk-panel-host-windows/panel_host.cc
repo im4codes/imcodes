@@ -102,8 +102,14 @@ Interface* MakeHandler(Callable fn) {
 // Kept small: when it grows past kMaxLogBytes it starts over.
 constexpr DWORD kMaxLogBytes = 64 * 1024;
 std::wstring g_log_path;
+// When the process started running (GetTickCount64): every log line says how many milliseconds after that it happened, so the log is
+// also the start-up timeline (window shown, runtime ready, page loaded) of a slow open. Time is the only thing it adds.
+ULONGLONG g_started_tick = 0;
 
-void Log(const char* event, HRESULT result = S_OK) {
+ULONGLONG ElapsedMs() { return GetTickCount64() - g_started_tick; }
+
+// `at_ms` is the elapsed time of an event that happened before the log file's location was known (0 = now).
+void Log(const char* event, HRESULT result = S_OK, ULONGLONG at_ms = 0) {
   if (g_log_path.empty()) return;
   HANDLE file = CreateFileW(g_log_path.c_str(), FILE_APPEND_DATA | GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS,
                             FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -115,13 +121,34 @@ void Log(const char* event, HRESULT result = S_OK) {
   }
   SYSTEMTIME now;
   GetSystemTime(&now);
-  char line[160];
-  const int length = wsprintfA(line, "%04u-%02u-%02uT%02u:%02u:%02uZ pid=%lu %s hr=0x%08lx\r\n", now.wYear, now.wMonth, now.wDay, now.wHour,
-                               now.wMinute, now.wSecond, GetCurrentProcessId(), event, static_cast<unsigned long>(result));
+  char line[192];
+  const ULONGLONG elapsed = at_ms != 0 ? at_ms : ElapsedMs();
+  const int length = wsprintfA(line, "%04u-%02u-%02uT%02u:%02u:%02uZ pid=%lu +%lums %s hr=0x%08lx\r\n", now.wYear, now.wMonth, now.wDay, now.wHour,
+                               now.wMinute, now.wSecond, GetCurrentProcessId(), static_cast<unsigned long>(elapsed), event,
+                               static_cast<unsigned long>(result));
   DWORD written = 0;
   if (length > 0) WriteFile(file, line, static_cast<DWORD>(length), &written, nullptr);
   CloseHandle(file);
 }
+
+// The panel page follows the system's light/dark choice (prefers-color-scheme). Until it has painted, the window shows the same
+// background and the product name instead of a white rectangle, so the window is recognisably "starting" the moment it appears.
+struct SkeletonColors {
+  COLORREF background;
+  COLORREF text;
+};
+
+SkeletonColors SkeletonColorsForSystemTheme() {
+  DWORD uses_light = 1;
+  DWORD size = sizeof(uses_light);
+  if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize", L"AppsUseLightTheme",
+                   RRF_RT_REG_DWORD, nullptr, &uses_light, &size) != ERROR_SUCCESS) {
+    uses_light = 1;
+  }
+  return uses_light != 0 ? SkeletonColors{RGB(0xf4, 0xf6, 0xfa), RGB(0x56, 0x63, 0x77)} : SkeletonColors{RGB(0x0e, 0x14, 0x1d), RGB(0x9a, 0xa9, 0xbf)};
+}
+
+SkeletonColors g_skeleton = {RGB(0xf4, 0xf6, 0xfa), RGB(0x56, 0x63, 0x77)};
 
 struct HostState {
   HWND window = nullptr;
@@ -211,6 +238,7 @@ void ConfigureView(ICoreWebView2* view) {
           [](ICoreWebView2*, ICoreWebView2NavigationCompletedEventArgs* args) -> HRESULT {
             BOOL success = TRUE;
             args->get_IsSuccess(&success);
+            Log(success ? "navigation_completed" : "navigation_failed");
             if (!success && g_host.window != nullptr) SetTimer(g_host.window, kRetryTimer, ids::kRetryMilliseconds, nullptr);
             return S_OK;
           }),
@@ -235,6 +263,13 @@ HRESULT OnControllerCreated(HRESULT result, ICoreWebView2Controller* controller)
   controller->AddRef();
   controller->get_CoreWebView2(&g_host.view);
   if (g_host.view == nullptr) return E_FAIL;
+  // The web view paints the same background as the skeleton until the page has painted (no white flash in a dark theme).
+  ICoreWebView2Controller2* controller2 = nullptr;
+  if (SUCCEEDED(controller->QueryInterface(IID_PPV_ARGS(&controller2))) && controller2 != nullptr) {
+    COREWEBVIEW2_COLOR background = {255, GetRValue(g_skeleton.background), GetGValue(g_skeleton.background), GetBValue(g_skeleton.background)};
+    controller2->put_DefaultBackgroundColor(background);
+    controller2->Release();
+  }
   ConfigureView(g_host.view);
   ResizeView();
   Navigate();
@@ -256,7 +291,23 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam, LPARAM lpa
   switch (message) {
     case WM_SIZE:
       ResizeView();
+      if (g_host.controller == nullptr) InvalidateRect(window, nullptr, TRUE);  // the skeleton's text stays centred while the window is resized
       return 0;
+    case WM_PAINT: {
+      PAINTSTRUCT paint;
+      HDC context = BeginPaint(window, &paint);
+      if (g_host.controller == nullptr) {
+        RECT area;
+        GetClientRect(window, &area);
+        SetBkMode(context, TRANSPARENT);
+        SetTextColor(context, g_skeleton.text);
+        SelectObject(context, GetStockObject(DEFAULT_GUI_FONT));
+        static const std::wstring label = Widen(common::kAiDeskProductName);
+        DrawTextW(context, label.c_str(), -1, &area, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+      }
+      EndPaint(window, &paint);
+      return 0;
+    }
     case WM_GETMINMAXINFO: {
       auto* info = reinterpret_cast<MINMAXINFO*>(lparam);
       const SIZE minimum = OuterSize(window, common::kLocalPanelWindowMinWidth, common::kLocalPanelWindowMinHeight,
@@ -327,6 +378,7 @@ void ActivateRunningInstance() {
 }  // namespace
 
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
+  g_started_tick = GetTickCount64();
   SetCurrentProcessExplicitAppUserModelID(ids::kAppUserModelId);
 
   HANDLE single_instance = CreateMutexW(nullptr, FALSE, ids::kSingleInstanceMutex);
@@ -356,7 +408,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
   window_class.hIcon = LoadIconW(instance, MAKEINTRESOURCEW(1));
   window_class.hIconSm = static_cast<HICON>(LoadImageW(instance, MAKEINTRESOURCEW(1), IMAGE_ICON, GetSystemMetrics(SM_CXSMICON),
                                                        GetSystemMetrics(SM_CYSMICON), 0));
-  window_class.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
+  g_skeleton = SkeletonColorsForSystemTheme();
+  window_class.hbrBackground = CreateSolidBrush(g_skeleton.background);
   if (RegisterClassExW(&window_class) == 0) return 1;
 
   const DWORD style = WS_OVERLAPPEDWINDOW;
@@ -371,8 +424,10 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
   ShowWindow(g_host.window, SW_SHOW);
   UpdateWindow(g_host.window);
   Raise(g_host.window);
+  const ULONGLONG shown_ms = ElapsedMs();
 
   const std::wstring user_data = UserDataFolder();
+  Log("window_shown", S_OK, shown_ms != 0 ? shown_ms : 1);
   Log("starting");
   const HRESULT started = CreateCoreWebView2EnvironmentWithOptions(
       nullptr, user_data.empty() ? nullptr : user_data.c_str(), nullptr,
