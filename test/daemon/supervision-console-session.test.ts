@@ -42,19 +42,31 @@ function emit() {
   return producer.appendTaskEvent({ scope: SCOPE, taskId: 'tsk_a', eventType: 'implementing', status: 'implementing' });
 }
 
+/** Wait for an event, not a pause: until `sent` holds at least `count` frames (a generous bound only keeps a real hang from running forever). */
+async function waitForFrames(count: number): Promise<void> {
+  await vi.waitFor(() => { expect(sent.length).toBeGreaterThanOrEqual(count); }, { timeout: 20_000, interval: 5 });
+}
+/** Let anything that is already due run, so an extra frame that would follow can show up before the count is asserted. */
+async function flushPending(): Promise<void> {
+  for (let i = 0; i < 5; i += 1) await new Promise<void>((resolve) => setImmediate(resolve));
+}
+
 beforeEach(() => {
   db = new DatabaseSync(':memory:');
   db.exec(LEGACY);
   migrateSupervisionStore(db as unknown as SupervisionMigrationDb);
   db.prepare(`INSERT INTO supervision_tasks (task_id, project_name, top_level_task_id, classification, status,
     payload_json, created_at, updated_at) VALUES ('tsk_a','codedeck','top','slice','implementing','{}',1,1)`).run();
-  sent = []; clock = 0;
+  // This test's own frame list, captured by the registry below: a drain left running by an earlier test must push into THAT test's list,
+  // never into this one's (the shared `sent` variable is re-pointed here for every test).
+  const frames: any[] = [];
+  sent = frames; clock = 0;
   producer = new SupervisionConsoleProducer(db as unknown as SupervisionMigrationDb, {
     projectionEpoch: EPOCH, now: () => ++clock,
     broadcast: (frame) => registry.broadcast(frame),
   });
   registry = new SupervisionConsoleSessionRegistry({
-    producer, send: (f) => sent.push(f), authorize: (s) => s.coordinatorSessionName === SCOPE.coordinatorSessionName,
+    producer, send: (f) => frames.push(f), authorize: (s) => s.coordinatorSessionName === SCOPE.coordinatorSessionName,
     now: () => clock,
   });
 });
@@ -77,7 +89,8 @@ describe('subscribe', () => {
     }
     expect(registry.handleFrame(subscribe())).toBe(true);
     expect(sent).toHaveLength(0);
-    await new Promise<void>((resolve) => setTimeout(resolve, 25));
+    await waitForFrames(1);
+    await flushPending();
     expect(sent).toHaveLength(1);
     expect(sent[0]).toMatchObject({ type: SUPERVISION_TASK_CONSOLE_MSG.SNAPSHOT, subscriptionId: 'sub-1' });
   });
@@ -92,9 +105,34 @@ describe('subscribe', () => {
       expect(registry.handleFrame(subscribe({ subscriptionId: `storm-${i}` }))).toBe(true);
     }
     expect(sent).toHaveLength(0);
-    await new Promise<void>((resolve) => setTimeout(resolve, 40));
+    await waitForFrames(1);
+    await flushPending();
     expect(sent).toHaveLength(1);
     expect(sent[0]).toMatchObject({ type: SUPERVISION_TASK_CONSOLE_MSG.SNAPSHOT, subscriptionId: 'storm-11' });
+  });
+
+  it('answers a large replay after as many slices as a very slow machine needs', async () => {
+    // A slow runner is a producer whose clock says every slice used up its whole budget: each slice then commits ONE event, so the
+    // replay takes ~96 yields. Nothing may depend on how long that takes.
+    producer.ensureProjectionBaseline(SCOPE);
+    for (let i = 0; i < 96; i += 1) {
+      db.prepare(`INSERT INTO supervision_task_events (task_id, assignment_id, event_type, status, payload_json, created_at)
+        VALUES ('tsk_a', NULL, 'implementing', 'implementing', '{}', ?)`).run(10 + i);
+    }
+    let mono = 0;
+    const slowFrames: any[] = [];
+    const slowProducer = new SupervisionConsoleProducer(db as unknown as SupervisionMigrationDb, {
+      projectionEpoch: EPOCH, now: () => ++clock, monotonicNowMs: () => (mono += 100),
+    });
+    const slowRegistry = new SupervisionConsoleSessionRegistry({
+      producer: slowProducer, send: (f) => slowFrames.push(f), authorize: () => true, now: () => clock,
+    });
+    expect(slowRegistry.handleFrame(subscribe({ subscriptionId: 'slow-1' }))).toBe(true);
+    expect(slowFrames).toHaveLength(0);
+    await vi.waitFor(() => { expect(slowFrames.length).toBeGreaterThanOrEqual(1); }, { timeout: 20_000, interval: 5 });
+    await flushPending();
+    expect(slowFrames).toHaveLength(1);
+    expect(slowFrames[0]).toMatchObject({ type: SUPERVISION_TASK_CONSOLE_MSG.SNAPSHOT, subscriptionId: 'slow-1' });
   });
 
   it('projects a steady-state registry commit inline and a real backlog through the sliced drain (live refresh)', async () => {
@@ -119,7 +157,8 @@ describe('subscribe', () => {
     registry.refreshActiveSubscriptions();
     expect(inline).not.toHaveBeenCalled();
     expect(sliced).toHaveBeenCalledTimes(1);
-    await new Promise<void>((resolve) => setTimeout(resolve, 30));
+    await waitForFrames(before + 40);
+    await flushPending();
     expect(sent.length - before).toBe(40);
   });
 
