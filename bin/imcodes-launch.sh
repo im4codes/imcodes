@@ -190,6 +190,12 @@ if [ -f "$NODE_DATACHANNEL_REPAIR" ] && [ -n "$NPM" ]; then
   fi
 fi
 
+# Preflight-only: bin/imcodes-launch.mjs (the macOS launch agent runs node directly so that Full Disk Access is attributed to node,
+# not to this script's interpreter) runs this file as a child just for the repairs above, then starts the daemon itself.
+if [ "${IMCODES_LAUNCH_PREFLIGHT_ONLY:-}" = "1" ]; then
+  exit 0
+fi
+
 # Hand off to the real daemon. `exec` replaces this shell so
 # systemd/launchctl tracks the node PID directly — no extra hop.
 exec "$NODE" "$ENTRY" "$@"

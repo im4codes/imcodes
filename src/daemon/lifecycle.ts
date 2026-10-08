@@ -286,6 +286,8 @@ const SERVER_LINK_STARTUP_GRACE_MS = 12_000;
 const STARTUP_CONTEXT_REPLICATION_DELAY_MS = 90_000;
 const STARTUP_TIMELINE_RETENTION_DELAY_MS = 120_000;
 const STARTUP_MEMORY_PRUNING_DELAY_MS = 150_000;
+/** Soon after start: the answer to "did the grant reach this daemon" should not wait behind the heavy background work. */
+const STARTUP_MACOS_LAUNCH_HEALTH_DELAY_MS = 15_000;
 const STARTUP_CONTEXT_BACKFILL_DELAY_MS = 180_000;
 const STARTUP_SESSION_DB_PUSH_DELAY_MS = 210_000;
 // Lowest-priority startup task: backfill persisted projection embeddings so the
@@ -1675,6 +1677,16 @@ export async function startup(): Promise<DaemonContext> {
       logger,
     });
     workerSessionSyncRetrier.start(startupWorkerSessionSyncOutcome.reason ?? 'startup_sync_failed');
+  }
+  if (process.platform === 'darwin') {
+    scheduleDaemonStartupBackgroundTask(
+      'macOS launch agent and Full Disk Access check',
+      async () => {
+        const { runMacosLaunchHealth } = await import('./macos-launch-health.js');
+        await runMacosLaunchHealth();
+      },
+      startupBackgroundBaseDelayMs + STARTUP_MACOS_LAUNCH_HEALTH_DELAY_MS,
+    );
   }
   scheduleDaemonStartupBackgroundTask(
     'shared-context startup timeline backfill',

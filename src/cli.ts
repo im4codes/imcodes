@@ -78,6 +78,7 @@ import { runAuditReplyCommand } from './cli/audit-reply.js';
 import { postToHookServer } from './cli/hook-client.js';
 import { runSendCommand } from './cli/send-command.js';
 import { resolveLiveHookPort } from './daemon/hook-port.js';
+import { MACOS_LAUNCH_MIGRATION_MODE } from '../shared/macos-daemon-launch.js';
 import {
   DAEMON_SERVER_LINK_FRESH_MS,
   formatDurationSeconds,
@@ -266,6 +267,19 @@ function killStaleImcodesProcesses(): void {
   }
   // Force kill if still alive
   try { process.kill(pid, 'SIGKILL'); } catch { /* already gone */ }
+}
+
+/**
+ * macOS: bring the launch agent to the launch target Full Disk Access can reach (node itself, not a script in front of it).
+ * The same function the install flow, the upgrade script and a starting daemon use; a plist that already runs node is left as is.
+ */
+async function ensureMacosLaunchTarget(): Promise<void> {
+  if (process.platform !== 'darwin') return;
+  const service = resolvePosixDaemonServicePaths();
+  if (service.scoped) return;
+  const { ensureMacosLaunchAgentTarget } = await import('./util/macos-launch-agent.js');
+  const result = ensureMacosLaunchAgentTarget({ plistPath: service.launchAgentPath, mode: MACOS_LAUNCH_MIGRATION_MODE.REGENERATE });
+  if (result.changed) console.log('Launch agent now starts Node directly, so a Full Disk Access grant on Node applies to the daemon (see "imcodes doctor").');
 }
 
 /** Ensure plist/systemd service uses --foreground. Patches in-place if missing. */
@@ -1073,6 +1087,7 @@ program
     // Step 2: Restart daemon so it picks up the new code.
     // The daemon's own watchdog loop will relaunch with the new version after exit.
     ensureServiceForeground();
+    await ensureMacosLaunchTarget();
     if (platform === 'darwin') {
       const plist = resolvePosixDaemonServicePaths().launchAgentPath;
       if (existsSync(plist)) {
@@ -1108,6 +1123,7 @@ program
   .description('Restart the imcodes daemon service')
   .action(async () => {
     ensureServiceForeground();
+    await ensureMacosLaunchTarget();
     const platform = process.platform;
     if (platform === 'darwin') {
       const plist = resolvePosixDaemonServicePaths().launchAgentPath;
@@ -1183,6 +1199,7 @@ program
     await saveConfig({ url, token });
     console.log(`Config saved. Restarting daemon...`);
     ensureServiceForeground();
+    await ensureMacosLaunchTarget();
     const platform = process.platform;
     if (platform === 'darwin') {
       const plist = resolvePosixDaemonServicePaths().launchAgentPath;
@@ -1220,6 +1237,7 @@ program
     // Restart daemon to drop the active connection
     console.log(`Restarting daemon to disconnect...`);
     ensureServiceForeground();
+    await ensureMacosLaunchTarget();
     const platform = process.platform;
     if (platform === 'darwin') {
       const plist = resolvePosixDaemonServicePaths().launchAgentPath;
@@ -1237,6 +1255,15 @@ program
       }
     }
     console.log(`Disconnected from ${provider}.`);
+  });
+
+program
+  .command('doctor')
+  .description('Check what needs your attention (macOS: Full Disk Access for the daemon and the agent sessions it starts)')
+  .option('--json', 'Output as JSON')
+  .action(async (opts: { json?: boolean }) => {
+    const { runDoctor } = await import('./cli/doctor.js');
+    process.exitCode = runDoctor(opts);
   });
 
 program

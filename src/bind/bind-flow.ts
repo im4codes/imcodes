@@ -1,12 +1,13 @@
 import { readFile, writeFile, mkdir } from 'fs/promises';
-import { existsSync as existsSyncFs } from 'fs';
+import { existsSync as existsSyncFs, readFileSync as readFileSyncFs, realpathSync as realpathSyncFs } from 'fs';
 import { dirname, join } from 'path';
 import { homedir, hostname } from 'os';
 import { execSync } from 'child_process';
 import logger from '../util/logger.js';
 import { BACKEND } from '../agent/tmux.js';
 import { restartWindowsDaemon } from '../util/windows-daemon.js';
-import { resolveDaemonLaunchTarget, renderSystemdExecStart, renderPlistProgramArguments } from '../util/launch-target.js';
+import { resolveDaemonLaunchTarget, renderSystemdExecStart } from '../util/launch-target.js';
+import { planMacosPlistProgramArguments, renderMacosLaunchAgentPlist, resolveMacosDaemonLaunchFacts } from '../util/macos-launch-agent.js';
 import { enableSystemdUserLinger, formatSystemdLingerFailureMessage } from '../util/systemd-linger.js';
 import { renderRecoveryExecStart, renderSystemdStartLimitBlock, renderSystemdTerminalDiagnostics } from '../util/systemd-unit.js';
 import { installRecoveryUnits } from '../util/systemd-recovery-install.js';
@@ -297,46 +298,24 @@ async function installLaunchAgent(): Promise<void> {
   const logPath = join(credentialsDir(), 'daemon.log');
   const launchAgentsDir = join(homedir(), 'Library', 'LaunchAgents');
 
-  // Prefer the self-healing launcher when this install ships it. See
-  // `src/util/launch-target.ts` for rationale.
-  const target = resolveDaemonLaunchTarget();
+  // The launch agent runs the node binary itself (shared/macos-daemon-launch.ts): macOS attributes Full Disk Access to the program
+  // launchd starts, and a script in front of node makes that `/usr/bin/env`. The self-healing runs inside node (bin/imcodes-launch.mjs).
+  // A node binary a re-bind finds in the existing plist is kept, so a grant the user already made keeps applying.
+  let existingPlist: string | undefined;
+  try { existingPlist = readFileSyncFs(service.launchAgentPath, 'utf8'); } catch { /* first install */ }
+  const programArguments = planMacosPlistProgramArguments(resolveMacosDaemonLaunchFacts(), existingPlist);
+  let launchProgram = programArguments[0]!;
+  try { launchProgram = realpathSyncFs(launchProgram); } catch { /* the path is checked at start */ }
 
-  const plist = `<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key>
-  <string>${service.launchAgentLabel}</string>
-  <key>ProgramArguments</key>
-  <array>
-${renderPlistProgramArguments(target)}
-  </array>
-  <key>EnvironmentVariables</key>
-  <dict>
-    <key>PATH</key>
-    <string>${process.env.PATH ?? '/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin'}</string>
-    <key>HOME</key>
-    <string>${homedir()}</string>
-${service.scoped ? `    <key>IMCODES_HOME</key>
-    <string>${service.stateHome}</string>
-    <key>IMCODES_DEFAULT_HOME</key>
-    <string>${dirname(service.defaultHome)}</string>
-` : ''}
-    <!-- See bind-flow.ts.installSystemdService for rationale on these flags
-         (V8 lazy-GC + heap-limit OOM cascade observed on production daemons). -->
-    <key>NODE_OPTIONS</key>
-    <string>--expose-gc --max-old-space-size=8192 ${daemonFatalReportNodeOptions(service.stateHome, 'plain', reportExcludeEnvFlagUsable(target.program))}</string>
-  </dict>
-  <key>RunAtLoad</key>
-  <true/>
-  <key>KeepAlive</key>
-  <true/>
-  <key>StandardOutPath</key>
-  <string>${logPath}</string>
-  <key>StandardErrorPath</key>
-  <string>${logPath}</string>
-</dict>
-</plist>`;
+  const plist = renderMacosLaunchAgentPlist({
+    label: service.launchAgentLabel,
+    programArguments,
+    logPath,
+    pathEnv: process.env.PATH ?? '/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin',
+    home: homedir(),
+    // See bind-flow.ts.installSystemdService for rationale on these flags (V8 lazy-GC + heap-limit OOM cascade on production daemons).
+    nodeOptions: `--expose-gc --max-old-space-size=8192 ${daemonFatalReportNodeOptions(service.stateHome, 'plain', reportExcludeEnvFlagUsable(launchProgram))}`,
+  });
 
   await mkdir(launchAgentsDir, { recursive: true });
   await writeFile(service.launchAgentPath, plist, 'utf8');

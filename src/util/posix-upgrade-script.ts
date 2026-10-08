@@ -589,6 +589,7 @@ log "[step 3] staged version: $INSTALLED_VER, target: ${targetVer}"
 
 NEW_IMCODES_SCRIPT="$GLOBAL_ROOT/imcodes/dist/src/index.js"
 NEW_LAUNCHER="$GLOBAL_ROOT/imcodes/bin/imcodes-launch.sh"
+NEW_LAUNCH_AGENT_CLI="$GLOBAL_ROOT/imcodes/dist/src/util/macos-launch-agent-cli.js"
 
 repair_cli_wrappers() {
   if [ "$SKIP_LAUNCH_CHAIN" = "1" ]; then
@@ -752,21 +753,20 @@ regenerate_launch_chain() {
   fi
   log "[step 3.5] regenerating launch chain"
 
-  # Prefer the self-healing launcher (bin/imcodes-launch.sh) when the
-  # freshly-installed package ships it. Older installs (pre-launcher) fall
-  # back to the direct node ExecStart so we never break versions that
-  # don't ship the file. Either way the resulting unit/plist points at
-  # absolute paths from THIS install — consistent with the rest of step
-  # 3.5's contract.
+  # Linux prefers the self-healing launcher (bin/imcodes-launch.sh) when the freshly-installed package ships it; older installs
+  # (pre-launcher) fall back to the direct node ExecStart so we never break versions that don't ship the file. Either way the
+  # resulting unit points at absolute paths from THIS install.
+  # macOS never points the launch agent at a script: Full Disk Access is attributed to the program launchd starts, and a script
+  # in front of node makes that /usr/bin/env. The package's own helper decides the launch target (node running
+  # bin/imcodes-launch.mjs, which does the self-healing inside node); a package too old to ship the helper gets node + its entry.
   if [ -f "$NEW_LAUNCHER" ]; then
     LINUX_EXEC="ExecStart=$NEW_LAUNCHER start --foreground"
-    DARWIN_PROGRAM_ARGS="[\\"$NEW_LAUNCHER\\",\\"start\\",\\"--foreground\\"]"
     log "[step 3.5] using self-healing launcher: $NEW_LAUNCHER"
   else
     LINUX_EXEC="ExecStart=$NODE $NEW_IMCODES_SCRIPT start --foreground"
-    DARWIN_PROGRAM_ARGS="[\\"$NODE\\",\\"$NEW_IMCODES_SCRIPT\\",\\"start\\",\\"--foreground\\"]"
     log "[step 3.5] $NEW_LAUNCHER not present in this version — using direct node ExecStart"
   fi
+  DARWIN_PROGRAM_ARGS="[\\"$NODE\\",\\"$NEW_IMCODES_SCRIPT\\",\\"start\\",\\"--foreground\\"]"
 
   if [ ! -f "$NEW_IMCODES_SCRIPT" ]; then
     log "[step 3.5] $NEW_IMCODES_SCRIPT not found — skipping (will rely on existing launch chain)"
@@ -802,8 +802,15 @@ regenerate_launch_chain() {
   elif [ "$(uname)" = "Darwin" ]; then
     PLIST="$HOME/Library/LaunchAgents/imcodes.daemon.plist"
     if [ -f "$PLIST" ]; then
-      if command -v plutil >/dev/null 2>&1; then
-        log "[step 3.5] rewriting plist ProgramArguments"
+      if [ -f "$NEW_LAUNCH_AGENT_CLI" ]; then
+        log "[step 3.5] aligning launch agent target (node runs directly so Full Disk Access applies)"
+        if "$NODE" "$NEW_LAUNCH_AGENT_CLI" ensure --plist "$PLIST" --entry "$NEW_IMCODES_SCRIPT" --node "$NODE" --mode regenerate >> "$LOG" 2>&1; then
+          log "[step 3.5] launch agent target OK"
+        else
+          log "[step 3.5] launch agent target FAILED (non-fatal)"
+        fi
+      elif command -v plutil >/dev/null 2>&1; then
+        log "[step 3.5] rewriting plist ProgramArguments (package without the launch-agent helper: node + entry)"
         if plutil -replace ProgramArguments -json "$DARWIN_PROGRAM_ARGS" "$PLIST" >> "$LOG" 2>&1; then
           log "[step 3.5] plutil rewrite OK"
         else
