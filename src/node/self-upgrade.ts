@@ -85,7 +85,22 @@ export const CONTROLLED_NODE_UPGRADE_STALE_AFTER_MS = 24 * 60 * 60 * 1_000;
 export const CONTROLLED_NODE_UPGRADE_ABSOLUTE_TTL_MS = 7 * 24 * 60 * 60 * 1_000;
 export const CONTROLLED_NODE_UPGRADE_MIN_FREE_BYTES = 512 * 1024 * 1024;
 export const CONTROLLED_NODE_UPGRADE_SWEEP_INTERVAL_MS = 60 * 60 * 1_000;
-const CONTROLLED_NODE_UPGRADE_MAX_ENUMERATE = 128;
+/**
+ * A pass reads the NAMES of at most this many entries of the temporary root (a name is matched against the staging
+ * pattern, nothing else: no stat, no read). It used to count every entry against a limit of 128 that the staging
+ * directories themselves shared, and a /tmp with thousands of other entries (15,067 on a real node, 155 of them stale
+ * staging directories) never got past its first 128 entries in directory order, so the backlog was never reached.
+ * Expensive work -- lstat, marker reads, deletes -- keeps its own hard bounds below.
+ */
+const CONTROLLED_NODE_UPGRADE_MAX_SCAN = 200_000;
+/** Matching staging names kept per pass (the rest wait for a later pass). */
+const CONTROLLED_NODE_UPGRADE_MAX_LISTED = 8_192;
+/** While a pass stopped on its I/O budget with candidates left, the next one follows after this delay (bounded chain). */
+export const CONTROLLED_NODE_UPGRADE_BACKLOG_PASS_DELAY_MS = 60_000;
+export const CONTROLLED_NODE_UPGRADE_BACKLOG_MAX_PASSES = 64;
+/** Worst case of one candidate: lstat x4 (directory + marker, checked twice), marker read x2, one delete. */
+const CONTROLLED_NODE_UPGRADE_CANDIDATE_LSTATS = 4;
+const CONTROLLED_NODE_UPGRADE_CANDIDATE_MARKER_READS = 2;
 const CONTROLLED_NODE_UPGRADE_MAX_LSTAT = 128;
 const CONTROLLED_NODE_UPGRADE_MAX_MARKER_READ = 64;
 const CONTROLLED_NODE_UPGRADE_MAX_DELETE = 32;
@@ -125,6 +140,11 @@ const CONTROLLED_NODE_UPGRADE_DIR_PATTERN = /^imcodes-node-upgrade-[A-Za-z0-9_-]
 const CONTROLLED_NODE_UPGRADE_TOKEN_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const activeControlledNodeUpgradeDirs = new Set<string>();
 const scheduledUpgradeSweeps = new Set<string>();
+/** Test seam: the staging directories of upgrades running in this process (the scavenger never touches them). */
+export const activeControlledNodeUpgradeDirsForTests = activeControlledNodeUpgradeDirs;
+/** Per temporary root: the last staging directory a pass examined, so the next pass continues after it instead of re-reading the same head. */
+const scavengeCursors = new Map<string, string>();
+const sweepsInFlight = new Set<string>();
 
 export interface ControlledNodeUpgradeCleanupDiagnostic {
   event: 'controlled_node_upgrade_cleanup';
@@ -218,12 +238,43 @@ async function defaultFreeBytes(path: string): Promise<number | null> {
   }
 }
 
-function ensurePeriodicUpgradeSweep(tempRoot: string, deps: ControlledNodeSelfUpgradeDeps): void {
+type ScavengeDeps = Pick<ControlledNodeSelfUpgradeDeps,
+  | 'now'
+  | 'uptime'
+  | 'removeUpgradeDir'
+  | 'isProcessAlive'
+  | 'onCleanupDiagnostic'
+  | 'onStaleScavengeOperation'
+  | 'beforeStaleCandidateRevalidation'>;
+
+/**
+ * One scheduled sweep: a bounded pass, then -- while a pass stopped on its I/O budget with candidates still unexamined --
+ * short follow-up passes (each as bounded as the first) until the backlog is drained or the chain limit is reached; the
+ * hourly timer starts the next chain, whose cursor continues where this one stopped.
+ */
+async function sweepWithBacklog(root: string, deps: ScavengeDeps, passesLeft = CONTROLLED_NODE_UPGRADE_BACKLOG_MAX_PASSES): Promise<void> {
+  if (sweepsInFlight.has(root)) return;
+  sweepsInFlight.add(root);
+  let more = false;
+  try {
+    more = (await scavengeStaleControlledNodeUpgradePass(root, deps)).moreWork;
+  } catch {
+    more = false;
+  } finally {
+    sweepsInFlight.delete(root);
+  }
+  if (more && passesLeft > 1) {
+    const timer = setTimeout(() => { void sweepWithBacklog(root, deps, passesLeft - 1); }, CONTROLLED_NODE_UPGRADE_BACKLOG_PASS_DELAY_MS);
+    timer.unref?.();
+  }
+}
+
+function ensurePeriodicUpgradeSweep(tempRoot: string, deps: ScavengeDeps): void {
   const canonicalRoot = resolve(tempRoot);
   if (scheduledUpgradeSweeps.has(canonicalRoot)) return;
   scheduledUpgradeSweeps.add(canonicalRoot);
   const timer = setInterval(() => {
-    void scavengeStaleControlledNodeUpgradeDirs(canonicalRoot, deps).catch(() => {});
+    void sweepWithBacklog(canonicalRoot, deps);
   }, CONTROLLED_NODE_UPGRADE_SWEEP_INTERVAL_MS);
   timer.unref?.();
 }
@@ -246,7 +297,7 @@ export function startControlledNodeUpgradeScavenger(
     | 'beforeStaleCandidateRevalidation'
   > = {},
 ): void {
-  void scavengeStaleControlledNodeUpgradeDirs(tempRoot, deps).catch(() => {});
+  void sweepWithBacklog(resolve(tempRoot), deps);
   ensurePeriodicUpgradeSweep(tempRoot, deps);
 }
 
@@ -340,17 +391,10 @@ async function removeUpgradeDirBestEffort(
  * Every refusal is fail-open: an upgrade may continue, but unknown Temp content
  * is never traversed or deleted.
  */
-export async function scavengeStaleControlledNodeUpgradeDirs(
+export async function scavengeStaleControlledNodeUpgradePass(
   tempRoot: string,
-  deps: Pick<ControlledNodeSelfUpgradeDeps,
-    | 'now'
-    | 'uptime'
-    | 'removeUpgradeDir'
-    | 'isProcessAlive'
-    | 'onCleanupDiagnostic'
-    | 'onStaleScavengeOperation'
-    | 'beforeStaleCandidateRevalidation'> = {},
-): Promise<number> {
+  deps: ScavengeDeps = {},
+): Promise<{ removed: number; moreWork: boolean }> {
   const now = deps.now?.() ?? Date.now();
   const cutoff = now - CONTROLLED_NODE_UPGRADE_STALE_AFTER_MS;
   const absoluteCutoff = now - CONTROLLED_NODE_UPGRADE_ABSOLUTE_TTL_MS;
@@ -364,7 +408,8 @@ export async function scavengeStaleControlledNodeUpgradeDirs(
   const canonicalRoot = resolve(tempRoot);
   let removed = 0;
   let deleteAttempts = 0;
-  let enumerated = 0;
+  let scanned = 0;
+  let moreWork = false;
   let lstatOperations = 0;
   let markerReads = 0;
   let budgetDiagnosticEmitted = false;
@@ -415,16 +460,47 @@ export async function scavengeStaleControlledNodeUpgradeDirs(
   );
 
   try {
+    // Phase 1: names only. Every entry of the root costs one pattern match (no stat, no read), up to a generous cap, so a
+    // crowded root cannot hide the staging directories behind its first entries in directory order.
+    const listed: string[] = [];
     const directory = await opendir(canonicalRoot);
     for await (const entry of directory) {
-      if (enumerated >= CONTROLLED_NODE_UPGRADE_MAX_ENUMERATE
-        || deleteAttempts >= CONTROLLED_NODE_UPGRADE_MAX_DELETE) {
+      if (scanned >= CONTROLLED_NODE_UPGRADE_MAX_SCAN) {
         emitBudgetExhausted();
         break;
       }
-      enumerated += 1;
+      scanned += 1;
       recordOperation('enumerate');
       if (!CONTROLLED_NODE_UPGRADE_DIR_PATTERN.test(entry.name)) continue;
+      if (listed.length >= CONTROLLED_NODE_UPGRADE_MAX_LISTED) {
+        emitBudgetExhausted();
+        moreWork = true;
+        break;
+      }
+      listed.push(entry.name);
+    }
+    // Phase 2: examine the staging directories, in a stable order that continues after the last one the previous pass
+    // examined (wrapping), within the hard I/O budgets. Young or live directories at the front cannot starve the rest.
+    listed.sort();
+    const cursor = scavengeCursors.get(canonicalRoot);
+    let startAt = 0;
+    if (cursor !== undefined) {
+      const after = listed.findIndex((name) => name > cursor);
+      startAt = after < 0 ? 0 : after;
+    }
+    const order = [...listed.slice(startAt), ...listed.slice(0, startAt)];
+    let lastExamined: string | undefined;
+    let examinedAll = true;
+    for (const name of order) {
+      if (deleteAttempts >= CONTROLLED_NODE_UPGRADE_MAX_DELETE
+        || lstatOperations + CONTROLLED_NODE_UPGRADE_CANDIDATE_LSTATS > CONTROLLED_NODE_UPGRADE_MAX_LSTAT
+        || markerReads + CONTROLLED_NODE_UPGRADE_CANDIDATE_MARKER_READS > CONTROLLED_NODE_UPGRADE_MAX_MARKER_READ) {
+        emitBudgetExhausted();
+        examinedAll = false;
+        break;
+      }
+      lastExamined = name;
+      const entry = { name };
       const candidate = resolve(canonicalRoot, entry.name);
       // The candidate is accepted only as the exact direct child returned by
       // this directory iterator. No user-controlled traversal is canonicalized.
@@ -511,6 +587,9 @@ export async function scavengeStaleControlledNodeUpgradeDirs(
         // cleanup failure. Do not surface paths or recurse into it.
       }
     }
+    if (examinedAll) scavengeCursors.delete(canonicalRoot);
+    else if (lastExamined !== undefined) scavengeCursors.set(canonicalRoot, lastExamined);
+    if (!examinedAll) moreWork = true;
   } catch (error) {
     emitCleanupDiagnostic({
       event: 'controlled_node_upgrade_cleanup',
@@ -519,7 +598,15 @@ export async function scavengeStaleControlledNodeUpgradeDirs(
       code: cleanupErrorCode(error),
     }, deps);
   }
-  return removed;
+  return { removed, moreWork };
+}
+
+/** One bounded pass; the number of staging directories it removed. */
+export async function scavengeStaleControlledNodeUpgradeDirs(
+  tempRoot: string,
+  deps: ScavengeDeps = {},
+): Promise<number> {
+  return (await scavengeStaleControlledNodeUpgradePass(tempRoot, deps)).removed;
 }
 
 export function controlledNodeArtifactTarget(

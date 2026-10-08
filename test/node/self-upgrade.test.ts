@@ -35,6 +35,10 @@ import {
   scheduleLinuxControlledNodeUpgrade,
   scheduleWindowsControlledNodeUpgrade,
   scavengeStaleControlledNodeUpgradeDirs,
+  scavengeStaleControlledNodeUpgradePass,
+  startControlledNodeUpgradeScavenger,
+  activeControlledNodeUpgradeDirsForTests,
+  CONTROLLED_NODE_UPGRADE_BACKLOG_PASS_DELAY_MS,
   startControlledNodeSelfUpgrade,
   windowsControlledNodeUpgradeTaskXml,
   withArtifactDownloadRetries,
@@ -1324,24 +1328,144 @@ describe('controlled-node self-upgrade', () => {
     expect(JSON.stringify(diagnostics)).not.toContain(root);
   });
 
-  it('hard-bounds directory iteration, lstat, marker reads, and deletes in a crowded Temp root', async () => {
+  it('hard-bounds lstat, marker reads and deletes per pass in a crowded Temp root, and still examines every directory over successive passes', async () => {
     const root = await mkdtemp(join(tmpdir(), 'imcodes-self-upgrade-scavenge-bounds-'));
     dirs.push(root);
     const now = Date.now();
     const old = now - CONTROLLED_NODE_UPGRADE_STALE_AFTER_MS - 60_000;
     for (let index = 0; index < 192; index += 1) {
-      await createOwnedUpgradeDir({ root, suffix: `bulk${String(index).padStart(4, '0')}`, createdAt: old });
+      await createOwnedUpgradeDir({ root, suffix: `bulk${String(index).padStart(4, '0')}`, createdAt: old, pid: 1_000 + index });
     }
-    const operations = { enumerate: 0, lstat: 0, marker_read: 0, delete: 0 };
-    const removed = await scavengeStaleControlledNodeUpgradeDirs(root, {
-      now: () => now,
-      uptime: () => 30 * 24 * 60 * 60,
-      isProcessAlive: () => true,
-      onStaleScavengeOperation: (operation) => { operations[operation] += 1; },
+    const examined = new Set<number>();
+    for (let pass = 0; pass < 8; pass += 1) {
+      const operations = { enumerate: 0, lstat: 0, marker_read: 0, delete: 0 };
+      const outcome = await scavengeStaleControlledNodeUpgradePass(root, {
+        now: () => now,
+        uptime: () => 30 * 24 * 60 * 60,
+        isProcessAlive: (pid) => { examined.add(pid); return true; },
+        onStaleScavengeOperation: (operation) => { operations[operation] += 1; },
+      });
+      expect(outcome.removed).toBe(0);
+      // names are cheap and unbounded by the staging count; the expensive work is bounded per pass
+      expect(operations.enumerate).toBe(192);
+      expect(operations.lstat).toBeLessThanOrEqual(128);
+      expect(operations.marker_read).toBeLessThanOrEqual(64);
+      expect(operations.delete).toBe(0);
+    }
+    // nothing was removed (every owner is alive), and the cursor walked through all 192 directories
+    expect(examined.size).toBe(192);
+    expect(await readdir(root)).toHaveLength(192);
+  });
+
+  describe('a backlog behind a crowded Temp root (a real node: 155 stale staging directories among 15,067 entries)', () => {
+    async function crowdedRoot(stale: number, junk: number) {
+      const root = await mkdtemp(join(tmpdir(), 'imcodes-self-upgrade-scavenge-backlog-'));
+      dirs.push(root);
+      const now = Date.now();
+      const old = now - CONTROLLED_NODE_UPGRADE_STALE_AFTER_MS - 60_000;
+      // Interleaved, so that wherever the filesystem puts them (creation order or hash order) the staging directories are
+      // spread among the other entries instead of sitting at the front.
+      const every = stale === 0 ? Number.POSITIVE_INFINITY : Math.max(1, Math.floor(junk / stale));
+      let madeStale = 0;
+      for (let index = 0; index < junk; index += 1) {
+        await writeFile(join(root, `other-${index}.log`), 'x');
+        if (madeStale < stale && index % every === 0) {
+          await createOwnedUpgradeDir({ root, suffix: `stale${String(madeStale).padStart(4, '0')}`, createdAt: old });
+          madeStale += 1;
+        }
+      }
+      for (; madeStale < stale; madeStale += 1) {
+        await createOwnedUpgradeDir({ root, suffix: `stale${String(madeStale).padStart(4, '0')}`, createdAt: old });
+      }
+      return { root, now, old };
+    }
+
+    it('drains 163 stale directories in ceil(163 / 32) passes with every per-pass bound held, and touches nothing else', async () => {
+      const { root, now } = await crowdedRoot(163, 4_000);
+      const passes: number[] = [];
+      for (let pass = 0; pass < 12 && passes.reduce((sum, n) => sum + n, 0) < 163; pass += 1) {
+        const operations = { enumerate: 0, lstat: 0, marker_read: 0, delete: 0 };
+        // the number-returning entry point (also the one the base build has): this test fails there, which is the point
+        const removedNow = await scavengeStaleControlledNodeUpgradeDirs(root, {
+          now: () => now,
+          uptime: () => 1,
+          isProcessAlive: () => false,
+          onStaleScavengeOperation: (operation) => { operations[operation] += 1; },
+        });
+        expect(operations.delete).toBeLessThanOrEqual(32);
+        expect(operations.lstat).toBeLessThanOrEqual(128);
+        expect(operations.marker_read).toBeLessThanOrEqual(64);
+        passes.push(removedNow);
+      }
+      expect(passes).toEqual([32, 32, 32, 32, 32, 3]);
+      const remaining = await readdir(root);
+      expect(remaining).toHaveLength(4_000);
+      expect(remaining.every((name) => name.startsWith('other-'))).toBe(true);
+    }, 120_000);
+
+    it('young, live, unowned and symlinked entries at the front never starve the stale ones behind them', async () => {
+      const root = await mkdtemp(join(tmpdir(), 'imcodes-self-upgrade-scavenge-starve-'));
+      dirs.push(root);
+      const now = Date.now();
+      const old = now - CONTROLLED_NODE_UPGRADE_STALE_AFTER_MS - 60_000;
+      // names sort so the entries that must be kept come first
+      for (let index = 0; index < 70; index += 1) await createOwnedUpgradeDir({ root, suffix: `a-young${String(index).padStart(3, '0')}`, createdAt: now - 1_000 });
+      for (let index = 0; index < 30; index += 1) await createOwnedUpgradeDir({ root, suffix: `b-live${String(index).padStart(3, '0')}`, createdAt: old, pid: 424_242 });
+      await createOwnedUpgradeDir({ root, suffix: 'c-nomarker', createdAt: old, marker: false });
+      await symlink(tmpdir(), join(root, 'imcodes-node-upgrade-d-link01'));
+      for (let index = 0; index < 40; index += 1) await createOwnedUpgradeDir({ root, suffix: `z-stale${String(index).padStart(3, '0')}`, createdAt: old, pid: 7 });
+      const deps = { now: () => now, uptime: () => 30 * 24 * 60 * 60, isProcessAlive: (pid: number) => pid === 424_242 };
+      let removedTotal = 0;
+      let passesUsed = 0;
+      for (; passesUsed < 10 && removedTotal < 40; passesUsed += 1) removedTotal += (await scavengeStaleControlledNodeUpgradePass(root, deps)).removed;
+      expect(removedTotal).toBe(40);
+      expect(passesUsed).toBeLessThanOrEqual(6);
+      const left = await readdir(root);
+      expect(left.filter((name) => name.includes('z-stale'))).toEqual([]);
+      expect(left.filter((name) => name.includes('a-young'))).toHaveLength(70);
+      expect(left.filter((name) => name.includes('b-live'))).toHaveLength(30);
+      expect(left).toContain('imcodes-node-upgrade-c-nomarker');
+      expect(left).toContain('imcodes-node-upgrade-d-link01');
+      expect((await lstat(tmpdir())).isDirectory()).toBe(true);
+    }, 120_000);
+
+    it('never removes the staging directory of an upgrade in progress in this process', async () => {
+      const { root, now, old } = await crowdedRoot(0, 0);
+      const active = await createOwnedUpgradeDir({ root, suffix: 'activeone', createdAt: old, pid: 7 });
+      activeControlledNodeUpgradeDirsForTests.add(active);
+      try {
+        const removed = await scavengeStaleControlledNodeUpgradeDirs(root, { now: () => now, uptime: () => 1, isProcessAlive: () => false });
+        expect(removed).toBe(0);
+        expect(await readdir(root)).toEqual([basename(active)]);
+      } finally {
+        activeControlledNodeUpgradeDirsForTests.delete(active);
+      }
     });
-    expect(removed).toBe(0);
-    expect(operations).toEqual({ enumerate: 128, lstat: 128, marker_read: 64, delete: 0 });
-    expect((await readdir(root))).toHaveLength(192);
+
+    it('the scheduled sweep follows a budget-limited pass with short bounded passes until the backlog is gone, then stops', async () => {
+      const { root, now } = await crowdedRoot(100, 0);
+      vi.useFakeTimers();
+      try {
+        startControlledNodeUpgradeScavenger(root, { now: () => now, uptime: () => 1, isProcessAlive: () => false });
+        const remainingAfter = async () => (await readdir(root)).length;
+        await vi.advanceTimersByTimeAsync(0);
+        await vi.waitFor(async () => expect(await remainingAfter()).toBe(68));
+        // nothing happens before the follow-up delay...
+        await vi.advanceTimersByTimeAsync(CONTROLLED_NODE_UPGRADE_BACKLOG_PASS_DELAY_MS - 1);
+        expect(await remainingAfter()).toBe(68);
+        // ...then one more bounded pass per delay
+        for (const expected of [36, 4, 0]) {
+          await vi.advanceTimersByTimeAsync(CONTROLLED_NODE_UPGRADE_BACKLOG_PASS_DELAY_MS);
+          await vi.waitFor(async () => expect(await remainingAfter()).toBe(expected));
+        }
+        const timersBefore = vi.getTimerCount();
+        await vi.advanceTimersByTimeAsync(CONTROLLED_NODE_UPGRADE_BACKLOG_PASS_DELAY_MS * 3);
+        // only the hourly interval remains: no follow-up chain is left running
+        expect(vi.getTimerCount()).toBeLessThanOrEqual(timersBefore);
+      } finally {
+        vi.useRealTimers();
+      }
+    }, 60_000);
   });
 
   it('uses a streaming directory iterator rather than eagerly materializing Windows Temp', async () => {

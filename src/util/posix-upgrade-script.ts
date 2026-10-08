@@ -157,10 +157,35 @@ write_install_failure_status() {
   mv "$status_tmp" "$UPGRADE_STATUS_FILE" 2>>"$LOG"
 }
 
+# Old attempts' script directories (logs, the staged installer) are removed by the NEXT attempt, not by a timer: a
+# background sleeper (sleep, then remove) per attempt left one process per attempt behind for a day (26 of them on a Mac whose
+# install kept failing and retrying). Only directories that look exactly like ours are touched: a direct child of the
+# directory this attempt's own script directory is in, named imcodes-upgrade-*, owned by this user, holding an upgrade.sh,
+# untouched for the retention time (the 24 h the logs are kept for diagnosis), never this attempt's own directory; at most 64
+# per run.
+sweep_old_upgrade_dirs() {
+  [ -n "$SCRIPT_DIR" ] && [ -d "$SCRIPT_DIR" ] || return 0
+  case "$(basename "$SCRIPT_DIR")" in imcodes-upgrade-*) ;; *) return 0 ;; esac
+  SWEEP_PARENT=$(dirname "$SCRIPT_DIR")
+  SWEEP_MINUTES=$(( CLEANUP_AFTER_SEC / 60 ))
+  SWEEP_COUNT=0
+  find "$SWEEP_PARENT" -maxdepth 1 -type d -name 'imcodes-upgrade-*' -user "$(id -u)" -mmin "+$SWEEP_MINUTES" 2>/dev/null | while IFS= read -r OLD_DIR; do
+    [ "$OLD_DIR" = "$SCRIPT_DIR" ] && continue
+    [ -f "$OLD_DIR/upgrade.sh" ] || continue
+    [ -L "$OLD_DIR" ] && continue
+    SWEEP_COUNT=$(( SWEEP_COUNT + 1 ))
+    [ "$SWEEP_COUNT" -gt 64 ] && break
+    rm -rf "$OLD_DIR" 2>/dev/null && log "[cleanup] removed old upgrade directory: $(basename "$OLD_DIR")"
+  done
+  return 0
+}
+
 schedule_self_cleanup() {
   if [ -z "$SCRIPT_DIR" ] || [ ! -d "$SCRIPT_DIR" ]; then
     return 0
   fi
+
+  sweep_old_upgrade_dirs
 
   if [ "$(uname)" = "Linux" ]; then
     if command -v systemd-run >/dev/null 2>&1; then
@@ -170,16 +195,17 @@ schedule_self_cleanup() {
         log "[cleanup] scheduled via systemd-run user unit: $CLEANUP_UNIT"
         return 0
       fi
-      log "[cleanup] systemd-run scheduling failed (non-fatal); leaving $SCRIPT_DIR for manual cleanup"
+      log "[cleanup] systemd-run scheduling failed (non-fatal); $SCRIPT_DIR is removed by a later upgrade attempt"
     else
-      log "[cleanup] systemd-run unavailable; leaving $SCRIPT_DIR for manual cleanup"
+      log "[cleanup] systemd-run unavailable; $SCRIPT_DIR is removed by a later upgrade attempt"
     fi
     log "[cleanup] skipped background sleeper on Linux to avoid leaking into imcodes.service cgroup"
     return 0
   fi
 
-  (sleep "$CLEANUP_AFTER_SEC" && rm -rf "$SCRIPT_DIR") >/dev/null 2>&1 &
-  log "[cleanup] scheduled via background sleeper"
+  # No timer process elsewhere either (a sleeper per attempt piled up): a later upgrade attempt removes this directory
+  # once it is older than the retention time.
+  log "[cleanup] $SCRIPT_DIR is removed by a later upgrade attempt after $CLEANUP_AFTER_SEC s"
 }
 
 log "=== imcodes upgrade started ==="
