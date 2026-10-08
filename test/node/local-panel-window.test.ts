@@ -26,6 +26,7 @@ import {
   type LocalPanelWindowProcess,
   type LocalPanelWindowRecordStore,
 } from '../../src/node/local-panel-window.js';
+import { createLocalPanelPhaseTimer, type LocalPanelTimingEntry } from '../../src/node/local-panel-timing.js';
 
 const facts = (over: Partial<LocalPanelWindowFacts> = {}): LocalPanelWindowFacts => ({
   platform: 'linux', panelRunning: true, hasDesktop: true, nativeUiInstalled: false, appModeBrowsers: [],
@@ -328,5 +329,102 @@ describe('openLocalPanelWindow', () => {
     });
     await expect(run()).resolves.toMatchObject({ reason: LOCAL_PANEL_WINDOW_REASON.LAUNCH_FAILED });
     expect(m.calls).toEqual([]);
+  });
+});
+
+// ---- where the time goes: phases, parallel checks, one verification per click ---------------------------------------------------------
+
+describe('openLocalPanelWindow: phase timing and the work done per click', () => {
+  /** A platform whose desktop check and host verification are separate promises the test settles by hand. */
+  function manualPlatform() {
+    const log: string[] = [];
+    const gates: Record<string, () => void> = {};
+    const gate = (name: string): Promise<void> => new Promise((resolve) => { gates[name] = resolve; });
+    const platform: LocalPanelWindowPlatform = {
+      platform: 'win32',
+      hasDesktop: async () => { log.push('desktop:start'); await gate('desktop'); log.push('desktop:end'); return true; },
+      nativeUiPath: async () => { log.push('verify:start'); await gate('verify'); log.push('verify:end'); return 'C:\\host\\aidesk-local-ui.exe'; },
+      nativeVerifySource: () => 'record',
+      nativeHostsOwnInstance: true,
+      findAppModeBrowsers: async () => { log.push('browsers'); return ['msedge.exe']; },
+      findWindowProcess: async () => { log.push('find'); return undefined; },
+      probePid: async () => ({ alive: false }),
+      canFocus: true,
+      focusWindow: async () => true,
+      launchNative: async (path) => { log.push(`launch:${path}`); return true; },
+      launchAppMode: async () => true,
+      openDefaultBrowser: async () => true,
+    };
+    return { platform, log, gates };
+  }
+  const store = (): LocalPanelWindowRecordStore => { let value: string | undefined; return { read: () => value, write: (next) => { value = next; }, clear: () => { value = undefined; } }; };
+
+  it('the desktop check and the host verification run side by side, and the host is verified once for the click (not again at launch)', async () => {
+    const { platform, log, gates } = manualPlatform();
+    let verifyCalls = 0;
+    const counted = { ...platform, nativeUiPath: async () => { verifyCalls += 1; return platform.nativeUiPath(); } };
+    const pending = openLocalPanelWindow({ platform: counted, store: store(), panelRunning: async () => true, log: () => undefined, sleep: async () => undefined });
+    await new Promise((resolve) => setImmediate(resolve));
+    // both are under way before either has finished
+    expect(log).toEqual(['desktop:start', 'verify:start']);
+    gates.verify!();
+    gates.desktop!();
+    const outcome = await pending;
+    expect(outcome).toMatchObject({ reason: LOCAL_PANEL_WINDOW_REASON.OPENED_NATIVE });
+    expect(verifyCalls).toBe(1);
+    expect(log.filter((entry) => entry.startsWith('launch:'))).toEqual(['launch:C:\\host\\aidesk-local-ui.exe']);
+    // a native host that keeps its own instance is never looked for first
+    expect(log).not.toContain('find');
+  });
+
+  it('records where the time went with an injected clock: per phase, in click order, with the reason, and the verify source', async () => {
+    const { platform, gates } = manualPlatform();
+    let clock = 10_000;
+    const timer = createLocalPanelPhaseTimer({ monotonicMs: () => clock, wallMs: () => 1_790_000_000_000 + clock });
+    const entries: LocalPanelTimingEntry[] = [];
+    const logged: Array<Record<string, unknown>> = [];
+    const wrapped: LocalPanelWindowPlatform = {
+      ...platform,
+      hasDesktop: async () => { clock += 40; return platform.hasDesktop(); },
+      nativeUiPath: async () => { clock += 700; return platform.nativeUiPath(); },
+      launchNative: async (path) => { clock += 1_250; return platform.launchNative(path); },
+    };
+    const pending = openLocalPanelWindow({
+      platform: wrapped, store: store(), panelRunning: async () => { clock += 5; return true; },
+      log: (_level, fields) => { logged.push(fields); }, timer, onTiming: (entry) => entries.push(entry),
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    gates.verify!();
+    gates.desktop!();
+    const outcome = await pending;
+    expect(entries).toHaveLength(1);
+    const entry = entries[0]!;
+    expect(outcome.timing).toEqual(entry);
+    expect(entry).toMatchObject({ platform: 'win32', reason: LOCAL_PANEL_WINDOW_REASON.OPENED_NATIVE, mechanism: 'native', verify: 'record' });
+    // desktop_check and native_verify run side by side, so their durations overlap (the one clock here advanced 40 + 700 while both were open)
+    expect(entry.phases).toEqual({ panel_probe: 5, desktop_check: 740, native_verify: 700, browser_search: 0, launch_native: 1_250 });
+    expect(entry.totalMs).toBe(5 + 40 + 700 + 1_250);
+    // the same numbers are in the one log line of the request (nothing else: no path, no user)
+    expect(logged.at(-1)).toMatchObject({ totalMs: entry.totalMs, phases: entry.phases, verify: 'record', reason: LOCAL_PANEL_WINDOW_REASON.OPENED_NATIVE });
+    expect(JSON.stringify(entry)).not.toMatch(/aidesk-local-ui|C:\\|127\.0\.0\.1/u);
+  });
+
+  it('a phase that throws still counts its time, the request still ends with a reason, and a failing history writer never fails the open', async () => {
+    let clock = 0;
+    const timer = createLocalPanelPhaseTimer({ monotonicMs: () => clock, wallMs: () => 5 });
+    const outcome = await openLocalPanelWindow({
+      platform: { ...manualPlatform().platform, hasDesktop: async () => { clock += 30; throw new Error('boom'); } },
+      store: store(), panelRunning: async () => true, log: () => undefined, timer, onTiming: () => { throw new Error('disk full'); },
+    });
+    expect(outcome.reason).toBe(LOCAL_PANEL_WINDOW_REASON.LAUNCH_FAILED);
+    expect(outcome.timing).toBeUndefined();
+  });
+
+  it('with no panel there is nothing else to measure: only the probe ran', async () => {
+    const entries: LocalPanelTimingEntry[] = [];
+    const { platform } = manualPlatform();
+    await openLocalPanelWindow({ platform, store: store(), panelRunning: async () => false, log: () => undefined, onTiming: (entry) => entries.push(entry) });
+    expect(Object.keys(entries[0]!.phases)).toEqual(['panel_probe']);
+    expect(entries[0]!.reason).toBe(LOCAL_PANEL_WINDOW_REASON.NO_PANEL);
   });
 });

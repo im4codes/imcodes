@@ -45,9 +45,10 @@ import {
 } from './remote-desktop-local-panel.js';
 import { startAideskLocalIpcServer } from './aidesk-local-ipc-server.js';
 import { ensureAideskDesktopEntry } from './aidesk-desktop-entry.js';
-import { startAideskLocalUiSidecarRefresh } from './aidesk-local-ui-sidecar.js';
+import { startAideskLocalUiSidecarRefresh, warmAideskLocalUiVerification } from './aidesk-local-ui-sidecar.js';
 import { startMacosAideskAppRefresh } from './macos-aidesk-app-refresh.js';
-import { localPanelWindowHandlers, openAideskLocalPanel } from './local-panel-window-run.js';
+import { describeLocalPanelTiming, localPanelWindowHandlers, openAideskLocalPanel } from './local-panel-window-run.js';
+import { LOCAL_PANEL_TIMING } from '../../shared/local-panel-window.js';
 import {
   CONSOLE_HOLD,
   consoleHoldCountdown,
@@ -227,6 +228,10 @@ async function main(): Promise<void> {
       stdout: (text) => { process.stdout.write(text); },
       stderr: (text) => { process.stderr.write(text); },
     });
+    return;
+  }
+  if (process.argv[2] === LOCAL_PANEL_TIMING.CLI_FLAG) {
+    process.stdout.write(`${describeLocalPanelTiming()}\n`);
     return;
   }
   if (process.argv[2] === '--open-local-panel') {
@@ -443,12 +448,15 @@ async function main(): Promise<void> {
   // The Windows panel window host (a signed WebView2 exe) is its own sidecar: refreshed here, apart from the node's upgrade, and never
   // able to fail the node (every outcome is a logged reason; failures back off).
   const stopAideskLocalUiRefresh = startAideskLocalUiSidecarRefresh({ credential: bootstrap.credential });
+  // The installed host is verified once here, off the click path (a click then only compares the file to the proof this leaves).
+  const stopAideskLocalUiWarm = warmAideskLocalUiVerification();
   // macOS: a newly installed aiDesk app only takes effect when the old menu-bar process is replaced. Done here when it is safe (no active
   // remote-desktop connection), logged by reason, capped per version; a no-op on other platforms.
   const stopMacosAideskAppRefresh = startMacosAideskAppRefresh({ activeConnections: () => runtime.remoteDesktopAccessStatus().connections.length });
   runtime.start();
   const stop = () => {
     stopAideskLocalUiRefresh();
+    stopAideskLocalUiWarm();
     stopMacosAideskAppRefresh();
     void localIpc?.close().catch(() => {});
     void localPanel?.close().catch(() => {});

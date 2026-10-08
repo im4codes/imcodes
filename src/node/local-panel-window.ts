@@ -4,6 +4,7 @@
  * `LocalPanelWindowPlatform`; nothing here knows how a window is opened on any one OS.
  */
 import {
+  LOCAL_PANEL_PHASE,
   LOCAL_PANEL_WINDOW_MECHANISM,
   LOCAL_PANEL_WINDOW_REASON,
   isAllowedLocalPanelUrl,
@@ -20,6 +21,8 @@ import {
   type LocalPanelWindowRecord,
 } from '../../shared/local-panel-window.js';
 
+import { createLocalPanelPhaseTimer, type LocalPanelPhaseTimer, type LocalPanelTimingEntry } from './local-panel-timing.js';
+
 export interface LocalPanelWindowProcess { pid: number; startedAtMs: number }
 
 /** The thin, per-OS part: how to find, focus and start things for the ACTIVE USER's desktop. */
@@ -29,6 +32,8 @@ export interface LocalPanelWindowPlatform {
   hasDesktop(): Promise<boolean>;
   /** Absolute path of the native aiDesk window, when it is installed AND verified (see aidesk-local-ui-artifact.ts). */
   nativeUiPath(): Promise<string | undefined>;
+  /** How the host returned by the last `nativeUiPath()` was trusted: `record` (an earlier full verification still covers it) or `full`. */
+  nativeVerifySource?(): string | undefined;
   /** App-mode capable browsers that can be tried, in preference order (identifiers the platform's launchAppMode understands). */
   findAppModeBrowsers(): Promise<string[]>;
   /** A running panel window (native or app-mode), found by what it is -- not by a record. */
@@ -58,6 +63,8 @@ export interface LocalPanelWindowOutcome {
   mechanism?: LocalPanelWindowMechanism;
   /** Reason codes of attempts that failed or mechanisms that were skipped on the way (for the log and for tests). */
   trail: LocalPanelWindowReason[];
+  /** Where the time between the click and this outcome went (also logged and kept in the bounded timing history). */
+  timing?: LocalPanelTimingEntry;
 }
 
 export interface OpenLocalPanelWindowInput {
@@ -70,6 +77,10 @@ export interface OpenLocalPanelWindowInput {
   locateTimeoutMs?: number;
   sleep?: (ms: number) => Promise<void>;
   now?: () => number;
+  /** Phase timer of this request (default: a real one); tests inject a clock. */
+  timer?: LocalPanelPhaseTimer;
+  /** Receives the finished timing of every request that got an outcome (the runner logs it and keeps the bounded history). */
+  onTiming?: (entry: LocalPanelTimingEntry) => void;
 }
 
 const defaultSleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
@@ -108,6 +119,8 @@ function rememberWindow(store: LocalPanelWindowRecordStore, window: LocalPanelWi
   store.write(JSON.stringify(record));
 }
 
+const timedIn = <T>(timer: LocalPanelPhaseTimer, phase: Parameters<LocalPanelPhaseTimer['measure']>[0], work: () => Promise<T>): Promise<T> => timer.measure(phase, work);
+
 async function locateLaunchedWindow(input: OpenLocalPanelWindowInput, mechanism: LocalPanelWindowMechanism): Promise<void> {
   const sleep = input.sleep ?? defaultSleep;
   const deadline = (input.locateTimeoutMs ?? 3_000) / 200;
@@ -120,37 +133,49 @@ async function locateLaunchedWindow(input: OpenLocalPanelWindowInput, mechanism:
   input.store.write(JSON.stringify({ pendingLaunch: { atMs: (input.now ?? Date.now)(), mechanism } }));
 }
 
-async function runAttempt(input: OpenLocalPanelWindowInput, attempt: LocalPanelWindowAttempt): Promise<boolean> {
+async function runAttempt(input: OpenLocalPanelWindowInput, timer: LocalPanelPhaseTimer, attempt: LocalPanelWindowAttempt, nativePath: string | undefined): Promise<boolean> {
   const { platform } = input;
   if (attempt.mechanism === LOCAL_PANEL_WINDOW_MECHANISM.NATIVE) {
-    const path = await platform.nativeUiPath();
-    return path !== undefined && platform.launchNative(path);
+    // The host was verified moments ago for this very click (and is verified again by the platform if it is asked for a second time).
+    const path = nativePath ?? await timedIn(timer, LOCAL_PANEL_PHASE.NATIVE_VERIFY, () => platform.nativeUiPath());
+    return path !== undefined && timedIn(timer, LOCAL_PANEL_PHASE.LAUNCH_NATIVE, () => platform.launchNative(path));
   }
-  if (attempt.mechanism === LOCAL_PANEL_WINDOW_MECHANISM.APP_MODE) return platform.launchAppMode(attempt.browser);
+  if (attempt.mechanism === LOCAL_PANEL_WINDOW_MECHANISM.APP_MODE) return timedIn(timer, LOCAL_PANEL_PHASE.LAUNCH_APP_MODE, () => platform.launchAppMode(attempt.browser));
   const url = localPanelUrl();
   // Defense in depth: the only URL any mechanism is ever handed is the panel's own.
-  return isAllowedLocalPanelUrl(url) && platform.openDefaultBrowser(url);
+  return isAllowedLocalPanelUrl(url) && timedIn(timer, LOCAL_PANEL_PHASE.LAUNCH_DEFAULT_BROWSER, () => platform.openDefaultBrowser(url));
 }
 
 /** One click on "local management": open the panel as an independent window, or focus the one already open. Never throws. */
 export async function openLocalPanelWindow(input: OpenLocalPanelWindowInput): Promise<LocalPanelWindowOutcome> {
   const trail: LocalPanelWindowReason[] = [];
+  const timer = input.timer ?? createLocalPanelPhaseTimer();
   // A logger that cannot write (unwritable log file, closed stream) must never turn a window that opened into a failure.
   const log: OpenLocalPanelWindowInput['log'] = (level, fields, message) => { try { input.log(level, fields, message); } catch { /* logging is best effort */ } };
   const finish = (outcome: Omit<LocalPanelWindowOutcome, 'trail'>, level: 'info' | 'warn' = 'info'): LocalPanelWindowOutcome => {
-    const result = { ...outcome, trail };
-    log(level, { reason: result.reason, mechanism: result.mechanism, trail, url: localPanelUrl() }, 'local panel window');
+    const timing = timer.finish({ platform: input.platform.platform, reason: outcome.reason, ...(outcome.mechanism ? { mechanism: outcome.mechanism } : {}) });
+    const result = { ...outcome, trail, timing };
+    log(level, { reason: result.reason, mechanism: result.mechanism, trail, url: localPanelUrl(), totalMs: timing.totalMs, phases: timing.phases, verify: timing.verify }, 'local panel window');
+    try { input.onTiming?.(timing); } catch { /* history only */ }
     return result;
   };
   try {
-    const panelRunning = await input.panelRunning();
-    const hasDesktop = panelRunning ? await input.platform.hasDesktop() : false;
-    const nativePath = panelRunning && hasDesktop ? await input.platform.nativeUiPath() : undefined;
+    const panelRunning = await timer.measure(LOCAL_PANEL_PHASE.PANEL_PROBE, () => input.panelRunning());
+    // The desktop check and the host verification do not depend on each other: they run side by side (the slower one sets the pace,
+    // not their sum). A host verified for a machine with no desktop is simply not used.
+    const [hasDesktop, verifiedNative] = panelRunning
+      ? await Promise.all([
+        timer.measure(LOCAL_PANEL_PHASE.DESKTOP_CHECK, () => input.platform.hasDesktop()),
+        timer.measure(LOCAL_PANEL_PHASE.NATIVE_VERIFY, () => input.platform.nativeUiPath()),
+      ])
+      : [false, undefined];
+    const nativePath = panelRunning && hasDesktop ? verifiedNative : undefined;
+    if (nativePath !== undefined) timer.note('verify', input.platform.nativeVerifySource?.() ?? 'full');
     const selfManagedNative = nativePath !== undefined && input.platform.nativeHostsOwnInstance === true;
-    const known: ExistingWindow = panelRunning && hasDesktop && !selfManagedNative ? await resolveExistingWindow(input) : {};
+    const known: ExistingWindow = panelRunning && hasDesktop && !selfManagedNative ? await timer.measure(LOCAL_PANEL_PHASE.EXISTING_WINDOW, () => resolveExistingWindow(input)) : {};
     const existing = known.window;
     if (known.launchInProgress) return finish({ reason: LOCAL_PANEL_WINDOW_REASON.LAUNCH_IN_PROGRESS });
-    const appModeBrowsers = panelRunning && hasDesktop && !existing ? await input.platform.findAppModeBrowsers() : [];
+    const appModeBrowsers = panelRunning && hasDesktop && !existing ? await timer.measure(LOCAL_PANEL_PHASE.BROWSER_SEARCH, () => input.platform.findAppModeBrowsers()) : [];
     const plan = planLocalPanelWindow({
       platform: input.platform.platform,
       panelRunning,
@@ -163,7 +188,7 @@ export async function openLocalPanelWindow(input: OpenLocalPanelWindowInput): Pr
     });
     if (plan.action === 'none') return finish({ reason: plan.reason }, plan.reason === LOCAL_PANEL_WINDOW_REASON.NO_PANEL ? 'warn' : 'info');
     if (plan.action === 'focus') {
-      if (input.platform.canFocus && existing && !(await input.platform.focusWindow(existing))) {
+      if (input.platform.canFocus && existing && !(await timer.measure(LOCAL_PANEL_PHASE.FOCUS, () => input.platform.focusWindow(existing)))) {
         trail.push(LOCAL_PANEL_WINDOW_REASON.KEPT_EXISTING);
         return finish({ reason: LOCAL_PANEL_WINDOW_REASON.KEPT_EXISTING });
       }
@@ -174,10 +199,10 @@ export async function openLocalPanelWindow(input: OpenLocalPanelWindowInput): Pr
     trail.push(...plan.skipped.map((reason) => (reason === LOCAL_PANEL_WINDOW_REASON.NATIVE_UI_MISSING && unavailable ? unavailable : reason)));
     for (const attempt of plan.attempts) {
       let ok = false;
-      try { ok = await runAttempt(input, attempt); } catch { ok = false; }
+      try { ok = await runAttempt(input, timer, attempt, nativePath); } catch { ok = false; }
       if (ok) {
         const selfManaged = attempt.mechanism === LOCAL_PANEL_WINDOW_MECHANISM.NATIVE && input.platform.nativeHostsOwnInstance === true;
-        if (attempt.mechanism !== LOCAL_PANEL_WINDOW_MECHANISM.DEFAULT_BROWSER && !selfManaged) await locateLaunchedWindow(input, attempt.mechanism);
+        if (attempt.mechanism !== LOCAL_PANEL_WINDOW_MECHANISM.DEFAULT_BROWSER && !selfManaged) await timer.measure(LOCAL_PANEL_PHASE.LOCATE, () => locateLaunchedWindow(input, attempt.mechanism));
         return finish({ reason: openedReasonOf(attempt.mechanism), mechanism: attempt.mechanism });
       }
       trail.push(LOCAL_PANEL_WINDOW_REASON.LAUNCH_FAILED);

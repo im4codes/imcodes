@@ -12,6 +12,7 @@ import {
   LOCAL_PANEL_WINDOW_STATE_FILE,
   localPanelUrl,
 } from '../../shared/local-panel-window.js';
+import { appendLocalPanelTiming, formatLocalPanelTiming, readLocalPanelTiming } from './local-panel-timing.js';
 import { REMOTE_DESKTOP_LOCAL_MANAGEMENT, type RemoteDesktopLocalWebAction } from '../../shared/remote-desktop-local-management.js';
 import logger from '../util/logger.js';
 import { startupDiagnosticsDir } from './startup-diagnostics.js';
@@ -60,15 +61,23 @@ export function probeLocalPanel(timeoutMs = 1_500, port: number = REMOTE_DESKTOP
 export async function runLocalPanelWindow(options: { platform?: LocalPanelWindowPlatform; store?: LocalPanelWindowRecordStore; stateDir?: string; panelRunning?: () => Promise<boolean> } = {}): Promise<LocalPanelWindowOutcome> {
   const platform = options.platform ?? createLocalPanelWindowPlatform();
   if (!platform) return { reason: LOCAL_PANEL_WINDOW_REASON.UNSUPPORTED_PLATFORM, trail: [] };
+  const stateDir = options.stateDir ?? startupDiagnosticsDir();
   return openLocalPanelWindow({
     platform,
-    store: options.store ?? createLocalPanelWindowRecordStore(options.stateDir ?? startupDiagnosticsDir()),
+    store: options.store ?? createLocalPanelWindowRecordStore(stateDir),
+    onTiming: (entry) => appendLocalPanelTiming(stateDir, entry),
     panelRunning: options.panelRunning ?? (() => probeLocalPanel()),
     log: (level, fields, message) => {
       try { logger[level](fields, message); } catch { /* an unwritable log file must not stop the window */ }
       if (level === 'warn') process.stderr.write(`imcodes-node: ${message}: ${String(fields.reason)}${fields.error ? ` [${String(fields.error)}]` : ''} (${localPanelUrl()})\n`);
     },
   });
+}
+
+/** `imcodes-node --local-panel-timing`: the recent open requests of this node's state directory, one line each (phases in click order). */
+export function describeLocalPanelTiming(stateDir: string = startupDiagnosticsDir()): string {
+  const entries = readLocalPanelTiming(stateDir);
+  return entries.length === 0 ? `no local panel opens recorded in ${stateDir}` : formatLocalPanelTiming(entries);
 }
 
 /**

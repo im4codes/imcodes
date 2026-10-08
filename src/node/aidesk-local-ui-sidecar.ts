@@ -32,7 +32,7 @@ import {
 import { CONTROLLED_NODE_ARTIFACT_ASSETS } from '../../shared/controlled-node-artifacts.js';
 import { compareImcodesVersions } from '../../shared/imcodes-version.js';
 import logger from '../util/logger.js';
-import { resolveVerifiedAideskLocalUi } from './aidesk-local-ui-artifact.js';
+import { resolveVerifiedAideskLocalUi, resolveVerifiedAideskLocalUiDetailed, type VerifiedAideskLocalUi } from './aidesk-local-ui-artifact.js';
 import { windowsComputerUseHelperAclCommands } from './installer.js';
 import { downloadControlledNodeAideskLocalUiFile, type ArtifactDownloadCredential } from './self-upgrade.js';
 
@@ -254,4 +254,37 @@ export function startAideskLocalUiSidecarRefresh(
   const random = options.random ?? Math.random;
   arm(AIDESK_LOCAL_UI_REFRESH_SCHEDULE.initialDelayMs + Math.round((random() * 2 - 1) * AIDESK_LOCAL_UI_REFRESH_SCHEDULE.initialJitterMs));
   return () => { stopped = true; if (handle) clear(handle); };
+}
+
+/** How long after the node started the installed host is verified in the background (long enough not to compete with startup). */
+export const AIDESK_LOCAL_UI_WARM_DELAY_MS = 20_000;
+
+/**
+ * Verifies the installed host once, in the background, so the first click after a node start (or after an update that did not come
+ * through the refresh above) finds the proof of that verification instead of paying for it: hashing the executable and validating
+ * its Authenticode chain take seconds on a slow or offline PC. Windows x64 only; nothing here can fail the node. Returns the stop function.
+ */
+export function warmAideskLocalUiVerification(
+  options: {
+    platform?: NodeJS.Platform;
+    arch?: string;
+    delayMs?: number;
+    resolve?: () => Promise<VerifiedAideskLocalUi | undefined>;
+    schedule?: (callback: () => void, ms: number) => { unref?: () => void };
+    clear?: (handle: unknown) => void;
+  } = {},
+): () => void {
+  const platform = options.platform ?? process.platform;
+  const arch = options.arch ?? process.arch;
+  if (platform !== AIDESK_LOCAL_UI_SIDECAR_TARGET.os || arch !== AIDESK_LOCAL_UI_SIDECAR_TARGET.arch) return () => undefined;
+  const resolve = options.resolve ?? (() => resolveVerifiedAideskLocalUiDetailed());
+  const schedule = options.schedule ?? ((callback, ms) => setTimeout(callback, ms));
+  const clear = options.clear ?? ((handle) => clearTimeout(handle as NodeJS.Timeout));
+  const handle = schedule(() => {
+    void resolve()
+      .then((host) => logger.info({ verified: host !== undefined, source: host?.source }, 'aidesk-local-ui verification warmed'))
+      .catch((error) => logger.warn({ err: error }, 'aidesk-local-ui verification warm-up failed'));
+  }, options.delayMs ?? AIDESK_LOCAL_UI_WARM_DELAY_MS);
+  handle.unref?.();
+  return () => clear(handle);
 }

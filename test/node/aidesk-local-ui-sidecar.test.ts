@@ -11,17 +11,20 @@ import { afterEach, describe, expect, it } from 'vitest';
 import {
   AIDESK_LOCAL_UI_MANIFEST_FILENAME,
   AIDESK_LOCAL_UI_NOTICES_FILENAME,
+  AIDESK_LOCAL_UI_VERIFIED_FILENAME,
   aideskLocalUiExecutableFileName,
 } from '../../shared/aidesk-local-ui-artifact.js';
 import { CONTROLLED_NODE_ARTIFACT_ASSETS } from '../../shared/controlled-node-artifacts.js';
 import {
   AIDESK_LOCAL_UI_REFRESH_REASON,
   AIDESK_LOCAL_UI_REFRESH_SCHEDULE,
+  AIDESK_LOCAL_UI_WARM_DELAY_MS,
+  warmAideskLocalUiVerification,
   nextAideskLocalUiRefreshDelayMs,
   refreshAideskLocalUiSidecar,
   startAideskLocalUiSidecarRefresh,
 } from '../../src/node/aidesk-local-ui-sidecar.js';
-import { resolveVerifiedAideskLocalUi } from '../../src/node/aidesk-local-ui-artifact.js';
+import { resolveVerifiedAideskLocalUi, resolveVerifiedAideskLocalUiDetailed } from '../../src/node/aidesk-local-ui-artifact.js';
 import { windowsComputerUseHelperAclCommands } from '../../src/node/installer.js';
 
 const SIGNER = 'cd'.repeat(32);
@@ -80,7 +83,8 @@ describe('refreshAideskLocalUiSidecar', () => {
     const { root, deps, finalDirectory, locked, calls } = setup(v1);
     const result = await refreshAideskLocalUiSidecar(deps);
     expect(result).toMatchObject({ updated: true, reason: 'updated', targetVersion: '2026.10.1' });
-    expect(readdirSync(finalDirectory).sort()).toEqual([AIDESK_LOCAL_UI_MANIFEST_FILENAME, AIDESK_LOCAL_UI_NOTICES_FILENAME, aideskLocalUiExecutableFileName('win32')].sort());
+    // The verification the refresh did leaves its proof beside the executable (it moves with the directory), so the first click needs none.
+    expect(readdirSync(finalDirectory).sort()).toEqual([AIDESK_LOCAL_UI_MANIFEST_FILENAME, AIDESK_LOCAL_UI_NOTICES_FILENAME, AIDESK_LOCAL_UI_VERIFIED_FILENAME, aideskLocalUiExecutableFileName('win32')].sort());
     expect(readFileSync(join(finalDirectory, 'aidesk-local-ui.exe'))).toEqual(v1.exe);
     // the manifest was fetched first, the executable only after it, and everything was locked down BEFORE the swap
     expect(calls).toEqual(['aidesk-local-ui-manifest', 'aidesk-local-ui', 'aidesk-local-ui-notices']);
@@ -88,6 +92,12 @@ describe('refreshAideskLocalUiSidecar', () => {
     expect(readdirSync(root).filter((name) => name.startsWith('.aidesk-local-ui-refresh-'))).toEqual([]);
     // what is installed is what the node's own launch-time verification accepts
     expect(await deps.verify(root)).toBe(join(finalDirectory, 'aidesk-local-ui.exe'));
+    const hashed: string[] = [];
+    expect(await resolveVerifiedAideskLocalUiDetailed({
+      execPath: join(root, 'imcodes-node.exe'), platform: 'win32', arch: 'x64', trustedWindowsSignerSha256: SIGNER,
+      hashFile: async (path) => { hashed.push(path); return ''; }, verifySigners: async () => { hashed.push('signer'); return false; },
+    })).toMatchObject({ source: 'record' });
+    expect(hashed).toEqual([]);
   });
 
   it('is a no-op when the installed copy is already that build, and repairs it when the installed file no longer verifies', async () => {
@@ -261,5 +271,34 @@ describe('the refresh schedule', () => {
     const other = startAideskLocalUiSidecarRefresh({ ...deps, platform: 'linux' }, { refresh: refresh as never, schedule });
     expect(armed.length).toBe(4); // nothing armed for another platform
     other();
+  });
+});
+
+describe('warmAideskLocalUiVerification', () => {
+  it('verifies the installed host once, in the background, on Windows x64 only; stopping cancels it', async () => {
+    const scheduled: Array<{ run: () => void; ms: number }> = [];
+    const schedule = (callback: () => void, ms: number) => { scheduled.push({ run: callback, ms }); return { unref: () => undefined }; };
+    const resolveHost = async () => { resolved += 1; return { path: 'C:\\x\\aidesk-local-ui.exe', sha256: 'a'.repeat(64), size: 1, mtimeMs: 1, source: 'full' as const }; };
+    let resolved = 0;
+    const stop = warmAideskLocalUiVerification({ platform: 'win32', arch: 'x64', resolve: resolveHost, schedule, clear: () => undefined });
+    expect(scheduled).toHaveLength(1);
+    expect(scheduled[0]!.ms).toBe(AIDESK_LOCAL_UI_WARM_DELAY_MS);
+    expect(resolved).toBe(0); // never in the way of startup
+    scheduled[0]!.run();
+    await new Promise((resolveTick) => setImmediate(resolveTick));
+    expect(resolved).toBe(1);
+    stop();
+    for (const [platform, arch] of [['linux', 'x64'], ['darwin', 'arm64'], ['win32', 'arm64']] as const) {
+      const before = scheduled.length;
+      warmAideskLocalUiVerification({ platform, arch, resolve: resolveHost, schedule });
+      expect(scheduled.length).toBe(before);
+    }
+  });
+
+  it('a failing verification never throws out of the timer', async () => {
+    let run: (() => void) | undefined;
+    warmAideskLocalUiVerification({ platform: 'win32', arch: 'x64', resolve: async () => { throw new Error('boom'); }, schedule: (callback) => { run = callback; return {}; } });
+    expect(() => run?.()).not.toThrow();
+    await new Promise((resolveTick) => setImmediate(resolveTick));
   });
 });

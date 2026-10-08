@@ -123,6 +123,15 @@ export const LOCAL_PANEL_WINDOWS_HOST = Object.freeze({
   retryMilliseconds: 2000,
   /** How long the node waits, after starting the host, for it to die (non-zero exit) before it counts as started. */
   launchWaitMilliseconds: 8000,
+  /**
+   * A node running as the desktop user (a shortcut) starts the host itself and watches it this long for an early non-zero exit: the
+   * host checks for its runtime before it shows anything, so "runtime missing" arrives at once; a window that is still up has started.
+   */
+  directWatchMilliseconds: 1500,
+  /** After the host exited "runtime missing", clicks go straight to the browser window for this long instead of starting it again. */
+  runtimeMissingRememberMilliseconds: 5 * 60_000,
+  /** Listing processes only to learn whether a desktop exists: an answer later than this is "could not tell", which counts as "try". */
+  desktopCheckTimeoutMilliseconds: 4_000,
 } as const);
 
 /**
@@ -269,3 +278,40 @@ export function openedReasonOf(mechanism: LocalPanelWindowMechanism): LocalPanel
       ? LOCAL_PANEL_WINDOW_REASON.OPENED_APP_MODE
       : LOCAL_PANEL_WINDOW_REASON.OPENED_DEFAULT_BROWSER;
 }
+
+/**
+ * The phases of one "open the local panel window" request, in the order a click walks through them. Every request logs how long each
+ * took (sum per phase, whole milliseconds) so a slow report names its own cause instead of needing a debugging session. The desktop
+ * check and the host verification run side by side, so their durations overlap: the total is the click's wall time, not their sum.
+ */
+export const LOCAL_PANEL_PHASE = Object.freeze({
+  /** Does the panel server answer on its loopback port? */
+  PANEL_PROBE: 'panel_probe',
+  /** Is there an interactive desktop to open a window on? */
+  DESKTOP_CHECK: 'desktop_check',
+  /** Is the native window host installed and verified (size, sha256, signer -- or the record of an earlier full verification)? */
+  NATIVE_VERIFY: 'native_verify',
+  /** Looking for a window that is already open (the record, then the process table). */
+  EXISTING_WINDOW: 'existing_window',
+  BROWSER_SEARCH: 'browser_search',
+  FOCUS: 'focus',
+  LAUNCH_NATIVE: 'launch_native',
+  LAUNCH_APP_MODE: 'launch_app_mode',
+  LAUNCH_DEFAULT_BROWSER: 'launch_default_browser',
+  /** Finding the freshly started window for the single-instance record. */
+  LOCATE: 'locate_window',
+} as const);
+export type LocalPanelPhase = typeof LOCAL_PANEL_PHASE[keyof typeof LOCAL_PANEL_PHASE];
+
+/** How the native window host was established as trusted on this click (`record` = the proof of an earlier full verification still covered it). */
+export const LOCAL_PANEL_VERIFY_SOURCE = Object.freeze({ RECORD: 'record', FULL: 'full', NONE: 'none' } as const);
+
+/**
+ * The bounded timing history beside the window record: one JSON object per open request, newest last, at most this many lines.
+ * Read it with `imcodes-node --local-panel-timing`. No user names, no paths, no URLs: reason codes, phase names and numbers only.
+ */
+export const LOCAL_PANEL_TIMING = Object.freeze({
+  FILE: 'local-panel-timing.jsonl',
+  MAX_LINES: 50,
+  CLI_FLAG: '--local-panel-timing',
+} as const);

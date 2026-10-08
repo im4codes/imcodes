@@ -77,3 +77,52 @@ export function validateAideskLocalUiManifest(
   if (expected.os === 'win32' && candidate.signerSha256 === undefined) return null;
   return candidate as unknown as AideskLocalUiManifest;
 }
+
+/**
+ * What a full verification (size, sha256, release signer) leaves behind, so a click does not repeat it: hashing the executable and
+ * validating its Authenticode chain (a cold PowerShell, with a revocation lookup that waits on the network) took seconds on a slow
+ * or offline PC, on EVERY open. It lives in the same directory as the executable and the manifest, which only SYSTEM and
+ * Administrators can write: whoever could forge it could replace the executable.
+ *
+ * It is honoured only while the file it describes is the very file that was verified (same manifest sha256, same size, same last
+ * write time) and the release signer it was verified against is still the compiled trust anchor; anything else is verified in full.
+ */
+export const AIDESK_LOCAL_UI_VERIFIED_FILENAME = 'aidesk-local-ui.verified.json' as const;
+export const AIDESK_LOCAL_UI_VERIFIED_SCHEMA_VERSION = 1 as const;
+export const AIDESK_LOCAL_UI_VERIFIED_MAX_BYTES = 4 * 1024;
+
+export interface AideskLocalUiVerifiedRecord {
+  schemaVersion: typeof AIDESK_LOCAL_UI_VERIFIED_SCHEMA_VERSION;
+  sha256: string;
+  size: number;
+  /** Whole milliseconds of the file's last write time when it was verified. */
+  mtimeMs: number;
+  /** The Authenticode signer (Windows) it was verified against; absent where there is no signature of its own. */
+  signerSha256?: string;
+  verifiedAtMs: number;
+}
+
+export function validateAideskLocalUiVerifiedRecord(value: unknown): AideskLocalUiVerifiedRecord | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const candidate = value as Record<string, unknown>;
+  if (!exactKeys(candidate, ['schemaVersion', 'sha256', 'size', 'mtimeMs', 'verifiedAtMs'], ['signerSha256'])) return null;
+  if (candidate.schemaVersion !== AIDESK_LOCAL_UI_VERIFIED_SCHEMA_VERSION) return null;
+  if (typeof candidate.sha256 !== 'string' || !SHA256_RE.test(candidate.sha256)) return null;
+  if (typeof candidate.size !== 'number' || !Number.isSafeInteger(candidate.size) || candidate.size <= 0 || candidate.size > AIDESK_LOCAL_UI_MAX_BYTES) return null;
+  if (typeof candidate.mtimeMs !== 'number' || !Number.isSafeInteger(candidate.mtimeMs) || candidate.mtimeMs < 0) return null;
+  if (typeof candidate.verifiedAtMs !== 'number' || !Number.isSafeInteger(candidate.verifiedAtMs) || candidate.verifiedAtMs < 0) return null;
+  if (candidate.signerSha256 !== undefined && (typeof candidate.signerSha256 !== 'string' || !SHA256_RE.test(candidate.signerSha256))) return null;
+  return candidate as unknown as AideskLocalUiVerifiedRecord;
+}
+
+/** Is `record` the proof for exactly this file, this manifest and this trust anchor? */
+export function aideskLocalUiVerifiedRecordCovers(
+  record: AideskLocalUiVerifiedRecord,
+  current: { manifest: AideskLocalUiManifest; size: number; mtimeMs: number; trustedSignerSha256?: string },
+): boolean {
+  return record.sha256 === current.manifest.sha256
+    && record.size === current.manifest.size
+    && record.size === current.size
+    && record.mtimeMs === Math.floor(current.mtimeMs)
+    && record.signerSha256 === (current.trustedSignerSha256 ?? current.manifest.signerSha256);
+}
