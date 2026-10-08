@@ -75,6 +75,25 @@ class InputLedger {
   InputResult ReleaseController(std::string_view controller_id) noexcept;
   void ReleaseAll() noexcept;
 
+  // The viewer's own account of what it holds, taken as authoritative: releases
+  // every key and button this ledger holds that is NOT in `declared_*`, provided
+  // it was pressed before the declaration was made (its press sequence is below
+  // `declaration_sequence`; one pressed after it, but delivered first, is the
+  // viewer's newer truth and is kept). This heals a key-up that was lost, or
+  // dropped on the way, which the viewer has long since forgotten. Returns
+  // kAdapterFailure if the backend refused a release; `released`, when given,
+  // receives how many were let go.
+  InputResult ReconcileHeld(
+      const std::unordered_set<std::string>& declared_keys,
+      const std::unordered_set<std::string>& declared_buttons,
+      InputSequence declaration_sequence,
+      std::size_t* released = nullptr) noexcept;
+
+  // True while any key or button is held down on the backend's behalf.
+  [[nodiscard]] bool HoldsInput() const noexcept {
+    return !key_owners_.empty() || !button_owners_.empty();
+  }
+
   [[nodiscard]] std::size_t controller_count() const noexcept {
     return controllers_.size();
   }
@@ -83,8 +102,11 @@ class InputLedger {
   struct ControllerState {
     InputEpoch epoch = 0;
     InputSequence last_sequence = 0;
-    std::unordered_set<std::string> keys;
-    std::unordered_set<std::string> buttons;
+    // Held key / button -> the input sequence of the press that put it down.
+    // The sequence orders a press against a held-input declaration without any
+    // wall clock (see ReconcileHeld).
+    std::unordered_map<std::string, InputSequence> keys;
+    std::unordered_map<std::string, InputSequence> buttons;
   };
 
   InputResult ValidateStamp(const InputStamp& stamp,
@@ -96,9 +118,17 @@ class InputLedger {
       std::string_view value,
       bool pressed,
       std::unordered_map<std::string, std::unordered_set<std::string>>* owners,
-      std::unordered_set<std::string> ControllerState::* owned_values,
+      std::unordered_map<std::string, InputSequence> ControllerState::* owned_values,
       bool (InputAdapter::*emit)(std::string_view, bool),
       bool heal_latched_before_press);
+  bool ReleaseUndeclared(
+      const std::string& controller_id,
+      std::unordered_map<std::string, InputSequence>* held,
+      std::unordered_map<std::string, std::unordered_set<std::string>>* owners,
+      const std::unordered_set<std::string>& declared,
+      InputSequence before,
+      bool (InputAdapter::*emit)(std::string_view, bool),
+      std::size_t* released) noexcept;
   bool ReleaseControllerState(const std::string& controller_id,
                               ControllerState* controller) noexcept;
   InputAdapter& backend_;

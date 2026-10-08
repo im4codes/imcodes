@@ -7,6 +7,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -386,6 +387,102 @@ int main() {
       ledger.ReleaseController("ledger-a") == common::InputResult::kApplied &&
           ledger_input.button_events.size() == 5,
       "release-all leaves no duplicated ownership state");
+
+  // The viewer's declaration of what it holds is authoritative over what the
+  // ledger holds: a key-up that was lost (so the viewer forgot the key) is
+  // released by the declaration, a key the viewer still holds is kept, and a
+  // press the viewer made AFTER the declaration (delivered first) is its newer
+  // truth and is kept. Ordering is by input sequence, never a clock.
+  {
+    const std::unordered_set<std::string> none;
+    FakeInput held_input;
+    common::InputLedger reconcile(held_input);
+    Require(reconcile.ApplyKey(Stamp("keyboard", 1, 7), 7, "MetaLeft", true) ==
+                    common::InputResult::kApplied &&
+                reconcile.ApplyKey(Stamp("keyboard", 2, 7), 7, "ShiftLeft",
+                                   true) == common::InputResult::kApplied &&
+                reconcile.ApplyButton(Stamp("pointer", 3, 7), 7, "primary",
+                                      true) == common::InputResult::kApplied,
+            "reconcile setup: two keys and a button held");
+    Require(reconcile.HoldsInput(), "the ledger reports held input");
+
+    std::size_t released = 99;  // ReconcileHeld resets it
+    Require(reconcile.ReconcileHeld({"ShiftLeft"}, {"primary"}, 10,
+                                    &released) == common::InputResult::kApplied &&
+                released == 1,
+            "an undeclared held key is released, declared ones are kept");
+    Require(held_input.key_events.back() ==
+                    std::pair<std::string, bool>{"MetaLeft", false} &&
+                held_input.button_events.size() == 1,
+            "the lost key-up is emitted for exactly the undeclared key");
+
+    Require(reconcile.ReconcileHeld({"ShiftLeft"}, {"primary"}, 10, &released) ==
+                    common::InputResult::kApplied &&
+                released == 0 && held_input.key_events.size() == 3,
+            "a repeated declaration is idempotent");
+
+    // A press made at or after the declaration's sequence is newer than it.
+    Require(reconcile.ApplyKey(Stamp("keyboard", 20, 7), 7, "ControlLeft",
+                               true) == common::InputResult::kApplied,
+            "a key pressed after the declaration was made");
+    Require(reconcile.ReconcileHeld({"ShiftLeft"}, {"primary"}, 20, &released) ==
+                    common::InputResult::kApplied &&
+                released == 0 && held_input.EmittedHeld("ControlLeft"),
+            "a key pressed after the declaration is the viewer's newer truth");
+    Require(reconcile.ReconcileHeld({"ShiftLeft"}, {"primary"}, 21, &released) ==
+                    common::InputResult::kApplied &&
+                released == 1 && !held_input.EmittedHeld("ControlLeft"),
+            "a later declaration that omits it releases it");
+
+    // An empty declaration releases every key and button pressed before it.
+    Require(reconcile.ReconcileHeld(none, none, 30, &released) ==
+                    common::InputResult::kApplied &&
+                released == 2 && !reconcile.HoldsInput() &&
+                !held_input.EmittedHeld("ShiftLeft") &&
+                held_input.button_events.back() ==
+                    std::pair<std::string, bool>{"primary", false},
+            "an empty declaration releases all that was held before it");
+
+    // Two controllers holding one key: only the last owner's release emits the
+    // physical key up, and a reconcile releases every controller's claim.
+    FakeInput shared_input;
+    common::InputLedger shared(shared_input);
+    Require(shared.ApplyKey(Stamp("keyboard", 1, 7), 7, "AltLeft", true) ==
+                    common::InputResult::kApplied &&
+                shared.ApplyKey(Stamp("control", 2, 7), 7, "AltLeft", true) ==
+                    common::InputResult::kApplied &&
+                shared_input.key_events.size() == 1,
+            "two controllers share one physical key");
+    Require(shared.ReconcileHeld(none, none, 9) == common::InputResult::kApplied &&
+                shared_input.key_events.size() == 2 &&
+                !shared_input.key_events.back().second && !shared.HoldsInput(),
+            "undeclared shared key is released once, for every owner");
+
+    // A backend that refuses a release is reported, and the ledger still
+    // forgets the claim so the next declaration is not stuck behind it.
+    FakeInput failing_input;
+    common::InputLedger failing(failing_input);
+    Require(failing.ApplyKey(Stamp("keyboard", 1, 7), 7, "MetaRight", true) ==
+                common::InputResult::kApplied,
+            "failing-backend setup");
+    failing_input.fail_next = true;
+    Require(failing.ReconcileHeld(none, none, 5) ==
+                    common::InputResult::kAdapterFailure &&
+                !failing.HoldsInput(),
+            "a refused release is reported and the claim is dropped");
+
+    // Held state reset by ReleaseAll is not resurrected by a later reconcile.
+    FakeInput after_release_input;
+    common::InputLedger after_release(after_release_input);
+    Require(after_release.ApplyKey(Stamp("keyboard", 1, 7), 7, "KeyA", true) ==
+                common::InputResult::kApplied,
+            "key held before release-all");
+    after_release.ReleaseAll();
+    Require(!after_release.HoldsInput() &&
+                after_release.ReconcileHeld(none, none, 5) ==
+                    common::InputResult::kApplied,
+            "reconcile after release-all has nothing to do");
+  }
 
   // A modifier latched in the OS that this session never pressed (its key-up
   // lost to a crashed worker, a swallowed release, a topology change

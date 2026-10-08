@@ -895,6 +895,15 @@ void LinuxRemoteDesktopSession::HandleDataChannelMessage(
     ReleaseController("pointer:position");
     accepted = true;
     acknowledge = true;
+  } else if (message.kind == imcodes::rd::DataChannelMessageKind::kHeldInput &&
+             channel == DataChannelKind::kControl) {
+    // The viewer's account of what it holds: release what this session holds
+    // and the viewer does not (a lost key-up). Not an input transition, so no
+    // acknowledgement.
+    (void)core_.ReconcileHeldInput(message.held_input.keys,
+                                   message.held_input.buttons,
+                                   message.correlation.sequence);
+    accepted = true;
   } else if (message.kind == imcodes::rd::DataChannelMessageKind::kControl &&
              channel == DataChannelKind::kControl &&
              message.control.kind == imcodes::rd::kCopySelectionKind) {

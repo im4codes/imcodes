@@ -728,6 +728,10 @@ class WorkerTransportSink final : public macos::MacosTransportCallbackSink {
   [[nodiscard]] bool wake_ready() const noexcept { return wake_[0] >= 0; }
   void DrainEvents();
   void DrainQualityTarget();
+  // Releases this viewer's held input when it declared what it holds at least once
+  // and then went silent for kHeldInputSilenceMs. A viewer that never declares (an
+  // older web) is never touched.
+  void ReleaseInputOfSilentViewer(std::int64_t now_ms);
   // Unlock: the loop owns the socket, so the sink only asks it to send.
   void SetUnlockRequester(std::function<bool(bool reveal)> requester) {
     unlock_requester_ = std::move(requester);
@@ -786,6 +790,8 @@ class WorkerTransportSink final : public macos::MacosTransportCallbackSink {
   std::shared_ptr<macos::RawVideoPath> raw_video_;
   std::shared_ptr<macos::WorkerVideoLog> video_log_;
   std::optional<macos::EncoderDescription> last_logged_encoder_;
+  bool held_input_armed_ = false;
+  std::int64_t last_held_input_ms_ = 0;
   macos::EncoderAnnouncement encoder_announcement_;
   rd::common::TopologyRevision presented_layout_revision_ = 0;
   std::uint64_t outbound_sequence_ = 0;
@@ -1830,6 +1836,24 @@ void WorkerTransportSink::OnUnlockReply(bool configured, std::string sign_in) {
     (void)EmitStatus();
 }
 
+void WorkerTransportSink::ReleaseInputOfSilentViewer(std::int64_t now_ms) {
+  if (!held_input_armed_ || session_ == nullptr)
+    return;
+  if (now_ms - last_held_input_ms_ < imcodes::rd::kHeldInputSilenceMs)
+    return;
+  // Disarmed until the viewer declares again: one release per silence, not one per
+  // poll. A frozen page that wakes up declares (and re-arms) with its next message.
+  held_input_armed_ = false;
+  if (!session_->HoldsInput())
+    return;
+  for (const char* controller :
+       {"control", "control:position", "keyboard", "pointer",
+        "pointer:position"}) {
+    session_->ReleaseController(controller);
+  }
+  std::cerr << "macos_remote_desktop_worker_held_input_silent_release\n";
+}
+
 void WorkerTransportSink::DrainQualityTarget() {
   std::optional<
       std::pair<rd::common::TransportCallbackStamp, rd::common::QualityTarget>>
@@ -1949,6 +1973,18 @@ void WorkerTransportSink::HandleDataChannelMessage(
       }));
     }
     acknowledge = true;
+  } else if (message.kind == imcodes::rd::DataChannelMessageKind::kHeldInput &&
+             channel == rd::common::DataChannelKind::kControl) {
+    // The viewer's account of what it holds. Whatever this session holds that the
+    // viewer does not (and that was pressed before the account was made) is a key-up
+    // that was lost on the way: let it go. No acknowledgement: it is not an input
+    // transition, and an unacknowledged one must never fail a session.
+    (void)session_->ReconcileHeldInput(message.held_input.keys,
+                                       message.held_input.buttons,
+                                       message.correlation.sequence);
+    held_input_armed_ = true;
+    last_held_input_ms_ = SampleNow().monotonic_ms;
+    accepted = true;
   } else if (message.kind == imcodes::rd::DataChannelMessageKind::kReleaseAll &&
              channel == rd::common::DataChannelKind::kControl) {
     session_->ReleaseController("control");
@@ -3187,6 +3223,7 @@ int RunLaunchAgentSession(const macos::WorkerLaunchContext& context) {
       route->sink->ReconcileDisclosure();
       route->sink->ObserveTypedUnlock();
       route->sink->DrainQualityTarget();
+      route->sink->ReleaseInputOfSilentViewer(SampleNow().monotonic_ms);
     }
 
     // Outbound media progress, once a second per route -- the Windows

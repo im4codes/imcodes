@@ -760,6 +760,73 @@ void SkipWhitespace(std::string_view text, std::size_t* index) {
   return out->correlation.input_epoch != 0;
 }
 
+// A comma-separated list of 0..max tokens. Empty string is the empty list.
+[[nodiscard]] bool ReadHeldList(const Scalar* scalar,
+                                std::size_t max_tokens,
+                                bool (*accept)(std::string_view),
+                                std::vector<std::string>* out) {
+  if (scalar == nullptr || scalar->type != Scalar::Type::kString)
+    return false;
+  const std::string& text = scalar->text;
+  if (text.size() > kMaxHeldInputListBytes)
+    return false;
+  out->clear();
+  if (text.empty())
+    return true;
+  std::size_t start = 0;
+  while (start <= text.size()) {
+    const std::size_t comma = text.find(',', start);
+    const std::size_t end = comma == std::string::npos ? text.size() : comma;
+    const std::string_view token(text.data() + start, end - start);
+    if (token.empty() || token.size() > kMaxKeyCodeBytes || !accept(token))
+      return false;
+    for (const std::string& existing : *out) {
+      if (existing == token)
+        return false;
+    }
+    if (out->size() >= max_tokens)
+      return false;
+    out->emplace_back(token);
+    if (comma == std::string::npos)
+      break;
+    start = comma + 1;
+  }
+  return true;
+}
+
+[[nodiscard]] bool IsHeldKeyToken(std::string_view token) {
+  for (const char c : token) {
+    const bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                    (c >= '0' && c <= '9') || c == '_' || c == '.' || c == '-';
+    if (!ok)
+      return false;
+  }
+  return true;
+}
+
+[[nodiscard]] bool IsHeldButtonToken(std::string_view token) {
+  return token == "left" || token == "middle" || token == "right" ||
+         token == "back" || token == "forward";
+}
+
+[[nodiscard]] bool ParseHeldInput(const Members& members,
+                                  DataChannelMessage* out) {
+  if (!HasExactKeys(members,
+                    {"type", "protocolVersion", "sessionId", "sequence",
+                     "layoutRevision", "inputEpoch", "keys", "buttons"},
+                    {})) {
+    return false;
+  }
+  if (!ReadCorrelation(members, &out->correlation))
+    return false;
+  if (out->correlation.input_epoch == 0)
+    return false;
+  return ReadHeldList(Find(members, "keys"), kMaxHeldInputKeys, &IsHeldKeyToken,
+                      &out->held_input.keys) &&
+         ReadHeldList(Find(members, "buttons"), 5, &IsHeldButtonToken,
+                      &out->held_input.buttons);
+}
+
 }  // namespace
 
 bool ParseDataChannelMessage(std::string_view payload,
@@ -793,6 +860,10 @@ bool ParseDataChannelMessage(std::string_view payload,
   } else if (type->text == kReleaseAllType) {
     parsed.kind = DataChannelMessageKind::kReleaseAll;
     if (!ParseReleaseAll(members, &parsed))
+      return false;
+  } else if (type->text == kHeldInputType) {
+    parsed.kind = DataChannelMessageKind::kHeldInput;
+    if (!ParseHeldInput(members, &parsed))
       return false;
   } else {
     // Worker-to-browser types and anything unknown are refused on this path.

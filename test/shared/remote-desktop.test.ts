@@ -915,6 +915,40 @@ describe('remote desktop production contract', () => {
     })).toMatchObject({ ok: true });
   });
 
+  it('validates the held-input declaration exactly: bounded, deduplicated, known buttons, no extras', () => {
+    const held = (patch: Record<string, unknown>) => validateRemoteDesktopDataMessage({
+      type: REMOTE_DESKTOP_DATA_MSG.HELD_INPUT,
+      ...inputBase,
+      keys: '',
+      buttons: '',
+      ...patch,
+    });
+    const rejected = { ok: false, error: REMOTE_DESKTOP_ERROR.INVALID_REQUEST };
+    expect(held({})).toMatchObject({ ok: true });
+    expect(held({ keys: 'MetaLeft,ShiftLeft', buttons: 'left,right' })).toMatchObject({ ok: true });
+    expect(held({ keys: 'A,A' })).toEqual(rejected);
+    expect(held({ keys: 'A,,B' })).toEqual(rejected);
+    expect(held({ keys: ',A' })).toEqual(rejected);
+    expect(held({ keys: 'A,' })).toEqual(rejected);
+    expect(held({ keys: 'Key A' })).toEqual(rejected);
+    expect(held({ keys: 7 })).toEqual(rejected);
+    expect(held({ buttons: 'primary' })).toEqual(rejected);
+    expect(held({ buttons: 'left,left' })).toEqual(rejected);
+    expect(held({ extra: true })).toEqual(rejected);
+    const keys = (count: number) => Array.from({ length: count }, (_, index) => `K${index}`).join(',');
+    expect(held({ keys: keys(REMOTE_DESKTOP_LIMITS.HELD_INPUT_KEYS) })).toMatchObject({ ok: true });
+    expect(held({ keys: keys(REMOTE_DESKTOP_LIMITS.HELD_INPUT_KEYS + 1) })).toEqual(rejected);
+    expect(held({ keys: 'a'.repeat(REMOTE_DESKTOP_LIMITS.HELD_INPUT_LIST_BYTES + 1) })).toEqual(rejected);
+    expect(held({ keys: 'a'.repeat(REMOTE_DESKTOP_LIMITS.KEY_CODE_BYTES + 1) })).toEqual(rejected);
+    expect(held({ inputEpoch: 0 })).toEqual(rejected);
+    // Neighbouring messages are unaffected by the new type.
+    expect(validateRemoteDesktopDataMessage({
+      type: REMOTE_DESKTOP_DATA_MSG.RELEASE_ALL,
+      ...inputBase,
+      keys: '',
+    })).toEqual(rejected);
+  });
+
   it('recognizes only daemon-to-server message types', () => {
     expect(isRemoteDesktopDaemonMessageType(REMOTE_DESKTOP_MSG.ANSWER)).toBe(true);
     expect(isRemoteDesktopDaemonMessageType(REMOTE_DESKTOP_MSG.MODE_STATE)).toBe(true);

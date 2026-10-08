@@ -199,3 +199,37 @@ scripts/macos-remote-desktop-build-spike.sh \
 `--apple-framework-only` is a bounded local diagnostic that compile/links the
 same source against ScreenCaptureKit and VideoToolbox without WebRTC. It is not
 evidence that the pinned WebRTC link succeeded.
+
+## Held input: what keeps a modifier from sticking
+
+The viewer owns the truth about which keys and buttons are down. Besides the
+per-transition messages it sends `remote_desktop.data.held_input` on the control
+channel: the comma-separated key codes and button names it holds *right now*
+(either list may be empty), correlated like any input message (session, layout
+revision, input epoch, a fresh sequence). It is unacknowledged, so an unanswered
+declaration never fails a session, and a worker that does not know the type drops
+it.
+
+The worker (`InputLedger::ReconcileHeld`) releases every key and button it holds
+that the viewer does not declare **and that was pressed before the declaration**
+(compared by input sequence, never by a clock), so a key the viewer pressed after
+declaring, but delivered first, is kept. That heals a key-up lost on the way, and a
+key the viewer forgot, at the next declaration instead of at the next session.
+
+When the declarations are sent:
+
+- 300 ms (`SETTLE_MS`) after a key or button changes (throttled, not debounced);
+- immediately, empty, from every `releaseAll` (blur, pagehide, hidden tab, view
+  mode, display change, input disabled, stop) -- including when the viewer tracks
+  nothing, which is when the old conditional `release_all` sent nothing;
+- every 2 s (`REFRESH_MS`) for as long as anything is held, so a modifier held
+  through a long drag is never released: the rule is "held means declared", not "held
+  for too long";
+- once when input becomes enabled on a connection, as a baseline.
+
+The safety for a viewer that cannot declare any more (frozen page, dead network
+that the peer has not noticed yet): once a viewer has declared at least once, a
+worker that hears nothing for 10 s (`kHeldInputSilenceMs`) while it holds input
+releases that viewer's input. A viewer that never declares (an older web) leaves the
+watchdog unarmed and behaves exactly as before. Linux applies the reconcile; the
+Windows worker ignores the message like any unknown type.

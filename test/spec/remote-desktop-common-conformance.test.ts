@@ -106,6 +106,11 @@ describe.skipIf(process.platform === 'win32')('remote-desktop common conformance
       'input backend failure performs terminal release-all',
       'terminal failure performs one release-all',
       'terminal cleanup is idempotent',
+      'an undeclared held key is released, declared ones are kept',
+      'a key pressed after the declaration is the viewer\'s newer truth',
+      'an empty declaration releases all that was held before it',
+      'undeclared shared key is released once, for every owner',
+      'a refused release is reported and the claim is dropped',
     ]) {
       expect(fake).toContain(assertion);
     }

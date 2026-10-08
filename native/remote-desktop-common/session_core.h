@@ -4,6 +4,8 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <unordered_set>
+#include <vector>
 
 #include "input_ledger.h"
 #include "platform_interfaces.h"
@@ -80,6 +82,14 @@ class SessionCore {
   InputResult HandleLedgerResult(InputResult result,
                                  std::string_view operation);
   void ReleaseAllControllers() noexcept;
+  // The viewer's declaration of what it holds: releases whatever this session
+  // holds that the viewer does not (see InputLedger::ReconcileHeld).
+  InputResult ReconcileHeldInput(const std::vector<std::string>& keys,
+                                 const std::vector<std::string>& buttons,
+                                 InputSequence declaration_sequence);
+  [[nodiscard]] bool HoldsInput() const noexcept {
+    return input_ledger_.HoldsInput();
+  }
   void StopPlatformResources() noexcept;
 
   PlatformAdapters adapters_;

@@ -863,6 +863,22 @@ class MacosRemoteDesktopSession::Impl final
     FinalizeIfCoreTerminatedLocked(MacosSessionEndReason::kAdapterFailure);
   }
 
+  common::InputResult ReconcileHeldInput(
+      const std::vector<std::string>& keys,
+      const std::vector<std::string>& buttons,
+      common::InputSequence declaration_sequence) {
+    std::lock_guard lock(mutex_);
+    const common::InputResult result =
+        core_.ReconcileHeldInput(keys, buttons, declaration_sequence);
+    FinalizeIfCoreTerminatedLocked(MacosSessionEndReason::kAdapterFailure);
+    return result;
+  }
+
+  bool HoldsInput() noexcept {
+    std::lock_guard lock(mutex_);
+    return core_.HoldsInput();
+  }
+
   bool ReleaseAllControllers() noexcept {
     std::lock_guard lock(mutex_);
     // SetControlActive(false) is the public seam that calls
@@ -1948,6 +1964,16 @@ common::InputResult MacosRemoteDesktopSession::ApplyText(
 void MacosRemoteDesktopSession::ReleaseController(
     std::string_view controller_id) noexcept {
   impl_->ReleaseController(controller_id);
+}
+
+common::InputResult MacosRemoteDesktopSession::ReconcileHeldInput(
+    const std::vector<std::string>& keys, const std::vector<std::string>& buttons,
+    common::InputSequence declaration_sequence) {
+  return impl_->ReconcileHeldInput(keys, buttons, declaration_sequence);
+}
+
+bool MacosRemoteDesktopSession::HoldsInput() const noexcept {
+  return impl_->HoldsInput();
 }
 
 bool MacosRemoteDesktopSession::ReleaseAllControllers() noexcept {

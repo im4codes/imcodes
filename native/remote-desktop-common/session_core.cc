@@ -180,6 +180,19 @@ void SessionCore::ReleaseAllControllers() noexcept {
   input_ledger_.ReleaseAll();
 }
 
+InputResult SessionCore::ReconcileHeldInput(
+    const std::vector<std::string>& keys,
+    const std::vector<std::string>& buttons,
+    InputSequence declaration_sequence) {
+  const std::unordered_set<std::string> declared_keys(keys.begin(), keys.end());
+  const std::unordered_set<std::string> declared_buttons(buttons.begin(),
+                                                         buttons.end());
+  return HandleLedgerResult(
+      input_ledger_.ReconcileHeld(declared_keys, declared_buttons,
+                                  declaration_sequence),
+      "held input reconcile");
+}
+
 void SessionCore::StopPlatformResources() noexcept {
   if (resources_stopped_)
     return;

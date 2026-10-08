@@ -20,7 +20,9 @@ import {
   REMOTE_DESKTOP_ENCODER_CLASS,
   REMOTE_DESKTOP_ENCODER_CODEC,
   REMOTE_DESKTOP_ENCODER_RAW_CODECS,
+  REMOTE_DESKTOP_HELD_INPUT,
   REMOTE_DESKTOP_LIMITS,
+  REMOTE_DESKTOP_POINTER_BUTTON,
   REMOTE_DESKTOP_MSG,
 } from '../../shared/remote-desktop.js';
 import { REMOTE_DESKTOP_WORKER_IPC_VERSION } from '../../shared/remote-desktop-worker.js';
@@ -169,6 +171,7 @@ describe('macOS remote-desktop cross-layer token agreement', () => {
       kKeyboardType: REMOTE_DESKTOP_DATA_MSG.KEYBOARD,
       kControlType: REMOTE_DESKTOP_DATA_MSG.CONTROL,
       kReleaseAllType: REMOTE_DESKTOP_DATA_MSG.RELEASE_ALL,
+      kHeldInputType: REMOTE_DESKTOP_DATA_MSG.HELD_INPUT,
       kControlRejectedType: REMOTE_DESKTOP_DATA_MSG.CONTROL_REJECTED,
       kInputAckKind: REMOTE_DESKTOP_CONTROL_KIND.INPUT_ACK,
       kCopySelectionKind: REMOTE_DESKTOP_CONTROL_KIND.COPY_SELECTION,
@@ -179,6 +182,40 @@ describe('macOS remote-desktop cross-layer token agreement', () => {
     for (const [nativeName, value] of Object.entries(expected)) {
       expect(dataTokens.get(nativeName), nativeName).toBe(value);
     }
+  });
+
+  it('pins the held-input limits, silence window and button names to the shared vocabulary', () => {
+    const number = (name: string): number => {
+      const match = new RegExp(`constexpr (?:std::size_t|long long) ${name} =\\s*([0-9_'* ]+);`).exec(dataHeader);
+      expect(match, name).not.toBeNull();
+      return Function(`return (${match![1].replace(/'/g, '')});`)() as number;
+    };
+    expect(number('kMaxHeldInputKeys')).toBe(REMOTE_DESKTOP_LIMITS.HELD_INPUT_KEYS);
+    expect(number('kMaxHeldInputListBytes')).toBe(REMOTE_DESKTOP_LIMITS.HELD_INPUT_LIST_BYTES);
+    expect(number('kHeldInputSilenceMs')).toBe(REMOTE_DESKTOP_HELD_INPUT.SILENCE_MS);
+    // The worker must outlast several refreshes before it calls the viewer silent.
+    expect(REMOTE_DESKTOP_HELD_INPUT.SILENCE_MS).toBeGreaterThanOrEqual(REMOTE_DESKTOP_HELD_INPUT.REFRESH_MS * 3);
+    const payload = read('native/remote-desktop-common/data_channel_payload.cc');
+    const tokenFn = /bool IsHeldButtonToken\(std::string_view token\) \{([\s\S]*?)\n\}/.exec(payload);
+    expect(tokenFn).not.toBeNull();
+    const nativeButtons = [...tokenFn![1].matchAll(/"([a-z]+)"/g)].map((match) => match[1]).sort();
+    expect(nativeButtons).toEqual(Object.values(REMOTE_DESKTOP_POINTER_BUTTON).sort());
+    expect(payload).toContain('ReadHeldList(Find(members, "buttons"), 5,');
+    expect(Object.values(REMOTE_DESKTOP_POINTER_BUTTON)).toHaveLength(5);
+  });
+
+  it('keeps the held-input safety inert for a viewer that never declares and silent drop for an unknown message', () => {
+    // Skew: an older web never declares, so the worker's silence watchdog must stay
+    // disarmed until the first declaration; and a held_input an older worker does
+    // not know is dropped by the parser rather than failing the session.
+    expect(workerMain).toMatch(/held_input_armed_ = false;/);
+    expect(workerMain).toMatch(/if \(!held_input_armed_ \|\| session_ == nullptr\)\s*\n?\s*return;/);
+    const armSites = [...workerMain.matchAll(/held_input_armed_ = true;/g)];
+    expect(armSites).toHaveLength(1);
+    expect(workerMain).toMatch(/kind == imcodes::rd::DataChannelMessageKind::kHeldInput &&\s*\n?\s*channel == rd::common::DataChannelKind::kControl/);
+    // Never acknowledged: an unacknowledged declaration must not fail a session.
+    const handler = /kHeldInput &&[\s\S]*?accepted = true;/.exec(workerMain)![0];
+    expect(handler).not.toContain('acknowledge = true');
   });
 
   it('accepts a native-shaped readiness payload through the real TS parser', () => {

@@ -46,6 +46,17 @@ inline constexpr char kPointerType[] = "remote_desktop.data.pointer";
 inline constexpr char kKeyboardType[] = "remote_desktop.data.keyboard";
 inline constexpr char kControlType[] = "remote_desktop.data.control";
 inline constexpr char kReleaseAllType[] = "remote_desktop.data.release_all";
+// Viewer to worker: the keys and buttons the viewer believes it holds RIGHT NOW,
+// as comma-separated lists. The worker releases what it holds and the viewer does
+// not declare (a lost key-up). Pinned to REMOTE_DESKTOP_DATA_MSG.HELD_INPUT and
+// REMOTE_DESKTOP_LIMITS.HELD_INPUT_* / REMOTE_DESKTOP_HELD_INPUT.SILENCE_MS in
+// shared/remote-desktop.ts by the cross-layer test.
+inline constexpr char kHeldInputType[] = "remote_desktop.data.held_input";
+inline constexpr std::size_t kMaxHeldInputKeys = 16;
+inline constexpr std::size_t kMaxHeldInputListBytes = 16 * 65;
+// A viewer that has declared at least once and then goes this long without a
+// declaration while the worker still holds input has its input released.
+inline constexpr long long kHeldInputSilenceMs = 10'000;
 // Worker to browser: a control command was understood but refused. Success is
 // already visible in the topology and status frames; without this, a refusal is
 // indistinguishable from a lost click.

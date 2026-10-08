@@ -24,6 +24,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "data_channel_constants.h"
 #include "quality_ladder.h"
@@ -50,6 +51,7 @@ enum class DataChannelMessageKind {
   kKeyboard,
   kControl,
   kReleaseAll,
+  kHeldInput,
 };
 
 enum class PointerKind {
@@ -132,12 +134,21 @@ struct ControlPayload {
   std::optional<std::uint64_t> chunk_count;
 };
 
+// held_input: what the viewer says it holds down. Both lists are validated
+// (bounded count, bounded tokens, no duplicates, known button names) and may be
+// empty -- "I hold nothing" is the most useful declaration there is.
+struct HeldInputPayload {
+  std::vector<std::string> keys;
+  std::vector<std::string> buttons;
+};
+
 struct DataChannelMessage {
   DataChannelMessageKind kind = DataChannelMessageKind::kReleaseAll;
   InputCorrelation correlation;
   PointerPayload pointer;
   KeyboardPayload keyboard;
   ControlPayload control;
+  HeldInputPayload held_input;
 };
 
 /**

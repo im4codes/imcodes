@@ -7,6 +7,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "../remote-desktop-common/session_core.h"
 #include "../remote-desktop-common/transport_session_core.h"
@@ -263,6 +264,13 @@ class MacosRemoteDesktopSession final {
   common::InputResult ApplyWheel(const common::WheelInput& input);
   common::InputResult ApplyText(const common::TextInput& input);
   void ReleaseController(std::string_view controller_id) noexcept;
+  // The viewer's declaration of what it holds: releases whatever this session holds
+  // that the viewer does not. Returns the ledger's verdict.
+  common::InputResult ReconcileHeldInput(const std::vector<std::string>& keys,
+                                         const std::vector<std::string>& buttons,
+                                         common::InputSequence declaration_sequence);
+  // True while a key or button is held down on this session's behalf.
+  [[nodiscard]] bool HoldsInput() const noexcept;
 
   // Releases every held key/button for every controller and drops back to
   // viewing. Returns false when the session cannot act (terminal, or view not

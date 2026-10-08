@@ -319,6 +319,69 @@ void ClipboardPasteAssemblerExpiresAndRejectsGaps() {
 
 }  // namespace
 
+void HeldInputDeclaresWhatTheViewerHolds() {
+  const std::string type = R"({"type":"remote_desktop.data.held_input",)";
+  rd::DataChannelMessage message;
+  Check(Accepts(type + Correlation() +
+                    R"(,"keys":"MetaLeft,ShiftLeft","buttons":"left"})",
+                &message),
+        "a held_input declaration is accepted");
+  Check(message.kind == rd::DataChannelMessageKind::kHeldInput &&
+            message.held_input.keys.size() == 2 &&
+            message.held_input.keys[0] == "MetaLeft" &&
+            message.held_input.keys[1] == "ShiftLeft" &&
+            message.held_input.buttons.size() == 1 &&
+            message.held_input.buttons[0] == "left" &&
+            message.correlation.sequence == 7,
+        "held_input carries its lists and correlation exactly");
+  Check(Accepts(type + Correlation() + R"(,"keys":"","buttons":""})", &message) &&
+            message.held_input.keys.empty() && message.held_input.buttons.empty(),
+        "an empty declaration (I hold nothing) is accepted and empty");
+  Check(Rejects(type + Correlation() + R"(,"keys":"MetaLeft"})"),
+        "held_input without buttons is refused");
+  Check(Rejects(type + Correlation() +
+                R"(,"keys":"MetaLeft","buttons":"","extra":1})"),
+        "an unknown member on held_input is refused");
+  Check(Rejects(type + Correlation() + R"(,"keys":"A,A","buttons":""})"),
+        "a duplicate key is refused");
+  Check(Rejects(type + Correlation() + R"(,"keys":"A,,B","buttons":""})"),
+        "an empty key token is refused");
+  Check(Rejects(type + Correlation() + R"(,"keys":",A","buttons":""})"),
+        "a leading separator is refused");
+  Check(Rejects(type + Correlation() + R"(,"keys":"A,","buttons":""})"),
+        "a trailing separator is refused");
+  Check(Rejects(type + Correlation() + R"(,"keys":"Key A","buttons":""})"),
+        "a key token with a space is refused");
+  Check(Rejects(type + Correlation() + R"(,"keys":"","buttons":"banana"})"),
+        "an unknown button name is refused");
+  Check(Rejects(type + Correlation() + R"(,"keys":"","buttons":"left,left"})"),
+        "a duplicate button is refused");
+  Check(Rejects(type + Correlation() + R"(,"keys":1,"buttons":""})"),
+        "a non-string key list is refused");
+  std::string many;
+  for (int index = 0; index < 17; ++index) {
+    if (index != 0)
+      many += ',';
+    many += "K" + std::to_string(index);
+  }
+  Check(Rejects(type + Correlation() + R"(,"keys":")" + many +
+                R"(","buttons":""})"),
+        "more than the bounded number of keys is refused");
+  Check(Accepts(type + Correlation() + R"(,"keys":")" +
+                    many.substr(0, many.rfind(',')) + R"(","buttons":""})",
+                &message) &&
+            message.held_input.keys.size() == 16,
+        "exactly the bounded number of keys is accepted");
+  Check(Rejects(type + Correlation() + R"(,"keys":")" +
+                std::string(rd::kMaxHeldInputListBytes + 1, 'a') +
+                R"(","buttons":""})"),
+        "an over-long list is refused");
+  Check(Rejects(type +
+                R"("protocolVersion":2,"sessionId":"session_1","sequence":7,)"
+                R"("layoutRevision":3,"inputEpoch":0,"keys":"","buttons":""})"),
+        "a zero input epoch is refused on held_input");
+}
+
 int main() {
   PointerMoveRequiresBothCoordinatesAndNothingElse();
   PointerButtonAndWheelAreConstrainedByKind();
@@ -328,6 +391,7 @@ int main() {
   ControlCarriesTypedOptionalOperations();
   PasteTextChunksAreBoundedAndCorrelated();
   ClipboardPasteAssemblerExpiresAndRejectsGaps();
+  HeldInputDeclaresWhatTheViewerHolds();
 
   if (g_failures != 0) {
     std::fprintf(stderr, "%d data-channel payload failure(s)\n", g_failures);

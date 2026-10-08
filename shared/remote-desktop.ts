@@ -80,6 +80,29 @@ export const REMOTE_DESKTOP_DATA_MSG = {
   // (handleData ignores what does not validate), and a newer web simply never
   // receives it from an older node.
   ENCODER: 'remote_desktop.data.encoder',
+  // Viewer → worker: the keys and buttons the viewer believes it is holding down
+  // RIGHT NOW. The worker releases anything it holds that the viewer does not
+  // declare (a key-up it never received, or dropped, which the viewer has long
+  // since forgotten), so a lost key-up can no longer leave a modifier latched on
+  // the remote machine. A message TYPE of its own, ignored by workers that do not
+  // know it (the macOS, Linux and Windows dispatchers all drop an unknown type).
+  HELD_INPUT: 'remote_desktop.data.held_input',
+} as const;
+
+/** Timing of the held-input declaration; the worker side is pinned to these by the
+ *  cross-layer test (kHeldInput* in native/remote-desktop-common/data_channel_constants.h). */
+export const REMOTE_DESKTOP_HELD_INPUT = {
+  /** After a key or button changes, wait this long (collapsing a burst of
+   *  keystrokes into one message) before declaring what is held. */
+  SETTLE_MS: 300,
+  /** While anything is held, declare it again this often, so a legitimately held
+   *  modifier (a Shift held through a long drag) stays held for as long as the
+   *  viewer says so. */
+  REFRESH_MS: 2_000,
+  /** A worker that has received declarations from a viewer and then hears none for
+   *  this long while it holds keys releases them: the viewer's page is frozen or
+   *  gone. Five times the refresh interval, so a few late messages never trip it. */
+  SILENCE_MS: 10_000,
 } as const;
 
 export const REMOTE_DESKTOP_CHANNEL = {
@@ -448,6 +471,9 @@ export const REMOTE_DESKTOP_LIMITS = {
   DISPLAYS: 16,
   KEY_CODE_BYTES: 64,
   KEY_VALUE_BYTES: 64,
+  /** Most keys a held-input declaration can name, and its comma-separated list's bytes. */
+  HELD_INPUT_KEYS: 16,
+  HELD_INPUT_LIST_BYTES: 16 * 65,
   TEXT_BYTES: 4 * 1024,
   TEXT_CODE_UNITS: 2 * 1024,
   PASTE_TEXT_BYTES: 64 * 1024,
@@ -950,11 +976,19 @@ export interface RemoteDesktopReleaseAll extends RemoteDesktopInputBase {
   type: typeof REMOTE_DESKTOP_DATA_MSG.RELEASE_ALL;
 }
 
+export interface RemoteDesktopHeldInput extends RemoteDesktopInputBase {
+  type: typeof REMOTE_DESKTOP_DATA_MSG.HELD_INPUT;
+  /** Comma-separated KeyboardEvent.code values held down; "" when none. */
+  keys: string;
+  /** Comma-separated pointer button names held down; "" when none. */
+  buttons: string;
+}
+
 export type RemoteDesktopBrowserMessage = RemoteDesktopStart | RemoteDesktopResume | RemoteDesktopOffer | RemoteDesktopIce | RemoteDesktopModeSet | RemoteDesktopCancel | RemoteDesktopStop;
 export type RemoteDesktopDaemonCommand = RemoteDesktopPrepare | RemoteDesktopOffer | RemoteDesktopIce | RemoteDesktopLease | RemoteDesktopModeState | RemoteDesktopCancel | RemoteDesktopDaemonStop;
 export type RemoteDesktopDaemonMessage = RemoteDesktopAnswer | RemoteDesktopIce | RemoteDesktopModeState | RemoteDesktopStatus | RemoteDesktopRenegotiate | RemoteDesktopTerminal;
 export type RemoteDesktopServerMessage = RemoteDesktopBootstrapRedeemed | RemoteDesktopAuthorized | RemoteDesktopResumed | RemoteDesktopAnswer | RemoteDesktopIce | RemoteDesktopModeState | RemoteDesktopStatus | RemoteDesktopRenegotiate | RemoteDesktopTerminal | RemoteDesktopError;
-export type RemoteDesktopDataMessage = RemoteDesktopDisplayTopology | RemoteDesktopQuality | RemoteDesktopEncoderInfo | RemoteDesktopClipboard | RemoteDesktopPointer | RemoteDesktopKeyboard | RemoteDesktopControl | RemoteDesktopReleaseAll | RemoteDesktopControlRejected;
+export type RemoteDesktopDataMessage = RemoteDesktopDisplayTopology | RemoteDesktopQuality | RemoteDesktopEncoderInfo | RemoteDesktopClipboard | RemoteDesktopPointer | RemoteDesktopKeyboard | RemoteDesktopControl | RemoteDesktopReleaseAll | RemoteDesktopHeldInput | RemoteDesktopControlRejected;
 
 export type RemoteDesktopValidationResult<T> = { ok: true; value: T } | { ok: false; error: typeof REMOTE_DESKTOP_ERROR.INVALID_REQUEST };
 
@@ -1438,6 +1472,28 @@ function validateEncoderInfo(value: Record<string, unknown>): boolean {
     && typeof value.rawCodecs === 'string' && ENCODER_RAW_CODECS.has(value.rawCodecs);
 }
 
+const HELD_CODE_RE = /^[A-Za-z0-9_.-]+$/;
+
+/** A comma-separated list of 0..max tokens, each matching `accept`, no duplicates. */
+function isHeldList(value: unknown, max: number, accept: (token: string) => boolean): value is string {
+  if (typeof value !== 'string' || value.length > REMOTE_DESKTOP_LIMITS.HELD_INPUT_LIST_BYTES) return false;
+  if (value === '') return true;
+  const tokens = value.split(',');
+  return tokens.length <= max
+    && new Set(tokens).size === tokens.length
+    && tokens.every((token) => token.length > 0
+      && remoteDesktopUtf8Bytes(token) <= REMOTE_DESKTOP_LIMITS.KEY_CODE_BYTES
+      && accept(token));
+}
+
+function validateHeldInput(value: Record<string, unknown>): boolean {
+  return hasExactKeys(value, ['type', 'protocolVersion', 'sessionId', 'sequence', 'layoutRevision', 'inputEpoch', 'keys', 'buttons'])
+    && hasInputCorrelation(value)
+    && isSafePositive(value.inputEpoch)
+    && isHeldList(value.keys, REMOTE_DESKTOP_LIMITS.HELD_INPUT_KEYS, (token) => HELD_CODE_RE.test(token))
+    && isHeldList(value.buttons, POINTER_BUTTONS.size, (token) => POINTER_BUTTONS.has(token));
+}
+
 /** Wire-shape check for a viewer quality preference (also used by the web). */
 export function isRemoteDesktopQualityPreference(value: unknown): value is RemoteDesktopQualityPreference {
   if (!isRecord(value)) return false;
@@ -1670,6 +1726,9 @@ export function validateRemoteDesktopDataMessage(value: unknown): RemoteDesktopV
   }
   if (value.type === REMOTE_DESKTOP_DATA_MSG.CONTROL_REJECTED && validateControlRejected(value)) {
     return { ok: true, value: value as unknown as RemoteDesktopControlRejected };
+  }
+  if (value.type === REMOTE_DESKTOP_DATA_MSG.HELD_INPUT && validateHeldInput(value)) {
+    return { ok: true, value: value as unknown as RemoteDesktopHeldInput };
   }
   if (value.type === REMOTE_DESKTOP_DATA_MSG.RELEASE_ALL
     && hasExactKeys(value, ['type', 'protocolVersion', 'sessionId', 'sequence', 'layoutRevision', 'inputEpoch'])

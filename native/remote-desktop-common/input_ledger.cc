@@ -133,7 +133,7 @@ InputResult InputLedger::ApplyOwnedTransition(
     std::string_view value,
     bool pressed,
     std::unordered_map<std::string, std::unordered_set<std::string>>* owners,
-    std::unordered_set<std::string> ControllerState::* owned_values,
+    std::unordered_map<std::string, InputSequence> ControllerState::* owned_values,
     bool (InputAdapter::*emit)(std::string_view, bool),
     bool heal_latched_before_press) {
   if (!IsBoundedToken(value))
@@ -148,7 +148,7 @@ InputResult InputLedger::ApplyOwnedTransition(
   auto& controller_values = controller->*owned_values;
   bool should_emit = false;
   if (pressed) {
-    if (controller_values.insert(owned).second) {
+    if (controller_values.try_emplace(owned, stamp.sequence).second) {
       auto& value_owners = (*owners)[owned];
       should_emit = value_owners.empty();
       value_owners.insert(stamp.controller_id);
@@ -257,7 +257,8 @@ InputResult InputLedger::ApplyText(const InputStamp& stamp,
 bool InputLedger::ReleaseControllerState(const std::string& controller_id,
                                          ControllerState* controller) noexcept {
   bool released = true;
-  for (const std::string& key : controller->keys) {
+  for (const auto& held : controller->keys) {
+    const std::string& key = held.first;
     auto owners = key_owners_.find(key);
     if (owners == key_owners_.end())
       continue;
@@ -267,7 +268,8 @@ bool InputLedger::ReleaseControllerState(const std::string& controller_id,
       key_owners_.erase(owners);
     }
   }
-  for (const std::string& button : controller->buttons) {
+  for (const auto& held : controller->buttons) {
+    const std::string& button = held.first;
     auto owners = button_owners_.find(button);
     if (owners == button_owners_.end())
       continue;
@@ -280,6 +282,57 @@ bool InputLedger::ReleaseControllerState(const std::string& controller_id,
   controller->keys.clear();
   controller->buttons.clear();
   return released;
+}
+
+bool InputLedger::ReleaseUndeclared(
+    const std::string& controller_id,
+    std::unordered_map<std::string, InputSequence>* held,
+    std::unordered_map<std::string, std::unordered_set<std::string>>* owners,
+    const std::unordered_set<std::string>& declared,
+    InputSequence before,
+    bool (InputAdapter::*emit)(std::string_view, bool),
+    std::size_t* released) noexcept {
+  bool ok = true;
+  for (auto it = held->begin(); it != held->end();) {
+    if (declared.count(it->first) != 0 || it->second >= before) {
+      ++it;
+      continue;
+    }
+    const std::string value = it->first;
+    it = held->erase(it);
+    auto owner = owners->find(value);
+    if (owner != owners->end()) {
+      owner->second.erase(controller_id);
+      if (owner->second.empty()) {
+        owners->erase(owner);
+        ok = (backend_.*emit)(value, false) && ok;
+      }
+    }
+    if (released != nullptr)
+      ++*released;
+  }
+  return ok;
+}
+
+InputResult InputLedger::ReconcileHeld(
+    const std::unordered_set<std::string>& declared_keys,
+    const std::unordered_set<std::string>& declared_buttons,
+    InputSequence declaration_sequence,
+    std::size_t* released) noexcept {
+  if (released != nullptr)
+    *released = 0;
+  bool ok = true;
+  for (auto& [controller_id, state] : controllers_) {
+    ok = ReleaseUndeclared(controller_id, &state.keys, &key_owners_,
+                           declared_keys, declaration_sequence,
+                           &InputAdapter::EmitKey, released) &&
+         ok;
+    ok = ReleaseUndeclared(controller_id, &state.buttons, &button_owners_,
+                           declared_buttons, declaration_sequence,
+                           &InputAdapter::EmitButton, released) &&
+         ok;
+  }
+  return ok ? InputResult::kApplied : InputResult::kAdapterFailure;
 }
 
 InputResult InputLedger::ReleaseController(
