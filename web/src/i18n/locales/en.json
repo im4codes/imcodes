@@ -332,6 +332,7 @@
       "supervision_heartbeat": "Supervision heartbeat",
       "audit_heartbeat": "Audit heartbeat",
       "implementation_heartbeat": "Implementation heartbeat",
+      "pair_heartbeat": "Pair heartbeat",
       "continue": "Supervision continuation",
       "post_audit_finalization": "Post-audit finalization",
       "audit_delegation": "Audit delegation",

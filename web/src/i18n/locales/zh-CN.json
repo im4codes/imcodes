@@ -332,6 +332,7 @@
       "supervision_heartbeat": "监督心跳",
       "audit_heartbeat": "审计心跳",
       "implementation_heartbeat": "实现心跳",
+      "pair_heartbeat": "配对心跳",
       "continue": "监督继续",
       "post_audit_finalization": "审计后收尾",
       "audit_delegation": "审计派发",

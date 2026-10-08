@@ -332,6 +332,7 @@
       "supervision_heartbeat": "감독 하트비트",
       "audit_heartbeat": "감사 하트비트",
       "implementation_heartbeat": "구현 하트비트",
+      "pair_heartbeat": "페어 하트비트",
       "continue": "감독 계속",
       "post_audit_finalization": "감사 후 마무리",
       "audit_delegation": "감사 위임",

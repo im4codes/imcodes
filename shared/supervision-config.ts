@@ -1,6 +1,6 @@
 import { advanceMarkdownFence, type MarkdownFenceState } from './markdown-fence.js';
 import { normalizeAuditBlockingSeverities, type AuditSeverity } from './audit-convergence.js';
-import type { TaskPairEngine } from './task-pair.js';
+import { TASK_PAIR_HEARTBEAT_AUTOMATION_KIND, type TaskPairEngine } from './task-pair.js';
 import type { SharedContextRuntimeBackend } from './context-types.js';
 import { CLAUDE_CODE_MODEL_IDS, CODEX_MODEL_IDS, DEFAULT_CODEX_AUTOMATION_MODEL } from '../src/shared/models/options.js';
 import { PROVIDER_ERROR_CODES } from './provider-error-codes.js';
@@ -92,6 +92,7 @@ export const SUPERVISION_USER_PROMPT_LABEL_KEYS = {
   [SUPERVISION_AUDIT_MARKER_CORRECTION_AUTOMATION_KIND]: 'chat.supervision_prompt.audit_marker_correction',
   [PEER_AUDIT_REWORK_AUTOMATION_KIND]: 'chat.supervision_prompt.peer_audit_rework',
   [SUPERVISION_AUTO_AUDIT_MODE_CONTROL_AUTOMATION_KIND]: 'chat.supervision_prompt.auto_audit_mode_control',
+  [TASK_PAIR_HEARTBEAT_AUTOMATION_KIND]: 'chat.supervision_prompt.pair_heartbeat',
 } as const;
 export type SupervisionUserPromptAutomationKind = keyof typeof SUPERVISION_USER_PROMPT_LABEL_KEYS;
 

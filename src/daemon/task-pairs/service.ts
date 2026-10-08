@@ -49,6 +49,7 @@ import {
   resolveTaskPairBrainWait,
   isTerminalTaskPairStatus,
   redirectTaskPairWorkspacePath,
+  TASK_PAIR_NEEDS_DECISION_VERB,
   mayContainTaskPairMarker,
   scanTaskPairMarkers,
   stripTaskPairMarkersForDisplay,
@@ -669,6 +670,8 @@ export class TaskPairService {
     const { markers } = scanTaskPairMarkers(text);
     const results: TaskPairTransition[] = [];
     for (const marker of markers) {
+      // Brain's NEEDS_DECISION pauses the Brain heartbeat in the scheduler; it is not a pair transition.
+      if (marker.verb.toUpperCase() === TASK_PAIR_NEEDS_DECISION_VERB) continue;
       results.push(this.applyMarker({
         project, writer, marker, source: 'marker', eventId: `${turnId}:${marker.markerIndex}`, now, turnText: text,
         ...(requireStructuredPairCreate ? { requireStructuredPairCreate: true } : {}),

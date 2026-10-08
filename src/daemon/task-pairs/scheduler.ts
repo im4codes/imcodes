@@ -26,6 +26,9 @@ import { getSession, listSessions, type SessionRecord } from '../../store/sessio
 import { restartSession } from '../../agent/session-manager.js';
 import {
   TASK_PAIR_BOTH_IDLE_NUDGE_MS,
+  TASK_PAIR_BRAIN_HEARTBEAT_REASON,
+  TASK_PAIR_NUDGE_REASON_PREFIX,
+  hasTaskPairNeedsDecisionMarker,
   resolveTaskPairBrainReminderInterval,
   TASK_PAIR_BRAIN_MIN_GAP_MS,
   TASK_PAIR_HEARTBEAT_MS,
@@ -306,9 +309,23 @@ export class TaskPairAutomation implements TaskPairScheduler {
   #busy(session: string): boolean {
     const known = this.#tickBusy?.get(session);
     if (known !== undefined) return known;
-    const busy = (this.#deps.isBusy ?? ((name) => isSessionBusy(name, this.#deps.busyProbe)))(session);
+    const busy = this.#liveBusy(session);
     this.#tickBusy?.set(session, busy);
     return busy;
+  }
+  /**
+   * Busy right now, never the tick snapshot.  A tick spans awaits (git, disk),
+   * and timeline events call publishBadges() in between; the Brain heartbeat
+   * must judge the Brain at the moment it would send, not at the tick's first look.
+   */
+  #liveBusy(session: string): boolean {
+    return (this.#deps.isBusy ?? ((name) => isSessionBusy(name, this.#deps.busyProbe)))(session);
+  }
+
+  #pauseMainHeartbeat(sessionId: string): void {
+    this.#mainHeartbeatPaused.add(sessionId);
+    this.#mainHeartbeatPauseCleared.delete(sessionId);
+    this.publishBadges();
   }
 
   /**
@@ -351,11 +368,11 @@ export class TaskPairAutomation implements TaskPairScheduler {
     }
     if (event.type === 'agent.status') {
       const status = String(event.payload.status ?? '').toLowerCase();
-      if (status === 'needs_input' || status === 'supervision_needs_input') {
-        this.#mainHeartbeatPaused.add(event.sessionId);
-        this.#mainHeartbeatPauseCleared.delete(event.sessionId);
-        this.publishBadges();
-      }
+      if (status === 'needs_input' || status === 'supervision_needs_input') this.#pauseMainHeartbeat(event.sessionId);
+    } else if (event.type === 'assistant.text' && pairs.length > 0 && event.payload.streaming !== true
+      && event.payload.automation !== true && hasTaskPairNeedsDecisionMarker(String(event.payload.text ?? ''))) {
+      // The main session is idle and stuck: it needs the user's decision (see TASK_PAIR_NEEDS_DECISION_RULE).
+      this.#pauseMainHeartbeat(event.sessionId);
     } else if (event.type === 'session.state') {
       const state = String(event.payload.state ?? '').toLowerCase();
       if (state === 'running' || state === 'idle') this.publishBadges();
@@ -985,8 +1002,9 @@ export class TaskPairAutomation implements TaskPairScheduler {
         // heartbeat.  Until the first due point, keep the projection paused.
         if (awaitingDecisionPause && !actionable.some((pair) => pair.liveness.brainReminderDue)) continue;
       }
-      if (actionable.length === 0 || this.#busy(brain)) {
-        if (this.#busy(brain)) {
+      const brainBusy = actionable.length > 0 && this.#liveBusy(brain);
+      if (actionable.length === 0 || brainBusy) {
+        if (brainBusy) {
           for (const due of actionable.filter((pair) => pair.liveness.brainReminderDue)) this.#recordReminderSkip(due, 'brain_busy', now);
         }
         clearSupervisionHeartbeatProjectionSource(brain, SUPERVISION_HEARTBEAT_PROJECTION_SOURCE.BRAIN);
@@ -1006,11 +1024,13 @@ export class TaskPairAutomation implements TaskPairScheduler {
     for (const brain of this.#mainHeartbeatSessions) {
       if (!mainSessions.has(brain)) {
         clearSupervisionHeartbeatProjectionSource(brain, SUPERVISION_HEARTBEAT_PROJECTION_SOURCE.BRAIN);
-        this.#mainHeartbeatPaused.delete(brain);
         this.#mainHeartbeatPauseCleared.delete(brain);
         this.#mainHeartbeatPending.delete(brain);
       }
     }
+    // A NEEDS_DECISION pause lasts until the user replies, also across stretches where no pair
+    // needs the Brain; it ends once the Brain has no open pair left (all tasks finished).
+    for (const brain of this.#mainHeartbeatPaused) if (!mainPairs.has(brain)) this.#mainHeartbeatPaused.delete(brain);
     this.#mainHeartbeatSessions = mainSessions;
     for (const brain of this.#mainHeartbeatDelivered.keys()) {
       if (!mainSessions.has(brain)) this.#mainHeartbeatDelivered.delete(brain);
@@ -1103,7 +1123,7 @@ export class TaskPairAutomation implements TaskPairScheduler {
       }
     };
     const onlyAwaitingDecision = deliveryPairs.length === 1 && deliveryPairs[0]!.state.status === TASK_PAIR_STATUS_AWAITING_BRAIN_DECISION;
-    const aggregateReason = onlyAwaitingDecision ? 'brain-decision-reminder' : 'brain-heartbeat';
+    const aggregateReason = onlyAwaitingDecision ? 'brain-decision-reminder' : TASK_PAIR_BRAIN_HEARTBEAT_REASON;
     void sendTaskPairMessage(brain, TASK_PAIR_AGGREGATE_NOTICE_ID, aggregateReason, buildBrainHeartbeatMessage(deliveryPairs.map((stored) => stored.state)))
       .then((result) => {
         // An aggregate names no single pair, so the delivery layer cannot
@@ -1369,7 +1389,7 @@ export class TaskPairAutomation implements TaskPairScheduler {
       if (!capacityLimited) {
         liveness.lastNudgedAt = now;
         store.saveLiveness(stored.project, pair.taskId, liveness);
-        await sendTaskPairMessage(session, pair.taskId, `nudge-${side}`, buildNudgeMessage(pair, side));
+        await sendTaskPairMessage(session, pair.taskId, `${TASK_PAIR_NUDGE_REASON_PREFIX}${side}`, buildNudgeMessage(pair, side));
         this.#recordLivenessDecision({ ...stored, liveness }, 'NUDGE', 'sent', `heartbeat_${side}`, now);
       } else {
         this.#recordLivenessDecision({ ...stored, liveness }, 'NUDGE', 'skipped', `capacity_${side}`, now);
@@ -1538,7 +1558,7 @@ export class TaskPairAutomation implements TaskPairScheduler {
       const repeat = silence > 1
         ? `This is repeated quiet heartbeat ${silence}; take ownership now.`
         : 'Both sides are idle; take ownership of the next action now.';
-      await sendTaskPairMessage(targetSession, pair.taskId, `nudge-${target}`, buildNudgeMessage(pair, target, repeat));
+      await sendTaskPairMessage(targetSession, pair.taskId, `${TASK_PAIR_NUDGE_REASON_PREFIX}${target}`, buildNudgeMessage(pair, target, repeat));
       this.#recordLivenessDecision({ project, state: pair, liveness: nextLiveness, queueOrder: 0 }, 'NUDGE', 'sent', 'both_idle', now);
     } else if (silence === TASK_PAIR_SILENCE_LIMIT) {
       this.#recordLivenessDecision({ project, state: pair, liveness: nextLiveness, queueOrder: 0 }, 'NUDGE', 'escalated', 'both_idle_silence_limit', now);

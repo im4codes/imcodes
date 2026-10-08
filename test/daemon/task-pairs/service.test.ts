@@ -713,6 +713,17 @@ describe('task-pair marker ingestion', () => {
     expect(sent.some((entry) => entry.target === BRAIN)).toBe(false);
   });
 
+  it('treats NEEDS_DECISION as no pair transition, from Brain or a participant (the scheduler owns the heartbeat pause)', async () => {
+    await say(BRAIN, `<!-- IMCODES_TASK DISPATCH T-ND executor=${EXEC} auditor=${AUD} -->`);
+    const before = pair('T-ND');
+    const eventsBefore = getTaskPairStore().listEvents(PROJECT, 'T-ND').length;
+    expect(before).toMatchObject({ status: 'working', flags: [] });
+    await say(BRAIN, 'Stuck.\n<!-- IMCODES_TASK NEEDS_DECISION - note="pick A or B" -->');
+    await say(EXEC, '<!-- IMCODES_TASK NEEDS_DECISION T-ND note="not a participant marker" -->');
+    expect(pair('T-ND')).toMatchObject({ status: 'working', flags: [], updatedAt: before!.updatedAt });
+    expect(getTaskPairStore().listEvents(PROJECT, 'T-ND')).toHaveLength(eventsBefore);
+  });
+
   it('ignores streaming, automation and memory-excluded payloads and legacy-engine projects', async () => {
     await say(BRAIN, `<!-- IMCODES_TASK DISPATCH T4 executor=${EXEC} auditor=${AUD} -->`, { streaming: true });
     await say(BRAIN, `<!-- IMCODES_TASK DISPATCH T4 executor=${EXEC} auditor=${AUD} -->`, { automation: true });

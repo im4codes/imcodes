@@ -332,6 +332,7 @@
       "supervision_heartbeat": "Pulso de supervisión",
       "audit_heartbeat": "Pulso de auditoría",
       "implementation_heartbeat": "Pulso de implementación",
+      "pair_heartbeat": "Pulso de la pareja",
       "continue": "Continuación de supervisión",
       "post_audit_finalization": "Finalización posterior a la auditoría",
       "audit_delegation": "Delegación de auditoría",

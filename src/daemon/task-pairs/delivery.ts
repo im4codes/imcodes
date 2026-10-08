@@ -16,7 +16,14 @@ import { getTransportRuntime } from '../../agent/session-manager.js';
 import { dispatchSessionMessage } from '../session-dispatch.js';
 import { createSendDispatchId, type SendMessageId } from '../../../shared/send-message-id.js';
 import { MEMORY_MCP_SEND_DELIVERY_MODES } from '../../../shared/memory-mcp-contracts.js';
-import { TASK_PAIR_AUTOMATION_KIND, TASK_PAIR_NUDGE_ID_PREFIX, isTerminalTaskPairStatus, type TaskPairDeliveryResult } from '../../../shared/task-pair.js';
+import {
+  TASK_PAIR_AUTOMATION_KIND,
+  TASK_PAIR_HEARTBEAT_AUTOMATION_KIND,
+  TASK_PAIR_NUDGE_ID_PREFIX,
+  isTaskPairHeartbeatReason,
+  isTerminalTaskPairStatus,
+  type TaskPairDeliveryResult,
+} from '../../../shared/task-pair.js';
 import { recordBrainNoticeOutcome } from './brain-notice.js';
 import { getTaskPairStore } from './store.js';
 import { noteTaskPairFocus, resetTaskPairFocusForTests, taskPairFocusOf } from './focus.js';
@@ -150,7 +157,7 @@ async function deliverTaskPairMessage(
       clientMessageId: messageId,
       allowDuplicate: true,
       automation: true,
-      automationKind: TASK_PAIR_AUTOMATION_KIND,
+      automationKind: isTaskPairHeartbeatReason(reason) ? TASK_PAIR_HEARTBEAT_AUTOMATION_KIND : TASK_PAIR_AUTOMATION_KIND,
       memoryExcluded: true,
     }, { source: 'daemon', confidence: 'high', eventId: messageId });
     const result = await dispatchSessionMessage(record, text, {

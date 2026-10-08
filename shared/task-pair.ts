@@ -154,6 +154,29 @@ export const TASK_PAIR_NATIVE_COLLABORATION_RULE =
   + TASK_PAIR_SUBSESSION_TERMINOLOGY;
 /** Automation kind stamped on daemon-authored pair messages. */
 export const TASK_PAIR_AUTOMATION_KIND = 'task-pair' as const;
+/** Automation kind of the pair heartbeat (a quiet-side nudge or the Brain heartbeat): shown as a heartbeat card, not a lifecycle notice. */
+export const TASK_PAIR_HEARTBEAT_AUTOMATION_KIND = 'task-pair-heartbeat' as const;
+/** Reason prefix of a quiet-side nudge (`nudge-executor`, `nudge-auditor`). */
+export const TASK_PAIR_NUDGE_REASON_PREFIX = 'nudge-' as const;
+/** Reason of the Brain's aggregate heartbeat notice. */
+export const TASK_PAIR_BRAIN_HEARTBEAT_REASON = 'brain-heartbeat' as const;
+
+/**
+ * Brain-only marker: the main session is idle, stuck on a problem it cannot
+ * solve, and needs the user's decision. It never changes pair state; it pauses
+ * the Brain heartbeat until the user replies (see the scheduler).
+ */
+export const TASK_PAIR_NEEDS_DECISION_VERB = 'NEEDS_DECISION' as const;
+export const TASK_PAIR_NEEDS_DECISION_RULE =
+  'Brain: when you are idle, have nothing to do, and are stuck on a problem only the user can decide, write '
+  + `<!-- ${TASK_PAIR_MARKER_TAG} ${TASK_PAIR_NEEDS_DECISION_VERB} - note="..." --> `
+  + 'on its own line in your final reply, with the options and a recommendation. The daemon then stops the Brain heartbeat until the user replies. '
+  + 'Never use it for a pair wait: participant BLOCKED/NEEDS_INPUT and pair_* tools are the pair channel.';
+
+/** True when a daemon-authored pair message is part of the pair heartbeat rather than a lifecycle notice. */
+export function isTaskPairHeartbeatReason(reason: string): boolean {
+  return reason === TASK_PAIR_BRAIN_HEARTBEAT_REASON || reason.startsWith(TASK_PAIR_NUDGE_REASON_PREFIX);
+}
 /** Directory-name prefix of a pair's executor worktree, beside legacy `asg_…` assignment worktrees. */
 export const TASK_PAIR_WORKTREE_PREFIX = 'pair_' as const;
 /**
@@ -1036,6 +1059,12 @@ export function stripTaskPairMarkersForDisplay(text: string): string {
 /** Cheap pre-check before a full scan. */
 export function mayContainTaskPairMarker(text: string): boolean {
   return text.includes(TASK_PAIR_MARKER_TAG);
+}
+
+/** True when assistant text carries a NEEDS_DECISION marker line (fenced or quoted lines do not count). */
+export function hasTaskPairNeedsDecisionMarker(text: string): boolean {
+  if (!mayContainTaskPairMarker(text)) return false;
+  return scanTaskPairMarkers(text).markers.some((marker) => marker.verb.toUpperCase() === TASK_PAIR_NEEDS_DECISION_VERB);
 }
 
 // ---------------------------------------------------------------------------
@@ -2477,6 +2506,7 @@ export function buildTaskPairMarkerContract(): string {
     'Executor: write STARTED once when you begin (never again on later turns; progress needs no marker) and work in the pair\'s workspace (below). When done, send the auditor your validation (full suites for code) with send_message and write READY_FOR_AUDIT naming material; the daemon relays it to the auditor. In a git workspace, commit locally before READY and name that commit as head= so the audit reads a fixed revision; REWORK fixes are new local commits. Only after the assigned auditor applies PASS in a material-backed audit round may the executor report the worktree path and HEAD to Brain (never push any branch) and write DONE (with output= when the result must be kept). DONE before PASS is recorded as unusual and cannot close or advance the pair. Write BLOCKED or NEEDS_INPUT with note="..." when stuck. auditor=none is a real choice, not a lesser one: no audit window is assigned and nothing auto-picks one for you. Do proportionate self-validation instead (full suites for code), commit locally in the worktree (never push any branch), then write DONE straight to Brain with no PASS required; this reports completion but leaves the pair open awaiting Brain\'s decision. The closing reply is relayed to Brain and must state what changed, the worktree path and HEAD or file paths, and your validation result before the DONE marker. Brain ends it with pair_close (action=done to accept, action=cancel); further Brain work returns it to working. Brain merges commits into dev and pushes dev.',
     TASK_PAIR_INTEGRATION_RULE,
     TASK_PAIR_BRAIN_CLOSE_RULE,
+    TASK_PAIR_NEEDS_DECISION_RULE,
     TASK_PAIR_NEXT_ROUND_RULE,
     TASK_PAIR_WORKSPACE_RULES,
     'Pairs have no assignmentId, auditAttemptId, auditRevision, immutable bundle, scopeFiles or control-plane binding: never wait for, ask for or block on them.',

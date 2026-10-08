@@ -128,7 +128,7 @@ import {
   readAgentDelegationSupervisionTaskProjection,
 } from '@shared/agent-delegation.js';
 import { parseTimelineDisplayText } from '../timeline-display-text.js';
-import { TASK_PAIR_AUTOMATION_KIND, TASK_PAIR_TIMELINE_EVENT } from '@shared/task-pair.js';
+import { TASK_PAIR_AUTOMATION_KIND, TASK_PAIR_HEARTBEAT_AUTOMATION_KIND, TASK_PAIR_TIMELINE_EVENT } from '@shared/task-pair.js';
 import { TaskPairStatusPanelHost } from './TaskPairStatusPanel.js';
 import { TaskPairEventChip } from './TaskPairEventChip.js';
 import { parseTaskPairNotification, taskPairNotificationKey } from '@shared/task-pair-notification.js';
@@ -5770,7 +5770,8 @@ function SupervisionAutomationPrompt({
   const actionLabel = expanded ? hideDetailsLabel : showDetailsLabel;
   const heartbeat = automationKind === SUPERVISION_WAITING_HEARTBEAT_AUTOMATION_KIND
     || automationKind === SUPERVISION_AUDIT_HEARTBEAT_AUTOMATION_KIND
-    || automationKind === SUPERVISION_IMPLEMENTATION_HEARTBEAT_AUTOMATION_KIND;
+    || automationKind === SUPERVISION_IMPLEMENTATION_HEARTBEAT_AUTOMATION_KIND
+    || automationKind === TASK_PAIR_HEARTBEAT_AUTOMATION_KIND;
   return (
     <div class={`chat-supervision-prompt${heartbeat ? ' is-heartbeat' : ''}`}>
       <button

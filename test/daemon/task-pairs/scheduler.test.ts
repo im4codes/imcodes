@@ -1562,6 +1562,101 @@ describe('task-pair heartbeat, replacement and queue', () => {
     expect(sentTo(BRAIN, 'brain-heartbeat')).toHaveLength(1);
   });
 
+  it('pauses the main heartbeat on the Brain NEEDS_DECISION marker (final reply only), leaves pair state alone, and re-arms after the user replies', async () => {
+    getTaskPairStore().savePair(PROJECT, {
+      taskId: 'brain-needs-decision', brain: BRAIN, status: 'passed', flags: [], flagSides: {}, round: 1,
+      blocking: ['P0'], previousAuditors: [], capCounts: {}, capRound: 0, createdAt: now, updatedAt: now,
+      executor: EXEC, auditor: AUD,
+    } satisfies TaskPairState);
+    automation.publishBadges();
+    expect(getSupervisionHeartbeatProjection(BRAIN)?.state).toBe('armed');
+    // A streamed delta is not the final reply: it must not pause.
+    automation.observeTimelineEvent({ sessionId: BRAIN, type: 'assistant.text', payload: { text: '<!-- IMCODES_TASK NEEDS_DECISION - note="x" -->', streaming: true } });
+    expect(getSupervisionHeartbeatProjection(BRAIN)?.state).toBe('armed');
+    automation.observeTimelineEvent({
+      sessionId: BRAIN, type: 'assistant.text',
+      payload: { text: 'Stuck on the schema choice.\n<!-- IMCODES_TASK NEEDS_DECISION - note="pick A or B" -->', streaming: false },
+    });
+    expect(getSupervisionHeartbeatProjection(BRAIN)).toMatchObject({ state: 'paused_needs_input', kind: 'pair' });
+    expect(pair('brain-needs-decision')).toMatchObject({ status: 'passed', flags: [] });
+    now += 10 * 60_000;
+    automation.publishBadges();
+    await flush();
+    expect(sentTo(BRAIN, 'brain-heartbeat')).toHaveLength(0);
+    automation.observeTimelineEvent({ sessionId: BRAIN, type: 'user.message', payload: { text: 'option A', automation: false } });
+    expect(getSupervisionHeartbeatProjection(BRAIN)).toMatchObject({ state: 'armed', kind: 'pair' });
+  });
+
+  it('NEEDS_DECISION: ignores a participant and an automation echo; the pause outlives a stretch with nothing for Brain and ends with the last open pair', async () => {
+    const save = (taskId: string, status: TaskPairState['status']) => getTaskPairStore().savePair(PROJECT, {
+      taskId, brain: BRAIN, status, flags: [], flagSides: {}, round: 1,
+      blocking: ['P0'], previousAuditors: [], capCounts: {}, capRound: 0, createdAt: now, updatedAt: now,
+      executor: EXEC, auditor: AUD,
+    } satisfies TaskPairState);
+    const text = 'Stuck.\n<!-- IMCODES_TASK NEEDS_DECISION - note="pick A or B" -->';
+    save('nd-keep', 'passed');
+    automation.publishBadges();
+    expect(getSupervisionHeartbeatProjection(BRAIN)?.state).toBe('armed');
+    // A participant writing it, or a daemon-authored automation text, pauses nothing.
+    automation.observeTimelineEvent({ sessionId: EXEC, type: 'assistant.text', payload: { text, streaming: false } });
+    automation.observeTimelineEvent({ sessionId: BRAIN, type: 'assistant.text', payload: { text, streaming: false, automation: true } });
+    expect(getSupervisionHeartbeatProjection(BRAIN)?.state).toBe('armed');
+    // Paused by the Brain; then nothing needs Brain for a while (the pair goes back to working).
+    automation.observeTimelineEvent({ sessionId: BRAIN, type: 'assistant.text', payload: { text, streaming: false } });
+    expect(getSupervisionHeartbeatProjection(BRAIN)?.state).toBe('paused_needs_input');
+    save('nd-keep', 'working');
+    automation.publishBadges();
+    expect(getSupervisionHeartbeatProjection(BRAIN)?.state ?? 'off').toBe('off');
+    // The pair needs Brain again: still paused, nothing delivered, the user has not replied.
+    save('nd-keep', 'passed');
+    now += 10 * 60_000;
+    automation.publishBadges();
+    await flush();
+    expect(getSupervisionHeartbeatProjection(BRAIN)).toMatchObject({ state: 'paused_needs_input' });
+    expect(sentTo(BRAIN, 'brain-heartbeat')).toHaveLength(0);
+    // All tasks finished: the pause is dropped with the last open pair, so a later task starts clean.
+    save('nd-keep', 'done');
+    automation.publishBadges();
+    save('nd-next', 'passed');
+    automation.publishBadges();
+    expect(getSupervisionHeartbeatProjection(BRAIN)).toMatchObject({ state: 'armed' });
+  });
+
+  it('judges the Brain busy at the moment of sending, not by the first look of a tick that is still running', async () => {
+    getTaskPairStore().savePair(PROJECT, {
+      taskId: 'brain-stale-busy', brain: BRAIN, status: 'passed', flags: [], flagSides: {}, round: 1,
+      blocking: ['P0'], previousAuditors: [], capCounts: {}, capRound: 0, createdAt: now, updatedAt: now,
+      executor: EXEC, auditor: AUD,
+    } satisfies TaskPairState);
+    // Events call publishBadges() while a tick is awaiting: do the same from inside the tick (the
+    // busy probe is read by it), once with the Brain idle (that look enters the tick snapshot) and
+    // once after the Brain became busy.
+    let interleaved = 0;
+    const seen: string[] = []; // asserted after the tick: it swallows errors thrown inside it
+    const probing = new TaskPairAutomation({
+      now: () => now,
+      importLegacy: () => undefined,
+      mainCheckoutRoots: () => [],
+      brainMainCheckoutActive: () => false,
+      isBusy: (name) => {
+        if (name !== BRAIN && interleaved === 0) {
+          interleaved += 1;
+          probing.publishBadges();
+          seen.push(getSupervisionHeartbeatProjection(BRAIN)?.state ?? 'off');
+          busy.add(BRAIN);
+          probing.publishBadges();
+          seen.push(getSupervisionHeartbeatProjection(BRAIN)?.state ?? 'off');
+        }
+        return busy.has(name);
+      },
+    });
+    taskPairService.setScheduler(probing);
+    await probing.tick();
+    expect(interleaved).toBe(1);
+    expect(seen).toEqual(['armed', 'off']);
+    expect(sentTo(BRAIN, 'brain-heartbeat')).toHaveLength(0);
+  });
+
   describe('NEXT_ROUND: what changes for the logic that depends on the passed state', () => {
     async function passRoundOne(taskId: string) {
       marker(BRAIN, `<!-- IMCODES_TASK DISPATCH ${taskId} executor=${EXEC} auditor=${AUD} -->`);

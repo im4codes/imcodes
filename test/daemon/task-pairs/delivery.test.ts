@@ -13,6 +13,7 @@ vi.mock('../../../src/daemon/session-dispatch.js', () => ({ dispatchSessionMessa
 vi.mock('../../../src/daemon/timeline-emitter.js', () => ({ timelineEmitter: { emit: mocks.emit } }));
 
 import { sendTaskPairMessage, setTaskPairDeliveryDepsForTests, taskPairMessageIdPrefix } from '../../../src/daemon/task-pairs/delivery.js';
+import { TASK_PAIR_AUTOMATION_KIND, TASK_PAIR_HEARTBEAT_AUTOMATION_KIND } from '../../../shared/task-pair.js';
 
 describe('task-pair reminder delivery dedupe', () => {
   afterEach(() => {
@@ -66,5 +67,21 @@ describe('task-pair reminder delivery dedupe', () => {
     await expect(sendTaskPairMessage('deck_delivery_brain', taskId, 'policy-rejection', 'replay', 'round:2'))
       .resolves.toBe('skipped_pending');
     expect(mocks.dispatchSessionMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it('stamps pair heartbeat nudges and the Brain heartbeat with the heartbeat automation kind', async () => {
+    mocks.getTransportRuntime.mockReturnValue({ pendingEntries: [] });
+    mocks.dispatchSessionMessage.mockResolvedValue('queued');
+
+    await sendTaskPairMessage('deck_delivery_exec', 'T1', 'nudge-executor', 'nudge');
+    await sendTaskPairMessage('deck_delivery_brain', '__aggregate__', 'brain-heartbeat', 'heartbeat');
+    await sendTaskPairMessage('deck_delivery_brain', 'T1', 'brain-workspace-kept', 'notice');
+
+    const kinds = mocks.emit.mock.calls.map(([, , payload]) => (payload as { automationKind: string }).automationKind);
+    expect(kinds).toEqual([
+      TASK_PAIR_HEARTBEAT_AUTOMATION_KIND,
+      TASK_PAIR_HEARTBEAT_AUTOMATION_KIND,
+      TASK_PAIR_AUTOMATION_KIND,
+    ]);
   });
 });

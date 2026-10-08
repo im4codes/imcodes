@@ -9,7 +9,7 @@ import {
   AGENT_DELEGATION_SENDER_MARKER,
 } from '../../shared/agent-delegation.js';
 import { CRON_CONTROL_PROTOCOL, CRON_RUN_TIMELINE } from '../../shared/cron-types.js';
-import { TASK_PAIR_AUTOMATION_KIND } from '../../shared/task-pair.js';
+import { TASK_PAIR_AUTOMATION_KIND, TASK_PAIR_HEARTBEAT_AUTOMATION_KIND } from '../../shared/task-pair.js';
 import { SUPERVISION_WAITING_HEARTBEAT_AUTOMATION_KIND } from '../../shared/supervision-config.js';
 
 const agentDelivery = (text: string) =>
@@ -44,6 +44,7 @@ describe('classifyUserMessageOrigin', () => {
     for (const payload of [
       { text: 'Heartbeat', automation: true, automationKind: SUPERVISION_WAITING_HEARTBEAT_AUTOMATION_KIND },
       { text: 'nudge', automation: true, automationKind: TASK_PAIR_AUTOMATION_KIND },
+      { text: 'pair heartbeat', automation: true, automationKind: TASK_PAIR_HEARTBEAT_AUTOMATION_KIND },
       { text: 'provisioning', automationKind: 'supervision-provisioning' },
       { text: 'run the report', [CRON_RUN_TIMELINE.PAYLOAD_KEY]: { scheduleId: 's1' } },
       { text: `${CRON_CONTROL_PROTOCOL.OPEN_TAG}id="x">run</imcodes-cron-control>` },

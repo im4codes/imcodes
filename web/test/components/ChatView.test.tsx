@@ -42,6 +42,7 @@ import {
   SUPERVISION_USER_PROMPT_LABEL_KEYS,
   SUPERVISION_WAITING_HEARTBEAT_AUTOMATION_KIND,
 } from '../../../shared/supervision-config.js';
+import { TASK_PAIR_HEARTBEAT_AUTOMATION_KIND } from '../../../shared/task-pair.js';
 
 const chatMarkdownRenderSpy = vi.hoisted(() => vi.fn());
 const showToolCallsPref = vi.hoisted(() => ({
@@ -198,6 +199,7 @@ vi.mock('react-i18next', () => ({
         'chat.supervision_prompt.supervision_heartbeat': 'Supervision heartbeat',
         'chat.supervision_prompt.audit_heartbeat': 'Audit heartbeat',
         'chat.supervision_prompt.implementation_heartbeat': 'Implementation heartbeat',
+        'chat.supervision_prompt.pair_heartbeat': 'Pair heartbeat',
         'chat.supervision_prompt.continue': 'Supervision continuation',
         'chat.supervision_prompt.post_audit_finalization': 'Post-audit finalization',
         'chat.supervision_prompt.audit_delegation': 'Audit delegation',
@@ -388,6 +390,7 @@ describe('supervision automation prompt labels', () => {
     'chat.supervision_prompt.supervision_heartbeat': 'Supervision heartbeat',
     'chat.supervision_prompt.audit_heartbeat': 'Audit heartbeat',
     'chat.supervision_prompt.implementation_heartbeat': 'Implementation heartbeat',
+    'chat.supervision_prompt.pair_heartbeat': 'Pair heartbeat',
     'chat.supervision_prompt.continue': 'Supervision continuation',
     'chat.supervision_prompt.post_audit_finalization': 'Post-audit finalization',
     'chat.supervision_prompt.audit_delegation': 'Audit delegation',
@@ -400,6 +403,7 @@ describe('supervision automation prompt labels', () => {
     [SUPERVISION_WAITING_HEARTBEAT_AUTOMATION_KIND, 'chat.supervision_prompt.supervision_heartbeat'],
     [SUPERVISION_AUDIT_HEARTBEAT_AUTOMATION_KIND, 'chat.supervision_prompt.audit_heartbeat'],
     [SUPERVISION_IMPLEMENTATION_HEARTBEAT_AUTOMATION_KIND, 'chat.supervision_prompt.implementation_heartbeat'],
+    [TASK_PAIR_HEARTBEAT_AUTOMATION_KIND, 'chat.supervision_prompt.pair_heartbeat'],
     [SUPERVISION_CONTINUE_AUTOMATION_KIND, 'chat.supervision_prompt.continue'],
     [SUPERVISION_POST_AUDIT_FINALIZATION_AUTOMATION_KIND, 'chat.supervision_prompt.post_audit_finalization'],
     [SUPERVISION_AUDIT_DELEGATION_AUTOMATION_KIND, 'chat.supervision_prompt.audit_delegation'],
@@ -426,6 +430,7 @@ describe('supervision automation prompt labels', () => {
         SUPERVISION_WAITING_HEARTBEAT_AUTOMATION_KIND,
         SUPERVISION_AUDIT_HEARTBEAT_AUTOMATION_KIND,
         SUPERVISION_IMPLEMENTATION_HEARTBEAT_AUTOMATION_KIND,
+        TASK_PAIR_HEARTBEAT_AUTOMATION_KIND,
       ].includes(automationKind as never);
       expect(disclosure?.textContent).toBe(`${heartbeat ? '❤️' : ''}${expectedLabelByKey[labelKey]}`);
       expect(container.querySelector('.chat-supervision-prompt')?.classList.contains('is-heartbeat')).toBe(heartbeat);

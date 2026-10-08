@@ -38,7 +38,7 @@ import type { TimelineEvent } from '../../src/ws-client.js';
 import { AGENT_DELEGATION_SENDER_MARKER } from '../../../shared/agent-delegation.js';
 import { CHAT_MESSAGE_ORIGINS, USER_MESSAGE_ORIGIN_FIELDS } from '../../../shared/chat-message-origin.js';
 import { CRON_CONTROL_PROTOCOL } from '../../../shared/cron-types.js';
-import { TASK_PAIR_AUTOMATION_KIND } from '../../../shared/task-pair.js';
+import { TASK_PAIR_AUTOMATION_KIND, TASK_PAIR_HEARTBEAT_AUTOMATION_KIND } from '../../../shared/task-pair.js';
 import { SUPERVISION_WAITING_HEARTBEAT_AUTOMATION_KIND } from '../../../shared/supervision-config.js';
 
 let seq = 0;
@@ -77,6 +77,7 @@ describe('ChatView user.message alignment by origin', () => {
         userMessage(sessionId, { text: 'spoken on the phone', commandId: 'cmd_voice' }),
         userMessage(sessionId, { text: agentDelivery('收到，本次复审已结束。') }),
         userMessage(sessionId, { text: 'pair nudge', automation: true, automationKind: TASK_PAIR_AUTOMATION_KIND }),
+        userMessage(sessionId, { text: 'pair heartbeat nudge', automation: true, automationKind: TASK_PAIR_HEARTBEAT_AUTOMATION_KIND }),
         userMessage(sessionId, { text: 'still waiting', automation: true, automationKind: SUPERVISION_WAITING_HEARTBEAT_AUTOMATION_KIND }),
         userMessage(sessionId, { text: `${CRON_CONTROL_PROTOCOL.OPEN_TAG}id="c1">nightly report</imcodes-cron-control>` }),
         userMessage(sessionId, { text: 'p2p round prompt', p2pRunId: 'run_1' }),
@@ -104,7 +105,7 @@ describe('ChatView user.message alignment by origin', () => {
       const byOrigin = (origin: string) => bubbles.filter((node) => node.classList.contains(`chat-user-origin-${origin}`)).length;
       expect(byOrigin(CHAT_MESSAGE_ORIGINS.USER)).toBe(2);
       expect(byOrigin(CHAT_MESSAGE_ORIGINS.AGENT)).toBe(1);
-      expect(byOrigin(CHAT_MESSAGE_ORIGINS.SYSTEM)).toBe(5);
+      expect(byOrigin(CHAT_MESSAGE_ORIGINS.SYSTEM)).toBe(6);
     });
   }
 

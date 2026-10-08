@@ -332,6 +332,7 @@
       "supervision_heartbeat": "Сигнал супервизии",
       "audit_heartbeat": "Сигнал аудита",
       "implementation_heartbeat": "Сигнал реализации",
+      "pair_heartbeat": "Сигнал пары",
       "continue": "Продолжение супервизии",
       "post_audit_finalization": "Завершение после аудита",
       "audit_delegation": "Делегирование аудита",

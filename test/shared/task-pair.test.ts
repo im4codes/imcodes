@@ -35,6 +35,8 @@ import {
   type TaskPairMarker,
   type TaskPairState,
   type TaskPairStatus,
+  hasTaskPairNeedsDecisionMarker,
+  isTaskPairHeartbeatReason,
 } from '../../shared/task-pair.js';
 
 const BRAIN = 'deck_proj_brain';
@@ -849,5 +851,24 @@ describe('pair binding ids', () => {
     expect(taskPairBindingOf(pair, 'brain')).toBeUndefined();
     expect(taskPairBindingOf({ taskId: 'T1', executor: 'exec', auditor: TASK_PAIR_NO_AUDITOR } as never, TASK_PAIR_NO_AUDITOR)).toBeUndefined();
     expect(taskPairBindingOf(undefined, 'exec')).toBeUndefined();
+  });
+});
+
+describe('isTaskPairHeartbeatReason', () => {
+  it('matches quiet-side nudges and the Brain heartbeat only', () => {
+    expect(isTaskPairHeartbeatReason('nudge-executor')).toBe(true);
+    expect(isTaskPairHeartbeatReason('nudge-auditor')).toBe(true);
+    expect(isTaskPairHeartbeatReason('brain-heartbeat')).toBe(true);
+    expect(isTaskPairHeartbeatReason('brain-decision-reminder')).toBe(false);
+    expect(isTaskPairHeartbeatReason('brain-workspace-kept')).toBe(false);
+    expect(isTaskPairHeartbeatReason('import-correction')).toBe(false);
+  });
+});
+
+describe('hasTaskPairNeedsDecisionMarker', () => {
+  it('matches a NEEDS_DECISION marker line but not one inside a code fence', () => {
+    expect(hasTaskPairNeedsDecisionMarker('Options:\n<!-- IMCODES_TASK NEEDS_DECISION - note="A or B" -->')).toBe(true);
+    expect(hasTaskPairNeedsDecisionMarker('```\n<!-- IMCODES_TASK NEEDS_DECISION - note="x" -->\n```')).toBe(false);
+    expect(hasTaskPairNeedsDecisionMarker('plain reply, no marker')).toBe(false);
   });
 });

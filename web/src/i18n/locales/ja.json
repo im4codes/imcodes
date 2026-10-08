@@ -332,6 +332,7 @@
       "supervision_heartbeat": "監督ハートビート",
       "audit_heartbeat": "監査ハートビート",
       "implementation_heartbeat": "実装ハートビート",
+      "pair_heartbeat": "ペアハートビート",
       "continue": "監督の続行",
       "post_audit_finalization": "監査後の最終処理",
       "audit_delegation": "監査の委任",
