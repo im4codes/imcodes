@@ -49,6 +49,7 @@ import { discussionRoutes } from './routes/discussions.js';
 import { tabSharingRoutes } from './routes/tab-sharing.js';
 import { preferencesRoutes } from './routes/preferences.js';
 import { aliasRoutes } from './routes/aliases.js';
+import { buildAppContentSecurityPolicy } from '../../shared/app-content-security-policy.js';
 import { ALIAS_API_PATH } from '../../shared/alias-types.js';
 import { sessionIdentityRoutes } from './routes/session-identities.js';
 import { SESSION_IDENTITY_API_PATH } from '../../shared/session-identity.js';
@@ -323,16 +324,7 @@ export function buildApp(env: Env, options: BuildAppOptions = {}) {
     'X-Content-Type-Options': 'nosniff',
     'Referrer-Policy': 'no-referrer',
     'Permissions-Policy': 'camera=(), microphone=(), geolocation=()',
-    'Content-Security-Policy': [
-      "default-src 'self'",
-      "script-src 'self' 'unsafe-inline'",   // Vite bundles inline runtime; tighten with hashes in future
-      "style-src 'self' 'unsafe-inline'",
-      "connect-src 'self' wss: ws: https://api.github.com",
-      "worker-src 'self' blob:",
-      "img-src 'self' data: https:",
-      "font-src 'self'",
-      "frame-ancestors 'none'",
-    ].join('; '),
+    'Content-Security-Policy': buildAppContentSecurityPolicy(),
   };
 
   // Landing page — served when request host matches LANDING_HOST env var

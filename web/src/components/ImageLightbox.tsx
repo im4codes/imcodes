@@ -25,6 +25,10 @@ interface Props {
   onNavigate?: (direction: -1 | 1) => void;
   canPrev?: boolean;
   canNext?: boolean;
+  /** The picture could not be loaded (blocked, undecodable): the owner may offer another source. */
+  onImageError?: () => void;
+  /** Extra class on the overlay (a caller that has to sit above the app chrome adds its layer class). */
+  overlayClass?: string;
 }
 
 type ClipboardItemConstructor = new (items: Record<string, Blob>) => unknown;
@@ -142,7 +146,7 @@ async function copyImageToClipboard(src: string) {
   throw new Error('clipboard_unavailable');
 }
 
-export function ImageLightbox({ src, alt = '', fileName, onDownload, onClose, onNavigate, canPrev = false, canNext = false }: Props) {
+export function ImageLightbox({ src, alt = '', fileName, onDownload, onClose, onNavigate, canPrev = false, canNext = false, onImageError, overlayClass }: Props) {
   const { t } = useTranslation();
   const lightboxRef = useRef<HTMLDivElement>(null);
   const imageRef = useRef<HTMLImageElement>(null);
@@ -501,7 +505,7 @@ export function ImageLightbox({ src, alt = '', fileName, onDownload, onClose, on
   return (
     <div
       ref={lightboxRef}
-      class="fb-lightbox"
+      class={overlayClass ? `fb-lightbox ${overlayClass}` : 'fb-lightbox'}
       role="dialog"
       aria-modal="true"
       tabIndex={-1}
@@ -514,6 +518,7 @@ export function ImageLightbox({ src, alt = '', fileName, onDownload, onClose, on
         ref={imageRef}
         src={src}
         alt={alt}
+        onError={onImageError}
         style={dragOffset !== 0 ? {
           transform: `translateY(${dragOffset}px)`,
           // Fade toward the dismiss threshold so the gesture shows its own

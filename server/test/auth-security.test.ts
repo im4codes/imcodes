@@ -5,6 +5,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { buildApp } from '../src/index.js';
 import type { Env } from '../src/env.js';
 import type { Database } from '../src/db/client.js';
+import { buildAppContentSecurityPolicy } from '../../shared/app-content-security-policy.js';
 import { COOKIE_SESSION } from '../../shared/cookie-names.js';
 import { EXPECTED_USER_ID_HEADER } from '../../shared/http-header-names.js';
 import { AUTH_IDENTITY_ERRORS } from '../../shared/auth-identity.js';
@@ -507,8 +508,11 @@ describe('Security headers on HTML responses', () => {
     expect(source).toContain("'Referrer-Policy': 'no-referrer'");
     expect(source).toContain('Permissions-Policy');
     expect(source).toContain('Content-Security-Policy');
-    expect(source).toContain("worker-src 'self' blob:");
-    expect(source).toContain("frame-ancestors 'none'");
+    // The policy itself is one shared definition; the header is built from it.
+    expect(source).toContain('buildAppContentSecurityPolicy()');
+    const csp = buildAppContentSecurityPolicy();
+    expect(csp).toContain("worker-src 'self' blob:");
+    expect(csp).toContain("frame-ancestors 'none'");
   });
 
   it('SECURITY_HEADERS are applied to HTML responses, not non-HTML', async () => {

@@ -1,13 +1,22 @@
+import { createPortal } from 'preact/compat';
 import { useEffect, useRef, useState } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import { buildAttachmentDownloadUrl } from '../api.js';
-import { getAttachmentPreview, isPreviewableImageName } from '../attachment-preview-cache.js';
+import { forgetAttachmentPreview, getAttachmentPreview, isPreviewableImageName } from '../attachment-preview-cache.js';
 import { ImageLightbox } from './ImageLightbox.js';
 import { sanitizeUploadFilename } from '@shared/upload-filename.js';
 
 /** Pause before the hover preview opens, so sweeping across chips does not flash them. */
 const HOVER_PREVIEW_DELAY_MS = 140;
 const POPOVER_GAP_PX = 8;
+/**
+ * Class of every overlay the chip opens (hover popover, lightbox, "loading" cover). They are rendered into <body> and take their
+ * z-index from `--layer-attachment-preview` (styles.css): the chip sits in the composer, whose `.attachment-badges` is
+ * `position: relative; z-index: 1`, so an overlay left inside it would rank as z-index 1 against the app bars and the
+ * composer itself, however large its own number, and the phone's bars would cover the picture.
+ */
+export const ATTACHMENT_PREVIEW_LAYER_CLASS = 'attachment-preview-layer';
+const toBody = (node: preact.ComponentChild) => createPortal(node, document.body);
 
 export interface ComposerAttachmentBadgeProps {
   seq: number;
@@ -38,6 +47,9 @@ export function ComposerAttachmentBadge({
   const hoverTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [src, setSrc] = useState<string | null>(() => (isImage ? getAttachmentPreview(path) ?? null : null));
   const [failed, setFailed] = useState(false);
+  // The local copy is tried first; when the page cannot show it (a policy that blocks blob: images, a codec the webview lacks)
+  // the uploaded file's authenticated download URL is tried once before giving up.
+  const remoteTriedRef = useRef(false);
   const [hover, setHover] = useState<{ left: number; bottom: number } | null>(null);
   const [lightbox, setLightbox] = useState(false);
 
@@ -51,10 +63,27 @@ export function ComposerAttachmentBadge({
     if (!isImage || src || failed) return;
     const local = getAttachmentPreview(path);
     if (local) { setSrc(local); return; }
-    if (!attachmentId || !serverId) { setFailed(true); return; }
+    loadRemoteSource();
+  };
+
+  function loadRemoteSource() {
+    if (!attachmentId || !serverId || remoteTriedRef.current) { setSrc(null); setFailed(true); return; }
+    remoteTriedRef.current = true;
     void buildAttachmentDownloadUrl(serverId, attachmentId, sessionName)
       .then(setSrc)
-      .catch(() => setFailed(true));
+      .catch(() => { setSrc(null); setFailed(true); });
+  }
+
+  // The <img> reported an error for the current source.
+  const onImageError = () => {
+    if (src && src.startsWith('blob:')) {
+      forgetAttachmentPreview(path);
+      setSrc(null);
+      loadRemoteSource();
+      return;
+    }
+    setSrc(null);
+    setFailed(true);
   };
 
   const cancelHover = () => {
@@ -122,28 +151,35 @@ export function ComposerAttachmentBadge({
           title={removing ? t('upload.deleting') : t('common.delete')}
         >×</button>
       </span>
-      {hover && isImage && (
+      {hover && isImage && toBody(
         <div
-          class="attachment-hover-preview"
+          class={`attachment-hover-preview ${ATTACHMENT_PREVIEW_LAYER_CLASS}`}
           role="img"
           aria-label={name}
           style={{ left: `${Math.max(8, hover.left)}px`, bottom: `${hover.bottom}px` }}
         >
           {src
-            ? <img src={src} alt={name} onError={() => setFailed(true)} />
+            ? <img src={src} alt={name} onError={onImageError} />
             : <span class="attachment-hover-preview-state">
               {failed ? t('upload.preview_unavailable') : t('upload.preview_loading')}
             </span>}
           <span class="attachment-hover-preview-caption">#{seq} {name}</span>
-        </div>
+        </div>,
       )}
-      {lightbox && src && (
-        <ImageLightbox src={src} alt={name} fileName={name} onClose={() => setLightbox(false)} />
+      {lightbox && src && toBody(
+        <ImageLightbox
+          src={src}
+          alt={name}
+          fileName={name}
+          onClose={() => setLightbox(false)}
+          onImageError={onImageError}
+          overlayClass={ATTACHMENT_PREVIEW_LAYER_CLASS}
+        />,
       )}
-      {lightbox && !src && (
-        <div class="attachment-lightbox-pending" onClick={() => setLightbox(false)} role="presentation">
+      {lightbox && !src && toBody(
+        <div class={`attachment-lightbox-pending ${ATTACHMENT_PREVIEW_LAYER_CLASS}`} onClick={() => setLightbox(false)} role="presentation">
           <span>{failed ? t('upload.preview_unavailable') : t('upload.preview_loading')}</span>
-        </div>
+        </div>,
       )}
     </>
   );
