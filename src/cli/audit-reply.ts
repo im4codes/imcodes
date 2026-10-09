@@ -8,6 +8,7 @@ import {
 } from '../../shared/peer-audit.js';
 import { resolveLiveHookPort } from '../daemon/hook-port.js';
 import { detectSenderSession } from '../util/detect-session.js';
+import { hookCredentialHeaders } from '../../shared/hook-session-credential.js';
 
 export interface AuditReplyCommandOptions {
   taskId: string;
@@ -43,6 +44,7 @@ async function postAuditReply(
         'Content-Type': 'application/json',
         'Content-Length': Buffer.byteLength(data),
         'x-imcodes-session': sender,
+        ...hookCredentialHeaders(),
       },
     }, (res) => {
       let body = '';

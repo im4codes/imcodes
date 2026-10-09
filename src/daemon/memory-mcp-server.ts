@@ -89,6 +89,7 @@ import {
   PARTICIPANT_TURN_TOOL_REFUSAL,
   isToolAllowedInParticipantTurn,
 } from '../../shared/participant-turn-tool-policy.js';
+import { hookCredentialHeaders } from '../../shared/hook-session-credential.js';
 
 export interface MemoryMcpServerOptions {
   env?: Record<string, string | undefined>;
@@ -526,7 +527,7 @@ export async function postHookSend(
       headers: {
         'Content-Type': 'application/json',
         'Content-Length': Buffer.byteLength(data),
-        ...(senderSessionName ? { 'x-imcodes-session': senderSessionName } : {}),
+        ...(senderSessionName ? { 'x-imcodes-session': senderSessionName, ...hookCredentialHeaders() } : {}),
       },
     }, (res) => {
       let raw = '';

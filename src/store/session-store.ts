@@ -123,6 +123,11 @@ export interface SessionRecord extends SessionContextBootstrapState {
    */
   sessionInstanceId?: string;
   /**
+   * Secret minted at each process launch and handed to that process through its environment so the loopback hook server can verify
+   * the session name a request claims (shared/hook-session-credential.ts). Local-only: never part of any outbound DTO.
+   */
+  hookCredential?: string;
+  /**
    * Identity of the current process/provider authority. It changes when that
    * authority is replaced, while ordinary state/model updates preserve it.
    * Optional only for legacy/read compatibility; authoritative upserts fill it.

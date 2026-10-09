@@ -4,6 +4,7 @@
  * time-bounded form without duplicating the request code.
  */
 import { SEND_COMMAND_FAILURE_KINDS, type SendCommandFailureKind } from '../../shared/send-command-mode.js';
+import { hookCredentialHeaders } from '../../shared/hook-session-credential.js';
 
 export interface HookPostOptions {
   /** Fail the request after this long. Unset: wait indefinitely, as before. */
@@ -44,6 +45,7 @@ export async function postToHookServer(
         headers: {
           'Content-Type': 'application/json',
           'Content-Length': Buffer.byteLength(data),
+          ...hookCredentialHeaders(),
           ...headers,
         },
       },

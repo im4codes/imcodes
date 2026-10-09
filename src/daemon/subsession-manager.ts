@@ -24,6 +24,7 @@ import { closeSingleSession, type CloseFailure, type CloseTreeResult } from '../
 import { emitSessionInlineError } from './session-error.js';
 import { resolveSubSessionCwd } from './subsession-cwd.js';
 import { clearResend } from './transport-resend-queue.js';
+import { hookCredentialEnv, mintHookCredential } from './hook-session-credential.js';
 import { registerTmuxSessionResource, releaseSessionResources, resourceOwnerEnv } from './session-resource-service.js';
 import { markSessionLaunchIdentity } from '../../shared/session-resource-lifecycle.js';
 import { isNativeAgentFenceRequiredForLaunch } from './native-collaboration-guard.js';
@@ -304,9 +305,12 @@ export async function startSubSession(sub: SubSessionRecord): Promise<void> {
   // Resolve CC env preset if specified
   const resourceSessionInstanceId = storedBeforeLaunch?.sessionInstanceId ?? randomUUID();
   const resourceRuntimeEpoch = createRuntimeEpoch();
+  // The pane launched below is always a new process, so it gets a new hook credential.
+  const hookCredential = mintHookCredential();
   const launchEnv: Record<string, string> = {
     IMCODES_SESSION: sessionName,
     ...resourceOwnerEnv({ sessionName, sessionInstanceId: resourceSessionInstanceId, runtimeEpoch: resourceRuntimeEpoch }),
+    ...hookCredentialEnv(hookCredential),
   };
   let presetInitMessage: string | undefined;
   if (sub.ccPreset && agentType === 'claude-code') {
@@ -319,6 +323,7 @@ export async function startSubSession(sub: SubSessionRecord): Promise<void> {
   Object.assign(launchEnv, {
     IMCODES_SESSION: sessionName,
     ...resourceOwnerEnv({ sessionName, sessionInstanceId: resourceSessionInstanceId, runtimeEpoch: resourceRuntimeEpoch }),
+    ...hookCredentialEnv(hookCredential),
   });
 
   await newSession(sessionName, launchCmd, { cwd: sub.cwd ?? undefined, env: launchEnv });
@@ -396,6 +401,7 @@ export async function startSubSession(sub: SubSessionRecord): Promise<void> {
       runtimeEpoch: resourceRuntimeEpoch,
       decidedAt: Date.now(),
     },
+    hookCredential,
     restarts: 0, restartTimestamps: [], createdAt: storedBeforeLaunch?.createdAt ?? Date.now(), updatedAt: Date.now()
   });
   try {

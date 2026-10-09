@@ -14,6 +14,8 @@
  * All hook scripts and plugins read this value at write time.
  */
 import { isLocalHookRequest } from './hook-request-guard.js';
+import { hookClaimAllowed } from './hook-session-credential.js';
+import { HOOK_SESSION_CREDENTIAL_ERROR } from '../../shared/hook-session-credential.js';
 import { TASK_PAIR_ENGINE_HOOK_PATH, TASK_PAIR_LEGACY_TOOL_HOOK_PATH } from '../../shared/task-pair.js';
 import { RETIRED_SUPERVISION_MCP_MESSAGE, RETIRED_SUPERVISION_MCP_TOOL_SET } from '../../shared/memory-mcp-contracts.js';
 import http from 'http';
@@ -965,6 +967,17 @@ export async function startHookServer(
 
     const url = req.url;
 
+    // A name in `x-imcodes-session` is only a claim: a session launched with a hook credential must present it (body `from` claims are
+    // checked the same way on the routes that read one).
+    const claimedHeader = req.headers['x-imcodes-session'];
+    const rejectUnverifiedClaim = (claimed: string | undefined): boolean => {
+      if (hookClaimAllowed(claimed, req.headers)) return false;
+      res.writeHead(403, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: HOOK_SESSION_CREDENTIAL_ERROR }));
+      return true;
+    };
+    if (rejectUnverifiedClaim(Array.isArray(claimedHeader) ? claimedHeader[0] : claimedHeader)) return;
+
     // Owner verification. Unauthenticated on purpose: every local client (the
     // stdio MCP child, `imcodes send`, the peer-audit CLI) must be able to ask
     // "who owns this port?" BEFORE it has any session/server credential. The
@@ -1230,6 +1243,7 @@ export async function startHookServer(
         const body = await readBody(req);
         const parsed = JSON.parse(body) as { from?: string };
         const from = parsed.from || '';
+        if (rejectUnverifiedClaim(from)) return;
         const fromRecord = from ? getSession(from) : null;
         const allSess = listSessions();
         const siblings = (fromRecord
@@ -1263,6 +1277,7 @@ export async function startHookServer(
       try {
         const body = await readBody(req);
         const parsed = JSON.parse(body) as SendRequest;
+        if (rejectUnverifiedClaim(typeof parsed.from === 'string' ? parsed.from : undefined)) return;
         const result = await handleSend(parsed, url === SEND_COMMAND_HOOK_PATH);
         const retryAfterMs = result.status === 429 && typeof result.body.retryAfterMs === 'number' ? result.body.retryAfterMs : undefined;
         res.writeHead(result.status, {

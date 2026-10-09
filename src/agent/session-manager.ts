@@ -53,6 +53,7 @@ import {
   type SessionState,
 } from '../store/session-store.js';
 import { markSessionLaunchIdentity } from '../../shared/session-resource-lifecycle.js';
+import { hookCredentialEnv, mintHookCredential } from '../daemon/hook-session-credential.js';
 import logger from '../util/logger.js';
 import { incrementCounter } from '../util/metrics.js';
 import { mapWithConcurrency } from '../util/concurrency.js';
@@ -1068,6 +1069,8 @@ export async function respawnSession(record: SessionRecord): Promise<boolean> {
 
   // Env injection: on ConPTY (Windows), pass env directly to the PTY spawn so cmd.exe
   // doesn't need to parse POSIX `export` syntax.  On tmux/wezterm, prepend `export` to cmd.
+  // A respawn always starts a new process, so it gets a new hook credential (the old process's copy stops working).
+  const hookCredential = mintHookCredential();
   const mergedEnv: Record<string, string> = {
     ...imcodesStateDirEnv(),
     IMCODES_SESSION: record.name,
@@ -1076,6 +1079,7 @@ export async function respawnSession(record: SessionRecord): Promise<boolean> {
       sessionInstanceId: resourceSessionInstanceId,
       runtimeEpoch: resourceRuntimeEpoch,
     }),
+    ...hookCredentialEnv(hookCredential),
   };
   if (record.ccPreset && record.agentType === 'claude-code') {
     const { resolvePresetEnv } = await import('../daemon/cc-presets.js');
@@ -1104,6 +1108,7 @@ export async function respawnSession(record: SessionRecord): Promise<boolean> {
     state: 'idle',
     sessionInstanceId: resourceSessionInstanceId,
     runtimeEpoch: resourceRuntimeEpoch,
+    hookCredential,
     // The proof names exactly the instance and epoch this process was launched for.
     nativeAgentLaunchFence: {
       fence: processLaunchFence(effectiveRecord.agentType, { nativeAgentsFenced, resumesExistingConversation: true }),
@@ -4042,11 +4047,14 @@ export async function launchSession(opts: LaunchOpts): Promise<void> {
   const resourceSessionInstanceId = storedBeforeLaunch?.sessionInstanceId ?? randomUUID();
   const resourceRuntimeEpoch = !exists ? randomUUID() : storedBeforeLaunch?.runtimeEpoch ?? randomUUID();
   // Inject both the display identity and the exact logical/runtime owner tuple.
+  // Only a pane this call creates receives the new environment; an adopted live pane keeps the process (and credential, if any) it has.
+  const hookCredential = exists ? storedBeforeLaunch?.hookCredential : mintHookCredential();
   const mergedEnv: Record<string, string> = {
     ...extraEnv,
     ...imcodesStateDirEnv(),
     IMCODES_SESSION: name,
     ...resourceOwnerEnv({ sessionName: name, sessionInstanceId: resourceSessionInstanceId, runtimeEpoch: resourceRuntimeEpoch }),
+    ...hookCredentialEnv(hookCredential),
   };
   // A missing tmux pane can be a non-fresh crash restart of the same logical
   // conversation. Only explicit fresh launches or genuinely new records reset
@@ -4160,6 +4168,7 @@ export async function launchSession(opts: LaunchOpts): Promise<void> {
       name,
       sessionInstanceId: resourceSessionInstanceId,
       runtimeEpoch: resourceRuntimeEpoch,
+      ...(hookCredential ? { hookCredential } : {}),
       projectName,
       role,
       agentType,
@@ -4201,6 +4210,7 @@ export async function launchSession(opts: LaunchOpts): Promise<void> {
         ...existing,
         sessionInstanceId: resourceSessionInstanceId,
         runtimeEpoch: resourceRuntimeEpoch,
+        ...(hookCredential ? { hookCredential } : {}),
         ...(paneId ? { paneId } : {}),
         ...(ccSessionId ? { ccSessionId } : {}),
         ...(codexSessionId ? { codexSessionId } : {}),
