@@ -7080,6 +7080,74 @@ ${PREFERENCE_CONTEXT_END}`;
     expect(String(resentPayload.assembledMessage)).not.toContain('Shared User');
   });
 
+  /**
+   * tsk_9a8c291594 -- the origin of a turn is the WEAKEST sender among every message that fed it. A participant's message that is
+   * appended natively into a running owner turn feeds that turn: from then on exec / file / computer-use are participant-origin.
+   */
+  describe('turn origin: the weakest sender among all messages that fed the current turn', () => {
+    const participantSend = (id: string) => runtime.send(`participant says ${id}`, id, undefined, undefined, {
+      sharedActor: sharedActorFixture,
+      sharedMachineAuthority: 'PARTICIPANT_TOKEN',
+    });
+    const enableNativeAppend = () => {
+      mock.provider.capabilities.activeDelegationNotification = AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE;
+      mock.provider.notifyActiveDelegation = vi.fn().mockResolvedValue(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+    };
+
+    it('an owner turn stays owner-origin until a participant message is appended into it, and is then participant-origin with no authority to borrow', async () => {
+      enableNativeAppend();
+      runtime.send('owner work', 'owner-turn');
+      await flushDispatch();
+      expect(runtime.requiresSharedMachineAuthority()).toBe(false);
+      expect(participantSend('p-append')).toBe('queued');
+      // Queued behind the running turn: still a SEPARATE turn, the running one is untouched.
+      expect(runtime.requiresSharedMachineAuthority()).toBe(false);
+
+      const result = await runtime.appendPendingMessagesToActiveTurn(['p-append'], 'append-origin-1');
+      expect(result.status).toBe('delivered');
+      expect(runtime.requiresSharedMachineAuthority()).toBe(true);
+      // The owner entry has no participant token: a mixed turn borrows nobody's authority (fail closed).
+      expect(runtime.getActiveSharedMachineAuthority()).toBeNull();
+    });
+
+    it('a participant turn that an owner message is appended into stays participant-origin', async () => {
+      enableNativeAppend();
+      participantSend('p-first');
+      await flushDispatch();
+      expect(runtime.requiresSharedMachineAuthority()).toBe(true);
+      expect(runtime.getActiveSharedMachineAuthority()).toBe('PARTICIPANT_TOKEN');
+      runtime.send('owner adds', 'owner-append');
+      await runtime.appendPendingMessagesToActiveTurn(['owner-append'], 'append-origin-2');
+      expect(runtime.requiresSharedMachineAuthority()).toBe(true);
+      expect(runtime.getActiveSharedMachineAuthority()).toBeNull();
+    });
+
+    it('the taint ends with the turn: the next owner turn is owner-origin again', async () => {
+      enableNativeAppend();
+      runtime.send('owner work', 'owner-turn-2');
+      await flushDispatch();
+      participantSend('p-append-2');
+      await runtime.appendPendingMessagesToActiveTurn(['p-append-2'], 'append-origin-3');
+      expect(runtime.requiresSharedMachineAuthority()).toBe(true);
+      mock.fireComplete('sess-1');
+      runtime.send('fresh owner turn', 'owner-turn-3');
+      await flushDispatch();
+      expect(runtime.requiresSharedMachineAuthority()).toBe(false);
+      expect(runtime.getActiveSharedMachineAuthority()).toBeNull();
+    });
+
+    it('owner and participant messages merged into one drained turn are participant-origin with no authority', async () => {
+      runtime.send('first', 'first');
+      await flushDispatch();
+      runtime.send('owner queued', 'owner-queued');
+      participantSend('p-queued');
+      mock.fireComplete('sess-1');
+      await flushDispatch();
+      expect(runtime.requiresSharedMachineAuthority()).toBe(true);
+      expect(runtime.getActiveSharedMachineAuthority()).toBeNull();
+    });
+  });
+
   it('T5b (N1 contract): synchronous re-entrant runtime.send from onDrain listener queues into pending, never starts a parallel turn', async () => {
     runtime.send('first', 'cmd-first');
     await waitForProviderSendCount(mock.provider, 1);

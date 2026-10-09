@@ -243,6 +243,44 @@ describe('a turn that a share participant started never executes', () => {
   });
 });
 
+describe('token rows: another target, a replayed token', () => {
+  it('a participant token is not a key to every device: a node the participant cannot reach themselves stays closed (view too)', async () => {
+    const otherNode = `n2_${tag}`;
+    await createServer(db, otherNode, actors.owner!.userId, 'second-node', sha(hex(8)), undefined, NODE_ROLE.CONTROLLED);
+    await db.execute('UPDATE servers SET exec_enabled = true WHERE id = $1', [otherNode]);
+    // pNo is a participant on the FIRST node only. Same token, other target:
+    const sessionName = `deck_proj_${hex(2)}`;
+    await db.execute(
+      `INSERT INTO sessions (id, server_id, name, project_name, role, agent_type, project_dir, state, created_at, updated_at)
+       VALUES ($1,$2,$3,'proj','brain','claude-code','/tmp','idle',$4,$4)`,
+      [hex(8), actors.owner!.serverId, sessionName, Date.now()],
+    );
+    await db.execute(
+      `INSERT INTO session_shares (id, server_id, session_name, target_user_id, role, created_by, created_at, updated_at)
+       VALUES ($1,$2,$3,$4,'participant',$5,$6,$6)`,
+      [hex(8), actors.owner!.serverId, sessionName, actors.pNo!.userId, actors.owner!.userId, Date.now()],
+    );
+    const token = issueSharedMachineAuthority({
+      type: SHARED_MACHINE_AUTHORITY_TYPE, sub: actors.pNo!.userId, sourceServerId: actors.owner!.serverId, sessionName,
+      projectName: 'proj', shareTarget: { kind: 'main', serverId: actors.owner!.serverId, sessionName }, actionId: hex(4),
+    } as never, KEY);
+    const headers = { [SHARED_MACHINE_AUTHORITY_HEADER]: token };
+    const viewOn = (target: string) => execApp().request(`/api/machine/computer-use?serverId=${target}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'X-Server-Id': actors.owner!.serverId, authorization: `Bearer ${actors.owner!.token}`, ...headers },
+      body: JSON.stringify({ tool: 'list_apps', arguments: {} }),
+    });
+    expect((await viewOn(nodeId)).status).toBe(200);
+    expect((await viewOn(otherNode)).status).toBe(403);
+
+    // A replayed token is only an authenticated context: when the share behind it ends, it stops working on the next action.
+    await db.execute('UPDATE session_shares SET revoked_at = $2 WHERE server_id = $1 AND session_name = $3', [actors.owner!.serverId, Date.now(), sessionName]);
+    expect((await viewOn(nodeId)).status).toBe(403);
+    // Replaying it can never raise authority: it is participant-origin, so exec is refused even before the share ends.
+    expect((await EXEC(actors.owner!, headers)).status).toBe(403);
+  });
+});
+
 describe('the exec switch and the kill switch', () => {
   it('a device with exec off runs nothing for anyone, the owner included, and nothing reaches the node', async () => {
     await db.execute('UPDATE servers SET exec_enabled = false WHERE id = $1', [nodeId]);

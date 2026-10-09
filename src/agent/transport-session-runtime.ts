@@ -659,6 +659,17 @@ export class TransportSessionRuntime implements SessionRuntime {
   private _pendingVersion = 0;
   /** Original message entries for the currently in-flight dispatch. */
   private _activeDispatchEntries: PendingTransportMessage[] = [];
+  /**
+   * Messages that were appended natively INTO the running turn after it was dispatched (the provider's active-turn append). They are not
+   * dispatch entries, but they feed the turn: its origin is the weakest sender among everything that fed it, so a participant's message
+   * appended into an owner turn makes the rest of that turn participant-origin. Valid only for the dispatch (or, with no dispatch id, the
+   * turn) they were appended into; a new turn starts clean.
+   */
+  private _appendedTurnOrigins: {
+    dispatchId: number | null;
+    turn: unknown;
+    entries: Array<Pick<PendingTransportMessage, 'sharedActor' | 'sharedMachineAuthority'>>;
+  } | null = null;
   /** Last single-message turn that reached provider completion. Consumed by
    * the authoritative idle projection; never inferred from timeline order. */
   private _lastCompletedTurn: PeerAuditCompletedTurnEvidence | null = null;
@@ -1338,16 +1349,38 @@ export class TransportSessionRuntime implements SessionRuntime {
   /** Snapshot of active entries for internal resend preservation, including idempotency markers. */
   get activeDispatchEntriesForResend(): PendingTransportMessage[] { return this._activeDispatchEntries.map((entry) => ({ ...entry })); }
 
+  /**
+   * Every message that fed the CURRENT turn: the dispatched entries and whatever was appended into the running turn since. The turn's
+   * origin class is the weakest of them (a participant anywhere makes it participant-origin).
+   */
+  private turnOriginEntries(): Array<Pick<PendingTransportMessage, 'sharedActor' | 'sharedMachineAuthority'>> {
+    const appended = this._appendedTurnOrigins;
+    const stillSameTurn = appended !== null && (
+      appended.dispatchId !== null
+        ? appended.dispatchId === this._activeDispatchId
+        : appended.turn !== null && appended.turn === this._activeTurn
+    );
+    return stillSameTurn ? [...this._activeDispatchEntries, ...appended.entries] : this._activeDispatchEntries;
+  }
+
   /** Opaque authority for the active turn only; ambiguity fails closed. */
   getActiveSharedMachineAuthority(): string | null {
-    if (this._activeDispatchEntries.length === 0
-      || this._activeDispatchEntries.some((entry) => !entry.sharedMachineAuthority)) return null;
-    const tokens = new Set(this._activeDispatchEntries.map((entry) => entry.sharedMachineAuthority!));
+    const origins = this.turnOriginEntries();
+    if (origins.length === 0 || origins.some((entry) => !entry.sharedMachineAuthority)) return null;
+    const tokens = new Set(origins.map((entry) => entry.sharedMachineAuthority!));
     return tokens.size === 1 ? [...tokens][0]! : null;
   }
 
   requiresSharedMachineAuthority(): boolean {
-    return this._activeDispatchEntries.some((entry) => entry.sharedActor?.effectiveActorRole === 'participant');
+    return this.turnOriginEntries().some((entry) => entry.sharedActor?.effectiveActorRole === 'participant');
+  }
+
+  /** The participant users that fed the current turn (for stamping what this turn sends onward). */
+  activeTurnParticipantUserIds(): string[] {
+    return [...new Set(this.turnOriginEntries()
+      .filter((entry) => entry.sharedActor?.effectiveActorRole === 'participant')
+      .map((entry) => entry.sharedActor!.actorUserId)
+      .filter((id) => typeof id === 'string' && id))];
   }
 
   getDiagnosticSnapshot(nowMs: number = Date.now()): TransportRuntimeDiagnosticSnapshot {
@@ -3248,6 +3281,28 @@ export class TransportSessionRuntime implements SessionRuntime {
         if (this.hasLocalDispatchInFlight()) return { status: 'deferred' };
       }
       return { status: 'stale' };
+    }
+
+    // The provider took these messages INTO the running turn: record who spoke, so the turn's origin includes them from now on.
+    {
+      const appended = this._appendedTurnOrigins;
+      const sameTurn = appended !== null && (
+        appended.dispatchId !== null
+          ? appended.dispatchId === this._activeDispatchId
+          : appended.turn !== null && appended.turn === this._activeTurn
+      );
+      const kept = sameTurn ? appended.entries : [];
+      this._appendedTurnOrigins = {
+        dispatchId: this._activeDispatchId,
+        turn: this._activeTurn,
+        entries: [
+          ...kept,
+          ...selected.map((entry) => ({
+            ...(entry.sharedActor ? { sharedActor: entry.sharedActor } : {}),
+            ...(entry.sharedMachineAuthority ? { sharedMachineAuthority: entry.sharedMachineAuthority } : {}),
+          })),
+        ],
+      };
     }
 
     // Provider acceptance is irreversible, but queue finalization/history

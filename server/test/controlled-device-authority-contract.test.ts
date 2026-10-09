@@ -68,15 +68,18 @@ describe('controlled-device centralized authority contract', () => {
     expect(handler).not.toMatch(/servers\.user_id\s*=|\bAND\s+user_id\s*=/);
   });
 
-  it('the exec switch and the exec audit are the DEVICE OWNER\'s alone (a participant or group admin cannot re-enable or read them)', () => {
+  it('device management is the OWNER\'s alone: only the display name may be passed the wider \'rename\' scope', () => {
     const routes = source('../src/routes/machines.ts');
-    for (const marker of ["machinesRoutes.post('/:serverId/exec-enabled'", "machinesRoutes.get('/:serverId/exec-audit'"]) {
-      const start = routes.indexOf(marker);
-      expect(start, marker).toBeGreaterThanOrEqual(0);
-      const handler = routes.slice(start, start + 1800);
-      expect(handler, marker).toContain('resolveControlledMachineManagementAccess');
-      expect(handler, marker).toContain('MACHINE_ACCESS_SOURCE.OWNER');
-    }
+    const calls = [...routes.matchAll(/resolveControlledMachineManagementAccess\(([^;]*);/g)].map((m) => m[1]!);
+    // Every management call is owner-only (no scope argument) except exactly one: the label.
+    expect(calls.filter((args) => args.includes("'rename'"))).toHaveLength(1);
+    const displayName = routes.slice(routes.indexOf("machinesRoutes.post('/:serverId/display-name'"), routes.indexOf("machinesRoutes.post('/:serverId/upgrade'"));
+    expect(displayName).toContain("'rename'");
+    const machineAccess = source('../src/share/machine-access.ts');
+    // The explicit-share-participant branch of the resolver is gone.
+    const resolver = machineAccess.slice(machineAccess.indexOf('export async function resolveControlledMachineManagementAccess'), machineAccess.indexOf('export async function resolveRemoteDesktopHostAccess') > 0 ? machineAccess.indexOf('export async function resolveRemoteDesktopHostAccess') : undefined);
+    expect(resolver).not.toContain('server_shares');
+    expect(resolver).not.toMatch(/role = 'participant'/);
   });
 
   it('every execute-class entry point goes through the one gate (admission + audit + rate limit) with an explicit action', () => {

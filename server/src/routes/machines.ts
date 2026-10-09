@@ -6,7 +6,7 @@ import { requireAuth } from '../security/authorization.js';
 import { logAudit } from '../security/audit.js';
 import { WsBridge } from '../ws/bridge.js';
 import { abandonAllForTarget } from '../ws/machine-exec-registry.js';
-import { MACHINE_ACCESS_SOURCE, MACHINE_ACTION, evaluateMachineAction, type MachineAccessSource } from '../../../shared/machine-access-policy.js';
+import { MACHINE_ACTION, evaluateMachineAction, type MachineAccessSource } from '../../../shared/machine-access-policy.js';
 import { listMachineActionAudit } from '../security/machine-exec-audit.js';
 import {
   NODE_ROLE,
@@ -326,7 +326,8 @@ machinesRoutes.post('/:serverId/display-name', requireAuth(), async (c) => {
   if (!parsed.success) return c.json({ error: 'invalid_body' }, 400);
   const displayName = normalizeMachineDisplayName(parsed.data.displayName);
   if (!displayName) return c.json({ error: MACHINE_REASONS.INVALID_DISPLAY_NAME }, 400);
-  const access = await resolveControlledMachineManagementAccess(c.env.DB, userId, serverId, Date.now());
+  // The label only: the owner and a group owner/admin (see ControlledMachineManagementScope).
+  const access = await resolveControlledMachineManagementAccess(c.env.DB, userId, serverId, Date.now(), 'rename');
   if (!access) return c.json({ error: 'not_found' }, 404);
 
   const row = await c.env.DB.queryOne<{ previous_name: string | null }>(
@@ -554,8 +555,8 @@ machinesRoutes.post('/:serverId/revoke', requireAuth(), async (c) => {
 
 // POST /api/machines/:serverId/exec-enabled — the OWNER's exec switch (D-E exec gate) for one device.
 //
-// Management by a group owner/admin or an explicit participant covers rename, upgrade and the rest; the switch that lets commands run
-// as SYSTEM/root is the device owner's alone. Otherwise a participant could re-enable exec the owner had turned off.
+// Owner-only (resolveControlledMachineManagementAccess default scope): the switch that lets commands run as SYSTEM/root is the device
+// owner's alone. A participant could otherwise re-enable exec the owner had turned off.
 machinesRoutes.post('/:serverId/exec-enabled', requireAuth(), async (c) => {
   const userId = c.get('userId' as never) as string;
   const serverId = c.req.param('serverId');
@@ -565,9 +566,6 @@ machinesRoutes.post('/:serverId/exec-enabled', requireAuth(), async (c) => {
   if (!parsed.success) return c.json({ error: 'invalid_body' }, 400);
   const access = await resolveControlledMachineManagementAccess(c.env.DB, userId, serverId, Date.now());
   if (!access) return c.json({ error: 'not_found' }, 404);
-  if (access.access_source !== MACHINE_ACCESS_SOURCE.OWNER) {
-    return c.json({ error: 'forbidden', reason: 'owner_only' }, 403);
-  }
   // Capture the prior value so the audit records from → to (enabling exec is a
   // high-privilege action that gates SYSTEM/root RCE and MUST be attributable).
   const row = await c.env.DB.queryOne<{ was: boolean }>(
@@ -635,7 +633,6 @@ machinesRoutes.get('/:serverId/exec-audit', requireAuth(), async (c) => {
   if (!serverId) return c.json({ error: 'invalid_request' }, 400);
   const access = await resolveControlledMachineManagementAccess(c.env.DB, userId, serverId, Date.now());
   if (!access) return c.json({ error: 'not_found' }, 404);
-  if (access.access_source !== MACHINE_ACCESS_SOURCE.OWNER) return c.json({ error: 'forbidden', reason: 'owner_only' }, 403);
   const limitRaw = Number(c.req.query('limit') ?? 50);
   const limit = Number.isInteger(limitRaw) ? Math.min(Math.max(limitRaw, 1), 200) : 50;
   const beforeRaw = c.req.query('before');

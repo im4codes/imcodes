@@ -28,10 +28,12 @@ export function readSenderParticipantTurn(senderSessionName: string | null | und
   if (runtime) {
     // Every real runtime has these; a runtime-shaped stand-in that lacks them reads as an owner turn instead of failing the send.
     if (!runtime.requiresSharedMachineAuthority?.()) return null;
-    const actors = new Set((runtime.activeDispatchEntries ?? [])
-      .filter((entry) => entry.sharedActor?.effectiveActorRole === 'participant')
-      .map((entry) => entry.sharedActor!.actorUserId)
-      .filter((id) => typeof id === 'string' && id));
+    // Everything that fed the current turn counts, including a participant's message appended into a running owner turn.
+    const actors = new Set(runtime.activeTurnParticipantUserIds?.()
+      ?? (runtime.activeDispatchEntries ?? [])
+        .filter((entry) => entry.sharedActor?.effectiveActorRole === 'participant')
+        .map((entry) => entry.sharedActor!.actorUserId)
+        .filter((id) => typeof id === 'string' && id));
     return {
       actorUserId: actors.size === 1 ? [...actors][0]! : AMBIGUOUS_PARTICIPANT_ACTOR,
       authority: runtime.getActiveSharedMachineAuthority?.() ?? null,

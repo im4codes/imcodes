@@ -277,7 +277,11 @@ export async function dispatchSessionMessage(
   // ordinary FIFO waiting must opt into `deliveryMode=queue`; keeping the
   // normalization at this runtime-neutral boundary prevents task-pair,
   // cron, relay, and named-send paths from silently reverting to FIFO.
-  const deliveryMode = options.deliveryMode ?? MEMORY_MCP_SEND_DELIVERY_MODES.APPEND;
+  // A participant-stamped message is a turn of its own: appending it into a turn that is already running would blend a participant's
+  // words into somebody else's turn (the turn's origin is the weakest sender among everything that fed it).
+  const deliveryMode = options.sharedActor?.effectiveActorRole === 'participant'
+    ? MEMORY_MCP_SEND_DELIVERY_MODES.QUEUE
+    : (options.deliveryMode ?? MEMORY_MCP_SEND_DELIVERY_MODES.APPEND);
   if ((target.runtimeType ?? getSessionRuntimeType(target.agentType)) === 'transport') {
     // `/clear` is daemon-managed: a fresh provider conversation, exactly as
     // from the browser. Handing it to runtime.send made it ordinary model text

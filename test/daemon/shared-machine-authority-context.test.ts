@@ -228,3 +228,36 @@ describe('process shared machine authority context', () => {
     });
   });
 });
+
+/**
+ * tsk_9a8c291594 — the origin of a turn is the WEAKEST sender among everything that fed it; exec / file / computer-use are execute-class
+ * and a participant anywhere in the chain makes them unavailable (the server refuses them again at admission).
+ */
+describe('process session: origin chain rows', () => {
+  beforeEach(() => clearProcessSharedMachineAuthoritiesForTests());
+
+  it('owner then participant in one turn: participant-origin, no authority to borrow', () => {
+    bindProcessSharedMachineActivity(SESSION, identity, owner, { now: 1_000, sessionRunning: true });
+    bindProcessSharedMachineActivity(SESSION, identity, participant('p-1', 'TOKEN'), { now: 2_000, sessionRunning: true });
+    expect(readProcessSharedMachineAuthority(SESSION, identity, 3_000, true)).toEqual(CLOSED);
+  });
+
+  it('participant queued while an owner turn is running: the window is participant-origin from that input on, never owner-open', () => {
+    bindProcessSharedMachineActivity(SESSION, identity, owner, { now: 1_000, sessionRunning: false });
+    expect(readProcessSharedMachineAuthority(SESSION, identity, 1_500, true)).toEqual(OPEN);
+    bindProcessSharedMachineActivity(SESSION, identity, participant('p-1', 'TOKEN'), { now: 2_000, sessionRunning: true });
+    expect(readProcessSharedMachineAuthority(SESSION, identity, 2_500, true).required).toBe(true);
+  });
+
+  it('a participant\'s token alone is borrowed only by that participant\'s turn; a second participant closes it', () => {
+    bindProcessSharedMachineActivity(SESSION, identity, participant('p-1', 'TOKEN-1'), { now: 1_000 });
+    expect(readProcessSharedMachineAuthority(SESSION, identity, 1_500, true)).toEqual({ required: true, authority: 'TOKEN-1' });
+    bindProcessSharedMachineActivity(SESSION, identity, participant('p-2', 'TOKEN-2'), { now: 2_000 });
+    expect(readProcessSharedMachineAuthority(SESSION, identity, 2_500, true)).toEqual(CLOSED);
+  });
+
+  it('a forged or stale runtime identity never reads an open window', () => {
+    bindProcessSharedMachineActivity(SESSION, identity, participant('p-1', 'TOKEN'), { now: 1_000 });
+    expect(readProcessSharedMachineAuthority(SESSION, { sessionInstanceId: 'other', runtimeEpoch: 'epoch-1' }, 1_500, true)).toEqual(CLOSED);
+  });
+});

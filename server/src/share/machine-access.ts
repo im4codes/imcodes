@@ -195,36 +195,37 @@ export async function resolveControlledMachineOperatorAccess(
 }
 
 /**
- * Management authority remains narrower than group visibility/operation.
- * Owners, group owners/admins, and explicitly delegated Participants retain
- * the existing mutation surface; an ordinary group member can use a device
- * but cannot rename, revoke, toggle SYSTEM exec, or change its worker.
+ * Management authority: who may change the device itself (not use it).
+ *
+ *   `owner` (default)  the device OWNER only. Everything that changes the device's security or availability -- revoke the node's
+ *                      credential, switch SYSTEM exec on or off, force a node upgrade, install the remote-desktop worker, store the
+ *                      sign-in (auto-unlock) secret, ask for screen-recording permission, read the exec audit, grant execute -- is
+ *                      the owner's alone. A share participant (who may operate, and execute with the owner's grant) and a group member
+ *                      or group admin (who may operate) can NOT: they could otherwise re-enable exec the owner switched off, revoke the
+ *                      credential and take the node offline, or push an upgrade.
+ *   `rename`           the owner and a group owner/admin, for the display name only (a label, not a capability).
+ *
+ * There is deliberately no branch for an explicit share participant: "can operate" never meant "can manage".
  */
+export type ControlledMachineManagementScope = 'owner' | 'rename';
+
 export async function resolveControlledMachineManagementAccess(
   db: Database,
   userId: string,
   serverId: string,
   now: number,
+  scope: ControlledMachineManagementScope = 'owner',
 ): Promise<ControlledMachineOperatorAccessRow | null> {
   const access = await resolveControlledMachineOperatorAccess(db, userId, serverId, now);
   if (!access) return null;
-  if (access.access_role === 'owner') return access;
+  if (access.access_role === 'owner' && access.access_source === 'owner') return access;
+  if (scope !== 'rename') return null;
   const manager = await db.queryOne<{ present: number }>(
     `SELECT 1 AS present FROM servers s
       WHERE s.id = $1
-        AND (
-          ${CAN_MANAGE_A_MACHINE_GROUP}
-          OR EXISTS (
-            SELECT 1 FROM server_shares sh
-             WHERE sh.server_id = s.id
-               AND sh.target_user_id = $2
-               AND sh.role = 'participant'
-               AND sh.revoked_at IS NULL
-               AND (sh.expires_at IS NULL OR sh.expires_at > $3)
-          )
-        )
+        AND ${CAN_MANAGE_A_MACHINE_GROUP}
       LIMIT 1`,
-    [serverId, userId, now],
+    [serverId, userId],
   );
   return manager ? access : null;
 }
