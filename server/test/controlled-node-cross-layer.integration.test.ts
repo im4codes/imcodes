@@ -3,6 +3,7 @@
  * Bridge validator -> generation-bound registry -> real machine-exec HTTP route
  * -> bounded daemon decoder -> real MCP SDK tools/list + tools/call.
  */
+import { mcpToolPayload } from '../../test/helpers/mcp-tool-result.js';
 import { EventEmitter } from 'node:events';
 import { createHash, randomBytes } from 'node:crypto';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
@@ -215,6 +216,7 @@ async function connectMcp(deps: MachineToolDeps): Promise<Client> {
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   const client = new Client({ name: 'cross-layer-client', version: '1.0.0' });
   await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+  await client.listTools(); // Hydrate real SDK output validators before every typed call.
   return client;
 }
 
@@ -383,13 +385,13 @@ describe('controlled-node cross-layer product path', () => {
     try {
       const exec = await callExec(client, 'nonzero');
       expect(exec.isError).toBe(true);
-      expect(exec.structuredContent).toMatchObject({ status: 'error', reason: MCP_ERROR_REASONS.EXEC_OFFLINE });
+      expect(mcpToolPayload(exec)).toMatchObject({ status: 'error', reason: MCP_ERROR_REASONS.EXEC_OFFLINE });
       const computer = await client.callTool({
         name: MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_CALL,
         arguments: { machine: target.nodeId, tool: 'list_apps' },
       });
       expect(computer.isError).toBe(true);
-      expect(computer.structuredContent).toMatchObject({ status: 'error', reason: MCP_ERROR_REASONS.EXEC_OFFLINE });
+      expect(mcpToolPayload(computer)).toMatchObject({ status: 'error', reason: MCP_ERROR_REASONS.EXEC_OFFLINE });
     } finally {
       socket.readyState = 1;
       await client.close();
@@ -451,7 +453,7 @@ describe('controlled-node cross-layer product path', () => {
     const client = await connectMcp(machineDeps({ token: 'wrong-token' }));
     const result = await callExec(client, 'nonzero');
     expect(result.isError).toBe(true);
-    expect(result.structuredContent).toMatchObject({ status: 'error', reason: MCP_ERROR_REASONS.IDENTITY_REJECTED });
+    expect(mcpToolPayload(result)).toMatchObject({ status: 'error', reason: MCP_ERROR_REASONS.IDENTITY_REJECTED });
     await client.close();
   });
 
@@ -462,7 +464,7 @@ describe('controlled-node cross-layer product path', () => {
     const client = await connectMcp(machineDeps(options));
     const result = await callExec(client, 'nonzero');
     expect(result.isError).toBe(true);
-    expect(result.structuredContent).toMatchObject({ status: 'error', reason });
+    expect(mcpToolPayload(result)).toMatchObject({ status: 'error', reason });
     await client.close();
   });
 });

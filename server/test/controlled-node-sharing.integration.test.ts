@@ -1,3 +1,4 @@
+import { mcpToolPayload } from '../../test/helpers/mcp-tool-result.js';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { createHash, randomBytes } from 'node:crypto';
 import { EventEmitter } from 'node:events';
@@ -508,6 +509,7 @@ describe('controlled-node shared action admission', () => {
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
     const mcpClient = new Client({ name: 'shared-local-authority-client', version: '1.0.0' });
     await Promise.all([mcpServer.connect(serverTransport), mcpClient.connect(clientTransport)]);
+    await mcpClient.listTools(); // Hydrate real SDK output validators before every typed call.
     const callLocal = () => mcpClient.callTool({
       name: MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_CALL,
       arguments: { machine: 'local', tool: 'list_apps' },
@@ -598,7 +600,7 @@ describe('controlled-node shared action admission', () => {
     })).status).toBe(403);
     const downgradedLocal = await callLocal();
     expect(downgradedLocal.isError).toBe(true);
-    expect(downgradedLocal.structuredContent).toMatchObject({
+    expect(mcpToolPayload(downgradedLocal)).toMatchObject({
       status: 'error', reason: 'control_plane_unavailable',
     });
     expect(localComputerUse, 'role changed after admission must stop before the local bridge')
@@ -628,7 +630,7 @@ describe('controlled-node shared action admission', () => {
     callerIdentity = { ...runtimeIdentity, runtimeEpoch: `${runtimeIdentity.runtimeEpoch}-stale` };
     const staleRuntimeLocal = await callLocal();
     expect(staleRuntimeLocal.isError).toBe(true);
-    expect(staleRuntimeLocal.structuredContent).toMatchObject({
+    expect(mcpToolPayload(staleRuntimeLocal)).toMatchObject({
       status: 'error', reason: 'internal_error', message: 'shared_machine_authority_unavailable',
     });
     expect(localComputerUse).toHaveBeenCalledTimes(1);
