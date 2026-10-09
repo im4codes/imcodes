@@ -804,8 +804,10 @@ export class TaskPairAutomation implements TaskPairScheduler {
         try {
           await ensureTaskPairWorkspaceAvailable(stored.project, stored.state.taskId);
           await refreshTaskPairWorkspaceHead(stored.project, stored.state.taskId);
-          const externallyRecovered = await this.#detectExternalParticipantRestart(stored);
-          const recovered = externallyRecovered || await this.#recoverParticipant(stored, now);
+          // A participant that is not a session at all cannot be nudged, restarted or recovered: Brain is told its name instead.
+          const missingParticipant = this.#reportMissingParticipants(stored);
+          const externallyRecovered = !missingParticipant && await this.#detectExternalParticipantRestart(stored);
+          const recovered = missingParticipant || externallyRecovered || await this.#recoverParticipant(stored, now);
           if (!recovered) {
             this.#checkEscalatedExecutor(stored, now);
             // The follow-up reminder updates liveness immediately; refresh the
@@ -815,7 +817,7 @@ export class TaskPairAutomation implements TaskPairScheduler {
             await this.#tickPair(afterEscalation, now);
           }
           const current = store.getPair(stored.project, stored.state.taskId) ?? stored;
-          await this.#checkStageStall(current, now);
+          if (!missingParticipant) await this.#checkStageStall(current, now);
         } catch (error) {
           logger.warn({ err: error, taskId: stored.state.taskId }, 'task-pair: pair tick failed');
         }
@@ -2148,6 +2150,27 @@ export class TaskPairAutomation implements TaskPairScheduler {
       && candidate.state.workspace.status === 'active'
       && resolvePath(candidate.state.workspace.nonGit.projectRoot) === root
     ));
+  }
+
+  /**
+   * The integrity check of an open pair: every assigned session must exist in the session store. A pair pointing at a name that is not
+   * a session (it was removed, or never survived creation) is told to Brain once per missing name, naming it and saying what to do;
+   * the pair is left as is for Brain to reassign or cancel. Returns true when a participant is missing.
+   */
+  #reportMissingParticipants(stored: StoredTaskPair): boolean {
+    const pair = stored.state;
+    if (!TASK_PAIR_OPEN_STATUSES.includes(pair.status)) return false;
+    let missing = false;
+    for (const [role, name] of [['executor', pair.executor], ['auditor', pair.auditor]] as const) {
+      if (!name || name === TASK_PAIR_NO_AUDITOR || getSession(name)) continue;
+      missing = true;
+      this.#flagOnceWithKey(
+        getTaskPairStore().getPair(stored.project, pair.taskId) ?? stored,
+        `missing_session:${name}`,
+        `The ${role} session ${name} of pair ${pair.taskId} does not exist (it was removed or never started), so nothing can reach it. Reassign the ${role} with pair_reassign (or cancel the pair with pair_close action=cancel).`,
+      );
+    }
+    return missing;
   }
 
   #flagOnceWithKey(stored: StoredTaskPair, key: string, text: string): void {

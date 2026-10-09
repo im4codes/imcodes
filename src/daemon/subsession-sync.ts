@@ -169,3 +169,29 @@ export async function sendSubSessionSync(
   if (!payload) return;
   serverLink.send(payload);
 }
+
+/** What `announceSubSession` achieved. `no_link`: nothing was sent (no server link, or its socket is not open); the reconnect resync covers it. */
+export type SubSessionAnnounceOutcome = 'announced' | 'no_link' | 'failed';
+
+/**
+ * Tell the server (and through it every browser) that a sub-session the daemon launched on its own exists: the server learns of a
+ * daemon-created sub-session only through `subsession.sync`, which it turns into the `sub_sessions` row and `subsession.created`.
+ * Unlike `sendSubSessionSync` this reports whether the message actually left: a dropped send is `no_link`, and a record that cannot
+ * be described (no agentType) is `failed`.
+ */
+export async function announceSubSession(
+  link: { send(msg: object): void; trySend?(msg: unknown): boolean; isConnected?(): boolean } | null,
+  id: string,
+): Promise<SubSessionAnnounceOutcome> {
+  if (!link || (link.isConnected && !link.isConnected())) return 'no_link';
+  const payload = await buildSubSessionSyncPayload(id);
+  if (!payload) return 'failed';
+  try {
+    if (link.trySend) return link.trySend(payload) ? 'announced' : 'no_link';
+    link.send(payload);
+    return 'announced';
+  } catch (error) {
+    logger.warn({ err: error, id }, 'subsession announce: send failed');
+    return 'no_link';
+  }
+}

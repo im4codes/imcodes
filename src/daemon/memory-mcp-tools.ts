@@ -4,8 +4,10 @@ import { emitTaskPairDaemonEvent, taskPairService } from './task-pairs/service.j
 import { isPairsEngineProject, projectBrainSession, projectOfSession, resolveTaskPairMaxConcurrency } from './task-pairs/engine.js';
 import { taskPairAutomation } from './task-pairs/scheduler.js';
 import { describeExecutionSelection } from './task-pairs/pool.js';
-import { ensurePairSessions, type PairSessionCreateSpec } from './task-pairs/session-creation.js';
+import { discardCreatedPairSessions, ensurePairSessions, type PairSessionCreateSpec } from './task-pairs/session-creation.js';
+import { pairSessionNotLiveReason } from './supervision-auto-provision.js';
 import { runExclusive } from '../util/keyed-mutex.js';
+import logger from '../util/logger.js';
 import { randomUUID } from 'node:crypto';
 import { parseTaskPairChecklist, taskPairChecklistCounts, updateTaskPairChecklist } from '../../shared/task-pair-checklist.js';
 import { isTerminalTaskPairStatus, TASK_PAIR_CREATE_REQUIRED_MESSAGE, TASK_PAIR_MCP_DELIVERY_EVENT, TASK_PAIR_MCP_DISPATCH_EVENT, TASK_PAIR_NO_AUDITOR, taskPairRoleOf } from '../../shared/task-pair.js';
@@ -1760,6 +1762,50 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       waitingReason: state.flags.includes('waiting_for_capacity') ? (state.capacityWaitReason ?? null) : null,
     };
   };
+  /** The pair's assigned sessions that are not a live participant right now (missing from the store, stopped, errored, no runtime), by name. */
+  const pairParticipantsNotLive = (state: { executor?: string; auditor?: string }): Array<{ role: 'executor' | 'auditor'; session: string; problem: string }> => {
+    const problems: Array<{ role: 'executor' | 'auditor'; session: string; problem: string }> = [];
+    for (const [role, session] of [['executor', state.executor], ['auditor', state.auditor]] as const) {
+      if (!session || session === TASK_PAIR_NO_AUDITOR) continue;
+      // Existing and restored sessions may restore their runtime lazily on the first delivery, so only existence and state are demanded here;
+      // a session this call created had its runtime verified when it was created.
+      const problem = pairSessionNotLiveReason(getSession(session), () => true);
+      if (problem) problems.push({ role, session, problem });
+    }
+    return problems;
+  };
+  const sessionNotLiveError = (taskId: string, problems: ReturnType<typeof pairParticipantsNotLive>, extra: Record<string, unknown> = {}): ToolResult => ({
+    ...error(
+      MCP_ERROR_REASONS.CONTROL_PLANE_UNAVAILABLE,
+      `session_not_live: ${problems.map((entry) => `${entry.role} ${entry.session}: ${entry.problem}`).join('; ')}`,
+    ),
+    failure: 'session_not_live',
+    taskId,
+    sessionsNotLive: problems,
+    ...extra,
+  });
+  /** A pair that was persisted but whose sessions turned out not to be live: cancelled (never left "dispatched" at a missing session), created sessions removed. */
+  const cancelPairNotLive = async (
+    project: string,
+    brainName: string,
+    taskId: string,
+    eventId: string,
+    problems: ReturnType<typeof pairParticipantsNotLive>,
+    created: readonly import('./task-pairs/session-creation.js').CreatedPairSession[],
+  ): Promise<ToolResult> => {
+    let cancelled = false;
+    try {
+      cancelled = !!taskPairService.applyMarker({
+        project, writer: brainName,
+        marker: { verb: 'CANCEL', knownVerb: 'CANCEL', taskId, attrs: {} },
+        source: 'mcp', eventId: `${eventId}:cancel-not-live`,
+      });
+    } catch (cancelError) {
+      logger.warn({ err: cancelError, taskId }, 'pair_create: could not cancel a pair whose sessions are not live');
+    }
+    await discardCreatedPairSessions(created);
+    return sessionNotLiveError(taskId, problems, { pairCancelled: cancelled, nothingDispatched: true });
+  };
   const deliverStructuredPairBriefs = async (project: string, taskId: string, requestEventId: string) => {
     const store = getTaskPairStore();
     if (store.getPair(project, taskId)?.state.status === 'queued') return [];
@@ -1783,7 +1829,8 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
         source: 'mcp', at: Date.now(),
       });
     }
-    return receipts;
+    // Each receipt says whether the target is a live session right now, so "queued" can never be read as "a session is there".
+    return receipts.map((receipt) => ({ ...receipt, live: !pairSessionNotLiveReason(getSession(receipt.target), () => true) }));
   };
   // Orchestrated path is the production wiring; the legacy `getMemorySources`
   // dep is retained for tests that only want to verify the local SQLite
@@ -2940,6 +2987,12 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       if (store.hasEvent(eventId)) {
         const replay = store.getPair(context.project, taskId);
         if (!replay) return error(MCP_ERROR_REASONS.CONTROL_PLANE_UNAVAILABLE, 'pair create replay has no persisted pair');
+        // A replay never reports success for a pair that was cancelled, or whose sessions are gone: it says so, by name.
+        if (replay.state.status === 'cancelled') {
+          return { ...error(MCP_ERROR_REASONS.CONTROL_PLANE_UNAVAILABLE, 'this pair_create was cancelled (its sessions were not live); retry with a new idempotencyKey'), failure: 'pair_cancelled', taskId, nothingDispatched: true };
+        }
+        const replayProblems = isTerminalTaskPairStatus(replay.state.status) ? [] : pairParticipantsNotLive(replay.state);
+        if (replayProblems.length > 0) return sessionNotLiveError(taskId, replayProblems, { idempotentReplay: true });
         const deliveries = await deliverStructuredPairBriefs(context.project, taskId, eventId);
         return { status: 'ok', taskId, idempotentReplay: true, state: replay.state.status, deliveries };
       }
@@ -2959,27 +3012,29 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
           createExecutor: createSpecArg(args, 'createExecutor'), createAuditor: createSpecArg(args, 'createAuditor'),
         });
         if (!ensured.ok) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, `pair_create did nothing: ${ensured.error}`);
+        // From here on every failure removes the sessions this call created: nothing is persisted, so nothing may be left behind.
+        const abort = async (result: ToolResult): Promise<ToolResult> => { await discardCreatedPairSessions(ensured.created); return result; };
         const executor = executorArg ?? ensured.executor;
         const auditor = auditorArg ?? ensured.auditor;
         if ((auditor !== undefined && auditor === executor) || (executor && executor === brainName) || (auditor && auditor !== TASK_PAIR_NO_AUDITOR && auditor === brainName)) {
-          return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'executor, auditor, and Brain must be distinct');
+          return abort(error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'executor, auditor, and Brain must be distinct'));
         }
         const byName = new Map(context.sessions.map((session) => [session.name, getSession(session.name) ?? session]));
         for (const entry of ensured.created) { const record = getSession(entry.session); if (record) byName.set(entry.session, record); }
         const executorRecord = executor ? byName.get(executor) : undefined;
         if (executor) {
-          if (!executorRecord) return error(MCP_ERROR_REASONS.PROJECTION_UNAVAILABLE, 'executor session not found');
-          if (executorRecord.projectName !== context.project) return error(MCP_ERROR_REASONS.SCOPE_FORBIDDEN, 'executor is outside the caller project');
+          if (!executorRecord) return abort(error(MCP_ERROR_REASONS.PROJECTION_UNAVAILABLE, 'executor session not found'));
+          if (executorRecord.projectName !== context.project) return abort(error(MCP_ERROR_REASONS.SCOPE_FORBIDDEN, 'executor is outside the caller project'));
           if (executorRecord.state === 'stopped' || executorRecord.state === 'error') {
-            return error(MCP_ERROR_REASONS.CONTROL_PLANE_UNAVAILABLE, `executor is ${executorRecord.state}`);
+            return abort(error(MCP_ERROR_REASONS.CONTROL_PLANE_UNAVAILABLE, `executor is ${executorRecord.state}`));
           }
         }
         if (auditor && auditor !== TASK_PAIR_NO_AUDITOR) {
           const auditorRecord = byName.get(auditor);
-          if (!auditorRecord) return error(MCP_ERROR_REASONS.PROJECTION_UNAVAILABLE, 'auditor session not found');
-          if (auditorRecord.projectName !== context.project) return error(MCP_ERROR_REASONS.SCOPE_FORBIDDEN, 'auditor is outside the caller project');
+          if (!auditorRecord) return abort(error(MCP_ERROR_REASONS.PROJECTION_UNAVAILABLE, 'auditor session not found'));
+          if (auditorRecord.projectName !== context.project) return abort(error(MCP_ERROR_REASONS.SCOPE_FORBIDDEN, 'auditor is outside the caller project'));
           if (auditorRecord.state === 'stopped' || auditorRecord.state === 'error') {
-            return error(MCP_ERROR_REASONS.CONTROL_PLANE_UNAVAILABLE, `auditor is ${auditorRecord.state}`);
+            return abort(error(MCP_ERROR_REASONS.CONTROL_PLANE_UNAVAILABLE, `auditor is ${auditorRecord.state}`));
           }
         }
         const busyTarget = executorRecord?.state === 'running'
@@ -3022,8 +3077,19 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
         // A pair with no named executor starts through the queue right away (the daemon picks from the pool, or the no-pool default).
         if (!executor && transition) await taskPairAutomation.runQueue(context.project, brainName);
         const stored = store.getPair(context.project, taskId);
-        if (!transition || !stored) return error(MCP_ERROR_REASONS.CONTROL_PLANE_UNAVAILABLE, 'pair creation was not persisted');
+        if (!transition || !stored) return abort(error(MCP_ERROR_REASONS.CONTROL_PLANE_UNAVAILABLE, 'pair creation was not persisted'));
+        // The gate between "persisted" and "dispatched": every assigned session is verified live NOW (it exists, is not stopped/errored,
+        // a transport session has its runtime), and only then does a brief go out. A miss cancels the pair and says which session.
+        const beforeDelivery = store.getPair(context.project, taskId) ?? stored;
+        if (beforeDelivery.state.status !== 'queued') {
+          const problems = pairParticipantsNotLive(beforeDelivery.state);
+          if (problems.length > 0) return cancelPairNotLive(context.project, brainName, taskId, eventId, problems, ensured.created);
+        }
         const deliveries = await deliverStructuredPairBriefs(context.project, taskId, eventId);
+        const unreachable = deliveries.filter((receipt) => receipt.status === 'no_session');
+        if (unreachable.length > 0) {
+          return cancelPairNotLive(context.project, brainName, taskId, eventId, unreachable.map((receipt) => ({ role: receipt.role, session: receipt.target, problem: 'the session does not exist' })), ensured.created);
+        }
         const latest = store.getPair(context.project, taskId) ?? stored;
         const executionSelection = describeExecutionSelection(brainName, latest.state, { executorNamed: !!executorArg || !!executorModel, auditorNamed: !!auditorArg || !!auditorModel }, {}, ensured.created);
         return { status: 'ok', taskId, idempotentReplay: false, created: transition.effect === 'created', state: latest.state.status, executionSelection, deliveries };
@@ -3047,6 +3113,8 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       if (store.hasEvent(eventId)) {
         const replay = store.getPair(context.project, taskId);
         if (!replay) return error(MCP_ERROR_REASONS.CONTROL_PLANE_UNAVAILABLE, 'pair dispatch replay has no persisted pair');
+        const replayProblems = isTerminalTaskPairStatus(replay.state.status) || replay.state.status === 'queued' ? [] : pairParticipantsNotLive(replay.state);
+        if (replayProblems.length > 0) return sessionNotLiveError(taskId, replayProblems, { idempotentReplay: true });
         const deliveries = await deliverStructuredPairBriefs(context.project, taskId, eventId);
         return { status: 'ok', taskId, idempotentReplay: true, state: replay.state.status, deliveries };
       }
@@ -3054,9 +3122,18 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       await taskPairAutomation.runQueue(context.project, caller.sessionName);
       const after = store.getPair(context.project, taskId);
       if (!after) return error(MCP_ERROR_REASONS.CONTROL_PLANE_UNAVAILABLE, 'pair disappeared during dispatch');
+      if (after.state.status !== 'queued') {
+        // Same gate as pair_create: the dispatch is only recorded (and a brief only sent) once every assigned session is verified live.
+        const problems = pairParticipantsNotLive(after.state);
+        if (problems.length > 0) return cancelPairNotLive(context.project, caller.sessionName, taskId, eventId, problems, []);
+      }
       const role = taskPairRoleOf(after.state, caller.sessionName);
       store.recordEvent({ id: eventId, project: context.project, taskId, writer: caller.sessionName, role, verb: TASK_PAIR_MCP_DISPATCH_EVENT, attrs: { idempotencyKey: idempotencyKey ?? taskId }, effect: 'dispatched', unusual: false, source: 'mcp', fromStatus: stored.state.status, toStatus: after.state.status, at: Date.now() });
       const deliveries = after.state.status === 'queued' ? [] : await deliverStructuredPairBriefs(context.project, taskId, eventId);
+      const unreachable = deliveries.filter((receipt) => receipt.status === 'no_session');
+      if (unreachable.length > 0) {
+        return cancelPairNotLive(context.project, caller.sessionName, taskId, eventId, unreachable.map((receipt) => ({ role: receipt.role, session: receipt.target, problem: 'the session does not exist' })), []);
+      }
       return { status: 'ok', taskId, idempotentReplay: false, state: after.state.status, deliveries };
     },
     [MEMORY_MCP_TOOL_NAMES.PAIR_CLOSE]: async (input) => {
@@ -3111,10 +3188,26 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       const idempotencyKey = stringArg(args, 'idempotencyKey');
       const replay = getTaskPairStore().hasEvent(structuredPairLifecycleEventId(context.project, taskId, 'REASSIGN', attrs, idempotencyKey));
       if (stored && isTerminalTaskPairStatus(stored.state.status) && !replay) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, `cannot reassign terminal pair (${stored.state.status})`);
-      return applyStructuredPairLifecycle({
+      // A named session must exist now: the pair is never pointed at a name that is not a session.
+      const namedProblems: ReturnType<typeof pairParticipantsNotLive> = [];
+      for (const role of ['executor', 'auditor'] as const) {
+        const named = attrs[role];
+        if (!named || named === TASK_PAIR_NO_AUDITOR || replay) continue;
+        const problem = pairSessionNotLiveReason(getSession(named), () => true);
+        if (problem) namedProblems.push({ role, session: named, problem });
+      }
+      if (namedProblems.length > 0) return sessionNotLiveError(taskId, namedProblems, { nothingChanged: true });
+      const reassigned = await applyStructuredPairLifecycle({
         project: context.project, taskId, verb: 'REASSIGN', attrs, idempotencyKey,
         authorize: (pair) => pair.state.brain === caller.sessionName ? undefined : error(MCP_ERROR_REASONS.SCOPE_FORBIDDEN, 'pair_reassign requires the pair Brain'),
       });
+      // A reassignment by model may have provisioned or picked a session: report a result whose sessions are not live as the failure it is.
+      const afterReassign = getTaskPairStore().getPair(context.project, taskId);
+      if (reassigned.status === 'ok' && afterReassign && !isTerminalTaskPairStatus(afterReassign.state.status) && afterReassign.state.status !== 'queued') {
+        const problems = pairParticipantsNotLive(afterReassign.state);
+        if (problems.length > 0) return sessionNotLiveError(taskId, problems);
+      }
+      return reassigned;
     },
     [MEMORY_MCP_TOOL_NAMES.PAIR_NEXT_ROUND]: async (input) => {
       const context = await pairCallerContext();

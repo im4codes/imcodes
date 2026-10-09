@@ -1215,7 +1215,7 @@ describe('the per-project cap of auto-created sessions under concurrency', () =>
       metadata: { createdBy: 'deck_proj_brain', pairTaskId: 'tsk_race', role: 'executor' as const, reason: TASK_PAIR_CREATED_SESSION_REASONS.DEFAULT },
     };
     const both = Promise.all([
-      createPairSubSession(pairRequest, h.deps),
+      createPairSubSession(pairRequest, { ...h.deps, hasRuntime: () => true, announce: async () => 'announced' }),
       provisionSupervisionTarget(forcedRequest('forced-1'), h.deps),
     ]);
     await tick();

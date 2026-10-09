@@ -48,7 +48,15 @@ export interface EnsurePairSessionsInput {
   createAuditor?: PairSessionCreateSpec;
 }
 
-export interface CreatedPairSession { session: string; role: PairSessionRole; reason: TaskPairCreatedSessionReason }
+export interface CreatedPairSession {
+  session: string;
+  role: PairSessionRole;
+  reason: TaskPairCreatedSessionReason;
+  /** The server was told about the session before pair_create returned. False: no open server link, the reconnect resync tells it. */
+  announced: boolean;
+  /** False for a session an earlier attempt with the same idempotency key already made (a retry reuses it). */
+  newlyCreated: boolean;
+}
 
 export type EnsurePairSessionsResult =
   | { ok: true; executor?: string; auditor?: string; created: CreatedPairSession[] }
@@ -86,6 +94,9 @@ const REASON_TEXT: Record<PairSubSessionFailureReason, string> = {
   launch_failed: 'the session failed to launch',
   readiness_timeout: 'the session did not become ready in time',
   identity_collision: 'a different session already uses the derived name',
+  not_daemon_process: 'the session can only be created by the daemon process, not by this helper process',
+  announce_failed: 'the server could not be told about the new session',
+  session_not_live: 'the new session did not stay alive',
 };
 
 function shortTitle(title: string | undefined): string {
@@ -149,11 +160,7 @@ export async function ensurePairSessions(input: EnsurePairSessionsInput, injecte
   }
 
   const created: CreatedPairSession[] = [];
-  const stop = async (): Promise<void> => {
-    for (const entry of created.filter((item) => item.reason !== undefined)) {
-      try { await (deps.stopSession ?? defaultStop)(entry.session); } catch { /* best effort: the error below is what matters */ }
-    }
-  };
+  const stop = (): Promise<void> => discardCreatedPairSessions(created, deps);
   // Executor before auditor: a failure removes whatever was already created in this call.
   for (const entry of wanted.sort((a, b) => (a.role === 'executor' ? 0 : 1) - (b.role === 'executor' ? 0 : 1))) {
     const resolved = resolveCreationConfig(parent, entry.spec);
@@ -169,7 +176,7 @@ export async function ensurePairSessions(input: EnsurePairSessionsInput, injecte
       await stop();
       return { ok: false, error: `cannot create the ${entry.role} sub-session: ${REASON_TEXT[result.reason]}${result.detail ? ` (${result.detail})` : ''}. Nothing was created for this pair. Name an existing session, free up quota, or configure the pool with execution_pool_set.` };
     }
-    created.push({ session: result.target.name, role: entry.role, reason: entry.reason });
+    created.push({ session: result.target.name, role: entry.role, reason: entry.reason, announced: result.announced === true, newlyCreated: result.created });
   }
 
   const executor = input.executor ?? created.find((entry) => entry.role === 'executor')?.session;
@@ -186,6 +193,16 @@ export async function ensurePairSessions(input: EnsurePairSessionsInput, injecte
     return { ok: false, error: `${shortfall} (pair-created sub-sessions are limited to ${TASK_PAIR_AUTO_CREATED_PAIR_MAX_PER_PROJECT} pairs, ${maxPerProject} sessions, per project; ${capRoom} slot(s) were free)` };
   }
   return { ok: true, ...(executor ? { executor } : {}), ...(auditor ? { auditor } : {}), created };
+}
+
+/**
+ * Remove sessions a failed pair_create made (best effort: the error being reported is what matters). A pair_create call must leave
+ * nothing behind on ANY failure path - the ones in this module and the ones after it (persisting the pair, verifying the sessions).
+ */
+export async function discardCreatedPairSessions(created: readonly CreatedPairSession[], deps: Pick<PairSessionCreationDeps, 'stopSession'> = {}): Promise<void> {
+  for (const entry of created) {
+    try { await (deps.stopSession ?? testDeps.stopSession ?? defaultStop)(entry.session); } catch { /* best effort */ }
+  }
 }
 
 async function defaultStop(sessionName: string): Promise<boolean> {

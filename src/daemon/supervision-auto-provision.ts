@@ -31,6 +31,9 @@ import { resolvePeerAuditProviderFamily } from './peer-audit-candidates.js';
 import { delegationTargetInputs } from './delegation-admission.js';
 import { startSubSession, stopSubSession, type SubSessionRecord } from './subsession-manager.js';
 import { getActiveServerLink } from './active-server-link.js';
+import { announceSubSession, type SubSessionAnnounceOutcome } from './subsession-sync.js';
+import { isNonDaemonProcess } from './process-role.js';
+import { getTransportRuntime } from '../agent/session-manager.js';
 import { closeSubSession } from './session-close.js';
 import { overlayCachedExecutionPools } from './supervisor-defaults-cache.js';
 import logger from '../util/logger.js';
@@ -607,7 +610,8 @@ export function autoCreatedSlotsInFlightForTests(): number { return creationsInF
 const PAIR_SESSION_ID_PREFIX = 'pair_auto_';
 
 export type PairSubSessionFailureReason =
-  | 'parent_unavailable' | 'cap_reached' | 'provider_limited' | 'provider_offline' | 'launch_failed' | 'readiness_timeout' | 'identity_collision';
+  | 'parent_unavailable' | 'cap_reached' | 'provider_limited' | 'provider_offline' | 'launch_failed' | 'readiness_timeout' | 'identity_collision'
+  | 'not_daemon_process' | 'announce_failed' | 'session_not_live';
 
 export interface PairSubSessionRequest {
   parentSessionName: string;
@@ -619,9 +623,32 @@ export interface PairSubSessionRequest {
   idempotencyKey: string;
 }
 
+/**
+ * `live: true` is a verified fact, not a hope: the record is in the daemon's store, it is ready, a transport session has its runtime in
+ * THIS process, and the server was told (`announced`) - or there is no open server link, in which case the reconnect resync tells it
+ * (`announced: false`). A result that cannot say this is a failure and the half-made session has been removed.
+ */
 export type PairSubSessionResult =
-  | { ok: true; target: SessionRecord; created: boolean }
+  | { ok: true; target: SessionRecord; created: boolean; live: true; announced: boolean }
   | { ok: false; reason: PairSubSessionFailureReason; detail?: string };
+
+/**
+ * Why this session is not a live pair participant right now, or undefined when it is: missing from the store, stopped/errored, or a
+ * transport session without a runtime in this process. The one definition pair_create, the delivery receipts and the heartbeat share.
+ */
+export function pairSessionNotLiveReason(
+  record: SessionRecord | undefined,
+  hasRuntime: (session: SessionRecord) => boolean = defaultHasRuntime,
+): string | undefined {
+  if (!record) return 'the session does not exist';
+  if (record.state === 'stopped' || record.state === 'error') return `the session is ${record.state}`;
+  if (record.runtimeType === 'transport' && !hasRuntime(record)) return 'the session has no running runtime';
+  return undefined;
+}
+
+function defaultHasRuntime(session: SessionRecord): boolean {
+  return getTransportRuntime(session.name) !== undefined;
+}
 
 /** Every sub-session of this project that pair_create created (the recycling selector, and the cap's count). */
 export function listPairCreatedSessions(projectName: string, sessions: readonly SessionRecord[]): SessionRecord[] {
@@ -649,22 +676,55 @@ function pairSessionIdentity(request: PairSubSessionRequest): { subId: string; s
  */
 export async function createPairSubSession(
   request: PairSubSessionRequest,
-  injected: SupervisionAutoProvisionDeps & { maxPerProject?: number } = {},
+  injected: SupervisionAutoProvisionDeps & {
+    maxPerProject?: number;
+    /** Test seams: what tells the server, whether a transport session has its runtime here, and whether this is a helper process. */
+    announce?: (sessionName: string, id: string) => Promise<SubSessionAnnounceOutcome>;
+    hasRuntime?: (session: SessionRecord) => boolean;
+    nonDaemonProcess?: boolean;
+  } = {},
 ): Promise<PairSubSessionResult> {
+  // Only the daemon may create a pair's session: a stdio MCP child or CLI has a private session map and provider registry, so a session
+  // it launches is invisible to the daemon and the server and dies with that process (the pair then names a session that does not exist).
+  if (injected.nonDaemonProcess ?? isNonDaemonProcess()) {
+    return { ok: false, reason: 'not_daemon_process', detail: 'pair sub-sessions are created by the daemon process only' };
+  }
   const deps = {
     now: injected.now ?? Date.now,
     listSessions: injected.listSessions ?? (() => listSessions()),
     getSession: injected.getSession ?? getSession,
     startSubSession: injected.startSubSession ?? startSubSession,
-    // The server link is passed so the server and browsers hear `subsession.closed` for a half-made session (it was already announced).
+    // The server link is passed so that, when the session had already been announced, the server and browsers hear `subsession.closed`.
     stopSubSession: injected.stopSubSession ?? (async (sessionName: string) => (await stopSubSession(sessionName, getActiveServerLink())).ok),
     wait: injected.wait ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms))),
     readyTimeoutMs: injected.readyTimeoutMs ?? SUPERVISION_AUTO_PROVISION_READY_TIMEOUT_MS,
     maxPerProject: injected.maxPerProject ?? TASK_PAIR_AUTO_CREATED_SESSION_MAX_PER_PROJECT,
+    announce: injected.announce ?? ((_sessionName: string, id: string) => announceSubSession(getActiveServerLink(), id)),
+    hasRuntime: injected.hasRuntime ?? defaultHasRuntime,
   };
   const parent = deps.getSession(request.parentSessionName);
   if (!parent || parent.role !== 'brain') return { ok: false, reason: 'parent_unavailable' };
   const { subId, sessionName } = pairSessionIdentity(request);
+  const discard = async (): Promise<void> => {
+    try { await deps.stopSubSession(sessionName); } catch (error) {
+      logger.warn({ err: error, sessionName }, 'pair session creation: could not remove a half-made session');
+    }
+  };
+  // The last gate before "created": the record is still in the store and has its runtime, then the server is told. Any miss removes the
+  // session (a session this call did not create is left alone) and reports it, so no caller ever holds a name that is not a live session.
+  const finishLive = async (ready: SessionRecord, created: boolean): Promise<PairSubSessionResult> => {
+    const notLive = pairSessionNotLiveReason(deps.getSession(sessionName) ?? undefined, deps.hasRuntime);
+    if (notLive) {
+      if (created) await discard();
+      return { ok: false, reason: 'session_not_live', detail: `${sessionName}: ${notLive}` };
+    }
+    const outcome = await deps.announce(sessionName, subId);
+    if (outcome === 'failed') {
+      if (created) await discard();
+      return { ok: false, reason: 'announce_failed', detail: sessionName };
+    }
+    return { ok: true, target: deps.getSession(sessionName) ?? ready, created, live: true, announced: outcome === 'announced' };
+  };
   const sessions = deps.listSessions();
   const existing = deps.getSession(sessionName);
   if (existing) {
@@ -674,7 +734,10 @@ export async function createPairSubSession(
       return { ok: false, reason: 'identity_collision', detail: sessionName };
     }
     const availability = resolveDelegationTargets(delegationTargetInputs(sessions), deps.now());
-    if (sessionIsReady(existing, availability.get(existing.name)?.availability)) return { ok: true, target: existing, created: false };
+    if (sessionIsReady(existing, availability.get(existing.name)?.availability)) {
+      // A retry finds the session already there: it is still verified and announced again (idempotent on the server) before it is called live.
+      return finishLive(existing, false);
+    }
   }
   const status = configurationAvailability(sessions, parent, request.config, deps.now());
   if (status === 'limited') return { ok: false, reason: 'provider_limited' };
@@ -685,11 +748,6 @@ export async function createPairSubSession(
     return { ok: false, reason: 'cap_reached', detail: `${deps.maxPerProject}` };
   }
 
-  const discard = async (): Promise<void> => {
-    try { await deps.stopSubSession(sessionName); } catch (error) {
-      logger.warn({ err: error, sessionName }, 'pair session creation: could not remove a half-made session');
-    }
-  };
   if (!existing) {
     try {
       await deps.startSubSession({
@@ -717,7 +775,7 @@ export async function createPairSubSession(
   while (deps.now() <= deadline) {
     const current = deps.getSession(sessionName);
     if (current && sessionIsReady(current, resolveDelegationTargets(delegationTargetInputs(deps.listSessions()), deps.now()).get(sessionName)?.availability)) {
-      return { ok: true, target: current, created: !existing };
+      return finishLive(current, !existing);
     }
     await deps.wait(SUPERVISION_AUTO_PROVISION_POLL_MS);
   }
