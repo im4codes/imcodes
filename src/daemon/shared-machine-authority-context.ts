@@ -17,12 +17,15 @@ type Window = {
   authority: string | null;
   lastActivityAt: number;
   /**
-   * Turn-producing inputs (a message, or a line submitted with Enter) bound
-   * since the window opened and not yet finished by an idle edge. A TUI queues
-   * input typed during a running turn and starts it right after the idle edge,
-   * so one idle edge ends ONE turn, not the whole window.
+   * Every turn that can still run on the session, counting the one already in
+   * flight when the window opened (the daemon did not see it start), the ones
+   * queued behind it in the TUI, and the ones bound but not typed yet. A
+   * turn-producing input is a message, or a line submitted with Enter (plain
+   * typing is not). One idle edge ends one turn.
    */
   turns: number;
+  /** Of `turns`: bound, but the daemon has not written them to the terminal yet (recall, delivery lock). */
+  undelivered: number;
 };
 
 /**
@@ -36,8 +39,8 @@ type Window = {
  *
  * Owner activity never clears the window. An idle edge ends one turn
  * ({@link releaseProcessSharedMachineAuthority}); the window is released only
- * when no further turn is queued behind it (see `turns`), so input queued in
- * the TUI during a participant's turn still runs bound to that participant.
+ * when no further turn can still run (see `turns`), so input queued in the TUI
+ * behind a running turn, or still being delivered, stays bound to its author.
  * Mirrors the transport rule in TransportSessionRuntime.getActiveSharedMachineAuthority.
  */
 const windows = new Map<string, Window>();
@@ -57,6 +60,19 @@ function quietAndIdle(window: Window, now: number, sessionRunning: boolean): boo
   return !sessionRunning && now - window.lastActivityAt >= PROCESS_SHARED_MACHINE_WINDOW_QUIET_MS;
 }
 
+/**
+ * Handle for one bound turn-producing input. `typed()` says the daemon wrote it
+ * to the terminal (from then on an idle edge may end its turn); `settle()` says
+ * delivery is over, whatever happened: an input that was never typed (failed,
+ * rerouted to a transport runtime, rejected) is not a turn that will run.
+ * Both are idempotent.
+ */
+export interface ProcessSharedMachineBinding {
+  typed(at?: number): void;
+  settle(): void;
+}
+const NO_BINDING: ProcessSharedMachineBinding = { typed() { /* not a turn */ }, settle() { /* not a turn */ } };
+
 /** Record who just fed a process session. Runs per keystroke: a Map lookup, no I/O. */
 export function bindProcessSharedMachineActivity(
   sessionName: string,
@@ -68,27 +84,56 @@ export function bindProcessSharedMachineActivity(
     /** The activity submits a turn (a message, an Enter). Plain typing does not. Default true. */
     startsTurn?: boolean;
   } = {},
-): void {
+): ProcessSharedMachineBinding {
   const now = opts.now ?? Date.now();
   let window = windows.get(sessionName);
   // A restarted runtime or a long-quiet idle session starts a fresh window.
   if (window && window.identity && identity && !sameIdentity(window.identity, identity)) window = undefined;
   if (window && quietAndIdle(window, now, opts.sessionRunning ?? false)) window = undefined;
   if (!window) {
-    window = { identity, owner: false, participants: new Set(), authority: null, lastActivityAt: now, turns: 0 };
+    // A session that is running when the window opens is running a turn the daemon never saw start
+    // (typed in the local tmux, an automation write): it is ahead of this input and must be counted.
+    window = {
+      identity, owner: false, participants: new Set(), authority: null, lastActivityAt: now,
+      turns: opts.sessionRunning ? 1 : 0, undelivered: 0,
+    };
     windows.set(sessionName, window);
   }
   window.lastActivityAt = now;
-  if (opts.startsTurn ?? true) window.turns += 1;
+  const startsTurn = opts.startsTurn ?? true;
+  if (startsTurn) {
+    window.turns += 1;
+    window.undelivered += 1;
+  }
   if (!identity) window.identity = null;
   if (activity.kind === SHARED_MACHINE_ACTIVITY_KIND.OWNER) {
     window.owner = true;
-    return;
+  } else {
+    window.participants.add(activity.actorUserId);
+    // Keep the participant marker even without a token: a participant turn must
+    // never degrade into the ordinary source-owner path because propagation failed.
+    if (activity.authority) window.authority = activity.authority;
   }
-  window.participants.add(activity.actorUserId);
-  // Keep the participant marker even without a token: a participant turn must
-  // never degrade into the ordinary source-owner path because propagation failed.
-  if (activity.authority) window.authority = activity.authority;
+  if (!startsTurn) return NO_BINDING;
+  const bound = window;
+  let pending = true;
+  return {
+    typed(at = Date.now()) {
+      if (!pending) return;
+      pending = false;
+      if (windows.get(sessionName) !== bound || bound.undelivered <= 0) return;
+      bound.undelivered -= 1;
+      // The terminal just received it: an idle edge right after is the tail of the previous turn.
+      bound.lastActivityAt = at;
+    },
+    settle() {
+      if (!pending) return;
+      pending = false;
+      if (windows.get(sessionName) !== bound || bound.undelivered <= 0) return;
+      bound.undelivered -= 1;
+      bound.turns = Math.max(0, bound.turns - 1);
+    },
+  };
 }
 
 /**
@@ -101,7 +146,7 @@ export function bindProcessSharedMachineCommand(
   record: { sessionInstanceId?: string; runtimeEpoch?: string; state?: string } | undefined,
   cmd: Record<string, unknown>,
   now?: number,
-): void {
+): ProcessSharedMachineBinding {
   const identity = record?.sessionInstanceId && record.runtimeEpoch
     ? { sessionInstanceId: record.sessionInstanceId, runtimeEpoch: record.runtimeEpoch }
     : null;
@@ -122,7 +167,7 @@ export function bindProcessSharedMachineCommand(
   const startsTurn = cmd.type === DAEMON_COMMAND_TYPES.SESSION_INPUT
     ? typeof cmd.data === 'string' && /[\r\n]/.test(cmd.data)
     : true;
-  bindProcessSharedMachineActivity(sessionName, identity, activity, {
+  return bindProcessSharedMachineActivity(sessionName, identity, activity, {
     startsTurn,
     sessionRunning: record?.state === 'running',
     ...(now === undefined ? {} : { now }),
@@ -139,20 +184,23 @@ export function bindProcessSharedMachineCommand(
 export const PROCESS_SHARED_MACHINE_IDLE_GUARD_MS = 1_500;
 
 /**
- * The session returned to idle: ONE turn is over. If more turn-producing input
- * was bound behind it (queued in the TUI, FIFO), the next turn starts at once
- * and must stay covered, so the window carries on: participants and token are
- * kept, the owner flag is cleared (the finished turn was the only one it could
- * have been about; a queued owner turn then runs more restricted than needed,
- * never less). Only when nothing is queued, or no participant is involved, is
- * the window released. Driven by the daemon's `session.state` = idle timeline
- * event (Claude Code Stop hook, Codex/Gemini watchers, terminal-streamer quiet timer).
+ * The session returned to idle: ONE turn is over. `turns` counts every turn that
+ * can still run (in flight, queued in the TUI, or bound but not typed yet), so
+ * while more than one remains the window carries on: participants and token are
+ * kept, the owner flag is cleared (a queued owner turn then runs more restricted
+ * than needed, never less). It is released only when no further turn can run.
+ * An owner-only window carries too, at no cost (it reads as unrestricted), so a
+ * participant that joins while an owner turn is still ahead is counted behind it.
+ * An edge never consumes a turn that has not been typed yet: it ended an earlier
+ * one. Driven by the daemon's `session.state` = idle timeline event (Claude Code
+ * Stop hook, Codex/Gemini watchers, terminal-streamer quiet timer).
  */
 export function releaseProcessSharedMachineAuthority(sessionName: string, now = Date.now()): void {
   const window = windows.get(sessionName);
   if (!window) return;
   if (now - window.lastActivityAt < PROCESS_SHARED_MACHINE_IDLE_GUARD_MS) return;
-  if (window.participants.size > 0 && window.turns > 1) {
+  if (window.undelivered > 0 && window.turns - window.undelivered <= 0) return;
+  if (window.turns > 1) {
     window.turns -= 1;
     window.owner = false;
     window.lastActivityAt = now;

@@ -21,16 +21,34 @@ const participant = (actorUserId: string, authority?: string): SharedMachineActi
 );
 
 type Step =
-  | { act: SharedMachineActivity; startsTurn?: boolean }
-  | 'idle';
+  | {
+    act: SharedMachineActivity;
+    startsTurn?: boolean;
+    /** The session record said 'running' when this input was bound. */
+    running?: boolean;
+    /** Not written to the terminal yet (recall, delivery lock); `'typed'` writes the oldest such one. */
+    undelivered?: boolean;
+  }
+  | 'idle'
+  | 'typed';
 
 /** Replays steps at 10s spacing (past the idle guard) and returns the hook answer at the end. */
 function replay(steps: readonly Step[]): { required: boolean; authority: string | null } {
   let now = 1_000_000;
+  const waiting: Array<{ typed(at?: number): void }> = [];
   for (const step of steps) {
     now += 10_000;
     if (step === 'idle') releaseProcessSharedMachineAuthority(SESSION, now);
-    else bindProcessSharedMachineActivity(SESSION, identity, step.act, { now, ...(step.startsTurn === undefined ? {} : { startsTurn: step.startsTurn }) });
+    else if (step === 'typed') waiting.shift()?.typed(now);
+    else {
+      const binding = bindProcessSharedMachineActivity(SESSION, identity, step.act, {
+        now,
+        ...(step.startsTurn === undefined ? {} : { startsTurn: step.startsTurn }),
+        ...(step.running ? { sessionRunning: true } : {}),
+      });
+      if (step.undelivered) waiting.push(binding);
+      else binding.typed(now);
+    }
   }
   return readProcessSharedMachineAuthority(SESSION, identity, now + 1);
 }
@@ -79,7 +97,19 @@ describe('process shared machine authority context', () => {
       ['FIFO: ... and only the third idle releases', [send, ownerAct, send, 'idle', 'idle', 'idle'], OPEN],
       ['two owner turns queued behind a participant turn are each covered, then released', [send, ownerAct, ownerAct, 'idle', 'idle'], BOUND],
       ['two owner turns queued behind a participant turn: third idle releases', [send, ownerAct, ownerAct, 'idle', 'idle', 'idle'], OPEN],
-      ['owner-only queued turns are released by the first idle (nothing to protect)', [ownerAct, ownerAct, ownerAct, 'idle'], OPEN],
+      // An owner-only window carries too (it reads as unrestricted): the count survives so a participant that joins later is placed behind the owner turns still ahead.
+      ['owner-only queued turns stay unrestricted while they drain, then release', [ownerAct, ownerAct, ownerAct, 'idle'], OPEN],
+      ['P0-b: owner A, owner B (queued), idle, participant C queued behind B, idle: C is still bound', [ownerAct, ownerAct, 'idle', send, 'idle'], BOUND],
+      ['P0-b: ... and the next idle releases', [ownerAct, ownerAct, 'idle', send, 'idle', 'idle'], OPEN],
+      ['P0-a: participant message while a turn the daemon never saw is running: the first idle ends THAT turn', [{ act: participant('alice', 'tok-send'), running: true }, 'idle'], BOUND],
+      ['P0-a: ... the second idle ends the participant turn', [{ act: participant('alice', 'tok-send'), running: true }, 'idle', 'idle'], OPEN],
+      ['P0-a regression: the same message on an idle record is released by its idle', [send, 'idle'], OPEN],
+      ['P0-a: plain typing while a turn is running still accounts for the in-flight turn', [{ act: participant('alice', 'tok-typing'), startsTurn: false, running: true }, submit, 'idle'], { required: true, authority: 'tok-submit' }],
+      // A bound message is typed only after recall and the delivery lock: an idle edge in that gap ended an EARLIER turn.
+      ['delivery gap: an idle edge before the message is typed does not release it (turn 0 untracked, record idle)', [{ act: participant('alice', 'tok-send'), undelivered: true }, 'idle'], BOUND],
+      ['delivery gap: ... once typed, its own idle ends it', [{ act: participant('alice', 'tok-send'), undelivered: true }, 'idle', 'typed', 'idle'], OPEN],
+      ['delivery gap with the in-flight turn counted (record running): the edge ends turn 0, the message stays', [{ act: participant('alice', 'tok-send'), running: true, undelivered: true }, 'idle'], BOUND],
+      ['delivery gap with the in-flight turn counted: typed, then its idle releases', [{ act: participant('alice', 'tok-send'), running: true, undelivered: true }, 'idle', 'typed', 'idle'], OPEN],
       ['plain typing never counts as a queued turn', [typing, typing, typing, submit, 'idle'], OPEN],
       ['two submitted lines: the second is a queued turn', [submit, submit, 'idle'], { required: true, authority: 'tok-submit' }],
       ['typing alone then idle: released', [typing, typing, 'idle'], OPEN],
@@ -117,7 +147,7 @@ describe('process shared machine authority context', () => {
   });
 
   it('ignores an idle signal that is only the tail of the previous turn', () => {
-    bindProcessSharedMachineActivity(SESSION, identity, participant('alice', 'tok'), { now: 5_000 });
+    bindProcessSharedMachineActivity(SESSION, identity, participant('alice', 'tok'), { now: 5_000 }).typed(5_000);
     releaseProcessSharedMachineAuthority(SESSION, 5_000 + PROCESS_SHARED_MACHINE_IDLE_GUARD_MS - 1);
     expect(readProcessSharedMachineAuthority(SESSION, identity, 6_000)).toEqual({ required: true, authority: 'tok' });
     releaseProcessSharedMachineAuthority(SESSION, 5_000 + PROCESS_SHARED_MACHINE_IDLE_GUARD_MS);
@@ -142,6 +172,28 @@ describe('process shared machine authority context', () => {
     bindProcessSharedMachineActivity(SESSION, identity, participant('alice', 'tok'), { now: 1_000 });
     bindProcessSharedMachineActivity(SESSION, identity, owner, { now: 1_000 + PROCESS_SHARED_MACHINE_WINDOW_QUIET_MS });
     expect(readProcessSharedMachineAuthority(SESSION, identity, 1_000 + PROCESS_SHARED_MACHINE_WINDOW_QUIET_MS + 1)).toEqual(OPEN);
+  });
+
+  describe('settle(): a bound input that never reached the terminal is not a turn', () => {
+    it('a rejected or rerouted send leaves no phantom queued turn behind', () => {
+      const first = bindProcessSharedMachineActivity(SESSION, identity, participant('alice', 'tok'), { now: 1_000 });
+      first.typed(1_000);
+      const second = bindProcessSharedMachineActivity(SESSION, identity, participant('alice', 'tok2'), { now: 2_000 });
+      second.settle(); // e.g. the send failed after the bind
+      second.typed(3_000); // idempotent: no effect after settle
+      releaseProcessSharedMachineAuthority(SESSION, 20_000);
+      expect(readProcessSharedMachineAuthority(SESSION, identity, 20_001)).toEqual(OPEN);
+    });
+
+    it('a settled/typed handle after the window was replaced does not touch the new window', () => {
+      const old = bindProcessSharedMachineActivity(SESSION, identity, participant('alice', 'tok'), { now: 1_000 });
+      releaseProcessSharedMachineAuthority(SESSION, 1_000 + PROCESS_SHARED_MACHINE_IDLE_GUARD_MS + 10_000); // no-op: undelivered
+      clearProcessSharedMachineAuthoritiesForTests();
+      bindProcessSharedMachineActivity(SESSION, identity, participant('alice', 'tok'), { now: 50_000 }).typed(50_000);
+      old.settle();
+      releaseProcessSharedMachineAuthority(SESSION, 80_000);
+      expect(readProcessSharedMachineAuthority(SESSION, identity, 80_001)).toEqual(OPEN);
+    });
   });
 
   describe('bindProcessSharedMachineCommand (what the daemon does with a browser command)', () => {

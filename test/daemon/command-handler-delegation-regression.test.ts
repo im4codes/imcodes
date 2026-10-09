@@ -79,6 +79,7 @@ vi.mock('../../src/daemon/supervision-automation.js', () => ({ supervisionAutoma
 vi.mock('../../src/daemon/git-remote-clone.js', () => ({ maybeCloneGitRemoteToDirectory: vi.fn(async ({ targetDir }: { targetDir: string }) => targetDir) }));
 
 const { handleWebCommand } = await import('../../src/daemon/command-handler.js');
+const { sendKeysDelayedEnter } = await import('../../src/agent/tmux.js');
 
 const flushAsync = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
 
@@ -213,23 +214,62 @@ describe('command-handler delegation routing behavior', () => {
       expect(hook()).toEqual({ required: true, authority: null });
     });
 
-    describe('input queued in the TUI during a running turn (one idle edge ends one turn)', () => {
+    describe('turns that can still run: queued in the TUI, in flight, or not typed yet (one idle edge ends one turn)', () => {
       let edgeAt = 0;
       const idleEdge = () => releaseProcessSharedMachineAuthority('deck_proj_brain', Date.now() + (edgeAt += 60_000));
-      beforeEach(() => {
-        getSessionMock.mockReturnValue({
-          name: 'deck_proj_brain', projectName: 'proj', projectDir: '/repo', role: 'brain',
-          agentType: 'claude-code', runtimeType: 'process', state: 'running', ...identity,
-        });
+      const typedCount = () => vi.mocked(sendKeysDelayedEnter).mock.calls.length;
+      /** Wait until `n` messages were written to the terminal (after memory recall and the delivery lock). */
+      const waitTyped = async (n: number) => {
+        const deadline = Date.now() + 8_000;
+        while (typedCount() < n && Date.now() < deadline) await new Promise<void>((resolve) => setTimeout(resolve, 5));
+        await flushAsync();
+        expect(typedCount()).toBeGreaterThanOrEqual(n);
+      };
+      const record = (state: string) => getSessionMock.mockReturnValue({
+        name: 'deck_proj_brain', projectName: 'proj', projectDir: '/repo', role: 'brain',
+        agentType: 'claude-code', runtimeType: 'process', state, ...identity,
       });
+      beforeEach(() => record('idle'));
 
       it('A: a second participant message sent while the first turn runs is still bound after the first idle', async () => {
+        record('running');
         await send({ sharedActor: participantActor, sharedMachineAuthority: 'tok-1' });
         await send({ sharedActor: participantActor, sharedMachineAuthority: 'tok-2' });
-        await flushAsync();
-        idleEdge();
-        // The queued turn starts now: it must NOT run with the owner's authority.
+        await waitTyped(2);
+        idleEdge(); // the turn the daemon never saw (running record) ends
         expect(hook()).toEqual({ required: true, authority: 'tok-2' });
+        idleEdge(); // first participant turn ends; the queued one starts
+        expect(hook()).toEqual({ required: true, authority: 'tok-2' });
+        idleEdge();
+        expect(hook()).toEqual({ required: false, authority: null });
+      });
+
+      it('P0-a: a participant message while a turn the daemon never tracked is running (empty window) outlives the first idle', async () => {
+        record('running');
+        await send({ sharedActor: participantActor, sharedMachineAuthority: 'tok-1' });
+        await waitTyped(1);
+        idleEdge(); // T0 ends, the queued participant turn starts
+        expect(hook()).toEqual({ required: true, authority: 'tok-1' });
+        idleEdge();
+        expect(hook()).toEqual({ required: false, authority: null });
+      });
+
+      it('regression: the same message on an idle record is released by its own idle edge', async () => {
+        await send({ sharedActor: participantActor, sharedMachineAuthority: 'tok-1' });
+        await waitTyped(1);
+        idleEdge();
+        expect(hook()).toEqual({ required: false, authority: null });
+      });
+
+      it('P0-b: owner A, owner B queued, idle, participant C queued behind B, idle: C is still bound', async () => {
+        await send();
+        await send();
+        await waitTyped(2);
+        idleEdge(); // A ends; B runs
+        await send({ sharedActor: participantActor, sharedMachineAuthority: 'tok-c' });
+        await waitTyped(3);
+        idleEdge(); // B ends; C runs
+        expect(hook()).toEqual({ required: true, authority: 'tok-c' });
         idleEdge();
         expect(hook()).toEqual({ required: false, authority: null });
       });
@@ -237,7 +277,7 @@ describe('command-handler delegation routing behavior', () => {
       it('B: a participant message queued behind an owner turn runs bound after the idle edge', async () => {
         await send();
         await send({ sharedActor: participantActor, sharedMachineAuthority: 'tok-q' });
-        await flushAsync();
+        await waitTyped(2);
         expect(hook()).toEqual({ required: true, authority: null });
         idleEdge();
         expect(hook()).toEqual({ required: true, authority: 'tok-q' });
@@ -245,8 +285,27 @@ describe('command-handler delegation routing behavior', () => {
         expect(hook()).toEqual({ required: false, authority: null });
       });
 
-      it('a single participant turn is released by its idle edge (no over-carry)', async () => {
+      it('delivery gap: an idle edge that arrives before the bound message is typed does not release it', async () => {
+        record('running');
+        let release!: () => void;
+        const gate = new Promise<void>((resolve) => { release = resolve; });
+        vi.mocked(sendKeysDelayedEnter).mockImplementationOnce(() => gate as never);
+        await send({ sharedActor: participantActor, sharedMachineAuthority: 'tok-gap' });
+        // The delivery is held (recall / delivery lock): nothing typed yet. T0 (running record) ends meanwhile.
+        for (let i = 0; i < 20 && typedCount() < 1; i += 1) await new Promise<void>((resolve) => setTimeout(resolve, 5));
+        idleEdge();
+        expect(hook()).toEqual({ required: true, authority: 'tok-gap' });
+        release();
+        await flushAsync();
+        idleEdge(); // now the participant's own turn ends
+        expect(hook()).toEqual({ required: false, authority: null });
+      });
+
+      it('a send that fails before it is typed leaves no phantom turn', async () => {
         await send({ sharedActor: participantActor, sharedMachineAuthority: 'tok-1' });
+        await waitTyped(1);
+        vi.mocked(sendKeysDelayedEnter).mockRejectedValueOnce(new Error('tmux gone'));
+        await send({ sharedActor: participantActor, sharedMachineAuthority: 'tok-2' });
         await flushAsync();
         idleEdge();
         expect(hook()).toEqual({ required: false, authority: null });

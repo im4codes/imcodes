@@ -32,7 +32,7 @@ import { terminalStreamer, type StreamSubscriber } from './terminal-streamer.js'
 import { terminalInputNeedsSessionMutex } from './terminal-input.js';
 import type { ServerLink } from './server-link.js';
 import { timelineEmitter } from './timeline-emitter.js';
-import { bindProcessSharedMachineCommand } from './shared-machine-authority-context.js';
+import { bindProcessSharedMachineCommand, type ProcessSharedMachineBinding } from './shared-machine-authority-context.js';
 import {
   emitTransportUserMessage as emitTransportUserMessageEvent,
   persistTransportUserMessage,
@@ -3998,7 +3998,21 @@ function hasUnsupportedDelegationFields(cmd: Record<string, unknown>): boolean {
   return findForbiddenAgentDelegationCommandFields(cmd).length > 0;
 }
 
+/** The participant-authority binding of one admitted send, shared with the process delivery below. */
+type SendAuthorityBinding = { current?: ProcessSharedMachineBinding };
+
 async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
+  const binding: SendAuthorityBinding = {};
+  try {
+    await handleSendBound(cmd, serverLink, binding);
+  } finally {
+    // Whatever path the send took (transport, rejection, error), a turn that was never
+    // typed into a process terminal is not a turn that will run.
+    binding.current?.settle();
+  }
+}
+
+async function handleSendBound(cmd: Record<string, unknown>, serverLink: ServerLink, authorityBinding: SendAuthorityBinding): Promise<void> {
   const sessionName = (cmd.sessionName ?? cmd.session) as string | undefined;
   const text = cmd.text as string | undefined;
   const commandId = cmd.commandId as string | undefined;
@@ -4627,7 +4641,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
   const record = (await import('../store/session-store.js')).getSession(sessionName);
   // Records who fed the session. A participant's turn is never cleared by a
   // later owner message: the window ends only when the session goes idle.
-  bindProcessSharedMachineCommand(sessionName, record, cmd);
+  authorityBinding.current = bindProcessSharedMachineCommand(sessionName, record, cmd);
 
   // F4 fix (audit f395d49c-78c) — fail closed when the session record is missing.
   //
@@ -5291,6 +5305,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
 
   try {
     await sendProcessSessionMessage(sessionName, finalText, attachments, {
+      onTyped: () => authorityBinding.current?.typed(),
       originalText: displayText,
       ...(attachmentRetentionPreamble ? { agentMessagePreamble: attachmentRetentionPreamble } : {}),
       commandId: effectiveId,
@@ -5340,6 +5355,8 @@ async function sendProcessSessionMessage(
   finalText: string,
   attachments: TransportAttachment[],
   options?: {
+    /** Called once the text has been written to the terminal (not before: recall and the delivery lock come first). */
+    onTyped?: () => void;
     originalText?: string;
     commandId?: string;
     isLegacy?: boolean;
@@ -5436,6 +5453,7 @@ async function sendProcessSessionMessage(
   const release = await getMutex(sessionName).acquire();
   try {
     await sendShellAwareCommand(sessionName, sendText, agentType);
+    options?.onTyped?.();
   } catch (sendErr) {
     rollbackSummarySyncReservation(memoryContext.summaryReservation);
     const errMsg = sendErr instanceof Error ? sendErr.message : String(sendErr);
@@ -6082,6 +6100,21 @@ async function handleDeleteTimelineMessage(cmd: Record<string, unknown>, serverL
 
 async function handleInput(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
   const sessionName = cmd.sessionName as string | undefined;
+  if (!sessionName || cmd.data === undefined) return;
+  // Transport sessions have no terminal and never reach the process authority window.
+  const binding = getTransportRuntime(sessionName)
+    ? undefined
+    : bindProcessSharedMachineCommand(sessionName, getSession(sessionName), cmd);
+  try {
+    await handleInputBound(cmd, serverLink);
+  } finally {
+    // Written (or failed, counted anyway: fail closed): an idle edge may end this line's turn from now on.
+    binding?.typed();
+  }
+}
+
+async function handleInputBound(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
+  const sessionName = cmd.sessionName as string | undefined;
   const data = cmd.data as string | undefined;
 
   // session.input SHALL NOT require or process commandId
@@ -6095,12 +6128,6 @@ async function handleInput(cmd: Record<string, unknown>, serverLink: ServerLink)
     }
     return;
   }
-
-  // Keystrokes feed the agent too: a participant's input binds the participant
-  // context (the server stamped it), an unstamped one is owner activity. A Map
-  // update only: no I/O on the keystroke path. Control keys (ESC / Ctrl-C) are
-  // bound like any other input and stay usable; they do not unlock anything.
-  bindProcessSharedMachineCommand(sessionName, getSession(sessionName), cmd);
 
   // node-pty writes are synchronous once the ConPTY module is loaded.  Do not
   // queue browser keystrokes behind the process-send mutex on Windows: that
