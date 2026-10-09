@@ -13,6 +13,7 @@
  * After startHookServer() resolves, `activeHookPort` holds the actual port.
  * All hook scripts and plugins read this value at write time.
  */
+import { isLocalHookRequest } from './hook-request-guard.js';
 import { TASK_PAIR_ENGINE_HOOK_PATH, TASK_PAIR_LEGACY_TOOL_HOOK_PATH } from '../../shared/task-pair.js';
 import { RETIRED_SUPERVISION_MCP_MESSAGE, RETIRED_SUPERVISION_MCP_TOOL_SET } from '../../shared/memory-mcp-contracts.js';
 import http from 'http';
@@ -953,6 +954,12 @@ export async function startHookServer(
     if (req.method !== 'POST') {
       res.writeHead(404);
       res.end();
+      return;
+    }
+    // A browser page (DNS rebinding, a cross-site POST) is not a local program: see hook-request-guard.ts.
+    if (!isLocalHookRequest(req.headers)) {
+      res.writeHead(403, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: 'hook_request_not_local' }));
       return;
     }
 
