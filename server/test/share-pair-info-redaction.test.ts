@@ -6,6 +6,7 @@
  */
 import { describe, expect, it } from 'vitest';
 import { filterShareDaemonMessage } from '../src/ws/share-policy.js';
+import { WsBridge } from '../src/ws/bridge.js';
 import { SUPERVISION_TASK_CONSOLE_MSG } from '../../shared/supervision-task-console.js';
 import { TRANSPORT_MSG } from '../../shared/transport-events.js';
 import { TASK_PAIR_TIMELINE_EVENT } from '../../shared/task-pair.js';
@@ -91,10 +92,15 @@ describe('everyone else', () => {
     expect(filterShareDaemonMessage(pairEvent, socket('participant', other))).toBeNull();
   });
 
-  it('the owner has no share state, so the bridge delivers the frame unchanged (nothing here filters it)', async () => {
-    // Pinned at the single choke point: the bridge only filters sockets that HAVE a share state.
-    const bridgeSource = (await import('node:fs')).readFileSync(new URL('../src/ws/bridge.ts', import.meta.url), 'utf8');
-    expect(bridgeSource).toMatch(/const state = this\.browserShareStates\.get\(ws\);\s*if \(!state\) return originalJson;/);
+  it.each(['owner', 'group owner', 'assigned executor', 'assigned auditor'])('%s authorized non-participant access is not redacted by the actual bridge choke point', () => {
+    // Membership/role authorization is unchanged. Authorized non-share sockets have no browserShareStates entry; exercise the real
+    // relay function rather than just matching its source. Assigned-session participant-origin tools are separately tested through MCP.
+    const relay = (WsBridge.prototype as unknown as { filterShareOutgoingJson(ws: unknown, msg: Record<string, unknown>, json: string): string | null }).filterShareOutgoingJson;
+    const bridge = { browserShareStates: new Map() };
+    for (const frame of [...frames.map(([, msg]) => msg), pairEvent, briefResponse]) {
+      const original = text(frame);
+      expect(relay.call(bridge, {}, frame, original)).toBe(original);
+    }
   });
 
   it('the redaction does not mutate the daemon frame (the owner\'s copy of the same frame stays whole)', () => {
