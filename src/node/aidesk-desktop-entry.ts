@@ -417,7 +417,9 @@ export async function ensureAideskDesktopEntry(
       if (!alreadyRunning) {
         launchMacosUserSessionCommand(user, {
           executable: '/usr/bin/open',
-          args: ['-g', MACOS_REMOTE_DESKTOP_RESPONSIBLE_APP_PATH,
+          // -n: a new process even when the app's launcher role (which holds the remote-desktop helpers and has no menu bar) is
+          // already running -- LaunchServices treats both as one application and would only activate that one.
+          args: ['-g', '-n', MACOS_REMOTE_DESKTOP_RESPONSIBLE_APP_PATH,
             '--args', '--aidesk-background'],
         });
       }

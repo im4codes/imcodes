@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { AIDESK_UI_LOG } from '../../shared/aidesk-ui-log.js';
 import { execFileSync } from 'node:child_process';
 import { bootstrapControlledNodeWithDisposition, defaultBootstrapDeps, journalPathFor, markServiceHealthy } from './bootstrap.js';
 import { runComputerUseIpcHelper } from './computer-use-ipc.js';
@@ -232,6 +233,11 @@ async function main(): Promise<void> {
   }
   if (process.argv[2] === LOCAL_PANEL_TIMING.CLI_FLAG) {
     process.stdout.write(`${describeLocalPanelTiming()}\n`);
+    return;
+  }
+  if (process.argv[2] === AIDESK_UI_LOG.CLI_FLAG) {
+    const { describeAideskUiLog } = await import('./aidesk-ui-log.js');
+    process.stdout.write(`${describeAideskUiLog()}\n`);
     return;
   }
   if (process.argv[2] === '--open-local-panel') {

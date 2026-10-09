@@ -27,6 +27,14 @@ extern char** environ;
 namespace imcodes::remote_desktop::macos {
 namespace {
 
+// Set by the aiDesk application (aidesk_agent_main.mm); null in the remote-desktop worker, which does not link the app's UI support.
+DiagnosticsEventSink g_event_sink = nullptr;
+LauncherRunLoopSetup g_launcher_run_loop_setup = nullptr;
+
+void EmitEvent(const char* event) noexcept {
+  if (g_event_sink != nullptr) g_event_sink(event);
+}
+
 void PrepareResponsibleApplication(bool activate) noexcept {
   [NSApplication sharedApplication];
   [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
@@ -180,6 +188,7 @@ class ApplePermissionOnboarding final : public NativePermissionOnboarding {
     // NSApplication makes a LaunchServices-opened onboarding bundle the
     // responsible GUI application, matching the working Computer Use flow.
     PrepareResponsibleApplication(true);
+    // blocking-ok: the worker's native command mode (macos_native_command_v1.cc), a CLI-style process with no app UI; the user-facing app uses StartPermissionRegistrationInBackground
     (void)CGRequestScreenCaptureAccess();
     const void* keys[] = {kAXTrustedCheckOptionPrompt};
     const void* values[] = {kCFBooleanTrue};
@@ -188,6 +197,7 @@ class ApplePermissionOnboarding final : public NativePermissionOnboarding {
         &kCFTypeDictionaryValueCallBacks);
     if (options == nullptr)
       return false;
+    // blocking-ok: same command mode as above
     (void)AXIsProcessTrustedWithOptions(options);
     CFRelease(options);
 
@@ -201,12 +211,14 @@ class ApplePermissionOnboarding final : public NativePermissionOnboarding {
     constexpr auto kProbeInterval = std::chrono::milliseconds(250);
     const auto deadline = std::chrono::steady_clock::now() + kPermissionWait;
     while (std::chrono::steady_clock::now() < deadline) {
+      // blocking-ok: same command mode as above
       if (CGPreflightScreenCaptureAccess() && AXIsProcessTrusted())
         return true;
       @autoreleasepool {
         const auto interval =
             std::chrono::duration<double>(kProbeInterval).count();
         [[NSRunLoop currentRunLoop]
+            // blocking-ok: same command mode as above
             runUntilDate:[NSDate dateWithTimeIntervalSinceNow:interval]];
       }
     }
@@ -317,18 +329,70 @@ bool ExecAiDeskProductHelper(AiDeskProductHelper helper,
     ::signal(SIGTERM, ForwardSignalToHelper);
     ::signal(SIGINT, ForwardSignalToHelper);
     ::signal(SIGHUP, ForwardSignalToHelper);
-    int status = 0;
-    for (;;) {
-      const pid_t reaped = ::waitpid(child, &status, 0);
-      if (reaped == child) break;
-      if (reaped < 0 && errno != EINTR) {
-        ::_exit(EX_OSERR);
+    // The wait is NOT on the main thread. This process registered with
+    // LaunchServices as an application (that is what keeps the grant on this
+    // bundle), and an application whose main thread sits in wait4 for as long as
+    // the helper lives -- hours -- is shown by the Dock as "Application Not
+    // Responding", and a Dock click, `open -b` or a reopen request for the app
+    // is delivered to this process, which never answers. A thread waits; the
+    // main thread runs the event loop, so the process stays responsive.
+    EmitEvent("helper_wait");
+    dispatch_queue_t waiter = dispatch_queue_create("to.aidesk.helper-wait", DISPATCH_QUEUE_SERIAL);
+    dispatch_async(waiter, ^{  // blocking-ok: its own thread, never the main thread
+      int status = 0;
+      for (;;) {
+        const pid_t reaped = ::waitpid(child, &status, 0);  // blocking-ok: the waiter thread
+        if (reaped == child) break;
+        if (reaped < 0 && errno != EINTR) {
+          ::_exit(EX_OSERR);
+        }
       }
+      // The helper's outcome IS this process's outcome: callers read the exit
+      // status (LaunchServices wait, launchd KeepAlive) exactly as before.
+      ::_exit(WIFEXITED(status) ? WEXITSTATUS(status) : 128 + WTERMSIG(status));
+    });
+    if (NSApp != nil) {
+      if (g_launcher_run_loop_setup != nullptr) g_launcher_run_loop_setup();
+      [NSApp run];
+    } else {
+      CFRunLoopRun();
     }
-    // The helper's outcome IS this process's outcome: callers read the exit
-    // status (LaunchServices wait, launchd KeepAlive) exactly as before.
-    ::_exit(WIFEXITED(status) ? WEXITSTATUS(status) : 128 + WTERMSIG(status));
+    ::_exit(EX_SOFTWARE);  // the event loop only ends if something stopped it; the helper is still ours to supervise, so do not linger
   }
+}
+
+void SetAppHooks(DiagnosticsEventSink event_sink, LauncherRunLoopSetup launcher_run_loop_setup) noexcept {
+  g_event_sink = event_sink;
+  g_launcher_run_loop_setup = launcher_run_loop_setup;
+}
+
+void StartPermissionRegistrationInBackground() noexcept {
+  // Everything that can wait -- the prompts (an IPC to the permission service) and the polling for the person's answer -- runs on
+  // its own queue; the application keeps its event loop. Nothing here touches the main thread or NSApp.
+  static dispatch_queue_t queue = dispatch_queue_create("to.aidesk.permission-registration", DISPATCH_QUEUE_SERIAL);
+  dispatch_async(queue, ^{
+    EmitEvent("permission_registration_start");
+    (void)CGRequestScreenCaptureAccess();  // blocking-ok: own queue
+    const void* keys[] = {kAXTrustedCheckOptionPrompt};
+    const void* values[] = {kCFBooleanTrue};
+    CFDictionaryRef options = CFDictionaryCreate(kCFAllocatorDefault, keys, values, 1, &kCFTypeDictionaryKeyCallBacks,
+                                                 &kCFTypeDictionaryValueCallBacks);
+    if (options != nullptr) {
+      (void)AXIsProcessTrustedWithOptions(options);  // blocking-ok: own queue
+      CFRelease(options);
+    }
+    // Stay alive for the person to finish in System Settings ("Quit & Reopen" needs a live application), bounded so a forgotten
+    // prompt cannot poll forever.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::minutes(10);
+    while (std::chrono::steady_clock::now() < deadline) {
+      if (CGPreflightScreenCaptureAccess() && AXIsProcessTrusted()) {  // blocking-ok: own queue
+        EmitEvent("permissions_ready");
+        return;
+      }
+      ::usleep(1000 * 1000);  // blocking-ok: own queue
+    }
+    EmitEvent("permission_registration_gave_up");
+  });
 }
 
 void PrepareMacosPermissionResponsibleApplication() noexcept {

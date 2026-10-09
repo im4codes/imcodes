@@ -119,7 +119,7 @@ export async function refreshMacosAideskApp(deps: AideskAppRefreshDeps): Promise
   const readState = deps.readState ?? defaultReadState;
   const writeState = deps.writeState ?? defaultWriteState;
   const launch = deps.launch ?? ((user: MacosUserSession, path: string) => {
-    launchMacosUserSessionCommand(user, { executable: '/usr/bin/open', args: ['-g', path, '--args', '--aidesk-background'] });
+    launchMacosUserSessionCommand(user, { executable: '/usr/bin/open', args: ['-g', '-n', path, '--args', '--aidesk-background'] });
   });
   try {
     // The install is lazy (the first remote-desktop command triggers it): do it now so "installed" is what the upgrade delivered.

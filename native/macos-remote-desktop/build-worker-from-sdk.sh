@@ -235,11 +235,12 @@ MAIN_SOURCES=(
 )
 # Not components of the remote desktop: the build spike is a probe, the aiDesk agent is the app
 # bundle's entry point and links none of this, and the panel window is the app's own WebKit window
-# (compiled only by scripts/build-aidesk-app.mjs, with -fobjc-arc, from aidesk-agent-build.json).
+# (compiled only by scripts/build-aidesk-app.mjs, with -fobjc-arc, from aidesk-agent-build.json), and so is the app's diagnostics / single-
+# instance support (aidesk_ui_support.mm; its test driver is built by test/native/aidesk-ui-support.test.ts).
 # This list is checked against the directory's *.mm by test/spec/macos-libwebrtc-sdk-consumer.test.ts:
 # an ARC-only source that is not one of BUILD.gn's ARC targets must be named here, or this glob
 # compiles it without ARC.
-EXCLUDED_SOURCES=( build_spike.mm aidesk_agent_main.mm aidesk_panel_window.mm )
+EXCLUDED_SOURCES=( build_spike.mm aidesk_agent_main.mm aidesk_panel_window.mm aidesk_ui_support.mm aidesk_ui_support_test_main.mm )
 
 is_excluded() {
   local candidate="$1" entry

@@ -45,6 +45,17 @@ enum class AiDeskProductHelper {
 // application bundle, irrespective of its command-line mode.
 [[nodiscard]] bool IsMacosPermissionResponsibleApplication() noexcept;
 
+// What only the aiDesk application provides (its diagnostics log, and the launcher's reopen handler). The remote-desktop worker compiles
+// this file too and does not link the application's UI support, so the application registers these at start and the worker leaves them
+// unset. Both are optional.
+using DiagnosticsEventSink = void (*)(const char* event) noexcept;
+using LauncherRunLoopSetup = void (*)() noexcept;
+void SetAppHooks(DiagnosticsEventSink event_sink, LauncherRunLoopSetup launcher_run_loop_setup) noexcept;
+
+// Asks for Screen Recording and Accessibility and waits (up to ten minutes) for the answer, all on a queue of its own: the caller
+// -- the application that was just opened -- keeps its event loop and shows its window. Returns at once.
+void StartPermissionRegistrationInBackground() noexcept;
+
 // Initializes the LaunchServices application identity without requesting or
 // changing any TCC permission. This lets non-interactive readiness and the
 // production LaunchAgent path observe grants owned by the signed app rather

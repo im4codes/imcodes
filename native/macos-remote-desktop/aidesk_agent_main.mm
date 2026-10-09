@@ -31,6 +31,7 @@
 #include "../remote-desktop-common/platform_interfaces.h"
 #include "../remote-desktop-common/aidesk_product_name.h"
 #include "aidesk_panel_window.h"
+#include "aidesk_ui_support.h"
 #include "../remote-desktop-common/local_indicator_visuals.h"
 
 namespace macos = imcodes::remote_desktop::macos;
@@ -98,6 +99,8 @@ NSDictionary *StatusPresentation(NSDictionary *state, NSInteger http_status) {
   root.fragment = nil;
   NSURLSessionConfiguration *configuration =
       [NSURLSessionConfiguration ephemeralSessionConfiguration];
+  // A node that accepts the connection and does not answer must not hold the status poll for the 60 s default.
+  configuration.timeoutIntervalForRequest = 4;
   configuration.HTTPShouldSetCookies = YES;
   configuration.HTTPCookieAcceptPolicy = NSHTTPCookieAcceptPolicyAlways;
   self.session = [NSURLSession sessionWithConfiguration:configuration];
@@ -178,6 +181,7 @@ NSDictionary *StatusPresentation(NSDictionary *state, NSInteger http_status) {
 @implementation AiDeskApplicationDelegate
 - (void)applicationDidFinishLaunching:(NSNotification *)notification {
   (void)notification;
+  macos::UiPhase(macos::kUiPhaseStatusItem);
   self.statusItem = [[NSStatusBar systemStatusBar]
       statusItemWithLength:NSVariableStatusItemLength];
   self.statusItem.button.title = @"ai";
@@ -189,6 +193,8 @@ NSDictionary *StatusPresentation(NSDictionary *state, NSInteger http_status) {
       initWithStateURL:[NSURL URLWithString:@(
           imcodes::remote_desktop::common::kLocalManagementStateUrl)]];
   [self refreshStatus:nil];
+  // Another request for the panel (a second launch of the app, or the node) is handed to this instance: it opens the window.
+  macos::ObserveUiRequests(^{ OpenLocalManagementPanel(); });
   if (g_open_panel_on_launch) OpenLocalManagementPanel();
   self.statusTimer = [NSTimer scheduledTimerWithTimeInterval:2.0
       target:self selector:@selector(refreshStatus:) userInfo:nil repeats:YES];
@@ -251,6 +257,8 @@ int main(int argc, char* argv[]) {
   if (imcodes::aidesk::fs_delegate::IsFsDelegateInvocation(argc, argv)) {
     return imcodes::aidesk::fs_delegate::FsDelegateMain(argc, argv);
   }
+  // `--aidesk-ui-log`: the diagnostics log (what the app did and when the main thread was late), headless.
+  if (argc == 2 && std::strcmp(argv[1], macos::kAiDeskUiLogArgument) == 0) return macos::PrintUiLog();
   if (argc == 3 && std::strcmp(argv[1], "--aidesk-status-probe") == 0) {
     @autoreleasepool {
       NSURL *state_url = [NSURL URLWithString:[NSString stringWithUTF8String:argv[2]]];
@@ -263,6 +271,7 @@ int main(int argc, char* argv[]) {
         if (error == nil && state != nil) result = StatusPresentation(state, status);
         dispatch_semaphore_signal(done);
       }];
+      // blocking-ok: `--aidesk-status-probe` is a headless one-shot command (no window, no run loop), never the user-facing app
       if (dispatch_semaphore_wait(done,
               dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC)) != 0 ||
           result == nil) {
@@ -276,17 +285,32 @@ int main(int argc, char* argv[]) {
       return EXIT_SUCCESS;
     }
   }
+  const bool background_launch = (argc == 2 || argc == 3) &&
+      std::strcmp(argv[1], "--aidesk-background") == 0 &&
+      (argc == 2 || std::strcmp(argv[2], "--aidesk-open-panel") == 0);
+  g_open_panel_on_launch = background_launch && argc == 3;
+  const bool ui_role = background_launch || macos::IsLocalOnboardingAppLaunch(argc, argv);
+
+  // Two roles share this bundle (one identity for the permission grants): the user-facing app (menu bar + panel window) and the
+  // launcher that holds the remote-desktop helpers. LaunchServices treats them as one application, so a request for the app may reach
+  // the launcher; the UI role therefore takes a lock of its own, and a second request is handed to the instance that has it.
+  macos::UiDiagnosticsStart(ui_role ? "ui" : "launcher");
+  macos::SetAppHooks(&macos::UiLogEvent, &macos::InstallLauncherReopenHandler);
+  if (ui_role) {
+    macos::UiPhase(macos::kUiPhaseClaimRole);
+    if (macos::ClaimUiRole() == macos::UiRoleClaim::kHandedOver) {
+      macos::UiLogFlush();
+      return EXIT_SUCCESS;
+    }
+  }
+
   // Registers the LaunchServices identity without asking for anything, so a
   // later permission check is answered against this bundle rather than a
   // parent process.
   if (macos::IsMacosPermissionResponsibleApplication())
     macos::PrepareMacosPermissionResponsibleApplication();
 
-  const bool background_launch = (argc == 2 || argc == 3) &&
-      std::strcmp(argv[1], "--aidesk-background") == 0 &&
-      (argc == 2 || std::strcmp(argv[2], "--aidesk-open-panel") == 0);
-  g_open_panel_on_launch = background_launch && argc == 3;
-  if (background_launch || macos::IsLocalOnboardingAppLaunch(argc, argv)) {
+  if (ui_role) {
     [NSApplication sharedApplication];
     [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
     AiDeskApplicationDelegate *delegate = [[AiDeskApplicationDelegate alloc] init];
@@ -295,15 +319,11 @@ int main(int argc, char* argv[]) {
       [NSApp run];
       return EXIT_SUCCESS;
     }
-    auto onboarding = macos::CreateMacosPermissionOnboarding();
-    if (!onboarding) {
-      std::cerr << "aidesk_onboarding_unavailable\n";
-      return EX_SOFTWARE;
-    }
-    // One prompt per permission, from the app the user just launched.
-    const bool registered = onboarding->RequestRegistration();
-    const bool opened = OpenLocalManagementPanel();
-    if (!registered || !opened) return EXIT_FAILURE;
+    // A Dock / Finder launch: the window first, at once. The permission prompts and the wait for the person's answer used to run
+    // HERE, on the main thread, before the run loop started -- ten minutes of beach ball (and, if they were not granted, no window
+    // ever) -- and now run on their own queue while the app already answers.
+    OpenLocalManagementPanel();
+    macos::StartPermissionRegistrationInBackground();
     [NSApp activateIgnoringOtherApps:YES];
     [NSApp run];
     return EXIT_SUCCESS;
