@@ -18,7 +18,7 @@ import {
   normalizeShareTargetInput,
   resolveEffectiveShareCoverage,
   revokeShare,
-  setServerShareExecGrant,
+  InvalidShareExecGrantError,
   shareTargetRef,
   shareTargetSessionName,
   updateShare,
@@ -404,24 +404,19 @@ tabSharingRoutes.post('/server/:serverId/shares', requireAuth(), async (c) => {
   const target = await normalizeExistingShareTarget(c.env.DB, parsed.data.target as ShareTargetInput);
   if (!target) return c.json({ error: 'invalid_body', reason: 'share-target-unavailable' }, 400);
 
-  // An execute grant is a statement about ONE controlled device: only a participant share of the device itself can carry it.
-  const wantsExecGrant = parsed.data.execGranted === true;
-  if (wantsExecGrant && (target.kind !== 'server' || parsed.data.role !== 'participant' || !await isControlledNodeShareTarget(c.env.DB, target))) {
-    return c.json({ error: 'invalid_body', reason: 'exec_grant_requires_controlled_device_participant' }, 400);
+  let share: Awaited<ReturnType<typeof createOrUpdateShare>>;
+  try {
+    // One upsert changes role/expiry/grant together; POST omission revokes a prior grant.
+    share = await createOrUpdateShare(c.env.DB, {
+      id: randomHex(16), target, targetUserId, role: parsed.data.role as ShareRole,
+      createdBy: userId, expiresAt: parsed.data.expiresAt ?? null,
+      execGranted: parsed.data.execGranted, now,
+    });
+  } catch (error) {
+    if (error instanceof InvalidShareExecGrantError) return c.json({ error: 'invalid_body', reason: error.message }, 400);
+    throw error;
   }
-  const share = await createOrUpdateShare(c.env.DB, {
-    id: randomHex(16),
-    target,
-    targetUserId,
-    role: parsed.data.role as ShareRole,
-    createdBy: userId,
-    expiresAt: parsed.data.expiresAt ?? null,
-    now,
-  });
-  // Written explicitly on every create/update: re-posting a share without the flag takes the grant away (fail closed), never keeps it by accident.
-  if (target.kind === 'server') {
-    await setServerShareExecGrant(c.env.DB, { shareId: share.id, serverId, granted: wantsExecGrant, now });
-  }
+  const wantsExecGrant = share.execGranted;
   await auditShareLifecycle(c, {
     actionType: share.createdAt === now ? 'share.create' : 'share.update',
     decision: share.createdAt === now ? 'accepted' : 'updated',
@@ -444,28 +439,18 @@ tabSharingRoutes.patch('/server/:serverId/shares/:shareId', requireAuth(), async
   const parsed = updateShareSchema.safeParse(body);
   if (!parsed.success) return c.json({ error: 'invalid_body' }, 400);
   const now = Date.now();
-  const share = await updateShare(c.env.DB, {
-    shareId: c.req.param('shareId') ?? '',
-    serverId,
-    role: parsed.data.role,
-    expiresAt: parsed.data.expiresAt,
-    now,
-  });
-  if (!share) return c.json({ error: 'not_found' }, 404);
-  // The execute grant follows the role: any role other than participant clears it, and it can only be SET on a participant share of a
-  // controlled device (a share that already exists, whatever its history).
-  let execGranted = false;
-  if (share.target.kind === 'server') {
-    const current = (await listServerShareExecGrants(c.env.DB, serverId)).get(share.id) === true;
-    const requested = parsed.data.execGranted;
-    if (requested === true && (share.role !== 'participant' || !await isControlledNodeShareTarget(c.env.DB, share.target))) {
-      return c.json({ error: 'invalid_body', reason: 'exec_grant_requires_controlled_device_participant' }, 400);
-    }
-    execGranted = share.role === 'participant' && (requested ?? current);
-    await setServerShareExecGrant(c.env.DB, { shareId: share.id, serverId, granted: execGranted, now });
-  } else if (parsed.data.execGranted === true) {
-    return c.json({ error: 'invalid_body', reason: 'exec_grant_requires_controlled_device_participant' }, 400);
+  let share: Awaited<ReturnType<typeof updateShare>>;
+  try {
+    share = await updateShare(c.env.DB, {
+      shareId: c.req.param('shareId') ?? '', serverId, role: parsed.data.role,
+      expiresAt: parsed.data.expiresAt, execGranted: parsed.data.execGranted, now,
+    });
+  } catch (error) {
+    if (error instanceof InvalidShareExecGrantError) return c.json({ error: 'invalid_body', reason: error.message }, 400);
+    throw error;
   }
+  if (!share) return c.json({ error: 'not_found' }, 404);
+  const execGranted = share.execGranted;
   await auditShareLifecycle(c, {
     actionType: 'share.update',
     decision: 'updated',
