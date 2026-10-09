@@ -12,6 +12,7 @@ import { createHash, randomBytes } from 'node:crypto';
 import { createDatabase, type Database } from '../src/db/client.js';
 import { runMigrations } from '../src/db/migrate.js';
 import { createUser } from '../src/db/queries.js';
+import { MACHINE_HOST_LINK_ROUTE } from '../../shared/machine-reference.js';
 import { machinesRoutes } from '../src/routes/machines.js';
 import { tabSharingRoutes } from '../src/routes/tab-sharing.js';
 import { signJwt } from '../src/security/crypto.js';
@@ -118,6 +119,28 @@ describe('security-relevant management is the OWNER\'s alone', () => {
     expect((await stateOf(id)).exec_enabled).toBe(true);
     expect((await app().request(`/api/machines/${id}/revoke`, { method: 'POST', headers: as('owner') })).status).toBe(200);
     expect((await stateOf(id)).revoked_at).not.toBeNull();
+  });
+});
+
+describe('group filing and host linking (query-serverId routes) are the OWNER\'s alone', () => {
+  const groupRows = async (id: string) => Number((await db.queryOne<{ n: string }>('SELECT COUNT(*) AS n FROM machine_groups WHERE server_id = $1', [id]))!.n);
+  it.each(NON_OWNERS)('%s cannot take the device out of its group, put it into one, or relink its host (404, rows untouched)', async (actor) => {
+    const id = await freshNode();
+    const before = await groupRows(id);
+    const hostBefore = (await db.queryOne<{ host_server_id: string | null }>('SELECT host_server_id FROM servers WHERE id = $1', [id]))!.host_server_id;
+    const out = await app().request(`/api/machines/desk-binding?serverId=${id}`, { method: 'POST', headers: as(actor), body: JSON.stringify({ teamId, member: false }) });
+    const into = await app().request(`/api/machines/desk-binding?serverId=${id}`, { method: 'POST', headers: as(actor), body: JSON.stringify({ teamId, member: true }) });
+    const link = await app().request(`/api/machines${MACHINE_HOST_LINK_ROUTE}?serverId=${id}`, { method: 'POST', headers: as(actor), body: JSON.stringify({ hostServerId: null }) });
+    expect([out.status, into.status, link.status], actor).toEqual([404, 404, 404]);
+    expect(await groupRows(id)).toBe(before);
+    expect((await db.queryOne<{ host_server_id: string | null }>('SELECT host_server_id FROM servers WHERE id = $1', [id]))!.host_server_id).toBe(hostBefore);
+  });
+
+  it('the owner can file the device out of a group', async () => {
+    const id = await freshNode();
+    const out = await app().request(`/api/machines/desk-binding?serverId=${id}`, { method: 'POST', headers: as('owner'), body: JSON.stringify({ teamId, member: false }) });
+    expect(out.status).toBe(200);
+    expect(await groupRows(id)).toBe(0);
   });
 });
 
