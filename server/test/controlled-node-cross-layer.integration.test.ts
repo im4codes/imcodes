@@ -30,7 +30,7 @@ import { MachineExecWorker } from '../../src/node/machine-exec-worker.js';
 import { createDatabase, type Database } from '../src/db/client.js';
 import { runMigrations } from '../src/db/migrate.js';
 import { createServer, createUser } from '../src/db/queries.js';
-import { createOrUpdateShare } from '../src/db/tab-sharing.js';
+import { createOrUpdateShare, setServerShareExecGrant } from '../src/db/tab-sharing.js';
 import { generateControlledNodeId } from '../src/services/controlled-node-identity.js';
 import {
   __setMachineExecRelayDeadlineBufferMsForTests,
@@ -257,8 +257,9 @@ beforeAll(async () => {
      VALUES ($1,$2,'controlled',$3,'online',$4,$5,true,NULL,'node-linux','Linux Node','linux',$6,$7)`,
     [target.serverId, ownerId, sha256(target.token), Date.now(), NODE_ROLE.CONTROLLED, target.nodeId, deskId],
   );
+  const crossShareId = `share_${hex(8)}`;
   await createOrUpdateShare(db, {
-    id: `share_${hex(8)}`,
+    id: crossShareId,
     target: { kind: 'server', serverId: target.serverId },
     targetUserId: participantId,
     role: 'participant',
@@ -266,6 +267,8 @@ beforeAll(async () => {
     expiresAt: null,
     now: Date.now(),
   });
+  // Operating is not executing: the participant runs commands here only because the owner granted EXECUTE on this device.
+  await setServerShareExecGrant(db, { shareId: crossShareId, serverId: target.serverId, granted: true, now: Date.now() });
 
   app = new Hono();
   app.use('*', async (c, next) => {

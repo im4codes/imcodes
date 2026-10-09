@@ -509,7 +509,7 @@ describe('owner-scoped machine listing (DB presence)', () => {
     const list = (await mine.json() as { machines: { serverId: string; online: boolean; execEnabled: boolean; os?: string; nodeRole: string; accessRole?: string }[] }).machines;
     expect(list.length).toBe(1);
     expect(list[0].online).toBe(false); // no heartbeat yet
-    expect(list[0].execEnabled).toBe(true); // installation is explicit consent; owner can still disable later
+    expect(list[0].execEnabled).toBe(false); // a new node does NOT execute until its owner switches execution on (migration 100)
     expect(list[0].nodeRole).toBe(NODE_ROLE.CONTROLLED);
     expect(list[0].os).toBe('linux');
     expect(list[0]).not.toHaveProperty('accessRole'); // rolling-upgrade compatibility with strict old daemons
@@ -548,6 +548,8 @@ describe('owner-scoped machine listing (DB presence)', () => {
     const postMigration = await redeemNode('post-migration', 'new-hostname');
     const legacy = await redeemNode('legacy-install', 'old-hostname');
     await db.execute('UPDATE servers SET ref_name = $2 WHERE id = $1', [legacy.serverId, 'legacy-node']);
+    // New nodes start with execution OFF; the owner switches it on for the devices they mean to run commands on.
+    await db.execute('UPDATE servers SET exec_enabled = true WHERE id = ANY($1::text[])', [[postMigration.serverId, legacy.serverId]]);
 
     const fetchFromApp = (async (input: string | URL | Request, init?: RequestInit) => {
       const url = new URL(typeof input === 'string' || input instanceof URL ? input : input.url);

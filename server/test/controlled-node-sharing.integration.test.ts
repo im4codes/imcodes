@@ -8,7 +8,7 @@ import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { createDatabase, type Database } from '../src/db/client.js';
 import { runMigrations } from '../src/db/migrate.js';
 import { createServer, createUser } from '../src/db/queries.js';
-import { createOrUpdateShare } from '../src/db/tab-sharing.js';
+import { createOrUpdateShare, setServerShareExecGrant } from '../src/db/tab-sharing.js';
 import { issueSharedMachineAuthorityForSession } from '../src/share/shared-machine-authority.js';
 import { machinesRoutes } from '../src/routes/machines.js';
 import { createMachineExecRoutes, machineExecAuditIntentStore } from '../src/routes/machine-exec.js';
@@ -189,8 +189,13 @@ async function createMachineGrant(params: {
   serverId: string;
   role: 'viewer' | 'participant';
   expiresAt?: number | null;
+  /**
+   * The owner's per-device EXECUTE grant. Operating a device is not executing on it (tsk_9a8c291594): these fixtures exercise the
+   * delegation and expiry mechanics, so a participant share carries the grant unless a test says `exec: false`.
+   */
+  exec?: boolean;
 }) {
-  return createOrUpdateShare(db, {
+  const share = await createOrUpdateShare(db, {
     id: `share-${hex(8)}`,
     target: { kind: 'server', serverId: params.serverId },
     targetUserId: params.recipientId,
@@ -199,6 +204,10 @@ async function createMachineGrant(params: {
     expiresAt: params.expiresAt ?? null,
     now: Date.now(),
   });
+  await setServerShareExecGrant(db, {
+    shareId: share.id, serverId: params.serverId, granted: params.role === 'participant' && (params.exec ?? true), now: Date.now(),
+  });
+  return share;
 }
 
 describe('controlled-node sharing reuses grants without becoming a shared Tab', () => {
@@ -294,8 +303,9 @@ describe('controlled-node sharing reuses grants without becoming a shared Tab', 
 
     const operationMatrix = [
       ['/api/machines/' + serverId + '/display-name', { displayName: 'Participant renamed' }, 200],
-      ['/api/machines/' + serverId + '/exec-enabled', { enabled: false }, 200],
-      ['/api/machines/' + serverId + '/exec-enabled', { enabled: true }, 200],
+      // The exec switch is the device OWNER's alone: a participant cannot turn execution off or back on (owner_only, not a missing route).
+      ['/api/machines/' + serverId + '/exec-enabled', { enabled: false }, 403],
+      ['/api/machines/' + serverId + '/exec-enabled', { enabled: true }, 403],
       ['/api/machines/' + serverId + '/auto-unlock', { secret: 'participant-supplied' }, 409],
       ['/api/machines/' + serverId + '/remote-desktop-worker', {}, 409],
     ] as const;
@@ -552,11 +562,13 @@ describe('controlled-node shared action admission', () => {
       machines: [expect.objectContaining({ serverId: targetId })],
     });
 
+    // A turn the participant started never EXECUTES (tsk_9a8c291594), even though the participant holds an execute grant of their own:
+    // the owner's agent must not be a confused deputy. Looking (below) still follows the participant's own access.
     const exec = await app.request(`/api/machine/exec?serverId=${targetId}`, {
       method: 'POST', headers, body: JSON.stringify({ command: 'echo shared' }),
     });
-    expect(exec.status).toBe(200);
-    expect(await exec.json()).toMatchObject({ outcome: 'completed' });
+    expect(exec.status).toBe(403);
+    expect(await exec.json()).toMatchObject({ outcome: 'not_dispatched', reason: 'target_forbidden' });
 
     const computer = await app.request(`/api/machine/computer-use?serverId=${targetId}`, {
       method: 'POST', headers, body: JSON.stringify({ tool: 'list_apps', arguments: {} }),
@@ -564,14 +576,11 @@ describe('controlled-node shared action admission', () => {
     expect(computer.status).toBe(200);
     expect(await computer.json()).toMatchObject({ outcome: 'completed' });
 
+    // Reading a file off the node is execute-class too: refused on a participant-started turn.
     const file = await app.request(`/api/server/${targetId}/machine-file-handle`, {
       method: 'POST', headers, body: JSON.stringify({ path: 'C:\\Temp\\shared.txt' }),
     });
-    const fileBody = await file.json();
-    expect(file.status, JSON.stringify(fileBody)).toBe(200);
-    expect(fileBody).toMatchObject({
-      ok: true, attachment: { serverId: targetId, daemonPath: 'C:\\Temp\\shared.txt' },
-    });
+    expect(file.status).toBe(403);
 
     // The token is only an authenticated admission context. Current role and
     // expiry are re-read at the device action boundary.
@@ -669,6 +678,7 @@ describe('controlled-node shared action admission', () => {
       .filter((route) => route.includes('/:serverId/')))]
       .sort();
     expect(routes).toEqual([
+      'GET /:serverId/exec-audit',
       'POST /:serverId/auto-unlock',
       'POST /:serverId/display-name',
       'POST /:serverId/exec-enabled',
@@ -956,15 +966,17 @@ describe('a shared-session participant reaches only the machines shared with the
     }
   });
 
-  it('keeps working for a participant who also has a machine share or group access (positive control)', async () => {
+  it('lets a participant-started turn LOOK at the nodes the participant reaches themselves, and never execute (positive control + confused deputy)', async () => {
     const t = await scene();
     for (const target of [t.participantShared, t.grouped]) {
-      expect((await exec(t.app, t.delegated, target)).status, `exec ${target}`).toBe(200);
+      // Read-only computer use follows the participant's own access (a machine share, or the group)...
       expect((await computerUse(t.app, t.delegated, target)).status, `computer-use ${target}`).toBe(200);
-      // Admission passed: the node has no live socket here, so the gate answers daemon_offline, not target_forbidden.
-      const file = await fileHandle(t.app, t.delegated, target);
-      expect(file.status, `file ${target}`).toBe(503);
-      expect(await file.json()).toMatchObject({ error: 'daemon_offline' });
+      // ...but exec and file access are execute-class: refused on a turn the participant started, even for the share that carries
+      // an execute grant of the participant's own (the owner's agent is not a confused deputy).
+      const execDenied = await exec(t.app, t.delegated, target);
+      expect(execDenied.status, `exec ${target}`).toBe(403);
+      expect(await execDenied.json()).toMatchObject({ outcome: 'not_dispatched', reason: 'target_forbidden' });
+      expect((await fileHandle(t.app, t.delegated, target)).status, `file ${target}`).toBe(403);
     }
   });
 
@@ -979,18 +991,18 @@ describe('a shared-session participant reaches only the machines shared with the
 
   it('denies again as soon as the participant\'s own access ends, with no fallback to the owner', async () => {
     const t = await scene();
-    expect((await exec(t.app, t.delegated, t.participantShared)).status).toBe(200);
+    expect((await computerUse(t.app, t.delegated, t.participantShared)).status).toBe(200);
     // Expired, then revoked, then downgraded: each is read live on the next action.
     await db.execute('UPDATE server_shares SET expires_at = $3 WHERE server_id = $1 AND target_user_id = $2', [t.participantShared, t.participantId, Date.now() - 1]);
-    expect((await exec(t.app, t.delegated, t.participantShared)).status).toBe(403);
+    expect((await computerUse(t.app, t.delegated, t.participantShared)).status).toBe(403);
     expect(await listed(t.app, t.delegated)).toEqual([t.grouped]);
     await db.execute('UPDATE server_shares SET expires_at = NULL, revoked_at = $3 WHERE server_id = $1 AND target_user_id = $2', [t.participantShared, t.participantId, Date.now()]);
     expect((await computerUse(t.app, t.delegated, t.participantShared)).status).toBe(403);
-    await db.execute('UPDATE server_shares SET revoked_at = NULL, role = $3 WHERE server_id = $1 AND target_user_id = $2', [t.participantShared, t.participantId, 'viewer']);
+    await db.execute('UPDATE server_shares SET revoked_at = NULL, role = $3, exec_granted = false WHERE server_id = $1 AND target_user_id = $2', [t.participantShared, t.participantId, 'viewer']);
     expect((await fileHandle(t.app, t.delegated, t.participantShared)).status).toBe(403);
     // Leaving the group removes the group path too.
     await db.execute('DELETE FROM team_members WHERE user_id = $1', [t.participantId]);
-    expect((await exec(t.app, t.delegated, t.grouped)).status).toBe(403);
+    expect((await computerUse(t.app, t.delegated, t.grouped)).status).toBe(403);
     expect(await listed(t.app, t.delegated)).toEqual([]);
     // The owner turn is untouched by any of it.
     expect((await exec(t.app, t.ownerTurn, t.participantShared)).status).toBe(200);
@@ -1006,7 +1018,7 @@ describe('a shared-session participant reaches only the machines shared with the
     expect((await app403List(t.app, t.delegated))).toBe(403);
   });
 
-  it('records the participant, not the owner, as the actor of an admitted exec', async () => {
+  it('audits a refused participant-turn exec with the participant as the delegated actor, and an unshared target as no_access', async () => {
     const t = await scene();
     const audited = new Hono();
     audited.use('*', async (c, next) => {
@@ -1017,20 +1029,32 @@ describe('a shared-session participant reaches only the machines shared with the
       online: true,
       result: { requestId: 'exec', ok: true, exitCode: 0, stdout: 'ok', stderr: '', durationMs: 1 },
     }), machineExecAuditIntentStore));
-    const response = await exec(audited as never, t.delegated, t.participantShared);
-    expect(response.status).toBe(200);
-    const row = await db.queryOne<{ user_id: string }>(
-      'SELECT user_id FROM machine_exec_audit WHERE source_server_id = $1 AND target_server_id = $2',
+    expect((await exec(audited as never, t.delegated, t.participantShared)).status).toBe(403);
+    const refused = await db.queryOne<{ user_id: string; delegated_actor_user_id: string | null; decision: string; reason: string; outcome: string }>(
+      'SELECT user_id, delegated_actor_user_id, decision, reason, outcome FROM machine_exec_audit WHERE source_server_id = $1 AND target_server_id = $2',
       [t.source.serverId, t.participantShared],
     );
-    expect(row?.user_id).toBe(t.participantId);
-    // And an admission that is refused leaves no audit row behind.
+    expect(refused).toEqual({
+      user_id: t.ownerId, delegated_actor_user_id: t.participantId, decision: 'denied', reason: 'participant_turn', outcome: 'denied',
+    });
+    // An owner turn is audited as the owner (allowed), with no delegated actor.
+    expect((await exec(audited as never, t.ownerTurn, t.participantShared)).status).toBe(200);
+    const allowed = await db.queryOne<{ user_id: string; delegated_actor_user_id: string | null; decision: string }>(
+      `SELECT user_id, delegated_actor_user_id, decision FROM machine_exec_audit
+        WHERE source_server_id = $1 AND target_server_id = $2 AND decision = 'allowed'`,
+      [t.source.serverId, t.participantShared],
+    );
+    expect(allowed).toEqual({ user_id: t.ownerId, delegated_actor_user_id: null, decision: 'allowed' });
+    // A target that is not shared with the participant at all is refused as no_access, and that is audited too.
     expect((await exec(audited as never, t.delegated, t.unshared)).status).toBe(403);
-    expect(await db.queryOne('SELECT 1 FROM machine_exec_audit WHERE target_server_id = $1', [t.unshared])).toBeNull();
+    expect(await db.queryOne<{ reason: string }>('SELECT reason FROM machine_exec_audit WHERE target_server_id = $1', [t.unshared]))
+      .toEqual({ reason: 'no_access' });
   });
 
   it('re-reads the participant\'s own access when a staged upload is redeemed', async () => {
     const t = await scene();
+    const participantDaemon = await fullCredential(t.participantId);
+    const ownDaemon = { 'X-Server-Id': participantDaemon.serverId, authorization: `Bearer ${participantDaemon.token}`, 'content-type': 'application/json' };
     const targetToken = hex(16);
     await db.execute('UPDATE servers SET token_hash = $2 WHERE id = $1', [t.participantShared, sha256(targetToken)]);
     const redeemed: number[] = [];
@@ -1067,7 +1091,8 @@ describe('a shared-session participant reaches only the machines shared with the
     const upload = async () => {
       const form = new FormData();
       form.append('file', new File(['payload'], 'payload.txt', { type: 'text/plain' }));
-      const { 'content-type': _ignored, ...headers } = t.delegated;
+      // The participant's OWN daemon (a turn they did not hand to the owner's agent): they hold the share with the execute grant.
+      const { 'content-type': _ignored, ...headers } = ownDaemon;
       await t.app.request(`/api/server/${t.participantShared}/upload`, { method: 'POST', headers, body: form });
     };
     await upload();
