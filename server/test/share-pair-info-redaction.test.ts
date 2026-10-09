@@ -49,6 +49,7 @@ const pairEvent = {
       // service.ts projects a participant's turnText into noticeText/auditDetails and its marker note into blockedNote. Those private
       // pair notices can quote titles, models or the assigned brief just like raw marker attrs; dropping only named title fields leaks.
       noticeText: `${TITLE}: ${MODEL}\n${BRIEF}`, blockedNote: BRIEF, auditDetails: { rawText: `${TITLE}: ${MODEL}\n${BRIEF}` },
+      cancelReason: BRIEF, checklistAutoTickNotice: BRIEF, futurePrivateNotice: { title: TITLE, model: MODEL, brief: BRIEF },
     },
   },
 };
@@ -76,7 +77,7 @@ describe.each([['participant'], ['viewer']] as const)('a %s share', (role) => {
   it('gets a task_pair.event without title and models; every other event is untouched', () => {
     const out = filterShareDaemonMessage(pairEvent, socket(role)) as { event: { payload: Record<string, unknown> } };
     expect(out.event.payload).toMatchObject({ taskId: 'task-1', verb: 'DISPATCH', executor: 'deck_sub_x', executorLabel: 'Exec', round: 1, blocking: ['P0'] });
-    for (const key of ['title', 'executorModel', 'auditorModel', 'executorThinking', 'auditorThinking', 'noticeText', 'blockedNote', 'auditDetails']) expect(out.event.payload, key).not.toHaveProperty(key);
+    for (const key of ['title', 'executorModel', 'auditorModel', 'executorThinking', 'auditorThinking', 'noticeText', 'blockedNote', 'auditDetails', 'cancelReason', 'checklistAutoTickNotice', 'futurePrivateNotice']) expect(out.event.payload, key).not.toHaveProperty(key);
     expect(filterShareDaemonMessage(ordinaryEvent, socket(role))).toEqual(ordinaryEvent);
   });
 

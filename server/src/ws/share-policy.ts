@@ -1329,12 +1329,16 @@ function redactBriefResponse(msg: Record<string, unknown>, _state: ShareScopedSo
   return { ...msg, brief: null, briefRevision: null };
 }
 
-const SHARE_HIDDEN_PAIR_EVENT_PAYLOAD_KEYS: readonly string[] = [
-  'title', 'executorModel', 'auditorModel', 'executorThinking', 'auditorThinking',
-  // Private pair turnText/notes can repeat the assigned title/model/brief under free-text keys. Share only transition metadata, never
-  // these notices, in live frames or history; ordinary shared-session chat messages are unaffected.
-  'noticeText', 'blockedNote', 'auditDetails',
-];
+// Only operational metadata is public to a share. Free-text notices (including cancellation/checklist/audit messages) originate in
+// private pair turns and can quote the title, model or assigned brief under any key. An allowlist closes that entire class, including
+// stored frames from older/newer daemons, without changing ordinary shared-session chat or the owner's unfiltered copy.
+const SHARE_PAIR_EVENT_OPERATIONAL_KEYS: ReadonlySet<string> = new Set([
+  'taskId', 'verb', 'writer', 'role', 'source', 'effect', 'fromStatus', 'toStatus',
+  'cancelActor', 'cancelSource', 'cancelProvenanceTrusted', 'unusual',
+  'executor', 'executorLabel', 'executorState', 'auditor', 'auditorLabel', 'auditorState',
+  'queuePosition', 'urgent', 'round', 'deliveryRound', 'flags', 'blocking', 'severityCounts', 'verdictJudgement',
+  'executorPool', 'auditorPool', 'checklistAutoTickReason',
+]);
 
 /** A `task_pair.event` loses its pair title and models; every other timeline event is returned as is. */
 function redactPairTimelineEvent(event: unknown): unknown {
@@ -1342,9 +1346,8 @@ function redactPairTimelineEvent(event: unknown): unknown {
   const record = event as Record<string, unknown>;
   if (record.type !== TASK_PAIR_TIMELINE_EVENT) return event;
   const payload = record.payload && typeof record.payload === 'object' && !Array.isArray(record.payload)
-    ? { ...(record.payload as Record<string, unknown>) }
+    ? Object.fromEntries(Object.entries(record.payload).filter(([key]) => SHARE_PAIR_EVENT_OPERATIONAL_KEYS.has(key)))
     : {};
-  for (const key of SHARE_HIDDEN_PAIR_EVENT_PAYLOAD_KEYS) delete payload[key];
   return { ...record, payload };
 }
 
