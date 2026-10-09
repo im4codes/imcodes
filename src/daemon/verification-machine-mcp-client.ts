@@ -1,3 +1,5 @@
+import { daemonApiUrl, type DaemonHttpMethod } from '../../shared/daemon-token-routes.js';
+import { daemonServerAuthHeaders } from '../../shared/daemon-server-auth.js';
 import {
   VERIFICATION_MACHINE_API_PATH,
   VERIFICATION_MACHINE_KIND_LIST,
@@ -65,12 +67,11 @@ async function request(options: Options, path: string, init: RequestInit) {
   timer.unref?.();
   try {
     const response = await (options.fetchImpl ?? fetch)(
-      `${endpoint.workerUrl.replace(/\/+$/u, '')}${VERIFICATION_MACHINE_API_PATH}${path}`,
+      daemonApiUrl(endpoint.workerUrl, (init.method ?? 'GET') as DaemonHttpMethod, `${VERIFICATION_MACHINE_API_PATH}${path}`),
       {
         ...init,
         headers: {
-          Authorization: `Bearer ${endpoint.token}`,
-          'X-Server-Id': endpoint.serverId,
+          ...daemonServerAuthHeaders(endpoint),
           ...(init.body ? { 'Content-Type': 'application/json' } : {}),
         },
         signal: controller.signal,

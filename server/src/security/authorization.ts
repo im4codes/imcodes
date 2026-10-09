@@ -18,6 +18,7 @@ import { isAccountSessionJwt } from './account-session-jwt.js';
 import { evaluateUserAccess, loadUserAccess } from './user-status.js';
 import { USER_STATUS, isUserStatusActive, userStatusDenialCode } from '../../../shared/user-status.js';
 import type { AuthErrorCode } from '../../../shared/auth-error-codes.js';
+import { enforceDaemonTokenRoute } from './daemon-token-policy.js';
 
 export type Role = 'owner' | 'admin' | 'member' | 'unauthenticated';
 
@@ -124,6 +125,7 @@ export async function resolveBearerOutcome(
     // The credential is genuine here, so naming the reason leaks nothing to its holder -- and tells the daemon why it is refused.
     if (!isUserStatusActive(server.owner_status)) return { auth: null, denied: userStatusDenialCode(server.owner_status ?? USER_STATUS.DISABLED) };
     const nodeRole: NodeRole = server.node_role === NODE_ROLE.CONTROLLED ? NODE_ROLE.CONTROLLED : NODE_ROLE.FULL;
+    enforceDaemonTokenRoute(c.req, daemonServerId, nodeRole);
     return { auth: { userId: server.user_id, role: 'owner' as Role, nodeRole, serverId: daemonServerId } };
   }
 

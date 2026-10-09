@@ -1,6 +1,7 @@
 import type { Context } from 'hono';
 import type { Env } from '../env.js';
 import { sha256Hex } from './crypto.js';
+import { enforceDaemonTokenRoute } from './daemon-token-policy.js';
 import { USAGE_INGEST_PATH_HEADER } from '../../../shared/usage-analytics.js';
 import { NODE_ROLE, NODE_ROLE_REFUSAL, type NodeRole } from '../../../shared/remote-exec.js';
 import { USER_STATUS, isUserStatusActive, userStatusDenialCode } from '../../../shared/user-status.js';
@@ -120,6 +121,8 @@ export async function authenticateDaemonServer<E extends { Bindings: Env }>(
       reason: NODE_ROLE_REFUSAL.CONTROLLED_NODE,
     };
   }
+
+  enforceDaemonTokenRoute(c.req, row.id, nodeRole);
 
   return {
     ok: true,

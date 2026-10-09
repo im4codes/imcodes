@@ -1,3 +1,5 @@
+import { daemonApiUrl } from '../../shared/daemon-token-routes.js';
+import { daemonServerAuthHeaders } from '../../shared/daemon-server-auth.js';
 // Daemon MCP → server channel for user-owned pinned messages. The daemon uses
 // its bound credential; the server derives the owner and re-authorizes every
 // referenced session. Tool callers never supply user/server/session identity.
@@ -134,11 +136,11 @@ async function request(
   timer.unref?.();
   try {
     const headers: Record<string, string> = {
-      Authorization: `Bearer ${endpoint.token}`,
-      'X-Server-Id': endpoint.serverId,
+      ...daemonServerAuthHeaders(endpoint),
     };
     if (body !== undefined) headers['Content-Type'] = 'application/json';
-    const res = await (options.fetchImpl ?? fetch)(pinUrl(endpoint, suffix, params), {
+    const url = new URL(pinUrl(endpoint, suffix, params));
+    const res = await (options.fetchImpl ?? fetch)(daemonApiUrl(endpoint.workerUrl, method, url.pathname + url.search), {
       method,
       headers,
       ...(body !== undefined ? { body: JSON.stringify(body) } : {}),

@@ -27,6 +27,7 @@ import {
 } from '../../shared/alias-types.js';
 import { MCP_ERROR_REASONS, type MCPErrorReason } from '../../shared/memory-mcp-errors.js';
 import { sanitizeMcpErrorMessage } from '../../shared/mcp-error-sanitize.js';
+import { daemonApiUrl, type DaemonHttpMethod } from '../../shared/daemon-token-routes.js';
 import { daemonServerAuthHeaders } from '../../shared/daemon-server-auth.js';
 
 const DEFAULT_TIMEOUT_MS = 15_000;
@@ -88,8 +89,8 @@ async function getEndpoint(options: AliasMcpClientOptions): Promise<AliasServerE
   return endpoint;
 }
 
-function aliasUrl(endpoint: AliasServerEndpoint, query = ''): string {
-  return `${cleanBaseUrl(endpoint.workerUrl)}${ALIAS_API_PATH}${query}`;
+function aliasUrl(endpoint: AliasServerEndpoint, method: DaemonHttpMethod, query = ''): string {
+  return daemonApiUrl(cleanBaseUrl(endpoint.workerUrl), method, `${ALIAS_API_PATH}${query}`);
 }
 
 async function parseJsonResponse(res: Response): Promise<unknown> {
@@ -168,7 +169,7 @@ async function requestAliases(
   const timer = setTimeout(() => controller.abort(), options.timeoutMs ?? DEFAULT_TIMEOUT_MS);
   timer.unref?.();
   try {
-    const res = await fetchImpl(aliasUrl(endpoint, query), {
+    const res = await fetchImpl(aliasUrl(endpoint, 'GET', query), {
       method: 'GET',
       headers: {
         ...daemonServerAuthHeaders(endpoint),
@@ -264,7 +265,7 @@ async function aliasWrite(
       ...daemonServerAuthHeaders(endpoint),
     };
     if (body !== undefined) headers['Content-Type'] = 'application/json';
-    const res = await fetchImpl(aliasUrl(endpoint, pathSuffix), {
+    const res = await fetchImpl(aliasUrl(endpoint, method, pathSuffix), {
       method,
       headers,
       ...(body !== undefined ? { body: JSON.stringify(body) } : {}),

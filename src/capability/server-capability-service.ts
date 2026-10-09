@@ -24,6 +24,7 @@ import {
   type CapabilityStatusResult,
   type CapabilitySummary,
 } from '../../shared/capability-management.js';
+import { daemonApiUrl, type DaemonHttpMethod } from '../../shared/daemon-token-routes.js';
 import { daemonServerAuthHeaders } from '../../shared/daemon-server-auth.js';
 
 export interface ServerCapabilityCredentials {
@@ -319,7 +320,7 @@ export class ServerCapabilityService implements CapabilityService {
     const timeoutMs = Math.max(1, Math.min(this.options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS, 60_000));
     const timer = setTimeout(() => controller.abort(new Error('Capability server request timed out')), timeoutMs);
     try {
-      const response = await this.fetchImpl(`${credentials.workerUrl.replace(/\/$/, '')}${path}`, {
+      const response = await this.fetchImpl(daemonApiUrl(credentials.workerUrl, (init.method ?? 'GET') as DaemonHttpMethod, path), {
         ...init,
         signal: controller.signal,
         headers: {

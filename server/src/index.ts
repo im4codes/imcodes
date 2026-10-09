@@ -56,7 +56,7 @@ import { sessionIdentityRoutes } from './routes/session-identities.js';
 import { SESSION_IDENTITY_API_PATH } from '../../shared/session-identity.js';
 import { verificationMachineRoutes } from './routes/verification-machines.js';
 import { VERIFICATION_MACHINE_API_PATH } from '../../shared/verification-machine.js';
-import { CLIENT_TIMEZONE_HEADER, DEVICE_TIMEZONE_HEADER, EXPECTED_USER_ID_HEADER } from '../../shared/http-header-names.js';
+import { CLIENT_TIMEZONE_HEADER, DEVICE_TIMEZONE_HEADER, EXPECTED_USER_ID_HEADER, SERVER_ID_HEADER } from '../../shared/http-header-names.js';
 import { tokenUsageRoutes } from './routes/token-usage.js';
 import { embeddingRoutes } from './routes/embedding.js';
 import { shutdownEmbeddingPool } from './util/embedding-pool.js';
@@ -100,7 +100,7 @@ import { csrfMiddleware } from './security/csrf.js';
 import { cors } from 'hono/cors';
 import { verifyJwt } from './security/crypto.js';
 import { evaluateUserAccess, loadUserAccess } from './security/user-status.js';
-import { resolveServerWebSocketAccess } from './security/authorization.js';
+import { resolveAuth, resolveServerWebSocketAccess } from './security/authorization.js';
 import logger from './util/logger.js';
 import { getPodIdentity } from './util/pod-identity.js';
 import { REMOTE_DESKTOP_APP_MANIFEST_MIME, isRemoteDesktopAppAssetPath } from '../../shared/remote-desktop-app.js';
@@ -232,6 +232,13 @@ export function buildApp(env: Env, options: BuildAppOptions = {}) {
 
   // CSRF protection for all API write operations (skips Bearer auth and safe methods)
   app.use('/api/*', csrfMiddleware());
+
+  // Verify explicit daemon credentials even on public/account-only or unknown
+  // routes. resolveAuth keeps the established cookie-first user-login flow.
+  app.use('/api/*', async (c, next) => {
+    if (c.req.header(SERVER_ID_HEADER)) await resolveAuth(c);
+    await next();
+  });
 
   app.route('/api/auth', authRoutes);
   app.route('/api/auth/github', githubAuthRoutes);

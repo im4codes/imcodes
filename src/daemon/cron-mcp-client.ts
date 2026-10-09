@@ -10,6 +10,7 @@ import type { MCPFeatureFlagValues } from '../../shared/memory-mcp-feature-flags
 import { validateMcpCronAction } from './cron-action-validator.js';
 import { DEVICE_TIMEZONE_HEADER } from '../../shared/http-header-names.js';
 import { normalizeClientTimezone } from '../../shared/client-timezone.js';
+import { daemonApiUrl, type DaemonHttpMethod } from '../../shared/daemon-token-routes.js';
 import { daemonServerAuthHeaders } from '../../shared/daemon-server-auth.js';
 
 const CRON_EXPIRES_AT_MAX_MS = 90 * 24 * 60 * 60 * 1000;
@@ -204,7 +205,8 @@ async function requestCron(
       : Intl.DateTimeFormat().resolvedOptions().timeZone,
   );
   try {
-    const res = await fetchImpl(cronUrl(endpoint, runtimeServerId, pathSuffix), {
+    const url = new URL(cronUrl(endpoint, runtimeServerId, pathSuffix));
+    const res = await fetchImpl(daemonApiUrl(endpoint.workerUrl, (init.method ?? 'GET') as DaemonHttpMethod, url.pathname + url.search), {
       ...init,
       headers: {
         // The credential names the BOUND server (the token belongs to it); the route names the server the job is for.

@@ -10,7 +10,7 @@ import { buildApp } from '../src/index.js';
 import type { Database } from '../src/db/client.js';
 import type { Env } from '../src/env.js';
 import { SERVER_ID_HEADER } from '../../shared/http-header-names.js';
-import { DAEMON_CREDENTIAL_REFUSAL } from '../src/security/authorization.js';
+import { DAEMON_TOKEN_ROUTE_NOT_ALLOWED as DAEMON_CREDENTIAL_REFUSAL } from '../../shared/daemon-token-routes.js';
 
 const TOKEN = 'daemon-token-123';
 const API_KEY = 'deck_0123456789abcdef0123456789abcdef';

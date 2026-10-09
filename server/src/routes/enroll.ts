@@ -1,5 +1,6 @@
 import { activeUserExistsSql } from '../security/user-status.js';
 import { USER_STATUS, isUserStatusActive, userStatusDenialCode } from '../../../shared/user-status.js';
+import { enforceDaemonTokenRoute } from '../security/daemon-token-policy.js';
 import { Hono, type Context } from 'hono';
 import { isAllowedServerUrl } from '../security/server-url.js';
 import { controlledNodeInstallCommand } from '../services/controlled-node-install-command.js';
@@ -1550,6 +1551,7 @@ enrollRoutes.get('/v2/node-artifact', async (c) => {
   if (!isUserStatusActive(server.owner_status)) {
     return c.json({ error: userStatusDenialCode(server.owner_status ?? USER_STATUS.DISABLED) }, 403);
   }
+  enforceDaemonTokenRoute(c.req, server.id, server.node_role === NODE_ROLE.CONTROLLED ? NODE_ROLE.CONTROLLED : NODE_ROLE.FULL);
   // A normal (FULL) daemon may fetch the remote-desktop bundle, and the runtime
   // executable that carries its elevated helper.
   //
