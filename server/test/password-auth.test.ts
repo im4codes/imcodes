@@ -26,7 +26,7 @@ interface MemUser {
 function makeMemDb(): Database {
   const users = new Map<string, MemUser>();
   const apiKeys = new Map<string, { id: string; user_id: string; key_hash: string; label: string | null; created_at: number; revoked_at: number | null; grace_expires_at: number | null }>();
-  const refreshTokens = new Map<string, { id: string; user_id: string; token_hash: string; family_id: string; used_at: number | null; expires_at: number; created_at: number }>();
+  const refreshTokens = new Map<string, { id: string; user_id: string; token_hash: string; family_id: string; used_at: number | null; expires_at: number; created_at: number, owner_status: 'active' }>();
   const servers = new Map<string, { id: string; user_id: string; name: string }>();
   const auditLog: unknown[] = [];
   const lockouts = new Map<string, { identity: string; failed_attempts: number; locked_until: number | null; last_attempt_at: number }>();
@@ -51,7 +51,7 @@ function makeMemDb(): Database {
       }
       if (s.includes('from api_keys where key_hash') && s.includes('revoked_at is null')) {
         for (const k of apiKeys.values()) {
-          if (k.key_hash === params[0] && !k.revoked_at) return { user_id: k.user_id } as T;
+          if (k.key_hash === params[0] && !k.revoked_at) return { user_id: k.user_id, user_status: 'active' } as T;
         }
         return null;
       }
@@ -143,7 +143,7 @@ function makeMemDb(): Database {
         refreshTokens.set(params[0] as string, {
           id: params[0] as string,
           user_id: params[1] as string,
-          token_hash: params[2] as string,
+          token_hash: params[2] as string, owner_status: 'active',
           family_id: params[3] as string,
           used_at: null,
           expires_at: params[4] as number,

@@ -1,3 +1,4 @@
+import { evaluateUserAccess, loadUserAccess } from '../security/user-status.js';
 import { Hono } from 'hono';
 import { getCookie, setCookie, deleteCookie } from 'hono/cookie';
 import type { Env } from '../env.js';
@@ -102,6 +103,9 @@ githubAuthRoutes.get('/callback', async (c): Promise<Response> => {
     }
     userId = payload.sub as string;
     targetOrigin = payload.origin as string ?? null;
+    // The relay token was minted before this request; the account may have been disabled since.
+    const relayDecision = evaluateUserAccess(await loadUserAccess(c.env.DB, userId));
+    if (!relayDecision.ok) return c.json({ error: relayDecision.code }, 403);
   } else {
     // --- Standard Flow: Handling code/state from GitHub ---
     if (!code || !state) {
@@ -185,6 +189,9 @@ githubAuthRoutes.get('/callback', async (c): Promise<Response> => {
       await upsertPlatformIdentity(c.env.DB, randomHex(16), user.id, 'github', String(githubUser.id));
     }
     userId = user.id;
+    // A disabled (or pending) account does not sign in through GitHub either: no relay token and no session is minted.
+    const loginDecision = evaluateUserAccess(await loadUserAccess(c.env.DB, userId));
+    if (!loginDecision.ok) return c.json({ error: loginDecision.code }, 403);
 
     // Cross-domain relay: exchange is done, now relay with a signed token
     // so the proxy domain can set cookies without needing the oauth_state cookie.

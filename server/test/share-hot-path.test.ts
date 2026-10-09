@@ -1,3 +1,4 @@
+import { activeUserAnswer } from './helpers/user-status.js';
 import { EventEmitter } from 'node:events';
 import { beforeEach, describe, expect, it } from 'vitest';
 import { WsBridge, __setShareBridgeClockForTests } from '../src/ws/bridge.js';
@@ -39,7 +40,8 @@ function makeCountingDb(delay: (callNo: number) => number, counts = { n: 0, audi
   const wait = () => sleep(delay(counts.n));
   const db = {
     queryOne: async (sql: string) => {
-      if (sql.includes('SELECT token_hash')) return { token_hash: sha256Hex('t') };
+      { const activeUser = activeUserAnswer(sql); if (activeUser) return activeUser as never; }
+      if (sql.includes('SELECT token_hash')) return { token_hash: sha256Hex('t'), owner_status: 'active' };
       counts.n += 1; await wait();
       if (sql.includes('EXISTS')) return { exists: true };
       if (sql.includes('runtime_type')) return { runtime_type: 'transport' };
@@ -295,6 +297,7 @@ describe('participant keystrokes through the bridge', () => {
     const db = makeCountingDb(() => 0, counts) as unknown as { queryOne: (sql: string, params?: unknown[]) => Promise<unknown> };
     const inner = db.queryOne.bind(db);
     db.queryOne = async (sql: string, params?: unknown[]) => {
+      { const activeUser = activeUserAnswer(sql); if (activeUser) return activeUser as never; }
       if (sql.includes('SELECT project_name FROM sessions')) {
         bindings.n += 1;
         return bindings.fail ? null : { project_name: 'proj' };

@@ -120,7 +120,7 @@ function makeDb(ownerUserId = 'owner-1', nodeRole = 'full'): Database {
     queryOne: async (sql: string) => {
       if (sql.includes('token_hash')) {
         return {
-          token_hash: sha256Hex('raw-token'),
+          token_hash: sha256Hex('raw-token'), owner_status: 'active',
           user_id: ownerUserId,
           node_role: nodeRole,
           revoked_at: null,

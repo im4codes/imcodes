@@ -1,6 +1,8 @@
 /**
  * File transfer routes: upload and download via HTTP, relayed to daemon over WS.
  */
+import { isUserActive } from '../security/user-status.js';
+import { AUTH_ERROR_CODES } from '../../../shared/auth-error-codes.js';
 import { Hono, type Context } from 'hono';
 import type { Env } from '../env.js';
 import { requireAuth } from '../security/authorization.js';
@@ -639,6 +641,11 @@ fileTransferRoutes.use('/:id/uploads/:attachmentId/download', async (c, next) =>
     const attachmentId = c.req.param('attachmentId')!;
     if (entry.serverId !== serverId || entry.attachmentId !== attachmentId) {
       return c.json({ error: 'token_resource_mismatch' }, 403);
+    }
+    // The token stands in for its issuer's login: a user disabled since it was issued downloads nothing (security/user-status.ts).
+    if (!await isUserActive(c.env.DB, entry.userId)) {
+      downloadTokens.delete(token);
+      return c.json({ error: AUTH_ERROR_CODES.ACCOUNT_DISABLED }, 403);
     }
     entry.remainingUses -= 1;
     if (entry.remainingUses <= 0) downloadTokens.delete(token);

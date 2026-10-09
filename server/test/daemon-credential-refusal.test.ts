@@ -3,6 +3,7 @@
  * requireAuth route. The token lives in ~/.imcodes/server.json, which the owner's agents (a participant-driven turn included) can read,
  * so account administration and credential minting must not accept it.
  */
+import { activeUserAnswer } from './helpers/user-status.js';
 import { createHash } from 'node:crypto';
 import { describe, expect, it } from 'vitest';
 import { buildApp } from '../src/index.js';
@@ -18,8 +19,9 @@ const sha = (v: string) => createHash('sha256').update(v).digest('hex');
 function makeApp() {
   const db = {
     queryOne: async (sql: string, params: unknown[] = []) => {
+      { const activeUser = activeUserAnswer(sql); if (activeUser) return activeUser as never; }
       const s = sql.toLowerCase().replace(/\s+/g, ' ');
-      if (s.includes('from servers where id')) return { token_hash: sha(TOKEN), user_id: 'admin-1', node_role: null, revoked_at: null };
+      if (s.includes('from servers where id')) return { token_hash: sha(TOKEN), owner_status: 'active', user_id: 'admin-1', node_role: null, revoked_at: null };
       if (s.includes('from api_keys')) return params[0] === sha(API_KEY) ? { id: 'key-1', user_id: 'admin-1' } : null;
       if (s.includes('from users where id')) return { id: 'admin-1', is_admin: true, status: 'active' };
       return null;

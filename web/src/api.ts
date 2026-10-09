@@ -7,6 +7,7 @@
 import { COOKIE_SESSION, COOKIE_CSRF, HEADER_CSRF } from '@shared/cookie-names.js';
 import { CLIENT_TIMEZONE_HEADER, EXPECTED_USER_ID_HEADER } from '@shared/http-header-names.js';
 import { AUTH_IDENTITY_ERRORS } from '@shared/auth-identity.js';
+import { AUTH_ERROR_CODES } from '@shared/auth-error-codes.js';
 import { CONTROLLED_NODE_MINT_ERRORS } from '@shared/controlled-node-artifacts.js';
 import { normalizeClientTimezone } from '@shared/client-timezone.js';
 import { PREVIEW_ACCESS_TOKEN_QUERY_PARAM } from '@shared/preview-types.js';
@@ -687,6 +688,11 @@ export async function apiFetch<T = unknown>(
         }
       } catch { /* refresh failed */ }
       throw new ApiError(403, body);
+    }
+    // The ACCOUNT was disabled (or is pending) while this session was open: the server refuses every credential of it with these codes.
+    // That is the end of the login, not a failure of this one request.
+    if (body.includes(AUTH_ERROR_CODES.ACCOUNT_DISABLED) || body.includes(AUTH_ERROR_CODES.ACCOUNT_PENDING)) {
+      _onAuthExpired?.(body.includes(AUTH_ERROR_CODES.ACCOUNT_PENDING) ? AUTH_ERROR_CODES.ACCOUNT_PENDING : AUTH_ERROR_CODES.ACCOUNT_DISABLED);
     }
     throw new ApiError(403, body);
   }

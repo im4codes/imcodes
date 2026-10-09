@@ -1,3 +1,4 @@
+import { activeUserAnswer } from './helpers/user-status.js';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { Hono } from 'hono';
 import { sha256Hex } from '../src/security/crypto.js';
@@ -36,6 +37,7 @@ function makeMockDb(options: { userPrefs?: Record<string, string> } = {}) {
   const tokenHash = sha256Hex('daemon-token');
   const db: Database = {
     queryOne: async <T = unknown>(sql: string, params: unknown[] = []) => {
+      { const activeUser = activeUserAnswer(sql); if (activeUser) return activeUser as never; }
       const s = normalize(sql);
       if (s.includes('from user_preferences')) {
         const value = options.userPrefs?.[`${String(params[0])}:${String(params[1])}`];
@@ -46,7 +48,7 @@ function makeMockDb(options: { userPrefs?: Record<string, string> } = {}) {
       // make a controlled or revoked credential look like a full daemon.
       if (s.includes('from servers where id = $1 and token_hash = $2')) {
         return params[0] === 'srv-1' && params[1] === tokenHash
-          ? ({ id: 'srv-1', team_id: 'ent-1', user_id: 'owner-1', node_role: 'full', revoked_at: null } as T)
+          ? ({ id: 'srv-1', team_id: 'ent-1', user_id: 'owner-1', node_role: 'full', revoked_at: null, owner_status: 'active' } as T)
           : null;
       }
       return null;

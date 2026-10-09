@@ -1,6 +1,7 @@
 /**
  * Cron handler: every minute — find due cron_jobs, dispatch via WsBridge.
  */
+import { activeUserExistsSql } from '../security/user-status.js';
 import { Cron } from 'croner';
 import type { Env } from '../env.js';
 import type { DbCronJob } from '../db/queries.js';
@@ -117,6 +118,7 @@ async function claimDueJobs(
       `SELECT *, last_run_at AS previous_run_at FROM cron_jobs
        WHERE status = $2 AND next_run_at <= $1
          AND (expires_at IS NULL OR expires_at >= $1)
+         AND ${activeUserExistsSql('cron_jobs.user_id')}
        ORDER BY next_run_at ASC
        LIMIT 50
        FOR UPDATE SKIP LOCKED`,
@@ -163,6 +165,7 @@ async function claimDueJobs(
        SELECT id, last_run_at AS previous_run_at FROM cron_jobs
        WHERE status = $2 AND next_run_at <= $1
          AND (expires_at IS NULL OR expires_at >= $1)
+         AND ${activeUserExistsSql('cron_jobs.user_id')}
        ORDER BY next_run_at ASC
        LIMIT 50
        FOR UPDATE SKIP LOCKED
@@ -189,8 +192,9 @@ async function recoverPendingDispatches(env: Env): Promise<ClaimedCronJob[]> {
       `SELECT j.*, e.id AS execution_id, e.detail AS execution_detail
          FROM cron_executions e
          JOIN cron_jobs j ON j.id = e.job_id
-        WHERE e.status = 'pending_dispatch'
-           OR (e.status = 'dispatching' AND e.created_at <= $1)
+        WHERE (e.status = 'pending_dispatch'
+           OR (e.status = 'dispatching' AND e.created_at <= $1))
+          AND ${activeUserExistsSql('j.user_id')}
         ORDER BY e.created_at ASC
         LIMIT 50
         FOR UPDATE OF e SKIP LOCKED`,

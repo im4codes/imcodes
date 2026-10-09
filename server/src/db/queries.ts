@@ -1,3 +1,4 @@
+import { USER_STATUS, type UserStatus } from '../../../shared/user-status.js';
 import type { Database } from './client.js';
 import type { ContextModelConfig } from '../../../shared/context-types.js';
 import type {
@@ -20,7 +21,7 @@ export interface DbUser {
   display_name: string | null;
   password_must_change: boolean | null;
   is_admin: boolean;
-  status: 'active' | 'pending' | 'disabled';
+  status: UserStatus;
 }
 
 export interface DbPlatformIdentity {
@@ -278,8 +279,42 @@ export async function listAllUsers(db: Database): Promise<DbUser[]> {
   return db.query<DbUser>('SELECT * FROM users ORDER BY created_at ASC');
 }
 
-export async function updateUserStatus(db: Database, userId: string, status: 'active' | 'pending' | 'disabled'): Promise<void> {
+export async function updateUserStatus(db: Database, userId: string, status: UserStatus): Promise<void> {
   await db.execute('UPDATE users SET status = $1 WHERE id = $2', [status, userId]);
+}
+
+export interface DisabledUserSessionsEnded {
+  apiKeysRevoked: number;
+  refreshTokensEnded: number;
+  loginNoncesDeleted: number;
+  nativeRemoteDesktopSessionsRevoked: number;
+}
+
+/**
+ * Disable a user AND end everything that would otherwise outlive the status: one transaction, so there is no window in which the
+ * account is off but its sessions are not.
+ *  - `users.sessions_valid_after` is stamped: login tokens (stateless JWTs) minted before it are refused even after the account is
+ *    enabled again;
+ *  - API keys are revoked (revoked_at), refresh tokens used up, pending API-key login nonces deleted, native remote-desktop sessions revoked.
+ * Enabling later restores the STATUS only; none of the above is resurrected. Live sockets are closed by the caller (they are per pod).
+ */
+export async function disableUserEndingSessions(db: Database, userId: string, now: number): Promise<DisabledUserSessionsEnded> {
+  return db.transaction(async (tx) => {
+    await tx.execute(
+      'UPDATE users SET status = $1, sessions_valid_after = GREATEST(sessions_valid_after, $2) WHERE id = $3',
+      [USER_STATUS.DISABLED, now, userId],
+    );
+    const keys = await tx.execute('UPDATE api_keys SET revoked_at = $1 WHERE user_id = $2 AND revoked_at IS NULL', [now, userId]);
+    const refresh = await tx.execute('UPDATE refresh_tokens SET used_at = $1 WHERE user_id = $2 AND used_at IS NULL', [now, userId]);
+    const nonces = await tx.execute('DELETE FROM auth_nonces WHERE user_id = $1', [userId]);
+    const native = await tx.execute('UPDATE remote_desktop_native_sessions SET revoked_at = $1 WHERE user_id = $2 AND revoked_at IS NULL', [now, userId]);
+    return {
+      apiKeysRevoked: keys.changes,
+      refreshTokensEnded: refresh.changes,
+      loginNoncesDeleted: nonces.changes,
+      nativeRemoteDesktopSessionsRevoked: native.changes,
+    };
+  });
 }
 
 export async function deleteUser(db: Database, userId: string): Promise<void> {
@@ -291,7 +326,7 @@ export async function deleteUser(db: Database, userId: string): Promise<void> {
 }
 
 export async function countActiveAdmins(db: Database): Promise<number> {
-  const row = await db.queryOne<{ cnt: number }>("SELECT COUNT(*) as cnt FROM users WHERE is_admin = TRUE AND status = 'active'");
+  const row = await db.queryOne<{ cnt: number }>("SELECT COUNT(*) as cnt FROM users WHERE is_admin = TRUE AND status = '" + USER_STATUS.ACTIVE + "'");
   return Number(row?.cnt ?? 0);
 }
 

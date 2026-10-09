@@ -1,3 +1,4 @@
+import { activeUserAnswer } from './helpers/user-status.js';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { buildApp } from '../src/index.js';
 import { WsBridge } from '../src/ws/bridge.js';
@@ -24,6 +25,7 @@ function makeMemDb(): Database {
         && (row.scope === 'user' || (row.scope === 'project' && row.scope_key === projectKey))) as T[];
     },
     queryOne: async <T = unknown>(sql: string, params: unknown[] = []) => {
+      { const activeUser = activeUserAnswer(sql); if (activeUser) return activeUser as never; }
       if (sql.includes('FROM user_aliases')) {
         return (params[0] === 'user-1' && params[1] === ALIAS_ID ? {
           id: ALIAS_ID, name: '211', value: 'ssh k@172.16.253.211', description: null,

@@ -1,3 +1,4 @@
+import { activeUserAnswer } from './helpers/user-status.js';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { EventEmitter } from 'node:events';
 import { createHash } from 'node:crypto';
@@ -50,10 +51,11 @@ function makeMemDb(options: { serverUserId?: string } = {}): Database {
       return [...rows.values()].filter((row) => row.user_id === params[0]) as T[];
     },
     queryOne: async <T = unknown>(sql: string, params: unknown[] = []) => {
+      { const activeUser = activeUserAnswer(sql); if (activeUser) return activeUser as never; }
       const normalized = sql.toLowerCase().replace(/\s+/g, ' ');
       if (normalized.includes('from servers where id')) {
         return {
-          token_hash: DAEMON_TOKEN_HASH, user_id: options.serverUserId ?? 'user-1', node_role: null, revoked_at: null, os: null,
+          token_hash: DAEMON_TOKEN_HASH, owner_status: 'active', actor_status: 'active', user_id: options.serverUserId ?? 'user-1', node_role: null, revoked_at: null, os: null,
         } as T;
       }
       if (normalized.includes('insert into session_identity_metadata')) {

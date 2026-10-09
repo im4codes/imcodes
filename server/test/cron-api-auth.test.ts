@@ -6,6 +6,7 @@
  * (share recipients and group members receive it; it is in URLs and logs) could create, read, change, trigger and delete
  * the owner's cron jobs: jobs that inject prompts or commands into the owner's agent sessions.
  */
+import { activeUserAnswer } from './helpers/user-status.js';
 import { beforeEach, describe, expect, it } from 'vitest';
 import { Hono } from 'hono';
 import type { Env } from '../src/env.js';
@@ -33,14 +34,15 @@ function makeDb(servers: ServerRow[]) {
   const find = (id: unknown) => servers.find((server) => server.id === id);
   const db = {
     queryOne: async <T = unknown>(sql: string, params: unknown[] = []): Promise<T | null> => {
+      { const activeUser = activeUserAnswer(sql); if (activeUser) return activeUser as never; }
       const s = normalize(sql);
-      if (s.includes('select token_hash, user_id, node_role, revoked_at from servers where id')) {
+      if ((s.startsWith('select token_hash, user_id, node_role, revoked_at') && s.includes('from servers where id'))) {
         const server = find(params[0]);
-        return (server ? { token_hash: sha256Hex(server.token), user_id: server.user_id, node_role: server.node_role, revoked_at: server.revoked_at } : null) as T | null;
+        return (server ? { token_hash: sha256Hex(server.token), owner_status: 'active', user_id: server.user_id, node_role: server.node_role, revoked_at: server.revoked_at } : null) as T | null;
       }
-      if (s.includes('select user_id from servers where id')) {
+      if (s.startsWith('select user_id') && s.includes('from servers where id')) {
         const server = find(params[0]);
-        return (server ? { user_id: server.user_id } : null) as T | null;
+        return (server ? { user_id: server.user_id, owner_status: 'active', actor_status: 'active' } : null) as T | null;
       }
       if (s.includes('exists (select 1 from servers')) return { exists: Boolean(find(params[0])) } as T;
       if (s.includes('from cron_jobs where id')) {
@@ -84,9 +86,9 @@ const TOKENS = { victim: 'tok-victim', attacker: 'tok-attacker', controlled: 'to
 
 function servers(): ServerRow[] {
   return [
-    { id: VICTIM_SERVER, token: TOKENS.victim, user_id: OWNER, node_role: NODE_ROLE.FULL, revoked_at: null },
-    { id: ATTACKER_SERVER, token: TOKENS.attacker, user_id: ATTACKER, node_role: NODE_ROLE.FULL, revoked_at: null },
-    { id: CONTROLLED_SERVER, token: TOKENS.controlled, user_id: OWNER, node_role: NODE_ROLE.CONTROLLED, revoked_at: null },
+    { id: VICTIM_SERVER, token: TOKENS.victim, user_id: OWNER, node_role: NODE_ROLE.FULL, revoked_at: null, owner_status: 'active' },
+    { id: ATTACKER_SERVER, token: TOKENS.attacker, user_id: ATTACKER, node_role: NODE_ROLE.FULL, revoked_at: null, owner_status: 'active' },
+    { id: CONTROLLED_SERVER, token: TOKENS.controlled, user_id: OWNER, node_role: NODE_ROLE.CONTROLLED, revoked_at: null, owner_status: 'active' },
     { id: REVOKED_SERVER, token: TOKENS.revoked, user_id: OWNER, node_role: NODE_ROLE.FULL, revoked_at: Date.now() - 1000 },
   ];
 }

@@ -18,7 +18,7 @@ function makeDb(execute: Database['execute']): Database {
   return {
     query: async () => [],
     queryOne: async () => ({
-      token_hash: sha256Hex('token'),
+      token_hash: sha256Hex('token'), owner_status: 'active',
       node_role: NODE_ROLE.CONTROLLED,
       revoked_at: null,
       user_id: 'owner-1',
@@ -85,7 +85,7 @@ describe('controlled worker refresh bridge contract', () => {
       ...db,
       queryOne: async (sql: string) => sql.includes('controlled_worker_refresh_attempt_id')
         ? {
-          token_hash: sha256Hex('token'), node_role: NODE_ROLE.CONTROLLED, revoked_at: null,
+          token_hash: sha256Hex('token'), owner_status: 'active', node_role: NODE_ROLE.CONTROLLED, revoked_at: null,
           user_id: 'owner-1', os: 'linux', controlled_worker_refresh_attempt_id: status.attemptId,
           controlled_worker_refresh_phase: status.phase,
           controlled_worker_refresh_installed_version: status.installedVersion,

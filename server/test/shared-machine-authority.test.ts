@@ -1,3 +1,4 @@
+import { activeUserAnswer } from './helpers/user-status.js';
 import { describe, expect, it } from 'vitest';
 import type { Database } from '../src/db/client.js';
 import {
@@ -10,11 +11,11 @@ const KEY = 'shared-machine-authority-unit-key-at-least-32-bytes';
 
 function fakeDb(role: 'participant' | 'viewer' | null = 'participant'): Database {
   return {
-    queryOne: async (sql: string) => sql.includes('SELECT EXISTS')
+    queryOne: async (sql: string) => activeUserAnswer(sql) ?? (sql.includes('SELECT EXISTS')
       ? { exists: true }
       : sql.includes('FROM sessions')
         ? { project_name: 'project-a' }
-        : null,
+        : null),
     query: async (sql: string) => {
       if (!role || !sql.includes('FROM session_shares')) return [];
       return [{

@@ -49,7 +49,7 @@ function makeDb(): Database {
       if (sql.includes('clock_timestamp()')) return { now_ms: NOW };
       if (sql.includes('remote_desktop_host_endpoints')) return { host_id: HOST_ID, server_id: SERVER_ID };
       return {
-        token_hash: createHash('sha256').update('my-token').digest('hex'),
+        token_hash: createHash('sha256').update('my-token').digest('hex'), owner_status: 'active',
         user_id: 'owner-1', node_role: 'controlled',
         revoked_at: null, os: 'win32',
       };

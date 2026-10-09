@@ -1,6 +1,7 @@
 /**
  * Security tests: cookie path, per-user rate limiting, JWT_SIGNING_KEY length
  */
+import { activeUserAnswer } from './helpers/user-status.js';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { buildApp } from '../src/index.js';
 import type { Env } from '../src/env.js';
@@ -15,7 +16,7 @@ import { AUTH_IDENTITY_ERRORS } from '../../shared/auth-identity.js';
 function makeMemDb(): Database {
   const users = new Map<string, { id: string; created_at: number; is_admin: boolean; status: string }>();
   const apiKeys = new Map<string, { id: string; user_id: string; key_hash: string; created_at: number; revoked_at: number | null; grace_expires_at: number | null }>();
-  const refreshTokens = new Map<string, { id: string; user_id: string; token_hash: string; family_id: string; expires_at: number; created_at: number; used_at: number | null }>();
+  const refreshTokens = new Map<string, { id: string; user_id: string; token_hash: string; family_id: string; expires_at: number; created_at: number; used_at: number | null, owner_status: 'active' }>();
   // auth_lockout: identity → { fail_count, first_fail_at, locked_until }
   const lockout = new Map<string, { identity: string; fail_count: number; first_fail_at: Date; locked_until: Date | null }>();
   const auditLog: unknown[] = [];
@@ -26,6 +27,7 @@ function makeMemDb(): Database {
 
   return {
     queryOne: async <T = unknown>(sql: string, params: unknown[] = []): Promise<T | null> => {
+      { const activeUser = activeUserAnswer(sql); if (activeUser) return activeUser as never; }
       const s = normalize(sql);
 
       if (s.includes('from users where id')) {
@@ -33,7 +35,7 @@ function makeMemDb(): Database {
       }
       if (s.includes('from api_keys where key_hash')) {
         for (const k of apiKeys.values()) {
-          if (k.key_hash === params[0] && !k.revoked_at) return { user_id: k.user_id } as T;
+          if (k.key_hash === params[0] && !k.revoked_at) return { user_id: k.user_id, user_status: 'active' } as T;
         }
         return null;
       }
@@ -99,7 +101,7 @@ function makeMemDb(): Database {
         refreshTokens.set(params[0] as string, {
           id: params[0] as string,
           user_id: params[1] as string,
-          token_hash: params[2] as string,
+          token_hash: params[2] as string, owner_status: 'active',
           family_id: params[3] as string,
           expires_at: params[4] as number,
           created_at: params[5] as number,

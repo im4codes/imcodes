@@ -1,4 +1,5 @@
 import type { Database } from '../db/client.js';
+import { activeUserExistsSql } from '../security/user-status.js';
 import {
   NODE_ROLE,
   type MachineAccessRole,
@@ -73,6 +74,12 @@ const CAN_MANAGE_A_MACHINE_GROUP = `EXISTS (
               AND tm.user_id = $2
               AND tm.role IN ('owner', 'admin')
          )`;
+
+/**
+ * Both the person asking (`$1`) and the machine's owner must be active accounts (security/user-status.ts). A disabled user operates
+ * nothing, and a machine whose owner is disabled is out of service for everyone it was shared with.
+ */
+const ACTIVE_ACCOUNTS_ACCESS_PREDICATE = `${activeUserExistsSql('$1')} AND ${activeUserExistsSql('s.user_id')}`;
 
 const CONTROLLED_MACHINE_ACCESS_SELECT = `
   SELECT s.id, s.user_id, s.node_id, s.ref_name, s.display_name, s.status, s.node_role, s.host_server_id,
@@ -166,6 +173,7 @@ export async function resolveControlledMachineAccess(
       WHERE s.id = $3
         AND s.node_role = $4
         AND s.revoked_at IS NULL
+        AND ${ACTIVE_ACCOUNTS_ACCESS_PREDICATE}
         AND (s.user_id = $1 OR sh.id IS NOT NULL OR ${IS_MEMBER_OF_A_MACHINE_GROUP})
       LIMIT 1`,
     [userId, now, serverId, NODE_ROLE.CONTROLLED],
@@ -247,6 +255,7 @@ export async function resolveRemoteDesktopHostAccess(
     `${CONTROLLED_MACHINE_ACCESS_SELECT}
       WHERE s.id = $3
         AND s.revoked_at IS NULL
+        AND ${ACTIVE_ACCOUNTS_ACCESS_PREDICATE}
         AND (s.user_id = $1 OR sh.id IS NOT NULL OR ${IS_MEMBER_OF_A_MACHINE_GROUP})
       LIMIT 1`,
     [userId, now, serverId],
@@ -277,6 +286,7 @@ export async function listAccessibleControlledMachines(
     `${CONTROLLED_MACHINE_ACCESS_SELECT}
       WHERE s.node_role = $3
         AND s.revoked_at IS NULL
+        AND ${ACTIVE_ACCOUNTS_ACCESS_PREDICATE}
         AND (s.user_id = $1 OR sh.id IS NOT NULL OR ${IS_MEMBER_OF_A_MACHINE_GROUP})
       ORDER BY s.display_name NULLS LAST, s.id
       LIMIT $4`,

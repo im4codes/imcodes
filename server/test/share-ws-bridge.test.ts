@@ -102,7 +102,7 @@ function makeDb(
   const discussionComments = new Map<string, Record<string, unknown>>();
   const db = {
     queryOne: async (sql: string, params?: unknown[]) => {
-      if (sql.includes('SELECT token_hash')) return { token_hash: sha256Hex('t'), ...(options.ownerUserId ? { user_id: options.ownerUserId } : {}) };
+      if (sql.includes('SELECT token_hash')) return { token_hash: sha256Hex('t'), owner_status: 'active', ...(options.ownerUserId ? { user_id: options.ownerUserId } : {}) };
       if (sql.includes('runtime_type')) return { runtime_type: runtimeType };
       if (sql.includes('SELECT 1 FROM sessions')) return { exists: 1 };
       if (sql.includes('SELECT 1 FROM sub_sessions')) return { exists: 1 };

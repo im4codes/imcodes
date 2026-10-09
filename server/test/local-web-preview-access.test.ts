@@ -1,3 +1,4 @@
+import { activeUserAnswer } from './helpers/user-status.js';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { resolveLocalPreviewAccess, commitAuthorizedAccess } from '../src/preview/access.js';
 import { LocalWebPreviewRegistry } from '../src/preview/registry.js';
@@ -11,9 +12,10 @@ import type { Database } from '../src/db/client.js';
 function makeDb(state: { ownerUserId: string }) {
   return {
     queryOne: async <T = unknown>(sql: string) => {
+      { const activeUser = activeUserAnswer(sql); if (activeUser) return activeUser as never; }
       const s = sql.toLowerCase().replace(/\s+/g, ' ').trim();
-      if (s.includes('select user_id from servers where id = $1')) {
-        return { user_id: state.ownerUserId } as unknown as T;
+      if ((s.startsWith('select user_id') && s.includes('from servers where id = $1'))) {
+        return { user_id: state.ownerUserId, owner_status: 'active', actor_status: 'active' } as unknown as T;
       }
       // Group membership lives in `machine_groups` now, keyed by machine
       // rather than by a single column on the server row.

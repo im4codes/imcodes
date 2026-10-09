@@ -12,6 +12,7 @@
  * terminal.stream_reset and unsubscribes the browser from that session.
  */
 
+import { ACCOUNT_WS_CLOSE_CODE, USER_STATUS, isUserStatusActive, userStatusDenialCode } from '../../../shared/user-status.js';
 import { buildCronExecutionResultUpdate } from '../cron/execution-result.js';
 import {
   CONTROLLED_NODE_ACK_SERVER_URLS_FIELD,
@@ -5803,6 +5804,7 @@ export class WsBridge {
           revoked_at?: number | null;
           os?: string | null;
           node_id?: string | null;
+          owner_status?: string | null;
           controlled_upgrade_status?: string | null;
           controlled_upgrade_target_version?: string | null;
           controlled_upgrade_reason?: string | null;
@@ -5824,6 +5826,7 @@ export class WsBridge {
             node_id?: string | null;
           }>(
             `SELECT token_hash, user_id, node_role, revoked_at, os, node_id,
+                    (SELECT u.status FROM users u WHERE u.id = servers.user_id) AS owner_status,
                     controlled_worker_refresh_attempt_id, controlled_worker_refresh_phase,
                     controlled_worker_refresh_installed_version, controlled_worker_refresh_target_version,
                     controlled_worker_refresh_artifact_sha256, controlled_worker_refresh_reason,
@@ -5857,6 +5860,15 @@ export class WsBridge {
         if (server.revoked_at != null) {
           logger.warn({ serverId: this.serverId }, 'Daemon auth rejected: revoked');
           ws.close(4003, 'revoked');
+          finishLocalAuth();
+          return;
+        }
+
+        // A daemon acts as its owner: when the owner's account is disabled (or still pending) the credential is refused, with the account's
+        // own error code as the close reason so the daemon can tell its user why (close 4003 backs off like a revoked credential: no storm).
+        if (!isUserStatusActive(server.owner_status)) {
+          logger.warn({ serverId: this.serverId }, 'Daemon auth rejected: owner account is not active');
+          ws.close(ACCOUNT_WS_CLOSE_CODE, userStatusDenialCode(server.owner_status ?? USER_STATUS.DISABLED));
           finishLocalAuth();
           return;
         }
@@ -11776,8 +11788,33 @@ export class WsBridge {
     }
   }
 
+  /**
+   * The users behind this bridge's live connections: every browser socket (member, controlled-target and share-scoped alike) and the
+   * daemon's owner. The account watcher (security/account-watch.ts) asks one status question for all of them.
+   */
+  collectLiveUserIds(into: Set<string>): void {
+    for (const userId of this.browserUserIds.values()) into.add(userId);
+    if (this.daemonWs && this.daemonOwnerUserId) into.add(this.daemonOwnerUserId);
+  }
+
+  /**
+   * End every live connection of users whose account may no longer act: their browser sockets, and the daemon whose owner they are.
+   * Close code 4003 with the account's error code as the reason (the same code a revoked credential gets, which clients back off on).
+   */
+  closeConnectionsOfUsers(userIds: ReadonlySet<string>, reason: string): { browserSockets: number; daemon: boolean } {
+    let browserSockets = 0;
+    for (const [ws, userId] of [...this.browserUserIds]) {
+      if (!userIds.has(userId)) continue;
+      browserSockets += 1;
+      try { ws.close(ACCOUNT_WS_CLOSE_CODE, reason); } catch { /* already closing */ }
+    }
+    const daemon = Boolean(this.daemonWs && this.daemonOwnerUserId && userIds.has(this.daemonOwnerUserId));
+    if (daemon) this.kickDaemon({ code: ACCOUNT_WS_CLOSE_CODE, reason });
+    return { browserSockets, daemon };
+  }
+
   /** Force-close the daemon WebSocket. Use after token rotation to evict the stale connection. */
-  kickDaemon(): void {
+  kickDaemon(close: { code: number; reason: string } = { code: 4001, reason: 'token_rotated' }): void {
     if (this.daemonWs) {
       if (this.db) {
         void remoteDesktopConsentCancellation.daemonDisconnected(
@@ -11792,7 +11829,7 @@ export class WsBridge {
       // Production WebSocket close is asynchronous. Drain request waiters before
       // clearing the socket identity, or the guarded close handler cannot do it.
       this.rejectAllPendingFileTransfers('daemon_disconnected');
-      try { this.daemonWs.close(4001, 'token_rotated'); } catch { /* ignore */ }
+      try { this.daemonWs.close(close.code, close.reason); } catch { /* ignore */ }
       this.daemonWs = null;
       this.authenticated = false;
       this.authPromise = null;

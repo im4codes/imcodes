@@ -72,7 +72,7 @@ async function buildRig(): Promise<TestRig> {
   let dbLatency = 0;
   const queryOne = async <T = unknown>(): Promise<T | null> => {
     if (dbLatency > 0) await new Promise((r) => setTimeout(r, dbLatency));
-    return { token_hash: 'valid-hash', user_id: '' } as T;
+    return { token_hash: 'valid-hash', user_id: '', owner_status: 'active' } as T;
   };
   const db = {
     queryOne,

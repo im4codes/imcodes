@@ -1,3 +1,4 @@
+import { activeUserAnswer } from './helpers/user-status.js';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { createServer, type Server as HttpServer } from 'node:http';
 import { WebSocket } from 'ws';
@@ -47,6 +48,7 @@ function makeDb(serverId: string, options: ShareDbOptions = {}): Database {
   const memberUserIds = new Set(options.memberUserIds ?? ['member-user']);
   return {
     queryOne: async <T = unknown>(sql: string, params: unknown[] = []) => {
+      { const activeUser = activeUserAnswer(sql); if (activeUser) return activeUser as never; }
       const normalized = sql.toLowerCase().replace(/\s+/g, ' ').trim();
       if (normalized.includes('select exists (select 1 from servers where id = $1)')) {
         return { exists: params[0] === serverId } as T;
@@ -57,8 +59,8 @@ function makeDb(serverId: string, options: ShareDbOptions = {}): Database {
       if (normalized.includes('select exists (select 1 from sub_sessions where server_id = $1 and id = $2')) {
         return { exists: params[0] === serverId && existingSubSessions.has(String(params[1])) } as T;
       }
-      if (normalized.includes('select user_id from servers where id = $1')) {
-        return { user_id: 'member-user' } as T;
+      if ((normalized.startsWith('select user_id') && normalized.includes('from servers where id = $1'))) {
+        return { user_id: 'member-user', owner_status: 'active', actor_status: 'active' } as T;
       }
       if (normalized.includes('select node_role from servers where id = $1 and revoked_at is null')) {
         return { node_role: 'full' } as T;

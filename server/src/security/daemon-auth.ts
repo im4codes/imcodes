@@ -3,6 +3,8 @@ import type { Env } from '../env.js';
 import { sha256Hex } from './crypto.js';
 import { USAGE_INGEST_PATH_HEADER } from '../../../shared/usage-analytics.js';
 import { NODE_ROLE, NODE_ROLE_REFUSAL, type NodeRole } from '../../../shared/remote-exec.js';
+import { USER_STATUS, isUserStatusActive, userStatusDenialCode } from '../../../shared/user-status.js';
+import type { AuthErrorCode } from '../../../shared/auth-error-codes.js';
 
 /**
  * Bearer authentication for daemon-token routes.
@@ -35,6 +37,8 @@ export type DaemonServerAuthResult =
   | { ok: true; auth: DaemonServerAuth }
   | { ok: false; status: 400; error: 'path_header_mismatch' }
   | { ok: false; status: 401; error: 'unauthorized' }
+  /** The credential is genuine but its OWNER's account may not act (disabled or pending): a clear code, not a retryable 401. */
+  | { ok: false; status: 403; error: AuthErrorCode }
   | { ok: false; status: 403; error: 'forbidden'; reason: typeof NODE_ROLE_REFUSAL.CONTROLLED_NODE };
 
 export interface DaemonServerAuthOptions {
@@ -81,12 +85,14 @@ export async function authenticateDaemonServer<E extends { Bindings: Env }>(
 
   const row = serverId
     ? await c.env.DB.queryOne<ServerAuthRow>(
-      `SELECT id, user_id, team_id, node_role, revoked_at
+      `SELECT id, user_id, team_id, node_role, revoked_at,
+              (SELECT u.status FROM users u WHERE u.id = servers.user_id) AS owner_status
          FROM servers WHERE id = $1 AND token_hash = $2`,
       [serverId, tokenHash],
     )
     : await c.env.DB.queryOne<ServerAuthRow>(
-      `SELECT id, user_id, team_id, node_role, revoked_at
+      `SELECT id, user_id, team_id, node_role, revoked_at,
+              (SELECT u.status FROM users u WHERE u.id = servers.user_id) AS owner_status
          FROM servers WHERE token_hash = $1`,
       [tokenHash],
     );
@@ -95,6 +101,11 @@ export async function authenticateDaemonServer<E extends { Bindings: Env }>(
   // "revoked" would confirm to whoever holds it that it was once real.
   if (!row || row.revoked_at != null) {
     return { ok: false, status: 401, error: 'unauthorized' };
+  }
+  // The daemon acts as its owner: a disabled (or pending) owner's daemon is refused with the account's own error code, so the daemon can
+  // tell the user why instead of retrying.
+  if (!isUserStatusActive(row.owner_status)) {
+    return { ok: false, status: 403, error: userStatusDenialCode(row.owner_status ?? USER_STATUS.DISABLED) };
   }
 
   // The role is read from the database, never from anything the caller sent.
@@ -127,6 +138,7 @@ interface ServerAuthRow {
   team_id: string | null;
   node_role: string | null;
   revoked_at: number | null;
+  owner_status: string | null;
 }
 
 /** Render a failure verbatim, so every route refuses in the same shape. */
@@ -135,7 +147,9 @@ export function daemonAuthFailure<E extends { Bindings: Env }>(
   failure: Extract<DaemonServerAuthResult, { ok: false }>,
 ): Response {
   if (failure.status === 403) {
-    return c.json({ error: failure.error, reason: failure.reason }, 403);
+    return 'reason' in failure
+      ? c.json({ error: failure.error, reason: failure.reason }, 403)
+      : c.json({ error: failure.error }, 403);
   }
   return c.json({ error: failure.error }, failure.status);
 }

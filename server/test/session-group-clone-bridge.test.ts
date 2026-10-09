@@ -1,3 +1,4 @@
+import { activeUserAnswer } from './helpers/user-status.js';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { EventEmitter } from 'node:events';
 import { WsBridge } from '../src/ws/bridge.js';
@@ -60,8 +61,9 @@ function makeDb(options: {
   const prefKey = (userId: unknown, key: unknown) => `${String(userId)}:${String(key)}`;
   const db = {
     queryOne: async (sql: string, params?: unknown[]) => {
-      if (sql.includes('token_hash')) return { token_hash: 'valid-hash', user_id: ownerUserId };
-      if (sql.includes('SELECT user_id FROM servers')) return { user_id: ownerUserId };
+      { const activeUser = activeUserAnswer(sql); if (activeUser) return activeUser as never; }
+      if (sql.includes('token_hash')) return { token_hash: 'valid-hash', owner_status: 'active', user_id: ownerUserId };
+      if (/^\s*SELECT user_id\b[\s\S]*FROM servers/.test(sql)) return { user_id: ownerUserId, owner_status: 'active', actor_status: 'active' };
       // Nobody here is in a group, so the machine-group role lookup finds
       // nothing. (It used to be answered from a `team_id` column on the server
       // row; group membership is its own table now.)

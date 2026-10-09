@@ -1,3 +1,4 @@
+import { USER_STATUS } from '../../../shared/user-status.js';
 import { createHash, randomBytes } from 'node:crypto';
 import type { Database } from '../db/client.js';
 import { verifyJwt } from '../security/crypto.js';
@@ -38,6 +39,8 @@ export type AccountSession = {
   kind: 'web' | 'native';
   id: string;
   userId: string;
+  /** `iat` of the login token behind a browser session: one minted before an admin ended the user's sessions is no longer current. */
+  issuedAtSeconds?: number;
 };
 
 /**
@@ -206,7 +209,7 @@ async function accountSessionRemainsCurrent(
          JOIN users AS account ON account.id = session.user_id
         WHERE session.id = $1 AND session.user_id = $2
           AND session.revoked_at IS NULL AND session.expires_at > $3
-          AND account.status = 'active'
+          AND account.status = '${USER_STATUS.ACTIVE}'
         FOR UPDATE OF session`,
       [session.id, session.userId, now],
     );
@@ -222,7 +225,7 @@ async function accountSessionRemainsCurrent(
         WHERE api_key.id = $1 AND api_key.user_id = $2
           AND api_key.revoked_at IS NULL
           AND (api_key.grace_expires_at IS NULL OR api_key.grace_expires_at > $3)
-          AND account.status = 'active'
+          AND account.status = '${USER_STATUS.ACTIVE}'
         FOR UPDATE OF api_key`,
       [apiKeyId, session.userId, now],
     );
@@ -231,13 +234,14 @@ async function accountSessionRemainsCurrent(
   const row = await db.queryOne<{ id: string }>(
     `SELECT account.id
        FROM users AS account
-      WHERE account.id = $1 AND account.status = 'active'
+      WHERE account.id = $1 AND account.status = '${USER_STATUS.ACTIVE}'
+        AND ($4::bigint IS NULL OR $4::bigint * 1000 >= account.sessions_valid_after)
         AND NOT EXISTS (
           SELECT 1 FROM remote_desktop_web_session_revocations AS revoked
            WHERE revoked.session_hash = $2 AND revoked.user_id = account.id
              AND revoked.expires_at > $3
         )`,
-    [session.userId, session.id, now],
+    [session.userId, session.id, now, session.issuedAtSeconds ?? null],
   );
   return row != null;
 }
@@ -256,6 +260,7 @@ export async function resolveBrowserAccountSession(
     kind: 'web',
     id: hashDomain(WEB_SESSION_HASH_DOMAIN, token),
     userId: payload.sub,
+    ...(typeof payload.iat === 'number' ? { issuedAtSeconds: payload.iat } : {}),
   } as const;
   if (!await accountSessionRemainsCurrent(db, session, now)) return null;
   return session;
@@ -401,7 +406,7 @@ export async function exchangeNativeAuthorizationCode(
          AND code.audience = $7
          AND code.expires_at > $8
          AND account.id = code.user_id
-         AND account.status = 'active'
+         AND account.status = '${USER_STATUS.ACTIVE}'
        RETURNING code.user_id, code.account_session_id, code.client_id,
                  code.issuer, code.audience`,
       [
@@ -468,7 +473,7 @@ export async function resolveNativeShellSession(
         AND session.audience = $4
         AND session.revoked_at IS NULL
         AND session.expires_at > $5
-        AND account.status = 'active'`,
+        AND account.status = '${USER_STATUS.ACTIVE}'`,
     [
       hashDomain(SESSION_HASH_DOMAIN, token),
       REMOTE_DESKTOP_NATIVE_CLIENT.clientId,

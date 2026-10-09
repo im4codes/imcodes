@@ -766,4 +766,28 @@ describe('auth nonce exchange API', () => {
     expect(JSON.parse(String(requests[6].body))).toEqual({ username: 'kai', password: 'pw', displayName: 'Kai', native: true });
     expect(JSON.parse(String(requests[8].body))).toEqual({ oldPassword: 'old-pw', newPassword: 'new-pw' });
   });
+  it.each([['account_disabled'], ['account_pending']])(
+    'ends the login (onAuthExpired) when any request is refused with %s, instead of leaving a signed-in shell of failing calls',
+    async (code) => {
+      const fetchMock = vi.mocked(fetch);
+      fetchMock.mockResolvedValue(jsonResponse({ error: code }, 403));
+      const { apiFetch, configure, onAuthExpired, ApiError } = await import('../src/api.js');
+      configure('https://im.example');
+      const expired = vi.fn();
+      onAuthExpired(expired);
+      await expect(apiFetch('/api/aliases')).rejects.toBeInstanceOf(ApiError);
+      expect(expired).toHaveBeenCalledWith(code);
+    },
+  );
+
+  it('does not end the login for an ordinary 403', async () => {
+    const fetchMock = vi.mocked(fetch);
+    fetchMock.mockResolvedValue(jsonResponse({ error: 'forbidden' }, 403));
+    const { apiFetch, configure, onAuthExpired, ApiError } = await import('../src/api.js');
+    configure('https://im.example');
+    const expired = vi.fn();
+    onAuthExpired(expired);
+    await expect(apiFetch('/api/aliases')).rejects.toBeInstanceOf(ApiError);
+    expect(expired).not.toHaveBeenCalled();
+  });
 });

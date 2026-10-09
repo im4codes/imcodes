@@ -103,7 +103,7 @@ function makeMemDb() {
   const challenges = new Map<string, MemChallenge>();
   const apiKeys = new Map<string, MemApiKey>();
   const authNonces = new Map<string, MemAuthNonce>();
-  const refreshTokens = new Map<string, { user_id: string; token_hash: string }>();
+  const refreshTokens = new Map<string, { user_id: string; token_hash: string, owner_status: 'active' }>();
 
   function normalize(sql: string): string {
     return sql.toLowerCase().replace(/\s+/g, ' ').trim();
@@ -222,7 +222,7 @@ function makeMemDb() {
         });
       }
       if (s.includes('insert into refresh_tokens')) {
-        refreshTokens.set(String(params[0]), { user_id: String(params[1]), token_hash: String(params[2]) });
+        refreshTokens.set(String(params[0]), { user_id: String(params[1]), token_hash: String(params[2]), owner_status: 'active' });
       }
       if (s.includes('insert into auth_nonces')) {
         authNonces.set(String(params[0]), {

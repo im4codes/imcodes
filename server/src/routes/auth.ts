@@ -3,10 +3,11 @@ import { getCookie, setCookie, deleteCookie } from 'hono/cookie';
 import type { Env } from '../env.js';
 import type { Database } from '../db/client.js';
 import { createUser, getUserById, getUserByUsername, getSetting, updateUserStatus } from '../db/queries.js';
-import { randomHex, sha256Hex, signJwt, verifyJwt, hashPassword, verifyPassword } from '../security/crypto.js';
+import { randomHex, sha256Hex, signJwt, hashPassword, verifyPassword } from '../security/crypto.js';
 import { checkIdempotency, recordIdempotency } from '../security/replay.js';
 import { checkAuthLockout, recordAuthFailure } from '../security/lockout.js';
-import { resolveServerWebSocketAccess } from '../security/authorization.js';
+import { resolveAuthOutcome, resolveServerWebSocketAccess } from '../security/authorization.js';
+import { isUserActive } from '../security/user-status.js';
 import { WsBridge } from '../ws/bridge.js';
 import { COOKIE_SESSION, COOKIE_CSRF } from '../../../shared/cookie-names.js';
 import { AUTH_ERROR_CODES } from '../../../shared/auth-error-codes.js';
@@ -55,41 +56,10 @@ type AuthRequestMetadata = {
 };
 
 async function resolveUserId(c: AnyAuthContext): Promise<string | null> {
-  // Task 1: Try rcc_session cookie first (parse manually to avoid Hono Context type constraint)
-  const cookieHeader = c.req.header('cookie') ?? '';
-  const cookieMatch = cookieHeader.match(new RegExp(`(?:^|;\\s*)${COOKIE_SESSION}=([^;]+)`));
-  const cookieToken = cookieMatch ? decodeURIComponent(cookieMatch[1]) : null;
-  if (cookieToken && c.env.JWT_SIGNING_KEY) {
-    const jwt = verifyJwt(cookieToken, c.env.JWT_SIGNING_KEY);
-    if (isAccountSessionJwt(jwt)) {
-      const user = await getUserById(c.env.DB, jwt.sub);
-      if (user && user.status === 'active') return user.id;
-    }
-  }
-
-  const auth = c.req.header('Authorization');
-  if (!auth?.startsWith('Bearer ')) return null;
-  const bearerToken = auth.slice(7);
-
-  // Try JWT first (web session tokens) — reject single-use ws-ticket tokens
-  const jwtBearer = verifyJwt(bearerToken, c.env.JWT_SIGNING_KEY);
-  if (isAccountSessionJwt(jwtBearer)) {
-    const user = await getUserById(c.env.DB, jwtBearer.sub);
-    if (user && user.status === 'active') return user.id;
-  }
-
-  // Fall back to API key check
-  const keyHash = sha256Hex(bearerToken);
-  const row = await c.env.DB.queryOne<{ user_id: string }>(
-    'SELECT user_id FROM api_keys WHERE key_hash = $1 AND revoked_at IS NULL',
-    [keyHash],
-  );
-  if (row) {
-    const apiKeyUser = await getUserById(c.env.DB, row.user_id);
-    if (apiKeyUser && apiKeyUser.status === 'active') return row.user_id;
-  }
-
-  return null;
+  // The ONE credential resolver (security/authorization.ts): login cookie / bearer JWT / API key, each followed by the account check, so a
+  // disabled or pending user holds no identity here either. A daemon server-token is not an account credential for these routes.
+  const resolution = await resolveAuthOutcome(c as unknown as Parameters<typeof resolveAuthOutcome>[0]);
+  return resolution.auth && !resolution.auth.serverId ? resolution.auth.userId : null;
 }
 
 function toClientUser(user: Awaited<ReturnType<typeof getUserById>>) {
@@ -454,6 +424,14 @@ authRoutes.post('/token-exchange', async (c) => {
     return c.json({ error: 'invalid_or_expired_nonce' }, 400);
   }
 
+  // The nonce carries a freshly minted API key: a disabled (or pending) user's nonce is consumed and refused, the key is never handed out.
+  if (!await isUserActive(c.env.DB, nonceRow.user_id)) {
+    await logAuthAudit(c, {
+      userId: nonceRow.user_id, action: 'auth.token_exchange', ip, outcomeCode: 'token_exchange_failed', details: { reason: 'account_not_active' },
+    }, c.env.DB);
+    return c.json({ error: 'invalid_or_expired_nonce' }, 400);
+  }
+
   await logAuthAudit(c, {
     userId: nonceRow.user_id,
     action: 'auth.token_exchange',
@@ -637,7 +615,6 @@ authRoutes.delete('/user/me', async (c) => {
 // ── Password auth ─────────────────────────────────────────────────────────
 
 import { validatePasswordComplexity, USERNAME_REGEX } from '../../../shared/password-rules.js';
-import { isAccountSessionJwt } from '../security/account-session-jwt.js';
 import { ACCOUNT_SESSION_JWT_TYPE } from '../../../shared/auth-token-types.js';
 
 // POST /api/auth/password/register — create a new user with username + password

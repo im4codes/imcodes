@@ -1,3 +1,4 @@
+import { activeUserAnswer } from './helpers/user-status.js';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { Hono } from 'hono';
 import { sha256Hex } from '../src/security/crypto.js';
@@ -66,13 +67,14 @@ function makeMockDb() {
 
   const db: Database = {
     queryOne: async <T = unknown>(sql: string, params: unknown[] = []) => {
+      { const activeUser = activeUserAnswer(sql); if (activeUser) return activeUser as never; }
       const normalized = sql.toLowerCase().replace(/\s+/g, ' ').trim();
       // The daemon-token guard reads role and revocation together with the row,
       // and matches on id first. A stub that omits node_role/revoked_at would
       // make a controlled or revoked credential look like a full daemon.
       if (normalized.includes('from servers where id = $1 and token_hash = $2')) {
         if (params[0] === 'srv-1' && params[1] === validTokenHash) {
-          return { id: 'srv-1', team_id: 'ent-1', user_id: 'user-1', node_role: 'full', revoked_at: null } as T;
+          return { id: 'srv-1', team_id: 'ent-1', user_id: 'user-1', node_role: 'full', revoked_at: null, owner_status: 'active' } as T;
         }
         return null;
       }
@@ -770,10 +772,11 @@ describe('shared-context processed remote route', () => {
     const personalDb: Database = {
       ...db,
       queryOne: async <T = unknown>(sql: string, params: unknown[] = []) => {
+      { const activeUser = activeUserAnswer(sql); if (activeUser) return activeUser as never; }
         const normalized = sql.toLowerCase().replace(/\s+/g, ' ').trim();
         if (normalized.includes('from servers where id = $1 and token_hash = $2')) {
           if (params[0] === 'srv-1' && params[1] === sha256Hex('daemon-token')) {
-            return { id: 'srv-1', team_id: null, user_id: 'user-1', node_role: 'full', revoked_at: null } as T;
+            return { id: 'srv-1', team_id: null, user_id: 'user-1', node_role: 'full', revoked_at: null, owner_status: 'active' } as T;
           }
         }
         return db.queryOne<T>(sql, params);
@@ -1103,6 +1106,7 @@ describe('shared-context processed remote route', () => {
     const staleDb: Database = {
       ...db,
       queryOne: async <T = unknown>(sql: string, params: unknown[] = []) => {
+      { const activeUser = activeUserAnswer(sql); if (activeUser) return activeUser as never; }
         const normalized = sql.toLowerCase().replace(/\s+/g, ' ').trim();
         if (normalized.includes('select id, updated_at from shared_context_projections where enterprise_id = $1 and project_id = $2 order by updated_at desc limit 1')) {
           if (params[0] === 'ent-1' && params[1] === 'github.com/acme/repo') {

@@ -21,6 +21,7 @@
  * tested, but nothing dispatches to a daemon.
  */
 
+import { isUserActive } from '../security/user-status.js';
 import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
 import type { Database } from '../db/client.js';
 import {
@@ -769,11 +770,13 @@ export async function claimLinkBrowser(
 ): Promise<{ claimed: boolean }> {
   const keyHash = hashBrowserKey(input.browserKeyThumbprint);
   return db.transaction(async (tx) => {
-    const link = await tx.queryOne<{ id: string; state: string; use_policy: string }>(
-      `SELECT id, state, use_policy FROM remote_desktop_guest_links WHERE id = $1 FOR UPDATE`,
+    const link = await tx.queryOne<{ id: string; state: string; use_policy: string; owner_user_id: string }>(
+      `SELECT id, state, use_policy, owner_user_id FROM remote_desktop_guest_links WHERE id = $1 FOR UPDATE`,
       [input.linkId],
     );
     if (!link || link.state !== 'active') throw new LinkAuthorityError(LINK_REFUSAL.NOT_FOUND);
+    // A link is its owner's authority: a disabled (or pending) owner's links admit nobody (security/user-status.ts).
+    if (!await isUserActive(tx, link.owner_user_id)) throw new LinkAuthorityError(LINK_REFUSAL.NOT_FOUND);
 
     const inserted = await tx.queryOne<{ link_id: string }>(
       `INSERT INTO remote_desktop_guest_browser_claims
@@ -822,6 +825,7 @@ export async function openOrResumeLinkSession(
       [input.linkId, input.hostId],
     );
     if (!link || link.state !== 'active') throw new LinkAuthorityError(LINK_REFUSAL.NOT_FOUND);
+    if (!await isUserActive(tx, link.owner_user_id)) throw new LinkAuthorityError(LINK_REFUSAL.NOT_FOUND);
 
     const claim = await tx.queryOne<{ browser_key_hash: string }>(
       `SELECT browser_key_hash FROM remote_desktop_guest_browser_claims

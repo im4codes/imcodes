@@ -43,7 +43,7 @@ class LoopbackWs extends EventEmitter {
 function serverDb(): Database {
   return {
     queryOne: async (sql: string) => sql.includes('SELECT token_hash')
-      ? { token_hash: sha256Hex('token') }
+      ? { token_hash: sha256Hex('token'), owner_status: 'active' }
       : null,
     query: async () => [],
     execute: async () => ({ changes: 0 }),

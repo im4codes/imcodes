@@ -3,6 +3,7 @@
  * binding at the calling daemon's server, so a daemon that learned another user's bot id received that bot's inbound chat messages.
  * The bot must belong to the server owner (the same rule /api/outbound already applied to sends).
  */
+import { activeUserAnswer } from './helpers/user-status.js';
 import { createHash } from 'node:crypto';
 import { describe, expect, it } from 'vitest';
 import { buildApp } from '../src/index.js';
@@ -16,9 +17,10 @@ function setup() {
   const bindings: unknown[][] = [];
   const db = {
     queryOne: async (sql: string, params: unknown[] = []) => {
+      { const activeUser = activeUserAnswer(sql); if (activeUser) return activeUser as never; }
       const s = sql.toLowerCase().replace(/\s+/g, ' ');
       if (s.includes('from servers where id')) {
-        return params[1] === TOKEN_HASH ? { id: params[0], user_id: 'user-a', team_id: null, node_role: null, revoked_at: null } : null;
+        return params[1] === TOKEN_HASH ? { id: params[0], user_id: 'user-a', team_id: null, node_role: null, revoked_at: null, owner_status: 'active' } : null;
       }
       if (s.includes('from platform_bots')) {
         if (params[0] === 'bot-of-a') return { user_id: 'user-a' };

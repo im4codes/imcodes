@@ -243,7 +243,7 @@ function makeDb(
 ) {
   const db = {
     queryOne: async () => ({
-      token_hash: tokenHash,
+      token_hash: tokenHash, owner_status: 'active',
       node_role: nodeRole,
       revoked_at: null,
       os,
@@ -270,7 +270,7 @@ function makeOpenSpecAutoDeliverOwnershipDb(allowedSessionNames: string[] = []) 
   const allowed = new Set(allowedSessionNames);
   const db = {
     queryOne: async (sql: string, params?: unknown[]) => {
-      if (sql.includes('token_hash')) return { token_hash: 'valid-hash', user_id: 'test-user' };
+      if (sql.includes('token_hash')) return { token_hash: 'valid-hash', owner_status: 'active', user_id: 'test-user' };
       if (sql.includes('FROM sessions WHERE')) {
         const sessionName = typeof params?.[1] === 'string' ? params[1] : '';
         return allowed.has(sessionName) ? { ok: 1 } : null;
@@ -298,7 +298,7 @@ function makeSubSessionOwnershipRaceDb(options: {
   const allowAfterChecks = options.allowAfterChecks ?? 2;
   const db = {
     queryOne: async (sql: string, params?: unknown[]) => {
-      if (sql.includes('token_hash')) return { token_hash: 'valid-hash', user_id: 'test-user' };
+      if (sql.includes('token_hash')) return { token_hash: 'valid-hash', owner_status: 'active', user_id: 'test-user' };
       if (sql.includes('FROM sessions WHERE')) return null;
       if (sql.includes('FROM sub_sessions WHERE')) {
         subChecks += 1;
@@ -324,7 +324,7 @@ function makeRepoCheckoutDb(options: {
   const db = {
     queryOne: async (sql: string, params: unknown[]) => {
       if (sql.includes('SELECT token_hash')) {
-        return { token_hash: 'valid-hash', user_id: 'test-user' };
+        return { token_hash: 'valid-hash', owner_status: 'active', user_id: 'test-user' };
       }
       if (options.throwOnAuthorization && (sql.includes('FROM sessions s') || sql.includes('FROM sub_sessions ss'))) {
         throw new Error('authz unavailable');
@@ -366,7 +366,7 @@ function makeTimelineOwnershipDb(options: {
   const db = {
     queryOne: async (sql: string, params: unknown[]) => {
       if (sql.includes('SELECT token_hash')) {
-        return { token_hash: 'valid-hash', user_id: 'test-user' };
+        return { token_hash: 'valid-hash', owner_status: 'active', user_id: 'test-user' };
       }
       if (options.throwOnOwnership && (sql.includes('FROM sessions WHERE') || sql.includes('FROM sub_sessions WHERE'))) {
         throw new Error('ownership db down');
@@ -833,7 +833,7 @@ describe('WsBridge', () => {
         queryOne: async (sql: string) => {
           if (sql.includes('remote_desktop_host_endpoints')) return hostId ? { host_id: hostId } : null;
           return {
-            token_hash: 'valid-hash',
+            token_hash: 'valid-hash', owner_status: 'active',
             node_role: 'controlled',
             revoked_at: null,
             os: CONTROLLED_NODE_OS_WIN,
@@ -896,6 +896,29 @@ describe('WsBridge', () => {
       expect(ws.closed).toBe(true);
     });
 
+    it.each([['disabled', 'account_disabled'], ['pending', 'account_pending'], [null, 'account_disabled']])(
+      'refuses a daemon whose owner account is %s: close 4003 with the account error code as the reason, never authenticated',
+      async (ownerStatus, reason) => {
+        const bridge = WsBridge.get(serverId);
+        const ws = new MockWs();
+        const db = {
+          queryOne: async () => ({ token_hash: 'valid-hash', user_id: 'owner-1', node_role: 'full', revoked_at: null, owner_status: ownerStatus }),
+          query: async () => [],
+          execute: async () => ({ changes: 1 }),
+          exec: async () => {},
+          transaction: async (fn: (tx: unknown) => Promise<unknown>) => fn(db),
+          close: () => {},
+        };
+        bridge.handleDaemonConnection(ws as never, db as never, {} as never);
+        ws.emit('message', JSON.stringify({ type: 'auth', serverId, token: 'good-token' }));
+        await flushAsync();
+        expect(ws.closed).toBe(true);
+        expect(ws.closeCode).toBe(4003);
+        expect(ws.closeReason).toBe(reason);
+        expect(ws.sentStrings.map((value) => JSON.parse(value))).not.toContainEqual(expect.objectContaining({ type: 'auth_ok' }));
+      },
+    );
+
     // Audit fix (78-server reconnect-storm investigation, 2026-05-11) —
     // pinned regression for the auth-handshake race that produced
     // "Daemon authenticated" log entries every ~500 ms in production
@@ -909,8 +932,8 @@ describe('WsBridge', () => {
       // race window. Without the fix, daemon.hello hits
       // `if (msg.type !== 'auth') ws.close(4001, 'auth_required')`
       // because `this.authenticated` is still false at that moment.
-      let resolveQuery: (value: { token_hash: string } | null) => void = () => {};
-      const queryPromise = new Promise<{ token_hash: string } | null>((res) => { resolveQuery = res; });
+      let resolveQuery: (value: { token_hash: string, owner_status: 'active' } | null) => void = () => {};
+      const queryPromise = new Promise<{ token_hash: string, owner_status: 'active' } | null>((res) => { resolveQuery = res; });
       const db = {
         queryOne: () => queryPromise,
         query: async () => [],
@@ -950,7 +973,7 @@ describe('WsBridge', () => {
       expect(ws.closeCode).toBeUndefined();
 
       // Now resolve the DB query and let auth complete.
-      resolveQuery({ token_hash: 'valid-hash' });
+      resolveQuery({ token_hash: 'valid-hash', owner_status: 'active' });
       await flushAsync();
 
       expect(bridge.isAuthenticated).toBe(true);
@@ -967,7 +990,7 @@ describe('WsBridge', () => {
       const writes: Array<{ sql: string; params: unknown[] }> = [];
       const db = {
         queryOne: async () => ({
-          token_hash: 'valid-hash',
+          token_hash: 'valid-hash', owner_status: 'active',
           node_role: 'controlled',
           revoked_at: null,
           os: CONTROLLED_NODE_OS_LINUX,
@@ -1367,7 +1390,7 @@ describe('WsBridge', () => {
       const executed: Array<{ sql: string; params: unknown[] }> = [];
       const db = {
         queryOne: async () => ({
-          token_hash: 'valid-hash',
+          token_hash: 'valid-hash', owner_status: 'active',
           node_role: 'controlled',
           revoked_at: null,
           os: CONTROLLED_NODE_OS_WIN,
@@ -2895,6 +2918,7 @@ describe('WsBridge', () => {
 
       type AuthRow = {
         token_hash: string;
+        owner_status?: string;
         node_role: 'full';
         revoked_at: null;
       };
@@ -2952,7 +2976,7 @@ describe('WsBridge', () => {
       // and auth promise. The stale continuation must not authenticate gen 2,
       // clear its promise, or rewrite its blocker-sync generation.
       firstAuth.resolveQuery({
-        token_hash: 'valid-hash',
+        token_hash: 'valid-hash', owner_status: 'active',
         node_role: 'full',
         revoked_at: null,
       });
@@ -2963,7 +2987,7 @@ describe('WsBridge', () => {
       // Generation 2 may authenticate, but remains unable to dispatch the
       // pending manual upgrade until its own persisted-blocker sync arrives.
       replacementAuth.resolveQuery({
-        token_hash: 'valid-hash',
+        token_hash: 'valid-hash', owner_status: 'active',
         node_role: 'full',
         revoked_at: null,
       });
@@ -3040,11 +3064,13 @@ describe('WsBridge', () => {
 
       let resolveReplacementAuth!: (value: {
         token_hash: string;
+        owner_status?: string;
         node_role: 'full';
         revoked_at: null;
       }) => void;
       const replacementQuery = new Promise<{
         token_hash: string;
+        owner_status?: string;
         node_role: 'full';
         revoked_at: null;
       }>((resolve) => {
@@ -3077,7 +3103,7 @@ describe('WsBridge', () => {
       expect(replacementWs.sentStrings.filter((raw) => raw.includes('"type":"session.send"'))).toHaveLength(0);
 
       resolveReplacementAuth({
-        token_hash: 'valid-hash',
+        token_hash: 'valid-hash', owner_status: 'active',
         node_role: 'full',
         revoked_at: null,
       });
@@ -4152,7 +4178,7 @@ describe('WsBridge', () => {
       });
       const delayedDb = {
         queryOne: async (sql: string) => {
-          if (sql.includes('FROM servers')) return { token_hash: 'valid-hash' };
+          if (sql.includes('FROM servers')) return { token_hash: 'valid-hash', owner_status: 'active' };
           if (sql.includes('FROM sessions')) return ownershipPending;
           return null;
         },
@@ -7125,7 +7151,7 @@ describe('WsBridge', () => {
     function makePushDb(tokenHash: string) {
       return {
         queryOne: async (sql: string, params?: unknown[]) => {
-          if (sql.includes('FROM servers')) return { token_hash: tokenHash, user_id: 'user-1', name: 'my-server' };
+          if (sql.includes('FROM servers')) return { token_hash: tokenHash, owner_status: 'active', user_id: 'user-1', name: 'my-server' };
           if (sql.includes('FROM sessions') && params?.[1] === 'deck_cd_brain') {
             return { project_name: 'codedeck', agent_type: 'claude-code', label: null };
           }
@@ -8349,7 +8375,7 @@ describe('WsBridge', () => {
     it('updates the exact execution row when executionId is provided', async () => {
       const execSpy = vi.fn(async () => ({ changes: 1 }));
       const db = {
-        queryOne: async () => ({ token_hash: 'valid-hash' }),
+        queryOne: async () => ({ token_hash: 'valid-hash', owner_status: 'active' }),
         query: async () => [],
         execute: execSpy,
         exec: async () => {},
@@ -8380,7 +8406,7 @@ describe('WsBridge', () => {
     it('collapses cumulative streaming snapshots sent by an older daemon before persistence', async () => {
       const execSpy = vi.fn(async () => ({ changes: 1 }));
       const db = {
-        queryOne: async () => ({ token_hash: 'valid-hash' }),
+        queryOne: async () => ({ token_hash: 'valid-hash', owner_status: 'active' }),
         query: async () => [],
         execute: execSpy,
         exec: async () => {},

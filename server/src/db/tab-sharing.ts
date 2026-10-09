@@ -1,4 +1,5 @@
 import type { Database } from './client.js';
+import { isActorAndServerOwnerActive } from '../security/user-status.js';
 import {
   buildShareAuditIdempotencyKey,
   isActiveShareGrant as isSharedActiveShareGrant,
@@ -294,6 +295,8 @@ export async function resolveEffectiveShareCoverage(
   params: { userId: string; target: ShareTarget; now: number },
 ): Promise<EffectiveCoverage | null> {
   if (!await targetExists(db, params.target)) return null;
+  // A disabled grantee operates nothing, and a server whose owner is disabled is out of service for everyone it was shared with.
+  if (!await isActorAndServerOwnerActive(db, params.userId, params.target.serverId)) return null;
   const rows = await coveringShareRows(db, params.userId, params.target, params.now);
   if (rows.length === 0) return null;
   const grants: ShareGrantLike[] = rows.map((row) => ({

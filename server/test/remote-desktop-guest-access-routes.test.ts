@@ -113,7 +113,7 @@ function app() {
 
 const DB = {
   queryOne: vi.fn(async (sql: string) => (
-    sql.includes('FROM api_keys') ? { id: 'mobile-key-1', user_id: 'owner-1' } : null
+    sql.includes('FROM api_keys') ? { id: 'mobile-key-1', user_id: 'owner-1', user_status: 'active' } : null
   )),
   transaction: async (fn: (db: unknown) => Promise<unknown>) => fn({}),
 };

@@ -1,3 +1,5 @@
+import { activeUserExistsSql } from '../security/user-status.js';
+import { USER_STATUS, isUserStatusActive, userStatusDenialCode } from '../../../shared/user-status.js';
 import { Hono, type Context } from 'hono';
 import { isAllowedServerUrl } from '../security/server-url.js';
 import { controlledNodeInstallCommand } from '../services/controlled-node-install-command.js';
@@ -488,6 +490,7 @@ async function reserveAttempt(
         WHERE (ticket_hash = $1 OR install_code_hash = $1)
           AND revoked_at IS NULL
           AND (ticket_expires_at IS NULL OR ticket_expires_at > $2)
+          AND ${activeUserExistsSql('controlled_node_enrollments_v2.owner_user_id')}
         FOR UPDATE`,
       [ticketHash, now],
     );
@@ -1530,8 +1533,11 @@ enrollRoutes.get('/v2/node-artifact', async (c) => {
     revoked_at: number | null;
     os: string | null;
     arch: string | null;
+    owner_status: string | null;
   }>(
-    'SELECT id, token_hash, node_role, revoked_at, os, arch FROM servers WHERE id = $1',
+    `SELECT id, token_hash, node_role, revoked_at, os, arch,
+            (SELECT u.status FROM users u WHERE u.id = servers.user_id) AS owner_status
+       FROM servers WHERE id = $1`,
     [serverId],
   );
   // Unknown, wrong-token and revoked answer identically. A distinct `revoked`
@@ -1539,6 +1545,10 @@ enrollRoutes.get('/v2/node-artifact', async (c) => {
   // contradicted the policy the central daemon-token resolver enforces.
   if (!server || server.token_hash !== tokenHash || server.revoked_at != null) {
     return c.json({ error: 'unauthorized' }, 401);
+  }
+  // The credential is genuine, so the reason can be named: a node acts as its owner, and a disabled owner's nodes download nothing.
+  if (!isUserStatusActive(server.owner_status)) {
+    return c.json({ error: userStatusDenialCode(server.owner_status ?? USER_STATUS.DISABLED) }, 403);
   }
   // A normal (FULL) daemon may fetch the remote-desktop bundle, and the runtime
   // executable that carries its elevated helper.
@@ -1886,9 +1896,11 @@ enrollRoutes.post('/v2/redeem', async (c) => {
                 install_id, node_token_hash, os, arch
            FROM controlled_node_enrollments_v2
           WHERE code_hash = $1
+            AND ${activeUserExistsSql('controlled_node_enrollments_v2.owner_user_id')}
           FOR UPDATE`,
         [codeHash],
       );
+      // A ticket stands for its owner: a disabled (or pending) owner's tickets redeem nothing, whatever their expiry.
       if (!row) return { kind: 'denied' as const };
       if (row.revoked_at != null) return { kind: 'denied' as const };
       // A ticket with no group is the normal case: a machine belongs to whoever

@@ -1,3 +1,4 @@
+import { resolveAuthOutcome } from '../security/authorization.js';
 import { Hono } from 'hono';
 import { setCookie } from 'hono/cookie';
 import type { Context } from 'hono';
@@ -9,13 +10,12 @@ import {
 } from '@simplewebauthn/server';
 import type { Env } from '../env.js';
 import { createUser, getUserById, getUserByUsername } from '../db/queries.js';
-import { randomHex, sha256Hex, signJwt, verifyJwt, hashPassword } from '../security/crypto.js';
+import { randomHex, sha256Hex, signJwt, hashPassword } from '../security/crypto.js';
 import { COOKIE_SESSION } from '../../../shared/cookie-names.js';
 import { AUTH_ERROR_CODES } from '../../../shared/auth-error-codes.js';
 import { issueAuthNonce, logAuthAudit, scheduleAuthNonceCleanup } from './auth.js';
 import { z } from 'zod';
 import logger from '../util/logger.js';
-import { isAccountSessionJwt } from '../security/account-session-jwt.js';
 
 type HonoEnv = { Bindings: Env };
 
@@ -48,35 +48,9 @@ function getRpInfo(c: Context<HonoEnv>): { rpId: string; origin: string } {
 }
 
 async function resolveAuthedUserId(c: Context<HonoEnv>): Promise<string | null> {
-  // Try rcc_session cookie first (browser)
-  const cookieHeader = c.req.header('cookie') ?? '';
-  const cookieMatch = cookieHeader.match(new RegExp(`(?:^|;\\s*)${COOKIE_SESSION}=([^;]+)`));
-  const cookieToken = cookieMatch ? decodeURIComponent(cookieMatch[1]) : null;
-  if (cookieToken && c.env.JWT_SIGNING_KEY) {
-    const jwt = verifyJwt(cookieToken, c.env.JWT_SIGNING_KEY);
-    if (isAccountSessionJwt(jwt)) {
-      const user = await getUserById(c.env.DB, jwt.sub);
-      if (user) return user.id;
-    }
-  }
-
-  // Try Bearer token (native app API key / CLI)
-  const auth = c.req.header('Authorization');
-  if (auth?.startsWith('Bearer ')) {
-    const bearerToken = auth.slice(7);
-    const jwt = verifyJwt(bearerToken, c.env.JWT_SIGNING_KEY);
-    if (isAccountSessionJwt(jwt)) {
-      const user = await getUserById(c.env.DB, jwt.sub);
-      if (user) return user.id;
-    }
-    const keyHash = sha256Hex(bearerToken);
-    const row = await c.env.DB.queryOne<{ user_id: string }>(
-      'SELECT user_id FROM api_keys WHERE key_hash = $1 AND revoked_at IS NULL', [keyHash],
-    );
-    if (row) return row.user_id;
-  }
-
-  return null;
+  // The ONE credential resolver (security/authorization.ts). It used to accept a login of a DISABLED user here (no status check at all).
+  const resolution = await resolveAuthOutcome(c);
+  return resolution.auth && !resolution.auth.serverId ? resolution.auth.userId : null;
 }
 
 function setSessionCookies(c: Context<HonoEnv>, accessToken: string, refreshToken: string): void {

@@ -73,7 +73,7 @@ function makeDeferredDb(tokenHash: string): DeferredDb {
   let nodeRole: 'full' | 'controlled' = 'full';
   const queryOne = async <T = unknown>(): Promise<T | null> => {
     if (latency > 0) await new Promise((r) => setTimeout(r, latency));
-    return { token_hash: tokenHash, user_id: 'user-1', node_role: nodeRole, revoked_at: null } as T;
+    return { token_hash: tokenHash, owner_status: 'active', user_id: 'user-1', node_role: nodeRole, revoked_at: null } as T;
   };
   const db = {
     queryOne,

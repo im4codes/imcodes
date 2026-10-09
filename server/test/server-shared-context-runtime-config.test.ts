@@ -76,7 +76,7 @@ describe('server shared-context runtime config routes', () => {
     updateServerSharedContextRuntimeConfigMock.mockResolvedValue(true);
     getUserPrefMock.mockResolvedValue(undefined);
     setUserPrefMock.mockResolvedValue(undefined);
-    queryOneMock.mockResolvedValue({ id: 'srv-1', user_id: 'user-1' });
+    queryOneMock.mockResolvedValue({ id: 'srv-1', user_id: 'user-1', owner_status: 'active' });
   });
 
   async function buildApp() {

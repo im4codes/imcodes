@@ -1,3 +1,4 @@
+import { activeUserAnswer } from './helpers/user-status.js';
 import { EventEmitter } from 'node:events';
 import { beforeEach, describe, expect, it } from 'vitest';
 import { WsBridge, __setShareBridgeClockForTests } from '../src/ws/bridge.js';
@@ -26,7 +27,8 @@ function makeDb(latencyMs: number) {
   const wait = () => sleep(latencyMs);
   const db = {
     queryOne: async (sql: string) => {
-      if (sql.includes('SELECT token_hash')) return { token_hash: sha256Hex('t') };
+      { const activeUser = activeUserAnswer(sql); if (activeUser) return activeUser as never; }
+      if (sql.includes('SELECT token_hash')) return { token_hash: sha256Hex('t'), owner_status: 'active' };
       await wait();
       if (sql.includes('EXISTS')) return { exists: true };
       if (sql.includes('runtime_type')) return { runtime_type: 'transport' };

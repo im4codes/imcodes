@@ -818,6 +818,28 @@ describe('Owner list and mutation matrix (4.7 / 4.8)', () => {
   });
 });
 
+describe('a link is its owner\'s authority (disabled owner)', () => {
+  it('a disabled owner\'s link admits nobody (claim and session open are refused like an unknown link), and works again once the owner is active', async () => {
+    const tp = newThumbprint();
+    const fx = await seedFixture();
+    const created = await createLink(fx, { mode: 'control' });
+    await db.execute("UPDATE users SET status = 'disabled' WHERE id = $1", [fx.ownerUserId]);
+    await expectRefusal(
+      claimLinkBrowser(db, { linkId: created.link.id, browserKeyThumbprint: tp, now: NOW }),
+      LINK_REFUSAL.NOT_FOUND,
+    );
+    await db.execute("UPDATE users SET status = 'active' WHERE id = $1", [fx.ownerUserId]);
+    expect(await claimLinkBrowser(db, { linkId: created.link.id, browserKeyThumbprint: tp, now: NOW })).toEqual({ claimed: true });
+    await db.execute("UPDATE users SET status = 'disabled' WHERE id = $1", [fx.ownerUserId]);
+    await expectRefusal(
+      openOrResumeLinkSession(db, { linkId: created.link.id, hostId: fx.hostId, browserKeyThumbprint: tp, now: NOW }),
+      LINK_REFUSAL.NOT_FOUND,
+    );
+    await db.execute("UPDATE users SET status = 'active' WHERE id = $1", [fx.ownerUserId]);
+    expect((await openOrResumeLinkSession(db, { linkId: created.link.id, hostId: fx.hostId, browserKeyThumbprint: tp, now: NOW })).resumed).toBe(false);
+  });
+});
+
 describe('browser claim and session binding (4.9 / 4.10)', () => {
   it('keeps a single-use link on one browser while allowing that browser to refresh', async () => {
     const tp = newThumbprint();

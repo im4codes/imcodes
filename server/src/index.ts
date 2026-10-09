@@ -3,6 +3,7 @@
  * Replaces the Cloudflare Workers deployment.
  */
 
+import { startAccountConnectionWatch } from './ws/account-watch.js';
 import { serve } from '@hono/node-server';
 import { getConnInfo } from '@hono/node-server/conninfo';
 import { Hono } from 'hono';
@@ -98,6 +99,7 @@ import { rateLimiter } from './security/lockout.js';
 import { csrfMiddleware } from './security/csrf.js';
 import { cors } from 'hono/cors';
 import { verifyJwt } from './security/crypto.js';
+import { evaluateUserAccess, loadUserAccess } from './security/user-status.js';
 import { resolveServerWebSocketAccess } from './security/authorization.js';
 import logger from './util/logger.js';
 import { getPodIdentity } from './util/pod-identity.js';
@@ -705,7 +707,10 @@ async function handlePreviewWsUpgrade(
   if (sessionCookieToken && env.JWT_SIGNING_KEY) {
     const payload = verifyJwt(sessionCookieToken, env.JWT_SIGNING_KEY);
     if (isAccountSessionJwt(payload)) {
-      sessionUserId = payload.sub;
+      // A disabled user's cookie is no identity (security/user-status.ts): the upgrade proceeds as an anonymous visitor, which the
+      // access resolver below then decides (a preview access token may still be valid on its own).
+      const decision = evaluateUserAccess(await loadUserAccess(env.DB, payload.sub), typeof payload.iat === 'number' ? payload.iat : undefined);
+      if (decision.ok) sessionUserId = payload.sub;
     }
   }
 
@@ -959,6 +964,8 @@ async function main() {
   });
 
   setupWebSocketUpgrade(httpServer as unknown as import('node:http').Server, env);
+  // Every replica closes the live connections of accounts that were disabled (on any replica) within a few seconds.
+  const stopAccountWatch = startAccountConnectionWatch(db);
 
   // Graceful shutdown — terminate the embedding worker so it doesn't keep
   // the process alive after SIGTERM (k8s rolling restart, docker stop, etc).
@@ -971,6 +978,7 @@ async function main() {
     });
     setRemoteDesktopManagementPrivacyDispatcher(null);
     setRemoteDesktopShellLaunchContextDispatcher(null);
+    stopAccountWatch();
     await managementPrivacyWorker.stop();
     try {
       await guestBackgroundRuntime.stop();

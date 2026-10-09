@@ -40,12 +40,13 @@ vi.mock('../src/util/logger.js', () => ({
 import { fileTransferRoutes } from '../src/routes/file-transfer.js';
 
 // Mount exactly like the real server does, with env bindings
+let accountStatus = 'active';
 const app = new Hono();
 // Inject fake env.DB so resolveServerRole doesn't crash
 app.use('/*', async (c, next) => {
   (c as any).env = {
     DB: {
-      queryOne: async () => ({ user_id: 'test-user', node_role: 'full', exec_enabled: true, revoked_at: null }),
+      queryOne: async () => ({ user_id: 'test-user', node_role: 'full', exec_enabled: true, revoked_at: null, owner_status: 'active', status: accountStatus }),
     },
   };
   return next();
@@ -89,6 +90,25 @@ describe('download-token', () => {
     expect(dlRes.headers.get('Content-Disposition')).toContain('test.txt');
     const body = await dlRes.text();
     expect(body).toBe('hello world');
+  });
+
+  it('a token issued to a user who was disabled afterwards downloads nothing (the token stands in for its issuer)', async () => {
+    const tokenRes = await app.request(
+      '/api/server/srv1/uploads/abc123/download-token',
+      { method: 'POST', headers: { Authorization: 'Bearer test' } },
+    );
+    const { token } = await tokenRes.json() as { token: string };
+    accountStatus = 'disabled';
+    try {
+      const dlRes = await app.request(`/api/server/srv1/uploads/abc123/download?token=${token}`);
+      expect(dlRes.status).toBe(403);
+      expect(await dlRes.json()).toEqual({ error: 'account_disabled' });
+      accountStatus = 'active';
+      // the refused token is gone for good: enabling the account does not resurrect it
+      expect((await app.request(`/api/server/srv1/uploads/abc123/download?token=${token}`)).status).toBe(401);
+    } finally {
+      accountStatus = 'active';
+    }
   });
 
   it('token allows repeated same-resource requests for native download handoff', async () => {
