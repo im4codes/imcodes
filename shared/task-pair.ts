@@ -18,6 +18,28 @@ import {
 } from './audit-convergence.js';
 import { advanceMarkdownFence, type MarkdownFenceState } from './markdown-fence.js';
 import { parseTaskPairChecklist, updateTaskPairChecklist } from './task-pair-checklist.js';
+import {
+  TASK_PAIR_WORKSPACE_AUTO_NOTE,
+  TASK_PAIR_WORKSPACE_KINDS,
+  TASK_PAIR_WORKSPACE_NONE,
+  TASK_PAIR_WORKSPACE_PICK_GUIDANCE,
+  TASK_PAIR_WORKSPACE_REQUESTS,
+  TASK_PAIR_WORKSPACE_VALUES_GUIDE,
+  TASK_PAIR_WORKTREE_ONLY_WHEN_NECESSARY,
+  isTaskPairWorkspaceRequest,
+  type TaskPairRequestedWorkspaceKind,
+  type TaskPairWorkspaceKind,
+  type TaskPairWorkspaceRequest,
+} from './task-pair-workspace.js';
+export {
+  TASK_PAIR_WORKSPACE_KINDS,
+  TASK_PAIR_WORKSPACE_NONE,
+  TASK_PAIR_WORKSPACE_REQUESTS,
+  isTaskPairWorkspaceRequest,
+  type TaskPairRequestedWorkspaceKind,
+  type TaskPairWorkspaceKind,
+  type TaskPairWorkspaceRequest,
+};
 
 export const TASK_PAIR_CONTRACT_ID = 'task_pair_markers_v1' as const;
 export const TASK_PAIR_MARKER_TAG = 'IMCODES_TASK' as const;
@@ -302,9 +324,6 @@ export const TASK_PAIR_EVIDENCE_COMMIT_PREFIX = 'evidence:' as const;
 export const TASK_PAIR_INTEGRATION_ATTR = 'integration' as const;
 export const TASK_PAIR_INTEGRATION_DISMISS_VALUE = 'dismiss' as const;
 export const TASK_PAIR_INTEGRATION_DISMISSED_EFFECT = 'integration_dismissed' as const;
-/** A git worktree for code in a git project; a plain task directory otherwise. */
-export const TASK_PAIR_WORKSPACE_KINDS = ['worktree', 'dir'] as const;
-export type TaskPairWorkspaceKind = typeof TASK_PAIR_WORKSPACE_KINDS[number];
 /**
  * Rebuildable directory names stripped from a finished pair's worktree, and
  * only ever when git reports the path as ignored (never tracked or untracked
@@ -432,9 +451,11 @@ export const TASK_PAIR_GENERIC_TITLE_PLACEHOLDERS = ['Delegated supervised task'
  * in the daemon's briefs. One text, so the contract and the deliveries agree.
  */
 export const TASK_PAIR_WORKSPACE_RULES = [
-  'Workspace: the daemon gives every pair one and names it in the executor brief and in the auditor\'s audit request.',
-  'A code task in a git project gets a git worktree under ~/.imcodes/worktrees: READY_FOR_AUDIT <taskId> worktree=<absolute path> head=<commit> base=<commit>.',
+  `Workspace: ${TASK_PAIR_WORKTREE_ONLY_WHEN_NECESSARY}`,
+  'The daemon names the pair\'s workspace (when it has one) in the executor brief and in the auditor\'s audit request.',
+  'A code task in a git project that changes tracked files gets a git worktree under ~/.imcodes/worktrees: READY_FOR_AUDIT <taskId> worktree=<absolute path> head=<commit> base=<commit>.',
   `Any other task (the project is not a git repo, or Brain dispatched it with workspace=dir) gets a task directory under ~/.imcodes/${TASK_PAIR_WORKS_DIR}/<project>/<taskId>/: work and write results there; READY_FOR_AUDIT <taskId> path=<the directory or the result files>, no git HEAD needed.`,
+  `Brain chooses the workspace with pair_create workspace=auto|worktree|dir|none. ${TASK_PAIR_WORKSPACE_VALUES_GUIDE} ${TASK_PAIR_WORKSPACE_AUTO_NOTE} A pair with workspace=none: work where the brief says (a remote machine, a service), send your report and evidence to the auditor with send_message, and write READY_FOR_AUDIT <taskId> with no worktree, path or head; the report is the audit material (an auditor of such a pair reads the report and re-checks the evidence it names, there is no diff). It has no DONE output= to copy: put what Brain must keep in your closing reply.`,
   'Never work in the main checkout or /tmp, and never delete the workspace by hand: the daemon removes it 7 days after the pair ends (DONE/CANCEL), and keeps a git worktree that still has uncommitted work or commits not yet integrated into any local or remote branch.',
   'If your workspace is missing, rebuild it from the original branch (or use the rebuilt path the daemon sends) and continue; do not wait.',
   'A project that is not a git repository: when git is installed the daemon makes it a LOCAL repo (baseline commit, repo-local identity, no remote, never a push; heavy directories and files over 50 MB stay untracked via a marked block in .gitignore; refused above 2 GB tracked) and the normal worktree flow above runs; at DONE the daemon merges your branch into the project and refuses any file the user has uncommitted edits in. Fallbacks (no git, over the cap, init failed): a copy-on-write CLONE in the task directory, no git (the daemon finds your changed files by comparing with a manifest, the auditor gets a per-file diff, READY path=<clone>, and at DONE the changes are copied back with conflicts refused and overwritten files backed up); else IN-PLACE editing of the project directory (READY path=<project dir> files=<comma separated changed files>; pairs on that project run one at a time unless Brain passes parallel=true). The mode is fixed at pair start. A directory that is a CONTAINER (the home directory, a volume root, a directory holding other registered projects or nested repositories) is never made a repo, cloned or edited: it gets an empty task directory and results come back through DONE output=. A later pair on a repo IM.codes made starts from the files as they are on disk (uncommitted edits are committed as a snapshot first, unless the owner has committed there themselves). Deleting unchanged files of a clone frees no disk (shared blocks); only the whole workspace or files you changed do.',
@@ -559,7 +580,8 @@ export const TASK_PAIR_BRIEF_STRUCTURE_RULE: string =
   + 'machines, accounts or credentials it needs); Out of scope. Acceptance is '
   + 'risk-tiered by default: full coverage for paths the change touches '
   + 'directly, a smoke check for paths it only rides on, unless the owner '
-  + 'asks for more.';
+  + 'asks for more. '
+  + TASK_PAIR_WORKSPACE_PICK_GUIDANCE + ' ' + TASK_PAIR_WORKTREE_ONLY_WHEN_NECESSARY;
 
 export const TASK_PAIR_ENVIRONMENT_PREFLIGHT_RULE: string =
   'Preflight first (executor): before implementing, check that everything '
@@ -1225,8 +1247,8 @@ export interface TaskPairState {
   capacityWaitReason?: string;
   /** Enforcement bookkeeping for auditor proposals and repeated REWORK. */
   auditorProposalNudgeRound?: number;
-  /** Workspace Brain asked for on DISPATCH/QUEUE (`workspace=dir`); otherwise chosen by the project. */
-  workspaceKind?: TaskPairWorkspaceKind;
+  /** Workspace Brain asked for on pair_create/DISPATCH/QUEUE (`workspace=dir|none|worktree`); otherwise chosen by the project. */
+  workspaceKind?: TaskPairRequestedWorkspaceKind;
   /** Brain's `parallel=true` on DISPATCH/QUEUE: run alongside another pair editing the same non-git project in place. */
   parallelInPlace?: boolean;
   /** Queue priority requested by the Brain; urgent queued work runs before normal FIFO work. */
@@ -1279,6 +1301,8 @@ export interface TaskPairMaterial {
   base?: string;
   /** Task-directory material: the directory or the result files. */
   path?: string;
+  /** A pair with no workspace (`workspace=none`): the material is the executor's report and evidence, sent to the auditor by message. */
+  report?: true;
   /** Explicit note that a deletion is intentional; suppresses only the advisory. */
   intentionalNote?: string;
   /** Changed files the executor stated on READY (comma separated); in-place mode's only record of what changed. */
@@ -1416,7 +1440,7 @@ function sameAuditMaterial(current: TaskPairMaterial, next: TaskPairMaterial): b
 
 function applyWorkspaceAttr(pair: TaskPairState, attrs: Record<string, string>): void {
   const kind = attrs.workspace;
-  if (kind && (TASK_PAIR_WORKSPACE_KINDS as readonly string[]).includes(kind)) pair.workspaceKind = kind as TaskPairWorkspaceKind;
+  if (kind && kind !== 'auto' && isTaskPairWorkspaceRequest(kind)) pair.workspaceKind = kind as TaskPairRequestedWorkspaceKind;
   if (attrs.parallel === 'true') pair.parallelInPlace = true;
 }
 
@@ -2103,7 +2127,11 @@ export function applyTaskPairMarker(
       const resubmitsHeld = !!pair.materialHold;
       pair.materialHold = undefined;
       if (material) pair.material = roundBase && !material.base ? { ...material, base: roundBase } : material;
-      else if (pair.workspace?.path) {
+      else if (pair.workspaceKind === TASK_PAIR_WORKSPACE_NONE) {
+        // No workspace by Brain's choice: there is no path or head to name. The executor's report to the auditor is the material, so
+        // the round is material-backed and PASS/REWORK can apply.
+        pair.material = { report: true, ...(roundBase ? { base: roundBase } : {}), at: ctx.now };
+      } else if (pair.workspace?.path) {
         pair.material = { path: pair.workspace.path, ...(pair.workspace.lastHead ? { head: pair.workspace.lastHead } : {}), ...(roundBase ? { base: roundBase } : {}), at: ctx.now };
       }
       if (pair.status === 'in_audit') {

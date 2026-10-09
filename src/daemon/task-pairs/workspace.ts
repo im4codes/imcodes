@@ -205,6 +205,8 @@ export interface TaskPairWorkspaceDeps {
   isBusy?: (sessionName: string) => boolean;
   /** Rehome: does any live process have its working directory inside `path`? */
   hasProcessInside?: (path: string) => Promise<boolean>;
+  /** Release: decide exactly as a real release would (same checks, same answer) but remove nothing; `removed` then means "would be removed". */
+  dryRun?: boolean;
 }
 
 function allowWorkspaceRemoval(deps: TaskPairWorkspaceDeps): boolean | Promise<boolean> {
@@ -433,6 +435,7 @@ export async function releaseTaskPairWorkspace(
   if (workspace.kind === 'dir') {
     const allowed = allowWorkspaceRemoval(deps);
     if (typeof allowed === 'boolean' ? !allowed : !(await allowed)) return { action: 'skipped' };
+    if (deps.dryRun) return { action: 'removed' };
     // A plain task directory has no git bookkeeping to settle.  Delete it
     // synchronously after the ownership check so a reopen cannot interleave
     // between the check and the filesystem mutation.
@@ -443,7 +446,7 @@ export async function releaseTaskPairWorkspace(
   const assignmentRoot = dirname(repoPath);
   const repoStat = await lstat(repoPath).catch(() => undefined);
   if (!repoStat) {
-    await rm(assignmentRoot, { recursive: true, force: true });
+    if (!deps.dryRun) await rm(assignmentRoot, { recursive: true, force: true });
     return { action: 'removed' };
   }
   const inspection = await (deps.inspectGit ?? inspectSupervisionGitWorktree)(repoPath);
@@ -466,6 +469,7 @@ export async function releaseTaskPairWorkspace(
       : undefined;
   if (notInAnyBranch === undefined || notInAnyBranch > 0) return { action: 'kept', reason: 'unpushed' };
   if (!(await removalAllowed(deps))) return { action: 'skipped' };
+  if (deps.dryRun) return { action: 'removed' };
   if (!(await removeRegisteredGitWorktree(inspection, repoPath))) return { action: 'kept', reason: 'unreadable' };
   await rm(assignmentRoot, { recursive: true, force: true });
   return { action: 'removed' };

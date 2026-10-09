@@ -2161,7 +2161,7 @@ export class TaskPairAutomation implements TaskPairScheduler {
    * git worktree, a git-init'd project and a COW clone never serialize (git and the copy-back catch conflicts).
    */
   #inPlaceHolder(pair: TaskPairState, executor: string): StoredTaskPair | undefined {
-    if (pair.parallelInPlace || pair.workspaceKind === 'dir') return undefined;
+    if (pair.parallelInPlace || pair.workspaceKind === 'dir' || pair.workspaceKind === 'none') return undefined;
     const projectDir = getSession(executor)?.projectDir;
     if (!projectDir) return undefined;
     const root = resolvePath(projectDir);

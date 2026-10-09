@@ -24,6 +24,7 @@ import {
   TASK_PAIR_TITLE_RULE,
   TASK_PAIR_TITLE_MARKER_RULE,
   TASK_PAIR_WORKS_DIR,
+  TASK_PAIR_WORKSPACE_NONE,
   TASK_PAIR_WORKSPACE_RULES,
   formatTaskPairSeverityCounts,
   taskPairDeliveryRound,
@@ -79,6 +80,9 @@ function blockingSummaryLine(pair: TaskPairState): string {
 export const NO_LEGACY_ARTIFACTS = 'This pair has no assignmentId, auditAttemptId, auditRevision, immutable bundle or scopeFiles; do not wait for or ask for them.';
 
 function materialLine(material: ResolvedTaskPairMaterial | TaskPairState['material'] | undefined): string | undefined {
+  if (material?.report && !material.worktree && !material.head && !material.path) {
+    return 'Material: this pair has NO workspace (Brain chose workspace=none), so there is no worktree, directory, HEAD or diff. The material is the executor\'s validation report and evidence, which they send you with send_message: judge the report, and re-check what you can of the evidence it names (commands, machines, outputs); ask them for anything missing.';
+  }
   if (material?.path && !material.worktree && !material.head) {
     return `Material: task directory ${material.path}. Read the files there directly; there is no git HEAD.`;
   }
@@ -87,6 +91,13 @@ function materialLine(material: ResolvedTaskPairMaterial | TaskPairState['materi
   const where = material.worktree ?? '<executor worktree>';
   const head = material.head ?? 'HEAD';
   return `Material: worktree ${where} · head ${head}${material.base ? ` · base ${material.base}` : ''}. Read it directly: git -C ${where} diff ${base}..${head} (uncommitted work: git -C ${where} diff).`;
+}
+
+/** A pair with nothing to commit or merge: Brain chose a task directory or no workspace (or the daemon made a task directory). */
+function pairHasNoWorktree(pair: TaskPairState): boolean {
+  if (pair.workspaceKind === TASK_PAIR_WORKSPACE_NONE || pair.workspaceKind === 'dir') return true;
+  // A task directory the daemon made for a container project; a COW clone or in-place edit brings its changes back and is not this.
+  return pair.workspace?.kind === 'dir' && (!pair.workspace.nonGit || pair.workspace.nonGit.mode === 'plain_dir');
 }
 
 function header(pair: TaskPairState): string {
@@ -111,7 +122,7 @@ export function buildCorrectionMessage(pair: TaskPairState, judgement: TaskPairV
 export function buildDoneReminderMessage(pair: TaskPairState): string {
   return [
     header(pair),
-    `DONE without a PASS is not complete. Send your validation to auditor ${pair.auditor ?? '(being assigned)'} with send_message, then write ${readyMarker(pair)}. After the auditor's PASS, commit locally in the worktree (never push any branch), report the worktree path and HEAD to Brain, then write DONE; Brain merges into dev and pushes dev.`,
+    `DONE without a PASS is not complete. Send your validation to auditor ${pair.auditor ?? '(being assigned)'} with send_message, then write ${readyMarker(pair)}. ${pairHasNoWorktree(pair) ? "After the auditor's PASS, report to Brain in your closing reply and write DONE; this pair has nothing to commit or merge." : "After the auditor's PASS, commit locally in the worktree (never push any branch), report the worktree path and HEAD to Brain, then write DONE; Brain merges into dev and pushes dev."}`,
     contracts(pair.blocking),
   ].join('\n');
 }
@@ -127,7 +138,9 @@ export function buildParticipantRecoveryMessage(
   lastInstruction?: string,
 ): string {
   const workspace = pair.workspace;
-  const location = workspace
+  const location = pair.workspaceKind === TASK_PAIR_WORKSPACE_NONE
+    ? 'Workspace: none (Brain chose workspace=none): nothing was created on disk; work where the brief says, and the report you send the auditor is the audit material.'
+    : workspace
     ? `Workspace: ${workspace.path} (absolute and authoritative; never use cwd or the project main checkout).`
       + ` Base: ${workspace.base ?? pair.material?.base ?? '(not recorded)'}.`
       + ` Latest head: ${workspace.lastHead ?? pair.material?.head ?? '(not recorded)'}.`
@@ -144,7 +157,9 @@ export function buildParticipantRecoveryMessage(
       : pair.status === 'passed'
         ? `Next: commit locally, report the worktree and HEAD to Brain, then write DONE.`
         : `Next: continue the task and report material progress; do not wait for legacy supervision artifacts.`;
-  const ready = workspace?.kind === 'worktree'
+  const ready = pair.workspaceKind === TASK_PAIR_WORKSPACE_NONE
+    ? `<!-- IMCODES_TASK READY_FOR_AUDIT ${pair.taskId} -->`
+    : workspace?.kind === 'worktree'
     ? `<!-- IMCODES_TASK READY_FOR_AUDIT ${pair.taskId} worktree=${workspace.path} head=${workspace.lastHead ?? pair.material?.head ?? '<commit>'} base=${workspace.base ?? pair.material?.base ?? '<commit>'} -->`
     : `<!-- IMCODES_TASK READY_FOR_AUDIT ${pair.taskId} path=${workspace?.path ?? '<task-directory>'} -->`;
   return [
@@ -263,7 +278,9 @@ export function buildBrainNoticeMessage(pair: TaskPairState, flag: TaskPairFlag,
   // A passed pair only needs the executor's local commit and DONE: another
   // executor can finish it, while DONE force=true would close it uncommitted.
   const resolve = flag === 'executor_silent' && pair.status === 'passed'
-    ? `The audit already passed; only a local worktree commit and DONE remain (never push any branch). Report the worktree path and HEAD to Brain; Brain merges into dev and pushes dev. Wait for the executor, or hand it to another session with pair_reassign (taskId=${pair.taskId}, executor=<session>). Use pair_close action=done force=true only once the work is committed.`
+    ? pairHasNoWorktree(pair)
+      ? `The audit already passed; only the executor's closing report and DONE remain (this pair has nothing to commit or merge). Wait for the executor, or hand it to another session with pair_reassign (taskId=${pair.taskId}, executor=<session>), or accept it with pair_close action=done force=true.`
+      : `The audit already passed; only a local worktree commit and DONE remain (never push any branch). Report the worktree path and HEAD to Brain; Brain merges into dev and pushes dev. Wait for the executor, or hand it to another session with pair_reassign (taskId=${pair.taskId}, executor=<session>). Use pair_close action=done force=true only once the work is committed.`
     : `Resolve with the MCP tools, e.g. pair_reassign (taskId=${pair.taskId}, auditor=<session>), pair_close action=done force=true (taskId=${pair.taskId}), or pair_close action=cancel (taskId=${pair.taskId}).`;
   // BLOCKED/NEEDS_INPUT is sent as an immediate `brain_notice` intent (no
   // explicit detail argument, unlike the heartbeat escalation path) -- fall
@@ -318,7 +335,7 @@ export function buildAggregatedBrainNoticeMessage(notices: readonly PendingBrain
 export function buildBrainHeartbeatMessage(pairs: readonly TaskPairState[]): string {
   const lines = pairs.map((pair) => {
     const reason = pair.status === 'passed'
-      ? 'audit passed; commit locally and DONE'
+      ? (pairHasNoWorktree(pair) ? 'audit passed; the executor writes DONE (nothing to commit or merge)' : 'audit passed; commit locally and DONE')
       : pair.status === 'awaiting_brain_decision'
         ? 'executor reported completion without an auditor; decide with pair_close (action=done force=true, or action=cancel) for this taskId'
       : pair.flags.length > 0
@@ -623,6 +640,9 @@ export function buildNonGitFinishLine(pair: TaskPairState, mode: 'git_init' | 'c
 
 /** What happens after PASS, for the executor's closing instruction. */
 function afterPassLine(pair: TaskPairState): string {
+  if (pair.workspaceKind === TASK_PAIR_WORKSPACE_NONE) {
+    return `After their PASS, report to Brain in your closing reply (what you did, what you found, the evidence) and write ${marker('DONE', pair.taskId)}; this pair has no workspace, so there is nothing to commit and no output= to copy.`;
+  }
   const nonGit = pair.workspace?.nonGit;
   const done = marker('DONE', pair.taskId);
   if (nonGit?.mode === 'git_init') return `After their PASS, commit locally in the worktree (never push any branch) and write ${done}; the daemon merges your branch into the project (refusing any file with uncommitted user edits) and tells Brain.`;
@@ -636,6 +656,9 @@ function afterPassLine(pair: TaskPairState): string {
  * worktree or a task directory), or, if none could be created, its own.
  */
 function workplaceLine(pair: TaskPairState): string {
+  if (pair.workspaceKind === TASK_PAIR_WORKSPACE_NONE) {
+    return `This pair has NO workspace (Brain chose workspace=none): the daemon created no worktree and no directory. Work wherever the brief says (a remote machine, a service, a read-only inspection of the project); do not create a worktree, and keep scratch files in a temp directory outside the project main checkout. Send your validation report and evidence to the auditor with send_message and write ${marker('READY_FOR_AUDIT', pair.taskId)} with no worktree, path or head: your report is the audit material.`;
+  }
   const workspace = pair.workspace;
   const nonGit = workspace?.status === 'active' ? workspace.nonGit : undefined;
   if (workspace && nonGit?.mode === 'cow') {
@@ -801,6 +824,7 @@ export function buildOutputFailedLine(pair: TaskPairState, reason: string): stri
 }
 
 function readyMarker(pair: TaskPairState): string {
+  if (pair.workspaceKind === TASK_PAIR_WORKSPACE_NONE) return marker('READY_FOR_AUDIT', pair.taskId);
   const nonGit = pair.workspace?.nonGit;
   if (nonGit?.mode === 'cow' && pair.workspace) return marker('READY_FOR_AUDIT', pair.taskId, `path=${pair.workspace.path}`);
   if (nonGit?.mode === 'in_place') return marker('READY_FOR_AUDIT', pair.taskId, `path=${nonGit.projectRoot} files=<comma separated changed files>`);
@@ -842,6 +866,7 @@ export function buildDispatchTrailer(pair: TaskPairState): string {
     '',
     TASK_PAIR_TITLE_RULE,
     `[IM.codes task ${pair.taskId} · auditor: ${pair.auditor ?? 'none'}] Write ${marker('STARTED', pair.taskId)} when you begin and finish with ${readyMarker(pair)}; follow ${TASK_PAIR_CONTRACT_ID} and ${AUDIT_CONVERGENCE_CONTRACT_ID} (blocking=${pair.blocking.join(',')}). ${workplaceLine(pair)} ${TASK_PAIR_WORKSPACE_RULES} ${NO_LEGACY_ARTIFACTS}`,
+    ...(pair.workspaceKind === TASK_PAIR_WORKSPACE_NONE ? [workplaceLine(pair)] : []),
     TASK_PAIR_PROJECT_PRECEDENCE_CLAUSE,
     TASK_PAIR_BRAIN_REPORTING_RULE,
     TASK_PAIR_CHECKLIST_RULE,
@@ -853,7 +878,9 @@ export function buildAuditorAssignmentMessage(pair: TaskPairState): string {
   return [
     header(pair),
     TASK_PAIR_TITLE_RULE,
-    `You are the auditor of this task for executor ${pair.executor}. On READY_FOR_AUDIT the daemon relays their workspace (worktree and head, or task-directory path), and they send you their validation; judge that by ${AUDIT_CONVERGENCE_CONTRACT_ID} (blocking=${pair.blocking.join(',')}) and write PASS or REWORK with severity counts.`,
+    pair.workspaceKind === TASK_PAIR_WORKSPACE_NONE
+      ? `You are the auditor of this task for executor ${pair.executor}. This pair has NO workspace (Brain chose workspace=none): there is no worktree, directory, HEAD or diff. On READY_FOR_AUDIT the material is the report and evidence the executor sends you with send_message; judge it by ${AUDIT_CONVERGENCE_CONTRACT_ID} (blocking=${pair.blocking.join(',')}), re-check what you can of the evidence it names, and write PASS or REWORK with severity counts.`
+      : `You are the auditor of this task for executor ${pair.executor}. On READY_FOR_AUDIT the daemon relays their workspace (worktree and head, or task-directory path), and they send you their validation; judge that by ${AUDIT_CONVERGENCE_CONTRACT_ID} (blocking=${pair.blocking.join(',')}) and write PASS or REWORK with severity counts.`,
     TASK_PAIR_AUDITOR_PROPOSAL_RULE,
     TASK_PAIR_CONVERGENCE_CHECKPOINT_RULE,
     TASK_PAIR_VALIDATION_REPORT_RULE,
@@ -923,7 +950,9 @@ export function buildPassDoneNoticeMessage(pair: TaskPairState): string {
     verdictLine,
     ...(pair.workspace?.path ? [`Worktree: ${pair.workspace.path}.${pair.workspace.lastHead ? ` Head: ${pair.workspace.lastHead}.` : ''}`] : []),
     ...(where ? [where] : []),
-    'Brain merges the reported commit into dev and pushes dev; the executor never pushes any branch.',
+    pairHasNoWorktree(pair)
+      ? 'This pair has no worktree, so there is nothing to merge: read the executor\'s closing report and close the pair.'
+      : 'Brain merges the reported commit into dev and pushes dev; the executor never pushes any branch.',
     ...(pair.status === 'passed' ? [`More rounds planned? Call pair_next_round (taskId=${pair.taskId}, optional base=<commit>, optional note="...") on this pair instead of closing it: it returns to working with the same workspace and participants. A closed (DONE) pair cannot open another round.`] : []),
     // A done pair is already closed (the backstop report): only an open (passed) pair still has something to close.
     pair.status === 'done' ? taskPairBrainEndedPairNote('done') : TASK_PAIR_BRAIN_CLOSE_REMINDER,

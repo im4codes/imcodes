@@ -31,6 +31,7 @@ import {
   TASK_PAIR_IDEMPOTENT_STARTED_EFFECT,
   TASK_PAIR_TITLE_EVENT_VERB,
   TASK_PAIR_WORKSPACE_EFFECTS,
+  TASK_PAIR_WORKSPACE_NONE,
   TASK_PAIR_WORKSPACE_REPAIR_STATUSES,
   TASK_PAIR_WORKSPACE_EVENT_VERB,
   TASK_PAIR_WORKSPACE_RETENTION_MS,
@@ -61,6 +62,7 @@ import {
   type TaskPairIntent,
   type TaskPairMarker,
   type TaskPairState,
+  type TaskPairWorkspaceRequest,
   type TaskPairResourceMode,
   type TaskPairResourceClaim,
   type TaskPairTransition,
@@ -78,7 +80,7 @@ import { resolveTaskPairMaterial, verifyTaskPairRoundBase } from './material.js'
 import { formatPossibleSilentRevertWarning, inspectPossibleSilentRevert, isRewrittenHead } from './rebase-revert-guard.js';
 import { applyBackCow, hasUnfinishedApplyBack, rollbackApplyBack, undoApplyBack } from './non-git.js';
 import { mergePairIntoProject } from './git-init.js';
-import { copyTaskPairOutput, describeKeptTaskPairWorkspace, gitBranch as gitBranchOf, listTaskPairSiblingWorktrees, provisionTaskPairWorkspace, releaseTaskPairWorkspace, rehomeTaskPairWorkspace, type TaskPairWorkspaceRevisionSource } from './workspace.js';
+import { copyTaskPairOutput, describeKeptTaskPairWorkspace, gitBranch as gitBranchOf, listTaskPairSiblingWorktrees, provisionTaskPairWorkspace, releaseTaskPairWorkspace, rehomeTaskPairWorkspace, type TaskPairWorkspaceRelease, type TaskPairWorkspaceRevisionSource } from './workspace.js';
 import { clearTaskPairProviderError, noteTaskPairProviderError } from './provider-errors.js';
 import {
   classifyDiskLevel, diskLevelRank, isDiskLevel, readWorktreeVolumeSpace, stripHeavyIgnoredDirs, stripHeavyNamedDirs, taskPairHygieneDeps,
@@ -117,6 +119,19 @@ import {
   buildRoundBaseMismatchAuditorMessage,
   buildRoundBaseMismatchExecutorMessage,
 } from './messages.js';
+
+/** One row of the on-demand workspace cleanup: an ended pair, its workspace, and what was (or would be) done. */
+export interface TaskPairWorkspaceGcEntry {
+  taskId: string;
+  title: string | null;
+  status: string;
+  kind: string;
+  path: string;
+  endedAt: number;
+  action: 'would_remove' | 'removed' | 'kept' | 'too_recent' | 'absent' | 'skipped' | 'failed';
+  /** Why a workspace was kept (dirty, untracked, unpushed, locked, unreadable, unapplied). */
+  reason?: string;
+}
 
 /** Intents that need the pool, the heartbeat or the queue (see scheduler.ts). */
 export interface TaskPairScheduler {
@@ -266,6 +281,7 @@ function readyHasValidationReport(store: ReturnType<typeof getTaskPairStore>, st
 }
 
 function readyMarkerForPair(pair: TaskPairState): string {
+  if (pair.workspaceKind === TASK_PAIR_WORKSPACE_NONE) return `<!-- IMCODES_TASK READY_FOR_AUDIT ${pair.taskId} -->`;
   const workspace = pair.workspace;
   if (workspace?.nonGit?.mode === 'cow') return `<!-- IMCODES_TASK READY_FOR_AUDIT ${pair.taskId} path=${workspace.path} -->`;
   if (workspace?.nonGit?.mode === 'in_place') return `<!-- IMCODES_TASK READY_FOR_AUDIT ${pair.taskId} path=${workspace.nonGit.projectRoot} files=<comma separated changed files> -->`;
@@ -303,6 +319,8 @@ export async function ensureTaskPairWorkspaceAvailable(project: string, taskId: 
   const store = getTaskPairStore();
   const stored = store.getPair(project, taskId);
   if (!stored || !stored.state.executor) return;
+  // Brain chose no workspace: there is nothing to provision, rebuild or repair.
+  if (stored.state.workspaceKind === TASK_PAIR_WORKSPACE_NONE) return;
   // A started pair with no workspace at all (its start skipped admission, or
   // provisioning failed then): give it one, once, instead of returning here and
   // leaving its executor to work wherever it happens to be.
@@ -1135,6 +1153,8 @@ export class TaskPairService {
     executorModel?: string;
     auditorModel?: string;
     executionPool?: 'primary' | 'economy';
+    /** The workspace Brain asked for on pair_create (auto = the daemon's default rule, not stored). */
+    workspace?: TaskPairWorkspaceRequest;
     suppressAutomaticBrief?: boolean;
     /** True only for the structured pair_create MCP operation. */
     structuredPairCreate?: true;
@@ -1269,6 +1289,7 @@ export class TaskPairService {
           ...(input.executorModel ? { executormodel: input.executorModel } : {}),
           ...(input.auditorModel ? { auditormodel: input.auditorModel } : {}),
           ...(input.executionPool ? { pool: input.executionPool } : {}),
+          ...(input.workspace && input.workspace !== 'auto' ? { workspace: input.workspace } : {}),
         },
         ...(input.brief ? { brief: input.brief } : {}),
       },
@@ -1648,7 +1669,7 @@ export class TaskPairService {
             break;
           case 'audit_request': {
             const material = await resolveTaskPairMaterial(pair);
-            if (material.source === 'pending' || (!material.worktree && !material.path)) {
+            if (material.source === 'pending' || (!material.worktree && !material.path && !material.report)) {
               if (pair.executor) await sendTaskPairMessage(pair.executor, pair.taskId, 'material-pending', `Material is pending for ${pair.taskId}; resend READY_FOR_AUDIT with worktree=<absolute path> head=<commit> (or path=<task directory>).`);
               await sendTaskPairMessage(intent.to, pair.taskId, 'audit-request', `Material pending for ${pair.taskId}; the executor must resend READY_FOR_AUDIT with an explicit workspace path and head.`);
             } else {
@@ -1812,6 +1833,8 @@ export class TaskPairService {
     const store = getTaskPairStore();
     const current = store.getPair(project, taskId)?.state;
     if (!current || !current.executor || isTerminalTaskPairStatus(current.status)) return current;
+    // workspace=none: nothing is created, on disk or in the pair record. Never provisioned later either.
+    if (current.workspaceKind === TASK_PAIR_WORKSPACE_NONE) return current;
     if (current.workspace && current.workspace.status !== 'removed') {
       // The brief that follows an executor change carries the path itself, so
       // the move needs no separate notice here.
@@ -1871,6 +1894,7 @@ export class TaskPairService {
     const store = getTaskPairStore();
     const stored = store.getPair(project, taskId);
     if (!stored || stored.legacyTaskId || !stored.state.executor || stored.state.workspace) return;
+    if (stored.state.workspaceKind === TASK_PAIR_WORKSPACE_NONE) return;
     if (!TASK_PAIR_WORKSPACE_REPAIR_STATUSES.includes(stored.state.status)) return;
     const pair = await this.ensureWorkspace(project, taskId);
     const workspace = pair?.workspace;
@@ -2145,37 +2169,8 @@ export class TaskPairService {
       if (!workspace || !isTerminalTaskPairStatus(pair.status)) continue;
       if (now - (workspace.endedAt ?? pair.updatedAt) < TASK_PAIR_WORKSPACE_RETENTION_MS) continue;
       try {
-        const releaseDeps = {
-          beforeRemove: () => {
-            const current = store.getPair(stored.project, pair.taskId)?.state;
-            return Boolean(current?.workspace
-              && (current.workspace.status === 'ended' || current.workspace.status === 'kept')
-              && isTerminalTaskPairStatus(current.status)
-              && current.workspace.endedAt === workspace.endedAt
-              && now - (current.workspace.endedAt ?? current.updatedAt) >= TASK_PAIR_WORKSPACE_RETENTION_MS);
-          },
-        };
-        const released = await releaseTaskPairWorkspace(pair, releaseDeps);
-        if (released.action === 'absent' || released.action === 'skipped') continue;
-        const latest = store.getPair(stored.project, pair.taskId)?.state ?? pair;
-        if (!latest.workspace || !isTerminalTaskPairStatus(latest.status)) continue;
-        const firstKeep = released.action === 'kept' && latest.workspace.status !== 'kept';
-        const next: TaskPairState = {
-          ...latest,
-          workspace: released.action === 'kept'
-            ? { ...latest.workspace, status: 'kept', keptReason: released.reason }
-            : { ...latest.workspace, status: 'removed' },
-        };
-        store.savePair(stored.project, next);
-        if (released.action === 'removed') {
-          this.#recordWorkspaceEvent(stored.project, next, TASK_PAIR_WORKSPACE_EFFECTS.REMOVED, { path: workspace.path }, {}, false);
-        } else if (firstKeep) {
-          this.#recordWorkspaceEvent(stored.project, next, TASK_PAIR_WORKSPACE_EFFECTS.KEPT, { path: workspace.path, reason: released.reason }, {}, true);
-          // The worktree GC backstop removes it too once the work is saved.
-          const { getSupervisionTaskRegistry } = await import('../supervision-state-store.js');
-          getSupervisionTaskRegistry().requestWorktreeGc(stored.project);
-        }
-        if (released.action === 'kept') keptThisSweep.push({ project: stored.project, pair: next, reason: released.reason });
+        const outcome = await this.#releaseEndedWorkspace(stored, now, TASK_PAIR_WORKSPACE_RETENTION_MS, false);
+        if (outcome?.kept) keptThisSweep.push(outcome.kept);
       } catch (error) {
         logger.warn({ err: error, taskId: pair.taskId }, 'task-pair: workspace sweep failed');
       }
@@ -2185,6 +2180,94 @@ export class TaskPairService {
     } catch (error) {
       logger.warn({ err: error }, 'task-pair: kept-workspace announcement failed');
     }
+  }
+
+  /**
+   * Release one ended pair's workspace now (its retention, or the caller's minimum age, has elapsed) and record the outcome. The ONE
+   * implementation of the safety rules: the hourly sweep and the on-demand gc both come through here, so a worktree that still holds
+   * unsaved work or commits no branch has is kept either way. `dryRun` decides exactly the same but removes and records nothing.
+   */
+  async #releaseEndedWorkspace(
+    stored: StoredTaskPair,
+    now: number,
+    retentionMs: number,
+    dryRun: boolean,
+  ): Promise<{ released: TaskPairWorkspaceRelease; kept?: { project: string; pair: TaskPairState; reason: string } } | undefined> {
+    const store = getTaskPairStore();
+    const pair = stored.state;
+    const workspace = pair.workspace;
+    if (!workspace || !isTerminalTaskPairStatus(pair.status)) return undefined;
+    const releaseDeps = {
+      ...(dryRun ? { dryRun: true } : {}),
+      beforeRemove: () => {
+        const current = store.getPair(stored.project, pair.taskId)?.state;
+        return Boolean(current?.workspace
+          && (current.workspace.status === 'ended' || current.workspace.status === 'kept')
+          && isTerminalTaskPairStatus(current.status)
+          && current.workspace.endedAt === workspace.endedAt
+          && now - (current.workspace.endedAt ?? current.updatedAt) >= retentionMs);
+      },
+    };
+    const released = await releaseTaskPairWorkspace(pair, releaseDeps);
+    if (dryRun || released.action === 'absent' || released.action === 'skipped') return { released };
+    const latest = store.getPair(stored.project, pair.taskId)?.state ?? pair;
+    if (!latest.workspace || !isTerminalTaskPairStatus(latest.status)) return { released };
+    const firstKeep = released.action === 'kept' && latest.workspace.status !== 'kept';
+    const next: TaskPairState = {
+      ...latest,
+      workspace: released.action === 'kept'
+        ? { ...latest.workspace, status: 'kept', keptReason: released.reason }
+        : { ...latest.workspace, status: 'removed' },
+    };
+    store.savePair(stored.project, next);
+    if (released.action === 'removed') {
+      this.#recordWorkspaceEvent(stored.project, next, TASK_PAIR_WORKSPACE_EFFECTS.REMOVED, { path: workspace.path }, {}, false);
+    } else if (firstKeep) {
+      this.#recordWorkspaceEvent(stored.project, next, TASK_PAIR_WORKSPACE_EFFECTS.KEPT, { path: workspace.path, reason: released.reason }, {}, true);
+      // The worktree GC backstop removes it too once the work is saved.
+      const { getSupervisionTaskRegistry } = await import('../supervision-state-store.js');
+      getSupervisionTaskRegistry().requestWorktreeGc(stored.project);
+    }
+    return released.action === 'kept' ? { released, kept: { project: stored.project, pair: next, reason: released.reason } } : { released };
+  }
+
+  /**
+   * On-demand cleanup of the workspaces of pairs that have ENDED (done / cancelled), without waiting out the seven-day retention.
+   * Open pairs are never listed. The checks are the sweep's own (a worktree with uncommitted or untracked files, commits no branch
+   * has, a lock, or a non-git pair whose work has not landed is kept and the reason is returned). `dryRun` (the default of the MCP
+   * tool) removes nothing. At most `limit` pairs are examined per call, oldest end first.
+   */
+  async gcWorkspaces(
+    project: string,
+    brain: string,
+    options: { dryRun: boolean; minAgeMs: number; now?: number; limit?: number },
+  ): Promise<TaskPairWorkspaceGcEntry[]> {
+    const now = options.now ?? Date.now();
+    const limit = Math.max(1, options.limit ?? 50);
+    const store = getTaskPairStore();
+    const candidates = store.listEndedWorkspacePairs()
+      .filter((stored) => stored.project === project && stored.state.brain === brain && stored.state.workspace && isTerminalTaskPairStatus(stored.state.status))
+      .sort((a, b) => (a.state.workspace!.endedAt ?? a.state.updatedAt) - (b.state.workspace!.endedAt ?? b.state.updatedAt));
+    const entries: TaskPairWorkspaceGcEntry[] = [];
+    for (const stored of candidates.slice(0, limit)) {
+      const pair = stored.state;
+      const workspace = pair.workspace!;
+      const endedAt = workspace.endedAt ?? pair.updatedAt;
+      const base = { taskId: pair.taskId, title: pair.title ?? null, status: pair.status, kind: workspace.kind, path: workspace.path, endedAt };
+      if (now - endedAt < options.minAgeMs) { entries.push({ ...base, action: 'too_recent' }); continue; }
+      try {
+        const outcome = await this.#releaseEndedWorkspace(stored, now, options.minAgeMs, options.dryRun);
+        const released = outcome?.released;
+        if (!released) { entries.push({ ...base, action: 'absent' }); continue; }
+        entries.push(released.action === 'kept'
+          ? { ...base, action: 'kept', reason: released.reason }
+          : { ...base, action: released.action === 'removed' ? (options.dryRun ? 'would_remove' : 'removed') : released.action });
+      } catch (error) {
+        logger.warn({ err: error, taskId: pair.taskId }, 'task-pair: workspace gc failed');
+        entries.push({ ...base, action: 'failed' });
+      }
+    }
+    return entries;
   }
 
   /**

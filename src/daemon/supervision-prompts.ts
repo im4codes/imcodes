@@ -36,6 +36,7 @@ import {
 } from '../../shared/supervision-config.js';
 import { SUPERVISION_IMCODES_BACKGROUND_DOCS } from './imcodes-workflow-docs.js';
 import { TASK_PAIR_BRAIN_CONTRACT_ID, TASK_PAIR_INERT_AUTHORIZATION_RULE, TASK_PAIR_PROJECT_PRECEDENCE_CLAUSE, type TaskPairEngineState } from '../../shared/task-pair.js';
+import { TASK_PAIR_WORKTREE_ONLY_WHEN_NECESSARY_TOKEN } from '../../shared/task-pair-workspace.js';
 import { FILE_OUTPUT_CONTRACT_ID } from '../../shared/file-output-contract.js';
 import {
   LOAD_VALIDATION_SAFETY_BY_LOCALE,
@@ -292,7 +293,7 @@ export const BRAIN_PAIRS_SUPERVISED_WORK = {
   newWork: 'pair_create_with_brief_and_roles_then_pair_dispatch_if_queued',
   sameWork: 'append_to_the_same_executor_same_taskId',
   material: 'executor_workspace_on_READY_FOR_AUDIT_relayed_by_daemon_worktree_and_head_or_task_dir_path',
-  workspace: 'code_in_git_project_worktree_else_task_dir_DISPATCH_workspace=dir_for_non_code_removed_7d_after_end',
+  workspace: `${TASK_PAIR_WORKTREE_ONLY_WHEN_NECESSARY_TOKEN}_removed_7d_after_end`,
   deliverables: 'judge_by_task_type_keep_via_DONE_output=_copied_into_project_user_told_temporary_plain_DONE',
   legacyArtifacts: 'none_on_pairs_no_registry_step_assignmentId_auditAttemptId_auditRevision_bundle_scopeFiles_never_ask_or_explain_them',
   notices: 'resolve_with_pair_mcp_tools_pair_reassign_pair_close_done_force_cancel',

@@ -10,7 +10,8 @@ import { runExclusive } from '../util/keyed-mutex.js';
 import logger from '../util/logger.js';
 import { randomUUID } from 'node:crypto';
 import { parseTaskPairChecklist, taskPairChecklistCounts, updateTaskPairChecklist } from '../../shared/task-pair-checklist.js';
-import { isTerminalTaskPairStatus, TASK_PAIR_CREATE_REQUIRED_MESSAGE, TASK_PAIR_MANUAL_MODE_NOTE, TASK_PAIR_MCP_DELIVERY_EVENT, TASK_PAIR_MCP_DISPATCH_EVENT, TASK_PAIR_NO_AUDITOR, taskPairRoleOf } from '../../shared/task-pair.js';
+import { isTerminalTaskPairStatus, TASK_PAIR_CREATE_REQUIRED_MESSAGE, TASK_PAIR_MANUAL_MODE_NOTE, TASK_PAIR_MCP_DELIVERY_EVENT, TASK_PAIR_MCP_DISPATCH_EVENT, TASK_PAIR_NO_AUDITOR, TASK_PAIR_WORKSPACE_REQUESTS, isTaskPairWorkspaceRequest, taskPairRoleOf, type TaskPairWorkspaceRequest } from '../../shared/task-pair.js';
+import { TASK_PAIR_WORKSPACE_PICK_GUIDANCE, taskPairWorkspaceCreateNote } from '../../shared/task-pair-workspace.js';
 import { z } from 'zod';
 import type { CapabilityMcpToolDeps } from './capability-mcp-tools.js';
 import { lstat, readFile, realpath } from 'node:fs/promises';
@@ -1759,6 +1760,13 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       updatedAt: state.updatedAt,
       flags: state.flags,
       brief: state.brief ?? null,
+      // What Brain asked for (auto when it left the choice to the daemon) and what exists on disk now.
+      workspace: {
+        requested: state.workspaceKind ?? 'auto',
+        kind: state.workspace?.kind ?? null,
+        path: state.workspace && state.workspace.status !== 'removed' ? state.workspace.path : null,
+        status: state.workspace?.status ?? null,
+      },
       waitingReason: state.flags.includes('waiting_for_capacity') ? (state.capacityWaitReason ?? null) : null,
     };
   };
@@ -2977,8 +2985,14 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
         return error(MCP_ERROR_REASONS.CONTROL_PLANE_UNAVAILABLE, `project '${context.project}' has no Brain session, so pair_create cannot start a pair here`);
       }
       const brainName = caller.sessionName;
-      const args = pickAllowedMcpArgs(input, ['taskId', 'title', 'brief', 'executor', 'auditor', 'executorModel', 'auditorModel', 'createExecutor', 'createAuditor', 'executionPool', 'idempotencyKey']);
+      const args = pickAllowedMcpArgs(input, ['taskId', 'title', 'brief', 'executor', 'auditor', 'executorModel', 'auditorModel', 'createExecutor', 'createAuditor', 'executionPool', 'workspace', 'idempotencyKey']);
       const executorArg = stringArg(args, 'executor');
+      const workspaceArg = stringArg(args, 'workspace');
+      // An unknown value is refused before anything is created or persisted.
+      if (workspaceArg !== undefined && !isTaskPairWorkspaceRequest(workspaceArg)) {
+        return error(MCP_ERROR_REASONS.VALIDATION_FAILED, `workspace must be one of ${TASK_PAIR_WORKSPACE_REQUESTS.join(', ')} (got "${workspaceArg}"). ${TASK_PAIR_WORKSPACE_PICK_GUIDANCE}`);
+      }
+      const workspaceRequest: TaskPairWorkspaceRequest = workspaceArg ?? 'auto';
       const brief = stringArg(args, 'brief');
       if (!brief) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'brief is required');
       const auditorArg = stringArg(args, 'auditor');
@@ -3058,6 +3072,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
                   ...(executorModel ? { executormodel: executorModel } : {}),
                   ...(auditorModel ? { auditormodel: auditorModel } : {}),
                   ...(executionPool ? { pool: executionPool } : {}),
+                  ...(workspaceRequest !== 'auto' ? { workspace: workspaceRequest } : {}),
                 },
                 brief,
               },
@@ -3074,6 +3089,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
               executorModel,
               auditorModel,
               executionPool,
+              workspace: workspaceRequest,
               brief,
               hasObjective: true,
               structuredPairCreate: true,
@@ -3098,7 +3114,11 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
         }
         const latest = store.getPair(context.project, taskId) ?? stored;
         const executionSelection = describeExecutionSelection(brainName, latest.state, { executorNamed: !!executorArg || !!executorModel, auditorNamed: !!auditorArg || !!auditorModel }, {}, ensured.created);
-        return { status: 'ok', taskId, idempotentReplay: false, created: transition.effect === 'created', state: latest.state.status, ...supervisionFields(context.project), executionSelection, deliveries };
+        return {
+          status: 'ok', taskId, idempotentReplay: false, created: transition.effect === 'created', state: latest.state.status,
+          workspace: { requested: latest.state.workspaceKind ?? 'auto', note: taskPairWorkspaceCreateNote(latest.state.workspaceKind ?? 'auto') },
+          ...supervisionFields(context.project), executionSelection, deliveries,
+        };
       });
     },
     [MEMORY_MCP_TOOL_NAMES.PAIR_DISPATCH]: async (input) => {
@@ -3282,6 +3302,21 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       const context = await pairCallerContext();
       if (context.status === 'error') return context.result;
       return { status: 'ok', maxConcurrency: getTaskPairStore().getMaxConcurrency(caller.sessionName!) };
+    },
+    [MEMORY_MCP_TOOL_NAMES.PAIR_WORKSPACE_GC]: async (input) => {
+      const context = await pairCallerContext();
+      if (context.status === 'error') return context.result;
+      if (!caller.sessionName || projectBrainSession(context.project) !== caller.sessionName) {
+        return error(MCP_ERROR_REASONS.SCOPE_FORBIDDEN, 'pair_workspace_gc requires the authoritative project Brain');
+      }
+      const args = pickAllowedMcpArgs(input, ['dryRun', 'minAgeHours', 'limit']);
+      const dryRun = args.dryRun === undefined ? true : args.dryRun === true;
+      const minAgeHours = typeof args.minAgeHours === 'number' && Number.isFinite(args.minAgeHours) && args.minAgeHours > 0 ? args.minAgeHours : 0;
+      const limit = typeof args.limit === 'number' && Number.isFinite(args.limit) ? Math.min(200, Math.max(1, Math.floor(args.limit))) : undefined;
+      const entries = await taskPairService.gcWorkspaces(context.project, caller.sessionName, {
+        dryRun, minAgeMs: minAgeHours * 60 * 60_000, ...(limit !== undefined ? { limit } : {}),
+      });
+      return { status: 'ok', dryRun, entries };
     },
     [MEMORY_MCP_TOOL_NAMES.SESSION_RUNTIME_IDENTITY_GET]: async (input) => {
       if (input && typeof input === 'object' && !Array.isArray(input) && Object.keys(input as Record<string, unknown>).length > 0) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'session_runtime_identity_get takes no arguments');
@@ -4557,6 +4592,7 @@ const schemas = {
     createExecutor: z.object({ providerFamily: z.string().trim().min(1).optional(), model: z.string().trim().min(1).optional() }).strict().optional(),
     createAuditor: z.object({ providerFamily: z.string().trim().min(1).optional(), model: z.string().trim().min(1).optional() }).strict().optional(),
     executionPool: z.enum(['primary', 'economy']).optional(),
+    workspace: z.enum(TASK_PAIR_WORKSPACE_REQUESTS).optional(),
     idempotencyKey: z.string().trim().min(1).optional(),
   }).strict(),
   [MEMORY_MCP_TOOL_NAMES.PAIR_DISPATCH]: z.object({
@@ -4603,6 +4639,11 @@ const schemas = {
     maxConcurrency: z.number().int().min(1).max(100).describe('Durable pair concurrency limit.'),
   }).strict(),
   [MEMORY_MCP_TOOL_NAMES.PAIR_GET_MAX_CONCURRENCY]: z.object({}).strict(),
+  [MEMORY_MCP_TOOL_NAMES.PAIR_WORKSPACE_GC]: z.object({
+    dryRun: z.boolean().optional(),
+    minAgeHours: z.number().min(0).optional(),
+    limit: z.number().int().min(1).max(200).optional(),
+  }).strict(),
   [MEMORY_MCP_TOOL_NAMES.SESSION_RUNTIME_IDENTITY_GET]: z.object({}).strict(),
   [MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE]: z.object({
     target: z.string().optional().describe('Exact target; omit only for autoProvision.'),

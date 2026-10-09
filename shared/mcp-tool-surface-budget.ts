@@ -48,13 +48,17 @@ export const MCP_INJECTED_EXECUTION_BLOCK = Object.freeze({ taskSupport: 'forbid
 // session_close (exact sub-session soft close, see shared/session-close.ts) adds one ~0.9 KiB contract to the full catalog on top of that
 // (measured 49,209 bytes together); the ceilings move by another 1,000 bytes for it, deliberately and reviewably, rather than trimming
 // unrelated safety text.
-export const MCP_TOOL_SURFACE_AUTHORED_BUDGET_BYTES = 50_000;
+// pair_create's `workspace` parameter and the owner rule "a worktree only when necessary" (see shared/task-pair-workspace.ts) add about
+// 1.1 KiB of authored schema to the full catalog (measured 50,064 bytes together; owner request, 2026-10), and the on-demand
+// pair_workspace_gc tool another ~0.6 KiB (raw wire payload 57,340 bytes together); neither is part of the bootstrap set, so that
+// ceiling does not move. The ceilings move by 1,000 bytes each, deliberately and reviewably.
+export const MCP_TOOL_SURFACE_AUTHORED_BUDGET_BYTES = 51_000;
 // Raw = authored + the MCP SDK framing. The pair-resource-claim tool adds one
 // intentionally discoverable contract and `command` one published parameter;
 // the structured pair_create/pair_dispatch and pair lifecycle contracts add
 // about 4.3 KiB to that wire payload; retain a bounded ceiling for the
 // resulting surface.
-export const MCP_TOOL_SURFACE_RAW_BUDGET_BYTES = 57_000;
+export const MCP_TOOL_SURFACE_RAW_BUDGET_BYTES = 58_000;
 /**
  * Default model-visible surface: one discovery tool plus the stable minimal
  * delegation, supervision-task, basic-memory/source-expansion, scheduling,

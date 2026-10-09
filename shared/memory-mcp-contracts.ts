@@ -29,6 +29,12 @@ import {
   COMPUTER_USE_TOOLS,
 } from './computer-use.js';
 import { FILE_TRANSFER_PATH_MAX_BYTES } from './transport/file-transfer.js';
+import {
+  TASK_PAIR_WORKSPACE_PARAMETER_DESCRIPTION,
+  TASK_PAIR_WORKSPACE_PICK_GUIDANCE,
+  TASK_PAIR_WORKSPACE_REQUESTS,
+  TASK_PAIR_WORKTREE_ONLY_WHEN_NECESSARY,
+} from './task-pair-workspace.js';
 import { TASK_PAIR_BRAIN_CLOSE_TOOL_NOTE, TASK_PAIR_BRAIN_CLOSE_TOOL_SHORT_NOTE } from './task-pair.js';
 import { MACHINE_FILE_TRANSFER_TRANSPORT } from './machine-direct-file-transfer.js';
 import { TRANSPORT_EFFORT_LEVELS } from './effort-levels.js';
@@ -122,6 +128,7 @@ export const MEMORY_MCP_TOOL_NAMES = {
   PAIR_VERDICT: 'pair_verdict',
   PAIR_SET_MAX_CONCURRENCY: 'pair_set_max_concurrency',
   PAIR_GET_MAX_CONCURRENCY: 'pair_get_max_concurrency',
+  PAIR_WORKSPACE_GC: 'pair_workspace_gc',
   SESSION_RUNTIME_IDENTITY_GET: 'session_runtime_identity_get',
   SESSION_RESTART: 'session_restart',
   SESSION_CLOSE: 'session_close',
@@ -197,6 +204,7 @@ export const MEMORY_MCP_TOOL_NAME_LIST = [
   MEMORY_MCP_TOOL_NAMES.PAIR_VERDICT,
   MEMORY_MCP_TOOL_NAMES.PAIR_SET_MAX_CONCURRENCY,
   MEMORY_MCP_TOOL_NAMES.PAIR_GET_MAX_CONCURRENCY,
+  MEMORY_MCP_TOOL_NAMES.PAIR_WORKSPACE_GC,
   MEMORY_MCP_TOOL_NAMES.SESSION_RUNTIME_IDENTITY_GET,
   MEMORY_MCP_TOOL_NAMES.SESSION_RESTART,
   MEMORY_MCP_TOOL_NAMES.SESSION_CLOSE,
@@ -777,7 +785,7 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
   },
   [MEMORY_MCP_TOOL_NAMES.PAIR_CREATE]: {
     name: MEMORY_MCP_TOOL_NAMES.PAIR_CREATE,
-    description: 'Brain-only structured creation of a task pair. Persists the brief and assignments atomically, then delivers participant briefs with durable delivery receipts. Retry with the same idempotencyKey to replay without duplicate creation or sends. Unnamed roles come from the pool; with no pool, from idle same-vendor secondary-tier sub-sessions, creating missing ones (capped, marked autoCreated). createExecutor/createAuditor create one. ' + TASK_PAIR_SUBSESSION_TERM_SHORT + ' ' + TASK_PAIR_BRAIN_CLOSE_TOOL_SHORT_NOTE,
+    description: 'Brain-only structured creation of a task pair. Persists the brief and assignments atomically, then delivers participant briefs with durable delivery receipts. Retry with the same idempotencyKey to replay without duplicate creation or sends. Unnamed roles come from the pool; with no pool, from idle same-vendor secondary-tier sub-sessions, creating missing ones (capped, marked autoCreated). createExecutor/createAuditor create one. ' + TASK_PAIR_SUBSESSION_TERM_SHORT + ' ' + TASK_PAIR_BRAIN_CLOSE_TOOL_SHORT_NOTE + ' ' + TASK_PAIR_WORKTREE_ONLY_WHEN_NECESSARY + ' ' + TASK_PAIR_WORKSPACE_PICK_GUIDANCE,
     inputSchema: objectSchema({
       taskId: stringSchema('Optional stable task id. When omitted, idempotencyKey deterministically derives one.'),
       title: stringSchema('Short specific title in the owner UI language.'),
@@ -789,6 +797,7 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
       createExecutor: objectSchema({ providerFamily: stringSchema('Provider family; default: Brain\'s.'), model: stringSchema('Model; default: the family secondary model.') }),
       createAuditor: objectSchema({ providerFamily: stringSchema('Provider family; default: Brain\'s.'), model: stringSchema('Model; default: the family secondary model.') }),
       executionPool: { type: 'string', enum: ['primary', 'economy'], description: 'Optional executor execution pool.' },
+      workspace: { type: 'string', enum: [...TASK_PAIR_WORKSPACE_REQUESTS], description: TASK_PAIR_WORKSPACE_PARAMETER_DESCRIPTION },
       idempotencyKey: stringSchema('Stable retry key for this create request.'),
     }, ['brief']),
     outputSchema: objectSchema({
@@ -875,6 +884,16 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
     description: 'Get the caller Brain\'s durable task-pair concurrency limit.',
     inputSchema: objectSchema({}),
     outputSchema: objectSchema({ status: stringSchema('ok or error.'), maxConcurrency: numberSchema('Stored concurrency limit.') }),
+  },
+  [MEMORY_MCP_TOOL_NAMES.PAIR_WORKSPACE_GC]: {
+    name: MEMORY_MCP_TOOL_NAMES.PAIR_WORKSPACE_GC,
+    description: 'Brain-only cleanup of the workspaces of ENDED pairs now, without the 7-day wait. dryRun (default true) lists what would go. Never touches an open pair, uncommitted or unintegrated work.',
+    inputSchema: objectSchema({
+      dryRun: booleanSchema('Default true: only list. false removes.'),
+      minAgeHours: numberSchema('Only pairs that ended at least this long ago; default 0.'),
+      limit: numberSchema('Pairs examined per call, oldest end first; default 50.'),
+    }),
+    outputSchema: objectSchema({ status: stringSchema('ok or error.'), dryRun: booleanSchema('Whether nothing was removed.'), entries: { type: 'array', items: { type: 'object' } } }),
   },
   [MEMORY_MCP_TOOL_NAMES.SESSION_RUNTIME_IDENTITY_GET]: {
     name: MEMORY_MCP_TOOL_NAMES.SESSION_RUNTIME_IDENTITY_GET,

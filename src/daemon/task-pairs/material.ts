@@ -15,7 +15,7 @@
  */
 import { execFileOffMainCallback as execFile } from '../../util/exec-helper.js';
 import { existsSync } from 'node:fs';
-import { redirectTaskPairWorkspacePath, sameTaskPairCommit, type TaskPairState } from '../../../shared/task-pair.js';
+import { redirectTaskPairWorkspacePath, sameTaskPairCommit, TASK_PAIR_WORKSPACE_NONE, type TaskPairState } from '../../../shared/task-pair.js';
 import { buildCowReview } from './non-git.js';
 
 const GIT_HEAD_TIMEOUT_MS = 5_000;
@@ -26,6 +26,8 @@ export interface ResolvedTaskPairMaterial {
   base?: string;
   /** Task-directory material. */
   path?: string;
+  /** `workspace=none`: the executor's report and evidence is the material (no path, head or diff). */
+  report?: true;
   /** Non-git project (cow clone / in-place): which way it is handled, so the audit request says how to review. */
   nonGit?: { mode: 'cow' | 'in_place'; projectRoot: string };
   /** In-place mode: the changed files the executor stated on READY (comma separated). */
@@ -76,6 +78,8 @@ export function setTaskPairMaterialDepsForTests(deps: TaskPairMaterialDeps | und
 }
 
 export async function resolveTaskPairMaterial(pair: TaskPairState, deps: TaskPairMaterialDeps = testDeps ?? {}): Promise<ResolvedTaskPairMaterial> {
+  // A pair with no workspace by Brain's choice: nothing to resolve. The executor's report to the auditor is the material.
+  if (pair.workspaceKind === TASK_PAIR_WORKSPACE_NONE) return { report: true, source: 'executor' };
   const workspace = pair.workspace && pair.workspace.status !== 'removed' ? pair.workspace : undefined;
   // A READY written after the worktree moved under a new executor may still
   // name the old path: it resolves to the workspace's current location, so an
