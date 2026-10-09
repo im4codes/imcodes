@@ -77,6 +77,7 @@ import { tmpdir } from 'node:os';
 import * as path from 'node:path';
 import { PassThrough, Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
+import { attachmentContentDisposition, resolveAttachmentDelivery } from '../../../shared/attachment-delivery.js';
 
 export const fileTransferRoutes = new Hono<{ Bindings: Env; Variables: { userId: string; role: string } }>();
 
@@ -452,6 +453,17 @@ function buildStagedDownloadUrl(requestUrl: string, configuredServerUrl: string 
 }
 
 /**
+ * The ONE place a download response gets its type, disposition and security headers (shared/attachment-delivery.ts): both the inline
+ * base64 path and the streaming relay go through it, so no download can be served inline as a document on the app origin.
+ */
+function setAttachmentDeliveryHeaders(c: Context, claimedMime: string | undefined, filename: string): void {
+  const delivery = resolveAttachmentDelivery(claimedMime);
+  c.header('Content-Type', delivery.contentType);
+  c.header('Content-Disposition', attachmentContentDisposition(delivery.disposition, filename));
+  for (const [name, value] of Object.entries(delivery.securityHeaders)) c.header(name, value);
+}
+
+/**
  * Send a `file.download_done` (base64 inline) daemon result to the browser as a
  * binary attachment response. Shared by the inline small-file fast path, the
  * legacy (no-stream-capability) path, and the relay-failure fallback — repo
@@ -468,17 +480,10 @@ function respondBase64Download(
   // so serve just the missing tail.
   if (offset > 0 && offset >= whole.length) return rangeNotSatisfiable(c, whole.length);
   const content = offset > 0 ? whole.subarray(offset) : whole;
-  const mime = (result.mime as string) || 'application/octet-stream';
   const filename = (result.filename as string) || attachmentId;
   const status = setAttachmentRangeHeaders(c, offset, whole.length);
-  c.header('Content-Type', mime);
+  setAttachmentDeliveryHeaders(c, result.mime as string | undefined, filename);
   c.header('Content-Length', String(content.length));
-  // RFC 5987: non-ASCII filenames must use filename*=UTF-8'' encoding. Include
-  // both for maximum client compatibility.
-  const safeFilename = filename.replace(/[^\x20-\x7E]/g, '_').replace(/"/g, '\\"');
-  const encodedFilename = encodeURIComponent(filename).replace(/'/g, '%27');
-  const disposition = mime.toLowerCase().startsWith('image/') ? 'inline' : 'attachment';
-  c.header('Content-Disposition', `${disposition}; filename="${safeFilename}"; filename*=UTF-8''${encodedFilename}`);
   return c.body(content, status as 200 | 206);
 }
 
@@ -577,7 +582,6 @@ async function attemptStreamedDownload(
       return { kind: 'done', response: respondBase64Download(c, result, attachmentId, offset) };
     }
 
-    const mime = (result.mime as string) || 'application/octet-stream';
     const filename = (result.filename as string) || attachmentId;
     const size = typeof result.size === 'number' && Number.isFinite(result.size) && result.size >= 0
       ? Math.trunc(result.size)
@@ -590,12 +594,8 @@ async function attemptStreamedDownload(
       return { kind: 'retry' };
     }
     const status = setAttachmentRangeHeaders(c, offset, size === undefined ? undefined : offset + size);
-    c.header('Content-Type', mime);
+    setAttachmentDeliveryHeaders(c, result.mime as string | undefined, filename);
     if (size !== undefined) c.header('Content-Length', String(size));
-    const safeFilename = filename.replace(/[^\x20-\x7E]/g, '_').replace(/"/g, '\\"');
-    const encodedFilename = encodeURIComponent(filename).replace(/'/g, '%27');
-    const disposition = mime.toLowerCase().startsWith('image/') ? 'inline' : 'attachment';
-    c.header('Content-Disposition', `${disposition}; filename="${safeFilename}"; filename*=UTF-8''${encodedFilename}`);
     c.header('Cache-Control', 'no-store');
     return {
       kind: 'done',
