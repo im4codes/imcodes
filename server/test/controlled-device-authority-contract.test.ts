@@ -12,8 +12,8 @@ const source = (relative: string) => readFileSync(new URL(relative, import.meta.
  * add feature checks after the appropriate authority.
  */
 const AUTHORITY_MATRIX = [
-  ['command execution', '../src/routes/machine-exec.ts', 'resolveMachineOperationalAccess'],
-  ['OCU / Computer Use', '../src/routes/machine-computer-use.ts', 'resolveMachineOperationalAccess'],
+  ['command execution', '../src/routes/machine-exec.ts', 'gateMachineAction'],
+  ['OCU / Computer Use', '../src/routes/machine-computer-use.ts', 'gateMachineAction'],
   ['file operations and transfers', '../src/routes/file-transfer.ts', 'resolveControlledMachineOperatorAccess'],
   ['status and device actions', '../src/routes/machines.ts', 'resolveControlledMachineManagementAccess'],
   ['controlled-device websocket admission', '../src/security/authorization.ts', 'resolveControlledMachineOperatorAccess'],
@@ -55,7 +55,7 @@ describe('controlled-device centralized authority contract', () => {
     expect([...new Set(machinesRoutes.routes
       .map((route) => `${route.method} ${route.path}`)
       .filter((route) => route.includes('/:serverId/')))]
-      .sort()).toEqual(MACHINE_ACTION_PATHS.map((path) => `POST ${path}`).sort());
+      .sort()).toEqual([...MACHINE_ACTION_PATHS.map((path) => `POST ${path}`), 'GET /:serverId/exec-audit'].sort());
   });
 
   it.each(MACHINE_ACTION_PATHS)('%s admits through the centralized authority without a downstream owner predicate', (path) => {
@@ -66,6 +66,25 @@ describe('controlled-device centralized authority contract', () => {
     expect(start).toBeGreaterThanOrEqual(0);
     expect(handler).toContain('resolveControlledMachineManagementAccess');
     expect(handler).not.toMatch(/servers\.user_id\s*=|\bAND\s+user_id\s*=/);
+  });
+
+  it('the exec switch and the exec audit are the DEVICE OWNER\'s alone (a participant or group admin cannot re-enable or read them)', () => {
+    const routes = source('../src/routes/machines.ts');
+    for (const marker of ["machinesRoutes.post('/:serverId/exec-enabled'", "machinesRoutes.get('/:serverId/exec-audit'"]) {
+      const start = routes.indexOf(marker);
+      expect(start, marker).toBeGreaterThanOrEqual(0);
+      const handler = routes.slice(start, start + 1800);
+      expect(handler, marker).toContain('resolveControlledMachineManagementAccess');
+      expect(handler, marker).toContain('MACHINE_ACCESS_SOURCE.OWNER');
+    }
+  });
+
+  it('every execute-class entry point goes through the one gate (admission + audit + rate limit) with an explicit action', () => {
+    for (const file of ['../src/routes/machine-exec.ts', '../src/routes/machine-computer-use.ts', '../src/routes/file-transfer.ts']) {
+      const text = source(file);
+      expect(text, file).toContain('gateMachineAction(');
+      expect(text, file).not.toMatch(/\bresolveMachineOperationalAccess\b/);
+    }
   });
 
   it('keeps sharing management outside operator authority', () => {
