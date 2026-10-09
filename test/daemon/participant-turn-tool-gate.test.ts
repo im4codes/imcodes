@@ -169,6 +169,8 @@ describe('participantTurnFromAuthorityHook (the production answer to "whose turn
     expect(await participantTurnFromAuthorityHook(async () => ({ ok: true, required: true, authority: null }))()).toBe(true);
     expect(await participantTurnFromAuthorityHook(async () => ({ ok: true, required: false, authority: null }))()).toBe(false);
     expect(await participantTurnFromAuthorityHook(async () => { throw new Error('shared_machine_authority_unavailable'); })()).toBe(true);
-    expect(await participantTurnFromAuthorityHook(async () => ({}))()).toBe(false);
+    for (const unknown of [{}, { ok: true }, { required: false }, { ok: false, required: false }, { ok: true, required: 'false' }]) {
+      expect(await participantTurnFromAuthorityHook(async () => unknown)()).toBe(true);
+    }
   });
 });

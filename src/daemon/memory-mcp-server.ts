@@ -360,7 +360,10 @@ export function participantTurnFromAuthorityHook(
 ): () => Promise<boolean> {
   return async () => {
     try {
-      return (await postAuthorityHook()).required === true;
+      const answer = await postAuthorityHook();
+      // Only a successful, explicit owner answer can vouch for this turn. Missing/unknown fields (including version-skewed hook
+      // replies) are not evidence of owner origin; the tool gate and every participant projection share this fail-closed answer.
+      return answer.ok !== true || answer.required !== false;
     } catch {
       return true;
     }
