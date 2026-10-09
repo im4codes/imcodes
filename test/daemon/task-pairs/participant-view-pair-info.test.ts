@@ -62,6 +62,11 @@ describe('a participant-started turn gets no open-pair titles, models or briefs'
   beforeEach(() => {
     setTaskPairStoreForTests(new TaskPairStore(':memory:'));
     getTaskPairStore().savePair(PROJECT, pair('task-1'));
+    getTaskPairStore().recordEvent({
+      id: 'event-1', project: PROJECT, taskId: 'task-1', writer: BRAIN, role: 'brain', verb: 'DISPATCH',
+      attrs: { title: SECRET_TITLE, executorModel: SECRET_MODEL, auditorModel: SECRET_MODEL, brief: SECRET_BRIEF },
+      effect: 'recorded', unusual: false, source: 'explicit_marker', fromStatus: 'queued', toStatus: 'working', at: 15,
+    });
   });
   afterEach(() => setTaskPairStoreForTests(undefined));
 
@@ -135,6 +140,10 @@ describe('a participant-started turn gets no open-pair titles, models or briefs'
       const h = handlers(turn);
       const listed = await h[MEMORY_MCP_TOOL_NAMES.PAIR_LIST]({}) as { pairs: Array<Record<string, unknown>> };
       const got = await h[MEMORY_MCP_TOOL_NAMES.PAIR_GET]({ taskId: 'task-1' }) as { pair: Record<string, unknown> };
+      expect(got.pair.events).toEqual([expect.objectContaining({
+        id: 'event-1', taskId: 'task-1', writer: BRAIN, verb: 'DISPATCH', fromStatus: 'queued', toStatus: 'working',
+        attrs: narrowed ? {} : { title: SECRET_TITLE, executorModel: SECRET_MODEL, auditorModel: SECRET_MODEL, brief: SECRET_BRIEF },
+      })]);
       for (const view of [listed.pairs[0]!, got.pair]) {
         expect(view).toMatchObject({ taskId: 'task-1', status: 'working', round: 1, blocking: ['P0'], executor: { session: EXEC }, auditor: { session: AUD } });
         if (narrowed) {

@@ -2986,11 +2986,15 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       const queuePositions = stored.state.status === 'queued'
         ? queuePositionsOf(getTaskPairStore().listPairsForBrain(caller.sessionName!, context.project, false, 500))
         : new Map<string, number>();
+      const participantView = await participantViewRequired();
+      const events = getTaskPairStore().listEvents(context.project, taskId, eventLimit);
       return {
         status: 'ok',
         pair: {
-          ...pairProjection(stored, context.sessions, queuePositions, await participantViewRequired()),
-          events: getTaskPairStore().listEvents(context.project, taskId, eventLimit),
+          ...pairProjection(stored, context.sessions, queuePositions, participantView),
+          // Marker attrs can contain titles/models and arbitrary brief or report text under different keys. Keep transition metadata,
+          // not raw attrs, for the entire history (including older stored events); the owner's view and stored records are unchanged.
+          events: participantView ? events.map((event) => ({ ...event, attrs: {} })) : events,
         },
       };
     },
