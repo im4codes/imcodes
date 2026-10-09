@@ -3,7 +3,6 @@ import {
   ATTACHMENT_INLINE_MIME_ALLOWLIST,
   normalizeAttachmentMime,
 } from '@shared/attachment-delivery.js';
-import { saveBlobViaDownloadAnchor } from './browser-download.js';
 
 /**
  * Opening a downloaded attachment WITHOUT ever rendering it as a document on the app origin.
@@ -32,12 +31,19 @@ function safeSaveName(name: string): string {
   return name.replace(/[\\/\0-\x1f]/g, '_').trim() || 'download';
 }
 
-export function openFetchedAttachment(
+// browser-download.ts imports @capacitor/core, which installs the global `Capacitor` when it loads; api.ts must not pull that in at module
+// load (it would replace an embedding shell's / a test's own `Capacitor`), so the save path loads it only when a file is actually saved.
+async function saveViaDownloadAnchor(blob: Blob, name: string): Promise<void> {
+  const { saveBlobViaDownloadAnchor } = await import('./browser-download.js');
+  saveBlobViaDownloadAnchor(blob, name);
+}
+
+export async function openFetchedAttachment(
   blob: Blob,
   response: { contentType: string | null; contentDisposition: string | null },
   fallbackName: string,
-  deps: { open?: (url: string) => void; save?: (blob: Blob, name: string) => void; revokeAfterMs?: number } = {},
-): AttachmentOpenOutcome {
+  deps: { open?: (url: string) => void; save?: (blob: Blob, name: string) => void | Promise<void>; revokeAfterMs?: number } = {},
+): Promise<AttachmentOpenOutcome> {
   const bare = normalizeAttachmentMime(response.contentType ?? blob.type);
   if (ATTACHMENT_INLINE_MIME_ALLOWLIST.includes(bare)) {
     const safe = new Blob([blob], { type: bare });
@@ -47,6 +53,6 @@ export function openFetchedAttachment(
     return 'opened';
   }
   const name = safeSaveName(filenameFromContentDisposition(response.contentDisposition) ?? fallbackName);
-  (deps.save ?? saveBlobViaDownloadAnchor)(new Blob([blob], { type: ATTACHMENT_FALLBACK_MIME }), name);
+  await (deps.save ?? saveViaDownloadAnchor)(new Blob([blob], { type: ATTACHMENT_FALLBACK_MIME }), name);
   return 'saved';
 }

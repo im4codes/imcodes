@@ -2369,7 +2369,7 @@ export async function previewAttachment(serverId: string, attachmentId: string, 
   }
   const blob = await res.blob();
   // Only a raster image is ever opened on the app origin; anything that could be a document is saved as a file (attachment-open.ts).
-  openFetchedAttachment(blob, {
+  await openFetchedAttachment(blob, {
     contentType: res.headers.get('content-type'),
     contentDisposition: res.headers.get('content-disposition'),
   }, attachmentId);
