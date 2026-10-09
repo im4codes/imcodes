@@ -3,6 +3,7 @@ import { useEffect, useRef, useState } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import { buildAttachmentDownloadUrl } from '../api.js';
 import { forgetAttachmentPreview, getAttachmentPreview, isPreviewableImageName } from '../attachment-preview-cache.js';
+import { ATTACHMENT_PREVIEW_CHROME, ATTACHMENT_PREVIEW_MARGIN_PX, attachmentPreviewLeft, attachmentPreviewSize } from '../attachment-preview-size.js';
 import { ImageLightbox } from './ImageLightbox.js';
 import { sanitizeUploadFilename } from '@shared/upload-filename.js';
 
@@ -50,7 +51,10 @@ export function ComposerAttachmentBadge({
   // The local copy is tried first; when the page cannot show it (a policy that blocks blob: images, a codec the webview lacks)
   // the uploaded file's authenticated download URL is tried once before giving up.
   const remoteTriedRef = useRef(false);
-  const [hover, setHover] = useState<{ left: number; bottom: number } | null>(null);
+  // `viewport` is the window size when the bubble opened: the bubble is sized from it and from the picture's own pixels (see attachment-preview-size.ts).
+  const [hover, setHover] = useState<{ left: number; bottom: number; viewport: { width: number; height: number } } | null>(null);
+  // The picture's pixel size, known once the browser has decoded it (tied to the source it was read from).
+  const [natural, setNatural] = useState<{ src: string; width: number; height: number } | null>(null);
   const [lightbox, setLightbox] = useState(false);
 
   useEffect(() => () => {
@@ -100,7 +104,7 @@ export function ComposerAttachmentBadge({
     hoverTimerRef.current = setTimeout(() => {
       const rect = badgeRef.current?.getBoundingClientRect();
       if (!rect) return;
-      setHover({ left: rect.left, bottom: window.innerHeight - rect.top + POPOVER_GAP_PX });
+      setHover({ left: rect.left, bottom: window.innerHeight - rect.top + POPOVER_GAP_PX, viewport: { width: window.innerWidth, height: window.innerHeight } });
     }, HOVER_PREVIEW_DELAY_MS);
   };
 
@@ -151,21 +155,49 @@ export function ComposerAttachmentBadge({
           title={removing ? t('upload.deleting') : t('common.delete')}
         >×</button>
       </span>
-      {hover && isImage && toBody(
-        <div
-          class={`attachment-hover-preview ${ATTACHMENT_PREVIEW_LAYER_CLASS}`}
-          role="img"
-          aria-label={name}
-          style={{ left: `${Math.max(8, hover.left)}px`, bottom: `${hover.bottom}px` }}
-        >
-          {src
-            ? <img src={src} alt={name} onError={onImageError} />
-            : <span class="attachment-hover-preview-state">
-              {failed ? t('upload.preview_unavailable') : t('upload.preview_loading')}
-            </span>}
-          <span class="attachment-hover-preview-caption">#{seq} {name}</span>
-        </div>,
-      )}
+      {hover && isImage && toBody((() => {
+        const known = src && natural && natural.src === src ? natural : null;
+        const box = known
+          ? attachmentPreviewSize({
+            viewport: hover.viewport,
+            natural: known,
+            availableHeight: hover.viewport.height - hover.bottom - ATTACHMENT_PREVIEW_MARGIN_PX,
+          })
+          : null;
+        const left = box
+          ? attachmentPreviewLeft({ anchorLeft: hover.left, outerWidth: box.width + ATTACHMENT_PREVIEW_CHROME.width, viewportWidth: hover.viewport.width })
+          : Math.max(ATTACHMENT_PREVIEW_MARGIN_PX, hover.left);
+        return (
+          <div
+            class={`attachment-hover-preview ${ATTACHMENT_PREVIEW_LAYER_CLASS}`}
+            role="img"
+            aria-label={name}
+            style={{ left: `${left}px`, bottom: `${hover.bottom}px` }}
+          >
+            {src && (
+              // The original picture (never a pre-shrunk copy), decoded off the main thread, shown at the size computed from its own pixels.
+              <img
+                src={src}
+                alt={name}
+                decoding="async"
+                class={box ? undefined : 'is-measuring'}
+                style={box ? { width: `${box.width}px`, height: `${box.height}px` } : undefined}
+                onLoad={(event) => {
+                  const img = event.currentTarget as HTMLImageElement;
+                  if (img.naturalWidth > 0 && img.naturalHeight > 0) setNatural({ src, width: img.naturalWidth, height: img.naturalHeight });
+                }}
+                onError={onImageError}
+              />
+            )}
+            {!box && (
+              <span class="attachment-hover-preview-state">
+                {failed ? t('upload.preview_unavailable') : t('upload.preview_loading')}
+              </span>
+            )}
+            <span class="attachment-hover-preview-caption">#{seq} {name}</span>
+          </div>
+        );
+      })())}
       {lightbox && src && toBody(
         <ImageLightbox
           src={src}

@@ -7,9 +7,11 @@ import { shareBlobOrDownload } from '../browser-download.js';
 // instead of a second, drifting copy (CLAUDE.md: never copy code that
 // already exists). The 1x-4x range these export is also exactly the range
 // this feature was asked for.
+import { lightboxActualSizeScale, LIGHTBOX_ZOOM_CAP } from '../attachment-preview-size.js';
 import {
   clampRemoteDesktopViewport,
   INITIAL_REMOTE_DESKTOP_VIEWPORT,
+  REMOTE_DESKTOP_MAX_ZOOM,
   viewportFromRemoteDesktopPinch,
   type RemoteDesktopViewport,
   type RemoteDesktopViewportGeometry,
@@ -178,9 +180,43 @@ export function ImageLightbox({ src, alt = '', fileName, onDownload, onClose, on
   // detection at touchend.
   const tapCandidateRef = useRef(false);
   const lastTapRef = useRef<{ time: number; x: number; y: number } | null>(null);
+  // The picture's own pixel size (known once it has loaded): what "100%" means, and how far a picture shown much smaller than its pixels may be zoomed.
+  const [natural, setNatural] = useState<{ width: number; height: number } | null>(null);
+  const naturalRef = useRef(natural);
+  naturalRef.current = natural;
+  const mouseDragRef = useRef<{ x: number; y: number; viewport: RemoteDesktopViewport; moved: boolean } | null>(null);
+  const suppressOverlayClickRef = useRef(false);
   const [downloadState, setDownloadState] = useState<'idle' | 'busy' | 'done' | 'error'>('idle');
   const [copyState, setCopyState] = useState<'idle' | 'busy' | 'done' | 'error'>('idle');
   const resolvedFileName = fileName || defaultImageFileName(alt);
+
+  /** Scale at which one picture pixel is one screen pixel, relative to the fitted size (0: already at/above its natural size). */
+  const actualScaleNow = (): number => {
+    const node = imageRef.current;
+    const size = naturalRef.current;
+    return node && size ? lightboxActualSizeScale(size, { width: node.offsetWidth, height: node.offsetHeight }) : 0;
+  };
+  const maxScaleNow = (): number => Math.min(LIGHTBOX_ZOOM_CAP, Math.max(REMOTE_DESKTOP_MAX_ZOOM, actualScaleNow()));
+  /**
+   * Fit <-> 100%: from the fitted view to the picture's own pixels (or 2x when it is already shown at full size), anchored at `point`
+   * (image-relative px, default the centre); from any zoomed view back to fit. A wide screenshot or a long page is read at 100% and panned.
+   */
+  const toggleActualSize = (point?: { x: number; y: number }) => {
+    const node = imageRef.current;
+    const stage = lightboxRef.current;
+    if (!node || !stage) { setViewport(INITIAL_REMOTE_DESKTOP_VIEWPORT); return; }
+    const current = viewportRef.current;
+    if (current.scale > 1.01) { setViewport(INITIAL_REMOTE_DESKTOP_VIEWPORT); return; }
+    const target = actualScaleNow() || 2;
+    const geometry = lightboxViewportGeometry(node, stage);
+    if (!point) {
+      // From the button or the keyboard: start at the picture's top-left corner (where a screenshot's text starts), not its middle.
+      // The bounds keep it covering the stage, and a dimension that already fits stays centred.
+      setViewport(clampRemoteDesktopViewport({ scale: target, x: Number.MAX_SAFE_INTEGER, y: Number.MAX_SAFE_INTEGER }, geometry, maxScaleNow()));
+      return;
+    }
+    setViewport(viewportFromRemoteDesktopPinch(current, point, point, target, geometry, maxScaleNow()));
+  };
 
   useEffect(() => {
     const previousActiveElement = document.activeElement instanceof HTMLElement
@@ -252,8 +288,35 @@ export function ImageLightbox({ src, alt = '', fileName, onDownload, onClose, on
     panStartViewportRef.current = null;
     tapCandidateRef.current = false;
     lastTapRef.current = null;
+    mouseDragRef.current = null;
     setViewport(INITIAL_REMOTE_DESKTOP_VIEWPORT);
+    setNatural(null);
   }, [src]);
+
+  // A mouse drag pans a zoomed picture (a touch drag does already). Bound on the window so the drag survives leaving the picture.
+  useEffect(() => {
+    const onMove = (e: MouseEvent) => {
+      const drag = mouseDragRef.current;
+      const node = imageRef.current;
+      const stage = lightboxRef.current;
+      if (!drag || !node || !stage) return;
+      const dx = e.clientX - drag.x;
+      const dy = e.clientY - drag.y;
+      if (!drag.moved && Math.hypot(dx, dy) < 4) return;
+      drag.moved = true;
+      e.preventDefault();
+      setViewport(clampRemoteDesktopViewport({ ...drag.viewport, x: drag.viewport.x + dx, y: drag.viewport.y + dy }, lightboxViewportGeometry(node, stage), maxScaleNow()));
+    };
+    const onUp = () => {
+      const drag = mouseDragRef.current;
+      mouseDragRef.current = null;
+      // The click that ends a drag must not close the lightbox.
+      if (drag?.moved) { suppressOverlayClickRef.current = true; setTimeout(() => { suppressOverlayClickRef.current = false; }, 0); }
+    };
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+    return () => { window.removeEventListener('mousemove', onMove); window.removeEventListener('mouseup', onUp); };
+  }, []);
 
   // Drag-to-dismiss/pinch-zoom/pan are bound imperatively with
   // `{ passive: false }` on the moves so they can call preventDefault.
@@ -330,6 +393,7 @@ export function ImageLightbox({ src, alt = '', fileName, onDownload, onClose, on
           center,
           pinch.viewport.scale * distance / pinch.distance,
           box,
+          maxScaleNow(),
         ));
         return;
       }
@@ -357,7 +421,7 @@ export function ImageLightbox({ src, alt = '', fileName, onDownload, onClose, on
           ...panStart,
           x: panStart.x + dx,
           y: panStart.y + dy,
-        }, box));
+        }, box, maxScaleNow()));
         return;
       }
 
@@ -390,7 +454,8 @@ export function ImageLightbox({ src, alt = '', fileName, onDownload, onClose, on
         && Math.hypot(touch.clientX - last.x, touch.clientY - last.y) <= DOUBLE_TAP_SLOP_PX;
       if (isDoubleTap) {
         lastTapRef.current = null;
-        setViewport(INITIAL_REMOTE_DESKTOP_VIEWPORT);
+        const rect = node.getBoundingClientRect();
+        toggleActualSize({ x: touch.clientX - rect.left, y: touch.clientY - rect.top });
         return true;
       }
       lastTapRef.current = { time: now, x: touch.clientX, y: touch.clientY };
@@ -465,8 +530,6 @@ export function ImageLightbox({ src, alt = '', fileName, onDownload, onClose, on
       });
   };
 
-  const resetZoom = () => setViewport(INITIAL_REMOTE_DESKTOP_VIEWPORT);
-
   // Desktop mouse-wheel zoom, anchored at the cursor -- the wheel's own
   // client point is passed as both the "before" and "after" pinch center,
   // which keeps that exact point fixed under the cursor as the scale
@@ -485,7 +548,7 @@ export function ImageLightbox({ src, alt = '', fileName, onDownload, onClose, on
     const current = viewportRef.current;
     const nextScale = current.scale * Math.exp(-e.deltaY * WHEEL_ZOOM_SENSITIVITY);
     setViewport(viewportFromRemoteDesktopPinch(
-      current, point, point, nextScale, lightboxViewportGeometry(node, stage),
+      current, point, point, nextScale, lightboxViewportGeometry(node, stage), maxScaleNow(),
     ));
   };
 
@@ -511,6 +574,7 @@ export function ImageLightbox({ src, alt = '', fileName, onDownload, onClose, on
       tabIndex={-1}
       onClick={(e) => {
         e.stopPropagation();
+        if (suppressOverlayClickRef.current) return;
         onClose();
       }}
     >
@@ -518,6 +582,12 @@ export function ImageLightbox({ src, alt = '', fileName, onDownload, onClose, on
         ref={imageRef}
         src={src}
         alt={alt}
+        decoding="async"
+        class={viewport.scale > 1 ? 'is-zoomed' : undefined}
+        onLoad={(e) => {
+          const img = e.currentTarget as HTMLImageElement;
+          if (img.naturalWidth > 0 && img.naturalHeight > 0) setNatural({ width: img.naturalWidth, height: img.naturalHeight });
+        }}
         onError={onImageError}
         style={dragOffset !== 0 ? {
           transform: `translateY(${dragOffset}px)`,
@@ -537,12 +607,17 @@ export function ImageLightbox({ src, alt = '', fileName, onDownload, onClose, on
         }}
         onDblClick={(e) => {
           e.stopPropagation();
-          resetZoom();
+          const rect = e.currentTarget.getBoundingClientRect();
+          toggleActualSize({ x: e.clientX - rect.left, y: e.clientY - rect.top });
         }}
         onWheel={handleWheel}
         onMouseDown={(e) => {
           e.stopPropagation();
           startLongPress();
+          if (e.button === 0 && viewportRef.current.scale > 1) {
+            e.preventDefault();
+            mouseDragRef.current = { x: e.clientX, y: e.clientY, viewport: viewportRef.current, moved: false };
+          }
         }}
         onMouseUp={clearLongPressTimer}
         onMouseLeave={clearLongPressTimer}
@@ -606,7 +681,17 @@ export function ImageLightbox({ src, alt = '', fileName, onDownload, onClose, on
           >›</button>
         </>
       )}
-      <button type="button" class="fb-lightbox-close" onClick={onClose}>✕</button>
+      {(actualScaleNow() > 0 || viewport.scale > 1.01) && (
+        <button
+          type="button"
+          class="fb-lightbox-zoom"
+          aria-pressed={viewport.scale > 1.01}
+          onClick={(e) => { e.stopPropagation(); toggleActualSize(); }}
+        >
+          {viewport.scale > 1.01 ? t('chat.image_zoom_fit') : t('chat.image_zoom_actual')}
+        </button>
+      )}
+      <button type="button" class="fb-lightbox-close" aria-label={t('common.close')} title={t('common.close')} onClick={(e) => { e.stopPropagation(); onClose(); }}>✕</button>
     </div>
   );
 }

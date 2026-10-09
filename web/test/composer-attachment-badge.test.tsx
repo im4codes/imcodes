@@ -19,6 +19,7 @@ vi.mock('../src/components/ImageLightbox.js', () => ({
 import { ComposerAttachmentBadge } from '../src/components/ComposerAttachmentBadge.js';
 import { forgetAttachmentPreview, rememberAttachmentPreview } from '../src/attachment-preview-cache.js';
 import { ATTACHMENT_PREVIEW_LAYER_CLASS } from '../src/components/ComposerAttachmentBadge.js';
+import { attachmentPreviewSize, attachmentPreviewLeft, ATTACHMENT_PREVIEW_CHROME } from '../src/attachment-preview-size.js';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 
@@ -264,6 +265,123 @@ describe('ComposerAttachmentBadge', () => {
       expect(ruleOf('.fb-lightbox.attachment-preview-layer')).toContain('z-index: var(--layer-attachment-preview)');
       // A phone's soft keyboard shrinks the visual viewport, not the layout one: the cover takes --vvh like the other full-screen layers.
       expect(css).toMatch(/\.fb-lightbox\.attachment-preview-layer[^{]*\{[^}]*height: var\(--vvh, 100dvh\)/);
+    });
+  });
+
+  describe('size of the hover bubble', () => {
+    const setViewport = (width: number, height: number) => {
+      Object.defineProperty(window, 'innerWidth', { configurable: true, value: width });
+      Object.defineProperty(window, 'innerHeight', { configurable: true, value: height });
+    };
+    const loadImage = (img: HTMLImageElement, width: number, height: number) => {
+      Object.defineProperty(img, 'naturalWidth', { configurable: true, value: width });
+      Object.defineProperty(img, 'naturalHeight', { configurable: true, value: height });
+      act(() => { img.dispatchEvent(new Event('load')); });
+    };
+    const chipAt = (container: HTMLElement, rect: { left: number; top: number }) => {
+      const badge = container.querySelector('.attachment-badge') as HTMLElement;
+      vi.spyOn(badge, 'getBoundingClientRect').mockReturnValue({ left: rect.left, top: rect.top, right: rect.left + 90, bottom: rect.top + 24, width: 90, height: 24, x: rect.left, y: rect.top, toJSON: () => ({}) } as DOMRect);
+      return badge;
+    };
+
+    it('is sized from the viewport and the picture\'s own pixels: a 1970 x 350 chat screenshot is shown wide, not as a 264 px sliver', () => {
+      setViewport(1440, 900);
+      rememberAttachmentPreview(base.path, new File(['x'], 'image.png', { type: 'image/png' }));
+      const { container } = render(<ComposerAttachmentBadge {...base} />);
+      enter(chipAt(container, { left: 40, top: 840 }), 'mouse');
+      act(() => { vi.advanceTimersByTime(200); });
+      const img = document.querySelector('.attachment-hover-preview img') as HTMLImageElement;
+      // Until the picture has been decoded it is measured out of sight and the loading text shows.
+      expect(img.classList.contains('is-measuring')).toBe(true);
+      expect(document.querySelector('.attachment-hover-preview-state')!.textContent).toBe('upload.preview_loading');
+      loadImage(img, 1970, 350);
+      const expected = attachmentPreviewSize({ viewport: { width: 1440, height: 900 }, natural: { width: 1970, height: 350 }, availableHeight: 900 - (900 - 840 + 8) - 12 });
+      expect(img.style.width).toBe(`${expected.width}px`);
+      expect(img.style.height).toBe(`${expected.height}px`);
+      expect(expected.width).toBeGreaterThan(1200);
+      expect(img.classList.contains('is-measuring')).toBe(false);
+      expect(document.querySelector('.attachment-hover-preview-state')).toBeNull();
+      // It is the ORIGINAL (the same object URL, no thumbnail), the bubble stays in the viewport and out of the pointer's way.
+      expect(img.getAttribute('src')).toBe('blob:local-1');
+      const bubble = document.querySelector('.attachment-hover-preview') as HTMLElement;
+      const left = Number.parseFloat(bubble.style.left);
+      expect(left).toBe(attachmentPreviewLeft({ anchorLeft: 40, outerWidth: expected.width + ATTACHMENT_PREVIEW_CHROME.width, viewportWidth: 1440 }));
+      expect(left + expected.width + ATTACHMENT_PREVIEW_CHROME.width).toBeLessThanOrEqual(1440);
+      expect(bubble.getAttribute('aria-label')).toBe('image.png');
+    });
+
+    it('a chip near the right edge pulls the bubble left so none of it is cut off, and a tall picture is limited by the room above the chip', () => {
+      setViewport(1440, 900);
+      rememberAttachmentPreview(base.path, new File(['x'], 'image.png', { type: 'image/png' }));
+      const { container } = render(<ComposerAttachmentBadge {...base} />);
+      enter(chipAt(container, { left: 1300, top: 400 }), 'mouse');
+      act(() => { vi.advanceTimersByTime(200); });
+      const img = document.querySelector('.attachment-hover-preview img') as HTMLImageElement;
+      loadImage(img, 1200, 1600);
+      const bubble = document.querySelector('.attachment-hover-preview') as HTMLElement;
+      const outer = Number.parseFloat(img.style.width) + ATTACHMENT_PREVIEW_CHROME.width;
+      expect(Number.parseFloat(bubble.style.left) + outer).toBeLessThanOrEqual(1440 - 12);
+      // chip top 400 -> only ~380 px above it: the picture plus its caption fit there
+      expect(Number.parseFloat(img.style.height) + ATTACHMENT_PREVIEW_CHROME.height).toBeLessThanOrEqual(400 - 8);
+    });
+
+    it('a tiny picture is not stretched, and the bubble neither takes pointer input nor the keyboard focus (no hover loop, no focus steal)', () => {
+      setViewport(1440, 900);
+      rememberAttachmentPreview(base.path, new File(['x'], 'image.png', { type: 'image/png' }));
+      const { container } = render(<ComposerAttachmentBadge {...base} />);
+      enter(chipAt(container, { left: 40, top: 840 }), 'mouse');
+      act(() => { vi.advanceTimersByTime(200); });
+      const img = document.querySelector('.attachment-hover-preview img') as HTMLImageElement;
+      loadImage(img, 16, 16);
+      expect(img.style.width).toBe('16px');
+      expect(img.style.height).toBe('16px');
+      const active = document.activeElement;
+      const bubble = document.querySelector('.attachment-hover-preview') as HTMLElement;
+      expect(bubble.tabIndex).toBe(-1);
+      expect(bubble.querySelector('button, a, input, [tabindex]')).toBeNull();
+      expect(document.activeElement).toBe(active);
+    });
+
+    it('the size follows the source: after a fallback to the download URL the new picture is measured again', async () => {
+      setViewport(1440, 900);
+      rememberAttachmentPreview(base.path, new File(['x'], 'image.png', { type: 'image/png' }));
+      const { container } = render(<ComposerAttachmentBadge {...base} attachmentId="att1" serverId="s1" />);
+      enter(chipAt(container, { left: 40, top: 840 }), 'mouse');
+      act(() => { vi.advanceTimersByTime(200); });
+      loadImage(document.querySelector('.attachment-hover-preview img') as HTMLImageElement, 400, 300);
+      await act(async () => { fireEvent.error(document.querySelector('.attachment-hover-preview img')!); await Promise.resolve(); await Promise.resolve(); });
+      const next = document.querySelector('.attachment-hover-preview img') as HTMLImageElement;
+      expect(next.getAttribute('src')).toBe('https://srv/api/server/s1/uploads/att1/download');
+      expect(next.classList.contains('is-measuring')).toBe(true);
+      loadImage(next, 1970, 350);
+      expect(Number.parseFloat(next.style.width)).toBeGreaterThan(1200);
+    });
+
+    it('several chips are each sized from their own picture', () => {
+      setViewport(1440, 900);
+      const paths = ['/tmp/up/a/one.png', '/tmp/up/b/two.png'];
+      let counter = 0;
+      (URL as unknown as { createObjectURL: unknown }).createObjectURL = vi.fn(() => `blob:size-${++counter}`);
+      for (const path of paths) rememberAttachmentPreview(path, new File(['x'], 'x.png', { type: 'image/png' }));
+      const { container } = render(
+        <>
+          <ComposerAttachmentBadge {...base} seq={1} name="one.png" path={paths[0]!} />
+          <ComposerAttachmentBadge {...base} seq={2} name="two.png" path={paths[1]!} />
+        </>,
+      );
+      const badges = [...container.querySelectorAll('.attachment-badge')] as HTMLElement[];
+      const sizes: string[] = [];
+      for (const [index, badge] of badges.entries()) {
+        vi.spyOn(badge, 'getBoundingClientRect').mockReturnValue({ left: 40 + index * 100, top: 840, right: 130, bottom: 864, width: 90, height: 24, x: 0, y: 0, toJSON: () => ({}) } as DOMRect);
+        enter(badge, 'mouse');
+        act(() => { vi.advanceTimersByTime(200); });
+        const img = document.querySelector('.attachment-hover-preview img') as HTMLImageElement;
+        loadImage(img, index === 0 ? 1970 : 1200, index === 0 ? 350 : 1600);
+        sizes.push(`${img.style.width}x${img.style.height}`);
+        firePointer(badge, 'leave', 'mouse');
+      }
+      expect(sizes[0]).not.toBe(sizes[1]);
+      expect(Number.parseFloat(sizes[0]!)).toBeGreaterThan(1200);
     });
   });
 });

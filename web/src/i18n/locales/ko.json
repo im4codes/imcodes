@@ -506,6 +506,8 @@
     "image_copy": "이미지 복사",
     "image_copied": "이미지를 복사했습니다",
     "image_copy_failed": "복사 실패",
+    "image_zoom_actual": "원본 크기",
+    "image_zoom_fit": "화면에 맞춤",
     "image_previous": "이전 이미지",
     "image_next": "다음 이미지",
     "tool_detail_toggle": "세부정보",

@@ -506,6 +506,8 @@
     "image_copy": "Копировать изображение",
     "image_copied": "Изображение скопировано",
     "image_copy_failed": "Не удалось скопировать",
+    "image_zoom_actual": "Реальный размер",
+    "image_zoom_fit": "По размеру экрана",
     "image_previous": "Предыдущее изображение",
     "image_next": "Следующее изображение",
     "tool_detail_toggle": "подробно",

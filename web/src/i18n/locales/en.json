@@ -506,6 +506,8 @@
     "image_copy": "Copy image",
     "image_copied": "Image copied",
     "image_copy_failed": "Copy failed",
+    "image_zoom_actual": "Actual size",
+    "image_zoom_fit": "Fit to screen",
     "image_previous": "Previous image",
     "image_next": "Next image",
     "tool_detail_toggle": "details",

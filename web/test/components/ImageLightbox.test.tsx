@@ -452,3 +452,127 @@ describe('ImageLightbox', () => {
     });
   });
 });
+
+describe('ImageLightbox: reading a wide or tall picture (100%, drag-pan, zoom range)', () => {
+  /** A 1970 x 350 screenshot fitted at 300 px wide (stubLightboxGeometry): 100% is 6.57x the fitted size. */
+  function renderLoaded(onClose = vi.fn(), natural = { width: 1970, height: 350 }) {
+    const view = render(<ImageLightbox src="data:image/png;base64,aW1n" onClose={onClose} />);
+    const stubbed = stubLightboxGeometry(view.container);
+    Object.defineProperty(stubbed.image, 'naturalWidth', { configurable: true, value: natural.width });
+    Object.defineProperty(stubbed.image, 'naturalHeight', { configurable: true, value: natural.height });
+    act(() => { stubbed.image.dispatchEvent(new Event('load')); });
+    return { ...view, ...stubbed, onClose };
+  }
+  const zoomButton = (container: HTMLElement) => container.querySelector('.fb-lightbox-zoom') as HTMLButtonElement | null;
+
+  it('offers 100% when the picture is shown smaller than its pixels, and "fit" once zoomed', () => {
+    const { container, image } = renderLoaded();
+    const button = zoomButton(container)!;
+    expect(button.textContent).toBe('image_zoom_actual');
+    expect(button.getAttribute('aria-pressed')).toBe('false');
+    fireEvent.click(button);
+    // one picture pixel per screen pixel: 1970 / 300 fitted px, beyond the 4x of an ordinary zoom
+    expect(readScale(image)).toBeCloseTo(1970 / 300, 2);
+    expect(readScale(image)).toBeGreaterThan(4);
+    expect(zoomButton(container)!.textContent).toBe('image_zoom_fit');
+    expect(zoomButton(container)!.getAttribute('aria-pressed')).toBe('true');
+    fireEvent.click(zoomButton(container)!);
+    expect(readScale(image)).toBe(1);
+    expect(zoomButton(container)!.textContent).toBe('image_zoom_actual');
+  });
+
+  it('a double click toggles fit <-> 100% (anchored where it was clicked), a double tap does the same', () => {
+    const { image } = renderLoaded();
+    fireEvent.dblClick(image, { clientX: 100, clientY: 100 });
+    expect(readScale(image)).toBeCloseTo(1970 / 300, 2);
+    fireEvent.dblClick(image, { clientX: 100, clientY: 100 });
+    expect(readScale(image)).toBe(1);
+    fireEvent.touchStart(image, { touches: [{ clientX: 200, clientY: 200 }] });
+    fireEvent.touchEnd(image, { touches: [], changedTouches: [{ clientX: 200, clientY: 200 }] });
+    fireEvent.touchStart(image, { touches: [{ clientX: 203, clientY: 203 }] });
+    fireEvent.touchEnd(image, { touches: [], changedTouches: [{ clientX: 203, clientY: 203 }] });
+    expect(readScale(image)).toBeCloseTo(1970 / 300, 2);
+    fireEvent.touchStart(image, { touches: [{ clientX: 200, clientY: 200 }] });
+    fireEvent.touchEnd(image, { touches: [], changedTouches: [{ clientX: 200, clientY: 200 }] });
+    fireEvent.touchStart(image, { touches: [{ clientX: 203, clientY: 203 }] });
+    fireEvent.touchEnd(image, { touches: [], changedTouches: [{ clientX: 203, clientY: 203 }] });
+    expect(readScale(image)).toBe(1);
+  });
+
+  it('the wheel and a pinch may zoom up to 100% of a picture shown far smaller than its pixels (not only the shared 4x), never beyond the cap', () => {
+    const { image } = renderLoaded();
+    fireEvent.wheel(image, { deltaY: -5000, clientX: 200, clientY: 200 });
+    expect(readScale(image)).toBeGreaterThan(4);
+    expect(readScale(image)).toBeLessThanOrEqual(16);
+    const huge = renderLoaded(vi.fn(), { width: 20000, height: 3000 });
+    fireEvent.wheel(huge.image, { deltaY: -50000, clientX: 200, clientY: 200 });
+    expect(readScale(huge.image)).toBeLessThanOrEqual(16);
+  });
+
+  it('a picture shown at (or above) its own size has no 100% button, and a double click still zooms in 2x', () => {
+    const view = renderLoaded(vi.fn(), { width: 280, height: 280 });
+    expect(zoomButton(view.container)).toBeNull();
+    fireEvent.dblClick(view.image, { clientX: 150, clientY: 150 });
+    expect(readScale(view.image)).toBe(2);
+    expect(zoomButton(view.container)!.textContent).toBe('image_zoom_fit');
+  });
+
+  it('before the picture has loaded there is nothing to offer: no button, and the ordinary zoom range', () => {
+    const { container } = render(<ImageLightbox src="data:image/png;base64,aW1n" onClose={vi.fn()} />);
+    const { image } = stubLightboxGeometry(container);
+    expect(zoomButton(container)).toBeNull();
+    fireEvent.wheel(image, { deltaY: -50000, clientX: 200, clientY: 200 });
+    expect(readScale(image)).toBeLessThanOrEqual(4);
+  });
+
+  it('a mouse drag pans the zoomed picture, ends without closing the lightbox, and does nothing when not zoomed', () => {
+    const { container, image, onClose } = renderLoaded();
+    // not zoomed: a drag does not pan
+    fireEvent.mouseDown(image, { button: 0, clientX: 200, clientY: 200 });
+    fireEvent.mouseMove(window, { clientX: 260, clientY: 230 });
+    fireEvent.mouseUp(window);
+    expect(readTranslate(image)).toEqual({ x: 0, y: 0 });
+    fireEvent.click(zoomButton(container)!);
+    expect(image.classList.contains('is-zoomed')).toBe(true);
+    const before = readTranslate(image);
+    // The button starts at the picture's top-left corner (where a screenshot's text starts): the content is pushed right/down to the bound.
+    expect(before.x).toBeCloseTo((1970 - 400) / 2, 0);
+    expect(before.y).toBeCloseTo((1970 - 400) / 2, 0);
+    fireEvent.mouseDown(image, { button: 0, clientX: 200, clientY: 200 });
+    fireEvent.mouseMove(window, { clientX: 140, clientY: 170 });
+    fireEvent.mouseUp(window);
+    expect(readTranslate(image).x).toBeCloseTo(before.x - 60, 0);
+    expect(readTranslate(image).y).toBeCloseTo(before.y - 30, 0);
+    // the click that ends the drag lands on the backdrop: it must not close the lightbox
+    fireEvent.click(container.querySelector('.fb-lightbox')!);
+    expect(onClose).not.toHaveBeenCalled();
+    // the next plain click on the backdrop does close it
+    return new Promise<void>((resolve) => setTimeout(() => {
+      fireEvent.click(container.querySelector('.fb-lightbox')!);
+      expect(onClose).toHaveBeenCalledTimes(1);
+      resolve();
+    }, 5));
+  });
+
+  it('a picture that loads from another source starts fit again, and a new source forgets the old size', () => {
+    const onClose = vi.fn();
+    const view = renderLoaded(onClose);
+    fireEvent.click(zoomButton(view.container)!);
+    expect(readScale(view.image)).toBeGreaterThan(4);
+    view.rerender(<ImageLightbox src="data:image/png;base64,YW5vdGhlcg==" onClose={onClose} />);
+    const next = view.container.querySelector('.fb-lightbox img') as HTMLImageElement;
+    expect(readScale(next)).toBe(1);
+    expect(zoomButton(view.container)).toBeNull();
+  });
+
+  it('closes with the visible, labelled close button and with Escape; the picture decodes off the main thread', () => {
+    const { container, onClose, image } = renderLoaded();
+    const close = container.querySelector('.fb-lightbox-close') as HTMLButtonElement;
+    expect(close.getAttribute('aria-label')).toBe('close');
+    fireEvent.click(close);
+    expect(onClose).toHaveBeenCalledTimes(1);
+    fireEvent.keyDown(window, { key: 'Escape' });
+    expect(onClose).toHaveBeenCalledTimes(2);
+    expect(image.getAttribute('decoding')).toBe('async');
+  });
+});

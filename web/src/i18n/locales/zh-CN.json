@@ -506,6 +506,8 @@
     "image_copy": "复制图片",
     "image_copied": "已复制图片",
     "image_copy_failed": "复制失败",
+    "image_zoom_actual": "原始大小",
+    "image_zoom_fit": "适应屏幕",
     "image_previous": "上一张",
     "image_next": "下一张",
     "tool_detail_toggle": "详情",

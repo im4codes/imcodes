@@ -506,6 +506,8 @@
     "image_copy": "画像をコピー",
     "image_copied": "画像をコピーしました",
     "image_copy_failed": "コピーに失敗しました",
+    "image_zoom_actual": "実寸",
+    "image_zoom_fit": "画面に合わせる",
     "image_previous": "前の画像",
     "image_next": "次の画像",
     "tool_detail_toggle": "詳細",

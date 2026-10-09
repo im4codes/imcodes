@@ -1826,8 +1826,10 @@ html.native-ios-mac .chat-dl-btn {
 .attachment-badge-main { display: inline-flex; align-items: center; gap: 4px; min-width: 0; padding: 0; background: none; border: none; color: inherit; font: inherit; cursor: zoom-in; }
 .attachment-badge.is-previewable:hover { border-color: rgba(125,211,252,0.45); color: #cbd5e1; }
 /* Hover preview: fixed so the (overflow-clipped) badge row can't cut it off. */
-.attachment-hover-preview { position: fixed; z-index: var(--layer-attachment-preview); display: grid; gap: 4px; max-width: min(280px, calc(100vw - 16px)); padding: 6px; background: #0b1220; border: 1px solid rgba(125,211,252,0.35); border-radius: 10px; box-shadow: 0 12px 32px rgba(0,0,0,0.55); pointer-events: none; }
-.attachment-hover-preview img { display: block; max-width: 264px; max-height: 240px; width: auto; height: auto; object-fit: contain; border-radius: 6px; background: #020617; }
+.attachment-hover-preview { position: fixed; z-index: var(--layer-attachment-preview); display: grid; gap: 4px; max-width: calc(100vw - 24px); pointer-events: none; padding: 6px; background: #0b1220; border: 1px solid rgba(125,211,252,0.35); border-radius: 10px; box-shadow: 0 12px 32px rgba(0,0,0,0.55); pointer-events: none; }
+/* The picture is sized by script from the viewport and its own pixels (attachment-preview-size.ts); until it has loaded it is measured out of sight. */
+.attachment-hover-preview img { display: block; max-width: none; object-fit: contain; border-radius: 6px; background: #020617; pointer-events: none; }
+.attachment-hover-preview img.is-measuring { position: absolute; width: 1px; height: 1px; opacity: 0; }
 .attachment-hover-preview-state { padding: 18px 22px; font-size: 12px; color: #94a3b8; }
 .attachment-hover-preview-caption { font-size: 11px; color: #94a3b8; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .attachment-lightbox-pending { position: fixed; inset: 0; z-index: var(--layer-attachment-preview); display: flex; align-items: center; justify-content: center; background: rgba(2,6,23,0.8); color: #cbd5e1; font-size: 14px; }
@@ -9224,6 +9226,10 @@ html.native-ios-mac .chat-dl-btn {
    pan, drag-to-dismiss) instead of letting the browser's own native pinch
    zoom the whole page or scroll behind the modal. */
 .fb-lightbox img { max-width: min(92vw, 100%); max-height: min(92vh, 100%); object-fit: contain; border-radius: 6px; cursor: default; touch-action: none; }
+.fb-lightbox img.is-zoomed { cursor: grab; }
+.fb-lightbox img.is-zoomed:active { cursor: grabbing; }
+.fb-lightbox-zoom { position: absolute; top: calc(var(--sat, 0px) + 16px); left: calc(env(safe-area-inset-left, 0px) + 16px); min-width: 36px; height: 36px; padding: 0 14px; border: none; border-radius: 18px; background: rgba(255,255,255,0.15); color: #fff; font-size: 13px; font-weight: 600; cursor: pointer; }
+.fb-lightbox-zoom:hover, .fb-lightbox-zoom:focus-visible { background: rgba(255,255,255,0.28); }
 .fb-lightbox-close { position: absolute; top: calc(var(--sat, 0px) + 16px); right: calc(env(safe-area-inset-right, 0px) + 16px); background: rgba(255,255,255,0.15); border: none; color: #fff; font-size: 20px; width: 36px; height: 36px; border-radius: 50%; cursor: pointer; display: flex; align-items: center; justify-content: center; }
 /* Paging arrows. Semi-transparent at rest so they never compete with the photo,
    and reachable at the vertical middle on both pointer and touch. They sit
