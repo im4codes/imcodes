@@ -5,6 +5,11 @@
  * turn, no turn context at all reads as an owner turn exactly like the gate.
  */
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
+import { createMemoryMcpServer } from '../../../src/daemon/memory-mcp-server.js';
+import { MCP_TOOL_DISCOVERY_NAME } from '../../../shared/mcp-tool-discovery.js';
+import { PARTICIPANT_TURN_TOOL_REFUSAL } from '../../../shared/participant-turn-tool-policy.js';
 import type { ContextNamespace } from '../../../shared/context-types.js';
 import type { TaskPairState } from '../../../shared/task-pair.js';
 import { MEMORY_MCP_TOOL_NAMES } from '../../../shared/memory-mcp-contracts.js';
@@ -59,6 +64,34 @@ describe('a participant-started turn gets no open-pair titles, models or briefs'
     getTaskPairStore().savePair(PROJECT, pair('task-1'));
   });
   afterEach(() => setTaskPairStoreForTests(undefined));
+
+  describe.each([BRAIN, EXEC, AUD])('pair_task_get through MCP for authorized session %s', (sessionName) => {
+    it.each([
+      ['owner origin', async () => false, false],
+      ['participant origin', async () => true, true],
+      ['unavailable origin', async () => { throw new Error('unreachable'); }, true],
+    ] as const)('preserves owner access and refuses brief disclosure for %s', async (_name, participantTurnRequired, denied) => {
+      const server = createMemoryMcpServer({ ...caller, sessionName }, { participantTurnRequired, sendDeps: { listSessions: () => SESSIONS } });
+      const client = new Client({ name: 'pair-brief-origin-test', version: '1' });
+      const [local, remote] = InMemoryTransport.createLinkedPair();
+      await Promise.all([client.connect(local), server.connect(remote)]);
+      try {
+        await client.callTool({ name: MCP_TOOL_DISCOVERY_NAME, arguments: { query: MEMORY_MCP_TOOL_NAMES.PAIR_TASK_GET } });
+        const result = await client.callTool({ name: MEMORY_MCP_TOOL_NAMES.PAIR_TASK_GET, arguments: { taskId: 'task-1' } });
+        if (denied) {
+          expect(result.structuredContent).toMatchObject({ reason: PARTICIPANT_TURN_TOOL_REFUSAL });
+          expect(text(result)).not.toContain(SECRET_BRIEF);
+          expect(text(result)).not.toContain(SECRET_TITLE);
+        } else {
+          expect(result.isError).not.toBe(true);
+          expect(result.structuredContent).toMatchObject({ title: SECRET_TITLE, markdown: SECRET_BRIEF });
+        }
+      } finally {
+        await client.close();
+        await server.close();
+      }
+    });
+  });
 
   const turns: Array<[string, (() => Promise<boolean>) | undefined, boolean]> = [
     ['owner turn', async () => false, false],

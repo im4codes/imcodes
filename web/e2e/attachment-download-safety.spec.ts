@@ -2,6 +2,7 @@ import { expect, test, type Page, type Route } from '@playwright/test';
 import { build } from 'esbuild';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
+import { readFile } from 'node:fs/promises';
 import { attachmentContentDisposition, resolveAttachmentDelivery } from '../../shared/attachment-delivery.js';
 
 /**
@@ -85,6 +86,7 @@ test('CONTROL: the previous behaviour (SVG inline, no CSP) does run its script o
  * module is bundled and run in Chromium against the exact server headers; a replica of the old behaviour is the control.
  */
 let apiBundle = '';
+let composerBundle = '';
 test.beforeAll(async () => {
   const webRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
   const result = await build({
@@ -101,6 +103,31 @@ test.beforeAll(async () => {
     target: 'es2022',
   });
   apiBundle = result.outputFiles[0]!.text;
+  const composer = await build({
+    absWorkingDir: webRoot,
+    stdin: {
+      contents: `import { h, render } from 'preact';
+        import './src/i18n/index.ts';
+        import { configure } from './src/api.ts';
+        import { rememberAttachmentPreview } from './src/attachment-preview-cache.ts';
+        import { ComposerAttachmentBadge } from './src/components/ComposerAttachmentBadge.tsx';
+        export function mount(id, localBytes, mime) {
+          configure('');
+          const name = id === 'svg' ? 'evil.svg' : 'pic.png';
+          const path = '/scoped-test/' + name;
+          if (localBytes) rememberAttachmentPreview(path, new File([new Uint8Array(localBytes)], name, { type: mime }));
+          render(h(ComposerAttachmentBadge, { seq: 1, name, path, attachmentId: id, serverId: 'srv-1', sessionName: 'deck_p_brain', removing: false, onRemove() {} }), document.body);
+        }`,
+      resolveDir: webRoot,
+      loader: 'ts',
+    },
+    bundle: true, format: 'iife', globalName: 'ImcodesComposer', write: false,
+    alias: { '@shared': path.resolve(webRoot, '../shared'), react: 'preact/compat', 'react-dom': 'preact/compat' },
+    jsx: 'automatic', jsxImportSource: 'preact',
+    define: { 'import.meta.env': '{}', 'import.meta.env.DEV': 'false', 'import.meta.env.PROD': 'true', 'import.meta.env.MODE': '"test"' },
+    logLevel: 'error', platform: 'browser', target: 'es2022',
+  });
+  composerBundle = composer.outputFiles[0]!.text;
 });
 
 async function serveDownloads(page: Page): Promise<{ beacons: () => number }> {
@@ -121,6 +148,34 @@ async function serveDownloads(page: Page): Promise<{ beacons: () => number }> {
   await page.route('**/api/server/srv-1/uploads/png/download*', asAttachment('image/png', 'pic.png', () => PNG));
   await page.route('**/probe', async (route) => route.fulfill({ status: 200, contentType: 'text/html', body: '<!doctype html><title>probe</title>' }));
   return { beacons: () => beacons };
+}
+
+for (const source of ['local', 'restored'] as const) {
+  for (const id of ['svg', 'png'] as const) {
+    test(`the real composer hover and lightbox safely render ${source} ${id}`, async ({ page }) => {
+      const seen = await serveDownloads(page);
+      await page.goto('/probe');
+      await page.addStyleTag({ content: await readFile(new URL('../src/styles.css', import.meta.url), 'utf8') });
+      await page.addScriptTag({ content: composerBundle });
+      const origin = new URL(page.url()).origin;
+      const bytes = id === 'svg' ? Buffer.from(SCRIPT_SVG(`${origin}/beacon/composer-svg`)) : PNG;
+      await page.evaluate(({ id, local, bytes }) => {
+        (window as unknown as { ImcodesComposer: { mount(id: string, bytes: number[] | null, mime: string): void } })
+          .ImcodesComposer.mount(id, local ? bytes : null, id === 'svg' ? 'image/svg+xml' : 'image/png');
+      }, { id, local: source === 'local', bytes: [...bytes] });
+      await page.locator('.attachment-badge-main').hover();
+      const hoverImage = page.locator('.attachment-hover-preview img');
+      await expect(hoverImage).toBeVisible();
+      await expect.poll(() => hoverImage.evaluate((img) => (img as HTMLImageElement).naturalWidth)).toBeGreaterThan(0);
+      await page.locator('.attachment-badge-main').click();
+      const fullImage = page.locator('.fb-lightbox img');
+      await expect(fullImage).toBeVisible();
+      await expect.poll(() => fullImage.evaluate((img) => (img as HTMLImageElement).naturalWidth)).toBeGreaterThan(0);
+      expect(seen.beacons()).toBe(0);
+      await page.locator('.fb-lightbox-close').click();
+      await expect(fullImage).toHaveCount(0);
+    });
+  }
 }
 
 for (const [name, id] of [['an SVG with a script', 'svg'], ['an HTML file with a script', 'html']] as const) {

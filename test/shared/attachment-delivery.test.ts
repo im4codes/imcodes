@@ -4,12 +4,41 @@ import {
   ATTACHMENT_FALLBACK_MIME,
   ATTACHMENT_INLINE_MIME_ALLOWLIST,
   ATTACHMENT_RESPONSE_CSP,
+  ATTACHMENT_SNIFF_BYTES,
   attachmentContentDisposition,
   normalizeAttachmentMime,
   resolveAttachmentDelivery,
+  sniffAttachmentMime,
 } from '../../shared/attachment-delivery.js';
 
 describe('attachment delivery policy', () => {
+  it.each([
+    [[0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a], 'image/png'],
+    [[0xff, 0xd8, 0xff, 0xe0], 'image/jpeg'],
+    ['GIF89a', 'image/gif'], ['GIF87a', 'image/gif'], ['RIFF\0\0\0\0WEBP', 'image/webp'],
+    ['BM\0\0\0\0\0\0\0\0\0\0\0\0', 'image/bmp'], ['%PDF-1.4', 'application/pdf'],
+    [[0x50, 0x4b, 0x03, 0x04], 'application/zip'],
+    ['\ufeff<?xml version="1.0"?>\n<!-- logo -->\n<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>', 'image/svg+xml'],
+    ['<svg/>', 'image/svg+xml'], ['<!doctype html><script>alert(1)</script>', 'text/html'],
+    ['<?xml version="1.0"?><document/>', 'application/xml'], ['ordinary text', 'text/plain'],
+    [[], 'application/octet-stream'], [[0xff], 'application/octet-stream'], ['\0binary', 'application/octet-stream'],
+  ] as const)('sniffs %j from bytes as %s without accepting a client MIME', (bytes, expected) => {
+    const prefix = typeof bytes === 'string' ? new TextEncoder().encode(bytes) : new Uint8Array(bytes);
+    expect(sniffAttachmentMime(prefix)).toBe(expected);
+  });
+
+  it('recognizes only aligned AVIF brands inside the declared ftyp box, and respects the sniff bound', () => {
+    const avif = new Uint8Array(24);
+    new DataView(avif.buffer).setUint32(0, 24);
+    avif.set(new TextEncoder().encode('ftypmif1\0\0\0\0avif'), 4);
+    expect(sniffAttachmentMime(avif)).toBe('image/avif');
+    new DataView(avif.buffer).setUint32(0, 16);
+    expect(sniffAttachmentMime(avif)).not.toBe('image/avif'); // compatible brand outside the box
+    const large = new Uint8Array(ATTACHMENT_SNIFF_BYTES * 4).fill(32);
+    large.set(new TextEncoder().encode('<svg/>'), ATTACHMENT_SNIFF_BYTES);
+    expect(sniffAttachmentMime(large)).toBe('text/plain');
+    expect(sniffAttachmentMime(new Uint8Array([0x89, 0x50, 0x4e, 0x47]))).not.toBe('image/png'); // truncated signature
+  });
   it('shows only the raster allowlist inline; SVG and every other type is a download', () => {
     for (const mime of ATTACHMENT_INLINE_MIME_ALLOWLIST) expect(resolveAttachmentDelivery(mime).disposition, mime).toBe(ATTACHMENT_DISPOSITION.INLINE);
     expect(ATTACHMENT_INLINE_MIME_ALLOWLIST.some((mime) => /svg|html|xml|javascript|pdf/.test(mime))).toBe(false);

@@ -77,7 +77,7 @@ import { tmpdir } from 'node:os';
 import * as path from 'node:path';
 import { PassThrough, Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
-import { attachmentContentDisposition, resolveAttachmentDelivery } from '../../../shared/attachment-delivery.js';
+import { ATTACHMENT_SNIFF_BYTES, attachmentContentDisposition, resolveAttachmentDelivery, sniffAttachmentMime } from '../../../shared/attachment-delivery.js';
 
 export const fileTransferRoutes = new Hono<{ Bindings: Env; Variables: { userId: string; role: string } }>();
 
@@ -461,6 +461,17 @@ function setAttachmentDeliveryHeaders(c: Context, claimedMime: string | undefine
   c.header('Content-Type', delivery.contentType);
   c.header('Content-Disposition', attachmentContentDisposition(delivery.disposition, filename));
   for (const [name, value] of Object.entries(delivery.securityHeaders)) c.header(name, value);
+}
+
+async function sniffStagedUploadMime(filePath: string): Promise<string> {
+  const handle = await open(filePath, 'r');
+  try {
+    const prefix = Buffer.alloc(ATTACHMENT_SNIFF_BYTES);
+    const { bytesRead } = await handle.read(prefix, 0, prefix.length, 0);
+    return sniffAttachmentMime(prefix.subarray(0, bytesRead));
+  } finally {
+    await handle.close();
+  }
 }
 
 /**
@@ -867,7 +878,8 @@ fileTransferRoutes.get('/:id/upload-staged/:uploadId', async (c) => {
   });
 
   const status = setAttachmentRangeHeaders(c, offset, entry.size);
-  c.header('Content-Type', entry.mime || 'application/octet-stream');
+  // This token-authenticated callback is still on the app origin: use the same locked delivery as the browser download route.
+  setAttachmentDeliveryHeaders(c, entry.mime, path.basename(entry.filePath));
   c.header('Content-Length', String(entry.size - offset));
   c.header('Cache-Control', 'no-store');
   return new Response(Readable.toWeb(fileStream) as ReadableStream, {
@@ -1308,7 +1320,6 @@ fileTransferRoutes.post('/:id/upload', async (c) => {
   let stagedDir: string;
   let stagedPath: string;
   let stagedSize: number;
-  let stagedMime = file.type || undefined;
   if (resumableRequested) {
     let accepted;
     try {
@@ -1339,7 +1350,6 @@ fileTransferRoutes.post('/:id/upload', async (c) => {
     stagedDir = accepted.dir;
     stagedPath = accepted.filePath;
     stagedSize = accepted.committedBytes;
-    stagedMime = accepted.mime;
   } else {
     storageFilename = randomHex(16);
     filename = fileTransferLegacyFilename(storageFilename, file.name || 'file');
@@ -1354,6 +1364,12 @@ fileTransferRoutes.post('/:id/upload', async (c) => {
     await rm(stagedDir, { recursive: true, force: true }).catch(() => {});
     return c.json({ error: 'upload_failed', message: 'size_mismatch' }, 400);
   }
+  // For resumable uploads this reads the assembled file from byte zero, including completion retries. The client MIME remains only a
+  // chunk-identity check; neither it nor the last chunk gets to label the attachment or the daemon fetch response.
+  const stagedMime = await sniffStagedUploadMime(stagedPath).catch(async (err) => {
+    if (!resumableRequested) await rm(stagedDir, { recursive: true, force: true }).catch(() => {});
+    throw err;
+  });
   const supportsRelayFetch = bridge.hasDaemonCapability(FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY);
   let relayStaged = false;
   let legacyStageDeleted = false;

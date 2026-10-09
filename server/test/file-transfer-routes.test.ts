@@ -144,6 +144,55 @@ describe('file-transfer upload route', () => {
     expect(new URL(message.downloadUrl).origin).toBe('https://im.codes');
   });
 
+  describe.each([true, false])('upload type detection (relay capability %s)', (relay) => {
+    it.each([
+      ['image/png', '<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>', 'image/svg+xml'],
+      ['image/jpeg', '<!doctype html><script>alert(1)</script>', 'text/html'],
+      ['image/png', '\u0000unknown binary', 'application/octet-stream'],
+      ['text/html', Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=', 'base64'), 'image/png'],
+    ] as const)('does not trust client MIME %s', async (claimed, bytes, detected) => {
+      hasDaemonCapabilityMock.mockImplementation((capability: string) => capability !== FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY || relay);
+      const app = makeApp();
+      sendFileTransferRequestMock.mockImplementationOnce(async (_id, message) => {
+        expect(message.mime).toBe(detected);
+        if (relay) {
+          const url = new URL(message.downloadUrl);
+          const staged = await app.request(url.pathname + url.search);
+          expect(staged.headers.get('content-type')).toBe(detected);
+          expect(staged.headers.get('x-content-type-options')).toBe('nosniff');
+          expect(staged.headers.get('content-security-policy')).toMatch(/^sandbox;/);
+          expect(staged.headers.get('content-disposition')).toMatch(detected === 'image/png' ? /^inline;/ : /^attachment;/);
+          expect(Buffer.from(await staged.arrayBuffer())).toEqual(Buffer.from(bytes));
+        } else {
+          expect(Buffer.from(message.content, 'base64')).toEqual(Buffer.from(bytes));
+        }
+        return { type: FILE_TRANSFER_MSG.UPLOAD_DONE, attachment: { id: 'a'.repeat(32), source: 'upload', daemonPath: '/tmp/sniffed', downloadable: true } };
+      });
+      const form = new FormData();
+      form.append('file', new File([bytes], 'client.png', { type: claimed }));
+      expect((await app.request('/api/server/srv-1/upload', { method: 'POST', headers: { Authorization: 'Bearer test' }, body: form })).status).toBe(200);
+      expect(sendFileTransferRequestMock.mock.calls[0]?.[1]).toMatchObject({ mime: detected });
+    });
+  });
+
+  it('sniffs the assembled file on resumable completion and replay, not the final chunk or the client label', async () => {
+    const bytes = '<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>';
+    const app = makeApp();
+    const clientUploadId = `resumable_${crypto.randomUUID().replaceAll('-', '')}`;
+    const request = (chunk: string, offset: number) => {
+      const form = new FormData();
+      form.append('file', new File([chunk], 'evil.png', { type: 'image/png' }));
+      for (const [key, value] of Object.entries({ clientUploadId, uploadOffset: String(offset), uploadTotalSize: String(bytes.length), uploadOriginalName: 'evil.png', uploadLastModified: '1234' })) form.append(key, value);
+      return app.request('/api/server/srv-1/upload', { method: 'POST', headers: { Authorization: 'Bearer test' }, body: form });
+    };
+    expect((await request(bytes.slice(0, 4), 0)).status).toBe(200);
+    expect(sendFileTransferRequestMock).not.toHaveBeenCalled();
+    expect((await request(bytes.slice(4), 4)).status).toBe(200);
+    expect((await request(bytes.slice(4), 4)).status).toBe(200);
+    for (const call of sendFileTransferRequestMock.mock.calls) expect(call[1]).toMatchObject({ mime: 'image/svg+xml', size: bytes.length });
+    expect(sendFileTransferRequestMock).toHaveBeenCalledTimes(2);
+  });
+
   it('mints an explicit-path handle only for a FULL source and capable controlled target', async () => {
     queryOneMock.mockResolvedValue({ user_id: 'user-1', node_role: 'controlled', exec_enabled: true, revoked_at: null, access_role: 'owner', access_source: 'owner', exec_granted: false });
     sendFileTransferRequestMock.mockResolvedValueOnce({
