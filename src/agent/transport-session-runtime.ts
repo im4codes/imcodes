@@ -113,7 +113,7 @@ import logger from '../util/logger.js';
 import { incrementCounter } from '../util/metrics.js';
 import type { SharedActorEnvelope } from '../../shared/tab-sharing.js';
 import { getTransportQueueStore } from '../daemon/transport-queue-store.js';
-import { projectOfSession, resolveTaskPairEngineState } from '../daemon/task-pairs/engine.js';
+import { resolveTaskPairPromptEngineState } from '../daemon/task-pairs/engine.js';
 import { resolveTaskPairTurnCwd } from '../daemon/task-pairs/turn-cwd.js';
 import { type TaskPairEngineState } from '../../shared/task-pair.js';
 import type { DiscardTransportQueueStateResult, LegacyQueueOwnershipEvidence, QueueRecipientIdentity } from '../daemon/transport-queue-store.js';
@@ -1237,14 +1237,16 @@ export class TransportSessionRuntime implements SessionRuntime {
    * contract: `pairs`, `legacy`, or `off` (no engine explicitly configured,
    * or the project is unknown -- neither pairs nor legacy automation may
    * run, so the contract must not fall back to `pairs` or `legacy` just
-   * because it isn't the other one).
+   * because it isn't the other one). A Brain of a project with supervision off
+   * still gets the pairs contract (its manual-only variant): manual pairs work
+   * in every supervision mode.
    */
   private resolveTaskPairEngine(): TaskPairEngineState {
     // No `!project` short-circuit: resolveTaskPairEngineState already checks
     // the env override before it needs a project, and an override must win
     // even for a session whose project cannot be resolved.
     try {
-      return resolveTaskPairEngineState(projectOfSession(this.sessionKey));
+      return resolveTaskPairPromptEngineState(this.sessionKey);
     } catch {
       return 'off';
     }

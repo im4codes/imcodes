@@ -27,7 +27,7 @@ import { fileURLToPath } from 'node:url';
 import { findMainCheckoutGitWrite, type MainCheckoutGitWrite } from '../../../shared/main-checkout-git-guard.js';
 import { TASK_PAIR_PARTICIPANT_STATUSES, type TaskPairState } from '../../../shared/task-pair.js';
 import { getSession, listSessions } from '../../store/session-store.js';
-import { isPairsEngineProject } from './engine.js';
+import { isTaskPairsAvailable } from './engine.js';
 import { getTaskPairStore } from './store.js';
 import { sendTaskPairMessage } from './delivery.js';
 import { buildMainCheckoutWriteBrainLine, buildMainCheckoutWriteParticipantNotice } from './messages.js';
@@ -99,7 +99,7 @@ export function evaluatePairMainCheckoutGitWrite(
   const command = commandOf(input);
   if (command === undefined || (!SHELL_TOOL_NAMES.test(toolName) && typeof input !== 'object')) return undefined;
   const session = getSession(sessionName);
-  if (!session || session.role === 'brain' || !session.projectDir || !isPairsEngineProject(session.projectName)) return undefined;
+  if (!session || session.role === 'brain' || !session.projectDir) return undefined;
   // Cheap path first: the classifier's regex rejects nearly every command before the store is touched.
   const roots = [session.projectDir];
   const brainDir = listSessions().find((candidate) => candidate.projectName === session.projectName && candidate.role === 'brain')?.projectDir;
@@ -107,7 +107,7 @@ export function evaluatePairMainCheckoutGitWrite(
   const hit = findMainCheckoutGitWrite({ command, cwd: options.cwd ?? cwdOf(input, options.detail) ?? session.projectDir, roots, home: homedir() });
   if (!hit) return undefined;
   const held = openPairOf(sessionName);
-  if (!held || held.pair.brain === sessionName) return undefined;
+  if (!held || held.pair.brain === sessionName || !isTaskPairsAvailable(session.projectName)) return undefined;
   return {
     ...hit,
     session: sessionName,

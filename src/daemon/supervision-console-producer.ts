@@ -19,7 +19,7 @@ import {
   taskPairBriefRevision,
   type PairScopeView,
 } from './supervision-console-pair-projection.js';
-import { isPairsEngineProject } from './task-pairs/engine.js';
+import { isPairsEngineProject, isTaskPairsAvailable } from './task-pairs/engine.js';
 import {
   SUPERVISION_TASK_CONSOLE_MSG,
   SUPERVISION_TASK_CONSOLE_SCHEMA_VERSION,
@@ -988,8 +988,18 @@ export class SupervisionConsoleProducer {
     return brief ? { briefRevision: taskPairBriefRevision(brief), brief } : null;
   }
 
+  /**
+   * Whether the console shows this project's PAIR rows. Supervision on (the pairs engine) always does; with supervision off the
+   * project still shows the pairs it has been given by hand, as long as it has a Brain, so a manual pair's lifecycle is visible
+   * (a project with no pair stays on the registry rows it always had).
+   */
   isPairsProject(scope: SupervisionTaskConsoleScope): boolean {
-    return isPairsEngineProject(scope.projectName);
+    return this.#showsPairs(scope.projectName);
+  }
+
+  #showsPairs(projectName: string): boolean {
+    return isPairsEngineProject(projectName)
+      || (getTaskPairStore().countPairs(projectName) > 0 && isTaskPairsAvailable(projectName));
   }
 
   #pairViewKey(scope: SupervisionTaskConsoleScope, subscriptionId: string): string {
@@ -1098,7 +1108,7 @@ export class SupervisionConsoleProducer {
     // A pair-delta snapshot seeds the per-scope pair view, so it must be built
     // fresh: a cached one would carry a pairRevision older than the deltas
     // already sent and the viewer would see a gap.
-    if (pairDelta && isPairsEngineProject(scope.projectName)) {
+    if (pairDelta && this.#showsPairs(scope.projectName)) {
       return this.#withAssignmentPass(() => this.#buildSnapshotParts(scope, cursor, true));
     }
     const now = Date.now();
@@ -1130,7 +1140,7 @@ export class SupervisionConsoleProducer {
     cursor: ReturnType<SupervisionConsoleProducer['restoreCursor']>,
     pairDelta: boolean,
   ): Omit<SupervisionTaskConsoleSnapshot, 'subscriptionId'> {
-    const pairRows = isPairsEngineProject(scope.projectName)
+    const pairRows = this.#showsPairs(scope.projectName)
       ? this.readPairRows(scope.projectName, { inlineBrief: !pairDelta })
       : undefined;
     const pairRevision: number | undefined = pairRows && pairDelta ? 0 : undefined;
@@ -1155,9 +1165,8 @@ export class SupervisionConsoleProducer {
       pools: pairRows ? this.readPoolsIncremental(scope.projectName) : this.readPools(scope.projectName),
       ...(pairRevision !== undefined ? { pairRevision } : {}),
     };
-    // No pair rows means the pairs engine is off for this project (the legacy
-    // engine is retired). Pairs may still sit on disk: say so rather than
-    // present a silent empty list.
+    // No pair rows means the project has no Brain session (the legacy engine is retired). Pairs may still sit on disk: say so
+    // rather than present a silent empty list.
     const inertPairs = pairRows ? 0 : getTaskPairStore().countPairs(scope.projectName);
     if (inertPairs > 0) snapshot.inertPairs = inertPairs;
     if (pairRows && pairDelta) this.#pairSnapshotEntries.set(snapshot, pairRows.entries);

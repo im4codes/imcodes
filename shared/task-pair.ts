@@ -454,8 +454,10 @@ export const TASK_PAIR_ENGINE_ENV = 'IMCODES_SUPERVISION_ENGINE' as const;
 /**
  * The resolved engine state for a project, including the inert `off` state:
  * a project whose supervision mode is `off` and which has no explicit engine
- * choice runs neither engine. Distinct from {@link TaskPairEngine}, which is
- * only the two engines a project can explicitly choose between.
+ * choice runs no supervision automation (no heartbeat). `off` does NOT mean the
+ * manual pair lifecycle is unavailable: see `isTaskPairsAvailable`. Distinct
+ * from {@link TaskPairEngine}, which is only the two engines a project can
+ * explicitly choose between.
  */
 export type TaskPairEngineState = TaskPairEngine | 'off';
 
@@ -791,22 +793,19 @@ export const TASK_PAIR_BRAIN_MCP_ONLY_RULE: string =
   + 'Naming executor/auditor (pair_create, pair_reassign) replaces the current holder of that role immediately, ignoring the execution pool role config; executorModel/auditorModel steers the next automatic pick but does not replace a current role; a project with no execution pool configured must name the role models or sessions explicitly.';
 
 /**
- * Stated in the Brain contract for a project not enabled for pairs (owner
- * decision, 2026-09-26, tsk_cd_pairs_optin: pairs is no longer a zero-config
- * default). Kept as one shared string so the daemon's own auto-start gates
- * can be reviewed against the same text.
+ * Stated in the Brain contract for a project whose supervision is off (owner decisions: 2026-09-26, tsk_cd_pairs_optin - pairs never
+ * start by themselves there; tsk_fb01f25f17 - supervision off never stops a MANUAL pair, it only means no daemon heartbeat). Kept as one
+ * shared string so the daemon's own auto-start gates can be reviewed against the same text.
  */
 export const TASK_PAIR_INERT_AUTHORIZATION_RULE: string =
-  'This project is not enabled for the pairs engine: never auto-start a '
-  + 'pair here, and no marker or DISPATCH can start one either -- the '
-  + 'engine ignores this project until it is enabled. If the user '
-  + 'explicitly asks for audited/paired work, ask them to confirm first; '
-  + 'on an explicit yes, tell them to enable it themselves (Session/Project '
-  + 'Settings -> Task Pairs -> Engine -> Task pairs) since no tool or '
-  + 'marker can enable it for them. If the project defines its own '
-  + 'dispatch/audit/pairing workflow (e.g. in AGENTS.md/CLAUDE.md/project '
-  + 'rules), tell the user about the conflict before recommending that, '
-  + 'and only recommend it if they explicitly override after hearing it.';
+  'Supervision is off for this project: never auto-start a pair here. '
+  + 'When the user explicitly asks for audited/paired work, start it by '
+  + 'hand with pair_create; it runs without a daemon heartbeat (no nudges, '
+  + 'escalations or reminders), so you follow it yourself. If the project '
+  + 'defines its own dispatch/audit/pairing workflow (e.g. in '
+  + 'AGENTS.md/CLAUDE.md/project rules), tell the user about the conflict '
+  + 'before recommending a pair, and only recommend it if they explicitly '
+  + 'override after hearing it.';
 
 /** New pairs-engine work must enter through the structured pair MCP surface. */
 export const TASK_PAIR_BRAIN_PAIR_CREATE_RULE: string =
@@ -816,6 +815,15 @@ export const TASK_PAIR_BRAIN_PAIR_CREATE_RULE: string =
   + 'metadata, a DISPATCH/QUEUE marker, or supervision_task_start. Ordinary '
   + 'messages to an existing pair and lifecycle markers after pair_create '
   + 'remain valid.';
+
+/**
+ * What a pair created while supervision is off can expect (returned by pair_create / pair_dispatch as `supervisionNote`). Supervision
+ * mode `off` never stops a Brain from creating and running pairs by hand; it only means the daemon does not watch them.
+ */
+export const TASK_PAIR_MANUAL_MODE_NOTE: string =
+  'Supervision is off for this project, so this pair runs manually: every explicit call and marker works (pair_dispatch, pair_reassign, '
+  + 'pair_next_round, pair_close, pair_verdict, DONE/PASS/REWORK), but the daemon sends no heartbeat nudges, escalations, reminders or queue '
+  + 'sweeps. A queued pair starts when you call pair_dispatch, or when an open pair of yours ends (DONE/CANCEL) and frees a slot.';
 
 export const TASK_PAIR_CREATE_REQUIRED_MESSAGE =
   'New Brain work on the pairs engine must use pair_create; send_message task metadata and new DISPATCH/QUEUE markers cannot create a pair.';

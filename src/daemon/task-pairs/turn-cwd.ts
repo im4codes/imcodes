@@ -25,7 +25,7 @@ import { statSync } from 'node:fs';
 import { isAbsolute } from 'node:path';
 import { TASK_PAIR_PARTICIPANT_STATUSES, type TaskPairState } from '../../../shared/task-pair.js';
 import { getSession } from '../../store/session-store.js';
-import { isPairsEngineProject } from './engine.js';
+import { isTaskPairsAvailable } from './engine.js';
 import { taskPairFocusOf } from './focus.js';
 import { getTaskPairStore } from './store.js';
 
@@ -73,7 +73,7 @@ export function pairWorkingLocation(pair: TaskPairState): string | undefined {
  */
 export function resolveTaskPairTurnCwd(sessionName: string): TaskPairTurnCwd | undefined {
   const session = getSession(sessionName);
-  if (!session || session.role === 'brain' || !isPairsEngineProject(session.projectName)) return undefined;
+  if (!session || session.role === 'brain') return undefined;
   const candidates: TaskPairTurnCwd[] = [];
   for (const stored of getTaskPairStore().pairsForSession(sessionName)) {
     const pair = stored.state;
@@ -83,7 +83,8 @@ export function resolveTaskPairTurnCwd(sessionName: string): TaskPairTurnCwd | u
     const cwd = pairWorkingLocation(pair);
     if (cwd) candidates.push({ cwd, taskId: pair.taskId, role });
   }
-  if (candidates.length === 0) return undefined;
+  // Stored pairs of a project without a Brain session are inert; with one, supervision mode does not matter (manual pairs are first-class).
+  if (candidates.length === 0 || !isTaskPairsAvailable(session.projectName)) return undefined;
   const focus = taskPairFocusOf(sessionName);
   const focused = focus ? candidates.filter((candidate) => candidate.taskId === focus) : [];
   const pool = focused.length > 0 ? focused : candidates;

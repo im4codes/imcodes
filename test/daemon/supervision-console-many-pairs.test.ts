@@ -2,9 +2,11 @@
  * tsk_a800294cfa: a project with a long pair history and a few open pairs
  * (the shape of a busy real project: dozens of finished pairs, three working,
  * a supervised_audit Brain) must show every open pair in the console snapshot,
- * with executor/auditor presentation; an engine-off project that still holds
- * pairs on disk must say so instead of presenting a silent empty list; and a
- * Brain of another project must never read this project's pairs.
+ * with executor/auditor presentation; a supervision-off project shows the pairs
+ * it was given by hand (manual pairs are first-class); a project the owner rolled
+ * back to legacy that still holds pairs on disk must say so instead of presenting a
+ * silent empty list; and a Brain of another project must never read this
+ * project's pairs.
  *
  * Deliberately does NOT force IMCODES_SUPERVISION_ENGINE: the engine is
  * resolved from the real Brain session snapshot, exactly as in production.
@@ -158,19 +160,31 @@ describe('a busy supervised_audit project with a long finished history', () => {
   });
 });
 
-describe('an engine-off project that still holds pairs on disk', () => {
+describe('a supervision-off project that holds pairs', () => {
+  it('shows the pairs it was given by hand, with no inert marker (manual pairs work in every supervision mode)', () => {
+    save(OFF, 'manual', 'working', 10);
+    registry.handleFrame(subscribe(OFF));
+    const snapshot = sent.at(-1);
+    expect(snapshot.type).toBe(SUPERVISION_TASK_CONSOLE_MSG.SNAPSHOT);
+    expect(snapshot.tasks).toHaveLength(1);
+    expect(snapshot.tasks[0]).toMatchObject({ taskId: 'manual' });
+    expect(snapshot.inertPairs).toBeUndefined();
+  });
+
+  it('a project with no pairs carries no marker', () => {
+    registry.handleFrame(subscribe(OFF));
+    expect(sent.at(-1).inertPairs).toBeUndefined();
+  });
+});
+
+describe('a project the owner explicitly rolled back to legacy (no pairs here) that still holds pairs on disk', () => {
   it('reports the stored pairs instead of a silent empty list, and exposes none of their rows', () => {
     save(OFF, 'stuck', 'working', 10);
+    upsertSession({ ...brain(OFF, SUPERVISION_MODE.OFF), transportConfig: { supervision: normalizeSessionSupervisionSnapshot({ mode: SUPERVISION_MODE.OFF, pairEngine: 'legacy' }) } } as unknown as SessionRecord);
     registry.handleFrame(subscribe(OFF));
     const snapshot = sent.at(-1);
     expect(snapshot.type).toBe(SUPERVISION_TASK_CONSOLE_MSG.SNAPSHOT);
     expect(snapshot.tasks).toEqual([]);
     expect(snapshot.inertPairs).toBe(1);
-    expect(JSON.stringify(snapshot)).not.toContain('one');
-  });
-
-  it('an engine-off project with no pairs carries no marker', () => {
-    registry.handleFrame(subscribe(OFF));
-    expect(sent.at(-1).inertPairs).toBeUndefined();
   });
 });

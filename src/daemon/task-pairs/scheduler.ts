@@ -46,7 +46,7 @@ import {
   type TaskPairState,
 } from '../../../shared/task-pair.js';
 import { getTaskPairStore, type StoredTaskPair, type TaskPairLiveness } from './store.js';
-import { isPairsEngineProject, projectBrainSession, resolveTaskPairMaxConcurrency } from './engine.js';
+import { isPairsEngineProject, projectBrainSession, projectOfSession, resolveTaskPairMaxConcurrency } from './engine.js';
 import { runIntegrationDriftPass } from './integration-drift.js';
 import { sendTaskPairMessage, taskPairMessageIdPrefix } from './delivery.js';
 import { BrainDecisionFollowUps, type ArmBrainDecisionFollowUp } from './brain-decision-followup.js';
@@ -226,6 +226,8 @@ export class TaskPairAutomation implements TaskPairScheduler {
     send: (brain, reason, text) => sendTaskPairMessage(brain, TASK_PAIR_AGGREGATE_NOTICE_ID, reason, text),
   });
   armBrainDecisionFollowUp(input: ArmBrainDecisionFollowUp): void {
+    // A follow-up nudge to the Brain is daemon-initiated automation: with supervision off (no heartbeat) the Brain is never chased.
+    if (!isPairsEngineProject(projectOfSession(input.brain))) return;
     this.#decisionFollowUps.arm(input);
   }
   #mainHeartbeatPauseCleared = new Set<string>();

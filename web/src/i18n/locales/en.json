@@ -3987,7 +3987,7 @@
     "recovering": "Projection gap detected. Requesting a full resync…",
     "error": "The live task stream is unavailable.",
     "empty": "No supervised tasks yet.",
-    "inert_pairs": "Automatic supervision is off for this project, so its {{count}} stored task pair(s) are not tracked or listed here. Turn supervision on in the Brain session settings to see them.",
+    "inert_pairs": "Task pairs are turned off for this project (legacy rollback), so its {{count}} stored task pair(s) are not tracked or listed here. Choose Task pairs in the Task pairs settings to see them.",
     "unsupported": "Unsupported task status. Resynchronizing safely.",
     "unknown_status": "Unknown status",
     "group": {
@@ -4644,10 +4644,10 @@
       "title": "Task pairs (marker-driven supervision)",
       "help": "Brain dispatches executor + auditor pairs; models write markers and the daemon keeps the state.",
       "engine": "Supervision engine",
-      "engine_unset": "Not enabled (default)",
+      "engine_unset": "Follows supervision mode (default)",
       "engine_pairs": "Task pairs",
       "engine_legacy": "Legacy registry (rollback)",
-      "engine_help": "Not enabled by default: Brain asks before starting a pair here, and never overrides the project's own workflow. Legacy is only a manual rollback for this project.",
+      "engine_help": "By default Brain can start pairs by hand when you ask for them; the daemon watches them (nudges, reminders, queue) only while supervision is on. Choose Task pairs to always watch them. Legacy is only a manual rollback that turns pairs off for this project.",
       "max_concurrency": "Maximum open pairs"
     },
     "output_saved": "Deliverable saved to {{path}}",

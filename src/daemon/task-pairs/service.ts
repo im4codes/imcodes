@@ -68,7 +68,7 @@ import {
 import { parseTaskPairChecklist, updateTaskPairChecklist } from '../../../shared/task-pair-checklist.js';
 import { parseTaskPairAuditDetails } from '../../../shared/task-pair-notification.js';
 import { flushTaskPairStoreLiveness, getTaskPairStore, livenessChangedBeyondActivityTimestamps, type StoredTaskPair, type TaskPairLiveness } from './store.js';
-import { brainUiLocale, isPairsEngineProject, projectBrainSession, projectOfSession } from './engine.js';
+import { brainUiLocale, isPairsEngineProject, isTaskPairsAvailable, projectBrainSession, projectOfSession } from './engine.js';
 import { inspectToolCallForPairMainCheckoutWrite } from './main-checkout-write-guard.js';
 import { noteTaskPairFocus, sendTaskPairMessage, taskPairFocusOf, taskPairMessageIdPrefix, type TaskPairDeliveryResult } from './delivery.js';
 import { brainNoticeForCard } from './brain-notice.js';
@@ -562,7 +562,7 @@ export class TaskPairService {
     const sessions = listSessions();
     for (const session of sessions) {
       const project = projectOfSession(session.name);
-      if (!project || !isPairsEngineProject(project)) continue;
+      if (!project || !isTaskPairsAvailable(project)) continue;
       let events: TimelineEvent[];
       try {
         events = await timelineStore.readCompletedTextTail(session.name, 50);
@@ -655,7 +655,7 @@ export class TaskPairService {
     const text = typeof payload.text === 'string' ? payload.text : '';
     const writer = event.sessionId;
     const project = projectOfSession(writer);
-    if (!project || !isPairsEngineProject(project)) return;
+    if (!project || !isTaskPairsAvailable(project)) return;
     const now = event.ts ?? Date.now();
     clearTaskPairProviderError(writer);
     this.recordProgress(writer, now, text);
@@ -1152,7 +1152,7 @@ export class TaskPairService {
     brief?: string;
   }): TaskPairTransition | undefined {
     const project = input.project ?? projectOfSession(input.sender) ?? projectOfSession(input.target);
-    if (!project || !isPairsEngineProject(project)) return undefined;
+    if (!project || !isTaskPairsAvailable(project)) return undefined;
     const store = getTaskPairStore();
     const existing = store.getPair(project, input.taskId);
     if (existing) {

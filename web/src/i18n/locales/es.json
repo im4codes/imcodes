@@ -3987,7 +3987,7 @@
     "recovering": "Se detectó una brecha. Solicitando resincronización completa…",
     "error": "El flujo de tareas en vivo no está disponible.",
     "empty": "Aún no hay tareas supervisadas.",
-    "inert_pairs": "La supervisión automática está desactivada en este proyecto, por lo que sus {{count}} pares de tareas guardados no se rastrean ni se listan aquí. Activa la supervisión en los ajustes de la sesión Brain para verlos.",
+    "inert_pairs": "Los pares de tareas están desactivados en este proyecto (reversión al modo heredado), por lo que sus {{count}} pares guardados no se rastrean ni se listan aquí. Elige Pares de tareas en los ajustes de pares de tareas para verlos.",
     "unsupported": "Estado no compatible. Resincronizando de forma segura.",
     "unknown_status": "Estado desconocido",
     "group": {
@@ -4644,10 +4644,10 @@
       "title": "Pares de tareas (supervisión por marcadores)",
       "help": "El Brain asigna pares ejecutor + auditor; los modelos escriben marcadores y el daemon mantiene el estado.",
       "engine": "Motor de supervisión",
-      "engine_unset": "No habilitado (predeterminado)",
+      "engine_unset": "Según el modo de supervisión (predeterminado)",
       "engine_pairs": "Pares de tareas",
       "engine_legacy": "Registro heredado (reversión)",
-      "engine_help": "No habilitado de forma predeterminada: Brain pregunta antes de iniciar un par aquí y nunca anula el flujo de trabajo propio del proyecto. El heredado es solo una reversión manual para este proyecto.",
+      "engine_help": "De forma predeterminada, Brain puede iniciar pares a mano cuando se lo pides; el daemon solo los vigila (avisos, recordatorios, cola) mientras la supervisión está activada. Elige Pares de tareas para vigilarlos siempre. El modo heredado es solo una reversión manual que desactiva los pares en este proyecto.",
       "max_concurrency": "Máximo de pares abiertos"
     },
     "output_saved": "Entregable guardado en {{path}}",

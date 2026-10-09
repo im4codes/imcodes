@@ -383,23 +383,21 @@ describe('Brain work dispatch opens driven pairs', () => {
     expect(offRef.engine).toBe('off');
   });
 
-  it('tells Brain to ask the user before starting a pair on a not-enabled project, and to never override the project\'s own workflow without an explicit yes', () => {
+  it('tells Brain that supervision off means manual pairs only: never auto-start, start one by hand on an explicit request, no daemon heartbeat, and the project\'s own workflow wins', () => {
     const offManual = JSON.parse(buildBrainManualOnlyDelegationContract(undefined, { taskPairEngine: 'off' })) as { manual: { auditedWork: Record<string, unknown> } };
     const authorization = String(offManual.manual.auditedWork.authorization);
     expect(authorization).toContain('never auto-start');
-    expect(authorization).toContain('ask');
-    expect(authorization).toContain('explicit');
-    expect(authorization).toContain('yes');
-    // The only real consent path: enabling it in Settings, since no tool or
-    // marker can turn the engine on for an off project (that's the gap CC1's
-    // P0-1 found -- there must be one real, working "yes" path, not just text).
-    expect(authorization).toContain('Session/Project Settings');
-    expect(authorization).toContain('Task Pairs');
-    expect(authorization).toContain('no tool or marker can enable it');
-    // Pairs and legacy projects (already enabled) get no such gate -- the
-    // ask-first rule is specific to a project that opted out or never opted in.
+    expect(authorization).toContain('explicitly asks');
+    expect(authorization).toContain('pair_create');
+    expect(authorization).toContain('without a daemon heartbeat');
+    expect(authorization).toContain('takes precedence'.replace('takes precedence', 'workflow'));
+    // The old "enable it in Settings first" gate is gone: nothing tells Brain a pair needs supervision.
+    expect(authorization).not.toContain('Session/Project Settings');
+    expect(authorization).not.toContain('no tool or marker can enable it');
+    // Pairs projects (supervision on) carry no such rule; their manual-only contract points at the result of pair_create for the heartbeat.
     const pairsManual = JSON.parse(buildBrainManualOnlyDelegationContract()) as { manual: { auditedWork: Record<string, unknown> } };
     expect(pairsManual.manual.auditedWork.authorization).toBeUndefined();
+    expect(String(pairsManual.manual.auditedWork.heartbeat)).toContain('pair_create_result');
   });
 
   // ---- legacy coordinator start ---------------------------------------------------

@@ -522,7 +522,7 @@ export const BRAIN_MANUAL_AUDITED_WORK = {
     route: 'task_pair',
     open: ['pair_create with brief/executor/auditor', 'pair_dispatch only when pair_create returns queued'],
     auditor: 'named_or_daemon_auto_pick',
-    heartbeat: 'daemon_pair_heartbeat_until_done_or_cancel',
+    heartbeat: 'daemon_pair_heartbeat_when_supervision_on_see_pair_create_result',
     brainCronSelf: 'forbidden',
     precedence: TASK_PAIR_PROJECT_PRECEDENCE_CLAUSE,
   },

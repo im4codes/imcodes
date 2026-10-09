@@ -1,7 +1,7 @@
 import { withPairsLegacyTools } from './task-pairs/legacy-tools.js';
 import { SEND_COMMAND_DESCRIPTION, SEND_COMMAND_FIELD } from '../../shared/send-command-mode.js';
 import { emitTaskPairDaemonEvent, taskPairService } from './task-pairs/service.js';
-import { isPairsEngineProject, projectBrainSession, projectOfSession, resolveTaskPairMaxConcurrency } from './task-pairs/engine.js';
+import { isPairsEngineProject, isTaskPairsAvailable, projectBrainSession, projectOfSession, resolveTaskPairMaxConcurrency, taskPairSupervisionStatus } from './task-pairs/engine.js';
 import { taskPairAutomation } from './task-pairs/scheduler.js';
 import { describeExecutionSelection } from './task-pairs/pool.js';
 import { discardCreatedPairSessions, ensurePairSessions, type PairSessionCreateSpec } from './task-pairs/session-creation.js';
@@ -10,7 +10,7 @@ import { runExclusive } from '../util/keyed-mutex.js';
 import logger from '../util/logger.js';
 import { randomUUID } from 'node:crypto';
 import { parseTaskPairChecklist, taskPairChecklistCounts, updateTaskPairChecklist } from '../../shared/task-pair-checklist.js';
-import { isTerminalTaskPairStatus, TASK_PAIR_CREATE_REQUIRED_MESSAGE, TASK_PAIR_MCP_DELIVERY_EVENT, TASK_PAIR_MCP_DISPATCH_EVENT, TASK_PAIR_NO_AUDITOR, taskPairRoleOf } from '../../shared/task-pair.js';
+import { isTerminalTaskPairStatus, TASK_PAIR_CREATE_REQUIRED_MESSAGE, TASK_PAIR_MANUAL_MODE_NOTE, TASK_PAIR_MCP_DELIVERY_EVENT, TASK_PAIR_MCP_DISPATCH_EVENT, TASK_PAIR_NO_AUDITOR, taskPairRoleOf } from '../../shared/task-pair.js';
 import { z } from 'zod';
 import type { CapabilityMcpToolDeps } from './capability-mcp-tools.js';
 import { lstat, readFile, realpath } from 'node:fs/promises';
@@ -1762,6 +1762,11 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       waitingReason: state.flags.includes('waiting_for_capacity') ? (state.capacityWaitReason ?? null) : null,
     };
   };
+  /** What the Brain can expect of a pair in this project: the supervision setting, whether the daemon watches it, and what that means. */
+  const supervisionFields = (project: string): { supervision: 'on' | 'off'; heartbeat: boolean; supervisionNote?: string } => {
+    const status = taskPairSupervisionStatus(project);
+    return { ...status, ...(status.heartbeat ? {} : { supervisionNote: TASK_PAIR_MANUAL_MODE_NOTE }) };
+  };
   /** The pair's assigned sessions that are not a live participant right now (missing from the store, stopped, errored, no runtime), by name. */
   const pairParticipantsNotLive = (state: { executor?: string; auditor?: string }): Array<{ role: 'executor' | 'auditor'; session: string; problem: string }> => {
     const problems: Array<{ role: 'executor' | 'auditor'; session: string; problem: string }> = [];
@@ -2967,8 +2972,9 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       if (!caller.sessionName || projectBrainSession(context.project) !== caller.sessionName) {
         return error(MCP_ERROR_REASONS.SCOPE_FORBIDDEN, 'pair_create requires the authoritative project Brain');
       }
-      if (!isPairsEngineProject(context.project)) {
-        return error(MCP_ERROR_REASONS.CONTROL_PLANE_UNAVAILABLE, `pairs engine is off for project '${context.project}' — enable it in supervision settings (set supervision mode to supervised in the Brain session) before calling pair_create`);
+      // Supervision mode never gates a manual pair: only a project without a Brain session cannot run one.
+      if (!isTaskPairsAvailable(context.project)) {
+        return error(MCP_ERROR_REASONS.CONTROL_PLANE_UNAVAILABLE, `project '${context.project}' has no Brain session, so pair_create cannot start a pair here`);
       }
       const brainName = caller.sessionName;
       const args = pickAllowedMcpArgs(input, ['taskId', 'title', 'brief', 'executor', 'auditor', 'executorModel', 'auditorModel', 'createExecutor', 'createAuditor', 'executionPool', 'idempotencyKey']);
@@ -2994,7 +3000,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
         const replayProblems = isTerminalTaskPairStatus(replay.state.status) ? [] : pairParticipantsNotLive(replay.state);
         if (replayProblems.length > 0) return sessionNotLiveError(taskId, replayProblems, { idempotentReplay: true });
         const deliveries = await deliverStructuredPairBriefs(context.project, taskId, eventId);
-        return { status: 'ok', taskId, idempotentReplay: true, state: replay.state.status, deliveries };
+        return { status: 'ok', taskId, idempotentReplay: true, state: replay.state.status, ...supervisionFields(context.project), deliveries };
       }
       if (store.getPair(context.project, taskId)) {
         return error(MCP_ERROR_REASONS.REVISION_CONFLICT, 'taskId already belongs to a different persisted pair; use its existing lifecycle');
@@ -3092,7 +3098,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
         }
         const latest = store.getPair(context.project, taskId) ?? stored;
         const executionSelection = describeExecutionSelection(brainName, latest.state, { executorNamed: !!executorArg || !!executorModel, auditorNamed: !!auditorArg || !!auditorModel }, {}, ensured.created);
-        return { status: 'ok', taskId, idempotentReplay: false, created: transition.effect === 'created', state: latest.state.status, executionSelection, deliveries };
+        return { status: 'ok', taskId, idempotentReplay: false, created: transition.effect === 'created', state: latest.state.status, ...supervisionFields(context.project), executionSelection, deliveries };
       });
     },
     [MEMORY_MCP_TOOL_NAMES.PAIR_DISPATCH]: async (input) => {
@@ -3116,7 +3122,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
         const replayProblems = isTerminalTaskPairStatus(replay.state.status) || replay.state.status === 'queued' ? [] : pairParticipantsNotLive(replay.state);
         if (replayProblems.length > 0) return sessionNotLiveError(taskId, replayProblems, { idempotentReplay: true });
         const deliveries = await deliverStructuredPairBriefs(context.project, taskId, eventId);
-        return { status: 'ok', taskId, idempotentReplay: true, state: replay.state.status, deliveries };
+        return { status: 'ok', taskId, idempotentReplay: true, state: replay.state.status, ...supervisionFields(context.project), deliveries };
       }
       if (stored.state.status !== 'queued') return error(MCP_ERROR_REASONS.VALIDATION_FAILED, `pair is not queued (${stored.state.status})`);
       await taskPairAutomation.runQueue(context.project, caller.sessionName);
@@ -3134,7 +3140,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       if (unreachable.length > 0) {
         return cancelPairNotLive(context.project, caller.sessionName, taskId, eventId, unreachable.map((receipt) => ({ role: receipt.role, session: receipt.target, problem: 'the session does not exist' })), []);
       }
-      return { status: 'ok', taskId, idempotentReplay: false, state: after.state.status, deliveries };
+      return { status: 'ok', taskId, idempotentReplay: false, state: after.state.status, ...supervisionFields(context.project), deliveries };
     },
     [MEMORY_MCP_TOOL_NAMES.PAIR_CLOSE]: async (input) => {
       const context = await pairCallerContext();
