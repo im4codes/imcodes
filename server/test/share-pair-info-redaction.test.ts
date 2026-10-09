@@ -44,7 +44,12 @@ const pairEvent = {
   type: 'timeline.event',
   event: {
     sessionId: SESSION, type: TASK_PAIR_TIMELINE_EVENT, ts: 1,
-    payload: { taskId: 'task-1', verb: 'DISPATCH', title: TITLE, executor: 'deck_sub_x', executorLabel: 'Exec', executorModel: MODEL, executorThinking: 'high', auditorModel: MODEL, auditorThinking: 'high', round: 1, blocking: ['P0'], flags: [] },
+    payload: {
+      taskId: 'task-1', verb: 'DISPATCH', title: TITLE, executor: 'deck_sub_x', executorLabel: 'Exec', executorModel: MODEL, executorThinking: 'high', auditorModel: MODEL, auditorThinking: 'high', round: 1, blocking: ['P0'], flags: [],
+      // service.ts projects a participant's turnText into noticeText/auditDetails and its marker note into blockedNote. Those private
+      // pair notices can quote titles, models or the assigned brief just like raw marker attrs; dropping only named title fields leaks.
+      noticeText: `${TITLE}: ${MODEL}\n${BRIEF}`, blockedNote: BRIEF, auditDetails: { rawText: `${TITLE}: ${MODEL}\n${BRIEF}` },
+    },
   },
 };
 const ordinaryEvent = { type: 'timeline.event', event: { sessionId: SESSION, type: 'assistant.text', ts: 2, payload: { text: 'the model is secret-model-x1 and the title Rotate the production signing key' } } };
@@ -71,7 +76,7 @@ describe.each([['participant'], ['viewer']] as const)('a %s share', (role) => {
   it('gets a task_pair.event without title and models; every other event is untouched', () => {
     const out = filterShareDaemonMessage(pairEvent, socket(role)) as { event: { payload: Record<string, unknown> } };
     expect(out.event.payload).toMatchObject({ taskId: 'task-1', verb: 'DISPATCH', executor: 'deck_sub_x', executorLabel: 'Exec', round: 1, blocking: ['P0'] });
-    for (const key of ['title', 'executorModel', 'auditorModel', 'executorThinking', 'auditorThinking']) expect(out.event.payload, key).not.toHaveProperty(key);
+    for (const key of ['title', 'executorModel', 'auditorModel', 'executorThinking', 'auditorThinking', 'noticeText', 'blockedNote', 'auditDetails']) expect(out.event.payload, key).not.toHaveProperty(key);
     expect(filterShareDaemonMessage(ordinaryEvent, socket(role))).toEqual(ordinaryEvent);
   });
 

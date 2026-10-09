@@ -1329,7 +1329,12 @@ function redactBriefResponse(msg: Record<string, unknown>, _state: ShareScopedSo
   return { ...msg, brief: null, briefRevision: null };
 }
 
-const SHARE_HIDDEN_PAIR_EVENT_PAYLOAD_KEYS: readonly string[] = ['title', 'executorModel', 'auditorModel', 'executorThinking', 'auditorThinking'];
+const SHARE_HIDDEN_PAIR_EVENT_PAYLOAD_KEYS: readonly string[] = [
+  'title', 'executorModel', 'auditorModel', 'executorThinking', 'auditorThinking',
+  // Private pair turnText/notes can repeat the assigned title/model/brief under free-text keys. Share only transition metadata, never
+  // these notices, in live frames or history; ordinary shared-session chat messages are unaffected.
+  'noticeText', 'blockedNote', 'auditDetails',
+];
 
 /** A `task_pair.event` loses its pair title and models; every other timeline event is returned as is. */
 function redactPairTimelineEvent(event: unknown): unknown {
