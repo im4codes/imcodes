@@ -156,10 +156,24 @@ function canPerform(role: Role, op: Operation): boolean {
  * Require authenticated request (any role).
  * Sets c.var.userId and c.var.role.
  */
-export function requireAuth() {
+export const DAEMON_CREDENTIAL_REFUSAL = 'daemon_credential_not_accepted';
+
+export interface RequireAuthOptions {
+  /**
+   * Refuse a daemon server-token (X-Server-Id + Bearer). That credential resolves to the OWNER's account with role `owner`, and it
+   * sits in a file the owner's agents can read (a participant-driven turn included), so account administration and credential
+   * minting must not accept it: only a login, an API key or a CLI key reaches those routes.
+   */
+  refuseDaemonCredential?: boolean;
+}
+
+export function requireAuth(options: RequireAuthOptions = {}) {
   return async (c: Context<{ Bindings: Env }>, next: Next): Promise<Response | void> => {
     const auth = await resolveAuth(c);
     if (!auth) return c.json({ error: 'unauthorized' }, 401);
+    if (options.refuseDaemonCredential && auth.serverId) {
+      return c.json({ error: 'forbidden', reason: DAEMON_CREDENTIAL_REFUSAL }, 403);
+    }
     const identityMismatch = rejectChangedClientIdentity(c, auth.userId);
     if (identityMismatch) return identityMismatch;
     // Global default-deny: a controlled-node credential may ONLY reach the WS

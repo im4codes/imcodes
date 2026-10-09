@@ -62,7 +62,7 @@ bindRoutes.post('/confirm', async (c) => {
 });
 
 // POST /api/bind/direct — single-step bind for web-authenticated users (API key already in hand)
-bindRoutes.post('/direct', requireAuth(), async (c) => {
+bindRoutes.post('/direct', requireAuth({ refuseDaemonCredential: true }), async (c) => {
   const body = await c.req.json().catch(() => null);
   const parsed = z.object({ serverName: z.string().min(1).max(64) }).safeParse(body);
   if (!parsed.success) return c.json({ error: 'invalid_body' }, 400);
@@ -85,7 +85,7 @@ bindRoutes.post('/direct', requireAuth(), async (c) => {
 
 // POST /api/bind/rebind — replace token for an existing server (--force re-bind)
 // Authenticated via Bearer API key (same as /direct). Requires serverId to match the caller's user.
-bindRoutes.post('/rebind', requireAuth(), async (c) => {
+bindRoutes.post('/rebind', requireAuth({ refuseDaemonCredential: true }), async (c) => {
   const body = await c.req.json().catch(() => null);
   const parsed = z.object({ serverId: z.string(), serverName: z.string().min(1).max(64) }).safeParse(body);
   if (!parsed.success) return c.json({ error: 'invalid_body' }, 400);

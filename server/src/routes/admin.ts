@@ -13,7 +13,7 @@ export const adminRoutes = new Hono<{ Bindings: Env }>();
 
 // ── Admin middleware — reuses global requireAuth + checks is_admin ────────
 
-adminRoutes.use('*', requireAuth());
+adminRoutes.use('*', requireAuth({ refuseDaemonCredential: true }));
 adminRoutes.use('*', async (c, next) => {
   const userId = c.get('userId' as never) as string;
   const user = await getUserById(c.env.DB, userId);
