@@ -19,6 +19,7 @@ import { listControlledMachines } from '../src/routes/machines.js';
 import { resetMachineActionGateForTests } from '../src/security/machine-action-gate.js';
 import { SHARED_MACHINE_AUTHORITY_HEADER, SHARED_MACHINE_AUTHORITY_TYPE } from '../../shared/shared-machine-authority.js';
 import { MACHINE_ACTION, MACHINE_DENIAL_REASON, type MachineAction } from '../../shared/machine-access-policy.js';
+import { USER_STATUS } from '../../shared/user-status.js';
 import { NODE_ROLE } from '../../shared/remote-exec.js';
 
 let db: Database;
@@ -357,5 +358,34 @@ describe('audit and rate limit', () => {
     const audited = await db.queryOne<{ n: string }>(
       `SELECT count(*) AS n FROM machine_exec_audit WHERE target_server_id = $1 AND reason = 'rate_limited'`, [nodeId]);
     expect(Number(audited!.n)).toBeGreaterThan(0);
+  });
+});
+
+// Combined integration boundary: grants do not outlive either account's active status.
+describe('active-account admission AND execute admission', () => {
+  it.each(['owner', 'pYes'])('%s being disabled denies every machine action despite stored execute grants', async (disabled) => {
+    expect((await EXEC(actors.owner!)).status).toBe(200);
+    expect((await EXEC(actors.pYes!)).status).toBe(200);
+    const before = execCalls + guiCalls;
+    await db.execute('UPDATE users SET status = $2 WHERE id = $1', [actors[disabled]!.userId, USER_STATUS.DISABLED]);
+    try {
+      const names = disabled === 'owner' ? ['owner', 'pYes', 'gMember'] : ['pYes'];
+      for (const name of names) {
+        for (const attempt of [EXEC, SHELL, CLICK, VIEW]) {
+          const response = await attempt(actors[name]!);
+          expect(response.status).toBe(name === disabled ? 401 : 403);
+        }
+        for (const action of [MACHINE_ACTION.FILE_SEND, MACHINE_ACTION.FILE_FETCH, MACHINE_ACTION.FILE_LIST]) {
+          expect(await admits(name, action)).toBe(false);
+        }
+      }
+      expect(execCalls + guiCalls).toBe(before);
+      // A grantee's disable does not lock out an unrelated active owner.
+      if (disabled === 'pYes') expect((await EXEC(actors.owner!)).status).toBe(200);
+    } finally {
+      await db.execute('UPDATE users SET status = $2 WHERE id = $1', [actors[disabled]!.userId, USER_STATUS.ACTIVE]);
+    }
+    expect((await EXEC(actors.owner!)).status).toBe(200);
+    expect((await EXEC(actors.pYes!)).status).toBe(200);
   });
 });
