@@ -85,6 +85,10 @@ import { getTransportQueueStore } from './transport-queue-store.js';
 import { registerExecutionPoolMcpTools, type ExecutionPoolMcpToolDeps } from './execution-pool-mcp-tools.js';
 import { getCachedSupervisorDefaults, refreshSupervisorDefaultsCache, updateSupervisorDefaultsCache } from './supervisor-defaults-cache.js';
 import { fileTransferMcpTimeoutMs } from '../../shared/transport/file-transfer.js';
+import {
+  PARTICIPANT_TURN_TOOL_REFUSAL,
+  isToolAllowedInParticipantTurn,
+} from '../../shared/participant-turn-tool-policy.js';
 
 export interface MemoryMcpServerOptions {
   env?: Record<string, string | undefined>;
@@ -344,6 +348,55 @@ function installMemoryMcpResourceGuard(
   }) as typeof server.registerTool;
 }
 
+/**
+ * The turn question, answered by the daemon's shared-machine-authority hook (the same source the machine tools use): `required` is true
+ * when a participant fed the session. A `required` turn with no usable authority is answered 403, and an unreachable daemon cannot vouch
+ * for the turn, so both read as a participant turn.
+ */
+export function participantTurnFromAuthorityHook(
+  postAuthorityHook: () => Promise<Record<string, unknown>>,
+): () => Promise<boolean> {
+  return async () => {
+    try {
+      return (await postAuthorityHook()).required === true;
+    } catch {
+      return true;
+    }
+  };
+}
+
+/**
+ * Refuse owner-level tools while the current turn belongs to a shared-session participant (shared/participant-turn-tool-policy.ts).
+ * Wraps registration like the resource guard, so EVERY tool of this server passes through it -- a tool registered by any module is
+ * covered, and a tool nobody classified is refused. The turn is asked per call: it changes with every message.
+ */
+function installParticipantTurnGate(server: McpServer, participantTurnRequired: (() => Promise<boolean>) | undefined): void {
+  if (!participantTurnRequired) return;
+  const original = server.registerTool.bind(server);
+  server.registerTool = ((name: string, config: unknown, callback: (...args: unknown[]) => unknown) => {
+    const gated = async (...args: unknown[]) => {
+      if (!isToolAllowedInParticipantTurn(name)) {
+        let participantTurn = true;
+        try { participantTurn = await participantTurnRequired(); } catch { participantTurn = true; }
+        if (participantTurn) {
+          const refusal = {
+            status: 'error',
+            reason: PARTICIPANT_TURN_TOOL_REFUSAL,
+            message: `${name} is not available while the turn was started by a shared-session participant; ask the session owner.`,
+          };
+          return { structuredContent: refusal, content: [{ type: 'text' as const, text: JSON.stringify(refusal) }], isError: true };
+        }
+      }
+      return callback(...args);
+    };
+    return original(
+      name,
+      config as Parameters<typeof original>[1],
+      gated as Parameters<typeof original>[2],
+    );
+  }) as typeof server.registerTool;
+}
+
 type ExactStoreMcpToolDeps = MessagePinMcpToolDeps & AliasMcpToolDeps;
 
 export function createMemoryMcpServer(
@@ -367,6 +420,7 @@ export function createMemoryMcpServer(
       catalogOptions.daemonAdmissionOwner ?? null,
     );
   }
+  installParticipantTurnGate(server, toolDeps.participantTurnRequired);
   const registered = new Map([
     ...registerMemoryMcpTools(server, caller, toolDeps),
     ...registerCapabilityMcpTools(server, caller, toolDeps),
@@ -625,6 +679,8 @@ export function mergeDefaultToolDeps(
     : null;
   return {
     ...toolDeps,
+    participantTurnRequired: toolDeps.participantTurnRequired
+      ?? (postSharedMachineAuthorityHook ? participantTurnFromAuthorityHook(postSharedMachineAuthorityHook) : undefined),
     invokeDaemonMemoryTool: toolDeps.invokeDaemonMemoryTool
       ?? (resourceOwner && caller.sessionName
         ? (() => {

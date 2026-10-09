@@ -330,6 +330,12 @@ type MemoryMcpListSummaries = (query: {
 const repositoryIdentityService = new GitOriginRepositoryIdentityService();
 
 export interface MemoryMcpToolDeps {
+  /**
+   * Whether the CURRENT turn of the calling session was started by a shared-session participant (shared/participant-turn-tool-policy.ts
+   * decides which tools such a turn may use). Absent when the session has no daemon turn context (tests, unscoped callers): no gate.
+   * It must resolve true when the answer cannot be obtained -- an unknown turn is treated as a participant turn.
+   */
+  participantTurnRequired?: () => Promise<boolean>;
   /** MCP child only: hand legacy supervision tool calls to the daemon (pairs engine). */
   legacyToolForwarder?: import('./task-pairs/legacy-tools.js').TaskPairLegacyToolForwarder;
   /**
