@@ -56,7 +56,9 @@ export function scanApiPaths(file: string, text: string): ApiPathUse[] {
 }
 
 /** Named shared path constants used by clients must not escape the scan. */
-export function scanImportedApiPaths(file: string, text: string): ApiPathUse[] {
+export function scanImportedApiPaths(
+  file: string, text: string, readSource: (path: string) => string = path => readFileSync(path, 'utf8'),
+): ApiPathUse[] {
   const sf = ts.createSourceFile(file, text, ts.ScriptTarget.Latest, true);
   const uses: ApiPathUse[] = [];
   for (const node of sf.statements) {
@@ -65,7 +67,7 @@ export function scanImportedApiPaths(file: string, text: string): ApiPathUse[] {
       || !ts.isNamedImports(node.importClause.namedBindings)) continue;
     const target = resolve(dirname(file), node.moduleSpecifier.text.replace(/\.js$/, '.ts'));
     if (!sharedSources.has(target)) {
-      const source = readFileSync(target, 'utf8');
+      const source = readSource(target);
       sharedSources.set(target, source.includes('/api/') ? ts.createSourceFile(target, source, ts.ScriptTarget.Latest, true) : null);
     }
     const shared = sharedSources.get(target);

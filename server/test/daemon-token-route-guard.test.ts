@@ -9,6 +9,9 @@ import { scanApiPaths, scanImportedApiPaths, sourceFiles, isNonDaemonApiUse } fr
 
 const root = fileURLToPath(new URL('../..', import.meta.url));
 const normalized = (path: string) => path.replace(/:[^/]+/g, ':param');
+const isCovered = (path: string, method?: string, importedPrefix = false) => DAEMON_TOKEN_ROUTES.some(route =>
+  (!method || route.method === method) && (normalized(route.path) === normalized(path)
+    || (importedPrefix && normalized(route.path).startsWith(`${normalized(path)}/`))));
 
 describe('daemon route inventory guards', () => {
   it('every daemon source API path and imported shared path has explicit admission', () => {
@@ -16,11 +19,13 @@ describe('daemon route inventory guards', () => {
     for (const file of sourceFiles(resolve(root, 'src'))) {
       const text = readFileSync(file, 'utf8');
       const name = relative(root, file);
-      for (const use of [...scanApiPaths(name, text), ...scanImportedApiPaths(file, text).map(u => ({ ...u, file: name }))]) {
+      const uses = [
+        ...scanApiPaths(name, text).map(use => ({ use, importedPrefix: false })),
+        ...scanImportedApiPaths(file, text).map(use => ({ use: { ...use, file: name }, importedPrefix: true })),
+      ];
+      for (const { use, importedPrefix } of uses) {
         if (isNonDaemonApiUse(use)) continue;
-        const path = normalized(use.path);
-        if (!DAEMON_TOKEN_ROUTES.some(route => (!use.method || route.method === use.method)
-          && (normalized(route.path) === path || normalized(route.path).startsWith(`${path}/`)))) {
+        if (!isCovered(use.path, use.method, importedPrefix)) {
           missing.push(`${name}: ${use.method ?? '(dynamic)'} ${use.path}`);
         }
       }
@@ -40,5 +45,10 @@ describe('daemon route inventory guards', () => {
       .toEqual([{ file: 'src/daemon/new.ts', path: '/api/account', method: 'POST' }]);
     expect(matchDaemonTokenRoute('POST', '/api/account', NODE_ROLE.FULL)).toBeUndefined();
     expect(matchDaemonTokenRoute('DELETE', '/api/machines', NODE_ROLE.FULL)).toBeUndefined();
+    // An admitted child does not grant a newly introduced literal parent URL.
+    expect(isCovered('/api/server/:id', 'GET')).toBe(false);
+    expect(isCovered('/api/capabilities/operations', 'GET')).toBe(false);
+    expect(isCovered('/api/capabilities/operations', 'GET', true)).toBe(true);
+    expect(isCovered('/api/machines', 'DELETE')).toBe(false);
   });
 });
