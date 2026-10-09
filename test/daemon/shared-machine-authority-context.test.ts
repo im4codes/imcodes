@@ -21,7 +21,7 @@ const participant = (actorUserId: string, authority?: string): SharedMachineActi
 );
 
 type Step =
-  | { act: SharedMachineActivity }
+  | { act: SharedMachineActivity; startsTurn?: boolean }
   | 'idle';
 
 /** Replays steps at 10s spacing (past the idle guard) and returns the hook answer at the end. */
@@ -30,7 +30,7 @@ function replay(steps: readonly Step[]): { required: boolean; authority: string 
   for (const step of steps) {
     now += 10_000;
     if (step === 'idle') releaseProcessSharedMachineAuthority(SESSION, now);
-    else bindProcessSharedMachineActivity(SESSION, identity, step.act, { now });
+    else bindProcessSharedMachineActivity(SESSION, identity, step.act, { now, ...(step.startsTurn === undefined ? {} : { startsTurn: step.startsTurn }) });
   }
   return readProcessSharedMachineAuthority(SESSION, identity, now + 1);
 }
@@ -43,6 +43,9 @@ describe('process shared machine authority context', () => {
     const input = { act: participant('alice', 'tok-input') } as const;
     const ownerAct = { act: owner } as const;
     const other = { act: participant('bob', 'tok-bob') } as const;
+    const typing = { act: participant('alice', 'tok-typing'), startsTurn: false } as const;
+    const submit = { act: participant('alice', 'tok-submit'), startsTurn: true } as const;
+    const BOUND = { required: true, authority: 'tok-send' };
 
     const table: Array<[string, readonly Step[], { required: boolean; authority: string | null }]> = [
       ['nothing yet', [], OPEN],
@@ -58,12 +61,28 @@ describe('process shared machine authority context', () => {
       ['participant input, then owner input', [input, ownerAct], CLOSED],
       ['participant send, owner, participant again: stays closed', [send, ownerAct, send], CLOSED],
       ['two different participants in one turn', [send, other], CLOSED],
-      ['participant, owner, idle: released', [send, ownerAct, 'idle'], OPEN],
+      ['participant, owner, idle: the owner\'s queued turn runs bound to the participant (never owner)', [send, ownerAct, 'idle'], BOUND],
+      ['participant, owner, idle, idle: released', [send, ownerAct, 'idle', 'idle'], OPEN],
       ['participant, idle: released', [send, 'idle'], OPEN],
       ['participant, idle, owner: owner runs unrestricted', [send, 'idle', ownerAct], OPEN],
       ['owner, idle, participant: participant bound', [ownerAct, 'idle', send], { required: true, authority: 'tok-send' }],
       ['participant, idle, other participant: only the new one', [send, 'idle', other], { required: true, authority: 'tok-bob' }],
       ['idle with nothing bound', ['idle'], OPEN],
+      // Input queued in the TUI during a running turn starts right after the idle edge: one idle ends one turn.
+      ['A: participant sends twice (second queued), first idle: the queued turn stays bound', [send, send, 'idle'], BOUND],
+      ['A: ... second idle releases', [send, send, 'idle', 'idle'], OPEN],
+      ['A: no over-carry, a single participant turn is released by its idle', [send, 'idle'], OPEN],
+      ['B: owner turn running, participant queued behind it, first idle: participant turn bound', [ownerAct, send, 'idle'], BOUND],
+      ['B: ... second idle releases', [ownerAct, send, 'idle', 'idle'], OPEN],
+      ['FIFO: participant turn, owner queued, participant queued; owner\'s turn restricted', [send, ownerAct, send, 'idle'], BOUND],
+      ['FIFO: ... the participant\'s queued turn after the owner\'s is still bound', [send, ownerAct, send, 'idle', 'idle'], BOUND],
+      ['FIFO: ... and only the third idle releases', [send, ownerAct, send, 'idle', 'idle', 'idle'], OPEN],
+      ['two owner turns queued behind a participant turn are each covered, then released', [send, ownerAct, ownerAct, 'idle', 'idle'], BOUND],
+      ['two owner turns queued behind a participant turn: third idle releases', [send, ownerAct, ownerAct, 'idle', 'idle', 'idle'], OPEN],
+      ['owner-only queued turns are released by the first idle (nothing to protect)', [ownerAct, ownerAct, ownerAct, 'idle'], OPEN],
+      ['plain typing never counts as a queued turn', [typing, typing, typing, submit, 'idle'], OPEN],
+      ['two submitted lines: the second is a queued turn', [submit, submit, 'idle'], { required: true, authority: 'tok-submit' }],
+      ['typing alone then idle: released', [typing, typing, 'idle'], OPEN],
       ['participant without any token fails closed', [{ act: participant('alice') }], CLOSED],
       ['participant without token, then owner', [{ act: participant('alice') }, ownerAct], CLOSED],
       ['tokenless keystroke then the same participant sends with a token', [{ act: participant('alice') }, send], { required: true, authority: 'tok-send' }],

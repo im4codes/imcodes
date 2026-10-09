@@ -1,3 +1,4 @@
+import { DAEMON_COMMAND_TYPES } from '../../shared/daemon-command-types.js';
 import {
   SHARED_MACHINE_ACTIVITY_KIND,
   type SharedMachineActivity,
@@ -15,6 +16,13 @@ type Window = {
   /** Latest server-minted token of the (single) participant; the server re-verifies it on every use. */
   authority: string | null;
   lastActivityAt: number;
+  /**
+   * Turn-producing inputs (a message, or a line submitted with Enter) bound
+   * since the window opened and not yet finished by an idle edge. A TUI queues
+   * input typed during a running turn and starts it right after the idle edge,
+   * so one idle edge ends ONE turn, not the whole window.
+   */
+  turns: number;
 };
 
 /**
@@ -26,8 +34,10 @@ type Window = {
  *   - owner activity only                  -> no restriction (`required: false`)
  *   - owner + participant, or two users    -> fail closed (`required`, no authority)
  *
- * The window is released when the session returns to idle
- * ({@link releaseProcessSharedMachineAuthority}); owner activity never clears it.
+ * Owner activity never clears the window. An idle edge ends one turn
+ * ({@link releaseProcessSharedMachineAuthority}); the window is released only
+ * when no further turn is queued behind it (see `turns`), so input queued in
+ * the TUI during a participant's turn still runs bound to that participant.
  * Mirrors the transport rule in TransportSessionRuntime.getActiveSharedMachineAuthority.
  */
 const windows = new Map<string, Window>();
@@ -52,7 +62,12 @@ export function bindProcessSharedMachineActivity(
   sessionName: string,
   identity: RuntimeIdentity | null,
   activity: SharedMachineActivity,
-  opts: { now?: number; sessionRunning?: boolean } = {},
+  opts: {
+    now?: number;
+    sessionRunning?: boolean;
+    /** The activity submits a turn (a message, an Enter). Plain typing does not. Default true. */
+    startsTurn?: boolean;
+  } = {},
 ): void {
   const now = opts.now ?? Date.now();
   let window = windows.get(sessionName);
@@ -60,10 +75,11 @@ export function bindProcessSharedMachineActivity(
   if (window && window.identity && identity && !sameIdentity(window.identity, identity)) window = undefined;
   if (window && quietAndIdle(window, now, opts.sessionRunning ?? false)) window = undefined;
   if (!window) {
-    window = { identity, owner: false, participants: new Set(), authority: null, lastActivityAt: now };
+    window = { identity, owner: false, participants: new Set(), authority: null, lastActivityAt: now, turns: 0 };
     windows.set(sessionName, window);
   }
   window.lastActivityAt = now;
+  if (opts.startsTurn ?? true) window.turns += 1;
   if (!identity) window.identity = null;
   if (activity.kind === SHARED_MACHINE_ACTIVITY_KIND.OWNER) {
     window.owner = true;
@@ -102,7 +118,12 @@ export function bindProcessSharedMachineCommand(
         authority,
       }
     : { kind: SHARED_MACHINE_ACTIVITY_KIND.OWNER };
+  // Keystrokes only start a turn when they submit a line (Enter); a message always does.
+  const startsTurn = cmd.type === DAEMON_COMMAND_TYPES.SESSION_INPUT
+    ? typeof cmd.data === 'string' && /[\r\n]/.test(cmd.data)
+    : true;
   bindProcessSharedMachineActivity(sessionName, identity, activity, {
+    startsTurn,
     sessionRunning: record?.state === 'running',
     ...(now === undefined ? {} : { now }),
   });
@@ -118,14 +139,25 @@ export function bindProcessSharedMachineCommand(
 export const PROCESS_SHARED_MACHINE_IDLE_GUARD_MS = 1_500;
 
 /**
- * The session returned to idle: the turn is over, the next activity starts a
- * fresh window. Driven by the daemon's `session.state` = idle timeline event
- * (Claude Code Stop hook, Codex/Gemini watchers, terminal-streamer quiet timer).
+ * The session returned to idle: ONE turn is over. If more turn-producing input
+ * was bound behind it (queued in the TUI, FIFO), the next turn starts at once
+ * and must stay covered, so the window carries on: participants and token are
+ * kept, the owner flag is cleared (the finished turn was the only one it could
+ * have been about; a queued owner turn then runs more restricted than needed,
+ * never less). Only when nothing is queued, or no participant is involved, is
+ * the window released. Driven by the daemon's `session.state` = idle timeline
+ * event (Claude Code Stop hook, Codex/Gemini watchers, terminal-streamer quiet timer).
  */
 export function releaseProcessSharedMachineAuthority(sessionName: string, now = Date.now()): void {
   const window = windows.get(sessionName);
   if (!window) return;
   if (now - window.lastActivityAt < PROCESS_SHARED_MACHINE_IDLE_GUARD_MS) return;
+  if (window.participants.size > 0 && window.turns > 1) {
+    window.turns -= 1;
+    window.owner = false;
+    window.lastActivityAt = now;
+    return;
+  }
   windows.delete(sessionName);
 }
 

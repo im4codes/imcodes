@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   clearProcessSharedMachineAuthoritiesForTests,
   readProcessSharedMachineAuthority,
+  releaseProcessSharedMachineAuthority,
 } from '../../src/daemon/shared-machine-authority-context.js';
 
 const {
@@ -210,6 +211,61 @@ describe('command-handler delegation routing behavior', () => {
       await send();
       await flushAsync();
       expect(hook()).toEqual({ required: true, authority: null });
+    });
+
+    describe('input queued in the TUI during a running turn (one idle edge ends one turn)', () => {
+      let edgeAt = 0;
+      const idleEdge = () => releaseProcessSharedMachineAuthority('deck_proj_brain', Date.now() + (edgeAt += 60_000));
+      beforeEach(() => {
+        getSessionMock.mockReturnValue({
+          name: 'deck_proj_brain', projectName: 'proj', projectDir: '/repo', role: 'brain',
+          agentType: 'claude-code', runtimeType: 'process', state: 'running', ...identity,
+        });
+      });
+
+      it('A: a second participant message sent while the first turn runs is still bound after the first idle', async () => {
+        await send({ sharedActor: participantActor, sharedMachineAuthority: 'tok-1' });
+        await send({ sharedActor: participantActor, sharedMachineAuthority: 'tok-2' });
+        await flushAsync();
+        idleEdge();
+        // The queued turn starts now: it must NOT run with the owner's authority.
+        expect(hook()).toEqual({ required: true, authority: 'tok-2' });
+        idleEdge();
+        expect(hook()).toEqual({ required: false, authority: null });
+      });
+
+      it('B: a participant message queued behind an owner turn runs bound after the idle edge', async () => {
+        await send();
+        await send({ sharedActor: participantActor, sharedMachineAuthority: 'tok-q' });
+        await flushAsync();
+        expect(hook()).toEqual({ required: true, authority: null });
+        idleEdge();
+        expect(hook()).toEqual({ required: true, authority: 'tok-q' });
+        idleEdge();
+        expect(hook()).toEqual({ required: false, authority: null });
+      });
+
+      it('a single participant turn is released by its idle edge (no over-carry)', async () => {
+        await send({ sharedActor: participantActor, sharedMachineAuthority: 'tok-1' });
+        await flushAsync();
+        idleEdge();
+        expect(hook()).toEqual({ required: false, authority: null });
+      });
+
+      it('submitted terminal lines count as queued turns; plain typing does not', async () => {
+        input({ sharedActor: participantActor, sharedMachineAuthority: 'k1', data: 'abc' });
+        input({ sharedActor: participantActor, sharedMachineAuthority: 'k2', data: 'def\r' });
+        await flushAsync();
+        idleEdge();
+        expect(hook()).toEqual({ required: false, authority: null });
+        input({ sharedActor: participantActor, sharedMachineAuthority: 'k3', data: 'one\r' });
+        input({ sharedActor: participantActor, sharedMachineAuthority: 'k4', data: 'two\r' });
+        await flushAsync();
+        idleEdge();
+        expect(hook()).toEqual({ required: true, authority: 'k4' });
+        idleEdge();
+        expect(hook()).toEqual({ required: false, authority: null });
+      });
     });
 
     it('owner-only keystrokes and messages keep the unrestricted path', async () => {
