@@ -25,6 +25,7 @@ import {
 } from '../../../shared/tab-sharing.js';
 import { REPO_MSG } from '../../../shared/repo-types.js';
 import { TIMELINE_MESSAGES } from '../../../shared/timeline-protocol.js';
+import { TASK_PAIR_TIMELINE_EVENT } from '../../../shared/task-pair.js';
 import {
   DIRECT_FILE_TRANSFER_DIRECTION,
   DIRECT_FILE_TRANSFER_MSG,
@@ -350,13 +351,16 @@ export const SHARE_SCOPED_DAEMON_MESSAGE_POLICY = new Map<string, DaemonMessageP
   ['subsession.removed', { target: subsessionRemovedTarget }],
   ['timeline.event', {
     target: timelineEventTarget,
+    redact: redactTimelineEventPairInfo,
   }],
-  [SUPERVISION_TASK_CONSOLE_MSG.SNAPSHOT, { target: supervisionTaskConsoleTarget, mainOrServerShareOnly: true }],
-  [SUPERVISION_TASK_CONSOLE_MSG.DELTA, { target: supervisionTaskConsoleTarget, mainOrServerShareOnly: true }],
+  // Pair titles, models and brief text are the project's work, not the shared session's: a share (viewer OR participant) gets the pair
+  // console without them (owner decision on audit tsk_854675e1e2, Q3c). The frames keep their shape so the console still renders.
+  [SUPERVISION_TASK_CONSOLE_MSG.SNAPSHOT, { target: supervisionTaskConsoleTarget, mainOrServerShareOnly: true, redact: redactPairInfoDeep }],
+  [SUPERVISION_TASK_CONSOLE_MSG.DELTA, { target: supervisionTaskConsoleTarget, mainOrServerShareOnly: true, redact: redactPairInfoDeep }],
   [SUPERVISION_TASK_CONSOLE_MSG.RESYNC_REQUIRED, { target: supervisionTaskConsoleTarget, mainOrServerShareOnly: true }],
   [SUPERVISION_TASK_CONSOLE_MSG.UNAVAILABLE, { target: supervisionTaskConsoleTarget, mainOrServerShareOnly: true }],
-  [SUPERVISION_TASK_CONSOLE_MSG.PAIR_DELTA, { target: supervisionTaskConsoleTarget, mainOrServerShareOnly: true }],
-  [SUPERVISION_TASK_CONSOLE_MSG.BRIEF_RESPONSE, { target: supervisionTaskConsoleTarget, mainOrServerShareOnly: true }],
+  [SUPERVISION_TASK_CONSOLE_MSG.PAIR_DELTA, { target: supervisionTaskConsoleTarget, mainOrServerShareOnly: true, redact: redactPairInfoDeep }],
+  [SUPERVISION_TASK_CONSOLE_MSG.BRIEF_RESPONSE, { target: supervisionTaskConsoleTarget, mainOrServerShareOnly: true, redact: redactBriefResponse }],
   [TRANSPORT_MSG.CHAT_HISTORY, {
     target: sessionIdFieldTarget,
     redact: redactTransportHistory,
@@ -1288,7 +1292,59 @@ function redactSessionList(msg: Record<string, unknown>, state: ShareScopedSocke
 }
 
 function redactTransportHistory(msg: Record<string, unknown>, _state: ShareScopedSocketState): Record<string, unknown> | null {
-  return msg;
+  if (!Array.isArray(msg.events)) return msg;
+  return { ...msg, events: msg.events.map((event) => redactPairTimelineEvent(event)) };
+}
+
+// ── pair information a share must not see (titles, models, brief text) ──────────────────────────────
+
+/** Keys that carry a pair's model / brief / objective on console rows and pair events. */
+const SHARE_HIDDEN_PAIR_KEYS: ReadonlySet<string> = new Set([
+  'executorModel', 'auditorModel', 'executorThinking', 'auditorThinking',
+  'observedModel', 'observedThinking',
+  'brief', 'briefRevision', 'objective',
+]);
+
+function redactPairValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(redactPairValue);
+  if (!value || typeof value !== 'object') return value;
+  const record = value as Record<string, unknown>;
+  const out: Record<string, unknown> = {};
+  for (const [key, inner] of Object.entries(record)) {
+    if (SHARE_HIDDEN_PAIR_KEYS.has(key)) continue;
+    out[key] = redactPairValue(inner);
+  }
+  // A console task row must keep a title (the UI requires one): its id stands in for the text.
+  if (typeof record.taskId === 'string' && typeof record.title === 'string') out.title = record.taskId;
+  return out;
+}
+
+/** Console snapshot / delta / pair_delta frames: every row loses title text, models and brief text, at any depth. */
+function redactPairInfoDeep(msg: Record<string, unknown>, _state: ShareScopedSocketState): Record<string, unknown> | null {
+  return redactPairValue(msg) as Record<string, unknown>;
+}
+
+/** The brief itself is never sent: the reply stays well-formed ("no brief") so the console does not wait for one. */
+function redactBriefResponse(msg: Record<string, unknown>, _state: ShareScopedSocketState): Record<string, unknown> | null {
+  return { ...msg, brief: null, briefRevision: null };
+}
+
+const SHARE_HIDDEN_PAIR_EVENT_PAYLOAD_KEYS: readonly string[] = ['title', 'executorModel', 'auditorModel', 'executorThinking', 'auditorThinking'];
+
+/** A `task_pair.event` loses its pair title and models; every other timeline event is returned as is. */
+function redactPairTimelineEvent(event: unknown): unknown {
+  if (!event || typeof event !== 'object' || Array.isArray(event)) return event;
+  const record = event as Record<string, unknown>;
+  if (record.type !== TASK_PAIR_TIMELINE_EVENT) return event;
+  const payload = record.payload && typeof record.payload === 'object' && !Array.isArray(record.payload)
+    ? { ...(record.payload as Record<string, unknown>) }
+    : {};
+  for (const key of SHARE_HIDDEN_PAIR_EVENT_PAYLOAD_KEYS) delete payload[key];
+  return { ...record, payload };
+}
+
+function redactTimelineEventPairInfo(msg: Record<string, unknown>, _state: ShareScopedSocketState): Record<string, unknown> | null {
+  return { ...msg, event: redactPairTimelineEvent(msg.event) };
 }
 
 function redactParticipantModelCatalog(msg: Record<string, unknown>, state: ShareScopedSocketState): Record<string, unknown> | null {

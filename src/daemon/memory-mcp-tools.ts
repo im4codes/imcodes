@@ -1747,7 +1747,8 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
   /**
    * Whether the current turn was started by a shared-session participant -- the SAME question the tool gate asks
    * (shared/participant-turn-tool-policy.ts via `participantTurnRequired`), never a second predicate. An unanswerable question reads as a
-   * participant turn (fail closed). No turn context (tests, unscoped callers) is no gate, exactly as for the gate.
+   * participant turn (fail closed). No turn context (tests, unscoped callers) is no gate, exactly as for the gate; production always wires
+   * the dependency (memory-mcp-server.ts builds it from the daemon's shared-machine-authority hook).
    */
   const participantViewRequired = async (): Promise<boolean> => {
     if (!deps.participantTurnRequired) return false;

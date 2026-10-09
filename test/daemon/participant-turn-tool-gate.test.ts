@@ -45,13 +45,13 @@ describe('participant-turn tool policy', () => {
 
   it('refuses an unlisted tool and lets the agent-to-agent, read and discovery tools through', () => {
     expect(isToolAllowedInParticipantTurn('a_tool_added_next_year')).toBe(false);
-    for (const allowed of ['send_message', 'send_list_targets', 'delegation_reply', 'search_memory', 'list_machines', 'mcp_tool_search']) {
+    for (const allowed of ['send_message', 'send_list_targets', 'delegation_reply', 'search_memory', 'list_machines', 'mcp_tool_search', 'pair_list', 'pair_get']) {
       expect(isToolAllowedInParticipantTurn(allowed), allowed).toBe(true);
     }
     for (const denied of ['cron_create', 'cron_create_self', 'resolve_alias', 'save_alias', 'pin_message', 'list_message_pins', 'save_preference',
       'update_memory', 'delete_memory', 'session_restart', 'session_close', 'session_model', 'send_stop', 'capability_install', 'capability_manage',
-      'pair_create', 'session_identity_set', 'execution_pool_set', 'verification_machine_set',
-      // tsk_9a8c291594: execute-class machine tools never run on a participant-started turn.
+      'pair_create', 'pair_task_get', 'session_identity_set', 'execution_pool_set', 'verification_machine_set',
+      // Execute-class tools remain forbidden on participant-started turns.
       'exec_remote', 'send_file_to_machine', 'fetch_file_from_machine', 'computer_use_call']) {
       expect(isToolAllowedInParticipantTurn(denied), denied).toBe(false);
     }

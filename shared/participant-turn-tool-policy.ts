@@ -46,7 +46,6 @@ export const PARTICIPANT_TURN_TOOL_POLICY: Readonly<Record<string, ParticipantTu
   // Work the session itself is assigned (bound to the exact pair role by the tool).
   [N.PAIR_LIST]: ALLOW,
   [N.PAIR_GET]: ALLOW,
-  [N.PAIR_TASK_GET]: ALLOW,
   [N.PAIR_TASK_UPDATE]: ALLOW,
   [N.PAIR_TASK_CHECK]: ALLOW,
   [N.PAIR_RESOURCE_CLAIM]: ALLOW,
@@ -80,6 +79,8 @@ export const PARTICIPANT_TURN_TOOL_POLICY: Readonly<Record<string, ParticipantTu
   [N.VERIFICATION_MACHINE_SET]: DENY,
   [N.VERIFICATION_MACHINE_REMOVE]: DENY,
   [N.VERIFICATION_MACHINE_VERIFY]: DENY,
+  // The assigned brief is the project's work text (and carries its title): not for a turn a participant started (audit tsk_854675e1e2, Q3c).
+  [N.PAIR_TASK_GET]: DENY,
   [N.PAIR_CREATE]: DENY,
   [N.PAIR_DISPATCH]: DENY,
   [N.PAIR_CLOSE]: DENY,
