@@ -630,7 +630,7 @@ machinesRoutes.post('/exec-enabled', requireAuth(), async (c) => {
 machinesRoutes.get('/:serverId/exec-audit', requireAuth(), async (c) => {
   const userId = c.get('userId' as never) as string;
   const serverId = c.req.param('serverId');
-  if (!serverId) return c.json({ error: 'invalid_request' }, 400);
+  if (!serverId) return c.json({ error: 'invalid_body' }, 400);
   const access = await resolveControlledMachineManagementAccess(c.env.DB, userId, serverId, Date.now());
   if (!access) return c.json({ error: 'not_found' }, 404);
   const limitRaw = Number(c.req.query('limit') ?? 50);
