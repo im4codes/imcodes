@@ -4,23 +4,22 @@ import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'preac
 import { createPortal } from 'preact/compat';
 import { useTranslation } from 'react-i18next';
 import type { TimelineEvent } from '../ws-client.js';
-import { TASK_PAIR_STATUS_PANEL_STORAGE_KEY, TASK_PAIR_TERMINAL_STATUSES, TASK_PAIR_TIMELINE_EVENT, TASK_PAIR_STATUSES, type TaskPairStatus } from '@shared/task-pair.js';
+import { TASK_PAIR_TERMINAL_STATUSES, TASK_PAIR_TIMELINE_EVENT, TASK_PAIR_STATUSES, type TaskPairStatus } from '@shared/task-pair.js';
 import { formatTaskDuration } from '../util/tool-duration.js';
 import { watchProjectionStore } from '../watch-projection.js';
 import { TaskPairBrief } from './TaskPairBrief.js';
+import {
+  TASK_PAIR_PANEL_LIVE_STATUSES,
+  readTaskPairPanelChoice,
+  resolveTaskPairPanelCollapsed,
+  serverWideStorageKey,
+  writeTaskPairPanelChoice,
+} from '../task-pair-panel-state.js';
 
 const MAX_ROWS = 6;
 
-export function collapsedStorageKey(serverId: string | null | undefined, mobile: boolean): string {
-  const scope = serverId ? `:${serverId}` : '';
-  return `${TASK_PAIR_STATUS_PANEL_STORAGE_KEY}${scope}:${mobile ? 'mobile' : 'desktop'}`;
-}
-function readCollapsed(serverId: string | null | undefined, mobile: boolean): boolean {
-  try {
-    const stored = window.localStorage.getItem(collapsedStorageKey(serverId, mobile));
-    return stored === null ? mobile : stored === '1';
-  } catch { return mobile; }
-}
+/** Kept for callers and tests: the server-wide flag's key (see task-pair-panel-state.ts). */
+export const collapsedStorageKey = serverWideStorageKey;
 
 function status(value: unknown): value is TaskPairStatus {
   return typeof value === 'string' && (TASK_PAIR_STATUSES as readonly string[]).includes(value);
@@ -154,17 +153,18 @@ function resolveSessionThinking(
 export function TaskPairStatusPanel({ events, sessions, serverId, scopeSessionId }: { events: readonly TimelineEvent[]; sessions?: readonly SessionLabelEntry[]; serverId?: string | null; scopeSessionId?: string | null }) {
   const { t } = useTranslation();
   const [isMobile, setIsMobile] = useState(isMobileLayout);
-  const [storedCollapsed, setCollapsed] = useState(() => readCollapsed(serverId, isMobileLayout()));
+  // The user's own choice for this panel (undefined: none yet). What is shown follows from it plus the defaults, so a resize, a layout
+  // check or a remount can never overwrite a choice with a default (see task-pair-panel-state.ts).
+  const [choice, setChoice] = useState<boolean | undefined>(() => readTaskPairPanelChoice({ serverId, mobile: isMobileLayout(), scopeSessionId }));
   // The mobile panel is measured against the visible chat area; when too little
   // room is left (landscape phone, keyboard open) the collapsed strip is shown
   // instead, without touching the user's stored choice.
   const [cramped, setCramped] = useState(false);
   const panelRef = useRef<HTMLElement>(null);
-  const collapsed = storedCollapsed || (isMobile && cramped);
   const persistCollapsed = useCallback((next: boolean) => {
-    setCollapsed(next);
-    try { window.localStorage.setItem(collapsedStorageKey(serverId, isMobile), next ? '1' : '0'); } catch {}
-  }, [serverId, isMobile]);
+    setChoice(next);
+    writeTaskPairPanelChoice({ serverId, mobile: isMobile, scopeSessionId, collapsed: next });
+  }, [serverId, isMobile, scopeSessionId]);
   useLayoutEffect(() => {
     const panel = panelRef.current;
     if (!isMobile || !panel) { setCramped(false); return undefined; }
@@ -173,14 +173,19 @@ export function TaskPairStatusPanel({ events, sessions, serverId, scopeSessionId
   useEffect(() => {
     const media = window.matchMedia?.('(max-width: 720px)');
     if (!media) return undefined;
-    const onChange = () => { const mobile = isMobileLayout(); setIsMobile(mobile); setCollapsed(readCollapsed(serverId, mobile)); };
+    // Only the layout class is tracked here; the choice is re-read by the effect below when the layout (or the panel's scope) changes.
+    const onChange = () => setIsMobile(isMobileLayout());
     media.addEventListener?.('change', onChange);
     window.addEventListener('resize', onChange);
     return () => { media.removeEventListener?.('change', onChange); window.removeEventListener('resize', onChange); };
   }, []);
+  const scopeKey = `${serverId ?? ''}|${scopeSessionId ?? ''}|${isMobile ? 'm' : 'd'}`;
+  const lastScopeKey = useRef(scopeKey);
   useEffect(() => {
-    setCollapsed(readCollapsed(serverId, isMobile));
-  }, [serverId, isMobile]);
+    if (lastScopeKey.current === scopeKey) return;
+    lastScopeKey.current = scopeKey;
+    setChoice(readTaskPairPanelChoice({ serverId, mobile: isMobile, scopeSessionId }));
+  }, [scopeKey, serverId, isMobile, scopeSessionId]);
   const [snapshotRows, setSnapshotRows] = useState<readonly Record<string, unknown>[] | null>(() => {
     const detail = (window as Window & { __imcodesTaskPairSnapshot?: { tasks?: readonly Record<string, unknown>[]; assignments?: readonly Record<string, unknown>[] } }).__imcodesTaskPairSnapshot;
     return detail ? normalizeSnapshot(detail) : null;
@@ -246,6 +251,10 @@ export function TaskPairStatusPanel({ events, sessions, serverId, scopeSessionId
     return result;
   }, { working: 0, audit: 0, queued: 0, awaitingBrain: 0 });
   if (latest.size === 0 || allRows.length === 0) return null;
+  // What is shown: the user's own choice if there is one, else the default (a phone's sub-session opens when it has a live task);
+  // too little room on a phone shows the strip without touching the choice.
+  const hasLiveTask = allRows.some((row) => TASK_PAIR_PANEL_LIVE_STATUSES.includes(String(row.payload.toStatus)));
+  const collapsed = resolveTaskPairPanelCollapsed({ choice, mobile: isMobile, scopeSessionId, hasLiveTask }) || (isMobile && cramped);
   const toggle = () => persistCollapsed(!collapsed);
   const toggleWithKeyboard = (event: KeyboardEvent) => {
     if (event.key !== 'Enter' && event.key !== ' ') return;
