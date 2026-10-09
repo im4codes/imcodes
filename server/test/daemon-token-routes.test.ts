@@ -42,6 +42,16 @@ describe('daemon credentials are admitted only on explicitly called routes', () 
     expect(env.DB.execute).not.toHaveBeenCalled();
   });
 
+  it('HEAD and credential-bearing OPTIONS cannot bypass admission; bare preflight is unchanged', async () => {
+    const app = buildApp(environment());
+    for (const method of ['HEAD', 'OPTIONS']) {
+      const response = await app.request('/api/team', { method, headers });
+      expect(response.status).toBe(403);
+      if (method === 'OPTIONS') expect(await response.json()).toMatchObject({ reason: DAEMON_TOKEN_ROUTE_NOT_ALLOWED });
+    }
+    expect((await app.request('/api/team', { method: 'OPTIONS' })).status).toBe(204);
+  });
+
   it.each(DAEMON_TOKEN_ROUTES)('$method $path passes real credential middleware', async (route) => {
     const app = new Hono<{ Bindings: Env }>();
     app.on(route.method, route.path, requireAuth(), c => c.json({ ok: true }));

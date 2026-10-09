@@ -209,6 +209,13 @@ export function buildApp(env: Env, options: BuildAppOptions = {}) {
     await next();
   });
 
+  // Verify explicit daemon credentials even on public/account-only or unknown
+  // routes, before CORS can short-circuit OPTIONS. resolveAuth keeps the established cookie-first user-login flow.
+  app.use('/api/*', async (c, next) => {
+    if (c.req.header(SERVER_ID_HEADER)) await resolveAuth(c);
+    await next();
+  });
+
   // CORS: allow Capacitor native WebView (capacitor://localhost) to access the API.
   // Web same-origin requests never trigger preflight, so this only affects native clients.
   // Applied to both /api/* and /health so the native app can verify server reachability.
@@ -232,13 +239,6 @@ export function buildApp(env: Env, options: BuildAppOptions = {}) {
 
   // CSRF protection for all API write operations (skips Bearer auth and safe methods)
   app.use('/api/*', csrfMiddleware());
-
-  // Verify explicit daemon credentials even on public/account-only or unknown
-  // routes. resolveAuth keeps the established cookie-first user-login flow.
-  app.use('/api/*', async (c, next) => {
-    if (c.req.header(SERVER_ID_HEADER)) await resolveAuth(c);
-    await next();
-  });
 
   app.route('/api/auth', authRoutes);
   app.route('/api/auth/github', githubAuthRoutes);
