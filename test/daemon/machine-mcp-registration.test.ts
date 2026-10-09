@@ -1,3 +1,4 @@
+import { mcpToolPayload } from '../helpers/mcp-tool-result.js';
 import { describe, it, expect, vi } from 'vitest';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
@@ -132,7 +133,7 @@ describe('machine MCP tools — in-process discovery + call parity', () => {
     });
     const res = await client.callTool({ name: MEMORY_MCP_TOOL_NAMES.LIST_MACHINES, arguments: {} });
     expect(res.isError).toBe(true);
-    expect((res.structuredContent as { reason?: string }).reason).toBe('feature_disabled');
+    expect(mcpToolPayload(res).reason).toBe('feature_disabled');
     await client.close();
   });
 
@@ -297,7 +298,7 @@ describe('machine MCP tools — in-process discovery + call parity', () => {
     const command = '界'.repeat(Math.floor(REMOTE_EXEC_MAX_COMMAND_BYTES / 3) + 1);
     const res = await client.callTool({ name: MEMORY_MCP_TOOL_NAMES.EXEC_REMOTE, arguments: { machine: 'win-1', command } });
     expect(res.isError).toBe(true);
-    expect(res.structuredContent).toMatchObject({ status: 'error', reason: 'validation_failed' });
+    expect(mcpToolPayload(res)).toMatchObject({ status: 'error', reason: 'validation_failed' });
     expect(execRemote).not.toHaveBeenCalled();
     await client.close();
   });
@@ -312,7 +313,7 @@ describe('machine MCP tools — in-process discovery + call parity', () => {
     const client = await connect({ listMachines: () => machines, execRemote: okDeps.execRemote });
     const res = await client.callTool({ name: MEMORY_MCP_TOOL_NAMES.LIST_MACHINES, arguments: {} });
     expect(res.isError).toBe(true);
-    expect(res.structuredContent).toMatchObject({ status: 'error', reason: 'control_plane_unavailable' });
+    expect(mcpToolPayload(res)).toMatchObject({ status: 'error', reason: 'control_plane_unavailable' });
     await client.close();
   });
 
@@ -323,7 +324,7 @@ describe('machine MCP tools — in-process discovery + call parity', () => {
     });
     const res = await client.callTool({ name: MEMORY_MCP_TOOL_NAMES.LIST_MACHINES, arguments: {} });
     expect(res.isError).toBe(true);
-    expect(JSON.stringify(res.structuredContent)).not.toContain('secret');
+    expect(JSON.stringify(mcpToolPayload(res))).not.toContain('secret');
     await client.close();
   });
 
@@ -366,7 +367,7 @@ describe('machine MCP tools — in-process discovery + call parity', () => {
     });
     const res = await client.callTool({ name: MEMORY_MCP_TOOL_NAMES.LIST_MACHINES, arguments: {} });
     expect(res.isError).toBe(true);
-    expect((res.structuredContent as { reason?: string }).reason).toBe('control_plane_unavailable');
+    expect(mcpToolPayload(res).reason).toBe('control_plane_unavailable');
     await client.close();
   });
 });

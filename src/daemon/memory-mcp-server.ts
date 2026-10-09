@@ -1,3 +1,4 @@
+import { installMcpErrorResultBoundary } from './mcp-error-result-boundary.js';
 import { TASK_PAIR_LEGACY_TOOL_HOOK_PATH } from '../../shared/task-pair.js';
 import { SEND_COMMAND_ERRORS, SEND_COMMAND_HOOK_PATH } from '../../shared/send-command-mode.js';
 import type { SessionCloseResult } from '../../shared/session-close.js';
@@ -412,6 +413,7 @@ export function createMemoryMcpServer(
     name: IMCODES_MEMORY_MCP_SERVER_NAME,
     version: '0.1.0',
   });
+  installMcpErrorResultBoundary(server);
   if (caller.transport === 'stdio') {
     installMemoryMcpResourceGuard(
       server,

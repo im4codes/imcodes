@@ -1,3 +1,4 @@
+import { installMcpErrorResultBoundary } from './mcp-error-result-boundary.js';
 import { withPairsLegacyTools } from './task-pairs/legacy-tools.js';
 import { SEND_COMMAND_DESCRIPTION, SEND_COMMAND_FIELD } from '../../shared/send-command-mode.js';
 import { emitTaskPairDaemonEvent, taskPairService } from './task-pairs/service.js';
@@ -4911,6 +4912,7 @@ export function registerMemoryMcpTools(
   deps: MemoryMcpToolDeps = {},
 ): ReadonlyMap<string, RegisteredTool> {
   const handlers = withPairsLegacyTools(caller.sessionName, createMemoryMcpToolHandlers(caller, deps), deps.legacyToolForwarder);
+  installMcpErrorResultBoundary(server);
   const registered = new Map<string, RegisteredTool>();
   // Role-gate the advertised surface: a controlled node never registers the
   // FULL-only machine tools, so its daemon.hello / tools/list excludes them (10.12).

@@ -1,3 +1,4 @@
+import { mcpToolPayload } from '../helpers/mcp-tool-result.js';
 /**
  * tsk_854675e1e2: while a shared-session PARTICIPANT's message drives the turn, the agent answers on the owner's machine with the owner's
  * tools. Only the machine tools followed the participant's own access; cron (jobs that later run as the owner), the owner's aliases and
@@ -146,7 +147,8 @@ describe('execute-class machine tools on a participant-started turn (tsk_9a8c291
           await client.callTool({ name: MCP_TOOL_DISCOVERY_NAME, arguments: { query: `group:${name === 'exec_remote' ? 'managed-machines' : 'file-transfer-computer-use'}` } });
           const result = await client.callTool({ name, arguments: args });
           if (expectRefused) {
-            expect(result.structuredContent, name).toMatchObject({ status: 'error', reason: PARTICIPANT_TURN_TOOL_REFUSAL });
+            expect(result.isError, name).toBe(true);
+            expect(mcpToolPayload(result), name).toMatchObject({ status: 'error', reason: PARTICIPANT_TURN_TOOL_REFUSAL });
           } else {
             expect((result.structuredContent as { reason?: string } | undefined)?.reason, name).not.toBe(PARTICIPANT_TURN_TOOL_REFUSAL);
           }
