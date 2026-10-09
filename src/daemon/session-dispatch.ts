@@ -26,6 +26,7 @@ import {
   buildAgentDelegationSenderLine,
   isAgentDelegationForwardedPayloadText,
   isDelegationReplyCapableAgentType,
+  neutralizeAgentDelegationEnvelopeMarkers,
   stripAgentDelegationControlInstructions,
   type AgentDelegationReplyAuthority,
   type AgentDelegationErrorCode,
@@ -143,7 +144,8 @@ export function buildSessionDispatchMessage(
   // turned it into prose: the command never ran and the model read it instead.
   if (options.command === true || isSessionControlDispatchText(message)) return sendCommandText(message);
   const contextStatus: DelegationContextStatus = options.contextStatus ?? (options.contextOmitted ? 'omitted' : 'ok');
-  let result = message;
+  // The body is the sender's content; only the line built below is the daemon's own envelope.
+  let result = neutralizeAgentDelegationEnvelopeMarkers(message);
   if (options.from) {
     const senderLine = buildAgentDelegationSenderLine(options.from, options.fromLabel);
     if (senderLine) result = `${senderLine}\n\n${result}`;

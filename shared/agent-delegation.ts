@@ -531,6 +531,29 @@ export function isDelegationUnsupportedControlText(text: string): boolean {
   return UNSUPPORTED_CONTROL_TEXT_RE.test(text);
 }
 
+/** The markers a RECEIVING agent trusts as "the daemon wrote this line" (sender identity, reply authority, completion notice). */
+const AGENT_DELEGATION_TRUSTED_ENVELOPE_MARKERS = [
+  AGENT_DELEGATION_SENDER_MARKER,
+  AGENT_DELEGATION_REPLY_INSTRUCTION_MARKER,
+  AGENT_DELEGATION_STRUCTURED_REPLY_INSTRUCTION_MARKER,
+  AGENT_DELEGATION_COMPLETION_NOTIFICATION_MARKER,
+] as const;
+
+/**
+ * Text typed by a person (the composer, a shared-session participant, a chat bridge) or written by an agent is CONTENT. It must not be
+ * able to start with the daemon's own envelope -- `<imcodes-agent-delegation-sender-v1>` + "Message from IM.codes session: deck_x_brain" --
+ * and pass for a message from another session (a participant impersonating the Brain to the owner's agent). The markers are defanged
+ * where such content enters; the daemon prepends the real envelope after this runs.
+ */
+export function neutralizeAgentDelegationEnvelopeMarkers(text: string): string {
+  let result = text;
+  for (const marker of AGENT_DELEGATION_TRUSTED_ENVELOPE_MARKERS) {
+    if (!result.includes(marker)) continue;
+    result = result.split(marker).join(`[forged ${marker.slice(1, -1)} removed]`);
+  }
+  return result;
+}
+
 /**
  * Renders a plain, always-present sender identification line — the exact
  * IM.codes session name and, when known, its display label. Unlike

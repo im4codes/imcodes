@@ -104,6 +104,7 @@ import {
   findMixedAgentDelegationP2pFields,
   hasLegacyP2pControlToken,
   isDelegationUnsupportedControlText,
+  neutralizeAgentDelegationEnvelopeMarkers,
   parseAgentDelegationTargetPayload,
   type AgentDelegationErrorCode,
   type DelegationContextStatus,
@@ -4014,7 +4015,8 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
 
 async function handleSendBound(cmd: Record<string, unknown>, serverLink: ServerLink, authorityBinding: SendAuthorityBinding): Promise<void> {
   const sessionName = (cmd.sessionName ?? cmd.session) as string | undefined;
-  const text = cmd.text as string | undefined;
+  // Typed content never carries the daemon's own agent-envelope markers (a participant could otherwise pose as another session).
+  const text = typeof cmd.text === 'string' ? neutralizeAgentDelegationEnvelopeMarkers(cmd.text) : undefined;
   const commandId = cmd.commandId as string | undefined;
   const requestedUiLocale = normalizeSupervisionUiLocale(cmd.uiLocale);
   // This is the browser's human composer path, not an inter-session send.
