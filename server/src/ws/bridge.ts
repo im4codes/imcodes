@@ -12,6 +12,7 @@
  * terminal.stream_reset and unsubscribes the browser from that session.
  */
 
+import { buildCronExecutionResultUpdate } from '../cron/execution-result.js';
 import {
   CONTROLLED_NODE_ACK_SERVER_URLS_FIELD,
   CONTROLLED_NODE_PUBLIC_URLS_ENV,
@@ -9212,12 +9213,10 @@ export class WsBridge {
     if (type === 'cron.p2p_linked' && this.db) {
       const { jobId, discussionId } = msg as { jobId: string; discussionId: string };
       if (jobId && discussionId) {
-        void this.db.execute(
-          `UPDATE cron_executions SET detail = $1 WHERE id = (
-             SELECT id FROM cron_executions WHERE job_id = $2 ORDER BY created_at DESC LIMIT 1
-           )`,
-          [`p2p:${discussionId}`, jobId],
-        ).catch(() => {});
+        const update = buildCronExecutionResultUpdate({
+          authenticatedServerId: this.serverId, jobId, detail: `p2p:${discussionId}`,
+        });
+        if (update) void this.db.execute(update.sql, update.params).catch(() => {});
       }
       this.broadcastToBrowsers(JSON.stringify({ type: 'cron.p2p_linked', jobId, discussionId }));
       return;
@@ -9229,28 +9228,14 @@ export class WsBridge {
       if (jobId && detail) {
         // Accept results from independently-upgraded older daemons without
         // persisting their newline-joined cumulative streaming snapshots.
-        const params: unknown[] = [normalizeCronExecutionDetail(detail.slice(0, 4000))];
-        let sql = '';
-        if (executionId) {
-          if (status) {
-            sql = 'UPDATE cron_executions SET detail = $1, status = $2 WHERE id = $3';
-            params.push(status, executionId);
-          } else {
-            sql = 'UPDATE cron_executions SET detail = $1 WHERE id = $2';
-            params.push(executionId);
-          }
-        } else if (status) {
-          sql = `UPDATE cron_executions SET detail = $1, status = $2 WHERE id = (
-             SELECT id FROM cron_executions WHERE job_id = $3 ORDER BY created_at DESC LIMIT 1
-           )`;
-          params.push(status, jobId);
-        } else {
-          sql = `UPDATE cron_executions SET detail = $1 WHERE id = (
-             SELECT id FROM cron_executions WHERE job_id = $2 ORDER BY created_at DESC LIMIT 1
-           )`;
-          params.push(jobId);
-        }
-        void this.db.execute(sql, params).catch(() => {});
+        const update = buildCronExecutionResultUpdate({
+          authenticatedServerId: this.serverId,
+          jobId,
+          ...(executionId ? { executionId } : {}),
+          ...(status ? { status } : {}),
+          detail: normalizeCronExecutionDetail(detail.slice(0, 4000)),
+        });
+        if (update) void this.db.execute(update.sql, update.params).catch(() => {});
       }
       return;
     }

@@ -8372,8 +8372,8 @@ describe('WsBridge', () => {
       await flushAsync();
 
       expect(execSpy).toHaveBeenCalledWith(
-        'UPDATE cron_executions SET detail = $1, status = $2 WHERE id = $3',
-        ['busy', 'skipped_busy', 'exec-1'],
+        'UPDATE cron_executions SET detail = $1, status = $2 WHERE id = $4 AND job_id = $5 AND job_id IN (SELECT id FROM cron_jobs WHERE server_id = $3)',
+        ['busy', 'skipped_busy', serverId, 'exec-1', 'job-1'],
       );
     });
 
@@ -8402,8 +8402,8 @@ describe('WsBridge', () => {
       await flushAsync();
 
       expect(execSpy).toHaveBeenCalledWith(
-        'UPDATE cron_executions SET detail = $1 WHERE id = $2',
-        ['主人开始今日任务执行并检查结果完成。', 'exec-stream'],
+        'UPDATE cron_executions SET detail = $1 WHERE id = $3 AND job_id = $4 AND job_id IN (SELECT id FROM cron_jobs WHERE server_id = $2)',
+        ['主人开始今日任务执行并检查结果完成。', serverId, 'exec-stream', 'job-stream'],
       );
     });
   });
