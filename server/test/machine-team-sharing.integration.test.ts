@@ -129,8 +129,11 @@ describe('associating a machine with a team', () => {
     expect(await roleFor(colleague), 'a plain member gets the group grant').toBe('participant');
     expect(await resolveControlledMachineManagementAccess(db, colleague, serverId, Date.now()))
       .toBeNull();
-    expect((await resolveControlledMachineManagementAccess(db, admin, serverId, Date.now()))?.access_role)
+    // Security-relevant management is the owner's alone: a group admin gets none of it; only a rename (a label) reaches group admins.
+    expect(await resolveControlledMachineManagementAccess(db, admin, serverId, Date.now())).toBeNull();
+    expect((await resolveControlledMachineManagementAccess(db, admin, serverId, Date.now(), 'rename'))?.access_role)
       .toBe('participant');
+    expect(await resolveControlledMachineManagementAccess(db, colleague, serverId, Date.now(), 'rename')).toBeNull();
     expect(await roleFor(stranger)).toBeUndefined();
   });
 

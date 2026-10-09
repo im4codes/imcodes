@@ -301,29 +301,27 @@ describe('controlled-node sharing reuses grants without becoming a shared Tab', 
       expect((await request).status, 'Participant must not manage the sharing relationship').toBe(403);
     }
 
+    // Device management (rename, exec switch, auto-unlock, worker, revoke) is the OWNER's alone: a Participant is refused with 404, the
+    // same as a stranger, and nothing about the device changes (F-02).
     const operationMatrix = [
-      ['/api/machines/' + serverId + '/display-name', { displayName: 'Participant renamed' }, 200],
-      // The exec switch is the device OWNER's alone: a participant cannot turn execution off or back on (owner_only, not a missing route).
-      ['/api/machines/' + serverId + '/exec-enabled', { enabled: false }, 403],
-      ['/api/machines/' + serverId + '/exec-enabled', { enabled: true }, 403],
-      ['/api/machines/' + serverId + '/auto-unlock', { secret: 'participant-supplied' }, 409],
-      ['/api/machines/' + serverId + '/remote-desktop-worker', {}, 409],
+      ['/api/machines/' + serverId + '/display-name', { displayName: 'Participant renamed' }],
+      ['/api/machines/' + serverId + '/exec-enabled', { enabled: false }],
+      ['/api/machines/' + serverId + '/exec-enabled', { enabled: true }],
+      ['/api/machines/' + serverId + '/auto-unlock', { secret: 'participant-supplied' }],
+      ['/api/machines/' + serverId + '/remote-desktop-worker', {}],
+      ['/api/machines/' + serverId + '/revoke', {}],
     ] as const;
-    for (const [path, body, expectedStatus] of operationMatrix) {
+    for (const [path, body] of operationMatrix) {
       const response = await app.request(path, {
         method: 'POST', headers: webAuth(recipientId), body: JSON.stringify(body),
       });
-      expect(response.status, `${path} must pass Participant authorization`).toBe(expectedStatus);
-      expect(response.status, `${path} must not retain an owner-only guard`).not.toBe(404);
+      expect(response.status, `${path} must be owner-only`).toBe(404);
     }
-
-    const revoke = await app.request(`/api/machines/${serverId}/revoke`, {
-      method: 'POST',
-      headers: webAuth(recipientId),
-    });
-    expect(revoke.status).toBe(200);
-    expect(await (await app.request('/api/machines', { headers: webAuth(recipientId) })).json())
-      .toEqual({ machines: [] });
+    expect(await db.queryOne<{ revoked_at: number | null; display_name: string | null }>(
+      'SELECT revoked_at, display_name FROM servers WHERE id = $1', [serverId],
+    )).toMatchObject({ revoked_at: null });
+    const listed = await (await app.request('/api/machines', { headers: webAuth(recipientId) })).json() as { machines: { serverId: string }[] };
+    expect(listed.machines.map((machine) => machine.serverId)).toContain(serverId);
   });
 });
 
