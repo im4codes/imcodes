@@ -142,8 +142,8 @@ function cleanRuntimeServerId(serverId: string | null | undefined): string | nul
   return typeof serverId === 'string' && serverId.trim() ? serverId.trim() : null;
 }
 
-function cronUrl(endpoint: CronServerEndpoint, runtimeServerId: string, suffix = ''): string {
-  return `${cleanBaseUrl(endpoint.workerUrl)}/api/server/${encodeURIComponent(runtimeServerId)}/cron${suffix}`;
+function cronUrl(endpoint: CronServerEndpoint, runtimeServerId: string, suffix: string, method: DaemonHttpMethod): string {
+  return daemonApiUrl(cleanBaseUrl(endpoint.workerUrl), method, `/api/server/${encodeURIComponent(runtimeServerId)}/cron${suffix}`);
 }
 
 async function getEndpoint(
@@ -205,8 +205,7 @@ async function requestCron(
       : Intl.DateTimeFormat().resolvedOptions().timeZone,
   );
   try {
-    const url = new URL(cronUrl(endpoint, runtimeServerId, pathSuffix));
-    const res = await fetchImpl(daemonApiUrl(endpoint.workerUrl, (init.method ?? 'GET') as DaemonHttpMethod, url.pathname + url.search), {
+    const res = await fetchImpl(cronUrl(endpoint, runtimeServerId, pathSuffix, (init.method ?? 'GET') as DaemonHttpMethod), {
       ...init,
       headers: {
         // The credential names the BOUND server (the token belongs to it); the route names the server the job is for.
