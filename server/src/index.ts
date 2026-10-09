@@ -90,7 +90,6 @@ import {
 } from '../../shared/remote-desktop.js';
 import {
   SHARE_REASONS,
-  SHARE_WS_TICKET_TYPE,
   parseShareWsTicketClaims,
   resolveShareCoverageFromDb,
 } from './ws/share-policy.js';
@@ -119,6 +118,7 @@ import {
   type RemoteDesktopUnattendedPasswordProofService,
 } from './services/remote-desktop-unattended-password.js';
 import { createPostgresRemoteDesktopEndpointEligibility } from './services/remote-desktop-host-identity.js';
+import { isAccountSessionJwt } from './security/account-session-jwt.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 // Docker: /app/dist/index.js → /app/web/dist
@@ -704,7 +704,7 @@ async function handlePreviewWsUpgrade(
   const sessionCookieToken = parseCookieHeader(req.headers['cookie'] ?? '', COOKIE_SESSION);
   if (sessionCookieToken && env.JWT_SIGNING_KEY) {
     const payload = verifyJwt(sessionCookieToken, env.JWT_SIGNING_KEY);
-    if (payload && typeof payload.sub === 'string' && payload.type !== 'ws-ticket' && payload.type !== SHARE_WS_TICKET_TYPE) {
+    if (isAccountSessionJwt(payload)) {
       sessionUserId = payload.sub;
     }
   }

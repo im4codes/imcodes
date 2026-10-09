@@ -61,7 +61,7 @@ async function resolveUserId(c: AnyAuthContext): Promise<string | null> {
   const cookieToken = cookieMatch ? decodeURIComponent(cookieMatch[1]) : null;
   if (cookieToken && c.env.JWT_SIGNING_KEY) {
     const jwt = verifyJwt(cookieToken, c.env.JWT_SIGNING_KEY);
-    if (jwt && typeof jwt.sub === 'string' && jwt.type !== 'ws-ticket' && jwt.type !== 'share-ws-ticket') {
+    if (isAccountSessionJwt(jwt)) {
       const user = await getUserById(c.env.DB, jwt.sub);
       if (user && user.status === 'active') return user.id;
     }
@@ -73,7 +73,7 @@ async function resolveUserId(c: AnyAuthContext): Promise<string | null> {
 
   // Try JWT first (web session tokens) — reject single-use ws-ticket tokens
   const jwtBearer = verifyJwt(bearerToken, c.env.JWT_SIGNING_KEY);
-  if (jwtBearer && typeof jwtBearer.sub === 'string' && jwtBearer.type !== 'ws-ticket' && jwtBearer.type !== 'share-ws-ticket') {
+  if (isAccountSessionJwt(jwtBearer)) {
     const user = await getUserById(c.env.DB, jwtBearer.sub);
     if (user && user.status === 'active') return user.id;
   }
@@ -637,6 +637,8 @@ authRoutes.delete('/user/me', async (c) => {
 // ── Password auth ─────────────────────────────────────────────────────────
 
 import { validatePasswordComplexity, USERNAME_REGEX } from '../../../shared/password-rules.js';
+import { isAccountSessionJwt } from '../security/account-session-jwt.js';
+import { ACCOUNT_SESSION_JWT_TYPE } from '../../../shared/auth-token-types.js';
 
 // POST /api/auth/password/register — create a new user with username + password
 const passwordRegisterSchema = z.object({
@@ -706,7 +708,7 @@ authRoutes.post('/password/register', async (c) => {
 
   // Issue session
   const isSecure = (c.req.header('x-forwarded-proto') ?? c.req.url).includes('https');
-  const accessToken = signJwt({ sub: userId, type: 'web' }, c.env.JWT_SIGNING_KEY, 4 * 3600);
+  const accessToken = signJwt({ sub: userId, type: ACCOUNT_SESSION_JWT_TYPE }, c.env.JWT_SIGNING_KEY, 4 * 3600);
   const refreshRaw = randomHex(32);
   const refreshHash = sha256Hex(refreshRaw);
   await c.env.DB.execute(
@@ -795,7 +797,7 @@ authRoutes.post('/password/login', async (c) => {
   }
 
   // Issue access (4h) + refresh (30d) tokens
-  const accessToken = signJwt({ sub: user.id, type: 'web' }, c.env.JWT_SIGNING_KEY, 4 * 3600);
+  const accessToken = signJwt({ sub: user.id, type: ACCOUNT_SESSION_JWT_TYPE }, c.env.JWT_SIGNING_KEY, 4 * 3600);
   const refreshRaw = randomHex(32);
   const refreshHash = sha256Hex(refreshRaw);
   const familyId = randomHex(16);

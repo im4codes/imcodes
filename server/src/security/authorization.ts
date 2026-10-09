@@ -14,7 +14,7 @@ import {
   resolveControlledMachineOperatorAccess,
 } from '../share/machine-access.js';
 import { resolveEffectiveShareCoverage } from '../db/tab-sharing.js';
-import { SHARED_MACHINE_AUTHORITY_TYPE } from '../../../shared/shared-machine-authority.js';
+import { isAccountSessionJwt } from './account-session-jwt.js';
 
 export type Role = 'owner' | 'admin' | 'member' | 'unauthenticated';
 
@@ -38,8 +38,7 @@ export async function resolveAuth(c: Pick<Context<{ Bindings: Env }>, 'req' | 'e
   const cookieToken = getCookieFromHeader(c.req.header('Cookie'), COOKIE_SESSION);
   if (cookieToken && c.env.JWT_SIGNING_KEY) {
     const payload = verifyJwt(cookieToken, c.env.JWT_SIGNING_KEY);
-    if (payload && typeof payload.sub === 'string' && payload.type !== 'ws-ticket'
-      && payload.type !== 'share-ws-ticket' && payload.type !== SHARED_MACHINE_AUTHORITY_TYPE) {
+    if (isAccountSessionJwt(payload)) {
       return { userId: payload.sub, role: (payload.role as Role) ?? 'member' };
     }
   }
@@ -100,9 +99,7 @@ export async function resolveBearerAuth(
   if (!c.env.JWT_SIGNING_KEY) return null;
   const payload = verifyJwt(token, c.env.JWT_SIGNING_KEY);
   if (!payload) return null;
-  if (typeof payload.sub !== 'string') return null;
-  if (payload.type === 'ws-ticket' || payload.type === 'share-ws-ticket'
-    || payload.type === SHARED_MACHINE_AUTHORITY_TYPE) return null; // reject special-purpose capability tickets
+  if (!isAccountSessionJwt(payload)) return null; // special-purpose tokens (tickets, machine authority, capability blobs) are not logins
   return { userId: payload.sub, role: (payload.role as Role) ?? 'member' };
 }
 

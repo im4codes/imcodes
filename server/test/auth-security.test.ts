@@ -211,6 +211,53 @@ describe('share ticket auth boundary', () => {
   });
 });
 
+/**
+ * tsk_854675e1e2: a special-purpose JWT (the 24 h shared-session machine authority minted for a share participant, the capability
+ * blob token, a relay token) is signed with the same key and carries `sub`. The account-session checks in /api/auth/* excluded only
+ * the two ws tickets by name, so such a token was accepted as the user's login: a malicious daemon that saw a participant's
+ * machine-authority token could mint a persistent API key for that participant. Account auth now accepts ONLY tokens that are login
+ * tokens (no `type`, or type `web`), whatever other types are added later.
+ */
+describe('special-purpose JWTs are not account sessions', () => {
+  const SPECIAL_TYPES = ['shared-session-machine-authority', 'capability-blob', 'auth-relay', 'ws-ticket', 'share-ws-ticket', 'something-added-next-year'];
+
+  it.each(SPECIAL_TYPES)('%s is refused as a Bearer token and as a session cookie, a login token is accepted', async (type) => {
+    const env = makeEnv();
+    const app = buildApp(env);
+    const { signJwt } = await import('../src/security/crypto.js');
+    const registered = await app.request('/api/auth/register', { method: 'POST' });
+    const { userId } = await registered.json() as { userId: string };
+
+    const special = signJwt({ type, sub: userId, sourceServerId: 'srv-1' }, env.JWT_SIGNING_KEY, 60);
+    const viaBearer = await app.request('/api/auth/user/me', { headers: { Authorization: `Bearer ${special}` } });
+    const viaCookie = await app.request('/api/auth/user/me', { headers: { Cookie: `${COOKIE_SESSION}=${encodeURIComponent(special)}` } });
+    expect(viaBearer.status).toBe(401);
+    expect(viaCookie.status).toBe(401);
+
+    for (const login of [signJwt({ sub: userId }, env.JWT_SIGNING_KEY, 60), signJwt({ sub: userId, type: 'web' }, env.JWT_SIGNING_KEY, 60)]) {
+      expect((await app.request('/api/auth/user/me', { headers: { Authorization: `Bearer ${login}` } })).status).toBe(200);
+      expect((await app.request('/api/auth/user/me', { headers: { Cookie: `${COOKIE_SESSION}=${encodeURIComponent(login)}` } })).status).toBe(200);
+    }
+  });
+});
+
+describe('isAccountSessionJwt (the one place that decides what a login token is)', () => {
+  it('accepts a subject with no type or the web type, and nothing else', async () => {
+    const { isAccountSessionJwt } = await import('../src/security/account-session-jwt.js');
+    expect(isAccountSessionJwt({ sub: 'u' })).toBe(true);
+    expect(isAccountSessionJwt({ sub: 'u', type: 'web' })).toBe(true);
+    expect(isAccountSessionJwt({ sub: 'u', type: 'ws-ticket' })).toBe(false);
+    expect(isAccountSessionJwt({ sub: 'u', type: 'shared-session-machine-authority' })).toBe(false);
+    expect(isAccountSessionJwt({ sub: 'u', type: '' })).toBe(false);
+    expect(isAccountSessionJwt({ sub: 'u', type: null })).toBe(false);
+    expect(isAccountSessionJwt({ type: 'web' })).toBe(false);
+    expect(isAccountSessionJwt({ sub: '' })).toBe(false);
+    expect(isAccountSessionJwt({ sub: 7 })).toBe(false);
+    expect(isAccountSessionJwt(null)).toBe(false);
+    expect(isAccountSessionJwt(undefined)).toBe(false);
+  });
+});
+
 describe('browser identity expectation boundary', () => {
   it('rejects a stale rendered identity before an authenticated route executes', async () => {
     const env = makeEnv();

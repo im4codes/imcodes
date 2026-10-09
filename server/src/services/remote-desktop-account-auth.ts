@@ -2,6 +2,7 @@ import { createHash, randomBytes } from 'node:crypto';
 import type { Database } from '../db/client.js';
 import { verifyJwt } from '../security/crypto.js';
 import { COOKIE_SESSION } from '../../../shared/cookie-names.js';
+import { isAccountSessionJwt } from '../security/account-session-jwt.js';
 
 export const REMOTE_DESKTOP_NATIVE_CLIENT = Object.freeze({
   clientId: 'imcodes-controlled-shell-v1',
@@ -250,8 +251,7 @@ export async function resolveBrowserAccountSession(
   const token = parseCookie(cookieHeader, COOKIE_SESSION);
   if (!token) return null;
   const payload = verifyJwt(token, jwtSigningKey);
-  if (!payload || typeof payload.sub !== 'string') return null;
-  if (payload.type === 'ws-ticket' || payload.type === 'share-ws-ticket') return null;
+  if (!isAccountSessionJwt(payload)) return null;
   const session = {
     kind: 'web',
     id: hashDomain(WEB_SESSION_HASH_DOMAIN, token),
@@ -270,8 +270,7 @@ export async function revokeBrowserAccountSession(
   const token = parseCookie(cookieHeader, COOKIE_SESSION);
   if (!token) return false;
   const payload = verifyJwt(token, jwtSigningKey);
-  if (!payload || typeof payload.sub !== 'string') return false;
-  if (payload.type === 'ws-ticket' || payload.type === 'share-ws-ticket') return false;
+  if (!isAccountSessionJwt(payload)) return false;
   const expiresAt = typeof payload.exp === 'number' && Number.isSafeInteger(payload.exp)
     ? Math.max(now + 1, payload.exp * 1000)
     : now + 4 * 60 * 60 * 1000;

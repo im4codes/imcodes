@@ -4,6 +4,7 @@ import type { Env } from '../env.js';
 import { createUser, getUserByPlatformId, upsertPlatformIdentity } from '../db/queries.js';
 import { randomHex, sha256Hex, signJwt, verifyJwt } from '../security/crypto.js';
 import logger from '../util/logger.js';
+import { ACCOUNT_SESSION_JWT_TYPE } from '../../../shared/auth-token-types.js';
 
 export const githubAuthRoutes = new Hono<{ Bindings: Env; Variables: { userId: string; role: string } }>();
 
@@ -203,7 +204,7 @@ githubAuthRoutes.get('/callback', async (c): Promise<Response> => {
   const isSecure = c.env.NODE_ENV === 'production';
 
   // Task 5: Issue 4-hour access token
-  const accessToken = signJwt({ sub: userId, type: 'web' }, c.env.JWT_SIGNING_KEY, 4 * 3600);
+  const accessToken = signJwt({ sub: userId, type: ACCOUNT_SESSION_JWT_TYPE }, c.env.JWT_SIGNING_KEY, 4 * 3600);
 
   // Task 5: Issue refresh token and persist to DB
   const refreshRaw = randomHex(32);
