@@ -12,6 +12,8 @@ import { SHARE_MESSAGE_LANE, shareBrowserMessageLane } from '../src/ws/share-lan
 import { resetSharedCommandRateLimitsForTests } from '../src/share/share-rate-limit.js';
 import { shareCancelDispatchDenial } from '../../shared/tab-sharing.js';
 import { DAEMON_COMMAND_TYPES } from '../../shared/daemon-command-types.js';
+import { SHARED_MACHINE_AUTHORITY_FIELD } from '../../shared/shared-machine-authority.js';
+import { verifyJwt } from '../src/security/crypto.js';
 
 class MockWs extends EventEmitter {
   sent: Array<string | Buffer> = [];
@@ -238,6 +240,118 @@ describe('share participant command hot path', () => {
     expect(shareBrowserMessageLane(JSON.stringify({ type: 'session.resize', cols: 80 }))).toBe(SHARE_MESSAGE_LANE.INPUT);
     expect(shareBrowserMessageLane(JSON.stringify({ type: 'session.send', text: 'x' }))).toBe(SHARE_MESSAGE_LANE.COMMAND);
     expect(shareBrowserMessageLane(JSON.stringify({ text: 'x', type: 'session.cancel' }))).toBe(SHARE_MESSAGE_LANE.COMMAND);
+  });
+});
+
+describe('participant terminal input carries the participant actor (process sessions)', () => {
+  const target: ShareTarget = { kind: 'main', serverId: 'srv', sessionName: 'deck_proj_brain' };
+  const state = (role: 'viewer' | 'participant') => ({
+    userId: 'alice', actorDisplayName: 'Alice', ticketId: 't', target, snapshot: coverage(target, role, 1_000), connectedAt: 1_000,
+  });
+  const decide = (msg: Record<string, unknown>, role: 'viewer' | 'participant' = 'participant') => evaluateShareCommand({
+    msg, state: state(role), now: 1_000, runtimeType: 'unknown', activeDispatchId: null,
+  });
+
+  it('stamps session.input with the server-built participant actor and drops client-supplied identity', () => {
+    const decision = decide({
+      type: DAEMON_COMMAND_TYPES.SESSION_INPUT, sessionName: 'deck_proj_brain', data: 'ls\r',
+      sharedActor: { actorUserId: 'owner', effectiveActorRole: 'owner' },
+      [SHARED_MACHINE_AUTHORITY_FIELD]: 'forged-token',
+    });
+    expect(decision.allowed).toBe(true);
+    const stamped = (decision as { stampedMessage?: Record<string, unknown> }).stampedMessage!;
+    expect(stamped.data).toBe('ls\r');
+    expect(stamped.sharedActor).toMatchObject({ actorUserId: 'alice', effectiveActorRole: 'participant' });
+    expect(stamped).not.toHaveProperty(SHARED_MACHINE_AUTHORITY_FIELD);
+  });
+
+  it('still denies a viewer and a session the share does not cover, and stamps nothing else that never feeds an agent', () => {
+    expect(decide({ type: DAEMON_COMMAND_TYPES.SESSION_INPUT, sessionName: 'deck_proj_brain', data: 'x' }, 'viewer'))
+      .toMatchObject({ allowed: false });
+    expect(decide({ type: DAEMON_COMMAND_TYPES.SESSION_INPUT, sessionName: 'deck_other_brain', data: 'x' }))
+      .toMatchObject({ allowed: false });
+    expect(decide({ type: DAEMON_COMMAND_TYPES.SESSION_RESIZE, sessionName: 'deck_proj_brain', cols: 80, rows: 24 }))
+      .toEqual({ allowed: true });
+  });
+
+  it('control keys (ESC, Ctrl-C) are ordinary stamped input: stop stays usable', () => {
+    for (const data of ['\u001b', '\u0003']) {
+      const decision = decide({ type: DAEMON_COMMAND_TYPES.SESSION_INPUT, sessionName: 'deck_proj_brain', data });
+      expect(decision).toMatchObject({ allowed: true, stampedMessage: { data, sharedActor: { effectiveActorRole: 'participant' } } });
+    }
+  });
+});
+
+describe('participant keystrokes through the bridge', () => {
+  let serverId: string;
+  beforeEach(() => {
+    serverId = `share-input-${Math.random().toString(36).slice(2)}`;
+    __setShareBridgeClockForTests(() => Date.now());
+    resetSharedCommandRateLimitsForTests();
+  });
+
+  /** The counting DB, plus the session binding lookup a machine-authority mint needs. */
+  function dbWithBinding(counts: { n: number; audits: number }, bindings: { n: number; fail?: boolean }) {
+    const db = makeCountingDb(() => 0, counts) as unknown as { queryOne: (sql: string, params?: unknown[]) => Promise<unknown> };
+    const inner = db.queryOne.bind(db);
+    db.queryOne = async (sql: string, params?: unknown[]) => {
+      if (sql.includes('SELECT project_name FROM sessions')) {
+        bindings.n += 1;
+        return bindings.fail ? null : { project_name: 'proj' };
+      }
+      return inner(sql, params);
+    };
+    return db as never;
+  }
+
+  const stampedInputs = (daemon: MockWs) => daemon.json.filter((m) => m.type === DAEMON_COMMAND_TYPES.SESSION_INPUT);
+
+  it('stamps every keystroke, replaces a forged identity, and mints one token per window instead of per keystroke', async () => {
+    const counts = { n: 0, audits: 0 };
+    const bindings = { n: 0 };
+    const { daemon, ws } = await connect(serverId, dbWithBinding(counts, bindings));
+    ws.emit('message', JSON.stringify({
+      type: DAEMON_COMMAND_TYPES.SESSION_INPUT, sessionName: 'deck_proj_brain', data: 'a',
+      sharedActor: { actorUserId: 'owner', effectiveActorRole: 'owner' }, [SHARED_MACHINE_AUTHORITY_FIELD]: 'forged',
+    }));
+    while (stampedInputs(daemon).length < 1) await sleep(2);
+    for (let i = 0; i < 30; i += 1) ws.emit('message', input(String(i % 10)));
+    const deadline = Date.now() + 3_000;
+    while (stampedInputs(daemon).length < 31 && Date.now() < deadline) await sleep(2);
+    const sent = stampedInputs(daemon);
+    expect(sent).toHaveLength(31);
+    for (const message of sent) {
+      expect(message.sharedActor).toMatchObject({ actorUserId: 'u', effectiveActorRole: 'participant' });
+    }
+    const tokens = new Set(sent.map((message) => String(message[SHARED_MACHINE_AUTHORITY_FIELD])));
+    expect(tokens.size).toBe(1);
+    const token = [...tokens][0]!;
+    expect(token).not.toBe('forged');
+    expect(verifyJwt(token, 'share-hot-path-key')).toMatchObject({ sub: 'u', sessionName: 'deck_proj_brain', projectName: 'proj' });
+    expect(bindings.n).toBe(1);
+  });
+
+  it('refreshes the token after the reuse window, and never reads the DB per keystroke even when it cannot mint', async () => {
+    let now = Date.now();
+    __setShareBridgeClockForTests(() => now);
+    const counts = { n: 0, audits: 0 };
+    const bindings = { n: 0, fail: true };
+    const { daemon, ws } = await connect(serverId, dbWithBinding(counts, bindings));
+    for (let i = 0; i < 20; i += 1) { ws.emit('message', input('x')); await sleep(1); }
+    const deadline = Date.now() + 3_000;
+    while (stampedInputs(daemon).length < 20 && Date.now() < deadline) await sleep(2);
+    const failed = stampedInputs(daemon);
+    // No token could be minted: the keystrokes still go through (stop must keep working), stamped as the
+    // participant and carrying no authority, so the daemon fails closed for machine tools.
+    expect(failed).toHaveLength(20);
+    expect(failed.every((message) => message.sharedActor && !(SHARED_MACHINE_AUTHORITY_FIELD in message))).toBe(true);
+    expect(bindings.n).toBe(1);
+    now += 31_000;
+    bindings.fail = false;
+    ws.emit('message', input('y'));
+    while (stampedInputs(daemon).length < 21) await sleep(2);
+    expect(bindings.n).toBe(2);
+    expect(stampedInputs(daemon)[20]![SHARED_MACHINE_AUTHORITY_FIELD]).toEqual(expect.any(String));
   });
 });
 

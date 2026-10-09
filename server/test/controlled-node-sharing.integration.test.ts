@@ -36,7 +36,7 @@ import { createDaemonMachineToolDeps } from '../../src/daemon/machine-mcp-deps.j
 import { listMachines as daemonListMachines } from '../../src/daemon/machine-exec-client.js';
 import { registerMemoryMcpTools } from '../../src/daemon/memory-mcp-tools.js';
 import {
-  bindProcessSharedMachineAuthority,
+  bindProcessSharedMachineCommand,
   clearProcessSharedMachineAuthoritiesForTests,
   readProcessSharedMachineAuthority,
 } from '../../src/daemon/shared-machine-authority-context.js';
@@ -459,12 +459,14 @@ describe('controlled-node shared action admission', () => {
     // test must not operate the developer workstation's GUI.
     const runtimeIdentity = { sessionInstanceId: `instance-${hex(4)}`, runtimeEpoch: `epoch-${hex(4)}` };
     let callerIdentity = runtimeIdentity;
-    bindProcessSharedMachineAuthority(
+    // The same participant re-binding with a different token replaces the token
+    // (one window, one actor); an unusable token must still fail at the server.
+    const bindAdmittedCommand = (token: string): void => bindProcessSharedMachineCommand(
       sessionName,
       runtimeIdentity,
-      authority as string,
-      (admitted?.sharedActor as { effectiveActorRole?: unknown } | undefined)?.effectiveActorRole === 'participant',
+      { sharedActor: admitted?.sharedActor, sharedMachineAuthority: token },
     );
+    bindAdmittedCommand(authority as string);
     const localComputerUse = vi.fn(async ({ tool }: { tool: string }) => ({
       outcome: 'completed' as const,
       result: {
@@ -611,10 +613,10 @@ describe('controlled-node shared action admission', () => {
     expect((await app.request(`/api/machine/exec?serverId=${targetId}`, {
       method: 'POST', headers: forgedHeaders, body: JSON.stringify({ command: 'echo forged' }),
     })).status).toBe(403);
-    bindProcessSharedMachineAuthority(sessionName, runtimeIdentity, `${authority as string}x`, true);
+    bindAdmittedCommand(`${authority as string}x`);
     expect((await callLocal()).isError).toBe(true);
     expect(localComputerUse).toHaveBeenCalledTimes(1);
-    bindProcessSharedMachineAuthority(sessionName, runtimeIdentity, authority as string, true);
+    bindAdmittedCommand(authority as string);
 
     callerIdentity = { ...runtimeIdentity, runtimeEpoch: `${runtimeIdentity.runtimeEpoch}-stale` };
     const staleRuntimeLocal = await callLocal();
@@ -640,10 +642,10 @@ describe('controlled-node shared action admission', () => {
       body: JSON.stringify({ tool: 'list_apps' }),
     })).status).toBe(403);
 
-    bindProcessSharedMachineAuthority(sessionName, runtimeIdentity, wrongProject, true);
+    bindAdmittedCommand(wrongProject);
     expect((await callLocal()).isError).toBe(true);
     expect(localComputerUse).toHaveBeenCalledTimes(1);
-    bindProcessSharedMachineAuthority(sessionName, runtimeIdentity, authority as string, true);
+    bindAdmittedCommand(authority as string);
 
     const foreignOwnerId = `foreign-owner-${hex(4)}`;
     await createUser(db, foreignOwnerId);

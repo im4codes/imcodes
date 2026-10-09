@@ -2,6 +2,7 @@ import type { Database } from '../db/client.js';
 import { resolveEffectiveShareCoverage } from '../db/tab-sharing.js';
 import { evaluateP2pSendTargetScope } from '../share/p2p-send-scope.js';
 import { DAEMON_COMMAND_TYPES } from '../../../shared/daemon-command-types.js';
+import { SHARED_MACHINE_AUTHORITY_FIELD, SHARE_PROCESS_INPUT_COMMANDS } from '../../../shared/shared-machine-authority.js';
 import { TRANSPORT_MSG } from '../../../shared/transport-events.js';
 import { FS_TRANSPORT_MSG } from '../../../shared/fs-transport-messages.js';
 import { P2P_WORKFLOW_MSG } from '../../../shared/p2p-workflow-messages.js';
@@ -605,9 +606,27 @@ export function evaluateShareCommand(input: {
   }
 
   if (policy.kind === 'participant-covered-action') {
-    return targetlessCoveredForServerParticipant || (sessionName && shareStateCoversSession(input.state, sessionName))
-      ? { allowed: true }
-      : { allowed: false, reason: SHARE_REASONS.DIRECT_SURFACE_DENIED };
+    if (!(targetlessCoveredForServerParticipant || (sessionName && shareStateCoversSession(input.state, sessionName)))) {
+      return { allowed: false, reason: SHARE_REASONS.DIRECT_SURFACE_DENIED };
+    }
+    if (SHARE_PROCESS_INPUT_COMMANDS.has(type)) {
+      // Raw keystrokes drive a process session's agent exactly like a message
+      // does, so they carry the same server-stamped actor (the daemon binds the
+      // participant context from it) and never a client-supplied one.
+      const {
+        sharedActor: _clientActor,
+        [SHARED_MACHINE_AUTHORITY_FIELD]: _clientAuthority,
+        ...rest
+      } = input.msg;
+      return {
+        allowed: true,
+        stampedMessage: {
+          ...rest,
+          sharedActor: buildSharedActorEnvelope(input.state, `share-input-${input.state.userId}`, input.now),
+        },
+      };
+    }
+    return { allowed: true };
   }
 
   if (policy.kind === 'participant-model-switch') {

@@ -31,7 +31,7 @@ import { MemoryRateLimiter } from './rate-limiter.js';
 import { SHARE_MESSAGE_LANE, SHARE_MESSAGE_LANE_MAX_PENDING, shareBrowserMessageLane, type ShareMessageLane } from './share-lanes.js';
 import { randomHex, sha256Hex } from '../security/crypto.js';
 import { issueSharedMachineAuthorityForSession } from '../share/shared-machine-authority.js';
-import { SHARED_MACHINE_AUTHORITY_FIELD } from '../../../shared/shared-machine-authority.js';
+import { SHARED_MACHINE_AUTHORITY_FIELD, SHARE_PROCESS_INPUT_COMMANDS } from '../../../shared/shared-machine-authority.js';
 import { resolveServerRole } from '../security/authorization.js';
 import { DAEMON_MSG } from '../../../shared/daemon-events.js';
 import { TERMINAL_CONTROL, TERMINAL_STREAM_RESET_REASON } from '../../../shared/terminal-protocol.js';
@@ -1994,6 +1994,14 @@ const SHARE_COVERAGE_MAX_STALENESS_MS = 60_000;
  * that never reached this process can go unseen.
  */
 const SHARE_HOT_PATH_COVERAGE_TTL_MS = 5_000;
+/**
+ * A participant's terminal keystrokes reuse one machine-authority token per
+ * socket+session for this long, so the DB read and JWT mint behind it happen at
+ * most once per window, never per keystroke. The token is only a claim: the
+ * daemon hands it to the MCP child and the server re-verifies it and re-reads
+ * the live grant on every machine call, so reuse cannot outlive a revocation.
+ */
+const SHARE_INPUT_AUTHORITY_REUSE_MS = 30_000;
 /** Share-command audit rows that may be waiting to be written; beyond it new ones are dropped and counted. */
 const SHARE_AUDIT_MAX_PENDING = 500;
 
@@ -2429,6 +2437,8 @@ export class WsBridge {
   private shareCoverageEpoch = 0;
   /** The coverage re-read in progress for a socket; concurrent commands wait on it instead of each querying. */
   private shareCoverageRefreshes = new WeakMap<WebSocket, Promise<ShareScopedSocketState | null>>();
+  private shareInputAuthorityTokens = new WeakMap<WebSocket, Map<string, { token: string | null; at: number }>>();
+  private shareInputAuthorityMints = new WeakMap<WebSocket, Map<string, Promise<string | null>>>();
   private pendingShareAudits = 0;
   private browserDataReadRateLimiter = new MemoryRateLimiter();
 
@@ -7488,17 +7498,7 @@ export class WsBridge {
     });
     if (decision.allowed && sessionName && msg.type === 'session.send' && decision.stampedMessage) {
       const actor = decision.stampedMessage.sharedActor as SharedActorEnvelope | undefined;
-      const signingKey = this.directFileTransferTicketSigningKey;
-      const token = actor && signingKey && this.db
-        ? await issueSharedMachineAuthorityForSession(this.db, {
-            actorUserId: actor.actorUserId,
-            sourceServerId: this.serverId,
-            sessionName,
-            shareTarget: actor.snapshot.target,
-            actionId: actor.actionId,
-            signingKey,
-          })
-        : null;
+      const token = actor ? await this.issueShareMachineAuthority(actor, sessionName) : null;
       if (!token) {
         const denied: ShareCommandDecision = { allowed: false, reason: SHARE_REASONS.TARGET_UNAVAILABLE };
         this.queueShareCommandAudit(current, msg, denied);
@@ -7508,6 +7508,16 @@ export class WsBridge {
         ...decision.stampedMessage,
         [SHARED_MACHINE_AUTHORITY_FIELD]: token,
       };
+    } else if (decision.allowed && sessionName && typeof msg.type === 'string'
+      && SHARE_PROCESS_INPUT_COMMANDS.has(msg.type) && decision.stampedMessage) {
+      // Keystrokes are never refused for want of a token (ESC/Ctrl-C must keep
+      // working); without one the daemon still binds the participant context
+      // with no authority, so machine tools fail closed.
+      const actor = decision.stampedMessage.sharedActor as SharedActorEnvelope | undefined;
+      const token = actor ? await this.shareInputMachineAuthority(ws, actor, sessionName) : null;
+      if (token) {
+        decision.stampedMessage = { ...decision.stampedMessage, [SHARED_MACHINE_AUTHORITY_FIELD]: token };
+      }
     }
     if (decision.allowed && sessionName) {
       const rateLimitReason = this.evaluateShareScopedRateLimit(current, msg, sessionName, shareClockNow());
@@ -7519,6 +7529,57 @@ export class WsBridge {
     }
     this.queueShareCommandAudit(current, msg, decision);
     return decision;
+  }
+
+  private async issueShareMachineAuthority(actor: SharedActorEnvelope, sessionName: string): Promise<string | null> {
+    const signingKey = this.directFileTransferTicketSigningKey;
+    if (!signingKey || !this.db) return null;
+    return issueSharedMachineAuthorityForSession(this.db, {
+      actorUserId: actor.actorUserId,
+      sourceServerId: this.serverId,
+      sessionName,
+      shareTarget: actor.snapshot.target,
+      actionId: actor.actionId,
+      signingKey,
+    });
+  }
+
+  /** Per socket+session token for a participant's keystrokes; see SHARE_INPUT_AUTHORITY_REUSE_MS. */
+  private async shareInputMachineAuthority(
+    ws: WebSocket,
+    actor: SharedActorEnvelope,
+    sessionName: string,
+  ): Promise<string | null> {
+    let perSession = this.shareInputAuthorityTokens.get(ws);
+    if (!perSession) {
+      perSession = new Map();
+      this.shareInputAuthorityTokens.set(ws, perSession);
+    }
+    const cached = perSession.get(sessionName);
+    const now = shareClockNow();
+    // A clock that went backwards never extends the window. A failed mint is
+    // remembered for the window too (token null): a session the server cannot
+    // bind must not turn every keystroke into a DB read.
+    if (cached && now >= cached.at && now - cached.at < SHARE_INPUT_AUTHORITY_REUSE_MS) return cached.token;
+    const inFlight = this.shareInputAuthorityMints.get(ws)?.get(sessionName);
+    if (inFlight) return inFlight;
+    const run = this.issueShareMachineAuthority(actor, sessionName)
+      .catch(() => null)
+      .then((token) => {
+        perSession.set(sessionName, { token, at: shareClockNow() });
+        return token;
+      })
+      .finally(() => {
+        const mints = this.shareInputAuthorityMints.get(ws);
+        mints?.delete(sessionName);
+      });
+    let mints = this.shareInputAuthorityMints.get(ws);
+    if (!mints) {
+      mints = new Map();
+      this.shareInputAuthorityMints.set(ws, mints);
+    }
+    mints.set(sessionName, run);
+    return run;
   }
 
   private shareCoverageIsFresh(state: ShareScopedSocketState): boolean {

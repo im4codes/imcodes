@@ -32,7 +32,7 @@ import { terminalStreamer, type StreamSubscriber } from './terminal-streamer.js'
 import { terminalInputNeedsSessionMutex } from './terminal-input.js';
 import type { ServerLink } from './server-link.js';
 import { timelineEmitter } from './timeline-emitter.js';
-import { bindProcessSharedMachineAuthority } from './shared-machine-authority-context.js';
+import { bindProcessSharedMachineCommand } from './shared-machine-authority-context.js';
 import {
   emitTransportUserMessage as emitTransportUserMessageEvent,
   persistTransportUserMessage,
@@ -4625,14 +4625,9 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
   // Transport sessions — route directly to the provider runtime, bypassing tmux.
   const transportRuntime = getTransportRuntime(sessionName);
   const record = (await import('../store/session-store.js')).getSession(sessionName);
-  bindProcessSharedMachineAuthority(
-    sessionName,
-    record?.sessionInstanceId && record.runtimeEpoch
-      ? { sessionInstanceId: record.sessionInstanceId, runtimeEpoch: record.runtimeEpoch }
-      : null,
-    sharedMachineAuthority,
-    sharedActor?.effectiveActorRole === 'participant',
-  );
+  // Records who fed the session. A participant's turn is never cleared by a
+  // later owner message: the window ends only when the session goes idle.
+  bindProcessSharedMachineCommand(sessionName, record, cmd);
 
   // F4 fix (audit f395d49c-78c) — fail closed when the session record is missing.
   //
@@ -6100,6 +6095,12 @@ async function handleInput(cmd: Record<string, unknown>, serverLink: ServerLink)
     }
     return;
   }
+
+  // Keystrokes feed the agent too: a participant's input binds the participant
+  // context (the server stamped it), an unstamped one is owner activity. A Map
+  // update only: no I/O on the keystroke path. Control keys (ESC / Ctrl-C) are
+  // bound like any other input and stay usable; they do not unlock anything.
+  bindProcessSharedMachineCommand(sessionName, getSession(sessionName), cmd);
 
   // node-pty writes are synchronous once the ConPTY module is loaded.  Do not
   // queue browser keystrokes behind the process-send mutex on Windows: that

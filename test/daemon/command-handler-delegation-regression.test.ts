@@ -50,6 +50,8 @@ vi.mock('../../src/agent/session-manager.js', () => ({
 }));
 
 vi.mock('../../src/agent/tmux.js', () => ({
+  BACKEND: 'tmux',
+  preparePrivateInputWriter: vi.fn(),
   sendKeys: vi.fn(),
   sendKeysDelayedEnter: vi.fn(),
   sendRawInput: vi.fn(),
@@ -162,6 +164,66 @@ describe('command-handler delegation routing behavior', () => {
 
     expect(readProcessSharedMachineAuthority('deck_proj_brain', identity))
       .toEqual({ required: true, authority: null });
+  });
+
+  describe('process session: who fed the terminal / agent in this turn', () => {
+    const identity = { sessionInstanceId: 'instance-shared-3', runtimeEpoch: 'epoch-shared-3' };
+    const participantActor = { actorUserId: 'participant-1', effectiveActorRole: 'participant', actionId: 'action-3' };
+    beforeEach(() => {
+      getSessionMock.mockReturnValue({
+        name: 'deck_proj_brain', projectName: 'proj', projectDir: '/repo', role: 'brain',
+        agentType: 'shell', runtimeType: 'process', state: 'idle', ...identity,
+      });
+    });
+    const input = (extra: Record<string, unknown> = {}) => handleWebCommand({
+      type: 'session.input', sessionName: 'deck_proj_brain', data: 'echo hi\r', ...extra,
+    }, serverLink() as any);
+    const send = (extra: Record<string, unknown> = {}) => handleWebCommand({
+      type: 'session.send', session: 'deck_proj_brain', text: 'hello', commandId: `cmd-${Math.random()}`, ...extra,
+    }, serverLink() as any);
+    const hook = () => readProcessSharedMachineAuthority('deck_proj_brain', identity);
+
+    it('D3/D6: participant keystrokes bind the participant context even when the last admitted turn was the owner\'s', async () => {
+      await send();
+      await flushAsync();
+      expect(hook()).toEqual({ required: false, authority: null });
+      input({ sharedActor: participantActor, sharedMachineAuthority: 'input-token' });
+      await flushAsync();
+      // Owner turn + participant keystrokes in one running turn: closed, never the owner's authority.
+      expect(hook()).toEqual({ required: true, authority: null });
+    });
+
+    it('participant keystrokes alone are bound to that participant; with no token they fail closed', async () => {
+      input({ sharedActor: participantActor, sharedMachineAuthority: 'input-token' });
+      await flushAsync();
+      expect(hook()).toEqual({ required: true, authority: 'input-token' });
+      clearProcessSharedMachineAuthoritiesForTests();
+      input({ sharedActor: participantActor });
+      await flushAsync();
+      expect(hook()).toEqual({ required: true, authority: null });
+    });
+
+    it('D2: an owner message after a participant message does not clear the restriction', async () => {
+      await send({ sharedActor: participantActor, sharedMachineAuthority: 'send-token' });
+      await flushAsync();
+      expect(hook()).toEqual({ required: true, authority: 'send-token' });
+      await send();
+      await flushAsync();
+      expect(hook()).toEqual({ required: true, authority: null });
+    });
+
+    it('owner-only keystrokes and messages keep the unrestricted path', async () => {
+      input();
+      await send();
+      await flushAsync();
+      expect(hook()).toEqual({ required: false, authority: null });
+    });
+
+    it('a forged sharedActor on a participant-less (owner) frame cannot widen anything: it is only ever a restriction', async () => {
+      input({ sharedActor: { actorUserId: 'x', effectiveActorRole: 'owner' }, sharedMachineAuthority: 'ignored-for-owner' });
+      await flushAsync();
+      expect(hook()).toEqual({ required: false, authority: null });
+    });
   });
 
   it('dispatches valid delegation once and emits delegated ack metadata through timeline and reliable ack', async () => {

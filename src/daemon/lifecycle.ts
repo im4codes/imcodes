@@ -29,6 +29,7 @@ import { isP2pParticipantMemoryNoise } from './p2p-memory-filter.js';
 import { handlePreviewBinaryFrame } from './preview-relay.js';
 import { buildSessionList, resolveAuthoritativeSessionListState } from './session-list.js';
 import { timelineEmitter } from './timeline-emitter.js';
+import { releaseProcessSharedMachineAuthority } from './shared-machine-authority-context.js';
 import { isDuplicateTimelineForward } from './timeline-forward-dedup.js';
 import type { TimelineEvent } from './timeline-event.js';
 import { attachDaemonUserNotice, DAEMON_USER_NOTICE_CODE } from '../../shared/daemon-user-notices.js';
@@ -1142,6 +1143,8 @@ export async function startup(): Promise<DaemonContext> {
     liveContextIngestion.handleTimelineEvent(e);
     if (e.type === 'session.state' && (e.payload as Record<string, unknown>).state === 'idle') {
       notifySessionIdle(e.sessionId);
+      // The turn is over: a participant's machine-authority window on a process session ends here.
+      releaseProcessSharedMachineAuthority(e.sessionId);
       void drainQueue(e.sessionId);
     }
   });

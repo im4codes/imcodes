@@ -1108,7 +1108,7 @@ export async function startHookServer(
         const processContext = readProcessSharedMachineAuthority(session.name, {
           sessionInstanceId: session.sessionInstanceId,
           runtimeEpoch: session.runtimeEpoch,
-        });
+        }, Date.now(), session.state === 'running');
         const required = runtime?.requiresSharedMachineAuthority() ?? processContext.required;
         const authority = runtime?.getActiveSharedMachineAuthority() ?? processContext.authority;
         if (required && !authority) {
