@@ -70,7 +70,8 @@ export async function insertControlledServerWithNodeId(
          (id, user_id, name, token_hash, status, created_at, node_role, exec_enabled,
           ref_name, display_name, os, arch, host_server_id, bound_with_key_id,
           team_id, node_id)
-       VALUES ($1, $2, $3, $4, 'offline', $5, 'controlled', true,
+       -- Execution starts OFF: the owner switches it on for a device they mean to run commands on.
+       VALUES ($1, $2, $3, $4, 'offline', $5, 'controlled', false,
                $6, $7, $8, $9, $10, $11, $12, $13)
        ON CONFLICT (node_id) WHERE node_role = 'controlled' DO NOTHING
        RETURNING node_id`,

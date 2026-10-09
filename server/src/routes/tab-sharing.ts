@@ -13,10 +13,12 @@ import {
   deriveShareTransitionKey,
   listActiveSharesForUser,
   listManagedShares,
+  listServerShareExecGrants,
   normalizeExistingShareTarget,
   normalizeShareTargetInput,
   resolveEffectiveShareCoverage,
   revokeShare,
+  setServerShareExecGrant,
   shareTargetRef,
   shareTargetSessionName,
   updateShare,
@@ -54,6 +56,8 @@ const createShareSchema = z.object({
   targetUser: z.string().min(1).optional(),
   role: shareRoleSchema,
   expiresAt: z.number().int().positive().nullable().optional(),
+  /** Per-device EXECUTE grant (controlled devices only; the owner is the only one who can manage these shares). Omitted = no grant. */
+  execGranted: z.boolean().optional(),
 }).refine((body) => body.targetUserId !== undefined || body.targetUser !== undefined, {
   message: 'missing_target_user',
 });
@@ -61,14 +65,19 @@ const createShareSchema = z.object({
 const updateShareSchema = z.object({
   role: shareRoleSchema.optional(),
   expiresAt: z.number().int().positive().nullable().optional(),
-}).refine((body) => body.role !== undefined || Object.prototype.hasOwnProperty.call(body, 'expiresAt'), {
+  execGranted: z.boolean().optional(),
+}).refine((body) => body.role !== undefined || body.execGranted !== undefined || Object.prototype.hasOwnProperty.call(body, 'expiresAt'), {
   message: 'empty_update',
 });
 
 const openShareSchema = z.object({ target: shareTargetInputSchema });
 const ticketSchema = z.object({ target: shareTargetInputSchema });
 
-function managedShareView(share: Awaited<ReturnType<typeof listManagedShares>>[number], user?: { id: string; display_name: string | null; username: string | null } | null) {
+function managedShareView(
+  share: Awaited<ReturnType<typeof listManagedShares>>[number],
+  user?: { id: string; display_name: string | null; username: string | null } | null,
+  execGranted = false,
+) {
   const targetUserId = user?.id ?? share.targetUserId;
   const targetUserDisplayName = user ? (user.display_name ?? user.username ?? user.id) : share.targetUserId;
   return {
@@ -79,6 +88,8 @@ function managedShareView(share: Awaited<ReturnType<typeof listManagedShares>>[n
     targetUserId,
     targetUserDisplayName,
     role: share.role,
+    /** The per-device execute grant (controlled devices; false everywhere else and for every pre-grant share). */
+    execGranted: share.role === 'participant' && execGranted,
     status: share.revokedAt !== null ? 'revoked' : 'active',
     expiresAt: share.expiresAt,
     createdBy: share.createdBy,
@@ -347,7 +358,8 @@ tabSharingRoutes.get('/server/:serverId/shares', requireAuth(), async (c) => {
     [userIds],
   );
   const userById = new Map(users.map((user) => [user.id, user]));
-  return c.json({ shares: shares.map((share) => managedShareView(share, userById.get(share.targetUserId))) });
+  const execGrants = await listServerShareExecGrants(c.env.DB, serverId);
+  return c.json({ shares: shares.map((share) => managedShareView(share, userById.get(share.targetUserId), execGrants.get(share.id) === true)) });
 });
 
 tabSharingRoutes.post('/server/:serverId/shares', requireAuth(), async (c) => {
@@ -392,6 +404,11 @@ tabSharingRoutes.post('/server/:serverId/shares', requireAuth(), async (c) => {
   const target = await normalizeExistingShareTarget(c.env.DB, parsed.data.target as ShareTargetInput);
   if (!target) return c.json({ error: 'invalid_body', reason: 'share-target-unavailable' }, 400);
 
+  // An execute grant is a statement about ONE controlled device: only a participant share of the device itself can carry it.
+  const wantsExecGrant = parsed.data.execGranted === true;
+  if (wantsExecGrant && (target.kind !== 'server' || parsed.data.role !== 'participant' || !await isControlledNodeShareTarget(c.env.DB, target))) {
+    return c.json({ error: 'invalid_body', reason: 'exec_grant_requires_controlled_device_participant' }, 400);
+  }
   const share = await createOrUpdateShare(c.env.DB, {
     id: randomHex(16),
     target,
@@ -401,6 +418,10 @@ tabSharingRoutes.post('/server/:serverId/shares', requireAuth(), async (c) => {
     expiresAt: parsed.data.expiresAt ?? null,
     now,
   });
+  // Written explicitly on every create/update: re-posting a share without the flag takes the grant away (fail closed), never keeps it by accident.
+  if (target.kind === 'server') {
+    await setServerShareExecGrant(c.env.DB, { shareId: share.id, serverId, granted: wantsExecGrant, now });
+  }
   await auditShareLifecycle(c, {
     actionType: share.createdAt === now ? 'share.create' : 'share.update',
     decision: share.createdAt === now ? 'accepted' : 'updated',
@@ -408,11 +429,11 @@ tabSharingRoutes.post('/server/:serverId/shares', requireAuth(), async (c) => {
     targetUserId,
     target,
     shareId: share.id,
-    snapshot: { role: share.role, expiresAt: share.expiresAt },
+    snapshot: { role: share.role, expiresAt: share.expiresAt, ...(target.kind === 'server' ? { execGranted: wantsExecGrant } : {}) },
     createdAt: now,
   });
   void WsBridge.get(serverId).revalidateShareSocketsForUser(share.targetUserId);
-  return c.json({ share: managedShareView(share, targetUser) }, share.createdAt === now ? 201 : 200);
+  return c.json({ share: managedShareView(share, targetUser, wantsExecGrant) }, share.createdAt === now ? 201 : 200);
 });
 
 tabSharingRoutes.patch('/server/:serverId/shares/:shareId', requireAuth(), async (c) => {
@@ -431,6 +452,20 @@ tabSharingRoutes.patch('/server/:serverId/shares/:shareId', requireAuth(), async
     now,
   });
   if (!share) return c.json({ error: 'not_found' }, 404);
+  // The execute grant follows the role: any role other than participant clears it, and it can only be SET on a participant share of a
+  // controlled device (a share that already exists, whatever its history).
+  let execGranted = false;
+  if (share.target.kind === 'server') {
+    const current = (await listServerShareExecGrants(c.env.DB, serverId)).get(share.id) === true;
+    const requested = parsed.data.execGranted;
+    if (requested === true && (share.role !== 'participant' || !await isControlledNodeShareTarget(c.env.DB, share.target))) {
+      return c.json({ error: 'invalid_body', reason: 'exec_grant_requires_controlled_device_participant' }, 400);
+    }
+    execGranted = share.role === 'participant' && (requested ?? current);
+    await setServerShareExecGrant(c.env.DB, { shareId: share.id, serverId, granted: execGranted, now });
+  } else if (parsed.data.execGranted === true) {
+    return c.json({ error: 'invalid_body', reason: 'exec_grant_requires_controlled_device_participant' }, 400);
+  }
   await auditShareLifecycle(c, {
     actionType: 'share.update',
     decision: 'updated',
@@ -438,11 +473,11 @@ tabSharingRoutes.patch('/server/:serverId/shares/:shareId', requireAuth(), async
     targetUserId: share.targetUserId,
     target: share.target,
     shareId: share.id,
-    snapshot: { role: share.role, expiresAt: share.expiresAt },
+    snapshot: { role: share.role, expiresAt: share.expiresAt, ...(share.target.kind === 'server' ? { execGranted } : {}) },
     createdAt: now,
   });
   void WsBridge.get(serverId).revalidateShareSocketsForUser(share.targetUserId);
-  return c.json({ share: managedShareView(share, await resolveUserByIdentifier(c.env.DB as Database, share.targetUserId)) });
+  return c.json({ share: managedShareView(share, await resolveUserByIdentifier(c.env.DB as Database, share.targetUserId), execGranted) });
 });
 
 tabSharingRoutes.delete('/server/:serverId/shares/:shareId', requireAuth(), async (c) => {

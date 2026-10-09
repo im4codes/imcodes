@@ -7,6 +7,12 @@ import {
 } from '../../../shared/shared-machine-authority.js';
 import type { ShareTarget } from '../../../shared/tab-sharing.js';
 import {
+  MACHINE_DENIAL_REASON,
+  evaluateMachineAction,
+  type MachineAction,
+  type MachineDenialReason,
+} from '../../../shared/machine-access-policy.js';
+import {
   canOperateControlledMachine,
   listAccessibleControlledMachines,
   resolveControlledMachineOperatorAccess,
@@ -200,37 +206,79 @@ export async function listActorOperableMachineIds(
  * delegated turn, as the participant's own current controlled device. A
  * present but invalid delegated context never falls back to owner authority,
  * and a valid one never widens a participant beyond what they were given.
+ *
+ * Operating is not executing: the ACTION decides (shared/machine-access-policy.ts). An execute-class action additionally needs the node's
+ * exec switch, the device owner or an explicit execute grant, and a turn that was not started by a share participant. The action is a
+ * REQUIRED argument, so a new call site cannot admit "something" without saying what.
  */
-export async function resolveMachineOperationalAccess(
+export interface MachineActionAdmissionInput {
+  token: string | undefined;
+  signingKey: string;
+  authenticatedSourceServerId: string;
+  sourceOwnerUserId: string;
+  targetServerId: string;
+  action: MachineAction;
+  now: number;
+}
+
+export type MachineActionAdmission =
+  | {
+      ok: true;
+      target: ControlledMachineOperatorAccessRow;
+      delegatedActorUserId?: string;
+    }
+  | {
+      ok: false;
+      reason: MachineDenialReason;
+      /** What the actor was, for the audit. Null when nothing could be resolved. */
+      accessSource: string | null;
+      delegatedActorUserId?: string;
+    };
+
+export async function admitMachineAction(
   db: Database,
-  input: {
-    token: string | undefined;
-    signingKey: string;
-    authenticatedSourceServerId: string;
-    sourceOwnerUserId: string;
-    targetServerId: string;
-    now: number;
-  },
-): Promise<{
-  target: ControlledMachineOperatorAccessRow;
-  delegatedActorUserId?: string;
-} | null> {
+  input: MachineActionAdmissionInput,
+): Promise<MachineActionAdmission> {
   const operational = await resolveMachineOperationalUser(db, input);
-  if (!operational) return null;
+  // An invalid / expired / foreign turn authority never falls back to the owner.
+  if (!operational) return { ok: false, reason: MACHINE_DENIAL_REASON.NO_ACCESS, accessSource: null };
+  const delegatedActorUserId = operational.delegatedActorUserId;
+  const deny = (reason: MachineDenialReason, accessSource: string | null): MachineActionAdmission => ({
+    ok: false, reason, accessSource, ...(delegatedActorUserId ? { delegatedActorUserId } : {}),
+  });
   const target = await resolveControlledMachineOperatorAccess(
     db,
     operational.userId,
     input.targetServerId,
     input.now,
   );
-  if (!target) return null;
-  if (!await actorMayOperateMachine(db, operational.delegatedActorUserId, input.targetServerId, input.now)) {
-    return null;
+  if (!target) return deny(MACHINE_DENIAL_REASON.NO_ACCESS, null);
+  if (!await actorMayOperateMachine(db, delegatedActorUserId, input.targetServerId, input.now)) {
+    return deny(MACHINE_DENIAL_REASON.NO_ACCESS, target.access_source);
   }
+  const decision = evaluateMachineAction({
+    accessRole: target.access_role,
+    accessSource: target.access_source,
+    execGranted: target.exec_granted === true,
+    execEnabled: target.exec_enabled === true,
+    participantTurn: Boolean(delegatedActorUserId),
+  }, input.action);
+  if (!decision.allowed) return deny(decision.reason, target.access_source);
+  return { ok: true, target, ...(delegatedActorUserId ? { delegatedActorUserId } : {}) };
+}
+
+/** The pre-split shape for callers that only need the target: null = refused. The action is required. */
+export async function resolveMachineOperationalAccess(
+  db: Database,
+  input: MachineActionAdmissionInput,
+): Promise<{
+  target: ControlledMachineOperatorAccessRow;
+  delegatedActorUserId?: string;
+} | null> {
+  const admission = await admitMachineAction(db, input);
+  if (!admission.ok) return null;
   return {
-    target,
-    ...(operational.delegatedActorUserId
-      ? { delegatedActorUserId: operational.delegatedActorUserId }
-      : {}),
+    target: admission.target,
+    ...(admission.delegatedActorUserId ? { delegatedActorUserId: admission.delegatedActorUserId } : {}),
   };
 }

@@ -31,7 +31,9 @@ import {
   type RemoteExecResult,
 } from '../../../shared/remote-exec.js';
 import { SHARED_MACHINE_AUTHORITY_HEADER } from '../../../shared/shared-machine-authority.js';
-import { resolveMachineOperationalAccess } from '../share/shared-machine-authority.js';
+import { admitMachineAction } from '../share/shared-machine-authority.js';
+import { gateMachineAction } from '../security/machine-action-gate.js';
+import { MACHINE_ACTION, MACHINE_ACTION_RATE_LIMIT, MACHINE_DENIAL_REASON } from '../../../shared/machine-access-policy.js';
 
 /** Extra time the relay waits beyond the node's own timeout before giving up (F: deadline ≥ node timeout). */
 const DEFAULT_RELAY_DEADLINE_BUFFER_MS = 30_000;
@@ -84,6 +86,9 @@ export interface ExecIntentStore {
     shell: string;
     commandSha256: string;
     commandLengthBytes: number;
+    /** The share participant whose turn this was, and where the actor's access came from (owner / share / group). */
+    delegatedActorUserId?: string;
+    accessSource?: string | null;
   }): Promise<void>;
   /** Update the SAME `correlationId` record with the truthful terminal outcome after dispatch. */
   settle(db: Database, correlationId: string, outcome: RemoteExecOutcome, result: {
@@ -126,6 +131,7 @@ function outcomeFor(dispatch: { online: boolean; result?: RemoteExecResult }): R
 }
 
 const sha256Hex = (s: string) => createHash('sha256').update(s).digest('hex');
+const MACHINE_ACTION_RATE_LIMIT_WINDOW_SECONDS = MACHINE_ACTION_RATE_LIMIT.WINDOW_MS / 1000;
 
 function preDispatchEnvelope(reason: MachineExecHttpReason) {
   return encodeMachineExecHttpEnvelope('not_dispatched', undefined, reason);
@@ -201,22 +207,28 @@ export function createMachineExecRoutes(
     if (!v.ok) return c.json(preDispatchEnvelope('invalid_request'), 400);
 
     const now = Date.now();
-    const operational = await resolveMachineOperationalAccess(c.env.DB, {
+    // Hash and length only: the command text is never stored or logged.
+    const commandSha256 = sha256Hex(v.value.command);
+    // Byte length matches the validator's UTF-8 byte cap (a JS string `.length`
+    // would under-count multibyte commands and break audit-vs-limit comparisons).
+    const commandLengthBytes = utf8ByteLength(v.value.command);
+    const admissionInput = {
       token: c.req.header(SHARED_MACHINE_AUTHORITY_HEADER),
       signingKey: c.env.JWT_SIGNING_KEY,
       authenticatedSourceServerId: sourceServerId,
       sourceOwnerUserId: userId,
       targetServerId: targetId,
+      action: MACHINE_ACTION.EXEC,
       now,
-    });
-    if (!operational) return c.json(preDispatchEnvelope('target_forbidden'), 403);
-    const target = operational.target;
-    if (!target.exec_enabled) return c.json(preDispatchEnvelope('exec_disabled'), 403);
-
-    const commandSha256 = sha256Hex(v.value.command);
-    // Byte length matches the validator's UTF-8 byte cap (a JS string `.length`
-    // would under-count multibyte commands and break audit-vs-limit comparisons).
-    const commandLengthBytes = utf8ByteLength(v.value.command);
+    };
+    // Operating a device is not executing on it: the owner, or an explicit execute grant, on a turn the owner's own request started
+    // (shared/machine-access-policy.ts). Refused attempts are audited and rate limited here, the same as allowed ones.
+    const gate = await gateMachineAction(c.env.DB, { ...admissionInput, payload: { commandSha256, commandLength: commandLengthBytes } });
+    if (!gate.ok) {
+      if (gate.status === 429) c.header('Retry-After', String(Math.ceil(MACHINE_ACTION_RATE_LIMIT_WINDOW_SECONDS)));
+      return c.json(preDispatchEnvelope(gate.wireReason), gate.status);
+    }
+    const operational = gate.admission;
 
     // Audit-checklist invariant: persist the dispatch intent BEFORE the send. This
     // is fail-closed — if the durable record cannot be written we refuse to run a
@@ -225,13 +237,26 @@ export function createMachineExecRoutes(
     if (intentStore) {
       try {
         await intentStore.record(c.env.DB, {
-          correlationId, userId: operational.delegatedActorUserId ?? userId, sourceServerId, targetServerId: targetId,
+          correlationId, userId, sourceServerId, targetServerId: targetId,
           shell: v.value.shell ?? 'default', commandSha256, commandLengthBytes,
+          ...(operational.delegatedActorUserId ? { delegatedActorUserId: operational.delegatedActorUserId } : {}),
+          accessSource: operational.target.access_source,
         });
       } catch (err) {
         logger.error({ serverId: targetId, err }, 'Refusing exec — durable intent could not be persisted');
         return c.json(preDispatchEnvelope('intent_unavailable'), 503);
       }
+    }
+
+    // Kill switch: the owner may have switched exec off (or revoked the grant) while the intent was being persisted. Nothing is sent
+    // after that: the access is read once more, immediately before the dispatch.
+    const recheck = await admitMachineAction(c.env.DB, { ...admissionInput, now: Date.now() });
+    if (!recheck.ok) {
+      if (intentStore) {
+        await intentStore.settle(c.env.DB, correlationId, 'not_dispatched', { exitCode: null, timedOut: false, durationMs: 0 })
+          .catch((err) => logger.error({ serverId: targetId, correlationId, err }, 'Failed to settle a refused exec intent'));
+      }
+      return c.json(preDispatchEnvelope(recheck.reason === MACHINE_DENIAL_REASON.EXEC_DISABLED ? 'exec_disabled' : 'target_forbidden'), 403);
     }
 
     const nodeTimeout = Math.min(v.value.timeoutMs ?? REMOTE_EXEC_DEFAULT_TIMEOUT_MS, REMOTE_EXEC_MAX_TIMEOUT_MS);
@@ -344,6 +369,9 @@ export const machineExecAuditIntentStore: ExecIntentStore = {
     commandLength: intent.commandLengthBytes,
     shell: intent.shell,
     now: Date.now(),
+    action: MACHINE_ACTION.EXEC,
+    ...(intent.delegatedActorUserId ? { delegatedActorUserId: intent.delegatedActorUserId } : {}),
+    accessSource: intent.accessSource ?? null,
   }),
   settle: async (db, correlationId, outcome, result) => {
     const updated = await updateMachineExecAuditResult(db, correlationId, {

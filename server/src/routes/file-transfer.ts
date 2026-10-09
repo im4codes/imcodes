@@ -51,7 +51,9 @@ import {
 import {
   resolveControlledMachineOperatorAccess,
 } from '../share/machine-access.js';
-import { actorMayOperateMachine, resolveMachineOperationalAccess } from '../share/shared-machine-authority.js';
+import { describeActionPayload, gateMachineAction } from '../security/machine-action-gate.js';
+import { recordMachineActionAuthorized } from '../security/machine-exec-audit.js';
+import { MACHINE_ACTION, MACHINE_ACTION_RATE_LIMIT, MACHINE_INTERACTIVE_SOURCE, evaluateMachineAction, type MachineAction } from '../../../shared/machine-access-policy.js';
 import { SHARED_MACHINE_AUTHORITY_HEADER } from '../../../shared/shared-machine-authority.js';
 import { sanitizeUploadFilename } from '../../../shared/upload-filename.js';
 import { FS_GENERIC_ERROR_CODES } from '../../../shared/fs-error-codes.js';
@@ -146,15 +148,19 @@ async function hasCurrentControlledStageAccess(
   entry: { serverId: string; controlledAccessUserId?: string; controlledActorUserId?: string },
 ): Promise<boolean> {
   if (!entry.controlledAccessUserId) return true;
+  // A staged download is a file READ on the node: it keeps passing the execute rule (exec switch, owner / execute grant) until the end,
+  // so the kill switch and a revoked grant stop a transfer that is already staged.
   const now = Date.now();
-  const access = await resolveControlledMachineOperatorAccess(
-    db,
-    entry.controlledAccessUserId,
-    entry.serverId,
-    now,
-  );
-  return access != null && access.exec_enabled
-    && await actorMayOperateMachine(db, entry.controlledActorUserId, entry.serverId, now);
+  const access = await resolveControlledMachineOperatorAccess(db, entry.controlledAccessUserId, entry.serverId, now);
+  if (!access) return false;
+  const decision = evaluateMachineAction({
+    accessRole: access.access_role,
+    accessSource: access.access_source,
+    execGranted: access.exec_granted === true,
+    execEnabled: access.exec_enabled === true,
+    participantTurn: Boolean(entry.controlledActorUserId),
+  }, MACHINE_ACTION.FILE_FETCH);
+  return decision.allowed;
 }
 
 function settleStagedDownloadReady(downloadId: string, settle: (entry: NonNullable<ReturnType<typeof stagedDownloads.get>>) => void): void {
@@ -648,7 +654,20 @@ fileTransferRoutes.use('/:id/uploads/:attachmentId/download', async (c, next) =>
 
 type ControlledTargetGate =
   | { ok: true; bridge: ReturnType<typeof WsBridge.get>; controlled: boolean; daemonGeneration?: number; delegatedActorUserId?: string }
-  | { ok: false; reason: 'scoped_auth' | 'target_forbidden' | 'exec_disabled' | 'daemon_offline' | 'capability_unavailable' };
+  | { ok: false; reason: 'scoped_auth' | 'target_forbidden' | 'exec_disabled' | 'daemon_offline' | 'capability_unavailable' | 'rate_limited' };
+
+/**
+ * What each file capability DOES on the node. Every one of them reads or writes files as the node's account, so every one is
+ * EXECUTE-class (shared/machine-access-policy.ts). A capability nobody mapped is treated as the strictest (a write).
+ */
+const FILE_CAPABILITY_ACTION: Readonly<Record<string, MachineAction>> = {
+  [FILE_TRANSFER_PATH_HANDLE_CAPABILITY]: MACHINE_ACTION.FILE_FETCH,
+  [FILE_TRANSFER_DIRECTORY_CAPABILITY]: MACHINE_ACTION.FILE_LIST,
+  [MACHINE_DIRECT_FILE_TRANSFER_CAPABILITY]: MACHINE_ACTION.FILE_SEND,
+  [MACHINE_DIRECT_FILE_FETCH_CAPABILITY]: MACHINE_ACTION.FILE_FETCH,
+  [FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY]: MACHINE_ACTION.FILE_SEND,
+  [FILE_TRANSFER_DOWNLOAD_STREAM_CAPABILITY]: MACHINE_ACTION.FILE_FETCH,
+};
 
 async function authorizeControlledFileTarget(
   c: Context,
@@ -685,23 +704,41 @@ async function authorizeControlledFileTarget(
     return { ok: false, reason: 'scoped_auth' };
   }
   const now = Date.now();
-  const operational = authenticatedFullDaemon
-    ? (await resolveMachineOperationalAccess(c.env.DB, {
-        token: c.req.header(SHARED_MACHINE_AUTHORITY_HEADER),
-        signingKey: c.env.JWT_SIGNING_KEY,
-        authenticatedSourceServerId: sourceServerId!,
-        sourceOwnerUserId: userId,
-        targetServerId: serverId,
-        now,
-      }))
-    : null;
-  const access = authenticatedFullDaemon
-    ? operational?.target ?? null
-    : await resolveControlledMachineOperatorAccess(c.env.DB, userId, serverId, now);
-  if (!access) {
-    return { ok: false, reason: 'target_forbidden' };
+  const action = FILE_CAPABILITY_ACTION[capability] ?? MACHINE_ACTION.FILE_SEND;
+  // One admission for both callers: a FULL daemon (possibly carrying a share participant's turn authority) or the signed-in user's own
+  // browser. Execute rule, audit (refusals too) and rate limit are the same for both.
+  const gate = await gateMachineAction(c.env.DB, {
+    token: authenticatedFullDaemon ? c.req.header(SHARED_MACHINE_AUTHORITY_HEADER) : undefined,
+    signingKey: c.env.JWT_SIGNING_KEY,
+    authenticatedSourceServerId: authenticatedFullDaemon ? sourceServerId! : '',
+    sourceOwnerUserId: userId,
+    targetServerId: serverId,
+    action,
+    now,
+    payload: describeActionPayload(`${action}:${capability}`),
+  });
+  if (!gate.ok) {
+    return { ok: false, reason: gate.status === 429 ? 'rate_limited' : gate.wireReason === 'exec_disabled' ? 'exec_disabled' : 'target_forbidden' };
   }
-  if (!access.exec_enabled) return { ok: false, reason: 'exec_disabled' };
+  const operational = gate.admission;
+  // Recorded before the transfer starts, fail closed: a file operation that cannot be audited does not start.
+  try {
+    await recordMachineActionAuthorized(c.env.DB, {
+      correlationId: randomHex(16),
+      userId,
+      sourceServerId: authenticatedFullDaemon ? sourceServerId! : MACHINE_INTERACTIVE_SOURCE,
+      targetServerId: serverId,
+      ...describeActionPayload(`${action}:${capability}`),
+      shell: action,
+      now,
+      action,
+      ...(operational.delegatedActorUserId ? { delegatedActorUserId: operational.delegatedActorUserId } : {}),
+      accessSource: operational.target.access_source,
+    });
+  } catch (err) {
+    logger.error({ serverId, action, err }, 'Refusing a machine file operation — durable audit could not be persisted');
+    return { ok: false, reason: 'daemon_offline' };
+  }
   if (!bridge.isDaemonConnected()) return { ok: false, reason: 'daemon_offline' };
   // Capture the exact socket generation synchronously with the capability
   // observation. Callers can spend time reading/validating request bodies, but
@@ -710,11 +747,15 @@ async function authorizeControlledFileTarget(
   if (!bridge.hasDaemonCapability(capability)) return { ok: false, reason: 'capability_unavailable' };
   return {
     ok: true, bridge, controlled: true, daemonGeneration,
-    ...(operational?.delegatedActorUserId ? { delegatedActorUserId: operational.delegatedActorUserId } : {}),
+    ...(operational.delegatedActorUserId ? { delegatedActorUserId: operational.delegatedActorUserId } : {}),
   };
 }
 
 function controlledTargetGateError(c: Context, reason: Exclude<ControlledTargetGate, { ok: true }>['reason']): Response {
+  if (reason === 'rate_limited') {
+    c.header('Retry-After', String(MACHINE_ACTION_RATE_LIMIT.WINDOW_MS / 1000));
+    return c.json({ error: reason }, 429);
+  }
   if (reason === 'daemon_offline') return c.json({ error: reason }, 503);
   if (reason === 'capability_unavailable') return c.json({ error: reason }, 409);
   return c.json({ error: reason }, 403);

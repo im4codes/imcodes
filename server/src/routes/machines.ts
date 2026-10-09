@@ -6,6 +6,8 @@ import { requireAuth } from '../security/authorization.js';
 import { logAudit } from '../security/audit.js';
 import { WsBridge } from '../ws/bridge.js';
 import { abandonAllForTarget } from '../ws/machine-exec-registry.js';
+import { MACHINE_ACCESS_SOURCE, MACHINE_ACTION, evaluateMachineAction, type MachineAccessSource } from '../../../shared/machine-access-policy.js';
+import { listMachineActionAudit } from '../security/machine-exec-audit.js';
 import {
   NODE_ROLE,
   MACHINE_LIST_MAX_ITEMS,
@@ -103,6 +105,8 @@ interface ControlledRow {
   host_server_id: string | null;
   remote_desktop_host_id: string | null;
   access_role: MachineAccessRole;
+  access_source: MachineAccessSource | null;
+  exec_granted: boolean;
   controlled_capabilities: unknown;
 }
 
@@ -123,6 +127,10 @@ export async function listControlledMachines(
   displayName: string;
   execEnabled: boolean;
   accessRole: MachineAccessRole;
+  /** Browser-only (never sent to a daemon, see DAEMON_MACHINE_LIST_SENT_KEYS): may THIS actor run commands / move files on the device? */
+  canExecute: boolean;
+  execGranted: boolean;
+  accessSource?: MachineAccessSource;
   remoteDesktopHostId?: string;
   // Declared because it is emitted. It was not, so the daemon-strip list below
   // could omit it without a type error -- and every strict daemon then rejected
@@ -204,6 +212,18 @@ export async function listControlledMachines(
       // keeps old MCP resolution logic from presenting a non-operable target.
       execEnabled: r.exec_enabled === true && r.access_role !== 'viewer',
       accessRole: r.access_role,
+      // Operating is not executing: the browser is told whether THIS actor may run commands / move files on the device (an owner, or a
+      // participant share with the owner's execute grant), where the access comes from, and whether a grant is held. A turn that was
+      // started by a share participant never executes, whatever it holds.
+      canExecute: evaluateMachineAction({
+        accessRole: r.access_role,
+        accessSource: r.access_source,
+        execGranted: r.exec_granted === true,
+        execEnabled: r.exec_enabled === true,
+        participantTurn: Boolean(delegatedActorUserId),
+      }, MACHINE_ACTION.EXEC).allowed,
+      execGranted: r.exec_granted === true,
+      ...(r.access_source ? { accessSource: r.access_source } : {}),
       ...(typeof r.remote_desktop_host_id === 'string' && r.remote_desktop_host_id
         ? { remoteDesktopHostId: r.remote_desktop_host_id }
         : {}),
@@ -287,8 +307,10 @@ machinesRoutes.get('/', requireAuth(), async (c) => {
   // Older daemons strictly reject unknown machine-list keys. Server-authenticated
   // callers do not need the display-only role because every action is admitted
   // again against the DB; preserve their legacy DTO during rolling upgrades.
+  // A daemon (an agent's list_machines) is told `execEnabled` only for devices it can actually execute on, so an agent does not plan
+  // commands the server will refuse; the browser keeps the raw switch and the separate `canExecute`.
   const responseMachines = authenticatedDaemon
-    ? machines.map((machine) => pickDaemonMachineListItem(machine))
+    ? machines.map((machine) => pickDaemonMachineListItem({ ...machine, execEnabled: machine.execEnabled === true && machine.canExecute === true }))
     : machines;
   return c.json({ machines: responseMachines });
 });
@@ -530,7 +552,10 @@ machinesRoutes.post('/:serverId/revoke', requireAuth(), async (c) => {
   return c.json({ ok: true });
 });
 
-// POST /api/machines/:serverId/exec-enabled — operator toggles D-E exec gate.
+// POST /api/machines/:serverId/exec-enabled — the OWNER's exec switch (D-E exec gate) for one device.
+//
+// Management by a group owner/admin or an explicit participant covers rename, upgrade and the rest; the switch that lets commands run
+// as SYSTEM/root is the device owner's alone. Otherwise a participant could re-enable exec the owner had turned off.
 machinesRoutes.post('/:serverId/exec-enabled', requireAuth(), async (c) => {
   const userId = c.get('userId' as never) as string;
   const serverId = c.req.param('serverId');
@@ -540,6 +565,9 @@ machinesRoutes.post('/:serverId/exec-enabled', requireAuth(), async (c) => {
   if (!parsed.success) return c.json({ error: 'invalid_body' }, 400);
   const access = await resolveControlledMachineManagementAccess(c.env.DB, userId, serverId, Date.now());
   if (!access) return c.json({ error: 'not_found' }, 404);
+  if (access.access_source !== MACHINE_ACCESS_SOURCE.OWNER) {
+    return c.json({ error: 'forbidden', reason: 'owner_only' }, 403);
+  }
   // Capture the prior value so the audit records from → to (enabling exec is a
   // high-privilege action that gates SYSTEM/root RCE and MUST be attributable).
   const row = await c.env.DB.queryOne<{ was: boolean }>(
@@ -550,11 +578,7 @@ machinesRoutes.post('/:serverId/exec-enabled', requireAuth(), async (c) => {
     [serverId, parsed.data.enabled, NODE_ROLE.CONTROLLED],
   );
   if (!row) return c.json({ error: 'not_found' }, 404);
-  if (!parsed.data.enabled) {
-    // This route is pod-sticky by serverId. Terminate every peer immediately
-    // after the DB mutation; worker lease expiry remains the lost-message guard.
-    WsBridge.get(serverId).stopAllRemoteDesktop(REMOTE_DESKTOP_TERMINAL_REASON.EXECUTION_DISABLED);
-  }
+  if (!parsed.data.enabled) stopExecutionOnDevice(serverId);
   const ip = (c.get('clientIp' as never) as string) ?? 'unknown';
   logAudit({
     userId,
@@ -563,6 +587,67 @@ machinesRoutes.post('/:serverId/exec-enabled', requireAuth(), async (c) => {
     details: { serverId, from: row.was === true, to: parsed.data.enabled },
   }, c.env.DB).catch(() => {});
   return c.json({ ok: true, execEnabled: parsed.data.enabled });
+});
+
+/**
+ * Everything that is running or waiting on a device stops when its exec switch goes off: remote-desktop peers end, and every pending
+ * exec / computer-use result wait is abandoned (the caller sees an indeterminate outcome, never a late success). New commands are refused
+ * by the next admission, and a command already admitted re-reads the switch immediately before it is sent.
+ */
+function stopExecutionOnDevice(serverId: string): void {
+  try {
+    const bridge = WsBridge.get(serverId);
+    // This route is pod-sticky by serverId. Terminate every peer immediately
+    // after the DB mutation; worker lease expiry remains the lost-message guard.
+    bridge.stopAllRemoteDesktop(REMOTE_DESKTOP_TERMINAL_REASON.EXECUTION_DISABLED);
+    abandonAllForTarget(serverId);
+  } catch { /* offline / other pod: the database switch is what every pod reads next */ }
+}
+
+// POST /api/machines/exec-enabled — the owner's KILL SWITCH for every device they own, at once. It can only turn execution OFF: turning
+// everything on at once is not a convenience worth having.
+machinesRoutes.post('/exec-enabled', requireAuth(), async (c) => {
+  const userId = c.get('userId' as never) as string;
+  const body = await c.req.json().catch(() => null);
+  const parsed = z.object({ enabled: z.literal(false) }).safeParse(body);
+  if (!parsed.success) return c.json({ error: 'invalid_body', reason: 'only_disable_is_allowed' }, 400);
+  const switched = await c.env.DB.query<{ id: string }>(
+    `UPDATE servers SET exec_enabled = false
+      WHERE user_id = $1 AND node_role = $2 AND revoked_at IS NULL AND exec_enabled = true
+      RETURNING id`,
+    [userId, NODE_ROLE.CONTROLLED],
+  );
+  for (const device of switched) stopExecutionOnDevice(device.id);
+  const ip = (c.get('clientIp' as never) as string) ?? 'unknown';
+  logAudit({
+    userId,
+    action: 'machine.exec_disabled_all',
+    ip,
+    details: { count: switched.length },
+  }, c.env.DB).catch(() => {});
+  return c.json({ ok: true, execEnabled: false, devicesSwitchedOff: switched.length });
+});
+
+// GET /api/machines/:serverId/exec-audit — what was tried on this device, allowed and refused (hash and length only, never the command).
+machinesRoutes.get('/:serverId/exec-audit', requireAuth(), async (c) => {
+  const userId = c.get('userId' as never) as string;
+  const serverId = c.req.param('serverId');
+  if (!serverId) return c.json({ error: 'invalid_request' }, 400);
+  const access = await resolveControlledMachineManagementAccess(c.env.DB, userId, serverId, Date.now());
+  if (!access) return c.json({ error: 'not_found' }, 404);
+  if (access.access_source !== MACHINE_ACCESS_SOURCE.OWNER) return c.json({ error: 'forbidden', reason: 'owner_only' }, 403);
+  const limitRaw = Number(c.req.query('limit') ?? 50);
+  const limit = Number.isInteger(limitRaw) ? Math.min(Math.max(limitRaw, 1), 200) : 50;
+  const beforeRaw = c.req.query('before');
+  const before = beforeRaw !== undefined && Number.isSafeInteger(Number(beforeRaw)) ? Number(beforeRaw) : undefined;
+  const decisionRaw = c.req.query('decision');
+  const decision = decisionRaw === 'allowed' || decisionRaw === 'denied' ? decisionRaw : undefined;
+  const entries = await listMachineActionAudit(c.env.DB, serverId, {
+    limit,
+    ...(before !== undefined ? { before } : {}),
+    ...(decision ? { decision } : {}),
+  });
+  return c.json({ entries });
 });
 
 /**

@@ -149,6 +149,8 @@ export async function createOrUpdateShare(
        VALUES ($1, $2, $3, $4, $5, $6, $6, $7, NULL)
        ON CONFLICT (server_id, target_user_id) DO UPDATE SET
          role = EXCLUDED.role,
+         -- A grant never survives a role other than participant (and the CHECK on the column would refuse the row otherwise).
+         exec_granted = CASE WHEN EXCLUDED.role = 'participant' THEN server_shares.exec_granted ELSE FALSE END,
          expires_at = EXCLUDED.expires_at,
          updated_at = EXCLUDED.updated_at,
          revoked_at = NULL,
@@ -198,8 +200,10 @@ export async function updateShare(
   const role = params.role ?? current.role;
   const expiresAt = Object.prototype.hasOwnProperty.call(params, 'expiresAt') ? params.expiresAt ?? null : current.expiresAt;
   const { table } = tableForTarget(current.target);
+  // server_shares also carries the device execute grant, which only a participant row may hold.
+  const clearsExecGrant = table === 'server_shares' ? ", exec_granted = CASE WHEN $1 = 'participant' THEN exec_granted ELSE FALSE END" : '';
   await db.execute(
-    `UPDATE ${table} SET role = $1, expires_at = $2, updated_at = $3 WHERE id = $4 AND server_id = $5`,
+    `UPDATE ${table} SET role = $1, expires_at = $2, updated_at = $3${clearsExecGrant} WHERE id = $4 AND server_id = $5`,
     [role, expiresAt, params.now, params.shareId, params.serverId],
   );
   return getShareById(db, params.serverId, params.shareId);
@@ -456,4 +460,29 @@ function tableForTarget(target: ShareTarget): { table: 'server_shares' | 'sessio
   if (target.kind === 'server') return { table: 'server_shares' };
   if (target.kind === 'main') return { table: 'session_shares' };
   return { table: 'sub_session_shares' };
+}
+
+/**
+ * The per-device EXECUTE grant lives on the server-level share row (migration 100). It is meaningful only for a `participant` role: a
+ * viewer row can never carry it, and a role change away from participant clears it in the same statement.
+ */
+export async function setServerShareExecGrant(
+  db: Database,
+  params: { shareId: string; serverId: string; granted: boolean; now: number },
+): Promise<void> {
+  await db.execute(
+    `UPDATE server_shares
+        SET exec_granted = ($3 AND role = 'participant'), updated_at = $4
+      WHERE id = $1 AND server_id = $2`,
+    [params.shareId, params.serverId, params.granted, params.now],
+  );
+}
+
+/** share id -> execute grant for the server-level shares of one device (absent id = no grant). */
+export async function listServerShareExecGrants(db: Database, serverId: string): Promise<Map<string, boolean>> {
+  const rows = await db.query<{ id: string; exec_granted: boolean }>(
+    'SELECT id, exec_granted FROM server_shares WHERE server_id = $1',
+    [serverId],
+  );
+  return new Map(rows.map((row) => [row.id, row.exec_granted === true]));
 }

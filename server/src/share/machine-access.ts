@@ -4,6 +4,7 @@ import {
   type MachineAccessRole,
 } from '../../../shared/remote-exec.js';
 import type { ControlledNodeCapability } from '../../../shared/controlled-node-capabilities.js';
+import type { MachineAccessSource } from '../../../shared/machine-access-policy.js';
 
 export interface ControlledMachineAccessRow {
   id: string;
@@ -20,6 +21,10 @@ export interface ControlledMachineAccessRow {
   revoked_at: number | null;
   access_role: MachineAccessRole;
   access_expires_at: number | null;
+  /** Where the access comes from. An EXECUTE grant only counts when this is `share` (shared/machine-access-policy.ts). */
+  access_source: MachineAccessSource | null;
+  /** The explicit per-device share row's execute grant; false for the owner row, a group member and every pre-grant share. */
+  exec_granted: boolean;
   controlled_capabilities: ControlledNodeCapability[] | null;
   controlled_upgrade_status: string | null;
   controlled_upgrade_target_version: string | null;
@@ -98,6 +103,14 @@ const CONTROLLED_MACHINE_ACCESS_SELECT = `
            WHEN sh.role IS NOT NULL THEN sh.role
            WHEN ${IS_MEMBER_OF_A_MACHINE_GROUP} THEN 'participant'
          END AS access_role,
+         CASE
+           WHEN s.user_id = $1 THEN 'owner'
+           WHEN sh.role IS NOT NULL THEN 'share'
+           WHEN ${IS_MEMBER_OF_A_MACHINE_GROUP} THEN 'group'
+         END AS access_source,
+         -- Only the explicit per-device row can carry an execute grant, and only a participant row (CHECK in migration 100). A group
+         -- membership has no row, so it can never grant it; a missing column reads false.
+         COALESCE(sh.exec_granted, FALSE) AS exec_granted,
          sh.expires_at AS access_expires_at
     FROM servers s
     LEFT JOIN remote_desktop_host_endpoints rdhe
