@@ -80,6 +80,7 @@ import {
   evaluateAutomaticSupervisionEnablement,
 } from '../../../shared/supervision-config.js';
 import {
+  denyIdentityServerAccess,
   handleSessionIdentityDelete,
   handleSessionIdentityGet,
   handleSessionIdentityPut,
@@ -575,20 +576,9 @@ sessionMgmtRoutes.put('/:id/sessions/:name/supervision/defaults', async (c) => {
 async function resolveServerIdentityOwner(
   c: Context<{ Bindings: Env; Variables: { userId: string; role: string } }>,
 ): Promise<{ ok: true; ownerUserId: string } | { ok: false; response: Response }> {
-  const userId = c.get('userId' as never) as string;
   const serverId = c.req.param('id')!;
-  const access = await resolveHttpShareAccess(c.env.DB, {
-    serverId,
-    userId,
-    target: { kind: 'server', serverId },
-  });
-  if (access.actor.kind === 'none') {
-    return { ok: false, response: c.json({ error: 'forbidden', reason: 'not_authorized_for_server' }, 403) };
-  }
-  if (access.actor.kind === 'share'
-    && (access.actor.effectiveActorRole !== 'participant' || access.shareProvenance !== 'server')) {
-    return { ok: false, response: c.json({ error: 'forbidden', reason: 'share-role-denied' }, 403) };
-  }
+  const denied = await denyIdentityServerAccess(c, serverId);
+  if (denied) return { ok: false, response: denied };
   const server = await getServerById(c.env.DB, serverId);
   if (!server) return { ok: false, response: c.json({ error: 'not_found' }, 404) };
   return { ok: true, ownerUserId: server.user_id };

@@ -10,6 +10,7 @@ import {
   upsertSessionIdentityProfile,
 } from '../db/session-identity-queries.js';
 import { WsBridge } from '../ws/bridge.js';
+import { resolveHttpShareAccess } from './share-http-auth.js';
 import logger from '../util/logger.js';
 import { SESSION_IDENTITY_LOCAL_RPC_TIMEOUT_MS } from '../../../shared/session-identity-ws.js';
 import {
@@ -53,6 +54,36 @@ function resolveScopeKey(
 }
 
 /**
+ * PROJECT/SESSION identity lives on the server's daemon and is rendered into the prompt of every agent of the project, so changing it is
+ * as sensitive as writing to the owner's sessions. Owner, or a participant of the WHOLE server (a session-scoped share cannot edit
+ * project/session identity); viewers and non-members are refused. Returns the refusal, or null when allowed.
+ */
+export async function denyIdentityServerAccess<
+  TVariables extends object, TPath extends string, TInput extends Input,
+>(
+  c: Context<IdentityHttpEnv<TVariables>, TPath, TInput>,
+  serverId: string,
+): Promise<Response | null> {
+  const actingUserId = (c as unknown as { get(name: string): unknown }).get('userId');
+  if (typeof actingUserId !== 'string' || !actingUserId) {
+    return c.json({ error: 'forbidden', reason: 'not_authorized_for_server' }, 403);
+  }
+  const access = await resolveHttpShareAccess(c.env.DB, {
+    serverId,
+    userId: actingUserId,
+    target: { kind: 'server', serverId },
+  });
+  if (access.actor.kind === 'none') {
+    return c.json({ error: 'forbidden', reason: 'not_authorized_for_server' }, 403);
+  }
+  if (access.actor.kind === 'share'
+    && (access.actor.effectiveActorRole !== 'participant' || access.shareProvenance !== 'server')) {
+    return c.json({ error: 'forbidden', reason: 'share-role-denied' }, 403);
+  }
+  return null;
+}
+
+/**
  * A PROJECT/SESSION daemon-local RPC call, shared by get/set/delete below.
  * Never HTTP: the daemon is reached only over its existing WebSocket, so a
  * flaky daemon<->server HTTP link can never make this hang or 502.
@@ -67,6 +98,11 @@ async function callDaemonLocal<
   if (!serverId) {
     return { ok: false, response: c.json({ error: 'identity_server_required' }, 400) };
   }
+  // The ONE admission point for every route that relays to a daemon: `serverId` arrives from the request (a query string on the flat
+  // route), so being logged in says nothing about this server. The acting user must be its owner or a whole-server participant;
+  // without this any registered user could read/overwrite/delete PROJECT/SESSION identity on someone else's daemon.
+  const denied = await denyIdentityServerAccess(c, serverId);
+  if (denied) return { ok: false, response: denied };
   const bridge = WsBridge.get(serverId);
   if (!bridge.isDaemonConnected()) {
     return { ok: false, response: c.json({ error: 'daemon_offline' }, 409) };
