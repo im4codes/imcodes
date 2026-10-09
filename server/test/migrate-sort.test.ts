@@ -52,6 +52,13 @@ describe('migration sort', () => {
     ]);
   });
 
+  it('retains different full filenames sharing a numeric prefix', () => {
+    const files = ['101_next.sql', '100_machine_execute.sql', '099_previous.sql', '100_user_sessions.sql'];
+    expect(sortMigrations(files)).toEqual([
+      '099_previous.sql', '100_machine_execute.sql', '100_user_sessions.sql', '101_next.sql',
+    ]);
+  });
+
   it('actual migration files are in numeric order', async () => {
     const files = (await readdir(MIGRATIONS_DIR)).filter((f) => f.endsWith('.sql'));
     const sorted = sortMigrations([...files]);
@@ -59,10 +66,12 @@ describe('migration sort', () => {
     // Verify sorted order matches numeric prefix sequence
     expect(sorted).toEqual(files.sort((a, b) => parseInt(a, 10) - parseInt(b, 10)));
 
-    // Verify no gaps or duplicates in prefix numbers
+    // The registry identifies migrations by FULL filename, not prefix.
+    // Independent migrations may share a prefix and must both remain present.
+    expect(new Set(sorted).size).toBe(sorted.length);
     const numbers = sorted.map((f) => parseInt(f, 10));
     for (let i = 1; i < numbers.length; i++) {
-      expect(numbers[i]).toBeGreaterThan(numbers[i - 1]);
+      expect(numbers[i]).toBeGreaterThanOrEqual(numbers[i - 1]);
     }
 
     // Verify first migration is 001
