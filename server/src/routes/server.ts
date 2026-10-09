@@ -687,7 +687,9 @@ serverRoutes.post('/:id/shared-context/processed', async (c) => {
       summary: projection.summary,
       content: projection.content,
     });
-    await c.env.DB.execute(
+    // `id` is the table's global key and the daemon chooses it. The update half of the upsert may only touch a row this server (or, for
+    // a personal projection, this same user) already owns; without that a daemon that knows another user's projection id rewrote it.
+    const upsert = await c.env.DB.execute(
       `INSERT INTO shared_context_projections (
         id, server_id, scope, enterprise_id, workspace_id, user_id, project_id,
         projection_class, source_event_ids_json, summary, content_json,
@@ -707,7 +709,10 @@ serverRoutes.post('/:id/shared-context/processed', async (c) => {
         origin = excluded.origin,
         created_at = excluded.created_at,
         updated_at = excluded.updated_at,
-        replicated_at = excluded.replicated_at`,
+        replicated_at = excluded.replicated_at
+      WHERE shared_context_projections.server_id = excluded.server_id
+         OR (excluded.scope = 'personal' AND shared_context_projections.scope = 'personal'
+             AND shared_context_projections.user_id = excluded.user_id)`,
       [
         projection.id,
         serverRow.serverId,
@@ -727,6 +732,7 @@ serverRoutes.post('/:id/shared-context/processed', async (c) => {
         now,
       ],
     );
+    if (upsert.changes === 0) continue; // an id that belongs to someone else: nothing written, nothing counted
     acceptedCount += 1;
     acceptedProjections.push(projection);
 
@@ -746,7 +752,8 @@ serverRoutes.post('/:id/shared-context/processed', async (c) => {
           summary = excluded.summary,
           content_json = excluded.content_json,
           origin = excluded.origin,
-          updated_at = excluded.updated_at`,
+          updated_at = excluded.updated_at
+        WHERE shared_context_records.server_id = excluded.server_id`,
         [
           `record:${projection.id}`,
           projection.id,
