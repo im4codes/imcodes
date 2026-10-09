@@ -9,7 +9,7 @@
  * not become reachable from a participant turn by accident: an unlisted tool is DENIED.
  *
  * `allow` here means "not refused for being a participant turn"; the tool's own scoping still applies (project-bound memory reads,
- * Brain-only checks, the participant's own machine access for the machine tools, the exact-session binding of replies).
+ * Brain-only checks, the participant's own machine access for discovery, the exact-session binding of replies).
  */
 import { ALIAS_MCP_TOOLS } from './alias-types.js';
 import { CAPABILITY_MCP_TOOL } from './capability-management.js';
@@ -52,13 +52,17 @@ export const PARTICIPANT_TURN_TOOL_POLICY: Readonly<Record<string, ParticipantTu
   [N.PAIR_RESOURCE_CLAIM]: ALLOW,
   [N.PAIR_VERDICT]: ALLOW,
   [N.PAIR_GET_MAX_CONCURRENCY]: ALLOW,
-  // Machine tools authorise against the PARTICIPANT's own machine access themselves (shared-machine-authority).
+  // Discovery follows the PARTICIPANT's own machine access (shared-machine-authority).
   [N.LIST_MACHINES]: ALLOW,
-  [N.EXEC_REMOTE]: ALLOW,
-  [N.SEND_FILE_TO_MACHINE]: ALLOW,
-  [N.FETCH_FILE_FROM_MACHINE]: ALLOW,
   [N.COMPUTER_USE_DOCS]: ALLOW,
-  [N.COMPUTER_USE_CALL]: ALLOW,
+  // EXECUTE-class machine tools never run on a turn a share participant started, whatever the participant holds (shared/machine-access-policy.ts):
+  // the owner's agent must not be a confused deputy. The server refuses the same actions again at admission (defense in depth).
+  [N.EXEC_REMOTE]: DENY,
+  [N.SEND_FILE_TO_MACHINE]: DENY,
+  [N.FETCH_FILE_FROM_MACHINE]: DENY,
+  // computer_use_call is one tool with many verbs (look / shell / click / type ...): the gate is per tool, so it is refused as a whole;
+  // looking at a screen is still available to the participant through their own session UI.
+  [N.COMPUTER_USE_CALL]: DENY,
   // Owner-level actions: refused.
   [N.ARCHIVE_MEMORY]: DENY,
   [N.RESTORE_MEMORY]: DENY,
