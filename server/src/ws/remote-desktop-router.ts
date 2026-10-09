@@ -1,6 +1,7 @@
 import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 import type WebSocket from 'ws';
 import type { Database } from '../db/client.js';
+import { evaluateMachineAction, MACHINE_ACTION } from '../../../shared/machine-access-policy.js';
 import {
   canOperateControlledMachine,
   resolveRemoteDesktopHostOperatorAccess,
@@ -360,6 +361,23 @@ export class RemoteDesktopRouter {
     return profile?.kind === 'common_v3' && !profile.input
       ? REMOTE_DESKTOP_ACCESS_MODE.VIEW
       : REMOTE_DESKTOP_ACCESS_MODE.CONTROL;
+  }
+
+  /**
+   * The highest mode an account's ACCESS allows. Remote-desktop CONTROL injects keyboard and mouse input, which can launch anything as
+   * the signed-in user, so it is GUI_INPUT in the one rule table (shared/machine-access-policy.ts): the device owner, or a share
+   * participant holding the owner's execute grant. Everyone else who can operate the device (a group member, a participant without the
+   * grant) may only watch. The exec switch is judged separately by `accessFault`, so it is assumed on here.
+   */
+  private accessModeCeiling(access: ControlledMachineAccessRow): typeof REMOTE_DESKTOP_ACCESS_MODE[keyof typeof REMOTE_DESKTOP_ACCESS_MODE] {
+    const decision = evaluateMachineAction({
+      accessRole: access.access_role,
+      accessSource: access.access_source,
+      execGranted: access.exec_granted === true,
+      execEnabled: true,
+      participantTurn: false,
+    }, MACHINE_ACTION.GUI_INPUT);
+    return decision.allowed ? REMOTE_DESKTOP_ACCESS_MODE.CONTROL : REMOTE_DESKTOP_ACCESS_MODE.VIEW;
   }
 
   handlesType(type: unknown): boolean {
@@ -1193,6 +1211,7 @@ export class RemoteDesktopRouter {
       return;
     }
 
+    const accessModeCeiling = this.accessModeCeiling(access!);
     const sessionId = mintOpaque();
     const capability = this.deriveCapability(start.requestId, sessionId);
     const routeGeneration = await this.allocateRouteGeneration(db).catch(() => null);
@@ -1238,7 +1257,7 @@ export class RemoteDesktopRouter {
         userId,
         hostId: registryIdentity.hostId,
         endpointGeneration: generation,
-        modeCeiling: REMOTE_DESKTOP_ACCESS_MODE.CONTROL,
+        modeCeiling: accessModeCeiling,
         authorityGeneration: 0,
         expiryRevision: 0,
         expiresAt: 0,
@@ -1255,7 +1274,7 @@ export class RemoteDesktopRouter {
       // Accessibility is not granted -- refuses a Control PREPARE outright, so
       // admitting it as Control failed every attempt with worker_failed and
       // the browser retried forever. It is admitted to View instead.
-      mode: this.admittedMode(),
+      mode: accessModeCeiling === REMOTE_DESKTOP_ACCESS_MODE.VIEW ? REMOTE_DESKTOP_ACCESS_MODE.VIEW : this.admittedMode(),
       inputEpoch: 1,
       reconnectAttempt: start.reconnectAttempt ?? 0,
       registryIdentity,
@@ -1770,6 +1789,18 @@ export class RemoteDesktopRouter {
       if (terminalReason) {
         this.failRoute(route, terminalReason, true);
         return;
+      }
+      // The execute grant can be revoked (or the role downgraded) while the route lives: CONTROL ends at this revalidation, exactly as
+      // the exec switch ends the route.
+      const ceiling = this.accessModeCeiling(access!);
+      if (route.actor.modeCeiling !== ceiling) route.actor = { ...route.actor, modeCeiling: ceiling };
+      if (ceiling === REMOTE_DESKTOP_ACCESS_MODE.VIEW && route.mode === REMOTE_DESKTOP_ACCESS_MODE.CONTROL) {
+        route.mode = REMOTE_DESKTOP_ACCESS_MODE.VIEW;
+        route.inputEpoch += 1;
+        if (!this.hooks.sendDaemon(this.modeState(route), route.daemonGeneration)) {
+          this.failRoute(route, REMOTE_DESKTOP_TERMINAL_REASON.DAEMON_REPLACED, false);
+          return;
+        }
       }
     } else {
       let current: RemoteDesktopActor | null = null;

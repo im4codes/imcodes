@@ -49,6 +49,14 @@ const start = {
   requestId,
 } as const;
 
+/** A share participant WITH the owner's execute grant: the only non-owner who may drive the desktop (GUI input is execute-class). */
+const GRANTED_PARTICIPANT = { access_role: 'participant', access_source: 'share', exec_granted: true } as const;
+/** Operate access without the grant: a share participant the owner never trusted with execute, and any group member. */
+const UNGRANTED_PARTICIPANTS = {
+  'a share participant without the execute grant': { access_role: 'participant', access_source: 'share', exec_granted: false },
+  'a group member (any group role)': { access_role: 'participant', access_source: 'group', exec_granted: false },
+} as const;
+
 function validAccess(now = Date.now()): ControlledMachineAccessRow {
   return {
     id: 'controlled-win',
@@ -62,6 +70,8 @@ function validAccess(now = Date.now()): ControlledMachineAccessRow {
     revoked_at: null,
     access_role: 'owner',
     access_expires_at: null,
+    access_source: 'owner',
+    exec_granted: false,
     controlled_capabilities: [REMOTE_DESKTOP_CAPABILITY],
     node_role: NODE_ROLE.CONTROLLED,
   };
@@ -218,6 +228,57 @@ describe('RemoteDesktopRouter', () => {
     });
     expect(f.daemonMessages.find((message) => message.type === REMOTE_DESKTOP_MSG.PREPARE))
       .toMatchObject({ mode: REMOTE_DESKTOP_ACCESS_MODE.VIEW });
+  });
+
+  // tsk_9a8c291594: remote-desktop CONTROL injects keyboard/mouse input, which can launch anything as the signed-in user. It is
+  // GUI_INPUT in the one rule table, so operate access alone gets a VIEW-only route.
+  describe('Control is execute-class: operate access alone only watches', () => {
+    for (const [label, row] of Object.entries(UNGRANTED_PARTICIPANTS)) {
+      it(`${label} is admitted in View, cannot switch to Control, and the daemon is never told to take input`, async () => {
+        const f = fixture({ resolveAccess: async () => ({ ...validAccess(), ...row }) });
+        await f.router.handleBrowser(f.browserA, 'someone', start);
+        const authority = f.messages(f.browserA).at(-1)!;
+        expect(authority).toMatchObject({ type: REMOTE_DESKTOP_MSG.AUTHORIZED, mode: REMOTE_DESKTOP_ACCESS_MODE.VIEW });
+        expect(f.daemonMessages.find((message) => message.type === REMOTE_DESKTOP_MSG.PREPARE))
+          .toMatchObject({ mode: REMOTE_DESKTOP_ACCESS_MODE.VIEW });
+
+        await f.router.handleBrowser(f.browserA, 'someone', {
+          type: REMOTE_DESKTOP_MSG.MODE_SET,
+          requestId: authority.requestId,
+          sessionId: authority.sessionId,
+          capability: authority.capability,
+          mode: REMOTE_DESKTOP_ACCESS_MODE.CONTROL,
+        });
+        expect(f.messages(f.browserA).at(-1)).toMatchObject({ type: REMOTE_DESKTOP_MSG.ERROR, error: REMOTE_DESKTOP_ERROR.ACCESS_DENIED });
+        expect(f.daemonMessages.some((message) => (
+          message.type === REMOTE_DESKTOP_MSG.MODE_STATE && message.mode === REMOTE_DESKTOP_ACCESS_MODE.CONTROL
+        ))).toBe(false);
+        expect(f.router.stats()).toMatchObject({ active: 1, controlling: 0 });
+      });
+    }
+
+    it('the owner and a participant WITH the grant keep Control', async () => {
+      await authorize(fixture());
+      await authorize(fixture({ resolveAccess: async () => ({ ...validAccess(), ...GRANTED_PARTICIPANT }) }), undefined, 'granted-user');
+    });
+
+    it('revoking the grant (or downgrading the role) while a Control route lives drops it to View at the next revalidation', async () => {
+      let row: ControlledMachineAccessRow = { ...validAccess(), ...GRANTED_PARTICIPANT };
+      const f = fixture({ resolveAccess: async () => row });
+      const authority = await authorize(f, f.browserA, 'granted-user');
+      expect(f.router.sessionsForUser('granted-user')[0]).toMatchObject({ mode: REMOTE_DESKTOP_ACCESS_MODE.CONTROL });
+      row = { ...validAccess(), ...GRANTED_PARTICIPANT, exec_granted: false };
+      await f.router.revalidateUser('granted-user');
+      expect(f.router.sessionsForUser('granted-user')[0]).toMatchObject({ mode: REMOTE_DESKTOP_ACCESS_MODE.VIEW, inputEpoch: 2 });
+      expect(f.daemonMessages.at(-1) && f.daemonMessages.filter((message) => message.type === REMOTE_DESKTOP_MSG.MODE_STATE).at(-1))
+        .toMatchObject({ mode: REMOTE_DESKTOP_ACCESS_MODE.VIEW, sessionId: authority.sessionId });
+      // And it cannot take Control back.
+      await f.router.handleBrowser(f.browserA, 'granted-user', {
+        type: REMOTE_DESKTOP_MSG.MODE_SET, ...authority, mode: REMOTE_DESKTOP_ACCESS_MODE.CONTROL,
+      });
+      expect(f.messages(f.browserA).at(-1)).toMatchObject({ error: REMOTE_DESKTOP_ERROR.ACCESS_DENIED });
+      expect(f.router.stats()).toMatchObject({ controlling: 0 });
+    });
   });
 
   it('still admits input-capable and legacy Windows nodes to Control', async () => {
@@ -1125,7 +1186,7 @@ describe('RemoteDesktopRouter', () => {
     const f = fixture({
       resolveAccess: async () => {
         await gate;
-        return { ...validAccess(), access_role: 'participant' };
+        return { ...validAccess(), ...GRANTED_PARTICIPANT };
       },
     });
     const first = f.router.handleBrowser(f.browserA, 'participant-user', start);
@@ -1282,7 +1343,7 @@ describe('RemoteDesktopRouter', () => {
     const f = fixture({
       resolveAccess: async (userId) => revokedUsers.has(userId)
         ? null
-        : { ...validAccess(), user_id: userId, access_role: 'participant' },
+        : { ...validAccess(), user_id: userId, ...GRANTED_PARTICIPANT },
     });
     const authorityA = await authorize(f, f.browserA, 'participant-a', 'request_revoke_a1');
     const authorityB = await authorize(f, f.browserB, 'participant-b', 'request_revoke_b1');
