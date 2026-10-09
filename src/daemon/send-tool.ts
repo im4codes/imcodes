@@ -1067,7 +1067,16 @@ function executionCloneErrorCode(err: unknown): ExecutionCloneErrorCode | null {
 
 export function listSendTargets(
   caller: SendRuntimeCaller,
-  input: { query?: string; limit?: number; executionPool?: SupervisionExecutionPoolKind } = {},
+  input: {
+    query?: string;
+    limit?: number;
+    executionPool?: SupervisionExecutionPoolKind;
+    /**
+     * The listing is for a turn a shared-session PARTICIPANT started (or the turn's origin is unknown: fail closed). Names, labels and
+     * state of siblings stay (they are what an agent needs to address one); open-pair titles and models of the project do not.
+     */
+    participantView?: boolean;
+  } = {},
   deps?: SendToolDeps,
 ): SendListTargetsResult {
   const d = depsWithDefaults(deps);
@@ -1104,11 +1113,14 @@ export function listSendTargets(
         target.label,
         target.role,
         target.agentType,
-        resolveEffectiveSessionModel(target),
-        target.activeModel,
-        target.requestedModel,
-        target.modelDisplay,
-        target.qwenModel,
+        // A participant view must not be able to search by (and so probe) a model it is not shown.
+        ...(input.participantView ? [] : [
+          resolveEffectiveSessionModel(target),
+          target.activeModel,
+          target.requestedModel,
+          target.modelDisplay,
+          target.qwenModel,
+        ]),
       ].some((value) => String(value ?? '').toLowerCase().includes(query)))
     : candidates;
 
@@ -1135,6 +1147,7 @@ export function listSendTargets(
       executionPools.state === 'configured' ? eligiblePools : undefined,
       // No pool configured: a sub-session of the Brain that the no-pool default would use (same provider family, secondary tier).
       executionPools.state !== 'configured' && isNoPoolDefaultTarget(allSessions, callerProjectName, target),
+      input.participantView === true,
     )),
   };
 }
@@ -6055,15 +6068,17 @@ function toTargetInfo(
   availability: DelegationTargetAvailability,
   eligiblePools?: SupervisionExecutionPoolKind[],
   defaultExecution = false,
+  participantView = false,
 ): SendTargetInfo {
-  const model = resolveEffectiveSessionModel(s);
-  const activeModel = optionalModelField(s.activeModel);
-  const requestedModel = optionalModelField(s.requestedModel);
-  const modelDisplay = optionalModelField(s.modelDisplay);
-  const qwenModel = optionalModelField(s.qwenModel);
+  // A participant view carries no model of the project's sessions and no open-pair title (see listSendTargets).
+  const model = participantView ? undefined : resolveEffectiveSessionModel(s);
+  const activeModel = participantView ? undefined : optionalModelField(s.activeModel);
+  const requestedModel = participantView ? undefined : optionalModelField(s.requestedModel);
+  const modelDisplay = participantView ? undefined : optionalModelField(s.modelDisplay);
+  const qwenModel = participantView ? undefined : optionalModelField(s.qwenModel);
   const activity = sessionActivityOf(s.name);
   const creationMarker = readCreationMarker(s);
-  const openPairs = getTaskPairStore().pairsForSession(s.name)
+  const openPairs = participantView ? [] : getTaskPairStore().pairsForSession(s.name)
     .filter((pair) => pair.state.brain === s.name || pair.state.executor === s.name || pair.state.auditor === s.name)
     .map((pair) => ({
       taskId: pair.state.taskId,
@@ -6088,7 +6103,7 @@ function toTargetInfo(
     ...(activity?.lastMessageAt === undefined ? {} : { lastMessageAt: activity.lastMessageAt }),
     ...(activity?.lastToolCallAt === undefined ? {} : { lastToolCallAt: activity.lastToolCallAt }),
     ...(openPairs.length === 0 ? {} : { openPairs }),
-    ...(creationMarker ? { autoCreated: { createdBy: creationMarker.createdBy, ...(creationMarker.pairTaskId ? { pairTaskId: creationMarker.pairTaskId } : {}) } } : {}),
+    ...(creationMarker ? { autoCreated: { createdBy: creationMarker.createdBy, ...(creationMarker.pairTaskId && !participantView ? { pairTaskId: creationMarker.pairTaskId } : {}) } } : {}),
     providerFamily: resolvePeerAuditProviderFamily(s),
     availability: availability.availability,
     ...(eligiblePools === undefined ? {} : {

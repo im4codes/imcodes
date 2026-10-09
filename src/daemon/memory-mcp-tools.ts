@@ -1744,29 +1744,39 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
     const queued = pairs.filter((pair) => pair.state.status === 'queued').sort(compareQueuedTaskPairs);
     return new Map(queued.map((pair, index) => [pair.state.taskId, index + 1]));
   };
+  /**
+   * Whether the current turn was started by a shared-session participant -- the SAME question the tool gate asks
+   * (shared/participant-turn-tool-policy.ts via `participantTurnRequired`), never a second predicate. An unanswerable question reads as a
+   * participant turn (fail closed). No turn context (tests, unscoped callers) is no gate, exactly as for the gate.
+   */
+  const participantViewRequired = async (): Promise<boolean> => {
+    if (!deps.participantTurnRequired) return false;
+    try { return await deps.participantTurnRequired(); } catch { return true; }
+  };
   const pairProjection = (
     stored: StoredTaskPair,
     sessions: SessionRecord[],
     queuePositions: Map<string, number> = new Map(),
+    participantView = false,
   ) => {
     const state = stored.state;
     return {
       taskId: state.taskId,
-      title: state.title ?? null,
+      title: participantView ? null : (state.title ?? null),
       status: state.status,
       round: state.round,
       blocking: state.blocking,
       executor: pairParticipant(state.executor, sessions),
       auditor: pairParticipant(state.auditor, sessions),
-      executorModel: state.executorModel ?? null,
-      auditorModel: state.auditor === 'none' ? 'none' : (state.auditorModel ?? null),
+      executorModel: participantView ? null : (state.executorModel ?? null),
+      auditorModel: participantView ? null : (state.auditor === 'none' ? 'none' : (state.auditorModel ?? null)),
       queuePosition: state.status === 'queued' ? (queuePositions.get(state.taskId) ?? null) : null,
       urgent: (state as TaskPairState & { urgent?: boolean }).urgent === true,
       queuedAt: state.createdAt,
       startedAt: state.status === 'queued' ? null : (state.startedAt ?? state.createdAt),
       updatedAt: state.updatedAt,
       flags: state.flags,
-      brief: state.brief ?? null,
+      brief: participantView ? null : (state.brief ?? null),
       // What Brain asked for (auto when it left the choice to the daemon) and what exists on disk now.
       workspace: {
         requested: state.workspaceKind ?? 'auto',
@@ -2937,6 +2947,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
         query: stringArg(args, 'query'),
         limit: numberArg(args, 'limit'),
         executionPool: executionPoolValue,
+        participantView: await participantViewRequired(),
       }, sendDepsWithSessions(sessions, {
         isDispatchEnabled: () => deps.sendDeps?.isDispatchEnabled?.() ?? true,
       })) as unknown as ToolResult;
@@ -2955,7 +2966,8 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       const queued = pairs.filter((pair) => pair.state.status === 'queued').sort(compareQueuedTaskPairs);
       const rest = pairs.filter((pair) => pair.state.status !== 'queued');
       const ordered = [...queued, ...rest];
-      return { status: 'ok', pairs: ordered.map((pair) => pairProjection(pair, context.sessions, queuePositions)) };
+      const participantView = await participantViewRequired();
+      return { status: 'ok', pairs: ordered.map((pair) => pairProjection(pair, context.sessions, queuePositions, participantView)) };
     },
     [MEMORY_MCP_TOOL_NAMES.PAIR_GET]: async (input) => {
       const context = await pairCallerContext();
@@ -2976,7 +2988,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       return {
         status: 'ok',
         pair: {
-          ...pairProjection(stored, context.sessions, queuePositions),
+          ...pairProjection(stored, context.sessions, queuePositions, await participantViewRequired()),
           events: getTaskPairStore().listEvents(context.project, taskId, eventLimit),
         },
       };
