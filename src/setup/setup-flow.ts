@@ -894,7 +894,8 @@ export type RetainedArtifactStaging =
 function isMissingContainerPathError(error: unknown): boolean {
   const text = `${error instanceof Error ? error.message : String(error)} `
     + `${(error as { stderr?: unknown } | null)?.stderr ?? ''}`;
-  return /no such file or directory|could not find the file/i.test(text);
+  // Docker 20.x reports a missing `docker cp` source as `No such container:path`; newer CLIs say `Could not find the file`.
+  return /no such file or directory|could not find the file|no such container:path/i.test(text);
 }
 
 function stagingFailure(step: string, error: unknown): RetainedArtifactStaging {

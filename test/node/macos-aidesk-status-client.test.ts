@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { promisify } from 'node:util';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { aideskAgentCompileArgs } from '../../scripts/build-aidesk-app.mjs';
+import { HOST_CLANG_ARCH } from '../helpers/macos-host-arch.js';
 import { REMOTE_DESKTOP_ACCESS_MODE } from '../../shared/remote-desktop.js';
 import { REMOTE_DESKTOP_LOCAL_MANAGEMENT } from '../../shared/remote-desktop-local-management.js';
 import {
@@ -33,7 +34,7 @@ mac('macOS aiDesk status client against the real local panel', () => {
     // The release build's own compile arguments (every source and framework of the agent), not a second hand-written list that can
     // fall behind the first: a source added to the agent once left this link without it.
     execFileSync('/usr/bin/clang++', aideskAgentCompileArgs({
-      arch: process.arch, minimumSystemVersion: '12.3', optimization: '-O0', outPath: agent,
+      arch: HOST_CLANG_ARCH, minimumSystemVersion: '12.3', optimization: '-O0', outPath: agent,
     }), { stdio: 'pipe' });
     panel = await startRemoteDesktopLocalPanel({
       publicNodeId: '1234567890',

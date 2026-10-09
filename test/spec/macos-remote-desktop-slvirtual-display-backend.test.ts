@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
+import { HOST_CLANG_ARCH } from '../helpers/macos-host-arch.js';
 import { readSource } from '../helpers/read-source.js';
 
 const ROOT = resolve(__dirname, '..', '..');
@@ -473,7 +474,7 @@ describe('SLVirtualDisplay exact-instance destroy backend', () => {
     async () => {
       const build = await runNative('xcrun', ['clang++',
         '-std=c++20', '-fsyntax-only', '-Wall', '-Wextra', '-Werror',
-        '-mmacosx-version-min=12.3', '-arch', process.arch,
+        '-mmacosx-version-min=12.3', '-arch', HOST_CLANG_ARCH,
         '-I', NATIVE,
         resolve(NATIVE, 'macos_slvirtual_display_runtime.mm'),
       ], {});
