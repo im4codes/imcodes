@@ -150,7 +150,6 @@ import { FeatureAnnouncementHost } from './components/FeatureAnnouncement.js';
 import { DownloadTransferCenter } from './components/DownloadTransferCenter.js';
 import { mergeUsageUpdate } from './usage-data.js';
 import { ServerIconBar } from './components/ServerIconBar.js';
-import { forgetTaskPairPanelSession } from './task-pair-panel-state.js';
 import { Sidebar, loadSidebarCollapsed, saveSidebarCollapsed } from './components/Sidebar.js';
 import { SessionTree } from './components/SessionTree.js';
 import { P2pRingProgress } from './components/P2pRingProgress.js';
@@ -3528,11 +3527,8 @@ export function App() {
   const closeSubSessionAndClearMaximized = useCallback((id: string) => {
     clearSubSessionMaximized(id);
     removeDesktopWindow(DESKTOP_WINDOW_IDS.subSession(id));
-    // The pair panel's remembered open/closed choice for this sub-session goes with it (the stored map stays bounded).
-    const closing = subSessions.find((sub) => sub.id === id);
-    if (closing) forgetTaskPairPanelSession(selectedServerIdRef.current, closing.sessionName);
     closeSubSession(id);
-  }, [clearSubSessionMaximized, closeSubSession, removeDesktopWindow, subSessions]);
+  }, [clearSubSessionMaximized, closeSubSession, removeDesktopWindow]);
 
   const defaultShellPref = usePref<string>(PREF_KEY_DEFAULT_SHELL, { parse: parseString });
   // Weekly (7d) quota opt-in (per-user pref → all servers). Tell the daemon

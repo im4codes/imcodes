@@ -9,11 +9,13 @@ import { formatTaskDuration } from '../util/tool-duration.js';
 import { watchProjectionStore } from '../watch-projection.js';
 import { TaskPairBrief } from './TaskPairBrief.js';
 import {
-  TASK_PAIR_PANEL_LIVE_STATUSES,
-  readTaskPairPanelChoice,
+  cleanLegacyTaskPairPanelKeysOnce,
+  isPhoneScreen,
+  readServerWideChoice,
   resolveTaskPairPanelCollapsed,
   serverWideStorageKey,
-  writeTaskPairPanelChoice,
+  usesVisitScopedChoice,
+  writeServerWideChoice,
 } from '../task-pair-panel-state.js';
 
 const MAX_ROWS = 6;
@@ -153,18 +155,23 @@ function resolveSessionThinking(
 export function TaskPairStatusPanel({ events, sessions, serverId, scopeSessionId }: { events: readonly TimelineEvent[]; sessions?: readonly SessionLabelEntry[]; serverId?: string | null; scopeSessionId?: string | null }) {
   const { t } = useTranslation();
   const [isMobile, setIsMobile] = useState(isMobileLayout);
-  // The user's own choice for this panel (undefined: none yet). What is shown follows from it plus the defaults, so a resize, a layout
-  // check or a remount can never overwrite a choice with a default (see task-pair-panel-state.ts).
-  const [choice, setChoice] = useState<boolean | undefined>(() => readTaskPairPanelChoice({ serverId, mobile: isMobileLayout(), scopeSessionId }));
+  // A phone sub-session shows its panel CLOSED every time it is opened and keeps the user's own choice in this component's memory only
+  // (it lives while the view stays mounted, through resizes, and is gone when the user leaves): nothing is stored. The main chat and
+  // the desktop keep the stored server-wide flag. See task-pair-panel-state.ts.
+  const phoneNow = () => isPhoneScreen({ mobile: isMobileLayout(), screenWidth: window.screen?.width, screenHeight: window.screen?.height, innerWidth: window.innerWidth });
+  const [phone, setPhone] = useState(phoneNow);
+  const visitScoped = usesVisitScopedChoice({ phone, scopeSessionId });
+  const [choice, setChoice] = useState<boolean | undefined>(() => (usesVisitScopedChoice({ phone: phoneNow(), scopeSessionId }) ? undefined : readServerWideChoice({ serverId, mobile: isMobileLayout() })));
+  cleanLegacyTaskPairPanelKeysOnce();
   // The mobile panel is measured against the visible chat area; when too little
   // room is left (landscape phone, keyboard open) the collapsed strip is shown
-  // instead, without touching the user's stored choice.
+  // instead, without touching the user's choice.
   const [cramped, setCramped] = useState(false);
   const panelRef = useRef<HTMLElement>(null);
   const persistCollapsed = useCallback((next: boolean) => {
     setChoice(next);
-    writeTaskPairPanelChoice({ serverId, mobile: isMobile, scopeSessionId, collapsed: next });
-  }, [serverId, isMobile, scopeSessionId]);
+    if (!visitScoped) writeServerWideChoice({ serverId, mobile: isMobile, collapsed: next });
+  }, [serverId, isMobile, visitScoped]);
   useLayoutEffect(() => {
     const panel = panelRef.current;
     if (!isMobile || !panel) { setCramped(false); return undefined; }
@@ -174,18 +181,20 @@ export function TaskPairStatusPanel({ events, sessions, serverId, scopeSessionId
     const media = window.matchMedia?.('(max-width: 720px)');
     if (!media) return undefined;
     // Only the layout class is tracked here; the choice is re-read by the effect below when the layout (or the panel's scope) changes.
-    const onChange = () => setIsMobile(isMobileLayout());
+    const onChange = () => { setIsMobile(isMobileLayout()); setPhone(phoneNow()); };
     media.addEventListener?.('change', onChange);
     window.addEventListener('resize', onChange);
     return () => { media.removeEventListener?.('change', onChange); window.removeEventListener('resize', onChange); };
   }, []);
-  const scopeKey = `${serverId ?? ''}|${scopeSessionId ?? ''}|${isMobile ? 'm' : 'd'}`;
+  // The choice is re-resolved only when what it belongs to changes: another server or sub-session, or the layout class. A phone
+  // sub-session starts closed again for a different session; a resize within the same view never reaches this.
+  const scopeKey = `${serverId ?? ''}|${scopeSessionId ?? ''}|${isMobile ? 'm' : 'd'}|${visitScoped ? 'v' : 's'}`;
   const lastScopeKey = useRef(scopeKey);
   useEffect(() => {
     if (lastScopeKey.current === scopeKey) return;
     lastScopeKey.current = scopeKey;
-    setChoice(readTaskPairPanelChoice({ serverId, mobile: isMobile, scopeSessionId }));
-  }, [scopeKey, serverId, isMobile, scopeSessionId]);
+    setChoice(visitScoped ? undefined : readServerWideChoice({ serverId, mobile: isMobile }));
+  }, [scopeKey, serverId, isMobile, visitScoped]);
   const [snapshotRows, setSnapshotRows] = useState<readonly Record<string, unknown>[] | null>(() => {
     const detail = (window as Window & { __imcodesTaskPairSnapshot?: { tasks?: readonly Record<string, unknown>[]; assignments?: readonly Record<string, unknown>[] } }).__imcodesTaskPairSnapshot;
     return detail ? normalizeSnapshot(detail) : null;
@@ -251,10 +260,9 @@ export function TaskPairStatusPanel({ events, sessions, serverId, scopeSessionId
     return result;
   }, { working: 0, audit: 0, queued: 0, awaitingBrain: 0 });
   if (latest.size === 0 || allRows.length === 0) return null;
-  // What is shown: the user's own choice if there is one, else the default (a phone's sub-session opens when it has a live task);
-  // too little room on a phone shows the strip without touching the choice.
-  const hasLiveTask = allRows.some((row) => TASK_PAIR_PANEL_LIVE_STATUSES.includes(String(row.payload.toStatus)));
-  const collapsed = resolveTaskPairPanelCollapsed({ choice, mobile: isMobile, scopeSessionId, hasLiveTask }) || (isMobile && cramped);
+  // What is shown: the user's own choice if there is one, else the default (a phone sub-session: closed); too little room on a phone
+  // shows the strip without touching the choice.
+  const collapsed = resolveTaskPairPanelCollapsed({ choice, mobile: isMobile, phone, scopeSessionId }) || (isMobile && cramped);
   const toggle = () => persistCollapsed(!collapsed);
   const toggleWithKeyboard = (event: KeyboardEvent) => {
     if (event.key !== 'Enter' && event.key !== ' ') return;
