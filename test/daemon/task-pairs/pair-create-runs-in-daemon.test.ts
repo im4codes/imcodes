@@ -8,6 +8,7 @@
  */
 import { mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
+import { SHARED_MACHINE_AUTHORITY_HOOK_PATH } from '../../../shared/shared-machine-authority.js';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
@@ -36,6 +37,12 @@ describe('pair_create called through the real stdio MCP child', () => {
 
     const received: Array<{ tool?: unknown; input?: unknown; sender?: string }> = [];
     const hookServer = createServer((req, res) => {
+      if (req.method === 'POST' && req.url === SHARED_MACHINE_AUTHORITY_HOOK_PATH) {
+        // The stdio child asks whose turn this is before it runs an owner-level tool; this is the owner's own turn.
+        req.resume();
+        req.on('end', () => { res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ ok: true, required: false, authority: null })); });
+        return;
+      }
       if (req.method !== 'POST' || req.url !== MEMORY_MCP_DAEMON_RPC_PATH) { res.writeHead(404); res.end(); return; }
       let raw = '';
       req.setEncoding('utf8');
