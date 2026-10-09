@@ -21,6 +21,7 @@ import { REMOTE_DESKTOP_CAPABILITY } from '../../shared/remote-desktop.js';
 import { CONTROLLED_NODE_AUTO_UNLOCK_ERROR } from '../../shared/controlled-node-auto-unlock.js';
 import { REMOTE_DESKTOP_INSTALLABLE_CAPABILITY } from '../../shared/remote-desktop-install.js';
 import { CONTROLLED_NODE_WORKER_REFRESH_CAPABILITY } from '../../shared/controlled-node-worker-refresh.js';
+import { DAEMON_TOKEN_ROUTE_NOT_ALLOWED } from '../../shared/daemon-token-routes.js';
 import { signJwt } from '../src/security/crypto.js';
 import { generateControlledNodeId } from '../src/services/controlled-node-identity.js';
 import { listMachines as decodeMachineList } from '../../src/daemon/machine-exec-client.js';
@@ -84,12 +85,12 @@ async function seedV2Enrollment(code: string, userId: string): Promise<void> {
   );
 }
 
-/** A FULL server credential for `userId`, usable as X-Server-Id + Bearer. */
-async function fullCredential(userId: string): Promise<{ serverId: string; token: string }> {
+/** Separate daemon and account credentials: owner management uses the account JWT. */
+async function fullCredential(userId: string): Promise<{ serverId: string; token: string; accountToken: string }> {
   const token = hex(16);
   const serverId = hex(8);
   await createServer(db, serverId, userId, 'full-box', sha256(token)); // node_role defaults to full
-  return { serverId, token };
+  return { serverId, token, accountToken: signJwt({ sub: userId, role: 'owner' }, JWT_KEY, 3600) };
 }
 
 describe('D-A transactional / idempotent redeem', () => {
@@ -162,7 +163,7 @@ describe('revocation kill-switch', () => {
     const kickSpy = vi.spyOn(WsBridge.get(serverId), 'kickDaemon');
 
     const revoke = await app.request(`/api/machines/${serverId}/revoke`, {
-      method: 'POST', headers: { 'X-Server-Id': owner.serverId, authorization: `Bearer ${owner.token}` },
+      method: 'POST', headers: { authorization: `Bearer ${owner.accountToken}` },
     });
     expect(revoke.status).toBe(200);
     expect(kickSpy).toHaveBeenCalledOnce();
@@ -192,8 +193,7 @@ describe('owner-scoped machine rename', () => {
     const response = await app.request(`/api/machines/${controlledId}/display-name`, {
       method: 'POST',
       headers: {
-        'X-Server-Id': owner.serverId,
-        authorization: `Bearer ${owner.token}`,
+        authorization: `Bearer ${owner.accountToken}`,
         'content-type': 'application/json',
       },
       body: JSON.stringify({ displayName: '  Office PC  ' }),
@@ -221,8 +221,7 @@ describe('owner-scoped machine rename', () => {
       [controlledId, userId, sha256(hex(16)), Date.now(), NODE_ROLE.CONTROLLED, generateControlledNodeId()],
     );
     const headers = {
-      'X-Server-Id': owner.serverId,
-      authorization: `Bearer ${owner.token}`,
+      authorization: `Bearer ${owner.accountToken}`,
       'content-type': 'application/json',
     };
 
@@ -237,8 +236,7 @@ describe('owner-scoped machine rename', () => {
     const denied = await app.request(`/api/machines/${controlledId}/display-name`, {
       method: 'POST',
       headers: {
-        'X-Server-Id': otherOwner.serverId,
-        authorization: `Bearer ${otherOwner.token}`,
+        authorization: `Bearer ${otherOwner.accountToken}`,
         'content-type': 'application/json',
       },
       body: JSON.stringify({ displayName: 'Hijacked' }),
@@ -268,8 +266,7 @@ describe('auto unlock capability gate', () => {
     const response = await app.request(`/api/machines/${controlledId}/auto-unlock`, {
       method: 'POST',
       headers: {
-        'X-Server-Id': owner.serverId,
-        authorization: `Bearer ${owner.token}`,
+        authorization: `Bearer ${owner.accountToken}`,
         'content-type': 'application/json',
       },
       body: JSON.stringify({ secret: 'hunter2' }),
@@ -312,8 +309,7 @@ describe('remote desktop worker quick install', () => {
       .mockReturnValue('sent');
     try {
       const headers = {
-        'X-Server-Id': owner.serverId,
-        authorization: `Bearer ${owner.token}`,
+      authorization: `Bearer ${owner.accountToken}`,
       };
       const response = await app.request(`/api/machines/${controlledId}/remote-desktop-worker`, {
         method: 'POST', headers,
@@ -325,8 +321,7 @@ describe('remote desktop worker quick install', () => {
       const denied = await app.request(`/api/machines/${controlledId}/remote-desktop-worker`, {
         method: 'POST',
         headers: {
-          'X-Server-Id': other.serverId,
-          authorization: `Bearer ${other.token}`,
+        authorization: `Bearer ${other.accountToken}`,
         },
       });
       expect(denied.status).toBe(404);
@@ -382,8 +377,7 @@ describe('remote desktop worker quick install', () => {
       const response = await app.request(`/api/machines/${controlledId}/remote-desktop-worker`, {
         method: 'POST',
         headers: {
-          'X-Server-Id': owner.serverId,
-          authorization: `Bearer ${owner.token}`,
+        authorization: `Bearer ${owner.accountToken}`,
         },
       });
       expect(response.status).toBe(202);
@@ -419,8 +413,7 @@ describe('remote desktop worker quick install', () => {
       .mockReturnValue('sent');
     try {
       const headers = {
-        'X-Server-Id': owner.serverId,
-        authorization: `Bearer ${owner.token}`,
+      authorization: `Bearer ${owner.accountToken}`,
       };
       const response = await app.request(`/api/machines/${controlledId}/remote-desktop-worker/refresh`, {
         method: 'POST', headers,
@@ -432,8 +425,7 @@ describe('remote desktop worker quick install', () => {
       const denied = await app.request(`/api/machines/${controlledId}/remote-desktop-worker/refresh`, {
         method: 'POST',
         headers: {
-          'X-Server-Id': other.serverId,
-          authorization: `Bearer ${other.token}`,
+        authorization: `Bearer ${other.accountToken}`,
         },
       });
       expect(denied.status).toBe(404);
@@ -713,7 +705,7 @@ describe('daemon-token routes reject controlled nodes', () => {
     expect(await res.text()).not.toContain(secret);
   });
 
-  it('still serves a full daemon on the same routes', async () => {
+  it('serves only proven full-daemon routes and denies unused owner-private routes', async () => {
     const app = buildApp();
     const userId = `u_${hex(4)}`;
     await createUser(db, userId);
@@ -721,9 +713,14 @@ describe('daemon-token routes reject controlled nodes', () => {
 
     for (const route of daemonRoutes(full.serverId)) {
       const res = await call(app, route, full.token);
-      // Payload validation may still reject a stub body; the guard must not.
-      expect(res.status, `${route.name} must not be role-forbidden for a full daemon`).not.toBe(403);
-      expect(res.status, `${route.name} must authenticate a full daemon`).not.toBe(401);
+      if (route.path.includes('/owner-private')) {
+        expect(res.status).toBe(403);
+        expect(await res.json()).toMatchObject({ reason: DAEMON_TOKEN_ROUTE_NOT_ALLOWED });
+      } else {
+        // Payload validation may still reject a stub body; admission must not.
+        expect(res.status, `${route.name} must not be role-forbidden for a full daemon`).not.toBe(403);
+        expect(res.status, `${route.name} must authenticate a full daemon`).not.toBe(401);
+      }
     }
   });
 

@@ -1,5 +1,5 @@
 import { activeUserAnswer } from './helpers/user-status.js';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { Hono } from 'hono';
 import { sha256Hex } from '../src/security/crypto.js';
 import type { Env } from '../src/env.js';
@@ -10,6 +10,10 @@ import {
   MEMORY_FEATURE_CONFIG_PREF_KEY,
   MEMORY_FEATURE_FLAGS_BY_NAME,
 } from '../../shared/feature-flags.js';
+
+// Below-admission business tests: the private HTTP routes are no longer daemon grants.
+// Mock only the admission boundary; owner identity, namespace and DB isolation stay real.
+vi.mock('../src/security/daemon-token-policy.js', () => ({ enforceDaemonTokenRoute: vi.fn() }));
 
 function makeEnv(db: Database): Env {
   return {
@@ -72,7 +76,7 @@ function makeMockDb(options: { userPrefs?: Record<string, string> } = {}) {
   return { db, executeLog };
 }
 
-describe('user_private owner-only server replication', () => {
+describe('below-admission user_private owner-only server replication', () => {
   beforeEach(() => {
     process.env.IMCODES_MEM_FEATURE_USER_PRIVATE_SYNC = 'true';
   });

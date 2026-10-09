@@ -21,6 +21,7 @@ import { join } from 'node:path';
 import { createDatabase, type Database } from '../src/db/client.js';
 import { runMigrations } from '../src/db/migrate.js';
 import { createUser as createUserRow, createServer } from '../src/db/queries.js';
+import { signJwt } from '../src/security/crypto.js';
 import { createEnrollRoutes, runEnrollmentRetention } from '../src/routes/enroll.js';
 import {
   createArtifactCatalog,
@@ -340,11 +341,11 @@ function buildApp(options: {
   return app;
 }
 
-async function owner(userId: string): Promise<{ serverId: string; token: string }> {
+async function owner(userId: string): Promise<{ serverId: string; token: string; accountToken: string }> {
   const token = hex(16);
   const serverId = hex(8);
   await createServer(db, serverId, userId, 'full-box', sha256(token));
-  return { serverId, token };
+  return { serverId, token, accountToken: signJwt({ sub: userId, role: 'owner' }, 'unused', 3600) };
 }
 
 /**
@@ -372,11 +373,11 @@ async function createUser(dbArg: Database, userId: string) {
   return created;
 }
 
-function ticketHeaders(userId: string, auth: { serverId: string; token: string }): Record<string, string> {
+// Installer management is an account operation, never a daemon-token grant.
+function ticketHeaders(userId: string, auth: { accountToken: string }): Record<string, string> {
   return {
     'content-type': 'application/json',
-    'X-Server-Id': auth.serverId,
-    authorization: `Bearer ${auth.token}`,
+    authorization: `Bearer ${auth.accountToken}`,
     [EXPECTED_USER_ID_HEADER]: userId,
   };
 }
@@ -392,7 +393,7 @@ describe('POST /api/enroll/v2/ticket (artifact manifest → enrollments_v2 row)'
 
     const missing = await app.request('/api/enroll/v2/ticket', {
       method: 'POST',
-      headers: { 'content-type': 'application/json', 'X-Server-Id': o.serverId, authorization: `Bearer ${o.token}` },
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${o.accountToken}` },
       body: JSON.stringify({ version: 2, teamId: deskOf(userId), os: 'linux', arch: 'x64' }),
     });
     expect(missing.status).toBe(428);
@@ -402,8 +403,7 @@ describe('POST /api/enroll/v2/ticket (artifact manifest → enrollments_v2 row)'
       method: 'POST',
       headers: {
         'content-type': 'application/json',
-        'X-Server-Id': o.serverId,
-        authorization: `Bearer ${o.token}`,
+        authorization: `Bearer ${o.accountToken}`,
         [EXPECTED_USER_ID_HEADER]: 'different-user',
       },
       body: JSON.stringify({ version: 2, teamId: deskOf(userId), os: 'linux', arch: 'x64' }),
@@ -2275,7 +2275,7 @@ describe('GET /api/enroll/v2/availability + retention', () => {
     const userId = `u_${hex(4)}`;
     await createUser(db, userId);
     const o = await owner(userId);
-    const headers = { 'X-Server-Id': o.serverId, authorization: `Bearer ${o.token}`, [EXPECTED_USER_ID_HEADER]: userId };
+    const headers = { authorization: `Bearer ${o.accountToken}`, [EXPECTED_USER_ID_HEADER]: userId };
 
     const [firstResponse, secondResponse] = await Promise.all([
       firstApp.request('/api/enroll/v2/availability', { headers }),
@@ -2293,7 +2293,7 @@ describe('GET /api/enroll/v2/availability + retention', () => {
     const userId = `u_${hex(4)}`;
     await createUser(db, userId);
     const o = await owner(userId);
-    const headers = { 'X-Server-Id': o.serverId, authorization: `Bearer ${o.token}`, [EXPECTED_USER_ID_HEADER]: userId };
+    const headers = { authorization: `Bearer ${o.accountToken}`, [EXPECTED_USER_ID_HEADER]: userId };
     const responses = await Promise.all(Array.from({ length: 20 }, () => (
       app.request('/api/enroll/v2/availability', { headers })
     )));
@@ -2323,7 +2323,7 @@ describe('GET /api/enroll/v2/availability + retention', () => {
     const userId = `u_${hex(4)}`;
     await createUser(db, userId);
     const o = await owner(userId);
-    const headers = { 'X-Server-Id': o.serverId, authorization: `Bearer ${o.token}`, [EXPECTED_USER_ID_HEADER]: userId };
+    const headers = { authorization: `Bearer ${o.accountToken}`, [EXPECTED_USER_ID_HEADER]: userId };
     const available = await app.request('/api/enroll/v2/availability', { headers });
     const catalog = await available.json() as { artifacts: Array<{ os: string; arch: string }> };
     expect(catalog.artifacts).toContainEqual(expect.objectContaining({ os: 'mac', arch: 'universal' }));
@@ -2385,7 +2385,7 @@ describe('GET /api/enroll/v2/availability + retention', () => {
     await createUser(db, userId);
     const o = await owner(userId);
     const r = await app.request('/api/enroll/v2/availability', {
-      headers: { 'X-Server-Id': o.serverId, authorization: `Bearer ${o.token}` },
+      headers: { authorization: `Bearer ${o.accountToken}` },
     });
     expect(r.status).toBe(200);
     const body = await r.json() as { artifacts: Array<{ os: string; arch: string; sizeBytes: number; sha256: string; source: string }> };

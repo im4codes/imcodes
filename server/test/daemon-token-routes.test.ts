@@ -26,6 +26,11 @@ describe('daemon credentials are admitted only on explicitly called routes', () 
     ['POST', '/api/push/register', { token: 'fixture-push-device', platform: PUSH_PLATFORM_IOS }],
     ['GET', '/api/auth/user/me'], ['GET', '/api/auth/user/me/keys'],
     ['POST', '/api/auth/user/me/keys', {}], ['PATCH', '/api/auth/user/me', { display_name: 'x' }],
+    ['POST', '/api/server/srv-1/shared-context/owner-private', { records: [] }],
+    ['POST', '/api/server/srv-1/shared-context/owner-private/search', { query: '' }],
+    ['GET', '/api/session-identities/all?serverId=srv-1'],
+    ['POST', '/api/machines/srv-1/revoke'],
+    ['POST', '/api/enroll/v2/ticket', {}],
     ['GET', '/api/admin/users'], ['POST', '/api/bind/direct', { serverName: 'fixture' }],
     ['GET', '/api/unknown-new-account-route'], ['POST', '/api/aliases/admin', {}],
   ];

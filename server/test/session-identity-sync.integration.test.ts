@@ -4,12 +4,13 @@ import { buildApp } from '../src/index.js';
 import { createDatabase, type Database } from '../src/db/client.js';
 import { runMigrations } from '../src/db/migrate.js';
 import { createServer, createUser } from '../src/db/queries.js';
-import { randomHex, sha256Hex } from '../src/security/crypto.js';
+import { randomHex, sha256Hex, signJwt } from '../src/security/crypto.js';
 import { listSessionIdentityProfiles } from '../src/db/session-identity-queries.js';
 import {
   SESSION_IDENTITY_SYNC_MAX_PROFILES,
   SESSION_IDENTITY_SYNC_MAX_BYTES,
 } from '../../shared/session-identity.js';
+import { DAEMON_TOKEN_ROUTE_NOT_ALLOWED } from '../../shared/daemon-token-routes.js';
 import type { Env } from '../src/env.js';
 
 let db: Database;
@@ -94,11 +95,17 @@ describe('session identity synchronization bounds', () => {
     expect(profiles.reduce((bytes, item) => bytes + Buffer.byteLength(item.content), 0))
       .toBeLessThanOrEqual(SESSION_IDENTITY_SYNC_MAX_BYTES);
 
-    const response = await app().request(`/api/session-identities/all?serverId=${serverId}`, {
+    const denied = await app().request(`/api/session-identities/all?serverId=${serverId}`, {
       headers: {
         Authorization: `Bearer ${token}`,
         'X-Server-Id': serverId,
       },
+    });
+    expect(denied.status).toBe(403);
+    expect(await denied.json()).toMatchObject({ reason: DAEMON_TOKEN_ROUTE_NOT_ALLOWED });
+    // This HTTP snapshot is an account route; daemons synchronize identities over WS.
+    const response = await app().request(`/api/session-identities/all?serverId=${serverId}`, {
+      headers: { Authorization: `Bearer ${signJwt({ sub: userId, role: 'owner' }, JWT_KEY, 3600)}` },
     });
     expect(response.status).toBe(200);
     const body = await response.json() as { profiles: unknown[]; truncated: boolean };
