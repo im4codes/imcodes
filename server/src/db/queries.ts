@@ -583,6 +583,12 @@ export async function getFullServersByUserId(db: Database, userId: string): Prom
 
 // ── Channel bindings ──────────────────────────────────────────────────────
 
+/** Owner of a chat-platform bot, or null when no such bot exists. */
+export async function getPlatformBotOwnerId(db: Database, botId: string): Promise<string | null> {
+  const row = await db.queryOne<{ user_id: string }>('SELECT user_id FROM platform_bots WHERE id = $1', [botId]);
+  return row?.user_id ?? null;
+}
+
 export async function upsertChannelBinding(
   db: Database,
   id: string,

@@ -7,6 +7,7 @@ import {
   updateServerHeartbeat,
   updateServerName,
   deleteServer,
+  getPlatformBotOwnerId,
   upsertChannelBinding,
   getServerById,
   getServerSharedContextRuntimeConfig,
@@ -609,6 +610,12 @@ serverRoutes.post('/:id/bindings', async (c) => {
   if (!parsed.success) return c.json({ error: 'invalid_body' }, 400);
 
   const { platform, channelId, botId, bindingType, target } = parsed.data;
+  // A binding routes that bot's inbound webhook messages to this server's daemon, and the upsert re-points an existing one. The bot
+  // must therefore be the server owner's own (outbound.ts applies the same rule to sends): otherwise a daemon could take over the
+  // chat channel of any bot whose id it learned.
+  if (await getPlatformBotOwnerId(c.env.DB, botId) !== serverRow.userId) {
+    return c.json({ error: 'forbidden' }, 403);
+  }
   const id = randomHex(16);
   await upsertChannelBinding(c.env.DB, id, serverRow.serverId, platform, channelId, bindingType, target, botId);
 
