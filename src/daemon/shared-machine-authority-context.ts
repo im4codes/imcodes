@@ -228,6 +228,11 @@ export function readProcessSharedMachineAuthority(
   return { required: true, authority: window.authority };
 }
 
+/** The participant users that fed the session during the current window (empty for owner-only or no window). */
+export function readProcessSharedMachineParticipants(sessionName: string): string[] {
+  return [...(windows.get(sessionName)?.participants ?? [])];
+}
+
 export function clearProcessSharedMachineAuthoritiesForTests(): void {
   windows.clear();
 }

@@ -5494,6 +5494,8 @@ export async function sendProcessSessionMessageForAutomation(
     suppressTimeline?: boolean;
     /** Command mode (shared/send-command-mode.ts): no memory recall, sandbox path rewrite or preamble. */
     verbatim?: boolean;
+    /** The text reached the terminal (an idle edge after this ends the turn it started). */
+    onTyped?: () => void;
     userMessageMetadata?: Readonly<{
       allowDuplicate?: boolean;
       memoryExcluded?: boolean;
@@ -5510,6 +5512,7 @@ export async function sendProcessSessionMessageForAutomation(
     originalText: text,
     ...(options?.verbatim ? { verbatim: true } : {}),
     ...(options?.suppressTimeline ? { suppressTimeline: true } : {}),
+    ...(options?.onTyped ? { onTyped: options.onTyped } : {}),
     ...(options?.userMessageMetadata ? { userMessageMetadata: options.userMessageMetadata } : {}),
   });
 }
