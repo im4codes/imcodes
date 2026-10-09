@@ -453,11 +453,78 @@ describe('shared-context and file API contracts', () => {
     );
   });
 
+  describe('previewAttachment never renders a script-capable file on the app origin', () => {
+    const SCRIPT_SVG = '<svg xmlns="http://www.w3.org/2000/svg"><script>alert(document.domain)</script></svg>';
+    const SCRIPT_HTML = '<!doctype html><script>alert(document.domain)</script>';
+
+    async function preview(contentType: string | undefined, body: string, extra: Record<string, string> = {}) {
+      const objectUrls: Blob[] = [];
+      Object.defineProperty(URL, 'createObjectURL', { configurable: true, value: vi.fn((blob: Blob) => { objectUrls.push(blob); return `blob:test-${objectUrls.length}`; }) });
+      Object.defineProperty(URL, 'revokeObjectURL', { configurable: true, value: vi.fn() });
+      const opened = vi.spyOn(window, 'open').mockReturnValue(null);
+      const anchors: Array<{ download: string; href: string }> = [];
+      vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(function (this: HTMLAnchorElement) {
+        anchors.push({ download: this.download, href: this.href });
+      });
+      vi.mocked(fetch).mockResolvedValueOnce(blobResponse(body, { ...(contentType === undefined ? {} : { 'Content-Type': contentType }), ...extra }));
+      const { configure, previewAttachment } = await import('../src/api.js');
+      configure('https://api.example');
+      await previewAttachment('srv-1', 'att-x', 'deck_project_brain');
+      return { objectUrls, opened, anchors };
+    }
+
+    it.each([
+      ['image/svg+xml', SCRIPT_SVG, 'evil.svg'],
+      ['IMAGE/SVG+XML; charset=utf-8', SCRIPT_SVG, 'evil2.svg'],
+      ['text/html', SCRIPT_HTML, 'evil.html'],
+      ['application/xhtml+xml', SCRIPT_HTML, 'evil.xhtml'],
+      ['text/xml', SCRIPT_SVG, 'evil.xml'],
+      ['application/javascript', 'alert(1)', 'evil.js'],
+      ['application/pdf', '%PDF-1.4', 'doc.pdf'],
+      ['image/x-surprise', 'x', 'odd.img'],
+      [undefined, 'x', 'unknown.bin'],
+    ] as const)('%s is saved as a file (octet-stream), never opened', async (contentType, body, name) => {
+      const { objectUrls, opened, anchors } = await preview(contentType, body, { 'Content-Disposition': `attachment; filename="${name}"` });
+      expect(opened).not.toHaveBeenCalled();
+      expect(objectUrls).toHaveLength(1);
+      expect(objectUrls[0]!.type).toBe('application/octet-stream'); // a blob: document of this type cannot be script
+      expect(anchors).toEqual([{ download: name, href: 'blob:test-1' }]);
+    });
+
+    it.each(['image/png', 'image/jpeg', 'image/gif', 'image/webp', 'image/avif', 'image/bmp', 'IMAGE/PNG', 'image/png; foo=bar'])('%s is still opened for preview, re-wrapped with exactly its bare type', async (contentType) => {
+      const { objectUrls, opened, anchors } = await preview(contentType, 'bytes');
+      expect(opened).toHaveBeenCalledWith('blob:test-1', '_blank');
+      expect(objectUrls[0]!.type).toBe(contentType.split(';')[0]!.trim().toLowerCase());
+      expect(anchors).toEqual([]);
+    });
+
+    it('a raster label can never carry a document type onto the blob: it is re-typed from the bare type, and a malformed label is saved, not opened', async () => {
+      const valid = await preview('image/png; charset=utf-8', SCRIPT_HTML);
+      expect(valid.objectUrls[0]!.type).toBe('image/png'); // not text/html, whatever the bytes are
+      vi.restoreAllMocks();
+      const malformed = await preview('image/png; charset=text/html', SCRIPT_HTML);
+      expect(malformed.opened).not.toHaveBeenCalled();
+      expect(malformed.objectUrls[0]!.type).toBe('application/octet-stream');
+    });
+
+    it('the native shell hands the authenticated URL to the system browser instead of building a blob in its own WebView', async () => {
+      vi.stubGlobal('Capacitor', { isNativePlatform: () => true });
+      const createObjectURL = vi.fn(() => 'blob:never');
+      Object.defineProperty(URL, 'createObjectURL', { configurable: true, value: createObjectURL });
+      vi.mocked(fetch).mockResolvedValueOnce(jsonResponse({ token: 'z'.repeat(32) }));
+      const { configure, previewAttachment } = await import('../src/api.js');
+      configure('https://api.example');
+      await previewAttachment('srv-1', 'att-native');
+      expect(browserOpenMock).toHaveBeenCalledWith({ url: `https://api.example/api/server/srv-1/uploads/att-native/download?token=${'z'.repeat(32)}` });
+      expect(createObjectURL).not.toHaveBeenCalled();
+    });
+  });
+
   it('downloads and previews attachments through desktop and native paths', async () => {
     vi.useFakeTimers();
     const fetchMock = vi.mocked(fetch);
     fetchMock
-      .mockResolvedValueOnce(blobResponse('preview'))
+      .mockResolvedValueOnce(blobResponse('preview', { 'Content-Type': 'image/png' }))
       .mockResolvedValueOnce(jsonResponse({ token: 'x'.repeat(32) }))
       .mockResolvedValueOnce(jsonResponse({ token: 'y'.repeat(32) }));
 

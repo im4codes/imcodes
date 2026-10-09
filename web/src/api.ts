@@ -29,6 +29,7 @@ import type { ContextMemoryView, ContextModelConfig } from '@shared/context-type
 import type { AuthoredContextScope } from '@shared/memory-scope.js';
 import type { SharedContextRuntimeConfigSnapshot } from '@shared/shared-context-runtime-config.js';
 import { isNative } from './native.js';
+import { openFetchedAttachment } from './attachment-open.js';
 import {
   SUPERVISION_USER_DEFAULT_PREF_KEY,
   normalizeSupervisorDefaultConfig,
@@ -2352,6 +2353,14 @@ export async function createControlledNodeInstallCommand(
 }
 
 export async function previewAttachment(serverId: string, attachmentId: string, sessionName?: string): Promise<void> {
+  // The native shell hands the authenticated URL to the system browser (as downloadAttachment does): a blob: document opened in the app's
+  // own WebView would belong to the app origin. The server's download headers (attachment/nosniff/sandbox CSP) apply there.
+  if (isNative()) {
+    const nativeUrl = await buildAttachmentDownloadUrl(serverId, attachmentId, sessionName);
+    const { Browser } = await import('@capacitor/browser');
+    await Browser.open({ url: nativeUrl });
+    return;
+  }
   const downloadUrl = await buildAttachmentDownloadUrl(serverId, attachmentId, sessionName);
   const res = await rawFetchUrl(downloadUrl);
   if (!res.ok) {
@@ -2359,9 +2368,11 @@ export async function previewAttachment(serverId: string, attachmentId: string, 
     throw new ApiError(res.status, body);
   }
   const blob = await res.blob();
-  const url = URL.createObjectURL(blob);
-  window.open(url, '_blank');
-  setTimeout(() => URL.revokeObjectURL(url), 60_000);
+  // Only a raster image is ever opened on the app origin; anything that could be a document is saved as a file (attachment-open.ts).
+  openFetchedAttachment(blob, {
+    contentType: res.headers.get('content-type'),
+    contentDisposition: res.headers.get('content-disposition'),
+  }, attachmentId);
 }
 
 /**
