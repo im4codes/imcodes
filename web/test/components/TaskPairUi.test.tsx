@@ -22,6 +22,7 @@ import { TaskPairSettingsSection, type TaskPairSettingsValue } from '../../src/c
 import { SUPERVISION_CONSOLE_UNAVAILABLE_REASONS } from '../../../shared/supervision-task-console.js';
 import {
   TASK_PAIR_STATUSES,
+  TASK_PAIR_TERMINAL_STATUSES,
   TASK_PAIR_WORKSPACE_EFFECTS,
   TASK_PAIR_WORKSPACE_EVENT_VERB,
 } from '../../../shared/task-pair.js';
@@ -504,6 +505,27 @@ describe('TaskPairStatusPanel', () => {
     expect(snapshot.tasks[0].pair.startedAt).toBe(123);
     expect(snapshot.tasks[0].brief).toBe('Keep this brief');
   });
+  it('does not resurrect terminal rows whose historical flags still request Brain attention', () => {
+    const snapshot = taskConsoleStateToPairSnapshot({
+      tasks: Object.fromEntries(TASK_PAIR_TERMINAL_STATUSES.map((status, index) => [status, {
+        taskId: status,
+        title: `${status} history`,
+        phase: 'final',
+        updatedAt: 300 + index,
+        pair: {
+          status,
+          flags: ['blocked', 'needs_input'],
+          round: 1,
+          blocking: ['P0'],
+          createdAt: 100,
+          startedAt: 100,
+          updatedAt: 300 + index,
+        },
+      }])),
+      assignments: {},
+    } as never);
+    expect(snapshot.tasks).toEqual([]);
+  });
   it('clears the prior scope snapshot before the next authoritative sync', async () => {
     (window as Window & { __imcodesTaskPairSnapshot?: unknown }).__imcodesTaskPairSnapshot = { tasks: [{ taskId: 'old-scope', title: 'Old scope', pair: { status: 'working' } }] };
     render(<TaskPairStatusPanelHost events={[]} serverId="scope-a" />);
@@ -512,6 +534,20 @@ describe('TaskPairStatusPanel', () => {
     await waitFor(() => expect(screen.queryByText('Old scope')).toBeNull());
     window.dispatchEvent(new CustomEvent('supervision:task-pairs', { detail: { tasks: [{ taskId: 'new-scope', title: 'New scope', pair: { status: 'working' } }], assignments: [], authoritative: true } }));
     expect(await waitFor(() => screen.getByText('New scope'))).toBeTruthy();
+  });
+  it('clears historical compact rows when the authoritative active snapshot is empty', async () => {
+    (window as Window & { __imcodesTaskPairSnapshot?: unknown }).__imcodesTaskPairSnapshot = {
+      tasks: [{ taskId: 'stale', title: 'Stale history', pair: { status: 'awaiting_brain_decision', flags: [] } }],
+      assignments: [],
+      authoritative: true,
+    };
+    const { container } = render(<TaskPairStatusPanelHost events={[]} serverId="active-empty" />);
+    expect(screen.getByText('Stale history')).toBeTruthy();
+    window.dispatchEvent(new CustomEvent('supervision:task-pairs', {
+      detail: { tasks: [], assignments: [], authoritative: true },
+    }));
+    await waitFor(() => expect(container.querySelector('.task-pair-status-panel')).toBeNull());
+    expect(screen.queryByText('Stale history')).toBeNull();
   });
   it('shows "round N in progress" for a working pair in a later delivery round instead of a passed/plain working label', () => {
     const at = Date.now();

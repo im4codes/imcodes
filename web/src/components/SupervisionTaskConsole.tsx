@@ -75,6 +75,13 @@ export function taskConsoleStateToPairSnapshot(state: SupervisionTaskConsoleRedu
       startedAt: task.updatedAt,
       updatedAt: task.updatedAt,
     };
+    // Historical terminal rows may retain the flags from the last open
+    // transition (for example `blocked`/`needs_input`).  Those flags are
+    // metadata, not a new lifecycle transition: applying them before the
+    // visibility check would resurrect a completed pair as
+    // `awaiting_brain_decision` in the compact panel.  The engine's lifecycle
+    // status is authoritative for whether a row can be shown as active.
+    if (TASK_PAIR_TERMINAL_STATUSES.includes(pair.status)) return [];
     const flags = [...(pair.flags ?? [])];
     const waitingForBrain = flags.some((flag) => BRAIN_DECISION_FLAGS.has(flag));
     const normalizedPair = {
