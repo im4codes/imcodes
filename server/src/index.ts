@@ -1,3 +1,5 @@
+import { MachineGroupInvalidationRuntime } from './services/machine-group-invalidation.js';
+import { applyMachineGroupInvalidation, failClosedMachineGroupConnections } from './ws/machine-group-revalidation.js';
 /**
  * IM.codes Node.js server entry point.
  * Replaces the Cloudflare Workers deployment.
@@ -909,6 +911,12 @@ async function main() {
   await ensureDefaultAdmin(db, envConfig);
   await initializeAuthNonceCleanup(db);
 
+  const machineGroupInvalidation = new MachineGroupInvalidationRuntime(
+    db, (scope) => applyMachineGroupInvalidation(db, scope), failClosedMachineGroupConnections,
+    envConfig.DATABASE_URL, (error) => logger.error({ error }, 'Machine group invalidation failed closed'),
+  );
+  await machineGroupInvalidation.start();
+
   const podId = getPodIdentity();
   const guestOutboxAdapter = new PostgresRemoteDesktopGuestOutboxDeliveryAdapter(
     db,
@@ -986,6 +994,7 @@ async function main() {
     setRemoteDesktopManagementPrivacyDispatcher(null);
     setRemoteDesktopShellLaunchContextDispatcher(null);
     stopAccountWatch();
+    await machineGroupInvalidation.stop();
     await managementPrivacyWorker.stop();
     try {
       await guestBackgroundRuntime.stop();

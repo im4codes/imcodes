@@ -2,6 +2,7 @@ import { createHash, randomBytes } from 'node:crypto';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import type WebSocket from 'ws';
 import { REMOTE_DESKTOP_CAPABILITY, REMOTE_DESKTOP_MSG, REMOTE_DESKTOP_PROTOCOL_VERSION, REMOTE_DESKTOP_TERMINAL_REASON } from '../../shared/remote-desktop.js';
+import { REMOTE_DESKTOP_ACCESS_MODE } from '../../shared/remote-desktop.js';
 import { NODE_ROLE } from '../../shared/remote-exec.js';
 import { createDatabase, type Database } from '../src/db/client.js';
 import { runMigrations } from '../src/db/migrate.js';
@@ -22,7 +23,7 @@ beforeAll(async () => {
 
 afterAll(async () => { await db.close(); });
 
-/** Legacy group metadata is independent of a controlled node's direct share authorization. */
+/** Live group read coverage is independent of a controlled node's direct share authorization. */
 async function seedDesk(ownerId: string): Promise<string> {
   const teamId = `rd-desk-${ownerId}`;
   const now = Date.now();
@@ -193,7 +194,7 @@ describe('remote desktop real-PostgreSQL authorization and teardown', () => {
     });
   });
 
-  it('revocation and reconnect cannot fall back to a residual group membership on a controlled node', async () => {
+  it('revocation and reconnect retain independent live group View coverage, but losing the final group closes', async () => {
     const ownerId = `rd-owner-${hex(5)}`;
     const participantId = `rd-participant-${hex(5)}`;
     await Promise.all([createUser(db, ownerId), createUser(db, participantId)]);
@@ -202,15 +203,21 @@ describe('remote desktop real-PostgreSQL authorization and teardown', () => {
     await db.execute('INSERT INTO team_members (team_id, user_id, role, joined_at) VALUES ($1,$2,$3,$4)', [teamId, participantId, 'member', Date.now()]);
     await db.execute('INSERT INTO machine_groups (server_id, team_id, added_at) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING', [serverId, teamId, Date.now()]);
     const f = fixture(serverId);
-    expect(await start(f, participantId, {} as WebSocket)).toMatchObject({ type: REMOTE_DESKTOP_MSG.ERROR });
-    expect(f.daemonMessages).toHaveLength(0);
+    const groupSocket = {} as WebSocket;
+    expect(await start(f, participantId, groupSocket)).toMatchObject({ type: REMOTE_DESKTOP_MSG.AUTHORIZED, mode: REMOTE_DESKTOP_ACCESS_MODE.VIEW });
+    f.router.stopAll();
     const share = await grant(ownerId, participantId, serverId, 'participant');
     const socket = {} as WebSocket;
     expect(await start(f, participantId, socket)).toMatchObject({ type: REMOTE_DESKTOP_MSG.AUTHORIZED });
     await db.execute('UPDATE server_shares SET revoked_at = $2 WHERE id = $1', [share.id, Date.now()]);
     await f.router.revalidateUser(participantId);
+    expect(f.router.stats().active).toBe(1);
+    expect(f.messages(socket).at(-1)).not.toMatchObject({ type: REMOTE_DESKTOP_MSG.TERMINAL });
+    f.router.stopAll();
+    expect(await start(f, participantId, {} as WebSocket)).toMatchObject({ type: REMOTE_DESKTOP_MSG.AUTHORIZED, mode: REMOTE_DESKTOP_ACCESS_MODE.VIEW });
+    await db.execute('DELETE FROM machine_groups WHERE server_id=$1 AND team_id=$2', [serverId, teamId]);
+    await f.router.revalidateUser(participantId);
     expect(f.router.stats().active).toBe(0);
-    expect(f.messages(socket).at(-1)).toMatchObject({ type: REMOTE_DESKTOP_MSG.TERMINAL, reason: REMOTE_DESKTOP_TERMINAL_REASON.AUTHORITY_REVOKED });
     const dispatches = f.daemonMessages.length;
     expect(await start(f, participantId, {} as WebSocket)).toMatchObject({ type: REMOTE_DESKTOP_MSG.ERROR });
     expect(f.daemonMessages).toHaveLength(dispatches);

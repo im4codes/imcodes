@@ -174,11 +174,18 @@ describe('owner rule: scheduler wires an explicit executormodel=/auditormodel= t
     setTaskPairDeliveryDepsForTests({ send: async (target, text) => { sent.push({ target, text }); } });
     for (const record of [session(BRAIN, 'brain'), session(EXEC, 'w1')]) upsertSession(record);
   });
-  afterEach(() => {
+  async function cleanupFixture(): Promise<void> {
+    // Stop producers, then drain their tracked work before replacing any
+    // process-wide dependency used by asynchronous delivery continuations.
+    automation?.stop();
+    await taskPairService.waitForIdle();
+    taskPairService.setScheduler(undefined);
+    setTaskPairDeliveryDepsForTests(undefined);
     setTaskPairStoreForTests(undefined);
     if (previousEngine === undefined) delete process.env.IMCODES_SUPERVISION_ENGINE;
     else process.env.IMCODES_SUPERVISION_ENGINE = previousEngine;
-  });
+  }
+  afterEach(cleanupFixture);
 
   it('picks the auditor purely by the requested model, never consulting the allowlist mock', () => {
     let seenRequestedModel: string | undefined;
@@ -224,13 +231,13 @@ describe('owner rule: scheduler wires an explicit executormodel=/auditormodel= t
       `<!-- IMCODES_TASK DISPATCH T61 executor=${EXEC} auditormodel=nonexistent-fictional-model -->`,
       'owner-rule-turn-2', now,
     );
-    await new Promise<void>((resolve) => setImmediate(resolve));
+    await taskPairService.waitForIdle();
     // A fresh DISPATCH now queues (capacity-gated like QUEUE): an ordinary
     // queue miss is silent by design (scheduler.ts#runQueueOnce). REASSIGN
     // still triggers an immediate pick attempt on the existing pair
     // regardless of status, which is what this diagnostic is actually about.
     taskPairService.ingestText(PROJECT, BRAIN, '<!-- IMCODES_TASK REASSIGN T61 -->', 'owner-rule-turn-2b', now);
-    await new Promise<void>((resolve) => setImmediate(resolve));
+    await taskPairService.waitForIdle();
 
     const pair = getTaskPairStore().getPair(PROJECT, 'T61')!.state;
     expect(pair.flags).toContain('needs_auditor');
@@ -257,4 +264,47 @@ describe('owner rule: scheduler wires an explicit executormodel=/auditormodel= t
     expect(pair.executor).toBe(EXEC);
     expect(pair.executorModel).toBe('gpt-6-luna');
   });
+  it('drains a barrier-held delivery before replacing the next case globals', async () => {
+    let enter!: () => void;
+    let release!: () => void;
+    const entered = new Promise<void>((resolve) => { enter = resolve; });
+    const barrier = new Promise<void>((resolve) => { release = resolve; });
+    setTaskPairDeliveryDepsForTests({ send: async (target, text) => {
+      enter();
+      await barrier;
+      sent.push({ target, text });
+    } });
+    automation = new TaskPairAutomation({
+      now: () => now,
+      pickCandidate: ({ role }) => role === 'auditor' ? 'deck_sub_ownersonnet' : undefined,
+      provision: async () => undefined,
+      poolOf: () => 'primary',
+      importLegacy: () => undefined,
+    });
+    taskPairService.setScheduler(automation);
+    taskPairService.ingestText(PROJECT, BRAIN,
+      `<!-- IMCODES_TASK DISPATCH T63 executor=${EXEC} auditormodel=claude-sonnet-5 -->`,
+      'owner-rule-barrier', now);
+    await entered;
+    const fixtureStore = getTaskPairStore();
+    let done = false;
+    const cleanup = cleanupFixture().then(() => { done = true; });
+    try {
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(done).toBe(false);
+      expect(getTaskPairStore()).toBe(fixtureStore);
+    } finally {
+      // Also drain on a failing old-teardown counterexample; never strand
+      // the held operation or let it touch a fallback/default store.
+      if (done) setTaskPairStoreForTests(new TaskPairStore(':memory:'));
+      release();
+      await cleanup;
+      await taskPairService.waitForIdle();
+    }
+    expect(taskPairService.pendingCount).toBe(0);
+    sent = []; // next case's newly-owned capture cannot receive T63 later
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(sent).toEqual([]);
+  });
+
 });

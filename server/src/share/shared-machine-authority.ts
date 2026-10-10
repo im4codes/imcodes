@@ -16,7 +16,6 @@ import {
   canOperateControlledMachine,
   listAccessibleControlledMachines,
   resolveControlledMachineOperatorAccess,
-  resolveControlledMachineParticipantShareAccess,
   type ControlledMachineOperatorAccessRow,
 } from './machine-access.js';
 
@@ -175,7 +174,8 @@ export async function resolveMachineOperationalUser(
  * A shared-session turn runs on the owner's daemon with the owner's agent, but
  * a session share grants no machine access. The participant must hold their OWN
  * Owner/Participant access to the exact target (a machine share or a group
- * membership), read live from the DB, in addition to the owner's access. An
+ * membership), read live from the DB. Source ownership authenticates the session,
+ * not the target fleet. An
  * owner turn has no delegated actor and is unchanged.
  */
 /** Current operable actor rows, not just visibility IDs: callers must not substitute the source owner's grants. */
@@ -185,16 +185,16 @@ export async function listActorOperableMachineAccess(
   now: number,
   limit: number,
 ) {
-  const rows = await listAccessibleControlledMachines(db, delegatedActorUserId, now, limit);
-  return new Map(rows.filter((row) => row.access_source === 'share' && canOperateControlledMachine(row.access_role)).map((row) => [row.id, row]));
+  const rows = await listAccessibleControlledMachines(db, delegatedActorUserId, now, limit, true);
+  return new Map(rows.filter((row) => canOperateControlledMachine(row.access_role)).map((row) => [row.id, row]));
 }
 
 /**
  * Single action-admission boundary for daemon-originated controlled-device
  * operations. The signed shared-turn context is verified against its exact
  * source session/project and live participant grant, then the exact target is
- * resolved as the source owner's current controlled device AND, for a
- * delegated turn, as the participant's own current controlled device. A
+ * resolved as the actual actor's current controlled device (the source owner
+ * only for a non-delegated turn). A
  * present but invalid delegated context never falls back to owner authority,
  * and a valid one never widens a participant beyond what they were given.
  *
@@ -237,12 +237,11 @@ export async function admitMachineAction(
   const deny = (reason: MachineDenialReason, accessSource: string | null): MachineActionAdmission => ({
     ok: false, reason, accessSource, ...(delegatedActorUserId ? { delegatedActorUserId } : {}),
   });
-  const ownerTarget = await resolveControlledMachineOperatorAccess(db, operational.userId, input.targetServerId, input.now);
-  if (!ownerTarget) return deny(MACHINE_DENIAL_REASON.NO_ACCESS, null);
-  // Preserve the source owner's scope, but evaluate and audit the real actor's role/source/grant, never the owner's substitute.
-  const target = delegatedActorUserId
-    ? await resolveControlledMachineParticipantShareAccess(db, delegatedActorUserId, input.targetServerId, input.now)
-    : ownerTarget;
+  // Source session/project authority has already been verified. Resolve the
+  // actor's own target, never an intersection with the source owner's fleet.
+  const target = await resolveControlledMachineOperatorAccess(
+    db, delegatedActorUserId ?? operational.userId, input.targetServerId, input.now,
+  );
   if (!target) return deny(MACHINE_DENIAL_REASON.NO_ACCESS, null);
   const decision = evaluateMachineAction({
     accessRole: target.access_role,

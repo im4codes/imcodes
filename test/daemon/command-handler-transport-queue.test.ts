@@ -524,6 +524,17 @@ describe('handleWebCommand transport queue behavior', () => {
     daemonVersion: '0.1.0',
   };
 
+  function hasTimelineReply(requestId: string): boolean {
+    return serverLink.send.mock.calls.some(([message]) =>
+      message.type === TIMELINE_MESSAGES.REPLAY && message.requestId === requestId);
+  }
+
+  // A timer turn is not completion: replay is scheduled with setImmediate and
+  // may await the SQLite projection. Wait only for this case's terminal replies.
+  async function waitForTimelineReplies(...requestIds: string[]): Promise<void> {
+    await waitForAsync(() => requestIds.every(hasTimelineReply));
+  }
+
   beforeEach(() => {
     vi.clearAllMocks();
     serverLink.send.mockReset();
@@ -3238,7 +3249,7 @@ describe('handleWebCommand transport queue behavior', () => {
       afterSeq: 0,
       epoch: 0,
     }, serverLink as any);
-    await flushAsync();
+    await waitForTimelineReplies('replay-big');
 
     const response = serverLink.send.mock.calls
       .map((call) => call[0] as Record<string, unknown>)
@@ -3271,7 +3282,7 @@ describe('handleWebCommand transport queue behavior', () => {
       afterSeq: 10,
       epoch: -1,
     }, serverLink as any);
-    await flushAsync();
+    await waitForTimelineReplies('replay-epoch-reset');
 
     const response = serverLink.send.mock.calls
       .map((call) => call[0] as Record<string, unknown>)
@@ -3311,7 +3322,7 @@ describe('handleWebCommand transport queue behavior', () => {
       afterSeq: 41,
       epoch: 0,
     }, serverLink as any);
-    await flushAsync();
+    await waitForTimelineReplies('replay-coalesce-1', 'replay-coalesce-2');
 
     expect(timelineEmitter.replay).toHaveBeenCalledTimes(1);
     expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
@@ -3323,6 +3334,43 @@ describe('handleWebCommand transport queue behavior', () => {
       type: TIMELINE_MESSAGES.REPLAY,
       requestId: 'replay-coalesce-2',
       events: [expect.objectContaining({ eventId: 'replay-coalesced-event' })],
+    }));
+  });
+
+  it('waits for its replay to finish rather than a timer or unrelated reply', async () => {
+    let release!: (events: never[]) => void;
+    const projectionRead = new Promise<never[]>((resolve) => { release = resolve; });
+    vi.mocked(timelineStore.readPreferred).mockReturnValueOnce(projectionRead);
+    let completed = false;
+    handleWebCommand({
+      type: TIMELINE_MESSAGES.REPLAY_REQUEST,
+      sessionName: 'deck_transport_brain',
+      requestId: 'replay-completion-barrier',
+      afterSeq: 10,
+      epoch: -1,
+    }, serverLink as any);
+    // Neither the right id with the wrong type nor another replay's id
+    // represents this request completing.
+    serverLink.send({ type: TIMELINE_MESSAGES.HISTORY, requestId: 'replay-completion-barrier' });
+    serverLink.send({ type: TIMELINE_MESSAGES.REPLAY, requestId: 'another-replay' });
+    const completion = waitForTimelineReplies('replay-completion-barrier')
+      .then(() => { completed = true; });
+    try {
+      await flushAsync();
+      expect(completed).toBe(false);
+    } finally {
+      release([]);
+      await completion;
+      // Drain even when a mutant replaces the completion helper with a timer.
+      await waitForAsync(() => hasTimelineReply('replay-completion-barrier'));
+    }
+    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: TIMELINE_MESSAGES.REPLAY,
+      requestId: 'replay-completion-barrier',
+      source: TIMELINE_RESPONSE_SOURCES.MAIN_SQLITE,
+      status: TIMELINE_RESPONSE_STATUS.OK,
+      cursorReset: true,
+      events: [],
     }));
   });
 
@@ -3491,6 +3539,7 @@ describe('handleWebCommand transport queue behavior', () => {
 
     await flushAsync();
     expect(transportSend).toHaveBeenCalledWith('ack under synthetic load', 'cmd-synthetic-load');
+    await waitForTimelineReplies('load-replay');
   });
 
   it('serves timeline.detail from the scoped detail store and rejects mismatched bindings', async () => {

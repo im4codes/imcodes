@@ -40,7 +40,7 @@ import { isControlledNodeId } from '@shared/controlled-node-identity.js';
 import { CONTROLLED_NODE_UPGRADE_STATUS, type ControlledNodeUpgradeStatus } from '@shared/daemon-upgrade.js';
 import type { DaemonUpgradeStatusSnapshot, DaemonUpgradeLifecycleStatus } from '@shared/daemon-upgrade.js';
 import { REMOTE_DESKTOP_CAPABILITY } from '@shared/remote-desktop.js';
-import { isMachineAccessRole, type MachineAccessRole } from '@shared/remote-exec.js';
+import { isMachineAccessRole, MACHINE_ACCESS_ROLES, type MachineAccessRole } from '@shared/remote-exec.js';
 import {
   validateControlledNodeCapabilities,
   type ControlledNodeCapability,
@@ -92,6 +92,8 @@ export interface MachineListItem {
   online: boolean;
   execEnabled: boolean;
   accessRole?: MachineAccessRole;
+  /** Browser-only label management. Legacy absence never grants a non-owner authority. */
+  canRename?: boolean;
   capabilities?: ControlledNodeCapability[];
   /** The node's own reported release. Absent on old Servers and unreported nodes. */
   daemonVersion?: string;
@@ -392,6 +394,7 @@ function normalizeMachine(raw: unknown): MachineListItem | null {
     accessRole: raw.accessRole === undefined
       ? 'owner'
       : isMachineAccessRole(raw.accessRole) ? raw.accessRole : 'viewer',
+    ...(raw.canRename === true && raw.accessRole === MACHINE_ACCESS_ROLES[2] ? { canRename: true } : {}),
     ...(capabilities.ok && capabilities.value.length > 0 ? { capabilities: capabilities.value } : {}),
     ...(typeof raw.daemonVersion === 'string' && raw.daemonVersion ? { daemonVersion: raw.daemonVersion } : {}),
     ...(raw.updateAvailable === true ? { updateAvailable: true } : {}),

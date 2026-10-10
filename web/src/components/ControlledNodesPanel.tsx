@@ -867,6 +867,18 @@ export function ControlledNodesPanel({
     const closeAfterAction = (): void => {
       if (inMobileMenu) closeMobileActionMenu();
     };
+    const renameAction = (
+      <button
+        type="button"
+        class="controlled-nodes-rename"
+        disabled={busyServerId === machine.serverId || editingServerId === machine.serverId}
+        title={t('common.rename')}
+        onClick={() => {
+          closeAfterAction();
+          startRename(machine.serverId, machine.displayName);
+        }}
+      ><span aria-hidden="true">✎</span><span class="controlled-nodes-mobile-action-label">{t('common.rename')}</span></button>
+    );
     return (
       <>
         {machineAccessRole(machine) === 'owner' ? (
@@ -893,16 +905,7 @@ export function ControlledNodesPanel({
                 setSharingMachine(machine);
               }}
             >{t('remote_desktop.access_password')}</button>}
-            <button
-              type="button"
-              class="controlled-nodes-rename"
-              disabled={busyServerId === machine.serverId || editingServerId === machine.serverId}
-              title={t('common.rename')}
-              onClick={() => {
-                closeAfterAction();
-                startRename(machine.serverId, machine.displayName);
-              }}
-            ><span aria-hidden="true">✎</span><span class="controlled-nodes-mobile-action-label">{t('common.rename')}</span></button>
+            {renameAction}
             <button
               type="button"
               class={`controlled-nodes-exec-toggle ${machine.execEnabled ? 'is-enabled' : 'is-disabled'}`}
@@ -987,6 +990,7 @@ export function ControlledNodesPanel({
               : t('controlled_nodes.share.view_only')}
           </span>
         )}
+        {machineAccessRole(machine) === 'participant' && machine.canRename === true && renameAction}
       </>
     );
   };
@@ -1246,7 +1250,7 @@ export function ControlledNodesPanel({
                   && !canOpenRemoteDesktopMachine(m)
                   && !needsRemoteDesktopPermission(m)
                   && <span class="controlled-nodes-action-slot" aria-hidden="true" />}
-                {mobileActions && machineAccessRole(m) === 'owner' ? (
+                {mobileActions && (machineAccessRole(m) === 'owner' || (machineAccessRole(m) === 'participant' && m.canRename === true)) ? (
                   <>
                     <button
                       ref={mobileActionMenuServerId === m.serverId ? mobileActionMenuTriggerRef : undefined}

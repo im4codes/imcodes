@@ -5,6 +5,7 @@ import { resolveUserByIdentifier } from '../db/user-lookup.js';
 import type { Database } from '../db/client.js';
 import { randomHex } from '../security/crypto.js';
 import { logAudit } from '../security/audit.js';
+import { mutateAndRevalidateMachineGroupAccess } from '../ws/machine-group-revalidation.js';
 
 /** A group name is a label, never a paragraph. */
 const GROUP_NAME_MAX_CHARS = 120;
@@ -297,11 +298,10 @@ teamRoutes.put('/:id/member/:memberId/role', requireAuth(), async (c) => {
     return c.json({ error: 'forbidden', reason: 'owner_required_to_manage_admin' }, 403);
   }
 
-  await c.env.DB.execute(
+  await mutateAndRevalidateMachineGroupAccess(c.env.DB, { teamId: teamId!, actorId: memberId! }, (tx) => tx.execute(
     'UPDATE team_members SET role = $1 WHERE team_id = $2 AND user_id = $3',
     [body!.role, teamId, memberId],
-  );
-
+  ));
   await logAudit({ userId, action: 'team.role_change', details: { teamId, memberId, role: body!.role } }, c.env.DB);
   return c.json({ ok: true });
 });
@@ -324,11 +324,10 @@ teamRoutes.delete('/:id/member/:memberId', requireAuth(), async (c) => {
     return c.json({ error: 'forbidden', reason: 'owner_required_to_manage_admin' }, 403);
   }
 
-  await c.env.DB.execute(
+  await mutateAndRevalidateMachineGroupAccess(c.env.DB, { teamId: teamId!, actorId: memberId! }, (tx) => tx.execute(
     'DELETE FROM team_members WHERE team_id = $1 AND user_id = $2',
     [teamId, memberId],
-  );
-
+  ));
   await logAudit({ userId, action: 'team.member_removed', details: { teamId, memberId } }, c.env.DB);
   return c.json({ ok: true });
 });

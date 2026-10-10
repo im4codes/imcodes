@@ -206,10 +206,18 @@ systemctl daemon-reload
 systemctl enable --now imcodes-desktop-xvfb.service
 # Xvfb needs a moment to actually start accepting connections before the
 # session tries to attach to it.
+DISPLAY_READY=0
 for _ in $(seq 1 20); do
-  DISPLAY="$DISPLAY_NUM" xdpyinfo >/dev/null 2>&1 && break
+  if DISPLAY="$DISPLAY_NUM" xdpyinfo >/dev/null 2>&1; then
+    DISPLAY_READY=1
+    break
+  fi
   sleep 0.5
 done
+if [[ "$DISPLAY_READY" -ne 1 ]]; then
+  echo "Xvfb did not become ready on display $DISPLAY_NUM" >&2
+  exit 1
+fi
 systemctl enable --now imcodes-desktop-session.service
 
 if [[ "$WITH_VNC" -eq 1 ]]; then
@@ -242,4 +250,6 @@ fi
 
 echo "== done =="
 echo "DISPLAY=$DISPLAY_NUM as user $TARGET_USER (systemctl status imcodes-desktop-session)"
-[[ "$WITH_VNC" -eq 1 ]] && echo "x11vnc listening on 127.0.0.1:$VNC_PORT (no auth -- see the unit's own comment)"
+if [[ "$WITH_VNC" -eq 1 ]]; then
+  echo "x11vnc listening on 127.0.0.1:$VNC_PORT (no auth -- see the unit's own comment)"
+fi

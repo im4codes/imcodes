@@ -8,10 +8,96 @@ import {
   pickLinuxDesktopUser,
   provisionLinuxDesktopEnvironment,
 } from '../../src/node/linux-desktop-environment.js';
+import { desktopShellFixture } from './linux-desktop-shell-fixture.js';
 
 const dirs: string[] = [];
 afterEach(async () => {
   await Promise.all(dirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
+});
+
+describe.skipIf(process.platform === 'win32')('real Bash desktop installer (no host commands)', () => {
+  const script = join(__dirname, '../../scripts/install-linux-desktop-environment.sh');
+
+  it.each([
+    ['default automatic', ['--no-firefox'], false],
+    ['optional VNC', ['--no-firefox', '--with-vnc', '--vnc-port', '5999'], true],
+    ['existing Firefox', [], false],
+  ] as const)('exits zero after %s success', async (_, args, vnc) => {
+    const fixture = await desktopShellFixture(dirs, { firefox: true });
+    const result = await fixture.run(script, args);
+    expect(result.code).toBe(0);
+    expect(result.output).toContain('== done ==');
+    expect(result.output).toContain('DISPLAY=:99 as user ai');
+    expect(result.output.includes('x11vnc listening on 127.0.0.1:5999')).toBe(vnc);
+    const calls = await fixture.calls();
+    expect(calls).toContain('apt-get install -y -qq xvfb x11-xserver-utils dbus-x11 xfce4 xfce4-whiskermenu-plugin fonts-noto-core fonts-noto-color-emoji pulseaudio');
+    expect(calls.includes('x11vnc')).toBe(vnc);
+    expect(calls).not.toContain('curl');
+    expect(calls).not.toContain('install -y -qq firefox');
+    expect(calls).toContain('modprobe snd-dummy'); // Explicit best effort stays non-fatal.
+    expect(await readFile(join(fixture.root, 'etc/systemd/system/imcodes-desktop-session.service'), 'utf8'))
+      .toContain('User=ai\nGroup=ai');
+    const session = await readFile(join(fixture.root, 'usr/local/lib/imcodes/imcodes-desktop-session.sh'), 'utf8');
+    expect(session.includes('firefox &')).toBe(args.length === 0);
+    if (args.length === 0) expect(result.output).toContain('firefox already installed');
+  });
+
+  it('retains user/display/resolution arguments and succeeds on the last display probe', async () => {
+    const fixture = await desktopShellFixture(dirs, { readyAt: 20 });
+    expect((await fixture.run(script, ['--user', 'ai', '--display', ':101', '--resolution', '1280x720x24', '--no-firefox'])).code).toBe(0);
+    expect(await readFile(join(fixture.root, 'probes'), 'utf8')).toBe('20');
+    expect((await fixture.calls()).match(/sleep 0.5/g)).toHaveLength(19);
+    expect(await readFile(join(fixture.root, 'etc/systemd/system/imcodes-desktop-xvfb.service'), 'utf8'))
+      .toContain('ExecStart=/usr/bin/Xvfb :101 -screen 0 1280x720x24 -nolisten tcp -ac');
+  });
+
+  it.each(['apt-get update', 'apt-get install', 'systemctl daemon-reload',
+    'systemctl enable --now imcodes-desktop-xvfb.service',
+    'systemctl enable --now imcodes-desktop-session.service',
+    'systemctl enable --now imcodes-desktop-vnc.service'])('does not mask %s failure', async (fail) => {
+    const fixture = await desktopShellFixture(dirs, { fail });
+    const result = await fixture.run(script, ['--no-firefox', '--with-vnc']);
+    expect(result.code).toBe(fail.startsWith('apt') ? 100 : 7);
+    expect(result.output).not.toContain('== done ==');
+  });
+
+  it('fails after the bounded display readiness retries without starting a session', async () => {
+    const fixture = await desktopShellFixture(dirs, { readyAt: 21 });
+    const result = await fixture.run(script, ['--no-firefox']);
+    expect(result.code).toBe(1);
+    expect(result.output).toContain('Xvfb did not become ready on display :99');
+    expect(result.output).not.toContain('== done ==');
+    expect(await readFile(join(fixture.root, 'probes'), 'utf8')).toBe('20');
+    expect((await fixture.calls()).match(/sleep 0.5/g)).toHaveLength(20);
+    expect(await fixture.calls()).not.toContain('enable --now imcodes-desktop-session');
+  });
+
+  it.each([
+    [{ apt: false }, [], 'apt-based'],
+    [{ euid: 1000 }, [], 'must run as root'],
+    [{}, ['--user', 'missing'], 'no such user'],
+    [{}, ['--display', '99'], '--display must look like'],
+    [{}, ['--unknown'], 'unknown argument'],
+    [{}, ['--user'], 'parameter'],
+  ])('keeps preflight/argument errors fatal (%s %s)', async (options, args, diagnostic) => {
+    const fixture = await desktopShellFixture(dirs, options);
+    const result = await fixture.run(script, args);
+    expect(result.code).not.toBe(0);
+    expect(result.output).toContain(diagnostic);
+    expect(await fixture.calls()).not.toContain('apt-get update');
+  });
+
+  it.each([undefined, 'apt-get install', 'systemctl enable --now imcodes-desktop-session.service'])
+    ('maps actual bundled shell exit to provider result (%s)', async (fail) => {
+      const fixture = await desktopShellFixture(dirs, { fail });
+      const result = await provisionLinuxDesktopEnvironment({
+        supported: () => true, readPasswd: () => PASSWD, pickUser: () => 'ai',
+        run: fixture.run,
+      });
+      expect(result).toMatchObject(fail
+        ? { ok: false, reason: LINUX_DESKTOP_PROVISION_FAILURE.INSTALL_FAILED }
+        : { ok: true, user: 'ai' });
+    });
 });
 
 const PASSWD = [

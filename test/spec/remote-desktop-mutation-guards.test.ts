@@ -1,5 +1,6 @@
 import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
+import ts from 'typescript';
 import { readSource } from '../helpers/read-source.js';
 
 const ROOT = resolve(__dirname, '..', '..');
@@ -46,6 +47,9 @@ interface Guard {
   path: SourcePath;
   needle: string;
   minimum?: number;
+  method?: string;
+  after?: string;
+  before?: string;
 }
 
 interface Contract {
@@ -53,11 +57,9 @@ interface Contract {
   guards: Guard[];
 }
 
-interface Mutation {
+interface Mutation extends Guard {
   name: string;
   contract: string;
-  path: SourcePath;
-  needle: string;
 }
 
 function loadSources(): Sources {
@@ -125,15 +127,86 @@ const contracts: Contract[] = [
   },
   {
     name: 'continuous access revalidation',
+    // One authority resolver is shared by START and renewal. Check each caller
+    // and each post-await refresh in its own method/phase, not global counts.
     guards: [
       {
         path: 'server/src/ws/remote-desktop-router.ts',
-        needle: 'this.hooks.resolveAccess ?? resolveRemoteDesktopHostOperatorAccess',
-        minimum: 2,
+        method: "resolveStableAccountAccess",
+        needle: "this.hooks.resolveAccess ?? resolveRemoteDesktopHostOperatorAccess",
       },
       {
         path: 'server/src/ws/remote-desktop-router.ts',
-        needle: 'this.revalidationFailure(access)',
+        method: "resolveStableAccountAccess",
+        needle: "const before = await machineGroupInvalidationRevision(db);",
+      },
+      {
+        path: 'server/src/ws/remote-desktop-router.ts',
+        method: "resolveStableAccountAccess",
+        needle: "const revision = await machineGroupInvalidationRevision(db);",
+      },
+      {
+        path: 'server/src/ws/remote-desktop-router.ts',
+        method: "resolveStableAccountAccess",
+        needle: "if (epoch === this.authorizationEpoch && before === revision) return { access, epoch, revision };",
+      },
+      {
+        path: 'server/src/ws/remote-desktop-router.ts',
+        method: "resolveStableAccountAccess",
+        needle: "!machineGroupInvalidationReady(db)",
+      },
+      {
+        path: 'server/src/ws/remote-desktop-router.ts',
+        method: "authorize",
+        needle: "snapshot = await this.resolveStableAccountAccess(db, userId, queryStartedAt);",
+      },
+      {
+        path: 'server/src/ws/remote-desktop-router.ts',
+        method: "authorize",
+        needle: "this.reject(socket, start.requestId, accessError.error, accessError.retryable);",
+      },
+      {
+        path: 'server/src/ws/remote-desktop-router.ts',
+        method: "renewLeaseExclusive",
+        needle: "access = (await this.resolveStableAccountAccess(db, route.actor.userId, this.now())).access;",
+      },
+      {
+        path: 'server/src/ws/remote-desktop-router.ts',
+        method: "renewLeaseExclusive",
+        needle: "this.revalidationFailure(access)",
+      },
+      {
+        path: 'server/src/ws/remote-desktop-router.ts',
+        method: "refreshAccountAccess",
+        needle: "? snapshot : this.resolveStableAccountAccess(db, userId, this.now());",
+      },
+      {
+        path: 'server/src/ws/remote-desktop-router.ts',
+        method: "authorize",
+        after: "await this.routeRegistry.reserve(db,",
+        before: "this.routesBySession.set(sessionId, route);",
+        needle: "snapshot = await this.refreshAccountAccess(db, userId, snapshot);",
+      },
+      {
+        path: 'server/src/ws/remote-desktop-router.ts',
+        method: "authorize",
+        after: "await this.routeRegistry.reserve(db,",
+        before: "this.routesBySession.set(sessionId, route);",
+        needle: "this.reject(socket, start.requestId, changedAccessError.error, changedAccessError.retryable);",
+      },
+      {
+        path: 'server/src/ws/remote-desktop-router.ts',
+        method: "authorize",
+        after: "await this.routeRegistry.activate(db,",
+        before: "const authority = {",
+        needle: "snapshot = await this.refreshAccountAccess(db, userId, snapshot);",
+      },
+      {
+        path: 'server/src/ws/remote-desktop-router.ts',
+        method: "authorize",
+        after: "await this.routeRegistry.activate(db,",
+        before: "const authority = {",
+        needle: "this.failRoute(route, terminalReason, true);",
       },
     ],
   },
@@ -1341,6 +1414,112 @@ const mutations: Mutation[] = [
     needle: 'this.hooks.resolveAccess ?? resolveRemoteDesktopHostOperatorAccess',
   },
   {
+    name: "remove centralized authority resolver",
+    contract: 'continuous access revalidation',
+    path: 'server/src/ws/remote-desktop-router.ts',
+    method: "resolveStableAccountAccess",
+    needle: "this.hooks.resolveAccess ?? resolveRemoteDesktopHostOperatorAccess",
+  },
+  {
+    name: "remove pre-query durable revision",
+    contract: 'continuous access revalidation',
+    path: 'server/src/ws/remote-desktop-router.ts',
+    method: "resolveStableAccountAccess",
+    needle: "const before = await machineGroupInvalidationRevision(db);",
+  },
+  {
+    name: "remove post-query durable revision",
+    contract: 'continuous access revalidation',
+    path: 'server/src/ws/remote-desktop-router.ts',
+    method: "resolveStableAccountAccess",
+    needle: "const revision = await machineGroupInvalidationRevision(db);",
+  },
+  {
+    name: "remove stable epoch and revision result",
+    contract: 'continuous access revalidation',
+    path: 'server/src/ws/remote-desktop-router.ts',
+    method: "resolveStableAccountAccess",
+    needle: "if (epoch === this.authorizationEpoch && before === revision) return { access, epoch, revision };",
+  },
+  {
+    name: "remove controlled invalidation readiness",
+    contract: 'continuous access revalidation',
+    path: 'server/src/ws/remote-desktop-router.ts',
+    method: "resolveStableAccountAccess",
+    needle: "!machineGroupInvalidationReady(db)",
+  },
+  {
+    name: "remove account START stable resolution",
+    contract: 'continuous access revalidation',
+    path: 'server/src/ws/remote-desktop-router.ts',
+    method: "authorize",
+    needle: "snapshot = await this.resolveStableAccountAccess(db, userId, queryStartedAt);",
+  },
+  {
+    name: "remove account START refusal",
+    contract: 'continuous access revalidation',
+    path: 'server/src/ws/remote-desktop-router.ts',
+    method: "authorize",
+    needle: "this.reject(socket, start.requestId, accessError.error, accessError.retryable);",
+  },
+  {
+    name: "remove renewal stable resolution",
+    contract: 'continuous access revalidation',
+    path: 'server/src/ws/remote-desktop-router.ts',
+    method: "renewLeaseExclusive",
+    needle: "access = (await this.resolveStableAccountAccess(db, route.actor.userId, this.now())).access;",
+  },
+  {
+    name: "remove renewal live refusal",
+    contract: 'continuous access revalidation',
+    path: 'server/src/ws/remote-desktop-router.ts',
+    method: "renewLeaseExclusive",
+    needle: "this.revalidationFailure(access)",
+  },
+  {
+    name: "remove refresh reruns stale authority",
+    contract: 'continuous access revalidation',
+    path: 'server/src/ws/remote-desktop-router.ts',
+    method: "refreshAccountAccess",
+    needle: "? snapshot : this.resolveStableAccountAccess(db, userId, this.now());",
+  },
+  {
+    name: "remove post-reserve authority refresh",
+    contract: 'continuous access revalidation',
+    path: 'server/src/ws/remote-desktop-router.ts',
+    method: "authorize",
+    after: "await this.routeRegistry.reserve(db,",
+    before: "this.routesBySession.set(sessionId, route);",
+    needle: "snapshot = await this.refreshAccountAccess(db, userId, snapshot);",
+  },
+  {
+    name: "remove post-reserve refusal",
+    contract: 'continuous access revalidation',
+    path: 'server/src/ws/remote-desktop-router.ts',
+    method: "authorize",
+    after: "await this.routeRegistry.reserve(db,",
+    before: "this.routesBySession.set(sessionId, route);",
+    needle: "this.reject(socket, start.requestId, changedAccessError.error, changedAccessError.retryable);",
+  },
+  {
+    name: "remove post-activate authority refresh",
+    contract: 'continuous access revalidation',
+    path: 'server/src/ws/remote-desktop-router.ts',
+    method: "authorize",
+    after: "await this.routeRegistry.activate(db,",
+    before: "const authority = {",
+    needle: "snapshot = await this.refreshAccountAccess(db, userId, snapshot);",
+  },
+  {
+    name: "remove post-activate refusal",
+    contract: 'continuous access revalidation',
+    path: 'server/src/ws/remote-desktop-router.ts',
+    method: "authorize",
+    after: "await this.routeRegistry.activate(db,",
+    before: "const authority = {",
+    needle: "this.failRoute(route, terminalReason, true);",
+  },
+  {
     name: 'remove requester socket binding',
     contract: 'requester socket and daemon generation binding',
     path: 'server/src/ws/remote-desktop-router.ts',
@@ -1919,10 +2098,44 @@ mutations.push(
   },
 );
 
+// Method selection is AST-based: an unrelated method, comment or string with
+// a method name cannot satisfy a caller guard. Phase bounds distinguish the two
+// identical refresh calls so deleting one cannot borrow the other one's match.
+function guardRange(source: string, guard: Guard): [number, number] | null {
+  let start = 0;
+  let end = source.length;
+  if (guard.method) {
+    const file = ts.createSourceFile('router.ts', source, ts.ScriptTarget.Latest, true);
+    const router = file.statements.find((node): node is ts.ClassDeclaration => (
+      ts.isClassDeclaration(node) && node.name?.text === 'RemoteDesktopRouter'
+    ));
+    const method = router?.members.find((node): node is ts.MethodDeclaration => (
+      ts.isMethodDeclaration(node) && ts.isIdentifier(node.name) && node.name.text === guard.method
+    ));
+    if (!method?.body) return null;
+    start = method.body.getStart(file);
+    end = method.body.getEnd();
+  }
+  if (guard.after) {
+    const offset = source.slice(start, end).indexOf(guard.after);
+    if (offset < 0) return null;
+    start += offset + guard.after.length;
+  }
+  if (guard.before) {
+    const offset = source.slice(start, end).indexOf(guard.before);
+    if (offset < 0) return null;
+    end = start + offset;
+  }
+  return [start, end];
+}
+
 function contractHolds(contract: Contract, sources: Sources): boolean {
-  return contract.guards.every((guard) => (
-    occurrences(sources[guard.path], guard.needle) >= (guard.minimum ?? 1)
-  ));
+  return contract.guards.every((guard) => {
+    const source = sources[guard.path];
+    const range = guardRange(source, guard);
+    return range !== null
+      && occurrences(source.slice(...range), guard.needle) >= (guard.minimum ?? 1);
+  });
 }
 
 describe('remote desktop load-bearing mutation guards', () => {
@@ -1935,9 +2148,15 @@ describe('remote desktop load-bearing mutation guards', () => {
   it.each(mutations)('$name makes its contract fail', (mutation) => {
     const contract = contracts.find((candidate) => candidate.name === mutation.contract);
     expect(contract).toBeDefined();
+    const source = sources[mutation.path];
+    const range = guardRange(source, mutation);
+    expect(range).not.toBeNull();
+    const [start, end] = range!;
+    expect(source.slice(start, end)).toContain(mutation.needle);
     const mutatedSources = {
       ...sources,
-      [mutation.path]: sources[mutation.path].split(mutation.needle).join(''),
+      [mutation.path]: source.slice(0, start)
+        + source.slice(start, end).split(mutation.needle).join('') + source.slice(end),
     };
     expect(contractHolds(contract!, mutatedSources)).toBe(false);
   });

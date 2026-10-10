@@ -1989,3 +1989,33 @@ describe('ControlledNodesPanel group rename and delete', () => {
     expect(container.querySelector('.controlled-nodes-control-panel')).not.toBeNull();
   });
 });
+
+
+describe('group label management is not device control', () => {
+  it.each([false,true])('live canRename=%s projects only rename to a group Participant', async (canRename) => {
+    machines = [machine({serverId:'group-device',displayName:'Group device',accessRole:'participant',canRename,execEnabled:true})];
+    const {container} = render(<ControlledNodesPanel />);
+    await waitFor(() => expect(container.textContent).toContain('Group device'));
+    expect(container.querySelector('.controlled-nodes-rename') !== null).toBe(canRename);
+    for (const selector of ['.controlled-nodes-exec-toggle','.controlled-nodes-revoke','.controlled-nodes-auto-unlock','.share-revoke-btn']) expect(container.querySelector(selector)).toBeNull();
+    if (canRename) {
+      renameMachine.mockClear();
+      fireEvent.click(container.querySelector('.controlled-nodes-rename')!);
+      fireEvent.input(container.querySelector('.controlled-nodes-rename-input')!, {target:{value:'Group renamed'}});
+      fireEvent.click(container.querySelector('.controlled-nodes-rename-save')!);
+      await waitFor(() => expect(renameMachine).toHaveBeenCalledWith('group-device','Group renamed'));
+    }
+  });
+});
+
+
+it('group admins get a mobile rename-only menu while owner safety actions remain unavailable', async () => {
+  setViewportSize(390,944);
+  machines = [machine({serverId:'mobile-group',displayName:'Mobile group',accessRole:'participant',canRename:true,execEnabled:true})];
+  const {container} = render(<ControlledNodesPanel />);
+  await waitFor(() => expect(container.querySelector('.controlled-nodes-mobile-menu-trigger')).not.toBeNull());
+  fireEvent.click(container.querySelector('.controlled-nodes-mobile-menu-trigger')!);
+  const menu = container.querySelector('.controlled-nodes-mobile-menu-panel')!;
+  expect(menu.querySelector('.controlled-nodes-rename')).not.toBeNull();
+  for (const selector of ['.controlled-nodes-exec-toggle','.controlled-nodes-revoke','.controlled-nodes-auto-unlock','.share-revoke-btn','.controlled-nodes-install-worker']) expect(menu.querySelector(selector)).toBeNull();
+});
