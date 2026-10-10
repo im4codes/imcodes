@@ -5803,10 +5803,60 @@ describe('handleWebCommand transport queue behavior', () => {
     }));
   });
 
+  it('receipts a missing-provider append without reporting native admission while resume is blocked', async () => {
+    const { clearAllResend } = await import('../../src/daemon/transport-resend-queue.js');
+    clearAllResend();
+    const store = getTransportQueueStore();
+    const entry = { clientMessageId: 'append-await-resume', text: 'keep this queued' };
+    store.enqueue({ sessionName: 'deck_transport_brain', ...entry });
+    const before = store.readSnapshot('deck_transport_brain');
+    const appendPendingMessagesToActiveTurn = vi.fn();
+    getTransportRuntimeMock.mockReturnValue({
+      providerSessionId: null,
+      appendPendingMessagesToActiveTurn,
+      pendingEntries: [entry],
+      pendingCount: 1,
+      sending: false,
+    });
+    let releaseStop!: () => void;
+    stopTransportRuntimeSessionMock.mockImplementationOnce(() => new Promise<void>((resolve) => {
+      releaseStop = resolve;
+    }));
+
+    try {
+      handleWebCommand({
+        type: TRANSPORT_QUEUE_COMMANDS.APPEND_MESSAGES,
+        sessionName: 'deck_transport_brain',
+        clientMessageIds: [entry.clientMessageId],
+        commandId: 'cmd-append-await-resume',
+      }, serverLink as any);
+      await waitForAsync(() => serverLink.send.mock.calls.some(([message]) => (
+        message.commandId === 'cmd-append-await-resume' && message.status === 'accepted'
+      )));
+
+      expect(stopTransportRuntimeSessionMock).toHaveBeenCalledWith('deck_transport_brain');
+      expect(launchTransportSessionMock).not.toHaveBeenCalled();
+      expect(appendPendingMessagesToActiveTurn).not.toHaveBeenCalled();
+      expect(store.readSnapshot('deck_transport_brain')).toEqual(before);
+      expect(store.hasDeliveryTombstone('deck_transport_brain', entry.clientMessageId)).toBe(false);
+      expect(emitMock).not.toHaveBeenCalledWith(
+        'deck_transport_brain', 'user.message', expect.anything(), expect.anything(),
+      );
+      expect(emitMock).not.toHaveBeenCalledWith(
+        'deck_transport_brain', 'transport.queue.delivery', expect.anything(), expect.anything(),
+      );
+    } finally {
+      releaseStop?.();
+      await waitForAsync(() => launchTransportSessionMock.mock.calls.length === 1);
+      clearAllResend();
+    }
+  });
+
   it('does not append and clears stale queue state when ownership adoption is ambiguous', async () => {
     const appendPendingMessagesToActiveTurn = vi.fn();
     const discardDurableQueueStateForRecipientConflict = vi.fn();
     getTransportRuntimeMock.mockReturnValue({
+      providerSessionId: 'route-transport',
       recipientIdentity: { sessionInstanceId: 'new-instance', runtimeEpoch: 'new-epoch' },
       adoptLegacyQueueRecipient: vi.fn(() => false),
       discardDurableQueueStateForRecipientConflict,
@@ -5912,6 +5962,7 @@ describe('handleWebCommand transport queue behavior', () => {
     store.markHandoffInFlight('deck_transport_brain', ['append-live-handoff'], 60_000, Date.now());
     const appendPendingMessagesToActiveTurn = vi.fn().mockResolvedValue({ status: 'not_found' });
     getTransportRuntimeMock.mockReturnValue({
+      providerSessionId: 'route-transport',
       appendPendingMessagesToActiveTurn,
       rehydratePendingFromStore: vi.fn(),
       pendingEntries: [{
@@ -5974,6 +6025,7 @@ describe('handleWebCommand transport queue behavior', () => {
     });
     const appendPendingMessagesToActiveTurn = vi.fn().mockResolvedValue({ status: 'stale' });
     getTransportRuntimeMock.mockReturnValue({
+      providerSessionId: 'route-transport',
       appendPendingMessagesToActiveTurn,
       rehydratePendingFromStore: vi.fn(),
       pendingEntries: [{
@@ -6016,6 +6068,7 @@ describe('handleWebCommand transport queue behavior', () => {
     // the broadcast state must reflect the turn now actually running.
     const appendPendingMessagesToActiveTurn = vi.fn().mockResolvedValue({ status: 'dispatched_as_new_turn' });
     getTransportRuntimeMock.mockReturnValue({
+      providerSessionId: 'route-transport',
       appendPendingMessagesToActiveTurn,
       rehydratePendingFromStore: vi.fn(),
       pendingEntries: [{
@@ -6053,6 +6106,7 @@ describe('handleWebCommand transport queue behavior', () => {
     // "The active turn already finished" rejection that left the user stuck.
     const appendPendingMessagesToActiveTurn = vi.fn().mockResolvedValue({ status: 'deferred' });
     getTransportRuntimeMock.mockReturnValue({
+      providerSessionId: 'route-transport',
       appendPendingMessagesToActiveTurn,
       rehydratePendingFromStore: vi.fn(),
       pendingEntries: [{ clientMessageId: 'append-deferred', text: 'wait for the dispatch to settle' }],
@@ -6090,6 +6144,7 @@ describe('handleWebCommand transport queue behavior', () => {
     // alone. Assert the authority is on the ack, not merely broadcast beside it.
     const appendPendingMessagesToActiveTurn = vi.fn().mockResolvedValue({ status: 'not_found' });
     getTransportRuntimeMock.mockReturnValue({
+      providerSessionId: 'route-transport',
       appendPendingMessagesToActiveTurn,
       rehydratePendingFromStore: vi.fn(),
       // The ghost shape: the runtime still lists the row, the canonical SQLite
