@@ -31,7 +31,7 @@ it.each(['', null])('does not revive a historical event label or diagnostic name
   expect(container.querySelector('.task-pair-card-payload pre')?.textContent).not.toContain('Current payload label');
   expect(container.querySelector('.task-pair-card-role')?.textContent).toContain(id);
 });
-it('retains the payload fallback for old peers that omit the label field', () => {
-  const { container } = render(<TaskPairStatusPanel events={events} sessions={[{ name: id }]} />);
+it.each([{ name: id }, { name: id, label: undefined }])('retains the payload fallback for old peers with missing labels: %j', (session) => {
+  const { container } = render(<TaskPairStatusPanel events={events} sessions={[session]} />);
   expect(container.querySelector('.task-pair-status-session-label')?.textContent).toBe('Current payload label');
 });

@@ -32,10 +32,11 @@ describe('task-pair display identity', () => {
 describe('label authority without default-data rewriting', () => {
   it('uses live labels, respects explicit null/empty clears, then payload and watch fallback', () => {
     expect(taskPairResolveDisplaySessionLabel(auto, 'Snapshot', { label: 'New name' }, 'Watch')).toBe('New name');
-    for (const label of [null, '', undefined]) {
+    for (const label of [null, '']) {
       expect(taskPairResolveDisplaySessionLabel(auto, 'Snapshot', { label }, 'Watch')).toBeUndefined();
     }
     expect(taskPairResolveDisplaySessionLabel(auto, 'Snapshot', {}, 'Watch')).toBe('Snapshot');
+    expect(taskPairResolveDisplaySessionLabel(auto, 'Snapshot', { label: undefined }, 'Watch')).toBe('Snapshot');
     expect(taskPairResolveDisplaySessionLabel(auto, undefined, {}, 'Watch')).toBe('Watch');
     expect(taskPairResolveDisplaySessionLabel(auto, undefined)).toBeUndefined();
   });

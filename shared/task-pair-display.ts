@@ -34,7 +34,7 @@ export function taskPairResolveDisplaySessionLabel(
   liveSession?: { label?: string | null },
   fallbackLabel?: unknown,
 ): string | undefined {
-  if (liveSession && Object.prototype.hasOwnProperty.call(liveSession, 'label')) {
+  if (liveSession && liveSession.label !== undefined && Object.prototype.hasOwnProperty.call(liveSession, 'label')) {
     return taskPairDisplaySessionLabel(id, liveSession.label);
   }
   return taskPairDisplaySessionLabel(id, payloadLabel) ?? taskPairDisplaySessionLabel(id, fallbackLabel);
