@@ -1109,6 +1109,15 @@ describe('RemoteDesktopRouter', () => {
     expect(f.messages(f.browserA)[0]).toMatchObject({ type: REMOTE_DESKTOP_MSG.AUTHORIZED, requestId });
   });
 
+  it('preserves normal FULL daemon group access without controlled-node grants', async () => {
+    const f = fixture({ access: { ...daemonHostAccess(), access_role: 'participant', access_source: 'group', exec_granted: false } });
+    await f.router.handleBrowser(f.browserA, 'group-user', start);
+    expect(f.messages(f.browserA)[0]).toMatchObject({ type: REMOTE_DESKTOP_MSG.AUTHORIZED, requestId });
+    await f.router.revalidateUser('group-user');
+    expect(f.router.stats().active).toBe(1);
+    f.router.stopAll();
+  });
+
   it.each([
     ['a revoked share', { access_role: 'viewer' }, REMOTE_DESKTOP_ERROR.ACCESS_DENIED],
     ['stale presence', { last_heartbeat_at: 1 }, REMOTE_DESKTOP_ERROR.DAEMON_OFFLINE],

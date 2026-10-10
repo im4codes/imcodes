@@ -5,7 +5,7 @@ import { REMOTE_DESKTOP_CAPABILITY, REMOTE_DESKTOP_MSG, REMOTE_DESKTOP_PROTOCOL_
 import { NODE_ROLE } from '../../shared/remote-exec.js';
 import { createDatabase, type Database } from '../src/db/client.js';
 import { runMigrations } from '../src/db/migrate.js';
-import { createUser } from '../src/db/queries.js';
+import { createServer, createUser } from '../src/db/queries.js';
 import { ensureCanonicalHostForServer } from '../src/services/remote-desktop-host-identity.js';
 import { createOrUpdateShare } from '../src/db/tab-sharing.js';
 import { RemoteDesktopRouter } from '../src/ws/remote-desktop-router.js';
@@ -216,6 +216,17 @@ describe('remote desktop real-PostgreSQL authorization and teardown', () => {
     expect(f.daemonMessages).toHaveLength(dispatches);
     expect(await start(f, ownerId, {} as WebSocket)).toMatchObject({ type: REMOTE_DESKTOP_MSG.AUTHORIZED });
     f.router.stopAll();
+    // The same group-only actor still has the established non-controlled FULL desktop path.
+    const fullId = `rd-full-${hex(6)}`;
+    await createServer(db, fullId, ownerId, 'FULL desktop', sha256(hex(16)));
+    await db.execute('UPDATE servers SET status = $2, last_heartbeat_at = $3 WHERE id = $1', [fullId, 'online', Date.now()]);
+    await ensureCanonicalHostForServer({ db, serverId: fullId, now: Date.now() });
+    await db.execute('INSERT INTO machine_groups (server_id, team_id, added_at) VALUES ($1,$2,$3)', [fullId, teamId, Date.now()]);
+    const full = fixture(fullId);
+    expect(await start(full, participantId, {} as WebSocket)).toMatchObject({ type: REMOTE_DESKTOP_MSG.AUTHORIZED });
+    await full.router.revalidateUser(participantId);
+    expect(full.router.stats().active).toBe(1);
+    full.router.stopAll();
   });
 
   it('serializes concurrent real-DB starts and isolates an unrelated user', async () => {
