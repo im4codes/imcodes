@@ -188,6 +188,26 @@ export async function resolveControlledMachineParticipantShareAccess(
   return access?.access_source === 'share' ? access : null;
 }
 
+/** The same live owner/direct-Participant read boundary, batched once per metadata packet (never a group/execute grant). */
+export async function resolveControlledMachineReadActors(
+  db: Database, serverId: string, actors: string[], now: number,
+): Promise<Set<string>> {
+  if (!actors.length) return new Set();
+  const rows = await db.query<{ actor_id: string }>(
+    `SELECT DISTINCT actor.id AS actor_id
+       FROM servers s
+       JOIN users actor ON actor.id = ANY($2::text[])
+       LEFT JOIN server_shares sh ON sh.server_id = s.id AND sh.target_user_id = actor.id
+        AND sh.role = 'participant' AND sh.revoked_at IS NULL
+        AND (sh.expires_at IS NULL OR sh.expires_at > $3)
+      WHERE s.id = $1 AND s.node_role = $4 AND s.revoked_at IS NULL
+        AND ${activeUserExistsSql('s.user_id')} AND ${activeUserExistsSql('actor.id')}
+        AND (s.user_id = actor.id OR sh.id IS NOT NULL)`,
+    [serverId, actors, now, NODE_ROLE.CONTROLLED],
+  );
+  return new Set(rows.map((row) => row.actor_id));
+}
+
 /**
  * Management authority: who may change the device itself (not use it).
  *

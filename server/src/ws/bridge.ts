@@ -21,6 +21,7 @@ import {
 } from '../../../shared/controlled-node-endpoints.js';
 import { AGENT_SKILLS_MESSAGE_PREFIX, AGENT_SKILLS_MSG } from '../../../shared/agent-skills.js';
 import { AGENT_MCP_MESSAGE_PREFIX, AGENT_MCP_MSG } from '../../../shared/agent-mcp.js';
+import { ControlledBrowserReadGate } from './controlled-browser-read-gate.js';
 import { DaemonRequestTracker } from './daemon-request-tracker.js';
 import { CommandAckOriginRouter } from './command-ack-origin-router.js';
 import WebSocket, { type RawData } from 'ws';
@@ -2463,6 +2464,7 @@ export class WsBridge {
   private browserUserIds = new Map<WebSocket, string>();
   /** Sockets admitted through Owner/Participant controlled-machine access. */
   private controlledTargetBrowserSockets = new Set<WebSocket>();
+  private readonly controlledBrowserReads: ControlledBrowserReadGate;
   /** browser socket → live share-scoped authorization state */
   private browserShareStates = new Map<WebSocket, ShareScopedSocketState>();
   private shareCoverageResolver: ShareCoverageResolver = resolveShareCoverageFromDb;
@@ -2809,6 +2811,10 @@ export class WsBridge {
   private ackHousekeepingTimer: ReturnType<typeof setInterval> | null = null;
 
   private constructor(private serverId: string) {
+    this.controlledBrowserReads = new ControlledBrowserReadGate(serverId, () => this.db, (socket) => {
+      this.cleanupBrowserSocket(socket);
+      try { socket.close(1008, 'controlled_read_revoked'); } catch { /* already closed */ }
+    });
     setRemoteDesktopPendingRouteCancellationDispatcher(
       (command) => WsBridge.dispatchRemoteDesktopPendingRouteCancellation(command),
     );
@@ -6673,6 +6679,7 @@ export class WsBridge {
       .map(([ws]) => ws);
     await Promise.all([
       remoteDesktopRevalidation,
+      this.controlledBrowserReads.revalidate(userId),
       ...sockets.map((ws) => this.revalidateShareSocket(ws)),
     ]);
   }
@@ -6813,17 +6820,22 @@ export class WsBridge {
     this.transportSubscriptions.set(ws, new Set());
     this.timelineSubscriptions.set(ws, new Map());
     this.browserUserIds.set(ws, userId);
-    if (controlledTarget) this.controlledTargetBrowserSockets.add(ws);
+    if (controlledTarget) {
+      this.controlledTargetBrowserSockets.add(ws);
+      this.controlledBrowserReads.register(ws, userId);
+      void this.controlledBrowserReads.revalidate(userId);
+    }
+    const sendInitial = (json: string) => controlledTarget ? this.controlledBrowserReads.send(ws, json) : safeSend(ws, json);
     const shareState = this.browserShareStates.get(ws);
 
     // Push cached provider statuses so the browser has them immediately — no WS race.
     if (!shareState) {
       for (const [providerId, connected] of this.providerStatus) {
-        safeSend(ws, JSON.stringify({ type: TRANSPORT_MSG.PROVIDER_STATUS, providerId, connected }));
+        sendInitial(JSON.stringify({ type: TRANSPORT_MSG.PROVIDER_STATUS, providerId, connected }));
       }
       // Push cached remote sessions for each connected provider
       for (const [providerId, sessions] of this.providerRemoteSessions) {
-        safeSend(ws, JSON.stringify({ type: TRANSPORT_MSG.SESSIONS_RESPONSE, providerId, sessions }));
+        sendInitial(JSON.stringify({ type: TRANSPORT_MSG.SESSIONS_RESPONSE, providerId, sessions }));
       }
     }
     // Worker refresh status is durable per controlled node. Replay the latest
@@ -6831,7 +6843,7 @@ export class WsBridge {
     // just like the cached capability snapshot below; otherwise a reconnecting
     // UI would regress to the stale worker version until the next refresh.
     if (this.controlledNodeWorkerRefreshStatus) {
-      safeSend(ws, JSON.stringify(this.controlledNodeWorkerRefreshStatus));
+      sendInitial(JSON.stringify(this.controlledNodeWorkerRefreshStatus));
     }
     /*
      * R3 v2 PR-σ — Replay the cached `daemon.hello` to newly-connected
@@ -6858,7 +6870,7 @@ export class WsBridge {
      * read-only viewer still doesn't need it.
      */
     if ((!shareState || shareState.snapshot.effectiveRole === 'participant') && this.daemonP2pWorkflowCapabilities) {
-      safeSend(ws, JSON.stringify({
+      sendInitial(JSON.stringify({
         type: P2P_WORKFLOW_MSG.DAEMON_HELLO,
         daemonId: this.daemonP2pWorkflowCapabilities.daemonId,
         capabilities: this.daemonP2pWorkflowCapabilities.capabilities,
@@ -8023,7 +8035,7 @@ export class WsBridge {
       const lastCheckedAt = state.coverageCheckedAt ?? state.connectedAt;
       return now - lastCheckedAt >= SHARE_COVERAGE_MAX_STALENESS_MS;
     });
-    await Promise.all(candidates.map(([ws]) => this.revalidateShareSocket(ws)));
+    await Promise.all([this.controlledBrowserReads.revalidate(), ...candidates.map(([ws]) => this.revalidateShareSocket(ws))]);
   }
 
   private teardownShareSocket(ws: WebSocket, reason: ShareReason): void {
@@ -10221,6 +10233,7 @@ export class WsBridge {
     this.mobileSockets.delete(ws);
     this.browserUserIds.delete(ws);
     this.controlledTargetBrowserSockets.delete(ws);
+    this.controlledBrowserReads.remove(ws);
     this.browserShareStates.delete(ws);
     const sessions = this.browserSubscriptions.get(ws);
     if (sessions) {
@@ -10395,7 +10408,9 @@ export class WsBridge {
 
   private broadcastToBrowsers(json: string): void {
     const msg = this.tryParseJsonRecord(json);
+    this.controlledBrowserReads.broadcast(json);
     for (const bs of this.browserSockets) {
+      if (this.controlledTargetBrowserSockets.has(bs)) continue;
       try {
         const outgoing = this.filterShareOutgoingJson(bs, msg, json);
         if (!outgoing) continue;
