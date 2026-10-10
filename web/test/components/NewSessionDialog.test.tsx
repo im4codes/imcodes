@@ -168,6 +168,7 @@ describe('NewSessionDialog', () => {
     expect(groups.map((group) => group.querySelector('.session-agent-group-title')?.textContent)).toEqual(['SDK', 'CLI']);
     const options = groups.flatMap((group) => Array.from(group.querySelectorAll<HTMLButtonElement>('[data-agent-type]')).map((button) => button.dataset.agentType));
     expect(options.slice(0, 17)).toEqual([
+      AGY_SDK_PROVIDER_ID,
       'claude-code-sdk',
       'codex-sdk',
       'qoder-sdk',
@@ -176,7 +177,6 @@ describe('NewSessionDialog', () => {
       'opencode-sdk',
       'gemini-sdk',
       'grok-sdk',
-      AGY_SDK_PROVIDER_ID,
       'kimi-sdk',
       HERMES_AGENT_PROVIDER_ID,
       'deepseek-harness',

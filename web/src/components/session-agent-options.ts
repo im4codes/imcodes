@@ -33,6 +33,14 @@ export const SESSION_AGENT_GROUP_LABEL_KEYS: Record<SessionAgentGroupId, string>
 
 const SESSION_AGENT_CHOICES: SessionAgentChoice[] = [
   {
+    id: AGY_SDK_PROVIDER_ID,
+    icon: '◈',
+    fallbackLabel: 'Antigravity',
+    labelKey: 'session.agentType.agy_sdk',
+    group: 'transport',
+    surfaces: ['new-session', 'sub-session'],
+  },
+  {
     id: 'claude-code-sdk',
     icon: '⚡',
     fallbackLabel: 'Claude Code SDK',
@@ -93,14 +101,6 @@ const SESSION_AGENT_CHOICES: SessionAgentChoice[] = [
     icon: '𝕏',
     fallbackLabel: 'Grok Build',
     labelKey: 'session.agentType.grok_sdk',
-    group: 'transport',
-    surfaces: ['new-session', 'sub-session'],
-  },
-  {
-    id: AGY_SDK_PROVIDER_ID,
-    icon: '◈',
-    fallbackLabel: 'Antigravity',
-    labelKey: 'session.agentType.agy_sdk',
     group: 'transport',
     surfaces: ['new-session', 'sub-session'],
   },
@@ -245,8 +245,8 @@ export function getSessionAgentLabel(
  * array could.
  */
 export const PROJECT_ROLE_AGENT_TYPES: string[] = [
-  'claude-code', 'claude-code-sdk', 'codex', 'codex-sdk', 'qoder-sdk', 'copilot-sdk',
+  AGY_SDK_PROVIDER_ID, 'claude-code', 'claude-code-sdk', 'codex', 'codex-sdk', 'qoder-sdk', 'copilot-sdk',
   'cursor-headless', 'opencode-sdk', 'opencode', 'gemini', 'gemini-sdk', 'grok-sdk',
-  'kimi-sdk', HERMES_AGENT_PROVIDER_ID, AGY_SDK_PROVIDER_ID, 'deepseek-harness', 'pi',
+  'kimi-sdk', HERMES_AGENT_PROVIDER_ID, 'deepseek-harness', 'pi',
   CODEBUDDY_PROVIDER_IDS.CHINA, CODEBUDDY_PROVIDER_IDS.INTERNATIONAL,
 ];

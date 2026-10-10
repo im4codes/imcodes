@@ -1714,6 +1714,147 @@ describe('WsBridge share-scoped sockets', () => {
     ]));
   });
 
+  it('delivers repo.detected broadcasts to shared server participants and viewers', async () => {
+    const bridge = WsBridge.get(serverId);
+    const serverTarget: ShareTarget = { kind: 'server', serverId };
+    bridge.setShareCoverageResolverForTests(async () => coverage(serverTarget, 'viewer', now));
+    const daemon = new MockWs();
+    bridge.handleDaemonConnection(daemon as never, makeDb(), { JWT_SIGNING_KEY: 'share-ws-test-signing-key' } as never);
+    daemon.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+    await flushAsync();
+    daemon.sent.length = 0;
+
+    const serverViewer = new MockWs();
+    bridge.handleShareBrowserConnection(serverViewer as never, 'viewer-user', makeDb(), {
+      ticketId: 'server-viewer',
+      target: serverTarget,
+      snapshot: coverage(serverTarget, 'viewer', now),
+    });
+
+    // Whole-server viewer can run repo.detect without sessionName and with a host path
+    serverViewer.emit('message', JSON.stringify({
+      type: REPO_MSG.DETECT,
+      requestId: 'server-viewer-detect',
+      projectDir: '/work/repo-alpha',
+    }));
+    await flushAsync();
+
+    expect(daemon.sentJson).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: REPO_MSG.DETECT, requestId: 'server-viewer-detect', projectDir: '/work/repo-alpha' }),
+    ]));
+
+    // Daemon broadcasts repo.detected — should reach server viewer
+    daemon.emit('message', JSON.stringify({
+      type: REPO_MSG.DETECTED,
+      projectDir: '/work/repo-alpha',
+      context: { status: 'ok', owner: 'org', repo: 'alpha', currentBranch: 'feature/alpha' },
+    }));
+    await flushAsync();
+
+    expect(serverViewer.sentJson).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        type: REPO_MSG.DETECTED,
+        projectDir: '/work/repo-alpha',
+        context: expect.objectContaining({ currentBranch: 'feature/alpha' }),
+      }),
+    ]));
+  });
+
+  it('delivers repo.detected push to tab share participant only for covered projectDir', async () => {
+    const bridge = WsBridge.get(serverId);
+    const target: ShareTarget = { kind: 'main', serverId, sessionName: 'deck_proj_brain' };
+    bridge.setShareCoverageResolverForTests(async () => coverage(target, 'participant', now));
+    const daemon = new MockWs();
+    bridge.handleDaemonConnection(daemon as never, makeDb(), { JWT_SIGNING_KEY: 'share-ws-test-signing-key' } as never);
+    daemon.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+    await flushAsync();
+
+    // Daemon sends session_list announcing deck_proj_brain with projectDir /work/brain
+    daemon.emit('message', JSON.stringify({
+      type: 'session_list',
+      sessions: [
+        { name: 'deck_proj_brain', project: 'brain', projectDir: '/work/brain', state: 'idle' },
+        { name: 'deck_proj_other', project: 'other', projectDir: '/work/other', state: 'idle' },
+      ],
+    }));
+    await flushAsync();
+    daemon.sent.length = 0;
+
+    const participant = new MockWs();
+    bridge.handleShareBrowserConnection(participant as never, 'participant-user', makeDb(), {
+      ticketId: 'tab-participant',
+      target,
+      snapshot: coverage(target, 'participant', now),
+    });
+    await flushAsync();
+
+    // Daemon pushes repo.detected for covered projectDir
+    daemon.emit('message', JSON.stringify({
+      type: REPO_MSG.DETECTED,
+      projectDir: '/work/brain',
+      context: { status: 'ok', owner: 'org', repo: 'brain', currentBranch: 'main' },
+    }));
+    // Daemon pushes repo.detected for UNCOVERED projectDir
+    daemon.emit('message', JSON.stringify({
+      type: REPO_MSG.DETECTED,
+      projectDir: '/work/other',
+      context: { status: 'ok', owner: 'org', repo: 'other', currentBranch: 'secret-branch' },
+    }));
+    await flushAsync();
+
+    // Covered projectDir reaches participant
+    expect(participant.sentJson).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        type: REPO_MSG.DETECTED,
+        projectDir: '/work/brain',
+        context: expect.objectContaining({ currentBranch: 'main' }),
+      }),
+    ]));
+    // Uncovered projectDir is NOT delivered to tab share participant
+    expect(participant.sentJson.some((m) => m.projectDir === '/work/other')).toBe(false);
+  });
+
+  it('allows whole-server participant to checkout branch using host projectDir', async () => {
+    const bridge = WsBridge.get(serverId);
+    const serverTarget: ShareTarget = { kind: 'server', serverId };
+    const daemon = new MockWs();
+    bridge.handleDaemonConnection(daemon as never, makeDb(), { JWT_SIGNING_KEY: 'share-ws-test-signing-key' } as never);
+    daemon.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+    await flushAsync();
+    daemon.sent.length = 0;
+
+    const serverParticipant = new MockWs();
+    const serverSnap: EffectiveCoverage = {
+      ...coverage(serverTarget, 'participant', now),
+      serverParticipantAuthority: true,
+    };
+    bridge.setShareCoverageResolverForTests(async () => serverSnap);
+    bridge.handleShareBrowserConnection(serverParticipant as never, 'sp-user', makeDb(), {
+      ticketId: 'sp-ticket',
+      target: serverTarget,
+      snapshot: serverSnap,
+    });
+    await flushAsync();
+
+    serverParticipant.emit('message', JSON.stringify({
+      type: REPO_MSG.CHECKOUT_BRANCH,
+      requestId: 'sp-checkout',
+      projectDir: '/work/repo-alpha',
+      sessionId: 'deck_proj_brain',
+      branch: 'release/v1',
+    }));
+    await flushAsync();
+
+    expect(daemon.sentJson).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        type: REPO_MSG.CHECKOUT_BRANCH,
+        requestId: 'sp-checkout',
+        projectDir: '/work/repo-alpha',
+        branch: 'release/v1',
+      }),
+    ]));
+  });
+
   it('allows participant send for a covered concrete tab and stamps a server-authored actor envelope', async () => {
     const bridge = WsBridge.get(serverId);
     const target: ShareTarget = { kind: 'main', serverId, sessionName: 'deck_proj_brain' };

@@ -4704,11 +4704,26 @@ export function App() {
           for (const sub of subSessionsRef.current) {
             if (sub.cwd === dir) sessionIds.add(sub.sessionName);
           }
+          const activeSessionObj = activeSessionRef.current
+            ? sessionsRef.current.find((s) => s.name === activeSessionRef.current)
+            : null;
+          if (activeSessionObj) {
+            const activeName = activeSessionObj.name;
+            const activeDir = activeSessionObj.projectDir;
+            if (activeDir === dir || dir === FS_SESSION_ROOT_PATH) {
+              sessionIds.add(activeName);
+            }
+          }
           if (sessionIds.size === 0) {
             ingestSessionRepoContext({ projectDir: dir, context });
           } else {
             for (const sessionId of sessionIds) {
               ingestSessionRepoContext({ sessionId, projectDir: dir, context });
+              if (dir !== FS_SESSION_ROOT_PATH) {
+                ingestSessionRepoContext({ sessionId, projectDir: FS_SESSION_ROOT_PATH, context });
+              } else if (activeSessionObj?.projectDir) {
+                ingestSessionRepoContext({ sessionId, projectDir: activeSessionObj.projectDir, context });
+              }
             }
           }
         }
@@ -5969,6 +5984,7 @@ export function App() {
 
   const isSharedServerParticipant = selectedShareTarget?.kind === 'server'
     && sharedAccessRole === 'participant';
+  const isTabShare = Boolean(selectedShareTarget && selectedShareTarget.kind !== 'server');
   const canCreateMainSession = !selectedShareTarget || isSharedServerParticipant;
   const canCreateSubSession = !selectedShareTarget
     || (sharedAccessRole === 'participant' && selectedShareTarget.kind !== 'subsession');
@@ -5984,7 +6000,7 @@ export function App() {
   const openRepoPage = useCallback((target?: { sessionId?: string | null; projectDir?: string | null; initialTab?: RepoPageTabKey; parentSubId?: string | null }) => {
     runVersionSensitiveAction(trans('repo.info_title', { defaultValue: 'Repository information' }), () => {
       const sessionId = target?.sessionId ?? activeSession ?? null;
-      const projectDir = selectedShareTarget
+      const projectDir = isTabShare
         ? FS_SESSION_ROOT_PATH
         : target?.projectDir ?? resolveRepoProjectDir(sessionId);
       if (!projectDir) return;
@@ -6024,10 +6040,10 @@ export function App() {
       }
       setShowRepoPage(true);
     });
-  }, [activeSession, ensureDesktopWindow, removeDesktopWindow, repoPanelTarget?.parentSubId, resolveRepoProjectDir, runVersionSensitiveAction, selectedServerId, selectedShareTarget, subSessions, trans]);
+  }, [activeSession, ensureDesktopWindow, isTabShare, removeDesktopWindow, repoPanelTarget?.parentSubId, resolveRepoProjectDir, runVersionSensitiveAction, selectedServerId, subSessions, trans]);
 
   const repoPanelSessionId = repoPanelTarget?.sessionId ?? activeSession ?? null;
-  const repoPanelProjectDir = selectedShareTarget
+  const repoPanelProjectDir = isTabShare
     ? FS_SESSION_ROOT_PATH
     : repoPanelTarget?.projectDir ?? activeSessionInfo?.projectDir;
 
@@ -6320,30 +6336,35 @@ export function App() {
   // React hooks ordering violation (hooks cannot be called conditionally).
   useEffect(() => {
     const ws = wsRef.current;
-    const dir = activeSessionInfo?.projectDir;
+    const isTab = selectedShareTarget && selectedShareTarget.kind !== 'server';
+    const rawDir = activeSessionInfo?.projectDir;
+    const dir = isTab ? FS_SESSION_ROOT_PATH : rawDir;
     if (!ws || !dir || !connected) return;
 
-    const existing = repoContextsRef.current.get(dir);
+    const existing = repoContextsRef.current.get(rawDir ?? dir) ?? (isTab ? repoContextsRef.current.get(FS_SESSION_ROOT_PATH) : undefined);
     // Already detected with a definitive status — no need to re-detect
     const TERMINAL_STATUSES = new Set(['ok', 'no_repo', 'cli_missing', 'cli_outdated', 'unauthorized', 'unknown_platform']);
     // Note: 'cli_error' is NOT terminal — it can be transient (rate limit, path mismatch, etc.)
     if (existing?.context?.status && TERMINAL_STATUSES.has(existing.context.status)) return;
 
+    const sessionName = activeSessionInfo?.name;
+    const opts = sessionName ? { sessionName } : undefined;
+
     // Delay initial detect to avoid browser rate limit on connect (burst of subscribes + timeline requests)
-    const initialTimer = setTimeout(() => ws.repoDetect(dir), 3_000);
+    const initialTimer = setTimeout(() => ws.repoDetect(dir, opts), 3_000);
 
     // Retry every 15s unless we get a definitive answer
     const interval = setInterval(() => {
-      const ctx = repoContextsRef.current.get(dir);
+      const ctx = repoContextsRef.current.get(rawDir ?? dir) ?? (isTab ? repoContextsRef.current.get(FS_SESSION_ROOT_PATH) : undefined);
       if (ctx?.context?.status && TERMINAL_STATUSES.has(ctx.context.status)) {
         clearInterval(interval);
         return;
       }
-      ws.repoDetect(dir);
+      ws.repoDetect(dir, opts);
     }, 15_000);
 
     return () => { clearTimeout(initialTimer); clearInterval(interval); };
-  }, [activeSessionInfo?.projectDir, connected]);
+  }, [activeSessionInfo?.name, activeSessionInfo?.projectDir, connected, selectedShareTarget]);
 
   // Show full-screen connecting indicator while waiting for initial WS + session data.
   // After 8s, show escape buttons so the user is never stuck.
@@ -7630,7 +7651,7 @@ export function App() {
           )}
           onFocus={() => bringDesktopWindowToFront(repoPanelDesktopWindowId)}
         >
-          <RepoPage ws={wsRef.current} sessionId={repoPanelSessionId} projectDir={repoPanelProjectDir} scopeToSessionRoot={!!sharedAccessRole} readOnly={sharedAccessRole === 'viewer'} initialTab={repoPanelTarget?.initialTab} initialTabToken={repoPanelTarget?.initialTabToken} onBack={() => setShowRepoPage(false)} onCiEvent={(run) => {
+          <RepoPage ws={wsRef.current} sessionId={repoPanelSessionId} projectDir={repoPanelProjectDir} scopeToSessionRoot={isTabShare} readOnly={sharedAccessRole === 'viewer'} initialTab={repoPanelTarget?.initialTab} initialTabToken={repoPanelTarget?.initialTabToken} onBack={() => setShowRepoPage(false)} onCiEvent={(run) => {
             const id = Date.now();
             const icon = run.status === 'success' ? '✅' : '❌';
             const failurePath = [run.failedJobName, run.failedStepName].filter(Boolean).join(' → ');

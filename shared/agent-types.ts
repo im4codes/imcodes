@@ -3,6 +3,7 @@ import { AGY_SDK_PROVIDER_ID } from './agy-agent.js';
 import { HERMES_AGENT_PROVIDER_ID } from './hermes-agent.js';
 
 export const SESSION_AGENT_TYPES = [
+  AGY_SDK_PROVIDER_ID,
   'claude-code-sdk',
   'claude-code',
   'codex-sdk',
@@ -14,7 +15,6 @@ export const SESSION_AGENT_TYPES = [
   'opencode',
   'gemini-sdk',
   'grok-sdk',
-  AGY_SDK_PROVIDER_ID,
   'gemini',
   'qwen',
   'openclaw',
@@ -33,6 +33,7 @@ export type SessionAgentType = typeof SESSION_AGENT_TYPES[number];
 export const CLAUDE_CODE_FAMILY = ['claude-code-sdk', 'claude-code'] as const;
 export const CODEX_FAMILY = ['codex-sdk', 'codex'] as const;
 export const TRANSPORT_SESSION_AGENT_TYPES = [
+  AGY_SDK_PROVIDER_ID,
   'claude-code-sdk',
   'codex-sdk',
   'qoder-sdk',
@@ -41,7 +42,6 @@ export const TRANSPORT_SESSION_AGENT_TYPES = [
   'opencode-sdk',
   'gemini-sdk',
   'grok-sdk',
-  AGY_SDK_PROVIDER_ID,
   'kimi-sdk',
   HERMES_AGENT_PROVIDER_ID,
   'deepseek-harness',

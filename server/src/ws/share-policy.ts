@@ -24,6 +24,7 @@ import {
   type ShareTarget,
 } from '../../../shared/tab-sharing.js';
 import { REPO_MSG } from '../../../shared/repo-types.js';
+import { FS_SESSION_ROOT_PATH } from '../../../src/shared/transport/fs.js';
 import { TIMELINE_MESSAGES } from '../../../shared/timeline-protocol.js';
 import { TASK_PAIR_TIMELINE_EVENT } from '../../../shared/task-pair.js';
 import {
@@ -74,6 +75,7 @@ export type ShareScopedSocketState = {
   snapshot: ShareAuthorizationSnapshot;
   connectedAt: number;
   coveredSessionNames?: readonly string[];
+  coveredProjectDirs?: readonly string[];
   /** When coverage was last re-resolved from the DB; bounds snapshot staleness. */
   coverageCheckedAt?: number;
   /** The bridge's share-change epoch when `snapshot` was read; an older value means a grant changed since. */
@@ -395,6 +397,71 @@ export const SHARE_SCOPED_DAEMON_MESSAGE_POLICY = new Map<string, DaemonMessageP
     // tab-scoped socket can safely receive this server-targeted message.
     scopesServerTargetInRedact: true,
   }],
+  [REPO_MSG.DETECTED, {
+    target: serverFieldTarget,
+    redact: redactRepoDaemonMessage,
+    scopesServerTargetInRedact: true,
+  }],
+  [REPO_MSG.DETECT_RESPONSE, {
+    target: serverFieldTarget,
+    redact: redactRepoDaemonMessage,
+    scopesServerTargetInRedact: true,
+  }],
+  [REPO_MSG.BRANCHES_RESPONSE, {
+    target: serverFieldTarget,
+    redact: redactRepoDaemonMessage,
+    scopesServerTargetInRedact: true,
+  }],
+  [REPO_MSG.CHECKOUT_BRANCH_RESPONSE, {
+    target: serverFieldTarget,
+    redact: redactRepoDaemonMessage,
+    scopesServerTargetInRedact: true,
+  }],
+  [REPO_MSG.COMMITS_RESPONSE, {
+    target: serverFieldTarget,
+    redact: redactRepoDaemonMessage,
+    scopesServerTargetInRedact: true,
+  }],
+  [REPO_MSG.ISSUES_RESPONSE, {
+    target: serverFieldTarget,
+    redact: redactRepoDaemonMessage,
+    scopesServerTargetInRedact: true,
+  }],
+  [REPO_MSG.PRS_RESPONSE, {
+    target: serverFieldTarget,
+    redact: redactRepoDaemonMessage,
+    scopesServerTargetInRedact: true,
+  }],
+  [REPO_MSG.ACTIONS_RESPONSE, {
+    target: serverFieldTarget,
+    redact: redactRepoDaemonMessage,
+    scopesServerTargetInRedact: true,
+  }],
+  [REPO_MSG.ACTION_DETAIL_RESPONSE, {
+    target: serverFieldTarget,
+    redact: redactRepoDaemonMessage,
+    scopesServerTargetInRedact: true,
+  }],
+  [REPO_MSG.COMMIT_DETAIL_RESPONSE, {
+    target: serverFieldTarget,
+    redact: redactRepoDaemonMessage,
+    scopesServerTargetInRedact: true,
+  }],
+  [REPO_MSG.PR_DETAIL_RESPONSE, {
+    target: serverFieldTarget,
+    redact: redactRepoDaemonMessage,
+    scopesServerTargetInRedact: true,
+  }],
+  [REPO_MSG.ISSUE_DETAIL_RESPONSE, {
+    target: serverFieldTarget,
+    redact: redactRepoDaemonMessage,
+    scopesServerTargetInRedact: true,
+  }],
+  [REPO_MSG.ERROR, {
+    target: serverFieldTarget,
+    redact: redactRepoDaemonMessage,
+    scopesServerTargetInRedact: true,
+  }],
 ]);
 
 export function normalizeShareTarget(input: unknown, expectedServerId?: string): ShareTarget | null {
@@ -436,6 +503,18 @@ export function shareTargetCoversSession(target: ShareTarget, sessionName: strin
 export function shareStateCoversSession(state: ShareScopedSocketState, sessionName: string): boolean {
   return shareTargetCoversSession(state.target, sessionName)
     || !!state.coveredSessionNames?.includes(sessionName);
+}
+
+export function shareTargetCoversProjectDir(target: ShareTarget, projectDir: string): boolean {
+  if (target.kind === 'server') return true;
+  return false;
+}
+
+export function shareStateCoversProjectDir(state: ShareScopedSocketState, projectDir: string): boolean {
+  if (state.target.kind === 'server') return true;
+  if (!projectDir) return false;
+  if (projectDir === FS_SESSION_ROOT_PATH) return true;
+  return !!state.coveredProjectDirs?.includes(projectDir);
 }
 
 /** A share actor may use identity-over-the-lease only as a participant whose share covers the session (HTTP identity route parity). */
@@ -529,9 +608,10 @@ export function evaluateShareCommand(input: {
   // creating a folder there -- are therefore covered for them exactly as for
   // the owner. Tab-share participants and viewers still need a covered target.
   const targetlessCoveredForServerParticipant = serverParticipant && !sessionName;
+  const targetlessCoveredForServer = input.state.target.kind === 'server' && !sessionName;
   if (policy.kind === 'allow-covered-read') {
     if (!sessionName) {
-      return policy.requireTarget && !targetlessCoveredForServerParticipant
+      return policy.requireTarget && !targetlessCoveredForServer
         ? { allowed: false, reason: SHARE_REASONS.DIRECT_SURFACE_DENIED }
         : { allowed: true };
     }
@@ -1402,3 +1482,20 @@ function redactActiveDispatchForViewers(msg: Record<string, unknown>, state: Sha
   delete redacted.dispatchId;
   return redacted;
 }
+
+function redactRepoDaemonMessage(
+  msg: Record<string, unknown>,
+  state: ShareScopedSocketState,
+): Record<string, unknown> | null {
+  if (state.target.kind === 'server') return msg;
+  const sessionName = commandSessionName(msg);
+  if (sessionName && shareStateCoversSession(state, sessionName)) {
+    return msg;
+  }
+  const projectDir = typeof msg.projectDir === 'string' ? msg.projectDir : '';
+  if (projectDir && shareStateCoversProjectDir(state, projectDir)) {
+    return msg;
+  }
+  return null;
+}
+

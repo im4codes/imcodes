@@ -1221,6 +1221,7 @@ export interface WatchRecentTextRow {
 export interface WatchActiveMainSessionRow {
   name: string;
   project: string;
+  projectDir?: string;
   state: string;
   agentType: string;
   runtimeType?: string;
@@ -1962,6 +1963,7 @@ type PendingFsRouteMap = Map<string, PendingFsRoute>;
 interface PendingRepoRoute {
   socket: WebSocket;
   timer: ReturnType<typeof setTimeout>;
+  sessionName?: string;
 }
 
 const REPO_REQUEST_TYPES = new Set<string>([
@@ -4199,11 +4201,12 @@ export class WsBridge {
   private registerPendingRepoRoute(ws: WebSocket, msg: Record<string, unknown>): void {
     const requestId = optionalString(msg.requestId);
     if (!requestId) return;
+    const sessionName = commandSessionName(msg);
     const previous = this.pendingRepoRequests.get(requestId);
     if (previous) clearTimeout(previous.timer);
     const timer = setTimeout(() => this.pendingRepoRequests.delete(requestId), FS_PENDING_UNICAST_TIMEOUT_MS);
     timer.unref?.();
-    this.pendingRepoRequests.set(requestId, { socket: ws, timer });
+    this.pendingRepoRequests.set(requestId, { socket: ws, timer, ...(sessionName ? { sessionName } : {}) });
   }
 
   private forwardPendingRepoRoute(msg: Record<string, unknown>): boolean {
@@ -4213,7 +4216,25 @@ export class WsBridge {
     if (!pending) return false;
     clearTimeout(pending.timer);
     this.pendingRepoRequests.delete(requestId);
-    safeSend(pending.socket, JSON.stringify(msg));
+    const resolvedMsg = pending.sessionName && !commandSessionName(msg)
+      ? { ...msg, sessionName: pending.sessionName }
+      : msg;
+    const outgoing = this.filterShareOutgoingJson(pending.socket, resolvedMsg, JSON.stringify(resolvedMsg));
+    if (outgoing) {
+      if (typeof msg.projectDir === 'string' && msg.projectDir) {
+        const state = this.browserShareStates.get(pending.socket);
+        if (state && state.target.kind !== 'server') {
+          const currentDirs = state.coveredProjectDirs ?? [];
+          if (!currentDirs.includes(msg.projectDir)) {
+            this.browserShareStates.set(pending.socket, {
+              ...state,
+              coveredProjectDirs: [...currentDirs, msg.projectDir],
+            });
+          }
+        }
+      }
+      safeSend(pending.socket, outgoing);
+    }
     return true;
   }
 
@@ -6646,6 +6667,8 @@ export class WsBridge {
     const effectiveTarget = options.snapshot.serverParticipantAuthority === true
       ? { kind: 'server' as const, serverId: options.target.serverId }
       : options.target;
+    const coveredSessionNames = this.baseCoveredSessionNames(effectiveTarget);
+    const coveredProjectDirs = this.baseCoveredProjectDirs(effectiveTarget, coveredSessionNames);
     this.browserShareStates.set(ws, {
       userId,
       actorDisplayName: userId,
@@ -6654,7 +6677,8 @@ export class WsBridge {
       requestedTarget: options.target,
       snapshot: options.snapshot,
       connectedAt: shareClockNow(),
-      coveredSessionNames: this.baseCoveredSessionNames(effectiveTarget),
+      coveredSessionNames,
+      coveredProjectDirs,
     });
     this.handleBrowserConnection(ws, userId, db, options.isMobile ?? false);
     void this.refreshShareActorDisplayName(ws);
@@ -6995,7 +7019,8 @@ export class WsBridge {
         return;
       }
 
-      if (this.browserShareStates.has(ws)) {
+      const shareState = this.browserShareStates.get(ws);
+      if (shareState) {
         const shareCommandDecision = await this.evaluateShareScopedBrowserCommand(ws, msg);
         if (!shareCommandDecision.allowed) {
           this.rejectShareScopedBrowserCommand(ws, msg, shareCommandDecision.reason);
@@ -7008,7 +7033,7 @@ export class WsBridge {
           msg = shareCommandDecision.stampedMessage;
           raw = JSON.stringify(msg);
         }
-        if (typeof msg.type === 'string' && REPO_REQUEST_TYPES.has(msg.type) && msg.projectDir !== FS_SESSION_ROOT_PATH) {
+        if (shareState.target.kind !== 'server' && typeof msg.type === 'string' && REPO_REQUEST_TYPES.has(msg.type) && msg.projectDir !== FS_SESSION_ROOT_PATH) {
           this.rejectShareScopedBrowserCommand(ws, msg, SHARE_REASONS.DIRECT_SURFACE_DENIED);
           return;
         }
@@ -7966,11 +7991,14 @@ export class WsBridge {
     const effectiveTarget = coverage.serverParticipantAuthority === true
       ? { kind: 'server' as const, serverId: coverage.target.serverId }
       : coverage.target;
+    const coveredSessionNames = await this.resolveShareCoveredSessionNames(effectiveTarget);
+    const coveredProjectDirs = await this.resolveShareCoveredProjectDirs(effectiveTarget, coveredSessionNames);
     const next: ShareScopedSocketState = {
       ...state,
       target: effectiveTarget,
       snapshot: coverage,
-      coveredSessionNames: await this.resolveShareCoveredSessionNames(effectiveTarget),
+      coveredSessionNames,
+      coveredProjectDirs,
     };
     if (state.snapshot.effectiveRole !== coverage.effectiveRole) {
       safeSend(ws, JSON.stringify({
@@ -7992,13 +8020,37 @@ export class WsBridge {
     return [`deck_sub_${target.subSessionId}`];
   }
 
+  private baseCoveredProjectDirs(target: ShareTarget, coveredSessionNames?: readonly string[]): string[] | undefined {
+    if (target.kind === 'server') return undefined;
+    const dirs = new Set<string>();
+    const sessionNames = new Set<string>(coveredSessionNames ?? []);
+    if (target.kind === 'main') sessionNames.add(target.sessionName);
+    if (target.kind === 'subsession') sessionNames.add(`deck_sub_${target.subSessionId}`);
+
+    for (const name of sessionNames) {
+      const active = this.activeMainSessions.get(name);
+      if (active?.projectDir) {
+        dirs.add(active.projectDir);
+      }
+      const activeSub = this.activeSubSessions.get(name);
+      if (activeSub?.parentSession) {
+        const parentActive = this.activeMainSessions.get(activeSub.parentSession);
+        if (parentActive?.projectDir) {
+          dirs.add(parentActive.projectDir);
+        }
+      }
+    }
+    return dirs.size > 0 ? Array.from(dirs) : undefined;
+  }
+
   private async refreshShareCoveredSessions(ws: WebSocket): Promise<void> {
     const state = this.browserShareStates.get(ws);
     if (!state) return;
     const coveredSessionNames = await this.resolveShareCoveredSessionNames(state.target);
+    const coveredProjectDirs = await this.resolveShareCoveredProjectDirs(state.target, coveredSessionNames);
     const current = this.browserShareStates.get(ws);
     if (!current || current.ticketId !== state.ticketId) return;
-    this.browserShareStates.set(ws, { ...current, coveredSessionNames });
+    this.browserShareStates.set(ws, { ...current, coveredSessionNames, coveredProjectDirs });
   }
 
   private async refreshShareActorDisplayName(ws: WebSocket): Promise<void> {
@@ -8026,6 +8078,55 @@ export class WsBridge {
       logger.warn({ err, serverId: this.serverId, target }, 'Failed to refresh covered share sub-sessions');
     }
     return this.baseCoveredSessionNames(target);
+  }
+
+  private async resolveShareCoveredProjectDirs(target: ShareTarget, coveredSessionNames?: readonly string[]): Promise<string[] | undefined> {
+    const base = this.baseCoveredProjectDirs(target, coveredSessionNames);
+    if (target.kind === 'server') return undefined;
+    if (!this.db) return base;
+    try {
+      const dirs = new Set<string>(base ?? []);
+      const sessionNames = Array.from(new Set([
+        ...(coveredSessionNames ?? []),
+        ...(target.kind === 'main' ? [target.sessionName] : []),
+      ]));
+      if (sessionNames.length > 0) {
+        const rows = await this.db.query<{ project_dir: string }>(
+          `SELECT DISTINCT project_dir FROM sessions WHERE server_id = $1 AND name = ANY($2) AND project_dir != ''`,
+          [this.serverId, sessionNames],
+        );
+        for (const row of rows) {
+          if (row.project_dir) dirs.add(row.project_dir);
+        }
+        const subSessionIds = sessionNames
+          .map((name) => rawSubSessionIdFromDisplayName(name))
+          .filter((id): id is string => typeof id === 'string');
+        if (subSessionIds.length > 0) {
+          const subRows = await this.db.query<{ cwd: string | null }>(
+            `SELECT DISTINCT cwd FROM sub_sessions WHERE server_id = $1 AND id = ANY($2) AND cwd IS NOT NULL AND cwd != ''`,
+            [this.serverId, subSessionIds],
+          );
+          for (const row of subRows) {
+            if (row.cwd) dirs.add(row.cwd);
+          }
+        }
+      }
+      return dirs.size > 0 ? Array.from(dirs) : undefined;
+    } catch (err) {
+      logger.warn({ err, serverId: this.serverId, target }, 'Failed to resolve covered project dirs');
+      return base;
+    }
+  }
+
+  private syncCoveredProjectDirsAcrossShareSockets(): void {
+    for (const [ws, state] of this.browserShareStates.entries()) {
+      if (state.target.kind === 'server') continue;
+      const baseDirs = this.baseCoveredProjectDirs(state.target, state.coveredSessionNames);
+      if (baseDirs && baseDirs.length > 0) {
+        const merged = Array.from(new Set([...(state.coveredProjectDirs ?? []), ...baseDirs]));
+        this.browserShareStates.set(ws, { ...state, coveredProjectDirs: merged });
+      }
+    }
   }
 
   private shareStateLooksExpired(state: ShareScopedSocketState): boolean {
@@ -9609,15 +9710,17 @@ export class WsBridge {
       });
       if (name && identityProjectKey) this.mainIdentityProjectKeys.set(name, identityProjectKey);
       const project = typeof row.project === 'string' ? row.project : '';
+      const projectDir = typeof row.projectDir === 'string' && row.projectDir.trim() ? row.projectDir.trim() : undefined;
       const state = typeof row.state === 'string' ? row.state : 'stopped';
       const agentType = typeof row.agentType === 'string' ? row.agentType : '';
       const runtimeType = typeof row.runtimeType === 'string' ? row.runtimeType : undefined;
       const label = typeof row.label === 'string' && row.label.trim() ? row.label.trim() : undefined;
       if (!name) continue;
-      this.activeMainSessions.set(name, { name, project, state, agentType, runtimeType, label });
+      this.activeMainSessions.set(name, { name, project, projectDir, state, agentType, runtimeType, label });
       this.sessionRuntimeTypes.set(name, this.normalizeRuntimeType(runtimeType));
       if (state === 'idle' || state === 'stopped') this.activeDispatchIds.delete(name);
     }
+    this.syncCoveredProjectDirsAcrossShareSockets();
     this.scheduleAutoUpgradeFlushAtIdleBoundary();
   }
 
@@ -10384,11 +10487,13 @@ export class WsBridge {
     }
 
     // Share-scoped commands have already passed the live participant + covered
-    // session policy immediately above this handler. They may address only the
+    // session policy immediately above this handler. Tab shares may address only the
     // daemon-owned virtual session root; accepting a host path here would turn
-    // repository checkout into a path-selection capability.
-    if (this.browserShareStates.has(ws)) {
-      if (projectDir !== FS_SESSION_ROOT_PATH) {
+    // repository checkout into a path-selection capability. Whole-server shares cover
+    // all sessions and projects on that server.
+    const shareState = this.browserShareStates.get(ws);
+    if (shareState) {
+      if (shareState.target.kind !== 'server' && projectDir !== FS_SESSION_ROOT_PATH) {
         sendRepoError('unauthorized');
         return false;
       }
