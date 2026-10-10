@@ -24,6 +24,7 @@ import {
 import { getSessionRuntimeType, isTransportSessionAgentType } from '@shared/agent-types.js';
 import { getAutoSessionLabelPrefix } from '../agent-display.js';
 import { EXECUTION_CLONE_KIND } from '@shared/execution-clone.js';
+import { AGY_SDK_PROVIDER_ID } from '@shared/agy-agent.js';
 import {
   parseSupervisionHeartbeatSnapshot,
   type SupervisionHeartbeatSnapshot,
@@ -67,6 +68,10 @@ function isCodexFamily(agentType: string | null | undefined): boolean {
   return agentType === 'codex' || agentType === 'codex-sdk';
 }
 
+function isQuotaPreservingSubSessionType(agentType: string | null | undefined): boolean {
+  return isCodexFamily(agentType) || agentType === 'claude-code-sdk' || agentType === AGY_SDK_PROVIDER_ID;
+}
+
 function toSessionName(id: string): string {
   return `deck_sub_${id}`;
 }
@@ -79,7 +84,7 @@ function mergeLoadedSubSession(s: SubSessionData, existing?: SubSession): SubSes
     state: 'unknown' as const,
   };
   if (!existing) return base;
-  const preserveCodexDisplay = isCodexFamily(base.type);
+  const preserveCodexDisplay = isQuotaPreservingSubSessionType(base.type);
   return {
     ...base,
     state: existing.state !== 'unknown' ? existing.state : base.state,
@@ -311,7 +316,7 @@ export function useSubSessions(
               const updated = [...prev];
               const existing = updated[existingIdx];
               if (isOlderActivityGeneration(m.activityGeneration, existing.activityGeneration)) return prev;
-              const preserveQuota = isCodexFamily(existing.type);
+              const preserveQuota = isQuotaPreservingSubSessionType(existing.type);
               const transportPendingPatch = buildTransportPendingSyncPatch(
                 existing,
                 m,
@@ -419,7 +424,7 @@ export function useSubSessions(
           setSubSessions((prev) => prev.map((s) => {
             if (s.id !== m.id) return s;
             if (isOlderActivityGeneration(m.activityGeneration, s.activityGeneration)) return s;
-            const preserveQuota = isCodexFamily(s.type);
+            const preserveQuota = isQuotaPreservingSubSessionType(s.type);
             const transportPendingPatch = buildTransportPendingSyncPatch(s, m, s.sessionName);
             return { ...s,
               ...(m.activityGeneration !== undefined ? { activityGeneration: m.activityGeneration as ActivityGenerationLike } : {}),

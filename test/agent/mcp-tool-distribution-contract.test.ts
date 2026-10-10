@@ -4,6 +4,7 @@ import {
   SESSION_AGENT_TYPES,
   TRANSPORT_SESSION_AGENT_TYPES,
 } from '../../shared/agent-types.js';
+import { AGY_SDK_PROVIDER_ID } from '../../shared/agy-agent.js';
 import {
   MCP_TOOL_DISCOVERY_REFRESH_INSTRUCTIONS,
   MCP_TOOL_DISTRIBUTION_CONTRACT_VERSION,
@@ -50,8 +51,14 @@ describe('shared MCP tool distribution contract', () => {
       delivery: 'shared_catalog_with_exact_fallback',
       managedMcp: true,
     });
+    expect(getMcpToolDistributionContract(AGY_SDK_PROVIDER_ID)).toMatchObject({
+      delivery: 'external_config_with_exact_fallback',
+      boundary: 'external_mcp_config',
+      managedMcp: false,
+      exactFallback: true,
+    });
     for (const agentType of TRANSPORT_SESSION_AGENT_TYPES) {
-      if (agentType === 'pi' || agentType === 'openclaw') continue;
+      if (agentType === 'pi' || agentType === 'openclaw' || agentType === AGY_SDK_PROVIDER_ID) continue;
       expect(getMcpToolDistributionContract(agentType)).toMatchObject({
         delivery: 'host_refresh_with_exact_fallback',
         managedMcp: true,

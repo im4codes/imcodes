@@ -4,6 +4,7 @@ import { pushDurableEventToWatch, syncSnapshotToWatch } from './watch-bridge.js'
 import type { TimelineEvent } from '../../src/shared/timeline/types.js';
 import { CODEBUDDY_PROVIDER_IDS } from '@shared/codebuddy.js';
 import { HERMES_AGENT_PROVIDER_ID } from '@shared/hermes-agent.js';
+import { AGY_SDK_PROVIDER_ID } from '@shared/agy-agent.js';
 import { isRunningTimelineEvent, isSdkSubagentTimelineEvent } from './timeline-running.js';
 import {
   createTransportQueueReducerState,
@@ -187,6 +188,7 @@ const BADGE_MAP: Record<string, string> = {
   'grok-sdk': 'gr',
   'kimi-sdk': 'km',
   [HERMES_AGENT_PROVIDER_ID]: 'he',
+  [AGY_SDK_PROVIDER_ID]: 'ag',
   'deepseek-harness': 'ds',
   pi: 'pi',
   [CODEBUDDY_PROVIDER_IDS.CHINA]: 'cb',

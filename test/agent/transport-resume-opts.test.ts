@@ -10,6 +10,7 @@ import {
 } from '../../src/agent/transport-resume-opts.js';
 import type { SessionRecord } from '../../src/store/session-store.js';
 import { CODEBUDDY_PROVIDER_IDS } from '../../shared/codebuddy.js';
+import { AGY_SDK_PROVIDER_ID } from '../../shared/agy-agent.js';
 import { HERMES_AGENT_PROVIDER_ID } from '../../shared/hermes-agent.js';
 
 function rec(overrides: Partial<SessionRecord>): SessionRecord {
@@ -30,6 +31,7 @@ function rec(overrides: Partial<SessionRecord>): SessionRecord {
 describe('buildTransportResumeLaunchOpts', () => {
   it('classifies Grok with the generic provider-resume family', () => {
     expect(usesProviderResumeId('grok-sdk')).toBe(true);
+    expect(usesProviderResumeId(AGY_SDK_PROVIDER_ID)).toBe(true);
     expect(usesProviderResumeId('kimi-sdk')).toBe(true);
     expect(usesProviderResumeId(HERMES_AGENT_PROVIDER_ID)).toBe(true);
     expect(usesProviderResumeId('opencode-sdk')).toBe(true);
@@ -56,7 +58,7 @@ describe('buildTransportResumeLaunchOpts', () => {
   });
 
   it('threads providerResumeId for directory-backed and durable transport providers', () => {
-    for (const agentType of ['cursor-headless', 'copilot-sdk', 'opencode-sdk', 'kimi-sdk', HERMES_AGENT_PROVIDER_ID, 'grok-sdk', 'deepseek-harness', 'pi', CODEBUDDY_PROVIDER_IDS.CHINA, CODEBUDDY_PROVIDER_IDS.INTERNATIONAL] as const) {
+    for (const agentType of ['cursor-headless', 'copilot-sdk', 'opencode-sdk', 'kimi-sdk', HERMES_AGENT_PROVIDER_ID, 'grok-sdk', AGY_SDK_PROVIDER_ID, 'deepseek-harness', 'pi', CODEBUDDY_PROVIDER_IDS.CHINA, CODEBUDDY_PROVIDER_IDS.INTERNATIONAL] as const) {
       expect(buildTransportResumeLaunchOpts(rec({ agentType, providerResumeId: 'pr-1' }))).toMatchObject({ providerResumeId: 'pr-1' });
     }
   });
@@ -203,5 +205,6 @@ describe('usesDirectoryScopedSessionListing', () => {
     expect(usesDirectoryScopedSessionListing(HERMES_AGENT_PROVIDER_ID)).toBe(true);
     expect(usesDirectoryScopedSessionListing('grok-sdk')).toBe(true);
     expect(usesDirectoryScopedSessionListing('cursor-headless')).toBe(false);
+    expect(usesDirectoryScopedSessionListing(AGY_SDK_PROVIDER_ID)).toBe(false);
   });
 });

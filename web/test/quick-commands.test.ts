@@ -9,6 +9,7 @@ import {
   matchSlashCommandTrigger,
 } from '../src/quick-commands.js';
 import { HERMES_AGENT_PROVIDER_ID } from '../../shared/hermes-agent.js';
+import { AGY_SDK_PROVIDER_ID } from '../../shared/agy-agent.js';
 
 describe('slash command suggestions', () => {
   it('opens only for an argument-free slash command at the start of the composer', () => {
@@ -55,6 +56,14 @@ describe('slash command suggestions', () => {
       '/tools',
       '/context',
     ]));
+  });
+
+  it('offers Antigravity clear and model controls without compact', () => {
+    expect(getDefaultQuickCommands(AGY_SDK_PROVIDER_ID)).toEqual([
+      '/stop',
+      '/clear',
+      '/model',
+    ]);
   });
 });
 

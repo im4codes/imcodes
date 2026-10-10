@@ -45,6 +45,7 @@ import {
   stripAgentDelegationControlInstructions,
   type AgentDelegationErrorCode,
 } from '../../shared/agent-delegation.js';
+import { AGY_SDK_PROVIDER_ID } from '../../shared/agy-agent.js';
 import { HERMES_AGENT_PROVIDER_ID } from '../../shared/hermes-agent.js';
 
 import { AUDIT_CONVERGENCE_CONTRACT_ID } from '../../shared/audit-convergence.js';
@@ -202,6 +203,7 @@ describe('agent delegation shared contract', () => {
       'opencode',
       'gemini-sdk',
       'grok-sdk',
+      AGY_SDK_PROVIDER_ID,
       'gemini',
       'qwen',
       'openclaw',

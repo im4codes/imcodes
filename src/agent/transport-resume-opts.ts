@@ -5,6 +5,7 @@ import type { RemoteSessionInfo } from './transport-provider.js';
 import { canonicalizeTransportCwd } from './transport-paths.js';
 import { isCodeBuddyProviderId } from '../../shared/codebuddy.js';
 import { HERMES_AGENT_PROVIDER_ID } from '../../shared/hermes-agent.js';
+import { AGY_SDK_PROVIDER_ID } from '../../shared/agy-agent.js';
 
 /** Providers whose durable conversation id is stored in SessionRecord.providerResumeId. */
 export function usesProviderResumeId(agentType: string | undefined): boolean {
@@ -13,6 +14,7 @@ export function usesProviderResumeId(agentType: string | undefined): boolean {
     || agentType === 'kimi-sdk'
     || agentType === HERMES_AGENT_PROVIDER_ID
     || agentType === 'grok-sdk'
+    || agentType === AGY_SDK_PROVIDER_ID
     || agentType === 'opencode-sdk'
     || agentType === 'deepseek-harness'
     || agentType === 'pi'

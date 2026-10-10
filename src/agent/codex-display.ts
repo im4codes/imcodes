@@ -18,7 +18,7 @@ function quotaMetaOrExisting(
   incoming: ProviderQuotaMeta | undefined,
   existing: ProviderQuotaMeta | undefined,
 ): ProviderQuotaMeta | undefined {
-  if (incoming && (incoming.primary || incoming.secondary)) return incoming;
+  if (incoming && (incoming.primary || incoming.secondary || (incoming.groups && incoming.groups.length > 0))) return incoming;
   return existing;
 }
 

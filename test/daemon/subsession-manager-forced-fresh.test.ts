@@ -22,6 +22,7 @@ import {
   EXECUTION_CLONE_KIND,
   type ExecutionCloneMetadata,
 } from '../../shared/execution-clone.js';
+import { AGY_SDK_PROVIDER_ID } from '../../shared/agy-agent.js';
 
 const {
   upsertSessionMock, getSessionMock, removeSessionMock,
@@ -201,9 +202,9 @@ describe('startSubSession — forced fresh (transport families)', () => {
     vi.clearAllMocks();
   });
 
-  // openclaw included; qwen/cursor-headless/copilot-sdk/gemini-sdk/grok-sdk are the
+  // openclaw included; qwen/cursor-headless/copilot-sdk/gemini-sdk/grok-sdk/agy-sdk are the
   // families the OLD code never passed `fresh` to.
-  const TRANSPORT_FAMILIES = ['qwen', 'cursor-headless', 'copilot-sdk', 'opencode-sdk', 'gemini-sdk', 'grok-sdk', 'codebuddy-cn', 'codebuddy-international', 'openclaw'] as const;
+  const TRANSPORT_FAMILIES = ['qwen', 'cursor-headless', 'copilot-sdk', 'opencode-sdk', 'gemini-sdk', 'grok-sdk', AGY_SDK_PROVIDER_ID, 'codebuddy-cn', 'codebuddy-international', 'openclaw'] as const;
 
   for (const type of TRANSPORT_FAMILIES) {
     it(`${type}: fresh:true reaches launch, NO old identity / bind reaches launchTransportSession`, async () => {
@@ -405,6 +406,38 @@ describe('startSubSession — non-fresh path unchanged (no regression)', () => {
     await startSubSession({
       id: 'nf-grok-stale-route',
       type: 'grok-sdk',
+      cwd: '/proj',
+      providerSessionId: 'stale-local-route',
+    });
+
+    const arg = lastTransportLaunchArg();
+    expect(arg.providerResumeId).toBeUndefined();
+    expect(arg.bindExistingKey).toBeUndefined();
+    expect(arg.skipCreate).toBe(false);
+    expect(arg.fresh).toBe(true);
+  });
+
+  it('agy-sdk non-fresh resumes only from providerResumeId and never binds the stale route key', async () => {
+    await startSubSession({
+      id: 'nf-agy',
+      type: AGY_SDK_PROVIDER_ID,
+      cwd: '/proj',
+      parentSession: 'deck_proj_brain',
+      providerSessionId: 'stale-local-route',
+      providerResumeId: 'agy-conv-session',
+    });
+
+    const arg = lastTransportLaunchArg();
+    expect(arg.providerResumeId).toBe('agy-conv-session');
+    expect(arg.bindExistingKey).toBeUndefined();
+    expect(arg.skipCreate).toBe(true);
+    expect(arg.fresh).toBeUndefined();
+  });
+
+  it('agy-sdk ignores a local route key without providerResumeId and starts fresh', async () => {
+    await startSubSession({
+      id: 'nf-agy-stale-route',
+      type: AGY_SDK_PROVIDER_ID,
       cwd: '/proj',
       providerSessionId: 'stale-local-route',
     });

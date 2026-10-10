@@ -4,6 +4,7 @@ import {
   PROCESS_SESSION_AGENT_TYPES,
   TRANSPORT_SESSION_AGENT_TYPES,
 } from '../../../shared/agent-types.js';
+import { AGY_SDK_PROVIDER_ID } from '../../../shared/agy-agent.js';
 import { IMCODES_SESSION_ENV } from '../../../shared/imcodes-send.js';
 import {
   buildMemoryMcpServerEnv,
@@ -80,7 +81,7 @@ describe('managed provider MCP registration helpers', () => {
 
     expect(TRANSPORT_SESSION_AGENT_TYPES.filter((agentType) => (
       !MEMORY_MCP_PROVIDER_IDS.includes(agentType as (typeof MEMORY_MCP_PROVIDER_IDS)[number])
-    ))).toEqual(['openclaw']);
+    ))).toEqual([AGY_SDK_PROVIDER_ID, 'openclaw']);
     expect(PROCESS_SESSION_AGENT_TYPES.some((agentType) => (
       MEMORY_MCP_PROVIDER_IDS.includes(agentType as (typeof MEMORY_MCP_PROVIDER_IDS)[number])
     ))).toBe(false);

@@ -1,6 +1,7 @@
 import type { SessionAgentType } from '@shared/agent-types.js';
 import { CODEBUDDY_PROVIDER_IDS } from '@shared/codebuddy.js';
 import { HERMES_AGENT_PROVIDER_ID } from '@shared/hermes-agent.js';
+import { AGY_SDK_PROVIDER_ID } from '@shared/agy-agent.js';
 
 export type SessionAgentGroupId = 'transport' | 'process';
 export type SessionAgentSurface = 'new-session' | 'sub-session';
@@ -92,6 +93,14 @@ const SESSION_AGENT_CHOICES: SessionAgentChoice[] = [
     icon: '𝕏',
     fallbackLabel: 'Grok Build',
     labelKey: 'session.agentType.grok_sdk',
+    group: 'transport',
+    surfaces: ['new-session', 'sub-session'],
+  },
+  {
+    id: AGY_SDK_PROVIDER_ID,
+    icon: '◈',
+    fallbackLabel: 'Antigravity',
+    labelKey: 'session.agentType.agy_sdk',
     group: 'transport',
     surfaces: ['new-session', 'sub-session'],
   },
@@ -238,6 +247,6 @@ export function getSessionAgentLabel(
 export const PROJECT_ROLE_AGENT_TYPES: string[] = [
   'claude-code', 'claude-code-sdk', 'codex', 'codex-sdk', 'qoder-sdk', 'copilot-sdk',
   'cursor-headless', 'opencode-sdk', 'opencode', 'gemini', 'gemini-sdk', 'grok-sdk',
-  'kimi-sdk', HERMES_AGENT_PROVIDER_ID, 'deepseek-harness', 'pi',
+  'kimi-sdk', HERMES_AGENT_PROVIDER_ID, AGY_SDK_PROVIDER_ID, 'deepseek-harness', 'pi',
   CODEBUDDY_PROVIDER_IDS.CHINA, CODEBUDDY_PROVIDER_IDS.INTERNATIONAL,
 ];

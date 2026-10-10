@@ -142,10 +142,12 @@ import {
 } from './p2p-target-selection.js';
 import { buildSessionList } from './session-list.js';
 import { setClaudeUsageQuotaOptIn, recordClaudeQuotaActivity } from '../agent/claude-usage-quota.js';
+import { recordAgyQuotaActivity } from '../agent/agy-usage-quota.js';
 import { CLAUDE_QUOTA_MSG } from '../../shared/claude-quota.js';
 import { CODEX_RESET_CREDITS_MSG } from '../../shared/codex-reset-credits.js';
 import { CODEX_CREDIT_HISTORY_MSG, type CodexCreditSnapshot } from '../../shared/codex-credit-history.js';
 import { HERMES_AGENT_PROVIDER_ID } from '../../shared/hermes-agent.js';
+import { AGY_SDK_PROVIDER_ID } from '../../shared/agy-agent.js';
 import { PROVIDER_ERROR_CODES } from '../agent/transport-provider.js';
 import { refreshCodexQuotaMetadataForSessions } from './codex-quota-refresh.js';
 import { fetchCodexResetCredits, consumeCodexResetCredit } from '../agent/codex-reset-credits.js';
@@ -1060,6 +1062,7 @@ export function supportsTransportClear(agentType: string | undefined): boolean {
     || agentType === 'kimi-sdk'
     || agentType === HERMES_AGENT_PROVIDER_ID
     || agentType === 'grok-sdk'
+    || agentType === AGY_SDK_PROVIDER_ID
     || agentType === 'deepseek-harness'
     || agentType === 'pi'
     || isCodeBuddyProviderId(agentType);
@@ -2580,7 +2583,7 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
       targetDir: requestedDir,
     });
 
-    if (agentType === 'claude-code-sdk' || agentType === 'codex-sdk' || agentType === 'copilot-sdk' || agentType === 'cursor-headless' || agentType === 'opencode-sdk' || agentType === 'gemini-sdk' || agentType === 'kimi-sdk' || agentType === HERMES_AGENT_PROVIDER_ID || agentType === 'grok-sdk') {
+    if (agentType === 'claude-code-sdk' || agentType === 'codex-sdk' || agentType === 'copilot-sdk' || agentType === 'cursor-headless' || agentType === 'opencode-sdk' || agentType === 'gemini-sdk' || agentType === 'kimi-sdk' || agentType === HERMES_AGENT_PROVIDER_ID || agentType === 'grok-sdk' || agentType === AGY_SDK_PROVIDER_ID) {
       logger.info({ project, agentType }, 'SDK fresh session.start removing stale main-session store record');
       // The fresh session starts under the SAME name, so its predecessor's
       // durable queue must be cleared and its authority rotated first.
@@ -2597,7 +2600,7 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
       brainType: agentType as ProjectConfig['brainType'],
       workerTypes: [],
       label,
-      fresh: agentType === 'claude-code-sdk' || agentType === 'codex-sdk' || agentType === 'opencode-sdk' || agentType === 'gemini-sdk' || agentType === 'kimi-sdk' || agentType === HERMES_AGENT_PROVIDER_ID || agentType === 'grok-sdk' || isCodeBuddyProviderId(agentType),
+      fresh: agentType === 'claude-code-sdk' || agentType === 'codex-sdk' || agentType === 'opencode-sdk' || agentType === 'gemini-sdk' || agentType === 'kimi-sdk' || agentType === HERMES_AGENT_PROVIDER_ID || agentType === 'grok-sdk' || agentType === AGY_SDK_PROVIDER_ID || isCodeBuddyProviderId(agentType),
       extraEnv,
       ccPreset: ccPresetName,
       effort,
@@ -2648,7 +2651,7 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
         effort,
         identityPrompt,
       });
-    } else if (agentType === 'opencode-sdk' || agentType === 'gemini-sdk' || agentType === 'kimi-sdk' || agentType === HERMES_AGENT_PROVIDER_ID || agentType === 'grok-sdk' || agentType === 'deepseek-harness' || agentType === 'pi' || isCodeBuddyProviderId(agentType)) {
+    } else if (agentType === 'opencode-sdk' || agentType === 'gemini-sdk' || agentType === 'kimi-sdk' || agentType === HERMES_AGENT_PROVIDER_ID || agentType === 'grok-sdk' || agentType === AGY_SDK_PROVIDER_ID || agentType === 'deepseek-harness' || agentType === 'pi' || isCodeBuddyProviderId(agentType)) {
       // Transport providers share the codex-sdk launch shape. DSH/Pi additionally
       // receive ccPreset so their adapters can bind the selected third-party
       // provider and model atomically before the first turn.
@@ -2798,7 +2801,7 @@ async function handleRestart(cmd: Record<string, unknown>, serverLink: ServerLin
 function isGenericModelSwitchAgent(agentType: string | undefined): boolean {
   return agentType === 'copilot-sdk' || agentType === 'cursor-headless' || agentType === 'opencode-sdk'
     || agentType === 'gemini-sdk' || agentType === 'kimi-sdk' || agentType === HERMES_AGENT_PROVIDER_ID
-    || agentType === 'grok-sdk' || agentType === 'deepseek-harness' || agentType === 'pi'
+    || agentType === 'grok-sdk' || agentType === AGY_SDK_PROVIDER_ID || agentType === 'deepseek-harness' || agentType === 'pi'
     || isCodeBuddyProviderId(agentType);
 }
 
@@ -2846,6 +2849,10 @@ async function resolveValidatedModelList(record: SessionRecord): Promise<{ model
     case 'grok-sdk': {
       const grokModels = await getProvider('grok-sdk')?.listModels?.().catch(() => ({ models: [] }));
       return { models: grokModels?.models.map((model) => model.id) ?? [] };
+    }
+    case AGY_SDK_PROVIDER_ID: {
+      const agyModels = await getProvider(AGY_SDK_PROVIDER_ID)?.listModels?.().catch(() => ({ models: [] }));
+      return { models: agyModels?.models.map((model) => model.id) ?? [] };
     }
     default:
       return null;
@@ -4061,6 +4068,7 @@ async function handleSendBound(cmd: Record<string, unknown>, serverLink: ServerL
   // Claude usage-quota poll alive (the quota tracks the Claude subscription).
   // Cheap sync Map lookup — does not touch the send hot-path ack latency.
   if (getSession(sessionName)?.agentType === 'claude-code-sdk') recordClaudeQuotaActivity();
+  if (getSession(sessionName)?.agentType === 'agy-sdk') recordAgyQuotaActivity();
 
   // Fallback: legacy clients that don't send commandId get a server-generated one
   const isLegacy = !commandId;
@@ -7462,7 +7470,7 @@ async function handleSubSessionStart(cmd: Record<string, unknown>, serverLink: S
         bindExistingKey,
         ...(ccPreset ? { ccPreset } : {}),
         ...(type === 'claude-code-sdk' ? { ccSessionId: randomUUID(), fresh: true } : {}),
-        ...(type === 'codex-sdk' || type === 'opencode-sdk' || type === 'kimi-sdk' || type === HERMES_AGENT_PROVIDER_ID || type === 'grok-sdk' || type === 'deepseek-harness' || type === 'pi' || isCodeBuddyProviderId(type) ? { fresh: true } : {}),
+        ...(type === 'codex-sdk' || type === 'opencode-sdk' || type === 'kimi-sdk' || type === HERMES_AGENT_PROVIDER_ID || type === 'grok-sdk' || type === AGY_SDK_PROVIDER_ID || type === 'deepseek-harness' || type === 'pi' || isCodeBuddyProviderId(type) ? { fresh: true } : {}),
         ...(effort ? { effort } : {}),
         userCreated: true,
         parentSession: parentSession || undefined,
@@ -11569,7 +11577,7 @@ async function loadTransportListModels(agentType: string, force: boolean): Promi
   // caller explicitly forces a live probe.
   if (!provider && !force) return await loadPassiveTransportListModels(agentType);
 
-  if (!provider && force && (agentType === 'gemini-sdk' || agentType === 'kimi-sdk' || agentType === HERMES_AGENT_PROVIDER_ID || agentType === 'grok-sdk' || agentType === 'opencode-sdk' || agentType === 'claude-code-sdk' || agentType === 'codex-sdk' || agentType === 'copilot-sdk' || agentType === 'cursor-headless' || isCodeBuddyProviderId(agentType))) {
+  if (!provider && force && (agentType === 'gemini-sdk' || agentType === 'kimi-sdk' || agentType === HERMES_AGENT_PROVIDER_ID || agentType === 'grok-sdk' || agentType === AGY_SDK_PROVIDER_ID || agentType === 'opencode-sdk' || agentType === 'claude-code-sdk' || agentType === 'codex-sdk' || agentType === 'copilot-sdk' || agentType === 'cursor-headless' || isCodeBuddyProviderId(agentType))) {
     try {
       provider = await ensureProviderConnected(agentType, {});
     } catch (err) {
@@ -11696,7 +11704,7 @@ async function loadPassiveTransportListModels(agentType: string): Promise<Transp
       defaultModel: CODEBUDDY_INTERNATIONAL_MODEL_FALLBACK[0],
     };
   }
-  if (agentType === 'cursor-headless' || agentType === 'kimi-sdk' || agentType === HERMES_AGENT_PROVIDER_ID || agentType === 'grok-sdk'
+  if (agentType === 'cursor-headless' || agentType === 'kimi-sdk' || agentType === HERMES_AGENT_PROVIDER_ID || agentType === 'grok-sdk' || agentType === AGY_SDK_PROVIDER_ID
     || agentType === 'deepseek-harness' || agentType === 'pi') {
     // DeepSeek Harness resolves provider routes and model catalogues from its
     // own `~/.dsh` configuration; IM.codes advertises no static list.

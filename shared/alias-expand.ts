@@ -5,6 +5,7 @@
 
 import { SESSION_AGENT_TYPES, type SessionAgentType } from './agent-types.js';
 import { CODEBUDDY_PROVIDER_IDS } from './codebuddy.js';
+import { AGY_SDK_PROVIDER_ID } from './agy-agent.js';
 import { HERMES_AGENT_PROVIDER_ID } from './hermes-agent.js';
 import {
   ALIAS_NOTE_HARD_MAX,
@@ -40,6 +41,7 @@ export const ALIAS_EXPANSION_MODE_BY_AGENT: Record<SessionAgentType, AliasExpans
   'opencode': 'legend',
   'gemini-sdk': 'legend',
   'grok-sdk': 'legend',
+  [AGY_SDK_PROVIDER_ID]: 'legend',
   'gemini': 'legend',
   'qwen': 'legend',
   'openclaw': 'legend',

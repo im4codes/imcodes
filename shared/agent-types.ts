@@ -1,4 +1,5 @@
 import { CODEBUDDY_PROVIDER_IDS } from './codebuddy.js';
+import { AGY_SDK_PROVIDER_ID } from './agy-agent.js';
 import { HERMES_AGENT_PROVIDER_ID } from './hermes-agent.js';
 
 export const SESSION_AGENT_TYPES = [
@@ -13,6 +14,7 @@ export const SESSION_AGENT_TYPES = [
   'opencode',
   'gemini-sdk',
   'grok-sdk',
+  AGY_SDK_PROVIDER_ID,
   'gemini',
   'qwen',
   'openclaw',
@@ -39,6 +41,7 @@ export const TRANSPORT_SESSION_AGENT_TYPES = [
   'opencode-sdk',
   'gemini-sdk',
   'grok-sdk',
+  AGY_SDK_PROVIDER_ID,
   'kimi-sdk',
   HERMES_AGENT_PROVIDER_ID,
   'deepseek-harness',

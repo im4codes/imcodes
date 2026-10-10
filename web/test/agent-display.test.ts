@@ -4,6 +4,7 @@
 import { describe, expect, it } from 'vitest';
 import { formatLabel } from '../src/format-label.js';
 import { getAutoSessionLabelPrefix } from '../src/agent-display.js';
+import { AGY_SDK_PROVIDER_ID } from '../../shared/agy-agent.js';
 import { HERMES_AGENT_PROVIDER_ID } from '../../shared/hermes-agent.js';
 
 describe('agent display helpers', () => {
@@ -25,6 +26,7 @@ describe('agent display helpers', () => {
     expect(getAutoSessionLabelPrefix('copilot-sdk')).toBe('Co');
     expect(getAutoSessionLabelPrefix('cursor-headless')).toBe('Cu');
     expect(getAutoSessionLabelPrefix('grok-sdk')).toBe('Gr');
+    expect(getAutoSessionLabelPrefix(AGY_SDK_PROVIDER_ID)).toBe('Ag');
     expect(getAutoSessionLabelPrefix(HERMES_AGENT_PROVIDER_ID)).toBe('He');
     expect(getAutoSessionLabelPrefix('opencode-sdk')).toBe('OC');
     expect(getAutoSessionLabelPrefix('deepseek-harness')).toBe('Ds');

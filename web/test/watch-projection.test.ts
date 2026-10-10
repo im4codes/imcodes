@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createWatchProjectionStore, type WatchApplicationContext } from '../src/watch-projection.js';
+import { AGY_SDK_PROVIDER_ID } from '../../shared/agy-agent.js';
 
 const localStorageData = new Map<string, string>();
 const localStorageMock = {
@@ -117,6 +118,16 @@ describe('watch projection store', () => {
     );
 
     expect(store.getSnapshot().sessions[0]).toMatchObject({ agentBadge: 'gr' });
+  });
+
+  it('projects the Antigravity transport badge', () => {
+    const { store } = makeSnapshotStore();
+    store.updateFromSessionList(
+      { id: 'srv-1', name: 'Main', baseUrl: 'https://main.test' },
+      [{ name: 'deck_agy_brain', project: 'Agy', role: 'brain', agentType: AGY_SDK_PROVIDER_ID, state: 'idle' }],
+    );
+
+    expect(store.getSnapshot().sessions[0]).toMatchObject({ agentBadge: 'ag' });
   });
 
   it('keeps auth/routing fields explicit even when apiKey is unavailable', () => {

@@ -3,6 +3,7 @@ import { LOAD_VALIDATION_SAFETY_BY_LOCALE } from './load-validation-safety.js';
 import { P2P_ROUTING_FIELDS } from './p2p-routing-fields.js';
 import { isSessionAgentType } from './agent-types.js';
 import { CODEBUDDY_PROVIDER_IDS } from './codebuddy.js';
+import { AGY_SDK_PROVIDER_ID } from './agy-agent.js';
 import { HERMES_AGENT_PROVIDER_ID } from './hermes-agent.js';
 import { isValidImcodesSessionName } from './session-scope.js';
 import {
@@ -402,6 +403,7 @@ export const DELEGATION_REPLY_CAPABLE_AGENT_TYPES = [
   'opencode',
   'gemini-sdk',
   'grok-sdk',
+  AGY_SDK_PROVIDER_ID,
   'gemini',
   'qwen',
   'openclaw',

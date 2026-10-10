@@ -38,6 +38,8 @@ import { readNativeAgentAdmissionMode } from '../../shared/native-collaboration-
 import { appendTransportEvent } from './transport-history.js';
 import logger from '../util/logger.js';
 import { TrailingThrottle } from '../util/trailing-throttle.js';
+import { AGY_SDK_PROVIDER_ID } from '../../shared/agy-agent.js';
+import { recordAgyQuotaActivity, refreshAgyQuotaMetadata } from '../agent/agy-usage-quota.js';
 import { getSession } from '../store/session-store.js';
 import { resolveSessionContextWindow } from './session-context-window.js';
 import { TIMELINE_EVENT_FILE_CHANGE } from '../../shared/file-change.js';
@@ -520,6 +522,11 @@ export function wireProviderToRelay(provider: TransportProvider): void {
       sessionId: sessionName,
       text: finalText,
     });
+
+    if (provider.id === AGY_SDK_PROVIDER_ID) {
+      recordAgyQuotaActivity();
+      void refreshAgyQuotaMetadata().catch(() => {});
+    }
   });
 
   provider.onError((providerSid: string, error: ProviderError) => {

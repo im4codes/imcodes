@@ -1,4 +1,5 @@
 import type { SessionAgentType } from './agent-types.js';
+import { AGY_SDK_PROVIDER_ID } from './agy-agent.js';
 
 /** Canonical shared contract for every IM.codes MCP-consuming runtime. */
 export const MCP_TOOL_DISTRIBUTION_CONTRACT_VERSION = 1 as const;
@@ -53,6 +54,7 @@ export const MCP_TOOL_RUNTIME_BOUNDARIES = Object.freeze({
   opencode: { delivery: 'external_config_with_exact_fallback', boundary: 'external_mcp_config' },
   'gemini-sdk': { delivery: 'host_refresh_with_exact_fallback', boundary: 'managed_mcp' },
   'grok-sdk': { delivery: 'host_refresh_with_exact_fallback', boundary: 'managed_mcp' },
+  [AGY_SDK_PROVIDER_ID]: { delivery: 'external_config_with_exact_fallback', boundary: 'external_mcp_config' },
   gemini: { delivery: 'external_config_with_exact_fallback', boundary: 'external_mcp_config' },
   qwen: { delivery: 'host_refresh_with_exact_fallback', boundary: 'managed_mcp' },
   openclaw: { delivery: 'not_applicable', boundary: 'gateway_native' },

@@ -1,8 +1,9 @@
 import { useEffect, useMemo, useState } from 'preact/hooks';
 import { formatProviderQuotaLabel, type ProviderQuotaMeta } from '@shared/provider-quota.js';
+import { AGY_SDK_PROVIDER_ID } from '@shared/agy-agent.js';
 
 export function isCompactProviderQuotaAgent(agentType: string | null | undefined): boolean {
-  return agentType === 'codex' || agentType === 'codex-sdk' || agentType === 'claude-code-sdk';
+  return agentType === 'codex' || agentType === 'codex-sdk' || agentType === 'claude-code-sdk' || agentType === AGY_SDK_PROVIDER_ID;
 }
 
 /**

@@ -10,6 +10,7 @@ import { useRef, useState } from 'preact/hooks';
 import { FILE_TRANSFER_LIMITS } from '../../../shared/transport/file-transfer.js';
 import { DIRECT_FILE_TRANSFER_ERROR } from '../../../shared/direct-file-transfer.js';
 import { HERMES_AGENT_PROVIDER_ID } from '../../../shared/hermes-agent.js';
+import { AGY_SDK_PROVIDER_ID } from '../../../shared/agy-agent.js';
 
 const DEFAULT_INNER_WIDTH = 1280;
 const { mockI18n, directFileTransferMocks, voiceOverlayMock } = vi.hoisted(() => ({
@@ -11107,6 +11108,46 @@ afterEach(() => {
     expectSendPayload(ws, {
       sessionName: 'grok-sdk-session',
       text: '/model grok-build-fast',
+    });
+  });
+
+  it('shows only dynamically discovered agy-sdk models and sends /model', async () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({
+          name: 'agy-sdk-session',
+          agentType: AGY_SDK_PROVIDER_ID,
+          runtimeType: 'transport',
+          activeModel: 'gemini-2.5-pro',
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    const request = ws.send.mock.calls.find((call) => call[0]?.type === 'transport.list_models')?.[0];
+    expect(request).toMatchObject({ type: 'transport.list_models', agentType: AGY_SDK_PROVIDER_ID });
+
+    act(() => ws.emit({
+      type: 'transport.models_response',
+      agentType: AGY_SDK_PROVIDER_ID,
+      requestId: request?.requestId,
+      models: [
+        { id: 'gemini-2.5-pro', name: 'Gemini 2.5 Pro' },
+        { id: 'gemini-2.5-flash', name: 'Gemini 2.5 Flash' },
+      ],
+      defaultModel: 'gemini-2.5-pro',
+      isAuthenticated: true,
+    }));
+
+    fireEvent.click(screen.getByRole('button', { name: /^gemini-2\.5-pro$/i }));
+    const menu = document.querySelector('.menu-dropdown') as HTMLElement;
+    fireEvent.click(within(menu).getByRole('button', { name: /gemini-2\.5-flash/i }));
+
+    expectSendPayload(ws, {
+      sessionName: 'agy-sdk-session',
+      text: '/model gemini-2.5-flash',
     });
   });
 

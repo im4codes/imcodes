@@ -78,6 +78,7 @@ import { getQwenDisplayMetadata } from './provider-display.js';
 import { getQwenOAuthQuotaUsageLabel } from './provider-quota.js';
 import { getClaudeSdkRuntimeConfig, normalizeClaudeSdkModelForProvider } from './sdk-runtime-config.js';
 import { peekClaudeUsageQuotaCached } from './claude-usage-quota.js';
+import { peekAgyUsageQuotaCached } from './agy-usage-quota.js';
 import { getCodexRuntimeConfig } from './codex-runtime-config.js';
 import { mergeCodexDisplayMetadata } from './codex-display.js';
 import type { TransportEffortLevel } from '../../shared/effort-levels.js';
@@ -2376,6 +2377,12 @@ function wireTransportSessionInfo(
     if (agentType === 'claude-code-sdk') {
       const proactive = peekClaudeUsageQuotaCached();
       if (proactive?.quotaMeta?.secondary) {
+        effQuotaLabel = proactive.quotaLabel;
+        effQuotaMeta = proactive.quotaMeta;
+      }
+    } else if (agentType === 'agy-sdk') {
+      const proactive = peekAgyUsageQuotaCached();
+      if (proactive?.quotaMeta?.groups?.length) {
         effQuotaLabel = proactive.quotaLabel;
         effQuotaMeta = proactive.quotaMeta;
       }

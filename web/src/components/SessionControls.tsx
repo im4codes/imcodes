@@ -150,6 +150,7 @@ import {
   isCodeBuddyProviderId,
 } from '@shared/codebuddy.js';
 import { HERMES_AGENT_PROVIDER_ID } from '@shared/hermes-agent.js';
+import { AGY_SDK_PROVIDER_ID } from '@shared/agy-agent.js';
 import {
   buildAgentDelegationOrchestrationPrompt,
   isDelegationUnsupportedControlText,
@@ -2028,9 +2029,10 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const isGrokSdk = activeSession?.agentType === 'grok-sdk';
   const isKimiSdk = activeSession?.agentType === 'kimi-sdk';
   const isHermesAgent = activeSession?.agentType === HERMES_AGENT_PROVIDER_ID;
+  const isAgySdk = activeSession?.agentType === AGY_SDK_PROVIDER_ID;
   const isOpenCodeSdk = activeSession?.agentType === 'opencode-sdk';
   const isCodeBuddy = isCodeBuddyProviderId(activeSession?.agentType);
-  const supportsGenericTransportModelSelect = isCopilot || isCursorHeadless || isDeepseekHarness || isPi || isGeminiSdk || isGrokSdk || isKimiSdk || isHermesAgent || isOpenCodeSdk || isCodeBuddy;
+  const supportsGenericTransportModelSelect = isCopilot || isCursorHeadless || isDeepseekHarness || isPi || isGeminiSdk || isGrokSdk || isKimiSdk || isHermesAgent || isAgySdk || isOpenCodeSdk || isCodeBuddy;
   // Source-of-truth priority for the model picker:
   //   1. `useTransportModels` — live daemon probe via `transport.list_models`
   //      WS round-trip. Works uniformly for main sessions AND sub-sessions
@@ -2074,7 +2076,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     if (isKimiSdk || isHermesAgent) {
       return dynamicTransportModels.models.map((m) => m.id);
     }
-    if (isGrokSdk) {
+    if (isGrokSdk || isAgySdk) {
       return dynamicTransportModels.models.map((m) => m.id);
     }
     if (activeSession?.agentType === CODEBUDDY_PROVIDER_IDS.CHINA) {
@@ -2092,6 +2094,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     isGrokSdk,
     isKimiSdk,
     isHermesAgent,
+    isAgySdk,
     isOpenCodeSdk,
     isCodeBuddy,
     activeSession?.agentType,

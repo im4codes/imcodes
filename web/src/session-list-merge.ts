@@ -21,6 +21,7 @@
  */
 
 import { mergeTransportConfigPreservingSupervision } from '@shared/supervision-config.js';
+import { AGY_SDK_PROVIDER_ID } from '@shared/agy-agent.js';
 import type { SessionInfo } from './types.js';
 import { resolveRuntimeType } from './runtime-type.js';
 import { parseSupervisionHeartbeatSnapshot } from '@shared/supervision-heartbeat.js';
@@ -156,11 +157,11 @@ export function mergeSessionListEntry(
         ? existing?.activityGeneration
         : undefined;
   const isCodexFamily = incoming.agentType === 'codex' || incoming.agentType === 'codex-sdk';
-  // Codex AND claude-code-sdk surface provider quota that the daemon may omit on
+  // Codex AND claude-code-sdk AND agy-sdk surface provider quota that the daemon may omit on
   // a given session_list pass (idle / 30-min throttle / a transient B failure);
   // preserve the last known value so the footer doesn't flicker blank between
   // updates instead of dropping it to undefined.
-  const preservesProviderQuota = isCodexFamily || incoming.agentType === 'claude-code-sdk';
+  const preservesProviderQuota = isCodexFamily || incoming.agentType === 'claude-code-sdk' || incoming.agentType === AGY_SDK_PROVIDER_ID;
   const pendingSyncPatch = !isOlderGeneration && hasTransportPendingSyncSnapshot(incoming as unknown as Record<string, unknown>)
     ? buildTransportPendingSyncPatch({
       transportPendingMessages: existing?.transportPendingMessages,

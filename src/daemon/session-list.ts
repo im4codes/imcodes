@@ -10,6 +10,7 @@ import { getCodexRuntimeConfig } from '../agent/codex-runtime-config.js';
 import { mergeCodexDisplayMetadata } from '../agent/codex-display.js';
 import { getCopilotRuntimeConfig } from '../agent/copilot-runtime-config.js';
 import { getCursorRuntimeConfig } from '../agent/cursor-runtime-config.js';
+import { fetchAgyUsageQuota, recordAgyQuotaActivity } from '../agent/agy-usage-quota.js';
 import { providerQuotaMetaEquals } from '../../shared/provider-quota.js';
 import { QWEN_AUTH_TYPES } from '../../shared/qwen-auth.js';
 import { getTransportRuntime } from '../agent/session-manager.js';
@@ -246,11 +247,16 @@ export async function buildSessionList(): Promise<SessionListItem[]> {
   const needsCodexHydration = sessions.some((s) => (s.agentType === 'codex' || s.agentType === 'codex-sdk'));
   const needsCopilotHydration = sessions.some((s) => s.agentType === 'copilot-sdk');
   const needsCursorHydration = sessions.some((s) => s.agentType === 'cursor-headless');
+  const needsAgySdkHydration = sessions.some((s) => s.agentType === 'agy-sdk');
   const qwenRuntime = needsQwenHydration ? await getQwenRuntimeConfig().catch(() => null) : null;
   const claudeSdkRuntime = needsClaudeSdkHydration ? await getClaudeSdkRuntimeConfig().catch(() => ({}) as import('../agent/sdk-runtime-config.js').SdkRuntimeConfig) : null;
   // Option B (best-effort, ≤1 fetch / 30min): proactive 5h+weekly quota pulled
   // from /api/oauth/usage. null → fall back to the SDK rate_limit_event quota.
   const claudeUsageQuota = needsClaudeSdkHydration ? await getClaudeUsageQuota().catch(() => null) : null;
+  if (needsAgySdkHydration) {
+    recordAgyQuotaActivity();
+  }
+  const agyUsageQuota = needsAgySdkHydration ? await fetchAgyUsageQuota().catch(() => null) : null;
   const codexRuntime = needsCodexHydration ? await getCodexRuntimeConfig({ probe: false }).catch(() => ({}) as import('../agent/codex-runtime-config.js').CodexRuntimeConfig) : null;
   const copilotRuntime = needsCopilotHydration ? await getCopilotRuntimeConfig({ probe: false }).catch(() => null) : null;
   const cursorRuntime = needsCursorHydration ? await getCursorRuntimeConfig({ probe: false }).catch(() => null) : null;
@@ -290,6 +296,23 @@ export async function buildSessionList(): Promise<SessionListItem[]> {
         ? { quotaLabel: claudeUsageQuota.quotaLabel, quotaMeta: claudeUsageQuota.quotaMeta }
         : {};
       return { ...baseItem(s), ...hydrated, ...quotaOverride };
+    }
+    if (s.agentType === 'agy-sdk') {
+      const quotaOverride = agyUsageQuota
+        ? { quotaLabel: agyUsageQuota.quotaLabel, quotaMeta: agyUsageQuota.quotaMeta }
+        : {};
+      const hydrated: Partial<SessionRecord> = {
+        permissionLabel: getPermissionLabel(s.agentType),
+        ...quotaOverride,
+      };
+      if (
+        hydrated.permissionLabel !== s.permissionLabel
+        || hydrated.quotaLabel !== s.quotaLabel
+        || !providerQuotaMetaEquals(hydrated.quotaMeta, s.quotaMeta)
+      ) {
+        upsertSession({ ...s, ...hydrated, updatedAt: Date.now() });
+      }
+      return { ...baseItem(s), ...hydrated };
     }
     if (s.agentType === 'codex' || s.agentType === 'codex-sdk') {
       const hydrated: Partial<SessionRecord> = {

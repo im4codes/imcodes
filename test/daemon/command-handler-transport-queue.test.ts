@@ -46,6 +46,7 @@ import {
 import { TIMELINE_CURSOR_DIRECTIONS, TIMELINE_MESSAGES, TIMELINE_RESPONSE_STATUS, TIMELINE_RESPONSE_SOURCES } from '../../shared/timeline-protocol.js';
 import { TRANSPORT_MSG } from '../../shared/transport-events.js';
 import { HERMES_AGENT_PROVIDER_ID } from '../../shared/hermes-agent.js';
+import { AGY_SDK_PROVIDER_ID } from '../../shared/agy-agent.js';
 import { RETIRED_SUPERVISION_EXECUTION_AUDIT_READY_MARKER } from '../../shared/supervision-config.js';
 import {
   AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES,
@@ -2127,6 +2128,62 @@ describe('handleWebCommand transport queue behavior', () => {
     expect(emitMock).toHaveBeenCalledWith('deck_transport_brain', 'command.ack', { commandId: 'cmd-clear-grok', status: 'accepted' });
   });
 
+  it('starts a fresh agy-sdk main session with the requested model', async () => {
+    handleWebCommand({
+      type: 'session.start',
+      project: 'transport',
+      dir: '/proj',
+      agentType: AGY_SDK_PROVIDER_ID,
+      requestedModel: 'gemini-2.5-pro',
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(launchTransportSessionMock).toHaveBeenCalledWith(expect.objectContaining({
+      name: 'deck_transport_brain',
+      projectName: 'transport',
+      agentType: AGY_SDK_PROVIDER_ID,
+      projectDir: '/proj',
+      fresh: true,
+      requestedModel: 'gemini-2.5-pro',
+    }));
+  });
+
+  it('dispatches /clear as a fresh agy-sdk relaunch without the old resume id', async () => {
+    getSessionMock.mockReturnValue({
+      name: 'deck_transport_brain',
+      projectName: 'transport',
+      role: 'brain',
+      agentType: AGY_SDK_PROVIDER_ID,
+      runtimeType: 'transport',
+      state: 'running',
+      projectDir: '/proj',
+      providerSessionId: 'route-agy-old',
+      providerResumeId: 'resume-agy-old',
+      requestedModel: 'gemini-2.5-pro',
+    });
+    getTransportRuntimeMock.mockReturnValue({
+      providerSessionId: 'route-agy-old',
+      send: vi.fn(() => 'queued'),
+      pendingCount: 1,
+      pendingMessages: ['a'],
+    });
+
+    handleWebCommand({ type: 'session.send', session: 'deck_transport_brain', text: '/clear', commandId: 'cmd-clear-agy' }, serverLink as any);
+    await flushAsync();
+
+    expect(stopTransportRuntimeSessionMock).toHaveBeenCalledWith('deck_transport_brain');
+    expect(launchTransportSessionMock).toHaveBeenCalledWith(expect.objectContaining({
+      name: 'deck_transport_brain',
+      agentType: AGY_SDK_PROVIDER_ID,
+      projectDir: '/proj',
+      requestedModel: 'gemini-2.5-pro',
+      fresh: true,
+    }));
+    expect(launchTransportSessionMock.mock.calls.at(-1)?.[0]).not.toHaveProperty('providerResumeId');
+    expect(launchTransportSessionMock.mock.calls.at(-1)?.[0]).not.toHaveProperty('bindExistingKey');
+    expect(emitMock).toHaveBeenCalledWith('deck_transport_brain', 'command.ack', { commandId: 'cmd-clear-agy', status: 'accepted' });
+  });
+
   it('dispatches /clear as a fresh CodeBuddy relaunch without the old resume id', async () => {
     getSessionMock.mockReturnValue({
       name: 'deck_transport_brain',
@@ -3794,6 +3851,28 @@ describe('handleWebCommand transport queue behavior', () => {
     }));
   });
 
+  it('force-connects agy-sdk for live model discovery', async () => {
+    const listModels = vi.fn().mockResolvedValue({ models: [{ id: 'gemini-2.5-pro' }], defaultModel: 'gemini-2.5-pro' });
+    getProviderMock.mockReturnValue(undefined);
+    ensureProviderConnectedMock.mockResolvedValue({ listModels });
+
+    handleWebCommand({ type: 'transport.list_models', agentType: AGY_SDK_PROVIDER_ID, requestId: 'agy-models', force: true }, serverLink as any);
+    await waitForAsync(() => serverLink.send.mock.calls.some((call) => (
+      (call[0] as Record<string, unknown>).type === 'transport.models_response'
+        && (call[0] as Record<string, unknown>).requestId === 'agy-models'
+    )));
+
+    expect(ensureProviderConnectedMock).toHaveBeenCalledWith(AGY_SDK_PROVIDER_ID, {});
+    expect(listModels).toHaveBeenCalledWith(true);
+    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'transport.models_response',
+      agentType: AGY_SDK_PROVIDER_ID,
+      requestId: 'agy-models',
+      models: [{ id: 'gemini-2.5-pro' }],
+      defaultModel: 'gemini-2.5-pro',
+    }));
+  });
+
   it.each([
     [Object.assign(new Error('ENOENT /secret/install/path'), { code: 'ENOENT' }), 'unavailable or incompatible', 'cli_unavailable_or_incompatible'],
     [{ code: 'AUTH_FAILED', message: 'token=super-secret', recoverable: false }, 'authentication is required', 'authentication'],
@@ -4745,6 +4824,33 @@ describe('handleWebCommand transport queue behavior', () => {
       projectDir: '/tmp/project',
       parentSession: 'deck_parent_brain',
       requestedModel: 'grok-build',
+      fresh: true,
+      userCreated: true,
+    }));
+  });
+
+  it('starts a fresh agy-sdk sub-session with exact parent project identity', async () => {
+    getSessionMock.mockImplementation((name: string) => name === 'deck_parent_brain'
+      ? { name, projectName: 'parent-project' }
+      : undefined);
+
+    handleWebCommand({
+      type: 'subsession.start',
+      id: 'agy_child',
+      sessionType: AGY_SDK_PROVIDER_ID,
+      cwd: '/tmp/project',
+      parentSession: 'deck_parent_brain',
+      requestedModel: 'gemini-2.5-pro',
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(launchTransportSessionMock).toHaveBeenCalledWith(expect.objectContaining({
+      name: 'deck_sub_agy_child',
+      projectName: 'parent-project',
+      agentType: AGY_SDK_PROVIDER_ID,
+      projectDir: '/tmp/project',
+      parentSession: 'deck_parent_brain',
+      requestedModel: 'gemini-2.5-pro',
       fresh: true,
       userCreated: true,
     }));
@@ -6508,6 +6614,45 @@ describe('handleWebCommand transport queue behavior', () => {
       requestedModel: 'grok-build-fast',
       activeModel: 'grok-build-fast',
       modelDisplay: 'grok-build-fast',
+    }));
+  });
+
+  it('switches model for agy-sdk transport sessions via /model', async () => {
+    const setAgentId = vi.fn();
+    getProviderMock.mockReturnValue({
+      listModels: vi.fn().mockResolvedValue({
+        models: [{ id: 'gemini-2.5-pro' }, { id: 'gemini-2.5-flash' }],
+        defaultModel: 'gemini-2.5-pro',
+        isAuthenticated: true,
+      }),
+    });
+    getSessionMock.mockReturnValue({
+      name: 'deck_transport_brain',
+      projectName: 'transport',
+      role: 'brain',
+      agentType: AGY_SDK_PROVIDER_ID,
+      runtimeType: 'transport',
+      state: 'running',
+      requestedModel: 'gemini-2.5-pro',
+    });
+    getTransportRuntimeMock.mockReturnValue({
+      providerSessionId: 'provider-route-agy',
+      setAgentId,
+    });
+
+    handleWebCommand({
+      type: 'session.send',
+      session: 'deck_transport_brain',
+      text: '/model gemini-2.5-flash',
+      commandId: 'cmd-model-agy',
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(setAgentId).toHaveBeenCalledWith('gemini-2.5-flash');
+    expect(upsertSessionMock).toHaveBeenCalledWith(expect.objectContaining({
+      requestedModel: 'gemini-2.5-flash',
+      activeModel: 'gemini-2.5-flash',
+      modelDisplay: 'gemini-2.5-flash',
     }));
   });
 

@@ -50,6 +50,7 @@ import {
   type PeerAuditValidationItem,
   type PeerAuditCandidate,
 } from '../../shared/peer-audit.js';
+import { AGY_SDK_PROVIDER_ID } from '../../shared/agy-agent.js';
 import { HERMES_AGENT_PROVIDER_ID } from '../../shared/hermes-agent.js';
 import { DAEMON_COMMAND_TYPES } from '../../shared/daemon-command-types.js';
 
@@ -153,6 +154,7 @@ describe('exact model and provider-family normalization', () => {
     expect(resolvePeerAuditProviderFamily({ providerId: 'codebuddy-cn' })).toBe('codebuddy');
     expect(resolvePeerAuditProviderFamily({ agentType: 'codebuddy-international' })).toBe('codebuddy');
     expect(resolvePeerAuditProviderFamily({ providerId: HERMES_AGENT_PROVIDER_ID })).toBe('hermes');
+    expect(resolvePeerAuditProviderFamily({ providerId: AGY_SDK_PROVIDER_ID })).toBe('google');
     expect(resolvePeerAuditProviderFamily({ providerId: 'codex-ish' })).toBe('unknown');
     expect(resolvePeerAuditProviderFamily({})).toBe('unknown');
   });

@@ -44,7 +44,7 @@ import {
 import { isEmbeddingStatus } from '../../../shared/embedding-status.js';
 import { DAEMON_STATS_MSG, DAEMON_STATS_NUMERIC_KEYS } from '../../../shared/daemon-stats.js';
 import { isDirectConnectivityRuntimeStatus } from '../../../shared/direct-file-transfer.js';
-import type { ProviderQuotaMeta, ProviderQuotaWindow } from '../../../shared/provider-quota.js';
+import { sanitizeProviderQuotaMeta } from '../../../shared/provider-quota.js';
 
 export { shareTargetKey };
 export type { EffectiveCoverage, ShareTarget };
@@ -1171,40 +1171,6 @@ const SHARE_VISIBLE_SESSION_FIELDS = new Set([
 
 const SHARE_PROVIDER_QUOTA_TEXT_MAX_CHARS = 1_024;
 
-function projectProviderQuotaWindow(value: unknown): ProviderQuotaWindow | undefined {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
-  const raw = value as Record<string, unknown>;
-  const usedPercent = typeof raw.usedPercent === 'number' && Number.isFinite(raw.usedPercent)
-    ? Math.max(0, Math.min(100, raw.usedPercent))
-    : undefined;
-  const windowDurationMins = typeof raw.windowDurationMins === 'number'
-    && Number.isFinite(raw.windowDurationMins)
-    && raw.windowDurationMins > 0
-    ? raw.windowDurationMins
-    : undefined;
-  const resetsAt = typeof raw.resetsAt === 'number' && Number.isFinite(raw.resetsAt) && raw.resetsAt > 0
-    ? raw.resetsAt
-    : undefined;
-  if (usedPercent === undefined && windowDurationMins === undefined && resetsAt === undefined) return undefined;
-  return {
-    ...(usedPercent !== undefined ? { usedPercent } : {}),
-    ...(windowDurationMins !== undefined ? { windowDurationMins } : {}),
-    ...(resetsAt !== undefined ? { resetsAt } : {}),
-  };
-}
-
-function projectProviderQuotaMeta(value: unknown): ProviderQuotaMeta | undefined {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
-  const raw = value as Record<string, unknown>;
-  const primary = projectProviderQuotaWindow(raw.primary);
-  const secondary = projectProviderQuotaWindow(raw.secondary);
-  if (!primary && !secondary) return undefined;
-  return {
-    ...(primary ? { primary } : {}),
-    ...(secondary ? { secondary } : {}),
-  };
-}
-
 function projectQuotaText(value: unknown): string | undefined {
   if (typeof value !== 'string') return undefined;
   const normalized = value.trim();
@@ -1216,7 +1182,7 @@ function projectQuotaText(value: unknown): string | undefined {
 function projectParticipantProviderQuota(row: Record<string, unknown>): Record<string, unknown> {
   const quotaLabel = projectQuotaText(row.quotaLabel);
   const quotaUsageLabel = projectQuotaText(row.quotaUsageLabel);
-  const quotaMeta = projectProviderQuotaMeta(row.quotaMeta);
+  const quotaMeta = sanitizeProviderQuotaMeta(row.quotaMeta);
   return {
     ...(quotaLabel ? { quotaLabel } : {}),
     ...(quotaUsageLabel ? { quotaUsageLabel } : {}),

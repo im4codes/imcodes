@@ -598,6 +598,19 @@ describe('generic i18n coverage guard', () => {
     }
   });
 
+  it('keeps the Antigravity agent label present in every locale', () => {
+    for (const locale of SUPPORTED_LOCALES) {
+      const messages = JSON.parse(readFileSync(join(WEB_ROOT, 'src/i18n/locales', `${locale}.json`), 'utf8')) as unknown;
+      const label = readPath(messages, 'session.agentType.agy_sdk');
+      const prerequisiteError = readPath(messages, 'new_session.agy_prerequisite_error');
+      expect(label, `${locale}:session.agentType.agy_sdk`).toEqual(expect.any(String));
+      expect((label as string).trim().length).toBeGreaterThan(0);
+      expect(label, `${locale}:session.agentType.agy_sdk`).toBe('Antigravity');
+      expect(prerequisiteError, `${locale}:new_session.agy_prerequisite_error`).toEqual(expect.any(String));
+      expect((prerequisiteError as string).trim().length).toBeGreaterThan(0);
+    }
+  });
+
   it('keeps a taskPair.flag.<flag> label for every TASK_PAIR_FLAGS entry in every locale (a new flag must never ship without one)', () => {
     for (const locale of SUPPORTED_LOCALES) {
       const messages = JSON.parse(readFileSync(join(WEB_ROOT, 'src/i18n/locales', `${locale}.json`), 'utf8')) as unknown;

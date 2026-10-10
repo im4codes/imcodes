@@ -6,6 +6,7 @@ import { h } from 'preact';
 import { render, screen, fireEvent, cleanup, waitFor, act } from '@testing-library/preact';
 import { GIT_REMOTE_CLONE_CAPABILITY_V1 } from '../../../shared/git-remote-url.js';
 import { DEFAULT_CODEX_SESSION_MODEL } from '../../../src/shared/models/options.js';
+import { AGY_SDK_PROVIDER_ID } from '../../../shared/agy-agent.js';
 import { HERMES_AGENT_PROVIDER_ID } from '../../../shared/hermes-agent.js';
 
 const {
@@ -166,7 +167,7 @@ describe('NewSessionDialog', () => {
     const groups = Array.from(document.querySelectorAll('.session-agent-group'));
     expect(groups.map((group) => group.querySelector('.session-agent-group-title')?.textContent)).toEqual(['SDK', 'CLI']);
     const options = groups.flatMap((group) => Array.from(group.querySelectorAll<HTMLButtonElement>('[data-agent-type]')).map((button) => button.dataset.agentType));
-    expect(options.slice(0, 16)).toEqual([
+    expect(options.slice(0, 17)).toEqual([
       'claude-code-sdk',
       'codex-sdk',
       'qoder-sdk',
@@ -175,6 +176,7 @@ describe('NewSessionDialog', () => {
       'opencode-sdk',
       'gemini-sdk',
       'grok-sdk',
+      AGY_SDK_PROVIDER_ID,
       'kimi-sdk',
       HERMES_AGENT_PROVIDER_ID,
       'deepseek-harness',
@@ -184,7 +186,7 @@ describe('NewSessionDialog', () => {
       'qwen',
       'openclaw',
     ]);
-    expect(options.slice(16)).toEqual([
+    expect(options.slice(17)).toEqual([
       'claude-code',
       'codex',
       'opencode',
@@ -1144,5 +1146,40 @@ describe('NewSessionDialog', () => {
       error: 'Grok authentication is required. Run `grok login`.',
     }));
     expect((await screen.findByRole('alert')).textContent).toContain('grok_prerequisite_error');
+  });
+
+  it('uses dynamically discovered agy-sdk models when starting a session', async () => {
+    const ws = makeWs();
+    render(<NewSessionDialog ws={ws as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
+
+    fireEvent.input(screen.getByPlaceholderText('my-project'), { target: { value: 'my-app' } });
+    fireEvent.input(screen.getByPlaceholderText('~/projects/my-project'), { target: { value: '~/projects/my-app' } });
+    selectAgent(AGY_SDK_PROVIDER_ID);
+
+    await waitFor(() => expect(ws.send.mock.calls.some((call) => (
+      call[0]?.type === 'transport.list_models' && call[0]?.agentType === AGY_SDK_PROVIDER_ID
+    ))).toBe(true));
+    const request = ws.send.mock.calls.find((call) => (
+      call[0]?.type === 'transport.list_models' && call[0]?.agentType === AGY_SDK_PROVIDER_ID
+    ))?.[0];
+    expect(request).toMatchObject({ force: true });
+    act(() => ws.emit({
+      type: 'transport.models_response',
+      agentType: AGY_SDK_PROVIDER_ID,
+      requestId: request?.requestId,
+      models: [{ id: 'gemini-2.5-pro', name: 'Gemini 2.5 Pro' }],
+      defaultModel: 'gemini-2.5-pro',
+      isAuthenticated: true,
+    }));
+
+    await waitFor(() => expect(screen.getByRole('option', { name: 'gemini-2.5-pro' })).toBeDefined());
+    const selects = screen.getAllByRole('combobox') as HTMLSelectElement[];
+    fireEvent.input(selects[0], { target: { value: 'gemini-2.5-pro' } });
+    fireEvent.click(screen.getByRole('button', { name: /start/i }));
+
+    expect(ws.sendSessionCommand).toHaveBeenCalledWith('start', expect.objectContaining({
+      agentType: AGY_SDK_PROVIDER_ID,
+      requestedModel: 'gemini-2.5-pro',
+    }));
   });
 });

@@ -16,6 +16,7 @@ import { resolveExactDelegationTarget } from './session-dispatch.js';
 import type { SessionRecord } from '../store/session-store.js';
 import { CODEBUDDY_PROVIDER_IDS } from '../../shared/codebuddy.js';
 import { HERMES_AGENT_PROVIDER_ID } from '../../shared/hermes-agent.js';
+import { AGY_SDK_PROVIDER_ID } from '../../shared/agy-agent.js';
 import { DELEGATION_AVAILABILITY, type DelegationTargetAvailability } from '../../shared/delegation-availability.js';
 import type { SupervisionAuditDegradedReason } from '../../shared/supervision-execution-pool.js';
 
@@ -125,6 +126,8 @@ function peerAuditTypeLabel(agentType: string): string {
       return 'Gm';
     case 'grok-sdk':
       return 'Gx';
+    case AGY_SDK_PROVIDER_ID:
+      return 'Ag';
     case 'qwen':
       return 'Qw';
     case 'kimi-sdk':

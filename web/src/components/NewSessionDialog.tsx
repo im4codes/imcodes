@@ -56,6 +56,7 @@ import {
   isCodeBuddyProviderId,
 } from "@shared/codebuddy.js";
 import { HERMES_AGENT_PROVIDER_ID } from "@shared/hermes-agent.js";
+import { AGY_SDK_PROVIDER_ID } from "@shared/agy-agent.js";
 import { SESSION_IDENTITY_SCOPES, normalizeSessionIdentityContent } from '@shared/session-identity.js';
 import { saveSessionIdentityProfile } from '../api.js';
 import { SessionIdentityTabs } from './SessionIdentityTabs.js';
@@ -506,6 +507,7 @@ export function NewSessionDialog({
           || agentType === "grok-sdk"
           || agentType === "kimi-sdk"
           || agentType === HERMES_AGENT_PROVIDER_ID
+          || agentType === AGY_SDK_PROVIDER_ID
           || agentType === "deepseek-harness"
           || agentType === "pi"
           || isCodeBuddyProviderId(agentType)
@@ -535,7 +537,7 @@ export function NewSessionDialog({
   const agentFlavor =
     agentType === "claude-code" || agentType === "codex"
       ? "cli"
-      : agentType === "claude-code-sdk" || agentType === "codex-sdk" || agentType === "qoder-sdk" || agentType === "opencode-sdk" || agentType === "grok-sdk" || agentType === "kimi-sdk" || agentType === HERMES_AGENT_PROVIDER_ID || agentType === "deepseek-harness" || agentType === "pi" || isCodeBuddyProviderId(agentType)
+      : agentType === "claude-code-sdk" || agentType === "codex-sdk" || agentType === "qoder-sdk" || agentType === "opencode-sdk" || agentType === "grok-sdk" || agentType === "kimi-sdk" || agentType === HERMES_AGENT_PROVIDER_ID || agentType === AGY_SDK_PROVIDER_ID || agentType === "deepseek-harness" || agentType === "pi" || isCodeBuddyProviderId(agentType)
         ? "sdk"
         : null;
   const qwenCompatibleApiPresetSelected = agentType === "qwen" && !!selectedCcPreset;
@@ -588,6 +590,7 @@ export function NewSessionDialog({
     || agentType === "grok-sdk"
     || agentType === "kimi-sdk"
     || agentType === HERMES_AGENT_PROVIDER_ID
+    || agentType === AGY_SDK_PROVIDER_ID
     || agentType === "deepseek-harness"
     || agentType === "pi"
     || isCodeBuddyProviderId(agentType)
@@ -980,6 +983,11 @@ export function NewSessionDialog({
             {agentType === HERMES_AGENT_PROVIDER_ID && transportModels.error && (
               <div role="alert" style={{ marginTop: 6, color: "#fca5a5", fontSize: 12 }}>
                 {t("new_session.hermes_prerequisite_error", { error: transportModels.error })}
+              </div>
+            )}
+            {agentType === AGY_SDK_PROVIDER_ID && transportModels.error && (
+              <div role="alert" style={{ marginTop: 6, color: "#fca5a5", fontSize: 12 }}>
+                {t("new_session.agy_prerequisite_error", { error: transportModels.error })}
               </div>
             )}
           </div>

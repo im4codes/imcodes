@@ -6,6 +6,7 @@ import { wireProviderToRelay, broadcastProviderStatus } from '../daemon/transpor
 import logger from '../util/logger.js';
 import { CODEBUDDY_PROVIDER_IDS } from '../../shared/codebuddy.js';
 import { HERMES_AGENT_PROVIDER_ID } from '../../shared/hermes-agent.js';
+import { AGY_SDK_PROVIDER_ID } from '../../shared/agy-agent.js';
 import { clearTransportRestoreBackoffForProvider } from './transport-restore-backoff.js';
 
 const providers = new Map<string, TransportProvider>();
@@ -108,6 +109,10 @@ async function createProvider(id: string): Promise<TransportProvider> {
     case 'grok-sdk': {
       const { GrokSdkProvider } = await import('./providers/grok-sdk.js');
       return new GrokSdkProvider();
+    }
+    case AGY_SDK_PROVIDER_ID: {
+      const { AgySdkProvider } = await import('./providers/agy-sdk.js');
+      return new AgySdkProvider();
     }
     case 'claude-code-sdk': {
       const { ClaudeCodeSdkProvider } = await import('./providers/claude-code-sdk.js');

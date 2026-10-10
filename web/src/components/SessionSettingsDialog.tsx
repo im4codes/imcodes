@@ -13,6 +13,7 @@ import { DAEMON_MSG } from '@shared/daemon-events.js';
 import { SESSION_AGENT_TYPES, TRANSPORT_SESSION_AGENT_TYPES, getSessionRuntimeType, type SessionAgentType } from '@shared/agent-types.js';
 import { CODEBUDDY_PROVIDER_IDS } from '@shared/codebuddy.js';
 import { HERMES_AGENT_PROVIDER_ID } from '@shared/hermes-agent.js';
+import { AGY_SDK_PROVIDER_ID } from '@shared/agy-agent.js';
 import { isDelegationReplyCapableAgentType } from '@shared/agent-delegation.js';
 import type { SharedContextRuntimeBackend } from '@shared/context-types.js';
 import {
@@ -1345,6 +1346,7 @@ export function SessionSettingsDialog({
       case 'grok-sdk': return t('session.agentType.grok_sdk');
       case 'kimi-sdk': return t('session.agentType.kimi_sdk');
       case HERMES_AGENT_PROVIDER_ID: return t('session.agentType.hermes_agent');
+      case AGY_SDK_PROVIDER_ID: return t('session.agentType.agy_sdk');
       case 'deepseek-harness': return t('session.agentType.deepseek_harness');
       case 'pi': return t('session.agentType.pi');
       case CODEBUDDY_PROVIDER_IDS.CHINA: return t('session.agentType.codebuddy_china');

@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { getSessionRuntimeType, isTransportSessionAgentType } from '../shared/agent-types.js';
 import { CODEBUDDY_PROVIDER_IDS } from '../shared/codebuddy.js';
+import { AGY_SDK_PROVIDER_ID } from '../shared/agy-agent.js';
 import { HERMES_AGENT_PROVIDER_ID } from '../shared/hermes-agent.js';
 
 describe('shared agent type helpers', () => {
@@ -11,6 +12,7 @@ describe('shared agent type helpers', () => {
     expect(isTransportSessionAgentType('kimi-sdk')).toBe(true);
     expect(isTransportSessionAgentType(HERMES_AGENT_PROVIDER_ID)).toBe(true);
     expect(isTransportSessionAgentType('grok-sdk')).toBe(true);
+    expect(isTransportSessionAgentType(AGY_SDK_PROVIDER_ID)).toBe(true);
     expect(isTransportSessionAgentType('deepseek-harness')).toBe(true);
     expect(isTransportSessionAgentType('pi')).toBe(true);
     expect(isTransportSessionAgentType(CODEBUDDY_PROVIDER_IDS.CHINA)).toBe(true);
@@ -28,6 +30,7 @@ describe('shared agent type helpers', () => {
     expect(getSessionRuntimeType('kimi-sdk')).toBe('transport');
     expect(getSessionRuntimeType(HERMES_AGENT_PROVIDER_ID)).toBe('transport');
     expect(getSessionRuntimeType('grok-sdk')).toBe('transport');
+    expect(getSessionRuntimeType(AGY_SDK_PROVIDER_ID)).toBe('transport');
     expect(getSessionRuntimeType('opencode-sdk')).toBe('transport');
     expect(getSessionRuntimeType('pi')).toBe('transport');
     expect(getSessionRuntimeType(CODEBUDDY_PROVIDER_IDS.CHINA)).toBe('transport');

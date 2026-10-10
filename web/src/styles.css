@@ -7098,6 +7098,7 @@ html.native-ios-mac .chat-dl-btn {
 .session-usage-codex-quota { display: flex; flex-direction: row; align-items: baseline; justify-content: flex-end; flex-wrap: wrap; gap: 1px 5px; margin-bottom: 2px; min-width: 0; max-width: 100%; }
 .session-usage-codex-line { color: #64748b; font-size: 9px; line-height: 1.2; text-align: right; }
 .session-usage-codex-line-compact { min-width: 0; max-width: 100%; white-space: normal; overflow-wrap: normal; word-break: normal; }
+.session-usage-codex-line-grouped { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .session-usage-weekly-authorize { background: none; border: none; padding: 0; margin: 0; font: inherit; font-size: 9px; line-height: 1.2; text-align: right; color: var(--chrome-accent, #22d3ee); cursor: pointer; text-decoration: underline; text-underline-offset: 2px; }
 .session-usage-weekly-authorize:hover { color: #67e8f9; }
 .codex-credits { position: relative; display: inline-flex; flex: 0 0 auto; }

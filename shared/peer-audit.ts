@@ -1,5 +1,6 @@
 import { redactSensitiveText } from './redact-secrets.js';
 import { CODEBUDDY_PROVIDER_IDS } from './codebuddy.js';
+import { AGY_SDK_PROVIDER_ID } from './agy-agent.js';
 import { HERMES_AGENT_PROVIDER_ID } from './hermes-agent.js';
 
 // Single shared source of truth for the lightweight peer-supervision-audit
@@ -303,6 +304,7 @@ const PEER_AUDIT_PROVIDER_FAMILY_BY_ID: Readonly<Record<string, string>> = {
   gemini: 'google',
   xai: 'xai',
   'grok-sdk': 'xai',
+  [AGY_SDK_PROVIDER_ID]: 'google',
   alibaba: 'alibaba',
   qwen: 'alibaba',
   moonshot: 'moonshot',

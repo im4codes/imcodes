@@ -10,7 +10,7 @@ import { bestModelLabel } from '../model-label.js';
 import { getSessionCost, getWeeklyCost, getMonthlyCost, formatCost } from '../cost-tracker.js';
 import { deriveSessionLiveStatus } from '../session-live-status.js';
 import type { UsageData } from '../usage-data.js';
-import type { ProviderQuotaMeta } from '@shared/provider-quota.js';
+import { formatProviderQuotaTitle, type ProviderQuotaMeta } from '@shared/provider-quota.js';
 import { isAuthoritativeUsageContextWindowSource } from '@shared/usage-context-window.js';
 import { CAPACITY_RETRY_ACTIVITY_DETAIL_PREFIX } from '@shared/capacity-retry.js';
 import { usePref, parseBooleanish } from '../hooks/usePref.js';
@@ -262,6 +262,10 @@ function UsageFooterImpl({ usage, sessionName, sessionState, agentType, modelOve
   const providerQuotaText = isCompactProviderQuotaAgent(agentType)
     ? (displayQuotaLabel ?? '').trim()
     : '';
+  const isGroupedQuota = Boolean(quotaMeta?.groups && quotaMeta.groups.length > 0);
+  const providerQuotaTitle = isGroupedQuota
+    ? formatProviderQuotaTitle(quotaMeta, now)
+    : undefined;
   // Reset credits are a codex-account feature (accrued via ChatGPT auth).
   const isCodexSession = agentType === 'codex' || agentType === 'codex-sdk';
   const executionCloneFeedbackText = useMemo(() => {
@@ -336,7 +340,7 @@ function UsageFooterImpl({ usage, sessionName, sessionState, agentType, modelOve
           {(providerQuotaText || showWeeklyAuthPrompt) && (
             <div class="session-usage-codex-quota">
               {providerQuotaText && (
-                <ProviderQuotaLine text={providerQuotaText} />
+                <ProviderQuotaLine text={providerQuotaText} className={isGroupedQuota ? 'session-usage-codex-line-grouped' : ''} title={providerQuotaTitle} />
               )}
               {showWeeklyAuthPrompt && (
                 <button

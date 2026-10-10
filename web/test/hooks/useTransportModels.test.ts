@@ -4,6 +4,7 @@
 import { describe, it, expect } from 'vitest';
 import { supportsDynamicTransportModels } from '../../src/hooks/useTransportModels.js';
 import { CODEBUDDY_PROVIDER_IDS } from '@shared/codebuddy.js';
+import { AGY_SDK_PROVIDER_ID } from '@shared/agy-agent.js';
 import { HERMES_AGENT_PROVIDER_ID } from '@shared/hermes-agent.js';
 
 /**
@@ -22,6 +23,7 @@ describe('supportsDynamicTransportModels', () => {
       'opencode-sdk',
       'gemini-sdk',
       'grok-sdk',
+      AGY_SDK_PROVIDER_ID,
       'kimi-sdk',
       HERMES_AGENT_PROVIDER_ID,
       'deepseek-harness',
