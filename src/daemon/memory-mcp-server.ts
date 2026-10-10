@@ -370,6 +370,14 @@ export function participantTurnFromAuthorityHook(
   };
 }
 
+/** Node access alone requires an explicit, coherent hook answer; an unknown reply must never borrow the daemon owner. */
+export function sharedMachineAuthorityFromHookResponse(answer: Record<string, unknown>): string | null {
+  if (answer.ok !== true || typeof answer.required !== 'boolean') throw new Error('shared_machine_authority_invalid_response');
+  if (answer.required === false && answer.authority == null) return null;
+  if (answer.required === true && typeof answer.authority === 'string' && answer.authority) return answer.authority;
+  throw new Error('shared_machine_authority_invalid_response');
+}
+
 /**
  * Refuse only exec_remote while the current turn belongs to a shared-session participant (shared/participant-turn-tool-policy.ts).
  * Wraps registration like the resource guard, so EVERY tool of this server passes through it -- a tool registered by any module is
@@ -840,12 +848,7 @@ export function mergeDefaultToolDeps(
       resourceOwner,
       loadSharedMachineAuthority: resourceOwner && caller.sessionName
         ? async () => {
-            const response = await postSharedMachineAuthorityHook!();
-            if (response.authority == null) return null;
-            if (typeof response.authority !== 'string' || !response.authority) {
-              throw new Error('shared_machine_authority_invalid_response');
-            }
-            return response.authority;
+            return sharedMachineAuthorityFromHookResponse(await postSharedMachineAuthorityHook!());
           }
         : async () => null,
     }),

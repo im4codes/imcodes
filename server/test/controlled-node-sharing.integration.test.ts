@@ -27,6 +27,7 @@ import {
   FILE_TRANSFER_MSG,
   FILE_TRANSFER_PATH_HANDLE_CAPABILITY,
   FILE_TRANSFER_DOWNLOAD_STREAM_CAPABILITY,
+  FILE_TRANSFER_RESUMABLE_UPLOAD_FIELD,
   FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY,
 } from '../../shared/transport/file-transfer.js';
 import {
@@ -946,7 +947,7 @@ describe('a shared-session participant reaches only the machines shared with the
     const desk = await createDesk(ownerId);
     await joinDesk(desk, participantId);
     expect((await bindDesk(app, ownerId, grouped, desk)).status).toBe(200);
-    return { app, ownerId, participantId, source, delegated, ownerTurn, unshared, participantShared, viewerShared, grouped, sessionShare };
+    return { app, ownerId, participantId, source, delegated, ownerTurn, unshared, participantShared, viewerShared, grouped, sessionShare, sessionName };
   }
 
   const listed = async (app: ReturnType<typeof buildApp>, headers: Record<string, string>) => {
@@ -1185,6 +1186,72 @@ describe('a shared-session participant reaches only the machines shared with the
       expect((await pending).status).toBe(403);
       expect(n.socket.sent.filter((raw) => JSON.parse(raw).type === FILE_TRANSFER_MSG.PATH_HANDLE)).toHaveLength(0);
     } finally { complete(); n.socket.close(); }
+  });
+
+  it('refuses a partial resumable stage when its actor grant is revoked while the body is arriving', async () => {
+    const t = await scene(); const n = await fileNode(t);
+    const form = new FormData();
+    form.append(FILE_TRANSFER_RESUMABLE_UPLOAD_FIELD.FILE, new File(['abc'], 'scoped.txt', { type: 'text/plain' }));
+    form.append(FILE_TRANSFER_RESUMABLE_UPLOAD_FIELD.CLIENT_UPLOAD_ID, hex(32));
+    form.append(FILE_TRANSFER_RESUMABLE_UPLOAD_FIELD.OFFSET, '0');
+    form.append(FILE_TRANSFER_RESUMABLE_UPLOAD_FIELD.TOTAL_SIZE, '9');
+    form.append(FILE_TRANSFER_RESUMABLE_UPLOAD_FIELD.ORIGINAL_NAME, 'scoped.txt');
+    form.append(FILE_TRANSFER_RESUMABLE_UPLOAD_FIELD.LAST_MODIFIED, '1');
+    const encoded = new Request('http://fixture', { method: 'POST', body: form });
+    const bytes = new Uint8Array(await encoded.arrayBuffer());
+    let release!: () => void;
+    const ready = new Promise<void>((resolve) => { release = resolve; });
+    const body = new ReadableStream<Uint8Array>({ async pull(controller) { await ready; controller.enqueue(bytes); controller.close(); } });
+    try {
+      const pending = t.app.request(`/api/server/${t.participantShared}/upload`, {
+        method: 'POST', headers: { ...t.delegated, 'content-type': encoded.headers.get('content-type')! }, body, duplex: 'half',
+      } as RequestInit);
+      const deadline = Date.now() + 2_000;
+      while (!await db.queryOne('SELECT correlation_id FROM machine_exec_audit WHERE target_server_id = $1 AND outcome = $2', [t.participantShared, 'authorized'])) {
+        if (Date.now() > deadline) throw new Error('admission_audit_timeout');
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      await db.execute('UPDATE server_shares SET exec_granted = false WHERE server_id = $1 AND target_user_id = $2', [t.participantShared, t.participantId]);
+      release();
+      expect((await pending).status).toBe(403);
+      expect(n.socket.sent.filter((raw) => JSON.parse(raw).type === FILE_TRANSFER_MSG.UPLOAD_FETCH)).toHaveLength(0);
+    } finally { release(); n.socket.close(); }
+  });
+
+  it('isolates resumable stages by the real actor even when the source owner, node and clientUploadId match', async () => {
+    const t = await scene();
+    const n = await fileNode(t);
+    const otherId = `resume-${hex(4)}`;
+    await createUser(db, otherId);
+    await createMachineGrant({ ownerId: t.ownerId, recipientId: otherId, serverId: t.participantShared, role: 'participant' });
+    const shareTarget = { kind: 'main' as const, serverId: t.source.serverId, sessionName: t.sessionName };
+    await createOrUpdateShare(db, { id: `share_${hex(8)}`, target: shareTarget, targetUserId: otherId, role: 'participant', createdBy: t.ownerId, expiresAt: null, now: Date.now() });
+    const otherAuthority = await issueSharedMachineAuthorityForSession(db, { actorUserId: otherId, sourceServerId: t.source.serverId,
+      sessionName: t.sessionName, shareTarget, actionId: `action-${hex(4)}`, signingKey: JWT_KEY });
+    const second = { ...t.delegated, [SHARED_MACHINE_AUTHORITY_HEADER]: otherAuthority! };
+    const clientUploadId = hex(32);
+    const chunk = async (headers: Record<string, string>, offset: number) => {
+      const form = new FormData();
+      form.append(FILE_TRANSFER_RESUMABLE_UPLOAD_FIELD.FILE, new File(['abc'], 'scoped.txt', { type: 'text/plain' }));
+      form.append(FILE_TRANSFER_RESUMABLE_UPLOAD_FIELD.CLIENT_UPLOAD_ID, clientUploadId);
+      form.append(FILE_TRANSFER_RESUMABLE_UPLOAD_FIELD.OFFSET, String(offset));
+      form.append(FILE_TRANSFER_RESUMABLE_UPLOAD_FIELD.TOTAL_SIZE, '9');
+      form.append(FILE_TRANSFER_RESUMABLE_UPLOAD_FIELD.ORIGINAL_NAME, 'scoped.txt');
+      form.append(FILE_TRANSFER_RESUMABLE_UPLOAD_FIELD.LAST_MODIFIED, '1');
+      const { 'content-type': _ignored, ...auth } = headers;
+      return t.app.request(`/api/server/${t.participantShared}/upload`, { method: 'POST', headers: auth, body: form });
+    };
+    try {
+      expect(await (await chunk(t.delegated, 0)).json()).toMatchObject({ complete: false, committedBytes: 3 });
+      const foreign = await chunk(second, 3);
+      expect(foreign.status).toBe(409);
+      expect(await foreign.json()).toMatchObject({ committedBytes: 0 });
+      expect((await chunk(t.ownerTurn, 3)).status).toBe(409);
+      expect(await (await chunk(t.delegated, 3)).json()).toMatchObject({ complete: false, committedBytes: 6 });
+      expect(n.socket.sent.filter((raw) => JSON.parse(raw).type === FILE_TRANSFER_MSG.UPLOAD_FETCH)).toHaveLength(0);
+      await db.execute('UPDATE server_shares SET exec_granted = false WHERE server_id = $1 AND target_user_id = $2', [t.participantShared, t.participantId]);
+      expect((await chunk(t.delegated, 6)).status).toBe(403);
+    } finally { n.socket.close(); }
   });
 
   it('rejects a device result after the signed session authority is revoked in flight', async () => {

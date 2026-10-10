@@ -17,6 +17,7 @@ import {
   resolveControlledMachineManagementAccess,
   resolveRemoteDesktopHostAccess,
 } from '../src/share/machine-access.js';
+import { createOrUpdateShare } from '../src/db/tab-sharing.js';
 import { NODE_ROLE } from '../../shared/remote-exec.js';
 import { ensureCanonicalHostForServer } from '../src/services/remote-desktop-host-identity.js';
 import { getRemoteDesktopWall } from '../src/services/remote-desktop-wall.js';
@@ -81,6 +82,11 @@ beforeEach(async () => {
   serverId = await installMachine(owner);
 });
 
+async function directShare(target: string, recipient: string): Promise<void> {
+  await createOrUpdateShare(db, { id: `direct-${Math.random().toString(16).slice(2)}`, target: { kind: 'server', serverId: target },
+    targetUserId: recipient, role: 'participant', createdBy: owner, expiresAt: null, now: Date.now() });
+}
+
 describe('a freshly installed machine', () => {
   it('belongs to whoever installed it, and to nobody else', async () => {
     // No team is not a missing authorization domain. It is the narrowest one,
@@ -137,7 +143,7 @@ describe('associating a machine with a team', () => {
     expect(await roleFor(stranger)).toBeUndefined();
   });
 
-  it('lists every grouped machine once for a member and none for a non-member', async () => {
+  it('lists direct-shared grouped machines once, never group-only machines', async () => {
     const teamId = await makeTeam(owner);
     await db.execute(
       "INSERT INTO team_members (team_id, user_id, role, joined_at) VALUES ($1, $2, 'member', $3)",
@@ -147,6 +153,9 @@ describe('associating a machine with a team', () => {
     await addToGroup(serverId, teamId);
     await addToGroup(second, teamId);
 
+    expect(await listAccessibleControlledMachines(db, colleague, Date.now(), 50)).toEqual([]);
+    expect(await resolveRemoteDesktopHostAccess(db, colleague, serverId, Date.now())).toBeNull();
+    await directShare(serverId, colleague); await directShare(second, colleague);
     const memberRows = await listAccessibleControlledMachines(db, colleague, Date.now(), 50);
     expect(memberRows.map((row) => row.id).sort()).toEqual([serverId, second].sort());
     expect(memberRows.every((row) => row.access_role === 'participant')).toBe(true);
@@ -156,7 +165,7 @@ describe('associating a machine with a team', () => {
     expect(await resolveRemoteDesktopHostAccess(db, stranger, serverId, Date.now())).toBeNull();
   });
 
-  it('uses the same group grant for the Desktop Wall and excludes non-members', async () => {
+  it('requires a direct share for controlled Desktop Wall hosts regardless of group membership', async () => {
     const teamId = await makeTeam(owner);
     await db.execute(
       "INSERT INTO team_members (team_id, user_id, role, joined_at) VALUES ($1, $2, 'member', $3)",
@@ -170,6 +179,9 @@ describe('associating a machine with a team', () => {
       [colleague, JSON.stringify([host.hostId]), Date.now()],
     );
 
+    expect((await getRemoteDesktopWall(db, colleague, Date.now())).hostIds).toEqual([]);
+    await directShare(serverId, colleague);
+    await db.execute('UPDATE remote_desktop_walls SET host_ids = $2::jsonb WHERE user_id = $1', [colleague, JSON.stringify([host.hostId])]);
     const memberWall = await getRemoteDesktopWall(db, colleague, Date.now());
     expect(memberWall.hostIds).toEqual([host.hostId]);
     expect(memberWall.hosts[0]?.accessRole).toBe('participant');
@@ -433,6 +445,8 @@ describe('a machine in several groups', () => {
       await addToGroup(serverId, team);
     }
 
+    expect(await listAccessibleControlledMachines(db, admin, Date.now(), 50)).toEqual([]);
+    await directShare(serverId, admin);
     const rows = await listAccessibleControlledMachines(db, admin, Date.now(), 50);
     expect(rows.filter((row) => row.id === serverId)).toHaveLength(1);
     // And it reports both groups it is in.

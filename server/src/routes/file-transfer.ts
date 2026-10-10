@@ -351,6 +351,7 @@ async function acceptResumableBrowserChunk(params: {
   originalName: string;
   lastModified: number;
   destinationDirectory?: string;
+  revalidate?: () => Promise<boolean>;
 }): Promise<{
   complete: boolean;
   committedBytes: number;
@@ -362,6 +363,7 @@ async function acceptResumableBrowserChunk(params: {
   const paths = resumableUploadPaths(params.serverId, params.userId, params.clientUploadId);
   await sweepExpiredResumableUploads();
   return withResumableUploadLock(paths.key, async () => {
+    if (params.revalidate && !await params.revalidate()) throw new Error('target_forbidden');
     await mkdir(paths.dir, { recursive: true, mode: 0o700 });
     let meta: ResumableBrowserUploadMeta | null = null;
     try {
@@ -412,6 +414,7 @@ async function acceptResumableBrowserChunk(params: {
       throw Object.assign(new Error('upload_offset_mismatch'), { committedBytes });
     }
     const chunkBytes = Buffer.from(await params.chunk.arrayBuffer());
+    if (params.revalidate && !await params.revalidate()) throw new Error('target_forbidden');
     const chunkHash = createHash('sha256').update(chunkBytes).digest('hex');
     if (params.offset < committedBytes) {
       if (params.offset + chunkBytes.length > committedBytes) {
@@ -791,21 +794,22 @@ async function authorizeControlledFileTarget(
   };
 }
 
+async function hasCurrentControlledFileAccess(c: Context, gate: Extract<ControlledTargetGate, { ok: true }>): Promise<boolean> {
+  if (!gate.controlled) return true;
+  if (!gate.admission) return false;
+  return (await admitMachineAction(c.env.DB, { ...gate.admission, signingKey: c.env.JWT_SIGNING_KEY, now: Date.now() })).ok;
+}
+
 /** Recheck live resource/provenance after body staging, immediately before dispatch, and before consuming a device result. */
 async function sendControlledFileRequest(
   c: Context, gate: Extract<ControlledTargetGate, { ok: true }>,
   ...args: Parameters<ReturnType<typeof WsBridge.get>['sendFileTransferRequest']>
 ): Promise<Record<string, unknown>> {
-  const current = async () => {
-    if (!gate.controlled) return true;
-    if (!gate.admission) return false;
-    return (await admitMachineAction(c.env.DB, { ...gate.admission, signingKey: c.env.JWT_SIGNING_KEY, now: Date.now() })).ok;
-  };
-  if (!await current()) throw new Error('target_forbidden');
+  if (!await hasCurrentControlledFileAccess(c, gate)) throw new Error('target_forbidden');
   const result = await (gate.controlled
     ? gate.bridge.sendFileTransferRequest(args[0], args[1], args[2], args[3], gate.daemonGeneration ?? args[4])
     : gate.bridge.sendFileTransferRequest(...args));
-  if (!await current()) throw new Error('target_forbidden');
+  if (!await hasCurrentControlledFileAccess(c, gate)) throw new Error('target_forbidden');
   return result;
 }
 
@@ -1393,12 +1397,14 @@ fileTransferRoutes.post('/:id/upload', async (c) => {
   let stagedDir: string;
   let stagedPath: string;
   let stagedSize: number;
+  if (!await hasCurrentControlledFileAccess(c, controlledGate)) return c.json({ error: 'target_forbidden' }, 403);
   if (resumableRequested) {
     let accepted;
     try {
       accepted = await acceptResumableBrowserChunk({
         serverId,
-        userId,
+        userId: controlledHandleActor(c, controlledGate),
+        revalidate: () => hasCurrentControlledFileAccess(c, controlledGate),
         clientUploadId: clientUploadId!,
         chunk: file,
         offset: uploadOffset,
@@ -1416,6 +1422,7 @@ fileTransferRoutes.post('/:id/upload', async (c) => {
         ...(typeof committedBytes === 'number' ? { committedBytes } : {}),
       }, message === 'upload_offset_mismatch' ? 409 : 400);
     }
+    if (!await hasCurrentControlledFileAccess(c, controlledGate)) return c.json({ error: 'target_forbidden' }, 403);
     if (!accepted.complete) {
       return c.json({ ok: true, complete: false, committedBytes: accepted.committedBytes });
     }
