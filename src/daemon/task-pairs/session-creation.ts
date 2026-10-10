@@ -1,3 +1,4 @@
+import { taskPairSessionLabel } from '../../../shared/task-pair-display.js';
 /**
  * Sub-sessions that pair_create creates for a pair.
  *
@@ -99,11 +100,6 @@ const REASON_TEXT: Record<PairSubSessionFailureReason, string> = {
   session_not_live: 'the new session did not stay alive',
 };
 
-function shortTitle(title: string | undefined): string {
-  const trimmed = title?.trim();
-  return trimmed ? `: ${trimmed.length > 40 ? `${trimmed.slice(0, 37)}...` : trimmed}` : '';
-}
-
 /**
  * How many sessions the default rule creates: the unsettled roles minus the idle default sessions that can serve them (never negative),
  * limited by the cap room left. Pure arithmetic over counts, so the rule is one testable line.
@@ -168,7 +164,7 @@ export async function ensurePairSessions(input: EnsurePairSessionsInput, injecte
     const result = await (deps.createSession ?? ((request) => createPairSubSession(request, deps.maxPerProject === undefined ? {} : { maxPerProject: deps.maxPerProject })))({
       parentSessionName: input.brain,
       config: resolved.config,
-      label: `Pair ${input.taskId} ${entry.role}${shortTitle(input.title)}`,
+      label: taskPairSessionLabel(entry.role),
       idempotencyKey: `${input.taskId}:${entry.role}`,
       metadata: { createdBy: input.brain, pairTaskId: input.taskId, role: entry.role, reason: entry.reason },
     });

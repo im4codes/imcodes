@@ -257,8 +257,9 @@ describe('creation: one deterministic rule', () => {
     expect(result.created.map((entry) => entry.role).sort()).toEqual(['auditor', 'executor']);
     expect(result.executor).not.toBe(result.auditor);
     expect(w.calls.map((call) => call.model)).toEqual(['sonnet'.length ? expect.stringMatching(/sonnet/) : '', expect.stringMatching(/sonnet/)].map(String).length ? [expect.stringMatching(/sonnet/), expect.stringMatching(/sonnet/)] : []);
-    expect(w.calls[0]!.label).toContain('tsk_new');
-    expect(w.calls[0]!.label).toContain('Fix the login retry');
+    expect(w.calls.map((call) => call.label)).toEqual(['Pair executor', 'Pair auditor']);
+    expect(w.calls[0]!.label).not.toContain('tsk_new');
+    expect(w.calls[0]!.label).not.toContain('Fix the login retry');
     expect(w.calls[0]!.metadata).toMatchObject({ createdBy: BRAIN, pairTaskId: 'tsk_new', role: 'executor', reason: TASK_PAIR_CREATED_SESSION_REASONS.DEFAULT });
   });
 

@@ -1,3 +1,4 @@
+import { TASK_PAIR_SESSION_ID_PREFIX } from '../../shared/task-pair.js';
 import { createHash } from 'node:crypto';
 import { identityContentHash } from '../util/identity-prompt-hash.js';
 import {
@@ -607,7 +608,6 @@ export function autoCreatedSlotsInFlightForTests(): number { return creationsInF
 
 // ---- sessions created by pair_create ------------------------------------------------------------------------------------------------
 
-const PAIR_SESSION_ID_PREFIX = 'pair_auto_';
 
 export type PairSubSessionFailureReason =
   | 'parent_unavailable' | 'cap_reached' | 'provider_limited' | 'provider_offline' | 'launch_failed' | 'readiness_timeout' | 'identity_collision'
@@ -662,7 +662,7 @@ function pairSessionIdentity(request: PairSubSessionRequest): { subId: string; s
     idempotencyKey: request.idempotencyKey,
     role: request.metadata.role ?? null,
   })).digest('hex');
-  const subId = `${PAIR_SESSION_ID_PREFIX}${digest.slice(0, 16)}`;
+  const subId = `${TASK_PAIR_SESSION_ID_PREFIX}${digest.slice(0, 16)}`;
   return { subId, sessionName: `deck_sub_${subId}` };
 }
 

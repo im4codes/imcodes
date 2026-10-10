@@ -15012,6 +15012,9 @@ button.quick-agent-delegation-preset.active {
 .task-pair-role-chip { display: inline-flex; align-items: center; gap: 4px; padding: 1px 7px; border-radius: 999px; border: 1px solid color-mix(in srgb, currentColor 20%, transparent); background: color-mix(in srgb, var(--chrome-accent, #22d3ee) 6%, transparent); font-size: 10px; }
 .task-pair-role-chip--muted { opacity: .6; font-style: italic; border-style: dashed; }
 .task-pair-status-session { margin: 0; padding: 0; border: 0; background: transparent; color: inherit; text-decoration: underline; cursor: pointer; font: inherit; font-size: 10px; }
+.task-pair-status-session-main { display: flex; flex-direction: column; align-items: flex-start; gap: 2px; text-align: left; }
+.task-pair-status-session-label, .task-pair-status-session-id { overflow-wrap: anywhere; }
+.task-pair-status-session-id { opacity: .75; font-size: 9px; }
 .task-pair-status-dot { display: inline-block; width: 5px; height: 5px; margin: 0 1px 1px 0; border-radius: 50%; background: var(--supervision-idle-text, #94a3b8); }
 .task-pair-status-dot.is-running { background: var(--status-active-text, #4ade80); box-shadow: 0 0 5px var(--status-active-text, #4ade80); animation: task-pair-status-pulse 1.4s ease-in-out infinite; }
 @keyframes task-pair-status-pulse { 50% { opacity: .45; } }

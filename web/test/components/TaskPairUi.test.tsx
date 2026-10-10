@@ -83,8 +83,9 @@ describe('TaskPairEventChip', () => {
     const preview = document.body.querySelector('.task-pair-card-hover-preview')!;
     expect(preview.textContent).toContain('Inspect handoff context');
     expect(preview.textContent).toContain('taskPair.status.passed');
-    expect(preview.textContent).toContain('provider/model-x');
-    expect(preview.textContent).toContain('taskPair.card_thinking:{"value":"high"}');
+    expect(preview.textContent).not.toContain('provider/model-x');
+    expect(preview.textContent).toContain('exec-session');
+    expect(preview.textContent).not.toContain('taskPair.card_thinking');
     expect(preview.textContent).toContain('Readable human summary');
     expect(preview.textContent).not.toContain('"taskId"');
     fireEvent.pointerLeave(card, { pointerType: 'mouse' });
@@ -141,7 +142,7 @@ describe('TaskPairEventChip', () => {
     fireEvent.click(toggle);
     expect(toggle.getAttribute('aria-expanded')).toBe('true');
     expect(toggle.getAttribute('aria-label')).toBe('taskPair.card_collapse');
-    expect(chip.querySelector('.task-pair-card-payload pre')?.textContent).toContain('"taskId": "T42"');
+    expect(chip.querySelector('.task-pair-card-payload pre')?.textContent).not.toContain('"taskId"');
     expect((chip.querySelector('.task-pair-card-payload') as HTMLDetailsElement).open).toBe(false);
     expect(chip.getAttribute('data-task-id')).toBe('T42');
     expect(chip.textContent).toContain('Fix login');
@@ -185,7 +186,7 @@ describe('TaskPairEventChip', () => {
     window.removeEventListener('deck:navigate', listener);
   });
 
-  it('shows executor and auditor models in the expanded card, with session fallback', () => {
+  it('shows only session identities instead of models in the expanded card', () => {
     const { container } = render(<TaskPairEventChip eventId="e-models" sessions={[
       { name: 'deck_sub_exec', activeModel: 'provider/active-executor', effort: 'high' },
       { name: 'deck_sub_aud', requestedModel: 'provider/requested-auditor', effort: 'medium' },
@@ -196,23 +197,23 @@ describe('TaskPairEventChip', () => {
     const card = container.querySelector('.task-pair-event-card')!;
     expect(card.textContent).not.toContain('provider/active-executor');
     fireEvent.click(card.querySelector('.task-pair-card-toggle')!);
-    expect(card.textContent).toContain('taskPair.card_model:{"value":"provider/active-executor"}');
-    expect(card.textContent).toContain('taskPair.card_model:{"value":"provider/requested-auditor"}');
-    expect(card.textContent).toContain('taskPair.card_thinking:{"value":"high"}');
-    expect(card.textContent).toContain('taskPair.card_thinking:{"value":"medium"}');
+    expect(card.textContent).not.toContain('taskPair.card_model:{"value":"provider/active-executor"}');
+    expect(card.textContent).not.toContain('taskPair.card_model:{"value":"provider/requested-auditor"}');
+    expect(card.textContent).not.toContain('taskPair.card_thinking:{"value":"high"}');
+    expect(card.textContent).not.toContain('taskPair.card_thinking:{"value":"medium"}');
   });
 
-  it('prefers payload models and explicitly marks missing models', () => {
+  it('never displays payload models or thinking for roles', () => {
     const { container } = render(<TaskPairEventChip eventId="e-model-payload" payload={{
       taskId: 'model-payload', title: 'Payload model', writer: 'daemon', verb: 'PASS', toStatus: 'passed',
       executor: 'deck_exec', executorLabel: 'Executor', executorModel: 'provider/pinned', executorThinking: 'low', auditor: 'deck_aud', auditorLabel: 'Auditor', unusual: false,
     }} />);
     const card = container.querySelector('.task-pair-event-card')!;
     fireEvent.click(card.querySelector('.task-pair-card-toggle')!);
-    expect(card.textContent).toContain('provider/pinned');
-    expect(card.textContent).toContain('taskPair.card_model:{"value":"taskPair.card_model_unknown"}');
-    expect(card.textContent).toContain('taskPair.card_thinking:{"value":"low"}');
-    expect(card.textContent).toContain('taskPair.card_thinking:{"value":"taskPair.card_thinking_unknown"}');
+    expect(card.textContent).not.toContain('provider/pinned');
+    expect(card.textContent).not.toContain('taskPair.card_model:{"value":"taskPair.card_model_unknown"}');
+    expect(card.textContent).not.toContain('taskPair.card_thinking:{"value":"low"}');
+    expect(card.textContent).not.toContain('taskPair.card_thinking:{"value":"taskPair.card_thinking_unknown"}');
     expect(card.textContent).not.toContain('provider/active');
   });
 
@@ -829,7 +830,7 @@ describe('TaskPairStatusPanel', () => {
     expect(screen.queryByText(/taskPair.panel_round/)).toBeNull();
   });
 
-  it('shows requested models for queued unassigned roles and no audit for auditor=none', () => {
+  it('shows unassigned roles without requested models and no audit for auditor=none', () => {
     render(<TaskPairStatusPanel events={[{
       eventId: 'queued-models', type: 'task_pair.event', ts: Date.now(),
       payload: {
@@ -840,8 +841,8 @@ describe('TaskPairStatusPanel', () => {
       eventId: 'queued-none', type: 'task_pair.event', ts: Date.now(),
       payload: { taskId: 'Q-none', title: 'Queued no audit', toStatus: 'queued', auditor: 'none', executorModel: 'gpt-6-luna' },
     }] as never} />);
-    expect(screen.getAllByText(/taskPair.panel_unassigned.*gpt-6-luna/).length).toBe(2);
-    expect(screen.getByText(/taskPair.panel_unassigned.*gpt-6-sol/)).toBeTruthy();
+    expect(screen.getAllByText('taskPair.panel_unassigned').length).toBe(3);
+    expect(screen.queryByText(/gpt-6-(luna|sol)/)).toBeNull();
     expect(screen.getByText('taskPair.panel_no_audit')).toBeTruthy();
   });
 
@@ -947,13 +948,13 @@ describe('TaskPairStatusPanel', () => {
         payload: { taskId: 'store-task', title: 'Store label', toStatus: 'working', executor: 'deck_sub_store' },
       }] as never} />);
       expect(screen.getByText('Store Cx')).toBeTruthy();
-      expect(screen.queryByText('deck_sub_store')).toBeNull();
+      expect(screen.getByText('deck_sub_store')).toBeTruthy();
     } finally {
       watchProjectionStore.setSnapshotStatus('switching');
     }
   });
 
-  it('shows payload model, falls back to the session model, hides ids, and navigates roles', () => {
+  it('shows live names and exact ids, hides models, and navigates roles', () => {
     const navigate = vi.fn();
     const listener = (event: Event) => navigate((event as CustomEvent).detail.session);
     window.addEventListener('deck:navigate', listener);
@@ -961,15 +962,15 @@ describe('TaskPairStatusPanel', () => {
       eventId: 'models', type: 'task_pair.event', ts: Date.now(),
       payload: { taskId: 'model-task', title: 'Models', toStatus: 'working', executor: 'deck_sub_exec', executorLabel: 'Executor', executorModel: 'gpt-6-sol', auditor: 'deck_sub_aud' },
     }] as never} />);
-    expect(screen.getByText(/Executor.*gpt-6-sol/)).toBeTruthy();
-    expect(screen.getByText(/Auditor.*gpt-6-astra/)).toBeTruthy();
-    expect(screen.queryByText(/deck_sub_(exec|aud)/)).toBeNull();
-    fireEvent.click(screen.getByRole('button', { name: /Executor.*gpt-6-sol/ }));
+    expect(screen.getByText('Cx1')).toBeTruthy();
+    expect(screen.getByText('deck_sub_exec')).toBeTruthy();
+    expect(screen.queryByText(/gpt-6-(sol|astra|luna)/)).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: /Cx1.*deck_sub_exec/ }));
     expect(navigate).toHaveBeenCalledWith('deck_sub_exec');
     window.removeEventListener('deck:navigate', listener);
   });
 
-  it('shows thinking levels for status-panel sessions and uses an explicit unknown fallback', () => {
+  it('does not show thinking levels or unknown-thinking placeholders', () => {
     render(<TaskPairStatusPanel sessions={[
       { name: 'deck_sub_exec', label: 'Executor', activeModel: 'provider/executor', effort: 'high' },
       { name: 'deck_sub_aud', label: 'Auditor', requestedModel: 'provider/auditor' },
@@ -980,14 +981,14 @@ describe('TaskPairStatusPanel', () => {
         executor: 'deck_sub_exec', auditor: 'deck_sub_aud',
       },
     }] as never} />);
-    expect(screen.getByText('taskPair.card_thinking:{"value":"high"}')).toBeTruthy();
-    expect(screen.getByText('taskPair.card_thinking:{"value":"taskPair.card_thinking_unknown"}')).toBeTruthy();
+    expect(screen.queryByText(/taskPair.card_thinking/)).toBeNull();
+    expect(screen.getByText('deck_sub_exec')).toBeTruthy();
   });
 
   it('uses localized neutral role fallbacks when labels are missing', () => {
     render(<TaskPairStatusPanel events={[{ eventId: 'fallback', type: 'task_pair.event', ts: Date.now(), payload: { taskId: 'fallback-task', title: 'Fallback', toStatus: 'working', executor: 'deck_sub_exec' } }] as never} />);
     expect(screen.getByText('taskPair.panel_executor')).toBeTruthy();
-    expect(screen.queryByText('deck_sub_exec')).toBeNull();
+    expect(screen.getByText('deck_sub_exec')).toBeTruthy();
   });
 
   const readCss = () => {
@@ -1332,7 +1333,7 @@ describe('TaskPairEventChip status colours', () => {
     expect(chip.textContent).toContain('taskPair.card_unassigned');
     expect(chip.querySelector('.task-pair-chip-status')?.className).toContain('status-unknown');
     expect(chip.getAttribute('data-task-id')).toHaveLength(160);
-    expect(chip.querySelector('.task-pair-card-payload pre')?.textContent).toContain('x'.repeat(160));
+    expect(chip.querySelector('.task-pair-card-payload pre')?.textContent).not.toContain('x'.repeat(160));
   });
 
   it('overrides the chat-system centering rule so every card body remains left aligned', () => {

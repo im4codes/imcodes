@@ -1,3 +1,5 @@
+import { TASK_PAIR_GENERIC_TITLE_PLACEHOLDERS } from './task-pair.js';
+
 /**
  * The formal identity every supervised dispatch surface shows: a readable
  * task title derived from the registry objective, plus the exact taskId and
@@ -160,4 +162,22 @@ export function formatSupervisionTaskIdentityHeader(input: {
     `taskId: ${input.taskId}`,
     `assignmentId: ${input.assignmentId}`,
   ].join('\n');
+}
+
+/**
+ * A title is deliberately authored only when it is neither a mechanical
+ * identifier/boilerplate nor the first-line projection used by send_message.
+ */
+export function isUsableTaskPairTitle(
+  value: unknown,
+  taskId: string,
+  sourceText?: string,
+  mechanical = false,
+): value is string {
+  const title = readSupervisionTaskTitle(value);
+  if (!title || (typeof value === 'string' && value.trim() === taskId.trim()) || title === taskId) return false;
+  if ((TASK_PAIR_GENERIC_TITLE_PLACEHOLDERS as readonly string[]).includes(title)) return false;
+  if (/^brain\s*:/iu.test(title)) return false;
+  if (mechanical && sourceText && title === deriveSupervisionTaskTitleFromBrief(sourceText)) return false;
+  return true;
 }

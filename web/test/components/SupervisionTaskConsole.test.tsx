@@ -384,7 +384,7 @@ describe('SupervisionTaskConsole', () => {
     expect(document.querySelector('.flag-verdict_inconsistent')?.textContent).toContain('taskPair.flag.verdict_inconsistent');
   });
 
-  it('uses the full task objective as the console title instead of the concise prompt title', () => {
+  it('uses only the concise task title rather than the full objective', () => {
     const fullObjective = 'Repair the supervision task console title. Preserve this complete objective for task details and tooltips.';
     const base = state();
     render(<SupervisionTaskConsoleView
@@ -404,12 +404,13 @@ describe('SupervisionTaskConsole', () => {
       onNavigateSession={() => {}}
     />);
 
-    const title = screen.getByText(fullObjective).closest('.supervision-task-console-task-title');
+    const title = screen.getByText('Repair the supervision task console title.…').closest('.supervision-task-console-task-title');
     expect(title).not.toBeNull();
-    expect(title?.textContent).not.toContain('Repair the supervision task console title.…');
+    expect(title?.textContent).toContain('Repair the supervision task console title.…');
+    expect(screen.queryByText(fullObjective)).toBeNull();
   });
 
-  it('renders a selected-locale registry objective verbatim and preserves legacy raw titles', () => {
+  it('renders the selected-locale concise title and preserves authored legacy titles', () => {
     const localizedObjective = '修复监督任务标题，并保留完整上下文。';
     const base = state();
     render(<SupervisionTaskConsoleView
@@ -435,7 +436,8 @@ describe('SupervisionTaskConsole', () => {
       onNavigateSession={() => {}}
     />);
 
-    expect(screen.getByText(localizedObjective)).not.toBeNull();
+    expect(screen.getByText('修复监督任务标题。')).not.toBeNull();
+    expect(screen.queryByText(localizedObjective)).toBeNull();
     expect(screen.getByText('Legacy raw task title')).not.toBeNull();
   });
 

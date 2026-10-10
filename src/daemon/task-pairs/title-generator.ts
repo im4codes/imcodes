@@ -10,8 +10,7 @@ import {
   type IsolatedClaudeQueryImplementation,
 } from '../../agent/isolated-claude-query.js';
 import { SUPERVISION_OUTPUT_LANGUAGE_LABELS, type SupervisionUiLocale } from '../../../shared/supervision-config.js';
-import { TASK_PAIR_GENERIC_TITLE_PLACEHOLDERS } from '../../../shared/task-pair.js';
-import { deriveSupervisionTaskTitleFromBrief, readSupervisionTaskTitle } from '../../../shared/supervision-task-identity.js';
+import { readSupervisionTaskTitle } from '../../../shared/supervision-task-identity.js';
 import logger from '../../util/logger.js';
 
 /** Longest title this generator will hand back; the mechanical fallback (shared/supervision-task-identity.ts) allows much longer text. */
@@ -33,23 +32,7 @@ export function taskPairTitlePlaceholder(locale: SupervisionUiLocale = 'en'): st
   return TASK_PAIR_TITLE_PLACEHOLDERS[locale] ?? TASK_PAIR_TITLE_PLACEHOLDERS.en;
 }
 
-/**
- * A title is deliberately authored only when it is neither a mechanical
- * identifier/boilerplate nor the first-line projection used by send_message.
- */
-export function isUsableTaskPairTitle(
-  value: unknown,
-  taskId: string,
-  sourceText?: string,
-  mechanical = false,
-): value is string {
-  const title = readSupervisionTaskTitle(value);
-  if (!title || title === taskId) return false;
-  if ((TASK_PAIR_GENERIC_TITLE_PLACEHOLDERS as readonly string[]).includes(title)) return false;
-  if (/^brain\s*:/iu.test(title)) return false;
-  if (mechanical && sourceText && title === deriveSupervisionTaskTitleFromBrief(sourceText)) return false;
-  return true;
-}
+export { isUsableTaskPairTitle } from '../../../shared/supervision-task-identity.js';
 
 const TITLE_OUTPUT_SCHEMA = {
   type: 'object',

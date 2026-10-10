@@ -1,3 +1,4 @@
+import { taskPairDisplayTitle, taskPairDisplaySessionLabel } from '@shared/task-pair-display.js';
 import type { ComponentChildren, RefObject } from 'preact';
 import { useMemo, useRef, useState, useEffect } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
@@ -341,6 +342,7 @@ function SessionButton(props: {
   const { t } = useTranslation();
   const { assignment } = props;
   const name = assignment.ownerSessionName;
+  const label = name ? taskPairDisplaySessionLabel(name, assignment.ownerSessionLabel) : undefined;
   const state = assignment.sessionState ?? 'unknown';
   // Four separate facts, never folded together:
   //  1. task lifecycle  -> rendered by the card's status pill
@@ -356,21 +358,19 @@ function SessionButton(props: {
   const stateLabel = showRuntimeState
     ? t(`supervision_task_console.session_state.${state}`)
     : workStateLabel;
-  if (!name) return null;
+  if (!name || name === 'none') return null;
   return (
     <button
       type="button"
       class={`supervision-task-console-session ${showRuntimeState ? `session-${state}` : `task-${props.taskTab}`} lane-${props.lane}`}
       data-session-state={showRuntimeState ? state : undefined}
       data-task-tab={props.taskTab}
-      aria-label={`${t(`supervision_task_console.${props.lane}`)}: ${assignment.ownerSessionLabel || name}, ${stateLabel}`}
+      aria-label={`${t(`supervision_task_console.${props.lane}`)}: ${label || name}, ${stateLabel}`}
       onClick={(event) => { event.stopPropagation(); props.onNavigateSession(name); }}
     >
       <span class="supervision-task-console-session-icon" aria-hidden="true" />
       <span class="supervision-task-console-session-copy">
-        <strong>{assignment.ownerSessionLabel || name}</strong>{assignment.ownerSessionLabel && <small> ({name})</small>}
-        <small>{assignment.observedProvider || assignment.ownerAgentType || '—'} · {assignment.observedModel || '—'}</small>
-        {props.lane === 'auditor' && (assignment.auditAttemptId || assignment.auditVerdict) && <small>{assignment.auditAttemptId || '—'} · {assignment.auditVerdict || '—'}</small>}
+        <strong>{label || name}</strong>{label && <small> ({name})</small>}
       </span>
       <span class="supervision-task-console-session-state">{stateLabel}{showRuntimeState ? ` · ${assignment.sessionStateSource ?? 'registry'}` : ''}</span>
       <span
@@ -440,13 +440,11 @@ function TaskCard(props: {
         <div class="supervision-task-console-task-summary">
           <ExpandableTaskObjective
             className="supervision-task-console-task-title"
-            text={props.task.pair ? (props.task.title ?? props.task.objective) : (props.task.objective ?? props.task.title)}
+            text={taskPairDisplayTitle(props.task.title, props.task.taskId) ?? t('taskPair.panel_untitled')}
             onActivate={props.onToggle}
             activateExpanded={props.expanded}
             activateControls={`task-console-details-${props.task.taskId}`}
           />
-          <small class="supervision-task-console-task-id">{props.task.taskId}</small>
-          {props.task.pair && props.task.objective && props.task.objective !== props.task.title && <small class="supervision-task-console-task-objective">{props.task.objective}</small>}
           <button
             type="button"
             class="supervision-task-console-details-toggle"
@@ -477,11 +475,6 @@ function TaskCard(props: {
       {props.expanded && (
         <div id={`task-console-details-${props.task.taskId}`} class="supervision-task-console-task-details">
           <dl class="supervision-task-console-fields">
-            <div class="supervision-task-console-field">
-              <dt>{t('supervision_task_console.task_id')}</dt>
-              <dd><button type="button" class="supervision-task-console-copy-id" onClick={() => { void navigator.clipboard?.writeText(props.task.taskId); }}>{props.task.taskId}<span>{t('supervision_task_console.copy_task_id')}</span></button></dd>
-            </div>
-            <Field label={t('supervision_task_console.top_level_task')} value={props.task.topLevelTaskId} />
             <Field label={t('supervision_task_console.current_action')} value={props.task.currentAction} />
             <Field label={t('supervision_task_console.next_action')} value={props.task.nextAction} />
             <Field label={t('supervision_task_console.validation')} value={t(`supervision_task_console.validation_state.${props.task.validationState}`)} />

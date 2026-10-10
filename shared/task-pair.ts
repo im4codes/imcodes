@@ -282,6 +282,8 @@ export type TaskPairCreatedSessionSource = typeof TASK_PAIR_CREATED_SESSION_SOUR
  * until it is recycled, a pair that created only its executor (the auditor was a reused idle session) uses one slot, and a recycled
  * (removed) session frees its slot with nothing to reconcile.
  */
+/** Stable sub-session namespace, shared with legacy-label presentation. */
+export const TASK_PAIR_SESSION_ID_PREFIX = 'pair_auto_' as const;
 export const TASK_PAIR_AUTO_CREATED_PAIR_MAX_PER_PROJECT = 10;
 export const TASK_PAIR_AUTO_CREATED_SESSION_MAX_PER_PROJECT = TASK_PAIR_AUTO_CREATED_PAIR_MAX_PER_PROJECT * 2;
 export const TASK_PAIR_CREATED_SESSION_REASONS = { DEFAULT: 'default_same_vendor_secondary', EXPLICIT: 'explicit_create' } as const;

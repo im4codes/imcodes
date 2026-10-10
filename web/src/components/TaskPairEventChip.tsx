@@ -1,3 +1,4 @@
+import { taskPairDisplayTitle, taskPairDisplaySessionLabel } from '@shared/task-pair-display.js';
 import { useTranslation } from 'react-i18next';
 import { useEffect, useRef, useState } from 'preact/hooks';
 import { createPortal } from 'preact/compat';
@@ -14,7 +15,7 @@ import {
 } from '@shared/task-pair.js';
 import { normalizeTaskPairAuditDetails, parseTaskPairAuditDetails } from '@shared/task-pair-notification.js';
 
-type SessionModelEntry = { name: string; activeModel?: string | null; requestedModel?: string | null; effort?: string | null };
+type SessionModelEntry = { name: string; label?: string | null; activeModel?: string | null; requestedModel?: string | null; effort?: string | null };
 
 const HOVER_PREVIEW_OPEN_DELAY_MS = 180;
 const HOVER_PREVIEW_CLOSE_DELAY_MS = 140;
@@ -28,6 +29,10 @@ function verbKey(verb: unknown): string {
   if (verb === TASK_PAIR_NOTICE_VERB) return 'notice';
   return typeof verb === 'string' && (TASK_PAIR_VERBS as readonly string[]).includes(verb) ? verb.toLowerCase() : 'other';
 }
+
+// Diagnostic text is still a display surface; protocol IDs and role runtime
+// metadata remain in the event, not in the rendered payload dump.
+const DISPLAY_OMITTED_KEYS = new Set(['taskId', 'topLevelTaskId', 'pairTaskId', 'executorModel', 'auditorModel', 'executorThinking', 'auditorThinking']);
 
 const SENSITIVE_KEY_RE = /(?:api[_ -]?key|access[_ -]?token|refresh[_ -]?token|token|password|secret|authorization|cookie|credential)/iu;
 
@@ -49,6 +54,7 @@ function safePayloadValue(value: unknown, key?: string): unknown {
   if (Array.isArray(value)) return value.map((entry) => safePayloadValue(entry));
   if (value && typeof value === 'object') {
     return Object.fromEntries(Object.entries(value as Record<string, unknown>)
+      .filter(([entryKey]) => !DISPLAY_OMITTED_KEYS.has(entryKey))
       .map(([entryKey, entryValue]) => [entryKey, safePayloadValue(entryValue, entryKey)]));
   }
   return value;
@@ -105,9 +111,16 @@ export function TaskPairEventChip({ eventId, payload, timestamp, sessions }: { e
     : '';
   const held = event.verdictJudgement === 'inconsistent' || event.verdictJudgement === 'missing_severity';
   const verdict = typeof event.verdictJudgement === 'string' ? event.verdictJudgement : '';
+  const title = taskPairDisplayTitle(event.title, taskId) ?? t('taskPair.card_untitled');
+  const displayPayload = {
+    ...payload,
+    title,
+    executorLabel: typeof event.executor === 'string' ? taskPairDisplaySessionLabel(event.executor, event.executorLabel) : undefined,
+    auditorLabel: typeof event.auditor === 'string' ? taskPairDisplaySessionLabel(event.auditor, event.auditorLabel) : undefined,
+  };
   const payloadForDetails = typeof timestamp === 'number' && Number.isFinite(timestamp)
-    ? { ...payload, _eventTimestamp: new Date(timestamp).toISOString() }
-    : payload;
+    ? { ...displayPayload, _eventTimestamp: new Date(timestamp).toISOString() }
+    : displayPayload;
   const payloadJson = JSON.stringify(safePayloadValue(payloadForDetails), null, 2) ?? '{}';
   const eventTime = typeof timestamp === 'number' && Number.isFinite(timestamp)
     ? new Intl.DateTimeFormat(i18n?.language || undefined, { hour: '2-digit', minute: '2-digit' }).format(new Date(timestamp))
@@ -145,7 +158,6 @@ export function TaskPairEventChip({ eventId, payload, timestamp, sessions }: { e
   // One colour per status (styles.css `.task-pair-chip--<status>`).
   const statusClass = isStatus(event.toStatus) ? ` task-pair-chip--${event.toStatus}` : '';
   const statusBadgeClass = isStatus(event.toStatus) ? event.toStatus : 'unknown';
-  const title = typeof event.title === 'string' && event.title.trim() ? event.title.trim() : t('taskPair.card_untitled');
   const clearHoverTimers = () => {
     if (hoverOpenTimerRef.current) clearTimeout(hoverOpenTimerRef.current);
     if (hoverCloseTimerRef.current) clearTimeout(hoverCloseTimerRef.current);
@@ -203,42 +215,20 @@ export function TaskPairEventChip({ eventId, payload, timestamp, sessions }: { e
     };
   }, [Boolean(hoverPreviewAnchor)]);
   const sessionLabel = (id: unknown, label: unknown) => {
-    if (typeof id !== 'string' || !id) return null;
-    const text = typeof label === 'string' && label ? `${label} (${id})` : id;
+    if (typeof id !== 'string' || !id || id === 'none') return null;
+    const name = taskPairDisplaySessionLabel(id, sessions?.find((entry) => entry.name === id)?.label ?? label);
+    const text = name ? `${name} (${id})` : id;
     return <button type="button" class="task-pair-chip-session" onClick={(click) => {
       click.stopPropagation();
       window.dispatchEvent(new CustomEvent('deck:navigate', { detail: { session: id } }));
     }}>{text}</button>;
   };
-  const resolveModel = (id: unknown, payloadModel: unknown): string | undefined => {
-    if (typeof payloadModel === 'string' && payloadModel.trim()) return payloadModel.trim();
-    if (typeof id !== 'string' || !id) return undefined;
-    const session = sessions?.find((entry) => entry.name === id);
-    return session?.activeModel?.trim() || session?.requestedModel?.trim() || undefined;
-  };
-  const resolveThinking = (id: unknown, payloadThinking: unknown): string | undefined => {
-    if (typeof payloadThinking === 'string' && payloadThinking.trim()) return payloadThinking.trim();
-    if (typeof id !== 'string' || !id) return undefined;
-    const session = sessions?.find((entry) => entry.name === id);
-    return session?.effort?.trim() || undefined;
-  };
-  const roleLabel = (id: unknown, label: unknown, modelValue: unknown, thinkingValue: unknown, role: 'executor' | 'auditor') => {
+  const roleLabel = (id: unknown, label: unknown, _model: unknown, _thinking: unknown, role: 'executor' | 'auditor') => {
     const session = sessionLabel(id, label);
-    const model = resolveModel(id, modelValue);
-    const thinking = resolveThinking(id, thinkingValue);
-    return <span class="task-pair-card-role"><span class="task-pair-card-role-label">{t(`taskPair.card_${role}`)}</span>{session ?? <span class="task-pair-card-unassigned">{t('taskPair.card_unassigned')}</span>}{session && <span class="task-pair-card-role-model">{t('taskPair.card_model', { value: model ?? t('taskPair.card_model_unknown') })}</span>}{session && <span class="task-pair-card-role-thinking">{t('taskPair.card_thinking', { value: thinking ?? t('taskPair.card_thinking_unknown') })}</span>}</span>;
+    return <span class="task-pair-card-role"><span class="task-pair-card-role-label">{t(`taskPair.card_${role}`)}</span>{session ?? <span class="task-pair-card-unassigned">{t(id === 'none' ? 'taskPair.panel_no_audit' : 'taskPair.card_unassigned')}</span>}</span>;
   };
-  const previewRole = (id: unknown, label: unknown, modelValue: unknown, thinkingValue: unknown, role: 'executor' | 'auditor') => {
-    const sessionId = typeof id === 'string' && id.trim() ? id.trim() : '';
-    const sessionName = typeof label === 'string' && label.trim() ? label.trim() : sessionId;
-    if (!sessionName) return null;
-    const model = resolveModel(id, modelValue) ?? t('taskPair.card_model_unknown');
-    const thinking = resolveThinking(id, thinkingValue) ?? t('taskPair.card_thinking_unknown');
-    return <div class="task-pair-card-hover-role">
-      <span class="task-pair-card-hover-role-name">{t(`taskPair.card_${role}`)}: {sessionName}</span>
-      <span class="task-pair-card-hover-role-meta">{t('taskPair.card_model', { value: model })} · {t('taskPair.card_thinking', { value: thinking })}</span>
-    </div>;
-  };
+  const previewRole = (id: unknown, label: unknown, model: unknown, thinking: unknown, role: 'executor' | 'auditor') =>
+    <div class="task-pair-card-hover-role">{roleLabel(id, label, model, thinking, role)}</div>;
   const renderHoverPreview = () => {
     if (!hoverPreviewAnchor || typeof document === 'undefined' || expanded) return null;
     const margin = 10;
