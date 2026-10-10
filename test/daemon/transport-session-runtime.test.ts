@@ -1458,6 +1458,108 @@ describe('TransportSessionRuntime', () => {
     expect(getTransportQueueStore().hasDeliveryTombstone('deck_test_brain', 'stop-no-proof-B')).toBe(false);
   });
 
+  it.each(['failure', 'timeout'] as const)('ordinary priority Stop preserves failed strong Stop proof and pending ids (%s)', async (reason) => {
+    runtime.send('foreground', 'stop-ordinary-A');
+    await waitForProviderSendCount(mock.provider, 1);
+    await flushDispatch();
+    runtime.send('retained B', 'stop-ordinary-B');
+    const confirmation = new ProviderStopConfirmation();
+    const target = {};
+    mock.provider.cancelAndWait = () => confirmation.confirm(target, async () => {
+      if (reason === 'failure') throw new Error('strong stop request refused');
+    }, () => true);
+    if (reason === 'timeout') vi.useFakeTimers();
+    try {
+      const failed = expect(runtime.stopAndSendPendingMessages(['stop-ordinary-B'], 'stop-ordinary-click'))
+        .rejects.toThrow(reason === 'failure' ? /request refused/ : /timed out/);
+      if (reason === 'timeout') await vi.advanceTimersByTimeAsync(5_001);
+      await failed;
+    } finally { vi.useRealTimers(); }
+    // Ordinary /stop stays priority and immediate, even if its interrupt never
+    // settles. Neither ACK nor another ordinary Stop can erase the old proof.
+    (mock.provider.cancel as ReturnType<typeof vi.fn>).mockReturnValue(new Promise<void>(() => {}));
+    await runtime.cancel();
+    await runtime.cancel();
+    await runtime.respondApproval('urgent-after-stop', true);
+    await flushDispatch();
+    expect(mock.provider.cancel).toHaveBeenCalledTimes(2);
+    expect(mock.provider.respondApproval).toHaveBeenCalledWith('sess-1', 'urgent-after-stop', true);
+    expect(mock.provider.send).toHaveBeenCalledTimes(1);
+    expect(runtime.pendingEntries.map((entry) => entry.clientMessageId)).toEqual(['stop-ordinary-B']);
+    expect(getTransportQueueStore().hasDeliveryTombstone('deck_test_brain', 'stop-ordinary-B')).toBe(false);
+    confirmation.complete({});
+    await flushDispatch();
+    expect(mock.provider.send).toHaveBeenCalledTimes(1);
+    confirmation.complete(target);
+    await waitForProviderSendCount(mock.provider, 2);
+    confirmation.complete(target);
+    await flushDispatch();
+    expect(mock.provider.send).toHaveBeenCalledTimes(2);
+    expect(mock.provider.send).toHaveBeenLastCalledWith('sess-1', expect.objectContaining({ userMessage: 'retained B' }));
+    expect(getTransportQueueStore().hasDeliveryTombstone('deck_test_brain', 'stop-ordinary-B')).toBe(true);
+  });
+
+  it('ordinary Stop cannot bypass missing strong capability but a later confirmed retry can settle', async () => {
+    runtime.send('foreground', 'stop-capability-A');
+    await waitForProviderSendCount(mock.provider, 1);
+    await flushDispatch();
+    runtime.send('retained B', 'stop-capability-B');
+    delete mock.provider.cancelAndWait;
+    await expect(runtime.stopAndSendPendingMessages(['stop-capability-B'], 'stop-capability-click')).rejects.toThrow('cannot confirm stop');
+    await runtime.cancel();
+    await flushDispatch();
+    expect(mock.provider.send).toHaveBeenCalledTimes(1);
+    expect(runtime.pendingEntries.map((entry) => entry.clientMessageId)).toEqual(['stop-capability-B']);
+    mock.provider.cancelAndWait = async () => {};
+    await expect(runtime.stopAndSendPendingMessages(['stop-capability-B'], 'stop-capability-retry'))
+      .resolves.toMatchObject({ status: 'stopped_and_dispatched' });
+    await waitForProviderSendCount(mock.provider, 2);
+    expect(mock.provider.send).toHaveBeenCalledTimes(2);
+  });
+
+  it('strong retry failure without a proof does not discard the previous late physical certificate', async () => {
+    runtime.send('foreground', 'stop-certificate-A');
+    await waitForProviderSendCount(mock.provider, 1);
+    await flushDispatch();
+    runtime.send('retained B', 'stop-certificate-B');
+    const confirmation = new ProviderStopConfirmation();
+    const target = {};
+    mock.provider.cancelAndWait = () => confirmation.confirm(target, async () => { throw new Error('first request refused'); }, () => true);
+    await expect(runtime.stopAndSendPendingMessages(['stop-certificate-B'], 'stop-certificate-first')).rejects.toThrow('first request refused');
+    mock.provider.cancelAndWait = () => { throw new Error('retry synchronously refused'); };
+    await expect(runtime.stopAndSendPendingMessages(['stop-certificate-B'], 'stop-certificate-retry')).rejects.toThrow('retry synchronously refused');
+    await runtime.cancel();
+    expect(mock.provider.send).toHaveBeenCalledTimes(1);
+    confirmation.complete(target);
+    await waitForProviderSendCount(mock.provider, 2);
+    expect(mock.provider.send).toHaveBeenCalledTimes(2);
+  });
+
+  it('old failed Stop proof cannot release a replacement runtime instance', async () => {
+    runtime.send('foreground', 'stop-instance-A');
+    await waitForProviderSendCount(mock.provider, 1);
+    await flushDispatch();
+    runtime.send('retained B', 'stop-instance-B');
+    const confirmation = new ProviderStopConfirmation();
+    const target = {};
+    mock.provider.cancelAndWait = () => confirmation.confirm(target, async () => { throw new Error('request refused'); }, () => true);
+    await expect(runtime.stopAndSendPendingMessages(['stop-instance-B'], 'stop-instance-click')).rejects.toThrow('request refused');
+    await runtime.cancel();
+    expect(mock.provider.send).toHaveBeenCalledTimes(1);
+    await runtime.kill({ preserveTransportQueue: true });
+    const replacement = makeMockProvider();
+    const next = new TransportSessionRuntime(replacement.provider, 'deck_test_brain');
+    await next.initialize(defaultConfig);
+    next.send('replacement foreground', 'stop-instance-C');
+    await waitForProviderSendCount(replacement.provider, 1);
+    expect(next.rehydratePendingFromStore()).toBe(1);
+    confirmation.complete(target);
+    await flushDispatch();
+    expect(replacement.provider.send).toHaveBeenCalledTimes(1);
+    expect(next.pendingEntries.map((entry) => entry.clientMessageId)).toEqual(['stop-instance-B']);
+    await next.kill();
+  });
+
   it('Stop cancel failure never starts a conflicting turn or clears pending messages', async () => {
     runtime.send('old turn', 'stop-fail-old');
     await waitForProviderSendCount(mock.provider, 1);

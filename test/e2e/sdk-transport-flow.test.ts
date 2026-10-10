@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { cleanupIsolatedSharedContextDb, createIsolatedSharedContextDb } from '../util/shared-context-db.js';
 import { TRANSPORT_QUEUE_COMMANDS } from '../../shared/transport-queue-types.js';
+import { SHARE_BROWSER_COMMANDS } from '../../shared/tab-sharing.js';
 import { DAEMON_COMMAND_TYPES } from '../../shared/daemon-command-types.js';
 import { MEMORY_MCP_ENV_KEYS } from '../../shared/memory-mcp-env.js';
 import { IMCODES_MEMORY_MCP_SERVER_NAME } from '../../shared/memory-mcp-server-name.js';
@@ -1818,7 +1819,7 @@ describe('sdk transport flow e2e', () => {
     mocks.finishCodexTurn!();
   });
 
-  it('Stop refuses to start a new Codex turn without a real terminal notification, even after interrupt ack', async () => {
+  it.each([DAEMON_COMMAND_TYPES.SESSION_CANCEL, '/stop'] as const)('Stop keeps its terminal barrier after later ordinary %s receipts', async (ordinary) => {
     mocks.holdCodexTurn = true;
     mocks.refuseSteer = true;
     await launchSession({ name: SESSION_CX, projectName: 'cxsdk', role: 'brain', agentType: 'codex-sdk', projectDir: sharedContextTempDir });
@@ -1836,11 +1837,24 @@ describe('sdk transport flow e2e', () => {
     expect(runtime.pendingEntries.map((entry) => entry.clientMessageId)).toEqual(['stop-terminal-B']);
     expect(getTransportQueueStore().hasDeliveryTombstone(SESSION_CX, 'stop-terminal-B')).toBe(false);
     expect(runtime.cancelStaleActiveTurnWithPending({ nowMs: Date.now() + 3_600_000, staleMs: 1 })).toBe(false);
+    for (let index = 0; index < 2; index++) {
+      const commandId = `stop-terminal-ordinary-${index}`;
+      handleWebCommand(ordinary === '/stop'
+        ? { type: SHARE_BROWSER_COMMANDS.SESSION_SEND, session: SESSION_CX, text: '/stop', commandId }
+        : { type: DAEMON_COMMAND_TYPES.SESSION_CANCEL, sessionName: SESSION_CX, commandId }, serverLink);
+      await waitForCondition(() => mocks.protocolCalls.filter((call) => call.method === 'turn/interrupt').length === index + 2);
+      await flushAsync();
+      expect(mocks.protocolCalls.filter((call) => call.method === 'turn/start')).toHaveLength(1);
+      expect(runtime.pendingEntries.map((entry) => entry.clientMessageId)).toEqual(['stop-terminal-B']);
+      expect(getTransportQueueStore().hasDeliveryTombstone(SESSION_CX, 'stop-terminal-B')).toBe(false);
+    }
     mocks.holdCodexTurn = false;
     mocks.finishCodexTurn!();
     await waitForCondition(() => getTransportQueueStore().hasDeliveryTombstone(SESSION_CX, 'stop-terminal-B'));
     expect(mocks.protocolCalls.filter((call) => call.method === 'turn/start')).toHaveLength(2);
-    expect(mocks.protocolCalls.filter((call) => call.method === 'turn/interrupt')).toHaveLength(1);
+    expect(mocks.protocolCalls.filter((call) => call.method === 'turn/interrupt')).toHaveLength(3);
+    await flushAsync();
+    expect(mocks.protocolCalls.filter((call) => call.method === 'turn/start')).toHaveLength(2);
   });
 
   it('dispatches busy/tool-active Claude append into the current SDK input stream at next safe boundary', async () => {

@@ -3572,7 +3572,12 @@ export class TransportSessionRuntime implements SessionRuntime {
   // A failed/expired strong Stop is not a local settlement. In particular,
   // health watchdogs must not turn that unknown physical state into a new turn.
   private _unconfirmedProviderStop = false;
-  private _lateStopConfirmationDispose: (() => void) | null = null;
+  private readonly _lateStopConfirmationDisposers = new Set<() => void>();
+
+  private clearLateStopConfirmations(): void {
+    for (const dispose of this._lateStopConfirmationDisposers) dispose();
+    this._lateStopConfirmationDisposers.clear();
+  }
   private _stopQueueIds = new Set<string>();
 
   /** User Stop only: native admission, or confirmed priority cancel + same ids. */
@@ -3641,9 +3646,9 @@ export class TransportSessionRuntime implements SessionRuntime {
   }
 
   async cancel(options?: { waitForProvider?: true }): Promise<void> {
-    this._lateStopConfirmationDispose?.();
-    this._lateStopConfirmationDispose = null;
-    if (!options?.waitForProvider) this._unconfirmedProviderStop = false;
+    // Ordinary priority Stop still sends an interrupt immediately, but its
+    // receipt cannot supersede an earlier unconfirmed physical cancellation.
+    // Keep captured proof observers across retries until proof or teardown.
     if (!this._providerSessionId) {
       throw new Error('TransportSessionRuntime not initialized — call initialize() first');
     }
@@ -3749,14 +3754,16 @@ export class TransportSessionRuntime implements SessionRuntime {
           const outcome = await withTimeoutOutcome(Promise.resolve(cancelResult), TRANSPORT_STOP_QUEUE_TIMEOUT_MS);
           if (outcome.timedOut) throw new Error('Provider stop timed out; queued work retained');
           this._unconfirmedProviderStop = false;
+          this.clearLateStopConfirmations();
         } catch (error) {
           // Outward failure stays honest. Only a later proof for the captured
           // instance/dispatch may release its queue; unrelated idle/watchdog
           // callbacks and a new instance can never do so.
-          this._lateStopConfirmationDispose = onConfirmedProviderStop(Promise.resolve(cancelResult), () => {
+          const dispose = onConfirmedProviderStop(Promise.resolve(cancelResult), () => {
             const release = () => {
               if (this._providerSessionId !== providerSessionId || this._activeDispatchId !== dispatchId || !this._unconfirmedProviderStop) return;
               this._unconfirmedProviderStop = false;
+              this.clearLateStopConfirmations();
               this.cancelActiveDispatchLocally(dispatchId);
             };
             // Proof can precede request rejection. Wait for the failed Stop's
@@ -3765,6 +3772,7 @@ export class TransportSessionRuntime implements SessionRuntime {
             if (operation) void operation.then(release, release);
             else release();
           });
+          this._lateStopConfirmationDisposers.add(dispose);
           throw error;
         }
       }
@@ -3846,8 +3854,7 @@ export class TransportSessionRuntime implements SessionRuntime {
     this._activeDispatchStaleRecoveryStarted = false;
     this._locallyCancelledDispatchIds.clear();
     this._confirmingStopDispatchIds.clear();
-    this._lateStopConfirmationDispose?.();
-    this._lateStopConfirmationDispose = null;
+    this.clearLateStopConfirmations();
     this._unconfirmedProviderStop = false;
     this._locallyCancelledActivityGenerations.clear();
     this._currentActivityGenerationLocallyCancelled = false;
@@ -5549,6 +5556,9 @@ export class TransportSessionRuntime implements SessionRuntime {
   }
 
   private cancelActiveDispatchLocally(dispatchId: number | null = this._activeDispatchId): void {
+    // All ordinary cancel and cancelled-continuation callers share this gate.
+    // Local settlement is not a terminal certificate for an unresolved Stop.
+    if (this._unconfirmedProviderStop) return;
     if (dispatchId !== null && this._activeDispatchId !== dispatchId) {
       this._locallyCancelledDispatchIds.delete(dispatchId);
       return;
