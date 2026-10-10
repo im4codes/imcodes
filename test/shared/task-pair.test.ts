@@ -336,6 +336,10 @@ describe('task-pair marker grammar', () => {
     expect(TASK_PAIR_BOUNDARY_AUDIT_RULE).toContain('per-call cost');
   });
 
+  it('routes an explicit SSH target directly in the generated pair contract', () => {
+    expect(buildTaskPairMarkerContract()).toContain('SSH TARGET ROUTING:');
+  });
+
   it('ships READY self-check and harness self-sufficiency rules', () => {
     const body = buildTaskPairMarkerContract();
     expect(body).toContain(TASK_PAIR_READY_SELF_CHECK_RULE);

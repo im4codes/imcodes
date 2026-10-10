@@ -1,3 +1,4 @@
+import { SSH_TARGET_ROUTING_GUIDANCE } from '../../shared/ssh-target-guidance.js';
 import type { TransportProvider } from './transport-provider.js';
 import type { TransportAttachment } from '../../shared/transport-attachments.js';
 import { selectRuntimeAuthoredContext } from './authored-context.js';
@@ -40,7 +41,9 @@ import { CRON_CONTROL_PROTOCOL, CRON_CONTROL_TRUSTED_SYSTEM_CLAUSE } from '../..
 
 /** Stable text: rendered once, registered in every managed session's system prompt. */
 const AUDIT_CONVERGENCE_SYSTEM_CONTRACT = buildAuditConvergenceContract();
-const TASK_PAIR_SYSTEM_CONTRACT = buildTaskPairMarkerContract();
+// Both standalone contracts carry the canonical rule. Here REAL_DEVICE
+// already supplies it whenever the pair contract is enabled; inject it once.
+const TASK_PAIR_SYSTEM_CONTRACT = buildTaskPairMarkerContract().replace(SSH_TARGET_ROUTING_GUIDANCE, '');
 import type { SessionRecord } from '../store/session-store.js';
 import { identitySpanForSegment, joinSpanned } from './priority-preserving-context-cap.js';
 

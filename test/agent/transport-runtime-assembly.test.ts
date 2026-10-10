@@ -1,3 +1,4 @@
+import { SSH_TARGET_ROUTING_GUIDANCE } from '../../shared/ssh-target-guidance.js';
 import { describe, expect, it, vi } from 'vitest';
 import {
   buildProviderContextPayload,
@@ -446,6 +447,8 @@ describe('buildProviderContextPayload', () => {
       });
 
       expect(payload.systemText).toContain(MCP_MEMORY_SEARCH_SYSTEM_GUIDANCE);
+      expect(payload.systemText).toContain(SSH_TARGET_ROUTING_GUIDANCE);
+      expect(payload.systemText?.split(SSH_TARGET_ROUTING_GUIDANCE)).toHaveLength(2);
       expect(payload.systemText).toContain('treat its tools as authoritative');
       expect(payload.systemText).toContain('prefer them over provider-native or improvised alternatives when relevant');
       expect(payload.systemText).toContain('Do not call memory for bare control messages');
@@ -982,6 +985,8 @@ describe('buildProviderContextPayload', () => {
       expect(systemText).toContain('imcodes send');
       expect(systemText).toContain('[display name](/absolute/full/path)');
       expect(systemText).toContain(REAL_DEVICE_TESTING_SYSTEM_GUIDANCE);
+      expect(systemText).toContain(SSH_TARGET_ROUTING_GUIDANCE);
+      expect(systemText.split(SSH_TARGET_ROUTING_GUIDANCE)).toHaveLength(2);
       expect(systemText).toContain('perform it before audit');
       expect(systemText).toContain('explicitly supplied by the user in the current request');
       expect(systemText).toContain('do not ask for a second authorization');

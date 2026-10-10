@@ -38,7 +38,7 @@
  * the canonical builders.
  */
 import { IMCODES_SESSION_ENV } from './imcodes-send.js';
-import { ALIAS_MCP_TOOLS } from './alias-types.js';
+import { SSH_TARGET_ROUTING_GUIDANCE } from './ssh-target-guidance.js';
 import { MEMORY_MCP_TOOL_NAMES } from './memory-mcp-contracts.js';
 import { VERIFICATION_MACHINE_MCP_TOOLS } from './verification-machine.js';
 import { FILE_OUTPUT_CONTRACT_ID, buildFileOutputContract } from './file-output-contract.js';
@@ -50,8 +50,9 @@ import { FILE_OUTPUT_CONTRACT_ID, buildFileOutputContract } from './file-output-
  */
 export const REAL_DEVICE_AUTHORIZATION_GUIDANCE = [
   'A device, SSH target/command, canonical nodeId, alias, or endpoint explicitly supplied by the user in the current request is authorized for that request\'s non-destructive inspection or testing; do not ask for a second authorization or require verification_machine_list first.',
+  SSH_TARGET_ROUTING_GUIDANCE,
   'Non-destructive work includes reading logs, checking status, running tests or builds, and temporary isolated validation.',
-  `Use the exact target with its tool's own schema, authority, resource-claim, reachability, and credential checks; for a controlled_node use ${MEMORY_MCP_TOOL_NAMES.EXEC_REMOTE} with its nodeId, and for an ssh target resolve its alias with ${ALIAS_MCP_TOOLS.RESOLVE}.`,
+  `Use the exact target with its tool's own schema, authority, resource-claim, reachability, and credential checks; for a controlled_node use ${MEMORY_MCP_TOOL_NAMES.EXEC_REMOTE} with its nodeId.`,
   `When the user has not specified a target, call ${VERIFICATION_MACHINE_MCP_TOOLS.LIST} and, when availability matters, ${VERIFICATION_MACHINE_MCP_TOOLS.VERIFY} before selecting a machine.`,
   'Deleting, overwriting, migrating ownership, restarting or stopping production, cleaning resources outside this task, or writing default-user data is destructive or irreversible and requires confirmation of the precise scope before execution.',
   'Never bypass tool authority or resource claims, expose credentials, or fabricate device evidence; report commands, targets, and outcomes exactly.',

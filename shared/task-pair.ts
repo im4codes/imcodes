@@ -16,6 +16,7 @@ import {
   normalizeAuditBlockingSeverities,
   type AuditSeverity,
 } from './audit-convergence.js';
+import { SSH_TARGET_ROUTING_GUIDANCE } from './ssh-target-guidance.js';
 import { advanceMarkdownFence, type MarkdownFenceState } from './markdown-fence.js';
 import { parseTaskPairChecklist, updateTaskPairChecklist } from './task-pair-checklist.js';
 import {
@@ -675,13 +676,14 @@ export const TASK_PAIR_READY_SELF_CHECK_RULE: string =
 export const TASK_PAIR_SELF_SUFFICIENCY_RULE: string =
   'Fix your own harness (pair): test stacks and their URLs, test accounts '
   + 'and keys minted in your own stack, and extra test participants are the '
-  + 'pair\'s job, not decisions for Brain. When a tool or channel fails, '
+  + 'pair\'s job, not decisions for Brain. When no SSH target was supplied and an authorized tool or channel fails, '
   + 'switch to an available alternative (for example plain ssh instead of a '
   + 'machine tool) before escalating. Any "cannot" sent to Brain includes '
-  + 'the exact command, the exact error and the alternatives already tried. '
+  + 'the exact command, the exact error and only relevant authorized alternatives already tried (not a mandatory channel sweep). '
   + 'When a switch or option is missing, create the condition another way '
   + '(an unpublished port, a temporary firewall rule on a test machine) '
-  + 'instead of dropping the row.';
+  + 'instead of dropping the row. '
+  + SSH_TARGET_ROUTING_GUIDANCE;
 
 /**
  * Brain-side rule (2026-09-29 22:00 review): a scope decision given only by

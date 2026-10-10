@@ -1,3 +1,4 @@
+import { SSH_TARGET_ROUTING_GUIDANCE } from '../../shared/ssh-target-guidance.js';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { readDelegationClaim } from '../../shared/delegation-claim.js';
 import { createHash } from 'node:crypto';
@@ -8085,6 +8086,7 @@ describe('Codex context budget protects IM.codes system and supervision instruct
     expect(contextText.endsWith(`Context instructions:\n${turn}`)).toBe(true);
     expect(contextText).toContain(buildAuditConvergenceContract());
     expect(contextText).toContain(REAL_DEVICE_TESTING_SYSTEM_GUIDANCE);
+    expect(contextText).toContain(SSH_TARGET_ROUTING_GUIDANCE);
     expect(contextText).toContain('agent identity truncated');
     expect(contextText).not.toContain('injected context truncated');
     await provider.disconnect().catch(() => {});

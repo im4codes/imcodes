@@ -1,3 +1,4 @@
+import { SSH_TARGET_ROUTING_GUIDANCE } from '../../shared/ssh-target-guidance.js';
 import { describe, expect, it, beforeEach, afterEach, vi } from 'vitest';
 import { chmod, mkdir, mkdtemp, realpath, rename, rm, symlink, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
@@ -1393,6 +1394,8 @@ exec "${realGit}" "$@"
       text.includes('Drive the implementation of @openspec/changes/demo-change aggressively.'),
     );
     expect(firstImplementationPrompt).toContain('Break the work into concrete sub-tasks');
+    expect(firstImplementationPrompt).toContain(SSH_TARGET_ROUTING_GUIDANCE);
+    expect(firstImplementationPrompt.split(SSH_TARGET_ROUTING_GUIDANCE)).toHaveLength(2);
     expect(firstImplementationPrompt).toContain('OpenSpec Auto Deliver context for @openspec/changes/demo-change.');
     expect(firstImplementationPrompt).toContain(`Project root: ${projectDir}`);
     expect(firstImplementationPrompt).toContain(`Change root: ${join(projectDir, 'openspec', 'changes', 'demo-change')}`);

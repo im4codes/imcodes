@@ -1,3 +1,4 @@
+import { SSH_TARGET_ROUTING_GUIDANCE } from '../../shared/ssh-target-guidance.js';
 import { PassThrough } from 'node:stream';
 import { EventEmitter } from 'node:events';
 import { readFile } from 'node:fs/promises';
@@ -1602,6 +1603,7 @@ describe('qwen system prompt argv budget', () => {
     expect(turn).toContain(SESSION_IDENTITY_BLOCK_CLOSE_TAG);
     expect(session.slice(span.end)).toContain(buildAuditConvergenceContract());
     expect(session.slice(span.end)).toContain(REAL_DEVICE_TESTING_SYSTEM_GUIDANCE);
+    expect(session.slice(span.end)).toContain(SSH_TARGET_ROUTING_GUIDANCE);
 
     const provider = new QwenProvider();
     await provider.connect({});
@@ -1618,6 +1620,7 @@ describe('qwen system prompt argv budget', () => {
     expect(sent.startsWith(session.slice(0, span.start))).toBe(true);
     expect(sent).toContain(buildAuditConvergenceContract());
     expect(sent).toContain(REAL_DEVICE_TESTING_SYSTEM_GUIDANCE);
+    expect(sent).toContain(SSH_TARGET_ROUTING_GUIDANCE);
     expect(sent).toContain('IM.codes system and supervision instructions were preserved');
     expect(sent).not.toContain('system prompt truncated');
   });
