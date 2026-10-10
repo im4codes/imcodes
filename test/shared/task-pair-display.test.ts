@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { taskPairDisplaySessionLabel, taskPairDisplayTitle, taskPairSessionLabel } from '../../shared/task-pair-display.js';
+import { taskPairDisplaySessionLabel, taskPairDisplayTitle, taskPairSessionLabel, taskPairResolveDisplaySessionLabel } from '../../shared/task-pair-display.js';
 
 const auto = 'deck_sub_pair_auto_0123456789abcdef';
 describe('task-pair display identity', () => {
@@ -26,5 +26,17 @@ describe('task-pair display identity', () => {
   });
   it('does not relabel an old session on reuse in the other role', () => {
     expect(taskPairDisplaySessionLabel(auto, 'Pair old-task executor: Old title')).toBe('Pair executor');
+  });
+});
+
+describe('label authority without default-data rewriting', () => {
+  it('uses live labels, respects explicit null/empty clears, then payload and watch fallback', () => {
+    expect(taskPairResolveDisplaySessionLabel(auto, 'Snapshot', { label: 'New name' }, 'Watch')).toBe('New name');
+    for (const label of [null, '', undefined]) {
+      expect(taskPairResolveDisplaySessionLabel(auto, 'Snapshot', { label }, 'Watch')).toBeUndefined();
+    }
+    expect(taskPairResolveDisplaySessionLabel(auto, 'Snapshot', {}, 'Watch')).toBe('Snapshot');
+    expect(taskPairResolveDisplaySessionLabel(auto, undefined, {}, 'Watch')).toBe('Watch');
+    expect(taskPairResolveDisplaySessionLabel(auto, undefined)).toBeUndefined();
   });
 });

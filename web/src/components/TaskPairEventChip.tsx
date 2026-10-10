@@ -1,4 +1,4 @@
-import { taskPairDisplayTitle, taskPairDisplaySessionLabel } from '@shared/task-pair-display.js';
+import { taskPairDisplayTitle, taskPairResolveDisplaySessionLabel } from '@shared/task-pair-display.js';
 import { useTranslation } from 'react-i18next';
 import { useEffect, useRef, useState } from 'preact/hooks';
 import { createPortal } from 'preact/compat';
@@ -115,8 +115,8 @@ export function TaskPairEventChip({ eventId, payload, timestamp, sessions }: { e
   const displayPayload = {
     ...payload,
     title,
-    executorLabel: typeof event.executor === 'string' ? taskPairDisplaySessionLabel(event.executor, event.executorLabel) : undefined,
-    auditorLabel: typeof event.auditor === 'string' ? taskPairDisplaySessionLabel(event.auditor, event.auditorLabel) : undefined,
+    executorLabel: typeof event.executor === 'string' ? taskPairResolveDisplaySessionLabel(event.executor, event.executorLabel, sessions?.find((entry) => entry.name === event.executor)) : undefined,
+    auditorLabel: typeof event.auditor === 'string' ? taskPairResolveDisplaySessionLabel(event.auditor, event.auditorLabel, sessions?.find((entry) => entry.name === event.auditor)) : undefined,
   };
   const payloadForDetails = typeof timestamp === 'number' && Number.isFinite(timestamp)
     ? { ...displayPayload, _eventTimestamp: new Date(timestamp).toISOString() }
@@ -216,7 +216,7 @@ export function TaskPairEventChip({ eventId, payload, timestamp, sessions }: { e
   }, [Boolean(hoverPreviewAnchor)]);
   const sessionLabel = (id: unknown, label: unknown) => {
     if (typeof id !== 'string' || !id || id === 'none') return null;
-    const name = taskPairDisplaySessionLabel(id, sessions?.find((entry) => entry.name === id)?.label ?? label);
+    const name = taskPairResolveDisplaySessionLabel(id, label, sessions?.find((entry) => entry.name === id));
     const text = name ? `${name} (${id})` : id;
     return <button type="button" class="task-pair-chip-session" onClick={(click) => {
       click.stopPropagation();

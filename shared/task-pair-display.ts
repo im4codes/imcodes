@@ -25,3 +25,17 @@ export function taskPairDisplaySessionLabel(id: string, value: unknown): string 
   }
   return label;
 }
+
+/** Live explicit clears are authoritative; absent fields on old peers are not.
+ * Cached watch labels are only a fallback after the explicit task payload. */
+export function taskPairResolveDisplaySessionLabel(
+  id: string,
+  payloadLabel: unknown,
+  liveSession?: { label?: string | null },
+  fallbackLabel?: unknown,
+): string | undefined {
+  if (liveSession && Object.prototype.hasOwnProperty.call(liveSession, 'label')) {
+    return taskPairDisplaySessionLabel(id, liveSession.label);
+  }
+  return taskPairDisplaySessionLabel(id, payloadLabel) ?? taskPairDisplaySessionLabel(id, fallbackLabel);
+}

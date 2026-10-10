@@ -1,4 +1,4 @@
-import { taskPairDisplayTitle, taskPairDisplaySessionLabel } from '@shared/task-pair-display.js';
+import { taskPairDisplayTitle, taskPairResolveDisplaySessionLabel } from '@shared/task-pair-display.js';
 import { isMobileLayout } from '../mobile-device.js';
 import { bindTaskPairPanelFit } from '../task-pair-panel-fit.js';
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'preact/hooks';
@@ -114,19 +114,6 @@ function hasPairActivity(events: readonly TimelineEvent[]): boolean {
   if (events.some((event) => event.type === TASK_PAIR_TIMELINE_EVENT)) return true;
   const snapshot = (window as Window & { __imcodesTaskPairSnapshot?: { tasks?: readonly unknown[]; authorityUnavailable?: boolean } }).__imcodesTaskPairSnapshot;
   return Boolean(snapshot?.authorityUnavailable) || (Array.isArray(snapshot?.tasks) && snapshot.tasks.length > 0);
-}
-
-function resolveSessionLabel(
-  id: string,
-  payloadLabel: unknown,
-  sessions: readonly SessionLabelEntry[] | undefined,
-  projectionSessions: readonly { sessionName: string; title: string }[],
-): string {
-  const session = sessions?.find((entry) => entry.name === id);
-  if (session?.label?.trim()) return session.label.trim();
-  const projected = projectionSessions.find((entry) => entry.sessionName === id);
-  if (projected?.title.trim()) return projected.title.trim();
-  return typeof payloadLabel === 'string' ? payloadLabel.trim() : '';
 }
 
 export function TaskPairStatusPanel({ events, sessions, serverId, scopeSessionId }: { events: readonly TimelineEvent[]; sessions?: readonly SessionLabelEntry[]; serverId?: string | null; scopeSessionId?: string | null }) {
@@ -251,7 +238,7 @@ export function TaskPairStatusPanel({ events, sessions, serverId, scopeSessionId
     // 'none' is a real, deliberate value (auditor=none): there is no session
     // to open, so it must not render as a dangling clickable placeholder.
     if (typeof id !== 'string' || !id || id === 'none') return null;
-    const text = taskPairDisplaySessionLabel(id, resolveSessionLabel(id, label, sessions, projectionSessions)) || t(`taskPair.panel_${role}`);
+    const text = taskPairResolveDisplaySessionLabel(id, label, sessions?.find((entry) => entry.name === id), projectionSessions.find((entry) => entry.sessionName === id)?.title) || t(`taskPair.panel_${role}`);
     return <button type="button" class="task-pair-status-session" data-session-name={id} onClick={() => window.dispatchEvent(new CustomEvent('deck:navigate', { detail: { session: id } }))}>
       <span class="task-pair-status-session-main"><span class="task-pair-status-session-label">{text}</span><small class="task-pair-status-session-id">{id}</small></span>
     </button>;
