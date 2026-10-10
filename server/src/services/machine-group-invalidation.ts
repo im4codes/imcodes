@@ -1,4 +1,4 @@
-import pg from 'pg';
+import type pg from 'pg';
 import { HTTPException } from 'hono/http-exception';
 import { randomUUID } from 'node:crypto';
 import { performance } from 'node:perf_hooks';
@@ -97,6 +97,7 @@ export class MachineGroupInvalidationRuntime {
   private again = false;
   private timer: ReturnType<typeof setInterval> | null = null;
   private listener: pg.Client | null = null;
+  private listenerGeneration = 0;
   private reconnect: ReturnType<typeof setTimeout> | null = null;
   private nextCleanup = 0;
 
@@ -179,26 +180,41 @@ export class MachineGroupInvalidationRuntime {
 
   private async listen(): Promise<void> {
     if (this.stopped || !this.connectionString) return;
-    const client = new pg.Client({ connectionString: this.connectionString, application_name: `${POLICY.LISTENER_APPLICATION_PREFIX}${this.receiverId}` });
-    this.listener = client;
+    const generation = ++this.listenerGeneration;
+    const current = () => !this.stopped && this.listenerGeneration === generation;
+    let client: pg.Client | null = null;
     const retry = () => {
-      if (this.listener !== client) return;
+      if (!current() || (client && this.listener !== client)) return;
       this.listener = null;
-      void client.end().catch(() => {});
-      if (!this.stopped && !this.reconnect) {
+      if (client) void client.end().catch(() => {});
+      if (!this.reconnect) {
         this.reconnect = setTimeout(() => { this.reconnect = null; void this.listen(); }, POLICY.POLL_MS);
         this.reconnect.unref?.();
       }
     };
-    client.on('notification', (notification) => { if (notification.channel === POLICY.CHANNEL) this.wake(); });
-    client.on('error', retry);
-    client.on('end', retry);
-    try { await client.connect(); await client.query(`LISTEN ${POLICY.CHANNEL}`); this.wake(); }
+    try {
+      // Thin bridge/router consumers need only readiness/revision, not the
+      // server's optional notification driver. Polling remains authoritative.
+      const { default: driver } = await import('pg');
+      if (!current()) return; // stop (or stop/start) may have won during loading.
+      client = new driver.Client({ connectionString: this.connectionString, application_name: `${POLICY.LISTENER_APPLICATION_PREFIX}${this.receiverId}` });
+      this.listener = client;
+      client.on('notification', (notification) => {
+        if (current() && this.listener === client && notification.channel === POLICY.CHANNEL) this.wake();
+      });
+      client.on('error', retry);
+      client.on('end', retry);
+      await client.connect();
+      if (!current() || this.listener !== client) { await client.end().catch(() => {}); return; }
+      await client.query(`LISTEN ${POLICY.CHANNEL}`);
+      if (current() && this.listener === client) this.wake();
+    }
     catch { retry(); } // Poller remains authoritative, even when LISTEN is unavailable.
   }
 
   async stop(): Promise<void> {
     this.stopped = true;
+    ++this.listenerGeneration; // Invalidate imports/connects from this lifecycle.
     this.healthyUntil = 0;
     this.unavailable(); // Close/fence this pod BEFORE it stops being a required receiver.
     if (this.timer) clearInterval(this.timer);
