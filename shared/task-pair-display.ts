@@ -1,4 +1,4 @@
-import { TASK_PAIR_SESSION_ID_PREFIX } from './task-pair.js';
+import { TASK_PAIR_ID_CHAR_CLASS, TASK_PAIR_SESSION_ID_PREFIX } from './task-pair.js';
 import { isUsableTaskPairTitle } from './supervision-task-identity.js';
 
 /** Display only; never change a task's protocol identity or persisted title. */
@@ -10,6 +10,10 @@ export function taskPairSessionLabel(role: 'executor' | 'auditor'): string {
   return `Pair ${role}`;
 }
 
+const LEGACY_PAIR_LABEL_RE = new RegExp(
+  String.raw`^Pair [${TASK_PAIR_ID_CHAR_CLASS}]+ (executor|auditor)(?:: ([^\r\n]{1,40}))?$`,
+);
+
 /** Legacy projection is deliberately narrow: the reserved generated namespace,
  * a complete old producer label (including its 40 UTF-16-unit title bound),
  * and a task identifier. Ordinary/custom Pair-style labels stay untouched.
@@ -20,7 +24,7 @@ export function taskPairDisplaySessionLabel(id: string, value: unknown): string 
   const label = value.trim();
   const suffix = id.slice(`deck_sub_${TASK_PAIR_SESSION_ID_PREFIX}`.length);
   if (id.startsWith(`deck_sub_${TASK_PAIR_SESSION_ID_PREFIX}`) && /^[a-f0-9]{16}$/.test(suffix)) {
-    const legacy = /^Pair [A-Za-z0-9_-]+ (executor|auditor)(?:: ([^\r\n]{1,40}))?$/.exec(value);
+    const legacy = LEGACY_PAIR_LABEL_RE.exec(value);
     if (legacy && (!legacy[2] || legacy[2].trim() === legacy[2])) return taskPairSessionLabel(legacy[1] as 'executor' | 'auditor');
   }
   return label;

@@ -1005,8 +1005,11 @@ export interface TaskPairMarkerScan {
   markerLineIndexes: number[];
 }
 
+/** Task identifier lexical class; shared with legacy producer-label projection. */
+export const TASK_PAIR_ID_CHAR_CLASS = 'A-Za-z0-9._:-' as const;
+
 const MARKER_LINE_RE = new RegExp(
-  String.raw`^[ \t]{0,3}<!--\s*${TASK_PAIR_MARKER_TAG}\s+([A-Za-z_]+)\s+([A-Za-z0-9._:-]{1,64}|-)`
+  String.raw`^[ \t]{0,3}<!--\s*${TASK_PAIR_MARKER_TAG}\s+([A-Za-z_]+)\s+([${TASK_PAIR_ID_CHAR_CLASS}]{1,64}|-)`
   + String.raw`((?:\s+[a-z0-9_]+=(?:"(?:[^"\\]|\\.){0,${TASK_PAIR_ATTR_VALUE_MAX}}"|[^\s">]+))*)\s*-->[ \t]*$`,
 );
 const ATTR_RE = /([a-z0-9_]+)=(?:"((?:[^"\\]|\\.)*)"|([^\s">]+))/g;

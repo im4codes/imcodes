@@ -41,6 +41,30 @@ describe('compact pair identities (screenshot counterexamples)', () => {
     expect(roles.textContent).not.toContain('产品排序任务');
     expect(roles.textContent).not.toMatch(/secret-model|other-model|card_thinking/);
   });
+  it('compacts all legacy protocol punctuation and keeps exact role navigation', () => {
+    const navigate = vi.fn();
+    const listener = (e: Event) => navigate((e as CustomEvent).detail.session);
+    window.addEventListener('deck:navigate', listener);
+    try {
+      for (const legacyId of ['tsk_release.v1', 'tsk_release:v1', 'tsk_release-v1_2', 'tsk_release.v1:rc_2-final']) {
+        const p = { ...payload, taskId: legacyId,
+          executorLabel: `Pair ${legacyId} executor: 发布任务`, auditorLabel: `Pair ${legacyId} auditor`,
+        };
+        const panel = render(<TaskPairStatusPanel events={event(p)} />);
+        expandedPanel(panel.container);
+        const roles = panel.container.querySelector('.task-pair-status-row-roles')!;
+        expect(roles.textContent).toContain(`Pair executor${exec}`);
+        expect(roles.textContent).toContain(`Pair auditor${audit}`);
+        expect(roles.textContent).not.toMatch(/发布任务|tsk_release/);
+        const buttons = roles.querySelectorAll('button');
+        fireEvent.click(buttons[0]!);
+        expect(navigate).toHaveBeenLastCalledWith(exec);
+        fireEvent.click(buttons[1]!);
+        expect(navigate).toHaveBeenLastCalledWith(audit);
+        panel.unmount();
+      }
+    } finally { window.removeEventListener('deck:navigate', listener); }
+  });
   it('does not expose an ID-valued or absent task title on panels or event cards', () => {
     for (const value of [taskId, '', undefined]) {
       const p = { ...payload, title: value } as typeof payload;
