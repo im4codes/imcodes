@@ -20,6 +20,11 @@ export const CLAUDE_CONTEXT_WINDOWS = {
   OPUS_1M_ALIAS: 1_000_000,
   OPUS_4_FAMILY: 1_000_000,
   SONNET_4_FAMILY: 1_000_000,
+  // The `haiku` alias resolves to Haiku 5.5 from Claude Code / Agent SDK 0.3.293
+  // (it was claude-haiku-4-5-20251001 up to 0.3.291). Measured on the bundled
+  // binary: modelUsage['claude-haiku-5-5'] = { contextWindow: 1_000_000,
+  // maxOutputTokens: 128_000 }; 0.3.291 reported 200_000 for Haiku 4.5.
+  HAIKU_5_FAMILY: 1_000_000,
   HAIKU_4_FAMILY: 200_000,
   CLAUDE_3_FAMILY: 200_000,
 } as const;
@@ -75,7 +80,8 @@ export function inferContextWindow(model?: string | null): number | undefined {
   if (/^claude-opus-4(?:$|[-_.])/.test(m)) return CLAUDE_CONTEXT_WINDOWS.OPUS_4_FAMILY;
   if (m == 'sonnet') return CLAUDE_CONTEXT_WINDOWS.SONNET_4_FAMILY;
   if (/^claude-sonnet-4(?:$|[-_.])/.test(m)) return CLAUDE_CONTEXT_WINDOWS.SONNET_4_FAMILY;
-  if (m == 'haiku') return CLAUDE_CONTEXT_WINDOWS.HAIKU_4_FAMILY;
+  if (m == 'haiku') return CLAUDE_CONTEXT_WINDOWS.HAIKU_5_FAMILY;
+  if (/^claude-haiku-5(?:$|[-_.])/.test(m)) return CLAUDE_CONTEXT_WINDOWS.HAIKU_5_FAMILY;
   if (/^claude-haiku-4(?:$|[-_.])/.test(m)) return CLAUDE_CONTEXT_WINDOWS.HAIKU_4_FAMILY;
   if (/^claude-3(?:[.-]|$)/.test(m)) return CLAUDE_CONTEXT_WINDOWS.CLAUDE_3_FAMILY;
 

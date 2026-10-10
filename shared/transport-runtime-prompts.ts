@@ -29,8 +29,8 @@
  *
  *   • `buildFilePathReportingPrompt` — appended to `sessionSystemText`
  *     by `compileAgentContextArtifact`. Applies to ALL transport
- *     providers because IM.codes file preview/download needs a concrete
- *     filesystem path, not a bare filename or ambiguous relative path.
+ *     providers because IM.codes file preview/download needs the canonical
+ *     file-output contract.
  *
  * Lives in `shared/` because both builders are pure string composition
  * with no Node-only dependencies — the server (defense-in-depth) and
@@ -38,22 +38,60 @@
  * the canonical builders.
  */
 import { IMCODES_SESSION_ENV } from './imcodes-send.js';
+import { SSH_TARGET_ROUTING_GUIDANCE } from './ssh-target-guidance.js';
+import { MEMORY_MCP_TOOL_NAMES } from './memory-mcp-contracts.js';
+import { VERIFICATION_MACHINE_MCP_TOOLS } from './verification-machine.js';
+import { FILE_OUTPUT_CONTRACT_ID, buildFileOutputContract } from './file-output-contract.js';
+
+/**
+ * Shared device-target authority rules. A target explicitly supplied in the
+ * current user request is already in scope for that request's safe work; it is
+ * not useful to make the user authorize the same target a second time.
+ */
+export const REAL_DEVICE_AUTHORIZATION_GUIDANCE = [
+  'A device, SSH target/command, canonical nodeId, alias, or endpoint explicitly supplied by the user in the current request is authorized for that request\'s non-destructive inspection or testing; do not ask for a second authorization or require verification_machine_list first.',
+  SSH_TARGET_ROUTING_GUIDANCE,
+  'Non-destructive work includes reading logs, checking status, running tests or builds, and temporary isolated validation.',
+  `Use the exact target with its tool's own schema, authority, resource-claim, reachability, and credential checks; for a controlled_node use ${MEMORY_MCP_TOOL_NAMES.EXEC_REMOTE} with its nodeId.`,
+  `When the user has not specified a target, call ${VERIFICATION_MACHINE_MCP_TOOLS.LIST} and, when availability matters, ${VERIFICATION_MACHINE_MCP_TOOLS.VERIFY} before selecting a machine.`,
+  'Deleting, overwriting, migrating ownership, restarting or stopping production, cleaning resources outside this task, or writing default-user data is destructive or irreversible and requires confirmation of the precise scope before execution.',
+  'Never bypass tool authority or resource claims, expose credentials, or fabricate device evidence; report commands, targets, and outcomes exactly.',
+].join(' ');
+
+/**
+ * Prefer evidence from an authorized real machine over a purely textual audit.
+ * This is provider-neutral and session-stable, so it belongs in the shared
+ * system prompt rather than in one SDK adapter or a supervision-only preamble.
+ */
+export const REAL_DEVICE_TESTING_SYSTEM_GUIDANCE = [
+  'REAL-DEVICE TESTING PRIORITY: when suitable real-device testing is available, perform it before audit because it can expose actual code defects quickly.',
+  REAL_DEVICE_AUTHORIZATION_GUIDANCE,
+].join(' ');
 
 /**
  * Render the IM.codes session identity block. Includes the exact
  * session name and the display label so the model knows to prefer
  * `$IMCODES_SESSION` (or the exact name) over the human-friendly label
  * when invoking `imcodes send` — labels can collide across sessions.
+ *
+ * When `role` is `'brain'`, the block also tells the model it IS the
+ * project's main session — the one leading the whole session group
+ * (coordinating sub-sessions/workers) — so it knows its own standing
+ * without having to infer it from the session name suffix.
  */
 export function buildTransportImcodesIdentityPrompt(
   sessionName: string,
   label: string | null | undefined,
+  role?: string | null,
 ): string {
   const displayLabel = label?.trim() || sessionName;
   return [
     'IM.codes session identity:',
     `- Exact session name: ${sessionName}`,
     `- Display label: ${displayLabel}`,
+    ...(role === 'brain'
+      ? ['- Your role: Brain — the main session leading this project\'s whole session group. Sub-sessions and workers report to you.']
+      : []),
     `- When invoking \`imcodes send\`, prefer $${IMCODES_SESSION_ENV}. If a SDK/tool environment lacks it, prefix the command with ${IMCODES_SESSION_ENV}=${sessionName}. Do not use display labels as sender identity unless the exact session name is unavailable, because labels can be duplicated.`,
   ].join('\n');
 }
@@ -63,20 +101,14 @@ export function buildTransportImcodesIdentityPrompt(
  * always report the file path of any generated image so the user can
  * find / open / link to it.
  *
- * Compressed into one line while preserving the functional points:
- *   1. report the absolute file path of every image you create/edit/save
- *   2. multiple images each get a path (implicit in "every")
- *   3. if no path is returned, say so explicitly
- *   4. if used in app/site/docs, note where it was added
- * The original's two redundant lines ("do not only say image was
- * generated" and the closing "never finish without …") restated rule 1
- * and were dropped — the positive imperative already covers them.
+ * The generic path/link shape is referenced from file_output_v1 instead of
+ * being restated here; this block adds only image-specific completeness.
  *
  * This block is daemon-injected into Codex baseInstructions, once per
  * thread/start|resume.
  */
 export function buildGeneratedImageReportingPrompt(): string {
-  return 'Generated images: report the absolute file path of every image you create/edit/save. If no path returned, say so. If used in app/site/docs, also note where added.';
+  return `Generated images: apply ${FILE_OUTPUT_CONTRACT_ID} to every image you create/edit/save. If no path returned, say so. If used in app/site/docs, also note where added.`;
 }
 
 /**
@@ -87,5 +119,5 @@ export function buildGeneratedImageReportingPrompt(): string {
  * daemon-injected outside user-authored prompt caps.
  */
 export function buildFilePathReportingPrompt(): string {
-  return 'Files: when sharing, sending, opening, previewing, or linking a local file, provide its full absolute filesystem path (not a bare filename or relative path). If only repo-relative is known, resolve it against the workspace first.';
+  return buildFileOutputContract();
 }

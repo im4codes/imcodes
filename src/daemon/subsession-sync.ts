@@ -4,12 +4,14 @@ import { getQwenDisplayMetadata } from '../agent/provider-display.js';
 import { getQwenOAuthQuotaUsageLabel } from '../agent/provider-quota.js';
 import { getClaudeSdkRuntimeConfig } from '../agent/sdk-runtime-config.js';
 import { getClaudeUsageQuota } from '../agent/claude-usage-quota.js';
+import { fetchAgyUsageQuota } from '../agent/agy-usage-quota.js';
 import { getSession, type SessionRecord } from '../store/session-store.js';
 import type { ServerLink } from './server-link.js';
 import { EXECUTION_CLONE_KIND, type ExecutionCloneMetadata } from '../../shared/execution-clone.js';
 import logger from '../util/logger.js';
 import type { QueueSnapshot } from '../../shared/transport-queue-types.js';
 import { buildTransportQueueSnapshotPayload, type TransportQueueSnapshotPayload } from './transport-queue-projection.js';
+import { getSupervisionHeartbeatProjectionForWire } from './supervision-heartbeat-projection.js';
 
 /**
  * Runtime-identity fields that MUST NOT replicate to Postgres for an execution
@@ -77,7 +79,7 @@ export async function buildSubSessionSyncPayload(
     return null;
   }
 
-  const freshDisplay: Partial<Pick<SessionRecord, 'modelDisplay' | 'codexAvailableModels' | 'planLabel' | 'quotaLabel' | 'quotaUsageLabel' | 'quotaMeta'>> = isQwenSession(r.agentType)
+  const freshDisplay: Partial<Pick<SessionRecord, 'modelDisplay' | 'codexAvailableModels' | 'planLabel' | 'quotaLabel' | 'quotaUsageLabel' | 'quotaMeta' | 'codexCreditsBalance' | 'codexCreditsHasCredits' | 'codexCreditsUnlimited'>> = isQwenSession(r.agentType)
     ? getQwenDisplayMetadata({
         model: r.qwenModel,
         authType: r.qwenAuthType,
@@ -93,6 +95,7 @@ export async function buildSubSessionSyncPayload(
   // Option B (best-effort, ≤1 fetch / 30min): proactive 5h+weekly quota for a
   // claude-code-sdk sub-session. null → fall back to the rate_limit_event quota.
   const usageQuota = isClaudeSdkSession(r.agentType) ? await getClaudeUsageQuota().catch(() => null) : null;
+  const agyUsageQuota = r.agentType === 'agy-sdk' ? await fetchAgyUsageQuota().catch(() => null) : null;
   void options;
   let transportQueue: TransportQueueSnapshotPayload | null = null;
   if (r.runtimeType === 'transport') {
@@ -139,6 +142,7 @@ export async function buildSubSessionSyncPayload(
     contextRetryExhausted: r.contextRetryExhausted ?? null,
     contextSharedPolicyOverride: r.contextSharedPolicyOverride ?? null,
     transportConfig: r.transportConfig ?? null,
+    supervisionHeartbeat: getSupervisionHeartbeatProjectionForWire(sessionName) ?? null,
     qwenModel: r.qwenModel ?? null,
     qwenAuthType: r.qwenAuthType ?? null,
     qwenAuthLimit: r.qwenAuthLimit ?? null,
@@ -146,9 +150,12 @@ export async function buildSubSessionSyncPayload(
     codexAvailableModels: freshDisplay.codexAvailableModels ?? r.codexAvailableModels ?? null,
     modelDisplay: freshDisplay.modelDisplay ?? r.modelDisplay ?? null,
     planLabel: freshDisplay.planLabel ?? r.planLabel ?? null,
-    quotaLabel: usageQuota?.quotaLabel ?? freshDisplay.quotaLabel ?? r.quotaLabel ?? null,
+    quotaLabel: usageQuota?.quotaLabel ?? agyUsageQuota?.quotaLabel ?? freshDisplay.quotaLabel ?? r.quotaLabel ?? null,
     quotaUsageLabel: freshDisplay.quotaUsageLabel ?? r.quotaUsageLabel ?? null,
-    quotaMeta: usageQuota?.quotaMeta ?? freshDisplay.quotaMeta ?? r.quotaMeta ?? null,
+    quotaMeta: usageQuota?.quotaMeta ?? agyUsageQuota?.quotaMeta ?? freshDisplay.quotaMeta ?? r.quotaMeta ?? null,
+    codexCreditsBalance: freshDisplay.codexCreditsBalance ?? r.codexCreditsBalance ?? null,
+    codexCreditsHasCredits: freshDisplay.codexCreditsHasCredits ?? r.codexCreditsHasCredits ?? null,
+    codexCreditsUnlimited: freshDisplay.codexCreditsUnlimited ?? r.codexCreditsUnlimited ?? null,
     effort: r.effort ?? null,
     ...(transportQueue ?? {}),
   };
@@ -163,4 +170,30 @@ export async function sendSubSessionSync(
   const payload = await buildSubSessionSyncPayload(id, overrides, options);
   if (!payload) return;
   serverLink.send(payload);
+}
+
+/** What `announceSubSession` achieved. `no_link`: nothing was sent (no server link, or its socket is not open); the reconnect resync covers it. */
+export type SubSessionAnnounceOutcome = 'announced' | 'no_link' | 'failed';
+
+/**
+ * Tell the server (and through it every browser) that a sub-session the daemon launched on its own exists: the server learns of a
+ * daemon-created sub-session only through `subsession.sync`, which it turns into the `sub_sessions` row and `subsession.created`.
+ * Unlike `sendSubSessionSync` this reports whether the message actually left: a dropped send is `no_link`, and a record that cannot
+ * be described (no agentType) is `failed`.
+ */
+export async function announceSubSession(
+  link: { send(msg: object): void; trySend?(msg: unknown): boolean; isConnected?(): boolean } | null,
+  id: string,
+): Promise<SubSessionAnnounceOutcome> {
+  if (!link || (link.isConnected && !link.isConnected())) return 'no_link';
+  const payload = await buildSubSessionSyncPayload(id);
+  if (!payload) return 'failed';
+  try {
+    if (link.trySend) return link.trySend(payload) ? 'announced' : 'no_link';
+    link.send(payload);
+    return 'announced';
+  } catch (error) {
+    logger.warn({ err: error, id }, 'subsession announce: send failed');
+    return 'no_link';
+  }
 }

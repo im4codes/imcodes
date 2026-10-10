@@ -2,8 +2,27 @@
  * SubSessionBar — bottom panel showing sub-session preview cards.
  * Cards show live chat/terminal previews. Single or double row layout.
  */
+import {
+  DAEMON_LIVENESS_MSG,
+  DAEMON_STATS_MSG,
+  isFiniteStat,
+  mergeDaemonLiveness,
+  mergeDaemonStats,
+  type DaemonStatsView,
+} from '@shared/daemon-stats.js';
+import {
+  DAEMON_STAT_PLACEHOLDER,
+  cpuSeverity,
+  formatCpuPercent,
+  formatLoadTriple,
+  formatMemoryCompact,
+  formatMemoryPair,
+  formatStatNumber,
+  formatUptime,
+} from '../util/daemon-stats-format.js';
 import { useState, useEffect, useMemo, useRef, useCallback } from 'preact/hooks';
 import type { JSX } from 'preact';
+import { createPortal, memo } from 'preact/compat';
 import { useTranslation } from 'react-i18next';
 import { SubSessionCard } from './SubSessionCard.js';
 import type { SubSession } from '../hooks/useSubSessions.js';
@@ -38,12 +57,24 @@ import {
   getSubSessionAccentColorMap,
 } from '../subsession-accent-colors.js';
 import { OpenSpecAutoDeliverRunBar } from './OpenSpecAutoDeliver.js';
+import { recordPerfRender } from '../perf-render-debug.js';
 import type { OpenSpecAutoDeliverProjection } from '../openspec-auto-deliver.js';
+import {
+  SUBSESSION_DESKTOP_DOCK_SIDE,
+  SUBSESSION_DESKTOP_LAYOUT,
+  type SubSessionDesktopDockSide,
+  type SubSessionDesktopLayout,
+} from '../subsession-desktop-layout-preference.js';
+import {
+  TEAM_DISCUSSION_LAYOUT,
+  type TeamDiscussionLayout,
+} from '../team-discussion-layout-preference.js';
 import {
   DIRECT_CONNECTIVITY_ENDPOINT_KIND,
   DIRECT_CONNECTIVITY_PROBE_STAGE,
   DIRECT_CONNECTIVITY_ROUTE,
   DIRECT_CONNECTIVITY_RUNTIME_STATE,
+  DIRECT_FILE_CONNECTION_STATUS,
   DIRECT_FILE_TRANSFER_LEASE_CAPABILITY,
   DIRECT_FILE_TRANSFER_ERROR,
   inferDirectConnectivityEndpointKind,
@@ -55,18 +86,21 @@ import {
   type DirectConnectivityProbeResult,
   type DirectConnectivityProbeStage,
   type DirectConnectivityRuntimeStatus,
+  type DirectFileConnectionStatus,
 } from '@shared/direct-file-transfer.js';
-import { DirectFileTransferFailure, probeDirectConnectivity } from '../direct-file-transfer.js';
+import {
+  DirectFileTransferFailure,
+  prewarmDirectFileLease,
+  probeDirectConnectivity,
+  subscribeDirectFileConnectionStatus,
+} from '../direct-file-transfer.js';
 
-interface DaemonStats {
-  daemonVersion?: string | null;
-  cpu: number;
-  memUsed: number;
-  memTotal: number;
-  load1: number;
-  load5: number;
-  load15: number;
-  uptime: number;
+function cpuClass(cpu: number | null | undefined): string {
+  const severity = cpuSeverity(cpu);
+  return severity === 'danger' ? ' danger' : severity === 'warn' ? ' warn' : '';
+}
+
+interface DaemonStats extends DaemonStatsView {
   embedding?: EmbeddingStatus | null;
   disks?: DiskUsage[] | null;
   shortRefHealth?: MemoryShortRefHealth | null;
@@ -87,6 +121,7 @@ interface CollapsedSubSessionButtonProps {
   idleFlashToken: number;
   usage?: { inputTokens: number; cacheTokens: number; contextWindow: number; contextWindowSource?: UsageContextWindowSource; model?: string };
   detectedModel?: string;
+  orientation?: 'horizontal' | 'vertical';
   sharedState?: SharedStateSummary | null;
   inP2p: boolean;
   draggable?: boolean;
@@ -105,6 +140,14 @@ interface Props {
   openIds: Set<string>;
   maximizedIds?: ReadonlySet<string>;
   desktopLayoutCapable?: boolean;
+  desktopLayout?: SubSessionDesktopLayout;
+  onDesktopLayoutChange?: (layout: SubSessionDesktopLayout) => void;
+  desktopDockSide?: SubSessionDesktopDockSide;
+  onDesktopDockSideChange?: (side: SubSessionDesktopDockSide) => void;
+  verticalRailHost?: HTMLElement | null;
+  teamDiscussionLayout?: TeamDiscussionLayout;
+  onTeamDiscussionLayoutChange?: (layout: TeamDiscussionLayout) => void;
+  teamDiscussionRailHost?: HTMLElement | null;
   idleFlashTokens?: Map<string, number>;
   sharedSubSessionStates?: ReadonlyMap<string, SharedStateSummary>;
   onOpen: (id: string) => void;
@@ -144,9 +187,11 @@ interface Props {
   onStopDiscussion?: (id: string) => void;
   ws: WsClient | null;
   connected: boolean;
-  onDiff: (sessionName: string, apply: (d: TerminalDiff) => void) => void;
+  onDiff: (sessionName: string, apply: (d: TerminalDiff) => void) => void | (() => void);
   onHistory: (sessionName: string, apply: (c: string) => void) => void;
   serverId?: string;
+  /** Main-session identity used to isolate the temporary quick-collapse stash. */
+  quickClosePersistenceScope?: string;
   /** Per-sub-session usage data (ctx tokens, model) collected from timeline events. */
   subUsages?: Map<string, { inputTokens: number; cacheTokens: number; contextWindow: number; contextWindowSource?: UsageContextWindowSource; model?: string }>;
   /** Last model detected from timeline/terminal events, keyed by sessionName. */
@@ -173,6 +218,7 @@ interface CardSize { w: number; h: number }
 
 const DEFAULT_SIZE: CardSize = { w: 350, h: 250 };
 export const SUBSESSION_BAR_COLLAPSED_STORAGE_KEY = 'rcc_subcard_collapsed';
+export const SUBSESSION_QUICK_CLOSED_STORAGE_KEY_PREFIX = 'rcc_subcard_quick_closed_v1:';
 const P2P_MOBILE_COMPACT_STORAGE_KEY = 'rcc_subcard_p2p_hidden';
 const P2P_DESKTOP_COMPACT_STORAGE_KEY = 'rcc_subcard_p2p_desktop_compact';
 const EXPANDED_PREVIEW_INITIAL_COUNT = 2;
@@ -191,18 +237,17 @@ function save(key: string, value: unknown) {
   try { localStorage.setItem(key, JSON.stringify(value)); } catch { /* ignore */ }
 }
 
-function formatUptime(seconds: number): string {
-  const d = Math.floor(seconds / 86400);
-  const h = Math.floor((seconds % 86400) / 3600);
-  return d > 0 ? `${d}d ${h}h` : `${h}h`;
+export function subSessionQuickClosedStorageKey(
+  serverId: string | undefined,
+  scope: string | undefined,
+): string {
+  return `${SUBSESSION_QUICK_CLOSED_STORAGE_KEY_PREFIX}${encodeURIComponent(serverId?.trim() || 'local')}:${encodeURIComponent(scope?.trim() || 'global')}`;
 }
 
-function formatMemoryPair(usedBytes: number, totalBytes: number): string {
-  const totalGb = totalBytes / (1024 ** 3);
-  if (totalGb >= 1) {
-    return `${(usedBytes / (1024 ** 3)).toFixed(1)} / ${totalGb.toFixed(1)} GB`;
-  }
-  return `${(usedBytes / (1024 ** 2)).toFixed(0)} / ${(totalBytes / (1024 ** 2)).toFixed(0)} MB`;
+function loadQuickClosedIds(key: string): string[] {
+  const stored = load<unknown>(key, []);
+  if (!Array.isArray(stored)) return [];
+  return [...new Set(stored.filter((value): value is string => typeof value === 'string' && value.trim().length > 0))];
 }
 
 /** Format a used/total byte pair in a shared GB or TB unit — never smaller
@@ -309,7 +354,7 @@ function renderTechClock(text: string): JSX.Element {
   );
 }
 
-function CollapsedSubSessionButton({ sub, accentColor, isOpen, isFocused, idleFlashToken, usage, sharedState, inP2p, draggable, onEntryPointerDown, onEntryTouchStart, onEntryClick, onEntryDoubleClick, onEntryDragStart, onEntryDragOver, onEntryDragEnd, t, detectedModel }: CollapsedSubSessionButtonProps) {
+function CollapsedSubSessionButtonImpl({ sub, accentColor, isOpen, isFocused, idleFlashToken, usage, sharedState, inP2p, draggable, onEntryPointerDown, onEntryTouchStart, onEntryClick, onEntryDoubleClick, onEntryDragStart, onEntryDragOver, onEntryDragEnd, t, detectedModel, orientation = 'horizontal' }: CollapsedSubSessionButtonProps) {
   const activeIdleFlashToken = useIdleFlashPlayback(idleFlashToken);
   const agentTag = sub.type === 'shell' ? (sub.shellBin?.split(/[/\\]/).pop() ?? 'shell') : sub.type;
   const label = sub.label ? `${formatLabel(sub.label)} · ${agentTag}` : agentTag;
@@ -331,7 +376,7 @@ function CollapsedSubSessionButton({ sub, accentColor, isOpen, isFocused, idleFl
     <button
       key={sub.id}
       data-sub-id={sub.id}
-      class={`subsession-card${isOpen ? ' open' : ''}${isFocused ? ' focused' : ''} mobile${isVisuallyBusy(sub.state, false) ? ' subcard-running-pulse' : ''}`}
+      class={`subsession-card${orientation === 'vertical' ? ' subsession-card-rail' : ''}${isOpen ? ' open' : ''}${isFocused ? ' focused' : ''} mobile${isVisuallyBusy(sub.state, false) ? ' subcard-running-pulse' : ''}`}
       draggable={draggable}
       onPointerDown={(event) => onEntryPointerDown(sub.id, event)}
       onTouchStart={() => onEntryTouchStart(sub.id)}
@@ -350,6 +395,10 @@ function CollapsedSubSessionButton({ sub, accentColor, isOpen, isFocused, idleFl
       <SharedStateIndicator state={sharedState} iconOnly />
       {model && <span class="subsession-card-model">{model}</span>}
       {sub.ccPresetId && <span class="subsession-card-custom-api" title={`Custom API: ${sub.ccPresetId}`}>◉</span>}
+      {/* tsk_5zv: a static running mark so the running state never depends on the
+          bottom marquee alone - it survives prefers-reduced-motion and reads at a
+          glance next to idle/starting. */}
+      {isVisuallyBusy(sub.state, false) && <span class="subcard-running" aria-hidden="true">●</span>}
       {sub.state === 'starting' && <span class="subsession-card-badge">…</span>}
       {ctxPct > 0 && (
         <span class="subsession-card-ctx" style={{ width: '100%' }}>
@@ -359,6 +408,43 @@ function CollapsedSubSessionButton({ sub, accentColor, isOpen, isFocused, idleFl
     </button>
   );
 }
+
+function sameCollapsedSub(a: SubSession, b: SubSession): boolean {
+  return a.sessionName === b.sessionName
+    && a.id === b.id
+    && a.type === b.type
+    && a.state === b.state
+    && a.label === b.label
+    && a.runtimeType === b.runtimeType
+    && a.activeModel === b.activeModel
+    && a.requestedModel === b.requestedModel
+    && a.modelDisplay === b.modelDisplay;
+}
+
+const CollapsedSubSessionButton = memo(CollapsedSubSessionButtonImpl, (prev, next) => (
+  sameCollapsedSub(prev.sub, next.sub)
+  && prev.accentColor === next.accentColor
+  && prev.isOpen === next.isOpen
+  && prev.isFocused === next.isFocused
+  && prev.idleFlashToken === next.idleFlashToken
+  && prev.usage?.inputTokens === next.usage?.inputTokens
+  && prev.usage?.cacheTokens === next.usage?.cacheTokens
+  && prev.usage?.contextWindow === next.usage?.contextWindow
+  && prev.usage?.model === next.usage?.model
+  && prev.sharedState === next.sharedState
+  && prev.inP2p === next.inP2p
+  && prev.draggable === next.draggable
+  && prev.onEntryPointerDown === next.onEntryPointerDown
+  && prev.onEntryTouchStart === next.onEntryTouchStart
+  && prev.onEntryClick === next.onEntryClick
+  && prev.onEntryDoubleClick === next.onEntryDoubleClick
+  && prev.onEntryDragStart === next.onEntryDragStart
+  && prev.onEntryDragOver === next.onEntryDragOver
+  && prev.onEntryDragEnd === next.onEntryDragEnd
+  && prev.t === next.t
+  && prev.detectedModel === next.detectedModel
+  && prev.orientation === next.orientation
+));
 
 function ExpandedSubSessionPlaceholder({ sub, accentColor, cardSize, sharedState, inP2p, t }: { sub: SubSession; accentColor: string; cardSize: CardSize; sharedState?: SharedStateSummary | null; inP2p: boolean; t: (key: string, vars?: Record<string, unknown>) => string }) {
   const agentTag = sub.type === 'shell' ? (sub.shellBin?.split(/[/\\]/).pop() ?? 'shell') : sub.type;
@@ -542,7 +628,7 @@ function DaemonStatsModal({
         <div class="daemon-details-grid">
           <div class="daemon-details-card daemon-details-card-cpu">
             <span>{t('subsessionBar.daemon_details_cpu')}</span>
-            <strong>{stats.cpu}%</strong>
+            <strong>{formatCpuPercent(stats.cpu)}</strong>
           </div>
           <div class="daemon-details-card daemon-details-card-memory">
             <span>{t('subsessionBar.daemon_details_memory')}</span>
@@ -550,7 +636,7 @@ function DaemonStatsModal({
           </div>
           <div class="daemon-details-card daemon-details-card-load">
             <span>{t('subsessionBar.daemon_details_load')}</span>
-            <strong>{stats.load1} / {stats.load5} / {stats.load15}</strong>
+            <strong>{formatLoadTriple(stats.load1, stats.load5, stats.load15)}</strong>
           </div>
           <div class="daemon-details-card daemon-details-card-uptime">
             <span>{t('subsessionBar.daemon_details_uptime')}</span>
@@ -678,9 +764,13 @@ function DaemonStatsModal({
   );
 }
 
-export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayoutCapable = true, idleFlashTokens, sharedSubSessionStates, onOpen, onFocus, onClose, onCloseAllOpen, onRestoreQuickClosed, onOpenMaximized, onMaximize, onRestore, onRestoreThenClose, onRestart, onNew, onViewAutoDeliver, onViewDiscussions, onViewDiscussion, onViewRepo, onViewCron, openSpecAutoProjection, openSpecAutoStopPending = false, openSpecAutoCompact = false, onOpenSpecAutoView, onOpenSpecAutoStop, onOpenSpecAutoToggleCompact, onOpenSpecAutoHide, discussions = [], totalRunningDiscussions = 0, onStopDiscussion, ws, connected, onDiff, onHistory, serverId, subUsages, detectedModels, focusedSubId, collapsed: controlledCollapsed, onCollapsedChange, onVisualOrderChange, quickData, sessions, allSubSessions, p2pSessionLabels, onSubTransportConfigSaved }: Props) {
+export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayoutCapable = true, desktopLayout = SUBSESSION_DESKTOP_LAYOUT.HORIZONTAL, onDesktopLayoutChange, desktopDockSide = SUBSESSION_DESKTOP_DOCK_SIDE.RIGHT, onDesktopDockSideChange, verticalRailHost, teamDiscussionLayout = TEAM_DISCUSSION_LAYOUT.BOTTOM, onTeamDiscussionLayoutChange, teamDiscussionRailHost, idleFlashTokens, sharedSubSessionStates, onOpen, onFocus, onClose, onCloseAllOpen, onRestoreQuickClosed, onOpenMaximized, onMaximize, onRestore, onRestoreThenClose, onRestart, onNew, onViewAutoDeliver, onViewDiscussions, onViewDiscussion, onViewRepo, onViewCron, openSpecAutoProjection, openSpecAutoStopPending = false, openSpecAutoCompact = false, onOpenSpecAutoView, onOpenSpecAutoStop, onOpenSpecAutoToggleCompact, onOpenSpecAutoHide, discussions = [], totalRunningDiscussions = 0, onStopDiscussion, ws, connected, onDiff, onHistory, serverId, quickClosePersistenceScope, subUsages, detectedModels, focusedSubId, collapsed: controlledCollapsed, onCollapsedChange, onVisualOrderChange, quickData, sessions, allSubSessions, p2pSessionLabels, onSubTransportConfigSaved }: Props) {
+  recordPerfRender('SubSessionBar');
   const { t } = useTranslation();
   const isMobile = !desktopLayoutCapable;
+  const isVerticalRail = desktopLayoutCapable && desktopLayout === SUBSESSION_DESKTOP_LAYOUT.VERTICAL;
+  const isTeamDiscussionRail = desktopLayoutCapable
+    && teamDiscussionLayout === TEAM_DISCUSSION_LAYOUT.RIGHT;
   const [layout, setLayout] = useState<Layout>(() => load('rcc_subcard_layout', 'single'));
   const [internalCollapsed, setInternalCollapsed] = useState(() => load(SUBSESSION_BAR_COLLAPSED_STORAGE_KEY, !desktopLayoutCapable));
   const collapsed = controlledCollapsed ?? internalCollapsed;
@@ -691,10 +781,31 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
   const [draftW, setDraftW] = useState(String(cardSize.w));
   const [draftH, setDraftH] = useState(String(cardSize.h));
   const [stats, setStats] = useState<DaemonStats | null>(null);
+  const [directFileConnectionStatus, setDirectFileConnectionStatus] = useState<DirectFileConnectionStatus>(DIRECT_FILE_CONNECTION_STATUS.NONE);
   const [showDaemonDetails, setShowDaemonDetails] = useState(false);
   const localClockNow = useNowTicker(!!stats && (desktopLayoutCapable || showDaemonDetails));
   const localClockText = useMemo(() => formatLocalDateTime(localClockNow), [localClockNow]);
-  const [quickClosedIds, setQuickClosedIds] = useState<string[]>([]);
+  const quickClosedStorageKey = useMemo(
+    () => subSessionQuickClosedStorageKey(serverId, quickClosePersistenceScope),
+    [quickClosePersistenceScope, serverId],
+  );
+  const [quickClosedState, setQuickClosedState] = useState(() => ({
+    storageKey: quickClosedStorageKey,
+    ids: loadQuickClosedIds(quickClosedStorageKey),
+  }));
+  const quickClosedIds = quickClosedState.storageKey === quickClosedStorageKey
+    ? quickClosedState.ids
+    : loadQuickClosedIds(quickClosedStorageKey);
+  const setQuickClosedIds = useCallback((ids: string[]) => {
+    const normalized = [...new Set(ids.filter((id) => id.trim().length > 0))];
+    save(quickClosedStorageKey, normalized);
+    setQuickClosedState({ storageKey: quickClosedStorageKey, ids: normalized });
+  }, [quickClosedStorageKey]);
+  useEffect(() => {
+    setQuickClosedState((current) => current.storageKey === quickClosedStorageKey
+      ? current
+      : { storageKey: quickClosedStorageKey, ids: loadQuickClosedIds(quickClosedStorageKey) });
+  }, [quickClosedStorageKey]);
   // DB sort_order is the authority — subSessions arrive pre-sorted from server.
   // Local dragOrder only tracks in-session drag reorder (synced back to DB via reorderSubSessions).
   const [dragOrder, setDragOrder] = useState<string[] | null>(null);
@@ -878,9 +989,13 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
     const sessionMap = new Map(subSessions.map((s) => [s.id, s]));
     return dragOrder.map((id) => sessionMap.get(id)).filter(Boolean) as SubSession[];
   }, [subSessions, dragOrder]);
-  const accentColorsById = useMemo(() => getSubSessionAccentColorMap(orderedSessions), [orderedSessions]);
   const orderedSessionIds = useMemo(() => orderedSessions.map((sub) => sub.id), [orderedSessions]);
   const orderedSessionIdsKey = orderedSessionIds.join(',');
+  // Status/state frames replace the SubSession objects while preserving the
+  // same ordered ids. Accent assignment is structural, so do not recompute it
+  // for every metadata update (the per-card components receive the latest
+  // object separately).
+  const accentColorsById = useMemo(() => getSubSessionAccentColorMap(orderedSessions), [orderedSessionIdsKey]);
   const orderedSessionsRef = useRef(orderedSessions);
   orderedSessionsRef.current = orderedSessions;
   const dragOrderRef = useRef(dragOrder);
@@ -892,11 +1007,11 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
     : EXPANDED_PREVIEW_INITIAL_COUNT;
   const hydratedExpandedPreviewIds = useMemo(
     () => new Set(orderedSessions.slice(0, currentExpandedPreviewBudget).map((sub) => sub.id)),
-    [currentExpandedPreviewBudget, orderedSessions],
+    [currentExpandedPreviewBudget, orderedSessionIdsKey],
   );
   const openSubWindowCount = useMemo(
-    () => orderedSessions.filter((sub) => openIds.has(sub.id)).length,
-    [openIds, orderedSessions],
+    () => orderedSessionIds.filter((id) => openIds.has(id)).length,
+    [openIds, orderedSessionIdsKey],
   );
   const restorableQuickClosedIds = useMemo(() => {
     if (quickClosedIds.length === 0) return [];
@@ -934,7 +1049,7 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
       setQuickClosedIds([]);
       onRestoreQuickClosed(restoreIds);
     }
-  }, [onCloseAllOpen, onRestoreQuickClosed, restorableQuickClosedIds]);
+  }, [onCloseAllOpen, onRestoreQuickClosed, restorableQuickClosedIds, setQuickClosedIds]);
 
   const moveSubSessionInDragOrder = useCallback((draggedId: string, overId: string) => {
     if (draggedId === overId) return;
@@ -1139,7 +1254,7 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
       el.removeEventListener('touchcancel', onCancel);
       el.removeEventListener('contextmenu', onContext);
     };
-  }, [collapsed, getEntryGestureController, moveSubSessionInDragOrder, syncOrderToServer]);
+  }, [collapsed, getEntryGestureController, isVerticalRail, moveSubSessionInDragOrder, syncOrderToServer]);
 
   useEffect(() => {
     const installHorizontalEdgeGuard = (el: HTMLDivElement | null) => {
@@ -1186,34 +1301,57 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
       cleanupCollapsed();
       cleanupExpanded();
     };
-  }, [collapsed, layout, orderedSessions.length]);
+  }, [collapsed, isVerticalRail, layout, orderedSessions.length]);
 
   useEffect(() => {
+    // Another server (or socket) never inherits this one's disks, embedding,
+    // handle alert or direct status; the first frame of the new one fills in.
+    setStats(null);
     if (!ws) return;
     return ws.onMessage((msg) => {
-      if (msg.type === 'daemon.stats') {
-        setStats({
-          daemonVersion: msg.daemonVersion,
-          cpu: msg.cpu,
-          memUsed: msg.memUsed,
-          memTotal: msg.memTotal,
-          load1: msg.load1,
-          load5: msg.load5,
-          load15: msg.load15,
-          uptime: msg.uptime,
-          // Older daemons don't ship `embedding`; preserve null so the
-          // icon falls through to its "unknown" rendering instead of
-          // showing a misleading "ready".
-          embedding: msg.embedding ?? null,
-          // Older daemons don't ship `disks`; null means "no data" so the
-          // desktop strip simply hides the readout (and mobile never shows it).
-          disks: msg.disks ?? null,
-          shortRefHealth: msg.shortRefHealth ?? null,
-          directConnectivity: msg.directConnectivity ?? null,
-        });
+      // Frames fold into the last snapshot (see mergeDaemonStats): a partial or
+      // liveness-only frame must never blank the card or turn a number into NaN.
+      if (msg.type === DAEMON_STATS_MSG) {
+        setStats((prev) => mergeDaemonStats<DaemonStats>(prev, msg as unknown as Record<string, unknown>));
+      } else if (msg.type === DAEMON_LIVENESS_MSG) {
+        setStats((prev) => mergeDaemonLiveness<DaemonStats>(prev, msg as unknown as Record<string, unknown>));
       }
     });
   }, [ws]);
+
+  useEffect(() => {
+    setStats(null);
+  }, [serverId]);
+
+  useEffect(() => {
+    if (!ws || !serverId || !connected) {
+      setDirectFileConnectionStatus(DIRECT_FILE_CONNECTION_STATUS.NONE);
+      return;
+    }
+    const unsubscribe = subscribeDirectFileConnectionStatus(ws, serverId, setDirectFileConnectionStatus);
+    const releasePrewarm = prewarmDirectFileLease(ws, serverId);
+    return () => {
+      releasePrewarm();
+      unsubscribe();
+    };
+  }, [connected, serverId, ws]);
+
+  const directFileConnectionLabel = t(
+    directFileConnectionStatus === DIRECT_FILE_CONNECTION_STATUS.DIRECT
+      ? 'subsessionBar.daemon_connection_direct'
+      : directFileConnectionStatus === DIRECT_FILE_CONNECTION_STATUS.RELAY
+        ? 'subsessionBar.daemon_connection_relay'
+        : 'subsessionBar.daemon_connection_none',
+  );
+  const directFileConnectionDot = (
+    <span
+      class={`daemon-connection-status daemon-connection-status-${directFileConnectionStatus}`}
+      data-testid="daemon-file-connection-status"
+      data-status={directFileConnectionStatus}
+      title={directFileConnectionLabel}
+      aria-label={directFileConnectionLabel}
+    />
+  );
 
   const toggleLayout = () => {
     const next: Layout = layout === 'single' ? 'double' : 'single';
@@ -1245,13 +1383,167 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
   const repoButtonLabel = t('repo.info_title', { defaultValue: t('subsessionBar.repository') });
   const cronButtonLabel = t('subsessionBar.scheduled_tasks');
 
+  const renderQuickSubWindowControl = () => showQuickSubWindowControl ? (
+    <button
+      type="button"
+      class={`subsession-close-all-strip${quickSubWindowIsRestore ? ' subsession-close-all-strip-restore' : ''}`}
+      title={quickSubWindowLabel}
+      aria-label={quickSubWindowLabel}
+      disabled={quickSubWindowDisabled}
+      onClick={handleQuickSubWindowControl}
+    >
+      <span class="subsession-close-all-arrow" aria-hidden="true">{quickSubWindowIsRestore ? '↑' : '↓'}</span>
+    </button>
+  ) : null;
+
+  const renderCompactSubSessionButtons = (orientation: 'horizontal' | 'vertical') => orderedSessions.map((sub) => (
+    <CollapsedSubSessionButton
+      key={sub.id}
+      sub={sub}
+      orientation={orientation}
+      accentColor={accentColorsById.get(sub.id) ?? DEFAULT_SUBSESSION_ACCENT_COLOR}
+      isOpen={openIds.has(sub.id)}
+      isFocused={isMobile ? openIds.has(sub.id) : focusedSubId === sub.id}
+      idleFlashToken={idleFlashTokens?.get(sub.sessionName) ?? 0}
+      usage={subUsages?.get(`deck_sub_${sub.id}`)}
+      detectedModel={detectedModels?.get(sub.sessionName)}
+      sharedState={sharedSubSessionStates?.get(sub.id) ?? sharedSubSessionStates?.get(sub.sessionName)}
+      inP2p={!!p2pSessionLabels?.has(sub.sessionName)}
+      draggable={desktopLayoutCapable}
+      onEntryPointerDown={handleEntryPointerDown}
+      onEntryTouchStart={handleEntryTouchStart}
+      onEntryClick={handleEntryClick}
+      onEntryDoubleClick={handleEntryDoubleClick}
+      onEntryDragStart={handleCollapsedEntryDragStart}
+      onEntryDragOver={handleCollapsedEntryDragOver}
+      onEntryDragEnd={handleCollapsedEntryDragEnd}
+      t={t}
+    />
+  ));
+
+  const verticalRail = isVerticalRail && verticalRailHost
+    ? createPortal(
+      <div class="subsession-vertical-rail" data-testid="subsession-vertical-rail">
+        <div class="subsession-vertical-rail-header">
+          <span class="subsession-vertical-rail-title">{t('subsessionBar.vertical_rail')}</span>
+          <span class="subsession-vertical-rail-count">{subSessions.length}</span>
+          <div class="subsession-vertical-rail-actions">
+            {onDesktopDockSideChange && (
+              <div
+                class="subsession-vertical-rail-dock-controls"
+                role="group"
+                aria-label={t('subsessionBar.dock_side')}
+              >
+                <button
+                  type="button"
+                  class="subsession-vertical-rail-dock-button"
+                  data-testid="subsession-vertical-rail-dock-left"
+                  aria-label={t('subsessionBar.dock_left')}
+                  title={t('subsessionBar.dock_left')}
+                  aria-pressed={desktopDockSide === SUBSESSION_DESKTOP_DOCK_SIDE.LEFT}
+                  onClick={() => onDesktopDockSideChange(SUBSESSION_DESKTOP_DOCK_SIDE.LEFT)}
+                >
+                  <span aria-hidden="true">←</span>
+                </button>
+                <button
+                  type="button"
+                  class="subsession-vertical-rail-dock-button"
+                  data-testid="subsession-vertical-rail-dock-right"
+                  aria-label={t('subsessionBar.dock_right')}
+                  title={t('subsessionBar.dock_right')}
+                  aria-pressed={desktopDockSide === SUBSESSION_DESKTOP_DOCK_SIDE.RIGHT}
+                  onClick={() => onDesktopDockSideChange(SUBSESSION_DESKTOP_DOCK_SIDE.RIGHT)}
+                >
+                  <span aria-hidden="true">→</span>
+                </button>
+              </div>
+            )}
+            {renderQuickSubWindowControl()}
+          </div>
+        </div>
+        <div
+          class="subsession-vertical-rail-scroll"
+          data-testid="subsession-vertical-rail-scroll"
+          ref={collapsedBarRef}
+        >
+          {renderCompactSubSessionButtons('vertical')}
+        </div>
+      </div>,
+      verticalRailHost,
+    )
+    : null;
+
+  const renderTeamDiscussionLayoutControls = () => onTeamDiscussionLayoutChange ? (
+    <div class="team-discussion-layout-controls" role="group" aria-label={t('subsessionBar.team_layout')}>
+      <button
+        type="button"
+        class="team-discussion-layout-button"
+        data-testid="team-discussion-layout-right"
+        aria-label={t('subsessionBar.team_dock_right')}
+        title={t('subsessionBar.team_dock_right')}
+        aria-pressed={teamDiscussionLayout === TEAM_DISCUSSION_LAYOUT.RIGHT}
+        onClick={() => onTeamDiscussionLayoutChange(TEAM_DISCUSSION_LAYOUT.RIGHT)}
+      >
+        <span aria-hidden="true">→</span>
+      </button>
+      <button
+        type="button"
+        class="team-discussion-layout-button"
+        data-testid="team-discussion-layout-bottom"
+        aria-label={t('subsessionBar.team_dock_bottom')}
+        title={t('subsessionBar.team_dock_bottom')}
+        aria-pressed={teamDiscussionLayout === TEAM_DISCUSSION_LAYOUT.BOTTOM}
+        onClick={() => onTeamDiscussionLayoutChange(TEAM_DISCUSSION_LAYOUT.BOTTOM)}
+      >
+        <span aria-hidden="true">↓</span>
+      </button>
+    </div>
+  ) : null;
+
+  const renderTeamDiscussionCards = (rail: boolean) => (
+    <div class={`discussion-panel${isMobile ? ' discussion-panel-mobile' : ''}${!isMobile && p2pDesktopCompact ? ' discussion-panel-desktop-compact' : ''}${rail ? ' discussion-panel-rail' : ''}`}>
+      {discussions.map((discussion) => (
+        <P2pProgressCard
+          key={discussion.id}
+          discussion={discussion}
+          compact={!isMobile && !p2pDesktopCompact && !rail}
+          mobile={isMobile}
+          ultraCompact={rail || (!isMobile && p2pDesktopCompact)}
+          hidden={isMobile && p2pHidden}
+          onToggleHide={isMobile ? () => setP2pHidden((value) => !value) : undefined}
+          onStopDiscussion={onStopDiscussion}
+          onClick={discussion.fileId && onViewDiscussion ? () => onViewDiscussion(discussion.fileId!) : undefined}
+        />
+      ))}
+    </div>
+  );
+
+  const teamDiscussionRail = isTeamDiscussionRail && teamDiscussionRailHost && discussions.length > 0
+    ? createPortal(
+      <div class="team-discussion-rail" data-testid="team-discussion-rail">
+        <div class="team-discussion-rail-header">
+          <span class="team-discussion-rail-title">{t('discussion.team_label')}</span>
+          <span class="team-discussion-rail-count">{discussions.length}</span>
+          {renderTeamDiscussionLayoutControls()}
+        </div>
+        <div class="team-discussion-rail-scroll" data-testid="team-discussion-rail-scroll">
+          {renderTeamDiscussionCards(true)}
+        </div>
+      </div>,
+      teamDiscussionRailHost,
+    )
+    : null;
+
   return (
-    <div class="subcard-bar">
+    <>
+    {verticalRail}
+    {teamDiscussionRail}
+    <div class={`subcard-bar${isVerticalRail ? ' subcard-bar-vertical-mode' : ''}`}>
       {/* Toolbar */}
       <div class="subcard-toolbar">
-        <button class="subcard-toolbar-btn" onClick={() => setCollapsed(!collapsed)} title={collapsed ? t('subsessionBar.show') : t('subsessionBar.hide')}>
+        {!isVerticalRail && <button class="subcard-toolbar-btn" onClick={() => setCollapsed(!collapsed)} title={collapsed ? t('subsessionBar.show') : t('subsessionBar.hide')}>
           {collapsed ? '▲' : '▼'}
-        </button>
+        </button>}
         {isMobile && discussions.length > 0 && (
           <button
             class={`subcard-toolbar-btn${p2pHidden ? ' subcard-toolbar-btn-active' : ''}`}
@@ -1276,27 +1568,44 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
         )}
         {!collapsed && (
           <>
-            <button class="subcard-toolbar-btn" onClick={toggleLayout} title={layout === 'single' ? t('subsessionBar.layout_double') : t('subsessionBar.layout_single')}>
+            {!isVerticalRail && <button class="subcard-toolbar-btn" onClick={toggleLayout} title={layout === 'single' ? t('subsessionBar.layout_double') : t('subsessionBar.layout_single')}>
               {layout === 'single' ? '⊞' : '☰'}
-            </button>
-            <button
+            </button>}
+            {!isVerticalRail && <button
               class={`subcard-toolbar-btn${showSizePanel ? ' subcard-toolbar-btn-active' : ''}`}
               onClick={() => { setShowSizePanel(!showSizePanel); setDraftW(String(cardSize.w)); setDraftH(String(cardSize.h)); }}
               title={t('subsessionBar.card_size')}
             >
               ⚙
-            </button>
-            <span class="subcard-toolbar-label">{t('subsessionBar.subs_count', { count: subSessions.length })}</span>
+            </button>}
+            {!isVerticalRail && <span class="subcard-toolbar-label">{t('subsessionBar.subs_count', { count: subSessions.length })}</span>}
+            {desktopLayoutCapable && onDesktopLayoutChange && (
+              <button
+                type="button"
+                class="subcard-toolbar-btn subsession-desktop-layout-toggle"
+                data-testid="subsession-desktop-layout-toggle"
+                data-layout={desktopLayout}
+                aria-pressed={isVerticalRail}
+                aria-label={isVerticalRail ? t('subsessionBar.switch_to_horizontal') : t('subsessionBar.switch_to_vertical')}
+                title={isVerticalRail ? t('subsessionBar.switch_to_horizontal') : t('subsessionBar.switch_to_vertical')}
+                onClick={() => onDesktopLayoutChange(
+                  isVerticalRail ? SUBSESSION_DESKTOP_LAYOUT.HORIZONTAL : SUBSESSION_DESKTOP_LAYOUT.VERTICAL,
+                )}
+              >
+                <span aria-hidden="true">{isVerticalRail ? '⇆' : '⇅'}</span>
+              </button>
+            )}
             {/* Desktop: full stats in expanded toolbar */}
             {stats && (
               <button
                 type="button"
                 class="daemon-stats-inline daemon-stats-inline-tech daemon-stats-trigger"
-                title={`${stats.daemonVersion ? `Daemon ${stats.daemonVersion} | ` : ''}Load: ${stats.load1} / ${stats.load5} / ${stats.load15} | Uptime: ${formatUptime(stats.uptime)}${desktopLayoutCapable ? ` | ${localClockText}` : ''}`}
+                title={`${stats.daemonVersion ? `Daemon ${stats.daemonVersion} | ` : ''}Load: ${formatLoadTriple(stats.load1, stats.load5, stats.load15)} | Uptime: ${formatUptime(stats.uptime)}${desktopLayoutCapable ? ` | ${localClockText}` : ''}`}
                 onClick={() => setShowDaemonDetails(true)}
                 aria-haspopup="dialog"
                 aria-label={t('subsessionBar.daemon_details_open')}
               >
+                {directFileConnectionDot}
                 {stats.daemonVersion && (
                   <>
                     {/* Display the short form (strips trailing -dev.NNN counter); the
@@ -1311,16 +1620,16 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
                     <span class="daemon-stat-sep"> · </span>
                   </>
                 )}
-                <span class={`daemon-stat-cpu${stats.cpu > 80 ? ' danger' : stats.cpu > 50 ? ' warn' : ''}`}>
-                  CPU {stats.cpu}%
+                <span class={`daemon-stat-cpu${cpuClass(stats.cpu)}`}>
+                  CPU {formatCpuPercent(stats.cpu)}
                 </span>
                 <span class="daemon-stat-sep"> · </span>
                 <span class="daemon-stat-mem">
-                  Mem {(() => { const gb = stats.memUsed / (1024 ** 3); return gb >= 1 ? `${gb.toFixed(1)}G` : `${(stats.memUsed / (1024 ** 2)).toFixed(0)}M`; })()}
+                  Mem {formatMemoryCompact(stats.memUsed)}
                 </span>
                 <span class="daemon-stat-sep"> · </span>
                 <span class="daemon-stat-load">
-                  Load {stats.load1}
+                  Load {formatStatNumber(stats.load1)}
                 </span>
                 {desktopLayoutCapable && stats.disks && stats.disks.length > 0 && (
                   <>
@@ -1350,24 +1659,42 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
             )}
           </>
         )}
+        {collapsed && desktopLayoutCapable && onDesktopLayoutChange && (
+          <button
+            type="button"
+            class="subcard-toolbar-btn subsession-desktop-layout-toggle"
+            data-testid="subsession-desktop-layout-toggle"
+            data-layout={desktopLayout}
+            aria-pressed={isVerticalRail}
+            aria-label={isVerticalRail ? t('subsessionBar.switch_to_horizontal') : t('subsessionBar.switch_to_vertical')}
+            title={isVerticalRail ? t('subsessionBar.switch_to_horizontal') : t('subsessionBar.switch_to_vertical')}
+            onClick={() => onDesktopLayoutChange(
+              isVerticalRail ? SUBSESSION_DESKTOP_LAYOUT.HORIZONTAL : SUBSESSION_DESKTOP_LAYOUT.VERTICAL,
+            )}
+          >
+            <span aria-hidden="true">{isVerticalRail ? '⇆' : '⇅'}</span>
+          </button>
+        )}
         {/* Collapsed toolbar: compact stats strip. */}
         {collapsed && stats && (() => {
-          const totalGb = stats.memTotal / (1024 ** 3);
+          const totalGb = (stats.memTotal ?? 0) / (1024 ** 3);
           const useG = totalGb >= 1;
           const div = useG ? 1024 ** 3 : 1024 ** 2;
           const unit = useG ? 'G' : 'M';
-          const memUsed = (stats.memUsed / div).toFixed(1);
-          const memTotal = useG ? totalGb.toFixed(1) : (stats.memTotal / div).toFixed(0);
+          const memKnown = isFiniteStat(stats.memUsed) && isFiniteStat(stats.memTotal);
+          const memUsed = memKnown ? ((stats.memUsed ?? 0) / div).toFixed(1) : DAEMON_STAT_PLACEHOLDER;
+          const memTotal = memKnown ? (useG ? totalGb.toFixed(1) : ((stats.memTotal ?? 0) / div).toFixed(0)) : DAEMON_STAT_PLACEHOLDER;
           const ei = { fontSize: '0.65em', verticalAlign: 'middle' } as const;
           return (
             <button
               type="button"
               class={`daemon-stats-inline daemon-stats-inline-tech daemon-stats-compact daemon-stats-trigger${desktopLayoutCapable ? '' : ' daemon-stats-mobile'}`}
-              title={`${stats.daemonVersion ? `v${stats.daemonVersion} | ` : ''}CPU ${stats.cpu}% | Mem ${memUsed}/${memTotal}${unit} | Load: ${stats.load1} / ${stats.load5} / ${stats.load15} | Uptime: ${formatUptime(stats.uptime)}${desktopLayoutCapable ? ` | ${localClockText}` : ''}`}
+              title={`${stats.daemonVersion ? `v${stats.daemonVersion} | ` : ''}CPU ${formatCpuPercent(stats.cpu)} | Mem ${memUsed}/${memTotal}${memKnown ? unit : ''} | Load: ${formatLoadTriple(stats.load1, stats.load5, stats.load15)} | Uptime: ${formatUptime(stats.uptime)}${desktopLayoutCapable ? ` | ${localClockText}` : ''}`}
               onClick={() => setShowDaemonDetails(true)}
               aria-haspopup="dialog"
               aria-label={t('subsessionBar.daemon_details_open')}
             >
+              {directFileConnectionDot}
               {/* Mobile-narrow stat strip — show short version; full string in title above. */}
               {stats.daemonVersion && (desktopLayoutCapable ? (
                 <span class="daemon-stat-version">v{formatDaemonVersionShort(stats.daemonVersion)} </span>
@@ -1376,11 +1703,11 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
                   {formatDaemonVersionMobile(stats.daemonVersion)}
                 </span>
               ))}
-              <span class={`daemon-stat-cpu${stats.cpu > 80 ? ' danger' : stats.cpu > 50 ? ' warn' : ''}`}><span style={ei}>⚙️</span>{stats.cpu}%</span>
+              <span class={`daemon-stat-cpu${cpuClass(stats.cpu)}`}><span style={ei}>⚙️</span>{isFiniteStat(stats.cpu) ? `${stats.cpu}%` : DAEMON_STAT_PLACEHOLDER}</span>
               {' '}
-              <span class="daemon-stat-mem"><span style={ei}>🧠</span>{memUsed}/{memTotal}{unit}</span>
+              <span class="daemon-stat-mem"><span style={ei}>🧠</span>{memUsed}/{memTotal}{memKnown ? unit : ''}</span>
               {' '}
-              <span class="daemon-stat-load">≡{Number(stats.load1).toFixed(1)}</span>
+              <span class="daemon-stat-load">≡{formatStatNumber(stats.load1, 1)}</span>
               {' '}
               {desktopLayoutCapable && stats.disks && stats.disks.length > 0 && (
                 <>{renderDiskStats(stats.disks)}{' '}</>
@@ -1507,7 +1834,7 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
       </div>
 
       {/* Size settings panel */}
-      {!collapsed && showSizePanel && (
+      {!isVerticalRail && !collapsed && showSizePanel && (
         <div class="subcard-size-panel">
           <span class="subcard-size-label">{t('subsessionBar.card_size')}</span>
           <label class="subcard-size-field">
@@ -1559,86 +1886,27 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
       )}
 
       {/* Discussions panel — above sub-session buttons */}
-      {discussions.length > 0 && (
-        <div class={`discussion-panel${isMobile ? ' discussion-panel-mobile' : ''}${!isMobile && p2pDesktopCompact ? ' discussion-panel-desktop-compact' : ''}`}>
-          {discussions.map((d) => (
-            <P2pProgressCard
-              key={d.id}
-              discussion={d}
-              compact={!isMobile && !p2pDesktopCompact}
-              mobile={isMobile}
-              ultraCompact={!isMobile && p2pDesktopCompact}
-              hidden={isMobile && p2pHidden}
-              onToggleHide={isMobile ? () => setP2pHidden((v) => !v) : undefined}
-              onStopDiscussion={onStopDiscussion}
-              onClick={d.fileId && onViewDiscussion ? () => onViewDiscussion(d.fileId!) : undefined}
-            />
-          ))}
+      {discussions.length > 0 && !isTeamDiscussionRail && (
+        <div class="team-discussion-bottom" data-testid="team-discussion-bottom">
+          {!isMobile && renderTeamDiscussionLayoutControls()}
+          {renderTeamDiscussionCards(false)}
         </div>
       )}
 
       {/* Collapsed: compact buttons (all platforms) — drag on desktop, long-press on touch */}
-      {collapsed && subSessions.length > 0 && (
+      {!isVerticalRail && collapsed && subSessions.length > 0 && (
         <div class="subsession-row-with-close">
-          {showQuickSubWindowControl && (
-            <button
-              type="button"
-              class={`subsession-close-all-strip${quickSubWindowIsRestore ? ' subsession-close-all-strip-restore' : ''}`}
-              title={quickSubWindowLabel}
-              aria-label={quickSubWindowLabel}
-              disabled={quickSubWindowDisabled}
-              onClick={handleQuickSubWindowControl}
-            >
-              <span class="subsession-close-all-arrow" aria-hidden="true">{quickSubWindowIsRestore ? '↑' : '↓'}</span>
-            </button>
-          )}
+          {renderQuickSubWindowControl()}
           <div class="subsession-bar" style={{ borderTop: 'none' }} ref={collapsedBarRef}>
-            {orderedSessions.map((sub) => (
-              <CollapsedSubSessionButton
-                key={sub.id}
-                sub={sub}
-                accentColor={accentColorsById.get(sub.id) ?? DEFAULT_SUBSESSION_ACCENT_COLOR}
-                isOpen={openIds.has(sub.id)}
-                // Desktop: focusedSubId marks the single active card. Mobile only
-                // ever opens ONE sub-session, so that open card IS the active one
-                // (focusedSubId is null on mobile) — treat open as active there so
-                // it gets the SOLID bottom accent, not the dashed open-only one.
-                isFocused={isMobile ? openIds.has(sub.id) : focusedSubId === sub.id}
-                idleFlashToken={idleFlashTokens?.get(sub.sessionName) ?? 0}
-                usage={subUsages?.get(`deck_sub_${sub.id}`)}
-                detectedModel={detectedModels?.get(sub.sessionName)}
-                sharedState={sharedSubSessionStates?.get(sub.id) ?? sharedSubSessionStates?.get(sub.sessionName)}
-                inP2p={!!p2pSessionLabels?.has(sub.sessionName)}
-                draggable={desktopLayoutCapable}
-                onEntryPointerDown={handleEntryPointerDown}
-                onEntryTouchStart={handleEntryTouchStart}
-                onEntryClick={handleEntryClick}
-                onEntryDoubleClick={handleEntryDoubleClick}
-                onEntryDragStart={handleCollapsedEntryDragStart}
-                onEntryDragOver={handleCollapsedEntryDragOver}
-                onEntryDragEnd={handleCollapsedEntryDragEnd}
-                t={t}
-              />
-            ))}
+            {renderCompactSubSessionButtons('horizontal')}
           </div>
         </div>
       )}
 
       {/* Expanded: preview cards (all platforms) */}
-      {!collapsed && orderedSessions.length > 0 && (
+      {!isVerticalRail && !collapsed && orderedSessions.length > 0 && (
         <div class="subsession-row-with-close">
-          {showQuickSubWindowControl && (
-            <button
-              type="button"
-              class={`subsession-close-all-strip${quickSubWindowIsRestore ? ' subsession-close-all-strip-restore' : ''}`}
-              title={quickSubWindowLabel}
-              aria-label={quickSubWindowLabel}
-              disabled={quickSubWindowDisabled}
-              onClick={handleQuickSubWindowControl}
-            >
-              <span class="subsession-close-all-arrow" aria-hidden="true">{quickSubWindowIsRestore ? '↑' : '↓'}</span>
-            </button>
-          )}
+          {renderQuickSubWindowControl()}
           <div
             ref={expandedScrollRef}
             class={`subcard-scroll ${layout === 'double' ? 'subcard-double' : 'subcard-single'}`}
@@ -1737,5 +2005,6 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
         />
       )}
     </div>
+    </>
   );
 }

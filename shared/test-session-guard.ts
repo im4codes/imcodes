@@ -6,6 +6,18 @@ export interface TestSessionGuardInput {
   cwd?: string | null;
 }
 
+/**
+ * Processes launched by a test harness must use an isolated HOME. Keep this
+ * predicate in shared/ so daemon entry points and spawned helpers cannot drift
+ * into different definitions of "test process".
+ */
+export function isTestSessionGuardedEnvironment(env: NodeJS.ProcessEnv = process.env): boolean {
+  return (typeof env.VITEST === 'string' && env.VITEST.length > 0)
+    || env.NODE_ENV === 'test'
+    || env.IMCODES_TEST_MODE === '1'
+    || (typeof env.IMCODES_TEST_HOME === 'string' && env.IMCODES_TEST_HOME.length > 0);
+}
+
 const SESSION_NAME_PATTERNS: RegExp[] = [
   /^e2e_/i,
   /^deck_e2e/i,
@@ -30,6 +42,19 @@ const SESSION_NAME_PATTERNS: RegExp[] = [
   // strictly to the TEST prefix `deck_sub_(e2e_)?execclone_` so REAL production
   // clones (random `deck_sub_<hex>` ids from subSessionName) are NEVER matched.
   /^deck_sub_(?:e2e_)?execclone_[a-z0-9_-]+$/i,
+  // test/daemon/task-pairs/pairs-workspace.test.ts fixtures.
+  /^deck_wtproj_brain$/i,
+  /^deck_sub_wt(?:exec|aud)$/i,
+  // test/daemon/lifecycle-worker-session-sync.test.ts legacy fixtures.
+  /^deck_existing_(?:brain|w\d+)$/i,
+];
+
+/** Queue-only fixture names. Keep separate from isKnownTestSessionName: these
+ * names are also used by command-handler tests and must not suppress normal
+ * session launch/persistence behavior in an isolated in-memory store. */
+const TRANSPORT_QUEUE_FIXTURE_PATTERNS: RegExp[] = [
+  /^(?:s1|s2|s-snapshot|alpha|beta|b)$/i,
+  /^deck_(?:transport_brain|codex_expired_resend_brain)$/i,
 ];
 
 const PROJECT_NAME_PATTERNS: RegExp[] = [
@@ -47,6 +72,8 @@ const PROJECT_NAME_PATTERNS: RegExp[] = [
   /^imcodes-test-p2p-workflow[-_]/i,
   /^p2pworkflow[a-z0-9-]+$/i,
   /^e2e[-_]/i,
+  /^wtproj$/i,
+  /^existing$/i,
 ];
 
 const PROJECT_DIR_PATTERNS: RegExp[] = [
@@ -61,6 +88,7 @@ const PROJECT_DIR_PATTERNS: RegExp[] = [
   /[/\\]tmp[/\\].*imc_p2p_wf_test_/i,
   // Temporary cwd/project dirs used by execution-clone lifecycle TESTS.
   /[/\\]tmp[/\\].*execclone[-_]/i,
+  /[/\\]tmp[/\\]existing-project(?:[/\\]|$)/i,
 ];
 
 function normalize(value: string | null | undefined): string | undefined {
@@ -75,6 +103,10 @@ function matchesAny(value: string | undefined, patterns: readonly RegExp[]): boo
 
 export function isKnownTestSessionName(value: string | null | undefined): boolean {
   return matchesAny(normalize(value), SESSION_NAME_PATTERNS);
+}
+
+export function isTransportQueueFixtureSessionName(value: string | null | undefined): boolean {
+  return matchesAny(normalize(value), TRANSPORT_QUEUE_FIXTURE_PATTERNS);
 }
 
 export function isKnownTestProjectName(value: string | null | undefined): boolean {

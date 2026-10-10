@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
-import { readFileSync, existsSync } from 'node:fs';
+import { existsSync } from 'node:fs';
 import { resolve } from 'node:path';
+import { readSource } from '../helpers/read-source.js';
 
 // Static reverse-regression guard for the smart-p2p-upgrade change.
 //
@@ -22,7 +23,7 @@ interface FileText {
 
 function read(rel: string): FileText {
   const abs = resolve(ROOT, rel);
-  const text = readFileSync(abs, 'utf8');
+  const text = readSource(abs);
   return { path: rel, text, lines: text.split('\n') };
 }
 
@@ -2488,14 +2489,21 @@ describe('p2p-workflow reverse-regression', () => {
       'Upload completion must append to the original composer draft key so switching windows does not drop the attachment',
     ).toBe(true);
 
-    // (4) Badge renders the seq via testid.
+    // (4) Badge renders the seq via testid. The chip lives in its own component
+    // (it also owns the image preview), which SessionControls must render with
+    // the composer's per-attachment seq.
+    const badge = read('web/src/components/ComposerAttachmentBadge.tsx');
     expect(
-      /data-testid=\{`attachment-tag-\$\{a\.seq\}`\}/.test(file.text),
-      'Attachment badge must render data-testid="attachment-tag-${a.seq}"',
+      /data-testid=\{`attachment-tag-\$\{seq\}`\}/.test(badge.text),
+      'Attachment badge must render data-testid="attachment-tag-${seq}"',
     ).toBe(true);
     expect(
-      /#\{a\.seq\}/.test(file.text),
-      'Attachment badge text must include #${a.seq}',
+      /#\{seq\}/.test(badge.text),
+      'Attachment badge text must include #${seq}',
+    ).toBe(true);
+    expect(
+      /<ComposerAttachmentBadge[\s\S]{0,120}seq=\{a\.seq\}/.test(file.text),
+      'SessionControls must pass each attachment\'s seq to the badge',
     ).toBe(true);
 
     // (5) Text-prepend uses the #N:(full path) format (not the legacy
@@ -2816,7 +2824,8 @@ describe('p2p-workflow reverse-regression', () => {
       'P2P must dispatch transport prompts through a queue-aware helper',
     ).toBe(true);
     expect(
-      /const\s+result\s*=\s*transportRuntime\.send\(args\.prompt(,\s*commandId)?\)/.test(orchestrator.text)
+      // The prompt may carry send metadata (e.g. its system message origin) after the commandId.
+      /const\s+result\s*=\s*transportRuntime\.send\(args\.prompt(,\s*commandId\b[^;]*)?\);/.test(orchestrator.text)
         && /if\s*\(result\s*===\s*'queued'\)/.test(orchestrator.text),
       'P2P must inspect transportRuntime.send() and handle queued results explicitly',
     ).toBe(true);

@@ -1,11 +1,13 @@
 import { describe, expect, it, vi, beforeEach } from 'vitest';
 import {
   UPGRADE_LOCK_FILE,
+  assertWindowsLaunchIdentity,
   encodeCmdAsUtf8Bom,
   encodeVbsAsUtf16,
   encodeWindowsDaemonScheduledTaskXml,
   resolveWindowsDaemonTaskUserId,
   windowsDaemonScheduledTaskXml,
+  windowsDaemonTaskName,
   writeVbsLauncher,
   writeWatchdogCmd,
 } from '../../src/util/windows-launch-artifacts.js';
@@ -70,6 +72,33 @@ describe('writeWatchdogCmd', () => {
     vi.stubEnv('APPDATA', 'C:\\Users\\X\\AppData\\Roaming');
   });
 
+  it('derives scoped task names without changing the default registration', () => {
+    // The default account profile is explicit: on real Windows the product
+    // takes it from the account (userInfo), not from USERPROFILE.
+    vi.stubEnv('IMCODES_DEFAULT_HOME', 'C:\\Users\\X');
+    const base = {
+      nodeExe: 'node.exe', imcodesScript: 'imcodes.js',
+      watchdogPath: 'C:\\Users\\X\\.imcodes\\daemon-watchdog.cmd',
+      vbsPath: 'C:\\Users\\X\\.imcodes\\daemon-launcher.vbs', logPath: 'x',
+    };
+    expect(windowsDaemonTaskName(base)).toBe('imcodes-daemon');
+    expect(windowsDaemonTaskName({ ...base, watchdogPath: 'C:\\Temp\\scopeA\\.imcodes\\daemon-watchdog.cmd' }))
+      .toMatch(/^imcodes-daemon-[0-9a-f]{12}$/);
+  });
+
+  it('refuses a scoped process writing the default daemon artifacts', () => {
+    // The default account profile is explicit: on real Windows the product
+    // takes it from the account (userInfo), not from USERPROFILE.
+    vi.stubEnv('IMCODES_DEFAULT_HOME', 'C:\\Users\\X');
+    vi.stubEnv('IMCODES_HOME', 'C:\\Temp\\scopeA\\.imcodes');
+    const paths = {
+      nodeExe: 'node.exe', imcodesScript: 'imcodes.js',
+      watchdogPath: 'C:\\Users\\X\\.imcodes\\daemon-watchdog.cmd',
+      vbsPath: 'C:\\Users\\X\\.imcodes\\daemon-launcher.vbs', logPath: 'x',
+    };
+    expect(() => assertWindowsLaunchIdentity(paths)).toThrow('windows_scoped_instance_refuses_default_daemon_artifacts');
+  });
+
   it('generates watchdog with upgrade lock check', async () => {
     const paths = {
       nodeExe: 'C:\\Program Files\\nodejs\\node.exe',
@@ -90,13 +119,38 @@ describe('writeWatchdogCmd', () => {
     expect(lockCheck).toBeGreaterThan(-1);
     expect(launchCmd).toBeGreaterThan(lockCheck);
 
-    // Lock file path must be in the check (now via %USERPROFILE% expansion
-    // so cmd.exe handles non-ASCII usernames natively at runtime).
-    expect(cmd).toContain('%USERPROFILE%\\.imcodes\\upgrade.lock');
+    // Lock file path must be in the check, via %IMCODES_HOME%. The default
+    // install defines it from %USERPROFILE% (so cmd.exe handles non-ASCII
+    // usernames natively) BEFORE first use; otherwise it expands to empty
+    // and the lock/log paths point at the drive root.
+    expect(cmd).toContain('%IMCODES_HOME%\\upgrade.lock');
+    const homeDefinition = cmd.indexOf('set "IMCODES_HOME=%USERPROFILE%\\.imcodes"');
+    expect(homeDefinition).toBeGreaterThan(-1);
+    expect(homeDefinition).toBeLessThan(cmd.indexOf('%IMCODES_HOME%'));
 
     // When locked, should wait and loop back (not launch daemon)
     expect(cmd).toContain('Upgrade in progress, waiting');
     expect(cmd).toContain('goto loop');
+  });
+
+  it('bakes scoped HOME environment into the relaunch command', async () => {
+    // The default account profile is explicit: on real Windows the product
+    // takes it from the account (userInfo), not from USERPROFILE.
+    vi.stubEnv('IMCODES_DEFAULT_HOME', 'C:\\Users\\X');
+    vi.stubEnv('IMCODES_HOME', 'C:\\Temp\\scopeA\\.imcodes');
+    const paths = {
+      nodeExe: 'C:\\Program Files\\nodejs\\node.exe',
+      imcodesScript: 'C:\\scopeA-prefix\\node_modules\\imcodes\\dist\\src\\index.js',
+      watchdogPath: 'C:\\Temp\\scopeA\\.imcodes\\daemon-watchdog.cmd',
+      vbsPath: 'C:\\Temp\\scopeA\\.imcodes\\daemon-launcher.vbs',
+      logPath: 'C:\\Temp\\scopeA\\.imcodes\\watchdog.log',
+    };
+    await writeWatchdogCmd(paths);
+    const cmd = written[paths.watchdogPath];
+    expect(cmd).toContain('set "IMCODES_HOME=C:\\Temp\\scopeA\\.imcodes"');
+    expect(cmd).toContain('set "HOME=C:\\Temp\\scopeA"');
+    expect(cmd).toContain('set "IMCODES_DEFAULT_HOME=C:\\Users\\X"');
+    expect(cmd).not.toContain('set "USERPROFILE=');
   });
 
   it('emits the preflight self-heal line via the npm shim env-var form when the shim is installed', async () => {
@@ -130,7 +184,7 @@ describe('writeWatchdogCmd', () => {
     expect(cmd).not.toContain('C:\\Users\\X\\AppData\\Roaming\\npm\\imcodes-launch-preflight');
     // Preflight output must go to the watchdog log so operators can
     // see what self-repair did.
-    expect(cmd).toContain('imcodes-launch-preflight.cmd" >> "%USERPROFILE%\\.imcodes\\watchdog.log"');
+    expect(cmd).toContain('imcodes-launch-preflight.cmd" >> "%IMCODES_HOME%\\watchdog.log"');
     // Order: preflight line MUST come before the launch line each
     // iteration, otherwise we'd attempt a launch on a broken install
     // first.
@@ -209,8 +263,8 @@ describe('writeWatchdogCmd', () => {
     };
     await writeWatchdogCmd(paths);
     const cmd = written[paths.watchdogPath];
-    expect(cmd).toContain('%USERPROFILE%\\.imcodes\\upgrade.lock');
-    expect(cmd).toContain('%USERPROFILE%\\.imcodes\\watchdog.log');
+    expect(cmd).toContain('%IMCODES_HOME%\\upgrade.lock');
+    expect(cmd).toContain('%IMCODES_HOME%\\watchdog.log');
   });
 
   it('falls back to node+script when shim not found', async () => {
@@ -422,6 +476,24 @@ describe('writeVbsLauncher', () => {
     const vbs = written[paths.vbsPath];
     expect(vbs).toContain('On Error Resume Next');
   });
+
+  it('bakes scoped HOME into the Task Scheduler launcher', async () => {
+    // The default account profile is explicit: on real Windows the product
+    // takes it from the account (userInfo), not from USERPROFILE.
+    vi.stubEnv('IMCODES_DEFAULT_HOME', 'C:\\Users\\X');
+    vi.stubEnv('IMCODES_HOME', 'C:\\Temp\\scopeA\\.imcodes');
+    const paths = {
+      nodeExe: '', imcodesScript: '', logPath: '',
+      watchdogPath: 'C:\\Temp\\scopeA\\.imcodes\\daemon-watchdog.cmd',
+      vbsPath: 'C:\\Temp\\scopeA\\.imcodes\\daemon-launcher.vbs',
+    };
+    await writeVbsLauncher(paths);
+    const vbs = written[paths.vbsPath];
+    expect(vbs).toContain('("IMCODES_HOME") = "C:\\Temp\\scopeA\\.imcodes"');
+    expect(vbs).toContain('("HOME") = "C:\\Temp\\scopeA"');
+    expect(vbs).toContain('("IMCODES_DEFAULT_HOME") = "C:\\Users\\X"');
+    expect(vbs).not.toContain('("USERPROFILE") =');
+  });
 });
 
 describe('windowsDaemonScheduledTaskXml', () => {
@@ -557,7 +629,7 @@ describe('writeWatchdogCmd encoding (regression: cmd.exe BOM bug)', () => {
     // routed through %APPDATA% and %USERPROFILE%.
     expect(cmd).not.toContain('用户测试');
     expect(cmd).toContain('%APPDATA%\\npm\\imcodes.cmd');
-    expect(cmd).toContain('%USERPROFILE%\\.imcodes\\watchdog.log');
+    expect(cmd).toContain('%IMCODES_HOME%\\watchdog.log');
   });
 
   it('uses ABSOLUTE shim path when npm prefix differs from %APPDATA%\\npm (nvm/fnm/custom)', async () => {

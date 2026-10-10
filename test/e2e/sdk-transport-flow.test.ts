@@ -1,9 +1,18 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { cleanupIsolatedSharedContextDb, createIsolatedSharedContextDb } from '../util/shared-context-db.js';
+import { TRANSPORT_QUEUE_COMMANDS } from '../../shared/transport-queue-types.js';
+import { SHARE_BROWSER_COMMANDS } from '../../shared/tab-sharing.js';
 import { DAEMON_COMMAND_TYPES } from '../../shared/daemon-command-types.js';
 import { MEMORY_MCP_ENV_KEYS } from '../../shared/memory-mcp-env.js';
 import { IMCODES_MEMORY_MCP_SERVER_NAME } from '../../shared/memory-mcp-server-name.js';
+import {
+  IMCODES_MEMORY_MCP_LAUNCH_ARGS,
+  IMCODES_MEMORY_MCP_LAUNCH_COMMAND,
+} from '../../src/agent/providers/getDefaultMcpServers.js';
 import { writeProcessedProjection } from '../../src/store/context-store.js';
+import { timelineStore } from '../../src/daemon/timeline-store.js';
+import { getLocalSessionIdentityProfile, putLocalSessionIdentityProfile, removeLocalSessionIdentityProfileQuiet } from '../../src/daemon/session-identity-local-store.js';
+import { identityPromptHash } from '../../src/util/identity-prompt-hash.js';
 
 const SESSION_CC = `deck_ccsdk_${Math.random().toString(36).slice(2, 8)}_brain`;
 const SESSION_CX = `deck_cxsdk_${Math.random().toString(36).slice(2, 8)}_brain`;
@@ -21,13 +30,75 @@ async function waitForCondition(check: () => boolean, timeoutMs = 3000, interval
   throw new Error('Timed out waiting for condition');
 }
 
+/** Text the real Claude Agent SDK serializes as appendSystemPrompt at initialize. */
+function claudePresetAppend(options: Record<string, unknown> | undefined): string {
+  const systemPrompt = options?.systemPrompt;
+  if (!systemPrompt || typeof systemPrompt !== 'object' || Array.isArray(systemPrompt)) return '';
+  const candidate = systemPrompt as Record<string, unknown>;
+  return candidate.type === 'preset'
+    && candidate.preset === 'claude_code'
+    && typeof candidate.append === 'string'
+    ? candidate.append
+    : '';
+}
+
 const mocks = vi.hoisted(() => {
   const store = new Map<string, Record<string, any>>();
   const emitted: Array<{ session: string; type: string; payload: Record<string, any>; opts?: Record<string, any> }> = [];
-  const claudeCalls: Array<{ prompt: string; options: Record<string, unknown> }> = [];
+  const claudeCalls: Array<{ prompt: unknown; options: Record<string, unknown> }> = [];
   const codexCalls: Array<{ mode: 'start' | 'resume'; id: string | null; input: string; options: Record<string, unknown> }> = [];
-  return { store, emitted, claudeCalls, codexCalls };
+  return { store, emitted, claudeCalls, codexCalls,
+    protocolCalls: [] as Array<{ method: string; params?: Record<string, any> }>,
+    holdClaudeQuery: false,
+    holdClaudeForStop: false,
+    claudeInputs: [] as Array<Record<string, any>>,
+    claudeAppendCount: 2,
+    releaseClaudeQuery: undefined as (() => void) | undefined,
+    claudeInterrupts: 0,
+    holdCodexTurn: false,
+    acceptCodexTurn: undefined as (() => void) | undefined,
+    finishCodexTurn: undefined as (() => void) | undefined,
+    refuseSteer: false,
+    refuseSteerText: undefined as string | undefined,
+    holdSteerText: undefined as string | undefined,
+    holdSteer: false,
+    releaseSteer: undefined as (() => void) | undefined,
+  };
 });
+
+const presetRouteMocks = vi.hoisted(() => ({
+  qwen: vi.fn(async (_preset: string) => ({
+    env: {
+      ANTHROPIC_BASE_URL: 'https://api.minimax.io/anthropic',
+      ANTHROPIC_API_KEY: 'test-qwen-key',
+      ANTHROPIC_MODEL: 'MiniMax-M3',
+      OPENAI_BASE_URL: 'https://api.minimax.io/anthropic',
+      OPENAI_API_KEY: 'test-qwen-key',
+    },
+    settings: {
+      security: { auth: { selectedType: 'anthropic' } },
+      model: { name: 'MiniMax-M3' },
+    },
+    model: 'MiniMax-M3',
+    availableModels: ['MiniMax-M3'],
+  })),
+  dsh: vi.fn(async (_preset: string, model?: string) => ({
+    env: { ANTHROPIC_MODEL: model ?? 'MiniMax-M3' },
+    llm: {
+      provider: 'minimax', model: model ?? 'MiniMax-M3',
+      baseUrl: 'https://api.minimax.io/anthropic', apiKey: 'test-dsh-key',
+    },
+    model: model ?? 'MiniMax-M3',
+  })),
+  pi: vi.fn(async (_preset: string, model?: string) => ({
+    env: { ANTHROPIC_MODEL: model ?? 'MiniMax-M3' },
+    piLlm: {
+      provider: 'minimax', model: model ?? 'MiniMax-M3',
+      baseUrl: 'https://api.minimax.io/anthropic', apiKey: 'test-pi-key',
+    },
+    model: model ?? 'MiniMax-M3',
+  })),
+}));
 
 const PRESET_ENV = {
   ANTHROPIC_BASE_URL: 'https://api.minimax.io/anthropic',
@@ -56,8 +127,8 @@ function expectMemoryMcpEnv(
 ): void {
   const server = (serverConfig as Record<string, any> | undefined)?.[IMCODES_MEMORY_MCP_SERVER_NAME];
   expect(server).toMatchObject({
-    command: 'imcodes',
-    args: ['memory', 'mcp'],
+    command: IMCODES_MEMORY_MCP_LAUNCH_COMMAND,
+    args: [...IMCODES_MEMORY_MCP_LAUNCH_ARGS],
   });
   expect(server?.env).toMatchObject({
     [MEMORY_MCP_ENV_KEYS.SESSION_NAME]: expected.sessionName,
@@ -100,11 +171,15 @@ vi.mock('../../src/daemon/cc-presets.js', () => ({
     name.trim().toLowerCase() === 'minimax' ? 200000 : undefined
   )),
   getPresetInitMessage: vi.fn(() => 'preset-init'),
+  getQwenPresetTransportConfig: presetRouteMocks.qwen,
+  getDshPresetTransportConfig: presetRouteMocks.dsh,
+  getPiPresetTransportConfig: presetRouteMocks.pi,
   invalidateCache: vi.fn(),
 }));
 
 vi.mock('node:child_process', async (importOriginal) => {
   const actual = await importOriginal<typeof import('node:child_process')>();
+  const { promisify } = await import('node:util');
   const { EventEmitter } = await import('node:events');
   const { PassThrough, Writable } = await import('node:stream');
   const spawn = vi.fn(() => {
@@ -128,16 +203,39 @@ vi.mock('node:child_process', async (importOriginal) => {
             mocks.codexCalls.push({ mode: 'resume', id: threadId, input: '', options: msg.params ?? {} });
             stdout.write(JSON.stringify({ id: msg.id, result: { thread: { id: threadId } } }) + '\n');
           }
+          if (msg.method) mocks.protocolCalls.push({ method: msg.method, params: msg.params });
+          if (msg.method === 'turn/steer' && typeof msg.id === 'number') {
+            const inputText = msg.params?.input?.[0]?.text;
+            const refused = mocks.refuseSteer || inputText === mocks.refuseSteerText;
+            const respond = () => stdout.write(JSON.stringify(refused
+              ? { id: msg.id, error: { code: -32601, message: 'steer unsupported' } }
+              : { id: msg.id, result: { turnId: 'turn-codex-e2e' } }) + '\n');
+            if (mocks.holdSteer || inputText === mocks.holdSteerText) mocks.releaseSteer = respond;
+            else respond();
+          }
           if (msg.method === 'turn/start' && typeof msg.id === 'number') {
-            stdout.write(JSON.stringify({ id: msg.id, result: { turn: { id: 'turn-codex-e2e', status: 'inProgress', items: [], error: null } } }) + '\n');
-            stdout.write(JSON.stringify({ method: 'item/started', params: { threadId: 'thread-codex-e2e', turnId: 'turn-codex-e2e', item: { id: 'cmd-codex-e2e', type: 'commandExecution', command: 'echo hi', aggregatedOutput: '', status: 'inProgress' } } }) + '\n');
-            stdout.write(JSON.stringify({ method: 'item/completed', params: { threadId: 'thread-codex-e2e', turnId: 'turn-codex-e2e', item: { id: 'cmd-codex-e2e', type: 'commandExecution', command: 'echo hi', aggregatedOutput: 'hi\n', status: 'completed' } } }) + '\n');
-            stdout.write(JSON.stringify({ method: 'item/started', params: { threadId: 'thread-codex-e2e', turnId: 'turn-codex-e2e', item: { id: 'msg-codex-e2e', type: 'agentMessage', text: '' } } }) + '\n');
-            stdout.write(JSON.stringify({ method: 'item/agentMessage/delta', params: { threadId: 'thread-codex-e2e', turnId: 'turn-codex-e2e', itemId: 'msg-codex-e2e', delta: 'Codex' } }) + '\n');
-            stdout.write(JSON.stringify({ method: 'item/agentMessage/delta', params: { threadId: 'thread-codex-e2e', turnId: 'turn-codex-e2e', itemId: 'msg-codex-e2e', delta: ': hello' } }) + '\n');
-            stdout.write(JSON.stringify({ method: 'thread/tokenUsage/updated', params: { threadId: 'thread-codex-e2e', turnId: 'turn-codex-e2e', tokenUsage: { last: { inputTokens: 7, cachedInputTokens: 2, outputTokens: 4 }, total: { inputTokens: 70, cachedInputTokens: 20, outputTokens: 4, totalTokens: 94, reasoningOutputTokens: 0 }, modelContextWindow: 1000000 } } }) + '\n');
-            stdout.write(JSON.stringify({ method: 'item/completed', params: { threadId: 'thread-codex-e2e', turnId: 'turn-codex-e2e', item: { id: 'msg-codex-e2e', type: 'agentMessage', text: 'Codex: hello' } } }) + '\n');
-            stdout.write(JSON.stringify({ method: 'turn/completed', params: { threadId: 'thread-codex-e2e', turn: { id: 'turn-codex-e2e', status: 'completed', error: null } } }) + '\n');
+            if (mocks.holdCodexTurn) {
+              mocks.acceptCodexTurn = () => {
+                stdout.write(JSON.stringify({ id: msg.id, result: { turn: { id: 'turn-codex-e2e', status: 'inProgress', items: [], error: null } } }) + '\n');
+                stdout.write(JSON.stringify({ method: 'item/started', params: { threadId: 'thread-codex-e2e', turnId: 'turn-codex-e2e', item: { id: 'cmd-held', type: 'commandExecution', command: 'echo fixture', aggregatedOutput: '', status: 'inProgress' } } }) + '\n');
+              };
+              mocks.finishCodexTurn = () => {
+                stdout.write(JSON.stringify({ method: 'turn/completed', params: { threadId: 'thread-codex-e2e', turn: { id: 'turn-codex-e2e', status: 'completed', error: null } } }) + '\n');
+              };
+              continue;
+            }
+
+            const turnNumber = mocks.protocolCalls.filter((call) => call.method === 'turn/start').length;
+            const turnId = turnNumber === 1 ? 'turn-codex-e2e' : `turn-codex-e2e-${turnNumber}`;
+            stdout.write(JSON.stringify({ id: msg.id, result: { turn: { id: turnId, status: 'inProgress', items: [], error: null } } }) + '\n');
+            stdout.write(JSON.stringify({ method: 'item/started', params: { threadId: 'thread-codex-e2e', turnId: turnId, item: { id: 'cmd-codex-e2e', type: 'commandExecution', command: 'echo hi', aggregatedOutput: '', status: 'inProgress' } } }) + '\n');
+            stdout.write(JSON.stringify({ method: 'item/completed', params: { threadId: 'thread-codex-e2e', turnId: turnId, item: { id: 'cmd-codex-e2e', type: 'commandExecution', command: 'echo hi', aggregatedOutput: 'hi\n', status: 'completed' } } }) + '\n');
+            stdout.write(JSON.stringify({ method: 'item/started', params: { threadId: 'thread-codex-e2e', turnId: turnId, item: { id: 'msg-codex-e2e', type: 'agentMessage', text: '' } } }) + '\n');
+            stdout.write(JSON.stringify({ method: 'item/agentMessage/delta', params: { threadId: 'thread-codex-e2e', turnId: turnId, itemId: 'msg-codex-e2e', delta: 'Codex' } }) + '\n');
+            stdout.write(JSON.stringify({ method: 'item/agentMessage/delta', params: { threadId: 'thread-codex-e2e', turnId: turnId, itemId: 'msg-codex-e2e', delta: ': hello' } }) + '\n');
+            stdout.write(JSON.stringify({ method: 'thread/tokenUsage/updated', params: { threadId: 'thread-codex-e2e', turnId: turnId, tokenUsage: { last: { inputTokens: 7, cachedInputTokens: 2, outputTokens: 4 }, total: { inputTokens: 70, cachedInputTokens: 20, outputTokens: 4, totalTokens: 94, reasoningOutputTokens: 0 }, modelContextWindow: 1000000 } } }) + '\n');
+            stdout.write(JSON.stringify({ method: 'item/completed', params: { threadId: 'thread-codex-e2e', turnId: turnId, item: { id: 'msg-codex-e2e', type: 'agentMessage', text: 'Codex: hello' } } }) + '\n');
+            stdout.write(JSON.stringify({ method: 'turn/completed', params: { threadId: 'thread-codex-e2e', turn: { id: turnId, status: 'completed', error: null } } }) + '\n');
           }
           if (msg.method === 'turn/interrupt' && typeof msg.id === 'number') {
             stdout.write(JSON.stringify({ id: msg.id, result: {} }) + '\n');
@@ -164,7 +262,7 @@ vi.mock('node:child_process', async (importOriginal) => {
   return {
     ...actual,
     spawn,
-    execFile: vi.fn((
+    execFile: Object.assign(vi.fn((
       _file: string,
       _args: string[],
       optionsOrCb?: Record<string, unknown> | ((err: Error | null, stdout: string, stderr: string) => void),
@@ -173,6 +271,9 @@ vi.mock('node:child_process', async (importOriginal) => {
       const cb = typeof optionsOrCb === 'function' ? optionsOrCb : maybeCb;
       cb?.(null, 'ok\n', '');
       return {} as never;
+    }), {
+      // Like the real execFile, a promisified call resolves `{ stdout, stderr }` (not the bare first value).
+      [promisify.custom]: async () => ({ stdout: 'ok\n', stderr: '' }),
     }),
     exec: vi.fn((_cmd: string, cb?: (err: Error | null, stdout: string, stderr: string) => void) => {
       cb?.(null, '', '');
@@ -182,14 +283,22 @@ vi.mock('node:child_process', async (importOriginal) => {
 });
 
 vi.mock('@anthropic-ai/claude-agent-sdk', () => ({
-  query: vi.fn(({ prompt, options }: { prompt: string; options: Record<string, unknown> }) => {
+  query: vi.fn(({ prompt, options }: { prompt: string | AsyncIterable<Record<string, any>>; options: Record<string, unknown> }) => {
     mocks.claudeCalls.push({ prompt, options });
     const sessionId = String(options.resume ?? options.sessionId ?? 'cc-session');
     async function* gen() {
+      const input = (mocks.holdClaudeQuery || mocks.holdClaudeForStop) && typeof prompt !== 'string' ? prompt[Symbol.asyncIterator]() : undefined;
+      if (input) mocks.claudeInputs.push((await input.next()).value);
       yield { type: 'system', subtype: 'init', session_id: sessionId, model: 'claude-sonnet-4-6' };
       yield { type: 'stream_event', session_id: sessionId, event: { type: 'message_start', message: { id: 'msg-cc-e2e' } } };
       yield { type: 'stream_event', session_id: sessionId, event: { type: 'content_block_start', index: 0, content_block: { type: 'tool_use', id: 'tool-cc-e2e', name: 'Read', input: { file_path: 'README.md' } } } };
       yield { type: 'stream_event', session_id: sessionId, event: { type: 'content_block_stop', index: 0 } };
+      if (mocks.holdClaudeForStop) {
+        await new Promise<void>((resolve) => { mocks.releaseClaudeQuery = resolve; });
+      } else if (input) {
+        for (let index = 0; index < mocks.claudeAppendCount; index++) mocks.claudeInputs.push((await input.next()).value);
+        await new Promise<void>((resolve) => { mocks.releaseClaudeQuery = resolve; });
+      }
       yield { type: 'stream_event', session_id: sessionId, event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'Claude' } } };
       yield { type: 'stream_event', session_id: sessionId, event: { type: 'content_block_delta', delta: { type: 'text_delta', text: ': hello' } } };
       yield { type: 'assistant', session_id: sessionId, message: { content: [{ type: 'text', text: 'Claude: hello' }] } };
@@ -197,7 +306,7 @@ vi.mock('@anthropic-ai/claude-agent-sdk', () => ({
     }
     const q = gen() as AsyncGenerator<any, void> & { close(): void; interrupt(): Promise<void> };
     q.close = () => {};
-    q.interrupt = async () => {};
+    q.interrupt = async () => { mocks.claudeInterrupts++; };
     return q;
   }),
 }));
@@ -253,6 +362,7 @@ vi.mock('../../src/daemon/timeline-emitter.js', () => ({
     }),
     on: vi.fn(() => () => {}),
     epoch: 0,
+    getBufferedEvents: vi.fn(() => []),
     replay: vi.fn(() => ({ events: [], truncated: false })),
   },
 }));
@@ -324,9 +434,9 @@ vi.mock('../../src/agent/tmux.js', () => ({
   getPaneStartCommand: vi.fn().mockResolvedValue(''),
   cleanupOrphanFifos: vi.fn().mockResolvedValue(undefined), BACKEND: 'tmux',
 }));
-vi.mock('../../src/daemon/jsonl-watcher.js', () => ({ startWatching: vi.fn(), startWatchingFile: vi.fn(), stopWatching: vi.fn(), isWatching: vi.fn(() => false), findJsonlPathBySessionId: vi.fn() }));
-vi.mock('../../src/daemon/codex-watcher.js', () => ({ startWatching: vi.fn(), startWatchingSpecificFile: vi.fn(), startWatchingById: vi.fn(), stopWatching: vi.fn(), isWatching: vi.fn(() => false), findRolloutPathByUuid: vi.fn(async () => null) }));
-vi.mock('../../src/daemon/gemini-watcher.js', () => ({ startWatching: vi.fn(), startWatchingLatest: vi.fn(), stopWatching: vi.fn(), isWatching: vi.fn(() => false) }));
+vi.mock('../../src/daemon/jsonl-watcher.js', () => ({ startWatching: vi.fn(), startWatchingFile: vi.fn(), ensureClaudeSessionFile: vi.fn(), preClaimFile: vi.fn(), reserveSessionFile: vi.fn(), reassignSessionFile: vi.fn(), stopWatching: vi.fn(), isWatching: vi.fn(() => false), findJsonlPathBySessionId: vi.fn() }));
+vi.mock('../../src/daemon/codex-watcher.js', () => ({ startWatching: vi.fn(), startWatchingSpecificFile: vi.fn(), startWatchingById: vi.fn(), stopWatching: vi.fn(), isWatching: vi.fn(() => false), isFileClaimedByOther: vi.fn(() => false), findRolloutPathByUuid: vi.fn(async () => null) }));
+vi.mock('../../src/daemon/gemini-watcher.js', () => ({ startWatching: vi.fn(), startWatchingLatest: vi.fn(), startWatchingDiscovered: vi.fn(), stopWatching: vi.fn(), isWatching: vi.fn(() => false) }));
 vi.mock('../../src/daemon/opencode-watcher.js', () => ({ startWatching: vi.fn(), stopWatching: vi.fn(), isWatching: vi.fn(() => false) }));
 vi.mock('../../src/agent/structured-session-bootstrap.js', () => ({ resolveStructuredSessionBootstrap: vi.fn(async (x) => x) }));
 vi.mock('../../src/agent/provider-display.js', () => ({ getQwenDisplayMetadata: vi.fn(() => ({})) }));
@@ -339,10 +449,19 @@ vi.mock('../../src/agent/codex-runtime-config.js', () => ({
 }));
 vi.mock('../../src/agent/brain-dispatcher.js', () => ({ BrainDispatcher: vi.fn().mockImplementation(() => ({ start: vi.fn(), stop: vi.fn() })) }));
 
-import { getTransportRuntime, launchSession } from '../../src/agent/session-manager.js';
+import { ensureTransportRuntimeAvailable, getTransportRuntime, launchSession } from '../../src/agent/session-manager.js';
 import { disconnectAll } from '../../src/agent/provider-registry.js';
+import { ClaudeCodeSdkProvider } from '../../src/agent/providers/claude-code-sdk.js';
+import { QwenProvider } from '../../src/agent/providers/qwen.js';
+import { DeepseekHarnessProvider } from '../../src/agent/providers/deepseek-harness.js';
+import { PiProvider } from '../../src/agent/providers/pi.js';
 import { handleWebCommand } from '../../src/daemon/command-handler.js';
+import { rebuildSubSessions } from '../../src/daemon/subsession-manager.js';
 import { newSession } from '../../src/agent/tmux.js';
+import { dispatchSessionMessage } from '../../src/daemon/session-dispatch.js';
+import { MEMORY_MCP_SEND_DELIVERY_MODES } from '../../shared/session-send-delivery.js';
+import { getTransportQueueStore, resetTransportQueueStoreForTests } from '../../src/daemon/transport-queue-store.js';
+import { join } from 'node:path';
 
 describe('sdk transport flow e2e', () => {
   let sharedContextTempDir: string;
@@ -693,8 +812,25 @@ describe('sdk transport flow e2e', () => {
     expect(switched?.agentType).toBe('claude-code-sdk');
     expect(switched?.ccPreset).toBe('MiniMax');
 
+    // Seed the source timeline so this test exercises the real cross-vendor
+    // handoff builder. The resulting pack resolves asynchronously while the
+    // first target dispatch waits within providerWaitMs.
+    const readPreferred = vi.spyOn(timelineStore, 'readPreferred').mockResolvedValue([{
+      eventId: 'settings-prior-user',
+      sessionId: 'deck_settings_preset_brain',
+      ts: 10,
+      seq: 1,
+      epoch: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'user.message',
+      payload: { text: 'prior conversation context' },
+    }] as any);
     handleWebCommand({ type: 'session.send', session: 'deck_settings_preset_brain', text: 'hello', commandId: 'cmd-settings-preset' }, serverLink);
     await flushAsync();
+    // Cross-vendor handoff tokenization is worker-backed. Wait for the actual
+    // provider dispatch instead of assuming one microtask flush is sufficient.
+    await waitForCondition(() => mocks.claudeCalls.length > 0, 5000);
 
     const claudeCall = mocks.claudeCalls.at(-1);
     expect(claudeCall?.options.env).toMatchObject({
@@ -703,7 +839,13 @@ describe('sdk transport flow e2e', () => {
       ANTHROPIC_MODEL: 'MiniMax-M2.7',
     });
     expect(claudeCall?.options.model).toBe('MiniMax-M2.7');
-    expect(String(claudeCall?.options.appendSystemPrompt ?? '')).toContain('Authoritative runtime model: MiniMax-M2.7.');
+    expect(claudePresetAppend(claudeCall?.options)).toContain('Authoritative runtime model: MiniMax-M2.7.');
+    // This is one captured first post-switch provider call: preserve both the
+    // handoff context and the unchanged cc-preset routing contract together.
+    const serializedPrompt = JSON.stringify(claudeCall?.prompt);
+    expect(serializedPrompt).toContain('[claude-code handoff —');
+    expect(serializedPrompt).toContain('IM.codes cross-vendor handoff');
+    readPreferred.mockRestore();
   });
 
   it('pushes a corrective session_list when settings restart fails', async () => {
@@ -760,7 +902,8 @@ describe('sdk transport flow e2e', () => {
     const record = mocks.store.get(SESSION_CC);
     const usage = mocks.emitted.find((e) => e.session === SESSION_CC && e.type === 'usage.update' && e.payload.model === 'haiku');
     expect(record?.modelDisplay).toBe('haiku');
-    expect(usage?.payload.contextWindow).toBe(200000);
+    // The `haiku` alias is Haiku 5.5 since Agent SDK 0.3.293, whose runtime reports a 1M window (CLAUDE_CONTEXT_WINDOWS.HAIKU_5_FAMILY).
+    expect(usage?.payload.contextWindow).toBe(1_000_000);
   });
 
   it('accepts /model opus as an alias for opus[1M] on claude-code-sdk', async () => {
@@ -860,6 +1003,139 @@ describe('sdk transport flow e2e', () => {
     }));
   });
 
+  it('rehydrates a CC preset from the durable rebuild wire before the first post-restart turn', async () => {
+    const sessionName = 'deck_sub_ccsdk_preset_rebuild';
+    mocks.store.set(sessionName, {
+      name: sessionName,
+      projectName: 'parent',
+      role: 'w1',
+      agentType: 'claude-code-sdk',
+      projectDir: '/tmp/ccsdk-preset-rebuild',
+      state: 'idle',
+      runtimeType: 'transport',
+      providerId: 'claude-code-sdk',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: 1,
+      updatedAt: 1,
+    });
+
+    await rebuildSubSessions([{
+      id: 'ccsdk_preset_rebuild',
+      type: 'claude-code-sdk',
+      runtimeType: 'transport',
+      providerId: 'claude-code-sdk',
+      cwd: '/tmp/ccsdk-preset-rebuild',
+      parentSession: 'deck_parent_brain',
+      ccPresetId: 'MiniMax',
+      requestedModel: 'MiniMax-M3',
+    }]);
+
+    expect(mocks.store.get(sessionName)).toMatchObject({
+      ccPreset: 'MiniMax',
+      requestedModel: 'MiniMax-M3',
+    });
+
+    const createSessionSpy = vi.spyOn(ClaudeCodeSdkProvider.prototype, 'createSession');
+    try {
+      await ensureTransportRuntimeAvailable(sessionName);
+      expect(getTransportRuntime(sessionName)).toBeDefined();
+      expect(createSessionSpy).toHaveBeenCalledWith(expect.objectContaining({
+        agentId: 'MiniMax-M3',
+        env: expect.objectContaining({
+          ANTHROPIC_BASE_URL: 'https://api.minimax.io/anthropic',
+          ANTHROPIC_API_KEY: expect.any(String),
+          ANTHROPIC_MODEL: 'MiniMax-M3',
+        }),
+      }));
+    } finally {
+      createSessionSpy.mockRestore();
+    }
+  });
+
+  it('rehydrates Qwen, DSH, and Pi preset routes through their real post-restart runtime assembly', async () => {
+    const qwenCreate = vi.spyOn(QwenProvider.prototype, 'createSession');
+    const dshCreate = vi.spyOn(DeepseekHarnessProvider.prototype, 'createSession');
+    const piCreate = vi.spyOn(PiProvider.prototype, 'createSession');
+    try {
+      await rebuildSubSessions([
+        {
+          id: 'qwen_preset_rebuild', type: 'qwen', runtimeType: 'transport',
+          providerId: 'qwen', cwd: '/tmp/qwen-preset-rebuild',
+          ccPresetId: 'MiniMax', requestedModel: 'stale-qwen-model',
+        },
+        {
+          id: 'dsh_preset_rebuild', type: 'deepseek-harness', runtimeType: 'transport',
+          providerId: 'deepseek-harness', cwd: '/tmp/dsh-preset-rebuild',
+          ccPresetId: 'MiniMax', requestedModel: 'MiniMax-M3',
+        },
+        {
+          id: 'pi_preset_rebuild', type: 'pi', runtimeType: 'transport',
+          providerId: 'pi', cwd: '/tmp/pi-preset-rebuild',
+          ccPresetId: 'MiniMax', requestedModel: 'MiniMax-M3',
+        },
+      ]);
+
+      await ensureTransportRuntimeAvailable('deck_sub_qwen_preset_rebuild');
+      await ensureTransportRuntimeAvailable('deck_sub_dsh_preset_rebuild');
+      await ensureTransportRuntimeAvailable('deck_sub_pi_preset_rebuild');
+
+      expect(presetRouteMocks.qwen).toHaveBeenCalledWith('MiniMax');
+      expect(qwenCreate).toHaveBeenCalledWith(expect.objectContaining({
+        agentId: 'MiniMax-M3',
+        env: expect.objectContaining({
+          OPENAI_BASE_URL: 'https://api.minimax.io/anthropic',
+          OPENAI_API_KEY: 'test-qwen-key',
+        }),
+        settings: expect.objectContaining({ model: { name: 'MiniMax-M3' } }),
+      }));
+      expect(presetRouteMocks.dsh).toHaveBeenCalledWith('MiniMax', 'MiniMax-M3');
+      expect(dshCreate).toHaveBeenCalledWith(expect.objectContaining({
+        agentId: 'MiniMax-M3',
+        llm: expect.objectContaining({ provider: 'minimax', model: 'MiniMax-M3', apiKey: 'test-dsh-key' }),
+      }));
+      expect(presetRouteMocks.pi).toHaveBeenCalledWith('MiniMax', 'MiniMax-M3');
+      expect(piCreate).toHaveBeenCalledWith(expect.objectContaining({
+        agentId: 'MiniMax-M3',
+        piLlm: expect.objectContaining({ provider: 'minimax', model: 'MiniMax-M3', apiKey: 'test-pi-key' }),
+      }));
+    } finally {
+      qwenCreate.mockRestore();
+      dshCreate.mockRestore();
+      piCreate.mockRestore();
+    }
+  });
+
+  it('does not synthesize a preset or credential route for direct DSH and Pi rebuilds', async () => {
+    presetRouteMocks.dsh.mockClear();
+    presetRouteMocks.pi.mockClear();
+    const dshCreate = vi.spyOn(DeepseekHarnessProvider.prototype, 'createSession');
+    const piCreate = vi.spyOn(PiProvider.prototype, 'createSession');
+    try {
+      await rebuildSubSessions([
+        {
+          id: 'dsh_direct_rebuild', type: 'deepseek-harness', runtimeType: 'transport',
+          providerId: 'deepseek-harness', cwd: '/tmp/dsh-direct-rebuild', requestedModel: 'deepseek-v4-flash',
+        },
+        {
+          id: 'pi_direct_rebuild', type: 'pi', runtimeType: 'transport',
+          providerId: 'pi', cwd: '/tmp/pi-direct-rebuild', requestedModel: 'provider-owned-model',
+        },
+      ]);
+
+      await ensureTransportRuntimeAvailable('deck_sub_dsh_direct_rebuild');
+      await ensureTransportRuntimeAvailable('deck_sub_pi_direct_rebuild');
+
+      expect(presetRouteMocks.dsh).not.toHaveBeenCalled();
+      expect(presetRouteMocks.pi).not.toHaveBeenCalled();
+      expect(dshCreate).toHaveBeenCalledWith(expect.not.objectContaining({ llm: expect.anything() }));
+      expect(piCreate).toHaveBeenCalledWith(expect.not.objectContaining({ piLlm: expect.anything() }));
+    } finally {
+      dshCreate.mockRestore();
+      piCreate.mockRestore();
+    }
+  });
+
 
   it('surfaces resolved transport bootstrap context in subsession.sync for transport sub-sessions', async () => {
     const serverLink = { send: vi.fn() } as any;
@@ -905,7 +1181,7 @@ describe('sdk transport flow e2e', () => {
     });
   });
 
-  it('applies live sub-session transportConfig supervision updates without restart and re-syncs the sub-session', async () => {
+  it('rejects live sub-session automatic supervision updates without mutation or re-sync', async () => {
     const sessionName = 'deck_sub_live_supervision';
     mocks.store.set(sessionName, {
       name: sessionName,
@@ -945,7 +1221,6 @@ describe('sdk transport flow e2e', () => {
       },
     }, serverLink);
     await flushAsync();
-    await waitForCondition(() => serverLink.send.mock.calls.some((call) => call[0]?.type === 'subsession.sync' && call[0]?.id === 'live_supervision'));
 
     const record = mocks.store.get(sessionName);
     expect(record).toMatchObject({
@@ -953,32 +1228,12 @@ describe('sdk transport flow e2e', () => {
       providerId: 'codex-sdk',
       providerSessionId: sessionName,
       codexSessionId: 'thread-codex-live-sub',
-      transportConfig: {
-        supervision: {
-          mode: 'supervised_audit',
-          backend: 'codex-sdk',
-          model: 'gpt-5.3-codex-spark',
-          taskRunPromptVersion: 'task_run_status_v1',
-          auditMode: 'audit',
-          maxAuditLoops: 2,
-        },
-      },
     });
+    expect(record?.transportConfig).toBeUndefined();
 
-    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
-      type: 'subsession.sync',
-      id: 'live_supervision',
-      transportConfig: expect.objectContaining({
-        supervision: expect.objectContaining({
-          mode: 'supervised_audit',
-          backend: 'codex-sdk',
-          model: 'gpt-5.3-codex-spark',
-          taskRunPromptVersion: 'task_run_status_v1',
-          auditMode: 'audit',
-          maxAuditLoops: 2,
-        }),
-      }),
-    }));
+    expect(serverLink.send.mock.calls.some((call) => (
+      call[0]?.type === 'subsession.sync' && call[0]?.id === 'live_supervision'
+    ))).toBe(false);
   });
 
   it('syncs codex-sdk sub-session model changes back to the frontend', async () => {
@@ -1107,6 +1362,145 @@ describe('sdk transport flow e2e', () => {
     expect(serverLink.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'session.error' }));
   });
 
+  /**
+   * The identity prompt is not session state: it is stored in the identity store (SESSION scope for what session.start
+   * carries) and derived from there at every launch. Every path below goes through the real command handler, session
+   * manager and provider to the system prompt the SDK is handed.
+   */
+  describe('session identity through session.start (never in the session record, always in the prompt)', () => {
+    const identityKey = (sessionName: string) => `:${sessionName}`; // no server bound in this process: the SESSION key is `<serverId>:<name>`
+    const cleanupProfiles: Array<[('user' | 'project' | 'session'), string]> = [];
+    const track = (scope: 'user' | 'project' | 'session', scopeKey: string) => { cleanupProfiles.push([scope, scopeKey]); };
+    afterEach(async () => {
+      for (const [scope, scopeKey] of cleanupProfiles.splice(0)) await removeLocalSessionIdentityProfileQuiet(scope, scopeKey);
+    });
+
+    async function promptAfterSend(serverLink: any, sessionName: string, commandId: string): Promise<string> {
+      const before = mocks.claudeCalls.length;
+      handleWebCommand({ type: 'session.send', session: sessionName, text: 'Report your identity.', commandId }, serverLink);
+      await flushAsync();
+      await waitForCondition(() => mocks.claudeCalls.length > before);
+      return claudePresetAppend(mocks.claudeCalls.at(-1)?.options);
+    }
+    async function startMain(serverLink: any, project: string, extra: Record<string, unknown> = {}): Promise<string> {
+      handleWebCommand({ type: 'session.start', project, dir: `/tmp/${project.replace(/ /g, '-')}-e2e`, agentType: 'claude-code-sdk', ...extra }, serverLink);
+      await flushAsync();
+      const sessionName = `deck_${project.replace(/ /g, '_')}_brain`;
+      await waitForCondition(() => !!mocks.store.get(sessionName));
+      return sessionName;
+    }
+    /** Run a restart command and wait until the session has a NEW runtime (the relaunch completed). */
+    async function restartAndWait(serverLink: any, sessionName: string, cmd: Record<string, unknown>): Promise<void> {
+      const before = getTransportRuntime(sessionName);
+      handleWebCommand({ ...cmd, sessionName }, serverLink);
+      await flushAsync();
+      await waitForCondition(() => {
+        const runtime = getTransportRuntime(sessionName);
+        return !!runtime && runtime !== before && !!runtime.providerSessionId;
+      }, 6000);
+    }
+
+    it('carries a selected-file identity from session.start into the first SDK system prompt, stores it in the identity store, and keeps it out of the record', async () => {
+      const serverLink = { send: vi.fn() } as any;
+      const identityDocument = '中'.repeat(49_323);
+      const sessionName = 'deck_identity_file_prompt_brain';
+      track('session', identityKey(sessionName));
+      await startMain(serverLink, 'identity file prompt', { identityPrompt: identityDocument });
+
+      expect(await promptAfterSend(serverLink, sessionName, 'cmd-identity-file-first-turn')).toContain(identityDocument);
+
+      const record = mocks.store.get(sessionName)!;
+      expect(record).not.toHaveProperty('identityPrompt');
+      expect(JSON.stringify(record)).not.toContain(identityDocument);
+      expect(record.appliedIdentityHash).toBe(identityPromptHash(identityDocument));
+      const stored = await getLocalSessionIdentityProfile('session', identityKey(sessionName));
+      expect(stored?.content).toBe(identityDocument);
+    });
+
+    it('a restart derives the identity from the store: it survives, and an edit made while it was stopped applies', async () => {
+      const serverLink = { send: vi.fn() } as any;
+      const sessionName = 'deck_identity_restart_brain';
+      track('session', identityKey(sessionName));
+      await startMain(serverLink, 'identity restart', { identityPrompt: 'Inline identity v1: be terse.' });
+      expect(await promptAfterSend(serverLink, sessionName, 'cmd-identity-restart-1')).toContain('Inline identity v1: be terse.');
+
+      await restartAndWait(serverLink, sessionName, { type: 'session.restart', agentType: 'claude-code-sdk' });
+      const afterRestart = await promptAfterSend(serverLink, sessionName, 'cmd-identity-restart-2');
+      expect(afterRestart).toContain('Inline identity v1: be terse.');
+      expect(JSON.stringify(mocks.store.get(sessionName))).not.toContain('Inline identity v1');
+
+      await putLocalSessionIdentityProfile({ scope: 'session', scopeKey: identityKey(sessionName), content: 'Edited identity v2: be verbose.', source: 'mcp' });
+      await restartAndWait(serverLink, sessionName, { type: 'session.restart', agentType: 'claude-code-sdk' });
+      const afterEdit = await promptAfterSend(serverLink, sessionName, 'cmd-identity-restart-3');
+      expect(afterEdit).toContain('Edited identity v2: be verbose.');
+      expect(afterEdit).not.toContain('Inline identity v1');
+    });
+
+    it('session.identity.refresh applies an edited identity to the running session for its next turn', async () => {
+      const serverLink = { send: vi.fn() } as any;
+      const sessionName = 'deck_identity_refresh_brain';
+      track('session', identityKey(sessionName));
+      await startMain(serverLink, 'identity refresh', { identityPrompt: 'Refresh identity v1.' });
+      expect(await promptAfterSend(serverLink, sessionName, 'cmd-identity-refresh-1')).toContain('Refresh identity v1.');
+
+      await putLocalSessionIdentityProfile({ scope: 'session', scopeKey: identityKey(sessionName), content: 'Refresh identity v2.', source: 'mcp' });
+      handleWebCommand({ type: 'session.identity.refresh', sessionName, commandId: 'identity-refresh-cmd' }, serverLink);
+      await waitForCondition(() => serverLink.send.mock.calls.some((call: any[]) => call[0]?.commandId === 'identity-refresh-cmd' && call[0]?.status === 'ok'));
+      const next = await promptAfterSend(serverLink, sessionName, 'cmd-identity-refresh-2');
+      expect(next).toContain('Refresh identity v2.');
+      expect(next).not.toContain('Refresh identity v1.');
+      expect(mocks.store.get(sessionName)!.appliedIdentityHash).toBeDefined();
+      expect(JSON.stringify(mocks.store.get(sessionName))).not.toContain('Refresh identity');
+    });
+
+    it('a session started WITHOUT an identity still gets the user-scope identity in its first prompt', async () => {
+      const serverLink = { send: vi.fn() } as any;
+      track('user', '');
+      await putLocalSessionIdentityProfile({ scope: 'user', scopeKey: '', content: 'User-wide identity: answer in Chinese.', source: 'mcp' });
+      const sessionName = await startMain(serverLink, 'identity user scope');
+      expect(await promptAfterSend(serverLink, sessionName, 'cmd-identity-user-1')).toContain('User-wide identity: answer in Chinese.');
+      expect(JSON.stringify(mocks.store.get(sessionName))).not.toContain('User-wide identity');
+    });
+
+    it('a session started with no identity anywhere has none, and the launch is not disturbed', async () => {
+      const serverLink = { send: vi.fn() } as any;
+      const sessionName = await startMain(serverLink, 'identity none');
+      const prompt = await promptAfterSend(serverLink, sessionName, 'cmd-identity-none-1');
+      expect(prompt).not.toContain('<imcodes-agent-identity>');
+      expect(mocks.store.get(sessionName)!.appliedIdentityHash).toBeUndefined();
+    });
+
+    it('a sub-session gets its SESSION-scope identity at start and after a restart, like a main session', async () => {
+      const serverLink = { send: vi.fn() } as any;
+      const sessionName = 'deck_sub_identity_sub';
+      track('session', identityKey(sessionName));
+      await putLocalSessionIdentityProfile({ scope: 'session', scopeKey: identityKey(sessionName), content: 'Sub-session identity v1.', source: 'mcp' });
+      handleWebCommand({ type: 'subsession.start', id: 'identity_sub', sessionType: 'claude-code-sdk', cwd: '/tmp/identity-sub-e2e', parentSession: 'deck_parent_brain' }, serverLink);
+      await flushAsync();
+      await waitForCondition(() => !!mocks.store.get(sessionName));
+      expect(await promptAfterSend(serverLink, sessionName, 'cmd-identity-sub-1')).toContain('Sub-session identity v1.');
+      expect(JSON.stringify(mocks.store.get(sessionName))).not.toContain('Sub-session identity');
+
+      await putLocalSessionIdentityProfile({ scope: 'session', scopeKey: identityKey(sessionName), content: 'Sub-session identity v2.', source: 'mcp' });
+      await restartAndWait(serverLink, sessionName, { type: 'subsession.restart' });
+      const afterRestart = await promptAfterSend(serverLink, sessionName, 'cmd-identity-sub-2');
+      expect(afterRestart).toContain('Sub-session identity v2.');
+      expect(afterRestart).not.toContain('Sub-session identity v1.');
+    });
+
+    it('an identity that cannot be saved to the store does not stop the session from starting with it', async () => {
+      const serverLink = { send: vi.fn() } as any;
+      const localStore = await import('../../src/daemon/session-identity-local-store.js');
+      const spy = vi.spyOn(localStore, 'putLocalSessionIdentityProfile').mockRejectedValue(new Error('disk full'));
+      try {
+        const sessionName = await startMain(serverLink, 'identity unsaved', { identityPrompt: 'Unsaved identity: first run only.' });
+        expect(await promptAfterSend(serverLink, sessionName, 'cmd-identity-unsaved-1')).toContain('Unsaved identity: first run only.');
+      } finally {
+        spy.mockRestore();
+      }
+    });
+  });
+
   it('starts a selected compatible model without duplicating the CC preset', async () => {
     const serverLink = { send: vi.fn() } as any;
 
@@ -1137,7 +1531,7 @@ describe('sdk transport flow e2e', () => {
       ANTHROPIC_DEFAULT_SONNET_MODEL: 'MiniMax-M3',
     });
     expect(claudeCall?.options.model).toBe('MiniMax-M3');
-    expect(String(claudeCall?.options.appendSystemPrompt ?? '')).toContain('Authoritative runtime model: MiniMax-M3.');
+    expect(claudePresetAppend(claudeCall?.options)).toContain('Authoritative runtime model: MiniMax-M3.');
   });
 
   it('switches among discovered models inside one CC preset for later turns', async () => {
@@ -1172,7 +1566,7 @@ describe('sdk transport flow e2e', () => {
     expect(record?.activeModel).toBe('MiniMax-M3');
     expect(usage?.payload.contextWindow).toBe(200000);
     expect(mocks.claudeCalls.at(-1)?.options.model).toBe('MiniMax-M3');
-    expect(String(mocks.claudeCalls.at(-1)?.options.appendSystemPrompt ?? '')).toContain(
+    expect(claudePresetAppend(mocks.claudeCalls.at(-1)?.options)).toContain(
       'Authoritative runtime model: MiniMax-M3.',
     );
     expect(serverLink.send).not.toHaveBeenCalledWith(expect.objectContaining({
@@ -1217,7 +1611,7 @@ describe('sdk transport flow e2e', () => {
       ANTHROPIC_MODEL: 'MiniMax-M2.7',
     });
     expect(claudeCall?.options.model).toBe('MiniMax-M2.7');
-    expect(String(claudeCall?.options.appendSystemPrompt ?? '')).toContain('Authoritative runtime model: MiniMax-M2.7.');
+    expect(claudePresetAppend(claudeCall?.options)).toContain('Authoritative runtime model: MiniMax-M2.7.');
     expect(streaming.map((e) => e.payload.text)).toEqual(['Claude']);
     expect(streaming[0]?.opts?.eventId).toBe(stableEventId);
     expect(final?.payload.text).toBe('Claude: hello');
@@ -1226,16 +1620,311 @@ describe('sdk transport flow e2e', () => {
 
   beforeEach(async () => {
     sharedContextTempDir = await createIsolatedSharedContextDb('sdk-transport-flow');
+    vi.stubEnv('IMCODES_TRANSPORT_QUEUE_DB_PATH', join(sharedContextTempDir, 'transport-queue.sqlite'));
+    resetTransportQueueStoreForTests();
     mocks.store.clear();
     mocks.emitted.length = 0;
     mocks.claudeCalls.length = 0;
     mocks.codexCalls.length = 0;
+    mocks.protocolCalls.length = 0;
+    mocks.holdCodexTurn = false;
+    mocks.holdClaudeQuery = false;
+    mocks.holdClaudeForStop = false;
+    mocks.claudeInputs.length = 0;
+    mocks.claudeAppendCount = 2;
+    mocks.releaseClaudeQuery = undefined;
+    mocks.claudeInterrupts = 0;
+    mocks.refuseSteer = false;
+    mocks.refuseSteerText = undefined;
+    mocks.holdSteerText = undefined;
+    mocks.holdSteer = false;
+    mocks.releaseSteer = undefined;
+    mocks.acceptCodexTurn = undefined;
+    mocks.finishCodexTurn = undefined;
   });
 
   afterEach(async () => {
     await disconnectAll();
+    resetTransportQueueStoreForTests();
+    vi.unstubAllEnvs();
     await cleanupIsolatedSharedContextDb(sharedContextTempDir);
     vi.clearAllMocks();
+  });
+
+  it.each([undefined, MEMORY_MCP_SEND_DELIVERY_MODES.APPEND])('dispatches inter-session native append through live Codex protocol before turn completion (%s)', async (deliveryMode) => {
+    mocks.holdCodexTurn = true;
+    await launchSession({ name: SESSION_CX, projectName: 'cxsdk', role: 'brain', agentType: 'codex-sdk', projectDir: sharedContextTempDir });
+    const runtime = getTransportRuntime(SESSION_CX)!;
+    runtime.send('foreground 原回合', 'native-foreground');
+    await waitForCondition(() => !!mocks.acceptCodexTurn);
+    const target = mocks.store.get(SESSION_CX) as any;
+    const beforeAccepted = await dispatchSessionMessage(target, '第一条\n中文消息', { messageId: 'native-B', deliveryMode });
+    expect(beforeAccepted).toBe('queued');
+    expect(mocks.protocolCalls.filter((call) => call.method === 'turn/steer')).toHaveLength(0);
+    expect(mocks.emitted.some((event) => event.type === 'user.message' && event.payload.clientMessageId === 'native-B')).toBe(false);
+    mocks.acceptCodexTurn!();
+    await waitForCondition(() => mocks.protocolCalls.some((call) => call.method === 'turn/steer'));
+    await waitForCondition(() => getTransportQueueStore().hasDeliveryTombstone(SESSION_CX, 'native-B'));
+    expect(runtime.hasActiveTurnWork()).toBe(true);
+    expect(mocks.protocolCalls.find((call) => call.method === 'turn/steer')).toMatchObject({ params: {
+      expectedTurnId: 'turn-codex-e2e', input: [{ type: 'text', text: '第一条\n中文消息' }],
+    } });
+    expect(mocks.emitted.filter((event) => event.type === 'user.message' && event.payload.clientMessageId === 'native-B')).toHaveLength(1);
+    await dispatchSessionMessage(target, 'explicit idle FIFO', { messageId: 'native-Q', deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.QUEUE });
+    expect(runtime.pendingEntries.map((entry) => entry.clientMessageId)).toEqual(['native-Q']);
+    await dispatchSessionMessage(target, '第二条 tool-active', { messageId: 'native-C', deliveryMode });
+    await waitForCondition(() => mocks.protocolCalls.filter((call) => call.method === 'turn/steer').length === 2);
+    expect(mocks.protocolCalls.filter((call) => call.method === 'turn/start')).toHaveLength(1);
+    expect(mocks.protocolCalls.filter((call) => call.method === 'turn/interrupt')).toHaveLength(0);
+    expect(runtime.pendingEntries.map((entry) => entry.clientMessageId)).toEqual(['native-Q']);
+    mocks.holdCodexTurn = false;
+    mocks.finishCodexTurn!();
+    await waitForCondition(() => mocks.protocolCalls.filter((call) => call.method === 'turn/start').length === 2);
+    expect(getTransportQueueStore().hasDeliveryTombstone(SESSION_CX, 'native-Q')).toBe(true);
+  });
+
+  it.each(['codex-sdk', 'claude-code-sdk'].flatMap((agentType) => [0, 1, 2].map((position) => ({ agentType, position }))))(
+    'mixed command at $position reaches $agentType protocol in the original turn, not one idle FIFO', async ({ agentType, position }) => {
+      const codex = agentType === 'codex-sdk';
+      const name = codex ? SESSION_CX : SESSION_CC;
+      mocks.holdCodexTurn = codex;
+      mocks.holdClaudeQuery = !codex;
+      const texts = ['普通第一条\n中文', '普通后续'];
+      texts.splice(position, 0, 'command 原文\n  不改缩进');
+      const expected = position === 0 ? [texts[0], texts.slice(1).join('\n\n')]
+        : position === 2 ? [texts.slice(0, 2).join('\n\n'), texts[2]] : texts;
+      mocks.claudeAppendCount = expected.length;
+      await launchSession({ name, projectName: codex ? 'cxsdk' : 'ccsdk', role: 'brain', agentType: agentType as any, projectDir: sharedContextTempDir });
+      const runtime = getTransportRuntime(name)!;
+      runtime.send('foreground', 'mixed-protocol-A');
+      if (codex) { await waitForCondition(() => !!mocks.acceptCodexTurn); mocks.acceptCodexTurn!(); }
+      await waitForCondition(() => getTransportQueueStore().hasDeliveryTombstone(name, 'mixed-protocol-A'));
+      const target = mocks.store.get(name) as any;
+      // The explicit FIFO is manually appended as a mixed selection. The
+      // command marker must survive dispatch and remain a distinct native input.
+      for (const [index, text] of texts.entries()) await dispatchSessionMessage(target, text, {
+        messageId: `mixed-protocol-${index}`, deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.QUEUE,
+        ...(index === position ? { command: true } : {}),
+      });
+      expect(JSON.parse(getTransportQueueStore().readPrivateDispatchMaterial(name, `mixed-protocol-${position}`, runtime.recipientIdentity)!)).toMatchObject({ commandMode: true });
+      const result = await runtime.appendPendingMessagesToActiveTurn(['mixed-protocol-0', 'mixed-protocol-1', 'mixed-protocol-2'], 'mixed-protocol-append');
+      expect(result.status).toBe('delivered');
+      if (codex) {
+        expect(mocks.protocolCalls.filter((call) => call.method === 'turn/steer').map((call) => call.params?.input[0].text)).toEqual(expected);
+        expect(mocks.protocolCalls.filter((call) => call.method === 'turn/steer').every((call) => call.params?.expectedTurnId === 'turn-codex-e2e')).toBe(true);
+        expect(mocks.protocolCalls.filter((call) => call.method === 'turn/start')).toHaveLength(1);
+        expect(mocks.protocolCalls.filter((call) => call.method === 'turn/interrupt')).toHaveLength(0);
+      } else {
+        await waitForCondition(() => mocks.claudeInputs.length === 1 + expected.length);
+        expect(mocks.claudeInputs.slice(1).map((input) => input.message.content)).toEqual(expected);
+        expect(mocks.claudeInputs.slice(1).every((input) => input.priority === 'next')).toBe(true);
+        expect(mocks.claudeCalls).toHaveLength(1);
+        expect(mocks.claudeInterrupts).toBe(0);
+      }
+      expect(runtime.hasActiveTurnWork()).toBe(true);
+      expect(runtime.pendingEntries).toEqual([]);
+      for (let index = 0; index < 3; index++) {
+        const id = `mixed-protocol-${index}`;
+        expect(getTransportQueueStore().hasDeliveryTombstone(name, id)).toBe(true);
+        expect(mocks.emitted.filter((event) => event.type === 'user.message' && event.payload.clientMessageId === id)).toHaveLength(1);
+      }
+      if (codex) { mocks.holdCodexTurn = false; mocks.finishCodexTurn!(); }
+      else { await waitForCondition(() => !!mocks.releaseClaudeQuery); mocks.holdClaudeQuery = false; mocks.releaseClaudeQuery!(); }
+    },
+  );
+
+  it.each(['codex-sdk', 'claude-code-sdk'])('default MCP command append reaches %s current native input verbatim', async (agentType) => {
+    const codex = agentType === 'codex-sdk';
+    const name = codex ? SESSION_CX : SESSION_CC;
+    mocks.holdCodexTurn = codex;
+    mocks.holdClaudeQuery = !codex;
+    mocks.claudeAppendCount = 1;
+    await launchSession({ name, projectName: codex ? 'cxsdk' : 'ccsdk', role: 'brain', agentType: agentType as any, projectDir: sharedContextTempDir });
+    const runtime = getTransportRuntime(name)!;
+    runtime.send('foreground', 'command-protocol-A');
+    if (codex) { await waitForCondition(() => !!mocks.acceptCodexTurn); mocks.acceptCodexTurn!(); }
+    await waitForCondition(() => getTransportQueueStore().hasDeliveryTombstone(name, 'command-protocol-A'));
+    const raw = 'command 中文\n  原样缩进';
+    expect(await dispatchSessionMessage(mocks.store.get(name) as any, raw, { messageId: 'command-protocol-B', command: true })).toBe('queued');
+    await waitForCondition(() => getTransportQueueStore().hasDeliveryTombstone(name, 'command-protocol-B'));
+    if (codex) {
+      expect(mocks.protocolCalls.filter((call) => call.method === 'turn/steer')).toMatchObject([{ params: { expectedTurnId: 'turn-codex-e2e', input: [{ type: 'text', text: raw }] } }]);
+      expect(mocks.protocolCalls.filter((call) => call.method === 'turn/interrupt')).toHaveLength(0);
+      mocks.holdCodexTurn = false; mocks.finishCodexTurn!();
+    } else {
+      await waitForCondition(() => mocks.claudeInputs.length === 2 && !!mocks.releaseClaudeQuery);
+      expect(mocks.claudeInputs[1]).toMatchObject({ message: { content: raw }, priority: 'next' });
+      expect(mocks.claudeInterrupts).toBe(0);
+      mocks.holdClaudeQuery = false; mocks.releaseClaudeQuery!();
+    }
+    expect(mocks.emitted.filter((event) => event.type === 'user.message' && event.payload.clientMessageId === 'command-protocol-B')).toHaveLength(1);
+  });
+
+  it('a delayed refused command reports partial protocol/UI facts without parking later ordinary append', async () => {
+    mocks.holdCodexTurn = true;
+    mocks.refuseSteerText = 'refused raw command';
+    mocks.holdSteerText = 'refused raw command';
+    await launchSession({ name: SESSION_CX, projectName: 'cxsdk', role: 'brain', agentType: 'codex-sdk', projectDir: sharedContextTempDir });
+    const runtime = getTransportRuntime(SESSION_CX)!;
+    runtime.send('foreground', 'partial-protocol-A');
+    await waitForCondition(() => !!mocks.acceptCodexTurn); mocks.acceptCodexTurn!();
+    await waitForCondition(() => getTransportQueueStore().hasDeliveryTombstone(SESSION_CX, 'partial-protocol-A'));
+    const target = mocks.store.get(SESSION_CX) as any;
+    for (const [id, text] of [['before', 'ordinary before'], ['cmd', 'refused raw command'], ['after', 'ordinary after']]) {
+      await dispatchSessionMessage(target, text!, { messageId: id!, deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.QUEUE, ...(id === 'cmd' ? { command: true } : {}) });
+    }
+    const link = { send: vi.fn() } as any;
+    handleWebCommand({ type: TRANSPORT_QUEUE_COMMANDS.APPEND_MESSAGES, sessionName: SESSION_CX, commandId: 'partial-protocol-click', clientMessageIds: ['before', 'cmd', 'after'] }, link);
+    await waitForCondition(() => !!mocks.releaseSteer);
+    expect(getTransportQueueStore().hasDeliveryTombstone(SESSION_CX, 'before')).toBe(true);
+    expect(getTransportQueueStore().hasDeliveryTombstone(SESSION_CX, 'cmd')).toBe(false);
+    expect(link.send.mock.calls.some(([frame]) => frame.commandId === 'partial-protocol-click' && frame.status === 'accepted')).toBe(false);
+    mocks.releaseSteer!();
+    await waitForCondition(() => link.send.mock.calls.some(([frame]) => frame.commandId === 'partial-protocol-click' && frame.status === 'error'));
+    const ack = link.send.mock.calls.find(([frame]) => frame.commandId === 'partial-protocol-click' && frame.status === 'error')[0];
+    expect(ack).toMatchObject({ queueReconcilesCommandId: 'partial-protocol-click', pendingMessageEntries: [{ clientMessageId: 'cmd', text: 'refused raw command', appendFallbackReason: 'unsupported' }] });
+    expect(ack.pendingMessageEntries).toHaveLength(1);
+    expect(mocks.protocolCalls.filter((call) => call.method === 'turn/steer').map((call) => call.params?.input[0].text)).toEqual(['ordinary before', 'refused raw command', 'ordinary after']);
+    expect(mocks.protocolCalls.filter((call) => call.method === 'turn/interrupt')).toHaveLength(0);
+    for (const id of ['before', 'after']) expect(mocks.emitted.filter((event) => event.type === 'user.message' && event.payload.clientMessageId === id)).toHaveLength(1);
+    mocks.holdCodexTurn = false; mocks.finishCodexTurn!();
+  });
+
+  it('does not strand a later real Codex steer behind a refused same-owner append admission', async () => {
+    mocks.holdCodexTurn = true;
+    await launchSession({ name: SESSION_CX, projectName: 'cxsdk', role: 'brain', agentType: 'codex-sdk', projectDir: sharedContextTempDir });
+    const runtime = getTransportRuntime(SESSION_CX)!;
+    runtime.send('foreground', 'refusal-protocol-A');
+    await waitForCondition(() => !!mocks.acceptCodexTurn);
+    mocks.acceptCodexTurn!();
+    await waitForCondition(() => getTransportQueueStore().hasDeliveryTombstone(SESSION_CX, 'refusal-protocol-A'));
+    mocks.refuseSteer = true;
+    mocks.holdSteer = true;
+    const target = mocks.store.get(SESSION_CX) as any;
+    await dispatchSessionMessage(target, 'refused B', { messageId: 'refusal-protocol-B' });
+    await waitForCondition(() => !!mocks.releaseSteer);
+    await dispatchSessionMessage(target, 'later C', { messageId: 'refusal-protocol-C' });
+    mocks.holdSteer = false;
+    mocks.refuseSteer = false;
+    mocks.refuseSteerText = undefined;
+    mocks.holdSteerText = undefined;
+    mocks.releaseSteer!();
+    await waitForCondition(() => mocks.protocolCalls.filter((call) => call.method === 'turn/steer').length === 2);
+    await waitForCondition(() => getTransportQueueStore().hasDeliveryTombstone(SESSION_CX, 'refusal-protocol-C'));
+    expect(runtime.pendingEntries.map((entry) => entry.clientMessageId)).toEqual(['refusal-protocol-B']);
+    expect(getTransportQueueStore().readSnapshot(SESSION_CX).pendingMessageEntries[0]).toMatchObject({ appendFallbackReason: 'unsupported' });
+    expect(mocks.protocolCalls.filter((call) => call.method === 'turn/interrupt')).toHaveLength(0);
+    expect(mocks.protocolCalls.filter((call) => call.method === 'turn/start')).toHaveLength(1);
+    mocks.holdCodexTurn = false;
+    mocks.finishCodexTurn!();
+  });
+
+  it.each([DAEMON_COMMAND_TYPES.SESSION_CANCEL, '/stop'] as const)('Stop keeps its terminal barrier after later ordinary %s receipts', async (ordinary) => {
+    mocks.holdCodexTurn = true;
+    mocks.refuseSteer = true;
+    await launchSession({ name: SESSION_CX, projectName: 'cxsdk', role: 'brain', agentType: 'codex-sdk', projectDir: sharedContextTempDir });
+    const runtime = getTransportRuntime(SESSION_CX)!;
+    runtime.send('foreground', 'stop-terminal-A');
+    await waitForCondition(() => !!mocks.acceptCodexTurn);
+    mocks.acceptCodexTurn!();
+    await waitForCondition(() => getTransportQueueStore().hasDeliveryTombstone(SESSION_CX, 'stop-terminal-A'));
+    runtime.send('retained B', 'stop-terminal-B');
+    const serverLink = { send: vi.fn() } as any;
+    handleWebCommand({ type: DAEMON_COMMAND_TYPES.SESSION_CANCEL, sessionName: SESSION_CX, commandId: 'stop-terminal-click', stopAndSendPendingMessageIds: ['stop-terminal-B'] }, serverLink);
+    await waitForCondition(() => serverLink.send.mock.calls.some(([frame]) => frame.type === 'command.ack' && frame.commandId === 'stop-terminal-click' && frame.status === 'error'), 8_000);
+    expect(mocks.protocolCalls.filter((call) => call.method === 'turn/start')).toHaveLength(1);
+    expect(mocks.protocolCalls.filter((call) => call.method === 'turn/interrupt')).toHaveLength(1);
+    expect(runtime.pendingEntries.map((entry) => entry.clientMessageId)).toEqual(['stop-terminal-B']);
+    expect(getTransportQueueStore().hasDeliveryTombstone(SESSION_CX, 'stop-terminal-B')).toBe(false);
+    expect(runtime.cancelStaleActiveTurnWithPending({ nowMs: Date.now() + 3_600_000, staleMs: 1 })).toBe(false);
+    for (let index = 0; index < 2; index++) {
+      const commandId = `stop-terminal-ordinary-${index}`;
+      handleWebCommand(ordinary === '/stop'
+        ? { type: SHARE_BROWSER_COMMANDS.SESSION_SEND, session: SESSION_CX, text: '/stop', commandId }
+        : { type: DAEMON_COMMAND_TYPES.SESSION_CANCEL, sessionName: SESSION_CX, commandId }, serverLink);
+      await waitForCondition(() => mocks.protocolCalls.filter((call) => call.method === 'turn/interrupt').length === index + 2);
+      await flushAsync();
+      expect(mocks.protocolCalls.filter((call) => call.method === 'turn/start')).toHaveLength(1);
+      expect(runtime.pendingEntries.map((entry) => entry.clientMessageId)).toEqual(['stop-terminal-B']);
+      expect(getTransportQueueStore().hasDeliveryTombstone(SESSION_CX, 'stop-terminal-B')).toBe(false);
+    }
+    mocks.holdCodexTurn = false;
+    mocks.finishCodexTurn!();
+    await waitForCondition(() => getTransportQueueStore().hasDeliveryTombstone(SESSION_CX, 'stop-terminal-B'));
+    expect(mocks.protocolCalls.filter((call) => call.method === 'turn/start')).toHaveLength(2);
+    expect(mocks.protocolCalls.filter((call) => call.method === 'turn/interrupt')).toHaveLength(3);
+    await flushAsync();
+    expect(mocks.protocolCalls.filter((call) => call.method === 'turn/start')).toHaveLength(2);
+  });
+
+  it('dispatches busy/tool-active Claude append into the current SDK input stream at next safe boundary', async () => {
+    mocks.holdClaudeQuery = true;
+    await launchSession({ name: SESSION_CC, projectName: 'ccsdk', role: 'brain', agentType: 'claude-code-sdk', projectDir: sharedContextTempDir });
+    const runtime = getTransportRuntime(SESSION_CC)!;
+    runtime.send('foreground', 'claude-native-A');
+    await waitForCondition(() => mocks.claudeInputs.length === 1);
+    const target = mocks.store.get(SESSION_CC) as any;
+    await dispatchSessionMessage(target, '中文\n第一条', { messageId: 'claude-native-B' });
+    await waitForCondition(() => mocks.claudeInputs.length === 2);
+    await dispatchSessionMessage(target, 'idle FIFO', { messageId: 'claude-native-Q', deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.QUEUE });
+    await dispatchSessionMessage(target, '第二条', { messageId: 'claude-native-C', deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND });
+    await waitForCondition(() => mocks.claudeInputs.length === 3 && !!mocks.releaseClaudeQuery);
+    expect(mocks.claudeInputs.slice(1)).toMatchObject([
+      { message: { content: '中文\n第一条' }, uuid: 'claude-native-B', priority: 'next' },
+      { message: { content: '第二条' }, uuid: 'claude-native-C', priority: 'next' },
+    ]);
+    expect(mocks.claudeCalls).toHaveLength(1);
+    expect(mocks.claudeInterrupts).toBe(0);
+    expect(runtime.hasActiveTurnWork()).toBe(true);
+    expect(runtime.pendingEntries.map((entry) => entry.clientMessageId)).toEqual(['claude-native-Q']);
+    mocks.holdClaudeQuery = false;
+    mocks.releaseClaudeQuery!();
+    await waitForCondition(() => mocks.claudeCalls.length === 2);
+  });
+
+  it('Stop on Claude control fallback waits for actual captured query termination, not interrupt receipt', async () => {
+    mocks.holdClaudeForStop = true;
+    await launchSession({ name: SESSION_CC, projectName: 'ccsdk', role: 'brain', agentType: 'claude-code-sdk', projectDir: sharedContextTempDir });
+    const runtime = getTransportRuntime(SESSION_CC)!;
+    runtime.send('foreground', 'stop-claude-A');
+    await waitForCondition(() => !!mocks.releaseClaudeQuery && getTransportQueueStore().hasDeliveryTombstone(SESSION_CC, 'stop-claude-A'));
+    runtime.send('/compact', 'stop-claude-B');
+    const serverLink = { send: vi.fn() } as any;
+    handleWebCommand({ type: DAEMON_COMMAND_TYPES.SESSION_CANCEL, sessionName: SESSION_CC, commandId: 'stop-claude-click', stopAndSendPendingMessageIds: ['stop-claude-B'] }, serverLink);
+    await waitForCondition(() => mocks.claudeInterrupts === 1);
+    expect(mocks.claudeCalls).toHaveLength(1);
+    expect(serverLink.send.mock.calls.some(([frame]) => frame.type === 'command.ack' && frame.commandId === 'stop-claude-click' && frame.status === 'accepted')).toBe(false);
+    mocks.holdClaudeForStop = false;
+    mocks.releaseClaudeQuery!();
+    await waitForCondition(() => serverLink.send.mock.calls.some(([frame]) => frame.type === 'command.ack' && frame.commandId === 'stop-claude-click' && frame.stopQueueOutcome === 'stopped_and_dispatched'));
+    await waitForCondition(() => mocks.claudeCalls.length === 2);
+    expect(getTransportQueueStore().hasDeliveryTombstone(SESSION_CC, 'stop-claude-B')).toBe(true);
+    expect(mocks.claudeInterrupts).toBe(1);
+  });
+
+  it.each([true, false])('Stop waits for Codex terminal proof across acceptance/refusal, retaining original ids (preaccept=%s)', async (preaccept) => {
+    mocks.holdCodexTurn = true;
+    mocks.refuseSteer = true;
+    await launchSession({ name: SESSION_CX, projectName: 'cxsdk', role: 'brain', agentType: 'codex-sdk', projectDir: sharedContextTempDir });
+    const runtime = getTransportRuntime(SESSION_CX)!;
+    runtime.send('foreground', 'stop-protocol-A');
+    await waitForCondition(() => !!mocks.acceptCodexTurn);
+    mocks.acceptCodexTurn!();
+    await waitForCondition(() => mocks.emitted.some((event) => event.session === SESSION_CX && event.type === 'tool.call'));
+    if (!preaccept) await waitForCondition(() => getTransportQueueStore().hasDeliveryTombstone(SESSION_CX, 'stop-protocol-A'));
+    runtime.send('pending 原消息', 'stop-protocol-B', undefined, undefined, { deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.QUEUE });
+    const serverLink = { send: vi.fn() } as any;
+    handleWebCommand({ type: DAEMON_COMMAND_TYPES.SESSION_CANCEL, sessionName: SESSION_CX, commandId: 'stop-protocol-click', stopAndSendPendingMessageIds: ['stop-protocol-B'] }, serverLink);
+    await waitForCondition(() => mocks.protocolCalls.some((call) => call.method === 'turn/interrupt'));
+    expect(mocks.protocolCalls.filter((call) => call.method === 'turn/start')).toHaveLength(1);
+    expect(serverLink.send.mock.calls.some(([frame]) => frame.type === 'command.ack' && frame.commandId === 'stop-protocol-click' && frame.status === 'accepted')).toBe(false);
+    mocks.holdCodexTurn = false;
+    mocks.finishCodexTurn!();
+    await waitForCondition(() => serverLink.send.mock.calls.some(([frame]) => frame.type === 'command.ack' && frame.commandId === 'stop-protocol-click' && frame.stopQueueOutcome === 'stopped_and_dispatched'));
+
+    await waitForCondition(() => mocks.protocolCalls.filter((call) => call.method === 'turn/start').length === 2);
+    expect(mocks.protocolCalls.filter((call) => call.method === 'turn/interrupt')).toHaveLength(1);
+    expect(getTransportQueueStore().hasDeliveryTombstone(SESSION_CX, 'stop-protocol-B')).toBe(true);
   });
 
   it('launches claude-code-sdk session and emits streaming + final transport timeline events', async () => {
@@ -1432,6 +2121,15 @@ describe('sdk transport flow e2e', () => {
     }, serverLink);
     await flushAsync();
     await waitForCondition(() => mocks.store.get(SESSION_CX)?.codexSessionId === 'thread-codex-e2e');
+    // The thread id arrives on thread.started, which PRECEDES every item this
+    // test then asserts. Waiting only for the id returns in the window before
+    // the turn has produced anything, and the assertions below read an empty
+    // timeline -- invisible on an idle machine, wide open on a loaded runner.
+    // Wait for the settled final message, which is the last thing the turn
+    // emits.
+    await waitForCondition(() => mocks.emitted.some((e) => e.session === SESSION_CX
+      && e.type === 'assistant.text'
+      && e.payload.streaming === false));
 
     const record = mocks.store.get(SESSION_CX);
     expect(record?.runtimeType).toBe('transport');

@@ -1,0 +1,123 @@
+
+ RUN  v3.2.7 /Users/k/.imcodes/worktrees/imcodes/deck_sub_0610320z/asg_nbp/repo
+
+ ❯ |daemon| test/agent/qwen-provider.test.ts (43 tests | 5 failed) 626ms
+   ✓ QwenProvider > connects by validating qwen CLI 6ms
+   ✓ QwenProvider > emits SDK subagent snapshots for Qwen runtime subagent notifications 6ms
+   ✓ QwenProvider > writes qwen reasoning settings and switches them per session effort 4ms
+   ✓ QwenProvider > preserves compatible API preset settings while forcing high qwen reasoning 2ms
+   ✓ QwenProvider > omits --auth-type when no preset settings are provided (preserves default qwen auth) 1ms
+   ✓ QwenProvider > allows the daemon MCP server and passes per-session Memory MCP identity env to qwen 3ms
+   ✓ QwenProvider > ignores settings.security.auth.selectedType that qwen CLI does not recognize 1ms
+   ✓ QwenProvider > preserves preset settings (security + modelProviders + model.name) when effort changes on subsequent sends 4ms
+   ✓ QwenProvider > passes session-specific preset env through to the spawned qwen process 1ms
+   ✓ QwenProvider > uses --session-id on first send, streams cumulative deltas, then resumes with --resume 3ms
+   ✓ QwenProvider > turns an empty zero-exit qwen run into a recoverable terminal error when retry budget is exhausted 3ms
+   ✓ QwenProvider > uses a provided UUID resumeId when restoring qwen sessions 1ms
+   ✓ QwenProvider > maps normalized payloads into qwen CLI prompt/system arguments 1ms
+   ✓ QwenProvider > translates IM.codes /compact into Qwen CLI /compress without context preambles 3ms
+   ✓ QwenProvider > rejects normalized payloads combined with legacy extraSystemPrompt 1ms
+   ✓ QwenProvider > falls back to a fresh session when --resume points to a missing qwen conversation id 16ms
+   ✓ QwenProvider > accepts a normalized provider payload 1ms
+   ✓ QwenProvider > injects split stable context only once and keeps per-turn context on later sends 5ms
+   ✓ QwenProvider > does not fall back to the session description after split stable context is injected 3ms
+   ✓ QwenProvider > keeps the legacy description fallback for raw string sends 1ms
+   ✓ QwenProvider > normalizes Windows cwd before spawning qwen 2ms
+   ✓ QwenProvider > keeps the streaming message id for final completion when qwen emits a different assistant id 3ms
+   ✓ QwenProvider > prefers assistant per-turn usage over cumulative result usage for ctx display 2ms
+   ✓ QwenProvider > queued messages batch-drain after the active turn completes 26ms
+   ✓ QwenProvider > drains queued messages from a terminal qwen result even when the process close is missing 26ms
+   ✓ QwenProvider > emits provider error on result is_error payload 3ms
+   ✓ QwenProvider > surfaces qwen synthetic API auth failures as AUTH_FAILED errors 5ms
+   ✓ QwenProvider > retries a transient Premature close once before surfacing an error  356ms
+   ✓ QwenProvider > retries qwen reasoning_content replay errors in a fresh high-thinking conversation 18ms
+   ✓ QwenProvider > retries qwen tool-call history replay errors in a fresh conversation 16ms
+   ✓ QwenProvider > does not retry transient errors after partial output has streamed 4ms
+   ✓ QwenProvider > cancel() terminates the child and emits a cancelled error 2ms
+   ✓ QwenProvider > suppresses buffered qwen output after cancel so stop cannot leak assistant text 3ms
+   ✓ QwenProvider > emits tool.call and tool.result events for qwen tool blocks 5ms
+   ✓ QwenProvider > emits thinking status from qwen thinking blocks and clears it on text output 2ms
+   ✓ QwenProvider > cross-message streaming accumulator > resets the streaming accumulator at each message_start so a second message is not prefixed with the first 2ms
+   × qwen system prompt argv budget > keeps the qwen argument budget strictly under Linux MAX_ARG_STRLEN 5ms
+     → expected undefined to be 131072 // Object.is equality
+   × qwen system prompt argv budget > filled ASCII identity: the sent argument fits, stays well-formed and keeps supervision text 3ms
+     → expected value must be number or bigint, received "undefined"
+   × qwen system prompt argv budget > filled CJK identity: the sent argument fits, stays well-formed and keeps supervision text 2ms
+     → expected value must be number or bigint, received "undefined"
+   × qwen system prompt argv budget > filled emoji identity: the sent argument fits, stays well-formed and keeps supervision text 3ms
+     → expected value must be number or bigint, received "undefined"
+   ✓ qwen system prompt argv budget > starts a real process with a full 200k CJK session identity once capped, where the uncapped argument cannot 61ms
+   × qwen system prompt argv budget > starts a real process with a filled emoji identity once capped, where the uncapped argument exceeds ARG_MAX on any POSIX host 8ms
+     → expected { status: null, code: 'E2BIG' } to deeply equal { status: +0, code: undefined }
+   ✓ qwen system prompt argv budget > sends a small identity unchanged 1ms
+
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 5 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  |daemon| test/agent/qwen-provider.test.ts > qwen system prompt argv budget > keeps the qwen argument budget strictly under Linux MAX_ARG_STRLEN
+AssertionError: expected undefined to be 131072 // Object.is equality
+
+[32m- Expected:[39m 
+131072
+
+[31m+ Received:[39m 
+undefined
+
+ ❯ test/agent/qwen-provider.test.ts:1532:40
+    1530| 
+    1531|   it('keeps the qwen argument budget strictly under Linux MAX_ARG_STRL…
+    1532|     expect(LINUX_MAX_ARG_STRLEN_BYTES).toBe(131_072);
+       |                                        ^
+    1533|     // The kernel limit includes the terminating NUL.
+    1534|     expect(QWEN_APPEND_SYSTEM_PROMPT_MAX_BYTES).toBeLessThan(LINUX_MAX…
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/5]⎯
+
+ FAIL  |daemon| test/agent/qwen-provider.test.ts > qwen system prompt argv budget > filled ASCII identity: the sent argument fits, stays well-formed and keeps supervision text
+ FAIL  |daemon| test/agent/qwen-provider.test.ts > qwen system prompt argv budget > filled CJK identity: the sent argument fits, stays well-formed and keeps supervision text
+ FAIL  |daemon| test/agent/qwen-provider.test.ts > qwen system prompt argv budget > filled emoji identity: the sent argument fits, stays well-formed and keeps supervision text
+TypeError: expected value must be number or bigint, received "undefined"
+ ❯ test/agent/qwen-provider.test.ts:1544:45
+    1542|     const { sent, full } = await sentSystemPrompt(`sess-argv-${label}`…
+    1543| 
+    1544|     expect(Buffer.byteLength(full, 'utf8')).toBeGreaterThan(LINUX_MAX_…
+       |                                             ^
+    1545|     expect(Buffer.byteLength(sent, 'utf8')).toBeLessThanOrEqual(QWEN_A…
+    1546|     expect(Buffer.from(sent, 'utf8').toString('utf8')).toBe(sent);
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[2/5]⎯
+
+ FAIL  |daemon| test/agent/qwen-provider.test.ts > qwen system prompt argv budget > starts a real process with a filled emoji identity once capped, where the uncapped argument exceeds ARG_MAX on any POSIX host
+AssertionError: expected { status: null, code: 'E2BIG' } to deeply equal { status: +0, code: undefined }
+
+[32m- Expected[39m
+[31m+ Received[39m
+
+[2m  {[22m
+[32m-   "code": undefined,[39m
+[32m-   "status": 0,[39m
+[31m+   "code": "E2BIG",[39m
+[31m+   "status": null,[39m
+[2m  }[22m
+
+ ❯ test/agent/qwen-provider.test.ts:1571:5
+    1569|     expect(Buffer.byteLength(full, 'utf8')).toBeGreaterThan(1_048_576);
+    1570| 
+    1571|     await expect(realSpawnResult(sent)).resolves.toEqual({ status: 0, …
+       |     ^
+    1572|     if (process.platform !== 'win32') {
+    1573|       await expect(realSpawnResult(full)).resolves.toMatchObject({ cod…
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[3/5]⎯
+
+
+ Test Files  1 failed (1)
+      Tests  5 failed | 38 passed (43)
+   Start at  00:32:43
+   Duration  2.02s (transform 751ms, setup 15ms, collect 1.07s, tests 626ms, environment 0ms, prepare 43ms)
+
+npm notice
+npm notice New minor version of npm available! 11.8.0 -> 11.19.1
+npm notice Changelog: https://github.com/npm/cli/releases/tag/v11.19.1
+npm notice To update run: npm install -g npm@11.19.1
+npm notice
+EXIT=1

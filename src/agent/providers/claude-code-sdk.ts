@@ -1,10 +1,18 @@
+import { confirmPromiseStop, bindCapturedChildStop, confirmCapturedChildExit } from '../provider-stop-confirmation.js';
 import { randomUUID } from 'node:crypto';
+import { backpressureYield } from '../../util/event-loop-backpressure.js';
 import { access } from 'node:fs/promises';
 import { constants as fsConstants, statSync } from 'node:fs';
 import { spawn, type ChildProcess } from 'node:child_process';
+import {
+  agentResourceOwner,
+  bindAgentProcessResource,
+  type AgentProcessResource,
+} from './agent-process-resource.js';
+import type { SessionResourceOwner } from '../../daemon/session-resource-registry.js';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { query, type PermissionMode, type SDKMessage, type SDKUserMessage } from '@anthropic-ai/claude-agent-sdk';
+import { query, type Options as ClaudeSdkOptions, type PermissionMode, type SDKMessage, type SDKUserMessage } from '@anthropic-ai/claude-agent-sdk';
 import { stripLeakedThink } from '../../util/strip-leaked-think.js';
 import { killProcessTree } from '../../util/kill-process-tree.js';
 import type {
@@ -19,6 +27,7 @@ import type {
   ProviderUsageUpdate,
   ProviderDelegationNotification,
   ToolCallEvent,
+  ToolExecutionGuard,
 } from '../transport-provider.js';
 import {
   BACKGROUND_SUBAGENT_WAKE_MODES,
@@ -42,6 +51,7 @@ import { composeMessageSideProviderPrompt, getProviderSystemTextParts } from '..
 import { getDefaultMcpServers } from './getDefaultMcpServers.js';
 import { claudeRateLimitsToQuotaMeta, type ClaudeRateLimitInfo } from '../claude-rate-limit.js';
 import { formatProviderQuotaLabel } from '../../../shared/provider-quota.js';
+import { claudeRateLimitSignal } from '../claude-rate-limit.js';
 import { IMCODES_MEMORY_MCP_SERVER_NAME } from '../../../shared/memory-mcp-server-name.js';
 import {
   AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES,
@@ -49,6 +59,12 @@ import {
   type AgentDelegationNotificationResult,
 } from '../../../shared/agent-delegation.js';
 import { CLAUDE_SYNTHETIC_SEED_TEXT } from '../../shared/claude-synthetic-seed.js';
+import {
+  NATIVE_AGENT_ADMISSION_MODES,
+  collectNativeAgentRequestStrings,
+  type NativeCollaborationGate,
+} from '../../../shared/native-collaboration-policy.js';
+import { CLAUDE_NATIVE_AGENT_TOOLS } from '../native-agent-fence.js';
 import {
   SDK_SUBAGENT_DETAIL_KIND,
   SDK_SUBAGENT_DIAGNOSTIC,
@@ -93,6 +109,11 @@ const CLAUDE_SDK_INPUT_PRIORITIES = {
 // the native ones to force the agent through our cron (one source of truth,
 // pod-routed, visible in our cron UI).
 const DISALLOWED_NATIVE_TOOLS = ['RemoteTrigger', 'CronCreate', 'CronList', 'CronUpdate', 'CronDelete'];
+// Native agent tools (spawn, workflow orchestration, send-more-work) stay
+// available; every call is routed through the daemon's supervision-authority
+// gate BEFORE it runs, which admits only proven analysis in managed sessions.
+const CLAUDE_NATIVE_AGENT_TOOL_NAMES: ReadonlySet<string> = new Set(CLAUDE_NATIVE_AGENT_TOOLS);
+const CLAUDE_NATIVE_AGENT_TOOL_MATCHER = CLAUDE_NATIVE_AGENT_TOOLS.join('|');
 const CLAUDE_TASK_SYSTEM_SUBTYPES = new Set([
   'task_started',
   'task_progress',
@@ -165,6 +186,10 @@ interface ClaudeSdkSessionState {
   currentText: string;
   currentQuery: ReturnType<typeof query> | null;
   currentChild: ChildProcess | null;
+  /** Owner identity for the registry lease on the spawned agent CLI. */
+  resourceOwner?: SessionResourceOwner | null;
+  /** Registry lease for `currentChild`, released when it exits or is reaped. */
+  agentResource?: AgentProcessResource;
   completed: boolean;
   cancelled: boolean;
   finalMetadata?: Record<string, unknown>;
@@ -371,9 +396,33 @@ function normalizeStatusName(status: string | undefined): string {
   return (status ?? '').replace(/[_\s-]+/g, '').toLowerCase();
 }
 
+/**
+ * A genuine Claude auth-failure notice, as opposed to prose that mentions one.
+ *
+ * Anchored to a message or segment boundary on purpose. The previous predicate
+ * made the `api error:` prefix optional, so it reduced to "a bare 401 anywhere
+ * in the text" — and it is applied to assistant prose, not only to transport
+ * errors. Any answer that merely contained the digits matched: a currency
+ * amount (`401.61 元/G/月`), a source line (`enroll.ts:401`), an explanation of
+ * what HTTP 401 means, or a truthful quotation of an error while discussing
+ * this very detector. Each of those got "run /logout and restart" appended to a
+ * correct answer, which is worse than saying nothing: it tells the user their
+ * session is broken when it is not.
+ *
+ * A real notice occupies a whole message or a whole `; `-joined SDK error
+ * segment. Prose embeds the phrase mid-sentence, and that is the distinction
+ * this matches on.
+ */
+const CLAUDE_AUTH_FAILURE_SEGMENT =
+  /(?:^|[\n;]\s*)(?:failed to authenticate\b|invalid authentication credentials\b|api error:\s*401\b)/i;
+
+export function isClaudeAuthFailureMessage(message: string): boolean {
+  return CLAUDE_AUTH_FAILURE_SEGMENT.test(message.trim());
+}
+
 function appendClaudeAuthRecoveryGuidance(message: string): string {
   if (isClaudeCredentialRefresh403(message)) return message;
-  if (!/failed to authenticate|invalid authentication credentials|(?:api error:\s*)?401\b/i.test(message)) return message;
+  if (!isClaudeAuthFailureMessage(message)) return message;
   return appendClaudeAuthRecoveryGuidanceUnconditionally(message);
 }
 
@@ -430,10 +479,13 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     multiTurn: true,
     attachments: false,
     reasoningEffort: true,
+    // Every query names its cwd (the pair workspace, else the session cwd); a resumed session keeps its history under another cwd.
+    turnCwd: true,
     supportedEffortLevels: CLAUDE_SDK_EFFORT_LEVELS,
     contextSupport: 'full-normalized-context-injection',
     backgroundSubagentWake: BACKGROUND_SUBAGENT_WAKE_MODES.NATIVE,
     activeDelegationNotification: AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE,
+    nativeAgentAdmission: NATIVE_AGENT_ADMISSION_MODES.PRE_EXECUTION_GATE,
     compact: {
       execution: 'slash-command',
       providerCommand: '/compact',
@@ -441,15 +493,30 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
       completion: 'status-only',
       cancellation: 'provider-cancel',
       reason: 'Verified with Claude Agent SDK 0.2.119 supportedCommands(): compact is a provider slash command, not an active RPC.',
+      // The session system text rides in the SDK `systemPrompt` option on every query, never in the compactable history.
+      reassertsSessionSystemText: true,
     },
   };
 
   private config: ProviderConfig | null = null;
   private sessions = new Map<string, ClaudeSdkSessionState>();
+
+  /**
+   * Teardowns started from synchronous helpers.
+   *
+   * Three call sites are sync by contract — one returns a boolean used in
+   * conditions, one arms a timer — so they cannot await the escalation. They
+   * must not DISCARD it either: a dropped promise is how a SIGTERM lands with
+   * its SIGKILL never following. They are tracked here and drained by
+   * `disconnect()`, which is what daemon shutdown awaits.
+   */
+  private pendingTeardowns = new Set<Promise<void>>();
   private deltaCallbacks: Array<(sessionId: string, delta: MessageDelta) => void> = [];
   private completeCallbacks: Array<(sessionId: string, message: AgentMessage) => void> = [];
   private errorCallbacks: Array<(sessionId: string, error: ProviderError) => void> = [];
   private toolCallCallbacks: Array<(sessionId: string, tool: ToolCallEvent) => void> = [];
+  private nativeCollaborationGate?: NativeCollaborationGate;
+  private toolExecutionGuard?: ToolExecutionGuard;
   private sessionInfoCallbacks: Array<(sessionId: string, info: SessionInfoUpdate) => void> = [];
   private statusCallbacks: Array<(sessionId: string, status: ProviderStatusUpdate) => void> = [];
   private usageCallbacks: Array<(sessionId: string, update: ProviderUsageUpdate) => void> = [];
@@ -467,7 +534,18 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
   }
 
   async connect(config: ProviderConfig): Promise<void> {
-    const binaryPath = this.getConfiguredBinaryPath(config);
+    // Probe the binary the SDK will actually spawn. The default name `claude`
+    // is resolved to the native binary bundled with our SDK dependency (then
+    // common per-user installs) -- exactly like every real spawn does. Probing
+    // the bare name instead only asked whether `claude` is on the daemon's
+    // PATH, which a systemd/nvm daemon's usually is not: connect() then failed
+    // with `spawn claude ENOENT` on machines that run Claude fine (every
+    // Claude/MiniMax/GLM session failed to start, and auto-resume failed the
+    // same way). Windows keeps its own shim resolution below.
+    const configuredBinary = this.getConfiguredBinaryPath(config);
+    const binaryPath = process.platform === 'win32'
+      ? configuredBinary
+      : resolveClaudeCodePathForSdk(configuredBinary);
     const resolved = resolveExecutableForSpawn(binaryPath);
     await access(resolved.executable, fsConstants.X_OK).catch(async () => {
       const { execFile } = await import('node:child_process');
@@ -509,7 +587,12 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
       this.clearResultCompletionFallback(state);
       this.clearTaskNotificationWake(state);
       try { state.currentQuery?.close(); } catch {}
-      this.terminateChild(state);
+      await this.terminateChild(state);
+    }
+    // Anything a synchronous helper started must finish its escalation before
+    // shutdown reports this phase complete.
+    if (this.pendingTeardowns.size > 0) {
+      await Promise.allSettled([...this.pendingTeardowns]);
     }
     this.sessions.clear();
     this.config = null;
@@ -539,6 +622,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
       currentText: existing?.currentText ?? '',
       currentQuery: null,
       currentChild: null,
+      resourceOwner: agentResourceOwner(config) ?? existing?.resourceOwner ?? null,
       completed: false,
       cancelled: false,
       finalMetadata: existing?.finalMetadata,
@@ -661,7 +745,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
       this.clearResultCompletionFallback(state);
       this.clearTaskNotificationWake(state);
       try { state.currentQuery?.close(); } catch {}
-      this.terminateChild(state);
+      await this.terminateChild(state);
       this.sessions.delete(sessionId);
     }
   }
@@ -692,6 +776,66 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
 
   onToolCall(cb: (sessionId: string, tool: ToolCallEvent) => void): void {
     this.toolCallCallbacks.push(cb);
+  }
+
+  setNativeCollaborationGate(gate: NativeCollaborationGate): void {
+    this.nativeCollaborationGate = gate;
+  }
+
+  setToolExecutionGuard(guard: ToolExecutionGuard): void {
+    this.toolExecutionGuard = guard;
+  }
+
+  /**
+   * PreToolUse hook for the Bash tool: the daemon may refuse a command before
+   * it runs (a pair participant writing git state in the main checkout). Any
+   * failure of the guard allows the call: a guard must never break a tool.
+   */
+  private evaluateToolExecutionHook(state: ClaudeSdkSessionState, input: unknown): Record<string, unknown> {
+    const hookInput = this.asRecord(input);
+    const guard = this.toolExecutionGuard;
+    if (!guard || !hookInput || hookInput.hook_event_name !== 'PreToolUse') return {};
+    try {
+      const decision = guard(state.routeId, {
+        toolName: typeof hookInput.tool_name === 'string' ? hookInput.tool_name : '',
+        input: hookInput.tool_input,
+        cwd: typeof hookInput.cwd === 'string' && hookInput.cwd ? hookInput.cwd : state.cwd,
+        ...(typeof hookInput.tool_use_id === 'string' ? { toolUseId: hookInput.tool_use_id } : {}),
+      });
+      if (decision.allow) return {};
+      return { hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: decision.reason } };
+    } catch (error) {
+      logger.warn({ provider: this.id, error }, 'Claude SDK tool execution guard failed; allowing the call');
+      return {};
+    }
+  }
+
+  /**
+   * PreToolUse hook for native agent tools (Agent/Task spawn, Workflow
+   * orchestration, SendMessage follow-up work). It records the request through
+   * the daemon's advisory contract callback; it never vetoes the provider call.
+   */
+  private evaluateNativeAgentToolHook(state: ClaudeSdkSessionState, input: unknown): Record<string, unknown> {
+    const hookInput = this.asRecord(input);
+    if (!hookInput || hookInput.hook_event_name !== 'PreToolUse') return {};
+    const toolName = typeof hookInput.tool_name === 'string' ? hookInput.tool_name : '';
+    if (!CLAUDE_NATIVE_AGENT_TOOL_NAMES.has(toolName)) return {};
+    const gate = this.nativeCollaborationGate;
+    if (!gate) return {};
+    // Every request string the tool carries: prompt and description, a
+    // workflow's script, name and args, a follow-up message.
+    const requestText = collectNativeAgentRequestStrings(hookInput.tool_input).join('\n');
+    try {
+      gate(state.routeId, {
+        provider: this.id,
+        toolName,
+        requestText,
+        ...(typeof hookInput.tool_use_id === 'string' ? { toolUseId: hookInput.tool_use_id } : {}),
+      });
+    } catch (error) {
+      logger.warn({ provider: this.id, error }, 'Claude SDK native collaboration advisory failed');
+    }
+    return {};
   }
 
   onSessionInfo(cb: (sessionId: string, info: SessionInfoUpdate) => void): () => void {
@@ -791,8 +935,9 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     // human-authored when it drained and "not from the user" when it was
     // appended. Only genuine runtime notifications (delegation replies, peer
     // audits) are synthetic peer input.
-    const isQueuedUserMessage = notification.deliveryKind
-      === PROVIDER_ACTIVE_TURN_DELIVERY_KINDS.QUEUED_MESSAGE;
+    const isHumanAppendedMessage = notification.deliveryKind
+      === PROVIDER_ACTIVE_TURN_DELIVERY_KINDS.QUEUED_MESSAGE
+      || notification.deliveryKind === PROVIDER_ACTIVE_TURN_DELIVERY_KINDS.MCP_MESSAGE;
     state.inputQueue.push({
       type: 'user',
       message: { role: 'user', content: notification.text },
@@ -804,7 +949,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
       // `next` is still injected into the active query after its current tool
       // result — it does not wait for the normal idle FIFO to drain.
       priority: CLAUDE_SDK_INPUT_PRIORITIES.NEXT_SAFE_BOUNDARY,
-      origin: isQueuedUserMessage
+      origin: isHumanAppendedMessage
         ? { kind: 'human' }
         : {
           kind: 'peer',
@@ -812,9 +957,44 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
           name: notification.delegationId,
         },
       shouldQuery: true,
-      ...(isQueuedUserMessage ? {} : { isSynthetic: true }),
+      ...(isHumanAppendedMessage ? {} : { isSynthetic: true }),
     } as SDKUserMessage);
     return AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED;
+  }
+
+  private readonly querySettlements = new WeakMap<ReturnType<typeof query>, Promise<void>>();
+  private readonly confirmedCancelOperations = new Map<string, Promise<void>>();
+
+  /** Strong Stop proof is the captured query ending or its actual child exit. */
+  cancelAndWait(sessionId: string): Promise<void> {
+    const existing = this.confirmedCancelOperations.get(sessionId);
+    if (existing) return existing;
+    const state = this.sessions.get(sessionId);
+    const activeQuery = state?.currentQuery;
+    if (!state || !activeQuery) return Promise.reject(new Error('Claude has no captured query to confirm stop'));
+    const generation = state.turnGeneration;
+    const settlement = this.querySettlements.get(activeQuery);
+    if (!settlement) return Promise.reject(new Error('Claude query settlement unavailable'));
+    const capturedChild = state.currentChild;
+    let removeExitListener = () => {};
+    const terminal = capturedChild ? Promise.race([
+      settlement,
+      new Promise<void>((resolve) => {
+        if (capturedChild.exitCode !== null || capturedChild.signalCode !== null) { resolve(); return; }
+        const onExit = () => resolve();
+        capturedChild.once('exit', onExit);
+        removeExitListener = () => capturedChild.removeListener('exit', onExit);
+      }),
+    ]) : settlement;
+    const operation = confirmPromiseStop(activeQuery, terminal, () => this.cancel(sessionId),
+      () => this.sessions.get(sessionId) === state && state.turnGeneration === generation);
+    if (capturedChild) bindCapturedChildStop(capturedChild, operation);
+    this.confirmedCancelOperations.set(sessionId, operation);
+    void operation.finally(() => {
+      removeExitListener();
+      if (this.confirmedCancelOperations.get(sessionId) === operation) this.confirmedCancelOperations.delete(sessionId);
+    }).catch(() => {});
+    return operation;
   }
 
   async cancel(sessionId: string): Promise<void> {
@@ -835,7 +1015,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     try {
       state.currentQuery.close();
     } catch {}
-    this.terminateChild(state);
+    await this.terminateChild(state);
   }
 
   private async startQuery(
@@ -880,11 +1060,25 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     state.currentConnectionClosedRetriesRemaining = connectionClosedRetriesRemaining;
     state.currentAuthRefreshRetriesRemaining = authRefreshRetriesRemaining;
     const credentialsMtimeMs = this.readClaudeCredentialsMtimeMs(state);
+    const sdkSystemPrompt: ClaudeSdkOptions['systemPrompt'] = baseSystemPrompt ? {
+      type: 'preset',
+      preset: 'claude_code',
+      append: baseSystemPrompt,
+    } : undefined;
     const options: Record<string, unknown> = {
-      cwd: state.cwd,
+      cwd: payload.turnCwd ?? state.cwd,
       ...(state.env ? { env: { ...process.env, ...state.env } } : {}),
       permissionMode: state.permissionMode,
       disallowedTools: DISALLOWED_NATIVE_TOOLS,
+      hooks: {
+        PreToolUse: [{
+          matcher: CLAUDE_NATIVE_AGENT_TOOL_MATCHER,
+          hooks: [async (input: unknown) => this.evaluateNativeAgentToolHook(state, input)],
+        }, {
+          matcher: 'Bash',
+          hooks: [async (input: unknown) => this.evaluateToolExecutionHook(state, input)],
+        }],
+      },
       pathToClaudeCodeExecutable: resolvedBinary,
       includePartialMessages: true,
       agentProgressSummaries: false,
@@ -896,18 +1090,38 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
       mcpServers: getClaudeMcpServers({
         sessionKey: state.routeId,
         sessionName: state.sessionName,
+        // `startQuery` rebuilds the MCP configuration on every turn (including
+        // resume and credential-refresh retries). Keep the resource owner in
+        // that rebuild. Omitting these two fields made the managed MCP inherit
+        // similarly named variables from the daemon/SDK child environment;
+        // when the daemon itself had been started from another managed
+        // session, one session's MCP process could therefore present another
+        // session's instance/epoch while retaining the correct session name.
+        sessionInstanceId: state.resourceOwner?.sessionInstanceId,
+        runtimeEpoch: state.resourceOwner?.runtimeEpoch,
         projectName: state.projectName,
         serverId: state.serverId,
         cwd: state.cwd,
         env: state.env,
         contextNamespace: state.contextNamespace,
       }),
-      ...(baseSystemPrompt ? {
-        appendSystemPrompt: baseSystemPrompt,
+      ...(sdkSystemPrompt ? {
+        // Claude Agent SDK does not accept `appendSystemPrompt` as a top-level
+        // query option. It only serializes the append text from the documented
+        // preset form below into its initialize control request. A top-level
+        // field survives loose mocks/`as any` but is silently ignored by the
+        // real SDK, which left every IM.codes system contract absent on Claude
+        // and Anthropic-compatible custom endpoints.
+        systemPrompt: sdkSystemPrompt,
       } : {}),
     };
     options.spawnClaudeCodeProcess = (req: { command: string; args: string[]; cwd?: string; env?: Record<string, string>; signal?: AbortSignal }) => {
       const child = spawn(req.command, req.args, {
+        // Own process group and session on POSIX. A reparented descendant keeps
+        // its PGID but loses its PPID, so after the agent parent dies this is the
+        // only ownership token teardown still has. Without it the eight vitest
+        // workers of the incident were unreachable on PPID=1.
+        detached: process.platform !== 'win32',
         cwd: req.cwd,
         env: req.env,
         signal: req.signal,
@@ -915,7 +1129,14 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
         windowsHide: true,
       });
       state.currentChild = child;
+      // Crash coverage: if the daemon dies without running teardown, the
+      // startup sweep reaps this group using the registry's process-start
+      // fingerprint. Registration is async and this callback must return the
+      // ChildProcess synchronously, so the lease object retains the pending
+      // registration and `release()` awaits it.
+      state.agentResource = bindAgentProcessResource(state.resourceOwner ?? null, child);
       child.once('exit', () => {
+        confirmCapturedChildExit(child);
         if (state.currentChild === child) state.currentChild = null;
       });
       child.on('error', (err) => {
@@ -956,7 +1177,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     const q = query({ prompt: inputQueue, options: options as any });
     const turnGeneration = ++state.turnGeneration;
     state.currentQuery = q;
-    void this.consumeQuery(
+    const settlement = this.consumeQuery(
       sessionId,
       state,
       q,
@@ -968,6 +1189,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
       authRefreshRetriesRemaining,
       credentialsMtimeMs,
     );
+    this.querySettlements.set(q, settlement);
   }
 
   private async consumeQuery(
@@ -986,6 +1208,9 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     try {
       for await (const msg of q) {
         this.handleMessage(sessionId, state, msg, turnGeneration);
+        // Past the SDK's own reader: not pulling the next message while the loop is overloaded lets the SDK's stdout
+        // reader fill and the `claude` child wait (nothing is dropped), instead of queueing messages in this heap.
+        await backpressureYield();
       }
       if (!pendingError && state.pendingError) {
         pendingError = state.pendingError;
@@ -1161,7 +1386,8 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     const authRefreshRetries = state.currentAuthRefreshRetriesRemaining ?? CLAUDE_AUTH_REFRESH_RETRY_LIMIT;
     const previousResumeId = state.resumeId;
     try { state.currentQuery?.close(); } catch {}
-    this.terminateChild(state);
+    // Sync caller: retained rather than awaited, and drained by disconnect().
+    this.trackTeardown(this.terminateChild(state));
     state.currentQuery = null;
     state.currentChild = null;
     state.pendingComplete = undefined;
@@ -1334,9 +1560,20 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
       if (info?.rateLimitType) {
         state.rateLimits = { ...(state.rateLimits ?? {}), [info.rateLimitType]: info };
         const quotaMeta = claudeRateLimitsToQuotaMeta(state.rateLimits);
-        if (quotaMeta) {
-          const quotaLabel = formatProviderQuotaLabel(quotaMeta);
-          this.emitSessionInfo(sessionId, { ...(quotaLabel ? { quotaLabel } : {}), quotaMeta });
+        // The VERDICT, mapped here in Claude's own adapter. `quotaMeta` above is
+        // display telemetry and cannot answer "are we being refused" --
+        // `usedPercent` is undefined while healthy, so a threshold on it would
+        // be a policy we invented rather than something Claude stated.
+        // `status` is what Claude actually said, and it used to be parsed and
+        // then dropped, leaving nothing downstream to read.
+        const limitSignal = claudeRateLimitSignal(info, this.id, Date.now());
+        const quotaLabel = quotaMeta ? formatProviderQuotaLabel(quotaMeta) : undefined;
+        if (quotaMeta || limitSignal) {
+          this.emitSessionInfo(sessionId, {
+            ...(quotaLabel ? { quotaLabel } : {}),
+            ...(quotaMeta ? { quotaMeta } : {}),
+            ...(limitSignal ? { limitSignal } : {}),
+          });
         }
       }
       return;
@@ -1824,7 +2061,8 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
         return;
       }
       try { q.close(); } catch {}
-      this.terminateChild(state);
+      // Sync caller: retained rather than awaited, and drained by disconnect().
+      this.trackTeardown(this.terminateChild(state));
       state.currentQuery = null;
       state.currentChild = null;
       for (const cb of this.completeCallbacks) cb(sessionId, pendingComplete);
@@ -2468,7 +2706,8 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     const q = state.currentQuery;
     state.currentQuery = null;
     try { q.close(); } catch {}
-    this.terminateChild(state);
+    // Sync caller: retained rather than awaited, and drained by disconnect().
+    this.trackTeardown(this.terminateChild(state));
     state.currentChild = null;
     logger.info({
       provider: this.id,
@@ -2988,22 +3227,35 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     } catch {}
     try { q.close(); } catch {}
     if (child && !child.killed) {
-      void killProcessTree(child, { gracefulMs: FORCE_KILL_TIMEOUT_MS });
+      await killProcessTree(child, { gracefulMs: FORCE_KILL_TIMEOUT_MS, ownsProcessGroup: true });
     }
     if (state.currentChild === child) state.currentChild = null;
+    // The group is gone, so the lease must go too — otherwise a later startup
+    // sweep would hold a record for a pid that is no longer ours.
+    const lease = state.agentResource;
+    state.agentResource = undefined;
+    await lease?.release();
   }
 
   private makeError(code: string, message: string, recoverable: boolean, details?: unknown): ProviderError {
     return { code, message, recoverable, ...(details !== undefined ? { details } : {}) };
   }
 
-  private terminateChild(state: ClaudeSdkSessionState): void {
+  /** Retain a teardown a synchronous caller cannot await, so shutdown can. */
+  private trackTeardown(teardown: Promise<void>): void {
+    this.pendingTeardowns.add(teardown);
+    void teardown.catch(() => {}).finally(() => { this.pendingTeardowns.delete(teardown); });
+  }
+
+  // Async on purpose: teardown must be awaitable, or shutdown resolves while
+  // the SIGTERM->SIGKILL window is still open and the SIGKILL never lands.
+  private async terminateChild(state: ClaudeSdkSessionState): Promise<void> {
     const child = state.currentChild;
     if (!child || child.killed) return;
     // Tree-kill instead of single SIGTERM: the claude-code wrapper may spawn
     // native descendants that survive a wrapper-only kill. killProcessTree
     // walks the descendant tree via `ps` and SIGKILLs stragglers after
     // FORCE_KILL_TIMEOUT_MS. Fire-and-forget so callers stay synchronous.
-    void killProcessTree(child, { gracefulMs: FORCE_KILL_TIMEOUT_MS });
+    await killProcessTree(child, { gracefulMs: FORCE_KILL_TIMEOUT_MS, ownsProcessGroup: true });
   }
 }

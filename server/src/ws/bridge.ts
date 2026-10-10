@@ -1,3 +1,8 @@
+import { machineGroupInvalidationReady, machineGroupInvalidationRevision } from '../services/machine-group-invalidation.js';
+import {
+  CONTROLLED_NODE_ABI_MODERN, CONTROLLED_NODE_ABI_GLIBC217,
+  CONTROLLED_NODE_ABI_PROFILE_FIELD, normalizeControlledNodeAbiProfile, type ControlledNodeAbiProfile,
+} from '../../../shared/controlled-node-abi.js';
 /**
  * WsBridge: per-server WebSocket bridge between daemon and browser clients.
  * Replaces the CF DaemonBridge Durable Object.
@@ -12,15 +17,73 @@
  * terminal.stream_reset and unsubscribes the browser from that session.
  */
 
-import WebSocket from 'ws';
+import { ACCOUNT_WS_CLOSE_CODE, USER_STATUS, isUserStatusActive, userStatusDenialCode } from '../../../shared/user-status.js';
+import { buildCronExecutionResultUpdate } from '../cron/execution-result.js';
+import {
+  CONTROLLED_NODE_ACK_SERVER_URLS_FIELD,
+  CONTROLLED_NODE_PUBLIC_URLS_ENV,
+  parseControlledNodePublicUrls,
+} from '../../../shared/controlled-node-endpoints.js';
+import { AGENT_SKILLS_MESSAGE_PREFIX, AGENT_SKILLS_MSG } from '../../../shared/agent-skills.js';
+import { AGENT_MCP_MESSAGE_PREFIX, AGENT_MCP_MSG } from '../../../shared/agent-mcp.js';
+import { ControlledBrowserReadGate } from './controlled-browser-read-gate.js';
+import { DaemonRequestTracker } from './daemon-request-tracker.js';
+import { CommandAckOriginRouter } from './command-ack-origin-router.js';
+import WebSocket, { type RawData } from 'ws';
+import { CLOCK_SYNC_FIELD } from '../../../shared/clock-sync.js';
 import { performance } from 'node:perf_hooks';
-import { randomUUID } from 'node:crypto';
+import { randomUUID, createHash } from 'node:crypto';
 import type { Database } from '../db/client.js';
 import type { Env } from '../env.js';
 import { MemoryRateLimiter } from './rate-limiter.js';
+import { SHARE_MESSAGE_LANE, SHARE_MESSAGE_LANE_MAX_PENDING, shareBrowserMessageLane, type ShareMessageLane } from './share-lanes.js';
 import { randomHex, sha256Hex } from '../security/crypto.js';
+import { issueSharedMachineAuthorityForSession } from '../share/shared-machine-authority.js';
+import { SHARED_MACHINE_AUTHORITY_FIELD, SHARE_PROCESS_INPUT_COMMANDS } from '../../../shared/shared-machine-authority.js';
 import { resolveServerRole } from '../security/authorization.js';
 import { DAEMON_MSG } from '../../../shared/daemon-events.js';
+import { TERMINAL_CONTROL, TERMINAL_STREAM_RESET_REASON } from '../../../shared/terminal-protocol.js';
+import { SUPERVISION_TASK_CONSOLE_MSG } from '../../../shared/supervision-task-console.js';
+import {
+  CONTROLLED_NODE_HOST_AUTO_LINK_OUTCOME,
+  validateControlledNodeLocalDaemonsMessage,
+} from '../../../shared/controlled-node-host-link.js';
+import { autoLinkControlledNodeHost } from '../services/controlled-node-host-link.js';
+import type {
+  CapabilityFinding,
+  CapabilityInstallState,
+  CapabilityOperationActivateFrame,
+  CapabilityOperationCommitAckFrame,
+  CapabilityOperationCommitAbortFrame,
+  CapabilityOperationCommitResultFrame,
+  CapabilityOperationCancelFrame,
+  CapabilityOperationConfirmFrame,
+  CapabilityOperationInstallFrame,
+  CapabilityOperationProgressFrame,
+  CapabilityOperationManageFrame,
+  CapabilityOperationManageAckFrame,
+  CapabilityOperationManageResultFrame,
+} from '../../../shared/capability-management.js';
+import {
+  CAPABILITY_BLOB_ACTION,
+  CAPABILITY_AUDIT_VERDICT,
+  CAPABILITY_ERROR,
+  CAPABILITY_FINDING_SEVERITY,
+  CAPABILITY_KIND,
+  CAPABILITY_INSTALL_STATE,
+  CAPABILITY_LIMITS,
+  CAPABILITY_MANAGE_ACTION,
+  CAPABILITY_MANAGE_PHASE,
+  CAPABILITY_MANAGE_RESULT_PHASE,
+  CAPABILITY_OPERATION_MSG,
+  CAPABILITY_READINESS,
+  CAPABILITY_SCOPE,
+  CAPABILITY_SOURCE_KIND,
+  CAPABILITY_SYNC_MSG,
+  isCapabilityInstallState,
+  normalizeCapabilityMcpDefinition,
+} from '../../../shared/capability-management.js';
+import { issueCapabilityBlobAccess } from '../services/capability-package-storage.js';
 import { CRON_MSG, normalizeCronExecutionDetail } from '../../../shared/cron-types.js';
 import {
   abandonPriorGenerations,
@@ -31,7 +94,14 @@ import {
 } from './machine-exec-registry.js';
 import { resolvePendingComputerUse, abandonComputerUsePriorGenerations } from './computer-use-registry.js';
 import { resolvePendingAutoUnlock } from './auto-unlock-registry.js';
+import { notifyRemoteDesktopAutoUnlock } from '../services/remote-desktop-auto-unlock-notification.js';
 import { validateControlledNodeAutoUnlockResult } from '../../../shared/controlled-node-auto-unlock.js';
+import {
+  CONTROLLED_NODE_ACK_NODE_ID_FIELD,
+  CONTROLLED_NODE_ACK_SERVER_ID_FIELD,
+  parseControlledNodeId,
+  type ControlledNodeId,
+} from '../../../shared/controlled-node-identity.js';
 import {
   NODE_ROLE,
   REMOTE_EXEC_MAX_ERROR_BYTES,
@@ -48,12 +118,18 @@ import { PEER_AUDIT_COMMAND_ERRORS, PEER_AUDIT_MESSAGES } from '../../../shared/
 import { PeerAuditUnicastRouter } from './peer-audit-unicast-router.js';
 import { DirectFileTransferRouter } from './direct-file-transfer-router.js';
 import { RemoteDesktopRouter } from './remote-desktop-router.js';
+import type {
+  RemoteDesktopGuestDeliveryResult,
+  RemoteDesktopGuestOutboxAuthorityMatch,
+  RemoteDesktopGuestOutboxExecutionTarget,
+} from '../services/remote-desktop-guest-outbox-worker.js';
 import { createTurnIceServerAuthority } from './turn-credentials.js';
 import {
   DIRECT_FILE_TRANSFER_REQUIRED_CAPABILITIES,
   isDirectConnectivityRuntimeStatus,
 } from '../../../shared/direct-file-transfer.js';
 import { FS_TRANSPORT_MSG } from '../../../shared/fs-transport-messages.js';
+import { FS_GENERIC_ERROR_CODES } from '../../../shared/fs-error-codes.js';
 import { FS_SESSION_ROOT_PATH } from '../../../src/shared/transport/fs.js';
 import {
   FILE_TRANSFER_MSG,
@@ -71,15 +147,88 @@ import {
 } from '../../../shared/controlled-node-capabilities.js';
 import {
   REMOTE_DESKTOP_CAPABILITY,
+  REMOTE_DESKTOP_MSG,
   REMOTE_DESKTOP_TERMINAL_REASON,
+  validateRemoteDesktopBrowserMessage,
+  type RemoteDesktopAccessMode,
   type RemoteDesktopTerminalReason,
 } from '../../../shared/remote-desktop.js';
+import {
+  CONTROLLED_NODE_WORKER_REFRESH_CAPABILITY,
+} from '../../../shared/controlled-node-worker-refresh.js';
+import {
+  REMOTE_DESKTOP_ACTOR_SOURCE,
+  REMOTE_DESKTOP_CAPTURE_PRIVACY_CAPABILITY,
+  REMOTE_DESKTOP_CONSENT_CANCEL_REASON,
+  REMOTE_DESKTOP_CONSENT_MSG,
+  REMOTE_DESKTOP_DEFAULT_SHIELDED_ROUTE_CAPABILITY,
+  REMOTE_DESKTOP_LINK_LIMITS,
+  REMOTE_DESKTOP_LOCAL_CONSENT_CAPABILITY,
+  REMOTE_DESKTOP_NODE_CONTEXT_MSG,
+  REMOTE_DESKTOP_PRIVACY_MSG,
+  REMOTE_DESKTOP_PRIVACY_PHASE,
+  REMOTE_DESKTOP_SHELL_MSG,
+  REMOTE_DESKTOP_SIGNED_SHELL_CAPABILITY,
+  validateRemoteDesktopBootstrapProof,
+  validateRemoteDesktopConsentMessage,
+  validateRemoteDesktopNodeAuthorityContext,
+  validateRemoteDesktopPrivacyMessage,
+  validateRemoteDesktopShellMessage,
+  type RemoteDesktopShellLaunchContext,
+  type RemoteDesktopOutboxEvent,
+  type RemoteDesktopActor,
+  type RemoteDesktopPrivacyBegin,
+  type RemoteDesktopPrivacyEnd,
+} from '../../../shared/remote-desktop-access.js';
+import {
+  redeemBootstrapForRoute,
+  resolveRedeemedGuestActor,
+} from '../services/remote-desktop-guest-bootstrap.js';
+import { hashBrowserKey } from '../services/remote-desktop-guest-links.js';
+import {
+  REMOTE_DESKTOP_CONSENT_STATE,
+  REMOTE_DESKTOP_CONSENT_CANCEL_TRIGGER,
+  cancelAttendedConsents,
+  consumeApprovedAttendedConsent,
+  createRemoteDesktopConsentResultConsumer,
+  getAttendedConsent,
+  remoteDesktopConsentCancellation,
+  requestAttendedConsent,
+  type RemoteDesktopConsentDispatchCommand,
+} from '../services/remote-desktop-consent-coordinator.js';
+import {
+  acknowledgeFreshFrame,
+  acknowledgeShield,
+  getPrivacyState,
+  markRecoveryRequired,
+  setRemoteDesktopPendingRouteCancellationDispatcher,
+  type RemoteDesktopManagementPrivacyCommand,
+  type RemoteDesktopPendingRouteCancellationCommand,
+} from '../services/remote-desktop-management-privacy.js';
+import type {
+  RemoteDesktopShellEndpointAuthority,
+  RemoteDesktopShellLaunchContextDispatcher,
+} from '../services/remote-desktop-shell-launch-context.js';
+import { readDatabaseClock } from '../services/remote-desktop-guest-due-worker.js';
 import { isRemoteDesktopFeatureEnabled } from '../../../shared/remote-desktop-feature.js';
+import { resolveRemoteDesktopSessionProfile } from '../../../shared/remote-desktop-platform.js';
 import {
   REMOTE_DESKTOP_INSTALLABLE_CAPABILITY,
+  REMOTE_DESKTOP_MACOS_INSTALLABLE_CAPABILITY,
   REMOTE_DESKTOP_INSTALL_MSG,
+  REMOTE_DESKTOP_PERMISSION_MSG,
+  validateRemoteDesktopInstallStateMessage,
 } from '../../../shared/remote-desktop-install.js';
-import { CONTROLLED_NODE_OS_WIN, isControlledNodeOs, type ControlledNodeOs } from '../../../shared/controlled-node-artifacts.js';
+import {
+  REMOTE_DESKTOP_LOGIN_SCREEN_MSG,
+  validateRemoteDesktopLoginScreenStateMessage,
+} from '../../../shared/remote-desktop-login-screen.js';
+import {
+  CONTROLLED_NODE_OS_WIN,
+  isControlledNodeArch,
+  isControlledNodeOs,
+  type ControlledNodeOs,
+} from '../../../shared/controlled-node-artifacts.js';
 import {
   CONTROLLED_NODE_SAFE_SELF_UPGRADE_CAPABILITY,
   CONTROLLED_NODE_UPGRADE_RESCUE_AUDIT_ACTION,
@@ -89,16 +238,37 @@ import {
   buildLegacyWindowsUpgradeRestartCommand,
   LEGACY_WINDOWS_UPGRADE_RESCUE_EXEC_TIMEOUT_MS,
   LEGACY_WINDOWS_UPGRADE_RESTART_EXEC_TIMEOUT_MS,
+  type LegacyWindowsUpgradeRestartThrottle,
   resolveLegacyWindowsUpgradePublisherSignerSha256,
+  resolveLegacyWindowsUpgradeRestartAttempt,
 } from './windows-controlled-node-upgrade-rescue.js';
 import { REPO_MSG, REPO_RELAY_TYPES } from '../../../shared/repo-types.js';
 import { TRANSPORT_RELAY_TYPES, TRANSPORT_MSG } from '../../../shared/transport-events.js';
 import { isEmbeddingStatus } from '../../../shared/embedding-status.js';
+import { isCoreLaneStatus } from '../../../shared/core-lane-status.js';
+import {
+  DAEMON_LIVENESS_MSG,
+  DAEMON_STATS_MSG,
+  hasDaemonLiveness,
+  hasAnyDaemonSystemStats,
+  pickDaemonLiveness,
+} from '../../../shared/daemon-stats.js';
 import {
   MEMORY_WS,
   isMemoryManagementRequestType,
   isMemoryManagementResponseType,
 } from '../../../shared/memory-ws.js';
+import { SESSION_IDENTITY_WS, SESSION_IDENTITY_LOCAL_RPC_TIMEOUT_MS } from '../../../shared/session-identity-ws.js';
+import {
+  getSessionIdentityProfile as getServerSessionIdentityProfile,
+  upsertSessionIdentityProfile as upsertServerSessionIdentityProfile,
+  deleteSessionIdentityProfile as deleteServerSessionIdentityProfile,
+  upsertSessionIdentityMetadata,
+  deleteSessionIdentityMetadata,
+  getSessionIdentityMetadata,
+} from '../db/session-identity-queries.js';
+import { sessionIdentitySessionKey } from '../../../shared/session-identity.js';
+import { normalizeSessionIdentityContent, sessionIdentityContentLength } from '../../../shared/session-identity.js';
 import {
   MEMORY_MANAGEMENT_CONTEXT_FIELD,
   type AuthenticatedMemoryManagementContext,
@@ -139,8 +309,10 @@ import {
   ACK_TIMEOUT_RETRY_LIMIT,
   ACK_DEDUP_TTL_MS,
   INFLIGHT_GC_TTL_MS,
+  COMMAND_ACK_ORIGIN_TTL_MS,
   type AckFailureReason,
 } from '../../../shared/ack-protocol.js';
+import { ASK_ANSWER_COMMAND } from '../../../shared/ask-answer.js';
 import {
   PREVIEW_BINARY_FRAME,
   PREVIEW_ERROR,
@@ -161,14 +333,46 @@ import { isStreamingResponse } from '../../../shared/preview-stream-policy.js';
 import { getSessionRuntimeType } from '../../../shared/agent-types.js';
 import { LocalWebPreviewRegistry, setPreviewActiveRelayHook, setPreviewEvictedHook } from '../preview/registry.js';
 import { updateServerHeartbeat, updateServerStatus, upsertDiscussion, insertDiscussionRound, createSubSession, getSubSessionById, updateSubSession, upsertOrchestrationRun, updateProviderStatus, clearProviderStatus, updateProviderRemoteSessions, upsertSessionTextTailCacheEvent, getUserPref, setUserPref, deleteUserPref, getDbSessionsByServer, getUserById, insertDiscussionComment } from '../db/queries.js';
+import {
+  activateCapabilityVersion,
+  advanceCapabilityOperation,
+  updateCapabilityOperation,
+  acknowledgeCapabilityReadiness,
+  completeCapabilityCommit,
+  expireCapabilityPendingActivations,
+  expireCapabilityPreActivationOperations,
+  failCapabilityOperationsForDisconnectedServer,
+  getCapabilityOperation,
+  getCapabilitySyncSnapshot,
+  getCapabilityAuthorityRecordSet,
+  getPendingCapabilityAuthorization,
+  listPendingCapabilityAuthorizations,
+  listPendingCapabilityBlobUploads,
+  failCapabilityPendingActivation,
+  advanceLocalCapabilityManageResult,
+  markLocalCapabilityManageCommitSent,
+  listReplayableLocalCapabilityManageRequests,
+  manageCapability,
+  type LocalCapabilityManageRequestView,
+} from '../db/capabilities.js';
 import { toDiscussionCommentView } from '../share/discussion-comment-view.js';
 import { resolveCoveredSessionNames } from '../share/covered-sessions.js';
 import logger from '../util/logger.js';
 import {
+  toCapabilityOperationAuthorizeFrame,
+  toCapabilitySummary,
+  toCapabilitySyncSnapshot,
+  toCapabilitySyncAuthorityFrame,
+} from '../services/capability-wire.js';
+import {
+  createCapabilityAuthorizationSigner,
+  type CapabilityAuthorizationSigner,
+} from '../services/capability-authorization.js';
+import {
   TIMELINE_DELIVERY_METRICS,
   countableTimelineEventType,
 } from '../../../shared/timeline-delivery-telemetry.js';
-import { incrementCounter } from '../util/metrics.js';
+import { addCounter, incrementCounter, snapshotCounters } from '../util/metrics.js';
 import { logAudit } from '../security/audit.js';
 import { pickReadableSessionDisplay } from '../../../shared/session-display.js';
 import { isKnownTestSessionLike } from '../../../shared/test-session-guard.js';
@@ -178,10 +382,35 @@ import {
   DAEMON_UPGRADE_BLOCKED_ACK_DISPOSITION,
   DAEMON_UPGRADE_BLOCKED_SYNC_PROTOCOL,
   DAEMON_UPGRADE_BLOCK_REASON,
+  DAEMON_UPGRADE_BUSY_RETRY_INTERVAL_MS,
+  DAEMON_UPGRADE_DEFERRAL_FIELD,
+  DAEMON_UPGRADE_DEFERRAL_RETRY_MARGIN_MS,
+  DAEMON_UPGRADE_RETRY_AFTER_FIELD,
+  isDaemonUpgradeDeferral,
+  isTimeGatedDaemonUpgradeReason,
+  DAEMON_UPGRADE_COOLDOWN_RETRY_MAX_MS,
+  DAEMON_UPGRADE_COOLDOWN_RETRY_MIN_MS,
   DAEMON_UPGRADE_DELIVERY_STATUS,
+  DAEMON_UPGRADE_IDLE_EDGE_MIN_INTERVAL_MS,
+  DAEMON_UPGRADE_SOURCE,
+  CONTROLLED_NODE_UPGRADE_STATUS,
+  CONTROLLED_NODE_UPGRADE_WAIT_REASON,
+  controlledNodeUpgradeRetryDelayMs,
+  controlledNodeUpgradeStaggerMs,
+  isDaemonUpgradeAvailable,
+  isDaemonAutoUpgradeAvailable,
+  isDaemonAutoUpgradeDisabledByEnv,
+  isRetryableDaemonUpgradeBlockReason,
   validateControlledNodeUpgradeBlockedMessage,
+  type ControlledNodeUpgradeStatus,
+  type DaemonAutoUpgradeView,
   type DaemonUpgradeBlockedAckDisposition,
 } from '../../../shared/daemon-upgrade.js';
+import {
+  CONTROLLED_NODE_WORKER_REFRESH_MSG,
+  validateControlledNodeWorkerRefreshStatusMessage,
+  type ControlledNodeWorkerRefreshStatusMessage,
+} from '../../../shared/controlled-node-worker-refresh.js';
 import {
   P2P_WORKFLOW_MSG,
   isP2pWorkflowRequestId,
@@ -196,14 +425,24 @@ import {
   P2P_BRIDGE_PENDING_REQUESTS_PER_SOCKET,
   P2P_CAPABILITY_FRESHNESS_TTL_MS,
 } from '../../../shared/p2p-workflow-constants.js';
-import { DaemonUpgradeCoordinator, type DaemonUpgradeSource, type RequestDaemonUpgradeResult } from './daemon-upgrade-coordinator.js';
+import { DaemonUpgradeCoordinator, type RequestDaemonUpgradeResult } from './daemon-upgrade-coordinator.js';
+import type { DaemonUpgradeSource } from '../../../shared/daemon-upgrade.js';
+import {
+  DAEMON_AUTH_RECONCILE_BUDGET_MS,
+  DAEMON_AUTH_RECONCILE_RETRY_DELAYS_MS,
+  DAEMON_AUTH_SLOW_PHASE_MS,
+  DAEMON_CONNECTION_DUEL_REPLACEMENTS,
+  DAEMON_CONNECTION_DUEL_WINDOW_MS,
+} from '../../../shared/daemon-auth.js';
 import {
   SHARE_REASONS,
+  buildSharedActorEnvelope,
   commandSessionName,
   evaluateShareCommand,
   filterShareDaemonMessage,
   resolveShareCoverageFromDb,
   shareStateCoversSession,
+  shareStateMayUseIdentity,
   shareTargetKey,
   type EffectiveCoverage,
   type ShareCoverageResolver,
@@ -241,18 +480,32 @@ import {
   type SessionGroupCloneSkippedMember,
   type SessionGroupCloneWarning,
 } from '../../../shared/session-group-clone.js';
+import { sessionIdentityProjectKey } from '../../../shared/session-identity.js';
 import { GIT_REMOTE_CLONE_CAPABILITY_V1 } from '../../../shared/git-remote-url.js';
 import { P2P_CONFIG_MSG } from '../../../shared/p2p-config-events.js';
 import { p2pSessionConfigLegacyPrefKeys, p2pSessionConfigPrefKey } from '../../../shared/p2p-config-scope.js';
 import { isP2pSavedConfig, type P2pSavedConfig } from '../../../shared/p2p-modes.js';
 import { FS_READ_ERROR_CODES } from '../../../shared/fs-read-error-codes.js';
 import {
+  TIMELINE_HISTORY_CANCEL_CAPABILITY,
+  TIMELINE_CURSOR_DIRECTIONS,
+  isTimelineHistoryContentFilter,
   TIMELINE_MESSAGES,
   TIMELINE_PROTOCOL_CAPABILITY,
   TIMELINE_RESPONSE_SOURCES,
   TIMELINE_RESPONSE_STATUS,
+  TIMELINE_SUBSCRIPTION_MODES,
+  TIMELINE_FULL_LATEST_VALUE_COALESCE_WINDOW_MS,
+  TIMELINE_SUMMARY_LATEST_VALUE_COALESCE_WINDOW_MS,
+  TIMELINE_TERMINAL_SESSION_STATES,
+  type TimelineSubscriptionMode,
 } from '../../../shared/timeline-protocol.js';
 import { TIMELINE_PAYLOAD_BUDGET_BYTES } from '../../../shared/timeline-payload-budget.js';
+import {
+  TIMELINE_HISTORY_LIMITS,
+  clampTimelineHistoryBudget,
+  clampTimelineHistoryLimit,
+} from '../../../shared/timeline-history-limits.js';
 import type { DaemonBuildInfo } from '../../../shared/build-manifest-types.js';
 import {
   TIMELINE_REQUEST_ERROR_REASONS,
@@ -284,15 +537,17 @@ import type { QueueSnapshot } from '../../../shared/transport-queue-types.js';
 
 const AUTH_TIMEOUT_MS = 5000;
 const MAX_QUEUE_SIZE = 100;
-const DAEMON_UPGRADE_BLOCKED_RETRY_MS = 60_000;
-const DAEMON_UPGRADE_BLOCKED_MIN_RETRY_MS = 5_000;
-const DAEMON_UPGRADE_BLOCKED_MAX_RETRY_MS = 15 * 60 * 1000;
+/**
+ * A command buffered while the daemon was unreachable is only meaningful for a
+ * short outage. Replaying it after a long one re-executes an intent the user
+ * has long since moved past (a stale `/model`, edit, delete...), so it is
+ * dropped instead of delivered on the next authentication.
+ */
+const DAEMON_QUEUE_REPLAY_MAX_AGE_MS = 10 * 60 * 1000;
 const DAEMON_UPGRADE_BLOCKED_FAILURE_DEDUP_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const DAEMON_UPGRADE_BLOCKED_FAILURE_DEDUP_MAX = 1_000;
 const LEGACY_UPGRADE_RESCUE_RETRY_BASE_MS = 60_000;
 const LEGACY_UPGRADE_RESCUE_RETRY_MAX_MS = 15 * 60_000;
-const LEGACY_UPGRADE_RESTART_RETRY_BASE_MS = 60_000;
-const LEGACY_UPGRADE_RESTART_RETRY_MAX_MS = 5 * 60_000;
 let resolveLegacyUpgradePublisherSigner = resolveLegacyWindowsUpgradePublisherSignerSha256;
 
 export function __setLegacyUpgradePublisherSignerResolverForTests(
@@ -302,16 +557,6 @@ export function __setLegacyUpgradePublisherSignerResolverForTests(
   resolveLegacyUpgradePublisherSigner = resolver;
   return () => { resolveLegacyUpgradePublisherSigner = previous; };
 }
-const DAEMON_UPGRADE_TRANSIENT_BLOCK_REASONS = new Set([
-  DAEMON_UPGRADE_BLOCK_REASON.ALREADY_IN_PROGRESS,
-  'p2p_active',
-  'auto_deliver_active',
-  'master_compaction_active',
-  'compression_active',
-  'transport_busy',
-  'session_busy',
-]);
-
 const SUBSESSION_QUEUE_RELAY_FIELDS = [
   'queueEpoch',
   'queueAuthorityId',
@@ -397,6 +642,17 @@ const SESSION_GROUP_CLONE_CONTEXT_TTL_MS = 10 * 60 * 1000;
  * the limiter back on, flip the flag — no other changes required.
  */
 const BROWSER_RATE_LIMIT_ENABLED = false;
+// Dedicated read-plane limiter stays enabled even while the legacy global
+// limiter is disabled. It cannot block session.send/STOP/control traffic and
+// bounds old browsers that predate owner-side single-flight.
+const BROWSER_DATA_READ_RATE_LIMIT = 64;
+const BROWSER_DATA_READ_RATE_WINDOW_MS = 10_000;
+const BROWSER_DATA_READ_TYPES: ReadonlySet<string> = new Set([
+  'fs.ls',
+  'fs.git_status',
+  TRANSPORT_MSG.LIST_MODELS,
+  TIMELINE_MESSAGES.HISTORY_REQUEST,
+]);
 // 4MB per (session, browser). Heavy output (build logs, large `cat`, log tail)
 // can burst tens of KB per frame; at 1MB the queue overflowed within a few
 // frames during heavy output and triggered stream_reset cascades, which the
@@ -404,7 +660,47 @@ const BROWSER_RATE_LIMIT_ENABLED = false;
 // at typical egress rates without holding meaningful memory (a single ws
 // per session, queue is reset on overflow anyway).
 const QUEUE_MAX_BYTES = 4 * 1024 * 1024;
+/** Resume sending only after in-flight bytes drain to a quarter of the budget.
+ *  Resuming at the high-water mark would flap: one callback frees a few KB and
+ *  the next full frame immediately re-triggers the overflow. */
+const QUEUE_LOW_WATER_BYTES = QUEUE_MAX_BYTES / 4;
+/** How long a socket may stay paused before its budget is forgiven once. Bounds
+ *  the damage of a wedged peer without letting every dropped frame buy a fresh
+ *  budget the way the old queue-replacement did. */
+const QUEUE_PAUSE_GRACE_MS = 2_000;
 const SUBSESSION_OWNERSHIP_RETRY_DELAYS_MS = [50, 150, 350] as const;
+/** Timeline JSON is bounded separately from raw PTY so a slow hidden tab cannot
+ * consume an unbounded amount of server memory. Control/ack frames remain on
+ * their direct liveness path and never enter this queue. */
+const TIMELINE_SOCKET_QUEUE_MAX_BYTES = 64 * 1024 * 1024;
+// A healthy browser can legitimately have ~1.5k timeline frames queued during
+// initial history hydration. Keep a bounded queue, but leave enough headroom
+// that this normal burst is not mistaken for transport backpressure.
+const TIMELINE_SOCKET_QUEUE_MAX_ITEMS = 65_536;
+// Initial history hydration can legitimately enqueue several multi-hundred-KB
+// frames on a local socket. Treat only a sustained ~16 MiB transport buffer as
+// real overflow; below that, healthy sockets stay on the direct path.
+const TIMELINE_SOCKET_BUFFERED_HIGH_WATER = 16 * 1024 * 1024;
+/** Bound gap-control traffic when a peer remains congested for a long time. */
+const TIMELINE_SOCKET_GAP_RATE_MAX = 16;
+/** Frames whose send completes synchronously are drained in bounded batches
+ *  per event-loop turn, then the pump yields (no recursion, no starvation). */
+const TIMELINE_QUEUE_PUMP_BATCH = 256;
+const TIMELINE_QUEUE_PUMP_BUDGET_MS = 4;
+const TIMELINE_SOCKET_GAP_RATE_WINDOW_MS = 1_000;
+const TIMELINE_SOCKET_MAX_PENDING_GAPS = 256;
+
+/**
+ * Stable identity for latest-value timeline payloads.  Daemons may construct
+ * equivalent objects in a different key order on each tick; treating those
+ * as different values would defeat unchanged-payload suppression.
+ */
+function timelinePayloadFingerprint(value: unknown): string {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(timelinePayloadFingerprint).join(',')}]`;
+  const record = value as Record<string, unknown>;
+  return `{${Object.keys(record).sort().map((key) => `${JSON.stringify(key)}:${timelinePayloadFingerprint(record[key])}`).join(',')}}`;
+}
 
 /**
  * Safe ws.send: checks readyState, wraps in try/catch.
@@ -442,24 +738,457 @@ function safeSend(ws: WebSocket, data: string | Buffer, onComplete?: (err?: Erro
  */
 class TerminalForwardQueue {
   private bufferedBytes = 0;
+  /** True once the high-water mark was hit; stays true until in-flight bytes
+   *  drain back below the low-water mark. While set, terminal frames are
+   *  dropped WITHOUT re-notifying the client (see `overflowNotified`). */
+  private paused = false;
+  private pausedSince = 0;
+  /** Bumped when the grace valve forgives the outstanding budget. Frames sent
+   *  before the bump belong to a dead generation: their `ws.send` callbacks
+   *  must NOT decrement the new accounting, or a late callback would push
+   *  `bufferedBytes` negative and hand the socket credit it never earned —
+   *  re-opening the unbounded-in-flight hole this class exists to close. */
+  private epoch = 0;
+  /** One stream_reset per overflow episode, not one per dropped frame. */
+  private overflowNotified = false;
+  /** Frames were withheld during a pause (or forgiven by the grace valve) and
+   *  the browser has not yet been told that the socket is writable again. */
+  private droppedSinceResume = false;
 
-  send(ws: WebSocket, data: string | Buffer, onOverflow: () => void): void {
+  /** In-flight bytes this queue has handed to `ws.send` and not yet seen
+   *  acknowledged. Exposed so overflow handling can decide when the socket is
+   *  writable again instead of resetting the counter. */
+  get inFlightBytes(): number {
+    return this.bufferedBytes;
+  }
+
+  /** True while the socket is above the high-water mark. */
+  get isPaused(): boolean {
+    return this.paused;
+  }
+
+  /**
+   * @returns `'sent'` | `'dropped'` — `'dropped'` means the frame did not go
+   *          out. The caller decides whether that is the FIRST drop of this
+   *          episode (worth a stream_reset) by checking `takeOverflowNotice()`.
+   */
+  send(ws: WebSocket, data: string | Buffer, onOverflow: () => void, onResume?: () => void): 'sent' | 'dropped' {
     const size = typeof data === 'string' ? Buffer.byteLength(data, 'utf8') : data.byteLength;
-    this.bufferedBytes += size;
+    let resumeAfterSend = false;
 
-    if (this.bufferedBytes > QUEUE_MAX_BYTES) {
-      this.bufferedBytes -= size;
-      onOverflow();
-      return;
+    const now = Date.now();
+    if (this.paused || this.bufferedBytes + size > QUEUE_MAX_BYTES) {
+      // A single frame larger than the whole budget with NOTHING in flight is
+      // not congestion — there is no backlog to drain. Drop just that frame and
+      // let the next one through; pausing here would stall a healthy socket.
+      //
+      // Such a drop must NOT consume the overflow episode's one-shot notice.
+      // It is not an episode: nothing is paused, so nothing will ever clear
+      // `overflowNotified` again, and the next REAL congestion episode would be
+      // silently swallowed — the browser would keep a gap it is never told
+      // about and would sit there until the user reloads.
+      if (!this.paused && this.bufferedBytes === 0) {
+        const hadNotice = this.overflowNotified;
+        onOverflow();
+        this.overflowNotified = hadNotice;
+        return 'dropped';
+      }
+      if (!this.paused) {
+        this.paused = true;
+        this.pausedSince = now;
+      }
+      // From here every drop is a gap the browser can only close with a
+      // snapshot that the socket must be able to carry.
+      this.droppedSinceResume = true;
+      // Escape valve. If the socket never acknowledges (a wedged connection, or
+      // a peer whose main thread has stopped reading), staying paused forever
+      // would freeze the terminal — the exact "终端卡住不更新, 刷新才恢复"
+      // regression the stream_reset design was written to avoid. So the budget
+      // IS eventually forgiven, but at most once per grace window instead of on
+      // every dropped frame: the old code replaced the whole queue on each
+      // overflow, which handed out a brand-new 4MB while the previous 4MB was
+      // still unacknowledged, so one socket's real backlog had no bound at all.
+      if (now - this.pausedSince >= QUEUE_PAUSE_GRACE_MS) {
+        // Forgive the outstanding budget, and retire the generation with it so
+        // the still-unacknowledged frames cannot decrement the fresh counter.
+        this.epoch += 1;
+        this.bufferedBytes = 0;
+        this.paused = false;
+        this.overflowNotified = false;
+        this.pausedSince = 0;
+        // Frames were dropped for the whole pause and the snapshot the browser
+        // asked for at its start could not be delivered either.
+        resumeAfterSend = this.droppedSinceResume;
+        this.droppedSinceResume = false;
+      } else {
+        onOverflow();
+        return 'dropped';
+      }
     }
 
+    this.bufferedBytes += size;
+    const sentEpoch = this.epoch;
     safeSend(ws, data, (err) => {
-      this.bufferedBytes -= size;
+      // A callback from a forgiven generation refers to bytes that were already
+      // written off. Decrementing here would drive the counter negative and let
+      // the next burst exceed the high-water mark by exactly that much.
+      const sameEpoch = sentEpoch === this.epoch;
+      if (sameEpoch) this.bufferedBytes -= size;
       if (err) {
         // Socket closed or errored — treat as overflow to trigger cleanup
+        this.paused = true;
         onOverflow();
+        return;
+      }
+      // Drained far enough to resume. The low-water mark (a quarter of the
+      // budget) gives the socket real headroom instead of flapping at the
+      // threshold.
+      if (sameEpoch && this.paused && this.bufferedBytes <= QUEUE_LOW_WATER_BYTES) {
+        this.paused = false;
+        this.overflowNotified = false;
+        // The socket carries frames again. The frames dropped meanwhile, and the
+        // snapshot requested when the drop began, never reached the browser:
+        // tell it to resync now that a snapshot can get through.
+        if (this.droppedSinceResume) {
+          this.droppedSinceResume = false;
+          onResume?.();
+        }
       }
     });
+    if (resumeAfterSend) onResume?.();
+    return 'sent';
+  }
+
+  /** True exactly once per overflow episode — use it to send a single
+   *  `terminal.stream_reset` instead of one per dropped frame. */
+  takeOverflowNotice(): boolean {
+    if (this.overflowNotified) return false;
+    this.overflowNotified = true;
+    return true;
+  }
+}
+
+type TimelineQueuePriority = 'final' | 'durable' | 'coalescible';
+
+function timelineQueuePriorityRank(priority: TimelineQueuePriority): number {
+  return priority === 'final' ? 0 : priority === 'durable' ? 1 : 2;
+}
+
+interface TimelineQueueEvent {
+  data: string;
+  sessionId: string;
+  epoch: number;
+  seq: number;
+  priority: TimelineQueuePriority;
+  coalesceKey?: string;
+  gapFromSeq?: number;
+  gapToSeq?: number;
+}
+
+interface TimelineEnqueueOptions {
+  /** Delay latest-value frames by one bounded presentation window. */
+  coalesceWindowMs?: number;
+  /** Flush delayed latest-value frames before this durable/terminal event. */
+  flushCoalesced?: boolean;
+}
+
+/**
+ * Per-browser timeline queue. It deliberately owns only timeline events;
+ * command acknowledgements, stop and approval frames continue through the
+ * direct control path above and therefore cannot wait behind this queue.
+ */
+export class TimelineOutboundQueue {
+  private pending: TimelineQueueEvent[] = [];
+  private bytes = 0;
+  private sending = false;
+  /** One merged missing range per session/epoch congestion episode. */
+  private pendingGaps = new Map<string, TimelineQueueEvent>();
+  private gapEpisodes = new Set<string>();
+  private gapSentAt: number[] = [];
+  private gapFlushScheduled = false;
+  private gapFlushTimer?: NodeJS.Timeout;
+  private gapFlushHandler?: (event: TimelineQueueEvent) => void;
+  private disposed = false;
+  private pumpScheduled = false;
+  private pendingCoalesced = new Map<string, TimelineQueueEvent>();
+  private coalesceTimer?: NodeJS.Timeout;
+
+  isIdle(): boolean {
+    return !this.sending && this.pending.length === 0 && this.bytes === 0
+      && this.pendingCoalesced.size === 0 && !this.coalesceTimer;
+  }
+
+  statsForTests(): { bytes: number; pending: number; pendingGaps: number } {
+    return { bytes: this.bytes, pending: this.pending.length, pendingGaps: this.pendingGaps.size };
+  }
+
+  dispose(): void {
+    this.disposed = true;
+    if (this.gapFlushTimer) clearTimeout(this.gapFlushTimer);
+    if (this.coalesceTimer) clearTimeout(this.coalesceTimer);
+    this.gapFlushTimer = undefined;
+    this.coalesceTimer = undefined;
+    this.pending = [];
+    this.bytes = 0;
+    this.pendingGaps.clear();
+    this.pendingCoalesced.clear();
+    this.gapEpisodes.clear();
+    this.gapSentAt = [];
+  }
+
+  /** Compose-only diagnostics; never used by the delivery path. */
+  snapshot(): { bytes: number; pending: number; sending: boolean } {
+    return { bytes: this.bytes, pending: this.pending.length, sending: this.sending };
+  }
+
+  enqueue(
+    ws: WebSocket,
+    item: TimelineQueueEvent,
+    onGap: (event: TimelineQueueEvent) => void,
+    onCoalesced?: () => void,
+    options?: TimelineEnqueueOptions,
+  ): void {
+    if (options?.flushCoalesced) this.flushCoalesced(ws, onGap, onCoalesced);
+    if (item.priority === 'coalescible' && options?.coalesceWindowMs !== undefined) {
+      this.enqueueCoalesced(ws, item, onGap, onCoalesced, options.coalesceWindowMs);
+      return;
+    }
+    this.enqueueImmediate(ws, item, onGap, onCoalesced);
+  }
+
+  private enqueueCoalesced(
+    ws: WebSocket,
+    item: TimelineQueueEvent,
+    onGap: (event: TimelineQueueEvent) => void,
+    onCoalesced: (() => void) | undefined,
+    windowMs: number,
+  ): void {
+    const key = item.coalesceKey ?? `${item.sessionId}\u0000${item.priority}`;
+    const previous = this.pendingCoalesced.get(key);
+    if (previous) {
+      // A pressured socket still needs an explicit seq gap for values replaced
+      // while it was unable to drain. Healthy presentation-window coalescing
+      // intentionally does not manufacture gaps.
+      if (typeof ws.bufferedAmount === 'number' && ws.bufferedAmount > TIMELINE_SOCKET_BUFFERED_HIGH_WATER) {
+        this.noteGap(previous);
+      }
+      onCoalesced?.();
+    }
+    this.pendingCoalesced.set(key, item);
+    if (this.coalesceTimer) return;
+    this.coalesceTimer = setTimeout(() => {
+      this.coalesceTimer = undefined;
+      this.flushCoalesced(ws, onGap, onCoalesced);
+    }, Math.max(1, windowMs));
+    this.coalesceTimer.unref?.();
+  }
+
+  private flushCoalesced(
+    ws: WebSocket,
+    onGap: (event: TimelineQueueEvent) => void,
+    onCoalesced?: () => void,
+  ): void {
+    if (this.coalesceTimer) {
+      clearTimeout(this.coalesceTimer);
+      this.coalesceTimer = undefined;
+    }
+    if (this.pendingCoalesced.size === 0) return;
+    const pending = [...this.pendingCoalesced.values()]
+      .sort((a, b) => a.seq - b.seq);
+    this.pendingCoalesced.clear();
+    for (const item of pending) this.enqueueImmediate(ws, item, onGap, onCoalesced);
+  }
+
+  private enqueueImmediate(ws: WebSocket, item: TimelineQueueEvent, onGap: (event: TimelineQueueEvent) => void, onCoalesced?: () => void): void {
+    const bufferedAmount = typeof ws.bufferedAmount === 'number' ? ws.bufferedAmount : 0;
+    const wasSocketPressured = bufferedAmount > TIMELINE_SOCKET_BUFFERED_HIGH_WATER;
+    const existingIndex = item.coalesceKey
+      ? this.pending.findIndex((entry) => entry.coalesceKey === item.coalesceKey)
+      : -1;
+    if (existingIndex >= 0) {
+      const previous = this.pending[existingIndex]!;
+      // Replacing a pending latest-value frame is still a loss of its
+      // sequence number. Record it for one merged gap per congestion episode;
+      // emitting one frame per replacement can itself overwhelm a healthy
+      // socket (and was the source of the observed gap storm).
+      // A latest-value replacement on an otherwise healthy asynchronous
+      // socket is normal scheduling, not backpressure. Only expose a gap when
+      // the queue/socket was already over its congestion threshold; otherwise
+      // a realistic status burst would manufacture seq_gap traffic despite a
+      // zero bufferedAmount.
+      if (wasSocketPressured) this.noteGap(previous);
+      onCoalesced?.();
+      this.bytes -= Buffer.byteLength(previous.data, 'utf8');
+      this.pending[existingIndex] = item;
+      this.bytes += Buffer.byteLength(item.data, 'utf8');
+    } else {
+      this.insertByPriority(item);
+      this.bytes += Buffer.byteLength(item.data, 'utf8');
+    }
+
+    const pressured = bufferedAmount > TIMELINE_SOCKET_BUFFERED_HIGH_WATER
+      || this.bytes > TIMELINE_SOCKET_QUEUE_MAX_BYTES
+      || this.pending.length > TIMELINE_SOCKET_QUEUE_MAX_ITEMS;
+    if (pressured) {
+      this.trim(ws);
+    }
+    this.scheduleGapFlush(onGap);
+    this.pump(ws, onGap);
+  }
+
+  private trim(ws: WebSocket): void {
+    while (this.bytes > TIMELINE_SOCKET_QUEUE_MAX_BYTES || this.pending.length > TIMELINE_SOCKET_QUEUE_MAX_ITEMS) {
+      // Preserve final and durable events for as long as possible. Under a
+      // completely wedged socket, close it for a history resync instead of
+      // dropping durable/final events and pretending a gap can repair them.
+      let index = this.pending.findIndex((entry) => entry.priority === 'coalescible');
+      if (index < 0) {
+        try { ws.close(1013, 'timeline_backpressure_resync'); } catch { /* already closing */ }
+        this.dispose();
+        return;
+      }
+      const [removed] = this.pending.splice(index, 1);
+      if (!removed) break;
+      this.bytes -= Buffer.byteLength(removed.data, 'utf8');
+      // Summary/latest-value frames are intentionally lossy when only the
+      // server-side queue is busy. Do not manufacture backpressure gaps on a
+      // healthy socket whose transport bufferedAmount is still below HWM;
+      // durable/final events always retain a gap for backfill convergence.
+      if (removed.priority !== 'coalescible'
+        || (typeof ws.bufferedAmount === 'number' && ws.bufferedAmount > TIMELINE_SOCKET_BUFFERED_HIGH_WATER)) {
+        this.noteGap(removed);
+      }
+    }
+  }
+
+  private gapKey(event: TimelineQueueEvent): string {
+    return `${event.sessionId}\u0000${event.epoch}`;
+  }
+
+  private noteGap(event: TimelineQueueEvent): void {
+    const key = this.gapKey(event);
+    const fromSeq = event.gapFromSeq ?? event.seq;
+    const toSeq = event.gapToSeq ?? event.seq;
+    const existing = this.pendingGaps.get(key);
+    if (existing) {
+      existing.gapFromSeq = Math.min(existing.gapFromSeq ?? fromSeq, fromSeq);
+      existing.gapToSeq = Math.max(existing.gapToSeq ?? toSeq, toSeq);
+      existing.seq = existing.gapFromSeq;
+      return;
+    }
+    if (this.pendingGaps.size >= TIMELINE_SOCKET_MAX_PENDING_GAPS) {
+      const oldest = this.pendingGaps.keys().next().value;
+      if (typeof oldest === 'string') this.pendingGaps.delete(oldest);
+    }
+    // Gap delivery only needs session/epoch/range metadata. Never retain the
+    // potentially multi-megabyte event payload in the bookkeeping map.
+    this.pendingGaps.set(key, {
+      ...event,
+      data: '',
+      seq: fromSeq,
+      gapFromSeq: fromSeq,
+      gapToSeq: toSeq,
+    });
+  }
+
+  private flushGaps(onGap: (event: TimelineQueueEvent) => void): void {
+    this.gapFlushHandler = onGap;
+    const now = Date.now();
+    this.gapSentAt = this.gapSentAt.filter((timestamp) => timestamp > now - TIMELINE_SOCKET_GAP_RATE_WINDOW_MS);
+    for (const [key, gap] of this.pendingGaps) {
+      if (this.gapEpisodes.has(key) || this.gapSentAt.length >= TIMELINE_SOCKET_GAP_RATE_MAX) continue;
+      this.pendingGaps.delete(key);
+      this.gapEpisodes.add(key);
+      this.gapSentAt.push(now);
+      onGap(gap);
+    }
+    if (this.pendingGaps.size > 0 && this.gapSentAt.length >= TIMELINE_SOCKET_GAP_RATE_MAX && !this.gapFlushTimer) {
+      const retryAt = (this.gapSentAt[0] ?? now) + TIMELINE_SOCKET_GAP_RATE_WINDOW_MS;
+      this.gapFlushTimer = setTimeout(() => {
+        this.gapFlushTimer = undefined;
+        if (this.gapFlushHandler) this.flushGaps(this.gapFlushHandler);
+      }, Math.max(1, retryAt - now));
+      this.gapFlushTimer.unref?.();
+    }
+  }
+
+  private scheduleGapFlush(onGap: (event: TimelineQueueEvent) => void): void {
+    if (this.gapFlushScheduled) return;
+    this.gapFlushScheduled = true;
+    setImmediate(() => {
+      this.gapFlushScheduled = false;
+      this.flushGaps(onGap);
+    });
+  }
+
+  private finishCongestionEpisode(): void {
+    if (this.sending || this.pending.length > 0) return;
+    this.gapEpisodes.clear();
+  }
+
+  /** Keep `pending` ordered final → durable → coalescible (FIFO within a
+   *  priority) at insertion time, so dequeue never re-sorts the backlog. */
+  private insertByPriority(item: TimelineQueueEvent): void {
+    const rank = timelineQueuePriorityRank(item.priority);
+    const last = this.pending[this.pending.length - 1];
+    if (!last || timelineQueuePriorityRank(last.priority) <= rank) {
+      this.pending.push(item);
+      return;
+    }
+    const index = this.pending.findIndex((entry) => timelineQueuePriorityRank(entry.priority) > rank);
+    this.pending.splice(index < 0 ? this.pending.length : index, 0, item);
+  }
+
+  private schedulePump(ws: WebSocket, onGap: (event: TimelineQueueEvent) => void): void {
+    if (this.pumpScheduled) return;
+    this.pumpScheduled = true;
+    setImmediate(() => {
+      this.pumpScheduled = false;
+      this.pump(ws, onGap);
+    });
+  }
+
+  private pump(ws: WebSocket, onGap: (event: TimelineQueueEvent) => void): void {
+    const deadline = performance.now() + TIMELINE_QUEUE_PUMP_BUDGET_MS;
+    let sent = 0;
+    while (!this.disposed && !this.sending && this.pending.length > 0) {
+      // Synchronous completions are drained iteratively (never recursively)
+      // and only up to a bounded batch/time budget per turn, then the pump
+      // yields so one congested socket cannot starve the event loop.
+      if (sent >= TIMELINE_QUEUE_PUMP_BATCH || performance.now() > deadline) {
+        this.schedulePump(ws, onGap);
+        return;
+      }
+      const item = this.pending.shift()!;
+      this.bytes -= Buffer.byteLength(item.data, 'utf8');
+      this.sending = true;
+      sent += 1;
+      let insideSend = true;
+      let completedSynchronously = false;
+      safeSend(ws, item.data, (error) => {
+        if (this.disposed) return;
+        this.sending = false;
+        // A close/reload is not congestion: there is no browser left to
+        // backfill, and emitting a gap on the closing socket creates telemetry
+        // noise during normal reconnects. Only a failed send on an open socket
+        // belongs to the congestion episode.
+        if (error && ws.readyState === WebSocket.OPEN) {
+          this.noteGap(item);
+          this.scheduleGapFlush(onGap);
+        } else if (error) {
+          this.pendingGaps.clear();
+          this.gapEpisodes.clear();
+        }
+        this.finishCongestionEpisode();
+        // A synchronous completion continues the surrounding loop; an
+        // asynchronous one already runs on a fresh stack.
+        if (insideSend) completedSynchronously = true;
+        else this.pump(ws, onGap);
+      });
+      insideSend = false;
+      if (!completedSynchronously) break;
+    }
+    this.finishCongestionEpisode();
   }
 }
 
@@ -492,6 +1221,7 @@ export interface WatchRecentTextRow {
 export interface WatchActiveMainSessionRow {
   name: string;
   project: string;
+  projectDir?: string;
   state: string;
   agentType: string;
   runtimeType?: string;
@@ -500,6 +1230,7 @@ export interface WatchActiveMainSessionRow {
 
 type WatchActiveSubSessionRow = {
   name: string;
+  state?: string;
   parentSession?: string;
   agentType?: string;
   runtimeType?: string;
@@ -611,6 +1342,9 @@ type PendingHttpTimelineRequest = {
 type PendingTimelineRequest = {
   socket: WebSocket;
   timer: ReturnType<typeof setTimeout>;
+  /** Subscription context captured when the request was admitted. */
+  sessionName?: string;
+  mode?: TimelineSubscriptionMode;
 };
 
 type TimelineDataPlaneRoute = 'browser_request' | 'http_request' | 'subscriber_fallback';
@@ -641,23 +1375,28 @@ type TimelineDataPlaneAttachment =
     requestId?: string;
     socket: WebSocket;
     payload: Record<string, unknown>;
+    estimatedBytes: number;
   }
   | {
     origin: 'http_request';
     requestId: string;
     pending: PendingHttpTimelineRequest;
     payload: Record<string, unknown>;
+    estimatedBytes: number;
   }
   | {
     origin: 'subscriber_fallback';
     sessionName: string;
     sockets: WebSocket[];
     payload: Record<string, unknown>;
+    estimatedBytes: number;
   };
 
 type TimelineDataPlaneJob = {
   meta: TimelineDataPlaneSendMeta;
   attachments: TimelineDataPlaneAttachment[];
+  /** Estimated encoded bytes retained by this job (per recipient). */
+  estimatedBytes: number;
   enqueuedAt: number;
   deadlineAt: number;
   queueDepthAtEnqueue: number;
@@ -680,8 +1419,19 @@ const TIMELINE_PENDING_UNICAST_TIMEOUT_MS = 30_000;
 // and a more generous ceiling, we recover automatically instead of
 // forcing a manual page refresh.
 const DEFAULT_TIMELINE_DATA_PLANE_QUEUE_CAP = 4096;
+const TIMELINE_DATA_PLANE_MAX_IN_FLIGHT = 4;
+const DEFAULT_TIMELINE_DATA_PLANE_QUEUE_MAX_BYTES = 64 * 1024 * 1024;
+// A single browser socket can legitimately fan out the bounded first page for
+// every visible/hidden window at once. Keep the per-socket cap hard-bounded,
+// but leave enough room for twenty <=2 MiB pages to queue without rejecting a
+// normal one-page open burst (the global/user caps remain independent guards).
+const DEFAULT_TIMELINE_DATA_PLANE_SOCKET_MAX_BYTES = 64 * 1024 * 1024;
+const DEFAULT_TIMELINE_DATA_PLANE_USER_MAX_BYTES = 64 * 1024 * 1024;
 const DEFAULT_TIMELINE_DATA_PLANE_JOB_DEADLINE_MS = 60_000;
 let timelineDataPlaneQueueCap = DEFAULT_TIMELINE_DATA_PLANE_QUEUE_CAP;
+let timelineDataPlaneQueueMaxBytes = DEFAULT_TIMELINE_DATA_PLANE_QUEUE_MAX_BYTES;
+let timelineDataPlaneSocketMaxBytes = DEFAULT_TIMELINE_DATA_PLANE_SOCKET_MAX_BYTES;
+let timelineDataPlaneUserMaxBytes = DEFAULT_TIMELINE_DATA_PLANE_USER_MAX_BYTES;
 let timelineDataPlaneJobDeadlineMs = DEFAULT_TIMELINE_DATA_PLANE_JOB_DEADLINE_MS;
 const BRIDGE_TIMELINE_LARGE_PAYLOAD_LOG_BYTES = TIMELINE_PAYLOAD_BUDGET_BYTES.DEFAULT_ENVELOPE;
 const BRIDGE_TIMELINE_SLOW_SEND_LOG_MS = 50;
@@ -711,20 +1461,38 @@ function deferTimelineDataPlaneTurn(): Promise<void> {
 
 export function __setTimelineDataPlaneQueueConfigForTests(config: {
   queueCap?: number;
+  maxBytes?: number;
+  socketMaxBytes?: number;
+  userMaxBytes?: number;
   deadlineMs?: number;
 }): () => void {
   const previous = {
     queueCap: timelineDataPlaneQueueCap,
+    maxBytes: timelineDataPlaneQueueMaxBytes,
+    socketMaxBytes: timelineDataPlaneSocketMaxBytes,
+    userMaxBytes: timelineDataPlaneUserMaxBytes,
     deadlineMs: timelineDataPlaneJobDeadlineMs,
   };
   if (typeof config.queueCap === 'number' && Number.isFinite(config.queueCap) && config.queueCap >= 0) {
     timelineDataPlaneQueueCap = Math.trunc(config.queueCap);
+  }
+  if (typeof config.maxBytes === 'number' && Number.isFinite(config.maxBytes) && config.maxBytes >= 0) {
+    timelineDataPlaneQueueMaxBytes = Math.trunc(config.maxBytes);
+  }
+  if (typeof config.socketMaxBytes === 'number' && Number.isFinite(config.socketMaxBytes) && config.socketMaxBytes >= 0) {
+    timelineDataPlaneSocketMaxBytes = Math.trunc(config.socketMaxBytes);
+  }
+  if (typeof config.userMaxBytes === 'number' && Number.isFinite(config.userMaxBytes) && config.userMaxBytes >= 0) {
+    timelineDataPlaneUserMaxBytes = Math.trunc(config.userMaxBytes);
   }
   if (typeof config.deadlineMs === 'number' && Number.isFinite(config.deadlineMs) && config.deadlineMs >= 0) {
     timelineDataPlaneJobDeadlineMs = Math.trunc(config.deadlineMs);
   }
   return () => {
     timelineDataPlaneQueueCap = previous.queueCap;
+    timelineDataPlaneQueueMaxBytes = previous.maxBytes;
+    timelineDataPlaneSocketMaxBytes = previous.socketMaxBytes;
+    timelineDataPlaneUserMaxBytes = previous.userMaxBytes;
     timelineDataPlaneJobDeadlineMs = previous.deadlineMs;
   };
 }
@@ -801,6 +1569,44 @@ function timelineResponseForRequestId(msg: Record<string, unknown>, requestId: s
   }
   response.requestId = requestId;
   return response;
+}
+
+/**
+ * Estimate the bytes retained by one timeline response without re-stringifying
+ * daemon payloads that already carry the measured wire size. Older daemons do
+ * not send actualPayloadBytes, so retain a conservative one-time fallback
+ * estimate rather than allowing an unbounded object into the data-plane queue.
+ */
+function estimateTimelineDataPlaneBytes(payload: Record<string, unknown>): number {
+  const measured = optionalNumber(payload.actualPayloadBytes);
+  if (measured !== undefined && measured >= 0) return Math.max(1, Math.trunc(measured));
+  const shaped = optionalNumber(payload.payloadBytes);
+  if (shaped !== undefined && shaped >= 0) return Math.max(1, Math.trunc(shaped));
+  try {
+    return Math.max(1, Buffer.byteLength(JSON.stringify(payload), 'utf8'));
+  } catch {
+    return TIMELINE_HISTORY_LIMITS.MAX_BYTES;
+  }
+}
+
+function boundTimelineHistoryRequest(msg: Record<string, unknown>): Record<string, unknown> {
+  if (msg.type !== TIMELINE_MESSAGES.HISTORY_REQUEST && msg.type !== TIMELINE_MESSAGES.PAGE_REQUEST) return msg;
+  const bounded = { ...msg };
+  if (Object.prototype.hasOwnProperty.call(msg, 'limit')) {
+    bounded.limit = clampTimelineHistoryLimit(msg.limit);
+  }
+  if (Object.prototype.hasOwnProperty.call(msg, 'budgetBytes')) {
+    bounded.budgetBytes = clampTimelineHistoryBudget(msg.budgetBytes);
+  }
+  return bounded;
+}
+
+function timelineSerializedForRequestId(serialized: string, sourceRequestId: string | undefined, requestId: string | undefined): string {
+  if (!sourceRequestId || !requestId || sourceRequestId === requestId) return serialized;
+  const needle = `${JSON.stringify('requestId')}:${JSON.stringify(sourceRequestId)}`;
+  const replacement = `${JSON.stringify('requestId')}:${JSON.stringify(requestId)}`;
+  const index = serialized.indexOf(needle);
+  return index < 0 ? serialized : `${serialized.slice(0, index)}${replacement}${serialized.slice(index + needle.length)}`;
 }
 
 function withBridgeActualPayloadBytes(msg: Record<string, unknown>): Record<string, unknown> {
@@ -1157,6 +1963,7 @@ type PendingFsRouteMap = Map<string, PendingFsRoute>;
 interface PendingRepoRoute {
   socket: WebSocket;
   timer: ReturnType<typeof setTimeout>;
+  sessionName?: string;
 }
 
 const REPO_REQUEST_TYPES = new Set<string>([
@@ -1188,15 +1995,164 @@ export function __setShareBridgeClockForTests(clock: (() => number) | null): voi
  * snapshot. Shares without an expiry produce no recheck deadline of their own.
  */
 const SHARE_COVERAGE_MAX_STALENESS_MS = 60_000;
+/**
+ * How long a share socket's resolved coverage serves the commands it sends
+ * (keystrokes, resize, stop...) before it is re-read from the DB. Any share
+ * grant change (create, update, revoke, sub-session close) bumps
+ * `shareCoverageEpoch` and so ends every socket's window at once, so a
+ * revocation never waits for this TTL; the TTL only bounds how long a change
+ * that never reached this process can go unseen.
+ */
+const SHARE_HOT_PATH_COVERAGE_TTL_MS = 5_000;
+/**
+ * A participant's terminal keystrokes reuse one machine-authority token per
+ * socket+session for this long, so the DB read and JWT mint behind it happen at
+ * most once per window, never per keystroke. The token is only a claim: the
+ * daemon hands it to the MCP child and the server re-verifies it and re-reads
+ * the live grant on every machine call, so reuse cannot outlive a revocation.
+ */
+const SHARE_INPUT_AUTHORITY_REUSE_MS = 30_000;
+/** Share-command audit rows that may be waiting to be written; beyond it new ones are dropped and counted. */
+const SHARE_AUDIT_MAX_PENDING = 500;
+
+function capabilityOpaqueId(value: unknown): string | null {
+  return typeof value === 'string' && value.trim() && value.length <= 128 ? value : null;
+}
+
+function capabilityDigest(value: unknown): string | null {
+  return typeof value === 'string' && /^[0-9a-f]{64}$/.test(value) ? value : null;
+}
+
+function capabilityStringList(value: unknown, max: number): string[] | null {
+  if (!Array.isArray(value) || value.length > max) return null;
+  const output: string[] = [];
+  for (const entry of value) {
+    if (typeof entry !== 'string' || entry.length > CAPABILITY_LIMITS.FINDING_TEXT_BYTES) return null;
+    output.push(entry);
+  }
+  return output;
+}
+
+function sanitizeCapabilityFindings(value: unknown): CapabilityFinding[] | null {
+  if (!Array.isArray(value) || value.length > CAPABILITY_LIMITS.FINDINGS) return null;
+  const output: CapabilityFinding[] = [];
+  for (const raw of value) {
+    if (typeof raw !== 'object' || raw === null) return null;
+    const finding = raw as Record<string, unknown>;
+    if (typeof finding.code !== 'string'
+      || finding.code.length > 128
+      || typeof finding.message !== 'string'
+      || finding.message.length > CAPABILITY_LIMITS.FINDING_TEXT_BYTES
+      || typeof finding.severity !== 'string'
+      || !Object.values(CAPABILITY_FINDING_SEVERITY).includes(finding.severity as CapabilityFinding['severity'])
+      || typeof finding.source !== 'string'
+      || !['scanner', 'auditor', 'runtime'].includes(finding.source)
+      || typeof finding.blocking !== 'boolean') return null;
+    output.push({
+      code: finding.code,
+      severity: finding.severity as CapabilityFinding['severity'],
+      message: finding.message,
+      ...(typeof finding.path === 'string' ? { path: finding.path.slice(0, CAPABILITY_LIMITS.PATH_BYTES) } : {}),
+      ...(typeof finding.remediation === 'string'
+        ? { remediation: finding.remediation.slice(0, CAPABILITY_LIMITS.FINDING_TEXT_BYTES) }
+        : {}),
+      source: finding.source as CapabilityFinding['source'],
+      blocking: finding.blocking,
+    });
+  }
+  return output;
+}
+
+function toCapabilityManageJournalFrame(
+  request: LocalCapabilityManageRequestView,
+  phase: typeof CAPABILITY_MANAGE_PHASE[keyof typeof CAPABILITY_MANAGE_PHASE],
+): CapabilityOperationManageFrame {
+  return {
+    type: CAPABILITY_OPERATION_MSG.MANAGE,
+    requestId: request.requestId,
+    phase,
+    ownerId: request.ownerUserId,
+    serverId: request.serverId,
+    capabilityId: request.itemId,
+    bindingId: request.bindingId,
+    action: request.action,
+    expectedRevision: request.expectedRevision,
+    authorityRevision: request.authorityRevision,
+    ...(request.targetVersionId ? { versionId: request.targetVersionId } : {}),
+    ...(request.authorization ? { authorization: request.authorization } : {}),
+  };
+}
+
+/**
+ * The heartbeat ack doubles as the clock-sync round trip: echo the peer's send
+ * time and add this Server's own, so the peer can place Server-stamped
+ * deadlines on its local clock (shared/clock-sync.ts). Peers that send no
+ * timestamp get the Server time alone, which older peers ignore.
+ */
+let advertisedUrlsRaw: string | undefined;
+let advertisedUrls: string[] = [];
+
+/**
+ * The public origins of this deployment a controlled node may fall back to (IMCODES_PUBLIC_URLS, comma separated). Empty/unset =
+ * advertise nothing, the node keeps using only the address it was enrolled with. Parsed once per distinct value.
+ */
+export function controlledNodeAdvertisedUrls(raw: string | undefined = process.env[CONTROLLED_NODE_PUBLIC_URLS_ENV]): string[] {
+  if (raw !== advertisedUrlsRaw) {
+    advertisedUrlsRaw = raw;
+    advertisedUrls = parseControlledNodePublicUrls(raw);
+  }
+  return advertisedUrls;
+}
+
+function heartbeatAckWithClock(
+  heartbeat: Record<string, unknown>,
+  /** Controlled nodes only: their own public ID, so a node enrolled before it existed can adopt it. */
+  controlledNodeId?: ControlledNodeId | null,
+  serverId?: string,
+  /** Controlled nodes only: the deployment's public origins (see controlledNodeAdvertisedUrls). */
+  publicUrls?: readonly string[],
+  abiProfile?: ControlledNodeAbiProfile,
+): Record<string, unknown> {
+  const sentAt = heartbeat[CLOCK_SYNC_FIELD.SENT_AT];
+  return {
+    type: 'heartbeat_ack',
+    ...(abiProfile === CONTROLLED_NODE_ABI_GLIBC217 ? { [CONTROLLED_NODE_ABI_PROFILE_FIELD]: abiProfile } : {}),
+    ...(publicUrls && publicUrls.length > 0 ? { [CONTROLLED_NODE_ACK_SERVER_URLS_FIELD]: publicUrls } : {}),
+    ...(controlledNodeId && serverId
+      ? { [CONTROLLED_NODE_ACK_NODE_ID_FIELD]: controlledNodeId, [CONTROLLED_NODE_ACK_SERVER_ID_FIELD]: serverId }
+      : {}),
+    [CLOCK_SYNC_FIELD.SERVER_TIME]: Date.now(),
+    ...(typeof sentAt === 'number' && Number.isFinite(sentAt) ? { [CLOCK_SYNC_FIELD.SENT_AT]: sentAt } : {}),
+  };
+}
 
 export class WsBridge {
   private static instances = new Map<string, WsBridge>();
+  private static remoteDesktopReconnectRevalidator: ((serverId: string) => Promise<void>) | null = null;
 
   private daemonWs: WebSocket | null = null;
   /** Bumped on every new daemon connection; binds pending MACHINE_EXEC results to a generation. */
   private daemonGeneration = 0;
   /** Persistent JWT key used only for stateless direct-file lease resume tickets. */
   private directFileTransferTicketSigningKey: string | null = null;
+  private capabilityBlobSigningKey: string | null = null;
+  private capabilityAuthorizationSigner: CapabilityAuthorizationSigner | null = null;
+  /**
+   * Capability frames from the daemon, handled one at a time in arrival order.
+   * Each progress frame is a revision-checked UPDATE in its own transaction;
+   * run concurrently, a frame could be checked before the previous one
+   * committed, match nothing, and be dropped as stale -- a local Skill sends
+   * acquiring, scanning and auditing within milliseconds, and every install
+   * stuck in acquiring.
+   */
+  private capabilityInbound: Promise<unknown> = Promise.resolve();
+
+  private pendingCapabilityManage = new Map<string, {
+    ownerUserId: string;
+    frame: CapabilityOperationManageFrame;
+    resolve: (result: CapabilityOperationManageResultFrame | null) => void;
+    timer: ReturnType<typeof setTimeout>;
+  }>();
 
   /** Count of inbound frames dropped from CONTROLLED nodes by the 10.2 allowlist (diagnostics/tests). */
   static controlledInboundDropped = 0;
@@ -1206,12 +2162,197 @@ export class WsBridge {
   static invalidMachineExecChunksDropped = 0;
   /** Count of malformed/oversized COMPUTER_USE_RESULT frames rejected before pending-RPC resolution. */
   static invalidComputerUseResultsDropped = 0;
+  /** Count of malformed, reverse-direction, stale or non-owning privacy frames. */
+  static invalidRemoteDesktopPrivacyFramesDropped = 0;
+  /** Count of malformed, stale or non-owning signed-shell lifecycle frames. */
+  static invalidRemoteDesktopShellFramesDropped = 0;
   /** DB-authoritative role of the connected daemon (controlled nodes are a restricted surface). */
   private daemonNodeRole: NodeRole = NODE_ROLE.FULL;
   private authenticated = false;
+  /** Current daemon generation has completed durable route reconciliation. */
+  private remoteDesktopAuthorityReadyGeneration: number | null = null;
   private daemonVersion: string | null = null;
+  private daemonControlledAbiProfile: ControlledNodeAbiProfile = CONTROLLED_NODE_ABI_MODERN;
   private daemonControlledOs: ControlledNodeOs | null = null;
+  /** The authenticated controlled node's public ID (from `servers.node_id`), sent back in its heartbeat acks. */
+  private daemonControlledNodeId: ControlledNodeId | null = null;
   private daemonOwnerUserId: string | null = null;
+  private lastCapabilityRevisionSent = 0;
+  private capabilitySyncInitialized = false;
+
+  /**
+   * Publish the two authority coordinates a controlled node cannot derive:
+   * its canonical physical-host principal and this Server connection's
+   * generation. Absence is fail closed -- the node may stay online, but it
+   * cannot answer attended-consent requests against a guessed identity.
+   */
+  private async sendRemoteDesktopNodeContext(
+    db: Database,
+    ws: WebSocket,
+    connectionGeneration: number,
+  ): Promise<void> {
+    if (this.daemonNodeRole !== NODE_ROLE.CONTROLLED
+      || this.daemonWs !== ws
+      || this.daemonGeneration !== connectionGeneration
+      || !this.authenticated) return;
+    const sendUnavailable = () => {
+      if (this.daemonWs !== ws
+        || this.daemonGeneration !== connectionGeneration
+        || !this.authenticated) return;
+      ws.send(JSON.stringify({
+        type: REMOTE_DESKTOP_NODE_CONTEXT_MSG.UNAVAILABLE,
+        daemonGeneration: connectionGeneration,
+      }));
+    };
+    try {
+      const row = await db.queryOne<{ host_id: string }>(
+        'SELECT host_id FROM remote_desktop_host_endpoints WHERE server_id = $1',
+        [this.serverId],
+      );
+      const context = row ? validateRemoteDesktopNodeAuthorityContext({
+        type: REMOTE_DESKTOP_NODE_CONTEXT_MSG.CURRENT,
+        hostId: row.host_id,
+        daemonGeneration: connectionGeneration,
+      }) : null;
+      if (!context?.ok) {
+        sendUnavailable();
+        return;
+      }
+      if (this.daemonWs !== ws
+        || this.daemonGeneration !== connectionGeneration
+        || !this.authenticated) return;
+      ws.send(JSON.stringify(context.value));
+    } catch (error) {
+      // Host backfill/migration failure removes consent authority; it must not
+      // take unrelated controlled-node exec/file-transfer liveness down.
+      logger.warn({ error, serverId: this.serverId },
+        'could not publish remote desktop canonical-host context');
+      sendUnavailable();
+    }
+  }
+  /**
+   * A controlled node's heartbeat is acknowledged and its server-side bookkeeping updated. Shared by the ordinary
+   * path (after authentication) and the early path (credentials verified, remote-desktop tail still running).
+   */
+  private acknowledgeControlledNodeHeartbeat(
+    msg: Record<string, unknown>,
+    ws: WebSocket,
+    db: Database,
+    connectionGeneration: number,
+  ): void {
+    const hbVersion = typeof msg.daemonVersion === 'string' ? msg.daemonVersion : this.daemonVersion;
+    if (typeof hbVersion === 'string') this.daemonVersion = hbVersion;
+    updateServerHeartbeat(db, this.serverId, hbVersion).catch((err) =>
+      logger.error({ err }, 'Failed to update heartbeat'),
+    );
+    try { ws.send(JSON.stringify(heartbeatAckWithClock(
+      msg,
+      this.daemonControlledNodeId,
+      this.serverId,
+      this.daemonNodeRole === NODE_ROLE.CONTROLLED ? controlledNodeAdvertisedUrls() : undefined,
+      this.daemonControlledAbiProfile,
+    ))); } catch { /* ignore */ }
+    void this.sendRemoteDesktopNodeContext(db, ws, connectionGeneration);
+  }
+
+  /**
+   * Remote-desktop reconcile + revalidate for a freshly authenticated connection, with a bounded wait.
+   *
+   * The pair of steps can legitimately take ~35 s (a restarted node with a live route must cold-start its worker
+   * and ack the replacement route), but nothing else on the connection may wait that long: the node gives a socket
+   * up after 30 s of silence. Authentication therefore continues after DAEMON_AUTH_RECONCILE_BUDGET_MS while the
+   * steps keep running in the background, and remote desktop stays unavailable for this generation
+   * (`remoteDesktopAuthorityReadyGeneration` unset: fail closed) until they really finish. A failure is retried and
+   * finally reported -- never left as a silent half-aligned state.
+   */
+  private async awaitRemoteDesktopReconcileForAuth(
+    generation: number,
+    isCurrent: () => boolean,
+    phases: { reconcileMs: number | null; revalidateMs: number | null },
+  ): Promise<boolean> {
+    const tail = this.runRemoteDesktopReconcileWithRetry(generation, isCurrent, phases);
+    let budgetTimer: ReturnType<typeof setTimeout> | null = null;
+    const outcome = await Promise.race([
+      tail.then(() => 'done' as const),
+      new Promise<'budget'>((resolve) => {
+        budgetTimer = setTimeout(() => resolve('budget'), DAEMON_AUTH_RECONCILE_BUDGET_MS);
+        (budgetTimer as { unref?: () => void }).unref?.();
+      }),
+    ]);
+    if (budgetTimer) clearTimeout(budgetTimer);
+    if (outcome === 'budget') {
+      logger.warn({
+        serverId: this.serverId,
+        generation,
+        budgetMs: DAEMON_AUTH_RECONCILE_BUDGET_MS,
+      }, 'remote desktop reconcile is still running; authentication continues and remote desktop stays unavailable on this connection until it finishes');
+    }
+    return outcome === 'done';
+  }
+
+  private async runRemoteDesktopReconcileWithRetry(
+    generation: number,
+    isCurrent: () => boolean,
+    phases: { reconcileMs: number | null; revalidateMs: number | null },
+  ): Promise<void> {
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        const startedAt = Date.now();
+        const recovered = await this.remoteDesktopRouter.reconcileDaemonReplacement(generation);
+        const reconciledAt = Date.now();
+        // The legacy reconciler closes every process-lost route. Running it after a
+        // privacy-fenced transparent replacement would immediately destroy that
+        // replacement, so it is used only when no in-memory route was recovered.
+        if (recovered === 0) await WsBridge.remoteDesktopReconnectRevalidator?.(this.serverId);
+        if (attempt === 0) {
+          phases.reconcileMs = reconciledAt - startedAt;
+          phases.revalidateMs = recovered === 0 ? Date.now() - reconciledAt : 0;
+        }
+        if (isCurrent()) this.remoteDesktopAuthorityReadyGeneration = generation;
+        return;
+      } catch (error) {
+        if (!isCurrent()) return;
+        const retryDelay = DAEMON_AUTH_RECONCILE_RETRY_DELAYS_MS[attempt];
+        if (retryDelay === undefined) {
+          incrementCounter('remote_desktop.reconcile_gave_up');
+          logger.error({ error, serverId: this.serverId, generation, attempts: attempt + 1 },
+            'remote desktop reconcile gave up; remote desktop stays unavailable on this connection until the node reconnects');
+          return;
+        }
+        // Keep the daemon available for unrelated services but fail closed for remote desktop;
+        // do not replay process-local remote authority.
+        logger.warn({ error, serverId: this.serverId, generation, attempt: attempt + 1, retryInMs: retryDelay },
+          'Remote desktop reconnect authority reconciliation failed; it will be retried');
+        await new Promise<void>((resolve) => {
+          const timer = setTimeout(resolve, retryDelay);
+          (timer as { unref?: () => void }).unref?.();
+        });
+        if (!isCurrent()) return;
+      }
+    }
+  }
+
+  /**
+   * An authenticated daemon connection was just replaced. One replacement is a normal reconnect; several within
+   * a minute mean two processes are using the same credential (a duplicated service, a misconfigured copy) and are
+   * kicking each other. The per-daemon connect limiter bounds the rate; this makes the situation visible.
+   */
+  private noteAuthenticatedConnectionReplaced(now = Date.now()): void {
+    if (!this.authenticated) return;
+    this.authenticatedReplacementTimes = this.authenticatedReplacementTimes
+      .filter((at) => now - at < DAEMON_CONNECTION_DUEL_WINDOW_MS);
+    this.authenticatedReplacementTimes.push(now);
+    if (this.authenticatedReplacementTimes.length >= DAEMON_CONNECTION_DUEL_REPLACEMENTS
+      && now - this.lastDuelWarnAt >= DAEMON_CONNECTION_DUEL_WINDOW_MS) {
+      this.lastDuelWarnAt = now;
+      logger.warn({
+        serverId: this.serverId,
+        replacements: this.authenticatedReplacementTimes.length,
+        windowMs: DAEMON_CONNECTION_DUEL_WINDOW_MS,
+      }, 'daemon connection replaced repeatedly');
+    }
+  }
+
   private legacyUpgradeRescuePreparedGeneration: number | null = null;
   /** A safe-self-upgrade node can still retain its process-local latch when a
    *  detached task fails before replacing the process. Arm the same verified
@@ -1226,12 +2367,46 @@ export class WsBridge {
     restartAttempts: number;
     restartInFlight: boolean;
     restartTimer: ReturnType<typeof setTimeout> | null;
-    restartCoordinatorPrepared: boolean;
   } | null = null;
+  /** Restart backoff for the legacy Windows restart-nudge, kept outside
+   *  `legacyUpgradeRescuePreparation` so it survives that per-generation
+   *  state being rebuilt on every disconnect/reconnect. Without this, a node
+   *  that disconnects every time the restart command runs never actually
+   *  experiences the exponential backoff — see resolveLegacyWindowsUpgradeRestartAttempt. */
+  private legacyUpgradeRestartThrottle: LegacyWindowsUpgradeRestartThrottle | null = null;
   private daemonUpgradeCoordinator = new DaemonUpgradeCoordinator();
+  private autoUpgradeStatus: ControlledNodeUpgradeStatus = CONTROLLED_NODE_UPGRADE_STATUS.CURRENT;
+  private autoUpgradeReason: string | null = null;
+  private autoUpgradeTargetVersion: string | null = null;
+  /** Attempt bookkeeping for ONE target; in memory only, so a pod restart
+   *  grants a failed node one fresh retry instead of a permanent block. */
+  private autoUpgradeAttemptTarget: string | null = null;
+  private autoUpgradeAttempts = 0;
+  private autoUpgradeLastAttemptAt: number | null = null;
+  private autoUpgradeRetryTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Epoch ms the armed retry fires at (surfaced to the card), or null. */
+  private autoUpgradeNextRetryAt: number | null = null;
+  /** The full daemon told us its own opt-out refused source:auto; reset per connection. */
+  private autoUpgradeDisabledOnDaemon = false;
+  /** Daemon connection generation the last upgrade command was written to. */
+  private daemonUpgradeSentGeneration: number | null = null;
+  private lastLoggedAutoUpgradeWait: string | null = null;
+  private autoUpgradePersistence: Promise<void> = Promise.resolve();
+  private controlledNodeWorkerRefreshStatus: ControlledNodeWorkerRefreshStatusMessage | null = null;
+  private controlledNodeWorkerRefreshPersistence: Promise<void> = Promise.resolve();
   private browserSockets = new Set<WebSocket>();
+  /**
+   * Task-console subscriptions each browser socket opened, so a socket that
+   * goes away without saying so (tab closed, phone asleep, network drop) can
+   * be unsubscribed on the daemon's behalf. The daemon holds one subscription
+   * per viewer and sends every delta once per subscription; without this a
+   * dead viewer's subscription (and its pair view) lived as long as the
+   * daemon connection did. Keyed by viewer (`clientId`, else the subscription
+   * id) + scope; a viewer's newer subscribe replaces its older entry.
+   */
+  private consoleSubscriptions = new Map<WebSocket, Map<string, { subscriptionId: string; projectName: string; coordinatorSessionName: string }>>();
   private mobileSockets = new Set<WebSocket>();
-  private queue: string[] = [];
+  private queue: Array<{ message: string; queuedAt: number }> = [];
   private authTimer: ReturnType<typeof setTimeout> | null = null;
   /**
    * Audit fix (78-server reconnect-storm investigation, 2026-05-11) —
@@ -1254,12 +2429,32 @@ export class WsBridge {
    * auth check has settled.
    */
   private authPromise: Promise<void> | null = null;
+  /**
+   * The FIRST half of `authPromise`: resolved as soon as this connection's own credentials are verified (one
+   * `servers` row lookup) or authentication failed. A controlled node's heartbeat -- the frame its watchdog
+   * counts as the auth ack -- waits only for this, never for the slow remote-desktop tail behind `authPromise`:
+   * a node gives a socket up after 30 s without any server frame.
+   */
+  private credentialPromise: Promise<void> | null = null;
+  /** When authenticated connections were replaced by a newer one; two processes sharing a credential show up here. */
+  private authenticatedReplacementTimes: number[] = [];
+  private lastDuelWarnAt = 0;
   /** Connection generation that advertised outbox-sync support during auth. */
   private upgradeBlockedSyncRequiredGeneration: number | null = null;
   /** Connection generation whose persisted blocker replay has completed. */
   private upgradeBlockedSyncCompleteGeneration: number | null = null;
   private seenUpgradeBlockedFailures = new Map<string, number>();
   private browserRateLimiter = new MemoryRateLimiter();
+  /** Per share socket, per lane: the tail of the ordered command chain and how many wait in it. */
+  private shareMessageLanes = new WeakMap<WebSocket, Map<ShareMessageLane, { tail: Promise<void>; pending: number }>>();
+  /** Bumped on every share grant change; a socket whose coverage predates it is re-read before its next command. */
+  private shareCoverageEpoch = 0;
+  /** The coverage re-read in progress for a socket; concurrent commands wait on it instead of each querying. */
+  private shareCoverageRefreshes = new WeakMap<WebSocket, Promise<ShareScopedSocketState | null>>();
+  private shareInputAuthorityTokens = new WeakMap<WebSocket, Map<string, { token: string | null; at: number }>>();
+  private shareInputAuthorityMints = new WeakMap<WebSocket, Map<string, Promise<string | null>>>();
+  private pendingShareAudits = 0;
+  private browserDataReadRateLimiter = new MemoryRateLimiter();
 
   /** browser socket → session name → raw-enabled flag */
   private browserSubscriptions = new Map<WebSocket, Map<string, boolean>>();
@@ -1267,11 +2462,20 @@ export class WsBridge {
   /** browser socket → set of subscribed transport session IDs */
   private transportSubscriptions = new Map<WebSocket, Set<string>>();
   private transportSubscriptionRevisions = new Map<WebSocket, Map<string, number>>();
+  /** browser socket → explicit timeline mode per session. */
+  private timelineSubscriptions = new Map<WebSocket, Map<string, TimelineSubscriptionMode>>();
+  /** Sockets that have spoken the v2 timeline protocol, including after unsubscribe. */
+  private timelineProtocolSockets = new Set<WebSocket>();
+  /** Bounded live timeline queues; control frames never use these queues. */
+  private timelineQueues = new Map<WebSocket, TimelineOutboundQueue>();
+  /** Last delivered/pending value per socket, used to suppress unchanged signals. */
+  private timelineLatestValueFingerprints = new Map<WebSocket, Map<string, string>>();
 
   /** browser socket → userId (for session ownership checks) */
   private browserUserIds = new Map<WebSocket, string>();
   /** Sockets admitted through Owner/Participant controlled-machine access. */
   private controlledTargetBrowserSockets = new Set<WebSocket>();
+  private readonly controlledBrowserReads: ControlledBrowserReadGate;
   /** browser socket → live share-scoped authorization state */
   private browserShareStates = new Map<WebSocket, ShareScopedSocketState>();
   private shareCoverageResolver: ShareCoverageResolver = resolveShareCoverageFromDb;
@@ -1327,6 +2531,12 @@ export class WsBridge {
    * any peer-audit response without a matching route is dropped, never
    * broadcast.
    */
+  /**
+   * commandId -> originating browser socket for command.ack delivery to a
+   * sender that isn't subscribed to the session. See CommandAckOriginRouter.
+   */
+  private readonly commandAckOrigins = new CommandAckOriginRouter(COMMAND_ACK_ORIGIN_TTL_MS);
+
   private readonly peerAuditRouter: PeerAuditUnicastRouter = new PeerAuditUnicastRouter(
     undefined,
     0,
@@ -1353,6 +2563,9 @@ export class WsBridge {
     iceServers: (userId) => createTurnIceServerAuthority(userId),
     sendDaemon: (message, generation) => this.trySendDirectFileTransfer(message, generation),
     sendBrowser: (socket, message) => { safeSend(socket, JSON.stringify(message)); },
+    authorizeIdentityOperation: (socket, scope, scopeKey, sessionName) => (
+      !!sessionName && this.canonicalIdentityScopeKeyForSocket(socket, scope, sessionName) === scopeKey
+    ),
   });
 
   /** Continuous-authority remote desktop signaling; media/input never enter Server. */
@@ -1366,11 +2579,21 @@ export class WsBridge {
     // capability, not the node role, is what gates the feature.
     daemonAvailable: () => Boolean(
       this.authenticated
+      && this.remoteDesktopAuthorityReadyGeneration === this.daemonGeneration
       && this.daemonWs?.readyState === WebSocket.OPEN
       && (this.daemonNodeRole === NODE_ROLE.CONTROLLED
         || this.hasDaemonCapability(REMOTE_DESKTOP_CAPABILITY)),
     ),
-    daemonSupportsRemoteDesktop: () => this.hasDaemonCapability(REMOTE_DESKTOP_CAPABILITY),
+    daemonSupportsRemoteDesktop: () => resolveRemoteDesktopSessionProfile(
+      this.daemonNodeRole === NODE_ROLE.CONTROLLED
+        ? [...this.controlledNodeCapabilities]
+        : this.daemonP2pWorkflowCapabilities?.capabilities,
+    ) !== null,
+    daemonRemoteDesktopCapabilities: () => (
+      this.daemonNodeRole === NODE_ROLE.CONTROLLED
+        ? [...this.controlledNodeCapabilities]
+        : [...(this.daemonP2pWorkflowCapabilities?.capabilities ?? [])]
+    ),
     featureEnabled: () => isRemoteDesktopFeatureEnabled(
       process.env.IMCODES_REMOTE_DESKTOP_ENABLED,
       process.env.NODE_ENV,
@@ -1379,6 +2602,73 @@ export class WsBridge {
     iceServers: (userId) => createTurnIceServerAuthority(userId),
     sendDaemon: (message, generation) => this.trySendRemoteDesktop(message, generation),
     sendBrowser: (socket, message) => { safeSend(socket, JSON.stringify(message)); },
+    redeemGuestBootstrap: async ({ proof, routeGeneration, clientIp, now }) => {
+      const db = this.db;
+      if (!db) return null;
+      const redeemed = await redeemBootstrapForRoute({
+        db,
+        proof,
+        redeemingServerId: this.serverId,
+        routeGeneration,
+        clientIp,
+        now,
+      });
+      if (!redeemed) return null;
+      // Bootstrap storage binds the independent route incarnation.  Runtime
+      // actor authority remains bound to the authenticated daemon channel.
+      return {
+        ...redeemed,
+        actor: { ...redeemed.actor, endpointGeneration: this.daemonGeneration },
+      };
+    },
+    resolveGuestActor: async (actor, now) => {
+      const db = this.db;
+      if (!db) return null;
+      return resolveRedeemedGuestActor({
+        db,
+        previous: actor,
+        serverId: this.serverId,
+        endpointGeneration: this.daemonGeneration,
+        now,
+      });
+    },
+    requestAttendedConsent: (input) => this.requestRemoteDesktopAttendedConsent(input),
+    cancelPendingGuestConsent: async (actor, cause) => {
+      const db = this.db;
+      if (!db || actor.source !== REMOTE_DESKTOP_ACTOR_SOURCE.ATTENDED_LINK) return;
+      const dispatch = (command: RemoteDesktopConsentDispatchCommand) => (
+        this.trySendRemoteDesktopConsent(command)
+      );
+      if (cause === 'privacy_epoch') {
+        await cancelAttendedConsents(db, {
+          selector: { actorAuditId: actor.auditId },
+          reason: REMOTE_DESKTOP_CONSENT_CANCEL_REASON.LOCAL_UI_FAILED,
+          trigger: REMOTE_DESKTOP_CONSENT_CANCEL_TRIGGER.CALLER_CANCEL,
+          dispatch,
+        });
+      } else if (cause === 'authority_revoked') {
+        await remoteDesktopConsentCancellation.linkRevoked(db, actor.auditId, dispatch);
+      } else {
+        await remoteDesktopConsentCancellation.browserDisconnected(
+          db,
+          hashBrowserKey(actor.browserKeyThumbprint),
+          dispatch,
+        );
+      }
+    },
+    cancelHostAttendedConsents: async (hostId) => {
+      const db = this.db;
+      if (!db) return;
+      await remoteDesktopConsentCancellation.localStop(
+        db,
+        hostId,
+        (command) => this.trySendRemoteDesktopConsent(command),
+      );
+    },
+    supportsDefaultShieldedRoute: () => (
+      this.hasDaemonCapability(REMOTE_DESKTOP_CAPTURE_PRIVACY_CAPABILITY)
+      && this.hasDaemonCapability(REMOTE_DESKTOP_DEFAULT_SHIELDED_ROUTE_CAPABILITY)
+    ),
     audit: (event, fields) => {
       incrementCounter('remote_desktop.session_event', { event });
       const db = this.db;
@@ -1391,6 +2681,12 @@ export class WsBridge {
         details,
       }, db);
     },
+    autoUnlockSucceeded: (event) => {
+      const db = this.db;
+      const env = this.pushEnv;
+      if (!db || !env) return;
+      void notifyRemoteDesktopAutoUnlock(db, env, event);
+    },
   });
 
   /** Per-request memory management pending map — routes sensitive admin responses via requestId unicast. */
@@ -1402,13 +2698,23 @@ export class WsBridge {
 
   private timelineDataPlaneQueue: TimelineDataPlaneJob[] = [];
   private timelineDataPlaneScheduled = false;
-  private timelineDataPlaneActive = false;
+  private timelineDataPlaneActiveJobs = new Set<TimelineDataPlaneJob>();
+  /** Bytes retained by queued and active timeline data-plane jobs. */
+  private timelineDataPlaneQueueBytes = 0;
+  private timelineDataPlaneBytesBySocket = new Map<WebSocket, number>();
+  private timelineDataPlaneBytesByUser = new Map<string, number>();
+  /** Canonical request id for each identical in-flight history/page request. */
+  private timelineInFlightByKey = new Map<string, string>();
+  private timelineRequestKeys = new Map<string, string>();
+  private timelineRequestAliases = new Map<string, Set<string>>();
 
   /** Lightweight per-session hot cache for Watch first-paint text. */
   private recentTextBySession = new Map<string, WatchRecentTextRow[]>();
   /** Content-bearing timeline events discarded because nobody was subscribed. */
   private timelineNoSubscriberDrops = 0;
   private lastTimelineNoSubscriberLogAt = 0;
+  /** Push credentials of the daemon connection, for owner security pushes. */
+  private pushEnv: Env | null = null;
   private pendingIdlePushes = new Map<string, {
     timer: ReturnType<typeof setTimeout> | null;
     db: Database;
@@ -1421,6 +2727,14 @@ export class WsBridge {
   /** Latest daemon-owned active sub-session snapshot for push title resolution. */
   private activeSubSessions = new Map<string, WatchActiveSubSessionRow>();
   private hasActiveMainSessionSnapshot = false;
+  /**
+   * Project-identity scope key per session, exactly as the daemon derives it
+   * (sessionIdentityProjectKey). Browser session lists for share recipients
+   * omit `contextNamespace`, so a participant's browser cannot know the key;
+   * the shared identity route resolves it here instead.
+   */
+  private mainIdentityProjectKeys = new Map<string, string>();
+  private subIdentityProjectKeys = new Map<string, string>();
 
   /**
    * File transfer correlation: requestId → { resolve, reject, timer }.
@@ -1440,11 +2754,20 @@ export class WsBridge {
    * replies with `MEMORY_WS.GET_SOURCES_RESPONSE`. See
    * openspec/changes/memory-source-server-routing.
    */
-  private pendingMemorySourcesRequests = new Map<string, {
-    resolve: (msg: Record<string, unknown>) => void;
-    reject: (err: Error) => void;
-    timer: ReturnType<typeof setTimeout>;
-  }>();
+  private readonly memorySourcesRequests = new DaemonRequestTracker();
+
+  /**
+   * requestId -> awaiting HTTP route caller, for PROJECT/SESSION identity
+   * get/set/delete forwarded to the daemon (the daemon is the sole content
+   * owner for those scopes; this is the only way to reach it, never HTTP).
+   */
+  private readonly sessionIdentityRequests = new DaemonRequestTracker();
+
+  /**
+   * `/api/agent-skills` and `/api/agent-mcp` callers awaiting the daemon's
+   * reply: owner-only reads and changes of the machine's agent configuration.
+   */
+  private readonly machineConfigRequests = new DaemonRequestTracker();
 
   private pendingPreviewRequests = new Map<string, PendingPreviewRequest>();
 
@@ -1499,6 +2822,14 @@ export class WsBridge {
   private ackHousekeepingTimer: ReturnType<typeof setInterval> | null = null;
 
   private constructor(private serverId: string) {
+    this.controlledBrowserReads = new ControlledBrowserReadGate(serverId, () => this.db, (socket) => {
+      this.cleanupBrowserSocket(socket);
+      try { socket.close(1008, 'controlled_read_revoked'); } catch { /* already closed */ }
+    }, () => machineGroupInvalidationReady(this.db), () => this.db
+      ? machineGroupInvalidationRevision(this.db) : Promise.reject(new Error('controlled_read_authority_unavailable')));
+    setRemoteDesktopPendingRouteCancellationDispatcher(
+      (command) => WsBridge.dispatchRemoteDesktopPendingRouteCancellation(command),
+    );
     // Start periodic cleanup sweep (shared across all bridge instances)
     if (!cleanupSweepHandle) {
       cleanupSweepHandle = setInterval(() => {
@@ -1536,8 +2867,1220 @@ export class WsBridge {
     return bridge;
   }
 
+  /** Read an already-created bridge without manufacturing per-pod state. */
+  static find(serverId: string): WsBridge | undefined {
+    return WsBridge.instances.get(serverId);
+  }
+
+  getControlledNodeUpgradeStatus(): {
+    status: ControlledNodeUpgradeStatus;
+    targetVersion?: string;
+    reason?: string;
+  } {
+    return {
+      status: this.autoUpgradeStatus,
+      ...(this.autoUpgradeTargetVersion ? { targetVersion: this.autoUpgradeTargetVersion } : {}),
+      ...(this.autoUpgradeReason ? { reason: this.autoUpgradeReason } : {}),
+    };
+  }
+
+  getControlledNodeWorkerRefreshStatus(): ControlledNodeWorkerRefreshStatusMessage | null {
+    return this.controlledNodeWorkerRefreshStatus;
+  }
+
+  private setControlledNodeWorkerRefreshStatus(status: ControlledNodeWorkerRefreshStatusMessage): void {
+    this.controlledNodeWorkerRefreshStatus = status;
+    const db = this.db;
+    if (!db) {
+      this.broadcastToBrowsers(JSON.stringify(status));
+      return;
+    }
+    this.controlledNodeWorkerRefreshPersistence = this.controlledNodeWorkerRefreshPersistence
+      .catch(() => {})
+      .then(() => db.execute(
+        `UPDATE servers
+            SET controlled_worker_refresh_attempt_id = $1,
+                controlled_worker_refresh_phase = $2,
+                controlled_worker_refresh_installed_version = $3,
+                controlled_worker_refresh_target_version = $4,
+                controlled_worker_refresh_artifact_sha256 = $5,
+                controlled_worker_refresh_reason = $6,
+                controlled_worker_refresh_recorded_at = $7
+          WHERE id = $8 AND node_role = $9 AND revoked_at IS NULL`,
+        [
+          status.attemptId,
+          status.phase,
+          status.installedVersion ?? null,
+          status.targetVersion ?? null,
+          status.artifactSha256 ?? null,
+          status.reason ?? null,
+          status.recordedAt,
+          this.serverId,
+          NODE_ROLE.CONTROLLED,
+        ],
+      ))
+      .then(() => undefined)
+      .catch((error) => logger.warn({ error, serverId: this.serverId }, 'Controlled worker refresh status persistence failed'));
+    this.broadcastToBrowsers(JSON.stringify(status));
+  }
+
+  private setAutoUpgradeState(
+    status: ControlledNodeUpgradeStatus,
+    targetVersion: string | null = this.autoUpgradeTargetVersion,
+    reason: string | null = null,
+  ): void {
+    this.autoUpgradeStatus = status;
+    this.autoUpgradeTargetVersion = targetVersion;
+    this.autoUpgradeReason = reason;
+    // Discovery is served by any API pod, so persist the bounded state rather
+    // than exposing a process-local WS snapshot as the authority. A stale or
+    // unavailable DB must never block the live daemon transition.
+    if (this.db && this.daemonNodeRole === NODE_ROLE.CONTROLLED) {
+      const db = this.db;
+      this.autoUpgradePersistence = this.autoUpgradePersistence
+        .catch(() => {})
+        .then(() => db.execute(
+          `UPDATE servers
+              SET controlled_upgrade_status = $1,
+                  controlled_upgrade_target_version = $2,
+                  controlled_upgrade_reason = $3
+            WHERE id = $4 AND node_role = $5 AND revoked_at IS NULL`,
+          [status, targetVersion, reason, this.serverId, NODE_ROLE.CONTROLLED],
+        ))
+        .then(() => undefined)
+        .catch((error) => logger.warn({ error, serverId: this.serverId }, 'Controlled upgrade state persistence failed'));
+    }
+  }
+
   static getAll(): Map<string, WsBridge> {
     return WsBridge.instances;
+  }
+
+  timelineQueueStatsForTests(ws: WebSocket): { bytes: number; pending: number; pendingGaps: number } {
+    return this.timelineQueues.get(ws)?.statsForTests() ?? { bytes: 0, pending: 0, pendingGaps: 0 };
+  }
+
+  static setRemoteDesktopReconnectRevalidator(
+    revalidator: ((serverId: string) => Promise<void>) | null,
+  ): void {
+    WsBridge.remoteDesktopReconnectRevalidator = revalidator;
+  }
+
+  /** Deliver one durable privacy command only through the currently
+   * authenticated, generation-bound daemon channel. It is never queued or
+   * replayed onto a replacement generation. */
+  static dispatchRemoteDesktopManagementPrivacy(
+    command: RemoteDesktopManagementPrivacyCommand,
+  ): boolean {
+    const bridge = WsBridge.instances.get(command.executionServerId);
+    return bridge?.trySendRemoteDesktopManagementPrivacy(
+      command.message,
+      command.daemonGeneration,
+    ) ?? false;
+  }
+
+  /**
+   * Production adapter for one-use signed-shell launch contexts. Resolution
+   * and delivery both re-check the same live, authenticated controlled-node
+   * generation and never queue onto a replacement connection.
+   */
+  static remoteDesktopShellLaunchContextDispatcher(): RemoteDesktopShellLaunchContextDispatcher {
+    return {
+      currentControlledEndpoint: async (input) => {
+        let selected: RemoteDesktopShellEndpointAuthority | null = null;
+        for (const bridge of WsBridge.instances.values()) {
+          const candidate = await bridge.currentRemoteDesktopShellEndpoint(input);
+          if (!candidate) continue;
+          // More than one live controlled endpoint for one canonical host is
+          // ambiguous presentation identity, not a reason to pick the first.
+          if (selected) return null;
+          selected = candidate;
+        }
+        return selected;
+      },
+      dispatch: async (input) => {
+        const bridge = WsBridge.instances.get(input.executionServerId);
+        return bridge?.trySendRemoteDesktopShellLaunchContext(
+          input.ownerUserId,
+          input.hostId,
+          input.context,
+          input.endpointGeneration,
+        ) ?? false;
+      },
+    };
+  }
+
+  static dispatchRemoteDesktopPendingRouteCancellation(
+    command: RemoteDesktopPendingRouteCancellationCommand,
+  ): boolean {
+    const bridge = WsBridge.instances.get(command.executionServerId);
+    if (!bridge) return false;
+    bridge.remoteDesktopRouter.cancelPendingRoutes(command.hostId, command.routes);
+    return true;
+  }
+
+  /** Resolve only an already-created bridge on this pod. Merely observing an
+   * outbox row must never instantiate a fake owner. */
+  static remoteDesktopGuestOutboxTarget(
+    serverId: string,
+  ): RemoteDesktopGuestOutboxExecutionTarget | null {
+    const bridge = WsBridge.instances.get(serverId);
+    if (!bridge) return null;
+    return {
+      isAvailable: () => bridge.isRemoteDesktopGuestOutboxTargetAvailable(),
+      apply: (event, routeId, routeGeneration, authority) => (
+        bridge.applyRemoteDesktopGuestOutboxEffect(event, routeId, routeGeneration, authority)
+      ),
+    };
+  }
+
+  /** Immediate same-process fan-out; heartbeat revision checks cover other pods. */
+  static async broadcastCapabilitySync(
+    ownerUserId: string,
+    db: Database,
+    afterRevision: number,
+  ): Promise<number> {
+    const record = await getCapabilitySyncSnapshot(db, {
+      ownerUserId,
+      maxItems: CAPABILITY_LIMITS.LIST_MAX,
+      afterRevision,
+    });
+    let delivered = 0;
+    for (const bridge of WsBridge.instances.values()) {
+      if (!bridge.canAcceptCapabilityOperation(ownerUserId)
+        || !bridge.daemonWs
+        || !bridge.capabilitySyncInitialized) continue;
+      try {
+        const keys = bridge.capabilityAuthorizationSigner ? [bridge.capabilityAuthorizationSigner.key] : [];
+        bridge.daemonWs.send(JSON.stringify(toCapabilitySyncSnapshot(
+          record,
+          CAPABILITY_SYNC_MSG.DELTA,
+          keys,
+        )));
+        const authority = await getCapabilityAuthorityRecordSet(db, {
+          ownerUserId,
+          serverId: bridge.serverId,
+        });
+        bridge.daemonWs.send(JSON.stringify(toCapabilitySyncAuthorityFrame(authority, keys)));
+        bridge.lastCapabilityRevisionSent = record.revision;
+        delivered += 1;
+      } catch (error) {
+        logger.warn({ error, serverId: bridge.serverId }, 'Capability sync fan-out failed');
+      }
+    }
+    return delivered;
+  }
+
+  static async dispatchPendingCapabilityAuthorization(
+    ownerUserId: string,
+    db: Database,
+    operationId: string,
+  ): Promise<boolean> {
+    const pending = await getPendingCapabilityAuthorization(db, { ownerUserId, operationId });
+    if (!pending) return false;
+    const bridge = WsBridge.instances.get(pending.targetServerId);
+    if (!bridge?.canAcceptCapabilityOperation(ownerUserId)
+      || !bridge.daemonWs
+      || !bridge.capabilityAuthorizationSigner) return false;
+    try {
+      bridge.daemonWs.send(JSON.stringify(toCapabilityOperationAuthorizeFrame(
+        pending,
+        [bridge.capabilityAuthorizationSigner.key],
+      )));
+      return true;
+    } catch (error) {
+      logger.warn({ error, serverId: pending.targetServerId, operationId }, 'Capability authorization dispatch failed');
+      return false;
+    }
+  }
+
+  /**
+   * True only for the authenticated same-account FULL daemon currently bound
+   * to this bridge. HTTP capability intake uses this before creating durable
+   * queued work so an offline/wrong-account/controlled target fails fast.
+   */
+  canAcceptCapabilityOperation(ownerUserId: string): boolean {
+    return this.authenticated
+      && this.daemonNodeRole === NODE_ROLE.FULL
+      && this.daemonOwnerUserId === ownerUserId
+      && this.daemonWs?.readyState === WebSocket.OPEN;
+  }
+
+  /** Operation install frames are live-generation control messages, never replayed. */
+  dispatchCapabilityInstall(ownerUserId: string, frame: CapabilityOperationInstallFrame): boolean {
+    if (!this.canAcceptCapabilityOperation(ownerUserId) || !this.daemonWs) return false;
+    try {
+      this.daemonWs.send(JSON.stringify(frame));
+      return true;
+    } catch (error) {
+      logger.warn({ error, serverId: this.serverId }, 'Capability install dispatch failed');
+      return false;
+    }
+  }
+
+  /** Browser confirmation is delivered live to the same owner daemon only. */
+  dispatchCapabilityConfirmation(ownerUserId: string, frame: CapabilityOperationConfirmFrame): boolean {
+    if (!this.canAcceptCapabilityOperation(ownerUserId) || !this.daemonWs) return false;
+    try {
+      this.daemonWs.send(JSON.stringify(frame));
+      return true;
+    } catch (error) {
+      logger.warn({ error, serverId: this.serverId }, 'Capability confirmation dispatch failed');
+      return false;
+    }
+  }
+
+  /** Owner cancellation is authoritative server-side; delivery only cleans up live work. */
+  dispatchCapabilityCancellation(ownerUserId: string, frame: CapabilityOperationCancelFrame): boolean {
+    if (!this.canAcceptCapabilityOperation(ownerUserId) || !this.daemonWs) return false;
+    try {
+      this.daemonWs.send(JSON.stringify(frame));
+      return true;
+    } catch (error) {
+      logger.warn({ error, serverId: this.serverId }, 'Capability cancellation dispatch failed');
+      return false;
+    }
+  }
+
+  /** Local authority mutates only after the exact daemon reports durable success. */
+  dispatchCapabilityManage(
+    ownerUserId: string,
+    frame: CapabilityOperationManageFrame,
+    timeoutMs = 10_000,
+  ): Promise<CapabilityOperationManageResultFrame | null> {
+    if (!this.canAcceptCapabilityOperation(ownerUserId) || !this.daemonWs) return Promise.resolve(null);
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        const pending = this.pendingCapabilityManage.get(frame.requestId);
+        if (!pending) return;
+        this.pendingCapabilityManage.delete(frame.requestId);
+        pending.resolve(null);
+      }, timeoutMs);
+      timer.unref?.();
+      this.pendingCapabilityManage.set(frame.requestId, { ownerUserId, frame, resolve, timer });
+      try {
+        this.daemonWs!.send(JSON.stringify(frame));
+      } catch (error) {
+        clearTimeout(timer);
+        this.pendingCapabilityManage.delete(frame.requestId);
+        logger.warn({ error, serverId: this.serverId, requestId: frame.requestId }, 'Capability manage dispatch failed');
+        resolve(null);
+      }
+    });
+  }
+
+  private rejectPendingCapabilityManage(): void {
+    for (const [requestId, pending] of this.pendingCapabilityManage) {
+      clearTimeout(pending.timer);
+      this.pendingCapabilityManage.delete(requestId);
+      pending.resolve(null);
+    }
+  }
+
+  private failDisconnectedCapabilityOperations(db: Database, ownerUserId: string): void {
+    this.rejectPendingCapabilityManage();
+    void failCapabilityOperationsForDisconnectedServer(db, {
+      ownerUserId,
+      serverId: this.serverId,
+    }).then((operations) => {
+      for (const operation of operations) {
+        this.broadcastToBrowsers(JSON.stringify({
+          type: CAPABILITY_OPERATION_MSG.PROGRESS,
+          operationId: operation.id,
+          revision: operation.revision,
+          state: operation.state,
+          errorCode: operation.errorCode,
+        }));
+      }
+    }).catch((error: unknown) => {
+      logger.warn({ error, serverId: this.serverId }, 'Failed to terminate disconnected capability operations');
+    });
+  }
+
+  private async sendCapabilitySnapshot(
+    db: Database,
+    socket: WebSocket,
+    expectedGeneration: number,
+    afterRevision?: number,
+  ): Promise<void> {
+    const ownerUserId = this.daemonOwnerUserId;
+    if (!ownerUserId || !this.canAcceptCapabilityOperation(ownerUserId)) return;
+    await this.expirePreActivationCapabilityOperations(
+      db,
+      socket,
+      expectedGeneration,
+      ownerUserId,
+    );
+    const record = await getCapabilitySyncSnapshot(db, {
+      ownerUserId,
+      maxItems: CAPABILITY_LIMITS.LIST_MAX,
+      afterRevision,
+    });
+    if (this.daemonWs !== socket || this.daemonGeneration !== expectedGeneration) return;
+    socket.send(JSON.stringify(toCapabilitySyncSnapshot(
+      record,
+      afterRevision === undefined ? CAPABILITY_SYNC_MSG.SNAPSHOT : CAPABILITY_SYNC_MSG.DELTA,
+      this.capabilityAuthorizationSigner ? [this.capabilityAuthorizationSigner.key] : [],
+    )));
+    const authority = await getCapabilityAuthorityRecordSet(db, {
+      ownerUserId,
+      serverId: this.serverId,
+    });
+    if (this.daemonWs !== socket || this.daemonGeneration !== expectedGeneration) return;
+    socket.send(JSON.stringify(toCapabilitySyncAuthorityFrame(
+      authority,
+      this.capabilityAuthorizationSigner ? [this.capabilityAuthorizationSigner.key] : [],
+    )));
+    this.lastCapabilityRevisionSent = record.revision;
+    this.capabilitySyncInitialized = true;
+    await this.replayPendingCapabilityBlobUploads(db, socket, expectedGeneration, ownerUserId);
+    await this.replayPendingCapabilityAuthorizations(db, socket, expectedGeneration, ownerUserId);
+    await this.replayLocalCapabilityManageRequests(db, socket, expectedGeneration, ownerUserId);
+  }
+
+  private async refreshCapabilitySyncOnHeartbeat(
+    db: Database,
+    socket: WebSocket,
+    expectedGeneration: number,
+  ): Promise<void> {
+    const ownerUserId = this.daemonOwnerUserId;
+    if (!ownerUserId
+      || !this.capabilitySyncInitialized
+      || !this.canAcceptCapabilityOperation(ownerUserId)) return;
+    await this.expirePreActivationCapabilityOperations(
+      db,
+      socket,
+      expectedGeneration,
+      ownerUserId,
+    );
+    const expired = await expireCapabilityPendingActivations(db, {
+      ownerUserId,
+      targetServerId: this.serverId,
+    });
+    for (const entry of expired) {
+      this.broadcastToBrowsers(JSON.stringify({
+        type: CAPABILITY_OPERATION_MSG.PROGRESS,
+        operationId: entry.operation.id,
+        revision: entry.operation.revision,
+        state: entry.operation.state,
+        errorCode: entry.operation.errorCode,
+      }));
+      if (this.daemonWs === socket && this.daemonGeneration === expectedGeneration) {
+        socket.send(JSON.stringify({
+          type: CAPABILITY_OPERATION_MSG.COMMIT_ABORT,
+          operationId: entry.operation.id,
+          capabilityId: entry.capabilityId,
+          versionId: entry.versionId,
+          bindingId: entry.bindingId,
+          authorityRevision: entry.authorityRevision,
+          errorCode: CAPABILITY_ERROR.RUNTIME_PENDING,
+        } satisfies CapabilityOperationCommitAbortFrame));
+      }
+    }
+    const record = await getCapabilitySyncSnapshot(db, {
+      ownerUserId,
+      maxItems: CAPABILITY_LIMITS.LIST_MAX,
+      afterRevision: this.lastCapabilityRevisionSent,
+    });
+    if (record.revision <= this.lastCapabilityRevisionSent
+      || this.daemonWs !== socket
+      || this.daemonGeneration !== expectedGeneration) return;
+    socket.send(JSON.stringify(toCapabilitySyncSnapshot(
+      record,
+      CAPABILITY_SYNC_MSG.DELTA,
+      this.capabilityAuthorizationSigner ? [this.capabilityAuthorizationSigner.key] : [],
+    )));
+    const authority = await getCapabilityAuthorityRecordSet(db, {
+      ownerUserId,
+      serverId: this.serverId,
+    });
+    if (this.daemonWs !== socket || this.daemonGeneration !== expectedGeneration) return;
+    socket.send(JSON.stringify(toCapabilitySyncAuthorityFrame(
+      authority,
+      this.capabilityAuthorizationSigner ? [this.capabilityAuthorizationSigner.key] : [],
+    )));
+    this.lastCapabilityRevisionSent = record.revision;
+  }
+
+  private async expirePreActivationCapabilityOperations(
+    db: Database,
+    socket: WebSocket,
+    expectedGeneration: number,
+    ownerUserId: string,
+  ): Promise<void> {
+    // A few non-capability bridge embedders intentionally expose a read-only
+    // Database-shaped test seam. Expiry requires a real transactional store;
+    // skipping it there keeps the snapshot itself available.
+    if (typeof db.transaction !== 'function') return;
+    const expired = await expireCapabilityPreActivationOperations(db, {
+      ownerUserId,
+      serverId: this.serverId,
+    });
+    for (const operation of expired) {
+      this.broadcastToBrowsers(JSON.stringify({
+        type: CAPABILITY_OPERATION_MSG.PROGRESS,
+        operationId: operation.id,
+        revision: operation.revision,
+        state: operation.state,
+        errorCode: operation.errorCode,
+      }));
+      if (this.daemonWs === socket && this.daemonGeneration === expectedGeneration) {
+        socket.send(JSON.stringify({
+          type: CAPABILITY_OPERATION_MSG.CANCEL,
+          operationId: operation.id,
+          expectedRevision: operation.revision,
+        } satisfies CapabilityOperationCancelFrame));
+      }
+    }
+  }
+
+  private async replayPendingCapabilityAuthorizations(
+    db: Database,
+    socket: WebSocket,
+    expectedGeneration: number,
+    ownerUserId: string,
+  ): Promise<void> {
+    if (!this.capabilityAuthorizationSigner) return;
+    const expired = await expireCapabilityPendingActivations(db, {
+      ownerUserId,
+      targetServerId: this.serverId,
+    });
+    for (const entry of expired) {
+      const { operation } = entry;
+      this.broadcastToBrowsers(JSON.stringify({
+        type: CAPABILITY_OPERATION_MSG.PROGRESS,
+        operationId: operation.id,
+        revision: operation.revision,
+        state: operation.state,
+        errorCode: operation.errorCode,
+      }));
+      if (entry.targetServerId === this.serverId
+        && this.daemonWs === socket && this.daemonGeneration === expectedGeneration) {
+        socket.send(JSON.stringify({
+          type: CAPABILITY_OPERATION_MSG.COMMIT_ABORT,
+          operationId: operation.id,
+          capabilityId: entry.capabilityId,
+          versionId: entry.versionId,
+          bindingId: entry.bindingId,
+          authorityRevision: entry.authorityRevision,
+          errorCode: CAPABILITY_ERROR.RUNTIME_PENDING,
+        } satisfies CapabilityOperationCommitAbortFrame));
+      }
+    }
+    const pending = await listPendingCapabilityAuthorizations(db, {
+      ownerUserId,
+      serverId: this.serverId,
+    });
+    for (const entry of pending) {
+      if (this.daemonWs !== socket || this.daemonGeneration !== expectedGeneration) return;
+      socket.send(JSON.stringify(toCapabilityOperationAuthorizeFrame(
+        entry,
+        [this.capabilityAuthorizationSigner.key],
+      )));
+    }
+  }
+
+  private async replayPendingCapabilityBlobUploads(
+    db: Database,
+    socket: WebSocket,
+    expectedGeneration: number,
+    ownerUserId: string,
+  ): Promise<void> {
+    if (!this.capabilityBlobSigningKey) return;
+    const pending = await listPendingCapabilityBlobUploads(db, {
+      ownerUserId,
+      serverId: this.serverId,
+    });
+    for (const entry of pending) {
+      if (this.daemonWs !== socket || this.daemonGeneration !== expectedGeneration) return;
+      const access = await issueCapabilityBlobAccess(db, {
+        ownerUserId,
+        serverId: this.serverId,
+        capabilityId: entry.capabilityId,
+        versionId: entry.versionId,
+        action: CAPABILITY_BLOB_ACTION.UPLOAD,
+        signingKey: this.capabilityBlobSigningKey,
+      });
+      if (access) socket.send(JSON.stringify({
+        type: CAPABILITY_SYNC_MSG.BLOB_CAPABILITY,
+        operationId: entry.operationId,
+        expectedRevision: entry.expectedRevision,
+        access,
+      }));
+    }
+  }
+
+  private async replayLocalCapabilityManageRequests(
+    db: Database,
+    socket: WebSocket,
+    expectedGeneration: number,
+    ownerUserId: string,
+  ): Promise<void> {
+    const requests = await listReplayableLocalCapabilityManageRequests(db, {
+      ownerUserId,
+      serverId: this.serverId,
+    });
+    for (const request of requests) {
+      if (this.daemonWs !== socket || this.daemonGeneration !== expectedGeneration) return;
+      if (request.phase === 'committed') {
+        socket.send(JSON.stringify({
+          type: CAPABILITY_OPERATION_MSG.MANAGE_ACK,
+          requestId: request.requestId,
+          capabilityId: request.itemId,
+          bindingId: request.bindingId,
+          authorityRevision: request.authorityRevision,
+        } satisfies CapabilityOperationManageAckFrame));
+        continue;
+      }
+      if (request.phase === 'aborted') {
+        socket.send(JSON.stringify({
+          type: CAPABILITY_OPERATION_MSG.MANAGE_ACK,
+          requestId: request.requestId,
+          capabilityId: request.itemId,
+          bindingId: request.bindingId,
+          authorityRevision: request.authorityRevision,
+        } satisfies CapabilityOperationManageAckFrame));
+        continue;
+      }
+      const phase = request.phase === 'prepare_sent'
+        ? CAPABILITY_MANAGE_PHASE.PREPARE
+        : CAPABILITY_MANAGE_PHASE.COMMIT;
+      socket.send(JSON.stringify(toCapabilityManageJournalFrame(request, phase)));
+    }
+  }
+
+  private async handleCapabilityDaemonMessage(
+    msg: Record<string, unknown>,
+    db: Database,
+    socket: WebSocket,
+    expectedGeneration: number,
+  ): Promise<boolean> {
+    const ownerUserId = this.daemonOwnerUserId;
+    if (!ownerUserId || !this.canAcceptCapabilityOperation(ownerUserId)) return false;
+
+    if (msg.type === CAPABILITY_SYNC_MSG.REQUEST) {
+      const afterRevision = msg.afterRevision === undefined
+        ? undefined
+        : Number.isSafeInteger(msg.afterRevision) && (msg.afterRevision as number) >= 0
+          ? msg.afterRevision as number
+          : null;
+      if (afterRevision === null) return true;
+      await this.sendCapabilitySnapshot(db, socket, expectedGeneration, afterRevision);
+      return true;
+    }
+
+    if (msg.type === CAPABILITY_SYNC_MSG.READINESS) {
+      const capabilityId = capabilityOpaqueId(msg.capabilityId);
+      const revision = Number.isSafeInteger(msg.revision) && (msg.revision as number) >= 0
+        ? msg.revision as number
+        : null;
+      const readiness = Object.values(CAPABILITY_READINESS).find((candidate) => candidate === msg.readiness);
+      const reasons = capabilityStringList(msg.reasons, CAPABILITY_LIMITS.FINDINGS);
+      if (!capabilityId || revision === null || !readiness || !reasons) return true;
+      const result = await acknowledgeCapabilityReadiness(db, {
+        ownerUserId,
+        itemId: capabilityId,
+        serverId: this.serverId,
+        state: readiness,
+        reasonCode: reasons[0] ?? null,
+        accountRevision: revision,
+        manifestDigest: msg.manifestDigest === undefined ? null : capabilityDigest(msg.manifestDigest),
+      });
+      if (result && this.daemonWs === socket && this.daemonGeneration === expectedGeneration) {
+        socket.send(JSON.stringify({
+          type: CAPABILITY_SYNC_MSG.ACK,
+          revision,
+          digest: sha256Hex(JSON.stringify({ capabilityId, readiness, revision })),
+        }));
+      }
+      return true;
+    }
+
+    if (msg.type === CAPABILITY_OPERATION_MSG.MANAGE_RESULT) {
+      const frame = msg as unknown as CapabilityOperationManageResultFrame;
+      const requestId = capabilityOpaqueId(frame.requestId);
+      const capabilityId = capabilityOpaqueId(frame.capabilityId);
+      const bindingId = capabilityOpaqueId(frame.bindingId);
+      const expectedRevision = Number.isSafeInteger(frame.expectedRevision) && frame.expectedRevision >= 1
+        ? frame.expectedRevision
+        : null;
+      const authorityRevision = Number.isSafeInteger(frame.authorityRevision) && frame.authorityRevision >= 1
+        ? frame.authorityRevision
+        : null;
+      const resultPhase = Object.values(CAPABILITY_MANAGE_RESULT_PHASE)
+        .find((candidate) => candidate === frame.phase);
+      const action = Object.values(CAPABILITY_MANAGE_ACTION).find((candidate) => candidate === frame.action);
+      if (!requestId || !capabilityId || !bindingId || expectedRevision === null
+        || authorityRevision === null || !resultPhase || !action
+        || action === CAPABILITY_MANAGE_ACTION.DELETE_CREDENTIALS
+        || action === CAPABILITY_MANAGE_ACTION.CANCEL_OPERATION
+        || typeof frame.ok !== 'boolean') return true;
+      const pending = this.pendingCapabilityManage.get(requestId);
+      if (pending && (pending.ownerUserId !== ownerUserId
+        || pending.frame.capabilityId !== capabilityId
+        || pending.frame.bindingId !== bindingId
+        || pending.frame.action !== frame.action
+        || pending.frame.expectedRevision !== expectedRevision
+        || pending.frame.authorityRevision !== authorityRevision)) return true;
+      const journal = await advanceLocalCapabilityManageResult(db, {
+        requestId,
+        ownerUserId,
+        serverId: this.serverId,
+        itemId: capabilityId,
+        bindingId,
+        action,
+        expectedRevision,
+        authorityRevision,
+        resultPhase,
+        ok: frame.ok,
+        errorCode: frame.errorCode,
+      });
+      if (!journal) return true;
+      if (resultPhase === CAPABILITY_MANAGE_RESULT_PHASE.ABORTED) {
+        if (this.daemonWs === socket && this.daemonGeneration === expectedGeneration) {
+          socket.send(JSON.stringify({
+            type: CAPABILITY_OPERATION_MSG.MANAGE_ACK,
+            requestId,
+            capabilityId,
+            bindingId,
+            authorityRevision,
+          } satisfies CapabilityOperationManageAckFrame));
+        }
+        if (pending) {
+          clearTimeout(pending.timer);
+          this.pendingCapabilityManage.delete(requestId);
+          pending.resolve(frame);
+        }
+        return true;
+      }
+      if (!frame.ok) {
+        if (this.daemonWs === socket && this.daemonGeneration === expectedGeneration) {
+          socket.send(JSON.stringify(toCapabilityManageJournalFrame(journal, CAPABILITY_MANAGE_PHASE.ABORT)));
+        }
+        if (pending) {
+          clearTimeout(pending.timer);
+          this.pendingCapabilityManage.delete(requestId);
+          pending.resolve(frame);
+        }
+        return true;
+      }
+      if (resultPhase === CAPABILITY_MANAGE_RESULT_PHASE.PREPARED) {
+        const commit = await markLocalCapabilityManageCommitSent(db, {
+          requestId,
+          ownerUserId,
+          serverId: this.serverId,
+        });
+        if (commit && this.daemonWs === socket && this.daemonGeneration === expectedGeneration) {
+          socket.send(JSON.stringify(toCapabilityManageJournalFrame(commit, CAPABILITY_MANAGE_PHASE.COMMIT)));
+        }
+        return true;
+      }
+      if (!this.capabilityAuthorizationSigner) return true;
+      const committed = await manageCapability(db, {
+        ownerUserId,
+        itemId: capabilityId,
+        expectedRevision,
+        action,
+        bindingId,
+        targetVersionId: journal.targetVersionId,
+        scope: CAPABILITY_SCOPE.LOCAL,
+        serverId: this.serverId,
+        localRequestId: requestId,
+        authorizationSigner: this.capabilityAuthorizationSigner,
+      });
+      if (committed.status !== 'ok') {
+        logger.warn({ serverId: this.serverId, requestId, status: committed.status }, 'Capability local manage commit rejected');
+        const aborted = await advanceLocalCapabilityManageResult(db, {
+          requestId,
+          ownerUserId,
+          serverId: this.serverId,
+          itemId: capabilityId,
+          bindingId,
+          action,
+          expectedRevision,
+          authorityRevision,
+          resultPhase: CAPABILITY_MANAGE_RESULT_PHASE.ABORTED,
+          ok: false,
+          errorCode: CAPABILITY_ERROR.CONFLICT,
+        });
+        if (aborted && this.daemonWs === socket && this.daemonGeneration === expectedGeneration) {
+          socket.send(JSON.stringify(toCapabilityManageJournalFrame(aborted, CAPABILITY_MANAGE_PHASE.ABORT)));
+        }
+        return true;
+      }
+      if (this.daemonWs === socket && this.daemonGeneration === expectedGeneration) {
+        socket.send(JSON.stringify({
+          type: CAPABILITY_OPERATION_MSG.MANAGE_ACK,
+          requestId,
+          capabilityId,
+          bindingId,
+          authorityRevision,
+        } satisfies CapabilityOperationManageAckFrame));
+      }
+      await WsBridge.broadcastCapabilitySync(
+        ownerUserId,
+        db,
+        Math.max(0, committed.accountRevision - 1),
+      );
+      if (pending) {
+        clearTimeout(pending.timer);
+        this.pendingCapabilityManage.delete(requestId);
+        pending.resolve(frame);
+      }
+      return true;
+    }
+
+    if (msg.type === CAPABILITY_OPERATION_MSG.PROGRESS) {
+      const frame = msg as unknown as CapabilityOperationProgressFrame;
+      const operationId = capabilityOpaqueId(frame.operationId);
+      const expectedRevision = Number.isSafeInteger(frame.expectedRevision) && frame.expectedRevision >= 1
+        ? frame.expectedRevision
+        : null;
+      const state = isCapabilityInstallState(frame.state) ? frame.state : null;
+      const artifactDigest = frame.artifactDigest === undefined ? undefined : capabilityDigest(frame.artifactDigest);
+      const auditDigest = frame.auditDigest === undefined ? undefined : capabilityDigest(frame.auditDigest);
+      const findings = frame.findings === undefined ? [] : sanitizeCapabilityFindings(frame.findings);
+      const auditVerdict = frame.auditVerdict === undefined
+        ? undefined
+        : Object.values(CAPABILITY_AUDIT_VERDICT).find((candidate) => candidate === frame.auditVerdict);
+      const errorCode = frame.errorCode === undefined
+        ? undefined
+        : Object.values(CAPABILITY_ERROR).find((candidate) => candidate === frame.errorCode);
+      const stdioCommand = frame.stdioCommand === undefined
+        ? undefined
+        : capabilityStringList(frame.stdioCommand, CAPABILITY_LIMITS.PATH_BYTES);
+      const tools = frame.tools === undefined
+        ? undefined
+        : capabilityStringList(frame.tools, CAPABILITY_LIMITS.FINDINGS);
+      const permissions = frame.permissions === undefined
+        ? undefined
+        : capabilityStringList(frame.permissions, CAPABILITY_LIMITS.FINDINGS);
+      const updateDiff = frame.updateDiff === undefined
+        ? undefined
+        : capabilityStringList(frame.updateDiff, CAPABILITY_LIMITS.FINDINGS);
+      const allowedProgressFrom: Partial<Record<CapabilityInstallState, CapabilityInstallState[]>> = {
+        [CAPABILITY_INSTALL_STATE.ACQUIRING]: [CAPABILITY_INSTALL_STATE.QUEUED],
+        [CAPABILITY_INSTALL_STATE.SCANNING]: [CAPABILITY_INSTALL_STATE.ACQUIRING],
+        [CAPABILITY_INSTALL_STATE.AUDITING]: [CAPABILITY_INSTALL_STATE.SCANNING],
+        // Current daemon versions may run the full local acquisition/scan/audit
+        // pipeline and emit only the terminal pre-confirmation frame.
+        [CAPABILITY_INSTALL_STATE.AWAITING_CONFIRMATION]: [
+          CAPABILITY_INSTALL_STATE.QUEUED,
+          CAPABILITY_INSTALL_STATE.AUDITING,
+        ],
+        [CAPABILITY_INSTALL_STATE.SYNCING]: [CAPABILITY_INSTALL_STATE.INSTALLING],
+        [CAPABILITY_INSTALL_STATE.REWORK]: [
+          CAPABILITY_INSTALL_STATE.QUEUED,
+          CAPABILITY_INSTALL_STATE.SCANNING,
+          CAPABILITY_INSTALL_STATE.AUDITING,
+        ],
+        [CAPABILITY_INSTALL_STATE.FAILED]: [
+          CAPABILITY_INSTALL_STATE.QUEUED,
+          CAPABILITY_INSTALL_STATE.ACQUIRING,
+          CAPABILITY_INSTALL_STATE.SCANNING,
+          CAPABILITY_INSTALL_STATE.AUDITING,
+          CAPABILITY_INSTALL_STATE.INSTALLING,
+          CAPABILITY_INSTALL_STATE.SYNCING,
+        ],
+      };
+      const allowedCurrentStates = state ? allowedProgressFrom[state] : undefined;
+      if (!operationId || expectedRevision === null || !state || !allowedCurrentStates || findings === null
+        || (frame.artifactDigest !== undefined && !artifactDigest)
+        || (frame.auditDigest !== undefined && !auditDigest)
+        || (frame.auditVerdict !== undefined && !auditVerdict)
+        || (frame.errorCode !== undefined && !errorCode)
+        || (frame.stdioCommand !== undefined && !stdioCommand)
+        || (frame.tools !== undefined && !tools)
+        || (frame.permissions !== undefined && !permissions)
+        || (frame.updateDiff !== undefined && !updateDiff)
+        || (state === CAPABILITY_INSTALL_STATE.AWAITING_CONFIRMATION
+          && (!artifactDigest || !auditDigest || auditVerdict !== CAPABILITY_AUDIT_VERDICT.PASS))) return true;
+
+      const evidence = auditVerdict && artifactDigest && auditDigest
+        ? {
+          kind: 'audit',
+          evidenceDigest: auditDigest,
+          artifactDigest,
+          policyVersion: 'daemon-isolated-auditor-v1',
+          verdict: auditVerdict,
+          findings,
+        } as const
+        : findings.length > 0 && artifactDigest
+          ? {
+          kind: 'scan',
+          evidenceDigest: sha256Hex(JSON.stringify({
+            policyVersion: 'daemon-deterministic-scan-v1',
+            artifactDigest,
+            findings,
+          })),
+          artifactDigest,
+          policyVersion: 'daemon-deterministic-scan-v1',
+          verdict: null,
+          findings,
+          } as const
+          : undefined;
+
+      const updated = await advanceCapabilityOperation(db, {
+        ownerUserId,
+        operationId,
+        expectedRevision,
+        state,
+        artifactDigest,
+        auditDigest,
+        errorCode,
+        allowedCurrentStates,
+        evidence,
+        requestSummaryPatch: {
+          ...(typeof frame.displayName === 'string'
+            ? { displayName: frame.displayName.slice(0, CAPABILITY_LIMITS.DISPLAY_NAME_CHARS) }
+            : {}),
+          ...(frame.hasScripts !== undefined ? { hasScripts: frame.hasScripts === true } : {}),
+          ...(frame.hasExecutables !== undefined ? { hasExecutables: frame.hasExecutables === true } : {}),
+          ...(stdioCommand ? { stdioCommand } : {}),
+          ...(tools ? { tools } : {}),
+          ...(permissions ? { permissions } : {}),
+          ...(updateDiff ? { updateDiff } : {}),
+        },
+      });
+      if (!updated) {
+        // A reviewed candidate is durable on the daemon before this progress
+        // frame is sent.  After reconnect it may replay the same exact frame
+        // whether or not the first write reached us.  Treat only the precise
+        // already-applied awaiting-confirmation transition as idempotent;
+        // every other stale revision remains rejected.
+        if (state === CAPABILITY_INSTALL_STATE.AWAITING_CONFIRMATION) {
+          const current = await getCapabilityOperation(db, { ownerUserId, operationId });
+          if (current?.state === CAPABILITY_INSTALL_STATE.AWAITING_CONFIRMATION
+            && current.revision === expectedRevision + 1
+            && current.artifactDigest === artifactDigest
+            && current.auditDigest === auditDigest) {
+            this.broadcastToBrowsers(JSON.stringify({ ...frame, revision: current.revision }));
+            return true;
+          }
+        }
+        logger.warn({ serverId: this.serverId, operationId, expectedRevision }, 'Dropped stale capability progress');
+        return true;
+      }
+      this.broadcastToBrowsers(JSON.stringify({ ...frame, revision: updated.revision }));
+      return true;
+    }
+
+    if (msg.type === CAPABILITY_OPERATION_MSG.ACTIVATE) {
+      const frame = msg as unknown as CapabilityOperationActivateFrame;
+      const operationId = capabilityOpaqueId(frame.operationId);
+      const capabilityId = capabilityOpaqueId(frame.capability?.id);
+      const versionId = capabilityOpaqueId(frame.version?.id);
+      const bindingId = capabilityOpaqueId(frame.binding?.id);
+      const expectedRevision = Number.isSafeInteger(frame.expectedRevision) && frame.expectedRevision >= 1
+        ? frame.expectedRevision
+        : null;
+      const artifactDigest = capabilityDigest(frame.version?.artifactDigest);
+      const blobDigest = frame.version?.blobDigest === undefined
+        ? undefined
+        : capabilityDigest(frame.version.blobDigest);
+      const blobByteSize = frame.version?.blobByteSize === undefined
+        ? undefined
+        : Number.isSafeInteger(frame.version.blobByteSize)
+          && frame.version.blobByteSize > 0
+          && frame.version.blobByteSize <= CAPABILITY_LIMITS.PACKAGE_BYTES
+          ? frame.version.blobByteSize
+          : null;
+      const auditDigest = capabilityDigest(frame.version?.auditDigest);
+      const scope = Object.values(CAPABILITY_SCOPE).find((candidate) => candidate === frame.binding?.scope);
+      const sourceKind = Object.values(CAPABILITY_SOURCE_KIND).find((candidate) => candidate === frame.version?.sourceKind);
+      const name = typeof frame.capability?.name === 'string'
+        && frame.capability.name.trim()
+        && frame.capability.name.length <= CAPABILITY_LIMITS.DISPLAY_NAME_CHARS
+        ? frame.capability.name.trim()
+        : null;
+      const providers = capabilityStringList(frame.binding?.providers, CAPABILITY_LIMITS.PROVIDERS);
+      const machines = capabilityStringList(frame.binding?.machines, CAPABILITY_LIMITS.MACHINES);
+      const tools = capabilityStringList(frame.capability?.tools ?? [], CAPABILITY_LIMITS.FINDINGS);
+      const permissions = capabilityStringList(frame.capability?.permissions ?? [], CAPABILITY_LIMITS.FINDINGS);
+      const activationFindings = sanitizeCapabilityFindings(frame.capability?.findings ?? []);
+      const scopeId = frame.binding?.scopeId === undefined
+        ? undefined
+        : capabilityOpaqueId(frame.binding.scopeId);
+      const normalizedDefinition = frame.capability?.kind === CAPABILITY_KIND.MCP && frame.definition
+        ? normalizeCapabilityMcpDefinition({
+          kind: CAPABILITY_SOURCE_KIND.MCP_CONFIG,
+          mcpConfig: frame.definition as unknown as Record<string, unknown>,
+        })
+        : null;
+      const synchronizedSkill = frame.capability?.kind === CAPABILITY_KIND.SKILL
+        && scope !== CAPABILITY_SCOPE.LOCAL;
+      if (!operationId || !capabilityId || !versionId || !bindingId || expectedRevision === null
+        || !artifactDigest || !auditDigest || !scope || !sourceKind || !name
+        || !providers || !machines || !tools || !permissions || !activationFindings
+        || (frame.binding?.scopeId !== undefined && !scopeId)
+        || frame.version.capabilityId !== capabilityId
+        || frame.binding.capabilityId !== capabilityId
+        || frame.binding.versionId !== versionId
+        || frame.version.auditVerdict !== CAPABILITY_AUDIT_VERDICT.PASS
+        || frame.capability.artifactDigest !== artifactDigest
+        || frame.capability.kind !== CAPABILITY_KIND.SKILL && frame.capability.kind !== CAPABILITY_KIND.MCP
+        || (frame.capability.kind === CAPABILITY_KIND.MCP && !normalizedDefinition)
+        || (frame.capability.kind === CAPABILITY_KIND.SKILL && frame.definition !== undefined)
+        || (frame.version.blobDigest !== undefined && !blobDigest)
+        || (frame.version.blobByteSize !== undefined && blobByteSize === null)
+        || (synchronizedSkill && (!blobDigest || blobByteSize === undefined))
+        || (!synchronizedSkill && (blobDigest !== undefined || blobByteSize !== undefined))) return true;
+
+      if (!this.capabilityAuthorizationSigner) return true;
+      let activationError: unknown = null;
+      const activated = await activateCapabilityVersion(db, {
+        ownerUserId,
+        targetServerId: this.serverId,
+        operationId,
+        expectedOperationRevision: expectedRevision,
+        requestedItemId: capabilityId,
+        requestedBindingId: bindingId,
+        name,
+        kind: frame.capability.kind,
+        sourceKind,
+        sourceSummary: frame.capability.sourceLabel?.slice(0, CAPABILITY_LIMITS.SOURCE_CHARS) ?? '',
+        artifactDigest,
+        blobDigest,
+        blobByteSize,
+        auditDigest,
+        manifest: {
+          findings: activationFindings,
+          scripts: frame.capability.hasScripts ? ['declared'] : [],
+          executables: frame.capability.hasExecutables ? ['declared'] : [],
+          tools,
+        },
+        definition: frame.capability.kind === CAPABILITY_KIND.MCP
+          ? normalizedDefinition!
+          : null,
+        permissionSummary: permissions,
+        scope,
+        projectKey: scope === CAPABILITY_SCOPE.PROJECT ? scopeId ?? null : null,
+        sessionKey: scope === CAPABILITY_SCOPE.SESSION ? scopeId ?? null : null,
+        serverId: scope === CAPABILITY_SCOPE.LOCAL ? this.serverId : null,
+        providerFilter: providers,
+        machineFilter: machines,
+        authorizationSigner: this.capabilityAuthorizationSigner,
+      }).catch((error: unknown) => {
+        activationError = error;
+        logger.warn({ error, serverId: this.serverId, operationId }, 'Capability activation rejected');
+        return null;
+      });
+      if (!activated) {
+        const errorCode = activationError instanceof Error
+          && activationError.message === 'capability_sync_item_quota_exceeded'
+          ? CAPABILITY_ERROR.CONFLICT
+          : CAPABILITY_ERROR.INTEGRITY_FAILED;
+        const failed = await updateCapabilityOperation(db, {
+          ownerUserId,
+          operationId,
+          expectedRevision,
+          state: CAPABILITY_INSTALL_STATE.FAILED,
+          errorCode,
+          allowedCurrentStates: [CAPABILITY_INSTALL_STATE.INSTALLING],
+        });
+        if (failed) {
+          if (this.daemonWs === socket && this.daemonGeneration === expectedGeneration) {
+            socket.send(JSON.stringify({
+              type: CAPABILITY_OPERATION_MSG.CANCEL,
+              operationId,
+              expectedRevision: failed.revision,
+            } satisfies CapabilityOperationCancelFrame));
+          }
+          this.broadcastToBrowsers(JSON.stringify({
+            type: CAPABILITY_OPERATION_MSG.PROGRESS,
+            operationId,
+            revision: failed.revision,
+            state: failed.state,
+            errorCode: failed.errorCode,
+          }));
+        } else {
+          // A periodic expiry sweep may already have failed this durable
+          // daemon journal while it was offline. Its replay is still useful:
+          // answer with the current authoritative revision so the daemon can
+          // discard the stale candidate instead of replaying forever.
+          const current = await getCapabilityOperation(db, { ownerUserId, operationId });
+          if (current
+            && current.requestSummary.targetServerId === this.serverId
+            && this.daemonWs === socket
+            && this.daemonGeneration === expectedGeneration) {
+            socket.send(JSON.stringify({
+              type: CAPABILITY_OPERATION_MSG.CANCEL,
+              operationId,
+              expectedRevision: current.revision,
+            } satisfies CapabilityOperationCancelFrame));
+          }
+        }
+        return true;
+      }
+      if (activated.pendingBlob && this.capabilityBlobSigningKey) {
+        const access = await issueCapabilityBlobAccess(db, {
+          ownerUserId,
+          serverId: this.serverId,
+          capabilityId: activated.item.id,
+          versionId: activated.candidate.versionId,
+          action: CAPABILITY_BLOB_ACTION.UPLOAD,
+          signingKey: this.capabilityBlobSigningKey,
+        }).catch((error: unknown) => {
+          logger.warn({ error, serverId: this.serverId, operationId }, 'Capability blob upload access failed');
+          return null;
+        });
+        if (access && this.daemonWs === socket && this.daemonGeneration === expectedGeneration) {
+          socket.send(JSON.stringify({
+            type: CAPABILITY_SYNC_MSG.BLOB_CAPABILITY,
+            operationId,
+            expectedRevision: activated.operation.revision,
+            access,
+          }));
+        } else if (!access) {
+          const failed = await failCapabilityPendingActivation(db, {
+            ownerUserId,
+            operationId,
+            errorCode: CAPABILITY_ERROR.RUNTIME_PENDING,
+            expectedRevision: activated.operation.revision,
+            capabilityId: activated.item.id,
+            versionId: activated.candidate.versionId,
+            bindingId: activated.candidate.bindingId,
+            targetServerId: this.serverId,
+          });
+          if (failed) this.broadcastToBrowsers(JSON.stringify({
+            type: CAPABILITY_OPERATION_MSG.PROGRESS,
+            operationId,
+            revision: failed.revision,
+            state: failed.state,
+            errorCode: failed.errorCode,
+          }));
+          return true;
+        }
+      } else if (this.capabilityAuthorizationSigner) {
+        const pending = await getPendingCapabilityAuthorization(db, { ownerUserId, operationId });
+        if (pending && this.daemonWs === socket && this.daemonGeneration === expectedGeneration) {
+          socket.send(JSON.stringify(toCapabilityOperationAuthorizeFrame(
+            pending,
+            [this.capabilityAuthorizationSigner.key],
+          )));
+        }
+      }
+      this.broadcastToBrowsers(JSON.stringify({
+        type: CAPABILITY_OPERATION_MSG.PROGRESS,
+        operationId,
+        revision: activated.operation.revision,
+        state: activated.operation.state,
+      }));
+      return true;
+    }
+
+    if (msg.type === CAPABILITY_OPERATION_MSG.COMMIT_RESULT) {
+      const frame = msg as unknown as CapabilityOperationCommitResultFrame;
+      const operationId = capabilityOpaqueId(frame.operationId);
+      const capabilityId = capabilityOpaqueId(frame.capabilityId);
+      const versionId = capabilityOpaqueId(frame.versionId);
+      const bindingId = capabilityOpaqueId(frame.bindingId);
+      const expectedRevision = Number.isSafeInteger(frame.expectedRevision) && frame.expectedRevision >= 1
+        ? frame.expectedRevision
+        : null;
+      const authorityRevision = Number.isSafeInteger(frame.authorityRevision) && frame.authorityRevision >= 1
+        ? frame.authorityRevision
+        : null;
+      const errorCode = frame.errorCode === undefined
+        ? CAPABILITY_ERROR.RUNTIME_PENDING
+        : Object.values(CAPABILITY_ERROR).find((candidate) => candidate === frame.errorCode);
+      if (!operationId || !capabilityId || !versionId || !bindingId || expectedRevision === null
+        || authorityRevision === null
+        || typeof frame.ok !== 'boolean' || !errorCode) return true;
+      if (!frame.ok) {
+        const failed = await failCapabilityPendingActivation(db, {
+          ownerUserId,
+          operationId,
+          errorCode,
+          expectedRevision,
+          capabilityId,
+          versionId,
+          bindingId,
+          authorityRevision,
+          targetServerId: this.serverId,
+        });
+        if (this.daemonWs === socket && this.daemonGeneration === expectedGeneration) {
+          socket.send(JSON.stringify({
+            type: CAPABILITY_OPERATION_MSG.COMMIT_ABORT,
+            operationId,
+            capabilityId,
+            versionId,
+            bindingId,
+            authorityRevision,
+            errorCode,
+          } satisfies CapabilityOperationCommitAbortFrame));
+        }
+        if (failed) this.broadcastToBrowsers(JSON.stringify({
+          type: CAPABILITY_OPERATION_MSG.PROGRESS,
+          operationId,
+          revision: failed.revision,
+          state: failed.state,
+          errorCode: failed.errorCode,
+        }));
+        return true;
+      }
+      const completed = await completeCapabilityCommit(db, {
+        ownerUserId,
+        targetServerId: this.serverId,
+        operationId,
+        expectedRevision,
+        capabilityId,
+        versionId,
+        bindingId,
+        authorityRevision,
+      });
+      if (completed.status !== 'ok') {
+        logger.warn({ serverId: this.serverId, operationId, status: completed.status }, 'Capability commit rejected');
+        if (this.daemonWs === socket && this.daemonGeneration === expectedGeneration) {
+          socket.send(JSON.stringify({
+            type: CAPABILITY_OPERATION_MSG.COMMIT_ABORT,
+            operationId,
+            capabilityId,
+            versionId,
+            bindingId,
+            authorityRevision,
+            errorCode: CAPABILITY_ERROR.RUNTIME_PENDING,
+          } satisfies CapabilityOperationCommitAbortFrame));
+        }
+        return true;
+      }
+      if (this.daemonWs === socket && this.daemonGeneration === expectedGeneration) {
+        socket.send(JSON.stringify({
+          type: CAPABILITY_OPERATION_MSG.COMMIT_ACK,
+          operationId,
+          capabilityId,
+          versionId,
+          bindingId,
+          authorityRevision,
+        } satisfies CapabilityOperationCommitAckFrame));
+      }
+      await WsBridge.broadcastCapabilitySync(
+        ownerUserId,
+        db,
+        Math.max(0, completed.accountRevision - 1),
+      ).catch((error: unknown) => {
+        logger.warn({ error, serverId: this.serverId, operationId }, 'Capability commit sync fan-out failed');
+        return 0;
+      });
+      this.broadcastToBrowsers(JSON.stringify({
+        type: CAPABILITY_OPERATION_MSG.ACTIVATE,
+        operationId,
+        capability: toCapabilitySummary(completed.item),
+      }));
+      return true;
+    }
+
+    return false;
+  }
+
+  /** Narrow test seam for validated daemon capability frames. */
+  async handleCapabilityDaemonMessageForTests(
+    msg: Record<string, unknown>,
+    db: Database,
+    socket: WebSocket,
+    expectedGeneration: number,
+  ): Promise<boolean> {
+    return this.handleCapabilityDaemonMessage(msg, db, socket, expectedGeneration);
   }
 
   /**
@@ -1658,11 +4201,12 @@ export class WsBridge {
   private registerPendingRepoRoute(ws: WebSocket, msg: Record<string, unknown>): void {
     const requestId = optionalString(msg.requestId);
     if (!requestId) return;
+    const sessionName = commandSessionName(msg);
     const previous = this.pendingRepoRequests.get(requestId);
     if (previous) clearTimeout(previous.timer);
     const timer = setTimeout(() => this.pendingRepoRequests.delete(requestId), FS_PENDING_UNICAST_TIMEOUT_MS);
     timer.unref?.();
-    this.pendingRepoRequests.set(requestId, { socket: ws, timer });
+    this.pendingRepoRequests.set(requestId, { socket: ws, timer, ...(sessionName ? { sessionName } : {}) });
   }
 
   private forwardPendingRepoRoute(msg: Record<string, unknown>): boolean {
@@ -1672,11 +4216,33 @@ export class WsBridge {
     if (!pending) return false;
     clearTimeout(pending.timer);
     this.pendingRepoRequests.delete(requestId);
-    safeSend(pending.socket, JSON.stringify(msg));
+    const resolvedMsg = pending.sessionName && !commandSessionName(msg)
+      ? { ...msg, sessionName: pending.sessionName }
+      : msg;
+    const outgoing = this.filterShareOutgoingJson(pending.socket, resolvedMsg, JSON.stringify(resolvedMsg));
+    if (outgoing) {
+      if (typeof msg.projectDir === 'string' && msg.projectDir) {
+        const state = this.browserShareStates.get(pending.socket);
+        if (state && state.target.kind !== 'server') {
+          const currentDirs = state.coveredProjectDirs ?? [];
+          if (!currentDirs.includes(msg.projectDir)) {
+            this.browserShareStates.set(pending.socket, {
+              ...state,
+              coveredProjectDirs: [...currentDirs, msg.projectDir],
+            });
+          }
+        }
+      }
+      safeSend(pending.socket, outgoing);
+    }
     return true;
   }
 
-  private registerPendingTimelineRequest(ws: WebSocket, msg: Record<string, unknown>): void {
+  private registerPendingTimelineRequest(
+    ws: WebSocket,
+    msg: Record<string, unknown>,
+    mode?: TimelineSubscriptionMode,
+  ): void {
     const requestId = optionalString(msg.requestId);
     if (!requestId) return;
     const previous = this.pendingTimelineRequests.get(requestId);
@@ -1684,9 +4250,84 @@ export class WsBridge {
       clearTimeout(previous.timer);
       logger.warn({ requestId, serverId: this.serverId, type: msg.type }, 'WsBridge: duplicate timeline request id replaced');
     }
-    const timer = setTimeout(() => this.pendingTimelineRequests.delete(requestId), TIMELINE_PENDING_UNICAST_TIMEOUT_MS);
+    const timer = setTimeout(() => {
+      this.removeTimelineRequestGroupMember(requestId);
+      this.cancelDaemonTimelineRequest(requestId);
+    }, TIMELINE_PENDING_UNICAST_TIMEOUT_MS);
     timer.unref?.();
-    this.pendingTimelineRequests.set(requestId, { socket: ws, timer });
+    const sessionName = optionalString(msg.sessionName);
+    const subscriptionMode = mode
+      ?? (msg.mode === TIMELINE_SUBSCRIPTION_MODES.SUMMARY
+        ? TIMELINE_SUBSCRIPTION_MODES.SUMMARY
+        : msg.mode === TIMELINE_SUBSCRIPTION_MODES.FULL
+          ? TIMELINE_SUBSCRIPTION_MODES.FULL
+          : sessionName ? this.timelineSubscriptions.get(ws)?.get(sessionName) : undefined);
+    this.pendingTimelineRequests.set(requestId, {
+      socket: ws,
+      timer,
+      ...(sessionName ? { sessionName } : {}),
+      ...(subscriptionMode ? { mode: subscriptionMode } : {}),
+    });
+  }
+
+  private removeTimelineRequestGroupMember(requestId: string): void {
+    const pending = this.pendingTimelineRequests.get(requestId);
+    if (pending) {
+      clearTimeout(pending.timer);
+      this.pendingTimelineRequests.delete(requestId);
+    }
+    const pendingHttp = this.pendingHttpTimelineRequests.get(requestId);
+    if (pendingHttp) {
+      clearTimeout(pendingHttp.timer);
+      if (pendingHttp.abortSignal && pendingHttp.abortHandler) {
+        pendingHttp.abortSignal.removeEventListener('abort', pendingHttp.abortHandler);
+      }
+      this.pendingHttpTimelineRequests.delete(requestId);
+    }
+    const key = this.timelineRequestKeys.get(requestId);
+    if (!key) return;
+    this.timelineRequestKeys.delete(requestId);
+    const aliases = this.timelineRequestAliases.get(key);
+    if (this.timelineInFlightByKey.get(key) === requestId) {
+      this.timelineInFlightByKey.delete(key);
+      for (const alias of aliases ?? []) {
+        if (alias === requestId) continue;
+        const aliasPending = this.pendingTimelineRequests.get(alias);
+        if (aliasPending) {
+          clearTimeout(aliasPending.timer);
+          this.pendingTimelineRequests.delete(alias);
+        }
+        const aliasHttp = this.pendingHttpTimelineRequests.get(alias);
+        if (aliasHttp) {
+          clearTimeout(aliasHttp.timer);
+          if (aliasHttp.abortSignal && aliasHttp.abortHandler) aliasHttp.abortSignal.removeEventListener('abort', aliasHttp.abortHandler);
+          this.pendingHttpTimelineRequests.delete(alias);
+        }
+        this.timelineRequestKeys.delete(alias);
+      }
+      this.timelineRequestAliases.delete(key);
+      return;
+    }
+    aliases?.delete(requestId);
+    if (!aliases || aliases.size === 0) {
+      this.timelineRequestAliases.delete(key);
+      this.timelineInFlightByKey.delete(key);
+    }
+  }
+
+  /**
+   * Tell the daemon nobody is waiting for this timeline reply any more, so it
+   * can drop it if still queued unsent. On a slow daemon uplink those replies
+   * otherwise keep occupying the link long after we would discard them
+   * ("timeline response missing pending request - dropped"). Best effort;
+   * daemons that do not advertise the capability are never sent the frame.
+   */
+  private cancelDaemonTimelineRequest(requestId: string): void {
+    if (!this.isDaemonConnected() || !this.hasDaemonCapability(TIMELINE_HISTORY_CANCEL_CAPABILITY)) return;
+    try {
+      this.daemonWs!.send(JSON.stringify({ type: TIMELINE_MESSAGES.HISTORY_CANCEL, requestId }));
+      incrementCounter('ws_bridge_timeline_request_cancelled');
+    } catch { /* daemon socket closing; nothing to cancel against */ }
   }
 
   private sendTimelineRequestError(
@@ -1703,6 +4344,49 @@ export class WsBridge {
     )));
   }
 
+  private rejectBrowserDataReadOverload(ws: WebSocket, msg: Record<string, unknown>): void {
+    const type = optionalString(msg.type);
+    if (type === TIMELINE_MESSAGES.HISTORY_REQUEST) {
+      this.sendTimelineRequestError(ws, msg, TIMELINE_REQUEST_ERROR_REASONS.QUEUE_FULL);
+      return;
+    }
+    if (type === 'fs.ls') {
+      safeSend(ws, JSON.stringify({
+        type: 'fs.ls_response',
+        requestId: msg.requestId,
+        path: optionalString(msg.path) ?? '',
+        status: 'error',
+        error: FS_GENERIC_ERROR_CODES.FS_LIST_WORKER_QUEUE_FULL,
+        recoverable: true,
+      }));
+      return;
+    }
+    if (type === 'fs.git_status') {
+      safeSend(ws, JSON.stringify({
+        type: 'fs.git_status_response',
+        requestId: msg.requestId,
+        path: optionalString(msg.path) ?? '',
+        status: 'error',
+        files: [],
+        error: FS_GENERIC_ERROR_CODES.FS_LIST_WORKER_QUEUE_FULL,
+        recoverable: true,
+      }));
+      return;
+    }
+    if (type === TRANSPORT_MSG.LIST_MODELS) {
+      safeSend(ws, JSON.stringify({
+        type: TRANSPORT_MSG.MODELS_RESPONSE,
+        requestId: msg.requestId,
+        agentType: optionalString(msg.agentType) ?? '',
+        ...(optionalString(msg.sessionName) ? { sessionName: optionalString(msg.sessionName) } : {}),
+        ...(optionalString(msg.ccPreset) ? { ccPreset: optionalString(msg.ccPreset) } : {}),
+        models: [],
+        error: TIMELINE_REQUEST_ERROR_REASONS.QUEUE_FULL,
+        recoverable: true,
+      }));
+    }
+  }
+
   private async verifyTimelineBrowserRequest(ws: WebSocket, msg: Record<string, unknown>): Promise<boolean> {
     const sessionName = optionalString(msg.sessionName);
     if (!sessionName) {
@@ -1716,6 +4400,51 @@ export class WsBridge {
       return false;
     }
     return true;
+  }
+
+  private async handleTimelineSubscription(ws: WebSocket, msg: Record<string, unknown>): Promise<void> {
+    const sessionName = optionalString(msg.sessionName);
+    if (!sessionName) return;
+    const mode = msg.mode === TIMELINE_SUBSCRIPTION_MODES.SUMMARY
+      ? TIMELINE_SUBSCRIPTION_MODES.SUMMARY
+      : msg.mode === TIMELINE_SUBSCRIPTION_MODES.FULL
+        ? TIMELINE_SUBSCRIPTION_MODES.FULL
+        : undefined;
+    if (!mode || !(await this.verifySessionOwnership(sessionName))) {
+      logger.warn({ serverId: this.serverId, sessionName }, 'timeline.subscribe: rejected or malformed subscription');
+      return;
+    }
+    this.timelineProtocolSockets.add(ws);
+    let subscriptions = this.timelineSubscriptions.get(ws);
+    if (!subscriptions) {
+      subscriptions = new Map();
+      this.timelineSubscriptions.set(ws, subscriptions);
+    }
+    this.clearTimelineLatestValueFingerprints(ws, sessionName);
+    subscriptions.set(sessionName, mode);
+
+    // A mode switch can carry the last cursor in one round trip. Reuse the
+    // existing history API so the browser receives authoritative durable rows,
+    // including a completed assistant message that was produced while hidden.
+    const afterSeq = typeof msg.afterSeq === 'number' && Number.isFinite(msg.afterSeq)
+      ? Math.max(0, Math.trunc(msg.afterSeq))
+      : undefined;
+    const epoch = typeof msg.epoch === 'number' && Number.isFinite(msg.epoch)
+      ? Math.trunc(msg.epoch)
+      : undefined;
+    if (afterSeq !== undefined && epoch !== undefined) {
+      const requestId = typeof msg.requestId === 'string' && msg.requestId.length > 0
+        ? msg.requestId
+        : `timeline-sub-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      const history: Record<string, unknown> = {
+        type: TIMELINE_MESSAGES.HISTORY_REQUEST,
+        sessionName,
+        requestId,
+        cursor: { epoch, afterSeq, direction: TIMELINE_CURSOR_DIRECTIONS.NEWER },
+      };
+      this.registerPendingTimelineRequest(ws, history, mode);
+      this.sendToDaemon(JSON.stringify(history));
+    }
   }
 
   private settlePendingHttpTimelineRequest(
@@ -1735,14 +4464,181 @@ export class WsBridge {
   }
 
   private scheduleTimelineDataPlaneDrain(): void {
-    if (this.timelineDataPlaneScheduled || this.timelineDataPlaneActive) return;
+    if (this.timelineDataPlaneScheduled || this.timelineDataPlaneActiveJobs.size >= TIMELINE_DATA_PLANE_MAX_IN_FLIGHT) return;
     this.timelineDataPlaneScheduled = true;
     setImmediate(() => this.drainTimelineDataPlaneQueue());
   }
 
-  private finishTimelineDataPlaneJob(): void {
-    this.timelineDataPlaneActive = false;
-    if (this.timelineDataPlaneQueue.length > 0) this.scheduleTimelineDataPlaneDrain();
+  private timelineAttachmentSockets(attachment: TimelineDataPlaneAttachment): WebSocket[] {
+    if (attachment.origin === 'browser_request') return [attachment.socket];
+    if (attachment.origin === 'subscriber_fallback') return attachment.sockets;
+    return [];
+  }
+
+  private timelineAttachmentBytes(attachment: TimelineDataPlaneAttachment): number {
+    const recipients = attachment.origin === 'http_request' ? 1 : this.timelineAttachmentSockets(attachment).length;
+    return attachment.estimatedBytes * Math.max(1, recipients);
+  }
+
+  private adjustTimelineDataPlaneAccounting(attachment: TimelineDataPlaneAttachment, delta: number): void {
+    const amount = this.timelineAttachmentBytes(attachment) * delta;
+    this.timelineDataPlaneQueueBytes = Math.max(0, this.timelineDataPlaneQueueBytes + amount);
+    for (const socket of this.timelineAttachmentSockets(attachment)) {
+      const next = Math.max(0, (this.timelineDataPlaneBytesBySocket.get(socket) ?? 0) + attachment.estimatedBytes * delta);
+      if (next === 0) this.timelineDataPlaneBytesBySocket.delete(socket);
+      else this.timelineDataPlaneBytesBySocket.set(socket, next);
+      const userId = this.browserUserIds.get(socket);
+      if (userId) {
+        const userNext = Math.max(0, (this.timelineDataPlaneBytesByUser.get(userId) ?? 0) + attachment.estimatedBytes * delta);
+        if (userNext === 0) this.timelineDataPlaneBytesByUser.delete(userId);
+        else this.timelineDataPlaneBytesByUser.set(userId, userNext);
+      }
+    }
+  }
+
+  private releaseTimelineDataPlaneAttachment(attachment: TimelineDataPlaneAttachment): void {
+    if (attachment.estimatedBytes > 0
+      && (attachment.origin !== 'subscriber_fallback' || attachment.sockets.length > 0)) {
+      this.adjustTimelineDataPlaneAccounting(attachment, -1);
+    }
+    attachment.estimatedBytes = 0;
+    attachment.payload = {};
+    if (attachment.origin === 'subscriber_fallback') attachment.sockets = [];
+  }
+
+  private pruneCanceledTimelineDataPlaneJobs(): void {
+    const retained: TimelineDataPlaneJob[] = [];
+    for (const job of this.timelineDataPlaneQueue) {
+      const attachments: TimelineDataPlaneAttachment[] = [];
+      for (const attachment of job.attachments) {
+        if (this.isTimelineDataPlaneAttachmentCanceled(attachment)) {
+          if (attachment.estimatedBytes > 0) {
+            incrementCounter('ws_bridge_timeline_data_plane_canceled', {
+              type: job.meta.type,
+              route: job.meta.route,
+            });
+          }
+          this.releaseTimelineDataPlaneAttachment(attachment);
+          continue;
+        }
+        if (attachment.origin === 'subscriber_fallback') {
+          const openSockets = attachment.sockets.filter((socket) => socket.readyState === WebSocket.OPEN);
+          if (openSockets.length !== attachment.sockets.length) {
+            for (const socket of attachment.sockets) {
+              if (openSockets.includes(socket)) continue;
+              const perSocket: TimelineDataPlaneAttachment = { ...attachment, sockets: [socket] };
+              this.adjustTimelineDataPlaneAccounting(perSocket, -1);
+            }
+            attachment.sockets = openSockets;
+          }
+          if (attachment.sockets.length === 0) {
+            this.releaseTimelineDataPlaneAttachment(attachment);
+            continue;
+          }
+        }
+        attachments.push(attachment);
+      }
+      job.attachments = attachments;
+      if (attachments.length > 0) {
+        job.estimatedBytes = attachments.reduce((sum, attachment) => sum + this.timelineAttachmentBytes(attachment), 0);
+        retained.push(job);
+      }
+    }
+    this.timelineDataPlaneQueue = retained;
+  }
+
+  private cancelTimelineDataPlaneForSocket(ws: WebSocket): void {
+    for (const job of this.timelineDataPlaneQueue) {
+      for (const attachment of job.attachments) {
+        if (attachment.origin === 'browser_request' && attachment.socket === ws) {
+          incrementCounter('ws_bridge_timeline_data_plane_canceled', {
+            type: job.meta.type,
+            route: job.meta.route,
+          });
+          this.releaseTimelineDataPlaneAttachment(attachment);
+        } else if (attachment.origin === 'subscriber_fallback' && attachment.sockets.includes(ws)) {
+          const remaining = attachment.sockets.filter((socket) => socket !== ws);
+          const removed: TimelineDataPlaneAttachment = { ...attachment, sockets: [ws] };
+          this.adjustTimelineDataPlaneAccounting(removed, -1);
+          attachment.sockets = remaining;
+          if (remaining.length === 0) this.releaseTimelineDataPlaneAttachment(attachment);
+        }
+      }
+    }
+    for (const active of this.timelineDataPlaneActiveJobs) {
+      for (const attachment of active.attachments) {
+        if (attachment.origin === 'browser_request' && attachment.socket === ws) {
+          incrementCounter('ws_bridge_timeline_data_plane_canceled', {
+            type: active.meta.type,
+            route: active.meta.route,
+          });
+          this.releaseTimelineDataPlaneAttachment(attachment);
+        } else if (attachment.origin === 'subscriber_fallback' && attachment.sockets.includes(ws)) {
+          const removed: TimelineDataPlaneAttachment = { ...attachment, sockets: [ws] };
+          this.adjustTimelineDataPlaneAccounting(removed, -1);
+          attachment.sockets = attachment.sockets.filter((socket) => socket !== ws);
+          if (attachment.sockets.length === 0) this.releaseTimelineDataPlaneAttachment(attachment);
+        }
+      }
+    }
+    this.pruneCanceledTimelineDataPlaneJobs();
+    for (const [requestId, pending] of this.pendingTimelineRequests) {
+      if (pending.socket !== ws) continue;
+      const key = this.timelineRequestKeys.get(requestId);
+      if (key) {
+        this.timelineRequestKeys.delete(requestId);
+        const aliases = this.timelineRequestAliases.get(key);
+        aliases?.delete(requestId);
+        if (aliases?.size === 0) {
+          this.timelineRequestAliases.delete(key);
+          this.timelineInFlightByKey.delete(key);
+        }
+      }
+    }
+  }
+
+  private timelineHistoryDedupeKey(msg: Record<string, unknown>): string | null {
+    if (msg.type !== TIMELINE_MESSAGES.HISTORY_REQUEST && msg.type !== TIMELINE_MESSAGES.PAGE_REQUEST) return null;
+    const sessionName = optionalString(msg.sessionName);
+    if (!sessionName) return null;
+    return JSON.stringify({
+      sessionName,
+      type: msg.type,
+      limit: clampTimelineHistoryLimit(msg.limit),
+      budgetBytes: clampTimelineHistoryBudget(msg.budgetBytes),
+      afterTs: optionalNumber(msg.afterTs) ?? optionalNumber((msg.cursor as Record<string, unknown> | undefined)?.afterTs) ?? null,
+      beforeTs: optionalNumber(msg.beforeTs) ?? optionalNumber((msg.cursor as Record<string, unknown> | undefined)?.beforeTs) ?? null,
+      afterSeq: optionalNumber((msg.cursor as Record<string, unknown> | undefined)?.afterSeq) ?? optionalNumber(msg.afterSeq) ?? null,
+      epoch: optionalNumber((msg.cursor as Record<string, unknown> | undefined)?.epoch) ?? optionalNumber(msg.epoch) ?? null,
+      direction: (msg.cursor as Record<string, unknown> | undefined)?.direction ?? null,
+      // A text-only window and a full window with the same bounds are different answers.
+      contentFilter: isTimelineHistoryContentFilter(msg.contentFilter) ? msg.contentFilter : null,
+    });
+  }
+
+  private registerTimelineHistoryAlias(msg: Record<string, unknown>): boolean {
+    const requestId = optionalString(msg.requestId);
+    const key = this.timelineHistoryDedupeKey(msg);
+    if (!requestId || !key) return false;
+    const canonical = this.timelineInFlightByKey.get(key);
+    this.timelineRequestKeys.set(requestId, key);
+    if (!canonical) {
+      this.timelineInFlightByKey.set(key, requestId);
+      this.timelineRequestAliases.set(key, new Set([requestId]));
+      return false;
+    }
+    this.timelineRequestAliases.get(key)?.add(requestId);
+    incrementCounter('ws_bridge_timeline_history_deduplicated');
+    return true;
+  }
+
+  private finishTimelineDataPlaneJob(job: TimelineDataPlaneJob): void {
+    if (this.timelineDataPlaneActiveJobs.delete(job)) {
+      for (const attachment of job.attachments) this.releaseTimelineDataPlaneAttachment(attachment);
+    }
+    if (this.timelineDataPlaneQueue.length > 0 && this.timelineDataPlaneActiveJobs.size < TIMELINE_DATA_PLANE_MAX_IN_FLIGHT) {
+      this.scheduleTimelineDataPlaneDrain();
+    }
   }
 
   private enqueueTimelineDataPlaneJob(
@@ -1753,8 +4649,28 @@ export class WsBridge {
     } = {},
   ): boolean {
     if (attachments.length === 0) return true;
+    this.pruneCanceledTimelineDataPlaneJobs();
     const queuedBehindCount = this.timelineDataPlaneQueue.length;
-    if (queuedBehindCount >= timelineDataPlaneQueueCap) {
+    const estimatedBytes = attachments.reduce((sum, attachment) => sum + this.timelineAttachmentBytes(attachment), 0);
+    const socketTotals = new Map<WebSocket, number>();
+    const userTotals = new Map<string, number>();
+    for (const attachment of attachments) {
+      for (const socket of this.timelineAttachmentSockets(attachment)) {
+        socketTotals.set(socket, (socketTotals.get(socket) ?? 0) + attachment.estimatedBytes);
+        const userId = this.browserUserIds.get(socket);
+        if (userId) userTotals.set(userId, (userTotals.get(userId) ?? 0) + attachment.estimatedBytes);
+      }
+    }
+    const overSocketBudget = [...socketTotals].some(([socket, bytes]) => (
+      (this.timelineDataPlaneBytesBySocket.get(socket) ?? 0) + bytes > timelineDataPlaneSocketMaxBytes
+    ));
+    const overUserBudget = [...userTotals].some(([userId, bytes]) => (
+      (this.timelineDataPlaneBytesByUser.get(userId) ?? 0) + bytes > timelineDataPlaneUserMaxBytes
+    ));
+    if (queuedBehindCount >= timelineDataPlaneQueueCap
+      || this.timelineDataPlaneQueueBytes + estimatedBytes > timelineDataPlaneQueueMaxBytes
+      || overSocketBudget
+      || overUserBudget) {
       incrementCounter('ws_bridge_timeline_data_plane_queue_full', {
         type: meta.type,
         route: meta.route,
@@ -1765,6 +4681,11 @@ export class WsBridge {
         route: meta.route,
         queueDepth: queuedBehindCount,
         queueCap: timelineDataPlaneQueueCap,
+        queueBytes: this.timelineDataPlaneQueueBytes,
+        estimatedBytes,
+        queueMaxBytes: timelineDataPlaneQueueMaxBytes,
+        overSocketBudget,
+        overUserBudget,
       }, 'WsBridge timeline data-plane queue full');
       return false;
     }
@@ -1773,11 +4694,13 @@ export class WsBridge {
     this.timelineDataPlaneQueue.push({
       meta,
       attachments,
+      estimatedBytes,
       enqueuedAt,
       deadlineAt: enqueuedAt + (options.deadlineMs ?? timelineDataPlaneJobDeadlineMs),
       queueDepthAtEnqueue,
       queuedBehindCount,
     });
+    for (const attachment of attachments) this.adjustTimelineDataPlaneAccounting(attachment, 1);
     incrementCounter('ws_bridge_timeline_data_plane_enqueue', {
       type: meta.type,
       route: meta.route,
@@ -1832,6 +4755,11 @@ export class WsBridge {
     }
     const attachments = job.attachments.filter((attachment) => !this.isTimelineDataPlaneAttachmentCanceled(attachment));
     if (attachments.length === 0) return;
+    const sharedSource = attachments.find((attachment) => attachment.origin !== 'http_request');
+    const sharedSerialized = sharedSource && this.stringifyTimelineDataPlaneResponse(sharedSource.payload, job.meta);
+    const sharedRequestId = sharedSource?.origin === 'browser_request'
+      ? optionalString(sharedSource.payload.requestId)
+      : undefined;
     let fanoutYieldCount = 0;
     for (let index = 0; index < attachments.length; index += 1) {
       if (index > 0) {
@@ -1846,12 +4774,25 @@ export class WsBridge {
         });
         continue;
       }
+      const serialized = sharedSerialized && attachment.origin !== 'http_request'
+        ? {
+          ...sharedSerialized,
+          json: timelineSerializedForRequestId(
+            sharedSerialized.json,
+            sharedRequestId,
+            attachment.origin === 'browser_request' ? optionalString(attachment.payload.requestId) : undefined,
+          ),
+          stringifyMs: index === attachments.findIndex((candidate) => candidate === sharedSource)
+            ? sharedSerialized.stringifyMs
+            : 0,
+        }
+        : undefined;
       await this.runTimelineDataPlaneAttachment(attachment, meta, {
         ...queue,
         attachmentIndex: index + 1,
         attachmentCount: attachments.length,
         fanoutYieldCount,
-      });
+      }, serialized);
     }
   }
 
@@ -1859,6 +4800,7 @@ export class WsBridge {
     attachment: TimelineDataPlaneAttachment,
     meta: TimelineDataPlaneSendMeta,
     queue: TimelineDataPlaneQueueMetrics,
+    sharedSerialized?: { json: string; jsonBytes: number; stringifyMs: number },
   ): void | Promise<void> {
     if (attachment.origin === 'http_request') {
       if (attachment.pending.settled) return;
@@ -1874,7 +4816,7 @@ export class WsBridge {
     }
 
     if (attachment.origin === 'browser_request') {
-      const serialized = this.stringifyTimelineDataPlaneResponse(attachment.payload, meta);
+      const serialized = sharedSerialized ?? this.stringifyTimelineDataPlaneResponse(attachment.payload, meta);
       if (!serialized) {
         if (attachment.socket.readyState === WebSocket.OPEN) {
           safeSend(attachment.socket, JSON.stringify(withBridgeActualPayloadBytes(
@@ -1898,7 +4840,7 @@ export class WsBridge {
       });
     }
 
-    const serialized = this.stringifyTimelineDataPlaneResponse(attachment.payload, meta);
+    const serialized = sharedSerialized ?? this.stringifyTimelineDataPlaneResponse(attachment.payload, meta);
     if (!serialized) return;
     const sockets = attachment.sockets.filter((socket) => socket.readyState === WebSocket.OPEN);
     if (sockets.length === 0) return;
@@ -1926,47 +4868,49 @@ export class WsBridge {
 
   private drainTimelineDataPlaneQueue(): void {
     this.timelineDataPlaneScheduled = false;
-    if (this.timelineDataPlaneActive) return;
-    const queueDepthBeforeDrain = this.timelineDataPlaneQueue.length;
-    const job = this.timelineDataPlaneQueue.shift();
-    if (!job) return;
-    this.timelineDataPlaneActive = true;
-    const queueMetrics: TimelineDataPlaneQueueMetrics = {
-      backlogAgeMs: performance.now() - job.enqueuedAt,
-      queueDepthAtEnqueue: job.queueDepthAtEnqueue,
-      queueDepthBeforeDrain,
-      queuedBehindCount: job.queuedBehindCount,
-    };
-    if (this.isTimelineDataPlaneJobCanceled(job)) {
-      incrementCounter('ws_bridge_timeline_data_plane_canceled', {
-        type: job.meta.type,
-        route: job.meta.route,
-      });
-      this.finishTimelineDataPlaneJob();
-      return;
+    this.pruneCanceledTimelineDataPlaneJobs();
+    while (this.timelineDataPlaneActiveJobs.size < TIMELINE_DATA_PLANE_MAX_IN_FLIGHT) {
+      const queueDepthBeforeDrain = this.timelineDataPlaneQueue.length;
+      const job = this.timelineDataPlaneQueue.shift();
+      if (!job) break;
+      this.timelineDataPlaneActiveJobs.add(job);
+      const queueMetrics: TimelineDataPlaneQueueMetrics = {
+        backlogAgeMs: performance.now() - job.enqueuedAt,
+        queueDepthAtEnqueue: job.queueDepthAtEnqueue,
+        queueDepthBeforeDrain,
+        queuedBehindCount: job.queuedBehindCount,
+      };
+      if (this.isTimelineDataPlaneJobCanceled(job)) {
+        incrementCounter('ws_bridge_timeline_data_plane_canceled', {
+          type: job.meta.type,
+          route: job.meta.route,
+        });
+        this.finishTimelineDataPlaneJob(job);
+        continue;
+      }
+      if (performance.now() > job.deadlineAt) {
+        incrementCounter('ws_bridge_timeline_data_plane_deadline_exceeded', {
+          type: job.meta.type,
+          route: job.meta.route,
+        });
+        logger.warn({
+          serverId: this.serverId,
+          type: job.meta.type,
+          route: job.meta.route,
+          backlogAgeMs: queueMetrics.backlogAgeMs,
+          deadlineMs: Math.max(0, job.deadlineAt - job.enqueuedAt),
+        }, 'WsBridge timeline data-plane deadline exceeded');
+        this.handleTimelineDataPlaneJobDeadline(job);
+        this.finishTimelineDataPlaneJob(job);
+        continue;
+      }
+      void Promise.resolve()
+        .then(() => this.runTimelineDataPlaneJob(job, queueMetrics))
+        .catch((err) => {
+          logger.warn({ serverId: this.serverId, err, type: job.meta.type, route: job.meta.route }, 'WsBridge timeline data-plane delivery failed');
+        })
+        .finally(() => this.finishTimelineDataPlaneJob(job));
     }
-    if (performance.now() > job.deadlineAt) {
-      incrementCounter('ws_bridge_timeline_data_plane_deadline_exceeded', {
-        type: job.meta.type,
-        route: job.meta.route,
-      });
-      logger.warn({
-        serverId: this.serverId,
-        type: job.meta.type,
-        route: job.meta.route,
-        backlogAgeMs: queueMetrics.backlogAgeMs,
-        deadlineMs: Math.max(0, job.deadlineAt - job.enqueuedAt),
-      }, 'WsBridge timeline data-plane deadline exceeded');
-      this.handleTimelineDataPlaneJobDeadline(job);
-      this.finishTimelineDataPlaneJob();
-      return;
-    }
-    void Promise.resolve()
-      .then(() => this.runTimelineDataPlaneJob(job, queueMetrics))
-      .catch((err) => {
-        logger.warn({ serverId: this.serverId, err, type: job.meta.type, route: job.meta.route }, 'WsBridge timeline data-plane delivery failed');
-      })
-      .finally(() => this.finishTimelineDataPlaneJob());
   }
 
   private stringifyTimelineDataPlaneResponse(
@@ -2106,10 +5050,50 @@ export class WsBridge {
       sessionName,
       sockets,
       payload: msg,
+      estimatedBytes: estimateTimelineDataPlaneBytes(msg),
     }]);
   }
 
+  /**
+   * Apply the same summary projection to request/response backfills that live
+   * fanout already applies.  A history response is routed directly to the
+   * requesting socket, so it cannot pass through deliverTimelineEventToSubscribers;
+   * without this projection a minimized summary window receives streaming text
+   * during cold backfill and loses the bytes/finality guarantees of summary mode.
+   */
+  private shapeTimelineResponseForSocket(
+    response: Record<string, unknown>,
+    pending: PendingTimelineRequest,
+  ): Record<string, unknown> {
+    if (pending.mode !== TIMELINE_SUBSCRIPTION_MODES.SUMMARY) return response;
+    if (response.type !== TIMELINE_MESSAGES.HISTORY
+      && response.type !== TIMELINE_MESSAGES.PAGE
+      && response.type !== TIMELINE_MESSAGES.REPLAY) return response;
+    if (!Array.isArray(response.events)) return response;
+    const inputEvents = response.events;
+    const events = inputEvents
+      .filter((event): event is Record<string, unknown> => isPlainRecord(event) && this.isTimelineSummaryEvent(event))
+      .map((event) => this.summarizeTimelineEvent(event));
+    incrementCounter('ws_bridge_timeline_summary_projection', {
+      responseType: String(response.type),
+      inputEvents: String(inputEvents.length),
+      outputEvents: String(events.length),
+    });
+    return { ...response, events };
+  }
+
   private handleTimelineDataPlaneResponse(msg: Record<string, unknown>, type: string): void {
+    const primaryRequestId = optionalString(msg.requestId);
+    if (primaryRequestId) {
+      const key = this.timelineRequestKeys.get(primaryRequestId);
+      const aliases = key ? this.timelineRequestAliases.get(key) : undefined;
+      if (key && aliases) {
+        msg = { ...msg, requestIds: [...aliases] };
+        this.timelineInFlightByKey.delete(key);
+        this.timelineRequestAliases.delete(key);
+        for (const alias of aliases) this.timelineRequestKeys.delete(alias);
+      }
+    }
     const requestIds = timelineResponseRequestIds(msg);
     if (requestIds.length > 0) {
       const socketDeliveries: Array<{ requestId: string; pending: PendingTimelineRequest }> = [];
@@ -2143,12 +5127,17 @@ export class WsBridge {
           requestId,
           pending,
           payload: timelineResponseForRequestId(msg, requestId),
+          estimatedBytes: estimateTimelineDataPlaneBytes(msg),
         })),
         ...socketDeliveries.map(({ requestId, pending }): TimelineDataPlaneAttachment => ({
           origin: 'browser_request',
           requestId,
           socket: pending.socket,
-          payload: timelineResponseForRequestId(msg, requestId),
+          payload: this.shapeTimelineResponseForSocket(
+            timelineResponseForRequestId(msg, requestId),
+            pending,
+          ),
+          estimatedBytes: estimateTimelineDataPlaneBytes(msg),
         })),
       ];
       this.enqueueTimelineDataPlaneFanout(attachments, {
@@ -2415,6 +5404,59 @@ export class WsBridge {
     }));
   }
 
+  /**
+   * Identity-over-the-lease access, mirroring the HTTP identity routes
+   * (server/src/routes/session-mgmt.ts: resolveSupervisorDefaultsOwner +
+   * canonicalSessionIdentityScopeKey): a server member/owner socket, or a
+   * share PARTICIPANT whose share covers `sessionName` (never a viewer, read
+   * or write), and only for the canonical scope key of THAT session -- so a
+   * participant cannot reach another session's or project's identity.
+   * Returns that canonical key, or null when access is denied.
+   */
+  private canonicalIdentityScopeKeyForSocket(
+    ws: WebSocket,
+    scope: 'project' | 'session',
+    sessionName: string,
+  ): string | null {
+    if (!sessionName) return null;
+    const shareState = this.browserShareStates.get(ws);
+    if (shareState && !shareStateMayUseIdentity(shareState, sessionName)) return null;
+    return scope === 'session'
+      ? sessionIdentitySessionKey(this.serverId, sessionName)
+      : this.resolveSessionIdentityProjectKey(sessionName);
+  }
+
+  /**
+   * Identity-over-lease (phase 2): pure server-side, never touches the
+   * daemon. Same access rule as the HTTP identity routes (see
+   * canonicalIdentityScopeKeyForSocket); anything else gets `ok: false` and
+   * falls back to the HTTP relay path.
+   */
+  private async handleSessionIdentityResolveQuery(ws: WebSocket, msg: Record<string, unknown>): Promise<void> {
+    const requestId = typeof msg.requestId === 'string' ? msg.requestId : '';
+    if (!requestId) return;
+    const scope = msg.scope === 'project' || msg.scope === 'session' ? msg.scope : null;
+    const sessionName = typeof msg.sessionName === 'string' ? msg.sessionName : '';
+    const ownerUserId = this.daemonOwnerUserId;
+    const scopeKey = scope ? this.canonicalIdentityScopeKeyForSocket(ws, scope, sessionName) : null;
+    if (!scope || !ownerUserId || !scopeKey || !this.db) {
+      safeSend(ws, JSON.stringify({ type: SESSION_IDENTITY_WS.RESOLVE_RESPONSE, requestId, ok: false }));
+      return;
+    }
+    try {
+      const metadata = await getSessionIdentityMetadata(this.db, ownerUserId, scope, scopeKey);
+      safeSend(ws, JSON.stringify({
+        type: SESSION_IDENTITY_WS.RESOLVE_RESPONSE,
+        requestId,
+        ok: true,
+        scopeKey,
+        ...(metadata ? { contentHash: metadata.contentHash, revision: metadata.revision, updatedAt: metadata.updatedAt } : {}),
+      }));
+    } catch {
+      safeSend(ws, JSON.stringify({ type: SESSION_IDENTITY_WS.RESOLVE_RESPONSE, requestId, ok: false }));
+    }
+  }
+
   private async handleMemoryFeaturesQuery(ws: WebSocket, msg: Record<string, unknown>): Promise<boolean> {
     if (msg.type !== MEMORY_WS.FEATURES_QUERY) return false;
     const requestId = this.registerMemoryManagementRequest(ws, msg);
@@ -2616,9 +5658,31 @@ export class WsBridge {
 
   handleDaemonConnection(ws: WebSocket, db: Database, env: Env, onAuthenticated?: () => void): void {
     this.db = db;
+    this.pushEnv = env;
     this.directFileTransferTicketSigningKey = env.JWT_SIGNING_KEY;
+    // Production startup already enforces a strong JWT_SIGNING_KEY. Some
+    // narrowly-scoped bridge tests and embedded callers intentionally omit it;
+    // keep unrelated daemon transport alive while capability signing remains
+    // fail-closed unavailable instead of deriving from an undefined value.
+    const capabilitySigningKey = typeof env.JWT_SIGNING_KEY === 'string' && env.JWT_SIGNING_KEY.length > 0
+      ? env.JWT_SIGNING_KEY
+      : null;
+    this.capabilityBlobSigningKey = capabilitySigningKey;
+    this.capabilityAuthorizationSigner = capabilitySigningKey
+      ? createCapabilityAuthorizationSigner(capabilitySigningKey)
+      : null;
     // Replace existing daemon connection
     if (this.daemonWs) {
+      this.noteAuthenticatedConnectionReplaced();
+      const replacedGeneration = this.daemonGeneration;
+      void remoteDesktopConsentCancellation.endpointReplaced(
+        db,
+        this.serverId,
+        replacedGeneration,
+      ).catch(() => {});
+      if (this.daemonOwnerUserId) {
+        this.failDisconnectedCapabilityOperations(db, this.daemonOwnerUserId);
+      }
       // `ws.close()` completes asynchronously in production. Reject the old
       // generation's request waiters before swapping `daemonWs`; otherwise the
       // old socket's identity-guarded close handler cannot see or drain them.
@@ -2626,11 +5690,26 @@ export class WsBridge {
       try { this.daemonWs.close(1001, 'replaced'); } catch { /* ignore */ }
     }
     this.daemonWs = ws;
+    // A test double or abrupt transport can emit `close` synchronously while
+    // the old socket is being replaced, causing maybeCleanup() to remove this
+    // otherwise live bridge before the assignment above. Re-register the same
+    // object; this never manufactures ownership because the new socket still
+    // has to authenticate and complete durable reconciliation.
+    WsBridge.instances.set(this.serverId, this);
     // New connection generation: abandon any pending exec bound to a prior
     // generation (they resolve as indeterminate) so a reconnect never delivers a
     // stale result to a new waiter (10.6).
     this.daemonGeneration++;
     const connectionGeneration = this.daemonGeneration;
+    // `daemon.hello.helloEpoch` is process-local and restarts from one after a
+    // daemon upgrade.  Scope the cached capability advertisement to this exact
+    // transport generation: when a replacement socket closes asynchronously,
+    // its identity-guarded close handler cannot clear the old cache after
+    // `daemonWs` has already moved to `ws`.  Retaining it would make the new
+    // process's lower hello epoch look stale forever, leaving browsers on the
+    // pre-upgrade capability snapshot even though the new daemon is healthy.
+    this.daemonP2pWorkflowCapabilities = null;
+    this.remoteDesktopAuthorityReadyGeneration = null;
     this.directFileTransferRouter.setDaemonGeneration(connectionGeneration);
     this.remoteDesktopRouter.setDaemonGeneration(connectionGeneration);
     abandonPriorGenerations(this.serverId, this.daemonGeneration);
@@ -2640,11 +5719,14 @@ export class WsBridge {
     this.peerAuditRouter.setDaemonGeneration(this.daemonGeneration);
     abandonComputerUsePriorGenerations(this.serverId, this.daemonGeneration);
     this.authenticated = false;
+    this.lastCapabilityRevisionSent = 0;
+    this.capabilitySyncInitialized = false;
     this.controlledNodeCapabilities.clear();
     // New connection: drop any auth promise from a prior connection so
     // late-arriving messages don't await a stale (and possibly resolved
     // for a different `ws`) auth.
     this.authPromise = null;
+    this.credentialPromise = null;
     this.upgradeBlockedSyncRequiredGeneration = null;
     this.upgradeBlockedSyncCompleteGeneration = null;
 
@@ -2688,6 +5770,20 @@ export class WsBridge {
       // daemon) raced the auth DB lookup and was rejected with
       // `ws.close(4001, 'auth_required')` even though auth was about to
       // succeed milliseconds later. See `authPromise` field doc above.
+      // A controlled node's heartbeat is what its watchdog counts as the auth ack, and the node gives a socket up
+      // after 30 s without any server frame. It therefore waits only for THIS connection's own credential check,
+      // never for the remote-desktop tail behind `authPromise` (up to 35 s on a restarted node with a live route).
+      // Every other frame still waits for the complete chain below, and a connection that was replaced or whose
+      // credentials failed falls through to the unchanged paths: it is never acknowledged.
+      if (msg.type === 'heartbeat' && this.credentialPromise && this.authPromise) {
+        const pendingCredential = this.credentialPromise;
+        try { await pendingCredential; } catch { /* resolves, never rejects */ }
+        if (this.daemonWs !== ws || this.daemonGeneration !== connectionGeneration) return;
+        if (this.authenticated && this.daemonNodeRole === NODE_ROLE.CONTROLLED) {
+          this.acknowledgeControlledNodeHeartbeat(msg, ws, db, connectionGeneration);
+          return;
+        }
+      }
       if (this.authPromise) {
         const pendingAuth = this.authPromise;
         try { await pendingAuth; } catch { /* ignore — closed below */ }
@@ -2714,9 +5810,16 @@ export class WsBridge {
         let resolveAuth!: () => void;
         const localAuthPromise = new Promise<void>((res) => { resolveAuth = res; });
         this.authPromise = localAuthPromise;
+        // First half of the barrier (see `credentialPromise`): created synchronously, with `authPromise`, so a
+        // heartbeat sent in the same breath as the auth frame can find it.
+        let resolveCredential!: () => void;
+        const localCredentialPromise = new Promise<void>((res) => { resolveCredential = res; });
+        this.credentialPromise = localCredentialPromise;
+        const authStartedAt = Date.now();
         const isCurrentAuthConnection = (): boolean =>
           this.daemonWs === ws && this.daemonGeneration === connectionGeneration;
         const finishLocalAuth = (): void => {
+          resolveCredential();
           resolveAuth();
           // A replacement connection owns a different auth promise. A stale
           // continuation may release only its own waiters; it must never clear
@@ -2724,15 +5827,32 @@ export class WsBridge {
           if (this.authPromise === localAuthPromise) {
             this.authPromise = null;
           }
+          if (this.credentialPromise === localCredentialPromise) {
+            this.credentialPromise = null;
+          }
         };
 
         const tokenHash = sha256Hex(msg.token);
+        const lookupStartedAt = Date.now();
         let server: {
           token_hash: string;
           user_id?: string;
           node_role?: string | null;
           revoked_at?: number | null;
           os?: string | null;
+          node_id?: string | null;
+          abi_profile?: unknown;
+          owner_status?: string | null;
+          controlled_upgrade_status?: string | null;
+          controlled_upgrade_target_version?: string | null;
+          controlled_upgrade_reason?: string | null;
+          controlled_worker_refresh_attempt_id?: string | null;
+          controlled_worker_refresh_phase?: string | null;
+          controlled_worker_refresh_installed_version?: string | null;
+          controlled_worker_refresh_target_version?: string | null;
+          controlled_worker_refresh_artifact_sha256?: string | null;
+          controlled_worker_refresh_reason?: string | null;
+          controlled_worker_refresh_recorded_at?: number | null;
         } | null = null;
         try {
           server = await db.queryOne<{
@@ -2741,8 +5861,16 @@ export class WsBridge {
             node_role?: string | null;
             revoked_at?: number | null;
             os?: string | null;
+            node_id?: string | null;
+            abi_profile?: unknown;
           }>(
-            'SELECT token_hash, user_id, node_role, revoked_at, os FROM servers WHERE id = $1',
+            `SELECT token_hash, user_id, node_role, revoked_at, os, node_id, abi_profile,
+                    (SELECT u.status FROM users u WHERE u.id = servers.user_id) AS owner_status,
+                    controlled_worker_refresh_attempt_id, controlled_worker_refresh_phase,
+                    controlled_worker_refresh_installed_version, controlled_worker_refresh_target_version,
+                    controlled_worker_refresh_artifact_sha256, controlled_worker_refresh_reason,
+                    controlled_worker_refresh_recorded_at
+               FROM servers WHERE id = $1`,
             [this.serverId],
           );
         } catch (err) {
@@ -2751,6 +5879,7 @@ export class WsBridge {
           if (!stillCurrent) return;
           throw err;
         }
+        const lookupMs = Date.now() - lookupStartedAt;
         // The DB lookup is the first asynchronous auth boundary. A replacement
         // may have installed a new socket and auth promise while it was pending.
         // Never let the stale continuation overwrite generation-bound state.
@@ -2774,6 +5903,27 @@ export class WsBridge {
           return;
         }
 
+        // A daemon acts as its owner: when the owner's account is disabled (or still pending) the credential is refused, with the account's
+        // own error code as the close reason so the daemon can tell its user why (close 4003 backs off like a revoked credential: no storm).
+        if (!isUserStatusActive(server.owner_status)) {
+          logger.warn({ serverId: this.serverId }, 'Daemon auth rejected: owner account is not active');
+          ws.close(ACCOUNT_WS_CLOSE_CODE, userStatusDenialCode(server.owner_status ?? USER_STATUS.DISABLED));
+          finishLocalAuth();
+          return;
+        }
+
+        if (server.node_role === NODE_ROLE.CONTROLLED) {
+          const storedProfile = normalizeControlledNodeAbiProfile(server.abi_profile);
+          const advertisedProfile = normalizeControlledNodeAbiProfile(msg[CONTROLLED_NODE_ABI_PROFILE_FIELD]);
+          if (!storedProfile || advertisedProfile !== storedProfile) {
+            ws.close(4002, 'abi_profile_mismatch');
+            finishLocalAuth();
+            return;
+          }
+          this.daemonControlledAbiProfile = storedProfile;
+        } else {
+          this.daemonControlledAbiProfile = CONTROLLED_NODE_ABI_MODERN;
+        }
         // node_role is authoritative from the DB; any client-declared `nodeRole`
         // in the auth frame is IGNORED (10.2). A controlled node's WS is only a
         // presence/heartbeat + MACHINE_EXEC_RESULT surface.
@@ -2784,6 +5934,7 @@ export class WsBridge {
           && isControlledNodeOs(server.os)
           ? server.os
           : null;
+        this.daemonControlledNodeId = this.daemonNodeRole === NODE_ROLE.CONTROLLED ? parseControlledNodeId(server.node_id) : null;
         const supportsUpgradeBlockedSync = this.daemonNodeRole === NODE_ROLE.FULL
           && msg[DAEMON_UPGRADE_BLOCKED_SYNC_PROTOCOL.AUTH_REVISION_FIELD]
             === DAEMON_UPGRADE_BLOCKED_SYNC_PROTOCOL.REVISION;
@@ -2803,6 +5954,40 @@ export class WsBridge {
           return;
         }
         this.controlledNodeCapabilities = new Set(controlledCapabilities.value);
+        if (this.daemonNodeRole === NODE_ROLE.CONTROLLED) {
+          const persistedStatus = typeof server.controlled_upgrade_status === 'string'
+            && Object.values(CONTROLLED_NODE_UPGRADE_STATUS).includes(
+              server.controlled_upgrade_status as ControlledNodeUpgradeStatus,
+            )
+            ? server.controlled_upgrade_status as ControlledNodeUpgradeStatus
+            : CONTROLLED_NODE_UPGRADE_STATUS.CURRENT;
+          // An UPGRADING marker is only a durable observation of the previous
+          // socket. A fresh auth with the old version must be allowed to retry
+          // once at this new authoritative idle boundary.
+          this.autoUpgradeStatus = persistedStatus === CONTROLLED_NODE_UPGRADE_STATUS.UPGRADING
+            ? CONTROLLED_NODE_UPGRADE_STATUS.AVAILABLE
+            : persistedStatus;
+          this.autoUpgradeTargetVersion = typeof server.controlled_upgrade_target_version === 'string'
+            ? server.controlled_upgrade_target_version
+            : null;
+          this.autoUpgradeReason = typeof server.controlled_upgrade_reason === 'string'
+            ? server.controlled_upgrade_reason
+            : null;
+          this.controlledNodeWorkerRefreshStatus = server.controlled_worker_refresh_attempt_id
+            && server.controlled_worker_refresh_phase
+            && typeof server.controlled_worker_refresh_recorded_at === 'number'
+            ? {
+              type: DAEMON_MSG.CONTROLLED_NODE_WORKER_REFRESH_STATUS,
+              attemptId: server.controlled_worker_refresh_attempt_id,
+              phase: server.controlled_worker_refresh_phase as ControlledNodeWorkerRefreshStatusMessage['phase'],
+              ...(server.controlled_worker_refresh_installed_version ? { installedVersion: server.controlled_worker_refresh_installed_version } : {}),
+              ...(server.controlled_worker_refresh_target_version ? { targetVersion: server.controlled_worker_refresh_target_version } : {}),
+              ...(server.controlled_worker_refresh_artifact_sha256 ? { artifactSha256: server.controlled_worker_refresh_artifact_sha256 } : {}),
+              ...(server.controlled_worker_refresh_reason ? { reason: server.controlled_worker_refresh_reason } : {}),
+              recordedAt: server.controlled_worker_refresh_recorded_at,
+            }
+            : null;
+        }
         this.resetLegacyUpgradeRescueForGeneration(connectionGeneration);
         this.authenticated = true;
         this.daemonVersion = typeof msg.daemonVersion === 'string' ? msg.daemonVersion : null;
@@ -2810,7 +5995,41 @@ export class WsBridge {
         this.clearPendingIdlePushes();
         this.activeMainSessions.clear();
         this.hasActiveMainSessionSnapshot = false;
-        logger.info({ serverId: this.serverId, daemonVersion: this.daemonVersion }, 'Daemon authenticated');
+        // This connection's own credentials are verified: a controlled node's heartbeat may be acknowledged now.
+        const credentialMs = Date.now() - authStartedAt;
+        resolveCredential();
+        // The legacy reconciler closes every process-lost route. It runs only when no in-memory route was
+        // recovered by a privacy-fenced transparent replacement (which it would destroy). Bounded wait, background
+        // completion and retry: see awaitRemoteDesktopReconcileForAuth.
+        const phases: { reconcileMs: number | null; revalidateMs: number | null } = { reconcileMs: null, revalidateMs: null };
+        const reconcileStartedAt = Date.now();
+        const reconcileDone = await this.awaitRemoteDesktopReconcileForAuth(connectionGeneration, isCurrentAuthConnection, phases);
+        const reconcileWaitedMs = Date.now() - reconcileStartedAt;
+        const contextStartedAt = Date.now();
+        await this.sendRemoteDesktopNodeContext(db, ws, connectionGeneration);
+        const contextMs = Date.now() - contextStartedAt;
+        if (!isCurrentAuthConnection()) {
+          finishLocalAuth();
+          return;
+        }
+        const authTimings = {
+          lookupMs,
+          credentialMs,
+          // A step that is still running when authentication completes is reported as the time waited so far.
+          reconcileMs: phases.reconcileMs ?? reconcileWaitedMs,
+          revalidateMs: phases.revalidateMs ?? (phases.reconcileMs === null ? 0 : Math.max(0, reconcileWaitedMs - phases.reconcileMs)),
+          reconcilePending: !reconcileDone,
+          contextMs,
+          totalMs: Date.now() - authStartedAt,
+        };
+        logger.info({ serverId: this.serverId, daemonVersion: this.daemonVersion, ...authTimings }, 'Daemon authenticated');
+        if (authTimings.totalMs > DAEMON_AUTH_SLOW_PHASE_MS
+          || authTimings.lookupMs > DAEMON_AUTH_SLOW_PHASE_MS
+          || authTimings.reconcileMs > DAEMON_AUTH_SLOW_PHASE_MS
+          || authTimings.revalidateMs > DAEMON_AUTH_SLOW_PHASE_MS
+          || authTimings.contextMs > DAEMON_AUTH_SLOW_PHASE_MS) {
+          logger.warn({ serverId: this.serverId, daemonVersion: this.daemonVersion, ...authTimings }, 'slow daemon auth');
+        }
         onAuthenticated?.();
 
         updateServerHeartbeat(
@@ -2818,6 +6037,12 @@ export class WsBridge {
           this.serverId,
           this.daemonVersion,
           this.daemonNodeRole === NODE_ROLE.CONTROLLED ? [...this.controlledNodeCapabilities] : undefined,
+          // Validated before it is stored: this column is read by artifact
+          // selection, and an unrecognised value is worse than the stale one
+          // it would replace.
+          typeof msg.runtimeArch === 'string' && isControlledNodeArch(msg.runtimeArch)
+            ? msg.runtimeArch
+            : null,
         ).catch((err) =>
           logger.error({ err }, 'Failed to update heartbeat on auth'),
         );
@@ -2838,68 +6063,66 @@ export class WsBridge {
             finishLocalAuth();
             return;
           }
+          // USER-scope identity content lives on the server; push it now
+          // instead of the daemon polling for it (owner rule,
+          // tsk_cd_identity_daemon_storage). Unconditional: this event is
+          // rare (one per connect) and the content is capped at 100k chars,
+          // so no need for hash comparison here -- a reconnecting daemon
+          // with a stale copy gets the current one either way.
+          try {
+            const userProfile = await getServerSessionIdentityProfile(db, server.user_id, 'user', '');
+            if (!isCurrentAuthConnection()) {
+              finishLocalAuth();
+              return;
+            }
+            if (userProfile && userProfile.content) this.sendSessionIdentityUserPush(userProfile);
+          } catch (err) {
+            logger.warn({ err, serverId: this.serverId }, 'failed to push user identity on daemon auth');
+          }
+          if (!isCurrentAuthConnection()) {
+            finishLocalAuth();
+            return;
+          }
+        }
+        if (this.daemonNodeRole === NODE_ROLE.FULL) {
+          try {
+            await this.sendCapabilitySnapshot(db, ws, connectionGeneration);
+          } catch (error) {
+            // Capability sync is fail-closed and independent from core daemon
+            // liveness. Keep the connection, report the unavailable slice, and
+            // let the daemon retry with CAPABILITY_SYNC_MSG.REQUEST.
+            logger.warn({ error, serverId: this.serverId }, 'Initial capability snapshot failed');
+          }
+          if (!isCurrentAuthConnection()) {
+            finishLocalAuth();
+            return;
+          }
         }
         this.daemonUpgradeCoordinator.clearIfTargetVersionMatches(this.daemonVersion);
         this.flushPendingDaemonUpgrade(ws);
 
-        // Auto-upgrade: on reconnect, retry up to 3 times, but never schedule
-        // more than one upgrade command per 15 minutes while the daemon remains
-        // on a mismatched version. This protects npm global install from
-        // reconnect storms and registry propagation windows.
-        // Always target the server's exact version so dev↔stable mismatches converge to
-        // the same channel in both directions.
-        const serverVersion = process.env.APP_VERSION;
-        const shouldUpgrade = Boolean(
-          serverVersion
-          && serverVersion !== '0.0.0'
-          && this.daemonVersion
-          && this.daemonVersion !== serverVersion,
-        );
-        if (shouldUpgrade) {
-          const result = this.requestDaemonUpgrade({
-            targetVersion: serverVersion,
-            source: 'auto',
-            isStillCurrent: () => this.daemonWs === ws && this.authenticated && this.daemonVersion !== serverVersion,
-          });
-          if (result.deliveryStatus === DAEMON_UPGRADE_DELIVERY_STATUS.SENT) {
-            logger.info({
-              serverId: this.serverId,
-              daemonVersion: this.daemonVersion,
-              serverVersion,
-              upgradeId: result.upgradeId,
-            }, 'Version mismatch — scheduling daemon.upgrade');
-          } else if (result.deliveryStatus === DAEMON_UPGRADE_DELIVERY_STATUS.SUPPRESSED) {
-            logger.info({
-              serverId: this.serverId,
-              daemonVersion: this.daemonVersion,
-              serverVersion,
-              nextAttemptAt: result.nextAttemptAt,
-            }, 'Version mismatch — auto daemon.upgrade suppressed by 15-minute interval');
-          } else if (result.deliveryStatus === DAEMON_UPGRADE_DELIVERY_STATUS.BACKOFF) {
-            logger.warn({
-              serverId: this.serverId,
-              daemonVersion: this.daemonVersion,
-              serverVersion,
-              reason: result.reason,
-            }, 'Version mismatch — auto daemon.upgrade in backoff');
-          } else if (result.deliveryStatus === DAEMON_UPGRADE_DELIVERY_STATUS.PENDING_PUBLICATION) {
-            logger.info({
-              serverId: this.serverId,
-              daemonVersion: this.daemonVersion,
-              serverVersion,
-              nextAttemptAt: result.nextAttemptAt,
-              reason: result.reason,
-            }, 'Version mismatch — waiting for daemon upgrade target to appear on npm');
-          }
-        } else {
-          // Version matches or auto-upgrade does not apply — reset retry state.
+        // Controlled nodes are passive workers and may converge automatically
+        // at this authenticated, live-socket boundary. Full daemons retain the
+        // operator-confirmed/manual policy and never enter this path.
+        if (this.daemonNodeRole !== NODE_ROLE.CONTROLLED) {
           this.daemonUpgradeCoordinator.clearIfTargetVersionMatches(this.daemonVersion);
         }
 
         // Replay queued messages, skipping terminal.subscribe/unsubscribe — refs replay below is authoritative
-        for (const queued of this.queue) {
+        const replayNow = Date.now();
+        let staleDropped = 0;
+        for (const { message: queued, queuedAt } of this.queue) {
           try {
-            const parsed = JSON.parse(queued) as { type?: string };
+            if (replayNow - queuedAt > DAEMON_QUEUE_REPLAY_MAX_AGE_MS) {
+              staleDropped += 1;
+              continue;
+            }
+            const parsed = JSON.parse(queued) as { type?: string; commandId?: unknown };
+            // A session.send still tracked as inflight is replayed (once, with the
+            // bridge-retry marker) by replayInflightToDaemon below; sending the raw
+            // copy here as well delivered the same command twice.
+            if (parsed.type === 'session.send' && typeof parsed.commandId === 'string'
+              && this.inflightCommands.has(parsed.commandId)) continue;
             if (parsed.type === 'terminal.subscribe' || parsed.type === 'terminal.unsubscribe') continue;
             // MACHINE_EXEC is never replayed — a one-shot SYSTEM command must not
             // execute on a fresh generation after the relay gave up (10.6).
@@ -2920,6 +6143,9 @@ export class WsBridge {
           } catch { /* ignore */ }
         }
         this.queue = [];
+        if (staleDropped > 0) {
+          logger.warn({ serverId: this.serverId, staleDropped }, 'Dropped stale queued daemon commands instead of replaying them');
+        }
 
         this.broadcastToBrowsers(JSON.stringify({ type: DAEMON_MSG.RECONNECTED }));
 
@@ -2961,14 +6187,75 @@ export class WsBridge {
         // reconnecting daemon, and its handler was waiting on authPromise. A
         // next-turn flush lets that persisted terminal blocker run first,
         // regardless of how long replayInflightToDaemon() made auth take.
-        setImmediate(() => {
+        const runPostAuthUpgrade = (autoTrigger: boolean) => {
           if (
             this.daemonWs !== ws
             || this.daemonGeneration !== connectionGeneration
             || !this.authenticated
           ) return;
+          if (autoTrigger) this.maybeAutoUpgradeDaemon();
           this.flushPendingDaemonUpgrade(ws);
-        });
+        };
+        // A new connection restarts the daemon's own opt-out evaluation and
+        // owns the retry schedule: a timer armed for an earlier socket must
+        // not keep this one from arming its own.
+        this.autoUpgradeDisabledOnDaemon = false;
+        this.clearAutoUpgradeRetryTimer();
+        // Per-daemon stagger: see CONTROLLED_NODE_UPGRADE_STAGGER_MAX_MS. A
+        // server restart reconnects everything at once; the automatic trigger
+        // is spread, while a request already pending (an offline manual
+        // upgrade) still flushes immediately on a full daemon.
+        const staggerTimer = setTimeout(() => runPostAuthUpgrade(true), controlledNodeUpgradeStaggerMs(this.serverId));
+        (staggerTimer as { unref?: () => void }).unref?.();
+        if (this.daemonNodeRole !== NODE_ROLE.CONTROLLED) {
+          setImmediate(() => runPostAuthUpgrade(false));
+        }
+        return;
+      }
+
+      // Local-consent results/cancels are endpoint/generation bound and are
+      // never relayed to browsers. Request is Server→node only.
+      if (typeof msg.type === 'string' && msg.type.startsWith('remote_desktop.consent.')) {
+        const parsed = validateRemoteDesktopConsentMessage(msg);
+        if (parsed.ok
+          && (parsed.value.type === REMOTE_DESKTOP_CONSENT_MSG.RESULT
+            || parsed.value.type === REMOTE_DESKTOP_CONSENT_MSG.CANCEL)
+          && this.db && this.authenticated
+          && this.daemonGeneration === connectionGeneration
+          && this.remoteDesktopAuthorityReadyGeneration === connectionGeneration
+          && this.hasDaemonCapability(REMOTE_DESKTOP_LOCAL_CONSENT_CAPABILITY)) {
+          await createRemoteDesktopConsentResultConsumer(this.db)({
+            executionServerId: this.serverId,
+            daemonGeneration: connectionGeneration,
+            message: parsed.value,
+          }).catch(() => false);
+        }
+        return;
+      }
+
+      // A shell may only report fail-closed recovery state in this direction.
+      // Launch is Server→node only; malformed/reversed frames are consumed and
+      // never reach browsers or the generic CONTROLLED-node allowlist.
+      if (msg.type === REMOTE_DESKTOP_SHELL_MSG.LAUNCH
+        || msg.type === REMOTE_DESKTOP_SHELL_MSG.RECOVERY_REQUIRED) {
+        if (msg.type === REMOTE_DESKTOP_SHELL_MSG.RECOVERY_REQUIRED) {
+          await this.handleRemoteDesktopShellRecoveryRequired(msg, connectionGeneration);
+        } else {
+          WsBridge.invalidRemoteDesktopShellFramesDropped += 1;
+        }
+        return;
+      }
+
+      // Privacy ACK is a Server-only control response. Consume the entire
+      // exact type before the ordinary remote-desktop namespace/CONTROLLED
+      // allowlist so malformed or stale acknowledgements cannot fall through
+      // to browser relay.
+      if (typeof msg.type === 'string' && msg.type.startsWith('management_privacy.')) {
+        if (msg.type === REMOTE_DESKTOP_PRIVACY_MSG.ACK) {
+          await this.handleRemoteDesktopManagementPrivacyAck(msg, connectionGeneration);
+        } else {
+          WsBridge.invalidRemoteDesktopPrivacyFramesDropped += 1;
+        }
         return;
       }
 
@@ -2976,17 +6263,62 @@ export class WsBridge {
       // admitted through its exact validator/session/generation registry before
       // the legacy allowlist. The router consumes the entire namespace, including
       // malformed frames, so none can fall through to generic browser relay.
+      // A daemon's reports on installs on its own computer share the namespace
+      // with signalling but are not signalling: the router below dropped them,
+      // so an install's progress and outcome never reached the browser that
+      // asked for it. Validated, then relayed to this daemon's browsers.
+      if (this.daemonNodeRole !== NODE_ROLE.CONTROLLED) {
+        const installState = validateRemoteDesktopInstallStateMessage(msg)
+          ?? validateRemoteDesktopLoginScreenStateMessage(msg);
+        if (installState) {
+          this.broadcastToBrowsers(JSON.stringify(installState));
+          return;
+        }
+      }
       if (this.remoteDesktopRouter.handleDaemon(msg, connectionGeneration)) {
         return;
       }
 
       // 10.2 — a CONTROLLED node's WS is a strict allowlist surface: it may ONLY
-      // deliver validated remote-desktop signaling, exec/file results, and heartbeats. Every other inbound frame is dropped
+      // deliver validated remote-desktop signaling, bounded session-readiness
+      // metadata, exec/file results, and heartbeats. Every other inbound frame is dropped
       // here BEFORE it can reach `relayToBrowsers` or the push dispatch below, so a
       // compromised controlled node cannot inject browser timeline messages or
       // trigger APNs/FCM. Client-declared role is irrelevant — `daemonNodeRole` is
       // DB-authoritative (set during auth).
       if (this.daemonNodeRole === NODE_ROLE.CONTROLLED) {
+        // Session readiness is a narrow, non-relayed control-plane surface.
+        // It establishes the authoritative idle/busy fence for upgrades while
+        // keeping controlled-node content and notifications fail-closed.
+        if (msg.type === 'session_list') {
+          if (!Array.isArray(msg.sessions)) {
+            WsBridge.controlledInboundDropped++;
+            return;
+          }
+          this.replaceActiveMainSessions(msg.sessions);
+          return;
+        }
+        if (msg.type === 'session.idle') {
+          const sessionName = typeof msg.session === 'string' ? msg.session : null;
+          if (!sessionName) {
+            WsBridge.controlledInboundDropped++;
+            return;
+          }
+          this.updateAuthoritativeSessionState(sessionName, 'idle');
+          return;
+        }
+        if (msg.type === TIMELINE_MESSAGES.EVENT) {
+          const event = msg.event as Record<string, unknown> | undefined;
+          const payload = event?.payload as Record<string, unknown> | undefined;
+          const sessionId = typeof event?.sessionId === 'string' ? event.sessionId : null;
+          const state = typeof payload?.state === 'string' ? payload.state : null;
+          if (!sessionId || event?.type !== 'session.state' || !state) {
+            WsBridge.controlledInboundDropped++;
+            return;
+          }
+          this.updateAuthoritativeSessionState(sessionId, state);
+          return;
+        }
         if (msg.type === DAEMON_MSG.UPGRADE_BLOCKED) {
           const blocked = validateControlledNodeUpgradeBlockedMessage(msg);
           if (!blocked.ok) {
@@ -2997,6 +6329,28 @@ export class WsBridge {
             blocked.value,
             ws,
           );
+          return;
+        }
+        if (msg.type === DAEMON_MSG.UPGRADING) {
+          const targetVersion = typeof msg.targetVersion === 'string' ? msg.targetVersion : null;
+          if (!targetVersion) {
+            WsBridge.controlledInboundDropped++;
+            return;
+          }
+          this.setAutoUpgradeState(
+            CONTROLLED_NODE_UPGRADE_STATUS.UPGRADING,
+            targetVersion,
+            null,
+          );
+          return;
+        }
+        if (msg.type === DAEMON_MSG.CONTROLLED_NODE_WORKER_REFRESH_STATUS) {
+          const status = validateControlledNodeWorkerRefreshStatusMessage(msg);
+          if (!status.ok) {
+            WsBridge.controlledInboundDropped++;
+            return;
+          }
+          this.setControlledNodeWorkerRefreshStatus(status.value);
           return;
         }
         if (msg.type === DAEMON_MSG.MACHINE_EXEC_CHUNK) {
@@ -3026,6 +6380,29 @@ export class WsBridge {
             || !resolvePendingAutoUnlock(this.serverId, this.daemonGeneration, result)) {
             WsBridge.controlledInboundDropped++;
           }
+          return;
+        }
+        if (msg.type === DAEMON_MSG.CONTROLLED_NODE_LOCAL_DAEMONS) {
+          // The daemons bound on this node's computer. Only their ids arrive,
+          // and the link is decided against the DB: a node can only ever be
+          // joined to a daemon of its own owner, so a forged report can at most
+          // mislink that owner's own button.
+          const report = validateControlledNodeLocalDaemonsMessage(msg);
+          const db = this.db;
+          if (!report || !db) {
+            WsBridge.controlledInboundDropped++;
+            return;
+          }
+          void autoLinkControlledNodeHost(db, {
+            nodeServerId: this.serverId,
+            reportedServerIds: report.serverIds,
+          }).then((outcome) => {
+            if (outcome === CONTROLLED_NODE_HOST_AUTO_LINK_OUTCOME.LINKED) {
+              logger.info({ serverId: this.serverId }, 'controlled node linked to the daemon on its computer');
+            }
+          }).catch((err) => {
+            logger.warn({ err, serverId: this.serverId }, 'controlled node host auto-link failed');
+          });
           return;
         }
         if (msg.type === MACHINE_DIRECT_FILE_TRANSFER_MSG.DONE || msg.type === MACHINE_DIRECT_FILE_TRANSFER_MSG.ERROR) {
@@ -3059,15 +6436,23 @@ export class WsBridge {
           return;
         }
         if (msg.type === 'heartbeat') {
-          const hbVersion = typeof msg.daemonVersion === 'string' ? msg.daemonVersion : this.daemonVersion;
-          if (typeof hbVersion === 'string') this.daemonVersion = hbVersion;
-          updateServerHeartbeat(db, this.serverId, hbVersion).catch((err) =>
-            logger.error({ err }, 'Failed to update heartbeat'),
-          );
-          try { ws.send(JSON.stringify({ type: 'heartbeat_ack' })); } catch { /* ignore */ }
+          this.acknowledgeControlledNodeHeartbeat(msg, ws, db, connectionGeneration);
           return;
         }
         WsBridge.controlledInboundDropped++;
+        return;
+      }
+
+      // Preserve the synchronous ordering of every established daemon message
+      // family (notably preview RESPONSE_START followed immediately by binary
+      // body frames). Only capability frames may cross this async DB boundary;
+      // unknown capability frames are default-denied rather than broadcast.
+      if (typeof msg.type === 'string' && msg.type.startsWith('capability.')) {
+        const handled = this.capabilityInbound
+          .catch(() => undefined)
+          .then(() => this.handleCapabilityDaemonMessage(msg, db, ws, connectionGeneration));
+        this.capabilityInbound = handled;
+        await handled;
         return;
       }
 
@@ -3126,7 +6511,10 @@ export class WsBridge {
           logger.error({ err }, 'Failed to update heartbeat'),
         );
         // Ack heartbeat so daemon watchdog doesn't consider the connection dead
-        try { ws.send(JSON.stringify({ type: 'heartbeat_ack' })); } catch { /* ignore */ }
+        try { ws.send(JSON.stringify(heartbeatAckWithClock(msg))); } catch { /* ignore */ }
+        void this.refreshCapabilitySyncOnHeartbeat(db, ws, connectionGeneration).catch((error: unknown) => {
+          logger.warn({ error, serverId: this.serverId }, 'Capability heartbeat sync refresh failed');
+        });
       }
 
       this.relayToBrowsers(msg);
@@ -3183,6 +6571,7 @@ export class WsBridge {
 
     ws.on('close', () => {
       if (this.daemonWs === ws) {
+        const disconnectedOwnerUserId = this.daemonOwnerUserId;
         this.daemonWs = null;
         this.authenticated = false;
         // Audit fix (78-server reconnect-storm) — drop the auth promise
@@ -3191,6 +6580,7 @@ export class WsBridge {
         // closed, the awaiting handlers will fall through and observe
         // `this.daemonWs !== ws` and bail out.
         this.authPromise = null;
+        this.credentialPromise = null;
         this.upgradeBlockedSyncRequiredGeneration = null;
         this.upgradeBlockedSyncCompleteGeneration = null;
         this.recentTextBySession.clear();
@@ -3198,6 +6588,7 @@ export class WsBridge {
         this.activeMainSessions.clear();
         this.activeSubSessions.clear();
         this.hasActiveMainSessionSnapshot = false;
+        this.clearAutoUpgradeRetryTimer();
         this.rejectAllPendingFileTransfers('daemon_disconnected');
         this.rejectAllPendingMemorySourcesRequests('daemon_disconnected');
         this.rejectAllPendingHttpTimelineRequests('daemon_disconnected');
@@ -3213,9 +6604,18 @@ export class WsBridge {
         this.daemonP2pWorkflowCapabilities = null;
         this.controlledNodeCapabilities.clear();
         this.daemonControlledOs = null;
+        this.daemonControlledNodeId = null;
         this.daemonOwnerUserId = null;
+        if (disconnectedOwnerUserId) {
+          this.failDisconnectedCapabilityOperations(db, disconnectedOwnerUserId);
+        }
         this.resetLegacyUpgradeRescueForGeneration(this.daemonGeneration);
-        this.remoteDesktopRouter.stopAll(REMOTE_DESKTOP_TERMINAL_REASON.DAEMON_REPLACED);
+        void remoteDesktopConsentCancellation.daemonDisconnected(
+          db,
+          this.serverId,
+          connectionGeneration,
+        ).catch(() => {});
+        this.remoteDesktopRouter.suspendDaemonGeneration(connectionGeneration);
         this.openspecAutoDeliverProjectionCache.clearActive();
         this.broadcastToBrowsers(JSON.stringify({ type: DAEMON_MSG.DISCONNECTED }));
         void clearProviderStatus(db, this.serverId).catch(() => {});
@@ -3264,14 +6664,21 @@ export class WsBridge {
       isMobile?: boolean;
     },
   ): void {
+    const effectiveTarget = options.snapshot.serverParticipantAuthority === true
+      ? { kind: 'server' as const, serverId: options.target.serverId }
+      : options.target;
+    const coveredSessionNames = this.baseCoveredSessionNames(effectiveTarget);
+    const coveredProjectDirs = this.baseCoveredProjectDirs(effectiveTarget, coveredSessionNames);
     this.browserShareStates.set(ws, {
       userId,
       actorDisplayName: userId,
       ticketId: options.ticketId,
-      target: options.target,
+      target: effectiveTarget,
+      requestedTarget: options.target,
       snapshot: options.snapshot,
       connectedAt: shareClockNow(),
-      coveredSessionNames: this.baseCoveredSessionNames(options.target),
+      coveredSessionNames,
+      coveredProjectDirs,
     });
     this.handleBrowserConnection(ws, userId, db, options.isMobile ?? false);
     void this.refreshShareActorDisplayName(ws);
@@ -3308,7 +6715,22 @@ export class WsBridge {
     }
   }
 
+  /** Distributed authority is unavailable/stopped: fence controlled reads synchronously; FULL paths are untouched. */
+  failClosedMachineGroupAccess(): void {
+    this.controlledBrowserReads.invalidateAll();
+    if (this.daemonNodeRole === NODE_ROLE.CONTROLLED) {
+      this.remoteDesktopRouter.stopAll(REMOTE_DESKTOP_TERMINAL_REASON.AUTHORITY_REVOKED);
+    }
+  }
+
+  /** A node's group association changed: revoke lost reads immediately, preserving other live coverage. */
+  async revalidateMachineGroupAccess(): Promise<void> {
+    await Promise.all([this.controlledBrowserReads.revalidate(), this.remoteDesktopRouter.revalidateUser()]);
+  }
+
   async revalidateShareSocketsForUser(userId: string): Promise<void> {
+    // Synchronous, before any await: from here no socket's cached coverage serves a command.
+    this.shareCoverageEpoch += 1;
     // Controlled-node desktop sessions use the same server_shares grant but are
     // not ordinary shared-tab sockets. Revalidate them independently so a
     // Viewer downgrade/revoke ends only that user's peers immediately.
@@ -3318,6 +6740,7 @@ export class WsBridge {
       .map(([ws]) => ws);
     await Promise.all([
       remoteDesktopRevalidation,
+      this.controlledBrowserReads.revalidate(userId),
       ...sockets.map((ws) => this.revalidateShareSocket(ws)),
     ]);
   }
@@ -3336,7 +6759,106 @@ export class WsBridge {
     this.remoteDesktopRouter.stopAll(reason);
   }
 
+  /**
+   * Anonymous remote-desktop signaling socket. It has no browser/session
+   * subscriptions and cannot reach any ordinary bridge command. The sole
+   * bounded first frame is the shared bootstrap proof, or an exact route-
+   * scoped RESUME after a transient socket loss; only after either authority
+   * check can standard remote-desktop signaling enter the Router.
+   */
+  handleGuestRemoteDesktopConnection(ws: WebSocket, db: Database, clientIp = '0.0.0.0'): void {
+    this.db = db;
+    let state: 'quarantined' | 'verifying' | 'admitted' | 'closed' = 'quarantined';
+    let receivedFirstFrame = false;
+    let inbound = Promise.resolve();
+    let quarantineTimer: ReturnType<typeof setTimeout> | null = null;
+    const closeUniformly = () => {
+      if (state === 'closed') return;
+      state = 'closed';
+      if (quarantineTimer) clearTimeout(quarantineTimer);
+      quarantineTimer = null;
+      this.remoteDesktopRouter.dropSocket(ws);
+      try { ws.close(1008, 'unavailable'); } catch { /* socket already gone */ }
+    };
+    quarantineTimer = setTimeout(
+      closeUniformly,
+      REMOTE_DESKTOP_LINK_LIMITS.BOOTSTRAP_TTL_MS,
+    );
+    quarantineTimer.unref?.();
+    const handleMessage = async (data: RawData) => {
+      const raw = (data as Buffer).toString();
+      if (state === 'closed') return;
+      if (state === 'quarantined') {
+        if (Buffer.byteLength(raw, 'utf8') > 1024) {
+          closeUniformly();
+          return;
+        }
+        let value: unknown;
+        try { value = JSON.parse(raw); } catch { closeUniformly(); return; }
+        const resume = validateRemoteDesktopBrowserMessage(value);
+        if (resume.ok && resume.value.type === REMOTE_DESKTOP_MSG.RESUME) {
+          state = 'verifying';
+          const resumed = await this.remoteDesktopRouter.resumeGuestBrowser(ws, resume.value);
+          if (!resumed || (state as string) === 'closed') {
+            closeUniformly();
+            return;
+          }
+          state = 'admitted';
+          if (quarantineTimer) clearTimeout(quarantineTimer);
+          quarantineTimer = null;
+          return;
+        }
+        const proof = validateRemoteDesktopBootstrapProof(value);
+        if (!proof.ok) { closeUniformly(); return; }
+        state = 'verifying';
+        const admitted = await this.remoteDesktopRouter.redeemGuestBootstrap(ws, proof.value, clientIp);
+        if (!admitted || (state as string) === 'closed') {
+          this.remoteDesktopRouter.dropSocket(ws);
+          closeUniformly();
+          return;
+        }
+        state = 'admitted';
+        if (quarantineTimer) clearTimeout(quarantineTimer);
+        quarantineTimer = null;
+        if (!safeSend(ws, JSON.stringify({ type: REMOTE_DESKTOP_MSG.BOOTSTRAP_REDEEMED }))) {
+          closeUniformly();
+        }
+        return;
+      }
+      if (state !== 'admitted' || Buffer.byteLength(raw, 'utf8') > SERVER_WS_MAX_PAYLOAD_BYTES) {
+        closeUniformly();
+        return;
+      }
+      let message: unknown;
+      try { message = JSON.parse(raw); } catch { closeUniformly(); return; }
+      const handled = await this.remoteDesktopRouter.handleGuestBrowser(ws, message);
+      if (!handled) closeUniformly();
+    };
+    ws.on('message', (data) => {
+      // The bootstrap proof is the sole frame permitted before atomic
+      // redemption. Record first-frame receipt synchronously: a same-tick
+      // second frame must close even before the async verifier advances state.
+      if (!receivedFirstFrame) {
+        receivedFirstFrame = true;
+      } else if (state !== 'admitted') {
+        closeUniformly();
+        return;
+      }
+      // Once admitted, preserve signaling order across async Router handlers.
+      inbound = inbound.then(() => handleMessage(data)).catch(closeUniformly);
+    });
+    ws.once('close', () => {
+      state = 'closed';
+      if (quarantineTimer) clearTimeout(quarantineTimer);
+      quarantineTimer = null;
+      this.remoteDesktopRouter.dropSocket(ws);
+    });
+    ws.once('error', closeUniformly);
+  }
+
   async revalidateShareSocketsForTarget(target: ShareTarget): Promise<void> {
+    // Synchronous, before any await: from here no socket's cached coverage serves a command.
+    this.shareCoverageEpoch += 1;
     const sockets = [...this.browserShareStates]
       .filter(([, state]) => (
         state.target.serverId === target.serverId
@@ -3357,19 +6879,32 @@ export class WsBridge {
     if (isMobile) this.mobileSockets.add(ws);
     this.browserSubscriptions.set(ws, new Map());
     this.transportSubscriptions.set(ws, new Set());
+    this.timelineSubscriptions.set(ws, new Map());
     this.browserUserIds.set(ws, userId);
-    if (controlledTarget) this.controlledTargetBrowserSockets.add(ws);
+    if (controlledTarget) {
+      this.controlledTargetBrowserSockets.add(ws);
+      this.controlledBrowserReads.register(ws, userId);
+      void this.controlledBrowserReads.revalidate(userId);
+    }
+    const sendInitial = (json: string) => controlledTarget ? this.controlledBrowserReads.send(ws, json) : safeSend(ws, json);
     const shareState = this.browserShareStates.get(ws);
 
     // Push cached provider statuses so the browser has them immediately — no WS race.
     if (!shareState) {
       for (const [providerId, connected] of this.providerStatus) {
-        safeSend(ws, JSON.stringify({ type: TRANSPORT_MSG.PROVIDER_STATUS, providerId, connected }));
+        sendInitial(JSON.stringify({ type: TRANSPORT_MSG.PROVIDER_STATUS, providerId, connected }));
       }
       // Push cached remote sessions for each connected provider
       for (const [providerId, sessions] of this.providerRemoteSessions) {
-        safeSend(ws, JSON.stringify({ type: TRANSPORT_MSG.SESSIONS_RESPONSE, providerId, sessions }));
+        sendInitial(JSON.stringify({ type: TRANSPORT_MSG.SESSIONS_RESPONSE, providerId, sessions }));
       }
+    }
+    // Worker refresh status is durable per controlled node. Replay the latest
+    // validated snapshot to browsers that connect after the daemon emitted it,
+    // just like the cached capability snapshot below; otherwise a reconnecting
+    // UI would regress to the stale worker version until the next refresh.
+    if (this.controlledNodeWorkerRefreshStatus) {
+      sendInitial(JSON.stringify(this.controlledNodeWorkerRefreshStatus));
     }
     /*
      * R3 v2 PR-σ — Replay the cached `daemon.hello` to newly-connected
@@ -3383,9 +6918,20 @@ export class WsBridge {
      * here gives every newly-connected browser the same starting
      * capability picture as one that was open during the original
      * hello broadcast.
+     *
+     * A participant share connection needs this exactly as much as the
+     * owner: `capabilities` also carries file.transfer.direct.lease.v2,
+     * which a participant's own file upload/download and the "WebRTC
+     * runtime" diagnostic both gate on. Excluding every share connection
+     * here (originally meant to withhold owner-only P2P *workflow launch*
+     * state, not general daemon capability) left a participant who joined
+     * after the original hello permanently without a capability snapshot
+     * — direct transfer never even attempted, and the diagnostic panel
+     * stuck on "unavailable" with nothing left to ever correct it. A
+     * read-only viewer still doesn't need it.
      */
-    if (!shareState && this.daemonP2pWorkflowCapabilities) {
-      safeSend(ws, JSON.stringify({
+    if ((!shareState || shareState.snapshot.effectiveRole === 'participant') && this.daemonP2pWorkflowCapabilities) {
+      sendInitial(JSON.stringify({
         type: P2P_WORKFLOW_MSG.DAEMON_HELLO,
         daemonId: this.daemonP2pWorkflowCapabilities.daemonId,
         capabilities: this.daemonP2pWorkflowCapabilities.capabilities,
@@ -3401,7 +6947,7 @@ export class WsBridge {
       }));
     }
 
-    ws.on('message', async (data) => {
+    const processBrowserMessage = async (data: unknown): Promise<void> => {
       let raw = (data as Buffer).toString();
       if (Buffer.byteLength(raw, 'utf8') > MAX_BROWSER_PAYLOAD) {
         logger.warn({ serverId: this.serverId }, 'Browser message too large — dropped');
@@ -3458,7 +7004,23 @@ export class WsBridge {
         return;
       }
 
-      if (this.browserShareStates.has(ws)) {
+      // Test-only observability for the real-browser performance harness. It
+      // is disabled unless explicitly enabled in the compose environment and
+      // exposes counters plus live per-socket queue/buffer state without
+      // routing through the daemon or delaying any control frame.
+      if (msg.type === 'perf.debug.timeline_metrics' && process.env.IMCODES_PERF_DEBUG === '1') {
+        const sockets = [...this.browserSockets].map((socket, index) => ({
+          index,
+          bufferedAmount: typeof socket.bufferedAmount === 'number' ? socket.bufferedAmount : 0,
+          queue: this.timelineQueues.get(socket)?.snapshot() ?? { bytes: 0, pending: 0, sending: false },
+          subscriptions: [...(this.timelineSubscriptions.get(socket)?.entries() ?? [])].map(([sessionName, mode]) => ({ sessionName, mode })),
+        }));
+        safeSend(ws, JSON.stringify({ type: msg.type, requestId: msg.requestId, counters: snapshotCounters(), sockets }));
+        return;
+      }
+
+      const shareState = this.browserShareStates.get(ws);
+      if (shareState) {
         const shareCommandDecision = await this.evaluateShareScopedBrowserCommand(ws, msg);
         if (!shareCommandDecision.allowed) {
           this.rejectShareScopedBrowserCommand(ws, msg, shareCommandDecision.reason);
@@ -3471,7 +7033,7 @@ export class WsBridge {
           msg = shareCommandDecision.stampedMessage;
           raw = JSON.stringify(msg);
         }
-        if (typeof msg.type === 'string' && REPO_REQUEST_TYPES.has(msg.type) && msg.projectDir !== FS_SESSION_ROOT_PATH) {
+        if (shareState.target.kind !== 'server' && typeof msg.type === 'string' && REPO_REQUEST_TYPES.has(msg.type) && msg.projectDir !== FS_SESSION_ROOT_PATH) {
           this.rejectShareScopedBrowserCommand(ws, msg, SHARE_REASONS.DIRECT_SURFACE_DENIED);
           return;
         }
@@ -3481,7 +7043,38 @@ export class WsBridge {
         return;
       }
 
+      // Clamp browser-controlled history page sizes before the daemon or
+      // bridge can retain the request. This applies to every ingress path,
+      // including older clients that still ask for thousands of events.
+      if (msg.type === TIMELINE_MESSAGES.HISTORY_REQUEST || msg.type === TIMELINE_MESSAGES.PAGE_REQUEST) {
+        msg = boundTimelineHistoryRequest(msg);
+        raw = JSON.stringify(msg);
+      }
+
+      if (BROWSER_DATA_READ_TYPES.has(browserMessageType)) {
+        const browserId = this.getBrowserId(ws);
+        if (!this.browserDataReadRateLimiter.check(
+          `data-read:${browserId}`,
+          BROWSER_DATA_READ_RATE_LIMIT,
+          BROWSER_DATA_READ_RATE_WINDOW_MS,
+        )) {
+          incrementCounter('ws_bridge_browser_data_read_rate_limited', { type: browserMessageType });
+          logger.warn({ serverId: this.serverId, type: browserMessageType }, 'Browser data read rate limit exceeded');
+          this.rejectBrowserDataReadOverload(ws, msg);
+          return;
+        }
+      }
+
       if (this.directFileTransferRouter.handleBrowser(ws, userId, msg)) {
+        return;
+      }
+      // Installs on the daemon's own computer share the remote_desktop.*
+      // namespace with signalling but are not signalling: the router below
+      // answered them `invalid_request`, so the install buttons never reached
+      // the daemon. Routed first, and only for the daemon's owner.
+      if (browserMessageType === REMOTE_DESKTOP_INSTALL_MSG.REQUEST
+        || browserMessageType === REMOTE_DESKTOP_LOGIN_SCREEN_MSG.REQUEST) {
+        this.forwardDaemonInstallRequest(userId, raw);
         return;
       }
       // Keep every non-remote browser message on the existing synchronous
@@ -3622,6 +7215,10 @@ export class WsBridge {
         return;
       }
 
+      if (msg.type === SESSION_IDENTITY_WS.RESOLVE_QUERY) {
+        await this.handleSessionIdentityResolveQuery(ws, msg);
+        return;
+      }
       if (msg.type === MEMORY_WS.FEATURES_QUERY) {
         await this.handleMemoryFeaturesQuery(ws, msg);
         return;
@@ -3701,6 +7298,20 @@ export class WsBridge {
         }
       }
 
+      // Explicit per-socket timeline quality. This is intentionally separate
+      // from terminal/chat subscriptions: a companion tab can subscribe to a
+      // session in summary mode without inheriting another socket's stream.
+      if (msg.type === TIMELINE_MESSAGES.SUBSCRIBE && typeof msg.sessionName === 'string') {
+        await this.handleTimelineSubscription(ws, msg);
+        return;
+      }
+      if (msg.type === TIMELINE_MESSAGES.UNSUBSCRIBE && typeof msg.sessionName === 'string') {
+        this.timelineProtocolSockets.add(ws);
+        this.timelineSubscriptions.get(ws)?.delete(msg.sessionName);
+        this.clearTimelineLatestValueFingerprints(ws, msg.sessionName);
+        return;
+      }
+
       // Track terminal subscriptions for binary routing + ref-counted daemon forwarding
       if (msg.type === 'terminal.subscribe' && typeof msg.session === 'string') {
         const sessionName = msg.session;
@@ -3770,11 +7381,18 @@ export class WsBridge {
       //
       // In all cases we record an inflight entry so that the later command.ack
       // (or timeout / disconnect) can correlate back to the right browser.
-      if ((msg.type === 'session.send' || msg.type === DAEMON_COMMAND_TYPES.SESSION_CANCEL) && typeof msg.commandId === 'string') {
+      if ((msg.type === 'session.send'
+        || msg.type === DAEMON_COMMAND_TYPES.SESSION_CANCEL
+        || msg.type === 'session.undo_queued_message'
+        || msg.type === ASK_ANSWER_COMMAND)
+        && typeof msg.commandId === 'string') {
         const sessionName = typeof msg.sessionName === 'string'
           ? msg.sessionName
           : (typeof msg.session === 'string' ? msg.session : '');
         if (sessionName) {
+          // An answer can come from a page that never subscribed to the session
+          // (the question card is app-level): route its ack back to this socket.
+          if (msg.type === ASK_ANSWER_COMMAND) this.commandAckOrigins.record(msg.commandId, ws);
           this.handleOutboundSessionSend(ws, msg.commandId, sessionName, raw);
           return;
         }
@@ -3828,7 +7446,31 @@ export class WsBridge {
         return;
       }
 
+      if (TIMELINE_REQUEST_TYPES.has(browserMessageType) && this.registerTimelineHistoryAlias(msg)) return;
+      // Generic commandId-bearing commands (session.identity.refresh,
+      // session.edit_queued_message, transport-queue append, timeline
+      // message delete, ...) aren't tracked by a more specific mechanism
+      // (inflightCommands / peerAuditRouter above) -- record the origin so
+      // their eventual command.ack can reach this socket even if it never
+      // subscribes to the session.
+      if (typeof msg.commandId === 'string') {
+        this.commandAckOrigins.record(msg.commandId, ws);
+        this.startAckHousekeepingIfNeeded();
+      }
+      if (msg.type === SUPERVISION_TASK_CONSOLE_MSG.SUBSCRIBE || msg.type === SUPERVISION_TASK_CONSOLE_MSG.UNSUBSCRIBE) {
+        this.trackBrowserConsoleSubscription(ws, msg);
+      }
       this.sendToDaemon(raw);
+    };
+    // An owner socket runs each message straight away. A share-scoped socket
+    // is checked against the DB before each command, so its messages go
+    // through per-socket ordered lanes (see scheduleShareBrowserMessage).
+    ws.on('message', (data) => {
+      if (!this.browserShareStates.has(ws)) {
+        void processBrowserMessage(data);
+        return;
+      }
+      this.scheduleShareBrowserMessage(ws, data, processBrowserMessage);
     });
 
     ws.on('close', () => {
@@ -3842,31 +7484,98 @@ export class WsBridge {
     });
   }
 
+  /**
+   * Order a share-scoped socket's commands. Each one awaits a coverage check
+   * (possibly a DB round trip), and unordered awaits let a later keystroke
+   * overtake an earlier one. Messages are therefore chained per socket and per
+   * lane: keyboard input and resize in one lane, every other command in
+   * another, so a slow `session.send` never delays typing and typing never
+   * delays it. Stop, approval answers and pings take no lane at all, so they
+   * are never queued behind anything.
+   */
+  private scheduleShareBrowserMessage(
+    ws: WebSocket,
+    data: unknown,
+    run: (data: unknown) => Promise<void>,
+  ): void {
+    const lane = shareBrowserMessageLane(data);
+    if (lane === SHARE_MESSAGE_LANE.PRIORITY) {
+      void run(data).catch((err) => {
+        logger.warn({ err, serverId: this.serverId }, 'Share priority command failed');
+        this.rejectShareCommandFailure(ws, data);
+      });
+      return;
+    }
+    let lanes = this.shareMessageLanes.get(ws);
+    if (!lanes) {
+      lanes = new Map();
+      this.shareMessageLanes.set(ws, lanes);
+    }
+    const current = lanes.get(lane) ?? { tail: Promise.resolve(), pending: 0 };
+    if (current.pending >= SHARE_MESSAGE_LANE_MAX_PENDING) {
+      incrementCounter('ws_bridge_share_lane_overflow', { lane });
+      logger.warn({ serverId: this.serverId, lane, pending: current.pending }, 'Share command lane overflow — message dropped');
+      this.rejectShareCommandFailure(ws, data, SHARE_REASONS.RATE_LIMITED);
+      return;
+    }
+    current.pending += 1;
+    current.tail = current.tail
+      .then(() => run(data))
+      .catch((err) => {
+        logger.warn({ err, serverId: this.serverId, lane }, 'Share command failed');
+        this.rejectShareCommandFailure(ws, data);
+      })
+      .finally(() => { current.pending -= 1; });
+    lanes.set(lane, current);
+  }
+
+  /**
+   * A share command that could not be processed (the DB was unavailable while its
+   * grant was re-read, the lane was full...) is answered, never just logged: the
+   * participant's browser gets the same `command.failed` / error frame as any other
+   * refusal, so a tap that did nothing says so.
+   */
+  private rejectShareCommandFailure(ws: WebSocket, data: unknown, reason: ShareReason = SHARE_REASONS.TARGET_UNAVAILABLE): void {
+    let msg: Record<string, unknown> | null = null;
+    try {
+      const parsed = JSON.parse((data as Buffer).toString()) as unknown;
+      if (parsed && typeof parsed === 'object') msg = parsed as Record<string, unknown>;
+    } catch { /* not JSON: nothing to answer */ }
+    if (!msg || msg.type === 'ping') return;
+    this.rejectShareScopedBrowserCommand(ws, msg, reason);
+  }
+
   private async evaluateShareScopedBrowserCommand(
     ws: WebSocket,
     msg: Record<string, unknown>,
   ): Promise<ShareCommandDecision> {
     const state = this.browserShareStates.get(ws);
     if (!state) return { allowed: true };
-    const coverage = await this.resolveLiveShareCoverage(state);
-    if (!coverage) {
+    // Commands arrive at keystroke rate, so the grant is not re-read from the
+    // DB for each one: the socket's coverage serves them until it is older than
+    // the TTL or a grant changed (epoch). Anything not fresh is re-resolved
+    // from the DB (single flight), and a failed re-resolution denies.
+    const current = this.shareCoverageIsFresh(state)
+      ? state
+      : await this.refreshShareCoverage(ws, state);
+    if (!current) {
       const decision: ShareCommandDecision = {
         allowed: false,
         reason: this.shareStateLooksExpired(state) ? SHARE_REASONS.EXPIRED : SHARE_REASONS.REVOKED,
         closeSocket: true,
       };
-      await this.auditShareScopedBrowserCommand(state, msg, decision);
+      this.queueShareCommandAudit(state, msg, decision);
       return {
         allowed: false,
         reason: decision.reason,
         closeSocket: true,
       };
     }
-    await this.refreshShareActorDisplayName(ws);
-    const refreshedState = this.browserShareStates.get(ws) ?? state;
-    const current = await this.applyShareCoverage(ws, refreshedState, coverage);
     const sessionName = commandSessionName(msg);
-    const runtimeType = sessionName ? await this.resolveSessionRuntimeType(sessionName) : 'unknown';
+    // Only a cancel depends on the runtime type, so a keystroke never waits on it.
+    const runtimeType = sessionName && msg.type === DAEMON_COMMAND_TYPES.SESSION_CANCEL
+      ? await this.resolveSessionRuntimeType(sessionName)
+      : 'unknown';
     const decision = evaluateShareCommand({
       msg,
       state: current,
@@ -3874,16 +7583,144 @@ export class WsBridge {
       runtimeType,
       activeDispatchId: sessionName ? this.activeDispatchIds.get(sessionName) ?? null : null,
     });
+    if (decision.allowed && sessionName && msg.type === 'session.send' && decision.stampedMessage) {
+      const actor = decision.stampedMessage.sharedActor as SharedActorEnvelope | undefined;
+      const token = actor ? await this.issueShareMachineAuthority(actor, sessionName) : null;
+      if (!token) {
+        const denied: ShareCommandDecision = { allowed: false, reason: SHARE_REASONS.TARGET_UNAVAILABLE };
+        this.queueShareCommandAudit(current, msg, denied);
+        return denied;
+      }
+      decision.stampedMessage = {
+        ...decision.stampedMessage,
+        [SHARED_MACHINE_AUTHORITY_FIELD]: token,
+      };
+    } else if (decision.allowed && sessionName && typeof msg.type === 'string'
+      && SHARE_PROCESS_INPUT_COMMANDS.has(msg.type) && decision.stampedMessage) {
+      // Keystrokes are never refused for want of a token (ESC/Ctrl-C must keep
+      // working); without one the daemon still binds the participant context
+      // with no authority, so machine tools fail closed.
+      const actor = decision.stampedMessage.sharedActor as SharedActorEnvelope | undefined;
+      const token = actor ? await this.shareInputMachineAuthority(ws, actor, sessionName) : null;
+      if (token) {
+        decision.stampedMessage = { ...decision.stampedMessage, [SHARED_MACHINE_AUTHORITY_FIELD]: token };
+      }
+    }
     if (decision.allowed && sessionName) {
       const rateLimitReason = this.evaluateShareScopedRateLimit(current, msg, sessionName, shareClockNow());
       if (rateLimitReason) {
         const rateLimitedDecision: ShareCommandDecision = { allowed: false, reason: rateLimitReason };
-        await this.auditShareScopedBrowserCommand(current, msg, rateLimitedDecision);
+        this.queueShareCommandAudit(current, msg, rateLimitedDecision);
         return rateLimitedDecision;
       }
     }
-    await this.auditShareScopedBrowserCommand(current, msg, decision);
+    this.queueShareCommandAudit(current, msg, decision);
     return decision;
+  }
+
+  private async issueShareMachineAuthority(actor: SharedActorEnvelope, sessionName: string): Promise<string | null> {
+    const signingKey = this.directFileTransferTicketSigningKey;
+    if (!signingKey || !this.db) return null;
+    return issueSharedMachineAuthorityForSession(this.db, {
+      actorUserId: actor.actorUserId,
+      sourceServerId: this.serverId,
+      sessionName,
+      shareTarget: actor.snapshot.target,
+      actionId: actor.actionId,
+      signingKey,
+    });
+  }
+
+  /** Per socket+session token for a participant's keystrokes; see SHARE_INPUT_AUTHORITY_REUSE_MS. */
+  private async shareInputMachineAuthority(
+    ws: WebSocket,
+    actor: SharedActorEnvelope,
+    sessionName: string,
+  ): Promise<string | null> {
+    let perSession = this.shareInputAuthorityTokens.get(ws);
+    if (!perSession) {
+      perSession = new Map();
+      this.shareInputAuthorityTokens.set(ws, perSession);
+    }
+    const cached = perSession.get(sessionName);
+    const now = shareClockNow();
+    // A clock that went backwards never extends the window. A failed mint is
+    // remembered for the window too (token null): a session the server cannot
+    // bind must not turn every keystroke into a DB read.
+    if (cached && now >= cached.at && now - cached.at < SHARE_INPUT_AUTHORITY_REUSE_MS) return cached.token;
+    const inFlight = this.shareInputAuthorityMints.get(ws)?.get(sessionName);
+    if (inFlight) return inFlight;
+    const run = this.issueShareMachineAuthority(actor, sessionName)
+      .catch(() => null)
+      .then((token) => {
+        perSession.set(sessionName, { token, at: shareClockNow() });
+        return token;
+      })
+      .finally(() => {
+        const mints = this.shareInputAuthorityMints.get(ws);
+        mints?.delete(sessionName);
+      });
+    let mints = this.shareInputAuthorityMints.get(ws);
+    if (!mints) {
+      mints = new Map();
+      this.shareInputAuthorityMints.set(ws, mints);
+    }
+    mints.set(sessionName, run);
+    return run;
+  }
+
+  private shareCoverageIsFresh(state: ShareScopedSocketState): boolean {
+    if (state.coverageEpoch !== this.shareCoverageEpoch) return false;
+    const checkedAt = state.coverageCheckedAt;
+    if (checkedAt === undefined) return false;
+    const now = shareClockNow();
+    // A clock that went backwards never extends the window.
+    if (now < checkedAt || now - checkedAt >= SHARE_HOT_PATH_COVERAGE_TTL_MS) return false;
+    // A grant with an expiry stops serving commands at it, whatever the TTL.
+    const expiresAt = state.snapshot.nextCoverageRecheckAt;
+    return !(typeof expiresAt === 'number' && now >= expiresAt);
+  }
+
+  /**
+   * Re-read a share socket's coverage from the DB (one read in flight per socket;
+   * a command that arrives meanwhile waits for it). Resolves to the new state, or
+   * null when the grant is gone, so every failure path denies.
+   */
+  private refreshShareCoverage(ws: WebSocket, state: ShareScopedSocketState): Promise<ShareScopedSocketState | null> {
+    const inFlight = this.shareCoverageRefreshes.get(ws);
+    if (inFlight) return inFlight;
+    const epoch = this.shareCoverageEpoch;
+    const run = (async (): Promise<ShareScopedSocketState | null> => {
+      const coverage = await this.resolveLiveShareCoverage(state);
+      if (!coverage) return null;
+      await this.refreshShareActorDisplayName(ws);
+      const refreshedState = this.browserShareStates.get(ws) ?? state;
+      return this.applyShareCoverage(ws, refreshedState, coverage, epoch);
+    })().finally(() => { this.shareCoverageRefreshes.delete(ws); });
+    this.shareCoverageRefreshes.set(ws, run);
+    return run;
+  }
+
+  /**
+   * Write a share-command audit row without holding the command back. The queue
+   * is bounded: past SHARE_AUDIT_MAX_PENDING waiting writes (a slow or failing
+   * DB) further rows are dropped, counted and logged rather than piling up.
+   * A failed write is logged by auditShareScopedBrowserCommand.
+   */
+  private queueShareCommandAudit(
+    state: ShareScopedSocketState,
+    msg: Record<string, unknown>,
+    decision: ShareCommandDecision,
+  ): void {
+    if (this.pendingShareAudits >= SHARE_AUDIT_MAX_PENDING) {
+      incrementCounter('ws_bridge_share_audit_dropped', { reason: 'queue_full' });
+      logger.warn({ serverId: this.serverId, pending: this.pendingShareAudits }, 'Share command audit queue full — audit row dropped');
+      return;
+    }
+    this.pendingShareAudits += 1;
+    void this.auditShareScopedBrowserCommand(state, msg, decision)
+      .catch((err) => logger.warn({ err, serverId: this.serverId }, 'Share command audit failed'))
+      .finally(() => { this.pendingShareAudits -= 1; });
   }
 
   private async handleShareDiscussionCommentCommand(ws: WebSocket, msg: Record<string, unknown>): Promise<void> {
@@ -4102,7 +7939,12 @@ export class WsBridge {
     const sessionName = commandSessionName(msg);
     const commandId = typeof msg.commandId === 'string' ? msg.commandId.trim() : '';
     if ((msg.type === 'session.send' || msg.type === DAEMON_COMMAND_TYPES.SESSION_CANCEL) && commandId && sessionName) {
-      this.emitCommandFailed(ws, commandId, sessionName, reason);
+      // A cancel refused because the turn changed names the turn that is running now,
+      // so the participant's browser can show it and tap Stop again on the right one.
+      const extra = msg.type === DAEMON_COMMAND_TYPES.SESSION_CANCEL && reason === SHARE_REASONS.DISPATCH_CHANGED
+        ? { activeDispatchId: this.activeDispatchIds.get(sessionName) ?? null }
+        : {};
+      this.emitCommandFailed(ws, commandId, sessionName, reason, extra);
       return;
     }
     if (commandId) {
@@ -4135,7 +7977,7 @@ export class WsBridge {
       db: this.db,
       serverId: this.serverId,
       userId: state.userId,
-      target: state.target,
+      target: state.requestedTarget ?? state.target,
       now: shareClockNow(),
     });
   }
@@ -4144,12 +7986,19 @@ export class WsBridge {
     ws: WebSocket,
     state: ShareScopedSocketState,
     coverage: EffectiveCoverage,
+    epoch: number,
   ): Promise<ShareScopedSocketState> {
+    const effectiveTarget = coverage.serverParticipantAuthority === true
+      ? { kind: 'server' as const, serverId: coverage.target.serverId }
+      : coverage.target;
+    const coveredSessionNames = await this.resolveShareCoveredSessionNames(effectiveTarget);
+    const coveredProjectDirs = await this.resolveShareCoveredProjectDirs(effectiveTarget, coveredSessionNames);
     const next: ShareScopedSocketState = {
       ...state,
-      target: coverage.target,
+      target: effectiveTarget,
       snapshot: coverage,
-      coveredSessionNames: await this.resolveShareCoveredSessionNames(coverage.target),
+      coveredSessionNames,
+      coveredProjectDirs,
     };
     if (state.snapshot.effectiveRole !== coverage.effectiveRole) {
       safeSend(ws, JSON.stringify({
@@ -4160,6 +8009,7 @@ export class WsBridge {
       }));
     }
     next.coverageCheckedAt = shareClockNow();
+    next.coverageEpoch = epoch;
     this.browserShareStates.set(ws, next);
     return next;
   }
@@ -4170,13 +8020,37 @@ export class WsBridge {
     return [`deck_sub_${target.subSessionId}`];
   }
 
+  private baseCoveredProjectDirs(target: ShareTarget, coveredSessionNames?: readonly string[]): string[] | undefined {
+    if (target.kind === 'server') return undefined;
+    const dirs = new Set<string>();
+    const sessionNames = new Set<string>(coveredSessionNames ?? []);
+    if (target.kind === 'main') sessionNames.add(target.sessionName);
+    if (target.kind === 'subsession') sessionNames.add(`deck_sub_${target.subSessionId}`);
+
+    for (const name of sessionNames) {
+      const active = this.activeMainSessions.get(name);
+      if (active?.projectDir) {
+        dirs.add(active.projectDir);
+      }
+      const activeSub = this.activeSubSessions.get(name);
+      if (activeSub?.parentSession) {
+        const parentActive = this.activeMainSessions.get(activeSub.parentSession);
+        if (parentActive?.projectDir) {
+          dirs.add(parentActive.projectDir);
+        }
+      }
+    }
+    return dirs.size > 0 ? Array.from(dirs) : undefined;
+  }
+
   private async refreshShareCoveredSessions(ws: WebSocket): Promise<void> {
     const state = this.browserShareStates.get(ws);
     if (!state) return;
     const coveredSessionNames = await this.resolveShareCoveredSessionNames(state.target);
+    const coveredProjectDirs = await this.resolveShareCoveredProjectDirs(state.target, coveredSessionNames);
     const current = this.browserShareStates.get(ws);
     if (!current || current.ticketId !== state.ticketId) return;
-    this.browserShareStates.set(ws, { ...current, coveredSessionNames });
+    this.browserShareStates.set(ws, { ...current, coveredSessionNames, coveredProjectDirs });
   }
 
   private async refreshShareActorDisplayName(ws: WebSocket): Promise<void> {
@@ -4206,6 +8080,55 @@ export class WsBridge {
     return this.baseCoveredSessionNames(target);
   }
 
+  private async resolveShareCoveredProjectDirs(target: ShareTarget, coveredSessionNames?: readonly string[]): Promise<string[] | undefined> {
+    const base = this.baseCoveredProjectDirs(target, coveredSessionNames);
+    if (target.kind === 'server') return undefined;
+    if (!this.db) return base;
+    try {
+      const dirs = new Set<string>(base ?? []);
+      const sessionNames = Array.from(new Set([
+        ...(coveredSessionNames ?? []),
+        ...(target.kind === 'main' ? [target.sessionName] : []),
+      ]));
+      if (sessionNames.length > 0) {
+        const rows = await this.db.query<{ project_dir: string }>(
+          `SELECT DISTINCT project_dir FROM sessions WHERE server_id = $1 AND name = ANY($2) AND project_dir != ''`,
+          [this.serverId, sessionNames],
+        );
+        for (const row of rows) {
+          if (row.project_dir) dirs.add(row.project_dir);
+        }
+        const subSessionIds = sessionNames
+          .map((name) => rawSubSessionIdFromDisplayName(name))
+          .filter((id): id is string => typeof id === 'string');
+        if (subSessionIds.length > 0) {
+          const subRows = await this.db.query<{ cwd: string | null }>(
+            `SELECT DISTINCT cwd FROM sub_sessions WHERE server_id = $1 AND id = ANY($2) AND cwd IS NOT NULL AND cwd != ''`,
+            [this.serverId, subSessionIds],
+          );
+          for (const row of subRows) {
+            if (row.cwd) dirs.add(row.cwd);
+          }
+        }
+      }
+      return dirs.size > 0 ? Array.from(dirs) : undefined;
+    } catch (err) {
+      logger.warn({ err, serverId: this.serverId, target }, 'Failed to resolve covered project dirs');
+      return base;
+    }
+  }
+
+  private syncCoveredProjectDirsAcrossShareSockets(): void {
+    for (const [ws, state] of this.browserShareStates.entries()) {
+      if (state.target.kind === 'server') continue;
+      const baseDirs = this.baseCoveredProjectDirs(state.target, state.coveredSessionNames);
+      if (baseDirs && baseDirs.length > 0) {
+        const merged = Array.from(new Set([...(state.coveredProjectDirs ?? []), ...baseDirs]));
+        this.browserShareStates.set(ws, { ...state, coveredProjectDirs: merged });
+      }
+    }
+  }
+
   private shareStateLooksExpired(state: ShareScopedSocketState): boolean {
     const next = state.snapshot.nextCoverageRecheckAt;
     return typeof next === 'number' && shareClockNow() >= next;
@@ -4220,6 +8143,7 @@ export class WsBridge {
     // let the staleness bound in sweepShareSockets retry within a minute,
     // rather than leaving the socket un-revalidated with no second chance.
     let coverage: EffectiveCoverage | null;
+    const epoch = this.shareCoverageEpoch;
     try {
       coverage = await this.resolveLiveShareCoverage(state);
     } catch (err) {
@@ -4230,7 +8154,7 @@ export class WsBridge {
       this.teardownShareSocket(ws, this.shareStateLooksExpired(state) ? SHARE_REASONS.EXPIRED : SHARE_REASONS.REVOKED);
       return;
     }
-    await this.applyShareCoverage(ws, state, coverage);
+    await this.applyShareCoverage(ws, state, coverage, epoch);
   }
 
   private async sweepShareSockets(): Promise<void> {
@@ -4249,7 +8173,7 @@ export class WsBridge {
       const lastCheckedAt = state.coverageCheckedAt ?? state.connectedAt;
       return now - lastCheckedAt >= SHARE_COVERAGE_MAX_STALENESS_MS;
     });
-    await Promise.all(candidates.map(([ws]) => this.revalidateShareSocket(ws)));
+    await Promise.all([this.controlledBrowserReads.revalidate(), ...candidates.map(([ws]) => this.revalidateShareSocket(ws))]);
   }
 
   private teardownShareSocket(ws: WebSocket, reason: ShareReason): void {
@@ -4298,11 +8222,84 @@ export class WsBridge {
     }
     if (msg.type === 'chat.status' && msg.status === 'idle') {
       this.activeDispatchIds.delete(sessionId);
+      this.scheduleAutoUpgradeFlushAtIdleBoundary();
       return;
     }
     if (msg.type === 'chat.complete' || msg.type === 'chat.error') {
       this.activeDispatchIds.delete(sessionId);
+      this.scheduleAutoUpgradeFlushAtIdleBoundary();
     }
+  }
+
+  private updateAuthoritativeSessionState(sessionName: string, state: string): void {
+    const main = this.activeMainSessions.get(sessionName);
+    if (main) this.activeMainSessions.set(sessionName, { ...main, state });
+    const sub = this.activeSubSessions.get(sessionName);
+    if (sub) this.activeSubSessions.set(sessionName, { ...sub, state });
+    if (state === 'idle' || state === 'stopped') this.activeDispatchIds.delete(sessionName);
+    this.scheduleAutoUpgradeFlushAtIdleBoundary();
+  }
+
+  private hasAuthoritativeBusySession(): boolean {
+    if (this.activeDispatchIds.size > 0) return true;
+    for (const session of this.activeMainSessions.values()) {
+      if (session.state !== 'idle' && session.state !== 'stopped') return true;
+    }
+    for (const session of this.activeSubSessions.values()) {
+      if (session.state !== undefined && session.state !== 'idle' && session.state !== 'stopped') return true;
+    }
+    return false;
+  }
+
+  /**
+   * Next safe edge for a deferred upgrade.
+   *
+   * CONTROLLED node: a live authenticated socket is necessary but not
+   * sufficient; an active dispatch must reach its idle/terminal edge first, so
+   * the request that was deferred while busy is flushed at that edge.
+   *
+   * FULL daemon: the daemon owns the idle decision (its own busy gates). This
+   * edge is only a TRIGGER: it is armed solely after the daemon answered a
+   * delivered command with a retryable block receipt (status DEFERRED), it
+   * never sends without such a receipt, it waits for the server's own view of
+   * the sessions to be quiet purely to avoid a pointless round trip, and it is
+   * spaced by DAEMON_UPGRADE_IDLE_EDGE_MIN_INTERVAL_MS. The daemon then decides
+   * again; a still-busy daemon simply answers another block receipt.
+   */
+  private scheduleAutoUpgradeFlushAtIdleBoundary(): void {
+    if (!this.authenticated || !this.daemonWs) return;
+    if (this.daemonNodeRole === NODE_ROLE.FULL) {
+      if (this.autoUpgradeStatus !== CONTROLLED_NODE_UPGRADE_STATUS.DEFERRED
+        || !this.autoUpgradeReason
+        || !isRetryableDaemonUpgradeBlockReason(this.autoUpgradeReason)
+        // A settle/recovery hold ends by the daemon's clock, not at an idle edge: its own timer asks again.
+        || isTimeGatedDaemonUpgradeReason(this.autoUpgradeReason)
+        || this.hasAuthoritativeBusySession()) return;
+      const last = this.autoUpgradeLastAttemptAt;
+      if (last !== null && Date.now() - last < DAEMON_UPGRADE_IDLE_EDGE_MIN_INTERVAL_MS) return;
+      const fullWs = this.daemonWs;
+      const fullGeneration = this.daemonGeneration;
+      setImmediate(() => {
+        if (this.daemonWs !== fullWs
+          || this.daemonGeneration !== fullGeneration
+          || !this.authenticated
+          || this.autoUpgradeStatus !== CONTROLLED_NODE_UPGRADE_STATUS.DEFERRED
+          || this.hasAuthoritativeBusySession()) return;
+        this.maybeAutoUpgradeDaemon();
+        this.flushPendingDaemonUpgrade(fullWs);
+      });
+      return;
+    }
+    if (this.daemonNodeRole !== NODE_ROLE.CONTROLLED || this.activeDispatchIds.size > 0) return;
+    const ws = this.daemonWs;
+    const generation = this.daemonGeneration;
+    setImmediate(() => {
+      if (this.daemonWs !== ws
+        || this.daemonGeneration !== generation
+        || !this.authenticated
+        || this.activeDispatchIds.size > 0) return;
+      this.flushPendingDaemonUpgrade(ws);
+    });
   }
 
   private firstStringField(msg: Record<string, unknown>, keys: string[]): string | null {
@@ -4338,6 +8335,7 @@ export class WsBridge {
       sendError('forbidden');
       return;
     }
+    const shareState = this.browserShareStates.get(ws);
 
     const role = await resolveServerRole(db, this.serverId, userId);
     if (role !== 'owner' && role !== 'admin') {
@@ -4383,6 +8381,13 @@ export class WsBridge {
         serverId: this.serverId,
         ...(operationId ? { operationId } : {}),
         ...(idempotencyKey ? { idempotencyKey } : {}),
+        ...(shareState ? {
+          sharedActor: buildSharedActorEnvelope(
+            shareState,
+            idempotencyKey || operationId || `share-action-${shareClockNow()}`,
+            shareClockNow(),
+          ),
+        } : {}),
       }));
       return;
     }
@@ -4430,6 +8435,9 @@ export class WsBridge {
       serverId: this.serverId,
       sourceMainSessionName,
       idempotencyKey,
+      ...(shareState ? {
+        sharedActor: buildSharedActorEnvelope(shareState, idempotencyKey, shareClockNow()),
+      } : {}),
     };
     if (targetProjectName.value !== undefined) payload.targetProjectName = targetProjectName.value;
     if (cwdOverride.value !== undefined) payload.cwdOverride = cwdOverride.value;
@@ -4960,6 +8968,38 @@ export class WsBridge {
       return;
     }
 
+    // ── PROJECT/SESSION identity: daemon is the sole content owner ────────
+    if (type === SESSION_IDENTITY_WS.LOCAL_RESPONSE) {
+      const requestId = typeof msg.requestId === 'string' ? msg.requestId : undefined;
+      if (requestId) this.resolveSessionIdentityLocal(requestId, msg);
+      return;
+    }
+    if (type === SESSION_IDENTITY_WS.MIGRATE_REQUEST) {
+      void this.handleSessionIdentityMigrateRequest(msg);
+      return;
+    }
+    if (type === SESSION_IDENTITY_WS.MIGRATE_CONFIRM) {
+      void this.handleSessionIdentityMigrateConfirm(msg);
+      return;
+    }
+    if (type === SESSION_IDENTITY_WS.LOCAL_REPORT) {
+      void this.handleSessionIdentityLocalReport(msg);
+      return;
+    }
+    if (type === SESSION_IDENTITY_WS.USER_REPORT) {
+      void this.handleSessionIdentityUserReport(msg);
+      return;
+    }
+
+    // Agent-configuration replies go to the waiting owner-only route only,
+    // never to browsers.
+    if (type === AGENT_SKILLS_MSG.LIST_RESPONSE || type === AGENT_SKILLS_MSG.RUN_RESPONSE
+      || type === AGENT_MCP_MSG.LIST_RESPONSE || type === AGENT_MCP_MSG.RUN_RESPONSE) {
+      const requestId = typeof msg.requestId === 'string' ? msg.requestId : undefined;
+      if (requestId) this.machineConfigRequests.resolve(requestId, msg);
+      return;
+    }
+
     // ── Terminal diff: session-scoped ─────────────────────────────────────────
     if (type === 'terminal_update') {
       const sessionName = (msg.diff as Record<string, unknown> | undefined)?.sessionName as string | undefined;
@@ -5023,33 +9063,18 @@ export class WsBridge {
       }
       if (rawEvent.type === 'session.state') {
         const payload = rawEvent.payload as Record<string, unknown> | undefined;
-        if (payload?.state === 'idle') this.activeDispatchIds.delete(sessionId);
+        if (typeof payload?.state === 'string') this.updateAuthoritativeSessionState(sessionId, payload.state);
       }
       this.ingestRecentTextFromTimelineEvent(rawEvent);
       if (this.db) {
         void upsertSessionTextTailCacheEvent(this.db, this.serverId, rawEvent)
           .catch((err) => logger.warn({ err, serverId: this.serverId, sessionId }, 'Failed to update session_text_tail_cache'));
       }
-      // Bypass TerminalForwardQueue: timeline events are control-plane and
-      // must never queue behind PTY data. Critical for cancel/stop UX —
-      // session.state(idle) used to arrive seconds after the push notification.
-      // Timeline is the shared chat state for every browser viewing this
-      // server, not an exclusive transport stream. The web client normally
-      // keeps passive subscriptions for every known session, but those
-      // subscriptions are intentionally asynchronous (ownership checks,
-      // reconnect replay, runtime-type correction). Tying live timeline
-      // delivery to that transient map creates a multi-device split-brain:
-      // one device can receive every streaming assistant.text update while a
-      // second connected device misses them and only catches the persisted
-      // final event through history/backfill.
-      //
-      // Fan out to the subscribed viewer plus that same user's companion
-      // devices. Different users remain isolated by the session subscription
-      // boundary, and share-scoped sockets still pass through
-      // filterShareOutgoingJson(). PTY/raw frames, transport deltas, and
-      // request/response data remain on their existing subscription/unicast
-      // paths.
-      const timelineRecipients = this.sendJsonToSessionUserDevices(sessionId, JSON.stringify(msg));
+      // New clients have per-socket explicit mode subscriptions. Legacy
+      // clients retain the old path until they speak timeline.subscribe.
+      const timelineRecipients = this.timelineProtocolSockets.size > 0
+        ? this.deliverTimelineEventToSubscribers(sessionId, rawEvent, msg)
+        : this.sendJsonToSessionUserDevices(sessionId, JSON.stringify(msg));
       this.recordTimelineFanout(sessionId, rawEvent, timelineRecipients);
       return;
     }
@@ -5086,10 +9111,14 @@ export class WsBridge {
       }
       // Control-plane: bypass the PTY queue. command.ack drives the UI
       // optimistic-bubble state — must never head-of-line block.
+      // The originating socket (if recorded and not itself a subscriber)
+      // gets this too, so a command sent from a page not subscribed to the
+      // session still receives its own ack instead of timing out.
+      const originSocket = commandId ? this.commandAckOrigins.take(commandId) : null;
       this.sendJsonToSessionSubscribers(sessionName, JSON.stringify({
         ...msg,
         activeDispatchId: this.activeDispatchIds.get(sessionName) ?? null,
-      }));
+      }), originSocket ?? undefined);
       return;
     }
 
@@ -5121,6 +9150,9 @@ export class WsBridge {
       // of the cancel/stop push notification — must arrive without queueing
       // behind PTY frames so the browser spinner clears in lockstep with
       // the push.
+      if (type === 'session.idle') {
+        this.updateAuthoritativeSessionState(sessionName, 'idle');
+      }
       this.sendJsonToSessionSubscribers(sessionName, JSON.stringify(msg));
       return;
     }
@@ -5145,9 +9177,20 @@ export class WsBridge {
           : agentType
             ? getSessionRuntimeType(agentType)
             : undefined;
-        this.activeSubSessions.set(subSessionName, { name: subSessionName, label, parentSession, agentType, runtimeType });
+        this.activeSubSessions.set(subSessionName, {
+          name: subSessionName,
+          state: typeof msg.state === 'string' ? msg.state : undefined,
+          label,
+          parentSession,
+          agentType,
+          runtimeType,
+        });
+        const subIdentityProjectKey = sessionIdentityProjectKey({
+          contextNamespace: msg.contextNamespace as { projectId?: unknown } | null | undefined,
+        });
+        if (subIdentityProjectKey) this.subIdentityProjectKeys.set(subSessionName, subIdentityProjectKey);
         this.sessionRuntimeTypes.set(subSessionName, this.normalizeRuntimeType(runtimeType));
-        if (msg.state === 'idle') this.activeDispatchIds.delete(subSessionName);
+        if (typeof msg.state === 'string') this.updateAuthoritativeSessionState(subSessionName, msg.state);
       }
       void (async () => {
         const requestedType = typeof msg.sessionType === 'string' && msg.sessionType.trim()
@@ -5218,6 +9261,7 @@ export class WsBridge {
           activeModel: msg.activeModel || msg.modelDisplay || null,
           effort: msg.effort || null,
           transportConfig: msg.transportConfig || null,
+          supervisionHeartbeat: msg.supervisionHeartbeat || null,
           ...queueRelay,
           ...executionCloneProjection,
           qwenModel: msg.qwenModel || null,
@@ -5331,12 +9375,10 @@ export class WsBridge {
     if (type === 'cron.p2p_linked' && this.db) {
       const { jobId, discussionId } = msg as { jobId: string; discussionId: string };
       if (jobId && discussionId) {
-        void this.db.execute(
-          `UPDATE cron_executions SET detail = $1 WHERE id = (
-             SELECT id FROM cron_executions WHERE job_id = $2 ORDER BY created_at DESC LIMIT 1
-           )`,
-          [`p2p:${discussionId}`, jobId],
-        ).catch(() => {});
+        const update = buildCronExecutionResultUpdate({
+          authenticatedServerId: this.serverId, jobId, detail: `p2p:${discussionId}`,
+        });
+        if (update) void this.db.execute(update.sql, update.params).catch(() => {});
       }
       this.broadcastToBrowsers(JSON.stringify({ type: 'cron.p2p_linked', jobId, discussionId }));
       return;
@@ -5348,28 +9390,14 @@ export class WsBridge {
       if (jobId && detail) {
         // Accept results from independently-upgraded older daemons without
         // persisting their newline-joined cumulative streaming snapshots.
-        const params: unknown[] = [normalizeCronExecutionDetail(detail.slice(0, 4000))];
-        let sql = '';
-        if (executionId) {
-          if (status) {
-            sql = 'UPDATE cron_executions SET detail = $1, status = $2 WHERE id = $3';
-            params.push(status, executionId);
-          } else {
-            sql = 'UPDATE cron_executions SET detail = $1 WHERE id = $2';
-            params.push(executionId);
-          }
-        } else if (status) {
-          sql = `UPDATE cron_executions SET detail = $1, status = $2 WHERE id = (
-             SELECT id FROM cron_executions WHERE job_id = $3 ORDER BY created_at DESC LIMIT 1
-           )`;
-          params.push(status, jobId);
-        } else {
-          sql = `UPDATE cron_executions SET detail = $1 WHERE id = (
-             SELECT id FROM cron_executions WHERE job_id = $2 ORDER BY created_at DESC LIMIT 1
-           )`;
-          params.push(jobId);
-        }
-        void this.db.execute(sql, params).catch(() => {});
+        const update = buildCronExecutionResultUpdate({
+          authenticatedServerId: this.serverId,
+          jobId,
+          ...(executionId ? { executionId } : {}),
+          ...(status ? { status } : {}),
+          detail: normalizeCronExecutionDetail(detail.slice(0, 4000)),
+        });
+        if (update) void this.db.execute(update.sql, update.params).catch(() => {});
       }
       return;
     }
@@ -5443,11 +9471,26 @@ export class WsBridge {
     }
 
     // ── Daemon stats: extract from heartbeat or standalone, broadcast to browsers ─
-    if (type === 'daemon.stats' || (type === 'heartbeat' && msg.cpu !== undefined)) {
+    // A heartbeat from the core-lane link worker carries only event-loop
+    // liveness. Rebuilding it as a full daemon.stats put undefined into every
+    // number, and viewers that replace their last stats rendered NaN/unknown
+    // until the next full frame. It goes out as its own frame instead.
+    if (type === 'heartbeat' && !hasAnyDaemonSystemStats(msg) && hasDaemonLiveness(msg)) {
       if (typeof msg.daemonVersion === 'string') this.daemonVersion = msg.daemonVersion;
       this.broadcastToBrowsers(JSON.stringify({
-        type: 'daemon.stats',
+        type: DAEMON_LIVENESS_MSG,
         daemonVersion: typeof msg.daemonVersion === 'string' ? msg.daemonVersion : this.daemonVersion,
+        ...pickDaemonLiveness(msg),
+      }));
+      return;
+    }
+    if (type === DAEMON_STATS_MSG || (type === 'heartbeat' && hasAnyDaemonSystemStats(msg))) {
+      if (typeof msg.daemonVersion === 'string') this.daemonVersion = msg.daemonVersion;
+      this.broadcastToBrowsers(JSON.stringify({
+        type: DAEMON_STATS_MSG,
+        daemonVersion: typeof msg.daemonVersion === 'string' ? msg.daemonVersion : this.daemonVersion,
+        latestDaemonVersion: process.env.APP_VERSION ?? null,
+        ...(this.daemonAutoUpgradeView() ? { autoUpgrade: this.daemonAutoUpgradeView() } : {}),
         cpu: msg.cpu, memUsed: msg.memUsed, memTotal: msg.memTotal,
         load1: msg.load1, load5: msg.load5, load15: msg.load15, uptime: msg.uptime,
         // The bridge rebuilds daemon.stats from an explicit allowlist. Keep
@@ -5463,6 +9506,11 @@ export class WsBridge {
         // full. Rebuilding the payload without them put the signal in a hole:
         // it reached this pod and went no further.
         ...(isPlainRecord(msg.shortRefHealth) ? { shortRefHealth: msg.shortRefHealth } : {}),
+        ...(isCoreLaneStatus(msg) ? {
+          ...(typeof msg.mainEventLoopLagMs === 'number' ? { mainEventLoopLagMs: msg.mainEventLoopLagMs } : {}),
+          ...(typeof msg.mainEventLoopBlockedMs === 'number' ? { mainEventLoopBlockedMs: msg.mainEventLoopBlockedMs } : {}),
+          ...(typeof msg.mainEventLoopBusy === 'boolean' ? { mainEventLoopBusy: msg.mainEventLoopBusy } : {}),
+        } : {}),
       }));
       return;
     }
@@ -5532,6 +9580,17 @@ export class WsBridge {
         safeSend(resolved.socket, JSON.stringify(msg));
       }
       return;
+    }
+
+    // A daemon-originated terminal reset belongs only to the browsers watching
+    // that session. Falling through to default-allow broadcast made every other
+    // tab reset a terminal it was never subscribed to and that never congested.
+    if (type === 'terminal.stream_reset') {
+      const session = typeof msg.session === 'string' ? msg.session : '';
+      if (session) {
+        this.sendJsonToSessionSubscribers(session, JSON.stringify(msg));
+        return;
+      }
     }
 
     // ── Default-allow: forward unrecognised types to all browsers ─────────────
@@ -5638,22 +9697,31 @@ export class WsBridge {
 
   private replaceActiveMainSessions(rawSessions: unknown): void {
     this.activeMainSessions.clear();
+    this.mainIdentityProjectKeys.clear();
     this.hasActiveMainSessionSnapshot = true;
     if (!Array.isArray(rawSessions)) return;
     for (const item of rawSessions) {
       if (!item || typeof item !== 'object') continue;
       const row = item as Record<string, unknown>;
       const name = typeof row.name === 'string' ? row.name : '';
+      const identityProjectKey = sessionIdentityProjectKey({
+        contextNamespace: row.contextNamespace as { projectId?: unknown } | null | undefined,
+        project: row.project,
+      });
+      if (name && identityProjectKey) this.mainIdentityProjectKeys.set(name, identityProjectKey);
       const project = typeof row.project === 'string' ? row.project : '';
+      const projectDir = typeof row.projectDir === 'string' && row.projectDir.trim() ? row.projectDir.trim() : undefined;
       const state = typeof row.state === 'string' ? row.state : 'stopped';
       const agentType = typeof row.agentType === 'string' ? row.agentType : '';
       const runtimeType = typeof row.runtimeType === 'string' ? row.runtimeType : undefined;
       const label = typeof row.label === 'string' && row.label.trim() ? row.label.trim() : undefined;
       if (!name) continue;
-      this.activeMainSessions.set(name, { name, project, state, agentType, runtimeType, label });
+      this.activeMainSessions.set(name, { name, project, projectDir, state, agentType, runtimeType, label });
       this.sessionRuntimeTypes.set(name, this.normalizeRuntimeType(runtimeType));
       if (state === 'idle' || state === 'stopped') this.activeDispatchIds.delete(name);
     }
+    this.syncCoveredProjectDirsAcrossShareSockets();
+    this.scheduleAutoUpgradeFlushAtIdleBoundary();
   }
 
   private pruneMainSessionRecentText(rawSessions: unknown): void {
@@ -5683,7 +9751,7 @@ export class WsBridge {
       if (!sessions.has(sessionName)) continue;
       if (!this.canShareSocketReceiveSession(ws, sessionName, data)) continue;
       const queue = this.getOrCreateQueue(sessionName, ws);
-      queue.send(ws, data, () => this.handleQueueOverflow(sessionName, ws));
+      queue.send(ws, data, () => this.handleQueueOverflow(sessionName, ws), () => this.handleQueueResume(sessionName, ws));
     }
   }
 
@@ -5723,7 +9791,7 @@ export class WsBridge {
    *    subscriptions to); we dedup per-WS so the same JSON is never sent
    *    twice.
    */
-  private sendJsonToSessionSubscribers(sessionName: string, json: string): number {
+  private sendJsonToSessionSubscribers(sessionName: string, json: string, extraRecipient?: WebSocket): number {
     const sent = new Set<WebSocket>();
     for (const [ws, sessions] of this.browserSubscriptions) {
       if (!sessions.has(sessionName)) continue;
@@ -5742,6 +9810,16 @@ export class WsBridge {
       if (!outgoing) continue;
       sent.add(ws);
       safeSend(ws, outgoing);
+    }
+    // Additive unicast to the socket that sent the originating command, when
+    // it isn't already among the subscribers above (see CommandAckOriginRouter).
+    if (extraRecipient && !sent.has(extraRecipient)) {
+      const msg = this.tryParseJsonRecord(json);
+      const outgoing = this.filterShareOutgoingJson(extraRecipient, msg, json);
+      if (outgoing) {
+        sent.add(extraRecipient);
+        safeSend(extraRecipient, outgoing);
+      }
     }
     return sent.size;
   }
@@ -5793,6 +9871,195 @@ export class WsBridge {
     return sent.size;
   }
 
+  private isTimelineSummaryEvent(event: Record<string, unknown>): boolean {
+    const type = typeof event.type === 'string' ? event.type : '';
+    const payload = event.payload && typeof event.payload === 'object'
+      ? event.payload as Record<string, unknown>
+      : {};
+    if (type === 'assistant.text') return payload.streaming !== true;
+    // Provider adapters may use assistant.final/assistant.message for the
+    // committed answer.  Summary/history projection must retain every
+    // terminal assistant event, not just the canonical assistant.text name.
+    if (type.startsWith('assistant.')) return payload.streaming !== true;
+    if (type === 'user.message' || type === 'ask.question' || type === 'task_pair.event'
+      || type === 'memory.context' || type === 'memory.compression' || type.startsWith('peer_audit.')
+      || type.startsWith('delegation.') || type.startsWith('execution_clone.')) return true;
+    return type === 'session.state' || type === 'agent.status' || type === 'usage.update'
+      || type === 'tool.call' || type === 'tool.result';
+  }
+
+  private summarizeTimelineEvent(event: Record<string, unknown>): Record<string, unknown> {
+    const type = typeof event.type === 'string' ? event.type : '';
+    const payload = event.payload && typeof event.payload === 'object'
+      ? event.payload as Record<string, unknown>
+      : {};
+    // Summary sockets need the latest state/status/usage values, not the
+    // transport's often-large diagnostic/detail trees. Keep primitive fields
+    // (state, status, model, token/cost counters, timestamps) and discard
+    // nested payloads so background windows cannot receive megabytes of
+    // repeated status metadata. Full-mode delivery remains byte-for-byte
+    // unchanged. This is deliberately generic because providers add fields
+    // over time; primitive values are the stable, renderable projection.
+    if (type === 'session.state' || type === 'agent.status' || type === 'usage.update') {
+      const compactPayload: Record<string, unknown> = {};
+      for (const [key, value] of Object.entries(payload)) {
+        if (typeof value === 'string') compactPayload[key] = value.length > 256 ? `${value.slice(0, 256)}…` : value;
+        else if (typeof value === 'number' || typeof value === 'boolean') compactPayload[key] = value;
+      }
+      return { ...event, summary: true, payload: compactPayload };
+    }
+    if (type !== 'tool.call' && type !== 'tool.result') return event;
+    const previewFields = ['command', 'description', 'input', 'output', 'text', 'error', 'status'];
+    const preview: Record<string, unknown> = {};
+    for (const key of previewFields) {
+      const value = payload[key];
+      if (typeof value === 'string') preview[key] = value.length > 256 ? `${value.slice(0, 256)}…` : value;
+      else if (typeof value === 'number' || typeof value === 'boolean') preview[key] = value;
+    }
+    return {
+      ...event,
+      summary: true,
+      payload: { name: payload.name ?? payload.toolName ?? 'tool', status: payload.status ?? type, preview },
+      detailAvailable: true,
+    };
+  }
+
+  private suppressUnchangedTimelineValue(
+    ws: WebSocket,
+    sessionName: string,
+    eventType: string,
+    payload: Record<string, unknown>,
+  ): boolean {
+    let fingerprints = this.timelineLatestValueFingerprints.get(ws);
+    if (!fingerprints) {
+      fingerprints = new Map();
+      this.timelineLatestValueFingerprints.set(ws, fingerprints);
+    }
+    const key = `${sessionName}\u0000${eventType}`;
+    const fingerprint = timelinePayloadFingerprint(payload);
+    if (fingerprints.get(key) === fingerprint) return true;
+    fingerprints.set(key, fingerprint);
+    return false;
+  }
+
+  private clearTimelineLatestValueFingerprints(ws: WebSocket, sessionName?: string): void {
+    if (!sessionName) {
+      this.timelineLatestValueFingerprints.delete(ws);
+      return;
+    }
+    const fingerprints = this.timelineLatestValueFingerprints.get(ws);
+    if (!fingerprints) return;
+    const prefix = `${sessionName}\u0000`;
+    for (const key of fingerprints.keys()) {
+      if (key.startsWith(prefix)) fingerprints.delete(key);
+    }
+    if (fingerprints.size === 0) this.timelineLatestValueFingerprints.delete(ws);
+  }
+
+  private deliverTimelineEventToSubscribers(
+    sessionName: string,
+    rawEvent: Record<string, unknown>,
+    envelope: Record<string, unknown>,
+  ): number {
+    const eventType = typeof rawEvent.type === 'string' ? rawEvent.type : '';
+    const payload = rawEvent.payload && typeof rawEvent.payload === 'object'
+      ? rawEvent.payload as Record<string, unknown>
+      : {};
+    const sessionId = typeof rawEvent.sessionId === 'string' ? rawEvent.sessionId : sessionName;
+    const epoch = typeof rawEvent.epoch === 'number' ? rawEvent.epoch : 0;
+    const seq = typeof rawEvent.seq === 'number' ? rawEvent.seq : 0;
+    let recipients = 0;
+    const sockets = new Set<WebSocket>();
+    for (const [ws, subscriptions] of this.timelineSubscriptions) {
+      if (!subscriptions.has(sessionName)) continue;
+      sockets.add(ws);
+    }
+    for (const [ws, subscriptions] of this.browserSubscriptions) {
+      if (this.timelineProtocolSockets.has(ws) || !subscriptions.has(sessionName)) continue;
+      sockets.add(ws);
+    }
+    for (const [ws, subscriptions] of this.transportSubscriptions) {
+      if (this.timelineProtocolSockets.has(ws) || !subscriptions.has(sessionName)) continue;
+      sockets.add(ws);
+    }
+
+    for (const ws of sockets) {
+      const mode = this.timelineSubscriptions.get(ws)?.get(sessionName);
+      if (this.timelineProtocolSockets.has(ws) && !mode) continue;
+      if (mode === TIMELINE_SUBSCRIPTION_MODES.SUMMARY && !this.isTimelineSummaryEvent(rawEvent)) continue;
+      const outgoingEvent = mode === TIMELINE_SUBSCRIPTION_MODES.SUMMARY
+        ? this.summarizeTimelineEvent(rawEvent)
+        : rawEvent;
+      const outgoingEnvelope = { ...envelope, event: outgoingEvent };
+      const msg = this.tryParseJsonRecord(JSON.stringify(outgoingEnvelope));
+      const outgoing = this.filterShareOutgoingJson(ws, msg, JSON.stringify(outgoingEnvelope));
+      if (!outgoing) continue;
+      const terminalSessionState = eventType === 'session.state'
+        && TIMELINE_TERMINAL_SESSION_STATES.includes(String(payload.state) as (typeof TIMELINE_TERMINAL_SESSION_STATES)[number]);
+      const terminalUsage = eventType === 'usage.update' && payload.streaming === false;
+      const latestValueEvent = eventType === 'session.state' || eventType === 'agent.status' || eventType === 'usage.update';
+      // Terminal states are authoritative transition boundaries. Never
+      // suppress them as duplicate latest values: a reconnecting browser may
+      // have missed the preceding running frame and otherwise stays stuck on
+      // a stale running flag forever.
+      const summaryMode = mode === TIMELINE_SUBSCRIPTION_MODES.SUMMARY;
+      if (summaryMode && latestValueEvent && !terminalSessionState && !terminalUsage
+        && this.suppressUnchangedTimelineValue(ws, sessionName, eventType, payload)) continue;
+      const coalescible = (eventType === 'session.state' || eventType === 'agent.status' || eventType === 'usage.update')
+        && summaryMode
+        && !terminalSessionState && !terminalUsage;
+      const priority = eventType === 'assistant.text' && payload.streaming !== true
+        ? 'final'
+        : terminalSessionState || terminalUsage ? 'final' : coalescible ? 'coalescible' : 'durable';
+      const item: TimelineQueueEvent = {
+        data: outgoing,
+        sessionId,
+        epoch,
+        seq,
+        priority,
+        ...(coalescible ? { coalesceKey: `${sessionId}\0${eventType}` } : {}),
+      };
+      // Latest-value signals are coalesced only for summary sockets. Full
+      // (visible) sockets remain fully live; text and status frames retain
+      // their provider cadence while terminal state is always authoritative.
+      let queue = this.timelineQueues.get(ws);
+      if (!queue) {
+        queue = new TimelineOutboundQueue();
+        this.timelineQueues.set(ws, queue);
+      }
+      incrementCounter(TIMELINE_DELIVERY_METRICS.SERVER_SOCKET_RECIPIENT, { mode: mode ?? 'legacy', eventType });
+      addCounter(TIMELINE_DELIVERY_METRICS.SERVER_SOCKET_BYTES, Buffer.byteLength(outgoing, 'utf8'), { mode: mode ?? 'legacy', eventType });
+      if (typeof ws.bufferedAmount === 'number' && ws.bufferedAmount > TIMELINE_SOCKET_BUFFERED_HIGH_WATER) {
+        addCounter(TIMELINE_DELIVERY_METRICS.SERVER_SOCKET_BUFFERED, ws.bufferedAmount, { mode: mode ?? 'legacy' });
+      }
+      queue.enqueue(ws, item, (dropped) => {
+        incrementCounter(TIMELINE_DELIVERY_METRICS.SERVER_SOCKET_GAP, { mode: mode ?? 'legacy', eventType });
+        incrementCounter('ws_bridge_timeline_socket_gap', { reason: dropped.priority });
+        const gap = {
+          type: TIMELINE_MESSAGES.SEQ_GAP,
+          sessionId: dropped.sessionId,
+          epoch: dropped.epoch,
+          fromSeq: dropped.gapFromSeq ?? dropped.seq,
+          toSeq: dropped.gapToSeq ?? dropped.seq,
+          reason: 'backpressure',
+          backfill: true,
+        };
+        safeSend(ws, JSON.stringify(gap));
+      }, () => {
+        incrementCounter(TIMELINE_DELIVERY_METRICS.SERVER_SOCKET_COALESCED, { mode: mode ?? 'legacy', eventType });
+      }, {
+        coalesceWindowMs: coalescible
+          ? mode === TIMELINE_SUBSCRIPTION_MODES.SUMMARY
+            ? TIMELINE_SUMMARY_LATEST_VALUE_COALESCE_WINDOW_MS
+            : TIMELINE_FULL_LATEST_VALUE_COALESCE_WINDOW_MS
+          : undefined,
+        flushCoalesced: !coalescible,
+      });
+      recipients += 1;
+    }
+    return recipients;
+  }
+
   /**
    * Observe the fan-out result for a live timeline event.
    *
@@ -5836,9 +10103,12 @@ export class WsBridge {
   private sendToRawSessionSubscribers(sessionName: string, data: string | Buffer): void {
     for (const [ws, sessions] of this.browserSubscriptions) {
       if (sessions.get(sessionName) !== true) continue;
+      // Terminal PTY streaming is an independent data plane from timeline
+      // subscriptions. A browser commonly keeps its timeline in summary mode
+      // while the terminal is visible; that must not suppress raw PTY bytes.
       if (!this.canShareSocketReceiveSession(ws, sessionName, data)) continue;
       const queue = this.getOrCreateQueue(sessionName, ws);
-      queue.send(ws, data, () => this.handleQueueOverflow(sessionName, ws));
+      queue.send(ws, data, () => this.handleQueueOverflow(sessionName, ws), () => this.handleQueueResume(sessionName, ws));
     }
   }
 
@@ -5861,11 +10131,34 @@ export class WsBridge {
     return !!this.filterShareOutgoingJson(ws, msg, data);
   }
 
-  private handleQueueOverflow(sessionName: string, ws: WebSocket): void {
-    const resetMsg = JSON.stringify({
-      type: 'terminal.stream_reset',
+  /**
+   * The slow browser socket is writable again after dropped frames: send it one
+   * more `terminal.stream_reset` so it asks for a snapshot NOW. The reset sent
+   * when the drop began made it ask while the socket was still full, so that
+   * snapshot (a `terminal.diff` through the same queue) was dropped like
+   * everything else, and the browser - discarding every byte until a snapshot
+   * arrives - stayed on its stale picture with no further signal ever sent.
+   */
+  private handleQueueResume(sessionName: string, ws: WebSocket): void {
+    safeSend(ws, JSON.stringify({
+      type: TERMINAL_CONTROL.STREAM_RESET,
       session: sessionName,
-      reason: 'backpressure',
+      reason: TERMINAL_STREAM_RESET_REASON.BACKPRESSURE_RESUME,
+    }));
+  }
+
+  private handleQueueOverflow(sessionName: string, ws: WebSocket): void {
+    // One reset per overflow EPISODE, not per dropped frame. Every reset makes
+    // the client ask for a fresh full-frame snapshot, which is exactly the work
+    // that overflowed the socket in the first place — notifying per frame turns
+    // congestion into a feedback loop.
+    const queue = this.terminalQueues.get(sessionName)?.get(ws);
+    if (queue && !queue.takeOverflowNotice()) return;
+
+    const resetMsg = JSON.stringify({
+      type: TERMINAL_CONTROL.STREAM_RESET,
+      session: sessionName,
+      reason: TERMINAL_STREAM_RESET_REASON.BACKPRESSURE,
     });
 
     const sent = safeSend(ws, resetMsg, (err) => {
@@ -5898,10 +10191,15 @@ export class WsBridge {
     // full re-subscribe roundtrip. The fresh queue gives us a clean budget
     // for subsequent sends; orphaned in-flight callbacks from the old
     // queue still decrement only their own (now-unreachable) counter.
-    const sessionQueues = this.terminalQueues.get(sessionName);
-    if (sessionQueues?.has(ws)) {
-      sessionQueues.set(ws, new TerminalForwardQueue());
-    }
+    // Deliberately NOT `sessionQueues.set(ws, new TerminalForwardQueue())`.
+    //
+    // Replacing the queue handed out a fresh 4MB budget while the previous
+    // ~4MB was still sitting unacknowledged in the socket/kernel: the orphaned
+    // callbacks only decremented a counter nobody could read any more. Repeated
+    // overflows could therefore keep buying new budget, so the real in-flight
+    // backlog for one socket was unbounded — the opposite of backpressure. The
+    // queue now stays put, keeps its counter, and resumes on its own once
+    // in-flight bytes drain below the low-water mark.
   }
 
   private getOrCreateQueue(sessionName: string, ws: WebSocket): TerminalForwardQueue {
@@ -6032,11 +10330,50 @@ export class WsBridge {
     return this.transportSubscriptionRevisions.get(ws)?.get(sessionId) === revision;
   }
 
+  private trackBrowserConsoleSubscription(ws: WebSocket, msg: Record<string, unknown>): void {
+    const subscriptionId = msg.subscriptionId;
+    const scope = msg.scope as { projectName?: unknown; coordinatorSessionName?: unknown } | undefined;
+    if (typeof subscriptionId !== 'string' || !subscriptionId
+      || typeof scope?.projectName !== 'string' || typeof scope.coordinatorSessionName !== 'string') return;
+    let entries = this.consoleSubscriptions.get(ws);
+    if (msg.type === SUPERVISION_TASK_CONSOLE_MSG.UNSUBSCRIBE) {
+      if (!entries) return;
+      for (const [key, entry] of entries) if (entry.subscriptionId === subscriptionId) entries.delete(key);
+      if (entries.size === 0) this.consoleSubscriptions.delete(ws);
+      return;
+    }
+    if (!entries) { entries = new Map(); this.consoleSubscriptions.set(ws, entries); }
+    const viewer = typeof msg.clientId === 'string' && msg.clientId ? msg.clientId : subscriptionId;
+    const key = JSON.stringify([viewer, scope.projectName, scope.coordinatorSessionName]);
+    entries.delete(key);
+    entries.set(key, { subscriptionId, projectName: scope.projectName, coordinatorSessionName: scope.coordinatorSessionName });
+    // A socket cannot legitimately hold many; bound what a hostile one can make us keep.
+    while (entries.size > 32) entries.delete(entries.keys().next().value as string);
+  }
+
+  /** The socket is gone: release the daemon-side subscriptions it opened (no-op for ones already replaced). */
+  private releaseBrowserConsoleSubscriptions(ws: WebSocket): void {
+    const entries = this.consoleSubscriptions.get(ws);
+    this.consoleSubscriptions.delete(ws);
+    if (!entries) return;
+    for (const entry of entries.values()) {
+      try {
+        this.sendToDaemon(JSON.stringify({
+          type: SUPERVISION_TASK_CONSOLE_MSG.UNSUBSCRIBE,
+          subscriptionId: entry.subscriptionId,
+          scope: { projectName: entry.projectName, coordinatorSessionName: entry.coordinatorSessionName },
+        }));
+      } catch { /* the daemon link is down: its subscriptions died with it */ }
+    }
+  }
+
   private cleanupBrowserSocket(ws: WebSocket): void {
+    this.releaseBrowserConsoleSubscriptions(ws);
     this.browserSockets.delete(ws);
     this.mobileSockets.delete(ws);
     this.browserUserIds.delete(ws);
     this.controlledTargetBrowserSockets.delete(ws);
+    this.controlledBrowserReads.remove(ws);
     this.browserShareStates.delete(ws);
     const sessions = this.browserSubscriptions.get(ws);
     if (sessions) {
@@ -6049,6 +10386,12 @@ export class WsBridge {
     this.terminalSubscriptionRevisions.delete(ws);
     this.transportSubscriptionRevisions.delete(ws);
     this.transportSubscriptions.delete(ws);
+    this.timelineSubscriptions.delete(ws);
+    this.timelineProtocolSockets.delete(ws);
+    this.clearTimelineLatestValueFingerprints(ws);
+    this.cancelTimelineDataPlaneForSocket(ws);
+    this.timelineQueues.get(ws)?.dispose();
+    this.timelineQueues.delete(ws);
     this.clearPendingFsRoutesForSocket(ws);
     for (const [requestId, pending] of this.pendingRepoRequests) {
       if (pending.socket !== ws) continue;
@@ -6056,6 +10399,7 @@ export class WsBridge {
       this.pendingRepoRequests.delete(requestId);
     }
     this.peerAuditRouter.dropSocket(ws);
+    this.commandAckOrigins.dropSocket(ws);
     this.directFileTransferRouter.dropSocket(ws);
     this.remoteDesktopRouter.dropSocket(ws);
     // Clean up pending timeline requests for this socket
@@ -6063,6 +10407,7 @@ export class WsBridge {
       if (pending.socket === ws) {
         clearTimeout(pending.timer);
         this.pendingTimelineRequests.delete(reqId);
+        this.cancelDaemonTimelineRequest(reqId);
       }
     }
     for (const [reqId, pending] of this.pendingMemoryManagementRequests) {
@@ -6142,11 +10487,13 @@ export class WsBridge {
     }
 
     // Share-scoped commands have already passed the live participant + covered
-    // session policy immediately above this handler. They may address only the
+    // session policy immediately above this handler. Tab shares may address only the
     // daemon-owned virtual session root; accepting a host path here would turn
-    // repository checkout into a path-selection capability.
-    if (this.browserShareStates.has(ws)) {
-      if (projectDir !== FS_SESSION_ROOT_PATH) {
+    // repository checkout into a path-selection capability. Whole-server shares cover
+    // all sessions and projects on that server.
+    const shareState = this.browserShareStates.get(ws);
+    if (shareState) {
+      if (shareState.target.kind !== 'server' && projectDir !== FS_SESSION_ROOT_PATH) {
         sendRepoError('unauthorized');
         return false;
       }
@@ -6203,7 +10550,9 @@ export class WsBridge {
 
   private broadcastToBrowsers(json: string): void {
     const msg = this.tryParseJsonRecord(json);
+    this.controlledBrowserReads.broadcast(json);
     for (const bs of this.browserSockets) {
+      if (this.controlledTargetBrowserSockets.has(bs)) continue;
       try {
         const outgoing = this.filterShareOutgoingJson(bs, msg, json);
         if (!outgoing) continue;
@@ -6309,7 +10658,17 @@ export class WsBridge {
     }
 
     // Fully offline (no daemon WS, no grace window): fail fast.
-    this.emitCommandFailed(ws, commandId, sessionName, ACK_FAILURE_DAEMON_OFFLINE);
+    this.emitInflightFailure({
+      commandId,
+      sessionName,
+      browser: ws,
+      rawPayload: raw,
+      state: 'buffered',
+      sentAt: Date.now(),
+      dispatchAttempts: 0,
+      timeoutTimer: null,
+      share: this.inflightShareMetadata(ws),
+    }, ACK_FAILURE_DAEMON_OFFLINE);
   }
 
   /** Replay buffered + dispatched commands to the daemon after reconnect. */
@@ -6380,40 +10739,48 @@ export class WsBridge {
     if (!entry.share) return true;
     const state = this.browserShareStates.get(entry.browser);
     if (!state || state.userId !== entry.share.userId) {
-      this.emitCommandFailed(entry.browser, entry.commandId, entry.sessionName, SHARE_REASONS.REVOKED);
+      this.emitInflightFailure(entry, SHARE_REASONS.REVOKED);
       this.removeInflight(entry.commandId);
       return false;
     }
-    const coverage = await this.resolveLiveShareCoverage(state);
-    if (!coverage) {
-      this.emitCommandFailed(
-        entry.browser,
-        entry.commandId,
-        entry.sessionName,
-        this.shareStateLooksExpired(state) ? SHARE_REASONS.EXPIRED : SHARE_REASONS.REVOKED,
-      );
-      this.removeInflight(entry.commandId);
-      return false;
+    // The command was just authorized against this socket's coverage (that check
+    // re-reads the DB whenever the coverage is older than the TTL or a grant
+    // changed), so an entry dispatched straight away needs no second DB round trip:
+    // for a Stop that was four more sequential queries between the tap and the
+    // daemon.
+    let current: ShareScopedSocketState | null;
+    // Only the first, immediate dispatch of an entry. One that waited (state
+    // `buffered`: replayed after a daemon reconnect) or is being retried
+    // (dispatchAttempts > 0) always re-reads the grant.
+    const dispatchedImmediately = entry.state === 'dispatched' && entry.dispatchAttempts === 0;
+    if (dispatchedImmediately && this.shareCoverageIsFresh(state)) {
+      current = state;
+    } else {
+      current = await this.refreshShareCoverage(entry.browser, state);
+      if (!current) {
+        this.emitInflightFailure(entry, this.shareStateLooksExpired(state) ? SHARE_REASONS.EXPIRED : SHARE_REASONS.REVOKED);
+        this.removeInflight(entry.commandId);
+        return false;
+      }
     }
-    const current = await this.applyShareCoverage(entry.browser, state, coverage);
     if (!shareStateCoversSession(current, entry.sessionName)) {
-      this.emitCommandFailed(entry.browser, entry.commandId, entry.sessionName, SHARE_REASONS.TARGET_UNAVAILABLE);
+      this.emitInflightFailure(entry, SHARE_REASONS.TARGET_UNAVAILABLE);
       this.removeInflight(entry.commandId);
       return false;
     }
     const sameTarget = shareTargetKey(current.target) === shareTargetKey(entry.share.target);
     if (!sameTarget || !shareStateCoversSession(current, entry.sessionName)) {
-      this.emitCommandFailed(entry.browser, entry.commandId, entry.sessionName, SHARE_REASONS.TARGET_UNAVAILABLE);
+      this.emitInflightFailure(entry, SHARE_REASONS.TARGET_UNAVAILABLE);
       this.removeInflight(entry.commandId);
       return false;
     }
     if (this.shareStateLooksExpired(current)) {
-      this.emitCommandFailed(entry.browser, entry.commandId, entry.sessionName, SHARE_REASONS.EXPIRED);
+      this.emitInflightFailure(entry, SHARE_REASONS.EXPIRED);
       this.removeInflight(entry.commandId);
       return false;
     }
     if (entry.share.requiredRole === 'participant' && current.snapshot.effectiveRole !== 'participant') {
-      this.emitCommandFailed(entry.browser, entry.commandId, entry.sessionName, SHARE_REASONS.ROLE_DENIED);
+      this.emitInflightFailure(entry, SHARE_REASONS.ROLE_DENIED);
       this.removeInflight(entry.commandId);
       return false;
     }
@@ -6450,7 +10817,7 @@ export class WsBridge {
       this.broadcastToBrowsers(JSON.stringify({ type: MSG_DAEMON_OFFLINE }));
     }
     for (const entry of [...this.inflightCommands.values()]) {
-      this.emitCommandFailed(entry.browser, entry.commandId, entry.sessionName, ACK_FAILURE_DAEMON_OFFLINE);
+      this.emitInflightFailure(entry, ACK_FAILURE_DAEMON_OFFLINE);
       this.removeInflight(entry.commandId);
     }
   }
@@ -6469,7 +10836,7 @@ export class WsBridge {
           dispatchAttempts: entry.dispatchAttempts,
           retryLimit: ACK_TIMEOUT_RETRY_LIMIT,
         },
-        'command.ack timeout — retrying session.send',
+        'command.ack timeout — retrying reliable session command',
       );
       void this.dispatchInflightToDaemon(entry, true);
       return;
@@ -6483,7 +10850,7 @@ export class WsBridge {
       return;
     }
     logger.warn({ serverId: this.serverId, commandId, sessionName: entry.sessionName }, 'command.ack timeout');
-    this.emitCommandFailed(entry.browser, commandId, entry.sessionName, ACK_FAILURE_ACK_TIMEOUT);
+    this.emitInflightFailure(entry, ACK_FAILURE_ACK_TIMEOUT);
     this.removeInflight(commandId);
   }
 
@@ -6523,6 +10890,7 @@ export class WsBridge {
     commandId: string,
     sessionName: string,
     reason: AckFailureReason | ShareReason,
+    extra: Record<string, unknown> = {},
   ): void {
     const payload = {
       type: MSG_COMMAND_FAILED,
@@ -6530,6 +10898,7 @@ export class WsBridge {
       session: sessionName,
       reason,
       retryable: true,
+      ...extra,
     };
     try {
       if (browser.readyState === WebSocket.OPEN) {
@@ -6538,6 +10907,34 @@ export class WsBridge {
     } catch (err) {
       logger.warn({ commandId, err }, 'failed to deliver command.failed to browser');
     }
+  }
+
+  private emitInflightFailure(entry: InflightCommand, reason: AckFailureReason | ShareReason): void {
+    const type = this.rawPayloadType(entry.rawPayload);
+    if (type === 'session.undo_queued_message') {
+      const payload = JSON.stringify({
+        type: MSG_COMMAND_ACK,
+        commandId: entry.commandId,
+        session: entry.sessionName,
+        sessionName: entry.sessionName,
+        status: 'error',
+        error: reason,
+      });
+      try {
+        if (entry.browser.readyState === WebSocket.OPEN) {
+          entry.browser.send(payload);
+        }
+      } catch (err) {
+        logger.warn({ commandId: entry.commandId, err }, 'failed to deliver queue mutation error ack to browser');
+      }
+      // The initiating browser may have reconnected/rotated while the daemon
+      // was down. Session subscribers are the authoritative multi-device/user
+      // projection, so the terminal failure must reach the replacement socket
+      // too instead of leaving it on a permanent optimistic tombstone.
+      this.sendJsonToSessionSubscribers(entry.sessionName, payload);
+      return;
+    }
+    this.emitCommandFailed(entry.browser, entry.commandId, entry.sessionName, reason);
   }
 
   /** Start periodic GC timer (idempotent). */
@@ -6560,7 +10957,9 @@ export class WsBridge {
     for (const [id, ts] of this.seenCommandAcks) {
       if (now - ts > ACK_DEDUP_TTL_MS) this.seenCommandAcks.delete(id);
     }
-    if (this.inflightCommands.size === 0 && this.seenCommandAcks.size === 0 && this.ackHousekeepingTimer) {
+    this.commandAckOrigins.sweep(now);
+    if (this.inflightCommands.size === 0 && this.seenCommandAcks.size === 0
+      && this.commandAckOrigins.size() === 0 && this.ackHousekeepingTimer) {
       clearInterval(this.ackHousekeepingTimer);
       this.ackHousekeepingTimer = null;
     }
@@ -6586,6 +10985,7 @@ export class WsBridge {
     const failureUpgradeId = typeof msg.upgradeId === 'string' && msg.upgradeId.length > 0 && msg.upgradeId.length <= 128
       ? msg.upgradeId
       : null;
+    const blockedReason = typeof msg.reason === 'string' ? msg.reason : 'unknown';
     if (!serverVersion || serverVersion === '0.0.0' || !this.daemonVersion || this.daemonVersion === serverVersion) {
       if (failureId) {
         this.sendDaemonUpgradeBlockedAck(
@@ -6609,6 +11009,35 @@ export class WsBridge {
       return false;
     }
 
+    if (this.daemonNodeRole === NODE_ROLE.CONTROLLED) {
+      const targetVersion = failedTargetVersion ?? serverVersion;
+      if (!isRetryableDaemonUpgradeBlockReason(blockedReason)) {
+        // `install_failed` AND every other node-reported reason (download,
+        // checksum, disk space, ...): the node gave up on this attempt. Leaving
+        // the lifecycle in `sent` made every later request answer
+        // `already_in_progress`, so the node was never offered the target again.
+        this.recordAutoUpgradeFailure(targetVersion, blockedReason);
+      } else {
+        // A node-side safety gate is recoverable, but must not turn into a
+        // restart loop. Keep the same coordinator lifecycle pending and retry
+        // once after a bounded idle edge/reconnect window.
+        this.daemonUpgradeCoordinator.deferAfterTransientBlock();
+        this.setAutoUpgradeState(
+          CONTROLLED_NODE_UPGRADE_STATUS.DEFERRED,
+          targetVersion,
+          blockedReason,
+        );
+      }
+    } else {
+      const handled = this.handleFullDaemonUpgradeBlocked(blockedReason, failedTargetVersion ?? serverVersion, msg);
+      if (handled === 'absorbed') {
+        // An automatic attempt the daemon held back for its own reasons is
+        // server-managed (retry/backoff) and shown on the status card; it is
+        // not an operator-facing "failure", so it is not relayed as a toast.
+        return false;
+      }
+    }
+
     if (msg.reason === DAEMON_UPGRADE_BLOCK_REASON.ALREADY_IN_PROGRESS) {
       if (this.requiresLegacyWindowsUpgradeRescue()
         && this.legacyUpgradeRescuePreparedGeneration === this.daemonGeneration) {
@@ -6621,74 +11050,306 @@ export class WsBridge {
       }
     }
 
-    // Controlled nodes intentionally expose only the minimal { type, reason }
-    // blocker envelope. They cannot provide the lifecycle identity and ACK
-    // metadata that make terminal failure handling safe for full daemons, so a
-    // short node-side failure must remain automatically retryable.
-    const retryDelayMs = this.daemonNodeRole === NODE_ROLE.CONTROLLED
-      ? DAEMON_UPGRADE_BLOCKED_RETRY_MS
-      : this.daemonUpgradeBlockedRetryDelayMs(msg);
-    if (retryDelayMs == null) {
-      const replayBeforeSync = this.upgradeBlockedSyncRequiredGeneration === this.daemonGeneration
-        && this.upgradeBlockedSyncCompleteGeneration !== this.daemonGeneration;
-      const supersededByManual = msg.reason === DAEMON_UPGRADE_BLOCK_REASON.INSTALL_FAILED
-        && failedTargetVersion != null
-        && (
-          this.daemonUpgradeCoordinator.isTerminalFailureSupersededByManual(
-            failedTargetVersion,
-            failureUpgradeId,
-          )
-          || (
-            failureUpgradeId == null
-            && replayBeforeSync
-            && this.daemonUpgradeCoordinator.hasManualLifecycleForTarget(failedTargetVersion)
-          )
-        );
-      if (supersededByManual) {
-        this.sendDaemonUpgradeBlockedAck(
-          ws,
-          failureId,
-          DAEMON_UPGRADE_BLOCKED_ACK_DISPOSITION.SUPERSEDED,
-        );
-        return false;
-      }
-      this.daemonUpgradeCoordinator.blockTargetAfterTerminalFailure(serverVersion);
-      const duplicate = failureId ? this.hasSeenUpgradeBlockedFailure(failureId) : false;
-      if (failureId) {
-        this.rememberUpgradeBlockedFailure(failureId);
-        this.sendDaemonUpgradeBlockedAck(
-          ws,
-          failureId,
-          DAEMON_UPGRADE_BLOCKED_ACK_DISPOSITION.ACCEPTED,
-        );
-      }
-      logger.info({
-        serverId: this.serverId,
-        daemonVersion: this.daemonVersion,
-        serverVersion,
-        reason: typeof msg.reason === 'string' ? msg.reason : 'unknown',
-      }, 'daemon.upgrade blocked by non-retryable reason');
-      return !duplicate;
+    // Receipts that reach this point (manual requests, install failures) are
+    // operator-visible: keep the blocker envelope/ack path so the UI can show
+    // the existing toast and card state. Automatic gate receipts were absorbed
+    // above and are shown on the card from the auto-upgrade status instead.
+    const duplicate = failureId ? this.hasSeenUpgradeBlockedFailure(failureId) : false;
+    if (failureId) {
+      this.rememberUpgradeBlockedFailure(failureId);
+      this.sendDaemonUpgradeBlockedAck(
+        ws,
+        failureId,
+        DAEMON_UPGRADE_BLOCKED_ACK_DISPOSITION.ACCEPTED,
+      );
     }
+    logger.info({
+      serverId: this.serverId,
+      daemonVersion: this.daemonVersion,
+      serverVersion,
+      reason: blockedReason,
+      failedTargetVersion,
+      failureUpgradeId,
+    }, 'daemon.upgrade blocked');
+    return !duplicate;
+  }
 
-    const result = this.daemonUpgradeCoordinator.retryAutoAfterBlocked({
-      retryDelayMs,
-      skipPublicationGate: this.daemonNodeRole === NODE_ROLE.CONTROLLED,
-      isDaemonReady: () => this.isDaemonReadyForUpgrade(),
-      isStillCurrent: () => this.daemonWs === ws && this.authenticated && this.daemonVersion !== serverVersion,
-      send: (message) => this.sendDirectToDaemon(message),
-    });
-    if (result?.deliveryStatus === DAEMON_UPGRADE_DELIVERY_STATUS.SENT) {
-      logger.info({
-        serverId: this.serverId,
-        daemonVersion: this.daemonVersion,
-        serverVersion,
-        reason: typeof msg.reason === 'string' ? msg.reason : 'unknown',
-        nextAttemptAt: result.nextAttemptAt,
-        upgradeId: result.upgradeId,
-      }, 'daemon.upgrade blocked by transient daemon state — retry scheduled');
+  /**
+   * A FULL daemon answered a delivered daemon.upgrade with a block receipt.
+   * The daemon's gates are the only definition of "busy": the server never
+   * second-guesses them, it only schedules the next ask.
+   *
+   * - `auto_upgrade_disabled`: the daemon's own opt-out. Stop asking on this
+   *   connection; not a failure, no backoff.
+   * - a retryable reason (busy gates, cooldown, already in progress): ask again
+   *   at the next session idle edge or after a bounded interval. This is not a
+   *   failed attempt, so it is taken back out of the attempt count.
+   * - anything else (install_failed, toolchain_unavailable, ...): a failure of
+   *   this exact target, retried on the 10m/30m/2h/6h schedule.
+   *
+   * A manual lifecycle that was blocked (an unforced request, or a daemon that
+   * predates `force`) is released instead of retried as manual: the operator
+   * can click again, and the automatic path takes over for the same target.
+   * Returns 'absorbed' when the receipt belonged to an automatic attempt and
+   * must not be relayed to browsers.
+   */
+  private handleFullDaemonUpgradeBlocked(
+    reason: string,
+    targetVersion: string,
+    msg: Record<string, unknown>,
+    now = Date.now(),
+  ): 'absorbed' | 'relay' {
+    const lifecycle = this.daemonUpgradeCoordinator.snapshot();
+    const fromAuto = lifecycle?.status === 'sent' && lifecycle.source === DAEMON_UPGRADE_SOURCE.AUTO;
+    const fromManual = lifecycle?.status === 'sent' && lifecycle.source === DAEMON_UPGRADE_SOURCE.MANUAL;
+    const countedAttempt = (): void => {
+      if (fromAuto && this.autoUpgradeAttempts > 0) this.autoUpgradeAttempts -= 1;
+    };
+    // Gate receipts answer a command this server delivered. One that matches no
+    // delivered lifecycle (already handled, superseded, or not ours) schedules
+    // nothing, so a stray or repeated receipt can never arm a retry by itself.
+    const isGateReceipt = reason === DAEMON_UPGRADE_BLOCK_REASON.AUTO_UPGRADE_DISABLED
+      || isRetryableDaemonUpgradeBlockReason(reason);
+    if (isGateReceipt && lifecycle?.status !== 'sent') {
+      return lifecycle?.source === DAEMON_UPGRADE_SOURCE.AUTO ? 'absorbed' : 'relay';
     }
-    return true;
+    if (reason === DAEMON_UPGRADE_BLOCK_REASON.AUTO_UPGRADE_DISABLED) {
+      this.autoUpgradeDisabledOnDaemon = true;
+      countedAttempt();
+      this.daemonUpgradeCoordinator.releaseSentLifecycle(now);
+      this.clearAutoUpgradeRetryTimer();
+      this.setAutoUpgradeState(CONTROLLED_NODE_UPGRADE_STATUS.DEFERRED, targetVersion, reason);
+      this.logAutoUpgradeWait(targetVersion, reason);
+      return fromAuto ? 'absorbed' : 'relay';
+    }
+    if (isRetryableDaemonUpgradeBlockReason(reason)) {
+      countedAttempt();
+      if (fromManual) this.daemonUpgradeCoordinator.releaseSentLifecycle(now);
+      else this.daemonUpgradeCoordinator.deferAfterTransientBlock(now);
+      // A daemon that is settling or recovering names the precise hold and when it lapses (on the wire it rides a
+      // legacy busy reason, so an older server in the same position just uses the busy interval). Only the daemon's
+      // own words count: an unknown value is ignored and the plain busy reason stands.
+      const deferral = isDaemonUpgradeDeferral(msg[DAEMON_UPGRADE_DEFERRAL_FIELD]) ? msg[DAEMON_UPGRADE_DEFERRAL_FIELD] : null;
+      const shownReason = deferral ?? reason;
+      this.setAutoUpgradeState(CONTROLLED_NODE_UPGRADE_STATUS.DEFERRED, targetVersion, shownReason);
+      const cooldownRemainingMs = typeof msg.cooldownRemainingMs === 'number' && Number.isFinite(msg.cooldownRemainingMs)
+        ? msg.cooldownRemainingMs
+        : null;
+      const retryAfterMs = deferral && typeof msg[DAEMON_UPGRADE_RETRY_AFTER_FIELD] === 'number' && Number.isFinite(msg[DAEMON_UPGRADE_RETRY_AFTER_FIELD])
+        ? msg[DAEMON_UPGRADE_RETRY_AFTER_FIELD] as number
+        : null;
+      this.scheduleAutoUpgradeRetry(
+        reason === DAEMON_UPGRADE_BLOCK_REASON.COOLDOWN_ACTIVE && cooldownRemainingMs !== null
+          ? Math.min(Math.max(cooldownRemainingMs, DAEMON_UPGRADE_COOLDOWN_RETRY_MIN_MS), DAEMON_UPGRADE_COOLDOWN_RETRY_MAX_MS)
+          : retryAfterMs !== null
+            // Ask again once the hold has lapsed, never faster than the shared floor (no retry storm) or later than the cap.
+            ? Math.min(Math.max(retryAfterMs + DAEMON_UPGRADE_DEFERRAL_RETRY_MARGIN_MS, DAEMON_UPGRADE_COOLDOWN_RETRY_MIN_MS), DAEMON_UPGRADE_COOLDOWN_RETRY_MAX_MS)
+            : DAEMON_UPGRADE_BUSY_RETRY_INTERVAL_MS,
+      );
+      this.logAutoUpgradeWait(targetVersion, shownReason);
+      return fromAuto ? 'absorbed' : 'relay';
+    }
+    this.recordAutoUpgradeFailure(targetVersion, reason, now);
+    return 'relay';
+  }
+
+  /** Controlled nodes are passive workers: auth + a live socket is the
+   * authoritative idle/ready boundary. Full daemons intentionally never use
+   * this path and retain the explicit operator-confirmation policy. */
+  /**
+   * The server-driven automatic upgrade trigger, shared by controlled nodes and
+   * full daemons. It decides only WHETHER to ask (version lag, opt-out, failure
+   * backoff for this exact target); a full daemon then decides WHEN it can
+   * safely act through its own busy gates and answers with a block receipt
+   * that handleDaemonUpgradeBlocked turns into a bounded retry.
+   */
+  private maybeAutoUpgradeDaemon(now = Date.now()): RequestDaemonUpgradeResult | null {
+    if (!this.authenticated) return null;
+    this.releaseManualUpgradeSentToEarlierConnection();
+    // An operator may explicitly hold the server-driven trigger closed while
+    // retaining manual upgrades. The published image does not set this value.
+    if (isDaemonAutoUpgradeDisabledByEnv()) {
+      this.logAutoUpgradeWait(process.env.APP_VERSION ?? null, CONTROLLED_NODE_UPGRADE_WAIT_REASON.DISABLED_BY_ENV);
+      return null;
+    }
+    const targetVersion = process.env.APP_VERSION;
+    if (!targetVersion || targetVersion === '0.0.0') {
+      this.logAutoUpgradeWait(null, CONTROLLED_NODE_UPGRADE_WAIT_REASON.SERVER_VERSION_UNKNOWN);
+      return null;
+    }
+    if (!this.daemonVersion) {
+      this.logAutoUpgradeWait(targetVersion, CONTROLLED_NODE_UPGRADE_WAIT_REASON.DAEMON_VERSION_UNKNOWN);
+      return null;
+    }
+    this.autoUpgradeTargetVersion = targetVersion;
+    if (this.daemonNodeRole === NODE_ROLE.FULL && this.autoUpgradeDisabledOnDaemon
+      && isDaemonAutoUpgradeAvailable(this.daemonVersion, targetVersion)) {
+      // The daemon's own opt-out refused source:auto on this connection. Do not
+      // ask again until it reconnects (config/env are re-read then); a manual
+      // upgrade is unaffected.
+      this.logAutoUpgradeWait(targetVersion, DAEMON_UPGRADE_BLOCK_REASON.AUTO_UPGRADE_DISABLED);
+      return null;
+    }
+    // A full daemon is only moved automatically along its own release channel;
+    // a controlled node keeps converging to the server's exact version.
+    const upgradeApplies = this.daemonNodeRole === NODE_ROLE.FULL
+      ? isDaemonAutoUpgradeAvailable(this.daemonVersion, targetVersion)
+      : isDaemonUpgradeAvailable(this.daemonVersion, targetVersion);
+    if (!upgradeApplies) {
+      this.setAutoUpgradeState(CONTROLLED_NODE_UPGRADE_STATUS.CURRENT, null, null);
+      this.daemonUpgradeCoordinator.clearIfTargetVersionMatches(this.daemonVersion);
+      this.resetAutoUpgradeAttempts(null);
+      return null;
+    }
+    // Attempt bookkeeping belongs to one target: a new server version is a new
+    // lifecycle, whatever happened to the previous one.
+    if (this.autoUpgradeAttemptTarget !== targetVersion) {
+      this.resetAutoUpgradeAttempts(targetVersion);
+    }
+    const attempts = this.autoUpgradeAttempts;
+    const lastAttemptAt = this.autoUpgradeLastAttemptAt;
+    const retryAfterMs = attempts > 0 ? controlledNodeUpgradeRetryDelayMs(attempts) : 0;
+    const retryRemainingMs = lastAttemptAt === null ? 0 : lastAttemptAt + retryAfterMs - now;
+    if (this.autoUpgradeStatus === CONTROLLED_NODE_UPGRADE_STATUS.FAILED) {
+      // A persisted failure blocks only this exact target, and only until the
+      // bounded retry is due. Loaded from the DB (no in-memory attempt) it is
+      // due immediately, so a node can never be stranded by an old failure.
+      if (retryRemainingMs > 0) {
+        this.scheduleAutoUpgradeRetry(retryRemainingMs);
+        this.logAutoUpgradeWait(targetVersion, CONTROLLED_NODE_UPGRADE_WAIT_REASON.RETRY_BACKOFF);
+        return null;
+      }
+      this.daemonUpgradeCoordinator.releaseTerminalBlock(targetVersion, now);
+      // A delivered-but-never-completed attempt leaves a `sent` lifecycle
+      // instead of a terminal block; its backoff is over too (no-op otherwise).
+      this.daemonUpgradeCoordinator.prepareRetryAfterDaemonRestart(now);
+    } else if (attempts > 0 && this.daemonUpgradeCoordinator.sentLifecycleFor(targetVersion)) {
+      // Delivered earlier, yet the daemon authenticated again still on the old
+      // version: the install did not complete. Offer it again, but only after
+      // the bounded backoff for this attempt count, so a daemon that restarts
+      // without upgrading cannot be asked on every reconnect.
+      if (retryRemainingMs > 0) {
+        // A controlled node keeps its established behavior (offered again on its
+        // next reconnect after the backoff); a full daemon, which may stay
+        // connected for days, gets the retry scheduled for it.
+        if (this.daemonNodeRole === NODE_ROLE.FULL) {
+          this.scheduleAutoUpgradeRetry(retryRemainingMs);
+          this.setAutoUpgradeState(
+            CONTROLLED_NODE_UPGRADE_STATUS.FAILED,
+            targetVersion,
+            CONTROLLED_NODE_UPGRADE_WAIT_REASON.VERSION_UNCHANGED_AFTER_UPGRADE,
+          );
+          this.logAutoUpgradeWait(targetVersion, CONTROLLED_NODE_UPGRADE_WAIT_REASON.VERSION_UNCHANGED_AFTER_UPGRADE);
+          return null;
+        }
+      } else {
+        this.daemonUpgradeCoordinator.prepareRetryAfterDaemonRestart(now);
+      }
+    }
+    this.setAutoUpgradeState(
+      this.autoUpgradeStatus === CONTROLLED_NODE_UPGRADE_STATUS.DEFERRED
+        ? CONTROLLED_NODE_UPGRADE_STATUS.DEFERRED
+        : CONTROLLED_NODE_UPGRADE_STATUS.AVAILABLE,
+      targetVersion,
+      this.autoUpgradeReason,
+    );
+    const result = this.requestDaemonUpgrade({
+      targetVersion,
+      source: DAEMON_UPGRADE_SOURCE.AUTO,
+    });
+    if (result.deliveryStatus === DAEMON_UPGRADE_DELIVERY_STATUS.SENT) {
+      this.lastLoggedAutoUpgradeWait = null;
+      this.setAutoUpgradeState(CONTROLLED_NODE_UPGRADE_STATUS.UPGRADING, targetVersion, null);
+    } else if (result.deliveryStatus === DAEMON_UPGRADE_DELIVERY_STATUS.PENDING_OFFLINE
+      || result.deliveryStatus === DAEMON_UPGRADE_DELIVERY_STATUS.BACKOFF) {
+      const failed = result.deliveryStatus === DAEMON_UPGRADE_DELIVERY_STATUS.BACKOFF;
+      const reason = result.reason ?? this.daemonUpgradeNotReadyReason() ?? null;
+      this.setAutoUpgradeState(
+        failed ? CONTROLLED_NODE_UPGRADE_STATUS.FAILED : CONTROLLED_NODE_UPGRADE_STATUS.DEFERRED,
+        targetVersion,
+        reason,
+      );
+      this.logAutoUpgradeWait(targetVersion, reason);
+    } else {
+      // already_in_progress / suppressed / anything else: still say why nothing was sent.
+      this.logAutoUpgradeWait(targetVersion, result.reason ?? result.deliveryStatus);
+    }
+    return result;
+  }
+
+  /** Log a held-back upgrade once per distinct reason, never per flush. */
+  private logAutoUpgradeWait(targetVersion: string | null, reason: string | null): void {
+    const key = `${targetVersion ?? 'none'}:${reason ?? 'unknown'}`;
+    if (this.lastLoggedAutoUpgradeWait === key) return;
+    this.lastLoggedAutoUpgradeWait = key;
+    logger.info({
+      serverId: this.serverId,
+      daemonVersion: this.daemonVersion,
+      targetVersion,
+      reason,
+    }, 'daemon auto-upgrade is being held back');
+  }
+
+  private resetAutoUpgradeAttempts(targetVersion: string | null): void {
+    this.autoUpgradeAttemptTarget = targetVersion;
+    this.autoUpgradeAttempts = 0;
+    this.autoUpgradeLastAttemptAt = null;
+    if (targetVersion === null) this.clearAutoUpgradeRetryTimer();
+  }
+
+  private clearAutoUpgradeRetryTimer(): void {
+    if (this.autoUpgradeRetryTimer) clearTimeout(this.autoUpgradeRetryTimer);
+    this.autoUpgradeRetryTimer = null;
+    this.autoUpgradeNextRetryAt = null;
+  }
+
+  /** Count one delivered upgrade command for the current target. */
+  private noteAutoUpgradeSent(message: Record<string, unknown>, now = Date.now()): void {
+    this.daemonUpgradeSentGeneration = this.daemonGeneration;
+    // A full daemon's manual upgrade is the operator's own action and must not
+    // advance the automatic trigger's failure backoff (and vice versa).
+    if (this.daemonNodeRole !== NODE_ROLE.CONTROLLED && message.source === DAEMON_UPGRADE_SOURCE.MANUAL) return;
+    const target = typeof message.targetVersion === 'string' ? message.targetVersion : this.autoUpgradeTargetVersion;
+    if (!target) return;
+    if (this.autoUpgradeAttemptTarget !== target) this.resetAutoUpgradeAttempts(target);
+    this.autoUpgradeAttempts += 1;
+    this.autoUpgradeLastAttemptAt = now;
+  }
+
+  private recordAutoUpgradeFailure(targetVersion: string, reason: string, now = Date.now()): void {
+    this.daemonUpgradeCoordinator.blockTargetAfterTerminalFailure(targetVersion, now);
+    if (this.autoUpgradeAttemptTarget !== targetVersion) {
+      this.resetAutoUpgradeAttempts(targetVersion);
+      this.autoUpgradeAttempts = 1;
+    }
+    this.autoUpgradeLastAttemptAt = now;
+    const retryInMs = controlledNodeUpgradeRetryDelayMs(Math.max(this.autoUpgradeAttempts, 1));
+    this.setAutoUpgradeState(CONTROLLED_NODE_UPGRADE_STATUS.FAILED, targetVersion, reason);
+    logger.warn({
+      serverId: this.serverId,
+      daemonVersion: this.daemonVersion,
+      targetVersion,
+      reason,
+      attempts: this.autoUpgradeAttempts,
+      retryInMs,
+    }, 'daemon upgrade failed; the same target is retried after a backoff');
+    this.scheduleAutoUpgradeRetry(retryInMs);
+  }
+
+  private scheduleAutoUpgradeRetry(delayMs: number): void {
+    if (this.autoUpgradeRetryTimer || !this.daemonWs) return;
+    const ws = this.daemonWs;
+    const generation = this.daemonGeneration;
+    const waitMs = Math.max(1_000, delayMs);
+    this.autoUpgradeNextRetryAt = Date.now() + waitMs;
+    this.autoUpgradeRetryTimer = setTimeout(() => {
+      this.autoUpgradeRetryTimer = null;
+      this.autoUpgradeNextRetryAt = null;
+      if (this.daemonWs !== ws || this.daemonGeneration !== generation || !this.authenticated) return;
+      this.maybeAutoUpgradeDaemon();
+      this.flushPendingDaemonUpgrade(ws);
+    }, waitMs);
+    (this.autoUpgradeRetryTimer as { unref?: () => void }).unref?.();
   }
 
   private sendDaemonUpgradeBlockedAck(
@@ -6728,35 +11389,55 @@ export class WsBridge {
     }
   }
 
-  private daemonUpgradeBlockedRetryDelayMs(msg: Record<string, unknown>): number | null {
-    const reason = typeof msg.reason === 'string' ? msg.reason : 'unknown';
-    if (reason === 'cooldown_active') {
-      const cooldownRemainingMs = typeof msg.cooldownRemainingMs === 'number' && Number.isFinite(msg.cooldownRemainingMs)
-        ? msg.cooldownRemainingMs
-        : null;
-      if (cooldownRemainingMs == null || cooldownRemainingMs <= 0) return DAEMON_UPGRADE_BLOCKED_MIN_RETRY_MS;
-      return Math.min(
-        DAEMON_UPGRADE_BLOCKED_MAX_RETRY_MS,
-        Math.max(DAEMON_UPGRADE_BLOCKED_MIN_RETRY_MS, Math.ceil(cooldownRemainingMs)),
-      );
+  /**
+   * A manual command was written to an earlier connection and the daemon is
+   * back on this one, still lagging: it did not (or could not) upgrade. Leaving
+   * that lifecycle `sent` answered every later request `already_in_progress`
+   * forever, so release it; the operator can confirm again and the automatic
+   * trigger (with its own attempt/backoff counters) takes over meanwhile.
+   */
+  private releaseManualUpgradeSentToEarlierConnection(): void {
+    if (this.daemonNodeRole !== NODE_ROLE.FULL) return;
+    const lifecycle = this.daemonUpgradeCoordinator.snapshot();
+    if (lifecycle?.status === 'sent'
+      && lifecycle.source === DAEMON_UPGRADE_SOURCE.MANUAL
+      && this.daemonUpgradeSentGeneration !== null
+      && this.daemonUpgradeSentGeneration !== this.daemonGeneration) {
+      this.daemonUpgradeCoordinator.releaseSentLifecycle();
     }
-    if (!DAEMON_UPGRADE_TRANSIENT_BLOCK_REASONS.has(reason)) return null;
-    return DAEMON_UPGRADE_BLOCKED_RETRY_MS;
   }
 
   requestDaemonUpgrade(input: {
     targetVersion?: unknown;
     source?: DaemonUpgradeSource;
+    /** Operator-confirmed forced upgrade; only honored for source manual. */
+    force?: boolean;
     isStillCurrent?: () => boolean;
   } = {}): RequestDaemonUpgradeResult {
+    this.releaseManualUpgradeSentToEarlierConnection();
     const result = this.daemonUpgradeCoordinator.request({
       targetVersion: input.targetVersion,
       source: input.source ?? 'manual',
+      force: input.force === true,
       skipPublicationGate: this.daemonNodeRole === NODE_ROLE.CONTROLLED,
       isDaemonReady: () => this.isDaemonReadyForUpgrade(),
       isStillCurrent: input.isStillCurrent,
-      send: (message) => this.sendDirectToDaemon(message),
+      send: (message) => {
+        this.noteAutoUpgradeSent(message);
+        this.sendDirectToDaemon(message);
+      },
     });
+    if (this.daemonNodeRole === NODE_ROLE.CONTROLLED && (input.source ?? DAEMON_UPGRADE_SOURCE.MANUAL) === DAEMON_UPGRADE_SOURCE.MANUAL) {
+      this.setAutoUpgradeState(
+        result.deliveryStatus === DAEMON_UPGRADE_DELIVERY_STATUS.SENT
+          ? CONTROLLED_NODE_UPGRADE_STATUS.UPGRADING
+          : result.deliveryStatus === DAEMON_UPGRADE_DELIVERY_STATUS.BACKOFF
+            ? CONTROLLED_NODE_UPGRADE_STATUS.FAILED
+            : CONTROLLED_NODE_UPGRADE_STATUS.DEFERRED,
+        result.targetVersion ?? this.autoUpgradeTargetVersion,
+        result.reason ?? null,
+      );
+    }
     if (
       result.ok
       && result.deliveryStatus === DAEMON_UPGRADE_DELIVERY_STATUS.PENDING_OFFLINE
@@ -6768,12 +11449,40 @@ export class WsBridge {
     return result;
   }
 
+  daemonUpgradeStatus() {
+    return {
+      currentVersion: this.daemonVersion,
+      upgrade: this.daemonUpgradeCoordinator.snapshot(),
+      autoUpgrade: this.daemonAutoUpgradeView(),
+    };
+  }
+
+  /**
+   * Server-driven upgrade status of a FULL daemon for the status card: what the
+   * automatic trigger is doing and why it is waiting. Null while the daemon is
+   * current or the role has its own surface (controlled nodes persist theirs).
+   */
+  private daemonAutoUpgradeView(): DaemonAutoUpgradeView | null {
+    if (this.daemonNodeRole !== NODE_ROLE.FULL || !this.authenticated) return null;
+    if (this.autoUpgradeStatus === CONTROLLED_NODE_UPGRADE_STATUS.CURRENT
+      || !isDaemonAutoUpgradeAvailable(this.daemonVersion, process.env.APP_VERSION)) return null;
+    return {
+      status: this.autoUpgradeStatus,
+      reason: this.autoUpgradeReason,
+      targetVersion: this.autoUpgradeTargetVersion,
+      nextRetryAt: this.autoUpgradeNextRetryAt,
+    };
+  }
+
   private flushPendingDaemonUpgrade(ws: WebSocket): RequestDaemonUpgradeResult | null {
     const result = this.daemonUpgradeCoordinator.flushPending({
       skipPublicationGate: this.daemonNodeRole === NODE_ROLE.CONTROLLED,
       isDaemonReady: () => this.isDaemonReadyForUpgrade(),
       isStillCurrent: () => this.daemonWs === ws && this.authenticated,
-      send: (message) => this.sendDirectToDaemon(message),
+      send: (message) => {
+        this.noteAutoUpgradeSent(message);
+        this.sendDirectToDaemon(message);
+      },
     });
     if (
       result?.ok
@@ -6784,11 +11493,26 @@ export class WsBridge {
       return { ...result, deliveryStatus: DAEMON_UPGRADE_DELIVERY_STATUS.PREPARING_RESCUE };
     }
     if (result?.deliveryStatus === DAEMON_UPGRADE_DELIVERY_STATUS.SENT) {
+      if (this.daemonNodeRole === NODE_ROLE.CONTROLLED) {
+        this.setAutoUpgradeState(
+          CONTROLLED_NODE_UPGRADE_STATUS.UPGRADING,
+          result.targetVersion ?? this.autoUpgradeTargetVersion,
+          null,
+        );
+      }
       logger.info({
         serverId: this.serverId,
         targetVersion: result.targetVersion,
         upgradeId: result.upgradeId,
       }, 'Flushed pending daemon.upgrade after daemon auth');
+    } else if (
+      result?.deliveryStatus === DAEMON_UPGRADE_DELIVERY_STATUS.PENDING_OFFLINE
+      && this.daemonNodeRole === NODE_ROLE.CONTROLLED
+    ) {
+      const reason = this.daemonUpgradeNotReadyReason();
+      const target = result.targetVersion ?? this.autoUpgradeTargetVersion;
+      this.setAutoUpgradeState(CONTROLLED_NODE_UPGRADE_STATUS.DEFERRED, target, reason);
+      if (target) this.logAutoUpgradeWait(target, reason);
     } else if (result?.deliveryStatus === DAEMON_UPGRADE_DELIVERY_STATUS.PENDING_PUBLICATION) {
       logger.info({
         serverId: this.serverId,
@@ -6800,15 +11524,29 @@ export class WsBridge {
   }
 
   private isDaemonReadyForUpgrade(): boolean {
+    return this.daemonUpgradeNotReadyReason() === null;
+  }
+
+  /**
+   * Why an upgrade cannot be sent right now, or null when it can. A controlled
+   * node hosts no agent sessions and never publishes a `session_list`, so the
+   * absence of a snapshot means "nothing to interrupt", not "unknown": only a
+   * dispatch in flight or a session the node itself reports as busy holds the
+   * upgrade back. Requiring a snapshot kept every controlled node deferred
+   * forever, with no reason shown.
+   */
+  private daemonUpgradeNotReadyReason(): string | null {
+    if (!this.daemonWs || !this.authenticated || this.authPromise !== null) {
+      return CONTROLLED_NODE_UPGRADE_WAIT_REASON.DAEMON_NOT_READY;
+    }
     const syncReady = this.upgradeBlockedSyncRequiredGeneration !== this.daemonGeneration
       || this.upgradeBlockedSyncCompleteGeneration === this.daemonGeneration;
-    return Boolean(
-      this.daemonWs
-      && this.authenticated
-      && this.authPromise === null
-      && syncReady
-      && !this.needsLegacyWindowsUpgradeRescue(),
-    );
+    if (!syncReady) return CONTROLLED_NODE_UPGRADE_WAIT_REASON.BLOCKED_SYNC_PENDING;
+    if (this.daemonNodeRole === NODE_ROLE.CONTROLLED && this.hasAuthoritativeBusySession()) {
+      return DAEMON_UPGRADE_BLOCK_REASON.SESSION_BUSY;
+    }
+    if (this.needsLegacyWindowsUpgradeRescue()) return CONTROLLED_NODE_UPGRADE_WAIT_REASON.LEGACY_RESCUE_PENDING;
+    return null;
   }
 
   private requiresLegacyWindowsUpgradeRescue(): boolean {
@@ -6842,7 +11580,6 @@ export class WsBridge {
         restartAttempts: 0,
         restartInFlight: false,
         restartTimer: null,
-        restartCoordinatorPrepared: false,
       };
     }
     this.ensureLegacyWindowsUpgradeRescue();
@@ -6866,7 +11603,6 @@ export class WsBridge {
         restartAttempts: 0,
         restartInFlight: false,
         restartTimer: null,
-        restartCoordinatorPrepared: false,
       }
       : null;
     this.legacyUpgradeRescuePreparedGeneration = this.requiresLegacyWindowsUpgradeRescue()
@@ -7034,8 +11770,50 @@ export class WsBridge {
       || state.restartTimer
     ) return;
 
+    const targetVersion = process.env.APP_VERSION;
+    if (!targetVersion || targetVersion === '0.0.0') return;
+
+    // A node that disconnects every time the restart command runs starts a
+    // brand new generation on each reconnect; `state` above was just rebuilt
+    // from scratch for that generation, so its own restartAttempts cannot
+    // carry a backoff across the disconnect. `legacyUpgradeRestartThrottle`
+    // is the persistent, cross-generation source of truth for that backoff.
+    const { attempts, waitMs } = resolveLegacyWindowsUpgradeRestartAttempt(
+      this.legacyUpgradeRestartThrottle,
+      targetVersion,
+      Date.now(),
+    );
+    if (waitMs > 0) {
+      state.restartAttempts = attempts;
+      // The previous restart did not clear the latch: say why nothing happens until the schedule allows another.
+      this.setAutoUpgradeState(
+        CONTROLLED_NODE_UPGRADE_STATUS.DEFERRED,
+        targetVersion,
+        CONTROLLED_NODE_UPGRADE_WAIT_REASON.LEGACY_RESTART_BACKOFF,
+      );
+      this.logAutoUpgradeWait(targetVersion, CONTROLLED_NODE_UPGRADE_WAIT_REASON.LEGACY_RESTART_BACKOFF);
+      state.restartTimer = setTimeout(() => {
+        state.restartTimer = null;
+        this.ensureLegacyWindowsUpgradeRestart(ws);
+      }, waitMs);
+      state.restartTimer.unref?.();
+      return;
+    }
+
     state.restartInFlight = true;
-    state.restartAttempts += 1;
+    state.restartAttempts = attempts;
+    logger.info({
+      serverId: this.serverId,
+      daemonVersion: this.daemonVersion,
+      targetVersion,
+      attempts,
+      nextAttemptNotBeforeInMs: controlledNodeUpgradeRetryDelayMs(attempts),
+    }, 'restarting a legacy Windows node to clear its stale upgrade-in-progress latch');
+    this.legacyUpgradeRestartThrottle = {
+      targetVersion,
+      attempts,
+      notBeforeMs: Date.now() + controlledNodeUpgradeRetryDelayMs(attempts),
+    };
     const restartId = randomUUID();
     const correlationId = `upgrade-restart-${restartId}`;
 
@@ -7046,10 +11824,10 @@ export class WsBridge {
         || !this.authenticated
         || this.legacyUpgradeRescuePreparedGeneration !== generation
       ) return;
-      const retryMs = Math.min(
-        LEGACY_UPGRADE_RESTART_RETRY_MAX_MS,
-        LEGACY_UPGRADE_RESTART_RETRY_BASE_MS * (2 ** Math.min(2, state.restartAttempts - 1)),
-      );
+      const retryMs = controlledNodeUpgradeRetryDelayMs(state.restartAttempts);
+      if (this.legacyUpgradeRestartThrottle?.targetVersion === targetVersion) {
+        this.legacyUpgradeRestartThrottle.notBeforeMs = Date.now() + retryMs;
+      }
       state.restartTimer = setTimeout(() => {
         state.restartTimer = null;
         this.ensureLegacyWindowsUpgradeRestart(ws);
@@ -7058,10 +11836,6 @@ export class WsBridge {
     };
 
     void (async () => {
-      const targetVersion = process.env.APP_VERSION;
-      if (!targetVersion || targetVersion === '0.0.0') {
-        throw new Error('legacy_upgrade_restart_target_version_unavailable');
-      }
       const expectedSignerSha256 = await resolveLegacyUpgradePublisherSigner(targetVersion);
       const prepared = buildLegacyWindowsUpgradeRestartCommand(
         state.preparedRescueId!,
@@ -7090,11 +11864,10 @@ export class WsBridge {
         || !this.authenticated
         || this.legacyUpgradeRescuePreparedGeneration !== generation
       ) throw new Error('legacy_upgrade_restart_generation_changed_before_dispatch');
-      if (!state.restartCoordinatorPrepared) {
-        if (!this.daemonUpgradeCoordinator.prepareRetryAfterDaemonRestart()) {
-          throw new Error('legacy_upgrade_restart_lifecycle_not_sent');
-        }
-        state.restartCoordinatorPrepared = true;
+      // Idempotent: a retry in the same generation (or a daemon.upgrade re-sent to the still-latched
+      // node meanwhile) is put back to `pending_offline` again, never an error.
+      if (this.daemonUpgradeCoordinator.prepareForLatchRescueRestart() === 'blocked') {
+        throw new Error('legacy_upgrade_restart_target_blocked');
       }
       const pending = registerPendingExec(
         this.serverId,
@@ -7146,7 +11919,19 @@ export class WsBridge {
         outcome: 'failed',
         reason: error instanceof Error ? error.message : 'legacy_upgrade_restart_failed',
       }).catch((auditError) => logger.error({ auditError, serverId: this.serverId }, 'Legacy upgrade restart result audit failed'));
-      logger.warn({ error, serverId: this.serverId }, 'Legacy Windows upgrade restart failed; keeping old node online');
+      const retryInMs = controlledNodeUpgradeRetryDelayMs(state.restartAttempts);
+      logger.warn({
+        error,
+        serverId: this.serverId,
+        targetVersion,
+        attempts: state.restartAttempts,
+        retryInMs,
+      }, 'Legacy Windows upgrade restart failed; keeping old node online');
+      this.setAutoUpgradeState(
+        CONTROLLED_NODE_UPGRADE_STATUS.DEFERRED,
+        targetVersion,
+        CONTROLLED_NODE_UPGRADE_WAIT_REASON.LEGACY_RESTART_FAILED,
+      );
       scheduleRetry();
     });
   }
@@ -7160,21 +11945,58 @@ export class WsBridge {
     }
   }
 
+  /**
+   * The users behind this bridge's live connections: every browser socket (member, controlled-target and share-scoped alike) and the
+   * daemon's owner. The account watcher (security/account-watch.ts) asks one status question for all of them.
+   */
+  collectLiveUserIds(into: Set<string>): void {
+    for (const userId of this.browserUserIds.values()) into.add(userId);
+    if (this.daemonWs && this.daemonOwnerUserId) into.add(this.daemonOwnerUserId);
+  }
+
+  /**
+   * End every live connection of users whose account may no longer act: their browser sockets, and the daemon whose owner they are.
+   * Close code 4003 with the account's error code as the reason (the same code a revoked credential gets, which clients back off on).
+   */
+  closeConnectionsOfUsers(userIds: ReadonlySet<string>, reason: string): { browserSockets: number; daemon: boolean } {
+    let browserSockets = 0;
+    for (const [ws, userId] of [...this.browserUserIds]) {
+      if (!userIds.has(userId)) continue;
+      browserSockets += 1;
+      try { ws.close(ACCOUNT_WS_CLOSE_CODE, reason); } catch { /* already closing */ }
+    }
+    const daemon = Boolean(this.daemonWs && this.daemonOwnerUserId && userIds.has(this.daemonOwnerUserId));
+    if (daemon) this.kickDaemon({ code: ACCOUNT_WS_CLOSE_CODE, reason });
+    return { browserSockets, daemon };
+  }
+
   /** Force-close the daemon WebSocket. Use after token rotation to evict the stale connection. */
-  kickDaemon(): void {
+  kickDaemon(close: { code: number; reason: string } = { code: 4001, reason: 'token_rotated' }): void {
     if (this.daemonWs) {
+      if (this.db) {
+        void remoteDesktopConsentCancellation.daemonDisconnected(
+          this.db,
+          this.serverId,
+          this.daemonGeneration,
+        ).catch(() => {});
+      }
+      if (this.db && this.daemonOwnerUserId) {
+        this.failDisconnectedCapabilityOperations(this.db, this.daemonOwnerUserId);
+      }
       // Production WebSocket close is asynchronous. Drain request waiters before
       // clearing the socket identity, or the guarded close handler cannot do it.
       this.rejectAllPendingFileTransfers('daemon_disconnected');
-      try { this.daemonWs.close(4001, 'token_rotated'); } catch { /* ignore */ }
+      try { this.daemonWs.close(close.code, close.reason); } catch { /* ignore */ }
       this.daemonWs = null;
       this.authenticated = false;
       this.authPromise = null;
+      this.credentialPromise = null;
       this.upgradeBlockedSyncRequiredGeneration = null;
       this.upgradeBlockedSyncCompleteGeneration = null;
       this.daemonP2pWorkflowCapabilities = null;
       this.controlledNodeCapabilities.clear();
       this.daemonControlledOs = null;
+      this.daemonControlledNodeId = null;
       this.daemonOwnerUserId = null;
       this.resetLegacyUpgradeRescueForGeneration(this.daemonGeneration);
       this.remoteDesktopRouter.stopAll(REMOTE_DESKTOP_TERMINAL_REASON.DAEMON_REPLACED);
@@ -7220,17 +12042,78 @@ export class WsBridge {
     }
   }
 
+  /**
+   * An install on the daemon's own computer: its remote-desktop worker, or the
+   * controlled node, which runs as root there -- silently where its user may
+   * sudo without a password. Only the daemon's owner may ask; someone it is
+   * shared with could otherwise enrol a node on the owner's machine to their
+   * own account. Never queued: an install that starts minutes later, on a
+   * machine nobody is watching, is worse than none.
+   */
+  private forwardDaemonInstallRequest(userId: string, raw: string): void {
+    if (!this.daemonOwnerUserId || userId !== this.daemonOwnerUserId) {
+      logger.warn({ serverId: this.serverId }, 'Refused a remote-desktop install request from a non-owner');
+      return;
+    }
+    if (!this.daemonWs || !this.authenticated || this.daemonWs.readyState !== WebSocket.OPEN
+      || this.daemonNodeRole === NODE_ROLE.CONTROLLED) return;
+    try {
+      this.daemonWs.send(raw);
+    } catch (err) {
+      logger.error({ serverId: this.serverId, err }, 'Failed to forward a remote-desktop install request');
+    }
+  }
+
   /** Request same-version worker repair without queueing or replaying it. */
   tryInstallControlledNodeRemoteDesktopWorker(expectedGeneration: number): 'sent' | 'offline' | 'generation_changed' | 'send_failed' {
     if (!this.daemonWs || !this.authenticated || this.daemonWs.readyState !== WebSocket.OPEN) return 'offline';
     if (this.daemonGeneration !== expectedGeneration) return 'generation_changed';
+    // Either platform's install offer. Checking only the Windows capability
+    // refused the request from a macOS node that had just advertised it could
+    // install -- the browser showed the button, the node was ready to act, and
+    // the relay in between dropped it.
     if (this.daemonNodeRole !== NODE_ROLE.CONTROLLED
-      || !this.hasDaemonCapability(REMOTE_DESKTOP_INSTALLABLE_CAPABILITY)) return 'offline';
+      || !(this.hasDaemonCapability(REMOTE_DESKTOP_INSTALLABLE_CAPABILITY)
+        || this.hasDaemonCapability(REMOTE_DESKTOP_MACOS_INSTALLABLE_CAPABILITY))) return 'offline';
     try {
       this.daemonWs.send(JSON.stringify({ type: REMOTE_DESKTOP_INSTALL_MSG.REQUEST }));
       return 'sent';
     } catch (err) {
       logger.error({ serverId: this.serverId, err }, 'Failed to request remote desktop worker repair');
+      return 'send_failed';
+    }
+  }
+
+  /** Request one independent worker refresh on an online controlled node. */
+  tryRefreshControlledNodeRemoteDesktopWorker(expectedGeneration: number): 'sent' | 'offline' | 'generation_changed' | 'send_failed' {
+    if (!this.daemonWs || !this.authenticated || this.daemonWs.readyState !== WebSocket.OPEN) return 'offline';
+    if (this.daemonGeneration !== expectedGeneration) return 'generation_changed';
+    if (this.daemonNodeRole !== NODE_ROLE.CONTROLLED
+      || !this.hasDaemonCapability(REMOTE_DESKTOP_CAPABILITY)
+      || !this.hasDaemonCapability(CONTROLLED_NODE_WORKER_REFRESH_CAPABILITY)) return 'offline';
+    try {
+      this.daemonWs.send(JSON.stringify({ type: CONTROLLED_NODE_WORKER_REFRESH_MSG.REQUEST }));
+      return 'sent';
+    } catch (err) {
+      logger.error({ serverId: this.serverId, err }, 'Failed to request remote desktop worker refresh');
+      return 'send_failed';
+    }
+  }
+
+  /**
+   * Ask a node to raise its own permission dialog. Never queued or replayed:
+   * a prompt that appears minutes later, on a machine nobody is watching, is
+   * worse than none -- the person who asked for it has gone.
+   */
+  tryRequestControlledNodeRemoteDesktopPermissions(expectedGeneration: number): 'sent' | 'offline' | 'generation_changed' | 'send_failed' {
+    if (!this.daemonWs || !this.authenticated || this.daemonWs.readyState !== WebSocket.OPEN) return 'offline';
+    if (this.daemonGeneration !== expectedGeneration) return 'generation_changed';
+    if (this.daemonNodeRole !== NODE_ROLE.CONTROLLED) return 'offline';
+    try {
+      this.daemonWs.send(JSON.stringify({ type: REMOTE_DESKTOP_PERMISSION_MSG.REQUEST }));
+      return 'sent';
+    } catch (err) {
+      logger.error({ serverId: this.serverId, err }, 'Failed to request remote desktop permissions');
       return 'send_failed';
     }
   }
@@ -7265,13 +12148,263 @@ export class WsBridge {
   private trySendRemoteDesktop(message: Record<string, unknown>, expectedGeneration: number): boolean {
     if (!this.daemonWs || !this.authenticated || this.daemonWs.readyState !== WebSocket.OPEN) return false;
     if (this.daemonGeneration !== expectedGeneration
-      || !this.hasDaemonCapability(REMOTE_DESKTOP_CAPABILITY)) return false;
+      || !this.daemonAdvertisesRemoteDesktopProfile()) return false;
     try {
       this.daemonWs.send(JSON.stringify(message));
       return true;
     } catch {
       incrementCounter('remote_desktop.signaling_send_failed', { type: String(message.type ?? 'unknown') });
       return false;
+    }
+  }
+
+  private trySendRemoteDesktopConsent(command: RemoteDesktopConsentDispatchCommand): boolean {
+    const parsed = validateRemoteDesktopConsentMessage(command.message);
+    if (!parsed.ok || parsed.value.type === REMOTE_DESKTOP_CONSENT_MSG.RESULT) return false;
+    if (command.executionServerId !== this.serverId
+      || command.daemonGeneration !== this.daemonGeneration
+      || !this.daemonWs || !this.authenticated || this.daemonWs.readyState !== WebSocket.OPEN
+      || this.remoteDesktopAuthorityReadyGeneration !== this.daemonGeneration
+      || !this.hasDaemonCapability(REMOTE_DESKTOP_LOCAL_CONSENT_CAPABILITY)) return false;
+    try {
+      this.daemonWs.send(JSON.stringify(parsed.value));
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  private async requestRemoteDesktopAttendedConsent(input: {
+    actor: RemoteDesktopActor;
+    sessionId: string;
+    routeGeneration: number;
+    daemonGeneration: number;
+    mode: RemoteDesktopAccessMode;
+  }): Promise<'approved' | 'denied' | 'timeout' | 'cancelled' | 'unavailable'> {
+    const db = this.db;
+    if (!db || input.actor.source !== REMOTE_DESKTOP_ACTOR_SOURCE.ATTENDED_LINK
+      || input.daemonGeneration !== this.daemonGeneration
+      || input.actor.endpointGeneration !== input.daemonGeneration) return 'unavailable';
+    const now = await readDatabaseClock(db);
+    const deadlineAt = now + REMOTE_DESKTOP_LINK_LIMITS.CONSENT_DEADLINE_MS;
+    const localWaitUntil = Date.now() + REMOTE_DESKTOP_LINK_LIMITS.CONSENT_DEADLINE_MS;
+    const consent = await requestAttendedConsent(db, {
+      hostId: input.actor.hostId,
+      actorAuditId: input.actor.auditId,
+      browserKeyHash: hashBrowserKey(input.actor.browserKeyThumbprint),
+      executionServerId: this.serverId,
+      endpointGeneration: input.actor.endpointGeneration,
+      daemonGeneration: input.daemonGeneration,
+      mode: input.mode,
+      requesterLabel: 'Remote guest',
+      deadlineAt,
+    }, { dispatch: (command) => this.trySendRemoteDesktopConsent(command) }).catch(() => null);
+    if (!consent) return 'unavailable';
+
+    while (Date.now() < localWaitUntil) {
+      const current = await getAttendedConsent(db, consent.approvalId).catch(() => null);
+      if (!current) return 'unavailable';
+      if (current.state === REMOTE_DESKTOP_CONSENT_STATE.DENIED) return 'denied';
+      if (current.state === REMOTE_DESKTOP_CONSENT_STATE.CANCELLED) return 'cancelled';
+      if (current.state === REMOTE_DESKTOP_CONSENT_STATE.TIMED_OUT) return 'timeout';
+      if (current.state === REMOTE_DESKTOP_CONSENT_STATE.APPROVED) {
+        return consumeApprovedAttendedConsent(db, {
+          approvalId: current.approvalId,
+          hostId: input.actor.hostId,
+          actorAuditId: input.actor.auditId,
+          browserKeyHash: hashBrowserKey(input.actor.browserKeyThumbprint),
+          executionServerId: this.serverId,
+          endpointGeneration: input.actor.endpointGeneration,
+          daemonGeneration: input.daemonGeneration,
+          mode: input.mode,
+          sessionId: input.sessionId,
+        }).then(() => 'approved' as const, () => 'unavailable' as const);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      if (this.daemonGeneration !== input.daemonGeneration || !this.authenticated) return 'cancelled';
+    }
+    return 'timeout';
+  }
+
+  private async currentRemoteDesktopShellEndpoint(input: {
+    ownerUserId: string;
+    hostId: string;
+  }): Promise<RemoteDesktopShellEndpointAuthority | null> {
+    const db = this.db;
+    const socket = this.daemonWs;
+    const generation = this.daemonGeneration;
+    if (!db || !socket || socket.readyState !== WebSocket.OPEN
+      || !this.authenticated
+      || this.daemonNodeRole !== NODE_ROLE.CONTROLLED
+      || this.daemonOwnerUserId !== input.ownerUserId
+      || this.remoteDesktopAuthorityReadyGeneration !== generation
+      || !this.hasDaemonCapability(REMOTE_DESKTOP_SIGNED_SHELL_CAPABILITY)) return null;
+    const mapping = await db.queryOne<{ server_id: string }>(
+      `SELECT server_id
+         FROM remote_desktop_host_endpoints
+        WHERE server_id = $1 AND host_id = $2 AND owner_user_id = $3
+          AND endpoint_role = 'controlled'`,
+      [this.serverId, input.hostId, input.ownerUserId],
+    );
+    if (!mapping
+      || this.daemonWs !== socket
+      || this.daemonGeneration !== generation
+      || !this.authenticated
+      || this.remoteDesktopAuthorityReadyGeneration !== generation
+      || !this.hasDaemonCapability(REMOTE_DESKTOP_SIGNED_SHELL_CAPABILITY)) return null;
+    return { serverId: this.serverId, endpointGeneration: generation };
+  }
+
+  private async trySendRemoteDesktopShellLaunchContext(
+    ownerUserId: string,
+    hostId: string,
+    context: RemoteDesktopShellLaunchContext,
+    expectedGeneration: number,
+  ): Promise<boolean> {
+    const parsed = validateRemoteDesktopShellMessage({
+      type: REMOTE_DESKTOP_SHELL_MSG.LAUNCH,
+      context,
+    });
+    if (!parsed.ok || parsed.value.type !== REMOTE_DESKTOP_SHELL_MSG.LAUNCH
+      || parsed.value.context.hostId !== hostId
+      || parsed.value.context.endpointGeneration !== expectedGeneration) return false;
+    const endpoint = await this.currentRemoteDesktopShellEndpoint({ ownerUserId, hostId });
+    if (!endpoint || endpoint.endpointGeneration !== expectedGeneration) return false;
+    const socket = this.daemonWs;
+    if (!socket || socket.readyState !== WebSocket.OPEN) return false;
+    try {
+      socket.send(JSON.stringify(parsed.value));
+      return this.daemonWs === socket
+        && this.daemonGeneration === expectedGeneration
+        && this.authenticated;
+    } catch {
+      incrementCounter('remote_desktop.shell_launch_send_failed');
+      return false;
+    }
+  }
+
+  /** Management privacy uses the authenticated node socket and no secondary
+   * nonce. Exact shared validation plus capability/generation checks prevent
+   * an account/session secret or a stale command entering the node channel. */
+  private trySendRemoteDesktopManagementPrivacy(
+    message: RemoteDesktopPrivacyBegin | RemoteDesktopPrivacyEnd,
+    expectedGeneration: number,
+  ): boolean {
+    const parsed = validateRemoteDesktopPrivacyMessage(message);
+    if (!parsed.ok || parsed.value.type === REMOTE_DESKTOP_PRIVACY_MSG.ACK) return false;
+    if (!this.daemonWs || !this.authenticated || this.daemonWs.readyState !== WebSocket.OPEN) return false;
+    if (this.daemonGeneration !== expectedGeneration
+      || !this.hasDaemonCapability(REMOTE_DESKTOP_CAPTURE_PRIVACY_CAPABILITY)) return false;
+    try {
+      this.daemonWs.send(JSON.stringify(parsed.value));
+      return true;
+    } catch {
+      incrementCounter('remote_desktop.privacy_send_failed', { type: parsed.value.type });
+      return false;
+    }
+  }
+
+  private async handleRemoteDesktopManagementPrivacyAck(
+    message: Record<string, unknown>,
+    connectionGeneration: number,
+  ): Promise<void> {
+    const reject = () => { WsBridge.invalidRemoteDesktopPrivacyFramesDropped += 1; };
+    const parsed = validateRemoteDesktopPrivacyMessage(message);
+    const db = this.db;
+    if (!parsed.ok
+      || parsed.value.type !== REMOTE_DESKTOP_PRIVACY_MSG.ACK
+      || !db
+      || !this.authenticated
+      || this.daemonGeneration !== connectionGeneration
+      || !this.hasDaemonCapability(REMOTE_DESKTOP_CAPTURE_PRIVACY_CAPABILITY)) {
+      reject();
+      return;
+    }
+
+    try {
+      const ack = parsed.value;
+      const state = await getPrivacyState(db, ack.hostId);
+      if (!state
+        || state.epochId !== ack.epochId
+        || state.revision !== ack.revision
+        || state.executionServerId !== this.serverId
+        || state.daemonGeneration !== connectionGeneration) {
+        reject();
+        return;
+      }
+      const now = await readDatabaseClock(db);
+      if (state.phase === REMOTE_DESKTOP_PRIVACY_PHASE.STARTING) {
+        await acknowledgeShield(db, {
+          hostId: ack.hostId,
+          epochId: ack.epochId,
+          revision: ack.revision,
+          executionServerId: this.serverId,
+          daemonGeneration: connectionGeneration,
+          workerGeneration: ack.workerGeneration,
+          acknowledgedRoutes: ack.routes,
+          now,
+        });
+        return;
+      }
+      if (state.phase === REMOTE_DESKTOP_PRIVACY_PHASE.ENDING) {
+        await acknowledgeFreshFrame(db, {
+          hostId: ack.hostId,
+          epochId: ack.epochId,
+          revision: ack.revision,
+          executionServerId: this.serverId,
+          daemonGeneration: connectionGeneration,
+          freshFrameGeneration: ack.workerGeneration,
+          acknowledgedRoutes: ack.routes,
+          now,
+        });
+        return;
+      }
+      reject();
+    } catch {
+      // All mismatches remain fail closed in durable state. ACK payloads are
+      // intentionally not logged because route IDs are unnecessary here.
+      reject();
+    }
+  }
+
+  private async handleRemoteDesktopShellRecoveryRequired(
+    message: Record<string, unknown>,
+    connectionGeneration: number,
+  ): Promise<void> {
+    const reject = () => { WsBridge.invalidRemoteDesktopShellFramesDropped += 1; };
+    const parsed = validateRemoteDesktopShellMessage(message);
+    const db = this.db;
+    if (!parsed.ok
+      || parsed.value.type !== REMOTE_DESKTOP_SHELL_MSG.RECOVERY_REQUIRED
+      || !db
+      || !this.authenticated
+      || this.daemonNodeRole !== NODE_ROLE.CONTROLLED
+      || this.daemonGeneration !== connectionGeneration
+      || this.remoteDesktopAuthorityReadyGeneration !== connectionGeneration
+      || parsed.value.endpointGeneration !== connectionGeneration
+      || !this.hasDaemonCapability(REMOTE_DESKTOP_SIGNED_SHELL_CAPABILITY)) {
+      reject();
+      return;
+    }
+    try {
+      const state = await getPrivacyState(db, parsed.value.hostId);
+      if (!state
+        || state.epochId !== parsed.value.epochId
+        || state.executionServerId !== this.serverId
+        || state.daemonGeneration !== connectionGeneration) {
+        reject();
+        return;
+      }
+      await markRecoveryRequired(db, {
+        hostId: parsed.value.hostId,
+        epochId: parsed.value.epochId,
+        reason: parsed.value.reason,
+        now: await readDatabaseClock(db),
+      });
+    } catch {
+      // Durable state remains closed on every failure. The payload is never
+      // logged because it is unnecessary for recovery and may contain IDs.
+      reject();
     }
   }
 
@@ -7302,9 +12435,11 @@ export class WsBridge {
       || parsedType === FILE_TRANSFER_MSG.PATH_HANDLE
       || parsedType === FILE_TRANSFER_MSG.DIRECTORY_LIST
       || parsedType === FILE_TRANSFER_MSG.DELETE
+      || parsedType === FILE_TRANSFER_MSG.MACOS_OPEN_FULL_DISK_ACCESS
       || parsedType === MACHINE_DIRECT_FILE_TRANSFER_MSG.REQUEST
       || parsedType === MACHINE_DIRECT_FILE_TRANSFER_MSG.FETCH_REQUEST
       || (typeof parsedType === 'string' && parsedType.startsWith('remote_desktop.'))
+      || (typeof parsedType === 'string' && parsedType.startsWith('management_privacy.'))
     ) {
       logger.warn({ serverId: this.serverId, type: parsedType }, 'Dropped control command sent via generic sendToDaemon');
       return;
@@ -7317,7 +12452,7 @@ export class WsBridge {
       }
     } else {
       if (this.queue.length < MAX_QUEUE_SIZE) {
-        this.queue.push(message);
+        this.queue.push({ message, queuedAt: Date.now() });
       }
     }
   }
@@ -7367,7 +12502,12 @@ export class WsBridge {
   }
 
   private isBrowserForbiddenDaemonCommandType(type: string): boolean {
-    return type === DAEMON_COMMAND_TYPES.SERVER_DELETE || type.startsWith('daemon.');
+    // Agent-skills and agent-MCP requests change what runs on the machine; they
+    // come only from the owner-checked routes, never straight from a browser.
+    return type === DAEMON_COMMAND_TYPES.SERVER_DELETE
+      || type.startsWith('daemon.')
+      || type.startsWith(AGENT_SKILLS_MESSAGE_PREFIX)
+      || type.startsWith(AGENT_MCP_MESSAGE_PREFIX);
   }
 
   requestTimelineHistory(params: {
@@ -7389,12 +12529,27 @@ export class WsBridge {
 
     const requestId = `watch-hist-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
     const timeoutMs = params.timeoutMs ?? HTTP_TIMELINE_TIMEOUT_MS;
+    const boundedLimit = clampTimelineHistoryLimit(params.limit);
+    const boundedBudgetBytes = clampTimelineHistoryBudget(params.budgetBytes);
+    const outbound = boundTimelineHistoryRequest({
+      type: TIMELINE_MESSAGES.HISTORY_REQUEST,
+      sessionName: params.sessionName,
+      requestId,
+      limit: boundedLimit,
+      ...(typeof params.beforeTs === 'number' ? { beforeTs: params.beforeTs } : {}),
+      ...(typeof params.afterTs === 'number' ? { afterTs: params.afterTs } : {}),
+      budgetBytes: boundedBudgetBytes,
+      ...(typeof params.includeDetails === 'boolean' ? { includeDetails: params.includeDetails } : {}),
+    });
 
     return new Promise<Record<string, unknown>>((resolve, reject) => {
       let pending: PendingHttpTimelineRequest;
       const timer = setTimeout(() => {
         const current = this.pendingHttpTimelineRequests.get(requestId) ?? pending;
         this.settlePendingHttpTimelineRequest(requestId, current, () => reject(new Error('timeout')));
+        this.pruneCanceledTimelineDataPlaneJobs();
+        this.removeTimelineRequestGroupMember(requestId);
+        this.cancelDaemonTimelineRequest(requestId);
       }, timeoutMs);
       timer.unref?.();
 
@@ -7406,27 +12561,26 @@ export class WsBridge {
             route: 'http_request',
           });
           this.settlePendingHttpTimelineRequest(requestId, pending, () => reject(new Error(TIMELINE_REQUEST_ERROR_REASONS.REQUEST_CANCELED)));
+          this.pruneCanceledTimelineDataPlaneJobs();
+          this.removeTimelineRequestGroupMember(requestId);
+          this.cancelDaemonTimelineRequest(requestId);
         };
         params.abortSignal.addEventListener('abort', pending.abortHandler, { once: true });
       }
       this.pendingHttpTimelineRequests.set(requestId, pending);
 
+      // Share one daemon history request among identical HTTP/browser callers;
+      // each caller still receives its own requestId on the response.
+      if (this.registerTimelineHistoryAlias(outbound)) return;
+
       try {
-        this.daemonWs!.send(JSON.stringify({
-          type: TIMELINE_MESSAGES.HISTORY_REQUEST,
-          sessionName: params.sessionName,
-          requestId,
-          ...(typeof params.limit === 'number' ? { limit: params.limit } : {}),
-          ...(typeof params.beforeTs === 'number' ? { beforeTs: params.beforeTs } : {}),
-          ...(typeof params.afterTs === 'number' ? { afterTs: params.afterTs } : {}),
-          ...(typeof params.budgetBytes === 'number' ? { budgetBytes: params.budgetBytes } : {}),
-          ...(typeof params.includeDetails === 'boolean' ? { includeDetails: params.includeDetails } : {}),
-        }));
+        this.daemonWs!.send(JSON.stringify(outbound));
       } catch (err) {
         const current = this.pendingHttpTimelineRequests.get(requestId) ?? pending;
         this.settlePendingHttpTimelineRequest(requestId, current, () => {
           reject(err instanceof Error ? err : new Error(String(err)));
         });
+        this.removeTimelineRequestGroupMember(requestId);
       }
     });
   }
@@ -7632,6 +12786,37 @@ export class WsBridge {
     return !!(this.daemonWs && this.authenticated);
   }
 
+  private isRemoteDesktopGuestOutboxTargetAvailable(): boolean {
+    return this.authenticated
+      && this.remoteDesktopAuthorityReadyGeneration === this.daemonGeneration
+      && this.daemonWs?.readyState === WebSocket.OPEN
+      && this.daemonAdvertisesRemoteDesktopProfile();
+  }
+
+  /**
+   * Whether the connected daemon advertises a complete remote-desktop session
+   * profile of any platform. The Windows v2 token alone was checked before,
+   * so signaling for a macOS v3 node was refused after admission had passed.
+   */
+  private daemonAdvertisesRemoteDesktopProfile(): boolean {
+    if (!this.daemonWs || this.daemonWs.readyState !== WebSocket.OPEN) return false;
+    return resolveRemoteDesktopSessionProfile(
+      this.daemonNodeRole === NODE_ROLE.CONTROLLED
+        ? [...this.controlledNodeCapabilities]
+        : this.daemonP2pWorkflowCapabilities?.capabilities,
+    ) !== null;
+  }
+
+  private applyRemoteDesktopGuestOutboxEffect(
+    event: RemoteDesktopOutboxEvent,
+    routeId: string,
+    routeGeneration: number,
+    authority: RemoteDesktopGuestOutboxAuthorityMatch,
+  ): RemoteDesktopGuestDeliveryResult {
+    if (!this.isRemoteDesktopGuestOutboxTargetAvailable()) return { status: 'not_owner' };
+    return this.remoteDesktopRouter.applyGuestOutboxEffect(event, routeId, routeGeneration, authority);
+  }
+
   /**
    * Send a file transfer request to daemon and await the correlated response.
    * Rejects if daemon is offline or the request times out.
@@ -7734,30 +12919,30 @@ export class WsBridge {
     if (!this.isDaemonConnected()) {
       return Promise.reject(new Error('daemon_offline'));
     }
-    return new Promise<Record<string, unknown>>((resolve, reject) => {
-      const timer = setTimeout(() => {
-        this.pendingMemorySourcesRequests.delete(requestId);
-        reject(new Error('timeout'));
-      }, timeoutMs);
+    return this.memorySourcesRequests.request(requestId, timeoutMs, () => {
+      this.daemonWs!.send(JSON.stringify({
+        type: MEMORY_WS.GET_SOURCES_REQUEST,
+        requestId,
+        projectionId,
+        expectedProjectId,
+        // The daemon stamps its own bound serverId on the reply, but we
+        // also tell it our expected serverId so its log can flag mis-
+        // routing when present.
+        expectedServerId: this.serverId,
+      }));
+    });
+  }
 
-      this.pendingMemorySourcesRequests.set(requestId, { resolve, reject, timer });
-
-      try {
-        this.daemonWs!.send(JSON.stringify({
-          type: MEMORY_WS.GET_SOURCES_REQUEST,
-          requestId,
-          projectionId,
-          expectedProjectId,
-          // The daemon stamps its own bound serverId on the reply, but we
-          // also tell it our expected serverId so its log can flag mis-
-          // routing when present.
-          expectedServerId: this.serverId,
-        }));
-      } catch (err) {
-        this.pendingMemorySourcesRequests.delete(requestId);
-        clearTimeout(timer);
-        reject(err instanceof Error ? err : new Error(String(err)));
-      }
+  /**
+   * Ask the daemon to read or change the machine's agent configuration (Agent
+   * Skills, MCP servers). Rejects with 'daemon_offline' or 'timeout'.
+   */
+  sendMachineConfigRequest(frame: Record<string, unknown> & { requestId: string }, timeoutMs: number): Promise<Record<string, unknown>> {
+    if (!this.isDaemonConnected()) {
+      return Promise.reject(new Error('daemon_offline'));
+    }
+    return this.machineConfigRequests.request(frame.requestId, timeoutMs, () => {
+      this.daemonWs!.send(JSON.stringify(frame));
     });
   }
 
@@ -7766,23 +12951,228 @@ export class WsBridge {
    * Returns true if a matching pending request was found and resolved.
    */
   resolveMemorySources(requestId: string, msg: Record<string, unknown>): boolean {
-    const pending = this.pendingMemorySourcesRequests.get(requestId);
-    if (!pending) return false;
-    clearTimeout(pending.timer);
-    this.pendingMemorySourcesRequests.delete(requestId);
-    pending.resolve(msg);
-    return true;
+    return this.memorySourcesRequests.resolve(requestId, msg);
   }
 
   /**
    * Reject all pending memory.get_sources requests (e.g. on daemon disconnect).
    */
   private rejectAllPendingMemorySourcesRequests(reason: string): void {
-    for (const [, pending] of this.pendingMemorySourcesRequests) {
-      clearTimeout(pending.timer);
-      pending.reject(new Error(reason));
+    this.memorySourcesRequests.rejectAll(reason);
+    this.machineConfigRequests.rejectAll(reason);
+    this.sessionIdentityRequests.rejectAll(reason);
+  }
+
+  // ── PROJECT/SESSION identity: daemon is the sole content owner ─────────
+  //
+  // The server never stores PROJECT/SESSION identity content (owner rule,
+  // tsk_cd_identity_daemon_storage). A get/set/delete for those scopes is a
+  // unicast RPC over the daemon WS, gated by requestId, exactly like
+  // sendMemorySourcesRequest above -- never HTTP daemon<->server in either
+  // direction, so a flaky proxy link can never make a save/apply time out.
+
+  /** Rejects with 'daemon_offline' or 'timeout'; never HTTP. */
+  sendSessionIdentityLocalRequest(
+    requestId: string,
+    payload: { op: 'get' | 'set' | 'delete'; scope: 'project' | 'session'; scopeKey: string; content?: string; source?: 'web' | 'mcp'; sourceFile?: string },
+    timeoutMs: number = SESSION_IDENTITY_LOCAL_RPC_TIMEOUT_MS,
+  ): Promise<Record<string, unknown>> {
+    if (!this.isDaemonConnected()) {
+      return Promise.reject(new Error('daemon_offline'));
     }
-    this.pendingMemorySourcesRequests.clear();
+    return this.sessionIdentityRequests.request(requestId, timeoutMs, () => {
+      this.daemonWs!.send(JSON.stringify({
+        type: SESSION_IDENTITY_WS.LOCAL_REQUEST,
+        requestId,
+        ...payload,
+      }));
+    });
+  }
+
+  private resolveSessionIdentityLocal(requestId: string, msg: Record<string, unknown>): boolean {
+    return this.sessionIdentityRequests.resolve(requestId, msg);
+  }
+
+  /** USER-scope content lives on the server; push it to this daemon over WS (never HTTP-polled). */
+  private sendSessionIdentityUserPush(profile: { content: string; contentHash: string; revision: number; updatedAt: number }): void {
+    this.sendToDaemon(JSON.stringify({
+      type: SESSION_IDENTITY_WS.PUSH,
+      scope: 'user',
+      content: profile.content,
+      contentHash: profile.contentHash,
+      revision: profile.revision,
+      updatedAt: profile.updatedAt,
+    }));
+  }
+
+  /**
+   * Deliver USER-scope content (or its removal) to every online daemon of an
+   * account, over each one's own WS -- never a daemon-initiated HTTP poll
+   * (owner rule, tsk_cd_identity_daemon_storage). Static + account-scoped
+   * (not tied to one bridge instance) so an HTTP route with no daemon
+   * connection of its own can call it after a USER-scope save/delete.
+   * Mirrors pushUserMemoryFeatureConfigToOnlineDaemons. A daemon offline
+   * right now gets the current content on its next connect instead (see
+   * handleDaemonConnection).
+   */
+  static async pushSessionIdentityUserToOnlineDaemonsForUser(
+    userId: string,
+    profile: { content: string; contentHash: string; revision: number; updatedAt: number },
+    excludeServerId?: string,
+  ): Promise<void> {
+    await WsBridge.broadcastSessionIdentityUserPush(userId, (bridge) => bridge.sendSessionIdentityUserPush(profile), excludeServerId);
+  }
+
+  static async pushSessionIdentityUserDeleteToOnlineDaemonsForUser(userId: string, excludeServerId?: string): Promise<void> {
+    await WsBridge.broadcastSessionIdentityUserPush(userId, (bridge) => bridge.sendToDaemon(JSON.stringify({
+      type: SESSION_IDENTITY_WS.PUSH, scope: 'user', deleted: true,
+    })), excludeServerId);
+  }
+
+  private static async broadcastSessionIdentityUserPush(
+    userId: string,
+    send: (bridge: WsBridge) => void,
+    excludeServerId?: string,
+  ): Promise<void> {
+    const entries = [...WsBridge.instances.values()];
+    await Promise.all(entries.map(async (bridge) => {
+      if (bridge.serverId === excludeServerId) return;
+      if (!bridge.authenticated || !bridge.daemonWs || !bridge.db) return;
+      if (bridge.daemonOwnerUserId !== userId) return;
+      try {
+        send(bridge);
+      } catch (error) {
+        logger.warn({ err: error, serverId: bridge.serverId }, 'failed to push user identity to daemon');
+      }
+    }));
+  }
+
+  /**
+   * Daemon -> server, fire-and-forget: an MCP-driven local write/delete of a
+   * PROJECT/SESSION profile. Keep the server's metadata row (hash/length/
+   * revision only, never content) in step.
+   */
+  private async handleSessionIdentityLocalReport(msg: Record<string, unknown>): Promise<void> {
+    const userId = this.daemonOwnerUserId;
+    if (!userId || !this.db) return;
+    const scope = msg.scope === 'project' || msg.scope === 'session' ? msg.scope : undefined;
+    const scopeKey = typeof msg.scopeKey === 'string' ? msg.scopeKey : undefined;
+    if (!scope || !scopeKey) return;
+    try {
+      if (msg.deleted === true) {
+        await deleteSessionIdentityMetadata(this.db, userId, scope, scopeKey);
+        return;
+      }
+      const contentHash = typeof msg.contentHash === 'string' ? msg.contentHash : undefined;
+      const contentLength = typeof msg.contentLength === 'number' ? msg.contentLength : undefined;
+      if (!contentHash || contentLength === undefined) return;
+      await upsertSessionIdentityMetadata(this.db, {
+        userId, scope, scopeKey, contentHash, contentLength,
+        source: msg.source === 'web' ? 'web' : 'mcp',
+        sourceFile: typeof msg.sourceFile === 'string' ? msg.sourceFile : undefined,
+      });
+    } catch (error) {
+      logger.warn({ err: error, serverId: this.serverId, scope, scopeKey }, 'session identity local report failed');
+    }
+  }
+
+  /**
+   * Daemon -> server, fire-and-forget: an MCP-driven write/delete of the
+   * USER-scope profile. This scope's content still lives on the server, so
+   * this carries the full content and gets persisted, then re-pushed to the
+   * account's other online daemons.
+   */
+  private async handleSessionIdentityUserReport(msg: Record<string, unknown>): Promise<void> {
+    const userId = this.daemonOwnerUserId;
+    if (!userId || !this.db) return;
+    try {
+      if (msg.deleted === true) {
+        await deleteServerSessionIdentityProfile(this.db, userId, 'user', '');
+        await WsBridge.pushSessionIdentityUserDeleteToOnlineDaemonsForUser(userId, this.serverId);
+        return;
+      }
+      if (typeof msg.content !== 'string') return;
+      const content = normalizeSessionIdentityContent(msg.content);
+      const contentHash = createHash('sha256').update(content, 'utf8').digest('hex');
+      const result = await upsertServerSessionIdentityProfile(this.db, {
+        userId, scope: 'user', scopeKey: '', content, contentHash,
+        source: msg.source === 'web' ? 'web' : 'mcp',
+        sourceFile: typeof msg.sourceFile === 'string' ? msg.sourceFile : undefined,
+      });
+      if (result === 'revision_conflict') return;
+      await WsBridge.pushSessionIdentityUserToOnlineDaemonsForUser(userId, result, this.serverId);
+    } catch (error) {
+      logger.warn({ err: error, serverId: this.serverId }, 'session identity user report failed');
+    }
+  }
+
+  /**
+   * Daemon -> server: on (re)connect, the daemon asks for any content the
+   * server still holds for the PROJECT/SESSION scope keys it recognizes as
+   * its own (its live sessions' project/session keys) -- the one-time,
+   * daemon-initiated migration off server storage. Zero data loss: the
+   * server clears a row's content only once MIGRATE_CONFIRM proves the
+   * daemon persisted and hash-verified it (see handleSessionIdentityMigrateConfirm).
+   */
+  private async handleSessionIdentityMigrateRequest(msg: Record<string, unknown>): Promise<void> {
+    const userId = this.daemonOwnerUserId;
+    const requestId = typeof msg.requestId === 'string' ? msg.requestId : undefined;
+    if (!userId || !this.db || !requestId) return;
+    const candidates = Array.isArray(msg.candidates) ? msg.candidates : [];
+    const rows: Array<{ scope: string; scopeKey: string; content: string; contentHash: string; revision: number; updatedAt: number }> = [];
+    for (const candidate of candidates) {
+      if (!candidate || typeof candidate !== 'object') continue;
+      const scope = (candidate as Record<string, unknown>).scope;
+      const scopeKey = (candidate as Record<string, unknown>).scopeKey;
+      if ((scope !== 'project' && scope !== 'session') || typeof scopeKey !== 'string' || !scopeKey) continue;
+      const profile = await getServerSessionIdentityProfile(this.db, userId, scope, scopeKey).catch(() => null);
+      if (profile && profile.content) {
+        rows.push({
+          scope, scopeKey: profile.scopeKey, content: profile.content, contentHash: profile.contentHash,
+          revision: profile.revision, updatedAt: profile.updatedAt,
+        });
+      }
+    }
+    this.sendToDaemon(JSON.stringify({ type: SESSION_IDENTITY_WS.MIGRATE_RESPONSE, requestId, rows }));
+  }
+
+  private async handleSessionIdentityMigrateConfirm(msg: Record<string, unknown>): Promise<void> {
+    const userId = this.daemonOwnerUserId;
+    if (!userId || !this.db) return;
+    const confirmed = Array.isArray(msg.confirmed) ? msg.confirmed : [];
+    for (const entry of confirmed) {
+      if (!entry || typeof entry !== 'object') continue;
+      const scope = (entry as Record<string, unknown>).scope;
+      const scopeKey = (entry as Record<string, unknown>).scopeKey;
+      const contentHash = (entry as Record<string, unknown>).contentHash;
+      if ((scope !== 'project' && scope !== 'session') || typeof scopeKey !== 'string' || typeof contentHash !== 'string') continue;
+      try {
+        const current = await getServerSessionIdentityProfile(this.db, userId, scope, scopeKey);
+        // Only clear when the daemon's confirmed hash still matches what the
+        // server has -- a concurrent edit after the migrate snapshot was
+        // read must never be silently discarded.
+        if (!current || current.contentHash !== contentHash) continue;
+        await upsertSessionIdentityMetadata(this.db, {
+          userId, scope, scopeKey, contentHash,
+          contentLength: sessionIdentityContentLength(current.content),
+          source: current.source,
+          sourceFile: current.sourceFile,
+        });
+        // Only a SESSION key names one daemon (it embeds the serverId). A
+        // PROJECT key is shared by every daemon of the user that runs that
+        // project, so clearing it on the first confirm would strand the
+        // others: keep the server copy for PROJECT rows so each daemon can
+        // still migrate its own copy.
+        if (scope === 'session') {
+          await this.db.execute(
+            `UPDATE session_identity_profiles SET content = NULL WHERE user_id = $1 AND scope = $2 AND scope_key = $3 AND content_hash = $4`,
+            [userId, scope, scopeKey, contentHash],
+          );
+        }
+      } catch (error) {
+        logger.warn({ err: error, serverId: this.serverId, scope, scopeKey }, 'session identity migrate confirm failed');
+      }
+    }
   }
 
   private resolvePreviewStart(msg: PreviewResponseStartMessage): void {
@@ -8643,6 +14033,7 @@ export class WsBridge {
       && this.pendingPreviewWsUpgrades.size === 0
     ) {
       this.browserRateLimiter.stop();
+      this.browserDataReadRateLimiter.stop();
       if (this.shareExpirySweepTimer) {
         clearInterval(this.shareExpirySweepTimer);
         this.shareExpirySweepTimer = null;
@@ -8668,6 +14059,20 @@ export class WsBridge {
       ...this.daemonP2pWorkflowCapabilities,
       capabilities: [...this.daemonP2pWorkflowCapabilities.capabilities],
     };
+  }
+
+  /**
+   * The project-identity scope key the daemon uses for this session, or null
+   * when this pod has not seen the session reported yet. A sub-session without
+   * its own context namespace shares its parent's project.
+   */
+  resolveSessionIdentityProjectKey(sessionName: string): string | null {
+    const main = this.mainIdentityProjectKeys.get(sessionName);
+    if (main) return main;
+    const sub = this.subIdentityProjectKeys.get(sessionName);
+    if (sub) return sub;
+    const parent = this.activeSubSessions.get(sessionName)?.parentSession;
+    return (parent && this.mainIdentityProjectKeys.get(parent)) || null;
   }
 
   hasDaemonCapability(capability: string, _now = Date.now()): boolean {

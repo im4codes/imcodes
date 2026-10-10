@@ -1,5 +1,7 @@
 #include "third_party/imcodes_remote_desktop/display_capture.h"
 
+#include "third_party/imcodes_remote_desktop/brand_logo_generated.h"
+
 #include <d3d11.h>
 #include <dxgi1_2.h>
 #include <shellscalingapi.h>
@@ -692,16 +694,211 @@ bool DxgiDesktopSource::BroadcastBgraFrame(int width, int height) {
   return true;
 }
 
+void DxgiDesktopSource::EngagePrivacyShield() {
+  privacy_shielded_.store(true);
+}
+
+void DxgiDesktopSource::ReleasePrivacyShield() {
+  privacy_shielded_.store(false);
+}
+
+/**
+ * The opaque frame shown to every viewer while the shield is up.
+ *
+ * Generated locally from constants: it carries no captured pixel and nothing
+ * the requester supplied, so it cannot leak either the screen behind it or
+ * anything an attacker chose to put in the request. A flat IM.codes-blue
+ * field is deliberate -- a viewer must be able to tell shielded from frozen,
+ * and a frozen last-good frame is exactly what we must never send.
+ */
+namespace {
+
+/**
+ * The privacy field colour, IM.codes #0F1724. Written as RGB constants so the
+ * flat fill and the logo compositing below derive from ONE source instead of
+ * two hand-tuned YUV triples that could drift apart.
+ */
+constexpr int kBrandFieldR = 15;
+constexpr int kBrandFieldG = 23;
+constexpr int kBrandFieldB = 36;
+
+int ClampByte(int value) { return value < 0 ? 0 : (value > 255 ? 255 : value); }
+
+// BT.601 studio swing, the range libwebrtc expects for I420.
+int RgbToY(int r, int g, int b) {
+  return ClampByte(((66 * r + 129 * g + 25 * b + 128) / 256) + 16);
+}
+int RgbToU(int r, int g, int b) {
+  return ClampByte(((-38 * r - 74 * g + 112 * b + 128) / 256) + 128);
+}
+int RgbToV(int r, int g, int b) {
+  return ClampByte(((112 * r - 94 * g - 18 * b + 128) / 256) + 128);
+}
+
+/** Largest compiled bitmap; the privacy mark never wants a smaller one. */
+const brand::LogoBitmap* LargestBrandBitmap() {
+  const brand::LogoBitmap* best = nullptr;
+  for (int i = 0; i < brand::kLogoBitmapCount; ++i) {
+    if (!best || brand::kLogoBitmaps[i].size > best->size) {
+      best = &brand::kLogoBitmaps[i];
+    }
+  }
+  return best;
+}
+
+/**
+ * Composite the canonical compiled logo into the centre of an already
+ * flat-filled I420 privacy frame.
+ *
+ * Every byte comes from brand_logo_generated.h -- the single generated product
+ * derived from web/public/imcodes-robot-avatar.png -- plus the constants
+ * above. Nothing here reads a captured surface, a requester string, a file or
+ * the network, so the mark cannot become a channel for the very thing the
+ * privacy epoch exists to hide.
+ *
+ * Returns false without writing anything when the geometry cannot be proven
+ * safe. The caller keeps the flat field in that case; it must never fall back
+ * to the real frame.
+ */
+bool CompositeBrandMark(webrtc::I420Buffer* buffer, int width, int height) {
+  if (!buffer || width <= 0 || height <= 0) return false;
+  // Odd dimensions make the 4:2:0 chroma mapping of an interior rectangle
+  // ambiguous at its edges. Refuse rather than write a half-covered block.
+  if ((width % 2) != 0 || (height % 2) != 0) return false;
+
+  const brand::LogoBitmap* bitmap = LargestBrandBitmap();
+  if (!bitmap || !bitmap->premultiplied_bgra || bitmap->size <= 0) return false;
+
+  // Integer replication only: no resampler, so the result is byte-identical on
+  // every host and no filtering code can misread the source buffer.
+  const int shorter = width < height ? width : height;
+  const int target = shorter / 6;
+  int scale = target / bitmap->size;
+  if (scale < 1) scale = 1;
+  const int edge = bitmap->size * scale;
+  if (edge <= 0 || edge > width || edge > height) return false;
+
+  // Even origin so each 2x2 chroma block is fully inside or fully outside.
+  const int left = ((width - edge) / 2) & ~1;
+  const int top = ((height - edge) / 2) & ~1;
+  if (left < 0 || top < 0 || left + edge > width || top + edge > height) {
+    return false;
+  }
+
+  const int stride_y = buffer->StrideY();
+  const int stride_u = buffer->StrideU();
+  const int stride_v = buffer->StrideV();
+  // Stride is never assumed to equal width; a narrower stride than the region
+  // we are about to touch would mean writing into the next row.
+  if (stride_y < width || stride_u < (width + 1) / 2 ||
+      stride_v < (width + 1) / 2) {
+    return false;
+  }
+
+  uint8_t* const data_y = buffer->MutableDataY();
+  uint8_t* const data_u = buffer->MutableDataU();
+  uint8_t* const data_v = buffer->MutableDataV();
+  if (!data_y || !data_u || !data_v) return false;
+
+  const uint8_t* const src = bitmap->premultiplied_bgra;
+  const int size = bitmap->size;
+
+  // Two passes so chroma can average the composited 2x2 block rather than
+  // sampling one corner of it.
+  for (int y = 0; y < edge; y += 2) {
+    for (int x = 0; x < edge; x += 2) {
+      int sum_r = 0;
+      int sum_g = 0;
+      int sum_b = 0;
+      for (int dy = 0; dy < 2; ++dy) {
+        for (int dx = 0; dx < 2; ++dx) {
+          const int sx = (x + dx) / scale;
+          const int sy = (y + dy) / scale;
+          // Defensive: replication maths already keeps this in range, but a
+          // future scale change must not silently read past the array.
+          if (sx < 0 || sy < 0 || sx >= size || sy >= size) return false;
+          const size_t index = (static_cast<size_t>(sy) * size + sx) * 4;
+          const int pb = src[index];
+          const int pg = src[index + 1];
+          const int pr = src[index + 2];
+          const int alpha = src[index + 3];
+          // Premultiplied source over the constant field:
+          //   out = src + field * (255 - a) / 255
+          const int inverse = 255 - alpha;
+          const int r = ClampByte(pr + kBrandFieldR * inverse / 255);
+          const int g = ClampByte(pg + kBrandFieldG * inverse / 255);
+          const int b = ClampByte(pb + kBrandFieldB * inverse / 255);
+          data_y[static_cast<size_t>(top + y + dy) * stride_y + left + x + dx] =
+              static_cast<uint8_t>(RgbToY(r, g, b));
+          sum_r += r;
+          sum_g += g;
+          sum_b += b;
+        }
+      }
+      const int avg_r = sum_r / 4;
+      const int avg_g = sum_g / 4;
+      const int avg_b = sum_b / 4;
+      const size_t chroma_row = static_cast<size_t>(top + y) / 2;
+      const size_t chroma_col = static_cast<size_t>(left + x) / 2;
+      data_u[chroma_row * stride_u + chroma_col] =
+          static_cast<uint8_t>(RgbToU(avg_r, avg_g, avg_b));
+      data_v[chroma_row * stride_v + chroma_col] =
+          static_cast<uint8_t>(RgbToV(avg_r, avg_g, avg_b));
+    }
+  }
+  return true;
+}
+
+}  // namespace
+
+webrtc::scoped_refptr<webrtc::I420Buffer> DxgiDesktopSource::PrivacyFrame(
+    int width, int height) {
+  if (!privacy_buffer_ || privacy_buffer_->width() != width ||
+      privacy_buffer_->height() != height) {
+    privacy_buffer_ = webrtc::I420Buffer::Create(width, height);
+    if (!privacy_buffer_) return nullptr;
+    // Flat brand field first, derived from the RGB constants above so it and
+    // the composited mark agree by construction.
+    webrtc::I420Buffer::SetBlack(privacy_buffer_.get());
+    std::memset(privacy_buffer_->MutableDataY(),
+                static_cast<uint8_t>(RgbToY(kBrandFieldR, kBrandFieldG, kBrandFieldB)),
+                static_cast<size_t>(privacy_buffer_->StrideY()) * height);
+    std::memset(privacy_buffer_->MutableDataU(),
+                static_cast<uint8_t>(RgbToU(kBrandFieldR, kBrandFieldG, kBrandFieldB)),
+                static_cast<size_t>(privacy_buffer_->StrideU()) * ((height + 1) / 2));
+    std::memset(privacy_buffer_->MutableDataV(),
+                static_cast<uint8_t>(RgbToV(kBrandFieldR, kBrandFieldG, kBrandFieldB)),
+                static_cast<size_t>(privacy_buffer_->StrideV()) * ((height + 1) / 2));
+    // Attribution. A failed mark leaves the opaque field exactly as it is --
+    // it is never a reason to show the desktop.
+    CompositeBrandMark(privacy_buffer_.get(), width, height);
+  }
+  return privacy_buffer_;
+}
+
 void DxgiDesktopSource::BroadcastFrame(
     const webrtc::scoped_refptr<webrtc::I420Buffer>& buffer) {
+  // Single chokepoint: every capture path reaches libwebrtc through here, so
+  // the shield cannot be bypassed by adding another source.
+  webrtc::scoped_refptr<webrtc::I420Buffer> outgoing = buffer;
+  if (privacy_shielded_.load() && buffer) {
+    outgoing = PrivacyFrame(buffer->width(), buffer->height());
+    // If the substitute could not be allocated we drop the frame entirely
+    // rather than fall back to the real one: no picture is an acceptable
+    // outcome, the owner's password is not.
+    if (!outgoing) return;
+  }
   const int64_t now_us =
       webrtc::Clock::GetRealTimeClock()->TimeInMicroseconds();
   webrtc::VideoFrame frame = webrtc::VideoFrame::Builder()
-                                  .set_video_frame_buffer(buffer)
+                                  .set_video_frame_buffer(outgoing)
                                   .set_timestamp_us(now_us)
                                   .set_rotation(webrtc::kVideoRotation_0)
                                   .build();
   broadcaster_.OnFrame(frame);
+  // Advances for shielded frames too: END proves freshness by requiring a
+  // generation strictly newer than the one the shield went up at.
+  shield_generation_.fetch_add(1);
   last_broadcast_us_ = now_us;
   captured_frames_++;
   first_frame_condition_.notify_all();

@@ -7,6 +7,7 @@ import {
   type TransportQueueReducerState,
 } from '../../shared/transport-queue-reducer.js';
 import { isWorkingSessionState } from '../../shared/session-activity-types.js';
+import { CAPACITY_RETRY_ACTIVITY_DETAIL_PREFIX } from '../../shared/capacity-retry.js';
 
 export type SessionLiveStatusMode =
   | 'idle'
@@ -51,6 +52,15 @@ export function isRunningSessionState(sessionState: string | null | undefined): 
   return isWorkingSessionState(sessionState);
 }
 
+/**
+ * A cancel/append acknowledgement can race the provider's final idle event.
+ * Treat this daemon response as an authoritative idle observation so a stale
+ * browser-local running flag cannot hold the transport queue forever.
+ */
+export function isActiveTurnFinishedError(value: unknown): boolean {
+  return typeof value === 'string' && /^the active turn already finished$/i.test(value.trim());
+}
+
 export function isStoppingSessionState(sessionState: string | null | undefined): boolean {
   return sessionState === 'stopping';
 }
@@ -75,6 +85,7 @@ export interface ResolveTimelineBackedSessionStateInput {
   timelineStateTs?: number | null;
   timelineLastEventTs?: number | null;
   now?: number;
+  authoritativeIdleAt?: number | null;
 }
 
 const NON_RUNNING_AUTHORITATIVE_STATES = new Set(['idle', 'stopped', 'stopping', 'error']);
@@ -97,7 +108,10 @@ export function resolveTimelineBackedSessionState(input: ResolveTimelineBackedSe
     && NON_RUNNING_AUTHORITATIVE_STATES.has(sessionState)
     && input.activeThinking !== true
     && input.activeToolCall !== true
-    && input.activeTransportTurn !== true
+    && (input.activeTransportTurn !== true
+      || (input.authoritativeIdleAt != null
+        && input.timelineLastEventTs != null
+        && input.timelineLastEventTs <= input.authoritativeIdleAt))
   ) {
     return sessionState;
   }
@@ -112,7 +126,7 @@ export function deriveSessionLiveStatus(input: SessionLiveStatusInput): SessionL
   const activeToolCall = input.activeToolCall === true;
   const pendingUserSend = input.pendingUserSend === true;
   const hasLiveQueue = input.transportQueueState ? selectSessionHasLiveQueue(input.transportQueueState) : false;
-  const activeTransportTurn = input.activeTransportTurn === true || hasLiveQueue;
+  const activeTransportTurn = input.activeTransportTurn === true;
   const stopRequested = input.stopRequested === true;
   const statusText = normalizeDetail(input.statusText);
   const activityDetail = normalizeDetail(input.transportActivityDetail);
@@ -142,7 +156,7 @@ export function deriveSessionLiveStatus(input: SessionLiveStatusInput): SessionL
   // running event completes a network/history round trip. This is deliberately
   // separate from generic thinking/tool tail evidence, which may be stale.
   const running = isRunningSessionState(state) || pendingUserSend;
-  const busy = stopping || running || activeThinking || activeToolCall || activeTransportTurn;
+  const busy = stopping || running || activeThinking || activeToolCall || activeTransportTurn || hasLiveQueue;
   const resultLike = isResultStatusText(statusText);
 
   let mode: SessionLiveStatusMode;
@@ -162,6 +176,8 @@ export function deriveSessionLiveStatus(input: SessionLiveStatusInput): SessionL
     mode = 'tool';
   } else if (activeThinking) {
     mode = 'thinking';
+  } else if (activityDetail?.startsWith(CAPACITY_RETRY_ACTIVITY_DETAIL_PREFIX)) {
+    mode = 'waiting';
   } else if (running || activeTransportTurn) {
     mode = 'running';
   } else if (statusText) {

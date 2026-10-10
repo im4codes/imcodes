@@ -3,24 +3,30 @@ import { useTranslation } from 'react-i18next';
 import { REMOTE_DESKTOP_CAPABILITY } from '@shared/remote-desktop.js';
 import {
   REMOTE_DESKTOP_INSTALLABLE_CAPABILITY,
+  REMOTE_DESKTOP_MACOS_INSTALLABLE_CAPABILITY,
   REMOTE_DESKTOP_INSTALL_MSG,
   REMOTE_DESKTOP_INSTALL_STATE,
   validateRemoteDesktopInstallStateMessage,
   type RemoteDesktopInstallState,
 } from '@shared/remote-desktop-install.js';
 import {
+  REMOTE_DESKTOP_LOGIN_SCREEN_ERROR,
   REMOTE_DESKTOP_LOGIN_SCREEN_MSG,
   REMOTE_DESKTOP_LOGIN_SCREEN_STATE,
+  readControlledNodeInstallHereTarget,
   validateRemoteDesktopLoginScreenStateMessage,
   type RemoteDesktopLoginScreenState,
 } from '@shared/remote-desktop-login-screen.js';
 import type { WsClient } from '../ws-client.js';
 import {
   daemonRemoteDesktopMachine,
-  listControllableMachines,
   mintControlledNodeExecutableTicket,
+  mintControlledNodeInstallCommand,
   type MachineListItem,
 } from '../api/machines.js';
+import { useMachines } from '../hooks/useMachines.js';
+import { canOpenRemoteDesktopMachine } from '../remote-desktop-profile.js';
+import { DaemonRemoteDesktopSetup } from './DaemonRemoteDesktopSetup.js';
 
 export interface DaemonRemoteDesktopControlProps {
   ws: WsClient | null;
@@ -39,21 +45,41 @@ export interface DaemonRemoteDesktopControlProps {
   offerLoginScreenSetup?: boolean;
   /**
    * Controlled machines this user can reach. Supplied by a caller that already
-   * has them; otherwise looked up here, and only for a daemon that can actually
-   * serve remote control, so an ordinary session never pays for the request.
+   * has them; otherwise read from the shared machine list, so every toolbar
+   * that mounts this control shares one request.
    */
   machines?: readonly MachineListItem[];
+  /**
+   * Whether this user may set remote desktop up on this daemon's computer: its
+   * owner, not someone it is shared with. The install command minted for this
+   * daemon and the machine link are both owner-only on the server.
+   */
+  canSetUp?: boolean;
 }
 
 /**
  * Remote control for the daemon's own machine.
  *
  * A daemon has no entry in the controlled-machine list, so its remote-desktop
- * state comes from the capabilities it advertises in `daemon.hello`: the
- * `installable` capability means "this is a Windows host that could serve remote
- * control", and the capability itself means "the native worker is installed and
- * verified". Anything else renders nothing at all — a machine that cannot serve
- * remote control should not offer a button that will fail.
+ * state comes from the capabilities it advertises in `daemon.hello`: an
+ * `installable` capability (`REMOTE_DESKTOP_INSTALLABLE_CAPABILITY` for
+ * Windows and Linux, which share the same repair-by-self-upgrade mechanism;
+ * `REMOTE_DESKTOP_MACOS_INSTALLABLE_CAPABILITY` under its own name for macOS,
+ * which installs by publishing into a component store instead) means "this
+ * host could serve remote control but needs one install/repair step first",
+ * and the capability itself means "the native worker is installed and
+ * verified". Both installable capabilities resolve to the same generic,
+ * field-less `REMOTE_DESKTOP_INSTALL_MSG.REQUEST` on click; the
+ * daemon/controlled-node side already branches on its own platform to run the
+ * right install path.
+ *
+ * A daemon that serves neither (Linux and macOS: their remote desktop is the
+ * IM.codes controlled node on the same computer) still gets the button. It
+ * opens the controlled node linked to this daemon (`hostServerId`) when that
+ * node can serve a session, and otherwise opens DaemonRemoteDesktopSetup,
+ * which asks for what is missing: an install, a permission, or the one-time
+ * link to an already-installed node. Right-click reopens that setup to change
+ * the link.
  */
 export function DaemonRemoteDesktopControl({
   ws,
@@ -64,6 +90,7 @@ export function DaemonRemoteDesktopControl({
   compact = false,
   offerLoginScreenSetup = true,
   machines,
+  canSetUp = true,
 }: DaemonRemoteDesktopControlProps) {
   const { t } = useTranslation();
   const [capabilities, setCapabilities] = useState<readonly string[]>([]);
@@ -71,7 +98,9 @@ export function DaemonRemoteDesktopControl({
   const [loginScreen, setLoginScreen] = useState<
     { state: RemoteDesktopLoginScreenState; error?: string } | null
   >(null);
-  const [fetched, setFetched] = useState<readonly MachineListItem[]>([]);
+  const [setupOpen, setSetupOpen] = useState(false);
+  const sharedMachines = useMachines();
+  const machineList = machines ?? sharedMachines.machines;
 
   useEffect(() => {
     if (!ws) {
@@ -101,43 +130,90 @@ export function DaemonRemoteDesktopControl({
 
   const ready = capabilities.includes(REMOTE_DESKTOP_CAPABILITY);
 
+  // A completed login-screen install enrolled a node for this machine; pick it
+  // up without the user reloading, since it is what the button steers to next.
   useEffect(() => {
-    if (machines || !ready || !serverId) return;
-    let cancelled = false;
-    void listControllableMachines()
-      .then((list) => { if (!cancelled) setFetched(list); })
-      // A failed lookup only means no hand-off is offered; the daemon's own
-      // remote control still works.
-      .catch(() => {});
-    return () => { cancelled = true; };
-    // `loginScreen` is a dependency so a completed install is picked up without
-    // the user reloading: the node it just enrolled is what the button steers to.
-  }, [machines, ready, serverId, loginScreen?.state]);
-  const installable = capabilities.includes(REMOTE_DESKTOP_INSTALLABLE_CAPABILITY);
-  if (!serverId || !daemonOnline || (!ready && !installable)) return null;
+    if (loginScreen?.state === REMOTE_DESKTOP_LOGIN_SCREEN_STATE.COMPLETED) {
+      void sharedMachines.refetch();
+    }
+  }, [loginScreen?.state]);
+  // Two separate wire names for the same meaning (see the class doc comment):
+  // Windows/Linux repair by self-upgrade under the legacy Windows-named
+  // constant, macOS component-store install under its own. A host that
+  // advertises neither is not offering anything this button could trigger.
+  const installable = capabilities.includes(REMOTE_DESKTOP_INSTALLABLE_CAPABILITY)
+    || capabilities.includes(REMOTE_DESKTOP_MACOS_INSTALLABLE_CAPABILITY);
+  if (!serverId || !daemonOnline) return null;
 
-  // A controlled node enrolled from this daemon is the same physical machine.
-  // Opening it instead of the daemon is what keeps one desktop to one session,
-  // and it is the only one of the two that reaches the sign-in screen.
-  const sharedMachine = (machines ?? fetched)
-    .find((machine) => machine.hostServerId === serverId) ?? null;
+  // A controlled node enrolled from (or linked to) this daemon is the same
+  // physical machine. Opening it instead of the daemon is what keeps one
+  // desktop to one session, and it is the only one of the two that reaches the
+  // sign-in screen.
+  const linkedNode = machineList.find((machine) => machine.hostServerId === serverId) ?? null;
+  const linkedOpenable = linkedNode !== null && canOpenRemoteDesktopMachine(linkedNode);
+  // A Linux or macOS daemon that can install the controlled node itself: the
+  // owner confirms once, the daemon runs the same install as the copyable
+  // command, and the node enrols linked to this daemon.
+  const installHereTarget = canSetUp ? readControlledNodeInstallHereTarget(capabilities) : null;
+  const installHere = installHereTarget ? {
+    state: loginScreen,
+    start: () => {
+      setLoginScreen({ state: REMOTE_DESKTOP_LOGIN_SCREEN_STATE.DOWNLOADING });
+      void mintControlledNodeInstallCommand(installHereTarget, serverId)
+        .then((minted) => {
+          if (!minted.installCode || !ws) throw new Error('install_code_unavailable');
+          ws.send({ type: REMOTE_DESKTOP_LOGIN_SCREEN_MSG.REQUEST, installCode: minted.installCode });
+        })
+        .catch(() => setLoginScreen({
+          state: REMOTE_DESKTOP_LOGIN_SCREEN_STATE.FAILED,
+          error: REMOTE_DESKTOP_LOGIN_SCREEN_ERROR.DOWNLOAD_FAILED,
+        }));
+    },
+  } : undefined;
+  const setup = setupOpen ? (
+    <DaemonRemoteDesktopSetup
+      serverId={serverId}
+      serverName={serverName}
+      machines={machineList}
+      onClose={() => setSetupOpen(false)}
+      onOpen={onOpen}
+      onChanged={() => sharedMachines.refetch()}
+      {...(installHere ? { installHere } : {})}
+    />
+  ) : null;
+  // Where the daemon has no remote desktop of its own, right-click reopens the
+  // setup: the only way to change which node is this computer once it opens.
+  const openSetupFromContextMenu = !ready && canSetUp
+    ? (event: MouseEvent) => {
+      event.preventDefault();
+      setSetupOpen(true);
+    }
+    : undefined;
 
-  if (ready || sharedMachine) {
-    const target = sharedMachine ?? daemonRemoteDesktopMachine(serverId, serverName ?? null);
+  if (ready || linkedOpenable) {
+    const target = linkedOpenable && linkedNode
+      ? linkedNode
+      : daemonRemoteDesktopMachine(serverId, serverName ?? null);
     const control = (
-      <button
-        class="view-toggle daemon-remote-desktop-btn"
-        title={t('remote_desktop.daemon_control')}
-        onClick={() => onOpen(target)}
-      >
-        🖥{compact ? '' : ` ${t('remote_desktop.daemon_control')}`}
-      </button>
+      <>
+        <button
+          class="view-toggle daemon-remote-desktop-btn"
+          title={linkedOpenable && linkedNode
+            ? t('remote_desktop.daemon_control_linked', { machine: linkedNode.displayName })
+            : t('remote_desktop.daemon_control')}
+          onClick={() => onOpen(target)}
+          onContextMenu={openSetupFromContextMenu}
+        >
+          🖥{compact ? '' : ` ${t('remote_desktop.daemon_control')}`}
+        </button>
+        {setup}
+      </>
     );
     const installing = loginScreen?.state === REMOTE_DESKTOP_LOGIN_SCREEN_STATE.DOWNLOADING
       || loginScreen?.state === REMOTE_DESKTOP_LOGIN_SCREEN_STATE.ELEVATING;
     // Only where there is room, and only while no controlled node already shares
     // this machine — in which case that node serves the sign-in screen already.
-    if (!offerLoginScreenSetup || sharedMachine || !ready) return control;
+    if (!offerLoginScreenSetup || linkedNode || !ready) return control;
     const failed = loginScreen?.state === REMOTE_DESKTOP_LOGIN_SCREEN_STATE.FAILED;
     return (
       <>
@@ -152,6 +228,13 @@ export function DaemonRemoteDesktopControl({
             })
             : t('remote_desktop.login_screen_hint')}
           onClick={() => {
+            if (!window.confirm(t('remote_desktop.install_confirm', {
+              server: serverName ?? serverId ?? '',
+            }))) return;
+            // No group is read or required. Enrolment binds this machine to its
+            // user; a group is an association made afterwards. Gating the
+            // install on one meant a user with no group could not install the
+            // login-screen component at all.
             setLoginScreen({ state: REMOTE_DESKTOP_LOGIN_SCREEN_STATE.DOWNLOADING });
             void mintControlledNodeExecutableTicket({ os: 'win', arch: 'x64' }, serverId)
               .then((minted) => {
@@ -178,6 +261,27 @@ export function DaemonRemoteDesktopControl({
     );
   }
 
+  if (!installable) {
+    // Linux/macOS daemon: its remote desktop is the controlled node on this
+    // computer. Nothing openable is linked yet, so the click says what is
+    // missing instead of the button being absent.
+    if (!canSetUp) return null;
+    return (
+      <>
+        <button
+          class="view-toggle daemon-remote-desktop-btn is-setup-required"
+          title={linkedNode
+            ? t('remote_desktop.daemon_control_linked', { machine: linkedNode.displayName })
+            : t('remote_desktop.setup_button_hint')}
+          onClick={() => setSetupOpen(true)}
+        >
+          🖥{compact ? '' : ` ${t('remote_desktop.daemon_control')}`}
+        </button>
+        {setup}
+      </>
+    );
+  }
+
   const downloading = install?.state === REMOTE_DESKTOP_INSTALL_STATE.DOWNLOADING;
   const failed = install?.state === REMOTE_DESKTOP_INSTALL_STATE.FAILED;
   const failureLabel = failed
@@ -194,6 +298,14 @@ export function DaemonRemoteDesktopControl({
       disabled={downloading}
       title={failed ? failureLabel : t('remote_desktop.install_worker')}
       onClick={() => {
+        // A one-time-per-click confirmation, not a config toggle: enabling
+        // remote control of this machine is worth a deliberate second step,
+        // the same way the login-screen and revoke actions elsewhere in
+        // this codebase already ask before doing something with this much
+        // reach (see ControlledNodesPanel's own window.confirm() calls).
+        if (!window.confirm(t('remote_desktop.install_confirm', {
+          server: serverName ?? serverId ?? '',
+        }))) return;
         setInstall({ state: REMOTE_DESKTOP_INSTALL_STATE.DOWNLOADING });
         ws?.send({ type: REMOTE_DESKTOP_INSTALL_MSG.REQUEST });
       }}

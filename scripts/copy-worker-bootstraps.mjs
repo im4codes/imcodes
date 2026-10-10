@@ -3,8 +3,8 @@
  * Copy plain-JS worker bootstrap files from src/ into dist/src/.
  *
  * `tsc` only processes .ts files (and .js when allowJs is on). Our worker
- * bootstraps are intentionally .mjs so they can be loaded by `new Worker()`
- * without any TS loader — but that means tsc ignores them, and the built
+ * bootstraps are intentionally .mjs so they can be loaded by worker threads or
+ * forked processes without any TS loader — but that means tsc ignores them, and the built
  * `dist/` tree would be missing the entry point the pool tries to spawn.
  *
  * This script copies every `src/**\/*.mjs` into the matching path under

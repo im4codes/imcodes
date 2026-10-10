@@ -4,8 +4,9 @@ import { join, dirname } from 'node:path';
 import { homedir, hostname, loadavg } from 'node:os';
 import { spawn, execFileSync } from 'node:child_process';
 
-const DEFAULT_PID_FILE = join(homedir(), '.imcodes', 'daemon.pid');
-const DEFAULT_LOG_DIR = join(homedir(), '.imcodes', 'logs');
+const STATE_DIR = process.env.IMCODES_HOME?.trim() || join(homedir(), '.imcodes'); // IMCODES_HOME is the state directory itself
+const DEFAULT_PID_FILE = join(STATE_DIR, 'daemon.pid');
+const DEFAULT_LOG_DIR = join(STATE_DIR, 'logs');
 
 function usage() {
   console.log(`Usage: node scripts/trace-daemon-latency.mjs [options]

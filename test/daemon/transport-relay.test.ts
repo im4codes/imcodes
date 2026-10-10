@@ -41,6 +41,7 @@ vi.mock('../../src/daemon/cc-presets.js', () => ({
 
 import {
   setTransportRelaySend,
+  setTransportToolExecutionEvaluator,
   wireProviderToRelay,
   emitTransportUserMessage,
   broadcastProviderStatus,
@@ -265,6 +266,74 @@ describe('transport-relay (timeline-emitter based)', () => {
       expect(emitMock.mock.calls[1][2].text).toBe('abc');
 
       vi.useRealTimers();
+    });
+
+    it('forwards the delegation-claim projection onto the finalized assistant.text event', () => {
+      // Without this the projection stops at the daemon: the relay reads
+      // metadata only for usage/model, so the UI would have no authority fact
+      // to render and would be left with the prose alone -- the exact gap.
+      const { provider, fireComplete } = makeMockProvider();
+      wireProviderToRelay(provider);
+
+      const claim = {
+        status: 'substantiated',
+        dispatches: [{
+          dispatchId: 'dsp-1', taskId: 'tsk-1', assignmentId: 'asg-1',
+          deliveries: [{ target: 'deck-worker', status: 'delivered' }],
+        }],
+      };
+      fireComplete('sess-claim', {
+        id: 'msg-claim', sessionId: 'sess-claim', kind: 'text', role: 'assistant',
+        content: 'done', timestamp: Date.now(), status: 'complete',
+        metadata: { delegationClaim: claim },
+      } as AgentMessage);
+
+      const finalized = emitMock.mock.calls
+        .filter((c) => c[1] === 'assistant.text')
+        .map((c) => c[2])
+        .filter((payload) => payload.streaming === false);
+      expect(finalized).toHaveLength(1);
+      expect(
+        finalized[0].delegationClaim,
+        'the authority projection must reach the timeline payload',
+      ).toEqual(claim);
+    });
+
+    it('drops a legacy machine-control-only claim before timeline persistence', () => {
+      const { provider, fireComplete } = makeMockProvider();
+      wireProviderToRelay(provider);
+      fireComplete('sess-ocu', {
+        id: 'msg-ocu', sessionId: 'sess-ocu', kind: 'text', role: 'assistant',
+        content: 'done', timestamp: Date.now(), status: 'complete',
+        metadata: { delegationClaim: {
+          status: 'substantiated',
+          dispatches: [{
+            dispatchId: 'mcp-ocu', kind: 'machine-control', tool: 'computer_use_call', machine: 'local',
+            deliveries: [{ target: 'local', status: 'delivered' }],
+          }],
+        } },
+      } as AgentMessage);
+      const finalized = emitMock.mock.calls
+        .filter((c) => c[1] === 'assistant.text')
+        .map((c) => c[2])
+        .find((payload) => payload.streaming === false);
+      expect(finalized).toBeDefined();
+      expect(Object.keys(finalized)).not.toContain('delegationClaim');
+    });
+
+    it('omits the delegation-claim key entirely when the turn carried no projection', () => {
+      const { provider, fireComplete } = makeMockProvider();
+      wireProviderToRelay(provider);
+      fireComplete('sess-noclaim', {
+        id: 'msg-noclaim', sessionId: 'sess-noclaim', kind: 'text', role: 'assistant',
+        content: 'hi', timestamp: Date.now(), status: 'complete',
+      } as AgentMessage);
+      const finalized = emitMock.mock.calls
+        .filter((c) => c[1] === 'assistant.text')
+        .map((c) => c[2])
+        .filter((payload) => payload.streaming === false);
+      expect(finalized).toHaveLength(1);
+      expect(Object.keys(finalized[0])).not.toContain('delegationClaim');
     });
 
     it('finalizes the previous message (full text, streaming:false) when messageId changes', () => {
@@ -933,6 +1002,55 @@ describe('transport-relay (timeline-emitter based)', () => {
       expect(emitMock.mock.calls.some(c => c[1] === 'session.state')).toBe(false);
     });
 
+    it('a transient (capacity) failure that the runtime retries adds NO error bubble and NO session.error row, however many attempts', async () => {
+      const { provider, fireError } = makeMockProvider();
+      wireProviderToRelay(provider);
+      emitMock.mockClear();
+      appendMock.mockClear();
+
+      for (let attempt = 0; attempt < 5; attempt += 1) {
+        fireError('sess-cap', { code: PROVIDER_ERROR_CODES.PROVIDER_ERROR, message: 'Selected model is at capacity. Please try a different model.', recoverable: false });
+      }
+      await Promise.resolve();
+
+      expect(emitMock.mock.calls.filter(c => c[1] === 'assistant.text')).toHaveLength(0);
+      expect(appendMock.mock.calls.filter(c => c[1]?.type === 'session.error')).toHaveLength(0);
+      expect(emitMock.mock.calls.some(c => c[1] === 'session.state')).toBe(false);
+    });
+
+    it('a transient failure still finalizes a partial streamed bubble (no hanging "streaming"), without an error suffix or a persisted row', async () => {
+      const { provider, fireDelta, fireError } = makeMockProvider();
+      wireProviderToRelay(provider);
+      fireDelta('sess-cap-partial', makeDelta({ messageId: 'msg-cap', delta: 'partial output' }));
+      emitMock.mockClear();
+      appendMock.mockClear();
+
+      fireError('sess-cap-partial', { code: PROVIDER_ERROR_CODES.PROVIDER_ERROR, message: 'API Error: 529 Overloaded', recoverable: false });
+      await Promise.resolve();
+
+      const texts = emitMock.mock.calls.filter(c => c[1] === 'assistant.text');
+      expect(texts).toHaveLength(1);
+      expect(texts[0]![2]).toMatchObject({ text: 'partial output', streaming: false, memoryExcluded: true });
+      expect(texts[0]![2].taskPairTerminalFlush).toBe(true);
+      expect(texts[0]![2].text).not.toContain('Error');
+      expect(appendMock.mock.calls.filter(c => c[1]?.type === 'session.error')).toHaveLength(0);
+    });
+
+    it('COUNTEREXAMPLE: a permanent error (401) still produces exactly one error bubble and one session.error', async () => {
+      const { provider, fireError } = makeMockProvider();
+      wireProviderToRelay(provider);
+      emitMock.mockClear();
+      appendMock.mockClear();
+
+      fireError('sess-401', { code: PROVIDER_ERROR_CODES.PROVIDER_ERROR, message: 'API Error: 401 Invalid authentication credentials', recoverable: false });
+      await Promise.resolve();
+
+      const texts = emitMock.mock.calls.filter(c => c[1] === 'assistant.text');
+      expect(texts).toHaveLength(1);
+      expect(texts[0]![2].text).toBe('⚠️ Error: API Error: 401 Invalid authentication credentials');
+      expect(appendMock.mock.calls.filter(c => c[1]?.type === 'session.error')).toHaveLength(1);
+    });
+
     it('caches to JSONL via appendTransportEvent with type session.error', async () => {
       const { provider, fireError } = makeMockProvider();
       wireProviderToRelay(provider);
@@ -970,6 +1088,7 @@ describe('transport-relay (timeline-emitter based)', () => {
         text: 'partial before stop\n\n⚠️ Turn cancelled',
         streaming: false,
         memoryExcluded: true,
+        taskPairTerminalFlush: true,
       });
       // A clean cancel must NOT emit a session error state.
       expect(emitMock.mock.calls.some(c => c[1] === 'session.state')).toBe(false);
@@ -1244,10 +1363,12 @@ describe('transport-relay (timeline-emitter based)', () => {
       const { provider, fireError } = makeMockProvider();
       wireProviderToRelay(provider);
 
-      fireError('sess-ai', { code: 'PROVIDER_ERROR', message: 'AI service overloaded', recoverable: true });
+      // (A transient message such as "overloaded" is retried by the runtime and deliberately not bubbled per attempt: see the
+      // capacity tests above.)
+      fireError('sess-ai', { code: 'PROVIDER_ERROR', message: 'AI service returned malformed output', recoverable: true });
 
       const textCall = emitMock.mock.calls.find(c => c[1] === 'assistant.text');
-      expect(textCall![2].text).toBe('⚠️ Error: AI service overloaded');
+      expect(textCall![2].text).toBe('⚠️ Error: AI service returned malformed output');
     });
 
     it('reuses the streaming eventId on error and preserves partial text', () => {
@@ -1304,7 +1425,12 @@ describe('transport-relay (timeline-emitter based)', () => {
     });
 
     it('caches user.message to JSONL via appendTransportEvent', async () => {
-      emitTransportUserMessage('sess-u', 'cached message');
+      emitTransportUserMessage('sess-u', 'cached message', {
+        commandId: 'queued-1',
+        clientMessageId: 'queued-1',
+        queueAppended: true,
+        pendingMessageVersion: 7,
+      }, 'transport-user:queued-1');
 
       await Promise.resolve();
 
@@ -1314,6 +1440,26 @@ describe('transport-relay (timeline-emitter based)', () => {
       expect(event.type).toBe('user.message');
       expect(event.text).toBe('cached message');
       expect(event.sessionId).toBe('sess-u');
+      expect(event.commandId).toBe('queued-1');
+      expect(event.clientMessageId).toBe('queued-1');
+      expect(event.queueAppended).toBe(true);
+      expect(event.pendingMessageVersion).toBe(7);
+
+      expect(emitMock).toHaveBeenCalledWith(
+        'sess-u',
+        'user.message',
+        expect.objectContaining({
+          text: 'cached message',
+          commandId: 'queued-1',
+          clientMessageId: 'queued-1',
+          queueAppended: true,
+        }),
+        expect.objectContaining({
+          source: 'daemon',
+          confidence: 'high',
+          eventId: 'transport-user:queued-1',
+        }),
+      );
     });
 
     it('emits with daemon source and high confidence', () => {
@@ -2177,5 +2323,31 @@ describe('same-eventId replacement semantics (appendEvent logic)', () => {
     expect(state).toHaveLength(2);
     expect(state[0].eventId).toBe(stableId);
     expect(state[1].eventId).toBe('transport:sess:msg-2');
+  });
+});
+
+describe('tool-execution guard seam (pair participants and the main checkout)', () => {
+  function wire() {
+    let installed: ((sid: string, request: { toolName: string; input: unknown; cwd?: string }) => { allow: boolean; reason?: string }) | undefined;
+    const { provider } = makeMockProvider();
+    (provider as unknown as { setToolExecutionGuard: (guard: typeof installed) => void }).setToolExecutionGuard = (guard) => { installed = guard; };
+    wireProviderToRelay(provider);
+    return installed!;
+  }
+  afterEach(() => setTransportToolExecutionEvaluator(undefined));
+
+  it('allows everything until the daemon lifecycle installs an evaluator', () => {
+    expect(wire()('deck_sub_exec', { toolName: 'Bash', input: { command: 'git reset --hard' } })).toEqual({ allow: true });
+  });
+
+  it('passes the resolved IM.codes session name and the request to the evaluator and returns its decision', () => {
+    const evaluator = vi.fn((_session: string, request: { input: unknown }) => (
+      JSON.stringify(request.input).includes('reset') ? { allow: false as const, reason: 'refused' } : { allow: true as const }
+    ));
+    setTransportToolExecutionEvaluator(evaluator);
+    const guard = wire();
+    expect(guard('deck_sub_exec', { toolName: 'Bash', input: { command: 'git reset --hard' }, cwd: '/p' })).toEqual({ allow: false, reason: 'refused' });
+    expect(evaluator).toHaveBeenCalledWith('deck_sub_exec', { toolName: 'Bash', input: { command: 'git reset --hard' }, cwd: '/p' });
+    expect(guard('deck_sub_exec', { toolName: 'Bash', input: { command: 'git status' } })).toEqual({ allow: true });
   });
 });

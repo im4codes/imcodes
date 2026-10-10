@@ -5,19 +5,22 @@
 import { useEffect, useRef, useState } from 'preact/hooks';
 
 interface Props {
-  /** Base64-encoded file content. */
-  data: string;
+  /**
+   * Chunked HTTP download URL for the document. The bytes are fetched here
+   * instead of being inlined into a WebSocket frame, so a large document can
+   * never monopolise the daemon link.
+   */
+  srcUrl: string;
   /** MIME type (application/pdf, .../wordprocessingml.document, .../spreadsheetml.sheet). */
   mimeType: string;
   /** File path — used for display and extension detection. */
   path: string;
 }
 
-function base64ToArrayBuffer(base64: string): ArrayBuffer {
-  const binary = atob(base64);
-  const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-  return bytes.buffer;
+async function fetchArrayBuffer(url: string, signal: AbortSignal): Promise<ArrayBuffer> {
+  const res = await fetch(url, { credentials: 'include', signal });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res.arrayBuffer();
 }
 
 let pdfWorkerBlobUrl: string | null = null;
@@ -45,7 +48,7 @@ export function getPdfWorkerSrc(): Promise<string> {
   return pdfWorkerSrcPromise;
 }
 
-function PdfPreview({ data }: { data: string }) {
+function PdfPreview({ data }: { data: ArrayBuffer }) {
   const containerRef = useRef<HTMLDivElement>(null);
   const [error, setError] = useState<string | null>(null);
   const [retryKey, setRetryKey] = useState(0);
@@ -100,7 +103,7 @@ function PdfPreview({ data }: { data: string }) {
         const workerSrc = await getPdfWorkerSrc();
         if (cancelled) return;
         pdfjsLib.GlobalWorkerOptions.workerSrc = workerSrc;
-        pdfDoc = await pdfjsLib.getDocument({ data: base64ToArrayBuffer(data) }).promise;
+        pdfDoc = await pdfjsLib.getDocument({ data: new Uint8Array(data) }).promise;
         if (cancelled) return;
         // Initial render at current width
         const w = container.clientWidth;
@@ -144,7 +147,7 @@ function PdfPreview({ data }: { data: string }) {
   return <div ref={containerRef} style={{ overflow: 'auto', width: '100%', height: '100%' }} />;
 }
 
-function DocxPreview({ data }: { data: string }) {
+function DocxPreview({ data }: { data: ArrayBuffer }) {
   const containerRef = useRef<HTMLDivElement>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -154,7 +157,7 @@ function DocxPreview({ data }: { data: string }) {
       try {
         const docxPreview = await import('docx-preview');
         if (cancelled || !containerRef.current) return;
-        const buf = base64ToArrayBuffer(data);
+        const buf = data;
         await docxPreview.renderAsync(buf, containerRef.current, undefined, {
           ignoreWidth: true,
           ignoreHeight: true,
@@ -179,7 +182,7 @@ function DocxPreview({ data }: { data: string }) {
   return <div ref={containerRef} style={{ overflow: 'auto', width: '100%', background: '#fff', color: '#000', borderRadius: 4 }} />;
 }
 
-function XlsxPreview({ data }: { data: string }) {
+function XlsxPreview({ data }: { data: ArrayBuffer }) {
   const [html, setHtml] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -191,7 +194,7 @@ function XlsxPreview({ data }: { data: string }) {
           import('xlsx'),
           import('dompurify'),
         ]);
-        const wb = XLSX.read(data, { type: 'base64' });
+        const wb = XLSX.read(data, { type: 'array' });
         const sheet = wb.Sheets[wb.SheetNames[0]];
         if (!sheet) { setError('Empty workbook'); return; }
         // `sheet_to_html` builds markup out of attacker-controlled cell text and
@@ -221,7 +224,25 @@ function XlsxPreview({ data }: { data: string }) {
   );
 }
 
-export default function OfficePreview({ data, mimeType, path }: Props) {
+export default function OfficePreview({ srcUrl, mimeType, path }: Props) {
+  const [data, setData] = useState<ArrayBuffer | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    setData(null);
+    setError(null);
+    fetchArrayBuffer(srcUrl, controller.signal)
+      .then((buf) => { if (!controller.signal.aborted) setData(buf); })
+      .catch((e: unknown) => {
+        if (controller.signal.aborted) return;
+        setError(e instanceof Error ? e.message : String(e));
+      });
+    return () => controller.abort();
+  }, [srcUrl]);
+
+  if (error) return <div style={{ color: '#ef4444', padding: 12 }}>{error}</div>;
+  if (!data) return <div style={{ color: '#64748b', padding: 12 }}>…</div>;
   if (mimeType === 'application/pdf') return <PdfPreview data={data} />;
   if (mimeType.includes('wordprocessingml')) return <DocxPreview data={data} />;
   if (mimeType.includes('spreadsheetml')) return <XlsxPreview data={data} />;

@@ -11,10 +11,16 @@ import { getSubSessionById, getSubSessionsByServer, isExecutionCloneRow } from '
 import { randomHex } from '../security/crypto.js';
 import { logAudit } from '../security/audit.js';
 import {
+  CRON_API_AUTH_ERRORS,
   CRON_COMPLETION_POLICY,
+  CRON_CONTROL_CONTRACT,
+  LEGACY_CRON_CONTROL_CONTRACT_V1,
   CRON_STATUS,
   normalizeCronCompletionPolicy,
   normalizeCronExecutionDetail,
+  normalizeCronSendActionForInterval,
+  registerCronControlAction,
+  type CronAction,
 } from '../../../shared/cron-types.js';
 import { MEMORY_MCP_CAPS } from '../../../shared/memory-mcp-contracts.js';
 import { MEMORY_MCP_SOURCE_FIELDS, stripMemoryMcpSourceProvenance } from '../../../shared/memory-mcp-provenance.js';
@@ -22,11 +28,11 @@ import { P2P_MODE_KEYS } from '../../../shared/p2p-modes.js';
 import { dispatchJobNow } from '../cron/job-dispatch.js';
 import { WsBridge } from '../ws/bridge.js';
 import { RESOURCE_TOPICS } from '../../../shared/resource-events.js';
-import { CLIENT_TIMEZONE_HEADER, DEVICE_TIMEZONE_HEADER } from '../../../shared/http-header-names.js';
+import { AUTHORIZATION_HEADER, CLIENT_TIMEZONE_HEADER, DEVICE_TIMEZONE_HEADER, SERVER_ID_HEADER } from '../../../shared/http-header-names.js';
 import { normalizeClientTimezone } from '../../../shared/client-timezone.js';
 import { loadRememberedClientTimezone, rememberClientTimezone } from '../util/client-timezone.js';
 
-type CronRouteEnv = { Bindings: Env; Variables: { userId: string; role: string; cronDaemonLocal?: boolean } };
+type CronRouteEnv = { Bindings: Env; Variables: { userId: string; role: string } };
 
 export const cronApiRoutes = new Hono<CronRouteEnv>();
 
@@ -41,8 +47,44 @@ const cronParticipantSchema = z.discriminatedUnion('type', [
   z.object({ type: z.literal('session'), value: z.string().regex(sessionNamePattern) }),
 ]);
 
+const currentCronControlRegistrationSchema = z.object({
+  contractId: z.literal(CRON_CONTROL_CONTRACT.contractId), version: z.literal(CRON_CONTROL_CONTRACT.version), scheduleId: z.string().min(1),
+  constraints: z.object({
+    authorization: z.literal(CRON_CONTROL_CONTRACT.constraints.authorization),
+    executeTaskBody: z.literal(CRON_CONTROL_CONTRACT.constraints.executeTaskBody),
+    scope: z.literal(CRON_CONTROL_CONTRACT.constraints.scope),
+    secrets: z.literal(CRON_CONTROL_CONTRACT.constraints.secrets),
+    updateSelf: z.literal(CRON_CONTROL_CONTRACT.constraints.updateSelf),
+    cancelRecurring: z.literal(CRON_CONTROL_CONTRACT.constraints.cancelRecurring),
+    cancelUntilComplete: z.literal(CRON_CONTROL_CONTRACT.constraints.cancelUntilComplete),
+    silent: z.literal(CRON_CONTROL_CONTRACT.constraints.silent),
+    network: z.literal(CRON_CONTROL_CONTRACT.constraints.network),
+    finalResponse: z.literal(CRON_CONTROL_CONTRACT.constraints.finalResponse),
+  }).strict(),
+}).strict();
+
+const legacyCronControlRegistrationSchema = z.object({
+  contractId: z.literal(LEGACY_CRON_CONTROL_CONTRACT_V1.contractId), version: z.literal(LEGACY_CRON_CONTROL_CONTRACT_V1.version), scheduleId: z.string().min(1),
+  constraints: z.object({
+    updateSelf: z.literal(LEGACY_CRON_CONTROL_CONTRACT_V1.constraints.updateSelf),
+    cancelRecurring: z.literal(LEGACY_CRON_CONTROL_CONTRACT_V1.constraints.cancelRecurring),
+    cancelUntilComplete: z.literal(LEGACY_CRON_CONTROL_CONTRACT_V1.constraints.cancelUntilComplete),
+    silent: z.literal(LEGACY_CRON_CONTROL_CONTRACT_V1.constraints.silent),
+    network: z.literal(LEGACY_CRON_CONTROL_CONTRACT_V1.constraints.network),
+    finalResponse: z.literal(LEGACY_CRON_CONTROL_CONTRACT_V1.constraints.finalResponse),
+  }).strict(),
+}).strict();
+
+const cronControlRegistrationSchema = z.union([
+  currentCronControlRegistrationSchema,
+  legacyCronControlRegistrationSchema,
+]);
+
 const cronActionSchemaRaw = z.discriminatedUnion('type', [
-  z.object({ type: z.literal('command'), command: z.string().min(1), selfManaged: z.boolean().optional() }),
+  z.object({
+    type: z.literal('command'), command: z.string().min(1), selfManaged: z.boolean().optional(),
+    cronControl: cronControlRegistrationSchema.optional(),
+  }),
   z.object({
     type: z.literal('send'),
     target: z.string().min(1),
@@ -50,6 +92,7 @@ const cronActionSchemaRaw = z.discriminatedUnion('type', [
     reply: z.boolean().optional(),
     broadcast: z.boolean().optional(),
     idempotencyKey: z.string().min(1).optional(),
+    onlyWhenIdle: z.boolean().optional(),
     [MEMORY_MCP_SOURCE_FIELDS.SOURCE_SESSION_NAME]: z.string().regex(sourceSessionNamePattern).optional(),
     [MEMORY_MCP_SOURCE_FIELDS.SOURCE_PROJECT_NAME]: z.string().min(1).max(64).optional(),
     [MEMORY_MCP_SOURCE_FIELDS.SOURCE_SERVER_ID]: z.string().min(1).max(128).optional(),
@@ -151,23 +194,25 @@ function isDaemonServerTokenCronRequest(
   routeServerId: string | null,
 ): boolean {
   if (!routeServerId) return false;
-  const authHeader = c.req.header('Authorization');
-  const headerServerId = c.req.header('X-Server-Id');
+  const authHeader = c.req.header(AUTHORIZATION_HEADER);
+  const headerServerId = c.req.header(SERVER_ID_HEADER);
   const cookieHeader = c.req.header('Cookie');
   return !!authHeader?.startsWith('Bearer ')
     && headerServerId === routeServerId
     && !cookieHeader;
 }
 
-function isLocalDaemonCronRequest(c: Context<CronRouteEnv>): boolean {
-  return c.get('cronDaemonLocal') === true;
-}
-
+/**
+ * True only for a request that `requireCronAuth` authenticated as THIS server's daemon: the credential is the server
+ * token (a bearer sent together with `X-Server-Id`, which `resolveBearerAuth` verifies against `servers.token_hash` and
+ * refuses for a revoked token or a controlled node) and the header names the route's own server. There is no other way
+ * to be "the daemon": the unauthenticated path that once granted it (any request naming a server) is gone.
+ */
 function isDaemonCronRequest(
   c: Context<CronRouteEnv>,
   routeServerId: string | null,
 ): boolean {
-  return isLocalDaemonCronRequest(c) || isDaemonServerTokenCronRequest(c, routeServerId);
+  return isDaemonServerTokenCronRequest(c, routeServerId);
 }
 
 type CronAccessMode = 'read' | 'write';
@@ -379,23 +424,25 @@ async function filterCronRowsForSharedScope<T extends {
   return rows.filter((_, index) => checks[index]);
 }
 
+/**
+ * Every cron route needs a real credential: a session cookie, a user bearer / API key, or the daemon's server token
+ * (`Authorization: Bearer <server token>` + `X-Server-Id`). A request with none is refused with 401 and touches nothing.
+ *
+ * Until now a route carrying `:serverId` and neither header was treated as the local daemon: it was given the server
+ * owner's identity and the daemon-attested flag. The serverId is not a secret (share recipients and group members receive
+ * it, it is in URLs and logs), so anyone could create, read, change and trigger the owner's cron jobs -- jobs that inject
+ * prompts or commands into the owner's agent sessions. A daemon from before this change still sends no credential: it is
+ * told so by name (`CRON_API_AUTH_ERRORS.DAEMON_CREDENTIAL_REQUIRED`) instead of a bare 401, and the open path stays shut.
+ */
 function requireCronAuth() {
+  const authenticate = requireAuth();
   return async (c: Context<CronRouteEnv>, next: Next): Promise<Response | void> => {
-    const routeServerId = getPodStickyServerId(c);
-    const hasAuthLikeHeader = Boolean(c.req.header('Authorization') || c.req.header('Cookie'));
-    if (routeServerId && !hasAuthLikeHeader) {
-      const server = await c.env.DB.queryOne<{ user_id: string }>(
-        'SELECT user_id FROM servers WHERE id = $1',
-        [routeServerId],
-      );
-      if (!server) return c.json({ error: 'not_found' }, 404);
-      c.set('userId', server.user_id);
-      c.set('role', 'owner');
-      c.set('cronDaemonLocal', true);
-      await next();
-      return;
+    const result = await authenticate(c as unknown as Context<{ Bindings: Env }>, next);
+    // Only the refusal's wording is ours: a daemon that names its server but sends no credential at all is told what to do.
+    if (result instanceof Response && result.status === 401 && !c.req.header(AUTHORIZATION_HEADER) && !c.req.header('Cookie') && c.req.header(SERVER_ID_HEADER)) {
+      return c.json({ error: CRON_API_AUTH_ERRORS.DAEMON_CREDENTIAL_REQUIRED }, 401);
     }
-    return requireAuth()(c as unknown as Context<{ Bindings: Env }>, next);
+    return result;
   };
 }
 
@@ -407,18 +454,49 @@ function normalizeCronActionForPersistence<T extends z.infer<typeof cronActionSc
   return stripMemoryMcpSourceProvenance(action) as T;
 }
 
+function registerSelfManagedCronAction(
+  action: z.infer<typeof cronActionSchema>,
+  scheduleId: string,
+  completionPolicy: z.infer<typeof cronJobCreateSchema>['completionPolicy'],
+): { ok: true; action: CronAction } | { ok: false; reason: string } {
+  if (action.type !== 'command' || action.selfManaged !== true) return { ok: true, action };
+  const registered = registerCronControlAction(action, scheduleId, completionPolicy);
+  return registered.ok
+    ? { ok: true, action: registered.action }
+    : { ok: false, reason: registered.reason };
+}
+
 /** Validate cron expression and enforce minimum 5-minute interval. Returns next run time or error string. */
-function validateCronExpr(cronExpr: string, timezone?: string): { nextRunAt: number } | { error: string } {
+function validateCronExpr(cronExpr: string, timezone?: string): { nextRunAt: number; intervalMs: number | null } | { error: string } {
   try {
     const opts = timezone ? { timezone } : undefined;
     const job = new Cron(cronExpr, opts);
     const first = job.nextRun();
     if (!first) return { error: 'invalid_cron_expression' };
-    const second = job.nextRun(first);
-    if (second && (second.getTime() - first.getTime()) < MIN_INTERVAL_MS) {
+    // Cron step expressions (for example */14) have a short boundary gap
+    // when the step does not divide the hour (56 -> 00 is 4 minutes). Looking
+    // only at the next two occurrences makes validity and the idle-only
+    // default depend on the wall-clock minute at which the request arrives.
+    // Sample a bounded horizon and use the largest observed interval as the
+    // schedule's stable cadence; this preserves the intended nominal period
+    // while still rejecting genuinely sub-five-minute schedules (*/1, */4).
+    const occurrences = [first];
+    let cursor = first;
+    for (let i = 0; i < 7; i++) {
+      const next = job.nextRun(cursor);
+      if (!next) break;
+      occurrences.push(next);
+      cursor = next;
+    }
+    const intervals = occurrences.slice(1).map((next, index) => next.getTime() - occurrences[index]!.getTime());
+    const intervalMs = intervals.length > 0 ? Math.max(...intervals) : null;
+    if (intervalMs !== null && intervalMs < MIN_INTERVAL_MS) {
       return { error: 'cron_interval_too_short' };
     }
-    return { nextRunAt: first.getTime() };
+    return {
+      nextRunAt: first.getTime(),
+      intervalMs,
+    };
   } catch {
     return { error: 'invalid_cron_expression' };
   }
@@ -476,7 +554,7 @@ cronApiRoutes.post('/', requireCronAuth(), async (c) => {
     expiresAt,
     completionPolicy,
   } = parsed.data;
-  const persistedAction = normalizeCronActionForPersistence(action, isDaemonCronRequest(c, routeServerId));
+  const unboundAction = normalizeCronActionForPersistence(action, isDaemonCronRequest(c, routeServerId));
 
   const access = await resolveCronScope(c, { serverId, userId, requestedProjectName: projectName, mode: 'write' });
   if (!access.ok) return c.json({ error: 'forbidden', reason: access.reason }, 403);
@@ -491,6 +569,14 @@ cronApiRoutes.post('/', requireCronAuth(), async (c) => {
 
   const id = randomHex(16);
   const now = Date.now();
+  const registeredAction = registerSelfManagedCronAction(unboundAction, id, completionPolicy);
+  if (!registeredAction.ok) {
+    return c.json({ error: 'invalid_cron_control', reason: registeredAction.reason }, 400);
+  }
+  const persistedAction = normalizeCronSendActionForInterval(
+    registeredAction.action,
+    validation.intervalMs,
+  );
 
   await c.env.DB.execute(
     `INSERT INTO cron_jobs (id, server_id, user_id, name, cron_expr, project_name, target_role, target_session_name, action, timezone, status, next_run_at, expires_at, completion_policy, created_at, updated_at)
@@ -523,6 +609,7 @@ cronApiRoutes.put('/:id', requireCronAuth(), async (c) => {
   const userId = c.get('userId' as never) as string;
   const routeServerId = getPodStickyServerId(c);
   const jobId = c.req.param('id');
+  if (!jobId) return c.json({ error: 'not_found' }, 404);
   const body = await c.req.json().catch(() => null);
   const parsed = cronJobUpdateSchema.safeParse(await withDefaultCronTimezone(c, userId, body));
   if (!parsed.success) return c.json({ error: 'invalid_body', issues: parsed.error.issues }, 400);
@@ -567,6 +654,7 @@ cronApiRoutes.put('/:id', requireCronAuth(), async (c) => {
 
   // Re-validate cron expression if changed
   let nextRunAt: number | undefined;
+  let effectiveIntervalMs: number | null | undefined;
   const newCronExpr = updates.cronExpr;
   const effectiveTz = updates.timezone ?? job.timezone ?? undefined;
   const scheduleChanged = (newCronExpr !== undefined && newCronExpr !== job.cron_expr)
@@ -577,6 +665,7 @@ cronApiRoutes.put('/:id', requireCronAuth(), async (c) => {
       return c.json({ error: validation.error, ...(validation.error === 'cron_interval_too_short' ? { minIntervalMinutes: 5 } : {}) }, 400);
     }
     nextRunAt = validation.nextRunAt;
+    effectiveIntervalMs = validation.intervalMs;
   }
 
   // Build dynamic UPDATE
@@ -584,14 +673,43 @@ cronApiRoutes.put('/:id', requireCronAuth(), async (c) => {
   const vals: unknown[] = [now];
   let idx = 2;
 
+  if (effectiveIntervalMs === undefined && (updates.action !== undefined || existingAction?.type === 'send')) {
+    const scheduleValidation = validateCronExpr(newCronExpr ?? job.cron_expr, effectiveTz);
+    if (!('error' in scheduleValidation)) effectiveIntervalMs = scheduleValidation.intervalMs;
+  }
+
+  // When an action is omitted, keep the existing action but still apply the
+  // schedule default to legacy rows that predate onlyWhenIdle. Explicit true
+  // and false values remain untouched by the shared normalizer.
+  if (updates.action === undefined && existingAction?.type === 'send') {
+    const normalizedExistingAction = normalizeCronSendActionForInterval(existingAction, effectiveIntervalMs);
+    if (normalizedExistingAction !== existingAction) {
+      sets.push(`action = $${idx++}`);
+      vals.push(JSON.stringify(normalizedExistingAction));
+    }
+  }
+
   if (updates.name !== undefined) { sets.push(`name = $${idx++}`); vals.push(updates.name); }
   if (updates.cronExpr !== undefined) { sets.push(`cron_expr = $${idx++}`); vals.push(updates.cronExpr); }
   if (updates.projectName !== undefined) { sets.push(`project_name = $${idx++}`); vals.push(updates.projectName); }
   if (updates.targetRole !== undefined) { sets.push(`target_role = $${idx++}`); vals.push(updates.targetRole); }
   if (updates.targetSessionName !== undefined) { sets.push(`target_session_name = $${idx++}`); vals.push(updates.targetSessionName); }
   if (updates.action !== undefined) {
+    const unboundAction = normalizeCronActionForPersistence(updates.action, isDaemonCronRequest(c, routeServerId));
+    const registeredAction = registerSelfManagedCronAction(
+      unboundAction,
+      jobId,
+      updates.completionPolicy ?? normalizeCronCompletionPolicy(job.completion_policy),
+    );
+    if (!registeredAction.ok) {
+      return c.json({ error: 'invalid_cron_control', reason: registeredAction.reason }, 400);
+    }
+    const normalizedAction = normalizeCronSendActionForInterval(
+      registeredAction.action,
+      effectiveIntervalMs,
+    );
     sets.push(`action = $${idx++}`);
-    vals.push(JSON.stringify(normalizeCronActionForPersistence(updates.action, isDaemonCronRequest(c, routeServerId))));
+    vals.push(JSON.stringify(normalizedAction));
   }
   if (updates.timezone !== undefined) { sets.push(`timezone = $${idx++}`); vals.push(updates.timezone); }
   if (updates.expiresAt !== undefined) { sets.push(`expires_at = $${idx++}`); vals.push(updates.expiresAt); }

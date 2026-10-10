@@ -6,6 +6,7 @@
  * never spawn a real worker_threads worker (no model load, fast test).
  */
 
+import { activeUserAnswer } from './helpers/user-status.js';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { buildApp } from '../src/index.js';
 import type { Env } from '../src/env.js';
@@ -21,10 +22,11 @@ function makeMemDb(): Database {
 
   return {
     queryOne: async <T = unknown>(sql: string, params: unknown[] = []): Promise<T | null> => {
+      { const activeUser = activeUserAnswer(sql); if (activeUser) return activeUser as never; }
       const s = sql.toLowerCase().replace(/\s+/g, ' ').trim();
       if (s.includes('from api_keys where key_hash')) {
         for (const k of apiKeys.values()) {
-          if (k.key_hash === params[0]) return { id: k.id, user_id: k.user_id } as T;
+          if (k.key_hash === params[0]) return { id: k.id, user_id: k.user_id, user_status: 'active' } as T;
         }
         return null;
       }

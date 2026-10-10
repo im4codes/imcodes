@@ -42,6 +42,15 @@
 export const CHAT_MOUNT_SETTLE_MS = 1_500;
 export const CHAT_MOUNT_SETTLE_TICK_MS = 80;
 
+/**
+ * How long an upward wheel/touch gesture keeps follow from RE-engaging. A reader
+ * who has only dragged a few dozen pixels is still inside the re-engage band of
+ * the bottom; without this hold the very next scroll event re-engaged follow and
+ * the stream's pin snapped them back down mid-drag (a 45-75px jump on touch).
+ * Covers the drag and the release; scrolling back down re-engages as before.
+ */
+export const CHAT_USER_SCROLL_UP_HOLD_MS = 400;
+
 export interface FollowThresholds {
   disengageThreshold: number;
   reengageThreshold: number;

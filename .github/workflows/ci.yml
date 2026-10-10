@@ -8,6 +8,30 @@ on:
   pull_request:
     branches: [main, master]
 
+# Grouping by ref and cancelling a stale run the moment a newer one starts
+# is genuinely safe for `pull_request` syncs (nobody acts on a superseded
+# PR check) and for throwaway `repro/**` branches (never publish/docker,
+# see each job's own `if:` below) -- so those two keep the original
+# behavior. It stopped being safe for `main`/`master`/`dev`: those are the
+# ONLY refs the Publish-to-npm and Docker-Build-&-Push jobs ever run on
+# (`if: github.ref == 'refs/heads/master' || ... == 'refs/heads/main' ||
+# ... == 'refs/heads/dev'`), and cancel-in-progress kills the WHOLE run --
+# every job in it, including one already mid-`npm publish` or mid-`docker
+# push` -- the instant a newer commit lands on the same branch. On `dev`
+# in particular, taking pushes from several concurrent sessions within
+# minutes of each other, this meant Publish/Docker routinely never
+# finished at all: superseded before reaching them, forever (live,
+# repeatedly observed). A half-finished publish/Docker push is worse than
+# a slightly slow one, exactly like this file's own original reasoning
+# for excluding release tags -- main/master/dev now get that same
+# protection. Lint/typecheck/test on those three branches pay for this
+# with an occasional wasted matrix run on a commit a newer push already
+# superseded; that is strictly cheaper than an interrupted publish.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request'
+    || (github.event_name == 'push' && startsWith(github.ref, 'refs/heads/repro/')) }}
+
 env:
   NODE_VERSION_PRIMARY: '24'
   NODE_VERSION_SERVER: '22'
@@ -19,6 +43,8 @@ jobs:
   lint:
     name: Lint
     runs-on: ubuntu-latest
+    # Ends a hung job itself instead of holding the concurrency group for the 6 h default (normal 1 min, max 1.4).
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -33,6 +59,8 @@ jobs:
   typecheck:
     name: Typecheck
     runs-on: ubuntu-latest
+    # Ends a hung job itself instead of holding the concurrency group for the 6 h default (normal 1 min, max 1.2).
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -53,6 +81,8 @@ jobs:
   secret-scan:
     name: Secret Scan (gitleaks)
     runs-on: ubuntu-latest
+    # Ends a hung job itself instead of holding the concurrency group for the 6 h default (normal 0.2 min, max 0.4).
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
         with:
@@ -66,6 +96,8 @@ jobs:
   unit-tests:
     name: Unit Tests (Node ${{ matrix.node }})
     runs-on: ubuntu-latest
+    # Ends a hung job itself instead of holding the concurrency group for the 6 h default (normal 10 min, max 11.5).
+    timeout-minutes: 30
     strategy:
       matrix:
         node: ['22', '24']
@@ -119,6 +151,8 @@ jobs:
   preview-dist-smoke:
     name: Preview Dist Smoke
     runs-on: ubuntu-latest
+    # Ends a hung job itself instead of holding the concurrency group for the 6 h default (normal 1 min, max 1.1).
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -131,6 +165,8 @@ jobs:
   embedding-real-tests:
     name: Embedding Integration Tests
     runs-on: ubuntu-latest
+    # Ends a hung job itself instead of holding the concurrency group for the 6 h default (normal 1 min, max 1.0; downloads a model).
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -154,6 +190,8 @@ jobs:
   macos-unit-tests:
     name: Unit Tests (macOS)
     runs-on: macos-latest
+    # Ends a hung job itself instead of holding the concurrency group for the 6 h default (normal 17 min, max 19.3).
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -168,11 +206,99 @@ jobs:
       - run: npm run build
       - run: npm run test:unit
 
+  # ── macOS remote-desktop components (built from the immutable SDK) ────────
+
+  # Proves the published libwebrtc SDK still builds the shipped components, on
+  # a runner with no WebRTC checkout, no gn and no ninja. Before this existed
+  # nothing in CI built the macOS components at all.
+  #
+  # arm64 only here. Both architectures are built in build-node-exe.yml for a
+  # release; doing both on every push would double a four-minute job to catch
+  # regressions that are almost never architecture-specific.
+  macos-remote-desktop-components:
+    name: macOS Remote Desktop (from SDK)
+    runs-on: macos-15
+    # Ends a hung job itself instead of holding the concurrency group for the 6 h default (normal 1.5 min, max 2.2).
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION_PRIMARY }}
+          cache: 'npm'
+      - run: ./scripts/ci-npm-ci.sh .
+      # Deliberately not cached. The extracted SDK is ~850MB per architecture,
+      # which would spend most of the repository's 10GB Actions cache budget to
+      # save a download of well under a minute.
+      - name: Install the pinned libwebrtc SDK
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          lock="native/macos-remote-desktop/libwebrtc-sdk-arm64.lock.json"
+          tag="$(node -p "require('./$lock').releaseTag")"
+          asset="$(node -p "require('./$lock').assetName")"
+          repository="$(node -p "require('./$lock').repository")"
+          download="$RUNNER_TEMP/libwebrtc-sdk-download"
+          mkdir -p "$download"
+          gh release download "$tag" --repo "$repository" --pattern "$asset" \
+            --dir "$download" --clobber
+          # Verifies the lock against the archive before extracting anything,
+          # and against every extracted file's digest afterwards.
+          node scripts/install-libwebrtc-sdk.mjs --target macos-arm64 \
+            "$download/$asset" "$RUNNER_TEMP/libwebrtc-sdk"
+          rm -rf "$download"
+      - name: Verify the installed SDK against the committed lock
+        run: >-
+          node scripts/libwebrtc-sdk-artifacts.mjs verify-sdk-lock
+          --target macos-arm64
+          native/macos-remote-desktop/libwebrtc-sdk-arm64.lock.json
+          "$RUNNER_TEMP/libwebrtc-sdk"
+      - name: Build the remote-desktop components
+        run: |
+          bash native/macos-remote-desktop/build-worker-from-sdk.sh \
+            --sdk-root "$RUNNER_TEMP/libwebrtc-sdk" \
+            --artifact-root "$RUNNER_TEMP/remote-desktop-components" \
+            --target-cpu arm64 --jobs 3
+      # Linking is not the same as working: a complete flag set is what
+      # separates a binary that runs from one that segfaults in a constructor,
+      # and only running it tells them apart.
+      - name: Run each component
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/remote-desktop-components"
+          for component in imcodes-remote-desktop-worker \
+            imcodes-remote-desktop-launch-agent \
+            imcodes-remote-desktop-disclosure \
+            imcodes-virtual-display-helper; do
+            test -x "$component"
+            # A usage error is the CORRECT answer to a nonsense argument: these
+            # exit 64 (EX_USAGE) and name the invocation they did not
+            # understand. What is being distinguished here is a process that
+            # ran from one that could not -- 126 and 127 are the shell's codes
+            # for "cannot execute", which is what a wrong-architecture binary
+            # or a missing dynamic library produces.
+            set +e
+            output="$(./"$component" --imcodes-ci-probe 2>&1)"
+            status=$?
+            set -e
+            if [ "$status" -ge 126 ] && [ "$status" -le 127 ]; then
+              echo "$component could not be executed (exit $status)" >&2
+              exit 1
+            fi
+            first="$(printf '%s\n' "$output" | head -1)"
+            test -n "$first"
+            echo "$component -> $first (exit $status)"
+          done
+
   # ── Windows unit tests (WezTerm backend) ──────────────────────────────────
 
   windows-unit-tests:
     name: Unit Tests (Windows)
     runs-on: windows-latest
+    # Ends a hung job itself instead of holding the concurrency group for the 6 h default (normal 2 min, max 2.7).
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -197,10 +323,39 @@ jobs:
         run: npx vitest run test/util/windows-stale-watchdog-cleanup.test.ts
         env:
           IMCODES_MUX: wezterm
+      - name: Run full Windows remote-desktop worker-host gate
+        run: npx vitest run test/node/remote-desktop-worker-host.test.ts test/node/remote-desktop-worker-host-core.test.ts test/node/remote-desktop-worker-test-endpoint.test.ts --reporter=verbose
+        env:
+          IMCODES_MUX: wezterm
+
+  aidesk-panel-host-windows:
+    name: aiDesk panel window host (Windows build)
+    runs-on: windows-latest
+    # Ends a hung job itself instead of holding the concurrency group for the 6 h default (normal 1.6 min, max 2.2).
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION_PRIMARY }}
+          cache: 'npm'
+      - run: bash ./scripts/ci-npm-ci.sh .
+      - name: Panel window host contract tests
+        run: npx vitest run test/spec/aidesk-panel-host-windows.test.ts test/spec/aidesk-local-ui-release-wiring.test.ts
+      - name: Build the panel window host (MSVC, pinned WebView2 SDK, static loader)
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $out = .\native\aidesk-panel-host-windows\build.ps1 -ArtifactRoot "$env:RUNNER_TEMP\aidesk-local-ui\win32-x64"
+          if ($LASTEXITCODE -ne 0) { throw 'building the panel window host failed' }
+          $out | Select-Object -Last 1 | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+          Get-Item "$env:RUNNER_TEMP\aidesk-local-ui\win32-x64\aidesk-local-ui.exe" | Select-Object Name, Length
 
   windows-conpty-tests:
     name: Unit Tests (Windows ConPTY)
     runs-on: windows-latest
+    # Ends a hung job itself instead of holding the concurrency group for the 6 h default (normal 1.7 min, max 2.8).
+    timeout-minutes: 20
     steps:
       - name: Checkout
         id: checkout_1
@@ -258,6 +413,8 @@ jobs:
   web-tests-unit:
     name: Web Tests (Unit)
     runs-on: ubuntu-latest
+    # Ends a hung job itself instead of holding the concurrency group for the 6 h default (normal 3 min, max 3.3).
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -271,6 +428,8 @@ jobs:
   web-tests-components:
     name: Web Tests (Components)
     runs-on: ubuntu-latest
+    # Ends a hung job itself instead of holding the concurrency group for the 6 h default (normal 2 min, max 2.1).
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -284,6 +443,8 @@ jobs:
   web-chat-perf:
     name: Web Chat Timeline Perf Guard
     runs-on: ubuntu-latest
+    # Ends a hung job itself instead of holding the concurrency group for the 6 h default (normal 2-3 min; 12.9 once when apt stalled; the install step is retried 3 x 4 min below).
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -297,7 +458,17 @@ jobs:
       # performs no layout, so the work this guards is largely invisible there.
       # The assertion is a ratio of one session length against another, which
       # normalises away how fast the CI host happens to be.
-      - run: cd web && npx playwright install --with-deps chromium
+      # `--with-deps` drives apt-get, and an apt mirror that stalls does not fail,
+      # it waits: this one step took 9-11 min on two earlier runs (it is ~25 s)
+      # and on run 37664607739 it never finished, holding the push concurrency
+      # group for hours. Bound apt's own network waits, then bound and retry the
+      # whole install.
+      - name: Install Chromium and its system libraries (bounded and retried)
+        timeout-minutes: 15
+        run: |
+          ./scripts/ci-apt-hardening.sh
+          cd web
+          CI_RETRY_BETWEEN_ATTEMPTS='sudo dpkg --configure -a' ../scripts/ci-retry.sh 3 240 npx playwright install --with-deps chromium
       - run: cd web && npm run test:browser:perf
       - name: Upload perf report
         if: always()
@@ -316,6 +487,8 @@ jobs:
   server-tests:
     name: Server Unit Tests
     runs-on: ubuntu-latest
+    # Ends a hung job itself instead of holding the concurrency group for the 6 h default (normal 2.3 min, max 2.7).
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -341,6 +514,8 @@ jobs:
   server-db-tests:
     name: Server DB Integration Tests
     runs-on: ubuntu-latest
+    # Ends a hung job itself instead of holding the concurrency group for the 6 h default (normal 2 min, max 2.4; the image pull and the tests are each retried).
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -393,6 +568,8 @@ jobs:
   e2e-tests:
     name: E2E Tests
     runs-on: ubuntu-latest
+    # Ends a hung job itself instead of holding the concurrency group for the 6 h default (normal 2.2 min, max 2.7).
+    timeout-minutes: 15
     needs: [unit-tests]
     steps:
       - name: Checkout
@@ -455,7 +632,9 @@ jobs:
           node-version: ${{ env.NODE_VERSION_PRIMARY }}
           cache: 'npm'
       - name: Install tmux
-        run: sudo apt-get install -y tmux
+        run: |
+          ./scripts/ci-apt-hardening.sh
+          sudo apt-get install -y tmux
       - name: Prime tmux server (ensures socket dir exists)
         run: tmux new-session -d -s init && tmux kill-session -t init
       - run: ./scripts/ci-npm-ci.sh .
@@ -471,6 +650,8 @@ jobs:
   repo-integration-tests:
     name: Repo Provider Integration Tests
     runs-on: ubuntu-latest
+    # Ends a hung job itself instead of holding the concurrency group for the 6 h default (normal 1 min, max 1.3).
+    timeout-minutes: 10
     needs: [unit-tests]
     steps:
       - uses: actions/checkout@v4
@@ -496,10 +677,52 @@ jobs:
 
   # ── Coverage ──────────────────────────────────────────────────────────────
 
+  coverage-shard:
+    name: Coverage shard ${{ matrix.shard }}
+    runs-on: ubuntu-latest
+    # Ends a hung job itself instead of holding the concurrency group for the 6 h default (normal 5-6 min, max 6.8).
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        shard: [1, 2, 3, 4]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION_PRIMARY }}
+          cache: 'npm'
+      # Keep this build in every shard: packaging and postinstall tests may
+      # land in any shard, and the build is short compared with test runtime.
+      - run: ./scripts/ci-npm-ci.sh .
+      - name: Install web deps (needed for tsx component tests)
+        run: ./scripts/ci-npm-ci.sh web
+      - name: Install server deps (needed for server route tests)
+        run: ./scripts/ci-npm-ci.sh server
+      - run: npm run build
+      - name: Run coverage shard
+        run: npm run test:coverage:ci -- --shard=${{ matrix.shard }}/4 --coverage.reportsDirectory=coverage/shard-${{ matrix.shard }} --reporter=blob --reporter=default
+        env:
+          # Shards only need JSON input for the merge; final reports are made
+          # once by the merge job, avoiding four lcov/text/reporting passes.
+          COVERAGE_REPORTERS: json
+      - name: Upload coverage shard
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-shard-${{ matrix.shard }}
+          path: |
+            coverage/shard-${{ matrix.shard }}/
+            .vitest-reports/
+          if-no-files-found: ignore
+
   coverage:
     name: Coverage Report
     runs-on: ubuntu-latest
-    needs: [unit-tests, web-tests-unit, web-tests-components]
+    # Ends a hung job itself instead of holding the concurrency group for the 6 h default (normal 1.3 min, max 1.9).
+    timeout-minutes: 10
+    needs: [coverage-shard]
     env:
       CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
     steps:
@@ -508,24 +731,31 @@ jobs:
         with:
           node-version: ${{ env.NODE_VERSION_PRIMARY }}
           cache: 'npm'
-      # tmux is no longer needed here: `test:coverage` skips the e2e project
-      # (which spawns real tmux + agent processes), saving ~1 min per run.
-      #
-      # `npm run build` IS still needed: although most tests resolve from
-      # `src/` via vitest's tsx transform, two suites assert against the
-      # built output and FAIL without `dist/`:
-      #   - test/packaging.test.ts             (verifies bin/main/files paths)
-      #   - test/util/postinstall-sharp-repair.test.ts (executes dist/.../postinstall-sharp-repair.js)
-      # Both run in the `daemon` project, which is included in coverage. They
-      # pass in the regular Unit Tests jobs because those run `npm run build`
-      # first; coverage must do the same.
       - run: ./scripts/ci-npm-ci.sh .
-      - name: Install web deps (needed for tsx component tests)
-        run: ./scripts/ci-npm-ci.sh web
-      - name: Install server deps (needed for server route tests)
-        run: ./scripts/ci-npm-ci.sh server
-      - run: npm run build
-      - run: npm run test:coverage
+      - name: Download coverage shard 1
+        uses: actions/download-artifact@v4
+        with:
+          name: coverage-shard-1
+          path: coverage/shards/shard-1
+      - name: Download coverage shard 2
+        uses: actions/download-artifact@v4
+        with:
+          name: coverage-shard-2
+          path: coverage/shards/shard-2
+      - name: Download coverage shard 3
+        uses: actions/download-artifact@v4
+        with:
+          name: coverage-shard-3
+          path: coverage/shards/shard-3
+      - name: Download coverage shard 4
+        uses: actions/download-artifact@v4
+        with:
+          name: coverage-shard-4
+          path: coverage/shards/shard-4
+      - name: Merge coverage reports
+        run: npm run coverage:merge -- coverage/shards coverage
+      - name: Write coverage summary and enforce thresholds
+        run: npm run coverage:summary && npm run coverage:check
       - name: Upload coverage artifact
         if: always()
         uses: actions/upload-artifact@v4
@@ -533,13 +763,13 @@ jobs:
           name: coverage-report
           path: |
             coverage/
-            !coverage/tmp/
+            !coverage/shards/
           if-no-files-found: error
       - name: Upload to Codecov
         if: ${{ env.CODECOV_TOKEN != '' }}
         uses: codecov/codecov-action@v4
         with:
-          token: ${{ env.CODECOV_TOKEN }}
+          token: ${{ secrets.CODECOV_TOKEN }}
           fail_ci_if_error: false
       - name: Skip Codecov upload when token is unavailable
         if: ${{ env.CODECOV_TOKEN == '' }}
@@ -553,6 +783,8 @@ jobs:
   publish:
     name: Publish to npm
     runs-on: ubuntu-latest
+    # Ends a hung job itself instead of holding the concurrency group for the 6 h default (normal 2 min).
+    timeout-minutes: 20
     needs: [docker]
     if: github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev'
     permissions:
@@ -632,6 +864,8 @@ jobs:
     name: Resolve release version
     if: github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev'
     runs-on: ubuntu-latest
+    # Ends a hung job itself instead of holding the concurrency group for the 6 h default (normal 0.2 min).
+    timeout-minutes: 5
     outputs:
       app_version: ${{ steps.version.outputs.app_version }}
     steps:
@@ -655,6 +889,8 @@ jobs:
     needs: [release_version]
     if: github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev'
     runs-on: ${{ matrix.runner }}
+    # Ends a hung job itself instead of holding the concurrency group for the 6 h default (normal 2-8 min; the Windows leg may wait up to 250 min for the SDK producer (--wait-seconds 15000), then builds for up to 30).
+    timeout-minutes: 330
     env:
       IMCODES_BUILD_VERSION: ${{ needs.release_version.outputs.app_version }}
     strategy:
@@ -709,8 +945,250 @@ jobs:
           $sha256 = [System.Security.Cryptography.SHA256]::Create()
           try { $signerSha256 = [BitConverter]::ToString($sha256.ComputeHash($certificate.RawData)).Replace('-', '').ToLowerInvariant() } finally { $sha256.Dispose() }
           "IMCODES_WINDOWS_SIGNING_CERT_SHA256=$signerSha256" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Import macOS release-signing identity
+        if: runner.os == 'macOS'
+        env:
+          IMCODES_MACOS_SIGNING_P12_BASE64: ${{ secrets.IMCODES_MACOS_SIGNING_P12_BASE64 }}
+          IMCODES_MACOS_SIGNING_P12_PASSWORD: ${{ secrets.IMCODES_MACOS_SIGNING_P12_PASSWORD }}
+          IMCODES_MACOS_KEYCHAIN_PASSWORD: ${{ secrets.IMCODES_MACOS_KEYCHAIN_PASSWORD }}
+          IMCODES_MACOS_TEAM_ID: ${{ secrets.IMCODES_MACOS_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          IDENTITY="$(node scripts/macos-release-signing.mjs import)"
+          # The fingerprint, not the common name: a name can match several
+          # certificates, and a release pins the exact one it signed with.
+          echo "IMCODES_MACOS_SIGNING_IDENTITY=$(printf '%s' "$IDENTITY" | node -e 'process.stdin.on("data",(d)=>process.stdout.write(JSON.parse(d).sha1))')" >> "$GITHUB_ENV"
+      - name: Write macOS notary API key
+        if: runner.os == 'macOS'
+        env:
+          IMCODES_MACOS_NOTARY_KEY_BASE64: ${{ secrets.IMCODES_MACOS_NOTARY_KEY_BASE64 }}
+        run: |
+          set -euo pipefail
+          if [ -z "${IMCODES_MACOS_NOTARY_KEY_BASE64:-}" ]; then
+            echo 'macOS notary API key is required.' >&2
+            exit 1
+          fi
+          KEY_PATH="$RUNNER_TEMP/imcodes-macos-notary.p8"
+          printf '%s' "$IMCODES_MACOS_NOTARY_KEY_BASE64" | base64 --decode > "$KEY_PATH"
+          chmod 600 "$KEY_PATH"
+          echo "IMCODES_MACOS_NOTARY_KEY_PATH=$KEY_PATH" >> "$GITHUB_ENV"
+      - name: Build, sign and describe the aiDesk panel window host
+        uses: ./.github/actions/build-aidesk-ui
+        with:
+          version: ${{ env.IMCODES_BUILD_VERSION }}
+          windows-signing-cert-thumbprint: ${{ env.IMCODES_WINDOWS_SIGNING_CERT_THUMBPRINT }}
+          windows-signing-cert-sha256: ${{ env.IMCODES_WINDOWS_SIGNING_CERT_SHA256 }}
       - name: Build controlled-node executable
         run: npm run build:node-exe
+      - name: Notarize macOS controlled-node executable
+        if: runner.os == 'macOS'
+        env:
+          IMCODES_MACOS_NOTARY_KEY_ID: ${{ secrets.IMCODES_MACOS_NOTARY_KEY_ID }}
+          IMCODES_MACOS_NOTARY_ISSUER: ${{ secrets.IMCODES_MACOS_NOTARY_ISSUER }}
+        run: |
+          set -euo pipefail
+          # Apple documents that a standalone binary gets a ticket but cannot
+          # have one stapled to it, so this records the notarization without
+          # claiming an offline-verifiable ticket. Users reach this file through
+          # the install command or the app, neither of which quarantines it.
+          node scripts/macos-release-signing.mjs notarize dist-node-exe/imcodes-node-macos
+      - name: Prove the signed macOS executable still runs
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          codesign --verify --strict --verbose=2 dist-node-exe/imcodes-node-macos
+          # The hardened runtime needs the JIT entitlements to be present and
+          # correct; a binary that signs and notarizes can still die on launch
+          # without them, and that failure would otherwise reach users first.
+          ./dist-node-exe/imcodes-node-macos --version
+      - name: Build and notarize the aiDesk application bundle
+        if: runner.os == 'macOS'
+        env:
+          IMCODES_MACOS_NOTARY_KEY_ID: ${{ secrets.IMCODES_MACOS_NOTARY_KEY_ID }}
+          IMCODES_MACOS_NOTARY_ISSUER: ${{ secrets.IMCODES_MACOS_NOTARY_ISSUER }}
+        run: |
+          set -euo pipefail
+          # One signed bundle holding every helper that needs a permission, so
+          # macOS attributes Screen Recording and Accessibility to the app the
+          # person chose rather than to whatever launched a helper. Unlike the
+          # bare executable this one CAN carry its notarization ticket, so it
+          # verifies with no network.
+          # Built during `build:node-exe`, before the manifest recorded the
+          # helper archive's hash -- swapping the archive afterwards makes
+          # every consumer reject the set as tampered with.
+          APP="dist-node-exe/aiDesk.to by IM.codes.app"
+          node scripts/macos-release-signing.mjs notarize "$APP"
+          xcrun stapler validate "$APP"
+      - name: Build, sign and notarize the aiDesk disk image
+        if: runner.os == 'macOS'
+        env:
+          IMCODES_MACOS_NOTARY_KEY_ID: ${{ secrets.IMCODES_MACOS_NOTARY_KEY_ID }}
+          IMCODES_MACOS_NOTARY_ISSUER: ${{ secrets.IMCODES_MACOS_NOTARY_ISSUER }}
+        run: |
+          set -euo pipefail
+          # Built from the app as it now stands, which already carries its own
+          # stapled ticket -- so the app keeps verifying offline after being
+          # dragged out of the image. A disk image rather than a package: both
+          # can be stapled, but one is a drag and the other is a wizard.
+          DMG="$(node scripts/build-aidesk-app.mjs dmg dist-node-exe)"
+          node scripts/macos-release-signing.mjs notarize "$DMG"
+          xcrun stapler validate "$DMG"
+      # The macOS remote-desktop components. Without this the image ships a
+      # macOS node that can self-upgrade but has no components to fetch: the
+      # server answers `remote_desktop_worker_not_built` and macOS remote
+      # desktop is simply unavailable, with nothing in CI saying so -- the
+      # artifact verifier below defaults to the WINDOWS target, so a missing
+      # macOS set was never a failure.
+      #
+      # Built from the published, locked SDKs rather than a checkout: the SDK
+      # is immutable and takes hours to reproduce, so a release build downloads
+      # it instead of rebuilding it.
+      # The SDK archives are immutable and named by their own digest, so the
+      # cache key is the lock files themselves. Without this every run on dev
+      # pulls ~470MB twice from release assets -- which is both slow and the
+      # step most likely to fail on a transient network error.
+      - name: Restore the locked macOS libwebrtc SDK archives
+        if: runner.os == 'macOS'
+        id: macos_libwebrtc_sdk_cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/libwebrtc-sdk-archives
+          key: imcodes-libwebrtc-macos-${{ hashFiles('native/macos-remote-desktop/libwebrtc-sdk-arm64.lock.json', 'native/macos-remote-desktop/libwebrtc-sdk-x64.lock.json') }}-v1
+      - name: Build, sign and notarize the macOS remote-desktop components
+        if: runner.os == 'macOS'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # IMCODES_MACOS_SIGNING_IDENTITY and IMCODES_MACOS_NOTARY_KEY_PATH
+          # are already in the environment from the signing-identity and notary
+          # key steps above.
+          IMCODES_MACOS_TEAM_ID: ${{ secrets.IMCODES_MACOS_TEAM_ID }}
+          IMCODES_MACOS_NOTARY_KEY_ID: ${{ secrets.IMCODES_MACOS_NOTARY_KEY_ID }}
+          IMCODES_MACOS_NOTARY_ISSUER: ${{ secrets.IMCODES_MACOS_NOTARY_ISSUER }}
+        run: |
+          set -euo pipefail
+          for arch in arm64 x64; do
+            lock="native/macos-remote-desktop/libwebrtc-sdk-$arch.lock.json"
+            tag="$(node -p "require('./$lock').releaseTag")"
+            asset="$(node -p "require('./$lock').assetName")"
+            repository="$(node -p "require('./$lock').repository")"
+            download="$RUNNER_TEMP/libwebrtc-sdk-archives"
+            sdk="$RUNNER_TEMP/libwebrtc-sdk-$arch"
+            mkdir -p "$download"
+            # Downloaded only on a cache miss. The installer verifies the
+            # archive against the lock's digest either way, so a cached file is
+            # never trusted for being cached.
+            if [ ! -f "$download/$asset" ]; then
+              gh release download "$tag" --repo "$repository" --pattern "$asset" \
+                --dir "$download" --clobber
+            fi
+            node scripts/install-libwebrtc-sdk.mjs --target "macos-$arch" \
+              "$download/$asset" "$sdk"
+            node scripts/libwebrtc-sdk-artifacts.mjs verify-sdk-lock \
+              --target "macos-$arch" "$lock" "$sdk"
+            node scripts/build-macos-remote-desktop-release.mjs \
+              --arch "$arch" \
+              --sdk-root "$sdk" \
+              --artifact-root "dist-node-exe/remote-desktop-worker/darwin-$arch" \
+              --worker-version "$IMCODES_BUILD_VERSION" \
+              --jobs 3
+            # The EXTRACTED tree only: ~850MB each, and the runner still has
+            # packaging and upload to do. The archive stays for the cache.
+            rm -rf "$sdk"
+          done
+      - name: Verify the macOS remote-desktop component sets
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          for arch in arm64 x64; do
+            node scripts/remote-desktop-worker-artifacts.mjs verify \
+              dist-node-exe "$IMCODES_BUILD_VERSION" darwin "$arch"
+          done
+      # The Linux remote-desktop worker. Same reasoning as the macOS block
+      # above: without this the image ships a Linux controlled node that can
+      # self-upgrade but has no worker binary, so LinuxRemoteDesktopWorkerHost
+      # .available() is permanently false and remote desktop is simply
+      # unavailable -- with nothing in CI saying so. Built from the published,
+      # locked SDK (build-libwebrtc-sdk.sh built it once, hours; this is a
+      # ~15s compile+link against the immutable result).
+      - name: Restore the locked Linux libwebrtc SDK archive
+        if: runner.os == 'Linux'
+        id: linux_libwebrtc_sdk_cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/libwebrtc-sdk-archives-linux
+          key: imcodes-libwebrtc-linux-${{ hashFiles('native/linux-remote-desktop/libwebrtc-sdk.lock.json') }}-v1
+      # The -dev packages, not just the runtime .so.N libraries: ld.lld's -lX11
+      # etc. look for the unversioned .so symlink each -dev package ships (the
+      # runtime-only packages install just libX11.so.6, with nothing named
+      # libX11.so, and the link step below failed with "unable to find
+      # library -lX11" on a bare ubuntu-latest runner before this was -dev).
+      # Also a virtual display to actually run the qualification test against
+      # below -- ubuntu-latest is headless by default. install-linux-desktop-
+      # environment.sh installs the same X11 client libraries on a controlled
+      # node for the same reason; this is the CI-only equivalent, narrowed to
+      # just the link-time libs and Xvfb rather than a full desktop session.
+      - name: Install X11 development libraries, Xvfb, and pulseaudio
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          ./scripts/ci-apt-hardening.sh
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libx11-dev libxext-dev libxtst-dev libxfixes-dev libxrandr-dev xvfb pulseaudio
+      - name: Build and test the Linux remote-desktop worker from the SDK
+        if: runner.os == 'Linux'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          lock="native/linux-remote-desktop/libwebrtc-sdk.lock.json"
+          tag="$(node -p "require('./$lock').releaseTag")"
+          asset="$(node -p "require('./$lock').assetName")"
+          repository="$(node -p "require('./$lock').repository")"
+          download="$RUNNER_TEMP/libwebrtc-sdk-archives-linux"
+          sdk="$RUNNER_TEMP/libwebrtc-sdk-linux"
+          mkdir -p "$download"
+          # Downloaded only on a cache miss. The installer verifies the
+          # archive against the lock's digest either way, so a cached file is
+          # never trusted for being cached.
+          if [ ! -f "$download/$asset" ]; then
+            gh release download "$tag" --repo "$repository" --pattern "$asset" \
+              --dir "$download" --clobber
+          fi
+          node scripts/install-libwebrtc-sdk.mjs --target linux-x64 \
+            "$download/$asset" "$sdk"
+          node scripts/libwebrtc-sdk-artifacts.mjs verify-sdk-lock \
+            --target linux-x64 "$lock" "$sdk"
+          Xvfb :99 -screen 0 1920x1080x24 &
+          echo $! > "$RUNNER_TEMP/xvfb.pid"
+          export DISPLAY=:99
+          # Bounded: Xvfb forks and returns before its socket is necessarily
+          # accepting connections.
+          for _ in $(seq 1 50); do
+            [ -e /tmp/.X11-unix/X99 ] && break
+            sleep 0.1
+          done
+          # A bare CI runner has no /proc/asound/cards entry at all (no sound
+          # card, real or virtual), which makes WebRTC's
+          # AudioDeviceModule::Init() hard-abort at session start ("Fatal
+          # error ... Check failed: 0 == adm->Init()") even though the
+          # qualification test never asked for audio -- there was simply
+          # nothing to open. Same fix as install-linux-desktop-environment.sh
+          # uses for a real headless server: pulseaudio gives it a real, if
+          # silent, device.
+          pulseaudio --start --exit-idle-time=-1 || true
+          bash native/linux-remote-desktop/build-worker-from-sdk.sh \
+            --sdk-root "$sdk" \
+            --artifact-root dist-node-exe/remote-desktop-worker/linux-x64 \
+            --worker-version "$IMCODES_BUILD_VERSION" \
+            --run-native-tests
+          kill "$(cat "$RUNNER_TEMP/xvfb.pid")" 2>/dev/null || true
+          rm -rf "$sdk"
+      - name: Verify the Linux remote-desktop worker artifact
+        if: runner.os == 'Linux'
+        # The full set check (worker + manifest, exact entries, executable bit, strict manifest, size, sha256, release version): the
+        # server serves the worker only with a matching manifest and a node's self-upgrade preflight fails without both.
+        run: node scripts/remote-desktop-worker-artifacts.mjs verify dist-node-exe "${{ env.IMCODES_BUILD_VERSION }}" linux x64
       - name: Resolve fixed libwebrtc SDK release
         if: runner.os == 'Windows'
         id: libwebrtc_sdk
@@ -790,6 +1268,10 @@ jobs:
       - name: Qualify signed Windows self-upgrade and rollback
         if: runner.os == 'Windows'
         run: npx tsx scripts/qualify-windows-self-upgrade.ts
+      - name: Record exact source revision in the platform artifact
+        # A shell-escaped newline becomes a literal `\\n` under PowerShell;
+        # writing the bare SHA keeps the marker byte-identical on every runner.
+        run: node -e "require('node:fs').writeFileSync('dist-node-exe/source-commit-${{ matrix.key }}.txt', process.env.GITHUB_SHA)"
       - name: Upload controlled-node executable
         uses: actions/upload-artifact@v4
         with:
@@ -797,10 +1279,16 @@ jobs:
           path: |
             dist-node-exe/${{ matrix.artifact }}
             dist-node-exe/${{ matrix.artifact }}.manifest.json
+            dist-node-exe/source-commit-${{ matrix.key }}.txt
             dist-node-exe/computer-use-helper/**
+            dist-node-exe/*.dmg
             dist-node-exe/remote-desktop-worker/**
+            dist-node-exe/aidesk-local-ui/**
           if-no-files-found: error
           retention-days: 30
+      - name: Remove macOS release-signing material
+        if: always() && runner.os == 'macOS'
+        run: node scripts/macos-release-signing.mjs cleanup
       - name: Remove Windows release-signing material
         if: always() && runner.os == 'Windows'
         shell: powershell
@@ -822,12 +1310,44 @@ jobs:
           $leftovers = @(($certificatePaths + $materialPaths) | Where-Object { Test-Path -LiteralPath $_ })
           if ($leftovers.Count -gt 0) { throw 'Windows release-signing material cleanup was incomplete.' }
 
+  controlled-node-compat-executable:
+    name: Controlled Node Executable (Linux x64 glibc 2.17, headless)
+    needs: [release_version]
+    if: github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION_PRIMARY }}
+          cache: 'npm'
+      - name: Install dependencies
+        shell: bash
+        run: ./scripts/ci-npm-ci.sh .
+      - name: Build headless compatibility artifact
+        id: compat
+        uses: ./.github/actions/build-controlled-node-compat
+        with:
+          version: ${{ needs.release_version.outputs.app_version }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: controlled-node-compat
+          path: |
+            dist-node-exe/${{ steps.compat.outputs.artifact }}
+            dist-node-exe/${{ steps.compat.outputs.artifact }}.manifest.json
+            dist-node-exe/source-commit-*.txt
+          if-no-files-found: error
+          retention-days: 30
+
   # ── Build & push Docker image ─────────────────────────────────────────────
 
   docker:
     name: Docker Build & Push
     runs-on: ubuntu-latest
-    needs: [lint, typecheck, secret-scan, unit-tests, macos-unit-tests, windows-unit-tests, windows-conpty-tests, web-tests-unit, web-tests-components, web-chat-perf, server-tests, server-db-tests, e2e-tests, release_version, controlled-node-executables]
+    # Ends a hung job itself instead of holding the concurrency group for the 6 h default (normal 4 min (2 runs seen); an image build + push).
+    timeout-minutes: 45
+    needs: [lint, typecheck, secret-scan, unit-tests, macos-unit-tests, windows-unit-tests, windows-conpty-tests, web-tests-unit, web-tests-components, web-chat-perf, server-tests, server-db-tests, e2e-tests, release_version, controlled-node-executables, controlled-node-compat-executable]
     if: github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev'
     outputs:
       npm_version: ${{ needs.release_version.outputs.app_version }}
@@ -848,19 +1368,102 @@ jobs:
           path: server/controlled-node-artifacts
           merge-multiple: true
 
+      # actions/upload-artifact -> download-artifact does not reliably
+      # preserve the executable bit through its zip transport: the Linux
+      # worker was uploaded chmod 0755 by build-worker-from-sdk.sh and came
+      # back `-rw-r--r--` here (confirmed with `ls -la` in CI, not inferred).
+      # remote-desktop-worker-artifacts.mjs verify checks size/sha256/file-
+      # ness but never the executable bit, so a macOS worker losing it the
+      # same way would pass every check below and still fail to exec once
+      # copied into the image. Restore +x on every artifact except the data
+      # files that must never have it (a `.exe` still needs it on the
+      # Windows node that runs it, but not on this Linux runner, and giving
+      # it +x here is harmless either way).
+      - name: Restore executable bits actions/download-artifact drops
+        run: |
+          set -euo pipefail
+          find server/controlled-node-artifacts -type f \
+            ! -name '*.json' ! -name '*.zip' ! -name '*.dmg' ! -name '*.dll' ! -name '*.cat' \
+            -exec chmod +x {} +
+
       - name: Verify controlled-node executable set
         env:
           IMCODES_BUILD_VERSION: ${{ needs.release_version.outputs.app_version }}
         run: >-
           node scripts/node-exe-artifacts.mjs verify-set server/controlled-node-artifacts
-          imcodes-node-linux imcodes-node-macos imcodes-node.exe
+          imcodes-node-linux imcodes-node-macos imcodes-node.exe imcodes-node-linux-glibc217
 
-      - name: Verify remote-desktop worker artifact
+      - name: Verify native artifacts came from this exact source revision
+        env:
+          RELEASE_COMMIT: ${{ github.sha }}
+          RELEASE_VERSION: ${{ needs.release_version.outputs.app_version }}
+        run: |
+          set -euo pipefail
+          for platform in linux macos windows "$(node -p "require('./shared/controlled-node-abi-profiles.json').GLIBC217.id")"; do
+            marker="server/controlled-node-artifacts/source-commit-${platform}.txt"
+            [ -f "$marker" ] || { echo "::error::missing $marker" >&2; exit 1; }
+            actual="$(tr -d '\r\n' < "$marker")"
+            [ "$actual" = "$RELEASE_COMMIT" ] || {
+              echo "::error::${platform} artifact was built from ${actual}, expected ${RELEASE_COMMIT}" >&2
+              exit 1
+            }
+          done
+          node - <<'NODE'
+          const fs = require('node:fs');
+          const path = require('node:path');
+          const crypto = require('node:crypto');
+          const root = 'server/controlled-node-artifacts';
+          const files = [];
+          function visit(dir) {
+            for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+              const full = path.join(dir, entry.name);
+              if (entry.isDirectory()) visit(full);
+              else if (entry.name.endsWith('.manifest.json')) {
+                files.push({
+                  path: path.relative(root, full).replaceAll(path.sep, '/'),
+                  sha256: crypto.createHash('sha256').update(fs.readFileSync(full)).digest('hex'),
+                });
+              }
+            }
+          }
+          visit(root);
+          files.sort((a, b) => a.path.localeCompare(b.path));
+          if (files.length < 5) throw new Error(`expected all platform manifests, found ${files.length}`);
+          fs.writeFileSync(path.join(root, 'release-provenance.json'), `${JSON.stringify({
+            schemaVersion: 1,
+            sourceCommit: process.env.RELEASE_COMMIT,
+            appVersion: process.env.RELEASE_VERSION,
+            manifestFiles: files,
+          }, null, 2)}\n`);
+          NODE
+
+      # EVERY target the image is supposed to serve, not just the default one.
+      # This verifier defaults to the Windows target when none is named, so a
+      # macOS component set could be -- and was -- absent from the image while
+      # this step passed. The server then answers
+      # `remote_desktop_worker_not_built` to a macOS node that upgraded itself
+      # expecting to find one.
+      - name: Verify remote-desktop worker artifacts for every target
         env:
           IMCODES_BUILD_VERSION: ${{ needs.release_version.outputs.app_version }}
-        run: >-
-          node scripts/remote-desktop-worker-artifacts.mjs verify
-          server/controlled-node-artifacts "$IMCODES_BUILD_VERSION"
+        run: |
+          set -euo pipefail
+          node scripts/remote-desktop-worker-artifacts.mjs verify \
+            server/controlled-node-artifacts "$IMCODES_BUILD_VERSION" win32 x64
+          # The Windows panel window host sidecar (its own manifest, signed exe and third-party notices; the server serves exactly these
+          # three files and answers 404 -- nodes skip -- when they are missing, so a missing one must fail HERE, not in the field).
+          node scripts/aidesk-ui-artifact.mjs verify \
+            server/controlled-node-artifacts/aidesk-local-ui/win32-x64 win32 x64 "$IMCODES_BUILD_VERSION"
+          test -s server/controlled-node-artifacts/aidesk-local-ui/win32-x64/THIRD-PARTY-NOTICES.txt
+          for arch in arm64 x64; do
+            node scripts/remote-desktop-worker-artifacts.mjs verify \
+              server/controlled-node-artifacts "$IMCODES_BUILD_VERSION" darwin "$arch"
+          done
+          # The Linux worker is two files (the executable and its manifest); the server serves it only with a matching
+          # manifest and a node's self-upgrade preflight fails without both, so check the whole set here, right after the
+          # chmod restore above, instead of ~15 minutes later in the image smoke test.
+          node scripts/remote-desktop-worker-artifacts.mjs verify \
+            server/controlled-node-artifacts "$IMCODES_BUILD_VERSION" linux x64
 
       - name: Get build timestamp
         id: ts
@@ -909,6 +1512,33 @@ jobs:
           echo "version=${COMMIT_COUNT}" >> "$GITHUB_OUTPUT"
           echo "app_version=$(date -u +%Y.%-m).${COMMIT_COUNT}" >> "$GITHUB_OUTPUT"
 
+      # The Dockerfile's Node base image is a build arg. Anonymous pulls from
+      # public.ecr.aws intermittently fail with "toomanyrequests: Data limit
+      # exceeded" and blocked the release; pick the first registry whose
+      # manifest resolves right now, preferring the Docker Hub login above.
+      - name: Resolve reachable Node base image
+        id: base_image
+        run: |
+          set -euo pipefail
+          candidates=(
+            docker.io/library/node:24-bookworm-slim
+            mirror.gcr.io/library/node:24-bookworm-slim
+            public.ecr.aws/docker/library/node:24-bookworm-slim
+          )
+          for attempt in 1 2 3; do
+            for image in "${candidates[@]}"; do
+              if docker buildx imagetools inspect "$image" >/dev/null 2>&1; then
+                echo "Using Node base image: $image (attempt $attempt)"
+                echo "image=$image" >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+              echo "::warning::Node base image unavailable right now: $image"
+            done
+            sleep $((attempt * 20))
+          done
+          echo "::error::No Node base image registry is reachable" >&2
+          exit 1
+
       # Build the image into the local docker daemon first so we can smoke-test
       # it BEFORE pushing. Without this step, an image whose Node process
       # crashes on startup (e.g. ERR_MODULE_NOT_FOUND from a missing prod dep)
@@ -921,9 +1551,11 @@ jobs:
           platforms: linux/amd64
           tags: imcodes-smoke:test
           build-args: |
+            NODE_BASE_IMAGE=${{ steps.base_image.outputs.image }}
             BUILD_TIME=${{ steps.ts.outputs.value }}
             OTA_VERSION=${{ steps.ota.outputs.version }}
             APP_VERSION=${{ needs.release_version.outputs.app_version }}
+            SOURCE_COMMIT=${{ github.sha }}
             IMCODES_EMBEDDING_PRELOAD_SOFT_FAIL=1
           cache-from: type=gha
           cache-to: type=gha,mode=max
@@ -933,6 +1565,21 @@ jobs:
       - name: Container startup smoke test
         run: |
           set -euo pipefail
+          # Keep the Go-template quotes literal. Backslash-escaping them here
+          # makes Docker's template parser see a backslash token and fail
+          # before any image provenance or migration checks run.
+          test "$(docker inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' imcodes-smoke:test)" = "${{ github.sha }}"
+          test "$(docker inspect --format '{{index .Config.Labels "org.opencontainers.image.version"}}' imcodes-smoke:test)" = "${{ needs.release_version.outputs.app_version }}"
+          docker run --rm --entrypoint test imcodes-smoke:test \
+            -f /app/dist/server/src/db/migrations/099_controlled_node_worker_refresh_status.sql
+          # The persisted status columns and refresh bridge use the
+          # `controlled_worker_refresh_*` schema name (the migration filename
+          # retains the historical `controlled_node_worker` prefix).  Check
+          # the actual runtime symbol rather than the filename prefix; the
+          # previous `controlled_node_worker_refresh` needle made every
+          # otherwise-valid image fail this smoke gate before publication.
+          docker run --rm --entrypoint sh imcodes-smoke:test -lc \
+            "grep -R -q 'controlled_worker_refresh_' /app/dist/server/src"
           # Override entrypoint to run an import-only check inside the actual
           # production image. index.ts has an isMain guard so the import
           # resolves all static deps (including all routes/* modules) without
@@ -942,10 +1589,28 @@ jobs:
             -e "import('./dist/server/src/index.js').then(() => { console.log('OK: image loads cleanly'); process.exit(0); }).catch(e => { console.error('FAIL:', e.message); console.error(e.stack); process.exit(1); })"
           docker run --rm --entrypoint node imcodes-smoke:test \
             scripts/node-exe-artifacts.mjs verify-set /app/controlled-node-executables \
-            imcodes-node-linux imcodes-node-macos imcodes-node.exe
+            imcodes-node-linux imcodes-node-macos imcodes-node.exe imcodes-node-linux-glibc217
+          docker run --rm --entrypoint node imcodes-smoke:test -e \
+            "const fs=require('node:fs'); const p=JSON.parse(fs.readFileSync('/app/controlled-node-executables/release-provenance.json','utf8')); if(p.sourceCommit!=='${{ github.sha }}'||p.appVersion!=='${{ needs.release_version.outputs.app_version }}') throw new Error('release provenance mismatch'); console.log('release provenance verified:',p.sourceCommit,p.appVersion)"
+          # Every target, named. This verifier defaults to the WINDOWS target
+          # when none is given, so this final gate -- the last check before the
+          # image ships -- passed on an image containing no macOS component set
+          # at all.
           docker run --rm --entrypoint node imcodes-smoke:test \
             scripts/remote-desktop-worker-artifacts.mjs verify \
-            /app/controlled-node-executables "${{ needs.release_version.outputs.app_version }}"
+            /app/controlled-node-executables "${{ needs.release_version.outputs.app_version }}" win32 x64
+          for f in aidesk-local-ui.exe aidesk-local-ui.manifest.json THIRD-PARTY-NOTICES.txt; do
+            docker run --rm --entrypoint test imcodes-smoke:test -s "/app/controlled-node-executables/aidesk-local-ui/win32-x64/$f"
+          done
+          for arch in arm64 x64; do
+            docker run --rm --entrypoint node imcodes-smoke:test \
+              scripts/remote-desktop-worker-artifacts.mjs verify \
+              /app/controlled-node-executables "${{ needs.release_version.outputs.app_version }}" darwin "$arch"
+          done
+          # Linux: worker + manifest, exact entries, executable bit, strict manifest, size, sha256 and release version.
+          docker run --rm --entrypoint node imcodes-smoke:test \
+            scripts/remote-desktop-worker-artifacts.mjs verify \
+            /app/controlled-node-executables "${{ needs.release_version.outputs.app_version }}" linux x64
 
       - name: Build and push (cache hit — only pushes layers)
         id: build_push
@@ -956,9 +1621,11 @@ jobs:
           platforms: linux/amd64
           tags: ${{ steps.tags.outputs.tags }}
           build-args: |
+            NODE_BASE_IMAGE=${{ steps.base_image.outputs.image }}
             BUILD_TIME=${{ steps.ts.outputs.value }}
             OTA_VERSION=${{ steps.ota.outputs.version }}
             APP_VERSION=${{ needs.release_version.outputs.app_version }}
+            SOURCE_COMMIT=${{ github.sha }}
             IMCODES_EMBEDDING_PRELOAD_SOFT_FAIL=1
           cache-from: type=gha
           cache-to: type=gha,mode=max
@@ -1007,6 +1674,8 @@ jobs:
   android-release:
     name: Android Release Build
     runs-on: ubuntu-latest
+    # Ends a hung job itself instead of holding the concurrency group for the 6 h default (normal 5.3 min, max 5.7).
+    timeout-minutes: 30
     needs: [lint, typecheck, secret-scan, unit-tests, web-tests-unit, web-tests-components, server-tests, e2e-tests]
     if: github.ref == 'refs/heads/master' || github.ref == 'refs/heads/dev'
     permissions:

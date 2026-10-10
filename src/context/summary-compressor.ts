@@ -22,7 +22,7 @@ import {
   type ProcessingProviderSessionConfig as CompressionProviderSessionConfig,
 } from './processing-provider-config.js';
 import { markEphemeralProviderSid, unmarkEphemeralProviderSid } from '../agent/session-manager.js';
-import { countTokens } from './tokenizer.js';
+import { countTokensAsync } from './tokenizer.js';
 import { compressToolEvent } from './tool-compressors.js';
 import { redactSensitiveText } from '../util/redact-secrets.js';
 import { ensurePinnedNotesSection, redactSummaryPreservingPinned } from '../util/redact-with-pinned-region.js';
@@ -124,6 +124,12 @@ function getBreaker(backend: string): BreakerStats {
     breakers.set(backend, b);
   }
   return b;
+}
+
+/** Would `canCall` let a request through? Read-only: never moves the breaker. */
+function breakerWouldAllow(backend: string, now: number): boolean {
+  const b = getBreaker(backend);
+  return b.state !== 'open' || now - b.openedAt >= b.cooldownMs;
 }
 
 function canCall(backend: string, now: number): boolean {
@@ -322,6 +328,8 @@ export const __testing__ = {
   recordSuccess,
   recordFailure,
   classifyCompressionError,
+  truncateEventText,
+  trimToTokenBudget,
 };
 
 // ── Compression provider (shared with the global registry singleton) ─────────
@@ -435,7 +443,7 @@ export async function localOnlyCompressor(input: CompressionInput): Promise<Comp
     usedBackup: false,
     fromSdk: true,
     inputTokens: 0,
-    outputTokens: countTokens(summary),
+    outputTokens: await countTokensAsync(summary),
     targetTokens: input.targetTokens ?? 0,
     durationMs: 0,
   };
@@ -639,19 +647,19 @@ export function computeTargetTokens(inputTokens: number, mode: CompressionMode =
   return Math.max(min, Math.min(max, computed));
 }
 
-function trimToTokenBudget(text: string, maxTokens: number): string {
-  if (countTokens(text) <= maxTokens) return text;
+async function trimToTokenBudget(text: string, maxTokens: number): Promise<string> {
+  if (await countTokensAsync(text) <= maxTokens) return text;
   let lo = 0;
   let hi = text.length;
   while (lo < hi) {
     const mid = Math.floor((lo + hi + 1) / 2);
-    if (countTokens(text.slice(0, mid)) <= maxTokens) lo = mid;
+    if (await countTokensAsync(text.slice(0, mid)) <= maxTokens) lo = mid;
     else hi = mid - 1;
   }
   return text.slice(0, lo).trimEnd() + '\n\n[... earlier summary truncated to bound prompt token budget ...]';
 }
 
-function trimPreviousSummary(previousSummary: string | undefined, maxTokens = DEFAULT_PREVIOUS_SUMMARY_MAX_TOKENS): string | undefined {
+async function trimPreviousSummary(previousSummary: string | undefined, maxTokens = DEFAULT_PREVIOUS_SUMMARY_MAX_TOKENS): Promise<string | undefined> {
   if (!previousSummary) return previousSummary;
   return trimToTokenBudget(previousSummary, maxTokens);
 }
@@ -661,7 +669,7 @@ async function compressWithSdkInner(input: CompressionInput): Promise<Compressio
   const mode = input.mode ?? 'auto';
   const startedAt = Date.now();
   const extraRedactPatterns = input.extraRedactPatterns ?? [];
-  const previousSummary = trimPreviousSummary(
+  const previousSummary = await trimPreviousSummary(
     mode === 'auto'
       ? undefined
       : input.previousSummary
@@ -676,9 +684,32 @@ async function compressWithSdkInner(input: CompressionInput): Promise<Compressio
       summary,
       model: '', backend: '', usedBackup: false, fromSdk: false,
       inputTokens: 0,
-      outputTokens: countTokens(summary),
+      outputTokens: await countTokensAsync(summary),
       targetTokens: input.targetTokens ?? 0,
       durationMs: Date.now() - startedAt,
+    };
+  }
+
+  // Every tier's breaker open: the answer is the local fallback, which needs
+  // none of the serialization, token counting and prompt building below.
+  // Doing that work anyway -- for every materialization target, while a
+  // backend is down for up to 30 minutes -- was pure main-thread waste.
+  const probeNow = Date.now();
+  const anyTierCallable = breakerWouldAllow(modelConfig.primaryContextBackend, probeNow)
+    || Boolean(modelConfig.backupContextBackend && modelConfig.backupContextModel
+      && breakerWouldAllow(modelConfig.backupContextBackend, probeNow));
+  if (!anyTierCallable) {
+    logger.debug({ backend: modelConfig.primaryContextBackend }, 'All compression backends open — local fallback');
+    const fallbackSummary = ensurePinnedNotesSection(
+      buildLocalFallbackSummary(events, previousSummary),
+      input.pinnedNotes ?? [],
+      extraRedactPatterns,
+    );
+    return {
+      summary: fallbackSummary,
+      model: 'local-fallback', backend: 'none', usedBackup: false, fromSdk: false,
+      inputTokens: 0, outputTokens: 0,
+      targetTokens: input.targetTokens ?? 0, durationMs: Date.now() - startedAt,
     };
   }
 
@@ -686,7 +717,7 @@ async function compressWithSdkInner(input: CompressionInput): Promise<Compressio
     maxEventChars: input.maxEventChars ?? DEFAULT_MAX_EVENT_CHARS,
     extraRedactPatterns,
   });
-  const inputTokens = countTokens(`${previousSummary ?? ''}
+  const inputTokens = await countTokensAsync(`${previousSummary ?? ''}
 ${serializedEvents}`);
   const targetTokens = input.targetTokens ?? computeTargetTokens(inputTokens, mode);
   const prompt = buildCompressionPrompt(events, previousSummary, targetTokens, {
@@ -715,7 +746,7 @@ ${serializedEvents}`);
         model: modelConfig.primaryContextModel,
         backend: modelConfig.primaryContextBackend,
         usedBackup: false, fromSdk: true,
-        inputTokens, outputTokens: countTokens(summary),
+        inputTokens, outputTokens: await countTokensAsync(summary),
         targetTokens, durationMs: Date.now() - startedAt,
       };
     } catch (err) {
@@ -746,7 +777,7 @@ ${serializedEvents}`);
           model: modelConfig.backupContextModel,
           backend: modelConfig.backupContextBackend,
           usedBackup: true, fromSdk: true,
-          inputTokens, outputTokens: countTokens(summary),
+          inputTokens, outputTokens: await countTokensAsync(summary),
           targetTokens, durationMs: Date.now() - startedAt,
         };
       } catch (err) {
@@ -773,7 +804,7 @@ ${serializedEvents}`);
   return {
     summary: fallbackSummary,
     model: 'local-fallback', backend: 'none', usedBackup: false, fromSdk: false,
-    inputTokens, outputTokens: countTokens(fallbackSummary),
+    inputTokens, outputTokens: await countTokensAsync(fallbackSummary),
     targetTokens, durationMs: Date.now() - startedAt,
     errorCode: errorClassification?.code,
     errorMessage: errorMessage ? errorMessage.slice(0, 500) : undefined,
@@ -1185,20 +1216,27 @@ export function serializeEvents(events: LocalContextEvent[], options: SerializeE
         : undefined;
     const compressed = compressToolEvent(toolName, content, event.id, maxEventChars);
     const redacted = redactSensitiveText(compressed, options.extraRedactPatterns ?? []);
-    const truncated = truncateByTokens(redacted, Math.max(1, countTokens(redacted.slice(0, maxEventChars))));
-    parts.push(`[${event.eventType}] ${truncated}`);
+    parts.push(`[${event.eventType}] ${truncateEventText(redacted, maxEventChars)}`);
   }
   return parts.join('\n\n');
 }
 
-function truncateByTokens(text: string, maxTokens: number): string {
-  if (countTokens(text) <= maxTokens) return text;
-  const headBudget = Math.max(1, Math.floor(maxTokens * 0.9));
-  const tailBudget = Math.max(1, maxTokens - headBudget);
-  const head = trimToTokenBudget(text, headBudget).replace(/\n\n\[\.\.\. earlier summary truncated to bound prompt token budget \.\.\.\]$/, '');
-  const reversedTail = trimToTokenBudget([...text].reverse().join(''), tailBudget).replace(/\n\n\[\.\.\. earlier summary truncated to bound prompt token budget \.\.\.\]$/, '');
-  const tail = [...reversedTail].reverse().join('');
-  return `${head}\n...[truncated]...\n${tail}`;
+/**
+ * Keep an event's first 90% and last 10% of `maxChars`. This used to be done
+ * in tokens -- but the token budget was itself "the tokens in the first
+ * maxChars characters", so it was a character limit computed by running the
+ * exact tokenizer over every event twice, plus a binary search of further
+ * tokenizer runs whenever it cut. Synchronous WASM on the main thread: over a
+ * few hundred events that froze the daemon for 0.5-1.3 s per compression (seen
+ * live on a 87-session node, several times a minute, with the SDK backend
+ * failing so every one of those runs was thrown away).
+ */
+function truncateEventText(text: string, maxChars: number): string {
+  const chars = [...text];
+  if (chars.length <= maxChars) return text;
+  const headChars = Math.max(1, Math.floor(maxChars * 0.9));
+  const tailChars = Math.max(1, maxChars - headChars);
+  return `${chars.slice(0, headChars).join('')}\n...[truncated]...\n${chars.slice(-tailChars).join('')}`;
 }
 
 // ── Local fallback ───────────────────────────────────────────────────────────

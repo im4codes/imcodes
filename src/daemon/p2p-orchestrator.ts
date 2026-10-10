@@ -6,6 +6,7 @@
  * Completion = file grew + agent idle.
  */
 
+import { CHAT_MESSAGE_ORIGINS } from '../../shared/chat-message-origin.js';
 import { appendFile, readdir, stat, writeFile, readFile, unlink, copyFile, open } from 'node:fs/promises';
 import { join, basename, dirname } from 'node:path';
 import { ensureImcDir } from '../util/imc-dir.js';
@@ -977,7 +978,8 @@ async function dispatchP2pPromptToSession(args: {
   const transportRuntime = await getOrRestoreP2pTransportRuntime(args.session);
   if (transportRuntime) {
     const commandId = buildP2pPromptCommandId(args.run, args.session, args.reason);
-    const result = transportRuntime.send(args.prompt, commandId);
+    // The origin rides a queued copy too: the drain projects its user.message.
+    const result = transportRuntime.send(args.prompt, commandId, undefined, undefined, { messageOrigin: CHAT_MESSAGE_ORIGINS.SYSTEM });
     if (result === 'sent') {
       timelineEmitter.emit(args.session, 'user.message', {
         text: args.prompt,

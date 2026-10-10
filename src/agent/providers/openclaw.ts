@@ -1,3 +1,4 @@
+import { ProviderStopConfirmation, confirmPromiseStop, providerStopTerminal } from '../provider-stop-confirmation.js';
 /**
  * OpenClaw TransportProvider
  *
@@ -28,10 +29,12 @@ import {
 import type { AgentMessage, MessageDelta, ToolCallEvent } from '../../../shared/agent-message.js';
 import type { ProviderContextPayload } from '../../../shared/context-types.js';
 import type { TransportAttachment } from '../../../shared/transport-attachments.js';
+import { AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES } from '../../../shared/agent-delegation.js';
 import logger from '../../util/logger.js';
 import { normalizeOpenClawDisplayName } from '../openclaw-display.js';
 import { composeMessageSideProviderPrompt, getProviderSystemTextParts } from '../provider-context-routing.js';
 import { OPENCLAW_THINKING_LEVELS, type TransportEffortLevel } from '../../../shared/effort-levels.js';
+import { NATIVE_AGENT_ADMISSION_MODES } from '../../../shared/native-collaboration-policy.js';
 
 // ── Internal frame types ─────────────────────────────────────────────────────
 
@@ -102,6 +105,13 @@ export class OpenClawProvider implements TransportProvider {
     reasoningEffort: true,
     supportedEffortLevels: OPENCLAW_THINKING_LEVELS,
     contextSupport: 'full-normalized-context-injection',
+    // OpenClaw's active-run queue is not an active-only admission contract.
+    // The current gateway `sessions.send` schema has no per-request queue mode,
+    // while `chat.send` with `queueMode: "steer"` starts a normal new turn when
+    // the target is already idle (and can do so when a captured target goes
+    // stale). TransportProvider requires that race to return STALE without
+    // starting work, so do not advertise or fake native append support.
+    activeDelegationNotification: AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.UNSUPPORTED,
     compact: {
       execution: 'unsupported',
       verified: true,
@@ -109,6 +119,9 @@ export class OpenClawProvider implements TransportProvider {
       cancellation: 'none',
       reason: 'Verified in this adapter/environment: OpenClaw exposes no compact RPC/command path here, and no local openclaw CLI is installed to test a provider slash command.',
     },
+    // The gateway exposes no per-call veto or per-session disable for native
+    // agents: this runtime cannot send or receive supervised work.
+    nativeAgentAdmission: NATIVE_AGENT_ADMISSION_MODES.UNENFORCEABLE,
   };
 
   // ── Private state ──────────────────────────────────────────────────────────
@@ -205,6 +218,22 @@ export class OpenClawProvider implements TransportProvider {
       });
       logger.info({ provider: this.id, ocKey }, 'agent RPC fallback succeeded');
     }
+  }
+
+  private readonly stopConfirmations = new ProviderStopConfirmation();
+
+  cancelAndWait(sessionId: string): Promise<void> {
+    const runs = [...this.runAccumulator.values()].filter((run) => run.sessionId === sessionId);
+    if (runs.length === 0) {
+      return this.cancel(sessionId).then(() => { throw new Error('OpenClaw has no captured active run to confirm Stop'); });
+    }
+    // One priority request, all captured run ids must physically terminate.
+    let request: Promise<void> | undefined;
+    const operations = runs.map((run) => this.stopConfirmations.confirm(run,
+      () => request ??= this.cancel(sessionId), () => true));
+    // Keep late physical run proof separate from each expired outward waiter.
+    return confirmPromiseStop(runs, Promise.all(operations.map(providerStopTerminal)),
+      () => Promise.all(operations).then(() => {}), () => true);
   }
 
   async cancel(sessionId: string): Promise<void> {
@@ -546,6 +575,7 @@ export class OpenClawProvider implements TransportProvider {
         const acc = this.runAccumulator.get(runId);
         this.toolStates.delete(runId);
         if (acc) {
+          this.stopConfirmations.complete(acc);
           this.runAccumulator.delete(runId);
           const message: AgentMessage = {
             id: acc.messageId,
@@ -565,6 +595,7 @@ export class OpenClawProvider implements TransportProvider {
       if (phase === 'error') {
         const acc = this.runAccumulator.get(runId);
         const sessionId = acc?.sessionId ?? sanitizeKey(payload.key ?? payload.sessionKey ?? runId);
+        if (acc) this.stopConfirmations.complete(acc);
         this.runAccumulator.delete(runId);
         this.toolStates.delete(runId);
         // Extract actual error message from OC data (e.g. "AI service overloaded", "OAuth token expired")

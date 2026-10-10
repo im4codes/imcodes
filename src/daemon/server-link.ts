@@ -1,7 +1,9 @@
 import os from 'node:os';
+import fs from 'node:fs';
 import { performance } from 'node:perf_hooks';
 import type { TimelineEvent } from './timeline-event.js';
 import logger from '../util/logger.js';
+import { getStartupDiagnosticsLog, STARTUP_DIAGNOSTIC_EVENT } from '../node/startup-diagnostics.js';
 import { DAEMON_VERSION } from '../util/version.js';
 import { DAEMON_MSG } from '../../shared/daemon-events.js';
 import {
@@ -10,6 +12,7 @@ import {
 } from '../../shared/daemon-upgrade.js';
 import { setTransportRelaySend } from './transport-relay.js';
 import { setProviderRegistryServerLink } from '../agent/provider-registry.js';
+import { flushPendingSubSessionClosedNotices, setActiveServerLink } from './active-server-link.js';
 import { getDefaultAckOutbox } from './ack-outbox.js';
 import { getDefaultUpgradeBlockedOutbox } from './upgrade-blocked-outbox.js';
 import { getEmbeddingStatus } from '../context/embedding.js';
@@ -27,14 +30,26 @@ import {
 } from '../../shared/p2p-workflow-constants.js';
 import { P2P_WORKFLOW_MSG } from '../../shared/p2p-workflow-messages.js';
 import { SESSION_GROUP_CLONE_CAPABILITY_V1 } from '../../shared/session-group-clone.js';
+import { ASK_ANSWER_ACK_CAPABILITY_V1 } from '../../shared/ask-answer.js';
 import { EXECUTION_CLONE_CAPABILITY_V1 } from '../../shared/execution-clone.js';
 import { GIT_REMOTE_CLONE_CAPABILITY_V1 } from '../../shared/git-remote-url.js';
-import { TIMELINE_MESSAGES, TIMELINE_PROTOCOL_CAPABILITY, TIMELINE_PROTOCOL_REVISION } from '../../shared/timeline-protocol.js';
+import {
+  TIMELINE_HISTORY_CANCEL_CAPABILITY,
+  TIMELINE_MESSAGES,
+  TIMELINE_PROTOCOL_CAPABILITY,
+  TIMELINE_PROTOCOL_REVISION,
+  TIMELINE_RESPONSE_SOURCES,
+  TIMELINE_RESPONSE_STATUS,
+} from '../../shared/timeline-protocol.js';
+import { TIMELINE_REQUEST_ERROR_REASONS } from '../../shared/timeline-history-errors.js';
+import { FS_GENERIC_ERROR_CODES } from '../../shared/fs-error-codes.js';
+import { TRANSPORT_MSG } from '../../shared/transport-events.js';
 import {
   FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY,
   FILE_TRANSFER_DOWNLOAD_STREAM_CAPABILITY,
 } from '../../shared/transport/file-transfer.js';
 import {
+  DIRECT_FILE_TRANSFER_DIRECTORY_UPLOAD_CAPABILITY,
   DIRECT_FILE_TRANSFER_REQUIRED_CAPABILITIES,
   type DirectConnectivityRuntimeStatus,
 } from '../../shared/direct-file-transfer.js';
@@ -47,8 +62,11 @@ import {
   stringifyForServerSend,
 } from './latency-tracer.js';
 import { getDaemonBuildInfo } from './build-info.js';
-import { daemonRemoteDesktopCapabilities } from './remote-desktop-registry.js';
+import { CLOCK_SYNC_FIELD } from '../../shared/clock-sync.js';
+import { daemonRemoteDesktopCapabilities, refreshDaemonRemoteDesktop } from './remote-desktop-registry.js';
 import { incrementCounter } from '../util/metrics.js';
+import { CoreLaneSocket, coreLaneWorkerEnabled } from './core-lane-socket.js';
+import { CORE_LANE_STALL_RESTART_DEFAULT_MS } from '../../shared/core-lane-liveness.js';
 import {
   TIMELINE_DELIVERY_METRICS,
   countableTimelineEventType,
@@ -75,6 +93,46 @@ interface SystemStats {
   shortRefHealth?: MemoryShortRefHealth;
   /** Optional WebRTC addon state; distinct from ICE/network reachability. */
   directConnectivity: DirectConnectivityRuntimeStatus;
+}
+
+/**
+ * Execute the deterministic test-only main-thread block and write the
+ * optional start/end marker. Kept separate from ServerLink so the causal
+ * marker contract can be exercised without opening a real WebSocket.
+ */
+export function runCoreLaneTestBlock({
+  blockMs,
+  blockMarkerFile,
+  pid = process.pid,
+  logger: blockLogger = logger,
+}: {
+  blockMs: number;
+  blockMarkerFile?: string;
+  pid?: number;
+  logger?: Pick<typeof logger, 'warn' | 'error'>;
+}): { pid: number; blockMs: number; startedAt: number; endedAt: number } {
+  const startedAt = Date.now();
+  if (blockMarkerFile) {
+    try {
+      fs.writeFileSync(blockMarkerFile, JSON.stringify({ pid, blockMs, startedAt }), 'utf8');
+    } catch (error) {
+      blockLogger.error({ error, blockMarkerFile }, 'Core-lane test fault: unable to write block-start marker');
+      throw error;
+    }
+  }
+  blockLogger.warn({ blockMs }, 'Core-lane test fault: blocking daemon main thread');
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Math.trunc(blockMs));
+  const endedAt = Date.now();
+  if (blockMarkerFile) {
+    try {
+      fs.writeFileSync(blockMarkerFile, JSON.stringify({ pid, blockMs, startedAt, endedAt }), 'utf8');
+    } catch (error) {
+      blockLogger.error({ error, blockMarkerFile }, 'Core-lane test fault: unable to write block-end marker');
+      throw error;
+    }
+  }
+  blockLogger.warn({ blockMs, elapsedMs: endedAt - startedAt }, 'Core-lane test fault: main thread unblocked');
+  return { pid, blockMs, startedAt, endedAt };
 }
 
 /** Collect lightweight system stats for daemon.stats messages. */
@@ -104,12 +162,39 @@ function collectSystemStats(): SystemStats {
 const HEARTBEAT_MS = 5_000;
 const STATS_MS = 5_000; // daemon.stats update interval (separate from heartbeat)
 const DEFAULT_DATA_PLANE_SEND_QUEUE_SOFT_CAP = 256;
-// Bumped from 512 → 100_000 (regression triage: commit 42dfabec used 512 +
-// shift-oldest, which silently dropped timeline.history responses on weak
-// links and forced users to refresh the page). 100_000 is an emergency
-// ceiling, not an expected steady-state — backpressure telemetry above
-// soft-cap is unchanged so ops can still see if a real backlog forms.
-const DEFAULT_DATA_PLANE_SEND_QUEUE_HARD_CAP = 100_000;
+// Never shift an already-accepted response: that previously forced users to
+// refresh after a weak-link episode. New work above the count/byte ceiling is
+// rejected with a request-scoped recoverable response instead.
+const DEFAULT_DATA_PLANE_SEND_QUEUE_HARD_CAP = 16_384;
+// Count cannot bound retained memory: one timeline response can approach 1 MiB.
+// Keep both the daemon-owned queue and the WebSocket implementation's internal
+// send buffer bounded. Control messages intentionally bypass these watermarks.
+const DEFAULT_DATA_PLANE_SEND_QUEUE_MAX_BYTES = 64 * 1024 * 1024;
+// Keep a bounded slice of the queue available for compact, request-scoped
+// overload replies. Without a reserve, the first payloads can consume the
+// whole byte budget and every later queue_full reply has nowhere safe to go.
+const DEFAULT_DATA_PLANE_OVERLOAD_RESERVE_BYTES = 8 * 1024 * 1024;
+const DEFAULT_DATA_PLANE_OVERLOAD_RESERVE_ITEMS = 1_024;
+const DEFAULT_DATA_PLANE_WS_HIGH_WATER_BYTES = 8 * 1024 * 1024;
+const DEFAULT_DATA_PLANE_WS_LOW_WATER_BYTES = 2 * 1024 * 1024;
+const DATA_PLANE_DRAIN_RECHECK_MS = 25;
+/**
+ * Uplink congestion, measured as the heartbeat round trip (the server echoes
+ * the heartbeat's send time on its ack, so the delay includes every queue in
+ * the path: this daemon's socket buffer, the kernel, the network, the
+ * server). The 8 MiB/2 MiB watermarks above assume a link that drains
+ * megabytes per second; on a congested intercontinental path (observed
+ * ~8 KB/s) they let minutes of bulk data sit in front of every heartbeat,
+ * command.ack and session.state, so the link looks stale and messages look
+ * unanswered. While congested, keep only a small slice of bulk data in the
+ * socket so control frames reach the wire within seconds.
+ */
+const LINK_CONGESTION_ENTER_DELAY_MS = 3_000;
+const LINK_CONGESTION_EXIT_DELAY_MS = 1_000;
+const CONGESTED_DATA_PLANE_WS_HIGH_WATER_BYTES = 64 * 1024;
+const CONGESTED_DATA_PLANE_WS_LOW_WATER_BYTES = 16 * 1024;
+const MAX_TRACKED_UNACKED_HEARTBEATS = 64;
+const DATA_PLANE_BACKPRESSURE_LOG_INTERVAL_MS = 5_000;
 // Bumped from 30s → 24h. 30s was the same regression: a brief WS hiccup
 // (Wi-Fi handoff, mobile background) silently expired the queued history /
 // fs / models responses before the link came back, so the reconnect flush
@@ -120,6 +205,11 @@ const DEFAULT_DATA_PLANE_SEND_STALE_MS = 24 * 60 * 60 * 1000;
 let dataPlaneSendQueueSoftCap = DEFAULT_DATA_PLANE_SEND_QUEUE_SOFT_CAP;
 let dataPlaneSendQueueHardCap = DEFAULT_DATA_PLANE_SEND_QUEUE_HARD_CAP;
 let dataPlaneSendStaleMs = DEFAULT_DATA_PLANE_SEND_STALE_MS;
+let dataPlaneSendQueueMaxBytes = DEFAULT_DATA_PLANE_SEND_QUEUE_MAX_BYTES;
+let dataPlaneOverloadReserveBytes = DEFAULT_DATA_PLANE_OVERLOAD_RESERVE_BYTES;
+let dataPlaneOverloadReserveItems = DEFAULT_DATA_PLANE_OVERLOAD_RESERVE_ITEMS;
+let dataPlaneWsHighWaterBytes = DEFAULT_DATA_PLANE_WS_HIGH_WATER_BYTES;
+let dataPlaneWsLowWaterBytes = DEFAULT_DATA_PLANE_WS_LOW_WATER_BYTES;
 
 type DataPlaneSendQueueItem = {
   msg: unknown;
@@ -127,6 +217,7 @@ type DataPlaneSendQueueItem = {
   requestId?: string;
   enqueuedAt: number;
   deadlineAt: number;
+  estimatedBytes: number;
 };
 /**
  * Audit fix (94b9b837-822 / A6) — reconnect tuning.
@@ -183,6 +274,12 @@ const WATCHDOG_MS = 10_000;           // check connection health every 10s
 // getOpenSocketSilenceMs() still prevents this from false-reconnecting a healthy
 // socket during the daemon's own load spikes (it reports 0 silence then).
 const SILENT_CONNECTION_RECYCLE_MS = 30_000;
+// Inbound application traffic is not a heartbeat proof. A half-open socket can
+// continue delivering stale/non-ack frames while the server no longer receives
+// our heartbeats, so bound the oldest outstanding heartbeat independently of
+// `lastPong`/generic message silence. Keep this longer than one silence window
+// to tolerate a transient missed ack while still recycling in bounded time.
+const HEARTBEAT_ACK_TIMEOUT_MS = 60_000;
 // Throttle for the dropped-timeline-event warning. The counter records every
 // drop; the log line is a human-facing heartbeat so a flapping link is visible
 // in daemon.log without one line per lost message.
@@ -207,6 +304,17 @@ let serverLinkReconnectResyncHandler: (() => void) | null = null;
 export function setServerLinkReconnectResyncHandler(handler: (() => void) | null): void {
   serverLinkReconnectResyncHandler = handler;
 }
+let serverLinkDisconnectSecurityHandler: (() => void) | null = null;
+export function setServerLinkDisconnectSecurityHandler(handler: (() => void) | null): void {
+  serverLinkDisconnectSecurityHandler = handler;
+}
+function clearServerLinkSecurity(reason: string): void {
+  try {
+    serverLinkDisconnectSecurityHandler?.();
+  } catch (err) {
+    logger.warn({ err, reason }, 'ServerLink: disconnect security cleanup failed');
+  }
+}
 const DAEMON_STATIC_CAPABILITIES = [
   SESSION_GROUP_CLONE_CAPABILITY_V1,
   // Distinct from session-group-clone — gates the dedicated execution-clone
@@ -215,13 +323,15 @@ const DAEMON_STATIC_CAPABILITIES = [
   EXECUTION_CLONE_CAPABILITY_V1,
   GIT_REMOTE_CLONE_CAPABILITY_V1,
   TIMELINE_PROTOCOL_CAPABILITY,
+  TIMELINE_HISTORY_CANCEL_CAPABILITY,
   FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY,
   FILE_TRANSFER_DOWNLOAD_STREAM_CAPABILITY,
+  ASK_ANSWER_ACK_CAPABILITY_V1,
 ] as const;
 
 export function directFileTransferDaemonCapabilities(available: boolean): readonly string[] {
   return available
-    ? [...DIRECT_FILE_TRANSFER_REQUIRED_CAPABILITIES]
+    ? [...DIRECT_FILE_TRANSFER_REQUIRED_CAPABILITIES, DIRECT_FILE_TRANSFER_DIRECTORY_UPLOAD_CAPABILITY]
     : [];
 }
 
@@ -241,6 +351,8 @@ export interface ServerLinkOpts {
   workerUrl: string;
   serverId: string;
   token: string;
+  authorizedSessions?: string[];
+  authorizedSessionsProvider?: () => string[];
 }
 
 export type MessageHandler = (msg: unknown) => void;
@@ -268,15 +380,102 @@ function requestIdOf(msg: unknown): string | undefined {
     : undefined;
 }
 
+function dataPlaneMessageBytes(msg: unknown): number {
+  try {
+    return Buffer.byteLength(JSON.stringify(msg), 'utf8');
+  } catch {
+    // Cyclic/unserializable data must never enter a retry queue forever.
+    return Number.POSITIVE_INFINITY;
+  }
+}
+
+function compactDataPlaneBackpressureResponse(msg: unknown): Record<string, unknown> | null {
+  if (!msg || typeof msg !== 'object' || Array.isArray(msg)) return null;
+  const input = msg as Record<string, unknown>;
+  const type = messageTypeOf(input);
+  if (!type) return null;
+  const requestId = requestIdOf(input);
+  const common = {
+    type,
+    ...(requestId ? { requestId } : {}),
+  };
+
+  if (
+    type === TIMELINE_MESSAGES.HISTORY
+    || type === TIMELINE_MESSAGES.REPLAY
+    || type === TIMELINE_MESSAGES.PAGE
+    || type === TIMELINE_MESSAGES.DETAIL
+  ) {
+    return {
+      ...common,
+      ...(typeof input.sessionName === 'string' ? { sessionName: input.sessionName } : {}),
+      ...(type === TIMELINE_MESSAGES.DETAIL && typeof input.detailId === 'string' ? { detailId: input.detailId } : {}),
+      status: TIMELINE_RESPONSE_STATUS.ERROR,
+      source: TIMELINE_RESPONSE_SOURCES.ERROR,
+      errorReason: TIMELINE_REQUEST_ERROR_REASONS.QUEUE_FULL,
+      ...(type === TIMELINE_MESSAGES.DETAIL ? {} : { events: [] }),
+      payloadTruncated: false,
+      hasMore: false,
+      recoverable: true,
+    };
+  }
+
+  if (type.startsWith('fs.') || type === 'file.search_response') {
+    return {
+      ...common,
+      ...(typeof input.path === 'string' ? { path: input.path } : {}),
+      status: 'error',
+      error: FS_GENERIC_ERROR_CODES.FS_LIST_WORKER_QUEUE_FULL,
+      recoverable: true,
+      ...(type === 'fs.git_status_response' ? { files: [] } : {}),
+      ...(type === 'file.search_response' ? { results: [] } : {}),
+    };
+  }
+
+  if (type === TRANSPORT_MSG.MODELS_RESPONSE) {
+    return {
+      ...common,
+      ...(typeof input.agentType === 'string' ? { agentType: input.agentType } : {}),
+      ...(typeof input.sessionName === 'string' ? { sessionName: input.sessionName } : {}),
+      ...(typeof input.ccPreset === 'string' ? { ccPreset: input.ccPreset } : {}),
+      models: [],
+      error: TIMELINE_REQUEST_ERROR_REASONS.QUEUE_FULL,
+      recoverable: true,
+    };
+  }
+
+  if (type === TRANSPORT_MSG.CHAT_HISTORY) {
+    return {
+      ...common,
+      ...(typeof input.sessionId === 'string' ? { sessionId: input.sessionId } : {}),
+      events: [],
+      error: TIMELINE_REQUEST_ERROR_REASONS.QUEUE_FULL,
+      recoverable: true,
+    };
+  }
+
+  return null;
+}
+
 export function __setServerLinkDataPlaneQueueConfigForTests(options: {
   softCap?: number;
   hardCap?: number;
   staleMs?: number;
+  maxBytes?: number;
+  overloadReserveBytes?: number;
+  overloadReserveItems?: number;
+  wsHighWaterBytes?: number;
+  wsLowWaterBytes?: number;
 } | null): void {
   if (!options) {
     dataPlaneSendQueueSoftCap = DEFAULT_DATA_PLANE_SEND_QUEUE_SOFT_CAP;
     dataPlaneSendQueueHardCap = DEFAULT_DATA_PLANE_SEND_QUEUE_HARD_CAP;
     dataPlaneSendStaleMs = DEFAULT_DATA_PLANE_SEND_STALE_MS;
+    dataPlaneSendQueueMaxBytes = DEFAULT_DATA_PLANE_SEND_QUEUE_MAX_BYTES;
+    dataPlaneOverloadReserveBytes = DEFAULT_DATA_PLANE_OVERLOAD_RESERVE_BYTES;
+    dataPlaneOverloadReserveItems = DEFAULT_DATA_PLANE_OVERLOAD_RESERVE_ITEMS;
+    dataPlaneWsHighWaterBytes = DEFAULT_DATA_PLANE_WS_HIGH_WATER_BYTES;
+    dataPlaneWsLowWaterBytes = DEFAULT_DATA_PLANE_WS_LOW_WATER_BYTES;
     return;
   }
   dataPlaneSendQueueSoftCap = Math.max(0, Math.trunc(options.softCap ?? DEFAULT_DATA_PLANE_SEND_QUEUE_SOFT_CAP));
@@ -285,23 +484,57 @@ export function __setServerLinkDataPlaneQueueConfigForTests(options: {
     Math.trunc(options.hardCap ?? DEFAULT_DATA_PLANE_SEND_QUEUE_HARD_CAP),
   );
   dataPlaneSendStaleMs = Math.max(0, Math.trunc(options.staleMs ?? DEFAULT_DATA_PLANE_SEND_STALE_MS));
+  dataPlaneSendQueueMaxBytes = Math.max(1, Math.trunc(options.maxBytes ?? DEFAULT_DATA_PLANE_SEND_QUEUE_MAX_BYTES));
+  dataPlaneOverloadReserveBytes = Math.max(0, Math.min(
+    dataPlaneSendQueueMaxBytes - 1,
+    Math.trunc(options.overloadReserveBytes
+      ?? Math.min(DEFAULT_DATA_PLANE_OVERLOAD_RESERVE_BYTES, Math.floor(dataPlaneSendQueueMaxBytes / 4))),
+  ));
+  dataPlaneOverloadReserveItems = Math.max(0, Math.min(
+    dataPlaneSendQueueHardCap - 1,
+    Math.trunc(options.overloadReserveItems
+      ?? Math.min(DEFAULT_DATA_PLANE_OVERLOAD_RESERVE_ITEMS, Math.floor(dataPlaneSendQueueHardCap / 4))),
+  ));
+  dataPlaneWsHighWaterBytes = Math.max(1, Math.trunc(options.wsHighWaterBytes ?? DEFAULT_DATA_PLANE_WS_HIGH_WATER_BYTES));
+  dataPlaneWsLowWaterBytes = Math.max(
+    0,
+    Math.min(dataPlaneWsHighWaterBytes, Math.trunc(options.wsLowWaterBytes ?? DEFAULT_DATA_PLANE_WS_LOW_WATER_BYTES)),
+  );
 }
 
 export class ServerLink {
-  private ws: WebSocket | null = null;
+  private ws: WebSocket | CoreLaneSocket | null = null;
+  /**
+   * Pure observability, shared with the controlled-node runtime (see
+   * src/node/startup-diagnostics.ts): the full daemon's connect/auth
+   * lifecycle written to the same startup-diagnostics.log convention.
+   * Unlike a controlled node, the full daemon has no health-lease concept,
+   * so only connect/auth events are recorded here.
+   */
+  private readonly diagnostics = getStartupDiagnosticsLog();
   private handlers: MessageHandler[] = [];
+  private openHandlers: Array<() => void> = [];
   private binaryHandlers: BinaryMessageHandler[] = [];
   private heartbeatTimer?: ReturnType<typeof setInterval>;
   private statsTimer?: ReturnType<typeof setInterval>;
   private reconnectTimer?: ReturnType<typeof setTimeout>;
   private watchdogTimer?: ReturnType<typeof setInterval>;
   private loopProbeTimer?: ReturnType<typeof setInterval>;
+  /** One-shot synchronous block used only by isolated real-daemon tests. */
+  private testMainThreadBlockScheduled = false;
   /** Wall-clock of the last event-loop probe tick; 0 when not running. */
   private lastLoopProbeAt = 0;
+  private mainStallRestartIssued = false;
   private pongTimer?: ReturnType<typeof setTimeout>;
   /** A6 connect-timeout watchdog. Cleared on open/close/error. */
   private connectTimeoutTimer?: ReturnType<typeof setTimeout>;
   private backoffMs = INITIAL_BACKOFF_MS;
+  /** True once the server has sent at least one message on the current socket,
+   *  proving auth was accepted. Reset on every new connect() call.
+   *  Backoff is only reset to INITIAL when this flips to true — so a
+   *  permanent auth_failed loop (server closes immediately, never sends) keeps
+   *  the exponential back-off instead of retrying at 500 ms forever. */
+  private serverAuthConfirmedOnCurrentSocket = false;
   private stopping = false;
   private reconnecting = false;
   /** True once this link has completed at least one successful open. Gates the
@@ -312,16 +545,34 @@ export class ServerLink {
   private timelineDropsWhileLinkDown = 0;
   private lastTimelineDropLogAt = 0;
   private lastPong = 0;               // timestamp of last received message (any message counts as proof of life)
+  /** Send times (Date.now) of heartbeats not yet acked, oldest first. */
+  private unackedHeartbeatSentAts: number[] = [];
+  private lastHeartbeatRoundTripMs: number | null = null;
+  private uplinkCongested = false;
+  /** True once THIS connection has received at least one heartbeat_ack. An
+   *  older self-hosted server that only ever answers with a ws pong never
+   *  sets this, so the ack-based watchdog below never applies to it -- the
+   *  existing silence/pong recycling is still what catches a truly dead
+   *  connection to that kind of server. */
+  private hasReceivedHeartbeatAck = false;
   private seq = 0;
   private readonly workerUrl: string;
   private readonly serverId: string;
   private readonly token: string;
+  private readonly authorizedSessions?: string[];
+  private readonly authorizedSessionsProvider?: () => string[];
   readonly daemonVersion = DAEMON_VERSION;
   private helloEpoch = 0;
   private lastHelloSentAt = 0;
   private sendBacklogStartedAt: number | null = null;
   private dataPlaneSendQueue: DataPlaneSendQueueItem[] = [];
+  private dataPlaneSendQueueBytes = 0;
   private dataPlaneSendScheduled = false;
+  private dataPlaneDrainTimer?: ReturnType<typeof setTimeout>;
+  private dataPlaneSocketBackpressured = false;
+  private dataPlaneOverloadReconnectRequested = false;
+  private lastDataPlaneBackpressureLogAt = 0;
+  private suppressedDataPlaneBackpressureLogs = 0;
   private dataPlaneQueueStartedAt: number | null = null;
   private p2pWorkflowCapabilities: readonly string[] = [
     P2P_WORKFLOW_CAPABILITY_V1,
@@ -334,6 +585,12 @@ export class ServerLink {
     this.workerUrl = opts.workerUrl;
     this.serverId = opts.serverId;
     this.token = opts.token;
+    this.authorizedSessions = opts.authorizedSessions;
+    this.authorizedSessionsProvider = opts.authorizedSessionsProvider;
+    this.diagnostics.record(STARTUP_DIAGNOSTIC_EVENT.PROCESS_START, {
+      platform: process.platform,
+      pid: process.pid,
+    });
   }
 
   getServerId(): string {
@@ -341,6 +598,9 @@ export class ServerLink {
   }
 
   connect(): void {
+    // A new authentication attempt replaces all authority learned over the
+    // prior socket, even if that socket never delivers a close event.
+    clearServerLinkSecurity('connect_replacement');
     // Clean up previous connection if any
     this.stopHeartbeat();
     this.stopWatchdog();
@@ -364,16 +624,46 @@ export class ServerLink {
 
     const wsUrl = this.workerUrl.replace(/^http/, 'ws') + `/api/server/${this.serverId}/ws`;
     logger.info({ url: wsUrl }, 'ServerLink: connecting');
+    this.diagnostics.record(STARTUP_DIAGNOSTIC_EVENT.WS_CONNECT_ATTEMPT, {});
     this.recordRuntimeLinkStatus({ state: 'connecting', workerUrl: this.workerUrl, serverId: this.serverId });
     this.reconnecting = false;
-    const ws = new WebSocket(wsUrl);
+    this.serverAuthConfirmedOnCurrentSocket = false;
+    // Production uses the worker-owned control socket so a synchronous main
+    // thread task cannot pause auth, heartbeat, reconnect, or priority sends.
+    // Vitest keeps the injectable in-process socket for deterministic protocol
+    // tests; IMCODES_CORE_LINK_WORKER=0 is the documented field kill switch.
+    const useCoreLaneWorker = coreLaneWorkerEnabled();
+    const auth = JSON.stringify({
+      type: 'auth',
+      serverId: this.serverId,
+      token: this.token,
+      daemonVersion: this.daemonVersion,
+      [DAEMON_UPGRADE_BLOCKED_SYNC_PROTOCOL.AUTH_REVISION_FIELD]:
+        DAEMON_UPGRADE_BLOCKED_SYNC_PROTOCOL.REVISION,
+    });
+    const ws = useCoreLaneWorker
+      ? new CoreLaneSocket(wsUrl, {
+        auth,
+        daemonVersion: this.daemonVersion,
+        stallRestartMs: Number(process.env.IMCODES_CORE_LANE_STALL_RESTART_MS
+          ?? CORE_LANE_STALL_RESTART_DEFAULT_MS),
+        heartbeatMs: HEARTBEAT_MS,
+        connectTimeoutMs: CONNECT_TIMEOUT_MS,
+        authorizedSessions: this.authorizedSessions,
+      })
+      : new WebSocket(wsUrl);
     this.ws = ws;
+    // Both implementations expose the browser WebSocket event surface; the
+    // worker facade intentionally keeps a narrower listener type. Normalize
+    // the local view once so protocol handlers remain identical in tests and
+    // production without weakening ServerLink's public API.
+    const eventSocket = ws as unknown as WebSocket;
 
     // Audit fix (94b9b837-822 / A6) — kill the connect attempt after
     // CONNECT_TIMEOUT_MS so a hung TCP SYN cannot wedge the daemon
     // for 75-127 s. Cleared on any of open/close/error.
     if (this.connectTimeoutTimer) clearTimeout(this.connectTimeoutTimer);
-    this.connectTimeoutTimer = setTimeout(() => {
+    this.connectTimeoutTimer = useCoreLaneWorker ? undefined : setTimeout(() => {
       if (this.ws !== ws) return;
       if (ws.readyState === WebSocket.OPEN) return;
       logger.warn(
@@ -383,7 +673,7 @@ export class ServerLink {
       try { ws.close(); } catch { /* ignore */ }
       // close handler will schedule reconnect.
     }, CONNECT_TIMEOUT_MS);
-    try { (this.connectTimeoutTimer as { unref?: () => void }).unref?.(); } catch { /* ignore */ }
+    try { (this.connectTimeoutTimer as { unref?: () => void } | undefined)?.unref?.(); } catch { /* ignore */ }
 
     const clearConnectTimeout = () => {
       if (this.connectTimeoutTimer) {
@@ -392,11 +682,19 @@ export class ServerLink {
       }
     };
 
-    ws.addEventListener('open', () => {
+    eventSocket.addEventListener('open', () => {
       if (this.ws !== ws) return; // replaced before open
       clearConnectTimeout();
       logger.info('ServerLink: connected');
-      this.backoffMs = INITIAL_BACKOFF_MS;
+      this.diagnostics.record(STARTUP_DIAGNOSTIC_EVENT.WS_CONNECT_ESTABLISHED, {});
+      // The auth frame is sent a few lines below, synchronously in this same
+      // handler, before anything can yield back to the event loop — safe to
+      // record it as sent right here, without ever logging the frame itself
+      // (it carries `token`).
+      this.diagnostics.record(STARTUP_DIAGNOSTIC_EVENT.AUTH_SENT, {});
+      this.dataPlaneSocketBackpressured = false;
+      this.dataPlaneOverloadReconnectRequested = false;
+      this.resetLinkCongestion();
       this.lastPong = Date.now();
       this.recordRuntimeLinkStatus({
         state: 'connected',
@@ -407,15 +705,14 @@ export class ServerLink {
       });
       // Send auth handshake immediately — server closes the socket if this is not
       // the first message or if credentials are invalid (5s timeout enforced server-side).
-      ws.send(JSON.stringify({
-        type: 'auth',
-        serverId: this.serverId,
-        token: this.token,
-        daemonVersion: this.daemonVersion,
-        [DAEMON_UPGRADE_BLOCKED_SYNC_PROTOCOL.AUTH_REVISION_FIELD]:
-          DAEMON_UPGRADE_BLOCKED_SYNC_PROTOCOL.REVISION,
-      }));
+      // The worker sends auth before publishing `open`, so a synchronous main
+      // thread stall cannot delay the first protocol frame. The in-process
+      // test socket keeps the historical path for deterministic tests.
+      if (!useCoreLaneWorker) ws.send(auth);
       this.sendDaemonHello();
+      for (const handler of this.openHandlers) {
+        try { handler(); } catch (err) { logger.warn({ err }, 'ServerLink: open handler failed'); }
+      }
       // Wire transport relay so provider callbacks can send events to browsers via this socket.
       setTransportRelaySend((msg) => {
         try {
@@ -425,8 +722,12 @@ export class ServerLink {
         }
       });
       setProviderRegistryServerLink(this);
-      this.startHeartbeat();
-      this.startWatchdog();
+      // Same link for code that is not handed one, plus a replay of any sub-session close the server missed while we were offline.
+      setActiveServerLink(this);
+      flushPendingSubSessionClosedNotices(this);
+      this.startHeartbeat(useCoreLaneWorker);
+      this.startWatchdog(useCoreLaneWorker);
+      this.scheduleTestMainThreadBlock();
 
       // Flush any acks that couldn't be sent before/during previous disconnects.
       // The outbox handles ordering, attempt caps, TTL, and isConnected() gating.
@@ -499,11 +800,13 @@ export class ServerLink {
       })();
     });
 
-    ws.addEventListener('error', (event) => {
+    eventSocket.addEventListener('error', (event) => {
       if (this.ws !== ws) return; // stale socket — a newer connection already took over
       clearConnectTimeout();
       const errorMessage = (event as ErrorEvent).message ?? 'unknown';
+      clearServerLinkSecurity('socket_error');
       logger.warn({ error: errorMessage }, 'ServerLink: error');
+      this.diagnostics.record(STARTUP_DIAGNOSTIC_EVENT.WS_CONNECT_FAILED, { reason: errorMessage });
       this.recordRuntimeLinkStatus({
         state: 'disconnected',
         lastDisconnectedAt: Date.now(),
@@ -513,12 +816,21 @@ export class ServerLink {
       // DNS failure) it may not. Schedule reconnect as a safety net — scheduleReconnect()
       // is idempotent (guards with `this.reconnecting`), so no double-reconnect risk
       // when close does fire.
-      if (!this.stopping) this.scheduleReconnect();
+      // A worker-owned socket reconnects itself. Scheduling a second worker
+      // here would race its bounded backoff and create duplicate connections.
+      if (!this.stopping && !useCoreLaneWorker) this.scheduleReconnect();
     });
 
-    ws.addEventListener('message', (event: MessageEvent) => {
+    eventSocket.addEventListener('message', (event: MessageEvent) => {
       if (this.ws !== ws) return; // stale socket
       this.lastPong = Date.now();
+      // First message from the server proves auth was accepted. Reset backoff
+      // here (not on socket open) so a permanent auth_failed loop — where the
+      // server closes immediately and never sends — keeps exponential back-off.
+      if (!this.serverAuthConfirmedOnCurrentSocket) {
+        this.serverAuthConfirmedOnCurrentSocket = true;
+        this.backoffMs = INITIAL_BACKOFF_MS;
+      }
       if (typeof event.data !== 'string') {
         void (async () => {
           const buffer = await toWebSocketBinaryBuffer(event.data);
@@ -548,6 +860,7 @@ export class ServerLink {
           return;
         }
         if (msg?.type === 'heartbeat_ack') {
+          this.observeHeartbeatAck(msg[CLOCK_SYNC_FIELD.SENT_AT], this.lastPong);
           // Heartbeat acks are the CLI/status proof-of-life source. They must
           // not be throttled behind a just-written heartbeat-sent record, or
           // the runtime file can report a false stale link while acks are
@@ -559,12 +872,16 @@ export class ServerLink {
           });
         }
         for (const h of this.handlers) h(msg);
+        const inboundId = (event as MessageEvent & { inboundId?: unknown }).inboundId;
+        if (useCoreLaneWorker && typeof inboundId === 'string') {
+          (ws as unknown as CoreLaneSocket).commitInbound(inboundId);
+        }
       } catch {
         // ignore parse errors
       }
     });
 
-    ws.addEventListener('close', (event: CloseEvent) => {
+    eventSocket.addEventListener('close', (event: CloseEvent) => {
       // If this.ws has already been replaced by a newer socket (e.g. because we called
       // connect() again while this socket was still in-flight), the server will close
       // this one with 1001 "replaced" — that's expected and we must NOT reconnect,
@@ -572,6 +889,7 @@ export class ServerLink {
       if (this.ws !== ws) return;
       clearConnectTimeout();
       logger.info({ code: event.code, reason: event.reason }, 'ServerLink: closed');
+      clearServerLinkSecurity('socket_close');
       this.recordRuntimeLinkStatus({
         state: 'disconnected',
         lastDisconnectedAt: Date.now(),
@@ -580,14 +898,13 @@ export class ServerLink {
       this.stopHeartbeat();
       this.stopWatchdog();
       setTransportRelaySend(() => { /* disconnected — discard */ });
-      if (!this.stopping) this.scheduleReconnect();
+      if (!this.stopping && !useCoreLaneWorker) this.scheduleReconnect();
     });
   }
 
   send(msg: unknown): void {
     if (this.shouldDeferDataPlaneSend(msg)) {
-      this.enqueueDataPlaneSend(msg);
-      this.scheduleDataPlaneFlush();
+      if (this.enqueueDataPlaneSend(msg)) this.scheduleDataPlaneFlush();
       return;
     }
     this.trySend(msg);
@@ -595,6 +912,21 @@ export class ServerLink {
 
   trySend(msg: unknown): boolean {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      // The worker-owned socket retains a bounded control queue while it is
+      // reconnecting. This is the core-lane exception to the historical
+      // best-effort drop rule: chat/control receipts must not disappear just
+      // because the main thread observed the transient CLOSED state.
+      if (this.ws instanceof CoreLaneSocket) {
+        try {
+          this.seq++;
+          const serialized = stringifyForServerSend(msg, this.seq);
+          this.ws.send(serialized.payload, 'priority');
+          return true;
+        } catch (err) {
+          logger.warn({ err }, 'ServerLink: core-lane queue rejected control send');
+        }
+      }
+      clearServerLinkSecurity('send_without_open_socket');
       // Best-effort: silently drop messages when the link isn't up. Throwing
       // here would become an unhandled rejection in any fire-and-forget
       // caller (handleP2pConfigSave, repo-handler, command-handler, etc.)
@@ -619,8 +951,13 @@ export class ServerLink {
       const sendStart = performance.now();
       const sendBacklogAgeMs = this.updateSendBacklogAge(bufferedAmountBefore, sendStart);
       const outboundQueueDepth = this.dataPlaneSendQueue.length;
+      const outboundQueueBytes = this.dataPlaneSendQueueBytes;
       const outboundQueueAgeMs = this.dataPlaneQueueStartedAt === null ? 0 : sendStart - this.dataPlaneQueueStartedAt;
-      this.ws.send(serialized.payload);
+      if (this.ws instanceof CoreLaneSocket) {
+        this.ws.send(serialized.payload, this.shouldDeferDataPlaneSend(msg) ? 'normal' : 'priority');
+      } else {
+        this.ws.send(serialized.payload);
+      }
       const bufferedAmountAfter = typeof this.ws.bufferedAmount === 'number' ? this.ws.bufferedAmount : undefined;
       if ((bufferedAmountAfter ?? 0) > 0 && this.sendBacklogStartedAt === null) {
         this.sendBacklogStartedAt = sendStart;
@@ -637,12 +974,14 @@ export class ServerLink {
         bufferedAmountAfter,
         sendBacklogAgeMs,
         outboundQueueDepth,
+        outboundQueueBytes,
         outboundQueueAgeMs,
         recipientCount: 1,
         success: true,
       });
       return true;
     } catch (err) {
+      clearServerLinkSecurity('socket_send_error');
       recordServerSend({
         msgType: typeof (msg as { type?: unknown })?.type === 'string' ? (msg as { type: string }).type : undefined,
         commandId: typeof (msg as { commandId?: unknown })?.commandId === 'string' ? (msg as { commandId: string }).commandId : undefined,
@@ -653,6 +992,7 @@ export class ServerLink {
         bufferedAmountAfter: undefined,
         sendBacklogAgeMs: undefined,
         outboundQueueDepth: this.dataPlaneSendQueue.length,
+        outboundQueueBytes: this.dataPlaneSendQueueBytes,
         outboundQueueAgeMs: this.dataPlaneQueueStartedAt === null ? 0 : performance.now() - this.dataPlaneQueueStartedAt,
         recipientCount: 1,
         success: false,
@@ -674,11 +1014,59 @@ export class ServerLink {
     return classifyServerSendPlane(msgType) === 'data';
   }
 
-  private enqueueDataPlaneSend(msg: unknown): void {
+  private enqueueDataPlaneSend(msg: unknown): boolean {
     const now = performance.now();
     const msgType = messageTypeOf(msg);
     const requestId = requestIdOf(msg);
+    const estimatedBytes = dataPlaneMessageBytes(msg);
     this.dropExpiredDataPlaneSendItems(now, 'enqueue_stale');
+    const normalCountCap = Math.max(1, dataPlaneSendQueueHardCap - dataPlaneOverloadReserveItems);
+    const normalByteCap = Math.max(1, dataPlaneSendQueueMaxBytes - dataPlaneOverloadReserveBytes);
+    const countLimited = this.dataPlaneSendQueue.length >= normalCountCap;
+    const byteLimited = !Number.isFinite(estimatedBytes)
+      || estimatedBytes > normalByteCap
+      || this.dataPlaneSendQueueBytes + estimatedBytes > normalByteCap;
+    if (countLimited || byteLimited) {
+      const reason = countLimited ? 'hard_count_cap_reject_new' : 'hard_byte_cap_reject_new';
+      const overflowResponse = compactDataPlaneBackpressureResponse(msg);
+      recordServerLinkDataPlaneBackpressure({
+        msgType,
+        requestId,
+        reason,
+        queueDepth: this.dataPlaneSendQueue.length,
+        queueBytes: this.dataPlaneSendQueueBytes,
+        messageBytes: Number.isFinite(estimatedBytes) ? estimatedBytes : -1,
+        maxQueueBytes: dataPlaneSendQueueMaxBytes,
+        wsBufferedAmount: this.ws?.bufferedAmount ?? 0,
+        softCap: dataPlaneSendQueueSoftCap,
+        hardCap: dataPlaneSendQueueHardCap,
+        overflow: 1,
+      });
+      incrementCounter('serverlink_data_plane_overload', { msgType: msgType ?? 'unknown', reason });
+      this.logDataPlaneBackpressure({
+        msgType,
+        requestId,
+        reason,
+        queueDepth: this.dataPlaneSendQueue.length,
+        queueBytes: this.dataPlaneSendQueueBytes,
+        messageBytes: Number.isFinite(estimatedBytes) ? estimatedBytes : undefined,
+        maxQueueBytes: dataPlaneSendQueueMaxBytes,
+        wsBufferedAmount: this.ws?.bufferedAmount ?? 0,
+      }, 'ServerLink: rejected data-plane payload at bounded queue');
+      // Compact failures are data-plane responses too: sending them directly
+      // while bufferedAmount is stuck merely moves an unbounded strong
+      // reference stream into the WebSocket implementation. Queue them inside
+      // the reserved portion of the same hard byte/count budget instead.
+      if (overflowResponse && this.enqueueCompactDataPlaneOverloadResponse(overflowResponse, now)) {
+        return true;
+      }
+      // If even the bounded reply reserve is exhausted, recycle the wedged
+      // socket once. The close is an explicit retry signal and releases its
+      // native send buffer; accepted queue entries remain ordered for the next
+      // connection. Never keep appending to an OPEN-but-undrainable socket.
+      this.requestDataPlaneOverloadReconnect(reason);
+      return false;
+    }
     if (this.dataPlaneSendQueue.length >= dataPlaneSendQueueSoftCap) {
       const overflow = Math.max(0, this.dataPlaneSendQueue.length - dataPlaneSendQueueSoftCap + 1);
       recordServerLinkDataPlaneBackpressure({
@@ -687,21 +1075,24 @@ export class ServerLink {
         queueDepth: this.dataPlaneSendQueue.length,
         softCap: dataPlaneSendQueueSoftCap,
         hardCap: dataPlaneSendQueueHardCap,
+        queueBytes: this.dataPlaneSendQueueBytes,
+        messageBytes: estimatedBytes,
+        maxQueueBytes: dataPlaneSendQueueMaxBytes,
+        wsBufferedAmount: this.ws?.bufferedAmount ?? 0,
         overflow,
       });
-      logger.warn({
+      this.logDataPlaneBackpressure({
         msgType,
         requestId,
         overflow,
         queueDepth: this.dataPlaneSendQueue.length,
         softCap: dataPlaneSendQueueSoftCap,
         hardCap: dataPlaneSendQueueHardCap,
+        queueBytes: this.dataPlaneSendQueueBytes,
+        messageBytes: estimatedBytes,
+        maxQueueBytes: dataPlaneSendQueueMaxBytes,
+        wsBufferedAmount: this.ws?.bufferedAmount ?? 0,
       }, 'ServerLink: data-plane queue backpressure');
-    }
-    if (this.dataPlaneSendQueue.length >= dataPlaneSendQueueHardCap) {
-      const dropped = this.dataPlaneSendQueue.shift();
-      this.recordDataPlaneSendItemDropped(dropped, now, 'hard_cap_drop_oldest');
-      this.dataPlaneQueueStartedAt = this.dataPlaneSendQueue[0]?.enqueuedAt ?? null;
     }
     this.dataPlaneSendQueue.push({
       msg,
@@ -709,15 +1100,72 @@ export class ServerLink {
       requestId,
       enqueuedAt: now,
       deadlineAt: now + dataPlaneSendStaleMs,
+      estimatedBytes,
     });
+    this.dataPlaneSendQueueBytes += estimatedBytes;
     this.dataPlaneQueueStartedAt ??= now;
+    return true;
+  }
+
+  private enqueueCompactDataPlaneOverloadResponse(msg: Record<string, unknown>, now: number): boolean {
+    const estimatedBytes = dataPlaneMessageBytes(msg);
+    if (!Number.isFinite(estimatedBytes)
+      || this.dataPlaneSendQueue.length >= dataPlaneSendQueueHardCap
+      || this.dataPlaneSendQueueBytes + estimatedBytes > dataPlaneSendQueueMaxBytes) return false;
+    this.dataPlaneSendQueue.push({
+      msg,
+      msgType: messageTypeOf(msg),
+      requestId: requestIdOf(msg),
+      enqueuedAt: now,
+      deadlineAt: now + dataPlaneSendStaleMs,
+      estimatedBytes,
+    });
+    this.dataPlaneSendQueueBytes += estimatedBytes;
+    this.dataPlaneQueueStartedAt ??= now;
+    incrementCounter('serverlink_data_plane_overload_response_queued', {
+      msgType: messageTypeOf(msg) ?? 'unknown',
+    });
+    return true;
+  }
+
+  private requestDataPlaneOverloadReconnect(reason: string): void {
+    if (this.dataPlaneOverloadReconnectRequested) return;
+    this.dataPlaneOverloadReconnectRequested = true;
+    incrementCounter('serverlink_data_plane_overload_reconnect', { reason });
+    this.logDataPlaneBackpressure({
+      reason: 'overload_reply_reserve_exhausted',
+      queueDepth: this.dataPlaneSendQueue.length,
+      queueBytes: this.dataPlaneSendQueueBytes,
+      maxQueueBytes: dataPlaneSendQueueMaxBytes,
+      wsBufferedAmount: this.ws?.bufferedAmount ?? 0,
+    }, 'ServerLink: recycling socket after bounded overload reserve exhausted');
+    if (this.ws?.readyState === WebSocket.OPEN) {
+      this.ws.close(1013, 'data_plane_backpressure');
+    }
+  }
+
+  private logDataPlaneBackpressure(fields: Record<string, unknown>, message: string): void {
+    const now = Date.now();
+    if (now - this.lastDataPlaneBackpressureLogAt < DATA_PLANE_BACKPRESSURE_LOG_INTERVAL_MS) {
+      this.suppressedDataPlaneBackpressureLogs += 1;
+      return;
+    }
+    logger.warn({
+      ...fields,
+      suppressedSinceLastLog: this.suppressedDataPlaneBackpressureLogs,
+    }, message);
+    this.lastDataPlaneBackpressureLogAt = now;
+    this.suppressedDataPlaneBackpressureLogs = 0;
   }
 
   private dropExpiredDataPlaneSendItems(now: number, reason: string): void {
     if (this.dataPlaneSendQueue.length === 0) return;
     const live: DataPlaneSendQueueItem[] = [];
     for (const item of this.dataPlaneSendQueue) {
-      if (item.deadlineAt <= now) this.recordDataPlaneSendItemDropped(item, now, reason);
+      if (item.deadlineAt <= now) {
+        this.dataPlaneSendQueueBytes = Math.max(0, this.dataPlaneSendQueueBytes - item.estimatedBytes);
+        this.recordDataPlaneSendItemDropped(item, now, reason);
+      }
       else live.push(item);
     }
     if (live.length === this.dataPlaneSendQueue.length) return;
@@ -755,6 +1203,140 @@ export class ServerLink {
     return !!this.ws && this.ws.readyState === WebSocket.OPEN;
   }
 
+  private isDataPlaneSocketBelowWatermark(): boolean {
+    if (!this.isLinkSendable()) return false;
+    const bufferedAmount = typeof this.ws?.bufferedAmount === 'number' ? this.ws.bufferedAmount : 0;
+    const congested = this.isUplinkCongested();
+    const highWater = congested
+      ? Math.min(dataPlaneWsHighWaterBytes, CONGESTED_DATA_PLANE_WS_HIGH_WATER_BYTES)
+      : dataPlaneWsHighWaterBytes;
+    const lowWater = congested
+      ? Math.min(dataPlaneWsLowWaterBytes, CONGESTED_DATA_PLANE_WS_LOW_WATER_BYTES)
+      : dataPlaneWsLowWaterBytes;
+    if (this.dataPlaneSocketBackpressured) {
+      if (bufferedAmount > lowWater) return false;
+      this.dataPlaneSocketBackpressured = false;
+      incrementCounter('serverlink_data_plane_socket_backpressure_recovered');
+      return true;
+    }
+    if (bufferedAmount >= highWater) {
+      this.dataPlaneSocketBackpressured = true;
+      incrementCounter('serverlink_data_plane_socket_backpressure', {
+        reason: congested ? 'congested_high_water' : 'high_water',
+      });
+      return false;
+    }
+    return true;
+  }
+
+  private scheduleDataPlaneWatermarkRecheck(): void {
+    if (this.dataPlaneDrainTimer || this.stopping || this.dataPlaneSendQueue.length === 0) return;
+    this.dataPlaneDrainTimer = setTimeout(() => {
+      this.dataPlaneDrainTimer = undefined;
+      this.scheduleDataPlaneFlush();
+    }, DATA_PLANE_DRAIN_RECHECK_MS);
+    this.dataPlaneDrainTimer.unref?.();
+  }
+
+  private resetLinkCongestion(): void {
+    this.unackedHeartbeatSentAts = [];
+    this.lastHeartbeatRoundTripMs = null;
+    this.uplinkCongested = false;
+    // A new connection has to prove it gets acks again -- reconnecting to a
+    // (possibly different) server never carries the proof forward.
+    this.hasReceivedHeartbeatAck = false;
+  }
+
+  private trackHeartbeatSent(sentAt: number): void {
+    this.unackedHeartbeatSentAts.push(sentAt);
+    if (this.unackedHeartbeatSentAts.length > MAX_TRACKED_UNACKED_HEARTBEATS) {
+      // Keep the OLDEST outstanding send: it is the one that proves how long
+      // the link has been failing to return an ack.
+      this.unackedHeartbeatSentAts.splice(1, 1);
+    }
+  }
+
+  private observeHeartbeatAck(echoedSentAt: unknown, receivedAt: number): void {
+    // Reaching here at all is the proof: this server sends heartbeat_ack,
+    // with or without the clock-echo field below. Once true, the ack-based
+    // watchdog is armed for the rest of this connection.
+    this.hasReceivedHeartbeatAck = true;
+    // Older self-hosted servers send the heartbeat_ack envelope without the
+    // clock-echo field. The frame is still an application-level proof; retire
+    // the oldest outstanding heartbeat FIFO so the bounded ack watchdog does
+    // not reconnect a healthy legacy server every minute.
+    if (typeof echoedSentAt !== 'number' || !Number.isFinite(echoedSentAt)) {
+      this.unackedHeartbeatSentAts.shift();
+      return;
+    }
+    this.lastHeartbeatRoundTripMs = Math.max(0, receivedAt - echoedSentAt);
+    this.unackedHeartbeatSentAts = this.unackedHeartbeatSentAts.filter((sentAt) => sentAt > echoedSentAt);
+  }
+
+  /** Current end-to-end link delay: the last measured heartbeat round trip,
+   *  or longer if an outstanding heartbeat has already waited longer. */
+  linkDelayMs(now: number = Date.now()): number {
+    const oldestUnacked = this.unackedHeartbeatSentAts[0];
+    const waiting = oldestUnacked === undefined ? 0 : Math.max(0, now - oldestUnacked);
+    return Math.max(this.lastHeartbeatRoundTripMs ?? 0, waiting);
+  }
+
+  /** True while the uplink is too slow for bulk data to share the socket
+   *  freely with control frames. Hysteresis avoids flapping around one value. */
+  isUplinkCongested(now: number = Date.now()): boolean {
+    const delay = this.linkDelayMs(now);
+    if (this.uplinkCongested) {
+      if (delay <= LINK_CONGESTION_EXIT_DELAY_MS) {
+        this.uplinkCongested = false;
+        incrementCounter('serverlink_uplink_congestion_cleared');
+      }
+    } else if (delay >= LINK_CONGESTION_ENTER_DELAY_MS) {
+      this.uplinkCongested = true;
+      incrementCounter('serverlink_uplink_congestion_entered');
+      logger.warn({ delayMs: delay }, 'ServerLink: uplink congested; limiting bulk data in the socket');
+    }
+    return this.uplinkCongested;
+  }
+
+  /**
+   * Drop queued, not-yet-written data-plane replies for a request the server
+   * has already abandoned (it timed out or its requester went away). Writing
+   * them would spend a congested uplink on bytes the server discards on
+   * arrival. Anything already handed to the socket is past recall.
+   */
+  cancelQueuedDataPlaneRequest(requestId: string): number {
+    if (!requestId || this.dataPlaneSendQueue.length === 0) return 0;
+    const now = performance.now();
+    const live: DataPlaneSendQueueItem[] = [];
+    let cancelled = 0;
+    for (const item of this.dataPlaneSendQueue) {
+      // A fan-out reply (`requestIds`) also serves other requesters; one
+      // requester giving up must not take it away from the rest.
+      const fanout = (item.msg as { requestIds?: unknown } | null)?.requestIds;
+      const servesOthers = Array.isArray(fanout) && fanout.length > 0;
+      if (item.requestId === requestId && !servesOthers) {
+        this.dataPlaneSendQueueBytes = Math.max(0, this.dataPlaneSendQueueBytes - item.estimatedBytes);
+        this.recordDataPlaneSendItemDropped(item, now, 'server_cancelled');
+        cancelled += 1;
+      } else {
+        live.push(item);
+      }
+    }
+    if (cancelled === 0) return 0;
+    this.dataPlaneSendQueue = live;
+    this.dataPlaneQueueStartedAt = this.dataPlaneSendQueue[0]?.enqueuedAt ?? null;
+    incrementCounter('serverlink_data_plane_server_cancelled');
+    return cancelled;
+  }
+
+  dataPlaneQueueStatsForTests(): { depth: number; bytes: number; socketBackpressured: boolean } {
+    return {
+      depth: this.dataPlaneSendQueue.length,
+      bytes: this.dataPlaneSendQueueBytes,
+      socketBackpressured: this.dataPlaneSocketBackpressured,
+    };
+  }
+
   /** Public hook for the WS `open` handler to kick the data-plane drain
    *  after reconnect. Without this, anything that piled up in the queue
    *  during the disconnect window would never be flushed. */
@@ -785,6 +1367,7 @@ export class ServerLink {
       }
       if (item.deadlineAt <= now) {
         this.dataPlaneSendQueue.shift();
+        this.dataPlaneSendQueueBytes = Math.max(0, this.dataPlaneSendQueueBytes - item.estimatedBytes);
         this.recordDataPlaneSendItemDropped(item, now, 'drain_stale');
       } else if (!this.isLinkSendable()) {
         // Stop the drain and wait for reconnect. Telemetry only — no drop.
@@ -794,9 +1377,27 @@ export class ServerLink {
           queueDepth: this.dataPlaneSendQueue.length,
           softCap: dataPlaneSendQueueSoftCap,
           hardCap: dataPlaneSendQueueHardCap,
+          queueBytes: this.dataPlaneSendQueueBytes,
+          maxQueueBytes: dataPlaneSendQueueMaxBytes,
+          wsBufferedAmount: this.ws?.bufferedAmount ?? 0,
           overflow: 0,
         });
         this.dataPlaneQueueStartedAt = this.dataPlaneSendQueue[0]?.enqueuedAt ?? null;
+        return;
+      } else if (!this.isDataPlaneSocketBelowWatermark()) {
+        recordServerLinkDataPlaneBackpressure({
+          msgType: item.msgType,
+          requestId: item.requestId,
+          reason: 'ws_high_water',
+          queueDepth: this.dataPlaneSendQueue.length,
+          queueBytes: this.dataPlaneSendQueueBytes,
+          maxQueueBytes: dataPlaneSendQueueMaxBytes,
+          wsBufferedAmount: this.ws?.bufferedAmount ?? 0,
+          wsHighWaterBytes: dataPlaneWsHighWaterBytes,
+          wsLowWaterBytes: dataPlaneWsLowWaterBytes,
+          overflow: 0,
+        });
+        this.scheduleDataPlaneWatermarkRecheck();
         return;
       } else {
         const ok = this.trySend(item.msg);
@@ -809,6 +1410,7 @@ export class ServerLink {
           return;
         }
         this.dataPlaneSendQueue.shift();
+        this.dataPlaneSendQueueBytes = Math.max(0, this.dataPlaneSendQueueBytes - item.estimatedBytes);
       }
       if (this.dataPlaneSendQueue.length === 0) {
         this.dataPlaneQueueStartedAt = null;
@@ -885,6 +1487,9 @@ export class ServerLink {
       helloEpoch: this.helloEpoch,
       sentAt,
     });
+    // A reconnect/hello is a safe boundary for a worker release check. The
+    // remote-desktop host itself defers while it has active connections.
+    void refreshDaemonRemoteDesktop().catch(() => {});
   }
 
   /**
@@ -942,7 +1547,7 @@ export class ServerLink {
   /** Send a timeline event to connected browsers via the server relay. */
   sendTimelineEvent(event: TimelineEvent): void {
     try {
-      this.send({ type: 'timeline.event', event });
+      this.send({ type: TIMELINE_MESSAGES.EVENT, event });
     } catch {
       // Not connected — timeline events are best-effort
     }
@@ -952,16 +1557,26 @@ export class ServerLink {
     this.handlers.push(handler);
   }
 
+  /** Runs after the auth frame is queued on every initial/replacement socket. */
+  onOpen(handler: () => void): void {
+    this.openHandlers.push(handler);
+  }
+
   onBinaryMessage(handler: BinaryMessageHandler): void {
     this.binaryHandlers.push(handler);
   }
 
   disconnect(): void {
+    clearServerLinkSecurity('explicit_disconnect');
     this.stopping = true;
     this.stopHeartbeat();
     this.stopWatchdog();
     if (this.pongTimer) clearTimeout(this.pongTimer);
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    if (this.dataPlaneDrainTimer) {
+      clearTimeout(this.dataPlaneDrainTimer);
+      this.dataPlaneDrainTimer = undefined;
+    }
     if (this.connectTimeoutTimer) {
       clearTimeout(this.connectTimeoutTimer);
       this.connectTimeoutTimer = undefined;
@@ -970,19 +1585,30 @@ export class ServerLink {
     this.ws = null;
   }
 
-  private startHeartbeat(): void {
+  private startHeartbeat(workerOwnsHeartbeat = false): void {
     // Runs for the lifetime of a connection so silence checks can tell a real
     // server outage from the daemon's own event-loop stalls.
     this.startLoopProbe();
-    this.heartbeatTimer = setInterval(() => {
+    if (!workerOwnsHeartbeat) this.heartbeatTimer = setInterval(() => {
       if (this.ws?.readyState === WebSocket.OPEN) {
         const now = Date.now();
+        if (this.heartbeatAckTimedOut(now)) {
+          this.forceReconnect('heartbeat_ack_timeout');
+          return;
+        }
         const silenceMs = this.getOpenSocketSilenceMs(now);
         if (silenceMs > SILENT_CONNECTION_RECYCLE_MS) {
           this.recycleSilentConnection('heartbeat_silent_connection', silenceMs);
           return;
         }
-        const sent = this.trySend({ type: 'heartbeat', daemonVersion: this.daemonVersion, ...collectSystemStats() });
+        const heartbeatSentAt = Date.now();
+        const sent = this.trySend({
+          type: 'heartbeat',
+          daemonVersion: this.daemonVersion,
+          ...collectSystemStats(),
+          [CLOCK_SYNC_FIELD.SENT_AT]: heartbeatSentAt,
+        });
+        if (sent) this.trackHeartbeatSent(heartbeatSentAt);
         this.recordRuntimeLinkStatus({
           state: sent ? 'connected' : 'disconnected',
           lastHeartbeatSentAt: now,
@@ -1009,7 +1635,8 @@ export class ServerLink {
   /** Watchdog: periodically verifies the connection is truly alive.
    *  A short missed-ack window is tolerated because the worker can update
    *  heartbeat state without returning a timely heartbeat_ack under load. */
-  private startWatchdog(): void {
+  private startWatchdog(workerOwnsHeartbeat = false): void {
+    if (workerOwnsHeartbeat) return;
     this.watchdogTimer = setInterval(() => {
       if (this.stopping) return;
 
@@ -1025,6 +1652,11 @@ export class ServerLink {
       // event-loop freeze) so a busy daemon doesn't force-reconnect a healthy
       // socket it simply couldn't read from.
       const silenceMs = this.getOpenSocketSilenceMs();
+      if (this.heartbeatAckTimedOut()) {
+        logger.warn('ServerLink watchdog: heartbeat ack timeout, forcing reconnect');
+        this.forceReconnect('heartbeat_ack_timeout');
+        return;
+      }
       if (silenceMs > SILENT_CONNECTION_RECYCLE_MS) {
         // Haven't received anything for heartbeat interval + timeout — dead connection
         logger.warn({ silenceMs }, 'ServerLink watchdog: connection silent, forcing reconnect');
@@ -1052,6 +1684,23 @@ export class ServerLink {
     return Math.max(0, now - this.lastPong);
   }
 
+  /** True when the oldest heartbeat sent on a clean event loop has no
+   * application-level acknowledgement within the bounded proof window.
+   * Never applies until this connection has shown it sends heartbeat_ack at
+   * all -- a server that only ever answers with a ws pong would otherwise
+   * accumulate unacked heartbeats forever and be force-reconnected roughly
+   * every heartbeat interval, even though it is perfectly healthy. Such a
+   * connection still gets reconnected on a truly dead link via the
+   * silence/pong-based watchdog check next to this one. */
+  private heartbeatAckTimedOut(now = Date.now()): boolean {
+    if (!this.hasReceivedHeartbeatAck) return false;
+    if (this.lastLoopProbeAt > 0 && now - this.lastLoopProbeAt > LOOP_PROBE_MS + EVENT_LOOP_STALL_THRESHOLD_MS) {
+      return false;
+    }
+    const oldestUnacked = this.unackedHeartbeatSentAts[0];
+    return oldestUnacked !== undefined && now - oldestUnacked > HEARTBEAT_ACK_TIMEOUT_MS;
+  }
+
   /** Lightweight ticker that detects event-loop freezes (see LOOP_PROBE_MS). */
   private startLoopProbe(): void {
     this.stopLoopProbe();
@@ -1062,6 +1711,11 @@ export class ServerLink {
       this.lastLoopProbeAt = now;
       if (prev <= 0) return;
       const drift = now - prev - LOOP_PROBE_MS;
+      const coreLane = this.ws instanceof CoreLaneSocket ? this.ws : null;
+      coreLane?.updateMainLag(Math.max(0, drift));
+      if (coreLane && this.authorizedSessionsProvider) {
+        try { coreLane.updateAuthorizedSessions(this.authorizedSessionsProvider()); } catch { /* session store may be mid-shutdown */ }
+      }
       if (drift > EVENT_LOOP_STALL_THRESHOLD_MS && this.lastPong > 0) {
         // The loop was frozen for ~drift ms; inbound couldn't be read. Don't let
         // that window count as server silence — reset the proof baseline so the
@@ -1069,6 +1723,25 @@ export class ServerLink {
         // force-reconnecting a healthy socket.
         this.lastPong = now;
         logger.warn({ driftMs: drift }, 'ServerLink: event-loop stall detected — deferring silence-based reconnect');
+        const configuredRestartMs = Number(process.env.IMCODES_CORE_LANE_STALL_RESTART_MS
+          ?? CORE_LANE_STALL_RESTART_DEFAULT_MS);
+        if (!this.mainStallRestartIssued
+          && !process.env.VITEST
+          && Number.isFinite(configuredRestartMs)
+          && configuredRestartMs > 0
+          && drift >= configuredRestartMs) {
+          this.mainStallRestartIssued = true;
+          logger.error({ driftMs: drift, restartAfterMs: configuredRestartMs },
+            'ServerLink: prolonged main-thread stall — requesting controlled daemon restart');
+          this.recordRuntimeLinkStatus({
+            state: 'disconnected',
+            lastDisconnectedAt: now,
+            lastError: `main_event_loop_stall:${Math.trunc(drift)}ms`,
+          });
+          // SIGTERM is the existing lifecycle/supervisor restart path. The
+          // guard prevents a second signal during the same stall.
+          process.kill(process.pid, 'SIGTERM');
+        }
       }
     }, LOOP_PROBE_MS);
     try { (this.loopProbeTimer as { unref?: () => void }).unref?.(); } catch { /* ignore */ }
@@ -1079,6 +1752,44 @@ export class ServerLink {
     this.lastLoopProbeAt = 0;
   }
 
+  /**
+   * Deterministic fault injection for the isolated core-lane matrix. It is
+   * deliberately gated to test daemons and never runs in a normal build.
+   * The worker heartbeat continues while this thread is blocked, allowing the
+   * browser/server evidence to prove that liveness and control ACKs stay off
+   * the main event loop.
+   */
+  private scheduleTestMainThreadBlock(): void {
+    if (this.testMainThreadBlockScheduled) return;
+    if (process.env.NODE_ENV !== 'test' && process.env.IMCODES_TEST_DAEMON !== '1') return;
+    const blockMs = Number(process.env.IMCODES_CORE_LANE_TEST_BLOCK_MS ?? 0);
+    if (!Number.isFinite(blockMs) || blockMs <= 0) return;
+    this.testMainThreadBlockScheduled = true;
+    const blockControlFile = process.env.IMCODES_CORE_LANE_TEST_BLOCK_CONTROL_FILE;
+    const blockMarkerFile = process.env.IMCODES_CORE_LANE_TEST_BLOCK_MARKER_FILE
+      ?? (blockControlFile ? `${blockControlFile}.marker` : undefined);
+    const block = () => {
+      runCoreLaneTestBlock({ blockMs, blockMarkerFile, pid: process.pid, logger });
+    };
+    if (blockControlFile) {
+      const poll = setInterval(() => {
+        try {
+          if (!fs.existsSync(blockControlFile)) return;
+          fs.unlinkSync(blockControlFile);
+          clearInterval(poll);
+          block();
+        } catch (error) {
+          logger.error({ error, blockControlFile }, 'Core-lane test fault: control-file poll failed');
+        }
+      }, 25);
+      try { (poll as { unref?: () => void }).unref?.(); } catch { /* test timer */ }
+      return;
+    }
+    const delayMs = Math.max(0, Number(process.env.IMCODES_CORE_LANE_TEST_BLOCK_AFTER_MS ?? 5_000));
+    const timer = setTimeout(block, delayMs);
+    try { (timer as { unref?: () => void }).unref?.(); } catch { /* test timer */ }
+  }
+
   private recycleSilentConnection(reason: string, silenceMs: number): void {
     logger.warn({ silenceMs, reason }, 'ServerLink: open socket has no inbound proof, forcing reconnect');
     this.forceReconnect(reason);
@@ -1086,6 +1797,7 @@ export class ServerLink {
 
   /** Kill current connection and force immediate reconnect */
   private forceReconnect(reason = 'watchdog_forced_reconnect'): void {
+    clearServerLinkSecurity(reason);
     this.stopHeartbeat();
     this.stopWatchdog();
     if (this.reconnectTimer) { clearTimeout(this.reconnectTimer); this.reconnectTimer = undefined; }
@@ -1120,6 +1832,9 @@ export class ServerLink {
       this.backoffMs = Math.min(this.backoffMs * 2, MAX_BACKOFF_MS);
     }, delayMs);
   }
+
+  /** Exposed for tests only — do NOT call in production paths. */
+  __backoffMsForTests(): number { return this.backoffMs; }
 
   private recordRuntimeLinkStatus(
     update: Parameters<typeof recordDaemonServerLinkStatus>[0],

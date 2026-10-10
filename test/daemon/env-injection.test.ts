@@ -3,6 +3,9 @@
  * Verifies that session-manager and subsession-manager both inject the env var.
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { identityPromptHash } from '../../src/util/identity-prompt-hash.js';
+import { SESSION_IDENTITY_SCOPES } from '../../shared/session-identity.js';
+import { putLocalSessionIdentityProfile, removeLocalSessionIdentityProfileQuiet } from '../../src/daemon/session-identity-local-store.js';
 
 // ── Mocks ─────────────────────────────────────────────────────────────────────
 
@@ -11,6 +14,8 @@ const mocks = vi.hoisted(() => ({
   upsertSession: vi.fn(),
   getSession: vi.fn(() => null),
   sessionExists: vi.fn().mockResolvedValue(false),
+  sendKeys: vi.fn().mockResolvedValue(undefined),
+  capturePane: vi.fn().mockResolvedValue(['›']),
 }));
 
 vi.mock('../../src/store/session-store.js', () => ({
@@ -29,8 +34,8 @@ vi.mock('../../src/agent/tmux.js', () => ({
   cleanupOrphanFifos: vi.fn(),
   newSession: mocks.newSession,
   killSession: vi.fn().mockResolvedValue(undefined),
-  sendKeys: vi.fn().mockResolvedValue(undefined),
-  capturePane: vi.fn().mockResolvedValue([]),
+  sendKeys: mocks.sendKeys,
+  capturePane: mocks.capturePane,
 }));
 
 vi.mock('../../src/daemon/codex-watcher.js', () => ({
@@ -47,6 +52,7 @@ vi.mock('../../src/daemon/codex-watcher.js', () => ({
 }));
 
 vi.mock('../../src/daemon/jsonl-watcher.js', () => ({
+  reserveSessionFile: vi.fn(), reassignSessionFile: vi.fn(),
   startWatching: vi.fn().mockResolvedValue(undefined),
   startWatchingFile: vi.fn().mockResolvedValue(undefined),
   isWatching: vi.fn().mockReturnValue(false),
@@ -84,7 +90,27 @@ vi.mock('../../src/util/logger.js', () => ({
   default: { debug: vi.fn(), warn: vi.fn(), info: vi.fn(), error: vi.fn() },
 }));
 
+vi.mock('../../src/daemon/session-resource-service.js', () => ({
+  initializeSessionResourceLifecycle: vi.fn().mockResolvedValue({ released: 0, preserved: 0, failed: 0 }),
+  registerTmuxSessionResource: vi.fn().mockResolvedValue(undefined),
+  releaseSessionChildResources: vi.fn().mockResolvedValue({ released: 0, failed: 0 }),
+  releaseSessionResources: vi.fn().mockResolvedValue({ released: 0, failed: 0 }),
+  resourceOwnerEnv: (owner: { sessionInstanceId: string; runtimeEpoch: string }) => ({
+    IMCODES_RESOURCE_SESSION_INSTANCE_ID: owner.sessionInstanceId,
+    IMCODES_RESOURCE_RUNTIME_EPOCH: owner.runtimeEpoch,
+  }),
+}));
+
 import { launchSession } from '../../src/agent/session-manager.js';
+
+/**
+ * The identity is typed into the agent after its startup poll (codex polls every 1.5 s) and, when derived, after reading the
+ * identity store. A fixed 1.6 s wait left 100 ms for all of that and failed on the Windows runner (no call yet); wait for the
+ * call itself instead, with a bound far beyond the work.
+ */
+const waitForIdentityInjection = (text: string) => vi.waitFor(() => {
+  expect(mocks.sendKeys).toHaveBeenCalledWith('deck_proj_brain', expect.stringContaining(text));
+}, { timeout: 20_000, interval: 50 });
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
@@ -109,6 +135,20 @@ describe('IMCODES_SESSION env injection', () => {
     const opts = callArgs[2];
     expect(opts.env).toBeDefined();
     expect(opts.env.IMCODES_SESSION).toBe('deck_proj_brain');
+  });
+
+  it('does not execute identity prose as a shell command', async () => {
+    await launchSession({
+      name: 'deck_proj_brain',
+      projectName: 'proj',
+      role: 'brain',
+      agentType: 'shell',
+      projectDir: '/proj',
+      identityPrompt: 'Never execute this as shell input.',
+    });
+    await Promise.resolve();
+
+    expect(mocks.sendKeys).not.toHaveBeenCalled();
   });
 
   it('injects IMCODES_SESSION into newSession env for claude-code agent', async () => {
@@ -139,6 +179,76 @@ describe('IMCODES_SESSION env injection', () => {
     const opts = mocks.newSession.mock.calls[0][2];
     expect(opts.env.IMCODES_SESSION).toBe('deck_proj_brain');
     expect(opts.env.RCC_AUTOFIX_MODE).toBe('1');
+  });
+
+  it('injects a selected-file identity into a process agent on its first launch', async () => {
+    await launchSession({
+      name: 'deck_proj_brain',
+      projectName: 'proj',
+      role: 'brain',
+      agentType: 'codex',
+      projectDir: '/proj',
+      identityPrompt: 'Identity loaded from the selected document.',
+    });
+    // The agent's startup poll (1.5 s) comes first, then the identity is typed in: wait for that, not for a clock.
+    await waitForIdentityInjection('Identity loaded from the selected document.');
+
+    // The text is injected into the agent, but the session record keeps only its digest (never the prompt).
+    expect(mocks.upsertSession).toHaveBeenCalledWith(expect.objectContaining({
+      appliedIdentityHash: identityPromptHash('Identity loaded from the selected document.'),
+    }));
+    for (const [record] of mocks.upsertSession.mock.calls) {
+      expect(JSON.stringify(record)).not.toContain('Identity loaded from the selected document.');
+    }
+    expect(mocks.sendKeys).toHaveBeenCalledWith(
+      'deck_proj_brain',
+      expect.stringContaining('Identity loaded from the selected document.'),
+    );
+  });
+
+  it('a launch with no explicit identity derives it from the identity store (the text is not in the session record)', async () => {
+    await putLocalSessionIdentityProfile({ scope: 'user', scopeKey: '', content: 'Derived user identity contract.', source: 'mcp' });
+    try {
+      await launchSession({
+        name: 'deck_proj_brain',
+        projectName: 'proj',
+        role: 'brain',
+        agentType: 'codex',
+        projectDir: '/proj',
+      });
+      await waitForIdentityInjection('Derived user identity contract.');
+    } finally {
+      await removeLocalSessionIdentityProfileQuiet('user', '');
+    }
+
+    expect(mocks.sendKeys).toHaveBeenCalledWith(
+      'deck_proj_brain',
+      expect.stringContaining('Derived user identity contract.'),
+    );
+    for (const [record] of mocks.upsertSession.mock.calls) {
+      expect(JSON.stringify(record)).not.toContain('Derived user identity contract.');
+    }
+  });
+
+  it('a derived PROJECT identity is looked up by the context namespace project id (as a restore does), not by the project name', async () => {
+    const projectId = 'project-uuid-7a1c';
+    await putLocalSessionIdentityProfile({ scope: SESSION_IDENTITY_SCOPES.PROJECT, scopeKey: projectId, content: 'Project identity keyed by id.', source: 'mcp' });
+    // A different profile under the project NAME: the lookup that ignored the namespace would have found this one instead.
+    await putLocalSessionIdentityProfile({ scope: SESSION_IDENTITY_SCOPES.PROJECT, scopeKey: 'proj', content: 'Project identity keyed by name.', source: 'mcp' });
+    mocks.getSession.mockReturnValue({
+      name: 'deck_proj_brain', projectName: 'proj', role: 'brain', agentType: 'codex', projectDir: '/proj', state: 'idle',
+      contextNamespace: { projectId }, restarts: 0, restartTimestamps: [], createdAt: 1, updatedAt: 1,
+    } as never);
+    try {
+      await launchSession({ name: 'deck_proj_brain', projectName: 'proj', role: 'brain', agentType: 'codex', projectDir: '/proj' });
+      await waitForIdentityInjection('Project identity keyed by id.');
+      const typed = mocks.sendKeys.mock.calls.map(([, keys]) => String(keys)).join('\n');
+      expect(typed).not.toContain('Project identity keyed by name.');
+    } finally {
+      mocks.getSession.mockReturnValue(null as never);
+      await removeLocalSessionIdentityProfileQuiet(SESSION_IDENTITY_SCOPES.PROJECT, projectId);
+      await removeLocalSessionIdentityProfileQuiet(SESSION_IDENTITY_SCOPES.PROJECT, 'proj');
+    }
   });
 
   it('does not call newSession when tmux session already exists', async () => {

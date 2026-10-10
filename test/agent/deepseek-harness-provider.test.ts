@@ -227,6 +227,19 @@ describe('DeepseekHarnessProvider', () => {
     expect(child.commands().some((command) => command.type === 'follow_up')).toBe(false);
   });
 
+  it('does not acknowledge an append after the active bridge stdin is destroyed', async () => {
+    const sessionId = await startSession();
+    await provider.send(sessionId, 'first task');
+    await flush();
+    child.stdin.destroyed = true;
+
+    await expect(provider.notifyActiveDelegation(sessionId, {
+      text: 'must remain queued',
+      sourceSession: 'deck_sub_source',
+    })).resolves.toBe('stale');
+    expect(child.commands().filter((command) => command.type === DSH_BRIDGE_COMMAND.STEER)).toEqual([]);
+  });
+
   it('reuses one child across turns instead of respawning', async () => {
     const sessionId = await startSession();
     await provider.send(sessionId, 'first');
@@ -393,13 +406,16 @@ describe('DeepseekHarnessProvider', () => {
     expect(errors[0].error).toMatchObject({ code: 'PROVIDER_ERROR', message: 'model request failed' });
   });
 
-  it('sends a cancel command and settles the turn as cancelled', async () => {
+  it('waits for the captured harness terminal after the cancel command', async () => {
     const sessionId = await startSession();
     await provider.send(sessionId, 'hi');
     await flush();
-    await provider.cancel(sessionId);
-    child.emitEvent({ type: DSH_BRIDGE_EVENT.TURN_END, reason: DSH_BRIDGE_TURN_REASON.CANCELLED });
+    let settled = false;
+    const stopping = provider.cancelAndWait(sessionId).then(() => { settled = true; });
     await flush();
+    expect(settled).toBe(false);
+    child.emitEvent({ type: DSH_BRIDGE_EVENT.TURN_END, reason: DSH_BRIDGE_TURN_REASON.CANCELLED });
+    await stopping;
 
     expect(child.commands().some((c) => c.type === DSH_BRIDGE_COMMAND.CANCEL)).toBe(true);
     expect(completions).toHaveLength(0);

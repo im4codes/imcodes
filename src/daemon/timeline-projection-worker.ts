@@ -2,7 +2,6 @@ import { parentPort, workerData } from 'node:worker_threads';
 import { createRequire } from 'node:module';
 import { mkdirSync, statSync, existsSync, readFileSync, openSync, readSync, closeSync } from 'node:fs';
 import { dirname, join } from 'node:path';
-import { homedir } from 'node:os';
 import type { TimelineEvent, TimelineEventType } from './timeline-event.js';
 import type {
   ProjectionSessionMeta,
@@ -21,10 +20,23 @@ type WorkerRequest = {
 }[ProjectionWorkerRequestType];
 
 const PROJECTION_VERSION = 1;
-const TIMELINE_DIR = join(homedir(), '.imcodes', 'timeline');
-const dbPath = typeof workerData?.dbPath === 'string' && workerData.dbPath
-  ? workerData.dbPath
-  : join(homedir(), '.imcodes', 'timeline.sqlite');
+// The worker entry must not import local modules (it loads as raw .ts without a `.js` resolver), so it cannot ask the state-dir
+// resolver itself: the client resolves the paths once and hands them over. There is deliberately no homedir() guess here — a worker
+// that guessed would open the real ~/.imcodes for a scoped daemon.
+if (typeof workerData?.dbPath !== 'string' || !workerData.dbPath) {
+  throw new Error('timeline projection worker requires workerData.dbPath (resolved by the client)');
+}
+const dbPath: string = workerData.dbPath;
+/** State directory the client resolved (IMCODES_HOME aware); defaults to the directory holding the projection db. */
+const stateDir: string = typeof workerData?.stateDir === 'string' && workerData.stateDir ? workerData.stateDir : dirname(dbPath);
+function timelineDir(): string {
+  // Production clients pass the canonical <home>/timeline.sqlite path. The
+  // worker contract also allows an arbitrary test db path, in which case the
+  // JSONL fixture remains under the client-supplied state directory's timeline tree.
+  return dbPath.endsWith('timeline.sqlite')
+    ? join(dirname(dbPath), 'timeline')
+    : join(stateDir, 'timeline');
+}
 
 let db: DatabaseSyncInstance | null = null;
 const rebuildPromises = new Map<string, Promise<boolean>>();
@@ -33,7 +45,7 @@ let writesSinceCheckpoint = 0;
 
 function sessionFilePath(sessionId: string): string {
   const safe = sessionId.replace(/[^a-zA-Z0-9_-]/g, '_');
-  return join(TIMELINE_DIR, `${safe}.jsonl`);
+  return join(timelineDir(), `${safe}.jsonl`);
 }
 
 function ensureDb(): DatabaseSyncInstance {
@@ -458,10 +470,26 @@ async function handleRecordAppendedEvent(event: TimelineEvent): Promise<boolean>
   return true;
 }
 
-function buildRangeSql(base: string, afterTs?: number, beforeTs?: number): { sql: string; params: unknown[] } {
+function buildRangeSql(
+  base: string,
+  afterTs?: number,
+  afterSeq?: number,
+  epoch?: number,
+  beforeTs?: number,
+): { sql: string; params: unknown[] } {
   const clauses = [base];
   const params: unknown[] = [];
-  if (afterTs !== undefined) {
+  if (epoch !== undefined) {
+    clauses.push('AND epoch = ?');
+    params.push(epoch);
+  }
+  if (afterSeq !== undefined) {
+    clauses.push('AND seq > ?');
+    params.push(afterSeq);
+  }
+  // A validated same-epoch sequence cursor is authoritative. Combining it
+  // with a timestamp using AND would drop events sharing the boundary ts.
+  if (afterTs !== undefined && (afterSeq === undefined || epoch === undefined)) {
     clauses.push('AND ts > ?');
     params.push(afterTs);
   }
@@ -472,12 +500,14 @@ function buildRangeSql(base: string, afterTs?: number, beforeTs?: number): { sql
   return { sql: clauses.join(' '), params };
 }
 
-async function handleQueryHistory(sessionId: string, afterTs?: number, beforeTs?: number, limit = 500): Promise<{ source: 'sqlite'; events: TimelineEvent[] }> {
+async function handleQueryHistory(sessionId: string, afterTs?: number, afterSeq?: number, epoch?: number, beforeTs?: number, limit = 500): Promise<{ source: 'sqlite'; events: TimelineEvent[] }> {
   if (!prepareSqliteRead(sessionId)) return { source: 'sqlite', events: [] };
   const boundedLimit = Math.max(1, Math.min(limit, 10_000));
   const { sql, params } = buildRangeSql(
     'SELECT * FROM timeline_projection_events WHERE session_id = ?',
     afterTs,
+    afterSeq,
+    epoch,
     beforeTs,
   );
   const rows = ensureDb().prepare(`${sql} ORDER BY ts DESC, append_ordinal DESC LIMIT ?`).all(...([sessionId, ...params, boundedLimit] as any[])) as Array<Record<string, unknown>>;
@@ -515,7 +545,7 @@ async function handleQueryCompletedTextTail(sessionId: string, limit = 50): Prom
   return { source: 'sqlite', events: rows.reverse().map(rowToEvent) };
 }
 
-async function handleQueryByTypes(sessionId: string, types: TimelineEventType[], afterTs?: number, beforeTs?: number, limit = 500): Promise<{ source: 'sqlite'; events: TimelineEvent[] }> {
+async function handleQueryByTypes(sessionId: string, types: TimelineEventType[], afterTs?: number, afterSeq?: number, epoch?: number, beforeTs?: number, limit = 500): Promise<{ source: 'sqlite'; events: TimelineEvent[] }> {
   if (!prepareSqliteRead(sessionId)) return { source: 'sqlite', events: [] };
   if (types.length === 0) return { source: 'sqlite', events: [] };
   const boundedLimit = Math.max(1, Math.min(limit, 10_000));
@@ -523,6 +553,8 @@ async function handleQueryByTypes(sessionId: string, types: TimelineEventType[],
   const { sql, params } = buildRangeSql(
     `SELECT * FROM timeline_projection_events WHERE session_id = ? AND type IN (${placeholders})`,
     afterTs,
+    afterSeq,
+    epoch,
     beforeTs,
   );
   const rows = ensureDb().prepare(`${sql} ORDER BY ts DESC, append_ordinal DESC LIMIT ?`)
@@ -589,13 +621,13 @@ async function handleRequest(message: WorkerRequest): Promise<unknown> {
     case 'recordAppendedEvent':
       return handleRecordAppendedEvent(message.payload.event);
     case 'queryHistory':
-      return handleQueryHistory(message.payload.sessionId, message.payload.afterTs, message.payload.beforeTs, message.payload.limit);
+      return handleQueryHistory(message.payload.sessionId, message.payload.afterTs, message.payload.afterSeq, message.payload.epoch, message.payload.beforeTs, message.payload.limit);
     case 'queryLatest':
       return handleQueryLatest(message.payload.sessionId);
     case 'queryCompletedTextTail':
       return handleQueryCompletedTextTail(message.payload.sessionId, message.payload.limit);
     case 'queryByTypes':
-      return handleQueryByTypes(message.payload.sessionId, message.payload.types, message.payload.afterTs, message.payload.beforeTs, message.payload.limit);
+      return handleQueryByTypes(message.payload.sessionId, message.payload.types, message.payload.afterTs, message.payload.afterSeq, message.payload.epoch, message.payload.beforeTs, message.payload.limit);
     case 'rebuildSession': {
       const existing = rebuildPromises.get(message.payload.sessionId);
       if (existing) return existing;

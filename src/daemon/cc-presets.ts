@@ -1,3 +1,4 @@
+import { resolveImcodesHome } from '../util/windows-daemon-lock.js';
 /**
  * CC Environment Presets — named sets of env vars for launching Claude Code
  * with alternative API providers (MiniMax, DeepSeek, OpenRouter, etc.).
@@ -9,7 +10,6 @@
 
 import { promises as fs } from 'node:fs';
 import { dirname, join } from 'node:path';
-import { homedir } from 'node:os';
 import {
   getCcPresetAvailableModelIds,
   getCcPresetEffectiveModel,
@@ -22,7 +22,7 @@ import type { DshLlmConfig } from '../../shared/deepseek-harness.js';
 import type { PiLlmConfig } from '../../shared/pi-agent.js';
 import logger from '../util/logger.js';
 
-const PRESETS_PATH = join(homedir(), '.imcodes', 'cc-presets.json');
+function presetsPath(): string { return join(resolveImcodesHome(), 'cc-presets.json'); }
 
 let cachedPresets: CcPreset[] | null = null;
 
@@ -112,12 +112,12 @@ function normalizePresets(raw: unknown): CcPreset[] {
 export async function loadPresets(): Promise<CcPreset[]> {
   if (cachedPresets) return cachedPresets;
   try {
-    const raw = await fs.readFile(PRESETS_PATH, 'utf8');
+    const raw = await fs.readFile(presetsPath(), 'utf8');
     cachedPresets = normalizePresets(JSON.parse(raw));
     return cachedPresets;
   } catch (err) {
     if ((err as NodeJS.ErrnoException)?.code !== 'ENOENT') {
-      logger.warn({ err, path: PRESETS_PATH }, 'Failed to load CC presets');
+      logger.warn({ err, path: presetsPath() }, 'Failed to load CC presets');
     }
     cachedPresets = [];
     return cachedPresets;
@@ -126,10 +126,10 @@ export async function loadPresets(): Promise<CcPreset[]> {
 
 export async function savePresets(presets: CcPreset[]): Promise<void> {
   const normalized = normalizePresets(presets);
-  await fs.mkdir(dirname(PRESETS_PATH), { recursive: true });
-  const tempPath = `${PRESETS_PATH}.${process.pid}.${Date.now()}.tmp`;
+  await fs.mkdir(dirname(presetsPath()), { recursive: true });
+  const tempPath = `${presetsPath()}.${process.pid}.${Date.now()}.tmp`;
   await fs.writeFile(tempPath, JSON.stringify(normalized, null, 2), 'utf8');
-  await fs.rename(tempPath, PRESETS_PATH);
+  await fs.rename(tempPath, presetsPath());
   cachedPresets = normalized;
 }
 
@@ -159,11 +159,15 @@ export function selectPresetModel(
   preset: Pick<CcPreset, 'availableModels' | 'defaultModel' | 'env'>,
   requestedModel?: string,
 ): string | undefined {
-  const availableModels = getPresetAvailableModelIds(preset);
-  const fallback = getPresetEffectiveModel(preset) ?? availableModels[0];
+  // Only a discovered catalogue is authoritative for membership. The helper
+  // also includes the preset's current default/env model, which made its list
+  // non-empty even when discovery had never run and accidentally rejected
+  // every deliberate model override as "not available".
+  const discoveredModels = (preset.availableModels ?? []).map((entry) => entry.id);
+  const fallback = getPresetEffectiveModel(preset) ?? discoveredModels[0];
   const requested = requestedModel?.trim();
   if (!requested) return fallback;
-  if (availableModels.length === 0 || availableModels.includes(requested)) return requested;
+  if (discoveredModels.length === 0 || discoveredModels.includes(requested)) return requested;
   return fallback;
 }
 
@@ -251,7 +255,7 @@ export async function getPresetTransportOverrides(
     configuredModel ? `Authoritative runtime model: ${configuredModel}.` : undefined,
     configuredModel ? `If the user asks which model you are using, answer exactly with "${configuredModel}".` : 'If the user asks which model or provider you are using, answer with the authoritative runtime facts above.',
     configuredBaseUrl ? `If the user asks which provider or endpoint you are using, mention "${configuredBaseUrl}".` : undefined,
-    'These runtime facts override any generic Claude Code tool schema, enum, or default.',
+    'These runtime facts only override generic model/provider identity. They never override Claude Code tool definitions, input schemas, required parameters, enums, or defaults. Follow every provided tool input schema exactly and never omit required fields.',
     'Do not answer with Sonnet, Opus, Haiku, or any inferred Claude default unless that exact value matches the authoritative runtime model above.',
   ].filter(Boolean).join(' ');
   return {
@@ -261,7 +265,7 @@ export async function getPresetTransportOverrides(
   };
 }
 
-export async function getQwenPresetTransportConfig(presetName: string): Promise<{
+export async function getQwenPresetTransportConfig(presetName: string, requestedModel?: string): Promise<{
   env: Record<string, string>;
   settings?: Record<string, unknown>;
   model?: string;
@@ -272,9 +276,9 @@ export async function getQwenPresetTransportConfig(presetName: string): Promise<
   const preset = await getPreset(presetName);
   if (!preset) return { env: {} };
 
-  const resolvedEnv = await resolvePresetEnv(presetName);
   const availableModels = getPresetAvailableModelIds(preset);
-  const model = getPresetEffectiveModel(preset) ?? availableModels[0];
+  const model = selectPresetModel(preset, requestedModel);
+  const resolvedEnv = await resolvePresetEnv(presetName, undefined, model);
   const baseUrl = resolvedEnv['ANTHROPIC_BASE_URL']?.trim() || undefined;
   const apiKey = resolvedEnv['ANTHROPIC_API_KEY']?.trim()
     || resolvedEnv['ANTHROPIC_AUTH_TOKEN']?.trim()

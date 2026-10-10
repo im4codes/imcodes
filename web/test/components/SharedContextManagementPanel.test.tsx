@@ -6,7 +6,7 @@ import { useState } from 'preact/hooks';
 import { act } from 'preact/test-utils';
 import { MEMORY_WS } from '@shared/memory-ws.js';
 import { MEMORY_FEATURE_FLAGS_BY_NAME } from '@shared/feature-flags.js';
-import { DEFAULT_CODEX_AUTOMATION_MODEL } from '../../../src/shared/models/options.js';
+import { DEFAULT_MEMORY_PRIMARY_CONTEXT_MODEL } from '@shared/shared-context-runtime-config.js';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('react-i18next', () => ({
@@ -76,6 +76,7 @@ vi.mock('../../src/api.js', () => ({
   deleteEnterpriseSharedMemory: (...args: unknown[]) => deleteEnterpriseSharedMemoryMock(...args),
 }));
 
+import { ApiError } from '../../src/api.js';
 import { SharedContextManagementPanel } from '../../src/components/SharedContextManagementPanel.js';
 
 async function flush() {
@@ -429,7 +430,7 @@ describe('SharedContextManagementPanel', () => {
     fireEvent.click(primaryBackend);
     fireEvent.click(backupBackend);
     await flush();
-    expect(screen.getAllByLabelText('model:qwen:qwen3-coder-plus').some((el) => el.getAttribute('aria-pressed') === 'true')).toBe(true);
+    expect((screen.getByLabelText('backup:model') as HTMLSelectElement).value).toBe('qwen3-coder-plus');
 
     await act(async () => {
       fireEvent.click(screen.getByText('sharedContext.management.processingSave'));
@@ -437,7 +438,7 @@ describe('SharedContextManagementPanel', () => {
 
     await waitFor(() => expect(updateSharedContextRuntimeConfigMock).toHaveBeenCalledWith('srv-1', {
       primaryContextBackend: 'codex-sdk',
-      primaryContextModel: DEFAULT_CODEX_AUTOMATION_MODEL,
+      primaryContextModel: DEFAULT_MEMORY_PRIMARY_CONTEXT_MODEL,
       primaryContextPreset: undefined,
       backupContextBackend: 'qwen',
       backupContextModel: 'qwen3-coder-plus',
@@ -451,8 +452,42 @@ describe('SharedContextManagementPanel', () => {
       },
       enablePersonalMemorySync: false,
     }));
-    expect(screen.getAllByLabelText('model:codex-sdk:gpt-5.4').some((el) => el.getAttribute('aria-pressed') === 'true')).toBe(true);
+    expect((screen.getByLabelText('primary:model') as HTMLSelectElement).value).toBe('gpt-5.4');
     expect(await screen.findByText('sharedContext.management.processingSavedPrimaryBackend')).toBeDefined();
+  });
+
+  it('pre-fills memory processing with the Codex Luna primary and Claude Haiku backup when unconfigured', async () => {
+    const snapshot = {
+      primaryContextBackend: 'codex-sdk',
+      primaryContextModel: 'gpt-6-luna',
+      primaryContextPreset: undefined,
+      backupContextBackend: 'claude-code-sdk',
+      backupContextModel: 'haiku',
+      backupContextPreset: undefined,
+      memoryRecallMinScore: 0.4,
+      memoryScoringWeights: { similarity: 0.4, recency: 0.25, frequency: 0.15, project: 0.2 },
+      enablePersonalMemorySync: false,
+    };
+    fetchSharedContextRuntimeConfigMock.mockResolvedValueOnce({
+      snapshot: {
+        persisted: snapshot,
+        effective: snapshot,
+        envPrimaryOverrideActive: false,
+        envBackupOverrideActive: false,
+        defaultPrimaryContextBackend: 'codex-sdk',
+        defaultPrimaryContextModel: 'gpt-6-luna',
+      },
+    });
+    render(<SharedContextManagementPanel serverId="srv-1" />);
+    await act(async () => {
+      fireEvent.click(screen.getByText('sharedContext.management.tabs.processing'));
+    });
+    await waitFor(() => expect(fetchSharedContextRuntimeConfigMock).toHaveBeenCalledWith('srv-1'));
+
+    expect(screen.getByLabelText('sharedContext.management.processingPrimaryBackend: codex-sdk')).toBeDefined();
+    expect((screen.getByLabelText('primary:model') as HTMLSelectElement).value).toBe('gpt-6-luna');
+    expect(screen.getByLabelText('sharedContext.management.processingBackupBackend: claude-code-sdk')).toBeDefined();
+    expect((screen.getByLabelText('backup:model') as HTMLSelectElement).value).toBe('haiku');
   });
 
   it('loads and saves the message recall threshold from memory settings', async () => {
@@ -476,8 +511,8 @@ describe('SharedContextManagementPanel', () => {
       primaryContextBackend: 'claude-code-sdk',
       primaryContextModel: 'sonnet',
       primaryContextPreset: undefined,
-      backupContextBackend: undefined,
-      backupContextModel: undefined,
+      backupContextBackend: 'claude-code-sdk',
+      backupContextModel: 'haiku',
       backupContextPreset: undefined,
       memoryRecallMinScore: 0.36,
       memoryScoringWeights: {
@@ -517,8 +552,8 @@ describe('SharedContextManagementPanel', () => {
       primaryContextBackend: 'claude-code-sdk',
       primaryContextModel: 'sonnet',
       primaryContextPreset: undefined,
-      backupContextBackend: undefined,
-      backupContextModel: undefined,
+      backupContextBackend: 'claude-code-sdk',
+      backupContextModel: 'haiku',
       backupContextPreset: undefined,
       memoryRecallMinScore: 0.4,
       memoryScoringWeights: {
@@ -553,17 +588,17 @@ describe('SharedContextManagementPanel', () => {
     });
 
     await waitFor(() => {
-      expect(screen.getAllByLabelText('model:claude-code-sdk:sonnet').some((el) => el.getAttribute('aria-pressed') === 'true')).toBe(true);
+      expect((screen.getByLabelText('primary:model') as HTMLSelectElement).value).toBe('sonnet');
     });
 
     await act(async () => {
       fireEvent.click(screen.getByLabelText('sharedContext.management.processingPrimaryBackend: qwen'));
     });
 
-    expect(screen.getAllByLabelText('model:qwen:qwen3-coder-plus').some((el) => el.getAttribute('aria-pressed') === 'true')).toBe(true);
+    expect((screen.getByLabelText('primary:model') as HTMLSelectElement).value).toBe('qwen3-coder-plus');
   });
 
-  it('defaults Codex-backed memory processing to Spark while keeping GPT-5.6 selectable', async () => {
+  it('defaults Codex-backed memory processing to gpt-6-luna while keeping GPT-5.6 selectable', async () => {
     render(<SharedContextManagementPanel serverId="srv-1" />);
     await flush();
 
@@ -571,17 +606,18 @@ describe('SharedContextManagementPanel', () => {
       fireEvent.click(screen.getByText('sharedContext.management.tabs.processing'));
     });
     await waitFor(() => {
-      expect(screen.getAllByLabelText('model:claude-code-sdk:sonnet').some((el) => el.getAttribute('aria-pressed') === 'true')).toBe(true);
+      expect((screen.getByLabelText('primary:model') as HTMLSelectElement).value).toBe('sonnet');
     });
     await act(async () => {
       fireEvent.click(screen.getByLabelText('sharedContext.management.processingPrimaryBackend: codex-sdk'));
     });
 
-    expect(await screen.findByLabelText('model:codex-sdk:gpt-5.6')).toBeDefined();
-    expect(screen.getByLabelText(`model:codex-sdk:${DEFAULT_CODEX_AUTOMATION_MODEL}`).getAttribute('aria-pressed')).toBe('true');
+    const primaryModel = await screen.findByLabelText('primary:model') as HTMLSelectElement;
+    expect(primaryModel.value).toBe(DEFAULT_MEMORY_PRIMARY_CONTEXT_MODEL);
+    expect([...primaryModel.options].some((option) => option.value === 'gpt-5.6')).toBe(true);
   });
 
-  it('allows selecting a backup model directly from backend-specific chips', async () => {
+  it('allows selecting a backup model from the backend-specific dropdown', async () => {
     render(<SharedContextManagementPanel serverId="srv-1" />);
     await flush();
 
@@ -592,12 +628,9 @@ describe('SharedContextManagementPanel', () => {
     await act(async () => {
       fireEvent.click(screen.getByLabelText('sharedContext.management.processingBackupBackend: qwen'));
     });
-    const qwenChip = await screen.findByLabelText('model:qwen:qwen3-coder-plus');
-    await act(async () => {
-      fireEvent.click(qwenChip);
-    });
-
-    expect(qwenChip.getAttribute('aria-pressed')).toBe('true');
+    const qwenModel = await screen.findByLabelText('backup:model') as HTMLSelectElement;
+    fireEvent.change(qwenModel, { target: { value: 'qwen3-coder-plus' } });
+    expect(qwenModel.value).toBe('qwen3-coder-plus');
   });
 
   it('preloads a backend-appropriate backup model as soon as the backup backend changes', async () => {
@@ -609,20 +642,21 @@ describe('SharedContextManagementPanel', () => {
     });
 
     await waitFor(() => {
-      expect(screen.getAllByLabelText('model:claude-code-sdk:sonnet').some((el) => el.getAttribute('aria-pressed') === 'false')).toBe(true);
+      expect((screen.getByLabelText('backup:model') as HTMLSelectElement).value).toBe('');
     });
 
     await act(async () => {
       fireEvent.click(screen.getByLabelText('sharedContext.management.processingBackupBackend: qwen'));
     });
 
-    expect(screen.getAllByLabelText('model:qwen:qwen3-coder-plus').some((el) => el.getAttribute('aria-pressed') === 'true')).toBe(true);
+    expect((screen.getByLabelText('backup:model') as HTMLSelectElement).value).toBe('qwen3-coder-plus');
   });
 
   it('loads qwen presets from ws and persists the selected preset with its derived model', async () => {
     const sent: Array<Record<string, unknown>> = [];
     const messageHandlers = new Set<(message: unknown) => void>();
     const ws = {
+      connected: true,
       send(message: Record<string, unknown>) {
         sent.push(message);
       },
@@ -660,18 +694,43 @@ describe('SharedContextManagementPanel', () => {
       fireEvent.click(screen.getByLabelText('sharedContext.management.processingPrimaryBackend: qwen'));
     });
 
-    // Preset chip — the old `<select>` was replaced with a chip button labeled
-    // `{idPrefix}:preset:{name}` so the selector is discoverable and testable
-    // without needing combo-box semantics.
-    const presetChip = await screen.findByLabelText('primary:preset:Qwen Team');
-    await act(async () => {
-      fireEvent.click(presetChip);
+    const presetSelect = await screen.findByLabelText('primary:preset') as HTMLSelectElement;
+    fireEvent.input(presetSelect, { target: { value: 'Qwen Team' } });
+    await waitFor(() => {
+      expect((screen.getByLabelText('primary:preset') as HTMLSelectElement).value).toBe('Qwen Team');
+      expect((screen.getByLabelText('primary:model') as HTMLSelectElement).value).toBe('qwen-team-model');
     });
 
-    // Clicking the preset chip should mark it active AND mirror the preset's
-    // ANTHROPIC_MODEL onto the built-in model highlight so the saved payload
-    // carries the correct model identifier.
-    expect(presetChip.getAttribute('aria-pressed')).toBe('true');
+    const modelRequest = await waitFor(() => {
+      const request = sent.find((message) => (
+        message.type === 'transport.list_models'
+        && message.agentType === 'qwen'
+        && message.ccPreset === 'Qwen Team'
+      ));
+      expect(request).toBeDefined();
+      return request!;
+    });
+    await act(async () => {
+      for (const handler of messageHandlers) {
+        handler({
+          type: 'transport.models_response',
+          requestId: modelRequest.requestId,
+          agentType: 'qwen',
+          ccPreset: 'Qwen Team',
+          models: [
+            { id: 'qwen-team-model' },
+            { id: 'qwen-team-model-v2' },
+          ],
+          defaultModel: 'qwen-team-model',
+        });
+      }
+    });
+    const primaryModel = screen.getByLabelText('primary:model') as HTMLSelectElement;
+    await waitFor(() => {
+      expect([...primaryModel.options].some((option) => option.value === 'qwen-team-model-v2')).toBe(true);
+    });
+    fireEvent.input(primaryModel, { target: { value: 'qwen-team-model-v2' } });
+    expect((screen.getByLabelText('primary:preset') as HTMLSelectElement).value).toBe('Qwen Team');
 
     await act(async () => {
       fireEvent.click(screen.getByText('sharedContext.management.processingSave'));
@@ -679,10 +738,10 @@ describe('SharedContextManagementPanel', () => {
 
     await waitFor(() => expect(updateSharedContextRuntimeConfigMock).toHaveBeenCalledWith('srv-1', {
       primaryContextBackend: 'qwen',
-      primaryContextModel: 'qwen-team-model',
+      primaryContextModel: 'qwen-team-model-v2',
       primaryContextPreset: 'Qwen Team',
-      backupContextBackend: undefined,
-      backupContextModel: undefined,
+      backupContextBackend: 'claude-code-sdk',
+      backupContextModel: 'haiku',
       backupContextPreset: undefined,
       memoryRecallMinScore: 0.4,
       memoryScoringWeights: {
@@ -988,6 +1047,111 @@ describe('SharedContextManagementPanel', () => {
       fireEvent.click(screen.getByText('sharedContext.management.memoryToolTabPreferences'));
     });
     expect((await screen.findAllByText('sharedContext.management.memoryToolDisabledNoDaemon')).length).toBeGreaterThan(0);
+  });
+
+  describe('a failed load names the request and its cause instead of a bare "API 404: not_found"', () => {
+    const notFound = () => new ApiError(404, 'not_found');
+    const makeWs = () => {
+      const sent: Array<Record<string, unknown>> = [];
+      return {
+        sent,
+        ws: {
+          send(message: Record<string, unknown>) { sent.push(message); },
+          onMessage() { return () => undefined; },
+        },
+      };
+    };
+
+    it('the memory tab keeps every section that loaded when the others answer 404 (older server / server the account does not own / left enterprise)', async () => {
+      fetchSharedContextRuntimeConfigMock.mockRejectedValue(notFound());
+      getEnterpriseSharedMemoryMock.mockRejectedValue(notFound());
+      const { ws, sent } = makeWs();
+      render(<SharedContextManagementPanel serverId="srv-1" ws={ws as never} />);
+      await flush();
+      await act(async () => { fireEvent.click(screen.getByText('sharedContext.management.tabs.memory')); });
+
+      // Each failed request is its own line, in the cause's words, never the raw code.
+      await waitFor(() => {
+        const sections = [...document.querySelectorAll('[data-load-error]')].map((node) => node.getAttribute('data-load-error')).sort();
+        expect(sections).toEqual(['enterpriseMemory', 'runtimeConfig']);
+      });
+      expect(screen.getAllByText('sharedContext.management.loadError.not_found')).toHaveLength(2);
+      expect(document.body.textContent).not.toContain('API 404');
+      // The requests that did not fail still ran and rendered: the local query was sent
+      // and the personal cloud memory (called BEFORE the failing enterprise one) is on screen.
+      expect(sent.some((message) => message.type === MEMORY_WS.PERSONAL_QUERY)).toBe(true);
+      expect(getPersonalCloudMemoryMock).toHaveBeenCalled();
+      expect(document.querySelector('[data-load-error="cloudMemory"]')).toBeNull();
+    });
+
+    it('a failing personal cloud request does not stop the enterprise memory from loading', async () => {
+      getPersonalCloudMemoryMock.mockRejectedValue(notFound());
+      const { ws } = makeWs();
+      render(<SharedContextManagementPanel serverId="srv-1" ws={ws as never} />);
+      await flush();
+      await act(async () => { fireEvent.click(screen.getByText('sharedContext.management.tabs.memory')); });
+      await waitFor(() => expect(getEnterpriseSharedMemoryMock).toHaveBeenCalledWith('team-1', expect.any(Object)));
+      await waitFor(() => expect(document.querySelector('[data-load-error="cloudMemory"]')).not.toBeNull());
+      expect(document.querySelector('[data-load-error="enterpriseMemory"]')).toBeNull();
+    });
+
+    it('a load error is shown only on the tabs that display what failed', async () => {
+      fetchSharedContextRuntimeConfigMock.mockRejectedValue(notFound());
+      const { ws } = makeWs();
+      render(<SharedContextManagementPanel serverId="srv-1" ws={ws as never} />);
+      await flush();
+      await act(async () => { fireEvent.click(screen.getByText('sharedContext.management.tabs.processing')); });
+      await waitFor(() => expect(document.querySelector('[data-load-error="runtimeConfig"]')).not.toBeNull());
+      await act(async () => { fireEvent.click(screen.getByText('sharedContext.management.tabs.enterprise')); });
+      expect(document.querySelector('[data-load-error]')).toBeNull();
+    });
+
+    it('a remembered enterprise the account no longer belongs to is replaced, not queried (it can only answer 404)', async () => {
+      getTeamMock.mockImplementation(async (id: string) => {
+        if (id === 'gone-team') throw notFound();
+        return { id, name: 'Acme', myRole: 'owner', members: [] };
+      });
+      const { ws } = makeWs();
+      render(<SharedContextManagementPanel enterpriseId="gone-team" serverId="srv-1" ws={ws as never} />);
+      await flush();
+      await flush();
+      await act(async () => { fireEvent.click(screen.getByText('sharedContext.management.tabs.memory')); });
+      await waitFor(() => expect(getEnterpriseSharedMemoryMock).toHaveBeenCalledWith('team-1', expect.any(Object)));
+      expect(getEnterpriseSharedMemoryMock.mock.calls.some((call) => call[0] === 'gone-team')).toBe(false);
+      await act(async () => { fireEvent.click(screen.getByText('sharedContext.management.tabs.enterprise')); });
+      await waitFor(() => expect(getTeamMock).toHaveBeenCalledWith('team-1'));
+      expect(document.querySelector('[data-load-error]')).toBeNull();
+    });
+  });
+
+  it('shows local memory as unavailable instead of rendering zero counts', async () => {
+    const sent: Array<Record<string, unknown>> = [];
+    const handlers = new Set<(message: unknown) => void>();
+    const ws = {
+      send(message: Record<string, unknown>) { sent.push(message); },
+      onMessage(handler: (message: unknown) => void) { handlers.add(handler); return () => handlers.delete(handler); },
+    };
+    render(<SharedContextManagementPanel serverId="srv-1" ws={ws as never} />);
+    await flush();
+    await act(async () => { fireEvent.click(screen.getByText('sharedContext.management.tabs.memory')); });
+    const query = [...sent].reverse().find((message) => message.type === MEMORY_WS.PERSONAL_QUERY);
+    expect(query).toBeDefined();
+    await act(async () => {
+      for (const handler of handlers) handler({
+        type: MEMORY_WS.PERSONAL_RESPONSE,
+        requestId: query?.requestId,
+        stats: {
+          totalRecords: 0, matchedRecords: 0, recentSummaryCount: 0,
+          durableCandidateCount: 0, projectCount: 0, stagedEventCount: 0,
+          dirtyTargetCount: 0, pendingJobCount: 0, localUnavailable: true,
+        },
+        records: [], pendingRecords: [], projects: [],
+      });
+    });
+    expect(await screen.findByText('sharedContext.management.memoryLocalStatusUnavailable')).toBeDefined();
+    const processedTab = screen.getByText('sharedContext.management.memoryTabLocalProcessed').closest('button');
+    expect(processedTab?.querySelector('span')).toBeNull();
+    expect(screen.queryByText('sharedContext.management.memoryProcessedEmptyPending')).toBeNull();
   });
 
   it('surfaces manual memory save validation instead of silently ignoring clicks', async () => {

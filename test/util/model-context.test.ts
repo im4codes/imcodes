@@ -42,6 +42,17 @@ describe('model context inference', () => {
     expect(inferContextWindow('claude-mythos-5')).toBe(1_000_000);
   });
 
+  it('maps the haiku alias and Haiku 5 ids to 1M context, and keeps Haiku 4 / Claude 3 at 200k', () => {
+    // `haiku` resolves to Haiku 5.5 from Agent SDK 0.3.293; the bundled binary reports contextWindow 1_000_000 for it
+    // (0.3.291 reported 200_000 for claude-haiku-4-5-20251001).
+    expect(inferContextWindow('haiku')).toBe(1_000_000);
+    expect(inferContextWindow('claude-haiku-5-5')).toBe(1_000_000);
+    expect(inferContextWindow('claude-haiku-5')).toBe(1_000_000);
+    expect(inferContextWindow('claude-haiku-4-5-20251001')).toBe(200_000);
+    expect(inferContextWindow('claude-haiku-4-5')).toBe(200_000);
+    expect(inferContextWindow('claude-3-haiku-20240307')).toBe(200_000);
+  });
+
   it('maps claude opus family to 1M context', () => {
     expect(inferContextWindow('opus[1M]')).toBe(1_000_000);
     expect(inferContextWindow('claude-opus-4-1')).toBe(1_000_000);

@@ -9,6 +9,11 @@ import {
   copilotSdkRuntimeHooks,
 } from '../../src/agent/providers/copilot-sdk.js';
 import type { MessageDelta } from '../../shared/agent-message.js';
+import {
+  AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES,
+  AGENT_DELEGATION_NOTIFICATION_RESULTS,
+} from '../../shared/agent-delegation.js';
+import { PROVIDER_ACTIVE_TURN_DELIVERY_KINDS } from '../../src/agent/transport-provider.js';
 
 const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
 
@@ -64,6 +69,42 @@ describe('CopilotSdkProvider streaming accumulator', () => {
     copilotSdkRuntimeHooks.loadSdk = originalLoadSdk;
   });
 
+  it('confirms Stop only after the captured SDK session idle, not abort ACK', async () => {
+    const fake = makeFakeSdk();
+    copilotSdkRuntimeHooks.loadSdk = vi.fn().mockResolvedValue(fake.sdk);
+    const provider = new CopilotSdkProvider();
+    await provider.connect({ binaryPath: 'copilot' });
+    await provider.createSession({ sessionKey: 'route-stop-proof', cwd: '/tmp/project' });
+    await provider.send('route-stop-proof', 'foreground');
+    let settled = false;
+    const stopping = provider.cancelAndWait('route-stop-proof').then(() => { settled = true; });
+    await flush();
+    expect(settled).toBe(false);
+    fake.captured.handler!({ type: 'assistant.message', data: { content: 'not terminal' } });
+    await flush();
+    expect(settled).toBe(false);
+    fake.captured.handler!({ type: 'session.idle', data: {} });
+    await stopping;
+    expect(settled).toBe(true);
+    await provider.disconnect();
+  });
+
+  it('does not confirm an old Stop with the next run idle on the same SDK session', async () => {
+    const fake = makeFakeSdk();
+    copilotSdkRuntimeHooks.loadSdk = vi.fn().mockResolvedValue(fake.sdk);
+    const provider = new CopilotSdkProvider();
+    await provider.connect({ binaryPath: 'copilot' });
+    await provider.createSession({ sessionKey: 'route-stop-next-run', cwd: process.cwd() });
+    await provider.send('route-stop-next-run', 'old foreground');
+    const stopping = provider.cancelAndWait('route-stop-next-run');
+    const rejected = expect(stopping).rejects.toThrow('instance changed');
+    await flush();
+    await provider.send('route-stop-next-run', 'independent new foreground');
+    fake.captured.handler!({ type: 'session.idle', data: {} });
+    await rejected;
+    await provider.disconnect();
+  });
+
   it('resets the streaming accumulator across messages so a second message is not prefixed with the first', async () => {
     const fake = makeFakeSdk();
     copilotSdkRuntimeHooks.loadSdk = vi.fn().mockResolvedValue(fake.sdk);
@@ -107,5 +148,114 @@ describe('CopilotSdkProvider streaming accumulator', () => {
 
     // Guard: no emitted delta should ever contain both messages concatenated.
     expect(captured.every((d) => !d.text.includes('Let me check.The answer'))).toBe(true);
+  });
+
+  it('uses Copilot immediate mode for active-turn append and deduplicates a stable notification id', async () => {
+    const fake = makeFakeSdk();
+    copilotSdkRuntimeHooks.loadSdk = vi.fn().mockResolvedValue(fake.sdk);
+    const provider = new CopilotSdkProvider();
+    await provider.connect({ binaryPath: 'copilot' });
+    await provider.createSession({ sessionKey: 'route-copilot', cwd: '/tmp/project' });
+
+    expect(provider.capabilities.activeDelegationNotification)
+      .toBe(AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE);
+    await provider.send('route-copilot', 'foreground');
+    const notification = {
+      notificationId: 'append-stable-id',
+      delegationId: 'composer-append',
+      sourceSessionName: 'route-copilot',
+      text: 'follow up now',
+      deliveryKind: PROVIDER_ACTIVE_TURN_DELIVERY_KINDS.MCP_MESSAGE,
+    } as const;
+
+    await expect(provider.notifyActiveDelegation('route-copilot', notification))
+      .resolves.toBe(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+    await expect(provider.notifyActiveDelegation('route-copilot', notification))
+      .resolves.toBe(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+
+    expect(fake.session.send).toHaveBeenCalledTimes(2);
+    expect(fake.session.send).toHaveBeenNthCalledWith(1, {
+      prompt: 'foreground',
+      mode: 'immediate',
+    });
+    expect(fake.session.send).toHaveBeenNthCalledWith(2, {
+      prompt: 'follow up now',
+      mode: 'immediate',
+    });
+  });
+
+  it('returns stale without injecting when the active turn idles before its initial input is accepted', async () => {
+    const fake = makeFakeSdk();
+    let acceptInitial!: () => void;
+    fake.session.send.mockImplementationOnce(() => new Promise<void>((resolve) => {
+      acceptInitial = resolve;
+    }));
+    copilotSdkRuntimeHooks.loadSdk = vi.fn().mockResolvedValue(fake.sdk);
+    const provider = new CopilotSdkProvider();
+    await provider.connect({ binaryPath: 'copilot' });
+    await provider.createSession({ sessionKey: 'route-copilot', cwd: '/tmp/project' });
+
+    const initialSend = provider.send('route-copilot', 'foreground');
+    await vi.waitFor(() => expect(fake.session.send).toHaveBeenCalledTimes(1));
+    const admission = provider.notifyActiveDelegation('route-copilot', {
+      notificationId: 'append-raced-idle',
+      delegationId: 'composer-append',
+      sourceSessionName: 'route-copilot',
+      text: 'must not start another turn',
+    });
+    fake.captured.handler?.({ type: 'session.idle', data: {} });
+
+    await expect(admission).resolves.toBe(AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE);
+    acceptInitial();
+    await initialSend;
+    expect(fake.session.send).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps a successful immediate admission delivered when Copilot idles around its ACK', async () => {
+    const fake = makeFakeSdk();
+    copilotSdkRuntimeHooks.loadSdk = vi.fn().mockResolvedValue(fake.sdk);
+    const provider = new CopilotSdkProvider();
+    await provider.connect({ binaryPath: 'copilot' });
+    await provider.createSession({ sessionKey: 'route-copilot', cwd: '/tmp/project' });
+    await provider.send('route-copilot', 'foreground');
+    let acceptAppend!: () => void;
+    fake.session.send.mockImplementationOnce(() => new Promise<void>((resolve) => {
+      acceptAppend = resolve;
+    }));
+
+    const admission = provider.notifyActiveDelegation('route-copilot', {
+      notificationId: 'append-raced-response',
+      delegationId: 'composer-append',
+      sourceSessionName: 'route-copilot',
+      text: 'live follow-up',
+    });
+    await vi.waitFor(() => expect(fake.session.send).toHaveBeenCalledTimes(2));
+    fake.captured.handler?.({ type: 'session.idle', data: {} });
+    acceptAppend();
+
+    await expect(admission).resolves.toBe(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+    expect(fake.session.send).toHaveBeenCalledTimes(2);
+  });
+
+  it('propagates a live immediate-admission error and permits an exact-id retry', async () => {
+    const fake = makeFakeSdk();
+    copilotSdkRuntimeHooks.loadSdk = vi.fn().mockResolvedValue(fake.sdk);
+    const provider = new CopilotSdkProvider();
+    await provider.connect({ binaryPath: 'copilot' });
+    await provider.createSession({ sessionKey: 'route-copilot', cwd: '/tmp/project' });
+    await provider.send('route-copilot', 'foreground');
+    fake.session.send.mockRejectedValueOnce(new Error('immediate admission failed'));
+    const notification = {
+      notificationId: 'append-retry-id',
+      delegationId: 'composer-append',
+      sourceSessionName: 'route-copilot',
+      text: 'retry me',
+    };
+
+    await expect(provider.notifyActiveDelegation('route-copilot', notification))
+      .rejects.toThrow('immediate admission failed');
+    await expect(provider.notifyActiveDelegation('route-copilot', notification))
+      .resolves.toBe(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+    expect(fake.session.send).toHaveBeenCalledTimes(3);
   });
 });

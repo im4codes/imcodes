@@ -1,3 +1,4 @@
+import { readQueueDeliveryPolicy } from './session-send-delivery.js';
 import type {
   QueueAttachmentProjection,
   QueueProjectionEntry,
@@ -47,6 +48,7 @@ export function buildQueueAttachmentProjection(value: unknown): QueueAttachmentP
 
 export function buildQueueProjectionEntry(entry: QueueStoredEntry): QueueProjectionEntry {
   return {
+    ...readQueueDeliveryPolicy(entry),
     clientMessageId: entry.clientMessageId,
     text: entry.text,
     status: entry.status,
@@ -58,8 +60,10 @@ export function buildQueueProjectionEntry(entry: QueueStoredEntry): QueueProject
     ...(entry.activityGeneration !== undefined ? { activityGeneration: entry.activityGeneration } : {}),
     ...(entry.replacesClientMessageId ? { replacesClientMessageId: entry.replacesClientMessageId } : {}),
     ...(entry.failureReason ? { failureReason: entry.failureReason } : {}),
+    ...(entry.dropReason ? { dropReason: entry.dropReason } : {}),
     ...(entry.attachments?.length ? { attachments: entry.attachments.map(buildQueueAttachmentProjection).filter((item): item is QueueAttachmentProjection => !!item) } : {}),
     ...(entry.sharedActor ? { sharedActor: buildQueueSharedActorProjection(entry.sharedActor) } : {}),
+    ...(entry.supervisionReference ? { supervisionReference: entry.supervisionReference } : {}),
   };
 }
 
@@ -78,6 +82,7 @@ export function containsProhibitedQueueProjectionField(value: unknown): boolean 
     'rawSessionHistory',
     'rawSharedActorEnvelope',
     'sharedActorEnvelope',
+    'sharedMachineAuthority',
     'fullChildTranscript',
     'timelineCommitted',
     'historyCommitted',

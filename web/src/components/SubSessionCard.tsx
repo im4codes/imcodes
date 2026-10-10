@@ -4,6 +4,8 @@
  * Right-edge drag handle lets user resize width independently per card.
  */
 import { useRef, useState, useCallback, useMemo, useEffect } from 'preact/hooks';
+import { memo } from 'preact/compat';
+import { useCoalescedFrame } from '../hooks/useCoalescedFrame.js';
 import type { JSX } from 'preact';
 import { useTranslation } from 'react-i18next';
 import { resizeHandleHoverEvents } from './window-resize.js';
@@ -11,13 +13,15 @@ import { ChatView } from './ChatView.js';
 import { resolveContextWindow } from '../model-context.js';
 import { bestModelLabel } from '../model-label.js';
 import { TerminalView } from './TerminalView.js';
+import { TerminalTextPreview } from './TerminalTextPreview.js';
 import { requestActiveTimelineRefreshAfterUserAction, useTimeline } from '../hooks/useTimeline.js';
 import { cancelSessionViaHttp } from '../api.js';
+import { notifyShareCancelFailure, shareCancelFailureFromHttpError, trackShareCancelCommand } from '../share-cancel-feedback.js';
 import type { WsClient } from '../ws-client.js';
 import type { TerminalDiff } from '../types.js';
 import type { SubSession } from '../hooks/useSubSessions.js';
 import { getActiveThinkingTs, isVisuallyBusy } from '../thinking-utils.js';
-import { SessionControls } from './SessionControls.js';
+import { StableSessionControls as SessionControls } from './StableSessionControls.js';
 import type { SessionInfo } from '../types.js';
 import { IdleFlashLayer } from './IdleFlashLayer.js';
 import { useIdleFlashPlayback } from '../hooks/useIdleFlashPlayback.js';
@@ -35,6 +39,10 @@ import { buildAliasSendExtra } from '../util/alias-send.js';
 import { parseAliasMarkers } from '@shared/alias-types.js';
 import { useMachines } from '../hooks/useMachines.js';
 import { buildMachineSendExtra } from '../util/machine-send.js';
+import { CODEBUDDY_PROVIDER_IDS } from '@shared/codebuddy.js';
+import { HERMES_AGENT_PROVIDER_ID } from '@shared/hermes-agent.js';
+import { AGY_SDK_PROVIDER_ID } from '@shared/agy-agent.js';
+import { recordPerfRender } from '../perf-render-debug.js';
 
 const TYPE_ICON: Record<string, string> = {
   'claude-code': '⚡',
@@ -51,8 +59,12 @@ const TYPE_ICON: Record<string, string> = {
   'gemini-sdk': '♊',
   'grok-sdk': '𝕏',
   'kimi-sdk': '月',
+  [HERMES_AGENT_PROVIDER_ID]: 'H',
+  [AGY_SDK_PROVIDER_ID]: 'A',
   'deepseek-harness': '🐳',
   pi: 'π',
+  [CODEBUDDY_PROVIDER_IDS.CHINA]: '云',
+  [CODEBUDDY_PROVIDER_IDS.INTERNATIONAL]: 'CB',
   'shell': '🐚',
   'script': '🔄',
 };
@@ -76,7 +88,7 @@ interface Props {
   onOpen: () => void;
   onClose?: () => void;
   onRestart?: () => void;
-  onDiff: (sessionName: string, apply: (d: TerminalDiff) => void) => void;
+  onDiff: (sessionName: string, apply: (d: TerminalDiff) => void) => void | (() => void);
   onHistory: (sessionName: string, apply: (c: string) => void) => void;
   cardW?: number;
   cardH?: number;
@@ -126,13 +138,16 @@ function buildCompactSessionInfo(sub: SubSession): SessionInfo {
     quotaMeta: sub.quotaMeta ?? undefined,
     effort: sub.effort ?? undefined,
     transportConfig: sub.transportConfig ?? undefined,
+    supervisionMode: sub.supervisionMode ?? undefined,
+    supervisionHeartbeat: sub.supervisionHeartbeat ?? undefined,
     transportPendingMessages: sub.transportPendingMessages ?? undefined,
     transportPendingMessageEntries: sub.transportPendingMessageEntries ?? undefined,
     transportPendingMessageVersion: sub.transportPendingMessageVersion ?? undefined,
   };
 }
 
-export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlashToken, onOpen, onClose, onRestart, onDiff, onHistory, cardW = 350, cardH = 250, quickData, sessions, subSessions, serverId, onTransportConfigSaved, inP2p, sharedState, accentColor = DEFAULT_SUBSESSION_ACCENT_COLOR, previewHydrateDelayMs = 160 }: Props) {
+function SubSessionCardImpl({ sub, ws, connected, isOpen, isFocused, idleFlashToken, onOpen, onClose, onRestart, onDiff, onHistory, cardW = 350, cardH = 250, quickData, sessions, subSessions, serverId, onTransportConfigSaved, inP2p, sharedState, accentColor = DEFAULT_SUBSESSION_ACCENT_COLOR, previewHydrateDelayMs = 160 }: Props) {
+  recordPerfRender('SubSessionCard');
   const { t } = useTranslation();
   // Shared alias data so the compact card's plain-text composer resolves
   // `;;(name)` markers the same way the main SessionControls composer does
@@ -143,7 +158,7 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
   // out-of-band `resolvedMachines` hint the same way SessionControls does. No
   // fail-closed gate (unlike aliases): an unresolved marker stays literal.
   const { machines: machineAll } = useMachines();
-  const activeIdleFlashToken = useIdleFlashPlayback(idleFlashToken);
+  const activeIdleFlashToken = useIdleFlashPlayback(idleFlashToken, isOpen || isFocused);
   const isShell = sub.type === 'shell' || sub.type === 'script';
   const [timelineHydrated, setTimelineHydrated] = useState(() => isOpen || isFocused === true);
   useEffect(() => {
@@ -161,20 +176,27 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
   // (message goes straight to the timeline with a spinner, reconciled by the
   // daemon echo).
   const timeline = isShell
-    ? { events: [], refreshing: false, addOptimisticUserMessage: undefined, retryOptimisticMessage: undefined }
+    ? { events: [], refreshing: false, addOptimisticUserMessage: undefined, removeOptimisticMessage: undefined, retryOptimisticMessage: undefined }
     : useTimeline(sub.sessionName, ws, serverId, {
-      // Open cards are active timeline consumers even when not focused. Keeping
-      // only the focused card active let open sub-session previews miss history
-      // retry/replay until the user clicked or switched windows.
-      isActiveSession: !!(isOpen || isFocused),
+      // Only the focused card owns opportunistic recovery. Open-but-unfocused
+      // cards remain visible/subscribed below, and catch up when focused,
+      // without multiplying resume work by the number of open cards.
+      // When the corresponding floating window is open it is the sole active
+      // presentation. The bar card remains a passive preview; otherwise the
+      // same session owns two hook-local recovery timers and can issue the
+      // same resume fetch twice before either request records its cooldown.
+      isActiveSession: !!isFocused && !isOpen,
       // Keep the live timeline hook attached even while preview hydration is
       // delayed. Without this, sub-session cards miss the typewriter phase and
       // only jump to cached/final text when the timer flips `timelineHydrated`.
       isVisible: timelineHydrated || isOpen || !!isFocused,
+      // Cards are collapsed previews; a promoted/open window owns the full stream.
+      subscriptionMode: 'summary',
     });
   const { events, refreshing } = timeline;
   const addOptimisticUserMessage = 'addOptimisticUserMessage' in timeline ? timeline.addOptimisticUserMessage : undefined;
   const markOptimisticFailed = 'markOptimisticFailed' in timeline ? timeline.markOptimisticFailed : undefined;
+  const removeOptimisticMessage = 'removeOptimisticMessage' in timeline ? timeline.removeOptimisticMessage : undefined;
   const retryOptimisticMessage = 'retryOptimisticMessage' in timeline ? timeline.retryOptimisticMessage : undefined;
   const forceRefresh = 'forceRefresh' in timeline ? timeline.forceRefresh : undefined;
   const termScrollRef = useRef<(() => void) | null>(null);
@@ -242,6 +264,7 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
     sharedState,
   }), [sharedState, sub]);
 
+  const scheduleFollowFrame = useCoalescedFrame();
   const forceFollowLatest = useCallback(() => {
     if (isShell) termScrollRef.current?.();
     else chatScrollRef.current?.();
@@ -284,8 +307,8 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
       addOptimisticUserMessage?.(text, commandId);
     }
     cardInputRef.current!.value = '';
-    requestAnimationFrame(() => { forceFollowLatest(); });
-  }, [addOptimisticUserMessage, aliasAll, aliasError, aliasLoaded, machineAll, ws, connected, sub.sessionName, forceFollowLatest]);
+    scheduleFollowFrame(() => { forceFollowLatest(); });
+  }, [addOptimisticUserMessage, aliasAll, aliasError, aliasLoaded, machineAll, ws, connected, sub.sessionName, forceFollowLatest, scheduleFollowFrame]);
 
   const handleTransportStop = useCallback(() => {
     // Stop is highest-priority — must fire even when the WS is briefly in
@@ -301,6 +324,7 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
       commandId: globalThis.crypto?.randomUUID?.() ?? `cancel-${Date.now()}-${Math.random().toString(16).slice(2)}`,
       ...(sharedState?.activeDispatchId ? { observedDispatchId: sharedState.activeDispatchId } : {}),
     };
+    trackShareCancelCommand(payload.commandId);
     let wsThrown: unknown = null;
     if (ws) {
       try {
@@ -313,6 +337,8 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
     }
     if (serverId) {
       void cancelSessionViaHttp(serverId, payload).catch((httpErr) => {
+        const refusal = shareCancelFailureFromHttpError(httpErr);
+        if (refusal) notifyShareCancelFailure({ ...refusal, session: sub.sessionName });
         // eslint-disable-next-line no-console
         console.warn('handleTransportStop: WS + HTTP both failed', { wsThrown, httpErr });
       });
@@ -325,6 +351,21 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
   }, [ws, sub.sessionName, sub.state, serverId, sharedState?.activeDispatchId]);
 
   const busy = useMemo(() => isVisuallyBusy(sub.state, !!getActiveThinkingTs(events)), [events, sub.state]);
+  // Summary cards receive frequent session.state/agent.status frames. Those
+  // frames do not change the rendered transcript, so they must not trigger a
+  // layout read/write scroll pass for every open card. Follow only when the
+  // chronological tail is actual chat/terminal content.
+  const latestContentToken = (() => {
+    const event = events[events.length - 1];
+    if (!event || !(
+      event.type === 'assistant.text'
+      || event.type === 'tool.call'
+      || event.type === 'tool.result'
+      || event.type === 'user.message'
+    )) return '';
+    const text = typeof event.payload.text === 'string' ? event.payload.text : '';
+    return event.eventId + ':' + event.seq + ':' + text;
+  })();
   // Preview cards always follow the latest content.
   useEffect(() => {
     const el = previewRef.current;
@@ -337,9 +378,13 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
     handleScroll();
     return () => el.removeEventListener('scroll', handleScroll);
   }, []);
+  // Coalesced: a raw rAF here queued one uncancelled callback per timeline
+  // update. With the display asleep nothing drains that queue, so a long
+  // lock plus several open cards built a backlog the browser then ran in a
+  // single post-unlock frame. See useCoalescedFrame for the full rationale.
   useEffect(() => {
-    requestAnimationFrame(() => { forceFollowLatest(); });
-  }, [events, sub.state, forceFollowLatest]);
+    scheduleFollowFrame(() => { forceFollowLatest(); });
+  }, [latestContentToken, sub.state, forceFollowLatest, scheduleFollowFrame]);
   const scrollToBottom = useCallback(() => {
     forceFollowLatest();
   }, [forceFollowLatest]);
@@ -443,7 +488,7 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
       {/* Preview — scrollable, auto-scrolls to bottom on new content */}
       <div style={{ position: 'relative', flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
         <div class={`subcard-preview${isShell ? ' subcard-preview-terminal' : ''}`} ref={previewRef}>
-          {isShell ? (
+          {isShell && (isOpen || isFocused) ? (
             <TerminalView
               sessionName={sub.sessionName}
               ws={ws}
@@ -454,8 +499,18 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
               onHistory={(apply) => onHistory(sub.sessionName, apply)}
               onScrollBottomFn={(fn) => { termScrollRef.current = fn; }}
             />
+          ) : isShell ? (
+            <TerminalTextPreview
+              sessionName={sub.sessionName}
+              ws={ws}
+              connected={connected}
+              onDiff={(apply) => onDiff(sub.sessionName, apply)}
+              onHistory={(apply) => onHistory(sub.sessionName, apply)}
+              onScrollBottomFn={(fn) => { termScrollRef.current = fn; }}
+            />
           ) : (
             <ChatView
+              visible={isOpen || isFocused}
               events={events}
               loading={false}
               refreshing={refreshing}
@@ -463,6 +518,7 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
               onForceSync={forceRefresh}
               onScrollBottomFn={setChatScrollFn}
               preview
+              scopeTaskPairs
               agentType={sub.type}
               onResendFailed={handleResendFailed}
             />
@@ -532,12 +588,14 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
                   addOptimisticUserMessage?.(text, meta?.commandId, {
                     ...(meta?.attachments ? { attachments: meta.attachments } : {}),
                     ...(meta?.extra ? { resendExtra: meta.extra } : {}),
+                    ...(meta?.queueAppend ? { queueAppend: true } : {}),
                   });
                   if (meta?.commandId && meta.localFailure) {
                     markOptimisticFailed?.(meta.commandId, meta.localFailure);
                   }
                   scrollToBottom();
                 }}
+                onRemoveOptimisticMessage={removeOptimisticMessage}
               />
             ) : (
               <input
@@ -570,3 +628,51 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
     </div>
   );
 }
+
+/**
+ * The parent session list is rebuilt for every daemon status/state frame. Its
+ * records are immutable in practice, but older daemons still send a fresh
+ * object for every row even when the card-visible fields did not change. Keep
+ * those transport updates from re-rendering every preview card. The timeline
+ * hook remains authoritative for content updates inside the card, while this
+ * comparator only filters parent prop churn.
+ */
+function sameCardSession(a: SubSession, b: SubSession): boolean {
+  return a.sessionName === b.sessionName
+    && a.id === b.id
+    && a.type === b.type
+    && a.state === b.state
+    && a.label === b.label
+    && a.cwd === b.cwd
+    && a.runtimeType === b.runtimeType
+    && a.providerId === b.providerId
+    && a.providerSessionId === b.providerSessionId
+    && a.sessionInstanceId === b.sessionInstanceId
+    && a.runtimeEpoch === b.runtimeEpoch
+    && a.requestedModel === b.requestedModel
+    && a.activeModel === b.activeModel
+    && a.modelDisplay === b.modelDisplay
+    && a.planLabel === b.planLabel
+    && a.quotaLabel === b.quotaLabel
+    && a.quotaUsageLabel === b.quotaUsageLabel
+    && a.effort === b.effort
+    && a.supervisionMode === b.supervisionMode
+    && a.transportPendingMessageVersion === b.transportPendingMessageVersion;
+}
+
+export const SubSessionCard = memo(SubSessionCardImpl, (prev, next) => (
+  sameCardSession(prev.sub, next.sub)
+  && prev.ws === next.ws
+  && prev.connected === next.connected
+  && prev.isOpen === next.isOpen
+  && prev.isFocused === next.isFocused
+  && prev.idleFlashToken === next.idleFlashToken
+  && prev.cardW === next.cardW
+  && prev.cardH === next.cardH
+  && prev.quickData === next.quickData
+  && prev.serverId === next.serverId
+  && prev.inP2p === next.inP2p
+  && prev.sharedState === next.sharedState
+  && prev.accentColor === next.accentColor
+  && prev.previewHydrateDelayMs === next.previewHydrateDelayMs
+));

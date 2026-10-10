@@ -75,13 +75,18 @@ describe('shared daemon/server/web wire protocol contracts', () => {
       MACHINE_EXEC_RESULT: 'machine.exec_result',
       COMPUTER_USE_RESULT: 'computer.use_result',
       CONTROLLED_NODE_AUTO_UNLOCK_RESULT: 'controlled_node.auto_unlock_result',
+      CONTROLLED_NODE_LOCAL_DAEMONS: 'controlled_node.local_daemons',
+      CONTROLLED_NODE_WORKER_REFRESH_STATUS: 'controlled_node.worker_refresh_status',
     });
 
     expect(DAEMON_COMMAND_TYPES).toEqual({
       DAEMON_UPGRADE: 'daemon.upgrade',
       SERVER_DELETE: 'server.delete',
       SESSION_CANCEL: 'session.cancel',
+      SESSION_INPUT: 'session.input',
+      SESSION_RESIZE: 'session.resize',
       SESSION_EXECUTION_CLONES: 'session.execution_clones',
+      SESSION_IDENTITY_REFRESH: 'session.identity.refresh',
       SESSION_UPDATE_TRANSPORT_CONFIG: 'session.update_transport_config',
       SUBSESSION_UPDATE_TRANSPORT_CONFIG: 'subsession.update_transport_config',
       MACHINE_EXEC: 'machine.exec',
@@ -91,6 +96,7 @@ describe('shared daemon/server/web wire protocol contracts', () => {
       PEER_AUDIT_QUICK_START: 'peer_audit.quick_start',
       PEER_AUDIT_CANCEL: 'peer_audit.cancel',
       PEER_AUDIT_REPLY: 'peer_audit.reply',
+      SUPERVISOR_DEFAULTS_CHANGED: 'supervisor_defaults.changed',
     });
   });
 

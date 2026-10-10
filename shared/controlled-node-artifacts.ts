@@ -3,6 +3,13 @@
 // The product ships one downloadable artifact per OS. macOS is a Universal 2
 // binary while the enrolled machine still reports its real runtime architecture.
 
+import {
+  CONTROLLED_NODE_ABI_GLIBC217,
+  CONTROLLED_NODE_ABI_MODERN,
+  isControlledNodeAbiTarget,
+  normalizeControlledNodeAbiProfile,
+  type ControlledNodeAbiProfile,
+} from './controlled-node-abi.js';
 import { AUTH_IDENTITY_ERRORS } from './auth-identity.js';
 
 export const CONTROLLED_NODE_OS_WIN = 'win' as const;
@@ -29,6 +36,7 @@ export type ControlledNodeArtifactArch =
 export interface ControlledNodeArtifactPair {
   os: ControlledNodeOs;
   arch: ControlledNodeArtifactArch;
+  abiProfile?: ControlledNodeAbiProfile;
 }
 
 /** Fixed triple for Win x64 / macOS Universal 2 / Linux x64. */
@@ -37,6 +45,12 @@ export const CONTROLLED_NODE_CANONICAL_ARTIFACTS: readonly ControlledNodeArtifac
   { os: CONTROLLED_NODE_OS_MAC, arch: CONTROLLED_NODE_ARTIFACT_ARCH_UNIVERSAL },
   { os: CONTROLLED_NODE_OS_LINUX, arch: CONTROLLED_NODE_ARCH_X64 },
 ] as const;
+
+/** Published variants, with old peers seeing only the canonical modern triple. */
+export const CONTROLLED_NODE_ARTIFACT_VARIANTS: readonly ControlledNodeArtifactPair[] = [
+  ...CONTROLLED_NODE_CANONICAL_ARTIFACTS,
+  { os: CONTROLLED_NODE_OS_LINUX, arch: CONTROLLED_NODE_ARCH_X64, abiProfile: CONTROLLED_NODE_ABI_GLIBC217 },
+];
 
 export const CONTROLLED_NODE_OS_ORDER: readonly ControlledNodeOs[] = [
   CONTROLLED_NODE_OS_WIN,
@@ -108,7 +122,26 @@ export const CONTROLLED_NODE_ARTIFACT_ASSETS = {
   REMOTE_DESKTOP_WORKER: 'remote-desktop-worker',
   REMOTE_DESKTOP_WORKER_MANIFEST: 'remote-desktop-worker-manifest',
   REMOTE_DESKTOP_VIRTUAL_DISPLAY: 'remote-desktop-virtual-display',
+  REMOTE_DESKTOP_MACOS_COMPONENT_SET: 'remote-desktop-macos-component-set',
+  /**
+   * The Windows panel window host (aidesk-local-ui.exe), its manifest and its third-party notices: an independent sidecar, refreshed by
+   * the node itself (never part of the transactional self-upgrade set). A missing file answers 404 and means "not published": the node skips.
+   */
+  AIDESK_LOCAL_UI: 'aidesk-local-ui',
+  AIDESK_LOCAL_UI_MANIFEST: 'aidesk-local-ui-manifest',
+  AIDESK_LOCAL_UI_NOTICES: 'aidesk-local-ui-notices',
 } as const;
+
+export type AideskLocalUiArtifactAsset =
+  | typeof CONTROLLED_NODE_ARTIFACT_ASSETS.AIDESK_LOCAL_UI
+  | typeof CONTROLLED_NODE_ARTIFACT_ASSETS.AIDESK_LOCAL_UI_MANIFEST
+  | typeof CONTROLLED_NODE_ARTIFACT_ASSETS.AIDESK_LOCAL_UI_NOTICES;
+
+export function isAideskLocalUiArtifactAsset(asset: string): asset is AideskLocalUiArtifactAsset {
+  return asset === CONTROLLED_NODE_ARTIFACT_ASSETS.AIDESK_LOCAL_UI
+    || asset === CONTROLLED_NODE_ARTIFACT_ASSETS.AIDESK_LOCAL_UI_MANIFEST
+    || asset === CONTROLLED_NODE_ARTIFACT_ASSETS.AIDESK_LOCAL_UI_NOTICES;
+}
 
 /**
  * Whether `asset` is part of the remote-desktop worker bundle.
@@ -122,12 +155,14 @@ export const CONTROLLED_NODE_ARTIFACT_ASSETS = {
 export type RemoteDesktopArtifactAsset =
   | typeof CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_WORKER
   | typeof CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_WORKER_MANIFEST
-  | typeof CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_VIRTUAL_DISPLAY;
+  | typeof CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_VIRTUAL_DISPLAY
+  | typeof CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_MACOS_COMPONENT_SET;
 
 export function isRemoteDesktopArtifactAsset(asset: string): asset is RemoteDesktopArtifactAsset {
   return asset === CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_WORKER
     || asset === CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_WORKER_MANIFEST
-    || asset === CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_VIRTUAL_DISPLAY;
+    || asset === CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_VIRTUAL_DISPLAY
+    || asset === CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_MACOS_COMPONENT_SET;
 }
 
 export const CONTROLLED_NODE_COMPUTER_USE_HELPER_FILENAMES = {
@@ -145,20 +180,30 @@ export const CONTROLLED_NODE_ARTIFACT_HEADERS = {
   SIZE_BYTES: 'x-imcodes-node-artifact-size-bytes',
   FILENAME: 'x-imcodes-node-artifact-filename',
   VERSION: 'x-imcodes-node-artifact-version',
+  ABI_PROFILE: 'x-imcodes-node-artifact-abi-profile',
   AUTHENTICODE_SIGNER_SHA256: 'x-imcodes-node-artifact-authenticode-signer-sha256',
   REMOTE_DESKTOP_PROTOCOL_VERSION: 'x-imcodes-remote-desktop-protocol-version',
 } as const;
 
-export function controlledNodeArtifactKey(os: ControlledNodeOs, arch: ControlledNodeArtifactArch): string {
-  return `${os}:${arch}`;
+export function controlledNodeArtifactKey(
+  os: ControlledNodeOs, arch: ControlledNodeArtifactArch, abiProfile?: ControlledNodeAbiProfile,
+): string {
+  return abiProfile === undefined || abiProfile === CONTROLLED_NODE_ABI_MODERN
+    ? `${os}:${arch}` : `${os}:${arch}:${abiProfile}`;
 }
 
-export function isCanonicalControlledNodePair(os: string, arch: string): boolean {
+export function isCanonicalControlledNodePair(os: string, arch: string, abiProfile?: unknown): boolean {
+  if (!isControlledNodeAbiTarget(os, arch, abiProfile)) return false;
   return CONTROLLED_NODE_CANONICAL_ARTIFACTS.some((pair) => pair.os === os && pair.arch === arch);
 }
 
 /** Normalize a current artifact target or a legacy macOS runtime target. */
-export function normalizeControlledNodeArtifactPair(os: string, arch: string): ControlledNodeArtifactPair | null {
+export function normalizeControlledNodeArtifactPair(os: string, arch: string, abiProfile?: unknown): ControlledNodeArtifactPair | null {
+  const profile = normalizeControlledNodeAbiProfile(abiProfile);
+  if (!profile || !isControlledNodeAbiTarget(os, arch, profile)) return null;
+  if (profile === CONTROLLED_NODE_ABI_GLIBC217) {
+    return { os: CONTROLLED_NODE_OS_LINUX, arch: CONTROLLED_NODE_ARCH_X64, abiProfile: profile };
+  }
   const canonical = CONTROLLED_NODE_CANONICAL_ARTIFACTS.find((pair) => pair.os === os && pair.arch === arch);
   if (canonical) return canonical;
   if (os === CONTROLLED_NODE_OS_MAC
@@ -195,5 +240,174 @@ export function compareControlledNodeArtifactPairs(
 ): number {
   const osCmp = CONTROLLED_NODE_OS_ORDER.indexOf(a.os) - CONTROLLED_NODE_OS_ORDER.indexOf(b.os);
   if (osCmp !== 0) return osCmp;
-  return CONTROLLED_NODE_ARCH_ORDER.indexOf(a.arch) - CONTROLLED_NODE_ARCH_ORDER.indexOf(b.arch);
+  const archCmp = CONTROLLED_NODE_ARCH_ORDER.indexOf(a.arch) - CONTROLLED_NODE_ARCH_ORDER.indexOf(b.arch);
+  if (archCmp !== 0) return archCmp;
+  return Number(a.abiProfile === CONTROLLED_NODE_ABI_GLIBC217) - Number(b.abiProfile === CONTROLLED_NODE_ABI_GLIBC217);
+}
+
+/* ────────────────────────────────────────────────────────────────────────── */
+/* Download-ticket delivery                                                   */
+/* ────────────────────────────────────────────────────────────────────────── */
+
+/**
+ * How a minted enrolment ticket reaches the machine being enrolled.
+ *
+ * These are two genuinely different threat/usability trade-offs, not one
+ * setting with two numbers:
+ *
+ * - `browser` — the operator is sitting at the machine and the browser redeems
+ *   the ticket within seconds. The exposure window should be as small as the
+ *   round trip allows.
+ * - `remote_link` — the operator is NOT at the machine. The link has to survive
+ *   being copied into a chat, an email or a ticketing system and opened later
+ *   on the target box. Without this, installing on a remote machine requires
+ *   downloading locally and transferring the binary by some other tool — which
+ *   is exactly the tool you cannot install yet.
+ *
+ * - `install_command` — a one-line shell command the operator pastes into a
+ *   terminal on the target machine. Unlike the two above it is meant to be kept
+ *   and reused across many machines, so it is long-lived and admits many
+ *   downloads. Its exposure is bounded by what the credential can actually do,
+ *   which is add a machine to the owner's account, never read from it.
+ *
+ * The ticket itself is identical in kind; only its lifetime and download budget
+ * differ. Browser tickets and install commands retain bounded budgets. A remote
+ * link instead admits any number of downloads and remains valid until its owner
+ * explicitly revokes that stable owner/OS/arch/host binding.
+ */
+export const CONTROLLED_NODE_TICKET_DELIVERY = {
+  BROWSER: 'browser',
+  REMOTE_LINK: 'remote_link',
+  INSTALL_COMMAND: 'install_command',
+} as const;
+
+export type ControlledNodeTicketDelivery =
+  (typeof CONTROLLED_NODE_TICKET_DELIVERY)[keyof typeof CONTROLLED_NODE_TICKET_DELIVERY];
+
+export const CONTROLLED_NODE_TICKET_DELIVERY_VALUES: readonly ControlledNodeTicketDelivery[] = [
+  CONTROLLED_NODE_TICKET_DELIVERY.BROWSER,
+  CONTROLLED_NODE_TICKET_DELIVERY.REMOTE_LINK,
+  CONTROLLED_NODE_TICKET_DELIVERY.INSTALL_COMMAND,
+];
+
+/**
+ * Ticket lifetime per delivery mode. `null` means the stable remote-link
+ * credential ends only at owner revocation; it is not an accidental missing
+ * timestamp.
+ *
+ * The install command is deliberately long-lived: it is meant to be saved and
+ * pasted on new machines whenever one is set up, and an expiry would silently
+ * turn a documented command into a broken one. A finite value is still used
+ * rather than "never", so a ticket that is genuinely forgotten eventually stops
+ * working and retention can reclaim the row.
+ */
+export const CONTROLLED_NODE_TICKET_TTL_MS: Readonly<
+  Record<ControlledNodeTicketDelivery, number | null>
+> = {
+  [CONTROLLED_NODE_TICKET_DELIVERY.BROWSER]: 5 * 60 * 1000,
+  [CONTROLLED_NODE_TICKET_DELIVERY.REMOTE_LINK]: null,
+  [CONTROLLED_NODE_TICKET_DELIVERY.INSTALL_COMMAND]: 10 * 365 * 24 * 60 * 60 * 1000,
+};
+
+/**
+ * How many downloads a ticket admits, per delivery mode.
+ *
+ * `browser` enrols one machine, with spare attempts so a failed download is
+ * recoverable. `remote_link` uses `null` deliberately: it may be carried to any
+ * number of machines until explicit revocation and must never fail because a
+ * consume counter crossed an arbitrary threshold. The install command is a
+ * separate, ten-year credential whose bounded fleet budget remains unchanged.
+ *
+ * `null` is persisted as SQL NULL. Do not replace it with a very large integer:
+ * doing so would only hide a finite limit and eventually make an otherwise-live
+ * link fail for the wrong reason.
+ */
+export const CONTROLLED_NODE_TICKET_MAX_CONSUMES = {
+  [CONTROLLED_NODE_TICKET_DELIVERY.BROWSER]: 3,
+  [CONTROLLED_NODE_TICKET_DELIVERY.REMOTE_LINK]: null,
+  [CONTROLLED_NODE_TICKET_DELIVERY.INSTALL_COMMAND]: 500,
+} as const satisfies Readonly<Record<ControlledNodeTicketDelivery, number | null>>;
+
+/**
+ * Alphabet for the install code that appears in the pasted command.
+ *
+ * Crockford-style: no `I`, `L`, `O` or `U`, so the code survives being read off
+ * a phone screen, dictated over a call, or copied out of a screenshot by hand.
+ * Uppercase only, for the same reason.
+ */
+export const CONTROLLED_NODE_INSTALL_CODE_ALPHABET = '0123456789ABCDEFGHJKMNPQRSTVWXYZ';
+
+/** 12 characters over a 32-symbol alphabet: 60 bits, far past guessing. */
+export const CONTROLLED_NODE_INSTALL_CODE_LENGTH = 12;
+
+const INSTALL_CODE_RE = new RegExp(
+  `^[${CONTROLLED_NODE_INSTALL_CODE_ALPHABET}]{${CONTROLLED_NODE_INSTALL_CODE_LENGTH}}$`,
+);
+
+/** Exact-shape check. Callers must reject before any database lookup. */
+export function isControlledNodeInstallCode(value: unknown): value is string {
+  return typeof value === 'string' && INSTALL_CODE_RE.test(value);
+}
+
+/**
+ * Where an install code's script is served: the pasted one-line command fetches
+ * `<server>/i/<code>`, and so does a daemon installing the node on its own
+ * computer. Short because it is typed and dictated.
+ */
+export const CONTROLLED_NODE_INSTALL_COMMAND_PATH = '/i';
+
+/**
+ * Normalize a hand-typed code.
+ *
+ * Accepts lowercase and the visually ambiguous characters the alphabet omits,
+ * so someone who typed `l` for `1` or `O` for `0` is not told their code is
+ * wrong. Returns null when the result is still not a valid code.
+ */
+export function normalizeControlledNodeInstallCode(value: string): string | null {
+  const folded = value
+    .trim()
+    .toUpperCase()
+    .replace(/[\s-]/g, '')
+    .replace(/[IL]/g, '1')
+    .replace(/[O]/g, '0')
+    .replace(/[U]/g, 'V');
+  return isControlledNodeInstallCode(folded) ? folded : null;
+}
+
+export function isControlledNodeTicketDelivery(
+  value: unknown,
+): value is ControlledNodeTicketDelivery {
+  return typeof value === 'string'
+    && (CONTROLLED_NODE_TICKET_DELIVERY_VALUES as readonly string[]).includes(value);
+}
+
+/**
+ * Ticket lifetime for a delivery mode, defaulting to the short browser window.
+ *
+ * Validates rather than indexing blindly. The argument is typed, but this value
+ * originates in a request body, so a caller that skipped validation would
+ * otherwise index the map with an unknown key and get `undefined` — which would
+ * flow into `now + undefined` and produce a NaN expiry. Failing to the short
+ * window keeps every unrecognized input on the conservative side.
+ */
+export function controlledNodeTicketTtlMs(delivery?: ControlledNodeTicketDelivery): number | null {
+  return isControlledNodeTicketDelivery(delivery)
+    ? CONTROLLED_NODE_TICKET_TTL_MS[delivery]
+    : CONTROLLED_NODE_TICKET_TTL_MS[CONTROLLED_NODE_TICKET_DELIVERY.BROWSER];
+}
+
+export const CONTROLLED_NODE_ENROLL_AUDIT_ACTION = {
+  TICKET_REVOKE: 'enroll.v2.ticket.revoke',
+} as const;
+
+/**
+ * Download budget for a delivery mode, validated for the same reason as the
+ * TTL. `null` is the explicit no-count-limit contract for a remote link.
+ */
+export function controlledNodeTicketMaxConsumes(
+  delivery?: ControlledNodeTicketDelivery,
+): number | null {
+  return isControlledNodeTicketDelivery(delivery)
+    ? CONTROLLED_NODE_TICKET_MAX_CONSUMES[delivery]
+    : CONTROLLED_NODE_TICKET_MAX_CONSUMES[CONTROLLED_NODE_TICKET_DELIVERY.BROWSER];
 }

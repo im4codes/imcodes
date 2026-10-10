@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { COMMAND_ACK_ERROR_DUPLICATE_COMMAND_ID } from '../../shared/ack-protocol.js';
+import { DAEMON_USER_NOTICE_CODE } from '../../shared/daemon-user-notices.js';
 
 const {
   getSessionMock,
@@ -127,10 +128,12 @@ describe('process session /clear handling', () => {
       'deck_proj_brain',
       'user.message',
       { text: '/clear', allowDuplicate: true, commandId: 'cmd-clear-process' },
-      undefined,
+      { source: 'daemon', confidence: 'high', eventId: 'transport-user:cmd-clear-process' },
     );
     expect(emitMock).toHaveBeenCalledWith('deck_proj_brain', 'assistant.text', {
       text: 'Started a fresh conversation',
+      noticeCode: DAEMON_USER_NOTICE_CODE.CONVERSATION_STARTED,
+      noticeParams: {},
       streaming: false,
       memoryExcluded: true,
     }, expect.objectContaining({ source: 'daemon' }));

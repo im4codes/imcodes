@@ -1,3 +1,9 @@
+import { createSignalWriteBatcher } from '../signal-write-batcher.js';
+import {
+  TIMELINE_PREFERENCE_DEPENDENT_TYPES,
+  isGuaranteedVisibleTimelineEvent,
+  isLastValueTimelineEventType,
+} from '../../../src/shared/timeline/types.js';
 import { DAEMON_MSG } from '@shared/daemon-events.js';
 import { TRANSPORT_MSG } from '@shared/transport-events.js';
 import {
@@ -5,10 +11,20 @@ import {
   TIMELINE_DETAIL_FIELD_PATHS as SHARED_TIMELINE_DETAIL_FIELD_PATHS,
   TIMELINE_MESSAGES,
   TIMELINE_PROTOCOL_REVISION,
+  TIMELINE_HISTORY_CONTENT_FILTERS,
   TIMELINE_RESPONSE_STATUS,
+  TIMELINE_STALE_WINDOW_TAIL_PEEK_LIMIT,
   type TimelineCursor,
   type TimelinePayloadMetadata,
 } from '@shared/timeline-protocol.js';
+import {
+  __resetTimelineGapsForTests,
+  foldPageIntoGap,
+  getTimelineGap,
+  setTimelineGap,
+  subscribeTimelineGap,
+  type TimelineGap,
+} from '../timeline/catchup/gap-store.js';
 import {
   TIMELINE_DETAIL_ERROR_REASONS,
   TIMELINE_HISTORY_ERROR_REASONS,
@@ -35,7 +51,11 @@ import {
 } from '@shared/transport-queue-reducer.js';
 import { reduceTimelineActivity } from '@shared/session-activity-types.js';
 import type { QueueEvent, QueueProjectionEntry, QueueSnapshot } from '@shared/transport-queue-types.js';
-import { TIMELINE_SNAPSHOT_STORAGE_PREFIX } from '../local-storage-quota.js';
+import {
+  TIMELINE_SNAPSHOT_STORAGE_PREFIX,
+  safeLocalStorageRemoveItem,
+  safeLocalStorageSetItem,
+} from '../local-storage-quota.js';
 
 /** Map an AckFailureReason to a localized message suitable for failureReason payload. */
 function localizedAckFailureReason(reason: AckFailureReason): string {
@@ -69,9 +89,10 @@ function localizedDelegationAckError(error: unknown): string | undefined {
  * listens for real-time WS events, handles reconnection replay.
  */
 
-import { useEffect, useRef, useState, useCallback } from 'preact/hooks';
+import { useEffect, useLayoutEffect, useRef, useState, useCallback } from 'preact/hooks';
 import type { WsClient, TimelineEvent, ServerMessage } from '../ws-client.js';
-import { TimelineDB } from '../timeline-db.js';
+import { TimelineDB, type DrainCursor } from '../timeline-db.js';
+import { getTimelineStore, __resetTimelineStoresForTests } from '../stores/timeline-store.js';
 import {
   TIMELINE_DETAIL_FIELD_PATHS,
   mergeTimelineEvents,
@@ -80,8 +101,9 @@ import {
 } from '../../../src/shared/timeline/merge.js';
 import { TIMELINE_HISTORY_CONTENT_TYPES } from '../../../src/shared/timeline/types.js';
 import { fetchTimelineHistoryHttp, sendSessionViaHttp } from '../api.js';
-import { MESSAGE_PIN_LIMITS } from '@shared/message-pins.js';
-import { runNewestWindowBackfill } from '../timeline/catchup/backfill-pager.js';
+import { MESSAGE_PIN_EVENT_TYPES, MESSAGE_PIN_LIMITS } from '@shared/message-pins.js';
+import { SESSION_SEND_DELIVERY_MODES } from '@shared/session-send-delivery.js';
+import { pageIsIncomplete, runNewestWindowBackfill } from '../timeline/catchup/backfill-pager.js';
 import { buildTransportPendingSyncPatch, normalizeTransportPendingEntries } from '../transport-queue.js';
 
 const TRANSPORT_QUEUE_EVENT_TYPES = new Set([
@@ -179,8 +201,8 @@ sharedDb.open().catch(() => {});
 // Updated by every useTimeline instance so that a second instance for the same
 // session (e.g. SubSessionWindow opening while SubSessionCard is running) can
 // render immediately from in-memory state without waiting for IDB or network.
+// Canonical per-session stores prevent duplicate merge/cache work across panes.
 const eventsCache = new Map<string, TimelineEvent[]>();
-const eventsCacheAccess = new Map<string, number>();
 const cacheListeners = new Map<string, Set<(events: TimelineEvent[]) => void>>();
 // Per-cacheKey wall-clock of the last *successful* HTTP backfill (response
 // received, not a timeout/null). Two consumers:
@@ -193,6 +215,48 @@ const cacheListeners = new Map<string, Set<(events: TimelineEvent[]) => void>>()
 //      idle/responding poll rate.
 const lastHttpBackfillResponseAt = new Map<string, number>();
 const MOUNT_BACKFILL_COOLDOWN_MS = 60_000;
+/**
+ * Background (non-visible) HTTP backfills share one gate per cacheKey across
+ * every hook mount of the session (main pane, sub-session card, window...).
+ * On a slow daemon uplink each backfill is a large reply that takes longer
+ * than its own timeout to arrive; without this gate every trigger (terminal
+ * tail reconcile, optimistic-send catch-up, watchdog) fired another one on
+ * top, the replies queued behind each other on the daemon's link, and
+ * heartbeats/acks queued behind them -- the link looked stale and messages
+ * looked unanswered. Only user-visible refreshes (manual ↻, visible
+ * recovery) bypass it.
+ */
+const BACKGROUND_BACKFILL_FAILURE_BACKOFF_BASE_MS = 5_000;
+const BACKGROUND_BACKFILL_FAILURE_BACKOFF_MAX_MS = 60_000;
+const backgroundBackfillGateByCacheKey = new Map<string, { inFlight: number; failureStreak: number; nextAllowedAt: number }>();
+/** Sessions whose stale-window hole is being filled right now (any window): one filler per session. */
+const gapBackfillInFlight = new Set<string>();
+/**
+ * A hole page the daemon keeps trimming to its payload budget is refetched (the dropped events lie inside its
+ * range), at most this many times at the same stitched top; after that the filler descends past it so one
+ * permanently oversized page cannot wedge the whole fill.
+ */
+const INCOMPLETE_HOLE_PAGE_HOLDS = 2;
+const incompleteHoleHoldByCacheKey = new Map<string, { top: number | null; holds: number }>();
+/** Delay before a hole's filler is re-fired after a payload-trimmed round (nothing else would restart it). */
+const INCOMPLETE_HOLE_RETRY_DELAY_MS = 1_500;
+/** A (re)connect is new evidence the link works again: let the next
+ *  background catch-up run instead of waiting out a failure backoff. */
+function liftBackgroundBackfillBackoff(cacheKey: string | null | undefined): void {
+  if (!cacheKey) return;
+  const gate = backgroundBackfillGateByCacheKey.get(cacheKey);
+  if (!gate) return;
+  gate.failureStreak = 0;
+  gate.nextAllowedAt = 0;
+}
+function backgroundBackfillGate(cacheKey: string) {
+  let gate = backgroundBackfillGateByCacheKey.get(cacheKey);
+  if (!gate) {
+    gate = { inFlight: 0, failureStreak: 0, nextAllowedAt: 0 };
+    backgroundBackfillGateByCacheKey.set(cacheKey, gate);
+  }
+  return gate;
+}
 /** Scenario-based HTTP timeout for catch-up backfills. The keystone weak-network
  *  fix was lifting the 2.5s default (which aborted before a slow daemon could
  *  answer on a weak link). But a flat 10s also wastes the everyday silent path's
@@ -275,6 +339,10 @@ type HttpBackfillOpts = {
   force?: boolean;
   mode?: HttpBackfillMode;
   _retryAttempt?: number;
+  /** Resume a chained round from a prior round's `resumeBeforeTs`. */
+  _resumeBeforeTs?: number;
+  /** Chained-round counter (bounds automatic cap_hit continuation). */
+  _roundsChained?: number;
 };
 
 function createHttpBackfillCountState(): Record<HttpBackfillMode, number> {
@@ -297,6 +365,12 @@ function resetBackfillCooldowns(): void {
   lastHttpBackfillResponseAt.clear();
   // A genuine resume should let the watchdog probe immediately again.
   watchdogStateByCacheKey.clear();
+  // ...and lift any background failure backoff, but keep in-flight counts:
+  // those requests are still running and must still gate duplicates.
+  for (const gate of backgroundBackfillGateByCacheKey.values()) {
+    gate.failureStreak = 0;
+    gate.nextAllowedAt = 0;
+  }
 }
 
 /** Diagnostic logging for the backfill chain. Off by default; flip
@@ -406,6 +480,26 @@ if (typeof document !== 'undefined' && typeof window !== 'undefined') {
 }
 
 const MAX_MEMORY_EVENTS = 300;
+// Server/daemon history pages are hard-capped at 200 events and 1 MiB. Keep
+// newer gap/reveal requests explicit so continuation cursors never fan out an
+// unbounded payload even when older callers still pass MAX_MEMORY_EVENTS.
+const MAX_FORWARD_PAGE_EVENTS = 200;
+const MAX_FORWARD_PAGE_BYTES = 1024 * 1024;
+/**
+ * A window whose newest cached event is older than this asks for its latest few messages FIRST
+ * (a tiny text-only request) before the ordinary newest-window/backfill machinery — so a chat
+ * reopened after a long time shows where the conversation is now in about one round trip.
+ */
+const STALE_WINDOW_PEEK_DEFAULT_MIN_AGE_MS = 60_000;
+/** A window that just peeked does not peek again (effect re-runs on dependency churn) for this long. */
+const STALE_WINDOW_PEEK_REPEAT_MS = 60_000;
+let staleWindowPeekMinAgeMs = STALE_WINDOW_PEEK_DEFAULT_MIN_AGE_MS;
+/** Test seam: how old the newest cached event must be before a reopen sends the tail peek (`Infinity` disables it). */
+export function __setStaleWindowPeekMinAgeMsForTests(ms: number | null): void {
+  staleWindowPeekMinAgeMs = ms ?? STALE_WINDOW_PEEK_DEFAULT_MIN_AGE_MS;
+}
+/** The peek is a handful of messages; a small budget keeps its reply tiny on a mobile link. */
+const STALE_WINDOW_PEEK_BUDGET_BYTES = 256 * 1024;
 const MAX_HISTORY_EVENTS = 2000;
 const MAX_PIN_CONTEXT_EVENTS = MESSAGE_PIN_LIMITS.CONTEXT_EVENTS_BEFORE
   + 1
@@ -426,6 +520,12 @@ function retainedTimelineMergeLimit(...eventSets: readonly TimelineEvent[][]): n
     : MAX_MEMORY_EVENTS;
 }
 /**
+ * Every chat window owns this bounded in-memory budget. There is deliberately
+ * no cross-window LRU: a busy peer may fill its own window, but can never make
+ * an unrelated visible/minimized chat lose its instant seed.
+ */
+const MAX_WINDOW_CACHED_EVENTS = MAX_HISTORY_EVENTS + MAX_PIN_CONTEXT_EVENTS;
+/**
  * How long a cold timeline may report the daemon fetch as still coming while
  * the socket is down.
  *
@@ -436,8 +536,6 @@ function retainedTimelineMergeLimit(...eventSets: readonly TimelineEvent[][]): n
  * forever, which is worse than the blank pane this whole change is fixing.
  */
 const DAEMON_CONNECT_WAIT_MS = 15_000;
-
-const MAX_CACHED_SESSIONS = 12;
 
 // A first-paint seed (localStorage tail snapshot, WS-replay tail, or a
 // partially-persisted IDB read) can be a LOW-COMPLETENESS tail: it shows a few
@@ -453,7 +551,6 @@ function isLowCompletenessSeed(events: readonly TimelineEvent[] | undefined): bo
   if (!events || events.length === 0) return true;
   return events.length < LOW_COMPLETENESS_SEED_THRESHOLD;
 }
-const MAX_TOTAL_CACHED_EVENTS = 12_000;
 const ECHO_WINDOW_MS = 500;
 const TIMELINE_HISTORY_AFTER_TS_OVERLAP_MS = 1;
 // Dedup window for user.message from JSONL vs web-UI-sent: JSONL watcher polls every 2s,
@@ -471,16 +568,273 @@ const TIMELINE_SNAPSHOT_WRITE_DELAY_MS = 750;
 // in IDB, so a later page refresh restores it — not only the localStorage mat.
 const STREAMING_IDLE_PERSIST_MS = 2000;
 const TERMINAL_TAIL_IDLE_RECONCILE_MS = 5000;
-// Snapshot tail size matches MAX_MEMORY_EVENTS (300) so the synchronous
-// first-paint seed approaches the same coverage as the IDB-restored cache.
-// The previous 50-event cap meant 5/6 of a 300-event session disappeared
-// after refresh until the async IDB load completed — visible on mobile as
-// "本地缓存还是没有立即显示". 300 events of compact payload is on the order
-// of 0.5–1 MB per session in localStorage; the per-origin 5 MB quota holds
-// up to ~5 active sessions before the `try/catch` swallow at the bottom of
-// `persistTimelineSnapshotTail` starts dropping writes. Dynamic LRU eviction
-// is a follow-up (see Round 3 plan PR-5 §quota).
-const MAX_PERSISTED_SNAPSHOT_EVENTS = 300;
+// Text and tool-detail events have separate row budgets. Tool traffic is often
+// much denser than conversation, so one command with hundreds of calls must not
+// push recent user/assistant text out before byte-budget selection even starts.
+// IndexedDB remains the full local-history store. This intentionally small
+// snapshot is only the highest-priority synchronous first paint while
+// IDB/network catch up. Keeping 512 KiB *per session* meant a workspace with a
+// few dozen chat windows exhausted Safari's localStorage budget; each new write
+// then evicted another window's only synchronous seed and switching back painted
+// a blank chat. Each window owns an independent 256 KiB ceiling and, when the
+// browser quota is tight, shrinks only its own snapshot instead of evicting a
+// peer window's recent chat.
+const MAX_PERSISTED_SNAPSHOT_EVENTS_PER_CLASS = 300;
+const MAX_PERSISTED_SNAPSHOT_BYTES = 256 * 1024;
+const PERSISTED_SNAPSHOT_SELF_BUDGETS = [256, 128, 64, 32, 16, 8].map((kib) => kib * 1024);
+const timelineSnapshotTextEncoder = new TextEncoder();
+// A local IndexedDB read is an optimization, never a gate in front of the
+// authoritative history sources. Safari can leave an IDB request pending after
+// a page freeze/version transition without producing success/error/blocked.
+// Bound how long an empty pane may call that read "loading"; the late read is
+// still merged if it eventually completes.
+const LOCAL_HISTORY_READ_DEADLINE_MS = 1_200;
+const LOCAL_HISTORY_DAEMON_HEDGE_MS = 100;
+
+/**
+ * How much history each session keeps in IndexedDB.
+ *
+ * Nothing pruned this store before — `pruneOldEvents` existed but was only ever
+ * called from tests — so it grew for the life of the install. Older history is
+ * NOT lost by trimming it: it lives on the daemon and comes back through
+ * `load older` (a WS page request) and the HTTP backfill, so the local copy
+ * only has to be big enough to paint instantly and to absorb a reconnect gap.
+ *
+ * Must stay comfortably above MAX_MEMORY_EVENTS (the size of the page the
+ * first paint reads); the assertion below fails the build if that ever stops
+ * holding, because a retention under the read page would silently truncate
+ * every restore.
+ */
+const LOCAL_RETAINED_EVENTS_PER_SESSION = 1000;
+
+/**
+ * Amortize the readwrite sweep: one prune per this many persisted events for a
+ * session, plus one after each bootstrap restore. Pruning on every write would
+ * put a delete transaction in front of live message writes.
+ */
+const LOCAL_PRUNE_WRITE_INTERVAL = 200;
+
+/**
+ * Sweep shape. All three of these exist because the first version blocked the
+ * UI: it deleted a never-pruned store in ONE readwrite transaction, per
+ * session, right after each first paint. Every timeline shares one IndexedDB
+ * connection, so a dozen sessions mounting together queued a dozen huge writes
+ * ahead of everyone's reads and chats opened blank, stuck on "local cache".
+ */
+const LOCAL_PRUNE_DELETIONS_PER_SWEEP = 500;
+/** Long enough that the mount burst -- every pane and card -- is fully painted. */
+const LOCAL_PRUNE_START_DELAY_MS = 5_000;
+/** Yield between chunks so reads interleave instead of queueing behind us. */
+const LOCAL_PRUNE_CHUNK_GAP_MS = 750;
+/** Bound total work per page session; the rest waits for the next load. */
+const LOCAL_PRUNE_MAX_CHUNKS = 40;
+
+const localPruneWriteCounts = new Map<string, number>();
+const localPruneDoneThisPageSession = new Set<string>();
+/** One sweep at a time across ALL sessions — they share a single connection. */
+let localPruneChain: Promise<void> = Promise.resolve();
+/**
+ * Test-only observers for the scheduled sweep's REAL completion.
+ *
+ * The multipass regression used to poll the DOM for a fixed 20 seconds. Under
+ * V8 coverage / loaded CI, fake-indexeddb can spend longer than that executing
+ * 1,000 instrumented cursor callbacks even though the production algorithm is
+ * still making progress and eventually refreshes the pane. Observing the
+ * lifecycle boundary directly keeps the test causal without changing product
+ * timing, raising a timeout, or leaving an old module's sweep running into the
+ * next test.
+ */
+const localPruneCompletionWaiters = new Map<string, Set<() => void>>();
+
+function notifyLocalHistoryPruneComplete(cacheKey: string): void {
+  const waiters = localPruneCompletionWaiters.get(cacheKey);
+  if (!waiters) return;
+  // This is a broadcast lifecycle edge, not a queue: every observer awaiting
+  // the same scheduled sweep is released by that sweep's first completion.
+  localPruneCompletionWaiters.delete(cacheKey);
+  for (const resolve of waiters) resolve();
+}
+
+/**
+ * Re-read the authoritative window for the mount that is on screen RIGHT NOW.
+ *
+ * The bootstrap read already happened — that is what returned a window with
+ * nothing renderable in it — and nothing re-reads on its own. Without this the
+ * drain only helps the NEXT time the session is opened, which for an offline
+ * client (or one whose daemon/HTTP backfill returns nothing) means the pane the
+ * user is staring at stays blank until they reload.
+ */
+async function refreshCachedWindowAfterDrain(
+  cacheKey: string,
+  deletedIds: readonly string[],
+): Promise<boolean> {
+  const refreshed = await sharedDb
+    .getRecentEvents(cacheKey, { limit: MAX_MEMORY_EVENTS })
+    .catch(() => [] as TimelineEvent[]);
+
+  const existing = getCachedEvents(cacheKey) ?? [];
+  // Drop exactly the rows the drain deleted — nothing else.
+  //
+  // `mergeTimelineEvents` is additive: it replaces or appends by eventId and
+  // never removes an `existing` row the incoming set omits. Each drained legacy
+  // signal has its own eventId, so a plain merge keeps all of them — and they
+  // are precisely the rows whose `ts` is NEWER than the buried conversation, so
+  // the newest-N trim then evicts the very messages the re-read went to fetch.
+  // The pane stayed blank after a successful drain AND a successful re-read.
+  //
+  // Evicting by "absent from the refreshed window" instead would over-delete:
+  // `getRecentEvents` deliberately returns conversation with an EMPTY signal set
+  // when the signals sub-read fails, and a live signal can arrive between that
+  // read and this merge. Both would silently wipe current state from the UI.
+  // The drain's own deletion list has neither failure mode.
+  const drained = new Set(deletedIds);
+  const survivors = drained.size === 0
+    ? existing
+    : existing.filter((event) => !drained.has(event.eventId));
+  // Evict first, merge second. A read that comes back empty is still a reason
+  // to drop the rows we know were deleted — returning early would leave them
+  // in the cache indefinitely.
+  const merged = refreshed.length > 0
+    ? mergeTimelineEvents(survivors, refreshed, retainedTimelineMergeLimit(survivors, refreshed))
+    : survivors;
+  if (merged !== existing) setCachedEvents(cacheKey, merged);
+
+  return merged.some((event) => isGuaranteedVisibleTimelineEvent(event));
+}
+
+function runLocalHistoryPrune(cacheKey: string): Promise<void> {
+  const run = localPruneChain.then(async () => {
+    // Drain first. Retention alone cannot fix a window full of last-value rows:
+    // `pruneOldEvents` keeps the newest N by timestamp with no idea what a row
+    // IS, so on a session whose newest rows are ~84% signals it happily retains
+    // 1000 unrenderable rows and the pane still opens with nothing in it.
+    // Draining the legacy signals is what returns the read window to
+    // conversation; the size trim below then applies to real history.
+    let paneHasRenderableContent = false;
+    let before: DrainCursor | undefined;
+    for (let chunk = 0; chunk < LOCAL_PRUNE_MAX_CHUNKS; chunk += 1) {
+      if (sharedDb.memoryOnly) return;
+      const drained = await sharedDb
+        .drainLegacySignals(cacheKey, {
+          maxDeletions: LOCAL_PRUNE_DELETIONS_PER_SWEEP,
+          ...(before !== undefined ? { before } : {}),
+        })
+        .catch(() => null);
+      if (!drained) break;
+      // Refresh after EVERY productive pass until the pane has content, not
+      // once after the whole loop and not once overall.
+      //
+      // Once-after-the-loop made an "immediate" repair wait out the full
+      // LOCAL_PRUNE_MAX_CHUNKS * LOCAL_PRUNE_CHUNK_GAP_MS (~30s). Once overall
+      // was just as wrong in the other direction: a backlog larger than one
+      // deletion budget leaves the first refreshed window still full of the
+      // NEXT layer of signals, and IndexedDB deletions do not notify anyone, so
+      // every later pass freed the window with nobody looking.
+      //
+      // Stopping as soon as something renderable appears keeps healthy sessions
+      // from paying for a window read per chunk.
+      if (drained.deleted > 0 && !paneHasRenderableContent) {
+        paneHasRenderableContent = await refreshCachedWindowAfterDrain(
+          cacheKey,
+          drained.deletedIds ?? [],
+        );
+      }
+      if (drained.done) break;
+      // Advance strictly downward. Without this a pass whose scan budget is
+      // consumed by conversation returns {deleted: 0, done: false} and the next
+      // pass re-scans the identical prefix — no progress, for every chunk.
+      if (drained.nextBefore === undefined
+        || (before !== undefined
+          && drained.nextBefore.ts === before.ts
+          && drained.nextBefore.eventId === before.eventId)) break;
+      before = drained.nextBefore;
+      await new Promise<void>((resolve) => { setTimeout(resolve, LOCAL_PRUNE_CHUNK_GAP_MS); });
+    }
+
+
+    for (let chunk = 0; chunk < LOCAL_PRUNE_MAX_CHUNKS; chunk += 1) {
+      if (sharedDb.memoryOnly) return;
+      const result = await sharedDb
+        .pruneOldEvents(cacheKey, LOCAL_RETAINED_EVENTS_PER_SESSION, {
+          maxDeletions: LOCAL_PRUNE_DELETIONS_PER_SWEEP,
+        })
+        .catch(() => null);
+      if (!result || result.done) return;
+      await new Promise<void>((resolve) => { setTimeout(resolve, LOCAL_PRUNE_CHUNK_GAP_MS); });
+    }
+  }).catch(() => {});
+  localPruneChain = run;
+  return run;
+}
+
+/**
+ * Trim a session's stored history to LOCAL_RETAINED_EVENTS_PER_SESSION.
+ *
+ * `force` runs at most once per session per page session (the post-restore
+ * sweep); otherwise the sweep waits until LOCAL_PRUNE_WRITE_INTERVAL events
+ * have been persisted for that key.
+ *
+ * Deliberately a no-op while the shared DB is degraded to memory-only: in that
+ * state it cannot report what is actually on disk, so a delete would be issued
+ * blind — and this file has already destroyed local history once by deleting
+ * against an assumption (see migrateRawToScoped).
+ */
+function scheduleLocalHistoryPrune(
+  cacheKey: string,
+  writtenEvents: number,
+  force = false,
+  immediate = false,
+): void {
+  if (!cacheKey || sharedDb.memoryOnly) return;
+  if (force) {
+    if (localPruneDoneThisPageSession.has(cacheKey)) return;
+    localPruneDoneThisPageSession.add(cacheKey);
+  } else {
+    const pending = (localPruneWriteCounts.get(cacheKey) ?? 0) + writtenEvents;
+    if (pending < LOCAL_PRUNE_WRITE_INTERVAL) {
+      localPruneWriteCounts.set(cacheKey, pending);
+      return;
+    }
+    localPruneWriteCounts.set(cacheKey, 0);
+  }
+  // Deliberately delayed and never awaited: reclaiming space must never sit in
+  // front of a paint, and there is no deadline on it.
+  //
+  // `immediate` is the one exception, and it is still deferred by a turn rather
+  // than run inline: the pane it is repairing is currently showing nothing, so
+  // the work has a deadline the ordinary space-reclaim does not.
+  const timer = setTimeout(
+    () => {
+      void runLocalHistoryPrune(cacheKey)
+        .finally(() => notifyLocalHistoryPruneComplete(cacheKey));
+    },
+    immediate ? 0 : LOCAL_PRUNE_START_DELAY_MS,
+  );
+  timer.unref?.();
+}
+
+/** Test hook: page-session prune bookkeeping is module state. */
+export function __resetLocalHistoryPruneStateForTests(): void {
+  localPruneChain = Promise.resolve();
+  localPruneWriteCounts.clear();
+  localPruneDoneThisPageSession.clear();
+  for (const waiters of localPruneCompletionWaiters.values()) {
+    for (const resolve of waiters) resolve();
+  }
+  localPruneCompletionWaiters.clear();
+}
+
+/** Await the next real scheduled sweep for this cache key (tests only). */
+export function __waitForLocalHistoryPruneForTests(cacheKey: string): Promise<void> {
+  return new Promise((resolve) => {
+    let waiters = localPruneCompletionWaiters.get(cacheKey);
+    if (!waiters) {
+      waiters = new Set();
+      localPruneCompletionWaiters.set(cacheKey, waiters);
+    }
+    waiters.add(resolve);
+  });
+}
 // If no confirmation arrives within this window we auto-flip the pending bubble to
 // "failed" so the user can retry rather than stare at a perpetual spinner.
 //
@@ -524,25 +878,30 @@ function normalizeForEcho(text: string): string {
     .replace(/\s+/g, ' ');
 }
 
-function markCacheAccess(cacheKey: string): void {
-  eventsCacheAccess.set(cacheKey, Date.now());
+function getCachedEvents(cacheKey: string): TimelineEvent[] | undefined {
+  return eventsCache.get(cacheKey);
 }
 
-function getCachedEvents(cacheKey: string): TimelineEvent[] | undefined {
-  const cached = eventsCache.get(cacheKey);
-  if (cached) markCacheAccess(cacheKey);
-  return cached;
+function boundCachedEvents(events: TimelineEvent[]): TimelineEvent[] {
+  return events.length > MAX_WINDOW_CACHED_EVENTS
+    ? events.slice(events.length - MAX_WINDOW_CACHED_EVENTS)
+    : events;
+}
+
+/** Update the per-session memory/snapshot cache without notifying sibling hook
+ * subscribers. Streaming deltas use this path so each mounted pane renders its
+ * own local frame while companion panes/tabs are not fanned out on every tick. */
+function setCachedEventsLocal(cacheKey: string, events: TimelineEvent[]): void {
+  const bounded = boundCachedEvents(events);
+  eventsCache.set(cacheKey, bounded);
+  scheduleTimelineSnapshotPersist(cacheKey, bounded);
 }
 
 function setCachedEvents(cacheKey: string, events: TimelineEvent[]): void {
-  eventsCache.set(cacheKey, events);
-  markCacheAccess(cacheKey);
-  scheduleTimelineSnapshotPersist(cacheKey, events);
-  const listeners = cacheListeners.get(cacheKey);
-  if (listeners) {
-    for (const listener of listeners) listener(events);
-  }
-  pruneTimelineCache();
+  const bounded = boundCachedEvents(events);
+  getTimelineStore(cacheKey).replace(bounded, undefined, undefined, MAX_WINDOW_CACHED_EVENTS);
+  eventsCache.set(cacheKey, bounded);
+  scheduleTimelineSnapshotPersist(cacheKey, bounded);
 }
 
 function scheduleBrowserFrame(callback: () => void): () => void {
@@ -554,38 +913,60 @@ function scheduleBrowserFrame(callback: () => void): () => void {
   return () => clearTimeout(id);
 }
 
-function subscribeCache(cacheKey: string, listener: (events: TimelineEvent[]) => void): () => void {
-  let listeners = cacheListeners.get(cacheKey);
-  if (!listeners) {
-    listeners = new Set();
-    cacheListeners.set(cacheKey, listeners);
+/**
+ * Timeline deltas are background work. Prefer the browser idle queue so input
+ * and paint get a turn before a burst of streaming assistant updates. The
+ * timeout keeps a quiet-but-busy page from starving the stream indefinitely;
+ * test environments without requestIdleCallback use the existing frame
+ * scheduler.
+ */
+function scheduleTimelineIdle(callback: () => void): () => void {
+  if (typeof window !== 'undefined' && typeof window.requestIdleCallback === 'function') {
+    const id = window.requestIdleCallback(() => callback(), { timeout: 50 });
+    return () => window.cancelIdleCallback?.(id);
   }
-  listeners.add(listener);
-  return () => {
-    const set = cacheListeners.get(cacheKey);
-    if (!set) return;
-    set.delete(listener);
-    if (set.size === 0) cacheListeners.delete(cacheKey);
-  };
+  return scheduleBrowserFrame(callback);
 }
 
-function pruneTimelineCache(): void {
-  let totalEvents = 0;
-  for (const events of eventsCache.values()) totalEvents += events.length;
-  if (eventsCache.size <= MAX_CACHED_SESSIONS && totalEvents <= MAX_TOTAL_CACHED_EVENTS) return;
+/**
+ * A passive presentation (a summary-mode hidden pane, a collapsed card) shows
+ * nothing anyone is watching, yet each flush of its coalesced live events is a
+ * setState and a render of its whole subtree. With ~20 such presentations the
+ * 50 ms idle budget alone was ~20 renders/s each. Flush them slowly instead;
+ * the pending map coalesces by eventId, so the newest value of every signal
+ * still lands, and becoming visible/active flushes at once.
+ */
+export const PASSIVE_TIMELINE_FLUSH_MS = 500;
 
-  const evictionOrder = [...eventsCache.keys()]
-    .filter((key) => (cacheListeners.get(key)?.size ?? 0) === 0)
-    .map((key) => ({ key, at: eventsCacheAccess.get(key) ?? 0, size: eventsCache.get(key)?.length ?? 0 }))
-    .sort((a, b) => a.at - b.at);
+/**
+ * A presentation is passive only when NOTHING about it is on screen: summary
+ * subscription, not the focus/recovery owner, and not visible. A card in the
+ * sub-session bar counts as visible once its preview is hydrated (or its window
+ * is open / it is focused) -- while it is on screen it follows the live stream
+ * at the normal idle-frame cadence like any other on-screen view. Only what is
+ * off screen (hidden panes, un-hydrated previews) may trail by
+ * PASSIVE_TIMELINE_FLUSH_MS.
+ */
+export function isPassiveTimelinePresentation(
+  subscriptionMode: 'full' | 'summary',
+  isActiveSession: boolean,
+  isVisible: boolean,
+): boolean {
+  return subscriptionMode === 'summary' && !isActiveSession && !isVisible;
+}
 
-  for (const entry of evictionOrder) {
-    if (eventsCache.size <= MAX_CACHED_SESSIONS && totalEvents <= MAX_TOTAL_CACHED_EVENTS) break;
-    if (eventsCache.delete(entry.key)) {
-      eventsCacheAccess.delete(entry.key);
-      totalEvents -= entry.size;
-    }
-  }
+/** Spread passive flushes so dozens of presentations do not all wake in the same task. */
+export const PASSIVE_TIMELINE_JITTER_MS = 250;
+
+function schedulePassiveTimelineFlush(callback: () => void): () => void {
+  const id = setTimeout(callback, PASSIVE_TIMELINE_FLUSH_MS + Math.random() * PASSIVE_TIMELINE_JITTER_MS);
+  return () => clearTimeout(id);
+}
+
+function subscribeCache(cacheKey: string, listener: (events: TimelineEvent[]) => void): () => void {
+  const store = getTimelineStore(cacheKey);
+  const wrapped = () => listener(store.getSnapshot().events);
+  return store.subscribe(wrapped);
 }
 
 function scopeCacheKey(serverId: string | null | undefined, sessionId: string): string {
@@ -596,9 +977,9 @@ function getTimelineSnapshotStorageKey(cacheKey: string): string {
   return `${TIMELINE_SNAPSHOT_STORAGE_PREFIX}${cacheKey}`;
 }
 
-function loadPersistedTimelineSnapshot(cacheKey: string): TimelineEvent[] {
+function loadTimelineSnapshotFromStorage(storage: Storage, cacheKey: string): TimelineEvent[] {
   try {
-    const raw = localStorage.getItem(getTimelineSnapshotStorageKey(cacheKey));
+    const raw = storage.getItem(getTimelineSnapshotStorageKey(cacheKey));
     if (!raw) return [];
     const parsed = JSON.parse(raw);
     if (!Array.isArray(parsed)) return [];
@@ -626,31 +1007,132 @@ function loadPersistedTimelineSnapshotWithFallback(
   cacheKey: string,
   rawSessionId: string | undefined,
 ): TimelineEvent[] {
-  const scoped = loadPersistedTimelineSnapshot(cacheKey);
-  if (scoped.length > 0) return scoped;
-  if (!rawSessionId || rawSessionId === cacheKey) return scoped;
-  const raw = loadPersistedTimelineSnapshot(rawSessionId);
-  if (raw.length === 0) return scoped;
-  // Best-effort migration: re-persist under the scoped key and clear the
-  // raw entry. localStorage.setItem can throw on quota; if it does we
-  // still return the raw events so the user sees them.
-  try {
-    localStorage.setItem(getTimelineSnapshotStorageKey(cacheKey), JSON.stringify(raw));
-    localStorage.removeItem(getTimelineSnapshotStorageKey(rawSessionId));
-  } catch {
-    /* ignore — fallback read still surfaced the events */
+  // Search one storage tier at a time. This ordering is load-bearing: the
+  // current window may have written under the raw session key before serverId
+  // resolved, while localStorage already contains a scoped snapshot produced
+  // by another tab. Looking up all scoped tiers before raw would let that peer
+  // replace this window's own cache.
+  const storages: Storage[] = [];
+  try { storages.push(sessionStorage); } catch { /* unavailable */ }
+  try { storages.push(localStorage); } catch { /* unavailable */ }
+  for (const storage of storages) {
+    const scoped = loadTimelineSnapshotFromStorage(storage, cacheKey);
+    if (scoped.length > 0) return scoped;
+    if (!rawSessionId || rawSessionId === cacheKey) continue;
+    const raw = loadTimelineSnapshotFromStorage(storage, rawSessionId);
+    if (raw.length === 0) continue;
+    // Best-effort same-tier migration. Only remove the source after the target
+    // write succeeds; quota/private-mode failure keeps the sole readable copy.
+    try {
+      storage.setItem(getTimelineSnapshotStorageKey(cacheKey), JSON.stringify(raw));
+      storage.removeItem(getTimelineSnapshotStorageKey(rawSessionId));
+    } catch { /* raw remains readable */ }
+    return raw;
   }
-  return raw;
+  return [];
+}
+
+function loadSynchronousTimelineSeed(
+  cacheKey: string,
+  rawSessionIdForFallback?: string,
+): TimelineEvent[] {
+  const memCached = getCachedEvents(cacheKey);
+  if (memCached && memCached.length > 0) return memCached;
+  return loadPersistedTimelineSnapshotWithFallback(cacheKey, rawSessionIdForFallback);
 }
 
 function getPersistableTimelineTail(
   events: TimelineEvent[],
   opts?: { includeStreaming?: boolean },
 ): TimelineEvent[] {
-  const persistable = events.filter((event) => opts?.includeStreaming === true || shouldPersistTimelineEvent(event));
-  return persistable.length > MAX_PERSISTED_SNAPSHOT_EVENTS
-    ? persistable.slice(persistable.length - MAX_PERSISTED_SNAPSHOT_EVENTS)
-    : persistable;
+  const persistable = events.filter((event) => {
+    if (opts?.includeStreaming !== true && !shouldPersistTimelineEvent(event)) return false;
+    if (event.hidden) return false;
+    // Keep rows that definitely paint plus tool-detail rows the user may have
+    // enabled. Last-value status/usage/terminal signals belong in IndexedDB,
+    // not in the scarce synchronous cache: normal idle signals can otherwise
+    // crowd conversation rows out before the per-class tail is selected.
+    return isGuaranteedVisibleTimelineEvent(event)
+      || TIMELINE_PREFERENCE_DEPENDENT_TYPES.includes(event.type);
+  });
+  const textTail = persistable
+    .filter(isTimelineSnapshotTextEvent)
+    .slice(-MAX_PERSISTED_SNAPSHOT_EVENTS_PER_CLASS);
+  const detailTail = persistable
+    .filter((event) => !isTimelineSnapshotTextEvent(event))
+    .slice(-MAX_PERSISTED_SNAPSHOT_EVENTS_PER_CLASS);
+  const retained = new Set([...textTail, ...detailTail]);
+  return persistable.filter((event) => retained.has(event));
+}
+
+function isTimelineSnapshotTextEvent(event: TimelineEvent): boolean {
+  return event.type === MESSAGE_PIN_EVENT_TYPES.USER
+    || event.type === MESSAGE_PIN_EVENT_TYPES.ASSISTANT;
+}
+
+function serializeCompactTimelineTextPreview(event: TimelineEvent): string {
+  const rawText = typeof event.payload.text === 'string' ? event.payload.text : '';
+  // Code-point slicing avoids cutting a surrogate pair. 1,024 code points fit
+  // comfortably inside the smallest 8 KiB self-budget even for CJK/emoji, so
+  // one oversized answer can never turn the synchronous cache into tool-only
+  // rows. The authoritative full payload remains in IndexedDB/daemon history.
+  const chars = Array.from(rawText);
+  const text = chars.length > 1_024
+    ? `${chars.slice(0, 1_024).join('')}…`
+    : rawText;
+  const payload: TimelineEvent['payload'] = {
+    text,
+    historyPayloadTruncated: true,
+    completeness: 'preview',
+  };
+  // Preserve the small rendering/reconciliation fields that affect bubble
+  // state, but intentionally do not copy arbitrary large payload members.
+  for (const key of ['streaming', 'pending', 'failed', 'commandId', 'clientMessageId', 'allowDuplicate'] as const) {
+    if (Object.prototype.hasOwnProperty.call(event.payload, key)) payload[key] = event.payload[key];
+  }
+  return JSON.stringify({ ...event, payload });
+}
+
+function serializeTimelineSnapshotTail(tail: TimelineEvent[], maxBytes = MAX_PERSISTED_SNAPSHOT_BYTES): string {
+  if (tail.length === 0) return '[]';
+
+  const serialized = tail.map((event, index) => ({
+    index,
+    event,
+    value: JSON.stringify(event),
+    compactValue: isTimelineSnapshotTextEvent(event)
+      ? serializeCompactTimelineTextPreview(event)
+      : undefined,
+  }));
+  const selected = new Map<number, string>();
+  let serializedBytes = 2; // []
+  const selectNewest = (candidates: typeof serialized): void => {
+    for (let index = candidates.length - 1; index >= 0; index -= 1) {
+      const candidate = candidates[index]!;
+      const commaBytes = selected.size > 0 ? 1 : 0;
+      const fullBytes = timelineSnapshotTextEncoder.encode(candidate.value).byteLength;
+      const value = serializedBytes + fullBytes + commaBytes <= maxBytes
+        ? candidate.value
+        : candidate.compactValue;
+      if (value === undefined) continue;
+      const valueBytes = timelineSnapshotTextEncoder.encode(value).byteLength;
+      const addedBytes = valueBytes + commaBytes;
+      if (serializedBytes + addedBytes > maxBytes) continue;
+      selected.set(candidate.index, value);
+      serializedBytes += addedBytes;
+    }
+  };
+
+  // Conversation text gets first claim on the budget, newest first. Tool rows
+  // are already distinct timeline events, so they use only the remaining room
+  // instead of displacing the text the user needs to see immediately.
+  selectNewest(serialized.filter(({ event }) => isTimelineSnapshotTextEvent(event)));
+  selectNewest(serialized.filter(({ event }) => !isTimelineSnapshotTextEvent(event)));
+
+  const ordered = [...selected.entries()]
+    .sort(([left], [right]) => left - right)
+    .map(([, value]) => value);
+  return `[${ordered.join(',')}]`;
 }
 
 function areTimelineSnapshotTailsSame(left: TimelineEvent[] | undefined, right: TimelineEvent[]): boolean {
@@ -666,16 +1148,32 @@ function areTimelineSnapshotTailsSame(left: TimelineEvent[] | undefined, right: 
 function persistTimelineSnapshotTail(cacheKey: string, tail: TimelineEvent[]): void {
   try {
     if (tail.length === 0) {
-      localStorage.removeItem(getTimelineSnapshotStorageKey(cacheKey));
+      safeLocalStorageRemoveItem(getTimelineSnapshotStorageKey(cacheKey));
+      try { sessionStorage.removeItem(getTimelineSnapshotStorageKey(cacheKey)); } catch { /* ignore */ }
       lastWrittenTimelineSnapshotTails.set(cacheKey, tail);
       return;
     }
-    localStorage.setItem(getTimelineSnapshotStorageKey(cacheKey), JSON.stringify(tail));
-    lastWrittenTimelineSnapshotTails.set(cacheKey, tail);
+    // Quota-aware write. The compact, renderable-only value keeps many session
+    // seeds resident. Each retry spends only this window's smaller budget; the
+    // storage helper never evicts another window's timeline/file/terminal cache.
+    const storageKey = getTimelineSnapshotStorageKey(cacheKey);
+    let durableWritten = false;
+    let windowWritten = false;
+    for (let index = 0; index < PERSISTED_SNAPSHOT_SELF_BUDGETS.length; index += 1) {
+      const value = serializeTimelineSnapshotTail(tail, PERSISTED_SNAPSHOT_SELF_BUDGETS[index]);
+      if (!windowWritten) {
+        try { sessionStorage.setItem(storageKey, value); windowWritten = true; } catch { /* self-shrink */ }
+      }
+      if (!durableWritten) durableWritten = safeLocalStorageSetItem(storageKey, value);
+      if (windowWritten && durableWritten) break;
+    }
+    // Record ONLY a write that landed: areTimelineSnapshotTailsSame() skips a
+    // write whose tail matches the last recorded one, so remembering a failed
+    // write would strand this session without a snapshot until its tail
+    // changed again.
+    if (windowWritten && durableWritten) lastWrittenTimelineSnapshotTails.set(cacheKey, tail);
   } catch {
-    // best-effort — quota / private mode / JSON encode failure all land here.
-    // A follow-up should add quota-driven LRU eviction; for now we lose the
-    // tail write on failure but never corrupt the on-disk snapshot.
+    // JSON encode failure only — storage quota is handled above.
   }
 }
 
@@ -695,11 +1193,24 @@ function flushPendingTimelineSnapshotWrites(): void {
   }
 }
 
-function persistTimelineSnapshotsBeforeFreeze(): void {
+function persistTimelineSnapshotsBeforeFreeze(): number {
+  let persistedCount = 0;
   for (const [cacheKey, cachedEvents] of eventsCache.entries()) {
+    // Ordinary (non-streaming) tails are already covered by the debounced
+    // snapshot writer, which flushTimelineSnapshotsBeforeFreeze() drains immediately
+    // before this pass. Re-serializing every retained session here turns a
+    // screen lock/pagehide into an O(all sessions x tail payload) synchronous
+    // main-thread task. On workspaces with many open timelines Chromium can
+    // resume the compositor while that task is still monopolizing JS, leaving
+    // animations alive but clicks and reload unresponsive. The only data that
+    // needs this extra crash-mat write is the streaming text intentionally
+    // excluded from the normal snapshot/IDB path.
+    if (!cachedEvents.some((event) => event.payload?.streaming === true)) continue;
     const tail = getPersistableTimelineTail(cachedEvents, { includeStreaming: true });
     persistTimelineSnapshotTail(cacheKey, tail);
+    persistedCount += 1;
   }
+  return persistedCount;
 }
 
 function clearPendingTimelineSnapshotWrites(): void {
@@ -707,6 +1218,22 @@ function clearPendingTimelineSnapshotWrites(): void {
   pendingTimelineSnapshotTimers.clear();
   pendingTimelineSnapshotTails.clear();
   lastWrittenTimelineSnapshotTails.clear();
+}
+
+function flushTimelineSnapshotsBeforeFreeze(): number {
+  signalWriteBatcher.flush();
+  flushPendingTimelineCacheIngests();
+  flushPendingTimelineSnapshotWrites();
+  // A full page refresh during an active transport turn otherwise loses the
+  // latest assistant.text streaming payload: streaming ticks are intentionally
+  // kept out of IDB, and the daemon history store only has the final event.
+  // localStorage is the lightweight browser-local crash mat for refresh/pagehide.
+  return persistTimelineSnapshotsBeforeFreeze();
+}
+
+/** Test seam for the exact callback registered on browser freeze events. */
+export function __flushTimelineSnapshotsBeforeFreezeForTests(): number {
+  return flushTimelineSnapshotsBeforeFreeze();
 }
 
 function scheduleTimelineSnapshotPersist(cacheKey: string, events: TimelineEvent[]): void {
@@ -722,20 +1249,11 @@ function scheduleTimelineSnapshotPersist(cacheKey: string, events: TimelineEvent
 }
 
 if (typeof document !== 'undefined' && typeof window !== 'undefined') {
-  const flushSnapshotsBeforeFreeze = (): void => {
-    flushPendingTimelineCacheIngests();
-    flushPendingTimelineSnapshotWrites();
-    // A full page refresh during an active transport turn otherwise loses the
-    // latest assistant.text streaming payload: streaming ticks are intentionally
-    // kept out of IDB, and the daemon history store only has the final event.
-    // localStorage is the lightweight browser-local crash mat for refresh/pagehide.
-    persistTimelineSnapshotsBeforeFreeze();
-  };
   document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'hidden') flushSnapshotsBeforeFreeze();
+    if (document.visibilityState === 'hidden') flushTimelineSnapshotsBeforeFreeze();
   });
-  window.addEventListener('pagehide', flushSnapshotsBeforeFreeze);
-  window.addEventListener('beforeunload', flushSnapshotsBeforeFreeze);
+  window.addEventListener('pagehide', flushTimelineSnapshotsBeforeFreeze);
+  window.addEventListener('beforeunload', flushTimelineSnapshotsBeforeFreeze);
 }
 
 function isProvisionalTransportHistoryEvent(event: TimelineEvent): boolean {
@@ -756,6 +1274,22 @@ function getUserMessageCommandId(event: TimelineEvent): string | undefined {
 
 function isLocalOptimisticUserMessage(event: TimelineEvent): boolean {
   return event.type === 'user.message' && event.eventId.startsWith(OPTIMISTIC_EVENT_ID_PREFIX);
+}
+
+/**
+ * A local bubble for an Append-mode send. It is steered INTO the running turn,
+ * so its timeline slot is final from the moment it is sent: a queue snapshot
+ * or delivery frame that still lists its id must not retire it (that retire
+ * path exists for FIFO sends, whose card lives in the queue strip instead).
+ * Only the daemon's own user.message for the same id replaces it.
+ */
+function isOptimisticAppendUserMessage(event: TimelineEvent): boolean {
+  if (!isLocalOptimisticUserMessage(event)) return false;
+  if (event.payload.queueAppended === true) return true;
+  const extra = event.payload._resendExtra;
+  return !!extra
+    && typeof extra === 'object'
+    && (extra as { deliveryMode?: unknown }).deliveryMode === SESSION_SEND_DELIVERY_MODES.APPEND;
 }
 
 function isAuthoritativeSendProgressEvent(event: TimelineEvent): boolean {
@@ -804,10 +1338,20 @@ function convertTransportHistoryRecordToTimelineEvent(
   };
 
   if (rawType === 'user.message' && typeof record.text === 'string') {
+    const payload: Record<string, unknown> = { text: record.text };
+    const commandId = typeof record.commandId === 'string' ? record.commandId.trim() : '';
+    const clientMessageId = typeof record.clientMessageId === 'string' ? record.clientMessageId.trim() : '';
+    if (commandId) payload.commandId = commandId;
+    if (clientMessageId) payload.clientMessageId = clientMessageId;
+    if (record.queueAppended === true) payload.queueAppended = true;
+    if (record.allowDuplicate === true) payload.allowDuplicate = true;
+    if (typeof record.pendingMessageVersion === 'number' && Number.isFinite(record.pendingMessageVersion)) {
+      payload.pendingMessageVersion = record.pendingMessageVersion;
+    }
     return {
       ...base,
       type: 'user.message',
-      payload: { text: record.text },
+      payload,
     };
   }
 
@@ -843,11 +1387,27 @@ function scopeEventsForDb(cacheKey: string, events: TimelineEvent[]): TimelineEv
   return events.map((event) => (event.sessionId === cacheKey ? event : { ...event, sessionId: cacheKey }));
 }
 
+/**
+ * Last-value signals are only ever kept as the newest per (session, type), so
+ * every presentation of every session used to open its own IDB transaction per
+ * flush for values the next flush overwrites. They now share one batched write
+ * per SIGNAL_WRITE_INTERVAL_MS (page hide / unload flushes at once); conversation
+ * events are still written immediately.
+ */
+const signalWriteBatcher = createSignalWriteBatcher({
+  write: (events) => { sharedDb.putEvents(events).catch(() => {}); },
+});
+
 function persistTimelineEvents(cacheKey: string, events: TimelineEvent[]): void {
   if (events.length === 0) return;
   const persistable = events.filter(shouldPersistTimelineEvent);
   if (persistable.length === 0) return;
-  sharedDb.putEvents(scopeEventsForDb(cacheKey, persistable)).catch(() => {});
+  const scoped = scopeEventsForDb(cacheKey, persistable);
+  const conversation = scoped.filter((event) => !isLastValueTimelineEventType(event.type));
+  const signals = scoped.filter((event) => isLastValueTimelineEventType(event.type));
+  if (conversation.length > 0) sharedDb.putEvents(conversation).catch(() => {});
+  if (signals.length > 0) signalWriteBatcher.push(signals);
+  scheduleLocalHistoryPrune(cacheKey, persistable.length);
 }
 
 // Persist events to IDB WITHOUT the streaming filter — used only by the
@@ -855,6 +1415,7 @@ function persistTimelineEvents(cacheKey: string, events: TimelineEvent[]): void 
 function persistTimelineEventsIncludingStreaming(cacheKey: string, events: TimelineEvent[]): void {
   if (events.length === 0) return;
   sharedDb.putEvents(scopeEventsForDb(cacheKey, events)).catch(() => {});
+  scheduleLocalHistoryPrune(cacheKey, events.length);
 }
 
 function shouldPersistTimelineEvent(event: TimelineEvent): boolean {
@@ -868,7 +1429,25 @@ function shouldPersistTimelineEvent(event: TimelineEvent): boolean {
 function shouldFrameCoalesceTimelineEvent(event: TimelineEvent): boolean {
   return (event.type === 'assistant.text' && event.payload?.streaming === true)
     || event.type === 'tool.call'
-    || event.type === 'tool.result';
+    || event.type === 'tool.result'
+    // Last-value signals: session state, agent status, token usage, memory
+    // context, terminal snapshots, command acks. Measured on a real store they
+    // are ~84% of all events, session.state alone ~67%, and by definition only
+    // the NEWEST of each is ever rendered.
+    //
+    // They were the only high-volume class left outside this allowlist, so each
+    // arrival drove its own setEvents and its own React commit. Measured through
+    // the live WS path with one macrotask per frame — which is how frames really
+    // arrive, and where React auto-batching does NOT apply — 200 session.state
+    // frames produced 200 commits while streaming text and tool events produced
+    // one.
+    //
+    // Coalescing costs at most one animation frame and cannot lose information:
+    // same-frame arrivals collapse via preferTimelineEvent, so the newest
+    // authoritative value wins and a superseded one was never going to be
+    // displayed. Queue reconciliation rides on session.state and still applies,
+    // one frame later rather than in the same call stack.
+    || (event.summary === true && isLastValueTimelineEventType(event.type));
 }
 
 const pendingTimelineCacheIngests = new Map<string, Map<string, TimelineEvent>>();
@@ -1033,13 +1612,18 @@ export function __getSharedTimelineBaseForTests(
 }
 
 export function __resetTimelineCacheForTests(): void {
+  signalWriteBatcher.cancel();
   cancelPendingTimelineCacheIngests();
   flushPendingTimelineSnapshotWrites();
   eventsCache.clear();
-  eventsCacheAccess.clear();
   cacheListeners.clear();
+  __resetTimelineStoresForTests();
   lastHttpBackfillResponseAt.clear();
   watchdogStateByCacheKey.clear();
+  backgroundBackfillGateByCacheKey.clear();
+  gapBackfillInFlight.clear();
+  incompleteHoleHoldByCacheKey.clear();
+  __resetTimelineGapsForTests();
 }
 
 export function __resetBackfillCooldownsForTests(): void {
@@ -1055,6 +1639,12 @@ export function __clearPersistedTimelineSnapshotsForTests(): void {
       if (key?.startsWith(TIMELINE_SNAPSHOT_STORAGE_PREFIX)) keys.push(key);
     }
     for (const key of keys) localStorage.removeItem(key);
+    const windowKeys: string[] = [];
+    for (let i = 0; i < sessionStorage.length; i++) {
+      const key = sessionStorage.key(i);
+      if (key?.startsWith(TIMELINE_SNAPSHOT_STORAGE_PREFIX)) windowKeys.push(key);
+    }
+    for (const key of windowKeys) sessionStorage.removeItem(key);
   } catch {
     // ignore
   }
@@ -1065,22 +1655,46 @@ function isHistoryCursorEligibleEvent(ev: TimelineEvent): boolean {
   // Pending optimistic bubbles carry `ts = Date.now()` from the client clock —
   // exclude them so a skewed client clock can't accidentally filter out
   // legitimately-missed server events.
-  if (ev.type === 'user.message' && (ev as { payload?: { pending?: boolean } }).payload?.pending) return false;
+  // A local optimistic bubble stays in the timeline after the daemon receipt
+  // (pending cleared) until its echo arrives, so it is excluded whether or not
+  // it is still pending.
+  if (ev.type === 'user.message'
+    && ((ev as { payload?: { pending?: boolean } }).payload?.pending || isLocalOptimisticUserMessage(ev))) return false;
   return true;
 }
 
-function getTimelineHistoryAfterTs(events: TimelineEvent[]): number | undefined {
+/** Newest ts of any event a history cursor may anchor on (content events only, never optimistic bubbles). */
+function getTimelineHistoryMaxTs(events: readonly TimelineEvent[]): number | undefined {
   let maxTs: number | undefined;
   for (const ev of events) {
     if (!isHistoryCursorEligibleEvent(ev)) continue;
     if (typeof ev.ts === 'number' && (maxTs === undefined || ev.ts > maxTs)) maxTs = ev.ts;
   }
+  return maxTs;
+}
+
+function getTimelineHistoryAfterTs(events: TimelineEvent[]): number | undefined {
+  const maxTs = getTimelineHistoryMaxTs(events);
   if (maxTs === undefined) return undefined;
   return Math.max(0, maxTs - TIMELINE_HISTORY_AFTER_TS_OVERLAP_MS);
 }
 
 export function __getTimelineHistoryAfterTsForTests(events: TimelineEvent[]): number | undefined {
   return getTimelineHistoryAfterTs(events);
+}
+
+/**
+ * Cache keys still held by the snapshot bookkeeping.
+ *
+ * These maps pin events and timers independently of the events cache, so
+ * eviction has to clear them too or it frees almost nothing.
+ */
+export function __getTimelineSnapshotBookkeepingKeysForTests(): string[] {
+  return [...new Set([
+    ...lastWrittenTimelineSnapshotTails.keys(),
+    ...pendingTimelineSnapshotTails.keys(),
+    ...pendingTimelineSnapshotTimers.keys(),
+  ])];
 }
 
 export function __getTimelineCacheKeysForTests(): string[] {
@@ -1130,6 +1744,10 @@ export interface UseTimelineResult {
     opts?: {
       attachments?: Array<Record<string, unknown>>;
       resendExtra?: Record<string, unknown>;
+      /** Keep a manually appended message visible while queue authority still
+       * reports it as pending. The authoritative user.message echo remains the
+       * only success settlement; explicit append rejection removes it. */
+      queueAppend?: boolean;
     },
   ) => void;
   /** Flip a pending optimistic message to failed state (red "!") keyed by commandId. */
@@ -1148,6 +1766,12 @@ export interface UseTimelineResult {
   ) => void;
   /** Load older events before the earliest currently loaded event. */
   loadOlderEvents: () => void;
+  /**
+   * The hole between this window's stale local cache and the newest messages it has already shown, while
+   * it is still being filled newest→oldest (null when there is none). `lowerTs` is exclusive: the newest
+   * cached event; `upperTs` is where the stitched newest block begins (null = not known yet).
+   */
+  historyGap: TimelineGap | null;
   /** Explicit user-triggered sync for THIS session (the chat ↻ button):
    *  visible (shows the refreshing overlay), force (works even when this hook
    *  isn't the active session, e.g. a visible sub-session card/window), and
@@ -1162,21 +1786,28 @@ export interface UseTimelineResult {
 
 export interface UseTimelineOptions {
   /**
-   * Only the active/visible timeline should trigger opportunistic HTTP
+   * Only the active timeline should trigger opportunistic HTTP
    * backfills. Inactive mounted timelines still stay warm via cache + WS
    * events, but they must not hammer `/timeline/history/full`.
    */
   isActiveSession?: boolean;
   /**
-   * Resume-broadcast eligibility: when `true`, the hook participates in the
-   * `ACTIVE_TIMELINE_REFRESH_EVENT` broadcast even if it isn't the active
-   * session. Used by visible-but-not-focused sub-session cards / windows so
-   * that a desktop with multiple open cards catches up on focus/visibility
-   * resume (gated by the same 15s success-only `ACTIVE_REFRESH_COOLDOWN_MS`,
-   * so multi-card resume is still rate-limited per session). Defaults to
-   * `isActiveSession` for back-compat.
+   * Presentation visibility. Visible inactive timelines stay subscribed and
+   * remain eligible for explicit per-session refresh, but a global browser
+   * resume only refreshes the focused/active timeline. This prevents a lock
+   * screen resume from creating one HTTP/IDB recovery job per open window.
+   * Defaults to `isActiveSession` for back-compat.
    */
   isVisible?: boolean;
+  /**
+   * This hook backs a real chat surface (main pane, floating window, or pinned
+   * panel), not a passive card preview. A visible surface must bootstrap its
+   * own history even when another window currently owns keyboard focus.
+   *
+   * Kept opt-in so a wall of SubSessionCard previews cannot fan out one daemon
+   * and HTTP history request per card after a reload.
+   */
+  bootstrapWhenVisible?: boolean;
   /**
    * Shell/script process sessions have no chat timeline. When disabled, the
    * hook stays idle and skips daemon/HTTP/text-tail history work entirely.
@@ -1188,6 +1819,8 @@ export interface UseTimelineOptions {
    * tool/result/idle frames but the daemon already reports the session idle.
    */
   authoritativeSessionState?: string;
+  /** Desired live timeline delivery for this presentation. Active/on-screen views use full; hidden cards use summary. */
+  subscriptionMode?: import('@shared/timeline-protocol.js').TimelineSubscriptionMode;
 }
 
 export type TimelineHistoryPhase = 'idle' | 'bootstrap' | 'refresh' | 'older';
@@ -1406,6 +2039,18 @@ function createTimelineHistoryResponseNotice(msg: TimelineProtocolServerMessage)
   };
 }
 
+/**
+ * Exposed for the production-chain regression: a daemon history frame must be
+ * classified here exactly as it is at runtime, so the test cannot pass against
+ * a re-implementation of the rule it is meant to protect.
+ */
+export function __shouldRetryTimelineHistoryResponseForTests(
+  msg: TimelineEventsServerMessage,
+  hasRenderedEvents: boolean,
+): boolean {
+  return shouldRetryTimelineHistoryResponse(msg, hasRenderedEvents);
+}
+
 function shouldRetryTimelineHistoryResponse(msg: TimelineEventsServerMessage, hasRenderedEvents: boolean): boolean {
   if (getTimelineEvents(msg).length > 0 || hasRenderedEvents) return false;
   if (msg.recoverable === true) return true;
@@ -1427,6 +2072,37 @@ function getOlderTimelineCursor(msg: TimelineEventsServerMessage): TimelineCurso
   if (!cursor || typeof cursor !== 'object') return null;
   if (cursor.direction !== TIMELINE_CURSOR_DIRECTIONS.OLDER) return null;
   return typeof cursor.beforeTs === 'number' ? cursor : null;
+}
+
+/**
+ * Return a stable identity for a paging cursor.  A summary projection may
+ * legitimately filter every event from a page while preserving the original
+ * paging metadata; if a buggy/old server repeats that cursor, the client must
+ * not turn the empty page into an unbounded request loop.
+ */
+function timelineCursorKey(cursor: TimelineCursor): string {
+  return JSON.stringify([
+    cursor.direction,
+    cursor.epoch,
+    cursor.afterSeq ?? null,
+    cursor.beforeTs ?? null,
+    cursor.afterTs ?? null,
+  ]);
+}
+
+/** Exposed for the pagination regression test; production uses the same key. */
+function shouldRequestNewerTimelineCursor(
+  previousCursorKey: string | null,
+  nextCursor: TimelineCursor,
+): boolean {
+  return previousCursorKey !== timelineCursorKey(nextCursor);
+}
+
+export function __shouldRequestNewerTimelineCursorForTests(
+  previousCursorKey: string | null,
+  nextCursor: TimelineCursor,
+): boolean {
+  return shouldRequestNewerTimelineCursor(previousCursorKey, nextCursor);
 }
 
 function hasStructuredOlderPage(msg: TimelineEventsServerMessage): boolean {
@@ -1558,10 +2234,15 @@ export function useTimeline(
   const cacheKey = sessionId ? scopeCacheKey(serverId, sessionId) : sessionId;
   const isActiveSession = options?.isActiveSession ?? true;
   const isVisible = options?.isVisible ?? isActiveSession;
+  const subscriptionMode = options?.subscriptionMode ?? (isActiveSession || isVisible ? 'full' : 'summary');
+  const bootstrapWhenVisible = options?.bootstrapWhenVisible ?? false;
+  const shouldBootstrapVisibleHistory = isActiveSession || (bootstrapWhenVisible && isVisible);
   const disableHistory = options?.disableHistory ?? false;
   const authoritativeSessionState = options?.authoritativeSessionState;
   const wsConnected = !!ws?.connected;
   const cacheKeyRef = useRef(cacheKey);
+  const timelineSubscriptionOwnerRef = useRef<symbol>(Symbol('timeline-subscription'));
+  const previousSubscriptionModeRef = useRef<typeof subscriptionMode | null>(null);
   cacheKeyRef.current = cacheKey;
   // ── Synchronous cache seed at first render ─────────────────────────────
   // The bootstrap effect that hits memCache / localStorage / IDB runs AFTER
@@ -1607,6 +2288,12 @@ export function useTimeline(
    */
   const localRestoredIdsRef = useRef<Set<string>>(new Set(events.map((event) => event.eventId)));
   /**
+   * Newest content-event ts among those local restores. Kept next to the ledger (and reset with it) instead of
+   * being re-derived from `events`: a restore is recorded before React applies it, and the stale-window hole
+   * decision must not depend on that ordering.
+   */
+  const localRestoredMaxTsRef = useRef<number | undefined>(getTimelineHistoryMaxTs(events));
+  /**
    * Which cacheKey the ledger above describes.
    *
    * Its own ref, NOT `cacheKeyRef`: that one is assigned during render, so by
@@ -1618,10 +2305,99 @@ export function useTimeline(
   /** Bounds how long the daemon step may claim "still coming" with no socket. */
   const daemonWaitTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   /** Union in a local restore and return the running distinct total. */
+  const tryDecideOpenGapRef = useRef<(() => void) | null>(null);
   const recordLocalRestore = useCallback((restored: readonly TimelineEvent[]): number => {
     for (const event of restored) localRestoredIdsRef.current.add(event.eventId);
+    const restoredMaxTs = getTimelineHistoryMaxTs(restored);
+    if (restoredMaxTs !== undefined && (localRestoredMaxTsRef.current === undefined || restoredMaxTs > localRestoredMaxTsRef.current)) {
+      localRestoredMaxTsRef.current = restoredMaxTs;
+    }
+    // A late local restore (IndexedDB) can be the piece that finally lets the hole be recognised.
+    tryDecideOpenGapRef.current?.();
     return localRestoredIdsRef.current.size;
   }, []);
+
+  // ── Stale-window gap (see timeline/catchup/gap-store.ts) ────────────────────
+  // The hole between the local cache and the newest window, filled newest→oldest. Module-level and
+  // persisted, so every window of the session and a reload share one record.
+  const [historyGap, setHistoryGap] = useState<TimelineGap | null>(() => getTimelineGap(cacheKey));
+  useEffect(() => {
+    if (!cacheKey) {
+      setHistoryGap(null);
+      return undefined;
+    }
+    setHistoryGap(getTimelineGap(cacheKey));
+    return subscribeTimelineGap(cacheKey, setHistoryGap);
+  }, [cacheKey]);
+  /** First newest-window page seen since this window (re)opened; the evidence a hole is decided from. */
+  const openWindowTailRef = useRef<{ key: string; minTs: number; maxTs: number; full: boolean } | null>(null);
+  /** The open a decision was already taken for (once per open: later pages are paging, not opening). */
+  const openGapDecidedKeyRef = useRef<string | null>(null);
+  /** Newest cached ts captured at a reconnect (the local-restore ledger only describes the first open). */
+  const openCursorOverrideRef = useRef<{ key: string; ts: number } | null>(null);
+  /** Outstanding stale-window peek request, and when/for what it was last sent. */
+  const peekRequestIdRef = useRef<string | null>(null);
+  const lastPeekRef = useRef<{ key: string; at: number } | null>(null);
+
+  /** Newest content-event ts the LOCAL cache held (memory / snapshot / IndexedDB), never daemon-fetched rows. */
+  const getLocalCacheCursorTs = useCallback((): number | undefined => {
+    const key = cacheKeyRef.current;
+    const override = openCursorOverrideRef.current;
+    if (override && override.key === key) return override.ts;
+    return localRestoredMaxTsRef.current;
+  }, []);
+
+  const tryDecideOpenGap = useCallback((): void => {
+    const key = cacheKeyRef.current;
+    if (!key || openGapDecidedKeyRef.current === key) return;
+    const tail = openWindowTailRef.current;
+    if (!tail || tail.key !== key) return;
+    // A hole recorded by an earlier open (or another window) is resumed as it is, never re-derived.
+    if (getTimelineGap(key)) {
+      openGapDecidedKeyRef.current = key;
+      return;
+    }
+    const cursorTs = getLocalCacheCursorTs();
+    // Nothing local yet: cold so far. A late local restore re-runs this, so do not decide.
+    if (cursorTs === undefined) {
+      backfillDebug('gap: undecided, no local cursor yet', { key, tailMinTs: tail.minTs, tailFull: tail.full });
+      return;
+    }
+    openGapDecidedKeyRef.current = key;
+    openCursorOverrideRef.current = null;
+    const next = foldPageIntoGap(null, {
+      lowerTs: Math.max(0, cursorTs - TIMELINE_HISTORY_AFTER_TS_OVERLAP_MS),
+      pageMinTs: tail.minTs,
+      pageMaxTs: tail.maxTs,
+      fullPage: tail.full,
+    });
+    backfillDebug('gap: decided', { key, cursorTs, tailMinTs: tail.minTs, tailMaxTs: tail.maxTs, tailFull: tail.full, gap: next });
+    if (next) setTimelineGap(key, next);
+  }, [getLocalCacheCursorTs]);
+  tryDecideOpenGapRef.current = tryDecideOpenGap;
+
+  /** Record the first newest-window page since (re)open — its oldest event vs the cache cursor decides the hole. */
+  const noteOpenWindowTail = useCallback((pageEvents: readonly TimelineEvent[], full: boolean): void => {
+    const key = cacheKeyRef.current;
+    if (!key) return;
+    if (openWindowTailRef.current?.key === key) {
+      // Already have the evidence; the local cache may only just have become known, so try to decide again.
+      tryDecideOpenGap();
+      return;
+    }
+    let minTs = Infinity;
+    let maxTs = -Infinity;
+    for (const event of pageEvents) {
+      if (!isHistoryCursorEligibleEvent(event) || typeof event.ts !== 'number' || !Number.isFinite(event.ts)) continue;
+      if (event.ts < minTs) minTs = event.ts;
+      if (event.ts > maxTs) maxTs = event.ts;
+    }
+    if (!Number.isFinite(minTs)) return;
+    openWindowTailRef.current = { key, minTs, maxTs, full };
+    backfillDebug('gap: newest-window page noted', { key, minTs, maxTs, full, count: pageEvents.length });
+    tryDecideOpenGap();
+  }, [tryDecideOpenGap]);
+
   const transportQueueStateRef = useRef<TransportQueueReducerState>(
     createTransportQueueReducerState(sessionId ?? undefined),
   );
@@ -1660,6 +2436,10 @@ export function useTimeline(
   const historyRequestIdRef = useRef<string | null>(null);
   const olderRequestIdRef = useRef<string | null>(null);
   const olderCursorRef = useRef<TimelineCursor | null>(null);
+  // Tracks the last newer cursor put on the wire.  A filtered summary page
+  // can contain no events while still reporting hasMore; repeating its cursor
+  // must not recurse into an unbounded history request loop.
+  const newerCursorKeyRef = useRef<string | null>(null);
   const historyLoadedRef = useRef<string | null>(null); // tracks which session has been loaded
   const historyRetryRef = useRef(0); // retry count for empty history responses
   const historyTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -1682,6 +2462,42 @@ export function useTimeline(
       counts: count === undefined ? prev.counts : { ...prev.counts, [step]: count },
     }));
   }, []);
+
+  /** Which cacheKey's local read (memory / snapshot / IndexedDB) has settled: after that an empty ledger means "cold". */
+  const localReadSettledKeyRef = useRef<string | null>(null);
+  /**
+   * A window reopened after a long time asks for its newest few readable messages FIRST — a tiny text-only
+   * request sent ahead of the newest window — so the conversation's latest state is on screen after one small
+   * round trip instead of after the (up to 1 MiB) window. Sent when the local cache is known and stale, or when
+   * the local read has not answered yet (a stale cache may be about to appear; a cold one just gets 30 messages
+   * it would have got anyway). Never for a settled-empty (cold) window, and at most once a minute per window.
+   */
+  const sendStaleWindowPeek = useCallback((): void => {
+    if (!ws?.connected || !sessionId || !cacheKey) return;
+    if (!Number.isFinite(staleWindowPeekMinAgeMs)) return;
+    const now = Date.now();
+    const cursorTs = getLocalCacheCursorTs();
+    if (cursorTs !== undefined) {
+      if (now - cursorTs < staleWindowPeekMinAgeMs) return;
+    } else if (localReadSettledKeyRef.current === cacheKey) {
+      return;
+    }
+    const last = lastPeekRef.current;
+    if (last && last.key === cacheKey && now - last.at < STALE_WINDOW_PEEK_REPEAT_MS) return;
+    lastPeekRef.current = { key: cacheKey, at: now };
+    peekRequestIdRef.current = ws.sendTimelineHistoryRequest(
+      sessionId,
+      TIMELINE_STALE_WINDOW_TAIL_PEEK_LIMIT,
+      undefined,
+      undefined,
+      undefined,
+      STALE_WINDOW_PEEK_BUDGET_BYTES,
+      TIMELINE_HISTORY_CONTENT_FILTERS.TEXT,
+    );
+    updateHistoryStep('textTail', 'running', 'bootstrap');
+  }, [cacheKey, getLocalCacheCursorTs, sessionId, updateHistoryStep, ws]);
+  const sendStaleWindowPeekRef = useRef(sendStaleWindowPeek);
+  sendStaleWindowPeekRef.current = sendStaleWindowPeek;
 
   const recordTimelineResponse = useCallback((
     msg: TimelineProtocolServerMessage,
@@ -1714,26 +2530,89 @@ export function useTimeline(
 
   const sendForwardHistoryRequest = useCallback((
     phase: Exclude<TimelineHistoryPhase, 'idle'>,
-    args?: { limit?: number; afterTs?: number },
+    args?: { limit?: number; afterTs?: number; cursor?: TimelineCursor },
+    allowSameNewerCursor = false,
   ) => {
     if (!ws || !sessionId) return null;
-    const requestId = args?.limit === undefined && args?.afterTs === undefined
-      ? ws.sendTimelineHistoryRequest(sessionId)
-      : args?.afterTs === undefined
-        ? ws.sendTimelineHistoryRequest(sessionId, args?.limit ?? MAX_MEMORY_EVENTS)
-        : ws.sendTimelineHistoryRequest(sessionId, args.limit ?? MAX_MEMORY_EVENTS, args.afterTs);
-    historyRequestIdRef.current = requestId;
-    armForwardHistoryTimeout(requestId, phase);
+    const cursor = args?.cursor;
+    if (cursor?.direction === TIMELINE_CURSOR_DIRECTIONS.NEWER) {
+      const cursorKey = timelineCursorKey(cursor);
+      if (!allowSameNewerCursor && !shouldRequestNewerTimelineCursor(newerCursorKeyRef.current, cursor)) return null;
+      newerCursorKeyRef.current = cursorKey;
+    } else {
+      // A fresh tail/bootstrap starts a new paging chain.
+      newerCursorKeyRef.current = null;
+    }
+    // Keep every daemon history/page request on the shared 200-event wire
+    // budget, even legacy callers that still pass MAX_MEMORY_EVENTS (300).
+    const boundedLimit = Math.min(args?.limit ?? MAX_FORWARD_PAGE_EVENTS, MAX_FORWARD_PAGE_EVENTS);
+    const requestId = args?.limit === undefined && args?.afterTs === undefined && args?.cursor === undefined
+      ? ws.sendTimelineHistoryRequest(sessionId, boundedLimit)
+      : args?.afterTs === undefined && args?.cursor === undefined
+        ? ws.sendTimelineHistoryRequest(sessionId, boundedLimit)
+        : args?.cursor === undefined
+          ? ws.sendTimelineHistoryRequest(sessionId, boundedLimit, args?.afterTs)
+        : ws.sendTimelineHistoryRequest(
+          sessionId,
+          boundedLimit,
+          args.afterTs,
+          undefined,
+          args.cursor,
+          args.cursor?.direction === TIMELINE_CURSOR_DIRECTIONS.NEWER ? MAX_FORWARD_PAGE_BYTES : undefined,
+        );
+    // ws.sendTimelineHistoryRequest de-dupes by (session, limit, afterTs): a
+    // call for a key with an already-outstanding request returns the SAME
+    // requestId without putting a new frame on the wire. Re-arming the give-up
+    // timeout unconditionally on every such no-op call lets a caller that
+    // retries faster than FORWARD_HISTORY_TIMEOUT_MS (the refresh button, a
+    // reconnect burst, a bootstrap re-run) push the deadline out indefinitely,
+    // so the fallback that stops the spinner never fires. Only a genuinely new
+    // requestId re-arms; a de-duped repeat leaves the original deadline alone.
+    if (requestId !== historyRequestIdRef.current) {
+      historyRequestIdRef.current = requestId;
+      armForwardHistoryTimeout(requestId, phase);
+    }
     return requestId;
   }, [armForwardHistoryTimeout, sessionId, ws]);
+
+  const sendNewerHistoryPage = useCallback((
+    phase: Exclude<TimelineHistoryPhase, 'idle'>,
+    cursor: TimelineCursor,
+  ) => sendForwardHistoryRequest(phase, {
+    limit: MAX_FORWARD_PAGE_EVENTS,
+    cursor: { ...cursor, direction: TIMELINE_CURSOR_DIRECTIONS.NEWER },
+  }), [sendForwardHistoryRequest]);
 
   const buildForwardHistoryArgs = useCallback((
     limit?: number,
     sourceEvents: TimelineEvent[] = eventsRef.current,
-  ): { limit?: number; afterTs?: number } | undefined => {
+  ): { limit?: number; afterTs?: number; cursor?: TimelineCursor } | undefined => {
+    // A local event cache already has the authoritative ordered cursor. Prefer
+    // an epoch/afterSeq delta so startup/reveal never downloads another full
+    // tail merely because timestamps overlap or many events share one ts.
+    // Epoch changes are handled by the server as a bounded history request.
+    let cachedEpoch = -1;
+    let cachedSeq = -1;
+    for (const event of sourceEvents) {
+      if (!Number.isFinite(event.epoch) || !Number.isFinite(event.seq)) continue;
+      if (event.epoch > cachedEpoch || (event.epoch === cachedEpoch && event.seq > cachedSeq)) {
+        cachedEpoch = event.epoch;
+        cachedSeq = event.seq;
+      }
+    }
+    if (cachedEpoch >= 0 && cachedSeq >= 0 && sourceEvents.length > 0) {
+      return {
+        limit: limit ?? MAX_FORWARD_PAGE_EVENTS,
+        cursor: {
+          epoch: cachedEpoch,
+          afterSeq: cachedSeq,
+          direction: TIMELINE_CURSOR_DIRECTIONS.NEWER,
+        },
+      };
+    }
     const afterTs = getTimelineHistoryAfterTs(sourceEvents);
     if (afterTs !== undefined) {
-      return { limit: limit ?? MAX_MEMORY_EVENTS, afterTs };
+      return { limit: limit ?? MAX_FORWARD_PAGE_EVENTS, afterTs };
     }
     return limit === undefined ? undefined : { limit };
   }, []);
@@ -1750,6 +2629,17 @@ export function useTimeline(
     }
     reconnectRefreshInFlightRef.current = true;
     lastReconnectRefreshAtRef.current = now;
+    // A reconnect after a long absence is a reopen as far as the hole is concerned: remember what the
+    // cache held BEFORE the refresh merges anything, and let the next newest-window page decide again.
+    const gapKey = cacheKeyRef.current;
+    if (gapKey && !getTimelineGap(gapKey)) {
+      const cursorTs = getTimelineHistoryMaxTs(eventsRef.current);
+      if (cursorTs !== undefined) {
+        openCursorOverrideRef.current = { key: gapKey, ts: cursorTs };
+        openWindowTailRef.current = null;
+        openGapDecidedKeyRef.current = null;
+      }
+    }
     return true;
   }, [sessionId]);
 
@@ -1764,17 +2654,95 @@ export function useTimeline(
     }
   }, []);
 
+  const synchronousSeedTriggerRef = useRef<{ cacheKey: string | null; active: boolean }>({
+    cacheKey: cacheKey ?? null,
+    active: isActiveSession,
+  });
+  useLayoutEffect(() => {
+    const nextKey = cacheKey ?? null;
+    const previous = synchronousSeedTriggerRef.current;
+    const cacheKeyChanged = previous.cacheKey !== nextKey;
+    const activated = !previous.active && isActiveSession;
+    synchronousSeedTriggerRef.current = { cacheKey: nextKey, active: isActiveSession };
+    // A newer cursor is scoped to one session/cache chain.  Reset it before
+    // the next bootstrap request so two sessions with identical epoch/seq
+    // cursors cannot suppress the new session's first delta fetch.
+    if (cacheKeyChanged) newerCursorKeyRef.current = null;
+    if (!cacheKeyChanged && !activated) return;
+    if (!cacheKeyChanged && activated && eventsRef.current.length > 0) return;
+
+    if (!sessionId) return;
+    if (disableHistory || !cacheKey) {
+      localRestoredKeyRef.current = nextKey;
+      localRestoredIdsRef.current = new Set();
+      setEvents([]);
+      setLoading(false);
+      setHistoryStatus(createIdleHistoryStatus());
+      return;
+    }
+
+    const rawSessionIdForFallback = sessionId !== cacheKey ? sessionId : undefined;
+    const seed = loadSynchronousTimelineSeed(cacheKey, rawSessionIdForFallback);
+    localRestoredKeyRef.current = cacheKey;
+    localRestoredIdsRef.current = new Set(seed.map((event) => event.eventId));
+    if (seed.length > 0) {
+      setEvents(seed);
+      setLoading(false);
+      setHistoryStatus(createBootstrapHistoryStatus({
+        canHttp: false,
+        cacheSeeded: true,
+        cacheCount: localRestoredIdsRef.current.size,
+      }));
+      return;
+    }
+
+    setEvents([]);
+    setLoading(true);
+    setHistoryStatus(createBootstrapHistoryStatus({ canHttp: false }));
+  }, [cacheKey, disableHistory, isActiveSession, sessionId]);
+
+  // The shared per-session cache fans every merge out to EVERY hook of that
+  // session (card, window, pane). Presentations nobody is looking at only need
+  // the newest snapshot eventually, so they apply it on the passive cadence
+  // instead of one render per merge; visible/active ones apply it at once.
+  const applyPassiveCacheSnapshotRef = useRef<(() => void) | null>(null);
   useEffect(() => {
     if (!cacheKey) return;
-    return subscribeCache(cacheKey, (nextEvents) => {
-      setEvents((prev) => (prev === nextEvents ? prev : nextEvents));
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    let latest: TimelineEvent[] | null = null;
+    const apply = () => {
+      if (timer !== null) { clearTimeout(timer); timer = null; }
+      const next = latest;
+      latest = null;
+      if (next) setEvents((prev) => (prev === next ? prev : next));
+    };
+    applyPassiveCacheSnapshotRef.current = apply;
+    const unsubscribe = subscribeCache(cacheKey, (nextEvents) => {
+      const passive = isPassiveTimelinePresentation(subscriptionModeRef.current, isActiveSessionRef.current, isVisibleRef.current);
+      if (!passive) {
+        if (timer !== null) { clearTimeout(timer); timer = null; }
+        latest = null;
+        setEvents((prev) => (prev === nextEvents ? prev : nextEvents));
+        return;
+      }
+      latest = nextEvents;
+      if (timer === null) timer = setTimeout(apply, PASSIVE_TIMELINE_FLUSH_MS + Math.random() * PASSIVE_TIMELINE_JITTER_MS);
     });
+    return () => {
+      unsubscribe();
+      if (timer !== null) clearTimeout(timer);
+      applyPassiveCacheSnapshotRef.current = null;
+    };
   }, [cacheKey]);
 
   // Reset on session change — but DON'T clear events when sessionId becomes null
   // (window minimized). The memory cache (eventsCache) preserves them for instant
   // restore when the window reopens.
   useEffect(() => {
+    // Keep the guard scoped to the current session even when the synchronous
+    // seed effect has no work to do (for example a cold cache or disabled
+    // history branch).
+    newerCursorKeyRef.current = null;
     if (!sessionId) {
       setLoading(false);
       setHttpRefreshing(false);
@@ -1816,6 +2784,7 @@ export function useTimeline(
     if (localRestoredKeyRef.current !== cacheKey) {
       localRestoredKeyRef.current = cacheKey ?? null;
       localRestoredIdsRef.current = new Set();
+      localRestoredMaxTsRef.current = undefined;
     }
     // If the synchronous mount-time seed already populated `events`, mark
     // the cache step done immediately so the bootstrap overlay never flashes
@@ -1845,15 +2814,12 @@ export function useTimeline(
 
     const requestDaemonHistory = (visible: boolean, limit?: number, sourceEvents?: TimelineEvent[], force = false): void => {
       if (!wsConnected || !ws) return;
-      // Gate WS-side timeline.history_request behind isActiveSession the same
-      // way fireHttpBackfill is gated. SubSessionCard mounts one useTimeline
-      // per sub-session card; with the gate missing, every non-focused card
-      // also asked the daemon for history on mount/reconnect, which (a) drove
-      // the daemon to recoverOpenCodeSessionRecord + exportOpenCodeSession for
-      // OpenCode-typed cards the user never opened, and (b) overwhelmed the
-      // WS bridge with N concurrent timeline.history_request calls per
-      // reconnect. Inactive cards still render previews from memory/IDB
-      // cache and live WS event pushes; they don't need their own backfill.
+      // Gate passive card/hidden history requests, but let an on-screen chat
+      // window request its bounded after-seq delta even when it is not focused.
+      // SubSessionCard mounts one useTimeline per preview; those remain cache /
+      // live-event only. A visible floating window must stay authoritative
+      // after a reconnect without waiting for focus, while its cached rows
+      // still paint synchronously before this request runs.
       //
       // EXCEPTION: when local cache is completely empty (cold IDB branch
       // below), inactive sessions MUST be allowed exactly one history
@@ -1866,7 +2832,7 @@ export function useTimeline(
       // mount-effect dep array includes `isActiveSession`) and the gate
       // passes — at which point the bootstrap path issues its history
       // request as normal.
-      if (!isActiveSessionRef.current && !force) {
+      if (!isActiveSessionRef.current && !shouldBootstrapVisibleHistoryRef.current && !force) {
         updateHistoryStep('daemon', 'skipped', 'bootstrap');
         setLoading(false);
         setRefreshing(false);
@@ -1878,6 +2844,7 @@ export function useTimeline(
       } else {
         markDaemonHistoryBackground();
       }
+      sendStaleWindowPeekRef.current();
       sendForwardHistoryRequest('bootstrap', buildForwardHistoryArgs(limit, sourceEvents));
     };
 
@@ -1942,8 +2909,28 @@ export function useTimeline(
       return () => { cancelled = true; };
     }
 
-    // 3. IndexedDB cache → daemon history (first load for this session in this page session)
-    if (localSnapshot.length === 0) setLoading(true);
+    // 3. IndexedDB cache + authoritative history (first load for this session
+    // in this page session). A cold ACTIVE pane starts daemon history in
+    // parallel with IDB. Previously the daemon request lived only after the
+    // awaited local read; one pending Safari IDB transaction therefore left the
+    // exact UI seen in production forever: "本地缓存 …  daemon ○" and no rows.
+    let coldDaemonRequested = false;
+    let coldDaemonTimer: ReturnType<typeof setTimeout> | null = null;
+    if (localSnapshot.length === 0) {
+      setLoading(true);
+      if (shouldBootstrapVisibleHistory && wsConnected) {
+        // Give a healthy local read one short head start, then hedge with the
+        // daemon instead of awaiting IDB indefinitely. This preserves the cheap
+        // local-first path while bounding the screenshot's cache-only stall.
+        coldDaemonTimer = setTimeout(() => {
+          coldDaemonTimer = null;
+          if (cancelled || coldDaemonRequested) return;
+          requestDaemonHistory(true, undefined, undefined, !isActiveSessionRef.current);
+          coldDaemonRequested = true;
+        }, LOCAL_HISTORY_DAEMON_HEDGE_MS);
+        coldDaemonTimer.unref?.();
+      }
+    }
     // Active session ("the open window") loads IDB immediately. Inactive
     // useTimeline instances (SubSessionCard previews in the bar, hidden
     // SubSessionWindow tabs, etc.) stagger by ~80ms so the active session
@@ -1974,9 +2961,43 @@ export function useTimeline(
       // never mistaken for "no history". `ensureOpen` is awaited inside the
       // read methods. See run 016f9b5b-c8f (split-key + fail-safe).
       const rawSessionIdForFallback = sessionId && sessionId !== cacheKey ? sessionId : undefined;
-      let { stored, cursor, rawAlreadyRead } = await readLocalTimelineMerged(
+      const localRead = readLocalTimelineMerged(
         db, cacheKey!, rawSessionIdForFallback, MAX_MEMORY_EVENTS,
       );
+      let deadlineTimer: ReturnType<typeof setTimeout> | null = null;
+      const first = await Promise.race([
+        localRead.then((result) => ({ kind: 'result' as const, result })),
+        new Promise<{ kind: 'deadline' }>((resolve) => {
+          deadlineTimer = setTimeout(() => resolve({ kind: 'deadline' }), LOCAL_HISTORY_READ_DEADLINE_MS);
+          deadlineTimer.unref?.();
+        }),
+      ]);
+      if (first.kind === 'deadline') {
+        if (cancelled) return;
+        // Let daemon/HTTP continue and let ChatView leave its cache-only
+        // spinner. Do not cancel the IDB request: a late success is valuable and
+        // is merged below under the same cache-key/cancellation fences.
+        updateHistoryStep('cache', 'offline', 'bootstrap');
+        setLoading(false);
+        if (shouldBootstrapVisibleHistory) {
+          fireHttpBackfillRef.current(0, {
+            cooldownMs: 0,
+            phase: 'bootstrap',
+            mode: 'manualLatestWindow',
+            force: true,
+          });
+        }
+      } else if (deadlineTimer) {
+        clearTimeout(deadlineTimer);
+      }
+      if (first.kind === 'result' && coldDaemonTimer) {
+        clearTimeout(coldDaemonTimer);
+        coldDaemonTimer = null;
+      }
+      if (first.kind === 'result') localReadSettledKeyRef.current = cacheKey ?? null;
+      let { stored, cursor, rawAlreadyRead } = first.kind === 'result'
+        ? first.result
+        : await localRead;
       if (cancelled) return;
       // Race-proof local recovery: `getRecentEvents` returns [] BOTH for a
       // genuine cold start AND when IndexedDB failed to open (blocked by another
@@ -2038,6 +3059,20 @@ export function useTimeline(
         // NON-low-completeness restore locks path-2. A truncated tail stays
         // unlocked so re-open re-reads/self-heals.
         markHistoryLoadedIfComplete(restored);
+        // The restore proves this key's store opened and is readable, which is
+        // the only safe moment to trim it. Fire-and-forget: it must never sit
+        // in front of the paint we just did.
+        //
+        // A restore that is ENTIRELY last-value signals is the blank-pane
+        // signature: the bounded window held nothing the chat can render. That
+        // pane is already wrong on screen, so the drain that fixes it should
+        // not wait out the usual idle delay.
+        // "Nothing the user can see", not merely "all last-value": a window of
+        // 299 signals plus one assistant.thinking or transport.queue row also
+        // renders empty, and would otherwise have waited out the idle delay.
+        const restoreIsAllSignals = restored.length > 0
+          && !restored.some((event) => isGuaranteedVisibleTimelineEvent(event));
+        scheduleLocalHistoryPrune(cacheKey!, 0, true, restoreIsAllSignals);
         requestDaemonHistory(false, MAX_MEMORY_EVENTS, restored);
         // Background HTTP backfill — IDB is authoritative only up to the last
         // WS event; reopening after a mid-chat close may leave a gap. A
@@ -2065,14 +3100,21 @@ export function useTimeline(
         // in (authoritative history reconciles by eventId), and leave
         // `historyLoadedRef` unset so a dep-churn re-run / ↻ / the IDB-open
         // backoff retry can re-read the local store if data appears.
-        if (isActiveSession && wsConnected) {
-          requestDaemonHistory(true);
+        if (shouldBootstrapVisibleHistory && wsConnected) {
+          if (!coldDaemonRequested) {
+            requestDaemonHistory(true, undefined, undefined, !isActiveSessionRef.current);
+            coldDaemonRequested = true;
+          }
+          // The local read has settled empty; the already-running daemon step
+          // now owns visible progress, so local loading must not keep the pane
+          // in an IDB-only spinner.
+          setLoading(false);
         } else {
           setLoading(false);
           // Nothing was fetched. Say WHICH it is instead of letting the status
           // fall back to a blanket idle, which reads as "history settled" and
           // renders the empty-chat placeholder while the fetch is still coming.
-          if (!isActiveSession) {
+          if (!shouldBootstrapVisibleHistory) {
             // Inactive timelines deliberately never issue the request, so this
             // is terminal now — a spinner here would never resolve.
             updateHistoryStep('daemon', 'offline', 'bootstrap');
@@ -2089,7 +3131,7 @@ export function useTimeline(
             daemonWaitTimerRef.current.unref?.();
           }
         }
-        if (isActiveSession) {
+        if (shouldBootstrapVisibleHistory) {
           // IDB came back EMPTY. If a low-completeness seed (localStorage tail
           // snapshot / WS replay tail) is already painted, a tail-mode backfill
           // would anchor afterTs at the seed's newest ts and never fetch the
@@ -2102,12 +3144,12 @@ export function useTimeline(
           // blank-pane self-heal effect.
           const truncatedSeedShowing = eventsRef.current.length > 0;
           fireHttpBackfillRef.current(200, truncatedSeedShowing
-            ? { cooldownMs: 0, phase: 'bootstrap', mode: 'manualLatestWindow' }
-            : { cooldownMs: 0, phase: 'bootstrap' });
+            ? { cooldownMs: 0, phase: 'bootstrap', mode: 'manualLatestWindow', force: true }
+            : { cooldownMs: 0, phase: 'bootstrap', force: true });
         }
       }
     };
-    if (isActiveSession) {
+    if (shouldBootstrapVisibleHistory) {
       // Active session: race straight to IDB so the open window paints with
       // full local history ASAP.
       load().catch(() => {});
@@ -2118,8 +3160,11 @@ export function useTimeline(
       // would let dep churn starve background sessions forever.
       setTimeout(() => { if (!cancelled) load().catch(() => {}); }, 80);
     }
-    return () => { cancelled = true; };
-  }, [buildForwardHistoryArgs, cacheKey, clearForwardHistoryTimeout, clearHttpBackfillTimer, disableHistory, isActiveSession, sendForwardHistoryRequest, sessionId, ws, wsConnected]);
+    return () => {
+      cancelled = true;
+      if (coldDaemonTimer) clearTimeout(coldDaemonTimer);
+    };
+  }, [buildForwardHistoryArgs, cacheKey, clearForwardHistoryTimeout, clearHttpBackfillTimer, disableHistory, getLocalCacheCursorTs, isActiveSession, sendForwardHistoryRequest, sessionId, shouldBootstrapVisibleHistory, ws, wsConnected]);
 
   // Map of commandId → optimistic eventId for O(1) lookup on command.ack / dedup.
   const optimisticIdsByCommandRef = useRef(new Map<string, string>());
@@ -2197,6 +3242,7 @@ export function useTimeline(
         const hasConfirmedEcho = base.some((e) =>
           e.type === 'user.message'
           && e.eventId !== eventId
+          && !isLocalOptimisticUserMessage(e)
           && !e.payload.pending
           && !e.payload.failed
           && String(e.payload.text ?? '').trim() === text,
@@ -2214,6 +3260,7 @@ export function useTimeline(
         pending: false,
         failed: true,
       };
+      delete payload.queued;
       if (error) payload.failureReason = error;
       const updated = [...base];
       updated[idx] = { ...existing, payload };
@@ -2380,23 +3427,44 @@ export function useTimeline(
     });
   }, [clearAutoRetryState, clearOptimisticTimer]);
 
-  const reconcileQueuedOptimisticEntries = useCallback((queuedEntries: Array<{ clientMessageId?: string }>) => {
+  // A message the queue now lists is shown in one place only:
+  //  - a FIFO send retires its local bubble; its card in the composer queue
+  //    strip (edit / undo / append) is its "queued" display until delivery;
+  //  - an Append send has no strip card and is never retired, so its own bubble
+  //    carries a small "Queued" marker while its id is listed (cleared on
+  //    delivery, failure, or when the real echo replaces the bubble).
+  // `markAppendQueued: false` is for the delivery path, where the id is being
+  // removed from the queue rather than reported as still queued.
+  const reconcileQueuedOptimisticEntries = useCallback((
+    queuedEntries: Array<{ clientMessageId?: string }>,
+    options?: { markAppendQueued?: boolean },
+  ) => {
     if (queuedEntries.length === 0) return;
     const queuedIds = new Set(queuedEntries.map((entry) => entry.clientMessageId).filter(Boolean));
     if (queuedIds.size === 0) return;
+    const markAppendQueued = options?.markAppendQueued !== false;
     setEvents((prev) => {
       const base = getSharedTimelineBase(cacheKeyRef.current, prev, MAX_MEMORY_EVENTS);
       let changed = false;
-      const next = base.filter((event) => {
-        if (!isLocalOptimisticUserMessage(event)) return true;
+      const next: TimelineEvent[] = [];
+      for (const event of base) {
+        if (!isLocalOptimisticUserMessage(event)) { next.push(event); continue; }
         const commandId = typeof event.payload.commandId === 'string' ? event.payload.commandId : '';
-        if (!commandId || !queuedIds.has(commandId)) return true;
+        if (!commandId || !queuedIds.has(commandId)) { next.push(event); continue; }
+        if (isOptimisticAppendUserMessage(event)) {
+          if (!markAppendQueued || event.payload.failed === true || event.payload.queued === true) {
+            next.push(event);
+            continue;
+          }
+          changed = true;
+          next.push({ ...event, payload: { ...event.payload, queued: true } });
+          continue;
+        }
         optimisticIdsByCommandRef.current.delete(commandId);
         rememberSettledCommandId(commandId);
         clearOptimisticTimer(commandId);
         changed = true;
-        return false;
-      });
+      }
       if (!changed) return base;
       if (cacheKeyRef.current) setCachedEvents(cacheKeyRef.current, next);
       return next;
@@ -2416,7 +3484,18 @@ export function useTimeline(
     reconcileQueuedOptimisticEntries(queuedEntries);
   }, [reconcileQueuedOptimisticEntries, sessionId]);
 
-  const markOptimisticAccepted = useCallback((commandId: string, options?: { clearPending?: boolean }) => {
+  const markOptimisticAccepted = useCallback((commandId: string, options?: {
+    clearPending?: boolean;
+    /**
+     * The daemon has only RECEIVED the command (`command.ack accepted`): stop
+     * the blocking spinner, but keep the command open (not settled) so a later
+     * queue failure / error still flips the bubble to a retryable failure and
+     * the eventual echo still reconciles it. Delegation commands keep their
+     * historical terminal-at-ack behaviour.
+     */
+    receiptOnly?: boolean;
+    queued?: boolean;
+  }) => {
     if (!commandId) return;
     // N-R2 fix (audit 0419d1ac-1f4 / O2 选项 D) — `accepted` is a daemon-
     // receipt ack ("I got your command"), NOT a terminal outcome. Two
@@ -2455,13 +3534,17 @@ export function useTimeline(
         failed: false,
         acked: true,
       };
+      if (options?.queued === true) payload.queued = true;
+      else if (options?.queued === false) delete payload.queued;
       delete payload.failureReason;
       const updated = [...base];
       updated[idx] = { ...existing, payload };
       if (cacheKeyRef.current) setCachedEvents(cacheKeyRef.current, updated);
       return updated;
     });
-    if (clearPending) rememberSettledCommandId(commandId);
+    if (clearPending && (isDelegationOptimisticCommand(commandId) || options?.receiptOnly !== true)) {
+      rememberSettledCommandId(commandId);
+    }
   }, [clearAutoRetryState, clearOptimisticTimer, isDelegationOptimisticCommand, rememberSettledCommandId]);
 
   const settleOptimisticByCommandAck = useCallback((commandId: string, status: string, error?: unknown, options?: { delegated?: boolean }) => {
@@ -2470,7 +3553,12 @@ export function useTimeline(
       markOptimisticFailed(commandId, localizedDelegationAckError(error) ?? (typeof error === 'string' ? error : status));
       return;
     }
-    markOptimisticAccepted(commandId, { clearPending: options?.delegated === true });
+    // A successful receipt means the daemon durably accepted the command (the
+    // core-lane worker acks within milliseconds, independent of the busy main
+    // thread or the agent's queue), NOT that the provider has delivered it.
+    // End the blocking spinner now; the command stays open so a later queue
+    // failure or error ack can still turn the bubble into a retryable failure.
+    markOptimisticAccepted(commandId, { clearPending: true, receiptOnly: options?.delegated !== true });
   }, [markOptimisticAccepted, markOptimisticFailed]);
 
   const settleOptimisticByCommandAckEvent = useCallback((event: TimelineEvent) => {
@@ -2498,9 +3586,10 @@ export function useTimeline(
       return;
     }
     if (event.type === 'transport.queue.delivery') {
-      reconcileQueuedOptimisticEntries([{ clientMessageId: event.clientMessageId }]);
+      markOptimisticAccepted(event.clientMessageId, { clearPending: true, queued: false });
+      reconcileQueuedOptimisticEntries([{ clientMessageId: event.clientMessageId }], { markAppendQueued: false });
     }
-  }, [markOptimisticFailed, reconcileQueuedOptimisticEntries, sessionId, settleOptimisticByCommandAck]);
+  }, [markOptimisticAccepted, markOptimisticFailed, reconcileQueuedOptimisticEntries, sessionId, settleOptimisticByCommandAck]);
 
   const applyTimelineTransportQueueEvidence = useCallback((event: TimelineEvent) => {
     const queueEvent = queueEventFromTimelineEvent(event);
@@ -2551,6 +3640,7 @@ export function useTimeline(
         };
         delete updated[idx]!.payload.failureReason;
         delete updated[idx]!.payload.acked;
+        delete updated[idx]!.payload.queued;
         if (cacheKeyRef.current) setCachedEvents(cacheKeyRef.current, updated);
         return updated;
       }
@@ -2583,6 +3673,10 @@ export function useTimeline(
       const optimisticEvent = base.find((event) => event.eventId === optimisticId);
       if (!optimisticEvent || optimisticEvent.type !== 'user.message') continue;
       if (!optimisticEvent.payload.pending && !optimisticEvent.payload.failed) continue;
+      // Progress from the already-running turn does not prove that an Append
+      // reached the provider boundary. Only its delivery fact or exact
+      // user.message echo may settle this optimistic row.
+      if (isOptimisticAppendUserMessage(optimisticEvent)) continue;
       if (typeof optimisticEvent.ts === 'number' && progressEvent.ts + 1_000 < optimisticEvent.ts) continue;
       const relatedToEventId = progressEvent.type === 'memory.context' && typeof progressEvent.payload.relatedToEventId === 'string'
         ? progressEvent.payload.relatedToEventId
@@ -2621,23 +3715,33 @@ export function useTimeline(
     opts?: {
       attachments?: Array<Record<string, unknown>>;
       resendExtra?: Record<string, unknown>;
+      queueAppend?: boolean;
     },
   ) => {
     if (!sessionId) return;
     const optimisticId = `${OPTIMISTIC_EVENT_ID_PREFIX}${sessionId}:${commandId ?? Date.now()}`;
+    const isAppend = opts?.queueAppend === true
+      || opts?.resendExtra?.deliveryMode === SESSION_SEND_DELIVERY_MODES.APPEND;
     if (commandId) {
       // Guard against double-send of the same commandId: if already tracked,
       // skip — the existing bubble is still valid.
       if (optimisticIdsByCommandRef.current.has(commandId)) return;
       optimisticIdsByCommandRef.current.set(commandId, optimisticId);
       clearOptimisticTimer(commandId);
-      const timer = setTimeout(() => {
-        markOptimisticFailed(commandId, 'timeout');
-      }, OPTIMISTIC_TIMEOUT_MS);
-      optimisticTimersRef.current.set(commandId, timer);
+      // A manual append is already durably represented by the transport queue.
+      // It can legitimately wait longer than the ordinary optimistic timeout
+      // before the provider accepts the next safe boundary. Do not turn that
+      // valid queued row into a false retryable failure.
+      if (!isAppend) {
+        const timer = setTimeout(() => {
+          markOptimisticFailed(commandId, 'timeout');
+        }, OPTIMISTIC_TIMEOUT_MS);
+        optimisticTimersRef.current.set(commandId, timer);
+      }
     }
     const payload: Record<string, unknown> = { text, pending: true };
     if (commandId) payload.commandId = commandId;
+    if (isAppend) payload.queueAppended = true;
     if (opts?.attachments && opts.attachments.length > 0) payload.attachments = opts.attachments;
     if (opts?.resendExtra && Object.keys(opts.resendExtra).length > 0) {
       // Prefix with _ so server-side consumers reading user.message payloads
@@ -2760,7 +3864,11 @@ export function useTimeline(
   /** Merge a batch of events into state (dedup + O(n) merge).
    *  Both `prev` and `incoming` are assumed mostly sorted by timestamp.
    *  Uses two-pointer merge instead of concatenate + full sort. */
-  const mergeEvents = useCallback((incoming: TimelineEvent[], maxEvents = MAX_MEMORY_EVENTS) => {
+  const mergeEvents = useCallback((
+    incoming: TimelineEvent[],
+    maxEvents = MAX_MEMORY_EVENTS,
+    options?: { updateCache?: boolean },
+  ) => {
     setEvents((prev) => {
       const effectiveMax = maxEvents === MAX_MEMORY_EVENTS
         ? retainedTimelineMergeLimit(prev, getCachedEvents(cacheKeyRef.current ?? '') ?? [])
@@ -2769,7 +3877,13 @@ export function useTimeline(
       const base = removeReconciledLocalUserMessages(sharedBase, incoming);
       const result = mergeTimelineEvents(base, incoming, effectiveMax);
       if (result === base) return base;
-      if (cacheKeyRef.current) setCachedEvents(cacheKeyRef.current, result);
+      if (cacheKeyRef.current) {
+        if (options?.updateCache === false) {
+          setCachedEventsLocal(cacheKeyRef.current, result);
+        } else {
+          setCachedEvents(cacheKeyRef.current, result);
+        }
+      }
       return result;
     });
   }, []);
@@ -2823,6 +3937,30 @@ export function useTimeline(
     persistTimelineEvents(key, preferred);
   }, []);
 
+  // A single 1 MiB history envelope can contain hundreds of large events. Do
+  // not merge that envelope in one render/effect turn: yielding between small
+  // chunks keeps input and paint responsive while preserving event order.
+  const HISTORY_APPLY_CHUNK_EVENTS = 10;
+  const mergeHistoryEventsYielding = useCallback((incoming: TimelineEvent[], maxEvents = MAX_MEMORY_EVENTS) => {
+    const key = cacheKeyRef.current;
+    let offset = 0;
+    const drain = (): void => {
+      if (cacheKeyRef.current !== key) return;
+      const chunk = incoming.slice(offset, offset + HISTORY_APPLY_CHUNK_EVENTS);
+      offset += chunk.length;
+      if (chunk.length === 0) return;
+      mergeEvents(chunk, maxEvents);
+      for (const historyEvent of chunk) {
+        applyTimelineTransportQueueEvidence(historyEvent);
+        settleOptimisticByCommandAckEvent(historyEvent);
+        settleOptimisticByTimelineProgress(historyEvent);
+      }
+      idbPutEvents(chunk);
+      if (offset < incoming.length) setTimeout(drain, 0);
+    };
+    drain();
+  }, [applyTimelineTransportQueueEvidence, idbPutEvents, mergeEvents, settleOptimisticByCommandAckEvent, settleOptimisticByTimelineProgress]);
+
   const loadMessageContext = useCallback(async (eventId: string, eventTs: number): Promise<boolean> => {
     if (!serverId || !sessionId || disableHistory || !eventId || !Number.isFinite(eventTs)) return false;
     if (eventsRef.current.some((event) => event.eventId === eventId)) return true;
@@ -2832,7 +3970,7 @@ export function useTimeline(
     try {
       const beforeResult = await fetchTimelineHistoryHttp(serverId, sessionId, {
         beforeTs: eventTs + 1,
-        limit: 500,
+        limit: MAX_FORWARD_PAGE_EVENTS,
         timeoutMs: 12_000,
       });
       if (cacheKeyRef.current !== requestedKey || !beforeResult) return false;
@@ -2853,7 +3991,7 @@ export function useTimeline(
         const afterResult = await fetchTimelineHistoryHttp(serverId, sessionId, {
           afterTs: Math.max(0, eventTs - 1),
           beforeTs,
-          limit: 500,
+          limit: MAX_FORWARD_PAGE_EVENTS,
           timeoutMs: 12_000,
         });
         if (cacheKeyRef.current !== requestedKey || !afterResult) break;
@@ -2926,8 +4064,25 @@ export function useTimeline(
     const incoming = [...pendingRealtimeEventsRef.current.values()];
     pendingRealtimeEventsRef.current.clear();
     if (incoming.length === 0) return;
-    mergeEvents(incoming);
-    idbPutEvents(incoming);
+    // Streaming assistant snapshots are already coalesced by eventId. They
+    // are ephemeral UI deltas; updating the shared cache/store on every frame
+    // fans out to sibling panes and schedules snapshot persistence. The final
+    // non-streaming event (or the idle persistence timer) publishes the latest
+    // value durably, so keep this hot path local to the mounted pane.
+    const streamingOnly = incoming.every(
+      (event) => event.type === 'assistant.text' && event.payload?.streaming === true,
+    );
+    // Streaming snapshots are local presentation deltas. Do not publish every
+    // typewriter frame to the shared cache/store: that fans out to every open
+    // pane (and companion tab) and can monopolize the renderer while a second
+    // tab is still settling its route. The final event and idle persistence
+    // below retain the authoritative text for cache-first restore.
+    mergeEvents(incoming, MAX_MEMORY_EVENTS, { updateCache: !streamingOnly });
+    // Idle persistence writes the latest streaming snapshot (and a final
+    // event writes immediately). Avoid an IndexedDB transaction for every
+    // typewriter delta; those synchronous writes were the remaining hidden
+    // fan-out on summary windows.
+    if (!streamingOnly) idbPutEvents(incoming);
   }, [idbPutEvents, mergeEvents]);
 
   // ── Streaming idle-persist ──────────────────────────────────────────────
@@ -2939,6 +4094,7 @@ export function useTimeline(
   const streamingIdlePersistKeyRef = useRef<string | null>(null);
   const streamingIdlePersistTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const flushStreamingIdlePersist = useCallback((fromIdleTimer = false) => {
+    // eslint-disable-next-line no-console
     if (streamingIdlePersistTimerRef.current) {
       clearTimeout(streamingIdlePersistTimerRef.current);
       streamingIdlePersistTimerRef.current = null;
@@ -2972,15 +4128,18 @@ export function useTimeline(
     // stream idled but is still streaming, the terminal was almost certainly
     // dropped: fire one immediate latest-window catch-up so it reconciles in
     // ~STREAMING_IDLE_PERSIST_MS instead of ~45s. Only from the idle timer (not a
-    // session-switch / unmount flush) and only for the still-current, active/visible
+    // session-switch / unmount flush) and only for the still-current, active
     // session; the HTTP backfill is a pure eventId-dedup merge, so a rare
-    // slightly-late terminal just no-ops.
+    // slightly-late terminal just no-ops. Only the focused presentation owns
+    // this opportunistic repair; open preview cards must not each start one.
     if (fromIdleTimer && hasStuckStream && key === cacheKeyRef.current
-      && (isActiveSessionRef.current || isVisibleRef.current)) {
+      && isActiveSessionRef.current) {
+      // eslint-disable-next-line no-console
       fireHttpBackfillRef.current(0, { phase: 'refresh', visible: false, force: true, mode: 'manualLatestWindow' });
     }
   }, []);
   const scheduleStreamingIdlePersist = useCallback((eventId: string) => {
+    // eslint-disable-next-line no-console
     const key = cacheKeyRef.current;
     if (!key) return;
     // Session changed mid-stream → flush the previous session's pending first.
@@ -2994,6 +4153,18 @@ export function useTimeline(
   }, [flushStreamingIdlePersist]);
 
   const appendRealtimeEvent = useCallback((event: TimelineEvent) => {
+    // Full-mode sockets deliver high-rate status/usage frames live for
+    // authoritative subscribers, but they are telemetry rather than chat rows.
+    // Keep only those two streams out of rendered timeline state so a 25 Hz
+    // feed cannot rebuild the whole window tree. session.state remains a
+    // rendered authoritative signal because queue/session reconciliation and
+    // optimistic-send UI depend on it.
+      const isFullModeTelemetry = event.summary !== true
+      && (event.type === 'agent.status' || event.type === 'usage.update');
+    if (isFullModeTelemetry) {
+      pendingRealtimeEventsRef.current.delete(event.eventId);
+      return;
+    }
     if (!shouldFrameCoalesceTimelineEvent(event)) {
       pendingRealtimeEventsRef.current.delete(event.eventId);
       // A final (non-streaming) version arrived — idbPutEvents persists it below,
@@ -3011,8 +4182,21 @@ export function useTimeline(
     const existing = pendingRealtimeEventsRef.current.get(event.eventId);
     pendingRealtimeEventsRef.current.set(event.eventId, existing ? preferTimelineEvent(existing, event) : event);
     if (pendingRealtimeFlushCancelRef.current) return;
-    pendingRealtimeFlushCancelRef.current = scheduleBrowserFrame(flushPendingRealtimeEvents);
+    const passive = isPassiveTimelinePresentation(subscriptionModeRef.current, isActiveSessionRef.current, isVisibleRef.current);
+    pendingRealtimeFlushCancelRef.current = passive
+      ? schedulePassiveTimelineFlush(flushPendingRealtimeEvents)
+      : scheduleTimelineIdle(flushPendingRealtimeEvents);
   }, [appendEvent, flushPendingRealtimeEvents, idbPutEvents, scheduleStreamingIdlePersist]);
+
+  // A presentation that was passive and is now visible/active must not wait out
+  // the slow cadence: flush what accumulated so it paints current state.
+  useEffect(() => {
+    if (!(isVisible || isActiveSession)) return;
+    applyPassiveCacheSnapshotRef.current?.();
+    if (pendingRealtimeEventsRef.current.size === 0) return;
+    pendingRealtimeFlushCancelRef.current?.();
+    flushPendingRealtimeEvents();
+  }, [flushPendingRealtimeEvents, isActiveSession, isVisible]);
 
   useEffect(() => () => {
     pendingRealtimeFlushCancelRef.current?.();
@@ -3056,6 +4240,10 @@ export function useTimeline(
   isActiveSessionRef.current = isActiveSession;
   const isVisibleRef = useRef(isVisible);
   isVisibleRef.current = isVisible;
+  const subscriptionModeRef = useRef(subscriptionMode);
+  subscriptionModeRef.current = subscriptionMode;
+  const shouldBootstrapVisibleHistoryRef = useRef(shouldBootstrapVisibleHistory);
+  shouldBootstrapVisibleHistoryRef.current = shouldBootstrapVisibleHistory;
   // Wall-clock of the last inbound live `timeline.event` for THIS session.
   // The foreground watchdog uses it (together with the last verified backfill)
   // to detect a silently-stalled stream — a live event the WS never delivered
@@ -3068,6 +4256,21 @@ export function useTimeline(
   // After both retries fail we give up — the next activation/reconnect will
   // fire a fresh backfill, and the WS path remains the primary.
   const HTTP_BACKFILL_RETRY_DELAYS_MS = [800, 2000] as const;
+
+  // Live evidence (real, not hypothetical): a client closed/offline for a
+  // long time can accumulate a backlog far larger than one round's budget
+  // (CATCHUP_TAIL_MAX_PAGES x MAX_MEMORY_EVENTS = 1500 events). Before this,
+  // a `cap_hit` round just stopped -- the pager's own docs called this an
+  // "accepted product trade-off" for a DIFFERENT, narrower gap (an event
+  // older than the local tail racing a live one), but in practice it meant
+  // ANY backlog over 1500 events silently stayed unrecovered forever unless
+  // the user somehow knew to keep manually re-triggering a refresh. Chaining
+  // automatically closes that: bounded (never unbounded, matching the
+  // pager's own philosophy), generous enough for a realistic long-offline
+  // backlog (up to CATCHUP_TAIL_MAX_ROUNDS rounds), and paced with a short
+  // delay between rounds rather than firing every request back to back.
+  const CATCHUP_TAIL_MAX_ROUNDS = 20;
+  const CATCHUP_TAIL_CHAIN_DELAY_MS = 150;
 
   const fireHttpBackfill = useCallback((delayMs: number, opts?: HttpBackfillOpts) => {
     // Read `isActiveSession` via ref so this gate always reflects the latest
@@ -3093,7 +4296,13 @@ export function useTimeline(
     const phase = opts?.phase ?? 'refresh';
     const visible = opts?.visible === true;
     const retryAttempt = opts?._retryAttempt ?? 0;
+    const resumeBeforeTs = opts?._resumeBeforeTs;
+    const roundsChained = opts?._roundsChained ?? 0;
     const mode = opts?.mode ?? 'tail';
+    // A visible refresh owns only the first newest page. Older-page
+    // continuation is background work and must not keep the foreground
+    // history stepper/spinner busy after the latest text has been merged.
+    const foregroundRound = visible && roundsChained === 0 && resumeBeforeTs === undefined;
     const backfillSessionId = sessionId;
     const backfillCacheKey = cacheKey;
     const dueAt = Date.now() + Math.max(0, delayMs);
@@ -3105,7 +4314,7 @@ export function useTimeline(
         hasTimer: true,
         inFlight: httpBackfillInFlightRef.current[mode],
       });
-      if (visible) updateHistoryStep('http', 'running', phase);
+      if (foregroundRound) updateHistoryStep('http', 'running', phase);
       return;
     }
     if (httpBackfillTimerRef.current[mode]) clearHttpBackfillTimer(mode);
@@ -3116,7 +4325,7 @@ export function useTimeline(
         hasTimer: false,
         inFlight: httpBackfillInFlightRef.current[mode],
       });
-      if (visible) updateHistoryStep('http', 'running', phase);
+      if (foregroundRound) updateHistoryStep('http', 'running', phase);
       return;
     }
     httpBackfillTimerDueAtRef.current[mode] = dueAt;
@@ -3124,11 +4333,12 @@ export function useTimeline(
       httpBackfillTimerRef.current[mode] = null;
       httpBackfillTimerDueAtRef.current[mode] = 0;
       if (cacheKeyRef.current !== backfillCacheKey) return;
-      if (backfillCacheKey && cooldownMs > 0) {
+      // A recorded hole is unfinished work, whatever the last successful catch-up says.
+      if (backfillCacheKey && cooldownMs > 0 && !getTimelineGap(backfillCacheKey)) {
         const lastOk = lastHttpBackfillResponseAt.get(backfillCacheKey);
         if (lastOk !== undefined && Date.now() - lastOk < cooldownMs) {
           backfillDebug('fireHttpBackfill: cooldown skip', { sessionId: backfillSessionId, mode, lastOk, cooldownMs });
-          if (visible) updateHistoryStep('http', 'done', phase);
+          if (foregroundRound) updateHistoryStep('http', 'done', phase);
           return;
         }
       }
@@ -3136,10 +4346,61 @@ export function useTimeline(
       // aren't re-downloaded. Manual ↻ is different: it intentionally asks for
       // the daemon's latest 300-event window with no lower timestamp bound, so
       // a newly-pushed event cannot mask the missing middle history below it.
-      const afterTs = mode === 'manualLatestWindow' ? undefined : getTimelineHistoryAfterTs(eventsRef.current);
-      const maxPages = mode === 'manualLatestWindow' ? 1 : undefined;
+      // Bounded internal continuations (legacy null-retry, chained cap_hit
+      // rounds) keep their own timing; only fresh background triggers are
+      // gated.
+      const gatedBackground = !visible && !!backfillCacheKey && retryAttempt === 0 && roundsChained === 0;
+      const gate = backfillCacheKey ? backgroundBackfillGate(backfillCacheKey) : null;
+      if (gatedBackground && gate) {
+        if (gate.inFlight > 0) {
+          backfillDebug('fireHttpBackfill: background skip, backfill in flight', { sessionId: backfillSessionId, mode });
+          return;
+        }
+        if (Date.now() < gate.nextAllowedAt) {
+          backfillDebug('fireHttpBackfill: background skip, failure backoff', { sessionId: backfillSessionId, mode, nextAllowedAt: gate.nextAllowedAt });
+          return;
+        }
+      }
+      // One filler per session: a second window (or a later trigger) leaves a running hole backfill alone;
+      // the merges it produces reach every window through the shared cache.
+      const roundGap = backfillCacheKey ? getTimelineGap(backfillCacheKey) : null;
+      const isGapFiller = !!backfillCacheKey && !!roundGap && mode !== 'manualLatestWindow';
+      if (isGapFiller && retryAttempt === 0 && roundsChained === 0 && gapBackfillInFlight.has(backfillCacheKey!)) {
+        backfillDebug('fireHttpBackfill: hole backfill already running', { sessionId: backfillSessionId, mode });
+        return;
+      }
+      let holdsGapFiller = isGapFiller;
+      if (isGapFiller) gapBackfillInFlight.add(backfillCacheKey!);
+      if (gate) gate.inFlight += 1;
+      // The lower bound of a catch-up is normally the newest ts the cache holds. While a hole is recorded
+      // (or the reopen has not yet decided whether there is one) that would be wrong: the merged tail has
+      // already moved "the newest ts" above the hole. So the recorded floor, or the cursor captured at
+      // open, wins.
+      const undecidedOpenCursor = !roundGap && !!backfillCacheKey && openGapDecidedKeyRef.current !== backfillCacheKey
+        ? getLocalCacheCursorTs()
+        : undefined;
+      backfillDebug('fireHttpBackfill: round bounds', { mode, hasGap: !!roundGap, gapLower: roundGap?.lowerTs, gapUpper: roundGap?.upperTs, undecidedOpenCursor });
+      const afterTs = mode === 'manualLatestWindow'
+        ? undefined
+        : roundGap
+          ? roundGap.lowerTs
+          : undecidedOpenCursor !== undefined
+            ? Math.max(0, undecidedOpenCursor - TIMELINE_HISTORY_AFTER_TS_OVERLAP_MS)
+            : getTimelineHistoryAfterTs(eventsRef.current);
+      // A cold visible pane has no local cursor to anchor a delta. Paint one
+      // bounded newest page and let the live subscription carry forward; do
+      // not walk the entire historical backlog before the first render. Once
+      // a cache cursor exists, a reconnect catch-up may continue through
+      // bounded pages to close a real gap. Manual refresh is already a single
+      // latest-window read.
+      // Only local cache/IDB rows should unlock multi-page catch-up. Live
+      // events may arrive before this delayed HTTP task fires on a cold pane;
+      // using eventsRef here would misclassify that cold start as cached and
+      // immediately walk the entire historical backlog.
+      const hadLocalEvents = localRestoredIdsRef.current.size > 0 || !!roundGap;
+      const maxPages = foregroundRound || mode === 'manualLatestWindow' || !hadLocalEvents ? 1 : undefined;
       backfillDebug('fireHttpBackfill: requesting', { sessionId: backfillSessionId, phase, mode, afterTs, retryAttempt });
-      if (visible) {
+      if (foregroundRound) {
         httpBackfillInFlightRef.current[mode] += 1;
         updateHistoryStep('http', 'running', phase);
         setHttpRefreshing(true);
@@ -3159,16 +4420,27 @@ export function useTimeline(
       void (async () => {
         let terminal: 'caught_up' | 'cap_hit' | 'truncated' | 'transient_null' | 'error' | null = null;
         try {
+          // The page currently being fetched: `undefined` = the newest window, else a step down the hole.
+          let pageBeforeTs: number | undefined;
+          // Whether that page arrived payload-trimmed/dropped/reset (the pager ends such a round `truncated`).
+          let pageIncomplete = false;
           const outcome = await runNewestWindowBackfill(afterTs, {
-            limit: MAX_MEMORY_EVENTS,
+            limit: MAX_FORWARD_PAGE_EVENTS,
             maxPages,
-            fetchPage: ({ afterTs: at, beforeTs: bt }) => Promise.resolve(fetchTimelineHistoryHttp(serverId, backfillSessionId, {
-              afterTs: at,
-              ...(bt !== undefined ? { beforeTs: bt } : {}),
-              limit: MAX_MEMORY_EVENTS,
-              timeoutMs: resolveBackfillTimeoutMs(opts),
-            })),
-            mergePage: (events) => {
+            // Only the hole's own round resumes at its stitched top; a manual newest-window refresh starts at the newest.
+            initialBeforeTs: resumeBeforeTs ?? (mode !== 'manualLatestWindow' && roundGap?.upperTs != null ? roundGap.upperTs + 1 : undefined),
+            fetchPage: async ({ afterTs: at, beforeTs: bt }) => {
+              pageBeforeTs = bt;
+              const page = await fetchTimelineHistoryHttp(serverId, backfillSessionId, {
+                afterTs: at,
+                ...(bt !== undefined ? { beforeTs: bt } : {}),
+                limit: MAX_FORWARD_PAGE_EVENTS,
+                timeoutMs: resolveBackfillTimeoutMs(opts),
+              });
+              pageIncomplete = page ? pageIsIncomplete(page) : false;
+              return page;
+            },
+            mergePage: async (events) => {
               if (cacheKeyRef.current !== backfillCacheKey) return { candidateCount: 0, minTs: null, maxTs: null };
               const recovered = events.filter(
                 (ev): ev is TimelineEvent => !!ev && typeof ev === 'object'
@@ -3180,17 +4452,69 @@ export function useTimeline(
               );
               if (recovered.length === 0) return { candidateCount: 0, minTs: null, maxTs: null };
               backfillDebug('fireHttpBackfill: merging page', { sessionId: backfillSessionId, count: recovered.length });
-              mergeEvents(recovered);
-              for (const recoveredEvent of recovered) {
-                settleOptimisticByCommandAckEvent(recoveredEvent);
-                settleOptimisticByTimelineProgress(recoveredEvent);
+              // The first newest-window page of an open is the evidence for a hole: record it BEFORE the merge
+              // moves the cache's own newest ts (and BEFORE anything is persisted).
+              if (pageBeforeTs === undefined && !roundGap) {
+                // A trimmed page's length proves nothing: it counts as a full window (the hole is not ruled out).
+                noteOpenWindowTail(recovered, pageIncomplete || recovered.length >= MAX_FORWARD_PAGE_EVENTS);
               }
-              idbPutEvents(recovered);
+              // While a hole is open the window must keep what it fills in, not only the newest 300.
+              const wideMerge = !!backfillCacheKey && !!getTimelineGap(backfillCacheKey);
+              // This very page just revealed the hole: from here on this round is its filler.
+              if (wideMerge && !holdsGapFiller && mode !== 'manualLatestWindow') {
+                holdsGapFiller = true;
+                gapBackfillInFlight.add(backfillCacheKey!);
+              }
+              // Apply large pages in small turns.  A 200-event page can carry
+              // megabytes of markdown/tool payload; merging it synchronously
+              // blocks input and first paint across every mounted pane.
+              const APPLY_CHUNK = 20;
+              for (let offset = 0; offset < recovered.length; offset += APPLY_CHUNK) {
+                if (cacheKeyRef.current !== backfillCacheKey) return { candidateCount: 0, minTs: null, maxTs: null };
+                const chunk = recovered.slice(offset, offset + APPLY_CHUNK);
+                mergeEvents(chunk, wideMerge ? MAX_HISTORY_EVENTS : undefined);
+                for (const recoveredEvent of chunk) {
+                  settleOptimisticByCommandAckEvent(recoveredEvent);
+                  settleOptimisticByTimelineProgress(recoveredEvent);
+                }
+                idbPutEvents(chunk);
+                if (offset + APPLY_CHUNK < recovered.length) {
+                  await new Promise<void>((resolve) => setTimeout(resolve, 0));
+                }
+              }
               let minTs = Infinity;
               let maxTs = -Infinity;
               for (const recoveredEvent of recovered) {
                 if (recoveredEvent.ts < minTs) minTs = recoveredEvent.ts;
                 if (recoveredEvent.ts > maxTs) maxTs = recoveredEvent.ts;
+              }
+              if (backfillCacheKey && Number.isFinite(minTs) && Number.isFinite(maxTs)) {
+                const currentGap = getTimelineGap(backfillCacheKey);
+                if (currentGap) {
+                  // A page held at the same stitched top too often stops being held, so the fill cannot wedge on it.
+                  let skipIncomplete = false;
+                  if (pageIncomplete) {
+                    const streak = incompleteHoleHoldByCacheKey.get(backfillCacheKey);
+                    const holds = streak && streak.top === currentGap.upperTs ? streak.holds + 1 : 1;
+                    skipIncomplete = holds > INCOMPLETE_HOLE_PAGE_HOLDS;
+                    incompleteHoleHoldByCacheKey.set(backfillCacheKey, { top: currentGap.upperTs, holds });
+                  } else {
+                    incompleteHoleHoldByCacheKey.delete(backfillCacheKey);
+                  }
+                  const folded = foldPageIntoGap(currentGap, {
+                    lowerTs: currentGap.lowerTs,
+                    pageMinTs: minTs,
+                    pageMaxTs: maxTs,
+                    fullPage: recovered.length >= MAX_FORWARD_PAGE_EVENTS,
+                    descending: pageBeforeTs !== undefined,
+                    incomplete: pageIncomplete,
+                    skipIncomplete,
+                  });
+                  backfillDebug('fireHttpBackfill: hole page folded', {
+                    pageIncomplete, skipIncomplete, pageMinTs: minTs, pageMaxTs: maxTs, before: currentGap, after: folded,
+                  });
+                  setTimelineGap(backfillCacheKey, folded);
+                }
               }
               return {
                 candidateCount: recovered.length,
@@ -3200,6 +4524,29 @@ export function useTimeline(
             },
           });
           terminal = outcome.terminal;
+          // The window down to the floor is exhausted: the hole is filled.
+          if (terminal === 'caught_up' && backfillCacheKey && mode !== 'manualLatestWindow') {
+            setTimelineGap(backfillCacheKey, null);
+            incompleteHoleHoldByCacheKey.delete(backfillCacheKey);
+          }
+          // A payload-trimmed page ended the round with the hole still open. Nothing else would restart the fill
+          // (the hole's own effect keys on the hole existing, which it still does), so re-fire it once after a
+          // short pause; bounded by the same round budget as the cap_hit chain.
+          if (terminal === 'truncated' && backfillCacheKey && mode !== 'manualLatestWindow'
+            && !!getTimelineGap(backfillCacheKey) && roundsChained < CATCHUP_TAIL_MAX_ROUNDS) {
+            backfillDebug('fireHttpBackfill: truncated round with an open hole → re-fire', {
+              sessionId: backfillSessionId, roundsChained: roundsChained + 1,
+            });
+            setTimeout(() => {
+              fireHttpBackfillRef.current(0, {
+                ...opts,
+                visible: false,
+                _roundsChained: roundsChained + 1,
+                _retryAttempt: 0,
+                _resumeBeforeTs: undefined,
+              });
+            }, INCOMPLETE_HOLE_RETRY_DELAY_MS);
+          }
           // Transient null on the FIRST page → preserve the legacy retry-with-backoff.
           // A null on a later page means ≥1 page already merged; stop (next trigger
           // continues) rather than restart the whole round.
@@ -3215,6 +4562,38 @@ export function useTimeline(
             }
             return;
           }
+          // `cap_hit` while still making real progress (every page full,
+          // strictly descending) means the window genuinely holds more below
+          // this round's budget -- the real-world shape of "closed for a long
+          // time, backlog bigger than 1500 events". Chain another round from
+          // exactly where this one stopped instead of leaving it unrecovered.
+          // The mode-scoped in-flight/timer gates below let this reuse the
+          // SAME dedupe/coalescing every other fireHttpBackfill call goes
+          // through; only the resume cursor and round counter carry forward.
+          // While a hole is recorded, ITS filler owns the walk down: an unbounded newest-window refresh must not
+          // chain a second walker past the hole's floor.
+          const manualRoundDuringHole = mode === 'manualLatestWindow' && !!backfillCacheKey && !!getTimelineGap(backfillCacheKey);
+          if (outcome.terminal === 'cap_hit' && outcome.resumeBeforeTs !== undefined
+            && hadLocalEvents
+            && !manualRoundDuringHole
+            && roundsChained < CATCHUP_TAIL_MAX_ROUNDS) {
+            backfillDebug('fireHttpBackfill: cap_hit → chaining next round', {
+              sessionId: backfillSessionId, roundsChained: roundsChained + 1, resumeBeforeTs: outcome.resumeBeforeTs,
+            });
+            setTimeout(() => {
+              fireHttpBackfillRef.current(0, {
+                ...opts,
+                visible: false,
+                _resumeBeforeTs: outcome.resumeBeforeTs,
+                _roundsChained: roundsChained + 1,
+                _retryAttempt: 0,
+              });
+            }, CATCHUP_TAIL_CHAIN_DELAY_MS);
+          } else if (outcome.terminal === 'cap_hit' && outcome.resumeBeforeTs !== undefined) {
+            backfillDebug('fireHttpBackfill: cap_hit → round budget exhausted, giving up for now', {
+              sessionId: backfillSessionId, roundsChained,
+            });
+          }
           if (backfillCacheKey && outcome.terminal === 'caught_up') {
             lastHttpBackfillResponseAt.set(backfillCacheKey, Date.now());
           }
@@ -3224,15 +4603,35 @@ export function useTimeline(
           /* opportunistic — WS path is primary */
         }
         finally {
-          if (visible) {
+          if (holdsGapFiller && backfillCacheKey) gapBackfillInFlight.delete(backfillCacheKey);
+          if (gate) {
+            gate.inFlight = Math.max(0, gate.inFlight - 1);
+            if (terminal === 'error' || terminal === 'transient_null') {
+              gate.failureStreak += 1;
+              gate.nextAllowedAt = Date.now() + Math.min(
+                BACKGROUND_BACKFILL_FAILURE_BACKOFF_BASE_MS * 2 ** (gate.failureStreak - 1),
+                BACKGROUND_BACKFILL_FAILURE_BACKOFF_MAX_MS,
+              );
+            } else if (terminal !== null) {
+              gate.failureStreak = 0;
+              gate.nextAllowedAt = 0;
+            }
+          }
+          if (foregroundRound) {
             httpBackfillInFlightRef.current[mode] = Math.max(0, httpBackfillInFlightRef.current[mode] - 1);
-            updateHistoryStep('http', terminal === 'caught_up' ? 'done' : 'pending', phase);
+            // The foreground contract ends when the newest page settles.
+            // Continuation rounds are intentionally invisible and must not
+            // leave a permanent spinner on a chat that already has content.
+            const foregroundState = terminal === 'transient_null'
+              ? (retryAttempt >= HTTP_BACKFILL_RETRY_DELAYS_MS.length ? 'offline' : 'pending')
+              : terminal === 'error' ? 'offline' : 'done';
+            updateHistoryStep('http', foregroundState, phase);
             if (totalHttpBackfillInFlight(httpBackfillInFlightRef.current) === 0) setHttpRefreshing(false);
           }
         }
       })();
     }, delayMs);
-  }, [clearHttpBackfillTimer, disableHistory, isActiveSession, serverId, sessionId, cacheKey, mergeEvents, idbPutEvents, settleOptimisticByCommandAckEvent, settleOptimisticByTimelineProgress, updateHistoryStep]);
+  }, [clearHttpBackfillTimer, disableHistory, isActiveSession, serverId, sessionId, cacheKey, getLocalCacheCursorTs, mergeEvents, noteOpenWindowTail, idbPutEvents, settleOptimisticByCommandAckEvent, settleOptimisticByTimelineProgress, updateHistoryStep]);
 
   // Stable indirection — lets the session-mount effect below call the latest
   // `fireHttpBackfill` without having to list it (and transitively its five
@@ -3240,6 +4639,17 @@ export function useTimeline(
   // mount effect to re-run on every render.
   const fireHttpBackfillRef = useRef(fireHttpBackfill);
   fireHttpBackfillRef.current = fireHttpBackfill;
+
+  // A recorded hole is unfinished work for every window that shows this session: start (or resume) its
+  // newest→oldest fill as soon as it exists and whenever the window becomes visible/active — a visible
+  // sub-session window and a resumed-after-reload hole included, neither of which has a mount-time catch-up
+  // of its own. A hidden/minimized window stays quiet (fireHttpBackfill gates on visibility) and resumes when shown.
+  const hasHistoryGap = historyGap !== null;
+  useEffect(() => {
+    if (!hasHistoryGap || disableHistory || !serverId || !sessionId) return;
+    if (!isActiveSession && !isVisible) return;
+    fireHttpBackfillRef.current(0, { cooldownMs: 0, phase: 'refresh' });
+  }, [hasHistoryGap, disableHistory, serverId, sessionId, isActiveSession, isVisible]);
 
   const terminalTailIdleReconcileTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const terminalTailIdleReconcileKeyRef = useRef<string | null>(null);
@@ -3337,19 +4747,37 @@ export function useTimeline(
     // i.e. when the HTTP path is a no-op), then opportunistically catch up
     // over HTTP.
     void reloadLocalTimeline();
+    // HTTP may be unavailable while the live daemon socket is healthy (for
+    // example before serverId resolution). Force a newest-window daemon read
+    // too; deliberately omit afterTs so one newly-sent/live event cannot hide
+    // the existing history below it.
+    if (ws?.connected && sessionId) {
+      updateHistoryStep('daemon', 'running', 'refresh');
+      setRefreshing(true);
+      sendForwardHistoryRequest('refresh', { limit: MAX_MEMORY_EVENTS });
+    }
     fireHttpBackfillRef.current(0, { phase: 'refresh', visible: true, force: true, mode: 'manualLatestWindow' });
-  }, [reloadLocalTimeline]);
+  }, [reloadLocalTimeline, sendForwardHistoryRequest, sessionId, updateHistoryStep, ws]);
 
-  // Self-heal a blank pane. The mount path seeds `events` from local cache, but
-  // it can still settle EMPTY even when history exists — e.g. serverId resolved
-  // AFTER the first read so the scoped cacheKey changed, a cold/slow IndexedDB
-  // read, or a daemon history response that came back empty. The user shouldn't
-  // have to hit ↻ to get the same recovery path. When the timeline has SETTLED
-  // blank, re-read local IDB and run the same latest-window HTTP catch-up used
-  // by forceRefresh. `manualLatestWindow` also clears any pending tail backfill,
-  // so this does not double-fetch after the mount bootstrap timer.
+  // Self-heal a blank pane. "Blank" means no event is GUARANTEED to create a
+  // ChatView row, not merely `events.length === 0`: an old window can restore a
+  // non-empty tail made entirely of peer_audit.status / last-value / hidden rows.
+  // The ordinary cache-hit catch-up is then anchored after those newer rows, so
+  // it cannot fetch the older conversation below them, while the old length
+  // check incorrectly declared the pane healthy. This is why clicking ↻ fixed
+  // the pane immediately: forceRefresh uses an unanchored latest-window read.
+  //
+  // Re-use that same path automatically after bootstrap settles. The shared
+  // visibility predicate is deliberately the contract mirrored by ChatView;
+  // it also makes a same-length replacement (one invisible row -> one visible
+  // message) clear the one-shot fence, which an `events.length` dependency could
+  // not observe. `manualLatestWindow` clears any pending tail backfill, so this
+  // does not double-fetch after the mount bootstrap timer.
   const blankSelfHealRef = useRef<string | null>(null);
   const staleToolSelfHealRef = useRef<string | null>(null);
+  const hasGuaranteedVisibleTimelineContent = events.some((event) => (
+    isGuaranteedVisibleTimelineEvent(event)
+  ));
   const fireBlankPaneRecovery = useCallback((visible: boolean) => {
     const key = cacheKeyRef.current;
     if (!key) return;
@@ -3365,22 +4793,23 @@ export function useTimeline(
   useEffect(() => {
     const key = cacheKey;
     if (!key || disableHistory) return;
-    if (events.length > 0) {
+    if (hasGuaranteedVisibleTimelineContent) {
       if (blankSelfHealRef.current === key) blankSelfHealRef.current = null;
       return;
     }
     if (loading || refreshing || httpRefreshing) return; // another recovery path is still running
-    if (!isActiveSessionRef.current && !isVisibleRef.current) return;
+    if (!shouldBootstrapVisibleHistoryRef.current) return;
     if (blankSelfHealRef.current === key) return;  // already self-healed this key
-    fireBlankPaneRecovery(isActiveSessionRef.current);
+    fireBlankPaneRecovery(true);
   }, [
     cacheKey,
-    events.length,
+    hasGuaranteedVisibleTimelineContent,
     loading,
     refreshing,
     httpRefreshing,
     disableHistory,
     fireBlankPaneRecovery,
+    shouldBootstrapVisibleHistory,
   ]);
 
   // Independent-authority self-heal: if the daemon/session list says the turn
@@ -3399,7 +4828,7 @@ export function useTimeline(
       staleToolSelfHealRef.current = null;
       return;
     }
-    if (!isActiveSessionRef.current && !isVisibleRef.current) return;
+    if (!isActiveSessionRef.current) return;
     let newestToolCallEventId = 'anonymous';
     for (let index = events.length - 1; index >= 0; index -= 1) {
       if (events[index]?.type === 'tool.call') {
@@ -3440,12 +4869,13 @@ export function useTimeline(
   useEffect(() => {
     if (disableHistory) return;
     const handler = (): void => {
-      // Resume broadcast: refresh if either the hook is the active session
-      // OR it is a visible-but-not-focused mount (open sub-session card / window).
-      // The downstream 15s success-only cooldown still rate-limits each session
-      // so multiple visible cards on desktop don't herd the daemon.
-      if (!isActiveSessionRef.current && !isVisibleRef.current) {
-        backfillDebug('activation event: gated by !isActiveSession && !isVisible', { sessionId });
+      // A resume broadcast is process-wide. Only the focused timeline may do
+      // recovery work; visible-but-inactive cards/windows stay warm through
+      // cache + WS and catch up when they become active. Per-session cooldowns
+      // cannot prevent an N-session herd because every session has a distinct
+      // key and a long resume deliberately resets those cooldowns.
+      if (!isActiveSessionRef.current) {
+        backfillDebug('activation event: gated by !isActiveSession', { sessionId });
         return;
       }
       const now = Date.now();
@@ -3511,6 +4941,9 @@ export function useTimeline(
     prevIsActiveRef.current = isActiveSession;
     if (!prev && isActiveSession) {
       backfillDebug('isActiveSession false→true: firing backfill', { sessionId });
+      // Tapping a chat that was not on screen: its latest messages first (tiny text-only tail), before the
+      // window request below is even sent.
+      sendStaleWindowPeekRef.current();
       // Short on-screen timeline → also re-read local history (idempotent merge).
       // Same rationale as the activation-event handler above
       // (ACTIVE_LOCAL_RELOAD_MAX_EVENTS): recover a truncated reopen without
@@ -3542,7 +4975,7 @@ export function useTimeline(
   // reconnected, and no focus/visibility tick fired — so none of the existing
   // catch-up triggers run and the chat just sits there stale. This is the core
   // "弱网前台停留不自动同步" complaint. Periodically, while foreground and
-  // active/visible, check whether the stream has gone quiet beyond
+  // active, check whether the stream has gone quiet beyond
   // WATCHDOG_STALE_MS (no content event AND no HTTP response) and, if so, fire
   // ONE silent catch-up. Any non-null HTTP response advances the staleness
   // baseline via `lastHttpBackfillResponseAt` (NOT a verified-contiguous signal),
@@ -3552,7 +4985,7 @@ export function useTimeline(
     if (disableHistory || typeof window === 'undefined') return;
     const tick = (): void => {
       if (typeof document !== 'undefined' && document.visibilityState !== 'visible') return;
-      if (!isActiveSessionRef.current && !isVisibleRef.current) return;
+      if (!isActiveSessionRef.current) return;
       if (!serverId || !sessionId) return;
       // HTTP backfill is independent of the socket, but if the WS is down the
       // reconnect path already owns recovery; the watchdog targets the
@@ -3589,6 +5022,32 @@ export function useTimeline(
     return () => window.clearInterval(id);
   }, [disableHistory, serverId, sessionId, ws]);
 
+  // Keep every mounted presentation subscribed. Hidden/minimized cards receive
+  // summary frames (including final assistant text), while any active/on-screen
+  // view is always full. Browser visibility never downgrades an active view.
+  useEffect(() => {
+    if (!ws || !sessionId || disableHistory) return;
+    const key = cacheKeyRef.current;
+    const snapshot = key ? getTimelineStore(key).getSnapshot() : undefined;
+    const cursor = snapshot && snapshot.epoch > 0
+      ? { epoch: snapshot.epoch, afterSeq: snapshot.seq }
+      : undefined;
+    const owner = timelineSubscriptionOwnerRef.current;
+    const previousMode = previousSubscriptionModeRef.current;
+    previousSubscriptionModeRef.current = subscriptionMode;
+    if (typeof ws.subscribeTimelineSession === 'function') {
+      ws.subscribeTimelineSession(sessionId, owner, subscriptionMode, cursor);
+    }
+    if (cursor && ws.connected && previousMode !== null && previousMode !== subscriptionMode) {
+      sendNewerHistoryPage('refresh', {
+        epoch: cursor.epoch, afterSeq: cursor.afterSeq, direction: TIMELINE_CURSOR_DIRECTIONS.NEWER,
+      });
+    }
+    return () => {
+      if (typeof ws.unsubscribeTimelineSession === 'function') ws.unsubscribeTimelineSession(sessionId, owner);
+    };
+  }, [disableHistory, sendNewerHistoryPage, sessionId, subscriptionMode, ws]);
+
   // Listen for WS messages
   useEffect(() => {
     if (disableHistory || !ws || !sessionId) return;
@@ -3598,6 +5057,16 @@ export function useTimeline(
         applyTransportQueueEvidence(msg);
         return;
       }
+      // Server may coalesce summary/full frames under pressure. Recover the
+      // missing ordered range from the canonical per-session history cursor.
+      if (msg.type === TIMELINE_MESSAGES.SEQ_GAP) {
+        if (msg.sessionId !== sessionId || !msg.backfill) return;
+        sendNewerHistoryPage('refresh', {
+          epoch: msg.epoch, afterSeq: msg.toSeq, direction: TIMELINE_CURSOR_DIRECTIONS.NEWER,
+        });
+        return;
+      }
+
       // ── Real-time event ──
       if (msg.type === TIMELINE_MESSAGES.EVENT) {
         const event = msg.event;
@@ -3687,7 +5156,7 @@ export function useTimeline(
             const optimisticTextIdx = base.findIndex(
               (e) =>
                 e.type === 'user.message'
-                && (e.payload.pending || e.payload.failed)
+                && (e.payload.pending || e.payload.failed || isLocalOptimisticUserMessage(e))
                 && normalizeForEcho(String(e.payload.text ?? '')) === normalizedText,
             );
             if (optimisticTextIdx >= 0) {
@@ -3712,7 +5181,7 @@ export function useTimeline(
             }
             const withoutPending = base.filter(
               (e) => {
-                if (e.type !== 'user.message' || (!e.payload.pending && !e.payload.failed)) return true;
+                if (e.type !== 'user.message' || (!e.payload.pending && !e.payload.failed && !isLocalOptimisticUserMessage(e))) return true;
                 const candidateCommandId = typeof e.payload.commandId === 'string'
                   ? e.payload.commandId
                   : '';
@@ -3728,6 +5197,7 @@ export function useTimeline(
               (e) =>
                 e.type === 'user.message' &&
                 e.payload.allowDuplicate !== true &&
+                !isLocalOptimisticUserMessage(e) &&
                 !e.payload.pending &&
                 !e.payload.failed &&
                 Math.abs(e.ts - event.ts) < USER_MSG_DEDUP_WINDOW_MS &&
@@ -3767,7 +5237,7 @@ export function useTimeline(
           .filter((event): event is TimelineEvent => event != null);
         if (provisionalEvents.length === 0) return;
         updateHistoryStep('daemon', 'done', 'bootstrap');
-        replaceEvents(provisionalEvents);
+        mergeHistoryEventsYielding(provisionalEvents.slice(-MAX_FORWARD_PAGE_EVENTS));
         setLoading(false);
         return;
       }
@@ -3788,8 +5258,7 @@ export function useTimeline(
           const olderCursor = getOlderTimelineCursor(msg);
           if (hasStructuredOlderPage(msg) && olderCursor) olderCursorRef.current = olderCursor;
           if (msg.events.length > 0) {
-            mergeEvents(msg.events, MAX_HISTORY_EVENTS);
-            idbPutEvents(msg.events);
+            mergeHistoryEventsYielding(msg.events, MAX_HISTORY_EVENTS);
           }
           if (shouldPreserveOlderAvailability) {
             return;
@@ -3803,6 +5272,15 @@ export function useTimeline(
           return;
         }
 
+        // Stale-window peek: the newest few messages, merged as a preview of the tail and nothing else
+        // (never a window, so it neither decides the hole nor ends the bootstrap).
+        if (msg.type === TIMELINE_MESSAGES.HISTORY && msg.requestId && msg.requestId === peekRequestIdRef.current) {
+          peekRequestIdRef.current = null;
+          updateHistoryStep('textTail', 'done', 'bootstrap');
+          if (msg.events.length > 0 && responseState !== 'error') mergeHistoryEventsYielding(msg.events);
+          return;
+        }
+
         // Accept any same-session history batch for forward sync. Mobile
         // reconnect/background churn can legitimately create overlapping history
         // requests; dropping the earlier response can leave the UI stuck on old
@@ -3812,6 +5290,15 @@ export function useTimeline(
         if (isCurrentForwardHistoryResponse) {
           clearForwardHistoryTimeout();
           reconnectRefreshInFlightRef.current = false;
+          // The newest window is here: an unanswered peek is now redundant.
+          if (peekRequestIdRef.current) {
+            peekRequestIdRef.current = null;
+            updateHistoryStep('textTail', 'done', 'bootstrap');
+          }
+          // This newest-window page is the evidence for whether a hole sits between the cache and it.
+          if (msg.requestId && msg.type === TIMELINE_MESSAGES.HISTORY && responseState !== 'error' && msg.events.length > 0) {
+            noteOpenWindowTail(msg.events, msg.hasMore === true);
+          }
         }
         if (!olderRequestIdRef.current || msg.requestId !== olderRequestIdRef.current) {
           if (!historyRequestIdRef.current || msg.requestId === historyRequestIdRef.current) {
@@ -3850,15 +5337,11 @@ export function useTimeline(
                 retainedTimelineMergeLimit(withoutProvisionalTransportHistory),
               );
             replaceEvents(next);
+            idbPutEvents(msg.events);
           } else {
-            mergeEvents(msg.events);
+            // While a hole is open the window keeps the tail AND the cache it will be stitched to.
+            mergeHistoryEventsYielding(msg.events, getTimelineGap(cacheKeyRef.current) ? MAX_HISTORY_EVENTS : undefined);
           }
-          for (const historyEvent of msg.events) {
-            applyTimelineTransportQueueEvidence(historyEvent);
-            settleOptimisticByCommandAckEvent(historyEvent);
-            settleOptimisticByTimelineProgress(historyEvent);
-          }
-          idbPutEvents(msg.events);
         } else if (historyRetryRef.current < 2 && ws?.connected && isActiveSessionRef.current && shouldRetryTimelineHistoryResponse(msg, eventsRef.current.length > 0)) {
           // Legacy empty response with no cached events — retry once after a
           // short delay. Explicit protocol outcomes (empty success, deferred,
@@ -3873,6 +5356,17 @@ export function useTimeline(
             if (!isActiveSessionRef.current) return;
             if (ws?.connected && sessionId) sendForwardHistoryRequest('bootstrap', buildForwardHistoryArgs(MAX_MEMORY_EVENTS));
           }, 1000 * historyRetryRef.current);
+        }
+        // Newer gap/reveal pages are bounded. Continue only when the server
+        // explicitly returns a newer cursor; an older cursor from an initial
+        // tail is retained for user-driven scroll and must not be auto-fetched.
+        if (
+          msg.hasMore === true
+          && msg.nextCursor?.direction === TIMELINE_CURSOR_DIRECTIONS.NEWER
+          && ws?.connected
+          && sessionId
+        ) {
+          sendNewerHistoryPage(loading ? 'bootstrap' : 'refresh', msg.nextCursor);
         }
         setLoading(false);
         setRefreshing(false);
@@ -3897,13 +5391,7 @@ export function useTimeline(
         if (replayEvents.length > 0) {
           const maxSeq = replayEvents.reduce((max, e) => Math.max(max, e.seq), 0);
           seqRef.current = Math.max(seqRef.current, maxSeq);
-          mergeEvents(replayEvents);
-          for (const replayEvent of replayEvents) {
-            applyTimelineTransportQueueEvidence(replayEvent);
-            settleOptimisticByCommandAckEvent(replayEvent);
-            settleOptimisticByTimelineProgress(replayEvent);
-          }
-          idbPutEvents(replayEvents);
+          mergeHistoryEventsYielding(replayEvents);
         }
         setRefreshing(false);
       }
@@ -3931,6 +5419,7 @@ export function useTimeline(
 
       // ── Reconnect: daemon restarted → epoch changed, replay is useless. Request only new events. ──
       if (msg.type === DAEMON_MSG.RECONNECTED) {
+        liftBackgroundBackfillBackoff(cacheKeyRef.current);
         // Only the active card's hook should refresh from daemon — N
         // SubSessionCards mounted in the bar would otherwise herd the daemon
         // with N concurrent timeline.history_request RPCs on every daemon
@@ -3960,7 +5449,7 @@ export function useTimeline(
             response: null,
           });
           setRefreshing(true);
-          sendForwardHistoryRequest('refresh', buildForwardHistoryArgs(MAX_MEMORY_EVENTS));
+          sendForwardHistoryRequest('refresh', buildForwardHistoryArgs(MAX_MEMORY_EVENTS), true);
           // `manualLatestWindow`: a daemon reconnect means the daemon→server link
           // was down, and live timeline events are control-plane — `trySend`
           // drops them silently with no queue and no replay, and the reconnect
@@ -4001,6 +5490,7 @@ export function useTimeline(
           dispatchActiveTimelineRefresh();
           return;
         }
+        liftBackgroundBackfillBackoff(cacheKeyRef.current);
         // Same gate as the DAEMON_MSG.RECONNECTED path — restrict the
         // browser-WS reconnect refresh to the active card's hook so we
         // don't herd the daemon with N timeline.history_request +
@@ -4034,8 +5524,14 @@ export function useTimeline(
           } else {
             replayRequestIdRef.current = null;
           }
-          const afterTs = getTimelineHistoryAfterTs(current);
-          sendForwardHistoryRequest('refresh', { limit: MAX_MEMORY_EVENTS, afterTs });
+          // Reuse the cached epoch/seq cursor for the durable leg too. The
+          // replay request covers in-memory streaming deltas; history should
+          // fetch only the contiguous durable tail after that same cursor.
+          // A reconnect is an explicit refresh, not a continuation of the
+          // previous response chain. It must be allowed to re-issue the same
+          // durable cursor after a disconnect, while response-driven pages
+          // remain guarded against non-advancing cursors.
+          sendForwardHistoryRequest('refresh', buildForwardHistoryArgs(MAX_MEMORY_EVENTS, current), true);
 
           // Fire HTTP backfill with a ~600ms delay to let the bridge's async
           // `terminal.subscribe` ownership-check race resolve; any live
@@ -4120,8 +5616,15 @@ export function useTimeline(
       }
     };
 
-    const unsub = ws.onMessage(handler);
-    return unsub;
+    const hasSessionRouting = typeof ws.onSessionMessage === 'function';
+    const unsub = hasSessionRouting ? ws.onSessionMessage(sessionId, handler) : ws.onMessage(handler);
+    // Daemon lifecycle frames are intentionally global (no session id). Keep
+    // only this low-frequency control path on the global bus; high-volume
+    // timeline/terminal frames remain exact-session routed.
+    const unsubGlobal = hasSessionRouting ? ws.onMessage((msg) => {
+      if (msg.type === DAEMON_MSG.RECONNECTED) handler(msg);
+    }) : () => {};
+    return () => { unsub(); unsubGlobal(); };
   }, [applyTimelineTransportQueueEvidence, applyTransportQueueEvidence, beginReconnectRefresh, buildForwardHistoryArgs, clearForwardHistoryTimeout, clearTerminalTailIdleReconcile, disableHistory, isActiveSession, ws, sessionId, appendEvent, clearOptimisticTimer, idbPutEvents, loading, markOptimisticFailed, mergeEvents, reconcileQueuedOptimisticMessages, recordTimelineResponse, rememberSettledCommandId, replaceEvents, resetOlderState, scheduleAutoRetry, scheduleTerminalTailIdleReconcile, sendForwardHistoryRequest, serverId, settleOptimisticByCommandAck, settleOptimisticByCommandAckEvent, settleOptimisticByTimelineProgress, updateHistoryStep]);
 
   useEffect(() => {
@@ -4180,6 +5683,7 @@ export function useTimeline(
     removeOptimisticMessage,
     retryOptimisticMessage,
     loadOlderEvents,
+    historyGap,
     forceRefresh,
     loadMessageContext,
   };

@@ -1,0 +1,11 @@
+{
+  "assetDir": "/remote-desktop-app",
+  "iconSourceDir": "web/public/remote-desktop-app",
+  "iconSourceHashFile": "SOURCE.sha256",
+  "maskableSafeZoneRatio": 0.8,
+  "icons": [
+    { "file": "icon-192.png", "size": 192, "purpose": "any" },
+    { "file": "icon-512.png", "size": 512, "purpose": "any" },
+    { "file": "icon-maskable-512.png", "size": 512, "purpose": "maskable" }
+  ]
+}

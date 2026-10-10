@@ -1,0 +1,363 @@
+import { DatabaseSync } from 'node:sqlite';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { SupervisionConsoleSessionRegistry } from '../../src/daemon/supervision-console-session.js';
+import { SupervisionConsoleProducer } from '../../src/daemon/supervision-console-producer.js';
+import { migrateSupervisionStore, type SupervisionMigrationDb } from '../../src/daemon/supervision-store-migrations.js';
+import {
+  SUPERVISION_TASK_CONSOLE_MSG, SUPERVISION_TASK_CONSOLE_SCHEMA_VERSION,
+} from '../../shared/supervision-task-console.js';
+import { SUPERVISION_TASK_STATUS_CONTRACT_VERSION } from '../../shared/supervision-config.js';
+
+const SCOPE = { projectName: 'codedeck', coordinatorSessionName: 'deck_cd_brain' };
+const OTHER = { projectName: 'codedeck', coordinatorSessionName: 'deck_other_brain' };
+const EPOCH = 'epoch-1';
+
+const LEGACY = `
+  CREATE TABLE supervision_tasks (task_id TEXT PRIMARY KEY, top_level_task_id TEXT NOT NULL,
+    classification TEXT NOT NULL, status TEXT NOT NULL, current_revision TEXT, commit_sha TEXT,
+    push_remote_ref TEXT, blocker TEXT, payload_json TEXT NOT NULL, created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL);
+  CREATE TABLE supervision_task_assignments (assignment_id TEXT PRIMARY KEY, task_id TEXT NOT NULL,
+    role TEXT NOT NULL, status TEXT NOT NULL, session_name TEXT NOT NULL, session_instance_id TEXT NOT NULL,
+    runtime_epoch TEXT NOT NULL, agent_type TEXT NOT NULL, provider_family TEXT NOT NULL,
+    lease_id TEXT NOT NULL, generation INTEGER NOT NULL, audit_attempt_id TEXT, audit_revision TEXT,
+    verdict TEXT, blocker TEXT, payload_json TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
+  CREATE TABLE supervision_task_events (id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL,
+    assignment_id TEXT, event_type TEXT NOT NULL, status TEXT NOT NULL, payload_json TEXT, created_at INTEGER NOT NULL);
+`;
+
+let db: DatabaseSync; let sent: any[]; let producer: SupervisionConsoleProducer;
+let registry: SupervisionConsoleSessionRegistry; let clock: number;
+
+function subscribe(over: Record<string, unknown> = {}) {
+  return {
+    type: SUPERVISION_TASK_CONSOLE_MSG.SUBSCRIBE, scope: SCOPE, subscriptionId: 'sub-1',
+    afterEventId: null, reason: 'initial',
+    schemaVersion: SUPERVISION_TASK_CONSOLE_SCHEMA_VERSION,
+    statusContractVersion: SUPERVISION_TASK_STATUS_CONTRACT_VERSION,
+    projectionVersion: 0, lastDurableEventId: null, projectionEpoch: EPOCH, ...over,
+  };
+}
+function emit() {
+  return producer.appendTaskEvent({ scope: SCOPE, taskId: 'tsk_a', eventType: 'implementing', status: 'implementing' });
+}
+
+/** Wait for an event, not a pause: until `sent` holds at least `count` frames (a generous bound only keeps a real hang from running forever). */
+async function waitForFrames(count: number): Promise<void> {
+  await vi.waitFor(() => { expect(sent.length).toBeGreaterThanOrEqual(count); }, { timeout: 20_000, interval: 5 });
+}
+/** Let anything that is already due run, so an extra frame that would follow can show up before the count is asserted. */
+async function flushPending(): Promise<void> {
+  for (let i = 0; i < 5; i += 1) await new Promise<void>((resolve) => setImmediate(resolve));
+}
+
+beforeEach(() => {
+  db = new DatabaseSync(':memory:');
+  db.exec(LEGACY);
+  migrateSupervisionStore(db as unknown as SupervisionMigrationDb);
+  db.prepare(`INSERT INTO supervision_tasks (task_id, project_name, top_level_task_id, classification, status,
+    payload_json, created_at, updated_at) VALUES ('tsk_a','codedeck','top','slice','implementing','{}',1,1)`).run();
+  // This test's own frame list, captured by the registry below: a drain left running by an earlier test must push into THAT test's list,
+  // never into this one's (the shared `sent` variable is re-pointed here for every test).
+  const frames: any[] = [];
+  sent = frames; clock = 0;
+  producer = new SupervisionConsoleProducer(db as unknown as SupervisionMigrationDb, {
+    projectionEpoch: EPOCH, now: () => ++clock,
+    broadcast: (frame) => registry.broadcast(frame),
+  });
+  registry = new SupervisionConsoleSessionRegistry({
+    producer, send: (f) => frames.push(f), authorize: (s) => s.coordinatorSessionName === SCOPE.coordinatorSessionName,
+    now: () => clock,
+  });
+});
+
+describe('subscribe', () => {
+  it('answers afterEventId:null with a full snapshot carrying the subscriptionId', () => {
+    expect(registry.handleFrame(subscribe())).toBe(true);
+    expect(sent).toHaveLength(1);
+    expect(sent[0].type).toBe(SUPERVISION_TASK_CONSOLE_MSG.SNAPSHOT);
+    expect(sent[0].subscriptionId).toBe('sub-1');
+    expect(sent[0].tasks).toHaveLength(1);
+    expect(sent[0].projectionEpoch).toBe(EPOCH);
+  });
+
+  it('yields a large replay before sending the snapshot', async () => {
+    producer.ensureProjectionBaseline(SCOPE);
+    for (let i = 0; i < 96; i += 1) {
+      db.prepare(`INSERT INTO supervision_task_events (task_id, assignment_id, event_type, status, payload_json, created_at)
+        VALUES ('tsk_a', NULL, 'implementing', 'implementing', '{}', ?)`).run(10 + i);
+    }
+    expect(registry.handleFrame(subscribe())).toBe(true);
+    expect(sent).toHaveLength(0);
+    await waitForFrames(1);
+    await flushPending();
+    expect(sent).toHaveLength(1);
+    expect(sent[0]).toMatchObject({ type: SUPERVISION_TASK_CONSOLE_MSG.SNAPSHOT, subscriptionId: 'sub-1' });
+  });
+
+  it('coalesces a resubscribe storm into one yielding replay and answers the latest id', async () => {
+    producer.ensureProjectionBaseline(SCOPE);
+    for (let i = 0; i < 96; i += 1) {
+      db.prepare(`INSERT INTO supervision_task_events (task_id, assignment_id, event_type, status, payload_json, created_at)
+        VALUES ('tsk_a', NULL, 'implementing', 'implementing', '{}', ?)`).run(10 + i);
+    }
+    for (let i = 0; i < 12; i += 1) {
+      expect(registry.handleFrame(subscribe({ subscriptionId: `storm-${i}` }))).toBe(true);
+    }
+    expect(sent).toHaveLength(0);
+    await waitForFrames(1);
+    await flushPending();
+    expect(sent).toHaveLength(1);
+    expect(sent[0]).toMatchObject({ type: SUPERVISION_TASK_CONSOLE_MSG.SNAPSHOT, subscriptionId: 'storm-11' });
+  });
+
+  it('answers a large replay after as many slices as a very slow machine needs', async () => {
+    // A slow runner is a producer whose clock says every slice used up its whole budget: each slice then commits ONE event, so the
+    // replay takes ~96 yields. Nothing may depend on how long that takes.
+    producer.ensureProjectionBaseline(SCOPE);
+    for (let i = 0; i < 96; i += 1) {
+      db.prepare(`INSERT INTO supervision_task_events (task_id, assignment_id, event_type, status, payload_json, created_at)
+        VALUES ('tsk_a', NULL, 'implementing', 'implementing', '{}', ?)`).run(10 + i);
+    }
+    let mono = 0;
+    const slowFrames: any[] = [];
+    const slowProducer = new SupervisionConsoleProducer(db as unknown as SupervisionMigrationDb, {
+      projectionEpoch: EPOCH, now: () => ++clock, monotonicNowMs: () => (mono += 100),
+    });
+    const slowRegistry = new SupervisionConsoleSessionRegistry({
+      producer: slowProducer, send: (f) => slowFrames.push(f), authorize: () => true, now: () => clock,
+    });
+    expect(slowRegistry.handleFrame(subscribe({ subscriptionId: 'slow-1' }))).toBe(true);
+    expect(slowFrames).toHaveLength(0);
+    await vi.waitFor(() => { expect(slowFrames.length).toBeGreaterThanOrEqual(1); }, { timeout: 20_000, interval: 5 });
+    await flushPending();
+    expect(slowFrames).toHaveLength(1);
+    expect(slowFrames[0]).toMatchObject({ type: SUPERVISION_TASK_CONSOLE_MSG.SNAPSHOT, subscriptionId: 'slow-1' });
+  });
+
+  it('projects a steady-state registry commit inline and a real backlog through the sliced drain (live refresh)', async () => {
+    registry.handleFrame(subscribe());
+    sent.length = 0;
+    const inline = vi.spyOn(producer, 'synchronizeDurableEvents');
+    const sliced = vi.spyOn(producer, 'synchronizeDurableEventsAsync');
+    // One commit: a couple of milliseconds, stays inline.
+    db.prepare(`INSERT INTO supervision_task_events (task_id, assignment_id, event_type, status, payload_json, created_at)
+      VALUES ('tsk_a', NULL, 'implementing', 'implementing', '{}', 500)`).run();
+    registry.refreshActiveSubscriptions();
+    expect(inline).toHaveBeenCalledTimes(1);
+    expect(sliced).not.toHaveBeenCalled();
+    // A backlog (registry writer far ahead of the console): drained in yielded slices,
+    // never one long synchronous pass on the event-loop turn that took the commit.
+    for (let i = 0; i < 40; i += 1) {
+      db.prepare(`INSERT INTO supervision_task_events (task_id, assignment_id, event_type, status, payload_json, created_at)
+        VALUES ('tsk_a', NULL, 'implementing', 'implementing', '{}', ?)`).run(600 + i);
+    }
+    inline.mockClear();
+    const before = sent.length;
+    registry.refreshActiveSubscriptions();
+    expect(inline).not.toHaveBeenCalled();
+    expect(sliced).toHaveBeenCalledTimes(1);
+    await waitForFrames(before + 40);
+    await flushPending();
+    expect(sent.length - before).toBe(40);
+  });
+
+  it('deduplicates an identical subscribe retry on the same connection', () => {
+    const synchronize = vi.spyOn(producer, 'synchronizeDurableEvents');
+    expect(registry.handleFrame(subscribe())).toBe(true);
+    expect(registry.handleFrame(subscribe())).toBe(true);
+    expect(synchronize).toHaveBeenCalledTimes(1);
+    expect(sent).toHaveLength(1);
+  });
+
+  it('rate-limits durable synchronization while still answering fresh subscription ids', () => {
+    const synchronize = vi.spyOn(producer, 'synchronizeDurableEvents');
+    for (let i = 0; i < 8; i += 1) {
+      clock = i * 1_100;
+      registry.handleFrame(subscribe({ subscriptionId: `sub-${i}` }));
+    }
+    // The first six attempts are the per-viewer budget; subsequent retries
+    // still receive a snapshot but cannot replay the same durable backlog.
+    expect(synchronize).toHaveBeenCalledTimes(6);
+    expect(sent).toHaveLength(8);
+    expect(registry.activeSubscriptionId(SCOPE)).toBe('sub-7');
+  });
+
+  it('is SILENT for an unauthorized scope: no frame at all', () => {
+    expect(registry.handleFrame(subscribe({ scope: OTHER }))).toBe(true);
+    expect(sent).toHaveLength(0);
+    expect(registry.refusedCount).toBe(1);
+  });
+
+  it('replays contiguous owed deltas on catch-up', () => {
+    const first = emit(); emit();
+    sent.length = 0;
+    registry.handleFrame(subscribe({ afterEventId: first.eventId - 1, projectionVersion: 0 }));
+    expect(sent.map((f) => f.projectionVersion)).toEqual([1, 2]);
+    expect(sent.every((f) => f.subscriptionId === 'sub-1')).toBe(true);
+  });
+
+  it('explicitly confirms the snapshot when the reconnect cursor is already current', () => {
+    const r = emit();
+    sent.length = 0;
+    registry.handleFrame(subscribe({ afterEventId: r.eventId, projectionVersion: 1 }));
+    expect(sent).toHaveLength(1);
+    expect(sent[0]).toMatchObject({
+      type: SUPERVISION_TASK_CONSOLE_MSG.SNAPSHOT,
+      subscriptionId: 'sub-1',
+      projectionVersion: 1,
+      lastDurableEventId: r.eventId,
+    });
+  });
+
+  it('demands resync rather than patching across a pruned outbox', () => {
+    emit(); const second = emit();
+    producer.recordAck(SCOPE, 1);
+    sent.length = 0;
+    // Client claims version 0 but v1 is acked/pruned: the hole is unpatchable.
+    registry.handleFrame(subscribe({ afterEventId: second.eventId - 2, projectionVersion: 0 }));
+    expect(sent).toHaveLength(1);
+    expect(sent[0].type).toBe(SUPERVISION_TASK_CONSOLE_MSG.RESYNC_REQUIRED);
+    expect(sent[0].reason).toBe('outbox_truncated');
+  });
+
+  it('demands resync on epoch, schema and status-contract mismatch', () => {
+    for (const [over, reason] of [
+      [{ projectionEpoch: 'epoch-9' }, 'authority_epoch_changed'],
+      [{ schemaVersion: 99 }, 'schema_mismatch'],
+      [{ statusContractVersion: 99 }, 'status_contract_mismatch'],
+    ] as const) {
+      sent.length = 0;
+      registry.handleFrame(subscribe({ afterEventId: 0, ...over }));
+      expect(sent[0]?.reason, reason).toBe(reason);
+    }
+  });
+});
+
+describe('ack', () => {
+  it('prunes the outbox durably', () => {
+    emit(); emit();
+    registry.handleFrame(subscribe());
+    registry.handleFrame({ type: SUPERVISION_TASK_CONSOLE_MSG.ACK, scope: SCOPE, subscriptionId: 'sub-1', projectionVersion: 1 });
+    expect(producer.pendingFrames(SCOPE).map((r) => r.projectionVersion)).toEqual([2]);
+  });
+
+  it('IGNORES an ack from a superseded subscription', () => {
+    emit(); emit();
+    registry.handleFrame(subscribe({ subscriptionId: 'sub-1' }));
+    registry.handleFrame(subscribe({ subscriptionId: 'sub-2' }));
+    registry.handleFrame({ type: SUPERVISION_TASK_CONSOLE_MSG.ACK, scope: SCOPE, subscriptionId: 'sub-1', projectionVersion: 2 });
+    expect(producer.pendingFrames(SCOPE)).toHaveLength(2);
+  });
+
+  it('is silent and inert for an unauthorized ack', () => {
+    emit();
+    registry.handleFrame({ type: SUPERVISION_TASK_CONSOLE_MSG.ACK, scope: OTHER, subscriptionId: 'x', projectionVersion: 9 });
+    expect(producer.pendingFrames(SCOPE)).toHaveLength(1);
+    expect(registry.refusedCount).toBe(1);
+  });
+});
+
+describe('live broadcast + unsubscribe', () => {
+  it('pushes new deltas to the active subscriber', () => {
+    registry.handleFrame(subscribe());
+    sent.length = 0;
+    emit();
+    expect(sent).toHaveLength(1);
+    expect(sent[0].type).toBe(SUPERVISION_TASK_CONSOLE_MSG.DELTA);
+    expect(sent[0].subscriptionId).toBe('sub-1');
+  });
+
+  it('stops pushing after unsubscribe, but the frame stays durable', () => {
+    registry.handleFrame(subscribe());
+    registry.handleFrame({ type: SUPERVISION_TASK_CONSOLE_MSG.UNSUBSCRIBE, scope: SCOPE, subscriptionId: 'sub-1' });
+    sent.length = 0;
+    emit();
+    expect(sent).toHaveLength(0);
+    expect(producer.pendingFrames(SCOPE)).toHaveLength(1);
+  });
+
+  it('does not let a stale unsubscribe drop the current subscription', () => {
+    registry.handleFrame(subscribe({ subscriptionId: 'sub-1' }));
+    registry.handleFrame(subscribe({ subscriptionId: 'sub-2' }));
+    registry.handleFrame({ type: SUPERVISION_TASK_CONSOLE_MSG.UNSUBSCRIBE, scope: SCOPE, subscriptionId: 'sub-1' });
+    expect(registry.activeSubscriptionId(SCOPE)).toBe('sub-2');
+  });
+});
+
+describe('frame ownership', () => {
+  it('claims only its own message types', () => {
+    expect(registry.handleFrame({ type: 'session.send' })).toBe(false);
+    expect(registry.handleFrame(null)).toBe(false);
+    expect(registry.handleFrame({ type: SUPERVISION_TASK_CONSOLE_MSG.SNAPSHOT })).toBe(true);
+    expect(sent).toHaveLength(0);
+  });
+});
+
+describe('pairs engine rows', () => {
+  const previousEngine = process.env.IMCODES_SUPERVISION_ENGINE;
+  beforeEach(async () => {
+    process.env.IMCODES_SUPERVISION_ENGINE = 'pairs';
+    const { TaskPairStore, setTaskPairStoreForTests } = await import('../../src/daemon/task-pairs/store.js');
+    setTaskPairStoreForTests(new TaskPairStore(':memory:'));
+  });
+  afterEach(async () => {
+    const { setTaskPairStoreForTests } = await import('../../src/daemon/task-pairs/store.js');
+    setTaskPairStoreForTests(undefined);
+    if (previousEngine === undefined) delete process.env.IMCODES_SUPERVISION_ENGINE;
+    else process.env.IMCODES_SUPERVISION_ENGINE = previousEngine;
+  });
+
+  it('builds the snapshot of a pairs project from the pair store, grouped by the closest legacy status', async () => {
+    const { taskPairService } = await import('../../src/daemon/task-pairs/service.js');
+    taskPairService.ingestText('codedeck', 'deck_cd_brain',
+      '<!-- IMCODES_TASK DISPATCH P1 executor=deck_sub_exec auditor=deck_sub_aud title="Export" -->', 'console-turn-1');
+    // The queue's admission (the only route by which a queued pair starts).
+    taskPairService.applyMarker({
+      project: 'codedeck', writer: 'daemon', source: 'queue', eventId: 'console-admit-1',
+      marker: { verb: 'DISPATCH', knownVerb: 'DISPATCH', taskId: 'P1', attrs: { executor: 'deck_sub_exec', auditor: 'deck_sub_aud' } },
+    });
+    // Owner rule: the auditor verdict must be tied to material from a real
+    // READY_FOR_AUDIT round.
+    taskPairService.ingestText('codedeck', 'deck_sub_exec', '<!-- IMCODES_TASK READY_FOR_AUDIT P1 path=/workspace -->', 'console-turn-2');
+    taskPairService.ingestText('codedeck', 'deck_sub_aud', '<!-- IMCODES_TASK REWORK P1 blocking=P0 p0=1 p2=1 -->', 'console-turn-3');
+    registry.handleFrame(subscribe());
+    const snapshot = sent[0];
+    expect(snapshot.tasks).toEqual([expect.objectContaining({
+      taskId: 'P1', title: 'Export', status: 'rework', auditRound: '1', auditVerdict: 'REWORK',
+      pair: expect.objectContaining({ status: 'rework', executor: 'deck_sub_exec', auditor: 'deck_sub_aud', round: 1, severityCounts: expect.objectContaining({ P0: 1, P2: 1 }) }),
+    })]);
+    expect(snapshot.assignments.map((row: { role: string; ownerSessionName: string }) => [row.role, row.ownerSessionName]))
+      .toEqual([['implementer', 'deck_sub_exec'], ['auditor', 'deck_sub_aud']]);
+  });
+
+  it('projects urgent-first queue positions per Brain', async () => {
+    const { taskPairService } = await import('../../src/daemon/task-pairs/service.js');
+    taskPairService.ingestText('codedeck', 'deck_cd_brain', '<!-- IMCODES_TASK QUEUE Q-normal-1 title="Normal 1" -->', 'queue-1');
+    taskPairService.ingestText('codedeck', 'deck_cd_brain', '<!-- IMCODES_TASK QUEUE Q-normal-2 title="Normal 2" -->', 'queue-2');
+    taskPairService.ingestText('codedeck', 'deck_cd_brain', '<!-- IMCODES_TASK QUEUE Q-urgent title="Urgent" urgent=true -->', 'queue-3');
+    registry.handleFrame(subscribe());
+    const queued = sent[0].tasks.filter((row: any) => row.pair?.status === 'queued');
+    expect(Object.fromEntries(queued.map((row: any) => [row.taskId, row.pair.queuePosition]))).toEqual({
+      'Q-normal-1': 2, 'Q-normal-2': 3, 'Q-urgent': 1,
+    });
+  });
+
+  it('keeps requested models in queued unassigned console rows', async () => {
+    const { taskPairService } = await import('../../src/daemon/task-pairs/service.js');
+    taskPairService.ingestText('codedeck', 'deck_cd_brain', '<!-- IMCODES_TASK QUEUE Q-models executormodel=gpt-6-luna auditormodel=gpt-6-sol -->', 'queue-models');
+    registry.handleFrame(subscribe());
+    const row = sent[0].tasks.find((task: any) => task.taskId === 'Q-models');
+    expect(row?.pair).toEqual(expect.objectContaining({ executorModel: 'gpt-6-luna', auditorModel: 'gpt-6-sol' }));
+  });
+
+  it('asks every viewer of a project to resync when a pair changes', () => {
+    registry.handleFrame(subscribe());
+    sent.length = 0;
+    registry.resyncProject('codedeck', 'task_pair_changed');
+    registry.resyncProject('otherproject', 'task_pair_changed');
+    expect(sent).toEqual([expect.objectContaining({
+      type: SUPERVISION_TASK_CONSOLE_MSG.RESYNC_REQUIRED, subscriptionId: 'sub-1', reason: 'task_pair_changed',
+    })]);
+  });
+});

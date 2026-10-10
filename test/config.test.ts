@@ -6,9 +6,18 @@ import { vi } from 'vitest';
 
 let tempDir: string;
 
+function loadedDefaults(config: Record<string, unknown>): string[] {
+  return [
+    (config.sessions as { storePath: string }).storePath,
+    (config.projects as { storePath: string }).storePath,
+  ];
+}
+
 beforeEach(() => {
   tempDir = mkdtempSync(join(tmpdir(), 'deck-config-test-'));
   vi.stubEnv('HOME', tempDir);
+  // IMCODES_HOME (set globally by the test setup) is the state directory and wins over HOME: move it with HOME.
+  vi.stubEnv('IMCODES_HOME', join(tempDir, '.imcodes'));
   vi.resetModules();
 });
 
@@ -25,6 +34,7 @@ describe('loadConfig()', () => {
     expect(config).toBeDefined();
     // Default config should have some known keys
     expect(typeof config).toBe('object');
+    expect(config.daemon.autoUpgrade).toBe(true);
   });
 
   it('expands ${ENV_VAR} in config values', async () => {
@@ -64,6 +74,19 @@ describe('loadConfig()', () => {
     const { loadConfig } = await import('../src/config.js');
     const config = await loadConfig();
     expect((config as Record<string, unknown>).someDir).toContain(tempDir);
+  });
+
+  it('expands ~/.imcodes/... to the state directory, which IMCODES_HOME relocates', async () => {
+    const scoped = join(tempDir, 'scoped-state');
+    vi.stubEnv('IMCODES_HOME', scoped);
+    mkdirSync(scoped, { recursive: true });
+    writeFileSync(join(scoped, 'config.yaml'), 'stateFile: ~/.imcodes/thing.json\nother: ~/elsewhere\n');
+    const { loadConfig } = await import('../src/config.js');
+    const config = await loadConfig() as unknown as Record<string, unknown>;
+    expect(config.stateFile).toBe(join(scoped, 'thing.json'));
+    expect(config.other).toBe(join(tempDir, 'elsewhere'));
+    // The shipped default paths follow it too, not the account home.
+    expect(loadedDefaults(config)).toEqual([join(scoped, 'sessions.json'), join(scoped, 'projects.json')]);
   });
 
   it('deep merges user config over defaults', async () => {

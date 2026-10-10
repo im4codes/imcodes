@@ -4,30 +4,43 @@
  * read from the DB (F1), so no `serverId` is sent — `apiFetch` handles cookie
  * credentials + CSRF automatically, mirroring `api/aliases.ts`.
  *
- * Returns the composer-facing machine DTO used by the `^^(name)` quick-reference
- * (ref_name key + render-only display name + online/exec-enabled flags). Offline
+ * Returns the composer-facing machine DTO used by the `^^(nodeId)` quick-reference
+ * (canonical nodeId + deprecated refName alias + render-only display name). Offline
  * machines are included for display; the picker renders them non-selectable.
  */
 import {
   FILE_TRANSFER_DIRECTORY_MAX_ENTRIES,
   FILE_TRANSFER_PATH_MAX_BYTES,
   type FileDirectoryEntry,
+  type FileDirectoryListQuery,
 } from '@shared/transport/file-transfer.js';
 import {
   compareControlledNodeArtifactPairs,
   CONTROLLED_NODE_MINT_ERRORS,
+  CONTROLLED_NODE_TICKET_DELIVERY,
   controlledNodeArtifactKey,
   isCanonicalControlledNodePair,
+  isControlledNodeInstallCode,
   isControlledNodeArtifactArch,
   isControlledNodeArtifactSha256,
   isControlledNodeOs,
+  isControlledNodeTicketDelivery,
   type ControlledNodeArtifactArch,
   type ControlledNodeArtifactPair,
   type ControlledNodeOs,
+  type ControlledNodeTicketDelivery,
 } from '@shared/controlled-node-artifacts.js';
-import { MACHINE_API_PATH } from '@shared/machine-reference.js';
+import {
+  MACHINE_API_PATH,
+  MACHINE_HOST_LINK_ROUTE,
+  MACHINE_IDENTITY_UNAVAILABLE,
+} from '@shared/machine-reference.js';
+import { CONTROLLED_NODE_ABI_MODERN, CONTROLLED_NODE_ABI_PROFILE_FIELD, normalizeControlledNodeAbiProfile, type ControlledNodeAbiProfile } from '@shared/controlled-node-abi.js';
+import { isControlledNodeId } from '@shared/controlled-node-identity.js';
+import { CONTROLLED_NODE_UPGRADE_STATUS, type ControlledNodeUpgradeStatus } from '@shared/daemon-upgrade.js';
+import type { DaemonUpgradeStatusSnapshot, DaemonUpgradeLifecycleStatus } from '@shared/daemon-upgrade.js';
 import { REMOTE_DESKTOP_CAPABILITY } from '@shared/remote-desktop.js';
-import { isMachineAccessRole, type MachineAccessRole } from '@shared/remote-exec.js';
+import { isMachineAccessRole, MACHINE_ACCESS_ROLES, type MachineAccessRole } from '@shared/remote-exec.js';
 import {
   validateControlledNodeCapabilities,
   type ControlledNodeCapability,
@@ -48,8 +61,9 @@ export type { ControlledNodeArtifactArch, ControlledNodeOs };
  * The daemon is not a controlled node, so it has no row in the machine list —
  * but `RemoteDesktopPanel` is keyed by `serverId` and needs a `MachineListItem`.
  * The fields the panel gates on are asserted here because the daemon already
- * proved them by advertising the remote-desktop capability, which it only does
- * on Windows x64 with a verified worker installed.
+ * proved them by advertising a complete remote-desktop capability profile.
+ * OS metadata is deliberately absent: it is descriptive and must not become
+ * launch authority.
  */
 export function daemonRemoteDesktopMachine(
   serverId: string,
@@ -57,9 +71,8 @@ export function daemonRemoteDesktopMachine(
 ): MachineListItem {
   return {
     serverId,
-    refName: serverId,
-    displayName: displayName ?? serverId,
-    os: 'win',
+    refName: '',
+    displayName: displayName?.trim() || MACHINE_IDENTITY_UNAVAILABLE,
     online: true,
     execEnabled: true,
     accessRole: 'owner',
@@ -69,17 +82,44 @@ export function daemonRemoteDesktopMachine(
 
 export interface MachineListItem {
   serverId: string;
+  /** Canonical controlled-node public identity; absent only for synthetic full-daemon hosts. */
+  nodeId?: string;
+  /** Canonical physical-host identity. Required for Owner guest-access management. */
+  remoteDesktopHostId?: string;
   refName: string;
   displayName: string;
   os?: string;
   online: boolean;
   execEnabled: boolean;
   accessRole?: MachineAccessRole;
+  /** Browser-only label management. Legacy absence never grants a non-owner authority. */
+  canRename?: boolean;
   capabilities?: ControlledNodeCapability[];
   /** The node's own reported release. Absent on old Servers and unreported nodes. */
   daemonVersion?: string;
   /** Server-computed: that release is older than the Server's target. */
   updateAvailable?: boolean;
+  upgradeStatus?: ControlledNodeUpgradeStatus;
+  upgradeTargetVersion?: string;
+  upgradeReason?: string;
+  latestVersion?: string;
+  upgrade?: {
+    upgradeId: string;
+    targetVersion: string;
+    status: DaemonUpgradeLifecycleStatus;
+    reason?: string;
+    updatedAt: number;
+    lastResult?: string;
+  };
+  workerRefresh?: {
+    attemptId: string;
+    phase: 'started' | 'deferred' | 'succeeded' | 'failed';
+    installedVersion?: string;
+    targetVersion?: string;
+    artifactSha256?: string;
+    reason?: string;
+    recordedAt: number;
+  };
   /** The node holds a sign-in secret for auto unlock. Never the secret itself. */
   autoUnlockConfigured?: boolean;
   /**
@@ -88,13 +128,19 @@ export interface MachineListItem {
    * steers here rather than opening a second session on the same desktop.
    */
   hostServerId?: string;
+  /**
+   * Every group this machine is in. Absent means none, which is how every
+   * machine starts; a machine can be in several at once.
+   */
+  teamIds?: string[];
+  teamNames?: string[];
 }
 
 /** Identifies one downloadable artifact in the canonical OS+arch matrix. */
 export interface ControlledNodeArtifactSelection extends ControlledNodeArtifactPair {}
 
 /** Per-artifact metadata returned by GET /api/enroll/v2/availability. */
-export interface ControlledNodeArtifactMetadata {
+export interface ControlledNodeArtifactMetadata extends ControlledNodeArtifactPair {
   os: ControlledNodeOs;
   arch: ControlledNodeArtifactArch;
   filename: string;
@@ -109,7 +155,7 @@ export interface ControlledNodeAvailability {
 }
 
 /** Minted download ticket from POST /api/enroll/v2/ticket. */
-export interface ControlledNodeExecutableTicket {
+export interface ControlledNodeExecutableTicket extends ControlledNodeArtifactPair {
   version: 2;
   ticket: string;
   ticketId: string;
@@ -118,8 +164,17 @@ export interface ControlledNodeExecutableTicket {
   filename: string;
   sizeBytes: number;
   sha256: string;
-  expiresAt: number;
+  expiresAt: number | null;
+  /** How this ticket is meant to reach the machine; decides its lifetime. */
+  delivery: ControlledNodeTicketDelivery;
   ownerUserId: string;
+  /**
+   * The line the operator pastes into a terminal, present only for the
+   * `install_command` delivery. Older servers do not send it.
+   */
+  installCommand?: string;
+  /** The code inside that line, for a daemon to run the same install itself. */
+  installCode?: string;
 }
 
 export async function createMachineFileHandle(
@@ -138,16 +193,27 @@ export async function createMachineFileHandle(
 export interface MachineDirectoryList {
   resolvedPath: string;
   entries: FileDirectoryEntry[];
+  /** More entries matched the query than `entries` carries; only a node that answers queries says so. */
+  truncated?: true;
+  total?: number;
+  /** The order was computed over only part of the matches (stat limit / time budget), cut or not. */
+  partial?: true;
+}
+
+/** A finite, non-negative number or nothing: a malformed metadata field is dropped, never shown as 0 or NaN. */
+function metadataNumber(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : undefined;
 }
 
 export async function listMachineDirectories(
   serverId: string,
   path: string,
   signal?: AbortSignal,
+  query?: FileDirectoryListQuery,
 ): Promise<MachineDirectoryList> {
-  const result = await apiFetch<{ ok?: boolean; resolvedPath?: unknown; entries?: unknown }>(
+  const result = await apiFetch<{ ok?: boolean; resolvedPath?: unknown; entries?: unknown; truncated?: unknown; total?: unknown; partial?: unknown }>(
     `/api/server/${encodeURIComponent(serverId)}/machine-file-list`,
-    { method: 'POST', body: JSON.stringify({ path }), signal },
+    { method: 'POST', body: JSON.stringify(query ? { path, query } : { path }), signal },
   );
   if (result.ok !== true
     || typeof result.resolvedPath !== 'string'
@@ -161,11 +227,48 @@ export async function listMachineDirectories(
     const candidate = entry as Partial<FileDirectoryEntry>;
     return typeof candidate.name === 'string'
       && typeof candidate.path === 'string'
-      && candidate.isDir === true
+      && typeof candidate.isDir === 'boolean'
       && typeof candidate.hidden === 'boolean';
   });
   if (entries.length !== result.entries.length) throw new Error('machine_file_list_failed');
-  return { resolvedPath: result.resolvedPath, entries };
+  const sanitized = entries.map((entry): FileDirectoryEntry => {
+    const { size, mtimeMs, birthtimeMs, ...base } = entry;
+    return {
+      ...base,
+      ...(metadataNumber(size) !== undefined ? { size: size as number } : {}),
+      ...(metadataNumber(mtimeMs) !== undefined ? { mtimeMs: mtimeMs as number } : {}),
+      ...(metadataNumber(birthtimeMs) !== undefined ? { birthtimeMs: birthtimeMs as number } : {}),
+    };
+  });
+  const total = metadataNumber(result.total);
+  const truncated = result.truncated === true && total !== undefined && Number.isSafeInteger(total);
+  return {
+    resolvedPath: result.resolvedPath,
+    entries: sanitized,
+    ...(truncated ? { truncated: true as const, total } : {}),
+    ...(result.partial === true ? { partial: true as const } : {}),
+  };
+}
+
+/**
+ * Ask a controlled node running macOS to reveal its native Full Disk Access
+ * settings pane, in the signed-in user's own session, so they can grant it
+ * to the daemon themselves. Call this after `listMachineDirectories` throws
+ * an `ApiError` whose `code` is
+ * `FILE_TRANSFER_DIRECTORY_LIST_ERROR.MACOS_FULL_DISK_ACCESS_REQUIRED`.
+ * Throws on failure; the thrown `ApiError.code` is one of
+ * `MACOS_OPEN_FULL_DISK_ACCESS_ERROR` (or a transport code such as
+ * `daemon_offline`/`timeout`).
+ */
+export async function openMacosFullDiskAccessSettings(
+  serverId: string,
+  signal?: AbortSignal,
+): Promise<void> {
+  const result = await apiFetch<{ ok?: boolean }>(
+    `/api/server/${encodeURIComponent(serverId)}/macos-open-full-disk-access`,
+    { method: 'POST', body: JSON.stringify({}), signal },
+  );
+  if (result.ok !== true) throw new Error('macos_open_full_disk_access_failed');
 }
 
 const ENROLL_V2_AVAILABILITY_PATH = '/api/enroll/v2/availability';
@@ -173,7 +276,7 @@ const ENROLL_V2_TICKET_PATH = '/api/enroll/v2/ticket';
 const ENROLL_V2_BOOTSTRAP_PATH = '/api/enroll/v2/bootstrap';
 
 export function artifactSelectionKey(sel: ControlledNodeArtifactSelection): string {
-  return controlledNodeArtifactKey(sel.os, sel.arch);
+  return controlledNodeArtifactKey(sel.os, sel.arch, sel.abiProfile);
 }
 
 function isRecord(v: unknown): v is Record<string, unknown> {
@@ -188,8 +291,11 @@ function normalizeArtifact(raw: unknown): ControlledNodeArtifactMetadata | null 
   const sizeBytes = typeof raw.sizeBytes === 'number' && Number.isFinite(raw.sizeBytes) ? raw.sizeBytes : null;
   const sha256 = typeof raw.sha256 === 'string' && isControlledNodeArtifactSha256(raw.sha256) ? raw.sha256 : null;
   if (!os || !arch || !filename || sizeBytes === null || sizeBytes < 0 || !sha256) return null;
-  if (!isCanonicalControlledNodePair(os, arch)) return null;
-  return { os, arch, filename, sizeBytes, sha256 };
+  const abiProfile = normalizeControlledNodeAbiProfile(raw.abiProfile);
+  if (!abiProfile || !isCanonicalControlledNodePair(os, arch, abiProfile)) return null;
+  return { os, arch, filename, sizeBytes, sha256,
+    ...(abiProfile !== CONTROLLED_NODE_ABI_MODERN ? { abiProfile } : {}),
+  };
 }
 
 function normalizeAvailability(res: unknown): ControlledNodeAvailability {
@@ -217,36 +323,68 @@ function normalizeTicket(res: unknown, expectedOwnerUserId: string): ControlledN
   const filename = typeof res.filename === 'string' ? res.filename : '';
   const sizeBytes = typeof res.sizeBytes === 'number' && Number.isFinite(res.sizeBytes) ? res.sizeBytes : null;
   const sha256 = typeof res.sha256 === 'string' && isControlledNodeArtifactSha256(res.sha256) ? res.sha256 : null;
-  const expiresAt = typeof res.expiresAt === 'number' && Number.isFinite(res.expiresAt) ? res.expiresAt : null;
   const ownerUserId = typeof res.ownerUserId === 'string' ? res.ownerUserId : '';
+  // A server that predates delivery modes minted a browser-window ticket, which
+  // is the safe assumption: it under-promises the lifetime rather than over.
+  const delivery = isControlledNodeTicketDelivery(res.delivery)
+    ? res.delivery
+    : CONTROLLED_NODE_TICKET_DELIVERY.BROWSER;
+  const expiresAt = typeof res.expiresAt === 'number' && Number.isFinite(res.expiresAt)
+    ? res.expiresAt
+    : res.expiresAt === null && delivery === CONTROLLED_NODE_TICKET_DELIVERY.REMOTE_LINK
+      ? null
+      : undefined;
+  const installCommand = typeof res.installCommand === 'string' && res.installCommand.length > 0
+    ? res.installCommand
+    : undefined;
+  const installCode = isControlledNodeInstallCode(res.installCode) ? res.installCode : undefined;
   if (ownerUserId && ownerUserId !== expectedOwnerUserId) {
     throw new Error(CONTROLLED_NODE_MINT_ERRORS.AUTH_IDENTITY_CHANGED);
   }
-  if (!ticket || !ticketId || !os || !arch || !filename || sizeBytes === null || !sha256 || expiresAt === null || !ownerUserId) {
+  if (!ticket || !ticketId || !os || !arch || !filename || sizeBytes === null || !sha256 || expiresAt === undefined || !ownerUserId) {
     throw new Error('invalid_ticket_response');
   }
-  if (!isCanonicalControlledNodePair(os, arch)) throw new Error('invalid_ticket_response');
-  return { version: 2, ticket, ticketId, os, arch, filename, sizeBytes, sha256, expiresAt, ownerUserId };
+  const abiProfile = normalizeControlledNodeAbiProfile(res.abiProfile);
+  if (!abiProfile || !isCanonicalControlledNodePair(os, arch, abiProfile)) throw new Error('invalid_ticket_response');
+  return {
+    version: 2, ticket, ticketId, os, arch, filename, sizeBytes, sha256,
+    expiresAt, delivery, ownerUserId,
+    ...(abiProfile !== CONTROLLED_NODE_ABI_MODERN ? { abiProfile } : {}),
+    ...(installCommand ? { installCommand } : {}),
+    ...(installCode ? { installCode } : {}),
+  };
 }
 
 /** Build download targets: one per canonical (os, arch) artifact with explicit arch. */
 export function buildControlledNodeDownloadTargets(res: ControlledNodeAvailability): ControlledNodeArtifactSelection[] {
   const targets = res.artifacts
-    .filter((a) => isCanonicalControlledNodePair(a.os, a.arch))
-    .map((a) => ({ os: a.os, arch: a.arch }));
+    .filter((a) => isCanonicalControlledNodePair(a.os, a.arch, a.abiProfile))
+    .map((a) => ({ os: a.os, arch: a.arch, ...(a.abiProfile ? { abiProfile: a.abiProfile } : {}) }));
   return [...targets].sort(compareControlledNodeArtifactPairs);
+}
+
+/** Group ids/names, keeping only the strings a caller can actually use. */
+function normalizeGroupIds(value: unknown): string[] {
+  return Array.isArray(value)
+    ? value.filter((entry): entry is string => typeof entry === 'string' && entry.length > 0)
+    : [];
 }
 
 function normalizeMachine(raw: unknown): MachineListItem | null {
   if (!isRecord(raw)) return null;
   const serverId = typeof raw.serverId === 'string' ? raw.serverId : '';
+  const nodeId = isControlledNodeId(raw.nodeId) ? raw.nodeId : null;
   const refName = typeof raw.refName === 'string' ? raw.refName : '';
-  if (!serverId || !refName) return null;
+  if (!serverId || !nodeId) return null;
   const capabilities = validateControlledNodeCapabilities(raw.capabilities);
   return {
     serverId,
+    nodeId,
+    ...(typeof raw.remoteDesktopHostId === 'string' && raw.remoteDesktopHostId
+      ? { remoteDesktopHostId: raw.remoteDesktopHostId }
+      : {}),
     refName,
-    displayName: typeof raw.displayName === 'string' && raw.displayName ? raw.displayName : refName,
+    displayName: typeof raw.displayName === 'string' && raw.displayName ? raw.displayName : nodeId,
     ...(typeof raw.os === 'string' && raw.os ? { os: raw.os } : {}),
     online: raw.online === true,
     execEnabled: raw.execEnabled === true,
@@ -256,12 +394,51 @@ function normalizeMachine(raw: unknown): MachineListItem | null {
     accessRole: raw.accessRole === undefined
       ? 'owner'
       : isMachineAccessRole(raw.accessRole) ? raw.accessRole : 'viewer',
+    ...(raw.canRename === true && raw.accessRole === MACHINE_ACCESS_ROLES[2] ? { canRename: true } : {}),
     ...(capabilities.ok && capabilities.value.length > 0 ? { capabilities: capabilities.value } : {}),
     ...(typeof raw.daemonVersion === 'string' && raw.daemonVersion ? { daemonVersion: raw.daemonVersion } : {}),
     ...(raw.updateAvailable === true ? { updateAvailable: true } : {}),
+    ...(Object.values(CONTROLLED_NODE_UPGRADE_STATUS).includes(raw.upgradeStatus as ControlledNodeUpgradeStatus)
+      ? { upgradeStatus: raw.upgradeStatus as ControlledNodeUpgradeStatus }
+      : {}),
+    ...(typeof raw.upgradeTargetVersion === 'string' && raw.upgradeTargetVersion
+      ? { upgradeTargetVersion: raw.upgradeTargetVersion }
+      : {}),
+    ...(typeof raw.upgradeReason === 'string' && raw.upgradeReason
+      ? { upgradeReason: raw.upgradeReason }
+      : {}),
+    ...(isRecord(raw.workerRefresh)
+      && typeof raw.workerRefresh.attemptId === 'string'
+      && typeof raw.workerRefresh.phase === 'string'
+      && ['started', 'deferred', 'succeeded', 'failed'].includes(raw.workerRefresh.phase)
+      && typeof raw.workerRefresh.recordedAt === 'number'
+      ? {
+        workerRefresh: {
+          attemptId: raw.workerRefresh.attemptId,
+          phase: raw.workerRefresh.phase as 'started' | 'deferred' | 'succeeded' | 'failed',
+          ...(typeof raw.workerRefresh.installedVersion === 'string' ? { installedVersion: raw.workerRefresh.installedVersion } : {}),
+          ...(typeof raw.workerRefresh.targetVersion === 'string' ? { targetVersion: raw.workerRefresh.targetVersion } : {}),
+          ...(typeof raw.workerRefresh.artifactSha256 === 'string' ? { artifactSha256: raw.workerRefresh.artifactSha256 } : {}),
+          ...(typeof raw.workerRefresh.reason === 'string' ? { reason: raw.workerRefresh.reason } : {}),
+          recordedAt: raw.workerRefresh.recordedAt,
+        },
+      }
+      : {}),
     ...(raw.autoUnlockConfigured === true ? { autoUnlockConfigured: true } : {}),
     ...(typeof raw.hostServerId === 'string' && raw.hostServerId
       ? { hostServerId: raw.hostServerId }
+      : {}),
+    // The groups this machine is in. This function rebuilds the object field by
+    // field, so anything not named here is dropped -- which is exactly what
+    // happened once already: the server sent them, the UI never saw them, and a
+    // machine never appeared to join a group at all.
+    ...(normalizeGroupIds(raw.teamIds).length > 0
+      ? {
+        teamIds: normalizeGroupIds(raw.teamIds),
+        ...(normalizeGroupIds(raw.teamNames).length === normalizeGroupIds(raw.teamIds).length
+          ? { teamNames: normalizeGroupIds(raw.teamNames) }
+          : {}),
+      }
       : {}),
   };
 }
@@ -286,6 +463,20 @@ export async function listControllableMachines(): Promise<MachineListItem[]> {
   return extractMachineList(res);
 }
 
+export interface MachineUpgradeStatus {
+  currentVersion: string | null;
+  latestVersion: string | null;
+  upgrade?: DaemonUpgradeStatusSnapshot;
+}
+
+export async function getMachineUpgradeStatus(serverId: string): Promise<MachineUpgradeStatus> {
+  return apiFetch<MachineUpgradeStatus>(`${MACHINE_API_PATH.replace('/api/machines', '/api/server')}/${encodeURIComponent(serverId)}/upgrade`);
+}
+
+export async function requestMachineUpgrade(serverId: string): Promise<MachineUpgradeStatus & { upgradeId?: string; deliveryStatus?: string; reason?: string }> {
+  return apiFetch<MachineUpgradeStatus & { upgradeId?: string; deliveryStatus?: string; reason?: string }>(`${MACHINE_API_PATH.replace('/api/machines', '/api/server')}/${encodeURIComponent(serverId)}/upgrade`, { method: 'POST' });
+}
+
 /** Enable/disable remote exec for a controlled machine (owner-scoped). */
 export async function setMachineExecEnabled(serverId: string, enabled: boolean): Promise<void> {
   await apiFetch(`${MACHINE_API_PATH}/${encodeURIComponent(serverId)}/exec-enabled`, {
@@ -295,9 +486,36 @@ export async function setMachineExecEnabled(serverId: string, enabled: boolean):
   });
 }
 
+/** Retry a controlled-node upgrade after a terminal or deferred state. */
+export async function upgradeControlledMachine(serverId: string): Promise<void> {
+  await apiFetch(`${MACHINE_API_PATH}/${encodeURIComponent(serverId)}/upgrade`, {
+    method: 'POST',
+  });
+}
+
 /** Ask a supported, online controlled node to fetch its missing signed worker bundle. */
 export async function installMachineRemoteDesktopWorker(serverId: string): Promise<void> {
   await apiFetch(`${MACHINE_API_PATH}/${encodeURIComponent(serverId)}/remote-desktop-worker`, {
+    method: 'POST',
+  });
+}
+
+/** Ask an online controlled node to refresh its independently released worker. */
+export async function refreshMachineRemoteDesktopWorker(serverId: string): Promise<void> {
+  await apiFetch(`${MACHINE_API_PATH}/${encodeURIComponent(serverId)}/remote-desktop-worker/refresh`, {
+    method: 'POST',
+  });
+}
+
+/**
+ * Ask an online controlled node to raise its own permission dialog.
+ *
+ * Nothing is granted here and nothing can be: macOS shows that dialog only to
+ * a responsible signed application in the console user's session, and only a
+ * human can answer it. This asks the machine to ask.
+ */
+export async function requestMachineRemoteDesktopPermissions(serverId: string): Promise<void> {
+  await apiFetch(`${MACHINE_API_PATH}/${encodeURIComponent(serverId)}/remote-desktop-permissions`, {
     method: 'POST',
   });
 }
@@ -347,6 +565,42 @@ export async function listAvailableExecutableOses(): Promise<string[]> {
   return [...new Set(artifacts.map((a) => a.os))];
 }
 
+/**
+ * Put a machine in one group, or take it out of that one.
+ *
+ * A machine can be in several groups, so this names the group it is joining or
+ * leaving and does not touch the others. Leaving is the owner's alone to do: a
+ * machine belongs to whoever installed it, so losing a role in a group must
+ * never leave them unable to get their own machine back out of it.
+ */
+export async function setMachineGroupMembership(
+  serverId: string,
+  teamId: string,
+  member: boolean,
+): Promise<void> {
+  await apiFetch(`/api/machines/desk-binding?serverId=${encodeURIComponent(serverId)}`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ teamId, member }),
+  });
+}
+
+/**
+ * Declare which daemon this controlled node shares a computer with, or clear it
+ * with `null`. Owner-only. That daemon's remote-desktop button then opens this
+ * node instead of offering to install one.
+ */
+export async function setMachineHostServer(
+  serverId: string,
+  hostServerId: string | null,
+): Promise<void> {
+  await apiFetch(`${MACHINE_API_PATH}${MACHINE_HOST_LINK_ROUTE}?serverId=${encodeURIComponent(serverId)}`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ hostServerId }),
+  });
+}
+
 /** Mint a one-time download ticket (POST /api/enroll/v2/ticket). */
 export async function mintControlledNodeExecutableTicket(
   selection: ControlledNodeArtifactSelection,
@@ -356,8 +610,13 @@ export async function mintControlledNodeExecutableTicket(
    * known to share a machine and the browser keeps offering one entry.
    */
   hostServerId?: string,
+  /**
+   * Defaults to a browser sitting at the machine. Pass `remote_link` when the
+   * operator will carry the link to a different machine and open it there.
+   */
+  delivery: ControlledNodeTicketDelivery = CONTROLLED_NODE_TICKET_DELIVERY.BROWSER,
 ): Promise<ControlledNodeExecutableTicket> {
-  if (!isCanonicalControlledNodePair(selection.os, selection.arch)) {
+  if (!isCanonicalControlledNodePair(selection.os, selection.arch, selection.abiProfile)) {
     throw new Error('controlled_node_non_canonical_pair');
   }
   const expectedOwnerUserId = getExpectedUserId();
@@ -371,16 +630,105 @@ export async function mintControlledNodeExecutableTicket(
       version: 2,
       os: selection.os,
       arch: selection.arch,
+      ...(selection.abiProfile && selection.abiProfile !== CONTROLLED_NODE_ABI_MODERN
+        ? { [CONTROLLED_NODE_ABI_PROFILE_FIELD]: selection.abiProfile } : {}),
       ...(hostServerId ? { hostServerId } : {}),
+      // Omitted for the default so an older server, which rejects unknown keys
+      // with its strict body schema, keeps working unchanged.
+      ...(delivery === CONTROLLED_NODE_TICKET_DELIVERY.BROWSER ? {} : { delivery }),
     }),
   });
-  return normalizeTicket(res, expectedOwnerUserId);
+  const ticket = normalizeTicket(res, expectedOwnerUserId);
+  if (normalizeControlledNodeAbiProfile(ticket.abiProfile) !== normalizeControlledNodeAbiProfile(selection.abiProfile)) {
+    throw new Error('invalid_ticket_response');
+  }
+  return ticket;
 }
 
 /**
  * Bootstrap page URL that consumes a minted ticket from the URL hash fragment.
  * The page performs the authenticated download without buffering in the SPA.
  */
-export function buildControlledNodeBootstrapUrl(ticket: string): string {
-  return `${getApiBaseUrl()}${ENROLL_V2_BOOTSTRAP_PATH}#ticket=${encodeURIComponent(ticket)}`;
+export function buildControlledNodeBootstrapUrl(ticket: string, abiProfile?: ControlledNodeAbiProfile): string {
+  const profile = normalizeControlledNodeAbiProfile(abiProfile);
+  if (!profile) throw new Error('invalid_abi_profile');
+  const suffix = profile === CONTROLLED_NODE_ABI_MODERN ? ''
+    : `&${CONTROLLED_NODE_ABI_PROFILE_FIELD}=${encodeURIComponent(profile)}`;
+  return `${getApiBaseUrl()}${ENROLL_V2_BOOTSTRAP_PATH}#ticket=${encodeURIComponent(ticket)}${suffix}`;
+}
+
+/**
+ * Mint the one-line install command for a platform.
+ *
+ * Solves the same deadlock as the remote link, for the case where the target
+ * has a terminal but no browser — a headless Linux box, or a Windows machine
+ * reached over RDP where pasting a URL into a browser is more work than pasting
+ * a line into a shell. The command is long-lived and admits many downloads,
+ * because it is meant to be kept and reused as machines are set up.
+ */
+export async function mintControlledNodeInstallCommand(
+  selection: ControlledNodeArtifactSelection,
+  hostServerId?: string,
+): Promise<{ command: string; installCode?: string; expiresAt: number; ticketId: string }> {
+  const minted = await mintControlledNodeExecutableTicket(
+    selection, hostServerId, CONTROLLED_NODE_TICKET_DELIVERY.INSTALL_COMMAND,
+  );
+  if (!minted.installCommand) throw new Error('install_command_unsupported');
+  if (minted.expiresAt === null) throw new Error('invalid_ticket_response');
+  return {
+    command: minted.installCommand,
+    ...(minted.installCode ? { installCode: minted.installCode } : {}),
+    expiresAt: minted.expiresAt,
+    ticketId: minted.ticketId,
+  };
+}
+
+/**
+ * Mint a long-lived link the operator can open ON the machine being enrolled.
+ *
+ * This exists to break a genuine deadlock: installing on a remote machine
+ * otherwise means downloading the binary here and transferring it there with
+ * some other remote tool — which is the tool you are trying to install. The
+ * ticket rides in the URL fragment, so it is never sent to the server as part
+ * of the request line and never lands in access logs or Referer headers.
+ */
+export async function mintControlledNodeRemoteInstallLink(
+  selection: ControlledNodeArtifactSelection,
+  hostServerId?: string,
+): Promise<{ url: string; expiresAt: number | null; ticketId: string }> {
+  const minted = await mintControlledNodeExecutableTicket(
+    selection, hostServerId, CONTROLLED_NODE_TICKET_DELIVERY.REMOTE_LINK,
+  );
+  return {
+    url: buildControlledNodeBootstrapUrl(minted.ticket, minted.abiProfile),
+    expiresAt: minted.expiresAt,
+    ticketId: minted.ticketId,
+  };
+}
+
+/** Explicitly revoke the stable remote link for one owner/artifact/host binding. */
+export async function revokeControlledNodeRemoteInstallLink(
+  selection: ControlledNodeArtifactSelection,
+  hostServerId?: string,
+): Promise<boolean> {
+  if (!isCanonicalControlledNodePair(selection.os, selection.arch, selection.abiProfile)) {
+    throw new Error('controlled_node_non_canonical_pair');
+  }
+  const response = await apiFetch<unknown>(ENROLL_V2_TICKET_PATH, {
+    method: 'DELETE',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      version: 2,
+      os: selection.os,
+      arch: selection.arch,
+      ...(selection.abiProfile && selection.abiProfile !== CONTROLLED_NODE_ABI_MODERN
+        ? { [CONTROLLED_NODE_ABI_PROFILE_FIELD]: selection.abiProfile } : {}),
+      delivery: CONTROLLED_NODE_TICKET_DELIVERY.REMOTE_LINK,
+      ...(hostServerId ? { hostServerId } : {}),
+    }),
+  });
+  if (!isRecord(response) || typeof response.revoked !== 'boolean') {
+    throw new Error('invalid_ticket_response');
+  }
+  return response.revoked;
 }

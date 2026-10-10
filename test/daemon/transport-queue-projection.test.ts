@@ -4,6 +4,10 @@ import { join } from 'node:path';
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+const { getSessionMock } = vi.hoisted(() => ({ getSessionMock: vi.fn() }));
+
+vi.mock('../../src/store/session-store.js', () => ({ getSession: getSessionMock }));
+
 import { buildLegacyTransportPendingQueueSnapshot, buildTransportQueueSnapshot } from '../../src/daemon/transport-queue-projection.js';
 import { buildTransportPendingQueueSnapshot } from '../../src/daemon/transport-pending-snapshot.js';
 import { resetTransportQueueStoreForTests } from '../../src/daemon/transport-queue-store.js';
@@ -16,6 +20,8 @@ beforeEach(() => {
   dbPath = join(dir, 'queue.sqlite');
   vi.stubEnv('IMCODES_TRANSPORT_QUEUE_DB_PATH', dbPath);
   resetTransportQueueStoreForTests();
+  getSessionMock.mockReset();
+  getSessionMock.mockReturnValue(undefined);
 });
 
 afterEach(() => {
@@ -62,6 +68,80 @@ describe('transport queue projection builder', () => {
     expect(legacy.queueAuthorityId).toEqual(expect.any(String));
   });
 
+  it('does not project legacy rows to a newer identified session that reused the same name', async () => {
+    const { getTransportQueueStore } = await import('../../src/daemon/transport-queue-store.js');
+    getTransportQueueStore().enqueue({
+      sessionName: 'deck-reused',
+      clientMessageId: 'old-private-message',
+      text: 'must not be exposed to replacement UI',
+      now: 10,
+      privateMaterialJson: JSON.stringify({ text: 'must not be exposed to replacement UI' }),
+    });
+    getSessionMock.mockReturnValue({
+      name: 'deck-reused',
+      sessionInstanceId: 'replacement-instance',
+      runtimeEpoch: 'replacement-epoch',
+      runtimeType: 'transport',
+      createdAt: 20,
+    });
+
+    const snapshot = buildTransportQueueSnapshot('deck-reused', 'test');
+    expect(snapshot.pendingMessageEntries).toEqual([]);
+    expect(snapshot.failedMessageEntries).toEqual([]);
+    expect(JSON.stringify(snapshot)).not.toContain('must not be exposed');
+  });
+
+  it('projects a live queue whose rows are bound to an earlier epoch of the SAME instance', async () => {
+    // The daemon holds two authorities for one queue: rows are stamped at
+    // enqueue with the runtime's `queueRecipient`, while the public projection
+    // gates on the persisted SessionRecord. A same-instance epoch rotation that
+    // the runtime has not adopted splits them, and the row-level gate then
+    // matches nothing -- the browser shows no queue at all while the runtime
+    // still holds and delivers the message. Instance isolation is the real
+    // ownership boundary; an epoch of the SAME instance is the same session.
+    const { getTransportQueueStore } = await import('../../src/daemon/transport-queue-store.js');
+    getTransportQueueStore().enqueue({
+      sessionName: 'deck-split-epoch',
+      recipient: { sessionInstanceId: 'instance-1', runtimeEpoch: 'epoch-bound' },
+      clientMessageId: 'queued-1',
+      text: 'still queued, still deliverable',
+      now: 10,
+    });
+    getSessionMock.mockReturnValue({
+      name: 'deck-split-epoch',
+      sessionInstanceId: 'instance-1',
+      runtimeEpoch: 'epoch-rotated',
+      runtimeType: 'transport',
+      createdAt: 5,
+    });
+
+    const snapshot = buildTransportQueueSnapshot('deck-split-epoch', 'test');
+    expect(snapshot.pendingMessageEntries.map((entry) => entry.clientMessageId)).toEqual(['queued-1']);
+  });
+
+  it('still refuses to project across a different session instance that reused the name', async () => {
+    const { getTransportQueueStore } = await import('../../src/daemon/transport-queue-store.js');
+    getTransportQueueStore().enqueue({
+      sessionName: 'deck-split-instance',
+      recipient: { sessionInstanceId: 'instance-1', runtimeEpoch: 'epoch-bound' },
+      clientMessageId: 'predecessor-1',
+      text: 'must not be exposed to replacement UI',
+      now: 10,
+      privateMaterialJson: JSON.stringify({ text: 'must not be exposed to replacement UI' }),
+    });
+    getSessionMock.mockReturnValue({
+      name: 'deck-split-instance',
+      sessionInstanceId: 'instance-2',
+      runtimeEpoch: 'epoch-bound',
+      runtimeType: 'transport',
+      createdAt: 20,
+    });
+
+    const snapshot = buildTransportQueueSnapshot('deck-split-instance', 'test');
+    expect(snapshot.pendingMessageEntries).toEqual([]);
+    expect(JSON.stringify(snapshot)).not.toContain('must not be exposed');
+  });
+
   it('does not use runtime, JSON, or JSONL replay pending arrays as queue authority', () => {
     const snapshot = buildTransportPendingQueueSnapshot('deck-runtime-only', {
       pendingMessages: ['runtime stale\ntext'],
@@ -86,6 +166,7 @@ describe('transport queue projection builder', () => {
         messagePreamble: 'SECRET_PREAMBLE',
         attachmentRefs: [{ daemonPath: '/tmp/raw-local-attachment' }],
         sharedActorEnvelope: { token: 'SECRET_ACTOR_TOKEN' },
+        sharedMachineAuthority: 'SECRET_MACHINE_AUTHORITY',
         timelineCommitted: true,
         historyCommitted: true,
       }),
@@ -113,6 +194,7 @@ describe('transport queue projection builder', () => {
       'SECRET_PREAMBLE',
       '/tmp/raw-local-attachment',
       'SECRET_ACTOR_TOKEN',
+      'SECRET_MACHINE_AUTHORITY',
       'SECRET_PROVIDER_PAYLOAD',
       'SECRET_TOOL_INPUT',
       'SECRET_TOOL_OUTPUT',

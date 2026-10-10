@@ -53,7 +53,7 @@ class DeferredCloseMockWs extends MockWs {
 
 function makeDb(tokenHash: string, nodeRole = 'full') {
   return {
-    queryOne: async () => ({ token_hash: tokenHash, user_id: 'user-1', node_role: nodeRole, revoked_at: null }),
+    queryOne: async () => ({ token_hash: tokenHash, owner_status: 'active', user_id: 'user-1', node_role: nodeRole, revoked_at: null }),
     query: async () => [],
     execute: async () => ({ changes: 1 }),
     exec: async () => {},

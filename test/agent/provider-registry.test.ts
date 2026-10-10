@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 // ── Hoisted mocks ─────────────────────────────────────────────────────────────
 
-const { mockConnect, mockDisconnect, MockOpenClawProvider, MockQwenProvider, MockClaudeCodeSdkProvider, MockCodexSdkProvider, MockQoderSdkProvider, MockCursorHeadlessProvider, MockCopilotSdkProvider, MockOpenCodeSdkProvider, MockKimiSdkProvider, MockGrokSdkProvider, MockDeepseekHarnessProvider, MockPiProvider } = vi.hoisted(() => {
+const { mockConnect, mockDisconnect, MockOpenClawProvider, MockQwenProvider, MockClaudeCodeSdkProvider, MockCodexSdkProvider, MockQoderSdkProvider, MockCursorHeadlessProvider, MockCopilotSdkProvider, MockOpenCodeSdkProvider, MockKimiSdkProvider, MockHermesAcpProvider, MockGrokSdkProvider, MockAgySdkProvider, MockDeepseekHarnessProvider, MockPiProvider } = vi.hoisted(() => {
   const mockConnect = vi.fn().mockResolvedValue(undefined);
   const mockDisconnect = vi.fn().mockResolvedValue(undefined);
   const MockOpenClawProvider = vi.fn().mockImplementation(() => ({
@@ -196,6 +196,27 @@ const { mockConnect, mockDisconnect, MockOpenClawProvider, MockQwenProvider, Moc
     createSession: vi.fn().mockResolvedValue('route-kimi'),
     endSession: vi.fn().mockResolvedValue(undefined),
   }));
+  const MockHermesAcpProvider = vi.fn().mockImplementation(() => ({
+    id: 'hermes-acp',
+    connectionMode: 'local-sdk',
+    sessionOwnership: 'shared',
+    capabilities: {
+      streaming: true,
+      toolCalling: true,
+      approval: true,
+      sessionRestore: true,
+      multiTurn: true,
+      attachments: false,
+    },
+    connect: mockConnect,
+    disconnect: mockDisconnect,
+    send: vi.fn().mockResolvedValue(undefined),
+    onDelta: vi.fn(),
+    onComplete: vi.fn(),
+    onError: vi.fn(),
+    createSession: vi.fn().mockResolvedValue('route-hermes'),
+    endSession: vi.fn().mockResolvedValue(undefined),
+  }));
   const MockGrokSdkProvider = vi.fn().mockImplementation(() => ({
     id: 'grok-sdk',
     connectionMode: 'local-sdk',
@@ -215,6 +236,27 @@ const { mockConnect, mockDisconnect, MockOpenClawProvider, MockQwenProvider, Moc
     onComplete: vi.fn(),
     onError: vi.fn(),
     createSession: vi.fn().mockResolvedValue('route-grok'),
+    endSession: vi.fn().mockResolvedValue(undefined),
+  }));
+  const MockAgySdkProvider = vi.fn().mockImplementation(() => ({
+    id: 'agy-sdk',
+    connectionMode: 'local-sdk',
+    sessionOwnership: 'shared',
+    capabilities: {
+      streaming: true,
+      toolCalling: true,
+      approval: true,
+      sessionRestore: true,
+      multiTurn: true,
+      attachments: false,
+    },
+    connect: mockConnect,
+    disconnect: mockDisconnect,
+    send: vi.fn().mockResolvedValue(undefined),
+    onDelta: vi.fn(),
+    onComplete: vi.fn(),
+    onError: vi.fn(),
+    createSession: vi.fn().mockResolvedValue('route-agy'),
     endSession: vi.fn().mockResolvedValue(undefined),
   }));
   const MockDeepseekHarnessProvider = vi.fn().mockImplementation(() => ({
@@ -259,7 +301,7 @@ const { mockConnect, mockDisconnect, MockOpenClawProvider, MockQwenProvider, Moc
     createSession: vi.fn().mockResolvedValue('session-pi'),
     endSession: vi.fn().mockResolvedValue(undefined),
   }));
-  return { mockConnect, mockDisconnect, MockOpenClawProvider, MockQwenProvider, MockClaudeCodeSdkProvider, MockCodexSdkProvider, MockQoderSdkProvider, MockCursorHeadlessProvider, MockCopilotSdkProvider, MockOpenCodeSdkProvider, MockKimiSdkProvider, MockGrokSdkProvider, MockDeepseekHarnessProvider, MockPiProvider };
+  return { mockConnect, mockDisconnect, MockOpenClawProvider, MockQwenProvider, MockClaudeCodeSdkProvider, MockCodexSdkProvider, MockQoderSdkProvider, MockCursorHeadlessProvider, MockCopilotSdkProvider, MockOpenCodeSdkProvider, MockKimiSdkProvider, MockHermesAcpProvider, MockGrokSdkProvider, MockAgySdkProvider, MockDeepseekHarnessProvider, MockPiProvider };
 });
 
 vi.mock('../../src/agent/providers/openclaw.js', () => ({
@@ -306,8 +348,16 @@ vi.mock('../../src/agent/providers/kimi-sdk.js', () => ({
   KimiSdkProvider: MockKimiSdkProvider,
 }));
 
+vi.mock('../../src/agent/providers/hermes-acp.js', () => ({
+  HermesAcpProvider: MockHermesAcpProvider,
+}));
+
 vi.mock('../../src/agent/providers/grok-sdk.js', () => ({
   GrokSdkProvider: MockGrokSdkProvider,
+}));
+
+vi.mock('../../src/agent/providers/agy-sdk.js', () => ({
+  AgySdkProvider: MockAgySdkProvider,
 }));
 
 vi.mock('../../src/util/logger.js', () => ({
@@ -329,6 +379,7 @@ import {
   disconnectProvider,
   disconnectAll,
 } from '../../src/agent/provider-registry.js';
+import { AGY_SDK_PROVIDER_ID } from '../../shared/agy-agent.js';
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -424,11 +475,25 @@ describe('getProvider', () => {
     expect(provider!.id).toBe('kimi-sdk');
   });
 
+  it('returns hermes-acp after connectProvider()', async () => {
+    await connectProvider('hermes-acp', CONFIG);
+    const provider = getProvider('hermes-acp');
+    expect(provider).toBeDefined();
+    expect(provider!.id).toBe('hermes-acp');
+  });
+
   it('returns grok-sdk after connectProvider()', async () => {
     await connectProvider('grok-sdk', CONFIG);
     const provider = getProvider('grok-sdk');
     expect(provider).toBeDefined();
     expect(provider!.id).toBe('grok-sdk');
+  });
+
+  it('returns agy-sdk after connectProvider()', async () => {
+    await connectProvider(AGY_SDK_PROVIDER_ID, CONFIG);
+    const provider = getProvider(AGY_SDK_PROVIDER_ID);
+    expect(provider).toBeDefined();
+    expect(provider!.id).toBe(AGY_SDK_PROVIDER_ID);
   });
 
   it('returns undefined for an unknown id', () => {
@@ -504,6 +569,12 @@ describe('connectProvider', () => {
     expect(mockConnect).toHaveBeenCalledWith(CONFIG);
   });
 
+  it('instantiates HermesAcpProvider and calls connect()', async () => {
+    await connectProvider('hermes-acp', CONFIG);
+    expect(MockHermesAcpProvider).toHaveBeenCalledOnce();
+    expect(mockConnect).toHaveBeenCalledWith(CONFIG);
+  });
+
   it('instantiates GrokSdkProvider and calls connect()', async () => {
     await connectProvider('grok-sdk', CONFIG);
     expect(MockGrokSdkProvider).toHaveBeenCalledOnce();
@@ -526,6 +597,32 @@ describe('connectProvider', () => {
 
     expect(second).toBe(first);
     expect(MockGrokSdkProvider).toHaveBeenCalledTimes(1);
+    expect(mockConnect).toHaveBeenCalledTimes(1);
+    expect(mockDisconnect).not.toHaveBeenCalled();
+  });
+
+  it('instantiates AgySdkProvider and calls connect()', async () => {
+    await connectProvider(AGY_SDK_PROVIDER_ID, CONFIG);
+    expect(MockAgySdkProvider).toHaveBeenCalledOnce();
+    expect(mockConnect).toHaveBeenCalledWith(CONFIG);
+  });
+
+  it('replaces an existing Agy provider before reconnecting', async () => {
+    await connectProvider(AGY_SDK_PROVIDER_ID, CONFIG);
+    await connectProvider(AGY_SDK_PROVIDER_ID, CONFIG);
+
+    expect(MockAgySdkProvider).toHaveBeenCalledTimes(2);
+    expect(mockDisconnect).toHaveBeenCalledTimes(1);
+    expect(mockConnect).toHaveBeenCalledTimes(2);
+    expect(getAllProviders().filter((provider) => provider.id === AGY_SDK_PROVIDER_ID)).toHaveLength(1);
+  });
+
+  it('reuses the connected Agy provider without starting a duplicate child', async () => {
+    const first = await ensureProviderConnected(AGY_SDK_PROVIDER_ID, CONFIG);
+    const second = await ensureProviderConnected(AGY_SDK_PROVIDER_ID, CONFIG);
+
+    expect(second).toBe(first);
+    expect(MockAgySdkProvider).toHaveBeenCalledTimes(1);
     expect(mockConnect).toHaveBeenCalledTimes(1);
     expect(mockDisconnect).not.toHaveBeenCalled();
   });

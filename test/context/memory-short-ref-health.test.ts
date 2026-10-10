@@ -1,7 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-const { runMock, incrementCounterMock, warnOncePerHourMock } = vi.hoisted(() => ({
+const { runMock, whenReadyMock, workerState, incrementCounterMock, warnOncePerHourMock } = vi.hoisted(() => ({
   runMock: vi.fn(),
+  whenReadyMock: vi.fn(async () => {}),
+  workerState: { isProductionOwner: false, isReady: true },
   incrementCounterMock: vi.fn(),
   warnOncePerHourMock: vi.fn(),
 }));
@@ -12,7 +14,12 @@ const { runMock, incrementCounterMock, warnOncePerHourMock } = vi.hoisted(() => 
 // the daemon log — on the same disk whose exhaustion is the failure being
 // reported, with write errors swallowed.
 vi.mock('../../src/store/context-store-worker-client.js', () => ({
-  getContextStoreClient: () => ({ run: runMock }),
+  getContextStoreClient: () => ({
+    run: runMock,
+    whenReady: whenReadyMock,
+    get isProductionOwner() { return workerState.isProductionOwner; },
+    get isReady() { return workerState.isReady; },
+  }),
 }));
 vi.mock('../../src/util/metrics.js', () => ({ incrementCounter: incrementCounterMock }));
 vi.mock('../../src/util/rate-limited-warn.js', () => ({ warnOncePerHour: warnOncePerHourMock }));
@@ -34,6 +41,9 @@ describe('memory short refs — persistence failure leaves the process', () => {
     delete process.env.IMCODES_MEMORY_SHORT_REF_PATH;
     process.env.IMCODES_MEMORY_SHORT_REF_LEGACY_PATH = '/nonexistent/imcodes-test/legacy.json';
     vi.clearAllMocks();
+    workerState.isProductionOwner = false;
+    workerState.isReady = true;
+    whenReadyMock.mockResolvedValue(undefined);
     resetMemoryShortRefsForTests();
   });
 
@@ -116,6 +126,7 @@ describe('memory short refs — persistence failure leaves the process', () => {
           expect.objectContaining({ id: entry.id }),
           expect.objectContaining({ id: queuedWhileDown.id }),
         ])],
+        { timeoutMs: 30_000 },
       ]);
       expect(getMemoryShortRefHealth()).toBeUndefined();
     } finally {
@@ -123,9 +134,36 @@ describe('memory short refs — persistence failure leaves the process', () => {
     }
   });
 
+  it('waits for an already-respawning production worker instead of recording false unavailable failures', async () => {
+    let releaseReady!: () => void;
+    workerState.isProductionOwner = true;
+    workerState.isReady = false;
+    whenReadyMock.mockImplementation(() => new Promise<void>((resolve) => {
+      releaseReady = () => {
+        workerState.isReady = true;
+        resolve();
+      };
+    }));
+    runMock.mockResolvedValue(1);
+
+    registerMemoryShortRefs([entry]);
+    await vi.waitFor(() => expect(whenReadyMock).toHaveBeenCalledTimes(1));
+    expect(runMock).not.toHaveBeenCalled();
+    expect(getMemoryShortRefHealth()).toBeUndefined();
+
+    releaseReady();
+    await vi.waitFor(() => expect(runMock).toHaveBeenCalledTimes(1));
+    expect(getMemoryShortRefHealth()).toBeUndefined();
+  });
+
   it('reports a failed warm-load too, not only writes', async () => {
     runMock.mockRejectedValue(new Error('context_store_unavailable'));
     await loadMemoryShortRefsFromStore();
+    expect(runMock).toHaveBeenCalledWith(
+      'listMemoryShortRefs',
+      [expect.any(Number)],
+      { timeoutMs: 30_000 },
+    );
     expect(getMemoryShortRefHealth()).toMatchObject({ stage: 'warm_load' });
   });
   it('reports discarded rows too, since those handles are lost the same way', async () => {

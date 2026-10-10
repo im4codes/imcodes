@@ -36,6 +36,15 @@ vi.mock('react-i18next', () => ({
 const aliasList: AliasEntry[] = [
   { name: 'deploy', value: 'ssh root@host && restart', description: 'ship prod', tags: [], createdAt: '', updatedAt: '', source: 'web' },
   { name: 'winbox', value: '10.0.0.9', description: 'windows server', tags: [], createdAt: '', updatedAt: '', source: 'web' },
+  ...Array.from({ length: 10 }, (_, index) => ({
+    name: `alias-${index + 1}`,
+    value: `value-${index + 1}`,
+    description: `long list row ${index + 1}`,
+    tags: [],
+    createdAt: '',
+    updatedAt: '',
+    source: 'web' as const,
+  })),
 ];
 
 // Control the alias list; use the REAL shared `filterAliases` (imported from the
@@ -248,13 +257,28 @@ describe('SessionControls — inline ; autocomplete', () => {
     typeInto(editor, ';');
     await waitFor(() => expect(container.querySelector('.controls-alias-picker')).toBeTruthy());
 
-    const lastRow = container.querySelector<HTMLElement>('[data-alias-name="winbox"]')!;
+    const lastRow = container.querySelector<HTMLElement>('[data-alias-name="alias-10"]')!;
     const scrollIntoView = vi.fn();
     lastRow.scrollIntoView = scrollIntoView;
 
     fireEvent.keyDown(editor, { key: 'ArrowUp' });
 
     await waitFor(() => expect(lastRow.getAttribute('aria-selected')).toBe('true'));
+    expect(scrollIntoView).toHaveBeenCalledWith({ block: 'nearest' });
+  });
+
+  it('keeps a long alias list keyboard selection visible while moving down', async () => {
+    const { editor, container } = renderControls();
+    typeInto(editor, ';');
+    await waitFor(() => expect(container.querySelector('.controls-alias-picker')).toBeTruthy());
+
+    const target = container.querySelector<HTMLElement>('[data-alias-name="alias-7"]')!;
+    const scrollIntoView = vi.fn();
+    target.scrollIntoView = scrollIntoView;
+
+    for (let index = 0; index < 8; index += 1) fireEvent.keyDown(editor, { key: 'ArrowDown' });
+
+    await waitFor(() => expect(target.getAttribute('aria-selected')).toBe('true'));
     expect(scrollIntoView).toHaveBeenCalledWith({ block: 'nearest' });
   });
 });

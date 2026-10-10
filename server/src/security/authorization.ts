@@ -8,16 +8,21 @@ import type { Database } from '../db/client.js';
 import { sha256Hex, verifyJwt } from './crypto.js';
 import { COOKIE_SESSION } from '../../../shared/cookie-names.js';
 import { AUTH_IDENTITY_ERRORS } from '../../../shared/auth-identity.js';
-import { EXPECTED_USER_ID_HEADER } from '../../../shared/http-header-names.js';
-import { NODE_ROLE, type NodeRole } from '../../../shared/remote-exec.js';
+import { EXPECTED_USER_ID_HEADER, SERVER_ID_HEADER } from '../../../shared/http-header-names.js';
+import { NODE_ROLE, type NodeRole, NODE_ROLE_REFUSAL } from '../../../shared/remote-exec.js';
 import {
-  canOperateControlledMachine,
-  resolveControlledMachineAccess,
+  resolveControlledMachineOperatorAccess,
 } from '../share/machine-access.js';
+import { resolveEffectiveShareCoverage } from '../db/tab-sharing.js';
+import { isAccountSessionJwt } from './account-session-jwt.js';
+import { evaluateUserAccess, loadUserAccess } from './user-status.js';
+import { USER_STATUS, isUserStatusActive, userStatusDenialCode } from '../../../shared/user-status.js';
+import type { AuthErrorCode } from '../../../shared/auth-error-codes.js';
+import { enforceDaemonTokenRoute } from './daemon-token-policy.js';
 
 export type Role = 'owner' | 'admin' | 'member' | 'unauthenticated';
 
-interface AuthContext {
+export interface AuthContext {
   userId: string;
   role: Role;
   keyId?: string;
@@ -28,66 +33,125 @@ interface AuthContext {
 }
 
 /**
+ * The outcome of resolving a credential: who it is, or -- when the credential is genuine but its ACCOUNT may not act (disabled, pending,
+ * sessions ended) -- why it was refused. A credential that is simply unknown or invalid is `{ auth: null }` with no reason: saying
+ * "disabled" would confirm to a stranger that the credential was once real.
+ */
+export type AuthResolution =
+  | { auth: AuthContext; denied?: undefined }
+  | { auth: null; denied?: AuthErrorCode };
+
+/** The response a middleware sends for a refused resolution. */
+export function authFailureResponse(c: Pick<Context, 'json'>, resolution: AuthResolution): Response {
+  return resolution.denied
+    ? c.json({ error: resolution.denied }, 403)
+    : c.json({ error: 'unauthorized' }, 401);
+}
+
+/**
  * Resolve auth context from request.
  * Priority: rcc_session cookie → Authorization: Bearer (API key / JWT).
  * Bearer is preserved for daemon server-token, API keys, and CLI clients.
+ *
+ * EVERY branch ends in the account check (shared/user-status.ts): an API key, a login token and a daemon server-token all act as a user,
+ * and a disabled user keeps none of them. The check is a join in the credential's own lookup where there is one, and a primary-key read
+ * for a stateless JWT -- never a per-pod cache, so a disable is honoured by every replica on its next request.
  */
-export async function resolveAuth(c: Pick<Context<{ Bindings: Env }>, 'req' | 'env'>): Promise<AuthContext | null> {
+export async function resolveAuthOutcome(c: Pick<Context<{ Bindings: Env }>, 'req' | 'env'>): Promise<AuthResolution> {
   // Task 1: Try HttpOnly session cookie first (browser sessions)
   const cookieToken = getCookieFromHeader(c.req.header('Cookie'), COOKIE_SESSION);
   if (cookieToken && c.env.JWT_SIGNING_KEY) {
     const payload = verifyJwt(cookieToken, c.env.JWT_SIGNING_KEY);
-    if (payload && typeof payload.sub === 'string' && payload.type !== 'ws-ticket' && payload.type !== 'share-ws-ticket') {
-      return { userId: payload.sub, role: (payload.role as Role) ?? 'member' };
+    if (isAccountSessionJwt(payload)) {
+      return resolveLoginTokenUser(c.env.DB, payload);
     }
   }
 
+  return resolveBearerOutcome(c);
+}
+
+export async function resolveAuth(c: Pick<Context<{ Bindings: Env }>, 'req' | 'env'>): Promise<AuthContext | null> {
+  return (await resolveAuthOutcome(c)).auth;
+}
+
+async function resolveLoginTokenUser(db: Database, payload: Record<string, unknown> & { sub: string }): Promise<AuthResolution> {
+  const decision = evaluateUserAccess(await loadUserAccess(db, payload.sub), typeof payload.iat === 'number' ? payload.iat : undefined);
+  if (!decision.ok) return { auth: null, denied: decision.code };
+  return { auth: { userId: payload.sub, role: (payload.role as Role) ?? 'member' } };
+}
+
+/**
+ * Resolve only the Authorization bearer supplied by the request.
+ *
+ * Account-sensitive routes use this after observing an Authorization header so
+ * an invalid bearer can never fall back to a valid browser cookie. Keep the
+ * credential parsing in one place with the ordinary authorization middleware.
+ */
+export async function resolveBearerAuth(
+  c: Pick<Context<{ Bindings: Env }>, 'req' | 'env'>,
+): Promise<AuthContext | null> {
+  return (await resolveBearerOutcome(c)).auth;
+}
+
+export async function resolveBearerOutcome(
+  c: Pick<Context<{ Bindings: Env }>, 'req' | 'env'>,
+): Promise<AuthResolution> {
   const authHeader = c.req.header('Authorization');
-  if (!authHeader?.startsWith('Bearer ')) return null;
+  if (!authHeader?.startsWith('Bearer ')) return { auth: null };
 
   const token = authHeader.slice(7);
 
   // Try daemon server-token auth: X-Server-Id header + Bearer <server-token>
   // Allows the daemon to call REST endpoints without a user JWT.
-  const daemonServerId = c.req.header('X-Server-Id');
+  const daemonServerId = c.req.header(SERVER_ID_HEADER);
   if (daemonServerId) {
     // Read node_role + revoked_at authoritatively from the DB (never from the
     // client). A revoked credential is denied everywhere; a `controlled` node's
     // role is carried so the guards below default-deny it on control APIs (10.2).
+    // The OWNER's account is read in the same statement (a scalar subquery: one round trip): a daemon acts as its owner, so a disabled
+    // owner's daemons are refused too.
     const server = await c.env.DB.queryOne<{
-      token_hash: string; user_id: string; node_role: string | null; revoked_at: number | null;
-    }>('SELECT token_hash, user_id, node_role, revoked_at FROM servers WHERE id = $1', [daemonServerId]);
-    if (!server) return null;
-    const tokenHash = sha256Hex(token);
-    if (tokenHash !== server.token_hash) return null;
-    if (server.revoked_at != null) return null; // revoked → denied everywhere (10.3)
-    const nodeRole: NodeRole = server.node_role === NODE_ROLE.CONTROLLED ? NODE_ROLE.CONTROLLED : NODE_ROLE.FULL;
-    return { userId: server.user_id, role: 'owner' as Role, nodeRole, serverId: daemonServerId };
+      token_hash: string; user_id: string; node_role: string | null; revoked_at: number | null; owner_status: string | null;
+    }>(
+      `SELECT token_hash, user_id, node_role, revoked_at,
+              (SELECT u.status FROM users u WHERE u.id = servers.user_id) AS owner_status
+         FROM servers WHERE id = $1`,
+      [daemonServerId],
+    );
+    // X-Server-Id is also a routing hint on account requests. It establishes daemon
+    // authority only when the bearer matches this row, not merely when present.
+    if (server && sha256Hex(token) === server.token_hash) {
+      if (server.revoked_at != null) return { auth: null }; // genuine revoked token never falls through
+      if (!isUserStatusActive(server.owner_status)) return { auth: null, denied: userStatusDenialCode(server.owner_status ?? USER_STATUS.DISABLED) };
+      const nodeRole: NodeRole = server.node_role === NODE_ROLE.CONTROLLED ? NODE_ROLE.CONTROLLED : NODE_ROLE.FULL;
+      enforceDaemonTokenRoute(c.req, daemonServerId, nodeRole);
+      return { auth: { userId: server.user_id, role: 'owner' as Role, nodeRole, serverId: daemonServerId } };
+    }
   }
 
   // Try API key lookup (deck_ prefix)
   if (token.startsWith('deck_')) {
     const keyHash = sha256Hex(token);
     const now = Date.now();
-    const row = await c.env.DB.queryOne<{ id: string; user_id: string }>(
-      `SELECT id, user_id FROM api_keys
+    const row = await c.env.DB.queryOne<{ id: string; user_id: string; user_status: string | null }>(
+      `SELECT id, user_id, (SELECT u.status FROM users u WHERE u.id = api_keys.user_id) AS user_status FROM api_keys
        WHERE key_hash = $1
          AND revoked_at IS NULL
          AND (grace_expires_at IS NULL OR grace_expires_at > $2)`,
       [keyHash, now],
     );
-    if (!row) return null;
-    return { userId: row.user_id, role: 'member', keyId: row.id }; // API keys default to member
+    if (!row) return { auth: null };
+    if (!isUserStatusActive(row.user_status)) return { auth: null, denied: userStatusDenialCode(row.user_status ?? USER_STATUS.DISABLED) };
+    return { auth: { userId: row.user_id, role: 'member', keyId: row.id } }; // API keys default to member
   }
 
   // Try JWT (access token) — verify HMAC-SHA256 signature
   // Reject special-purpose tokens (e.g. ws-ticket) from being used as session auth
-  if (!c.env.JWT_SIGNING_KEY) return null;
+  if (!c.env.JWT_SIGNING_KEY) return { auth: null };
   const payload = verifyJwt(token, c.env.JWT_SIGNING_KEY);
-  if (!payload) return null;
-  if (typeof payload.sub !== 'string') return null;
-  if (payload.type === 'ws-ticket' || payload.type === 'share-ws-ticket') return null; // reject special-purpose WebSocket tickets
-  return { userId: payload.sub, role: (payload.role as Role) ?? 'member' };
+  if (!payload) return { auth: null };
+  if (!isAccountSessionJwt(payload)) return { auth: null }; // special-purpose tokens (tickets, machine authority, capability blobs) are not logins
+  return resolveLoginTokenUser(c.env.DB, payload);
 }
 
 function getCookieFromHeader(cookieHeader: string | undefined, name: string): string | undefined {
@@ -143,16 +207,31 @@ function canPerform(role: Role, op: Operation): boolean {
  * Require authenticated request (any role).
  * Sets c.var.userId and c.var.role.
  */
-export function requireAuth() {
+export const DAEMON_CREDENTIAL_REFUSAL = 'daemon_credential_not_accepted';
+
+export interface RequireAuthOptions {
+  /**
+   * Refuse a daemon server-token (X-Server-Id + Bearer). That credential resolves to the OWNER's account with role `owner`, and it
+   * sits in a file the owner's agents can read (a participant-driven turn included), so account administration and credential
+   * minting must not accept it: only a login, an API key or a CLI key reaches those routes.
+   */
+  refuseDaemonCredential?: boolean;
+}
+
+export function requireAuth(options: RequireAuthOptions = {}) {
   return async (c: Context<{ Bindings: Env }>, next: Next): Promise<Response | void> => {
-    const auth = await resolveAuth(c);
-    if (!auth) return c.json({ error: 'unauthorized' }, 401);
+    const resolution = await resolveAuthOutcome(c);
+    const auth = resolution.auth;
+    if (!auth) return authFailureResponse(c, resolution);
+    if (options.refuseDaemonCredential && auth.serverId) {
+      return c.json({ error: 'forbidden', reason: DAEMON_CREDENTIAL_REFUSAL }, 403);
+    }
     const identityMismatch = rejectChangedClientIdentity(c, auth.userId);
     if (identityMismatch) return identityMismatch;
     // Global default-deny: a controlled-node credential may ONLY reach the WS
     // presence/heartbeat + MACHINE_EXEC_RESULT surface, never a normal REST API (10.2).
     if (auth.nodeRole === NODE_ROLE.CONTROLLED) {
-      return c.json({ error: 'forbidden', reason: 'controlled_node' }, 403);
+      return c.json({ error: 'forbidden', reason: NODE_ROLE_REFUSAL.CONTROLLED_NODE }, 403);
     }
 
     c.set('userId' as never, auth.userId);
@@ -173,12 +252,13 @@ export function requireRole(minRole: Role) {
     : 'read';
 
   return async (c: Context<{ Bindings: Env }>, next: Next): Promise<Response | void> => {
-    const auth = await resolveAuth(c);
-    if (!auth) return c.json({ error: 'unauthorized' }, 401);
+    const resolution = await resolveAuthOutcome(c);
+    const auth = resolution.auth;
+    if (!auth) return authFailureResponse(c, resolution);
     const identityMismatch = rejectChangedClientIdentity(c, auth.userId);
     if (identityMismatch) return identityMismatch;
     if (auth.nodeRole === NODE_ROLE.CONTROLLED) {
-      return c.json({ error: 'forbidden', reason: 'controlled_node' }, 403);
+      return c.json({ error: 'forbidden', reason: NODE_ROLE_REFUSAL.CONTROLLED_NODE }, 403);
     }
 
     if (!canPerform(auth.role, minPerm)) {
@@ -213,8 +293,9 @@ export const requireOwner = () => requireRole('owner');
  */
 export function requireTeamRole(minRole: 'owner' | 'admin' | 'member' = 'member', paramName = 'id') {
   return async (c: Context<{ Bindings: Env }>, next: Next): Promise<Response | void> => {
-    const auth = await resolveAuth(c);
-    if (!auth) return c.json({ error: 'unauthorized' }, 401);
+    const resolution = await resolveAuthOutcome(c);
+    const auth = resolution.auth;
+    if (!auth) return authFailureResponse(c, resolution);
     const identityMismatch = rejectChangedClientIdentity(c, auth.userId);
     if (identityMismatch) return identityMismatch;
 
@@ -248,35 +329,64 @@ export type ServerWebSocketAccess =
  * Resolve the user's role for a specific server.
  * Checks server ownership first, then team membership.
  */
+export async function resolveServerMembershipRole(
+  db: Database,
+  serverId: string,
+  userId: string,
+): Promise<ServerRole> {
+  // The actor's and the owner's accounts are read in the same statement (security/user-status.ts): a disabled user holds no role on any
+  // server, and a server whose owner is disabled has no members -- it acts as its owner, whose daemon is refused.
+  const server = await db.queryOne<{ user_id: string; owner_status: string | null; actor_status: string | null }>(
+    `SELECT user_id, (SELECT o.status FROM users o WHERE o.id = servers.user_id) AS owner_status,
+            (SELECT a.status FROM users a WHERE a.id = $2) AS actor_status
+       FROM servers WHERE id = $1`,
+    [serverId, userId],
+  );
+
+  if (!server) return 'none';
+  if (!isUserStatusActive(server.owner_status) || !isUserStatusActive(server.actor_status)) return 'none';
+
+  // Direct owner
+  if (server.user_id === userId) return 'owner';
+
+  // Through any group this machine is in. A machine can be in several, so the
+  // strongest role across all of them decides -- being a plain member of one
+  // group must not cancel out running another that holds the same machine.
+  const member = await db.queryOne<{ role: string }>(
+    `SELECT tm.role FROM machine_groups mg
+       JOIN team_members tm ON tm.team_id = mg.team_id
+      WHERE mg.server_id = $1 AND tm.user_id = $2
+      ORDER BY CASE tm.role WHEN 'owner' THEN 0 WHEN 'admin' THEN 1 ELSE 2 END
+      LIMIT 1`,
+    [serverId, userId],
+  );
+  if (member) {
+    if (member.role === 'owner' || member.role === 'admin') return 'admin';
+    return 'member';
+  }
+
+  return 'none';
+}
+
+/**
+ * Operational server authority. An active whole-server Participant is the
+ * owner's delegated operator for that server; a main/sub-session grant is not.
+ * Grant management must use resolveServerMembershipRole instead so delegated
+ * operators can never re-share or escalate access.
+ */
 export async function resolveServerRole(
   db: Database,
   serverId: string,
   userId: string,
 ): Promise<ServerRole> {
-  const server = await db.queryOne<{ team_id: string | null; user_id: string }>(
-    'SELECT team_id, user_id FROM servers WHERE id = $1',
-    [serverId],
-  );
-
-  if (!server) return 'none';
-
-  // Direct owner
-  if (server.user_id === userId) return 'owner';
-
-  // Team membership
-  if (server.team_id) {
-    const member = await db.queryOne<{ role: string }>(
-      'SELECT role FROM team_members WHERE team_id = $1 AND user_id = $2',
-      [server.team_id, userId],
-    );
-    if (member) {
-      if (member.role === 'owner') return 'admin'; // team owner → admin on server
-      if (member.role === 'admin') return 'admin';
-      return 'member';
-    }
-  }
-
-  return 'none';
+  const membership = await resolveServerMembershipRole(db, serverId, userId);
+  if (membership !== 'none') return membership;
+  const coverage = await resolveEffectiveShareCoverage(db, {
+    userId,
+    target: { kind: 'server', serverId },
+    now: Date.now(),
+  });
+  return coverage?.effectiveRole === 'participant' ? 'owner' : 'none';
 }
 
 /**
@@ -296,14 +406,16 @@ export async function resolveServerWebSocketAccess(
     [serverId],
   );
   if (!target) return null;
+
   if (target.node_role === NODE_ROLE.CONTROLLED) {
-    const controlled = await resolveControlledMachineAccess(db, userId, serverId, now);
+    const controlled = await resolveControlledMachineOperatorAccess(db, userId, serverId, now);
     if (!controlled) return null;
-    return canOperateControlledMachine(controlled.access_role)
-      ? { kind: 'controlled', role: controlled.access_role }
-      : null;
+    return { kind: 'controlled', role: controlled.access_role };
   }
-  const role = await resolveServerRole(db, serverId, userId);
+  // Shared operators must enter through a share ticket so their provenance is
+  // retained and every relayed action is stamped. Never let the ordinary WS
+  // endpoint erase that authority boundary by treating them as a member.
+  const role = await resolveServerMembershipRole(db, serverId, userId);
   return role === 'none' ? null : { kind: 'standard', role };
 }
 

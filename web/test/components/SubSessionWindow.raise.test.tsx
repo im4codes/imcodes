@@ -35,6 +35,8 @@ const ws = {
   subscribeTerminal() {}, unsubscribeTerminal() {},
   sendSnapshotRequest() {}, sendResize() {},
   fsGitStatus() { return 'req-1'; }, send() {},
+  getDaemonCapabilitySnapshot() { return null; },
+  onDaemonCapabilitySnapshot() { return () => undefined; },
 } as any;
 
 describe('SubSessionWindow raise-on-click', () => {

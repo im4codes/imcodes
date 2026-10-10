@@ -2,8 +2,9 @@
  * Tests for `src/util/launch-target.ts`.
  *
  * Pins the contract: when a global install ships
- * `bin/imcodes-launch.sh`, systemd ExecStart and launchctl
- * ProgramArguments MUST point at that launcher (not at node directly).
+ * `bin/imcodes-launch.sh`, the systemd ExecStart MUST point at that
+ * launcher (not at node directly). macOS does not use this target at
+ * all: its launch agent runs node itself (macos-launch-agent.test.ts).
  * If the launcher is missing — older installs / source checkouts
  * without `bin/` — the helper transparently falls back to direct node
  * invocation so we never break versions that pre-date the launcher.
@@ -19,7 +20,6 @@ import { tmpdir } from 'node:os';
 import {
   resolveDaemonLaunchTarget,
   renderSystemdExecStart,
-  renderPlistProgramArguments,
 } from '../../src/util/launch-target.js';
 
 function makeFakeInstall(opts: { withLauncher: boolean }): { dir: string; entry: string } {
@@ -84,19 +84,5 @@ describe('renderSystemdExecStart', () => {
   it('joins program + args with single spaces (matches ExecStart= format)', () => {
     expect(renderSystemdExecStart({ program: '/x/launch', args: ['start', '--foreground'] }))
       .toBe('/x/launch start --foreground');
-  });
-});
-
-describe('renderPlistProgramArguments', () => {
-  it('renders a plist <string> array body for ProgramArguments', () => {
-    const out = renderPlistProgramArguments({
-      program: '/x/launch',
-      args: ['start', '--foreground'],
-    });
-    expect(out).toBe(
-      '    <string>/x/launch</string>\n'
-      + '    <string>start</string>\n'
-      + '    <string>--foreground</string>',
-    );
   });
 });

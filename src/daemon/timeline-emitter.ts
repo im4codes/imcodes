@@ -10,13 +10,20 @@ import { tmpdir } from 'os';
 import { performance } from 'node:perf_hooks';
 import type { TimelineEvent, TimelineEventType, TimelineSource, TimelineConfidence } from './timeline-event.js';
 import { timelineStore } from './timeline-store.js';
-import { preferTimelineEvent } from '../shared/timeline/merge.js';
+import { isUserDeletedTimelineEvent, preferTimelineEvent } from '../shared/timeline/merge.js';
 import { isMemoryNoiseTurn } from '../../shared/memory-noise-patterns.js';
-import { recordTurnUsage } from '../store/context-store.js';
+import { getContextStoreClient } from '../store/context-store-worker-client.js';
 import { getSession } from '../store/session-store.js';
+import { registerSessionStateProbeObserver } from '../store/session-state-probe-events.js';
 import logger from '../util/logger.js';
+import { incrementCounter } from '../util/metrics.js';
 import { recordTimelineEmit } from './latency-tracer.js';
-import { TIMELINE_RESPONSE_SOURCES, type TimelineResponseSource } from '../../shared/timeline-protocol.js';
+import {
+  TIMELINE_RESPONSE_SOURCES,
+  TIMELINE_TERMINAL_SESSION_STATES,
+  type TimelineResponseSource,
+} from '../../shared/timeline-protocol.js';
+import { TIMELINE_DELIVERY_METRICS } from '../../shared/timeline-delivery-telemetry.js';
 import { isSessionModelSwitchCommandText } from '../../shared/session-control-commands.js';
 import { recordAssistantFileReadGrants } from './session-file-read-grants.js';
 
@@ -51,16 +58,64 @@ function isTrustedTempPath(filePath: string): boolean {
 
 const MAX_BUFFER = 500;
 
+/**
+ * Latest-value signals are snapshots.  Providers and terminal probes can call
+ * emit repeatedly with freshly allocated payload objects, so reference
+ * equality cannot suppress unchanged frames.  Sort object keys recursively to
+ * make the fingerprint independent of construction order.
+ */
+function timelinePayloadFingerprint(value: unknown): string {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map((entry) => timelinePayloadFingerprint(entry)).join(',')}]`;
+  const record = value as Record<string, unknown>;
+  return `{${Object.keys(record).sort().map((key) => `${JSON.stringify(key)}:${timelinePayloadFingerprint(record[key])}`).join(',')}}`;
+}
+
+function signalFingerprintKey(sessionId: string, type: TimelineEventType): string {
+  return `${sessionId}\u0000${type}`;
+}
+
 export class TimelineEmitter {
   private seqMap = new Map<string, number>();
   private buffer = new Map<string, TimelineEvent[]>();
-  private handlers = new Set<(e: TimelineEvent) => void>();
+  /** handler -> whether it also receives user-delete tombstones (see `on`). */
+  private handlers = new Map<(e: TimelineEvent) => void, boolean>();
   /** Track last session.state per session to deduplicate repeated idle events */
   private lastSessionState = new Map<string, string>();
+  /** Exact payload fingerprints for latest-value signal deduplication. */
+  private lastSignalPayload = new Map<string, string>();
   /** Track recent user.message per session to deduplicate (text → timestamp) */
   private recentUserMsg = new Map<string, { text: string; ts: number }>();
   /** Daemon startup timestamp — changes on restart, used for epoch-based seq continuity */
   readonly epoch = Date.now();
+  /**
+   * In-flight `recordTurnUsage` worker RPCs, fired-and-forgotten from `emit`
+   * (nothing on the heartbeat/ack/send path may await this). Tracked only so
+   * a graceful shutdown can wait for them with a bounded budget instead of
+   * exiting mid-write and losing the row -- the exact race a synchronous
+   * write used to avoid before this became fire-and-forget.
+   */
+  private pendingUsageWrites = new Set<Promise<unknown>>();
+
+  /**
+   * Wait up to `budgetMs` for every currently in-flight usage-record write to
+   * settle. Never blocks longer than the budget: whatever is still pending
+   * at the deadline is abandoned (counted, not awaited further) so shutdown
+   * itself is never at the mercy of a stalled worker.
+   */
+  async drainUsageWrites(budgetMs: number): Promise<{ pendingAtStart: number; abandoned: number }> {
+    const pendingAtStart = this.pendingUsageWrites.size;
+    if (pendingAtStart === 0) return { pendingAtStart: 0, abandoned: 0 };
+    let timedOut = false;
+    await Promise.race([
+      Promise.allSettled([...this.pendingUsageWrites]),
+      new Promise<void>((resolve) => {
+        const timer = setTimeout(() => { timedOut = true; resolve(); }, budgetMs);
+        timer.unref?.();
+      }),
+    ]);
+    return { pendingAtStart, abandoned: timedOut ? this.pendingUsageWrites.size : 0 };
+  }
 
   emit(
     sessionId: string,
@@ -93,33 +148,44 @@ export class TimelineEmitter {
       });
     };
 
-    // Deduplicate session.state — skip repeated same-state events to avoid UI flicker,
-    // but still return a synthetic event so callers (store updates, idle callbacks) proceed.
-    //
-    // Structured queue authority fields bypass state-only dedupe. Legacy
-    // diagnostic fields such as pendingCount/pendingMessages must not trigger
-    // queue mutation delivery.
+    // Deduplicate latest-value signals — skip repeated snapshots to avoid UI
+    // churn and daemon/server bandwidth, but still return a synthetic event so
+    // callers (store updates, idle callbacks) proceed. Queue-authoritative and
+    // error-bearing session states intentionally retain their established edge
+    // semantics: every such mutation is independently meaningful.
     if (type === 'session.state') {
       const state = String(payload.state ?? '');
-      const hasQueueMutation = Array.isArray(payload.pendingMessageEntries)
-        || Array.isArray(payload.transportPendingMessageEntries)
-        || Array.isArray(payload.failedMessageEntries)
-        || typeof payload.queueEpoch === 'string'
-        || typeof payload.queueAuthorityId === 'string'
-        || typeof payload.pendingMessageVersion === 'number'
-        || typeof payload.transportPendingMessageVersion === 'number'
-        || typeof payload.resetReason === 'string'
-        || typeof payload.dropReason === 'string'
-        || typeof payload.degradedReason === 'string'
-        || typeof payload.queueError === 'string'
-        || 'error' in payload;
-      if (!hasQueueMutation && this.lastSessionState.get(sessionId) === state) {
-        // State unchanged AND no queue/error snapshot — don't emit to
-        // handlers/UI, but still return synthetic event for caller.
+      const pendingMessageVersion = typeof payload.pendingMessageVersion === 'number'
+        ? payload.pendingMessageVersion
+        : payload.transportPendingMessageVersion;
+      const hasStructuredQueueMutation = typeof payload.queueEpoch === 'string'
+        && payload.queueEpoch.trim().length > 0
+        && typeof payload.queueAuthorityId === 'string'
+        && payload.queueAuthorityId.trim().length > 0
+        && typeof pendingMessageVersion === 'number'
+        && Number.isFinite(pendingMessageVersion);
+      const hasErrorMutation = 'error' in payload;
+      const terminalState = TIMELINE_TERMINAL_SESSION_STATES.includes(
+        state as (typeof TIMELINE_TERMINAL_SESSION_STATES)[number],
+      );
+      if (!terminalState && !hasStructuredQueueMutation && !hasErrorMutation) {
+        const key = signalFingerprintKey(sessionId, type);
+        const fingerprint = timelinePayloadFingerprint({ state });
+        if (this.lastSignalPayload.get(key) === fingerprint) {
+          finishTrace('synthetic');
+          return { eventId: '', sessionId, ts: Date.now(), seq: 0, epoch: this.epoch, source: opts?.source ?? 'daemon', confidence: opts?.confidence ?? 'high', type, payload } as TimelineEvent;
+        }
+        this.lastSignalPayload.set(key, fingerprint);
+      }
+      this.lastSessionState.set(sessionId, state);
+    } else if (type === 'agent.status' || type === 'usage.update') {
+      const key = signalFingerprintKey(sessionId, type);
+      const fingerprint = timelinePayloadFingerprint(payload);
+      if (this.lastSignalPayload.get(key) === fingerprint) {
         finishTrace('synthetic');
         return { eventId: '', sessionId, ts: Date.now(), seq: 0, epoch: this.epoch, source: opts?.source ?? 'daemon', confidence: opts?.confidence ?? 'high', type, payload } as TimelineEvent;
       }
-      this.lastSessionState.set(sessionId, state);
+      this.lastSignalPayload.set(key, fingerprint);
     }
 
     // Reset same-state dedup on visible activity so the next idle is meaningful
@@ -127,14 +193,19 @@ export class TimelineEmitter {
     // paths can emit assistant/tool activity without a fresh user.message or a
     // running transition; if we keep the old `idle` fingerprint, the final idle
     // is swallowed and the UI can stay in a fake-working state until refresh.
+    // A user-delete tombstone is bookkeeping, not agent/user activity.
     if (
-      type === 'user.message'
-      || type === 'assistant.text'
-      || type === 'tool.call'
-      || type === 'tool.result'
-      || (type === 'agent.status' && payload.status)
+      payload.userDeleted !== true
+      && (
+        type === 'user.message'
+        || type === 'assistant.text'
+        || type === 'tool.call'
+        || type === 'tool.result'
+        || (type === 'agent.status' && payload.status)
+      )
     ) {
       this.lastSessionState.delete(sessionId);
+      this.lastSignalPayload.delete(signalFingerprintKey(sessionId, 'session.state'));
     }
 
     // Deduplicate user.message — skip if same session + same text within 5s
@@ -182,7 +253,10 @@ export class TimelineEmitter {
 
       const key = sessionId;
       const resolvedText = String(payload.text ?? '');
-      if (!allowDuplicate) {
+      // A hidden re-emit (a user delete of this very message) is never a duplicate
+      // send: without this guard deleting a message within 5s of sending it was a
+      // silent no-op that still acked "accepted".
+      if (!allowDuplicate && opts?.hidden !== true) {
         const prev = this.recentUserMsg.get(key);
         const now = Date.now();
         if (prev && prev.text === resolvedText && now - prev.ts < 5_000) {
@@ -202,7 +276,7 @@ export class TimelineEmitter {
     }
 
     if (type === 'assistant.text' && typeof payload.text === 'string' && opts?.hidden !== true) {
-      recordAssistantFileReadGrants(sessionId, payload.text);
+      recordAssistantFileReadGrants(sessionId, payload.text, { streaming: payload.streaming === true });
     }
 
     const seq = (this.seqMap.get(sessionId) ?? 0) + 1;
@@ -292,22 +366,21 @@ export class TimelineEmitter {
       timelineStore.append(event);
       traceAppendScheduleMs += performance.now() - appendStart;
       // Mirror per-turn `usage.update` into SQLite so operators can query
-      // historical token spend without parsing JSONL. Best-effort — failures
-      // never escape (recordTurnUsage swallows internally + extra try/catch).
+      // historical token spend without parsing JSONL. This MUST stay off the
+      // daemon event loop: the context-store worker owns SQLite and a large
+      // database/page cache or a stalled write must never starve ServerLink.
+      // Best-effort — failures degrade usage telemetry only.
       // Final-only: streaming deltas don't reach here.
       //
-      // Round-2 audit (0699ea64-3e6 finding A1): synchronous call + eventId
-      // idempotency key. Replaced the previous `void import(...).then(...)`
-      // pattern — there is no real cyclic dependency on context-store, and
-      // the .then deferred path lost rows under SIGTERM races. Passing
-      // `eventId` lets the partial UNIQUE index swallow replay duplicates
-      // (e.g. gemini-watcher's deterministic stableId on daemon restart).
+      // Preserve the eventId idempotency key from the earlier path. The
+      // worker-side partial UNIQUE index swallows replay duplicates (e.g.
+      // gemini-watcher's deterministic stableId on daemon restart).
       if (type === 'usage.update') {
         const usageStart = performance.now();
         try {
           const sessionRecord = getSession(sessionId);
           const parentSessionName = sessionRecord?.parentSession ?? null;
-          recordTurnUsage({
+          const usageRecord = {
             createdAt: ts,
             sessionName: sessionId,
             agentType: typeof payload.agentType === 'string' ? payload.agentType : null,
@@ -322,7 +395,20 @@ export class TimelineEmitter {
             contextWindow: typeof payload.contextWindow === 'number' ? payload.contextWindow : null,
             costUsd: typeof payload.costUsd === 'number' ? payload.costUsd : null,
             eventId,
-          });
+          };
+          // Keep this fire-and-forget from the emitter's synchronous API, but
+          // route it through the bounded worker RPC. `run()` enforces the
+          // awaited cap/timeout; a slow store rejects after its budget instead
+          // of accumulating unbounded work on the main thread. Tracked in
+          // pendingUsageWrites purely so shutdown can drain it -- nothing on
+          // this call path (or the heartbeat/ack/send paths) ever awaits it.
+          const usageWrite = getContextStoreClient()
+            .run('recordTurnUsage', [usageRecord])
+            .catch(() => {
+              incrementCounter('mem.turn_usage.record_failed', {});
+            });
+          this.pendingUsageWrites.add(usageWrite);
+          void usageWrite.finally(() => this.pendingUsageWrites.delete(usageWrite));
         } catch { /* swallow — telemetry must never escape */ }
         finally {
           traceUsageMs += performance.now() - usageStart;
@@ -330,9 +416,24 @@ export class TimelineEmitter {
       }
     }
 
+    // Low-overhead per-session emit accounting. It is opt-in because labels
+    // include session ids and should not add cardinality on installations that
+    // do not collect delivery telemetry. It remains outside the handler loop so
+    // instrumentation cannot delay liveness-critical consumers or server-link
+    // delivery.
+    if (process.env.IMCODES_TIMELINE_DELIVERY_METRICS === '1') {
+      incrementCounter(TIMELINE_DELIVERY_METRICS.DAEMON_SESSION_EMIT, { sessionId, type });
+    }
+
     // Notify handlers
     const handlersStart = performance.now();
-    for (const h of this.handlers) {
+    // A user-delete tombstone is persisted and broadcast to viewers, but it is
+    // never new agent/user activity: only handlers that opted in (the
+    // server-link forwarder) see it, so memory ingestion, supervision, task
+    // pairs, cron and peer-audit cannot mistake a delete for output.
+    const isTombstone = isUserDeletedTimelineEvent(event);
+    for (const [h, includeUserDeleted] of this.handlers) {
+      if (isTombstone && !includeUserDeleted) continue;
       traceHandlerCount += 1;
       try { h(event); } catch { /* ignore */ }
     }
@@ -342,13 +443,27 @@ export class TimelineEmitter {
     return event;
   }
 
-  on(handler: (e: TimelineEvent) => void): () => void {
-    this.handlers.add(handler);
+  /**
+   * Subscribe to every emitted event. User-delete tombstones
+   * (`isUserDeletedTimelineEvent`) are excluded unless the handler passes
+   * `includeUserDeleted` -- only the consumers that mirror the timeline to
+   * viewers / the server should.
+   */
+  on(handler: (e: TimelineEvent) => void, opts?: { includeUserDeleted?: boolean }): () => void {
+    this.handlers.set(handler, opts?.includeUserDeleted === true);
     return () => { this.handlers.delete(handler); };
   }
 
   /** Return a copy of the live in-memory buffer for readers that need the
    * just-emitted event before the async timeline projection catches up. */
+  /** Numbers only (diagnostics): how much the in-memory per-session rings hold. */
+  memoryStats(): { sessions: number; bufferedEvents: number; maxSessionEvents: number } {
+    let events = 0;
+    let max = 0;
+    for (const ring of this.buffer.values()) { events += ring.length; if (ring.length > max) max = ring.length; }
+    return { sessions: this.buffer.size, bufferedEvents: events, maxSessionEvents: max };
+  }
+
   getBufferedEvents(sessionId: string): TimelineEvent[] {
     return [...(this.buffer.get(sessionId) ?? [])];
   }
@@ -412,8 +527,15 @@ export class TimelineEmitter {
     this.buffer.delete(sessionId);
     this.seqMap.delete(sessionId);
     this.lastSessionState.delete(sessionId);
+    this.lastSignalPayload.delete(signalFingerprintKey(sessionId, 'session.state'));
+    this.lastSignalPayload.delete(signalFingerprintKey(sessionId, 'agent.status'));
+    this.lastSignalPayload.delete(signalFingerprintKey(sessionId, 'usage.update'));
     this.recentUserMsg.delete(sessionId);
   }
 }
 
 export const timelineEmitter = new TimelineEmitter();
+
+registerSessionStateProbeObserver((sessionName, state) => {
+  timelineEmitter.emit(sessionName, 'session.state', { state });
+});

@@ -18,6 +18,7 @@ import {
 import {
   patchPeerAuditTargetInTransportConfig,
   readSupervisionSnapshotFromTransportConfig,
+  resolveSupervisionAuditBlockingSeverities,
 } from '../../shared/supervision-config.js';
 import { persistSessionRecord } from '../agent/session-manager.js';
 import { getTransportRuntime } from '../agent/session-manager.js';
@@ -37,7 +38,6 @@ import {
   type PeerAuditTerminalRecord,
 } from './peer-audit-controller.js';
 import {
-  peerAuditCapabilityMatches,
   processPeerAuditReplyAuthority,
   registerPeerAuditReplyIngressHandler,
 } from './peer-audit-reply-ingress.js';
@@ -45,6 +45,7 @@ import { emitPeerAuditResult, emitPeerAuditStatus, peerAuditResultEventId } from
 import { PEER_AUDIT_TERMINAL_OUTCOMES } from '../../shared/peer-audit.js';
 import { buildPeerAuditBriefV1 } from './supervision-prompts.js';
 import { cancelQueuedPeerAuditMessage, dispatchPeerAuditMessage } from './session-dispatch.js';
+import { getSupervisionTaskRegistry } from './supervision-state-store.js';
 
 interface AttemptContext {
   brief: string;
@@ -53,6 +54,8 @@ interface AttemptContext {
   baselineId: string;
   targetConfigRevision: string;
   candidateRevision: string;
+  /** Passed report rows supplied by the daemon for this exact attempt. */
+  acceptedImplementerValidation: boolean;
   baselineValid: () => boolean;
   onAutomaticTerminal?: (terminal: PeerAuditTerminalRecord) => void;
 }
@@ -428,9 +431,8 @@ export class PeerAuditService {
     persistSessionRecord(nextRecord, nextRecord.name);
 
     const attemptId = opaqueId();
-    const capability = randomBytes(32).toString('base64url');
     const configRevision = targetConfigRevision(nextRecord);
-    const brief = this.#buildBrief(baseline, attemptId, capability, nextRecord);
+    const brief = this.#buildBrief(baseline, attemptId, nextRecord);
     this.#contexts.set(attemptId, {
       brief,
       auditorSessionName: candidate.name,
@@ -438,6 +440,7 @@ export class PeerAuditService {
       baselineId: baseline.baselineId,
       targetConfigRevision: configRevision,
       candidateRevision: command.candidateRevision,
+      acceptedImplementerValidation: false,
       baselineValid: () => this.baseline.getCompletedBaseline({
         sessionName: nextRecord.name,
         auditedSessionInstanceId: nextRecord.sessionInstanceId!,
@@ -458,7 +461,6 @@ export class PeerAuditService {
       auditorSessionInstanceId: candidate.sessionInstanceId,
       auditorRuntimeEpoch: candidate.runtimeEpoch,
       selectionIntent: command.selectionIntent,
-      capabilityHash: hash(capability),
     });
     if (requested.status !== 'started') {
       this.#contexts.delete(attemptId);
@@ -511,10 +513,9 @@ export class PeerAuditService {
       ...(input.supervisorRationale ? { supervisorRationale: input.supervisorRationale } : {}),
     };
     const attemptId = opaqueId();
-    const capability = randomBytes(32).toString('base64url');
     const configRevision = targetConfigRevision(audited);
     const context: AttemptContext = {
-      brief: this.#buildBrief(baseline, attemptId, capability, audited, {
+      brief: this.#buildBrief(baseline, attemptId, audited, {
         changePath: input.changePath,
         changedPaths: input.changedPaths,
         validations: input.validations,
@@ -525,6 +526,7 @@ export class PeerAuditService {
       baselineId: baseline.baselineId,
       targetConfigRevision: configRevision,
       candidateRevision: candidateList.list.revision,
+      acceptedImplementerValidation: input.validations?.some((item) => item.outcome === 'passed') ?? false,
       baselineValid: input.isStillValid,
       onAutomaticTerminal: input.onTerminal,
     };
@@ -543,7 +545,6 @@ export class PeerAuditService {
       auditorSessionInstanceId: candidate.sessionInstanceId,
       auditorRuntimeEpoch: candidate.runtimeEpoch,
       selectionIntent: 'remembered_fast_path' as const,
-      capabilityHash: hash(capability),
     };
     const requested = this.#controller(audited.name).request(request, {
       // A repeated automatic evaluation for the same completed baseline is
@@ -625,7 +626,7 @@ export class PeerAuditService {
     const controller = sessionName ? this.#controllers.get(sessionName) : undefined;
     const pending = controller?.pending;
     if (!pending || pending.attemptId !== envelope.attemptId) {
-      return { ok: false, error: PEER_AUDIT_REPLY_ERRORS.INVALID_CAPABILITY };
+      return { ok: false, error: PEER_AUDIT_REPLY_ERRORS.ATTEMPT_MISMATCH };
     }
     const audited = getSession(pending.auditedSessionName);
     const context = this.#contexts.get(pending.attemptId);
@@ -649,6 +650,7 @@ export class PeerAuditService {
         configRevision: pending.targetConfigRevision,
         controllerRevision: pending.revision,
         deadlineAt: pending.deadlineAt,
+        acceptedImplementerValidation: context?.acceptedImplementerValidation === true,
       },
       current: {
         sender: sender.sessionInstanceId && sender.runtimeEpoch ? {
@@ -667,13 +669,25 @@ export class PeerAuditService {
         configRevision: audited ? targetConfigRevision(audited) : undefined,
         controllerRevision: controller.pending?.revision,
       },
-      capabilityMatches: (provided) => peerAuditCapabilityMatches(
-        pending.capabilityHash,
-        hash(provided),
-      ),
       onInvalidReply: () => { controller.invalidReply({ attemptId: envelope.attemptId }); },
       onDeadline: () => { controller.timeout({ attemptId: pending.attemptId, occurredAt: receivedAt }); },
       reduce: (reply) => {
+        const persisted = getSupervisionTaskRegistry().applyMatchingAuditReceipt({
+          attemptId: reply.attemptId,
+          revision: pending.candidateRevision,
+          verdict: reply.verdict,
+          auditedSessionName: pending.auditedSessionName,
+          auditorSessionName: pending.auditorSessionName,
+          findings: reply.findings,
+          now: reply.receivedAt,
+        });
+        // Not every peer audit is attached to a registry task. Missing is the
+        // only benign case; a bound task whose attempt/revision/state fails
+        // validation must reject the structured receipt rather than emit a
+        // PASS that the authoritative registry could not persist.
+        if (!persisted.ok && persisted.reason !== 'not_found') {
+          return { accepted: false };
+        }
         const transition = controller.replyAccepted({
           attemptId: pending.attemptId,
           attemptRevision: reply.controllerRevision,
@@ -698,7 +712,6 @@ export class PeerAuditService {
   #buildBrief(
     baseline: CompletedAuditBaseline,
     attemptId: string,
-    capability: string,
     record: SessionRecord,
     context: {
       changePath?: string;
@@ -709,19 +722,21 @@ export class PeerAuditService {
   ): string {
     return buildPeerAuditBriefV1({
       attemptId,
-      replyCapability: capability,
       taskRequest: baseline.userText,
       completedResult: baseline.assistantText,
       acceptanceCriteria: [
         `Satisfy this exact user request: ${baseline.userText}`,
         'Identify concrete correctness, regression, security, and missing-test risks.',
-        'Use applicable non-destructive executable validation and report exact evidence.',
+        'Use the submitted exact-baseline validation report; run only a contract-allowed small exception check.',
       ],
       projectPath: record.projectDir,
       changePath: context.changePath,
       changedPaths: context.changedPaths,
       validations: context.validations,
       ...(context.narrowScope ? { narrowScope: true } : {}),
+      blockingSeverities: resolveSupervisionAuditBlockingSeverities(
+        readSupervisionSnapshotFromTransportConfig(record.transportConfig),
+      ),
       supervisorRationale: baseline.supervisorRationale,
       ...(this.#lastReworkFindings.get(record.name)
         ? { priorReworkFindings: this.#lastReworkFindings.get(record.name) }

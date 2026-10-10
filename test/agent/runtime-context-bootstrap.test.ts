@@ -7,6 +7,8 @@ import { configureSharedContextRuntime } from '../../src/context/shared-context-
 import { makeMemoryShortRef, resetMemoryShortRefsForTests, resolveMemoryShortRef } from '../../src/context/memory-short-ref.js';
 import { ensureContextNamespace, writeContextObservation, writeProcessedProjection } from '../../src/store/context-store.js';
 import { cleanupIsolatedSharedContextDb, createIsolatedSharedContextDb } from '../util/shared-context-db.js';
+import { projectionOwnerCache } from '../../src/daemon/memory-projection-owner-cache.js';
+import { setMemoryInjectionEnabled } from '../../src/context/memory-injection-toggle.js';
 
 const detectRepoMock = vi.hoisted(() => vi.fn());
 
@@ -18,7 +20,12 @@ vi.mock('../../src/repo/detector.js', async (importOriginal) => {
   };
 });
 
-import { buildTransportStartupMemory, resolveTransportContextBootstrap } from '../../src/agent/runtime-context-bootstrap.js';
+import {
+  BOOTSTRAP_BACKEND_FETCH_TIMEOUT_MS,
+  buildTransportStartupMemory,
+  resolveTransportContextBootstrap,
+  __clearOriginUrlCacheForTests,
+} from '../../src/agent/runtime-context-bootstrap.js';
 
 describe('resolveTransportContextBootstrap', () => {
   let tempDir: string;
@@ -26,7 +33,9 @@ describe('resolveTransportContextBootstrap', () => {
 
   beforeEach(() => {
     detectRepoMock.mockReset();
+    __clearOriginUrlCacheForTests();
     resetMemoryShortRefsForTests();
+    projectionOwnerCache.clear();
     configureSharedContextRuntime(null);
     vi.unstubAllGlobals();
     vi.unstubAllEnvs();
@@ -412,6 +421,35 @@ describe('resolveTransportContextBootstrap', () => {
     }));
   });
 
+  it('omits durable/recent startup memory once memory_injection_set disables it for the namespace, even when processed memory exists', async () => {
+    const now = Date.now();
+    detectRepoMock.mockResolvedValue({
+      info: {
+        remoteUrl: 'git@github.com:acme/repo.git',
+      },
+    });
+    writeProcessedProjection({
+      namespace: {
+        scope: 'personal',
+        projectId: 'github.com/acme/repo',
+      },
+      class: 'recent_summary',
+      sourceEventIds: ['evt-toggle'],
+      summary: 'Should be hidden once injection is disabled',
+      content: { kind: 'startup' },
+      createdAt: now - 100,
+      updatedAt: now - 50,
+    });
+    await setMemoryInjectionEnabled({ scope: 'personal', projectId: 'github.com/acme/repo' }, false);
+
+    const result = await resolveTransportContextBootstrap({
+      projectDir: '/tmp/project',
+      transportConfig: {},
+    });
+
+    expect(result.startupMemory).toBeUndefined();
+  });
+
   it('includes cloud startup memory for the resolved personal project when backend sync is available', async () => {
     detectRepoMock.mockResolvedValue({
       info: {
@@ -515,6 +553,33 @@ describe('resolveTransportContextBootstrap', () => {
     expect(result.startupMemory?.items.map((item) => item.id)).not.toContain('cloud-other-scope');
   });
 
+  it('never surfaces proj:7326uk25z6pnx outside the target consumer namespace', async () => {
+    const projectionId = '455678dc-ab00-4e94-b12c-cac37417a3b8';
+    const remoteItem = {
+      type: 'processed' as const,
+      id: projectionId,
+      projectId: 'github.com/acme/repo',
+      scope: 'personal',
+      userId: 'brain-user',
+      projectionClass: 'recent_summary' as const,
+      summary: 'Brain-only projection must not become a recoverable CC3 action',
+      createdAt: 1,
+      originServerId: 'server-brain',
+    };
+    const brain = await buildTransportStartupMemory({
+      scope: 'personal', projectId: 'github.com/acme/repo', userId: 'brain-user',
+    }, { remoteItems: [remoteItem] });
+    expect(brain?.injectedText).toContain('proj:');
+    expect(brain?.items.map((item) => item.id)).toContain(projectionId);
+    expect(projectionOwnerCache.get(projectionId)).toBe('server-brain');
+
+    const cc3 = await buildTransportStartupMemory({
+      scope: 'personal', projectId: 'github.com/acme/repo', userId: 'cc3-user',
+    }, { remoteItems: [remoteItem] });
+    expect(cc3?.items.map((item) => item.id) ?? []).not.toContain(projectionId);
+    expect(cc3?.injectedText ?? '').not.toContain('proj:7326uk25z6pnx');
+  });
+
   it('buildTransportStartupMemory keeps up to 20 durable plus 30 recent memories', async () => {
     const now = Date.now();
     const namespace = {
@@ -550,6 +615,27 @@ describe('resolveTransportContextBootstrap', () => {
     expect(startup?.items.filter((item) => item.projectionClass === 'durable_memory_candidate')).toHaveLength(20);
     expect(startup?.items.filter((item) => item.projectionClass === 'recent_summary')).toHaveLength(30);
     expect(startup?.items.slice(0, 20).every((item) => item.projectionClass === 'durable_memory_candidate')).toBe(true);
+  });
+
+  it('buildTransportStartupMemory returns no project memory for any caller once the project turned injection off', async () => {
+    const now = Date.now();
+    const namespace = { scope: 'personal' as const, projectId: 'github.com/acme/repo' };
+    writeProcessedProjection({
+      namespace,
+      class: 'durable_memory_candidate',
+      sourceEventIds: ['evt-toggle-off'],
+      summary: 'Memory that must not be injected while the toggle is off',
+      content: {},
+      createdAt: now - 100,
+      updatedAt: now - 50,
+    });
+    expect((await buildTransportStartupMemory(namespace))?.items.length).toBeGreaterThan(0);
+
+    // Written the way memory_injection_set writes it: daemon-local owner filled in.
+    await setMemoryInjectionEnabled({ ...namespace, userId: 'daemon-local' }, false);
+    // The first-dispatch fallback calls the builder directly, without managedSkillsOnly.
+    const startup = await buildTransportStartupMemory(namespace, { projectDir: '/tmp/project' });
+    expect(startup?.items.some((item) => item.summary.includes('must not be injected')) ?? false).toBe(false);
   });
 
   it('buildTransportStartupMemory mixes important and recent startup memories with durable entries first', async () => {
@@ -759,5 +845,75 @@ describe('resolveTransportContextBootstrap', () => {
     expect(personalStartup?.injectedText).toContain('reference only');
     expect(sharedStartup?.items).toHaveLength(1);
     expect(sharedStartup?.items[0]?.summary).toContain('Shared');
+  });
+  describe('a backend that never answers cannot hold the bootstrap', () => {
+    /** Accepts the request and never replies; only the caller's abort signal ends it. */
+    const hangingBackendFetch = () => vi.fn((_url: unknown, init?: RequestInit) => new Promise<Response>((_resolve, reject) => {
+      init?.signal?.addEventListener('abort', () => reject(init.signal?.reason ?? new Error('aborted')), { once: true });
+    }));
+
+    it('namespace resolution gives up at the bootstrap fetch cap and falls back to the personal namespace', async () => {
+      detectRepoMock.mockResolvedValue({ info: { remoteUrl: 'https://github.com/acme/repo.git' } });
+      const fetchMock = hangingBackendFetch();
+      vi.stubGlobal('fetch', fetchMock);
+      configureSharedContextRuntime({ workerUrl: 'http://worker.test', serverId: 'srv-1', token: 'daemon-token' });
+
+      const startedAt = Date.now();
+      const result = await resolveTransportContextBootstrap({ projectDir: '/tmp/project', transportConfig: {} });
+      const elapsed = Date.now() - startedAt;
+
+      expect(result.namespace).toEqual({ scope: 'personal', projectId: 'github.com/acme/repo' });
+      expect(result.diagnostics).toContain('namespace:server-resolution-failed');
+      // Two capped fetches in sequence (namespace, then remote startup memory); never an unbounded wait.
+      expect(elapsed).toBeGreaterThanOrEqual(BOOTSTRAP_BACKEND_FETCH_TIMEOUT_MS - 100);
+      expect(elapsed).toBeLessThan(2 * BOOTSTRAP_BACKEND_FETCH_TIMEOUT_MS + 2_000);
+      expect(fetchMock.mock.calls[0]?.[1]?.signal).toBeInstanceOf(AbortSignal);
+    }, 15_000);
+
+    it('remote startup memory gives up at the same cap and the bootstrap still returns', async () => {
+      const fetchMock = hangingBackendFetch();
+      vi.stubGlobal('fetch', fetchMock);
+      configureSharedContextRuntime({ workerUrl: 'http://worker.test', serverId: 'srv-1', token: 'daemon-token' });
+
+      const startedAt = Date.now();
+      const result = await resolveTransportContextBootstrap({
+        projectDir: '/tmp/project',
+        transportConfig: { sharedContextNamespace: { scope: 'personal', projectId: 'github.com/acme/repo' } },
+      });
+      const elapsed = Date.now() - startedAt;
+
+      expect(result.namespace).toEqual({ scope: 'personal', projectId: 'github.com/acme/repo' });
+      expect(elapsed).toBeLessThan(BOOTSTRAP_BACKEND_FETCH_TIMEOUT_MS + 1_500);
+      expect(fetchMock.mock.calls.some((call) => String(call[0]).includes('/shared-context/memory/search'))).toBe(true);
+    }, 15_000);
+  });
+
+  it('reports the namespace as soon as it is known, before any context-store work', async () => {
+    const seen: Array<{ namespace: unknown; diagnostics: string[] }> = [];
+    let resultReturned = false;
+    const result = await resolveTransportContextBootstrap({
+      projectDir: '/tmp/project',
+      transportConfig: { sharedContextNamespace: { scope: 'personal', projectId: 'github.com/acme/repo' } },
+      onNamespaceResolved: (stage) => {
+        expect(resultReturned).toBe(false);
+        seen.push({ namespace: stage.namespace, diagnostics: stage.diagnostics });
+      },
+    });
+    resultReturned = true;
+
+    expect(seen).toEqual([{
+      namespace: { scope: 'personal', projectId: 'github.com/acme/repo' },
+      diagnostics: ['namespace:explicit'],
+    }]);
+    expect(result.namespace).toEqual(seen[0]?.namespace);
+  });
+
+  it('an observer that throws cannot break the bootstrap', async () => {
+    const result = await resolveTransportContextBootstrap({
+      projectDir: '/tmp/project',
+      transportConfig: { sharedContextNamespace: { scope: 'personal', projectId: 'github.com/acme/repo' } },
+      onNamespaceResolved: () => { throw new Error('observer bug'); },
+    });
+    expect(result.namespace).toEqual({ scope: 'personal', projectId: 'github.com/acme/repo' });
   });
 });

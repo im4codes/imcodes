@@ -25,6 +25,8 @@ export interface TimelineHistoryBuildJobInput {
   sessionName: string;
   limit: number;
   afterTs?: number;
+  afterSeq?: number;
+  epoch?: number;
   beforeTs?: number;
   maxResponseBytes?: number;
   contentTypes: TimelineEventType[];

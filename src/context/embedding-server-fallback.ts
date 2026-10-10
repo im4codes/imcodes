@@ -29,6 +29,7 @@
 
 import { EMBEDDING_DIM } from '../../shared/embedding-config.js';
 import logger from '../util/logger.js';
+import { daemonServerAuthHeaders } from '../../shared/daemon-server-auth.js';
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
 
@@ -114,8 +115,7 @@ export async function tryServerEmbedding(
     const res = await fetchImpl(`${creds.workerUrl.replace(/\/$/, '')}/api/embedding`, {
       method: 'POST',
       headers: {
-        Authorization: `Bearer ${creds.token}`,
-        'X-Server-Id': creds.serverId,
+        ...daemonServerAuthHeaders(creds),
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({ text }),

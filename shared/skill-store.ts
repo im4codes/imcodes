@@ -365,13 +365,14 @@ export function getProjectSkillEscapeHatchPath(input: { projectRoot: string; cat
   );
 }
 
-export function getUserSkillRoot(homeDir: string): string {
-  return join(homeDir, '.imcodes', 'skills');
+/** `<state dir>/skills`. `stateDir` (the resolved IM.codes state directory) defaults to `<homeDir>/.imcodes`; src callers pass the resolver's answer so IMCODES_HOME relocates the store. */
+export function getUserSkillRoot(homeDir: string, stateDir: string = join(homeDir, '.imcodes')): string {
+  return join(stateDir, 'skills');
 }
 
-export function getUserSkillPath(input: { homeDir: string; category: string; skillName: string }): string {
+export function getUserSkillPath(input: { homeDir: string; stateDir?: string; category: string; skillName: string }): string {
   return join(
-    getUserSkillRoot(input.homeDir),
+    getUserSkillRoot(input.homeDir, input.stateDir),
     normalizeSkillPathSegment(input.category),
     `${normalizeSkillPathSegment(input.skillName)}${SKILL_FILE_EXTENSION}`,
   );

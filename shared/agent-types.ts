@@ -1,4 +1,9 @@
+import { CODEBUDDY_PROVIDER_IDS } from './codebuddy.js';
+import { AGY_SDK_PROVIDER_ID } from './agy-agent.js';
+import { HERMES_AGENT_PROVIDER_ID } from './hermes-agent.js';
+
 export const SESSION_AGENT_TYPES = [
+  AGY_SDK_PROVIDER_ID,
   'claude-code-sdk',
   'claude-code',
   'codex-sdk',
@@ -14,8 +19,11 @@ export const SESSION_AGENT_TYPES = [
   'qwen',
   'openclaw',
   'kimi-sdk',
+  HERMES_AGENT_PROVIDER_ID,
   'deepseek-harness',
   'pi',
+  CODEBUDDY_PROVIDER_IDS.CHINA,
+  CODEBUDDY_PROVIDER_IDS.INTERNATIONAL,
   'shell',
   'script',
 ] as const;
@@ -25,6 +33,7 @@ export type SessionAgentType = typeof SESSION_AGENT_TYPES[number];
 export const CLAUDE_CODE_FAMILY = ['claude-code-sdk', 'claude-code'] as const;
 export const CODEX_FAMILY = ['codex-sdk', 'codex'] as const;
 export const TRANSPORT_SESSION_AGENT_TYPES = [
+  AGY_SDK_PROVIDER_ID,
   'claude-code-sdk',
   'codex-sdk',
   'qoder-sdk',
@@ -34,8 +43,11 @@ export const TRANSPORT_SESSION_AGENT_TYPES = [
   'gemini-sdk',
   'grok-sdk',
   'kimi-sdk',
+  HERMES_AGENT_PROVIDER_ID,
   'deepseek-harness',
   'pi',
+  CODEBUDDY_PROVIDER_IDS.CHINA,
+  CODEBUDDY_PROVIDER_IDS.INTERNATIONAL,
   'qwen',
   'openclaw',
 ] as const;

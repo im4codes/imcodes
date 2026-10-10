@@ -1,3 +1,4 @@
+import { resolveImcodesHome } from '../util/windows-daemon-lock.js';
 /**
  * Timeline event store.
  *
@@ -12,7 +13,8 @@
  * `emit()` synchronous guarantees (handled by timeline-emitter):
  *   - Ring buffer push completes; `replay()` immediately sees it.
  *   - Handler broadcast completes; WS / projection sync listeners see it.
- *   - `recordTurnUsage` (better-sqlite3) writes synchronously.
+ *   - usage telemetry is submitted to the context-store worker asynchronously;
+ *     emit never waits for SQLite.
  *
  * `emit()` does NOT guarantee:
  *   - JSONL file content visible to `read()` / `getLatest()` — those paths
@@ -32,16 +34,17 @@
 import { mkdirSync, readdirSync, statSync, openSync, readSync, fstatSync, closeSync, createReadStream } from 'fs';
 import { mkdir, appendFile, writeFile, rename, unlink } from 'fs/promises';
 import { join } from 'path';
-import { homedir } from 'os';
 import { createInterface } from 'readline';
 import type { TimelineEvent } from './timeline-event.js';
 import logger from '../util/logger.js';
-import { timelineProjection, type TimelineProjectionQueryOpts } from './timeline-projection.js';
+import { timelineProjection, TimelineProjectionBusyError, type TimelineProjectionQueryOpts } from './timeline-projection.js';
 import { TIMELINE_HISTORY_ERROR_REASONS, type TimelineHistoryErrorReason } from '../../shared/timeline-history-errors.js';
 import { TIMELINE_RESPONSE_SOURCES } from '../../shared/timeline-protocol.js';
 import { AGENT_DELEGATION_REPLY_TIMELINE_EVENT } from '../../shared/agent-delegation.js';
 
-export const TIMELINE_DIR = join(homedir(), '.imcodes', 'timeline');
+export function timelineDir(): string { return join(resolveImcodesHome(), 'timeline'); }
+/** @deprecated Use timelineDir() so HOME changes are observed lazily. */
+export const TIMELINE_DIR = timelineDir();
 const MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 const MAX_EVENTS_PER_FILE = 5000;
 
@@ -189,7 +192,7 @@ class TimelineStore {
   private ensureDirSync(): void {
     if (this.initialized) return;
     try {
-      mkdirSync(TIMELINE_DIR, { recursive: true });
+      mkdirSync(timelineDir(), { recursive: true });
     } catch { /* exists */ }
     this.initialized = true;
   }
@@ -197,7 +200,7 @@ class TimelineStore {
   private async ensureDirAsync(): Promise<void> {
     if (this.initialized) return;
     try {
-      await mkdir(TIMELINE_DIR, { recursive: true });
+      await mkdir(timelineDir(), { recursive: true });
     } catch { /* exists */ }
     this.initialized = true;
   }
@@ -205,7 +208,7 @@ class TimelineStore {
   filePath(sessionName: string): string {
     // Sanitize session name for filesystem
     const safe = sessionName.replace(/[^a-zA-Z0-9_-]/g, '_');
-    return join(TIMELINE_DIR, `${safe}.jsonl`);
+    return join(timelineDir(), `${safe}.jsonl`);
   }
 
   /**
@@ -327,11 +330,13 @@ class TimelineStore {
 
   async readPreferred(
     sessionName: string,
-    opts?: { afterTs?: number; beforeTs?: number; limit?: number },
+    opts?: { afterTs?: number; afterSeq?: number; epoch?: number; beforeTs?: number; limit?: number },
   ): Promise<TimelineEvent[]> {
     const events = await timelineProjection.queryHistory({
       sessionId: sessionName,
       afterTs: opts?.afterTs,
+      afterSeq: opts?.afterSeq,
+      epoch: opts?.epoch,
       beforeTs: opts?.beforeTs,
       limit: opts?.limit,
     });
@@ -344,13 +349,25 @@ class TimelineStore {
     types: TimelineEvent['type'][],
     opts?: TimelineProjectionQueryOpts,
   ): Promise<TimelineEvent[]> {
-    const events = await timelineProjection.queryByTypes({
-      sessionId: sessionName,
-      types,
-      afterTs: opts?.afterTs,
-      beforeTs: opts?.beforeTs,
-      limit: opts?.limit,
-    });
+    let events: TimelineEvent[] | null;
+    try {
+      events = await timelineProjection.queryByTypes({
+        sessionId: sessionName,
+        types,
+        afterTs: opts?.afterTs,
+        afterSeq: opts?.afterSeq,
+        epoch: opts?.epoch,
+        beforeTs: opts?.beforeTs,
+        limit: opts?.limit,
+      });
+    } catch (err) {
+      // Busy is not absence. Reporting it as absence is what invites the caller
+      // to do this work on the main thread.
+      if (err instanceof TimelineProjectionBusyError) {
+        throw new TimelinePreferredReadError(TIMELINE_HISTORY_ERROR_REASONS.PROJECTION_BUSY);
+      }
+      throw err;
+    }
     if (events === null) throw new TimelinePreferredReadError(TIMELINE_HISTORY_ERROR_REASONS.PROJECTION_UNAVAILABLE);
     return events;
   }
@@ -448,7 +465,7 @@ class TimelineStore {
     this.ensureDirSync();
     let files: string[];
     try {
-      files = readdirSync(TIMELINE_DIR);
+      files = readdirSync(timelineDir());
     } catch (err) {
       logger.debug({ err }, 'TimelineStore: truncateAll readdir failed');
       return;
@@ -477,14 +494,14 @@ class TimelineStore {
     const now = Date.now();
     let files: string[];
     try {
-      files = readdirSync(TIMELINE_DIR);
+      files = readdirSync(timelineDir());
     } catch (err) {
       logger.debug({ err }, 'TimelineStore: cleanup readdir failed');
       return;
     }
     for (const file of files) {
       if (!file.endsWith('.jsonl')) continue;
-      const fullPath = join(TIMELINE_DIR, file);
+      const fullPath = join(timelineDir(), file);
       try {
         const stat = statSync(fullPath);
         if (now - stat.mtimeMs > MAX_AGE_MS) {

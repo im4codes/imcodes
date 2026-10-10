@@ -1,6 +1,11 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { Hono } from 'hono';
-import { SHARED_CONTEXT_RUNTIME_CONFIG_MSG } from '../../shared/shared-context-runtime-config.js';
+import {
+  DEFAULT_MEMORY_BACKUP_CONTEXT_BACKEND,
+  DEFAULT_MEMORY_BACKUP_CONTEXT_MODEL,
+  DEFAULT_MEMORY_PRIMARY_CONTEXT_MODEL,
+  SHARED_CONTEXT_RUNTIME_CONFIG_MSG,
+} from '../../shared/shared-context-runtime-config.js';
 
 const getServersByUserIdMock = vi.fn();
 const getServerByIdMock = vi.fn();
@@ -71,7 +76,7 @@ describe('server shared-context runtime config routes', () => {
     updateServerSharedContextRuntimeConfigMock.mockResolvedValue(true);
     getUserPrefMock.mockResolvedValue(undefined);
     setUserPrefMock.mockResolvedValue(undefined);
-    queryOneMock.mockResolvedValue({ id: 'srv-1', user_id: 'user-1' });
+    queryOneMock.mockResolvedValue({ id: 'srv-1', user_id: 'user-1', owner_status: 'active' });
   });
 
   async function buildApp() {
@@ -116,6 +121,40 @@ describe('server shared-context runtime config routes', () => {
           enablePersonalMemorySync: true,
         },
       },
+    });
+  });
+
+  it('returns memory-processing defaults when the server has no saved config', async () => {
+    getServerSharedContextRuntimeConfigMock.mockResolvedValueOnce(null);
+    const app = await buildApp();
+    const response = await app.request('/api/server/srv-1/shared-context/runtime-config');
+    expect(response.status).toBe(200);
+    const body = await response.json();
+    expect(body.snapshot.persisted).toMatchObject({
+      primaryContextBackend: 'codex-sdk',
+      primaryContextModel: DEFAULT_MEMORY_PRIMARY_CONTEXT_MODEL,
+      backupContextBackend: DEFAULT_MEMORY_BACKUP_CONTEXT_BACKEND,
+      backupContextModel: DEFAULT_MEMORY_BACKUP_CONTEXT_MODEL,
+    });
+    expect(body.snapshot.effective).toMatchObject(body.snapshot.persisted);
+  });
+
+  it('normalizes the daemon-facing config with the same defaults', async () => {
+    getServerSharedContextRuntimeConfigMock.mockResolvedValueOnce({
+      primaryContextBackend: 'claude-code-sdk',
+      primaryContextModel: 'sonnet',
+    });
+    const app = await buildApp();
+    const response = await app.request('/api/server/srv-1/shared-context/runtime-config/daemon', {
+      headers: { Authorization: 'Bearer daemon-token' },
+    });
+    expect(response.status).toBe(200);
+    const body = await response.json();
+    expect(body.config).toMatchObject({
+      primaryContextBackend: 'claude-code-sdk',
+      primaryContextModel: 'sonnet',
+      backupContextBackend: DEFAULT_MEMORY_BACKUP_CONTEXT_BACKEND,
+      backupContextModel: DEFAULT_MEMORY_BACKUP_CONTEXT_MODEL,
     });
   });
 
@@ -228,8 +267,8 @@ describe('server shared-context runtime config routes', () => {
         primaryContextBackend: 'claude-code-sdk',
         primaryContextModel: 'sonnet',
         primaryContextPreset: undefined,
-        backupContextBackend: undefined,
-        backupContextModel: undefined,
+        backupContextBackend: DEFAULT_MEMORY_BACKUP_CONTEXT_BACKEND,
+        backupContextModel: DEFAULT_MEMORY_BACKUP_CONTEXT_MODEL,
         backupContextPreset: undefined,
         memoryRecallMinScore: 0.4,
         memoryScoringWeights: {

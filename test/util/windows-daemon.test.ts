@@ -13,7 +13,11 @@ const state = vi.hoisted(() => ({
   execCalls: [] as string[],
   spawnCalls: [] as Array<{ cmd: string; args: string[] }>,
   rmSyncCalls: [] as string[],
+  lockMetadata: null as null | { pid: number; startToken: string; socketPath: string; version: 1; acquiredAt: number; sessionIds: string[]; residualResources: string[] },
 }));
+const originalHome = process.env.HOME;
+const originalImcodesHome = process.env.IMCODES_HOME;
+const originalUserProfile = process.env.USERPROFILE;
 
 vi.mock('node:os', () => ({ homedir: () => 'C:\\Users\\tester' }));
 
@@ -40,10 +44,19 @@ vi.mock('node:fs', () => ({
   }),
 }));
 
+vi.mock('../../src/daemon/instance-lock.js', () => ({
+  readInstanceLockMetadata: () => state.lockMetadata,
+  isRecordedProcessIdentityCurrent: () => true,
+}));
+
 vi.mock('node:child_process', () => ({
   execSync: vi.fn((cmd: string) => {
     state.execCalls.push(cmd);
-    if (cmd.startsWith('taskkill ')) return '';
+    if (cmd.startsWith('taskkill ')) {
+      const match = cmd.match(/\/pid\s+(\d+)/i);
+      if (match) state.alivePids.delete(Number(match[1]));
+      return '';
+    }
     if (cmd.includes('schtasks /End')) return '';
     if (cmd.includes('schtasks /Run')) {
       if (!state.scheduledTaskRunOk) throw new Error('run failed');
@@ -59,6 +72,12 @@ vi.mock('node:child_process', () => ({
 
 function reset(): void {
   vi.resetModules();
+  // The production helper honors HOME overrides. Keep this mocked Windows
+  // fixture on the default home so legacy broad-recovery tests exercise the
+  // default branch; scoped behavior is covered separately below.
+  process.env.HOME = 'C:\\Users\\tester';
+  process.env.USERPROFILE = 'C:\\Users\\tester';
+  delete process.env.IMCODES_HOME;
   state.pidContents = [''];
   state.pidIndex = 0;
   state.scheduledTaskRunOk = false;
@@ -69,6 +88,7 @@ function reset(): void {
   state.execCalls = [];
   state.spawnCalls = [];
   state.rmSyncCalls = [];
+  state.lockMetadata = null;
   vi.spyOn(process, 'platform', 'get').mockReturnValue('win32');
   vi.spyOn(process, 'kill').mockImplementation(((pid: number) => {
     if (!state.alivePids.has(pid)) throw new Error('not running');
@@ -82,6 +102,12 @@ describe('restartWindowsDaemon', () => {
   beforeEach(reset);
   afterEach(() => {
     vi.restoreAllMocks();
+    if (originalHome === undefined) delete process.env.HOME;
+    else process.env.HOME = originalHome;
+    if (originalImcodesHome === undefined) delete process.env.IMCODES_HOME;
+    else process.env.IMCODES_HOME = originalImcodesHome;
+    if (originalUserProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = originalUserProfile;
   });
 
   // ── Launcher priority ──
@@ -237,5 +263,82 @@ describe('restartWindowsDaemon', () => {
 
     // No rmSync calls when lock is absent — avoids fs noise on the happy path.
     expect(state.rmSyncCalls).toEqual([]);
+  });
+
+  it('scoped cleanup targets only the current HOME lock owner, never a broad node scan', async () => {
+    process.env.HOME = 'C:\\Users\\scoped-a';
+    const { windowsDaemonLockPipeName } = await import('../../src/util/windows-daemon-lock.js');
+    const pipe = windowsDaemonLockPipeName();
+    state.lockMetadata = {
+      version: 1,
+      pid: 777,
+      startToken: 'windows:777-start',
+      acquiredAt: Date.now(),
+      socketPath: pipe,
+      sessionIds: [],
+      residualResources: [],
+    };
+    state.alivePids = new Set([777]);
+
+    const { killOrphanDaemonProcesses } = await import('../../src/util/windows-daemon.js');
+    expect(killOrphanDaemonProcesses()).toBe(true);
+    expect(state.execCalls).toContain('taskkill /f /pid 777');
+    expect(state.execCalls.some((call) => call.includes('find-orphans.ps1'))).toBe(false);
+  });
+
+  it('default cleanup still kills its own metadata daemon without scanning other homes', async () => {
+    const { WINDOWS_DAEMON_LOCK_PIPE } = await import('../../src/util/windows-daemon-lock.js');
+    state.lockMetadata = {
+      version: 1,
+      pid: 778,
+      startToken: 'windows:778-start',
+      acquiredAt: Date.now(),
+      socketPath: WINDOWS_DAEMON_LOCK_PIPE,
+      sessionIds: [],
+      residualResources: [],
+    };
+    state.alivePids = new Set([778]);
+
+    const { killOrphanDaemonProcesses } = await import('../../src/util/windows-daemon.js');
+    expect(killOrphanDaemonProcesses()).toBe(true);
+    expect(state.execCalls).toContain('taskkill /f /pid 778');
+    expect(state.execCalls.some((call) => call.includes('find-orphans.ps1'))).toBe(false);
+  });
+
+  it('scoped restart refuses a stale/reused daemon.pid before taskkill', async () => {
+    process.env.HOME = 'C:\\Users\\scoped-a';
+    const { windowsDaemonLockPipeName } = await import('../../src/util/windows-daemon-lock.js');
+    state.pidContents = ['999', '1000'];
+    state.alivePids = new Set([999, 1000]);
+    state.vbsExists = true;
+    state.lockMetadata = {
+      version: 1,
+      pid: 777,
+      startToken: 'windows:777-start',
+      acquiredAt: Date.now(),
+      socketPath: windowsDaemonLockPipeName(),
+      sessionIds: [],
+      residualResources: [],
+    };
+
+    const { restartWindowsDaemon } = await import('../../src/util/windows-daemon.js');
+    // The fixture intentionally keeps stale metadata, so no newly acquired
+    // PID can be observed; the important invariant is that PID 999 is not
+    // taskkilled merely because daemon.pid names it.
+    expect(restartWindowsDaemon()).toBe(false);
+    expect(state.execCalls).not.toContain('taskkill /f /pid 999');
+  });
+
+  it('matches only the current scoped watchdog path in an A/B process listing', async () => {
+    const { watchdogCommandLineMatchesHome } = await import('../../src/util/windows-daemon.js');
+    // Prefix-related homes are the important counterexample: a bare HOME
+    // substring would make C:\\Temp\\lock match C:\\Temp\\lock2.
+    const homeA = 'C:\\Temp\\lock\\.imcodes';
+    const homeB = 'C:\\Temp\\lock2\\.imcodes';
+    const watchdogA = `cmd.exe /c "${homeA}\\daemon-watchdog.cmd"`;
+    const watchdogB = `cmd.exe /c "${homeB}\\daemon-watchdog.cmd"`;
+    expect(watchdogCommandLineMatchesHome(watchdogA, homeA)).toBe(true);
+    expect(watchdogCommandLineMatchesHome(watchdogB, homeA)).toBe(false);
+    expect(watchdogCommandLineMatchesHome(watchdogB, homeB)).toBe(true);
   });
 });

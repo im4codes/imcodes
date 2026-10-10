@@ -6,16 +6,18 @@ import {
   randomBytes,
   timingSafeEqual,
 } from 'node:crypto';
-import { open, lstat, realpath, rename, unlink, type FileHandle } from 'node:fs/promises';
+import { mkdir, open, lstat, readFile, realpath, rename, stat, unlink, writeFile, type FileHandle } from 'node:fs/promises';
+import type { Stats } from 'node:fs';
 import { networkInterfaces } from 'node:os';
 import { createServer, connect, isIP, type Server, type Socket } from 'node:net';
-import { basename, resolve } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 import {
   MACHINE_DIRECT_FILE_TRANSFER_ERROR,
   MACHINE_DIRECT_FILE_TRANSFER_LIMITS,
   MACHINE_DIRECT_FILE_TRANSFER_MSG,
   MACHINE_DIRECT_FRAME_TYPE,
   MACHINE_DIRECT_HANDSHAKE_MSG,
+  MACHINE_DIRECT_RESUME_FILE_PREFIX,
   isRoutableMachineDirectAddress,
   isValidMachineDirectEncryptedFrameLength,
   validateMachineDirectSourceHello,
@@ -28,6 +30,10 @@ import {
   type MachineDirectUploadRequest,
   type MachineDirectUploadResponse,
 } from '../../shared/machine-direct-file-transfer.js';
+import {
+  validateFileTransferSourceIdentity,
+  type FileTransferSourceIdentity,
+} from '../../shared/transport/file-transfer.js';
 import { isFilePreviewPathAllowed } from './file-preview-path-policy.js';
 import {
   createDirectUploadFilename,
@@ -38,6 +44,7 @@ import {
   resolveUploadPath,
   tryClaimClientUpload,
 } from './file-transfer-handler.js';
+import { imcodesStateDir } from '../util/imcodes-state-dir.js';
 
 class MachineDirectProtocolError extends Error {}
 
@@ -131,11 +138,15 @@ export function createMachineDirectProof(
   requestId: string,
   targetNonce: string,
   sourceNonce?: string,
+  resumeOffset = 0,
 ): string {
   const secret = capabilityBytes(capability);
-  const proofInput = role === 'target'
+  const base = role === 'target'
     ? `target:${requestId}:${targetNonce}`
     : `source:${requestId}:${targetNonce}:${sourceNonce ?? ''}`;
+  // Keep offset zero wire-compatible with v1 peers. A non-zero resume
+  // boundary is authority-bearing and therefore part of both proofs.
+  const proofInput = resumeOffset > 0 ? `${base}:resume:${resumeOffset}` : base;
   return hmac(secret, proofInput);
 }
 
@@ -245,9 +256,85 @@ interface MachineDirectCryptoContext {
   capability: string;
 }
 
+type MachineDirectSourceIdentity = FileTransferSourceIdentity;
+
+const MACHINE_FETCH_RESUME_IDENTITY_SUFFIX = '.identity.json';
+
+function machineFileSourceIdentityEquals(
+  left: FileTransferSourceIdentity | null | undefined,
+  right: FileTransferSourceIdentity | null | undefined,
+): boolean {
+  return Boolean(left && right
+    && left.size === right.size
+    && left.mtimeMs === right.mtimeMs
+    && left.device === right.device
+    && left.inode === right.inode);
+}
+
+export function machineFetchResumeIdentityPath(tempPath: string): string {
+  return `${tempPath}${MACHINE_FETCH_RESUME_IDENTITY_SUFFIX}`;
+}
+
+export async function readMachineFetchResumeIdentity(tempPath: string): Promise<FileTransferSourceIdentity | null> {
+  const raw = await readFile(machineFetchResumeIdentityPath(tempPath), 'utf8').catch(() => null);
+  if (!raw) return null;
+  try {
+    return validateFileTransferSourceIdentity(JSON.parse(raw) as unknown);
+  } catch {
+    return null;
+  }
+}
+
+async function writeMachineFetchResumeIdentity(
+  tempPath: string,
+  identity: FileTransferSourceIdentity,
+): Promise<void> {
+  const identityPath = machineFetchResumeIdentityPath(tempPath);
+  const stagingPath = `${identityPath}.${randomBytes(8).toString('hex')}.tmp`;
+  try {
+    await writeFile(stagingPath, JSON.stringify(identity), { flag: 'wx', mode: 0o600 });
+    await rename(stagingPath, identityPath);
+  } finally {
+    await unlink(stagingPath).catch(() => {});
+  }
+}
+
+export async function removeMachineFetchResumeIdentity(tempPath: string): Promise<void> {
+  await unlink(machineFetchResumeIdentityPath(tempPath)).catch(() => {});
+}
+
+export async function discardMachineFetchResume(tempPath: string): Promise<void> {
+  await Promise.all([
+    unlink(tempPath).catch(() => {}),
+    removeMachineFetchResumeIdentity(tempPath),
+  ]);
+}
+
+export async function bindMachineFetchResumeIdentity(
+  tempPath: string,
+  identity: FileTransferSourceIdentity,
+): Promise<void> {
+  const existing = await readMachineFetchResumeIdentity(tempPath);
+  if (machineFileSourceIdentityEquals(existing, identity)) return;
+  await removeMachineFetchResumeIdentity(tempPath);
+  await writeMachineFetchResumeIdentity(tempPath, identity);
+}
+
+function machineDirectSourceIdentityMatches(
+  actual: Stats,
+  expected: MachineDirectSourceIdentity,
+): boolean {
+  return actual.isFile()
+    && actual.size === expected.size
+    && actual.mtimeMs === expected.mtimeMs
+    && actual.dev === expected.device
+    && actual.ino === expected.inode;
+}
+
 interface AuthenticatedMachineDirectSocket {
   reader: SocketReader;
   key: Buffer;
+  resumeOffset: number;
 }
 
 async function authenticateMachineDirectSource(
@@ -261,10 +348,11 @@ async function authenticateMachineDirectSource(
     'handshake_timeout',
   ));
   const validatedTargetHello = validateMachineDirectTargetHello(targetHello);
+  const resumeOffset = validatedTargetHello?.resumeOffset ?? 0;
   if (!validatedTargetHello
     || validatedTargetHello.requestId !== request.requestId
     || !proofMatches(
-      createMachineDirectProof(request.capability, 'target', request.requestId, validatedTargetHello.nonce),
+      createMachineDirectProof(request.capability, 'target', request.requestId, validatedTargetHello.nonce, undefined, resumeOffset),
       validatedTargetHello.proof,
     )) {
     throw new MachineDirectProtocolError('auth_failed');
@@ -274,17 +362,19 @@ async function authenticateMachineDirectSource(
     type: MACHINE_DIRECT_HANDSHAKE_MSG.SOURCE_HELLO,
     requestId: request.requestId,
     nonce: sourceNonce,
-    proof: createMachineDirectProof(request.capability, 'source', request.requestId, validatedTargetHello.nonce, sourceNonce),
+    proof: createMachineDirectProof(request.capability, 'source', request.requestId, validatedTargetHello.nonce, sourceNonce, resumeOffset),
   })}\n`);
   return {
     reader,
     key: deriveMachineDirectTransferKey(request.capability, validatedTargetHello.nonce, sourceNonce, request.requestId),
+    resumeOffset,
   };
 }
 
 async function authenticateMachineDirectTarget(
   socket: Socket,
   request: MachineDirectCryptoContext,
+  resumeOffset = 0,
 ): Promise<AuthenticatedMachineDirectSocket> {
   const reader = new SocketReader(socket);
   const targetNonce = randomBytes(MACHINE_DIRECT_FILE_TRANSFER_LIMITS.NONCE_BYTES).toString('base64url');
@@ -292,7 +382,8 @@ async function authenticateMachineDirectTarget(
     type: MACHINE_DIRECT_HANDSHAKE_MSG.TARGET_HELLO,
     requestId: request.requestId,
     nonce: targetNonce,
-    proof: createMachineDirectProof(request.capability, 'target', request.requestId, targetNonce),
+    proof: createMachineDirectProof(request.capability, 'target', request.requestId, targetNonce, undefined, resumeOffset),
+    ...(resumeOffset > 0 ? { resumeOffset } : {}),
   })}\n`);
   const sourceHello = parseJsonLine(await withTimeout(
     reader.readLine(MACHINE_DIRECT_FILE_TRANSFER_LIMITS.HANDSHAKE_LINE_MAX_BYTES),
@@ -303,7 +394,7 @@ async function authenticateMachineDirectTarget(
   if (!validatedSourceHello
     || validatedSourceHello.requestId !== request.requestId
     || !proofMatches(
-      createMachineDirectProof(request.capability, 'source', request.requestId, targetNonce, validatedSourceHello.nonce),
+      createMachineDirectProof(request.capability, 'source', request.requestId, targetNonce, validatedSourceHello.nonce, resumeOffset),
       validatedSourceHello.proof,
     )) {
     throw new MachineDirectProtocolError('auth_failed');
@@ -311,6 +402,7 @@ async function authenticateMachineDirectTarget(
   return {
     reader,
     key: deriveMachineDirectTransferKey(request.capability, targetNonce, validatedSourceHello.nonce, request.requestId),
+    resumeOffset,
   };
 }
 
@@ -319,17 +411,23 @@ async function readEncryptedMachineDirectFrame(
   requestId: string,
   counter: bigint,
   timeoutMs: number,
+  stallTimeoutMs: number = MACHINE_DIRECT_FILE_TRANSFER_LIMITS.STALL_TIMEOUT_MS,
 ): Promise<Buffer> {
+  // `timeoutMs` is the overall transfer budget used by the caller.  Bound
+  // each individual frame read separately so a dead/stalled peer fails over
+  // promptly, while a healthy transfer that keeps making progress may run for
+  // the full overall budget.
+  const frameTimeoutMs = Math.min(timeoutMs, stallTimeoutMs);
   const lengthHeader = await withTimeout(
     authenticated.reader.readExact(MACHINE_DIRECT_FILE_TRANSFER_LIMITS.FRAME_LENGTH_HEADER_BYTES),
-    timeoutMs,
+    frameTimeoutMs,
     'transfer_timeout',
   );
   const length = lengthHeader.readUInt32BE(0);
   if (!isValidMachineDirectEncryptedFrameLength(length)) {
     throw new MachineDirectProtocolError('invalid_frame_length');
   }
-  const encrypted = await withTimeout(authenticated.reader.readExact(length), timeoutMs, 'transfer_timeout');
+  const encrypted = await withTimeout(authenticated.reader.readExact(length), frameTimeoutMs, 'transfer_timeout');
   return decryptMachineDirectFrame(authenticated.key, requestId, counter, encrypted);
 }
 
@@ -358,24 +456,38 @@ async function sendEncryptedFile(
   socket: Socket,
   sourceFile: string | FileHandle,
   request: MachineDirectCryptoContext,
+  totalSize: number,
   start?: MachineDirectFetchStart,
+  expectedSourceIdentity?: MachineDirectSourceIdentity,
+  onProgress?: () => void,
 ): Promise<number> {
-  const { key } = await authenticateMachineDirectSource(socket, request);
+  const { key, resumeOffset } = await authenticateMachineDirectSource(socket, request);
+  onProgress?.();
+  if (!Number.isSafeInteger(resumeOffset) || resumeOffset < 0 || resumeOffset > totalSize) {
+    throw new MachineDirectProtocolError('size_mismatch');
+  }
   let counter = 0n;
-  let total = 0;
+  let total = resumeOffset;
   const source = typeof sourceFile === 'string' ? await open(sourceFile, 'r') : sourceFile;
   try {
+    const sourceStat = await source.stat();
+    if (!sourceStat.isFile() || sourceStat.size !== totalSize) throw new MachineDirectProtocolError('source_changed');
+    if (expectedSourceIdentity && !machineDirectSourceIdentityMatches(sourceStat, expectedSourceIdentity)) {
+      throw new MachineDirectProtocolError('source_changed');
+    }
     if (start) {
       await writeSocket(socket, encryptMachineDirectFrame(
         key,
         request.requestId,
         counter++,
-        encodeMachineDirectFetchStart(start),
+        encodeMachineDirectFetchStart({ ...start, ...(resumeOffset > 0 ? { resumeOffset } : {}) }),
       ));
+      onProgress?.();
     }
     for await (const chunk of source.createReadStream({
       autoClose: false,
       highWaterMark: MACHINE_DIRECT_FILE_TRANSFER_LIMITS.MAX_FRAME_PLAINTEXT_BYTES - 1,
+      start: resumeOffset,
     })) {
       const bytes = Buffer.from(chunk);
       total += bytes.length;
@@ -385,6 +497,15 @@ async function sendEncryptedFile(
         counter++,
         Buffer.concat([Buffer.from([MACHINE_DIRECT_FRAME_TYPE.DATA]), bytes]),
       ));
+      onProgress?.();
+    }
+    const completedStat = await source.stat();
+    if ((expectedSourceIdentity && !machineDirectSourceIdentityMatches(completedStat, expectedSourceIdentity))
+      || completedStat.size !== sourceStat.size
+      || completedStat.mtimeMs !== sourceStat.mtimeMs
+      || completedStat.dev !== sourceStat.dev
+      || completedStat.ino !== sourceStat.ino) {
+      throw new MachineDirectProtocolError('source_changed');
     }
   } finally {
     await source.close().catch(() => {});
@@ -400,18 +521,22 @@ async function sendEncryptedFile(
 export interface MachineDirectSender {
   candidates: MachineDirectCandidate[];
   completion: Promise<void>;
+  onProgress?(listener: () => void): () => void;
   close(): void;
 }
 
 export async function startMachineDirectSender(options: {
   sourcePath: string;
   request: Omit<MachineDirectUploadRequest, 'candidates'>;
+  expectedSourceIdentity?: MachineDirectSourceIdentity;
 }): Promise<MachineDirectSender | null> {
   let activeConnections = 0;
   let settled = false;
   let resolveCompletion!: () => void;
   let rejectCompletion!: (error: Error) => void;
   const completion = new Promise<void>((resolve, reject) => { resolveCompletion = resolve; rejectCompletion = reject; });
+  const progressListeners = new Set<() => void>();
+  const emitProgress = () => { for (const listener of progressListeners) listener(); };
   const sockets = new Set<Socket>();
   let candidates: MachineDirectCandidate[] = [];
   const server = createServer((socket) => {
@@ -422,7 +547,15 @@ export async function startMachineDirectSender(options: {
     activeConnections += 1;
     sockets.add(socket);
     const request: MachineDirectUploadRequest = { ...options.request, candidates };
-    void sendEncryptedFile(socket, options.sourcePath, request).then(() => {
+    void sendEncryptedFile(
+      socket,
+      options.sourcePath,
+      request,
+      request.size,
+      undefined,
+      options.expectedSourceIdentity,
+      emitProgress,
+    ).then(() => {
       if (settled) return;
       settled = true;
       server.close();
@@ -453,6 +586,10 @@ export async function startMachineDirectSender(options: {
   return {
     candidates,
     completion,
+    onProgress(listener) {
+      progressListeners.add(listener);
+      return () => progressListeners.delete(listener);
+    },
     close() {
       if (!settled) {
         settled = true;
@@ -523,7 +660,16 @@ async function openValidatedMachineDirectSource(sourcePath: string): Promise<{
     }
     return {
       handle,
-      start: { size: opened.size, originalName: basename(canonical) },
+      start: {
+        size: opened.size,
+        originalName: basename(canonical),
+        sourceIdentity: {
+          size: opened.size,
+          mtimeMs: opened.mtimeMs,
+          device: opened.dev,
+          inode: opened.ino,
+        },
+      },
     };
   } catch (error) {
     await handle.close().catch(() => {});
@@ -547,7 +693,7 @@ export async function sendMachineDirectFetch(request: MachineDirectFetchRequest)
   try {
     source = await openValidatedMachineDirectSource(request.sourcePath);
     socket = await connectAny(request.candidates);
-    const total = await sendEncryptedFile(socket, source.handle, request, source.start);
+    const total = await sendEncryptedFile(socket, source.handle, request, source.start.size, source.start);
     if (total !== source.start.size) throw new MachineDirectProtocolError('size_mismatch');
     return { type: MACHINE_DIRECT_FILE_TRANSFER_MSG.FETCH_DONE, requestId: request.requestId, size: total };
   } catch (error) {
@@ -577,6 +723,8 @@ export async function startMachineDirectFetchReceiver(options: {
   tempPath: string;
   request: Omit<MachineDirectFetchRequest, 'candidates' | 'sourcePath'>;
   transferTimeoutMs?: number;
+  stallTimeoutMs?: number;
+  onProgress?: () => void;
 }): Promise<MachineDirectFetchReceiver | null> {
   let activeConnections = 0;
   let settled = false;
@@ -599,9 +747,24 @@ export async function startMachineDirectFetchReceiver(options: {
       let file: FileHandle | undefined;
       let tempCreated = false;
       let succeeded = false;
+      let preservePartial = false;
       try {
-        const channel = await authenticateMachineDirectTarget(socket, options.request);
+        let existing = await stat(options.tempPath).catch(() => null);
+        if (existing && !existing.isFile()) throw new MachineDirectProtocolError('invalid_partial');
+        let storedIdentity = existing ? await readMachineFetchResumeIdentity(options.tempPath) : null;
+        // A partial without an exact durable source identity can never be
+        // authenticated as a prefix of the next source version.
+        if (existing && !storedIdentity) {
+          await discardMachineFetchResume(options.tempPath);
+          existing = null;
+        } else if (!existing) {
+          await removeMachineFetchResumeIdentity(options.tempPath);
+          storedIdentity = null;
+        }
+        const resumeOffset = existing?.size ?? 0;
+        const channel = await authenticateMachineDirectTarget(socket, options.request, resumeOffset);
         authenticated = true;
+        options.onProgress?.();
         let counter = 0n;
         const timeoutMs = options.transferTimeoutMs ?? MACHINE_DIRECT_FILE_TRANSFER_LIMITS.TRANSFER_TIMEOUT_MS;
         const start = decodeMachineDirectFetchStart(await readEncryptedMachineDirectFrame(
@@ -609,16 +772,31 @@ export async function startMachineDirectFetchReceiver(options: {
           options.request.requestId,
           counter++,
           timeoutMs,
+          options.stallTimeoutMs,
         ));
-        file = await open(options.tempPath, 'wx', 0o600);
+        if (!start.sourceIdentity) {
+          throw new MachineDirectProtocolError('source_identity_missing');
+        }
+        if ((start.resumeOffset ?? 0) !== resumeOffset || resumeOffset > start.size) {
+          throw new MachineDirectProtocolError('size_mismatch');
+        }
+        if (resumeOffset > 0 && !machineFileSourceIdentityEquals(storedIdentity, start.sourceIdentity)) {
+          await discardMachineFetchResume(options.tempPath);
+          throw new MachineDirectProtocolError('source_identity_mismatch');
+        }
+        if (resumeOffset === 0) {
+          await bindMachineFetchResumeIdentity(options.tempPath, start.sourceIdentity);
+        }
+        file = await open(options.tempPath, existing ? 'r+' : 'wx', 0o600);
         tempCreated = true;
-        let loaded = 0;
+        let loaded = resumeOffset;
         for (;;) {
           const plaintext = await readEncryptedMachineDirectFrame(
             channel,
             options.request.requestId,
             counter++,
             timeoutMs,
+            options.stallTimeoutMs,
           );
           if (plaintext[0] === MACHINE_DIRECT_FRAME_TYPE.DATA) {
             loaded += plaintext.length - 1;
@@ -626,10 +804,11 @@ export async function startMachineDirectFetchReceiver(options: {
             const data = plaintext.subarray(1);
             let offset = 0;
             while (offset < data.length) {
-              const { bytesWritten } = await file.write(data, offset, data.length - offset);
+              const { bytesWritten } = await file.write(data, offset, data.length - offset, loaded - data.length + offset);
               if (bytesWritten <= 0) throw new MachineDirectProtocolError('write_failed');
               offset += bytesWritten;
             }
+            options.onProgress?.();
             continue;
           }
           if (plaintext[0] !== MACHINE_DIRECT_FRAME_TYPE.FINISH
@@ -652,11 +831,17 @@ export async function startMachineDirectFetchReceiver(options: {
           return;
         }
       } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        preservePartial = authenticated
+          && !message.includes('auth')
+          && !message.includes('size')
+          && !message.includes('identity')
+          && !message.includes('invalid_');
         if (authenticated && !settled) {
           await file?.close().catch(() => {});
           file = undefined;
-          if (tempCreated) {
-            await unlink(options.tempPath).catch(() => {});
+          if (tempCreated && !preservePartial) {
+            await discardMachineFetchResume(options.tempPath);
             tempCreated = false;
           }
           settled = true;
@@ -669,7 +854,7 @@ export async function startMachineDirectFetchReceiver(options: {
         activeConnections = Math.max(0, activeConnections - 1);
         socket.destroy();
         await file?.close().catch(() => {});
-        if (tempCreated && !succeeded) await unlink(options.tempPath).catch(() => {});
+        if (tempCreated && !succeeded && !preservePartial) await discardMachineFetchResume(options.tempPath);
       }
     })();
   });
@@ -704,7 +889,7 @@ export async function startMachineDirectFetchReceiver(options: {
 
 export async function receiveMachineDirectUpload(
   request: MachineDirectUploadRequest,
-  options: { transferTimeoutMs?: number } = {},
+  options: { transferTimeoutMs?: number; stallTimeoutMs?: number } = {},
 ): Promise<MachineDirectUploadResponse> {
   const existing = lookupAttachmentByClientUploadId(request.clientUploadId);
   if (existing) return { type: MACHINE_DIRECT_FILE_TRANSFER_MSG.DONE, requestId: request.requestId, attachment: existing };
@@ -726,27 +911,76 @@ export async function receiveMachineDirectUpload(
   let socket: Socket | undefined;
   let file: Awaited<ReturnType<typeof open>> | undefined;
   let temp = '';
+  let resumeMetaPath = '';
   let promoted = '';
+  let discardPartial = false;
   try {
     await initFileTransfer();
+    const resumeBase = `${MACHINE_DIRECT_RESUME_FILE_PREFIX}${request.clientUploadId}`;
+    temp = join(imcodesStateDir(), 'uploads', `${resumeBase}.part`);
+    resumeMetaPath = join(imcodesStateDir(), 'uploads', `${resumeBase}.json`);
+    type ResumeMeta = {
+      version: 1;
+      filename: string;
+      originalName: string;
+      mime?: string;
+      size: number;
+    };
+    let resumeMeta: ResumeMeta | null = null;
+    try { resumeMeta = JSON.parse(await readFile(resumeMetaPath, 'utf8')) as ResumeMeta; } catch { /* first attempt */ }
+    if (!resumeMeta) {
+      resumeMeta = {
+        version: 1,
+        filename: createDirectUploadFilename(request.originalName),
+        originalName: request.originalName,
+        ...(request.mime ? { mime: request.mime } : {}),
+        size: request.size,
+      };
+      await writeFile(temp, new Uint8Array(0), { flag: 'wx', mode: 0o600 }).catch(async (error) => {
+        const existing = await stat(temp).catch(() => null);
+        if (!existing?.isFile()) throw error;
+      });
+      await writeFile(resumeMetaPath, JSON.stringify(resumeMeta), { flag: 'wx', mode: 0o600 }).catch(async (error) => {
+        const existing = await readFile(resumeMetaPath, 'utf8').catch(() => null);
+        if (!existing) throw error;
+        resumeMeta = JSON.parse(existing) as ResumeMeta;
+      });
+    }
+    if (resumeMeta.version !== 1
+      || resumeMeta.originalName !== request.originalName
+      || (resumeMeta.mime ?? '') !== (request.mime ?? '')
+      || resumeMeta.size !== request.size) {
+      throw new MachineDirectProtocolError('upload_identity_mismatch');
+    }
+    const partial = await stat(temp);
+    if (!partial.isFile() || partial.size > request.size) {
+      discardPartial = true;
+      throw new MachineDirectProtocolError('size_mismatch');
+    }
     socket = await connectAny(request.candidates);
-    const channel = await authenticateMachineDirectTarget(socket, request);
-    const filename = createDirectUploadFilename(request.originalName);
-    const resolved = resolveUploadPath(filename);
-    temp = `${resolved}.machine-${randomBytes(12).toString('hex')}.part`;
-    file = await open(temp, 'wx', 0o600);
+    const channel = await authenticateMachineDirectTarget(socket, request, partial.size);
+    const filename = resumeMeta.filename;
+    const resolved = resolveUploadPath(filename, resumeMeta.originalName);
+    await mkdir(dirname(resolved), { recursive: true });
+    file = await open(temp, 'r+', 0o600);
     let counter = 0n;
-    let loaded = 0;
+    let loaded = partial.size;
     for (;;) {
       const transferTimeoutMs = options.transferTimeoutMs ?? MACHINE_DIRECT_FILE_TRANSFER_LIMITS.TRANSFER_TIMEOUT_MS;
-      const plaintext = await readEncryptedMachineDirectFrame(channel, request.requestId, counter++, transferTimeoutMs);
+      const plaintext = await readEncryptedMachineDirectFrame(
+        channel,
+        request.requestId,
+        counter++,
+        transferTimeoutMs,
+        options.stallTimeoutMs,
+      );
       if (plaintext[0] === MACHINE_DIRECT_FRAME_TYPE.DATA) {
         loaded += plaintext.length - 1;
         if (loaded > request.size) throw new MachineDirectProtocolError('size_mismatch');
         const data = plaintext.subarray(1);
         let offset = 0;
         while (offset < data.length) {
-          const { bytesWritten } = await file.write(data, offset, data.length - offset);
+          const { bytesWritten } = await file.write(data, offset, data.length - offset, loaded - data.length + offset);
           if (bytesWritten <= 0) throw new MachineDirectProtocolError('write_failed');
           offset += bytesWritten;
         }
@@ -765,6 +999,8 @@ export async function receiveMachineDirectUpload(
       file = undefined;
       await rename(temp, resolved);
       temp = '';
+      await unlink(resumeMetaPath).catch(() => {});
+      resumeMetaPath = '';
       promoted = resolved;
       const attachment = await finalizeDirectUploadedFile({
         clientUploadId: request.clientUploadId,
@@ -779,6 +1015,11 @@ export async function receiveMachineDirectUpload(
     }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
+    if (message.includes('size_mismatch')) discardPartial = true;
+    if (!discardPartial && temp) {
+      const partialSize = await stat(temp).then((entry) => entry.size).catch(() => 0);
+      if (partialSize === 0) discardPartial = true;
+    }
     const directError: MachineDirectUploadResponse = {
       type: MACHINE_DIRECT_FILE_TRANSFER_MSG.ERROR,
       requestId: request.requestId,
@@ -792,7 +1033,8 @@ export async function receiveMachineDirectUpload(
   } finally {
     socket?.destroy();
     await file?.close().catch(() => {});
-    if (temp) await unlink(temp).catch(() => {});
+    if (temp && discardPartial) await unlink(temp).catch(() => {});
+    if (resumeMetaPath && discardPartial) await unlink(resumeMetaPath).catch(() => {});
     if (promoted) {
       await unlink(promoted).catch(() => {});
       await unlink(`${promoted}.meta.json`).catch(() => {});

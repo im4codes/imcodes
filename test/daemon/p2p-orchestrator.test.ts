@@ -1581,6 +1581,17 @@ describe('P2P orchestrator — parallel rounds', () => {
       setTimeout(() => notifySessionIdle(session), 20);
     });
 
+    // A too-tight hopTimeoutMs doesn't just fail deck_proj_w2's hop fast (the
+    // intent here) -- it also caps deck_proj_w1's post-summary execution
+    // confirmation gate at hopTimeoutMs * 3 (see runPostSummaryExecutionConfirmationGate
+    // in src/daemon/p2p-orchestrator.ts). At 120ms that gate's 360ms deadline
+    // is well inside normal scheduling/polling overhead on a loaded CI runner
+    // (observed up to ~0.5s, see the sibling "does not double the configured
+    // timeout" fix), so deck_proj_w1's own successful hop can spuriously time
+    // out the whole run before it ever reaches 'completed'. This test asserts
+    // only final outcome, not wall-clock, so there's no reason to keep it
+    // tight -- match the sibling test's contention-tolerant value.
+    const hopTimeoutMs = 2000;
     const run = await startP2pRun(
       'deck_proj_brain',
       [
@@ -1593,10 +1604,10 @@ describe('P2P orchestrator — parallel rounds', () => {
       1,
       undefined,
       undefined,
-      120,
+      hopTimeoutMs,
     );
 
-    const done = await waitForStatus(run.id, ['completed']);
+    const done = await waitForStatus(run.id, ['completed'], 15000);
     const content = await readFile(done.contextFilePath, 'utf8');
     expect(content).toContain('SUCCESS-deck_proj_w1');
     expect(content).not.toContain('SUCCESS-deck_proj_w2');

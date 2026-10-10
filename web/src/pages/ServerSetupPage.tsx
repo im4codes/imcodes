@@ -3,7 +3,7 @@ import { useTranslation } from 'react-i18next';
 import { DEFAULT_SERVER_URL, isNative, isValidServerUrl, setServerUrl, getServerList, addServerToList, removeServerFromList } from '../native.js';
 
 interface Props {
-  onConnect: (serverUrl: string) => void;
+  onConnect: (serverUrl: string) => void | Promise<void>;
 }
 
 export function ServerSetupPage({ onConnect }: Props) {
@@ -35,7 +35,7 @@ export function ServerSetupPage({ onConnect }: Props) {
       }
       await addServerToList(url);
       await setServerUrl(url);
-      onConnect(url);
+      await onConnect(url);
     } catch {
       setError(t('serverSetup.error'));
     } finally {

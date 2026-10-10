@@ -21,8 +21,16 @@
  */
 
 import { mergeTransportConfigPreservingSupervision } from '@shared/supervision-config.js';
+import { AGY_SDK_PROVIDER_ID } from '@shared/agy-agent.js';
 import type { SessionInfo } from './types.js';
 import { resolveRuntimeType } from './runtime-type.js';
+import { parseSupervisionHeartbeatSnapshot } from '@shared/supervision-heartbeat.js';
+import {
+  canReplaceActivityGeneration,
+  isOlderActivityGeneration,
+  isOrderedActivityGeneration,
+  type ActivityGenerationLike,
+} from '@shared/session-activity-types.js';
 import {
   buildTransportPendingSyncPatch,
   hasTransportPendingSyncSnapshot,
@@ -37,6 +45,7 @@ export interface IncomingSessionListEntry {
   name: string;
   sessionInstanceId?: string;
   runtimeEpoch?: string;
+  activityGeneration?: ActivityGenerationLike;
   project: string;
   role: string;
   agentType: string;
@@ -62,11 +71,16 @@ export interface IncomingSessionListEntry {
   quotaLabel?: string | null;
   quotaUsageLabel?: string | null;
   quotaMeta?: SessionInfo['quotaMeta'];
+  codexCreditsBalance?: SessionInfo['codexCreditsBalance'];
+  codexCreditsHasCredits?: SessionInfo['codexCreditsHasCredits'];
+  codexCreditsUnlimited?: SessionInfo['codexCreditsUnlimited'];
   effort?: SessionInfo['effort'];
   serviceTier?: SessionInfo['serviceTier'];
   contextNamespace?: SessionInfo['contextNamespace'];
   contextNamespaceDiagnostics?: string[];
   transportConfig?: Record<string, unknown> | null;
+  supervisionMode?: SessionInfo['supervisionMode'];
+  supervisionHeartbeat?: unknown;
   transportPendingMessages?: unknown;
   transportPendingMessageEntries?: unknown;
   pendingMessageEntries?: unknown;
@@ -98,6 +112,19 @@ export function parseMainSessionName(sessionName: string): { project: string; ro
   };
 }
 
+/**
+ * Resolves a shared-entry session's project identifier. The server's `title`
+ * field is a display label (the session's own label, or its project name if
+ * unlabeled) — it must never be trusted as the project identifier, since a
+ * labeled session's title is the label, not the project. The session name
+ * always encodes the real project per the `deck_{project}_{role}` convention,
+ * so that parse is authoritative; `title` is only a last-resort fallback for
+ * a name that doesn't match the convention.
+ */
+export function resolveSharedSessionProject(sessionName: string, title: string): string {
+  return parseMainSessionName(sessionName)?.project || title || sessionName;
+}
+
 export function isWorkerSessionName(sessionName: string): boolean {
   const parsed = parseMainSessionName(sessionName);
   return Boolean(parsed && parsed.role !== 'brain');
@@ -113,13 +140,29 @@ export function mergeSessionListEntry(
   incoming: IncomingSessionListEntry,
   existing: SessionInfo | undefined,
 ): SessionInfo {
+  const isOlderGeneration = Boolean(
+    existing
+    && isOlderActivityGeneration(incoming.activityGeneration, existing.activityGeneration),
+  );
+  const incomingGenerationIsOrdered = isOrderedActivityGeneration(incoming.activityGeneration);
+  const currentGenerationIsOrdered = isOrderedActivityGeneration(existing?.activityGeneration);
+  const canReplaceCurrentGeneration = incoming.activityGeneration !== undefined
+    && canReplaceActivityGeneration(incoming.activityGeneration, existing?.activityGeneration);
+  const nextState = isOlderGeneration ? existing!.state : incoming.state as SessionInfo['state'];
+  const nextActivityGeneration = currentGenerationIsOrdered && !canReplaceCurrentGeneration
+    ? existing!.activityGeneration
+    : incomingGenerationIsOrdered
+      ? incoming.activityGeneration
+      : incoming.activityGeneration === undefined
+        ? existing?.activityGeneration
+        : undefined;
   const isCodexFamily = incoming.agentType === 'codex' || incoming.agentType === 'codex-sdk';
-  // Codex AND claude-code-sdk surface provider quota that the daemon may omit on
+  // Codex AND claude-code-sdk AND agy-sdk surface provider quota that the daemon may omit on
   // a given session_list pass (idle / 30-min throttle / a transient B failure);
   // preserve the last known value so the footer doesn't flicker blank between
   // updates instead of dropping it to undefined.
-  const preservesProviderQuota = isCodexFamily || incoming.agentType === 'claude-code-sdk';
-  const pendingSyncPatch = hasTransportPendingSyncSnapshot(incoming as unknown as Record<string, unknown>)
+  const preservesProviderQuota = isCodexFamily || incoming.agentType === 'claude-code-sdk' || incoming.agentType === AGY_SDK_PROVIDER_ID;
+  const pendingSyncPatch = !isOlderGeneration && hasTransportPendingSyncSnapshot(incoming as unknown as Record<string, unknown>)
     ? buildTransportPendingSyncPatch({
       transportPendingMessages: existing?.transportPendingMessages,
       transportPendingMessageEntries: existing?.transportPendingMessageEntries,
@@ -127,6 +170,7 @@ export function mergeSessionListEntry(
       queueEpoch: existing?.queueEpoch,
       queueAuthorityId: existing?.queueAuthorityId,
       failedMessageEntries: existing?.failedMessageEntries,
+      transportPendingSettledMessageIds: existing?.transportPendingSettledMessageIds,
     }, incoming as unknown as Record<string, unknown>, incoming.name)
     : {};
   const hasPendingSyncPatch = Object.keys(pendingSyncPatch).length > 0;
@@ -149,9 +193,20 @@ export function mergeSessionListEntry(
     agentType: incoming.agentType,
     providerId: incoming.providerId ?? existing?.providerId,
     agentVersion: incoming.agentVersion,
-    state: incoming.state as SessionInfo['state'],
-    error: incoming.state === 'error'
-      ? (incoming.error ?? existing?.error ?? null)
+    state: nextState,
+    ...(nextActivityGeneration !== undefined ? { activityGeneration: nextActivityGeneration } : {}),
+    // Keep the local idle proof across the authoritative session-list refresh
+    // triggered by a stale-turn acknowledgement.  The daemon snapshot carries
+    // the canonical state but not the browser observation timestamp; dropping
+    // this marker here would immediately resurrect a stale timeline turn in
+    // the composer after the refresh.
+    authoritativeIdleAt: nextState === 'idle'
+      ? existing?.authoritativeIdleAt
+      : undefined,
+    error: nextState === 'error'
+      ? (isOlderGeneration
+        ? (existing?.error ?? null)
+        : (incoming.error ?? existing?.error ?? null))
       : null,
     projectDir: incoming.projectDir ?? existing?.projectDir,
     runtimeType: resolveRuntimeType({
@@ -174,6 +229,9 @@ export function mergeSessionListEntry(
     quotaLabel: incoming.quotaLabel ?? (preservesProviderQuota ? existing?.quotaLabel : undefined),
     quotaUsageLabel: incoming.quotaUsageLabel ?? (preservesProviderQuota ? existing?.quotaUsageLabel : undefined),
     quotaMeta: incoming.quotaMeta ?? (preservesProviderQuota ? existing?.quotaMeta : undefined),
+    codexCreditsBalance: incoming.codexCreditsBalance ?? (preservesProviderQuota ? existing?.codexCreditsBalance : undefined),
+    codexCreditsHasCredits: incoming.codexCreditsHasCredits ?? (preservesProviderQuota ? existing?.codexCreditsHasCredits : undefined),
+    codexCreditsUnlimited: incoming.codexCreditsUnlimited ?? (preservesProviderQuota ? existing?.codexCreditsUnlimited : undefined),
     effort: incoming.effort ?? existing?.effort,
     serviceTier: incoming.serviceTier ?? existing?.serviceTier,
     contextNamespace: incoming.contextNamespace ?? existing?.contextNamespace,
@@ -182,11 +240,20 @@ export function mergeSessionListEntry(
       incoming.transportConfig,
       existing?.transportConfig,
     ),
+    supervisionHeartbeat: incoming.supervisionHeartbeat === undefined
+      ? existing?.supervisionHeartbeat
+      : parseSupervisionHeartbeatSnapshot(incoming.supervisionHeartbeat),
+    supervisionMode: incoming.supervisionMode !== undefined
+      ? incoming.supervisionMode
+      : existing?.supervisionMode,
     transportPendingMessages: nextPendingMessages,
     transportPendingMessageEntries: nextPendingEntries,
     queueEpoch: hasPendingSyncPatch ? (pendingSyncPatch.queueEpoch ?? existing?.queueEpoch) : existing?.queueEpoch,
     queueAuthorityId: hasPendingSyncPatch ? (pendingSyncPatch.queueAuthorityId ?? existing?.queueAuthorityId) : existing?.queueAuthorityId,
     failedMessageEntries: hasPendingSyncPatch ? (pendingSyncPatch.failedMessageEntries ?? []) : (existing?.failedMessageEntries ?? []),
+    transportPendingSettledMessageIds: hasPendingSyncPatch
+      ? (pendingSyncPatch.transportPendingSettledMessageIds ?? existing?.transportPendingSettledMessageIds)
+      : existing?.transportPendingSettledMessageIds,
     transportPendingMessageVersion: nextPendingVersion,
     sharedState: incoming.sharedState ?? existing?.sharedState,
     executionTemplateEligible: incoming.executionTemplateEligible ?? existing?.executionTemplateEligible,

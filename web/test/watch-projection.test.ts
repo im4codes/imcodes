@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createWatchProjectionStore, type WatchApplicationContext } from '../src/watch-projection.js';
+import { AGY_SDK_PROVIDER_ID } from '../../shared/agy-agent.js';
 
 const localStorageData = new Map<string, string>();
 const localStorageMock = {
@@ -117,6 +118,16 @@ describe('watch projection store', () => {
     );
 
     expect(store.getSnapshot().sessions[0]).toMatchObject({ agentBadge: 'gr' });
+  });
+
+  it('projects the Antigravity transport badge', () => {
+    const { store } = makeSnapshotStore();
+    store.updateFromSessionList(
+      { id: 'srv-1', name: 'Main', baseUrl: 'https://main.test' },
+      [{ name: 'deck_agy_brain', project: 'Agy', role: 'brain', agentType: AGY_SDK_PROVIDER_ID, state: 'idle' }],
+    );
+
+    expect(store.getSnapshot().sessions[0]).toMatchObject({ agentBadge: 'ag' });
   });
 
   it('keeps auth/routing fields explicit even when apiKey is unavailable', () => {
@@ -340,6 +351,70 @@ describe('watch projection store', () => {
       transportPendingMessageVersion: 1,
       transportPendingMessageEntries: [],
     });
+  });
+
+  it('keeps settled main and sub-session messages out of a reconnect snapshot', () => {
+    const { store } = makeSnapshotStore(2_850);
+    const server = { id: 'srv-1', name: 'Main', baseUrl: 'https://main.test' };
+    const queue = {
+      queueEpoch: 'epoch-1',
+      queueAuthorityId: 'authority-1',
+      transportPendingMessageVersion: 2,
+      transportPendingMessageEntries: [{
+        clientMessageId: 'sent-before-reconnect',
+        text: '之前让你做的远桌 UI做到什么程度了',
+        status: 'queued',
+        placement: 'normal',
+        ordinal: 0,
+        createdAt: 1,
+        updatedAt: 1,
+      }],
+      failedMessageEntries: [],
+      transportPendingSettledMessageIds: ['sent-before-reconnect'],
+    };
+
+    store.updateFromSessionListWithSubs(server, [{
+      name: 'deck_proj_brain', project: 'Project', role: 'brain', agentType: 'codex', state: 'idle', ...queue,
+    }], [{
+      sessionName: 'deck_sub_worker', sessionType: 'claude-code-sdk', state: 'idle', parentSession: 'deck_proj_brain', ...queue,
+    }]);
+
+    expect(store.getSnapshot().sessions
+      .filter((row) => row.sessionName === 'deck_proj_brain' || row.sessionName === 'deck_sub_worker')
+      .every((row) => row.transportPendingMessageEntries?.length === 0)).toBe(true);
+
+    // A switching/reconnect cycle clears the projection caches.  The local
+    // settled ledger supplied on the next list must still fence the stale row.
+    store.setSnapshotStatus('switching');
+    store.updateFromSessionListWithSubs(server, [{
+      name: 'deck_proj_brain', project: 'Project', role: 'brain', agentType: 'codex', state: 'idle', ...queue,
+    }], [{
+      sessionName: 'deck_sub_worker', sessionType: 'claude-code-sdk', state: 'idle', parentSession: 'deck_proj_brain', ...queue,
+    }]);
+
+    for (const row of store.getSnapshot().sessions) {
+      expect(row.transportPendingMessageEntries).toEqual([]);
+    }
+  });
+
+  it('rejects an older-generation watch snapshot after a newer queue state', () => {
+    const { store } = makeSnapshotStore(2_860);
+    const server = { id: 'srv-1', name: 'Main', baseUrl: 'https://main.test' };
+    store.updateFromSessionList(server, [{
+      name: 'deck_proj_brain', project: 'Project', role: 'brain', agentType: 'codex', state: 'idle',
+      queueEpoch: 'epoch-1', queueAuthorityId: 'authority-1', transportPendingMessageVersion: 3,
+      transportPendingMessageEntries: [{ clientMessageId: 'new', text: 'new', status: 'queued' }],
+      failedMessageEntries: [], activityGeneration: 2,
+    } as any]);
+    store.updateFromSessionList(server, [{
+      name: 'deck_proj_brain', project: 'Project', role: 'brain', agentType: 'codex', state: 'idle',
+      queueEpoch: 'epoch-1', queueAuthorityId: 'authority-1', transportPendingMessageVersion: 4,
+      transportPendingMessageEntries: [{ clientMessageId: 'old', text: 'old replay', status: 'queued' }],
+      failedMessageEntries: [], activityGeneration: 1,
+    } as any]);
+
+    expect(store.getSnapshot().sessions[0]?.transportPendingMessageEntries?.map((entry) => entry.clientMessageId))
+      .toEqual(['new']);
   });
 
   // Native Watch XCTest is not wired into this repo's Vitest CI. This fixture is

@@ -1,6 +1,7 @@
 import { useState } from 'preact/hooks';
 import type { AutoFixTaskStatus } from '../types';
 import { useNowTicker } from '../hooks/useNowTicker.js';
+import { formatTaskDuration } from '../util/tool-duration.js';
 
 interface TaskCardProps {
   task: AutoFixTaskStatus;
@@ -43,27 +44,21 @@ const PRIORITY_BG: Record<number, string> = {
   3: '#1e293b',
 };
 
-function formatElapsed(ms: number): string {
-  const totalSeconds = Math.floor(ms / 1000);
-  const hours = Math.floor(totalSeconds / 3600);
-  const minutes = Math.floor((totalSeconds % 3600) / 60);
-  const seconds = totalSeconds % 60;
-  if (hours > 0) {
-    return `${hours}h ${minutes}m ${seconds}s`;
-  }
-  if (minutes > 0) {
-    return `${minutes}m ${seconds}s`;
-  }
-  return `${seconds}s`;
-}
-
 export function TaskCard({ task, priority, onAbort, onRetry }: TaskCardProps) {
   const [expanded, setExpanded] = useState(false);
 
   const isTerminal = task.state === 'done' || task.state === 'failed';
   const now = useNowTicker(!isTerminal);
 
-  const elapsed = now - task.startedAt;
+  const elapsed = formatTaskDuration({
+    startedAt: task.startedAt,
+    finishedAt: task.finishedAt,
+    endedAt: task.endedAt,
+    updatedAt: task.updatedAt,
+    durationMs: task.durationMs,
+    now,
+    terminal: isTerminal,
+  }, { day: 'd', hour: 'h', minute: 'm', second: 's' });
   const borderColor = STATE_BORDER_COLORS[task.state] ?? '#334155';
 
   return (
@@ -122,7 +117,7 @@ export function TaskCard({ task, priority, onAbort, onRetry }: TaskCardProps) {
 
         {/* Elapsed time */}
         <div style={{ color: '#64748b', fontSize: '11px', whiteSpace: 'nowrap', flexShrink: 0 }}>
-          {formatElapsed(elapsed)}
+          {elapsed}
         </div>
 
         {/* Expand chevron */}

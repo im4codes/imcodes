@@ -10,6 +10,7 @@ import { getCodexRuntimeConfig } from '../agent/codex-runtime-config.js';
 import { mergeCodexDisplayMetadata } from '../agent/codex-display.js';
 import { getCopilotRuntimeConfig } from '../agent/copilot-runtime-config.js';
 import { getCursorRuntimeConfig } from '../agent/cursor-runtime-config.js';
+import { fetchAgyUsageQuota, recordAgyQuotaActivity } from '../agent/agy-usage-quota.js';
 import { providerQuotaMetaEquals } from '../../shared/provider-quota.js';
 import { QWEN_AUTH_TYPES } from '../../shared/qwen-auth.js';
 import { getTransportRuntime } from '../agent/session-manager.js';
@@ -18,6 +19,8 @@ import { buildTransportQueueSnapshotPayload } from './transport-queue-projection
 import { expireResendEntries } from './transport-resend-queue.js';
 import { validateExecutionTemplateCandidate } from './execution-clone.js';
 import { isWorkingSessionState } from '../../shared/session-activity-types.js';
+import type { SupervisionHeartbeatSnapshot } from '../../shared/supervision-heartbeat.js';
+import { getSupervisionHeartbeatProjectionForWire } from './supervision-heartbeat-projection.js';
 
 export interface SessionListItem extends SessionContextBootstrapState {
   name: string;
@@ -49,6 +52,9 @@ export interface SessionListItem extends SessionContextBootstrapState {
   quotaLabel?: string;
   quotaUsageLabel?: string;
   quotaMeta?: import('../../shared/provider-quota.js').ProviderQuotaMeta;
+  codexCreditsBalance?: string;
+  codexCreditsHasCredits?: boolean;
+  codexCreditsUnlimited?: boolean;
   effort?: import('../../shared/effort-levels.js').TransportEffortLevel;
   /** Provider service tier, so a viewer can be warned about Codex's Fast tier. */
   serviceTier?: string;
@@ -72,6 +78,7 @@ export interface SessionListItem extends SessionContextBootstrapState {
   /** Ineligibility reason code (an `EXECUTION_CLONE_ERROR_CODES` value) set ONLY
    *  when `executionTemplateEligible` is false. Absent when eligible. */
   executionTemplateIneligibleReason?: string;
+  supervisionHeartbeat?: SupervisionHeartbeatSnapshot;
 }
 
 /**
@@ -116,21 +123,35 @@ function resolveTransportSessionListState(
   return record.state;
 }
 
+/**
+ * The one daemon-side session activity projection used by both session.list and
+ * the supervision console. It observes the live transport runtime and its
+ * structured queue; it never guesses from elapsed heartbeat time.
+ */
+export function resolveAuthoritativeSessionListState(record: SessionRecord, projectedQueue?: QueueSnapshot | null): SessionListItem['state'] {
+  const runtime = record.runtimeType === 'transport' ? getTransportRuntime(record.name) : undefined;
+  const runtimeState = resolveTransportSessionListState(record, runtime);
+  if (record.runtimeType === 'transport') expireResendEntries(record.name);
+  const queueSnapshot = record.runtimeType === 'transport'
+    ? (projectedQueue ?? buildTransportQueueSnapshotPayload(record.name, 'session_list').queueSnapshot)
+    : null;
+  const hasPendingQueue = (queueSnapshot?.pendingMessageEntries.length ?? 0) > 0;
+  return hasPendingQueue
+    ? (runtime ? (runtimeState === 'idle' ? 'queued' : runtimeState) : 'queued')
+    : runtimeState;
+}
+
 function baseItem(s: SessionRecord): SessionListItem {
-  const runtime = s.runtimeType === 'transport' ? getTransportRuntime(s.name) : undefined;
-  const runtimeState = resolveTransportSessionListState(s, runtime);
-  if (s.runtimeType === 'transport') {
-    expireResendEntries(s.name);
-  }
+  // Expire resend entries before taking the single queue snapshot; otherwise
+  // state resolution can invalidate a snapshot that still reports old work.
+  if (s.runtimeType === 'transport') expireResendEntries(s.name);
   const queuePayload = s.runtimeType === 'transport'
     ? buildTransportQueueSnapshotPayload(s.name, 'session_list')
     : null;
-  const hasPendingQueue = (queuePayload?.pendingMessageEntries.length ?? 0) > 0;
-  const state = hasPendingQueue
-    ? runtime
-      ? (runtimeState === 'idle' ? 'queued' : runtimeState)
-      : 'queued'
-    : runtimeState;
+  // Build the transport queue projection once per item. This used to happen
+  // once in state resolution and again while assembling the payload, doubling
+  // the synchronous SQLite/legacy-backfill work for every transport session.
+  const state = resolveAuthoritativeSessionListState(s, queuePayload?.queueSnapshot ?? null);
   // DAEMON-AUTHORITATIVE template eligibility. Computed from the persisted
   // record (not the resolved transport `state` above) so it stays deterministic
   // and matches the clone-create gate's view of the session.
@@ -165,6 +186,9 @@ function baseItem(s: SessionRecord): SessionListItem {
     quotaLabel: s.quotaLabel,
     quotaUsageLabel: s.quotaUsageLabel,
     quotaMeta: s.quotaMeta,
+    codexCreditsBalance: s.codexCreditsBalance,
+    codexCreditsHasCredits: s.codexCreditsHasCredits,
+    codexCreditsUnlimited: s.codexCreditsUnlimited,
     effort: s.effort,
     serviceTier: s.serviceTier,
     contextNamespace: s.contextNamespace,
@@ -177,6 +201,7 @@ function baseItem(s: SessionRecord): SessionListItem {
     label: s.label,
     userCreated: s.userCreated,
     transportConfig: s.transportConfig,
+    supervisionHeartbeat: getSupervisionHeartbeatProjectionForWire(s.name),
     ...(queuePayload ?? {}),
     executionTemplateEligible: eligibility.eligible,
     ...(eligibility.eligible
@@ -222,11 +247,16 @@ export async function buildSessionList(): Promise<SessionListItem[]> {
   const needsCodexHydration = sessions.some((s) => (s.agentType === 'codex' || s.agentType === 'codex-sdk'));
   const needsCopilotHydration = sessions.some((s) => s.agentType === 'copilot-sdk');
   const needsCursorHydration = sessions.some((s) => s.agentType === 'cursor-headless');
+  const needsAgySdkHydration = sessions.some((s) => s.agentType === 'agy-sdk');
   const qwenRuntime = needsQwenHydration ? await getQwenRuntimeConfig().catch(() => null) : null;
   const claudeSdkRuntime = needsClaudeSdkHydration ? await getClaudeSdkRuntimeConfig().catch(() => ({}) as import('../agent/sdk-runtime-config.js').SdkRuntimeConfig) : null;
   // Option B (best-effort, ≤1 fetch / 30min): proactive 5h+weekly quota pulled
   // from /api/oauth/usage. null → fall back to the SDK rate_limit_event quota.
   const claudeUsageQuota = needsClaudeSdkHydration ? await getClaudeUsageQuota().catch(() => null) : null;
+  if (needsAgySdkHydration) {
+    recordAgyQuotaActivity();
+  }
+  const agyUsageQuota = needsAgySdkHydration ? await fetchAgyUsageQuota().catch(() => null) : null;
   const codexRuntime = needsCodexHydration ? await getCodexRuntimeConfig({ probe: false }).catch(() => ({}) as import('../agent/codex-runtime-config.js').CodexRuntimeConfig) : null;
   const copilotRuntime = needsCopilotHydration ? await getCopilotRuntimeConfig({ probe: false }).catch(() => null) : null;
   const cursorRuntime = needsCursorHydration ? await getCursorRuntimeConfig({ probe: false }).catch(() => null) : null;
@@ -266,6 +296,23 @@ export async function buildSessionList(): Promise<SessionListItem[]> {
         ? { quotaLabel: claudeUsageQuota.quotaLabel, quotaMeta: claudeUsageQuota.quotaMeta }
         : {};
       return { ...baseItem(s), ...hydrated, ...quotaOverride };
+    }
+    if (s.agentType === 'agy-sdk') {
+      const quotaOverride = agyUsageQuota
+        ? { quotaLabel: agyUsageQuota.quotaLabel, quotaMeta: agyUsageQuota.quotaMeta }
+        : {};
+      const hydrated: Partial<SessionRecord> = {
+        permissionLabel: getPermissionLabel(s.agentType),
+        ...quotaOverride,
+      };
+      if (
+        hydrated.permissionLabel !== s.permissionLabel
+        || hydrated.quotaLabel !== s.quotaLabel
+        || !providerQuotaMetaEquals(hydrated.quotaMeta, s.quotaMeta)
+      ) {
+        upsertSession({ ...s, ...hydrated, updatedAt: Date.now() });
+      }
+      return { ...baseItem(s), ...hydrated };
     }
     if (s.agentType === 'codex' || s.agentType === 'codex-sdk') {
       const hydrated: Partial<SessionRecord> = {

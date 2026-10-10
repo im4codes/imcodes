@@ -12,12 +12,22 @@ export interface FsEntry {
   hidden: boolean;
   /** File size in bytes (only when includeMetadata requested). */
   size?: number;
+  /** Last-modified / creation time in epoch ms; only a controlled node's listing query supplies them. */
+  mtimeMs?: number;
+  birthtimeMs?: number;
   /** MIME type inferred from extension (only for files with includeMetadata). */
   mime?: string;
   /** Controlled download handle ID (only when includeMetadata requested). */
   downloadId?: string;
   /** OpenSpec task checkbox summary, only when explicitly requested for openspec/changes. */
   openSpecTaskStats?: OpenSpecTaskStats;
+  /**
+   * Capacity of the volume this entry IS, populated only for volume roots.
+   * Measuring per entry would be one syscall per row for a value identical
+   * across every row in the listing.
+   */
+  totalBytes?: number;
+  freeBytes?: number;
 }
 
 export interface OpenSpecTaskStats {
@@ -48,6 +58,12 @@ interface FsBaseResponse {
 export interface FsLsResponse extends FsBaseResponse {
   type: 'fs.ls_response';
   entries?: FsEntry[];
+  /** A controlled node's listing query matched more entries than `entries` carries. */
+  truncated?: boolean;
+  /** How many entries matched, when `truncated`. */
+  total?: number;
+  /** The order was computed over only part of the matches. */
+  partial?: boolean;
 }
 
 export interface FsReadResponse extends FsBaseResponse {
@@ -65,6 +81,10 @@ export interface FsReadResponse extends FsBaseResponse {
   mtime?: number;
   /** File size in bytes when the daemon returns stream/download metadata. */
   size?: number;
+  /** Redacted daemon-side candidate labels for a chat file reference. */
+  attemptedLocations?: string[];
+  /** Number of bounded filename-search matches; newest mtime is selected. */
+  resolutionMatchCount?: number;
 }
 
 export interface FsWriteRequest {

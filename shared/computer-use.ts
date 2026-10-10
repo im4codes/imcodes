@@ -1,5 +1,10 @@
 import { DAEMON_COMMAND_TYPES } from './daemon-command-types.js';
 import { DAEMON_MSG } from './daemon-events.js';
+import {
+  isSessionResourceOwnerIdentity,
+  type SessionResourceOwnerIdentity,
+} from './session-resource-lifecycle.js';
+import { REMOTE_EXEC_MAX_TIMEOUT_MS, REMOTE_EXEC_MIN_TIMEOUT_MS } from './remote-exec.js';
 
 export const COMPUTER_USE_TOOLS = [
   'list_apps',
@@ -23,6 +28,27 @@ export const COMPUTER_USE_TOOLS = [
 ] as const;
 
 export type ComputerUseToolName = (typeof COMPUTER_USE_TOOLS)[number];
+
+/**
+ * Tools that only look. Re-running one of these changes nothing on the remote
+ * machine, so a request whose answer was lost can simply be asked again.
+ *
+ * Everything not listed here acts: a click, a keystroke, a shell command, a
+ * navigation. When the answer to one of those goes missing there is no way to
+ * tell from here whether it ran, and asking again risks doing it twice --
+ * which is worse than reporting that the answer went missing. The list is
+ * therefore an allowlist, so a tool added later is treated as acting until
+ * someone says otherwise.
+ */
+export const COMPUTER_USE_READ_ONLY_TOOLS = [
+  'list_apps',
+  'get_app_state',
+  'browser_snapshot',
+] as const satisfies readonly ComputerUseToolName[];
+
+export function isReadOnlyComputerUseTool(tool: ComputerUseToolName): boolean {
+  return (COMPUTER_USE_READ_ONLY_TOOLS as readonly string[]).includes(tool);
+}
 
 export const COMPUTER_USE_DOC_TOPICS = [
   'overview',
@@ -68,6 +94,7 @@ export const COMPUTER_USE_HTTP_REASON = {
   SCOPED_AUTH: 'scoped_auth',
   TARGET_FORBIDDEN: 'target_forbidden',
   EXEC_DISABLED: 'exec_disabled',
+  TARGET_UNAVAILABLE: 'target_unavailable',
   RELAY_DEADLINE: 'relay_deadline',
   INVALID_RESULT: 'invalid_result',
 } as const;
@@ -79,6 +106,7 @@ export interface ComputerUseRequest {
   tool: ComputerUseToolName;
   arguments?: Record<string, unknown>;
   timeoutMs?: number;
+  resourceOwner?: SessionResourceOwnerIdentity;
 }
 
 export interface ComputerUseContentItem {
@@ -151,7 +179,7 @@ function isContentItem(value: unknown): value is ComputerUseContentItem {
   return utf8ByteLength(value.data) <= COMPUTER_USE_MAX_IMAGE_BASE64_BYTES;
 }
 
-const COMPUTER_USE_REQUEST_KEYS = new Set(['type', 'correlationId', 'tool', 'arguments', 'timeoutMs']);
+const COMPUTER_USE_REQUEST_KEYS = new Set(['type', 'correlationId', 'tool', 'arguments', 'timeoutMs', 'resourceOwner']);
 const COMPUTER_USE_RESULT_KEYS = new Set(['type', 'correlationId', 'ok', 'tool', 'content', 'durationMs', 'error', 'timedOut', 'truncated']);
 const COMPUTER_USE_HTTP_ENVELOPE_KEYS = new Set(['protocol', 'version', 'outcome', 'result', 'reason']);
 const COMPUTER_USE_HTTP_REASONS: ReadonlySet<string> = new Set(Object.values(COMPUTER_USE_HTTP_REASON));
@@ -170,6 +198,10 @@ export function validateComputerUseFrame(raw: unknown): ValidationResult<Compute
     && (typeof timeoutMs !== 'number' || !Number.isInteger(timeoutMs) || timeoutMs < COMPUTER_USE_MIN_TIMEOUT_MS || timeoutMs > maxTimeoutMs)) {
     return { ok: false, error: 'invalid_timeoutMs' };
   }
+  const resourceOwner = raw.resourceOwner;
+  if (resourceOwner !== undefined) {
+    if (!isSessionResourceOwnerIdentity(resourceOwner)) return { ok: false, error: 'invalid_resourceOwner' };
+  }
   return {
     ok: true,
     value: {
@@ -178,6 +210,7 @@ export function validateComputerUseFrame(raw: unknown): ValidationResult<Compute
       tool: raw.tool,
       ...(raw.arguments !== undefined ? { arguments: raw.arguments } : {}),
       ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+      ...(resourceOwner !== undefined ? { resourceOwner } : {}),
     },
   };
 }
@@ -264,31 +297,35 @@ export function computerUseDocs(topic: ComputerUseDocTopic): string {
       return [
         'Computer Use controls GUI apps either on the current full imcodes daemon host (machine=local) or on a controlled machine through a typed helper running in the active user desktop session.',
         'The agent never receives shell access for this surface: call computer_use_call with one named tool and JSON arguments.',
-        'Target controlled machines accept either their stable ref_name or the complete ^^(ref_name) marker. When the message already contains a marker, pass either form without calling list_machines first; use list_machines only for discovery or an explicit status request. On full imcodes daemons, machine=local/localhost/self/this controls the daemon host directly. Results are bounded text/image MCP-style content.',
+        'A request that names a CLI, executable, script, terminal command, or shell operation is not a GUI request. Route it through exec_remote for session-0/SYSTEM, or through shell_session1 only when it genuinely requires the active signed-in user session; never select OCU merely because the target is a Windows machine.',
+        'An OCU/helper error proves that the GUI route failed, not that the machine is unauthorized or uncontrollable. If the original intent is a shell command and exec_remote is authorized, use that correct route rather than reporting an authorization refusal.',
+        'Target controlled machines use their canonical 10-digit nodeId or complete ^^(nodeId) marker. A deprecated noncanonical legacy ref_name remains accepted only for migration compatibility. When the message already contains a marker, pass either form without calling list_machines first; use list_machines only for discovery or an explicit status request. On full imcodes daemons, machine=local/localhost/self/this controls the daemon host directly. Results are bounded text/image MCP-style content.',
         'When the user asks to use a browser on the daemon host, call computer_use_call with machine=local and the built-in CDP-backed browser_* tools; do not probe for or install a separate Playwright runtime through a shell.',
         'Open Computer Use (OCU) supplies the integrated cross-platform desktop-app control path; browser_* is IM.codes\' separate CDP implementation and should be preferred over coordinate GUI control for web pages.',
       ].join('\n');
     case 'workflow':
       return [
         'Recommended workflow:',
-        '1. Use machine=local/localhost/self/this for this daemon host. For a controlled node, pass either a known stable ref_name or the complete ^^(ref_name) marker directly; call list_machines only when no exact target is available or the user asks for status.',
-        '2. computer_use_docs for the relevant topic/tool details only.',
-        '3. computer_use_call tool=list_apps to discover app ids.',
-        '4. For element/index actions, call computer_use_call tool=get_app_state first to discover stable element indexes; pure coordinate click can use the fast path directly when the target is known.',
-        '5. Prefer element/index based actions when precision matters; use coordinate actions for low-latency direct control and verify when needed.',
-        '6. For web pages, prefer browser_* tools and pull computer_use_docs topic=browser only when browser automation details are needed.',
+        '1. Use machine=local/localhost/self/this for this daemon host. For a controlled node, pass its canonical 10-digit nodeId or complete ^^(nodeId) marker directly; a deprecated noncanonical legacy ref_name is compatibility-only. Call list_machines only when no exact target is available or the user asks for status.',
+        '2. Classify intent before selecting a tool: executable/CLI/script/terminal work uses exec_remote (SYSTEM/session 0), or shell_session1 only for required active-user semantics. Use OCU only for actual GUI interaction.',
+        '3. computer_use_docs for the relevant topic/tool details only.',
+        '4. computer_use_call tool=list_apps to discover app ids.',
+        '5. For element/index actions, call computer_use_call tool=get_app_state first to discover stable element indexes; pure coordinate click can use the fast path directly when the target is known.',
+        '6. Prefer element/index based actions when precision matters; use coordinate actions for low-latency direct control and verify when needed.',
+        '7. For web pages, prefer browser_* tools and pull computer_use_docs topic=browser only when browser automation details are needed.',
       ].join('\n');
     case 'tools':
       return [
         `Available tools: ${COMPUTER_USE_TOOLS.join(', ')}.`,
         'shell_session1: run a bounded shell command in the active logged-in user session through the IPC helper; its requested timeout may be 1,000..900,000 ms. For SYSTEM/session-0 shell use exec_remote instead.',
         'list_apps: enumerate controllable GUI apps.',
-        'get_app_state: inspect one app/window accessibility tree.',
+        'get_app_state: inspect one app/window accessibility tree. Output shows at most 200 nodes by default; pass maxNodes=1..1500 to bound returned nodes and maxDepth=1..80 to limit collected depth. When bounded, the text ends with "truncated: N nodes omitted".',
         `click, perform_secondary_action, scroll, drag: pointer/UI actions. On Windows, coordinate drag accepts optional duration_ms=${COMPUTER_USE_DRAG_DURATION_MIN_MS}..${COMPUTER_USE_DRAG_DURATION_MAX_MS} for cursor travel duration; omit it for normal speed.`,
         'type_text, press_key, set_value: keyboard/value actions.',
-        'Arguments are open-computer-use-compatible. Call get_app_state first to find app ids and element indexes; pure coordinate click may skip state and uses a Windows fast path when possible.',
+        'Arguments are open-computer-use-compatible. Call get_app_state first to find app ids and element indexes; only displayed element indexes are safe to reuse. If a target was omitted, narrow the app/window or increase maxNodes and refresh state. Pure coordinate click may skip state and uses a Windows fast path when possible.',
         'Action results omit screenshots and full UI state by default for low-latency control. Pass arguments.includeState=true to return state text, or includeImage=true to request a compressed image; optional imageFormat=jpeg|webp|png, imageQuality=1..100, imageMaxWidth=320..3840.',
         'GUI and browser methods keep the 1,000..120,000 ms timeout range; only shell_session1 permits up to 900,000 ms.',
+        `exec_remote accepts timeoutMs=${REMOTE_EXEC_MIN_TIMEOUT_MS}..${REMOTE_EXEC_MAX_TIMEOUT_MS} ms and rejects the unknown timeout field. Also self-limit the command inside command with the target shell/platform timeout facility (for example GNU timeout 30s command).`,
       ].join('\n');
     case 'browser':
       return [
@@ -298,7 +335,7 @@ export function computerUseDocs(topic: ComputerUseDocTopic): string {
         'Then use browser_navigate, browser_snapshot, browser_click, browser_fill, browser_press, browser_evaluate, browser_close.',
         'Every browser snapshot includes automation.cdpEndpoint, cdpHost, and cdpPort. A local Python/Node script may attach to that loopback CDP endpoint (for example Playwright connect_over_cdp) to run complex logic against the same browser instance instead of launching another browser.',
         'The daemon-managed endpoint listens on 127.0.0.1 only. Coordinate MCP browser calls and external scripts so they do not race, and do not terminate the shared browser until the task is finished.',
-        'Selectors are CSS selectors. For click/fill you may pass selector or visible text. Prefer stable CSS selectors over coordinates.',
+        'Selectors are CSS selectors first. For click/fill, the text argument performs visible-text matching; selector falls back to visible-text matching when CSS finds nothing or is invalid, including a text= prefix. Prefer stable CSS selectors. Failures are classified as invalid_selector, element_not_found, or page_exception with a bounded real cause.',
         'Linux without DISPLAY/WAYLAND defaults to headless and uses no-sandbox/dev-shm-safe flags unless noSandbox=false is passed.',
         'browser_open, browser_navigate, and browser_snapshot return url/title, bounded visible text, and common links/buttons/inputs. Pass includeImage=true only when visual evidence is needed; the optional viewport screenshot is delivered as model-visible image content.',
         'Search fallback: Bing /search?q=<keywords>; then Google or DuckDuckGo.',
@@ -316,7 +353,7 @@ export function computerUseDocs(topic: ComputerUseDocTopic): string {
     case 'safety':
       return [
         'Ask the user before destructive or externally visible actions such as sending messages, deleting data, purchases, or changing account/security settings.',
-        'Shell is intentionally split: exec_remote is session-0/SYSTEM; shell_session1 is active-user/session-1. Both are explicit typed methods with bounded JSON arguments/results.',
+        `Shell is intentionally split: exec_remote is session-0/SYSTEM; shell_session1 is active-user/session-1. Both are explicit typed methods with bounded JSON arguments/results. exec_remote accepts timeoutMs=${REMOTE_EXEC_MIN_TIMEOUT_MS}..${REMOTE_EXEC_MAX_TIMEOUT_MS} ms and rejects timeout; also put a shell-native timeout in command so the command self-limits.`,
         'If the UI state is ambiguous, call get_app_state again instead of guessing.',
       ].join('\n');
   }

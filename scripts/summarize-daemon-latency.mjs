@@ -3,7 +3,8 @@ import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 import { homedir } from 'node:os';
 
-const DEFAULT_LOG_DIR = join(homedir(), '.imcodes', 'logs');
+const STATE_DIR = process.env.IMCODES_HOME?.trim() || join(homedir(), '.imcodes'); // IMCODES_HOME is the state directory itself
+const DEFAULT_LOG_DIR = join(STATE_DIR, 'logs');
 const DEFAULT_LATENCY_TRACE = join(DEFAULT_LOG_DIR, 'latency-trace.ndjson');
 const DEFAULT_DAEMON_LOG = join(DEFAULT_LOG_DIR, 'daemon.log');
 const DEFAULT_PROC_TRACE = join(DEFAULT_LOG_DIR, 'daemon-proc-trace-*.ndjson');

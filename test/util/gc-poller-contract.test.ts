@@ -35,6 +35,9 @@ describe('GC poller wiring', () => {
     expect(src).toMatch(/if \(gcTimer\) clearInterval\(gcTimer\)/);
     // Must be invoked from the start path next to the other pollers.
     expect(src).toMatch(/startContextMaterializationPoller[^]*startGcPoller\(\);/);
+    // The heap guard starts beside it and is stopped in shutdown.
+    expect(src).toMatch(/startGcPoller\(\);\s*startDaemonMemoryGuard\(\);/);
+    expect(src).toMatch(/if \(gcTimer\) clearInterval\(gcTimer\);\s*stopMemoryGuard\(\);/);
   });
 
   // Both install paths must include --expose-gc in NODE_OPTIONS, otherwise
@@ -60,16 +63,25 @@ describe('GC poller wiring', () => {
     // global backstop; it MUST be in the unit env because glibc reads it at
     // process init (unsettable from JS). Pairs with the onnxruntime
     // intraOpNumThreads cap in src/context/embedding.ts.
+    // 158 (2026-10-07): two heap-exhaustion aborts left only a GC trace. The runtime writes a compact JSON report
+    // (native stack, heap statistics) into the state directory's diagnostics folder when it dies of a fatal error.
+    it(`${rel} asks the runtime for a fatal-error report in the unit's NODE_OPTIONS`, () => {
+      const src = readFileSync(resolve(REPO_ROOT, rel), 'utf8');
+      expect(src).toMatch(/NODE_OPTIONS=--expose-gc --max-old-space-size=8192 \$\{daemonFatalReportNodeOptions\(service\.stateHome(?:, '(?:systemd|plain)', reportExcludeEnvFlagUsable\(target\.program\))?\)\}/);
+    });
+
     it(`${rel} sets MALLOC_ARENA_MAX=2 in the systemd unit template`, () => {
       const src = readFileSync(resolve(REPO_ROOT, rel), 'utf8');
       expect(src).toMatch(/MALLOC_ARENA_MAX=2/);
     });
   }
 
-  it('bind-flow.ts plist includes NODE_OPTIONS in EnvironmentVariables (macOS path)', () => {
+  it('the macOS plist registers NODE_OPTIONS in EnvironmentVariables, with the flags the install flow computes', () => {
+    // The template moved to renderMacosLaunchAgentPlist (shared by the install flow); the flags are still decided in bind-flow.ts.
+    const template = readFileSync(resolve(REPO_ROOT, 'src/util/macos-launch-agent.ts'), 'utf8');
+    expect(template).toMatch(/<key>NODE_OPTIONS<\/key>[\s\S]*input\.nodeOptions/);
     const src = readFileSync(resolve(REPO_ROOT, 'src/bind/bind-flow.ts'), 'utf8');
-    // The plist template must register NODE_OPTIONS as a <key>/<string>
-    // pair inside <key>EnvironmentVariables</key><dict>...</dict>.
-    expect(src).toMatch(/<key>NODE_OPTIONS<\/key>[\s\S]*--expose-gc/);
+    expect(src).toMatch(/nodeOptions: `--expose-gc/);
+    expect(src).toMatch(/daemonFatalReportNodeOptions\(service\.stateHome, 'plain', reportExcludeEnvFlagUsable\(launchProgram\)\)/);
   });
 });

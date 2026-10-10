@@ -135,7 +135,7 @@ function makeDb(projectionRow?: Record<string, unknown>): Database {
           ? projectionRow as T
           : null as T;
       }
-      return { token_hash: 'valid-hash' } as T;
+      return { token_hash: 'valid-hash', owner_status: 'active' } as T;
     },
     query: async () => [],
     execute: async () => ({ changes: 0 }),

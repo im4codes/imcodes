@@ -1,16 +1,304 @@
 import { DAEMON_MSG } from './daemon-events.js';
+import { compareImcodesVersions, getReleaseChannel, isImcodesVersionOutdated } from './imcodes-version.js';
 
 export const DAEMON_UPGRADE_TARGET_LATEST = 'latest';
+
+/**
+ * Deployment-level opt-out for server-driven automatic upgrades. The image
+ * must not set this value itself; an operator can still provide it explicitly
+ * while manual and replayed upgrades remain available.
+ */
+export function isDaemonAutoUpgradeDisabledByEnv(
+  env: Record<string, string | undefined> = process.env,
+): boolean {
+  return env.IMCODES_DISABLE_AUTO_UPGRADE === '1'
+    || env.IMCODES_DISABLE_AUTO_UPGRADE === 'true';
+}
+
+/** Origin of a daemon upgrade command. `auto` is the server-driven trigger
+ * (controlled nodes and, once idle, full daemons); `manual` is the operator's
+ * confirmed request; `replay` re-delivers an existing lifecycle. */
+export const DAEMON_UPGRADE_SOURCE = {
+  AUTO: 'auto',
+  MANUAL: 'manual',
+  REPLAY: 'replay',
+} as const;
+
+export type DaemonUpgradeSource = typeof DAEMON_UPGRADE_SOURCE[keyof typeof DAEMON_UPGRADE_SOURCE];
+
+/**
+ * Wire source of a received daemon.upgrade command. Servers older than the
+ * manual-upgrade change send no source and only ever pushed automatic
+ * upgrades, so a missing or unknown source is treated as auto: the daemon's
+ * autoUpgrade:false / IMCODES_DISABLE_AUTO_UPGRADE opt-out must still hold
+ * against them.
+ */
+export function resolveDaemonUpgradeSource(raw: unknown): DaemonUpgradeSource {
+  return raw === DAEMON_UPGRADE_SOURCE.MANUAL || raw === DAEMON_UPGRADE_SOURCE.REPLAY || raw === DAEMON_UPGRADE_SOURCE.AUTO
+    ? raw
+    : DAEMON_UPGRADE_SOURCE.AUTO;
+}
+
+/**
+ * Wire field that turns an operator-confirmed manual upgrade into a FORCED one:
+ * the daemon then skips its "something is busy" gates (P2P runs, Auto Deliver,
+ * master compaction, active sessions). It is deliberately a separate field, not
+ * implied by `source: manual`, so a future API/CLI entry that sends manual
+ * cannot bypass the safety gates by accident. Only the confirmation-dialog path
+ * sets it; the server forwards it for manual requests only.
+ */
+export const DAEMON_UPGRADE_FORCE_FIELD = 'force';
+
+/** Body of the confirmation-dialog request: the operator accepted that running work is interrupted. */
+export const DAEMON_UPGRADE_FORCED_REQUEST_BODY = { [DAEMON_UPGRADE_FORCE_FIELD]: true } as const;
+
+/** True only for an explicit `force: true` on a MANUAL upgrade; auto/replay ignore it. */
+export function resolveDaemonUpgradeForce(rawForce: unknown, source: DaemonUpgradeSource): boolean {
+  return source === DAEMON_UPGRADE_SOURCE.MANUAL && rawForce === true;
+}
+
+/**
+ * Returns true when the daemon should show the operator an upgrade action.
+ * Release-channel mismatches are actionable even when semver ordering says the
+ * stable build is newer than the server's dev build: the server still
+ * converges daemons to its own channel when the operator confirms.
+ */
+export function isDaemonUpgradeAvailable(
+  current: string | null | undefined,
+  latest: string | null | undefined,
+): boolean {
+  if (!current || !latest || current === latest) return false;
+  if (getReleaseChannel(current) !== getReleaseChannel(latest)) return true;
+  const compared = compareImcodesVersions(current, latest);
+  return compared === null ? false : compared < 0;
+}
+
+/**
+ * Whether the SERVER may start an upgrade on its own. Narrower than
+ * {@link isDaemonUpgradeAvailable}: only a strictly older daemon on the same
+ * release channel qualifies. Moving a daemon across channels (a dev build
+ * pointed at a stable server, or the reverse) stays an operator decision made
+ * in the card; the daemon's downgrade guard would refuse the dev-ward half
+ * silently anyway.
+ */
+export function isDaemonAutoUpgradeAvailable(
+  current: string | null | undefined,
+  latest: string | null | undefined,
+): boolean {
+  if (!current || !latest || current === latest) return false;
+  if (getReleaseChannel(current) !== getReleaseChannel(latest)) return false;
+  return isImcodesVersionOutdated(current, latest);
+}
 
 export const DAEMON_UPGRADE_BLOCK_REASON = {
   ALREADY_IN_PROGRESS: 'already_in_progress',
   INSTALL_FAILED: 'install_failed',
+  TRANSPORT_BUSY: 'transport_busy',
+  SESSION_BUSY: 'session_busy',
+  COOLDOWN_ACTIVE: 'cooldown_active',
+  TOOLCHAIN_UNAVAILABLE: 'toolchain_unavailable',
+  P2P_ACTIVE: 'p2p_active',
+  AUTO_DELIVER_ACTIVE: 'auto_deliver_active',
+  MASTER_COMPACTION_ACTIVE: 'master_compaction_active',
+  /** Legacy: older daemons held an upgrade back for memory compression. */
+  COMPRESSION_ACTIVE: 'compression_active',
+  /** The daemon's own opt-out (config `daemon.autoUpgrade=false` or env) refused a source:auto upgrade. */
+  AUTO_UPGRADE_DISABLED: 'auto_upgrade_disabled',
+  /** A controlled node found its own rollback script dead before it finished. */
+  ROLLBACK_INTERRUPTED: 'rollback_interrupted',
+  /** A controlled node's rollback finished with failures: it may be running an unexpected build. */
+  ROLLBACK_FAILED: 'rollback_failed',
 } as const;
+
+/**
+ * The daemon's own "busy" gates: it is doing work an upgrade restart would
+ * interrupt. These ARE the definition of "not idle" for an automatic upgrade
+ * (the server holds no second copy); a forced manual upgrade skips exactly
+ * these.
+ */
+export const DAEMON_UPGRADE_BUSY_BLOCK_REASONS: readonly string[] = [
+  DAEMON_UPGRADE_BLOCK_REASON.P2P_ACTIVE,
+  DAEMON_UPGRADE_BLOCK_REASON.AUTO_DELIVER_ACTIVE,
+  DAEMON_UPGRADE_BLOCK_REASON.MASTER_COMPACTION_ACTIVE,
+  DAEMON_UPGRADE_BLOCK_REASON.TRANSPORT_BUSY,
+  DAEMON_UPGRADE_BLOCK_REASON.SESSION_BUSY,
+];
+
+export function isDaemonUpgradeBusyBlockReason(reason: string): boolean {
+  return DAEMON_UPGRADE_BUSY_BLOCK_REASONS.includes(reason);
+}
+
+/**
+ * Why a FULL daemon holds back a server-driven (source:auto) upgrade even though no turn is running yet:
+ * a process that has just started has no in-memory activity, which says nothing about being idle. After a crash
+ * (systemd restarts it within seconds) the work that was running is only about to resume from disk, and the
+ * server re-offers the upgrade on every reconnect. 158, 2026-10-07: the busy gate blocked 9 times for 20 min,
+ * the daemon was then ABRT-killed, and the fresh process upgraded 10 s after boot, before its durable queue was
+ * even rehydrated.
+ *
+ * On the wire these ride on a LEGACY busy reason ({@link DAEMON_UPGRADE_BLOCK_REASON.SESSION_BUSY}) plus the
+ * {@link DAEMON_UPGRADE_DEFERRAL_FIELD} and {@link DAEMON_UPGRADE_RETRY_AFTER_FIELD} fields: a server that
+ * predates them keeps treating the receipt as a retryable busy gate (never as a failed attempt), a current one
+ * reads the precise reason and the daemon's own retry hint.
+ */
+export const DAEMON_UPGRADE_DEFERRAL = {
+  /** Uptime is under the settle window, or startup restore (sessions, queues, resume) is not finished yet. */
+  STARTING_UP: 'starting_up',
+  /** The previous process did not exit on purpose (crash, OOM kill, power loss): its work is resuming. */
+  UNCLEAN_SHUTDOWN_RECOVERY: 'unclean_shutdown_recovery',
+} as const;
+export type DaemonUpgradeDeferral = (typeof DAEMON_UPGRADE_DEFERRAL)[keyof typeof DAEMON_UPGRADE_DEFERRAL];
+export const DAEMON_UPGRADE_DEFERRAL_FIELD = 'deferral';
+export const DAEMON_UPGRADE_RETRY_AFTER_FIELD = 'retryAfterMs';
+/** The server asks again this long AFTER the hold the daemon named lapses, so the retry never lands a moment early. */
+export const DAEMON_UPGRADE_DEFERRAL_RETRY_MARGIN_MS = 10_000;
+/** Names the unfinished startup phases on a STARTING_UP receipt (observability only). */
+export const DAEMON_UPGRADE_PENDING_PHASES_FIELD = 'pendingStartupPhases';
+
+/** A freshly started daemon takes no server-driven upgrade before this much uptime (any start, clean or not). */
+export const DAEMON_UPGRADE_STARTUP_SETTLE_MS = 5 * 60_000;
+/** After an UNCLEAN previous exit the daemon takes no server-driven upgrade before this much uptime. */
+export const DAEMON_UPGRADE_UNCLEAN_RECOVERY_MS = 15 * 60_000;
+/** Startup restore that has not reported done by this uptime stops holding the upgrade (a wedged phase must not pin the version forever). */
+export const DAEMON_UPGRADE_STARTUP_RESTORE_TIMEOUT_MS = 10 * 60_000;
+
+/** The restore phases a server-driven upgrade waits for. Each is reported by the daemon's own startup. */
+export const DAEMON_STARTUP_PHASE = {
+  /** `restoreFromStore`: stored sessions reconciled, missing tmux/process sessions re-created. */
+  SESSIONS_RECONCILED: 'sessions_reconciled',
+  /** Local transport runtimes with a pending resend restored: durable queue rehydrated and resumed. */
+  TRANSPORT_RESUMED: 'transport_resumed',
+  /** The delayed warm restore of the remaining transport runtimes finished. */
+  TRANSPORT_WARM_RESTORED: 'transport_warm_restored',
+} as const;
+export type DaemonStartupPhase = (typeof DAEMON_STARTUP_PHASE)[keyof typeof DAEMON_STARTUP_PHASE];
+export const DAEMON_STARTUP_PHASES: readonly DaemonStartupPhase[] = Object.values(DAEMON_STARTUP_PHASE);
+
+/** File (in the daemon state dir) recording whether the previous process exited on purpose. */
+export const DAEMON_RUN_STATE_FILE = 'daemon-run-state.json';
+export const DAEMON_RUN_STATE = {
+  RUNNING: 'running',
+  /** Written the moment a graceful shutdown starts (SIGTERM from systemctl restart / the upgrade script included). */
+  STOPPING: 'stopping',
+} as const;
+export type DaemonRunState = (typeof DAEMON_RUN_STATE)[keyof typeof DAEMON_RUN_STATE];
+
+export function isDaemonUpgradeDeferral(value: unknown): value is DaemonUpgradeDeferral {
+  return value === DAEMON_UPGRADE_DEFERRAL.STARTING_UP || value === DAEMON_UPGRADE_DEFERRAL.UNCLEAN_SHUTDOWN_RECOVERY;
+}
+
+/** Deferrals that end by themselves after a known time: the server waits for its own timer, not an idle edge. */
+export function isTimeGatedDaemonUpgradeReason(reason: string | null | undefined): boolean {
+  return isDaemonUpgradeDeferral(reason);
+}
+
+/**
+ * Why the server is holding a controlled node's upgrade back. These are
+ * surfaced as `controlled_upgrade_reason` and in the server log, so an operator
+ * can tell "waiting for an idle edge" from "never going to be sent".
+ * `SESSION_BUSY` deliberately reuses {@link DAEMON_UPGRADE_BLOCK_REASON}.
+ */
+export const CONTROLLED_NODE_UPGRADE_WAIT_REASON = {
+  DAEMON_NOT_READY: 'daemon_not_ready',
+  BLOCKED_SYNC_PENDING: 'blocked_sync_pending',
+  LEGACY_RESCUE_PENDING: 'legacy_rescue_pending',
+  /** The operator set IMCODES_DISABLE_AUTO_UPGRADE on this deployment. */
+  DISABLED_BY_ENV: 'auto_upgrade_disabled_by_env',
+  /** The server has no usable APP_VERSION to converge nodes to. */
+  SERVER_VERSION_UNKNOWN: 'server_version_unknown',
+  DAEMON_VERSION_UNKNOWN: 'daemon_version_unknown',
+  /** A failed attempt for this exact target is waiting out its backoff. */
+  RETRY_BACKOFF: 'retry_backoff',
+  /** The daemon authenticated again on the old version after an upgrade was delivered. */
+  VERSION_UNCHANGED_AFTER_UPGRADE: 'version_unchanged_after_upgrade',
+  /**
+   * A legacy Windows node still holds its stale upgrade-in-progress latch and the
+   * next rescue restart (which clears it) is waiting out the shared retry schedule.
+   */
+  LEGACY_RESTART_BACKOFF: 'legacy_restart_backoff',
+  /** The last rescue restart of a latched legacy Windows node could not be run or verified. */
+  LEGACY_RESTART_FAILED: 'legacy_restart_failed',
+} as const;
+
+/**
+ * A full daemon that answered `daemon.upgrade` with one of its busy gates is
+ * asked again after this long (or sooner at a session idle edge, no more often
+ * than {@link DAEMON_UPGRADE_IDLE_EDGE_MIN_INTERVAL_MS}). The retry is only a
+ * new request: the daemon decides again, so this is a trigger, never a gate.
+ */
+export const DAEMON_UPGRADE_BUSY_RETRY_INTERVAL_MS = 5 * 60_000;
+export const DAEMON_UPGRADE_IDLE_EDGE_MIN_INTERVAL_MS = 60_000;
+/** Bounds for a retry scheduled from the daemon's reported cooldown remainder. */
+export const DAEMON_UPGRADE_COOLDOWN_RETRY_MIN_MS = 60_000;
+export const DAEMON_UPGRADE_COOLDOWN_RETRY_MAX_MS = 15 * 60_000;
+
+/**
+ * Retry schedule for a controlled-node upgrade that failed or never completed.
+ * A failure blocks only the exact target that failed, and only for this long;
+ * the last delay repeats so a node that keeps failing is retried a few times a
+ * day rather than every reconnect (restart loop) or never (silently stuck).
+ */
+export const CONTROLLED_NODE_UPGRADE_RETRY_DELAYS_MS = [
+  10 * 60_000,
+  30 * 60_000,
+  2 * 60 * 60_000,
+  6 * 60 * 60_000,
+] as const;
+
+/** `attempts` is the number of upgrade attempts already made for one target. */
+export function controlledNodeUpgradeRetryDelayMs(attempts: number): number {
+  const made = Number.isFinite(attempts) ? Math.trunc(attempts) : 1;
+  const index = Math.min(Math.max(made - 1, 0), CONTROLLED_NODE_UPGRADE_RETRY_DELAYS_MS.length - 1);
+  return CONTROLLED_NODE_UPGRADE_RETRY_DELAYS_MS[index]!;
+}
+
+/**
+ * A server restart reconnects every controlled node within seconds, and each
+ * one would start pulling a ~200 MB artifact at once. Spread the automatic
+ * post-auth trigger over this window, deterministically per node so a given
+ * node's delay is stable and testable.
+ */
+export const CONTROLLED_NODE_UPGRADE_STAGGER_MAX_MS = 15_000;
+
+export function controlledNodeUpgradeStaggerMs(serverId: string): number {
+  let hash = 0;
+  for (let i = 0; i < serverId.length; i += 1) hash = (Math.imul(hash, 31) + serverId.charCodeAt(i)) >>> 0;
+  return hash % CONTROLLED_NODE_UPGRADE_STAGGER_MAX_MS;
+}
+
+export const CONTROLLED_NODE_UPGRADE_STATUS = {
+  CURRENT: 'current',
+  AVAILABLE: 'available',
+  DEFERRED: 'deferred',
+  UPGRADING: 'upgrading',
+  FAILED: 'failed',
+} as const;
+
+export type ControlledNodeUpgradeStatus =
+  (typeof CONTROLLED_NODE_UPGRADE_STATUS)[keyof typeof CONTROLLED_NODE_UPGRADE_STATUS];
+
+export function isRetryableDaemonUpgradeBlockReason(reason: string): boolean {
+  return reason === DAEMON_UPGRADE_BLOCK_REASON.ALREADY_IN_PROGRESS
+    || reason === DAEMON_UPGRADE_BLOCK_REASON.COOLDOWN_ACTIVE
+    || isDaemonUpgradeDeferral(reason)
+    || isDaemonUpgradeBusyBlockReason(reason);
+}
+
+/** Auto-upgrade status of one daemon as the browser sees it (rides daemon.stats). */
+export interface DaemonAutoUpgradeView {
+  status: ControlledNodeUpgradeStatus;
+  /** Wait/block reason: a block reason, a wait reason, or null. */
+  reason: string | null;
+  targetVersion: string | null;
+  /** Epoch ms of the next scheduled automatic retry, when one is armed. */
+  nextRetryAt: number | null;
+}
 
 export interface ControlledNodeUpgradeBlockedMessage {
   [key: string]: unknown;
   type: typeof DAEMON_MSG.UPGRADE_BLOCKED;
   reason: string;
+  targetVersion?: string;
 }
 
 /** CONTROLLED nodes expose only this exact, bounded upgrade-blocker envelope. */
@@ -19,17 +307,17 @@ export function validateControlledNodeUpgradeBlockedMessage(
 ): { ok: true; value: ControlledNodeUpgradeBlockedMessage } | { ok: false } {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return { ok: false };
   const record = value as Record<string, unknown>;
-  if (Object.keys(record).length !== 2) return { ok: false };
   if (record.type !== DAEMON_MSG.UPGRADE_BLOCKED) return { ok: false };
-  if (typeof record.reason !== 'string' || record.reason.length < 1) {
-    return { ok: false };
-  }
+  if (typeof record.reason !== 'string' || record.reason.length < 1) return { ok: false };
+  const keys = Object.keys(record);
+  if (!keys.every((key) => key === 'type' || key === 'reason' || key === 'targetVersion')) return { ok: false };
+  const targetVersion = typeof record.targetVersion === 'string' && DAEMON_UPGRADE_TARGET_VERSION_RE.test(record.targetVersion)
+    ? record.targetVersion
+    : undefined;
+  if (record.targetVersion !== undefined && !targetVersion) return { ok: false };
   return {
     ok: true,
-    // The daemon's exception text is diagnostic only. Bound what crosses the
-    // trust boundary without dropping a recoverable frame merely because an old
-    // runtime included a long URL or platform error in its message.
-    value: { type: DAEMON_MSG.UPGRADE_BLOCKED, reason: record.reason.slice(0, 128) },
+    value: { type: DAEMON_MSG.UPGRADE_BLOCKED, reason: record.reason.slice(0, 128), ...(targetVersion ? { targetVersion } : {}) },
   };
 }
 
@@ -57,6 +345,26 @@ export const DAEMON_UPGRADE_DELIVERY_STATUS = {
   PREPARING_RESCUE: 'preparing_rescue',
   INVALID_TARGET: 'invalid_target',
 } as const;
+
+/** Server-authoritative lifecycle states exposed to the controlled-node UI. */
+export const DAEMON_UPGRADE_LIFECYCLE_STATUS = {
+  PENDING_OFFLINE: 'pending_offline',
+  PENDING_PUBLICATION: 'pending_publication',
+  SENT: 'sent',
+  TERMINAL_BLOCKED: 'terminal_blocked',
+  SUPERSEDED: 'superseded',
+} as const;
+export type DaemonUpgradeLifecycleStatus = typeof DAEMON_UPGRADE_LIFECYCLE_STATUS[keyof typeof DAEMON_UPGRADE_LIFECYCLE_STATUS];
+
+export interface DaemonUpgradeStatusSnapshot {
+  upgradeId: string;
+  targetVersion: string;
+  source: DaemonUpgradeSource;
+  status: DaemonUpgradeLifecycleStatus;
+  createdAt: number;
+  updatedAt: number;
+  lastSentAt: number | null;
+}
 
 export type DaemonUpgradeDeliveryStatus =
   (typeof DAEMON_UPGRADE_DELIVERY_STATUS)[keyof typeof DAEMON_UPGRADE_DELIVERY_STATUS];

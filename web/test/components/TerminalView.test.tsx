@@ -5,6 +5,8 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { h } from 'preact';
 import { render, screen } from '@testing-library/preact';
 
+vi.mock('react-i18next', () => ({ useTranslation: () => ({ t: (key: string) => key }) }));
+
 vi.mock('xterm', () => ({
   Terminal: vi.fn().mockImplementation(() => ({
     open: vi.fn(),
@@ -43,6 +45,7 @@ global.ResizeObserver = vi.fn().mockImplementation(() => ({
 }));
 
 import { TerminalView } from '../../src/components/TerminalView.js';
+import { Terminal as TerminalMock } from 'xterm';
 import type { TerminalDiff } from '../../src/types.js';
 
 describe('TerminalView', () => {
@@ -115,6 +118,7 @@ describe('TerminalView', () => {
     // Component writes cursor-positioned escape sequences for partial updates
     expect(mockWrite).toHaveBeenCalledWith(
       '\x1b[1;1Hline one\x1b[K\x1b[2;1Hline two\x1b[K',
+      expect.any(Function),
     );
   });
 
@@ -257,6 +261,153 @@ describe('TerminalView', () => {
     expect(mockScrollToBottom).toHaveBeenCalledOnce();
   });
 
+  it('bounds a slow xterm writer and requests a full snapshot instead of replaying stale bytes', async () => {
+    vi.useFakeTimers();
+    const { Terminal } = await import('xterm');
+    const writes: Array<{ data: Uint8Array | string; done?: () => void }> = [];
+    const mockWrite = vi.fn((data: Uint8Array | string, done?: () => void) => {
+      writes.push({ data, done });
+    });
+    (Terminal as ReturnType<typeof vi.fn>).mockImplementation(() => ({
+      open: vi.fn(), write: mockWrite, reset: vi.fn(), loadAddon: vi.fn(), dispose: vi.fn(),
+      options: {}, attachCustomKeyEventHandler: vi.fn(), hasSelection: vi.fn().mockReturnValue(false),
+      getSelection: vi.fn().mockReturnValue(''), onData: vi.fn(), onResize: vi.fn(), onScroll: vi.fn(),
+      focus: vi.fn(), scrollToBottom: vi.fn(), buffer: { active: { baseY: 0, viewportY: 0 } }, cols: 80, rows: 24,
+    }));
+
+    let rawHandler: ((data: Uint8Array) => void) | undefined;
+    let applyDiff: ((diff: TerminalDiff) => void) | undefined;
+    const sendSnapshotRequest = vi.fn();
+    const ws = {
+      onTerminalRaw: vi.fn((_session: string, handler: (data: Uint8Array) => void) => {
+        rawHandler = handler;
+        return vi.fn();
+      }),
+      onMessage: vi.fn(() => vi.fn()),
+      sendSnapshotRequest,
+    };
+    render(<TerminalView sessionName="slow-shell" ws={ws as any} onDiff={(fn) => { applyDiff = fn; }} />);
+
+    rawHandler!(new Uint8Array([65]));
+    vi.advanceTimersByTime(16);
+    expect(writes).toHaveLength(1);
+    // The first write is intentionally held open to model a busy parser.
+    rawHandler!(new Uint8Array(64 * 1024 + 1));
+    expect(sendSnapshotRequest).toHaveBeenCalledOnce();
+    expect(writes).toHaveLength(1);
+
+    // The fresh full frame is allowed through and supersedes the stale queue.
+    writes[0]?.done?.();
+    applyDiff?.({ rows: 1, lines: [[0, 'fresh']], fullFrame: true });
+    expect(writes).toHaveLength(2);
+    expect(writes[1]?.data).toContain('\x1b[H');
+  });
+
+  it('lets preview full-frame recovery bypass raw suppression and resume later frames', async () => {
+    vi.useFakeTimers();
+    const { Terminal } = await import('xterm');
+    const writes: Array<{ data: Uint8Array | string; done?: () => void }> = [];
+    const mockWrite = vi.fn((data: Uint8Array | string, done?: () => void) => {
+      writes.push({ data, done });
+    });
+    (Terminal as ReturnType<typeof vi.fn>).mockImplementation(() => ({
+      open: vi.fn(), write: mockWrite, reset: vi.fn(), loadAddon: vi.fn(), dispose: vi.fn(),
+      options: {}, attachCustomKeyEventHandler: vi.fn(), hasSelection: vi.fn().mockReturnValue(false),
+      getSelection: vi.fn().mockReturnValue(''), onData: vi.fn(), onResize: vi.fn(), onScroll: vi.fn(),
+      focus: vi.fn(), scrollToBottom: vi.fn(), buffer: { active: { baseY: 0, viewportY: 0 } }, cols: 80, rows: 24,
+    }));
+
+    let rawHandler: ((data: Uint8Array) => void) | undefined;
+    let applyDiff: ((diff: TerminalDiff) => void) | undefined;
+    const sendSnapshotRequest = vi.fn();
+    const ws = {
+      onTerminalRaw: vi.fn((_session: string, handler: (data: Uint8Array) => void) => {
+        rawHandler = handler;
+        return vi.fn();
+      }),
+      onMessage: vi.fn(() => vi.fn()),
+      sendSnapshotRequest,
+    };
+    render(<TerminalView sessionName="preview-recovery" ws={ws as any} preview onDiff={(fn) => { applyDiff = fn; }} />);
+
+    rawHandler!(new Uint8Array([65]));
+    vi.advanceTimersByTime(32);
+    expect(writes).toHaveLength(1);
+    // Exceed the smaller preview cap while the first parser write is held.
+    rawHandler!(new Uint8Array(16 * 1024 + 1));
+    expect(sendSnapshotRequest).toHaveBeenCalledOnce();
+
+    // The full frame must not be suppressed by the recent raw write.
+    applyDiff?.({ rows: 1, lines: [[0, 'recovered']], fullFrame: true });
+    writes[0]?.done?.();
+    expect(writes).toHaveLength(2);
+    expect(writes[1]?.data).toContain('\x1b[H');
+    writes[1]?.done?.();
+
+    // Recovery clears the suppression window; partial and raw frames resume.
+    applyDiff?.({ rows: 1, lines: [[0, 'live partial']] });
+    expect(writes).toHaveLength(3);
+    writes[2]?.done?.();
+    rawHandler!(new Uint8Array([66]));
+    vi.advanceTimersByTime(32);
+    expect(writes).toHaveLength(4);
+  });
+
+  it.each([false, true])('drops a pending raw batch when an authoritative full frame arrives (preview=%s)', async (preview) => {
+    vi.useFakeTimers();
+    const { Terminal } = await import('xterm');
+    const writes: Array<{ data: Uint8Array | string; done?: () => void }> = [];
+    const mockWrite = vi.fn((data: Uint8Array | string, done?: () => void) => {
+      writes.push({ data, done });
+      done?.();
+    });
+    (Terminal as ReturnType<typeof vi.fn>).mockImplementation(() => ({
+      open: vi.fn(), write: mockWrite, reset: vi.fn(), loadAddon: vi.fn(), dispose: vi.fn(),
+      options: {}, attachCustomKeyEventHandler: vi.fn(), hasSelection: vi.fn().mockReturnValue(false),
+      getSelection: vi.fn().mockReturnValue(''), onData: vi.fn(), onResize: vi.fn(), onScroll: vi.fn(),
+      focus: vi.fn(), scrollToBottom: vi.fn(), buffer: { active: { baseY: 0, viewportY: 0 } }, cols: 80, rows: 24,
+    }));
+
+    let rawHandler: ((data: Uint8Array) => void) | undefined;
+    let applyDiff: ((diff: TerminalDiff) => void) | undefined;
+    const ws = {
+      onTerminalRaw: vi.fn((_session: string, handler: (data: Uint8Array) => void) => {
+        rawHandler = handler;
+        return vi.fn();
+      }),
+      onMessage: vi.fn(() => vi.fn()),
+      sendSnapshotRequest: vi.fn(),
+    };
+    render(<TerminalView sessionName="pending-full-frame" ws={ws as any} preview={preview} onDiff={(fn) => { applyDiff = fn; }} />);
+
+    // Keep raw bytes in the coalescing timer; they must not resurrect
+    // after the authoritative frame replaces the display.
+    rawHandler!(new Uint8Array([65]));
+    expect(writes).toHaveLength(0);
+    applyDiff?.({ rows: 1, lines: [[0, 'authoritative']], fullFrame: true });
+    expect(writes).toHaveLength(1);
+    expect(writes[0]?.data).toContain('authoritative');
+
+    vi.advanceTimersByTime(32);
+    expect(writes).toHaveLength(1);
+  });
+
+  it('ignores a diff callback retained by an unmounted view generation', async () => {
+    const { Terminal } = await import('xterm');
+    const mockWrite = vi.fn();
+    (Terminal as ReturnType<typeof vi.fn>).mockImplementation(() => ({
+      open: vi.fn(), write: mockWrite, reset: vi.fn(), loadAddon: vi.fn(), dispose: vi.fn(),
+      options: {}, attachCustomKeyEventHandler: vi.fn(), hasSelection: vi.fn().mockReturnValue(false),
+      getSelection: vi.fn().mockReturnValue(''), onData: vi.fn(), onResize: vi.fn(), onScroll: vi.fn(),
+      focus: vi.fn(), scrollToBottom: vi.fn(), buffer: { active: { baseY: 0, viewportY: 0 } }, cols: 80, rows: 24,
+    }));
+    let applyDiff: ((diff: TerminalDiff) => void) | undefined;
+    const { unmount } = render(<TerminalView sessionName="stale-view" onDiff={(fn) => { applyDiff = fn; }} />);
+    unmount();
+    applyDiff?.({ rows: 1, lines: [[0, 'late frame']] });
+    expect(mockWrite).not.toHaveBeenCalled();
+  });
+
   it('sends clipboard text to the session when pasting into the terminal', async () => {
     const { Terminal } = await import('xterm');
     const mockFocus = vi.fn();
@@ -303,5 +454,104 @@ describe('TerminalView', () => {
     expect(event.defaultPrevented).toBe(true);
     expect(mockFocus).toHaveBeenCalled();
     expect(sendInput).toHaveBeenCalledWith('paste-session', 'echo pasted\n');
+  });
+
+  it('shows a localized restart action when daemon recovery is exhausted', async () => {
+    let onMessage: ((msg: unknown) => void) | undefined;
+    const onRestart = vi.fn();
+    render(
+      <TerminalView
+        sessionName="recovery-session"
+        onRestart={onRestart}
+        ws={{
+          onTerminalRaw: vi.fn(() => vi.fn()),
+          onMessage: vi.fn((handler: (msg: unknown) => void) => { onMessage = handler; return vi.fn(); }),
+        } as any}
+      />,
+    );
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    onMessage?.({ type: 'terminal.recovery_exhausted', session: 'recovery-session', reason: 'restart_limit' });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(screen.getByTestId('terminal-recovery-error')).toBeTruthy();
+    screen.getByRole('button', { name: 'session.terminal_restart' }).click();
+    expect(onRestart).toHaveBeenCalledOnce();
+  });
+});
+
+describe('TerminalView — diff scroll backlog while frames are stalled', () => {
+  /** rAF that only ENQUEUES. Reproduces a sleeping display: no frames are
+   *  produced, but WebSocket diffs keep arriving because they are I/O, not
+   *  throttled timers. The shared fake-timer config keeps rAF real for the rest
+   *  of the suite, so the stall is installed locally and restored after. */
+  function installStalledRaf() {
+    const queue: FrameRequestCallback[] = [];
+    const cancelled = new Set<number>();
+    const prevRaf = globalThis.requestAnimationFrame;
+    const prevCancel = globalThis.cancelAnimationFrame;
+    let nextId = 1;
+    Object.defineProperty(globalThis, 'requestAnimationFrame', {
+      value: (cb: FrameRequestCallback) => {
+        const id = nextId++;
+        queue.push(((t: number) => { if (!cancelled.has(id)) cb(t); }) as FrameRequestCallback);
+        return id;
+      },
+      configurable: true, writable: true,
+    });
+    Object.defineProperty(globalThis, 'cancelAnimationFrame', {
+      value: (id: number) => { cancelled.add(id); },
+      configurable: true, writable: true,
+    });
+    return {
+      get queued() { return queue.length; },
+      flush() {
+        const batch = queue.splice(0, queue.length);
+        for (const cb of batch) cb(0);
+      },
+      restore() {
+        Object.defineProperty(globalThis, 'requestAnimationFrame', { value: prevRaf, configurable: true, writable: true });
+        Object.defineProperty(globalThis, 'cancelAnimationFrame', { value: prevCancel, configurable: true, writable: true });
+      },
+    };
+  }
+
+  it('coalesces the scroll frame across a burst of partial diffs', async () => {
+    const raf = installStalledRaf();
+    try {
+      let applyDiff!: (d: unknown) => void;
+      render(
+        h(TerminalView, {
+          sessionName: 'stalled-session',
+          onDiff: (fn: (d: unknown) => void) => { applyDiff = fn; },
+        } as never),
+      );
+      await new Promise((r) => setTimeout(r, 60));
+      const baseline = raf.queued;
+
+      // 200 PTY updates arriving while the display is asleep. A naive
+      // rAF-per-diff queued 200 scroll callbacks, all executed inside the first
+      // frame after unlock.
+      for (let i = 0; i < 200; i++) {
+        applyDiff({
+          sessionName: 'stalled-session',
+          lines: [[0, `line ${i}`]],
+          cols: 80,
+          rows: 24,
+          fullFrame: false,
+        });
+      }
+
+      expect(raf.queued - baseline).toBe(1);
+
+      // And the coalesced frame must still actually scroll once frames resume —
+      // dropping the work instead of merging it would leave the terminal stuck
+      // off-bottom.
+      const term = (TerminalMock as unknown as { mock: { results: Array<{ value: { scrollToBottom: ReturnType<typeof vi.fn> } }> } }).mock;
+      const instance = term.results[term.results.length - 1]?.value;
+      instance?.scrollToBottom?.mockClear?.();
+      raf.flush();
+      expect(instance?.scrollToBottom).toHaveBeenCalledTimes(1);
+    } finally {
+      raf.restore();
+    }
   });
 });

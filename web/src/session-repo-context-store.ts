@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'preact/hooks';
+import { FS_SESSION_ROOT_PATH } from '../../src/shared/transport/fs.js';
 
 export const PROJECT_REPO_CONTEXT_SESSION_ID = '*';
 
@@ -142,7 +143,7 @@ export function ingestSessionRepoContext(input: IngestSessionRepoContextInput): 
   const projectKey = makeSessionRepoContextKey(PROJECT_REPO_CONTEXT_SESSION_ID, input.projectDir);
   const existing = contextsByKey.get(key);
   if (isStale(existing, incoming)) return false;
-  if (sessionId !== PROJECT_REPO_CONTEXT_SESSION_ID) {
+  if (sessionId !== PROJECT_REPO_CONTEXT_SESSION_ID && input.projectDir !== FS_SESSION_ROOT_PATH) {
     const projectExisting = contextsByKey.get(projectKey);
     if (isStale(projectExisting, incoming)) return false;
   }
@@ -150,10 +151,19 @@ export function ingestSessionRepoContext(input: IngestSessionRepoContextInput): 
   notify(key);
 
   if (sessionId !== PROJECT_REPO_CONTEXT_SESSION_ID) {
-    const projectExisting = contextsByKey.get(projectKey);
-    if (!isStale(projectExisting, { ...incoming, sessionId: PROJECT_REPO_CONTEXT_SESSION_ID })) {
-      contextsByKey.set(projectKey, { ...incoming, sessionId: PROJECT_REPO_CONTEXT_SESSION_ID });
-      notify(projectKey);
+    if (input.projectDir !== FS_SESSION_ROOT_PATH) {
+      const projectExisting = contextsByKey.get(projectKey);
+      if (!isStale(projectExisting, { ...incoming, sessionId: PROJECT_REPO_CONTEXT_SESSION_ID })) {
+        contextsByKey.set(projectKey, { ...incoming, sessionId: PROJECT_REPO_CONTEXT_SESSION_ID });
+        notify(projectKey);
+      }
+      notify(makeSessionRepoContextKey(sessionId, FS_SESSION_ROOT_PATH));
+    } else {
+      for (const existingKey of contextsByKey.keys()) {
+        if (existingKey.startsWith(`${sessionId}::`) && !existingKey.endsWith(`::${FS_SESSION_ROOT_PATH}`)) {
+          notify(existingKey);
+        }
+      }
     }
   }
 
@@ -166,8 +176,23 @@ export function getSessionRepoContext(
 ): SessionRepoContextSnapshot | null {
   if (!projectDir) return null;
   const exact = contextsByKey.get(makeSessionRepoContextKey(sessionId, projectDir));
-  const project = contextsByKey.get(makeSessionRepoContextKey(PROJECT_REPO_CONTEXT_SESSION_ID, projectDir));
-  return freshestContext(exact, project);
+  const project = projectDir === FS_SESSION_ROOT_PATH
+    ? undefined
+    : contextsByKey.get(makeSessionRepoContextKey(PROJECT_REPO_CONTEXT_SESSION_ID, projectDir));
+  let best = freshestContext(exact, project);
+  if (!best && sessionId && sessionId !== PROJECT_REPO_CONTEXT_SESSION_ID) {
+    if (projectDir === FS_SESSION_ROOT_PATH) {
+      for (const [key, ctx] of contextsByKey) {
+        if (key.startsWith(`${sessionId}::`) && !key.endsWith(`::${FS_SESSION_ROOT_PATH}`)) {
+          best = freshestContext(best ?? undefined, ctx);
+        }
+      }
+    } else {
+      const virtualContext = contextsByKey.get(makeSessionRepoContextKey(sessionId, FS_SESSION_ROOT_PATH));
+      best = virtualContext ?? null;
+    }
+  }
+  return best;
 }
 
 export function subscribeSessionRepoContext(
@@ -179,6 +204,11 @@ export function subscribeSessionRepoContext(
     makeSessionRepoContextKey(sessionId, projectDir),
     makeSessionRepoContextKey(PROJECT_REPO_CONTEXT_SESSION_ID, projectDir),
   ];
+  if (sessionId && sessionId !== PROJECT_REPO_CONTEXT_SESSION_ID) {
+    if (projectDir !== FS_SESSION_ROOT_PATH) {
+      keys.push(makeSessionRepoContextKey(sessionId, FS_SESSION_ROOT_PATH));
+    }
+  }
   for (const key of keys) {
     let listeners = listenersByKey.get(key);
     if (!listeners) {

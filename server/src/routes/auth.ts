@@ -3,17 +3,20 @@ import { getCookie, setCookie, deleteCookie } from 'hono/cookie';
 import type { Env } from '../env.js';
 import type { Database } from '../db/client.js';
 import { createUser, getUserById, getUserByUsername, getSetting, updateUserStatus } from '../db/queries.js';
-import { randomHex, sha256Hex, signJwt, verifyJwt, hashPassword, verifyPassword } from '../security/crypto.js';
+import { randomHex, sha256Hex, signJwt, hashPassword, verifyPassword } from '../security/crypto.js';
 import { checkIdempotency, recordIdempotency } from '../security/replay.js';
 import { checkAuthLockout, recordAuthFailure } from '../security/lockout.js';
-import { resolveServerWebSocketAccess } from '../security/authorization.js';
+import { resolveAuthOutcome, resolveServerWebSocketAccess } from '../security/authorization.js';
+import { isUserActive } from '../security/user-status.js';
 import { WsBridge } from '../ws/bridge.js';
 import { COOKIE_SESSION, COOKIE_CSRF } from '../../../shared/cookie-names.js';
+import { AUTH_ERROR_CODES } from '../../../shared/auth-error-codes.js';
 import { deleteTokenUsageFactsForUser } from '../db/token-usage-queries.js';
 import { z } from 'zod';
 import logger from '../util/logger.js';
 import { CLIENT_TIMEZONE_HEADER } from '../../../shared/http-header-names.js';
 import { rememberClientTimezone } from '../util/client-timezone.js';
+import { revokeBrowserAccountSession } from '../services/remote-desktop-account-auth.js';
 
 export const authRoutes = new Hono<{ Bindings: Env; Variables: { userId: string; role: string } }>();
 
@@ -53,41 +56,10 @@ type AuthRequestMetadata = {
 };
 
 async function resolveUserId(c: AnyAuthContext): Promise<string | null> {
-  // Task 1: Try rcc_session cookie first (parse manually to avoid Hono Context type constraint)
-  const cookieHeader = c.req.header('cookie') ?? '';
-  const cookieMatch = cookieHeader.match(new RegExp(`(?:^|;\\s*)${COOKIE_SESSION}=([^;]+)`));
-  const cookieToken = cookieMatch ? decodeURIComponent(cookieMatch[1]) : null;
-  if (cookieToken && c.env.JWT_SIGNING_KEY) {
-    const jwt = verifyJwt(cookieToken, c.env.JWT_SIGNING_KEY);
-    if (jwt && typeof jwt.sub === 'string' && jwt.type !== 'ws-ticket' && jwt.type !== 'share-ws-ticket') {
-      const user = await getUserById(c.env.DB, jwt.sub);
-      if (user && user.status === 'active') return user.id;
-    }
-  }
-
-  const auth = c.req.header('Authorization');
-  if (!auth?.startsWith('Bearer ')) return null;
-  const bearerToken = auth.slice(7);
-
-  // Try JWT first (web session tokens) — reject single-use ws-ticket tokens
-  const jwtBearer = verifyJwt(bearerToken, c.env.JWT_SIGNING_KEY);
-  if (jwtBearer && typeof jwtBearer.sub === 'string' && jwtBearer.type !== 'ws-ticket' && jwtBearer.type !== 'share-ws-ticket') {
-    const user = await getUserById(c.env.DB, jwtBearer.sub);
-    if (user && user.status === 'active') return user.id;
-  }
-
-  // Fall back to API key check
-  const keyHash = sha256Hex(bearerToken);
-  const row = await c.env.DB.queryOne<{ user_id: string }>(
-    'SELECT user_id FROM api_keys WHERE key_hash = $1 AND revoked_at IS NULL',
-    [keyHash],
-  );
-  if (row) {
-    const apiKeyUser = await getUserById(c.env.DB, row.user_id);
-    if (apiKeyUser && apiKeyUser.status === 'active') return row.user_id;
-  }
-
-  return null;
+  // The ONE credential resolver (security/authorization.ts): login cookie / bearer JWT / API key, each followed by the account check, so a
+  // disabled or pending user holds no identity here either. A daemon server-token is not an account credential for these routes.
+  const resolution = await resolveAuthOutcome(c as unknown as Parameters<typeof resolveAuthOutcome>[0]);
+  return resolution.auth && !resolution.auth.serverId ? resolution.auth.userId : null;
 }
 
 function toClientUser(user: Awaited<ReturnType<typeof getUserById>>) {
@@ -182,7 +154,7 @@ authRoutes.post('/register', async (c) => {
   // Check if registration is enabled
   const regEnabled = await getSetting(c.env.DB, 'registration_enabled');
   if (regEnabled === 'false') {
-    return c.json({ error: 'registration_disabled' }, 403);
+    return c.json({ error: AUTH_ERROR_CODES.REGISTRATION_DISABLED }, 403);
   }
 
   // Idempotency: deduplicate retried registration requests
@@ -452,6 +424,14 @@ authRoutes.post('/token-exchange', async (c) => {
     return c.json({ error: 'invalid_or_expired_nonce' }, 400);
   }
 
+  // The nonce carries a freshly minted API key: a disabled (or pending) user's nonce is consumed and refused, the key is never handed out.
+  if (!await isUserActive(c.env.DB, nonceRow.user_id)) {
+    await logAuthAudit(c, {
+      userId: nonceRow.user_id, action: 'auth.token_exchange', ip, outcomeCode: 'token_exchange_failed', details: { reason: 'account_not_active' },
+    }, c.env.DB);
+    return c.json({ error: 'invalid_or_expired_nonce' }, 400);
+  }
+
   await logAuthAudit(c, {
     userId: nonceRow.user_id,
     action: 'auth.token_exchange',
@@ -477,7 +457,7 @@ authRoutes.post('/refresh', async (c) => {
   const refreshToken = cookieRefresh ?? parsed.data?.refreshToken;
   if (!refreshToken) {
     logger.warn({ hasCookieRefresh: !!cookieRefresh }, '[refresh] no refresh token provided');
-    return c.json({ error: 'invalid_body' }, 400);
+    return c.json({ error: AUTH_ERROR_CODES.INVALID_BODY }, 400);
   }
 
   const tokenHash = sha256Hex(refreshToken);
@@ -502,18 +482,15 @@ authRoutes.post('/refresh', async (c) => {
   if (!refreshUser || refreshUser.status !== 'active') {
     // Consume the token to prevent replay, but don't issue new ones
     await c.env.DB.execute('UPDATE refresh_tokens SET used_at = $1 WHERE id = $2', [Date.now(), row.id]);
-    return c.json({ error: 'account_disabled' }, 403);
+    return c.json({ error: AUTH_ERROR_CODES.ACCOUNT_DISABLED }, 403);
   }
 
-  // Per-IP + per-user lockout check on refresh
-  const refreshIp = c.get('clientIp' as never) as string ?? 'unknown';
-  const refreshIpLockout = await checkAuthLockout(c.env.DB, `ip:${refreshIp}`);
-  if (refreshIpLockout.locked) {
-    return c.json({ error: 'too_many_attempts', retryAfterMs: refreshIpLockout.lockedUntil ? refreshIpLockout.lockedUntil - Date.now() : 0 }, 429);
-  }
+  // A valid refresh token is not a brute-force attempt. In particular, never
+  // consult a shared IP bucket here: one user's password failures must not
+  // invalidate refresh for every other logged-in user.
   const userLockout = await checkAuthLockout(c.env.DB, `user:${row.user_id}`);
   if (userLockout.locked) {
-    return c.json({ error: 'too_many_attempts', retryAfterMs: userLockout.lockedUntil ? userLockout.lockedUntil - Date.now() : 0 }, 429);
+    return c.json({ error: AUTH_ERROR_CODES.TOO_MANY_ATTEMPTS, retryAfterMs: userLockout.lockedUntil ? userLockout.lockedUntil - Date.now() : 0 }, 429);
   }
 
   // Mark old token consumed (rotation)
@@ -638,6 +615,7 @@ authRoutes.delete('/user/me', async (c) => {
 // ── Password auth ─────────────────────────────────────────────────────────
 
 import { validatePasswordComplexity, USERNAME_REGEX } from '../../../shared/password-rules.js';
+import { ACCOUNT_SESSION_JWT_TYPE } from '../../../shared/auth-token-types.js';
 
 // POST /api/auth/password/register — create a new user with username + password
 const passwordRegisterSchema = z.object({
@@ -651,12 +629,12 @@ authRoutes.post('/password/register', async (c) => {
   // Check if registration is enabled
   const regEnabled = await getSetting(c.env.DB, 'registration_enabled');
   if (regEnabled === 'false') {
-    return c.json({ error: 'registration_disabled' }, 403);
+    return c.json({ error: AUTH_ERROR_CODES.REGISTRATION_DISABLED }, 403);
   }
 
   const body = await c.req.json().catch(() => null);
   const parsed = passwordRegisterSchema.safeParse(body);
-  if (!parsed.success) return c.json({ error: 'invalid_body' }, 400);
+  if (!parsed.success) return c.json({ error: AUTH_ERROR_CODES.INVALID_BODY }, 400);
 
   const { username, password, displayName, native } = parsed.data;
 
@@ -669,13 +647,13 @@ authRoutes.post('/password/register', async (c) => {
   // Validate username format
   const normalizedUsername = username.trim().toLowerCase();
   if (!USERNAME_REGEX.test(normalizedUsername)) {
-    return c.json({ error: 'invalid_username_format' }, 400);
+    return c.json({ error: AUTH_ERROR_CODES.INVALID_USERNAME_FORMAT }, 400);
   }
 
   // Check username availability
   const existingUser = await getUserByUsername(c.env.DB, normalizedUsername);
   if (existingUser) {
-    return c.json({ error: 'username_taken' }, 409);
+    return c.json({ error: AUTH_ERROR_CODES.USERNAME_TAKEN }, 409);
   }
 
   // Create user
@@ -707,7 +685,7 @@ authRoutes.post('/password/register', async (c) => {
 
   // Issue session
   const isSecure = (c.req.header('x-forwarded-proto') ?? c.req.url).includes('https');
-  const accessToken = signJwt({ sub: userId, type: 'web' }, c.env.JWT_SIGNING_KEY, 4 * 3600);
+  const accessToken = signJwt({ sub: userId, type: ACCOUNT_SESSION_JWT_TYPE }, c.env.JWT_SIGNING_KEY, 4 * 3600);
   const refreshRaw = randomHex(32);
   const refreshHash = sha256Hex(refreshRaw);
   await c.env.DB.execute(
@@ -755,55 +733,48 @@ const passwordLoginSchema = z.object({
 authRoutes.post('/password/login', async (c) => {
   const body = await c.req.json().catch(() => null);
   const parsed = passwordLoginSchema.safeParse(body);
-  if (!parsed.success) return c.json({ error: 'invalid_body' }, 400);
+  if (!parsed.success) return c.json({ error: AUTH_ERROR_CODES.INVALID_BODY }, 400);
 
   const { username, password, native } = parsed.data;
   const ip = c.get('clientIp' as never) as string ?? 'unknown';
   const normalizedUsername = username.trim().toLowerCase();
 
-  // Triple-dimension lockout checks (OWASP/NIST compliant):
-  // 1. IP — prevents single-source brute force
-  // 2. Username (normalized) — prevents distributed credential stuffing
-  // Both checked BEFORE user lookup to avoid timing side-channels.
-  const ipLockout = await checkAuthLockout(c.env.DB, `ip:${ip}`);
-  if (ipLockout.locked) {
-    return c.json({ error: 'too_many_attempts', retryAfterMs: ipLockout.lockedUntil ? ipLockout.lockedUntil - Date.now() : 0 }, 429);
-  }
-
+  // Account-only lockout checks. IP dimensions are deliberately not used:
+  // a reverse proxy can collapse all users onto one socket address.
+  // Check BEFORE user lookup to avoid timing side-channels.
   const usernameLockout = await checkAuthLockout(c.env.DB, `username:${normalizedUsername}`);
   if (usernameLockout.locked) {
-    return c.json({ error: 'too_many_attempts', retryAfterMs: usernameLockout.lockedUntil ? usernameLockout.lockedUntil - Date.now() : 0 }, 429);
+    return c.json({ error: AUTH_ERROR_CODES.TOO_MANY_ATTEMPTS, retryAfterMs: usernameLockout.lockedUntil ? usernameLockout.lockedUntil - Date.now() : 0 }, 429);
   }
 
   const user = await getUserByUsername(c.env.DB, normalizedUsername);
   if (!user || !user.password_hash) {
-    // Unified failure: record against BOTH ip and username even for non-existent users
-    await recordAuthFailure(c.env.DB, `ip:${ip}`);
-    await recordAuthFailure(c.env.DB, `username:${normalizedUsername}`);
-    return c.json({ error: 'invalid_credentials' }, 401);
+    // Unified failure: record against the attempted username even when it does
+    // not exist. This cannot affect another account.
+    await recordAuthFailure(c.env.DB, `username:${normalizedUsername}`, 'password_login_invalid_credentials');
+    return c.json({ error: AUTH_ERROR_CODES.INVALID_CREDENTIALS }, 401);
   }
 
-  // 3. User ID — prevents abuse of specific known accounts
+  // User ID — prevents abuse of a specific known account.
   const userLockout = await checkAuthLockout(c.env.DB, `user:${user.id}`);
   if (userLockout.locked) {
-    return c.json({ error: 'too_many_attempts', retryAfterMs: userLockout.lockedUntil ? userLockout.lockedUntil - Date.now() : 0 }, 429);
+    return c.json({ error: AUTH_ERROR_CODES.TOO_MANY_ATTEMPTS, retryAfterMs: userLockout.lockedUntil ? userLockout.lockedUntil - Date.now() : 0 }, 429);
   }
 
   const valid = await verifyPassword(password, user.password_hash);
   if (!valid) {
-    await recordAuthFailure(c.env.DB, `ip:${ip}`);
-    await recordAuthFailure(c.env.DB, `username:${normalizedUsername}`);
-    await recordAuthFailure(c.env.DB, `user:${user.id}`);
-    return c.json({ error: 'invalid_credentials' }, 401);
+    await recordAuthFailure(c.env.DB, `username:${normalizedUsername}`, 'password_login_invalid_credentials');
+    await recordAuthFailure(c.env.DB, `user:${user.id}`, 'password_login_invalid_credentials');
+    return c.json({ error: AUTH_ERROR_CODES.INVALID_CREDENTIALS }, 401);
   }
 
   // Reject disabled/pending users
   if (user.status !== 'active') {
-    return c.json({ error: user.status === 'pending' ? 'account_pending' : 'account_disabled' }, 403);
+    return c.json({ error: user.status === 'pending' ? AUTH_ERROR_CODES.ACCOUNT_PENDING : AUTH_ERROR_CODES.ACCOUNT_DISABLED }, 403);
   }
 
   // Issue access (4h) + refresh (30d) tokens
-  const accessToken = signJwt({ sub: user.id, type: 'web' }, c.env.JWT_SIGNING_KEY, 4 * 3600);
+  const accessToken = signJwt({ sub: user.id, type: ACCOUNT_SESSION_JWT_TYPE }, c.env.JWT_SIGNING_KEY, 4 * 3600);
   const refreshRaw = randomHex(32);
   const refreshHash = sha256Hex(refreshRaw);
   const familyId = randomHex(16);
@@ -913,6 +884,15 @@ authRoutes.post('/password/change', async (c) => {
 // POST /api/auth/logout — clear session cookies + invalidate refresh tokens
 authRoutes.post('/logout', async (c) => {
   const userId = await resolveUserId(c);
+
+  // The access JWT remains cryptographically valid after its cookie is removed.
+  // Persist exact-session revocation before clearing it so pending native codes
+  // and action-bound remote-desktop grants cannot survive logout.
+  await revokeBrowserAccountSession(
+    c.env.DB,
+    c.env.JWT_SIGNING_KEY,
+    c.req.header('cookie'),
+  );
 
   // Clear all auth cookies regardless of auth state
   deleteCookie(c, COOKIE_SESSION, { path: '/' });

@@ -16,6 +16,10 @@ export interface TimelineProjectionQuery {
   sessionId: string;
   limit?: number;
   afterTs?: number;
+  /** Optional same-daemon cursor. When supplied, epoch and seq form the
+   * authoritative boundary even when many events share one timestamp. */
+  afterSeq?: number;
+  epoch?: number;
   beforeTs?: number;
   types?: TimelineEventType[];
 }

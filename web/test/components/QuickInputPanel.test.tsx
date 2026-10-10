@@ -49,6 +49,7 @@ vi.mock('../../src/api.js', () => ({
 }));
 
 import { QuickInputPanel, useQuickData, __resetQuickDataForTests, type QuickData } from '../../src/components/QuickInputPanel.js';
+import { AGY_SDK_PROVIDER_ID } from '../../../shared/agy-agent.js';
 
 describe('QuickInputPanel history scope', () => {
   const defaultWidth = window.innerWidth;
@@ -653,6 +654,34 @@ describe('QuickInputPanel history scope', () => {
 
     // The empty model catalogue makes `/model <id>` the free-text entry point
     // for the daemon's DeepSeek Harness model plumbing.
+    const commands = Array.from(document.querySelectorAll('.qp-section-header + .qp-pills .qp-pill-default')).map((el) => el.textContent?.trim());
+    expect(commands).toEqual(expect.arrayContaining(['/clear', '/model']));
+    expect(commands).not.toContain('/compact');
+    expect(commands).not.toContain('/thinking');
+  });
+
+  it('offers /model for Antigravity without unsupported compact/thinking controls', () => {
+    render(
+      <QuickInputPanel
+        open
+        onClose={vi.fn()}
+        onSelect={vi.fn()}
+        onSend={vi.fn()}
+        agentType={AGY_SDK_PROVIDER_ID}
+        sessionName="session-agy"
+        data={{ history: [], sessionHistory: {}, commands: [], phrases: [] }}
+        loaded
+        onAddCommand={vi.fn()}
+        onAddPhrase={vi.fn()}
+        onRemoveCommand={vi.fn()}
+        onRemovePhrase={vi.fn()}
+        onRemoveHistory={vi.fn()}
+        onRemoveSessionHistory={vi.fn()}
+        onClearHistory={vi.fn()}
+        onClearSessionHistory={vi.fn()}
+      />,
+    );
+
     const commands = Array.from(document.querySelectorAll('.qp-section-header + .qp-pills .qp-pill-default')).map((el) => el.textContent?.trim());
     expect(commands).toEqual(expect.arrayContaining(['/clear', '/model']));
     expect(commands).not.toContain('/compact');

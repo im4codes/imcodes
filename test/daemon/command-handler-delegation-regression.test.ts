@@ -1,4 +1,9 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import {
+  clearProcessSharedMachineAuthoritiesForTests,
+  readProcessSharedMachineAuthority,
+  releaseProcessSharedMachineAuthority,
+} from '../../src/daemon/shared-machine-authority-context.js';
 
 const {
   dispatchDelegatedSessionSendMock,
@@ -46,6 +51,8 @@ vi.mock('../../src/agent/session-manager.js', () => ({
 }));
 
 vi.mock('../../src/agent/tmux.js', () => ({
+  BACKEND: 'tmux',
+  preparePrivateInputWriter: vi.fn(),
   sendKeys: vi.fn(),
   sendKeysDelayedEnter: vi.fn(),
   sendRawInput: vi.fn(),
@@ -72,6 +79,7 @@ vi.mock('../../src/daemon/supervision-automation.js', () => ({ supervisionAutoma
 vi.mock('../../src/daemon/git-remote-clone.js', () => ({ maybeCloneGitRemoteToDirectory: vi.fn(async ({ targetDir }: { targetDir: string }) => targetDir) }));
 
 const { handleWebCommand } = await import('../../src/daemon/command-handler.js');
+const { sendKeysDelayedEnter } = await import('../../src/agent/tmux.js');
 
 const flushAsync = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
 
@@ -88,6 +96,7 @@ function serverLink() {
 describe('command-handler delegation routing behavior', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    clearProcessSharedMachineAuthoritiesForTests();
     getSessionMock.mockReturnValue({
       name: 'deck_proj_brain',
       projectName: 'proj',
@@ -102,6 +111,233 @@ describe('command-handler delegation routing behavior', () => {
       contextStatus: 'ok',
       dispatchId: 'snd_dispatch_test',
       messageId: 'snd_msg_test',
+    });
+  });
+
+  it('binds a participant session.send authority to the exact process runtime before agent dispatch', async () => {
+    const identity = { sessionInstanceId: 'instance-shared-1', runtimeEpoch: 'epoch-shared-1' };
+    getSessionMock.mockReturnValue({
+      name: 'deck_proj_brain',
+      projectName: 'proj',
+      projectDir: '/repo',
+      role: 'brain',
+      agentType: 'codex',
+      runtimeType: 'process',
+      state: 'idle',
+      ...identity,
+    });
+
+    handleWebCommand({
+      type: 'session.send',
+      session: 'deck_proj_brain',
+      text: 'use Computer Use locally',
+      commandId: 'shared-local-1',
+      sharedActor: {
+        actorUserId: 'participant-1',
+        effectiveActorRole: 'participant',
+        actionId: 'action-1',
+      },
+      sharedMachineAuthority: 'server-minted-shared-authority',
+    }, serverLink() as any);
+    await flushAsync();
+
+    expect(readProcessSharedMachineAuthority('deck_proj_brain', identity)).toEqual({
+      required: true,
+      authority: 'server-minted-shared-authority',
+    });
+    expect(readProcessSharedMachineAuthority('deck_proj_brain', {
+      ...identity,
+      runtimeEpoch: 'epoch-stale',
+    })).toEqual({ required: true, authority: null });
+  });
+
+  it('retains a deny marker when participant session.send loses its minted authority', async () => {
+    const identity = { sessionInstanceId: 'instance-shared-2', runtimeEpoch: 'epoch-shared-2' };
+    getSessionMock.mockReturnValue({
+      name: 'deck_proj_brain', projectName: 'proj', projectDir: '/repo', role: 'brain',
+      agentType: 'codex', runtimeType: 'process', state: 'idle', ...identity,
+    });
+
+    handleWebCommand({
+      type: 'session.send', session: 'deck_proj_brain', text: 'must fail closed', commandId: 'shared-local-2',
+      sharedActor: { actorUserId: 'participant-1', effectiveActorRole: 'participant', actionId: 'action-2' },
+    }, serverLink() as any);
+    await flushAsync();
+
+    expect(readProcessSharedMachineAuthority('deck_proj_brain', identity))
+      .toEqual({ required: true, authority: null });
+  });
+
+  describe('process session: who fed the terminal / agent in this turn', () => {
+    const identity = { sessionInstanceId: 'instance-shared-3', runtimeEpoch: 'epoch-shared-3' };
+    const participantActor = { actorUserId: 'participant-1', effectiveActorRole: 'participant', actionId: 'action-3' };
+    beforeEach(() => {
+      getSessionMock.mockReturnValue({
+        name: 'deck_proj_brain', projectName: 'proj', projectDir: '/repo', role: 'brain',
+        agentType: 'shell', runtimeType: 'process', state: 'idle', ...identity,
+      });
+    });
+    const input = (extra: Record<string, unknown> = {}) => handleWebCommand({
+      type: 'session.input', sessionName: 'deck_proj_brain', data: 'echo hi\r', ...extra,
+    }, serverLink() as any);
+    const send = (extra: Record<string, unknown> = {}) => handleWebCommand({
+      type: 'session.send', session: 'deck_proj_brain', text: 'hello', commandId: `cmd-${Math.random()}`, ...extra,
+    }, serverLink() as any);
+    const hook = () => readProcessSharedMachineAuthority('deck_proj_brain', identity);
+
+    it('D3/D6: participant keystrokes bind the participant context even when the last admitted turn was the owner\'s', async () => {
+      await send();
+      await flushAsync();
+      expect(hook()).toEqual({ required: false, authority: null });
+      input({ sharedActor: participantActor, sharedMachineAuthority: 'input-token' });
+      await flushAsync();
+      // Owner turn + participant keystrokes in one running turn: closed, never the owner's authority.
+      expect(hook()).toEqual({ required: true, authority: null });
+    });
+
+    it('participant keystrokes alone are bound to that participant; with no token they fail closed', async () => {
+      input({ sharedActor: participantActor, sharedMachineAuthority: 'input-token' });
+      await flushAsync();
+      expect(hook()).toEqual({ required: true, authority: 'input-token' });
+      clearProcessSharedMachineAuthoritiesForTests();
+      input({ sharedActor: participantActor });
+      await flushAsync();
+      expect(hook()).toEqual({ required: true, authority: null });
+    });
+
+    it('D2: an owner message after a participant message does not clear the restriction', async () => {
+      await send({ sharedActor: participantActor, sharedMachineAuthority: 'send-token' });
+      await flushAsync();
+      expect(hook()).toEqual({ required: true, authority: 'send-token' });
+      await send();
+      await flushAsync();
+      expect(hook()).toEqual({ required: true, authority: null });
+    });
+
+    describe('turns that can still run: queued in the TUI, in flight, or not typed yet (one idle edge ends one turn)', () => {
+      let edgeAt = 0;
+      const idleEdge = () => releaseProcessSharedMachineAuthority('deck_proj_brain', Date.now() + (edgeAt += 60_000));
+      const typedCount = () => vi.mocked(sendKeysDelayedEnter).mock.calls.length;
+      /** Wait until `n` messages were written to the terminal (after memory recall and the delivery lock). */
+      const waitTyped = async (n: number) => {
+        const deadline = Date.now() + 8_000;
+        while (typedCount() < n && Date.now() < deadline) await new Promise<void>((resolve) => setTimeout(resolve, 5));
+        await flushAsync();
+        expect(typedCount()).toBeGreaterThanOrEqual(n);
+      };
+      const record = (state: string) => getSessionMock.mockReturnValue({
+        name: 'deck_proj_brain', projectName: 'proj', projectDir: '/repo', role: 'brain',
+        agentType: 'claude-code', runtimeType: 'process', state, ...identity,
+      });
+      beforeEach(() => record('idle'));
+
+      it('A: a second participant message sent while the first turn runs is still bound after the first idle', async () => {
+        record('running');
+        await send({ sharedActor: participantActor, sharedMachineAuthority: 'tok-1' });
+        await send({ sharedActor: participantActor, sharedMachineAuthority: 'tok-2' });
+        await waitTyped(2);
+        idleEdge(); // the turn the daemon never saw (running record) ends
+        expect(hook()).toEqual({ required: true, authority: 'tok-2' });
+        idleEdge(); // first participant turn ends; the queued one starts
+        expect(hook()).toEqual({ required: true, authority: 'tok-2' });
+        idleEdge();
+        expect(hook()).toEqual({ required: false, authority: null });
+      });
+
+      it('P0-a: a participant message while a turn the daemon never tracked is running (empty window) outlives the first idle', async () => {
+        record('running');
+        await send({ sharedActor: participantActor, sharedMachineAuthority: 'tok-1' });
+        await waitTyped(1);
+        idleEdge(); // T0 ends, the queued participant turn starts
+        expect(hook()).toEqual({ required: true, authority: 'tok-1' });
+        idleEdge();
+        expect(hook()).toEqual({ required: false, authority: null });
+      });
+
+      it('regression: the same message on an idle record is released by its own idle edge', async () => {
+        await send({ sharedActor: participantActor, sharedMachineAuthority: 'tok-1' });
+        await waitTyped(1);
+        idleEdge();
+        expect(hook()).toEqual({ required: false, authority: null });
+      });
+
+      it('P0-b: owner A, owner B queued, idle, participant C queued behind B, idle: C is still bound', async () => {
+        await send();
+        await send();
+        await waitTyped(2);
+        idleEdge(); // A ends; B runs
+        await send({ sharedActor: participantActor, sharedMachineAuthority: 'tok-c' });
+        await waitTyped(3);
+        idleEdge(); // B ends; C runs
+        expect(hook()).toEqual({ required: true, authority: 'tok-c' });
+        idleEdge();
+        expect(hook()).toEqual({ required: false, authority: null });
+      });
+
+      it('B: a participant message queued behind an owner turn runs bound after the idle edge', async () => {
+        await send();
+        await send({ sharedActor: participantActor, sharedMachineAuthority: 'tok-q' });
+        await waitTyped(2);
+        expect(hook()).toEqual({ required: true, authority: null });
+        idleEdge();
+        expect(hook()).toEqual({ required: true, authority: 'tok-q' });
+        idleEdge();
+        expect(hook()).toEqual({ required: false, authority: null });
+      });
+
+      it('delivery gap: an idle edge that arrives before the bound message is typed does not release it', async () => {
+        record('running');
+        let release!: () => void;
+        const gate = new Promise<void>((resolve) => { release = resolve; });
+        vi.mocked(sendKeysDelayedEnter).mockImplementationOnce(() => gate as never);
+        await send({ sharedActor: participantActor, sharedMachineAuthority: 'tok-gap' });
+        // The delivery is held (recall / delivery lock): nothing typed yet. T0 (running record) ends meanwhile.
+        for (let i = 0; i < 20 && typedCount() < 1; i += 1) await new Promise<void>((resolve) => setTimeout(resolve, 5));
+        idleEdge();
+        expect(hook()).toEqual({ required: true, authority: 'tok-gap' });
+        release();
+        await flushAsync();
+        idleEdge(); // now the participant's own turn ends
+        expect(hook()).toEqual({ required: false, authority: null });
+      });
+
+      it('a send that fails before it is typed leaves no phantom turn', async () => {
+        await send({ sharedActor: participantActor, sharedMachineAuthority: 'tok-1' });
+        await waitTyped(1);
+        vi.mocked(sendKeysDelayedEnter).mockRejectedValueOnce(new Error('tmux gone'));
+        await send({ sharedActor: participantActor, sharedMachineAuthority: 'tok-2' });
+        await flushAsync();
+        idleEdge();
+        expect(hook()).toEqual({ required: false, authority: null });
+      });
+
+      it('submitted terminal lines count as queued turns; plain typing does not', async () => {
+        input({ sharedActor: participantActor, sharedMachineAuthority: 'k1', data: 'abc' });
+        input({ sharedActor: participantActor, sharedMachineAuthority: 'k2', data: 'def\r' });
+        await flushAsync();
+        idleEdge();
+        expect(hook()).toEqual({ required: false, authority: null });
+        input({ sharedActor: participantActor, sharedMachineAuthority: 'k3', data: 'one\r' });
+        input({ sharedActor: participantActor, sharedMachineAuthority: 'k4', data: 'two\r' });
+        await flushAsync();
+        idleEdge();
+        expect(hook()).toEqual({ required: true, authority: 'k4' });
+        idleEdge();
+        expect(hook()).toEqual({ required: false, authority: null });
+      });
+    });
+
+    it('owner-only keystrokes and messages keep the unrestricted path', async () => {
+      input();
+      await send();
+      await flushAsync();
+      expect(hook()).toEqual({ required: false, authority: null });
+    });
+
+    it('a forged sharedActor on a participant-less (owner) frame cannot widen anything: it is only ever a restriction', async () => {
+      input({ sharedActor: { actorUserId: 'x', effectiveActorRole: 'owner' }, sharedMachineAuthority: 'ignored-for-owner' });
+      await flushAsync();
+      expect(hook()).toEqual({ required: false, authority: null });
     });
   });
 

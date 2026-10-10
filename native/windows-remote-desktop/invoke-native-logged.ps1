@@ -23,8 +23,9 @@ function Invoke-NativeLogged {
     $ErrorActionPreference = $PreviousErrorActionPreference
   }
   if ($null -eq $NativeExitCode -or $NativeExitCode -ne 0) {
+    $OutputText = Get-Content -Raw -LiteralPath $Stdout -ErrorAction SilentlyContinue
     $ErrorText = Get-Content -Raw -LiteralPath $Stderr -ErrorAction SilentlyContinue
     $ExitDescription = if ($null -eq $NativeExitCode) { 'no native exit code' } else { $NativeExitCode }
-    throw "$Name failed ($ExitDescription): $ErrorText"
+    throw "$Name failed ($ExitDescription): stdout=$OutputText stderr=$ErrorText"
   }
 }

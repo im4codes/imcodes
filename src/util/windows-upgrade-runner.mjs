@@ -44,6 +44,7 @@
  *   process.argv[6] = absolute path to script_dir (for self-cleanup)
  *   process.argv[7] = npm registry to pin (or "-" for npm's ambient default)
  *   process.argv[8] = current daemon version (for the latest downgrade guard)
+ *   process.argv[9] = npm global prefix owning the running daemon package
  *
  * Exit code:
  *   0 on success or expected abort (install fail, version mismatch).
@@ -53,16 +54,32 @@
 
 import { spawnSync, spawn, execSync } from 'node:child_process';
 import {
-  appendFileSync, existsSync, mkdirSync, readFileSync,
+  appendFileSync, copyFileSync, existsSync, mkdirSync, readFileSync,
   rmSync, unlinkSync, writeFileSync,
 } from 'node:fs';
 import { homedir } from 'node:os';
-import { basename, dirname, join } from 'node:path';
+import { basename, delimiter, dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { parseWatchdogProcessListing, windowsTaskName } from './windows-daemon-watchdog.mjs';
 
-const HOME = homedir();
-const LOCK = join(HOME, '.imcodes', 'upgrade.lock');
-const PIDFILE = join(HOME, '.imcodes', 'daemon.pid');
-const DAEMON_TASK = 'imcodes-daemon';
+// IMCODES_HOME is already the state directory.  Otherwise honor an explicit
+// HOME override before falling back to the platform homedir; this keeps
+// upgrade.lock and daemon.pid scoped to the same instance as the daemon lock.
+function resolveImcodesStateDir() {
+  const configured = process.env.IMCODES_HOME?.trim();
+  if (configured) return resolve(configured);
+  const home = process.env.HOME?.trim() || process.env.USERPROFILE?.trim() || homedir();
+  return resolve(join(home, '.imcodes'));
+}
+
+const IMCODES_HOME = resolveImcodesStateDir();
+const LOCK = join(IMCODES_HOME, 'upgrade.lock');
+const PIDFILE = join(IMCODES_HOME, 'daemon.pid');
+const DEFAULT_STATE_DIR = resolve(join(
+  process.env.IMCODES_DEFAULT_HOME?.trim() || homedir(),
+  '.imcodes',
+));
+const DAEMON_TASK = windowsTaskName('daemon', IMCODES_HOME, DEFAULT_STATE_DIR);
 
 const LOG_FILE = process.argv[2];
 const NPM_CMD = process.argv[3];
@@ -72,6 +89,7 @@ const SCRIPT_DIR = process.argv[6];
 // "-" sentinel means "use npm's ambient/default registry" (no --registry flag).
 const REGISTRY = process.argv[7] && process.argv[7] !== '-' ? process.argv[7] : null;
 const CURRENT_VER = process.argv[8] || null;
+const NPM_PREFIX = process.argv[9]?.trim() || null;
 
 /** Compare two daemon version strings (release + optional prerelease).
  *  Returns <0 if a<b, 0 if equal, >0 if a>b. Mirrors the in-script
@@ -135,6 +153,10 @@ function trace(step, stage, extra) {
  *  a tight 60 s budget — none of them have any reason to take longer. */
 const NPM_INSTALL_TIMEOUT_MS = 10 * 60_000;
 const FAST_CMD_TIMEOUT_MS = 60_000;
+/** How long the health check waits for a new daemon, and how much longer when a daemon was running before
+ *  (a cold start after an upgrade can be slow). Overridable so the rollback path is testable in seconds. */
+const HEALTH_CHECK_MS = Number(process.env.IMCODES_UPGRADE_HEALTH_MS) || 15_000;
+const HEALTH_CHECK_EXTENDED_MS = Number(process.env.IMCODES_UPGRADE_HEALTH_EXTENDED_MS) || 120_000;
 
 function sleepMs(ms) {
   // Synchronous sleep without setTimeout — matches the rest of the
@@ -240,7 +262,7 @@ function spawnNpm(npmCmd, args, options) {
   const npmDir = dirname(npmCmd);
   const env = {
     ...(opts.env ?? process.env),
-    PATH: `${npmDir};${(opts.env?.PATH ?? process.env.PATH ?? '')}`,
+    PATH: `${npmDir}${delimiter}${(opts.env?.PATH ?? process.env.PATH ?? '')}`,
   };
   const result = spawnSync('npm', args, { ...opts, env, shell: true });
   if (result.error) log(`spawnNpm(shell npm) error: ${result.error.code ?? ''} ${result.error.message}`);
@@ -257,7 +279,7 @@ function spawnCmdShim(shimCmd, args, options) {
   const baseName = basename(shimCmd).replace(/\.(cmd|bat)$/i, '');
   const env = {
     ...(opts.env ?? process.env),
-    PATH: `${dir};${(opts.env?.PATH ?? process.env.PATH ?? '')}`,
+    PATH: `${dir}${delimiter}${(opts.env?.PATH ?? process.env.PATH ?? '')}`,
   };
   const result = spawnSync(baseName, args, { ...opts, env, shell: true });
   if (result.error) log(`spawnCmdShim(${baseName}) error: ${result.error.code ?? ''} ${result.error.message}`);
@@ -278,23 +300,22 @@ function killStaleWatchdogs() {
   const psScript =
     "Get-CimInstance Win32_Process -Filter \"Name='cmd.exe'\" | " +
     "Where-Object { $_.CommandLine -like '*daemon-watchdog*' } | " +
-    "ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }";
+    "ForEach-Object { \"$($_.ProcessId)`t$($_.CommandLine)\" }";
   try {
-    execSync(`powershell -NoProfile -NonInteractive -Command "${psScript}"`, {
-      stdio: 'ignore', windowsHide: true,
+    const out = execSync(`powershell -NoProfile -NonInteractive -Command "${psScript}"`, {
+      encoding: 'utf8', windowsHide: true,
     });
+    for (const pid of parseWatchdogProcessListing(out, IMCODES_HOME, DEFAULT_STATE_DIR)) {
+      tryKillPid(pid);
+    }
     return;
   } catch { /* fall through to wmic */ }
   try {
     const out = execSync(
-      'wmic process where "Name=\'cmd.exe\' and CommandLine like \'%daemon-watchdog%\'" get ProcessId /format:list',
+      `wmic process where "Name='cmd.exe' and CommandLine like '%daemon-watchdog%'" get ProcessId,CommandLine /format:list`,
       { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true },
     );
-    const pids = out.split(/\r?\n/)
-      .map((line) => line.match(/^ProcessId=(\d+)/))
-      .filter((m) => m !== null)
-      .map((m) => parseInt(m[1], 10))
-      .filter((pid) => Number.isFinite(pid) && pid > 0);
+    const pids = parseWatchdogProcessListing(out, IMCODES_HOME, DEFAULT_STATE_DIR);
     for (const pid of pids) tryKillPid(pid);
   } catch { /* both methods failed — best effort */ }
 }
@@ -304,6 +325,7 @@ function killStaleWatchdogs() {
  *  this lives under different roots — the only authoritative source
  *  is `npm prefix -g` itself. */
 function resolveNpmPrefix() {
+  if (NPM_PREFIX) return NPM_PREFIX;
   try {
     const r = spawnNpm(NPM_CMD, ['prefix', '-g'], {
       encoding: 'utf8', windowsHide: true,
@@ -342,7 +364,7 @@ function sharpRepair(npmPrefix) {
     const dir = join(root, dep);
     const pkgJson = join(dir, 'package.json');
     if (!existsSync(pkgJson) && existsSync(dir)) {
-      try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+      try { cleanTree(dir); } catch { /* ignore */ }
     }
   }
   const imcodesDir = join(npmPrefix, 'node_modules', 'imcodes');
@@ -402,9 +424,12 @@ function nodeDatachannelRepair(npmPrefix) {
  *  cleanly without holding open file handles in SCRIPT_DIR. */
 function scheduleTmpDelete() {
   if (!SCRIPT_DIR) return;
+  // The shared helper removes the tree and proves it is gone (Node 24's rmSync silently keeps a path with
+  // non-ASCII characters on Windows, and a Chinese user name puts them in %TEMP%). It runs from its own
+  // loaded copy, so deleting the directory it sits in is fine.
   const detached = spawn(process.execPath, [
     '-e',
-    `setTimeout(() => { try { require('fs').rmSync(${JSON.stringify(SCRIPT_DIR)}, { recursive: true, force: true }); } catch {} }, 60_000);`,
+    `setTimeout(() => { try { require('child_process').spawnSync(process.execPath, [${JSON.stringify(STAGED_INSTALL_HELPER)}, 'clean', '--path', ${JSON.stringify(SCRIPT_DIR)}], { stdio: 'ignore' }); } catch {} }, 60_000);`,
   ], { detached: true, stdio: 'ignore', windowsHide: true });
   detached.unref();
 }
@@ -421,61 +446,194 @@ function scheduleTmpDelete() {
  *  verify or any later step had failed.  Now: fail = preserve. */
 let upgradeSucceeded = false;
 
-async function main() {
-  log('=== upgrade started ===');
-  log(`pkg: ${PKG_SPEC}, target: ${TARGET_VER}`);
-  log(`npm: ${NPM_CMD}`);
-  log(`script_dir: ${SCRIPT_DIR}`);
-  log(`runner_pid: ${process.pid}`);
-  trace(0, 'main-entry');
+/** The shared staged-install helper, staged next to this runner (it is a separate file so the swap logic
+ *  exists once for POSIX and Windows; it is spawned, never imported). */
+const STAGED_INSTALL_HELPER = join(dirname(fileURLToPath(import.meta.url)), 'staged-package-install.mjs');
 
-  // Step 1: Acquire upgrade lock (watchdog will park on it).
-  // Use a directory write — even if upgrade.lock's parent .imcodes
-  // doesn't yet exist for some reason, mkdir is idempotent.
-  mkdirSync(join(HOME, '.imcodes'), { recursive: true });
-  writeFileSync(LOCK, 'upgrade');
-  trace(1, 'lock-acquired');
+/** Run one command of the helper. stdout/stderr go to the log; the caller reads `.status` (see the helper's exit codes). */
+function stagedInstall(command, args, timeout = 10 * 60_000) {
+  const result = spawnSync(process.execPath, [STAGED_INSTALL_HELPER, command, ...args], {
+    encoding: 'utf8', windowsHide: true, timeout, killSignal: 'SIGKILL',
+  });
+  if (result.error) log(`[staged-install ${command}] spawn error: ${result.error.code ?? ''} ${result.error.message}`);
+  for (const line of String(result.stdout ?? '').split(/\r?\n/)) {
+    if (line.trim() && !line.startsWith('VERIFIED_VERSION=')) log(line.trim());
+  }
+  if (result.stderr) log(`[staged-install ${command}] ${String(result.stderr).trim()}`);
+  return result;
+}
 
-  // Step 2: Capture old daemon PID.
-  const oldPid = readNumber(PIDFILE);
-  log(`old daemon PID: ${oldPid ?? 'none'} (kill only after install succeeds)`);
-  trace(2, 'old-pid-captured', `pid=${oldPid ?? 'none'}`);
+/** Remove a directory tree through the shared helper, which verifies it is really gone. */
+function cleanTree(path) {
+  const result = stagedInstall('clean', ['--path', path], 3 * 60_000);
+  if (result.status !== 0) log(`could not remove ${path} [exit ${result.status}] — a later run's recover sweeps it`);
+}
 
-  // Step 3: npm install (bounded heap, bounded wall-clock).  Old daemon
-  // stays alive — its .js modules were loaded into V8 at startup, so npm
-  // overwriting them on disk doesn't affect the running process.
-  const env = {
-    ...process.env,
-    // Cap heap at 4 GB.  Older versions accumulated --max-old-space-size
-    // flags across upgrades because the daemon's relaunched env inherited
-    // our setlocal value; that bug is gone now (we don't mutate process
-    // env, we just pass a fresh env object to the npm child).
-    NODE_OPTIONS: '--max-old-space-size=4096',
-  };
-  log(`installing ${PKG_SPEC}...`);
+function isAlive(pid) {
+  if (!pid) return false;
+  try { process.kill(pid, 0); return true; } catch (error) { return error?.code === 'EPERM'; }
+}
+
+/** Stop a process and everything it started (workers, MCP servers: they hold the addons). Bounded. */
+function stopProcessTree(pid, waitMs = 20_000) {
+  if (!pid || pid === process.pid) return;
+  if (process.platform === 'win32') {
+    try { execSync(`taskkill /f /t /pid ${pid}`, { stdio: 'ignore', windowsHide: true, timeout: FAST_CMD_TIMEOUT_MS }); } catch { /* not running */ }
+  } else {
+    try { process.kill(pid, 'SIGKILL'); } catch { /* not running */ }
+  }
+  const deadline = Date.now() + waitMs;
+  while (isAlive(pid) && Date.now() < deadline) sleepMs(250);
+  if (isAlive(pid)) log(`process ${pid} is still alive ${waitMs} ms after the kill — continuing; the swap will report a lock if it matters`);
+}
+
+/**
+ * Processes whose command line names the live package directory (a stdio MCP server an agent started from
+ * it, a worker the daemon's tree kill missed) hold files inside it and would block the rename. They run the
+ * package that is about to be replaced, so they stop with it. Windows only: a POSIX rename does not care.
+ */
+function stopPackageLockers(packageDir) {
+  if (process.platform !== 'win32') return;
+  const needle = packageDir.replaceAll('/', '\\').toLowerCase().replaceAll("'", "''");
+  // The `imcodes upgrade` command that launched this run also runs from the package and follows the log: it is not a locker.
+  const script = `Get-CimInstance Win32_Process | Where-Object { $_.ProcessId -ne ${process.pid} -and $_.CommandLine -and $_.CommandLine.ToLower().Contains('${needle}') -and $_.CommandLine -notmatch '\\supgrade(\\s|$)' } | ForEach-Object { $_.ProcessId }`;
+  let out = '';
+  try {
+    // -EncodedCommand: no shell quoting of a path that may hold spaces, quotes or non-ASCII.
+    const encoded = Buffer.from(script, 'utf16le').toString('base64');
+    out = execSync(`powershell -NoProfile -NonInteractive -EncodedCommand ${encoded}`, { encoding: 'utf8', windowsHide: true, timeout: FAST_CMD_TIMEOUT_MS });
+  } catch (error) {
+    log(`lockers query failed: ${error?.message ?? error}`);
+    return;
+  }
+  for (const line of out.split(/\r?\n/)) {
+    const pid = Number.parseInt(line.trim(), 10);
+    if (Number.isInteger(pid) && pid > 0 && pid !== process.pid) {
+      log(`stopping PID ${pid}: its command line names ${packageDir}`);
+      stopProcessTree(pid, 10_000);
+    }
+  }
+}
+
+/** Wait up to `ms` for a live daemon whose pid is not one we killed. */
+function waitForNewDaemon(killedPids, ms) {
+  const deadline = Date.now() + ms;
+  while (Date.now() < deadline) {
+    sleepMs(500);
+    const pid = readNumber(PIDFILE);
+    if (pid && !killedPids.has(pid) && isAlive(pid)) return pid;
+  }
+  return null;
+}
+
+/** Regenerate the launch chain through the live package's shim and ask Task Scheduler to own the watchdog. */
+function relaunchDaemon(shim, stepLabel) {
+  trace(7, `pre-repair-watchdog${stepLabel}`);
+  log(`regenerating launch chain via repair-watchdog${stepLabel}`);
+  try {
+    const r = spawnCmdShim(shim, ['repair-watchdog'], {
+      stdio: ['ignore', 'pipe', 'pipe'], encoding: 'utf8', windowsHide: true, timeout: FAST_CMD_TIMEOUT_MS,
+    });
+    if (r.status !== 0) log(`repair-watchdog exit ${r.status}: ${(r.stderr || '').trim()}`);
+    trace(7, `post-repair-watchdog${stepLabel}`, `exit=${r.status}`);
+  } catch (e) {
+    log(`repair-watchdog warning: ${e?.message ?? e}`);
+  }
+  // Never spawn VBS directly: that creates an unmanaged watchdog Task Scheduler cannot observe or recover.
+  trace(8, `pre-scheduled-task-launch${stepLabel}`);
+  log(`starting new watchdog via Task Scheduler${stepLabel}`);
+  try {
+    const taskStart = spawnSync('schtasks', ['/Run', '/TN', DAEMON_TASK], {
+      stdio: ['ignore', 'pipe', 'pipe'], encoding: 'utf8', windowsHide: true, timeout: FAST_CMD_TIMEOUT_MS,
+    });
+    trace(8, `post-scheduled-task-launch${stepLabel}`, `exit=${taskStart.status}`);
+    if (taskStart.status !== 0) log(`scheduled task start warning [exit ${taskStart.status}]: ${(taskStart.stderr || '').trim()}`);
+  } catch (e) {
+    log(`scheduled task start warning: ${e?.message ?? e}`);
+    trace(8, `scheduled-task-launch-failed${stepLabel}`);
+  }
+}
+
+/** The package's bin names, to find their shims in an npm prefix root. */
+function binNamesOf(packageDir) {
+  try {
+    const pkg = JSON.parse(readFileSync(join(packageDir, 'package.json'), 'utf8'));
+    return typeof pkg.bin === 'string' ? [pkg.name ?? 'imcodes'] : Object.keys(pkg.bin ?? {});
+  } catch {
+    return ['imcodes'];
+  }
+}
+
+const SHIM_SUFFIXES = ['', '.cmd', '.ps1'];
+
+/** Copy the shims of `names` from one prefix root to another (npm writes them at the prefix root). Best effort. */
+function copyShims(fromRoot, toRoot, names) {
+  for (const name of names) {
+    for (const suffix of SHIM_SUFFIXES) {
+      const source = join(fromRoot, `${name}${suffix}`);
+      if (!existsSync(source)) continue;
+      try { copyFileSync(source, join(toRoot, `${name}${suffix}`)); } catch (error) {
+        log(`could not copy shim ${name}${suffix}: ${error?.code ?? error?.message ?? error}`);
+      }
+    }
+  }
+}
+
+/**
+ * Stage, verify, stop the daemon, switch, relaunch, health-check, roll back on failure.
+ * Returns true when the run ended in a state worth a clean exit (upgraded, or already current).
+ * The daemon is left running, and the old package in place, on every failure BEFORE the stop;
+ * after the stop a failed switch or an unhealthy new package puts the old package back and relaunches it.
+ */
+async function stageAndSwap(npmPrefix, oldPid, env) {
+  const globalRoot = join(npmPrefix, 'node_modules');
+  const livePackage = join(globalRoot, 'imcodes');
+  const stagePrefix = join(npmPrefix, `.imcodes-stage.${process.pid}`);
+  const stagedPackage = join(stagePrefix, 'node_modules', 'imcodes');
+  const tag = String(process.pid);
+  const swapArgs = ['--global-root', globalRoot, '--stage-prefix', stagePrefix, '--tag', tag, '--node', process.execPath];
+  const shim = join(npmPrefix, 'imcodes.cmd');
+  const killed = new Set(oldPid ? [oldPid] : []);
+
+  // A run that died between its two renames leaves no live package; put it back before anything else,
+  // and drop what dead upgrades left behind.
+  trace(3, 'pre-recover');
+  stagedInstall('recover', ['--global-root', globalRoot], 2 * 60_000);
+
+  // Refuse before changing anything: prefix not writable, not enough free disk (2x the package).
+  let expectedBytes = '';
+  const view = spawnNpm(NPM_CMD, ['view', '--prefer-online', ...(REGISTRY ? ['--registry', REGISTRY] : []), PKG_SPEC, 'dist.unpackedSize', '--json'], {
+    env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, timeout: FAST_CMD_TIMEOUT_MS,
+  });
+  const reported = Number.parseInt(String(view.stdout ?? '').trim().replace(/^"|"$/g, ''), 10);
+  if (view.status === 0 && Number.isFinite(reported) && reported > 0) expectedBytes = String(reported);
+  const preflight = stagedInstall('preflight', ['--global-root', globalRoot, '--pkg', PKG_SPEC, ...(expectedBytes ? ['--expected-bytes', expectedBytes] : [])], 2 * 60_000);
+  if (preflight.status !== 0) {
+    log(`preflight refused the upgrade [exit ${preflight.status}] — nothing was changed; the old daemon keeps running`);
+    return false;
+  }
+
+  // Stage: npm writes into a sibling prefix (same volume), never into the live package.
+  log(`installing ${PKG_SPEC} into the staging prefix ${stagePrefix}...`);
   trace(3, 'pre-npm-install');
   const installStartedAt = Date.now();
   if (REGISTRY) log(`pinning npm registry: ${REGISTRY}`);
+  cleanTree(stagePrefix);
+  mkdirSync(stagePrefix, { recursive: true });
   const installResult = spawnNpm(
     NPM_CMD,
-    // --ignore-scripts: sharp's install hook is unreliable on global
-    // npm-prefix installs (see sharpRepair() doc).  Skip post-install,
-    // we'll nest-install sharp ourselves below.
-    // --registry pins the same source the daemon's pre-flight probe used.
-    // --fetch-retries / --fetch-timeout: `npm install -g` removes the old
-    // install's files before completing the new one, so a SINGLE transient
-    // network drop (ECONNRESET) mid-download aborts the install and leaves
-    // BOTH the old and new versions broken — imcodes.cmd + node_modules gone —
-    // which permanently bricks the daemon (workers can't spawn, watchdog can't
-    // relaunch the missing shim). Observed on a flaky-network Windows host that
-    // "kept dying after every upgrade". Retrying the network fetches turns a
-    // transient blip into a slow-but-successful upgrade instead of a brick.
+    // --ignore-scripts: sharp's install hook is unreliable on global npm-prefix installs (see sharpRepair()
+    // doc); skip post-install and nest-install sharp ourselves below. --registry pins the same source the
+    // daemon's pre-flight probe used. --fetch-retries / --fetch-timeout: a transient network drop
+    // (ECONNRESET) mid-download must not abort the install; retrying turns a blip into a slow success.
+    // --prefix: the STAGE. The live package is not touched until it verifies.
     [
       'install', '-g', '--ignore-scripts',
       '--fetch-retries', '4',
       '--fetch-retry-mintimeout', '10000',
       '--fetch-retry-maxtimeout', '120000',
       '--fetch-timeout', '300000',
+      '--prefix', stagePrefix,
       ...(REGISTRY ? ['--registry', REGISTRY] : []),
       PKG_SPEC,
     ],
@@ -488,13 +646,183 @@ async function main() {
   if (installResult.stdout) log(`npm stdout: ${installResult.stdout.trim()}`);
   if (installResult.stderr) log(`npm stderr: ${installResult.stderr.trim()}`);
   trace(3, 'post-npm-install', `exit=${installResult.status} signal=${installResult.signal ?? 'none'} elapsed=${installElapsedMs}ms`);
-  if (installResult.status !== 0) {
-    log(`install FAILED (exit ${installResult.status}, signal ${installResult.signal ?? 'none'}) — old daemon untouched, lock released`);
-    return;  // finally clears the lock; tmp dir preserved (success flag stays false)
+  if (installResult.status !== 0 || !existsSync(stagedPackage)) {
+    log(`install FAILED [exit ${installResult.status} signal ${installResult.signal ?? 'none'}] — the stage is discarded, the old package and daemon are untouched, lock released`);
+    cleanTree(stagePrefix);
+    return false;
   }
-  log('install OK');
+  log('install OK (staged)');
 
-  // Step 4: Verify install — shim must exist, version must match (if pinned).
+  // Repairs run on the STAGE, so what gets switched in is complete.
+  trace(5, 'pre-sharp-repair');
+  try { sharpRepair(stagePrefix); } catch (e) { log(`sharp repair threw: ${e?.message ?? e}`); }
+  trace(5, 'post-sharp-repair');
+  trace(5, 'pre-node-datachannel-repair');
+  try { nodeDatachannelRepair(stagePrefix); } catch (e) { log(`node-datachannel repair threw: ${e?.message ?? e}`); }
+  trace(5, 'post-node-datachannel-repair');
+
+  // Verify BEFORE the daemon is touched: bins present, entry script prints the target version.
+  const verify = spawnSync(process.execPath, [STAGED_INSTALL_HELPER, 'verify', '--pkg-dir', stagedPackage, '--target', TARGET_VER, '--node', process.execPath], {
+    encoding: 'utf8', windowsHide: true, timeout: 5 * 60_000, killSignal: 'SIGKILL',
+  });
+  for (const line of String(verify.stdout ?? '').split(/\r?\n/)) if (line.trim() && !line.startsWith('VERIFIED_VERSION=')) log(line.trim());
+  const installedVer = (String(verify.stdout ?? '').match(/^VERIFIED_VERSION=(.+)$/m)?.[1] ?? '').trim();
+  trace(4, 'post-version-check', `installed=${installedVer || '?'} target=${TARGET_VER}`);
+  log(`installed version: ${installedVer || '?'}, target: ${TARGET_VER}`);
+  if (verify.status !== 0 || !installedVer) {
+    log(`staged package FAILED verification [exit ${verify.status}] — discarded; the old package and daemon are untouched`);
+    cleanTree(stagePrefix);
+    return false;
+  }
+  // Downgrade guard for `latest`: a stale mirror can resolve below a local dev build. The daemon keeps running.
+  if (TARGET_VER === 'latest' && CURRENT_VER && compareDaemonVersionsLocal(installedVer, CURRENT_VER) < 0) {
+    log(`installed ${installedVer} is OLDER than current ${CURRENT_VER} — refusing to downgrade`);
+    cleanTree(stagePrefix);
+    return false;
+  }
+
+  // ---- point of no return is the daemon stop; everything below restores the old package on failure ----
+  trace(6, 'pre-kill-watchdogs');
+  log('killing stale watchdogs');
+  killStaleWatchdogs();
+  trace(6, 'post-kill-watchdogs');
+  if (oldPid) {
+    log(`stopping old daemon PID ${oldPid} (and its process tree)`);
+    stopProcessTree(oldPid);
+    trace(6, 'old-daemon-killed', `pid=${oldPid}`);
+  }
+  stopPackageLockers(livePackage);
+  // Brief settle so Windows releases the image files before the rename.
+  sleepMs(2_000);
+
+  const restartPrevious = (why) => {
+    log(`${why} — relaunching the previous version`);
+    relaunchDaemon(shim, ' [previous version]');
+    // The watchdog parks on upgrade.lock: release it so the relaunched daemon can actually start.
+    clearLock();
+    const pid = waitForNewDaemon(killed, 45_000);
+    log(pid ? `previous version is running again: PID ${pid}` : 'WARNING: no live daemon after relaunching the previous version — the watchdog will keep retrying');
+  };
+
+  trace(9, 'pre-switch');
+  const oldShimsDir = join(SCRIPT_DIR || npmPrefix, 'shims-old');
+  try { mkdirSync(oldShimsDir, { recursive: true }); copyShims(npmPrefix, oldShimsDir, binNamesOf(livePackage)); } catch { /* best effort */ }
+  const switched = stagedInstall('switch', swapArgs, 3 * 60_000);
+  trace(9, 'post-switch', `exit=${switched.status}`);
+  if (switched.status !== 0) {
+    log(`switch FAILED [exit ${switched.status}] — the previous package is in place (a rename stayed locked or failed)`);
+    restartPrevious('switch failed');
+    cleanTree(stagePrefix);
+    return false;
+  }
+  copyShims(stagePrefix, npmPrefix, binNamesOf(livePackage));
+
+  const rollBack = (why) => {
+    log(`ROLLBACK: ${why}`);
+    // Hold the lock again: the watchdog must not start a daemon inside the package being put back.
+    try { writeFileSync(LOCK, 'upgrade'); } catch { /* the daemon is already stopped; best effort */ }
+    killStaleWatchdogs();
+    for (const pid of [readNumber(PIDFILE)].filter(Boolean)) { killed.add(pid); stopProcessTree(pid); }
+    stopPackageLockers(livePackage);
+    sleepMs(2_000);
+    // A process that started from the new package while it was being judged (a slow daemon start) can still
+    // hold a file in it: look again for lockers between attempts instead of giving up on the first lock.
+    let back = stagedInstall('rollback', swapArgs, 3 * 60_000);
+    for (let attempt = 2; attempt <= 3 && back.status === 78; attempt += 1) {
+      log(`rollback rename is locked — stopping whatever still runs from the new package and retrying (attempt ${attempt})`);
+      for (const pid of [readNumber(PIDFILE)].filter(Boolean)) { killed.add(pid); stopProcessTree(pid); }
+      stopPackageLockers(livePackage);
+      sleepMs(2_000);
+      back = stagedInstall('rollback', swapArgs, 3 * 60_000);
+    }
+    if (back.status !== 0) {
+      log(`ROLLBACK FAILED [exit ${back.status}] — the previous package is kept as ${join(globalRoot, `.imcodes-old.${tag}`)}`);
+      return;
+    }
+    try { copyShims(oldShimsDir, npmPrefix, binNamesOf(livePackage)); } catch { /* best effort */ }
+    restartPrevious('rolled back');
+    cleanTree(stagePrefix);
+  };
+
+  // The live shim must exist and run the new package.
+  trace(4, 'pre-resolve-npm-prefix');
+  trace(4, 'post-resolve-npm-prefix', `prefix=${npmPrefix}`);
+  if (!existsSync(shim)) {
+    log(`shim missing at ${shim}`);
+    rollBack('the new package has no shim');
+    return false;
+  }
+  trace(4, 'shim-exists', `path=${shim}`);
+  let shimVersion = '';
+  try {
+    const r = spawnCmdShim(shim, ['--version'], { encoding: 'utf8', windowsHide: true, timeout: FAST_CMD_TIMEOUT_MS });
+    if (r.status === 0) shimVersion = (r.stdout || '').trim();
+  } catch { /* ignore */ }
+  if (shimVersion !== installedVer) {
+    log(`the live shim prints [${shimVersion || '?'}], expected [${installedVer}]`);
+    rollBack('the shim does not run the new package');
+    return false;
+  }
+
+  relaunchDaemon(shim, '');
+
+  // Step 9: release the lock now -- the watchdog exits :wait_loop and launches the new daemon as soon as the
+  // lock is gone, and the health check below needs that daemon. (The `finally` clears it again if a throw skips this.)
+  clearLock();
+  // Step 10: health check -- 15 s as before, extended (only when a daemon was running before) before judging the package unusable.
+  trace(10, 'pre-health-check');
+  let newPid = waitForNewDaemon(killed, HEALTH_CHECK_MS);
+  if (!newPid && oldPid) {
+    log(`no new daemon after ${HEALTH_CHECK_MS} ms; a daemon was running before, so waiting up to ${HEALTH_CHECK_EXTENDED_MS} ms more before judging the new package unusable`);
+    newPid = waitForNewDaemon(killed, HEALTH_CHECK_EXTENDED_MS);
+  }
+  if (newPid) {
+    log(`health check PASSED: new daemon PID ${newPid}`);
+    trace(10, 'health-check-passed', `pid=${newPid}`);
+  } else if (oldPid) {
+    log('health check FAILED: no new daemon within the extended wait');
+    trace(10, 'health-check-failed');
+    rollBack('the daemon did not come back on the new package');
+    return false;
+  } else {
+    log('health check: no daemon was running before, none is expected (the watchdog will start one)');
+    trace(10, 'health-check-skipped');
+  }
+
+  stagedInstall('commit', ['--global-root', globalRoot, '--stage-prefix', stagePrefix, '--tag', tag], 2 * 60_000);
+  return true;
+}
+
+async function main() {
+  log('=== upgrade started ===');
+  log(`pkg: ${PKG_SPEC}, target: ${TARGET_VER}`);
+  log(`npm: ${NPM_CMD}`);
+  log(`script_dir: ${SCRIPT_DIR}`);
+  log(`runner_pid: ${process.pid}`);
+  trace(0, 'main-entry');
+
+  // Step 1: Acquire upgrade lock (watchdog will park on it).
+  // Use a directory write — even if upgrade.lock's parent .imcodes
+  // doesn't yet exist for some reason, mkdir is idempotent.
+  mkdirSync(IMCODES_HOME, { recursive: true });
+  writeFileSync(LOCK, 'upgrade');
+  trace(1, 'lock-acquired');
+
+  // Step 2: Capture old daemon PID. It is stopped only after the new package is staged and verified.
+  const oldPid = readNumber(PIDFILE);
+  log(`old daemon PID: ${oldPid ?? 'none'} (stopped only after the new package is staged and verified)`);
+  trace(2, 'old-pid-captured', `pid=${oldPid ?? 'none'}`);
+
+  const env = {
+    ...process.env,
+    // Cap heap at 4 GB.  Older versions accumulated --max-old-space-size
+    // flags across upgrades because the daemon's relaunched env inherited
+    // our setlocal value; that bug is gone now (we don't mutate process
+    // env, we just pass a fresh env object to the npm child).
+    NODE_OPTIONS: '--max-old-space-size=4096',
+  };
+
+  // The prefix must be known up front: the stage and the swap live inside it.
   trace(4, 'pre-resolve-npm-prefix');
   const npmPrefix = resolveNpmPrefix();
   trace(4, 'post-resolve-npm-prefix', `prefix=${npmPrefix ?? 'null'}`);
@@ -502,143 +830,47 @@ async function main() {
     log('could not resolve npm global prefix — aborting');
     return;
   }
-  const shim = join(npmPrefix, 'imcodes.cmd');
-  if (!existsSync(shim)) {
-    log(`shim missing at ${shim} — aborting`);
-    return;
-  }
-  trace(4, 'shim-exists', `path=${shim}`);
-  let installedVer = '';
-  try {
-    const r = spawnCmdShim(shim, ['--version'], {
-      encoding: 'utf8', windowsHide: true, timeout: FAST_CMD_TIMEOUT_MS,
-    });
-    if (r.status === 0) installedVer = (r.stdout || '').trim();
-  } catch { /* ignore */ }
-  trace(4, 'post-version-check', `installed=${installedVer || '?'} target=${TARGET_VER}`);
-  log(`installed version: ${installedVer || '?'}, target: ${TARGET_VER}`);
-  if (TARGET_VER !== 'latest' && installedVer && installedVer !== TARGET_VER) {
-    log('version mismatch after install — aborting');
-    return;
-  }
-  // Downgrade guard for `latest`: Linux/macOS refuse to restart when the
-  // freshly-installed version is older than the running daemon (a stale mirror
-  // `latest` can resolve below a local dev build). Windows had no such guard.
-  // The old daemon keeps running (its modules are already loaded in memory);
-  // we simply decline to kill + relaunch into the older on-disk version.
-  if (TARGET_VER === 'latest' && installedVer && CURRENT_VER) {
-    if (compareDaemonVersionsLocal(installedVer, CURRENT_VER) < 0) {
-      log(`installed ${installedVer} is OLDER than current ${CURRENT_VER} — refusing to downgrade`);
-      return;
-    }
-  }
+  log(`npm prefix: ${npmPrefix}`);
 
-  // Step 5: Sharp repair (best effort).
-  trace(5, 'pre-sharp-repair');
-  try { sharpRepair(npmPrefix); } catch (e) { log(`sharp repair threw: ${e?.message ?? e}`); }
-  trace(5, 'post-sharp-repair');
+  const ok = await stageAndSwap(npmPrefix, oldPid, env);
 
-  // Step 5.1: node-datachannel native addon repair (best effort).
-  trace(5, 'pre-node-datachannel-repair');
-  try { nodeDatachannelRepair(npmPrefix); } catch (e) { log(`node-datachannel repair threw: ${e?.message ?? e}`); }
-  trace(5, 'post-node-datachannel-repair');
-
-  // Step 6: Kill stale watchdogs and the old daemon.
-  trace(6, 'pre-kill-watchdogs');
-  log('killing stale watchdogs');
-  killStaleWatchdogs();
-  trace(6, 'post-kill-watchdogs');
-  if (oldPid) {
-    log(`stopping old daemon PID ${oldPid}`);
-    tryKillPid(oldPid);
-    trace(6, 'old-daemon-killed', `pid=${oldPid}`);
-  }
-  // Brief settle so Windows finishes process teardown before we ask the
-  // new shim to do its repair-watchdog dance.
-  sleepMs(2_000);
-
-  // Step 7: Regenerate launch chain via the new shim.
-  // shim is .cmd → must go through cmd.exe explicitly under Node 24.
-  trace(7, 'pre-repair-watchdog');
-  log('regenerating launch chain via repair-watchdog');
-  try {
-    const r = spawnCmdShim(shim, ['repair-watchdog'], {
-      stdio: ['ignore', 'pipe', 'pipe'], encoding: 'utf8', windowsHide: true,
-      timeout: FAST_CMD_TIMEOUT_MS,
-    });
-    if (r.status !== 0) log(`repair-watchdog exit ${r.status}: ${(r.stderr || '').trim()}`);
-    trace(7, 'post-repair-watchdog', `exit=${r.status}`);
-  } catch (e) {
-    log(`repair-watchdog warning: ${e?.message ?? e}`);
-  }
-
-  // Step 8: Ask Task Scheduler to own the replacement watchdog. The repair
-  // command normally starts it already; this idempotent /Run is a safety net.
-  // Never spawn VBS directly here: that creates an unmanaged watchdog which
-  // Task Scheduler cannot observe or recover after an external tree-kill.
-  trace(8, 'pre-scheduled-task-launch');
-  log('starting new watchdog via Task Scheduler');
-  try {
-    const taskStart = spawnSync('schtasks', ['/Run', '/TN', DAEMON_TASK], {
-      stdio: ['ignore', 'pipe', 'pipe'], encoding: 'utf8', windowsHide: true,
-      timeout: FAST_CMD_TIMEOUT_MS,
-    });
-    trace(8, 'post-scheduled-task-launch', `exit=${taskStart.status}`);
-    if (taskStart.status !== 0) {
-      log(`scheduled task start warning [exit ${taskStart.status}]: ${(taskStart.stderr || '').trim()}`);
-    }
-  } catch (e) {
-    log(`scheduled task start warning: ${e?.message ?? e}`);
-    trace(8, 'scheduled-task-launch-failed');
-  }
-
-  // Step 9: Lock removed in `finally` — watchdog exits :wait_loop and
-  // launches the new daemon as soon as it sees the lock gone.
-
-  // Step 10: Health check — wait up to 15s for a NEW daemon PID.
-  trace(10, 'pre-health-check');
-  const deadline = Date.now() + 15_000;
-  let newPid = null;
-  while (Date.now() < deadline) {
-    sleepMs(500);
-    const pid = readNumber(PIDFILE);
-    if (pid && pid !== oldPid) { newPid = pid; break; }
-  }
-  if (newPid) {
-    log(`health check PASSED: new daemon PID ${newPid}`);
-    trace(10, 'health-check-passed', `pid=${newPid}`);
+  // Mark the run as a success only when the swap ended well (or was a clean refusal we
+  // explicitly accept, like the downgrade guard: those return false and PRESERVE the tmp dir
+  // for postmortem). A failed health check with no daemon expected still counts as done.
+  if (ok) {
+    upgradeSucceeded = true;
+    trace(99, 'main-exit-success');
   } else {
-    log('health check FAILED: no new daemon PID within 15s (watchdog will keep retrying)');
-    trace(10, 'health-check-failed');
+    trace(99, 'main-exit-not-upgraded');
   }
-
-  // Mark the run as a success — even a failed health check counts as
-  // "ran to completion" because the watchdog will recover.  Only
-  // EARLY-RETURN aborts (install fail, no prefix, version mismatch)
-  // leave upgradeSucceeded === false → tmp preserved for postmortem.
-  upgradeSucceeded = true;
-  trace(99, 'main-exit-success');
 }
 
-// Top-level try/finally guarantees the lock gets cleared no matter how
-// main() exits — clean return, abort, or unexpected throw.  This is the
-// invariant the cmd.exe version kept getting wrong.
-main()
-  .catch((e) => {
-    log(`FATAL: ${e?.stack ?? e?.message ?? String(e)}`);
-    trace(99, 'main-exit-fatal');
-  })
-  .finally(() => {
-    const cleared = clearLock();
-    log(cleared ? 'lock released' : 'WARNING: failed to release lock — watchdog self-heal will recover');
-    if (upgradeSucceeded) {
-      log('=== upgrade done — tmp dir scheduled for delete in 60s ===');
-      scheduleTmpDelete();
-    } else {
-      // PRESERVE the tmp dir on any failure path so its upgrade.log is
-      // available for postmortem.  This is the bug from 2026-05-08 that
-      // kept us blind to three consecutive silent failures.
-      log(`=== upgrade FAILED — tmp dir PRESERVED for postmortem: ${SCRIPT_DIR} ===`);
-      log('grep [trace] in upgrade.log to find the last reached step.');
-    }
-  });
+// A staged-runner smoke check loads the module without starting an upgrade.
+// Production invocations never pass these flags; they are only used by the
+// bounded staging guard test.
+if (process.argv.includes('--help') || process.argv.includes('--dry-run')) {
+  console.log('windows-upgrade-runner: staged dependency closure loaded');
+} else {
+  // Top-level try/finally guarantees the lock gets cleared no matter how
+  // main() exits — clean return, abort, or unexpected throw.
+  // This is the invariant the cmd.exe version kept getting wrong.
+  main()
+    .catch((e) => {
+      log(`FATAL: ${e?.stack ?? e?.message ?? String(e)}`);
+      trace(99, 'main-exit-fatal');
+    })
+    .finally(() => {
+      const cleared = clearLock();
+      log(cleared ? 'lock released' : 'WARNING: failed to release lock — watchdog self-heal will recover');
+      if (upgradeSucceeded) {
+        log('=== upgrade done — tmp dir scheduled for delete in 60s ===');
+        scheduleTmpDelete();
+      } else {
+        // PRESERVE the tmp dir on any failure path so its upgrade.log is
+        // available for postmortem.  This is the bug from 2026-05-08 that
+        // kept us blind to three consecutive silent failures.
+        log(`=== upgrade FAILED — tmp dir PRESERVED for postmortem: ${SCRIPT_DIR} ===`);
+        log('grep [trace] in upgrade.log to find the last reached step.');
+      }
+    });
+}

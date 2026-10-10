@@ -83,6 +83,11 @@ function buildFakeNpm(opts: {
   return lines.join('\r\n') + '\r\n';
 }
 
+/** A fake npm global prefix holding an installed package: the staged install needs a global root to stage beside. */
+function installedPrefix(dir: string): void {
+  mkdirSync(join(dir, 'node_modules', 'imcodes'), { recursive: true });
+}
+
 /** Run the runner directly via `node` and return all the side effects.
  *  This mirrors EXACTLY what wscript→node would do in production:
  *  hidden, no console, all paths passed as positional argv. */
@@ -93,6 +98,8 @@ function runRunner(opts: {
   pkgSpec: string;
   targetVer: string;
   timeoutMs?: number;
+  /** The npm prefix handed to the runner as argv[9] (otherwise it asks `npm prefix -g`). */
+  prefix?: string;
 }): {
   status: number | null;
   stdout: string;
@@ -103,7 +110,7 @@ function runRunner(opts: {
   const logFile = join(opts.scriptDir, 'upgrade.log');
   const result = spawnSync(
     process.execPath,
-    [RUNNER, logFile, opts.npmCmd, opts.pkgSpec, opts.targetVer, opts.scriptDir],
+    [RUNNER, logFile, opts.npmCmd, opts.pkgSpec, opts.targetVer, opts.scriptDir, ...(opts.prefix ? ['-', '', opts.prefix] : [])],
     {
       // Override USERPROFILE so the runner's homedir() lands in our
       // sandbox.  Crucial — without this, the runner would write to
@@ -135,6 +142,7 @@ describe.skipIf(!isWindows)('windows-upgrade-runner.mjs (real Node child)', () =
         onInstall: { stdout: 'simulated network error', stderr: 'ETIMEDOUT', exitCode: 1 },
         onPrefix: { stdout: dir, stderr: '', exitCode: 0 },
       }));
+      installedPrefix(dir);
 
       const r = runRunner({
         scriptDir: dir,
@@ -158,21 +166,18 @@ describe.skipIf(!isWindows)('windows-upgrade-runner.mjs (real Node child)', () =
     }
   });
 
-  it('shim missing after install → lock cleared, version-mismatch path fires', () => {
-    const dir = mkdtempSync(join(tmpdir(), 'imcodes-runner-noshim-'));
+  it('npm exits 0 but stages nothing → nothing switched, lock cleared, old package untouched', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'imcodes-runner-nostage-'));
     try {
       const userProfile = join(dir, 'profile');
       mkdirSync(join(userProfile, '.imcodes'), { recursive: true });
       const npmPath = join(dir, 'npm.cmd');
-      // npm install succeeds, but `npm prefix -g` returns a path that
-      // does NOT have an imcodes.cmd shim.  The runner should detect
-      // this and abort cleanly.
-      const fakePrefix = join(dir, 'fake-prefix');
-      mkdirSync(fakePrefix, { recursive: true });  // exists but empty
       writeFileSync(npmPath, buildFakeNpm({
         onInstall: { stdout: 'added 1 package', stderr: '', exitCode: 0 },
-        onPrefix: { stdout: fakePrefix, stderr: '', exitCode: 0 },
+        onPrefix: { stdout: dir, stderr: '', exitCode: 0 },
       }));
+      installedPrefix(dir);
+      writeFileSync(join(dir, 'node_modules', 'imcodes', 'sentinel.txt'), 'old');
 
       const r = runRunner({
         scriptDir: dir,
@@ -182,12 +187,13 @@ describe.skipIf(!isWindows)('windows-upgrade-runner.mjs (real Node child)', () =
         targetVer: '1.2.3',
       });
 
-      expect(r.lockExists, `lock survived no-shim abort: ${r.log}`).toBe(false);
-      expect(r.log).toContain('shim missing');
+      expect(r.lockExists, `lock survived the abort: ${r.log}`).toBe(false);
+      expect(r.log).toContain('install FAILED');
+      expect(r.log).not.toContain('stopping old daemon');
+      expect(readFileSync(join(dir, 'node_modules', 'imcodes', 'sentinel.txt'), 'utf8')).toBe('old');
       expect(r.log).toContain('lock released');
       expect(r.status).toBe(0);
     } finally {
-      // Tmp dir might be PRESERVED by runner on failure — clean up always
       rmSync(dir, { recursive: true, force: true });
     }
   });
@@ -236,6 +242,7 @@ describe.skipIf(!isWindows)('windows-upgrade-runner.mjs (real Node child)', () =
         onInstall: { stdout: 'sim cn install', stderr: '', exitCode: 1 },
         onPrefix: { stdout: dir, stderr: '', exitCode: 0 },
       }));
+      installedPrefix(dir);
 
       const r = runRunner({
         scriptDir: dir,
@@ -279,6 +286,7 @@ describe.skipIf(!isWindows)('windows-upgrade-runner.mjs (real Node child)', () =
         onInstall: { stdout: '', stderr: '', exitCode: 1 },
         onPrefix: { stdout: dir, stderr: '', exitCode: 0 },
       }));
+      installedPrefix(dir);
 
       const before = Date.now();
       runRunner({
@@ -353,12 +361,14 @@ describe.skipIf(!isWindows)('windows-upgrade-runner.mjs (real Node child)', () =
       const npmCmd = join(npmDir, 'npm.cmd');
       writeFileSync(npmCmd, '@echo off\r\necho fallback npm.cmd should not be used\r\nexit /b 99\r\n');
 
+      installedPrefix(dir);
       const r = runRunner({
         scriptDir: dir,
         fakeUserProfile: userProfile,
         npmCmd,
         pkgSpec: 'imcodes@9999.9.9-bogus',
         targetVer: '9999.9.9-bogus',
+        prefix: dir,
       });
 
       // Critical assertions: we MUST see real npm error output (proving

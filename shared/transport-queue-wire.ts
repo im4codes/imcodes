@@ -5,6 +5,7 @@ import {
   QUEUE_DROP_REASONS,
   QUEUE_RESET_REASONS,
   type QueueEvent,
+  type QueueSnapshot,
 } from './transport-queue-types.js';
 
 const QUEUE_EVENT_TYPES = new Set([
@@ -67,7 +68,9 @@ function isProjectionEntry(value: unknown, statusSet: Set<string>): boolean {
     && typeof value.createdAt === 'number'
     && Number.isFinite(value.createdAt)
     && typeof value.updatedAt === 'number'
-    && Number.isFinite(value.updatedAt);
+    && Number.isFinite(value.updatedAt)
+    && (value.dropReason === undefined
+      || (typeof value.dropReason === 'string' && QUEUE_DROP_REASONS.has(value.dropReason as never)));
 }
 
 export function isValidTransportQueueWireEvent(value: unknown): value is QueueEvent {
@@ -103,4 +106,22 @@ export function isValidTransportQueueWireEvent(value: unknown): value is QueueEv
     default:
       return false;
   }
+}
+
+/** Canonical flat compatibility aliases always accompany the exact snapshot. */
+export function transportQueueSnapshotToPayload(snapshot: QueueSnapshot) {
+  return {
+    queueSnapshot: snapshot,
+    queueEpoch: snapshot.queueEpoch,
+    queueAuthorityId: snapshot.queueAuthorityId,
+    pendingMessageVersion: snapshot.pendingMessageVersion,
+    pendingCount: snapshot.pendingMessageEntries.length,
+    pendingMessageEntries: snapshot.pendingMessageEntries,
+    failedMessageEntries: snapshot.failedMessageEntries,
+    ...(snapshot.resetReason ? { resetReason: snapshot.resetReason } : {}),
+    ...(snapshot.dropReason ? { dropReason: snapshot.dropReason } : {}),
+    ...(snapshot.activityGeneration !== undefined ? { activityGeneration: snapshot.activityGeneration } : {}),
+    ...(snapshot.degraded !== undefined ? { degraded: snapshot.degraded } : {}),
+    ...(snapshot.degradedReason ? { degradedReason: snapshot.degradedReason } : {}),
+  };
 }

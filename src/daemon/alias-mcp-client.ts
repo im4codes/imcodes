@@ -27,6 +27,8 @@ import {
 } from '../../shared/alias-types.js';
 import { MCP_ERROR_REASONS, type MCPErrorReason } from '../../shared/memory-mcp-errors.js';
 import { sanitizeMcpErrorMessage } from '../../shared/mcp-error-sanitize.js';
+import { daemonApiUrl, type DaemonHttpMethod } from '../../shared/daemon-token-routes.js';
+import { daemonServerAuthHeaders } from '../../shared/daemon-server-auth.js';
 
 const DEFAULT_TIMEOUT_MS = 15_000;
 const ALIAS_LIST_LIMIT_MAX = 500;
@@ -87,8 +89,8 @@ async function getEndpoint(options: AliasMcpClientOptions): Promise<AliasServerE
   return endpoint;
 }
 
-function aliasUrl(endpoint: AliasServerEndpoint, query = ''): string {
-  return `${cleanBaseUrl(endpoint.workerUrl)}${ALIAS_API_PATH}${query}`;
+function aliasUrl(endpoint: AliasServerEndpoint, method: DaemonHttpMethod, query = ''): string {
+  return daemonApiUrl(cleanBaseUrl(endpoint.workerUrl), method, `${ALIAS_API_PATH}${query}`);
 }
 
 async function parseJsonResponse(res: Response): Promise<unknown> {
@@ -132,6 +134,7 @@ function coerceAliasEntry(raw: unknown): AliasEntry | null {
     ? record.tags.filter((tag): tag is string => typeof tag === 'string')
     : [];
   return {
+    ...(typeof record.id === 'string' ? { id: record.id } : {}),
     name,
     value,
     ...(typeof record.description === 'string' ? { description: record.description } : {}),
@@ -166,11 +169,10 @@ async function requestAliases(
   const timer = setTimeout(() => controller.abort(), options.timeoutMs ?? DEFAULT_TIMEOUT_MS);
   timer.unref?.();
   try {
-    const res = await fetchImpl(aliasUrl(endpoint, query), {
+    const res = await fetchImpl(aliasUrl(endpoint, 'GET', query), {
       method: 'GET',
       headers: {
-        Authorization: `Bearer ${endpoint.token}`,
-        'X-Server-Id': endpoint.serverId,
+        ...daemonServerAuthHeaders(endpoint),
       },
       signal: controller.signal,
     });
@@ -260,11 +262,10 @@ async function aliasWrite(
   timer.unref?.();
   try {
     const headers: Record<string, string> = {
-      Authorization: `Bearer ${endpoint.token}`,
-      'X-Server-Id': endpoint.serverId,
+      ...daemonServerAuthHeaders(endpoint),
     };
     if (body !== undefined) headers['Content-Type'] = 'application/json';
-    const res = await fetchImpl(aliasUrl(endpoint, pathSuffix), {
+    const res = await fetchImpl(aliasUrl(endpoint, method, pathSuffix), {
       method,
       headers,
       ...(body !== undefined ? { body: JSON.stringify(body) } : {}),

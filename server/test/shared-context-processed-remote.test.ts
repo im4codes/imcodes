@@ -1,3 +1,4 @@
+import { activeUserAnswer } from './helpers/user-status.js';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { Hono } from 'hono';
 import { sha256Hex } from '../src/security/crypto.js';
@@ -66,22 +67,14 @@ function makeMockDb() {
 
   const db: Database = {
     queryOne: async <T = unknown>(sql: string, params: unknown[] = []) => {
+      { const activeUser = activeUserAnswer(sql); if (activeUser) return activeUser as never; }
       const normalized = sql.toLowerCase().replace(/\s+/g, ' ').trim();
-      if (normalized.includes('select id, team_id, user_id from servers where token_hash = $1 and id = $2')) {
-        if (params[0] === validTokenHash && params[1] === 'srv-1') {
-          return { id: 'srv-1', team_id: 'ent-1', user_id: 'user-1' } as T;
-        }
-        return null;
-      }
-      if (normalized.includes('select id, team_id from servers where token_hash = $1 and id = $2')) {
-        if (params[0] === validTokenHash && params[1] === 'srv-1') {
-          return { id: 'srv-1', team_id: 'ent-1' } as T;
-        }
-        return null;
-      }
-      if (normalized.includes('select id from servers where token_hash = $1 and id = $2')) {
-        if (params[0] === validTokenHash && params[1] === 'srv-1') {
-          return { id: 'srv-1' } as T;
+      // The daemon-token guard reads role and revocation together with the row,
+      // and matches on id first. A stub that omits node_role/revoked_at would
+      // make a controlled or revoked credential look like a full daemon.
+      if (normalized.includes('from servers where id = $1 and token_hash = $2')) {
+        if (params[0] === 'srv-1' && params[1] === validTokenHash) {
+          return { id: 'srv-1', team_id: 'ent-1', user_id: 'user-1', node_role: 'full', revoked_at: null, owner_status: 'active' } as T;
         }
         return null;
       }
@@ -271,6 +264,13 @@ function makeMockDb() {
       executeSql.push(sql);
       const normalized = sql.toLowerCase().replace(/\s+/g, ' ').trim();
       if (normalized.includes('insert into shared_context_projections')) {
+        // Postgres itself is what rejects a literal NUL byte in a text
+        // parameter (error 22021); a JS mock can't reproduce that, so this
+        // simulates it explicitly to prove the route sanitizes before this
+        // call instead of relying on the real database to catch it.
+        if (typeof params[9] === 'string' && params[9].includes('\u0000')) {
+          throw new Error('invalid byte sequence for encoding "UTF8": 0x00');
+        }
         projectionRows.push({
           id: params[0],
           server_id: params[1],
@@ -280,11 +280,15 @@ function makeMockDb() {
           user_id: params[5],
           project_id: params[6],
           projection_class: params[7],
+          summary: params[9],
           origin: params[12],
         });
         return { changes: 1 };
       }
       if (normalized.includes('insert into shared_context_records')) {
+        if (typeof params[9] === 'string' && params[9].includes('\u0000')) {
+          throw new Error('invalid byte sequence for encoding "UTF8": 0x00');
+        }
         recordRows.push({
           id: params[0],
           projection_id: params[1],
@@ -295,6 +299,7 @@ function makeMockDb() {
           user_id: params[6],
           project_id: params[7],
           record_class: params[8],
+          summary: params[9],
           origin: params[11],
         });
         return { changes: 1 };
@@ -399,6 +404,50 @@ describe('shared-context processed remote route', () => {
     expect(aliasRows).toHaveLength(0);
   });
 
+  it('strips a NUL byte from the summary instead of letting it break the whole replication batch', async () => {
+    const { db, projectionRows, recordRows } = makeMockDb();
+    const app = new Hono<{ Bindings: Env }>();
+    app.route('/api/server', serverRoutes);
+
+    const response = await app.request('/api/server/srv-1/shared-context/processed', {
+      method: 'POST',
+      headers: {
+        authorization: 'Bearer daemon-token',
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({
+        namespace: {
+          scope: 'project_shared',
+          projectId: 'github.com/acme/repo',
+          enterpriseId: 'ent-1',
+        },
+        projections: [
+          {
+            id: 'proj-nul',
+            namespace: {
+              scope: 'project_shared',
+              projectId: 'github.com/acme/repo',
+              enterpriseId: 'ent-1',
+            },
+            class: 'durable_memory_candidate',
+            origin: 'chat_compacted',
+            sourceEventIds: ['evt-1'],
+            summary: 'decision with an embedded\u0000NUL byte',
+            content: { kind: 'decision' },
+            createdAt: 100,
+            updatedAt: 110,
+          },
+        ],
+      }),
+    }, makeEnv(db));
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual(expect.objectContaining({ ok: true, projectionCount: 1 }));
+    expect(projectionRows).toHaveLength(1);
+    expect(projectionRows[0].summary).toBe('decision with an embedded�NUL byte');
+    expect(recordRows).toHaveLength(1);
+    expect(recordRows[0].summary).toBe('decision with an embedded�NUL byte');
+  });
 
   it('skips noisy API error projections during remote replication', async () => {
     const { db, projectionRows, recordRows } = makeMockDb();
@@ -723,10 +772,11 @@ describe('shared-context processed remote route', () => {
     const personalDb: Database = {
       ...db,
       queryOne: async <T = unknown>(sql: string, params: unknown[] = []) => {
+      { const activeUser = activeUserAnswer(sql); if (activeUser) return activeUser as never; }
         const normalized = sql.toLowerCase().replace(/\s+/g, ' ').trim();
-        if (normalized.includes('select id, team_id, user_id from servers where token_hash = $1 and id = $2')) {
-          if (params[0] === sha256Hex('daemon-token') && params[1] === 'srv-1') {
-            return { id: 'srv-1', team_id: null, user_id: 'user-1' } as T;
+        if (normalized.includes('from servers where id = $1 and token_hash = $2')) {
+          if (params[0] === 'srv-1' && params[1] === sha256Hex('daemon-token')) {
+            return { id: 'srv-1', team_id: null, user_id: 'user-1', node_role: 'full', revoked_at: null, owner_status: 'active' } as T;
           }
         }
         return db.queryOne<T>(sql, params);
@@ -1056,6 +1106,7 @@ describe('shared-context processed remote route', () => {
     const staleDb: Database = {
       ...db,
       queryOne: async <T = unknown>(sql: string, params: unknown[] = []) => {
+      { const activeUser = activeUserAnswer(sql); if (activeUser) return activeUser as never; }
         const normalized = sql.toLowerCase().replace(/\s+/g, ' ').trim();
         if (normalized.includes('select id, updated_at from shared_context_projections where enterprise_id = $1 and project_id = $2 order by updated_at desc limit 1')) {
           if (params[0] === 'ent-1' && params[1] === 'github.com/acme/repo') {

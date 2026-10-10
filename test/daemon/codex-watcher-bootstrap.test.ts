@@ -3,10 +3,10 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 const writeFileMock = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
 const mkdirMock = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
 const readdirMock = vi.hoisted(() => vi.fn().mockRejectedValue(new Error('missing')));
-const execMock = vi.hoisted(() => vi.fn((cmd: string, cb?: (err: Error | null, result: { stdout: string; stderr: string }) => void) => {
-  cb?.(null, { stdout: cmd.includes('--version') ? 'codex-cli 0.113.0\n' : '', stderr: '' });
-  return {} as any;
-}));
+// The watcher spawns through the exec helper (src/util/exec-helper.ts), not child_process.exec: the daemon must not fork itself.
+const execMock = vi.hoisted(() => vi.fn(async (_file: string, args: readonly string[]) => (
+  { stdout: args.includes('--version') ? 'codex-cli 0.113.0\n' : '', stderr: '' }
+)));
 const readProjectMemoryMock = vi.hoisted(() => vi.fn().mockResolvedValue('# Project context'));
 const appendAgentSendDocsMock = vi.hoisted(() => vi.fn((memory: string | null) => `${memory ?? ''}\n\nAGENT_SEND_DOCS`.trim()));
 const buildSessionBootstrapContextWithItemsMock = vi.hoisted(() => vi.fn().mockResolvedValue({
@@ -33,8 +33,8 @@ vi.mock('os', () => ({
   homedir: () => '/tmp/home',
 }));
 
-vi.mock('node:child_process', () => ({
-  exec: execMock,
+vi.mock('../../src/util/exec-helper.js', () => ({
+  execFileOffMain: execMock,
 }));
 
 vi.mock('../../src/daemon/memory-inject.js', () => ({

@@ -1,3 +1,4 @@
+import { readQueueDeliveryPolicy, type QueueDeliveryPolicy } from '../../shared/session-send-delivery.js';
 import type { SharedActorEnvelope } from '@shared/tab-sharing.js';
 import {
   createTransportQueueReducerState,
@@ -5,7 +6,7 @@ import {
 } from '../../shared/transport-queue-reducer.js';
 import type { QueueEvent, QueueProjectionEntry } from '../../shared/transport-queue-types.js';
 
-export interface TransportPendingMessageEntry {
+export interface TransportPendingMessageEntry extends QueueDeliveryPolicy {
   clientMessageId: string;
   text: string;
   sharedActor?: SharedActorEnvelope;
@@ -115,6 +116,7 @@ export function extractTransportPendingMessageEntries(value: unknown): Transport
     if (!clientMessageId || !text) return [];
     const sharedActor = (entry as { sharedActor?: unknown }).sharedActor;
     return [{
+      ...readQueueDeliveryPolicy(entry as QueueDeliveryPolicy),
       clientMessageId,
       text,
       ...(sharedActor && typeof sharedActor === 'object' ? { sharedActor: sharedActor as SharedActorEnvelope } : {}),
@@ -248,6 +250,8 @@ export interface TransportPendingQueueSyncState {
   queueEpoch?: string | null;
   queueAuthorityId?: string | null;
   failedMessageEntries?: TransportPendingMessageEntry[] | null;
+  /** Delivery/failure tombstones retained across independently received snapshots. */
+  transportPendingSettledMessageIds?: string[] | null;
 }
 
 export interface TransportPendingQueueSyncPatch {
@@ -257,6 +261,7 @@ export interface TransportPendingQueueSyncPatch {
   queueEpoch?: string;
   queueAuthorityId?: string;
   failedMessageEntries?: TransportPendingMessageEntry[];
+  transportPendingSettledMessageIds?: string[];
 }
 
 export function hasTransportPendingSyncSnapshot(value: Record<string, unknown>): boolean {
@@ -268,6 +273,7 @@ export function hasTransportPendingSyncSnapshot(value: Record<string, unknown>):
 
 function toQueueProjectionEntries(value: unknown, status: QueueProjectionEntry['status']): QueueProjectionEntry[] {
   return extractTransportPendingMessageEntries(value).map((entry, ordinal) => ({
+    ...readQueueDeliveryPolicy(entry),
     clientMessageId: entry.clientMessageId,
     text: entry.text,
     status,
@@ -280,6 +286,7 @@ function toQueueProjectionEntries(value: unknown, status: QueueProjectionEntry['
 
 function fromQueueProjectionEntries(entries: QueueProjectionEntry[]): TransportPendingMessageEntry[] {
   return entries.map((entry) => ({
+    ...readQueueDeliveryPolicy(entry),
     clientMessageId: entry.clientMessageId,
     text: entry.text,
     ...(entry.sharedActor ? { sharedActor: entry.sharedActor as SharedActorEnvelope } : {}),
@@ -296,7 +303,27 @@ function buildTransportQueueReducerBaseline(
   baseline.pendingMessageVersion = existing.transportPendingMessageVersion ?? undefined;
   baseline.pendingMessageEntries = toQueueProjectionEntries(existing.transportPendingMessageEntries, 'queued');
   baseline.failedMessageEntries = toQueueProjectionEntries(existing.failedMessageEntries, 'failed');
+  const settledIds = Array.isArray(existing.transportPendingSettledMessageIds)
+    ? existing.transportPendingSettledMessageIds
+      .filter((id): id is string => typeof id === 'string' && id.length > 0)
+    : [];
+  if (baseline.queueEpoch && settledIds.length > 0) {
+    baseline.deliveredTombstones = Object.fromEntries(
+      settledIds.map((id) => [`${baseline.queueEpoch}:${id}`, true as const]),
+    );
+  }
   return baseline;
+}
+
+function settledMessageIds(state: ReturnType<typeof createTransportQueueReducerState>): string[] {
+  const epoch = state.queueEpoch;
+  if (!epoch) return [];
+  const prefix = `${epoch}:`;
+  return Object.keys(state.deliveredTombstones)
+    .filter((key) => key.startsWith(prefix))
+    .map((key) => key.slice(prefix.length))
+    .filter(Boolean)
+    .sort();
 }
 
 export function buildTransportPendingSyncPatch(
@@ -325,6 +352,7 @@ export function buildTransportPendingSyncPatch(
     ...(typeof value.resetReason === 'string' ? { resetReason: value.resetReason as never } : {}),
   });
   if (next === baseline || next.degradedEvidence.length > baseline.degradedEvidence.length) return {};
+  const settledIds = settledMessageIds(next);
   return {
     queueEpoch,
     queueAuthorityId,
@@ -332,6 +360,9 @@ export function buildTransportPendingSyncPatch(
     transportPendingMessages: next.pendingMessageEntries.map((entry) => entry.text),
     transportPendingMessageEntries: fromQueueProjectionEntries(next.pendingMessageEntries),
     failedMessageEntries: fromQueueProjectionEntries(next.failedMessageEntries),
+    ...(settledIds.length > 0 || existing.transportPendingSettledMessageIds !== undefined
+      ? { transportPendingSettledMessageIds: settledIds }
+      : {}),
   };
 }
 
@@ -346,6 +377,7 @@ export function buildTransportQueueEventPatch(
   const next = reduceTransportQueueEvent(baseline, event);
   if (next === baseline || next.degradedEvidence.length > baseline.degradedEvidence.length) return {};
   if (next.queueEpoch === undefined || next.queueAuthorityId === undefined || next.pendingMessageVersion === undefined) return {};
+  const settledIds = settledMessageIds(next);
   return {
     queueEpoch: next.queueEpoch,
     queueAuthorityId: next.queueAuthorityId,
@@ -353,5 +385,9 @@ export function buildTransportQueueEventPatch(
     transportPendingMessages: next.pendingMessageEntries.map((entry) => entry.text),
     transportPendingMessageEntries: fromQueueProjectionEntries(next.pendingMessageEntries),
     failedMessageEntries: fromQueueProjectionEntries(next.failedMessageEntries),
+    ...(settledIds.length > 0
+      || (existing.transportPendingSettledMessageIds !== undefined && next.queueEpoch !== existing.queueEpoch)
+      ? { transportPendingSettledMessageIds: settledIds }
+      : {}),
   };
 }

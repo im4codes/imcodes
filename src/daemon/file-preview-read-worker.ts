@@ -21,6 +21,7 @@ export interface PreviewReadWorkerErrorCodes {
   staleRead: FsReadErrorCode;
   invalidRequest: FsReadErrorCode;
   internalError: FsReadErrorCode;
+  parentNotFound: FsReadErrorCode;
   /** Optional: code returned when the path is a directory. Falls back to
    *  internalError when a caller (e.g. an older test deps) doesn't supply it. */
   isDirectory?: FsReadErrorCode;
@@ -186,7 +187,17 @@ async function handleSnapshot(
     };
   }
 
-  if ((classification.previewKind === 'video' || classification.previewKind === 'audio') && mimeType) {
+  // Streamed kinds are answered with metadata + a download handle only. The
+  // file is never read here, so no inline payload can stall the event loop or
+  // monopolise the WebSocket; the browser pulls bytes over the chunked HTTP
+  // download channel instead.
+  if (
+    (classification.previewKind === 'video'
+      || classification.previewKind === 'audio'
+      || classification.previewKind === 'image'
+      || classification.previewKind === 'office')
+    && mimeType
+  ) {
     const endStats = await deps.stat(message.realPath);
     return {
       ...baseResult(message),
@@ -211,27 +222,6 @@ async function handleSnapshot(
   const buffer = toBuffer(await deps.readFile(message.realPath));
   const endStats = await deps.stat(message.realPath);
   const endSignature = deps.signatureForStat?.(endStats) ?? statSignature(endStats);
-
-  if ((classification.previewKind === 'image' || classification.previewKind === 'office') && mimeType) {
-    return {
-      ...baseResult(message),
-      phase: 'snapshot',
-      kind: 'success',
-      realPath: message.realPath,
-      startSignature: message.startSignature,
-      endSignature,
-      size: endStats.size,
-      mtimeMs: endStats.mtimeMs,
-      fileName: message.fileName,
-      classification,
-      payload: {
-        mode: 'base64',
-        content: buffer.toString('base64'),
-        encoding: 'base64',
-        mimeType,
-      },
-    };
-  }
 
   const isBinary = deps.isBinaryBuffer ? deps.isBinaryBuffer(buffer) : hasNulByte(buffer);
   if (isBinary) {
@@ -272,7 +262,13 @@ export async function handlePreviewReadWorkerRequest(
       case 'snapshot':
         return await handleSnapshot(message, deps);
     }
-  } catch {
+  } catch (error) {
+    const code = error && typeof error === 'object' && 'code' in error
+      ? String((error as { code?: unknown }).code)
+      : '';
+    if (code === 'ENOENT' || code === 'ENOTDIR') {
+      return workerError(message, deps.errorCodes.parentNotFound);
+    }
     return workerError(message, deps.errorCodes.internalError);
   }
 }
@@ -334,6 +330,7 @@ export async function createDefaultPreviewReadWorkerDependencies(): Promise<Prev
       staleRead: pickString(errorContainer, ['STALE_READ', 'staleRead']) as FsReadErrorCode,
       invalidRequest: pickString(errorContainer, ['INVALID_REQUEST', 'invalidRequest']) as FsReadErrorCode,
       internalError: pickString(errorContainer, ['INTERNAL_ERROR', 'internalError']) as FsReadErrorCode,
+      parentNotFound: pickString(errorContainer, ['PARENT_NOT_FOUND', 'parentNotFound']) as FsReadErrorCode,
       isDirectory: pickString(errorContainer, ['IS_DIRECTORY', 'isDirectory']) as FsReadErrorCode,
     },
     previewReasons: {

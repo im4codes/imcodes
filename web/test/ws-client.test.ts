@@ -3,8 +3,9 @@ import { WsClient } from '../src/ws-client.js';
 import { DAEMON_MSG } from '@shared/daemon-events.js';
 import { P2P_WORKFLOW_MSG, isP2pWorkflowRequestId } from '@shared/p2p-workflow-messages.js';
 import { TRANSPORT_MSG } from '@shared/transport-events.js';
+import { ASK_ANSWER_ACK_CAPABILITY_V1 } from '@shared/ask-answer.js';
 import { REPO_MSG } from '@shared/repo-types.js';
-import { TIMELINE_MESSAGES } from '@shared/timeline-protocol.js';
+import { TIMELINE_MESSAGES, TIMELINE_PROTOCOL_CAPABILITY } from '@shared/timeline-protocol.js';
 import { FS_TRANSPORT_MSG } from '@shared/fs-transport-messages.js';
 import { FS_GENERIC_ERROR_CODES } from '@shared/fs-error-codes.js';
 import { FS_WRITE_MAX_BYTES } from '@shared/fs-write-limits.js';
@@ -106,6 +107,37 @@ describe('WsClient', () => {
     expect(client.connected).toBe(false);
   });
 
+  it('coalesces concurrent session-list requests until the response arrives', async () => {
+    const client = new WsClient('http://localhost:8787', 'srv-1');
+    client.connect();
+    await flushAsync();
+    lastWs!.emit('open');
+    lastWs!.send.mockClear();
+
+    client.requestSessionList();
+    client.requestSessionList();
+    expect(lastWs!.send.mock.calls.filter(([raw]) => String(raw).includes('get_sessions'))).toHaveLength(1);
+
+    lastWs!.emit('message', { data: JSON.stringify({ type: 'session_list', sessions: [] }) });
+    client.requestSessionList();
+    expect(lastWs!.send.mock.calls.filter(([raw]) => String(raw).includes('get_sessions'))).toHaveLength(2);
+    client.disconnect();
+  });
+
+  it('dedupes identical sub-session rebuild payloads on one socket', async () => {
+    const client = await connectClient();
+    const payload = [{ id: 'sub-1', type: 'claude-code', runtimeType: 'transport' as const, label: 'worker' }];
+    lastWs!.send.mockClear();
+
+    client.subSessionRebuildAll(payload);
+    client.subSessionRebuildAll(payload);
+
+    const rebuilds = lastWs!.send.mock.calls
+      .map(([raw]) => JSON.parse(String(raw)) as { type?: string });
+    expect(rebuilds.filter((message) => message.type === 'subsession.rebuild_all')).toHaveLength(1);
+    client.disconnect();
+  });
+
   it('opens a WebSocket on connect()', async () => {
     const client = new WsClient('http://localhost:8787', 'srv-1');
     client.connect();
@@ -146,6 +178,46 @@ describe('WsClient', () => {
 
     expect(handler).toHaveBeenCalledOnce();
     expect(handler).toHaveBeenCalledWith(msg);
+  });
+
+  it('arbitrates timeline subscriptions with full for any active owner', async () => {
+    const client = await connectClient();
+    lastWs!.send.mockClear();
+    const hidden = Symbol('hidden');
+    const active = Symbol('active');
+    client.subscribeTimelineSession('s1', hidden, 'summary');
+    client.subscribeTimelineSession('s1', active, 'full');
+    const sent = lastWs!.send.mock.calls.map((call) => JSON.parse(call[0] as string));
+    expect(sent.at(-1)).toMatchObject({ type: TIMELINE_MESSAGES.SUBSCRIBE, sessionName: 's1', mode: 'full' });
+    client.unsubscribeTimelineSession('s1', active);
+    expect(JSON.parse(lastWs!.send.mock.calls.at(-1)![0] as string)).toMatchObject({ type: TIMELINE_MESSAGES.SUBSCRIBE, sessionName: 's1', mode: 'summary' });
+  });
+
+  it('keeps an active full subscription across browser visibility changes', async () => {
+    const client = await connectClient();
+    const owner = Symbol('active');
+    client.subscribeTimelineSession('s1', owner, 'full');
+    lastWs!.send.mockClear();
+    setDocumentVisibility('hidden');
+    document.dispatchEvent(new Event('visibilitychange'));
+    setDocumentVisibility('visible');
+    document.dispatchEvent(new Event('visibilitychange'));
+    const timelineFrames = lastWs!.send.mock.calls
+      .map((call) => JSON.parse(call[0] as string))
+      .filter((message) => message.type === TIMELINE_MESSAGES.SUBSCRIBE);
+    expect(timelineFrames.every((message) => message.mode === 'full')).toBe(true);
+  });
+
+  it('routes timeline frames to the matching session handler', async () => {
+    const client = await connectClient();
+    const s1 = vi.fn();
+    const s2 = vi.fn();
+    client.onSessionMessage('s1', s1);
+    client.onSessionMessage('s2', s2);
+    const event = { eventId: 'e1', sessionId: 's1', ts: 1, seq: 1, epoch: 1, source: 'daemon', confidence: 'high', type: 'assistant.text', payload: { text: 'final', streaming: false } };
+    lastWs!.emit('message', { data: JSON.stringify({ type: TIMELINE_MESSAGES.EVENT, event }) });
+    expect(s1).toHaveBeenCalledOnce();
+    expect(s2).not.toHaveBeenCalled();
   });
 
   it('does not dispatch pong messages to handlers', async () => {
@@ -419,7 +491,7 @@ describe('WsClient', () => {
 
     client.probeConnection();
 
-    expect(client.connected).toBe(false);
+    expect(client.connected).toBe(true);
     expect(handler).toHaveBeenCalledWith({
       type: 'session.event',
       event: 'probing',
@@ -429,11 +501,11 @@ describe('WsClient', () => {
     });
     expect(handler).not.toHaveBeenCalledWith(expect.objectContaining({ event: 'disconnected' }));
     expect(JSON.parse(socket.send.mock.calls[0][0] as string)).toEqual({ type: 'ping' });
-    // During the probe window send() must NOT deliver (no extra socket.send)
-    // and must NOT throw (an uncaught throw here crashes the ChatView).
+    // Probe state is not a disconnect: regular sends remain available on the
+    // open socket and must not be dropped.
     const callsBeforeGuarded = socket.send.mock.calls.length;
     expect(() => client.send({ type: 'session.send', sessionName: 's', text: 'guarded' })).not.toThrow();
-    expect(socket.send.mock.calls.length).toBe(callsBeforeGuarded);
+    expect(socket.send.mock.calls.length).toBe(callsBeforeGuarded + 1);
 
     socket.emit('message', { data: JSON.stringify({ type: 'pong' }) });
     expect(client.connected).toBe(true);
@@ -446,6 +518,43 @@ describe('WsClient', () => {
     });
 
     client.disconnect();
+    vi.useRealTimers();
+  });
+
+  it('never silently drops terminal keystrokes typed during the foreground probe window', async () => {
+    // Terminal input is fire-and-forget: sendInput() has no commandId, no ACK
+    // and no replay, unlike session.send which the caller can retry. The probe
+    // flips _connected=false on every tab resume while readyState is still
+    // OPEN, so this window is hit constantly -- and every keystroke typed in it
+    // is discarded with no way for the user or the client to know. Keystrokes
+    // must survive the window in order, either by going out on the OS-open
+    // socket or by being buffered and flushed when the probe resolves.
+    vi.useFakeTimers();
+    const client = new WsClient('http://localhost:8787', 'srv-1');
+    client.onMessage(vi.fn());
+    client.connect();
+    await vi.advanceTimersByTimeAsync(0);
+    lastWs!.emit('open');
+    const socket = lastWs!;
+
+    client.probeConnection();
+    expect(client.connected).toBe(true);
+    expect(socket.readyState).toBe(MockWebSocket.OPEN);
+    socket.send.mockClear();
+
+    // The user types while the tab is resuming.
+    for (const ch of ['l', 's', '\r']) client.sendInput('deck_demo_brain', ch);
+
+    // Probe resolves; the path was healthy the whole time.
+    socket.emit('message', { data: JSON.stringify({ type: 'pong' }) });
+    expect(client.connected).toBe(true);
+    await vi.advanceTimersByTimeAsync(50);
+
+    const delivered = socket.send.mock.calls
+      .map((c) => JSON.parse(c[0] as string))
+      .filter((m) => m.type === 'session.input')
+      .map((m) => m.data);
+    expect(delivered.join(''), 'every keystroke must survive the probe window in order').toBe('ls\r');
     vi.useRealTimers();
   });
 
@@ -492,7 +601,7 @@ describe('WsClient', () => {
 
     client.subscribeTerminal('pending-session', true);
     client.subscribeTransportSession('pending-session');
-    expect(socket.send).not.toHaveBeenCalled();
+    expect(socket.send).toHaveBeenCalled();
 
     socket.emit('message', { data: JSON.stringify({ type: 'pong' }) });
     await vi.advanceTimersByTimeAsync(0);
@@ -523,7 +632,7 @@ describe('WsClient', () => {
 
     client.unsubscribeTerminal('gone-session');
     client.unsubscribeTransportSession('gone-session');
-    expect(socket.send).not.toHaveBeenCalled();
+    expect(socket.send).toHaveBeenCalled();
 
     socket.emit('message', { data: JSON.stringify({ type: 'pong' }) });
     await vi.advanceTimersByTimeAsync(0);
@@ -660,7 +769,7 @@ describe('WsClient', () => {
     handler.mockClear();
 
     client.probeConnection();
-    expect(client.connected).toBe(false);
+    expect(client.connected).toBe(true);
 
     socket.emit('message', { data: JSON.stringify({ type: 'session_list', sessions: [] }) });
 
@@ -674,6 +783,162 @@ describe('WsClient', () => {
     socket.send.mockClear();
     client.requestSessionList();
     expect(socket.send).toHaveBeenCalledWith(expect.stringContaining('get_sessions'));
+
+    client.disconnect();
+    vi.useRealTimers();
+  });
+
+  it('emits one recovery notice per probe, even when timeline frames keep arriving', async () => {
+    vi.useFakeTimers();
+    const client = new WsClient('http://localhost:8787', 'srv-1');
+    const handler = vi.fn();
+    client.onMessage(handler);
+    client.connect();
+    await vi.advanceTimersByTimeAsync(0);
+    lastWs!.emit('open');
+    const socket = lastWs!;
+    handler.mockClear();
+
+    client.probeConnection();
+    socket.emit('message', { data: JSON.stringify({ type: 'session_list', sessions: [] }) });
+    expect(handler.mock.calls.filter(([msg]) => msg?.reason === 'probe_recovered')).toHaveLength(1);
+
+    // A second probe can be triggered while the first recovered socket is
+    // still busy. Its first timeline frame restores the connected bit, but
+    // must not fan out another expensive app-level resync immediately.
+    client.probeConnection();
+    socket.emit('message', { data: JSON.stringify({ type: 'timeline.event', event: { sessionId: 's1', eventId: 'e1', seq: 1, epoch: 1, type: 'assistant.text', payload: { text: 'x' } } }) });
+    expect(handler.mock.calls.filter(([msg]) => msg?.reason === 'probe_recovered')).toHaveLength(2);
+
+    client.disconnect();
+    vi.useRealTimers();
+  });
+
+  it('emits exactly one recovery notice across a 1000-frame probe burst', async () => {
+    vi.useFakeTimers();
+    const client = new WsClient('http://localhost:8787', 'srv-1');
+    const handler = vi.fn();
+    client.onMessage(handler);
+    client.connect();
+    await vi.advanceTimersByTimeAsync(0);
+    lastWs!.emit('open');
+    const socket = lastWs!;
+    handler.mockClear();
+
+    client.probeConnection();
+    for (let i = 0; i < 1_000; i++) {
+      socket.emit('message', { data: JSON.stringify({
+        type: 'timeline.event',
+        event: { sessionId: 's1', eventId: `e${i}`, seq: i + 1, epoch: 1, type: 'assistant.text', payload: { text: 'x' } },
+      }) });
+    }
+
+    expect(client.connected).toBe(true);
+    expect(handler.mock.calls.filter(([msg]) => msg?.reason === 'probe_recovered')).toHaveLength(1);
+    // Keep one event synchronous, then yield the backlog in bounded timer
+    // batches so mounted timelines can render between batches.
+    expect(handler.mock.calls.filter(([msg]) => msg?.type === 'timeline.event')).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(200);
+    expect(handler.mock.calls.filter(([msg]) => msg?.type === 'timeline.event')).toHaveLength(1_000);
+    client.disconnect();
+    vi.useRealTimers();
+  });
+
+  it('coalesces queued transient status frames per session while preserving durable events', async () => {
+    vi.useFakeTimers();
+    const client = new WsClient('http://localhost:8787', 'srv-1');
+    const handler = vi.fn();
+    client.onMessage(handler);
+    client.connect();
+    await vi.advanceTimersByTimeAsync(0);
+    lastWs!.emit('open');
+    const socket = lastWs!;
+    handler.mockClear();
+
+    for (let i = 0; i < 1_000; i++) {
+      socket.emit('message', { data: JSON.stringify({
+        type: 'timeline.event',
+        event: {
+          sessionId: 's1', eventId: `state-${i}`, seq: i + 1, epoch: 1,
+          type: 'session.state', summary: true, payload: { state: 'running' },
+        },
+      }) });
+    }
+
+    // One event is allowed through for first paint. The queued intermediate
+    // states collapse to the latest state for this session/type.
+    expect(handler.mock.calls.filter(([msg]) => msg?.type === 'timeline.event')).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(handler.mock.calls.filter(([msg]) => msg?.type === 'timeline.event')).toHaveLength(2);
+    const delivered = handler.mock.calls
+      .map(([msg]) => msg)
+      .filter((msg) => msg?.type === 'timeline.event')
+      .at(-1);
+    expect(delivered?.event?.eventId).toBe('state-999');
+
+    client.disconnect();
+    vi.useRealTimers();
+  });
+
+  it('keeps full-mode transient status frames live', async () => {
+    vi.useFakeTimers();
+    const client = new WsClient('http://localhost:8787', 'srv-1');
+    const handler = vi.fn();
+    client.onMessage(handler);
+    client.connect();
+    await vi.advanceTimersByTimeAsync(0);
+    lastWs!.emit('open');
+    const socket = lastWs!;
+    handler.mockClear();
+
+    for (let i = 0; i < 100; i++) {
+      socket.emit('message', { data: JSON.stringify({
+        type: 'timeline.event',
+        event: {
+          sessionId: 's1', eventId: `full-state-${i}`, seq: i + 1, epoch: 1,
+          type: 'session.state', payload: { state: 'running' },
+        },
+      }) });
+    }
+
+    await vi.advanceTimersByTimeAsync(100);
+    const delivered = handler.mock.calls
+      .map(([msg]) => msg)
+      .filter((msg) => msg?.type === 'timeline.event');
+    expect(delivered).toHaveLength(100);
+    expect(delivered.at(-1)?.event?.eventId).toBe('full-state-99');
+
+    client.disconnect();
+    vi.useRealTimers();
+  });
+
+  it('delivers every terminal idle transition instead of coalescing it away', async () => {
+    vi.useFakeTimers();
+    const client = new WsClient('http://localhost:8787', 'srv-1');
+    const handler = vi.fn();
+    client.onMessage(handler);
+    client.connect();
+    await vi.advanceTimersByTimeAsync(0);
+    lastWs!.emit('open');
+    const socket = lastWs!;
+    handler.mockClear();
+
+    for (let i = 0; i < 50; i += 1) {
+      socket.emit('message', { data: JSON.stringify({
+        type: 'timeline.event',
+        event: {
+          sessionId: 's1', eventId: `idle-${i}`, seq: i + 1, epoch: 1,
+          type: 'session.state', payload: { state: 'idle' },
+        },
+      }) });
+    }
+
+    await vi.advanceTimersByTimeAsync(100);
+    const delivered = handler.mock.calls
+      .map(([msg]) => msg)
+      .filter((msg) => msg?.type === 'timeline.event');
+    expect(delivered).toHaveLength(50);
+    expect(delivered.every((msg) => msg.event?.payload?.state === 'idle')).toBe(true);
 
     client.disconnect();
     vi.useRealTimers();
@@ -1083,7 +1348,153 @@ describe('WsClient', () => {
       const secondWs = lastWs!;
       secondWs.emit('open');
 
+      // The LIVE subscription is restored synchronously so no realtime event is
+      // dropped while reconnecting...
+      expect(secondWs.send).toHaveBeenCalledWith(expect.stringContaining('"forceHistory":false'));
+      // ...and the expensive history replay follows on a staggered timer, so a
+      // reconnect with many open sessions cannot fire them all at once.
+      await vi.advanceTimersByTimeAsync(500);
       expect(secondWs.send).toHaveBeenCalledWith(expect.stringContaining('"forceHistory":true'));
+      client.disconnect();
+      vi.useRealTimers();
+    });
+
+    it('governs snapshot requests across sessions instead of emitting one per terminal', async () => {
+      vi.useFakeTimers();
+      const client = new WsClient('http://localhost:8787', 'srv-1');
+      client.connect();
+      await vi.advanceTimersByTimeAsync(0);
+      lastWs!.emit('open');
+      const ws = lastWs!;
+      ws.send.mockClear();
+
+      const snapshots = () => ws.send.mock.calls
+        .map((c) => String(c[0]))
+        .filter((raw) => raw.includes('"terminal.snapshot_request"'));
+
+      // A reconnect re-runs the snapshot effect in TerminalView, SessionPane and
+      // SubSessionWindow. SessionPane/SubSessionWindow each render a
+      // TerminalView, so the same session asks twice — times every session.
+      const sessions = ['s1', 's2', 's3', 's4', 's5'];
+      for (const name of sessions) {
+        client.sendSnapshotRequest(name);
+        client.sendSnapshotRequest(name);  // the nested TerminalView
+      }
+
+      // Ungoverned this was 10 requests in one tick. The global cursor lets one
+      // through and defers the rest.
+      expect(snapshots().length).toBeLessThanOrEqual(1);
+
+      await vi.advanceTimersByTimeAsync(2_000);
+      const targets = snapshots().map((raw) => JSON.parse(raw).sessionName as string);
+      // Every session still recovers exactly once — governance must never starve
+      // or permanently freeze a terminal.
+      expect(new Set(targets)).toEqual(new Set(sessions));
+      // 10 ungoverned calls collapse to at most one per session plus a single
+      // deferred follow-up for the session that was already in flight — and
+      // every one of them is spread out by the global cursor rather than
+      // emitted in the same tick.
+      expect(targets.length).toBeLessThanOrEqual(sessions.length + 1);
+
+      client.disconnect();
+      vi.useRealTimers();
+    });
+
+    it('does not re-send an unchanged terminal size', async () => {
+      vi.useFakeTimers();
+      const client = new WsClient('http://localhost:8787', 'srv-1');
+      client.connect();
+      await vi.advanceTimersByTimeAsync(0);
+      lastWs!.emit('open');
+      const ws = lastWs!;
+      ws.send.mockClear();
+
+      const resizes = () => ws.send.mock.calls
+        .map((c) => String(c[0]))
+        .filter((raw) => raw.includes('"session.resize"'));
+
+      client.sendResize('s1', 120, 40);
+      client.sendResize('s1', 120, 40);
+      client.sendResize('s1', 120, 40);
+      // tmux has one size per session; a redundant resize reflows the whole pane
+      // and streams that reflow to every subscriber.
+      expect(resizes()).toHaveLength(1);
+
+      client.sendResize('s1', 121, 40);
+      expect(resizes()).toHaveLength(2);
+
+      client.disconnect();
+      vi.useRealTimers();
+    });
+
+    it('staggers transport history replay instead of asking for every session at once', async () => {
+      vi.useFakeTimers();
+      const client = new WsClient('http://localhost:8787', 'srv-1');
+      client.connect();
+      await vi.advanceTimersByTimeAsync(0);
+      lastWs!.emit('open');
+      const firstWs = lastWs!;
+
+      const sessions = ['s1', 's2', 's3', 's4', 's5'];
+      for (const id of sessions) client.subscribeTransportSession(id);
+
+      // Socket dies the way it does after a long lock, and everything reconnects.
+      firstWs.send.mockClear();
+      firstWs.emit('close');
+      await vi.advanceTimersByTimeAsync(5000);
+      const secondWs = lastWs!;
+      expect(secondWs).not.toBe(firstWs);
+      secondWs.emit('open');
+
+      const subscribesWithHistory = () => secondWs.send.mock.calls
+        .map((c) => String(c[0]))
+        .filter((raw) => raw.includes(`"type":"${TRANSPORT_MSG.CHAT_SUBSCRIBE}"`) && raw.includes('"forceHistory":true'));
+      const subscribesLiveOnly = () => secondWs.send.mock.calls
+        .map((c) => String(c[0]))
+        .filter((raw) => raw.includes(`"type":"${TRANSPORT_MSG.CHAT_SUBSCRIBE}"`) && raw.includes('"forceHistory":false'));
+
+      // Every session gets its LIVE subscription back immediately — nothing may
+      // sit unsubscribed while the histories trickle in, or the server silently
+      // drops its realtime events.
+      expect(subscribesLiveOnly()).toHaveLength(sessions.length);
+      // ...but at most one history replay has been asked for so far. Before this
+      // fix all five went out in the same synchronous loop.
+      expect(subscribesWithHistory().length).toBeLessThanOrEqual(1);
+
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(subscribesWithHistory()).toHaveLength(sessions.length);
+
+      client.disconnect();
+      vi.useRealTimers();
+    });
+
+    it('drops a queued history replay when the session is unsubscribed during the stagger window', async () => {
+      vi.useFakeTimers();
+      const client = new WsClient('http://localhost:8787', 'srv-1');
+      client.onMessage(vi.fn());
+      client.connect();
+      await vi.advanceTimersByTimeAsync(0);
+      lastWs!.emit('open');
+
+      for (const id of ['keep-1', 'keep-2', 'closed-3']) client.subscribeTransportSession(id);
+
+      lastWs!.emit('close');
+      await vi.advanceTimersByTimeAsync(1000);
+      await vi.advanceTimersByTimeAsync(0);
+      const secondWs = lastWs!;
+      secondWs.send.mockClear();
+      secondWs.emit('open');
+
+      // User closes that window while its history request is still queued.
+      client.unsubscribeTransportSession('closed-3');
+      await vi.advanceTimersByTimeAsync(2_000);
+
+      const historyTargets = secondWs.send.mock.calls
+        .map((c) => String(c[0]))
+        .filter((raw) => raw.includes('"forceHistory":true'))
+        .map((raw) => JSON.parse(raw).sessionId as string);
+      expect(historyTargets).not.toContain('closed-3');
+
       client.disconnect();
       vi.useRealTimers();
     });
@@ -1136,8 +1547,7 @@ describe('WsClient', () => {
 
       socket.send.mockClear();
       client.subscribeTransportSession('passive-session', { replayHistory: false });
-      expect(socket.send).toHaveBeenCalledWith(expect.stringContaining('"forceHistory":false'));
-      expect(socket.send).not.toHaveBeenCalledWith(expect.stringContaining('"forceHistory":true'));
+      expect(socket.send).not.toHaveBeenCalled();
       client.disconnect();
       vi.useRealTimers();
     });
@@ -1504,6 +1914,60 @@ describe('WsClient', () => {
       client.disconnect();
     });
 
+    it('single-flights identical owner reads until the matching response settles', async () => {
+      vi.useFakeTimers();
+      const client = new WsClient('http://localhost:8787', 'srv-1');
+      client.connect();
+      await vi.advanceTimersByTimeAsync(0);
+      lastWs!.emit('open');
+      lastWs!.send.mockClear();
+
+      const first = client.fsListDir('/home/user/shared', true, false, { sessionName: 'deck_owner' });
+      const duplicate = client.fsListDir('/home/user/shared', true, false, { sessionName: 'deck_owner' });
+      expect(duplicate).toBe(first);
+      await vi.advanceTimersByTimeAsync(400);
+      expect(lastWs!.send.mock.calls
+        .map(([raw]) => JSON.parse(String(raw)))
+        .filter((message) => message.type === 'fs.ls')).toHaveLength(1);
+
+      lastWs!.emit('message', { data: JSON.stringify({
+        type: 'fs.ls_response', requestId: first, path: '/home/user/shared', status: 'ok', entries: [],
+      }) });
+      const afterSettle = client.fsListDir('/home/user/shared', true, false, { sessionName: 'deck_owner' });
+      expect(afterSettle).not.toBe(first);
+      await vi.advanceTimersByTimeAsync(400);
+      expect(lastWs!.send.mock.calls
+        .map(([raw]) => JSON.parse(String(raw)))
+        .filter((message) => message.type === 'fs.ls')).toHaveLength(2);
+
+      client.disconnect();
+      vi.useRealTimers();
+    });
+
+    it('forgetOwnedDataRequest lets a caller-side give-up retry actually hit the wire', async () => {
+      vi.useFakeTimers();
+      const client = new WsClient('http://localhost:8787', 'srv-1');
+      client.connect();
+      await vi.advanceTimersByTimeAsync(0);
+      lastWs!.emit('open');
+      lastWs!.send.mockClear();
+
+      const first = client.fsListDir('/home/user/shared', true, false, { sessionName: 'deck_owner' });
+      // A caller (e.g. FileBrowser) that gives up locally before any response
+      // arrives -- its own timeout fired -- must be able to retry without the
+      // dedup entry silently absorbing the retry into the dead requestId.
+      client.forgetOwnedDataRequest(first);
+      const retry = client.fsListDir('/home/user/shared', true, false, { sessionName: 'deck_owner' });
+      expect(retry).not.toBe(first);
+      await vi.advanceTimersByTimeAsync(400);
+      expect(lastWs!.send.mock.calls
+        .map(([raw]) => JSON.parse(String(raw)))
+        .filter((message) => message.type === 'fs.ls')).toHaveLength(2);
+
+      client.disconnect();
+      vi.useRealTimers();
+    });
+
     it('fs.ls_response is dispatched to onMessage handlers', async () => {
       const client = await connectClient();
       const handler = vi.fn();
@@ -1521,6 +1985,116 @@ describe('WsClient', () => {
       expect(handler).toHaveBeenCalledWith(expect.objectContaining({ type: 'fs.ls_response', requestId }));
       client.disconnect();
     });
+  });
+
+  it('single-flights timeline history, git status and model catalogue reads by semantic owner key', async () => {
+    vi.useFakeTimers();
+    const client = new WsClient('http://localhost:8787', 'srv-1');
+    client.connect();
+    await vi.advanceTimersByTimeAsync(0);
+    lastWs!.emit('open');
+    lastWs!.send.mockClear();
+
+    expect(client.sendTimelineHistoryRequest('deck_owner', 500))
+      .toBe(client.sendTimelineHistoryRequest('deck_owner', 500));
+    expect(client.fsGitStatus('/repo', { includeStats: true, sessionName: 'deck_owner' }))
+      .toBe(client.fsGitStatus('/repo', { includeStats: true, sessionName: 'deck_owner' }));
+    expect(client.requestTransportModels({ agentType: 'codex-sdk', sessionName: 'deck_owner' }))
+      .toBe(client.requestTransportModels({ agentType: 'codex-sdk', sessionName: 'deck_owner' }));
+
+    await vi.advanceTimersByTimeAsync(500);
+    const sent = lastWs!.send.mock.calls.map(([raw]) => JSON.parse(String(raw)) as { type: string });
+    expect(sent.filter((message) => message.type === TIMELINE_MESSAGES.HISTORY_REQUEST)).toHaveLength(1);
+    expect(sent.filter((message) => message.type === 'fs.git_status')).toHaveLength(1);
+    expect(sent.filter((message) => message.type === TRANSPORT_MSG.LIST_MODELS)).toHaveLength(1);
+
+    client.disconnect();
+    vi.useRealTimers();
+  });
+
+  it('includes byte budgets on bounded newer history and older page requests', async () => {
+    const client = await connectClient();
+    lastWs!.send.mockClear();
+    lastWs!.emit('message', { data: JSON.stringify({
+      type: 'daemon.hello',
+      daemonId: 'daemon-bounded',
+      capabilities: [TIMELINE_PROTOCOL_CAPABILITY],
+      timelineProtocolRevision: 1,
+      helloEpoch: 1,
+      sentAt: Date.now(),
+    }) });
+
+    client.sendTimelineHistoryRequest('deck_bounded', 200, undefined, undefined, {
+      epoch: 7,
+      afterSeq: 41,
+      direction: 'newer',
+    }, 1024 * 1024);
+    client.sendTimelinePageRequest('deck_bounded', {
+      epoch: 7,
+      beforeTs: 1234,
+      direction: 'older',
+    }, 200, 1024 * 1024);
+
+    const messages = lastWs!.send.mock.calls.map(([raw]) => JSON.parse(String(raw)) as Record<string, unknown>);
+    expect(messages).toEqual([
+      expect.objectContaining({
+        type: TIMELINE_MESSAGES.HISTORY_REQUEST,
+        sessionName: 'deck_bounded',
+        limit: 200,
+        budgetBytes: 1024 * 1024,
+        cursor: { epoch: 7, afterSeq: 41, direction: 'newer' },
+      }),
+      expect.objectContaining({
+        type: TIMELINE_MESSAGES.PAGE_REQUEST,
+        sessionName: 'deck_bounded',
+        limit: 200,
+        budgetBytes: 1024 * 1024,
+        cursor: { epoch: 7, beforeTs: 1234, direction: 'older' },
+      }),
+    ]);
+    client.disconnect();
+  });
+
+  it('puts a text-only contentFilter on the wire and keeps it a different owner key from the unfiltered window', async () => {
+    const client = await connectClient();
+    lastWs!.send.mockClear();
+    const peek = client.sendTimelineHistoryRequest('deck_peek', 30, undefined, undefined, undefined, 256 * 1024, 'text');
+    const window = client.sendTimelineHistoryRequest('deck_peek', 30, undefined, undefined, undefined, 256 * 1024);
+    // Identical peeks single-flight; the unfiltered request with the same bounds is another read.
+    expect(client.sendTimelineHistoryRequest('deck_peek', 30, undefined, undefined, undefined, 256 * 1024, 'text')).toBe(peek);
+    expect(window).not.toBe(peek);
+    const messages = lastWs!.send.mock.calls.map(([raw]) => JSON.parse(String(raw)) as Record<string, unknown>)
+      .filter((message) => message.type === TIMELINE_MESSAGES.HISTORY_REQUEST);
+    expect(messages).toHaveLength(2);
+    expect(messages.find((message) => message.requestId === peek)).toMatchObject({ contentFilter: 'text', limit: 30, budgetBytes: 256 * 1024 });
+    expect(messages.find((message) => message.requestId === window)?.contentFilter).toBeUndefined();
+    client.disconnect();
+  });
+
+  it('rate-limits unique owner data reads without blocking control traffic and emits a recoverable result', async () => {
+    const client = await connectClient();
+    const handler = vi.fn();
+    client.onMessage(handler);
+    lastWs!.send.mockClear();
+
+    let rejectedRequestId = '';
+    for (let index = 0; index < 65; index += 1) {
+      rejectedRequestId = client.sendTimelineHistoryRequest(`deck_owner_${index}`, 500);
+    }
+    client.send({ type: 'session.send', sessionName: 'deck_owner_0', text: 'still-live', commandId: 'cmd-live' });
+    await Promise.resolve();
+
+    const sent = lastWs!.send.mock.calls.map(([raw]) => JSON.parse(String(raw)) as { type: string });
+    expect(sent.filter((message) => message.type === TIMELINE_MESSAGES.HISTORY_REQUEST)).toHaveLength(64);
+    expect(sent).toContainEqual(expect.objectContaining({ type: 'session.send', commandId: 'cmd-live' }));
+    expect(handler).toHaveBeenCalledWith(expect.objectContaining({
+      type: TIMELINE_MESSAGES.HISTORY,
+      requestId: rejectedRequestId,
+      status: 'error',
+      errorReason: 'queue_full',
+      recoverable: true,
+    }));
+    client.disconnect();
   });
 
   describe('fs rename/delete', () => {
@@ -1602,6 +2176,65 @@ describe('WsClient', () => {
       // Socket is gone; even urgent send must throw so the caller falls
       // back to HTTP rather than silently dropping.
       expect(() => client.sendUrgent({ type: 'session.send', text: '/stop' })).toThrow('WebSocket not connected');
+    });
+
+    describe('askAnswer', () => {
+      const hello = (capabilities: string[]) => ({ data: JSON.stringify({
+        type: 'daemon.hello',
+        daemonId: 'daemon-ask',
+        capabilities,
+        helloEpoch: 1,
+        sentAt: Date.now(),
+      }) });
+
+      it('reports a socket that is not open instead of silently dropping the answer', async () => {
+        const client = await connectClient();
+        lastWs!.emit('close', { code: 1006, reason: 'lost' });
+        expect(client.askAnswer('deck_brain', 'A', { toolUseId: 'toolu_1' })).toEqual({ ok: false, reason: 'not_connected' });
+      });
+
+      it('still delivers during the probe window where the gated send() would drop it', async () => {
+        const client = await connectClient();
+        lastWs!.send.mockClear();
+        (client as unknown as { _connected: boolean })._connected = false;
+        const result = client.askAnswer('deck_brain', 'A');
+        expect(result).toEqual({ ok: true });
+        expect(JSON.parse(String(lastWs!.send.mock.calls[0]![0]))).toEqual({
+          type: 'ask.answer', sessionName: 'deck_brain', answer: 'A',
+        });
+        client.disconnect();
+      });
+
+      it('reports an over-size answer', async () => {
+        const client = await connectClient();
+        lastWs!.send.mockClear();
+        expect(client.askAnswer('deck_brain', 'x'.repeat(5 * 1024 * 1024))).toEqual({ ok: false, reason: 'too_large' });
+        expect(lastWs!.send).not.toHaveBeenCalled();
+        client.disconnect();
+      });
+
+      it('adds a commandId + toolUseId only when the daemon advertises answer acks', async () => {
+        const client = await connectClient();
+        lastWs!.emit('message', hello([ASK_ANSWER_ACK_CAPABILITY_V1]));
+        lastWs!.send.mockClear();
+        const result = client.askAnswer('deck_brain', 'A', { toolUseId: 'toolu_1' });
+        expect(result.ok).toBe(true);
+        const frame = JSON.parse(String(lastWs!.send.mock.calls[0]![0])) as Record<string, unknown>;
+        expect(frame).toMatchObject({ type: 'ask.answer', sessionName: 'deck_brain', answer: 'A', toolUseId: 'toolu_1' });
+        expect(typeof frame.commandId).toBe('string');
+        expect(result).toEqual({ ok: true, commandId: frame.commandId });
+        client.disconnect();
+      });
+
+      it('sends the legacy frame (no commandId) to a daemon without the capability', async () => {
+        const client = await connectClient();
+        lastWs!.emit('message', hello([]));
+        lastWs!.send.mockClear();
+        const result = client.askAnswer('deck_brain', 'A', { toolUseId: 'toolu_1' });
+        expect(result).toEqual({ ok: true });
+        expect(JSON.parse(String(lastWs!.send.mock.calls[0]![0]))).not.toHaveProperty('commandId');
+        client.disconnect();
+      });
     });
 
     it('sendSessionCommandUrgent maps cancel to session.cancel without /stop text', async () => {

@@ -99,6 +99,9 @@ describe('transport-history', () => {
       sessionId: session,
       text: 'retry this',
       commandId: 'cmd-1',
+      clientMessageId: 'cmd-1',
+      queueAppended: true,
+      pendingMessageVersion: 4,
     };
     await appendTransportEvent(session, event);
 
@@ -106,6 +109,9 @@ describe('transport-history', () => {
     expect(events[0]['type']).toBe('user.message');
     expect(events[0]['text']).toBe('retry this');
     expect(events[0]['commandId']).toBe('cmd-1');
+    expect(events[0]['clientMessageId']).toBe('cmd-1');
+    expect(events[0]['queueAppended']).toBe(true);
+    expect(events[0]['pendingMessageVersion']).toBe(4);
   });
 
   it('skips non-rendered or hidden transport history events', async () => {

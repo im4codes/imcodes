@@ -5,6 +5,7 @@ import { MEMORY_MCP_DEGRADED_REASON } from '../../shared/memory-ws.js';
 import type { MemorySearchQuery, MemorySearchResultItem } from '../context/memory-search.js';
 import { searchLocalMemoryForManagement, searchLocalMemorySemanticForManagement } from '../context/memory-recall-client.js';
 import { projectionOwnerCache } from './memory-projection-owner-cache.js';
+import { daemonServerAuthHeaders } from '../../shared/daemon-server-auth.js';
 
 export type MemoryMcpListProjectionClass = Extract<ProcessedContextClass, 'recent_summary' | 'durable_memory_candidate'>;
 
@@ -168,8 +169,7 @@ async function searchCloudMemoryRecall(
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      Authorization: `Bearer ${credentials.token}`,
-      'X-Server-Id': credentials.serverId,
+      ...daemonServerAuthHeaders(credentials),
     },
     body: JSON.stringify({
       query: query.query,
@@ -223,8 +223,7 @@ async function listCloudMemorySummaries(
   }), {
     method: 'GET',
     headers: {
-      Authorization: `Bearer ${credentials.token}`,
-      'X-Server-Id': credentials.serverId,
+      ...daemonServerAuthHeaders(credentials),
     },
   });
   if (!response.ok) return [];

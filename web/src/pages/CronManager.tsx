@@ -1,4 +1,6 @@
 import { useState, useEffect, useCallback, useMemo } from 'preact/hooks';
+import { createPortal } from 'preact/compat';
+import type { ComponentChildren } from 'preact';
 import { useTranslation } from 'react-i18next';
 import { apiFetch } from '../api.js';
 import type { CronAction, CronCompletionPolicy, CronJobStatus } from '@shared/cron-types';
@@ -17,6 +19,16 @@ import { ChatMarkdown } from '../components/ChatMarkdown.js';
 import { useResourceEvent } from '../hooks/useResourceEvent.js';
 import { RESOURCE_TOPICS } from '@shared/resource-events.js';
 import type { WsClient } from '../ws-client.js';
+
+// A pinned CronManager lives below two overflow-clipping sidebar containers.
+// Its dialogs must leave that subtree or a successful edit click renders a
+// fully clipped FloatingPanel. Keep pinned dialogs above managed workspace
+// windows while remaining below the app's 9999+ system-dialog layer.
+const PINNED_CRON_SUBPANEL_Z_INDEX = 7900;
+
+function placeCronSubPanel(panel: ComponentChildren, portal: boolean): ComponentChildren {
+  return !portal || typeof document === 'undefined' ? panel : createPortal(panel, document.body);
+}
 
 // ── Types ────────────────────────────────────────────────────────────────
 
@@ -100,6 +112,8 @@ interface Props {
   windowZIndex?: number;
   /** Raise the owning cron window, so clicking a nested dialog lifts both. */
   onWindowFocus?: () => void;
+  /** Escape an overflow-clipping host such as the pinned sidebar panel. */
+  portalSubPanels?: boolean;
 }
 
 type CronSendActionView = Extract<CronAction, { type: 'send' }>;
@@ -217,8 +231,10 @@ function isCurrentContextJob(job: Pick<CronJob, 'server_id' | 'project_name'>, s
 
 // ── Component ────────────────────────────────────────────────────────────
 
-export function CronManager({ serverId, projectName, sessions, subSessions = [], activeSession, onBack: _onBack, onViewDiscussion, onNavigateSession, servers = [], ws, sharedSessionName, readOnly = false, windowZIndex, onWindowFocus }: Props) {
-  const subPanelZIndex = windowZIndex !== undefined ? windowZIndex + 1 : undefined;
+export function CronManager({ serverId, projectName, sessions, subSessions = [], activeSession, onBack: _onBack, onViewDiscussion, onNavigateSession, servers = [], ws, sharedSessionName, readOnly = false, windowZIndex, onWindowFocus, portalSubPanels = false }: Props) {
+  const subPanelZIndex = windowZIndex !== undefined
+    ? windowZIndex + 1
+    : portalSubPanels ? PINNED_CRON_SUBPANEL_Z_INDEX : undefined;
   const { t } = useTranslation();
   const [jobs, setJobs] = useState<CronJob[]>([]);
   const [loading, setLoading] = useState(true);
@@ -437,6 +453,7 @@ export function CronManager({ serverId, projectName, sessions, subSessions = [],
           onViewDiscussion={onViewDiscussion}
           onNavigateSession={handleNavigateSession}
           t={t}
+          portalSubPanels={portalSubPanels}
         />
       )}
 
@@ -500,7 +517,7 @@ export function CronManager({ serverId, projectName, sessions, subSessions = [],
       })}
 
       {/* Sub-panel: Create/Edit form — FloatingPanel */}
-      {subPanel === 'form' && (
+      {subPanel === 'form' && placeCronSubPanel(
         <FloatingPanel
           id="cron-form"
           zIndex={subPanelZIndex}
@@ -523,10 +540,10 @@ export function CronManager({ serverId, projectName, sessions, subSessions = [],
             />
           </div>
         </FloatingPanel>
-      )}
+      , portalSubPanels)}
 
       {/* Sub-panel: Execution history — FloatingPanel */}
-      {historyJobId && historyJob && (
+      {historyJobId && historyJob && placeCronSubPanel(
         <FloatingPanel
           id={`cron-history-${historyJobId}`}
           zIndex={subPanelZIndex}
@@ -544,16 +561,17 @@ export function CronManager({ serverId, projectName, sessions, subSessions = [],
             onViewDiscussion={onViewDiscussion}
             onNavigateSession={handleNavigateSession}
             t={t}
+            portalSubPanels={portalSubPanels}
           />
         </FloatingPanel>
-      )}
+      , portalSubPanels)}
     </div>
   );
 }
 
 // ── Cross-Job Execution List ─────────────────────────────────────────────
 
-function CrossJobExecutionList({ executions, loading, serverNameMap, showAllServers, onViewDiscussion, onNavigateSession, t, subPanelZIndex, onWindowFocus }: {
+function CrossJobExecutionList({ executions, loading, serverNameMap, showAllServers, onViewDiscussion, onNavigateSession, t, subPanelZIndex, onWindowFocus, portalSubPanels }: {
   executions: CrossJobExecution[] | null;
   loading: boolean;
   serverNameMap: Map<string, string>;
@@ -563,6 +581,7 @@ function CrossJobExecutionList({ executions, loading, serverNameMap, showAllServ
   t: (key: string) => string;
   subPanelZIndex?: number;
   onWindowFocus?: () => void;
+  portalSubPanels: boolean;
 }) {
   const [detailExec, setDetailExec] = useState<CrossJobExecution | null>(null);
 
@@ -647,7 +666,7 @@ function CrossJobExecutionList({ executions, loading, serverNameMap, showAllServ
       </div>
 
       {/* Detail floating panel */}
-      {detailExec && (
+      {detailExec && placeCronSubPanel(
         <FloatingPanel
           id={`exec-detail-${detailExec.id}`}
           zIndex={subPanelZIndex}
@@ -659,7 +678,7 @@ function CrossJobExecutionList({ executions, loading, serverNameMap, showAllServ
         >
           <ExecDetailView exec={detailExec} onNavigateSession={onNavigateSession ? () => onNavigateSession(resolveExecSession(detailExec), detailExec.detail?.slice(0, 500)) : undefined} t={t} />
         </FloatingPanel>
-      )}
+      , portalSubPanels)}
     </div>
   );
 }
@@ -673,7 +692,7 @@ const execStatusColor = (status: string): string => {
   return '#fbbf24';
 };
 
-function CronHistoryPanel({ executions, job, onViewDiscussion, onNavigateSession, t, subPanelZIndex, onWindowFocus }: {
+function CronHistoryPanel({ executions, job, onViewDiscussion, onNavigateSession, t, subPanelZIndex, onWindowFocus, portalSubPanels }: {
   executions: CronExecution[] | null;
   job: CronJob;
   onViewDiscussion?: (fileId: string) => void;
@@ -681,6 +700,7 @@ function CronHistoryPanel({ executions, job, onViewDiscussion, onNavigateSession
   t: (key: string) => string;
   subPanelZIndex?: number;
   onWindowFocus?: () => void;
+  portalSubPanels: boolean;
 }) {
   const jobSessionName = job.target_session_name ?? `deck_${job.project_name}_${job.target_role}`;
   const [detailExec, setDetailExec] = useState<CronExecution | null>(null);
@@ -761,7 +781,7 @@ function CronHistoryPanel({ executions, job, onViewDiscussion, onNavigateSession
       </div>
 
       {/* Detail floating panel */}
-      {detailExec && (
+      {detailExec && placeCronSubPanel(
         <FloatingPanel
           id={`exec-detail-${detailExec.id}`}
           zIndex={subPanelZIndex}
@@ -773,7 +793,7 @@ function CronHistoryPanel({ executions, job, onViewDiscussion, onNavigateSession
         >
           <ExecDetailView exec={detailExec} onNavigateSession={onNavigateSession ? () => onNavigateSession(jobSessionName, detailExec.detail?.slice(0, 500)) : undefined} t={t} />
         </FloatingPanel>
-      )}
+      , portalSubPanels)}
     </div>
   );
 }
@@ -1066,6 +1086,12 @@ function CronForm({ serverId, projectName, sessions, subSessions = [], activeSes
             ? { selfManaged: true }
             : {}
         ),
+        // cronControl is server-authored authority bound to this schedule.
+        // Editing user-visible fields must not silently strip the v2
+        // registration from an existing self-managed task.
+        ...(existingAction?.type === 'command' && existingAction.cronControl
+          ? { cronControl: existingAction.cronControl }
+          : {}),
       }
       : actionType === 'send'
         ? {

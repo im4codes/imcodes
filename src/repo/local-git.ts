@@ -1,7 +1,5 @@
-import { execFile } from 'node:child_process';
 import { access } from 'node:fs/promises';
 import { isAbsolute, join } from 'node:path';
-import { promisify } from 'node:util';
 import type {
   RepoCommit,
   RepoCommitDetail,
@@ -10,8 +8,8 @@ import type {
   RepoListResult,
 } from './types.js';
 import { DEFAULT_PAGE_SIZE } from './provider.js';
+import { repoExecFile as execFileAsync } from './repo-exec.js';
 
-const execFileAsync = promisify(execFile);
 
 const GIT_TIMEOUT_MS = 10_000;
 const TARGET_BRANCH_RE = /^[A-Za-z0-9._][A-Za-z0-9._/-]{0,255}$/;

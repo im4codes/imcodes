@@ -18,8 +18,25 @@ import {
   type FileBrowserPreviewRequest,
   type FileBrowserPreviewUpdate,
 } from './components/file-browser-lazy.js';
+import {
+  DAEMON_LIVENESS_MSG,
+  DAEMON_STATS_MSG,
+  isDaemonMainLoopBusy,
+  mergeDaemonLiveness,
+  mergeDaemonStats,
+  type DaemonStatsView,
+} from '@shared/daemon-stats.js';
+import {
+  cpuSeverity,
+  formatCpuPercent,
+  formatMemoryCompact,
+  formatStatNumber,
+  formatUptime as formatDaemonUptime,
+} from './util/daemon-stats-format.js';
 import { DAEMON_MSG } from '@shared/daemon-events.js';
+import { sessionIdentityProjectKey } from '@shared/session-identity.js';
 import { AUTH_IDENTITY_ERRORS } from '@shared/auth-identity.js';
+import { REMOTE_DESKTOP_STOP_ORIGIN } from '@shared/remote-desktop.js';
 import { FS_SESSION_ROOT_PATH } from '../../src/shared/transport/fs.js';
 import { P2P_WORKFLOW_MSG } from '@shared/p2p-workflow-messages.js';
 import { RECONNECT_GRACE_MS } from '@shared/ack-protocol.js';
@@ -28,21 +45,57 @@ import type { MessagePin } from '@shared/message-pins.js';
 import { mapP2pRunToDiscussion, mergeP2pDiscussionUpdate, mergeP2pStatusResponseDiscussions } from './p2p-run-mapping.js';
 import { matchDiscussionIndex, reconcileDiscussionEntry, reconcileClassicList, isBarActiveDiscussion, makeOptimisticDiscussionEntry, discussionErrorReasonKey, shouldToastDiscussionError, classifyDiscussionStop, removeDiscussionByRequestId } from './discussion-reconcile.js';
 import { PENDING_START_TIMEOUT_MS, DISCUSSION_RECONCILE_HIDDEN_MS } from '@shared/discussion-ui.js';
+import { LOGIN_SESSION_NOT_STUCK_KEY } from './login-session-not-stuck.js';
 import { useTranslation } from 'react-i18next';
 import { ErrorBoundary } from './components/ErrorBoundary.js';
 import { LanguageSwitcher } from './components/LanguageSwitcher.js';
 import { LoginPage } from './pages/LoginPage.js';
+import { isActiveTurnFinishedError } from './session-live-status.js';
 import { SessionTabs } from './components/SessionTabs.js';
 // TransportChatView removed — transport sessions use unified ChatView via timelineEmitter
-import { SessionPane } from './components/SessionPane.js';
+import { StableSessionPane as SessionPane } from './components/StableSessionPane.js';
+import {
+  SupervisionTaskConsole,
+  SupervisionTaskPairSnapshotBridge,
+  SupervisionTaskConsoleToggle,
+  supervisionTaskConsolePreferenceBounds,
+} from './components/SupervisionTaskConsole.js';
+import {
+  loadSupervisionTaskConsolePreferences,
+  saveSupervisionTaskConsolePreferences,
+} from './supervision-task-console-preferences.js';
+import { canViewSupervisionTaskConsole } from './supervision-task-console-visibility.js';
+import {
+  clearAllSupervisionTaskConsoleCaches,
+  clearSupervisionTaskConsoleCache,
+  clearSupervisionTaskConsoleCacheForUser,
+} from './supervision-task-console-cache.js';
 import { ShareSessionDialog } from './components/ShareSessionDialog.js';
 import { SharedEntriesPanel } from './components/SharedEntriesPanel.js';
+import { MobileSharedEntriesMenu } from './components/MobileSharedEntriesMenu.js';
 import { SharedStateIndicator } from './components/SharedStateIndicator.js';
 import { applyGlobalFontPrefs, DEFAULT_CHAT_FONT, useFontPrefs } from './components/FontPrefsDropdown.js';
 import { useQuickData } from './components/QuickInputPanel.js';
 import { NewSessionDialog } from './components/NewSessionDialog.js';
 import { SubSessionBar, SUBSESSION_BAR_COLLAPSED_STORAGE_KEY } from './components/SubSessionBar.js';
-import { SubSessionWindow } from './components/SubSessionWindow.js';
+import {
+  loadSubSessionDesktopDockSide,
+  loadSubSessionDesktopLayout,
+  saveSubSessionDesktopDockSide,
+  saveSubSessionDesktopLayout,
+  SUBSESSION_DESKTOP_DOCK_SIDE,
+  SUBSESSION_DESKTOP_LAYOUT,
+  type SubSessionDesktopDockSide,
+  type SubSessionDesktopLayout,
+} from './subsession-desktop-layout-preference.js';
+import {
+  defaultTeamDiscussionLayout,
+  loadTeamDiscussionLayout,
+  saveTeamDiscussionLayout,
+  TEAM_DISCUSSION_LAYOUT,
+  type TeamDiscussionLayout,
+} from './team-discussion-layout-preference.js';
+import { StableSubSessionWindow as SubSessionWindow } from './components/StableSubSessionWindow.js';
 import { OpenSpecAutoDeliverDetailsPanel } from './components/OpenSpecAutoDeliver.js';
 import { useOpenSpecAutoDeliver } from './hooks/useOpenSpecAutoDeliver.js';
 import { isOpenSpecAutoDeliverActiveProjection } from './openspec-auto-deliver.js';
@@ -61,6 +114,9 @@ import type { SessionSettingsOpenIntent } from './session-settings-open-intent.j
 import { StartDiscussionDialog, type DiscussionPrefs, type SubSessionOption } from './components/StartDiscussionDialog.js';
 import { AskQuestionDialog, type PendingQuestion } from './components/AskQuestionDialog.js';
 import { shouldDismissPendingQuestion } from './ask-question-dismiss.js';
+import { AskAnswerTracker, type AskAnswerFailure } from './ask-answer-tracker.js';
+import { AskAnswerFailedDialog } from './components/AskAnswerFailedDialog.js';
+import { ASK_ANSWER_ACK_WAIT_MS } from '@shared/ask-answer.js';
 import type { TrailingAskQuestion } from './find-pending-question.js';
 import { ServerContextMenu, DeleteServerDialog } from './components/ServerContextMenu.js';
 import { RepoPage, type RepoPageTabKey } from './pages/RepoPage.js';
@@ -72,7 +128,19 @@ import { CronManager } from './pages/CronManager.js';
 import { SharedContextManagementPanel } from './components/SharedContextManagementPanel.js';
 import { ControlledNodesPanel } from './components/ControlledNodesPanel.js';
 import { ControlledNodeQuickMenu } from './components/ControlledNodeQuickMenu.js';
-import { RemoteDesktopPanel } from './components/RemoteDesktopPanel.js';
+import { RemoteDesktopWorkspace } from './components/RemoteDesktopWorkspace.js';
+import { RemoteDesktopWall, REMOTE_DESKTOP_WALL_WINDOW_ID } from './components/RemoteDesktopWall.js';
+import { RemoteDesktopConnectionManager } from './remote-desktop-connection-manager.js';
+import { openRemoteDesktopWallWindow } from './remote-desktop-window.js';
+import {
+  REMOTE_DESKTOP_WORKSPACE_WINDOW_ID,
+  activateRemoteDesktopWorkspaceTab,
+  closeRemoteDesktopWorkspace,
+  closeRemoteDesktopWorkspaceHost,
+  createRemoteDesktopWorkspaceState,
+  openRemoteDesktopWorkspaceHost,
+  reorderRemoteDesktopWorkspaceHost,
+} from './remote-desktop-workspace-state.js';
 import { DaemonRemoteDesktopControl } from './components/DaemonRemoteDesktopControl.js';
 import type { MachineListItem } from './api/machines.js';
 import { ContextDiagnosticsPanel } from './components/ContextDiagnosticsPanel.js';
@@ -92,7 +160,13 @@ import {
   getSubSessionAccentColorMap,
 } from './subsession-accent-colors.js';
 import type { PanelRenderContext } from './components/PinnedPanelRegistry.js';
-import { shareTargetKey, type ShareDialogTarget, type ShareGrantSummary, type SharedStateSummary, type ShareTarget } from './tab-sharing-ui.js';
+import { canSharedActorControlSession, shareTargetKey, type ShareDialogTarget, type ShareGrantSummary, type SharedStateSummary, type ShareTarget } from './tab-sharing-ui.js';
+import {
+  clearSharedTabRestoreMarker,
+  findRememberedSharedEntry,
+  readSharedTabRestoreMarker,
+  rememberSharedTab,
+} from './shared-tab-restore.js';
 import './components/pinnedPanelTypes.js'; // register all panel types
 import {
   LOCAL_WEB_PREVIEW_PANEL_TYPE,
@@ -108,6 +182,8 @@ import {
 import { clearMessagePinsCache } from './hooks/useMessagePins.js';
 import type { ChatLocalWebPreviewOpenHandler } from './components/ChatLoopbackLink.js';
 import { formatDaemonVersionShort } from './util/format-version.js';
+import { DaemonStatusCard, DaemonUpgradeConfirmDialog, type DaemonUpgradeRequestState } from './components/DaemonStatusCard.js';
+import { DAEMON_UPGRADE_FORCED_REQUEST_BODY, isDaemonUpgradeBusyBlockReason } from '@shared/daemon-upgrade.js';
 import { nextDaemonUpgradingState, daemonUpgradingLabel, type DaemonUpgradingState } from './util/daemon-upgrade-status.js';
 import {
   daemonUpgradeBlockedToastKey,
@@ -116,12 +192,15 @@ import {
 } from './daemon-upgrade-blocked.js';
 import { safeLocalStorageRemoveItem, safeLocalStorageSetItem } from './local-storage-quota.js';
 import { getSessionRuntimeType } from '@shared/agent-types.js';
+import { canSessionRoleOwnAutomaticSupervision, getSupportedSupervisionBackendOptions } from '@shared/supervision-config.js';
+import type { SupervisionExecutionPoolKind } from '@shared/supervision-execution-pool.js';
 import { EXECUTION_CLONE_KIND } from '@shared/execution-clone.js';
 import {
   isNavigableMainSession,
   isSubSessionName,
   mergeSessionListEntry,
   parseMainSessionName,
+  resolveSharedSessionProject,
   type IncomingSessionListEntry,
 } from './session-list-merge.js';
 import { resolveSessionInfoRuntimeType } from './runtime-type.js';
@@ -137,7 +216,7 @@ import {
   resolveP2pRootSession,
   serializeP2pSavedConfig,
 } from './preferences/p2p-config-pref.js';
-import { readHashState, resolveInitialServerId, resolveInitialSessionName, writeHashState } from './hooks/useHashState.js';
+import { readHashState, readTabRouteState, resolveInitialRouteState, writeHashState } from './hooks/useHashState.js';
 import { useSubSessions, type SubSession } from './hooks/useSubSessions.js';
 import { useProviderStatus } from './hooks/useProviderStatus.js';
 import { useProgressiveMount } from './hooks/useProgressiveMount.js';
@@ -154,11 +233,20 @@ import {
 import { WsClient, type P2pWorkflowRequestScope } from './ws-client.js';
 import { configure as configureApi, configureExpectedUserId, apiFetch, onAuthExpired, startProactiveRefresh, stopProactiveRefresh, refreshSessionIfStale, ApiError, configureApiKey, clearApiKey, fetchMe, getApiKey, normalizeLocalWebPreviewPath, listP2pRuns, discoverSharedEntries, openSharedEntry, listManagedSharesForServer, type SharedEntrySummary } from './api.js';
 import { isNative, getServerUrl, clearServerUrl } from './native.js';
-import { getAuthKey, clearAuthKey } from './biometric-auth.js';
+import { recordPerfRender } from './perf-render-debug.js';
+import { isMobileDevice } from './mobile-device.js';
+import {
+  getAuthKey,
+  clearAuthKey,
+  getAuthKeyId,
+  clearAuthKeyId,
+  initializeServerScopedAuth,
+} from './biometric-auth.js';
 import { initPushNotifications, resetPushBadge } from './push-notifications.js';
 import { ServerSetupPage } from './pages/ServerSetupPage.js';
 import { NativeAuthBridge } from './pages/NativeAuthBridge.js';
 import type { SessionInfo, TerminalDiff } from './types.js';
+import { TerminalDiffRegistry } from './terminal-diff-registry.js';
 import { REPO_MSG } from '@shared/repo-types.js';
 import {
   buildTerminalResubscribePlan,
@@ -171,8 +259,8 @@ import {
 } from './terminal-subscribe-mode.js';
 import { onWatchCommand } from './watch-bridge.js';
 import { watchProjectionStore } from './watch-projection.js';
-import { isIdleSessionStateTimelineEvent, isRunningTimelineEvent } from './timeline-running.js';
-import { isWorkingSessionState } from '@shared/session-activity-types.js';
+import { isIdleSessionStateTimelineEvent, noteLiveIdleSignal, isRunningTimelineEvent } from './timeline-running.js';
+import { isOlderActivityGeneration, isWorkingSessionState, type ActivityGenerationLike } from '@shared/session-activity-types.js';
 import { isP2pDiscussionVisibleInSubSessionBar } from './p2p-discussion-scope.js';
 import {
   extractTransportPendingVersion,
@@ -189,6 +277,7 @@ import { resolveEffectiveSessionModel } from '@shared/session-model.js';
 import { loadLegacyCodexModelPreferenceForModelessSession } from './codex-model-preference.js';
 import { resolveQuickAgentDelegationModel } from './quick-agent-delegation-model.js';
 import { updateMainSessionLabel } from './session-label-api.js';
+import { computeAutoLaunchLabels } from './auto-launch-labels.js';
 import { buildDocumentTitle } from './tab-title.js';
 import {
   getDaemonBadgeState,
@@ -197,14 +286,26 @@ import {
   isServerOnline,
   pickAutoEntryServer,
   pickMostRecentMainSession,
+  resolveServerSessionSnapshot,
   shouldResetSelectedServer,
   shouldShowInitialConnectingGate,
 } from './server-selection.js';
+import { readLastRememberedServerId, readServerSession, writeServerSession } from './server-tab-state.js';
 import { installNativeAppResumeRefresh } from './app-resume-refresh.js';
+import { resumeDirectFileTransfers } from './direct-file-transfer.js';
 import { isImeComposingKeyEvent } from './ime-keyboard.js';
 import { markServerDaemonActivity, markServerOffline, touchServerHeartbeat } from './server-online-state.js';
-import { MSG_DAEMON_ONLINE, MSG_DAEMON_OFFLINE } from '@shared/ack-protocol.js';
-import { markSessionRunningIfNeeded } from './session-state-updates.js';
+import { MSG_DAEMON_ONLINE, MSG_DAEMON_OFFLINE, MSG_COMMAND_FAILED } from '@shared/ack-protocol.js';
+import { SHARE_CANCEL_FAILED_EVENT, notifyShareCancelFailure, shareCancelFailureReasonKey, takeTrackedShareCancel, type ShareCancelFailure } from './share-cancel-feedback.js';
+import {
+  REMOTE_DESKTOP_LOCAL_MANAGEMENT,
+  REMOTE_DESKTOP_LOCAL_WEB_ACTION,
+} from '@shared/remote-desktop-local-management.js';
+import { looselyEqual, markSessionRunningIfNeeded, updateSessionIfChanged } from './session-state-updates.js';
+import { createMapUpdateBatcher, type MapUpdateBatcher } from './map-update-batcher.js';
+import { useStructuralIdentity } from './hooks/useStructuralIdentity.js';
+import { CapabilityOperationNotice } from './components/CapabilityOperationNotice.js';
+import { RemoteDesktopWindowBlockedNotice } from './components/RemoteDesktopWindowBlockedNotice.js';
 import {
   APP_UPDATE_REQUIRED_EVENT,
   fetchCurrentAppBuildInfo,
@@ -215,6 +316,11 @@ import {
   type AppUpdateReason,
   type AppUpdateRequiredDetail,
 } from './app-update.js';
+
+async function clearStoredAuthForServer(serverUrl?: string | null): Promise<void> {
+  try { await clearAuthKey(serverUrl); } catch { /* local revocation is best-effort */ }
+  try { await clearAuthKeyId(serverUrl); } catch { /* local revocation is best-effort */ }
+}
 
 const DashboardPage = lazy(() => lazyImportWithAppUpdateNotice(() => import('./pages/DashboardPage.js')).then((m) => ({ default: m.DashboardPage })));
 const DiscussionsPage = lazy(() => lazyImportWithAppUpdateNotice(() => import('./pages/DiscussionsPage.js')).then((m) => ({ default: m.DiscussionsPage })));
@@ -254,6 +360,17 @@ function appendContentEditableTextPreservingNewlines(element: HTMLElement, suffi
 const nativeCallback = typeof window !== 'undefined'
   ? new URLSearchParams(window.location.search).get('native_callback')
   : null;
+const aideskManagementQuery = typeof window !== 'undefined'
+  ? new URLSearchParams(window.location.search)
+  : null;
+const aideskManagementNodeId = aideskManagementQuery?.get(
+  REMOTE_DESKTOP_LOCAL_MANAGEMENT.WEB_NODE_QUERY,
+) ?? null;
+const aideskManagementAction = aideskManagementQuery?.get(
+  REMOTE_DESKTOP_LOCAL_MANAGEMENT.WEB_ACTION_QUERY,
+) === REMOTE_DESKTOP_LOCAL_WEB_ACTION.SHARE
+  ? REMOTE_DESKTOP_LOCAL_WEB_ACTION.SHARE
+  : REMOTE_DESKTOP_LOCAL_WEB_ACTION.MANAGE;
 
 type ViewMode = TerminalSubscribeViewMode;
 
@@ -288,6 +405,34 @@ const DAEMON_ONLINE_WS_RECOVERY_INTERVAL_MS = 5_000;
 // after this so it doesn't stick forever. Reconnect/online clears it sooner.
 const DAEMON_UPGRADING_MAX_MS = 5 * 60 * 1_000;
 const OPENSPEC_AUTO_RUNBAR_COMPACT_STORAGE_KEY = 'rcc_openspec_auto_runbar_compact';
+const MAX_PERSISTED_MAXIMIZED_SUBSESSION_IDS = 128;
+
+/**
+ * Desktop sub-session maximize state belongs to the owning main-session tab,
+ * not to the currently mounted App tree.  Keep the key server-scoped too:
+ * session names are daemon-local and can legitimately repeat on two servers.
+ * The bounded parser is deliberately fail-closed for malformed/legacy values.
+ */
+function maximizedSubSessionStorageKey(serverId: string | null, sessionName: string): string {
+  return `rcc_maximized_subs_${serverId ?? 'default'}_${sessionName}`;
+}
+
+function loadPersistedMaximizedSubSessionIds(serverId: string | null, sessionName: string | null): Set<string> {
+  if (!sessionName) return new Set();
+  try {
+    const raw = localStorage.getItem(maximizedSubSessionStorageKey(serverId, sessionName));
+    if (!raw) return new Set();
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return new Set();
+    return new Set(
+      parsed
+        .filter((id): id is string => typeof id === 'string' && id.length > 0)
+        .slice(0, MAX_PERSISTED_MAXIMIZED_SUBSESSION_IDS),
+    );
+  } catch {
+    return new Set();
+  }
+}
 
 function readOpenSpecAutoRunbarCompactPreference(): boolean {
   try {
@@ -408,6 +553,7 @@ interface ServerInfo {
   status: string;
   lastHeartbeatAt: number | null;
   daemonVersion?: string | null;
+  latestDaemonVersion?: string | null;
   createdAt: number;
 }
 
@@ -427,6 +573,26 @@ function formatSharedAccessError(error: unknown): string {
   if (error instanceof ApiError) return error.body || error.message;
   if (error instanceof Error) return error.message;
   return String(error || 'share_failed');
+}
+
+function sharedEntryFallbackFromHash(
+  entryId: string | null,
+  serverId: string | null,
+  sessionName: string | null,
+): SharedEntrySummary | null {
+  if (!entryId || !serverId) return null;
+  const target: ShareTarget = sessionName
+    ? { kind: 'main', serverId, sessionName }
+    : { kind: 'server', serverId };
+  return {
+    id: entryId,
+    serverId,
+    serverName: serverId,
+    role: 'viewer',
+    status: 'active',
+    target,
+    targetLabel: sessionName ?? serverId,
+  };
 }
 
 function buildSharedOutStateFromShares(shares: ShareGrantSummary[]): SharedStateSummary | null {
@@ -497,9 +663,47 @@ function findSharedEntryForHash(
   return candidates.find((entry) => entry.target.kind === 'server') ?? null;
 }
 
+/**
+ * The project key the identity editor starts from. A sub-session is not in the
+ * main-session list, so it falls back to its own namespace and then to its
+ * parent's project (share recipients never see `contextNamespace`; the server
+ * replaces the key with the daemon's canonical one on the session-bound route).
+ */
+function settingsIdentityProjectKey(
+  target: { sessionName: string; subId?: string; parentSession?: string | null },
+  sessions: ReadonlyArray<{ name: string; project?: string; contextNamespace?: { projectId?: unknown } | null }>,
+  subSessions: ReadonlyArray<{ id: string; sessionName: string; parentSession?: string | null; contextNamespace?: { projectId?: unknown } | null }>,
+): string | undefined {
+  const main = sessions.find((session) => session.name === target.sessionName);
+  if (main) return sessionIdentityProjectKey(main) || undefined;
+  const sub = subSessions.find((candidate) => candidate.id === target.subId || candidate.sessionName === target.sessionName);
+  const own = sub ? sessionIdentityProjectKey({ contextNamespace: sub.contextNamespace }) : '';
+  if (own) return own;
+  const parentName = sub?.parentSession ?? target.parentSession;
+  const parent = parentName ? sessions.find((session) => session.name === parentName) : undefined;
+  return (parent && sessionIdentityProjectKey(parent)) || undefined;
+}
+
+/** Token-usage bars refresh at most this often; the newest value always wins. */
+const SUB_USAGE_COMMIT_INTERVAL_MS = 250;
+
 export function App() {
+  recordPerfRender('App');
   const { t: trans } = useTranslation();
-  const initialHashStateRef = useRef(readHashState());
+  const remoteDesktopConnectionManagerRef = useRef<RemoteDesktopConnectionManager | null>(null);
+  if (!remoteDesktopConnectionManagerRef.current) {
+    remoteDesktopConnectionManagerRef.current = new RemoteDesktopConnectionManager();
+  }
+  const remoteDesktopConnectionManager = remoteDesktopConnectionManagerRef.current;
+  /** Server ids this account actually owns, sourced only from /api/server. */
+  const ownedServerIdsRef = useRef<Set<string>>(new Set());
+  const initialHashStateRef = useRef(resolveInitialRouteState());
+  const initialSharedTabRestoreRef = useRef(readSharedTabRestoreMarker());
+  const sharedOpenGenerationRef = useRef(0);
+  /** Invalidates asynchronous external-route authorization after a newer navigation. */
+  const externalRouteGenerationRef = useRef(0);
+  /** Deduplicates the hashchange/popstate pair emitted for one route transition. */
+  const externalRouteInFlightKeyRef = useRef<string | null>(null);
   const [globalFontPrefs] = useFontPrefs('chat', DEFAULT_CHAT_FONT);
   useEffect(() => {
     applyGlobalFontPrefs(globalFontPrefs);
@@ -517,46 +721,214 @@ export function App() {
       return null;
     }
   });
+  const [daemonUpgradeRequests, setDaemonUpgradeRequests] = useState<Record<string, DaemonUpgradeRequestState>>({});
+  const [daemonUpgradeConfirmTarget, setDaemonUpgradeConfirmTarget] = useState<ServerInfo | 'all' | null>(null);
+  const supervisionCacheUserRef = useRef<string | null>(auth?.userId ?? null);
+  useEffect(() => {
+    const previousUserId = supervisionCacheUserRef.current;
+    const nextUserId = auth?.userId ?? null;
+    if (previousUserId && previousUserId !== nextUserId) {
+      clearSupervisionTaskConsoleCacheForUser(previousUserId);
+    }
+    if (!nextUserId) clearAllSupervisionTaskConsoleCaches();
+    supervisionCacheUserRef.current = nextUserId;
+  }, [auth?.userId]);
+  const [initialAuthVerificationPending, setInitialAuthVerificationPending] = useState(
+    () => !isNative(),
+  );
+  // Set only once mount verification has actually concluded 401 AND a login
+  // had just set `rcc_login_session_not_stuck` before its own reload -- never
+  // on a bare 401 (that is the normal state of every logged-out visitor), and
+  // never before verification settles (or a session that DID stick would
+  // flash the message for the instant LoginPage mounts ahead of /me).
+  const [sessionNotStuck, setSessionNotStuck] = useState(false);
+  const authMutationGenerationRef = useRef(0);
+  const activeAuthAttemptSettlementsRef = useRef(new Set<Promise<void>>());
+  const authCredentialCleanupCountRef = useRef(0);
+  const [authCredentialCleanupPending, setAuthCredentialCleanupPending] = useState(false);
+  const holdAuthCredentialCleanupGate = useCallback(() => {
+    authCredentialCleanupCountRef.current += 1;
+    setAuthCredentialCleanupPending(true);
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      authCredentialCleanupCountRef.current = Math.max(
+        0,
+        authCredentialCleanupCountRef.current - 1,
+      );
+      if (authCredentialCleanupCountRef.current === 0) {
+        setAuthCredentialCleanupPending(false);
+      }
+    };
+  }, []);
+  const beginAuthAttempt = useCallback(() => {
+    // Explicit user authentication outranks startup verification and every
+    // older login attempt. Claim a generation at admission time rather than
+    // at success: an already pending /me response must not be able to commit
+    // the previous cookie identity while this attempt is in flight.
+    authMutationGenerationRef.current += 1;
+    const generation = authMutationGenerationRef.current;
+    let finished = false;
+    let resolveSettled!: () => void;
+    const settled = new Promise<void>((resolve) => {
+      resolveSettled = resolve;
+    });
+    activeAuthAttemptSettlementsRef.current.add(settled);
+    return {
+      isCurrent: () => generation === authMutationGenerationRef.current,
+      finish: () => {
+        if (finished) return;
+        finished = true;
+        activeAuthAttemptSettlementsRef.current.delete(settled);
+        resolveSettled();
+      },
+    };
+  }, []);
   const [managedShares, setManagedShares] = useState<ShareGrantSummary[]>([]);
-  const clearAuthState = useCallback(async (reason?: string) => {
+  const clearAuthState = useCallback(async (
+    reason?: string,
+    options?: {
+      preserveSharedNavigation?: boolean;
+      preserveCredentials?: boolean;
+      credentialServerUrl?: string | null;
+    },
+  ) => {
+    // Authentication is authority, but it is not navigation state. In
+    // particular, a refresh can discover an expired cookie before LoginPage
+    // completes a fresh sign-in. Clearing the explicit shared hash here used
+    // to turn `#/server/session?shared=entry` into the dashboard URL, so the
+    // post-login render had no route left to restore. Preserve only the route
+    // that is still explicitly present in this tab; /api/shares/open remains
+    // the sole authority after authentication succeeds.
     console.warn('[auth] clearing auth state', reason ?? '');
+    // Capture the navigation intent and revoke the old authority synchronously.
+    // Credential deletion can involve native IPC; an in-flight shared open must
+    // already be fenced out while those asynchronous operations are pending.
+    const hashRoute = readHashState();
+    const sharedRoute = hashRoute.serverId ? hashRoute : readTabRouteState();
+    const preserveSharedRoute = options?.preserveSharedNavigation !== false && Boolean(
+      sharedRoute.serverId && sharedRoute.sharedEntryId,
+    );
+    const sharedRestoreMarker = preserveSharedRoute
+      ? readSharedTabRestoreMarker()
+      : null;
+    // Do not expose LoginPage until every cleanup started for the old authority
+    // has completed. Native credential deletion is unconditional, so allowing a
+    // fresh login while it is in flight could delete the newly stored key.
+    const releaseCleanupGate = holdAuthCredentialCleanupGate();
+    authMutationGenerationRef.current += 1;
+    const staleAuthAttempts = [...activeAuthAttemptSettlementsRef.current];
+    sharedOpenGenerationRef.current += 1;
     clearApiKey();
     configureExpectedUserId(null);
-    try { await clearAuthKey(); } catch { /* ignore */ }
-    try {
-      const { Preferences } = await import('@capacitor/preferences');
-      await Preferences.remove({ key: 'deck_api_key_id' });
-    } catch { /* ignore */ }
     localStorage.removeItem('rcc_auth');
     localStorage.removeItem('rcc_server');
     localStorage.removeItem('rcc_server_name');
     localStorage.removeItem('rcc_session');
+    clearSharedTabRestoreMarker();
     clearMessagePinsCache();
     clearMessagePinNavigation();
+    // A shared hash is only a navigation intent. Everything learned under the
+    // expired identity is discarded before asynchronous credential cleanup.
     setAuth(null);
     setServers([]);
+    ownedServerIdsRef.current = new Set();
     setServersLoaded(false);
     setServersSynced(false);
-    setSelectedServerId(null);
+    setSessions([]);
+    setSessionsLoaded(false);
+    setSharedActiveDispatchIds(new Map());
+    setOpeningSharedEntryId(null);
+    setSharedEntriesLoading(false);
+    setSharedEntriesLoaded(false);
+    setSharedReturnServer(null);
+    setShowSharedReturnGuide(false);
+    setOpenSubIds(new Set());
+    setMaximizedSubIds(new Set());
+    setDiscussions([]);
+    setRepoContexts(new Map());
+    if (preserveSharedRoute) {
+      initialHashStateRef.current = sharedRoute;
+      initialSharedTabRestoreRef.current = sharedRestoreMarker;
+      sharedHashRestoreStartedRef.current = false;
+    } else {
+      const emptyRoute = { serverId: null, sessionName: null, sharedEntryId: null };
+      initialHashStateRef.current = emptyRoute;
+      initialSharedTabRestoreRef.current = null;
+      sharedHashRestoreStartedRef.current = false;
+      writeHashState(null, null, null);
+    }
+    setSelectedServerId(preserveSharedRoute ? sharedRoute.serverId : null);
     setSelectedServerName(null);
     setSelectedShareTarget(null);
+    setSelectedSharedEntryId(preserveSharedRoute ? sharedRoute.sharedEntryId : null);
+    if (preserveSharedRoute) setActiveSessionState(sharedRoute.sessionName);
+    setSharedHashRestorePending(preserveSharedRoute);
     setSharedEntries([]);
     setSharedEntriesError(null);
     setManagedShares([]);
     setManualDashboard(false);
     setAutoEnteringRecent(false);
-  }, []);
+    try {
+      // If an invalidated login was already inside a native credential write,
+      // let it settle first so this cleanup is guaranteed to be the last writer.
+      await Promise.allSettled(staleAuthAttempts);
+      if (!options?.preserveCredentials) {
+        await clearStoredAuthForServer(options?.credentialServerUrl);
+      }
+    } finally {
+      releaseCleanupGate();
+    }
+  }, [holdAuthCredentialCleanupGate]);
 
   // Native: server URL state and readiness flag
   const [nativeServerUrl, setNativeServerUrl] = useState<string | null>(null);
   const [nativeReady, setNativeReady] = useState(!isNative()); // web is immediately ready
   const [splashDone, setSplashDone] = useState(false);
 
+  const connectNativeServer = useCallback(async (url: string) => {
+    const releaseCleanupGate = holdAuthCredentialCleanupGate();
+    const attempt = beginAuthAttempt();
+    setNativeServerUrl(url);
+    configureApi(url);
+    configureExpectedUserId(null);
+    clearApiKey();
+    try {
+      const storedKey = await getAuthKey(url);
+      if (!storedKey || !attempt.isCurrent()) return;
+      configureApiKey(storedKey);
+      try {
+        const user = await apiFetch<{ id: string }>('/api/auth/user/me');
+        if (!attempt.isCurrent()) return;
+        const authState: AuthState = { userId: user.id, baseUrl: url };
+        authMutationGenerationRef.current += 1;
+        configureExpectedUserId(user.id);
+        localStorage.setItem('rcc_auth', JSON.stringify(authState));
+        setAuth(authState);
+      } catch (err) {
+        // A network outage must not destroy a still-valid saved session. Only
+        // the selected server's authoritative 401 invalidates its credentials.
+        // apiFetch notifies the global expiry handler before throwing, so the
+        // attempt may already be stale here; the URL-scoped deletion is still
+        // required and cannot affect a different server selected afterward.
+        if (err instanceof ApiError && err.status === 401) {
+          await clearStoredAuthForServer(url);
+        }
+        if (!attempt.isCurrent()) return;
+        clearApiKey();
+      }
+    } finally {
+      attempt.finish();
+      releaseCleanupGate();
+    }
+  }, [beginAuthAttempt, holdAuthCredentialCleanupGate]);
+
   const [servers, setServers] = useState<ServerInfo[]>([]);
   const [serversLoaded, setServersLoaded] = useState(false);
   const [serversSynced, setServersSynced] = useState(false);
   const [selectedServerId, setSelectedServerId] = useState<string | null>(
-    () => resolveInitialServerId(),
+    () => initialHashStateRef.current.serverId,
   );
   const selectedServerIdRef = useRef<string | null>(selectedServerId);
   const [selectedServerName, setSelectedServerName] = useState<string | null>(
@@ -567,8 +939,33 @@ export function App() {
   const autoEntryRunRef = useRef(0);
   const [showMobileServerMenu, setShowMobileServerMenu] = useState(false);
   const [showMobileFileBrowser, setShowMobileFileBrowser] = useState(false);
+  // On phones the console is a large overlay: never re-open it by itself at
+  // launch (owner: load silently, no big box on open). It opens only from its
+  // toggle. Desktop keeps the remembered side-panel state.
+  const [showSupervisionTaskConsole, setShowSupervisionTaskConsole] = useState(
+    () => !isMobileDevice() && loadSupervisionTaskConsolePreferences(supervisionTaskConsolePreferenceBounds()).open,
+  );
+  const toggleSupervisionTaskConsole = useCallback(() => {
+    setShowSupervisionTaskConsole((open) => {
+      const nextOpen = !open;
+      const bounds = supervisionTaskConsolePreferenceBounds();
+      const preferences = loadSupervisionTaskConsolePreferences(bounds);
+      saveSupervisionTaskConsolePreferences({ ...preferences, open: nextOpen }, bounds);
+      return nextOpen;
+    });
+  }, []);
+  const closeSupervisionTaskConsole = useCallback(() => {
+    const bounds = supervisionTaskConsolePreferenceBounds();
+    const preferences = loadSupervisionTaskConsolePreferences(bounds);
+    saveSupervisionTaskConsolePreferences({ ...preferences, open: false }, bounds);
+    setShowSupervisionTaskConsole(false);
+  }, []);
+  const supervisionTaskConsoleToggleRef = useRef<HTMLButtonElement>(null);
   const [shareDialogTarget, setShareDialogTarget] = useState<ShareDialogTarget | null>(null);
   const [selectedShareTarget, setSelectedShareTarget] = useState<ShareTarget | null>(null);
+  const [selectedSharedEntryId, setSelectedSharedEntryId] = useState<string | null>(
+    () => initialHashStateRef.current.sharedEntryId,
+  );
   const [sharedHashRestorePending, setSharedHashRestorePending] = useState(
     () => Boolean(initialHashStateRef.current.serverId),
   );
@@ -592,7 +989,9 @@ export function App() {
   }, [sidebarCollapsed]);
   const [showDesktopFileBrowser, setShowDesktopFileBrowser] = useState(false);
   const [desktopFileBrowserMaximized, setDesktopFileBrowserMaximized] = useState(false);
-  const [maximizedSubIds, setMaximizedSubIds] = useState<Set<string>>(() => new Set());
+  const [maximizedSubIds, setMaximizedSubIds] = useState<Set<string>>(() => (
+    loadPersistedMaximizedSubSessionIds(selectedServerId, initialHashStateRef.current.sessionName)
+  ));
   const [subSessionBarCollapsed, setSubSessionBarCollapsed] = useState(() => {
     try {
       const raw = localStorage.getItem(SUBSESSION_BAR_COLLAPSED_STORAGE_KEY);
@@ -605,6 +1004,49 @@ export function App() {
       localStorage.setItem(SUBSESSION_BAR_COLLAPSED_STORAGE_KEY, JSON.stringify(subSessionBarCollapsed));
     } catch { /* ignore */ }
   }, [subSessionBarCollapsed]);
+  const [subSessionDesktopLayout, setSubSessionDesktopLayout] = useState<SubSessionDesktopLayout>(
+    () => loadSubSessionDesktopLayout(),
+  );
+  const [subSessionDesktopDockSide, setSubSessionDesktopDockSide] = useState<SubSessionDesktopDockSide>(
+    () => loadSubSessionDesktopDockSide(),
+  );
+  const [subSessionVerticalRailHost, setSubSessionVerticalRailHost] = useState<HTMLElement | null>(null);
+  const handleSubSessionDesktopLayoutChange = useCallback((layout: SubSessionDesktopLayout) => {
+    setSubSessionDesktopLayout(layout);
+    // Persist only from the desktop-only control. Mobile rendering never writes or resets this preference.
+    saveSubSessionDesktopLayout(layout);
+  }, []);
+  const handleSubSessionDesktopDockSideChange = useCallback((side: SubSessionDesktopDockSide) => {
+    setSubSessionDesktopDockSide(side);
+    // Like the layout choice, docking is a desktop-only local preference.
+    saveSubSessionDesktopDockSide(side);
+  }, []);
+  const [manualTeamDiscussionLayout, setManualTeamDiscussionLayout] = useState<TeamDiscussionLayout | null>(
+    () => loadTeamDiscussionLayout(),
+  );
+  const [automaticTeamDiscussionLayout, setAutomaticTeamDiscussionLayout] = useState<TeamDiscussionLayout>(
+    () => defaultTeamDiscussionLayout(
+      window.innerHeight,
+      !/iPhone|iPad|iPod|Android/i.test(navigator.userAgent),
+    ),
+  );
+  const teamDiscussionLayout = manualTeamDiscussionLayout ?? automaticTeamDiscussionLayout;
+  const [teamDiscussionRailHost, setTeamDiscussionRailHost] = useState<HTMLElement | null>(null);
+  const handleTeamDiscussionLayoutChange = useCallback((layout: TeamDiscussionLayout) => {
+    setManualTeamDiscussionLayout(layout);
+    saveTeamDiscussionLayout(layout);
+  }, []);
+  useEffect(() => {
+    if (manualTeamDiscussionLayout !== null) return undefined;
+    const updateAutomaticLayout = () => {
+      setAutomaticTeamDiscussionLayout(defaultTeamDiscussionLayout(
+        window.innerHeight,
+        !/iPhone|iPad|iPod|Android/i.test(navigator.userAgent),
+      ));
+    };
+    window.addEventListener('resize', updateAutomaticLayout);
+    return () => window.removeEventListener('resize', updateAutomaticLayout);
+  }, [manualTeamDiscussionLayout]);
   const desktopWorkspaceBoundsRef = useRef<HTMLDivElement | null>(null);
   const getDesktopMaximizeBounds = useCallback((): WorkspaceBounds | null => {
     const el = desktopWorkspaceBoundsRef.current;
@@ -708,6 +1150,7 @@ export function App() {
     localStorage.removeItem('rcc_server');
     localStorage.removeItem('rcc_server_name');
     localStorage.removeItem('rcc_session');
+    clearSharedTabRestoreMarker();
   }, [selectedServerId, servers, serversLoaded, serversSynced, selectedShareTarget, sharedHashRestorePending]);
 
   useEffect(() => {
@@ -872,6 +1315,10 @@ export function App() {
   // Native: initialize server URL and API key from Preferences storage
   useEffect(() => {
     if (!isNative()) return;
+    const authGeneration = authMutationGenerationRef.current;
+    const isCurrentAuthGeneration = () => (
+      authGeneration === authMutationGenerationRef.current
+    );
     // Set status bar to match app background
     import('@capacitor/status-bar').then(({ StatusBar, Style }) => {
       StatusBar.setStyle({ style: Style.Dark });
@@ -887,19 +1334,25 @@ export function App() {
         setNativeServerUrl(url);
         if (url) configureApi(url);
 
-        const storedKey = url ? await getAuthKey() : null;
-        if (storedKey) {
+        await initializeServerScopedAuth(url);
+        const storedKey = url ? await getAuthKey(url) : null;
+        if (storedKey && isCurrentAuthGeneration()) {
           configureApiKey(storedKey);
           try {
             const user = await apiFetch<{ id: string }>('/api/auth/user/me');
+            if (!isCurrentAuthGeneration()) return;
             const authState: AuthState = { userId: user.id, baseUrl: url! };
+            authMutationGenerationRef.current += 1;
             configureExpectedUserId(user.id);
             localStorage.setItem('rcc_auth', JSON.stringify(authState));
             setAuth(authState);
           } catch (err) {
             console.warn('[native] /me failed:', err);
+            if (err instanceof ApiError && err.status === 401) {
+              await clearStoredAuthForServer(url);
+            }
+            if (!isCurrentAuthGeneration()) return;
             clearApiKey();
-            await clearAuthKey();
           }
         }
       } catch (e) {
@@ -938,7 +1391,7 @@ export function App() {
   // Native: init push notifications after login
   useEffect(() => {
     if (!auth || !isNative()) return;
-    getAuthKey().then((key) => {
+    getAuthKey(auth.baseUrl).then((key) => {
       if (key) initPushNotifications(key, auth.baseUrl).catch(console.warn);
     });
   }, [auth]);
@@ -962,36 +1415,60 @@ export function App() {
   // Registered once so any apiFetch 401 after refresh failure lands here.
   useEffect(() => {
     onAuthExpired((reason?: string) => {
-      void clearAuthState(reason ?? 'expired');
+      void clearAuthState(reason ?? 'expired', { credentialServerUrl: auth?.baseUrl });
     });
-  }, [clearAuthState]);
+  }, [auth?.baseUrl, clearAuthState]);
 
 
   // Verify session via /api/auth/user/me on mount (cookie-based auth)
   // Also handles post-OAuth redirect: cookie was set by server, we just need to confirm.
   useEffect(() => {
     if (isNative()) return; // native uses biometric auth flow above
+    const authGeneration = authMutationGenerationRef.current;
     const baseUrl = window.location.origin;
     configureApi(baseUrl);
     console.warn('[auth] mount: verifying session via /api/auth/user/me');
-    apiFetch<{ id: string }>('/api/auth/user/me').then((user) => {
+    void apiFetch<{ id: string }>('/api/auth/user/me').then((user) => {
       console.warn(`[auth] /me OK: userId=${user.id}`);
+      try { sessionStorage.removeItem(LOGIN_SESSION_NOT_STUCK_KEY); } catch { /* ignore */ }
+      if (authGeneration !== authMutationGenerationRef.current) return;
       if (auth && auth.userId !== user.id) {
-        void clearAuthState(AUTH_IDENTITY_ERRORS.CHANGED);
+        void clearAuthState(AUTH_IDENTITY_ERRORS.CHANGED, { credentialServerUrl: auth.baseUrl });
         return;
       }
       const authState: AuthState = { userId: user.id, baseUrl };
+      authMutationGenerationRef.current += 1;
       configureExpectedUserId(user.id);
       localStorage.setItem('rcc_auth', JSON.stringify(authState));
       setAuth((prev) => {
         if (prev && prev.userId === authState.userId && prev.baseUrl === authState.baseUrl) return prev;
         return authState;
       });
-    }).catch((err) => {
+    }).catch(async (err) => {
       console.warn(`[auth] /me FAILED:`, err instanceof ApiError ? `${err.status}: ${err.body}` : err);
       if (err instanceof ApiError && err.status === 401) {
-        void clearAuthState('mount_verify_401');
+        // Only a login that just completed sets this flag, right before its
+        // own reload -- an ordinary logged-out visitor never does. Consuming
+        // it here (rather than leaving it for LoginPage to read at mount)
+        // means the message only ever appears once we know verification
+        // truly failed, not the instant LoginPage renders. Checked in both
+        // branches below: a stale local `auth` record from a previous login
+        // must not swallow the flag and delay the message to a later reload.
+        try {
+          if (sessionStorage.getItem(LOGIN_SESSION_NOT_STUCK_KEY) === '1') {
+            sessionStorage.removeItem(LOGIN_SESSION_NOT_STUCK_KEY);
+            setSessionNotStuck(true);
+          }
+        } catch { /* ignore storage restrictions */ }
+        // A logged-out cold start has no auth state to clear. Running the full
+        // clear path anyway used to erase an explicit shared hash before the
+        // user could sign in and continue to that tab.
+        if (auth) {
+          await clearAuthState('mount_verify_401', { credentialServerUrl: auth.baseUrl });
+        }
       }
+    }).finally(() => {
+      setInitialAuthVerificationPending(false);
     });
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -1046,7 +1523,7 @@ export function App() {
         await fetchMe();
       } catch (err) {
         if (err instanceof ApiError && err.status === 401) {
-          await clearAuthState(reason);
+          await clearAuthState(reason, { credentialServerUrl: auth.baseUrl });
         }
       }
     };
@@ -1073,31 +1550,58 @@ export function App() {
   }, [selectedServerId]);
 
   const handleUpgradeDaemon = useCallback(async (server: ServerInfo) => {
+    setDaemonUpgradeConfirmTarget(server);
+  }, []);
+
+  const performDaemonUpgrade = useCallback(async (server: ServerInfo) => {
+    setDaemonUpgradeRequests((previous) => ({ ...previous, [server.id]: { phase: 'requesting' } }));
     try {
-      await apiFetch(`/api/server/${server.id}/upgrade`, { method: 'POST' });
-      alert(trans('server.upgrade_sent', { name: server.name }));
+      await apiFetch(`/api/server/${server.id}/upgrade`, { method: 'POST', body: JSON.stringify(DAEMON_UPGRADE_FORCED_REQUEST_BODY) });
+      setDaemonUpgradeRequests((previous) => ({ ...previous, [server.id]: { phase: 'sent' } }));
     } catch {
-      alert(trans('server.upgrade_failed'));
+      setDaemonUpgradeRequests((previous) => ({ ...previous, [server.id]: { phase: 'failed', message: trans('server.upgrade_failed') } }));
     }
   }, [trans]);
 
   const handleUpgradeAll = useCallback(async () => {
-    const results: string[] = [];
-    for (const server of servers) {
-      try {
-        await apiFetch(`/api/server/${server.id}/upgrade`, { method: 'POST' });
-        results.push(`✓ ${server.name}`);
-      } catch {
-        results.push(`✗ ${server.name}`);
-      }
+    setDaemonUpgradeConfirmTarget('all');
+  }, []);
+
+  const confirmDaemonUpgrade = useCallback(async () => {
+    const target = daemonUpgradeConfirmTarget;
+    setDaemonUpgradeConfirmTarget(null);
+    if (!target) return;
+    if (target === 'all') {
+      setDaemonUpgradeRequests((previous) => {
+        const next = { ...previous };
+        servers.forEach((server) => { next[server.id] = { phase: 'requesting' }; });
+        return next;
+      });
+      const results = await Promise.allSettled(servers.map(async (server) => {
+        await apiFetch(`/api/server/${server.id}/upgrade`, { method: 'POST', body: JSON.stringify(DAEMON_UPGRADE_FORCED_REQUEST_BODY) });
+        return server.id;
+      }));
+      setDaemonUpgradeRequests((previous) => {
+        const next = { ...previous };
+        results.forEach((result, index) => {
+          const id = servers[index]?.id;
+          if (!id) return;
+          next[id] = result.status === 'rejected'
+            ? { phase: 'failed', message: trans('server.upgrade_failed') }
+            : { phase: 'sent' };
+        });
+        return next;
+      });
+      return;
     }
-    alert(results.join('\n'));
-  }, [servers]);
+    await performDaemonUpgrade(target);
+  }, [daemonUpgradeConfirmTarget, performDaemonUpgrade, servers, trans]);
 
   const handleDeleteServer = useCallback(async (server: ServerInfo) => {
     try {
       await apiFetch(`/api/server/${server.id}`, { method: 'DELETE' });
       setServers((prev) => prev.filter((s) => s.id !== server.id));
+      ownedServerIdsRef.current.delete(server.id);
       if (server.id === selectedServerId) {
         setSelectedServerId(null);
         setSelectedServerName(null);
@@ -1114,6 +1618,14 @@ export function App() {
     try {
       const data = await apiFetch<{ servers: ServerInfo[] }>('/api/server');
       setServers(data.servers);
+      // Authoritative ownership, kept apart from `servers` on purpose.
+      // `handleOpenSharedEntry` merges the shared server into `servers` so the
+      // rest of the UI can render it, which makes that array a MIXED inventory:
+      // membership there proves the app has seen a server, never that this
+      // account owns it. Ownership decides whether a route may skip the
+      // /api/shares/open coverage check, so it must come from /api/server and
+      // nowhere else.
+      ownedServerIdsRef.current = new Set(data.servers.map((server) => server.id));
       setServersSynced(true);
     } catch {
       // Preserve the last known list on refresh failures. The request is still
@@ -1135,7 +1647,7 @@ export function App() {
     if (!selectedServer || isServerOnline(selectedServer)) return;
     void fetchMe().catch(async (err) => {
       if (err instanceof ApiError && err.status === 401) {
-        await clearAuthState('server_offline_verify_401');
+        await clearAuthState('server_offline_verify_401', { credentialServerUrl: auth.baseUrl });
       }
     });
   }, [auth, clearAuthState, selectedServerId, servers, serversLoaded]);
@@ -1232,10 +1744,11 @@ export function App() {
       if (mapped.length > 0) {
         setSessionsLoaded(true);
       }
-      // Auto-select first session if none was previously saved
-      if (navigableMapped.length > 0 && !localStorage.getItem('rcc_session')) {
-        setActiveSession(navigableMapped[0].name);
-      }
+      // Restore the last tab for this server, never the global session value
+      // left by another server. A stale/missing snapshot safely falls back
+      // to the first navigable tab -- without being recorded as the user's
+      // choice, so the memory of what they really had open is kept.
+      restoreLastTabRef.current(selectedServerId, navigableMapped.map((session) => session.name));
     }).catch(() => { clearTimeout(timer); /* WS fallback */ });
     return () => { clearTimeout(timer); ctrl.abort(); };
   }, [auth, selectedServerId, selectedShareTarget, sharedHashRestorePending]);
@@ -1280,13 +1793,13 @@ export function App() {
   );
   const [sessionsLoaded, setSessionsLoaded] = useState(false);
   const [activeSession, setActiveSessionState] = useState<string | null>(
-    () => resolveInitialSessionName(),
+    () => initialHashStateRef.current.sessionName,
   );
 
   // Sync URL hash with current server + session so each tab has its own URL
   useEffect(() => {
-    writeHashState(selectedServerId, activeSession);
-  }, [selectedServerId, activeSession]);
+    writeHashState(selectedServerId, activeSession, selectedSharedEntryId);
+  }, [selectedServerId, activeSession, selectedSharedEntryId]);
 
   const [showNewSession, setShowNewSession] = useState(false);
   const [renameRequest, setRenameRequest] = useState<string | null>(null);
@@ -1317,6 +1830,7 @@ export function App() {
   const loadedWebBuildId = useMemo(() => getLoadedWebBuildId(), []);
   const [appUpdateNotice, setAppUpdateNotice] = useState<AppUpdateNotice | null>(null);
   const appUpdateRequiredRef = useRef(false);
+  const appBuildCheckRef = useRef<{ inFlight: Promise<boolean> | null }>({ inFlight: null });
   const markAppUpdateRequired = useCallback((detail: AppUpdateRequiredDetail) => {
     appUpdateRequiredRef.current = true;
     setAppUpdateNotice((prev) => ({
@@ -1330,16 +1844,28 @@ export function App() {
     }));
   }, [loadedWebBuildId]);
   const checkForAppUpdate = useCallback(async (options?: { blocking?: boolean; featureLabel?: string }) => {
-    const current = await fetchCurrentAppBuildInfo();
-    if (!current || !isAppBuildMismatch(loadedWebBuildId, current.buildId)) return false;
-    markAppUpdateRequired({
-      reason: 'build_mismatch',
-      currentBuildId: current.buildId,
-      loadedBuildId: loadedWebBuildId,
-      blocking: options?.blocking,
-      featureLabel: options?.featureLabel,
-    });
-    return true;
+    const state = appBuildCheckRef.current;
+    // Coalesce concurrent checks. Probe recovery never calls this path; only a
+    // real socket reconnect or an explicit version-sensitive action may check.
+    if (state.inFlight) return state.inFlight;
+    const request = (async () => {
+      const current = await fetchCurrentAppBuildInfo();
+      if (!current || !isAppBuildMismatch(loadedWebBuildId, current.buildId)) return false;
+      markAppUpdateRequired({
+        reason: 'build_mismatch',
+        currentBuildId: current.buildId,
+        loadedBuildId: loadedWebBuildId,
+        blocking: options?.blocking,
+        featureLabel: options?.featureLabel,
+      });
+      return true;
+    })();
+    state.inFlight = request;
+    try {
+      return await request;
+    } finally {
+      if (appBuildCheckRef.current.inFlight === request) appBuildCheckRef.current.inFlight = null;
+    }
   }, [loadedWebBuildId, markAppUpdateRequired]);
   const showAppUpdateBlocker = useCallback((featureLabel?: string, reason: AppUpdateReason = 'version_sensitive_feature') => {
     markAppUpdateRequired({
@@ -1421,6 +1947,26 @@ export function App() {
   const [detectedModels, setDetectedModels] = useState<Map<string, string>>(new Map());
   const detectedModelsRef = useRef<Map<string, string>>(new Map());
   const [subUsages, setSubUsages] = useState<Map<string, { inputTokens: number; cacheTokens: number; contextWindow: number; contextWindowSource?: UsageContextWindowSource; model?: string }>>(new Map());
+  type SubUsageValue = { inputTokens: number; cacheTokens: number; contextWindow: number; contextWindowSource?: UsageContextWindowSource; model?: string };
+  const subUsagesRef = useRef(subUsages);
+  subUsagesRef.current = subUsages;
+  const subUsageBatcherRef = useRef<MapUpdateBatcher<string, SubUsageValue> | null>(null);
+  if (subUsageBatcherRef.current === null) {
+    subUsageBatcherRef.current = createMapUpdateBatcher<string, SubUsageValue>({
+      intervalMs: SUB_USAGE_COMMIT_INTERVAL_MS,
+      read: (key) => subUsagesRef.current.get(key),
+      commit: (updates) => setSubUsages((prev) => {
+        let next: Map<string, SubUsageValue> | null = null;
+        for (const [key, value] of updates) {
+          if (looselyEqual(prev.get(key), value)) continue;
+          next ??= new Map(prev);
+          next.set(key, value);
+        }
+        return next ?? prev;
+      }),
+    });
+  }
+  useEffect(() => () => subUsageBatcherRef.current?.cancel(), []);
   const quickData = useQuickData();
   const lastImcodesActivityRef = useRef(Date.now());
   const resubscribeTimersRef = useRef<Set<ReturnType<typeof setTimeout>>>(new Set());
@@ -1444,9 +1990,16 @@ export function App() {
   // IDs of currently-open (non-minimized) sub-session windows.
   // Persisted per main session in localStorage so open state survives
   // session switches and page reloads.
+  // The URL hash is tab-local and therefore authoritative over the shared
+  // localStorage fallback. Keep the persistence scope in a ref so session
+  // switches can update it synchronously before replacing the open-window set.
+  // Reading `localStorage.rcc_session` here made a reload in tab B restore tab
+  // A's window state (or no windows at all).
+  const openSubPersistenceSessionRef = useRef(initialHashStateRef.current.sessionName);
+  const openSubPersistenceServerRef = useRef(selectedServerId);
   const [openSubIds, setOpenSubIdsRaw] = useState<Set<string>>(() => {
     try {
-      const initial = localStorage.getItem('rcc_session');
+      const initial = openSubPersistenceSessionRef.current;
       if (initial) {
         const raw = localStorage.getItem(`rcc_open_subs_${initial}`);
         if (raw) return new Set(JSON.parse(raw) as string[]);
@@ -1454,34 +2007,66 @@ export function App() {
     } catch { /* ignore */ }
     return new Set();
   });
+  // Keep windows that were open in a previously visited main-session tab
+  // mounted (but hidden) while the user looks at another tab. Main
+  // SessionPane instances already follow this lifecycle; floating sub-session
+  // windows used to be the exception: switching tabs unmounted every ChatView
+  // and switching back mounted all of them again. Two heavy timelines could
+  // then race their cache/IDB bootstrap and one pane intermittently stayed
+  // blank until the user forced a refresh. Retaining the component instances
+  // preserves their timeline/scroll/composer state and makes the return trip a
+  // visibility flip rather than a destructive rebuild.
+  const [retainedOpenSubIds, setRetainedOpenSubIds] = useState<Set<string>>(
+    () => new Set(openSubIds),
+  );
   const openSubIdsRef = useRef(openSubIds);
   openSubIdsRef.current = openSubIds;
   const persistOpenSubIds = useCallback((next: Set<string>) => {
-    let mainSession: string | null = null;
-    try {
-      mainSession = localStorage.getItem('rcc_session');
-    } catch {
-      return;
-    }
+    const mainSession = openSubPersistenceSessionRef.current;
     if (!mainSession) return;
     const ids = Array.from(next);
     const storageKey = `rcc_open_subs_${mainSession}`;
     if (ids.length > 0) safeLocalStorageSetItem(storageKey, JSON.stringify(ids));
     else safeLocalStorageRemoveItem(storageKey);
   }, []);
-  const setOpenSubIds = useCallback((updater: Set<string> | ((prev: Set<string>) => Set<string>)) => {
-    if (typeof updater !== 'function') {
-      openSubIdsRef.current = updater;
-      persistOpenSubIds(updater);
-      setOpenSubIdsRaw(updater);
-      return;
-    }
-    setOpenSubIdsRaw((prev) => {
-      const next = updater(prev);
-      openSubIdsRef.current = next;
-      persistOpenSubIds(next);
-      return next;
+  const persistMaximizedSubIds = useCallback((next: Set<string>) => {
+    const mainSession = openSubPersistenceSessionRef.current;
+    if (!mainSession) return;
+    const ids = Array.from(next).slice(0, MAX_PERSISTED_MAXIMIZED_SUBSESSION_IDS);
+    const storageKey = maximizedSubSessionStorageKey(openSubPersistenceServerRef.current, mainSession);
+    if (ids.length > 0) safeLocalStorageSetItem(storageKey, JSON.stringify(ids));
+    else safeLocalStorageRemoveItem(storageKey);
+  }, []);
+  useEffect(() => {
+    // State changes from maximize/restore and session switches share one
+    // bounded, session-scoped persistence path.  Reading the refs avoids a
+    // transient render writing the previous tab's state under the new key.
+    persistMaximizedSubIds(maximizedSubIds);
+  }, [maximizedSubIds, persistMaximizedSubIds]);
+  const setOpenSubIds = useCallback((
+    updater: Set<string> | ((prev: Set<string>) => Set<string>),
+    options?: { retainPrevious?: boolean },
+  ) => {
+    // Resolve functional updates against the synchronous ref. Several window
+    // actions can run in one browser turn; waiting for Preact's state updater
+    // would make the retained-set reconciliation observe an older open set.
+    const previous = openSubIdsRef.current;
+    const next = typeof updater === 'function' ? updater(previous) : updater;
+    openSubIdsRef.current = next;
+    persistOpenSubIds(next);
+    setRetainedOpenSubIds((retained) => {
+      const updated = new Set(retained);
+      // Ordinary window actions replace the active tab's retained membership
+      // (so minimize/close really unmounts it). A main-tab switch instead keeps
+      // the previous tab mounted and only adds the target tab's restored set.
+      if (!options?.retainPrevious) {
+        for (const id of previous) updated.delete(id);
+      }
+      for (const id of next) updated.add(id);
+      if (updated.size === retained.size && [...updated].every((id) => retained.has(id))) return retained;
+      return updated;
     });
+    setOpenSubIdsRaw(next);
   }, [persistOpenSubIds]);
 
   // Panels pinned to the sidebar — synced to server, write-through cache
@@ -1550,7 +2135,7 @@ export function App() {
   if (stackRef.current === null) stackRef.current = new MutableDesktopWindowStack();
   const [stackVersion, setStackVersion] = useState(0);
   const bumpStack = useCallback(() => setStackVersion((n) => n + 1), []);
-  const isMobileRef = useRef(/iPhone|iPad|iPod|Android/i.test(navigator.userAgent));
+  const isMobileRef = useRef(isMobileDevice());
 
   // Active (frontmost) sub-session. Managed EXPLICITLY rather than re-derived
   // from the mutable window stack on every render: opening/focusing a window
@@ -1580,16 +2165,26 @@ export function App() {
   // `stackVersion` counter live so z-index consumers re-render on stack changes.
   useEffect(() => { recomputeFocusedSubId(); }, [stackVersion, recomputeFocusedSubId]);
 
+  const canUseWindowStackForSurface = useCallback((meta: DesktopWindowMeta): boolean => {
+    if (!isMobileRef.current) return true;
+    // Mobile sub-sessions keep their existing single-open drawer semantics and
+    // geometry, but full-screen work surfaces (remote desktop, wall, file
+    // preview, discussions, etc.) still need the shared stack ordering so the
+    // latest opened surface is not covered by an older fallback-z overlay.
+    return meta.kind !== DESKTOP_WINDOW_KINDS.subSession
+      && meta.kind !== DESKTOP_WINDOW_KINDS.subsessionFileBrowser;
+  }, []);
+
   /** Idempotent register; raises if `bringToFront` is requested. Bumps version only on real change. */
   const ensureDesktopWindow = useCallback((id: string, meta: DesktopWindowMeta, opts?: { bringToFront?: boolean }) => {
-    if (isMobileRef.current) return;
+    if (!canUseWindowStackForSurface(meta)) return;
     const stack = stackRef.current!;
     let changed = stack.ensureWindow(id, meta);
     if (opts?.bringToFront) {
       if (stack.bringToFront(id)) changed = true;
     }
     if (changed) bumpStack();
-  }, []);
+  }, [canUseWindowStackForSurface]);
 
   const openLocalWebPreviewFromChat = useCallback<ChatLocalWebPreviewOpenHandler>(({ port, path }) => {
     setLocalWebPreviewPort(String(port));
@@ -1607,7 +2202,6 @@ export function App() {
 
   /** Raise an existing window. No-op (no version bump) if it is already frontmost. */
   const bringDesktopWindowToFront = useCallback((id: string) => {
-    if (isMobileRef.current) return;
     if (stackRef.current!.bringToFront(id)) bumpStack();
   }, []);
 
@@ -1636,7 +2230,8 @@ export function App() {
   }, []);
 
   const [showSubDialog, setShowSubDialog] = useState(false);
-  const [settingsTarget, setSettingsTarget] = useState<{ sessionName: string; sessionInstanceId?: string; runtimeEpoch?: string; activeModel?: string | null; requestedModel?: string | null; providerId?: string | null; subId?: string; label: string; description: string; cwd: string; type: string; parentSession?: string | null; transportConfig?: Record<string, unknown> | null; openIntent?: SessionSettingsOpenIntent } | null>(null);
+  const [poolAddTarget, setPoolAddTarget] = useState<SupervisionExecutionPoolKind | null>(null);
+  const [settingsTarget, setSettingsTarget] = useState<{ sessionName: string; sessionInstanceId?: string; runtimeEpoch?: string; activeModel?: string | null; requestedModel?: string | null; modelDisplay?: string | null; providerId?: string | null; subId?: string; label: string; description: string; cwd: string; type: string; parentSession?: string | null; transportConfig?: Record<string, unknown> | null; supervisionMode?: import('@shared/supervision-config.js').SupervisionMode | null; openIntent?: SessionSettingsOpenIntent; canControlAutomaticSupervision: boolean } | null>(null);
   const [cloneSessionTarget, setCloneSessionTarget] = useState<SessionInfo | null>(null);
 
   // Derive focused (topmost) sub-session from the shared stack + open set.
@@ -1646,6 +2241,7 @@ export function App() {
   const openSubIdsKeyMemo = useMemo(() => openSubIdsKey(openSubIds), [openSubIds]);
   const maximizedSubIdsRef = useRef(maximizedSubIds);
   maximizedSubIdsRef.current = maximizedSubIds;
+  const liveIdleSessionsRef = useRef<Set<string>>(new Set());
   const flashIdleSession = useCallback((sessionName: string) => {
     setIdleFlashTokens((prev) => {
       const next = new Map(prev);
@@ -1716,9 +2312,14 @@ export function App() {
   const [showCronManager, setShowCronManager] = useState(false);
   const [showAdminPage, setShowAdminPage] = useState(false);
   const [showSharedContextManagement, setShowSharedContextManagement] = useState(false);
-  const [showControlledNodes, setShowControlledNodes] = useState(false);
-  const [remoteDesktopMachine, setRemoteDesktopMachine] = useState<MachineListItem | null>(null);
-  const [remoteDesktopMinimized, setRemoteDesktopMinimized] = useState(false);
+  const [showControlledNodes, setShowControlledNodes] = useState(Boolean(aideskManagementNodeId));
+  const [remoteDesktopWorkspace, setRemoteDesktopWorkspace] = useState(
+    createRemoteDesktopWorkspaceState,
+  );
+  const [remoteDesktopWorkspaceMinimized, setRemoteDesktopWorkspaceMinimized] = useState(false);
+  const [remoteDesktopWallOpen, setRemoteDesktopWallOpen] = useState(false);
+  const [remoteDesktopWallMinimized, setRemoteDesktopWallMinimized] = useState(false);
+  const [remoteDesktopWallHostKeys, setRemoteDesktopWallHostKeys] = useState<readonly string[]>([]);
   const [showSharedContextDiagnostics, setShowSharedContextDiagnostics] = useState(false);
   const [sharedContextManagementProps, setSharedContextManagementProps] = useState<Record<string, unknown>>({});
   const [sharedContextDiagnosticsProps, setSharedContextDiagnosticsProps] = useState<SharedContextDiagnosticsWindowState>({});
@@ -1736,15 +2337,56 @@ export function App() {
   }, [ensureDesktopWindow, selectedServerId]);
 
   const openRemoteDesktop = useCallback((machine: MachineListItem) => {
-    setRemoteDesktopMachine(machine);
-    setRemoteDesktopMinimized(false);
-    // Join the managed desktop stack so this window can be raised and, just as
-    // importantly, can be covered by another window the user clicks.
-    ensureDesktopWindow(DESKTOP_WINDOW_IDS.remoteDesktop(machine.serverId), {
+    setRemoteDesktopWorkspace((current) => openRemoteDesktopWorkspaceHost(current, machine));
+    setRemoteDesktopWorkspaceMinimized(false);
+    ensureDesktopWindow(REMOTE_DESKTOP_WORKSPACE_WINDOW_ID, {
       kind: DESKTOP_WINDOW_KINDS.remoteDesktop,
-      serverId: machine.serverId,
     }, { bringToFront: true });
   }, [ensureDesktopWindow]);
+
+  const openRemoteDesktopWall = useCallback(() => {
+    setRemoteDesktopWallOpen(true);
+    setRemoteDesktopWallMinimized(false);
+    ensureDesktopWindow(DESKTOP_WINDOW_IDS.remoteDesktopWall, {
+      kind: DESKTOP_WINDOW_KINDS.remoteDesktopWall,
+    }, { bringToFront: true });
+  }, [ensureDesktopWindow]);
+
+  const openRemoteDesktopById = useCallback(() => {
+    window.open('/remote-desktop/access', '_blank', 'noopener,noreferrer');
+  }, []);
+
+  const closeRemoteDesktopWall = useCallback((hostKeys: readonly string[]) => {
+    const retained = new Set(remoteDesktopWorkspace.orderedHostKeys);
+    for (const hostKey of hostKeys) {
+      if (!retained.has(hostKey)) {
+        remoteDesktopConnectionManager.stop(hostKey, REMOTE_DESKTOP_STOP_ORIGIN.WALL_CLOSE);
+      }
+    }
+    setRemoteDesktopWallOpen(false);
+    setRemoteDesktopWallMinimized(false);
+    removeDesktopWindow(DESKTOP_WINDOW_IDS.remoteDesktopWall);
+  }, [remoteDesktopConnectionManager, remoteDesktopWorkspace.orderedHostKeys, removeDesktopWindow]);
+
+  const openRemoteDesktopWallStandalone = useCallback(() => {
+    if (!openRemoteDesktopWallWindow()) return;
+    closeRemoteDesktopWall(remoteDesktopWallHostKeys);
+  }, [closeRemoteDesktopWall, remoteDesktopWallHostKeys]);
+
+  useEffect(() => {
+    if (auth) return;
+    remoteDesktopConnectionManager.stopAll(REMOTE_DESKTOP_STOP_ORIGIN.APP_SIGN_OUT);
+    setRemoteDesktopWorkspace(createRemoteDesktopWorkspaceState());
+    setRemoteDesktopWorkspaceMinimized(false);
+    setRemoteDesktopWallOpen(false);
+    setRemoteDesktopWallHostKeys([]);
+    removeDesktopWindow(REMOTE_DESKTOP_WORKSPACE_WINDOW_ID);
+    removeDesktopWindow(REMOTE_DESKTOP_WALL_WINDOW_ID);
+  }, [auth, remoteDesktopConnectionManager, removeDesktopWindow]);
+
+  useEffect(() => () => remoteDesktopConnectionManager.stopAll(
+    REMOTE_DESKTOP_STOP_ORIGIN.APP_UNMOUNT,
+  ), [remoteDesktopConnectionManager]);
 
   // Fetch current user info on auth
   useEffect(() => {
@@ -1780,6 +2422,14 @@ export function App() {
   // Questions the user already answered/dismissed this session — so re-hydrating
   // from history (below) never re-pops a question they've dealt with.
   const dismissedQuestionsRef = useRef<Set<string>>(new Set());
+  // Answers sent to the daemon but not yet confirmed, and the one (if any) that
+  // turned out refused/lost — shown with the user's text so it is never silent.
+  const [askAnswerFailure, setAskAnswerFailure] = useState<AskAnswerFailure | null>(null);
+  const askAnswerTrackerRef = useRef<AskAnswerTracker | null>(null);
+  if (!askAnswerTrackerRef.current) {
+    askAnswerTrackerRef.current = new AskAnswerTracker(ASK_ANSWER_ACK_WAIT_MS, setAskAnswerFailure);
+  }
+  useEffect(() => () => askAnswerTrackerRef.current?.dispose(), []);
   const [discussions, setDiscussions] = useState<Array<{
     id: string;
     topic: string;
@@ -1947,7 +2597,12 @@ export function App() {
       const next = new Set(prev);
       next.delete(id);
       return next;
-    });
+    // Keep the minimized pane mounted as a cheap summary shell.  Removing it
+    // from the retained set made the canonical 19-window run report only the
+    // nine full panes and forced a cold remount on restore.  `visible=false`
+    // keeps its subscription/history summary path while SubSessionWindow
+    // suppresses full controls and ChatView work until restoration.
+    }, { retainPrevious: true });
     removeDesktopWindow(DESKTOP_WINDOW_IDS.subSession(id));
   }, [clearSubSessionMaximized, removeDesktopWindow, setOpenSubIds]);
 
@@ -2037,7 +2692,10 @@ export function App() {
 
   const closeAllSubSessionWindows = useCallback(() => {
     setMaximizedSubIds(new Set());
-    setOpenSubIds(new Set());
+    // This is a presentation collapse (active-tab click / toolbar arrow), not
+    // termination. Keep the ChatView instances retained so expanding the same
+    // windows is instant and cannot race two fresh timeline bootstraps.
+    setOpenSubIds(new Set(), { retainPrevious: true });
     recomputeFocusedSubId();
     if (isMobileRef.current) return;
     const stack = stackRef.current!;
@@ -2097,7 +2755,8 @@ export function App() {
   // stack's own short-circuit logic ensures no version bump when nothing
   // changed (e.g. re-running the effect when an unrelated dep changes).
   //
-  // Mobile is a no-op (the helpers themselves bail out on isMobileRef).
+  // On mobile, sub-session entries remain no-op, while full-screen work
+  // surfaces still register so z-index follows the same frontmost ordering.
   useEffect(() => {
     if (showRepoPage) {
       if (repoPanelParentSubId) {
@@ -2210,34 +2869,135 @@ export function App() {
     }
   }, [previewFileRequest, selectedServerId, ensureDesktopWindow, removeDesktopWindow]);
 
+  // The tab the user last chose on purpose, and whether they have chosen one at
+  // all since this document loaded. Only an explicit choice is remembered per
+  // server, and a late automatic restore never overrides one.
+  const rememberIntentRef = useRef<string | null>(null);
+  // The server the user last chose a tab on in this document. Scoped to the
+  // server so a choice made elsewhere (a shared session, the previous server)
+  // never blocks restoring the tab of the server being entered.
+  const explicitSelectionServerRef = useRef<string | null>(null);
+
+  /**
+   * `remember: false` marks an AUTOMATIC selection (restoring the saved tab,
+   * replacing a tab that no longer exists, auto-entering a server). Those are
+   * never recorded as "the user's last tab", so a fallback cannot replace the
+   * memory of what the user really had open.
+   */
   const setActiveSession = useCallback((
     name: string | null,
-    opts?: { keepSubWindows?: boolean; scrollToBottom?: boolean },
+    opts?: { keepSubWindows?: boolean; scrollToBottom?: boolean; remember?: boolean },
   ) => {
+    const deliberate = Boolean(name) && opts?.remember !== false;
+    rememberIntentRef.current = deliberate ? name : null;
+    if (deliberate) explicitSelectionServerRef.current = selectedServerId;
+    // Update this before setOpenSubIds: state setters below run in the same
+    // turn, before the hash-sync effect can publish the new tab-local scope.
+    openSubPersistenceSessionRef.current = name;
+    openSubPersistenceServerRef.current = selectedServerId;
     if (name) safeLocalStorageSetItem('rcc_session', name);
     else safeLocalStorageRemoveItem('rcc_session');
     setActiveSessionState(name);
     if (!opts?.keepSubWindows) {
-      setMaximizedSubIds(new Set());
+      setMaximizedSubIds(loadPersistedMaximizedSubSessionIds(selectedServerId, name));
       setDesktopFileBrowserMaximized(false);
       // Restore saved open sub-sessions for the target main session
       if (name) {
         try {
           const raw = localStorage.getItem(`rcc_open_subs_${name}`);
-          if (raw) { setOpenSubIds(new Set(JSON.parse(raw) as string[])); }
-          else { setOpenSubIds(new Set()); }
-        } catch { setOpenSubIds(new Set()); }
+          if (raw) { setOpenSubIds(new Set(JSON.parse(raw) as string[]), { retainPrevious: true }); }
+          else { setOpenSubIds(new Set(), { retainPrevious: true }); }
+        } catch { setOpenSubIds(new Set(), { retainPrevious: true }); }
       } else {
-        setOpenSubIds(new Set());
+        setOpenSubIds(new Set(), { retainPrevious: true });
       }
     }
     // scroll chat to bottom on session switch (rAF gives ChatView time to mount)
     if (name && opts?.scrollToBottom !== false) {
       requestAnimationFrame(() => chatScrollFnsRef.current.get(name)?.());
     }
-  }, [setOpenSubIds]);
+  }, [selectedServerId, setOpenSubIds]);
+
+  // Keep a server-scoped snapshot of the tab the user deliberately opened.
+  // It is written ONLY for an explicit choice (rememberIntentRef): an
+  // unresolved selection (null, e.g. a boot from a server-only hash) must not
+  // erase it before the restore reads it, and an automatic fallback must not
+  // replace it. The one-render guard prevents a server switch from briefly
+  // writing the previous server's active tab before its route/session restore.
+  const sessionSnapshotServerRef = useRef<string | null>(selectedServerId);
+  useEffect(() => {
+    if (sessionSnapshotServerRef.current !== selectedServerId) {
+      sessionSnapshotServerRef.current = selectedServerId;
+      return;
+    }
+    if (!selectedServerId || selectedShareTarget || sharedHashRestorePending) return;
+    if (!activeSession || rememberIntentRef.current !== activeSession) return;
+    writeServerSession(selectedServerId, activeSession);
+  }, [activeSession, selectedServerId, selectedShareTarget, sharedHashRestorePending]);
+
+  /**
+   * Restore the tab the user last had open on `serverId` once its session list
+   * is known (shared by the REST and websocket list paths). An explicit hash
+   * session wins, then the per-server memory; a missing/disabled tab falls back
+   * to the server's most recent/first main session without being remembered.
+   * Does nothing once the user has picked a tab on this server this load, so a
+   * late list can never override a click.
+   */
+  const restoreLastTabRef = useRef<(serverId: string, navigableNames: readonly string[]) => string | null>(() => null);
+  restoreLastTabRef.current = (serverId, navigableNames) => {
+    if (explicitSelectionServerRef.current === serverId || navigableNames.length === 0) return null;
+    const remembered = readServerSession(serverId);
+    const preferred = resolveServerSessionSnapshot(
+      serverId,
+      initialHashStateRef.current.sessionName ?? remembered,
+      navigableNames.map((sessionName) => ({ serverId, sessionName })),
+      remembered,
+    ) ?? navigableNames[0]!;
+    setActiveSession(preferred, { remember: false });
+    // Migration: a tab that came from the hash or from an older build's single
+    // global value (not from a fallback) is where the user really was, so it
+    // becomes this server's memory when none exists yet. Otherwise a user who
+    // upgrades and never clicks a tab would lose it on the next server switch.
+    if (!remembered && preferred === initialHashStateRef.current.sessionName) {
+      writeServerSession(serverId, preferred);
+    }
+    if (preferred !== initialHashStateRef.current.sessionName) {
+      initialHashStateRef.current = { ...initialHashStateRef.current, serverId, sessionName: preferred };
+      writeHashState(serverId, preferred);
+    }
+    return preferred;
+  };
+
+  const claimExplicitSessionNavigation = useCallback((name: string) => {
+    sharedOpenGenerationRef.current += 1;
+    externalRouteGenerationRef.current += 1;
+    externalRouteInFlightKeyRef.current = null;
+    setOpeningSharedEntryId(null);
+
+    const keepsSharedRoute = !selectedShareTarget
+      || selectedShareTarget.kind !== 'main'
+      || selectedShareTarget.sessionName === name;
+    const nextSharedEntryId = keepsSharedRoute ? selectedSharedEntryId : null;
+    if (!keepsSharedRoute) {
+      setSelectedShareTarget(null);
+      setSelectedSharedEntryId(null);
+      clearSharedTabRestoreMarker();
+      initialSharedTabRestoreRef.current = null;
+    }
+
+    const nextRoute = {
+      serverId: selectedServerId,
+      sessionName: name,
+      sharedEntryId: nextSharedEntryId,
+    };
+    initialHashStateRef.current = nextRoute;
+    sharedHashRestoreStartedRef.current = true;
+    setSharedHashRestorePending(false);
+    writeHashState(nextRoute.serverId, nextRoute.sessionName, nextRoute.sharedEntryId);
+  }, [selectedServerId, selectedSharedEntryId, selectedShareTarget]);
 
   const selectMainSessionTab = useCallback((name: string) => {
+    claimExplicitSessionNavigation(name);
     if (name === activeSessionRef.current) {
       closeAllSubSessionWindows();
     } else {
@@ -2248,24 +3008,32 @@ export function App() {
       next.delete(name);
       return next;
     });
-  }, [closeAllSubSessionWindows, setActiveSession]);
+  }, [claimExplicitSessionNavigation, closeAllSubSessionWindows, setActiveSession]);
 
   const selectSubSessionFromTree = useCallback((sub: SubSession) => {
+    claimExplicitSessionNavigation(sub.parentSession ?? activeSessionRef.current ?? sub.sessionName);
     if (sub.parentSession && sub.parentSession !== activeSessionRef.current) {
       setActiveSession(sub.parentSession, { keepSubWindows: true });
     }
     openSubSessionWindow(sub.id);
-  }, [openSubSessionWindow, setActiveSession]);
+  }, [claimExplicitSessionNavigation, openSubSessionWindow, setActiveSession]);
 
   useEffect(() => {
-    if (!activeSession) return;
+    // Do not let a persisted/hash-selected tab survive once the current
+    // server's authoritative session list has loaded and says it is gone.
+    // This covers server switching, refresh/back-forward, and permission or
+    // role changes that remove a previously navigable tab.
+    if (!activeSession || !sessionsLoaded) return;
     if (navigableMainSessions.some((session) => session.name === activeSession)) return;
     const hiddenActive = sessions.find((session) => session.name === activeSession);
-    if (!hiddenActive || isNavigableMainSession(hiddenActive)) return;
-    const replacement = navigableMainSessions.find((session) => session.project === hiddenActive.project)
+    if (hiddenActive && isNavigableMainSession(hiddenActive)) return;
+    const replacement = (hiddenActive
+      ? navigableMainSessions.find((session) => session.project === hiddenActive.project)
+      : undefined)
       ?? navigableMainSessions[0];
-    if (replacement) setActiveSession(replacement.name);
-  }, [activeSession, navigableMainSessions, sessions, setActiveSession]);
+    // Automatic: the replacement is a fallback, not something the user chose.
+    setActiveSession(replacement?.name ?? null, { remember: false });
+  }, [activeSession, navigableMainSessions, sessions, sessionsLoaded, setActiveSession]);
 
   useEffect(() => {
     if (!auth || selectedServerId || !serversLoaded || servers.length === 0 || manualDashboard) return;
@@ -2294,10 +3062,20 @@ export function App() {
       if (cancelled || runId !== autoEntryRunRef.current || selectedServerIdRef.current) return;
 
       const recent = pickMostRecentMainSession(rows.filter((row) => typeof row.previewUpdatedAt === 'number'));
-      const fallback = pickAutoEntryServer(servers, savedServerId);
-      const savedFallbackSession = fallback ? localStorage.getItem(`rcc_session_${fallback.serverId}`) : null;
+      // Entering with no server selected (first load after a login, the
+      // dashboard) returns to where the user last was: the saved server, else
+      // the server whose tab was remembered most recently. Only then does
+      // recent activity decide.
+      const fallback = pickAutoEntryServer(servers, savedServerId ?? readLastRememberedServerId());
+      const rememberedTab = fallback ? readServerSession(fallback.serverId) : null;
+      const rememberedStillThere = fallback && rememberedTab
+        && resolveServerSessionSnapshot(fallback.serverId, rememberedTab, rows) === rememberedTab;
+      const savedFallbackSession = fallback
+        ? resolveServerSessionSnapshot(fallback.serverId, readServerSession(fallback.serverId), rows)
+        : null;
       const firstMain = pickMostRecentMainSession(rows);
-      const selection = recent
+      const selection = (rememberedStillThere && fallback ? { ...fallback, sessionName: rememberedTab } : null)
+        ?? recent
         ?? (fallback && savedFallbackSession ? { ...fallback, sessionName: savedFallbackSession } : null)
         ?? firstMain
         ?? fallback;
@@ -2309,14 +3087,11 @@ export function App() {
       else localStorage.removeItem('rcc_server_name');
       setSelectedServerId(selection.serverId);
       setSelectedServerName(server?.name ?? null);
-      if (selection.sessionName) {
-        localStorage.setItem(`rcc_session_${selection.serverId}`, selection.sessionName);
-        setActiveSession(selection.sessionName);
-      } else {
-        const savedSession = localStorage.getItem(`rcc_session_${selection.serverId}`);
-        setActiveSession(savedSession);
-      }
-      writeHashState(selection.serverId, selection.sessionName ?? localStorage.getItem(`rcc_session_${selection.serverId}`));
+      // Automatic entry: whatever it lands on is a fallback, never recorded as
+      // the user's own last tab (that memory is only written by a real choice).
+      const entered = selection.sessionName ?? savedFallbackSession;
+      setActiveSession(entered, { remember: false });
+      writeHashState(selection.serverId, entered);
     };
 
     void choose().finally(() => {
@@ -2363,6 +3138,28 @@ export function App() {
     setTimeout(() => setToasts((prev) => prev.filter((x) => x.id !== id)), 8000);
   }, []);
 
+  // A shared participant's Stop was refused: say why, and when the cause is that
+  // the turn changed, adopt the running turn so the next tap names the right one.
+  useEffect(() => {
+    const onShareCancelFailed = (event: Event) => {
+      const failure = (event as CustomEvent<ShareCancelFailure>).detail;
+      const t = transRef.current;
+      if (failure.session && failure.activeDispatchId) {
+        const { session, activeDispatchId } = failure;
+        setSharedActiveDispatchIds((previous) => new Map(previous).set(session, activeDispatchId));
+      }
+      const id = Date.now() + Math.random();
+      setToasts((prev) => [...prev, {
+        id, sessionName: '', project: '', kind: 'notification',
+        title: t('share.cancel_failed.title'),
+        message: t(`share.cancel_failed.reason.${shareCancelFailureReasonKey(failure.reason)}`),
+      }]);
+      setTimeout(() => setToasts((prev) => prev.filter((x) => x.id !== id)), 8000);
+    };
+    window.addEventListener(SHARE_CANCEL_FAILED_EVENT, onShareCancelFailed);
+    return () => window.removeEventListener(SHARE_CANCEL_FAILED_EVENT, onShareCancelFailed);
+  }, []);
+
   // App owns the optimistic launch state and mints the requestId so the
   // pending card is inserted BEFORE the (synchronously-throwing) send.
   const handleStartDiscussion = useCallback((payload: {
@@ -2403,7 +3200,7 @@ export function App() {
     }
     setShowDiscussionDialog(false);
   }, [pushDiscussionFailureToast]);
-  const [daemonStats, setDaemonStats] = useState<{ daemonVersion?: string | null; cpu: number; memUsed: number; memTotal: number; load1: number; load5: number; load15: number; uptime: number } | null>(null);
+  const [daemonStats, setDaemonStats] = useState<DaemonStatsView | null>(null);
 
   useEffect(() => {
     if (!auth || !selectedServerId || sharedHashRestorePending) return;
@@ -2448,12 +3245,16 @@ export function App() {
       const runtimeEpoch = source.runtimeEpoch ?? current.runtimeEpoch;
       const activeModel = source.activeModel ?? current.activeModel;
       const requestedModel = source.requestedModel ?? current.requestedModel;
+      const modelDisplay = source.modelDisplay ?? current.modelDisplay;
       const providerId = source.providerId ?? current.providerId;
+      const supervisionMode = source.supervisionMode ?? current.supervisionMode;
       if (sessionInstanceId === current.sessionInstanceId
         && runtimeEpoch === current.runtimeEpoch
         && activeModel === current.activeModel
         && requestedModel === current.requestedModel
-        && providerId === current.providerId) {
+        && modelDisplay === current.modelDisplay
+        && providerId === current.providerId
+        && supervisionMode === current.supervisionMode) {
         return current;
       }
       return {
@@ -2462,7 +3263,9 @@ export function App() {
         runtimeEpoch,
         activeModel,
         requestedModel,
+        modelDisplay,
         providerId,
+        supervisionMode,
       };
     });
   }, [sessions, subSessions]);
@@ -2540,7 +3343,7 @@ export function App() {
     entry: SharedEntrySummary,
     options?: { restoreFromHash?: boolean; preferredSessionName?: string | null },
   ) => {
-    if (openingSharedEntryId) return;
+    if (openingSharedEntryId) return false;
     const returnServer = options?.restoreFromHash
       ? null
       : selectedShareTarget
@@ -2555,8 +3358,10 @@ export function App() {
         : null;
     setOpeningSharedEntryId(entry.id);
     setSharedEntriesError(null);
+    const openGeneration = sharedOpenGenerationRef.current;
     try {
       const opened = await openSharedEntry(entry.target);
+      if (openGeneration !== sharedOpenGenerationRef.current) return false;
       const nextServer: ServerInfo = {
         id: opened.server.id,
         name: opened.server.name,
@@ -2568,12 +3373,14 @@ export function App() {
         const parsed = parseMainSessionName(session.sessionName);
         return {
           name: session.sessionName,
-          project: session.title || parsed?.project || session.sessionName,
+          project: resolveSharedSessionProject(session.sessionName, session.title),
           role: parsed?.role ?? 'brain',
           agentType: session.agentType || 'unknown',
           state: session.state as SessionInfo['state'],
           label: session.title,
+          supervisionMode: session.supervisionMode ?? null,
           sharedState: {
+            targetKind: opened.target.kind,
             effectiveRole: opened.coverage.effectiveRole,
             status: 'active',
             scopeLabel: entry.targetLabel,
@@ -2592,6 +3399,8 @@ export function App() {
       setSharedActiveDispatchIds(openedDispatchIds);
 
       setSelectedShareTarget(opened.target);
+      setSelectedSharedEntryId(entry.id);
+      rememberSharedTab(entry);
       setManualDashboard(false);
       setSelectedServerId(opened.server.id);
       setSelectedServerName(opened.server.name);
@@ -2622,7 +3431,9 @@ export function App() {
       } else {
         localStorage.removeItem('rcc_session');
       }
-      setActiveSession(activeFromTarget, { keepSubWindows: true });
+      // A shared target is not a choice of the owner's own tab on any of their
+      // servers: never remember it, and never let it block a later restore.
+      setActiveSession(activeFromTarget, { keepSubWindows: true, remember: false });
       if (openedTarget.kind === 'subsession') {
         setOpenSubIds((prev) => new Set([...prev, openedTarget.subSessionId]));
       }
@@ -2632,18 +3443,27 @@ export function App() {
       }
       setShowMobileServerMenu(false);
       setMobileSidebarOpen(false);
+      return true;
     } catch (err) {
+      if (openGeneration !== sharedOpenGenerationRef.current) return false;
       setSharedEntriesError(formatSharedAccessError(err));
+      return false;
     } finally {
-      setOpeningSharedEntryId(null);
+      if (openGeneration === sharedOpenGenerationRef.current) {
+        setOpeningSharedEntryId(null);
+      }
     }
   }, [hydrateSharedSubSessions, openingSharedEntryId, resolvedSelectedServerName, selectedServerId, selectedShareTarget, servers, setActiveSession, sharedReturnServer]);
 
   useEffect(() => {
-    if (!sharedHashRestorePending || !auth || !serversLoaded) return;
+    if (initialAuthVerificationPending || !sharedHashRestorePending || !auth || !serversLoaded) return;
     if (sharedHashRestoreStartedRef.current) return;
 
     const initial = initialHashStateRef.current;
+    const urlSharedEntryId = initial.sharedEntryId;
+    const remembered = initialSharedTabRestoreRef.current?.serverId === initial.serverId
+      ? initialSharedTabRestoreRef.current
+      : null;
     if (!initial.serverId
       || selectedServerId !== initial.serverId
       || selectedShareTarget) {
@@ -2651,7 +3471,7 @@ export function App() {
       setSharedHashRestorePending(false);
       return;
     }
-    if (servers.some((server) => server.id === initial.serverId)) {
+    if (!urlSharedEntryId && !remembered && servers.some((server) => server.id === initial.serverId)) {
       sharedHashRestoreStartedRef.current = true;
       setSharedHashRestorePending(false);
       return;
@@ -2659,8 +3479,26 @@ export function App() {
     if (!sharedEntriesLoaded) return;
 
     sharedHashRestoreStartedRef.current = true;
-    const entry = findSharedEntryForHash(sharedEntries, initial.serverId, initial.sessionName);
+    const discoveredEntry = urlSharedEntryId
+      ? sharedEntries.find((candidate) => (
+          candidate.status === 'active'
+          && candidate.id === urlSharedEntryId
+          && candidate.serverId === initial.serverId
+        )) ?? null
+      : remembered
+        ? findRememberedSharedEntry(sharedEntries, remembered)
+        : findSharedEntryForHash(sharedEntries, initial.serverId, initial.sessionName);
+    // The shared inventory is navigation UI, not restore authority. It can be
+    // temporarily empty during auth refresh/reconnect. For an explicit shared
+    // URL, reconstruct the main/server target and let /api/shares/open perform
+    // the authoritative coverage check instead of silently dropping home.
+    const entry = discoveredEntry ?? sharedEntryFallbackFromHash(
+      urlSharedEntryId,
+      initial.serverId,
+      initial.sessionName,
+    );
     if (!entry) {
+      if (remembered) clearSharedTabRestoreMarker();
       setSharedHashRestorePending(false);
       return;
     }
@@ -2668,12 +3506,15 @@ export function App() {
     void handleOpenSharedEntry(entry, {
       restoreFromHash: true,
       preferredSessionName: initial.sessionName,
-    }).finally(() => {
-      setSharedHashRestorePending(false);
+    }).then((restored) => {
+      if (restored || !urlSharedEntryId) {
+        setSharedHashRestorePending(false);
+      }
     });
   }, [
     auth,
     handleOpenSharedEntry,
+    initialAuthVerificationPending,
     selectedServerId,
     selectedShareTarget,
     servers,
@@ -2716,6 +3557,41 @@ export function App() {
     () => visibleSubSessions.map((sub) => sub.sessionName),
     [visibleSubSessions],
   );
+  const p2pDiscussionScopeSubSessionNames = useMemo(() => {
+    if (!activeRootSession) return visibleSubSessionNames;
+    const names = new Set(visibleSubSessionNames);
+    for (const sub of subSessions) {
+      if (sub.parentSession === activeRootSession || sub.sessionName === activeSession) {
+        names.add(sub.sessionName);
+      }
+    }
+    return [...names];
+  }, [activeRootSession, activeSession, subSessions, visibleSubSessionNames]);
+  const p2pRouteResyncKeyRef = useRef<string | null>(null);
+  useEffect(() => {
+    const scopeSession = activeSession ?? activeRootSession ?? null;
+    const key = `${selectedServerId ?? ''}:${scopeSession ?? ''}`;
+    const ws = wsRef.current;
+    if (!auth || !selectedServerId || sharedHashRestorePending) {
+      p2pRouteResyncKeyRef.current = key;
+      return;
+    }
+    if (!connected || !ws?.connected) return;
+    const previousKey = p2pRouteResyncKeyRef.current;
+    p2pRouteResyncKeyRef.current = key;
+    if (!previousKey || previousKey === key) return;
+    const scope = scopeSession ? { sessionName: scopeSession } : undefined;
+    ws.p2pListDiscussions(scope);
+    requestP2pStatusWithCachedRunConfirmation(ws, scope);
+  }, [
+    activeRootSession,
+    activeSession,
+    auth,
+    connected,
+    requestP2pStatusWithCachedRunConfirmation,
+    selectedServerId,
+    sharedHashRestorePending,
+  ]);
   const p2pConfigPref = usePref(
     activeRootSession ? p2pSessionConfigPrefKey(activeRootSession, selectedServerId) : null,
     {
@@ -2758,7 +3634,7 @@ export function App() {
     setP2pSessionNames(names);
   }, [activeRootSession, p2pConfigPref.value]);
 
-  const diffApplyersRef = useRef<Map<string, (diff: TerminalDiff) => void>>(new Map());
+  const diffApplyersRef = useRef(new TerminalDiffRegistry());
   const historyApplyersRef = useRef<Map<string, (content: string) => void>>(new Map());
   // Per-session input refs (chat input element in SessionPane) — used by global keyboard handler
   const inputRefsMap = useRef<Map<string, HTMLDivElement>>(new Map());
@@ -3025,9 +3901,19 @@ export function App() {
     }
   }, [activeSession, bringSubToFront, runVersionSensitiveAction, setPinnedPanels, subSessions, trans]);
 
-  const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
+  const isMobile = isMobileDevice();
   isMobileRef.current = isMobile;
   const desktopLayoutCapable = !isMobile;
+  const visibleTeamDiscussions = useMemo(() => discussions.filter((discussion) => (
+    isP2pDiscussionVisibleInSubSessionBar(discussion, {
+      activeSession,
+      activeRootSession,
+      visibleSubSessionNames: p2pDiscussionScopeSubSessionNames,
+    })
+  )), [activeRootSession, activeSession, discussions, p2pDiscussionScopeSubSessionNames]);
+  const mobileRemoteSurfaceActive = isMobile
+    && ((remoteDesktopWorkspace.open && !remoteDesktopWorkspaceMinimized)
+      || (remoteDesktopWallOpen && !remoteDesktopWallMinimized));
 
   // Open sub-session windows are restored from localStorage, so a reload
   // re-mounts all of them in one render pass — which is why reloading to escape
@@ -3045,7 +3931,15 @@ export function App() {
     return visibleSubSessions.filter((sub) => openSubIds.has(sub.id)
       && (isMobile || !pinnedPanels.some((p) => p.type === 'subsession' && p.props?.sessionName === sub.sessionName)));
   }, [visibleSubSessions, openSubIds, isMobile, pinnedPanels]);
-  const mountedWindowCount = useProgressiveMount(openWindowSubs.length);
+  const visibleOpenWindowIds = useMemo(
+    () => new Set(openWindowSubs.map((sub) => sub.id)),
+    [openWindowSubs],
+  );
+  const retainedWindowSubs = useMemo(() => (
+    subSessions.filter((sub) => retainedOpenSubIds.has(sub.id)
+      && !pinnedPanels.some((p) => p.type === 'subsession' && p.props?.sessionName === sub.sessionName))
+  ), [pinnedPanels, retainedOpenSubIds, subSessions]);
+  const mountedWindowCount = useProgressiveMount(retainedWindowSubs.length);
   const defaultViewMode: ViewMode = isMobile ? 'chat' : 'terminal';
   // Per-session view mode: Record<sessionName, ViewMode>
   const [viewModes, setViewModes] = useState<Record<string, ViewMode>>(() => {
@@ -3101,8 +3995,39 @@ export function App() {
 
     const ws = new WsClient(auth.baseUrl, selectedServerId, { shareTarget: selectedShareTarget });
     wsRef.current = ws;
+    // Test-only, opt-in via an explicit query param: lets the identity-over-lease
+    // real-machine harness (test/perf/browser/identity-p2p.spec.mjs) call
+    // getSessionIdentityDirect/setSessionIdentityDirect directly against the
+    // app's own live connection, instead of driving the settings UI blindly.
+    // Never set unless a caller explicitly opts in via the URL.
+    if (new URLSearchParams(window.location.search).get('identityTestHooks') === '1') {
+      (window as unknown as { __identityTestWs__?: WsClient }).__identityTestWs__ = ws;
+      void import('./direct-file-transfer.js').then((mod) => {
+        (window as unknown as { __identityTestDirectFileTransfer__?: unknown }).__identityTestDirectFileTransfer__ = mod;
+      });
+      void import('./session-identity-direct.js').then((mod) => {
+        (window as unknown as { __identityTestDirectFirst__?: unknown }).__identityTestDirectFirst__ = mod;
+      });
+    }
 
     const unsub = ws.onMessage((msg) => {
+      askAnswerTrackerRef.current?.handle(msg);
+      if (msg.type === 'timeline.event' && msg.event.type === 'user.message') {
+        // The echo of an answer names the question it settled: close this
+        // device's copy of the card (answered from another tab/device).
+        const answeredId = msg.event.payload.askToolUseId;
+        if (typeof answeredId === 'string' && answeredId) {
+          dismissedQuestionsRef.current.add(answeredId);
+          setPendingQuestion((pq) => (pq?.toolUseId === answeredId ? null : pq));
+        }
+      }
+      if (msg.type === DAEMON_MSG.CONTROLLED_NODE_WORKER_REFRESH_STATUS
+        && selectedServerId
+        && typeof window !== 'undefined') {
+        window.dispatchEvent(new CustomEvent('controlled-node-worker-refresh-status', {
+          detail: { serverId: selectedServerId, ...msg },
+        }));
+      }
       if (msg.type === 'session.event') {
         if (msg.session) {
           watchProjectionStore.updateSessionState(msg.session, msg.state);
@@ -3110,7 +4035,8 @@ export function App() {
         if (msg.event === 'connected') {
           setConnected(true);
           setConnecting(false);
-          void checkForAppUpdate();
+          const isProbeRecovered = msg.reason === 'probe_recovered';
+          if (!isProbeRecovered) void checkForAppUpdate();
           // `probe_recovered` only proves the socket is alive; control-plane
           // state (session list, P2P discussions/status) may still be stale
           // because we silently missed live events during the half-open window.
@@ -3118,8 +4044,7 @@ export function App() {
           // `requestActiveTimelineRefresh({resetCooldowns:true})` reset — the
           // active-refresh listener in `useTimeline` already bare-dispatches on
           // probe_recovered (governed by the 15s success-only cooldown).
-          const isProbeRecovered = msg.reason === 'probe_recovered';
-          ws.requestSessionList();
+          if (!isProbeRecovered) ws.requestSessionList();
           // Migrate to scoped p2p list. The active session is captured via the
           // ref to survive useEffect closure; the daemon will fail-closed and
           // return [] if it cannot resolve a project scope from this session,
@@ -3127,7 +4052,7 @@ export function App() {
           // tracked inside the WS client via setP2pWorkflowRequestScope on
           // terminal subscribe — passing it explicitly here just makes the
           // scope source obvious at the call site.
-          {
+          if (!isProbeRecovered) {
             const initialActive = activeSessionRef.current;
             const initialScope = initialActive ? { sessionName: initialActive } : undefined;
             ws.p2pListDiscussions(initialScope);
@@ -3227,16 +4152,39 @@ export function App() {
           sessionType: sub.type ?? '',
           state: sub.state,
           label: sub.label,
+          activeModel: sub.activeModel,
+          requestedModel: sub.requestedModel,
           parentSession: sub.parentSession,
           queueEpoch: sub.queueEpoch,
           queueAuthorityId: sub.queueAuthorityId,
           transportPendingMessageVersion: sub.transportPendingMessageVersion,
           transportPendingMessageEntries: sub.transportPendingMessageEntries,
           failedMessageEntries: sub.failedMessageEntries,
+          transportPendingSettledMessageIds: sub.transportPendingSettledMessageIds,
+          activityGeneration: sub.activityGeneration,
         }));
+        // The daemon session-list is authoritative for discovery but may lag
+        // the browser's settled ledger during reconnect/restore.  Feed the
+        // watch projection the coalesced local row so its queue reducer keeps
+        // the same settled/generation fence as the main UI.
+        const watchSessions = msg.sessions.map((raw) => {
+          const incoming = raw as IncomingSessionListEntry;
+          const existing = sessionsRef.current.find((session) => session.name === incoming.name);
+          const merged = mergeSessionListEntry(incoming, existing);
+          return {
+            ...incoming,
+            activityGeneration: merged.activityGeneration,
+            queueEpoch: merged.queueEpoch,
+            queueAuthorityId: merged.queueAuthorityId,
+            transportPendingMessageVersion: merged.transportPendingMessageVersion,
+            transportPendingMessageEntries: merged.transportPendingMessageEntries,
+            failedMessageEntries: merged.failedMessageEntries,
+            transportPendingSettledMessageIds: merged.transportPendingSettledMessageIds,
+          };
+        });
         watchProjectionStore.updateFromSessionListWithSubs(
           { id: selectedServerId, name: watchServerName, baseUrl: auth.baseUrl },
-          msg.sessions,
+          watchSessions,
           watchSubInputs,
         );
         // Daemon is connected — mark this server as online now. Also cancel
@@ -3269,12 +4217,15 @@ export function App() {
           const replacement = hiddenActive
             ? navigableNewSessions.find((s) => s.project === hiddenActive.project)
             : null;
-          setActiveSession(replacement?.name ?? null);
+          setActiveSession(replacement?.name ?? null, { remember: false });
+        } else if (!activeSessionRef.current && !selectedShareTarget && !sharedHashRestorePending) {
+          // Nothing selected yet (the REST list is slow or failed): restore the
+          // remembered tab from this list instead of leaving the user on none.
+          restoreLastTabRef.current(selectedServerId, navigableNewSessions.map((s) => s.name));
         }
       }
       if (msg.type === 'terminal.diff') {
-        const apply = diffApplyersRef.current.get(msg.diff.sessionName);
-        apply?.(msg.diff);
+        diffApplyersRef.current.dispatch(msg.diff.sessionName, msg.diff);
         // Scan terminal lines for model keywords (catches Codex footer, fallback for all agents)
         const sessionName = msg.diff.sessionName;
         const stripped = msg.diff.lines.map(([, l]: [unknown, string]) => l.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '')).join(' ').toLowerCase();
@@ -3284,7 +4235,7 @@ export function App() {
           stripped.includes('opus') ? 'opus[1M]' :
           stripped.includes('sonnet') ? 'sonnet' :
           stripped.includes('haiku') ? 'haiku' : null;
-        const gptMatch = stripped.match(/\b(gpt-5(?:\.\d+)?(?:-\w+)?)\b/);
+        const gptMatch = stripped.match(/\b(gpt-\d+(?:\.\d+)?(?:-[a-z0-9]+)*)\b/);
         const geminiMatch = stripped.match(/\b(gemini[- ]\d[\w.-]*)\b/);
         const detected = claudeModel ?? (gptMatch ? gptMatch[1] : null) ?? (geminiMatch ? geminiMatch[1] : null);
         if (detected) {
@@ -3298,14 +4249,20 @@ export function App() {
         watchProjectionStore.handleTimelineEvent(event);
         if (isRunningTimelineEvent(event) && !event.sessionId.startsWith('deck_sub_')) {
           const current = sessionsRef.current.find((session) => session.name === event.sessionId);
-          if (current && current.state !== 'running') {
+          const incomingGeneration = event.payload?.activityGeneration as ActivityGenerationLike;
+          if (current
+            && !isOlderActivityGeneration(incomingGeneration, current.activityGeneration)
+            && current.state !== 'running') {
             setSessions((prev) => markSessionRunningIfNeeded(prev, event.sessionId));
           }
         }
-        if (isIdleSessionStateTimelineEvent(event)) {
+        // A repeat of an idle edge already handled (idle after idle with only
+        // telemetry between) neither flashes nor alerts nor re-renders the app.
+        const repeatedIdle = noteLiveIdleSignal(liveIdleSessionsRef.current, event);
+        if (isIdleSessionStateTimelineEvent(event) && !repeatedIdle) {
           flashIdleSession(event.sessionId);
           if (!event.sessionId.startsWith('deck_sub_')) {
-            setIdleAlerts((prev) => new Set([...prev, event.sessionId]));
+            setIdleAlerts((prev) => (prev.has(event.sessionId) ? prev : new Set([...prev, event.sessionId])));
           }
         }
         if (event.type === 'ask.question') {
@@ -3369,6 +4326,8 @@ export function App() {
           const incomingVersion = extractTransportPendingVersion(event.payload.pendingMessageVersion);
           setSessions((prev) => prev.map((s) => {
             if (s.name !== event.sessionId) return s;
+            const incomingGeneration = event.payload.activityGeneration as ActivityGenerationLike;
+            if (isOlderActivityGeneration(incomingGeneration, s.activityGeneration)) return s;
             const nextQueue = removeTransportPendingEntryForUserMessage(
               s.transportPendingMessageEntries,
               s.transportPendingMessages,
@@ -3380,10 +4339,21 @@ export function App() {
               event.sessionId,
             );
             const advancedVersion = nextTransportQueueVersion(s.transportPendingMessageVersion, incomingVersion);
+            const settledId = typeof event.payload.clientMessageId === 'string' ? event.payload.clientMessageId.trim() : '';
+            const settledIds = settledId
+              ? [...new Set([...(s.transportPendingSettledMessageIds ?? []), settledId])].sort()
+              : s.transportPendingSettledMessageIds;
             if (!nextQueue.changed) {
-              return advancedVersion === s.transportPendingMessageVersion
+              return advancedVersion === s.transportPendingMessageVersion && settledIds === s.transportPendingSettledMessageIds
                 ? s
-                : { ...s, transportPendingMessageVersion: advancedVersion };
+                : {
+                  ...s,
+                  transportPendingMessageVersion: advancedVersion,
+                  ...(event.payload.activityGeneration !== undefined
+                    ? { activityGeneration: incomingGeneration }
+                    : {}),
+                  ...(settledIds ? { transportPendingSettledMessageIds: settledIds } : {}),
+                };
             }
             return {
               ...s,
@@ -3391,6 +4361,10 @@ export function App() {
               transportPendingMessages: nextQueue.messages,
               transportPendingMessageEntries: nextQueue.entries,
               transportPendingMessageVersion: advancedVersion,
+              ...(event.payload.activityGeneration !== undefined
+                ? { activityGeneration: incomingGeneration }
+                : {}),
+              ...(settledIds ? { transportPendingSettledMessageIds: settledIds } : {}),
             };
           }));
         }
@@ -3398,8 +4372,12 @@ export function App() {
         if (event.type === 'session.state' && !event.sessionId.startsWith('deck_sub_')) {
           const liveState = String(event.payload.state ?? '');
           if (liveState === 'queued' || liveState === 'running' || liveState === 'idle') {
-            setSessions((prev) => prev.map((s) => {
-              if (s.name !== event.sessionId) return s;
+            // A frame that repeats what the record already says must not
+            // re-render the app and every mounted pane (updateSessionIfChanged
+            // returns the same array, so setSessions bails out).
+            setSessions((prev) => updateSessionIfChanged(prev, event.sessionId, (s) => {
+              const incomingGeneration = (event.payload as Record<string, unknown>).activityGeneration as ActivityGenerationLike;
+              if (isOlderActivityGeneration(incomingGeneration, s.activityGeneration)) return s;
               const queuePatch = buildTransportPendingSyncPatch({
                 transportPendingMessages: s.transportPendingMessages,
                 transportPendingMessageEntries: s.transportPendingMessageEntries,
@@ -3407,9 +4385,13 @@ export function App() {
                 queueEpoch: s.queueEpoch,
                 queueAuthorityId: s.queueAuthorityId,
                 failedMessageEntries: s.failedMessageEntries,
+                transportPendingSettledMessageIds: s.transportPendingSettledMessageIds,
               }, event.payload as Record<string, unknown>, event.sessionId);
               return {
                 ...s,
+                ...(event.payload.activityGeneration !== undefined
+                  ? { activityGeneration: incomingGeneration }
+                  : {}),
                 state: liveState as SessionInfo['state'],
                 ...queuePatch,
               };
@@ -3418,9 +4400,9 @@ export function App() {
             const errorDetail = typeof event.payload.error === 'string' && event.payload.error.trim()
               ? event.payload.error.trim()
               : null;
-            setSessions((prev) => prev.map((s) => s.name === event.sessionId
-              ? { ...s, state: 'error' as SessionInfo['state'], error: errorDetail ?? s.error ?? null }
-              : s));
+            setSessions((prev) => updateSessionIfChanged(prev, event.sessionId, (s) => (
+              { ...s, state: 'error' as SessionInfo['state'], error: errorDetail ?? s.error ?? null }
+            )));
           }
         }
         if (event.type === 'session.state' && String(event.payload.state ?? '') === 'idle') {
@@ -3448,7 +4430,7 @@ export function App() {
               (modelStr.includes('opus') || modelStr.includes('sonnet') || modelStr.includes('haiku'))
                 ? rawModel
                 : null;
-            const gptM = modelStr.match(/\b(gpt-5(?:\.\d+)?(?:-\w+)?)\b/);
+            const gptM = modelStr.match(/\b(gpt-\d+(?:\.\d+)?(?:-[a-z0-9]+)*)\b/);
             const gemM = modelStr.match(/\b(gemini[- ]\d[\w.-]*)\b/);
             const det = claudeM ?? (gptM ? gptM[1] : null) ?? (gemM ? gemM[1] : null);
             if (det) {
@@ -3470,13 +4452,9 @@ export function App() {
             const displayPayload = effectiveModel && payload.model !== effectiveModel
               ? { ...payload, model: effectiveModel }
               : payload;
-            setSubUsages((prev) => {
-              const merged = mergeUsageUpdate(prev.get(event.sessionId), displayPayload as Record<string, unknown>);
-              if (!merged) return prev;
-              const next = new Map(prev);
-              next.set(event.sessionId, merged);
-              return next;
-            });
+            // Token usage arrives at up to 25 Hz per session; commit it in one
+            // batch per interval instead of re-rendering the app per frame.
+            subUsageBatcherRef.current?.push(event.sessionId, (current) => mergeUsageUpdate(current, displayPayload as Record<string, unknown>));
           }
         }
       }
@@ -3511,9 +4489,9 @@ export function App() {
         });
         if (!sessionName.startsWith('deck_sub_')) {
           // Main session: update state + tab alert
-          setSessions((prev) => prev.map((s) => s.name === sessionName ? { ...s, state: 'idle' as SessionInfo['state'] } : s));
+          setSessions((prev) => updateSessionIfChanged(prev, sessionName, (s) => ({ ...s, state: 'idle' as SessionInfo['state'] })));
           // Always flash the tab — even if it's the active one
-          setIdleAlerts((prev) => new Set([...prev, sessionName]));
+          setIdleAlerts((prev) => (prev.has(sessionName) ? prev : new Set([...prev, sessionName])));
         }
         flashIdleSession(sessionName);
         // Always show a toast (main + sub sessions)
@@ -3726,11 +4704,26 @@ export function App() {
           for (const sub of subSessionsRef.current) {
             if (sub.cwd === dir) sessionIds.add(sub.sessionName);
           }
+          const activeSessionObj = activeSessionRef.current
+            ? sessionsRef.current.find((s) => s.name === activeSessionRef.current)
+            : null;
+          if (activeSessionObj) {
+            const activeName = activeSessionObj.name;
+            const activeDir = activeSessionObj.projectDir;
+            if (activeDir === dir || dir === FS_SESSION_ROOT_PATH) {
+              sessionIds.add(activeName);
+            }
+          }
           if (sessionIds.size === 0) {
             ingestSessionRepoContext({ projectDir: dir, context });
           } else {
             for (const sessionId of sessionIds) {
               ingestSessionRepoContext({ sessionId, projectDir: dir, context });
+              if (dir !== FS_SESSION_ROOT_PATH) {
+                ingestSessionRepoContext({ sessionId, projectDir: FS_SESSION_ROOT_PATH, context });
+              } else if (activeSessionObj?.projectDir) {
+                ingestSessionRepoContext({ sessionId, projectDir: activeSessionObj.projectDir, context });
+              }
             }
           }
         }
@@ -3782,6 +4775,16 @@ export function App() {
         }
       }
       if (msg.type === DAEMON_MSG.UPGRADE_BLOCKED) {
+        if (selectedServerId) {
+          setDaemonUpgradeRequests((previous) => ({
+            ...previous,
+            [selectedServerId]: {
+              phase: 'failed',
+              blockedReason: msg.reason,
+              ...(msg.activeSessionNames?.length ? { blockedSessionNames: msg.activeSessionNames.slice(0, 5) } : {}),
+            },
+          }));
+        }
         const now = Date.now();
         if (shouldShowDaemonUpgradeBlockedToast(lastUpgradeBlockedToastRef.current, msg.reason, now)) {
           lastUpgradeBlockedToastRef.current = { reason: msg.reason, shownAt: now };
@@ -3827,6 +4830,13 @@ export function App() {
         // (The upgrading badge is cleared by the reducer block above, which also
         // handles ONLINE/RECONNECTED.)
         setDaemonOnline(true);
+        if (selectedServerId) {
+          setDaemonUpgradeRequests((previous) => {
+            const current = previous[selectedServerId];
+            if (!current || (current.phase !== 'requesting' && current.phase !== 'sent')) return previous;
+            return { ...previous, [selectedServerId]: { phase: 'idle' } };
+          });
+        }
         setServers((prev) => markServerDaemonActivity(prev, selectedServerId));
       }
       if (msg.type === MSG_DAEMON_OFFLINE) {
@@ -3853,6 +4863,29 @@ export function App() {
         console.error('[daemon.error]', msg.kind, msg.message, msg.stack);
         // Auto-dismiss after 10 seconds
         setTimeout(() => setToasts((prev) => prev.filter((x) => x.id !== id)), 10_000);
+      }
+      // The daemon's stale-turn response is authoritative even when the
+      // terminal session.state idle frame was lost during a hidden-window
+      // burst/reconnect. Reconcile the local session immediately so queued
+      // sends stop waiting on a stale running flag; the next session_list
+      // refresh supplies the queue snapshot.
+      if (msg.type === 'command.ack'
+        && msg.status === 'error'
+        && isActiveTurnFinishedError(msg.error)
+        && typeof msg.session === 'string') {
+        const staleSession = msg.session;
+        if (isSubSessionName(staleSession)) {
+          const subId = staleSession.slice('deck_sub_'.length);
+          updateSubLocal(subId, { state: 'idle', authoritativeIdleAt: Date.now() });
+        } else {
+          setSessions((prev) => prev.map((session) => (
+            session.name === staleSession
+              ? { ...session, state: 'idle' as SessionInfo['state'], authoritativeIdleAt: Date.now() }
+              : session
+          )));
+        }
+        watchProjectionStore.updateSessionState(staleSession, 'idle');
+        ws.requestSessionList();
       }
       // P2P command errors surface as `command.ack status:error` with a
       // specific `error` code. `useTimeline` handles them per-session by
@@ -3905,6 +4938,11 @@ export function App() {
           }]);
           setTimeout(() => setToasts((prev) => prev.filter((x) => x.id !== id)), 8000);
         }
+      }
+      // A refused Stop must never look like nothing happened (shared participants:
+      // rate limit, the turn changed, access ended...).
+      if (msg.type === MSG_COMMAND_FAILED && takeTrackedShareCancel(msg.commandId)) {
+        notifyShareCancelFailure({ reason: msg.reason, activeDispatchId: msg.activeDispatchId, session: msg.session });
       }
       if (msg.type === 'command.ack' && selectedShareTarget) {
         setSharedActiveDispatchIds((previous) => {
@@ -3970,8 +5008,13 @@ export function App() {
       setServers((prev) => touchServerHeartbeat(prev, selectedServerId));
     });
     const unsubStats = ws.onMessage((msg) => {
-      if (msg.type === 'daemon.stats') {
-        setDaemonStats({ daemonVersion: msg.daemonVersion, cpu: msg.cpu, memUsed: msg.memUsed, memTotal: msg.memTotal, load1: msg.load1, load5: msg.load5, load15: msg.load15, uptime: msg.uptime });
+      // A liveness frame (link-worker heartbeat) proves the daemon is alive just
+      // like a stats frame, but carries no system numbers: both fold into the
+      // last snapshot instead of replacing it, so nothing ever blanks or turns NaN.
+      if (msg.type === DAEMON_STATS_MSG || msg.type === DAEMON_LIVENESS_MSG) {
+        setDaemonStats((prev) => (msg.type === DAEMON_STATS_MSG
+          ? mergeDaemonStats(prev, msg as unknown as Record<string, unknown>)
+          : mergeDaemonLiveness(prev, msg as unknown as Record<string, unknown>)));
         if (daemonOfflineGraceTimerRef.current) {
           clearTimeout(daemonOfflineGraceTimerRef.current);
           daemonOfflineGraceTimerRef.current = null;
@@ -4017,6 +5060,7 @@ export function App() {
         hiddenSinceAt = Date.now();
         return;
       }
+      resumeDirectFileTransfers(ws, selectedServerId);
       const wasLongHidden = hiddenSinceAt > 0 && Date.now() - hiddenSinceAt > DISCUSSION_RECONCILE_HIDDEN_MS;
       hiddenSinceAt = 0;
       handleResume(wasLongHidden, wasLongHidden);
@@ -4055,7 +5099,11 @@ export function App() {
     let removeAppStateListener: (() => void) | null = null;
     if (isNative()) {
       void import('@capacitor/app')
-        .then(({ App }) => installNativeAppResumeRefresh(true, (force) => ws.resumeConnection(force), App))
+        .then(({ App }) => installNativeAppResumeRefresh(true, (force) => {
+          resumeDirectFileTransfers(ws, selectedServerId);
+          ws.resumeConnection(force);
+          remoteDesktopConnectionManager.resumeExhaustedConnections();
+        }, App))
         .then((cleanup) => {
           removeAppStateListener = cleanup;
         })
@@ -4083,7 +5131,7 @@ export function App() {
       for (const timer of resubscribeTimersRef.current) clearTimeout(timer);
       resubscribeTimersRef.current.clear();
     };
-  }, [auth, selectedServerId, selectedShareTarget, sharedHashRestorePending, requestP2pStatusWithCachedRunConfirmation]);
+  }, [auth, selectedServerId, selectedShareTarget, sharedHashRestorePending, requestP2pStatusWithCachedRunConfirmation, remoteDesktopConnectionManager]);
 
   // Subscribe to terminal streams for process-backed sessions when connected.
   // Transport/SDK sessions have no PTY stream; their timeline updates are
@@ -4113,18 +5161,25 @@ export function App() {
   // Key includes runtimeType + agentType so effect re-runs when WebSocket merge
   // corrects null→'transport' or a pre-migration row relies on agentType fallback.
   const transportSessionKey = sessions.map((s) => `${s.name}:${s.runtimeType}:${s.agentType}`).sort().join(',');
+  const transportSubscribedSessionsRef = useRef<Set<string>>(new Set());
   useEffect(() => {
     const ws = wsRef.current;
-    if (!ws?.connected || sessions.length === 0) return;
-    const names = listGlobalTransportSubscriptionNames(sessions);
-    for (const name of names) {
-      try { ws.subscribeTransportSession(name, { replayHistory: false }); } catch { /* ignore */ }
+    const names = ws?.connected ? listGlobalTransportSubscriptionNames(sessions) : [];
+    const desired = new Set(names);
+    // Diff the desired set instead of using effect cleanup to unsubscribe the
+    // entire population. Session metadata updates can churn this effect's key
+    // while the same sessions remain present; cleanup/re-subscribe then emits
+    // thousands of chat.subscribe frames during a large-window restore.
+    for (const name of transportSubscribedSessionsRef.current) {
+      if (desired.has(name)) continue;
+      try { ws?.unsubscribeTransportSession(name); } catch { /* ignore */ }
     }
-    return () => {
-      for (const name of names) {
-        try { ws.unsubscribeTransportSession(name); } catch { /* ignore */ }
+    if (ws?.connected) {
+      for (const name of desired) {
+        try { ws.subscribeTransportSession(name, { replayHistory: false }); } catch { /* ignore */ }
       }
-    };
+    }
+    transportSubscribedSessionsRef.current = desired;
   // NOTE: `sessions` (the raw array) is intentionally omitted from the dep
   // array. Including it caused a subscribe/unsubscribe flap loop — every
   // setState produces a new array reference even when contents are identical,
@@ -4340,17 +5395,24 @@ export function App() {
   const closeSidebar = useCallback(() => setMobileSidebarOpen(false), []);
 
   const handleLogout = useCallback(async () => {
+    // User intent to leave is authoritative immediately; a shared-open response
+    // that settles while logout I/O is pending must not restore the old route.
+    authMutationGenerationRef.current += 1;
+    sharedOpenGenerationRef.current += 1;
+    setOpeningSharedEntryId(null);
     if (isNative()) {
       // Native: revoke API key server-side, clear biometric storage
+      const credentialServerUrl = auth?.baseUrl ?? nativeServerUrl;
       try {
-        const { Preferences } = await import('@capacitor/preferences');
-        const { value: keyId } = await Preferences.get({ key: 'deck_api_key_id' });
+        const keyId = await getAuthKeyId(credentialServerUrl);
         if (keyId) {
           await apiFetch(`/api/auth/user/me/keys/${keyId}`, { method: 'DELETE' }).catch(() => {});
-          await Preferences.remove({ key: 'deck_api_key_id' });
         }
       } catch { /* ignore */ }
-      await clearAuthKey();
+      // Local authority revocation must continue even if Secure Storage is
+      // unavailable. In particular, server switching must never carry the old
+      // in-memory/localStorage identity into ServerSetupPage.
+      await clearStoredAuthForServer(credentialServerUrl);
       clearApiKey();
     } else {
       try {
@@ -4361,6 +5423,7 @@ export function App() {
     localStorage.removeItem('rcc_server');
     localStorage.removeItem('rcc_server_name');
     localStorage.removeItem('rcc_session');
+    clearSharedTabRestoreMarker();
     clearMessagePinsCache();
     clearMessagePinNavigation();
     configureExpectedUserId(null);
@@ -4369,6 +5432,7 @@ export function App() {
     setActiveSession(null);
     setSelectedServerId(null);
     setSelectedShareTarget(null);
+    setSelectedSharedEntryId(null);
     setSharedReturnServer(null);
     setShowSharedReturnGuide(false);
     setSharedEntries([]);
@@ -4377,50 +5441,267 @@ export function App() {
     setRepoContexts(new Map());
     setManualDashboard(false);
     setAutoEnteringRecent(false);
-  }, [setActiveSession]);
+  }, [auth?.baseUrl, nativeServerUrl, setActiveSession]);
 
-  // Native only: log out + clear server URL → back to ServerSetupPage
+  // Native only: suspend the current server locally and return to the picker.
+  // Stored credentials remain isolated under that server URL, so selecting it
+  // again can restore the session after a fresh /me authority check.
   const handleChangeServer = useCallback(async () => {
     setShowMobileServerMenu(false);
-    try { await handleLogout(); } catch { /* ignore */ }
-    try { await clearServerUrl(); } catch { /* ignore */ }
-    setNativeServerUrl(null);
-  }, [handleLogout]);
+    // Both authenticated and LoginPage-initiated switching must keep the gate
+    // held through clearServerUrl. Otherwise handleLogout can render the old
+    // server's LoginPage after setAuth(null), allowing a fresh credential write
+    // to race the remainder of this server-switch operation.
+    const releaseCleanupGate = holdAuthCredentialCleanupGate();
+    try {
+      // LoginPage can be unmounted while a native auth Promise is still writing
+      // its server-scoped credential. Wait for it, revoke all in-memory route
+      // authority, but do not revoke/delete the saved server session.
+      await clearAuthState('change_server', {
+        preserveSharedNavigation: false,
+        preserveCredentials: true,
+        credentialServerUrl: auth?.baseUrl ?? nativeServerUrl,
+      });
+      try { await clearServerUrl(); } catch { /* ignore */ }
+      setNativeServerUrl(null);
+    } finally {
+      releaseCleanupGate();
+    }
+  }, [auth?.baseUrl, clearAuthState, holdAuthCredentialCleanupGate, nativeServerUrl]);
 
   const handleSelectServer = useCallback(async (serverId: string, serverName?: string) => {
+    sharedOpenGenerationRef.current += 1;
+    externalRouteGenerationRef.current += 1;
+    externalRouteInFlightKeyRef.current = null;
+    setOpeningSharedEntryId(null);
     autoEntryRunRef.current++;
     setManualDashboard(false);
     setSelectedShareTarget(null);
+    setSelectedSharedEntryId(null);
+    clearSharedTabRestoreMarker();
     setShowSharedReturnGuide(false);
     // Save current active session for the server we're leaving
-    const prevServer = localStorage.getItem('rcc_server');
-    const currentSession = localStorage.getItem('rcc_session');
-    if (prevServer && currentSession) {
-      localStorage.setItem(`rcc_session_${prevServer}`, currentSession);
-    } else if (prevServer) {
-      localStorage.removeItem(`rcc_session_${prevServer}`);
+    // Prefer live route refs over the cross-tab legacy fallback.  The latter
+    // may still point at a different server while a hash/back-forward route is
+    // converging.
+    // Only a tab the user deliberately opened is remembered; leaving a server
+    // with nothing selected (or with an automatic fallback showing) must keep
+    // what was remembered before, never erase or replace it.
+    const prevServer = selectedServerIdRef.current ?? localStorage.getItem('rcc_server');
+    const currentSession = activeSessionRef.current;
+    if (prevServer && currentSession && rememberIntentRef.current === currentSession) {
+      writeServerSession(prevServer, currentSession);
     }
 
     localStorage.setItem('rcc_server', serverId);
     if (serverName) localStorage.setItem('rcc_server_name', serverName);
 
-    // Restore previously selected session for this server
-    const savedSession = localStorage.getItem(`rcc_session_${serverId}`);
-    if (savedSession) {
-      safeLocalStorageSetItem('rcc_session', savedSession);
-    } else {
-      localStorage.removeItem('rcc_session');
-    }
+    // The destination server's session list is not loaded yet. Keep the
+    // scoped snapshot in storage, but do not put an unvalidated candidate in
+    // the hash; the destination hydrate will resolve it against navigable
+    // sessions before selecting it.
+
+    // This click, not the route that happened to mount the document, is now
+    // authoritative. Converge the canonical state before the hash-sync effect
+    // can publish the old shared selection while reload is being scheduled.
+    // Retiring the startup refs also prevents a delayed restore/open result
+    // from treating the original shared URL as a still-live intent.
+    const nextRoute = { serverId, sessionName: null, sharedEntryId: null };
+    initialHashStateRef.current = nextRoute;
+    initialSharedTabRestoreRef.current = null;
+    sharedHashRestoreStartedRef.current = true;
+    setSharedHashRestorePending(false);
+    selectedServerIdRef.current = serverId;
+    setSelectedServerId(serverId);
+    setSelectedServerName(serverName ?? null);
+    setActiveSession(null);
 
     // Write the hash BEFORE reload so the new page picks up the right server+session
     // from the URL rather than from (now shared) localStorage.
-    writeHashState(serverId, savedSession ?? null);
+    writeHashState(serverId, null);
 
     // Full page reload — guarantees all components, WS connections, and pinned
     // panels start fresh with the new server. Avoids stale WS/state bugs.
     markFastServerSwitchSplash();
     window.location.reload();
-  }, []);
+  }, [setActiveSession]);
+
+  /**
+   * The single consumer of route changes this document did not initiate.
+   *
+   * Nothing used to subscribe to `popstate`/`hashchange`, so editing the
+   * address bar, following a direct link into this tab, using back/forward, or
+   * having the browser restore a session moved the URL while the app kept
+   * rendering — and kept talking to — whatever it had already selected. A user
+   * sitting in a shared session who navigated to one of their own servers was
+   * left with that server in the address bar and the shared pane still mounted
+   * and still privileged.
+   *
+   * This is deliberately NOT a second router and holds no state of its own: it
+   * parses with the existing `readHashState` helper, resolves authorization
+   * BEFORE touching any UI, and then converges the same selection setters every
+   * other navigation path already uses.
+   *
+   * Authorization is the load-bearing part. A URL is an intent, never a grant:
+   * an owned server must be present in the authorized server set, and a shared
+   * target must pass the existing `/api/shares/open` coverage check through
+   * `handleOpenSharedEntry`. Anything unknown, expired, revoked, or belonging
+   * to another account fails closed — and failing closed explicitly tears down
+   * the shared pane rather than leaving a privileged surface mounted under a
+   * route that no longer authorizes it.
+   */
+  useEffect(() => {
+    if (!auth || !serversLoaded) return;
+
+    /**
+     * Land on the dashboard as an EXPLICIT choice.
+     *
+     * Simply nulling the selection is not enough: auto-entry reads a null
+     * `selectedServerId` as "the user has not picked yet" and helpfully picks
+     * one, which is how an unauthorized route ended up re-selecting the shared
+     * server (confirmed by stack: the stale hash write came from `choose` in
+     * the auto-entry effect). `manualDashboard` is the existing signal for
+     * "empty on purpose", so reuse it rather than inventing a second flag.
+     */
+    const failClosedToDashboard = () => {
+      autoEntryRunRef.current++;
+      setManualDashboard(true);
+      localStorage.removeItem('rcc_server');
+      localStorage.removeItem('rcc_server_name');
+      localStorage.removeItem('rcc_session');
+      clearSharedTabRestoreMarker();
+      setSelectedShareTarget(null);
+      setSelectedSharedEntryId(null);
+      setSelectedServerId(null);
+      setSelectedServerName(null);
+      setActiveSession(null);
+    };
+
+    const consumeExternalRoute = () => {
+      const route = readHashState();
+      // Same route: nothing to do. Also makes duplicate/coalesced events
+      // (hashchange + popstate fire together for one user action) idempotent.
+      const routeKey = `${route.serverId ?? ''}|${route.sessionName ?? ''}|${route.sharedEntryId ?? ''}`;
+      if (externalRouteInFlightKeyRef.current === routeKey) return;
+      if (route.serverId === selectedServerId
+        && route.sessionName === (activeSession ?? null)
+        && route.sharedEntryId === (selectedSharedEntryId ?? null)) {
+        // Already showing this route, so there is nothing to converge — but if
+        // some OTHER route is still being authorized, navigating back here is
+        // the user abandoning it. Returning early without retiring that work
+        // let a late /api/shares/open result land and render a session the user
+        // had already left.
+        if (externalRouteInFlightKeyRef.current !== null) {
+          externalRouteInFlightKeyRef.current = null;
+          sharedOpenGenerationRef.current += 1;
+          externalRouteGenerationRef.current += 1;
+          setOpeningSharedEntryId(null);
+        }
+        return;
+      }
+      externalRouteInFlightKeyRef.current = routeKey;
+
+      // An external navigation is an explicit user intent and outranks any
+      // shared-open still in flight, exactly like the in-app navigation paths.
+      sharedOpenGenerationRef.current += 1;
+      setOpeningSharedEntryId(null);
+      // Auto-entry treats a null selection as "nobody has chosen yet" and picks
+      // a server on the user's behalf. Clearing the selection to fail closed
+      // would therefore hand the tab straight back to it, which is how an
+      // unauthorized route ended up re-selecting the shared server. Retire the
+      // in-flight auto-entry run the same way the in-app navigation handlers do.
+      autoEntryRunRef.current++;
+      const generation = ++externalRouteGenerationRef.current;
+
+      // Route cleared (back to the dashboard URL): drop everything, including
+      // any shared authority.
+      if (!route.serverId) {
+        externalRouteInFlightKeyRef.current = null;
+        failClosedToDashboard();
+        return;
+      }
+
+      // Ownership is asked of the authoritative inventory, NOT of `servers`.
+      // Using `servers.find` here meant that once a share had been opened its
+      // server was permanently treated as owned, so revisiting that route
+      // skipped /api/shares/open and a revoked or expired share still rendered.
+      const ownedServer = ownedServerIdsRef.current.has(route.serverId)
+        ? servers.find((server) => server.id === route.serverId)
+        : undefined;
+      if (ownedServer) {
+        // Converge atomically onto the owned server; any prior shared authority
+        // is dropped in the same turn so no privileged pane survives the move.
+        setSelectedShareTarget(null);
+        setSelectedSharedEntryId(null);
+        clearSharedTabRestoreMarker();
+        setShowSharedReturnGuide(false);
+        setManualDashboard(false);
+        localStorage.setItem('rcc_server', ownedServer.id);
+        if (ownedServer.name) localStorage.setItem('rcc_server_name', ownedServer.name);
+        initialHashStateRef.current = {
+          serverId: ownedServer.id,
+          sessionName: route.sessionName,
+          sharedEntryId: null,
+        };
+        setSelectedServerId(ownedServer.id);
+        setSelectedServerName(ownedServer.name ?? null);
+        const routeSessionIsLoaded = route.sessionName
+          ? sessions.some((session) => session.name === route.sessionName && isNavigableMainSession(session))
+          : false;
+        setActiveSession(routeSessionIsLoaded ? route.sessionName : null);
+        externalRouteInFlightKeyRef.current = null;
+        return;
+      }
+
+      // Not an owned server. The only way this may render is if the existing
+      // share-open path authorizes it; the inventory is navigation UI, so a
+      // hash-only target is reconstructed and left for the server to judge.
+      const entry = (route.sharedEntryId
+        ? sharedEntries.find((candidate) => (
+            candidate.status === 'active'
+            && candidate.id === route.sharedEntryId
+            && candidate.serverId === route.serverId
+          )) ?? null
+        : findSharedEntryForHash(sharedEntries, route.serverId, route.sessionName))
+        ?? sharedEntryFallbackFromHash(route.sharedEntryId, route.serverId, route.sessionName);
+
+      if (!entry) {
+        // Unknown/unauthorized route: fail closed. Never keep a stale shared
+        // pane alive under a route that does not authorize it.
+        externalRouteInFlightKeyRef.current = null;
+        failClosedToDashboard();
+        return;
+      }
+
+      void handleOpenSharedEntry(entry, { preferredSessionName: route.sessionName })
+        .then((opened) => {
+          if (externalRouteInFlightKeyRef.current === routeKey) externalRouteInFlightKeyRef.current = null;
+          if (generation !== externalRouteGenerationRef.current) return;
+          if (opened) return;
+          // Expired/revoked/cross-user share: the server refused. Tear the
+          // privileged surface down instead of leaving it on screen.
+          failClosedToDashboard();
+        });
+    };
+
+    window.addEventListener('hashchange', consumeExternalRoute);
+    window.addEventListener('popstate', consumeExternalRoute);
+    return () => {
+      window.removeEventListener('hashchange', consumeExternalRoute);
+      window.removeEventListener('popstate', consumeExternalRoute);
+    };
+  }, [
+    activeSession,
+    auth,
+    handleOpenSharedEntry,
+    selectedServerId,
+    selectedSharedEntryId,
+    servers,
+    serversLoaded,
+    sessions,
+    setActiveSession,
+    sharedEntries,
+  ]);
 
   // Pending navigation target for sub-sessions that haven't loaded yet
   const [pendingNav, setPendingNav] = useState<{ session: string; quote?: string } | null>(() => {
@@ -4468,17 +5749,26 @@ export function App() {
           scrollToBottom: options?.scrollToBottom,
         });
       }
-      setOpenSubIds((prev) => new Set([...prev, sub.id]));
-      bringSubToFront(sub.id);
+      // Use the same authoritative open path as the mobile sub-session bar.
+      // On desktop it preserves the other floating windows and raises this
+      // one. On mobile exactly one full-screen sub-session can be visible, so
+      // it replaces the previously-open overlay. The old inline add-to-set
+      // logic left both mobile windows mounted at the same z-index; whichever
+      // happened to render last covered the notification target.
+      openSubSessionWindow(sub.id);
     } else {
       safeLocalStorageSetItem('rcc_session', session);
       setActiveSession(session, { scrollToBottom: options?.scrollToBottom });
+      // A mobile sub-session is a full-screen overlay. Merely selecting its
+      // already-active parent session restores the persisted overlay, leaving
+      // the notification's main-session target hidden underneath it.
+      if (isMobileRef.current) closeAllSubSessionWindows();
     }
     if (quote) {
       const quoteText = `${quote.trim().split('\n').map((l: string) => `> ${l}`).join('\n')}\n`;
       setPendingPrefills((prev) => ({ ...prev, [session]: (prev[session] || '') + quoteText }));
     }
-  }, [setActiveSession, bringSubToFront, resolveNavigationSubSession]);
+  }, [closeAllSubSessionWindows, openSubSessionWindow, resolveNavigationSubSession, setActiveSession]);
 
   const navigateToSessionRef = useRef(navigateToSession);
   navigateToSessionRef.current = navigateToSession;
@@ -4560,20 +5850,32 @@ export function App() {
   }, [handleSelectServer, navigateToSession, runVersionSensitiveAction, trans]);
 
   const handleBackToDashboard = useCallback(() => {
+    sharedOpenGenerationRef.current += 1;
+    setOpeningSharedEntryId(null);
     autoEntryRunRef.current++;
     setManualDashboard(true);
     localStorage.removeItem('rcc_server');
     localStorage.removeItem('rcc_server_name');
     localStorage.removeItem('rcc_session');
+    clearSharedTabRestoreMarker();
     setSelectedServerId(null);
     setSelectedServerName(null);
     setSelectedShareTarget(null);
+    setSelectedSharedEntryId(null);
     setActiveSession(null);
     setShowMobileServerMenu(false);
   }, [setActiveSession]);
 
+  const canStopProjectForCurrentShare = !selectedShareTarget || (
+    selectedShareTarget.kind === 'server'
+    && sessions.find((session) => session.name === activeSession)?.sharedState?.effectiveRole === 'participant'
+  );
+
   const handleStopProject = useCallback((project: string) => {
     if (!wsRef.current) return;
+    // A concrete tab share never owns the whole project lifecycle. Whole-
+    // server participants are the explicit owner-equivalent exception.
+    if (!canStopProjectForCurrentShare) return;
     // Pinned tabs are protected — refuse to stop a project that has any
     // pinned session. User must unpin first. Defense-in-depth so all stop
     // paths (tab context menu, session-controls menu) honor this.
@@ -4586,15 +5888,15 @@ export function App() {
     ));
     wsRef.current.sendSessionCommand('stop', { project });
     requestActiveTimelineRefreshAfterUserAction();
-  }, [pinnedTabs, sessions, trans]);
+  }, [canStopProjectForCurrentShare, pinnedTabs, sessions, trans]);
 
   const handleRestartProject = useCallback((project: string, fresh?: boolean) => {
     wsRef.current?.sendSessionCommand('restart', { project, ...(fresh ? { fresh: true } : {}) });
   }, []);
 
-  const registerDiffApplyer = useCallback((sessionName: string, apply: (d: TerminalDiff) => void) => {
-    diffApplyersRef.current.set(sessionName, apply);
-  }, []);
+  const registerDiffApplyer = useCallback((sessionName: string, apply: (d: TerminalDiff) => void): (() => void) => (
+    diffApplyersRef.current.register(sessionName, apply)
+  ), []);
 
   const registerHistoryApplyer = useCallback((sessionName: string, apply: (content: string) => void) => {
     historyApplyersRef.current.set(sessionName, apply);
@@ -4606,6 +5908,28 @@ export function App() {
     return <NativeAuthBridge callbackUrl={nativeCallback} />;
   }
 
+  const activeSessionInfo = sessions.find((s) => s.name === activeSession) ?? null;
+  const sharedAccessRole = selectedShareTarget
+    ? (activeSessionInfo?.sharedState?.effectiveRole ?? 'viewer')
+    : null;
+  const supervisionTaskConsoleVisibility = {
+    session: activeSessionInfo,
+    shareTargetKind: selectedShareTarget?.kind ?? null,
+    sharedAccessRole: selectedShareTarget
+      ? (activeSessionInfo?.sharedState?.effectiveRole ?? null)
+      : null,
+  };
+  const canViewTaskConsole = canViewSupervisionTaskConsole(supervisionTaskConsoleVisibility);
+  useEffect(() => {
+    if (!auth || canViewTaskConsole || !selectedServerId || !activeSessionInfo) return;
+    clearSupervisionTaskConsoleCache({
+      userId: auth.userId,
+      serverId: selectedServerId,
+      projectName: activeSessionInfo.project,
+      coordinatorSessionName: activeSessionInfo.name,
+    });
+  }, [activeSessionInfo?.name, activeSessionInfo?.project, auth?.userId, canViewTaskConsole, selectedServerId]);
+
   if (!nativeReady || !splashDone) {
     return null; // Wait for startup readiness while the HTML splash remains visible
   }
@@ -4613,11 +5937,30 @@ export function App() {
   if (isNative() && !nativeServerUrl) {
     return (
       <ServerSetupPage
-        onConnect={(url) => {
-          setNativeServerUrl(url);
-          configureApi(url);
-        }}
+        onConnect={connectNativeServer}
       />
+    );
+  }
+
+  if (authCredentialCleanupPending) {
+    return (
+      <div
+        data-testid="auth-credential-cleanup-gate"
+        role="status"
+        aria-live="polite"
+        style={{
+          minHeight: '100vh',
+          display: 'flex',
+          flexDirection: 'column',
+          alignItems: 'center',
+          justifyContent: 'center',
+          gap: 12,
+          color: '#94a3b8',
+        }}
+      >
+        <div class="spinner" aria-hidden="true" />
+        <div>{trans('common.loading')}</div>
+      </div>
     );
   }
 
@@ -4625,21 +5968,24 @@ export function App() {
     return (
       <LoginPage
         serverUrl={nativeServerUrl}
+        beginAuthAttempt={beginAuthAttempt}
+        sessionNotStuck={sessionNotStuck}
         onLoginSuccess={(userId, url) => {
           const authState: AuthState = { userId, baseUrl: url };
+          authMutationGenerationRef.current += 1;
           configureExpectedUserId(userId);
           localStorage.setItem('rcc_auth', JSON.stringify(authState));
           setAuth(authState);
         }}
-        onChangeServer={isNative() ? () => setNativeServerUrl(null) : undefined}
+        onChangeServer={isNative() ? handleChangeServer : undefined}
       />
     );
   }
 
-  const activeSessionInfo = sessions.find((s) => s.name === activeSession) ?? null;
-  const sharedAccessRole = selectedShareTarget
-    ? (activeSessionInfo?.sharedState?.effectiveRole ?? 'viewer')
-    : null;
+  const isSharedServerParticipant = selectedShareTarget?.kind === 'server'
+    && sharedAccessRole === 'participant';
+  const isTabShare = Boolean(selectedShareTarget && selectedShareTarget.kind !== 'server');
+  const canCreateMainSession = !selectedShareTarget || isSharedServerParticipant;
   const canCreateSubSession = !selectedShareTarget
     || (sharedAccessRole === 'participant' && selectedShareTarget.kind !== 'subsession');
 
@@ -4654,7 +6000,7 @@ export function App() {
   const openRepoPage = useCallback((target?: { sessionId?: string | null; projectDir?: string | null; initialTab?: RepoPageTabKey; parentSubId?: string | null }) => {
     runVersionSensitiveAction(trans('repo.info_title', { defaultValue: 'Repository information' }), () => {
       const sessionId = target?.sessionId ?? activeSession ?? null;
-      const projectDir = selectedShareTarget
+      const projectDir = isTabShare
         ? FS_SESSION_ROOT_PATH
         : target?.projectDir ?? resolveRepoProjectDir(sessionId);
       if (!projectDir) return;
@@ -4694,10 +6040,10 @@ export function App() {
       }
       setShowRepoPage(true);
     });
-  }, [activeSession, ensureDesktopWindow, removeDesktopWindow, repoPanelTarget?.parentSubId, resolveRepoProjectDir, runVersionSensitiveAction, selectedServerId, selectedShareTarget, subSessions, trans]);
+  }, [activeSession, ensureDesktopWindow, isTabShare, removeDesktopWindow, repoPanelTarget?.parentSubId, resolveRepoProjectDir, runVersionSensitiveAction, selectedServerId, subSessions, trans]);
 
   const repoPanelSessionId = repoPanelTarget?.sessionId ?? activeSession ?? null;
-  const repoPanelProjectDir = selectedShareTarget
+  const repoPanelProjectDir = isTabShare
     ? FS_SESSION_ROOT_PATH
     : repoPanelTarget?.projectDir ?? activeSessionInfo?.projectDir;
 
@@ -4847,7 +6193,7 @@ export function App() {
 
   // Memoized sub-session mappings — avoids creating new arrays on every render,
   // which would defeat memo() on child components (SessionPane, SessionTree, pinned panels).
-  const quickDelegationSessions = useMemo(() => sessions.map((session) => {
+  const quickDelegationSessions = useStructuralIdentity(useMemo(() => sessions.map((session) => {
     const effectiveModel = resolveQuickAgentDelegationModel(
       session,
       detectedModels.get(session.name),
@@ -4855,8 +6201,8 @@ export function App() {
     return effectiveModel && effectiveModel !== session.activeModel
       ? { ...session, activeModel: effectiveModel }
       : session;
-  }), [detectedModels, sessions]);
-  const subSessionsSlim = useMemo(() => subSessions.map((session) => ({
+  }), [detectedModels, sessions]));
+  const subSessionsSlim = useStructuralIdentity(useMemo(() => subSessions.map((session) => ({
     sessionName: session.sessionName,
     type: session.type,
     label: session.label,
@@ -4867,7 +6213,7 @@ export function App() {
       detectedModels.get(session.sessionName),
       subUsages.get(session.sessionName)?.model,
     ),
-  })), [detectedModels, subSessions, subUsages]);
+  })), [detectedModels, subSessions, subUsages]));
   const peerAuditSettingsSessions = useMemo<PeerAuditSettingsSession[]>(() => subSessions
     .filter((session) => session.executionCloneKind !== EXECUTION_CLONE_KIND && typeof session.parentRunId !== 'string')
     .map((session) => ({
@@ -4887,6 +6233,10 @@ export function App() {
       requestedModel: session.requestedModel,
       modelDisplay: session.modelDisplay,
       providerId: session.providerId,
+      closedAt: session.closedAt,
+      ccPresetId: session.ccPresetId,
+      executionCloneKind: session.executionCloneKind,
+      parentRunId: session.parentRunId,
     })), [detectedModels, subSessions, subUsages]);
   const openShareDialogForSession = useCallback((session: SessionInfo, subSessionId?: string | null) => {
     if (!selectedServerId) return;
@@ -4986,35 +6336,40 @@ export function App() {
   // React hooks ordering violation (hooks cannot be called conditionally).
   useEffect(() => {
     const ws = wsRef.current;
-    const dir = activeSessionInfo?.projectDir;
+    const isTab = selectedShareTarget && selectedShareTarget.kind !== 'server';
+    const rawDir = activeSessionInfo?.projectDir;
+    const dir = isTab ? FS_SESSION_ROOT_PATH : rawDir;
     if (!ws || !dir || !connected) return;
 
-    const existing = repoContextsRef.current.get(dir);
+    const existing = repoContextsRef.current.get(rawDir ?? dir) ?? (isTab ? repoContextsRef.current.get(FS_SESSION_ROOT_PATH) : undefined);
     // Already detected with a definitive status — no need to re-detect
     const TERMINAL_STATUSES = new Set(['ok', 'no_repo', 'cli_missing', 'cli_outdated', 'unauthorized', 'unknown_platform']);
     // Note: 'cli_error' is NOT terminal — it can be transient (rate limit, path mismatch, etc.)
     if (existing?.context?.status && TERMINAL_STATUSES.has(existing.context.status)) return;
 
+    const sessionName = activeSessionInfo?.name;
+    const opts = sessionName ? { sessionName } : undefined;
+
     // Delay initial detect to avoid browser rate limit on connect (burst of subscribes + timeline requests)
-    const initialTimer = setTimeout(() => ws.repoDetect(dir), 3_000);
+    const initialTimer = setTimeout(() => ws.repoDetect(dir, opts), 3_000);
 
     // Retry every 15s unless we get a definitive answer
     const interval = setInterval(() => {
-      const ctx = repoContextsRef.current.get(dir);
+      const ctx = repoContextsRef.current.get(rawDir ?? dir) ?? (isTab ? repoContextsRef.current.get(FS_SESSION_ROOT_PATH) : undefined);
       if (ctx?.context?.status && TERMINAL_STATUSES.has(ctx.context.status)) {
         clearInterval(interval);
         return;
       }
-      ws.repoDetect(dir);
+      ws.repoDetect(dir, opts);
     }, 15_000);
 
     return () => { clearTimeout(initialTimer); clearInterval(interval); };
-  }, [activeSessionInfo?.projectDir, connected]);
+  }, [activeSessionInfo?.name, activeSessionInfo?.projectDir, connected, selectedShareTarget]);
 
   // Show full-screen connecting indicator while waiting for initial WS + session data.
   // After 8s, show escape buttons so the user is never stuck.
   const [connectTimeout, setConnectTimeout] = useState(false);
-  const showInitialConnectingGate = shouldShowInitialConnectingGate(
+  const showInitialConnectingGate = initialAuthVerificationPending || shouldShowInitialConnectingGate(
     Boolean(auth),
     selectedServerId,
     connected,
@@ -5025,6 +6380,22 @@ export function App() {
     ? servers.find((server) => server.id === selectedServerId) ?? null
     : null;
   const daemonVersionForDisplay = daemonStats?.daemonVersion ?? selectedServerInfo?.daemonVersion ?? null;
+  const latestDaemonVersionForDisplay = daemonStats?.latestDaemonVersion ?? selectedServerInfo?.latestDaemonVersion ?? null;
+  const daemonUpgradeRequest = selectedServerId
+    ? daemonUpgradeRequests[selectedServerId] ?? { phase: 'idle' as const }
+    : { phase: 'idle' as const };
+  // What a confirmed upgrade will interrupt: the daemon's most recent block
+  // receipt for this server (a manual attempt) or, failing that, the reason the
+  // automatic trigger is currently waiting on one of the daemon's busy gates.
+  const daemonUpgradeConfirmBlocked = {
+    reason: daemonUpgradeRequest.phase === 'failed' && daemonUpgradeRequest.blockedReason
+      ? daemonUpgradeRequest.blockedReason
+      : (daemonStats?.autoUpgrade?.reason && isDaemonUpgradeBusyBlockReason(daemonStats.autoUpgrade.reason)
+        ? daemonStats.autoUpgrade.reason
+        : null),
+    sessionNames: daemonUpgradeRequest.phase === 'failed' ? daemonUpgradeRequest.blockedSessionNames : undefined,
+  };
+  const busyDaemonSessionCount = sessions.filter((session) => session.state === 'running' || session.state === 'queued').length;
   const daemonBadgeState = getDaemonBadgeState(connected, connecting, daemonOnline, selectedServerInfo);
 
   useEffect(() => {
@@ -5065,11 +6436,16 @@ export function App() {
   }, [showInitialConnectingGate]);
 
   if (showInitialConnectingGate) {
+    const sharedRestoreError = sharedHashRestorePending && initialHashStateRef.current.sharedEntryId
+      ? sharedEntriesError
+      : null;
     return (
       <div style={{ position: 'fixed', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', background: '#0a0e1a', flexDirection: 'column', gap: 16 }}>
         <div class="spinner" style={{ width: 32, height: 32 }} />
-        <div style={{ color: '#64748b', fontSize: 14 }}>{connecting ? trans('common.reconnecting') : trans('common.loading')}</div>
-        {connectTimeout && (
+        <div style={{ color: sharedRestoreError ? '#fca5a5' : '#64748b', fontSize: 14 }}>
+          {sharedRestoreError ?? (connecting ? trans('common.reconnecting') : trans('common.loading'))}
+        </div>
+        {(connectTimeout || sharedRestoreError) && (
           <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
             <button class="btn" style={{ background: '#334155', color: '#e2e8f0', fontSize: 12 }} onClick={handleBackToDashboard}>
               ← Back
@@ -5083,8 +6459,45 @@ export function App() {
     );
   }
 
+  const renderSubSessionVerticalRailHost = (side: SubSessionDesktopDockSide) => (
+    !isMobile
+      && selectedServerId
+      && subSessionDesktopLayout === SUBSESSION_DESKTOP_LAYOUT.VERTICAL
+      && subSessionDesktopDockSide === side
+      ? (
+        <aside
+          key={side}
+          ref={setSubSessionVerticalRailHost}
+          class={`subsession-vertical-rail-host subsession-vertical-rail-host-${side}`}
+          data-testid="subsession-vertical-rail-host"
+          data-dock-side={side}
+          aria-label={trans('subsessionBar.vertical_rail')}
+        />
+      )
+      : null
+  );
+
+  const renderTeamDiscussionRailHost = () => (
+    !isMobile
+      && selectedServerId
+      && visibleTeamDiscussions.length > 0
+      && teamDiscussionLayout === TEAM_DISCUSSION_LAYOUT.RIGHT
+      ? (
+        <aside
+          ref={setTeamDiscussionRailHost}
+          class="team-discussion-rail-host"
+          data-testid="team-discussion-rail-host"
+          aria-label={trans('subsessionBar.team_right_rail')}
+        />
+      )
+      : null
+  );
+
   return (
-    <div class={`layout${isMobile ? ' layout-mobile' : ''}`} key={selectedServerId ?? ''}>
+    <div
+      class={`layout${isMobile ? ' layout-mobile' : ''}${mobileRemoteSurfaceActive ? ' layout-mobile-remote-surface-active' : ''}`}
+      key={selectedServerId ?? ''}
+    >
       {showSharedReturnGuide && sharedReturnServer && selectedShareTarget && (
         <aside
           class="shared-return-guide"
@@ -5111,7 +6524,7 @@ export function App() {
           </div>
         </aside>
       )}
-      {/* Desktop 3-column: [ServerIconBar][SidebarPanel][MainContent] */}
+      {/* Desktop flow: the vertical rail is a real root flex child, docked on either side of MainContent. */}
       {!isMobile && (
         <>
           <ServerIconBar
@@ -5157,8 +6570,25 @@ export function App() {
                 >
                   {trans('controlled_nodes.title')}
                 </button>
-                <ControlledNodeQuickMenu onOpenRemoteDesktop={openRemoteDesktop} />
+                <ControlledNodeQuickMenu
+                  onOpenRemoteDesktop={openRemoteDesktop}
+                  onOpenRemoteDesktopWall={openRemoteDesktopWall}
+                  onConnectById={openRemoteDesktopById}
+                />
               </div>
+              {/* Owner: a remote-desktop button right of the AI Desk dropdown on
+                  desktop, the same control as the session toolbars. One
+                  button only: the login-screen setup stays in the toolbar. */}
+              <DaemonRemoteDesktopControl
+                compact
+                offerLoginScreenSetup={false}
+                ws={wsRef.current}
+                serverId={selectedServerId}
+                serverName={selectedServerInfo?.name}
+                daemonOnline={daemonOnline}
+                onOpen={openRemoteDesktop}
+                canSetUp={!selectedShareTarget}
+              />
               {/* Session-list show/hide toggle — same as the mobile sidebar ⊞ button */}
               <button
                 class="btn"
@@ -5187,13 +6617,12 @@ export function App() {
               idleFlashTokens={idleFlashTokens}
               p2pSessionLabels={p2pSessionLabels}
               onSelectSession={(name) => {
-                setActiveSession(name);
-                setIdleAlerts((prev) => { const s = new Set(prev); s.delete(name); return s; });
+                selectMainSessionTab(name);
               }}
               onSelectSubSession={(sub) => {
                 selectSubSessionFromTree(sub);
               }}
-              onNewSession={selectedShareTarget ? undefined : () => setShowNewSession(true)}
+              onNewSession={canCreateMainSession ? () => setShowNewSession(true) : undefined}
               onNewSubSession={canCreateSubSession ? () => setShowSubDialog(true) : undefined}
             />}
 
@@ -5296,8 +6725,18 @@ export function App() {
           )}
         </div>
         <div style={{ flex: 1 }} />
-        {connected && (daemonStats || daemonVersionForDisplay) && (
+        {selectedServerInfo && (connected || daemonStats || daemonVersionForDisplay) && (
           <div class="sidebar-stats">
+            <DaemonStatusCard
+              currentVersion={daemonVersionForDisplay}
+              latestVersion={latestDaemonVersionForDisplay}
+              online={connected && daemonOnline}
+              busySessions={busyDaemonSessionCount}
+              upgrading={Boolean(daemonUpgrading)}
+              requestState={daemonUpgradeRequest}
+              autoUpgrade={daemonStats?.autoUpgrade ?? null}
+              onUpgrade={() => handleUpgradeDaemon(selectedServerInfo)}
+            />
             {daemonVersionForDisplay && (
               <div class="sidebar-stats-row">
                 {/* Tooltip surfaces the full version (incl. dev counter) for support. */}
@@ -5314,21 +6753,26 @@ export function App() {
             )}
             {daemonStats && (
               <div class="sidebar-stats-row">
-                <span style={{ color: daemonStats.cpu > 80 ? '#f87171' : daemonStats.cpu > 50 ? '#fbbf24' : '#4ade80' }}>
-                  CPU {daemonStats.cpu}%
+                <span style={{ color: { danger: '#f87171', warn: '#fbbf24', ok: '#4ade80', unknown: '#94a3b8' }[cpuSeverity(daemonStats.cpu) ?? 'unknown'] }}>
+                  CPU {formatCpuPercent(daemonStats.cpu)}
                 </span>
                 <span style={{ color: '#a78bfa' }}>
-                  Load {daemonStats.load1}
+                  Load {formatStatNumber(daemonStats.load1)}
                 </span>
               </div>
             )}
             {daemonStats && (
               <div class="sidebar-stats-row">
                 <span style={{ color: '#60a5fa' }}>
-                  Mem {(() => { const gb = daemonStats.memUsed / (1024 ** 3); return gb >= 1 ? `${gb.toFixed(1)}G` : `${(daemonStats.memUsed / (1024 ** 2)).toFixed(0)}M`; })()}/{(() => { const gb = daemonStats.memTotal / (1024 ** 3); return gb >= 1 ? `${gb.toFixed(1)}G` : `${(daemonStats.memTotal / (1024 ** 2)).toFixed(0)}M`; })()}
+                  Mem {formatMemoryCompact(daemonStats.memUsed)}/{formatMemoryCompact(daemonStats.memTotal)}
                 </span>
+                {isDaemonMainLoopBusy(daemonStats) && (
+                  <span style={{ color: '#fb923c' }} title="Main daemon event loop is busy">
+                    Busy {Math.round(daemonStats.mainEventLoopBlockedMs ?? daemonStats.mainEventLoopLagMs ?? 0)}ms
+                  </span>
+                )}
                 <span style={{ color: '#94a3b8' }}>
-                  {(() => { const s = daemonStats.uptime; const d = Math.floor(s / 86400); const h = Math.floor((s % 86400) / 3600); return d > 0 ? `${d}d ${h}h` : `${h}h`; })()}
+                  {formatDaemonUptime(daemonStats.uptime)}
                 </span>
               </div>
             )}
@@ -5347,6 +6791,8 @@ export function App() {
         </div>
       </aside>
 
+      {renderSubSessionVerticalRailHost(SUBSESSION_DESKTOP_DOCK_SIDE.LEFT)}
+
       {/* Main */}
       <main class="main">
         {!selectedServerId && !manualDashboard && (!serversLoaded || autoEnteringRecent || servers.length > 0) ? (
@@ -5355,9 +6801,29 @@ export function App() {
             <div>{trans('common.loading')}</div>
           </div>
         ) : !selectedServerId ? (
-          <div style={{ flex: 1, minHeight: 0, overflowY: 'auto' }}>
+          <div style={{ position: 'relative', flex: 1, minHeight: 0, overflowY: 'auto' }}>
+            {isMobile && (
+              <button
+                type="button"
+                class="mobile-dashboard-menu-button"
+                aria-label={trans('sidebar.expand')}
+                onClick={() => setMobileSidebarOpen(true)}
+              >≡</button>
+            )}
             <Suspense fallback={<div style={{ textAlign: 'center', padding: 48, color: '#64748b' }}>Loading...</div>}>
-              <DashboardPage onSelectServer={handleSelectServer} onLogout={handleLogout} onOpenUsageSummary={() => setShowUsageSummaryPage(true)} onServersLoaded={setServers} />
+              <DashboardPage
+                onSelectServer={handleSelectServer}
+                onLogout={handleLogout}
+                onOpenUsageSummary={() => setShowUsageSummaryPage(true)}
+                onServersLoaded={setServers}
+                sharedEntries={sharedEntries}
+                sharedEntriesLoading={sharedEntriesLoading}
+                sharedEntriesLoaded={sharedEntriesLoaded}
+                sharedEntriesError={sharedEntriesError}
+                openingSharedEntryId={openingSharedEntryId}
+                onOpenSharedEntry={(entry) => void handleOpenSharedEntry(entry)}
+                onRefreshSharedEntries={() => void refreshSharedEntries()}
+              />
             </Suspense>
           </div>
         ) : (
@@ -5412,19 +6878,17 @@ export function App() {
                       );
                     })}
                     {sharedEntries.length > 0 && (
-                      <div class="mobile-server-menu-shared">
-                        <div class="mobile-server-menu-shared-title">{trans('share.sharedWithMe.title')}</div>
-                        {sharedEntries.map((entry) => (
-                          <button
-                            key={entry.id}
-                            class="mobile-server-menu-item"
-                            onClick={() => { void handleOpenSharedEntry(entry); setShowMobileServerMenu(false); }}
-                          >
-                            <span>↗</span>
-                            {' '}{entry.targetLabel}
-                          </button>
-                        ))}
-                      </div>
+                      <MobileSharedEntriesMenu
+                        entries={sharedEntries}
+                        loading={sharedEntriesLoading}
+                        error={sharedEntriesError}
+                        openingEntryId={openingSharedEntryId}
+                        onOpen={(entry) => {
+                          void handleOpenSharedEntry(entry);
+                          setShowMobileServerMenu(false);
+                        }}
+                        onRefresh={() => void refreshSharedEntries()}
+                      />
                     )}
                     <div style={{ padding: '6px 12px', borderTop: '1px solid #334155' }}>
                       <LanguageSwitcher />
@@ -5434,6 +6898,18 @@ export function App() {
                 )}
               </div>
               <div class="mobile-server-actions">
+                {/* Left of the file-manager button, on purpose: remote-desktop
+                    launch/enable is the first action in this row. */}
+                <DaemonRemoteDesktopControl
+                  compact
+                  offerLoginScreenSetup={false}
+                  ws={wsRef.current}
+                  serverId={selectedServerId}
+                  serverName={selectedServerInfo?.name}
+                  daemonOnline={daemonOnline}
+                  onOpen={openRemoteDesktop}
+                  canSetUp={!selectedShareTarget}
+                />
                 {activeSession && (
                   <button
                     class="view-toggle"
@@ -5451,20 +6927,17 @@ export function App() {
                 <button class="view-toggle" title={trans('localWebPreview.title')} onClick={() => setShowDesktopLocalWebPreview((o) => !o)} style={{ position: 'relative' }}>
                   🌐
                 </button>
+                <SupervisionTaskConsoleToggle
+                  visibility={supervisionTaskConsoleVisibility}
+                  open={showSupervisionTaskConsole}
+                  triggerRef={supervisionTaskConsoleToggleRef}
+                  onToggle={toggleSupervisionTaskConsole}
+                />
                 {!isTransportSession && (
                   <button class="view-toggle" data-onboarding="view-toggle" onClick={toggleViewMode}>
                     {viewMode === 'chat' ? '⌨' : '💬'}
                   </button>
                 )}
-                <DaemonRemoteDesktopControl
-                  compact
-                  offerLoginScreenSetup={false}
-                  ws={wsRef.current}
-                  serverId={selectedServerId}
-                  serverName={selectedServerInfo?.name}
-                  daemonOnline={daemonOnline}
-                  onOpen={openRemoteDesktop}
-                />
                 <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 0, lineHeight: 1.2 }}>
                   <span class={`badge ${daemonBadgeState === 'online' ? 'badge-online' : daemonBadgeState === 'connecting' ? 'badge-connecting' : 'badge-offline'}`} style={{ fontSize: 10 }}>
                     {daemonBadgeState === 'online'
@@ -5490,8 +6963,9 @@ export function App() {
               p2pSessionLabels={p2pSessionLabels}
               onAlertDismiss={(name) => setIdleAlerts((prev) => { const s = new Set(prev); s.delete(name); return s; })}
               onSelect={selectMainSessionTab}
-              onNewSession={() => setShowNewSession(true)}
+              onNewSession={canCreateMainSession ? () => setShowNewSession(true) : undefined}
               onStopProject={handleStopProject}
+              canStopProject={!selectedShareTarget || isSharedServerParticipant}
               onRestartProject={handleRestartProject}
               onOpenSessionSettings={(session) => setSettingsTarget({
                 sessionName: session.name,
@@ -5499,6 +6973,7 @@ export function App() {
                 runtimeEpoch: session.runtimeEpoch,
                 activeModel: session.activeModel,
                 requestedModel: session.requestedModel,
+                modelDisplay: session.modelDisplay,
                 providerId: session.providerId,
                 label: session.label || '',
                 description: session.description || '',
@@ -5506,9 +6981,12 @@ export function App() {
                 type: session.agentType || '',
                 parentSession: null,
                 transportConfig: session.transportConfig ?? null,
+                supervisionMode: session.supervisionMode ?? null,
+                canControlAutomaticSupervision: canSharedActorControlSession(session.sharedState)
+                  && canSessionRoleOwnAutomaticSupervision(session.role),
               })}
               onCloneSession={(session) => setCloneSessionTarget(session)}
-              onShareSession={openShareDialogForSession}
+              onShareSession={selectedShareTarget ? undefined : openShareDialogForSession}
               renameRequest={renameRequest}
               onRenameHandled={() => setRenameRequest(null)}
               onRenameSession={handleRenameSession}
@@ -5540,6 +7018,7 @@ export function App() {
                   serverName={selectedServerInfo?.name}
                   daemonOnline={daemonOnline}
                   onOpen={openRemoteDesktop}
+                  canSetUp={!selectedShareTarget}
                 />
               </div>
             )}
@@ -5547,6 +7026,17 @@ export function App() {
             {/* Desktop view mode toggle — mobile uses the one in mobile-server-bar */}
             {!isMobile && resolvedActiveSessionExists && (
               <div class="desktop-view-toggle">
+                {/* Left of the file-manager button, on purpose: remote-desktop
+                    launch/enable is the first action in this row. */}
+                <DaemonRemoteDesktopControl
+                  compact
+                  ws={wsRef.current}
+                  serverId={selectedServerId}
+                  serverName={selectedServerInfo?.name}
+                  daemonOnline={daemonOnline}
+                  onOpen={openRemoteDesktop}
+                  canSetUp={!selectedShareTarget}
+                />
                 <button
                   class="view-toggle"
                   title={trans('picker.files')}
@@ -5567,6 +7057,12 @@ export function App() {
                 >
                   🌐
                 </button>
+                <SupervisionTaskConsoleToggle
+                  visibility={supervisionTaskConsoleVisibility}
+                  open={showSupervisionTaskConsole}
+                  triggerRef={supervisionTaskConsoleToggleRef}
+                  onToggle={toggleSupervisionTaskConsole}
+                />
                 <DesktopWindowMaximizeButton
                   class="view-toggle desktop-main-maximize-toggle"
                   data-testid="main-session-maximize-toggle"
@@ -5578,19 +7074,13 @@ export function App() {
                     {viewMode === 'chat' ? '⌨ Terminal' : '💬 Chat'}
                   </button>
                 )}
-                <DaemonRemoteDesktopControl
-                  compact
-                  ws={wsRef.current}
-                  serverId={selectedServerId}
-                  serverName={selectedServerInfo?.name}
-                  daemonOnline={daemonOnline}
-                  onOpen={openRemoteDesktop}
-                />
               </div>
             )}
 
-            {/* Session panes: visible brain sessions stay mounted; worker sessions remain addressable but hidden from main windows. */}
-            {visibleMainSessions.map((s) => (
+            <div class="supervision-task-console-workspace">
+              <div class="supervision-task-console-primary">
+              {/* Session panes: visible brain sessions stay mounted; worker sessions remain addressable but hidden from main windows. */}
+              {visibleMainSessions.map((s) => (
               <ErrorBoundary key={`eb-${s.name}`}>
               <SessionPane
                 key={s.name}
@@ -5614,9 +7104,10 @@ export function App() {
                 onDiff={(apply) => registerDiffApplyer(s.name, apply)}
                 onHistory={(apply) => registerHistoryApplyer(s.name, apply)}
                 onStopProject={handleStopProject}
+                onRestart={() => handleRestartProject(s.project)}
                 onRenameSession={() => setRenameRequest(s.name)}
-                onSettings={(openIntent) => setSettingsTarget({ sessionName: s.name, sessionInstanceId: s.sessionInstanceId, runtimeEpoch: s.runtimeEpoch, activeModel: s.activeModel, requestedModel: s.requestedModel, providerId: s.providerId, label: s.label || '', description: s.description || '', cwd: s.projectDir || '', type: s.agentType || '', parentSession: null, transportConfig: s.transportConfig ?? null, openIntent })}
-                onShareSession={openShareDialogForSession}
+                onSettings={(openIntent) => setSettingsTarget({ sessionName: s.name, sessionInstanceId: s.sessionInstanceId, runtimeEpoch: s.runtimeEpoch, activeModel: s.activeModel, requestedModel: s.requestedModel, modelDisplay: s.modelDisplay, providerId: s.providerId, label: s.label || '', description: s.description || '', cwd: s.projectDir || '', type: s.agentType || '', parentSession: null, transportConfig: s.transportConfig ?? null, supervisionMode: s.supervisionMode ?? null, openIntent, canControlAutomaticSupervision: canSharedActorControlSession(s.sharedState) && canSessionRoleOwnAutomaticSupervision(s.role) })}
+                onShareSession={selectedShareTarget ? undefined : openShareDialogForSession}
                 sessionPinned={pinnedTabs.has(s.name)}
                 stopBlockedByPinned={sessions.some((session) => session.project === s.project && pinnedTabs.has(session.name))}
                 onToggleSessionPin={togglePinnedTab}
@@ -5644,23 +7135,56 @@ export function App() {
                 onVersionSensitiveAction={runVersionSensitiveAction}
               />
               </ErrorBoundary>
-            ))}
+              ))}
 
-            {!resolvedActiveSessionExists && !sessionsLoaded && (
+              {!resolvedActiveSessionExists && !sessionsLoaded && (
               <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#475569', flexDirection: 'column', gap: 12 }}>
                 <div class="spinner" />
                 <div>{connected ? 'Waiting for daemon...' : 'Connecting...'}</div>
               </div>
-            )}
-            {!resolvedActiveSessionExists && sessionsLoaded && (
+              )}
+              {!resolvedActiveSessionExists && sessionsLoaded && (
               <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#475569', flexDirection: 'column', gap: 12 }}>
                 <div style={{ fontSize: 32 }}>⌨</div>
                 <div>Select a session or start a new one</div>
-                <button class="btn btn-primary" onClick={() => setShowNewSession(true)}>
-                  + New Session
-                </button>
+                {canCreateMainSession && (
+                  <button class="btn btn-primary" onClick={() => setShowNewSession(true)}>
+                    + New Session
+                  </button>
+                )}
               </div>
-            )}
+              )}
+              </div>
+              {auth?.userId && selectedServerId && activeSessionInfo && wsRef.current && (
+                <SupervisionTaskPairSnapshotBridge
+                  ws={wsRef.current}
+                  connected={connected && daemonOnline}
+                  userId={auth.userId}
+                  serverId={selectedServerId}
+                  projectName={activeSessionInfo.project}
+                  coordinatorSessionName={activeSessionInfo.name}
+                />
+              )}
+              {showSupervisionTaskConsole && canViewTaskConsole && activeSessionInfo && (
+                <SupervisionTaskConsole
+                  key={`${auth.userId}:${selectedServerId}:${activeSessionInfo.project}:${activeSessionInfo.name}`}
+                  ws={wsRef.current}
+                  connected={connected && daemonOnline}
+                  userId={auth.userId}
+                  serverId={selectedServerId!}
+                  projectName={activeSessionInfo.project}
+                  coordinatorSessionName={activeSessionInfo.name}
+                  mobile={isMobile}
+                  readOnly={sharedAccessRole === 'viewer'}
+                  onClose={closeSupervisionTaskConsole}
+                  returnFocusRef={supervisionTaskConsoleToggleRef}
+                  onNavigateSession={(sessionName) => {
+                    navigateToSession(sessionName);
+                    if (isMobile) closeSupervisionTaskConsole();
+                  }}
+                />
+              )}
+            </div>
 
             {/* Desktop floating file browser */}
             {!isMobile && showDesktopFileBrowser && wsRef.current && activeSessionInfo && (
@@ -5762,6 +7286,14 @@ export function App() {
                 openIds={openSubIds}
                 maximizedIds={maximizedSubIds}
                 desktopLayoutCapable={desktopLayoutCapable}
+                desktopLayout={subSessionDesktopLayout}
+                onDesktopLayoutChange={handleSubSessionDesktopLayoutChange}
+                desktopDockSide={subSessionDesktopDockSide}
+                onDesktopDockSideChange={handleSubSessionDesktopDockSideChange}
+                verticalRailHost={subSessionVerticalRailHost}
+                teamDiscussionLayout={teamDiscussionLayout}
+                onTeamDiscussionLayoutChange={handleTeamDiscussionLayoutChange}
+                teamDiscussionRailHost={teamDiscussionRailHost}
                 collapsed={subSessionBarCollapsed}
                 onCollapsedChange={setSubSessionBarCollapsed}
                 onVisualOrderChange={handleSubSessionVisualOrderChange}
@@ -5789,11 +7321,7 @@ export function App() {
                 }}
                 onViewDiscussions={() => runVersionSensitiveAction(trans('p2p.discussions.title'), () => { setDiscussionInitialId(null); setDiscussionInitialTab('team'); setShowDiscussionsPage(true); })}
                 onViewDiscussion={(fileId) => runVersionSensitiveAction(trans('p2p.discussions.title'), () => { setDiscussionInitialId(fileId); setDiscussionInitialTab('team'); setShowDiscussionsPage(true); })}
-                discussions={discussions.filter((d) => isP2pDiscussionVisibleInSubSessionBar(d, {
-                  activeSession,
-                  activeRootSession,
-                  visibleSubSessionNames,
-                }))}
+                discussions={visibleTeamDiscussions}
                 // Daemon-wide running count (NOT scoped to this
                 // session) so the View Discussions (📋) button shows
                 // a badge even when the user is viewing a session
@@ -5823,6 +7351,7 @@ export function App() {
                 onDiff={registerDiffApplyer}
                 onHistory={registerHistoryApplyer}
                 serverId={selectedServerId}
+                quickClosePersistenceScope={activeRootSession ?? activeSession ?? undefined}
                 onViewRepo={() => openRepoPage()}
                 onViewCron={() => runVersionSensitiveAction(trans('cron.title'), () => setShowCronManager(true))}
                 subUsages={subUsages}
@@ -5840,8 +7369,11 @@ export function App() {
         )}
       </main>
 
+      {renderSubSessionVerticalRailHost(SUBSESSION_DESKTOP_DOCK_SIDE.RIGHT)}
+      {renderTeamDiscussionRailHost()}
+
       {/* Mobile sidebar overlay — always mounted so pinned panels stay alive, shown/hidden via CSS */}
-      {isMobile && selectedServerId && (
+      {isMobile && (
         <div ref={sidebarOverlayRef} class={`mobile-sidebar-overlay${mobileSidebarOpen ? ' open' : ''}`} onPointerDown={(e) => { if (e.target === e.currentTarget) closeSidebar(); }}>
           <div ref={sidebarPanelRef} class="mobile-sidebar-panel">
             <div class="mobile-sidebar-header">
@@ -5857,32 +7389,45 @@ export function App() {
                   onClick={() => { setShowSettingsPage(true); closeSidebar(); }}
                   title="Settings"
                 >⚙</button>
-                <button
-                  class="mobile-sidebar-hdr-btn"
-                  onClick={() => {
-                    setSharedContextManagementProps((prev) => ({ ...prev, serverId: selectedServerId }));
-                    setShowSharedContextManagement(true);
-                    closeSidebar();
-                  }}
-                  title={trans('sharedContext.management.title')}
-                >CTX</button>
-                <button
-                  class={`mobile-sidebar-hdr-btn${mobileHideServerBar ? '' : ' active'}`}
-                  onClick={() => setMobileHideServerBar((p) => { const v = !p; localStorage.setItem('mobile_hide_server_bar', v ? '1' : ''); return v; })}
-                  title="Server bar"
-                >≡</button>
-                <button
-                  class={`mobile-sidebar-hdr-btn${mobileHideTabBar ? '' : ' active'}`}
-                  onClick={() => setMobileHideTabBar((p) => { const v = !p; localStorage.setItem('mobile_hide_tab_bar', v ? '1' : ''); return v; })}
-                  title="Session tabs"
-                >⊞</button>
+                {isAdmin && (
+                  <button
+                    class="mobile-sidebar-hdr-btn"
+                    onClick={() => { setShowAdminPage(true); closeSidebar(); }}
+                    title={trans('admin.title')}
+                  >🛡</button>
+                )}
+                {selectedServerId && (
+                  <button
+                    class="mobile-sidebar-hdr-btn"
+                    onClick={() => {
+                      setSharedContextManagementProps((prev) => ({ ...prev, serverId: selectedServerId }));
+                      setShowSharedContextManagement(true);
+                      closeSidebar();
+                    }}
+                    title={trans('sharedContext.management.title')}
+                  >CTX</button>
+                )}
+                {(servers.length > 0 || sharedEntriesLoading || sharedEntriesError !== null || sharedEntries.length > 0) && (
+                  <button
+                    class={`mobile-sidebar-hdr-btn${mobileHideServerBar ? '' : ' active'}`}
+                    onClick={() => setMobileHideServerBar((p) => { const v = !p; localStorage.setItem('mobile_hide_server_bar', v ? '1' : ''); return v; })}
+                    title="Server bar"
+                  >≡</button>
+                )}
+                {selectedServerId && (
+                  <button
+                    class={`mobile-sidebar-hdr-btn${mobileHideTabBar ? '' : ' active'}`}
+                    onClick={() => setMobileHideTabBar((p) => { const v = !p; localStorage.setItem('mobile_hide_tab_bar', v ? '1' : ''); return v; })}
+                    title="Session tabs"
+                  >⊞</button>
+                )}
                 <button class="mobile-sidebar-close" onClick={() => closeSidebar()}>✕</button>
               </div>
             </div>
             <div class="mobile-sidebar-body">
               <ErrorBoundary>
               {/* Server switcher — collapsible via sidebar toggle */}
-              {!mobileHideServerBar && (
+              {(servers.length > 0 || sharedEntriesLoading || sharedEntriesError !== null || sharedEntries.length > 0) && !mobileHideServerBar && (
                 <div style={{ padding: '8px 12px', borderBottom: '1px solid #1e293b' }}>
                   {servers.map((s) => {
                     const online = isServerOnline(s);
@@ -5910,7 +7455,7 @@ export function App() {
                 </div>
               )}
               {/* Session tree — collapsible via sidebar toggle */}
-              {!mobileHideTabBar && <SessionTree
+              {selectedServerId && !mobileHideTabBar && <SessionTree
                 serverId={selectedServerId}
                 sessions={visibleMainSessions}
                 subSessions={subSessions}
@@ -5920,21 +7465,20 @@ export function App() {
                 idleFlashTokens={idleFlashTokens}
                 p2pSessionLabels={p2pSessionLabels}
                 onSelectSession={(name) => {
-                  setActiveSession(name);
-                  setIdleAlerts((prev) => { const s = new Set(prev); s.delete(name); return s; });
+                  selectMainSessionTab(name);
                   closeSidebar();
                 }}
                 onSelectSubSession={(sub) => {
                   selectSubSessionFromTree(sub);
                   closeSidebar();
                 }}
-                onNewSession={selectedShareTarget ? undefined : () => { setShowNewSession(true); closeSidebar(); }}
+                onNewSession={canCreateMainSession ? () => { setShowNewSession(true); closeSidebar(); } : undefined}
                 onNewSubSession={canCreateSubSession ? () => { setShowSubDialog(true); closeSidebar(); } : undefined}
                 height={sessionTreeHeight}
                 onResizeHeight={saveSessionTreeHeight}
               />}
               {/* P2P ring progress */}
-              {discussions.filter((d) => d.state === 'running' || d.state === 'setup').filter((d) => d.id.startsWith('p2p_')).map((d) => (
+              {selectedServerId && discussions.filter((d) => d.state === 'running' || d.state === 'setup').filter((d) => d.id.startsWith('p2p_')).map((d) => (
                 <P2pRingProgress
                   key={d.id}
                   completedRounds={Math.max(0, d.currentRound - 1)}
@@ -5949,7 +7493,7 @@ export function App() {
                 />
               ))}
               {/* Pinned panels — same as desktop sidebar */}
-              {visiblePinnedPanels.map((panel) => {
+              {selectedServerId && visiblePinnedPanels.map((panel) => {
                 const height = pinnedPanelHeights[panel.id] ?? 240;
                 const ctx: PanelRenderContext = {
                   ws: wsRef.current,
@@ -5990,11 +7534,22 @@ export function App() {
             </div>
             {/* Footer */}
             <div class="mobile-sidebar-footer">
-              {connected && (daemonStats || daemonVersionForDisplay) && (
-                <div style={{ fontSize: 11, color: '#64748b', marginBottom: 4, display: 'flex', alignItems: 'center', gap: 6 }}>
+              {selectedServerId && selectedServerInfo && (connected || daemonStats || daemonVersionForDisplay) && (
+                <div class="mobile-sidebar-daemon-status">
+                  <DaemonStatusCard
+                    currentVersion={daemonVersionForDisplay}
+                    latestVersion={latestDaemonVersionForDisplay}
+                    online={connected && daemonOnline}
+                    busySessions={busyDaemonSessionCount}
+                    upgrading={Boolean(daemonUpgrading)}
+                    requestState={daemonUpgradeRequest}
+                    autoUpgrade={daemonStats?.autoUpgrade ?? null}
+                    onUpgrade={() => handleUpgradeDaemon(selectedServerInfo)}
+                    compact
+                  />
                   <span title={daemonVersionForDisplay ? `v${daemonVersionForDisplay}` : undefined}>
                     {daemonVersionForDisplay && <span>v{formatDaemonVersionShort(daemonVersionForDisplay)}{daemonStats ? ' · ' : ''}</span>}
-                    {daemonStats && <span>CPU {daemonStats.cpu}% · Load {daemonStats.load1}</span>}
+                    {daemonStats && <span>CPU {formatCpuPercent(daemonStats.cpu)} · Load {formatStatNumber(daemonStats.load1)}{isDaemonMainLoopBusy(daemonStats) ? ` · Busy ${Math.round(daemonStats.mainEventLoopBlockedMs ?? daemonStats.mainEventLoopLagMs ?? 0)}ms` : ''}</span>}
                   </span>
                   {daemonUpgrading && (
                     <span class="daemon-upgrading-badge" title={daemonUpgradingLabel(daemonUpgrading, trans, formatDaemonVersionShort)}>
@@ -6002,15 +7557,8 @@ export function App() {
                       {daemonUpgradingLabel(daemonUpgrading, trans, formatDaemonVersionShort)}
                     </span>
                   )}
-                  <DaemonRemoteDesktopControl
-                    ws={wsRef.current}
-                    serverId={selectedServerId}
-                    serverName={selectedServerInfo?.name}
-                    daemonOnline={daemonOnline}
-                    onOpen={openRemoteDesktop}
-                  />
                   <button
-                    style={{ fontSize: 10, color: '#38bdf8', background: 'none', border: '1px solid #334155', borderRadius: 4, padding: '1px 5px', cursor: 'pointer' }}
+                    class="mobile-sidebar-watch-sync"
                     onClick={async () => {
                       try {
                         const snapshot = watchProjectionStore.getSnapshot();
@@ -6055,6 +7603,7 @@ export function App() {
           <Suspense fallback={<div style={{ textAlign: 'center', padding: 48, color: '#64748b' }}>Loading...</div>}>
             <DiscussionsPage
               ws={wsRef.current}
+              serverId={selectedServerId}
               onBack={() => { setShowDiscussionsPage(false); setDiscussionInitialId(null); setDiscussionInitialTab('team'); }}
               initialSelectedId={discussionInitialId}
               initialTab={discussionInitialTab}
@@ -6102,7 +7651,7 @@ export function App() {
           )}
           onFocus={() => bringDesktopWindowToFront(repoPanelDesktopWindowId)}
         >
-          <RepoPage ws={wsRef.current} sessionId={repoPanelSessionId} projectDir={repoPanelProjectDir} scopeToSessionRoot={!!sharedAccessRole} readOnly={sharedAccessRole === 'viewer'} initialTab={repoPanelTarget?.initialTab} initialTabToken={repoPanelTarget?.initialTabToken} onBack={() => setShowRepoPage(false)} onCiEvent={(run) => {
+          <RepoPage ws={wsRef.current} sessionId={repoPanelSessionId} projectDir={repoPanelProjectDir} scopeToSessionRoot={isTabShare} readOnly={sharedAccessRole === 'viewer'} initialTab={repoPanelTarget?.initialTab} initialTabToken={repoPanelTarget?.initialTabToken} onBack={() => setShowRepoPage(false)} onCiEvent={(run) => {
             const id = Date.now();
             const icon = run.status === 'success' ? '✅' : '❌';
             const failurePath = [run.failedJobName, run.failedStepName].filter(Boolean).join(' → ');
@@ -6266,7 +7815,7 @@ export function App() {
           />
         </FloatingPanel>
       )}
-      {showControlledNodes && (
+      {showControlledNodes && !mobileRemoteSurfaceActive && (
         <FloatingPanel
           id="controlled-nodes"
           title={trans('controlled_nodes.title')}
@@ -6279,31 +7828,73 @@ export function App() {
         >
           <ControlledNodesPanel
             onOpenRemoteDesktop={openRemoteDesktop}
+            onOpenRemoteDesktopWall={openRemoteDesktopWall}
+            onConnectById={openRemoteDesktopById}
+            projectKey={activeSessionInfo?.contextNamespace?.projectId || activeSessionInfo?.project}
+            initialNodeId={aideskManagementNodeId ?? undefined}
+            initialAction={aideskManagementAction}
+            remoteDesktopManager={remoteDesktopConnectionManager}
           />
         </FloatingPanel>
       )}
 
-      {remoteDesktopMachine && (
-        <RemoteDesktopPanel
-          key={remoteDesktopMachine.serverId}
-          machine={remoteDesktopMachine}
+      {remoteDesktopWorkspace.open && (
+        <RemoteDesktopWorkspace
+          state={remoteDesktopWorkspace}
+          manager={remoteDesktopConnectionManager}
+          quickData={quickData}
           ws={wsRef.current}
-          minimized={remoteDesktopMinimized}
-          allowStandaloneWindow={!isMobile}
+          minimized={remoteDesktopWorkspaceMinimized}
           zIndex={getDesktopWindowZIndex(
-            DESKTOP_WINDOW_IDS.remoteDesktop(remoteDesktopMachine.serverId),
-            5110,
+            REMOTE_DESKTOP_WORKSPACE_WINDOW_ID,
+            isMobile ? 7000 : 5110,
           )}
           onFocus={() => bringDesktopWindowToFront(
-            DESKTOP_WINDOW_IDS.remoteDesktop(remoteDesktopMachine.serverId),
+            REMOTE_DESKTOP_WORKSPACE_WINDOW_ID,
           )}
-          onMinimize={() => setRemoteDesktopMinimized(true)}
-          onRestore={() => setRemoteDesktopMinimized(false)}
-          onClose={() => {
-            removeDesktopWindow(DESKTOP_WINDOW_IDS.remoteDesktop(remoteDesktopMachine.serverId));
-            setRemoteDesktopMachine(null);
-            setRemoteDesktopMinimized(false);
+          // A popup on a phone either never opens or opens as a tab with no
+          // way back, so the tear-off action is desktop-only.
+          allowStandaloneWindow={!isMobile}
+          onOpenHost={openRemoteDesktop}
+          onActivateTab={(tabId) => setRemoteDesktopWorkspace((current) => (
+            activateRemoteDesktopWorkspaceTab(current, tabId)
+          ))}
+          onCloseHost={(hostKey) => setRemoteDesktopWorkspace((current) => {
+            const next = closeRemoteDesktopWorkspaceHost(current, hostKey);
+            if (!next.open) {
+              setRemoteDesktopWorkspaceMinimized(false);
+              removeDesktopWindow(REMOTE_DESKTOP_WORKSPACE_WINDOW_ID);
+            }
+            return next;
+          })}
+          onReorderHost={(hostKey, direction) => setRemoteDesktopWorkspace((current) => (
+            reorderRemoteDesktopWorkspaceHost(current, hostKey, direction)
+          ))}
+          onMinimize={() => setRemoteDesktopWorkspaceMinimized(true)}
+          onRestore={() => setRemoteDesktopWorkspaceMinimized(false)}
+          onCloseWorkspace={() => {
+            removeDesktopWindow(REMOTE_DESKTOP_WORKSPACE_WINDOW_ID);
+            setRemoteDesktopWorkspace((current) => closeRemoteDesktopWorkspace(current));
+            setRemoteDesktopWorkspaceMinimized(false);
           }}
+          wallHostKeys={new Set(remoteDesktopWallHostKeys)}
+        />
+      )}
+
+      {remoteDesktopWallOpen && (
+        <RemoteDesktopWall
+          manager={remoteDesktopConnectionManager}
+          retainedHostKeys={new Set(remoteDesktopWorkspace.orderedHostKeys)}
+          minimized={remoteDesktopWallMinimized}
+          zIndex={getDesktopWindowZIndex(DESKTOP_WINDOW_IDS.remoteDesktopWall, isMobile ? 7000 : 5105)}
+          onFocus={() => bringDesktopWindowToFront(DESKTOP_WINDOW_IDS.remoteDesktopWall)}
+          onMinimize={() => setRemoteDesktopWallMinimized(true)}
+          onRestore={() => setRemoteDesktopWallMinimized(false)}
+          onOpenStandalone={openRemoteDesktopWallStandalone}
+          onConnectById={openRemoteDesktopById}
+          onOpenHost={openRemoteDesktop}
+          onHostKeysChange={setRemoteDesktopWallHostKeys}
+          onClose={closeRemoteDesktopWall}
         />
       )}
 
@@ -6336,7 +7927,14 @@ export function App() {
       )}
 
       {showAdminPage && (
-        <div style={{ position: 'fixed', inset: 0, zIndex: 9999, background: '#0a0e1a', paddingTop: 'var(--sat, 0px)' }}>
+        <div
+          data-testid="admin-page-overlay"
+          style={{
+            position: 'fixed', inset: 0, zIndex: 9999, display: 'flex', flexDirection: 'column',
+            width: '100%', height: '100dvh', minHeight: 0, boxSizing: 'border-box',
+            background: '#0a0e1a', paddingTop: 'var(--sat, 0px)', overflow: 'hidden',
+          }}
+        >
           <AdminPage onBack={() => setShowAdminPage(false)} />
         </div>
       )}
@@ -6415,6 +8013,7 @@ export function App() {
       {showNewSession && (
         <NewSessionDialog
           ws={wsRef.current}
+          serverId={selectedServerId ?? ''}
           onClose={() => setShowNewSession(false)}
           onSessionStarted={(name) => { setActiveSession(name); setShowNewSession(false); }}
           isProviderConnected={isProviderConnected}
@@ -6431,14 +8030,23 @@ export function App() {
       )}
 
       {/* Sub-session windows (floating) — only show if not pinned */}
-      {openWindowSubs.slice(0, mountedWindowCount).map((sub) => {
+      {retainedWindowSubs.slice(0, mountedWindowCount).map((sub) => {
+        const windowVisible = visibleOpenWindowIds.has(sub.id) && !mobileRemoteSurfaceActive;
         return (
-          <div key={sub.id} style={{ display: 'contents' }}>
+          <div
+            key={sub.id}
+            data-subsession-retained={sub.id}
+            style={{ display: windowVisible ? 'contents' : 'none' }}
+          >
             <SubSessionWindow
               sub={sub}
               ws={wsRef.current}
               connected={connected}
-              active={isMobile || focusedSubId === sub.id}
+              daemonOnline={daemonOnline}
+              onOpenRemoteDesktop={openRemoteDesktop}
+              remoteDesktopCanSetUp={!selectedShareTarget}
+              active={windowVisible && (isMobile || focusedSubId === sub.id)}
+              visible={windowVisible}
               onPendingQuestion={surfaceAskQuestionFromHistory}
               idleFlashToken={idleFlashTokens.get(sub.sessionName) ?? 0}
               onDiff={registerDiffApplyer}
@@ -6461,8 +8069,8 @@ export function App() {
                 const label = prompt('Rename sub-session:', sub.label ?? '');
                 if (label !== null) renameSubSession(sub.id, label);
               }}
-              onSettings={(openIntent) => setSettingsTarget({ sessionName: sub.sessionName, sessionInstanceId: sub.sessionInstanceId ?? undefined, runtimeEpoch: sub.runtimeEpoch ?? undefined, activeModel: sub.activeModel, requestedModel: sub.requestedModel, providerId: sub.providerId, subId: sub.id, label: sub.label || '', description: sub.description || '', cwd: sub.cwd || '', type: sub.type, parentSession: sub.parentSession, transportConfig: sub.transportConfig ?? null, openIntent })}
-              onShareSession={openShareDialogForSession}
+              onSettings={(openIntent) => setSettingsTarget({ sessionName: sub.sessionName, sessionInstanceId: sub.sessionInstanceId ?? undefined, runtimeEpoch: sub.runtimeEpoch ?? undefined, activeModel: sub.activeModel, requestedModel: sub.requestedModel, modelDisplay: sub.modelDisplay, providerId: sub.providerId, subId: sub.id, label: sub.label || '', description: sub.description || '', cwd: sub.cwd || '', type: sub.type, parentSession: sub.parentSession, transportConfig: sub.transportConfig ?? null, supervisionMode: sub.supervisionMode ?? null, openIntent, canControlAutomaticSupervision: false })}
+              onShareSession={selectedShareTarget ? undefined : openShareDialogForSession}
               onViewRepo={() => openRepoPage({ sessionId: sub.sessionName, projectDir: sub.cwd, initialTab: 'branches', parentSubId: sub.id })}
               onTransportConfigSaved={(transportConfig) => updateSubLocal(sub.id, { transportConfig })}
               onPreviewFile={(request) => handlePreviewFileRequest({ ...request, sourcePreviewLive: false })}
@@ -6526,14 +8134,49 @@ export function App() {
         <AskQuestionDialog
           pending={pendingQuestion}
           onSubmit={(answer) => {
+            const sent = wsRef.current?.askAnswer(
+              pendingQuestion.sessionName,
+              answer,
+              { toolUseId: pendingQuestion.toolUseId },
+            );
+            if (sent && !sent.ok) {
+              // Nothing left the browser: keep the card (and the user's
+              // selections) open instead of dismissing it as if answered.
+              const toastId = Date.now() + Math.random();
+              setToasts((prev) => [...prev, {
+                id: toastId,
+                kind: 'notification',
+                title: trans(sent.reason === 'too_large' ? 'askQuestion.answerTooLarge' : 'askQuestion.answerNotSent'),
+              }]);
+              setTimeout(() => setToasts((prev) => prev.filter((x) => x.id !== toastId)), 8000);
+              return;
+            }
+            if (sent?.commandId) {
+              askAnswerTrackerRef.current?.track({
+                commandId: sent.commandId,
+                sessionName: pendingQuestion.sessionName,
+                toolUseId: pendingQuestion.toolUseId,
+                answer,
+              });
+            }
             dismissedQuestionsRef.current.add(pendingQuestion.toolUseId);
-            wsRef.current?.askAnswer(pendingQuestion.sessionName, answer);
             setPendingQuestion(null);
           }}
           onDismiss={() => {
             dismissedQuestionsRef.current.add(pendingQuestion.toolUseId);
             setPendingQuestion(null);
           }}
+        />
+      )}
+
+      {askAnswerFailure && (
+        <AskAnswerFailedDialog
+          failure={askAnswerFailure}
+          onSendAsMessage={(answer) => {
+            wsRef.current?.sendSessionMessage(askAnswerFailure.sessionName, answer);
+            setAskAnswerFailure(null);
+          }}
+          onDismiss={() => setAskAnswerFailure(null)}
         />
       )}
 
@@ -6549,6 +8192,17 @@ export function App() {
         />
       )}
 
+      {daemonUpgradeConfirmTarget && (
+        <DaemonUpgradeConfirmDialog
+          busySessions={busyDaemonSessionCount}
+          targetCount={daemonUpgradeConfirmTarget === 'all' ? servers.length : 1}
+          blockedReason={daemonUpgradeConfirmTarget === 'all' ? null : daemonUpgradeConfirmBlocked.reason}
+          blockedSessionNames={daemonUpgradeConfirmBlocked.sessionNames}
+          onCancel={() => setDaemonUpgradeConfirmTarget(null)}
+          onConfirm={() => void confirmDaemonUpgrade()}
+        />
+      )}
+
       {deleteTarget && (
         <DeleteServerDialog
           serverName={deleteTarget.name}
@@ -6561,24 +8215,44 @@ export function App() {
         <StartSubSessionDialog
           ws={wsRef.current}
           defaultCwd={activeSessionInfo?.projectDir}
+          allowedAgentTypes={poolAddTarget ? getSupportedSupervisionBackendOptions() : undefined}
+          overlayClassName={poolAddTarget ? 'session-settings-child-overlay' : undefined}
           isProviderConnected={isProviderConnected}
           getRemoteSessions={getRemoteSessions}
           refreshSessions={refreshSessions}
           onToast={showSuccessToast}
           onStart={async (type, shellBin, cwd, label, extra) => {
             setShowSubDialog(false);
-            const sub = await createSubSession(type, shellBin, cwd, label, extra);
-            if (sub) {
-              setOpenSubIds((prev) => new Set([...prev, sub.id]));
-              bringSubToFront(sub.id);
+            setPoolAddTarget(null);
+            const { launchCount, ...cleanExtra } = extra ?? {};
+            const count = typeof launchCount === 'number' && launchCount > 1 ? launchCount : 1;
+            const passedExtra = Object.keys(cleanExtra).length > 0 ? cleanExtra : undefined;
+            // A single launch keeps the existing auto-generated label exactly as
+            // before (create() derives it). A multi-launch pre-computes every
+            // label up front instead of relying on create()'s own duplicate-label
+            // suffixing, which reads subSessions from this closure and would see
+            // the SAME stale list (and mint the SAME suffix) for every iteration.
+            const siblings = subSessions.filter((s) => s.parentSession === activeSession);
+            const iterationLabels = computeAutoLaunchLabels(siblings, type, label, count);
+            for (const iterationLabel of iterationLabels) {
+              const sub = await createSubSession(type, shellBin, cwd, iterationLabel, passedExtra);
+              if (sub) {
+                setOpenSubIds((prev) => new Set([...prev, sub.id]));
+                bringSubToFront(sub.id);
+              }
             }
           }}
-          onClose={() => setShowSubDialog(false)}
+          onClose={() => {
+            setShowSubDialog(false);
+            setPoolAddTarget(null);
+          }}
         />
       )}
 
-      {settingsTarget && selectedServerId && (
+      {settingsTarget && selectedServerId && (() => {
+        return (
         <SessionSettingsDialog
+          surface={settingsTarget.openIntent?.surface === 'supervision' ? 'supervision' : 'session'}
           serverId={selectedServerId}
           sessionName={settingsTarget.sessionName}
           subSessionId={settingsTarget.subId}
@@ -6587,13 +8261,22 @@ export function App() {
           cwd={settingsTarget.cwd}
           type={settingsTarget.type}
           parentSession={settingsTarget.parentSession}
+          canControlAutomaticSupervision={settingsTarget.canControlAutomaticSupervision}
           transportConfig={settingsTarget.transportConfig}
+          supervisionMode={settingsTarget.supervisionMode}
           sessionInstanceId={settingsTarget.sessionInstanceId}
           runtimeEpoch={settingsTarget.runtimeEpoch}
           activeModel={settingsTarget.activeModel}
           requestedModel={settingsTarget.requestedModel}
+          modelDisplay={settingsTarget.modelDisplay}
           providerId={settingsTarget.providerId}
+          projectKey={settingsIdentityProjectKey(settingsTarget, sessions, subSessions)}
           peerAuditSessions={peerAuditSettingsSessions}
+          poolSessionDialogOpen={poolAddTarget != null}
+          onAddPoolSession={canCreateSubSession ? (pool) => {
+            setPoolAddTarget(pool);
+            setShowSubDialog(true);
+          } : undefined}
           openIntent={settingsTarget.openIntent}
           ws={wsRef.current}
           onClose={() => setSettingsTarget(null)}
@@ -6607,6 +8290,9 @@ export function App() {
                 description: fields.description !== undefined ? (fields.description ?? null) : undefined,
                 cwd: fields.cwd !== undefined ? (fields.cwd ?? null) : undefined,
                 transportConfig: fields.transportConfig !== undefined ? fields.transportConfig : undefined,
+                requestedModel: fields.requestedModel,
+                activeModel: fields.activeModel,
+                modelDisplay: fields.modelDisplay,
               });
             } else {
               // Main session: update sessions list with saved fields
@@ -6621,12 +8307,16 @@ export function App() {
                 if (fields.description !== undefined) updated.description = fields.description ?? null;
                 if (fields.cwd !== undefined) updated.projectDir = fields.cwd ?? updated.projectDir;
                 if (fields.transportConfig !== undefined) updated.transportConfig = fields.transportConfig;
+                if (fields.requestedModel !== undefined) updated.requestedModel = fields.requestedModel;
+                if (fields.activeModel !== undefined) updated.activeModel = fields.activeModel;
+                if (fields.modelDisplay !== undefined) updated.modelDisplay = fields.modelDisplay;
                 return updated;
               }));
             }
           }}
         />
-      )}
+        );
+      })()}
 
       {cloneSessionTarget && selectedServerId && (
         <CloneSessionGroupDialog
@@ -6732,6 +8422,10 @@ export function App() {
       )}
 
       <DownloadTransferCenter />
+
+      <CapabilityOperationNotice serverId={selectedServerId} />
+
+      <RemoteDesktopWindowBlockedNotice />
 
       {/* Toasts: idle completions + CC notifications */}
       {toasts.length > 0 && (

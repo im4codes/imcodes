@@ -2,19 +2,51 @@ import { execSync, spawn } from 'node:child_process';
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
+import {
+  WINDOWS_DAEMON_LOCK_PIPE,
+  resolveImcodesHome,
+  resolveWindowsDefaultHome,
+  windowsDaemonLockPipeName,
+} from './windows-daemon-lock.js';
+import {
+  parseDaemonProcessListing,
+  parseWatchdogProcessListing,
+  watchdogCommandLineMatchesHome as sharedWatchdogCommandLineMatchesHome,
+  windowsTaskName,
+} from './windows-daemon-watchdog.mjs';
+import {
+  isRecordedProcessIdentityCurrent,
+  readInstanceLockMetadata,
+} from '../daemon/instance-lock.js';
 
-const WINDOWS_DAEMON_TASK = 'imcodes-daemon';
 const WINDOWS_COMMAND_TIMEOUT_MS = 15_000;
 
 function readDaemonPid(currentPid?: number): number | null {
-  const pidFile = resolve(homedir(), '.imcodes', 'daemon.pid');
+  const pidFile = resolve(resolveImcodesHome(), 'daemon.pid');
   try {
     const pid = parseInt(readFileSync(pidFile, 'utf8').trim(), 10);
     if (!pid || pid <= 0 || pid === currentPid) return null;
+    // A stale custom-home pid can be reused by another isolated daemon.  Do
+    // not taskkill by number alone: bind it to this HOME's lock metadata and
+    // verify the recorded process start identity before returning it.
+    if (isHomeScopedInstance()) {
+      const metadata = readInstanceLockMetadata();
+      if (!metadata || metadata.pid !== pid
+        || metadata.socketPath !== windowsDaemonLockPipeName()
+        || !isRecordedProcessIdentityCurrent(metadata)) return null;
+    }
     return pid;
   } catch {
     return null;
   }
+}
+
+function isHomeScopedInstance(): boolean {
+  return windowsDaemonLockPipeName() !== WINDOWS_DAEMON_LOCK_PIPE;
+}
+
+function daemonTaskName(): string {
+  return windowsTaskName('daemon', resolveImcodesHome(), defaultStateHome());
 }
 
 function isPidAlive(pid: number): boolean {
@@ -49,7 +81,8 @@ function sleepMs(ms: number): void {
  *  This function is best-effort: it logs nothing and swallows all errors. */
 export function killAllStaleWatchdogs(): void {
   if (process.platform !== 'win32') return;
-  const pids = findStaleWatchdogPids();
+  // Match the exact canonical artifact for both default and scoped homes.
+  const pids = findStaleWatchdogPids(resolveImcodesHome());
   for (const pid of pids) {
     try {
       // `/T` has hung indefinitely on real Task Scheduler VBS -> CMD -> Node
@@ -72,8 +105,14 @@ export function killAllStaleWatchdogs(): void {
  *  (e.g. inside a Filter clause), cmd.exe→powershell command-line parsing
  *  closes the outer quote prematurely and the script becomes truncated.
  *  This was the root cause of the CI failure. */
-function findStaleWatchdogPids(): number[] {
+export function watchdogCommandLineMatchesHome(commandLine: string, stateHome: string): boolean {
+  return sharedWatchdogCommandLineMatchesHome(commandLine, stateHome, defaultStateHome());
+}
+
+function findStaleWatchdogPids(stateHome?: string): number[] {
   const pids = new Set<number>();
+  const currentHome = stateHome ?? resolveImcodesHome();
+  const defaultHome = defaultStateHome();
   // ── PowerShell path (works on every Windows since 7) ────────────────────
   let scriptDir: string | null = null;
   try {
@@ -85,8 +124,8 @@ function findStaleWatchdogPids(): number[] {
     writeFileSync(
       scriptPath,
       "Get-CimInstance Win32_Process -Filter \"Name='cmd.exe'\" | " +
-        "Where-Object { $_.CommandLine -like '*daemon-watchdog*' } | " +
-        "ForEach-Object { $_.ProcessId }\r\n",
+      "Where-Object { $_.CommandLine -like '*daemon-watchdog*' } | " +
+        "ForEach-Object { \"$($_.ProcessId)`t$($_.CommandLine)\" }\r\n",
     );
     const out = execSync(
       `powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "${scriptPath}"`,
@@ -95,10 +134,7 @@ function findStaleWatchdogPids(): number[] {
         timeout: WINDOWS_COMMAND_TIMEOUT_MS, killSignal: 'SIGKILL',
       },
     );
-    for (const line of out.split(/\r?\n/)) {
-      const pid = parseInt(line.trim(), 10);
-      if (Number.isFinite(pid) && pid > 0) pids.add(pid);
-    }
+    for (const pid of parseWatchdogProcessListing(out, currentHome, defaultHome)) pids.add(pid);
   } catch { /* fall through to wmic */ } finally {
     if (scriptDir) {
       try { rmSync(scriptDir, { recursive: true, force: true }); } catch { /* ignore */ }
@@ -106,29 +142,30 @@ function findStaleWatchdogPids(): number[] {
   }
   if (pids.size > 0) return [...pids];
   // ── Legacy wmic path ────────────────────────────────────────────────────
+  // A verified metadata PID is authoritative; avoid an expensive process
+  // scan in that common scoped-restart path.  The command-line fallback is
+  // only needed when metadata is absent/stale (or for default legacy recovery).
   try {
     const out = execSync(
-      'wmic process where "Name=\'cmd.exe\' and CommandLine like \'%daemon-watchdog%\'" get ProcessId /format:list',
+      `wmic process where "Name='cmd.exe' and CommandLine like '%daemon-watchdog%'" get ProcessId,CommandLine /format:list`,
       {
         encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true,
         timeout: WINDOWS_COMMAND_TIMEOUT_MS, killSignal: 'SIGKILL',
       },
     );
-    for (const line of out.split(/\r?\n/)) {
-      const m = line.match(/^ProcessId=(\d+)/);
-      if (m) {
-        const pid = parseInt(m[1], 10);
-        if (Number.isFinite(pid) && pid > 0) pids.add(pid);
-      }
-    }
+    for (const pid of parseWatchdogProcessListing(out, currentHome, defaultHome)) pids.add(pid);
   } catch { /* both methods failed */ }
   return [...pids];
+}
+
+function defaultStateHome(): string {
+  return resolveWindowsDefaultHome();
 }
 
 // ── Launcher methods (all hidden — no visible windows) ──────────────────────
 
 function tryStartVbsLauncher(): boolean {
-  const vbs = resolve(homedir(), '.imcodes', 'daemon-launcher.vbs');
+  const vbs = resolve(resolveImcodesHome(), 'daemon-launcher.vbs');
   if (!existsSync(vbs)) return false;
   spawn('wscript', [vbs], { detached: true, stdio: 'ignore', windowsHide: true }).unref();
   return true;
@@ -136,7 +173,7 @@ function tryStartVbsLauncher(): boolean {
 
 function tryStartScheduledTask(): boolean {
   try {
-    execSync(`schtasks /Run /TN ${WINDOWS_DAEMON_TASK}`, {
+    execSync(`schtasks /Run /TN ${daemonTaskName()}`, {
       stdio: 'ignore', windowsHide: true,
       timeout: WINDOWS_COMMAND_TIMEOUT_MS, killSignal: 'SIGKILL',
     });
@@ -147,6 +184,7 @@ function tryStartScheduledTask(): boolean {
 }
 
 function tryStartStartupShortcut(): boolean {
+  if (isHomeScopedInstance()) return false;
   const startupCmd = resolve(
     homedir(),
     'AppData',
@@ -184,7 +222,7 @@ function tryStartStartupShortcut(): boolean {
  *  weird ACL, fall back to PowerShell `Remove-Item -Force`. */
 function clearUpgradeLock(): boolean {
   if (process.platform !== 'win32') return false;
-  const lockPath = resolve(homedir(), '.imcodes', 'upgrade.lock');
+  const lockPath = resolve(resolveImcodesHome(), 'upgrade.lock');
   if (!existsSync(lockPath)) return false;
   try {
     rmSync(lockPath, { force: true });
@@ -269,8 +307,14 @@ export function restartWindowsDaemon(currentPid?: number): boolean {
   return false;
 }
 
+/** PowerShell `-like` pattern for daemon node.exe command lines. `-like` treats
+ *  backslash literally (only `` ` `` escapes), so this must contain SINGLE
+ *  backslashes: a doubled `\\` pattern never matches a real Windows path. */
+export const DAEMON_PROCESS_LIKE_PATTERN = '*node_modules\\imcodes\\dist*';
+
 /** Forcefully kill any node.exe process that is listening on the imcodes
- *  daemon's named pipe (`\\.\pipe\imcodes-daemon-lock`).  This handles the
+ *  daemon's home-scoped named pipe (the default is
+ *  `windowsDaemonLockPipeName()`).  This handles the
  *  edge case where an orphan daemon survives `taskkill` because it was
  *  spawned with elevated privileges.  We use `wmic process delete` (the
  *  one method that works against permission-denied targets in our test
@@ -283,29 +327,37 @@ export function restartWindowsDaemon(currentPid?: number): boolean {
  *  Returns true if at least one orphan was killed. */
 export function killOrphanDaemonProcesses(): boolean {
   if (process.platform !== 'win32') return false;
-  let killed = false;
+  const currentHome = resolveImcodesHome();
+  const defaultHome = defaultStateHome();
+  const lockPipeName = windowsDaemonLockPipeName();
+  const candidatePids = new Set<number>();
+
+  // Lock metadata is the authoritative identity for the current instance and
+  // works even when an older launcher does not expose IMCODES_HOME in its
+  // command line.  Verify both the pipe and process-start token before using
+  // the PID; never taskkill a reused PID.
+  const metadata = readInstanceLockMetadata();
+  if (metadata && metadata.socketPath === lockPipeName
+    && isRecordedProcessIdentityCurrent(metadata)
+    && metadata.pid !== process.pid) {
+    candidatePids.add(metadata.pid);
+  }
+
+  // Also inspect command lines so recovery can find an orphan whose metadata
+  // file was lost.  The shared home matcher is deliberately strict: a daemon
+  // is killable only when its command line names this canonical state home.
+  // There is no default-home no-path exception for daemons (only watchdogs
+  // have that legacy compatibility escape hatch).
   let scriptDir: string | null = null;
-  try {
-    // Find every node.exe process whose command line references imcodes
-    // (covers `node imcodes/dist/src/index.js`, the npm shim, etc.)
+  if (candidatePids.size === 0) try {
     scriptDir = mkdtempSync(join(tmpdir(), 'imcodes-orphan-query-'));
     const scriptPath = join(scriptDir, 'find-orphans.ps1');
-    // CRITICAL: filter must be SPECIFIC to the daemon entry point, not just
-    // any process with "imcodes" in its command line.  The repo working
-    // directory itself contains "imcodes" (C:\Users\X\imcodes-src) so a
-    // loose `*imcodes*` filter would kill the test runner itself.
-    //
-    // The npm-installed imcodes daemon always runs as one of:
-    //   "C:\Program Files\nodejs\node.exe" "<npm root>\node_modules\imcodes\dist\src\index.js"
-    //   "C:\Users\<user>\AppData\Roaming\npm\imcodes.cmd" start --foreground
-    //
-    // We match the substring "node_modules\imcodes\dist" which appears in
-    // both cases (the .cmd shim resolves to the dist path internally).
     writeFileSync(
       scriptPath,
-      "Get-CimInstance Win32_Process -Filter \"Name='node.exe'\" | " +
-        "Where-Object { $_.CommandLine -like '*node_modules\\imcodes\\dist*' } | " +
-        "ForEach-Object { $_.ProcessId }\r\n",
+      `# instance-lock-pipe: ${lockPipeName}\r\n` +
+        "Get-CimInstance Win32_Process -Filter \"Name='node.exe'\" | " +
+        `Where-Object { $_.CommandLine -like '${DAEMON_PROCESS_LIKE_PATTERN}' } | ` +
+        "ForEach-Object { \"$($_.ProcessId)`t$($_.CommandLine)\" }\r\n",
     );
     const out = execSync(
       `powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "${scriptPath}"`,
@@ -314,45 +366,41 @@ export function killOrphanDaemonProcesses(): boolean {
         timeout: WINDOWS_COMMAND_TIMEOUT_MS, killSignal: 'SIGKILL',
       },
     );
-    const orphanPids = out
-      .split(/\r?\n/)
-      .map((line) => parseInt(line.trim(), 10))
-      .filter((pid) => Number.isFinite(pid) && pid > 0 && pid !== process.pid);
-
-    for (const pid of orphanPids) {
-      // Try taskkill first (fast path).  Always pass windowsHide so no
-      // console window flashes during the kill chain.
-      try {
-        execSync(`taskkill /f /pid ${pid}`, {
-          stdio: 'ignore', windowsHide: true,
-          timeout: WINDOWS_COMMAND_TIMEOUT_MS, killSignal: 'SIGKILL',
-        });
-        if (!isPidAlive(pid)) { killed = true; continue; }
-      } catch { /* try next method */ }
-      // Fallback: wmic delete (works against access-denied targets in some cases)
-      try {
-        execSync(`wmic process where ProcessId=${pid} delete`, {
-          stdio: 'ignore', windowsHide: true,
-          timeout: WINDOWS_COMMAND_TIMEOUT_MS, killSignal: 'SIGKILL',
-        });
-        if (!isPidAlive(pid)) { killed = true; continue; }
-      } catch { /* try next method */ }
-      // Last resort: PowerShell Stop-Process
-      try {
-        execSync(
-          `powershell -NoProfile -NonInteractive -WindowStyle Hidden -Command "Stop-Process -Id ${pid} -Force -ErrorAction SilentlyContinue"`,
-          {
-            stdio: 'ignore', windowsHide: true,
-            timeout: WINDOWS_COMMAND_TIMEOUT_MS, killSignal: 'SIGKILL',
-          },
-        );
-        if (!isPidAlive(pid)) { killed = true; }
-      } catch { /* gave up */ }
+    for (const pid of parseDaemonProcessListing(out, currentHome, defaultHome)) {
+      if (pid !== process.pid) candidatePids.add(pid);
     }
-  } catch { /* enumeration failed */ } finally {
+  } catch { /* enumeration failed; metadata path remains available */ } finally {
     if (scriptDir) {
       try { rmSync(scriptDir, { recursive: true, force: true }); } catch { /* ignore */ }
     }
+  }
+
+  let killed = false;
+  for (const pid of candidatePids) {
+    try {
+      execSync(`taskkill /f /pid ${pid}`, {
+        stdio: 'ignore', windowsHide: true,
+        timeout: WINDOWS_COMMAND_TIMEOUT_MS, killSignal: 'SIGKILL',
+      });
+      if (!isPidAlive(pid)) { killed = true; continue; }
+    } catch { /* try next method */ }
+    try {
+      execSync(`wmic process where ProcessId=${pid} delete`, {
+        stdio: 'ignore', windowsHide: true,
+        timeout: WINDOWS_COMMAND_TIMEOUT_MS, killSignal: 'SIGKILL',
+      });
+      if (!isPidAlive(pid)) { killed = true; continue; }
+    } catch { /* try PowerShell fallback */ }
+    try {
+      execSync(
+        `powershell -NoProfile -NonInteractive -WindowStyle Hidden -Command "Stop-Process -Id ${pid} -Force -ErrorAction SilentlyContinue"`,
+        {
+          stdio: 'ignore', windowsHide: true,
+          timeout: WINDOWS_COMMAND_TIMEOUT_MS, killSignal: 'SIGKILL',
+        },
+      );
+      if (!isPidAlive(pid)) killed = true;
+    } catch { /* gave up */ }
   }
   return killed;
 }

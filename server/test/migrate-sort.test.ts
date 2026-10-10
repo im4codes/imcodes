@@ -7,6 +7,7 @@ import { describe, it, expect } from 'vitest';
 import { readdir } from 'node:fs/promises';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { isMigrationFile } from '../src/db/migrate.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const MIGRATIONS_DIR = join(__dirname, '../src/db/migrations');
@@ -22,6 +23,13 @@ function sortMigrations(files: string[]): string[] {
 }
 
 describe('migration sort', () => {
+  it('ignores archive metadata and non-canonical names', () => {
+    expect(isMigrationFile('001_init.sql')).toBe(true);
+    expect(isMigrationFile('099_feature-name.sql')).toBe(true);
+    expect(isMigrationFile('._001_init.sql')).toBe(false);
+    expect(isMigrationFile('001_init.SQL')).toBe(false);
+    expect(isMigrationFile('migration.sql')).toBe(false);
+  });
   it('sorts 3-digit prefixed files in numeric order', () => {
     const files = ['010_foo.sql', '002_bar.sql', '001_init.sql', '035_baz.sql'];
     expect(sortMigrations(files)).toEqual([
@@ -44,6 +52,13 @@ describe('migration sort', () => {
     ]);
   });
 
+  it('retains different full filenames sharing a numeric prefix', () => {
+    const files = ['101_next.sql', '100_machine_execute.sql', '099_previous.sql', '100_user_sessions.sql'];
+    expect(sortMigrations(files)).toEqual([
+      '099_previous.sql', '100_machine_execute.sql', '100_user_sessions.sql', '101_next.sql',
+    ]);
+  });
+
   it('actual migration files are in numeric order', async () => {
     const files = (await readdir(MIGRATIONS_DIR)).filter((f) => f.endsWith('.sql'));
     const sorted = sortMigrations([...files]);
@@ -51,10 +66,12 @@ describe('migration sort', () => {
     // Verify sorted order matches numeric prefix sequence
     expect(sorted).toEqual(files.sort((a, b) => parseInt(a, 10) - parseInt(b, 10)));
 
-    // Verify no gaps or duplicates in prefix numbers
+    // The registry identifies migrations by FULL filename, not prefix.
+    // Independent migrations may share a prefix and must both remain present.
+    expect(new Set(sorted).size).toBe(sorted.length);
     const numbers = sorted.map((f) => parseInt(f, 10));
     for (let i = 1; i < numbers.length; i++) {
-      expect(numbers[i]).toBeGreaterThan(numbers[i - 1]);
+      expect(numbers[i]).toBeGreaterThanOrEqual(numbers[i - 1]);
     }
 
     // Verify first migration is 001

@@ -6,6 +6,8 @@ import {
   beginDownloadTransfer,
   canSaveDownloadTransfer,
   canRetryDownloadTransfer,
+  canPauseDownloadTransfer,
+  canResumeDownloadTransfer,
   cancelDownloadTransfer,
   completeDownloadTransfer,
   dismissDownloadTransfer,
@@ -13,6 +15,8 @@ import {
   getDownloadTransfers,
   reportDownloadTransferProgress,
   retryDownloadTransfer,
+  pauseDownloadTransfer,
+  resumeDownloadTransfer,
   saveDownloadTransfer,
   setDownloadTransferSave,
   setDownloadTransferRetry,
@@ -104,9 +108,54 @@ describe('download transfer store', () => {
       status: DOWNLOAD_TRANSFER_STATUS.COMPLETED,
       loadedBytes: 1_000,
       totalBytes: 1_000,
-      startedAt: 2_000,
+      startedAt: 1_000,
     });
     expect(canRetryDownloadTransfer(transfer.id)).toBe(false);
+  });
+
+  it('pauses and resumes from the durable prefix without resetting progress', async () => {
+    const transfer = beginDownloadTransfer('resume.iso', 1_000);
+    const retry = vi.fn(async (_signal: AbortSignal, resumeFromBytes?: number) => {
+      expect(resumeFromBytes).toBe(512);
+      reportDownloadTransferProgress(transfer.id, 512, 1_024, 3_000);
+      reportDownloadTransferProgress(transfer.id, 1_024, 1_024, 3_100);
+      completeDownloadTransfer(transfer.id, false, 3_100);
+    });
+    setDownloadTransferRetry(transfer.id, retry);
+    updateDownloadTransfer(transfer.id, DOWNLOAD_TRANSFER_ROUTE.DIRECT, DOWNLOAD_TRANSFER_STATUS.TRANSFERRING, 1_050);
+    reportDownloadTransferProgress(transfer.id, 512, 1_024, 1_200);
+
+    expect(canPauseDownloadTransfer(transfer.id)).toBe(true);
+    pauseDownloadTransfer(transfer.id, 1_300);
+    expect(getDownloadTransfers()[0]).toMatchObject({
+      status: DOWNLOAD_TRANSFER_STATUS.PAUSED,
+      loadedBytes: 512,
+      totalBytes: 1_024,
+    });
+    expect(canResumeDownloadTransfer(transfer.id)).toBe(true);
+
+    await resumeDownloadTransfer(transfer.id, 2_000);
+    expect(retry).toHaveBeenCalledOnce();
+    expect(getDownloadTransfers()[0]).toMatchObject({
+      status: DOWNLOAD_TRANSFER_STATUS.COMPLETED,
+      loadedBytes: 1_024,
+      startedAt: 1_000,
+    });
+  });
+
+  it('turns a silent transfer into a retryable failure after the stall bound', () => {
+    const transfer = beginDownloadTransfer('stalled.iso', 1_000);
+    setDownloadTransferRetry(transfer.id, vi.fn(async () => undefined));
+    updateDownloadTransfer(transfer.id, DOWNLOAD_TRANSFER_ROUTE.HTTP, DOWNLOAD_TRANSFER_STATUS.TRANSFERRING, 1_000);
+    reportDownloadTransferProgress(transfer.id, 128, 1_000, 1_000);
+
+    vi.advanceTimersByTime(30_500);
+    expect(getDownloadTransfers()[0]).toMatchObject({
+      status: DOWNLOAD_TRANSFER_STATUS.FAILED,
+      loadedBytes: 128,
+      totalBytes: 1_000,
+    });
+    expect(canRetryDownloadTransfer(transfer.id)).toBe(true);
   });
 
   it('retains downloaded bytes for an explicit save tap and completes only after it succeeds', async () => {

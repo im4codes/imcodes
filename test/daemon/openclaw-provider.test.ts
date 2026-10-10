@@ -36,6 +36,7 @@ function lastWs(): any {
 import { OpenClawProvider } from '../../src/agent/providers/openclaw.js';
 import type { ProviderError } from '../../src/agent/transport-provider.js';
 import type { AgentMessage, MessageDelta, ToolCallEvent } from '../../shared/agent-message.js';
+import { AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES } from '../../shared/agent-delegation.js';
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -107,6 +108,21 @@ describe('OpenClawProvider', () => {
     vi.useRealTimers();
   });
 
+  it('confirms Stop only for the captured run lifecycle, not receipt or another run terminal', async () => {
+    await connectProvider(provider);
+    emitAgentEvent({ runId: 'stop-run', key: 'agent:main', stream: 'lifecycle', data: { phase: 'start' } });
+    let settled = false;
+    const stopping = provider.cancelAndWait('agent___main').then(() => { settled = true; });
+    await Promise.resolve();
+    replyToLastRpc();
+    emitAgentEvent({ runId: 'foreign-run', key: 'agent:other', stream: 'lifecycle', data: { phase: 'end' } });
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    emitAgentEvent({ runId: 'stop-run', key: 'agent:main', stream: 'lifecycle', data: { phase: 'end' } });
+    await stopping;
+    expect(settled).toBe(true);
+  });
+
   // 1. Static properties
   it('has correct id, connectionMode, sessionOwnership, and capabilities', () => {
     expect(provider.id).toBe('openclaw');
@@ -122,6 +138,7 @@ describe('OpenClawProvider', () => {
       reasoningEffort: true,
       supportedEffortLevels: ['off', 'minimal', 'low', 'medium', 'high', 'adaptive'],
       contextSupport: 'full-normalized-context-injection',
+      activeDelegationNotification: AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.UNSUPPORTED,
       compact: {
         execution: 'unsupported',
         verified: true,
@@ -129,7 +146,15 @@ describe('OpenClawProvider', () => {
         cancellation: 'none',
         reason: 'Verified in this adapter/environment: OpenClaw exposes no compact RPC/command path here, and no local openclaw CLI is installed to test a provider slash command.',
       },
+      // No per-call veto and no per-session disable: refused for supervised work.
+      nativeAgentAdmission: 'unenforceable',
     });
+  });
+
+  it('does not expose a native active-turn notifier without active-only gateway admission', () => {
+    expect(provider.capabilities.activeDelegationNotification)
+      .toBe(AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.UNSUPPORTED);
+    expect(provider.notifyActiveDelegation).toBeUndefined();
   });
 
   // 2. Handshake flow
@@ -263,6 +288,7 @@ describe('OpenClawProvider', () => {
       expect(rpcFrame.params.message).toBe('Hello agent');
       expect(rpcFrame.params.thinking).toBe('off');
       expect(rpcFrame.params.idempotencyKey).toBeDefined();
+      expect(rpcFrame.params).not.toHaveProperty('queueMode');
 
       replyToLastRpc();
       await sendPromise;

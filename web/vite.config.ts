@@ -2,6 +2,7 @@ import { defineConfig } from 'vite';
 import preact from '@preact/preset-vite';
 import path from 'path';
 import { createHash } from 'node:crypto';
+import { remoteDesktopAppManifestPlugin } from './vite-plugin-remote-desktop-app';
 
 // VITE_REGION selects the regional push channel at compile time:
 //   - 'global' (default) — FCM on Android via @capacitor/push-notifications
@@ -16,6 +17,7 @@ const webBuildId = process.env.WEB_BUILD_ID
     .slice(0, 12);
 
 export default defineConfig(({ mode }) => ({
+  // Harness-only opt-in keeps production bundles unchanged while enabling CDP profile source mapping.
   define: {
     __BUILD_TIME__: JSON.stringify(buildTime),
     __WEB_BUILD_ID__: JSON.stringify(webBuildId),
@@ -23,6 +25,7 @@ export default defineConfig(({ mode }) => ({
   },
   plugins: [
     preact(),
+    remoteDesktopAppManifestPlugin(),
     {
       name: 'imcodes-app-build-manifest',
       generateBundle() {
@@ -55,9 +58,14 @@ export default defineConfig(({ mode }) => ({
       },
     },
   },
+  // The fixture preview is consumed from the compose network (the browser
+  // reaches it as `web:4300`). Vite rejects that hostname by default. Keep
+  // the explicit single-host allow-list rather than disabling host checks.
+  preview: { allowedHosts: ['web'] },
   build: {
     outDir: 'dist',
     target: 'es2020',
+    sourcemap: process.env.IMC_PERF_SOURCEMAP === '1',
     rollupOptions: {
       // Fixture harness entry is added ONLY for the dedicated fixtures build
       // (`vite build --mode fixtures`, see the `build:fixtures` npm script).

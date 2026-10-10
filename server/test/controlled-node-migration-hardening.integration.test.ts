@@ -17,12 +17,12 @@ import { createDatabase, type Database } from '../src/db/client.js';
 import { runMigrations } from '../src/db/migrate.js';
 import { createServer, createUser } from '../src/db/queries.js';
 import { NODE_ROLE } from '../../shared/remote-exec.js';
+import { generateControlledNodeId } from '../src/services/controlled-node-identity.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const migFile = (name: string) => join(__dirname, '..', 'src', 'db', 'migrations', name);
 const MIGRATION_056 = '056_controlled_node_v2_ticket_hash_hardening.sql';
 const MIGRATION_057 = '057_machine_exec_audit_immutable_server_ids.sql';
-const MIGRATION_058 = '058_controlled_node_exec_default_enabled.sql';
 const MIGRATION_059 = '059_controlled_node_reusable_installers.sql';
 const hex = (n: number) => randomBytes(n).toString('hex');
 
@@ -102,34 +102,43 @@ describe('059 reusable controlled-node installers', () => {
   });
 });
 
-describe('058 controlled-node execution default', () => {
-  it('defaults new server rows to executable without changing an existing explicit false', async () => {
+describe('100 controlled-node execution default (secure by default)', () => {
+  it('new server rows are NOT executable until their owner switches execution on; existing explicit values never change', async () => {
     const userId = `u_${hex(4)}`;
     await createUser(db, userId);
     const defaultedId = `ctl_default_${hex(6)}`;
+    const enabledId = `ctl_enabled_${hex(6)}`;
     const disabledId = `ctl_disabled_${hex(6)}`;
     await db.execute(
-      `INSERT INTO servers (id, user_id, name, token_hash, status, created_at, node_role)
-       VALUES ($1, $2, 'default-enabled', $3, 'offline', $4, $5)`,
-      [defaultedId, userId, hex(16), Date.now(), NODE_ROLE.CONTROLLED],
+      `INSERT INTO servers (id, user_id, name, token_hash, status, created_at, node_role, node_id)
+       VALUES ($1, $2, 'default', $3, 'offline', $4, $5, $6)`,
+      [defaultedId, userId, hex(16), Date.now(), NODE_ROLE.CONTROLLED, generateControlledNodeId()],
     );
-    await db.execute(
-      `INSERT INTO servers (id, user_id, name, token_hash, status, created_at, node_role, exec_enabled)
-       VALUES ($1, $2, 'explicitly-disabled', $3, 'offline', $4, $5, false)`,
-      [disabledId, userId, hex(16), Date.now(), NODE_ROLE.CONTROLLED],
-    );
+    for (const [id, value] of [[enabledId, true], [disabledId, false]] as const) {
+      await db.execute(
+        `INSERT INTO servers (id, user_id, name, token_hash, status, created_at, node_role, exec_enabled, node_id)
+         VALUES ($1, $2, 'explicit', $3, 'offline', $4, $5, $6, $7)`,
+        [id, userId, hex(16), Date.now(), NODE_ROLE.CONTROLLED, value, generateControlledNodeId()],
+      );
+    }
 
-    const sql = await readFile(migFile(MIGRATION_058), 'utf8');
+    // Applying the migration again changes no row (it only sets the column default).
+    const sql = await readFile(migFile('100_machine_execute_grant_and_audit.sql'), 'utf8');
     await db.execute(sql);
 
     const rows = await db.query<{ id: string; exec_enabled: boolean }>(
-      'SELECT id, exec_enabled FROM servers WHERE id IN ($1, $2) ORDER BY id',
-      [defaultedId, disabledId],
+      'SELECT id, exec_enabled FROM servers WHERE id IN ($1, $2, $3) ORDER BY id',
+      [defaultedId, enabledId, disabledId],
     );
     expect(new Map(rows.map((row) => [row.id, row.exec_enabled]))).toEqual(new Map([
-      [defaultedId, true],
+      [defaultedId, false],
+      [enabledId, true],
       [disabledId, false],
     ]));
+    // A share created before the grant existed means "no execute".
+    const shareColumn = await db.queryOne<{ column_default: string; is_nullable: string }>(
+      `SELECT column_default, is_nullable FROM information_schema.columns WHERE table_name = 'server_shares' AND column_name = 'exec_granted'`);
+    expect(shareColumn).toMatchObject({ column_default: 'false', is_nullable: 'NO' });
   });
 });
 

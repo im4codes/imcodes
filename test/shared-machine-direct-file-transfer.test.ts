@@ -33,6 +33,27 @@ function request() {
 }
 
 describe('machine direct file-transfer trust boundary', () => {
+  it('keeps connect and authenticated handshake windows viable at cross-region RTT', () => {
+    const crossRegionRttMs = 300;
+    expect(MACHINE_DIRECT_FILE_TRANSFER_LIMITS.CONNECT_TIMEOUT_MS).toBeGreaterThanOrEqual(8_000);
+    expect(MACHINE_DIRECT_FILE_TRANSFER_LIMITS.HANDSHAKE_TIMEOUT_MS).toBeGreaterThanOrEqual(8_000);
+    expect(Math.floor(MACHINE_DIRECT_FILE_TRANSFER_LIMITS.CONNECT_TIMEOUT_MS / crossRegionRttMs))
+      .toBeGreaterThanOrEqual(26);
+    expect(Math.floor(MACHINE_DIRECT_FILE_TRANSFER_LIMITS.HANDSHAKE_TIMEOUT_MS / crossRegionRttMs))
+      .toBeGreaterThanOrEqual(26);
+  });
+
+  it('uses a short control-start budget without imposing a total transfer cap', () => {
+    expect(MACHINE_DIRECT_FILE_TRANSFER_LIMITS.STALL_TIMEOUT_MS).toBe(30_000);
+    expect(MACHINE_DIRECT_FILE_TRANSFER_LIMITS.STALL_TIMEOUT_MS)
+      .toBeLessThan(MACHINE_DIRECT_FILE_TRANSFER_LIMITS.TRANSFER_TIMEOUT_MS);
+    // CONTROL_TIMEOUT_MS only covers the pre-progress handshake/lease. Once
+    // authenticated progress starts, the stall timer governs the transfer, so
+    // a multi-minute/large transfer is not cut off by the control budget.
+    expect(MACHINE_DIRECT_FILE_TRANSFER_LIMITS.CONTROL_TIMEOUT_MS)
+      .toBeLessThan(MACHINE_DIRECT_FILE_TRANSFER_LIMITS.TRANSFER_TIMEOUT_MS);
+  });
+
   it('refreshes authority from the receiving hop clock regardless of sender clock skew', () => {
     const receivedAt = Date.parse('2026-08-03T12:00:00.000Z');
     for (const expiresAt of [receivedAt - 30 * 86_400_000, receivedAt + 30 * 86_400_000]) {

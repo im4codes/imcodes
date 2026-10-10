@@ -30,7 +30,6 @@ export interface PendingPeerAudit {
   selectionIntent: PeerAuditSelectionIntent;
   startedAt: number;
   deadlineAt: number;
-  capabilityHash: string;
   dispatchId?: string;
   messageId?: string;
   queueEpoch?: string;

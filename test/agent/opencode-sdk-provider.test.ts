@@ -3,6 +3,10 @@ import {
   OpenCodeSdkProvider,
   openCodeSdkRuntimeHooks,
 } from '../../src/agent/providers/opencode-sdk.js';
+import {
+  IMCODES_MEMORY_MCP_LAUNCH_ARGS,
+  IMCODES_MEMORY_MCP_LAUNCH_COMMAND,
+} from '../../src/agent/providers/getDefaultMcpServers.js';
 import type { ProviderContextPayload } from '../../shared/context-types.js';
 import { MEMORY_MCP_STATUS } from '../../shared/memory-ws.js';
 import { PROVIDER_ERROR_CODES } from '../../src/agent/transport-provider.js';
@@ -130,6 +134,47 @@ describe('OpenCodeSdkProvider', () => {
     openCodeSdkRuntimeHooks.start = originalStart;
   });
 
+  it('confirms Stop on the captured provider-session idle, not abort ACK or another session idle', async () => {
+    const harness = createHarness();
+    openCodeSdkRuntimeHooks.start = vi.fn(async (options) => {
+      options.signal.addEventListener('abort', harness.queue.close, { once: true });
+      return { client: harness.client as any, server: harness.server };
+    });
+    const provider = new OpenCodeSdkProvider();
+    await provider.connect({});
+    const route = await provider.createSession({ sessionKey: 'route-stop-proof', cwd: '/tmp/project' });
+    await provider.send(route, 'foreground');
+    let settled = false;
+    const stopping = provider.cancelAndWait(route).then(() => { settled = true; });
+    await vi.waitFor(() => expect(harness.client.session.abort).toHaveBeenCalledOnce());
+    harness.queue.push({ type: 'session.idle', properties: { sessionID: 'unrelated-session' } });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(settled).toBe(false);
+    harness.queue.push({ type: 'session.idle', properties: { sessionID: 'oc-session-1' } });
+    await stopping;
+    expect(settled).toBe(true);
+    await provider.disconnect();
+  });
+
+  it('does not confirm an old Stop with a new run idle on the same provider session', async () => {
+    const harness = createHarness();
+    openCodeSdkRuntimeHooks.start = vi.fn(async (options) => {
+      options.signal.addEventListener('abort', harness.queue.close, { once: true });
+      return { client: harness.client as any, server: harness.server };
+    });
+    const provider = new OpenCodeSdkProvider();
+    await provider.connect({});
+    const route = await provider.createSession({ sessionKey: 'route-stop-next-run', cwd: process.cwd() });
+    await provider.send(route, 'old foreground');
+    const stopping = provider.cancelAndWait(route);
+    const rejected = expect(stopping).rejects.toThrow('instance changed');
+    await vi.waitFor(() => expect(harness.client.session.abort).toHaveBeenCalledOnce());
+    await provider.send(route, 'independent new foreground');
+    harness.queue.push({ type: 'session.idle', properties: { sessionID: 'oc-session-1' } });
+    await rejected;
+    await provider.disconnect();
+  });
+
   it('steers a correlated delegation completion through the OpenCode v2 session client', async () => {
     const harness = createHarness();
     openCodeSdkRuntimeHooks.start = vi.fn(async (options) => {
@@ -161,6 +206,39 @@ describe('OpenCodeSdkProvider', () => {
       resume: true,
     }, { throwOnError: true });
     expect(harness.client.session.abort).not.toHaveBeenCalled();
+    await provider.disconnect();
+  });
+
+  it('does not replay a steer whose provider ACK races with session idle', async () => {
+    const harness = createHarness();
+    const steerAck = deferred<{ data: { accepted: boolean }; response: { status: number } }>();
+    harness.client.notificationSession.prompt.mockImplementationOnce(() => steerAck.promise);
+    openCodeSdkRuntimeHooks.start = vi.fn(async (options) => {
+      options.signal.addEventListener('abort', harness.queue.close, { once: true });
+      return { client: harness.client as any, server: harness.server };
+    });
+    const provider = new OpenCodeSdkProvider();
+    await provider.connect({});
+    const routeId = await provider.createSession({
+      sessionKey: 'route-steer-idle-race',
+      sessionName: 'deck_project_brain',
+      cwd: '/tmp/project',
+    });
+    await provider.send(routeId, 'foreground work');
+
+    const admission = provider.notifyActiveDelegation?.(routeId, {
+      notificationId: 'notification_idle_race',
+      delegationId: 'delegation_idle_race',
+      sourceSessionName: 'deck_sub_auditor',
+      text: 'accepted before idle is observed',
+    });
+    await vi.waitFor(() => expect(harness.client.notificationSession.prompt).toHaveBeenCalledOnce());
+    harness.queue.push({ type: 'session.idle', properties: { sessionID: 'oc-session-1' } });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    steerAck.resolve({ data: { accepted: true }, response: { status: 200 } });
+
+    await expect(admission).resolves.toBe(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+    expect(harness.client.notificationSession.prompt).toHaveBeenCalledOnce();
     await provider.disconnect();
   });
 
@@ -318,7 +396,7 @@ describe('OpenCodeSdkProvider', () => {
         mcp: expect.objectContaining({
           'imcodes-memory': expect.objectContaining({
             type: 'local',
-            command: ['imcodes', 'memory', 'mcp'],
+            command: [IMCODES_MEMORY_MCP_LAUNCH_COMMAND, ...IMCODES_MEMORY_MCP_LAUNCH_ARGS],
             environment: expect.objectContaining({ IMCODES_DAEMON_SESSION_NAME: 'deck_proj_brain' }),
           }),
         }),
@@ -519,6 +597,77 @@ describe('OpenCodeSdkProvider', () => {
     expect(harness.client.session.promptAsync).toHaveBeenCalledOnce();
     expect(harness.client.session.message).toHaveBeenCalled();
     await provider.disconnect();
+  });
+
+  it('deduplicates the same stable delivery id after the provider client restarts', async () => {
+    const harness = createHarness();
+    harness.client.session.promptAsync.mockImplementation((options: any) => {
+      harness.messages.set(options.body.messageID, {
+        info: {
+          id: options.body.messageID,
+          sessionID: options.path.id,
+          role: 'user',
+        },
+        parts: options.body.parts,
+      });
+      return result(undefined);
+    });
+    openCodeSdkRuntimeHooks.start = vi.fn(async (options) => {
+      options.signal.addEventListener('abort', harness.queue.close, { once: true });
+      return { client: harness.client as any, server: harness.server };
+    });
+    const payload = {
+      userMessage: 'audit the exact revision',
+      assembledMessage: 'audit the exact revision',
+      deliveryId: 'stable-auto-audit-delivery',
+      context: {
+        requiredAuthoredContext: [],
+        advisoryAuthoredContext: [],
+        appliedDocumentVersionIds: [],
+        diagnostics: [],
+      },
+      authority: {
+        namespace: { scope: 'personal', projectId: 'p' },
+        authoritySource: 'none',
+        freshness: 'fresh',
+        fallbackAllowed: true,
+        retryScheduled: false,
+        providerPolicyOutcome: 'allowed',
+        diagnostics: [],
+      },
+      supportClass: 'full-normalized-context-injection',
+      diagnostics: [],
+    } satisfies ProviderContextPayload;
+
+    const first = new OpenCodeSdkProvider();
+    await first.connect({});
+    const firstRoute = await first.createSession({
+      sessionKey: 'restart-stable-route',
+      cwd: '/tmp/project',
+    });
+    await first.send(firstRoute, payload);
+    expect(first.capabilities.restartDurableDeliveryId).toEqual({
+      restartDurable: true,
+      replayAfterAcceptance: 'deduplicated',
+    });
+    const acceptedMessageId = harness.client.session.promptAsync.mock.calls[0]![0].body.messageID;
+    await first.disconnect();
+
+    const restarted = new OpenCodeSdkProvider();
+    await restarted.connect({});
+    const restartedRoute = await restarted.createSession({
+      sessionKey: 'restart-stable-route',
+      cwd: '/tmp/project',
+      skipCreate: true,
+      resumeId: 'oc-session-1',
+    });
+    await restarted.send(restartedRoute, payload);
+
+    expect(harness.client.session.promptAsync).toHaveBeenCalledOnce();
+    expect(harness.client.session.message).toHaveBeenCalledWith(expect.objectContaining({
+      path: { id: 'oc-session-1', messageID: acceptedMessageId },
+    }));
+    await restarted.disconnect();
   });
 
   it('surfaces a missing prompt_async delivery as recoverable and reuses its message ID on retry', async () => {

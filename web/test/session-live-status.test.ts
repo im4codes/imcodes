@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { deriveSessionLiveStatus, isRunningSessionState, resolveTimelineBackedSessionState } from '../src/session-live-status.js';
+import { deriveSessionLiveStatus, isActiveTurnFinishedError, isRunningSessionState, resolveTimelineBackedSessionState } from '../src/session-live-status.js';
 import { SESSION_CONTROL_TIMELINE_REASON_USER_CANCEL } from '@shared/session-control-commands.js';
 import {
   createTransportQueueReducerState,
@@ -7,6 +7,13 @@ import {
 } from '../../shared/transport-queue-reducer.js';
 
 describe('session-live-status', () => {
+  it('recognizes the authoritative stale-turn acknowledgement used to clear a stuck queue', () => {
+    expect(isActiveTurnFinishedError('The active turn already finished')).toBe(true);
+    expect(isActiveTurnFinishedError(' the active turn already finished ')).toBe(true);
+    expect(isActiveTurnFinishedError('Queued message not found')).toBe(false);
+    expect(isActiveTurnFinishedError(undefined)).toBe(false);
+  });
+
   it('treats authoritative running state as busy even when timeline tail is settled', () => {
     const status = deriveSessionLiveStatus({ sessionState: 'running', activeTransportTurn: false });
     expect(status.mode).toBe('running');
@@ -77,6 +84,16 @@ describe('session-live-status', () => {
       activeThinking: false,
       activeToolCall: false,
       activeTransportTurn: false,
+    })).toBe('idle');
+  });
+
+  it('lets a stale-turn idle acknowledgement override a stale active-turn hint', () => {
+    expect(resolveTimelineBackedSessionState({
+      timelineState: 'running',
+      sessionState: 'idle',
+      activeTransportTurn: true,
+      timelineLastEventTs: 10_000,
+      authoritativeIdleAt: 20_000,
     })).toBe('idle');
   });
 
@@ -152,7 +169,10 @@ describe('session-live-status', () => {
       failedMessageEntries: [],
       source: 'test',
     });
-    expect(deriveSessionLiveStatus({ sessionState: 'idle', transportQueueState: liveQueueState }).busy).toBe(true);
+    const liveStatus = deriveSessionLiveStatus({ sessionState: 'idle', transportQueueState: liveQueueState });
+    expect(liveStatus.busy).toBe(true);
+    expect(liveStatus.mode).toBe('idle');
+    expect(liveStatus.visualMode).toBe('idle');
 
     const failedOnlyState = reduceTransportQueueEvent(createTransportQueueReducerState('deck'), {
       type: 'transport.queue.snapshot',
@@ -185,5 +205,25 @@ describe('session-live-status', () => {
 
     expect(status.mode).toBe('idle');
     expect(status.busy).toBe(false);
+  });
+
+  it('clears the working indicator once a turn settles to error, then shows running again once the queued message actually dispatches as the next turn (session-queue-stuck-forever regression)', () => {
+    // A turn that hit the provider send-start timeout, an unrecoverable
+    // provider error, or was stopped settles to 'error'/'idle' on the
+    // daemon side. The working indicator must clear immediately -- this is
+    // exactly what used to stay stuck at "Agent 工作中…" forever because the
+    // daemon kept re-broadcasting 'queued' for a queue it never drained.
+    const afterSettlement = deriveSessionLiveStatus({ sessionState: 'error', activeTransportTurn: false });
+    expect(afterSettlement.busy).toBe(false);
+    expect(afterSettlement.sweep).toBe(false);
+    expect(afterSettlement.visualMode).not.toBe('running');
+    expect(isRunningSessionState('error')).toBe(false);
+
+    // The daemon's fix then dispatches the previously-queued message as a
+    // fresh turn: the client must show real working state again, not idle.
+    const afterDrain = deriveSessionLiveStatus({ sessionState: 'running', activeTransportTurn: true });
+    expect(afterDrain.busy).toBe(true);
+    expect(afterDrain.sweep).toBe(true);
+    expect(afterDrain.visualMode).toBe('running');
   });
 });

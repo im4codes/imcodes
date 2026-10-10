@@ -1,6 +1,7 @@
 import { createPortal } from 'preact/compat';
-import { useEffect } from 'preact/hooks';
+import { useEffect, useRef } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
+import { isHtmlPreviewPath } from '@shared/html-preview.js';
 import { HtmlSafePreview } from './HtmlSafePreview.js';
 import { createSafeHtmlPreviewDocument } from '../util/html-safe-preview.js';
 
@@ -14,20 +15,39 @@ interface HtmlFullscreenPreviewProps {
   onClose: () => void;
 }
 
+const HTML_PREVIEW_OBJECT_URL_RELEASE_DELAY_MS = 60_000;
+
 export function openHtmlPreviewInNewWindow(preview: HtmlFullscreenPreviewState): boolean {
-  if (preview.status !== 'ok' || typeof preview.content !== 'string') return false;
+  if (preview.status !== 'ok' || typeof preview.content !== 'string'
+    || !isHtmlPreviewPath(preview.path)) return false;
   if (typeof URL.createObjectURL !== 'function') return false;
   const result = createSafeHtmlPreviewDocument(preview.content);
   if (result.status !== 'ok') return false;
 
   const url = URL.createObjectURL(new Blob([result.srcDoc], { type: 'text/html;charset=utf-8' }));
   try {
-    const opened = window.open(url, '_blank', 'noopener,noreferrer');
+    // `noopener` in the feature string makes some browsers return null even
+    // when they created the window, so it cannot be used when closing the
+    // owner depends on confirmed creation. Obtain the handle first, then sever
+    // its opener synchronously.
+    const opened = window.open(url, '_blank');
     if (!opened) {
       URL.revokeObjectURL(url);
       return false;
     }
-    window.setTimeout(() => URL.revokeObjectURL(url), 60_000);
+    try { opened.opener = null; } catch { /* Browser policy may already isolate it. */ }
+
+    // Owner cleanup must not revoke the token before the new window consumes
+    // it. Release on the child's load, with a bounded fallback for browsers
+    // that do not expose the cross-window event.
+    let released = false;
+    const release = () => {
+      if (released) return;
+      released = true;
+      URL.revokeObjectURL(url);
+    };
+    try { opened.addEventListener('load', release, { once: true }); } catch { /* fallback timer below */ }
+    window.setTimeout(release, HTML_PREVIEW_OBJECT_URL_RELEASE_DELAY_MS);
     return true;
   } catch {
     URL.revokeObjectURL(url);
@@ -37,6 +57,11 @@ export function openHtmlPreviewInNewWindow(preview: HtmlFullscreenPreviewState):
 
 export function HtmlFullscreenPreview({ preview, onClose }: HtmlFullscreenPreviewProps) {
   const { t } = useTranslation();
+  const openingRef = useRef(false);
+
+  useEffect(() => {
+    openingRef.current = false;
+  }, [preview]);
 
   useEffect(() => {
     if (!preview) return undefined;
@@ -48,7 +73,17 @@ export function HtmlFullscreenPreview({ preview, onClose }: HtmlFullscreenPrevie
   }, [onClose, preview]);
 
   if (!preview) return null;
-  const canOpenInNewWindow = preview.status === 'ok' && typeof preview.content === 'string';
+  const canOpenInNewWindow = preview.status === 'ok' && typeof preview.content === 'string'
+    && isHtmlPreviewPath(preview.path);
+  const openInNewWindow = () => {
+    if (openingRef.current) return;
+    openingRef.current = true;
+    if (openHtmlPreviewInNewWindow(preview)) {
+      onClose();
+      return;
+    }
+    openingRef.current = false;
+  };
 
   return createPortal((
     <div
@@ -60,8 +95,11 @@ export function HtmlFullscreenPreview({ preview, onClose }: HtmlFullscreenPrevie
       <button
         type="button"
         class="html-fullscreen-preview-open-window"
-        onClick={() => {
-          if (openHtmlPreviewInNewWindow(preview)) onClose();
+        onClick={openInNewWindow}
+        onKeyDown={(event) => {
+          if (event.key !== 'Enter' && event.key !== ' ') return;
+          event.preventDefault();
+          openInNewWindow();
         }}
         disabled={!canOpenInNewWindow}
         title={t('chat.html_preview_open_new_window')}

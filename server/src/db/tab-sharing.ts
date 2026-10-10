@@ -1,4 +1,6 @@
 import type { Database } from './client.js';
+import { isActorAndServerOwnerActive } from '../security/user-status.js';
+import { NODE_ROLE } from '../../../shared/remote-exec.js';
 import {
   buildShareAuditIdempotencyKey,
   isActiveShareGrant as isSharedActiveShareGrant,
@@ -131,6 +133,33 @@ export async function normalizeExistingShareTarget(db: Database, input: ShareTar
   return row ? target : null;
 }
 
+/** Invalid execute combinations are rejected before any mutation, also for DB callers. */
+export class InvalidShareExecGrantError extends Error {
+  constructor() { super('exec_grant_requires_controlled_device_participant'); }
+}
+
+async function validateShareExecGrant(db: Database, target: ShareTarget, role: ShareRole, granted?: boolean): Promise<void> {
+  if (granted !== true) return;
+  if (target.kind !== 'server' || role !== 'participant') throw new InvalidShareExecGrantError();
+  const server = await db.queryOne<{ node_role: string }>('SELECT node_role FROM servers WHERE id = $1', [target.serverId]);
+  if (server?.node_role !== NODE_ROLE.CONTROLLED) throw new InvalidShareExecGrantError();
+}
+
+// RETURNING captures exactly the committed mutation, not a later concurrent writer's row.
+function mutationProjection(target: ShareTarget): string {
+  return `'${target.kind}' AS target_kind, id, server_id,
+    ${target.kind === 'main' ? 'session_name' : 'NULL::TEXT AS session_name'},
+    ${target.kind === 'subsession' ? 'sub_session_id' : 'NULL::TEXT AS sub_session_id'},
+    target_user_id, role, created_by, created_at, updated_at, expires_at, revoked_at,
+    ${target.kind === 'server' ? 'exec_granted' : 'FALSE AS exec_granted'}`;
+}
+
+type ShareMutationRow = ShareRow & { execGranted: boolean };
+type DbShareMutationRow = DbShareRow & { exec_granted: boolean };
+function mapShareMutation(row: DbShareMutationRow): ShareMutationRow {
+  return { ...mapShareRow(row), execGranted: row.exec_granted };
+}
+
 export async function createOrUpdateShare(
   db: Database,
   params: {
@@ -140,69 +169,66 @@ export async function createOrUpdateShare(
     role: ShareRole;
     createdBy: string;
     expiresAt?: number | null;
+    execGranted?: boolean;
     now: number;
   },
-): Promise<ShareRow> {
-  if (params.target.kind === 'server') {
-    await db.execute(
-      `INSERT INTO server_shares (id, server_id, target_user_id, role, created_by, created_at, updated_at, expires_at, revoked_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $6, $7, NULL)
-       ON CONFLICT (server_id, target_user_id) DO UPDATE SET
-         role = EXCLUDED.role,
-         expires_at = EXCLUDED.expires_at,
-         updated_at = EXCLUDED.updated_at,
-         revoked_at = NULL,
-         created_at = CASE WHEN server_shares.revoked_at IS NULL THEN server_shares.created_at ELSE EXCLUDED.created_at END,
-         created_by = EXCLUDED.created_by`,
-      [params.id, params.target.serverId, params.targetUserId, params.role, params.createdBy, params.now, params.expiresAt ?? null],
-    );
-  } else if (params.target.kind === 'main') {
-    await db.execute(
-      `INSERT INTO session_shares (id, server_id, session_name, target_user_id, role, created_by, created_at, updated_at, expires_at, revoked_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $7, $8, NULL)
-       ON CONFLICT (server_id, session_name, target_user_id) DO UPDATE SET
-         role = EXCLUDED.role,
-         expires_at = EXCLUDED.expires_at,
-         updated_at = EXCLUDED.updated_at,
-         revoked_at = NULL,
-         created_at = CASE WHEN session_shares.revoked_at IS NULL THEN session_shares.created_at ELSE EXCLUDED.created_at END,
-         created_by = EXCLUDED.created_by`,
-      [params.id, params.target.serverId, params.target.sessionName, params.targetUserId, params.role, params.createdBy, params.now, params.expiresAt ?? null],
-    );
-  } else {
-    await db.execute(
-      `INSERT INTO sub_session_shares (id, server_id, sub_session_id, target_user_id, role, created_by, created_at, updated_at, expires_at, revoked_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $7, $8, NULL)
-       ON CONFLICT (server_id, sub_session_id, target_user_id) DO UPDATE SET
-         role = EXCLUDED.role,
-         expires_at = EXCLUDED.expires_at,
-         updated_at = EXCLUDED.updated_at,
-         revoked_at = NULL,
-         created_at = CASE WHEN sub_session_shares.revoked_at IS NULL THEN sub_session_shares.created_at ELSE EXCLUDED.created_at END,
-         created_by = EXCLUDED.created_by`,
-      [params.id, params.target.serverId, params.target.subSessionId, params.targetUserId, params.role, params.createdBy, params.now, params.expiresAt ?? null],
-    );
-  }
-
-  const row = await getShareByTargetAndUser(db, params.target, params.targetUserId);
+): Promise<ShareMutationRow> {
+  await validateShareExecGrant(db, params.target, params.role, params.execGranted);
+  const { table } = tableForTarget(params.target);
+  const targetColumn = params.target.kind === 'main' ? 'session_name' : 'sub_session_id';
+  const targetValue = params.target.kind === 'main' ? params.target.sessionName
+    : params.target.kind === 'subsession' ? params.target.subSessionId : null;
+  const isServer = params.target.kind === 'server';
+  const row = await db.queryOne<DbShareMutationRow>(
+    `INSERT INTO ${table} (id, server_id, target_user_id, role, created_by, created_at, updated_at, expires_at, revoked_at,
+       ${isServer ? 'exec_granted' : targetColumn})
+     VALUES ($1, $2, $3, $4, $5, $6, $6, $7, NULL, $8)
+     ON CONFLICT (server_id, ${isServer ? '' : `${targetColumn}, `}target_user_id) DO UPDATE SET
+       role = EXCLUDED.role,
+       ${isServer ? 'exec_granted = EXCLUDED.exec_granted,' : ''}
+       expires_at = EXCLUDED.expires_at,
+       updated_at = EXCLUDED.updated_at,
+       revoked_at = NULL,
+       created_at = CASE WHEN ${table}.revoked_at IS NULL THEN ${table}.created_at ELSE EXCLUDED.created_at END,
+       created_by = EXCLUDED.created_by
+     RETURNING ${mutationProjection(params.target)}`,
+    [params.id, params.target.serverId, params.targetUserId, params.role, params.createdBy,
+      params.now, params.expiresAt ?? null, isServer ? params.execGranted === true : targetValue],
+  );
   if (!row) throw new Error('share_upsert_failed');
-  return row;
+  return mapShareMutation(row);
 }
 
 export async function updateShare(
   db: Database,
-  params: { shareId: string; serverId: string; role?: ShareRole; expiresAt?: number | null; now: number },
-): Promise<ShareRow | null> {
-  const current = await getShareById(db, params.serverId, params.shareId);
-  if (!current) return null;
-  const role = params.role ?? current.role;
-  const expiresAt = Object.prototype.hasOwnProperty.call(params, 'expiresAt') ? params.expiresAt ?? null : current.expiresAt;
-  const { table } = tableForTarget(current.target);
-  await db.execute(
-    `UPDATE ${table} SET role = $1, expires_at = $2, updated_at = $3 WHERE id = $4 AND server_id = $5`,
-    [role, expiresAt, params.now, params.shareId, params.serverId],
-  );
-  return getShareById(db, params.serverId, params.shareId);
+  params: { shareId: string; serverId: string; role?: ShareRole; expiresAt?: number | null; execGranted?: boolean; now: number },
+): Promise<ShareMutationRow | null> {
+  // Target identity cannot be patched. Lock its concrete table row before deriving
+  // omitted values or validating role+grant, so concurrent patches cannot use stale roles.
+  const identity = await getShareById(db, params.serverId, params.shareId);
+  if (!identity) return null;
+  const { table } = tableForTarget(identity.target);
+  return db.transaction(async (tx) => {
+    const current = await tx.queryOne<DbShareMutationRow>(
+      `SELECT ${mutationProjection(identity.target)} FROM ${table} WHERE id = $1 AND server_id = $2 FOR UPDATE`,
+      [params.shareId, params.serverId],
+    );
+    if (!current) return null;
+    const role = params.role ?? current.role;
+    await validateShareExecGrant(tx, identity.target, role, params.execGranted);
+    // undefined (including a route's explicit undefined property) means omitted;
+    // null alone clears expiration. A role downgrade always revokes execute atomically.
+    const expiresAt = params.expiresAt === undefined ? current.expires_at : params.expiresAt;
+    const execGranted = role === 'participant' && (params.execGranted ?? current.exec_granted);
+    const row = await tx.queryOne<DbShareMutationRow>(
+      `UPDATE ${table} SET role = $1, expires_at = $2, updated_at = $3
+         ${identity.target.kind === 'server' ? ', exec_granted = $6' : ''}
+       WHERE id = $4 AND server_id = $5 RETURNING ${mutationProjection(identity.target)}`,
+      [role, expiresAt, params.now, params.shareId, params.serverId,
+        ...(identity.target.kind === 'server' ? [execGranted] : [])],
+    );
+    return row ? mapShareMutation(row) : null;
+  });
 }
 
 export async function revokeShare(db: Database, params: { shareId: string; serverId: string; now: number }): Promise<ShareRow | null> {
@@ -260,36 +286,13 @@ export async function getShareById(db: Database, serverId: string, shareId: stri
   return mapShareRows(rows)[0] ?? null;
 }
 
-async function getShareByTargetAndUser(db: Database, target: ShareTarget, targetUserId: string): Promise<ShareRow | null> {
-  if (target.kind === 'server') {
-    const row = await db.queryOne<DbShareRow>(
-      `SELECT 'server' AS target_kind, id, server_id, NULL::TEXT AS session_name, NULL::TEXT AS sub_session_id, target_user_id, role, created_by, created_at, updated_at, expires_at, revoked_at
-         FROM server_shares WHERE server_id = $1 AND target_user_id = $2`,
-      [target.serverId, targetUserId],
-    );
-    return row ? mapShareRow(row) : null;
-  }
-  if (target.kind === 'main') {
-    const row = await db.queryOne<DbShareRow>(
-      `SELECT 'main' AS target_kind, id, server_id, session_name, NULL::TEXT AS sub_session_id, target_user_id, role, created_by, created_at, updated_at, expires_at, revoked_at
-         FROM session_shares WHERE server_id = $1 AND session_name = $2 AND target_user_id = $3`,
-      [target.serverId, target.sessionName, targetUserId],
-    );
-    return row ? mapShareRow(row) : null;
-  }
-  const row = await db.queryOne<DbShareRow>(
-    `SELECT 'subsession' AS target_kind, id, server_id, NULL::TEXT AS session_name, sub_session_id, target_user_id, role, created_by, created_at, updated_at, expires_at, revoked_at
-       FROM sub_session_shares WHERE server_id = $1 AND sub_session_id = $2 AND target_user_id = $3`,
-    [target.serverId, target.subSessionId, targetUserId],
-  );
-  return row ? mapShareRow(row) : null;
-}
-
 export async function resolveEffectiveShareCoverage(
   db: Database,
   params: { userId: string; target: ShareTarget; now: number },
 ): Promise<EffectiveCoverage | null> {
   if (!await targetExists(db, params.target)) return null;
+  // A disabled grantee operates nothing, and a server whose owner is disabled is out of service for everyone it was shared with.
+  if (!await isActorAndServerOwnerActive(db, params.userId, params.target.serverId)) return null;
   const rows = await coveringShareRows(db, params.userId, params.target, params.now);
   if (rows.length === 0) return null;
   const grants: ShareGrantLike[] = rows.map((row) => ({
@@ -456,4 +459,27 @@ function tableForTarget(target: ShareTarget): { table: 'server_shares' | 'sessio
   if (target.kind === 'server') return { table: 'server_shares' };
   if (target.kind === 'main') return { table: 'session_shares' };
   return { table: 'sub_session_shares' };
+}
+
+/**
+ * The per-device EXECUTE grant lives on the server-level share row (migration 100). It is meaningful only for a `participant` role: a
+ * viewer row can never carry it, and a role change away from participant clears it in the same statement.
+ */
+export async function setServerShareExecGrant(
+  db: Database,
+  params: { shareId: string; serverId: string; granted: boolean; now: number },
+): Promise<void> {
+  const share = await getShareById(db, params.serverId, params.shareId);
+  if (share?.target.kind === 'server') {
+    await updateShare(db, { shareId: params.shareId, serverId: params.serverId, execGranted: params.granted, now: params.now });
+  }
+}
+
+/** share id -> execute grant for the server-level shares of one device (absent id = no grant). */
+export async function listServerShareExecGrants(db: Database, serverId: string): Promise<Map<string, boolean>> {
+  const rows = await db.query<{ id: string; exec_granted: boolean }>(
+    'SELECT id, exec_granted FROM server_shares WHERE server_id = $1',
+    [serverId],
+  );
+  return new Map(rows.map((row) => [row.id, row.exec_granted === true]));
 }

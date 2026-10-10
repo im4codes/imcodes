@@ -1,42 +1,65 @@
-import { loadStore, flushStore, listSessions, getSession, upsertSession, removeSession, type SessionRecord } from '../store/session-store.js';
-import { restoreFromStore, setSessionEventCallback, setSessionPersistCallback, restartSession, respawnSession, initOnStartup, rebuildProviderRoutes, getTransportRuntime, unregisterProviderRoute, resyncTransportSessionStatesAfterLinkRestore } from '../agent/session-manager.js';
-import { sessionExists, isPaneAlive, BACKEND, killSession } from '../agent/tmux.js';
+import { CHAT_MESSAGE_ORIGINS, USER_MESSAGE_ORIGIN_FIELDS } from '../../shared/chat-message-origin.js';
+import { taskPairService } from './task-pairs/service.js';
+import { evaluatePairMainCheckoutGitWrite, mainCheckoutWriteRefusal } from './task-pairs/main-checkout-write-guard.js';
+import { setTransportToolExecutionEvaluator } from './transport-relay.js';
+import { taskPairAutomation } from './task-pairs/scheduler.js';
+import { getTaskPairStore } from './task-pairs/store.js';
+import { isSessionWorking } from './session-working.js';
+import { createSupervisionSessionPresentationResolver } from './supervision-session-presentation.js';
+import { createSupervisionPairRefreshScheduler } from './supervision-pair-refresh.js';
+import { loadStore, flushStore, listSessions, getSession, upsertSession, removeSession, markSessionStoreAuthoritative, configureSessionStoreWriteAuthority, type SessionRecord } from '../store/session-store.js';
+import { markDaemonProcess } from './process-role.js';
+import { restoreFromStore, setSessionEventCallback, setSessionPersistCallback, setTransportSessionRestoredCallback, restartSession, respawnSession, initOnStartup, rebuildProviderRoutes, getTransportRuntime, unregisterProviderRoute, resyncTransportSessionStatesAfterLinkRestore, ensureTransportRuntimeForPendingResend } from '../agent/session-manager.js';
+import { beginUpgradeReadinessTracking, markGracefulShutdownStarted, markStartupPhaseDone } from './upgrade-readiness.js';
+import { DAEMON_STARTUP_PHASE } from '../../shared/daemon-upgrade.js';
+import { sessionExists, isPaneAlive, BACKEND, killSession, createTmuxHealthProbe, type TmuxHealthProbe } from '../agent/tmux.js';
 import { detectRepo } from '../repo/detector.js';
 import { repoCache, RepoCache } from '../repo/cache.js';
-import { ServerLink, setServerLinkReconnectResyncHandler } from './server-link.js';
+import { ServerLink, setServerLinkDisconnectSecurityHandler, setServerLinkReconnectResyncHandler } from './server-link.js';
 import { DaemonRemoteDesktop } from './remote-desktop-daemon.js';
-import { closeDaemonRemoteDesktop, setDaemonRemoteDesktop } from './remote-desktop-registry.js';
-import { handleWebCommand, setRouterContext, refreshCodexQuotaMetadata, refreshClaudeSdkSubQuotaMetadata } from './command-handler.js';
+import { closeDaemonRemoteDesktop, refreshDaemonRemoteDesktop, setDaemonRemoteDesktop } from './remote-desktop-registry.js';
+import { handleWebCommand, setRouterContext, refreshCodexQuotaMetadata, refreshClaudeSdkSubQuotaMetadata, refreshAgyQuotaMetadataForSessions } from './command-handler.js';
 import { dispatchSessionMessageByName } from './session-dispatch.js';
+import { dispatchReadyAuditSweep } from './send-tool.js';
 import { initFileTransfer, startCleanupTimer } from './file-transfer-handler.js';
 import { initializeDirectFileTransfer, shutdownDirectFileTransfers } from './direct-file-transfer.js';
 import { loadMemoryShortRefsFromStore } from '../context/memory-short-ref.js';
 import { notifySessionIdle, listP2pRuns, serializeP2pRun } from './p2p-orchestrator.js';
 import { isP2pParticipantMemoryNoise } from './p2p-memory-filter.js';
 import { handlePreviewBinaryFrame } from './preview-relay.js';
-import { buildSessionList } from './session-list.js';
+import { buildSessionList, resolveAuthoritativeSessionListState } from './session-list.js';
 import { timelineEmitter } from './timeline-emitter.js';
+import { releaseProcessSharedMachineAuthority } from './shared-machine-authority-context.js';
+import { isDuplicateTimelineForward } from './timeline-forward-dedup.js';
+import type { TimelineEvent } from './timeline-event.js';
+import { attachDaemonUserNotice, DAEMON_USER_NOTICE_CODE } from '../../shared/daemon-user-notices.js';
 import { isExecutionClone, sweepExecutionClones, destroyExecutionClone, resolveExecutionCloneRetentionMs } from './execution-clone.js';
 import { EXECUTION_CLONE_TIMELINE } from '../../shared/execution-clone.js';
 import { startLatencyTracer } from './latency-tracer.js';
+import { startEventLoopWatchdog, stopEventLoopWatchdog } from './event-loop-watchdog.js';
 import { supervisionAutomation } from './supervision-automation.js';
+import {
+  getSupervisionHeartbeatProjectionForWire,
+  setSupervisionHeartbeatProjectionListener,
+} from './supervision-heartbeat-projection.js';
+import { sendSubSessionSync } from './subsession-sync.js';
 import { peerAuditService } from './peer-audit-service.js';
 import { timelineStore } from './timeline-store.js';
 import { getDefaultAckOutbox } from './ack-outbox.js';
-import { startHookServer, drainQueue } from './hook-server.js';
+import { closeHookServer, drainQueue, startHookServer } from './hook-server.js';
 import { initTempFileStore } from '../store/temp-file-store.js';
 import { setupCCHooks } from '../agent/signal.js';
 import type http from 'http';
-import net from 'node:net';
 import { monitorEventLoopDelay } from 'node:perf_hooks';
 import { loadConfig, type Config } from '../config.js';
 import { loadCredentials } from '../bind/bind-flow.js';
 import logger from '../util/logger.js';
+import { startMemoryGuard, stopMemoryGuard } from './memory-guard.js';
+import { imcodesStateDir } from '../util/imcodes-state-dir.js';
+import { registerMemoryProbe } from './memory-probes.js';
+import { DAEMON_MEMORY_GUARD_EXIT_CODE, DAEMON_MEMORY_GUARD_HARD_EXIT_MS } from '../../shared/daemon-memory-guard.js';
 import { recordDaemonStart } from '../util/daemon-status.js';
 import { installDaemonRuntimeDiagnosticsProvider } from './runtime-diagnostics.js';
-import * as fs from 'node:fs';
-import * as path from 'node:path';
-import * as os from 'node:os';
 import { P2P_TERMINAL_RUN_STATUSES } from '../../shared/p2p-status.js';
 import { pickReadableSessionDisplay } from '../../shared/session-display.js';
 import { buildWorkerSessionPersistBody, mergeWorkerSessionSnapshot, shouldPersistMainSessionToWorkerOnStartup } from './session-bootstrap.js';
@@ -46,12 +69,22 @@ import { fetchBackendSharedContextRuntimeConfig } from '../context/backend-runti
 import { setContextModelRuntimeConfig } from '../context/context-model-config.js';
 import { closeLiveContextMaterializationAdmission, LiveContextIngestion } from '../context/live-context-ingestion.js';
 import { LocalSkillReviewWorker } from '../context/skill-review-worker.js';
+import { execFileOffMain, execFileOffMainIdempotent, shutdownExecHelper, startExecHelper } from '../util/exec-helper.js';
+import { setRepoExecFile } from '../repo/repo-exec.js';
+import { useProcessTreeExecFile } from '../util/kill-process-tree.js';
 import { resolveTransportContextBootstrap } from '../agent/runtime-context-bootstrap.js';
 import { pruneLocalMemory } from '../context/memory-pruning.js';
 import { backfillProjectionEmbeddings } from '../context/projection-embedding-maintenance.js';
 import { getContextStoreClient } from '../store/context-store-worker-client.js';
 import { setArchiveBackfillSchedulingEnabled } from '../store/archive-backfill-scheduling.js';
 import { getResendCount } from './transport-resend-queue.js';
+import {
+  getTransportQueueStore,
+  classifyQueueSweepCandidate,
+  shouldQuarantineUnrestorableQueueSession,
+} from './transport-queue-store.js';
+import { TRANSPORT_QUEUE_SWEEP_INTERVAL_MS } from '../../shared/transport-queue-types.js';
+import { pruneTransportRestoreBackoff } from '../agent/transport-restore-backoff.js';
 import { isKnownTestSessionLike } from '../../shared/test-session-guard.js';
 import { isTransportAgent } from '../agent/detect.js';
 import { TRANSPORT_SESSION_AGENT_TYPES } from '../../shared/agent-types.js';
@@ -68,6 +101,101 @@ import { buildTransportQueueSnapshotPayload } from './transport-queue-projection
 import { getStaleSessionCompressionRun, resolveSessionCompressionWatchRuns } from '../context/summary-compressor.js';
 import { isServerLinkResyncStatePayload, normalizeActivityGeneration } from '../../shared/session-activity-types.js';
 import type { TransportRuntimeDiagnosticSnapshot } from '../agent/transport-session-runtime.js';
+import { CAPABILITY_OPERATION_MSG, CAPABILITY_SYNC_MSG } from '../../shared/capability-management.js';
+import { CapabilityOperationHandler } from '../capability/capability-operation-handler.js';
+import { clearCapabilityAuthorizationKeys } from '../capability/capability-authorization.js';
+import { DaemonCapabilityServiceAdapter } from '../capability/capability-service-adapter.js';
+import { createCapabilityBlobHttpClient } from '../capability/capability-blob-http-client.js';
+import { CapabilitySyncService } from '../capability/capability-sync-service.js';
+import { createCapabilitySyncRuntime } from '../capability/capability-sync-runtime.js';
+import { CapabilitySyncFrameHandler } from '../capability/capability-sync-handler.js';
+import { CapabilitySourceConvergenceStore } from '../capability/capability-source-convergence.js';
+import { cleanupAbandonedCapabilityQuarantine } from '../capability/skill-acquisition.js';
+import { clearResend } from './transport-resend-queue.js';
+import {
+  createProductionSupervisionConsoleBinding,
+  isAuthorizedSupervisionConsoleScope,
+  type SupervisionConsoleBinding,
+} from './supervision-console-binding.js';
+import {
+  getSupervisionTaskRegistry,
+  setSupervisionLiveParticipantsResolver,
+} from './supervision-state-store.js';
+import { resolveLiveSupervisionParticipants } from './supervision-brain-authority.js';
+import {
+  acquireInstanceLock,
+  releaseInstanceLock,
+  updateInstanceLockDiagnostics,
+  type DaemonInstanceLockError,
+  type InstanceLockHandle,
+} from './instance-lock.js';
+import {
+  startDaemonCgroupValidationProbes,
+  type CgroupValidationProbeController,
+} from './cgroup-validation-probes.js';
+import { runOrderedDaemonShutdown } from './ordered-shutdown.js';
+import { startSessionIdentitySync, stopSessionIdentitySync } from './session-identity-sync.js';
+import { setSessionIdentityReportSender } from './session-identity-local-store.js';
+import { requestSessionIdentityMigration } from './session-identity-server-sync.js';
+
+export { acquireInstanceLock, releaseInstanceLock } from './instance-lock.js';
+
+/**
+ * Coalesce heartbeat projection changes onto the two authoritative session
+ * snapshot channels. Kept as a small injectable unit so lifecycle tests can
+ * prove both main-session and sub-session publication without booting a daemon.
+ */
+export function createSupervisionHeartbeatProjectionSyncHandler(deps: {
+  getServerLink: () => ServerLink | null;
+  buildSessionList?: typeof buildSessionList;
+  sendSubSessionSync?: typeof sendSubSessionSync;
+  onError?: (error: unknown, sessions: string[]) => void;
+}): (sessionName: string) => void {
+  const buildList = deps.buildSessionList ?? buildSessionList;
+  const syncSubSession = deps.sendSubSessionSync ?? sendSubSessionSync;
+  const pending = new Set<string>();
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  return (sessionName) => {
+    pending.add(sessionName);
+    if (timer) return;
+    timer = setTimeout(() => {
+      timer = null;
+      const names = [...pending];
+      pending.clear();
+      const link = deps.getServerLink();
+      if (!link) return;
+      void (async () => {
+        if (names.some((name) => !name.startsWith('deck_sub_'))) {
+          const sessions = await buildList();
+          link.send({ type: 'session_list', daemonVersion: link.daemonVersion, sessions });
+        }
+        for (const name of names) {
+          if (!name.startsWith('deck_sub_')) continue;
+          await syncSubSession(link, name.slice('deck_sub_'.length));
+        }
+      })().catch((error) => {
+        deps.onError?.(error, names);
+      });
+    }, 0);
+    timer.unref?.();
+  };
+}
+
+let supervisionConsole: SupervisionConsoleBinding | undefined;
+
+/** Exposed for diagnostics/tests; undefined until the link is bound. */
+export function getSupervisionConsoleBinding(): SupervisionConsoleBinding | undefined {
+  return supervisionConsole;
+}
+
+/** Preserve durable registry time when an assignment owner has no live session record. */
+export function resolveMissingSupervisionSessionPresentation(durableObservedAt: number): {
+  state: 'offline';
+  source: 'registry';
+  observedAt: number;
+} {
+  return { state: 'offline', source: 'registry', observedAt: durableObservedAt };
+}
 
 function latestAssistantTextFromEvents(events: Array<{ type?: unknown; payload?: unknown }>): string | undefined {
   for (let i = events.length - 1; i >= 0; i--) {
@@ -159,6 +287,8 @@ const SERVER_LINK_STARTUP_GRACE_MS = 12_000;
 const STARTUP_CONTEXT_REPLICATION_DELAY_MS = 90_000;
 const STARTUP_TIMELINE_RETENTION_DELAY_MS = 120_000;
 const STARTUP_MEMORY_PRUNING_DELAY_MS = 150_000;
+/** Soon after start: the answer to "did the grant reach this daemon" should not wait behind the heavy background work. */
+const STARTUP_MACOS_LAUNCH_HEALTH_DELAY_MS = 15_000;
 const STARTUP_CONTEXT_BACKFILL_DELAY_MS = 180_000;
 const STARTUP_SESSION_DB_PUSH_DELAY_MS = 210_000;
 // Lowest-priority startup task: backfill persisted projection embeddings so the
@@ -167,7 +297,6 @@ const STARTUP_SESSION_DB_PUSH_DELAY_MS = 210_000;
 const STARTUP_EMBEDDING_BACKFILL_DELAY_MS = 240_000;
 const STARTUP_TRANSPORT_RESTORE_DELAY_MS = 45_000;
 const STARTUP_TRANSPORT_SLOW_RESTORE_DELAY_MS = 90_000;
-const TRANSPORT_SLOW_RESTORE_INTER_SESSION_DELAY_MS = 2_000;
 const TRANSPORT_SLOW_RESTORE_PROVIDER_PAUSE_MS = 5_000;
 const STARTUP_CONTEXT_BACKFILL_PAUSE_MS = 25;
 const STARTUP_CONTEXT_BACKFILL_PAUSE_EVERY = 5;
@@ -257,6 +386,9 @@ async function dropLocalSession(session: SessionRecord): Promise<void> {
     await killSession(session.name).catch(() => {});
   }
 
+  // ONE removal boundary: durable queue work must never outlive its session
+  // and become deliverable to a later same-named instance.
+  clearResend(session.name, 'session_removed');
   removeSession(session.name);
 }
 
@@ -393,6 +525,7 @@ export async function syncSessionsFromWorker(
     if (plan.status === WORKER_SESSION_SYNC_STATUS.APPLIED) {
       await Promise.all([
         ...plan.remoteTestSessions.map(async (session) => {
+          if (session.state === 'stopped') return;
           await deleteSessionFromWorker(workerUrl, serverId, token, session.name);
           remoteTestDeletedCount++;
         }),
@@ -449,76 +582,55 @@ function scheduleDaemonStartupBackgroundTask(label: string, task: () => Promise<
   timer.unref?.();
 }
 
-/** Write PID file so restart can reliably find the old process. */
-function writePidFile(): void {
-  const pidPath = path.join(os.homedir(), '.imcodes', 'daemon.pid');
-  try {
-    fs.mkdirSync(path.dirname(pidPath), { recursive: true });
-    fs.writeFileSync(pidPath, String(process.pid), 'utf8');
-  } catch { /* best-effort */ }
+let lockServer: InstanceLockHandle | null = null;
+let cgroupValidationProbes: CgroupValidationProbeController | null = null;
+
+export interface DaemonStartupFailureDiagnostic {
+  reason: string;
+  code: string;
+  sessionIds: string[];
+  residualResources: string[];
 }
 
-let lockServer: net.Server | null = null;
-
-/** Acquire a single-instance lock via Unix domain socket.
- *  If another daemon is already running, the socket is in use and we exit.
- *  The lock auto-releases when the process exits (even on crash).
- *  @param sockPath — override for testing; defaults to ~/.imcodes/daemon.sock */
-export async function acquireInstanceLock(sockPath?: string): Promise<net.Server> {
-  // Windows: use a named pipe instead of Unix domain socket (UDS has path length limits and AV issues)
-  const p = process.platform === 'win32'
-    ? '\\\\.\\pipe\\imcodes-daemon-lock'
-    : (sockPath ?? path.join(os.homedir(), '.imcodes', 'daemon.sock'));
-
-  if (process.platform !== 'win32') {
-    fs.mkdirSync(path.dirname(p), { recursive: true });
-  }
-
-  return new Promise((resolve, reject) => {
-    const server = net.createServer();
-
-    server.on('error', (err: NodeJS.ErrnoException) => {
-      if (err.code === 'EADDRINUSE') {
-        // Socket/pipe exists — check if another daemon is actually alive
-        const client = net.connect(p, () => {
-          // Connection succeeded → another daemon is running
-          client.destroy();
-          reject(new Error(`Another imcodes daemon is already running. Use 'imcodes restart' to restart it.`));
-        });
-        client.on('error', () => {
-          // Connection failed → stale socket from a crashed process, reclaim it
-          if (process.platform !== 'win32') {
-            try { fs.unlinkSync(p); } catch { /* ignore */ }
-          }
-          server.listen(p, () => resolve(server));
-        });
-      } else {
-        reject(err);
-      }
-    });
-
-    server.listen(p, () => resolve(server));
-  });
-}
-
-/** Release a single-instance lock. */
-export function releaseInstanceLock(server: net.Server, sockPath?: string): void {
-  server.close();
-  if (process.platform !== 'win32') {
-    const p = sockPath ?? path.join(os.homedir(), '.imcodes', 'daemon.sock');
-    try { fs.unlinkSync(p); } catch { /* ignore */ }
-  }
+export function describeDaemonStartupFailure(error: unknown): DaemonStartupFailureDiagnostic {
+  const lockError = error as Partial<DaemonInstanceLockError>;
+  const owner = lockError.owner;
+  const sessions = owner?.sessionIds ?? listSessions().map((session) => session.name);
+  const resources = owner?.residualResources
+    ?? lockServer?.metadata.residualResources
+    ?? sessions.map((sessionId) => `session:${sessionId}`);
+  return {
+    reason: error instanceof Error ? error.message : String(error),
+    code: typeof lockError.code === 'string' ? lockError.code : 'DAEMON_STARTUP_FAILED',
+    sessionIds: [...new Set(sessions)].sort(),
+    residualResources: [...new Set(resources)].sort(),
+  };
 }
 
 /** Startup sequence: config → store → memory → sessions → server link */
 export async function startup(): Promise<DaemonContext> {
+  // Fork the exec helper FIRST, while the daemon is still small: every later tmux/git/ps
+  // spawn is posted to it instead of forking from this (soon multi-GB) process.
+  startExecHelper();
+  useProcessTreeExecFile(execFileOffMainIdempotent);
+  // src/repo is shared with the server image, so it cannot import the helper itself.
+  setRepoExecFile({ offMain: execFileOffMain, offMainIdempotent: execFileOffMainIdempotent });
   logger.info({
     version: DAEMON_VERSION,
     buildSha: process.env.IMCODES_BUILD_SHA ?? process.env.GIT_COMMIT ?? process.env.SOURCE_VERSION ?? 'unknown',
     changeId: 'memory-system-1.1-foundations',
   }, 'Daemon starting');
   lockServer = await acquireInstanceLock();
-  writePidFile();
+  // Fence session-store writes to the exact process/start token that acquired
+  // the daemon lock. This must happen BEFORE loadStore: startup reconciliation
+  // can schedule a migration/probe write, and a non-owner must never be able
+  // to persist its transient (possibly empty) in-memory view.
+  configureSessionStoreWriteAuthority(lockServer.identity, lockServer.metadataPath);
+  // Only the process that owns the lock records its start and reads how its predecessor ended: a server-driven
+  // upgrade is held back while this process is new or recovering from a crash (see upgrade-readiness.ts).
+  beginUpgradeReadinessTracking();
+  markDaemonProcess();
+  cgroupValidationProbes = startDaemonCgroupValidationProbes();
   installDaemonRuntimeDiagnosticsProvider();
   // Captures an initial heap snapshot into the runtime status; subsequent
   // refreshes ride the heartbeat write (no dedicated timer / extra I/O).
@@ -528,7 +640,21 @@ export async function startup(): Promise<DaemonContext> {
   logger.info({ config: config.daemon }, 'Config loaded');
 
   await loadStore();
+  // From here the daemon's memory owns sessions.json; in-process refreshes must
+  // not replace it with a disk snapshot.
+  markSessionStoreAuthoritative();
   logger.info('Session store loaded');
+  updateInstanceLockDiagnostics(lockServer, {
+    sessionIds: listSessions().map((session) => session.name),
+    residualResources: [
+      `instance-lock:${lockServer.socketPath}`,
+      ...listSessions().map((session) => (
+        session.runtimeType === 'transport' || isTransportAgent(session.agentType)
+          ? `transport-session:${session.name}`
+          : `terminal-session:${session.name}`
+      )),
+    ],
+  });
 
   await initTempFileStore();
   logger.info('Temp file store initialized');
@@ -545,13 +671,30 @@ export async function startup(): Promise<DaemonContext> {
   logger.info('File transfer initialized');
   await initializeDirectFileTransfer();
 
+  const useContextStoreWorker = !(process.env.VITEST || process.env.NODE_ENV === 'test');
+  if (useContextStoreWorker) {
+    // Start the context-store worker BEFORE any context-store-backed warm-load.
+    // Regression: the short-ref warm-load used to fire above this point, so a
+    // production daemon could open the SQLite store on the main thread before the
+    // worker became the single owner. That poisoned the worker-only invariant and
+    // showed up later as repeated worker timeouts plus failed short-ref persists.
+    getContextStoreClient().start();
+    // The worker is now the single long-lived DB owner — let it (not the
+    // main-thread connection) run the archive-backfill timer.
+    setArchiveBackfillSchedulingEnabled(false);
+  }
+
   // Warm the memory short-ref index so handles injected before this restart
   // still resolve. Resolution is synchronous (it runs inside render paths), so
-  // the durable map is read once here rather than per lookup. Best-effort: a
-  // cold index only means a handle re-registers on its next injection.
-  void loadMemoryShortRefsFromStore()
-    .then((loaded) => { if (loaded > 0) logger.info({ loaded }, 'Memory short-ref index warmed'); })
-    .catch(() => { /* non-fatal: handles are a pure function of the id */ });
+  // the durable map is read once here rather than per lookup. In production this
+  // must wait for the worker owner instead of falling back to an in-process
+  // SQLite connection; tests/CLI keep the original in-process path. Best-effort:
+  // a cold index only means a handle re-registers on its next injection.
+  void (async () => {
+    if (useContextStoreWorker) await getContextStoreClient().whenReady();
+    const loaded = await loadMemoryShortRefsFromStore();
+    if (loaded > 0) logger.info({ loaded }, 'Memory short-ref index warmed');
+  })().catch(() => { /* non-fatal: handles are a pure function of the id */ });
 
   // Clean up old timeline files (>7 days) and truncate oversized ones.
   //
@@ -598,32 +741,27 @@ export async function startup(): Promise<DaemonContext> {
   const serverId = creds?.serverId ?? '';
   const token = creds?.token ?? '';
   configureSharedContextRuntime(creds ? { workerUrl: workerUrl!, serverId, token } : null);
-  // Warm the context-store worker at boot so front-of-turn recall + store access
-  // run off the daemon main thread. Skipped under test (the in-process path is
-  // used there, matching the embedding engine's test behavior); recall callers
-  // fall back to in-process automatically until the worker reports ready.
-  if (!(process.env.VITEST || process.env.NODE_ENV === 'test')) {
-    getContextStoreClient().start();
-    // The worker is now the single long-lived DB owner — let it (not the
-    // main-thread connection) run the archive-backfill timer.
-    setArchiveBackfillSchedulingEnabled(false);
-  }
   if (creds) {
+    cleanupAbandonedCapabilityQuarantine();
     try {
       const runtimeConfig = await fetchBackendSharedContextRuntimeConfig({ workerUrl: workerUrl!, serverId, token });
       setContextModelRuntimeConfig(runtimeConfig);
     } catch (err) {
       logger.warn({ err, serverId }, 'shared-context runtime config bootstrap failed');
     }
-    // Prime the supervisor global-defaults cache so the very first
-    // supervision dispatch after startup uses the current custom
-    // instructions even if no session's cached snapshot carries them.
+    // Prime the account-level supervisor runtime so the first decision uses
+    // the current primary/backup selection and global instructions even when
+    // a session carries an older compatibility snapshot.
     // Fire-and-forget: failure just means the daemon falls through to
     // the snapshot mirror. The WS-reconnect hook below keeps it fresh.
     void (async () => {
       try {
-        const { refreshSupervisorDefaultsCache } = await import('./supervisor-defaults-cache.js');
+        const {
+          refreshSupervisorDefaultsCache,
+          startSupervisorDefaultsCacheRefresh,
+        } = await import('./supervisor-defaults-cache.js');
         await refreshSupervisorDefaultsCache();
+        startSupervisorDefaultsCacheRefresh();
       } catch (err) {
         logger.debug({ err }, 'supervisor-defaults-cache: startup prime failed');
       }
@@ -648,6 +786,9 @@ export async function startup(): Promise<DaemonContext> {
     // restoreFromStore must NEVER crash the daemon — log and continue.
     // Sessions may not be restored, but daemon stays alive for WS/heartbeat.
     logger.error({ err }, 'restoreFromStore failed — daemon continues without session restore');
+  } finally {
+    // Done either way: a failed restore has nothing left running that an upgrade could wait for.
+    markStartupPhaseDone(DAEMON_STARTUP_PHASE.SESSIONS_RECONCILED);
   }
 
   // Initialize the command.ack outbox before serverLink connects so any
@@ -684,6 +825,9 @@ export async function startup(): Promise<DaemonContext> {
       }
       return resolveTransportContextBootstrap({
         projectDir: latest.projectDir,
+        sessionId: latest.name,
+        providerId: latest.providerId ?? latest.agentType,
+        serverId: serverId || undefined,
         transportConfig: latest.transportConfig ?? {},
         startupMemoryAlreadyInjected: true,
       });
@@ -696,7 +840,97 @@ export async function startup(): Promise<DaemonContext> {
   let serverLink: ServerLink | null = null;
   let scheduleServerLinkRestoreBroadcast: (() => void) | null = null;
   if (creds) {
-    serverLink = new ServerLink({ workerUrl: workerUrl!, serverId, token });
+    serverLink = new ServerLink({ workerUrl: workerUrl!, serverId, token, authorizedSessions: listSessions().map((session) => session.name), authorizedSessionsProvider: () => listSessions().map((session) => session.name) });
+    const capabilityBlobClient = createCapabilityBlobHttpClient({
+      serverId,
+      loadCredentials: async () => ({ serverId, token, workerUrl: workerUrl! }),
+    });
+    const capabilitySourceConvergenceStore = new CapabilitySourceConvergenceStore();
+    const capabilityServicesByOwner = new Map<string, DaemonCapabilityServiceAdapter>();
+    const capabilitySyncServicesByOwner = new Map<string, CapabilitySyncService>();
+    setServerLinkDisconnectSecurityHandler(() => {
+      for (const ownerId of new Set([...capabilityServicesByOwner.keys(), ...capabilitySyncServicesByOwner.keys()])) {
+        clearCapabilityAuthorizationKeys(ownerId, serverId);
+      }
+    });
+    const capabilitySyncServiceForOwner = (ownerId: string): CapabilitySyncService => {
+      let service = capabilitySyncServicesByOwner.get(ownerId);
+      if (!service) {
+        const runtime = createCapabilitySyncRuntime({
+          ownerId,
+          serverId,
+          blobClient: capabilityBlobClient,
+          convergenceStore: capabilitySourceConvergenceStore,
+        });
+        service = new CapabilitySyncService({
+          ownerId,
+          serverId,
+          loadSkillContent: runtime.loadSkillContent,
+          publishSkill: runtime.publishSkill,
+          reconcileSkill: runtime.reconcileSkill,
+          send: (frame) => serverLink!.send(frame),
+        });
+        capabilitySyncServicesByOwner.set(ownerId, service);
+      }
+      return service;
+    };
+    const capabilityOperationHandler = new CapabilityOperationHandler({
+      isFullDaemon: true,
+      serverId,
+      serviceForOwner: (ownerId) => {
+        let service = capabilityServicesByOwner.get(ownerId);
+        if (!service) {
+          service = new DaemonCapabilityServiceAdapter({
+            ownerId,
+            serverId,
+            conversationIdentity: `imcodes-server-capability:${serverId}`,
+          });
+          capabilityServicesByOwner.set(ownerId, service);
+        }
+        return service;
+      },
+      send: (frame) => serverLink!.send(frame),
+      blobClient: capabilityBlobClient,
+      convergenceStore: capabilitySourceConvergenceStore,
+      onBlobUploadFailure: (failure) => {
+        logger.warn({
+          capabilityId: failure.capabilityId,
+          versionId: failure.versionId,
+          readiness: failure.readiness,
+          errorCode: failure.errorCode,
+        }, 'Capability source blob upload failed closed');
+      },
+    });
+    if (capabilityCandidateCleanupTimer) clearInterval(capabilityCandidateCleanupTimer);
+    capabilityCandidateCleanupTimer = setInterval(() => {
+      void capabilityOperationHandler.cleanupExpiredCandidates().catch((error) => {
+        logger.warn({ error }, 'Expired capability candidate cleanup failed closed');
+      });
+    }, 60_000);
+    capabilityCandidateCleanupTimer.unref?.();
+    serverLink.onOpen(() => {
+      void capabilityOperationHandler.replayPending().catch((error) => {
+        logger.warn({ error }, 'Capability operation outbox replay failed');
+      });
+    });
+    const capabilitySyncHandler = new CapabilitySyncFrameHandler({
+      serviceForOwner: capabilitySyncServiceForOwner,
+      requestFullSnapshot: () => serverLink!.send({ type: CAPABILITY_SYNC_MSG.REQUEST }),
+      onError: (error, context) => {
+        if (context.ownerId) clearCapabilityAuthorizationKeys(context.ownerId, serverId);
+        else {
+          for (const ownerId of capabilitySyncServicesByOwner.keys()) {
+            clearCapabilityAuthorizationKeys(ownerId, serverId);
+          }
+        }
+        // Logged under `err` so pino's error serializer runs. Under a plain
+        // `error` key the Error's `message` and `stack` are non-enumerable and
+        // are silently dropped, leaving only own properties like `code` — which
+        // is how a Windows fleet spent hours emitting this warning every 30s
+        // with no indication of what actually failed.
+        logger.warn({ err: error, ...context }, 'Capability synchronization failed closed');
+      },
+    });
     // Heal the exact loss window observed on deck_sub_26624c1t: an
     // authoritative `session.state: idle` emitted while the ServerLink socket
     // was down is silently dropped (control-plane, no replay), leaving the
@@ -704,6 +938,7 @@ export async function startup(): Promise<DaemonContext> {
     // each RE-connect, re-broadcast every transport session's current state.
     setServerLinkReconnectResyncHandler(() => {
       resyncTransportSessionStatesAfterLinkRestore();
+      void reconcileDurableTransportQueues();
       // Sub-sessions need the same treatment.
       //
       // The server drops its `activeSubSessions` map when the daemon socket
@@ -732,7 +967,30 @@ export async function startup(): Promise<DaemonContext> {
       send: (message) => link.send(message as never),
       onCapabilityChange: () => link.refreshDaemonCapabilities(),
     }));
+    void refreshDaemonRemoteDesktop();
     serverLink.onMessage((msg) => {
+      const type = msg && typeof msg === 'object' && 'type' in msg ? (msg as { type?: unknown }).type : undefined;
+      if (type === CAPABILITY_OPERATION_MSG.INSTALL
+        || type === CAPABILITY_OPERATION_MSG.CONFIRM
+        || type === CAPABILITY_OPERATION_MSG.CANCEL
+        || type === CAPABILITY_OPERATION_MSG.AUTHORIZE
+        || type === CAPABILITY_OPERATION_MSG.COMMIT_ACK
+        || type === CAPABILITY_OPERATION_MSG.COMMIT_ABORT
+        || type === CAPABILITY_OPERATION_MSG.MANAGE
+        || type === CAPABILITY_OPERATION_MSG.MANAGE_ACK
+        || type === CAPABILITY_SYNC_MSG.BLOB_CAPABILITY) {
+        void capabilityOperationHandler.handle(msg).catch((error) => {
+          logger.warn({ error, type }, 'Capability operation handler failed closed');
+        });
+        return;
+      }
+      if (type === CAPABILITY_SYNC_MSG.SNAPSHOT
+        || type === CAPABILITY_SYNC_MSG.DELTA
+        || type === CAPABILITY_SYNC_MSG.TOMBSTONE
+        || type === CAPABILITY_SYNC_MSG.AUTHORITY) {
+        void capabilitySyncHandler.handle(msg);
+        return;
+      }
       handleWebCommand(msg, serverLink!);
     });
     serverLink.onBinaryMessage((data) => {
@@ -821,8 +1079,12 @@ export async function startup(): Promise<DaemonContext> {
               quotaLabel: session.quotaLabel ?? null,
               quotaUsageLabel: session.quotaUsageLabel ?? null,
               quotaMeta: session.quotaMeta ?? null,
+              codexCreditsBalance: session.codexCreditsBalance ?? null,
+              codexCreditsHasCredits: session.codexCreditsHasCredits ?? null,
+              codexCreditsUnlimited: session.codexCreditsUnlimited ?? null,
               effort: session.effort ?? null,
               transportConfig: session.transportConfig ?? null,
+              supervisionHeartbeat: getSupervisionHeartbeatProjectionForWire(session.name) ?? null,
               ...(transportRuntime ? buildTransportQueueSnapshotPayload(session.name, 'lifecycle') : {}),
             });
           } catch { /* ignore */ }
@@ -881,6 +1143,8 @@ export async function startup(): Promise<DaemonContext> {
     liveContextIngestion.handleTimelineEvent(e);
     if (e.type === 'session.state' && (e.payload as Record<string, unknown>).state === 'idle') {
       notifySessionIdle(e.sessionId);
+      // The turn is over: a participant's machine-authority window on a process session ends here.
+      releaseProcessSharedMachineAuthority(e.sessionId);
       void drainQueue(e.sessionId);
     }
   });
@@ -1057,13 +1321,42 @@ export async function startup(): Promise<DaemonContext> {
   if (serverLink) {
     const sentEventIds = new Set<string>();
     const DEDUP_MAX = 2000;
+    const latestValues = new Map<string, TimelineEvent>();
+    let latestFlushTimer: ReturnType<typeof setTimeout> | null = null;
+    const latestFlushMs = Number.parseInt(process.env.IMCODES_TIMELINE_LATEST_COALESCE_MS ?? '40', 10);
+
+    const sendTimelineNow = (event: TimelineEvent): void => {
+      // For session.state idle, attach lastText so push notifications have context.
+      // Skip shell/script — they are always idle, no useful notification.
+      if (event.type === 'session.state' && (event.payload as Record<string, unknown>).state === 'idle') {
+        const rec = listSessions().find((s) => s.name === event.sessionId);
+        if (rec?.agentType === 'shell' || rec?.agentType === 'script') return;
+        void getLastAssistantText(event.sessionId).then((lastText) => {
+          serverLink!.send({ type: 'timeline.event', event, ...(lastText ? { lastText } : {}) });
+        }).catch(() => {
+          serverLink!.send({ type: 'timeline.event', event });
+        });
+        return;
+      }
+      serverLink.sendTimelineEvent(event);
+    };
+
+    const flushLatestValues = (): void => {
+      latestFlushTimer = null;
+      const values = [...latestValues.values()];
+      latestValues.clear();
+      for (const event of values) sendTimelineNow(event);
+    };
+
+    const scheduleLatestValue = (event: TimelineEvent): void => {
+      latestValues.set(`${event.sessionId}\0${event.type}`, event);
+      if (latestFlushTimer) return;
+      latestFlushTimer = setTimeout(flushLatestValues, Number.isFinite(latestFlushMs) ? Math.max(0, latestFlushMs) : 40);
+      latestFlushTimer.unref?.();
+    };
 
     timelineEmitter.on((event) => {
-      // Transport streaming events reuse the same eventId for in-place replacement
-      // (typewriter effect). Don't dedup them — every delta AND the final event
-      // must reach the browser. The `transport:` prefix identifies these events.
-      const isTransportStream = event.eventId?.startsWith('transport:') ?? false;
-      if (event.eventId && sentEventIds.has(event.eventId) && !isTransportStream) return;
+      if (isDuplicateTimelineForward(event, sentEventIds)) return;
       if (event.eventId) {
         sentEventIds.add(event.eventId);
         if (sentEventIds.size > DEDUP_MAX) {
@@ -1076,20 +1369,17 @@ export async function startup(): Promise<DaemonContext> {
           for (const v of keep) sentEventIds.add(v);
         }
       }
-      // For session.state idle, attach lastText so push notifications have context
-      // Skip shell/script — they are always idle, no useful notification
-      if (event.type === 'session.state' && (event.payload as Record<string, unknown>).state === 'idle') {
-        const rec = listSessions().find((s) => s.name === event.sessionId);
-        if (rec?.agentType === 'shell' || rec?.agentType === 'script') return;
-        void getLastAssistantText(event.sessionId).then((lastText) => {
-          serverLink!.send({ type: 'timeline.event', event, ...(lastText ? { lastText } : {}) });
-        }).catch(() => {
-          serverLink!.send({ type: 'timeline.event', event });
-        });
+      // Latest-value signals are trailing-coalesced per session. Durable
+      // conversation/tool/final events stay ordered and are sent immediately;
+      // the final state is always the value flushed for its session.
+      if (event.type === 'agent.status' || event.type === 'usage.update' || event.type === 'session.state') {
+        scheduleLatestValue(event);
       } else {
-        serverLink!.sendTimelineEvent(event);
+        sendTimelineNow(event);
       }
-    });
+    // User-delete tombstones must reach viewers and other devices, so this
+    // forwarder (and only it) opts in.
+    }, { includeUserDeleted: true });
   }
 
   // Set up router context so inbound chat messages can be dispatched to routeMessage
@@ -1128,6 +1418,9 @@ export async function startup(): Promise<DaemonContext> {
       const record = sessions.find((s) => s.name === payload.session);
       const display = resolvePushDisplayContext(payload.session, sessions);
       if (payload.event === 'idle') {
+        // Hooks are one of the idle observation paths; reconcile the durable
+        // queue even when this particular runtime missed the in-process edge.
+        void reconcileDurableTransportQueues();
         // Shell/script sessions are always "idle" — skip to avoid noise
         if (record?.agentType === 'shell' || record?.agentType === 'script') return;
         // notifySessionIdle is handled by the unified timeline listener below
@@ -1169,26 +1462,178 @@ export async function startup(): Promise<DaemonContext> {
         serverLink.send({ type: 'session.tool', session: payload.session, tool: null });
       }
     } catch { /* not connected */ }
+  }, {
+    // Memory MCP children receive this same daemon-owned ServerLink id in
+    // their sanitized environment. Supplying it independently here lets the
+    // hook accept legacy daemon-local namespaces without trusting a
+    // child-provided server id or waiting for capability authority hydration.
+    memoryMcpServerId: serverId || undefined,
+    // The daemon owns this listener for the whole process lifetime, so an
+    // unexpected loss must self-heal (rebind + republish authority) instead of
+    // leaving the machine with no hook endpoint until a full daemon restart.
+    rebindOnListenerLoss: true,
   });
   hookServer = hookResult.server;
   // Rewrite all CC hook scripts with the actual port (may differ from last run)
   await setupCCHooks().catch((e) => logger.warn({ err: e }, 'CC hook setup failed'));
 
+  setTransportSessionRestoredCallback((sessionName) => {
+    supervisionAutomation.applyPersistedSnapshot(sessionName);
+  });
+  // Coalesce schedule transitions into the existing session snapshot channels.
+  // The browser ticks locally; only a new deadline/state causes daemon traffic.
+  setSupervisionHeartbeatProjectionListener(createSupervisionHeartbeatProjectionSyncHandler({
+    getServerLink: () => serverLink,
+    onError: (error, sessions) => {
+      logger.warn({ err: error, sessions }, 'Supervision heartbeat projection sync failed');
+    },
+  }));
   supervisionAutomation.init();
+  taskPairService.init();
+  // A pair participant's git write in the main checkout is refused before it runs where the provider has a pre-tool hook.
+  setTransportToolExecutionEvaluator((sessionName, request) => {
+    const hit = evaluatePairMainCheckoutGitWrite(sessionName, request.toolName, request.input, { cwd: request.cwd });
+    return hit ? { allow: false, reason: mainCheckoutWriteRefusal(hit) } : { allow: true };
+  });
+  taskPairService.setScheduler(taskPairAutomation);
+  taskPairAutomation.start();
+  // In-flight legacy tasks of `pairs` projects are imported once; off the startup path.
+  setImmediate(() => {
+    void (async () => {
+      try {
+        const [{ importLegacyTasks }, { getSupervisionTaskRegistry }] = await Promise.all([
+          import('./task-pairs/legacy-import.js'),
+          import('./supervision-state-store.js'),
+        ]);
+        importLegacyTasks(getSupervisionTaskRegistry());
+      } catch (error) {
+        logger.warn({ err: error }, 'task-pair: legacy import failed');
+      }
+    })();
+  });
   supervisionAutomation.setServerLink(serverLink);
+  // One recovery pass closes the durable ready_for_audit -> dispatch crash
+  // window. Post-open hooks own normal materialization; no polling worker.
+  // Restart identity convergence needs the daemon's real view of live runtimes.
+  // Without this the singleton registry had no resolver and every rotated
+  // instance/epoch was refused as owner_mismatch in production while passing in
+  // tests that injected one.
+  setSupervisionLiveParticipantsResolver(
+    (projectName) => resolveLiveSupervisionParticipants(projectName),
+  );
+  void dispatchReadyAuditSweep().catch((err) => {
+    logger.warn({ err }, 'automatic supervision audit boot sweep failed');
+  });
+
+  // Supervision task console: durable SQLite projection -> outbox -> this link.
+  // Capability injection, no process-global registry: the binding receives the
+  // link and its own database and owns nothing ambient. A failure here must not
+  // take the daemon down, so it is logged and the rest of startup continues.
+  try {
+    if (!serverLink) throw new Error('no server link');
+    // Live participant presentation, memoized per session for bulk passes; the
+    // timeline hook below invalidates a session's entry on every event that can
+    // change it (see supervision-session-presentation.ts).
+    const supervisionPresentation = createSupervisionSessionPresentationResolver({
+      getSession,
+      isWaitingForUserInput: (sessionName) => supervisionAutomation.isWaitingForUserInput(sessionName),
+      observeListState: resolveAuthoritativeSessionListState,
+      isSessionWorking,
+      resolveMissing: resolveMissingSupervisionSessionPresentation,
+    });
+    supervisionConsole = createProductionSupervisionConsoleBinding({
+      serverLink,
+      registry: getSupervisionTaskRegistry(),
+      // Snapshot projection can enumerate hundreds of assignments and owner
+      // state. Keep the authenticated WS callback responsive in the daemon;
+      // unit/integration bindings retain synchronous delivery by default.
+      deferSnapshots: true,
+      // Only the coordinator that owns a project scope may subscribe to it.
+      authorize: (scope) => isAuthorizedSupervisionConsoleScope(scope, listSessions()),
+      resolveSessionPresentation: (sessionName, durableObservedAt) => supervisionPresentation.resolve(sessionName, durableObservedAt),
+      onError: (error) => logger.warn({ error }, 'supervision console projection unavailable'),
+    });
+    logger.info({ epoch: supervisionConsole.projectionEpoch }, 'supervision console bound');
+    // Pair changes refresh the task console and the session badges, coalesced
+    // per project so a burst of markers costs one refresh. The console gets a
+    // one-pair delta for the pairs that changed; a legacy console viewer still
+    // re-subscribes for a full snapshot.
+    const pairRefresh = createSupervisionPairRefreshScheduler({
+      participantsOf: (project, taskId) => {
+        const state = getTaskPairStore().getPair(project, taskId)?.state;
+        return [state?.executor, state?.auditor].filter((name): name is string => Boolean(name));
+      },
+      invalidatePresentation: (sessionName) => supervisionPresentation.invalidate(sessionName),
+      pairsChanged: (project, taskIds, reason) => supervisionConsole?.sessions.pairsChanged(project, taskIds, reason),
+      // Badges follow pair rows, reminders and session state, and the timeline
+      // observer above already republishes on a session's running/idle change
+      // and on user messages. A flush that only saw streamed activity has
+      // nothing new for them, and this ran a full pass every 250 ms per
+      // project for as long as any session streamed.
+      publishBadges: () => taskPairAutomation.publishBadges(),
+    });
+    const schedulePairRefresh = pairRefresh.schedule;
+    getTaskPairStore().onPairSaved((project, taskId) => schedulePairRefresh(project, taskId, 'task_pair_changed'));
+    // State/tool events change live executorState/auditorState in the status
+    // payload even when no pair row was saved. Resolve by participant so main
+    // sessions and sub-sessions follow the same refresh path.
+    timelineEmitter.on((event) => {
+      // The pairs engine owns the Brain heartbeat projection. Keep this call
+      // before the participant-only refresh filter so user messages and
+      // needs-input status from the main session can pause/re-arm it too.
+      taskPairAutomation.observeTimelineEvent(event);
+      if (event.type !== 'session.state' && event.type !== 'assistant.thinking' && event.type !== 'assistant.text'
+        && event.type !== 'tool.call' && event.type !== 'tool.result') return;
+      for (const pair of getTaskPairStore().pairsForSession(event.sessionId)) {
+        schedulePairRefresh(pair.project, pair.state.taskId, 'session_activity_changed');
+      }
+    });
+  } catch (err) {
+    supervisionConsole = undefined;
+    logger.warn({ err }, 'supervision console binding failed');
+  }
 
   ctx = { config, serverLink, persistBinding, removeBinding, sendSessionEvent };
+  updateInstanceLockDiagnostics(lockServer, {
+    sessionIds: listSessions().map((session) => session.name),
+    residualResources: [
+      `instance-lock:${lockServer.socketPath}`,
+      ...(hookServer ? ['mcp-ingress:hook-server'] : []),
+      ...(serverLink ? ['browser-link:server-websocket'] : []),
+      ...(process.platform === 'linux' ? ['container-authority:systemd-control-group'] : []),
+      ...listSessions().map((session) => (
+        session.runtimeType === 'transport' || isTransportAgent(session.agentType)
+          ? `transport-session:${session.name}`
+          : `terminal-session:${session.name}`
+      )),
+    ],
+  });
   setupSignalHandlers();
   startHealthPoller();
+  startDurableTransportQueueSweep();
   startCodexQuotaPoller(serverLink);
   startContextReplicationPoller(workerUrl, serverId, token);
   startUsageSyncWorker(workerUrl, serverId, token);
+  // PROJECT/SESSION/USER identity writes report themselves to the server
+  // over this same WS connection (never HTTP -- owner rule,
+  // tsk_cd_identity_daemon_storage). Set once here; session-identity-local-store.ts
+  // calls it on every local write.
+  if (serverLink) {
+    setSessionIdentityReportSender((report) => serverLink!.send(report));
+    void requestSessionIdentityMigration(serverLink);
+  }
+  startSessionIdentitySync((message) => {
+    logger.warn({ reason: message }, 'session identity synchronization failed');
+  });
   startContextMaterializationPoller(liveContextIngestion);
   startGcPoller();
+  startDaemonMemoryGuard();
   startEventLoopDelayMonitor();
+  startEventLoopWatchdog();
   startLatencyTracer();
 
   logger.info('Daemon started');
+  cgroupValidationProbes?.markReady();
 
   if (serverLink) {
     serverLink.connect();
@@ -1235,6 +1680,16 @@ export async function startup(): Promise<DaemonContext> {
       logger,
     });
     workerSessionSyncRetrier.start(startupWorkerSessionSyncOutcome.reason ?? 'startup_sync_failed');
+  }
+  if (process.platform === 'darwin') {
+    scheduleDaemonStartupBackgroundTask(
+      'macOS launch agent and Full Disk Access check',
+      async () => {
+        const { runMacosLaunchHealth } = await import('./macos-launch-health.js');
+        await runMacosLaunchHealth();
+      },
+      startupBackgroundBaseDelayMs + STARTUP_MACOS_LAUNCH_HEALTH_DELAY_MS,
+    );
   }
   scheduleDaemonStartupBackgroundTask(
     'shared-context startup timeline backfill',
@@ -1302,7 +1757,9 @@ function hasRestorableLocalTransportSessions(
     if (!(s.runtimeType === 'transport' || isTransportAgent(s.agentType))) return false;
     if (effectiveProviderId !== providerId) return false;
     if (!s.providerSessionId) return false;
-    if (options.onlyWithPendingResend && getResendCount(s.name) === 0) return false;
+    if (options.onlyWithPendingResend
+      && getResendCount(s.name) === 0
+      && !getTransportQueueStore().listLiveQueueSessions().some((item) => item.sessionName === s.name)) return false;
     if (options.onlyMissingRuntime && getTransportRuntime(s.name)?.providerSessionId) return false;
     return true;
   });
@@ -1328,7 +1785,9 @@ async function slowWarmRestoreTransportProviders(): Promise<void> {
         await ensureProviderConnected(providerId, {});
         await restoreTransportSessions(providerId, {
           concurrency: 1,
-          interSessionDelayMs: TRANSPORT_SLOW_RESTORE_INTER_SESSION_DELAY_MS,
+          // No fixed gap: the floor is RESTORE_PACING_MIN_GAP_MS, then each restore waits for the event loop to recover.
+          interSessionDelayMs: 0,
+          paceByEventLoopHealth: true,
         });
       } catch (err) {
         logger.warn({ err, providerId }, 'Delayed transport runtime warm restore failed');
@@ -1340,6 +1799,7 @@ async function slowWarmRestoreTransportProviders(): Promise<void> {
     await task;
   } finally {
     if (slowTransportWarmRestoreInFlight === task) slowTransportWarmRestoreInFlight = null;
+    markStartupPhaseDone(DAEMON_STARTUP_PHASE.TRANSPORT_WARM_RESTORED);
   }
 }
 
@@ -1362,6 +1822,9 @@ async function autoReconnectProviders(): Promise<void> {
         logger.warn({ err, providerId }, 'Local transport provider auto-connect failed');
       }
     }
+    // The sessions that had queued/resend messages are restored and resumed. The OpenClaw reconnect below retries
+    // forever, so it must not be what an upgrade waits for.
+    markStartupPhaseDone(DAEMON_STARTUP_PHASE.TRANSPORT_RESUMED);
 
     const ocConfig = await loadOcConfig();
     if (ocConfig) {
@@ -1393,46 +1856,95 @@ async function autoReconnectProviders(): Promise<void> {
     }
   } catch (err) {
     logger.warn({ err }, 'Provider auto-reconnect check failed');
+    markStartupPhaseDone(DAEMON_STARTUP_PHASE.TRANSPORT_RESUMED);
   }
 }
 
-/** Shutdown sequence: flush store, disconnect WS, release lock, exit cleanly */
-export async function shutdown(exitCode = 0): Promise<void> {
+let shutdownInFlight: Promise<void> | null = null;
+
+/** Shutdown sequence: flush store, disconnect WS, release lock, exit cleanly. */
+export function shutdown(exitCode = 0): Promise<void> {
+  if (shutdownInFlight) return shutdownInFlight;
+  shutdownInFlight = performShutdown(exitCode);
+  return shutdownInFlight;
+}
+
+async function performShutdown(exitCode: number): Promise<void> {
   logger.info('Daemon shutting down');
-
-  // Peer-audit attempts are intentionally not restart-resumable. Cancel
-  // deadlines/queued dispatches and close the dedicated reply ingress before
-  // timeline and queue stores are drained.
-  peerAuditService.shutdown();
-
-  await shutdownDirectFileTransfers().catch((err) => {
-    logger.warn({ err }, 'Daemon shutdown direct file transfer cleanup failed');
-  });
-
-  // The native worker is a separate process; leaving it running would keep a
-  // capture session and its named pipe alive past the daemon that owns it.
-  closeDaemonRemoteDesktop();
-
-  // Kill all ConPTY sessions (they don't survive daemon exit like tmux)
-  if ((BACKEND as string) === 'conpty') {
-    try {
-      const conpty = await import('../agent/conpty.js');
-      const names: string[] = conpty.conptyListSessions();
-      for (const name of names) {
-        try {
-          conpty.conptyKillSession(name);
-        } catch (e) {
-          logger.warn({ err: e, session: name }, 'Failed to kill ConPTY session during shutdown');
-        }
+  // First thing, before any teardown can be slow or fail: this exit is on purpose (SIGTERM from `systemctl restart`,
+  // which the upgrade script itself uses, included), so the next process is not "recovering from a crash".
+  markGracefulShutdownStarted();
+  const orderedShutdown = await runOrderedDaemonShutdown({
+    session: async () => {
+      logger.info({ shutdownPhase: 'session' }, 'Daemon shutdown phase session started');
+      // Stop new delegated/session work before tearing down its transports.
+      peerAuditService.shutdown();
+      if ((BACKEND as string) === 'conpty') {
+        const conpty = await import('../agent/conpty.js');
+        for (const name of conpty.conptyListSessions()) await conpty.conptyKillSession(name);
       }
-    } catch { /* conpty not available */ }
-  }
-
-  try {
-    const { terminalStreamer } = await import('./terminal-streamer.js');
-    await terminalStreamer.destroyAsync();
-  } catch (err) {
-    logger.warn({ err }, 'Daemon shutdown terminal streamer drain failed');
+      await cgroupValidationProbes?.stopPhase('session');
+      logger.info({ shutdownPhase: 'session' }, 'Daemon shutdown phase session completed');
+    },
+    mcp: async () => {
+      logger.info({ shutdownPhase: 'mcp' }, 'Daemon shutdown phase MCP started');
+      // SDK transport sessions own their MCP child processes. Disconnecting
+      // every provider closes those children before browser/container teardown.
+      const { disconnectAll } = await import('../agent/provider-registry.js');
+      await disconnectAll();
+      if (hookServer) {
+        // MUST go through closeHookServer: a bare close() now looks like an
+        // unexpected listener loss and would arm the hook server's rebind path
+        // in the middle of shutdown.
+        await closeHookServer(hookServer);
+        hookServer = null;
+      }
+      await cgroupValidationProbes?.stopPhase('mcp');
+      logger.info({ shutdownPhase: 'mcp' }, 'Daemon shutdown phase MCP completed');
+    },
+    browser: async () => {
+      logger.info({ shutdownPhase: 'browser' }, 'Daemon shutdown phase browser started');
+      try {
+        const { shutdownDefaultPreviewReadCoordinatorForDaemon } = await import('./file-preview-read-coordinator.js');
+        await shutdownDefaultPreviewReadCoordinatorForDaemon();
+      } catch (err) {
+        logger.warn({ errorKind: err instanceof Error ? err.name : typeof err }, 'Daemon shutdown preview read drain failed');
+      }
+      const { terminalStreamer } = await import('./terminal-streamer.js');
+      await terminalStreamer.destroyAsync();
+      closeDaemonRemoteDesktop();
+      ctx?.serverLink?.disconnect();
+      try {
+        const { closeComputerUseRuntimeForProcessExit } = await import('../node/computer-use-runner.js');
+        await closeComputerUseRuntimeForProcessExit();
+      } catch (error) {
+        logger.warn({ errorKind: error instanceof Error ? error.name : typeof error }, 'Daemon shutdown browser runtime cleanup failed');
+        throw error;
+      }
+      await cgroupValidationProbes?.stopPhase('browser');
+      logger.info({ shutdownPhase: 'browser' }, 'Daemon shutdown phase browser completed');
+    },
+    container: async () => {
+      logger.info({ shutdownPhase: 'container' }, 'Daemon shutdown phase container started');
+      await shutdownDirectFileTransfers();
+      await cgroupValidationProbes?.stopPhase('container');
+      logger.info({ shutdownPhase: 'container' }, 'Daemon shutdown phase container completed');
+    },
+  }, {
+    phaseTimeoutMs: 10_000,
+    forceKill: async (phase, failure) => {
+      // Individual runtime owners already perform TERM→KILL escalation. If a
+      // phase still times out, exit non-zero below; systemd's control-group
+      // authority then applies the final bounded SIGKILL to every descendant.
+      logger.error({ phase, failure }, 'Daemon shutdown phase failed; forcing bounded process-group cleanup');
+      if (phase === 'browser') {
+        closeDaemonRemoteDesktop();
+        ctx?.serverLink?.disconnect();
+      }
+    },
+  });
+  if (!orderedShutdown.ok) {
+    logger.error({ failures: orderedShutdown.failures }, 'Daemon shutdown failed closed');
   }
 
   try {
@@ -1481,16 +1993,46 @@ export async function shutdown(exitCode = 0): Promise<void> {
     logger.warn({ err }, 'Daemon shutdown timeline drain failed');
   }
 
+  // recordTurnUsage is fired-and-forgotten from timelineEmitter.emit (nothing
+  // on the heartbeat/ack/send path may await it), which is exactly the SIGTERM
+  // race a synchronous write used to avoid before it became async. Give any
+  // in-flight write a few seconds to land before the process exits under it;
+  // whatever is still pending past that budget is abandoned, not awaited
+  // further, so a stalled worker can never hang shutdown itself.
   try {
-    const { disconnectAll } = await import('../agent/provider-registry.js');
-    await disconnectAll();
-  } catch { /* ignore */ }
-
-  try {
-    const { shutdownDefaultPreviewReadCoordinatorForDaemon } = await import('./file-preview-read-coordinator.js');
-    await shutdownDefaultPreviewReadCoordinatorForDaemon();
+    const usageDrainStart = Date.now();
+    const usageDrain = await timelineEmitter.drainUsageWrites(3_000);
+    if (usageDrain.abandoned > 0) {
+      logger.warn({ ...usageDrain, elapsedMs: Date.now() - usageDrainStart }, 'Daemon shutdown: usage-record writes abandoned at the drain budget');
+    } else if (usageDrain.pendingAtStart > 0) {
+      logger.info({ ...usageDrain, elapsedMs: Date.now() - usageDrainStart }, 'Daemon shutdown: usage-record writes drained');
+    }
   } catch (err) {
-    logger.warn({ errorKind: err instanceof Error ? err.name : typeof err }, 'Daemon shutdown preview read drain failed');
+    logger.warn({ err }, 'Daemon shutdown usage-record drain failed');
+  }
+
+  // applyMarker's fire-and-forget background work (running intents, briefing
+  // participants, ending or refreshing a workspace) is tracked and given a
+  // `.catch()` at creation (service.ts's #track), which alone stops it from
+  // ever surfacing as an unhandled rejection. This additionally gives it a
+  // real chance to land before exit -- bounded, so a stalled send or a
+  // wedged git call can never hang shutdown itself.
+  try {
+    const pairsDrainStart = Date.now();
+    const pendingAtStart = taskPairService.pendingCount;
+    const abandoned = await Promise.race([
+      taskPairService.dispose().then(() => 0),
+      new Promise<number>((resolve) => {
+        setTimeout(() => resolve(taskPairService.pendingCount), 3_000).unref?.();
+      }),
+    ]);
+    if (abandoned > 0) {
+      logger.warn({ abandoned, pendingAtStart }, 'Daemon shutdown: task-pair background work still in flight at the deadline');
+    } else if (pendingAtStart > 0) {
+      logger.info({ pendingAtStart, elapsedMs: Date.now() - pairsDrainStart }, 'Daemon shutdown: task-pair background work drained');
+    }
+  } catch (err) {
+    logger.warn({ err }, 'Daemon shutdown task-pair drain failed');
   }
 
   try {
@@ -1516,24 +2058,43 @@ export async function shutdown(exitCode = 0): Promise<void> {
 
   try {
     if (healthTimer) clearInterval(healthTimer);
+    if (transportQueueSweepTimer) clearInterval(transportQueueSweepTimer);
     if (codexQuotaTimer) clearInterval(codexQuotaTimer);
     if (contextReplicationTimer) clearInterval(contextReplicationTimer);
     usageSyncWorker?.stop();
+    stopSessionIdentitySync();
     if (contextMaterializationTimer) clearInterval(contextMaterializationTimer);
     if (gcTimer) clearInterval(gcTimer);
+    stopMemoryGuard();
     if (eventLoopDelayTimer) clearInterval(eventLoopDelayTimer);
+    stopEventLoopWatchdog();
+    if (capabilityCandidateCleanupTimer) {
+      clearInterval(capabilityCandidateCleanupTimer);
+      capabilityCandidateCleanupTimer = null;
+    }
     workerSessionSyncRetrier?.stop();
     workerSessionSyncRetrier = null;
-    hookServer?.close();
-    ctx?.serverLink?.disconnect();
     configureSharedContextRuntime(null);
+    const { stopSupervisorDefaultsCacheRefresh } = await import('./supervisor-defaults-cache.js');
+    stopSupervisorDefaultsCacheRefresh();
     await flushStore();
     logger.info('Store flushed');
   } catch (e) {
     logger.error({ err: e }, 'Error during shutdown');
   }
 
-  if (lockServer) releaseInstanceLock(lockServer);
+  // Last spawner to go: later spawns (lock release, exit paths) run directly, not via the helper.
+  try {
+    await shutdownExecHelper();
+  } catch (err) {
+    logger.warn({ errorKind: err instanceof Error ? err.name : typeof err }, 'Daemon shutdown exec helper stop failed');
+  }
+
+  if (lockServer) {
+    await releaseInstanceLock(lockServer);
+    lockServer = null;
+  }
+  cgroupValidationProbes = null;
 
   if ((BACKEND as string) === 'conpty') {
     logger.info('Daemon stopped (ConPTY sessions killed)');
@@ -1541,7 +2102,7 @@ export async function shutdown(exitCode = 0): Promise<void> {
     // tmux/wezterm sessions are intentionally NOT killed — they keep running
     logger.info('Daemon stopped (tmux sessions left running)');
   }
-  process.exit(exitCode);
+  process.exit(Math.max(exitCode, orderedShutdown.exitCode));
 }
 
 const HEALTH_POLL_MS = 30_000;
@@ -1561,6 +2122,9 @@ const CONTEXT_MATERIALIZATION_POLL_MS = 15_000;
  */
 const GC_POLL_MS = parseInt(process.env.IMCODES_GC_POLL_MS ?? '300000', 10);
 let healthTimer: ReturnType<typeof setInterval> | null = null;
+let transportQueueSweepTimer: ReturnType<typeof setInterval> | null = null;
+let transportQueueSweepInFlight: Promise<void> | null = null;
+const orphanQueueRestoreAttempts = new Map<string, number>();
 const memoryCompressionAutoContinuedRunIds = new Set<string>();
 const codexAutoContinuedActivityGenerations = new Set<string>();
 let codexQuotaTimer: ReturnType<typeof setInterval> | null = null;
@@ -1569,6 +2133,7 @@ let usageSyncWorker: UsageSyncWorker | null = null;
 let contextMaterializationTimer: ReturnType<typeof setInterval> | null = null;
 let gcTimer: ReturnType<typeof setInterval> | null = null;
 let eventLoopDelayTimer: ReturnType<typeof setInterval> | null = null;
+let capabilityCandidateCleanupTimer: ReturnType<typeof setInterval> | null = null;
 let hookServer: http.Server | null = null;
 
 /** Mark an execution clone whose tmux pane has died as completed so the GC
@@ -1600,7 +2165,7 @@ function completeExecutionCloneOnPaneDeath(s: SessionRecord): void {
 
 /** Per-session health check. Exported so the execution-clone respawn-skip and
  *  the sweep can be asserted deterministically without the 30s tick (task 3.9). */
-export async function checkSessionHealth(s: SessionRecord): Promise<void> {
+export async function checkSessionHealth(s: SessionRecord, probe: TmuxHealthProbe = { exists: sessionExists, paneAlive: isPaneAlive }): Promise<void> {
   if (s.state === 'stopped' || s.state === 'error') return;
   // Execution clones are ephemeral: NEVER auto-respawn (this is the real
   // destroy-safety mechanism — teardown is not atomic). On pane death, mark for
@@ -1608,8 +2173,8 @@ export async function checkSessionHealth(s: SessionRecord): Promise<void> {
   if (isExecutionClone(s)) {
     if (s.runtimeType === 'transport' || isTransportAgent(s.agentType)) return; // no pane; bounded by hard-timeout / orchestrator / restart sweep
     try {
-      const exists = await sessionExists(s.name);
-      if (!exists || !(await isPaneAlive(s.name))) completeExecutionCloneOnPaneDeath(s);
+      const exists = await probe.exists(s.name);
+      if (!exists || !(await probe.paneAlive(s.name))) completeExecutionCloneOnPaneDeath(s);
     } catch { /* ignore */ }
     return;
   }
@@ -1621,11 +2186,11 @@ export async function checkSessionHealth(s: SessionRecord): Promise<void> {
   // Sub-sessions: auto-restart dead panes, mark stopped if tmux session gone entirely
   if (s.name.startsWith('deck_sub_')) {
     try {
-      const exists = await sessionExists(s.name);
+      const exists = await probe.exists(s.name);
       if (!exists) {
         logger.info({ session: s.name }, 'Sub-session gone, marking stopped');
         upsertSession({ ...s, state: 'stopped', updatedAt: Date.now() });
-      } else if (!(await isPaneAlive(s.name))) {
+      } else if (!(await probe.paneAlive(s.name))) {
         logger.warn({ session: s.name }, 'Sub-session pane dead, respawning');
         await respawnSession(s);
       }
@@ -1633,11 +2198,11 @@ export async function checkSessionHealth(s: SessionRecord): Promise<void> {
     return;
   }
   try {
-    const exists = await sessionExists(s.name);
+    const exists = await probe.exists(s.name);
     if (!exists) {
       logger.warn({ session: s.name }, 'Session missing, attempting restart');
       await restartSession(s);
-    } else if (!(await isPaneAlive(s.name))) {
+    } else if (!(await probe.paneAlive(s.name))) {
       logger.warn({ session: s.name }, 'Pane dead, respawning');
       await respawnSession(s);
     }
@@ -1675,8 +2240,9 @@ export async function runExecutionCloneSweep(now: number): Promise<void> {
 function startHealthPoller(): void {
   healthTimer = setInterval(async () => {
     const sessions = listSessions();
+    const tmuxProbe = createTmuxHealthProbe();
     for (const s of sessions) {
-      await checkSessionHealth(s);
+      await checkSessionHealth(s, tmuxProbe);
       let memoryCompressionRecovered = false;
       try {
         memoryCompressionRecovered = await recoverMemoryCompressionStalledSession(s.name);
@@ -1737,6 +2303,119 @@ function startHealthPoller(): void {
       logger.warn({ err }, 'Execution-clone sweep error');
     }
   }, HEALTH_POLL_MS);
+}
+
+/**
+ * Reconcile durable queue rows independently of in-process idle hooks. Rows
+ * can outlive a runtime (hook outage, restart, or a deferred sub-session), so
+ * the SQLite authority is the sweep's source of truth. The sweep is bounded
+ * and idempotent: a live runtime rehydrates and drains when idle; a missing
+ * runtime is launched once and its normal restore path performs the drain.
+ */
+async function reconcileDurableTransportQueues(): Promise<void> {
+  if (transportQueueSweepInFlight) return transportQueueSweepInFlight;
+  const run = (async () => {
+    // Restore-backoff entries of sessions deleted in the meantime must not linger.
+    pruneTransportRestoreBackoff((name) => !!getSession(name));
+    const store = getTransportQueueStore();
+    const stale = store.expireStaleDelegationEntries();
+    if (stale.length > 0) {
+      const bySender = new Map<string, Array<{ sessionName: string; createdAt: number; firstLine: string }>>();
+      for (const entry of stale) {
+        const sender = /Message from IM\.codes session:\s*([A-Za-z0-9_-]+)/.exec(entry.text)?.[1];
+        if (!sender) continue;
+        const list = bySender.get(sender) ?? [];
+        if (list.length < 20) {
+          const firstLine = entry.text.split(/\r?\n/).find((line) => line.trim() && !line.startsWith('<imcodes-'))?.trim() ?? 'delegation';
+          list.push({ sessionName: entry.sessionName, createdAt: entry.createdAt, firstLine: firstLine.slice(0, 120) });
+        }
+        bySender.set(sender, list);
+      }
+      for (const [sender, entries] of bySender) {
+        timelineEmitter.emit(sender, 'assistant.text', {
+          ...attachDaemonUserNotice(
+            DAEMON_USER_NOTICE_CODE.STALE_DELEGATION_MESSAGES_EXPIRED,
+            `⚠️ ${entries.length} 条过期的代理消息已丢弃，请重新发送仍然相关的任务。\n${entries
+              .map((entry) => `- ${entry.sessionName} @ ${new Date(entry.createdAt).toISOString()}: ${entry.firstLine}`)
+              .join('\n')}`,
+            {
+              count: entries.length,
+              detail: entries
+                .map((entry) => `${entry.sessionName}: ${entry.firstLine}`)
+                .join('; '),
+            },
+          ),
+          streaming: false,
+          memoryExcluded: true,
+        }, { source: 'daemon', confidence: 'high' });
+        logger.info({ sender, entries }, 'transport queue stale delegation rows expired and sender notified');
+      }
+    }
+    const liveCandidates = new Map(
+      store.listLiveQueueSessions().map((candidate) => [candidate.sessionName, candidate]),
+    );
+    for (const candidate of store.listQueueSessionsForReconciliation()) {
+      const liveCandidate = liveCandidates.get(candidate.sessionName);
+      const runtime = getTransportRuntime(candidate.sessionName);
+      try {
+        const session = getSession(candidate.sessionName);
+        const decision = classifyQueueSweepCandidate({
+          hasLiveRows: !!liveCandidate,
+          hasBoundRuntime: !!runtime?.providerSessionId,
+          restorableSession: !!session && isTransportAgent(session.agentType) && !!session.providerSessionId,
+        });
+        if (decision === 'rehydrate_bound_runtime') {
+          const recovered = runtime!.rehydratePendingFromStore();
+          if (recovered > 0) runtime!.drainPendingIfIdle('durable-queue-sweep');
+          continue;
+        }
+        if (decision === 'skip_no_live_rows') {
+          // Only terminal rows: nothing to drain, so no restore attempt (it
+          // used to be retried every sweep for a session that could never
+          // restore, e.g. cursor-headless without a durable provider id).
+          orphanQueueRestoreAttempts.delete(candidate.sessionName);
+          continue;
+        }
+        if (decision === 'count_orphan_attempt') {
+          const attempt = (orphanQueueRestoreAttempts.get(candidate.sessionName) ?? 0) + 1;
+          orphanQueueRestoreAttempts.set(candidate.sessionName, attempt);
+          if (shouldQuarantineUnrestorableQueueSession(attempt)) {
+            store.dropUnrestorableSession(candidate.sessionName);
+            orphanQueueRestoreAttempts.delete(candidate.sessionName);
+            logger.warn({
+              sessionName: candidate.sessionName,
+              pendingCount: candidate.pendingCount,
+              attempts: attempt,
+              droppedCount: candidate.pendingCount,
+            }, 'transport queue orphan had no restorable target; dropped after bounded retries');
+          }
+          continue;
+        }
+        orphanQueueRestoreAttempts.delete(candidate.sessionName);
+        void ensureTransportRuntimeForPendingResend(candidate.sessionName).then(() => {
+          orphanQueueRestoreAttempts.delete(candidate.sessionName);
+        }).catch((err) => {
+          logger.warn({ err, sessionName: candidate.sessionName }, 'durable transport queue sweep runtime restore failed');
+        });
+      } catch (err) {
+        logger.warn({ err, sessionName: candidate.sessionName }, 'durable transport queue sweep failed');
+      }
+    }
+  })();
+  transportQueueSweepInFlight = run;
+  try {
+    await run;
+  } finally {
+    if (transportQueueSweepInFlight === run) transportQueueSweepInFlight = null;
+  }
+}
+
+function startDurableTransportQueueSweep(): void {
+  void reconcileDurableTransportQueues();
+  transportQueueSweepTimer = setInterval(() => {
+    void reconcileDurableTransportQueues();
+  }, TRANSPORT_QUEUE_SWEEP_INTERVAL_MS);
+  transportQueueSweepTimer.unref?.();
 }
 
 
@@ -1836,7 +2515,11 @@ export async function recoverCodexStalledSession(
     s.name,
     'assistant.text',
     {
-      text: '⚠️ Codex watchdog stopped a stale turn after 12 minutes with no activity and sent `continue`.',
+      ...attachDaemonUserNotice(
+        DAEMON_USER_NOTICE_CODE.CODEX_WATCHDOG_RECOVERED,
+        '⚠️ Codex watchdog stopped a stale turn after 12 minutes with no activity and sent `continue`.',
+        { minutes: CODEX_STALE_ACTIVE_TURN_AUTO_CONTINUE_AFTER_MS / 60_000 },
+      ),
       streaming: false,
       automation: true,
       memoryExcluded: true,
@@ -1851,12 +2534,15 @@ export async function recoverCodexStalledSession(
       text: 'continue',
       clientMessageId: commandId,
       allowDuplicate: true,
+      // The watchdog's own nudge, not the human's input.
+      [USER_MESSAGE_ORIGIN_FIELDS.ORIGIN]: CHAT_MESSAGE_ORIGINS.SYSTEM,
     },
     { source: 'daemon', confidence: 'high', eventId: `transport-user:${commandId}` },
   );
   const sendResult = runtime.send('continue', commandId, undefined, undefined, {
     queuePlacement: 'front',
     timelineCommitted: true,
+    messageOrigin: CHAT_MESSAGE_ORIGINS.SYSTEM,
   });
   if (sendResult === 'queued') await runtime.cancel();
   return true;
@@ -1900,7 +2586,11 @@ export async function recoverMemoryCompressionStalledSession(
     sessionName,
     'assistant.text',
     {
-      text: '⚠️ Memory compression watchdog stopped a stale turn after 6 minutes and sent `continue`.',
+      ...attachDaemonUserNotice(
+        DAEMON_USER_NOTICE_CODE.MEMORY_WATCHDOG_RECOVERED,
+        '⚠️ Memory compression watchdog stopped a stale turn after 6 minutes and sent `continue`.',
+        { minutes: MEMORY_COMPRESSION_AUTO_CONTINUE_AFTER_MS / 60_000 },
+      ),
       streaming: false,
       automation: true,
       memoryExcluded: true,
@@ -1915,12 +2605,15 @@ export async function recoverMemoryCompressionStalledSession(
       text: 'continue',
       clientMessageId: commandId,
       allowDuplicate: true,
+      // The watchdog's own nudge, not the human's input.
+      [USER_MESSAGE_ORIGIN_FIELDS.ORIGIN]: CHAT_MESSAGE_ORIGINS.SYSTEM,
     },
     { source: 'daemon', confidence: 'high', eventId: `transport-user:${commandId}` },
   );
   const sendResult = runtime.send('continue', commandId, undefined, undefined, {
     queuePlacement: 'front',
     timelineCommitted: true,
+    messageOrigin: CHAT_MESSAGE_ORIGINS.SYSTEM,
   });
   if (sendResult === 'queued') await runtime.cancel();
   resolveSessionCompressionWatchRuns(sessionName);
@@ -1938,6 +2631,10 @@ function startCodexQuotaPoller(serverLink: ServerLink | null): void {
     // subsession.sync to keep their 7d quota line fresh — mirrors the codex subs.
     void refreshClaudeSdkSubQuotaMetadata(serverLink).catch((err) => {
       logger.warn({ err }, 'Claude SDK sub-session quota refresh failed');
+    });
+    // agy-sdk sessions probe `agy --print /usage` (throttled to 15m by AGY_USAGE_CACHE_TTL_MS).
+    void refreshAgyQuotaMetadataForSessions(serverLink).catch((err) => {
+      logger.warn({ err }, 'Antigravity quota refresh failed');
     });
   }, CODEX_QUOTA_REFRESH_MS);
 }
@@ -2008,6 +2705,27 @@ function startContextMaterializationPoller(liveContextIngestion: LiveContextInge
  * the poller is a silent no-op (so this is safe to ship without
  * mandating the flag — the worst case is we don't get the speedup).
  */
+/**
+ * Watch the V8 heap against its limit and restart in a controlled way before it is exhausted (see memory-guard.ts).
+ * The hard-exit timer is the last resort when the ordered shutdown itself hangs on a nearly full heap.
+ */
+function startDaemonMemoryGuard(): void {
+  registerMemoryProbe('timeline', () => timelineEmitter.memoryStats());
+  registerMemoryProbe('process', () => {
+    const resources: Record<string, number> = {};
+    for (const type of process.getActiveResourcesInfo()) resources[type] = (resources[type] ?? 0) + 1;
+    return { ...resources, sessions: listSessions().length };
+  });
+  startMemoryGuard({
+    stateDir: imcodesStateDir(),
+    log: logger,
+    shutdown: async (exitCode) => {
+      setTimeout(() => process.exit(DAEMON_MEMORY_GUARD_EXIT_CODE), DAEMON_MEMORY_GUARD_HARD_EXIT_MS).unref?.();
+      await shutdown(exitCode);
+    },
+  });
+}
+
 function startGcPoller(): void {
   const gc = (globalThis as { gc?: () => void }).gc;
   if (typeof gc !== 'function') {
