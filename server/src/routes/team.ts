@@ -5,6 +5,7 @@ import { resolveUserByIdentifier } from '../db/user-lookup.js';
 import type { Database } from '../db/client.js';
 import { randomHex } from '../security/crypto.js';
 import { logAudit } from '../security/audit.js';
+import { revalidateGroupMemberMachines } from '../ws/machine-group-revalidation.js';
 
 /** A group name is a label, never a paragraph. */
 const GROUP_NAME_MAX_CHARS = 120;
@@ -302,6 +303,7 @@ teamRoutes.put('/:id/member/:memberId/role', requireAuth(), async (c) => {
     [body!.role, teamId, memberId],
   );
 
+  await revalidateGroupMemberMachines(c.env.DB, teamId!, memberId!);
   await logAudit({ userId, action: 'team.role_change', details: { teamId, memberId, role: body!.role } }, c.env.DB);
   return c.json({ ok: true });
 });
@@ -329,6 +331,7 @@ teamRoutes.delete('/:id/member/:memberId', requireAuth(), async (c) => {
     [teamId, memberId],
   );
 
+  await revalidateGroupMemberMachines(c.env.DB, teamId!, memberId!);
   await logAudit({ userId, action: 'team.member_removed', details: { teamId, memberId } }, c.env.DB);
   return c.json({ ok: true });
 });

@@ -20,6 +20,8 @@ import { fileTransferRoutes } from '../src/routes/file-transfer.js';
 import { WsBridge } from '../src/ws/bridge.js';
 import { signJwt } from '../src/security/crypto.js';
 import { COOKIE_SESSION } from '../../shared/cookie-names.js';
+import { listControlledMachines } from '../src/routes/machines.js';
+import { MACHINE_LIST_MAX_ITEMS } from '../../shared/remote-exec.js';
 import { NODE_ROLE } from '../../shared/remote-exec.js';
 import { REMOTE_DESKTOP_CAPABILITY } from '../../shared/remote-desktop.js';
 import { generateControlledNodeId } from '../src/services/controlled-node-identity.js';
@@ -36,7 +38,8 @@ import {
 } from '../../shared/shared-machine-authority.js';
 import { MEMORY_MCP_TOOL_NAMES } from '../../shared/memory-mcp-contracts.js';
 import { createDaemonMachineToolDeps } from '../../src/daemon/machine-mcp-deps.js';
-import { listMachines as daemonListMachines } from '../../src/daemon/machine-exec-client.js';
+import { computerUseCall as daemonComputerUse } from '../../src/daemon/computer-use-client.js';
+import { execRemote as daemonExecRemote, listMachines as daemonListMachines } from '../../src/daemon/machine-exec-client.js';
 import { registerMemoryMcpTools } from '../../src/daemon/memory-mcp-tools.js';
 import {
   bindProcessSharedMachineCommand,
@@ -968,10 +971,99 @@ describe('a shared-session participant reaches only the machines shared with the
     { method: 'POST', headers, body: JSON.stringify({ path: '/tmp/x.txt' }) },
   );
 
+  it.each(['member', 'admin', 'owner'] as const)('%s: actual actor group authorizes API and real SDK even when source owner has no target access', async (role) => {
+    const t = await scene();
+    const peer = `peer-${hex(4)}`; await createUser(db, peer);
+    const node = await controlledNode(peer);
+    const group = await createDesk(role === 'owner' ? t.participantId : peer);
+    if (role === 'owner') await joinDesk(group, peer, 'admin');
+    else await joinDesk(group, t.participantId, role);
+    expect((await bindDesk(t.app, peer, node, group)).status).toBe(200);
+    expect(await listed(t.app, t.ownerTurn)).not.toContain(node);
+    expect(await listed(t.app, t.delegated)).toContain(node);
+    expect((await computerUse(t.app, t.ownerTurn, node)).status).toBe(403);
+    expect((await computerUse(t.app, t.delegated, node)).status).toBe(200);
+    expect((await exec(t.app, t.delegated, node)).status).toBe(403);
+    expect((await fileHandle(t.app, t.delegated, node)).status).toBe(403);
+    const browser = await (await t.app.request('/api/machines', { headers: webAuth(t.participantId) })).json();
+    expect(browser.machines.find((m: {serverId: string}) => m.serverId === node)).toMatchObject({ accessRole: 'participant', canExecute: false, execGranted: false, accessSource: 'group' });
+    expect(browser.machines.find((m: {serverId: string}) => m.serverId === node).canRename === true).toBe(role !== 'member');
+    expect((await t.app.request(`/api/machines/${node}/display-name`, { method:'POST',headers:webAuth(t.participantId),body:JSON.stringify({displayName:'Group label'}) })).status).toBe(role === 'member' ? 404 : 200);
+    for (const action of ['exec-enabled', 'upgrade', 'remote-desktop-worker', 'revoke']) {
+      expect((await t.app.request(`/api/machines/${node}/${action}`, { method:'POST',headers:webAuth(t.participantId),body:JSON.stringify({enabled:true}) })).status).toBe(404);
+    }
+    const fetchImpl = ((input: string | URL | Request, init?: RequestInit) => {
+      const url = new URL(typeof input === 'string' || input instanceof URL ? String(input) : input.url);
+      return t.app.request(`${url.pathname}${url.search}`, init);
+    }) as typeof fetch;
+    const deps = createDaemonMachineToolDeps({
+      loadCredential: async () => ({serverUrl:'http://group-scoped.test',serverId:t.source.serverId,token:t.source.token}),
+      loadSharedMachineAuthority: async () => t.delegated[SHARED_MACHINE_AUTHORITY_HEADER]!,
+      listMachines: input => daemonListMachines({...input,fetchImpl}),
+      computerUseCall: input => daemonComputerUse({...input,fetchImpl}),
+      execRemote: input => daemonExecRemote({...input,fetchImpl}),
+    });
+    const mcp = new McpServer({name:'group-actor-scope',version:'1.0.0'});
+    registerMemoryMcpTools(mcp, {} as McpRuntimeCaller, {machineDeps:deps,nodeRole:NODE_ROLE.FULL});
+    const client = new Client({name:'group-actor-client',version:'1.0.0'});
+    const [ct,st] = InMemoryTransport.createLinkedPair();
+    await Promise.all([mcp.connect(st),client.connect(ct)]);
+    try {
+      await client.listTools();
+      const nodeId = (await db.queryOne<{node_id:string}>('SELECT node_id FROM servers WHERE id=$1', [node]))!.node_id;
+      const list = await client.callTool({name:MEMORY_MCP_TOOL_NAMES.LIST_MACHINES,arguments:{includeOffline:true}});
+      expect(list.isError).not.toBe(true); expect(JSON.stringify(mcpToolPayload(list))).toContain(nodeId);
+      const view = await client.callTool({name:MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_CALL,arguments:{machine:nodeId,tool:'list_apps'}});
+      expect(view.isError,JSON.stringify(view)).not.toBe(true);
+      const execute = await client.callTool({name:MEMORY_MCP_TOOL_NAMES.EXEC_REMOTE,arguments:{machine:nodeId,command:'echo no-dispatch'}});
+      expect(execute.isError).toBe(true); // typed normal refusal, no SDK schema exception
+      const viewer = await createMachineGrant({ownerId:peer,recipientId:t.participantId,serverId:node,role:'viewer'});
+      expect((await computerUse(t.app,t.delegated,node)).status).toBe(403);
+      expect(await listed(t.app,t.delegated)).not.toContain(node); // more specific viewer wins
+      await db.execute('UPDATE server_shares SET expires_at=$2 WHERE id=$1',[viewer.id,Date.now()-1]);
+      expect((await computerUse(t.app,t.delegated,node)).status).toBe(200); // falls back to real group
+      await db.execute('DELETE FROM team_members WHERE team_id=$1 AND user_id=$2',[group,t.participantId]);
+      expect((await computerUse(t.app,t.delegated,node)).status).toBe(403);
+      expect(await listed(t.app,t.delegated)).not.toContain(node);
+      expect((await client.callTool({name:MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_CALL,arguments:{machine:nodeId,tool:'list_apps'}})).isError).toBe(true);
+      // An actor's explicit grant works without source-owner target authority, and ends live.
+      await createMachineGrant({ownerId:peer,recipientId:t.participantId,serverId:node,role:'participant'});
+      expect((await computerUse(t.app,t.delegated,node)).status).toBe(200);
+      expect((await fileHandle(t.app,t.delegated,node)).status).toBe(503); // admitted, offline target, not an owner-fleet denial
+      await db.execute('UPDATE server_shares SET revoked_at=$3 WHERE server_id=$1 AND target_user_id=$2',[node,t.participantId,Date.now()]);
+      expect((await fileHandle(t.app,t.delegated,node)).status).toBe(403);
+    } finally { await client.close(); await mcp.close(); }
+  });
+
+  it('bounds the actual actor fleet at MAX+1 after excluding direct-viewer overrides, with no source fleet intersection', async () => {
+    const t = await scene(), peer = `scale-owner-${hex(4)}`; await createUser(db,peer);
+    const group = await createDesk(peer); await joinDesk(group,t.participantId);
+    // Two existing operable targets plus 200 new group targets exceed the cap; source owner sees none of the new fleet.
+    await db.execute(`INSERT INTO servers (id,user_id,name,token_hash,status,created_at,node_role,node_id,exec_enabled)
+      SELECT $1 || i::text,$2,'scale','hash','offline',$3,$4,(1000000000+i)::text,true FROM generate_series(1,$5) i`,
+      [group,peer,Date.now(),NODE_ROLE.CONTROLLED,MACHINE_LIST_MAX_ITEMS]);
+    await db.execute('INSERT INTO machine_groups (server_id,team_id,added_at) SELECT id,$1,$2 FROM servers WHERE user_id=$3', [group,Date.now(),peer]);
+    // Viewer overrides sort first. They must be excluded BEFORE applying the
+    // operable fleet cap, not after LIMIT (which would silently hide all groups).
+    await db.execute(`INSERT INTO servers (id,user_id,name,token_hash,status,created_at,node_role,node_id,exec_enabled,display_name)
+      SELECT $1 || 'viewer' || i::text,$2,'scale-viewer','hash','offline',$3,$4,(2000000000+i)::text,true,'AAA viewer' FROM generate_series(1,$5) i`,
+      [group,peer,Date.now(),NODE_ROLE.CONTROLLED,MACHINE_LIST_MAX_ITEMS+1]);
+    await db.execute(`INSERT INTO machine_groups (server_id,team_id,added_at) SELECT id,$1,$2 FROM servers WHERE user_id=$3 ON CONFLICT DO NOTHING`, [group,Date.now(),peer]);
+    await db.execute(`INSERT INTO server_shares (id,server_id,target_user_id,role,created_by,created_at,updated_at)
+      SELECT id || 'share',id,$1,'viewer',$2,$3,$3 FROM servers WHERE user_id=$2 AND display_name='AAA viewer'`, [t.participantId,peer,Date.now()]);
+    const bounded = await listControlledMachines(db,t.ownerId,Date.now(),t.participantId);
+    expect(bounded.overLimit).toBe(true); expect(bounded.machines).toHaveLength(MACHINE_LIST_MAX_ITEMS);
+    expect((await t.app.request('/api/machines',{headers:t.delegated})).status).toBe(413);
+    await db.execute('DELETE FROM machine_groups WHERE team_id=$1',[group]);
+    expect((await listControlledMachines(db,t.ownerId,Date.now(),t.participantId)).overLimit).toBe(false);
+    const stranger = `scale-none-${hex(4)}`; await createUser(db,stranger);
+    expect((await listControlledMachines(db,stranger,Date.now())).machines).toEqual([]);
+  });
+
   it('hides and denies every owner node that is not shared with the participant, on every device surface', async () => {
     const t = await scene();
-    expect(await listed(t.app, t.delegated)).toEqual([t.participantShared]);
-    for (const [name, target] of [['unshared', t.unshared], ['group-only', t.grouped], ['viewer share', t.viewerShared]] as const) {
+    expect(await listed(t.app, t.delegated)).toEqual([t.grouped, t.participantShared].sort());
+    for (const [name, target] of [['unshared', t.unshared], ['viewer share', t.viewerShared]] as const) {
       const execDenied = await exec(t.app, t.delegated, target);
       expect(execDenied.status, `exec ${name}`).toBe(403);
       expect(await execDenied.json()).toMatchObject({ reason: 'target_forbidden' });
@@ -984,7 +1076,7 @@ describe('a shared-session participant reaches only the machines shared with the
     const t = await scene();
     for (const target of [t.participantShared, t.grouped]) {
       // Read-only computer use follows the participant's own access (a machine share, or the group)...
-      expect((await computerUse(t.app, t.delegated, target)).status, `computer-use ${target}`).toBe(target === t.participantShared ? 200 : 403);
+      expect((await computerUse(t.app, t.delegated, target)).status, `computer-use ${target}`).toBe(200);
       // Only exec_remote is participant-gated. A granted file request reaches the offline node (503), not a policy refusal.
       // A group-only actor still lacks the file grant (403).
       const execDenied = await exec(t.app, t.delegated, target);
@@ -1009,7 +1101,7 @@ describe('a shared-session participant reaches only the machines shared with the
     // Expired, then revoked, then downgraded: each is read live on the next action.
     await db.execute('UPDATE server_shares SET expires_at = $3 WHERE server_id = $1 AND target_user_id = $2', [t.participantShared, t.participantId, Date.now() - 1]);
     expect((await computerUse(t.app, t.delegated, t.participantShared)).status).toBe(403);
-    expect(await listed(t.app, t.delegated)).toEqual([]);
+    expect(await listed(t.app, t.delegated)).toEqual([t.grouped]);
     await db.execute('UPDATE server_shares SET expires_at = NULL, revoked_at = $3 WHERE server_id = $1 AND target_user_id = $2', [t.participantShared, t.participantId, Date.now()]);
     expect((await computerUse(t.app, t.delegated, t.participantShared)).status).toBe(403);
     await db.execute('UPDATE server_shares SET revoked_at = NULL, role = $3, exec_granted = false WHERE server_id = $1 AND target_user_id = $2', [t.participantShared, t.participantId, 'viewer']);
@@ -1022,16 +1114,16 @@ describe('a shared-session participant reaches only the machines shared with the
     expect((await exec(t.app, t.ownerTurn, t.participantShared)).status).toBe(200);
   });
 
-  it('a group with a direct share loses access immediately when that share expires or is revoked', async () => {
+  it('expiry or revocation of a direct share preserves independent live group read coverage, never its execute grant', async () => {
     const t = await scene();
     const share = await createMachineGrant({ ownerId: t.ownerId, recipientId: t.participantId, serverId: t.grouped, role: 'participant' });
     expect((await computerUse(t.app, t.delegated, t.grouped)).status).toBe(200);
     expect(await listed(t.app, t.delegated)).toContain(t.grouped);
     for (const field of ['expires_at', 'revoked_at'] as const) {
       await db.execute(`UPDATE server_shares SET expires_at = $2, revoked_at = $3 WHERE id = $1`, [share.id, field === 'expires_at' ? Date.now() - 1 : null, field === 'revoked_at' ? Date.now() : null]);
-      expect((await computerUse(t.app, t.delegated, t.grouped)).status).toBe(403);
+      expect((await computerUse(t.app, t.delegated, t.grouped)).status).toBe(200);
       expect((await fileHandle(t.app, t.delegated, t.grouped)).status).toBe(403);
-      expect(await listed(t.app, t.delegated)).not.toContain(t.grouped);
+      expect(await listed(t.app, t.delegated)).toContain(t.grouped);
     }
     expect((await computerUse(t.app, t.ownerTurn, t.grouped)).status).toBe(200);
   });

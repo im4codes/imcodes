@@ -107,6 +107,7 @@ interface ControlledRow {
   access_role: MachineAccessRole;
   access_source: MachineAccessSource | null;
   exec_granted: boolean;
+  can_rename?: boolean;
   controlled_capabilities: unknown;
 }
 
@@ -129,6 +130,8 @@ export async function listControlledMachines(
   accessRole: MachineAccessRole;
   /** Browser-only (never sent to a daemon, see DAEMON_MACHINE_LIST_SENT_KEYS): may THIS actor run commands / move files on the device? */
   canExecute: boolean;
+  /** Browser-only live role hint; absent on legacy peers and daemon DTOs. */
+  canRename?: boolean;
   execGranted: boolean;
   accessSource?: MachineAccessSource;
   remoteDesktopHostId?: string;
@@ -137,22 +140,11 @@ export async function listControlledMachines(
   // the whole machine list as malformed.
   hostServerId?: string;
 })[]; overLimit: boolean }> {
-  let rows: ControlledRow[] = await listAccessibleControlledMachines(
-    db,
-    userId,
-    nowMs,
-    MACHINE_LIST_MAX_ITEMS + 1,
-  );
-  // The bound applies to the owner's fleet before any narrowing, so a participant never gets a silently truncated list.
+  const rows: ControlledRow[] = delegatedActorUserId
+    ? [...(await listActorOperableMachineAccess(db, delegatedActorUserId, nowMs, MACHINE_LIST_MAX_ITEMS + 1)).values()]
+    : await listAccessibleControlledMachines(db, userId, nowMs, MACHINE_LIST_MAX_ITEMS + 1);
+  // The bound is on the authenticated actual actor's fleet, not the source owner's.
   const overLimit = rows.length > MACHINE_LIST_MAX_ITEMS;
-  if (delegatedActorUserId) {
-    // Preserve the owner's fleet scope while projecting the participant's own access, not the owner's grants.
-    const actorOperable = await listActorOperableMachineAccess(db, delegatedActorUserId, nowMs, MACHINE_LIST_MAX_ITEMS + 1);
-    rows = rows.flatMap((row) => {
-      const actor = actorOperable.get(row.id);
-      return actor ? [{ ...row, access_role: actor.access_role, access_source: actor.access_source, exec_granted: actor.exec_granted }] : [];
-    });
-  }
   const machines = rows.slice(0, MACHINE_LIST_MAX_ITEMS).map((r) => {
     if (!isControlledNodeId(r.node_id)) {
       throw new Error(`controlled_node_missing_canonical_node_id:${r.id}`);
@@ -225,6 +217,7 @@ export async function listControlledMachines(
         participantTurn: Boolean(delegatedActorUserId),
       }, MACHINE_ACTION.EXEC).allowed,
       execGranted: r.exec_granted === true,
+      ...(r.can_rename === true && r.access_role !== 'owner' ? { canRename: true } : {}),
       ...(r.access_source ? { accessSource: r.access_source } : {}),
       ...(typeof r.remote_desktop_host_id === 'string' && r.remote_desktop_host_id
         ? { remoteDesktopHostId: r.remote_desktop_host_id }
@@ -461,6 +454,8 @@ machinesRoutes.post('/desk-binding', requireAuth(), async (c) => {
       [serverId, teamId],
     );
   }
+
+  await WsBridge.find(serverId)?.revalidateMachineGroupAccess();
 
   const ip = (c.get('clientIp' as never) as string) ?? 'unknown';
   logAudit({

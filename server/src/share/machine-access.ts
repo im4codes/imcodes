@@ -26,6 +26,8 @@ export interface ControlledMachineAccessRow {
   access_source: MachineAccessSource | null;
   /** The explicit per-device share row's execute grant; false for the owner row, a group member and every pre-grant share. */
   exec_granted: boolean;
+  /** Browser label-management hint only; mutations still re-resolve live authority. */
+  can_rename?: boolean;
   controlled_capabilities: ControlledNodeCapability[] | null;
   controlled_upgrade_status: string | null;
   controlled_upgrade_target_version: string | null;
@@ -60,20 +62,20 @@ export type ControlledMachineOperatorAccessRow = ControlledMachineAccessRow & {
  * is not a machine list, and the GROUP BY needed to undo that is one more place
  * to get wrong.
  */
-export const IS_MEMBER_OF_A_MACHINE_GROUP = `EXISTS (
+export function machineGroupMembershipSql(actor: string, managementOnly = false): string {
+  // Compile-time SQL expressions only; callers never interpolate request input.
+  return `EXISTS (
            SELECT 1 FROM machine_groups mg
              JOIN team_members tm ON tm.team_id = mg.team_id
             WHERE mg.server_id = s.id
-              AND tm.user_id = $1
+              AND tm.user_id = ${actor}
+              ${managementOnly ? "AND tm.role IN ('owner', 'admin')" : ''}
          )`;
+}
 
-const CAN_MANAGE_A_MACHINE_GROUP = `EXISTS (
-           SELECT 1 FROM machine_groups mg
-             JOIN team_members tm ON tm.team_id = mg.team_id
-            WHERE mg.server_id = s.id
-              AND tm.user_id = $2
-              AND tm.role IN ('owner', 'admin')
-         )`;
+export const IS_MEMBER_OF_A_MACHINE_GROUP = machineGroupMembershipSql('$1');
+
+const CAN_MANAGE_A_MACHINE_GROUP = machineGroupMembershipSql('$2', true);
 
 /**
  * Both the person asking (`$1`) and the machine's owner must be active accounts (security/user-status.ts). A disabled user operates
@@ -118,6 +120,9 @@ const CONTROLLED_MACHINE_ACCESS_SELECT = `
          -- Only the explicit per-device row can carry an execute grant, and only a participant row (CHECK in migration 100). A group
          -- membership has no row, so it can never grant it; a missing column reads false.
          COALESCE(sh.exec_granted, FALSE) AS exec_granted,
+         CASE WHEN s.user_id = $1 THEN TRUE
+           WHEN (sh.role IS NULL OR sh.role = 'participant') AND ${machineGroupMembershipSql('$1', true)} THEN TRUE
+           ELSE FALSE END AS can_rename,
          sh.expires_at AS access_expires_at
     FROM servers s
     LEFT JOIN remote_desktop_host_endpoints rdhe
@@ -129,8 +134,8 @@ const CONTROLLED_MACHINE_ACCESS_SELECT = `
      AND sh.target_user_id = $1
      AND sh.revoked_at IS NULL
      AND (sh.expires_at IS NULL OR sh.expires_at > $2)
-    -- Group rows are retained here only for metadata-management authority.
-    -- Operational/list/desktop callers require ownership or an explicit share.
+    -- A live group membership grants bounded visibility/read, never execute.
+    -- The more specific active direct role still wins over that group default.
 `;
 
 /**
@@ -162,7 +167,7 @@ export async function resolveControlledMachineAccess(
  * The single operational authority boundary for a controlled device.
  *
  * Every device capability must enter through this helper rather than spelling
- * an owner-only predicate in its own route.  The share row is read on every
+ * an owner-only predicate in its own route. Group membership and the share row are read on every
  * action, so revocation, expiry, and a Participant -> Viewer downgrade take
  * effect without copying an owner credential into the participant's daemon.
  * Sharing-management routes deliberately do not use this helper: they remain
@@ -175,20 +180,12 @@ export async function resolveControlledMachineOperatorAccess(
   now: number,
 ): Promise<ControlledMachineOperatorAccessRow | null> {
   const access = await resolveControlledMachineAccess(db, userId, serverId, now);
-  return access && access.access_source !== 'group' && canOperateControlledMachine(access.access_role)
+  return access && canOperateControlledMachine(access.access_role)
     ? access as ControlledMachineOperatorAccessRow
     : null;
 }
 
-/** A participant-origin tool must hold a live direct node share; ownership/group rows are not delegated grants. */
-export async function resolveControlledMachineParticipantShareAccess(
-  db: Database, userId: string, serverId: string, now: number,
-): Promise<ControlledMachineOperatorAccessRow | null> {
-  const access = await resolveControlledMachineOperatorAccess(db, userId, serverId, now);
-  return access?.access_source === 'share' ? access : null;
-}
-
-/** The same live owner/direct-Participant read boundary, batched once per metadata packet (never a group/execute grant). */
+/** Live owner/Participant read coverage, batched once per packet; direct Viewer overrides group, and no read grants execution. */
 export async function resolveControlledMachineReadActors(
   db: Database, serverId: string, actors: string[], now: number,
 ): Promise<Set<string>> {
@@ -198,11 +195,12 @@ export async function resolveControlledMachineReadActors(
        FROM servers s
        JOIN users actor ON actor.id = ANY($2::text[])
        LEFT JOIN server_shares sh ON sh.server_id = s.id AND sh.target_user_id = actor.id
-        AND sh.role = 'participant' AND sh.revoked_at IS NULL
+        AND sh.revoked_at IS NULL
         AND (sh.expires_at IS NULL OR sh.expires_at > $3)
       WHERE s.id = $1 AND s.node_role = $4 AND s.revoked_at IS NULL
         AND ${activeUserExistsSql('s.user_id')} AND ${activeUserExistsSql('actor.id')}
-        AND (s.user_id = actor.id OR sh.id IS NOT NULL)`,
+        AND (s.user_id = actor.id OR sh.role = 'participant'
+          OR (sh.id IS NULL AND ${machineGroupMembershipSql('actor.id')}))`,
     [serverId, actors, now, NODE_ROLE.CONTROLLED],
   );
   return new Set(rows.map((row) => row.actor_id));
@@ -263,9 +261,9 @@ export async function resolveRemoteDesktopHostAccess(
       WHERE s.id = $3
         AND s.revoked_at IS NULL
         AND ${ACTIVE_ACCOUNTS_ACCESS_PREDICATE}
-        AND (s.user_id = $1 OR sh.id IS NOT NULL OR (s.node_role IS DISTINCT FROM $4 AND ${IS_MEMBER_OF_A_MACHINE_GROUP}))
+        AND (s.user_id = $1 OR sh.id IS NOT NULL OR ${IS_MEMBER_OF_A_MACHINE_GROUP})
       LIMIT 1`,
-    [userId, now, serverId, NODE_ROLE.CONTROLLED],
+    [userId, now, serverId],
   );
 }
 
@@ -282,22 +280,25 @@ export async function resolveRemoteDesktopHostOperatorAccess(
     : null;
 }
 
-/** One bounded query for owned + actively shared controlled-node discovery. */
+/** One bounded, deduplicated query for own, direct-share and live-group controlled-node discovery. */
 export async function listAccessibleControlledMachines(
   db: Database,
   userId: string,
   now: number,
   limit: number,
+  operableOnly = false,
 ): Promise<ControlledMachineAccessRow[]> {
   return db.query<ControlledMachineAccessRow>(
     `${CONTROLLED_MACHINE_ACCESS_SELECT}
       WHERE s.node_role = $3
         AND s.revoked_at IS NULL
         AND ${ACTIVE_ACCOUNTS_ACCESS_PREDICATE}
-        AND (s.user_id = $1 OR sh.id IS NOT NULL)
+        AND (s.user_id = $1 OR sh.id IS NOT NULL OR ${IS_MEMBER_OF_A_MACHINE_GROUP})
+        AND (NOT $5::boolean OR s.user_id = $1 OR sh.role = 'participant'
+          OR (sh.id IS NULL AND ${IS_MEMBER_OF_A_MACHINE_GROUP}))
       ORDER BY s.display_name NULLS LAST, s.id
       LIMIT $4`,
-    [userId, now, NODE_ROLE.CONTROLLED, limit],
+    [userId, now, NODE_ROLE.CONTROLLED, limit, operableOnly],
   );
 }
 

@@ -8,6 +8,10 @@ import { createServer, createUser } from '../src/db/queries.js';
 import { createOrUpdateShare } from '../src/db/tab-sharing.js';
 import { resolveControlledMachineReadActors } from '../src/share/machine-access.js';
 import { WsBridge } from '../src/ws/bridge.js';
+import { Hono } from 'hono';
+import { teamRoutes } from '../src/routes/team.js';
+import { machinesRoutes } from '../src/routes/machines.js';
+import { signJwt } from '../src/security/crypto.js';
 import { NODE_ROLE } from '../../shared/remote-exec.js';
 
 let db: Database;
@@ -118,7 +122,7 @@ it('unknown authority closes controlled metadata subscriptions but ordinary FULL
   } finally { owner.close(); t.cleanup(); }
 });
 
-it('batched read permission denies group/viewer/disabled/revoked nodes without borrowing owner identity (200-actor cost)', async () => {
+it('batched read permission includes live groups but denies viewer/disabled/revoked nodes without borrowing owner identity (200-actor cost)', async () => {
   const t = await fixture(); const n = t.nodes[0]!;
   try {
     const groupOnly = `meta-group-${id()}`, team = `meta-team-${id()}`;
@@ -126,9 +130,17 @@ it('batched read permission denies group/viewer/disabled/revoked nodes without b
     await db.execute('INSERT INTO teams (id,name,owner_id,plan,created_at) VALUES ($1,$2,$3,$4,$5)', [team, 'metadata', t.owner, 'free', Date.now()]);
     for (const actor of [t.owner, groupOnly]) await db.execute('INSERT INTO team_members (team_id,user_id,role,joined_at) VALUES ($1,$2,$3,$4)', [team, actor, actor === t.owner ? 'owner' : 'member', Date.now()]);
     await db.execute('INSERT INTO machine_groups (server_id,team_id,added_at) VALUES ($1,$2,$3)', [n.serverId, team, Date.now()]);
+    expect(await resolveControlledMachineReadActors(db, n.serverId, [groupOnly], Date.now())).toEqual(new Set([groupOnly]));
+    await t.share(n, groupOnly);
+    await db.execute('UPDATE server_shares SET role=$3 WHERE server_id=$1 AND target_user_id=$2', [n.serverId, groupOnly, 'viewer']);
+    expect(await resolveControlledMachineReadActors(db, n.serverId, [groupOnly], Date.now())).toEqual(new Set());
+    await db.execute('UPDATE server_shares SET expires_at=$3 WHERE server_id=$1 AND target_user_id=$2', [n.serverId, groupOnly, Date.now()-1]);
+    expect(await resolveControlledMachineReadActors(db, n.serverId, [groupOnly], Date.now())).toEqual(new Set([groupOnly]));
+    expect(await resolveControlledMachineReadActors(db, t.nodes[1]!.serverId, [groupOnly], Date.now())).toEqual(new Set());
+    await db.execute('UPDATE users SET status=$2 WHERE id=$1', [groupOnly,'disabled']);
     expect(await resolveControlledMachineReadActors(db, n.serverId, [groupOnly], Date.now())).toEqual(new Set());
     const actors = [t.owner, t.a, t.b];
-    for (let i = 0; i < 197; i++) { const user = `meta-scale-${id()}`; await createUser(db, user); await t.share(n, user); actors.push(user); }
+    for (let i = 0; i < 197; i++) { const user = `meta-scale-${id()}`; await createUser(db, user); if (i % 2) await t.share(n, user); else await db.execute('INSERT INTO team_members (team_id,user_id,role,joined_at) VALUES ($1,$2,$3,$4)', [team,user,'member',Date.now()]); actors.push(user); }
     const start = performance.now(); const allowed = await resolveControlledMachineReadActors(db, n.serverId, actors, Date.now());
     console.log(JSON.stringify({ controlledReadActors: actors.length, lookupMs: performance.now() - start }));
     expect(allowed.size).toBe(200);
@@ -153,5 +165,48 @@ it('revoking another source share does not remove still-valid direct node read c
     await n.bridge.revalidateShareSocketsForUser(t.a);
     t.broadcast(n, 'daemon.upgrade_status'); await n.bridge.revalidateShareSocketsForUser(t.a);
     expect(a.closed).toBe(false); expect(a.sent).toHaveLength(1);
+  } finally { t.cleanup(); }
+});
+
+// Real routes plus real PG/bridge: group mutations invalidate existing subscriptions,
+// not merely the next reconnect, and never close another independent coverage.
+it('group membership/node removal fences cached subscriptions immediately with multi-group/direct coverage and actor isolation', async () => {
+  const t = await fixture(), n = t.nodes[0]!, other = t.nodes[1]!;
+  const key = 'group-metadata-scoped-test';
+  const app = new Hono();
+  app.use('*', async (c, next) => { Object.assign(c.env ??= {}, { DB: db, JWT_SIGNING_KEY: key }); await next(); });
+  app.route('/api/team', teamRoutes); app.route('/api/machines', machinesRoutes);
+  const auth = { authorization: `Bearer ${signJwt({ sub: t.owner, type: 'web' }, key, 3600)}`, 'content-type': 'application/json' };
+  const groups: string[] = [];
+  for (let i = 0; i < 2; i++) {
+    const group = `meta-live-${id()}`; groups.push(group);
+    await db.execute('INSERT INTO teams (id,name,owner_id,plan,created_at) VALUES ($1,$2,$3,$4,$5)', [group,'metadata',t.owner,'free',Date.now()]);
+    for (const [actor, role] of [[t.owner,'owner'],[t.a,'member'],[t.b,'admin']])
+      await db.execute('INSERT INTO team_members (team_id,user_id,role,joined_at) VALUES ($1,$2,$3,$4)', [group,actor,role,Date.now()]);
+    await db.execute('INSERT INTO machine_groups (server_id,team_id,added_at) VALUES ($1,$2,$3)', [n.serverId,group,Date.now()]);
+  }
+  await db.execute('DELETE FROM server_shares WHERE server_id=$1 AND target_user_id=$2', [n.serverId,t.a]);
+  const a = t.connect(n,t.a), b = t.connect(n,t.b), owner = t.connect(n,t.owner), otherA = t.connect(other,t.a);
+  try {
+    await n.bridge.revalidateShareSocketsForUser(t.a); await other.bridge.revalidateShareSocketsForUser(t.a);
+    expect(a.sent.some(raw => JSON.parse(raw).type === 'daemon.hello')).toBe(true);
+    a.sent = [];
+    expect((await app.request(`/api/team/${groups[0]}/member/${t.a}`, { method:'DELETE',headers:auth })).status).toBe(200);
+    expect(a.closed).toBe(false); // second group still covers the actor
+    expect((await app.request(`/api/machines/desk-binding?serverId=${n.serverId}`, { method:'POST',headers:auth,body:JSON.stringify({teamId:groups[1],member:false}) })).status).toBe(200);
+    expect(a.closed).toBe(true); expect(a.sent).toEqual([]);
+    expect(b.closed).toBe(false); expect(owner.closed).toBe(false); expect(otherA.closed).toBe(false);
+    for (const type of ['daemon.hello','controlled_node.worker_refresh_status','daemon.upgrade_status']) t.broadcast(n,type);
+    await n.bridge.revalidateShareSocketsForUser(t.b);
+    expect(a.sent).toEqual([]);
+    const denied = t.connect(n,t.a); await n.bridge.revalidateShareSocketsForUser(t.a);
+    expect(denied.closed).toBe(true); expect(denied.sent).toEqual([]);
+    await t.share(n,t.a);
+    const independent = t.connect(n,t.a); await n.bridge.revalidateShareSocketsForUser(t.a);
+    expect((await app.request(`/api/machines/desk-binding?serverId=${n.serverId}`, { method:'POST',headers:auth,body:JSON.stringify({teamId:groups[0],member:false}) })).status).toBe(200);
+    expect(independent.closed).toBe(false); // direct coverage independent of group removal
+    await db.execute('UPDATE users SET status=$2 WHERE id=$1', [t.owner,'disabled']);
+    t.broadcast(n,'daemon.hello'); await n.bridge.revalidateMachineGroupAccess();
+    expect(independent.closed).toBe(true); expect(owner.closed).toBe(true); expect(b.closed).toBe(true);
   } finally { t.cleanup(); }
 });

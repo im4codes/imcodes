@@ -384,3 +384,18 @@ describe('controlled-node group normalization', () => {
     expect(machine).not.toHaveProperty('teamNames');
   });
 });
+
+
+it('preserves only a boolean true live Participant rename hint; legacy, viewer and malformed hints cannot grant management', async () => {
+  apiFetch.mockResolvedValueOnce({machines:withNodeIds([
+    {serverId:'admin',accessRole:'participant',canRename:true},
+    {serverId:'member',accessRole:'participant',canRename:false},
+    {serverId:'legacy-member',accessRole:'participant'},
+    {serverId:'viewer',accessRole:'viewer',canRename:true},
+    {serverId:'invalid',accessRole:'bad',canRename:true},
+    {serverId:'string',accessRole:'participant',canRename:'true'},
+  ])});
+  const machines = await listControllableMachines();
+  expect(machines[0]?.canRename).toBe(true);
+  expect(machines.slice(1).every(machine => machine.canRename === undefined)).toBe(true);
+});

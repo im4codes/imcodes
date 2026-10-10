@@ -973,9 +973,9 @@ export class RemoteDesktopRouter {
     for (const route of [...this.routesBySession.values()]) this.failRoute(route, reason, true);
   }
 
-  /** Re-resolve only this user's live grants after a share mutation commits. */
-  async revalidateUser(userId: string): Promise<void> {
-    const routes = [...this.routesBySession.values()].filter((route) => route.userId === userId);
+  /** Re-resolve live grants after share/group mutations; omitted actor rechecks this target's active routes. */
+  async revalidateUser(userId?: string): Promise<void> {
+    const routes = [...this.routesBySession.values()].filter((route) => userId === undefined || route.userId === userId);
     await Promise.all(routes.map((route) => this.renewLease(route)));
   }
 
@@ -1498,7 +1498,6 @@ export class RemoteDesktopRouter {
     // remote-desktop capability only on win32 with the worker installed, which
     // `daemonSupportsRemoteDesktop()` checks before and after this admission.
     const controlledNode = access.node_role === NODE_ROLE.CONTROLLED;
-    if (controlledNode && access.access_role !== 'owner' && access.access_source !== 'share') return 'denied';
     if (access.access_role !== 'owner'
       && access.access_expires_at !== null
       && (typeof access.access_expires_at !== 'number'

@@ -6689,6 +6689,11 @@ export class WsBridge {
     }
   }
 
+  /** A node's group association changed: revoke lost reads immediately, preserving other live coverage. */
+  async revalidateMachineGroupAccess(): Promise<void> {
+    await Promise.all([this.controlledBrowserReads.revalidate(), this.remoteDesktopRouter.revalidateUser()]);
+  }
+
   async revalidateShareSocketsForUser(userId: string): Promise<void> {
     // Synchronous, before any await: from here no socket's cached coverage serves a command.
     this.shareCoverageEpoch += 1;
