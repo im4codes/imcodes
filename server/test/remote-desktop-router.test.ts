@@ -234,10 +234,16 @@ describe('RemoteDesktopRouter', () => {
   // GUI_INPUT in the one rule table, so operate access alone gets a VIEW-only route.
   describe('Control is execute-class: operate access alone only watches', () => {
     for (const [label, row] of Object.entries(UNGRANTED_PARTICIPANTS)) {
-      it(`${label} is admitted in View, cannot switch to Control, and the daemon is never told to take input`, async () => {
+      it(`${label}: only a direct share may View; no execute grant ever enables Control`, async () => {
         const f = fixture({ resolveAccess: async () => ({ ...validAccess(), ...row }) });
         await f.router.handleBrowser(f.browserA, 'someone', start);
         const authority = f.messages(f.browserA).at(-1)!;
+        if (row.access_source === 'group') {
+          expect(authority).toMatchObject({ type: REMOTE_DESKTOP_MSG.ERROR, error: REMOTE_DESKTOP_ERROR.ACCESS_DENIED });
+          expect(f.daemonMessages).toEqual([]);
+          expect(f.router.stats().active).toBe(0);
+          return;
+        }
         expect(authority).toMatchObject({ type: REMOTE_DESKTOP_MSG.AUTHORIZED, mode: REMOTE_DESKTOP_ACCESS_MODE.VIEW });
         expect(f.daemonMessages.find((message) => message.type === REMOTE_DESKTOP_MSG.PREPARE))
           .toMatchObject({ mode: REMOTE_DESKTOP_ACCESS_MODE.VIEW });

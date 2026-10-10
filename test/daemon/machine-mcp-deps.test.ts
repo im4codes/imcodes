@@ -106,7 +106,7 @@ describe('daemon machine tool deps — fail-closed resolution (10.12 / 10.11)', 
     expect(localComputerUse).not.toHaveBeenCalled();
   });
 
-  it('live-revalidates a participant turn before dispatching local Computer Use', async () => {
+  it('does not mistake valid turn authority or an unrelated node share for permission to the owner local backend', async () => {
     const order: string[] = [];
     const listMachines = vi.fn(async (input: { sharedMachineAuthority?: string }) => {
       order.push(`revalidate:${input.sharedMachineAuthority ?? 'owner'}`);
@@ -124,14 +124,26 @@ describe('daemon machine tool deps — fail-closed resolution (10.12 / 10.11)', 
     });
 
     await expect(deps.computerUseCall?.({ machine: 'local', tool: 'list_apps' }))
-      .resolves.toMatchObject({ outcome: 'completed' });
-    expect(order).toEqual(['revalidate:signed-shared-turn', 'local-dispatch']);
+      .resolves.toMatchObject({ outcome: 'not_dispatched', reason: MCP_ERROR_REASONS.MACHINE_NOT_FOUND });
+    expect(order).toEqual(['revalidate:signed-shared-turn']);
+    expect(localComputerUse).not.toHaveBeenCalled();
     expect(listMachines).toHaveBeenCalledWith(expect.objectContaining({
       sourceServerId: creds.serverId,
       sourceToken: creds.token,
       sharedMachineAuthority: 'signed-shared-turn',
       includeOffline: true,
     }));
+  });
+
+  it.each(['local', 'localhost', 'self', 'this', ' LOCAL ', 'LocalHost', creds.serverId])('a participant alias %s never borrows the owner local backend', async (machine) => {
+    const local = vi.fn(async () => ({ outcome: 'completed' as const }));
+    const remote = vi.fn(async () => ({ outcome: 'completed' as const }));
+    const deps = createDaemonMachineToolDeps({ loadCredential: async () => creds,
+      loadSharedMachineAuthority: async () => 'participant', listMachines: async () => [m({ serverId: 'unrelated-shared-node' })],
+      localComputerUseCall: local as never, computerUseCall: remote as never });
+    expect(await deps.computerUseCall?.({ machine, tool: 'click', arguments: { x: 1, y: 2 } }))
+      .toMatchObject({ outcome: 'not_dispatched', reason: MCP_ERROR_REASONS.MACHINE_NOT_FOUND });
+    expect(local).not.toHaveBeenCalled(); expect(remote).not.toHaveBeenCalled();
   });
 
   it('denies a stale delegated turn before local Computer Use when live revalidation rejects it', async () => {

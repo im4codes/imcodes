@@ -305,25 +305,9 @@ export function createDaemonMachineToolDeps(overrides: DaemonMachineToolDepsOver
       // expiry and revocation state. A required context that cannot be loaded
       // throws here and MUST NOT degrade into an owner-authored local call.
       const sharedMachineAuthority = await loadSharedMachineAuthority();
-      if (isLocalComputerUseTarget(machine, creds)) {
-        if (sharedMachineAuthority) {
-          if (!creds) {
-            return { outcome: 'not_dispatched', reason: MCP_ERROR_REASONS.FEATURE_DISABLED, error: 'daemon is not bound to a server' };
-          }
-          try {
-            // Discovery is the authenticated, source-daemon-bound live
-            // revalidation seam. Its result is intentionally unused: the
-            // target is the already-bound local daemon, but no host action may
-            // start until the server has accepted the exact participant turn.
-            await listWithAuthority(creds, true, sharedMachineAuthority);
-          } catch (err) {
-            if (err instanceof MachineControlPlaneError) {
-              const reason = err.kind === 'unbound' ? MCP_ERROR_REASONS.FEATURE_DISABLED : MCP_ERROR_REASONS.CONTROL_PLANE_UNAVAILABLE;
-              return { outcome: 'not_dispatched', reason, error: `machine control plane: ${err.kind}` };
-            }
-            throw err;
-          }
-        }
+      // Owner local tools remain local. A participant alias names a resource, not the owner's local backend.
+      // Resolve it against the live authorized controlled fleet and dispatch through the server's target/action recheck.
+      if (isLocalComputerUseTarget(machine, creds) && !sharedMachineAuthority) {
         return localComputerUse({
           tool,
           ...(args ? { arguments: args } : {}),
@@ -343,7 +327,9 @@ export function createDaemonMachineToolDeps(overrides: DaemonMachineToolDepsOver
         }
         throw err;
       }
-      const matches = matchingMachines(all, machine);
+      const matches = isLocalComputerUseTarget(machine, creds)
+        ? all.filter((candidate) => candidate.serverId === creds.serverId)
+        : matchingMachines(all, machine);
       if (matches.length === 0) return { outcome: 'not_dispatched', reason: MCP_ERROR_REASONS.MACHINE_NOT_FOUND, error: `no controllable machine named "${machine}"` };
       if (matches.length > 1) return { outcome: 'not_dispatched', reason: MCP_ERROR_REASONS.MACHINE_AMBIGUOUS, error: `more than one machine named "${machine}"` };
       const target = matches[0]!;

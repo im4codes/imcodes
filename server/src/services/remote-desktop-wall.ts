@@ -91,7 +91,7 @@ async function resolveHost(
       WHERE (h.id = $2 OR requested.server_id = $2)
         AND h.merge_state = 'resolved'
         AND s.revoked_at IS NULL
-        AND (s.user_id = $1 OR sh.id IS NOT NULL OR ${IS_MEMBER_OF_A_MACHINE_GROUP})
+        AND (s.user_id = $1 OR sh.id IS NOT NULL OR (s.node_role IS DISTINCT FROM $4 AND ${IS_MEMBER_OF_A_MACHINE_GROUP}))
       -- A canonical host may retain stale reinstall endpoints. Prefer any
       -- durable-online endpoint before the controlled-role preference so one
       -- old row cannot make the wall display a live desktop as offline.

@@ -16,6 +16,7 @@ import {
   canOperateControlledMachine,
   listAccessibleControlledMachines,
   resolveControlledMachineOperatorAccess,
+  resolveControlledMachineParticipantShareAccess,
   type ControlledMachineOperatorAccessRow,
 } from './machine-access.js';
 
@@ -185,7 +186,7 @@ export async function listActorOperableMachineAccess(
   limit: number,
 ) {
   const rows = await listAccessibleControlledMachines(db, delegatedActorUserId, now, limit);
-  return new Map(rows.filter((row) => canOperateControlledMachine(row.access_role)).map((row) => [row.id, row]));
+  return new Map(rows.filter((row) => row.access_source === 'share' && canOperateControlledMachine(row.access_role)).map((row) => [row.id, row]));
 }
 
 /**
@@ -240,7 +241,7 @@ export async function admitMachineAction(
   if (!ownerTarget) return deny(MACHINE_DENIAL_REASON.NO_ACCESS, null);
   // Preserve the source owner's scope, but evaluate and audit the real actor's role/source/grant, never the owner's substitute.
   const target = delegatedActorUserId
-    ? await resolveControlledMachineOperatorAccess(db, delegatedActorUserId, input.targetServerId, input.now)
+    ? await resolveControlledMachineParticipantShareAccess(db, delegatedActorUserId, input.targetServerId, input.now)
     : ownerTarget;
   if (!target) return deny(MACHINE_DENIAL_REASON.NO_ACCESS, null);
   const decision = evaluateMachineAction({

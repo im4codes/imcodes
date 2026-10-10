@@ -1498,6 +1498,7 @@ export class RemoteDesktopRouter {
     // remote-desktop capability only on win32 with the worker installed, which
     // `daemonSupportsRemoteDesktop()` checks before and after this admission.
     const controlledNode = access.node_role === NODE_ROLE.CONTROLLED;
+    if (controlledNode && access.access_role !== 'owner' && access.access_source !== 'share') return 'denied';
     if (access.access_role !== 'owner'
       && access.access_expires_at !== null
       && (typeof access.access_expires_at !== 'number'

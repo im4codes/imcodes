@@ -19,7 +19,7 @@ it('the participant-only deny set is exactly exec_remote, including every regist
   const registered = Object.keys((server as unknown as { _registeredTools: Record<string, unknown> })._registeredTools);
   expect(registered.length).toBeGreaterThan(60);
   expect(Object.keys(PARTICIPANT_TURN_TOOL_POLICY)).toEqual([N.EXEC_REMOTE]);
-  for (const name of [...registered, ...Object.values(N), 'future_registered_tool', 'EXEC_REMOTE', 'shell_session1']) {
+  for (const name of [...registered, ...Object.values(N), 'future_registered_tool', 'EXEC_REMOTE', 'shell_session1', 'constructor', 'toString', '__proto__']) {
     expect(isToolAllowedInParticipantTurn(name), name).toBe(name !== N.EXEC_REMOTE);
   }
 });

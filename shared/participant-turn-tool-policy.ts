@@ -20,5 +20,5 @@ export const PARTICIPANT_TURN_TOOL_POLICY: Readonly<Record<string, ParticipantTu
 
 /** All other tools reach their original identity, project, role, resource and schema checks. */
 export function isToolAllowedInParticipantTurn(toolName: string): boolean {
-  return (PARTICIPANT_TURN_TOOL_POLICY[toolName] ?? ALLOW) === ALLOW;
+  return !Object.hasOwn(PARTICIPANT_TURN_TOOL_POLICY, toolName) || PARTICIPANT_TURN_TOOL_POLICY[toolName] === ALLOW;
 }

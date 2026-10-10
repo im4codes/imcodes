@@ -132,7 +132,7 @@ async function admits(name: string, action: MachineAction, token?: string): Prom
 /** Who may EXECUTE (exec, shell, GUI input, file send / fetch / list): the owner and the explicit participant WITH the grant. */
 const MAY_EXECUTE = ['owner', 'pYes', 'groupAndGrant'];
 /** Who may merely operate (view-class): every access that is not a viewer / nothing. */
-const MAY_VIEW = ['owner', 'pNo', 'pYes', 'gMember', 'gAdmin', 'groupAndGrant'];
+const MAY_VIEW = ['owner', 'pNo', 'pYes', 'groupAndGrant'];
 
 describe('role x action matrix (real resolvers, real routes)', () => {
   it.each(NAMES)('%s: exec_remote / shell_session1 / click -> only the owner and an explicit execute grant run', async (name) => {
@@ -157,14 +157,14 @@ describe('role x action matrix (real resolvers, real routes)', () => {
     }
   });
 
-  it.each(NAMES)('%s: list_machines visibility is unchanged', async (name) => {
+  it.each(NAMES)('%s: controlled discovery requires ownership or a live direct share', async (name) => {
     const visible = (await listControlledMachines(db, actors[name]!.userId, Date.now())).machines.some((m) => m.serverId === nodeId);
-    expect(visible, name).toBe(['owner', 'pNo', 'pYes', 'viewer', 'gMember', 'gAdmin', 'viewerAndGroup', 'groupAndGrant'].includes(name));
+    expect(visible, name).toBe(['owner', 'pNo', 'pYes', 'viewer', 'viewerAndGroup', 'groupAndGrant'].includes(name));
   });
 
   it('the listing tells an actor whether THEY can execute, and a daemon-facing flag follows it', async () => {
     const forMember = (await listControlledMachines(db, actors.gMember!.userId, Date.now())).machines.find((m) => m.serverId === nodeId)!;
-    expect(forMember).toMatchObject({ execEnabled: true, canExecute: false, execGranted: false, accessSource: 'group' });
+    expect(forMember).toBeUndefined();
     const forGrantee = (await listControlledMachines(db, actors.pYes!.userId, Date.now())).machines.find((m) => m.serverId === nodeId)!;
     expect(forGrantee).toMatchObject({ canExecute: true, execGranted: true, accessSource: 'share' });
     const forOwner = (await listControlledMachines(db, actors.owner!.userId, Date.now())).machines.find((m) => m.serverId === nodeId)!;
@@ -217,15 +217,15 @@ describe('only exec_remote is refused on participant-origin turns', () => {
     expect(execCalls).toBe(before);
     for (const attempt of [SHELL, CLICK]) {
       const calls = guiCalls;
-      expect((await attempt(owner, headers)).status).toBe(MAY_EXECUTE.includes(name) ? 200 : 403);
-      expect(guiCalls - calls).toBe(MAY_EXECUTE.includes(name) ? 1 : 0);
+      expect((await attempt(owner, headers)).status).toBe(['pYes', 'groupAndGrant'].includes(name) ? 200 : 403);
+      expect(guiCalls - calls).toBe(['pYes', 'groupAndGrant'].includes(name) ? 1 : 0);
     }
     for (const action of [MACHINE_ACTION.FILE_SEND, MACHINE_ACTION.FILE_FETCH, MACHINE_ACTION.FILE_LIST]) {
       const admission = await admitMachineAction(db, {
         token: headers[SHARED_MACHINE_AUTHORITY_HEADER], signingKey: KEY, authenticatedSourceServerId: owner.serverId,
         sourceOwnerUserId: owner.userId, targetServerId: nodeId, action, now: Date.now(),
       });
-      expect(admission.ok, action).toBe(MAY_EXECUTE.includes(name));
+      expect(admission.ok, action).toBe(['pYes', 'groupAndGrant'].includes(name));
     }
   });
 
@@ -233,18 +233,21 @@ describe('only exec_remote is refused on participant-origin turns', () => {
     const delegated = await delegatedHeader(name);
     const owner = actors.owner!;
     const projected = (await listControlledMachines(db, owner.userId, Date.now(), actors[name]!.userId)).machines.find((m) => m.serverId === nodeId)!;
-    expect(projected).toMatchObject({ execEnabled: true, canExecute: false, accessSource: name === 'gMember' ? 'group' : 'share', execGranted: name === 'pYes' });
+    if (name === 'gMember') expect(projected).toBeUndefined();
+    else expect(projected).toMatchObject({ execEnabled: true, canExecute: false, accessSource: 'share', execGranted: name === 'pYes' });
     const response = await execApp().request('/api/machines', {
       headers: { 'X-Server-Id': owner.serverId, authorization: `Bearer ${owner.token}`, ...delegated },
     });
     expect(response.status).toBe(200);
     const listed = await response.json();
-    expect(listed.machines.find((m: { serverId: string }) => m.serverId === nodeId)).toMatchObject({ execEnabled: true });
-    expect(listed.machines.find((m: { serverId: string }) => m.serverId === nodeId)).not.toHaveProperty('canExecute');
+    const item = listed.machines.find((m: { serverId: string }) => m.serverId === nodeId);
+    if (name === 'gMember') expect(item).toBeUndefined();
+    else { expect(item).toMatchObject({ execEnabled: true }); expect(item).not.toHaveProperty('canExecute'); }
   });
 
-  it('a read-only view still follows the participant\'s OWN access (a group member may look, a stranger may not)', async () => {
-    expect((await VIEW(actors.owner!, await delegatedHeader('gMember'))).status).toBe(200);
+  it('a read-only view still follows the participant\'s OWN access (a direct share may look, a group or stranger may not)', async () => {
+    expect((await VIEW(actors.owner!, await delegatedHeader('pNo'))).status).toBe(200);
+    expect((await VIEW(actors.owner!, await delegatedHeader('gMember'))).status).toBe(403);
     expect((await VIEW(actors.owner!, await delegatedHeader('other'))).status).toBe(403);
   });
 
@@ -352,13 +355,13 @@ describe('audit and rate limit', () => {
     const rows = await db.query<Record<string, unknown>>(
       `SELECT * FROM machine_exec_audit WHERE target_server_id = $1 AND command_sha256 = $2 ORDER BY created_at`, [nodeId, sha(secretCommand)]);
     expect(rows.map((r) => [r.user_id, r.decision, r.reason ?? null, r.action])).toEqual([
-      [actors.gMember!.userId, 'denied', 'execute_not_granted', 'exec'],
+      [actors.gMember!.userId, 'denied', 'no_access', 'exec'],
       [actors.owner!.userId, 'allowed', null, 'exec'],
     ]);
     expect(JSON.stringify(rows)).not.toContain('SECRET');
     expect(Number(rows[0]!.command_length)).toBe(Buffer.byteLength(secretCommand));
     expect(rows[1]!.access_source).toBe('owner');
-    expect(rows[0]!.access_source).toBe('group');
+    expect(rows[0]!.access_source).toBeNull();
   });
 
   it('rate limits an actor per device with 429 and Retry-After, audits it, and never lets strangers starve the owner', async () => {

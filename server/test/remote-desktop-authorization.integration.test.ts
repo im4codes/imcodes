@@ -22,13 +22,7 @@ beforeAll(async () => {
 
 afterAll(async () => { await db.close(); });
 
-/**
- * Desk scope: a controlled node is bound to exactly one Desk, and a share only
- * grants access to a current member of it. These helpers therefore bind the
- * machine and enrol the grantee, so the role/expiry/revocation contracts below
- * are exercised on a realistic machine rather than on a legacy unbound one
- * (which now admits nobody but its owner).
- */
+/** Legacy group metadata is independent of a controlled node's direct share authorization. */
 async function seedDesk(ownerId: string): Promise<string> {
   const teamId = `rd-desk-${ownerId}`;
   const now = Date.now();
@@ -197,6 +191,31 @@ describe('remote desktop real-PostgreSQL authorization and teardown', () => {
       type: REMOTE_DESKTOP_MSG.TERMINAL,
       reason: REMOTE_DESKTOP_TERMINAL_REASON.AUTHORITY_REVOKED,
     });
+  });
+
+  it('revocation and reconnect cannot fall back to a residual group membership on a controlled node', async () => {
+    const ownerId = `rd-owner-${hex(5)}`;
+    const participantId = `rd-participant-${hex(5)}`;
+    await Promise.all([createUser(db, ownerId), createUser(db, participantId)]);
+    const serverId = await createControlledNode(ownerId);
+    const teamId = await seedDesk(ownerId);
+    await db.execute('INSERT INTO team_members (team_id, user_id, role, joined_at) VALUES ($1,$2,$3,$4)', [teamId, participantId, 'member', Date.now()]);
+    await db.execute('INSERT INTO machine_groups (server_id, team_id, added_at) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING', [serverId, teamId, Date.now()]);
+    const f = fixture(serverId);
+    expect(await start(f, participantId, {} as WebSocket)).toMatchObject({ type: REMOTE_DESKTOP_MSG.ERROR });
+    expect(f.daemonMessages).toHaveLength(0);
+    const share = await grant(ownerId, participantId, serverId, 'participant');
+    const socket = {} as WebSocket;
+    expect(await start(f, participantId, socket)).toMatchObject({ type: REMOTE_DESKTOP_MSG.AUTHORIZED });
+    await db.execute('UPDATE server_shares SET revoked_at = $2 WHERE id = $1', [share.id, Date.now()]);
+    await f.router.revalidateUser(participantId);
+    expect(f.router.stats().active).toBe(0);
+    expect(f.messages(socket).at(-1)).toMatchObject({ type: REMOTE_DESKTOP_MSG.TERMINAL, reason: REMOTE_DESKTOP_TERMINAL_REASON.AUTHORITY_REVOKED });
+    const dispatches = f.daemonMessages.length;
+    expect(await start(f, participantId, {} as WebSocket)).toMatchObject({ type: REMOTE_DESKTOP_MSG.ERROR });
+    expect(f.daemonMessages).toHaveLength(dispatches);
+    expect(await start(f, ownerId, {} as WebSocket)).toMatchObject({ type: REMOTE_DESKTOP_MSG.AUTHORIZED });
+    f.router.stopAll();
   });
 
   it('serializes concurrent real-DB starts and isolates an unrelated user', async () => {

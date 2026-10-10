@@ -122,37 +122,15 @@ const CONTROLLED_MACHINE_ACCESS_SELECT = `
     FROM servers s
     LEFT JOIN remote_desktop_host_endpoints rdhe
       ON rdhe.server_id = s.id
-    -- Sharing one machine with one person, and sharing a group of machines with
-    -- a team, are two separate grants. Either is sufficient on its own.
-    --
-    -- They were briefly collapsed: the share JOIN additionally required the
-    -- grantee to be a current member of the machine's team, so on a machine
-    -- with no team -- which is now every machine at install -- share rows
-    -- granted nothing at all while the UI still listed them as 有效/active. A
-    -- grant that is displayed as active and enforced as absent is the worst of
-    -- the two possible answers.
+    -- Direct node shares stand independently of group metadata and are re-read live.
     LEFT JOIN server_shares sh
       ON sh.server_id = s.id
      AND s.user_id <> $1
      AND sh.target_user_id = $1
      AND sh.revoked_at IS NULL
      AND (sh.expires_at IS NULL OR sh.expires_at > $2)
-    -- The group path is available to every current group member. Management
-    -- mutations have their own owner/admin fences; this read/operate grant is
-    -- intentionally role-independent so group membership does not produce a
-    -- device list that cannot actually be opened.
-    --
-    -- A machine can be in several groups, so this is a join through the
-    -- membership table rather than a single column: one matching group is
-    -- enough, and being in one group does not remove it from another.
-    --
-    -- A group has three roles for management. All three roles can discover and
-    -- operate machines in the group; only the existing owner/admin management
-    -- routes can change membership, shares, or group metadata.
-    --
-    -- Membership and role are read here rather than copied into a row, so a
-    -- demotion, a removal, or taking the machine out all take effect on the
-    -- next request.
+    -- Group rows are retained here only for metadata-management authority.
+    -- Operational/list/desktop callers require ownership or an explicit share.
 `;
 
 /**
@@ -197,9 +175,17 @@ export async function resolveControlledMachineOperatorAccess(
   now: number,
 ): Promise<ControlledMachineOperatorAccessRow | null> {
   const access = await resolveControlledMachineAccess(db, userId, serverId, now);
-  return access && canOperateControlledMachine(access.access_role)
+  return access && access.access_source !== 'group' && canOperateControlledMachine(access.access_role)
     ? access as ControlledMachineOperatorAccessRow
     : null;
+}
+
+/** A participant-origin tool must hold a live direct node share; ownership/group rows are not delegated grants. */
+export async function resolveControlledMachineParticipantShareAccess(
+  db: Database, userId: string, serverId: string, now: number,
+): Promise<ControlledMachineOperatorAccessRow | null> {
+  const access = await resolveControlledMachineOperatorAccess(db, userId, serverId, now);
+  return access?.access_source === 'share' ? access : null;
 }
 
 /**
@@ -209,7 +195,7 @@ export async function resolveControlledMachineOperatorAccess(
  *                      credential, switch SYSTEM exec on or off, force a node upgrade, install the remote-desktop worker, store the
  *                      sign-in (auto-unlock) secret, ask for screen-recording permission, read the exec audit, grant execute -- is
  *                      the owner's alone. A share participant (who may operate, and execute with the owner's grant) and a group member
- *                      or group admin (who may operate) can NOT: they could otherwise re-enable exec the owner switched off, revoke the
+ *                      or group admin (metadata management only) can NOT: they could otherwise re-enable exec the owner switched off, revoke the
  *                      credential and take the node offline, or push an upgrade.
  *   `rename`           the owner and a group owner/admin, for the display name only (a label, not a capability).
  *
@@ -224,7 +210,8 @@ export async function resolveControlledMachineManagementAccess(
   now: number,
   scope: ControlledMachineManagementScope = 'owner',
 ): Promise<ControlledMachineOperatorAccessRow | null> {
-  const access = await resolveControlledMachineOperatorAccess(db, userId, serverId, now);
+  const resolved = await resolveControlledMachineAccess(db, userId, serverId, now);
+  const access = resolved && canOperateControlledMachine(resolved.access_role) ? resolved as ControlledMachineOperatorAccessRow : null;
   if (!access) return null;
   if (access.access_role === 'owner' && access.access_source === 'owner') return access;
   if (scope !== 'rename') return null;
@@ -256,9 +243,9 @@ export async function resolveRemoteDesktopHostAccess(
       WHERE s.id = $3
         AND s.revoked_at IS NULL
         AND ${ACTIVE_ACCOUNTS_ACCESS_PREDICATE}
-        AND (s.user_id = $1 OR sh.id IS NOT NULL OR ${IS_MEMBER_OF_A_MACHINE_GROUP})
+        AND (s.user_id = $1 OR sh.id IS NOT NULL OR (s.node_role IS DISTINCT FROM $4 AND ${IS_MEMBER_OF_A_MACHINE_GROUP}))
       LIMIT 1`,
-    [userId, now, serverId],
+    [userId, now, serverId, NODE_ROLE.CONTROLLED],
   );
 }
 
@@ -287,7 +274,7 @@ export async function listAccessibleControlledMachines(
       WHERE s.node_role = $3
         AND s.revoked_at IS NULL
         AND ${ACTIVE_ACCOUNTS_ACCESS_PREDICATE}
-        AND (s.user_id = $1 OR sh.id IS NOT NULL OR ${IS_MEMBER_OF_A_MACHINE_GROUP})
+        AND (s.user_id = $1 OR sh.id IS NOT NULL)
       ORDER BY s.display_name NULLS LAST, s.id
       LIMIT $4`,
     [userId, now, NODE_ROLE.CONTROLLED, limit],

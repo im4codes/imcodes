@@ -991,7 +991,7 @@ describe('file-transfer upload route', () => {
       body: form,
     });
 
-    expect(response.status).toBe(500);
+    expect(response.status).toBe(403);
     expect(stagedStatus).toBe(403);
   });
 
@@ -1314,6 +1314,15 @@ describe('file-transfer download route', () => {
       user_id: 'machine-owner', node_role: 'controlled', exec_enabled: true,
       revoked_at: null, access_role: 'participant', access_source: 'share', exec_granted: true,
     });
+    sendFileTransferRequestMock.mockResolvedValueOnce({
+      type: FILE_TRANSFER_MSG.PATH_HANDLE_DONE,
+      attachment: { id: 'abc123', source: 'local', downloadable: true },
+      sourceIdentity: { size: 6, mtimeMs: 1, device: 2, inode: 3 },
+    });
+    expect((await app.request('/api/server/controlled-1/machine-file-handle', {
+      method: 'POST', headers: { Authorization: 'Bearer source', 'X-Server-Id': 'full-1' },
+      body: JSON.stringify({ path: '/scoped/secret.txt' }),
+    })).status).toBe(200);
     const stagedStatuses: number[] = [];
     sendFileTransferRequestMock.mockImplementation(async (_requestId, message) => {
       if ((message as { type?: string }).type !== FILE_TRANSFER_MSG.DOWNLOAD_STREAM) {
@@ -1334,7 +1343,7 @@ describe('file-transfer download route', () => {
       headers: { Authorization: 'Bearer source', 'X-Server-Id': 'full-1' },
     });
 
-    expect(response.status).toBe(404);
+    expect(response.status).toBe(403);
     expect(stagedStatuses.length).toBeGreaterThan(0);
     expect(stagedStatuses.every((status) => status === 403)).toBe(true);
   });

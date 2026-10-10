@@ -26,6 +26,7 @@ import { generateControlledNodeId } from '../src/services/controlled-node-identi
 import {
   FILE_TRANSFER_MSG,
   FILE_TRANSFER_PATH_HANDLE_CAPABILITY,
+  FILE_TRANSFER_DOWNLOAD_STREAM_CAPABILITY,
   FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY,
 } from '../../shared/transport/file-transfer.js';
 import {
@@ -121,8 +122,9 @@ function buildApp() {
   });
   app.route('/api/machines', machinesRoutes);
   app.route('/api', tabSharingRoutes);
-  app.route('/api/server', sessionMgmtRoutes);
+  // Match production: native download token middleware precedes the session-wide auth middleware.
   app.route('/api/server', fileTransferRoutes);
+  app.route('/api/server', sessionMgmtRoutes);
   app.route('/api/machine/exec', createMachineExecRoutes(async () => ({
     online: true,
     result: { requestId: 'exec', ok: true, exitCode: 0, stdout: 'ok', stderr: '', durationMs: 1 },
@@ -515,11 +517,22 @@ describe('controlled-node shared action admission', () => {
       arguments: { machine: 'local', tool: 'list_apps' },
     });
     const localResult = await callLocal();
-    expect(localResult.isError).toBeFalsy();
-    expect(localResult.structuredContent).toMatchObject({
-      status: 'ok', outcome: 'completed', result: { ok: true, content: [{ text: 'local-ok' }] },
-    });
-    expect(localComputerUse).toHaveBeenCalledTimes(1);
+    expect(localResult.isError).toBe(true);
+    expect(mcpToolPayload(localResult)).toMatchObject({ reason: 'machine_not_found' });
+    expect(localComputerUse).not.toHaveBeenCalled();
+    for (const machine of ['localhost', 'self', 'this', 'LOCAL', 'LoCaLhOsT', '^^(local)', '^^(SELF)', `^^(${source.serverId})`, source.serverId]) {
+      const aliasResult = await mcpClient.callTool({
+        name: MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_CALL,
+        arguments: { ...(machine === undefined ? {} : { machine }), tool: 'list_apps' },
+      });
+      expect(aliasResult.isError, `local alias ${String(machine)}`).toBe(true);
+      expect(mcpToolPayload(aliasResult), JSON.stringify(aliasResult)).toMatchObject({ reason: 'machine_not_found' });
+    }
+    // No default/whitespace form exists in the public schema; these remain ordinary input errors.
+    for (const arguments_ of [{ tool: 'list_apps' }, { machine: ' LOCAL ', tool: 'list_apps' }]) {
+      expect((await mcpClient.callTool({ name: MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_CALL, arguments: arguments_ })).isError).toBe(true);
+    }
+    expect(localComputerUse).not.toHaveBeenCalled();
     const targetSocket = new CaptureDaemonSocket((message) => {
       if (message.type !== FILE_TRANSFER_MSG.PATH_HANDLE) return;
       queueMicrotask(() => targetSocket.emit('message', Buffer.from(JSON.stringify({
@@ -604,7 +617,7 @@ describe('controlled-node shared action admission', () => {
       status: 'error', reason: 'control_plane_unavailable',
     });
     expect(localComputerUse, 'role changed after admission must stop before the local bridge')
-      .toHaveBeenCalledTimes(1);
+      .not.toHaveBeenCalled();
 
     await db.execute('UPDATE session_shares SET role = $2, expires_at = $3 WHERE id = $1', [shareId, 'participant', Date.now() - 1]);
     expect((await app.request(`/api/server/${source.serverId}/session/send`, {
@@ -615,7 +628,7 @@ describe('controlled-node shared action admission', () => {
       method: 'POST', headers, body: JSON.stringify({ tool: 'list_apps' }),
     })).status).toBe(403);
     expect((await callLocal()).isError).toBe(true);
-    expect(localComputerUse).toHaveBeenCalledTimes(1);
+    expect(localComputerUse).not.toHaveBeenCalled();
 
     await db.execute('UPDATE session_shares SET expires_at = NULL WHERE id = $1', [shareId]);
     const forgedHeaders = { ...headers, [SHARED_MACHINE_AUTHORITY_HEADER]: `${authority}x` };
@@ -624,7 +637,7 @@ describe('controlled-node shared action admission', () => {
     })).status).toBe(403);
     bindAdmittedCommand(`${authority as string}x`);
     expect((await callLocal()).isError).toBe(true);
-    expect(localComputerUse).toHaveBeenCalledTimes(1);
+    expect(localComputerUse).not.toHaveBeenCalled();
     bindAdmittedCommand(authority as string);
 
     callerIdentity = { ...runtimeIdentity, runtimeEpoch: `${runtimeIdentity.runtimeEpoch}-stale` };
@@ -633,7 +646,7 @@ describe('controlled-node shared action admission', () => {
     expect(mcpToolPayload(staleRuntimeLocal)).toMatchObject({
       status: 'error', reason: 'internal_error', message: 'shared_machine_authority_unavailable',
     });
-    expect(localComputerUse).toHaveBeenCalledTimes(1);
+    expect(localComputerUse).not.toHaveBeenCalled();
     callerIdentity = runtimeIdentity;
 
     const wrongProject = signJwt({
@@ -653,7 +666,7 @@ describe('controlled-node shared action admission', () => {
 
     bindAdmittedCommand(wrongProject);
     expect((await callLocal()).isError).toBe(true);
-    expect(localComputerUse).toHaveBeenCalledTimes(1);
+    expect(localComputerUse).not.toHaveBeenCalled();
     bindAdmittedCommand(authority as string);
 
     const foreignOwnerId = `foreign-owner-${hex(4)}`;
@@ -665,7 +678,7 @@ describe('controlled-node shared action admission', () => {
 
     await db.execute('UPDATE session_shares SET revoked_at = $2 WHERE id = $1', [shareId, Date.now()]);
     expect((await callLocal()).isError).toBe(true);
-    expect(localComputerUse).toHaveBeenCalledTimes(1);
+    expect(localComputerUse).not.toHaveBeenCalled();
     await mcpClient.close();
     clearProcessSharedMachineAuthoritiesForTests();
     sourceSocket.close();
@@ -956,8 +969,8 @@ describe('a shared-session participant reaches only the machines shared with the
 
   it('hides and denies every owner node that is not shared with the participant, on every device surface', async () => {
     const t = await scene();
-    expect(await listed(t.app, t.delegated)).toEqual([t.grouped, t.participantShared].sort());
-    for (const [name, target] of [['unshared', t.unshared], ['viewer share', t.viewerShared]] as const) {
+    expect(await listed(t.app, t.delegated)).toEqual([t.participantShared]);
+    for (const [name, target] of [['unshared', t.unshared], ['group-only', t.grouped], ['viewer share', t.viewerShared]] as const) {
       const execDenied = await exec(t.app, t.delegated, target);
       expect(execDenied.status, `exec ${name}`).toBe(403);
       expect(await execDenied.json()).toMatchObject({ reason: 'target_forbidden' });
@@ -970,7 +983,7 @@ describe('a shared-session participant reaches only the machines shared with the
     const t = await scene();
     for (const target of [t.participantShared, t.grouped]) {
       // Read-only computer use follows the participant's own access (a machine share, or the group)...
-      expect((await computerUse(t.app, t.delegated, target)).status, `computer-use ${target}`).toBe(200);
+      expect((await computerUse(t.app, t.delegated, target)).status, `computer-use ${target}`).toBe(target === t.participantShared ? 200 : 403);
       // Only exec_remote is participant-gated. A granted file request reaches the offline node (503), not a policy refusal.
       // A group-only actor still lacks the file grant (403).
       const execDenied = await exec(t.app, t.delegated, target);
@@ -995,7 +1008,7 @@ describe('a shared-session participant reaches only the machines shared with the
     // Expired, then revoked, then downgraded: each is read live on the next action.
     await db.execute('UPDATE server_shares SET expires_at = $3 WHERE server_id = $1 AND target_user_id = $2', [t.participantShared, t.participantId, Date.now() - 1]);
     expect((await computerUse(t.app, t.delegated, t.participantShared)).status).toBe(403);
-    expect(await listed(t.app, t.delegated)).toEqual([t.grouped]);
+    expect(await listed(t.app, t.delegated)).toEqual([]);
     await db.execute('UPDATE server_shares SET expires_at = NULL, revoked_at = $3 WHERE server_id = $1 AND target_user_id = $2', [t.participantShared, t.participantId, Date.now()]);
     expect((await computerUse(t.app, t.delegated, t.participantShared)).status).toBe(403);
     await db.execute('UPDATE server_shares SET revoked_at = NULL, role = $3, exec_granted = false WHERE server_id = $1 AND target_user_id = $2', [t.participantShared, t.participantId, 'viewer']);
@@ -1006,6 +1019,20 @@ describe('a shared-session participant reaches only the machines shared with the
     expect(await listed(t.app, t.delegated)).toEqual([]);
     // The owner turn is untouched by any of it.
     expect((await exec(t.app, t.ownerTurn, t.participantShared)).status).toBe(200);
+  });
+
+  it('a group with a direct share loses access immediately when that share expires or is revoked', async () => {
+    const t = await scene();
+    const share = await createMachineGrant({ ownerId: t.ownerId, recipientId: t.participantId, serverId: t.grouped, role: 'participant' });
+    expect((await computerUse(t.app, t.delegated, t.grouped)).status).toBe(200);
+    expect(await listed(t.app, t.delegated)).toContain(t.grouped);
+    for (const field of ['expires_at', 'revoked_at'] as const) {
+      await db.execute(`UPDATE server_shares SET expires_at = $2, revoked_at = $3 WHERE id = $1`, [share.id, field === 'expires_at' ? Date.now() - 1 : null, field === 'revoked_at' ? Date.now() : null]);
+      expect((await computerUse(t.app, t.delegated, t.grouped)).status).toBe(403);
+      expect((await fileHandle(t.app, t.delegated, t.grouped)).status).toBe(403);
+      expect(await listed(t.app, t.delegated)).not.toContain(t.grouped);
+    }
+    expect((await computerUse(t.app, t.ownerTurn, t.grouped)).status).toBe(200);
   });
 
   it('still refuses a forged, foreign or revoked-session authority even on a node shared with the participant', async () => {
@@ -1049,6 +1076,128 @@ describe('a shared-session participant reaches only the machines shared with the
     expect((await exec(audited as never, t.delegated, t.unshared)).status).toBe(403);
     expect(await db.queryOne<{ reason: string }>('SELECT reason FROM machine_exec_audit WHERE target_server_id = $1', [t.unshared]))
       .toEqual({ reason: 'no_access' });
+  });
+
+  async function fileNode(t: Awaited<ReturnType<typeof scene>>, beforeReply?: () => Promise<void>) {
+    const token = hex(16);
+    const attachmentId = hex(16);
+    await db.execute('UPDATE servers SET token_hash = $2 WHERE id = $1', [t.participantShared, sha256(token)]);
+    const socket = new CaptureDaemonSocket((message) => {
+      if (![FILE_TRANSFER_MSG.PATH_HANDLE, FILE_TRANSFER_MSG.DOWNLOAD_STREAM, FILE_TRANSFER_MSG.DOWNLOAD].includes(message.type as never)) return;
+      void (async () => {
+        await beforeReply?.();
+        const reply = message.type === FILE_TRANSFER_MSG.PATH_HANDLE ? {
+          type: FILE_TRANSFER_MSG.PATH_HANDLE_DONE, requestId: message.requestId,
+          attachment: { id: attachmentId, source: 'local', serverId: t.participantShared, daemonPath: '/scoped/payload.txt', createdAt: new Date().toISOString(), downloadable: true },
+          sourceIdentity: { size: 7, mtimeMs: 1, device: 2, inode: 3 },
+        } : {
+          type: FILE_TRANSFER_MSG.DOWNLOAD_DONE, downloadId: message.downloadId,
+          content: Buffer.from('payload').toString('base64'), mime: 'text/plain', filename: 'scoped.txt',
+        };
+        socket.emit('message', Buffer.from(JSON.stringify(reply)), false);
+      })();
+    });
+    const bridge = WsBridge.get(t.participantShared);
+    bridge.handleDaemonConnection(socket as never, db, { JWT_SIGNING_KEY: JWT_KEY } as never);
+    socket.emit('message', Buffer.from(JSON.stringify({
+      type: 'auth', serverId: t.participantShared, token,
+      capabilities: [FILE_TRANSFER_PATH_HANDLE_CAPABILITY, FILE_TRANSFER_DOWNLOAD_STREAM_CAPABILITY, FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY],
+    })), false);
+    await waitFor(() => bridge.isDaemonConnected());
+    return { socket, attachmentId };
+  }
+
+  it.each(['device-grant', 'node-share'] as const)('native download tokens retain and revalidate the issuing participant (%s)', async (revocation) => {
+    const t = await scene();
+    const n = await fileNode(t);
+    try {
+      expect((await fileHandle(t.app, t.delegated, t.participantShared)).status).toBe(200);
+      const tokenPath = `/api/server/${t.participantShared}/uploads/${n.attachmentId}/download-token`;
+      // This is a browser-only route in the original daemon-token inventory: never widen it.
+      expect((await t.app.request(tokenPath, { method: 'POST', headers: t.delegated })).status).toBe(403);
+      const minted = await t.app.request(tokenPath, { method: 'POST', headers: webAuth(t.participantId) });
+      expect(minted.status, await minted.clone().text()).toBe(200);
+      const { token } = await minted.json() as { token: string };
+      const url = `/api/server/${t.participantShared}/uploads/${n.attachmentId}/download?token=${token}`;
+      const good = await t.app.request(url);
+      expect(good.status, await good.clone().text()).toBe(200);
+      expect(await good.text()).toBe('payload');
+      expect((await t.app.request(`/api/server/${t.unshared}/uploads/${n.attachmentId}/download?token=${token}`)).status).toBe(403);
+      if (revocation === 'device-grant') {
+        await db.execute('UPDATE server_shares SET exec_granted = false WHERE server_id = $1 AND target_user_id = $2', [t.participantShared, t.participantId]);
+      } else {
+        await db.execute('UPDATE server_shares SET expires_at = $3 WHERE server_id = $1 AND target_user_id = $2', [t.participantShared, t.participantId, Date.now() - 1]);
+      }
+      const dispatches = n.socket.sent.length;
+      expect((await t.app.request(url)).status).toBe(403);
+      expect(n.socket.sent).toHaveLength(dispatches);
+    } finally { n.socket.close(); }
+  });
+
+  it('binds handles to their node and issuing actor, without breaking the owner or another actor\'s own handle', async () => {
+    const t = await scene();
+    const n = await fileNode(t);
+    const otherId = `other-${hex(4)}`;
+    await createUser(db, otherId);
+    await createMachineGrant({ ownerId: t.ownerId, recipientId: otherId, serverId: t.participantShared, role: 'participant' });
+    const other = webAuth(otherId);
+    try {
+      expect((await fileHandle(t.app, t.delegated, t.participantShared)).status).toBe(200);
+      const base = `/api/server/${t.participantShared}/uploads/${n.attachmentId}`;
+      const before = n.socket.sent.length;
+      for (const [path, method] of [[base + '/download', 'GET'], [base + '/download-token', 'POST'], [base, 'DELETE']] as const) {
+        expect((await t.app.request(path, { method, headers: other })).status, path).toBe(403);
+      }
+      expect(n.socket.sent).toHaveLength(before);
+      expect((await t.app.request(base + '/download', { headers: t.ownerTurn })).status).toBe(200);
+      expect((await fileHandle(t.app, other, t.participantShared)).status).toBe(200);
+      expect((await t.app.request(base + '/download', { headers: other })).status).toBe(200);
+    } finally { n.socket.close(); }
+  });
+
+  it('revalidates after JSON body staging and immediately before actual file dispatch', async () => {
+    const t = await scene();
+    const n = await fileNode(t);
+    let complete!: () => void;
+    const waiting = new Promise<void>((resolve) => { complete = resolve; });
+    let read!: () => void;
+    const reading = new Promise<void>((resolve) => { read = resolve; });
+    const body = new ReadableStream<Uint8Array>({
+      async pull(controller) {
+        read(); await waiting;
+        controller.enqueue(new TextEncoder().encode(JSON.stringify({ path: '/scoped/payload.txt' })));
+        controller.close();
+      },
+    });
+    try {
+      const pending = t.app.request(`/api/server/${t.participantShared}/machine-file-handle`, {
+        method: 'POST', headers: t.delegated, body, duplex: 'half',
+      } as RequestInit);
+      // pull can begin before admission; wait for the admission audit before revoking.
+      await reading;
+      const deadline = Date.now() + 2_000;
+      while (!await db.queryOne('SELECT correlation_id FROM machine_exec_audit WHERE target_server_id = $1 AND outcome = $2', [t.participantShared, 'authorized'])) {
+        if (Date.now() > deadline) throw new Error('admission_audit_timeout');
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      await db.execute('UPDATE server_shares SET exec_granted = false WHERE server_id = $1 AND target_user_id = $2', [t.participantShared, t.participantId]);
+      complete();
+      expect((await pending).status).toBe(403);
+      expect(n.socket.sent.filter((raw) => JSON.parse(raw).type === FILE_TRANSFER_MSG.PATH_HANDLE)).toHaveLength(0);
+    } finally { complete(); n.socket.close(); }
+  });
+
+  it('rejects a device result after the signed session authority is revoked in flight', async () => {
+    const t = await scene();
+    const n = await fileNode(t, async () => {
+      await db.execute('UPDATE session_shares SET revoked_at = $2 WHERE id = $1', [t.sessionShare.id, Date.now()]);
+    });
+    try {
+      const reply = await fileHandle(t.app, t.delegated, t.participantShared);
+      expect(reply.status).toBe(403);
+      expect(await reply.json()).toEqual({ error: 'target_forbidden' });
+      expect(n.socket.sent.filter((raw) => JSON.parse(raw).type === FILE_TRANSFER_MSG.PATH_HANDLE)).toHaveLength(1);
+    } finally { n.socket.close(); }
   });
 
   it.each([false, true])('re-reads the participant execute grant when a staged upload is redeemed (delegated=%s)', async (delegated) => {
