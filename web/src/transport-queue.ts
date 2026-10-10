@@ -1,4 +1,4 @@
-import { readQueueDeliveryPolicy, type QueueDeliveryPolicy } from '@shared/session-send-delivery.js';
+import { readQueueDeliveryPolicy, type QueueDeliveryPolicy } from '../../shared/session-send-delivery.js';
 import type { SharedActorEnvelope } from '@shared/tab-sharing.js';
 import {
   createTransportQueueReducerState,
