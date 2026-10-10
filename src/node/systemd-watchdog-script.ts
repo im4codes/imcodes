@@ -1,4 +1,6 @@
-# Python 2.7/3 standard-library transport for legacy systemd/SELinux.
+// Canonical Python transport, embedded in both SEA and the tsc/npm distribution.
+// Keep it as source data, not a bundler-only ?raw import.
+export const SYSTEMD_WATCHDOG_NOTIFY_SCRIPT = String.raw`# Python 2.7/3 standard-library transport for legacy systemd/SELinux.
 # No SCM_CREDENTIALS spoofing, parent PID impersonation, timer, or autonomous
 # renewal. Stay in the unit cgroup until stdin EOF so PID attribution cannot
 # race a short-lived sender's exit. Only the node's liveness decision feeds it.
@@ -22,3 +24,4 @@ while True:
     transport.sendto(b'WATCHDOG=1', address)
     sys.stdout.write('SENT\n')
     sys.stdout.flush()
+`;

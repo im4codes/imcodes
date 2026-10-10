@@ -1,3 +1,8 @@
+import { mkdtemp, readFile, writeFile, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
+import ts from 'typescript';
 import { EventEmitter } from 'node:events';
 import { PassThrough } from 'node:stream';
 import type { ChildProcessWithoutNullStreams } from 'node:child_process';
@@ -102,4 +107,23 @@ describe('unit-owned non-spoofing watchdog sender', () => {
     await expect(value.pulse()).rejects.toThrow('requires_system_python');
     expect(spawn).not.toHaveBeenCalled();
   });
+});
+
+
+it('loads the emitted watchdog module without bundler-only raw assets in the npm daemon path', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'imcodes-watchdog-emitted-test-'));
+  try {
+    await writeFile(join(dir, 'package.json'), JSON.stringify({ type: 'module' }));
+    for (const name of ['systemd-watchdog', 'systemd-watchdog-script']) {
+      const source = await readFile(`src/node/${name}.ts`, 'utf8');
+      const { outputText } = ts.transpileModule(source, { compilerOptions: {
+        target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext,
+      } });
+      await writeFile(join(dir, `${name}.js`), outputText);
+    }
+    const compiled = await import(/* @vite-ignore */ pathToFileURL(join(dir, 'systemd-watchdog.js')).href);
+    expect(typeof compiled.createSystemdWatchdogTransport).toBe('function');
+    const script = await import(/* @vite-ignore */ pathToFileURL(join(dir, 'systemd-watchdog-script.js')).href);
+    expect(script.SYSTEMD_WATCHDOG_NOTIFY_SCRIPT).toContain('sys.stdin.readline()');
+  } finally { await rm(dir, {recursive: true, force: true}); }
 });

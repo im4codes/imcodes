@@ -1,6 +1,6 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import notifyScript from '../../scripts/systemd-watchdog-notify.py?raw';
+import { SYSTEMD_WATCHDOG_NOTIFY_SCRIPT } from './systemd-watchdog-script.js';
 
 const PULSE_TIMEOUT_MS = 2_000;
 const MAX_RESPONSE_BYTES = 128;
@@ -70,7 +70,7 @@ export function createSystemdWatchdogTransport(options: {
       env: { NOTIFY_SOCKET: address, ...(process.env.IMCODES_HOME ? { IMCODES_HOME: process.env.IMCODES_HOME } : {}) },
       stdio: ['pipe', 'pipe', 'pipe'],
       windowsHide: true,
-    })))(python, ['-E', '-S', '-u', '-c', notifyScript], socket);
+    })))(python, ['-E', '-S', '-u', '-c', SYSTEMD_WATCHDOG_NOTIFY_SCRIPT], socket);
     child = sender;
     ready = false;
     response = '';
