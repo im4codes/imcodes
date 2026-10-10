@@ -1,6 +1,7 @@
 import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 import type WebSocket from 'ws';
 import type { Database } from '../db/client.js';
+import { machineGroupInvalidationReady, machineGroupInvalidationRevision } from '../services/machine-group-invalidation.js';
 import { evaluateMachineAction, MACHINE_ACTION } from '../../../shared/machine-access-policy.js';
 import {
   canOperateControlledMachine,
@@ -343,6 +344,7 @@ export class RemoteDesktopRouter {
   private auditWindowStartedAt = 0;
   private auditWindowCount = 0;
   private admissionQueue: Promise<void> = Promise.resolve();
+  private authorizationEpoch = 0;
   private readonly routeRegistry: RemoteDesktopRouteRegistry;
   private counters: Omit<RemoteDesktopRouterStats, 'active' | 'controlling'> = {
     admitted: 0,
@@ -970,11 +972,14 @@ export class RemoteDesktopRouter {
   }
 
   stopAll(reason: RemoteDesktopTerminalReason = REMOTE_DESKTOP_TERMINAL_REASON.INTERNAL_ERROR): void {
+    this.authorizationEpoch++;
     for (const route of [...this.routesBySession.values()]) this.failRoute(route, reason, true);
   }
 
   /** Re-resolve live grants after share/group mutations; omitted actor rechecks this target's active routes. */
   async revalidateUser(userId?: string): Promise<void> {
+    // Fence pending START and already-running lease SQL, not just routes currently in the registry.
+    this.authorizationEpoch++;
     const routes = [...this.routesBySession.values()].filter((route) => userId === undefined || route.userId === userId);
     await Promise.all(routes.map((route) => this.renewLease(route)));
   }
@@ -1160,13 +1165,10 @@ export class RemoteDesktopRouter {
     const generation = this.hooks.daemonGeneration();
     const queryStartedAt = this.now();
     let access: ControlledMachineAccessRow | null;
+    let snapshot: Awaited<ReturnType<RemoteDesktopRouter['resolveStableAccountAccess']>>;
     try {
-      access = await (this.hooks.resolveAccess ?? resolveRemoteDesktopHostOperatorAccess)(
-        db,
-        userId,
-        this.hooks.serverId(),
-        queryStartedAt,
-      );
+      snapshot = await this.resolveStableAccountAccess(db, userId, queryStartedAt);
+      access = snapshot.access;
     } catch {
       this.reject(socket, start.requestId, REMOTE_DESKTOP_ERROR.INTERNAL_ERROR, true);
       return;
@@ -1211,7 +1213,6 @@ export class RemoteDesktopRouter {
       return;
     }
 
-    const accessModeCeiling = this.accessModeCeiling(access!);
     const sessionId = mintOpaque();
     const capability = this.deriveCapability(start.requestId, sessionId);
     const routeGeneration = await this.allocateRouteGeneration(db).catch(() => null);
@@ -1240,6 +1241,17 @@ export class RemoteDesktopRouter {
       );
       return;
     }
+    // Allocation/reservation awaits may straddle a revoke. No PREPARE may borrow the earlier authorization.
+    try { snapshot = await this.refreshAccountAccess(db, userId, snapshot); }
+    catch { snapshot = { ...snapshot, access: null }; }
+    access = snapshot.access;
+    const changedAccessError = this.admissionError(access, this.now());
+    if (changedAccessError) {
+      await this.routeRegistry.close(db, { ...registryIdentity, routeId: sessionId, now: this.now() }).catch(() => {});
+      this.reject(socket, start.requestId, changedAccessError.error, changedAccessError.retryable);
+      return;
+    }
+    const accessModeCeiling = this.accessModeCeiling(access!);
     const leaseExpiresAt = Math.min(
       authorizedAt + REMOTE_DESKTOP_LIMITS.LEASE_DURATION_MS,
       expiresAt,
@@ -1297,6 +1309,17 @@ export class RemoteDesktopRouter {
       this.reject(socket, start.requestId, REMOTE_DESKTOP_ERROR.CAPABILITY_UNAVAILABLE, true);
       return;
     }
+
+    // Revalidation may have removed this pending route while activate awaited PG. Never resurrect it.
+    if (this.routesBySession.get(sessionId) !== route) return;
+    try { snapshot = await this.refreshAccountAccess(db, userId, snapshot); }
+    catch { snapshot = { ...snapshot, access: null }; }
+    if (this.routesBySession.get(sessionId) !== route) return;
+    const terminalReason = this.revalidationFailure(snapshot.access);
+    if (terminalReason) { this.failRoute(route, terminalReason, true); return; }
+    const latestCeiling = this.accessModeCeiling(snapshot.access!);
+    route.actor = { ...route.actor, modeCeiling: latestCeiling };
+    if (latestCeiling === REMOTE_DESKTOP_ACCESS_MODE.VIEW) route.mode = REMOTE_DESKTOP_ACCESS_MODE.VIEW;
 
     const authority = {
       requestId: start.requestId,
@@ -1775,12 +1798,7 @@ export class RemoteDesktopRouter {
     if (route.actor.source === REMOTE_DESKTOP_ACTOR_SOURCE.ACCOUNT) {
       let access: ControlledMachineAccessRow | null = null;
       try {
-        access = await (this.hooks.resolveAccess ?? resolveRemoteDesktopHostOperatorAccess)(
-          db,
-          route.actor.userId,
-          this.hooks.serverId(),
-          this.now(),
-        );
+        access = (await this.resolveStableAccountAccess(db, route.actor.userId, this.now())).access;
       } catch {
         // Fail closed below.
       }
@@ -1857,6 +1875,32 @@ export class RemoteDesktopRouter {
     route.leaseExpiresAt = nextLease;
     clearTimeout(route.leaseTimer);
     route.leaseTimer = this.scheduleLeaseExpiry(route);
+  }
+
+  /** One live permission class for account START/reservation/activation and renewal; notifications are not a prerequisite. */
+  private async resolveStableAccountAccess(db: Database, userId: string, now: number): Promise<{
+    access: ControlledMachineAccessRow | null; epoch: number; revision: number;
+  }> {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const epoch = this.authorizationEpoch;
+      const before = await machineGroupInvalidationRevision(db);
+      const access = await (this.hooks.resolveAccess ?? resolveRemoteDesktopHostOperatorAccess)(db, userId, this.hooks.serverId(), now);
+      const revision = await machineGroupInvalidationRevision(db);
+      if (access?.node_role === NODE_ROLE.CONTROLLED && !machineGroupInvalidationReady(db)) {
+        return { access: null, epoch, revision };
+      }
+      if (epoch === this.authorizationEpoch && before === revision) return { access, epoch, revision };
+    }
+    return { access: null, epoch: this.authorizationEpoch, revision: -1 };
+  }
+
+  private async refreshAccountAccess(db: Database, userId: string,
+    snapshot: { access: ControlledMachineAccessRow | null; epoch: number; revision: number },
+  ): Promise<typeof snapshot> {
+    if (snapshot.access?.node_role === NODE_ROLE.CONTROLLED && !machineGroupInvalidationReady(db)) return { ...snapshot, access: null };
+    const revision = await machineGroupInvalidationRevision(db);
+    return snapshot.epoch === this.authorizationEpoch && snapshot.revision === revision
+      ? snapshot : this.resolveStableAccountAccess(db, userId, this.now());
   }
 
   private revalidationFailure(access: ControlledMachineAccessRow | null): RemoteDesktopTerminalReason | null {

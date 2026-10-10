@@ -97,10 +97,12 @@ async function browser(url: string, serverId: string, user: string) {
 const refresh = (ws: WebSocket, marker: string) => ws.send(JSON.stringify({ type:DAEMON_MSG.CONTROLLED_NODE_WORKER_REFRESH_STATUS,
   attemptId:marker, phase:'succeeded', installedVersion:'2026.10.5371-dev.5816', targetVersion:'2026.10.5371-dev.5816', artifactSha256:'a'.repeat(64), recordedAt:Date.now() }));
 async function desktop(reader: Awaited<ReturnType<typeof browser>>) {
+  const started=performance.now();
   reader.ws.send(JSON.stringify({type:REMOTE_DESKTOP_MSG.START, protocolVersion:REMOTE_DESKTOP_PROTOCOL_VERSION, requestId:id()}));
   await wait(() => reader.frames.some(f=>f.type===REMOTE_DESKTOP_MSG.AUTHORIZED||f.type===REMOTE_DESKTOP_MSG.ERROR));
   if (!reader.frames.some(f=>f.type===REMOTE_DESKTOP_MSG.AUTHORIZED)) console.error(reader.frames.filter(f=>f.type===REMOTE_DESKTOP_MSG.ERROR));
   expect(reader.frames.find(f=>f.type===REMOTE_DESKTOP_MSG.AUTHORIZED)).toMatchObject({mode:REMOTE_DESKTOP_ACCESS_MODE.VIEW});
+  console.log(JSON.stringify({metric:'group_desktop_start',durationMs:performance.now()-started,normalAccountRightsQueries:5,renewalAccountRightsQueries:3}));
 }
 
 it('partial additive migration retries retain existing multi-owner event IDs while another connection writes', async () => {
@@ -191,6 +193,20 @@ it('mutation rollback leaves grants/epoch/events unchanged; concurrent writers c
     expect((await db.queryOne<{n:number}>('SELECT count(*)::int AS n FROM machine_group_invalidations WHERE team_id=$1 AND recipients <@ acknowledgements',[t.team]))?.n).toBe(2);
   } finally { await runtime.stop(); }
 },10000);
+
+it('two node pods reject pending desktop admissions from old real-PG snapshots after third-pod revoke completes', async () => {
+  const t=await fixture();const pods=[await pod(),await pod(false)],publisher=await pod();const ds=[] as WebSocket[];
+  for(let i=0;i<2;i++) {
+    const p=pods[i]!,n=t.nodes[i]!;ds.push(await daemon(p.url,n.server,n.token));const reader=await browser(p.url,n.server,t.actor);
+    const armed=ipc(p.child,IPC.ARM_ACCESS);p.child.send({type:IPC.ARM_ACCESS,actor:t.actor});await armed;
+    const held=ipc(p.child,IPC.HELD);reader.ws.send(JSON.stringify({type:REMOTE_DESKTOP_MSG.START,protocolVersion:REMOTE_DESKTOP_PROTOCOL_VERSION,requestId:id()}));
+    expect((await held).permitted).toBe(true);
+  }
+  // No route existed when each receiver applied its fence. Its old pending SQL must not create one later.
+  expect((await fetch(publisher.url+`/api/team/${t.team}/member/${t.actor}`,{method:'DELETE',headers:auth(t.owner)})).status).toBe(200);
+  for(const p of pods) { const fresh=ipc(p.child,IPC.FRESH_ACCESS);p.child.send({type:IPC.RELEASE});expect((await fresh).permitted).toBe(false); }
+  for(const node of ds) expect(daemonFrames.get(node)!.some(f=>f.type===REMOTE_DESKTOP_MSG.PREPARE)).toBe(false);
+},30000);
 
 it('a missing fleet receipt is applied/pending within the deadline, never a fake successful revocation', async () => {
   const receiver=id(), event=id();

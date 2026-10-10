@@ -8,6 +8,8 @@ import type { Env } from '../../src/env.js';
 
 const db = createDatabase(process.env.TEST_DATABASE_URL!);
 let heldActor: string | null = null;
+let heldAccessActor: string | null = null;
+let freshAccessActor: string | null = null;
 let release: (() => void) | null = null;
 const query = db.query.bind(db);
 db.query = async <T>(sql: string, parameters: unknown[] = []): Promise<T[]> => {
@@ -19,6 +21,17 @@ db.query = async <T>(sql: string, parameters: unknown[] = []): Promise<T[]> => {
     await new Promise<void>((resolve) => { release = resolve; process.send?.({ type: IPC.HELD }); });
   }
   return rows;
+};
+const queryOne = db.queryOne.bind(db);
+db.queryOne = async <T>(sql: string, parameters: unknown[] = []): Promise<T | null> => {
+  const row = await queryOne<T>(sql, parameters);
+  if (sql.includes('END AS access_role') && heldAccessActor && parameters[0] === heldAccessActor) {
+    freshAccessActor = heldAccessActor; heldAccessActor = null;
+    await new Promise<void>(resolve => { release = resolve; process.send?.({ type: IPC.HELD, permitted: Boolean(row) }); });
+  } else if (sql.includes('END AS access_role') && freshAccessActor && parameters[0] === freshAccessActor) {
+    freshAccessActor = null; process.send?.({ type: IPC.FRESH_ACCESS, permitted: Boolean(row) });
+  }
+  return row;
 };
 const runtime = new MachineGroupInvalidationRuntime(db,
   scope => applyMachineGroupInvalidation(db, scope), failClosedMachineGroupConnections,
@@ -34,6 +47,7 @@ setupWebSocketUpgrade(http, env);
 if (!http.listening) await new Promise<void>(resolve => http.once('listening', resolve));
 process.on('message', (message: { type: string; actor?: string }) => {
   if (message.type === IPC.ARM) { heldActor = message.actor!; process.send?.({ type: IPC.ARM }); }
+  if (message.type === IPC.ARM_ACCESS) { heldAccessActor = message.actor!; process.send?.({ type: IPC.ARM_ACCESS }); }
   if (message.type === IPC.RELEASE) { release?.(); release = null; }
   if (message.type === IPC.STOP) {
     release?.();

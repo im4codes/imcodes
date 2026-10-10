@@ -1851,3 +1851,56 @@ describe('a relay-required remote desktop receives real relay material', () => {
       .toMatchObject({ relayBitrateCapBps: 500_000 });
   });
 });
+
+it('a revalidation fences a pending START SQL snapshot, retaining an independent legal grant', async () => {
+  for (const remains of [false,true]) {
+    let release!: (access:ControlledMachineAccessRow|null)=>void; let initial=true;
+    const group={...validAccess(),...UNGRANTED_PARTICIPANTS['a group member (any group role)']};
+    const f=fixture({resolveAccess:async()=>{ if(initial){initial=false;return new Promise(r=>{release=r;});}return remains?group:null; }});
+    try {
+      const admission=f.router.handleBrowser(f.browserA,'participant',start);
+      await vi.waitFor(()=>expect(release).toBeTypeOf('function'));
+      const fenced=f.router.revalidateUser('participant');release(group);await Promise.all([admission,fenced]);
+      expect(f.daemonMessages.some(m=>m.type===REMOTE_DESKTOP_MSG.PREPARE)).toBe(remains);
+      expect(f.router.stats().active).toBe(remains?1:0);
+    }finally{f.router.stopAll();}
+  }
+});
+it('a second revalidation cannot reuse an already-running lease SQL snapshot after revocation', async () => {
+  let release!: (access:ControlledMachineAccessRow|null)=>void;let calls=0;
+  const group={...validAccess(),...UNGRANTED_PARTICIPANTS['a group member (any group role)']};
+  const f=fixture({resolveAccess:async()=>{ if(++calls===2)return new Promise(r=>{release=r;});return calls===1?group:null; }});
+  try {
+    await f.router.handleBrowser(f.browserA,'participant',start);
+    const first=f.router.revalidateUser('participant');await vi.waitFor(()=>expect(release).toBeTypeOf('function'));
+    const second=f.router.revalidateUser('participant');release(group);await Promise.all([first,second]);
+    expect(f.router.stats().active).toBe(0);expect(f.daemonMessages.some(m=>m.type===REMOTE_DESKTOP_MSG.LEASE)).toBe(false);
+  }finally{f.router.stopAll();}
+});
+it('reservation/activation awaits cannot revive revoked Desktop authority or a route already removed', async () => {
+  for(const phase of ['reserve','activate']) {
+    let release!: ()=>void;let granted=true;const closed=vi.fn();
+    const group={...validAccess(),...UNGRANTED_PARTICIPANTS['a group member (any group role)']};
+    const f=fixture({resolveAccess:async()=>granted?group:null,routeRegistry:{
+      reserve:async(_db,input)=>{if(phase==='reserve')await new Promise<void>(r=>{release=r;});return {hostId:'host-00000000000000000001',routeGeneration:input.routeGeneration,authority:{actorSource:REMOTE_DESKTOP_ACTOR_SOURCE.ACCOUNT}};},
+      activate:async()=>{if(phase==='activate')await new Promise<void>(r=>{release=r;});},close:async()=>{closed();},
+    }});
+    try {
+      const admission=f.router.handleBrowser(f.browserA,'participant',start);await vi.waitFor(()=>expect(release).toBeTypeOf('function'));
+      granted=false;await f.router.revalidateUser('participant');release();await admission;
+      expect(f.router.stats().active).toBe(0);expect(f.daemonMessages.some(m=>m.type===REMOTE_DESKTOP_MSG.PREPARE)).toBe(false);
+      expect(closed).toHaveBeenCalledTimes(1);
+    }finally{f.router.stopAll();}
+  }
+});
+it('valid owner and ordinary FULL pending admissions survive an unrelated actor fence', async () => {
+  for(const access of [validAccess(),daemonHostAccess()]) {
+    let release!: (access:ControlledMachineAccessRow|null)=>void;let initial=true;
+    const f=fixture({resolveAccess:async()=>{if(initial){initial=false;return new Promise(r=>{release=r;});}return access;}});
+    try {
+      const admission=f.router.handleBrowser(f.browserA,'owner-user',start);await vi.waitFor(()=>expect(release).toBeTypeOf('function'));
+      const fence=f.router.revalidateUser('another-actor');release(access);await Promise.all([admission,fence]);
+      expect(f.router.stats().active).toBe(1);expect(f.daemonMessages.some(m=>m.type===REMOTE_DESKTOP_MSG.PREPARE)).toBe(true);
+    }finally{f.router.stopAll();}
+  }
+});
