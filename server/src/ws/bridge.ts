@@ -1,3 +1,4 @@
+import { machineGroupInvalidationReady, machineGroupInvalidationRevision } from '../services/machine-group-invalidation.js';
 import {
   CONTROLLED_NODE_ABI_MODERN, CONTROLLED_NODE_ABI_GLIBC217,
   CONTROLLED_NODE_ABI_PROFILE_FIELD, normalizeControlledNodeAbiProfile, type ControlledNodeAbiProfile,
@@ -2822,7 +2823,8 @@ export class WsBridge {
     this.controlledBrowserReads = new ControlledBrowserReadGate(serverId, () => this.db, (socket) => {
       this.cleanupBrowserSocket(socket);
       try { socket.close(1008, 'controlled_read_revoked'); } catch { /* already closed */ }
-    });
+    }, () => machineGroupInvalidationReady(this.db), () => this.db
+      ? machineGroupInvalidationRevision(this.db) : Promise.reject(new Error('controlled_read_authority_unavailable')));
     setRemoteDesktopPendingRouteCancellationDispatcher(
       (command) => WsBridge.dispatchRemoteDesktopPendingRouteCancellation(command),
     );
@@ -6686,6 +6688,14 @@ export class WsBridge {
       if (state.target.serverId !== target.serverId) continue;
       if (state.target.kind !== 'server' && shareTargetKey(state.target) !== targetRef) continue;
       safeSend(ws, serialized);
+    }
+  }
+
+  /** Distributed authority is unavailable/stopped: fence controlled reads synchronously; FULL paths are untouched. */
+  failClosedMachineGroupAccess(): void {
+    this.controlledBrowserReads.invalidateAll();
+    if (this.daemonNodeRole === NODE_ROLE.CONTROLLED) {
+      this.remoteDesktopRouter.stopAll(REMOTE_DESKTOP_TERMINAL_REASON.AUTHORITY_REVOKED);
     }
   }
 

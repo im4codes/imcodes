@@ -1,3 +1,4 @@
+import { mutateAndRevalidateMachineGroupAccess } from '../ws/machine-group-revalidation.js';
 import { Hono } from 'hono';
 import { z } from 'zod';
 import type { Env } from '../env.js';
@@ -443,19 +444,11 @@ machinesRoutes.post('/desk-binding', requireAuth(), async (c) => {
       [teamId, userId],
     );
     if (!membership) return c.json({ error: 'forbidden', reason: 'desk_membership_required' }, 403);
-    await c.env.DB.execute(
-      `INSERT INTO machine_groups (server_id, team_id, added_at) VALUES ($1, $2, $3)
-       ON CONFLICT (server_id, team_id) DO NOTHING`,
-      [serverId, teamId, Date.now()],
-    );
-  } else {
-    await c.env.DB.execute(
-      'DELETE FROM machine_groups WHERE server_id = $1 AND team_id = $2',
-      [serverId, teamId],
-    );
   }
-
-  await WsBridge.find(serverId)?.revalidateMachineGroupAccess();
+  await mutateAndRevalidateMachineGroupAccess(c.env.DB, { serverId }, (tx) => member
+    ? tx.execute(`INSERT INTO machine_groups (server_id, team_id, added_at) VALUES ($1, $2, $3)
+       ON CONFLICT (server_id, team_id) DO NOTHING`, [serverId, teamId, Date.now()])
+    : tx.execute('DELETE FROM machine_groups WHERE server_id = $1 AND team_id = $2', [serverId, teamId]));
 
   const ip = (c.get('clientIp' as never) as string) ?? 'unknown';
   logAudit({

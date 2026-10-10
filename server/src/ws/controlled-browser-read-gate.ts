@@ -13,7 +13,9 @@ export class ControlledBrowserReadGate {
   private epoch = 0;
 
   constructor(private readonly serverId: string, private readonly database: () => Database | null,
-    private readonly invalidate: (socket: WebSocket) => void) {}
+    private readonly invalidate: (socket: WebSocket) => void,
+    private readonly authorityReady: () => boolean = () => true,
+    private readonly revision: () => Promise<number> = async () => 0) {}
 
   register(socket: WebSocket, actor: string): void { this.actors.set(socket, actor); }
   remove(socket: WebSocket): void { this.actors.delete(socket); }
@@ -26,6 +28,11 @@ export class ControlledBrowserReadGate {
     // Fence an in-flight read before waiting on its queue: its old SQL snapshot cannot serve a revoke.
     this.epoch++;
     return this.enqueue([...this.actors].filter(([, user]) => actor === undefined || user === actor));
+  }
+
+  invalidateAll(): void {
+    this.epoch++;
+    for (const socket of [...this.actors.keys()]) this.invalidate(socket);
   }
 
   private enqueue(targets: Array<[WebSocket, string]>, json?: string): Promise<void> {
@@ -41,21 +48,27 @@ export class ControlledBrowserReadGate {
       let timer: ReturnType<typeof setTimeout> | undefined;
       try {
         const db = this.database();
-        if (!db) throw new Error('controlled_read_authority_unavailable');
+        if (!db || !this.authorityReady()) throw new Error('controlled_read_authority_unavailable');
         const users = [...new Set(current.map(([, actor]) => actor))];
         const deadline = Date.now() + READ_AUTHORITY_TIMEOUT_MS;
         let allowed: Set<string> | undefined;
         for (let attempt = 0; attempt < 3; attempt++) {
           const epoch = this.epoch;
-          allowed = await Promise.race([
-            resolveControlledMachineReadActors(db, this.serverId, users, Date.now()),
+          const read = await Promise.race([
+            (async () => {
+              const before = await this.revision();
+              const permitted = await resolveControlledMachineReadActors(db, this.serverId, users, Date.now());
+              const after = await this.revision();
+              return { before, after, permitted };
+            })(),
             new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error('controlled_read_authority_timeout')), Math.max(1, deadline - Date.now())); timer.unref?.(); }),
           ]);
           if (timer) clearTimeout(timer);
-          if (epoch === this.epoch) break;
+          allowed = read.permitted;
+          if (epoch === this.epoch && read.before === read.after) break;
           allowed = undefined;
         }
-        if (!allowed) throw new Error('controlled_read_authority_changed');
+        if (!allowed || !this.authorityReady()) throw new Error('controlled_read_authority_changed');
         for (const [socket, actor] of current) {
           if (!this.actors.has(socket) || this.actors.get(socket) !== actor) continue;
           if (!allowed.has(actor)) { this.invalidate(socket); continue; }

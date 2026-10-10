@@ -49,3 +49,33 @@ it('queue overflow is bounded and invalidates only registered controlled readers
   await gate.revalidate(); await Promise.resolve();
   expect(invalid).toHaveBeenCalledTimes(1); expect(ws.send).not.toHaveBeenCalled(); expect(query).not.toHaveBeenCalled();
 });
+
+it('fleet authority failure/stop fences an old allowed snapshot and never touches unregistered FULL readers', async () => {
+  let release!: (rows: unknown) => void;
+  let ready = true;
+  const query = vi.fn(() => new Promise(resolve => { release = resolve; }));
+  const invalid = vi.fn((ws: WebSocket) => gate.remove(ws));
+  const gate = new ControlledBrowserReadGate('node', () => ({ query }) as unknown as Database, invalid, () => ready);
+  const ws = socket(), full = socket(); gate.register(ws, 'actor'); gate.send(ws, 'old-snapshot');
+  await vi.waitFor(() => expect(query).toHaveBeenCalledTimes(1));
+  ready = false; release([{ actor_id: 'actor' }]);
+  await gate.revalidate();
+  expect(ws.send).not.toHaveBeenCalled(); expect(invalid).toHaveBeenCalledWith(ws);
+  expect(invalid).not.toHaveBeenCalledWith(full);
+  gate.register(ws, 'actor'); gate.invalidateAll();
+  expect(invalid).toHaveBeenCalledTimes(2); expect(invalid).not.toHaveBeenCalledWith(full);
+});
+
+it('a durable revision fences stale SQL even before this pod receives any notification', async () => {
+  let release!: (rows: unknown) => void;
+  let revision = 0;
+  const query = vi.fn().mockImplementationOnce(() => new Promise(resolve => { release = resolve; }))
+    .mockResolvedValue([]);
+  const invalid = vi.fn((ws: WebSocket) => gate.remove(ws));
+  const gate = new ControlledBrowserReadGate('node', () => ({ query }) as unknown as Database, invalid, () => true, async () => revision);
+  const ws = socket(); gate.register(ws, 'actor'); gate.send(ws, 'old-snapshot');
+  await vi.waitFor(() => expect(query).toHaveBeenCalledTimes(1));
+  revision++; release([{ actor_id: 'actor' }]);
+  await vi.waitFor(() => expect(invalid).toHaveBeenCalledWith(ws));
+  expect(ws.send).not.toHaveBeenCalled(); expect(query).toHaveBeenCalledTimes(2);
+});
