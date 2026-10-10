@@ -1293,7 +1293,7 @@ describe('QwenProvider', () => {
     expect(errors).toEqual(['API Error: Premature close']);
   });
 
-  it('cancel() terminates the child and emits a cancelled error', async () => {
+  it('cancelAndWait() confirms actual child exit and terminates the child and emits a cancelled error', async () => {
     const provider = new QwenProvider();
     await provider.connect({});
     await provider.createSession({ sessionKey: 'sess-cancel', cwd: '/tmp/project' });
@@ -1303,7 +1303,7 @@ describe('QwenProvider', () => {
 
     await provider.send('sess-cancel', 'cancel me');
     const run = lastSpawn();
-    await provider.cancel?.('sess-cancel');
+    await provider.cancelAndWait('sess-cancel');
     await flushIO();
 
     expect(run.child.kill).toHaveBeenCalledWith('SIGTERM');

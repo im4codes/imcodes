@@ -180,7 +180,7 @@ describe('peer-audit dedicated dispatch', () => {
     await expect(dispatchSessionMessage(legacyTransport, 'ordinary delegation', {
       messageId: 'send_message_12345678' as never,
     })).resolves.toBe('sent');
-    expect(sendMock).toHaveBeenCalledWith('ordinary delegation', 'send_message_12345678');
+    expect(sendMock).toHaveBeenCalledWith('ordinary delegation', 'send_message_12345678', undefined, undefined, { deliveryMode: 'append' });
     expect(processSendMock).not.toHaveBeenCalled();
   });
 
@@ -192,7 +192,7 @@ describe('peer-audit dedicated dispatch', () => {
       .resolves.toBe('sent');
     expect(sendMock).toHaveBeenCalledWith(
       'transport external message',
-      expect.stringMatching(/^send_message_/),
+      expect.stringMatching(/^send_message_/), undefined, undefined, { deliveryMode: 'append' },
     );
     expect(processSendMock).not.toHaveBeenCalled();
 
@@ -213,7 +213,7 @@ describe('peer-audit dedicated dispatch', () => {
       deliveryMode: 'append',
     })).resolves.toBe('sent');
 
-    expect(appendExternalMock).toHaveBeenCalledWith('peer update', 'send_message_12345678');
+    expect(appendExternalMock).toHaveBeenCalledWith('peer update', 'send_message_12345678', undefined, undefined, { timelineCommitted: false });
     expect(sendMock).not.toHaveBeenCalled();
     expect(enqueueResendMock).not.toHaveBeenCalled();
   });
@@ -232,7 +232,7 @@ describe('peer-audit dedicated dispatch', () => {
       queueSupervisionReference,
     })).rejects.toThrow('transport supervision authority temporarily unavailable');
     expect(appendExternalMock).toHaveBeenCalledWith(
-      'retry later', 'send_message_retry', queueSupervisionReference,
+      'retry later', 'send_message_retry', queueSupervisionReference, undefined, { timelineCommitted: false },
     );
     expect(sendMock).not.toHaveBeenCalled();
   });
@@ -290,7 +290,7 @@ describe('peer-audit dedicated dispatch', () => {
       'send_message_12345678',
       undefined,
       undefined,
-      { timelineCommitted: true },
+      { timelineCommitted: true, deliveryMode: 'append' },
     );
   });
 
@@ -338,7 +338,7 @@ describe('peer-audit dedicated dispatch', () => {
     })).resolves.toBe('queued');
 
     expect(appendExternalMock).toHaveBeenCalledOnce();
-    expect(sendMock).toHaveBeenCalledWith('peer update', 'send_message_12345678');
+    expect(sendMock).toHaveBeenCalledWith('peer update', 'send_message_12345678', undefined, undefined, { deliveryMode: 'append' });
   });
 
   it('durably queues a named transport send while its runtime is still restoring', async () => {

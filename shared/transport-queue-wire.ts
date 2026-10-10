@@ -5,6 +5,7 @@ import {
   QUEUE_DROP_REASONS,
   QUEUE_RESET_REASONS,
   type QueueEvent,
+  type QueueSnapshot,
 } from './transport-queue-types.js';
 
 const QUEUE_EVENT_TYPES = new Set([
@@ -105,4 +106,22 @@ export function isValidTransportQueueWireEvent(value: unknown): value is QueueEv
     default:
       return false;
   }
+}
+
+/** Canonical flat compatibility aliases always accompany the exact snapshot. */
+export function transportQueueSnapshotToPayload(snapshot: QueueSnapshot) {
+  return {
+    queueSnapshot: snapshot,
+    queueEpoch: snapshot.queueEpoch,
+    queueAuthorityId: snapshot.queueAuthorityId,
+    pendingMessageVersion: snapshot.pendingMessageVersion,
+    pendingCount: snapshot.pendingMessageEntries.length,
+    pendingMessageEntries: snapshot.pendingMessageEntries,
+    failedMessageEntries: snapshot.failedMessageEntries,
+    ...(snapshot.resetReason ? { resetReason: snapshot.resetReason } : {}),
+    ...(snapshot.dropReason ? { dropReason: snapshot.dropReason } : {}),
+    ...(snapshot.activityGeneration !== undefined ? { activityGeneration: snapshot.activityGeneration } : {}),
+    ...(snapshot.degraded !== undefined ? { degraded: snapshot.degraded } : {}),
+    ...(snapshot.degradedReason ? { degradedReason: snapshot.degradedReason } : {}),
+  };
 }

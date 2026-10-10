@@ -134,6 +134,47 @@ describe('OpenCodeSdkProvider', () => {
     openCodeSdkRuntimeHooks.start = originalStart;
   });
 
+  it('confirms Stop on the captured provider-session idle, not abort ACK or another session idle', async () => {
+    const harness = createHarness();
+    openCodeSdkRuntimeHooks.start = vi.fn(async (options) => {
+      options.signal.addEventListener('abort', harness.queue.close, { once: true });
+      return { client: harness.client as any, server: harness.server };
+    });
+    const provider = new OpenCodeSdkProvider();
+    await provider.connect({});
+    const route = await provider.createSession({ sessionKey: 'route-stop-proof', cwd: '/tmp/project' });
+    await provider.send(route, 'foreground');
+    let settled = false;
+    const stopping = provider.cancelAndWait(route).then(() => { settled = true; });
+    await vi.waitFor(() => expect(harness.client.session.abort).toHaveBeenCalledOnce());
+    harness.queue.push({ type: 'session.idle', properties: { sessionID: 'unrelated-session' } });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(settled).toBe(false);
+    harness.queue.push({ type: 'session.idle', properties: { sessionID: 'oc-session-1' } });
+    await stopping;
+    expect(settled).toBe(true);
+    await provider.disconnect();
+  });
+
+  it('does not confirm an old Stop with a new run idle on the same provider session', async () => {
+    const harness = createHarness();
+    openCodeSdkRuntimeHooks.start = vi.fn(async (options) => {
+      options.signal.addEventListener('abort', harness.queue.close, { once: true });
+      return { client: harness.client as any, server: harness.server };
+    });
+    const provider = new OpenCodeSdkProvider();
+    await provider.connect({});
+    const route = await provider.createSession({ sessionKey: 'route-stop-next-run', cwd: process.cwd() });
+    await provider.send(route, 'old foreground');
+    const stopping = provider.cancelAndWait(route);
+    const rejected = expect(stopping).rejects.toThrow('instance changed');
+    await vi.waitFor(() => expect(harness.client.session.abort).toHaveBeenCalledOnce());
+    await provider.send(route, 'independent new foreground');
+    harness.queue.push({ type: 'session.idle', properties: { sessionID: 'oc-session-1' } });
+    await rejected;
+    await provider.disconnect();
+  });
+
   it('steers a correlated delegation completion through the OpenCode v2 session client', async () => {
     const harness = createHarness();
     openCodeSdkRuntimeHooks.start = vi.fn(async (options) => {

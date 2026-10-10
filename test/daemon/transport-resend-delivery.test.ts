@@ -73,8 +73,11 @@ describe('transport resend delivery policy', () => {
     })).resolves.toBe('appended');
 
     expect(harness.appendExternalMessageToActiveTurn).toHaveBeenCalledWith(
-      'expanded shortcut body',
+      '#shortcut',
       'msg-append',
+      undefined,
+      undefined,
+      { providerText: 'expanded shortcut body' },
     );
     expect(harness.send).not.toHaveBeenCalled();
   });
@@ -107,7 +110,7 @@ describe('transport resend delivery policy', () => {
       entry.clientMessageId,
       undefined,
       undefined,
-      { activeTurnDeliveryKind: 'delegation_reply', delegationReply },
+      { deliveryMode: 'append', activeTurnDeliveryKind: 'delegation_reply', delegationReply },
     );
   });
 
@@ -127,7 +130,7 @@ describe('transport resend delivery policy', () => {
     expect(harness.appendExternalMessageToActiveTurn).toHaveBeenCalledWith(
       'raw command', 'msg-command-mode', undefined, undefined, { commandMode: true },
     );
-    expect(harness.send).toHaveBeenCalledWith('raw command', 'msg-command-mode', undefined, undefined, { commandMode: true });
+    expect(harness.send).toHaveBeenCalledWith('raw command', 'msg-command-mode', undefined, undefined, { deliveryMode: 'append', commandMode: true });
 
     // Counterexample: an entry without the marker never gains one.
     harness.send.mockClear();
@@ -173,6 +176,7 @@ describe('transport resend delivery policy', () => {
         undefined,
         undefined,
         {
+          deliveryMode: 'append',
           supervisionReference: {
             kind: 'implementation_blocker',
             taskId: 'tsk_wake',
@@ -184,6 +188,16 @@ describe('transport resend delivery policy', () => {
       );
     },
   );
+
+  it('accepts durable append staging without sending or enqueueing the same restore row twice', async () => {
+    const harness = runtimeHarness();
+    harness.appendExternalMessageToActiveTurn.mockResolvedValue('queued');
+    await expect(deliverTransportResendEntry(harness.runtime, {
+      text: '等待接纳', commandId: 'owned-once', deliveryMode: 'append', queuedAt: Date.now(),
+    })).resolves.toBe('queued');
+    expect(harness.appendExternalMessageToActiveTurn).toHaveBeenCalledOnce();
+    expect(harness.send).not.toHaveBeenCalled();
+  });
 
   it('propagates temporary authority unavailability without falling back or fabricating delivery', async () => {
     const harness = runtimeHarness();
@@ -223,7 +237,7 @@ describe('transport resend delivery policy', () => {
       'cmd-image',
       [attachment],
       undefined,
-      {},
+      { deliveryMode: 'append' },
     );
   });
 
@@ -251,7 +265,7 @@ describe('transport resend delivery policy', () => {
       'cron-message',
       undefined,
       undefined,
-      { registeredSystemContract },
+      { deliveryMode: 'append', registeredSystemContract },
     );
   });
 });

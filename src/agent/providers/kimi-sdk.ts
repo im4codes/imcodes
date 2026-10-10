@@ -1,3 +1,4 @@
+import { confirmPromiseStop } from '../provider-stop-confirmation.js';
 /**
  * KimiSdkProvider — TransportProvider that drives `kimi acp` over the
  * Agent Client Protocol (ACP, https://agentclientprotocol.com/).
@@ -639,6 +640,17 @@ export class KimiSdkProvider implements TransportProvider {
     await this.startTurn(sessionId, state, payload, generation);
   }
 
+  private readonly promptTerminals = new WeakMap<KimiSdkSessionState, Promise<unknown>>();
+
+  cancelAndWait(sessionId: string): Promise<void> {
+    const state = this.sessions.get(sessionId);
+    const terminal = state && this.promptTerminals.get(state);
+    if (!state || !terminal) return Promise.reject(new Error('ACP prompt terminal unavailable'));
+    const generation = state.turnGeneration;
+    return confirmPromiseStop(terminal, terminal, () => this.cancel(sessionId),
+      () => this.sessions.get(sessionId) === state && state.turnGeneration === generation);
+  }
+
   async cancel(sessionId: string): Promise<void> {
     const state = this.sessions.get(sessionId);
     if (!state?.acpSessionId || !state.promptInFlight || !this.connection) return;
@@ -1011,6 +1023,7 @@ export class KimiSdkProvider implements TransportProvider {
         prompt: promptBlocks,
         messageId: randomUUID(),
       });
+      this.promptTerminals.set(state, turn);
       void turn.then((result: PromptResponse) => {
         this.settleTurn(
           sessionId,

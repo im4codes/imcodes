@@ -1,3 +1,7 @@
+import { onConfirmedProviderStop } from './provider-stop-confirmation.js';
+import { transportQueueSnapshotToPayload } from '../../shared/transport-queue-wire.js';
+import { TRANSPORT_STOP_QUEUE_OUTCOMES, TRANSPORT_STOP_QUEUE_TIMEOUT_MS } from '../../shared/transport-queue-types.js';
+import { TRANSPORT_APPEND_FALLBACK_REASONS, readQueueDeliveryPolicy, type TransportAppendFallbackReason } from '../../shared/session-send-delivery.js';
 import { isChatMessageOrigin, type ChatMessageOrigin } from '../../shared/chat-message-origin.js';
 import { randomUUID } from 'node:crypto';
 import type { SessionRecord } from '../store/session-store.js';
@@ -172,6 +176,7 @@ export interface PendingTransportMessage {
   historyCommitted?: boolean;
   /** @internal: retain provider-native append intent across the pre-send startup window. */
   deliveryMode?: MemoryMcpSendDeliveryMode;
+  appendFallbackReason?: TransportAppendFallbackReason;
   /** @internal: distinguishes a human queue steer from an MCP append. */
   activeTurnDeliveryKind?: ProviderActiveTurnDeliveryKind;
   /** @internal: private peer-audit queue ownership; excluded from public snapshots. */
@@ -201,7 +206,7 @@ export interface PendingTransportMessage {
   };
 }
 
-export type ExternalAppendResult = 'sent' | 'appended' | 'stale' | 'retry' | 'unsupported';
+export type ExternalAppendResult = 'sent' | 'queued' | 'appended' | 'stale' | 'retry' | 'unsupported';
 
 export type TransportQueueAdmissionDecision = QueueSupervisionAdmission;
 
@@ -259,6 +264,7 @@ function publicPendingEntry(entry: PendingTransportMessage): PendingTransportMes
   delete publicEntry.timelineCommitted;
   delete publicEntry.historyCommitted;
   delete publicEntry.deliveryMode;
+  delete publicEntry.appendFallbackReason;
   delete publicEntry.activeTurnDeliveryKind;
   // RV-B: the expanded alias value (`providerText`) and the per-turn
   // `messagePreamble` are secret agent-bound material. The public projection
@@ -742,6 +748,7 @@ export class TransportSessionRuntime implements SessionRuntime {
   private readonly _pendingBackgroundSubagentWake = new Map<string, SdkSubagentDetail>();
   private _backgroundSubagentWakeTimer: ReturnType<typeof setTimeout> | null = null;
   private readonly _locallyCancelledDispatchIds = new Set<number>();
+  private readonly _confirmingStopDispatchIds = new Set<number>();
   private readonly _locallyCancelledActivityGenerations = new Set<string>();
   private _currentActivityGenerationLocallyCancelled = false;
   private _activeDispatchHasSideEffectEvidence = false;
@@ -850,6 +857,9 @@ export class TransportSessionRuntime implements SessionRuntime {
             'transport runtime got provider completion without active turn; settling normally (not dropped)',
           );
         }
+        // An ordinary completion callback may be a provider-local watchdog.
+        // The captured strong source publishes its physical proof separately.
+        if (this._unconfirmedProviderStop) return;
         if (this._activeDispatchCancelled) {
           this.rollbackActiveSummarySyncReservation(this._activeDispatchId ?? undefined);
           this.clearStalePendingCancelFallbackTimer();
@@ -936,6 +946,13 @@ export class TransportSessionRuntime implements SessionRuntime {
       this.provider.onError((sid: string, error: ProviderError) => {
         if (sid !== this._providerSessionId) return;
         this._lastActivityAt = Date.now();
+        if (this._unconfirmedProviderStop) {
+          if (error.code === PROVIDER_ERROR_CODES.CANCELLED && this._cancelledProviderErrorsToIgnore > 0) {
+            this._cancelledProviderErrorsToIgnore--;
+          }
+          this.recordProviderError(error);
+          return; // Generic error/connection loss is not captured terminal proof.
+        }
         if (this._externalCompletionSettlementsToIgnore > 0) {
           this._externalCompletionSettlementsToIgnore--;
           logger.warn(
@@ -1731,6 +1748,7 @@ export class TransportSessionRuntime implements SessionRuntime {
                 : {}),
               ...(material.timelineCommitted === true ? { timelineCommitted: true } : {}),
               ...(material.historyCommitted === true ? { historyCommitted: true } : {}),
+              ...readQueueDeliveryPolicy(material),
               ...(material.deliveryMode === MEMORY_MCP_SEND_DELIVERY_MODES.APPEND
                 ? { deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND }
                 : {}),
@@ -1802,6 +1820,7 @@ export class TransportSessionRuntime implements SessionRuntime {
     nowMs?: number;
     staleMs?: number;
   }): boolean {
+    if (this._unconfirmedProviderStop) return false;
     if (this._activeDispatchStaleRecoveryStarted) return false;
     if (!this._providerSessionId) return false;
     if (this._pendingMessages.length === 0) return false;
@@ -1855,6 +1874,7 @@ export class TransportSessionRuntime implements SessionRuntime {
    * the relay's no-active-turn path. Returns true if it recovered.
    */
   recoverSilentActiveTurn(options?: { staleMs?: number; nowMs?: number; reason?: string }): boolean {
+    if (this._unconfirmedProviderStop) return false;
     if (!this.hasActiveTurnWork()) return false;
     if (!this._providerSessionId) return false;
     const nowMs = options?.nowMs ?? Date.now();
@@ -1898,6 +1918,7 @@ export class TransportSessionRuntime implements SessionRuntime {
    * one-turn-at-a-time path.
    */
   settleActiveDispatchFromExternalCompletion(reason = 'external-completion'): boolean {
+    if (this._unconfirmedProviderStop) return false;
     const activity = this.getActivitySnapshot();
     if (activity.blockingWorkCount <= 0) return false;
     const dispatchId = this._activeDispatchId;
@@ -2434,7 +2455,7 @@ export class TransportSessionRuntime implements SessionRuntime {
       if (!busyReasons.includes(reason)) busyReasons.push(reason);
     };
 
-    if (this._sending || this._activeTurn) add('runtime_dispatch');
+    if (this._stopQueueBarrier || this._unconfirmedProviderStop || this._sending || this._activeTurn) add('runtime_dispatch');
     add('active_dispatch_entry', this._activeDispatchEntries.length);
     if (this._recoverableRetryTimer !== null) add('recoverable_retry');
     if (this._capacityRetryTimer !== null) add('capacity_retry');
@@ -2780,6 +2801,13 @@ export class TransportSessionRuntime implements SessionRuntime {
       ...(metadata?.timelineCommitted ? { timelineCommitted: true } : {}),
       ...(metadata?.historyCommitted ? { historyCommitted: true } : {}),
       ...(nativeAppendRequested ? { deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND } : {}),
+      ...(metadata?.deliveryMode === MEMORY_MCP_SEND_DELIVERY_MODES.APPEND && !nativeAppendRequested
+        ? { appendFallbackReason: (attachments?.length ?? 0) > 0
+          ? TRANSPORT_APPEND_FALLBACK_REASONS.ATTACHMENTS_UNSUPPORTED
+          : message.trim().startsWith('/')
+            ? TRANSPORT_APPEND_FALLBACK_REASONS.CONTROL_UNSUPPORTED
+            : TRANSPORT_APPEND_FALLBACK_REASONS.UNSUPPORTED }
+        : {}),
       ...(nativeAppendRequested && metadata?.activeTurnDeliveryKind
         ? { activeTurnDeliveryKind: metadata.activeTurnDeliveryKind }
         : {}),
@@ -2908,10 +2936,7 @@ export class TransportSessionRuntime implements SessionRuntime {
     clientMessageId: string,
     supervisionReference?: QueueSupervisionReference,
     queueHandoff?: TransportQueueHandoffOwnership,
-    privateMetadata?: Pick<
-      TransportSendMetadata,
-      'activeTurnDeliveryKind' | 'peerAudit' | 'delegationReply' | 'commandMode'
-    >,
+    privateMetadata?: TransportSendMetadata,
   ): Promise<ExternalAppendResult> {
     if (!this._providerSessionId) return 'stale';
     if (!this.hasActiveTurnWork()) {
@@ -2920,7 +2945,8 @@ export class TransportSessionRuntime implements SessionRuntime {
           ...(supervisionReference ? { supervisionReference } : {}),
           ...(queueHandoff ? { queueHandoff } : {}),
           ...privateMetadata,
-        }) === 'sent' ? 'sent' : 'stale';
+          deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND,
+        });
       } catch (error) {
         return error instanceof Error && error.message.includes('temporarily unavailable') ? 'retry' : 'stale';
       }
@@ -2936,19 +2962,17 @@ export class TransportSessionRuntime implements SessionRuntime {
     // send-start Promise proves A was accepted; an unsupported provider was
     // rejected above and therefore never gets a misleading append receipt.
     const staged = this.send(message, clientMessageId, undefined, undefined, {
-      timelineCommitted: true,
+      ...privateMetadata,
+      timelineCommitted: privateMetadata?.timelineCommitted ?? true,
       deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND,
       activeTurnDeliveryKind: privateMetadata?.activeTurnDeliveryKind
         ?? PROVIDER_ACTIVE_TURN_DELIVERY_KINDS.MCP_MESSAGE,
-      ...(privateMetadata?.peerAudit ? { peerAudit: privateMetadata.peerAudit } : {}),
-      ...(privateMetadata?.delegationReply
-        ? { delegationReply: privateMetadata.delegationReply }
-        : {}),
-      ...(privateMetadata?.commandMode ? { commandMode: true as const } : {}),
       ...(supervisionReference ? { supervisionReference } : {}),
       ...(queueHandoff ? { queueHandoff } : {}),
     });
-    return staged === 'queued' ? 'appended' : 'stale';
+    // This is durable daemon admission, not proof that the provider accepted
+    // the append. The delivery fact settles that separate irreversible edge.
+    return staged;
   }
 
   /**
@@ -3230,10 +3254,15 @@ export class TransportSessionRuntime implements SessionRuntime {
         const entriesAddedWhileAwaitingAdmission = this._pendingMessages.filter(
           (entry) => !originalIds.has(entry.clientMessageId),
         );
-        // Restore the exact pre-admission FIFO, then retain any messages that
-        // arrived while the provider admission call was in flight. Prepending
-        // only the selected rows would reorder a failed partial append.
-        this._pendingMessages = [...originalQueue, ...entriesAddedWhileAwaitingAdmission];
+        // Restore reserved rows in their original positions, while preserving
+        // edits/withdrawals of unreserved rows and later arrivals. Restoring
+        // the whole original array resurrected a user withdrawal.
+        const currentById = new Map(this._pendingMessages.map((entry) => [entry.clientMessageId, entry]));
+        this._pendingMessages = [
+          ...originalQueue.flatMap((entry) => idSet.has(entry.clientMessageId)
+            ? [entry] : (currentById.has(entry.clientMessageId) ? [currentById.get(entry.clientMessageId)!] : [])),
+          ...entriesAddedWhileAwaitingAdmission,
+        ];
       }
       for (const [handoffId, clientMessageIds] of reservationGroups) {
         try {
@@ -3499,9 +3528,93 @@ export class TransportSessionRuntime implements SessionRuntime {
     return removed;
   }
 
-  async cancel(): Promise<void> {
+  private _stopQueueOperation: Promise<AppendQueuedMessagesResult | { status: typeof TRANSPORT_STOP_QUEUE_OUTCOMES.STOPPED_AND_DISPATCHED | typeof TRANSPORT_STOP_QUEUE_OUTCOMES.ALREADY_DELIVERED }> | null = null;
+  private _stopQueueBarrier = false;
+  // A failed/expired strong Stop is not a local settlement. In particular,
+  // health watchdogs must not turn that unknown physical state into a new turn.
+  private _unconfirmedProviderStop = false;
+  private _lateStopConfirmationDispose: (() => void) | null = null;
+  private _stopQueueIds = new Set<string>();
+
+  /** User Stop only: native admission, or confirmed priority cancel + same ids. */
+  stopAndSendPendingMessages(ids: string[], notificationId: string): NonNullable<TransportSessionRuntime['_stopQueueOperation']> {
+    if (this._stopQueueOperation) {
+      return ids.length === this._stopQueueIds.size && ids.every((id) => this._stopQueueIds.has(id))
+        ? this._stopQueueOperation : Promise.resolve({ status: 'retry' });
+    }
+    this._stopQueueIds = new Set(ids);
+    const operation = this.runStopAndSendPendingMessages(new Set(ids), notificationId);
+    this._stopQueueOperation = operation;
+    void operation.finally(() => {
+      if (this._stopQueueOperation === operation) this._stopQueueOperation = null;
+    }).catch(() => {});
+    return operation;
+  }
+
+  private async runStopAndSendPendingMessages(ids: Set<string>, notificationId: string): NonNullable<TransportSessionRuntime['_stopQueueOperation']> {
+    if (this._activeAppendFlush && [...ids].some((id) => !this._pendingMessages.some((entry) => entry.clientMessageId === id))) {
+      const pending = await withTimeoutOutcome(this._activeAppendFlush, TRANSPORT_STOP_QUEUE_TIMEOUT_MS);
+      if (pending.timedOut) throw new Error('Native append admission unconfirmed; queued work retained');
+    }
+    const selected = this._pendingMessages.filter((entry) => ids.has(entry.clientMessageId));
+    if (selected.length === 0) {
+      const store = getTransportQueueStore();
+      if ([...ids].every((id) => store.hasDeliveryTombstone(this.sessionKey, id))) {
+        return { status: TRANSPORT_STOP_QUEUE_OUTCOMES.ALREADY_DELIVERED };
+      }
+      return { status: 'not_found' };
+    }
+    const hadActiveWork = this.hasActiveTurnWork();
+    let resumeAppends = false;
+    this._stopQueueBarrier = true;
+    try {
+      if (hadActiveWork && (this._activeDispatchId === null || this._activeDispatchProviderAccepted)) {
+        const admission = this.appendPendingMessagesToActiveTurn(selected.map((entry) => entry.clientMessageId), notificationId);
+        const outcome = await withTimeoutOutcome(admission, TRANSPORT_STOP_QUEUE_TIMEOUT_MS);
+        // An unconfirmed native request may still take effect. Do not duplicate
+        // it into a fresh turn merely because our bounded wait timed out.
+        if (outcome.timedOut) {
+          void admission.then((late) => {
+            if (late.status === 'delivered') this.publishAcceptedAppend(late);
+          }).catch(() => {});
+          throw new Error('Native append admission timed out; queued work retained');
+        }
+        const result = outcome.value;
+        if (result.status === 'delivered') {
+          resumeAppends = true;
+          return result;
+        }
+        if (result.status !== 'unsupported' && result.status !== 'attachments_unsupported'
+          && result.status !== 'control_unsupported' && result.status !== 'stale') return result;
+      }
+      // No ordinary-send mutex. Preserve pending rows and leases until the
+      // provider confirms cancellation; callbacks cannot drain through barrier.
+      await this.cancel({ waitForProvider: true });
+      this._stopQueueBarrier = false;
+      if (!this._drainPending(ids)) {
+        return { status: this._pendingMessages.some((entry) => ids.has(entry.clientMessageId)) ? 'retry' : 'not_found' };
+      }
+      return { status: TRANSPORT_STOP_QUEUE_OUTCOMES.STOPPED_AND_DISPATCHED };
+    } finally {
+      this._stopQueueBarrier = false;
+      if (resumeAppends) this.scheduleActiveAppendFlush(this._activeDispatchId);
+    }
+  }
+
+  async cancel(options?: { waitForProvider?: true }): Promise<void> {
+    this._lateStopConfirmationDispose?.();
+    this._lateStopConfirmationDispose = null;
+    if (!options?.waitForProvider) this._unconfirmedProviderStop = false;
     if (!this._providerSessionId) {
       throw new Error('TransportSessionRuntime not initialized — call initialize() first');
+    }
+    if (options?.waitForProvider && !this._activeTurn && !this._sending) {
+      // The explicit Stop selection owns these rows. Unlike ordinary Stop,
+      // do not discard a selected retry while settling its backoff.
+      this.cancelCapacityRetry();
+      this.clearRecoverableRetryTimer();
+      this._recoverableRetryEntryIds = [];
+      this._recoverableDispatchRetries = 0;
     }
     if ((this._capacityRetryTimer || this._capacityRetryEntryIds.length > 0)
       && !this._activeTurn && !this._sending) {
@@ -3545,6 +3658,7 @@ export class TransportSessionRuntime implements SessionRuntime {
     // Keep queued user messages intact so they may drain after the cancelled
     // turn settles; only the currently active turn is being interrupted.
     const dispatchId = this._activeDispatchId;
+    if (options?.waitForProvider && dispatchId !== null) this._confirmingStopDispatchIds.add(dispatchId);
     if (dispatchId !== null) {
       this._locallyCancelledDispatchIds.add(dispatchId);
       this._activeDispatchCancelled = true;
@@ -3563,6 +3677,7 @@ export class TransportSessionRuntime implements SessionRuntime {
       return;
     }
     if (!this.provider.cancel) {
+      if (options?.waitForProvider && (this._activeDispatchProviderStarted || this.providerSnapshotHasAppendableTurn(this.getProviderActiveWorkSnapshot()))) throw new Error('Provider cannot confirm stop; queued work retained');
       this.cancelActiveDispatchLocally(dispatchId);
       return;
     }
@@ -3576,8 +3691,44 @@ export class TransportSessionRuntime implements SessionRuntime {
     // legitimate completion.
     const providerSessionId = this._providerSessionId;
     if (providerSessionId) this._cancelledProviderErrorsToIgnore += 1;
+    if (options?.waitForProvider) this._unconfirmedProviderStop = true;
     try {
-      const cancelResult = this.provider.cancel(providerSessionId);
+      if (options?.waitForProvider && !this.provider.cancelAndWait) {
+        // Older adapters only promise that an interrupt was requested. Send
+        // the user's priority Stop, but never infer physical termination from
+        // that receipt or start competing queued work on the same provider.
+        void Promise.resolve(this.provider.cancel(providerSessionId)).catch((err) => {
+          logger.warn({ err, sessionKey: this.sessionKey }, 'Provider Stop request failed without terminal confirmation');
+        });
+        throw new Error('Provider cannot confirm stop; queued work retained');
+      }
+      const cancelResult = options?.waitForProvider
+        ? this.provider.cancelAndWait!(providerSessionId)
+        : this.provider.cancel(providerSessionId);
+      if (options?.waitForProvider) {
+        try {
+          const outcome = await withTimeoutOutcome(Promise.resolve(cancelResult), TRANSPORT_STOP_QUEUE_TIMEOUT_MS);
+          if (outcome.timedOut) throw new Error('Provider stop timed out; queued work retained');
+          this._unconfirmedProviderStop = false;
+        } catch (error) {
+          // Outward failure stays honest. Only a later proof for the captured
+          // instance/dispatch may release its queue; unrelated idle/watchdog
+          // callbacks and a new instance can never do so.
+          this._lateStopConfirmationDispose = onConfirmedProviderStop(Promise.resolve(cancelResult), () => {
+            const release = () => {
+              if (this._providerSessionId !== providerSessionId || this._activeDispatchId !== dispatchId || !this._unconfirmedProviderStop) return;
+              this._unconfirmedProviderStop = false;
+              this.cancelActiveDispatchLocally(dispatchId);
+            };
+            // Proof can precede request rejection. Wait for the failed Stop's
+            // barrier to settle before draining, without changing its outcome.
+            const operation = this._stopQueueOperation;
+            if (operation) void operation.then(release, release);
+            else release();
+          });
+          throw error;
+        }
+      }
       void Promise.resolve(cancelResult).catch((err) => {
         logger.warn(
           { err, sessionKey: this.sessionKey, providerSessionId },
@@ -3585,6 +3736,7 @@ export class TransportSessionRuntime implements SessionRuntime {
         );
       });
     } catch (err) {
+      if (options?.waitForProvider) throw err;
       logger.warn(
         { err, sessionKey: this.sessionKey, providerSessionId },
         'transport runtime provider cancel threw after local STOP settlement',
@@ -3654,6 +3806,10 @@ export class TransportSessionRuntime implements SessionRuntime {
     this._activeDispatchId = null;
     this._activeDispatchStaleRecoveryStarted = false;
     this._locallyCancelledDispatchIds.clear();
+    this._confirmingStopDispatchIds.clear();
+    this._lateStopConfirmationDispose?.();
+    this._lateStopConfirmationDispose = null;
+    this._unconfirmedProviderStop = false;
     this._locallyCancelledActivityGenerations.clear();
     this._currentActivityGenerationLocallyCancelled = false;
     this._externalCompletionSettlementsToIgnore = 0;
@@ -4096,6 +4252,7 @@ export class TransportSessionRuntime implements SessionRuntime {
         ...(entry.timelineCommitted ? { timelineCommitted: true } : {}),
         ...(entry.historyCommitted ? { historyCommitted: true } : {}),
         ...(entry.deliveryMode ? { deliveryMode: entry.deliveryMode } : {}),
+        ...(entry.appendFallbackReason ? { appendFallbackReason: entry.appendFallbackReason } : {}),
         ...(entry.activeTurnDeliveryKind
           ? { activeTurnDeliveryKind: entry.activeTurnDeliveryKind }
           : {}),
@@ -4673,9 +4830,9 @@ export class TransportSessionRuntime implements SessionRuntime {
           logger.warn({ err, sessionKey: this.sessionKey }, 'failed to persist consumed cross-vendor handoff');
         }
       }
-      if (this.isDispatchLocallyCancelled(dispatchId)) {
+      if (this.isDispatchLocallyCancelled(dispatchId) || this._confirmingStopDispatchIds.has(dispatchId)) {
         this.rollbackActiveSummarySyncReservation(dispatchId);
-        await this.provider.cancel?.(this._providerSessionId!).catch((err: unknown) => {
+        if (!this._confirmingStopDispatchIds.has(dispatchId)) await this.provider.cancel?.(this._providerSessionId!).catch((err: unknown) => {
           logger.warn({ err, providerSessionId: this._providerSessionId }, 'runtime dispatch noticed late cancel after provider send accepted');
         });
         return;
@@ -4777,6 +4934,10 @@ export class TransportSessionRuntime implements SessionRuntime {
                   message: err instanceof Error ? err.message : String(err),
                   recoverable: false,
                 });
+        if (this._unconfirmedProviderStop) {
+          this.recordProviderError(providerError);
+          return; // Keep the old owner until its strong physical proof arrives.
+        }
         if (this.handleSdkTurnLostRecovery(providerError)) {
           return;
         }
@@ -4920,7 +5081,7 @@ export class TransportSessionRuntime implements SessionRuntime {
         // next attempt fast (settling the same way), instead of the session
         // sitting stuck in "working" with the queue never draining.
         this._drainPending();
-      });
+      }).finally(() => { this._confirmingStopDispatchIds.delete(dispatchId); });
   }
 
   private providerSnapshotHasAppendableTurn(snapshot: ProviderActiveWorkSnapshot | null): boolean {
@@ -4936,6 +5097,7 @@ export class TransportSessionRuntime implements SessionRuntime {
   }
 
   private ownsActiveAppendFlush(dispatchId: number | null): boolean {
+    if (this._stopQueueBarrier || this._unconfirmedProviderStop) return false;
     return dispatchId === null
       ? this._activeDispatchId === null
         && !this.hasInFlightDispatchWork()
@@ -5024,6 +5186,20 @@ export class TransportSessionRuntime implements SessionRuntime {
         continue;
       }
       if (result.status !== 'delivered') {
+        if (result.status === 'stale' || result.status === 'unsupported') {
+          entry.appendFallbackReason = result.status === 'stale'
+            ? TRANSPORT_APPEND_FALLBACK_REASONS.STALE
+            : TRANSPORT_APPEND_FALLBACK_REASONS.UNSUPPORTED;
+          try {
+            getTransportQueueStore().markAppendFallback(this.sessionKey, entry.clientMessageId, entry.appendFallbackReason, this.queueRecipient ?? null);
+            timelineEmitter.emit(this.sessionKey, 'session.state', {
+              state: 'queued',
+              ...transportQueueSnapshotToPayload(getTransportQueueStore().readSnapshotForRecipient(this.sessionKey, this.queueRecipient ?? null)),
+            }, { source: 'daemon', confidence: 'high' });
+          } catch (error) {
+            logger.warn({ error, sessionKey: this.sessionKey }, 'transport append fallback projection failed');
+          }
+        }
         logger.info(
           {
             sessionKey: this.sessionKey,
@@ -5032,23 +5208,32 @@ export class TransportSessionRuntime implements SessionRuntime {
           },
           'transport active append was not admitted; retaining durable idle fallback',
         );
-        return;
+        // A refusal belongs to this message, not to all messages arriving
+        // during its admission. Same-owner wakes are coalesced into this loop:
+        // defer this id for the pass and keep inspecting later APPEND entries.
+        // Ordinary FIFO entries are never selected, and no refused id spins.
+        deferredRetryIds.add(entry.clientMessageId);
+        continue;
       }
-      const timelineEntries = result.entries.filter((candidate) => !candidate.timelineCommitted);
-      for (const candidate of timelineEntries) candidate.timelineCommitted = true;
-      if (timelineEntries.length > 0) {
-        try {
-          this._onActiveAppend?.(timelineEntries, result.queueSnapshot);
-        } catch (error) {
-          logger.warn({ error, sessionKey: this.sessionKey }, 'transport active append projection callback failed');
-        }
+      this.publishAcceptedAppend(result);
+    }
+  }
+
+  private publishAcceptedAppend(result: Extract<AppendQueuedMessagesResult, { status: 'delivered' }>): void {
+    const timelineEntries = result.entries.filter((candidate) => !candidate.timelineCommitted);
+    for (const candidate of timelineEntries) candidate.timelineCommitted = true;
+    if (timelineEntries.length > 0) {
+      try {
+        this._onActiveAppend?.(timelineEntries, result.queueSnapshot);
+      } catch (error) {
+        logger.warn({ error, sessionKey: this.sessionKey }, 'transport active append projection callback failed');
       }
-      for (const fact of result.deliveryFacts) {
-        timelineEmitter.emit(this.sessionKey, 'transport.queue.delivery', { ...fact }, {
-          source: 'daemon',
-          confidence: 'high',
-        });
-      }
+    }
+    for (const fact of result.deliveryFacts) {
+      timelineEmitter.emit(this.sessionKey, 'transport.queue.delivery', { ...fact }, {
+        source: 'daemon',
+        confidence: 'high',
+      });
     }
   }
 
@@ -5130,7 +5315,8 @@ export class TransportSessionRuntime implements SessionRuntime {
     }
   }
 
-  private _drainPending(): boolean {
+  private _drainPending(selectedIds?: ReadonlySet<string>): boolean {
+    if (this._stopQueueBarrier || this._unconfirmedProviderStop) return false;
     if (this._pendingMessages.length === 0 || !this._providerSessionId) return false;
     // Durable rows can outlive the scheduler decision that created them. Re-run
     // the daemon authority predicate at the final delivery edge; rejected rows
@@ -5150,6 +5336,10 @@ export class TransportSessionRuntime implements SessionRuntime {
       );
       for (const clientMessageId of authorizedIds) this._pendingAuthorityRetryAttempts.delete(clientMessageId);
       if (authorizedIds.size === 0) return false;
+    }
+    if (selectedIds) {
+      authorizedIds = new Set(this._pendingMessages.filter((entry) => selectedIds.has(entry.clientMessageId)
+        && (!authorizedIds || authorizedIds.has(entry.clientMessageId))).map((entry) => entry.clientMessageId));
     }
     const activity = this.getActivitySnapshot();
     if (activity.blockingWorkCount > 0) {

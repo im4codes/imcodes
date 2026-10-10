@@ -1,3 +1,4 @@
+import { readQueueDeliveryPolicy } from './session-send-delivery.js';
 import type {
   QueueAttachmentProjection,
   QueueProjectionEntry,
@@ -47,6 +48,7 @@ export function buildQueueAttachmentProjection(value: unknown): QueueAttachmentP
 
 export function buildQueueProjectionEntry(entry: QueueStoredEntry): QueueProjectionEntry {
   return {
+    ...readQueueDeliveryPolicy(entry),
     clientMessageId: entry.clientMessageId,
     text: entry.text,
     status: entry.status,

@@ -1,3 +1,4 @@
+import { ProviderStopConfirmation, preserveProviderStopProof } from '../provider-stop-confirmation.js';
 /**
  * Pi coding-agent transport.
  *
@@ -113,6 +114,7 @@ interface PiSessionState {
   currentMessageId: string | null;
   committedSegments: string[];
   turnActive: boolean;
+  turnGeneration: number;
   cancelled: boolean;
   terminalError: string | null;
   terminalAborted: boolean;
@@ -233,6 +235,7 @@ export class PiProvider implements TransportProvider {
       currentMessageId: null,
       committedSegments: [],
       turnActive: false,
+      turnGeneration: 0,
       cancelled: false,
       terminalError: null,
       terminalAborted: false,
@@ -308,6 +311,7 @@ export class PiProvider implements TransportProvider {
     if (!message.trim()) return;
 
     this.emitStatus(sessionId, state, { status: 'working', label: null });
+    state.turnGeneration++;
     await this.ensureChild(state);
     this.resetTurn(state);
     state.currentMessageId = `${state.routeId}:${randomUUID()}`;
@@ -342,6 +346,20 @@ export class PiProvider implements TransportProvider {
     } catch {
       return AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE;
     }
+  }
+
+  private readonly stopConfirmations = new ProviderStopConfirmation();
+
+  cancelAndWait(sessionId: string): Promise<void> {
+    const state = this.sessions.get(sessionId);
+    const child = state?.child;
+    if (!state || !child) return Promise.reject(new Error('Provider child unavailable for Stop'));
+    const onExit = () => this.stopConfirmations.complete(child);
+    child.once('exit', onExit);
+    const generation = state.turnGeneration;
+    const operation = this.stopConfirmations.confirm(child, () => this.cancel(sessionId),
+      () => this.sessions.get(sessionId) === state && state.turnGeneration === generation);
+    return preserveProviderStopProof(operation, operation.finally(() => child.removeListener('exit', onExit)));
   }
 
   async cancel(sessionId: string): Promise<void> {
@@ -461,8 +479,8 @@ export class PiProvider implements TransportProvider {
       if (line) logger.debug({ provider: this.id, session: state.sessionName, line: line.slice(0, 500) }, 'Pi stderr');
     });
     child.on('error', (error) => this.handleGone(state, child, formatPiLaunchError(error)));
-    child.on('exit', (code, signal) => this.handleGone(state, child, `Pi exited (code=${code ?? 'null'} signal=${signal ?? 'null'})`));
-    child.on('close', (code, signal) => this.handleGone(state, child, `Pi closed (code=${code ?? 'null'} signal=${signal ?? 'null'})`));
+    child.on('exit', (code, signal) => { this.stopConfirmations.complete(child); this.handleGone(state, child, `Pi exited (code=${code ?? 'null'} signal=${signal ?? 'null'})`); });
+    child.on('close', (code, signal) => { this.stopConfirmations.complete(child); this.handleGone(state, child, `Pi closed (code=${code ?? 'null'} signal=${signal ?? 'null'})`); });
 
     const startPromise = this.request(state, { type: PI_RPC_COMMAND.GET_STATE })
       .then((response) => this.applyStateResponse(state, response.data))
@@ -622,6 +640,7 @@ export class PiProvider implements TransportProvider {
         this.emitStatus(sessionId, state, { status: 'working', label: 'Retrying...' });
         return;
       case PI_RPC_FRAME.AGENT_SETTLED:
+        if (state.child) this.stopConfirmations.complete(state.child);
         this.finishTurn(state);
         return;
       default:

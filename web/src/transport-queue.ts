@@ -1,3 +1,4 @@
+import { readQueueDeliveryPolicy, type QueueDeliveryPolicy } from '@shared/session-send-delivery.js';
 import type { SharedActorEnvelope } from '@shared/tab-sharing.js';
 import {
   createTransportQueueReducerState,
@@ -5,7 +6,7 @@ import {
 } from '../../shared/transport-queue-reducer.js';
 import type { QueueEvent, QueueProjectionEntry } from '../../shared/transport-queue-types.js';
 
-export interface TransportPendingMessageEntry {
+export interface TransportPendingMessageEntry extends QueueDeliveryPolicy {
   clientMessageId: string;
   text: string;
   sharedActor?: SharedActorEnvelope;
@@ -115,6 +116,7 @@ export function extractTransportPendingMessageEntries(value: unknown): Transport
     if (!clientMessageId || !text) return [];
     const sharedActor = (entry as { sharedActor?: unknown }).sharedActor;
     return [{
+      ...readQueueDeliveryPolicy(entry as QueueDeliveryPolicy),
       clientMessageId,
       text,
       ...(sharedActor && typeof sharedActor === 'object' ? { sharedActor: sharedActor as SharedActorEnvelope } : {}),
@@ -271,6 +273,7 @@ export function hasTransportPendingSyncSnapshot(value: Record<string, unknown>):
 
 function toQueueProjectionEntries(value: unknown, status: QueueProjectionEntry['status']): QueueProjectionEntry[] {
   return extractTransportPendingMessageEntries(value).map((entry, ordinal) => ({
+    ...readQueueDeliveryPolicy(entry),
     clientMessageId: entry.clientMessageId,
     text: entry.text,
     status,
@@ -283,6 +286,7 @@ function toQueueProjectionEntries(value: unknown, status: QueueProjectionEntry['
 
 function fromQueueProjectionEntries(entries: QueueProjectionEntry[]): TransportPendingMessageEntry[] {
   return entries.map((entry) => ({
+    ...readQueueDeliveryPolicy(entry),
     clientMessageId: entry.clientMessageId,
     text: entry.text,
     ...(entry.sharedActor ? { sharedActor: entry.sharedActor as SharedActorEnvelope } : {}),

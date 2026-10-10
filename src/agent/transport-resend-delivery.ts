@@ -20,6 +20,7 @@ function buildResendMetadata(
   ownership?: ResendHandoffOwnership,
 ): TransportSendMetadata {
   return {
+    ...(entry.deliveryMode ? { deliveryMode: entry.deliveryMode } : {}),
     ...(entry.sharedActor ? { sharedActor: entry.sharedActor } : {}),
     ...(entry.sharedMachineAuthority ? { sharedMachineAuthority: entry.sharedMachineAuthority } : {}),
     ...(entry.providerText != null ? { providerText: entry.providerText } : {}),
@@ -45,8 +46,12 @@ function buildResendMetadata(
 
 function buildAppendPrivateMetadata(
   entry: ResendEntry,
-): Pick<TransportSendMetadata, 'activeTurnDeliveryKind' | 'peerAudit' | 'delegationReply' | 'commandMode'> | undefined {
+): TransportSendMetadata | undefined {
   const metadata = {
+    ...(entry.sharedActor ? { sharedActor: entry.sharedActor } : {}),
+    ...(entry.providerText != null ? { providerText: entry.providerText } : {}),
+    ...(entry.aliasAudit ? { aliasAudit: entry.aliasAudit } : {}),
+    ...(entry.messageOrigin ? { messageOrigin: entry.messageOrigin } : {}),
     ...(entry.activeTurnDeliveryKind
       ? { activeTurnDeliveryKind: entry.activeTurnDeliveryKind }
       : {}),
@@ -84,14 +89,14 @@ export async function deliverTransportResendEntry(
     if (ownership) {
       appendResult = privateMetadata
         ? await runtime.appendExternalMessageToActiveTurn(
-            entry.providerText ?? entry.text,
+            entry.text,
             entry.clientMessageId ?? entry.commandId,
             entry.supervisionReference,
             ownership,
             privateMetadata,
           )
         : await runtime.appendExternalMessageToActiveTurn(
-            entry.providerText ?? entry.text,
+            entry.text,
             entry.clientMessageId ?? entry.commandId,
             entry.supervisionReference,
             ownership,
@@ -99,20 +104,20 @@ export async function deliverTransportResendEntry(
     } else if (entry.supervisionReference) {
       appendResult = privateMetadata
         ? await runtime.appendExternalMessageToActiveTurn(
-            entry.providerText ?? entry.text,
+            entry.text,
             entry.clientMessageId ?? entry.commandId,
             entry.supervisionReference,
             undefined,
             privateMetadata,
           )
         : await runtime.appendExternalMessageToActiveTurn(
-            entry.providerText ?? entry.text,
+            entry.text,
             entry.clientMessageId ?? entry.commandId,
             entry.supervisionReference,
           );
     } else if (privateMetadata) {
       appendResult = await runtime.appendExternalMessageToActiveTurn(
-        entry.providerText ?? entry.text,
+        entry.text,
         entry.clientMessageId ?? entry.commandId,
         undefined,
         undefined,
@@ -120,11 +125,11 @@ export async function deliverTransportResendEntry(
       );
     } else {
       appendResult = await runtime.appendExternalMessageToActiveTurn(
-        entry.providerText ?? entry.text,
+        entry.text,
         entry.clientMessageId ?? entry.commandId,
       );
     }
-    if (appendResult === 'sent' || appendResult === 'appended' || appendResult === 'retry') return appendResult;
+    if (appendResult === 'sent' || appendResult === 'appended' || appendResult === 'queued' || appendResult === 'retry') return appendResult;
   }
 
   const attachments = entry.attachments ?? [];

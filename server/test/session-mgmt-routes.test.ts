@@ -581,14 +581,14 @@ describe('session-mgmt persistence routes', () => {
     const res = await app.request('/api/server/srv-1/session/cancel', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ sessionName: 'deck_proj_brain', commandId: 'cancel-1', text: '/stop' }),
+      body: JSON.stringify({ sessionName: 'deck_proj_brain', commandId: 'cancel-1', stopAndSendPendingMessageIds: ['queued-1'], text: '/stop' }),
     });
 
     expect(res.status).toBe(200);
     expect(JSON.parse(String(sendToDaemonMock.mock.calls[0]?.[0]))).toEqual({
       type: DAEMON_COMMAND_TYPES.SESSION_CANCEL,
       sessionName: 'deck_proj_brain',
-      commandId: 'cancel-1',
+      commandId: 'cancel-1', stopAndSendPendingMessageIds: ['queued-1'],
     });
   });
 
@@ -1803,6 +1803,7 @@ describe('session-mgmt persistence routes', () => {
       body: JSON.stringify({
         sessionName: 'deck_proj_brain',
         commandId: 'cancel-1',
+        stopAndSendPendingMessageIds: ['queued-1'],
         observedDispatchId: 'dispatch-1',
         text: '/stop',
       }),
@@ -1813,6 +1814,7 @@ describe('session-mgmt persistence routes', () => {
       type: DAEMON_COMMAND_TYPES.SESSION_CANCEL,
       sessionName: 'deck_proj_brain',
       commandId: 'cancel-1',
+        stopAndSendPendingMessageIds: ['queued-1'],
       observedDispatchId: 'dispatch-1',
       sharedActor: expect.objectContaining({
         actorUserId: 'user-1',

@@ -6913,6 +6913,41 @@ describe('CodexSdkProvider', () => {
     }
   }, 60_000);
 
+  it('strong Stop captures terminal before turn/start acceptance without resurrecting the stopped turn', async () => {
+    const provider = createCodexProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-stop-terminal-first', cwd: process.cwd() });
+    childProcessMock.setHoldTurnStart(true);
+    const sending = provider.send('route-stop-terminal-first', 'foreground');
+    await waitForCondition(() => childProcessMock.children[0]?.requests.some((request) => request.method === 'turn/start') === true);
+    const child = childProcessMock.children[0];
+    const stopping = provider.cancelAndWait('route-stop-terminal-first');
+    child.emits({ method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'interrupted' } } });
+    childProcessMock.releaseHeldTurnStarts();
+    await sending;
+    await stopping;
+    expect(provider.getSessionDiagnostics('route-stop-terminal-first')).toMatchObject({ runningTurnId: null });
+    expect(child.requests.filter((request) => request.method === 'turn/interrupt')).toHaveLength(0);
+  });
+
+  it('strong Stop requires its captured turn id, not an unrelated or id-less terminal', async () => {
+    const provider = createCodexProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-strong-correlated-stop', cwd: process.cwd() });
+    await provider.send('route-strong-correlated-stop', 'foreground');
+    const child = childProcessMock.children[0];
+    let confirmed = false;
+    const stopping = provider.cancelAndWait('route-strong-correlated-stop').then(() => { confirmed = true; });
+    await new Promise<void>((resolve) => realSetImmediate(resolve));
+    child.emits({ method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 'unrelated-turn', status: 'interrupted' } } });
+    child.emits({ method: 'turn/completed', params: { threadId: 'thread-1', turn: { status: 'interrupted' } } });
+    await new Promise<void>((resolve) => realSetImmediate(resolve));
+    expect(confirmed).toBe(false);
+    child.emits({ method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'interrupted' } } });
+    await stopping;
+    expect(confirmed).toBe(true);
+  });
+
   it('ignores a late id-less interrupted notification from a previous stop and still settles the newer turn', async () => {
     vi.useFakeTimers();
     const randomSpy = vi.spyOn(Math, 'random').mockReturnValue(0);

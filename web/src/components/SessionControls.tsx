@@ -88,10 +88,15 @@ import { collectSettledQueuedIds } from '../session-controls-queue.js';
 import { deriveSessionLiveStatus, isRunningSessionState } from '../session-live-status.js';
 import { DAEMON_MSG } from '@shared/daemon-events.js';
 import {
+  TRANSPORT_STOP_QUEUE_FIELDS,
+  TRANSPORT_STOP_QUEUE_OUTCOMES,
+  TRANSPORT_STOP_QUEUE_TIMEOUT_MS,
   TRANSPORT_QUEUE_COMMANDS,
   TRANSPORT_QUEUE_DELIVERY_EVENT_TYPE,
 } from '@shared/transport-queue-types.js';
 import {
+  queuedMessageDeliveryLabelKey,
+  type QueueDeliveryPolicy,
   DEFAULT_SESSION_SEND_DELIVERY_MODE,
   SESSION_SEND_DELIVERY_MODES,
   SESSION_SEND_DELIVERY_USER_PREF_KEY,
@@ -472,7 +477,7 @@ function mergeOpenSpecTaskStats(
 }
 
 const TRANSPORT_QUEUE_HIDDEN_KEY_PREFIX = 'imcodes:transport-queue-hidden:';
-type LocalQueuedTransportEntry = {
+type LocalQueuedTransportEntry = QueueDeliveryPolicy & {
   clientMessageId: string;
   text: string;
   status?: 'sending' | 'queued' | 'failed';
@@ -1332,6 +1337,9 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const acceptedQueueSnapshotSeqRef = useRef(0);
   const lastRealtimeEmptyQueueSnapshotRef = useRef<{ sessionName: string; version?: number; observedAtMs: number } | null>(null);
   const failedQueuedCommandIdsRef = useRef<Set<string>>(new Set());
+  const queueTranslationRef = useRef(t);
+  queueTranslationRef.current = t;
+  const pendingStopQueueRef = useRef<{ commandId: string; timer: ReturnType<typeof setTimeout> } | null>(null);
   const queuedMutationRollbackRef = useRef<Map<string,
     | { type: 'edit' | 'undo'; entry: LocalQueuedTransportEntry }
     // `acceptedSnapshotSeq` is the accepted-snapshot count as it stood when the
@@ -1842,6 +1850,11 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       setEffortClampNotice(null);
     }, 4500);
   }, [t]);
+  useEffect(() => () => {
+    if (pendingStopQueueRef.current) clearTimeout(pendingStopQueueRef.current.timer);
+    pendingStopQueueRef.current = null;
+  }, [activeSession?.name]);
+
   const transportQueueAppendFailedLabel = t('session.transport_queue_append_failed');
 
   // Persist input draft across unmount/remount (sub-session minimize/restore)
@@ -2540,6 +2553,21 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       }
       if (msg.type === 'command.ack') {
         if (msg.session && msg.session !== sessionName) return;
+        const stopPending = pendingStopQueueRef.current;
+        if (stopPending?.commandId === msg.commandId) {
+          clearTimeout(stopPending.timer);
+          pendingStopQueueRef.current = null;
+          const stopOutcome = (msg as unknown as Record<string, unknown>)[TRANSPORT_STOP_QUEUE_FIELDS.OUTCOME];
+          if (msg.status === 'accepted' && stopOutcome === TRANSPORT_STOP_QUEUE_OUTCOMES.APPENDED) {
+            showAppendSuccessNotice(queueTranslationRef.current('session.stop_appended_queue'));
+          } else if (msg.status === 'accepted' && stopOutcome === TRANSPORT_STOP_QUEUE_OUTCOMES.STOPPED_AND_DISPATCHED) {
+            showAppendSuccessNotice(queueTranslationRef.current('session.stop_queue_stopped'));
+          } else if (stopOutcome !== TRANSPORT_STOP_QUEUE_OUTCOMES.ALREADY_DELIVERED) {
+            // Old peers may acknowledge the real Stop receipt without a queue
+            // outcome. Never invent a native-append success from that receipt.
+            showSendWarning(msg.error || queueTranslationRef.current('session.stop_queue_unconfirmed'));
+          }
+        }
         const rollback = queuedMutationRollbackRef.current.get(msg.commandId);
         // Authority BEFORE rollback. The daemon also broadcasts this snapshot on
         // a timeline session.state for other subscribers, but that frame is
@@ -2762,7 +2790,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       }
     };
     return ws.onMessage(handleRealtimeQueueMessage);
-  }, [activeSession?.name, onRemoveOptimisticMessage, showSendWarning, transportQueueAppendFailedLabel, ws]);
+  }, [activeSession?.name, onRemoveOptimisticMessage, showAppendSuccessNotice, showSendWarning, transportQueueAppendFailedLabel, ws]);
 
   // Reset P2P mode on session change
   useEffect(() => { setP2pMode('solo'); setP2pOpen(false); }, [activeSession?.name]);
@@ -4083,12 +4111,13 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     globalThis.crypto?.randomUUID?.() ?? `cmd-${Date.now()}-${Math.random().toString(16).slice(2)}`
   ), []);
 
-  const cancelActiveTransportTurn = useCallback((commandId = makeCommandId()): string | null => {
+  const cancelActiveTransportTurn = useCallback((commandId = makeCommandId(), stopQueueIds?: string[]): string | null => {
     if (!activeSession) return null;
     trackShareCancelCommand(commandId);
     const payload = {
       sessionName: activeSession.name,
       commandId,
+      ...(stopQueueIds ? { [TRANSPORT_STOP_QUEUE_FIELDS.IDS]: stopQueueIds } : {}),
       ...(activeSession.sharedState?.activeDispatchId ? { observedDispatchId: activeSession.sharedState.activeDispatchId } : {}),
     };
     if (!ws) {
@@ -4518,17 +4547,33 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   }, [activeSession, incomingQueuedTransportEntries, isEditableQueuedEntry, onSend, queuedTransportEntries, sendQueuedMessageMutation, showSendWarning, transportQueueAppendFailedLabel]);
 
   const handleStopButtonPress = useCallback(() => {
-    if (appendableQueuedTransportEntries.length > 0) {
+    const queued = queuedTransportEntries.filter((entry) => entry.status !== 'failed');
+    if (queued.length > 0) {
+      if (pendingStopQueueRef.current) return;
       const now = Date.now();
       if (now - stopPressGuardRef.current < 600) return;
       stopPressGuardRef.current = now;
-      if (handleQueuedMessagesAppend(appendableQueuedTransportEntries)) {
-        showAppendSuccessNotice(t('session.stop_appended_queue'));
+      const commandId = makeCommandId();
+      const timer = setTimeout(() => {
+        if (pendingStopQueueRef.current?.commandId !== commandId) return;
+        pendingStopQueueRef.current = null;
+        showSendWarning(t('session.stop_queue_unconfirmed'));
+      }, TRANSPORT_STOP_QUEUE_TIMEOUT_MS * 3);
+      // Stop is sent on the priority lane. The daemon owns native admission,
+      // definitive refusal and confirmed cancel; the browser never resends text.
+      pendingStopQueueRef.current = { commandId, timer };
+      try {
+        if (!cancelActiveTransportTurn(commandId, queued.map((entry) => entry.clientMessageId))) throw new Error('Stop unavailable');
+        showAppendSuccessNotice(t('session.stop_queue_pending'));
+      } catch {
+        clearTimeout(timer);
+        pendingStopQueueRef.current = null;
+        showSendWarning(t('session.stop_queue_unconfirmed'));
       }
       return;
     }
     handleStopPress();
-  }, [appendableQueuedTransportEntries, handleQueuedMessagesAppend, handleStopPress, showAppendSuccessNotice, t]);
+  }, [queuedTransportEntries, cancelActiveTransportTurn, handleStopPress, makeCommandId, showAppendSuccessNotice, showSendWarning, t]);
 
   // Escape and the visible Stop button must share the same queue-first policy.
   // Keeping a separate direct-cancel path here would let one Escape press skip
@@ -7684,7 +7729,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
                   testId="transport-queue-append-all"
                 />
               )}
-              <div>{t('session.transport_send_queued')}</div>
+              <div>{t(queuedMessageDeliveryLabelKey(queuedTransportEntries.find((entry) => entry.deliveryMode === SESSION_SEND_DELIVERY_MODES.APPEND && !entry.appendFallbackReason) ?? queuedTransportEntries[0] ?? {}))}</div>
               <button type="button" class="controls-queued-toggle" onClick={toggleQueuedHintExpanded}>
                 {t('common.hide')}
               </button>
@@ -7712,14 +7757,14 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
                         ? t('chat.sendFailedLabel', 'Send failed')
                         : entry.status === 'sending'
                           ? t('chat.sendingLabel', 'Sending')
-                          : t('session.transport_send_queued')
+                          : t(queuedMessageDeliveryLabelKey(entry))
                     }
                     title={
                       entry.status === 'failed'
                         ? t('chat.sendFailedLabel', 'Send failed')
                         : entry.status === 'sending'
                           ? t('chat.sendingLabel', 'Sending')
-                          : t('session.transport_send_queued')
+                          : t(queuedMessageDeliveryLabelKey(entry))
                     }
                   />
                   {(isEditableQueuedEntry(entry) || entry.status === 'failed') && (
@@ -7760,7 +7805,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       )}
       {editingQueuedEntry && (
         <div class="controls-queued-editing">
-          <span>{t('session.transport_send_queued')} · {t('settings.edit')}</span>
+          <span>{t(queuedMessageDeliveryLabelKey(queuedTransportEntries[0] ?? {}))} · {t('settings.edit')}</span>
           <button type="button" class="controls-queued-action" onClick={() => setEditingQueuedMessageId(null)}>
             {t('common.cancel')}
           </button>

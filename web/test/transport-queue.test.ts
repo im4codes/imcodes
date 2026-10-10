@@ -486,3 +486,23 @@ describe('buildTransportPendingSyncPatch new queue protocol', () => {
     expect(patch).toEqual({});
   });
 });
+
+
+describe('append delivery policy projection', () => {
+  it('preserves pending/fallback policy through canonical snapshot, reconnect, and delivery facts', () => {
+    const entry = { clientMessageId: 'append-policy', text: '中文\n原文', deliveryMode: 'append', appendFallbackReason: 'unsupported' };
+    const first = buildTransportPendingSyncPatch({}, { queueEpoch: 'epoch', queueAuthorityId: 'authority', pendingMessageVersion: 1, pendingMessageEntries: [entry] }, 'deck_policy');
+    expect(first.transportPendingMessageEntries).toEqual([entry]);
+    const reconnect = buildTransportPendingSyncPatch(first, { queueEpoch: 'epoch', queueAuthorityId: 'authority', pendingMessageVersion: 2, pendingMessageEntries: [entry] }, 'deck_policy');
+    expect(reconnect.transportPendingMessageEntries).toEqual([entry]);
+    const delivered = buildTransportQueueEventPatch(reconnect, { type: 'transport.queue.delivery', sessionName: 'deck_policy', queueEpoch: 'epoch', queueAuthorityId: 'authority', pendingMessageVersion: 3, clientMessageId: 'append-policy', deliveryFrameId: 'native-frame', deliveryFrameVersion: 3 }, 'deck_policy');
+    expect(delivered.transportPendingMessageEntries).toEqual([]);
+    expect(buildTransportPendingSyncPatch(delivered, { queueEpoch: 'epoch', queueAuthorityId: 'authority', pendingMessageVersion: 2, pendingMessageEntries: [entry] }, 'deck_policy')).toEqual({});
+  });
+  it('missing and unknown old-peer policy fields retain the safe ordinary queue projection', () => {
+    expect(extractTransportPendingMessageEntries([
+      { clientMessageId: 'old', text: 'old peer' },
+      { clientMessageId: 'unknown', text: 'future peer', deliveryMode: 'future', appendFallbackReason: 'future', providerText: 'private' },
+    ])).toEqual([{ clientMessageId: 'old', text: 'old peer' }, { clientMessageId: 'unknown', text: 'future peer' }]);
+  });
+});

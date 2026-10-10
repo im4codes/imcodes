@@ -5692,6 +5692,37 @@ describe('handleWebCommand transport queue behavior', () => {
     expect(stateCall?.[2]).not.toHaveProperty('pendingMessages');
   });
 
+  it.each(['stopped_and_dispatched', 'already_delivered', 'retry', 'stale', 'not_found'])('Stop selection reports actual outcome %s, never a request receipt', async (status) => {
+    const store = getTransportQueueStore();
+    store.enqueue({ sessionName: 'deck_transport_brain', clientMessageId: 'stop-selected-B', text: 'original', now: 100 });
+    let finish!: (result: { status: string }) => void;
+    const stopAndSendPendingMessages = vi.fn(() => new Promise<{ status: string }>((resolve) => { finish = resolve; }));
+    const cancel = vi.fn();
+    getTransportRuntimeMock.mockReturnValue({ stopAndSendPendingMessages, cancel, pendingCount: 1, sending: true });
+    handleWebCommand({ type: DAEMON_COMMAND_TYPES.SESSION_CANCEL, sessionName: 'deck_transport_brain', commandId: 'stop-selection-click', stopAndSendPendingMessageIds: ['stop-selected-B', 'stop-selected-B'] }, serverLink as any);
+    await flushAsync();
+    expect(stopAndSendPendingMessages).toHaveBeenCalledWith(['stop-selected-B'], 'stop-selection-click');
+    expect(cancel).not.toHaveBeenCalled();
+    expect(serverLink.send).not.toHaveBeenCalledWith(expect.objectContaining({ commandId: 'stop-selection-click', status: 'accepted' }));
+    finish({ status });
+    await flushAsync();
+    const accepted = status === 'stopped_and_dispatched' || status === 'already_delivered';
+    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({ commandId: 'stop-selection-click', status: accepted ? 'accepted' : 'error', ...(accepted ? { stopQueueOutcome: status } : {}) }));
+    expect(store.readSnapshot('deck_transport_brain').pendingMessageEntries.map((entry) => entry.clientMessageId)).toEqual(['stop-selected-B']);
+  });
+
+  it('Stop selection cannot publish success for a replacement runtime instance', async () => {
+    let finish!: (result: { status: string }) => void;
+    const runtime = { stopAndSendPendingMessages: vi.fn(() => new Promise<{ status: string }>((resolve) => { finish = resolve; })) };
+    getTransportRuntimeMock.mockReturnValue(runtime);
+    handleWebCommand({ type: DAEMON_COMMAND_TYPES.SESSION_CANCEL, sessionName: 'deck_transport_brain', commandId: 'stop-replaced', stopAndSendPendingMessageIds: ['B'] }, serverLink as any);
+    await flushAsync();
+    getTransportRuntimeMock.mockReturnValue({});
+    finish({ status: 'stopped_and_dispatched' });
+    await flushAsync();
+    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({ commandId: 'stop-replaced', status: 'error', error: expect.stringContaining('instance changed') }));
+  });
+
   it('appends selected queued messages to the active turn and emits authoritative delivery facts', async () => {
     const store = getTransportQueueStore();
     store.enqueue({

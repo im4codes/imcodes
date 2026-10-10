@@ -108,6 +108,21 @@ describe('OpenClawProvider', () => {
     vi.useRealTimers();
   });
 
+  it('confirms Stop only for the captured run lifecycle, not receipt or another run terminal', async () => {
+    await connectProvider(provider);
+    emitAgentEvent({ runId: 'stop-run', key: 'agent:main', stream: 'lifecycle', data: { phase: 'start' } });
+    let settled = false;
+    const stopping = provider.cancelAndWait('agent___main').then(() => { settled = true; });
+    await Promise.resolve();
+    replyToLastRpc();
+    emitAgentEvent({ runId: 'foreign-run', key: 'agent:other', stream: 'lifecycle', data: { phase: 'end' } });
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    emitAgentEvent({ runId: 'stop-run', key: 'agent:main', stream: 'lifecycle', data: { phase: 'end' } });
+    await stopping;
+    expect(settled).toBe(true);
+  });
+
   // 1. Static properties
   it('has correct id, connectionMode, sessionOwnership, and capabilities', () => {
     expect(provider.id).toBe('openclaw');

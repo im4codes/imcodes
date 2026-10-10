@@ -43,9 +43,22 @@ function claudePresetAppend(options: Record<string, unknown> | undefined): strin
 const mocks = vi.hoisted(() => {
   const store = new Map<string, Record<string, any>>();
   const emitted: Array<{ session: string; type: string; payload: Record<string, any>; opts?: Record<string, any> }> = [];
-  const claudeCalls: Array<{ prompt: string; options: Record<string, unknown> }> = [];
+  const claudeCalls: Array<{ prompt: unknown; options: Record<string, unknown> }> = [];
   const codexCalls: Array<{ mode: 'start' | 'resume'; id: string | null; input: string; options: Record<string, unknown> }> = [];
-  return { store, emitted, claudeCalls, codexCalls };
+  return { store, emitted, claudeCalls, codexCalls,
+    protocolCalls: [] as Array<{ method: string; params?: Record<string, any> }>,
+    holdClaudeQuery: false,
+    holdClaudeForStop: false,
+    claudeInputs: [] as Array<Record<string, any>>,
+    releaseClaudeQuery: undefined as (() => void) | undefined,
+    claudeInterrupts: 0,
+    holdCodexTurn: false,
+    acceptCodexTurn: undefined as (() => void) | undefined,
+    finishCodexTurn: undefined as (() => void) | undefined,
+    refuseSteer: false,
+    holdSteer: false,
+    releaseSteer: undefined as (() => void) | undefined,
+  };
 });
 
 const presetRouteMocks = vi.hoisted(() => ({
@@ -185,16 +198,38 @@ vi.mock('node:child_process', async (importOriginal) => {
             mocks.codexCalls.push({ mode: 'resume', id: threadId, input: '', options: msg.params ?? {} });
             stdout.write(JSON.stringify({ id: msg.id, result: { thread: { id: threadId } } }) + '\n');
           }
+          if (msg.method) mocks.protocolCalls.push({ method: msg.method, params: msg.params });
+          if (msg.method === 'turn/steer' && typeof msg.id === 'number') {
+            const refused = mocks.refuseSteer;
+            const respond = () => stdout.write(JSON.stringify(refused
+              ? { id: msg.id, error: { code: -32601, message: 'steer unsupported' } }
+              : { id: msg.id, result: { turnId: 'turn-codex-e2e' } }) + '\n');
+            if (mocks.holdSteer) mocks.releaseSteer = respond;
+            else respond();
+          }
           if (msg.method === 'turn/start' && typeof msg.id === 'number') {
-            stdout.write(JSON.stringify({ id: msg.id, result: { turn: { id: 'turn-codex-e2e', status: 'inProgress', items: [], error: null } } }) + '\n');
-            stdout.write(JSON.stringify({ method: 'item/started', params: { threadId: 'thread-codex-e2e', turnId: 'turn-codex-e2e', item: { id: 'cmd-codex-e2e', type: 'commandExecution', command: 'echo hi', aggregatedOutput: '', status: 'inProgress' } } }) + '\n');
-            stdout.write(JSON.stringify({ method: 'item/completed', params: { threadId: 'thread-codex-e2e', turnId: 'turn-codex-e2e', item: { id: 'cmd-codex-e2e', type: 'commandExecution', command: 'echo hi', aggregatedOutput: 'hi\n', status: 'completed' } } }) + '\n');
-            stdout.write(JSON.stringify({ method: 'item/started', params: { threadId: 'thread-codex-e2e', turnId: 'turn-codex-e2e', item: { id: 'msg-codex-e2e', type: 'agentMessage', text: '' } } }) + '\n');
-            stdout.write(JSON.stringify({ method: 'item/agentMessage/delta', params: { threadId: 'thread-codex-e2e', turnId: 'turn-codex-e2e', itemId: 'msg-codex-e2e', delta: 'Codex' } }) + '\n');
-            stdout.write(JSON.stringify({ method: 'item/agentMessage/delta', params: { threadId: 'thread-codex-e2e', turnId: 'turn-codex-e2e', itemId: 'msg-codex-e2e', delta: ': hello' } }) + '\n');
-            stdout.write(JSON.stringify({ method: 'thread/tokenUsage/updated', params: { threadId: 'thread-codex-e2e', turnId: 'turn-codex-e2e', tokenUsage: { last: { inputTokens: 7, cachedInputTokens: 2, outputTokens: 4 }, total: { inputTokens: 70, cachedInputTokens: 20, outputTokens: 4, totalTokens: 94, reasoningOutputTokens: 0 }, modelContextWindow: 1000000 } } }) + '\n');
-            stdout.write(JSON.stringify({ method: 'item/completed', params: { threadId: 'thread-codex-e2e', turnId: 'turn-codex-e2e', item: { id: 'msg-codex-e2e', type: 'agentMessage', text: 'Codex: hello' } } }) + '\n');
-            stdout.write(JSON.stringify({ method: 'turn/completed', params: { threadId: 'thread-codex-e2e', turn: { id: 'turn-codex-e2e', status: 'completed', error: null } } }) + '\n');
+            if (mocks.holdCodexTurn) {
+              mocks.acceptCodexTurn = () => {
+                stdout.write(JSON.stringify({ id: msg.id, result: { turn: { id: 'turn-codex-e2e', status: 'inProgress', items: [], error: null } } }) + '\n');
+                stdout.write(JSON.stringify({ method: 'item/started', params: { threadId: 'thread-codex-e2e', turnId: 'turn-codex-e2e', item: { id: 'cmd-held', type: 'commandExecution', command: 'echo fixture', aggregatedOutput: '', status: 'inProgress' } } }) + '\n');
+              };
+              mocks.finishCodexTurn = () => {
+                stdout.write(JSON.stringify({ method: 'turn/completed', params: { threadId: 'thread-codex-e2e', turn: { id: 'turn-codex-e2e', status: 'completed', error: null } } }) + '\n');
+              };
+              continue;
+            }
+
+            const turnNumber = mocks.protocolCalls.filter((call) => call.method === 'turn/start').length;
+            const turnId = turnNumber === 1 ? 'turn-codex-e2e' : `turn-codex-e2e-${turnNumber}`;
+            stdout.write(JSON.stringify({ id: msg.id, result: { turn: { id: turnId, status: 'inProgress', items: [], error: null } } }) + '\n');
+            stdout.write(JSON.stringify({ method: 'item/started', params: { threadId: 'thread-codex-e2e', turnId: turnId, item: { id: 'cmd-codex-e2e', type: 'commandExecution', command: 'echo hi', aggregatedOutput: '', status: 'inProgress' } } }) + '\n');
+            stdout.write(JSON.stringify({ method: 'item/completed', params: { threadId: 'thread-codex-e2e', turnId: turnId, item: { id: 'cmd-codex-e2e', type: 'commandExecution', command: 'echo hi', aggregatedOutput: 'hi\n', status: 'completed' } } }) + '\n');
+            stdout.write(JSON.stringify({ method: 'item/started', params: { threadId: 'thread-codex-e2e', turnId: turnId, item: { id: 'msg-codex-e2e', type: 'agentMessage', text: '' } } }) + '\n');
+            stdout.write(JSON.stringify({ method: 'item/agentMessage/delta', params: { threadId: 'thread-codex-e2e', turnId: turnId, itemId: 'msg-codex-e2e', delta: 'Codex' } }) + '\n');
+            stdout.write(JSON.stringify({ method: 'item/agentMessage/delta', params: { threadId: 'thread-codex-e2e', turnId: turnId, itemId: 'msg-codex-e2e', delta: ': hello' } }) + '\n');
+            stdout.write(JSON.stringify({ method: 'thread/tokenUsage/updated', params: { threadId: 'thread-codex-e2e', turnId: turnId, tokenUsage: { last: { inputTokens: 7, cachedInputTokens: 2, outputTokens: 4 }, total: { inputTokens: 70, cachedInputTokens: 20, outputTokens: 4, totalTokens: 94, reasoningOutputTokens: 0 }, modelContextWindow: 1000000 } } }) + '\n');
+            stdout.write(JSON.stringify({ method: 'item/completed', params: { threadId: 'thread-codex-e2e', turnId: turnId, item: { id: 'msg-codex-e2e', type: 'agentMessage', text: 'Codex: hello' } } }) + '\n');
+            stdout.write(JSON.stringify({ method: 'turn/completed', params: { threadId: 'thread-codex-e2e', turn: { id: turnId, status: 'completed', error: null } } }) + '\n');
           }
           if (msg.method === 'turn/interrupt' && typeof msg.id === 'number') {
             stdout.write(JSON.stringify({ id: msg.id, result: {} }) + '\n');
@@ -242,14 +277,23 @@ vi.mock('node:child_process', async (importOriginal) => {
 });
 
 vi.mock('@anthropic-ai/claude-agent-sdk', () => ({
-  query: vi.fn(({ prompt, options }: { prompt: string; options: Record<string, unknown> }) => {
+  query: vi.fn(({ prompt, options }: { prompt: string | AsyncIterable<Record<string, any>>; options: Record<string, unknown> }) => {
     mocks.claudeCalls.push({ prompt, options });
     const sessionId = String(options.resume ?? options.sessionId ?? 'cc-session');
     async function* gen() {
+      const input = (mocks.holdClaudeQuery || mocks.holdClaudeForStop) && typeof prompt !== 'string' ? prompt[Symbol.asyncIterator]() : undefined;
+      if (input) mocks.claudeInputs.push((await input.next()).value);
       yield { type: 'system', subtype: 'init', session_id: sessionId, model: 'claude-sonnet-4-6' };
       yield { type: 'stream_event', session_id: sessionId, event: { type: 'message_start', message: { id: 'msg-cc-e2e' } } };
       yield { type: 'stream_event', session_id: sessionId, event: { type: 'content_block_start', index: 0, content_block: { type: 'tool_use', id: 'tool-cc-e2e', name: 'Read', input: { file_path: 'README.md' } } } };
       yield { type: 'stream_event', session_id: sessionId, event: { type: 'content_block_stop', index: 0 } };
+      if (mocks.holdClaudeForStop) {
+        await new Promise<void>((resolve) => { mocks.releaseClaudeQuery = resolve; });
+      } else if (input) {
+        mocks.claudeInputs.push((await input.next()).value);
+        mocks.claudeInputs.push((await input.next()).value);
+        await new Promise<void>((resolve) => { mocks.releaseClaudeQuery = resolve; });
+      }
       yield { type: 'stream_event', session_id: sessionId, event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'Claude' } } };
       yield { type: 'stream_event', session_id: sessionId, event: { type: 'content_block_delta', delta: { type: 'text_delta', text: ': hello' } } };
       yield { type: 'assistant', session_id: sessionId, message: { content: [{ type: 'text', text: 'Claude: hello' }] } };
@@ -257,7 +301,7 @@ vi.mock('@anthropic-ai/claude-agent-sdk', () => ({
     }
     const q = gen() as AsyncGenerator<any, void> & { close(): void; interrupt(): Promise<void> };
     q.close = () => {};
-    q.interrupt = async () => {};
+    q.interrupt = async () => { mocks.claudeInterrupts++; };
     return q;
   }),
 }));
@@ -409,6 +453,10 @@ import { PiProvider } from '../../src/agent/providers/pi.js';
 import { handleWebCommand } from '../../src/daemon/command-handler.js';
 import { rebuildSubSessions } from '../../src/daemon/subsession-manager.js';
 import { newSession } from '../../src/agent/tmux.js';
+import { dispatchSessionMessage } from '../../src/daemon/session-dispatch.js';
+import { MEMORY_MCP_SEND_DELIVERY_MODES } from '../../shared/session-send-delivery.js';
+import { getTransportQueueStore, resetTransportQueueStoreForTests } from '../../src/daemon/transport-queue-store.js';
+import { join } from 'node:path';
 
 describe('sdk transport flow e2e', () => {
   let sharedContextTempDir: string;
@@ -1567,16 +1615,186 @@ describe('sdk transport flow e2e', () => {
 
   beforeEach(async () => {
     sharedContextTempDir = await createIsolatedSharedContextDb('sdk-transport-flow');
+    vi.stubEnv('IMCODES_TRANSPORT_QUEUE_DB_PATH', join(sharedContextTempDir, 'transport-queue.sqlite'));
+    resetTransportQueueStoreForTests();
     mocks.store.clear();
     mocks.emitted.length = 0;
     mocks.claudeCalls.length = 0;
     mocks.codexCalls.length = 0;
+    mocks.protocolCalls.length = 0;
+    mocks.holdCodexTurn = false;
+    mocks.holdClaudeQuery = false;
+    mocks.holdClaudeForStop = false;
+    mocks.claudeInputs.length = 0;
+    mocks.releaseClaudeQuery = undefined;
+    mocks.claudeInterrupts = 0;
+    mocks.refuseSteer = false;
+    mocks.holdSteer = false;
+    mocks.releaseSteer = undefined;
+    mocks.acceptCodexTurn = undefined;
+    mocks.finishCodexTurn = undefined;
   });
 
   afterEach(async () => {
     await disconnectAll();
+    resetTransportQueueStoreForTests();
+    vi.unstubAllEnvs();
     await cleanupIsolatedSharedContextDb(sharedContextTempDir);
     vi.clearAllMocks();
+  });
+
+  it.each([undefined, MEMORY_MCP_SEND_DELIVERY_MODES.APPEND])('dispatches inter-session native append through live Codex protocol before turn completion (%s)', async (deliveryMode) => {
+    mocks.holdCodexTurn = true;
+    await launchSession({ name: SESSION_CX, projectName: 'cxsdk', role: 'brain', agentType: 'codex-sdk', projectDir: sharedContextTempDir });
+    const runtime = getTransportRuntime(SESSION_CX)!;
+    runtime.send('foreground 原回合', 'native-foreground');
+    await waitForCondition(() => !!mocks.acceptCodexTurn);
+    const target = mocks.store.get(SESSION_CX) as any;
+    const beforeAccepted = await dispatchSessionMessage(target, '第一条\n中文消息', { messageId: 'native-B', deliveryMode });
+    expect(beforeAccepted).toBe('queued');
+    expect(mocks.protocolCalls.filter((call) => call.method === 'turn/steer')).toHaveLength(0);
+    expect(mocks.emitted.some((event) => event.type === 'user.message' && event.payload.clientMessageId === 'native-B')).toBe(false);
+    mocks.acceptCodexTurn!();
+    await waitForCondition(() => mocks.protocolCalls.some((call) => call.method === 'turn/steer'));
+    await waitForCondition(() => getTransportQueueStore().hasDeliveryTombstone(SESSION_CX, 'native-B'));
+    expect(runtime.hasActiveTurnWork()).toBe(true);
+    expect(mocks.protocolCalls.find((call) => call.method === 'turn/steer')).toMatchObject({ params: {
+      expectedTurnId: 'turn-codex-e2e', input: [{ type: 'text', text: '第一条\n中文消息' }],
+    } });
+    expect(mocks.emitted.filter((event) => event.type === 'user.message' && event.payload.clientMessageId === 'native-B')).toHaveLength(1);
+    await dispatchSessionMessage(target, 'explicit idle FIFO', { messageId: 'native-Q', deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.QUEUE });
+    expect(runtime.pendingEntries.map((entry) => entry.clientMessageId)).toEqual(['native-Q']);
+    await dispatchSessionMessage(target, '第二条 tool-active', { messageId: 'native-C', deliveryMode });
+    await waitForCondition(() => mocks.protocolCalls.filter((call) => call.method === 'turn/steer').length === 2);
+    expect(mocks.protocolCalls.filter((call) => call.method === 'turn/start')).toHaveLength(1);
+    expect(mocks.protocolCalls.filter((call) => call.method === 'turn/interrupt')).toHaveLength(0);
+    expect(runtime.pendingEntries.map((entry) => entry.clientMessageId)).toEqual(['native-Q']);
+    mocks.holdCodexTurn = false;
+    mocks.finishCodexTurn!();
+    await waitForCondition(() => mocks.protocolCalls.filter((call) => call.method === 'turn/start').length === 2);
+    expect(getTransportQueueStore().hasDeliveryTombstone(SESSION_CX, 'native-Q')).toBe(true);
+  });
+
+  it('does not strand a later real Codex steer behind a refused same-owner append admission', async () => {
+    mocks.holdCodexTurn = true;
+    await launchSession({ name: SESSION_CX, projectName: 'cxsdk', role: 'brain', agentType: 'codex-sdk', projectDir: sharedContextTempDir });
+    const runtime = getTransportRuntime(SESSION_CX)!;
+    runtime.send('foreground', 'refusal-protocol-A');
+    await waitForCondition(() => !!mocks.acceptCodexTurn);
+    mocks.acceptCodexTurn!();
+    await waitForCondition(() => getTransportQueueStore().hasDeliveryTombstone(SESSION_CX, 'refusal-protocol-A'));
+    mocks.refuseSteer = true;
+    mocks.holdSteer = true;
+    const target = mocks.store.get(SESSION_CX) as any;
+    await dispatchSessionMessage(target, 'refused B', { messageId: 'refusal-protocol-B' });
+    await waitForCondition(() => !!mocks.releaseSteer);
+    await dispatchSessionMessage(target, 'later C', { messageId: 'refusal-protocol-C' });
+    mocks.holdSteer = false;
+    mocks.refuseSteer = false;
+    mocks.releaseSteer!();
+    await waitForCondition(() => mocks.protocolCalls.filter((call) => call.method === 'turn/steer').length === 2);
+    await waitForCondition(() => getTransportQueueStore().hasDeliveryTombstone(SESSION_CX, 'refusal-protocol-C'));
+    expect(runtime.pendingEntries.map((entry) => entry.clientMessageId)).toEqual(['refusal-protocol-B']);
+    expect(getTransportQueueStore().readSnapshot(SESSION_CX).pendingMessageEntries[0]).toMatchObject({ appendFallbackReason: 'unsupported' });
+    expect(mocks.protocolCalls.filter((call) => call.method === 'turn/interrupt')).toHaveLength(0);
+    expect(mocks.protocolCalls.filter((call) => call.method === 'turn/start')).toHaveLength(1);
+    mocks.holdCodexTurn = false;
+    mocks.finishCodexTurn!();
+  });
+
+  it('Stop refuses to start a new Codex turn without a real terminal notification, even after interrupt ack', async () => {
+    mocks.holdCodexTurn = true;
+    mocks.refuseSteer = true;
+    await launchSession({ name: SESSION_CX, projectName: 'cxsdk', role: 'brain', agentType: 'codex-sdk', projectDir: sharedContextTempDir });
+    const runtime = getTransportRuntime(SESSION_CX)!;
+    runtime.send('foreground', 'stop-terminal-A');
+    await waitForCondition(() => !!mocks.acceptCodexTurn);
+    mocks.acceptCodexTurn!();
+    await waitForCondition(() => getTransportQueueStore().hasDeliveryTombstone(SESSION_CX, 'stop-terminal-A'));
+    runtime.send('retained B', 'stop-terminal-B');
+    const serverLink = { send: vi.fn() } as any;
+    handleWebCommand({ type: DAEMON_COMMAND_TYPES.SESSION_CANCEL, sessionName: SESSION_CX, commandId: 'stop-terminal-click', stopAndSendPendingMessageIds: ['stop-terminal-B'] }, serverLink);
+    await waitForCondition(() => serverLink.send.mock.calls.some(([frame]) => frame.type === 'command.ack' && frame.commandId === 'stop-terminal-click' && frame.status === 'error'), 8_000);
+    expect(mocks.protocolCalls.filter((call) => call.method === 'turn/start')).toHaveLength(1);
+    expect(mocks.protocolCalls.filter((call) => call.method === 'turn/interrupt')).toHaveLength(1);
+    expect(runtime.pendingEntries.map((entry) => entry.clientMessageId)).toEqual(['stop-terminal-B']);
+    expect(getTransportQueueStore().hasDeliveryTombstone(SESSION_CX, 'stop-terminal-B')).toBe(false);
+    expect(runtime.cancelStaleActiveTurnWithPending({ nowMs: Date.now() + 3_600_000, staleMs: 1 })).toBe(false);
+    mocks.holdCodexTurn = false;
+    mocks.finishCodexTurn!();
+    await waitForCondition(() => getTransportQueueStore().hasDeliveryTombstone(SESSION_CX, 'stop-terminal-B'));
+    expect(mocks.protocolCalls.filter((call) => call.method === 'turn/start')).toHaveLength(2);
+    expect(mocks.protocolCalls.filter((call) => call.method === 'turn/interrupt')).toHaveLength(1);
+  });
+
+  it('dispatches busy/tool-active Claude append into the current SDK input stream at next safe boundary', async () => {
+    mocks.holdClaudeQuery = true;
+    await launchSession({ name: SESSION_CC, projectName: 'ccsdk', role: 'brain', agentType: 'claude-code-sdk', projectDir: sharedContextTempDir });
+    const runtime = getTransportRuntime(SESSION_CC)!;
+    runtime.send('foreground', 'claude-native-A');
+    await waitForCondition(() => mocks.claudeInputs.length === 1);
+    const target = mocks.store.get(SESSION_CC) as any;
+    await dispatchSessionMessage(target, '中文\n第一条', { messageId: 'claude-native-B' });
+    await waitForCondition(() => mocks.claudeInputs.length === 2);
+    await dispatchSessionMessage(target, 'idle FIFO', { messageId: 'claude-native-Q', deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.QUEUE });
+    await dispatchSessionMessage(target, '第二条', { messageId: 'claude-native-C', deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND });
+    await waitForCondition(() => mocks.claudeInputs.length === 3 && !!mocks.releaseClaudeQuery);
+    expect(mocks.claudeInputs.slice(1)).toMatchObject([
+      { message: { content: '中文\n第一条' }, uuid: 'claude-native-B', priority: 'next' },
+      { message: { content: '第二条' }, uuid: 'claude-native-C', priority: 'next' },
+    ]);
+    expect(mocks.claudeCalls).toHaveLength(1);
+    expect(mocks.claudeInterrupts).toBe(0);
+    expect(runtime.hasActiveTurnWork()).toBe(true);
+    expect(runtime.pendingEntries.map((entry) => entry.clientMessageId)).toEqual(['claude-native-Q']);
+    mocks.holdClaudeQuery = false;
+    mocks.releaseClaudeQuery!();
+    await waitForCondition(() => mocks.claudeCalls.length === 2);
+  });
+
+  it('Stop on Claude control fallback waits for actual captured query termination, not interrupt receipt', async () => {
+    mocks.holdClaudeForStop = true;
+    await launchSession({ name: SESSION_CC, projectName: 'ccsdk', role: 'brain', agentType: 'claude-code-sdk', projectDir: sharedContextTempDir });
+    const runtime = getTransportRuntime(SESSION_CC)!;
+    runtime.send('foreground', 'stop-claude-A');
+    await waitForCondition(() => !!mocks.releaseClaudeQuery && getTransportQueueStore().hasDeliveryTombstone(SESSION_CC, 'stop-claude-A'));
+    runtime.send('/compact', 'stop-claude-B');
+    const serverLink = { send: vi.fn() } as any;
+    handleWebCommand({ type: DAEMON_COMMAND_TYPES.SESSION_CANCEL, sessionName: SESSION_CC, commandId: 'stop-claude-click', stopAndSendPendingMessageIds: ['stop-claude-B'] }, serverLink);
+    await waitForCondition(() => mocks.claudeInterrupts === 1);
+    expect(mocks.claudeCalls).toHaveLength(1);
+    expect(serverLink.send.mock.calls.some(([frame]) => frame.type === 'command.ack' && frame.commandId === 'stop-claude-click' && frame.status === 'accepted')).toBe(false);
+    mocks.holdClaudeForStop = false;
+    mocks.releaseClaudeQuery!();
+    await waitForCondition(() => serverLink.send.mock.calls.some(([frame]) => frame.type === 'command.ack' && frame.commandId === 'stop-claude-click' && frame.stopQueueOutcome === 'stopped_and_dispatched'));
+    await waitForCondition(() => mocks.claudeCalls.length === 2);
+    expect(getTransportQueueStore().hasDeliveryTombstone(SESSION_CC, 'stop-claude-B')).toBe(true);
+    expect(mocks.claudeInterrupts).toBe(1);
+  });
+
+  it.each([true, false])('Stop waits for Codex terminal proof across acceptance/refusal, retaining original ids (preaccept=%s)', async (preaccept) => {
+    mocks.holdCodexTurn = true;
+    mocks.refuseSteer = true;
+    await launchSession({ name: SESSION_CX, projectName: 'cxsdk', role: 'brain', agentType: 'codex-sdk', projectDir: sharedContextTempDir });
+    const runtime = getTransportRuntime(SESSION_CX)!;
+    runtime.send('foreground', 'stop-protocol-A');
+    await waitForCondition(() => !!mocks.acceptCodexTurn);
+    mocks.acceptCodexTurn!();
+    await waitForCondition(() => mocks.emitted.some((event) => event.session === SESSION_CX && event.type === 'tool.call'));
+    if (!preaccept) await waitForCondition(() => getTransportQueueStore().hasDeliveryTombstone(SESSION_CX, 'stop-protocol-A'));
+    runtime.send('pending 原消息', 'stop-protocol-B', undefined, undefined, { deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.QUEUE });
+    const serverLink = { send: vi.fn() } as any;
+    handleWebCommand({ type: DAEMON_COMMAND_TYPES.SESSION_CANCEL, sessionName: SESSION_CX, commandId: 'stop-protocol-click', stopAndSendPendingMessageIds: ['stop-protocol-B'] }, serverLink);
+    await waitForCondition(() => mocks.protocolCalls.some((call) => call.method === 'turn/interrupt'));
+    expect(mocks.protocolCalls.filter((call) => call.method === 'turn/start')).toHaveLength(1);
+    expect(serverLink.send.mock.calls.some(([frame]) => frame.type === 'command.ack' && frame.commandId === 'stop-protocol-click' && frame.status === 'accepted')).toBe(false);
+    mocks.holdCodexTurn = false;
+    mocks.finishCodexTurn!();
+    await waitForCondition(() => serverLink.send.mock.calls.some(([frame]) => frame.type === 'command.ack' && frame.commandId === 'stop-protocol-click' && frame.stopQueueOutcome === 'stopped_and_dispatched'));
+
+    await waitForCondition(() => mocks.protocolCalls.filter((call) => call.method === 'turn/start').length === 2);
+    expect(mocks.protocolCalls.filter((call) => call.method === 'turn/interrupt')).toHaveLength(1);
+    expect(getTransportQueueStore().hasDeliveryTombstone(SESSION_CX, 'stop-protocol-B')).toBe(true);
   });
 
   it('launches claude-code-sdk session and emits streaming + final transport timeline events', async () => {

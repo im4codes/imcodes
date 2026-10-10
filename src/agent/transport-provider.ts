@@ -654,6 +654,8 @@ export interface TransportProvider {
    * Providers that support interruption should implement this.
    */
   cancel?(sessionId: string, options?: ProviderCancelOptions): Promise<void>;
+  /** Strong terminal proof for Stop-and-send; a local watchdog is not proof. */
+  cancelAndWait?(sessionId: string): Promise<void>;
 
   /**
    * Register a callback to receive incremental output deltas while the agent is streaming.

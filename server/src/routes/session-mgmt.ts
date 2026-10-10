@@ -1,4 +1,5 @@
 import { Hono, type Context } from 'hono';
+import { TRANSPORT_STOP_QUEUE_FIELDS } from '../../../shared/transport-queue-types.js';
 import type { Env } from '../env.js';
 import { getServerById, getDbSessionByName, getDbSessionsByServer, getSubSessionById, getSubSessionsByServer, getUserPref, setUserPref, upsertDbSession, deleteDbSession, updateSessionLabel, updateProjectName, updateSession, updateSubSession } from '../db/queries.js';
 import { requireAuth } from '../security/authorization.js';
@@ -1081,6 +1082,8 @@ sessionMgmtRoutes.post('/:id/session/cancel', async (c) => {
       return relayToDaemon(c, DAEMON_COMMAND_TYPES.SESSION_CANCEL, {
         ...(sessionName ? { sessionName } : session ? { session } : {}),
         ...(commandId ? { commandId } : {}),
+        ...(body[TRANSPORT_STOP_QUEUE_FIELDS.IDS] !== undefined
+          ? { [TRANSPORT_STOP_QUEUE_FIELDS.IDS]: body[TRANSPORT_STOP_QUEUE_FIELDS.IDS] } : {}),
         observedDispatchId,
         sharedActor: await buildHttpSharedActor(c.env.DB, {
           userId,
@@ -1101,6 +1104,8 @@ sessionMgmtRoutes.post('/:id/session/cancel', async (c) => {
   return relayToDaemon(c, DAEMON_COMMAND_TYPES.SESSION_CANCEL, {
     ...(sessionName ? { sessionName } : session ? { session } : {}),
     ...(commandId ? { commandId } : {}),
+    ...(body[TRANSPORT_STOP_QUEUE_FIELDS.IDS] !== undefined
+      ? { [TRANSPORT_STOP_QUEUE_FIELDS.IDS]: body[TRANSPORT_STOP_QUEUE_FIELDS.IDS] } : {}),
   });
 });
 

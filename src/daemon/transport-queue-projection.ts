@@ -1,3 +1,4 @@
+import { transportQueueSnapshotToPayload } from '../../shared/transport-queue-wire.js';
 import { createHash } from 'node:crypto';
 import type { PendingTransportMessage } from '../agent/transport-session-runtime.js';
 import {
@@ -315,22 +316,7 @@ export function buildTransportQueueSnapshot(
   return snapshot;
 }
 
-export function transportQueueSnapshotToPayload(snapshot: QueueSnapshot): TransportQueueSnapshotPayload {
-  return {
-    queueSnapshot: snapshot,
-    queueEpoch: snapshot.queueEpoch,
-    queueAuthorityId: snapshot.queueAuthorityId,
-    pendingMessageVersion: snapshot.pendingMessageVersion,
-    pendingCount: snapshot.pendingMessageEntries.length,
-    pendingMessageEntries: snapshot.pendingMessageEntries,
-    failedMessageEntries: snapshot.failedMessageEntries,
-    ...(snapshot.resetReason ? { resetReason: snapshot.resetReason } : {}),
-    ...(snapshot.dropReason ? { dropReason: snapshot.dropReason } : {}),
-    ...(snapshot.activityGeneration !== undefined ? { activityGeneration: snapshot.activityGeneration } : {}),
-    ...(snapshot.degraded !== undefined ? { degraded: snapshot.degraded } : {}),
-    ...(snapshot.degradedReason ? { degradedReason: snapshot.degradedReason } : {}),
-  };
-}
+export { transportQueueSnapshotToPayload } from '../../shared/transport-queue-wire.js';
 
 export function buildTransportQueueSnapshotPayload(
   sessionName: string,

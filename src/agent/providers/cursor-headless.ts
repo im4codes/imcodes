@@ -1,3 +1,4 @@
+import { confirmChildStop, confirmCapturedChildExit } from '../provider-stop-confirmation.js';
 import { randomUUID } from 'node:crypto';
 import { gateChildStream } from '../../util/event-loop-backpressure.js';
 import path from 'node:path';
@@ -679,6 +680,7 @@ export class CursorHeadlessProvider implements TransportProvider {
     });
 
     child.once('close', (code, signal) => {
+      confirmCapturedChildExit(child);
       rl.close();
       state.child = null;
       clearStatus();
@@ -741,6 +743,13 @@ export class CursorHeadlessProvider implements TransportProvider {
     } catch (err) {
       return { models: [], error: err instanceof Error ? err.message : String(err) };
     }
+  }
+
+  cancelAndWait(sessionId: string): Promise<void> {
+    const state = this.getSessionState(sessionId);
+    const child = state?.child;
+    if (!state || !child) return Promise.reject(new Error('Provider has no captured child to confirm stop'));
+    return confirmChildStop(child, () => this.cancel(sessionId), () => this.getSessionState(sessionId) === state);
   }
 
   async cancel(sessionId: string): Promise<void> {

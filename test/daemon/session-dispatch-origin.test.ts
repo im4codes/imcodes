@@ -69,7 +69,7 @@ describe('session dispatch message origin', () => {
     } as never);
     expect(classifyUserMessageOrigin(userRow(emit))).toBe(CHAT_MESSAGE_ORIGINS.AGENT);
     expect(mocks.runtimeSend).toHaveBeenCalledWith('please review', 'send_message_o1', undefined, undefined,
-      { messageOrigin: CHAT_MESSAGE_ORIGINS.AGENT });
+      { messageOrigin: CHAT_MESSAGE_ORIGINS.AGENT, deliveryMode: 'append' });
   });
 
   it('keeps the origin on a queued copy, whose drain writes the row', async () => {
@@ -79,7 +79,7 @@ describe('session dispatch message origin', () => {
       messageId: 'send_message_o2', messageOrigin: CHAT_MESSAGE_ORIGINS.SYSTEM,
     } as never);
     expect(userRow(emit)).toBeUndefined();
-    expect(mocks.runtimeSend.mock.calls[0]?.[4]).toEqual({ messageOrigin: CHAT_MESSAGE_ORIGINS.SYSTEM });
+    expect(mocks.runtimeSend.mock.calls[0]?.[4]).toEqual({ messageOrigin: CHAT_MESSAGE_ORIGINS.SYSTEM, deliveryMode: 'append' });
   });
 
   it('stamps a control command another session sent, which carries no sender block', async () => {
@@ -102,7 +102,7 @@ describe('session dispatch message origin', () => {
   it('leaves human input from an external chat bridge unstamped', async () => {
     const emit = vi.spyOn(timelineEmitter, 'emit');
     await dispatchSessionMessage(session(), 'hi from telegram', { messageId: 'send_message_o5' } as never);
-    expect(mocks.runtimeSend).toHaveBeenCalledWith('hi from telegram', 'send_message_o5');
+    expect(mocks.runtimeSend).toHaveBeenCalledWith('hi from telegram', 'send_message_o5', undefined, undefined, { deliveryMode: 'append' });
     expect(classifyUserMessageOrigin(userRow(emit))).toBe(CHAT_MESSAGE_ORIGINS.USER);
   });
 });

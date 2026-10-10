@@ -5215,7 +5215,59 @@ afterEach(() => {
     }));
   });
 
-  it('uses Stop to append the queue first and shows that the session is still running', () => {
+  it('does not claim Stop append admission from a websocket send alone', () => {
+    const ws = makeWs();
+    render(<SessionControls ws={ws as any} activeSession={makeSession({
+      name: 'qwen-session', agentType: 'qwen', runtimeType: 'transport', state: 'running',
+      transportPendingMessageEntries: [{ clientMessageId: 'stop-pending', text: '待发送消息' }],
+    })} quickData={makeQuickData() as any} />);
+    fireEvent.click(screen.getByRole('button', { name: /^stop$/i }));
+    expect(screen.queryByText('Queued messages appended; the session is still running.')).toBeNull();
+  });
+
+  it.each([
+    ['accepted', 'stopped_and_dispatched', 'stop_queue_stopped'],
+    ['accepted', undefined, 'stop_queue_unconfirmed'],
+    ['error', undefined, 'stop_queue_unconfirmed'],
+  ])('Stop uses matching actual outcome, retaining ids across old/rejected/out-of-order receipts (%s/%s)', async (status, outcome, label) => {
+    const ws = makeWs();
+    const session = makeSession({ name: 'qwen-session', agentType: 'qwen', runtimeType: 'transport', state: 'running',
+      transportPendingMessageEntries: [{ clientMessageId: 'stop-receipt-B', text: 'retain original' }] });
+    const view = render(<SessionControls ws={ws as any} activeSession={session} quickData={makeQuickData() as any} />);
+    fireEvent.click(screen.getByRole('button', { name: /^stop$/i }));
+    const request = gatherCancelCalls(ws)[0];
+    expect(request.stopAndSendPendingMessageIds).toEqual(['stop-receipt-B']);
+    view.rerender(<SessionControls ws={ws as any} activeSession={{ ...session, transportPendingMessageEntries: [
+      ...session.transportPendingMessageEntries!, { clientMessageId: 'new-arrival', text: 'new during Stop' },
+    ] }} quickData={makeQuickData() as any} />);
+    fireEvent.click(screen.getByRole('button', { name: /^stop$/i }));
+    expect(gatherCancelCalls(ws)).toHaveLength(1);
+    await act(async () => ws.emit({ type: 'command.ack', session: 'other-target', commandId: request.commandId, status: 'accepted', stopQueueOutcome: 'appended' }));
+    await act(async () => ws.emit({ type: 'command.ack', session: 'qwen-session', commandId: 'foreign-command', status: 'accepted', stopQueueOutcome: 'appended' }));
+    expect(screen.queryByText('Queued messages appended; the session is still running.')).toBeNull();
+    await act(async () => ws.emit({ type: 'command.ack', session: 'qwen-session', commandId: request.commandId, status, stopQueueOutcome: outcome }));
+    expect(screen.getByText(label)).toBeDefined();
+    expect(screen.getByText('retain original')).toBeDefined();
+    expect(screen.getByText('new during Stop')).toBeDefined();
+    expect(gatherSendCalls(ws)).toEqual([]);
+    await act(async () => ws.emit({ type: 'command.ack', session: 'qwen-session', commandId: request.commandId, status: 'accepted', stopQueueOutcome: 'appended' }));
+    expect(screen.queryByText('Queued messages appended; the session is still running.')).toBeNull();
+  });
+
+  it.each([
+    [{ deliveryMode: 'append' }, 'transport_append_pending'],
+    [{ deliveryMode: 'append', appendFallbackReason: 'unsupported' }, 'transport_append_fallback'],
+    [{ deliveryMode: 'queue' }, 'transport_send_queued'],
+  ])('queue card distinguishes pending native admission from true idle fallback (%j)', (policy, label) => {
+    render(<SessionControls ws={makeWs() as any} activeSession={makeSession({
+      name: 'qwen-session', agentType: 'qwen', runtimeType: 'transport', state: 'running',
+      transportPendingMessageEntries: [{ clientMessageId: 'policy-row', text: 'normal pending', ...policy }],
+    })} quickData={makeQuickData() as any} />);
+    expect(screen.getAllByText(label).length).toBeGreaterThan(0);
+    expect(screen.queryByText('Queued messages appended; the session is still running.')).toBeNull();
+  });
+
+  it('uses priority Stop selection and reports native append only after actual admission', async () => {
     const ws = makeWs();
     render(
       <SessionControls
@@ -5238,22 +5290,22 @@ afterEach(() => {
     fireEvent.pointerDown(stop);
     fireEvent.click(stop, { detail: 1 });
 
-    expect(ws.send).toHaveBeenCalledWith(expect.objectContaining({
-      type: 'session.append_queued_messages',
+    expect(ws.sendSessionCommandUrgent).toHaveBeenCalledWith('cancel', expect.objectContaining({
       sessionName: 'qwen-session',
-      clientMessageIds: ['msg-1'],
+      stopAndSendPendingMessageIds: ['msg-1'],
       commandId: expect.any(String),
     }));
-    expect(gatherCancelCalls(ws)).toEqual([]);
-    expect(ws.send.mock.calls.filter(([payload]) => (
-      (payload as { type?: string }).type === 'session.append_queued_messages'
-    ))).toHaveLength(1);
-    const notice = screen.getByRole('status');
+    expect(gatherCancelCalls(ws)).toHaveLength(1);
+    expect(ws.sendSessionCommandUrgent.mock.calls.filter(([kind]) => kind === 'cancel')).toHaveLength(1);
+    expect(screen.queryByText('Queued messages appended; the session is still running.')).toBeNull();
+    const request = gatherCancelCalls(ws)[0];
+    await act(async () => ws.emit({ type: 'command.ack', session: 'qwen-session', commandId: request.commandId, status: 'accepted', stopQueueOutcome: 'appended' }));
+    const notice = screen.getByText('Queued messages appended; the session is still running.').closest('[role="status"]')!;
     expect(notice.textContent).toContain('Queued messages appended; the session is still running.');
     expect(notice.classList.contains('queue-append-success-toast')).toBe(true);
   });
 
-  it('never turns the delayed click from a queue-first Stop press into a cancel', () => {
+  it('does not duplicate the priority Stop selection after a delayed click', () => {
     const now = vi.spyOn(Date, 'now').mockReturnValue(1_000);
     try {
       const ws = makeWs();
@@ -5275,16 +5327,14 @@ afterEach(() => {
 
       const stop = screen.getByRole('button', { name: /^stop$/i });
       fireEvent.pointerDown(stop);
-      expect(screen.queryByText('append despite delayed click')).toBeNull();
+      expect(screen.getByText('append despite delayed click')).toBeDefined();
 
       // Simulate streaming/main-thread jank beyond the old 600 ms guard.
       now.mockReturnValue(1_701);
       fireEvent.click(stop, { detail: 1 });
 
-      expect(ws.send.mock.calls.filter(([payload]) => (
-        (payload as { type?: string }).type === 'session.append_queued_messages'
-      ))).toHaveLength(1);
-      expect(gatherCancelCalls(ws)).toEqual([]);
+      expect(ws.sendSessionCommandUrgent.mock.calls.filter(([kind]) => kind === 'cancel')).toHaveLength(1);
+      expect(gatherCancelCalls(ws)).toHaveLength(1);
     } finally {
       now.mockRestore();
     }
@@ -5415,12 +5465,11 @@ afterEach(() => {
     fireEvent.pointerDown(stop);
     fireEvent.click(stop);
 
-    expect(ws.send).toHaveBeenCalledWith(expect.objectContaining({
-      type: 'session.append_queued_messages',
+    expect(ws.sendSessionCommandUrgent).toHaveBeenCalledWith('cancel', expect.objectContaining({
       sessionName: 'qwen-session',
-      clientMessageIds: [send?.commandId],
+      stopAndSendPendingMessageIds: [send?.commandId],
     }));
-    expect(gatherCancelCalls(ws)).toEqual([]);
+    expect(gatherCancelCalls(ws)).toHaveLength(1);
   });
 
   it('keeps a failed local queue row out of Append and lets Stop remain a real cancel', () => {
@@ -6786,39 +6835,19 @@ afterEach(() => {
     expect(ws.sendInput).not.toHaveBeenCalled();
   });
 
-  it('uses Escape to append a queued message without canceling the active transport turn', () => {
+  it('uses Escape for the same priority Stop selection without optimistic admission', () => {
     const ws = makeWs();
-    render(
-      <SessionControls
-        ws={ws as any}
-        activeSession={makeSession({
-          name: 'qwen-session',
-          agentType: 'qwen',
-          runtimeType: 'transport',
-          state: 'running',
-          transportPendingMessageEntries: [
-            { clientMessageId: 'msg-escape-append', text: 'append from Escape' },
-          ],
-        })}
-        quickData={makeQuickData() as any}
-      />,
-    );
-
+    render(<SessionControls ws={ws as any} activeSession={makeSession({
+      name: 'qwen-session', agentType: 'qwen', runtimeType: 'transport', state: 'running',
+      transportPendingMessageEntries: [{ clientMessageId: 'msg-escape-append', text: 'append from Escape' }],
+    })} quickData={makeQuickData() as any} />);
     const input = screen.getByRole('textbox') as HTMLDivElement;
     input.focus();
     fireEvent.keyDown(input, { key: 'Escape' });
-
-    expect(ws.send.mock.calls.filter(([payload]) => (
-      (payload as { type?: string }).type === 'session.append_queued_messages'
-    ))).toEqual([[expect.objectContaining({
-      sessionName: 'qwen-session',
-      clientMessageIds: ['msg-escape-append'],
-      commandId: expect.any(String),
-    })]]);
-    expect(gatherCancelCalls(ws)).toEqual([]);
-    expect(screen.queryByText('append from Escape')).toBeNull();
-    const notice = screen.getByText('Queued messages appended; the session is still running.');
-    expect(notice.closest('[role="status"]')?.classList.contains('queue-append-success-toast')).toBe(true);
+    expectUrgentCancelPayload(ws, { sessionName: 'qwen-session', stopAndSendPendingMessageIds: ['msg-escape-append'] });
+    expect(gatherCancelCalls(ws)).toHaveLength(1);
+    expect(screen.getByText('append from Escape')).toBeDefined();
+    expect(screen.queryByText('Queued messages appended; the session is still running.')).toBeNull();
   });
 
   it('pressing Escape with window focus sends direct cancel for the active transport surface', () => {

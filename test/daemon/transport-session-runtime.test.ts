@@ -1,3 +1,4 @@
+import { ProviderStopConfirmation } from '../../src/agent/provider-stop-confirmation.js';
 import { CHAT_MESSAGE_ORIGINS } from '../../shared/chat-message-origin.js';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { readFileSync } from 'node:fs';
@@ -145,7 +146,7 @@ function makeMockProvider(id = 'mock') {
   const fireTool = (sid: string, tool: ToolCallEvent) =>
     toolCb?.(sid, tool);
 
-  return {
+  const mock = {
     provider: {
       id, connectionMode: 'persistent', sessionOwnership: 'provider',
       capabilities: { streaming: true, toolCalling: false, approval: false, sessionRestore: false, multiTurn: true, attachments: false, contextSupport: 'full-normalized-context-injection' },
@@ -162,6 +163,10 @@ function makeMockProvider(id = 'mock') {
     } as unknown as TransportProvider,
     fireDelta, fireComplete, fireError, fireApproval, fireStatus, fireUsage, fireTool,
   };
+  // This fixture exposes the strong capability explicitly. Individual tests
+  // control its settlement separately from a production interrupt receipt.
+  mock.provider.cancelAndWait = (sid) => Promise.resolve(mock.provider.cancel!(sid));
+  return mock;
 }
 
 function makeSearchItem(overrides: Partial<MemorySearchResultItem> = {}): MemorySearchResultItem {
@@ -1155,7 +1160,7 @@ describe('TransportSessionRuntime', () => {
 
     const result = await runtime.appendExternalMessageToActiveTurn('peer update', 'send_message_peer_1');
 
-    expect(result).toBe('appended');
+    expect(result).toBe('queued');
     expect(mock.provider.notifyActiveDelegation).toHaveBeenCalledWith('sess-1', {
       notificationId: 'send_message_peer_1',
       delegationId: 'mcp-append:send_message_peer_1',
@@ -1340,6 +1345,284 @@ describe('TransportSessionRuntime', () => {
     expect(mock.provider.notifyActiveDelegation).toHaveBeenCalledOnce();
   });
 
+  it.each([
+    AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE,
+    AGENT_DELEGATION_NOTIFICATION_RESULTS.UNSUPPORTED,
+  ])('does not strand later native appends behind a refused admission (%s)', async (refusal) => {
+    mock.provider.capabilities.activeDelegationNotification = AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE;
+    let refuseFirst!: (result: typeof refusal) => void;
+    mock.provider.notifyActiveDelegation = vi.fn()
+      .mockImplementationOnce(() => new Promise((resolve) => { refuseFirst = resolve; }))
+      .mockResolvedValue(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+    runtime.send('long foreground turn', 'foreground-refused-append');
+    await waitForProviderSendCount(mock.provider, 1);
+    await flushDispatch();
+    expect(runtime.send('first refused', 'append-refused', undefined, undefined, {
+      deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND,
+    })).toBe('queued');
+    await flushDispatch();
+    expect(mock.provider.notifyActiveDelegation).toHaveBeenCalledTimes(1);
+    // A second request arrives while the first native admission owns the same
+    // dispatch flush. The refusal must not silently drop this wake-up.
+    expect(runtime.send('后续消息\n保持当前回合', 'append-after-refusal', undefined, undefined, {
+      deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND,
+    })).toBe('queued');
+    refuseFirst(refusal);
+    await flushDispatch();
+    expect(mock.provider.notifyActiveDelegation).toHaveBeenCalledTimes(2);
+    expect(mock.provider.notifyActiveDelegation).toHaveBeenLastCalledWith('sess-1', expect.objectContaining({
+      notificationId: 'append-after-refusal', text: '后续消息\n保持当前回合',
+    }));
+    expect(mock.provider.send).toHaveBeenCalledTimes(1);
+    expect(mock.provider.cancel).not.toHaveBeenCalled();
+    expect(runtime.pendingEntries.map((entry) => entry.clientMessageId)).toEqual(['append-refused']);
+    expect(getTransportQueueStore().hasDeliveryTombstone('deck_test_brain', 'append-after-refusal')).toBe(true);
+    expect(getTransportQueueStore().hasDeliveryTombstone('deck_test_brain', 'append-refused')).toBe(false);
+  });
+
+  it('Stop falls back to confirmed cancel while retaining the frozen queue ids and FIFO order', async () => {
+    runtime.send('old turn', 'stop-old');
+    await waitForProviderSendCount(mock.provider, 1);
+    await flushDispatch();
+    runtime.send('B', 'stop-B');
+    runtime.send('C', 'stop-C');
+    let confirmStop!: () => void;
+    (mock.provider.cancel as ReturnType<typeof vi.fn>).mockImplementationOnce(() => new Promise<void>((resolve) => { confirmStop = resolve; }));
+    const stopping = runtime.stopAndSendPendingMessages(['stop-C', 'stop-B'], 'stop-click');
+    const duplicate = runtime.stopAndSendPendingMessages(['stop-C', 'stop-B'], 'stop-click-replayed');
+    expect(duplicate).toBe(stopping);
+    await flushDispatch();
+    expect(mock.provider.cancel).toHaveBeenCalledOnce();
+    expect(mock.provider.send).toHaveBeenCalledTimes(1);
+    expect(runtime.send('new during stop', 'stop-D')).toBe('queued');
+    await expect(runtime.stopAndSendPendingMessages(['stop-B', 'stop-C', 'stop-D'], 'second-click'))
+      .resolves.toMatchObject({ status: 'retry' });
+    confirmStop();
+    await expect(stopping).resolves.toMatchObject({ status: 'stopped_and_dispatched' });
+    await waitForProviderSendCount(mock.provider, 2);
+    expect(mock.provider.send).toHaveBeenLastCalledWith('sess-1', expect.objectContaining({ userMessage: 'B\n\nC' }));
+    expect(runtime.pendingEntries.map((entry) => entry.clientMessageId)).toEqual(['stop-D']);
+    await flushDispatch();
+    await expect(runtime.stopAndSendPendingMessages(['stop-B', 'stop-C'], 'reconnect-click'))
+      .resolves.toMatchObject({ status: 'already_delivered' });
+    expect(mock.provider.cancel).toHaveBeenCalledOnce();
+  });
+
+  it.each(['provider', 'attachments', 'control', 'refused'] as const)('Stop preserves pending rows and uses real cancel for %s append refusal', async (reason) => {
+    mock.provider.capabilities.activeDelegationNotification = AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE;
+    mock.provider.notifyActiveDelegation = vi.fn().mockResolvedValue(reason === 'refused'
+      ? AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE : AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+    if (reason === 'provider') mock.provider.capabilities.activeDelegationNotification = AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.UNSUPPORTED;
+    runtime.send('old turn', 'stop-kind-old');
+    await waitForProviderSendCount(mock.provider, 1);
+    await flushDispatch();
+    const text = reason === 'control' ? '/compact' : '待发送\n不丢失';
+    const attachments = reason === 'attachments' ? [{ id: 'fixture-owned', name: 'image.png', mimeType: 'image/png', path: '/owned/fixture.png' }] : undefined;
+    runtime.send(text, 'stop-kind-B', attachments as never);
+    await expect(runtime.stopAndSendPendingMessages(['stop-kind-B'], 'stop-kind-click'))
+      .resolves.toMatchObject({ status: 'stopped_and_dispatched' });
+    await waitForProviderSendCount(mock.provider, 2);
+    expect(mock.provider.cancel).toHaveBeenCalledOnce();
+    expect(mock.provider.send).toHaveBeenLastCalledWith('sess-1', expect.objectContaining({ userMessage: text,
+      ...(attachments ? { attachments } : {}),
+    }));
+    expect(getTransportQueueStore().hasDeliveryTombstone('deck_test_brain', 'stop-kind-B')).toBe(true);
+  });
+
+  it('Stop keeps the old turn running only after actual native admission', async () => {
+    mock.provider.capabilities.activeDelegationNotification = AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE;
+    mock.provider.notifyActiveDelegation = vi.fn().mockResolvedValue(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+    runtime.send('old turn', 'stop-native-old');
+    await waitForProviderSendCount(mock.provider, 1);
+    await flushDispatch();
+    runtime.send('B', 'stop-native-B');
+    await expect(runtime.stopAndSendPendingMessages(['stop-native-B'], 'stop-native-click'))
+      .resolves.toMatchObject({ status: 'delivered' });
+    expect(mock.provider.cancel).not.toHaveBeenCalled();
+    expect(mock.provider.send).toHaveBeenCalledTimes(1);
+    expect(runtime.pendingEntries).toEqual([]);
+  });
+
+  it('Stop without a strong provider capability requests priority cancel but never infers termination from its receipt', async () => {
+    delete mock.provider.cancelAndWait;
+    runtime.send('old turn', 'stop-no-proof-old');
+    await waitForProviderSendCount(mock.provider, 1);
+    await flushDispatch();
+    runtime.send('B', 'stop-no-proof-B');
+    await expect(runtime.stopAndSendPendingMessages(['stop-no-proof-B'], 'stop-no-proof-click'))
+      .rejects.toThrow('cannot confirm stop');
+    await flushDispatch();
+    expect(mock.provider.cancel).toHaveBeenCalledOnce();
+    expect(mock.provider.send).toHaveBeenCalledTimes(1);
+    expect(runtime.pendingEntries.map((entry) => entry.clientMessageId)).toEqual(['stop-no-proof-B']);
+    expect(getTransportQueueStore().hasDeliveryTombstone('deck_test_brain', 'stop-no-proof-B')).toBe(false);
+  });
+
+  it('Stop cancel failure never starts a conflicting turn or clears pending messages', async () => {
+    runtime.send('old turn', 'stop-fail-old');
+    await waitForProviderSendCount(mock.provider, 1);
+    await flushDispatch();
+    runtime.send('B', 'stop-fail-B');
+    (mock.provider.cancel as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new Error('cancel refused'));
+    await expect(runtime.stopAndSendPendingMessages(['stop-fail-B'], 'stop-fail-click')).rejects.toThrow('cancel refused');
+    expect(mock.provider.send).toHaveBeenCalledTimes(1);
+    expect(runtime.pendingEntries.map((entry) => entry.clientMessageId)).toEqual(['stop-fail-B']);
+    expect(getTransportQueueStore().readSnapshot('deck_test_brain').pendingMessageEntries.map((entry) => entry.clientMessageId)).toEqual(['stop-fail-B']);
+  });
+
+  it('failed strong Stop remains retryable without blocking priority approval or changing frozen IDs', async () => {
+    runtime.send('foreground', 'stop-retry-A');
+    await waitForProviderSendCount(mock.provider, 1);
+    await flushDispatch();
+    runtime.send('retained', 'stop-retry-B');
+    (mock.provider.cancel as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new Error('first stop failed'));
+    await expect(runtime.stopAndSendPendingMessages(['stop-retry-B'], 'stop-retry-click-1')).rejects.toThrow('first stop failed');
+    await runtime.respondApproval('priority-approval', true);
+    expect(mock.provider.respondApproval).toHaveBeenCalledWith('sess-1', 'priority-approval', true);
+    expect(mock.provider.send).toHaveBeenCalledTimes(1);
+    await expect(runtime.stopAndSendPendingMessages(['stop-retry-B'], 'stop-retry-click-2')).resolves.toMatchObject({ status: 'stopped_and_dispatched' });
+    await waitForProviderSendCount(mock.provider, 2);
+    expect(mock.provider.cancel).toHaveBeenCalledTimes(2);
+    expect(mock.provider.send).toHaveBeenLastCalledWith('sess-1', expect.objectContaining({ userMessage: 'retained' }));
+    expect(getTransportQueueStore().hasDeliveryTombstone('deck_test_brain', 'stop-retry-B')).toBe(true);
+  });
+
+  it('Stop rechecks authority and current edits/withdrawals after cancel admission', async () => {
+    runtime.send('old turn', 'stop-edited-old');
+    await waitForProviderSendCount(mock.provider, 1);
+    await flushDispatch();
+    runtime.send('B', 'stop-edited-B');
+    runtime.send('C', 'stop-edited-C');
+    let confirmStop!: () => void;
+    (mock.provider.cancel as ReturnType<typeof vi.fn>).mockImplementationOnce(() => new Promise<void>((resolve) => { confirmStop = resolve; }));
+    const stopping = runtime.stopAndSendPendingMessages(['stop-edited-B', 'stop-edited-C'], 'stop-edited-click');
+    await flushDispatch();
+    runtime.removePendingMessage('stop-edited-B');
+    runtime.editPendingMessage('stop-edited-C', 'C updated');
+    confirmStop();
+    await stopping;
+    await waitForProviderSendCount(mock.provider, 2);
+    expect(mock.provider.send).toHaveBeenLastCalledWith('sess-1', expect.objectContaining({ userMessage: 'C updated' }));
+    expect(mock.provider.send).toHaveBeenCalledTimes(2);
+  });
+
+  it('Stop preserves durable rows without a new turn when priority cancellation hangs', async () => {
+    runtime.send('foreground', 'stop-hang-A');
+    await waitForProviderSendCount(mock.provider, 1);
+    await flushDispatch();
+    runtime.send('must retain', 'stop-hang-B');
+    (mock.provider.cancel as ReturnType<typeof vi.fn>).mockReturnValueOnce(new Promise<void>(() => {}));
+    vi.useFakeTimers();
+    try {
+      const stopping = runtime.stopAndSendPendingMessages(['stop-hang-B'], 'stop-hang-click');
+      const rejected = expect(stopping).rejects.toThrow('Provider stop timed out');
+      await vi.advanceTimersByTimeAsync(5_001);
+      await rejected;
+      expect(mock.provider.send).toHaveBeenCalledTimes(1);
+      expect(runtime.pendingEntries.map((entry) => entry.clientMessageId)).toEqual(['stop-hang-B']);
+      expect(getTransportQueueStore().hasDeliveryTombstone('deck_test_brain', 'stop-hang-B')).toBe(false);
+      // A failed strong Stop must not later be converted into local success by
+      // the ordinary health watchdog or external-completion shortcuts.
+      expect(runtime.cancelStaleActiveTurnWithPending({ nowMs: Date.now() + 3_600_000, staleMs: 1 })).toBe(false);
+      expect(runtime.recoverSilentActiveTurn({ nowMs: Date.now() + 3_600_000, staleMs: 1 })).toBe(false);
+      expect(runtime.settleActiveDispatchFromExternalCompletion('stop-no-terminal')).toBe(false);
+      expect(mock.provider.send).toHaveBeenCalledTimes(1);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it.each(['timeout', 'proof-before-rejection'] as const)('failed Stop releases only on captured physical proof (%s), not a generic completion', async (timing) => {
+    runtime.send('foreground', 'stop-proof-A');
+    await waitForProviderSendCount(mock.provider, 1);
+    await flushDispatch();
+    runtime.send('B', 'stop-proof-B');
+    const confirmation = new ProviderStopConfirmation();
+    const target = {};
+    mock.provider.cancelAndWait = () => confirmation.confirm(target, async () => {
+      if (timing === 'proof-before-rejection') {
+        confirmation.complete(target);
+        throw new Error('request failed after physical stop');
+      }
+    }, () => true);
+    if (timing === 'timeout') vi.useFakeTimers();
+    try {
+      const stopping = runtime.stopAndSendPendingMessages(['stop-proof-B'], 'stop-proof-click');
+      const rejected = expect(stopping).rejects.toThrow(timing === 'timeout' ? /timed out/ : /request failed/);
+      if (timing === 'timeout') await vi.advanceTimersByTimeAsync(5_001);
+      await rejected;
+      if (timing === 'timeout') {
+        mock.fireComplete('sess-1');
+        mock.fireError('sess-1', { code: 'CONNECTION_LOST', message: 'generic disconnect', recoverable: true });
+        expect(mock.provider.send).toHaveBeenCalledTimes(1);
+        confirmation.complete({});
+        expect(mock.provider.send).toHaveBeenCalledTimes(1);
+        confirmation.complete(target);
+        await vi.advanceTimersByTimeAsync(0);
+      }
+    } finally { vi.useRealTimers(); }
+    await waitForProviderSendCount(mock.provider, 2);
+    expect(mock.provider.send).toHaveBeenLastCalledWith('sess-1', expect.objectContaining({ userMessage: 'B' }));
+    confirmation.complete(target);
+    await flushDispatch();
+    expect(mock.provider.send).toHaveBeenCalledTimes(2);
+    expect(runtime.pendingEntries).toEqual([]);
+  });
+
+  it('Stop never resends an ambiguous native append that succeeds after its wait expires', async () => {
+    mock.provider.capabilities.activeDelegationNotification = AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE;
+    let admit!: (result: typeof AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED) => void;
+    mock.provider.notifyActiveDelegation = vi.fn(() => new Promise((resolve) => { admit = resolve; }));
+    runtime.send('foreground', 'stop-late-A');
+    await waitForProviderSendCount(mock.provider, 1);
+    await flushDispatch();
+    runtime.send('late accepted', 'stop-late-B');
+    const emitted = timelineEmitterEmitMock;
+    vi.useFakeTimers();
+    try {
+      const stopping = runtime.stopAndSendPendingMessages(['stop-late-B'], 'stop-late-click');
+      const rejected = expect(stopping).rejects.toThrow('Native append admission timed out');
+      await vi.advanceTimersByTimeAsync(5_001);
+      await rejected;
+      expect(mock.provider.cancel).not.toHaveBeenCalled();
+      expect(mock.provider.send).toHaveBeenCalledTimes(1);
+      admit(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(getTransportQueueStore().hasDeliveryTombstone('deck_test_brain', 'stop-late-B')).toBe(true);
+      expect(emitted).toHaveBeenCalledWith('deck_test_brain', 'transport.queue.delivery', expect.objectContaining({ clientMessageId: 'stop-late-B' }), expect.anything());
+      await expect(runtime.stopAndSendPendingMessages(['stop-late-B'], 'stop-late-reconnect')).resolves.toMatchObject({ status: 'already_delivered' });
+      expect(mock.provider.notifyActiveDelegation).toHaveBeenCalledOnce();
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('Stop rechecks pending authority after cancel instead of dispatching revoked work', async () => {
+    runtime.send('foreground', 'stop-revoke-A');
+    await waitForProviderSendCount(mock.provider, 1);
+    await flushDispatch();
+    runtime.send('revoked work', 'stop-revoke-B');
+    let authorized = true;
+    runtime.pendingDrainAdmission = () => authorized ? 'authorized' : 'stale';
+    (mock.provider.cancel as ReturnType<typeof vi.fn>).mockImplementationOnce(async () => { authorized = false; });
+    await expect(runtime.stopAndSendPendingMessages(['stop-revoke-B'], 'stop-revoke-click')).resolves.toMatchObject({ status: 'not_found' });
+    expect(mock.provider.send).toHaveBeenCalledTimes(1);
+    expect(getTransportQueueStore().hasDeliveryTombstone('deck_test_brain', 'stop-revoke-B')).toBe(false);
+  });
+
+  it('refused native admission does not resurrect an unrelated queue withdrawal', async () => {
+    mock.provider.capabilities.activeDelegationNotification = AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE;
+    let refuse!: (result: typeof AGENT_DELEGATION_NOTIFICATION_RESULTS.UNSUPPORTED) => void;
+    mock.provider.notifyActiveDelegation = vi.fn(() => new Promise((resolve) => { refuse = resolve; }));
+    runtime.send('foreground', 'withdraw-foreground');
+    await waitForProviderSendCount(mock.provider, 1);
+    await flushDispatch();
+    runtime.send('ordinary Q', 'withdraw-Q');
+    runtime.send('append B', 'withdraw-B', undefined, undefined, { deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND });
+    await flushDispatch();
+    expect(runtime.removePendingMessage('withdraw-Q')).not.toBeNull();
+    refuse(AGENT_DELEGATION_NOTIFICATION_RESULTS.UNSUPPORTED);
+    await flushDispatch();
+    expect(runtime.pendingEntries.map((entry) => entry.clientMessageId)).toEqual(['withdraw-B']);
+    expect(getTransportQueueStore().readSnapshot('deck_test_brain').pendingMessageEntries.map((entry) => entry.clientMessageId)).toEqual(['withdraw-B']);
+  });
+
   it('buffers immediate B/C appends until provider.send confirms A admission, then injects next in order', async () => {
     mock.provider.capabilities.activeDelegationNotification = AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE;
     mock.provider.notifyActiveDelegation = vi.fn().mockResolvedValue(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
@@ -1356,8 +1639,8 @@ describe('TransportSessionRuntime', () => {
     }));
 
     expect(runtime.send('A', 'msg-A')).toBe('sent');
-    await expect(runtime.appendExternalMessageToActiveTurn('B', 'msg-B')).resolves.toBe('appended');
-    await expect(runtime.appendExternalMessageToActiveTurn('C', 'msg-C')).resolves.toBe('appended');
+    await expect(runtime.appendExternalMessageToActiveTurn('B', 'msg-B')).resolves.toBe('queued');
+    await expect(runtime.appendExternalMessageToActiveTurn('C', 'msg-C')).resolves.toBe('queued');
 
     // Context assembly is deliberately blocked: provider.send/query has not
     // started, yet receipt is immediate and neither append was demoted into a
@@ -1905,7 +2188,7 @@ describe('TransportSessionRuntime', () => {
     })).toBe('queued');
     await flushDispatch();
 
-    expect(mock.provider.notifyActiveDelegation).toHaveBeenCalledOnce();
+    expect(mock.provider.notifyActiveDelegation).toHaveBeenCalledTimes(2);
     expect(runtime.pendingEntries).toEqual([
       { clientMessageId: 'auto-append-B', text: 'B' },
       { clientMessageId: 'auto-append-C', text: 'C' },

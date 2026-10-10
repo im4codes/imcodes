@@ -1,3 +1,4 @@
+import { readQueueDeliveryPolicy, type TransportAppendFallbackReason } from '../../shared/session-send-delivery.js';
 import { resolveImcodesHome } from '../util/windows-daemon-lock.js';
 import { createRequire } from 'node:module';
 import { dirname, join } from 'node:path';
@@ -250,6 +251,7 @@ function parseStoredEntry(row: Record<string, unknown>): QueueStoredEntry {
     queueAuthorityId: requireNonEmpty(String(row.queueAuthorityId ?? ''), 'row.queueAuthorityId'),
     clientMessageId: requireNonEmpty(String(row.clientMessageId ?? ''), 'row.clientMessageId'),
     ...(readString(row.commandId) ? { commandId: readString(row.commandId) } : {}),
+    ...readQueueDeliveryPolicy(row),
     text: String(row.text ?? ''),
     status: String(row.status ?? 'queued') as QueueStoredEntry['status'],
     placement: String(row.placement ?? 'normal') as QueuePlacement,
@@ -1057,6 +1059,29 @@ export class TransportQueueStore {
       WHERE session_name = ? AND client_message_id = ? AND ${gate.sql}
     `).get(sessionName, clientMessageId, ...gate.params) as { materialJson?: string } | undefined;
     return readString(row?.materialJson);
+  }
+
+  /** Projection-only policy change after a definitive native refusal. */
+  markAppendFallback(
+    sessionName: string, clientMessageId: string, reason: TransportAppendFallbackReason,
+    recipient: QueueRecipientIdentity | null = null,
+  ): void {
+    const gate = this.recipientPredicate(normalizeQueueRecipient(recipient));
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const material = this.readPrivateDispatchMaterial(sessionName, clientMessageId, recipient);
+      const parsed = material ? JSON.parse(material) as Record<string, unknown> : undefined;
+      if (parsed && parsed.appendFallbackReason !== reason) {
+        parsed.appendFallbackReason = reason;
+        this.db.prepare(`UPDATE queue_private_material SET material_json = ? WHERE session_name = ? AND client_message_id = ? AND ${gate.sql}`)
+          .run(JSON.stringify(parsed), sessionName, clientMessageId, ...gate.params);
+        this.bumpVersion(sessionName);
+      }
+      this.db.exec('COMMIT');
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
   }
 
   /**
@@ -2443,10 +2468,15 @@ export class TransportQueueStore {
         e.handoff_started_at AS handoffStartedAt,
         e.handoff_expires_at AS handoffExpiresAt,
         e.handoff_attempt AS handoffAttempt,
-        e.private_material_ref AS privateMaterialRef
+        e.private_material_ref AS privateMaterialRef,
+        CASE WHEN json_valid(p.material_json) THEN json_extract(p.material_json, '$.deliveryMode') END AS deliveryMode,
+        CASE WHEN json_valid(p.material_json) THEN json_extract(p.material_json, '$.appendFallbackReason') END AS appendFallbackReason
         , e.supervision_reference_json AS supervisionReferenceJson
       FROM queue_entries e
       JOIN queue_meta m ON m.session_name = e.session_name
+      LEFT JOIN queue_private_material p ON p.session_name = e.session_name AND p.client_message_id = e.client_message_id
+        AND p.recipient_session_instance_id IS e.recipient_session_instance_id
+        AND p.recipient_runtime_epoch IS e.recipient_runtime_epoch
       WHERE e.session_name = ?
         ${rowGateSql ? `AND ${rowGateSql}` : ''}
       ORDER BY CASE e.placement WHEN 'front' THEN 0 ELSE 1 END, e.ordinal, e.created_at, e.client_message_id

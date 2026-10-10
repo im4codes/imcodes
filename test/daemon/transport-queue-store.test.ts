@@ -46,6 +46,30 @@ afterEach(() => {
 });
 
 describe('TransportQueueStore', () => {
+  it('projects only whitelisted append policy from matching private material, including restart and fallback updates', () => {
+    const recipient = { sessionInstanceId: 'policy-instance', runtimeEpoch: 'policy-epoch' };
+    store.enqueue({ sessionName: 'policy-target', clientMessageId: 'policy-id', text: 'original', recipient,
+      privateMaterialJson: JSON.stringify({ text: 'original', deliveryMode: 'append', providerText: 'PRIVATE', sharedMachineAuthority: 'PRIVATE' }) });
+    const before = store.readSnapshotForRecipient('policy-target', recipient);
+    expect(before.pendingMessageEntries[0]).toMatchObject({ deliveryMode: 'append', text: 'original' });
+    expect(JSON.stringify(before)).not.toContain('PRIVATE');
+    const lease = store.markHandoffInFlight('policy-target', ['policy-id'], undefined, undefined, recipient);
+    store.releaseHandoff('policy-target', lease[0]!.handoffId, ['policy-id']);
+    store.markAppendFallback('policy-target', 'policy-id', 'unsupported', recipient);
+    const fallback = store.readSnapshotForRecipient('policy-target', recipient);
+    expect(fallback.pendingMessageEntries[0]).toMatchObject({ deliveryMode: 'append', appendFallbackReason: 'unsupported' });
+    expect(fallback.pendingMessageVersion).toBeGreaterThan(before.pendingMessageVersion);
+    expect(store.readSnapshotForRecipient('policy-target', { ...recipient, runtimeEpoch: 'new-epoch' }).pendingMessageEntries).toEqual([]);
+    store.close();
+    store = new TransportQueueStore({ dbPath: join(dir, 'queue.sqlite') });
+    expect(store.readSnapshotForRecipient('policy-target', recipient).pendingMessageEntries[0]).toMatchObject({ deliveryMode: 'append', appendFallbackReason: 'unsupported' });
+    store.enqueue({ sessionName: 'policy-target', clientMessageId: 'unknown-policy', text: 'safe', recipient,
+      privateMaterialJson: JSON.stringify({ text: 'safe', deliveryMode: 'future', appendFallbackReason: 'future' }) });
+    const unknown = store.readSnapshotForRecipient('policy-target', recipient).pendingMessageEntries.find((entry) => entry.clientMessageId === 'unknown-policy');
+    expect(unknown).not.toHaveProperty('deliveryMode');
+    expect(unknown).not.toHaveProperty('appendFallbackReason');
+  });
+
   it('resolves the default database from the isolated home at construction time', () => {
     const isolatedHome = mkdtempSync(join(tmpdir(), 'imcodes-queue-home-'));
     const previous = {

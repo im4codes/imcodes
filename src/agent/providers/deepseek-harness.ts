@@ -1,3 +1,4 @@
+import { ProviderStopConfirmation, preserveProviderStopProof } from '../provider-stop-confirmation.js';
 /**
  * DeepSeek Harness (`dsh`) transport provider.
  *
@@ -143,6 +144,7 @@ interface DeepseekHarnessSessionState {
    */
   committedSegments: string[];
   turnActive: boolean;
+  turnGeneration: number;
   cancelled: boolean;
   /** Tool names captured on tool/call, replayed onto the matching tool/result. */
   toolNames: Map<string, string>;
@@ -261,6 +263,7 @@ export class DeepseekHarnessProvider implements TransportProvider {
       currentMessageId: null,
       committedSegments: [],
       turnActive: false,
+      turnGeneration: 0,
       cancelled: false,
       toolNames: new Map(),
       sessionSystemTextInjected: existing?.sessionSystemTextInjected,
@@ -358,6 +361,7 @@ export class DeepseekHarnessProvider implements TransportProvider {
     // Announce work BEFORE the child is up: a first turn pays the harness's
     // own dependency bootstrap, and the session should not look idle for it.
     this.emitStatus(sessionId, state, { status: 'working', label: null });
+    state.turnGeneration++;
     await this.ensureChild(state);
     state.currentText = '';
     state.committedSegments = [];
@@ -392,6 +396,20 @@ export class DeepseekHarnessProvider implements TransportProvider {
     return this.write(state, { type: DSH_BRIDGE_COMMAND.STEER, text: notification.text })
       ? AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED
       : AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE;
+  }
+
+  private readonly stopConfirmations = new ProviderStopConfirmation();
+
+  cancelAndWait(sessionId: string): Promise<void> {
+    const state = this.sessions.get(sessionId);
+    const child = state?.child;
+    if (!state || !child) return Promise.reject(new Error('Provider child unavailable for Stop'));
+    const onExit = () => this.stopConfirmations.complete(child);
+    child.once('exit', onExit);
+    const generation = state.turnGeneration;
+    const operation = this.stopConfirmations.confirm(child, () => this.cancel(sessionId),
+      () => this.sessions.get(sessionId) === state && state.turnGeneration === generation);
+    return preserveProviderStopProof(operation, operation.finally(() => child.removeListener('exit', onExit)));
   }
 
   async cancel(sessionId: string): Promise<void> {
@@ -566,9 +584,11 @@ export class DeepseekHarnessProvider implements TransportProvider {
       if (wasActive) this.failSession(state, reason);
     };
     child.on('exit', (code, signal) => {
+      this.stopConfirmations.complete(child);
       onGone(`dsh exited (code=${code ?? 'null'} signal=${signal ?? 'null'})`);
     });
     child.on('close', (code, signal) => {
+      this.stopConfirmations.complete(child);
       onGone(`dsh closed (code=${code ?? 'null'} signal=${signal ?? 'null'})`);
     });
 
@@ -776,6 +796,7 @@ export class DeepseekHarnessProvider implements TransportProvider {
         return;
       }
       case DSH_BRIDGE_EVENT.TURN_END:
+        if (state.child) this.stopConfirmations.complete(state.child);
         this.finishTurn(state, event.reason, event.message, event.code);
         return;
       case DSH_BRIDGE_EVENT.ERROR: {

@@ -1,3 +1,4 @@
+import { confirmPromiseStop, bindCapturedChildStop, confirmCapturedChildExit } from '../provider-stop-confirmation.js';
 import { randomUUID } from 'node:crypto';
 import { backpressureYield } from '../../util/event-loop-backpressure.js';
 import { access } from 'node:fs/promises';
@@ -961,6 +962,41 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     return AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED;
   }
 
+  private readonly querySettlements = new WeakMap<ReturnType<typeof query>, Promise<void>>();
+  private readonly confirmedCancelOperations = new Map<string, Promise<void>>();
+
+  /** Strong Stop proof is the captured query ending or its actual child exit. */
+  cancelAndWait(sessionId: string): Promise<void> {
+    const existing = this.confirmedCancelOperations.get(sessionId);
+    if (existing) return existing;
+    const state = this.sessions.get(sessionId);
+    const activeQuery = state?.currentQuery;
+    if (!state || !activeQuery) return Promise.reject(new Error('Claude has no captured query to confirm stop'));
+    const generation = state.turnGeneration;
+    const settlement = this.querySettlements.get(activeQuery);
+    if (!settlement) return Promise.reject(new Error('Claude query settlement unavailable'));
+    const child = state.currentChild;
+    let removeExitListener = () => {};
+    const terminal = child ? Promise.race([
+      settlement,
+      new Promise<void>((resolve) => {
+        if (child.exitCode !== null || child.signalCode !== null) { resolve(); return; }
+        const onExit = () => resolve();
+        child.once('exit', onExit);
+        removeExitListener = () => child.removeListener('exit', onExit);
+      }),
+    ]) : settlement;
+    const operation = confirmPromiseStop(activeQuery, terminal, () => this.cancel(sessionId),
+      () => this.sessions.get(sessionId) === state && state.turnGeneration === generation);
+    if (child) bindCapturedChildStop(child, operation);
+    this.confirmedCancelOperations.set(sessionId, operation);
+    void operation.finally(() => {
+      removeExitListener();
+      if (this.confirmedCancelOperations.get(sessionId) === operation) this.confirmedCancelOperations.delete(sessionId);
+    }).catch(() => {});
+    return operation;
+  }
+
   async cancel(sessionId: string): Promise<void> {
     const state = this.sessions.get(sessionId);
     if (!state) return;
@@ -1100,6 +1136,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
       // registration and `release()` awaits it.
       state.agentResource = bindAgentProcessResource(state.resourceOwner ?? null, child);
       child.once('exit', () => {
+        confirmCapturedChildExit(child);
         if (state.currentChild === child) state.currentChild = null;
       });
       child.on('error', (err) => {
@@ -1140,7 +1177,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     const q = query({ prompt: inputQueue, options: options as any });
     const turnGeneration = ++state.turnGeneration;
     state.currentQuery = q;
-    void this.consumeQuery(
+    const settlement = this.consumeQuery(
       sessionId,
       state,
       q,
@@ -1152,6 +1189,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
       authRefreshRetriesRemaining,
       credentialsMtimeMs,
     );
+    this.querySettlements.set(q, settlement);
   }
 
   private async consumeQuery(

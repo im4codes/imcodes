@@ -1,3 +1,4 @@
+import { ProviderStopConfirmation } from '../provider-stop-confirmation.js';
 import { randomUUID } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import path from 'node:path';
@@ -878,6 +879,17 @@ export class CopilotSdkProvider implements TransportProvider {
     return this.makeError(PROVIDER_ERROR_CODES.PROVIDER_ERROR, `Copilot compact failed: ${message}`, false, error);
   }
 
+  private readonly stopConfirmations = new ProviderStopConfirmation();
+
+  cancelAndWait(sessionId: string): Promise<void> {
+    const state = this.getSessionState(sessionId);
+    if (!state) return Promise.reject(new Error('Copilot session unavailable for Stop'));
+    const session = state.session;
+    const generation = state.activeTurnGeneration;
+    return this.stopConfirmations.confirm(session, () => this.cancel(sessionId),
+      () => this.getSessionState(sessionId) === state && state.activeTurnGeneration === generation);
+  }
+
   async cancel(sessionId: string): Promise<void> {
     const state = this.getSessionState(sessionId);
     if (!state) return;
@@ -1021,7 +1033,11 @@ export class CopilotSdkProvider implements TransportProvider {
     state.unsubscribes.forEach((fn) => fn());
     state.unsubscribes = [];
     const generation = ++state.generation;
-    const unsubscribe = state.session.on((event: Record<string, any>) => {
+    const session = state.session;
+    const unsubscribe = session.on((event: Record<string, any>) => {
+      // The captured SDK session owns this terminal, including a terminal
+      // arriving while cancellation rotates its poisoned routing state.
+      if (event.type === 'session.idle') this.stopConfirmations.complete(session);
       if (!this.isCurrentGeneration(state, generation)) return;
       this.handleSessionEvent(state, generation, event);
     });

@@ -1,3 +1,4 @@
+import type { QueueDeliveryPolicy } from './session-send-delivery.js';
 export type QueueEntryStatus =
   | 'queued'
   | 'handoff_inflight'
@@ -111,7 +112,7 @@ export interface QueueDispatchMaterial {
   sharedActor?: unknown;
 }
 
-export interface QueueStoredEntry {
+export interface QueueStoredEntry extends QueueDeliveryPolicy {
   sessionName: string;
   queueEpoch: string;
   queueAuthorityId: string;
@@ -139,7 +140,7 @@ export interface QueueStoredEntry {
   supervisionReference?: QueueSupervisionReference;
 }
 
-export interface QueueProjectionEntry {
+export interface QueueProjectionEntry extends QueueDeliveryPolicy {
   clientMessageId: string;
   text: string;
   status: QueueEntryStatus;
@@ -278,3 +279,15 @@ export const QUEUE_DROP_REASONS = new Set<QueueDropReason>([
   'session_removed',
   'private_material_missing',
 ]);
+
+/** Optional fields on priority session.cancel. Old peers keep real Stop. */
+export const TRANSPORT_STOP_QUEUE_FIELDS = {
+  IDS: 'stopAndSendPendingMessageIds',
+  OUTCOME: 'stopQueueOutcome',
+} as const;
+export const TRANSPORT_STOP_QUEUE_OUTCOMES = {
+  APPENDED: 'appended',
+  STOPPED_AND_DISPATCHED: 'stopped_and_dispatched',
+  ALREADY_DELIVERED: 'already_delivered',
+} as const;
+export const TRANSPORT_STOP_QUEUE_TIMEOUT_MS = 5_000;

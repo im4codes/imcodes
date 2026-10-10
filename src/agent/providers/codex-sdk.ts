@@ -1,3 +1,4 @@
+import { ProviderStopConfirmation } from '../provider-stop-confirmation.js';
 import { createHash } from 'node:crypto';
 import { gateChildStream } from '../../util/event-loop-backpressure.js';
 import { capContextPreservingPriority, joinSpanned, type PriorityPreservingCapMarkers, type SpannedText } from '../priority-preserving-context-cap.js';
@@ -764,6 +765,9 @@ async function readCodexAuthFingerprint(env: Record<string, string | undefined>)
     return null;
   }
 }
+
+/** A correlated JSON-RPC error proves refusal, unlike disconnect/timeout. */
+class CodexRpcResponseError extends Error {}
 
 class CodexMalformedRpcResponseError extends Error {
   constructor(
@@ -3078,6 +3082,7 @@ export class CodexSdkProvider implements TransportProvider {
       if (!latest || latest.runningTurnId !== turnId || latest.cancelled) {
         return AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE;
       }
+      if (error instanceof CodexRpcResponseError) return AGENT_DELEGATION_NOTIFICATION_RESULTS.UNSUPPORTED;
       throw error;
     }
     return AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED;
@@ -3087,6 +3092,56 @@ export class CodexSdkProvider implements TransportProvider {
     state.activeItemIds.clear();
     state.activeToolItemIds.clear();
     state.activeCompactionItemIds.clear();
+  }
+
+  private readonly confirmedCancelOperations = new Map<string, Promise<void>>();
+  private readonly confirmedCancelTerminals = new WeakMap<CodexSdkSessionState, { turnId: string | null; generation: number; acceptancePending: boolean; seen: Set<string> }>();
+  private readonly stopConfirmations = new ProviderStopConfirmation();
+
+  /** Stop-and-send needs a real terminal notification, not a local watchdog. */
+  cancelAndWait(sessionId: string): Promise<void> {
+    const existing = this.confirmedCancelOperations.get(sessionId);
+    if (existing) return existing;
+    const state = this.sessions.get(sessionId);
+    if (!state) return Promise.reject(new Error('Codex session disconnected before Stop'));
+    const generation = state.turnDispatchGeneration;
+    const terminals = { turnId: state.runningTurnId ?? null, generation, acceptancePending: state.turnStartInFlight, seen: new Set<string>() };
+    this.confirmedCancelTerminals.set(state, terminals);
+    const operation = this.stopConfirmations.confirm(terminals, () => this.confirmCancel(sessionId, terminals),
+      () => this.sessions.get(sessionId) === state && state.turnDispatchGeneration === generation);
+    this.confirmedCancelOperations.set(sessionId, operation);
+    void operation.finally(() => {
+      if (this.confirmedCancelOperations.get(sessionId) === operation) {
+        this.confirmedCancelOperations.delete(sessionId);
+      }
+    }).catch(() => {});
+    return operation;
+  }
+
+  private async confirmCancel(sessionId: string, terminals: { turnId: string | null; acceptancePending: boolean; seen: Set<string> }): Promise<void> {
+    const state = this.sessions.get(sessionId);
+    if (!state) throw new Error('Codex session disconnected before stop confirmation');
+    state.cancelled = true;
+    this.clearCancelTimer(state);
+    const deadline = Date.now() + CANCEL_INTERRUPT_TIMEOUT_MS;
+    // Acceptance can expose the id after Stop. startTurn must leave this
+    // operation in charge, rather than arming the ordinary local watchdog.
+    while ((state.turnStartInFlight || terminals.acceptancePending) && !state.runningTurnId) {
+      if (Date.now() >= deadline) throw new Error('Codex turn acceptance still pending');
+      if (this.sessions.get(sessionId) !== state) throw new Error('Codex session disconnected before stop confirmation');
+      await new Promise<void>((resolve) => setTimeout(resolve, 10));
+    }
+    const turnId = state.runningTurnId;
+    if (!turnId || !state.threadId) {
+      if (terminals.turnId && terminals.seen.has(terminals.turnId)) return;
+      throw new Error('Codex has no correlated turn to confirm stop');
+    }
+    terminals.turnId = turnId;
+    if (terminals.seen.has(turnId)) this.stopConfirmations.complete(terminals);
+    await this.request('turn/interrupt', { threadId: state.threadId, turnId }, CANCEL_INTERRUPT_TIMEOUT_MS);
+    // The shared confirmation waits for the parser's captured terminal source,
+    // not this interrupt RPC receipt. Its expired outward wait can still accept
+    // a late physical proof without reviving the cancelled start continuation.
   }
 
   async cancel(sessionId: string): Promise<void> {
@@ -3745,7 +3800,18 @@ export class CodexSdkProvider implements TransportProvider {
       // clobber an id already learned from streamed items/deltas with undefined,
       // or the turn-id guards below would start dropping live assistant text.
       const startedTurnId = readParamTurnId((result ?? {}) as Record<string, any>);
-      const terminalArrivedDuringStart = Boolean(startedTurnId && state.terminalDuringTurnStartIds.delete(startedTurnId));
+      const stopTarget = this.confirmedCancelTerminals.get(state);
+      if (stopTarget && stopTarget.generation === state.turnDispatchGeneration) stopTarget.acceptancePending = false;
+      if (startedTurnId && stopTarget && stopTarget.generation === state.turnDispatchGeneration) {
+        stopTarget.turnId = startedTurnId;
+        if (stopTarget.seen.has(startedTurnId)) {
+          this.stopConfirmations.complete(stopTarget);
+          state.terminalDuringTurnStartIds.add(startedTurnId);
+        }
+      }
+      const terminalArrivedDuringStart = Boolean(startedTurnId && (
+        state.terminalDuringTurnStartIds.delete(startedTurnId)
+      ));
       if (!terminalArrivedDuringStart) {
         if (startedTurnId) {
           state.completedTurnIds.delete(startedTurnId);
@@ -3765,7 +3831,7 @@ export class CodexSdkProvider implements TransportProvider {
       if (shouldInjectStableUpdate && state.pendingSessionSystemTextUpdate === desiredSessionSystemText) {
         state.pendingSessionSystemTextUpdateTurnId = state.runningTurnId;
       }
-      if (state.cancelled && state.runningTurnId) {
+      if (state.cancelled && state.runningTurnId && !this.confirmedCancelOperations.has(sessionId)) {
         await this.interruptRunningTurn(sessionId, state, state.runningTurnId);
       }
       if (state.runningTurnId) this.armRawChecklistPolling(sessionId, state);
@@ -4217,7 +4283,7 @@ export class CodexSdkProvider implements TransportProvider {
       if (!pending) return;
       this.pendingRequests.delete(msg.id);
       if (msg.error) {
-        pending.reject(new Error(msg.error.message ?? 'Codex app-server request failed'));
+        pending.reject(new CodexRpcResponseError(msg.error.message ?? 'Codex app-server request failed'));
       } else {
         pending.resolve(msg.result);
       }
@@ -5312,6 +5378,16 @@ export class CodexSdkProvider implements TransportProvider {
           runningTurnId: state.runningTurnId,
         }, 'Codex SDK ignored an uncorrelated interrupted notification while a newer turn is active');
         return;
+      }
+      const stopTarget = this.confirmedCancelTerminals.get(state);
+      if (stopTarget && stopTarget.generation !== state.turnDispatchGeneration) {
+        this.confirmedCancelTerminals.delete(state);
+      } else if (turnId && stopTarget) {
+        stopTarget.seen.add(turnId);
+        if (stopTarget.turnId === turnId) this.stopConfirmations.complete(stopTarget);
+        // This start continuation alone owns its terminal marker. Never keep
+        // adding ids for later generations through a completed Stop record.
+        if (state.turnStartInFlight) state.terminalDuringTurnStartIds.add(turnId);
       }
       this.clearIdleSettleTimer(state); // explicit turn/completed supersedes any pending idle settle
 

@@ -118,6 +118,19 @@ describe('PiProvider', () => {
     });
   }
 
+  it('confirms Stop only after the captured child agent terminal, not abort ACK', async () => {
+    const sessionId = await start();
+    await provider.send(sessionId, 'foreground');
+    let settled = false;
+    const stopping = provider.cancelAndWait(sessionId).then(() => { settled = true; });
+    await flush();
+    expect(child.written.some((command) => command.type === PI_RPC_COMMAND.ABORT)).toBe(true);
+    expect(settled).toBe(false);
+    child.emitFrame({ type: PI_RPC_FRAME.AGENT_SETTLED });
+    await stopping;
+    expect(settled).toBe(true);
+  });
+
   it('streams strict LF JSONL, tool lifecycle, usage and final completion', async () => {
     const sessionId = await start();
     await provider.send(sessionId, 'inspect this');

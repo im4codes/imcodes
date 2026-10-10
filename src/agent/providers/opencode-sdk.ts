@@ -1,3 +1,4 @@
+import { ProviderStopConfirmation } from '../provider-stop-confirmation.js';
 import { createHash, randomUUID } from 'node:crypto';
 import { createServer } from 'node:net';
 import { pathToFileURL } from 'node:url';
@@ -771,6 +772,19 @@ export class OpenCodeSdkProvider implements TransportProvider {
     return AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED;
   }
 
+  private readonly stopConfirmations = new ProviderStopConfirmation();
+
+  cancelAndWait(sessionId: string): Promise<void> {
+    const state = this.sessions.get(sessionId);
+    if (!state) return Promise.reject(new Error('OpenCode session unavailable for Stop'));
+    const providerSessionId = state.providerSessionId;
+    const generation = state.generation;
+    const cancelledGeneration = generation + (state.busy ? 1 : 0);
+    return this.stopConfirmations.confirm(state, () => this.cancel(sessionId),
+      () => this.sessions.get(sessionId) === state && state.providerSessionId === providerSessionId
+        && (state.generation === generation || state.generation === cancelledGeneration));
+  }
+
   async cancel(sessionId: string, options?: ProviderCancelOptions): Promise<void> {
     const state = this.sessions.get(sessionId);
     if (!state || !state.busy) return;
@@ -1057,6 +1071,7 @@ export class OpenCodeSdkProvider implements TransportProvider {
       case 'session.status': {
         const status = event.properties?.status;
         if (status?.type === 'idle') {
+          this.stopConfirmations.complete(state);
           this.completeOnce(state, 'session.status');
           return;
         }
@@ -1073,6 +1088,7 @@ export class OpenCodeSdkProvider implements TransportProvider {
         return;
       }
       case 'session.idle':
+        this.stopConfirmations.complete(state);
         this.completeOnce(state, 'session.idle');
         return;
       case 'session.error': {

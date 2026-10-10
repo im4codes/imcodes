@@ -375,7 +375,13 @@ export async function dispatchSessionMessage(
     }
     if (deliveryMode === MEMORY_MCP_SEND_DELIVERY_MODES.APPEND) {
       const appendExternal = runtime.appendExternalMessageToActiveTurn;
-      const commandPrivateMetadata = options.command ? { commandMode: true as const } : undefined;
+      const privateMetadata = {
+        timelineCommitted: options.suppressTimeline === true,
+        ...originMetadata(options),
+        ...(options.sharedActor ? { sharedActor: options.sharedActor } : {}),
+        ...(options.sharedMachineAuthority ? { sharedMachineAuthority: options.sharedMachineAuthority } : {}),
+      };
+      const commandPrivateMetadata = Object.keys(privateMetadata).length > 0 ? privateMetadata : undefined;
       const result = typeof appendExternal === 'function'
         ? commandPrivateMetadata
           ? await appendExternal.call(runtime, message, options.messageId, options.queueSupervisionReference, undefined, commandPrivateMetadata)
@@ -386,36 +392,19 @@ export async function dispatchSessionMessage(
       if (result === 'retry') {
         throw new Error('transport supervision authority temporarily unavailable');
       }
-      if (result !== 'sent' && result !== 'appended') {
+      if (result !== 'sent' && result !== 'appended' && result !== 'queued') {
         // Unsupported providers and active-turn races retain the old durable
         // delivery guarantee. Prefer append, but never drop a peer message.
-        const fallback = options.suppressTimeline
-          ? runtime.send(message, options.messageId, undefined, undefined, {
-              ...(options.sharedActor ? { sharedActor: options.sharedActor } : {}),
-        ...(options.sharedMachineAuthority ? { sharedMachineAuthority: options.sharedMachineAuthority } : {}),
-              timelineCommitted: true,
-              ...(options.queueSupervisionReference
-                ? { supervisionReference: options.queueSupervisionReference }
-                : {}),
-              ...originMetadata(options),
-            })
-          : options.sharedActor
-          ? runtime.send(message, options.messageId, undefined, undefined, {
-              sharedActor: options.sharedActor,
-              ...(options.sharedMachineAuthority ? { sharedMachineAuthority: options.sharedMachineAuthority } : {}),
-              ...(options.queueSupervisionReference
-                ? { supervisionReference: options.queueSupervisionReference }
-                : {}),
-              ...originMetadata(options),
-            })
-          : options.queueSupervisionReference
-          ? runtime.send(message, options.messageId, undefined, undefined, {
-              supervisionReference: options.queueSupervisionReference,
-              ...originMetadata(options),
-            })
-          : options.messageOrigin || options.command
-          ? runtime.send(message, options.messageId, undefined, undefined, originMetadata(options))
-          : runtime.send(message, options.messageId);
+        const fallback = runtime.send(message, options.messageId, undefined, undefined, {
+          deliveryMode,
+          ...(options.sharedActor ? { sharedActor: options.sharedActor } : {}),
+          ...(options.sharedMachineAuthority ? { sharedMachineAuthority: options.sharedMachineAuthority } : {}),
+          ...(options.suppressTimeline ? { timelineCommitted: true } : {}),
+          ...(options.queueSupervisionReference
+            ? { supervisionReference: options.queueSupervisionReference }
+            : {}),
+          ...originMetadata(options),
+        });
         if (fallback === 'sent' && !options.suppressTimeline) {
           emitStructuredTransportUserMessage(
             target.name,
@@ -432,7 +421,7 @@ export async function dispatchSessionMessage(
         }
         return fallback;
       }
-      if (!options.suppressTimeline) {
+      if (result !== 'queued' && !options.suppressTimeline) {
         emitStructuredTransportUserMessage(
           target.name,
           message,
@@ -441,7 +430,13 @@ export async function dispatchSessionMessage(
           options.messageOrigin,
         );
       }
-      return 'sent';
+      if (result === 'queued') {
+        timelineEmitter.emit(target.name, 'session.state', {
+          state: 'queued',
+          ...buildTransportQueueSnapshotPayload(target.name, 'send_tool'),
+        }, { source: 'daemon', confidence: 'high' });
+      }
+      return result === 'queued' ? 'queued' : 'sent';
     }
     const result = options.suppressTimeline
       ? runtime.send(message, options.messageId, undefined, undefined, {
@@ -575,7 +570,9 @@ export async function dispatchPeerAuditMessage(input: {
       : 'unsupported';
     // If it queues, the drain projects it: a daemon audit brief, not the
     // human's input. Unsupported providers retain the durable fallback.
-    const disposition = appendResult === 'sent' || appendResult === 'appended'
+    const disposition = appendResult === 'queued'
+      ? 'queued'
+      : appendResult === 'sent' || appendResult === 'appended'
       ? 'sent'
       : runtime.send(input.brief, messageId, undefined, undefined, metadata);
     const queueEpoch = disposition === 'queued'

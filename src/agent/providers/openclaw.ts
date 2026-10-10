@@ -1,3 +1,4 @@
+import { ProviderStopConfirmation, confirmPromiseStop, providerStopTerminal } from '../provider-stop-confirmation.js';
 /**
  * OpenClaw TransportProvider
  *
@@ -217,6 +218,22 @@ export class OpenClawProvider implements TransportProvider {
       });
       logger.info({ provider: this.id, ocKey }, 'agent RPC fallback succeeded');
     }
+  }
+
+  private readonly stopConfirmations = new ProviderStopConfirmation();
+
+  cancelAndWait(sessionId: string): Promise<void> {
+    const runs = [...this.runAccumulator.values()].filter((run) => run.sessionId === sessionId);
+    if (runs.length === 0) {
+      return this.cancel(sessionId).then(() => { throw new Error('OpenClaw has no captured active run to confirm Stop'); });
+    }
+    // One priority request, all captured run ids must physically terminate.
+    let request: Promise<void> | undefined;
+    const operations = runs.map((run) => this.stopConfirmations.confirm(run,
+      () => request ??= this.cancel(sessionId), () => true));
+    // Keep late physical run proof separate from each expired outward waiter.
+    return confirmPromiseStop(runs, Promise.all(operations.map(providerStopTerminal)),
+      () => Promise.all(operations).then(() => {}), () => true);
   }
 
   async cancel(sessionId: string): Promise<void> {
@@ -558,6 +575,7 @@ export class OpenClawProvider implements TransportProvider {
         const acc = this.runAccumulator.get(runId);
         this.toolStates.delete(runId);
         if (acc) {
+          this.stopConfirmations.complete(acc);
           this.runAccumulator.delete(runId);
           const message: AgentMessage = {
             id: acc.messageId,
@@ -577,6 +595,7 @@ export class OpenClawProvider implements TransportProvider {
       if (phase === 'error') {
         const acc = this.runAccumulator.get(runId);
         const sessionId = acc?.sessionId ?? sanitizeKey(payload.key ?? payload.sessionKey ?? runId);
+        if (acc) this.stopConfirmations.complete(acc);
         this.runAccumulator.delete(runId);
         this.toolStates.delete(runId);
         // Extract actual error message from OC data (e.g. "AI service overloaded", "OAuth token expired")

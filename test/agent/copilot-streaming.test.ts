@@ -69,6 +69,42 @@ describe('CopilotSdkProvider streaming accumulator', () => {
     copilotSdkRuntimeHooks.loadSdk = originalLoadSdk;
   });
 
+  it('confirms Stop only after the captured SDK session idle, not abort ACK', async () => {
+    const fake = makeFakeSdk();
+    copilotSdkRuntimeHooks.loadSdk = vi.fn().mockResolvedValue(fake.sdk);
+    const provider = new CopilotSdkProvider();
+    await provider.connect({ binaryPath: 'copilot' });
+    await provider.createSession({ sessionKey: 'route-stop-proof', cwd: '/tmp/project' });
+    await provider.send('route-stop-proof', 'foreground');
+    let settled = false;
+    const stopping = provider.cancelAndWait('route-stop-proof').then(() => { settled = true; });
+    await flush();
+    expect(settled).toBe(false);
+    fake.captured.handler!({ type: 'assistant.message', data: { content: 'not terminal' } });
+    await flush();
+    expect(settled).toBe(false);
+    fake.captured.handler!({ type: 'session.idle', data: {} });
+    await stopping;
+    expect(settled).toBe(true);
+    await provider.disconnect();
+  });
+
+  it('does not confirm an old Stop with the next run idle on the same SDK session', async () => {
+    const fake = makeFakeSdk();
+    copilotSdkRuntimeHooks.loadSdk = vi.fn().mockResolvedValue(fake.sdk);
+    const provider = new CopilotSdkProvider();
+    await provider.connect({ binaryPath: 'copilot' });
+    await provider.createSession({ sessionKey: 'route-stop-next-run', cwd: process.cwd() });
+    await provider.send('route-stop-next-run', 'old foreground');
+    const stopping = provider.cancelAndWait('route-stop-next-run');
+    const rejected = expect(stopping).rejects.toThrow('instance changed');
+    await flush();
+    await provider.send('route-stop-next-run', 'independent new foreground');
+    fake.captured.handler!({ type: 'session.idle', data: {} });
+    await rejected;
+    await provider.disconnect();
+  });
+
   it('resets the streaming accumulator across messages so a second message is not prefixed with the first', async () => {
     const fake = makeFakeSdk();
     copilotSdkRuntimeHooks.loadSdk = vi.fn().mockResolvedValue(fake.sdk);

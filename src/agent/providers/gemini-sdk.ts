@@ -1,3 +1,4 @@
+import { confirmPromiseStop } from '../provider-stop-confirmation.js';
 /**
  * GeminiSdkProvider — TransportProvider that drives `gemini --acp` over the
  * Agent Client Protocol (ACP, https://agentclientprotocol.com/).
@@ -660,6 +661,16 @@ export class GeminiSdkProvider implements TransportProvider {
     void this.startTurn(sessionId, state, payload);
   }
 
+  private readonly promptTerminals = new WeakMap<GeminiSdkSessionState, Promise<unknown>>();
+
+  cancelAndWait(sessionId: string): Promise<void> {
+    const state = this.sessions.get(sessionId);
+    const terminal = state && this.promptTerminals.get(state);
+    if (!state || !terminal) return Promise.reject(new Error('Gemini prompt terminal unavailable'));
+    return confirmPromiseStop(terminal, terminal, () => this.cancel(sessionId),
+      () => this.sessions.get(sessionId) === state && this.promptTerminals.get(state) === terminal);
+  }
+
   async cancel(sessionId: string): Promise<void> {
     const state = this.sessions.get(sessionId);
     if (!state?.acpSessionId || !state.promptInFlight || !this.connection) return;
@@ -873,10 +884,9 @@ export class GeminiSdkProvider implements TransportProvider {
 
       // Long-lived call — agent streams sessionUpdate notifications until this
       // resolves with { stopReason }.
-      const result: PromptResponse = await this.connection!.prompt({
-        sessionId: state.acpSessionId!,
-        prompt: promptBlocks,
-      });
+      const terminal = this.connection!.prompt({ sessionId: state.acpSessionId!, prompt: promptBlocks });
+      this.promptTerminals.set(state, terminal);
+      const result: PromptResponse = await terminal;
       this.settleTurn(sessionId, state, result.stopReason, includeSessionSystemText ? sessionSystemText : undefined);
     } catch (err) {
       state.promptInFlight = false;

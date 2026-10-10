@@ -1,3 +1,4 @@
+import { queuedUserMessageAttribution } from '../agent/transport-queued-user-message.js';
 /**
  * Handle commands from the web UI and inbound chat messages via ServerLink.
  * Commands arrive as JSON objects with a `type` field.
@@ -305,6 +306,8 @@ import { bindP2pCompiledWorkflow } from './p2p-workflow-bind.js';
 import { readP2pDiscussionWithOffset } from './p2p-workflow-discussion-offsets.js';
 import { DAEMON_COMMAND_TYPES } from '../../shared/daemon-command-types.js';
 import {
+  TRANSPORT_STOP_QUEUE_FIELDS,
+  TRANSPORT_STOP_QUEUE_OUTCOMES,
   TRANSPORT_QUEUE_APPEND_MAX_ENTRIES,
   TRANSPORT_QUEUE_COMMANDS,
 } from '../../shared/transport-queue-types.js';
@@ -3368,6 +3371,46 @@ async function handleSessionCancel(cmd: Record<string, unknown>, serverLink: Ser
     return;
   }
 
+  const selected = cmd[TRANSPORT_STOP_QUEUE_FIELDS.IDS];
+  if (selected !== undefined) {
+    const ids = Array.isArray(selected) ? [...new Set(selected.filter((id): id is string => typeof id === 'string' && !!id.trim()).map((id) => id.trim()))] : [];
+    const runtime = getTransportRuntime(sessionName);
+    if (!commandId || ids.length === 0 || ids.length > TRANSPORT_QUEUE_APPEND_MAX_ENTRIES
+      || !runtime?.stopAndSendPendingMessages) {
+      if (commandId) emitCommandAck(sessionName, commandId, 'error', 'Stop queue selection unavailable', serverLink);
+      return;
+    }
+    try {
+      if (runtime.recipientIdentity && runtime.adoptLegacyQueueRecipient?.() === false) {
+        throw new Error('Queued message ownership changed');
+      }
+      const result = await runtime.stopAndSendPendingMessages(ids, commandId);
+      if (getTransportRuntime(sessionName) !== runtime) throw new Error('Transport session instance changed');
+      if (result.status === 'delivered') emitActiveQueueAppendResult(sessionName, result);
+      const outcome = result.status === 'delivered' ? TRANSPORT_STOP_QUEUE_OUTCOMES.APPENDED
+        : result.status === TRANSPORT_STOP_QUEUE_OUTCOMES.STOPPED_AND_DISPATCHED || result.status === TRANSPORT_STOP_QUEUE_OUTCOMES.ALREADY_DELIVERED
+          ? result.status : undefined;
+      if (!outcome) throw new Error(`Stop queue admission not confirmed: ${result.status}`);
+      const snapshot = buildTransportQueueSnapshotPayload(sessionName, 'command_handler');
+      const extras = {
+        [TRANSPORT_STOP_QUEUE_FIELDS.OUTCOME]: outcome,
+        queueEpoch: snapshot.queueEpoch, queueAuthorityId: snapshot.queueAuthorityId,
+        pendingMessageVersion: snapshot.pendingMessageVersion,
+        pendingMessageEntries: snapshot.pendingMessageEntries,
+        failedMessageEntries: snapshot.failedMessageEntries,
+        queueReconcilesCommandId: commandId,
+      };
+      timelineEmitter.emit(sessionName, 'session.state', {
+        state: runtime.pendingCount > 0 ? 'queued' : (runtime.sending ? 'running' : 'idle'), ...snapshot,
+      }, { source: 'daemon', confidence: 'high' });
+      timelineEmitter.emit(sessionName, 'command.ack', { commandId, status: 'accepted', ...extras });
+      emitCommandAckReliable(serverLink, { sessionName, commandId, status: 'accepted', ...extras });
+    } catch (error) {
+      emitCommandAck(sessionName, commandId, 'error', describeTransportSendError(error), serverLink);
+    }
+    return;
+  }
+
   if (cancelTransportTurnNow(sessionName, commandId, serverLink)) return;
 
   const errMsg = 'Transport session unavailable';
@@ -5812,6 +5855,37 @@ async function handleUndoQueuedTransportMessage(cmd: Record<string, unknown>, se
   }
 }
 
+function emitActiveQueueAppendResult(sessionName: string, result: Extract<import('../agent/transport-session-runtime.js').AppendQueuedMessagesResult, { status: 'delivered' }>): void {
+  for (const entry of result.entries) {
+    supervisionAutomation.removeQueuedTaskIntent(sessionName, entry.clientMessageId);
+    const payload = {
+      text: entry.text,
+      commandId: entry.clientMessageId,
+      clientMessageId: entry.clientMessageId,
+      allowDuplicate: true,
+      // This row records an in-turn queue steer. It extends the currently
+      // supervised task and must not seed a second implicit run at idle.
+      queueAppended: true,
+      pendingMessageVersion: result.queueSnapshot.pendingMessageVersion,
+      ...queuedUserMessageAttribution(entry),
+    };
+    timelineEmitter.emit(
+      sessionName,
+      'user.message',
+      payload,
+      { source: 'daemon', confidence: 'high', eventId: `transport-user:${entry.clientMessageId}` },
+    );
+    persistTransportUserMessage(sessionName, entry.text, payload);
+  }
+  for (const fact of result.deliveryFacts) {
+    timelineEmitter.emit(sessionName, 'transport.queue.delivery', { ...fact }, {
+      source: 'daemon',
+      confidence: 'high',
+    });
+  }
+
+}
+
 async function handleAppendQueuedTransportMessages(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
   const sessionName = typeof cmd.sessionName === 'string' ? cmd.sessionName.trim() : '';
   const commandId = typeof cmd.commandId === 'string' && cmd.commandId.trim()
@@ -5979,34 +6053,7 @@ async function handleAppendQueuedTransportMessages(cmd: Record<string, unknown>,
       return;
     }
 
-    for (const entry of result.entries) {
-      supervisionAutomation.removeQueuedTaskIntent(sessionName, entry.clientMessageId);
-      const payload = {
-        text: entry.text,
-        commandId: entry.clientMessageId,
-        clientMessageId: entry.clientMessageId,
-        allowDuplicate: true,
-        // This row records an in-turn queue steer. It extends the currently
-        // supervised task and must not seed a second implicit run at idle.
-        queueAppended: true,
-        pendingMessageVersion: result.queueSnapshot.pendingMessageVersion,
-        ...(entry.sharedActor ? { sharedActor: entry.sharedActor } : {}),
-        ...(entry.aliasAudit ? { aliasAudit: entry.aliasAudit } : {}),
-      };
-      timelineEmitter.emit(
-        sessionName,
-        'user.message',
-        payload,
-        { source: 'daemon', confidence: 'high', eventId: `transport-user:${entry.clientMessageId}` },
-      );
-      persistTransportUserMessage(sessionName, entry.text, payload);
-    }
-    for (const fact of result.deliveryFacts) {
-      timelineEmitter.emit(sessionName, 'transport.queue.delivery', { ...fact }, {
-        source: 'daemon',
-        confidence: 'high',
-      });
-    }
+    emitActiveQueueAppendResult(sessionName, result);
     timelineEmitter.emit(sessionName, 'session.state', {
       state: runtime.pendingCount > 0 ? 'queued' : (runtime.sending ? 'running' : 'idle'),
       ...transportQueueSnapshotToPayload(result.queueSnapshot),

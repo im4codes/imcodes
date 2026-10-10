@@ -973,7 +973,7 @@ describe('Qoder SDK readiness and streaming fixtures', () => {
     expect(events.completions[0].message.content).toBe('next ok');
   });
 
-  it('uses local-abandon cancel and suppresses late events after generation rotation', async () => {
+  it('confirms query termination for Stop and suppresses late events after generation rotation', async () => {
     const p = await makeProvider();
     const route = await createReadySession(p);
     const events = collect(p);
@@ -989,7 +989,7 @@ describe('Qoder SDK readiness and streaming fixtures', () => {
 
     await p.send(route, 'hello');
     await vi.waitFor(() => expect(sdkMock.state.calls).toHaveLength(1));
-    await p.cancel(route);
+    await p.cancelAndWait(route);
     await vi.waitFor(() => expect(events.errors).toHaveLength(1));
 
     expect(sdkMock.state.interrupted).toBe(1);

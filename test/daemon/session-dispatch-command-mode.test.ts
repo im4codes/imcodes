@@ -56,19 +56,19 @@ describe('session dispatch command mode', () => {
 
   it('append: idle-start goes through appendExternalMessageToActiveTurn with the command marker', async () => {
     await dispatchSessionMessage(transport(), '/compact', { messageId: 'send_message_c1', ...AGENT, command: true } as never);
-    expect(mocks.appendExternal).toHaveBeenCalledWith('/compact', 'send_message_c1', undefined, undefined, { commandMode: true });
+    expect(mocks.appendExternal).toHaveBeenCalledWith('/compact', 'send_message_c1', undefined, undefined, { commandMode: true, ...AGENT, timelineCommitted: false });
   });
 
   it('counterexample: an ordinary append carries no command marker', async () => {
     await dispatchSessionMessage(transport(), 'plain', { messageId: 'send_message_c2', ...AGENT } as never);
-    expect(mocks.appendExternal).toHaveBeenCalledWith('plain', 'send_message_c2');
+    expect(mocks.appendExternal).toHaveBeenCalledWith('plain', 'send_message_c2', undefined, undefined, { ...AGENT, timelineCommitted: false });
   });
 
   it('append falling back to the FIFO keeps the marker on the queued copy', async () => {
     mocks.appendExternal.mockResolvedValue('unsupported');
     mocks.runtimeSend.mockReturnValue('queued');
     await expect(dispatchSessionMessage(transport(), 'raw', { messageId: 'send_message_c3', ...AGENT, command: true } as never)).resolves.toBe('queued');
-    expect(mocks.runtimeSend).toHaveBeenCalledWith('raw', 'send_message_c3', undefined, undefined, { ...AGENT, commandMode: true });
+    expect(mocks.runtimeSend).toHaveBeenCalledWith('raw', 'send_message_c3', undefined, undefined, { ...AGENT, commandMode: true, deliveryMode: 'append' });
   });
 
   it('explicit queue mode marks the runtime send', async () => {

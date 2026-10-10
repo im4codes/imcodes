@@ -1,3 +1,4 @@
+import { confirmPromiseStop } from '../provider-stop-confirmation.js';
 import { randomUUID } from 'node:crypto';
 
 import type {
@@ -504,7 +505,9 @@ export class QoderSdkProvider implements TransportProvider {
     // first prompt. Later priority:'next' messages use this same live stream.
     const query = this.sdk.query({ prompt: input, options: queryOptions.options });
     state.activeQuery = query;
-    void this.consumeQuery(sessionId, state, generation, query).catch((err) => {
+    const terminal = this.consumeQuery(sessionId, state, generation, query);
+    this.queryTerminals.set(query, terminal);
+    void terminal.catch((err) => {
       if (state.activeGeneration !== generation || state.cancelled) return;
       this.finishWithError(sessionId, state, generation, this.normalizeQoderError(err));
     });
@@ -597,6 +600,18 @@ export class QoderSdkProvider implements TransportProvider {
     const resolve = state.resolveActiveTurnSettled;
     state.resolveActiveTurnSettled = null;
     resolve?.();
+  }
+
+  private readonly queryTerminals = new WeakMap<QoderQuery, Promise<void>>();
+
+  cancelAndWait(sessionId: string): Promise<void> {
+    const state = this.sessions.get(sessionId);
+    const query = state?.activeQuery;
+    const terminal = query && this.queryTerminals.get(query);
+    if (!state || !terminal) return Promise.reject(new Error('Qoder query terminal unavailable'));
+    const generation = state.activeGeneration;
+    return confirmPromiseStop(terminal, terminal, () => this.cancel(sessionId),
+      () => this.sessions.get(sessionId) === state && state.activeGeneration === generation);
   }
 
   async cancel(sessionId: string): Promise<void> {
