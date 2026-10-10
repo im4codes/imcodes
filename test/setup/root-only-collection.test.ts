@@ -3,7 +3,8 @@ import { globSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import config from '../../vitest.config.js';
 import serverConfig from '../../server/vitest.config.js';
-import { rootOnlyRuntimeDependencies, runtimeImports } from '../helpers/root-only-runtime-imports.js';
+import { execFileSync } from 'node:child_process';
+import { runtimeImports } from '../helpers/root-only-runtime-imports.js';
 
 const root = fileURLToPath(new URL('../..', import.meta.url));
 const daemon = config.test!.projects![0] as { test: { include: string[]; exclude: string[] } };
@@ -11,6 +12,15 @@ const rootServer = config.test!.projects![2] as { test: { include: string[]; exc
 const files = (test: { include?: string[]; exclude?: string[] }) => globSync(test.include!, {
   cwd: root, exclude: test.exclude,
 }).map(file => file.replaceAll('\\', '/'));
+
+// Keep the whole-graph AST allocation outside a reused test worker (and its V8
+// coverage instrumentation). This is one pure analysis child, NOT a nested suite.
+const rootOnlyRuntimeDependencies = (root: string, entries: string[]) => JSON.parse(execFileSync(
+  process.execPath,
+  ['--max-old-space-size=512', '--import', 'tsx',
+    fileURLToPath(new URL('../helpers/root-only-runtime-import-worker.ts', import.meta.url))],
+  { cwd: root, input: JSON.stringify({ root, entries }), encoding: 'utf8', timeout: 15_000, maxBuffer: 1024 * 1024 },
+)) as { missing: { specifier: string; file: string }[]; files: number; serverFiles: number };
 
 describe('root-only daemon collection boundary', () => {
   it('all actual daemon entries resolve their static server dependencies from root alone', () => {
