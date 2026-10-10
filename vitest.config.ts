@@ -37,6 +37,9 @@ export default defineConfig({
           exclude: ['test/e2e/**', 'test/**/*.integration.test.ts', HARNESS_OWNED_PROBE_FIXTURES, '**/node_modules/**'],
           environment: 'node',
           globals: false,
+          // Result-update IPC needs a real event-loop turn between synchronous
+          // fixtures, independently of test/hookTimeout. Keep stock semantics.
+          runner: './test/setup/cooperative-runner.ts',
           // Runs before each test file is imported, which is the only point
           // early enough: daemon modules resolve ~/.imcodes paths at import
           // time (src/util/logger.ts even opens daemon.log there), so without
