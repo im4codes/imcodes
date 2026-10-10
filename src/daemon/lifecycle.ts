@@ -18,7 +18,7 @@ import { repoCache, RepoCache } from '../repo/cache.js';
 import { ServerLink, setServerLinkDisconnectSecurityHandler, setServerLinkReconnectResyncHandler } from './server-link.js';
 import { DaemonRemoteDesktop } from './remote-desktop-daemon.js';
 import { closeDaemonRemoteDesktop, refreshDaemonRemoteDesktop, setDaemonRemoteDesktop } from './remote-desktop-registry.js';
-import { handleWebCommand, setRouterContext, refreshCodexQuotaMetadata, refreshClaudeSdkSubQuotaMetadata } from './command-handler.js';
+import { handleWebCommand, setRouterContext, refreshCodexQuotaMetadata, refreshClaudeSdkSubQuotaMetadata, refreshAgyQuotaMetadataForSessions } from './command-handler.js';
 import { dispatchSessionMessageByName } from './session-dispatch.js';
 import { dispatchReadyAuditSweep } from './send-tool.js';
 import { initFileTransfer, startCleanupTimer } from './file-transfer-handler.js';
@@ -2631,6 +2631,10 @@ function startCodexQuotaPoller(serverLink: ServerLink | null): void {
     // subsession.sync to keep their 7d quota line fresh — mirrors the codex subs.
     void refreshClaudeSdkSubQuotaMetadata(serverLink).catch((err) => {
       logger.warn({ err }, 'Claude SDK sub-session quota refresh failed');
+    });
+    // agy-sdk sessions probe `agy --print /usage` (throttled to 15m by AGY_USAGE_CACHE_TTL_MS).
+    void refreshAgyQuotaMetadataForSessions(serverLink).catch((err) => {
+      logger.warn({ err }, 'Antigravity quota refresh failed');
     });
   }, CODEX_QUOTA_REFRESH_MS);
 }

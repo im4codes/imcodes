@@ -35,11 +35,13 @@ describe('parseAgyUsageTsv', () => {
     expect(gemini.primary).toEqual({
       windowDurationMins: 300,
       usedPercent: 6, // 100 - 94%
+      percentPrecision: 2,
       resetsAt: 1791666877, // 2026-10-10T21:14:37Z
     });
     expect(gemini.secondary).toEqual({
       windowDurationMins: 10080,
       usedPercent: 0, // 100 - 100%
+      percentPrecision: 2,
       resetsAt: 1792253677, // 2026-10-17T16:14:37Z
     });
 
@@ -49,13 +51,24 @@ describe('parseAgyUsageTsv', () => {
     expect(claudeGpt.primary).toEqual({
       windowDurationMins: 300,
       usedPercent: 20, // 100 - 80%
+      percentPrecision: 2,
       resetsAt: 1791666997, // 2026-10-10T21:16:37Z
     });
     expect(claudeGpt.secondary).toEqual({
       windowDurationMins: 10080,
       usedPercent: 11, // 100 - 89%
+      percentPrecision: 2,
       resetsAt: 1792253797, // 2026-10-17T16:16:37Z
     });
+  });
+
+  it('preserves up to 2 decimal places and formats with 2 decimal places', () => {
+    const decimalTsv = 'Gemini Models\tFive Hour Limit Remaining\t94.55%\t2026-10-10T21:14:37Z\n';
+    const meta = parseAgyUsageTsv(decimalTsv);
+    expect(meta?.groups?.[0].primary?.usedPercent).toBe(5.45);
+    expect(meta?.groups?.[0].primary?.percentPrecision).toBe(2);
+    const label = formatProviderQuotaLabel(meta);
+    expect(label).toContain('5.45%');
   });
 
   it('handles CRLF line endings identically to LF', () => {
@@ -94,6 +107,7 @@ describe('parseAgyUsageTsv', () => {
     expect(meta?.groups?.[0].primary).toEqual({
       windowDurationMins: 300,
       usedPercent: 6,
+      percentPrecision: 2,
       resetsAt: 1791666877,
     });
     expect(meta?.groups?.[0].secondary).toBeUndefined();
@@ -354,6 +368,6 @@ process.exit(1);
     expect(quota?.quotaMeta.groups).toHaveLength(2);
     expect(quota?.quotaLabel).toBeDefined();
     // One line label containing Gemini and Claude/GPT groups separated by ' | '
-    expect(quota?.quotaLabel).toMatch(/^Gemini 5h 6% .* · 7d 0% .* \| Claude\/GPT 5h 20% .* · 7d 11% /);
+    expect(quota?.quotaLabel).toMatch(/^Gemini 5h 6\.00% .* · 7d 0\.00% .* \| Claude\/GPT 5h 20\.00% .* · 7d 11\.00% /);
   });
 });

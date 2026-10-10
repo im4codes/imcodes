@@ -169,7 +169,10 @@ describe('session-live-status', () => {
       failedMessageEntries: [],
       source: 'test',
     });
-    expect(deriveSessionLiveStatus({ sessionState: 'idle', transportQueueState: liveQueueState }).busy).toBe(true);
+    const liveStatus = deriveSessionLiveStatus({ sessionState: 'idle', transportQueueState: liveQueueState });
+    expect(liveStatus.busy).toBe(true);
+    expect(liveStatus.mode).toBe('idle');
+    expect(liveStatus.visualMode).toBe('idle');
 
     const failedOnlyState = reduceTransportQueueEvent(createTransportQueueReducerState('deck'), {
       type: 'transport.queue.snapshot',

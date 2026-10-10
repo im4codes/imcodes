@@ -2,6 +2,7 @@ export interface ProviderQuotaWindow {
   usedPercent?: number;
   windowDurationMins?: number;
   resetsAt?: number;
+  percentPrecision?: number;
 }
 
 export interface ProviderQuotaGroup {
@@ -17,9 +18,13 @@ export interface ProviderQuotaMeta {
   groups?: ProviderQuotaGroup[];
 }
 
-function formatPercent(value: number | undefined): string | undefined {
+function formatPercent(value: number | undefined, precision?: number): string | undefined {
   if (typeof value !== 'number' || !Number.isFinite(value)) return undefined;
-  return `${Math.max(0, Math.min(100, Math.round(value)))}%`;
+  const clamped = Math.max(0, Math.min(100, value));
+  if (typeof precision === 'number' && precision >= 0) {
+    return `${clamped.toFixed(precision)}%`;
+  }
+  return `${Math.round(clamped)}%`;
 }
 
 function formatWindowDuration(value: number | undefined, fallback: string): string {
@@ -64,7 +69,7 @@ function formatQuotaWindow(
   // The percent is only known for some sources (Codex always; the token-free
   // Claude rate_limit_event omits it when healthy). Show it only when present
   // rather than a bare "—" placeholder.
-  const percent = formatPercent(window.usedPercent);
+  const percent = formatPercent(window.usedPercent, window.percentPrecision);
   if (percent) parts.push(percent);
   const remaining = formatRemainingTime(window.resetsAt, nowMs);
   if (remaining) parts.push(remaining);
@@ -129,7 +134,8 @@ export function formatProviderQuotaTitle(
 function quotaWindowEquals(a: ProviderQuotaWindow | null | undefined, b: ProviderQuotaWindow | null | undefined): boolean {
   return (a?.usedPercent ?? null) === (b?.usedPercent ?? null)
     && (a?.windowDurationMins ?? null) === (b?.windowDurationMins ?? null)
-    && (a?.resetsAt ?? null) === (b?.resetsAt ?? null);
+    && (a?.resetsAt ?? null) === (b?.resetsAt ?? null)
+    && (a?.percentPrecision ?? null) === (b?.percentPrecision ?? null);
 }
 
 function quotaGroupEquals(a: ProviderQuotaGroup, b: ProviderQuotaGroup): boolean {

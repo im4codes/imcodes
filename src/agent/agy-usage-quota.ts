@@ -122,7 +122,7 @@ export function parseAgyUsageTsv(stdout: string | null | undefined): ProviderQuo
     // Remaining percent -> used percent (100 - remaining, clamp 0..100)
     const remainingNum = parseFloat(percentStr.replace('%', '').trim());
     if (!Number.isFinite(remainingNum)) continue;
-    const usedPercent = Math.max(0, Math.min(100, Math.round(100 - remainingNum)));
+    const usedPercent = Math.max(0, Math.min(100, Math.round((100 - remainingNum) * 100) / 100));
 
     // Resets at -> epoch seconds
     const resetsAt = parseResetTimestamp(resetsAtStr);
@@ -130,6 +130,7 @@ export function parseAgyUsageTsv(stdout: string | null | undefined): ProviderQuo
     const quotaWindow: ProviderQuotaWindow = {
       windowDurationMins,
       usedPercent,
+      percentPrecision: 2,
       ...(resetsAt !== undefined ? { resetsAt } : {}),
     };
 

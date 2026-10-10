@@ -3109,7 +3109,8 @@ export class TransportSessionRuntime implements SessionRuntime {
     options: { allowDispatchAsNewTurn?: boolean } = {},
   ): Promise<AppendQueuedMessagesResult> {
     const ids = [...new Set(clientMessageIds.map((id) => id.trim()).filter(Boolean))];
-    if (ids.length === 0 || !this._providerSessionId) return { status: 'not_found' };
+    if (ids.length === 0) return { status: 'not_found' };
+    if (!this._providerSessionId) return { status: 'stale' };
     if (!this.hasActiveTurnWork()) {
       // No turn is actually running — it already settled (completion, error,
       // send-start timeout, stop, provider crash/restart) by the time this
@@ -3123,8 +3124,11 @@ export class TransportSessionRuntime implements SessionRuntime {
       // own careful authority/ownership checks and must keep its existing
       // "stale means defer to the normal idle-drain path" behavior unchanged
       // — it must not force an immediate out-of-turn dispatch.
-      if (options.allowDispatchAsNewTurn && this._drainPending()) {
-        return { status: 'dispatched_as_new_turn' };
+      if (options.allowDispatchAsNewTurn) {
+        if (this._drainPending()) {
+          return { status: 'dispatched_as_new_turn' };
+        }
+        return { status: 'deferred' };
       }
       return { status: 'stale' };
     }

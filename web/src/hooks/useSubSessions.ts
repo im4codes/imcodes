@@ -618,6 +618,11 @@ export function useSubSessions(
           return replaceAtIfChanged(prev, idx, {
             ...prev[idx],
             state: state as SubSession['state'],
+            ...(state === 'idle'
+              ? { authoritativeIdleAt: Date.now() }
+              : state === 'running'
+                ? { authoritativeIdleAt: undefined }
+                : {}),
             ...(statePayload?.activityGeneration !== undefined
               ? { activityGeneration: statePayload.activityGeneration as ActivityGenerationLike }
               : {}),
@@ -637,6 +642,11 @@ export function useSubSessions(
         next[idx] = {
           ...next[idx],
           state: state as SubSession['state'],
+          ...(state === 'idle'
+            ? { authoritativeIdleAt: Date.now() }
+            : state === 'running'
+              ? { authoritativeIdleAt: undefined }
+              : {}),
         };
         return next;
       });

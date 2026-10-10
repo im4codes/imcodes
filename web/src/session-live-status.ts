@@ -126,7 +126,7 @@ export function deriveSessionLiveStatus(input: SessionLiveStatusInput): SessionL
   const activeToolCall = input.activeToolCall === true;
   const pendingUserSend = input.pendingUserSend === true;
   const hasLiveQueue = input.transportQueueState ? selectSessionHasLiveQueue(input.transportQueueState) : false;
-  const activeTransportTurn = input.activeTransportTurn === true || hasLiveQueue;
+  const activeTransportTurn = input.activeTransportTurn === true;
   const stopRequested = input.stopRequested === true;
   const statusText = normalizeDetail(input.statusText);
   const activityDetail = normalizeDetail(input.transportActivityDetail);
@@ -156,7 +156,7 @@ export function deriveSessionLiveStatus(input: SessionLiveStatusInput): SessionL
   // running event completes a network/history round trip. This is deliberately
   // separate from generic thinking/tool tail evidence, which may be stale.
   const running = isRunningSessionState(state) || pendingUserSend;
-  const busy = stopping || running || activeThinking || activeToolCall || activeTransportTurn;
+  const busy = stopping || running || activeThinking || activeToolCall || activeTransportTurn || hasLiveQueue;
   const resultLike = isResultStatusText(statusText);
 
   let mode: SessionLiveStatusMode;

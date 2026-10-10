@@ -562,15 +562,26 @@ export class AgySdkProvider implements TransportProvider {
 
     if (stepType === AGY_STEP_TYPE.AGENT_RESPONSE) {
       const text = asString(step.text_delta);
-      // The DONE frame carries a trailing "\n" separator, not user-visible text.
-      if (!text || stepState === AGY_STEP_STATE.DONE) return;
+      // The DONE frame carries a trailing "\n" separator, not user-visible text,
+      // but only skip if the delta is actually empty/whitespace-only.
+      if (!text || (stepState === AGY_STEP_STATE.DONE && !text.trim())) return;
       const stepIndex = asNumber(step.step_index);
+      const prefix = state.conversationId ?? state.routeId;
       const targetMessageId = stepIndex !== undefined
-        ? `${state.conversationId ?? state.routeId}:step:${stepIndex}`
+        ? `${prefix}:step:${stepIndex}`
         : (state.currentMessageId ?? randomUUID());
       if (state.currentMessageId !== targetMessageId) {
+        // If the ID changed only because conversationId was learned mid-turn,
+        // preserve the accumulated text so the streaming prefix does not flicker/reset.
+        const onlyPrefixChanged = Boolean(
+          state.currentMessageId
+          && stepIndex !== undefined
+          && state.currentMessageId.endsWith(`:step:${stepIndex}`)
+        );
         state.currentMessageId = targetMessageId;
-        state.currentText = '';
+        if (!onlyPrefixChanged) {
+          state.currentText = '';
+        }
       }
       state.currentText += text;
       // Transport relay and web ChatView render delta.delta directly as the display
@@ -635,11 +646,27 @@ export class AgySdkProvider implements TransportProvider {
       return;
     }
 
-    const response = asString(result.response);
-    const content = (streamed && streamed.trim() ? streamed : (response && response.trim() ? response : streamed)).trimEnd();
+    const response = asString(result.response)?.trimEnd();
+    // Authoritative complete response from agy. If no tool was called, response is
+    // the single complete turn response. Prefer it over potentially truncated streaming text.
+    // When tools were called (multi-step), preserve the streamed step text unless empty.
+    const content = (!sawTool && response && response.trim()
+      ? response
+      : (streamed && streamed.trim() ? streamed : (response && response.trim() ? response : streamed))
+    ).trimEnd();
     if (!content && !sawTool) {
       this.emitError(sessionId, PROVIDER_ERROR_CODES.PROVIDER_ERROR, 'agy finished without producing a response', true);
       return;
+    }
+    // If final content has text that was not fully streamed, emit a catch-up delta before complete
+    if (content && content !== streamed) {
+      const catchupDelta: MessageDelta = {
+        messageId,
+        type: 'text',
+        delta: content,
+        role: 'assistant',
+      };
+      for (const cb of this.deltaCallbacks) cb(sessionId, catchupDelta);
     }
     const message: AgentMessage = {
       id: messageId,
