@@ -78,6 +78,8 @@ export default defineConfig({
             'server/test/admin.test.ts',
             'server/test/cron-api.test.ts',
             'server/test/job-dispatch.test.ts',
+            // Real server HTTP + daemon retry contract: server-native job installs both layers.
+            'server/test/daemon-token-version-skew.test.ts',
             '**/node_modules/**',
           ],
           environment: 'node',

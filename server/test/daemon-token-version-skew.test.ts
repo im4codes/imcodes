@@ -1,8 +1,11 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { buildApp } from '../../server/src/index.js';
-import { environment, headers } from '../../server/test/helpers/daemon-token-env.js';
+import { buildApp } from '../src/index.js';
+import { environment, headers } from './helpers/daemon-token-env.js';
 import { DAEMON_TOKEN_ROUTE_NOT_ALLOWED } from '../../shared/daemon-token-routes.js';
+// This daemon module has no imports or home/global side effects. Keep the
+// real HTTP+retry combination in the server-native suite, which installs both layers.
 import { createWorkerSessionSyncRetrier } from '../../src/daemon/worker-session-sync-retrier.js';
+import { advanceCappedWorkerSyncRetries, WORKER_SYNC_SCHEDULED_DELAYS } from '../../test/helpers/capped-worker-sync-retries.js';
 
 afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); });
 describe('older daemon calls fail clearly without a retry storm', () => {
@@ -23,11 +26,9 @@ describe('older daemon calls fail clearly without a retry storm', () => {
       logger: { warn: context => delays.push(context.delayMs as number) } });
     retry.start('old_server_skew');
     expect(request).not.toHaveBeenCalled();
-    for (const delay of [10_000, 10_000, 20_000, 40_000, 80_000, 160_000, 300_000, 300_000]) {
-      await vi.advanceTimersByTimeAsync(delay);
-    }
+    await advanceCappedWorkerSyncRetries(vi.advanceTimersByTimeAsync);
     expect(request).toHaveBeenCalledTimes(8);
-    expect(delays).toEqual([10_000, 10_000, 20_000, 40_000, 80_000, 160_000, 300_000, 300_000, 300_000]);
+    expect(delays).toEqual(WORKER_SYNC_SCHEDULED_DELAYS);
     retry.stop();
     await vi.advanceTimersByTimeAsync(3_600_000);
     expect(request).toHaveBeenCalledTimes(8);
