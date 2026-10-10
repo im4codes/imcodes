@@ -106,16 +106,6 @@ describe('agy-sdk helpers', () => {
     ]);
   });
 
-  it('reports memory MCP status ready or degraded', async () => {
-    const p = new AgySdkProvider();
-    await p.connect({});
-    const status = p.getMemoryMcpStatus();
-    expect(status.providerId).toBe('agy-sdk');
-    expect(status.connected).toBe(true);
-    // Under vitest without explicit path, auto-config is skipped under test -> degraded or ready
-    expect(['ready', 'degraded']).toContain(status.status);
-  });
-
   it('encodes one NDJSON user line', () => {
     const line = encodeAgyUserLine('hi\nthere');
     expect(line.endsWith('\n')).toBe(true);
@@ -176,6 +166,13 @@ describe('AgySdkProvider (fake agy process)', () => {
     expect(provider.capabilities.streaming).toBe(true);
     expect(provider.capabilities.sessionRestore).toBe(true);
     expect(provider.capabilities.approval).toBe(false);
+  });
+
+  it('reports memory MCP status ready or degraded', () => {
+    const status = provider.getMemoryMcpStatus();
+    expect(status.providerId).toBe(AGY_SDK_PROVIDER_ID);
+    expect(status.connected).toBe(true);
+    expect(['ready', 'degraded']).toContain(status.status);
   });
 
   it('streams deltas, completes the turn and reports the conversation id for resume', async () => {
