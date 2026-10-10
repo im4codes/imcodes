@@ -109,6 +109,28 @@ describe('parseAgyUsageTsv', () => {
     expect(meta?.groups?.[0].id).toBe('gemini');
   });
 
+  it('parses real multi-space column aligned output with local timezone and banner', () => {
+    const realOutput = [
+      'Quota:',
+      'Gemini Models          Weekly Limit Remaining     99%  2026-10-18 00:14 CST',
+      'Gemini Models          Five Hour Limit Remaining  89%  2026-10-11 05:14 CST',
+      'Claude and GPT models  Weekly Limit Remaining     84%  2026-10-18 00:16 CST',
+      'Claude and GPT models  Five Hour Limit Remaining  68%  2026-10-11 05:16 CST',
+    ].join('\n');
+    const meta = parseAgyUsageTsv(realOutput);
+    expect(meta).toBeDefined();
+    expect(meta?.groups).toHaveLength(2);
+    const [gemini, claudeGpt] = meta!.groups!;
+    expect(gemini.id).toBe('gemini');
+    expect(gemini.secondary?.usedPercent).toBe(1);
+    expect(gemini.primary?.usedPercent).toBe(11);
+    expect(gemini.primary?.resetsAt).toBeDefined();
+    expect(claudeGpt.id).toBe('claude-gpt');
+    expect(claudeGpt.secondary?.usedPercent).toBe(16);
+    expect(claudeGpt.primary?.usedPercent).toBe(32);
+    expect(claudeGpt.primary?.resetsAt).toBeDefined();
+  });
+
   it('appends unknown tiers after known groups in encounter order with slug ids', () => {
     const customTsv = [
       'Custom Reasoning Models\tFive Hour Limit Remaining\t50%\t2026-10-10T21:14:37Z',

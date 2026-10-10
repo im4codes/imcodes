@@ -37,6 +37,19 @@ import { execFileOffMain as execFileAsync } from '../../util/exec-helper.js';
 import { gateChildStream } from '../../util/event-loop-backpressure.js';
 import { composeMessageSideProviderPrompt } from '../provider-context-routing.js';
 import { normalizeTransportCwd, resolveExecutableForSpawn } from '../transport-paths.js';
+import {
+  ensureAgyMcpConfigHasImcodesEntry,
+  agyMcpEnsureOptionsFromConfig,
+  type AgyMcpEnsureResult,
+} from '../../daemon/agy-mcp-config.js';
+import { IMCODES_MEMORY_MCP_SERVER_NAME } from '../../../shared/memory-mcp-server-name.js';
+import { getDefaultMcpServers } from './getDefaultMcpServers.js';
+import {
+  MEMORY_MCP_PROVIDER_STATUS_REASON,
+  MEMORY_MCP_STATUS,
+  type MemoryMcpProviderStatusView,
+} from '../../../shared/memory-ws.js';
+import { recordAgyQuotaActivity, refreshAgyQuotaMetadata } from '../agy-usage-quota.js';
 
 const MODEL_CACHE_TTL_MS = 60_000;
 const MODEL_PROBE_TIMEOUT_MS = 30_000;
@@ -57,6 +70,7 @@ interface AgySessionState {
   routeId: string;
   cwd: string;
   env?: Record<string, string>;
+  mcpEnv?: Record<string, string>;
   model?: string;
   /** agy conversation id; durable resume handle (persisted by the daemon as providerResumeId). */
   conversationId?: string;
@@ -87,6 +101,11 @@ function asNumber(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
 }
 
+function buildAgyMemoryMcpEnv(config: SessionConfig): Record<string, string> | undefined {
+  const env = getDefaultMcpServers(config)[IMCODES_MEMORY_MCP_SERVER_NAME]?.env;
+  return env && Object.keys(env).length > 0 ? env : undefined;
+}
+
 /**
  * Pure builder for the argv of one long-lived `agy` stream-json process.
  * `--dangerously-skip-permissions` is mandatory: stream-json mode has no
@@ -104,16 +123,18 @@ export function buildAgyArgs(opts: { conversationId?: string; model?: string }):
   ];
 }
 
-/** Parse `agy models` output: `<id>\t<display name>` per line after a "Fetching…" banner. */
+/** Parse `agy models` output: `<id> <display name>` per line (tab- or multi-space separated). */
 export function parseAgyModelList(stdout: string): ProviderModelList['models'] {
   const models: ProviderModelList['models'] = [];
   for (const rawLine of stdout.split(/\r?\n/)) {
     const line = rawLine.trim();
-    if (!line || !line.includes('\t')) continue;
-    const [id, ...rest] = line.split('\t');
-    const modelId = id.trim();
-    if (!modelId) continue;
-    const name = rest.join('\t').trim();
+    if (!line) continue;
+    const parts = line.includes('\t') ? line.split('\t') : line.split(/\s{2,}/);
+    if (parts.length === 0) continue;
+    const modelId = parts[0].trim();
+    if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(modelId)) continue;
+    if (modelId.toLowerCase() === 'fetching' || modelId.toLowerCase() === 'models') continue;
+    const name = parts.slice(1).join(' ').trim();
     models.push({ id: modelId, ...(name ? { name } : {}) });
   }
   return models;
@@ -165,6 +186,7 @@ export class AgySdkProvider implements TransportProvider {
   };
 
   private config: ProviderConfig | null = null;
+  private mcpRegistration: AgyMcpEnsureResult | null = null;
   private readonly sessions = new Map<string, AgySessionState>();
   private readonly deltaCallbacks = new Set<(sessionId: string, delta: MessageDelta) => void>();
   private readonly completeCallbacks = new Set<(sessionId: string, message: AgentMessage) => void>();
@@ -178,6 +200,10 @@ export class AgySdkProvider implements TransportProvider {
 
   async connect(config: ProviderConfig): Promise<void> {
     this.config = config;
+    this.mcpRegistration = await ensureAgyMcpConfigHasImcodesEntry(agyMcpEnsureOptionsFromConfig(config)).catch((err) => {
+      logger.warn({ err }, 'Failed to ensure Antigravity MCP configuration');
+      return null;
+    });
     const { executable, prependArgs } = this.resolveBinary();
     try {
       await execFileAsync(executable, [...prependArgs, '--help'], { timeout: 15_000, env: this.spawnEnv() });
@@ -208,6 +234,7 @@ export class AgySdkProvider implements TransportProvider {
       routeId,
       cwd: normalizeTransportCwd(config.cwd) ?? existing?.cwd ?? normalizeTransportCwd(process.cwd())!,
       env: config.env ?? existing?.env,
+      mcpEnv: buildAgyMemoryMcpEnv(config) ?? existing?.mcpEnv,
       model: typeof config.agentId === 'string' && config.agentId ? config.agentId : existing?.model,
       conversationId: config.resumeId ?? existing?.conversationId,
       child: existing?.child ?? null,
@@ -257,6 +284,7 @@ export class AgySdkProvider implements TransportProvider {
     attachments?: TransportAttachment[],
     extraSystemPrompt?: string,
   ): Promise<void> {
+    recordAgyQuotaActivity();
     const state = this.sessions.get(sessionId);
     if (!state) throw this.makeError(PROVIDER_ERROR_CODES.SESSION_NOT_FOUND, `Session ${sessionId} not found`, false);
     const normalized = normalizeProviderPayload(payload, attachments, extraSystemPrompt);
@@ -346,7 +374,7 @@ export class AgySdkProvider implements TransportProvider {
       });
       const models = parseAgyModelList(stdout);
       const list: ProviderModelList = models.length > 0
-        ? { models, isAuthenticated: true }
+        ? { models, defaultModel: models[0]?.id, isAuthenticated: true }
         : { models: [], isAuthenticated: false, error: 'agy returned no models. Run `agy` once to sign in.' };
       if (models.length > 0) this.modelCache = { at: now, list };
       return list;
@@ -357,6 +385,25 @@ export class AgySdkProvider implements TransportProvider {
         : 'Could not list Antigravity models. Run `agy` once to sign in.';
       return { models: [], isAuthenticated: false, error };
     }
+  }
+
+  getMemoryMcpStatus(): MemoryMcpProviderStatusView {
+    if (this.mcpRegistration?.degraded) {
+      return {
+        providerId: this.id,
+        status: MEMORY_MCP_STATUS.DEGRADED,
+        connected: true,
+        degradedReasons: [
+          this.mcpRegistration.reason ?? MEMORY_MCP_PROVIDER_STATUS_REASON.MCP_REGISTRATION_FAILED,
+        ],
+      };
+    }
+    return {
+      providerId: this.id,
+      status: MEMORY_MCP_STATUS.READY,
+      connected: true,
+      degradedReasons: [],
+    };
   }
 
   getSessionDiagnostics(sessionId: string): Record<string, unknown> | null {
@@ -375,8 +422,12 @@ export class AgySdkProvider implements TransportProvider {
     return resolveAgyBinary(this.config);
   }
 
-  private spawnEnv(extra?: Record<string, string>): NodeJS.ProcessEnv {
-    return { ...process.env, ...(this.config?.env as Record<string, string> | undefined), ...extra };
+  private spawnEnv(...extra: (Record<string, string> | undefined)[]): NodeJS.ProcessEnv {
+    const mergedExtra: Record<string, string> = {};
+    for (const e of extra) {
+      if (e) Object.assign(mergedExtra, e);
+    }
+    return { ...process.env, ...(this.config?.env as Record<string, string> | undefined), ...mergedExtra };
   }
 
   private ensureChild(sessionId: string, state: AgySessionState): ChildProcess {
@@ -385,7 +436,7 @@ export class AgySdkProvider implements TransportProvider {
     const args = [...prependArgs, ...buildAgyArgs({ conversationId: state.conversationId, model: state.model })];
     const child = spawn(executable, args, {
       cwd: state.cwd,
-      env: this.spawnEnv(state.env),
+      env: this.spawnEnv(state.env, state.mcpEnv),
       stdio: ['pipe', 'pipe', 'pipe'],
       // Own process group so killProcessTree can reap agy's tool subprocesses.
       detached: process.platform !== 'win32',
@@ -492,9 +543,23 @@ export class AgySdkProvider implements TransportProvider {
       const text = asString(step.text_delta);
       // The DONE frame carries a trailing "\n" separator, not user-visible text.
       if (!text || stepState === AGY_STEP_STATE.DONE) return;
-      state.currentMessageId ??= randomUUID();
+      const stepIndex = asNumber(step.step_index);
+      const targetMessageId = stepIndex !== undefined
+        ? `${state.conversationId ?? state.routeId}:step:${stepIndex}`
+        : (state.currentMessageId ?? randomUUID());
+      if (state.currentMessageId !== targetMessageId) {
+        state.currentMessageId = targetMessageId;
+        state.currentText = '';
+      }
       state.currentText += text;
-      const delta: MessageDelta = { messageId: state.currentMessageId, type: 'text', delta: text, role: 'assistant' };
+      // Transport relay and web ChatView render delta.delta directly as the display
+      // text for this messageId, so delta.delta MUST be the cumulative running total.
+      const delta: MessageDelta = {
+        messageId: state.currentMessageId,
+        type: 'text',
+        delta: state.currentText,
+        role: 'assistant',
+      };
       for (const cb of this.deltaCallbacks) cb(sessionId, delta);
       return;
     }
@@ -550,7 +615,7 @@ export class AgySdkProvider implements TransportProvider {
     }
 
     const response = asString(result.response);
-    const content = (response && response.trim() ? response : streamed).trimEnd();
+    const content = (streamed && streamed.trim() ? streamed : (response && response.trim() ? response : streamed)).trimEnd();
     if (!content && !sawTool) {
       this.emitError(sessionId, PROVIDER_ERROR_CODES.PROVIDER_ERROR, 'agy finished without producing a response', true);
       return;
@@ -574,6 +639,8 @@ export class AgySdkProvider implements TransportProvider {
       },
     };
     for (const cb of this.completeCallbacks) cb(sessionId, message);
+    recordAgyQuotaActivity();
+    void refreshAgyQuotaMetadata().catch(() => {});
   }
 
   // ── Emit helpers ───────────────────────────────────────────────────────────

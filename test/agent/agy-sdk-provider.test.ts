@@ -46,6 +46,19 @@ process.stdin.on('data', (d) => {
       emit({ event: 'result', result: { conversation_id: convId, status: 'ERROR', response: '', error: 'boom unauthorized', num_turns: 0, usage: {} } });
       continue;
     }
+    if (text.includes('MULTI_STEP')) {
+      const idx1 = step++;
+      emit({ event: 'step_update', step_update: { conversation_id: convId, step_index: idx1, state: 'ACTIVE', step_type: 'agent_response', text_delta: 'Before' } });
+      emit({ event: 'step_update', step_update: { conversation_id: convId, step_index: idx1, state: 'DONE', step_type: 'agent_response', text_delta: '\\n' } });
+      const idxTool = step++;
+      emit({ event: 'step_update', step_update: { conversation_id: convId, step_index: idxTool, state: 'ACTIVE', step_type: 'tool', tool_name: 'run_command', tool_info: { name: 'run_command', parameters: { CommandLine: 'echo mid' } } } });
+      emit({ event: 'step_update', step_update: { conversation_id: convId, step_index: idxTool, state: 'DONE', step_type: 'tool', tool_name: 'run_command', tool_info: { name: 'run_command', parameters: { CommandLine: 'echo mid' }, output: 'mid\\r\\n' } } });
+      const idx2 = step++;
+      emit({ event: 'step_update', step_update: { conversation_id: convId, step_index: idx2, state: 'ACTIVE', step_type: 'agent_response', text_delta: 'After' } });
+      emit({ event: 'step_update', step_update: { conversation_id: convId, step_index: idx2, state: 'DONE', step_type: 'agent_response', text_delta: '\\n' } });
+      emit({ event: 'result', result: { conversation_id: convId, status: 'SUCCESS', response: 'Before\\nAfter\\n', num_turns: 1, usage: {} } });
+      continue;
+    }
     if (text.includes('TOOL')) {
       const idx = step++;
       emit({ event: 'step_update', step_update: { conversation_id: convId, step_index: idx, state: 'ACTIVE', step_type: 'tool', tool_name: 'run_command', tool_info: { name: 'run_command', parameters: { CommandLine: 'echo hi' } } } });
@@ -76,6 +89,31 @@ describe('agy-sdk helpers', () => {
       { id: 'id-b', name: 'Name B (Low)' },
     ]);
     expect(parseAgyModelList('Fetching available models...\n')).toEqual([]);
+  });
+
+  it('parses real `agy models` output with multiple spaces and spinner characters', () => {
+    const raw = [
+      '⠋ Fetching available models...',
+      '⠙ Fetching available models...',
+      'gemini-3.8-flash-high     Gemini 3.8 Flash (High)',
+      'gemini-3.8-flash-medium   Gemini 3.8 Flash (Medium)',
+      'claude-opus-5-5-low\tClaude Opus 5.5 (Low)',
+    ].join('\n');
+    expect(parseAgyModelList(raw)).toEqual([
+      { id: 'gemini-3.8-flash-high', name: 'Gemini 3.8 Flash (High)' },
+      { id: 'gemini-3.8-flash-medium', name: 'Gemini 3.8 Flash (Medium)' },
+      { id: 'claude-opus-5-5-low', name: 'Claude Opus 5.5 (Low)' },
+    ]);
+  });
+
+  it('reports memory MCP status ready or degraded', async () => {
+    const p = new AgySdkProvider();
+    await p.connect({});
+    const status = p.getMemoryMcpStatus();
+    expect(status.providerId).toBe('agy-sdk');
+    expect(status.connected).toBe(true);
+    // Under vitest without explicit path, auto-config is skipped under test -> degraded or ready
+    expect(['ready', 'degraded']).toContain(status.status);
   });
 
   it('encodes one NDJSON user line', () => {
@@ -144,7 +182,7 @@ describe('AgySdkProvider (fake agy process)', () => {
     const sid = await provider.createSession({ sessionKey: 's1', cwd: dir });
     await provider.send(sid, 'say hello');
     await waitFor(() => completes.length === 1);
-    expect(deltas.map(([, d]) => d.delta).join('')).toBe('Hello');
+    expect(deltas.map(([, d]) => d.delta)).toEqual(['Hel', 'Hello']);
     expect(new Set(deltas.map(([, d]) => d.messageId)).size).toBe(1);
     expect(completes[0][1].content).toBe('Hello');
     expect(completes[0][1].id).toBe(deltas[0][1].messageId);
@@ -171,6 +209,17 @@ describe('AgySdkProvider (fake agy process)', () => {
     expect(tools[0][1].input).toEqual({ CommandLine: 'echo hi' });
     expect(tools[1][1].output).toBe('hi\r\n');
     expect(tools[0][1].id).toBe(tools[1][1].id);
+  });
+
+  it('handles multi-step turns with tool calls separating agent responses without duplicating earlier steps', async () => {
+    const sid = await provider.createSession({ sessionKey: 's3-multi', cwd: dir });
+    await provider.send(sid, 'please MULTI_STEP');
+    await waitFor(() => completes.length === 1);
+    expect(deltas.map(([, d]) => d.delta)).toEqual(['Before', 'After']);
+    expect(deltas[0][1].messageId).not.toBe(deltas[1][1].messageId);
+    expect(tools.map(([, t]) => t.status)).toEqual(['running', 'complete']);
+    expect(completes[0][1].content).toBe('After');
+    expect(completes[0][1].id).toBe(deltas[1][1].messageId);
   });
 
   it('maps a failed result to a provider error without completing', async () => {

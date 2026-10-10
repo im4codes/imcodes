@@ -45,19 +45,37 @@ function slugify(raw: string): string {
     .replace(/^-+|-+$/g, '') || 'tier';
 }
 
+export function parseResetTimestamp(raw: string): number | undefined {
+  const str = raw.trim();
+  if (!str) return undefined;
+  if (/Z|[+-]\d{2}:?\d{2}$/i.test(str)) {
+    const ms = Date.parse(str);
+    return Number.isFinite(ms) ? Math.floor(ms / 1000) : undefined;
+  }
+  const match = str.match(/^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}(?::\d{2})?)(?:\s+[A-Za-z]+)?$/);
+  if (match) {
+    const localIso = `${match[1]}T${match[2].length === 5 ? match[2] + ':00' : match[2]}`;
+    const d = new Date(localIso);
+    const ms = d.getTime();
+    if (Number.isFinite(ms)) return Math.floor(ms / 1000);
+  }
+  const parsedMs = Date.parse(str);
+  return Number.isFinite(parsedMs) ? Math.floor(parsedMs / 1000) : undefined;
+}
+
 /**
- * Pure parser for `agy --print /usage` TSV output.
- * Formats: 4 tab-separated columns per line:
- *   `<Tier Label>\t<Window Label>\t<Remaining%>\t<ISO-8601 UTC Reset>`
+ * Pure parser for `agy --print /usage` output (TSV or multi-space aligned columns).
+ * Formats: 4 columns per line:
+ *   `<Tier Label>\t<Window Label>\t<Remaining%>\t<Reset Time>`
  *
  * Rules:
- * - Lines not having exactly 4 tab-delimited columns are ignored.
+ * - Lines not having exactly 4 tab- or multi-space-delimited columns are ignored.
  * - Known tiers mapped via PROVIDER_QUOTA_GROUP_ID; known order is Gemini first, then Claude/GPT.
  * - Unknown tiers get id = slug(rawLabel), label = rawLabel, appended after known groups in encounter order.
  * - Unknown window labels are ignored.
  * - Tiers with no valid windows are omitted.
  * - Used percent = clamp(0, 100, 100 - remainingPercent).
- * - Reset timestamp converted to epoch seconds.
+ * - Reset timestamp converted to epoch seconds (supporting ISO UTC and local time like "YYYY-MM-DD HH:mm CST").
  * - Returns undefined if no valid groups exist.
  * - Does NOT set legacy primary/secondary on the returned ProviderQuotaMeta.
  */
@@ -77,7 +95,9 @@ export function parseAgyUsageTsv(stdout: string | null | undefined): ProviderQuo
 
   for (const rawLine of lines) {
     if (!rawLine.trim()) continue;
-    const cols = rawLine.split('\t');
+    const cols = rawLine.includes('\t')
+      ? rawLine.split('\t')
+      : rawLine.trim().split(/\s{2,}/);
     if (cols.length !== 4) continue;
 
     const [rawTier, rawWindow, rawRemaining, rawResetsAt] = cols;
@@ -105,8 +125,7 @@ export function parseAgyUsageTsv(stdout: string | null | undefined): ProviderQuo
     const usedPercent = Math.max(0, Math.min(100, Math.round(100 - remainingNum)));
 
     // Resets at -> epoch seconds
-    const parsedMs = Date.parse(resetsAtStr);
-    const resetsAt = Number.isFinite(parsedMs) ? Math.floor(parsedMs / 1000) : undefined;
+    const resetsAt = parseResetTimestamp(resetsAtStr);
 
     const quotaWindow: ProviderQuotaWindow = {
       windowDurationMins,
