@@ -1,3 +1,4 @@
+import { CONTROLLED_NODE_ABI_GLIBC217, CONTROLLED_NODE_ABI_MODERN } from '../../shared/controlled-node-abi.js';
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtemp, rm, stat, writeFile, open } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -442,5 +443,21 @@ describe('install journal persistence + resume (10.10)', () => {
     const fh = await open(parent, 'r');
     await fh.close();
     expect((await stat(path)).isFile()).toBe(true);
+  });
+});
+
+describe('ABI journal identity', () => {
+  it('persists compat through retries and refuses a later profile rewrite', async () => {
+    const elevated = await writeInstallPhase(path, 'elevated', { now: 1 });
+    const prepared = await writeInstallPhase(path, 'credential_prepared', { now: 2, previous: elevated, ...IDENTITY, abiProfile: CONTROLLED_NODE_ABI_GLIBC217 });
+    expect((await loadInstallJournal(path)).abiProfile).toBe(CONTROLLED_NODE_ABI_GLIBC217);
+    const retried = await writeInstallPhase(path, 'credential_prepared', { now: 3, previous: prepared });
+    expect(retried.abiProfile).toBe(CONTROLLED_NODE_ABI_GLIBC217);
+    await expect(writeInstallPhase(path, 'credential_prepared', { now: 4, previous: retried, abiProfile: CONTROLLED_NODE_ABI_MODERN })).rejects.toThrow(InstallJournalTransitionError);
+    expect((await loadInstallJournal(path)).abiProfile).toBe(CONTROLLED_NODE_ABI_GLIBC217);
+  });
+  it.each([null, [], 'unknown', 1])('rejects persisted invalid ABI %j', async (abiProfile) => {
+    await writeFile(path, JSON.stringify({ version: 1, phase: 'elevated', updatedAt: 1, abiProfile }));
+    await expect(loadInstallJournal(path)).rejects.toThrow(InstallJournalCorruptError);
   });
 });

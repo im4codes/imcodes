@@ -1,3 +1,4 @@
+import { CONTROLLED_NODE_ABI_GLIBC217, CONTROLLED_NODE_ABI_PROFILE_FIELD } from '../../shared/controlled-node-abi.js';
 import { EventEmitter } from 'node:events';
 import { lstat, mkdir, mkdtemp, rm, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -2207,5 +2208,50 @@ describe('recovered upgrade failure reporting', () => {
       targetVersion: '2026.9.4544-dev.5197',
     }));
     runtime.stop();
+  });
+});
+
+describe('compat runtime headless and old-peer profile handling', () => {
+  it('keeps core capabilities and ACK health but never probes, launches or installs desktop components', async () => {
+    const socket = new MockSocket();
+    const remoteDesktopWorker = { available: vi.fn(() => true), handle: vi.fn(async () => true), close: vi.fn() };
+    const linuxDesktop = { displayAvailable: vi.fn(() => false), provisionSupported: vi.fn(() => true), provision: vi.fn() };
+    const repair = vi.fn();
+    const onAuthenticated = vi.fn();
+    const runtime = createControlledNodeRuntime({ serverUrl: 'https://im.example', serverId: 'abi-test', token: 'scoped',
+      nodeRole: NODE_ROLE.CONTROLLED, abiProfile: CONTROLLED_NODE_ABI_GLIBC217,
+    }, () => socket, { platform: 'linux', arch: 'x64', remoteDesktopWorker, linuxDesktop,
+      repairMissingRemoteDesktopWorker: repair, onAuthenticated });
+    try {
+      runtime.start(); socket.open();
+      const auth = JSON.parse(socket.sent[0]!);
+      expect(auth[CONTROLLED_NODE_ABI_PROFILE_FIELD]).toBe(CONTROLLED_NODE_ABI_GLIBC217);
+      expect(auth.capabilities).toContain(FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY);
+      expect(auth.capabilities).toContain(CONTROLLED_NODE_SAFE_SELF_UPGRADE_CAPABILITY);
+      expect(auth.capabilities.filter((capability: string) => capability.startsWith('remote_desktop'))).toEqual([]);
+      // Old servers omit the ACK field. Preserve this healthy node's immutable profile;
+      // download/header fencing, not loss of heartbeat, rejects incompatible old-server upgrades.
+      socket.emit('message', JSON.stringify({ type: 'heartbeat_ack' }));
+      await vi.waitFor(() => expect(onAuthenticated).toHaveBeenCalledOnce());
+      expect(remoteDesktopWorker.available).not.toHaveBeenCalled();
+      expect(linuxDesktop.displayAvailable).not.toHaveBeenCalled();
+      expect(linuxDesktop.provision).not.toHaveBeenCalled();
+      expect(repair).not.toHaveBeenCalled();
+    } finally { runtime.stop(); }
+  });
+  it.each(['unknown', null, [], 'modern'])('never authenticates explicit wrong ACK profile %j', async (profile) => {
+    const socket = new MockSocket();
+    const onAuthenticated = vi.fn();
+    const onHeartbeatAck = vi.fn();
+    const runtime = createControlledNodeRuntime({ serverUrl: 'https://im.example', serverId: 'abi-test', token: 'scoped',
+      nodeRole: NODE_ROLE.CONTROLLED, abiProfile: CONTROLLED_NODE_ABI_GLIBC217,
+    }, () => socket, { platform: 'linux', arch: 'x64', onAuthenticated, onHeartbeatAck });
+    try {
+      runtime.start(); socket.open();
+      socket.emit('message', JSON.stringify({ type: 'heartbeat_ack', [CONTROLLED_NODE_ABI_PROFILE_FIELD]: profile }));
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(onAuthenticated).not.toHaveBeenCalled();
+      expect(onHeartbeatAck).not.toHaveBeenCalled();
+    } finally { runtime.stop(); }
   });
 });

@@ -2306,7 +2306,7 @@ export async function downloadControlledNodeExecutable(
 
   try {
     const ticket = await mintControlledNodeExecutableTicket(selection, teamId);
-    const url = buildControlledNodeBootstrapUrl(ticket.ticket);
+    const url = buildControlledNodeBootstrapUrl(ticket.ticket, ticket.abiProfile);
     if (nativeRuntime) {
       const { Browser } = await import('@capacitor/browser');
       await Browser.open({ url });

@@ -1,3 +1,4 @@
+import { CONTROLLED_NODE_ABI_MODERN, CONTROLLED_NODE_RUNTIME_ABI_PROFILE, normalizeControlledNodeAbiProfile, type ControlledNodeAbiProfile } from '../../shared/controlled-node-abi.js';
 // First-run bootstrap for the controlled node — journaled install/enroll flow with
 // D-A v2 identity pre-persist, stable trailer-free executable staging, real
 // platform installer wiring, and crash-loop backoff (N5).
@@ -86,6 +87,7 @@ export async function prepareCredentialDir(credentialPath = defaultCredentialPat
 }
 
 export interface ControlledNodeBootstrapDeps {
+  abiProfile?: ControlledNodeAbiProfile;
   loadCredential: () => Promise<ControlledNodeCredential | null>;
   openVerifiedEnrollmentSource: (executablePath?: string) => Promise<VerifiedEnrollmentSource>;
   loadInstallIdentity: () => Promise<PendingInstallIdentity | null>;
@@ -452,6 +454,8 @@ async function ensureIdentityPrepared(
     journal = await deps.writeInstallPhase(deps.journalPath, 'credential_prepared', {
       now: deps.now,
       previous: journal,
+      ...((deps.abiProfile ?? CONTROLLED_NODE_RUNTIME_ABI_PROFILE) !== CONTROLLED_NODE_ABI_MODERN
+        ? { abiProfile: deps.abiProfile ?? CONTROLLED_NODE_RUNTIME_ABI_PROFILE } : {}),
       installId: identity.installId,
       nodeTokenHash: identity.nodeTokenHash,
       sourceExePath: identity.sourceExePath,
@@ -752,6 +756,12 @@ async function ensureServiceStartRequested(
 export async function bootstrapControlledNodeWithDisposition(deps: ControlledNodeBootstrapDeps): Promise<BootstrapResult> {
   const existing = await deps.loadCredential();
   let journal = await loadJournalOrThrow(deps);
+  const abiProfile = deps.abiProfile ?? CONTROLLED_NODE_RUNTIME_ABI_PROFILE;
+  if ((existing && normalizeControlledNodeAbiProfile(existing.abiProfile) !== abiProfile)
+    || (phaseIndex(journal.phase) >= phaseIndex('credential_prepared')
+      && normalizeControlledNodeAbiProfile(journal.abiProfile) !== abiProfile)) {
+    throw new Error('controlled node persisted ABI profile does not match the executable');
+  }
   if (existing && deps.recoverInterruptedUpgrade) {
     const recovery = await deps.recoverInterruptedUpgrade(journal);
     journal = recovery.journal;

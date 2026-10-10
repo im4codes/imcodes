@@ -1,0 +1,24 @@
+{
+  "MODERN": {
+    "id": "modern",
+    "provider": "nodejs-official",
+    "minimumGlibc": "2.28",
+    "minimumKernel": "4.18",
+    "minimumGlibcxx": "3.4.21"
+  },
+  "GLIBC217": {
+    "id": "linux-glibc217",
+    "provider": "nodejs-unofficial-builds",
+    "os": "linux",
+    "arch": "x64",
+    "fileName": "imcodes-node-linux-glibc217",
+    "nodeVersion": "v22.23.3",
+    "dist": "https://unofficial-builds.nodejs.org/download/release",
+    "nodeArchive": "node-v22.23.3-linux-x64-glibc-217.tar.gz",
+    "nodeArchiveSha256": "d40d23977d2c39df68b09e71a9376e88bec6b805df02af35c08a332674a6c42e",
+    "nodeBinarySha256": "8bbebfaeef1021f9d601739e94d8a9bc152e1bac129bc8ab409b257706745ad8",
+    "minimumGlibc": "2.17",
+    "minimumKernel": "3.10",
+    "minimumGlibcxx": "3.4.19"
+  }
+}

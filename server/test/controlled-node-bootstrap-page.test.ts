@@ -1,3 +1,5 @@
+import { CONTROLLED_NODE_ABI_GLIBC217, CONTROLLED_NODE_ABI_PROFILE_FIELD } from '../../shared/controlled-node-abi.js';
+import { CONTROLLED_NODE_ARTIFACT_HEADERS } from '../../shared/controlled-node-artifacts.js';
 import { describe, expect, it } from 'vitest';
 import { buildControlledNodeBootstrapPage } from '../src/routes/controlled-node-bootstrap-page.js';
 
@@ -111,7 +113,7 @@ function bootstrapScript(html: string): string {
   return scripts[0]?.[1] ?? '';
 }
 
-function runPage(input: { ticket?: string; now?: number; historyThrows?: boolean } = {}) {
+function runPage(input: { ticket?: string; fragment?: string; now?: number; historyThrows?: boolean } = {}) {
   const ticket = input.ticket ?? 'ticket_secret_123456';
   const elements = new Map<string, FakeElement>([
     ['download-status', new FakeElement()],
@@ -141,7 +143,7 @@ function runPage(input: { ticket?: string; now?: number; historyThrows?: boolean
     },
   };
   const location = {
-    hash: input.ticket === '' ? '' : `#ticket=${ticket}`,
+    hash: input.fragment ?? (input.ticket === '' ? '' : `#ticket=${ticket}`),
     pathname: '/api/enroll/v2/bootstrap',
     search: '',
   };
@@ -322,5 +324,27 @@ describe('controlled-node bootstrap download page', () => {
     expect(html).toContain("xhr.open('POST',downloadPath,true)");
     expect(html).not.toContain('console.');
     expect(html).not.toContain('?ticket=');
+  });
+});
+
+describe('bootstrap ABI compatibility fence', () => {
+  const compatFragment = `#ticket=ticket_secret_123456&${CONTROLLED_NODE_ABI_PROFILE_FIELD}=${CONTROLLED_NODE_ABI_GLIBC217}`;
+  it('sends compat in the body only and saves bytes only after explicit response acknowledgement', () => {
+    const runtime = runPage({ fragment: compatFragment });
+    expect(runtime.xhr?.body).toContain(`${CONTROLLED_NODE_ABI_PROFILE_FIELD}=${CONTROLLED_NODE_ABI_GLIBC217}`);
+    expect(runtime.replaced).toEqual(['/api/enroll/v2/bootstrap']);
+    runtime.xhr?.finish(200, new Blob(['compat']), { [CONTROLLED_NODE_ARTIFACT_HEADERS.ABI_PROFILE]: CONTROLLED_NODE_ABI_GLIBC217 });
+    expect(runtime.createdBlobs).toHaveLength(1);
+  });
+  it.each([undefined, 'unknown', 'modern', `${CONTROLLED_NODE_ABI_GLIBC217}, ${CONTROLLED_NODE_ABI_GLIBC217}`])('refuses old or incorrect server acknowledgement %j', (profile) => {
+    const runtime = runPage({ fragment: compatFragment });
+    runtime.xhr?.finish(200, new Blob(['wrong']), profile === undefined ? {} : { [CONTROLLED_NODE_ARTIFACT_HEADERS.ABI_PROFILE]: profile });
+    expect(runtime.createdBlobs).toHaveLength(0);
+    expect(runtime.elements.get('download-status')?.textContent).toContain('incompatible');
+  });
+  it.each(['unknown', '', `${CONTROLLED_NODE_ABI_GLIBC217}&${CONTROLLED_NODE_ABI_PROFILE_FIELD}=${CONTROLLED_NODE_ABI_GLIBC217}`])('rejects malformed or duplicate fragment %j before downloading', (profile) => {
+    const runtime = runPage({ fragment: `#ticket=ticket_secret_123456&${CONTROLLED_NODE_ABI_PROFILE_FIELD}=${profile}` });
+    expect(runtime.xhr).toBeNull();
+    expect(runtime.replaced).toHaveLength(1);
   });
 });

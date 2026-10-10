@@ -1,3 +1,7 @@
+import {
+  CONTROLLED_NODE_ABI_PROFILE_FIELD, CONTROLLED_NODE_ABI_MODERN, CONTROLLED_NODE_ABI_GLIBC217, normalizeControlledNodeAbiProfile,
+  isControlledNodeAbiTarget, enrollmentAbiDigest, type ControlledNodeAbiProfile,
+} from '../../../shared/controlled-node-abi.js';
 import { activeUserExistsSql } from '../security/user-status.js';
 import { USER_STATUS, isUserStatusActive, userStatusDenialCode } from '../../../shared/user-status.js';
 import { enforceDaemonTokenRoute } from '../security/daemon-token-policy.js';
@@ -165,6 +169,7 @@ const TICKET_BODY = z
     version: z.literal(2),
     os: z.string(),
     arch: z.string(),
+    abiProfile: z.string().optional(),
     /**
      * The daemon whose machine this node is being enrolled on, when the enrolment
      * is the "give this machine login-screen control" flow. Recorded so the
@@ -228,10 +233,11 @@ enrollRoutes.post('/v2/ticket', requireAuth(), async (c) => {
   const parsed = TICKET_BODY.safeParse(body);
   if (!parsed.success) return c.json({ error: 'invalid_body' }, 400);
   const { os, arch, hostServerId } = parsed.data;
+  const abiProfile = normalizeControlledNodeAbiProfile(parsed.data.abiProfile);
   const delivery = parsed.data.delivery && isControlledNodeTicketDelivery(parsed.data.delivery)
     ? parsed.data.delivery
     : CONTROLLED_NODE_TICKET_DELIVERY.BROWSER;
-  if (!isControlledNodeOs(os) || !isControlledNodeArtifactArch(arch) || !isCanonicalControlledNodePair(os, arch)) {
+  if (!isControlledNodeOs(os) || !isControlledNodeArtifactArch(arch) || !isCanonicalControlledNodePair(os, arch, abiProfile)) {
     return c.json({ error: 'invalid_body' }, 400);
   }
   if (hostServerId !== undefined) {
@@ -248,12 +254,32 @@ enrollRoutes.post('/v2/ticket', requireAuth(), async (c) => {
 
   // Single-flight verification caches descriptors only; mint never borrows a
   // stream handle that could later be closed underneath a download.
-  const v = await artifactCatalog.ensureVerified(dir, os, arch);
+  if (!abiProfile) return c.json({ error: 'invalid_body' }, 400);
+  // A stable remote link keeps the original owner/OS/CPU binding (including
+  // old servers' conflict target). Its explicitly requested ABI is a verified
+  // variant, not a new permission, fake arch or replacement of its old URL.
+  const ticketProfile = delivery === CONTROLLED_NODE_TICKET_DELIVERY.REMOTE_LINK
+    ? CONTROLLED_NODE_ABI_MODERN : abiProfile;
+  const v = await artifactCatalog.ensureVerified(dir, os, arch, ticketProfile);
   if (!v.ok) return c.json({ error: 'executable_not_built', os, arch }, 503);
   // Persist the descriptor so /v2/availability and downstream tooling can
   // read it without re-hashing. Best-effort; not on the critical mint path.
   await artifactCatalog.persistDescriptor(c.env.DB as Database, v.descriptor).catch(() => {});
 
+  const abiVariants: Partial<Record<ControlledNodeAbiProfile, string>> = {};
+  let requestedDescriptor = v.descriptor;
+  if (os === CONTROLLED_NODE_OS_LINUX && arch === 'x64'
+    && (delivery === CONTROLLED_NODE_TICKET_DELIVERY.INSTALL_COMMAND
+      || delivery === CONTROLLED_NODE_TICKET_DELIVERY.REMOTE_LINK)
+    && ticketProfile === CONTROLLED_NODE_ABI_MODERN) {
+    const legacy = await artifactCatalog.ensureVerified(dir, os, arch, CONTROLLED_NODE_ABI_GLIBC217);
+    if (legacy.ok) {
+      abiVariants[CONTROLLED_NODE_ABI_GLIBC217] = legacy.descriptor.sha256;
+      if (abiProfile === CONTROLLED_NODE_ABI_GLIBC217) requestedDescriptor = legacy.descriptor;
+    } else if (abiProfile === CONTROLLED_NODE_ABI_GLIBC217) {
+      return c.json({ error: 'executable_not_built', os, arch, abiProfile }, 503);
+    }
+  }
   const serverUrl = resolveCanonicalServerUrl(c);
   if (!serverUrl) return c.json({ error: 'canonical_server_url_required' }, 403);
 
@@ -291,17 +317,18 @@ enrollRoutes.post('/v2/ticket', requireAuth(), async (c) => {
          (ticket_hash, code_hash, owner_user_id, os, arch, artifact_sha256,
           encrypted_code, encrypted_ticket, delivery, consumed_count,
           max_consumes, ticket_expires_at, expires_at, reusable, created_at,
-          host_server_id, install_code_hash)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 0, $10, NULL, NULL, TRUE, $11, $12, NULL)
+          host_server_id, install_code_hash, abi_profile, abi_variants)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 0, $10, NULL, NULL, TRUE, $11, $12, NULL, $13, $14::jsonb)
        ON CONFLICT (owner_user_id, os, arch, (COALESCE(host_server_id, '')))
          WHERE delivery = 'remote_link'
            AND revoked_at IS NULL
            AND encrypted_ticket IS NOT NULL
-       DO UPDATE SET owner_user_id = EXCLUDED.owner_user_id
+       DO UPDATE SET owner_user_id = EXCLUDED.owner_user_id,
+           abi_variants = controlled_node_enrollments_v2.abi_variants || EXCLUDED.abi_variants
        RETURNING id, ticket_hash, encrypted_ticket`,
       [ticketHash, codeHash, userId, os, arch, v.descriptor.sha256,
        encryptedCode, encryptedTicket, delivery, maxConsumes, now,
-       hostServerId ?? null],
+       hostServerId ?? null, ticketProfile, JSON.stringify(abiVariants)],
     )
     : await (c.env.DB as Database).queryOne<{
       id: string; ticket_hash: string; encrypted_ticket: string | null;
@@ -310,12 +337,12 @@ enrollRoutes.post('/v2/ticket', requireAuth(), async (c) => {
          (ticket_hash, code_hash, owner_user_id, os, arch, artifact_sha256,
           encrypted_code, encrypted_ticket, delivery, consumed_count,
           max_consumes, ticket_expires_at, expires_at, reusable, created_at,
-          host_server_id, install_code_hash)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, NULL, $8, 0, $9, $10, NULL, TRUE, $11, $12, $13)
+          host_server_id, install_code_hash, abi_profile, abi_variants)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, NULL, $8, 0, $9, $10, NULL, TRUE, $11, $12, $13, $14, $15::jsonb)
        RETURNING id, ticket_hash, encrypted_ticket`,
       [ticketHash, codeHash, userId, os, arch, v.descriptor.sha256,
        encryptedCode, delivery, maxConsumes, ticketExpiresAt, now,
-       hostServerId ?? null, installCodeHash],
+       hostServerId ?? null, installCodeHash, ticketProfile, JSON.stringify(abiVariants)],
     );
   if (!inserted) {
     return c.json({ error: 'ticket_mint_failed' }, 500);
@@ -353,9 +380,10 @@ enrollRoutes.post('/v2/ticket', requireAuth(), async (c) => {
     version: 2,
     os,
     arch,
-    filename: v.descriptor.filename,
-    sizeBytes: v.descriptor.sizeBytes,
-    sha256: v.descriptor.sha256,
+    ...(abiProfile !== CONTROLLED_NODE_ABI_MODERN ? { abiProfile } : {}),
+    filename: requestedDescriptor.filename,
+    sizeBytes: requestedDescriptor.sizeBytes,
+    sha256: requestedDescriptor.sha256,
     maxConsumes,
     expiresAt: ticketExpiresAt,
     delivery,
@@ -388,7 +416,7 @@ enrollRoutes.delete('/v2/ticket', requireAuth(), async (c) => {
   if (parsed.data.delivery !== CONTROLLED_NODE_TICKET_DELIVERY.REMOTE_LINK
     || !isControlledNodeOs(os)
     || !isControlledNodeArtifactArch(arch)
-    || !isCanonicalControlledNodePair(os, arch)) {
+    || !isCanonicalControlledNodePair(os, arch, normalizeControlledNodeAbiProfile(parsed.data.abiProfile))) {
     return c.json({ error: 'invalid_body' }, 400);
   }
 
@@ -420,7 +448,7 @@ enrollRoutes.delete('/v2/ticket', requireAuth(), async (c) => {
 // ── GET /api/enroll/v2/download (bearer) ───────────────────────────────────
 
 const BEARER_RE = /^Bearer\s+([A-Za-z0-9_-]{8,128})$/;
-const DOWNLOAD_BODY = z.object({ ticket: z.string().min(8).max(128) }).strict();
+const DOWNLOAD_BODY = z.object({ ticket: z.string().min(8).max(128), abiProfile: z.string().optional() }).strict();
 
 /** Pull ticket from JSON POST body first, then form-urlencoded, then Bearer. */
 async function readTicket(c: Context): Promise<string | null> {
@@ -461,6 +489,8 @@ interface DownloadCommit {
   os: string;
   arch: string;
   artifactSha256: string;
+  abiProfile?: unknown;
+  abiVariants?: unknown;
   delivery: string;
   encryptedCode: string;
   attemptId: string;
@@ -481,12 +511,12 @@ async function reserveAttempt(
     // Lock the parent row.
     const candidate = await tx.queryOne<{
       id: string; owner_user_id: string; os: string; arch: string;
-      artifact_sha256: string; encrypted_code: string; delivery: string;
+      artifact_sha256: string; encrypted_code: string; delivery: string; abi_profile?: unknown; abi_variants?: unknown;
     }>(
       // Either credential resolves the same row: the download ticket, or the
       // short install code from a pasted command. Both are sha256 of a
       // high-entropy secret and each column is unique, so they cannot collide.
-      `SELECT id, owner_user_id, os, arch, artifact_sha256, encrypted_code, delivery
+      `SELECT id, owner_user_id, os, arch, artifact_sha256, encrypted_code, delivery, abi_profile, abi_variants
          FROM controlled_node_enrollments_v2
         WHERE (ticket_hash = $1 OR install_code_hash = $1)
           AND revoked_at IS NULL
@@ -532,6 +562,8 @@ async function reserveAttempt(
       os: candidate.os,
       arch: candidate.arch,
       artifactSha256: candidate.artifact_sha256,
+      abiProfile: candidate.abi_profile,
+      abiVariants: candidate.abi_variants,
       delivery: candidate.delivery,
       encryptedCode: candidate.encrypted_code,
       attemptId: attemptInsert.attempt_id,
@@ -742,7 +774,30 @@ function buildBufferArtifactStream(
 
 // ── Consume + stream: reservation → pre-stream checks → committed → stream ─
 
-async function consumeAndStream(c: Context, rawTicket: string): Promise<Response> {
+async function readDownloadAbiProfile(c: Context): Promise<{ valid: boolean; value?: string }> {
+  const queries = c.req.queries(CONTROLLED_NODE_ABI_PROFILE_FIELD) ?? [];
+  if (queries.length > 1) return { valid: false };
+  let value: unknown = queries[0];
+  if (c.req.method === 'POST') {
+    const type = c.req.header('content-type') ?? '';
+    if (type.includes('application/json')) {
+      const body = await c.req.json().catch(() => null);
+      if (body && Object.hasOwn(body, CONTROLLED_NODE_ABI_PROFILE_FIELD)) {
+        if (value !== undefined) return { valid: false };
+        value = body.abiProfile;
+      }
+    } else if (type.includes('application/x-www-form-urlencoded')) {
+      const params = new URLSearchParams(await c.req.text());
+      const profiles = params.getAll(CONTROLLED_NODE_ABI_PROFILE_FIELD);
+      if (profiles.length > 1 || (profiles.length > 0 && value !== undefined)) return { valid: false };
+      if (profiles.length) value = profiles[0];
+    }
+  }
+  return (value === undefined || typeof value === 'string') && normalizeControlledNodeAbiProfile(value) !== null
+    ? { valid: true, value } : { valid: false };
+}
+
+async function consumeAndStream(c: Context, rawTicket: string, rawProfile?: unknown): Promise<Response> {
   const ticketHash = sha256Hex(rawTicket);
   const now = Date.now();
   const ip = (c.get('clientIp' as never) as string) ?? 'unknown';
@@ -762,14 +817,26 @@ async function consumeAndStream(c: Context, rawTicket: string): Promise<Response
     await releaseAttempt(c.env.DB as Database, reservation.attemptId, reservation.ticketId, ip, now);
     return c.json({ error: 'executable_dir_not_configured' }, 503);
   }
-  const downloadTarget = normalizeControlledNodeArtifactPair(reservation.os, reservation.arch);
+  const profile = normalizeControlledNodeAbiProfile(rawProfile);
+  const pinnedDigest = profile ? enrollmentAbiDigest({
+    os: reservation.os, arch: reservation.arch, abiProfile: reservation.abiProfile,
+    sha256: reservation.artifactSha256, variants: reservation.abiVariants,
+    allowVariants: reservation.delivery === CONTROLLED_NODE_TICKET_DELIVERY.INSTALL_COMMAND
+      || reservation.delivery === CONTROLLED_NODE_TICKET_DELIVERY.REMOTE_LINK,
+  }, profile) : null;
+  if (!profile || !pinnedDigest) {
+    await releaseAttempt(c.env.DB as Database, reservation.attemptId, reservation.ticketId, ip, now);
+    return c.json({ error: 'abi_profile_mismatch' }, 409);
+  }
+  reservation.artifactSha256 = pinnedDigest;
+  const downloadTarget = normalizeControlledNodeArtifactPair(reservation.os, reservation.arch, profile);
   if (!downloadTarget) {
     await releaseAttempt(c.env.DB as Database, reservation.attemptId, reservation.ticketId, ip, now);
     return c.json({ error: 'unsupported_artifact' }, 500);
   }
   const downloadOs: ControlledNodeOs = downloadTarget.os;
   const downloadArch: ControlledNodeArtifactArch = downloadTarget.arch;
-  const v = await artifactCatalog.ensureVerified(dir, downloadOs, downloadArch);
+  const v = await artifactCatalog.ensureVerified(dir, downloadOs, downloadArch, profile);
   if (!v.ok) {
     await releaseAttempt(c.env.DB as Database, reservation.attemptId, reservation.ticketId, ip, now);
     logAudit({
@@ -788,7 +855,7 @@ async function consumeAndStream(c: Context, rawTicket: string): Promise<Response
   const stableRemoteLink = reservation.delivery === CONTROLLED_NODE_TICKET_DELIVERY.REMOTE_LINK;
   if (!stableRemoteLink && v.descriptor.sha256 !== reservation.artifactSha256) {
     // Stale manifest pin; release the slot and surface the mismatch.
-    artifactCatalog.invalidate(dir, downloadOs, downloadArch);
+    artifactCatalog.invalidate(dir, downloadOs, downloadArch, profile);
     await releaseAttempt(c.env.DB as Database, reservation.attemptId, reservation.ticketId, ip, now);
     return c.json({ error: 'artifact_digest_mismatch' }, 503);
   }
@@ -854,6 +921,7 @@ async function consumeAndStream(c: Context, rawTicket: string): Promise<Response
     trailer = encodeEnrollmentTrailer({
       serverUrl,
       enrollToken: enrollCode,
+      ...(profile !== CONTROLLED_NODE_ABI_MODERN ? { abiProfile: profile } : {}),
       ...(ownerName ? { ownerName } : {}),
     });
   } catch {
@@ -863,7 +931,7 @@ async function consumeAndStream(c: Context, rawTicket: string): Promise<Response
 
   const opened = await artifactCatalog.openPinned(dir, v.descriptor);
   if (!opened) {
-    artifactCatalog.invalidate(dir, downloadOs, downloadArch);
+    artifactCatalog.invalidate(dir, downloadOs, downloadArch, profile);
     await releaseAttempt(c.env.DB as Database, reservation.attemptId, reservation.ticketId, ip, now);
     return c.json({ error: 'artifact_digest_mismatch' }, 503);
   }
@@ -903,6 +971,7 @@ async function consumeAndStream(c: Context, rawTicket: string): Promise<Response
   c.header('Content-Length', String(total));
   c.header('Content-Type', 'application/octet-stream');
   c.header('Content-Disposition', `attachment; filename="${filename}"`);
+  c.header(CONTROLLED_NODE_ARTIFACT_HEADERS.ABI_PROFILE, profile);
   c.header('Cache-Control', 'private, no-store');
   c.header('Referrer-Policy', 'no-referrer');
   c.header('X-Content-Type-Options', 'nosniff');
@@ -919,7 +988,9 @@ enrollRoutes.post('/v2/download', async (c) => {
   if (gate) return gate;
   const rawTicket = await readTicket(c);
   if (!rawTicket) return c.json({ error: 'missing_ticket' }, 401);
-  return consumeAndStream(c, rawTicket);
+  const profile = await readDownloadAbiProfile(c);
+  if (!profile.valid) return c.json({ error: 'invalid_body' }, 400);
+  return consumeAndStream(c, rawTicket, profile.value);
 });
 
 enrollRoutes.get('/v2/download', async (c) => {
@@ -928,7 +999,9 @@ enrollRoutes.get('/v2/download', async (c) => {
   const auth = c.req.header('Authorization') ?? '';
   const m = BEARER_RE.exec(auth);
   if (!m || !m[1]) return c.json({ error: 'missing_or_invalid_ticket' }, 401);
-  return consumeAndStream(c, m[1]);
+  const profile = await readDownloadAbiProfile(c);
+  if (!profile.valid) return c.json({ error: 'invalid_query' }, 400);
+  return consumeAndStream(c, m[1], profile.value);
 });
 
 
@@ -936,6 +1009,7 @@ const NODE_ARTIFACT_QUERY = z.object({
   serverId: z.string().min(1).max(128),
   os: z.string(),
   arch: z.string(),
+  abiProfile: z.string().optional(),
   asset: z.enum([
     CONTROLLED_NODE_ARTIFACT_ASSETS.NODE,
     CONTROLLED_NODE_ARTIFACT_ASSETS.COMPUTER_USE_HELPER,
@@ -1507,6 +1581,7 @@ enrollRoutes.get('/v2/node-artifact', async (c) => {
     serverId: c.req.query('serverId') ?? c.req.header(SERVER_ID_HEADER) ?? '',
     os: c.req.query('os') ?? '',
     arch: c.req.query('arch') ?? '',
+    abiProfile: c.req.query(CONTROLLED_NODE_ABI_PROFILE_FIELD),
     asset: c.req.query('asset') ?? CONTROLLED_NODE_ARTIFACT_ASSETS.NODE,
   });
   if (!parsed.success) return c.json({ error: 'invalid_query' }, 400);
@@ -1521,7 +1596,9 @@ enrollRoutes.get('/v2/node-artifact', async (c) => {
     && requestedMacosComponentArch === null) {
     return c.json({ error: 'invalid_query' }, 400);
   }
-  const artifactTarget = normalizeControlledNodeArtifactPair(os, arch);
+  const abiProfile = normalizeControlledNodeAbiProfile(parsed.data.abiProfile);
+  if ((c.req.queries(CONTROLLED_NODE_ABI_PROFILE_FIELD) ?? []).length > 1 || !abiProfile) return c.json({ error: 'invalid_query' }, 400);
+  const artifactTarget = normalizeControlledNodeArtifactPair(os, arch, abiProfile);
   if (!artifactTarget) {
     return c.json({ error: 'invalid_query' }, 400);
   }
@@ -1534,9 +1611,10 @@ enrollRoutes.get('/v2/node-artifact', async (c) => {
     revoked_at: number | null;
     os: string | null;
     arch: string | null;
+    abi_profile?: unknown;
     owner_status: string | null;
   }>(
-    `SELECT id, token_hash, node_role, revoked_at, os, arch,
+    `SELECT id, token_hash, node_role, revoked_at, os, arch, abi_profile,
             (SELECT u.status FROM users u WHERE u.id = servers.user_id) AS owner_status
        FROM servers WHERE id = $1`,
     [serverId],
@@ -1601,6 +1679,10 @@ enrollRoutes.get('/v2/node-artifact', async (c) => {
     return c.json({ error: 'platform_mismatch' }, 403);
   }
 
+  if (normalizeControlledNodeAbiProfile(server.abi_profile) !== abiProfile
+    || (abiProfile === CONTROLLED_NODE_ABI_GLIBC217 && asset !== CONTROLLED_NODE_ARTIFACT_ASSETS.NODE)) {
+    return c.json({ error: 'abi_profile_mismatch' }, 409);
+  }
   const dir = process.env.IMCODES_NODE_EXE_DIR;
   if (!dir) return c.json({ error: 'executable_dir_not_configured' }, 503);
   if (isAideskLocalUiArtifactAsset(asset)) {
@@ -1737,7 +1819,7 @@ enrollRoutes.get('/v2/node-artifact', async (c) => {
       : buildBareArtifactStream(openedWorker.handle!, openedWorker.sizeBytes, openedWorker.close);
     return c.body(stream as unknown as ReadableStream, 200);
   }
-  const v = await artifactCatalog.ensureVerified(dir, artifactTarget.os, artifactTarget.arch);
+  const v = await artifactCatalog.ensureVerified(dir, artifactTarget.os, artifactTarget.arch, abiProfile);
   if (!v.ok) return c.json({ error: 'executable_not_built', os: artifactTarget.os, arch: artifactTarget.arch }, 503);
   if (artifactTarget.os === CONTROLLED_NODE_OS_WIN && artifactTarget.arch === 'x64') {
     // Old deployed upgraders download the main executable first and used to
@@ -1761,7 +1843,7 @@ enrollRoutes.get('/v2/node-artifact', async (c) => {
   await artifactCatalog.persistDescriptor(c.env.DB as Database, v.descriptor).catch(() => {});
   const opened = await artifactCatalog.openPinned(dir, v.descriptor);
   if (!opened) {
-    artifactCatalog.invalidate(dir, artifactTarget.os, artifactTarget.arch);
+    artifactCatalog.invalidate(dir, artifactTarget.os, artifactTarget.arch, abiProfile);
     return c.json({ error: 'artifact_digest_mismatch' }, 503);
   }
 
@@ -1776,6 +1858,7 @@ enrollRoutes.get('/v2/node-artifact', async (c) => {
   c.header(CONTROLLED_NODE_ARTIFACT_HEADERS.SIZE_BYTES, String(v.descriptor.sizeBytes));
   c.header(CONTROLLED_NODE_ARTIFACT_HEADERS.FILENAME, v.descriptor.filename);
   c.header(CONTROLLED_NODE_ARTIFACT_HEADERS.VERSION, v.descriptor.version);
+  c.header(CONTROLLED_NODE_ARTIFACT_HEADERS.ABI_PROFILE, abiProfile);
   if (v.descriptor.authenticodeSignerSha256) {
     c.header(
       CONTROLLED_NODE_ARTIFACT_HEADERS.AUTHENTICODE_SIGNER_SHA256,
@@ -1819,6 +1902,7 @@ const REDEEM_BODY = z
     hostname: z.string().min(1).max(255),
     os: z.string().min(1).max(64),
     arch: z.string().min(1).max(16),
+    abiProfile: z.string().optional(),
   })
   .strict();
 
@@ -1873,6 +1957,8 @@ enrollRoutes.post('/v2/redeem', async (c) => {
   if (!isControlledNodeOs(os) || !isControlledNodeArch(arch) || !isControlledNodeRuntimePair(os, arch)) {
     return c.json({ error: 'invalid_body' }, 400);
   }
+  const abiProfile = normalizeControlledNodeAbiProfile(parsed.data.abiProfile);
+  if (!abiProfile || !isControlledNodeAbiTarget(os, arch, abiProfile)) return c.json({ error: 'invalid_body' }, 400);
   const codeHash = sha256Hex(enrollToken);
 
   const now = Date.now();
@@ -1892,10 +1978,14 @@ enrollRoutes.post('/v2/redeem', async (c) => {
         os: string;
         arch: string;
         host_server_id: string | null;
+        abi_profile?: unknown;
+        abi_variants?: unknown;
+        artifact_sha256: string;
+        delivery: string;
       }>(
         `SELECT id, owner_user_id, expires_at, reusable, revoked_at,
                 used_at, redeemed_server_id, host_server_id,
-                install_id, node_token_hash, os, arch
+                install_id, node_token_hash, os, arch, abi_profile, abi_variants, artifact_sha256, delivery
            FROM controlled_node_enrollments_v2
           WHERE code_hash = $1
             AND ${activeUserExistsSql('controlled_node_enrollments_v2.owner_user_id')}
@@ -1916,22 +2006,28 @@ enrollRoutes.post('/v2/redeem', async (c) => {
         return { kind: 'mismatch' as const, ticketId: row.id };
       }
 
+      if (normalizeControlledNodeAbiProfile(row.abi_profile) !== abiProfile && !enrollmentAbiDigest({
+        os: row.os, arch: row.arch, abiProfile: row.abi_profile, sha256: row.artifact_sha256,
+        variants: row.abi_variants, allowVariants: row.delivery === CONTROLLED_NODE_TICKET_DELIVERY.INSTALL_COMMAND
+          || row.delivery === CONTROLLED_NODE_TICKET_DELIVERY.REMOTE_LINK,
+      }, abiProfile)) return { kind: 'mismatch' as const, ticketId: row.id };
       const existing = await tx.queryOne<{
         node_token_hash: string;
         redeemed_server_id: string;
         node_id: string | null;
         ref_name: string | null;
         display_name: string | null;
+        abi_profile?: unknown;
       }>(
         `SELECT install.node_token_hash, install.redeemed_server_id,
-                server.node_id, server.ref_name, server.display_name
+                server.node_id, server.ref_name, server.display_name, server.abi_profile
            FROM controlled_node_enrollment_installs AS install
            JOIN servers AS server ON server.id = install.redeemed_server_id
           WHERE install.enrollment_id = $1 AND install.install_id = $2`,
         [row.id, installId],
       );
       if (existing) {
-        if (existing.node_token_hash !== nodeTokenHash) {
+        if (existing.node_token_hash !== nodeTokenHash || normalizeControlledNodeAbiProfile(existing.abi_profile) !== abiProfile) {
           return { kind: 'mismatch' as const, ticketId: row.id };
         }
         const existingNodeId = parseControlledNodeId(existing.node_id);
@@ -1984,6 +2080,7 @@ enrollRoutes.post('/v2/redeem', async (c) => {
         row.host_server_id,
         dependencies.controlledNodeIdRandomBytes,
       );
+      await tx.execute('UPDATE servers SET abi_profile = $2 WHERE id = $1', [serverId, abiProfile]);
       await tx.execute(
         `INSERT INTO controlled_node_enrollment_installs
            (enrollment_id, install_id, node_token_hash, redeemed_server_id, created_at)
@@ -2046,6 +2143,7 @@ enrollRoutes.post('/v2/redeem', async (c) => {
     nodeId: result.nodeId,
     ticketId: result.ticketId,
     nodeRole: NODE_ROLE.CONTROLLED,
+    ...(abiProfile !== CONTROLLED_NODE_ABI_MODERN ? { abiProfile } : {}),
     ...('refName' in result && result.refName ? { refName: result.refName } : {}),
     displayName: result.displayName,
     version: 2,

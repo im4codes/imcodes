@@ -1,3 +1,4 @@
+import { normalizeControlledNodeAbiProfile, type ControlledNodeAbiProfile } from '../../shared/controlled-node-abi.js';
 // Recoverable install journal for the controlled node (10.10). Each phase is
 // persisted with fsync + atomic rename so a reboot resumes from the last
 // completed phase. The critical ordering fix: elevation + protected-dir creation
@@ -78,6 +79,7 @@ export interface ServiceReceipt {
 }
 
 export interface InstallJournal {
+  abiProfile?: ControlledNodeAbiProfile;
   version?: typeof INSTALL_JOURNAL_VERSION;
   phase: InstallPhase;
   updatedAt: number;
@@ -161,6 +163,7 @@ function validateJournalMetadata(journal: InstallJournal): void {
     && journal.phase === 'uninstalled'
     && journal.updatedAt === 0;
   if (journal.version !== INSTALL_JOURNAL_VERSION && !isFreshDefault) invalidJournal('install journal version is invalid');
+  if (!normalizeControlledNodeAbiProfile(journal.abiProfile)) invalidJournal('install journal ABI profile is invalid');
   if (!Number.isSafeInteger(journal.updatedAt) || journal.updatedAt < 0) invalidJournal('install journal updatedAt is invalid');
   if (journal.installId !== undefined && !isNonEmptyString(journal.installId, 512)) invalidJournal('install journal installId is invalid');
   if (journal.nodeTokenHash !== undefined && !isEnrollmentNodeTokenHash(journal.nodeTokenHash)) invalidJournal('install journal nodeTokenHash is invalid');
@@ -227,6 +230,7 @@ function validateJournalMetadata(journal: InstallJournal): void {
  * both of those.
  */
 const IMMUTABLE_JOURNAL_FIELDS = [
+  'abiProfile',
   'installId',
   'nodeTokenHash',
   'stagedExePath',
@@ -323,6 +327,7 @@ function mergeJournal(existing: InstallJournal | null, patch: Partial<InstallJou
     ...base,
     ...patch,
     version: INSTALL_JOURNAL_VERSION,
+    abiProfile: patch.abiProfile !== undefined ? patch.abiProfile : base.abiProfile,
     installId: patch.installId ?? base.installId,
     nodeTokenHash: patch.nodeTokenHash ?? base.nodeTokenHash,
     sourceExePath: patch.sourceExePath ?? base.sourceExePath,
@@ -387,6 +392,7 @@ export async function loadInstallJournal(path: string): Promise<InstallJournal> 
     }
     const journal = mergeJournal(null, {
       version: parsed.version,
+      abiProfile: parsed.abiProfile,
       phase: parsed.phase,
       updatedAt: parsed.updatedAt ?? 0,
       installId: parsed.installId,
@@ -419,6 +425,7 @@ export async function writeInstallPhase(
   extra: {
     installId?: string;
     nodeTokenHash?: string;
+    abiProfile?: ControlledNodeAbiProfile;
     sourceExePath?: string;
     stagedExePath?: string;
     sourceArtifact?: SourceArtifactIdentity;
@@ -455,6 +462,7 @@ export async function writeInstallPhase(
   const patch: Partial<InstallJournal> = {
     phase,
     updatedAt: extra.now,
+    abiProfile: extra.abiProfile,
     installId: extra.installId,
     nodeTokenHash: extra.nodeTokenHash,
     sourceExePath: extra.sourceExePath,

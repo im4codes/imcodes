@@ -1,3 +1,5 @@
+import { CONTROLLED_NODE_ABI_GLIBC217, CONTROLLED_NODE_RUNTIME_ABI_PROFILE } from '../../shared/controlled-node-abi.js';
+import { createSystemdWatchdogTransport } from './systemd-watchdog.js';
 import { execFile } from 'node:child_process';
 import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
@@ -307,8 +309,14 @@ export function createControlledNodeHealthLeasePublisher(
   };
 }
 
-/** `systemd-notify WATCHDOG=1` for one pid (the unit sets NotifyAccess=all). */
+let legacySystemdTransport: ReturnType<typeof createSystemdWatchdogTransport> | undefined;
+
+/** The legacy sender stays attributed to this unit without pretending to be the main PID. */
 export function notifySystemdWatchdog(pid: number): Promise<void> {
+  if (CONTROLLED_NODE_RUNTIME_ABI_PROFILE === CONTROLLED_NODE_ABI_GLIBC217) {
+    legacySystemdTransport ??= createSystemdWatchdogTransport();
+    return legacySystemdTransport.pulse();
+  }
   return new Promise<void>((resolve, reject) => {
     execFile('systemd-notify', [`--pid=${pid}`, 'WATCHDOG=1'], { windowsHide: true }, (error) => {
       if (error) reject(error);

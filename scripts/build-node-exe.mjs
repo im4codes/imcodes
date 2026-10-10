@@ -28,9 +28,16 @@ import {
   verifyOfficialNodeArtifact,
   writeNodeExeManifest,
   NODE_EXE_MANIFEST_SUFFIX,
+  sha256File,
 } from './node-exe-artifacts.mjs';
 
-const NODE_VERSION = process.env.NODE_EXE_NODE_VERSION ?? 'v22.11.0';
+import { CONTROLLED_NODE_ABI_PROFILES, ABI_MODERN, resolveNodeExeAbiProfile, verifyCompatNodeArtifact } from './controlled-node-abi.mjs';
+
+const ABI_PROFILE = resolveNodeExeAbiProfile(process.env.NODE_EXE_ABI_PROFILE, process.platform, process.arch);
+const compat = ABI_PROFILE === ABI_MODERN ? null : CONTROLLED_NODE_ABI_PROFILES.GLIBC217;
+const NODE_VERSION = process.env.NODE_EXE_NODE_VERSION ?? compat?.nodeVersion ?? 'v22.11.0';
+if (compat && NODE_VERSION !== compat.nodeVersion) throw new Error('compat runtime must match its reviewed version pin');
+if (compat && process.env.NODE_EXE_MIRROR) throw new Error('community runtime uses its explicit pinned provider, not NODE_EXE_MIRROR');
 const OFFICIAL_NODE_DIST = 'https://nodejs.org/dist';
 const MIRROR = (process.env.NODE_EXE_MIRROR ?? OFFICIAL_NODE_DIST).replace(/\/+$/, '');
 const SEA_FUSE = 'NODE_SEA_FUSE_fce680ab2cc467b6e072b8b5df1996b2';
@@ -39,11 +46,11 @@ const platform = process.platform; // darwin | linux | win32
 const arch = process.arch === 'arm64' ? 'arm64' : 'x64';
 const isWin = platform === 'win32';
 const artifactArch = platform === 'darwin' ? 'universal' : arch;
-const outName = isWin ? 'imcodes-node.exe' : `imcodes-node-${platform === 'darwin' ? 'macos' : 'linux'}`;
+const outName = compat ? compat.fileName : isWin ? 'imcodes-node.exe' : `imcodes-node-${platform === 'darwin' ? 'macos' : 'linux'}`;
 
 const root = resolve(process.cwd());
 const buildDir = join(root, 'dist-node-exe');
-const workDir = join(tmpdir(), `imcodes-node-build-${platform}-${arch}`);
+const workDir = join(process.env.NODE_EXE_WORK_ROOT ?? tmpdir(), `imcodes-node-build-${platform}-${arch}-${ABI_PROFILE}`);
 const require = createRequire(import.meta.url);
 
 function sh(file, args, opts = {}) { return execFileSync(file, args, { stdio: 'inherit', ...opts }); }
@@ -164,10 +171,34 @@ async function ensureOfficialNode(targetArch = arch) {
   return { nodeBin, nodeArchive: archiveName, nodeArchiveSha256 };
 }
 
+async function ensureCompatNode() {
+  const cacheRoot = process.env.NODE_EXE_CACHE ?? join(tmpdir(), 'compatnode', ABI_PROFILE);
+  await mkdir(cacheRoot, { recursive: true });
+  const archivePath = join(cacheRoot, compat.nodeArchive);
+  if (!existsSync(archivePath)) {
+    const temp = `${archivePath}.${process.pid}.tmp`;
+    try {
+      // No redirects: the community provider is explicit, never presented as nodejs.org.
+      await downloadFile(`${compat.dist}/${NODE_VERSION}/${compat.nodeArchive}`, temp, 'error');
+      await verifyCompatNodeArtifact(temp);
+      await rename(temp, archivePath);
+    } finally {
+      await rm(temp, { force: true });
+    }
+  }
+  const nodeArchiveSha256 = await verifyCompatNodeArtifact(archivePath);
+  const dirName = compat.nodeArchive.replace(/\.tar\.gz$/, '');
+  await rm(join(cacheRoot, dirName), { recursive: true, force: true });
+  sh('tar', ['-xf', archivePath, '-C', cacheRoot]);
+  const nodeBin = join(cacheRoot, dirName, 'bin', 'node');
+  if (await sha256File(nodeBin) !== compat.nodeBinarySha256) throw new Error('compatible Node binary checksum mismatch');
+  return { nodeBin, nodeArchive: compat.nodeArchive, nodeArchiveSha256 };
+}
+
 async function main() {
   const officialNodes = platform === 'darwin'
     ? await Promise.all(['arm64', 'x64'].map((targetArch) => ensureOfficialNode(targetArch)))
-    : [await ensureOfficialNode()];
+    : [await (compat ? ensureCompatNode() : ensureOfficialNode())];
   const officialNode = officialNodes.find(({ nodeBin }) => nodeBin.includes(`-${arch}/`)) ?? officialNodes[0];
   if (!officialNode) throw new Error(`no official Node binary for build host architecture ${arch}`);
   await rm(workDir, { recursive: true, force: true });
@@ -190,6 +221,7 @@ async function main() {
     plugins: [rawTextImportsPlugin],
     define: {
       'process.env.IMCODES_BUILD_VERSION': JSON.stringify(buildVersion),
+      __IMCODES_NODE_ABI_PROFILE__: JSON.stringify(ABI_PROFILE),
       // `ws` probes these optional native accelerators with a caught
       // `require()` when they are not explicitly disabled. A SEA's injected
       // require can only load built-ins, so the harmless probe prints a large
@@ -268,7 +300,7 @@ async function main() {
   // Copy the platform Computer Use helper as a sidecar artifact when available.
   // It is not injected into the SEA binary: the helper is an independently
   // signed/native executable and should remain replaceable/verifiable.
-  sh(process.execPath, [join(root, 'scripts', 'copy-computer-use-helper.mjs'), '--node-exe'], {
+  if (!compat) sh(process.execPath, [join(root, 'scripts', 'copy-computer-use-helper.mjs'), '--node-exe'], {
     env: {
       ...process.env,
       ...(platform === 'darwin' ? { IMCODES_COMPUTER_USE_HELPER_TARGET_ARCH: 'universal' } : {}),
@@ -346,8 +378,13 @@ async function main() {
     postjectVersion,
     buildCommit,
     buildVersion,
-    helperPath,
-    helperRelativePath,
+    ...(!compat ? { helperPath, helperRelativePath } : {}),
+    ...(compat ? {
+      abiProfile: ABI_PROFILE,
+      nodeProvider: compat.provider,
+      nodeBinarySha256: await sha256File(officialNode.nodeBin),
+      seaBlobSha256: await sha256File(blobPath),
+    } : {}),
     ...(isWin && windowsReleaseSignerSha256
       ? { authenticodeSignerSha256: windowsReleaseSignerSha256 }
       : {}),

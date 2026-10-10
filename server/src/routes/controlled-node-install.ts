@@ -1,3 +1,4 @@
+import { normalizeControlledNodeAbiProfile, isControlledNodeAbiTarget } from '../../../shared/controlled-node-abi.js';
 import { Hono } from 'hono';
 import type { Env } from '../env.js';
 import type { Database } from '../db/client.js';
@@ -51,8 +52,8 @@ export function createControlledNodeInstallCommandRoutes(
     const installCode = normalizeControlledNodeInstallCode(c.req.param('code') ?? '');
     if (!installCode) return c.text('not found\n', 404);
 
-    const row = await (c.env.DB as Database).queryOne<{ os: string; arch: string; artifact_sha256: string }>(
-      `SELECT os, arch, artifact_sha256
+    const row = await (c.env.DB as Database).queryOne<{ os: string; arch: string; artifact_sha256: string; abi_profile?: unknown }>(
+      `SELECT os, arch, artifact_sha256, abi_profile
        FROM controlled_node_enrollments_v2
       WHERE install_code_hash = $1
         AND revoked_at IS NULL
@@ -62,6 +63,9 @@ export function createControlledNodeInstallCommandRoutes(
     if (!row || !isControlledNodeOs(row.os) || !isControlledNodeArtifactArch(row.arch)) {
       return c.text('not found\n', 404);
     }
+
+    const abiProfile = normalizeControlledNodeAbiProfile(row.abi_profile);
+    if (!abiProfile || !isControlledNodeAbiTarget(row.os, row.arch, abiProfile)) return c.text('not found\n', 404);
 
     let windowsAuthenticodeSignerSha256: string | undefined;
     if (row.os === 'win') {
@@ -82,6 +86,7 @@ export function createControlledNodeInstallCommandRoutes(
       installCode,
       os: row.os,
       arch: row.arch,
+      abiProfile,
       windowsAuthenticodeSignerSha256,
     });
     c.header('Content-Type', script.contentType);

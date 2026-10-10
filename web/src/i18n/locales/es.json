@@ -3667,6 +3667,7 @@
       "purpose": "Para qué sirve: el agente solo puede afirmar que un cambio funciona en Windows, macOS o Linux si realmente lo ejecuta allí. Las máquinas autorizadas aquí son las que puede usar para eso: verificación en dispositivos reales de varias plataformas, en vez de razonar sobre lo que debería pasar. No se usa nada hasta que hace falta, y la autorización es por máquina y revocable."
     },
     "short": "Nodos",
+    "linux_compat_headless": "Linux (glibc 2.17, sin escritorio)",
     "add_title": "Añadir una máquina",
     "os_win": "Descargar para Windows",
     "os_mac": "Descargar para macOS",

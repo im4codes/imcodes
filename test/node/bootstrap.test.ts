@@ -1,3 +1,4 @@
+import { CONTROLLED_NODE_ABI_GLIBC217, CONTROLLED_NODE_ABI_MODERN } from '../../shared/controlled-node-abi.js';
 import { describe, it, expect, vi } from 'vitest';
 import { createHash } from 'node:crypto';
 import { mkdtempSync } from 'node:fs';
@@ -906,5 +907,40 @@ describe('isCurrentExecutableStable', () => {
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
+  });
+});
+
+
+describe('bootstrap ABI authority before protected side effects', () => {
+  it.each([undefined, CONTROLLED_NODE_ABI_MODERN])('refuses stale credential profile %j on compat before elevation or repair', async (profile) => {
+    const deps = makeDeps({ abiProfile: CONTROLLED_NODE_ABI_GLIBC217,
+      loadCredential: vi.fn(async () => ({ ...CRED, abiProfile: profile })) });
+    await expect(bootstrapControlledNodeWithDisposition(deps)).rejects.toThrow('persisted ABI profile');
+    expect(deps.prepareCredentialDir).not.toHaveBeenCalled();
+    expect(deps.assertElevated).not.toHaveBeenCalled();
+    expect(deps.installDefinition).not.toHaveBeenCalled();
+    expect(deps.phases).toEqual([]);
+  });
+
+  it('refuses a missing prepared journal profile before interrupted-upgrade recovery', async () => {
+    const recovery = vi.fn();
+    const deps = makeDeps({ abiProfile: CONTROLLED_NODE_ABI_GLIBC217,
+      loadCredential: vi.fn(async () => ({ ...CRED, abiProfile: CONTROLLED_NODE_ABI_GLIBC217 })),
+      loadInstallJournal: vi.fn(async () => ({ version: INSTALL_JOURNAL_VERSION, phase: 'credential_prepared', updatedAt: 5 })),
+      recoverInterruptedUpgrade: recovery,
+    });
+    await expect(bootstrapControlledNodeWithDisposition(deps)).rejects.toThrow('persisted ABI profile');
+    expect(recovery).not.toHaveBeenCalled();
+    expect(deps.phases).toEqual([]);
+  });
+
+  it('pins profile in every subsequent durable phase, not only the credential', async () => {
+    const deps = makeDeps({ abiProfile: CONTROLLED_NODE_ABI_GLIBC217,
+      redeemEnrollmentV2: vi.fn(async () => ({ ...CRED, abiProfile: CONTROLLED_NODE_ABI_GLIBC217 })) });
+    const result = await bootstrapControlledNodeWithDisposition(deps);
+    expect(result.credential.abiProfile).toBe(CONTROLLED_NODE_ABI_GLIBC217);
+    expect(result.journal.abiProfile).toBe(CONTROLLED_NODE_ABI_GLIBC217);
+    expect(result.journal.phase).toBe('service_start_requested');
+    expect(deps.writeInstallPhase).toHaveBeenCalledWith(expect.any(String), 'credential_prepared', expect.objectContaining({abiProfile: CONTROLLED_NODE_ABI_GLIBC217}));
   });
 });

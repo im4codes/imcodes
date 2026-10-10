@@ -1,3 +1,6 @@
+import { linuxControlledNodeAbiDetectionScript } from './controlled-node-abi-detection.js';
+import { CONTROLLED_NODE_ARTIFACT_HEADERS } from '../../../shared/controlled-node-artifacts.js';
+import { CONTROLLED_NODE_ABI_GLIBC217, CONTROLLED_NODE_ABI_PROFILE_FIELD, type ControlledNodeAbiProfile } from '../../../shared/controlled-node-abi.js';
 /**
  * One-line install commands for controlled nodes.
  *
@@ -90,6 +93,7 @@ function renderShellScript(
   serverUrl: string,
   installCode: string,
   os: ControlledNodeOs,
+  abiProfile?: ControlledNodeAbiProfile,
 ): string {
   const expectOs = os === 'mac' ? 'mac' : 'linux';
   const curlProtocolFlags = `${curlTransportFlags(serverUrl)} `;
@@ -131,14 +135,22 @@ imcodes_install() {
     exit 1
   fi
 
+  __ABI_DETECTION__
+
   imcodes_dir=$(mktemp -d 2>/dev/null || mktemp -d -t imcodes)
   trap 'rm -rf "$imcodes_dir"' EXIT INT TERM
   imcodes_binary="$imcodes_dir/imcodes-node"
+  imcodes_headers="$imcodes_dir/headers"
 
   echo "IM.codes: downloading..."
   if command -v curl >/dev/null 2>&1; then
+    set -- --data-urlencode "ticket=$imcodes_code"
+    if [ "$imcodes_abi" = '__COMPAT_ABI__' ]; then
+      set -- "$@" --data-urlencode "__ABI_FIELD__=$imcodes_abi"
+    fi
     curl -fsSL __CURL_PROTOCOL_FLAGS__\
-      --data-urlencode "ticket=$imcodes_code" \
+      "$@" \
+      -D "$imcodes_headers" \
       "$imcodes_server__DOWNLOAD_PATH__" -o "$imcodes_binary" || {
       echo "IM.codes: download failed. The install command may have been revoked or used up." >&2
       exit 1
@@ -169,6 +181,12 @@ imcodes_install() {
     exit 1
   fi
 
+  if [ "$imcodes_abi" = '__COMPAT_ABI__' ]; then
+    imcodes_response_abi=$(awk 'tolower($1)=="__ABI_HEADER__:" {gsub(/\r/,"",$2);print $2}' "$imcodes_headers")
+    [ "$imcodes_response_abi" = "$imcodes_abi" ] || {
+      echo "IM.codes: server did not acknowledge the requested ABI; refusing to execute." >&2; exit 1;
+    }
+  fi
   chmod 700 "$imcodes_binary"
   echo "IM.codes: installing..."
   "$imcodes_binary"
@@ -176,6 +194,10 @@ imcodes_install() {
 
 imcodes_install
 `
+    .replace('__ABI_DETECTION__', linuxControlledNodeAbiDetectionScript(abiProfile))
+    .replace(/__ABI_FIELD__/g, CONTROLLED_NODE_ABI_PROFILE_FIELD)
+    .replace(/__COMPAT_ABI__/g, CONTROLLED_NODE_ABI_GLIBC217)
+    .replace(/__ABI_HEADER__/g, CONTROLLED_NODE_ARTIFACT_HEADERS.ABI_PROFILE)
     .replace(/__SERVER_URL__/g, serverUrl)
     .replace(/__INSTALL_CODE__/g, installCode)
     .replace(/__EXPECT_OS__/g, expectOs)
@@ -292,6 +314,7 @@ export function renderControlledNodeInstallScript(input: {
   installCode: string;
   os: ControlledNodeOs;
   arch: ControlledNodeArtifactArch;
+  abiProfile?: ControlledNodeAbiProfile;
   /** Required only for Windows; obtained from the ticket-pinned release manifest. */
   windowsAuthenticodeSignerSha256?: string;
 }): InstallCommandScript {
@@ -307,7 +330,7 @@ export function renderControlledNodeInstallScript(input: {
       contentType: 'text/plain; charset=utf-8',
     }
     : {
-      body: renderShellScript(input.serverUrl, input.installCode, input.os),
+      body: renderShellScript(input.serverUrl, input.installCode, input.os, input.abiProfile),
       contentType: 'text/plain; charset=utf-8',
     };
 }

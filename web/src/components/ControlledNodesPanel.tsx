@@ -1,3 +1,4 @@
+import { CONTROLLED_NODE_ABI_GLIBC217 } from '@shared/controlled-node-abi.js';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import {
@@ -106,7 +107,7 @@ function downloadLabel(
   t: (key: string, opts?: Record<string, string>) => string,
 ): string {
   return t('controlled_nodes.download_target', {
-    os: t(`controlled_nodes.os_${target.os}`),
+    os: target.abiProfile === CONTROLLED_NODE_ABI_GLIBC217 ? t('controlled_nodes.linux_compat_headless') : t(`controlled_nodes.os_${target.os}`),
     arch: target.arch,
   });
 }
@@ -115,7 +116,7 @@ function findArtifactForTarget(
   artifacts: ControlledNodeArtifactMetadata[],
   target: ControlledNodeArtifactSelection,
 ): ControlledNodeArtifactMetadata | undefined {
-  return artifacts.find((a) => a.os === target.os && a.arch === target.arch);
+  return artifacts.find((a) => artifactSelectionKey(a) === artifactSelectionKey(target));
 }
 
 
@@ -1329,7 +1330,7 @@ export function ControlledNodesPanel({
                 <div class="controlled-nodes-platform">
                   <span class="controlled-nodes-platform-glyph" aria-hidden="true">{platform.glyph}</span>
                   <div class="controlled-nodes-platform-copy">
-                    <strong>{platform.name}</strong>
+                    <strong>{target.abiProfile === CONTROLLED_NODE_ABI_GLIBC217 ? t('controlled_nodes.linux_compat_headless') : platform.name}</strong>
                     {meta && <span class="controlled-nodes-artifact-meta">{meta}</span>}
                   </div>
                 </div>

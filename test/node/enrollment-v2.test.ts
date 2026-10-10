@@ -1,3 +1,4 @@
+import { CONTROLLED_NODE_ABI_GLIBC217 } from '../../shared/controlled-node-abi.js';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { mkdtemp, open, readdir, rename, rm, readFile, stat, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -517,5 +518,17 @@ describe('copyCleanExecutable', () => {
     } finally {
       await source.close();
     }
+  });
+});
+
+describe('enrollment ABI identity', () => {
+  it('round-trips explicit compat and rejects a trailer for another executable profile', () => {
+    const blob = { serverUrl: 'https://im.example', enrollToken: 'abi-ticket', abiProfile: CONTROLLED_NODE_ABI_GLIBC217 };
+    expect(parseEnrollmentBlob(Buffer.concat([Buffer.from('prefix'), encodeEnrollmentBlob(blob)]))).toEqual(blob);
+    const identity = generateInstallIdentity();
+    const runtime = { platform: 'linux', arch: 'x64', hostname: 'abi-test', abiProfile: CONTROLLED_NODE_ABI_GLIBC217 } as const;
+    expect(buildEnrollRedeemV2Request(blob, identity, runtime)).toMatchObject({ abiProfile: CONTROLLED_NODE_ABI_GLIBC217 });
+    expect(() => buildEnrollRedeemV2Request({ ...blob, abiProfile: undefined }, identity, runtime)).toThrow('enrollment_abi_profile_mismatch');
+    expect(() => buildEnrollRedeemV2Request(blob, identity)).toThrow('enrollment_abi_profile_mismatch');
   });
 });

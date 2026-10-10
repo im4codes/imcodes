@@ -1,3 +1,7 @@
+import {
+  CONTROLLED_NODE_ABI_MODERN, CONTROLLED_NODE_RUNTIME_ABI_PROFILE,
+  normalizeControlledNodeAbiProfile, type ControlledNodeAbiProfile,
+} from '../../shared/controlled-node-abi.js';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { constants as fsConstants, type Stats } from 'node:fs';
 import { chmod, chown, lstat, mkdir, open, readdir, readFile, rename, unlink } from 'node:fs/promises';
@@ -33,6 +37,7 @@ import {
 } from './installer.js';
 
 export interface ControlledNodeCredential {
+  abiProfile?: ControlledNodeAbiProfile;
   serverId: string;
   /** Server-minted public identity. Optional only for pre-migration credentials. */
   nodeId?: string;
@@ -54,6 +59,7 @@ export interface PendingInstallIdentity extends InstallIdentity {
 }
 
 export interface EnrollmentRuntimeIdentity {
+  abiProfile?: ControlledNodeAbiProfile;
   platform: string;
   arch: string;
   hostname: string;
@@ -630,6 +636,9 @@ export async function loadCredential(
     || (value.nodeId !== undefined && !isControlledNodeId(value.nodeId))) {
       throw new Error('credential_invalid');
     }
+    if (normalizeControlledNodeAbiProfile(value.abiProfile) !== CONTROLLED_NODE_RUNTIME_ABI_PROFILE) {
+      throw new Error('credential_abi_profile_mismatch');
+    }
     return value as ControlledNodeCredential;
   } catch (error) {
     if (isNotFoundError(error)) return null;
@@ -663,6 +672,10 @@ export function buildEnrollRedeemV2Request(
     hostname: os.hostname(),
   },
 ): EnrollRedeemV2Request {
+  const abiProfile = runtime.abiProfile ?? CONTROLLED_NODE_RUNTIME_ABI_PROFILE;
+  if (normalizeControlledNodeAbiProfile(blob.abiProfile) !== abiProfile) {
+    throw new Error('enrollment_abi_profile_mismatch');
+  }
   return {
     version: ENROLLMENT_REDEEM_VERSION_V2,
     enrollToken: blob.enrollToken,
@@ -671,6 +684,7 @@ export function buildEnrollRedeemV2Request(
     hostname: runtime.hostname,
     os: enrollmentOsFromNodePlatform(runtime.platform),
     arch: runtime.arch,
+    ...(abiProfile !== CONTROLLED_NODE_ABI_MODERN ? { abiProfile } : {}),
   };
 }
 
@@ -699,11 +713,15 @@ export async function redeemEnrollmentV2(
   if (responseOrigin !== expectedOrigin) throw new Error('enrollment_redeem_origin_mismatch');
   if (!response.ok) throw new Error(`enrollment_redeem_failed:${response.status}`);
   const value = await response.json() as EnrollRedeemV2Response & { token?: string };
+  if (normalizeControlledNodeAbiProfile(value.abiProfile) !== normalizeControlledNodeAbiProfile(body.abiProfile)) {
+    throw new Error('enrollment_redeem_abi_profile_mismatch');
+  }
   if ('token' in value && value.token) throw new Error('enrollment_redeem_v2_returned_raw_token');
   if (value.nodeRole !== NODE_ROLE.CONTROLLED || !value.serverId || !isControlledNodeId(value.nodeId)) {
     throw new Error('enrollment_redeem_invalid_response');
   }
   return {
+    ...(body.abiProfile ? { abiProfile: body.abiProfile } : {}),
     serverId: value.serverId,
     nodeId: value.nodeId,
     token: identity.nodeToken,

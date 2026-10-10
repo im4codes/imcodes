@@ -1,3 +1,6 @@
+import {
+  CONTROLLED_NODE_ABI_GLIBC217, CONTROLLED_NODE_ABI_MODERN, CONTROLLED_NODE_ABI_PROFILE_FIELD, normalizeControlledNodeAbiProfile,
+} from '../../shared/controlled-node-abi.js';
 import WebSocket from 'ws';
 import { randomUUID } from 'node:crypto';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
@@ -256,7 +259,9 @@ export function createPlatformRemoteDesktopWorkerHost(input: {
   onMessage(message: RemoteDesktopDaemonMessage): void;
   windows?: RemoteDesktopWorkerHostOptions;
   macos?: MacosRemoteDesktopWorkerHostOptions;
+  headless?: boolean;
 }): PlatformRemoteDesktopWorkerSelection {
+  if (input.headless) return { worker: new UnavailableRemoteDesktopWorkerHost() };
   if (input.platform === 'win32') {
     const worker = new RemoteDesktopWorkerHost(input.onMessage, input.windows);
     return worker.available()
@@ -474,7 +479,8 @@ export function createControlledNodeRuntime(
   let healthLeasePublishObservedOnce = false;
   diagnostics.record(STARTUP_DIAGNOSTIC_EVENT.PROCESS_START, { platform, arch, pid: process.pid });
   diagnostics.armHealthLeaseTimeout(STARTUP_DIAGNOSTICS_HEALTH_LEASE_TIMEOUT_MS);
-  const platformWorker = options.remoteDesktopWorker
+  const headlessProfile = normalizeControlledNodeAbiProfile(credential.abiProfile) === CONTROLLED_NODE_ABI_GLIBC217;
+  const platformWorker: PlatformRemoteDesktopWorkerSelection = headlessProfile ? { worker: new UnavailableRemoteDesktopWorkerHost() } : options.remoteDesktopWorker
     ? { worker: options.remoteDesktopWorker }
     : createPlatformRemoteDesktopWorkerHost({
       platform,
@@ -528,7 +534,7 @@ export function createControlledNodeRuntime(
     });
   const remoteDesktopWorker = platformWorker.worker;
   const remoteDesktopWorkerStartup = platformWorker.startup;
-  const remoteDesktopFeatureEnabled = isRemoteDesktopFeatureEnabled(
+  const remoteDesktopFeatureEnabled = !headlessProfile && isRemoteDesktopFeatureEnabled(
     process.env.IMCODES_REMOTE_DESKTOP_ENABLED,
     process.env.NODE_ENV,
   );
@@ -569,7 +575,7 @@ export function createControlledNodeRuntime(
    * socket and re-publishes when the set of openable displays changes. The
    * injected test seam is hermetic and never probes the real machine.
    */
-  const linuxDisplayProbeEnabled = platform === 'linux' && !options.linuxDesktop;
+  const linuxDisplayProbeEnabled = !headlessProfile && platform === 'linux' && !options.linuxDesktop;
   const refreshLinuxDisplayProbe = (): void => {
     if (!linuxDisplayProbeEnabled || !x11DisplayProbeIsStale()) return;
     void refreshX11DisplayProbe().then((changed) => {
@@ -1230,7 +1236,7 @@ export function createControlledNodeRuntime(
   };
   const linuxDesktopInstallable = (): boolean => linuxDesktopMissing && linuxDesktop.provisionSupported();
   const provisionLinuxDesktop = async (): Promise<void> => {
-    if (linuxDesktopProvisionInFlight) return;
+    if (headlessProfile || linuxDesktopProvisionInFlight) return;
     linuxDesktopProvisionInFlight = true;
     logger.info('installing a basic desktop environment for remote desktop on this headless Linux box');
     try {
@@ -1450,6 +1456,8 @@ export function createControlledNodeRuntime(
     serverId: credential.serverId,
     token: credential.token,
     daemonVersion: DAEMON_VERSION,
+    ...(credential.abiProfile !== undefined && credential.abiProfile !== CONTROLLED_NODE_ABI_MODERN
+      ? { [CONTROLLED_NODE_ABI_PROFILE_FIELD]: credential.abiProfile } : {}),
     // The architecture this process is ACTUALLY running as, which the row
     // recorded at enrollment may not be. The macOS executable is universal,
     // so enrollment recorded whichever slice ran the installer -- under
@@ -1662,6 +1670,15 @@ export function createControlledNodeRuntime(
         return;
       }
       if (isControlledNodeAuthAck(message)) {
+        // Missing metadata on an old peer never changes the credential's last-good
+        // ABI. Its artifact responses still must explicitly acknowledge compat.
+        if (Object.hasOwn(message, CONTROLLED_NODE_ABI_PROFILE_FIELD)
+          && normalizeControlledNodeAbiProfile(message[CONTROLLED_NODE_ABI_PROFILE_FIELD])
+            !== normalizeControlledNodeAbiProfile(credential.abiProfile)) {
+          logger.warn('controlled node: rejected acknowledgement with mismatched ABI profile');
+          client.reconnect();
+          return;
+        }
         // An ack that names another server ID does not authenticate this node here: nothing below runs (no lease, no
         // "service healthy", no adoption) and the socket is dropped; the address is not used again for a day.
         if (!connection.onAuthenticatedAck(message)) {

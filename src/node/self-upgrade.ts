@@ -1,3 +1,7 @@
+import {
+  CONTROLLED_NODE_ABI_PROFILE_FIELD, CONTROLLED_NODE_ABI_MODERN, CONTROLLED_NODE_ABI_GLIBC217, CONTROLLED_NODE_RUNTIME_ABI_PROFILE,
+  normalizeControlledNodeAbiProfile, isControlledNodeAbiTarget, type ControlledNodeAbiProfile,
+} from '../../shared/controlled-node-abi.js';
 import { execFile, execFileSync, spawn } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { appendFile, chmod, lstat, mkdir, mkdtemp, open, opendir, readFile, rename, rm, stat, statfs, writeFile } from 'node:fs/promises';
@@ -22,8 +26,6 @@ import { DAEMON_UPGRADE_TARGET_LATEST, normalizeDaemonUpgradeTargetVersion } fro
 import { isTransientRequestFailure } from '../../shared/request-failure.js';
 import { compareImcodesVersions } from '../../shared/imcodes-version.js';
 import {
-  CONTROLLED_NODE_POSIX_UPGRADE_SCRIPT_STOP_TIMEOUT_MIN,
-  CONTROLLED_NODE_POSIX_UPGRADE_SCRIPT_TIMEOUT_MIN,
   CONTROLLED_NODE_UPGRADE_RESULT_FILE,
   CONTROLLED_NODE_UPGRADE_RESULT_STATUS,
   CONTROLLED_NODE_WINDOWS_RELEASE_TRUST_PREFLIGHT_FAILURE,
@@ -154,11 +156,13 @@ export interface ControlledNodeUpgradeCleanupDiagnostic {
 }
 
 export interface ControlledNodeArtifactTarget {
+  abiProfile?: ControlledNodeAbiProfile;
   os: ControlledNodeOs;
   arch: ControlledNodeArtifactArch;
 }
 
 export interface ControlledNodeSelfUpgradeDeps {
+  abiProfile?: ControlledNodeAbiProfile;
   fetchImpl?: typeof fetch;
   spawnDetached?: (file: string, args: readonly string[], options: { windowsHide?: boolean }) => void;
   scheduleWindowsUpgrade?: (taskName: string, taskXmlPath: string) => void;
@@ -612,7 +616,13 @@ export async function scavengeStaleControlledNodeUpgradeDirs(
 export function controlledNodeArtifactTarget(
   platform: NodeJS.Platform = process.platform,
   arch: NodeJS.Architecture = process.arch,
+  abiProfile: ControlledNodeAbiProfile = CONTROLLED_NODE_RUNTIME_ABI_PROFILE,
 ): ControlledNodeArtifactTarget | null {
+  if (abiProfile === CONTROLLED_NODE_ABI_GLIBC217) {
+    return platform === 'linux' && arch === 'x64'
+      ? { os: CONTROLLED_NODE_OS_LINUX, arch: CONTROLLED_NODE_ARCH_X64, abiProfile } : null;
+  }
+  if (abiProfile !== CONTROLLED_NODE_ABI_MODERN) return null;
   if (platform === 'win32' && arch === 'x64') return { os: CONTROLLED_NODE_OS_WIN, arch: CONTROLLED_NODE_ARCH_X64 };
   if (platform === 'darwin' && (arch === 'arm64' || arch === 'x64')) {
     return { os: CONTROLLED_NODE_OS_MAC, arch: CONTROLLED_NODE_ARTIFACT_ARCH_UNIVERSAL };
@@ -630,6 +640,7 @@ export function controlledNodeArtifactUpgradeUrl(
   url.searchParams.set('serverId', credential.serverId);
   url.searchParams.set('os', target.os);
   url.searchParams.set('arch', target.arch);
+  if (target.abiProfile !== undefined && target.abiProfile !== CONTROLLED_NODE_ABI_MODERN) url.searchParams.set(CONTROLLED_NODE_ABI_PROFILE_FIELD, target.abiProfile);
   if (asset !== CONTROLLED_NODE_ARTIFACT_ASSETS.NODE) url.searchParams.set('asset', asset);
   return url.toString();
 }
@@ -762,6 +773,15 @@ async function downloadArtifact(input: {
     },
   });
   if (!response.ok) throw new Error(`download_failed_${response.status}`);
+  const abiProfile = normalizeControlledNodeAbiProfile(input.target.abiProfile);
+  if (!abiProfile || !isControlledNodeAbiTarget(input.target.os, input.target.arch, abiProfile)) throw new Error('invalid_artifact_abi_profile');
+  if (asset === CONTROLLED_NODE_ARTIFACT_ASSETS.NODE) {
+    const responseProfile = readHeader(response.headers, CONTROLLED_NODE_ARTIFACT_HEADERS.ABI_PROFILE);
+    if (normalizeControlledNodeAbiProfile(responseProfile === null ? undefined : responseProfile) !== abiProfile) {
+      await response.body?.cancel().catch(() => {});
+      throw new Error('artifact_abi_profile_mismatch');
+    }
+  }
   const expectedSha = readHeader(response.headers, CONTROLLED_NODE_ARTIFACT_HEADERS.SHA256);
   const filename = readHeader(response.headers, CONTROLLED_NODE_ARTIFACT_HEADERS.FILENAME) || basename(defaultStagedExecutablePath());
   if (input.expectedFileName && basename(filename) !== input.expectedFileName) throw new Error('artifact_filename_mismatch');
@@ -825,6 +845,7 @@ async function downloadArtifact(input: {
       fileName: basename(filename),
       os: input.target.os === CONTROLLED_NODE_OS_MAC ? 'darwin' : input.target.os === CONTROLLED_NODE_OS_WIN ? 'win32' : input.target.os,
       arch: input.target.arch,
+      ...(abiProfile !== CONTROLLED_NODE_ABI_MODERN ? { abiProfile } : {}),
       size: downloaded.sizeBytes,
       sha256: downloaded.sha256,
       ...(authenticodeSignerSha256 ? { authenticodeSignerSha256 } : {}),
@@ -1931,30 +1952,8 @@ export async function refreshControlledNodeRemoteDesktopWorker(
   }
 }
 
-/**
- * Run Linux replacement outside imcodes-node.service's cgroup. A detached
- * child remains owned by the service and is killed by `systemctl stop` before
- * it can copy the new executable or restart the unit.
- */
-export function scheduleLinuxControlledNodeUpgrade(
-  unitName: string,
-  scriptPath: string,
-  runCommand: (file: string, args: readonly string[]) => void = (file, args) => {
-    execFileSync(file, [...args], { stdio: 'ignore' });
-  },
-): void {
-  runCommand('systemd-run', [
-    `--unit=${unitName}`,
-    '--collect',
-    '--no-block',
-    '--property=Type=oneshot',
-    // The script hosts the whole health window and a rollback: it must outlive both.
-    `--property=TimeoutStartSec=${CONTROLLED_NODE_POSIX_UPGRADE_SCRIPT_TIMEOUT_MIN}min`,
-    `--property=TimeoutStopSec=${CONTROLLED_NODE_POSIX_UPGRADE_SCRIPT_STOP_TIMEOUT_MIN}min`,
-    '/bin/sh',
-    scriptPath,
-  ]);
-}
+export { scheduleLinuxControlledNodeUpgrade } from './linux-upgrade-scheduler.js';
+import { scheduleLinuxControlledNodeUpgrade } from './linux-upgrade-scheduler.js';
 
 export async function startControlledNodeSelfUpgrade(
   credential: ControlledNodeCredential,
@@ -1964,7 +1963,11 @@ export async function startControlledNodeSelfUpgrade(
   const targetVersion = normalizeDaemonUpgradeTargetVersion(rawTargetVersion);
   const platform = deps.platform ?? process.platform;
   const arch = deps.arch ?? process.arch;
-  const target = controlledNodeArtifactTarget(platform, arch);
+  const abiProfile = deps.abiProfile ?? CONTROLLED_NODE_RUNTIME_ABI_PROFILE;
+  if (normalizeControlledNodeAbiProfile(credential.abiProfile) !== abiProfile) {
+    return { ok: false, targetVersion, reason: 'credential_abi_profile_mismatch' };
+  }
+  const target = controlledNodeArtifactTarget(platform, arch, abiProfile);
   if (!target) return { ok: false, targetVersion, reason: 'unsupported_platform' };
   const fetchImpl = deps.fetchImpl ?? fetch;
   if (!fetchImpl) return { ok: false, targetVersion, reason: 'fetch_unavailable' };
@@ -2031,7 +2034,7 @@ export async function startControlledNodeSelfUpgrade(
       onProgress: recordProgress,
     }), { sleep: deps.sleep });
     if (!downloaded.version) throw new Error('missing_artifact_version');
-    const helper = await withArtifactDownloadRetries(
+    const helper = abiProfile === CONTROLLED_NODE_ABI_GLIBC217 ? undefined : await withArtifactDownloadRetries(
       () => downloadControlledNodeComputerUseHelper({ credential, target, dir: stagingDir, fetchImpl }),
       { sleep: deps.sleep },
     );
@@ -2043,7 +2046,7 @@ export async function startControlledNodeSelfUpgrade(
     // unconditionally (macOS gets neither -- its own bootstrap coordinator
     // fetches its component set independently) is cheap and simpler than
     // branching on platform here too.
-    const remoteDesktopWorker = (await withArtifactDownloadRetries(() => downloadControlledNodeRemoteDesktopWorker({
+    const remoteDesktopWorker = abiProfile === CONTROLLED_NODE_ABI_GLIBC217 ? undefined : (await withArtifactDownloadRetries(() => downloadControlledNodeRemoteDesktopWorker({
       credential,
       target,
       dir: stagingDir,

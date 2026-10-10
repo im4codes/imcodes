@@ -3,6 +3,13 @@
 // The product ships one downloadable artifact per OS. macOS is a Universal 2
 // binary while the enrolled machine still reports its real runtime architecture.
 
+import {
+  CONTROLLED_NODE_ABI_GLIBC217,
+  CONTROLLED_NODE_ABI_MODERN,
+  isControlledNodeAbiTarget,
+  normalizeControlledNodeAbiProfile,
+  type ControlledNodeAbiProfile,
+} from './controlled-node-abi.js';
 import { AUTH_IDENTITY_ERRORS } from './auth-identity.js';
 
 export const CONTROLLED_NODE_OS_WIN = 'win' as const;
@@ -29,6 +36,7 @@ export type ControlledNodeArtifactArch =
 export interface ControlledNodeArtifactPair {
   os: ControlledNodeOs;
   arch: ControlledNodeArtifactArch;
+  abiProfile?: ControlledNodeAbiProfile;
 }
 
 /** Fixed triple for Win x64 / macOS Universal 2 / Linux x64. */
@@ -37,6 +45,12 @@ export const CONTROLLED_NODE_CANONICAL_ARTIFACTS: readonly ControlledNodeArtifac
   { os: CONTROLLED_NODE_OS_MAC, arch: CONTROLLED_NODE_ARTIFACT_ARCH_UNIVERSAL },
   { os: CONTROLLED_NODE_OS_LINUX, arch: CONTROLLED_NODE_ARCH_X64 },
 ] as const;
+
+/** Published variants, with old peers seeing only the canonical modern triple. */
+export const CONTROLLED_NODE_ARTIFACT_VARIANTS: readonly ControlledNodeArtifactPair[] = [
+  ...CONTROLLED_NODE_CANONICAL_ARTIFACTS,
+  { os: CONTROLLED_NODE_OS_LINUX, arch: CONTROLLED_NODE_ARCH_X64, abiProfile: CONTROLLED_NODE_ABI_GLIBC217 },
+];
 
 export const CONTROLLED_NODE_OS_ORDER: readonly ControlledNodeOs[] = [
   CONTROLLED_NODE_OS_WIN,
@@ -166,20 +180,30 @@ export const CONTROLLED_NODE_ARTIFACT_HEADERS = {
   SIZE_BYTES: 'x-imcodes-node-artifact-size-bytes',
   FILENAME: 'x-imcodes-node-artifact-filename',
   VERSION: 'x-imcodes-node-artifact-version',
+  ABI_PROFILE: 'x-imcodes-node-artifact-abi-profile',
   AUTHENTICODE_SIGNER_SHA256: 'x-imcodes-node-artifact-authenticode-signer-sha256',
   REMOTE_DESKTOP_PROTOCOL_VERSION: 'x-imcodes-remote-desktop-protocol-version',
 } as const;
 
-export function controlledNodeArtifactKey(os: ControlledNodeOs, arch: ControlledNodeArtifactArch): string {
-  return `${os}:${arch}`;
+export function controlledNodeArtifactKey(
+  os: ControlledNodeOs, arch: ControlledNodeArtifactArch, abiProfile?: ControlledNodeAbiProfile,
+): string {
+  return abiProfile === undefined || abiProfile === CONTROLLED_NODE_ABI_MODERN
+    ? `${os}:${arch}` : `${os}:${arch}:${abiProfile}`;
 }
 
-export function isCanonicalControlledNodePair(os: string, arch: string): boolean {
+export function isCanonicalControlledNodePair(os: string, arch: string, abiProfile?: unknown): boolean {
+  if (!isControlledNodeAbiTarget(os, arch, abiProfile)) return false;
   return CONTROLLED_NODE_CANONICAL_ARTIFACTS.some((pair) => pair.os === os && pair.arch === arch);
 }
 
 /** Normalize a current artifact target or a legacy macOS runtime target. */
-export function normalizeControlledNodeArtifactPair(os: string, arch: string): ControlledNodeArtifactPair | null {
+export function normalizeControlledNodeArtifactPair(os: string, arch: string, abiProfile?: unknown): ControlledNodeArtifactPair | null {
+  const profile = normalizeControlledNodeAbiProfile(abiProfile);
+  if (!profile || !isControlledNodeAbiTarget(os, arch, profile)) return null;
+  if (profile === CONTROLLED_NODE_ABI_GLIBC217) {
+    return { os: CONTROLLED_NODE_OS_LINUX, arch: CONTROLLED_NODE_ARCH_X64, abiProfile: profile };
+  }
   const canonical = CONTROLLED_NODE_CANONICAL_ARTIFACTS.find((pair) => pair.os === os && pair.arch === arch);
   if (canonical) return canonical;
   if (os === CONTROLLED_NODE_OS_MAC
@@ -216,7 +240,9 @@ export function compareControlledNodeArtifactPairs(
 ): number {
   const osCmp = CONTROLLED_NODE_OS_ORDER.indexOf(a.os) - CONTROLLED_NODE_OS_ORDER.indexOf(b.os);
   if (osCmp !== 0) return osCmp;
-  return CONTROLLED_NODE_ARCH_ORDER.indexOf(a.arch) - CONTROLLED_NODE_ARCH_ORDER.indexOf(b.arch);
+  const archCmp = CONTROLLED_NODE_ARCH_ORDER.indexOf(a.arch) - CONTROLLED_NODE_ARCH_ORDER.indexOf(b.arch);
+  if (archCmp !== 0) return archCmp;
+  return Number(a.abiProfile === CONTROLLED_NODE_ABI_GLIBC217) - Number(b.abiProfile === CONTROLLED_NODE_ABI_GLIBC217);
 }
 
 /* ────────────────────────────────────────────────────────────────────────── */

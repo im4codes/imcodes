@@ -1,3 +1,7 @@
+import {
+  CONTROLLED_NODE_ABI_MODERN, CONTROLLED_NODE_ABI_GLIBC217,
+  CONTROLLED_NODE_ABI_PROFILE_FIELD, normalizeControlledNodeAbiProfile, type ControlledNodeAbiProfile,
+} from '../../../shared/controlled-node-abi.js';
 /**
  * WsBridge: per-server WebSocket bridge between daemon and browser clients.
  * Replaces the CF DaemonBridge Durable Object.
@@ -2104,10 +2108,12 @@ function heartbeatAckWithClock(
   serverId?: string,
   /** Controlled nodes only: the deployment's public origins (see controlledNodeAdvertisedUrls). */
   publicUrls?: readonly string[],
+  abiProfile?: ControlledNodeAbiProfile,
 ): Record<string, unknown> {
   const sentAt = heartbeat[CLOCK_SYNC_FIELD.SENT_AT];
   return {
     type: 'heartbeat_ack',
+    ...(abiProfile === CONTROLLED_NODE_ABI_GLIBC217 ? { [CONTROLLED_NODE_ABI_PROFILE_FIELD]: abiProfile } : {}),
     ...(publicUrls && publicUrls.length > 0 ? { [CONTROLLED_NODE_ACK_SERVER_URLS_FIELD]: publicUrls } : {}),
     ...(controlledNodeId && serverId
       ? { [CONTROLLED_NODE_ACK_NODE_ID_FIELD]: controlledNodeId, [CONTROLLED_NODE_ACK_SERVER_ID_FIELD]: serverId }
@@ -2163,6 +2169,7 @@ export class WsBridge {
   /** Current daemon generation has completed durable route reconciliation. */
   private remoteDesktopAuthorityReadyGeneration: number | null = null;
   private daemonVersion: string | null = null;
+  private daemonControlledAbiProfile: ControlledNodeAbiProfile = CONTROLLED_NODE_ABI_MODERN;
   private daemonControlledOs: ControlledNodeOs | null = null;
   /** The authenticated controlled node's public ID (from `servers.node_id`), sent back in its heartbeat acks. */
   private daemonControlledNodeId: ControlledNodeId | null = null;
@@ -2240,6 +2247,7 @@ export class WsBridge {
       this.daemonControlledNodeId,
       this.serverId,
       this.daemonNodeRole === NODE_ROLE.CONTROLLED ? controlledNodeAdvertisedUrls() : undefined,
+      this.daemonControlledAbiProfile,
     ))); } catch { /* ignore */ }
     void this.sendRemoteDesktopNodeContext(db, ws, connectionGeneration);
   }
@@ -5810,6 +5818,7 @@ export class WsBridge {
           revoked_at?: number | null;
           os?: string | null;
           node_id?: string | null;
+          abi_profile?: unknown;
           owner_status?: string | null;
           controlled_upgrade_status?: string | null;
           controlled_upgrade_target_version?: string | null;
@@ -5830,8 +5839,9 @@ export class WsBridge {
             revoked_at?: number | null;
             os?: string | null;
             node_id?: string | null;
+            abi_profile?: unknown;
           }>(
-            `SELECT token_hash, user_id, node_role, revoked_at, os, node_id,
+            `SELECT token_hash, user_id, node_role, revoked_at, os, node_id, abi_profile,
                     (SELECT u.status FROM users u WHERE u.id = servers.user_id) AS owner_status,
                     controlled_worker_refresh_attempt_id, controlled_worker_refresh_phase,
                     controlled_worker_refresh_installed_version, controlled_worker_refresh_target_version,
@@ -5879,6 +5889,18 @@ export class WsBridge {
           return;
         }
 
+        if (server.node_role === NODE_ROLE.CONTROLLED) {
+          const storedProfile = normalizeControlledNodeAbiProfile(server.abi_profile);
+          const advertisedProfile = normalizeControlledNodeAbiProfile(msg[CONTROLLED_NODE_ABI_PROFILE_FIELD]);
+          if (!storedProfile || advertisedProfile !== storedProfile) {
+            ws.close(4002, 'abi_profile_mismatch');
+            finishLocalAuth();
+            return;
+          }
+          this.daemonControlledAbiProfile = storedProfile;
+        } else {
+          this.daemonControlledAbiProfile = CONTROLLED_NODE_ABI_MODERN;
+        }
         // node_role is authoritative from the DB; any client-declared `nodeRole`
         // in the auth frame is IGNORED (10.2). A controlled node's WS is only a
         // presence/heartbeat + MACHINE_EXEC_RESULT surface.

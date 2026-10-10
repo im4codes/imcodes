@@ -3667,6 +3667,7 @@
       "purpose": "這個是做什麼的：模型要說「這個改動在 Windows / macOS / Linux 上沒問題」,唯一誠實的做法是真的拿去那台機器上跑一遍。這裡授權的機器,就是允許它用來做這件事的——跨平台真機驗證,而不是靠推理斷言「應該可以」。只有真正需要時才會用到,授權按機器單獨給、隨時可撤銷。"
     },
     "short": "節點",
+    "linux_compat_headless": "Linux（glibc 2.17，無桌面）",
     "add_title": "新增機器",
     "os_win": "下載 Windows 版",
     "os_mac": "下載 macOS 版",

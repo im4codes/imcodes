@@ -5,6 +5,7 @@ import { createReadStream } from 'node:fs';
 import { readFile, stat, writeFile } from 'node:fs/promises';
 import { basename, join, resolve } from 'node:path';
 import process from 'node:process';
+import abiProfiles from '../shared/controlled-node-abi-profiles.json' with { type: 'json' };
 import { pathToFileURL } from 'node:url';
 
 export const NODE_EXE_MANIFEST_SCHEMA_VERSION = 1;
@@ -15,6 +16,7 @@ const SUPPORTED_PLATFORMS = new Set(['linux', 'darwin', 'win32']);
 const SUPPORTED_ARCHES = new Set(['x64', 'arm64', 'universal']);
 const EXPECTED_TARGET_BY_ARTIFACT = new Map([
   ['imcodes-node-linux', { os: 'linux', arch: 'x64' }],
+  [abiProfiles.GLIBC217.fileName, { os: 'linux', arch: 'x64' }],
   ['imcodes-node-macos', { os: 'darwin', arch: 'universal' }],
   ['imcodes-node.exe', { os: 'win32', arch: 'x64' }],
 ]);
@@ -101,6 +103,10 @@ export async function createNodeExeManifest({
   helperPath,
   helperRelativePath,
   authenticodeSignerSha256,
+  abiProfile,
+  nodeProvider,
+  nodeBinarySha256,
+  seaBlobSha256,
 }) {
   if (!SUPPORTED_PLATFORMS.has(os)) throw new Error(`unsupported manifest os: ${os}`);
   if (!SUPPORTED_ARCHES.has(arch)) throw new Error(`unsupported manifest arch: ${arch}`);
@@ -134,7 +140,7 @@ export async function createNodeExeManifest({
     && (typeof authenticodeSignerSha256 !== 'string' || !SHA256_RE.test(authenticodeSignerSha256))) {
     throw new Error('invalid Authenticode signer SHA-256');
   }
-  return {
+  const manifest = {
     schemaVersion: NODE_EXE_MANIFEST_SCHEMA_VERSION,
     artifact: {
       fileName: basename(artifactPath),
@@ -142,6 +148,7 @@ export async function createNodeExeManifest({
       arch,
       size: file.size,
       sha256: await sha256File(artifactPath),
+      ...(abiProfile !== undefined ? { abiProfile } : {}),
       ...(authenticodeSignerSha256 ? { authenticodeSignerSha256 } : {}),
     },
     ...(computerUseHelper ? { computerUseHelper } : {}),
@@ -150,6 +157,7 @@ export async function createNodeExeManifest({
       nodeArchive,
       nodeArchiveSha256,
       postjectVersion,
+      ...(nodeProvider !== undefined ? { nodeProvider, nodeBinarySha256, seaBlobSha256 } : {}),
       ...(arch === 'universal' ? { nodeArchives } : {}),
     },
     build: {
@@ -157,6 +165,7 @@ export async function createNodeExeManifest({
       version: normalizedBuildVersion,
     },
   };
+  return assertManifestShape(manifest, artifactPath);
 }
 
 export async function writeNodeExeManifest(manifest, outputPath) {
@@ -193,6 +202,22 @@ function assertManifestShape(value, manifestPath) {
   if (typeof toolchain.nodeVersion !== 'string' || !/^v\d+\.\d+\.\d+$/.test(toolchain.nodeVersion)) fail('toolchain.nodeVersion is invalid');
   if (typeof toolchain.nodeArchive !== 'string' || basename(toolchain.nodeArchive) !== toolchain.nodeArchive || toolchain.nodeArchive.length === 0) fail('toolchain.nodeArchive is invalid');
   if (typeof toolchain.nodeArchiveSha256 !== 'string' || !SHA256_RE.test(toolchain.nodeArchiveSha256)) fail('toolchain.nodeArchiveSha256 is invalid');
+  const profile = artifact.abiProfile === undefined ? abiProfiles.MODERN.id : artifact.abiProfile;
+  if (!Object.values(abiProfiles).some((entry) => entry.id === profile)) fail('unknown ABI profile');
+  const compat = abiProfiles.GLIBC217;
+  if (profile === abiProfiles.GLIBC217.id) {
+    if (artifact.os !== 'linux' || artifact.arch !== 'x64' || artifact.fileName !== compat.fileName) fail('incompatible ABI target');
+    if (toolchain.nodeProvider !== compat.provider
+      || toolchain.nodeVersion !== compat.nodeVersion
+      || toolchain.nodeArchive !== compat.nodeArchive
+      || toolchain.nodeArchiveSha256 !== compat.nodeArchiveSha256
+      || toolchain.nodeBinarySha256 !== compat.nodeBinarySha256
+      || typeof toolchain.seaBlobSha256 !== 'string' || !SHA256_RE.test(toolchain.seaBlobSha256)) fail('invalid compatible runtime provenance');
+    if (computerUseHelper !== undefined) fail('glibc217 profile is headless');
+  } else {
+    if (artifact.fileName === compat.fileName) fail('compat filename requires its explicit ABI profile');
+    if (toolchain.nodeProvider !== undefined && toolchain.nodeProvider !== abiProfiles.MODERN.provider) fail('modern runtime must use official provider');
+  }
   if (typeof toolchain.postjectVersion !== 'string' || toolchain.postjectVersion.length === 0) fail('toolchain.postjectVersion is invalid');
   if (artifact.arch === 'universal') {
     try {
@@ -230,7 +255,7 @@ export async function verifyNodeExeManifest(manifestPath, artifactDirectory) {
 export async function verifyNodeExeManifestSet(artifactDirectory, expectedFileNames) {
   if (!Array.isArray(expectedFileNames) || expectedFileNames.length === 0) throw new Error('expected at least one controlled-node artifact');
   const seen = new Set();
-  let expectedToolchain;
+  const toolchainsByProfile = new Map();
   let expectedCommit = process.env.GITHUB_SHA?.trim();
   let expectedVersion = process.env.IMCODES_BUILD_VERSION?.trim() || process.env.APP_VERSION?.trim();
   if (expectedVersion) expectedVersion = normalizeNodeExeBuildVersion(expectedVersion);
@@ -247,7 +272,9 @@ export async function verifyNodeExeManifestSet(artifactDirectory, expectedFileNa
       nodeVersion: manifest.toolchain.nodeVersion,
       postjectVersion: manifest.toolchain.postjectVersion,
     });
-    expectedToolchain ??= toolchainKey;
+    const profile = manifest.artifact.abiProfile ?? abiProfiles.MODERN.id;
+    const expectedToolchain = toolchainsByProfile.get(profile) ?? toolchainKey;
+    toolchainsByProfile.set(profile, expectedToolchain);
     if (toolchainKey !== expectedToolchain) throw new Error(`controlled-node artifacts were built with inconsistent toolchains: ${fileName}`);
     expectedCommit ??= manifest.build.commit;
     if (manifest.build.commit !== expectedCommit) throw new Error(`controlled-node artifact commit mismatch for ${fileName}: expected ${expectedCommit}, got ${manifest.build.commit}`);

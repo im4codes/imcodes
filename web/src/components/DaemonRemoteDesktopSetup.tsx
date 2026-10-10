@@ -1,3 +1,4 @@
+import { CONTROLLED_NODE_ABI_MODERN, normalizeControlledNodeAbiProfile } from '@shared/controlled-node-abi.js';
 import { useEffect, useRef, useState } from 'preact/hooks';
 import { createPortal } from 'preact/compat';
 import { useTranslation } from 'react-i18next';
@@ -134,7 +135,7 @@ export function DaemonRemoteDesktopSetup({
     setTargetsFailed(false);
     listAvailableExecutables()
       .then((availability) => {
-        if (!cancelled) setTargets(buildControlledNodeDownloadTargets(availability));
+        if (!cancelled) setTargets(buildControlledNodeDownloadTargets(availability).filter((target) => normalizeControlledNodeAbiProfile(target.abiProfile) === CONTROLLED_NODE_ABI_MODERN));
       })
       .catch(() => { if (!cancelled) setTargetsFailed(true); })
       .finally(() => { if (!cancelled) setTargetsLoading(false); });

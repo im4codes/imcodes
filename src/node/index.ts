@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { CONTROLLED_NODE_ABI_GLIBC217, CONTROLLED_NODE_RUNTIME_ABI_PROFILE } from '../../shared/controlled-node-abi.js';
 import { AIDESK_UI_LOG } from '../../shared/aidesk-ui-log.js';
 import { execFileSync } from 'node:child_process';
 import { bootstrapControlledNodeWithDisposition, defaultBootstrapDeps, journalPathFor, markServiceHealthy } from './bootstrap.js';
@@ -439,8 +440,9 @@ async function main(): Promise<void> {
       return null;
     });
   }
-  if (bootstrap.credential.nodeId) await startLocalManagement(bootstrap.credential.nodeId);
-  void ensureAideskDesktopEntry().then((result) => {
+  const headlessProfile = CONTROLLED_NODE_RUNTIME_ABI_PROFILE === CONTROLLED_NODE_ABI_GLIBC217;
+  if (!headlessProfile && bootstrap.credential.nodeId) await startLocalManagement(bootstrap.credential.nodeId);
+  if (!headlessProfile) void ensureAideskDesktopEntry().then((result) => {
     if (result === 'preserved') {
       logger.warn('existing user-created aiDesk desktop entry was preserved');
     } else if (result === 'failed' || result === 'unavailable') {
@@ -453,12 +455,12 @@ async function main(): Promise<void> {
   });
   // The Windows panel window host (a signed WebView2 exe) is its own sidecar: refreshed here, apart from the node's upgrade, and never
   // able to fail the node (every outcome is a logged reason; failures back off).
-  const stopAideskLocalUiRefresh = startAideskLocalUiSidecarRefresh({ credential: bootstrap.credential });
+  const stopAideskLocalUiRefresh = headlessProfile ? () => undefined : startAideskLocalUiSidecarRefresh({ credential: bootstrap.credential });
   // The installed host is verified once here, off the click path (a click then only compares the file to the proof this leaves).
-  const stopAideskLocalUiWarm = warmAideskLocalUiVerification();
+  const stopAideskLocalUiWarm = headlessProfile ? () => undefined : warmAideskLocalUiVerification();
   // macOS: a newly installed aiDesk app only takes effect when the old menu-bar process is replaced. Done here when it is safe (no active
   // remote-desktop connection), logged by reason, capped per version; a no-op on other platforms.
-  const stopMacosAideskAppRefresh = startMacosAideskAppRefresh({ activeConnections: () => runtime.remoteDesktopAccessStatus().connections.length });
+  const stopMacosAideskAppRefresh = headlessProfile ? () => undefined : startMacosAideskAppRefresh({ activeConnections: () => runtime.remoteDesktopAccessStatus().connections.length });
   runtime.start();
   const stop = () => {
     stopAideskLocalUiRefresh();

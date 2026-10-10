@@ -615,10 +615,15 @@ describe('generated installer runs against a loopback HTTP origin', () => {
   });
 
   /** Bounded run: a hang fails the test rather than stalling the suite. */
-  function runScript(script: string): Promise<{ stdout: string; stderr: string; code: number }> {
+  function runScript(script: string, abi: { glibc?: string; kernel?: string; glibcxx?: string; arch?: string } = {}): Promise<{ stdout: string; stderr: string; code: number }> {
     return new Promise((resolve) => {
       const path = join(dir, 'installer.sh');
-      void writeFile(path, `id() { echo 0; }\nuname() { echo Linux; }\n${script}`).then(() => {
+      const lib = join(dir, 'test-libstdcpp');
+      // Explicit Linux ABI fixture, not the old uname shim that returned Linux
+      // even for -m/-r. The renderer's detection and real grep/awk still run.
+      const rendered = script.replace('/lib64/libstdc++.so.6', `'${lib}'`);
+      const commands = `id() { echo 0; }\nuname() { case "$1" in -m) echo '${abi.arch ?? 'x86_64'}';; -r) echo '${abi.kernel ?? '6.8.0'}';; *) echo Linux;; esac; }\ngetconf() { echo 'glibc ${abi.glibc ?? '2.35'}'; }\n`;
+      void writeFile(lib, `GLIBCXX_${abi.glibcxx ?? '3.4.21'}`).then(() => writeFile(path, commands + rendered)).then(() => {
         execFile('sh', [path], { timeout: 20_000, encoding: 'utf8' }, (error, stdout, stderr) => {
           resolve({
             stdout: String(stdout),
@@ -629,6 +634,17 @@ describe('generated installer runs against a loopback HTTP origin', () => {
       });
     });
   }
+
+  it.each([
+    { glibc: '2.16' }, { kernel: '3.9.0' }, { glibcxx: '3.4.18' },
+    { arch: 'aarch64' }, { glibc: 'malformed' },
+  ])('refuses below-minimum or wrong-platform ABI %j before executing any bytes', async (abi) => {
+    const { body } = renderControlledNodeInstallScript({ serverUrl: origin, installCode: freshCode(), os: 'linux', arch: 'x64' });
+    const run = await runScript(body, abi);
+    expect(run.code).not.toBe(0);
+    expect(run.stdout).not.toContain('INSTALLED-OK');
+    expect(run.stdout).not.toContain('downloading');
+  });
 
   it('downloads and executes the artifact over plain loopback HTTP', async () => {
     const code = freshCode();

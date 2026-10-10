@@ -1,4 +1,5 @@
 import { readFileSync } from 'node:fs';
+import { parse as parseYaml } from 'yaml';
 import { describe, expect, it } from 'vitest';
 
 describe('controlled-node executable release wiring', () => {
@@ -639,5 +640,34 @@ describe('controlled-node executable release wiring', () => {
     const publish = build.indexOf('publishAideskHelperSidecar');
     expect(guard, 'the replacement is guarded').toBeGreaterThanOrEqual(0);
     expect(guard).toBeLessThan(publish);
+  });
+});
+
+describe('headless compatibility release wiring', () => {
+  it('ships a separately pinned artifact without changing modern OS/CPU legs or building GUI', () => {
+    const action = readFileSync('.github/actions/build-controlled-node-compat/action.yml', 'utf8');
+    const wrapper = readFileSync('scripts/build-node-compat-exe.mjs', 'utf8');
+    const parsed = parseYaml(action);
+    expect(parsed.runs.using).toBe('composite');
+    expect(parsed.runs.steps).toHaveLength(3);
+    for (const step of parsed.runs.steps) { expect(step.shell).toBe('bash'); expect(typeof step.run).toBe('string'); }
+    expect(parsed.steps).toBeUndefined();
+    expect(action).toContain('shared/controlled-node-abi-profiles.json');
+    expect(action).toContain('npm run check:node-exe-deps');
+    expect(action).toContain('node scripts/build-node-compat-exe.mjs');
+    expect(action).not.toContain('build-worker');
+    expect(action).not.toContain('signing');
+    expect(wrapper).toContain('NODE_EXE_ABI_PROFILE: pin.id');
+    expect(wrapper).toContain('verifyNodeExeManifestSet');
+    expect(wrapper).toContain('source-commit-${pin.id}.txt');
+    for (const path of ['.github/workflows/ci.yml', '.github/workflows/build-node-exe.yml']) {
+      const workflow = readFileSync(path, 'utf8');
+      expect(workflow).toContain('uses: ./.github/actions/build-controlled-node-compat');
+      expect(workflow).toContain('dist-node-exe/${{ steps.compat.outputs.artifact }}.manifest.json');
+    }
+    const workflow = readFileSync('.github/workflows/ci.yml', 'utf8');
+    expect(workflow).toContain('release_version, controlled-node-executables, controlled-node-compat-executable]');
+    expect(workflow).toContain('imcodes-node-linux imcodes-node-macos imcodes-node.exe imcodes-node-linux-glibc217');
+    expect(workflow).toContain('controlled-node-compat');
   });
 });

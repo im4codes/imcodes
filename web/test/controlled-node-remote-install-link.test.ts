@@ -1,3 +1,4 @@
+import { CONTROLLED_NODE_ABI_GLIBC217, CONTROLLED_NODE_ABI_PROFILE_FIELD } from '../../shared/controlled-node-abi.js';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const apiFetch = vi.fn();
@@ -151,5 +152,20 @@ describe('controlled-node remote install link', () => {
         version: 2, os: 'win', arch: 'x64', delivery: 'remote_link', hostServerId: 'host-7',
       }),
     }));
+  });
+});
+
+describe('ABI-scoped browser tickets', () => {
+  const selection = { os: 'linux', arch: 'x64', abiProfile: CONTROLLED_NODE_ABI_GLIBC217 } as const;
+  it('retains compat in the mint and secret fragment', async () => {
+    apiFetch.mockResolvedValueOnce(ticketResponse({ ...selection, delivery: CONTROLLED_NODE_TICKET_DELIVERY.REMOTE_LINK }));
+    const link = await mintControlledNodeRemoteInstallLink(selection);
+    expect(sentBody()[CONTROLLED_NODE_ABI_PROFILE_FIELD]).toBe(CONTROLLED_NODE_ABI_GLIBC217);
+    expect(new URL(link.url).hash).toContain(`${CONTROLLED_NODE_ABI_PROFILE_FIELD}=${CONTROLLED_NODE_ABI_GLIBC217}`);
+    expect(new URL(link.url).search).toBe('');
+  });
+  it('refuses an older server dropping the requested profile', async () => {
+    apiFetch.mockResolvedValueOnce(ticketResponse({ os: 'linux', arch: 'x64' }));
+    await expect(mintControlledNodeExecutableTicket(selection)).rejects.toThrow('invalid_ticket_response');
   });
 });

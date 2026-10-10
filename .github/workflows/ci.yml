@@ -1310,6 +1310,36 @@ jobs:
           $leftovers = @(($certificatePaths + $materialPaths) | Where-Object { Test-Path -LiteralPath $_ })
           if ($leftovers.Count -gt 0) { throw 'Windows release-signing material cleanup was incomplete.' }
 
+  controlled-node-compat-executable:
+    name: Controlled Node Executable (Linux x64 glibc 2.17, headless)
+    needs: [release_version]
+    if: github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION_PRIMARY }}
+          cache: 'npm'
+      - name: Install dependencies
+        shell: bash
+        run: ./scripts/ci-npm-ci.sh .
+      - name: Build headless compatibility artifact
+        id: compat
+        uses: ./.github/actions/build-controlled-node-compat
+        with:
+          version: ${{ needs.release_version.outputs.app_version }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: controlled-node-compat
+          path: |
+            dist-node-exe/${{ steps.compat.outputs.artifact }}
+            dist-node-exe/${{ steps.compat.outputs.artifact }}.manifest.json
+            dist-node-exe/source-commit-*.txt
+          if-no-files-found: error
+          retention-days: 30
+
   # ── Build & push Docker image ─────────────────────────────────────────────
 
   docker:
@@ -1317,7 +1347,7 @@ jobs:
     runs-on: ubuntu-latest
     # Ends a hung job itself instead of holding the concurrency group for the 6 h default (normal 4 min (2 runs seen); an image build + push).
     timeout-minutes: 45
-    needs: [lint, typecheck, secret-scan, unit-tests, macos-unit-tests, windows-unit-tests, windows-conpty-tests, web-tests-unit, web-tests-components, web-chat-perf, server-tests, server-db-tests, e2e-tests, release_version, controlled-node-executables]
+    needs: [lint, typecheck, secret-scan, unit-tests, macos-unit-tests, windows-unit-tests, windows-conpty-tests, web-tests-unit, web-tests-components, web-chat-perf, server-tests, server-db-tests, e2e-tests, release_version, controlled-node-executables, controlled-node-compat-executable]
     if: github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev'
     outputs:
       npm_version: ${{ needs.release_version.outputs.app_version }}
@@ -1361,7 +1391,7 @@ jobs:
           IMCODES_BUILD_VERSION: ${{ needs.release_version.outputs.app_version }}
         run: >-
           node scripts/node-exe-artifacts.mjs verify-set server/controlled-node-artifacts
-          imcodes-node-linux imcodes-node-macos imcodes-node.exe
+          imcodes-node-linux imcodes-node-macos imcodes-node.exe imcodes-node-linux-glibc217
 
       - name: Verify native artifacts came from this exact source revision
         env:
@@ -1369,7 +1399,7 @@ jobs:
           RELEASE_VERSION: ${{ needs.release_version.outputs.app_version }}
         run: |
           set -euo pipefail
-          for platform in linux macos windows; do
+          for platform in linux macos windows "$(node -p "require('./shared/controlled-node-abi-profiles.json').GLIBC217.id")"; do
             marker="server/controlled-node-artifacts/source-commit-${platform}.txt"
             [ -f "$marker" ] || { echo "::error::missing $marker" >&2; exit 1; }
             actual="$(tr -d '\r\n' < "$marker")"
@@ -1559,7 +1589,7 @@ jobs:
             -e "import('./dist/server/src/index.js').then(() => { console.log('OK: image loads cleanly'); process.exit(0); }).catch(e => { console.error('FAIL:', e.message); console.error(e.stack); process.exit(1); })"
           docker run --rm --entrypoint node imcodes-smoke:test \
             scripts/node-exe-artifacts.mjs verify-set /app/controlled-node-executables \
-            imcodes-node-linux imcodes-node-macos imcodes-node.exe
+            imcodes-node-linux imcodes-node-macos imcodes-node.exe imcodes-node-linux-glibc217
           docker run --rm --entrypoint node imcodes-smoke:test -e \
             "const fs=require('node:fs'); const p=JSON.parse(fs.readFileSync('/app/controlled-node-executables/release-provenance.json','utf8')); if(p.sourceCommit!=='${{ github.sha }}'||p.appVersion!=='${{ needs.release_version.outputs.app_version }}') throw new Error('release provenance mismatch'); console.log('release provenance verified:',p.sourceCommit,p.appVersion)"
           # Every target, named. This verifier defaults to the WINDOWS target

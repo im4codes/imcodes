@@ -1,3 +1,4 @@
+import { normalizeControlledNodeAbiProfile, CONTROLLED_NODE_ABI_MODERN, type ControlledNodeAbiProfile } from './controlled-node-abi.js';
 import { DAEMON_MSG } from './daemon-events.js';
 import { DAEMON_COMMAND_TYPES } from './daemon-command-types.js';
 import type { ControlledNodeCapability } from './controlled-node-capabilities.js';
@@ -242,6 +243,7 @@ export const ENROLLMENT_OWNER_NAME_MAX_CHARS = 64;
 export const ENROLLMENT_BLOB_MAGIC = 'IMCODESENROLLv1';
 
 export interface EnrollmentBlob {
+  abiProfile?: ControlledNodeAbiProfile;
   serverUrl: string;
   enrollToken: string;
   /**
@@ -291,10 +293,12 @@ export interface EnrollRedeemV2Request {
   hostname: string;
   os: EnrollmentOs;
   arch: string;
+  abiProfile?: ControlledNodeAbiProfile;
 }
 
 /** Server response for D-A v2 — MUST NOT include a recoverable raw token. */
 export interface EnrollRedeemV2Response {
+  abiProfile?: ControlledNodeAbiProfile;
   serverId: string;
   nodeId: string;
   nodeRole: typeof NODE_ROLE.CONTROLLED;
@@ -382,7 +386,8 @@ export function decodeEnrollmentTrailerWithRange(
   const trailerStart = tailFileOffset + trailerStartInTail;
   try {
     const parsed = JSON.parse(tail.toString('utf8', bodyStart, bodyEnd)) as Partial<EnrollmentBlob>;
-    if (typeof parsed?.serverUrl === 'string' && typeof parsed?.enrollToken === 'string'
+    const abiProfile = normalizeControlledNodeAbiProfile(parsed?.abiProfile);
+    if (abiProfile && typeof parsed?.serverUrl === 'string' && typeof parsed?.enrollToken === 'string'
       && /^https?:\/\//.test(parsed.serverUrl) && parsed.enrollToken.length > 0) {
       // The Desk name is the only human-authored field here, and it is rendered
       // into the pre-install scam warning. A display name is chosen by a user, so
@@ -397,6 +402,7 @@ export function decodeEnrollmentTrailerWithRange(
         blob: {
           serverUrl: parsed.serverUrl.replace(/\/+$/, ''),
           enrollToken: parsed.enrollToken,
+          ...(abiProfile !== CONTROLLED_NODE_ABI_MODERN ? { abiProfile } : {}),
           ...(ownerName ? { ownerName } : {}),
         },
         trailerStart,

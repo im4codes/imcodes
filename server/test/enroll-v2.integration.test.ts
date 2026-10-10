@@ -1,3 +1,4 @@
+import { CONTROLLED_NODE_ABI_GLIBC217, CONTROLLED_NODE_ABI_MODERN, CONTROLLED_NODE_ABI_PROFILE_FIELD, CONTROLLED_NODE_ABI_PROFILES } from '../../shared/controlled-node-abi.js';
 /**
  * Controlled-node v2 enrollment + download ticket — real PostgreSQL
  * (testcontainers via integration-global). Covers the integrated repair:
@@ -296,6 +297,7 @@ beforeEach(async () => {
   artifactCatalog = createArtifactCatalog();
   await db.execute("DELETE FROM controlled_node_enrollments_v2");
   await db.execute("DELETE FROM controlled_node_artifact_manifests");
+  await db.execute("DELETE FROM controlled_node_artifact_variants");
   await db.execute("DELETE FROM servers WHERE node_role = 'controlled'");
   // Remove sidecars left by a previous test, then restore the verified
   // baseline set. Missing sidecars are intentionally fail-closed.
@@ -3165,4 +3167,93 @@ describe('controlled-node Desk scope at enrollment', () => {
     )).toEqual({ desk_team_id: null });
   });
 
+});
+
+// Shared real-PG harness, but compat publication is scoped to these tests so
+// legacy catalog rows/availability tests retain their original fixtures.
+async function writeCompatRelease(): Promise<Buffer> {
+  const pin = CONTROLLED_NODE_ABI_PROFILES.GLIBC217;
+  const bytes = Buffer.from('IMCODES_TEST_COMPAT_ARTIFACT');
+  await writeFile(join(exeDir, pin.fileName), bytes);
+  await writeFile(join(exeDir, `${pin.fileName}.manifest.json`), JSON.stringify({ schemaVersion: 1,
+    artifact: { fileName: pin.fileName, os: 'linux', arch: 'x64', abiProfile: pin.id, size: bytes.length, sha256: sha256(bytes) },
+    build: { commit: 'a'.repeat(40), version: '2026.7.1234-dev.5' },
+    toolchain: { nodeProvider: pin.provider, nodeVersion: pin.nodeVersion, nodeArchive: pin.nodeArchive,
+      nodeArchiveSha256: pin.nodeArchiveSha256, nodeBinarySha256: pin.nodeBinarySha256, seaBlobSha256: 'c'.repeat(64) },
+  }));
+  return bytes;
+}
+async function abiTicketFixture(delivery: string, abiProfile?: string) {
+  const bytes = await writeCompatRelease();
+  const userId = `u_${hex(4)}`;
+  await createUser(db, userId);
+  const auth = await owner(userId);
+  const app = buildApp();
+  const mint = () => app.request('/api/enroll/v2/ticket', { method: 'POST', headers: ticketHeaders(userId, auth),
+    body: JSON.stringify({ version: 2, os: 'linux', arch: 'x64', delivery, ...(abiProfile ? { abiProfile } : {}) }) });
+  const response = await mint(); expect(response.status).toBe(200);
+  const ticket = await response.json() as { ticket: string; ticketId: string; abiProfile?: string };
+  return { app, bytes, ticket, userId, auth, mint };
+}
+describe('ABI enrollment, download and old-peer fences (real PostgreSQL)', () => {
+  it('binds an explicit browser package to compat and refuses modern before spending a consume slot', async () => {
+    const { app, ticket, bytes } = await abiTicketFixture(CONTROLLED_NODE_TICKET_DELIVERY.BROWSER, CONTROLLED_NODE_ABI_GLIBC217);
+    expect(ticket.abiProfile).toBe(CONTROLLED_NODE_ABI_GLIBC217);
+    const old = await app.request(`/api/enroll/v2/download`, { headers: { authorization: `Bearer ${ticket.ticket}` } });
+    expect(old.status).toBe(409);
+    expect(await db.queryOne('SELECT consumed_count FROM controlled_node_enrollments_v2 WHERE id=$1', [ticket.ticketId])).toEqual({ consumed_count: 0 });
+    const correct = await app.request(`/api/enroll/v2/download?${CONTROLLED_NODE_ABI_PROFILE_FIELD}=${CONTROLLED_NODE_ABI_GLIBC217}`, { headers: { authorization: `Bearer ${ticket.ticket}` } });
+    expect(correct.status).toBe(200);
+    expect(correct.headers.get(CONTROLLED_NODE_ARTIFACT_HEADERS.ABI_PROFILE)).toBe(CONTROLLED_NODE_ABI_GLIBC217);
+    const downloaded = Buffer.from(await correct.arrayBuffer());
+    expect(downloaded.subarray(0, bytes.length)).toEqual(bytes);
+    expect(decodeEnrollmentTrailer(downloaded)).toMatchObject({ abiProfile: CONTROLLED_NODE_ABI_GLIBC217 });
+  });
+  it('auto-detected install tickets authorize verified variants, keep credential identity immutable and fence upgrades', async () => {
+    const { app, ticket } = await abiTicketFixture(CONTROLLED_NODE_TICKET_DELIVERY.INSTALL_COMMAND);
+    const binding = await db.queryOne<{ abi_profile: string; abi_variants: Record<string, string> }>('SELECT abi_profile, abi_variants FROM controlled_node_enrollments_v2 WHERE id=$1', [ticket.ticketId]);
+    expect(binding?.abi_profile).toBe(CONTROLLED_NODE_ABI_MODERN);
+    expect(binding?.abi_variants[CONTROLLED_NODE_ABI_GLIBC217]).toBe(sha256(Buffer.from('IMCODES_TEST_COMPAT_ARTIFACT')));
+    const download = await app.request('/api/enroll/v2/download', { method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ ticket: ticket.ticket, abiProfile: CONTROLLED_NODE_ABI_GLIBC217 }) });
+    expect(download.status).toBe(200);
+    const blob = decodeEnrollmentTrailer(Buffer.from(await download.arrayBuffer()))!;
+    const token = hex(32);
+    const payload = { version: 2, installId: `abi-${hex(8)}`, nodeTokenHash: sha256(token), hostname: 'abi-test', os: 'linux', arch: 'x64', enrollToken: blob.enrollToken, abiProfile: CONTROLLED_NODE_ABI_GLIBC217 };
+    const redeem = (body: unknown) => app.request('/api/enroll/v2/redeem', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
+    const first = await redeem(payload); expect(first.status).toBe(200);
+    const identity = await first.json() as { serverId: string; abiProfile: string };
+    expect(identity.abiProfile).toBe(CONTROLLED_NODE_ABI_GLIBC217);
+    expect((await redeem(payload)).status).toBe(200);
+    expect((await redeem({ ...payload, abiProfile: CONTROLLED_NODE_ABI_MODERN })).status).toBe(409);
+    expect(await db.queryOne('SELECT abi_profile FROM servers WHERE id=$1', [identity.serverId])).toEqual({ abi_profile: CONTROLLED_NODE_ABI_GLIBC217 });
+    const headers = { authorization: `Bearer ${token}`, 'X-Server-Id': identity.serverId };
+    const path = `/api/enroll/v2/node-artifact?serverId=${identity.serverId}&os=linux&arch=x64`;
+    expect((await app.request(path, { headers })).status).toBe(409);
+    expect((await app.request(`${path}&${CONTROLLED_NODE_ABI_PROFILE_FIELD}=unknown`, { headers })).status).toBe(400);
+    const correct = await app.request(`${path}&${CONTROLLED_NODE_ABI_PROFILE_FIELD}=${CONTROLLED_NODE_ABI_GLIBC217}`, { headers });
+    expect(correct.status).toBe(200);
+    expect(correct.headers.get(CONTROLLED_NODE_ARTIFACT_HEADERS.ABI_PROFILE)).toBe(CONTROLLED_NODE_ABI_GLIBC217);
+    await correct.arrayBuffer();
+  });
+  it('shares the old stable-link owner/OS/CPU permission without duplicating or reviving its ticket', async () => {
+    const { app, ticket, userId, auth } = await abiTicketFixture(CONTROLLED_NODE_TICKET_DELIVERY.REMOTE_LINK);
+    const responses = await Promise.all(Array.from({ length: 6 }, (_, index) => app.request('/api/enroll/v2/ticket', { method: 'POST', headers: ticketHeaders(userId, auth),
+      body: JSON.stringify({ version: 2, os: 'linux', arch: 'x64', delivery: CONTROLLED_NODE_TICKET_DELIVERY.REMOTE_LINK,
+        ...(index % 2 ? { abiProfile: CONTROLLED_NODE_ABI_GLIBC217 } : {}) }) })));
+    for (const response of responses) {
+      expect(response.status).toBe(200);
+      const body = await response.json() as { ticketId: string; ticket: string };
+      expect(body.ticketId).toBe(ticket.ticketId); expect(body.ticket).toBe(ticket.ticket);
+    }
+    expect(await db.queryOne('SELECT COUNT(*)::int AS n FROM controlled_node_enrollments_v2 WHERE owner_user_id=$1', [userId])).toEqual({ n: 1 });
+    const revoked = await app.request('/api/enroll/v2/ticket', { method: 'DELETE', headers: ticketHeaders(userId, auth), body: JSON.stringify({ version: 2, os: 'linux', arch: 'x64', delivery: CONTROLLED_NODE_TICKET_DELIVERY.REMOTE_LINK, abiProfile: CONTROLLED_NODE_ABI_GLIBC217 }) });
+    expect(revoked.status).toBe(200);
+    expect((await app.request(`/api/enroll/v2/download?${CONTROLLED_NODE_ABI_PROFILE_FIELD}=${CONTROLLED_NODE_ABI_GLIBC217}`, { headers: { authorization: `Bearer ${ticket.ticket}` } })).status).toBe(401);
+  });
+  it.each([`unknown`, `${CONTROLLED_NODE_ABI_GLIBC217}&${CONTROLLED_NODE_ABI_PROFILE_FIELD}=${CONTROLLED_NODE_ABI_GLIBC217}`])('rejects invalid/duplicate profile %s without losing ticket state', async (profile) => {
+    const { app, ticket } = await abiTicketFixture(CONTROLLED_NODE_TICKET_DELIVERY.INSTALL_COMMAND);
+    expect((await app.request(`/api/enroll/v2/download?${CONTROLLED_NODE_ABI_PROFILE_FIELD}=${profile}`, { headers: { authorization: `Bearer ${ticket.ticket}` } })).status).toBe(400);
+    expect(await db.queryOne('SELECT consumed_count FROM controlled_node_enrollments_v2 WHERE id=$1', [ticket.ticketId])).toEqual({ consumed_count: 0 });
+  });
 });

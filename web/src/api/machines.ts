@@ -35,6 +35,7 @@ import {
   MACHINE_HOST_LINK_ROUTE,
   MACHINE_IDENTITY_UNAVAILABLE,
 } from '@shared/machine-reference.js';
+import { CONTROLLED_NODE_ABI_MODERN, CONTROLLED_NODE_ABI_PROFILE_FIELD, normalizeControlledNodeAbiProfile, type ControlledNodeAbiProfile } from '@shared/controlled-node-abi.js';
 import { isControlledNodeId } from '@shared/controlled-node-identity.js';
 import { CONTROLLED_NODE_UPGRADE_STATUS, type ControlledNodeUpgradeStatus } from '@shared/daemon-upgrade.js';
 import type { DaemonUpgradeStatusSnapshot, DaemonUpgradeLifecycleStatus } from '@shared/daemon-upgrade.js';
@@ -137,7 +138,7 @@ export interface MachineListItem {
 export interface ControlledNodeArtifactSelection extends ControlledNodeArtifactPair {}
 
 /** Per-artifact metadata returned by GET /api/enroll/v2/availability. */
-export interface ControlledNodeArtifactMetadata {
+export interface ControlledNodeArtifactMetadata extends ControlledNodeArtifactPair {
   os: ControlledNodeOs;
   arch: ControlledNodeArtifactArch;
   filename: string;
@@ -152,7 +153,7 @@ export interface ControlledNodeAvailability {
 }
 
 /** Minted download ticket from POST /api/enroll/v2/ticket. */
-export interface ControlledNodeExecutableTicket {
+export interface ControlledNodeExecutableTicket extends ControlledNodeArtifactPair {
   version: 2;
   ticket: string;
   ticketId: string;
@@ -273,7 +274,7 @@ const ENROLL_V2_TICKET_PATH = '/api/enroll/v2/ticket';
 const ENROLL_V2_BOOTSTRAP_PATH = '/api/enroll/v2/bootstrap';
 
 export function artifactSelectionKey(sel: ControlledNodeArtifactSelection): string {
-  return controlledNodeArtifactKey(sel.os, sel.arch);
+  return controlledNodeArtifactKey(sel.os, sel.arch, sel.abiProfile);
 }
 
 function isRecord(v: unknown): v is Record<string, unknown> {
@@ -288,8 +289,11 @@ function normalizeArtifact(raw: unknown): ControlledNodeArtifactMetadata | null 
   const sizeBytes = typeof raw.sizeBytes === 'number' && Number.isFinite(raw.sizeBytes) ? raw.sizeBytes : null;
   const sha256 = typeof raw.sha256 === 'string' && isControlledNodeArtifactSha256(raw.sha256) ? raw.sha256 : null;
   if (!os || !arch || !filename || sizeBytes === null || sizeBytes < 0 || !sha256) return null;
-  if (!isCanonicalControlledNodePair(os, arch)) return null;
-  return { os, arch, filename, sizeBytes, sha256 };
+  const abiProfile = normalizeControlledNodeAbiProfile(raw.abiProfile);
+  if (!abiProfile || !isCanonicalControlledNodePair(os, arch, abiProfile)) return null;
+  return { os, arch, filename, sizeBytes, sha256,
+    ...(abiProfile !== CONTROLLED_NODE_ABI_MODERN ? { abiProfile } : {}),
+  };
 }
 
 function normalizeAvailability(res: unknown): ControlledNodeAvailability {
@@ -338,10 +342,12 @@ function normalizeTicket(res: unknown, expectedOwnerUserId: string): ControlledN
   if (!ticket || !ticketId || !os || !arch || !filename || sizeBytes === null || !sha256 || expiresAt === undefined || !ownerUserId) {
     throw new Error('invalid_ticket_response');
   }
-  if (!isCanonicalControlledNodePair(os, arch)) throw new Error('invalid_ticket_response');
+  const abiProfile = normalizeControlledNodeAbiProfile(res.abiProfile);
+  if (!abiProfile || !isCanonicalControlledNodePair(os, arch, abiProfile)) throw new Error('invalid_ticket_response');
   return {
     version: 2, ticket, ticketId, os, arch, filename, sizeBytes, sha256,
     expiresAt, delivery, ownerUserId,
+    ...(abiProfile !== CONTROLLED_NODE_ABI_MODERN ? { abiProfile } : {}),
     ...(installCommand ? { installCommand } : {}),
     ...(installCode ? { installCode } : {}),
   };
@@ -350,8 +356,8 @@ function normalizeTicket(res: unknown, expectedOwnerUserId: string): ControlledN
 /** Build download targets: one per canonical (os, arch) artifact with explicit arch. */
 export function buildControlledNodeDownloadTargets(res: ControlledNodeAvailability): ControlledNodeArtifactSelection[] {
   const targets = res.artifacts
-    .filter((a) => isCanonicalControlledNodePair(a.os, a.arch))
-    .map((a) => ({ os: a.os, arch: a.arch }));
+    .filter((a) => isCanonicalControlledNodePair(a.os, a.arch, a.abiProfile))
+    .map((a) => ({ os: a.os, arch: a.arch, ...(a.abiProfile ? { abiProfile: a.abiProfile } : {}) }));
   return [...targets].sort(compareControlledNodeArtifactPairs);
 }
 
@@ -607,7 +613,7 @@ export async function mintControlledNodeExecutableTicket(
    */
   delivery: ControlledNodeTicketDelivery = CONTROLLED_NODE_TICKET_DELIVERY.BROWSER,
 ): Promise<ControlledNodeExecutableTicket> {
-  if (!isCanonicalControlledNodePair(selection.os, selection.arch)) {
+  if (!isCanonicalControlledNodePair(selection.os, selection.arch, selection.abiProfile)) {
     throw new Error('controlled_node_non_canonical_pair');
   }
   const expectedOwnerUserId = getExpectedUserId();
@@ -621,21 +627,31 @@ export async function mintControlledNodeExecutableTicket(
       version: 2,
       os: selection.os,
       arch: selection.arch,
+      ...(selection.abiProfile && selection.abiProfile !== CONTROLLED_NODE_ABI_MODERN
+        ? { [CONTROLLED_NODE_ABI_PROFILE_FIELD]: selection.abiProfile } : {}),
       ...(hostServerId ? { hostServerId } : {}),
       // Omitted for the default so an older server, which rejects unknown keys
       // with its strict body schema, keeps working unchanged.
       ...(delivery === CONTROLLED_NODE_TICKET_DELIVERY.BROWSER ? {} : { delivery }),
     }),
   });
-  return normalizeTicket(res, expectedOwnerUserId);
+  const ticket = normalizeTicket(res, expectedOwnerUserId);
+  if (normalizeControlledNodeAbiProfile(ticket.abiProfile) !== normalizeControlledNodeAbiProfile(selection.abiProfile)) {
+    throw new Error('invalid_ticket_response');
+  }
+  return ticket;
 }
 
 /**
  * Bootstrap page URL that consumes a minted ticket from the URL hash fragment.
  * The page performs the authenticated download without buffering in the SPA.
  */
-export function buildControlledNodeBootstrapUrl(ticket: string): string {
-  return `${getApiBaseUrl()}${ENROLL_V2_BOOTSTRAP_PATH}#ticket=${encodeURIComponent(ticket)}`;
+export function buildControlledNodeBootstrapUrl(ticket: string, abiProfile?: ControlledNodeAbiProfile): string {
+  const profile = normalizeControlledNodeAbiProfile(abiProfile);
+  if (!profile) throw new Error('invalid_abi_profile');
+  const suffix = profile === CONTROLLED_NODE_ABI_MODERN ? ''
+    : `&${CONTROLLED_NODE_ABI_PROFILE_FIELD}=${encodeURIComponent(profile)}`;
+  return `${getApiBaseUrl()}${ENROLL_V2_BOOTSTRAP_PATH}#ticket=${encodeURIComponent(ticket)}${suffix}`;
 }
 
 /**
@@ -681,7 +697,7 @@ export async function mintControlledNodeRemoteInstallLink(
     selection, hostServerId, CONTROLLED_NODE_TICKET_DELIVERY.REMOTE_LINK,
   );
   return {
-    url: buildControlledNodeBootstrapUrl(minted.ticket),
+    url: buildControlledNodeBootstrapUrl(minted.ticket, minted.abiProfile),
     expiresAt: minted.expiresAt,
     ticketId: minted.ticketId,
   };
@@ -692,7 +708,7 @@ export async function revokeControlledNodeRemoteInstallLink(
   selection: ControlledNodeArtifactSelection,
   hostServerId?: string,
 ): Promise<boolean> {
-  if (!isCanonicalControlledNodePair(selection.os, selection.arch)) {
+  if (!isCanonicalControlledNodePair(selection.os, selection.arch, selection.abiProfile)) {
     throw new Error('controlled_node_non_canonical_pair');
   }
   const response = await apiFetch<unknown>(ENROLL_V2_TICKET_PATH, {
@@ -702,6 +718,8 @@ export async function revokeControlledNodeRemoteInstallLink(
       version: 2,
       os: selection.os,
       arch: selection.arch,
+      ...(selection.abiProfile && selection.abiProfile !== CONTROLLED_NODE_ABI_MODERN
+        ? { [CONTROLLED_NODE_ABI_PROFILE_FIELD]: selection.abiProfile } : {}),
       delivery: CONTROLLED_NODE_TICKET_DELIVERY.REMOTE_LINK,
       ...(hostServerId ? { hostServerId } : {}),
     }),

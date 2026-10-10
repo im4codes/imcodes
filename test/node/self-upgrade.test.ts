@@ -1,3 +1,4 @@
+import { CONTROLLED_NODE_ABI_GLIBC217, CONTROLLED_NODE_ABI_PROFILE_FIELD } from '../../shared/controlled-node-abi.js';
 import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, rename as fsRename, rm, symlink, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
@@ -1777,25 +1778,23 @@ describe('controlled-node self-upgrade', () => {
     expect((cleanupFailures[0] as NodeJS.ErrnoException).code).toBe('EACCES');
   });
 
-  it('starts Linux replacement in a transient unit outside the node service cgroup', () => {
+  it('starts Linux replacement in a generation-owned static unit outside the node cgroup', async () => {
+    const unitDirectory = await mkdtemp(join(tmpdir(), 'imcodes-upgrade-unit-test-'));
+    dirs.push(unitDirectory);
     const calls: Array<{ file: string; args: readonly string[] }> = [];
     scheduleLinuxControlledNodeUpgrade('imcodes-node-upgrade-test', '/tmp/upgrade.sh', (file, args) => {
       calls.push({ file, args });
-    });
-    expect(calls).toEqual([{
-      file: 'systemd-run',
-      args: [
-        '--unit=imcodes-node-upgrade-test',
-        '--collect',
-        '--no-block',
-        '--property=Type=oneshot',
-        // the script hosts the whole health window (15 min cap) plus a rollback
-        '--property=TimeoutStartSec=25min',
-        '--property=TimeoutStopSec=5min',
-        '/bin/sh',
-        '/tmp/upgrade.sh',
-      ],
-    }]);
+    }, { unitDirectory });
+    expect(calls).toEqual([
+      { file: '/bin/systemctl', args: ['daemon-reload'] },
+      { file: '/bin/systemctl', args: ['--no-block', 'start', 'imcodes-node-upgrade-test.service'] },
+    ]);
+    const unit = await readFile(join(unitDirectory, 'imcodes-node-upgrade-test.service'), 'utf8');
+    expect(unit).toContain('Type=oneshot');
+    expect(unit).toContain('TimeoutStartSec=25min');
+    expect(unit).toContain('TimeoutStopSec=5min');
+    expect(unit).toContain('ExecStopPost=');
+    expect(unit).not.toContain('--collect');
   });
 
   it.each([
@@ -2332,5 +2331,44 @@ describe('controlled-node self-upgrade', () => {
       executable: 'new-native-artifact',
       manifest: 'new-native-manifest',
     });
+  });
+});
+
+describe('self-upgrade ABI fence', () => {
+  const credential = { serverUrl: 'https://im.example', serverId: 'abi-test', token: 'scoped-token' };
+  const target = { os: 'linux', arch: 'x64', abiProfile: CONTROLLED_NODE_ABI_GLIBC217 } as const;
+  it('preserves sticky routing and never substitutes fake architecture', () => {
+    const url = new URL(controlledNodeArtifactUpgradeUrl({ ...credential, serverUrl: 'https://im.example/prefix' }, target));
+    expect(url.searchParams.get(CONTROLLED_NODE_ABI_PROFILE_FIELD)).toBe(CONTROLLED_NODE_ABI_GLIBC217);
+    expect(url.searchParams.get('arch')).toBe('x64');
+    expect(url.searchParams.get('serverId')).toBe(credential.serverId);
+    // Enrollment URLs are origin-only; preserve the existing root API path even for a caller's stale path.
+    expect(url.pathname).toBe(CONTROLLED_NODE_ARTIFACT_UPGRADE_PATH);
+  });
+  it.each([undefined, 'unknown', 'modern', `${CONTROLLED_NODE_ABI_GLIBC217}, ${CONTROLLED_NODE_ABI_GLIBC217}`])
+  ('rejects wrong/old ABI response %j before writing artifacts', async (responseProfile) => {
+    const dir = await mkdtemp(join(tmpdir(), 'imcodes-test-abi-download-')); dirs.push(dir);
+    const body = Buffer.from('incompatible binary');
+    const headers = {
+      [CONTROLLED_NODE_ARTIFACT_HEADERS.SHA256]: createHash('sha256').update(body).digest('hex'),
+      [CONTROLLED_NODE_ARTIFACT_HEADERS.SIZE_BYTES]: String(body.length),
+      [CONTROLLED_NODE_ARTIFACT_HEADERS.FILENAME]: 'imcodes-node-linux',
+      ...(responseProfile === undefined ? {} : { [CONTROLLED_NODE_ARTIFACT_HEADERS.ABI_PROFILE]: responseProfile }),
+    };
+    await expect(downloadControlledNodeExecutable({ credential, target, dir, fetchImpl: vi.fn(async () => new Response(body, { headers })) as typeof fetch }))
+      .rejects.toThrow('artifact_abi_profile_mismatch');
+    expect(await readdir(dir)).toEqual([]);
+  });
+  it('keeps profile in the staged manifest only after exact acknowledgement and full hash checks', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'imcodes-test-abi-download-')); dirs.push(dir);
+    const body = Buffer.from('compatible binary');
+    const result = await downloadControlledNodeExecutable({ credential, target, dir, fetchImpl: vi.fn(async () => new Response(body, { headers: {
+      [CONTROLLED_NODE_ARTIFACT_HEADERS.SHA256]: createHash('sha256').update(body).digest('hex'),
+      [CONTROLLED_NODE_ARTIFACT_HEADERS.SIZE_BYTES]: String(body.length),
+      [CONTROLLED_NODE_ARTIFACT_HEADERS.FILENAME]: 'imcodes-node-linux-glibc217',
+      [CONTROLLED_NODE_ARTIFACT_HEADERS.ABI_PROFILE]: CONTROLLED_NODE_ABI_GLIBC217,
+    } })) as typeof fetch });
+    expect(result).toBeDefined();
+    expect(JSON.parse(await readFile(`${result!.artifactPath}.manifest.json`, 'utf8')).artifact.abiProfile).toBe(CONTROLLED_NODE_ABI_GLIBC217);
   });
 });

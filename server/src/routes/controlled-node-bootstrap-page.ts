@@ -1,3 +1,5 @@
+import { CONTROLLED_NODE_ABI_GLIBC217, CONTROLLED_NODE_ABI_MODERN, CONTROLLED_NODE_ABI_PROFILE_FIELD } from '../../../shared/controlled-node-abi.js';
+import { CONTROLLED_NODE_ARTIFACT_HEADERS } from '../../../shared/controlled-node-artifacts.js';
 const BOOTSTRAP_DOWNLOAD_PATH = '/api/enroll/v2/download';
 
 /**
@@ -19,6 +21,14 @@ export function buildControlledNodeBootstrapPage(nonce: string): string {
   var detail=document.getElementById('download-detail');
   var progress=document.getElementById('download-progress');
   var cancelButton=document.getElementById('download-cancel');
+  var abiField=${JSON.stringify(CONTROLLED_NODE_ABI_PROFILE_FIELD)};
+  var modernAbi=${JSON.stringify(CONTROLLED_NODE_ABI_MODERN)};
+  var compatAbi=${JSON.stringify(CONTROLLED_NODE_ABI_GLIBC217)};
+  var abiHeader=${JSON.stringify(CONTROLLED_NODE_ARTIFACT_HEADERS.ABI_PROFILE)};
+  var fragments=new URLSearchParams(location.hash.slice(1));
+  var profiles=fragments.getAll(abiField);
+  var abiProfile=profiles.length===0?modernAbi:profiles.length===1?profiles[0]:null;
+  var abiValid=abiProfile===modernAbi||abiProfile===compatAbi;
   var ticketMatch=location.hash.slice(1).match(/(?:^|&)ticket=([A-Za-z0-9_-]{8,128})(?:&|$)/);
   var ticket=ticketMatch&&ticketMatch[1]||'';
   var fragmentScrubbed=true;
@@ -114,7 +124,7 @@ export function buildControlledNodeBootstrapPage(nonce: string): string {
     fail('This browser could not secure the download link.');
     return;
   }
-  if(!ticket){
+  if(!ticket||!abiValid||fragments.getAll('ticket').length!==1){
     fail('This download link is invalid.');
     return;
   }
@@ -132,6 +142,8 @@ export function buildControlledNodeBootstrapPage(nonce: string): string {
   xhr.onload=function(){
     if(settled)return;
     if(xhr.status<200||xhr.status>=300){fail('Download failed. Please request a new link.');return}
+    var receivedAbi=xhr.getResponseHeader(abiHeader);
+    if((receivedAbi===null?modernAbi:receivedAbi)!==abiProfile){fail('The server returned an incompatible artifact.');return}
     var blob=xhr.response;
     if(!blob||!Number.isFinite(blob.size)||blob.size<=0){fail('The download was empty.');return}
     if(blob.size>MAX_BLOB_BYTES){fail('Download is too large for this browser.');return}
@@ -150,6 +162,7 @@ export function buildControlledNodeBootstrapPage(nonce: string): string {
     cleanupObjectUrl();
   },{once:true});
   var requestBody='ticket='+encodeURIComponent(ticket);
+  if(abiProfile!==modernAbi)requestBody+='&'+abiField+'='+encodeURIComponent(abiProfile);
   ticket='';
   xhr.send(requestBody);
   requestBody='';
