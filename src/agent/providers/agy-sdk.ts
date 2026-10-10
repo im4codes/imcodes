@@ -1,5 +1,6 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
+import path from 'node:path';
 import readline from 'node:readline';
 import type {
   ProviderCapabilities,
@@ -36,7 +37,7 @@ import { killProcessTree } from '../../util/kill-process-tree.js';
 import { execFileOffMain as execFileAsync } from '../../util/exec-helper.js';
 import { gateChildStream } from '../../util/event-loop-backpressure.js';
 import { composeMessageSideProviderPrompt } from '../provider-context-routing.js';
-import { normalizeTransportCwd, resolveExecutableForSpawn } from '../transport-paths.js';
+import { normalizeTransportCwd, resolveAgyPathForSdk, resolveExecutableForSpawn } from '../transport-paths.js';
 import {
   ensureAgyMcpConfigHasImcodesEntry,
   agyMcpEnsureOptionsFromConfig,
@@ -145,11 +146,12 @@ export function encodeAgyUserLine(text: string): string {
   return `${JSON.stringify({ event: AGY_STREAM_EVENT.USER, message: { content: text } })}\n`;
 }
 
-/** Resolve the `agy` executable to spawn, honoring `config.binaryPath`, `AGY_CLI_PATH`, and PATH. */
+/** Resolve the `agy` executable to spawn, honoring `config.binaryPath`, `AGY_CLI_PATH`, candidates, and PATH. */
 export function resolveAgyBinary(config?: ProviderConfig | { binaryPath?: string } | null): { executable: string; prependArgs: string[] } {
   const direct = typeof config?.binaryPath === 'string' ? config.binaryPath.trim() : '';
-  const name = direct || process.env[AGY_CLI_PATH_ENV]?.trim() || AGY_CLI_BINARY;
-  return resolveExecutableForSpawn(name);
+  const raw = direct || process.env[AGY_CLI_PATH_ENV]?.trim() || AGY_CLI_BINARY;
+  const resolved = resolveAgyPathForSdk(raw);
+  return resolveExecutableForSpawn(resolved);
 }
 
 /**
@@ -427,7 +429,26 @@ export class AgySdkProvider implements TransportProvider {
     for (const e of extra) {
       if (e) Object.assign(mergedExtra, e);
     }
-    return { ...process.env, ...(this.config?.env as Record<string, string> | undefined), ...mergedExtra };
+    const env = { ...process.env, ...(this.config?.env as Record<string, string> | undefined), ...mergedExtra };
+    const pathKey = process.platform === 'win32'
+      ? Object.keys(env).find((k) => k.toUpperCase() === 'PATH') ?? 'Path'
+      : 'PATH';
+    const currentPath = env[pathKey] || '';
+    const delimiter = process.platform === 'win32' ? ';' : ':';
+    const home = process.env.HOME;
+    const additionalDirs = [
+      home ? path.join(home, '.local', 'bin') : undefined,
+      home ? path.join(home, '.gemini', 'antigravity-cli', 'bin') : undefined,
+      home ? path.join(home, '.npm-global', 'bin') : undefined,
+      '/usr/local/bin',
+      '/opt/homebrew/bin',
+      '/usr/bin',
+      '/bin',
+    ].filter((dir): dir is string => !!dir && !currentPath.split(delimiter).includes(dir));
+    if (additionalDirs.length > 0) {
+      env[pathKey] = [...additionalDirs, currentPath].filter(Boolean).join(delimiter);
+    }
+    return env;
   }
 
   private ensureChild(sessionId: string, state: AgySessionState): ChildProcess {
@@ -669,7 +690,12 @@ export class AgySdkProvider implements TransportProvider {
     for (const cb of this.errorCallbacks) cb(sessionId, error);
   }
 
-  private makeError(code: string, message: string, recoverable: boolean): ProviderError {
-    return { code, message, recoverable };
+  private makeError(code: string, message: string, recoverable: boolean, details?: unknown): ProviderError {
+    const err = new Error(message) as Error & ProviderError;
+    err.name = 'ProviderError';
+    (err as any).code = code;
+    (err as any).recoverable = recoverable;
+    if (details !== undefined) (err as any).details = details;
+    return err;
   }
 }

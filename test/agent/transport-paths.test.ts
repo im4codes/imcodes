@@ -8,6 +8,7 @@ import {
   parseNpmCmdShim,
   resolveExecutableForSpawn,
   resolveClaudeCodePathForSdk,
+  resolveAgyPathForSdk,
 } from '../../src/agent/transport-paths.js';
 
 describe('normalizeTransportCwd', () => {
@@ -54,6 +55,20 @@ describe('resolveClaudeCodePathForSdk (macOS/Linux bundled-binary resolution)', 
     if (process.platform === 'win32') return;
     expect(resolveClaudeCodePathForSdk('/custom/bin/claude')).toBe('/custom/bin/claude');
     expect(resolveClaudeCodePathForSdk('claude-canary')).toBe('claude-canary');
+  });
+});
+
+describe('resolveAgyPathForSdk (per-user and system candidate resolution)', () => {
+  it('honours an explicit caller-provided binary path unchanged', () => {
+    if (process.platform === 'win32') return;
+    expect(resolveAgyPathForSdk('/custom/bin/agy')).toBe('/custom/bin/agy');
+  });
+
+  it('resolves agy from candidates or falls back gracefully', () => {
+    if (process.platform === 'win32') return;
+    const resolved = resolveAgyPathForSdk('agy');
+    expect(typeof resolved).toBe('string');
+    expect(resolved.length).toBeGreaterThan(0);
   });
 });
 

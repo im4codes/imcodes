@@ -2708,7 +2708,7 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
     }
   } catch (err) {
     logger.error({ project, err }, 'session.start failed');
-    const message = err instanceof Error ? err.message : String(err);
+    const message = describeTransportSendError(err);
     try { serverLink.send({ type: 'session.error', project, message }); } catch { /* ignore */ }
   }
 }
@@ -2737,7 +2737,7 @@ async function handleRestart(cmd: Record<string, unknown>, serverLink: ServerLin
           logger.info({ sessionName, agentType: cmd.agentType ?? record.agentType }, 'Session relaunched via settings');
         } catch (err) {
           logger.error({ sessionName, err }, 'session.restart(sessionName) failed');
-          const message = err instanceof Error ? err.message : String(err);
+          const message = describeTransportSendError(err);
           emitSessionInlineError(sessionName, message);
           try { serverLink.send({ type: 'session.error', project: record.projectName, message }); } catch { /* ignore */ }
           await handleGetSessions(serverLink);
@@ -2785,7 +2785,7 @@ async function handleRestart(cmd: Record<string, unknown>, serverLink: ServerLin
     logger.info({ project, fresh }, 'Session restarted via web');
   } catch (err) {
     logger.error({ project, err }, 'session.restart failed');
-    const message = err instanceof Error ? err.message : String(err);
+    const message = describeTransportSendError(err);
     emitSessionInlineError(brain.name, message);
     try { serverLink.send({ type: 'session.error', project, message }); } catch { /* ignore */ }
   }
@@ -4930,7 +4930,7 @@ async function handleSendBound(cmd: Record<string, unknown>, serverLink: ServerL
         await resumeTransportRuntimeAfterLoss(record);
       } catch (err) {
         logger.error({ err, sessionName }, 'auto-resume after missing transport runtime failed');
-        const resumeErr = err instanceof Error ? err.message : String(err);
+        const resumeErr = describeTransportSendError(err);
         timelineEmitter.emit(
           sessionName,
           'assistant.text',
@@ -5023,7 +5023,7 @@ async function handleSendBound(cmd: Record<string, unknown>, serverLink: ServerL
           await resumeTransportRuntimeAfterLoss(record);
         } catch (err) {
           logger.error({ err, sessionName }, 'auto-resume after provider-session-id loss failed');
-          const resumeErr = err instanceof Error ? err.message : String(err);
+          const resumeErr = describeTransportSendError(err);
           timelineEmitter.emit(
             sessionName,
             'assistant.text',
