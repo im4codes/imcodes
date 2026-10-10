@@ -1,3 +1,5 @@
+import { AUTH_ERROR_CODES } from '../../shared/auth-error-codes.js';
+import { USER_STATUS } from '../../shared/user-status.js';
 import { Hono } from 'hono';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { Env } from '../src/env.js';
@@ -101,6 +103,34 @@ describe('daemon credentials are admitted only on explicitly called routes', () 
       { Cookie: `${COOKIE_SESSION}=${jwt}` }, { Cookie: `${COOKIE_SESSION}=${jwt}`, ...headers },
     ]) expect((await app.request('/api/auth/user/me', { headers: userHeaders })).status).toBe(200);
     expect((await app.request('/api/team', { headers: { Authorization: 'Bearer invalid', [SERVER_ID_HEADER]: 'srv-1' } })).status).toBe(401);
+  });
+
+  it.each(['srv-1', 'missing-server'])('incidental %s header does not replace account bearer authority', async serverId => {
+    const jwt = signJwt({ sub: 'user-1', role: 'owner' }, signingKey, 60);
+    const app = new Hono<{ Bindings: Env }>();
+    app.get('/api/account-probe', requireAuth(), c => c.json({ userId: c.get('userId'), role: c.get('role') }));
+    for (const bearer of [jwt, key]) {
+      const response = await app.request('/api/account-probe', {
+        headers: { Authorization: `Bearer ${bearer}`, [SERVER_ID_HEADER]: serverId },
+      }, environment(NODE_ROLE.CONTROLLED, 1));
+      expect(response.status).toBe(200);
+      expect(await response.json()).toMatchObject({ userId: 'user-1' });
+    }
+  });
+
+  it('matched disabled or revoked daemon credentials never fall through to account identity', async () => {
+    const app = new Hono<{ Bindings: Env }>();
+    app.get('/api/account-probe', requireAuth(), c => c.json({ ok: true }));
+    const disabled = environment();
+    const query = disabled.DB.queryOne.bind(disabled.DB);
+    vi.spyOn(disabled.DB, 'queryOne').mockImplementation(async (...args) => {
+      const row = await query(...args);
+      return row && 'token_hash' in row ? { ...row, owner_status: USER_STATUS.DISABLED } : row;
+    });
+    const refused = await app.request('/api/account-probe', { headers }, disabled);
+    expect(refused.status).toBe(403);
+    expect(await refused.json()).toMatchObject({ error: AUTH_ERROR_CODES.ACCOUNT_DISABLED });
+    expect((await app.request('/api/account-probe', { headers }, environment(NODE_ROLE.FULL, 1))).status).toBe(401);
   });
 
   it('matches methods and encoded identifier segments exactly and preserves sticky query', () => {

@@ -1,3 +1,5 @@
+import { AUTH_ERROR_CODES } from '../../shared/auth-error-codes.js';
+import { USER_STATUS } from '../../shared/user-status.js';
 /** Real PostgreSQL + real loopback HTTP; record daemon client requests. */
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { serve } from '@hono/node-server';
@@ -13,6 +15,7 @@ import { cronMcpCreateSelf, cronMcpList, cronMcpDelete } from '../../src/daemon/
 import { fetchBackendStartupMemoryItems } from '../../src/context/backend-startup-memory.js';
 import { createServerCapabilityService } from '../../src/capability/server-capability-service.js';
 import { listMachines } from '../../src/daemon/machine-exec-client.js';
+import { SERVER_ID_HEADER } from '../../shared/http-header-names.js';
 import { listVerificationMachineProfiles } from '../../src/daemon/verification-machine-mcp-client.js';
 
 let db: Database;
@@ -124,6 +127,39 @@ describe('bound daemon clients against new server admission', () => {
       ...(['POST', 'PUT', 'PATCH'].includes(route.method) ? { body: '{}' } : {}) });
     expect(response.status).not.toBe(401);
     expect(await response.text()).not.toContain(DAEMON_TOKEN_ROUTE_NOT_ALLOWED);
+  });
+
+  it('real account bearers with routing headers remain account credentials, including disabled-user denial', async () => {
+    const apiKey = 'deck_fixture_policy_account_key';
+    await db.execute('INSERT INTO api_keys (id,user_id,key_hash,created_at) VALUES ($1,$2,$3,$4)', [
+      'fixture-policy-account-key', user, sha256Hex(apiKey), Date.now(),
+    ]);
+    const jwt = signJwt({ sub: user, role: 'owner' }, signingKey, 3600);
+    try {
+      for (const bearer of [jwt, apiKey]) {
+        for (const serverId of [endpoint.serverId, 'fixture-missing-server']) {
+          const response = await send('/api/auth/user/me', { headers: {
+            Authorization: `Bearer ${bearer}`, [SERVER_ID_HEADER]: serverId,
+          } });
+          expect(response.status).toBe(200);
+          expect(await response.json()).toMatchObject({ id: user });
+        }
+      }
+      await db.execute('UPDATE users SET status = $1 WHERE id = $2', [USER_STATUS.DISABLED, user]);
+      for (const bearer of [jwt, apiKey]) {
+        const response = await send('/api/team', { headers: {
+          Authorization: `Bearer ${bearer}`, [SERVER_ID_HEADER]: endpoint.serverId,
+        } });
+        expect(response.status).toBe(403);
+        expect(await response.json()).toMatchObject({ error: AUTH_ERROR_CODES.ACCOUNT_DISABLED });
+      }
+      const daemon = await send('/api/aliases', { headers: daemonServerAuthHeaders(endpoint) });
+      expect(daemon.status).toBe(403);
+      expect(await daemon.json()).toMatchObject({ error: AUTH_ERROR_CODES.ACCOUNT_DISABLED });
+    } finally {
+      await db.execute('UPDATE users SET status = $1 WHERE id = $2', [USER_STATUS.ACTIVE, user]);
+      await db.execute('DELETE FROM api_keys WHERE id = $1', ['fixture-policy-account-key']);
+    }
   });
 
   it('records real daemon/client methods and paths without recording credentials', () => {

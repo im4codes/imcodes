@@ -118,15 +118,15 @@ export async function resolveBearerOutcome(
          FROM servers WHERE id = $1`,
       [daemonServerId],
     );
-    if (!server) return { auth: null };
-    const tokenHash = sha256Hex(token);
-    if (tokenHash !== server.token_hash) return { auth: null };
-    if (server.revoked_at != null) return { auth: null }; // revoked → denied everywhere (10.3)
-    // The credential is genuine here, so naming the reason leaks nothing to its holder -- and tells the daemon why it is refused.
-    if (!isUserStatusActive(server.owner_status)) return { auth: null, denied: userStatusDenialCode(server.owner_status ?? USER_STATUS.DISABLED) };
-    const nodeRole: NodeRole = server.node_role === NODE_ROLE.CONTROLLED ? NODE_ROLE.CONTROLLED : NODE_ROLE.FULL;
-    enforceDaemonTokenRoute(c.req, daemonServerId, nodeRole);
-    return { auth: { userId: server.user_id, role: 'owner' as Role, nodeRole, serverId: daemonServerId } };
+    // X-Server-Id is also a routing hint on account requests. It establishes daemon
+    // authority only when the bearer matches this row, not merely when present.
+    if (server && sha256Hex(token) === server.token_hash) {
+      if (server.revoked_at != null) return { auth: null }; // genuine revoked token never falls through
+      if (!isUserStatusActive(server.owner_status)) return { auth: null, denied: userStatusDenialCode(server.owner_status ?? USER_STATUS.DISABLED) };
+      const nodeRole: NodeRole = server.node_role === NODE_ROLE.CONTROLLED ? NODE_ROLE.CONTROLLED : NODE_ROLE.FULL;
+      enforceDaemonTokenRoute(c.req, daemonServerId, nodeRole);
+      return { auth: { userId: server.user_id, role: 'owner' as Role, nodeRole, serverId: daemonServerId } };
+    }
   }
 
   // Try API key lookup (deck_ prefix)
