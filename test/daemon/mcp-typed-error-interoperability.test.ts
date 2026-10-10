@@ -62,7 +62,7 @@ async function invoke(client: Client, [name, args]: Invocation, fallback: boolea
 }
 
 describe.each([false, true])('real SDK typed-error interoperability (fallback=%s)', (fallback) => {
-  it.each(executeCalls)('participant %s refuses cleanly, preserves typed reason, never dispatches (%j)', async (name, args) => {
+  it.each(executeCalls.filter(([name]) => name === MEMORY_MCP_TOOL_NAMES.EXEC_REMOTE))('participant %s refuses cleanly, preserves typed reason, never dispatches (%j)', async (name, args) => {
     const deps = machineDeps();
     await withClient({ machineDeps: deps, participantTurnRequired: async () => true }, async (client) => {
       const result = await invoke(client, [name, args], fallback);
@@ -97,8 +97,8 @@ describe.each([false, true])('real SDK typed-error interoperability (fallback=%s
     });
   });
 
-  it('owner computer_use and docs success stay structured and schema-valid', async () => {
-    await withClient({ machineDeps: machineDeps(), participantTurnRequired: async () => false }, async (client) => {
+  it.each([false, true])('owner/participant computer_use and docs success stay structured and schema-valid (participant=%s)', async (participant) => {
+    await withClient({ machineDeps: machineDeps(), participantTurnRequired: async () => participant }, async (client) => {
       const result = await invoke(client, [MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_CALL, { machine: NODE, tool: 'list_apps' }], fallback);
       expect(result.isError).not.toBe(true);
       expect(result.structuredContent).toMatchObject({ status: 'ok', outcome: 'completed' });

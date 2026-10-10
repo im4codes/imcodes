@@ -154,7 +154,11 @@ async function hasCurrentControlledStageAccess(
   // A staged download is a file READ on the node: it keeps passing the execute rule (exec switch, owner / execute grant) until the end,
   // so the kill switch and a revoked grant stop a transfer that is already staged.
   const now = Date.now();
-  const access = await resolveControlledMachineOperatorAccess(db, entry.controlledAccessUserId, entry.serverId, now);
+  const ownerAccess = await resolveControlledMachineOperatorAccess(db, entry.controlledAccessUserId, entry.serverId, now);
+  if (!ownerAccess) return false;
+  const access = entry.controlledActorUserId
+    ? await resolveControlledMachineOperatorAccess(db, entry.controlledActorUserId, entry.serverId, now)
+    : ownerAccess;
   if (!access) return false;
   const decision = evaluateMachineAction({
     accessRole: access.access_role,

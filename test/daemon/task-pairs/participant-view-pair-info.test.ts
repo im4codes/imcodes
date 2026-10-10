@@ -9,7 +9,6 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { createMemoryMcpServer } from '../../../src/daemon/memory-mcp-server.js';
 import { MCP_TOOL_DISCOVERY_NAME } from '../../../shared/mcp-tool-discovery.js';
-import { PARTICIPANT_TURN_TOOL_REFUSAL } from '../../../shared/participant-turn-tool-policy.js';
 import type { ContextNamespace } from '../../../shared/context-types.js';
 import type { TaskPairState } from '../../../shared/task-pair.js';
 import { MEMORY_MCP_TOOL_NAMES } from '../../../shared/memory-mcp-contracts.js';
@@ -84,7 +83,8 @@ describe('a participant-started turn gets no open-pair titles, models or briefs'
         await client.callTool({ name: MCP_TOOL_DISCOVERY_NAME, arguments: { query: MEMORY_MCP_TOOL_NAMES.PAIR_TASK_GET } });
         const result = await client.callTool({ name: MEMORY_MCP_TOOL_NAMES.PAIR_TASK_GET, arguments: { taskId: 'task-1' } });
         if (denied) {
-          expect(result.structuredContent).toMatchObject({ reason: PARTICIPANT_TURN_TOOL_REFUSAL });
+          expect(result.isError).not.toBe(true);
+          expect(result.structuredContent).toMatchObject({ taskId: 'task-1', title: null, markdown: null });
           expect(text(result)).not.toContain(SECRET_BRIEF);
           expect(text(result)).not.toContain(SECRET_TITLE);
         } else {

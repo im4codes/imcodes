@@ -9,8 +9,7 @@
  *
  *   EXECUTE-class needs ALL of:  the node's exec switch is ON  AND  the actor is the device OWNER, or an explicit per-device share row
  *   with role `participant` AND exec_granted (set by the owner only; a group never grants it, a viewer never has it)
- *   AND the turn was not started by a share participant (the owner's agent must not be a confused deputy for a request somebody
- *   else typed, even when that somebody holds a grant of their own).
+ *   Only EXEC (exec_remote) additionally refuses participant-origin turns. Other actions use the actor's real access and grant.
  *
  * Reading files is EXECUTE-class on purpose: the node's account can read credentials, keys and browser profiles, so "read any path"
  * is a privilege escalation for whoever holds it. Loosen it here, in one place, if the owner decides otherwise.
@@ -72,7 +71,7 @@ export const MACHINE_DENIAL_REASON = {
   EXEC_DISABLED: 'exec_disabled',
   /** The actor can operate the device but holds no execute grant (group member, share participant without the grant). */
   EXECUTE_NOT_GRANTED: 'execute_not_granted',
-  /** The turn was started by a share participant: never executes, whatever the participant holds. */
+  /** exec_remote was requested on a share-participant turn: refused even with an execute grant. */
   PARTICIPANT_TURN: 'participant_turn',
   /** The action is unknown to this table. */
   UNKNOWN_ACTION: 'unknown_action',
@@ -103,7 +102,7 @@ export function evaluateMachineAction(subject: MachineAccessSubject, action: Mac
   if (action === MACHINE_ACTION.LIST) return { allowed: true };
   if (!subject.execEnabled) return { allowed: false, reason: MACHINE_DENIAL_REASON.EXEC_DISABLED };
   if (!machineActionRequiresExecute(action)) return { allowed: true };
-  if (subject.participantTurn) return { allowed: false, reason: MACHINE_DENIAL_REASON.PARTICIPANT_TURN };
+  if (action === MACHINE_ACTION.EXEC && subject.participantTurn) return { allowed: false, reason: MACHINE_DENIAL_REASON.PARTICIPANT_TURN };
   if (subject.accessSource === MACHINE_ACCESS_SOURCE.OWNER && subject.accessRole === 'owner') return { allowed: true };
   if (subject.accessSource === MACHINE_ACCESS_SOURCE.SHARE && subject.accessRole === 'participant' && subject.execGranted === true) {
     return { allowed: true };

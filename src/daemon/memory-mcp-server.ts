@@ -371,9 +371,9 @@ export function participantTurnFromAuthorityHook(
 }
 
 /**
- * Refuse owner-level tools while the current turn belongs to a shared-session participant (shared/participant-turn-tool-policy.ts).
+ * Refuse only exec_remote while the current turn belongs to a shared-session participant (shared/participant-turn-tool-policy.ts).
  * Wraps registration like the resource guard, so EVERY tool of this server passes through it -- a tool registered by any module is
- * covered, and a tool nobody classified is refused. The turn is asked per call: it changes with every message.
+ * covered without changing its original authority checks. Only exec_remote asks the turn per call.
  */
 function installParticipantTurnGate(server: McpServer, participantTurnRequired: (() => Promise<boolean>) | undefined): void {
   if (!participantTurnRequired) return;

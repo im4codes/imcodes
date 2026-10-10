@@ -177,25 +177,15 @@ export async function resolveMachineOperationalUser(
  * membership), read live from the DB, in addition to the owner's access. An
  * owner turn has no delegated actor and is unchanged.
  */
-export async function actorMayOperateMachine(
-  db: Database,
-  delegatedActorUserId: string | undefined,
-  targetServerId: string,
-  now: number,
-): Promise<boolean> {
-  if (!delegatedActorUserId) return true;
-  return (await resolveControlledMachineOperatorAccess(db, delegatedActorUserId, targetServerId, now)) !== null;
-}
-
-/** The list form of actorMayOperateMachine: ids of the controlled machines the participant can operate themselves. */
-export async function listActorOperableMachineIds(
+/** Current operable actor rows, not just visibility IDs: callers must not substitute the source owner's grants. */
+export async function listActorOperableMachineAccess(
   db: Database,
   delegatedActorUserId: string,
   now: number,
   limit: number,
-): Promise<Set<string>> {
+) {
   const rows = await listAccessibleControlledMachines(db, delegatedActorUserId, now, limit);
-  return new Set(rows.filter((row) => canOperateControlledMachine(row.access_role)).map((row) => row.id));
+  return new Map(rows.filter((row) => canOperateControlledMachine(row.access_role)).map((row) => [row.id, row]));
 }
 
 /**
@@ -208,7 +198,7 @@ export async function listActorOperableMachineIds(
  * and a valid one never widens a participant beyond what they were given.
  *
  * Operating is not executing: the ACTION decides (shared/machine-access-policy.ts). An execute-class action additionally needs the node's
- * exec switch, the device owner or an explicit execute grant, and a turn that was not started by a share participant. The action is a
+ * exec switch and the current ACTOR's device ownership or explicit execute grant. Only exec_remote additionally refuses participant turns. The action is a
  * REQUIRED argument, so a new call site cannot admit "something" without saying what.
  */
 export interface MachineActionAdmissionInput {
@@ -246,16 +236,13 @@ export async function admitMachineAction(
   const deny = (reason: MachineDenialReason, accessSource: string | null): MachineActionAdmission => ({
     ok: false, reason, accessSource, ...(delegatedActorUserId ? { delegatedActorUserId } : {}),
   });
-  const target = await resolveControlledMachineOperatorAccess(
-    db,
-    operational.userId,
-    input.targetServerId,
-    input.now,
-  );
+  const ownerTarget = await resolveControlledMachineOperatorAccess(db, operational.userId, input.targetServerId, input.now);
+  if (!ownerTarget) return deny(MACHINE_DENIAL_REASON.NO_ACCESS, null);
+  // Preserve the source owner's scope, but evaluate and audit the real actor's role/source/grant, never the owner's substitute.
+  const target = delegatedActorUserId
+    ? await resolveControlledMachineOperatorAccess(db, delegatedActorUserId, input.targetServerId, input.now)
+    : ownerTarget;
   if (!target) return deny(MACHINE_DENIAL_REASON.NO_ACCESS, null);
-  if (!await actorMayOperateMachine(db, delegatedActorUserId, input.targetServerId, input.now)) {
-    return deny(MACHINE_DENIAL_REASON.NO_ACCESS, target.access_source);
-  }
   const decision = evaluateMachineAction({
     accessRole: target.access_role,
     accessSource: target.access_source,

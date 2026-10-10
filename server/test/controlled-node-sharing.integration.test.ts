@@ -576,11 +576,11 @@ describe('controlled-node shared action admission', () => {
     expect(computer.status).toBe(200);
     expect(await computer.json()).toMatchObject({ outcome: 'completed' });
 
-    // Reading a file off the node is execute-class too: refused on a participant-started turn.
+    // File access is allowed by the participant's own execute grant, independently of exec_remote.
     const file = await app.request(`/api/server/${targetId}/machine-file-handle`, {
       method: 'POST', headers, body: JSON.stringify({ path: 'C:\\Temp\\shared.txt' }),
     });
-    expect(file.status).toBe(403);
+    expect(file.status).toBe(200);
 
     // The token is only an authenticated admission context. Current role and
     // expiry are re-read at the device action boundary.
@@ -966,17 +966,17 @@ describe('a shared-session participant reaches only the machines shared with the
     }
   });
 
-  it('lets a participant-started turn LOOK at the nodes the participant reaches themselves, and never execute (positive control + confused deputy)', async () => {
+  it('participant-origin exec_remote is refused, while View and file access follow the real grant', async () => {
     const t = await scene();
     for (const target of [t.participantShared, t.grouped]) {
       // Read-only computer use follows the participant's own access (a machine share, or the group)...
       expect((await computerUse(t.app, t.delegated, target)).status, `computer-use ${target}`).toBe(200);
-      // ...but exec and file access are execute-class: refused on a turn the participant started, even for the share that carries
-      // an execute grant of the participant's own (the owner's agent is not a confused deputy).
+      // Only exec_remote is participant-gated. A granted file request reaches the offline node (503), not a policy refusal.
+      // A group-only actor still lacks the file grant (403).
       const execDenied = await exec(t.app, t.delegated, target);
       expect(execDenied.status, `exec ${target}`).toBe(403);
       expect(await execDenied.json()).toMatchObject({ outcome: 'not_dispatched', reason: 'target_forbidden' });
-      expect((await fileHandle(t.app, t.delegated, target)).status, `file ${target}`).toBe(403);
+      expect((await fileHandle(t.app, t.delegated, target)).status, `file ${target}`).toBe(target === t.participantShared ? 503 : 403);
     }
   });
 
@@ -1051,7 +1051,7 @@ describe('a shared-session participant reaches only the machines shared with the
       .toEqual({ reason: 'no_access' });
   });
 
-  it('re-reads the participant\'s own access when a staged upload is redeemed', async () => {
+  it.each([false, true])('re-reads the participant execute grant when a staged upload is redeemed (delegated=%s)', async (delegated) => {
     const t = await scene();
     const participantDaemon = await fullCredential(t.participantId);
     const ownDaemon = { 'X-Server-Id': participantDaemon.serverId, authorization: `Bearer ${participantDaemon.token}`, 'content-type': 'application/json' };
@@ -1071,7 +1071,7 @@ describe('a shared-session participant reaches only the machines shared with the
       const url = new URL(String(message.downloadUrl));
       void (async () => {
         if (revokeBeforeRedeem) {
-          await db.execute('UPDATE server_shares SET revoked_at = $3 WHERE server_id = $1 AND target_user_id = $2', [t.participantShared, t.participantId, Date.now()]);
+          await db.execute('UPDATE server_shares SET exec_granted = false WHERE server_id = $1 AND target_user_id = $2', [t.participantShared, t.participantId]);
         }
         const staged = await redeemApp.request(`${url.pathname}${url.search}`);
         redeemed.push(staged.status);
@@ -1092,7 +1092,7 @@ describe('a shared-session participant reaches only the machines shared with the
       const form = new FormData();
       form.append('file', new File(['payload'], 'payload.txt', { type: 'text/plain' }));
       // The participant's OWN daemon (a turn they did not hand to the owner's agent): they hold the share with the execute grant.
-      const { 'content-type': _ignored, ...headers } = ownDaemon;
+      const { 'content-type': _ignored, ...headers } = delegated ? t.delegated : ownDaemon;
       await t.app.request(`/api/server/${t.participantShared}/upload`, { method: 'POST', headers, body: form });
     };
     await upload();
@@ -1101,7 +1101,7 @@ describe('a shared-session participant reaches only the machines shared with the
     revokeBeforeRedeem = true;
     await upload();
     await waitFor(() => redeemed.length === 2);
-    expect(redeemed[1], 'participant share revoked between staging and redeem').toBe(403);
+    expect(redeemed[1], 'participant execute grant revoked between staging and redeem').toBe(403);
     targetSocket.close();
   });
 });

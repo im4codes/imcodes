@@ -15,10 +15,10 @@ import { createServer, createUser } from '../src/db/queries.js';
 import { createMachineExecRoutes, machineExecAuditIntentStore, type ExecDispatcher } from '../src/routes/machine-exec.js';
 import { createMachineComputerUseRoutes, type ComputerUseDispatcher } from '../src/routes/machine-computer-use.js';
 import { admitMachineAction, issueSharedMachineAuthority } from '../src/share/shared-machine-authority.js';
-import { listControlledMachines } from '../src/routes/machines.js';
+import { listControlledMachines, machinesRoutes } from '../src/routes/machines.js';
 import { resetMachineActionGateForTests } from '../src/security/machine-action-gate.js';
 import { SHARED_MACHINE_AUTHORITY_HEADER, SHARED_MACHINE_AUTHORITY_TYPE } from '../../shared/shared-machine-authority.js';
-import { MACHINE_ACTION, MACHINE_DENIAL_REASON, type MachineAction } from '../../shared/machine-access-policy.js';
+import { MACHINE_ACTION, type MachineAction } from '../../shared/machine-access-policy.js';
 import { USER_STATUS } from '../../shared/user-status.js';
 import { NODE_ROLE } from '../../shared/remote-exec.js';
 
@@ -101,6 +101,7 @@ beforeAll(async () => {
 function execApp() {
   const app = new Hono();
   app.use('*', async (c, next) => { (c as unknown as { env: unknown }).env = { DB: db, JWT_SIGNING_KEY: KEY }; await next(); });
+  app.route('/api/machines', machinesRoutes);
   app.route('/api/machine/exec', createMachineExecRoutes(execDispatcher, machineExecAuditIntentStore));
   app.route('/api/machine/computer-use', createMachineComputerUseRoutes(computerUseDispatcher));
   return app;
@@ -185,7 +186,7 @@ describe('role x action matrix (real resolvers, real routes)', () => {
   });
 });
 
-describe('a turn that a share participant started never executes', () => {
+describe('only exec_remote is refused on participant-origin turns', () => {
   async function delegatedHeader(participant: string): Promise<Record<string, string>> {
     // The owner's FULL daemon runs a shared session; the participant's message drives it (server-minted, signed turn authority).
     const owner = actors.owner!;
@@ -208,22 +209,38 @@ describe('a turn that a share participant started never executes', () => {
     };
   }
 
-  it('refuses every execute-class action, even when the participant holds an execute grant of their own', async () => {
-    const headers = await delegatedHeader('pYes');
+  it.each(NAMES)('%s: participant-origin refuses only exec_remote; other actions use the participant grant', async (name) => {
+    const headers = await delegatedHeader(name);
     const owner = actors.owner!;
-    for (const attempt of [EXEC, SHELL, CLICK]) {
-      const before = execCalls + guiCalls;
-      const response = await attempt(owner, headers);
-      expect(response.status).toBe(403);
-      expect(execCalls + guiCalls).toBe(before);
+    const before = execCalls;
+    expect((await EXEC(owner, headers)).status).toBe(403);
+    expect(execCalls).toBe(before);
+    for (const attempt of [SHELL, CLICK]) {
+      const calls = guiCalls;
+      expect((await attempt(owner, headers)).status).toBe(MAY_EXECUTE.includes(name) ? 200 : 403);
+      expect(guiCalls - calls).toBe(MAY_EXECUTE.includes(name) ? 1 : 0);
     }
     for (const action of [MACHINE_ACTION.FILE_SEND, MACHINE_ACTION.FILE_FETCH, MACHINE_ACTION.FILE_LIST]) {
       const admission = await admitMachineAction(db, {
         token: headers[SHARED_MACHINE_AUTHORITY_HEADER], signingKey: KEY, authenticatedSourceServerId: owner.serverId,
         sourceOwnerUserId: owner.userId, targetServerId: nodeId, action, now: Date.now(),
       });
-      expect(admission).toMatchObject({ ok: false, reason: MACHINE_DENIAL_REASON.PARTICIPANT_TURN });
+      expect(admission.ok, action).toBe(MAY_EXECUTE.includes(name));
     }
+  });
+
+  it.each(['pNo', 'pYes', 'gMember'])('%s: daemon list keeps the raw switch for non-EXEC consumers without owner-grant substitution', async (name) => {
+    const delegated = await delegatedHeader(name);
+    const owner = actors.owner!;
+    const projected = (await listControlledMachines(db, owner.userId, Date.now(), actors[name]!.userId)).machines.find((m) => m.serverId === nodeId)!;
+    expect(projected).toMatchObject({ execEnabled: true, canExecute: false, accessSource: name === 'gMember' ? 'group' : 'share', execGranted: name === 'pYes' });
+    const response = await execApp().request('/api/machines', {
+      headers: { 'X-Server-Id': owner.serverId, authorization: `Bearer ${owner.token}`, ...delegated },
+    });
+    expect(response.status).toBe(200);
+    const listed = await response.json();
+    expect(listed.machines.find((m: { serverId: string }) => m.serverId === nodeId)).toMatchObject({ execEnabled: true });
+    expect(listed.machines.find((m: { serverId: string }) => m.serverId === nodeId)).not.toHaveProperty('canExecute');
   });
 
   it('a read-only view still follows the participant\'s OWN access (a group member may look, a stranger may not)', async () => {
@@ -307,7 +324,8 @@ describe('the exec switch and the kill switch', () => {
     };
     const app = new Hono();
     app.use('*', async (c, next) => { (c as unknown as { env: unknown }).env = { DB: db, JWT_SIGNING_KEY: KEY }; await next(); });
-    app.route('/api/machine/exec', createMachineExecRoutes(racing, intentStore));
+    app.route('/api/machines', machinesRoutes);
+  app.route('/api/machine/exec', createMachineExecRoutes(racing, intentStore));
     try {
       const owner = actors.owner!;
       const response = await app.request(`/api/machine/exec?serverId=${nodeId}`, {

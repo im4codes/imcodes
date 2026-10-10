@@ -1603,10 +1603,10 @@ function pairAccessError(access: PairChecklistAccess): ToolResult {
     : error(MCP_ERROR_REASONS.PROJECTION_UNAVAILABLE, 'task pair not found');
 }
 
-function pairChecklistView(pair: ReturnType<typeof pairChecklistTarget>) {
+function pairChecklistView(pair: ReturnType<typeof pairChecklistTarget>, participantView = false) {
   if (!pair) return undefined;
   const markdown = pair.state.brief ?? '';
-  return { taskId: pair.state.taskId, title: pair.state.title ?? null, markdown, status: pair.state.status, executor: pair.state.executor, auditor: pair.state.auditor, brain: pair.state.brain, round: pair.state.round, flags: pair.state.flags, blocking: pair.state.blocking, previousAuditors: pair.state.previousAuditors, capCounts: pair.state.capCounts, workspaceKind: pair.state.workspaceKind, lastVerdict: pair.state.lastVerdict, createdAt: pair.state.createdAt, updatedAt: pair.state.updatedAt, workspace: pair.state.workspace, material: pair.state.material, output: pair.state.output, resourceClaims: pair.state.resourceClaims ?? [], resourceCleanup: pair.state.resourceCleanup ?? null, ...taskPairChecklistCounts(markdown) };
+  return { taskId: pair.state.taskId, title: participantView ? null : (pair.state.title ?? null), markdown: participantView ? null : markdown, status: pair.state.status, executor: pair.state.executor, auditor: pair.state.auditor, brain: pair.state.brain, round: pair.state.round, flags: pair.state.flags, blocking: pair.state.blocking, previousAuditors: pair.state.previousAuditors, capCounts: pair.state.capCounts, workspaceKind: pair.state.workspaceKind, lastVerdict: pair.state.lastVerdict, createdAt: pair.state.createdAt, updatedAt: pair.state.updatedAt, workspace: pair.state.workspace, material: pair.state.material, output: pair.state.output, resourceClaims: pair.state.resourceClaims ?? [], resourceCleanup: pair.state.resourceCleanup ?? null, ...taskPairChecklistCounts(markdown) };
 }
 
 function savePairBrief(pair: NonNullable<ReturnType<typeof pairChecklistTarget>>, markdown: string, writer: string) {
@@ -2084,7 +2084,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       const taskId = typeof input === 'object' && input !== null && typeof (input as Record<string, unknown>).taskId === 'string' ? String((input as Record<string, unknown>).taskId) : undefined;
       const access = pairChecklistAccess(caller, await sendSessions(), taskId);
       if (access.status !== 'ok') return pairAccessError(access);
-      return pairChecklistView(access.pair)!;
+      return pairChecklistView(access.pair, await participantViewRequired())!;
     },
     [MEMORY_MCP_TOOL_NAMES.PAIR_TASK_UPDATE]: async (input) => {
       const args = (input && typeof input === 'object' ? input : {}) as Record<string, unknown>;
@@ -2099,7 +2099,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
         if (!savedTitle) return error(MCP_ERROR_REASONS.SCOPE_FORBIDDEN, 'only the project Brain may set a valid task title');
       }
       const saved = markdown === undefined ? getTaskPairStore().getPair(pair.project, pair.state.taskId) : savePairBrief(pair, markdown, caller.sessionName ?? 'unknown');
-      return pairChecklistView(saved)!;
+      return pairChecklistView(saved, await participantViewRequired())!;
     },
     [MEMORY_MCP_TOOL_NAMES.PAIR_TASK_CHECK]: async (input) => {
       const args = (input && typeof input === 'object' ? input : {}) as Record<string, unknown>;
@@ -2110,7 +2110,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       if (access.status !== 'ok') return pairAccessError(access);
       const pair = access.pair;
       const markdown = updateTaskPairChecklist(pair.state.brief ?? '', items, box, args.checked);
-      return pairChecklistView(savePairBrief(pair, markdown, caller.sessionName ?? 'unknown'))!;
+      return pairChecklistView(savePairBrief(pair, markdown, caller.sessionName ?? 'unknown'), await participantViewRequired())!;
     },
     [MEMORY_MCP_TOOL_NAMES.PAIR_RESOURCE_CLAIM]: async (input) => {
       const args = (input && typeof input === 'object' ? input : {}) as Record<string, unknown>;

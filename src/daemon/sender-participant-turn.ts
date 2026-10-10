@@ -2,7 +2,7 @@
  * Whose turn is a session in right now -- the question an agent-to-agent message must answer about its SENDER.
  *
  * A shared-session participant's message makes the owner's agent run a turn under restricted authority (machine access follows the
- * participant's own access, owner-level MCP tools are refused). If that agent could simply send_message a sibling session, the sibling
+ * participant's own access, exec_remote is refused). If that agent could simply send_message a sibling session, the sibling
  * would run the same request as an ordinary owner turn: the restriction would end at the first hop. The sender's participant context
  * is therefore read here and stamped on the message (session-dispatch.ts), so the receiving turn is bound to the same participant.
  */

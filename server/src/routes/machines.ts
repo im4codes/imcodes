@@ -59,7 +59,7 @@ import {
 } from '../services/controlled-node-host-link.js';
 import { isControlledNodeId } from '../../../shared/controlled-node-identity.js';
 import { SHARED_MACHINE_AUTHORITY_HEADER } from '../../../shared/shared-machine-authority.js';
-import { listActorOperableMachineIds, resolveMachineOperationalUser } from '../share/shared-machine-authority.js';
+import { listActorOperableMachineAccess, resolveMachineOperationalUser } from '../share/shared-machine-authority.js';
 import {
   CONTROLLED_NODE_UPGRADE_STATUS,
   DAEMON_UPGRADE_DELIVERY_STATUS,
@@ -146,10 +146,12 @@ export async function listControlledMachines(
   // The bound applies to the owner's fleet before any narrowing, so a participant never gets a silently truncated list.
   const overLimit = rows.length > MACHINE_LIST_MAX_ITEMS;
   if (delegatedActorUserId) {
-    // The same rule as action admission (actorMayOperateMachine): the owner's
-    // fleet intersected with what the participant is themselves allowed to operate.
-    const actorOperable = await listActorOperableMachineIds(db, delegatedActorUserId, nowMs, MACHINE_LIST_MAX_ITEMS + 1);
-    rows = rows.filter((row) => actorOperable.has(row.id));
+    // Preserve the owner's fleet scope while projecting the participant's own access, not the owner's grants.
+    const actorOperable = await listActorOperableMachineAccess(db, delegatedActorUserId, nowMs, MACHINE_LIST_MAX_ITEMS + 1);
+    rows = rows.flatMap((row) => {
+      const actor = actorOperable.get(row.id);
+      return actor ? [{ ...row, access_role: actor.access_role, access_source: actor.access_source, exec_granted: actor.exec_granted }] : [];
+    });
   }
   const machines = rows.slice(0, MACHINE_LIST_MAX_ITEMS).map((r) => {
     if (!isControlledNodeId(r.node_id)) {
@@ -214,7 +216,7 @@ export async function listControlledMachines(
       accessRole: r.access_role,
       // Operating is not executing: the browser is told whether THIS actor may run commands / move files on the device (an owner, or a
       // participant share with the owner's execute grant), where the access comes from, and whether a grant is held. A turn that was
-      // started by a share participant never executes, whatever it holds.
+      // started by a share participant cannot use exec_remote, but other actions follow its real grant.
       canExecute: evaluateMachineAction({
         accessRole: r.access_role,
         accessSource: r.access_source,
@@ -307,10 +309,10 @@ machinesRoutes.get('/', requireAuth(), async (c) => {
   // Older daemons strictly reject unknown machine-list keys. Server-authenticated
   // callers do not need the display-only role because every action is admitted
   // again against the DB; preserve their legacy DTO during rolling upgrades.
-  // A daemon (an agent's list_machines) is told `execEnabled` only for devices it can actually execute on, so an agent does not plan
-  // commands the server will refuse; the browser keeps the raw switch and the separate `canExecute`.
+  // Keep the node's switch separate from exec_remote admission: projecting canExecute into execEnabled hides devices from
+  // non-EXEC consumers (View, shell, GUI and file tools). Each action revalidates the actor's own DB access at admission.
   const responseMachines = authenticatedDaemon
-    ? machines.map((machine) => pickDaemonMachineListItem({ ...machine, execEnabled: machine.execEnabled === true && machine.canExecute === true }))
+    ? machines.map((machine) => pickDaemonMachineListItem(machine))
     : machines;
   return c.json({ machines: responseMachines });
 });
