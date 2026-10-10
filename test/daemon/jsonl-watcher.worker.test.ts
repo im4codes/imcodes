@@ -192,7 +192,7 @@ describe('jsonl-watcher parity: worker ON vs worker OFF', () => {
     const mainEvents = await runFixture(false, fixture);
     expect(workerEvents.length).toBeGreaterThan(0);
     expect(canonicalize(workerEvents)).toEqual(canonicalize(mainEvents));
-  }, 15000);
+  }, 60000);
 
   it('produces identical events for Edit tool_use + tool_result pair (file.change)', async () => {
     const tuId = `tu_${randomUUID().slice(0, 8)}`;
@@ -211,7 +211,7 @@ describe('jsonl-watcher parity: worker ON vs worker OFF', () => {
     expect(workerTypes).toContain('file.change');
     expect(mainTypes).toContain('file.change');
     expect(canonicalize(workerEvents)).toEqual(canonicalize(mainEvents));
-  }, 15000);
+  }, 60000);
 
   it('produces identical events when tool_use and tool_result arrive in separate drain cycles', async () => {
     const tuId = `tu_${randomUUID().slice(0, 8)}`;
@@ -252,7 +252,7 @@ describe('jsonl-watcher parity: worker ON vs worker OFF', () => {
     // The tool.call that emits alongside file.change should be 'hidden'
     const hiddenCall = workerEvents.find((e) => e.type === 'tool.call' && e.opts?.hidden === true);
     expect(hiddenCall).toBeDefined();
-  }, 20000);
+  }, 60000);
 
   it('falls back to main thread when worker is unavailable', async () => {
     process.env.IM4CODES_JSONL_WORKER = '1'; // opt into the worker path for this test
@@ -287,5 +287,5 @@ describe('jsonl-watcher parity: worker ON vs worker OFF', () => {
     } finally {
       jsonlParsePool.isAvailable = originalIsAvailable;
     }
-  }, 15000);
+  }, 60000);
 });

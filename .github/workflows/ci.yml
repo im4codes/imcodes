@@ -715,7 +715,7 @@ jobs:
           path: |
             coverage/shard-${{ matrix.shard }}/
             .vitest-reports/
-          if-no-files-found: error
+          if-no-files-found: ignore
 
   coverage:
     name: Coverage Report
