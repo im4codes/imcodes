@@ -975,20 +975,20 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     const generation = state.turnGeneration;
     const settlement = this.querySettlements.get(activeQuery);
     if (!settlement) return Promise.reject(new Error('Claude query settlement unavailable'));
-    const child = state.currentChild;
+    const capturedChild = state.currentChild;
     let removeExitListener = () => {};
-    const terminal = child ? Promise.race([
+    const terminal = capturedChild ? Promise.race([
       settlement,
       new Promise<void>((resolve) => {
-        if (child.exitCode !== null || child.signalCode !== null) { resolve(); return; }
+        if (capturedChild.exitCode !== null || capturedChild.signalCode !== null) { resolve(); return; }
         const onExit = () => resolve();
-        child.once('exit', onExit);
-        removeExitListener = () => child.removeListener('exit', onExit);
+        capturedChild.once('exit', onExit);
+        removeExitListener = () => capturedChild.removeListener('exit', onExit);
       }),
     ]) : settlement;
     const operation = confirmPromiseStop(activeQuery, terminal, () => this.cancel(sessionId),
       () => this.sessions.get(sessionId) === state && state.turnGeneration === generation);
-    if (child) bindCapturedChildStop(child, operation);
+    if (capturedChild) bindCapturedChildStop(capturedChild, operation);
     this.confirmedCancelOperations.set(sessionId, operation);
     void operation.finally(() => {
       removeExitListener();

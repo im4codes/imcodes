@@ -101,6 +101,15 @@ async function makeRuntime(providerId: string, sessionKey: string) {
   return { provider, runtime, finish };
 }
 
+async function nativeAppendHarness(sessionKey: string) {
+  const harness = await makeRuntime('claude-code-sdk', sessionKey);
+  harness.provider.capabilities = { ...harness.provider.capabilities, activeDelegationNotification: 'native' } as never;
+  harness.provider.notifyActiveDelegation = vi.fn().mockResolvedValue('delivered');
+  harness.runtime.send('foreground', 'foreground');
+  await waitForSends(harness.provider, 1);
+  return harness;
+}
+
 describe('TransportSessionRuntime command mode', () => {
   beforeEach(() => {
     resetTransportQueueStoreForTests();
@@ -189,7 +198,7 @@ describe('TransportSessionRuntime command mode', () => {
     expect(turn!.messagePreamble).toBeUndefined();
   });
 
-  it('a native append never joins a command with another queued message', async () => {
+  it.each([0, 1, 2])('native append splits command at position %s without making the entire mixed queue wait idle', async (commandPosition) => {
     const provider = makeProvider('claude-code-sdk');
     provider.capabilities = { ...provider.capabilities, activeDelegationNotification: 'native' } as never;
     provider.notifyActiveDelegation = vi.fn().mockResolvedValue('delivered');
@@ -197,13 +206,114 @@ describe('TransportSessionRuntime command mode', () => {
     await runtime.initialize({ sessionKey: 'deck_cmdmode_append' });
     runtime.send('turn one', 'turn-one');
     await waitForSends(provider, 1);
-    runtime.send('ordinary', 'ord');
-    runtime.send('raw command', 'cmd', undefined, undefined, { commandMode: true });
-    // Two queued rows selected for one native append would be joined into one provider text.
-    expect(await runtime.appendPendingMessagesToActiveTurn(['ord', 'cmd'], 'note-1')).toEqual({ status: 'control_unsupported' });
-    expect(provider.notifyActiveDelegation).not.toHaveBeenCalled();
-    // A command alone may still ride a native append, as exactly its own text.
-    expect(await runtime.appendPendingMessagesToActiveTurn(['cmd'], 'note-2')).toMatchObject({ status: 'delivered' });
-    expect(provider.notifyActiveDelegation).toHaveBeenCalledWith('provider-session-1', expect.objectContaining({ text: 'raw command' }));
+    const texts = ['ordinary before\n中文', 'ordinary after'];
+    texts.splice(commandPosition, 0, 'raw command\n  原文');
+    for (const [index, text] of texts.entries()) runtime.send(text, `mixed-${index}`, undefined, undefined,
+      index === commandPosition ? { commandMode: true } : undefined);
+    const result = await runtime.appendPendingMessagesToActiveTurn(['mixed-0', 'mixed-1', 'mixed-2'], 'note-mixed');
+    expect(result).toMatchObject({ status: 'delivered' });
+    const admissions = (provider.notifyActiveDelegation as ReturnType<typeof vi.fn>).mock.calls.map((call) => call[1].text);
+    expect(admissions).toEqual(commandPosition === 0 ? [texts[0], texts.slice(1).join('\n\n')]
+      : commandPosition === 2 ? [texts.slice(0, 2).join('\n\n'), texts[2]] : texts);
+    expect(runtime.pendingEntries).toEqual([]);
+    expect(provider.cancel).not.toHaveBeenCalled();
+    expect(provider.send).toHaveBeenCalledTimes(1);
+    for (let i = 0; i < 3; i++) expect(getTransportQueueStore().hasDeliveryTombstone('deck_cmdmode_append', `mixed-${i}`)).toBe(true);
   });
+  it.each(['unsupported', 'stale'])('one command returning %s publishes partial truth and does not strand later text', async (status) => {
+    const { runtime, provider } = await nativeAppendHarness('deck_cmdmode_partial');
+    provider.notifyActiveDelegation = vi.fn(async (_session, notification) => notification.text === 'raw command' ? status : 'delivered') as never;
+    runtime.send('before', 'before');
+    runtime.send('raw command', 'cmd', undefined, undefined, { commandMode: true });
+    runtime.send('after', 'after');
+    const result = await runtime.appendPendingMessagesToActiveTurn(['before', 'cmd', 'after'], 'partial');
+    expect(result).toEqual({ status });
+    expect((provider.notifyActiveDelegation as ReturnType<typeof vi.fn>).mock.calls.map((call) => call[1].text)).toEqual(['before', 'raw command', 'after']);
+    expect(runtime.pendingEntries.map((entry) => entry.clientMessageId)).toEqual(['cmd']);
+    expect(getTransportQueueStore().hasDeliveryTombstone('deck_cmdmode_partial', 'cmd')).toBe(false);
+    for (const id of ['before', 'after']) {
+      expect(getTransportQueueStore().hasDeliveryTombstone('deck_cmdmode_partial', id)).toBe(true);
+      expect(timelineEmitterEmitMock.mock.calls.filter((call) => call[1] === 'transport.queue.delivery' && call[2].clientMessageId === id)).toHaveLength(1);
+    }
+    expect(provider.cancel).not.toHaveBeenCalled();
+    // Retry only the unadmitted command. Already accepted neighbours remain gone.
+    (provider.notifyActiveDelegation as ReturnType<typeof vi.fn>).mockResolvedValue('delivered');
+    expect(await runtime.appendPendingMessagesToActiveTurn(['cmd'], 'retry')).toMatchObject({ status: 'delivered' });
+    expect(runtime.pendingEntries).toEqual([]);
+    expect(await runtime.appendPendingMessagesToActiveTurn(['before', 'cmd', 'after'], 'duplicate')).toEqual({ status: 'not_found' });
+    expect(provider.notifyActiveDelegation).toHaveBeenCalledTimes(4);
+  });
+
+  it('keeps consecutive commands as separate native inputs and compact on its dedicated SDK path', async () => {
+    const { runtime, provider } = await nativeAppendHarness('deck_cmdmode_controls');
+    runtime.send('command 1', 'cmd1', undefined, undefined, { commandMode: true });
+    runtime.send('command 2', 'cmd2', undefined, undefined, { commandMode: true });
+    runtime.send('/compact', 'compact', undefined, undefined, { commandMode: true });
+    runtime.send('ordinary', 'ordinary');
+    expect(await runtime.appendPendingMessagesToActiveTurn(['cmd1', 'cmd2', 'compact', 'ordinary'], 'controls')).toEqual({ status: 'control_unsupported' });
+    expect((provider.notifyActiveDelegation as ReturnType<typeof vi.fn>).mock.calls.map((call) => call[1].text)).toEqual(['command 1', 'command 2', 'ordinary']);
+    expect(runtime.pendingEntries.map((entry) => entry.clientMessageId)).toEqual(['compact']);
+    expect(provider.cancel).not.toHaveBeenCalled();
+  });
+
+  it.each(['edit', 'withdraw', 'revoke'])('a delayed command does not replay accepted rows or swallow a later %s/new arrival', async (action) => {
+    const { runtime, provider } = await nativeAppendHarness('deck_cmdmode_delayed');
+    let release!: (result: 'delivered') => void;
+    provider.notifyActiveDelegation = vi.fn(async (_session, notification) => notification.text === 'command'
+      ? new Promise<'delivered'>((resolve) => { release = resolve; }) : 'delivered') as never;
+    runtime.send('before', 'before');
+    runtime.send('command', 'cmd', undefined, undefined, { commandMode: true });
+    runtime.send('after', 'after');
+    const admission = runtime.appendPendingMessagesToActiveTurn(['before', 'cmd', 'after'], 'delayed');
+    await vi.waitFor(() => expect(release).toBeTypeOf('function'));
+    expect(getTransportQueueStore().hasDeliveryTombstone('deck_cmdmode_delayed', 'before')).toBe(true);
+    expect(getTransportQueueStore().hasDeliveryTombstone('deck_cmdmode_delayed', 'cmd')).toBe(false);
+    runtime.send('new arrival outside frozen selection', 'new');
+    if (action === 'edit') expect(runtime.editPendingMessage('after', 'after edited')).toBe(true);
+    if (action === 'withdraw') expect(runtime.removePendingMessage('after')).not.toBeNull();
+    if (action === 'revoke') runtime.pendingDrainAdmission = (entry) => entry.clientMessageId === 'after' ? 'stale' : 'authorized';
+    release('delivered');
+    const result = await admission;
+    expect(result.status).toBe(action === 'edit' ? 'delivered' : action === 'withdraw' ? 'not_found' : 'rejected');
+    expect((provider.notifyActiveDelegation as ReturnType<typeof vi.fn>).mock.calls.map((call) => call[1].text)).toEqual(
+      action === 'edit' ? ['before', 'command', 'after edited'] : ['before', 'command']);
+    expect(runtime.pendingEntries.map((entry) => entry.clientMessageId)).toEqual(['new']);
+    expect(getTransportQueueStore().hasDeliveryTombstone('deck_cmdmode_delayed', 'cmd')).toBe(true);
+    expect(provider.cancel).not.toHaveBeenCalled();
+  });
+
+  it('restores commandMode and append intent from durable metadata without merging the command into ordinary text', async () => {
+    const before = await makeRuntime('claude-code-sdk', 'deck_cmdmode_restore_native');
+    before.provider.capabilities = { ...before.provider.capabilities, activeDelegationNotification: 'native' } as never;
+    before.provider.notifyActiveDelegation = vi.fn().mockResolvedValue('delivered');
+    before.provider.send = vi.fn(() => new Promise<void>(() => {}));
+    before.runtime.send('old foreground', 'old-foreground');
+    await waitForSends(before.provider, 1);
+    before.runtime.send('command 原文', 'cmd', undefined, undefined, { commandMode: true, deliveryMode: 'append' });
+    before.runtime.send('ordinary 中文', 'ord', undefined, undefined, { deliveryMode: 'append' });
+    await before.runtime.kill({ preserveTransportQueue: true });
+    const after = await nativeAppendHarness('deck_cmdmode_restore_native');
+    expect(after.runtime.rehydratePendingFromStore()).toBe(2);
+    const result = await after.runtime.appendPendingMessagesToActiveTurn(['cmd', 'ord'], 'restored-native');
+    expect(result.status).toBe('delivered');
+    expect((after.provider.notifyActiveDelegation as ReturnType<typeof vi.fn>).mock.calls.map((call) => call[1].text)).toEqual(['command 原文', 'ordinary 中文']);
+    expect(after.runtime.pendingEntries).toEqual([]);
+    await after.runtime.kill({ preserveTransportQueue: true });
+  });
+
+  it('handles the 200-entry command append limit with one native admission per id and no replay', async () => {
+    const { runtime, provider } = await nativeAppendHarness('deck_cmdmode_limit');
+    const ids = Array.from({ length: 200 }, (_, index) => `command-${index}`);
+    for (const [index, id] of ids.entries()) runtime.send(`command ${index} 中文\n${'x'.repeat(1024)}`, id, undefined, undefined, { commandMode: true });
+    const started = performance.now();
+    const result = await runtime.appendPendingMessagesToActiveTurn(ids, 'command-limit');
+    console.info('command-append-200 fixture milliseconds', performance.now() - started);
+    expect(result.status).toBe('delivered');
+    expect(provider.notifyActiveDelegation).toHaveBeenCalledTimes(200);
+    expect(runtime.pendingEntries).toEqual([]);
+    expect(provider.cancel).not.toHaveBeenCalled();
+    expect(getTransportQueueStore().readSnapshot('deck_cmdmode_limit').pendingMessageEntries).toEqual([]);
+    await runtime.kill({ preserveTransportQueue: true });
+  }, 30_000);
+
 });

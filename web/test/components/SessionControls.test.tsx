@@ -4,6 +4,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { h } from 'preact';
 import { render, screen, fireEvent, cleanup, within, waitFor, act } from '@testing-library/preact';
+import { TRANSPORT_QUEUE_COMMANDS } from '../../../shared/transport-queue-types.js';
 import { SESSION_SEND_DELIVERY_MODES } from '../../../shared/session-send-delivery.js';
 import { selectQueueDeliveryMode } from '../fixtures/delivery-mode.js';
 import { useRef, useState } from 'preact/hooks';
@@ -5251,6 +5252,34 @@ afterEach(() => {
     expect(screen.getByText('new during Stop')).toBeDefined();
     expect(gatherSendCalls(ws)).toEqual([]);
     await act(async () => ws.emit({ type: 'command.ack', session: 'qwen-session', commandId: request.commandId, status: 'accepted', stopQueueOutcome: 'appended' }));
+    expect(screen.queryByText('Queued messages appended; the session is still running.')).toBeNull();
+  });
+
+  it('a partial command rejection reconciles only its survivor without restoring accepted neighbours or claiming all appended', async () => {
+    const ws = makeWs();
+    render(<SessionControls ws={ws as any} activeSession={makeTransportSession({
+      name: 'qwen-session', agentType: 'qwen', state: 'running',
+      transportPendingMessageEntries: [
+        { clientMessageId: 'mixed-before', text: 'accepted before' },
+        { clientMessageId: 'mixed-command', text: 'command 原文' },
+        { clientMessageId: 'mixed-after', text: 'accepted after' },
+      ], transportPendingMessageVersion: 7,
+      queueEpoch: 'queue-epoch-1', queueAuthorityId: 'queue-authority-1',
+    })} quickData={makeQuickData() as any} />);
+    confirmAppendAll();
+    const request = ws.send.mock.calls.find(([frame]) => frame?.type === TRANSPORT_QUEUE_COMMANDS.APPEND_MESSAGES)?.[0] as { commandId: string };
+    await act(async () => ws.emit({
+      type: 'command.ack', session: 'qwen-session', commandId: request.commandId, status: 'error',
+      error: 'This provider cannot append to the active turn',
+      queueEpoch: 'queue-epoch-1', queueAuthorityId: 'queue-authority-1', pendingMessageVersion: 10,
+      queueReconcilesCommandId: request.commandId,
+      pendingMessageEntries: [{ clientMessageId: 'mixed-command', text: 'command 原文', appendFallbackReason: 'unsupported' }],
+      failedMessageEntries: [],
+    }));
+    await waitFor(() => expect(screen.queryByText('accepted before')).toBeNull());
+    expect(screen.queryByText('accepted after')).toBeNull();
+    expect(screen.getByText('command 原文')).toBeDefined();
+    expect(screen.getAllByText('transport_append_fallback').length).toBeGreaterThan(0);
     expect(screen.queryByText('Queued messages appended; the session is still running.')).toBeNull();
   });
 

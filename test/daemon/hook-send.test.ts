@@ -84,7 +84,7 @@ function postSend(port: number, body: Record<string, unknown>, headers?: Record<
     const req = http.request({
       hostname: '127.0.0.1', port, path: '/send', method: 'POST',
       agent: false,
-      headers: { 'Content-Type': 'application/json', 'Content-Length': String(data.length), Connection: 'close', ...headers },
+      headers: { 'Content-Type': 'application/json', 'Content-Length': String(Buffer.byteLength(data)), Connection: 'close', ...headers },
     }, (res) => {
       let body = '';
       res.on('data', (chunk) => { body += chunk; });
@@ -1170,6 +1170,9 @@ describe('Hook server /send endpoint', () => {
       expect(mockRuntime.appendExternalMessageToActiveTurn).toHaveBeenCalledWith(
         `${buildAgentDelegationSenderLine('deck_proj_brain')}\n\nhello transport`,
         messageId,
+        undefined,
+        undefined,
+        { timelineCommitted: false, messageOrigin: CHAT_MESSAGE_ORIGINS.AGENT },
       );
       expect(mockRuntime.send).not.toHaveBeenCalled();
       expect(timelineEmitMock).toHaveBeenCalledWith(
@@ -1184,6 +1187,33 @@ describe('Hook server /send endpoint', () => {
         },
         { source: 'daemon', confidence: 'high', eventId: `transport-user:${messageId}` },
       );
+    });
+
+    it('keeps a native pre-acceptance durable append owned by the runtime without a second send or premature timeline', async () => {
+      const brain = makeSession({ name: 'deck_proj_brain', role: 'brain' });
+      const transport = makeSession({ name: 'deck_proj_w1', role: 'w1', agentType: 'openclaw', runtimeType: 'transport', label: 'OpenClaw' });
+      getSessionMock.mockImplementation((name: string) => [brain, transport].find((session) => session.name === name) ?? null);
+      listSessionsMock.mockReturnValue([brain, transport]);
+      const runtime = {
+        providerSessionId: 'transport-provider-session',
+        appendExternalMessageToActiveTurn: vi.fn(async (text: string, clientMessageId: string) => {
+          getTransportQueueStore().enqueue({ sessionName: transport.name, clientMessageId, commandId: clientMessageId, text, now: Date.now() });
+          return 'queued';
+        }),
+        send: vi.fn(),
+        getStatus: vi.fn().mockReturnValue('running'),
+      };
+      getTransportRuntimeMock.mockReturnValue(runtime);
+      const res = await postSend(port, { from: brain.name, to: transport.name, message: '接受后追加\n保持来源' });
+      expect(res.body, JSON.stringify(res.body)).toMatchObject({ ok: true, queued: true, target: transport.name });
+      expect(res.body.delivered).not.toBe(true);
+      expect(runtime.appendExternalMessageToActiveTurn).toHaveBeenCalledTimes(1);
+      expect(runtime.send).not.toHaveBeenCalled();
+      expect(timelineEmitMock).not.toHaveBeenCalledWith(transport.name, 'user.message', expect.anything(), expect.anything());
+      expect(timelineEmitMock).toHaveBeenCalledWith(transport.name, 'session.state', expect.objectContaining({
+        state: 'queued',
+        pendingMessageEntries: [expect.objectContaining({ clientMessageId: res.body.messageId })],
+      }), { source: 'daemon', confidence: 'high' });
     });
 
     it('records queued transport sends as queue state until runtime drain emits the user message', async () => {
@@ -1220,9 +1250,13 @@ describe('Hook server /send endpoint', () => {
       expect(res.body.ok).toBe(true);
       expect(res.body.queued).toBe(true);
       const expectedQueuedText = `${buildAgentDelegationSenderLine('deck_proj_brain')}\n\nqueued transport`;
-      expect(mockRuntime.appendExternalMessageToActiveTurn).toHaveBeenCalledWith(expectedQueuedText, res.body.messageId);
+      expect(mockRuntime.appendExternalMessageToActiveTurn).toHaveBeenCalledWith(
+        expectedQueuedText, res.body.messageId, undefined, undefined,
+        { timelineCommitted: false, messageOrigin: CHAT_MESSAGE_ORIGINS.AGENT },
+      );
       // The queued copy carries the agent origin its drained row will render with.
       expect(mockRuntime.send).toHaveBeenCalledWith(expectedQueuedText, res.body.messageId, undefined, undefined, {
+        deliveryMode: 'append',
         messageOrigin: CHAT_MESSAGE_ORIGINS.AGENT,
       });
       expect(timelineEmitMock).not.toHaveBeenCalledWith(
@@ -1419,7 +1453,7 @@ describe('Hook server /send endpoint', () => {
       const res = await new Promise<{ status: number; body: string }>((resolve, reject) => {
         const req = http.request({
           hostname: '127.0.0.1', port, path: '/notify', method: 'POST',
-          headers: { 'Content-Type': 'application/json', 'Content-Length': String(data.length) },
+          headers: { 'Content-Type': 'application/json', 'Content-Length': String(Buffer.byteLength(data)) },
         }, (resp) => {
           let body = '';
           resp.on('data', (chunk) => { body += chunk; });

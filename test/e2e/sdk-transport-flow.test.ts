@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { cleanupIsolatedSharedContextDb, createIsolatedSharedContextDb } from '../util/shared-context-db.js';
+import { TRANSPORT_QUEUE_COMMANDS } from '../../shared/transport-queue-types.js';
 import { DAEMON_COMMAND_TYPES } from '../../shared/daemon-command-types.js';
 import { MEMORY_MCP_ENV_KEYS } from '../../shared/memory-mcp-env.js';
 import { IMCODES_MEMORY_MCP_SERVER_NAME } from '../../shared/memory-mcp-server-name.js';
@@ -50,12 +51,15 @@ const mocks = vi.hoisted(() => {
     holdClaudeQuery: false,
     holdClaudeForStop: false,
     claudeInputs: [] as Array<Record<string, any>>,
+    claudeAppendCount: 2,
     releaseClaudeQuery: undefined as (() => void) | undefined,
     claudeInterrupts: 0,
     holdCodexTurn: false,
     acceptCodexTurn: undefined as (() => void) | undefined,
     finishCodexTurn: undefined as (() => void) | undefined,
     refuseSteer: false,
+    refuseSteerText: undefined as string | undefined,
+    holdSteerText: undefined as string | undefined,
     holdSteer: false,
     releaseSteer: undefined as (() => void) | undefined,
   };
@@ -200,11 +204,12 @@ vi.mock('node:child_process', async (importOriginal) => {
           }
           if (msg.method) mocks.protocolCalls.push({ method: msg.method, params: msg.params });
           if (msg.method === 'turn/steer' && typeof msg.id === 'number') {
-            const refused = mocks.refuseSteer;
+            const inputText = msg.params?.input?.[0]?.text;
+            const refused = mocks.refuseSteer || inputText === mocks.refuseSteerText;
             const respond = () => stdout.write(JSON.stringify(refused
               ? { id: msg.id, error: { code: -32601, message: 'steer unsupported' } }
               : { id: msg.id, result: { turnId: 'turn-codex-e2e' } }) + '\n');
-            if (mocks.holdSteer) mocks.releaseSteer = respond;
+            if (mocks.holdSteer || inputText === mocks.holdSteerText) mocks.releaseSteer = respond;
             else respond();
           }
           if (msg.method === 'turn/start' && typeof msg.id === 'number') {
@@ -290,8 +295,7 @@ vi.mock('@anthropic-ai/claude-agent-sdk', () => ({
       if (mocks.holdClaudeForStop) {
         await new Promise<void>((resolve) => { mocks.releaseClaudeQuery = resolve; });
       } else if (input) {
-        mocks.claudeInputs.push((await input.next()).value);
-        mocks.claudeInputs.push((await input.next()).value);
+        for (let index = 0; index < mocks.claudeAppendCount; index++) mocks.claudeInputs.push((await input.next()).value);
         await new Promise<void>((resolve) => { mocks.releaseClaudeQuery = resolve; });
       }
       yield { type: 'stream_event', session_id: sessionId, event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'Claude' } } };
@@ -1626,9 +1630,12 @@ describe('sdk transport flow e2e', () => {
     mocks.holdClaudeQuery = false;
     mocks.holdClaudeForStop = false;
     mocks.claudeInputs.length = 0;
+    mocks.claudeAppendCount = 2;
     mocks.releaseClaudeQuery = undefined;
     mocks.claudeInterrupts = 0;
     mocks.refuseSteer = false;
+    mocks.refuseSteerText = undefined;
+    mocks.holdSteerText = undefined;
     mocks.holdSteer = false;
     mocks.releaseSteer = undefined;
     mocks.acceptCodexTurn = undefined;
@@ -1675,6 +1682,113 @@ describe('sdk transport flow e2e', () => {
     expect(getTransportQueueStore().hasDeliveryTombstone(SESSION_CX, 'native-Q')).toBe(true);
   });
 
+  it.each(['codex-sdk', 'claude-code-sdk'].flatMap((agentType) => [0, 1, 2].map((position) => ({ agentType, position }))))(
+    'mixed command at $position reaches $agentType protocol in the original turn, not one idle FIFO', async ({ agentType, position }) => {
+      const codex = agentType === 'codex-sdk';
+      const name = codex ? SESSION_CX : SESSION_CC;
+      mocks.holdCodexTurn = codex;
+      mocks.holdClaudeQuery = !codex;
+      const texts = ['普通第一条\n中文', '普通后续'];
+      texts.splice(position, 0, 'command 原文\n  不改缩进');
+      const expected = position === 0 ? [texts[0], texts.slice(1).join('\n\n')]
+        : position === 2 ? [texts.slice(0, 2).join('\n\n'), texts[2]] : texts;
+      mocks.claudeAppendCount = expected.length;
+      await launchSession({ name, projectName: codex ? 'cxsdk' : 'ccsdk', role: 'brain', agentType: agentType as any, projectDir: sharedContextTempDir });
+      const runtime = getTransportRuntime(name)!;
+      runtime.send('foreground', 'mixed-protocol-A');
+      if (codex) { await waitForCondition(() => !!mocks.acceptCodexTurn); mocks.acceptCodexTurn!(); }
+      await waitForCondition(() => getTransportQueueStore().hasDeliveryTombstone(name, 'mixed-protocol-A'));
+      const target = mocks.store.get(name) as any;
+      // The explicit FIFO is manually appended as a mixed selection. The
+      // command marker must survive dispatch and remain a distinct native input.
+      for (const [index, text] of texts.entries()) await dispatchSessionMessage(target, text, {
+        messageId: `mixed-protocol-${index}`, deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.QUEUE,
+        ...(index === position ? { command: true } : {}),
+      });
+      expect(JSON.parse(getTransportQueueStore().readPrivateDispatchMaterial(name, `mixed-protocol-${position}`, runtime.recipientIdentity)!)).toMatchObject({ commandMode: true });
+      const result = await runtime.appendPendingMessagesToActiveTurn(['mixed-protocol-0', 'mixed-protocol-1', 'mixed-protocol-2'], 'mixed-protocol-append');
+      expect(result.status).toBe('delivered');
+      if (codex) {
+        expect(mocks.protocolCalls.filter((call) => call.method === 'turn/steer').map((call) => call.params?.input[0].text)).toEqual(expected);
+        expect(mocks.protocolCalls.filter((call) => call.method === 'turn/steer').every((call) => call.params?.expectedTurnId === 'turn-codex-e2e')).toBe(true);
+        expect(mocks.protocolCalls.filter((call) => call.method === 'turn/start')).toHaveLength(1);
+        expect(mocks.protocolCalls.filter((call) => call.method === 'turn/interrupt')).toHaveLength(0);
+      } else {
+        await waitForCondition(() => mocks.claudeInputs.length === 1 + expected.length);
+        expect(mocks.claudeInputs.slice(1).map((input) => input.message.content)).toEqual(expected);
+        expect(mocks.claudeInputs.slice(1).every((input) => input.priority === 'next')).toBe(true);
+        expect(mocks.claudeCalls).toHaveLength(1);
+        expect(mocks.claudeInterrupts).toBe(0);
+      }
+      expect(runtime.hasActiveTurnWork()).toBe(true);
+      expect(runtime.pendingEntries).toEqual([]);
+      for (let index = 0; index < 3; index++) {
+        const id = `mixed-protocol-${index}`;
+        expect(getTransportQueueStore().hasDeliveryTombstone(name, id)).toBe(true);
+        expect(mocks.emitted.filter((event) => event.type === 'user.message' && event.payload.clientMessageId === id)).toHaveLength(1);
+      }
+      if (codex) { mocks.holdCodexTurn = false; mocks.finishCodexTurn!(); }
+      else { await waitForCondition(() => !!mocks.releaseClaudeQuery); mocks.holdClaudeQuery = false; mocks.releaseClaudeQuery!(); }
+    },
+  );
+
+  it.each(['codex-sdk', 'claude-code-sdk'])('default MCP command append reaches %s current native input verbatim', async (agentType) => {
+    const codex = agentType === 'codex-sdk';
+    const name = codex ? SESSION_CX : SESSION_CC;
+    mocks.holdCodexTurn = codex;
+    mocks.holdClaudeQuery = !codex;
+    mocks.claudeAppendCount = 1;
+    await launchSession({ name, projectName: codex ? 'cxsdk' : 'ccsdk', role: 'brain', agentType: agentType as any, projectDir: sharedContextTempDir });
+    const runtime = getTransportRuntime(name)!;
+    runtime.send('foreground', 'command-protocol-A');
+    if (codex) { await waitForCondition(() => !!mocks.acceptCodexTurn); mocks.acceptCodexTurn!(); }
+    await waitForCondition(() => getTransportQueueStore().hasDeliveryTombstone(name, 'command-protocol-A'));
+    const raw = 'command 中文\n  原样缩进';
+    expect(await dispatchSessionMessage(mocks.store.get(name) as any, raw, { messageId: 'command-protocol-B', command: true })).toBe('queued');
+    await waitForCondition(() => getTransportQueueStore().hasDeliveryTombstone(name, 'command-protocol-B'));
+    if (codex) {
+      expect(mocks.protocolCalls.filter((call) => call.method === 'turn/steer')).toMatchObject([{ params: { expectedTurnId: 'turn-codex-e2e', input: [{ type: 'text', text: raw }] } }]);
+      expect(mocks.protocolCalls.filter((call) => call.method === 'turn/interrupt')).toHaveLength(0);
+      mocks.holdCodexTurn = false; mocks.finishCodexTurn!();
+    } else {
+      await waitForCondition(() => mocks.claudeInputs.length === 2 && !!mocks.releaseClaudeQuery);
+      expect(mocks.claudeInputs[1]).toMatchObject({ message: { content: raw }, priority: 'next' });
+      expect(mocks.claudeInterrupts).toBe(0);
+      mocks.holdClaudeQuery = false; mocks.releaseClaudeQuery!();
+    }
+    expect(mocks.emitted.filter((event) => event.type === 'user.message' && event.payload.clientMessageId === 'command-protocol-B')).toHaveLength(1);
+  });
+
+  it('a delayed refused command reports partial protocol/UI facts without parking later ordinary append', async () => {
+    mocks.holdCodexTurn = true;
+    mocks.refuseSteerText = 'refused raw command';
+    mocks.holdSteerText = 'refused raw command';
+    await launchSession({ name: SESSION_CX, projectName: 'cxsdk', role: 'brain', agentType: 'codex-sdk', projectDir: sharedContextTempDir });
+    const runtime = getTransportRuntime(SESSION_CX)!;
+    runtime.send('foreground', 'partial-protocol-A');
+    await waitForCondition(() => !!mocks.acceptCodexTurn); mocks.acceptCodexTurn!();
+    await waitForCondition(() => getTransportQueueStore().hasDeliveryTombstone(SESSION_CX, 'partial-protocol-A'));
+    const target = mocks.store.get(SESSION_CX) as any;
+    for (const [id, text] of [['before', 'ordinary before'], ['cmd', 'refused raw command'], ['after', 'ordinary after']]) {
+      await dispatchSessionMessage(target, text!, { messageId: id!, deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.QUEUE, ...(id === 'cmd' ? { command: true } : {}) });
+    }
+    const link = { send: vi.fn() } as any;
+    handleWebCommand({ type: TRANSPORT_QUEUE_COMMANDS.APPEND_MESSAGES, sessionName: SESSION_CX, commandId: 'partial-protocol-click', clientMessageIds: ['before', 'cmd', 'after'] }, link);
+    await waitForCondition(() => !!mocks.releaseSteer);
+    expect(getTransportQueueStore().hasDeliveryTombstone(SESSION_CX, 'before')).toBe(true);
+    expect(getTransportQueueStore().hasDeliveryTombstone(SESSION_CX, 'cmd')).toBe(false);
+    expect(link.send.mock.calls.some(([frame]) => frame.commandId === 'partial-protocol-click' && frame.status === 'accepted')).toBe(false);
+    mocks.releaseSteer!();
+    await waitForCondition(() => link.send.mock.calls.some(([frame]) => frame.commandId === 'partial-protocol-click' && frame.status === 'error'));
+    const ack = link.send.mock.calls.find(([frame]) => frame.commandId === 'partial-protocol-click' && frame.status === 'error')[0];
+    expect(ack).toMatchObject({ queueReconcilesCommandId: 'partial-protocol-click', pendingMessageEntries: [{ clientMessageId: 'cmd', text: 'refused raw command', appendFallbackReason: 'unsupported' }] });
+    expect(ack.pendingMessageEntries).toHaveLength(1);
+    expect(mocks.protocolCalls.filter((call) => call.method === 'turn/steer').map((call) => call.params?.input[0].text)).toEqual(['ordinary before', 'refused raw command', 'ordinary after']);
+    expect(mocks.protocolCalls.filter((call) => call.method === 'turn/interrupt')).toHaveLength(0);
+    for (const id of ['before', 'after']) expect(mocks.emitted.filter((event) => event.type === 'user.message' && event.payload.clientMessageId === id)).toHaveLength(1);
+    mocks.holdCodexTurn = false; mocks.finishCodexTurn!();
+  });
+
   it('does not strand a later real Codex steer behind a refused same-owner append admission', async () => {
     mocks.holdCodexTurn = true;
     await launchSession({ name: SESSION_CX, projectName: 'cxsdk', role: 'brain', agentType: 'codex-sdk', projectDir: sharedContextTempDir });
@@ -1691,6 +1805,8 @@ describe('sdk transport flow e2e', () => {
     await dispatchSessionMessage(target, 'later C', { messageId: 'refusal-protocol-C' });
     mocks.holdSteer = false;
     mocks.refuseSteer = false;
+    mocks.refuseSteerText = undefined;
+    mocks.holdSteerText = undefined;
     mocks.releaseSteer!();
     await waitForCondition(() => mocks.protocolCalls.filter((call) => call.method === 'turn/steer').length === 2);
     await waitForCondition(() => getTransportQueueStore().hasDeliveryTombstone(SESSION_CX, 'refusal-protocol-C'));

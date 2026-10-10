@@ -1488,9 +1488,9 @@ export class QwenProvider implements TransportProvider {
 
   cancelAndWait(sessionId: string): Promise<void> {
     const state = this.sessions.get(sessionId);
-    const child = state?.child;
-    if (!state || !child) return Promise.reject(new Error('Provider has no captured child to confirm stop'));
-    return confirmChildStop(child, () => this.cancel(sessionId), () => this.sessions.get(sessionId) === state);
+    const capturedChild = state?.child;
+    if (!state || !capturedChild) return Promise.reject(new Error('Provider has no captured child to confirm stop'));
+    return confirmChildStop(capturedChild, () => this.cancel(sessionId), () => this.sessions.get(sessionId) === state);
   }
 
   async cancel(sessionId: string): Promise<void> {

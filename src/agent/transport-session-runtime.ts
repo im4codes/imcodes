@@ -221,6 +221,8 @@ function normalizeQueueAdmissionDecision(
 export type AppendQueuedMessagesResult =
   | {
       status: 'delivered';
+      /** Mixed native batches publish irreversible admissions before the next batch. */
+      projectionCommitted?: true;
       entries: PendingTransportMessage[];
       queueSnapshot: QueueSnapshot;
       deliveryFacts: QueueDeliveryFact[];
@@ -495,8 +497,11 @@ function isTransportSlashControl(message: string | undefined): boolean {
  * run of ordinary entries before the first command entry, or that command entry
  * alone when it is at the head. Order is preserved; the rest drain next turn.
  */
-function takeDrainBatch(entries: PendingTransportMessage[]): PendingTransportMessage[] {
-  const firstCommand = entries.findIndex((entry) => entry.commandMode === true);
+function takeDrainBatch(
+  entries: PendingTransportMessage[],
+  isolate: (entry: PendingTransportMessage) => boolean = (entry) => entry.commandMode === true,
+): PendingTransportMessage[] {
+  const firstCommand = entries.findIndex(isolate);
   if (firstCommand < 0) return entries;
   if (firstCommand === 0) return [entries[0]!];
   return entries.slice(0, firstCommand);
@@ -2783,7 +2788,7 @@ export class TransportSessionRuntime implements SessionRuntime {
       && this.provider.capabilities.activeDelegationNotification === AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE
       && !!this.provider.notifyActiveDelegation
       && (attachments?.length ?? 0) === 0
-      && !message.trim().startsWith('/');
+      && !isDelegationUnsupportedControlText(message);
     const entry: PendingTransportMessage = {
       clientMessageId: resolvedClientMessageId,
       text: message,
@@ -2804,7 +2809,7 @@ export class TransportSessionRuntime implements SessionRuntime {
       ...(metadata?.deliveryMode === MEMORY_MCP_SEND_DELIVERY_MODES.APPEND && !nativeAppendRequested
         ? { appendFallbackReason: (attachments?.length ?? 0) > 0
           ? TRANSPORT_APPEND_FALLBACK_REASONS.ATTACHMENTS_UNSUPPORTED
-          : message.trim().startsWith('/')
+          : isDelegationUnsupportedControlText(message)
             ? TRANSPORT_APPEND_FALLBACK_REASONS.CONTROL_UNSUPPORTED
             : TRANSPORT_APPEND_FALLBACK_REASONS.UNSUPPORTED }
         : {}),
@@ -3166,6 +3171,46 @@ export class TransportSessionRuntime implements SessionRuntime {
     const originalQueue = [...this._pendingMessages];
     const selected = originalQueue.filter((entry) => idSet.has(entry.clientMessageId));
     if (selected.length !== ids.length) return { status: 'not_found' };
+    // Preserve verbatim command boundaries without turning one command into
+    // head-of-line blocking for every selected row. Each sub-batch uses this
+    // same reservation/admission primitive and re-reads current authority and
+    // content. Publish a confirmed side effect immediately: later rejection,
+    // withdrawal, timeout or Stop must never replay already-admitted ids.
+    const needsOwnAdmission = (entry: PendingTransportMessage): boolean => entry.commandMode === true
+      || isDelegationUnsupportedControlText(entry.text) || (entry.attachments?.length ?? 0) > 0;
+    if (selected.length > 1 && selected.some(needsOwnAdmission)) {
+      let remaining = selected;
+      const capturedProviderSession = this._providerSessionId;
+      const capturedDispatch = this._activeDispatchId;
+      const capturedGeneration = this._activityGeneration;
+      const delivered: PendingTransportMessage[] = [];
+      const deliveryFacts: QueueDeliveryFact[] = [];
+      let failure: Exclude<AppendQueuedMessagesResult, { status: 'delivered' }> | undefined;
+      while (remaining.length > 0) {
+        if (this._providerSessionId !== capturedProviderSession || this._activeDispatchId !== capturedDispatch
+          || this._activityGeneration !== capturedGeneration) return { status: 'stale' };
+        const batch = takeDrainBatch(remaining, needsOwnAdmission);
+        remaining = remaining.slice(batch.length);
+        const result = await this.appendPendingMessagesToActiveTurn(
+          batch.map((entry) => entry.clientMessageId),
+          `${notificationId}:${batch[0]!.clientMessageId}`, deliveryKind, options,
+        );
+        if (result.status === 'delivered') {
+          this.publishAcceptedAppend(result);
+          delivered.push(...result.entries);
+          deliveryFacts.push(...result.deliveryFacts);
+        } else {
+          failure ??= result;
+          this.recordActiveAppendFallback(batch, result.status);
+        }
+      }
+      // A partial admission is NOT success for the entire selection. Accepted
+      // rows already have facts; the rejection and snapshot keep only the
+      // remaining rows visible and retryable.
+      if (failure) return failure;
+      return { status: 'delivered', projectionCommitted: true, entries: delivered, deliveryFacts,
+        queueSnapshot: getTransportQueueStore().readSnapshotForRecipient(this.sessionKey, this.queueRecipient ?? null) };
+    }
     // Authority can change while an APPEND waits behind an active provider
     // turn. Revalidate before handoff reservation/provider admission and drop
     // only the stale control rows. A distinct status lets the automatic flush
@@ -3197,12 +3242,6 @@ export class TransportSessionRuntime implements SessionRuntime {
       return { status: 'attachments_unsupported' };
     }
     if (selected.some((entry) => isDelegationUnsupportedControlText(entry.text))) {
-      return { status: 'control_unsupported' };
-    }
-    // A command-mode message must reach the provider as exactly its own text.
-    // Native append joins the selected rows, so a command may only ride alone;
-    // otherwise it stays in the FIFO, where `_drainPending` delivers it alone.
-    if (selected.length > 1 && selected.some((entry) => entry.commandMode === true)) {
       return { status: 'control_unsupported' };
     }
 
@@ -5186,20 +5225,7 @@ export class TransportSessionRuntime implements SessionRuntime {
         continue;
       }
       if (result.status !== 'delivered') {
-        if (result.status === 'stale' || result.status === 'unsupported') {
-          entry.appendFallbackReason = result.status === 'stale'
-            ? TRANSPORT_APPEND_FALLBACK_REASONS.STALE
-            : TRANSPORT_APPEND_FALLBACK_REASONS.UNSUPPORTED;
-          try {
-            getTransportQueueStore().markAppendFallback(this.sessionKey, entry.clientMessageId, entry.appendFallbackReason, this.queueRecipient ?? null);
-            timelineEmitter.emit(this.sessionKey, 'session.state', {
-              state: 'queued',
-              ...transportQueueSnapshotToPayload(getTransportQueueStore().readSnapshotForRecipient(this.sessionKey, this.queueRecipient ?? null)),
-            }, { source: 'daemon', confidence: 'high' });
-          } catch (error) {
-            logger.warn({ error, sessionKey: this.sessionKey }, 'transport append fallback projection failed');
-          }
-        }
+        this.recordActiveAppendFallback([entry], result.status);
         logger.info(
           {
             sessionKey: this.sessionKey,
@@ -5219,7 +5245,29 @@ export class TransportSessionRuntime implements SessionRuntime {
     }
   }
 
+  private recordActiveAppendFallback(entries: PendingTransportMessage[], status: AppendQueuedMessagesResult['status']): void {
+    const reason = status === 'stale' ? TRANSPORT_APPEND_FALLBACK_REASONS.STALE
+      : status === 'unsupported' ? TRANSPORT_APPEND_FALLBACK_REASONS.UNSUPPORTED
+      : status === 'control_unsupported' ? TRANSPORT_APPEND_FALLBACK_REASONS.CONTROL_UNSUPPORTED
+      : status === 'attachments_unsupported' ? TRANSPORT_APPEND_FALLBACK_REASONS.ATTACHMENTS_UNSUPPORTED : undefined;
+    if (!reason) return;
+    try {
+      const store = getTransportQueueStore();
+      for (const entry of entries) {
+        entry.appendFallbackReason = reason;
+        store.markAppendFallback(this.sessionKey, entry.clientMessageId, reason, this.queueRecipient ?? null);
+      }
+      timelineEmitter.emit(this.sessionKey, 'session.state', {
+        state: 'queued',
+        ...transportQueueSnapshotToPayload(store.readSnapshotForRecipient(this.sessionKey, this.queueRecipient ?? null)),
+      }, { source: 'daemon', confidence: 'high' });
+    } catch (error) {
+      logger.warn({ error, sessionKey: this.sessionKey }, 'transport append fallback projection failed');
+    }
+  }
+
   private publishAcceptedAppend(result: Extract<AppendQueuedMessagesResult, { status: 'delivered' }>): void {
+    if (result.projectionCommitted) return;
     const timelineEntries = result.entries.filter((candidate) => !candidate.timelineCommitted);
     for (const candidate of timelineEntries) candidate.timelineCommitted = true;
     if (timelineEntries.length > 0) {

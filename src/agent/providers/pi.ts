@@ -352,14 +352,14 @@ export class PiProvider implements TransportProvider {
 
   cancelAndWait(sessionId: string): Promise<void> {
     const state = this.sessions.get(sessionId);
-    const child = state?.child;
-    if (!state || !child) return Promise.reject(new Error('Provider child unavailable for Stop'));
-    const onExit = () => this.stopConfirmations.complete(child);
-    child.once('exit', onExit);
+    const capturedChild = state?.child;
+    if (!state || !capturedChild) return Promise.reject(new Error('Provider child unavailable for Stop'));
+    const onExit = () => this.stopConfirmations.complete(capturedChild);
+    capturedChild.once('exit', onExit);
     const generation = state.turnGeneration;
-    const operation = this.stopConfirmations.confirm(child, () => this.cancel(sessionId),
+    const operation = this.stopConfirmations.confirm(capturedChild, () => this.cancel(sessionId),
       () => this.sessions.get(sessionId) === state && state.turnGeneration === generation);
-    return preserveProviderStopProof(operation, operation.finally(() => child.removeListener('exit', onExit)));
+    return preserveProviderStopProof(operation, operation.finally(() => capturedChild.removeListener('exit', onExit)));
   }
 
   async cancel(sessionId: string): Promise<void> {

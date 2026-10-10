@@ -5858,6 +5858,7 @@ async function handleUndoQueuedTransportMessage(cmd: Record<string, unknown>, se
 function emitActiveQueueAppendResult(sessionName: string, result: Extract<import('../agent/transport-session-runtime.js').AppendQueuedMessagesResult, { status: 'delivered' }>): void {
   for (const entry of result.entries) {
     supervisionAutomation.removeQueuedTaskIntent(sessionName, entry.clientMessageId);
+    if (result.projectionCommitted) continue;
     const payload = {
       text: entry.text,
       commandId: entry.clientMessageId,
@@ -5877,7 +5878,7 @@ function emitActiveQueueAppendResult(sessionName: string, result: Extract<import
     );
     persistTransportUserMessage(sessionName, entry.text, payload);
   }
-  for (const fact of result.deliveryFacts) {
+  for (const fact of result.projectionCommitted ? [] : result.deliveryFacts) {
     timelineEmitter.emit(sessionName, 'transport.queue.delivery', { ...fact }, {
       source: 'daemon',
       confidence: 'high',
@@ -5995,58 +5996,22 @@ async function handleAppendQueuedTransportMessages(cmd: Record<string, unknown>,
             : result.status === 'stale'
               ? 'The active turn already finished'
               : 'Queued message not found';
-      if (result.status === 'not_found') {
-        // A bounded ownership recovery may have retired a pre-session ghost.
-        // The browser must be able to retire the stale card instead of
-        // restoring it from optimistic local state -- and it must be able to do
-        // so from the ONE frame this closure delivers reliably.
-        //
-        // The timeline broadcast below is kept so other subscribers of this
-        // session still converge, but correctness no longer depends on its
-        // delivery or its ordering: the same recipient-gated authority is
-        // attached to the reliable, replayable ack. `queueSnapshot` and
-        // `pendingCount` are deliberately left off the ack -- the former would
-        // duplicate the whole projection into every persisted outbox record,
-        // and the latter is a legacy live-queue field the wire validator
-        // rejects. The browser reduces the flat fields it already knows.
-        const queuePayload = buildTransportQueueSnapshotPayload(sessionName, 'command_handler');
-        timelineEmitter.emit(sessionName, 'session.state', {
-          state: runtime.pendingCount > 0 ? 'queued' : (runtime.sending ? 'running' : 'idle'),
-          ...queuePayload,
-          queueReconcilesCommandId: commandId,
-        }, { source: 'daemon', confidence: 'high' });
-        reject(error, {
-          queueEpoch: queuePayload.queueEpoch,
-          queueAuthorityId: queuePayload.queueAuthorityId,
-          pendingMessageVersion: queuePayload.pendingMessageVersion,
-          pendingMessageEntries: queuePayload.pendingMessageEntries,
-          failedMessageEntries: queuePayload.failedMessageEntries,
-          queueReconcilesCommandId: commandId,
-          ...(queuePayload.degraded !== undefined ? { degraded: queuePayload.degraded } : {}),
-          ...(queuePayload.degradedReason ? { degradedReason: queuePayload.degradedReason } : {}),
-        });
-        return;
-      }
-      // Every other failure here (most concretely 'stale': the turn this
-      // tried to append to already finished by the time the daemon looked)
-      // can ALSO mean the browser's belief about "is a turn still active" is
-      // now wrong. Previously this branch rejected with no state update at
-      // all, so a browser that thought a turn was running had nothing to
-      // ever correct it: it kept showing "working" with a live Stop control,
-      // and kept queueing behind a turn that would never resume -- exactly
-      // the stuck-forever state this closure exists to prevent for
-      // 'not_found'. The queued messages themselves are untouched by any of
-      // these statuses (none of them consume from the pending queue), so
-      // only the state fields are needed here, not a card-retirement ack.
+      // Partial native batches can already have irreversible admissions. A
+      // reliable error ack must carry the exact current survivors too, so a
+      // viewer that missed delivery facts cannot restore/resend accepted rows.
       const queuePayload = buildTransportQueueSnapshotPayload(sessionName, 'command_handler');
       timelineEmitter.emit(sessionName, 'session.state', {
         state: runtime.pendingCount > 0 ? 'queued' : (runtime.sending ? 'running' : 'idle'),
         ...queuePayload,
+        queueReconcilesCommandId: commandId,
       }, { source: 'daemon', confidence: 'high' });
       reject(error, {
         queueEpoch: queuePayload.queueEpoch,
         queueAuthorityId: queuePayload.queueAuthorityId,
         pendingMessageVersion: queuePayload.pendingMessageVersion,
+        pendingMessageEntries: queuePayload.pendingMessageEntries,
+        failedMessageEntries: queuePayload.failedMessageEntries,
+        queueReconcilesCommandId: commandId,
         ...(queuePayload.degraded !== undefined ? { degraded: queuePayload.degraded } : {}),
         ...(queuePayload.degradedReason ? { degradedReason: queuePayload.degradedReason } : {}),
       });

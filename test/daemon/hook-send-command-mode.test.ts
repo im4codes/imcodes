@@ -118,7 +118,17 @@ describe('hook-server /send-command', () => {
     const [text, messageId, , , privateMetadata] = runtime.appendExternalMessageToActiveTurn.mock.calls[0]!;
     expect(Buffer.from(text).equals(Buffer.from(exact))).toBe(true);
     expect(text).not.toContain(AGENT_DELEGATION_SENDER_MARKER);
-    expect(privateMetadata).toEqual({ commandMode: true });
+    expect(privateMetadata).toEqual({
+      timelineCommitted: false,
+      messageOrigin: CHAT_MESSAGE_ORIGINS.AGENT,
+      commandMode: true,
+      sharedActor: expect.objectContaining({
+        actionId: messageId,
+        actorUserId: brain.name,
+        actorDisplayName: brain.name,
+        snapshot: expect.objectContaining({ target: expect.objectContaining({ subSessionId: name }) }),
+      }),
+    });
     expect(timelineEmitMock).toHaveBeenCalledWith(
       name,
       'user.message',
