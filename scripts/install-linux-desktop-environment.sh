@@ -57,41 +57,72 @@ done
 [[ "$EUID" -eq 0 ]] || { echo 'must run as root (sudo)' >&2; exit 1; }
 [[ "$DISPLAY_NUM" == :* ]] || { echo '--display must look like :99' >&2; exit 1; }
 id -u "$TARGET_USER" >/dev/null 2>&1 || { echo "no such user: $TARGET_USER" >&2; exit 1; }
-command -v apt-get >/dev/null || { echo 'this script is apt-based (Debian/Ubuntu only)' >&2; exit 1; }
+PKG_MGR=""
+if command -v apt-get >/dev/null 2>&1; then
+  PKG_MGR="apt"
+elif command -v dnf >/dev/null 2>&1; then
+  PKG_MGR="dnf"
+elif command -v yum >/dev/null 2>&1; then
+  PKG_MGR="yum"
+else
+  echo 'this script is apt-based (Debian/Ubuntu) or dnf/yum-based (CentOS/RHEL)' >&2
+  exit 1
+fi
 
 TARGET_HOME="$(getent passwd "$TARGET_USER" | cut -d: -f6)"
 [[ -n "$TARGET_HOME" && -d "$TARGET_HOME" ]] || { echo "no home directory for $TARGET_USER" >&2; exit 1; }
 
-echo "== installing desktop packages for $TARGET_USER on display $DISPLAY_NUM =="
+echo "== installing desktop packages for $TARGET_USER on display $DISPLAY_NUM using $PKG_MGR =="
 
-export DEBIAN_FRONTEND=noninteractive
-apt-get update -qq
+if [[ "$PKG_MGR" == "apt" ]]; then
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -qq
 
-BASE_PACKAGES=(
-  xvfb
-  x11-xserver-utils
-  dbus-x11
-  # A real, full desktop environment, not a bare window manager + dock --
-  # xfce4 pulls in xfwm4, the panel, the desktop manager, and xfce4-terminal;
-  # xfce4-goodies is deliberately skipped (adds a large app set this
-  # remote-desktop test target does not need). The Whisker Menu plugin
-  # replaces the panel's default plain "Applications" text button with a
-  # real searchable start menu -- installed here, wired onto the panel by
-  # the session script below once XFCE's own panel process is actually up.
-  xfce4
-  xfce4-whiskermenu-plugin
-  fonts-noto-core
-  fonts-noto-color-emoji
-  # A fully headless box (no sound card at all -- true of most VMs/CI
-  # runners, this one included) has no /proc/asound/cards entry, which
-  # makes WebRTC's AudioDeviceModule::Init() hard-fail at session start
-  # ("Check failed: 0 == adm->Init()") even though the session never asked
-  # for audio to be silent -- it just had nothing to open. pulseaudio gives
-  # it a real, if silent, device to open.
-  pulseaudio
-)
-[[ "$WITH_VNC" -eq 1 ]] && BASE_PACKAGES+=(x11vnc)
-apt-get install -y -qq "${BASE_PACKAGES[@]}"
+  BASE_PACKAGES=(
+    xvfb
+    x11-xserver-utils
+    dbus-x11
+    # A real, full desktop environment, not a bare window manager + dock --
+    # xfce4 pulls in xfwm4, the panel, the desktop manager, and xfce4-terminal;
+    # xfce4-goodies is deliberately skipped (adds a large app set this
+    # remote-desktop test target does not need). The Whisker Menu plugin
+    # replaces the panel's default plain "Applications" text button with a
+    # real searchable start menu -- installed here, wired onto the panel by
+    # the session script below once XFCE's own panel process is actually up.
+    xfce4
+    xfce4-whiskermenu-plugin
+    fonts-noto-core
+    fonts-noto-color-emoji
+    # A fully headless box (no sound card at all -- true of most VMs/CI
+    # runners, this one included) has no /proc/asound/cards entry, which
+    # makes WebRTC's AudioDeviceModule::Init() hard-fail at session start
+    # ("Check failed: 0 == adm->Init()") even though the session never asked
+    # for audio to be silent -- it just had nothing to open. pulseaudio gives
+    # it a real, if silent, device to open.
+    pulseaudio
+  )
+  [[ "$WITH_VNC" -eq 1 ]] && BASE_PACKAGES+=(x11vnc)
+  apt-get install -y -qq "${BASE_PACKAGES[@]}"
+elif [[ "$PKG_MGR" == "dnf" || "$PKG_MGR" == "yum" ]]; then
+  # On CentOS/RHEL/Fedora, ensure EPEL repository is present for XFCE packages
+  if ! rpm -q epel-release >/dev/null 2>&1; then
+    "$PKG_MGR" install -y -q epel-release || true
+  fi
+  BASE_PACKAGES=(
+    xorg-x11-server-Xvfb
+    xorg-x11-xauth
+    xorg-x11-utils
+    dbus-x11
+    xfce4-session
+    xfwm4
+    xfce4-panel
+    xfdesktop
+    xfce4-terminal
+    pulseaudio
+  )
+  [[ "$WITH_VNC" -eq 1 ]] && BASE_PACKAGES+=(x11vnc)
+  "$PKG_MGR" install -y -q "${BASE_PACKAGES[@]}"
+fi
 
 # snd-dummy: a real (if fake) ALSA card, independent of pulseaudio -- some
 # ADM backends probe ALSA devices directly rather than going through
@@ -111,20 +142,24 @@ fi
 # repo ships a real .deb; a pin makes it win over the Ubuntu transitional
 # package of the same name without removing anything the box already has.
 if [[ "$WITH_FIREFOX" -eq 1 ]] && ! command -v firefox >/dev/null; then
-  install -d -m 0755 /etc/apt/keyrings
-  if [[ ! -f /etc/apt/keyrings/packages.mozilla.org.asc ]]; then
-    curl -fsSL https://packages.mozilla.org/apt/repo-signing-key.gpg \
-      -o /etc/apt/keyrings/packages.mozilla.org.asc
-  fi
-  echo 'deb [signed-by=/etc/apt/keyrings/packages.mozilla.org.asc] https://packages.mozilla.org/apt mozilla main' \
-    > /etc/apt/sources.list.d/mozilla.list
-  cat > /etc/apt/preferences.d/mozilla <<'PIN'
+  if [[ "$PKG_MGR" == "apt" ]]; then
+    install -d -m 0755 /etc/apt/keyrings
+    if [[ ! -f /etc/apt/keyrings/packages.mozilla.org.asc ]]; then
+      curl -fsSL https://packages.mozilla.org/apt/repo-signing-key.gpg \
+        -o /etc/apt/keyrings/packages.mozilla.org.asc
+    fi
+    echo 'deb [signed-by=/etc/apt/keyrings/packages.mozilla.org.asc] https://packages.mozilla.org/apt mozilla main' \
+      > /etc/apt/sources.list.d/mozilla.list
+    cat > /etc/apt/preferences.d/mozilla <<'PIN'
 Package: firefox*
 Pin: origin packages.mozilla.org
 Pin-Priority: 1001
 PIN
-  apt-get update -qq
-  apt-get install -y -qq firefox
+    apt-get update -qq
+    apt-get install -y -qq firefox
+  elif [[ "$PKG_MGR" == "dnf" || "$PKG_MGR" == "yum" ]]; then
+    "$PKG_MGR" install -y -q firefox || true
+  fi
 elif [[ "$WITH_FIREFOX" -eq 1 ]]; then
   echo "firefox already installed, skipping Mozilla repo setup"
 fi

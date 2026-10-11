@@ -30,6 +30,7 @@ export const LINUX_DESKTOP_PROVISION_FAILURE = {
   UNSUPPORTED_DISTRO: 'unsupported_distro',
   NO_DESKTOP_USER: 'no_desktop_user',
   INSTALL_FAILED: 'install_failed',
+  SUDO_REQUIRED: 'sudo_required',
 } as const;
 export type LinuxDesktopProvisionFailure =
   typeof LINUX_DESKTOP_PROVISION_FAILURE[keyof typeof LINUX_DESKTOP_PROVISION_FAILURE];
@@ -53,11 +54,45 @@ export function linuxGraphicalDisplayAvailable(socketDir = X11_SOCKET_DIR): bool
   return accessible === undefined || sockets.some((number) => accessible.includes(number));
 }
 
-/** The installer is apt-based (Debian/Ubuntu). */
+export function isLinuxRootUser(): boolean {
+  return typeof process.getuid === 'function' ? process.getuid() === 0 : false;
+}
+
+export function checkLinuxPasswordlessSudo(
+  exec: typeof execFile = execFile,
+): Promise<boolean> {
+  if (isLinuxRootUser()) return Promise.resolve(true);
+  return new Promise((resolve) => {
+    exec('sudo', ['-n', 'true'], { timeout: 3000 }, (error) => {
+      resolve(!error);
+    });
+  });
+}
+
+export function detectLinuxPackageManager(
+  exists: (path: string) => boolean = existsSync,
+): 'apt' | 'dnf' | 'yum' | null {
+  if (exists('/usr/bin/apt-get')) return 'apt';
+  if (exists('/usr/bin/dnf')) return 'dnf';
+  if (exists('/usr/bin/yum')) return 'yum';
+  return null;
+}
+
+/** The installer supports apt-based (Debian/Ubuntu) and dnf/yum-based (CentOS/RHEL). */
 export function linuxDesktopProvisionSupported(
   exists: (path: string) => boolean = existsSync,
 ): boolean {
-  return exists('/usr/bin/apt-get') && exists('/usr/bin/systemctl');
+  return detectLinuxPackageManager(exists) !== null && exists('/usr/bin/systemctl');
+}
+
+export function getLinuxDesktopManualInstallCommand(pkgMgr?: 'apt' | 'dnf' | 'yum' | null): string {
+  if (pkgMgr === 'dnf') {
+    return 'sudo dnf install -y epel-release && sudo dnf install -y xorg-x11-server-Xvfb xorg-x11-xauth dbus-x11 xfce4-session xfwm4 xfce4-panel xfdesktop xfce4-terminal pulseaudio';
+  }
+  if (pkgMgr === 'yum') {
+    return 'sudo yum install -y epel-release && sudo yum install -y xorg-x11-server-Xvfb xorg-x11-xauth dbus-x11 xfce4-session xfwm4 xfce4-panel xfdesktop xfce4-terminal pulseaudio';
+  }
+  return 'sudo apt-get update && sudo apt-get install -y xvfb x11-xserver-utils dbus-x11 xfce4 xfce4-whiskermenu-plugin fonts-noto-core fonts-noto-color-emoji pulseaudio';
 }
 
 /**
@@ -105,7 +140,10 @@ export function pickLinuxDesktopUserProfile(
 type RunScript = (scriptPath: string, args: readonly string[]) => Promise<{ code: number; output: string }>;
 
 const runScript: RunScript = (scriptPath, args) => new Promise((resolve) => {
-  execFile('bash', [scriptPath, ...args], {
+  const isRoot = isLinuxRootUser();
+  const cmd = isRoot ? 'bash' : 'sudo';
+  const cmdArgs = isRoot ? [scriptPath, ...args] : ['-n', 'bash', scriptPath, ...args];
+  execFile(cmd, cmdArgs, {
     timeout: PROVISION_TIMEOUT_MS,
     maxBuffer: 16 * 1024 * 1024,
     env: { ...process.env, DEBIAN_FRONTEND: 'noninteractive' },
@@ -122,12 +160,23 @@ const runScript: RunScript = (scriptPath, args) => new Promise((resolve) => {
  */
 export async function provisionLinuxDesktopEnvironment(deps: {
   supported?: () => boolean;
+  detectPkgMgr?: () => 'apt' | 'dnf' | 'yum' | null;
+  canElevate?: () => Promise<boolean>;
   readPasswd?: () => string;
   pickUser?: (passwd: string) => string | null;
   run?: RunScript;
 } = {}): Promise<LinuxDesktopProvisionResult> {
   if (!(deps.supported ?? linuxDesktopProvisionSupported)()) {
     return { ok: false, reason: LINUX_DESKTOP_PROVISION_FAILURE.UNSUPPORTED_DISTRO };
+  }
+  const canElevate = await (deps.canElevate ?? (async () => isLinuxRootUser() || await checkLinuxPasswordlessSudo()))();
+  if (!canElevate) {
+    const pkgMgr = (deps.detectPkgMgr ?? detectLinuxPackageManager)();
+    return {
+      ok: false,
+      reason: LINUX_DESKTOP_PROVISION_FAILURE.SUDO_REQUIRED,
+      detail: getLinuxDesktopManualInstallCommand(pkgMgr),
+    };
   }
   const passwd = (deps.readPasswd ?? (() => readFileSync('/etc/passwd', 'utf8')))();
   const user = (deps.pickUser ?? pickLinuxDesktopUser)(passwd);
