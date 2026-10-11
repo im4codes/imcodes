@@ -192,8 +192,8 @@ describe('supervision config helpers', () => {
     expect(normalizeSupervisorDefaultConfig({
       backend: 'codex-sdk',
       model: CODEX_MODEL_IDS[0],
-      backupBackend: 'codex-sdk',
-      backupModel: CODEX_MODEL_IDS[0],
+      backupBackend: 'openclaw',
+      backupModel: 'gpt-5.4',
       backupPreset: 'ignored',
     }).backupPreset).toBeUndefined();
   });
@@ -894,12 +894,21 @@ describe('supervision config helpers', () => {
 
     it('preset is stripped when backend does not support presets', () => {
       const config = normalizeSupervisorDefaultConfig({
-        backend: 'codex-sdk',
-        model: CODEX_MODEL_IDS[0],
+        backend: 'openclaw',
+        model: 'gpt-5.4',
         // @ts-expect-error intentionally passing preset to a non-preset backend
         preset: 'ShouldBeDropped',
       });
       expect(config.preset).toBeUndefined();
+    });
+
+    it('preset is preserved when backend supports presets (codex-sdk)', () => {
+      const config = normalizeSupervisorDefaultConfig({
+        backend: 'codex-sdk',
+        model: CODEX_MODEL_IDS[0],
+        preset: 'MyCodexPreset',
+      });
+      expect(config.preset).toBe('MyCodexPreset');
     });
 
     it('preset-pinned qwen model passes snapshot validation', () => {

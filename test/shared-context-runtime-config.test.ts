@@ -115,7 +115,7 @@ describe('shared-context-runtime-config', () => {
 
   it('drops preset selections for backends that do not support presets', () => {
     const result = normalizeSharedContextRuntimeConfig({
-      primaryContextBackend: 'codex-sdk',
+      primaryContextBackend: 'openclaw',
       primaryContextModel: 'gpt-5.4',
       primaryContextPreset: 'Should Not Persist',
       backupContextBackend: 'openclaw',
@@ -135,6 +135,17 @@ describe('shared-context-runtime-config', () => {
     expect(result.primaryContextBackend).toBe('claude-code-sdk');
     expect(result.primaryContextPreset).toBe('minimax');
     expect(result.primaryContextModel).toBe('MiniMax-M3');
+  });
+
+  it('keeps preset selections for codex-sdk (third-party OpenAI SDK)', () => {
+    const result = normalizeSharedContextRuntimeConfig({
+      primaryContextBackend: 'codex-sdk',
+      primaryContextModel: 'gpt-4o',
+      primaryContextPreset: 'openai-preset',
+    });
+    expect(result.primaryContextBackend).toBe('codex-sdk');
+    expect(result.primaryContextPreset).toBe('openai-preset');
+    expect(result.primaryContextModel).toBe('gpt-4o');
   });
 
   it('omits sdk fields when not provided', () => {

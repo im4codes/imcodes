@@ -1214,7 +1214,7 @@ export interface SupervisorDefaultConfig {
   customInstructions?: string;
   /**
    * Optional preset name for backends that expose them via
-   * `doesSharedContextBackendSupportPresets()` (`qwen` or `claude-code-sdk`). When
+   * `doesSharedContextBackendSupportPresets()` (`qwen`, `claude-code-sdk`, or `codex-sdk`). When
    * set, the daemon broker routes the supervisor session through the preset's
    * env bundle by delegating to `resolveProcessingProviderSessionConfig`.
    */
@@ -1367,7 +1367,7 @@ export function normalizeSupervisorDefaultConfig(
     ?? inferSharedContextRuntimeBackend(merged.model)
     ?? DEFAULT_SUPERVISION_BACKEND;
   // Presets are only meaningful for backends that declare preset support
-  // (qwen or claude-code-sdk). Reuse the shared runtime normalizer so supervision
+  // (qwen, claude-code-sdk, or codex-sdk). Reuse the shared runtime normalizer so supervision
   // preserves the exact same trim/gating semantics as shared context config.
   const preset = normalizeSharedContextPresetValue(normalizedBackend, typeof merged.preset === 'string' ? merged.preset : undefined);
   const rawModel = trimString(merged.model);
