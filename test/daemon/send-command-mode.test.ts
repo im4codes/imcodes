@@ -216,6 +216,14 @@ describe('command mode: dispatchSendMessage (MCP send_message)', () => {
     expect(dispatchMessage).not.toHaveBeenCalled();
   });
 
+  it('/stop without command mode also takes the priority stop path and is never dispatched as a message', async () => {
+    const result = await dispatchSendMessage(caller, { target: W2, message: ' /stop ' }, deps());
+    expect(result).toMatchObject({ status: 'accepted', deliveries: [{ target: W2, status: 'delivered' }] });
+    expect(cancelSession).toHaveBeenCalledTimes(1);
+    expect(cancelSession.mock.calls[0]![0].name).toBe(W2);
+    expect(dispatchMessage).not.toHaveBeenCalled();
+  });
+
   describe('invalid combinations are rejected with a clear error and deliver nothing', () => {
     it.each([
       ['reply=true', { reply: true }, SEND_COMMAND_ERRORS.WITH_REPLY],

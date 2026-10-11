@@ -17,6 +17,7 @@ vi.mock('../../src/daemon/command-handler.js', () => ({
   supportsTransportClear: () => true,
   switchSessionModelNow: vi.fn(),
   sendProcessSessionMessageForAutomation: mocks.processSend,
+  stopSessionNow: vi.fn(() => true),
 }));
 vi.mock('../../src/agent/session-manager.js', async (importOriginal) => ({
   ...(await importOriginal<Record<string, unknown>>()),
@@ -88,7 +89,7 @@ describe('readSenderParticipantTurn', () => {
 describe('the actor stamp of an agent-to-agent message', () => {
   const caller = { userId: 'owner', sessionName: 'deck_proj_brain', projectName: 'proj', projectRoot: '/repo' };
 
-  it('carries the participant, their authority, and waits for its own turn when the sender is in a participant turn', () => {
+  it('carries the participant and their authority when the sender is in a participant turn', () => {
     const sender = record('deck_proj_brain', { runtimeType: 'transport' });
     mocks.sessions.set(sender.name, sender);
     mocks.runtimes.set(sender.name, senderRuntime(['participant-1'], 'jwt-1'));
@@ -96,7 +97,7 @@ describe('the actor stamp of an agent-to-agent message', () => {
     const stamp = buildServerMemberSharedActorOption(caller, sender, target, 'msg-1', 1000);
     expect(stamp.sharedActor).toMatchObject({ actorUserId: 'participant-1', effectiveActorRole: 'participant' });
     expect(stamp.sharedMachineAuthority).toBe('jwt-1');
-    expect(stamp.deliveryMode).toBe(MEMORY_MCP_SEND_DELIVERY_MODES.QUEUE);
+    expect(stamp.deliveryMode).toBeUndefined();
   });
 
   it('keeps the ordinary stamp for an owner turn (no participant claim, no forced queue)', () => {
@@ -142,7 +143,7 @@ describe('dispatch of a participant-stamped message', () => {
       .toEqual({ required: false, authority: null });
   });
 
-  it('hands a TRANSPORT target the stamp and the token, and never appends it into a running turn', async () => {
+  it('hands a TRANSPORT target the stamp and the token, and appends it into a running turn', async () => {
     const sender = record('deck_proj_brain');
     mocks.sessions.set(sender.name, sender);
     mocks.runtimes.set(sender.name, senderRuntime(['participant-1'], 'jwt-1'));
@@ -155,10 +156,46 @@ describe('dispatch of a participant-stamped message', () => {
       dispatchId: 'd3' as never, messageId: 'm3' as never, ...stamped(sender.name, target),
     } as never);
 
+    expect(appendExternalMessageToActiveTurn).toHaveBeenCalledTimes(1);
+    expect(appendExternalMessageToActiveTurn).toHaveBeenCalledWith(
+      'do the thing',
+      'm3',
+      undefined,
+      undefined,
+      expect.objectContaining({
+        sharedActor: expect.objectContaining({ effectiveActorRole: 'participant', actorUserId: 'participant-1' }),
+        sharedMachineAuthority: 'jwt-1',
+      }),
+    );
+  });
+
+  it('hands a TRANSPORT target the stamp and the token, and queues when deliveryMode is explicitly queue', async () => {
+    const sender = record('deck_proj_brain');
+    mocks.sessions.set(sender.name, sender);
+    mocks.runtimes.set(sender.name, senderRuntime(['participant-1'], 'jwt-1'));
+    const send = vi.fn((): 'sent' => 'sent');
+    const appendExternalMessageToActiveTurn = vi.fn(async () => 'appended');
+    const target = record('deck_proj_w2');
+    mocks.runtimes.set(target.name, { providerSessionId: 'provider-1', send, appendExternalMessageToActiveTurn });
+
+    await dispatchSessionMessage(target, 'do the thing', {
+      dispatchId: 'd4' as never, messageId: 'm4' as never, deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.QUEUE, ...stamped(sender.name, target),
+    } as never);
+
     expect(appendExternalMessageToActiveTurn).not.toHaveBeenCalled();
     expect(send).toHaveBeenCalledTimes(1);
     const metadata = (send.mock.calls[0] as unknown[])[4] as { sharedActor?: { effectiveActorRole: string; actorUserId: string }; sharedMachineAuthority?: string };
     expect(metadata.sharedActor).toMatchObject({ effectiveActorRole: 'participant', actorUserId: 'participant-1' });
     expect(metadata.sharedMachineAuthority).toBe('jwt-1');
+  });
+
+  it('routes /stop directly to stopSessionNow on the priority lane', async () => {
+    const { stopSessionNow } = await import('../../src/daemon/command-handler.js');
+    const target = record('deck_proj_w2');
+    const result = await dispatchSessionMessage(target, ' /stop ', {
+      dispatchId: 'd5' as never, messageId: 'm5' as never,
+    } as never);
+    expect(result).toBe('sent');
+    expect(stopSessionNow).toHaveBeenCalledWith(target.name);
   });
 });

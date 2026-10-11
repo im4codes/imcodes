@@ -1361,6 +1361,15 @@ export async function dispatchSendMessage(
   if (input.command === true) {
     return dispatchCommandSend(caller, callerProjectName, allSessions, input, d, deps);
   }
+  // Transport command liveness contract (CLAUDE.md): /stop is urgent control and
+  // must never ride the ordinary send queue or wrap in delegation envelopes.
+  if (typeof input.message === 'string' && input.message.trim() === '/stop') {
+    return dispatchSendStop(caller, {
+      ...(input.target ? { target: input.target } : {}),
+      ...(input.broadcast ? { broadcast: true } : {}),
+      ...(input.idempotencyKey ? { idempotencyKey: input.idempotencyKey } : {}),
+    }, deps);
+  }
   // New pairs-engine work has one authoritative creation route.  In
   // particular, do not let a Brain accidentally turn an ordinary
   // send_message task envelope into a second, implicit pair: pair_create owns

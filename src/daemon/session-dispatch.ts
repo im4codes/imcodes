@@ -218,7 +218,6 @@ export function buildServerMemberSharedActorOption(
     return {
       sharedActor: stamped,
       ...(senderTurn.authority ? { sharedMachineAuthority: senderTurn.authority } : {}),
-      deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.QUEUE,
     };
   }
   if (!shouldAttachServerMemberActor(caller.sessionName, callerRecord, target)) return {};
@@ -273,15 +272,20 @@ export async function dispatchSessionMessage(
   message: string,
   options: SessionDispatchMessageOptions,
 ): Promise<SessionDispatchMessageResult> {
+  // Urgent control: /stop stops the target immediately and never rides any send queue.
+  if (isSessionControlCommandText(message.trim(), 'stop')) {
+    const { stopSessionNow } = await import('./command-handler.js');
+    stopSessionNow(target.name);
+    return 'sent';
+  }
   // Inter-session traffic is append-by-default. Callers that explicitly need
   // ordinary FIFO waiting must opt into `deliveryMode=queue`; keeping the
   // normalization at this runtime-neutral boundary prevents task-pair,
   // cron, relay, and named-send paths from silently reverting to FIFO.
-  // A participant-stamped message is a turn of its own: appending it into a turn that is already running would blend a participant's
-  // words into somebody else's turn (the turn's origin is the weakest sender among everything that fed it).
-  const deliveryMode = options.sharedActor?.effectiveActorRole === 'participant'
-    ? MEMORY_MCP_SEND_DELIVERY_MODES.QUEUE
-    : (options.deliveryMode ?? MEMORY_MCP_SEND_DELIVERY_MODES.APPEND);
+  // Appending into a running turn records the sender's origin (via _appendedTurnOrigins),
+  // so participant restrictions and machine authority taints are preserved safely without
+  // blocking in-flight steer/append.
+  const deliveryMode = options.deliveryMode ?? MEMORY_MCP_SEND_DELIVERY_MODES.APPEND;
   if ((target.runtimeType ?? getSessionRuntimeType(target.agentType)) === 'transport') {
     // `/clear` is daemon-managed: a fresh provider conversation, exactly as
     // from the browser. Handing it to runtime.send made it ordinary model text
