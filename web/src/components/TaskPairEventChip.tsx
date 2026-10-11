@@ -2,6 +2,7 @@ import { taskPairDisplayTitle, taskPairResolveDisplaySessionLabel } from '@share
 import { useTranslation } from 'react-i18next';
 import { useEffect, useRef, useState } from 'preact/hooks';
 import { createPortal } from 'preact/compat';
+import { isMobileLayout } from '../mobile-device.js';
 import { AUDIT_SEVERITY_LEVELS } from '@shared/audit-convergence.js';
 import {
   TASK_PAIR_BRAIN_NOTICE_STATUSES,
@@ -78,6 +79,29 @@ function workspaceText(t: (key: string, options?: Record<string, unknown>) => st
 export function TaskPairEventChip({ eventId, payload, timestamp, sessions }: { eventId: string; payload: Record<string, unknown>; timestamp?: number; sessions?: readonly SessionModelEntry[] }) {
   const { t, i18n } = useTranslation();
   const [expanded, setExpanded] = useState(false);
+  const [isMobile, setIsMobile] = useState(isMobileLayout);
+  const [activeSplitTaskId, setActiveSplitTaskId] = useState<string | null>(() => {
+    return (window as Window & { __imcodesActiveSplitTaskId?: string | null }).__imcodesActiveSplitTaskId ?? null;
+  });
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const detail = (e as CustomEvent).detail;
+      setActiveSplitTaskId(detail?.activeTaskId ?? null);
+    };
+    window.addEventListener('deck:pair-split-state', handler);
+    return () => window.removeEventListener('deck:pair-split-state', handler);
+  }, []);
+  useEffect(() => {
+    const media = window.matchMedia?.('(max-width: 720px)');
+    if (!media) return undefined;
+    const onChange = () => setIsMobile(isMobileLayout());
+    media.addEventListener?.('change', onChange);
+    window.addEventListener('resize', onChange);
+    return () => {
+      media.removeEventListener?.('change', onChange);
+      window.removeEventListener('resize', onChange);
+    };
+  }, []);
   const [hoverPreviewAnchor, setHoverPreviewAnchor] = useState<DOMRect | null>(null);
   const cardRef = useRef<HTMLElement | null>(null);
   const hoverOpenTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -363,6 +387,32 @@ export function TaskPairEventChip({ eventId, payload, timestamp, sessions }: { e
           <span class="task-pair-card-event-meta"><span>{t('taskPair.card_event')}</span>{verb}</span>
           {roleLabel(event.executor, event.executorLabel, event.executorModel, event.executorThinking, 'executor')}
           {roleLabel(event.auditor, event.auditorLabel, event.auditorModel, event.auditorThinking, 'auditor')}
+          {!isMobile && typeof event.executor === 'string' && event.executor && event.executor !== 'none' && typeof event.auditor === 'string' && event.auditor && event.auditor !== 'none' && (() => {
+            const taskIdStr = String(taskId);
+            const isSplitOpen = activeSplitTaskId === taskIdStr;
+            return (
+              <button
+                type="button"
+                class={`task-pair-split-btn${isSplitOpen ? ' is-active' : ''}`}
+                title={isSplitOpen ? t('taskPair.panel_close_split') : t('taskPair.panel_open_split')}
+                aria-label={isSplitOpen ? t('taskPair.panel_close_split') : t('taskPair.panel_open_split')}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  window.dispatchEvent(new CustomEvent('deck:pair-split', {
+                    detail: {
+                      taskId: taskIdStr,
+                      executor: event.executor,
+                      auditor: event.auditor,
+                      action: isSplitOpen ? 'close' : 'open',
+                    },
+                  }));
+                }}
+              >
+                <span class="task-pair-split-icon" aria-hidden="true">◫</span>
+                <span class="task-pair-split-text">{isSplitOpen ? t('taskPair.panel_close_split') : t('taskPair.panel_open_split')}</span>
+              </button>
+            );
+          })()}
           {isCancelledEvent && <div class="task-pair-card-cancel-meta" data-cancel-provenance="true">
             <span>{t('taskPair.card_cancel_actor', { value: cancelActor || t('taskPair.card_cancel_unknown') })}</span>
             <span>{t('taskPair.card_cancel_source', { value: cancelSource ? t(`taskPair.cancel_source.${cancelSource}`, { defaultValue: cancelSource }) : t('taskPair.card_cancel_unknown') })}</span>

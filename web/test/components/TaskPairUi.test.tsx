@@ -23,6 +23,7 @@ import { SUPERVISION_CONSOLE_UNAVAILABLE_REASONS } from '../../../shared/supervi
 import {
   TASK_PAIR_STATUSES,
   TASK_PAIR_TERMINAL_STATUSES,
+  TASK_PAIR_TIMELINE_EVENT,
   TASK_PAIR_WORKSPACE_EFFECTS,
   TASK_PAIR_WORKSPACE_EVENT_VERB,
 } from '../../../shared/task-pair.js';
@@ -344,6 +345,40 @@ describe('TaskPairEventChip', () => {
     expect(payload).toContain('•••');
     restoreMatchMedia();
     vi.useRealTimers();
+  });
+
+  it('renders split view button in expanded event chip on desktop and dispatches deck:pair-split', () => {
+    const onSplit = vi.fn();
+    const handler = (e: Event) => onSplit((e as CustomEvent).detail);
+    window.addEventListener('deck:pair-split', handler);
+    try {
+      const { container } = render(<TaskPairEventChip eventId="e-split" payload={{
+        taskId: 'task-chip-split',
+        title: 'Event Chip Task',
+        writer: 'daemon',
+        verb: 'WORKING',
+        toStatus: 'working',
+        executor: 'exec-sub-1',
+        auditor: 'audit-sub-1',
+      }} />);
+      // Initially collapsed, toggle expands
+      const toggle = container.querySelector('.task-pair-card-toggle') as HTMLButtonElement;
+      fireEvent.click(toggle);
+
+      const splitBtn = container.querySelector('.task-pair-split-btn') as HTMLButtonElement;
+      expect(splitBtn).toBeTruthy();
+      expect(splitBtn.textContent).toContain('taskPair.panel_open_split');
+
+      fireEvent.click(splitBtn);
+      expect(onSplit).toHaveBeenCalledWith({
+        taskId: 'task-chip-split',
+        executor: 'exec-sub-1',
+        auditor: 'audit-sub-1',
+        action: 'open',
+      });
+    } finally {
+      window.removeEventListener('deck:pair-split', handler);
+    }
   });
 });
 
@@ -1223,6 +1258,90 @@ describe('TaskPairStatusPanel', () => {
       }
       for (const key of ['panel_icon_working', 'panel_icon_audit', 'panel_icon_queued', 'panel_icon_awaiting_brain', 'panel_rework_count']) expect(taskPair[key], `${locale}.${key}`).toBeTruthy();
       expect(taskPair.panel_counts, `${locale}.panel_counts should be removed`).toBeUndefined();
+    }
+  });
+
+  it('renders split view toggle button on desktop for tasks with executor and auditor and dispatches deck:pair-split', () => {
+    localStorage.setItem(collapsedStorageKey({ serverId: 's1', mobile: false }), 'false');
+    const onSplit = vi.fn();
+    const handler = (e: Event) => onSplit((e as CustomEvent).detail);
+    window.addEventListener('deck:pair-split', handler);
+    try {
+      const events = [
+        {
+          id: 'e1',
+          type: TASK_PAIR_TIMELINE_EVENT,
+          payload: {
+            taskId: 'task-split-1',
+            title: 'Split View Task',
+            verb: 'WORKING',
+            toStatus: 'working',
+            executor: 'exec-sub',
+            auditor: 'audit-sub',
+          },
+        },
+        {
+          id: 'e2',
+          type: TASK_PAIR_TIMELINE_EVENT,
+          payload: {
+            taskId: 'task-no-audit',
+            title: 'No Audit Task',
+            verb: 'WORKING',
+            toStatus: 'working',
+            executor: 'exec-sub',
+            auditor: 'none',
+          },
+        },
+      ];
+      const { container } = render(<TaskPairStatusPanel events={events as any} serverId="s1" />);
+      const rows = container.querySelectorAll('.task-pair-status-row');
+      expect(rows.length).toBe(2);
+
+      // Row 1 has both executor and auditor -> split button exists
+      const splitBtn = rows[0].querySelector('.task-pair-split-btn') as HTMLButtonElement;
+      expect(splitBtn).toBeTruthy();
+      expect(splitBtn.textContent).toContain('taskPair.panel_open_split');
+
+      // Row 2 has auditor='none' -> split button must NOT exist
+      const splitBtn2 = rows[1].querySelector('.task-pair-split-btn');
+      expect(splitBtn2).toBeNull();
+
+      // Clicking split button dispatches deck:pair-split
+      fireEvent.click(splitBtn);
+      expect(onSplit).toHaveBeenCalledWith({
+        taskId: 'task-split-1',
+        executor: 'exec-sub',
+        auditor: 'audit-sub',
+        action: 'open',
+      });
+
+      // When deck:pair-split-state broadcasts activeTaskId, button updates to active / close
+      act(() => {
+        window.dispatchEvent(new CustomEvent('deck:pair-split-state', { detail: { activeTaskId: 'task-split-1' } }));
+      });
+      expect(splitBtn.classList.contains('is-active')).toBe(true);
+      expect(splitBtn.textContent).toContain('taskPair.panel_close_split');
+
+      // Clicking when active dispatches action: 'close'
+      fireEvent.click(splitBtn);
+      expect(onSplit).toHaveBeenCalledWith({
+        taskId: 'task-split-1',
+        executor: 'exec-sub',
+        auditor: 'audit-sub',
+        action: 'close',
+      });
+    } finally {
+      window.removeEventListener('deck:pair-split', handler);
+      localStorage.clear();
+    }
+  });
+
+  it('has panel_open_split and panel_close_split i18n keys across all seven locales', () => {
+    const WEB = process.cwd().endsWith('/web') ? process.cwd() : join(process.cwd(), 'web');
+    for (const locale of ['en', 'zh-CN', 'zh-TW', 'es', 'ru', 'ja', 'ko']) {
+      const taskPair = (JSON.parse(readFileSync(join(WEB, 'src/i18n/locales', `${locale}.json`), 'utf8')) as { taskPair: Record<string, string> }).taskPair;
+      expect(taskPair.panel_open_split, `${locale}.panel_open_split`).toBeTruthy();
+      expect(taskPair.panel_close_split, `${locale}.panel_close_split`).toBeTruthy();
     }
   });
 });

@@ -227,11 +227,11 @@ function currentDesktopBounds(): WorkspaceBounds {
   }));
 }
 
-function clampDesktopGeom(geom: WindowGeometry): WindowGeometry {
+function clampDesktopGeom(geom: WindowGeometry, options?: { minW?: number; minH?: number }): WindowGeometry {
   const bounds = currentDesktopBounds();
   return clampGeometryFullyIntoWorkspace(geom, bounds, {
-    minW: MIN_W,
-    minH: MIN_H,
+    minW: options?.minW ?? MIN_W,
+    minH: options?.minH ?? MIN_H,
   });
 }
 
@@ -261,9 +261,12 @@ function loadLocal(id: string): { geom: WindowGeometry; viewMode: ViewMode } {
   try {
     const raw = localStorage.getItem(LOCAL_KEY(id));
     if (raw) {
-      const parsed = JSON.parse(raw) as { geom?: unknown; viewMode?: unknown };
+      const parsed = JSON.parse(raw) as { geom?: unknown; viewMode?: unknown; isSplit?: boolean };
+      const isSplit = Boolean(parsed.isSplit || (parsed.geom as { isSplit?: boolean } | undefined)?.isSplit);
+      const minW = isSplit ? Math.min(MIN_W, Math.max(200, (parsed.geom as { w?: number } | undefined)?.w ?? MIN_W)) : MIN_W;
+      const minH = isSplit ? Math.min(MIN_H, Math.max(150, (parsed.geom as { h?: number } | undefined)?.h ?? MIN_H)) : MIN_H;
       return {
-        geom: clampDesktopGeom(normalizeWindowGeometry(parsed.geom, fallback)),
+        geom: clampDesktopGeom(normalizeWindowGeometry(parsed.geom, fallback), { minW, minH }),
         viewMode: parsed.viewMode === 'terminal' || parsed.viewMode === 'chat' ? parsed.viewMode : 'chat',
       };
     }
@@ -448,6 +451,21 @@ export function SubSessionWindow({
   const isTransport = effectiveRuntimeType === 'transport';
   const initial = loadLocal(sub.id);
   const [geom, setGeom] = useState<WindowGeometry>(initial.geom);
+
+  useEffect(() => {
+    if (isMobile) return;
+    const handler = (e: Event) => {
+      const detail = (e as CustomEvent).detail;
+      if (detail?.subId === sub.id && detail?.geom) {
+        setGeom(clampDesktopGeom(detail.geom, {
+          minW: Math.min(MIN_W, Math.max(200, detail.geom.w)),
+          minH: Math.min(MIN_H, Math.max(150, detail.geom.h)),
+        }));
+      }
+    };
+    window.addEventListener('deck:subsession-geom', handler);
+    return () => window.removeEventListener('deck:subsession-geom', handler);
+  }, [isMobile, sub.id]);
   const [viewMode, setViewMode] = useState<ViewMode>(isShell ? 'terminal' : isTransport ? 'chat' : initial.viewMode);
   const [maximizeBoundsVersion, setMaximizeBoundsVersion] = useState(0);
   // confirmClose removed — × now minimizes instead of terminating

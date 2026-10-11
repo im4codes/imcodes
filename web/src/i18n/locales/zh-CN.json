@@ -4703,6 +4703,8 @@
     "panel_auditor": "审计者",
     "panel_untitled": "未命名任务",
     "panel_model_separator": " · ",
+    "panel_open_split": "并列查看",
+    "panel_close_split": "关闭并列",
     "checklist_progress": "实现 {{implemented}}/{{total}} · 审计 {{audited}}/{{total}}",
     "implemented": "实现",
     "audited": "审计",

@@ -4693,6 +4693,8 @@
     "panel_auditor": "Аудитор",
     "panel_untitled": "Задача без названия",
     "panel_model_separator": " · ",
+    "panel_open_split": "Раздельный вид",
+    "panel_close_split": "Закрыть разделение",
     "checklist_progress": "Реализовано {{implemented}}/{{total}} · Проверено {{audited}}/{{total}}",
     "implemented": "Реализовано",
     "audited": "Проверено",

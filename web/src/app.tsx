@@ -9,7 +9,9 @@ import {
 } from './window-stack.js';
 import {
   reserveWorkspaceBottom,
+  viewportWorkspaceBelowSessionTabs,
   workspaceBoundsFromRect,
+  type WindowGeometry,
   type WorkspaceBounds,
 } from './desktop-window-maximize.js';
 import { lazy, Suspense } from 'preact/compat';
@@ -2021,6 +2023,8 @@ export function App() {
   );
   const openSubIdsRef = useRef(openSubIds);
   openSubIdsRef.current = openSubIds;
+  const activeSplitPairRef = useRef<{ taskId: string; executorSubId: string; auditorSubId: string } | null>(null);
+  const [, setActiveSplitPairTaskId] = useState<string | null>(null);
   const persistOpenSubIds = useCallback((next: Set<string>) => {
     const mainSession = openSubPersistenceSessionRef.current;
     if (!mainSession) return;
@@ -2604,6 +2608,12 @@ export function App() {
     // suppresses full controls and ChatView work until restoration.
     }, { retainPrevious: true });
     removeDesktopWindow(DESKTOP_WINDOW_IDS.subSession(id));
+    if (activeSplitPairRef.current && (activeSplitPairRef.current.executorSubId === id || activeSplitPairRef.current.auditorSubId === id)) {
+      activeSplitPairRef.current = null;
+      setActiveSplitPairTaskId(null);
+      (window as Window & { __imcodesActiveSplitTaskId?: string | null }).__imcodesActiveSplitTaskId = null;
+      window.dispatchEvent(new CustomEvent('deck:pair-split-state', { detail: { activeTaskId: null } }));
+    }
   }, [clearSubSessionMaximized, removeDesktopWindow, setOpenSubIds]);
 
   const openSubSessionMaximized = useCallback((id: string) => {
@@ -2705,6 +2715,12 @@ export function App() {
       if (stack.removeWindow(entry.id)) changed = true;
     }
     if (changed) bumpStack();
+    if (activeSplitPairRef.current) {
+      activeSplitPairRef.current = null;
+      setActiveSplitPairTaskId(null);
+      (window as Window & { __imcodesActiveSplitTaskId?: string | null }).__imcodesActiveSplitTaskId = null;
+      window.dispatchEvent(new CustomEvent('deck:pair-split-state', { detail: { activeTaskId: null } }));
+    }
   }, [bumpStack, recomputeFocusedSubId, setOpenSubIds]);
 
   const restoreQuickClosedSubSessionWindows = useCallback((ids: string[]) => {
@@ -3534,6 +3550,12 @@ export function App() {
   const closeSubSessionAndClearMaximized = useCallback((id: string) => {
     clearSubSessionMaximized(id);
     removeDesktopWindow(DESKTOP_WINDOW_IDS.subSession(id));
+    if (activeSplitPairRef.current && (activeSplitPairRef.current.executorSubId === id || activeSplitPairRef.current.auditorSubId === id)) {
+      activeSplitPairRef.current = null;
+      setActiveSplitPairTaskId(null);
+      (window as Window & { __imcodesActiveSplitTaskId?: string | null }).__imcodesActiveSplitTaskId = null;
+      window.dispatchEvent(new CustomEvent('deck:pair-split-state', { detail: { activeTaskId: null } }));
+    }
     closeSubSession(id);
   }, [clearSubSessionMaximized, closeSubSession, removeDesktopWindow]);
 
@@ -5727,9 +5749,16 @@ export function App() {
     if (exact) return { isSubSession: true, sub: exact };
 
     const idMatch = sessionName.match(/^deck_sub_(.+)$/);
+    if (idMatch) {
+      const byId = candidates.find((candidate) => candidate.id === idMatch[1]);
+      if (byId) return { isSubSession: true, sub: byId };
+    }
+    const byIdDirect = candidates.find((candidate) => candidate.id === sessionName);
+    if (byIdDirect) return { isSubSession: true, sub: byIdDirect };
+
     return {
       isSubSession: !!idMatch,
-      sub: idMatch ? candidates.find((candidate) => candidate.id === idMatch[1]) : undefined,
+      sub: undefined,
     };
   }, []);
 
@@ -5855,6 +5884,167 @@ export function App() {
 
     return () => { window.removeEventListener('deck:navigate', handler); window.removeEventListener('deck:view-discussion', discussionHandler); };
   }, [handleSelectServer, navigateToSession, runVersionSensitiveAction, trans]);
+
+  const handlePairSplit = useCallback((detail: {
+    taskId: string;
+    executor: string;
+    auditor: string;
+    action?: 'open' | 'close' | 'toggle';
+  }) => {
+    if (isMobileRef.current) return;
+    const { taskId, executor, auditor, action = 'toggle' } = detail;
+    if (!taskId || !executor || !auditor || auditor === 'none') return;
+
+    const resolveSub = (nameOrId: string) => {
+      const match = nameOrId.match(/^deck_sub_(.+)$/);
+      const subIdCandidate = match ? match[1] : nameOrId;
+      const found = subSessionsRef.current.find((s) => s.id === subIdCandidate || s.sessionName === nameOrId || s.id === nameOrId);
+      return { id: found ? found.id : subIdCandidate, sub: found };
+    };
+
+    const resolvedExec = resolveSub(executor);
+    const resolvedAudit = resolveSub(auditor);
+    const executorSubId = resolvedExec.id;
+    const auditorSubId = resolvedAudit.id;
+
+    const isCurrentActive = activeSplitPairRef.current?.taskId === taskId
+      && openSubIdsRef.current.has(executorSubId)
+      && openSubIdsRef.current.has(auditorSubId);
+
+    const shouldClose = action === 'close' || (action === 'toggle' && isCurrentActive);
+
+    if (shouldClose) {
+      activeSplitPairRef.current = null;
+      setActiveSplitPairTaskId(null);
+      (window as Window & { __imcodesActiveSplitTaskId?: string | null }).__imcodesActiveSplitTaskId = null;
+      window.dispatchEvent(new CustomEvent('deck:pair-split-state', { detail: { activeTaskId: null } }));
+      minimizeSubSessionWindow(executorSubId);
+      minimizeSubSessionWindow(auditorSubId);
+      return;
+    }
+
+    if (activeSplitPairRef.current && activeSplitPairRef.current.taskId !== taskId) {
+      minimizeSubSessionWindow(activeSplitPairRef.current.executorSubId);
+      minimizeSubSessionWindow(activeSplitPairRef.current.auditorSubId);
+    }
+
+    const bounds = getDesktopMaximizeBounds() ?? reserveWorkspaceBottom(viewportWorkspaceBelowSessionTabs({
+      viewportWidth: window.innerWidth,
+      viewportHeight: window.innerHeight,
+      minW: 600,
+      minH: 400,
+    }));
+    const halfW = Math.max(300, Math.floor(bounds.w / 2));
+    const leftGeom: WindowGeometry = {
+      x: bounds.x,
+      y: bounds.y,
+      w: halfW,
+      h: bounds.h,
+    };
+    const rightGeom: WindowGeometry = {
+      x: bounds.x + halfW,
+      y: bounds.y,
+      w: Math.max(300, bounds.w - halfW),
+      h: bounds.h,
+    };
+
+    const updateWindowGeom = (subId: string, geom: WindowGeometry) => {
+      const key = `rcc_subsession_${subId}`;
+      try {
+        const raw = localStorage.getItem(key);
+        const existing = raw ? JSON.parse(raw) : {};
+        localStorage.setItem(key, JSON.stringify({ ...existing, geom, isSplit: true }));
+      } catch {}
+      window.dispatchEvent(new CustomEvent('deck:subsession-geom', { detail: { subId, geom } }));
+    };
+
+    updateWindowGeom(executorSubId, leftGeom);
+    updateWindowGeom(auditorSubId, rightGeom);
+
+    clearSubSessionMaximized(executorSubId);
+    clearSubSessionMaximized(auditorSubId);
+    unpinSubSessionPanel(executorSubId);
+    unpinSubSessionPanel(auditorSubId);
+
+    const parent = resolvedExec.sub?.parentSession || resolvedAudit.sub?.parentSession;
+    if (parent && parent !== activeSessionRef.current) {
+      setActiveSession(parent, { keepSubWindows: true });
+    }
+
+    setOpenSubIds((prev) => {
+      const next = new Set(prev);
+      next.add(executorSubId);
+      next.add(auditorSubId);
+      return next;
+    });
+
+    ensureDesktopWindow(DESKTOP_WINDOW_IDS.subSession(auditorSubId), getSubSessionDesktopWindowMeta(auditorSubId), { bringToFront: true });
+    ensureDesktopWindow(DESKTOP_WINDOW_IDS.subSession(executorSubId), getSubSessionDesktopWindowMeta(executorSubId), { bringToFront: true });
+    activateSubId(executorSubId);
+
+    activeSplitPairRef.current = { taskId, executorSubId, auditorSubId };
+    setActiveSplitPairTaskId(taskId);
+    (window as Window & { __imcodesActiveSplitTaskId?: string | null }).__imcodesActiveSplitTaskId = taskId;
+    window.dispatchEvent(new CustomEvent('deck:pair-split-state', { detail: { activeTaskId: taskId } }));
+  }, [
+    activateSubId,
+    clearSubSessionMaximized,
+    ensureDesktopWindow,
+    getDesktopMaximizeBounds,
+    getSubSessionDesktopWindowMeta,
+    minimizeSubSessionWindow,
+    setActiveSession,
+    setOpenSubIds,
+    unpinSubSessionPanel,
+  ]);
+
+  useEffect(() => {
+    const pairSplitHandler = (e: Event) => {
+      const detail = (e as CustomEvent).detail;
+      if (detail && typeof detail.taskId === 'string') {
+        handlePairSplit(detail);
+      }
+    };
+    window.addEventListener('deck:pair-split', pairSplitHandler);
+    return () => window.removeEventListener('deck:pair-split', pairSplitHandler);
+  }, [handlePairSplit]);
+
+  useEffect(() => {
+    if (isMobile) return;
+    const onResize = () => {
+      if (!activeSplitPairRef.current) return;
+      const { executorSubId, auditorSubId } = activeSplitPairRef.current;
+      if (!openSubIdsRef.current.has(executorSubId) || !openSubIdsRef.current.has(auditorSubId)) {
+        activeSplitPairRef.current = null;
+        setActiveSplitPairTaskId(null);
+        (window as Window & { __imcodesActiveSplitTaskId?: string | null }).__imcodesActiveSplitTaskId = null;
+        window.dispatchEvent(new CustomEvent('deck:pair-split-state', { detail: { activeTaskId: null } }));
+        return;
+      }
+      const bounds = getDesktopMaximizeBounds() ?? reserveWorkspaceBottom(viewportWorkspaceBelowSessionTabs({
+        viewportWidth: window.innerWidth,
+        viewportHeight: window.innerHeight,
+        minW: 600,
+        minH: 400,
+      }));
+      const halfW = Math.max(300, Math.floor(bounds.w / 2));
+      const leftGeom: WindowGeometry = { x: bounds.x, y: bounds.y, w: halfW, h: bounds.h };
+      const rightGeom: WindowGeometry = { x: bounds.x + halfW, y: bounds.y, w: Math.max(300, bounds.w - halfW), h: bounds.h };
+      const updateWindowGeom = (subId: string, geom: WindowGeometry) => {
+        const key = `rcc_subsession_${subId}`;
+        try {
+          const raw = localStorage.getItem(key);
+          const existing = raw ? JSON.parse(raw) : {};
+          localStorage.setItem(key, JSON.stringify({ ...existing, geom, isSplit: true }));
+        } catch {}
+        window.dispatchEvent(new CustomEvent('deck:subsession-geom', { detail: { subId, geom } }));
+      };
+      updateWindowGeom(executorSubId, leftGeom);
+      updateWindowGeom(auditorSubId, rightGeom);
+    };
+    window.addEventListener('resize', onResize);
+    return () => window.removeEventListener('resize', onResize);
+  }, [getDesktopMaximizeBounds, isMobile]);
 
   const handleBackToDashboard = useCallback(() => {
     sharedOpenGenerationRef.current += 1;

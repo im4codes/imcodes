@@ -4703,6 +4703,8 @@
     "panel_auditor": "Auditor",
     "panel_untitled": "Untitled task",
     "panel_model_separator": " · ",
+    "panel_open_split": "Split view",
+    "panel_close_split": "Close split",
     "checklist_progress": "Implemented {{implemented}}/{{total}} · Audited {{audited}}/{{total}}",
     "implemented": "Implemented",
     "audited": "Audited",
