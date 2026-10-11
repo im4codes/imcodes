@@ -22,7 +22,7 @@ import { TaskPairStore, getTaskPairStore, setTaskPairStoreForTests } from '../..
 import { taskPairService } from '../../../src/daemon/task-pairs/service.js';
 import { TaskPairAutomation } from '../../../src/daemon/task-pairs/scheduler.js';
 import { setPairSessionCreationDepsForTests, resolveCreationConfig } from '../../../src/daemon/task-pairs/session-creation.js';
-import { createPairSubSession, pairSessionNotLiveReason, type PairSubSessionFailureReason, type PairSubSessionRequest, type PairSubSessionResult } from '../../../src/daemon/supervision-auto-provision.js';
+import { clearSupervisionAutoProvisionStateForTests, createPairSubSession, pairSessionNotLiveReason, type PairSubSessionFailureReason, type PairSubSessionRequest, type PairSubSessionResult } from '../../../src/daemon/supervision-auto-provision.js';
 import { resetActiveServerLinkForTests, setActiveServerLink } from '../../../src/daemon/active-server-link.js';
 
 const PROJECT = 'liveproj';
@@ -188,7 +188,7 @@ describe('pair_create end to end', () => {
       const forced = outcome(request, launches);
       if (forced) return forced;
       return createPairSubSession(request, {
-        readyTimeoutMs: 0,
+        readyTimeoutMs: 500,
         startSubSession: async (sub) => {
           const name = `deck_sub_${sub.id}`;
           events.push(`start:${request.metadata.role}`);
@@ -204,6 +204,8 @@ describe('pair_create end to end', () => {
 
   beforeEach(() => {
     process.env.IMCODES_SUPERVISION_ENGINE = 'pairs';
+    clearSupervisionAutoProvisionStateForTests();
+    for (const name of [BRAIN, 'deck_sub_mine', 'deck_sub_dead']) removeSession(name);
     setTaskPairStoreForTests(new TaskPairStore(':memory:'));
     events = [];
     created = [];
@@ -220,6 +222,7 @@ describe('pair_create end to end', () => {
   });
   afterEach(() => {
     vi.restoreAllMocks();
+    clearSupervisionAutoProvisionStateForTests();
     setPairSessionCreationDepsForTests(undefined);
     setTaskPairDeliveryDepsForTests(undefined);
     setTaskPairStoreForTests(undefined);

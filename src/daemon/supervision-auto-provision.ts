@@ -535,7 +535,7 @@ async function provisionConfig(
     }
 
     const deadline = deps.now() + deps.readyTimeoutMs;
-    while (deps.now() <= deadline) {
+    do {
       const current = readyChildren(deps.listSessions(), parent, config, deps.now(), request.identityPrompt)
         .find((candidate) => candidate.name === identity.sessionName);
       if (current) {
@@ -552,8 +552,9 @@ async function provisionConfig(
           },
         };
       }
+      if (deps.now() >= deadline) break;
       await deps.wait(SUPERVISION_AUTO_PROVISION_POLL_MS);
-    }
+    } while (deps.now() <= deadline);
     if (!force) cooldownUntil.set(`${parent.name}\0${request.pool}`, deps.now() + deps.cooldownMs);
     if (force) await discardHalfMade(deps, identity.sessionName);
     return {
@@ -772,13 +773,14 @@ export async function createPairSubSession(
     }
   }
   const deadline = deps.now() + deps.readyTimeoutMs;
-  while (deps.now() <= deadline) {
+  do {
     const current = deps.getSession(sessionName);
     if (current && sessionIsReady(current, resolveDelegationTargets(delegationTargetInputs(deps.listSessions()), deps.now()).get(sessionName)?.availability)) {
       return finishLive(current, !existing);
     }
+    if (deps.now() >= deadline) break;
     await deps.wait(SUPERVISION_AUTO_PROVISION_POLL_MS);
-  }
+  } while (deps.now() <= deadline);
   await discard();
   return { ok: false, reason: 'readiness_timeout', detail: sessionName };
 }
