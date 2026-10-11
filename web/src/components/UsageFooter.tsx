@@ -78,6 +78,7 @@ interface Props {
   /** WS client — enables the Codex reset-credits affordance (codex sessions). */
   wsClient?: WsClient | null;
   connected?: boolean;
+  isMobile?: boolean;
 }
 
 // Keep execution-clone plumbing intact while removing only this compact
@@ -90,7 +91,7 @@ const fmt = (n: number) =>
   : n >= 1000 ? `${(n / 1000).toFixed(0)}k`
   : String(n);
 
-function UsageFooterImpl({ usage, sessionName, sessionState, agentType, modelOverride, planLabel, quotaLabel, quotaUsageLabel, quotaMeta, codexCreditsBalance, codexCreditsUnlimited, showCost, activeThinkingTs, statusText, activeToolCall, activeTimelineTurn, pendingUserSend, transportActivityDetail, sessionError, now, onRunExecutionClones, runExecutionClonesBusy, runExecutionClonesDisabled, runExecutionClonesTitle, runExecutionClonesCount, runExecutionClonesFeedback, onRefreshHistory, historyRefreshing = false, historyStatus, wsClient, connected }: Props) {
+function UsageFooterImpl({ usage, sessionName, sessionState, agentType, modelOverride, planLabel, quotaLabel, quotaUsageLabel, quotaMeta, codexCreditsBalance, codexCreditsUnlimited, showCost, activeThinkingTs, statusText, activeToolCall, activeTimelineTurn, pendingUserSend, transportActivityDetail, sessionError, now, onRunExecutionClones, runExecutionClonesBusy, runExecutionClonesDisabled, runExecutionClonesTitle, runExecutionClonesCount, runExecutionClonesFeedback, onRefreshHistory, historyRefreshing = false, historyStatus, wsClient, connected, isMobile }: Props) {
   recordPerfRender('UsageFooter');
   const { t } = useTranslation();
   const [sessionUsageOpen, setSessionUsageOpen] = useState(false);
@@ -140,7 +141,7 @@ function UsageFooterImpl({ usage, sessionName, sessionState, agentType, modelOve
   const previousCtxSignatureRef = useRef<string | null>(null);
 
   const displayModel = modelOverride ?? usage.model;
-  const displayQuotaLabel = useProviderQuotaLabel({ quotaLabel, quotaMeta, now });
+  const displayQuotaLabel = useProviderQuotaLabel({ quotaLabel, quotaMeta, now, isMobile });
 
   const displayPlanLabel = useMemo(() => {
     const normalized = planLabel?.trim().toLowerCase();

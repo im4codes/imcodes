@@ -662,17 +662,18 @@ export function useSubSessions(
   ): Promise<SubSession | null> => {
     if (!serverId) return null;
     try {
+      const effectiveParentSession = (extra?.parentSession as string | undefined) ?? activeSession ?? null;
       // Auto-generate label if not provided: agentType + incrementing number
       let effectiveLabel = label;
       if (!effectiveLabel) {
-        const siblings = subSessions.filter((s) => s.parentSession === activeSession);
+        const siblings = subSessions.filter((s) => s.parentSession === effectiveParentSession);
         const prefix = getAutoSessionLabelPrefix(type);
         let n = siblings.filter((s) => s.type === type).length + 1;
         effectiveLabel = `${prefix}${n}`;
         while (siblings.some((s) => s.label === effectiveLabel)) { n++; effectiveLabel = `${prefix}${n}`; }
       } else {
         // Prevent duplicate labels within the same parent session
-        const siblings = subSessions.filter((s) => s.parentSession === activeSession);
+        const siblings = subSessions.filter((s) => s.parentSession === effectiveParentSession);
         if (siblings.some((s) => s.label === effectiveLabel)) {
           let n = 2;
           while (siblings.some((s) => s.label === `${effectiveLabel}${n}`)) n++;
@@ -690,7 +691,7 @@ export function useSubSessions(
         cwd,
         label: effectiveLabel,
         ccSessionId,
-        parentSession: activeSession ?? null,
+        parentSession: effectiveParentSession,
         description,
         ccPresetId,
         requestedModel: requestedModel ?? null,
@@ -726,7 +727,7 @@ export function useSubSessions(
           sessionType: type,
           cwd,
           ccSessionId,
-          parentSession: activeSession,
+          parentSession: effectiveParentSession,
           ...(extra ?? {}),
         });
       } else if (extra?.ccPreset || extra?.ccInitPrompt) {
@@ -737,11 +738,11 @@ export function useSubSessions(
           sessionType: type,
           cwd,
           ccSessionId,
-          parentSession: activeSession,
+          parentSession: effectiveParentSession,
           ...extra,
         });
       } else {
-        ws?.subSessionStart(sub.id, type, shellBin, cwd, ccSessionId, activeSession);
+        ws?.subSessionStart(sub.id, type, shellBin, cwd, ccSessionId, effectiveParentSession ?? undefined);
       }
       return sub;
     } catch (err) {

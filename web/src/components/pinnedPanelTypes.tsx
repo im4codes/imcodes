@@ -168,7 +168,8 @@ registerPanelType('filebrowser', {
   title: () => '📁 Files',
   render: (panel, ctx) => {
     // Follow active tab's project dir; fall back to captured dir at pin time
-    const projectDir = ctx.sharedAccessRole
+    const isTabShare = ctx.shareTargetKind ? ctx.shareTargetKind !== 'server' : Boolean(ctx.sharedAccessRole);
+    const projectDir = isTabShare
       ? FS_SESSION_ROOT_PATH
       : ctx.activeProjectDir ?? (panel.props?.projectDir as string | undefined);
     if (!ctx.ws || !projectDir) return <div class="sidebar-pinned-unavailable">No project dir</div>;
@@ -179,7 +180,7 @@ registerPanelType('filebrowser', {
         ws={ctx.ws}
         serverId={ctx.serverId}
         sessionName={activeSession}
-        scopeToSessionRoot={!!ctx.sharedAccessRole}
+        scopeToSessionRoot={isTabShare}
         readOnly={ctx.sharedAccessRole === 'viewer'}
         mode="file-multi"
         layout="panel"
@@ -222,7 +223,8 @@ registerPanelType('repopage', {
   title: () => 'Repository',
   render: (panel, ctx) => {
     // Follow active tab's project dir — keep mounted during WS reconnect to preserve state
-    const projectDir = ctx.sharedAccessRole
+    const isTabShare = ctx.shareTargetKind ? ctx.shareTargetKind !== 'server' : Boolean(ctx.sharedAccessRole);
+    const projectDir = isTabShare
       ? FS_SESSION_ROOT_PATH
       : ctx.activeProjectDir ?? (panel.props?.projectDir as string | undefined);
     if (!ctx.ws || !projectDir) return <div class="sidebar-pinned-unavailable">No project dir</div>;
@@ -232,7 +234,7 @@ registerPanelType('repopage', {
         ws={ctx.ws}
         sessionId={ctx.activeSession ?? panel.props?.sessionName as string | undefined}
         projectDir={projectDir}
-        scopeToSessionRoot={!!ctx.sharedAccessRole}
+        scopeToSessionRoot={isTabShare}
         readOnly={ctx.sharedAccessRole === 'viewer'}
         onBack={() => {}}
         onCiEvent={ctx.onCiEvent ?? (() => {})}
@@ -246,8 +248,13 @@ registerPanelType('repopage', {
 registerPanelType('cronmanager', {
   title: () => 'Scheduled Tasks',
   render: (panel, ctx) => {
-    // Derive project from active session, fall back to pinned prop
-    const projectName = (ctx.sessions?.find(s => s.name === ctx.activeSession)?.project
+    // Derive project from active session or subsession, fall back to pinned prop
+    const activeSub = ctx.subSessions?.find((s) => s.sessionName === ctx.activeSession);
+    const activeMain = ctx.sessions?.find((s) => s.name === ctx.activeSession);
+    const parentMain = activeSub ? ctx.sessions?.find((s) => s.name === activeSub.parentSession) : null;
+    const projectName = (activeMain?.project
+      ?? parentMain?.project
+      ?? ctx.sessions?.[0]?.project
       ?? panel.props?.projectName as string | undefined);
     if (!projectName) return <div class="sidebar-pinned-unavailable">No project</div>;
     const subSessionsSlim = ctx.subSessions.map(s => ({
@@ -262,7 +269,7 @@ registerPanelType('cronmanager', {
         sessions={(ctx.sessions ?? []) as any}
         subSessions={subSessionsSlim}
         activeSession={ctx.activeSession}
-        sharedSessionName={ctx.sharedAccessRole ? ctx.activeSession ?? undefined : undefined}
+        sharedSessionName={ctx.sharedSessionName ?? (ctx.sharedAccessRole ? ctx.activeSession ?? undefined : undefined)}
         readOnly={ctx.sharedAccessRole === 'viewer'}
         portalSubPanels
         onBack={() => {}}

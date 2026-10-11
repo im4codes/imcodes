@@ -94,6 +94,7 @@ async function callDaemonLocal<
   c: Context<IdentityHttpEnv<TVariables>, TPath, TInput>,
   serverId: string | undefined,
   payload: { op: 'get' | 'set' | 'delete'; scope: 'project' | 'session'; scopeKey: string; content?: string; source?: 'web' | 'mcp'; sourceFile?: string },
+  sessionCoveredParticipant = false,
 ): Promise<{ ok: true; body: Record<string, unknown> } | { ok: false; response: Response }> {
   if (!serverId) {
     return { ok: false, response: c.json({ error: 'identity_server_required' }, 400) };
@@ -101,8 +102,10 @@ async function callDaemonLocal<
   // The ONE admission point for every route that relays to a daemon: `serverId` arrives from the request (a query string on the flat
   // route), so being logged in says nothing about this server. The acting user must be its owner or a whole-server participant;
   // without this any registered user could read/overwrite/delete PROJECT/SESSION identity on someone else's daemon.
-  const denied = await denyIdentityServerAccess(c, serverId);
-  if (denied) return { ok: false, response: denied };
+  if (!sessionCoveredParticipant) {
+    const denied = await denyIdentityServerAccess(c, serverId);
+    if (denied) return { ok: false, response: denied };
+  }
   const bridge = WsBridge.get(serverId);
   if (!bridge.isDaemonConnected()) {
     return { ok: false, response: c.json({ error: 'daemon_offline' }, 409) };
@@ -134,6 +137,7 @@ export async function handleSessionIdentityGet<
   ownerUserId: string,
   canonicalScopeKey?: SessionIdentityCanonicalScopeKey,
   serverId?: string,
+  sessionCoveredParticipant = false,
 ): Promise<Response> {
   const scope = readScope(c);
   if (!scope) return c.json({ error: 'identity_scope_invalid' }, 400);
@@ -143,7 +147,7 @@ export async function handleSessionIdentityGet<
     const profile = await getSessionIdentityProfile(c.env.DB, ownerUserId, scope, scopeKey);
     return c.json({ profile });
   }
-  const daemon = await callDaemonLocal(c, serverId, { op: 'get', scope, scopeKey });
+  const daemon = await callDaemonLocal(c, serverId, { op: 'get', scope, scopeKey }, sessionCoveredParticipant);
   if (!daemon.ok) {
     // The daemon (the only content source for this scope) is unreachable --
     // fall back to the metadata row so the editor can at least show hash/
@@ -175,6 +179,7 @@ export async function handleSessionIdentityPut<
   ownerUserId: string,
   canonicalScopeKey?: SessionIdentityCanonicalScopeKey,
   serverId?: string,
+  sessionCoveredParticipant = false,
 ): Promise<Response> {
   const body = await c.req.json().catch(() => null) as Record<string, unknown> | null;
   if (!body) return c.json({ error: 'identity_request_invalid' }, 400);
@@ -210,7 +215,7 @@ export async function handleSessionIdentityPut<
   }
   const daemon = await callDaemonLocal(c, serverId, {
     op: 'set', scope, scopeKey, content, source: 'web', sourceFile: sourceFile || undefined,
-  });
+  }, sessionCoveredParticipant);
   if (!daemon.ok) return daemon.response;
   const daemonBody = daemon.body;
   const contentHash = typeof daemonBody.contentHash === 'string' ? daemonBody.contentHash : createHash('sha256').update(content, 'utf8').digest('hex');
@@ -245,6 +250,7 @@ export async function handleSessionIdentityDelete<
   ownerUserId: string,
   canonicalScopeKey?: SessionIdentityCanonicalScopeKey,
   serverId?: string,
+  sessionCoveredParticipant = false,
 ): Promise<Response> {
   const scope = readScope(c);
   if (!scope) return c.json({ error: 'identity_scope_invalid' }, 400);
@@ -255,7 +261,7 @@ export async function handleSessionIdentityDelete<
     if (result === 'deleted') void WsBridge.pushSessionIdentityUserDeleteToOnlineDaemonsForUser(ownerUserId).catch(() => {});
     return c.json({ deleted: result === 'deleted' });
   }
-  const daemon = await callDaemonLocal(c, serverId, { op: 'delete', scope, scopeKey });
+  const daemon = await callDaemonLocal(c, serverId, { op: 'delete', scope, scopeKey }, sessionCoveredParticipant);
   if (!daemon.ok) return daemon.response;
   const deleted = await deleteSessionIdentityMetadata(c.env.DB, ownerUserId, scope, scopeKey);
   return c.json({ deleted });

@@ -588,19 +588,19 @@ async function resolveServerIdentityOwner(
 sessionMgmtRoutes.get('/:id/identity', async (c) => {
   const resolved = await resolveServerIdentityOwner(c);
   if (!resolved.ok) return resolved.response;
-  return handleSessionIdentityGet(c, resolved.ownerUserId, undefined, c.req.param('id')!);
+  return handleSessionIdentityGet(c, resolved.ownerUserId, undefined, c.req.param('id')!, true);
 });
 
 sessionMgmtRoutes.put('/:id/identity', async (c) => {
   const resolved = await resolveServerIdentityOwner(c);
   if (!resolved.ok) return resolved.response;
-  return handleSessionIdentityPut(c, resolved.ownerUserId, undefined, c.req.param('id')!);
+  return handleSessionIdentityPut(c, resolved.ownerUserId, undefined, c.req.param('id')!, true);
 });
 
 sessionMgmtRoutes.delete('/:id/identity', async (c) => {
   const resolved = await resolveServerIdentityOwner(c);
   if (!resolved.ok) return resolved.response;
-  return handleSessionIdentityDelete(c, resolved.ownerUserId, undefined, c.req.param('id')!);
+  return handleSessionIdentityDelete(c, resolved.ownerUserId, undefined, c.req.param('id')!, true);
 });
 
 /**
@@ -627,21 +627,21 @@ sessionMgmtRoutes.get('/:id/sessions/:name/identity', async (c) => {
   const resolved = await resolveSupervisorDefaultsOwner(c);
   if (!resolved.ok) return resolved.response;
   return handleSessionIdentityGet(c, resolved.ownerUserId,
-    canonicalSessionIdentityScopeKey(c.req.param('id')!, c.req.param('name')!), c.req.param('id')!);
+    canonicalSessionIdentityScopeKey(c.req.param('id')!, c.req.param('name')!), c.req.param('id')!, true);
 });
 
 sessionMgmtRoutes.put('/:id/sessions/:name/identity', async (c) => {
   const resolved = await resolveSupervisorDefaultsOwner(c);
   if (!resolved.ok) return resolved.response;
   return handleSessionIdentityPut(c, resolved.ownerUserId,
-    canonicalSessionIdentityScopeKey(c.req.param('id')!, c.req.param('name')!), c.req.param('id')!);
+    canonicalSessionIdentityScopeKey(c.req.param('id')!, c.req.param('name')!), c.req.param('id')!, true);
 });
 
 sessionMgmtRoutes.delete('/:id/sessions/:name/identity', async (c) => {
   const resolved = await resolveSupervisorDefaultsOwner(c);
   if (!resolved.ok) return resolved.response;
   return handleSessionIdentityDelete(c, resolved.ownerUserId,
-    canonicalSessionIdentityScopeKey(c.req.param('id')!, c.req.param('name')!), c.req.param('id')!);
+    canonicalSessionIdentityScopeKey(c.req.param('id')!, c.req.param('name')!), c.req.param('id')!, true);
 });
 
 /** PATCH /api/server/:id/sessions/:name — update session settings (label, description, cwd) */

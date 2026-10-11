@@ -1179,12 +1179,24 @@ function CronForm({ serverId, projectName, sessions, subSessions = [], activeSes
               {sessionDisplayLabel(s)} ({agentBadge(s.agentType)})
             </option>
           ))}
+          {!sessions.some(s => s.role === 'brain') && (
+            <option value="role:brain">brain</option>
+          )}
+          {!sessions.some(s => s.role === 'w1') && (
+            <option value="role:w1">w1</option>
+          )}
+          {targetRole && targetRole !== 'brain' && targetRole !== 'w1' && !sessions.some(s => s.role === targetRole) && !targetSessionName && (
+            <option value={`role:${targetRole}`}>{targetRole}</option>
+          )}
           {subSessions.length > 0 && <option disabled>──────────</option>}
           {subSessions.map(s => (
             <option key={s.sessionName} value={`sub:${s.sessionName}`}>
               {s.label ? formatLabel(s.label) : s.type} ({agentBadge(s.type)})
             </option>
           ))}
+          {targetSessionName && !subSessions.some(s => s.sessionName === targetSessionName) && (
+            <option value={`sub:${targetSessionName}`}>{targetSessionName}</option>
+          )}
         </select>
 
         <label style={labelStyle}>{t('cron.completion_policy')}</label>

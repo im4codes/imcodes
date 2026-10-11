@@ -1695,6 +1695,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
     verb: 'DONE' | 'CANCEL' | 'REASSIGN' | 'NEXT_ROUND' | 'PASS' | 'REWORK';
     attrs: Record<string, string>;
     idempotencyKey?: string;
+    turnText?: string;
     authorize: (pair: StoredTaskPair) => ToolResult | undefined;
   }): Promise<ToolResult> => {
     const store = getTaskPairStore();
@@ -1711,6 +1712,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       source: 'mcp',
       eventId,
       suppressAutomaticBrief: false,
+      ...(input.turnText ? { turnText: input.turnText } : {}),
     });
     await taskPairService.waitForIdle();
     const after = store.getPair(input.project, input.taskId);
@@ -3285,7 +3287,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
     [MEMORY_MCP_TOOL_NAMES.PAIR_VERDICT]: async (input) => {
       const context = await pairCallerContext();
       if (context.status === 'error') return context.result;
-      const args = pickAllowedMcpArgs(input, ['taskId', 'verdict', 'blocking', 'p0', 'p1', 'p2', 'p3', 'p4', 'idempotencyKey']);
+      const args = pickAllowedMcpArgs(input, ['taskId', 'verdict', 'blocking', 'p0', 'p1', 'p2', 'p3', 'p4', 'idempotencyKey', 'reason', 'notice', 'summary', 'findings']);
       const taskId = stringArg(args, 'taskId')?.trim();
       const verdict = stringArg(args, 'verdict');
       if (!taskId || (verdict !== 'PASS' && verdict !== 'REWORK')) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'taskId and verdict=PASS|REWORK are required');
@@ -3299,6 +3301,28 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
         const count = numberArg(args, level);
         if (count !== undefined) attrs[level] = String(count);
       }
+      const reason = stringArg(args, 'reason')?.trim();
+      const notice = stringArg(args, 'notice')?.trim();
+      const summary = stringArg(args, 'summary')?.trim();
+      let turnText = notice || '';
+      if (!turnText) {
+        const parts: string[] = [];
+        if (summary) parts.push(`Summary: ${summary}`);
+        if (reason) parts.push(`Reason: ${reason}`);
+        if (Array.isArray(args.findings)) {
+          for (const item of args.findings) {
+            if (typeof item === 'string') {
+              parts.push(`- ${item}`);
+            } else if (item && typeof item === 'object') {
+              const rec = item as Record<string, unknown>;
+              const sev = typeof rec.severity === 'string' ? `[${rec.severity}] ` : '';
+              const sum = typeof rec.summary === 'string' ? rec.summary : '';
+              if (sev || sum) parts.push(`- ${sev}${sum}`);
+            }
+          }
+        }
+        if (parts.length > 0) turnText = parts.join('\n');
+      }
       const verdictKey = stringArg(args, 'idempotencyKey')?.trim() || JSON.stringify(Object.entries(attrs).sort());
       const verdictEventId = `mcp:pair-${verdict.toLowerCase()}:${context.project}:${taskId}:${verdictKey}`;
       if ((stored.state.status !== 'in_audit' || !stored.state.material) && !getTaskPairStore().hasEvent(verdictEventId)) {
@@ -3306,6 +3330,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       }
       return applyStructuredPairLifecycle({
         project: context.project, taskId, verb: verdict, attrs, idempotencyKey: stringArg(args, 'idempotencyKey'),
+        ...(turnText ? { turnText } : {}),
         authorize: (pair) => pair.state.auditor === caller.sessionName ? undefined : error(MCP_ERROR_REASONS.SCOPE_FORBIDDEN, 'pair_verdict requires the assigned auditor'),
       });
     },
@@ -4658,6 +4683,10 @@ const schemas = {
     p3: z.number().int().nonnegative().optional(),
     p4: z.number().int().nonnegative().optional(),
     idempotencyKey: z.string().trim().min(1).optional(),
+    reason: z.string().trim().optional(),
+    notice: z.string().trim().optional(),
+    summary: z.string().trim().optional(),
+    findings: z.array(z.record(z.string(), z.unknown())).optional(),
   }).strict(),
   [MEMORY_MCP_TOOL_NAMES.PAIR_SET_MAX_CONCURRENCY]: z.object({
     maxConcurrency: z.number().int().min(1).max(100).describe('Durable pair concurrency limit.'),

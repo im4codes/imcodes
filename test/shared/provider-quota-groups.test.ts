@@ -9,6 +9,7 @@ import {
   providerQuotaMetaEquals,
   sanitizeProviderQuotaGroup,
   sanitizeProviderQuotaMeta,
+  stripPercentDecimals,
   type ProviderQuotaGroup,
   type ProviderQuotaMeta,
 } from '../../shared/provider-quota.js';
@@ -330,4 +331,50 @@ describe('provider-quota groups and formatting contract', () => {
       groups: [{ id: 'gemini', label: 'Gemini', primary: { usedPercent: 5 } }],
     });
   });
+
+  describe('mobile precision and stripPercentDecimals', () => {
+    it('stripPercentDecimals strips decimal places and rounds percentage values in pre-formatted strings', () => {
+      expect(stripPercentDecimals('Gemini 5h 5.45% 3h10m · 7d 12.00% 5d02h')).toBe('Gemini 5h 5% 3h10m · 7d 12% 5d02h');
+      expect(stripPercentDecimals('Claude/GPT 5h 94.55% 4h59m')).toBe('Claude/GPT 5h 95% 4h59m');
+      expect(stripPercentDecimals('5h 0.00% 12m')).toBe('5h 0% 12m');
+      expect(stripPercentDecimals('5h 12% 3h10m')).toBe('5h 12% 3h10m');
+      expect(stripPercentDecimals(null)).toBeNull();
+      expect(stripPercentDecimals(undefined)).toBeUndefined();
+      expect(stripPercentDecimals('')).toBe('');
+    });
+
+    it('formatProviderQuotaLabel with precision: 0 overrides window percentPrecision', () => {
+      const metaWithDecimals: ProviderQuotaMeta = {
+        groups: [
+          {
+            id: PROVIDER_QUOTA_GROUP_ID.GEMINI,
+            label: PROVIDER_QUOTA_GROUP_LABEL.GEMINI,
+            primary: {
+              usedPercent: 5.45,
+              percentPrecision: 2,
+              windowDurationMins: 300,
+              resetsAt: geminiReset5hSec,
+            },
+            secondary: {
+              usedPercent: 12.00,
+              percentPrecision: 2,
+              windowDurationMins: 10_080,
+              resetsAt: geminiReset7dSec,
+            },
+          },
+        ],
+      };
+
+      // Default keeps percentPrecision: 2
+      const defaultLabel = formatProviderQuotaLabel(metaWithDecimals, fixedNowMs);
+      expect(defaultLabel).toContain('5.45%');
+      expect(defaultLabel).toContain('12.00%');
+
+      // With precision: 0, decimals are omitted
+      const mobileLabel = formatProviderQuotaLabel(metaWithDecimals, fixedNowMs, { precision: 0 });
+      expect(mobileLabel).toBe('Gemini 5h 5% 3h10m · 7d 12% 5d02h');
+      expect(mobileLabel).not.toContain('.');
+    });
+  });
 });
+

@@ -1217,6 +1217,8 @@ export function SubSessionWindow({
               ws={ws}
               serverId={serverId}
               sessionName={sub.sessionName}
+              scopeToSessionRoot={sharedState?.status === 'active' && sharedState.targetKind !== 'server'}
+              readOnly={sharedState?.status === 'active' && sharedState.effectiveRole === 'viewer'}
               mode="file-multi"
               layout="panel"
               initialPath={sub.cwd ?? '~'}
@@ -1253,6 +1255,8 @@ export function SubSessionWindow({
               ws={ws}
               serverId={serverId}
               sessionName={sub.sessionName}
+              scopeToSessionRoot={sharedState?.status === 'active' && sharedState.targetKind !== 'server'}
+              readOnly={sharedState?.status === 'active' && sharedState.effectiveRole === 'viewer'}
               mode="file-multi"
               layout="panel"
               initialPath={sub.cwd ?? '~'}

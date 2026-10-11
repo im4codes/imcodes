@@ -820,6 +820,13 @@ export class TaskPairService {
     if (!recorded) return { effect: 'replayed', unusual: false, intents: [] };
     let stored: StoredTaskPair | undefined = existing;
     if (transition.pair) {
+      if (transition.verdict && transition.pair.lastVerdict) {
+        const noticeText = input.turnText ? stripTaskPairMarkersForDisplay(input.turnText).trim().slice(0, 4000) : '';
+        const auditDetails = noticeText ? parseTaskPairAuditDetails(noticeText) : undefined;
+        if (noticeText && !transition.pair.lastVerdict.noticeText) transition.pair.lastVerdict.noticeText = noticeText;
+        if (auditDetails && !transition.pair.lastVerdict.auditDetails) transition.pair.lastVerdict.auditDetails = auditDetails;
+        if (auditDetails?.reason && !transition.pair.lastVerdict.reason) transition.pair.lastVerdict.reason = auditDetails.reason;
+      }
       // Any marker that reopens a terminal pair (STARTED/WORKING/QUEUE,
       // READY_FOR_AUDIT, or a new verdict) must also reopen its retained
       // workspace. These paths do not pass through ensureWorkspace, so clear
@@ -1579,6 +1586,11 @@ export class TaskPairService {
   ): void {
     const noticeText = input.turnText ? stripTaskPairMarkersForDisplay(input.turnText).trim().slice(0, 4000) : '';
     const auditDetails = noticeText ? parseTaskPairAuditDetails(noticeText) : undefined;
+    if (pair?.lastVerdict) {
+      if (noticeText && !pair.lastVerdict.noticeText) pair.lastVerdict.noticeText = noticeText;
+      if (auditDetails && !pair.lastVerdict.auditDetails) pair.lastVerdict.auditDetails = auditDetails;
+      if (auditDetails?.reason && !pair.lastVerdict.reason) pair.lastVerdict.reason = auditDetails.reason;
+    }
     emitTaskPairTimelineEvent({
       taskId,
       verb: input.marker.knownVerb ?? input.marker.verb,
@@ -2674,6 +2686,20 @@ export function emitTaskPairTimelineEvent(
       ...(pair.auditorThinking ? { auditorThinking: pair.auditorThinking } : {}),
     } : {}),
   };
+  if (pair?.lastVerdict) {
+    if (!payload.severityCounts) payload.severityCounts = pair.lastVerdict.counts;
+    if (!payload.verdictJudgement) payload.verdictJudgement = pair.lastVerdict.judgement;
+    if (payload.toStatus === 'rework' || pair.status === 'rework') {
+      if (!payload.noticeText && pair.lastVerdict.noticeText) payload.noticeText = pair.lastVerdict.noticeText;
+      if (!payload.auditDetails) {
+        if (pair.lastVerdict.auditDetails) {
+          payload.auditDetails = pair.lastVerdict.auditDetails;
+        } else if (payload.noticeText) {
+          payload.auditDetails = parseTaskPairAuditDetails(payload.noticeText);
+        }
+      }
+    }
+  }
   for (const [role, session] of [['executor', pair?.executor], ['auditor', pair?.auditor]] as const) {
     if (!session || session === TASK_PAIR_NO_AUDITOR) continue;
     const record = getSession(session);

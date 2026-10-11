@@ -108,3 +108,50 @@ describe('SessionIdentityTabs counts in the authoritative unit (NFC + trim code 
     }
   }
 });
+
+describe('SessionIdentityTabs in shared sessions without pre-known projectKey', () => {
+  it('loads all 3 scopes and allows persistence for project scope via sessionName', async () => {
+    vi.mocked(fetchSessionIdentityProfile).mockImplementation(async (scope) => {
+      if (scope === 'project') {
+        return { scope: 'project', scopeKey: 'canonical-proj-key', content: 'Shared project prompt', revision: 1, updatedAt: 1234 } as never;
+      }
+      if (scope === 'user') {
+        return { scope: 'user', scopeKey: '', content: 'Owner user prompt', revision: 1, updatedAt: 1234 } as never;
+      }
+      return null;
+    });
+
+    const view = render(h(SessionIdentityTabs, {
+      serverId: 'srv',
+      sessionName: 'deck_shared_sub_123',
+      // projectKey intentionally omitted
+    }));
+
+    // Verify all 3 identity scopes are visible in UI
+    expect(view.getByText('session.identityScope_user')).toBeTruthy();
+    expect(view.getByText('session.identityScope_project')).toBeTruthy();
+    expect(view.getByText('session.identityScope_session')).toBeTruthy();
+
+    // Switch to project scope
+    fireEvent.click(view.getByText('session.identityScope_project'));
+
+    await waitFor(() => {
+      expect((view.getByLabelText('session-identity-content') as HTMLTextAreaElement).value).toBe('Shared project prompt');
+    });
+
+    // The Apply button text is rendered (not "Save after create")
+    const applyButton = view.getByText('session.identityApply') as HTMLButtonElement;
+    expect(applyButton).toBeTruthy();
+
+    // Modify content -> Apply button becomes active
+    const textarea = view.getByLabelText('session-identity-content') as HTMLTextAreaElement;
+    fireEvent.input(textarea, { target: { value: 'Updated shared project prompt' } });
+    expect(applyButton.disabled).toBe(false);
+
+    // Switch to user scope -> loads user prompt
+    fireEvent.click(view.getByText('session.identityScope_user'));
+    await waitFor(() => {
+      expect((view.getByLabelText('session-identity-content') as HTMLTextAreaElement).value).toBe('Owner user prompt');
+    });
+  });
+});

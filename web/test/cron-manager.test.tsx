@@ -150,6 +150,36 @@ describe('CronManager', () => {
     expect((screen.getByText('✕') as HTMLButtonElement).disabled).toBe(true);
   });
 
+  it('scopes shared participant requests to the covered project and allows creating and editing project jobs', async () => {
+    apiFetch.mockResolvedValueOnce({ jobs: [cronJob()] });
+
+    render(
+      <CronManager
+        serverId="srv-current"
+        projectName="cd"
+        sessions={sessions}
+        subSessions={subSessions}
+        activeSession="deck_sub_1"
+        sharedSessionName="deck_sub_1"
+        readOnly={false}
+        onBack={vi.fn()}
+      />,
+    );
+
+    expect(await screen.findByText('Current job')).toBeDefined();
+    expect(apiFetch).toHaveBeenCalledWith(expect.stringContaining('sessionName=deck_sub_1'));
+    const createBtn = screen.getByTitle('cron.create') as HTMLButtonElement;
+    expect(createBtn).toBeDefined();
+    expect(createBtn.disabled).toBe(false);
+
+    const triggerBtn = screen.getByText('▶') as HTMLButtonElement;
+    const editBtn = screen.getByText('✎') as HTMLButtonElement;
+    const deleteBtn = screen.getByText('✕') as HTMLButtonElement;
+    expect(triggerBtn.disabled).toBe(false);
+    expect(editBtn.disabled).toBe(false);
+    expect(deleteBtn.disabled).toBe(false);
+  });
+
   it('renders other-tab jobs as read-only', async () => {
     apiFetch.mockResolvedValueOnce({
       jobs: [{

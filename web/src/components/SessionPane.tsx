@@ -472,7 +472,7 @@ export function SessionPane({
           onOpenLocalWebPreview={onOpenLocalWebPreview}
           ws={connected ? ws : null}
           serverId={serverId}
-          scopeFilesToSession={!!session.sharedState}
+          scopeFilesToSession={!!session.sharedState && session.sharedState.targetKind !== 'server'}
           readOnlyFiles={!!session.sharedState && session.sharedState.effectiveRole !== 'participant'}
           onQuote={addQuote}
           agentType={session.agentType}

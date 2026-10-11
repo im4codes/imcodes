@@ -42,6 +42,33 @@ describe('task-pair notification thinking metadata', () => {
     });
   });
 
+  it('parses Chinese rework notices with bold tags, prefixes, and continuation summaries', () => {
+    const parsed = parseTaskPairAuditDetails(
+      '第二轮仍REWORK：**[P0] 验收4未闭合**。21项API结果不等于新增列表、双按钮及异人审批开始的正式页面验证；多租户证据也未覆盖。\n\n'
+      + '已给出窄补验方案及报告更正项。已有API结果保留，不要求重跑无关套件。',
+    );
+    expect(parsed?.findings).toHaveLength(1);
+    expect(parsed?.findings?.[0]).toMatchObject({
+      severity: 'P0',
+      summary: '验收4未闭合。21项API结果不等于新增列表、双按钮及异人审批开始的正式页面验证；多租户证据也未覆盖。',
+    });
+    expect(parsed?.summary).toContain('已给出窄补验方案');
+  });
+
+  it('parses Chinese reason labels and unlabelled rework prose', () => {
+    expect(parseTaskPairAuditDetails(
+      '返工原因: 接单后的费用审批入口缺失，且异人审批未覆盖',
+    )).toMatchObject({
+      reason: '接单后的费用审批入口缺失，且异人审批未覆盖',
+    });
+
+    expect(parseTaskPairAuditDetails(
+      '接单后的费用审批入口缺失，需要补充入口及相应权限检查。',
+    )).toMatchObject({
+      summary: '接单后的费用审批入口缺失，需要补充入口及相应权限检查。',
+    });
+  });
+
   it('keeps thinking levels from marker attributes when the assistant body has no prose fields', () => {
     const parsed = parseTaskPairNotification(
       '[IM.codes task tsk_attrs "Thinking attrs"]\n'

@@ -3221,11 +3221,18 @@ export function App() {
   }, [auth, selectedServerId, sharedHashRestorePending]);
 
   // ── Sub-sessions ───────────────────────────────────────────────────────────
+  const canonicalSharedSessionName = selectedShareTarget
+    ? (selectedShareTarget.kind === 'subsession'
+        ? `deck_sub_${selectedShareTarget.subSessionId}`
+        : selectedShareTarget.kind === 'main'
+          ? selectedShareTarget.sessionName
+          : (activeSession ?? undefined))
+    : undefined;
   const { subSessions, visibleSubSessions, loadedServerId, create: createSubSession, close: closeSubSession, restart: restartSubSession, rename: renameSubSession, updateLocal: updateSubLocal, hydrateShared: hydrateSharedSubSessions } = useSubSessions(
     (nativeReady && auth) ? selectedServerId : null,
     wsRef.current,
     connected,
-    activeSession,
+    activeSession || canonicalSharedSessionName || null,
     Boolean(selectedShareTarget),
   );
 
@@ -5987,7 +5994,7 @@ export function App() {
   const isTabShare = Boolean(selectedShareTarget && selectedShareTarget.kind !== 'server');
   const canCreateMainSession = !selectedShareTarget || isSharedServerParticipant;
   const canCreateSubSession = !selectedShareTarget
-    || (sharedAccessRole === 'participant' && selectedShareTarget.kind !== 'subsession');
+    || sharedAccessRole === 'participant';
 
   const resolveRepoProjectDir = useCallback((sessionId?: string | null) => {
     if (!sessionId) return activeSessionInfo?.projectDir ?? undefined;
@@ -6301,7 +6308,10 @@ export function App() {
     if (pinnedPanels.length > 0) { autoPinnedRef.current = true; return; } // user already has panels
     autoPinnedRef.current = true;
     pinPanel('filebrowser', { sessionName: activeSession, projectDir: activeSessionInfo.projectDir, serverId: selectedServerId });
-    const cronProject = sessions.find(s => s.name === activeSession)?.project;
+    const activeSub = subSessionsSlim.find((s) => s.sessionName === activeSession);
+    const activeMain = sessions.find((s) => s.name === activeSession);
+    const parentMain = activeSub ? sessions.find((s) => s.name === activeSub.parentSession) : null;
+    const cronProject = activeMain?.project ?? parentMain?.project ?? sessions[0]?.project;
     if (cronProject) {
       pinPanel('cronmanager', { sessionName: activeSession, projectName: cronProject, serverId: selectedServerId });
     }
@@ -6657,6 +6667,8 @@ export function App() {
                 activeSession,
                 activeProjectDir: activeSessionInfo?.projectDir,
                 sharedAccessRole,
+                shareTargetKind: selectedShareTarget?.kind ?? null,
+                sharedSessionName: canonicalSharedSessionName,
                 sessions,
                 servers: servers.map(s => ({ id: s.id, name: s.name })),
                 onQuote: (text) => {
@@ -7211,8 +7223,8 @@ export function App() {
                   ws={wsRef.current}
                   serverId={selectedServerId}
                   sessionName={activeSession ?? undefined}
-                  scopeToSessionRoot={!!activeSessionInfo.sharedState}
-                  readOnly={!!activeSessionInfo.sharedState && activeSessionInfo.sharedState.effectiveRole !== 'participant'}
+                  scopeToSessionRoot={isTabShare}
+                  readOnly={sharedAccessRole === 'viewer'}
                   mode="file-multi"
                   layout="panel"
                   initialPath={activeSessionInfo.projectDir ?? '~'}
@@ -7507,6 +7519,7 @@ export function App() {
                   activeSession,
                   activeProjectDir: activeSessionInfo?.projectDir,
                   sharedAccessRole,
+                  shareTargetKind: selectedShareTarget?.kind ?? null,
                   sessions,
                   servers: servers.map(s => ({ id: s.id, name: s.name })),
                   onQuote: (text) => {
@@ -7744,7 +7757,10 @@ export function App() {
       )}
 
       {showCronManager && selectedServerId && (() => {
-        const cronProject = sessions.find(s => s.name === activeSession)?.project;
+        const activeSub = subSessionsSlim.find((s) => s.sessionName === activeSession);
+        const activeMain = sessions.find((s) => s.name === activeSession);
+        const parentMain = activeSub ? sessions.find((s) => s.name === activeSub.parentSession) : null;
+        const cronProject = activeMain?.project ?? parentMain?.project ?? sessions[0]?.project ?? null;
         return cronProject ? (
           <FloatingPanel
             id="cron"
@@ -7765,7 +7781,7 @@ export function App() {
               sessions={sessions}
               subSessions={subSessionsSlim}
               activeSession={activeSession}
-              sharedSessionName={sharedAccessRole ? activeSession ?? undefined : undefined}
+              sharedSessionName={canonicalSharedSessionName}
               readOnly={sharedAccessRole === 'viewer'}
               onNavigateSession={(sessionName, quote) => {
                 setShowCronManager(false);
@@ -8226,15 +8242,27 @@ export function App() {
             setPoolAddTarget(null);
             const { launchCount, ...cleanExtra } = extra ?? {};
             const count = typeof launchCount === 'number' && launchCount > 1 ? launchCount : 1;
-            const passedExtra = Object.keys(cleanExtra).length > 0 ? cleanExtra : undefined;
+            const effectiveParent = (cleanExtra.parentSession as string | undefined)
+              ?? activeSession
+              ?? canonicalSharedSessionName
+              ?? undefined;
             // A single launch keeps the existing auto-generated label exactly as
             // before (create() derives it). A multi-launch pre-computes every
             // label up front instead of relying on create()'s own duplicate-label
             // suffixing, which reads subSessions from this closure and would see
             // the SAME stale list (and mint the SAME suffix) for every iteration.
-            const siblings = subSessions.filter((s) => s.parentSession === activeSession);
+            const siblings = subSessions.filter((s) => s.parentSession === (effectiveParent ?? null));
             const iterationLabels = computeAutoLaunchLabels(siblings, type, label, count);
-            for (const iterationLabel of iterationLabels) {
+            for (let i = 0; i < iterationLabels.length; i++) {
+              const iterationLabel = iterationLabels[i];
+              let iterationExtra = cleanExtra;
+              if (effectiveParent && iterationExtra.parentSession === undefined) {
+                iterationExtra = { ...iterationExtra, parentSession: effectiveParent };
+              }
+              if (count > 1 && typeof iterationExtra.ocSessionKey === 'string' && iterationExtra.ocSessionKey) {
+                iterationExtra = { ...iterationExtra, ocSessionKey: `${iterationExtra.ocSessionKey}-${i + 1}` };
+              }
+              const passedExtra = Object.keys(iterationExtra).length > 0 ? iterationExtra : undefined;
               const sub = await createSubSession(type, shellBin, cwd, iterationLabel, passedExtra);
               if (sub) {
                 setOpenSubIds((prev) => new Set([...prev, sub.id]));

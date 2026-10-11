@@ -97,6 +97,50 @@ describe('sub-session routes', () => {
     expect(mockCreateSubSession).toHaveBeenCalled();
   });
 
+  it('allows a share participant to create a child under a covered sub-session', async () => {
+    mockResolveServerMemberAccessOrShareDeny.mockResolvedValue({ ok: false, reason: 'share-direct-surface-denied' });
+    mockResolveHttpShareAccessForCoveredSession.mockResolvedValue({
+      membership: 'none',
+      actor: { kind: 'share', effectiveActorRole: 'participant' },
+    });
+    const app = await buildApp();
+    const res = await app.request('/api/server/srv-1/sub-sessions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ type: 'codex-sdk', parent_session: 'deck_sub_abc12345' }),
+    });
+
+    expect(res.status).toBe(201);
+    expect(mockResolveHttpShareAccessForCoveredSession).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      serverId: 'srv-1',
+      userId: 'user-1',
+      target: { kind: 'subsession', serverId: 'srv-1', subSessionId: 'abc12345' },
+    }));
+    expect(mockCreateSubSession).toHaveBeenCalled();
+  });
+
+  it('allows a whole-server participant to create a sub-session when parent_session is omitted', async () => {
+    mockResolveServerMemberAccessOrShareDeny.mockResolvedValue({ ok: false, reason: 'share-direct-surface-denied' });
+    mockResolveHttpShareAccess.mockResolvedValue({
+      membership: 'none',
+      actor: { kind: 'share', effectiveActorRole: 'participant' },
+    });
+    const app = await buildApp();
+    const res = await app.request('/api/server/srv-1/sub-sessions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ type: 'codex-sdk' }),
+    });
+
+    expect(res.status).toBe(201);
+    expect(mockResolveHttpShareAccess).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      serverId: 'srv-1',
+      userId: 'user-1',
+      target: { kind: 'server', serverId: 'srv-1' },
+    }));
+    expect(mockCreateSubSession).toHaveBeenCalled();
+  });
+
   it('denies a shared viewer creating a sub-session', async () => {
     mockResolveServerMemberAccessOrShareDeny.mockResolvedValue({ ok: false, reason: 'share-direct-surface-denied' });
     mockResolveHttpShareAccess.mockResolvedValue({

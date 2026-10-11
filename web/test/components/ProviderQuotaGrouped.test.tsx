@@ -48,6 +48,7 @@ vi.mock('../../src/api/usage-summary.js', () => ({
 import {
   isCompactProviderQuotaAgent,
   ProviderQuotaLine,
+  useProviderQuotaLabel,
 } from '../../src/components/ProviderQuotaLine.js';
 import { UsageFooter } from '../../src/components/UsageFooter.js';
 import {
@@ -195,5 +196,70 @@ describe('ProviderQuotaLine and UsageFooter grouped quota rendering', () => {
 
     const lineElements = container.querySelectorAll('.session-usage-codex-line-compact');
     expect(lineElements).toHaveLength(0);
+  });
+
+  it('omits decimals on mobile in useProviderQuotaLabel and UsageFooter for antigravity quota', () => {
+    const agyMetaWithDecimals: ProviderQuotaMeta = {
+      groups: [
+        {
+          id: PROVIDER_QUOTA_GROUP_ID.GEMINI,
+          label: PROVIDER_QUOTA_GROUP_LABEL.GEMINI,
+          primary: { usedPercent: 5.45, percentPrecision: 2, windowDurationMins: 300, resetsAt: geminiReset5hSec },
+          secondary: { usedPercent: 12.00, percentPrecision: 2, windowDurationMins: 10_080, resetsAt: geminiReset7dSec },
+        },
+      ],
+    };
+
+    function QuotaLabelProbe({ isMobile, meta, fallback }: { isMobile?: boolean; meta?: ProviderQuotaMeta; fallback?: string }) {
+      const label = useProviderQuotaLabel({ quotaLabel: fallback, quotaMeta: meta, now: fixedNowMs, isMobile });
+      return <div data-testid="quota-label-output">{label}</div>;
+    }
+
+    // 1. Desktop keeps 2 decimal places
+    const desktopRender = render(
+      <QuotaLabelProbe isMobile={false} meta={agyMetaWithDecimals} />,
+    );
+    expect(desktopRender.getByTestId('quota-label-output').textContent).toBe(
+      'Gemini 5h 5.45% 3h10m · 7d 12.00% 5d02h',
+    );
+    desktopRender.unmount();
+
+    // 2. Mobile omits decimal places
+    const mobileRender = render(
+      <QuotaLabelProbe isMobile={true} meta={agyMetaWithDecimals} />,
+    );
+    expect(mobileRender.getByTestId('quota-label-output').textContent).toBe(
+      'Gemini 5h 5% 3h10m · 7d 12% 5d02h',
+    );
+    mobileRender.unmount();
+
+    // 3. Fallback string with decimals also has decimals stripped on mobile
+    const fallbackMobileRender = render(
+      <QuotaLabelProbe isMobile={true} fallback="Gemini 5h 5.45% 3h10m · 7d 12.00% 5d02h" />,
+    );
+    expect(fallbackMobileRender.getByTestId('quota-label-output').textContent).toBe(
+      'Gemini 5h 5% 3h10m · 7d 12% 5d02h',
+    );
+    fallbackMobileRender.unmount();
+
+    // 4. UsageFooter with isMobile={true} renders quota without decimals
+    const footerMobile = render(
+      <UsageFooter
+        usage={{
+          inputTokens: 1000,
+          cacheTokens: 500,
+          contextWindow: 1_000_000,
+          model: 'gemini-2.5-pro',
+        }}
+        sessionName="deck_test_agy_mobile"
+        agentType={AGY_SDK_PROVIDER_ID}
+        quotaMeta={agyMetaWithDecimals}
+        now={fixedNowMs}
+        isMobile={true}
+      />,
+    );
+    const lineElement = footerMobile.container.querySelector('.session-usage-codex-line-compact');
+    expect(lineElement?.textContent).toBe('Gemini 5h 5% 3h10m · 7d 12% 5d02h');
+    footerMobile.unmount();
   });
 });

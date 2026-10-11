@@ -3,11 +3,12 @@ import type { Context, Next } from 'hono';
 import { Cron } from 'croner';
 import { z } from 'zod';
 import type { Env } from '../env.js';
+import type { Database } from '../db/client.js';
 import type { DbCronJob } from '../db/queries.js';
 import { requireAuth } from '../security/authorization.js';
 import { resolveHttpShareAccessForCoveredSession, resolveServerMemberAccessOrShareDeny } from './share-http-auth.js';
-import { shareTargetFromSessionName } from '../db/tab-sharing.js';
-import { getSubSessionById, getSubSessionsByServer, isExecutionCloneRow } from '../db/queries.js';
+import { listActiveSharesForUser, shareTargetFromSessionName, shareTargetSessionName } from '../db/tab-sharing.js';
+import { getSubSessionById, isExecutionCloneRow } from '../db/queries.js';
 import { randomHex } from '../security/crypto.js';
 import { logAudit } from '../security/audit.js';
 import {
@@ -222,8 +223,6 @@ type CronScope = {
   shared: boolean;
   sharedSessionName: string | null;
   sharedTargetKind: 'server' | 'main' | 'subsession' | null;
-  sharedMainRole: string | null;
-  sharedTargetSessionNames: string[] | null;
 };
 
 async function resolveCronScope(
@@ -243,39 +242,60 @@ async function resolveCronScope(
         shared: false,
         sharedSessionName: null,
         sharedTargetKind: null,
-        sharedMainRole: null,
-        sharedTargetSessionNames: null,
       },
     };
   }
 
-  const sessionName = (c.req.query('sessionName') ?? '').trim();
-  const target = shareTargetFromSessionName(params.serverId, sessionName);
+  let sessionName = (c.req.query('sessionName') ?? '').trim();
+  let target = shareTargetFromSessionName(params.serverId, sessionName);
+  if (!target) {
+    const userShares = await listActiveSharesForUser(c.env.DB, params.userId, Date.now()).catch(() => []);
+    const serverShare = userShares.find((s) => s.serverId === params.serverId);
+    if (serverShare) {
+      target = serverShare.target;
+      sessionName = shareTargetSessionName(serverShare.target) ?? '';
+    }
+  }
   if (!target) return { ok: false, reason: member.reason };
-  const access = await resolveHttpShareAccessForCoveredSession(c.env.DB, {
+  let access = await resolveHttpShareAccessForCoveredSession(c.env.DB, {
     serverId: params.serverId,
     userId: params.userId,
     target,
   });
+
+  if (access.actor.kind !== 'share' && target.kind === 'main') {
+    const userShares = await listActiveSharesForUser(c.env.DB, params.userId, Date.now()).catch(() => []);
+    for (const share of userShares) {
+      if (share.serverId !== params.serverId || share.target.kind !== 'subsession') continue;
+      const child = await getSubSessionById(c.env.DB, share.target.subSessionId, params.serverId);
+      if (child && child.closed_at === null && child.parent_session === target.sessionName) {
+        const subAccess = await resolveHttpShareAccessForCoveredSession(c.env.DB, {
+          serverId: params.serverId,
+          userId: params.userId,
+          target: share.target,
+        });
+        if (subAccess.actor.kind === 'share') {
+          access = subAccess;
+          target = share.target;
+          sessionName = shareTargetSessionName(share.target) ?? sessionName;
+          break;
+        }
+      }
+    }
+  }
+
   if (access.actor.kind !== 'share') return { ok: false, reason: member.reason };
   if (params.mode === 'write' && access.actor.effectiveActorRole !== 'participant') {
     return { ok: false, reason: 'share-role-denied' };
   }
 
   let projectName: string | null = null;
-  let sharedMainRole: string | null = null;
-  let sharedTargetSessionNames: string[] | null = null;
   if (target.kind === 'main') {
     const row = await c.env.DB.queryOne<{ project_name: string; role: string }>(
       'SELECT project_name, role FROM sessions WHERE server_id = $1 AND name = $2 LIMIT 1',
       [params.serverId, target.sessionName],
     );
     projectName = row?.project_name ?? null;
-    sharedMainRole = row?.role ?? null;
-    const children = await getSubSessionsByServer(c.env.DB, params.serverId);
-    sharedTargetSessionNames = children
-      .filter((child) => child.parent_session === target.sessionName)
-      .map((child) => `deck_sub_${child.id}`);
   } else if (target.kind === 'subsession') {
     const row = await getSubSessionById(c.env.DB, target.subSessionId, params.serverId);
     if (row?.parent_session) {
@@ -285,7 +305,6 @@ async function resolveCronScope(
       );
       projectName = parent?.project_name ?? null;
     }
-    sharedTargetSessionNames = [sessionName];
   }
   const server = await c.env.DB.queryOne<{ user_id: string }>(
     'SELECT user_id FROM servers WHERE id = $1',
@@ -300,8 +319,6 @@ async function resolveCronScope(
       shared: true,
       sharedSessionName: sessionName,
       sharedTargetKind: target.kind,
-      sharedMainRole,
-      sharedTargetSessionNames,
     },
   };
 }
@@ -369,6 +386,35 @@ function cronPayloadRoleRefs(payload: {
   return [...refs];
 }
 
+async function sessionBelongsToProject(
+  db: Database,
+  serverId: string,
+  sessionName: string,
+  projectName: string,
+): Promise<boolean> {
+  const target = shareTargetFromSessionName(serverId, sessionName);
+  if (!target) return false;
+  if (target.kind === 'subsession') {
+    const child = await getSubSessionById(db, target.subSessionId, serverId);
+    if (!child || child.closed_at !== null || isExecutionCloneRow(child) || !child.parent_session) {
+      return false;
+    }
+    const parent = await db.queryOne<{ project_name: string }>(
+      'SELECT project_name FROM sessions WHERE server_id = $1 AND name = $2 LIMIT 1',
+      [serverId, child.parent_session],
+    );
+    return parent?.project_name === projectName;
+  }
+  if (target.kind === 'main') {
+    const row = await db.queryOne<{ project_name: string }>(
+      'SELECT project_name FROM sessions WHERE server_id = $1 AND name = $2 LIMIT 1',
+      [serverId, target.sessionName],
+    );
+    return row?.project_name === projectName;
+  }
+  return false;
+}
+
 async function cronScopeCoversPayload(
   c: Context<CronRouteEnv>,
   serverId: string,
@@ -376,40 +422,43 @@ async function cronScopeCoversPayload(
   payload: { targetRole?: string | null; targetSessionName?: string | null; action?: z.infer<typeof cronActionSchema> },
 ): Promise<boolean> {
   if (!scope.shared || scope.sharedTargetKind === 'server') return true;
+  if (!scope.projectName) return false;
   if (!payload.action) return false;
-  const refs = cronPayloadSessionRefs(payload);
-  const roleRefs = cronPayloadRoleRefs(payload);
-  if (scope.sharedTargetKind === 'subsession') {
-    return payload.targetSessionName === scope.sharedSessionName
-      && refs.every((name) => name === scope.sharedSessionName)
-      && roleRefs.length === 0;
-  }
+
   if (payload.targetSessionName) {
-    if (!scope.sharedTargetSessionNames?.includes(payload.targetSessionName)) return false;
-  } else if (!scope.sharedMainRole || payload.targetRole !== scope.sharedMainRole) {
-    return false;
+    if (!await sessionBelongsToProject(c.env.DB, serverId, payload.targetSessionName, scope.projectName)) {
+      return false;
+    }
+  } else if (payload.targetRole) {
+    if (!rolePattern.test(payload.targetRole)) return false;
   }
-  if (roleRefs.some((role) => role !== scope.sharedMainRole)) return false;
-  for (const name of refs) {
-    if (name === scope.sharedSessionName) continue;
-    const target = shareTargetFromSessionName(serverId, name);
-    if (!target || target.kind !== 'subsession') return false;
-    const child = await getSubSessionById(c.env.DB, target.subSessionId, serverId);
-    if (!child || child.closed_at !== null || isExecutionCloneRow(child) || child.parent_session !== scope.sharedSessionName) {
+
+  const roleRefs = cronPayloadRoleRefs(payload);
+  for (const role of roleRefs) {
+    if (!rolePattern.test(role)) return false;
+  }
+
+  const sessionRefs = cronPayloadSessionRefs(payload);
+  for (const name of sessionRefs) {
+    if (!await sessionBelongsToProject(c.env.DB, serverId, name, scope.projectName)) {
       return false;
     }
   }
+
   return true;
 }
 
 async function filterCronRowsForSharedScope<T extends {
   server_id: string;
+  project_name?: string | null;
   target_role: string;
   target_session_name: string | null;
   action: string;
 }>(c: Context<CronRouteEnv>, scope: CronScope, rows: T[]): Promise<T[]> {
   if (!scope.shared) return rows;
+  if (!scope.projectName) return [];
   const checks = await Promise.all(rows.map(async (row) => {
+    if (row.project_name !== scope.projectName) return false;
     let action: z.infer<typeof cronActionSchema> | undefined;
     try {
       const parsed = cronActionSchema.safeParse(JSON.parse(row.action));
@@ -511,23 +560,18 @@ cronApiRoutes.get('/', requireCronAuth(), async (c) => {
 
   const access = serverId
     ? await resolveCronScope(c, { serverId, userId, requestedProjectName: projectName, mode: 'read' })
-    : { ok: true as const, scope: { ownerUserId: userId, projectName, shared: false, sharedSessionName: null, sharedTargetKind: null, sharedMainRole: null, sharedTargetSessionNames: null } };
+    : { ok: true as const, scope: { ownerUserId: userId, projectName, shared: false, sharedSessionName: null, sharedTargetKind: null } };
   if (!access.ok) return c.json({ error: 'forbidden', reason: access.reason }, 403);
 
   const jobs = await c.env.DB.query<DbCronJob>(
     `SELECT * FROM cron_jobs WHERE user_id = $1
        AND ($2::text IS NULL OR server_id = $2)
        AND ($3::text IS NULL OR project_name = $3)
-       AND ($4::text[] IS NULL
-         OR target_session_name = ANY($4::text[])
-         OR ($5::text IS NOT NULL AND target_session_name IS NULL AND target_role = $5))
      ORDER BY created_at DESC`,
     [
       access.scope.ownerUserId,
       serverId,
       access.scope.projectName,
-      access.scope.sharedTargetSessionNames,
-      access.scope.sharedMainRole,
     ],
   );
   return c.json({ jobs: await filterCronRowsForSharedScope(c, access.scope, jobs) });
@@ -863,7 +907,7 @@ cronApiRoutes.get('/executions', requireCronAuth(), async (c) => {
   const limit = Math.min(Math.max(1, limitParam), 200);
   const access = serverId
     ? await resolveCronScope(c, { serverId, userId, requestedProjectName, mode: 'read' })
-    : { ok: true as const, scope: { ownerUserId: userId, projectName: requestedProjectName, shared: false, sharedSessionName: null, sharedTargetKind: null, sharedMainRole: null, sharedTargetSessionNames: null } };
+    : { ok: true as const, scope: { ownerUserId: userId, projectName: requestedProjectName, shared: false, sharedSessionName: null, sharedTargetKind: null } };
   if (!access.ok) return c.json({ error: 'forbidden', reason: access.reason }, 403);
 
   if (mode === 'latest') {
@@ -877,11 +921,8 @@ cronApiRoutes.get('/executions', requireCronAuth(), async (c) => {
        WHERE j.user_id = $1
          AND ($2::text IS NULL OR j.server_id = $2)
          AND ($3::text IS NULL OR j.project_name = $3)
-         AND ($4::text[] IS NULL
-           OR j.target_session_name = ANY($4::text[])
-           OR ($5::text IS NOT NULL AND j.target_session_name IS NULL AND j.target_role = $5))
        ORDER BY j.id, e.created_at DESC`,
-      [access.scope.ownerUserId, serverId, access.scope.projectName, access.scope.sharedTargetSessionNames, access.scope.sharedMainRole],
+      [access.scope.ownerUserId, serverId, access.scope.projectName],
     );
     const visibleRows = await filterCronRowsForSharedScope(c, access.scope, rows as Array<DbCronJob & Record<string, unknown>>);
     return c.json({ executions: normalizeCronExecutionRows(visibleRows) });
@@ -896,12 +937,9 @@ cronApiRoutes.get('/executions', requireCronAuth(), async (c) => {
      WHERE j.user_id = $1
        AND ($2::text IS NULL OR j.server_id = $2)
        AND ($3::text IS NULL OR j.project_name = $3)
-       AND ($4::text[] IS NULL
-         OR j.target_session_name = ANY($4::text[])
-         OR ($5::text IS NOT NULL AND j.target_session_name IS NULL AND j.target_role = $5))
      ORDER BY e.created_at DESC
-     LIMIT $6`,
-    [access.scope.ownerUserId, serverId, access.scope.projectName, access.scope.sharedTargetSessionNames, access.scope.sharedMainRole, limit],
+     LIMIT $4`,
+    [access.scope.ownerUserId, serverId, access.scope.projectName, limit],
   );
   const visibleRows = await filterCronRowsForSharedScope(c, access.scope, rows as Array<DbCronJob & Record<string, unknown>>);
   return c.json({ executions: normalizeCronExecutionRows(visibleRows) });

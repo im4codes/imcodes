@@ -118,14 +118,16 @@ function inferStatus(verb: TaskPairVerb, status: TaskPairStatus | undefined): Ta
   }
 }
 
-const DETAIL_FIELD_RE = /^\s*(?:[-*]\s*)?(?:\*\*|__)?(?<label>invariant|violat(?:es|ed|ion)|violation\s+of\s+invariant|invariant\s+violated|违反不变量|不变量|location|位置|file(?:\s*\/\s*function)?|function|evidence(?:\s*\/\s*repro(?:duction)?)?|证据|repro(?:duction)?|复现|proposal|recommendation|auditor\s+proposal|suggest(?:ed)? solution|suggested fix|fix|建议(?:方案)?|trade[- ]?offs?|权衡|validation(?:\s+summary)?|验证(?:摘要)?|tests?|suite|next step|next steps|下一步|reason|why|原因)(?:\*\*|__)?\s*[:：]\s*(?:\*\*|__)?(?<value>.*)$/iu;
-const FINDING_RE = /^\s*(?:[-*]\s*)?(?:finding\s*)?\[\s*(P[0-4])\s*\]\s*(.*)$/iu;
-const FINDING_WORD_RE = /^\s*(?:[-*]\s*)?(?:finding|发现)\s*[:：]?\s*(.*)$/iu;
-const SUMMARY_RE = /^\s*(?:summary|audit summary|摘要|审计摘要)\s*[:：]\s*(.*)$/iu;
+const DETAIL_FIELD_RE = /^\s*(?:[-*•]\s*)?(?:\*\*|__)?(?<label>invariant|violat(?:es|ed|ion)|violation\s+of\s+invariant|invariant\s+violated|违反不变量|不变量|location|位置|file(?:\s*\/\s*function)?|function|evidence(?:\s*\/\s*repro(?:duction)?)?|证据|repro(?:duction)?|复现|proposal|recommendation|auditor\s+proposal|suggest(?:ed)?\s+(?:solution|fix)|solution|fix|建议(?:方案)?|建议|trade[- ]?offs?|权衡|validation(?:\s+summary)?|验证(?:摘要)?|tests?|suite|next step|next steps|下一步|reason|why|原因|返工原因|未通过原因|主要问题|审计意见|返工意见|审查意见)(?:\*\*|__)?\s*[:：]\s*(?:\*\*|__)?(?<value>.*)$/iu;
+const FINDING_RE = /^\s*(?:[-*•]\s*)?(?:.*?(?:REWORK|PASS|finding|发现|问题|audit|审计|第[0-9一二三四五六七八九十]+轮.*?)\s*[:：]\s*)?(?:\*\*|__)?(?:finding\s*)?\[\s*(P[0-4])\s*\](?:\*\*|__)?\s*[:：]?\s*(.*)$/iu;
+const BARE_FINDING_RE = /^\s*(?:[-*•]\s*)?(?:\*\*|__)?\b(P[0-4])\b(?:\*\*|__)?\s*[:：-]\s*(.*)$/iu;
+const FINDING_WORD_RE = /^\s*(?:[-*•]\s*)?(?:finding|发现|问题|主要问题)\s*[:：]?\s*(.*)$/iu;
+const SUMMARY_RE = /^\s*(?:[-*•]\s*)?(?:\*\*|__)?(?:summary|audit summary|摘要|审计摘要|总体评价|评估|结论)(?:\*\*|__)?\s*[:：]\s*(.*)$/iu;
+const METADATA_LINE_RE = /^\s*(?:\[IM\.codes task\b|<!--|\s*Audited\s+pair\b|\b(?:status|round|executor|auditor|verdict|blocking)\s*[:=])/iu;
 
 function cleanDetailText(value: unknown, max = 2000): string | undefined {
   if (typeof value !== 'string') return undefined;
-  const text = value.replace(/\s+/gu, ' ').trim();
+  const text = value.replace(/\*\*/gu, '').replace(/__/gu, '').replace(/\s+/gu, ' ').trim();
   return text ? text.slice(0, max) : undefined;
 }
 
@@ -154,10 +156,14 @@ export function parseTaskPairAuditDetails(text: unknown): TaskPairAuditDetails |
   const validation: string[] = [];
   const nextSteps: string[] = [];
   const reasons: string[] = [];
+  const unlabelledProse: string[] = [];
   for (const rawLine of lines) {
     const line = rawLine.trim();
-    if (!line) continue;
-    const findingMatch = line.match(FINDING_RE);
+    if (!line) {
+      currentField = undefined;
+      continue;
+    }
+    const findingMatch = line.match(FINDING_RE) || line.match(BARE_FINDING_RE);
     const findingWord = line.match(FINDING_WORD_RE);
     if (findingMatch || findingWord) {
       current = { ...(findingMatch?.[1] ? { severity: findingMatch[1].toUpperCase() } : {}) };
@@ -184,13 +190,23 @@ export function parseTaskPairAuditDetails(text: unknown): TaskPairAuditDetails |
       if (current && /trade|权衡/iu.test(label)) { setFindingField(current, 'tradeoffs', value); currentField = 'tradeoffs'; continue; }
       if (/validation|验证|tests?|suite/iu.test(label)) validation.push(value);
       else if (/next step|下一步/iu.test(label)) nextSteps.push(value);
-      else if (/reason|why|原因/iu.test(label)) reasons.push(value);
+      else if (/reason|why|原因|返工原因|未通过原因|主要问题|审计意见|返工意见|审查意见/iu.test(label)) reasons.push(value);
       continue;
     }
     if (current && currentField && currentField !== 'severity') {
       const continuation = cleanDetailText(line);
-      if (continuation && currentField !== 'summary') current[currentField] = `${current[currentField] ?? ''} ${continuation}`.trim().slice(0, 2000);
+      if (continuation) {
+        current[currentField] = `${current[currentField] ?? ''} ${continuation}`.trim().slice(0, 2000);
+      }
+      continue;
     }
+    if (!METADATA_LINE_RE.test(line) && !line.startsWith('```')) {
+      const prose = cleanDetailText(line);
+      if (prose) unlabelledProse.push(prose);
+    }
+  }
+  if (!summary && unlabelledProse.length > 0) {
+    summary = cleanDetailText(unlabelledProse.join(' '), 3000);
   }
   const result: TaskPairAuditDetails = {
     ...(findings.length ? { findings: findings.slice(0, 20) } : {}),

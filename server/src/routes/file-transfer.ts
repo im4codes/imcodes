@@ -6,7 +6,7 @@ import { AUTH_ERROR_CODES } from '../../../shared/auth-error-codes.js';
 import { Hono, type Context } from 'hono';
 import type { Env } from '../env.js';
 import { requireAuth } from '../security/authorization.js';
-import { resolveHttpShareAccessForCoveredSession, resolveServerMemberAccessOrShareDeny } from './share-http-auth.js';
+import { resolveHttpShareAccess, resolveHttpShareAccessForCoveredSession, resolveServerMemberAccessOrShareDeny } from './share-http-auth.js';
 import { shareTargetFromSessionName } from '../db/tab-sharing.js';
 import { WsBridge } from '../ws/bridge.js';
 import { randomHex } from '../security/crypto.js';
@@ -865,6 +865,19 @@ async function authorizeSessionFileAccess(
     ?? c.req.query('sessionName')
     ?? ''
   ).trim();
+
+  const serverAccess = await resolveHttpShareAccess(c.env.DB, {
+    serverId,
+    userId,
+    target: { kind: 'server', serverId },
+  });
+  if (serverAccess.actor.kind === 'share') {
+    if (mode === 'write' && serverAccess.actor.effectiveActorRole !== 'participant') {
+      return { ok: false, reason: 'share-role-denied' };
+    }
+    return { ok: true, sessionName: sessionName || undefined };
+  }
+
   const target = shareTargetFromSessionName(serverId, sessionName);
   if (!target) return { ok: false, reason: member.reason };
 

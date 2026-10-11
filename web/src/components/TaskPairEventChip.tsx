@@ -138,7 +138,15 @@ export function TaskPairEventChip({ eventId, payload, timestamp, sessions }: { e
   const noticeText = typeof (event as Record<string, unknown>).noticeText === 'string'
     ? (event as Record<string, unknown>).noticeText as string
     : '';
-  const parsedAuditDetails = normalizeTaskPairAuditDetails(event) ?? parseTaskPairAuditDetails(noticeText);
+  const fromEvent = normalizeTaskPairAuditDetails(event);
+  const fromNotice = parseTaskPairAuditDetails(noticeText);
+  const parsedAuditDetails = fromEvent && fromNotice ? {
+    findings: fromEvent.findings?.length ? fromEvent.findings : fromNotice.findings,
+    summary: fromEvent.summary ?? fromNotice.summary,
+    validation: fromEvent.validation ?? fromNotice.validation,
+    reason: fromEvent.reason ?? fromNotice.reason,
+    nextStep: fromEvent.nextStep ?? fromNotice.nextStep,
+  } : (fromEvent ?? fromNotice);
   const blockedNote = typeof event.blockedNote === 'string' ? event.blockedNote.trim() : '';
   const auditDetails = parsedAuditDetails || blockedNote
     ? {
@@ -262,27 +270,31 @@ export function TaskPairEventChip({ eventId, payload, timestamp, sessions }: { e
       </div>
     </div>, document.body);
   };
-  const renderAuditDetails = () => <section class="task-pair-card-audit-details" aria-label={t('taskPair.card_audit_details')}>
-    <h4>{t('taskPair.card_audit_details')}</h4>
-    {findings.length > 0 ? findings.map((finding, index) => <article class="task-pair-card-finding" key={`${index}-${finding.severity ?? ''}`}>
-      <div class="task-pair-card-finding-head">
-        <strong>{t('taskPair.card_finding', { index: index + 1 })}</strong>
-        {finding.severity && <span class="task-pair-card-finding-severity">{safeDetailText(finding.severity)}</span>}
-      </div>
-      {finding.summary && <p class="task-pair-card-finding-summary">{safeDetailText(finding.summary)}</p>}
-      {finding.invariant && <p><b>{t('taskPair.card_invariant')}:</b> {safeDetailText(finding.invariant)}</p>}
-      {finding.location && <p><b>{t('taskPair.card_location')}:</b> {safeDetailText(finding.location)}</p>}
-      {finding.evidence && <p><b>{t('taskPair.card_evidence')}:</b> {safeDetailText(finding.evidence)}</p>}
-      {finding.proposal && <p><b>{t('taskPair.card_proposal')}:</b> {safeDetailText(finding.proposal)}</p>}
-      {finding.tradeoffs && <p><b>{t('taskPair.card_tradeoffs')}:</b> {safeDetailText(finding.tradeoffs)}</p>}
-    </article>) : null}
-    {auditDetails?.summary && <p class="task-pair-card-detail-line"><b>{t('taskPair.card_summary')}:</b> {safeDetailText(auditDetails.summary)}</p>}
-    {auditDetails?.validation && <p class="task-pair-card-detail-line"><b>{t('taskPair.card_validation')}:</b> {safeDetailText(auditDetails.validation)}</p>}
-    {auditDetails?.reason && <p class="task-pair-card-detail-line"><b>{t('taskPair.card_reason')}:</b> {safeDetailText(auditDetails.reason)}</p>}
-    {auditDetails?.nextStep && <p class="task-pair-card-detail-line"><b>{t('taskPair.card_next_step')}:</b> {safeDetailText(auditDetails.nextStep)}</p>}
-    {noBlockingFindings && <p class="task-pair-card-detail-line">{t('taskPair.card_no_blocking')}</p>}
-    {!hasAuditDetails && !noBlockingFindings && <p class="task-pair-card-details-unavailable">{t('taskPair.card_details_unavailable')}</p>}
-  </section>;
+  const isVerdictEvent = event.verb === 'PASS' || event.verb === 'REWORK';
+  const renderAuditDetails = () => {
+    if (!hasAuditDetails && !noBlockingFindings && !isVerdictEvent) return null;
+    return <section class="task-pair-card-audit-details" aria-label={t('taskPair.card_audit_details')}>
+      <h4>{t('taskPair.card_audit_details')}</h4>
+      {findings.length > 0 ? findings.map((finding, index) => <article class="task-pair-card-finding" key={`${index}-${finding.severity ?? ''}`}>
+        <div class="task-pair-card-finding-head">
+          <strong>{t('taskPair.card_finding', { index: index + 1 })}</strong>
+          {finding.severity && <span class="task-pair-card-finding-severity">{safeDetailText(finding.severity)}</span>}
+        </div>
+        {finding.summary && <p class="task-pair-card-finding-summary">{safeDetailText(finding.summary)}</p>}
+        {finding.invariant && <p><b>{t('taskPair.card_invariant')}:</b> {safeDetailText(finding.invariant)}</p>}
+        {finding.location && <p><b>{t('taskPair.card_location')}:</b> {safeDetailText(finding.location)}</p>}
+        {finding.evidence && <p><b>{t('taskPair.card_evidence')}:</b> {safeDetailText(finding.evidence)}</p>}
+        {finding.proposal && <p><b>{t('taskPair.card_proposal')}:</b> {safeDetailText(finding.proposal)}</p>}
+        {finding.tradeoffs && <p><b>{t('taskPair.card_tradeoffs')}:</b> {safeDetailText(finding.tradeoffs)}</p>}
+      </article>) : null}
+      {auditDetails?.summary && <p class="task-pair-card-detail-line"><b>{t('taskPair.card_summary')}:</b> {safeDetailText(auditDetails.summary)}</p>}
+      {auditDetails?.validation && <p class="task-pair-card-detail-line"><b>{t('taskPair.card_validation')}:</b> {safeDetailText(auditDetails.validation)}</p>}
+      {auditDetails?.reason && <p class="task-pair-card-detail-line"><b>{t('taskPair.card_reason')}:</b> {safeDetailText(auditDetails.reason)}</p>}
+      {auditDetails?.nextStep && <p class="task-pair-card-detail-line"><b>{t('taskPair.card_next_step')}:</b> {safeDetailText(auditDetails.nextStep)}</p>}
+      {noBlockingFindings && <p class="task-pair-card-detail-line">{t('taskPair.card_no_blocking')}</p>}
+      {!hasAuditDetails && !noBlockingFindings && isVerdictEvent && <p class="task-pair-card-details-unavailable">{t('taskPair.card_details_unavailable')}</p>}
+    </section>;
+  };
   return (
     <section
       ref={cardRef}

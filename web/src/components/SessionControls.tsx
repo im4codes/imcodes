@@ -5740,7 +5740,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
             ws={ws}
             serverId={serverId}
             sessionName={activeSession.name}
-            scopeToSessionRoot={isShareScopedSession}
+            scopeToSessionRoot={isShareScopedSession && sharedState?.targetKind !== 'server'}
             readOnly={isShareScopedSession && !canSharedSessionSend}
             mode="file-multi"
           layout="panel"
@@ -5772,7 +5772,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
             ws={ws}
             serverId={serverId}
             sessionName={activeSession.name}
-            scopeToSessionRoot={isShareScopedSession}
+            scopeToSessionRoot={isShareScopedSession && sharedState?.targetKind !== 'server'}
             readOnly={isShareScopedSession && !canSharedSessionSend}
             mode="file-multi"
             layout="panel"

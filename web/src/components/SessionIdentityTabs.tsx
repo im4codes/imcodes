@@ -48,6 +48,9 @@ export function SessionIdentityTabs({
   const [drafts, setDrafts] = useState<Record<SessionIdentityScope, Draft>>({
     user: emptyDraft(), project: emptyDraft(), session: emptyDraft(),
   });
+  const [resolvedScopeKeys, setResolvedScopeKeys] = useState<Record<SessionIdentityScope, string>>({
+    user: '', project: '', session: '',
+  });
   const [showBrowser, setShowBrowser] = useState(false);
   const [saving, setSaving] = useState(false);
   const [refreshPending, setRefreshPending] = useState(false);
@@ -60,24 +63,39 @@ export function SessionIdentityTabs({
   }), [projectKey, serverId, sessionName]);
   const accessContext = useMemo(() => (sessionName ? { serverId, sessionName } : { serverId }), [serverId, sessionName]);
 
+  const effectiveScopeKey = (scope: SessionIdentityScope) => resolvedScopeKeys[scope] || scopeKey[scope];
+
   useEffect(() => {
     let live = true;
     void Promise.all(SESSION_IDENTITY_SCOPE_LIST.map(async (scope) => {
       const key = scopeKey[scope];
-      if ((scope !== SESSION_IDENTITY_SCOPES.USER && !key) || (scope === SESSION_IDENTITY_SCOPES.SESSION && !sessionName)) {
+      const shouldSkipFetch = (scope === SESSION_IDENTITY_SCOPES.SESSION && !sessionName)
+        || (scope === SESSION_IDENTITY_SCOPES.PROJECT && !key && !sessionName);
+      if (shouldSkipFetch) {
         return [scope, {
           content: scope === SESSION_IDENTITY_SCOPES.SESSION ? pendingSessionIdentity ?? '' : '',
           initial: '', revision: 0, sourceFile: '', loaded: true,
-        }] as const;
+        }, ''] as const;
       }
       const profile = await fetchSessionIdentityProfileDirectFirst(scope, key, accessContext, ws);
       return [scope, {
         content: profile?.content ?? '', initial: profile?.content ?? '', revision: profile?.revision ?? 0,
         sourceFile: profile?.sourceFile ?? '', loaded: true,
-      }] as const;
+      }, profile?.scopeKey ?? ''] as const;
     })).then((entries) => {
       if (!live) return;
-      setDrafts(Object.fromEntries(entries) as Record<SessionIdentityScope, Draft>);
+      const nextDrafts: Record<SessionIdentityScope, Draft> = {
+        user: emptyDraft(), project: emptyDraft(), session: emptyDraft(),
+      };
+      const nextKeys: Record<SessionIdentityScope, string> = {
+        user: '', project: '', session: '',
+      };
+      for (const [scope, draft, resolvedKey] of entries) {
+        nextDrafts[scope] = draft;
+        if (resolvedKey) nextKeys[scope] = resolvedKey;
+      }
+      setDrafts(nextDrafts);
+      setResolvedScopeKeys((prev) => ({ ...prev, ...nextKeys }));
       setError('');
     }).catch((reason) => {
       // eslint-disable-next-line no-console
@@ -89,7 +107,10 @@ export function SessionIdentityTabs({
 
   const draft = drafts[activeScope];
   const validationError = draft.content.trim() ? sessionIdentityContentError(draft.content, activeScope) : null;
-  const canPersist = activeScope === SESSION_IDENTITY_SCOPES.USER || Boolean(scopeKey[activeScope]);
+  const currentKey = effectiveScopeKey(activeScope);
+  const canPersist = activeScope === SESSION_IDENTITY_SCOPES.USER
+    || Boolean(currentKey)
+    || (activeScope === SESSION_IDENTITY_SCOPES.PROJECT && Boolean(sessionName));
 
   const updateDraft = (next: Partial<Draft>) => {
     setDrafts((current) => ({ ...current, [activeScope]: { ...current[activeScope], ...next } }));
@@ -106,15 +127,19 @@ export function SessionIdentityTabs({
       const content = draft.content.trim() ? normalizeSessionIdentityContent(draft.content) : '';
       let profile: SessionIdentityProfile | null = null;
       const contentChanged = content !== draft.initial;
+      const keyToSave = effectiveScopeKey(activeScope);
       if (content && contentChanged) {
         profile = await saveSessionIdentityProfileDirectFirst({
           scope: activeScope,
-          scopeKey: scopeKey[activeScope],
+          scopeKey: keyToSave,
           content,
           ...(draft.sourceFile ? { sourceFile: draft.sourceFile } : {}),
         }, accessContext, ws);
       } else if (!content && contentChanged && draft.revision > 0) {
-        await clearSessionIdentityProfileDirectFirst(activeScope, scopeKey[activeScope], accessContext);
+        await clearSessionIdentityProfileDirectFirst(activeScope, keyToSave, accessContext);
+      }
+      if (profile?.scopeKey) {
+        setResolvedScopeKeys((prev) => ({ ...prev, [activeScope]: profile.scopeKey }));
       }
       if (contentChanged) {
         setDrafts((current) => ({

@@ -20,12 +20,13 @@ import {
   MACHINE_DIRECT_FILE_TRANSFER_MSG,
 } from '../../shared/machine-direct-file-transfer.js';
 
-const { sendFileTransferRequestMock, isDaemonConnectedMock, hasDaemonCapabilityMock, daemonConnectionGenerationMock, mockResolveServerMemberAccessOrShareDeny, mockResolveHttpShareAccessForCoveredSession, queryOneMock, executeMock } = vi.hoisted(() => ({
+const { sendFileTransferRequestMock, isDaemonConnectedMock, hasDaemonCapabilityMock, daemonConnectionGenerationMock, mockResolveServerMemberAccessOrShareDeny, mockResolveHttpShareAccess, mockResolveHttpShareAccessForCoveredSession, queryOneMock, executeMock } = vi.hoisted(() => ({
   sendFileTransferRequestMock: vi.fn(),
   isDaemonConnectedMock: vi.fn(),
   hasDaemonCapabilityMock: vi.fn(),
   daemonConnectionGenerationMock: vi.fn(),
   mockResolveServerMemberAccessOrShareDeny: vi.fn(),
+  mockResolveHttpShareAccess: vi.fn(),
   mockResolveHttpShareAccessForCoveredSession: vi.fn(),
   queryOneMock: vi.fn(),
   executeMock: vi.fn(async () => ({ changes: 1 })),
@@ -62,6 +63,7 @@ vi.mock('../src/ws/bridge.js', () => ({
 
 vi.mock('../src/routes/share-http-auth.js', () => ({
   resolveServerMemberAccessOrShareDeny: (...args: unknown[]) => mockResolveServerMemberAccessOrShareDeny(...args),
+  resolveHttpShareAccess: (...args: unknown[]) => mockResolveHttpShareAccess(...args),
   resolveHttpShareAccessForCoveredSession: (...args: unknown[]) => mockResolveHttpShareAccessForCoveredSession(...args),
 }));
 
@@ -113,6 +115,7 @@ describe('file-transfer upload route', () => {
     isDaemonConnectedMock.mockReturnValue(true);
     hasDaemonCapabilityMock.mockReturnValue(true);
     mockResolveServerMemberAccessOrShareDeny.mockResolvedValue({ ok: true, role: 'owner' });
+    mockResolveHttpShareAccess.mockReset().mockResolvedValue({ membership: 'none', actor: { kind: 'none' } });
     mockResolveHttpShareAccessForCoveredSession.mockReset();
     queryOneMock.mockReset();
     executeMock.mockClear();
@@ -733,6 +736,56 @@ describe('file-transfer upload route', () => {
       serverId: 'srv-1',
       userId: 'user-1',
       target: { kind: 'main', serverId: 'srv-1', sessionName: 'deck_project_brain' },
+    }));
+    expect(sendFileTransferRequestMock).toHaveBeenCalled();
+  });
+
+  it('allows a whole-server participant to upload even without sessionName while viewer is refused', async () => {
+    mockResolveServerMemberAccessOrShareDeny.mockResolvedValue({
+      ok: false,
+      reason: 'share-direct-surface-denied',
+    });
+    mockResolveHttpShareAccess.mockResolvedValue({
+      membership: 'none',
+      actor: {
+        kind: 'share',
+        effectiveActorRole: 'viewer',
+        coverage: { target: { kind: 'server', serverId: 'srv-1' }, serverParticipantAuthority: false },
+      },
+      shareProvenance: 'server',
+    });
+    const viewerForm = new FormData();
+    viewerForm.append('file', new File(['viewer'], 'viewer.txt', { type: 'text/plain' }));
+    const viewer = await makeApp().request('/api/server/srv-1/upload', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer test' },
+      body: viewerForm,
+    });
+    expect(viewer.status).toBe(403);
+    await expect(viewer.json()).resolves.toEqual({ error: 'forbidden', reason: 'share-role-denied' });
+    expect(sendFileTransferRequestMock).not.toHaveBeenCalled();
+
+    mockResolveHttpShareAccess.mockResolvedValue({
+      membership: 'none',
+      actor: {
+        kind: 'share',
+        effectiveActorRole: 'participant',
+        coverage: { target: { kind: 'server', serverId: 'srv-1' }, serverParticipantAuthority: true },
+      },
+      shareProvenance: 'server',
+    });
+    const participantForm = new FormData();
+    participantForm.append('file', new File(['participant'], 'participant.txt', { type: 'text/plain' }));
+    const participant = await makeApp().request('/api/server/srv-1/upload', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer test' },
+      body: participantForm,
+    });
+    expect(participant.status).toBe(200);
+    expect(mockResolveHttpShareAccess).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      serverId: 'srv-1',
+      userId: 'user-1',
+      target: { kind: 'server', serverId: 'srv-1' },
     }));
     expect(sendFileTransferRequestMock).toHaveBeenCalled();
   });

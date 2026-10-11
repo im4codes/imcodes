@@ -1178,6 +1178,16 @@ export function isAppliedVerdict(judgement: TaskPairVerdictJudgement): boolean {
 // Pair state and the lenient state machine
 // ---------------------------------------------------------------------------
 
+export interface TaskPairLastVerdict {
+  verb: 'PASS' | 'REWORK';
+  counts: TaskPairSeverityCounts;
+  judgement: TaskPairVerdictJudgement;
+  round: number;
+  noticeText?: string;
+  auditDetails?: TaskPairAuditDetails;
+  reason?: string;
+}
+
 export interface TaskPairState {
   taskId: string;
   brain: string;
@@ -1218,7 +1228,7 @@ export interface TaskPairState {
    * it happened to resolve to.
    */
   blockingSource?: TaskPairBlockingSource;
-  lastVerdict?: { verb: 'PASS' | 'REWORK'; counts: TaskPairSeverityCounts; judgement: TaskPairVerdictJudgement; round: number };
+  lastVerdict?: TaskPairLastVerdict;
   previousAuditors: string[];
   /** Auditor explicitly selected by Brain; heartbeat replacement must keep it
    * unless the session is genuinely unavailable. */
@@ -1640,7 +1650,11 @@ function clonePair(pair: TaskPairState): TaskPairState {
     previousAuditors: [...pair.previousAuditors],
     capCounts: { ...pair.capCounts },
     lastWaitResolution: pair.lastWaitResolution ? { ...pair.lastWaitResolution } : undefined,
-    lastVerdict: pair.lastVerdict ? { ...pair.lastVerdict, counts: { ...pair.lastVerdict.counts } } : undefined,
+    lastVerdict: pair.lastVerdict ? {
+      ...pair.lastVerdict,
+      counts: { ...pair.lastVerdict.counts },
+      ...(pair.lastVerdict.auditDetails ? { auditDetails: { ...pair.lastVerdict.auditDetails } } : {}),
+    } : undefined,
     material: pair.material ? { ...pair.material } : undefined,
     workspace: pair.workspace ? { ...pair.workspace } : undefined,
     output: pair.output ? { ...pair.output } : undefined,
@@ -2187,7 +2201,14 @@ export function applyTaskPairMarker(
       const verdict = judgeTaskPairVerdict(verb, attrs, pair.blocking);
       if (verdict.blockingMismatch) unusual = true;
       if (terminal && verb === 'PASS') {
-        pair.lastVerdict = { verb, counts: verdict.counts, judgement: verdict.judgement, round: pair.round };
+        const noticeText = ctx.turnText ? stripTaskPairMarkersForDisplay(ctx.turnText).trim().slice(0, 4000) : undefined;
+        pair.lastVerdict = {
+          verb,
+          counts: verdict.counts,
+          judgement: verdict.judgement,
+          round: pair.round,
+          ...(noticeText ? { noticeText } : {}),
+        };
         return done('recorded', { verdict });
       }
       applyVerdict(pair, verb, verdict, ctx.writer, intents, ctx);
@@ -2374,7 +2395,14 @@ function applyVerdict(
   intents: TaskPairIntent[],
   ctx?: TaskPairApplyContext,
 ): void {
-  pair.lastVerdict = { verb, counts: verdict.counts, judgement: verdict.judgement, round: pair.round };
+  const noticeText = ctx?.turnText ? stripTaskPairMarkersForDisplay(ctx.turnText).trim().slice(0, 4000) : undefined;
+  pair.lastVerdict = {
+    verb,
+    counts: verdict.counts,
+    judgement: verdict.judgement,
+    round: pair.round,
+    ...(noticeText ? { noticeText } : {}),
+  };
   if (!isAppliedVerdict(verdict.judgement)) {
     if (spendCap(pair, 'verdict_correction', intents)) {
       intents.push({ kind: 'correction', to: writer, judgement: verdict.judgement });

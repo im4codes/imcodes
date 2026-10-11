@@ -58,18 +58,39 @@ export function formatResetDateTime(epochSeconds: number | undefined): string | 
   return `${month}/${day} ${hh}:${mm}`;
 }
 
+export interface FormatProviderQuotaOptions {
+  precision?: number;
+}
+
+/**
+ * Strips decimal places from percentage values in a pre-formatted quota string
+ * (e.g. "5.45%" -> "5%", "12.00%" -> "12%").
+ * Used on mobile viewports to prevent line overflow and unnecessary wrapping.
+ */
+export function stripPercentDecimals(label: string): string;
+export function stripPercentDecimals(label: string | null | undefined): string | null | undefined;
+export function stripPercentDecimals(label: string | null | undefined): string | null | undefined {
+  if (typeof label !== 'string' || !label) return label;
+  return label.replace(/(\d+)\.(\d+)%/g, (_match, intPart, decPart) => {
+    const num = parseFloat(`${intPart}.${decPart}`);
+    return `${Math.round(num)}%`;
+  });
+}
+
 function formatQuotaWindow(
   window: ProviderQuotaWindow | null | undefined,
   fallbackWindowLabel: string,
   nowMs: number,
   includeResetDateTime = true,
+  precisionOverride?: number,
 ): string | undefined {
   if (!window) return undefined;
   const parts = [formatWindowDuration(window.windowDurationMins, fallbackWindowLabel)];
   // The percent is only known for some sources (Codex always; the token-free
   // Claude rate_limit_event omits it when healthy). Show it only when present
   // rather than a bare "—" placeholder.
-  const percent = formatPercent(window.usedPercent, window.percentPrecision);
+  const precision = precisionOverride !== undefined ? precisionOverride : window.percentPrecision;
+  const percent = formatPercent(window.usedPercent, precision);
   if (percent) parts.push(percent);
   const remaining = formatRemainingTime(window.resetsAt, nowMs);
   if (remaining) parts.push(remaining);
@@ -85,10 +106,11 @@ function formatQuotaGroup(
   nowMs: number,
   labels: { primary: string; secondary: string },
   includeResetDateTime: boolean,
+  precisionOverride?: number,
 ): string | undefined {
   const windowParts = [
-    formatQuotaWindow(group.primary, labels.primary, nowMs, includeResetDateTime),
-    formatQuotaWindow(group.secondary, labels.secondary, nowMs, includeResetDateTime),
+    formatQuotaWindow(group.primary, labels.primary, nowMs, includeResetDateTime, precisionOverride),
+    formatQuotaWindow(group.secondary, labels.secondary, nowMs, includeResetDateTime, precisionOverride),
   ].filter((value): value is string => !!value);
   if (windowParts.length === 0) return undefined;
   const labelPrefix = group.label ? `${group.label} ` : '';
@@ -98,17 +120,28 @@ function formatQuotaGroup(
 export function formatProviderQuotaLabel(
   meta: ProviderQuotaMeta | null | undefined,
   nowMs = Date.now(),
-  labels: { primary: string; secondary: string } = { primary: '5h', secondary: '7d' },
+  labelsOrOptions?: { primary: string; secondary: string } | FormatProviderQuotaOptions,
+  options?: FormatProviderQuotaOptions,
 ): string | undefined {
+  let labels: { primary: string; secondary: string } = { primary: '5h', secondary: '7d' };
+  let opts = options;
+  if (labelsOrOptions) {
+    if ('primary' in labelsOrOptions || 'secondary' in labelsOrOptions) {
+      labels = labelsOrOptions as { primary: string; secondary: string };
+    } else {
+      opts = labelsOrOptions as FormatProviderQuotaOptions;
+    }
+  }
+  const precision = opts?.precision;
   if (meta?.groups && meta.groups.length > 0) {
     const groupParts = meta.groups
-      .map((group) => formatQuotaGroup(group, nowMs, labels, false))
+      .map((group) => formatQuotaGroup(group, nowMs, labels, false, precision))
       .filter((value): value is string => !!value);
     return groupParts.length > 0 ? groupParts.join(' | ') : undefined;
   }
   const parts = [
-    formatQuotaWindow(meta?.primary, labels.primary, nowMs, true),
-    formatQuotaWindow(meta?.secondary, labels.secondary, nowMs, true),
+    formatQuotaWindow(meta?.primary, labels.primary, nowMs, true, precision),
+    formatQuotaWindow(meta?.secondary, labels.secondary, nowMs, true, precision),
   ].filter((value): value is string => !!value);
   return parts.length > 0 ? parts.join(' · ') : undefined;
 }
@@ -116,17 +149,28 @@ export function formatProviderQuotaLabel(
 export function formatProviderQuotaTitle(
   meta: ProviderQuotaMeta | null | undefined,
   nowMs = Date.now(),
-  labels: { primary: string; secondary: string } = { primary: '5h', secondary: '7d' },
+  labelsOrOptions?: { primary: string; secondary: string } | FormatProviderQuotaOptions,
+  options?: FormatProviderQuotaOptions,
 ): string | undefined {
+  let labels: { primary: string; secondary: string } = { primary: '5h', secondary: '7d' };
+  let opts = options;
+  if (labelsOrOptions) {
+    if ('primary' in labelsOrOptions || 'secondary' in labelsOrOptions) {
+      labels = labelsOrOptions as { primary: string; secondary: string };
+    } else {
+      opts = labelsOrOptions as FormatProviderQuotaOptions;
+    }
+  }
+  const precision = opts?.precision;
   if (meta?.groups && meta.groups.length > 0) {
     const groupLines = meta.groups
-      .map((group) => formatQuotaGroup(group, nowMs, labels, true))
+      .map((group) => formatQuotaGroup(group, nowMs, labels, true, precision))
       .filter((value): value is string => !!value);
     return groupLines.length > 0 ? groupLines.join('\n') : undefined;
   }
   const parts = [
-    formatQuotaWindow(meta?.primary, labels.primary, nowMs, true),
-    formatQuotaWindow(meta?.secondary, labels.secondary, nowMs, true),
+    formatQuotaWindow(meta?.primary, labels.primary, nowMs, true, precision),
+    formatQuotaWindow(meta?.secondary, labels.secondary, nowMs, true, precision),
   ].filter((value): value is string => !!value);
   return parts.length > 0 ? parts.join('\n') : undefined;
 }

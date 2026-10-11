@@ -280,6 +280,30 @@ describe('TaskPairEventChip', () => {
     expect(card.querySelectorAll('.task-pair-card-finding')).toHaveLength(0);
   });
 
+  it('parses Chinese rework notice into findings and reasons without unavailable placeholder', () => {
+    const { container } = render(<TaskPairEventChip eventId="e-rework-zh" payload={{
+      taskId: 'tsk_service_accept_fee_entry_fix_20261011', title: '修正接单后的费用审批入口', writer: 'daemon', verb: 'REWORK', toStatus: 'rework',
+      severityCounts: { P0: 1, P1: 0, P2: 0, P3: 0, P4: 0 },
+      noticeText: '第二轮仍REWORK：**[P0] 验收4未闭合**。21项API结果不等于新增列表、双按钮及异人审批开始的正式页面验证；多租户证据也未覆盖。\n\n已给出窄补验方案及报告更正项。已有API结果保留，不要求重跑无关套件。',
+    }} />);
+    const card = container.querySelector('.task-pair-event-card')!;
+    fireEvent.click(card.querySelector('.task-pair-card-toggle')!);
+    const details = card.querySelector('.task-pair-card-audit-details')!;
+    expect(details.textContent).toContain('P0');
+    expect(details.textContent).toContain('验收4未闭合');
+    expect(details.textContent).toContain('已给出窄补验方案');
+    expect(details.querySelector('.task-pair-card-details-unavailable')).toBeNull();
+  });
+
+  it('does not render empty audit details placeholder for non-verdict events like BRIEF_UPDATED', () => {
+    const { container } = render(<TaskPairEventChip eventId="e-brief" payload={{
+      taskId: 'tsk_service_accept_fee_entry_fix_20261011', title: '修正接单后的费用审批入口', writer: 'daemon', verb: 'BRIEF_UPDATED', toStatus: 'rework',
+    }} />);
+    const card = container.querySelector('.task-pair-event-card')!;
+    fireEvent.click(card.querySelector('.task-pair-card-toggle')!);
+    expect(card.querySelector('.task-pair-card-audit-details')).toBeNull();
+  });
+
   it('shows a blocked note for NEEDS_INPUT and respects configured blocking levels', () => {
     const { container } = render(<TaskPairEventChip eventId="e-blocked" payload={{
       taskId: 'T-blocked', title: 'Waiting for input', writer: 'daemon', verb: 'NEEDS_INPUT', toStatus: 'awaiting_brain_decision',

@@ -349,8 +349,8 @@ export const SHARE_SCOPED_DAEMON_MESSAGE_POLICY = new Map<string, DaemonMessageP
   ['command.ack', { target: sessionFieldTarget, redact: redactActiveDispatchForViewers }],
   ['command.failed', { target: sessionFieldTarget }],
   ['subsession.response', { target: sessionNameFieldTarget }],
-  ['subsession.created', { target: subsessionCreatedTarget, redact: redactSubsessionCreated }],
-  ['subsession.removed', { target: subsessionRemovedTarget }],
+  ['subsession.created', { target: serverFieldTarget, redact: redactSubsessionCreated, scopesServerTargetInRedact: true }],
+  ['subsession.removed', { target: serverFieldTarget, redact: redactSubsessionRemoved, scopesServerTargetInRedact: true }],
   ['timeline.event', {
     target: timelineEventTarget,
     redact: redactTimelineEventPairInfo,
@@ -884,6 +884,10 @@ export function commandSessionName(msg: Record<string, unknown>): string | null 
     const value = msg[key];
     if (typeof value === 'string' && value.trim()) return value.trim();
   }
+  if (typeof msg.id === 'string' && msg.id.trim() && (msg.type === 'subsession.start' || msg.type === 'subsession.restart')) {
+    const id = msg.id.trim();
+    return id.startsWith('deck_sub_') ? id : `deck_sub_${id}`;
+  }
   const scope = msg.scope;
   if (scope && typeof scope === 'object' && !Array.isArray(scope)) {
     const coordinatorSessionName = (scope as Record<string, unknown>).coordinatorSessionName;
@@ -1126,18 +1130,6 @@ function p2pRunScopedTarget(msg: Record<string, unknown>): ShareTarget | null {
   return normalizeShareTarget(runSnapshot?.target) ?? sharedActorTarget(msg);
 }
 
-function subsessionCreatedTarget(msg: Record<string, unknown>): ShareTarget | null {
-  const parentSession = typeof msg.parentSession === 'string' ? msg.parentSession.trim() : '';
-  if (parentSession) return { kind: 'main', serverId: '', sessionName: parentSession };
-  const id = typeof msg.id === 'string' ? msg.id : '';
-  const sessionName = typeof msg.sessionName === 'string' ? msg.sessionName : (id ? `deck_sub_${id}` : '');
-  return sessionName ? sessionNameToShareTarget('', sessionName) : null;
-}
-
-function subsessionRemovedTarget(msg: Record<string, unknown>): ShareTarget | null {
-  return subsessionCreatedTarget(msg);
-}
-
 function redactDaemonStatsForParticipant(
   msg: Record<string, unknown>,
   state: ShareScopedSocketState,
@@ -1304,7 +1296,15 @@ const SHARE_VISIBLE_SUBSESSION_FIELDS = new Set([
 function redactSubsessionCreated(
   msg: Record<string, unknown>,
   state: ShareScopedSocketState,
-): Record<string, unknown> {
+): Record<string, unknown> | null {
+  if (state.target.kind !== 'server') {
+    const parentSession = typeof msg.parentSession === 'string' ? msg.parentSession.trim() : '';
+    const id = typeof msg.id === 'string' ? msg.id : '';
+    const sessionName = typeof msg.sessionName === 'string' ? msg.sessionName : (id ? `deck_sub_${id}` : '');
+    const parentCovered = !!(parentSession && shareStateCoversSession(state, parentSession));
+    const selfCovered = !!(sessionName && shareStateCoversSession(state, sessionName));
+    if (!parentCovered && !selfCovered) return null;
+  }
   const redacted: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(msg)) {
     if (SHARE_VISIBLE_SUBSESSION_FIELDS.has(key)) redacted[key] = value;
@@ -1315,6 +1315,21 @@ function redactSubsessionCreated(
     Object.assign(redacted, projectParticipantProviderQuota(msg));
   }
   return redacted;
+}
+
+function redactSubsessionRemoved(
+  msg: Record<string, unknown>,
+  state: ShareScopedSocketState,
+): Record<string, unknown> | null {
+  if (state.target.kind !== 'server') {
+    const parentSession = typeof msg.parentSession === 'string' ? msg.parentSession.trim() : '';
+    const id = typeof msg.id === 'string' ? msg.id : '';
+    const sessionName = typeof msg.sessionName === 'string' ? msg.sessionName : (id ? `deck_sub_${id}` : '');
+    const parentCovered = !!(parentSession && shareStateCoversSession(state, parentSession));
+    const selfCovered = !!(sessionName && shareStateCoversSession(state, sessionName));
+    if (!parentCovered && !selfCovered) return null;
+  }
+  return msg;
 }
 
 function redactSessionList(msg: Record<string, unknown>, state: ShareScopedSocketState): Record<string, unknown> | null {
