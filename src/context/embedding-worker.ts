@@ -72,34 +72,43 @@ async function embedOne(text: string): Promise<Float32Array> {
   return toFloat32(result.data);
 }
 
-port.on('message', async (msg: EmbeddingWorkerRequest) => {
-  try {
-    if (msg.type === 'warmup') {
-      await getPipeline();
-      port.postMessage({ id: msg.id, ok: true, result: true } satisfies EmbeddingWorkerResponse);
-      return;
-    }
-    if (msg.type === 'embed') {
-      const vec = await embedOne(msg.text);
-      port.postMessage({ id: msg.id, ok: true, result: vec } satisfies EmbeddingWorkerResponse, [vec.buffer as ArrayBuffer]);
-      return;
-    }
-    if (msg.type === 'embedBatch') {
-      // Load once up front: a load failure must fail the whole batch (so the
-      // host can apply its sticky/fallback policy), but a per-text inference
-      // failure only nulls that entry.
-      await getPipeline();
-      const out: (Float32Array | null)[] = [];
-      for (const text of msg.texts) {
-        try { out.push(await embedOne(text)); } catch { out.push(null); }
+let queuePromise: Promise<unknown> = Promise.resolve();
+function enqueueTask<T>(task: () => Promise<T>): Promise<T> {
+  const next = queuePromise.then(task, task);
+  queuePromise = next.then(() => {}, () => {});
+  return next;
+}
+
+port.on('message', (msg: EmbeddingWorkerRequest) => {
+  void enqueueTask(async () => {
+    try {
+      if (msg.type === 'warmup') {
+        await getPipeline();
+        port.postMessage({ id: msg.id, ok: true, result: true } satisfies EmbeddingWorkerResponse);
+        return;
       }
-      const transfer = out.filter((v): v is Float32Array => v !== null).map((v) => v.buffer as ArrayBuffer);
-      port.postMessage({ id: msg.id, ok: true, result: out } satisfies EmbeddingWorkerResponse, transfer);
-      return;
+      if (msg.type === 'embed') {
+        const vec = await embedOne(msg.text);
+        port.postMessage({ id: msg.id, ok: true, result: vec } satisfies EmbeddingWorkerResponse, [vec.buffer as ArrayBuffer]);
+        return;
+      }
+      if (msg.type === 'embedBatch') {
+        // Load once up front: a load failure must fail the whole batch (so the
+        // host can apply its sticky/fallback policy), but a per-text inference
+        // failure only nulls that entry.
+        await getPipeline();
+        const out: (Float32Array | null)[] = [];
+        for (const text of msg.texts) {
+          try { out.push(await embedOne(text)); } catch { out.push(null); }
+        }
+        const transfer = out.filter((v): v is Float32Array => v !== null).map((v) => v.buffer as ArrayBuffer);
+        port.postMessage({ id: msg.id, ok: true, result: out } satisfies EmbeddingWorkerResponse, transfer);
+        return;
+      }
+    } catch (err) {
+      const code = (err as { code?: string } | null)?.code ?? null;
+      const error = err instanceof Error ? err.message : String(err);
+      port.postMessage({ id: (msg as { id: number }).id, ok: false, error, code } satisfies EmbeddingWorkerResponse);
     }
-  } catch (err) {
-    const code = (err as { code?: string } | null)?.code ?? null;
-    const error = err instanceof Error ? err.message : String(err);
-    port.postMessage({ id: (msg as { id: number }).id, ok: false, error, code } satisfies EmbeddingWorkerResponse);
-  }
+  });
 });

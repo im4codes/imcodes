@@ -2,6 +2,7 @@ import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
+  isDaemonProcess,
   isNonDaemonProcess,
   markDaemonProcess,
   markNonDaemonProcess,
@@ -14,25 +15,29 @@ const read = (file: string) => readFileSync(resolve(repoRoot, file), 'utf8');
 afterEach(() => resetProcessRoleForTests());
 
 describe('process role', () => {
-  it('an unmarked process (tests, embedded use) is not treated as a helper', () => {
+  it('an unmarked process (tests, embedded use) is not treated as a helper or daemon', () => {
     expect(isNonDaemonProcess()).toBe(false);
+    expect(isDaemonProcess()).toBe(false);
   });
 
   it('a helper marks itself non-daemon', () => {
     markNonDaemonProcess();
     expect(isNonDaemonProcess()).toBe(true);
+    expect(isDaemonProcess()).toBe(false);
   });
 
   it('the daemon overrides the helper mark that `imcodes start` set on its way in', () => {
     markNonDaemonProcess(); // runCli()
     markDaemonProcess(); // lifecycle.startup() after the instance lock
     expect(isNonDaemonProcess()).toBe(false);
+    expect(isDaemonProcess()).toBe(true);
   });
 
   it('a running daemon can never be demoted by a late helper mark', () => {
     markDaemonProcess();
     markNonDaemonProcess();
     expect(isNonDaemonProcess()).toBe(false);
+    expect(isDaemonProcess()).toBe(true);
   });
 });
 

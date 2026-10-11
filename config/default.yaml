@@ -44,6 +44,7 @@ tracker:
 memory:
   claudeMemUrl: ${CLAUDE_MEM_URL:-http://localhost:37777}
   mem0Url: ${MEM0_URL:-http://localhost:37778}
+  embeddingMode: ${IMCODES_EMBEDDING_MODE:-auto}
 
 server:
   cfWorkerUrl: ${CF_WORKER_URL}

@@ -31,6 +31,11 @@ export function isNonDaemonProcess(): boolean {
   return role === 'non-daemon';
 }
 
+/** True only for the process that holds the daemon instance lock. */
+export function isDaemonProcess(): boolean {
+  return role === 'daemon';
+}
+
 export function resetProcessRoleForTests(): void {
   role = 'unknown';
 }

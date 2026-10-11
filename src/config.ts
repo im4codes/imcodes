@@ -54,6 +54,8 @@ export interface Config {
   };
   memory: {
     claudeMemUrl: string;
+    mem0Url?: string;
+    embeddingMode?: string;
   };
   cf?: {
     workerUrl?: string;

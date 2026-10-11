@@ -307,6 +307,7 @@ export class KimiSdkProvider implements TransportProvider {
   private cachedDefaultModel: string | null = null;
   /** Negotiated ACP support for durable `session/list` discovery. */
   private sessionListSupported = false;
+  private isDisconnecting = false;
 
   constructor(profile: AcpCliProviderProfile = KIMI_PROFILE) {
     this.profile = profile;
@@ -397,16 +398,21 @@ export class KimiSdkProvider implements TransportProvider {
   }
 
   async disconnect(): Promise<void> {
-    this.cancelPendingApprovals();
-    await this.teardownChild();
-    this.acpToRoute.clear();
-    this.acpRouteOrder.clear();
-    this.sessions.clear();
-    this.config = null;
-    this.initPromise = null;
-    this.cachedModels = null;
-    this.cachedDefaultModel = null;
-    this.sessionListSupported = false;
+    this.isDisconnecting = true;
+    try {
+      this.cancelPendingApprovals();
+      await this.teardownChild();
+      this.acpToRoute.clear();
+      this.acpRouteOrder.clear();
+      this.sessions.clear();
+      this.config = null;
+      this.initPromise = null;
+      this.cachedModels = null;
+      this.cachedDefaultModel = null;
+      this.sessionListSupported = false;
+    } finally {
+      this.isDisconnecting = false;
+    }
   }
 
   async createSession(config: SessionConfig): Promise<string> {
@@ -851,12 +857,13 @@ export class KimiSdkProvider implements TransportProvider {
     });
 
     child.on('exit', (code, signal) => {
+      if (this.isDisconnecting) return;
       const err = new Error(`${this.profile.displayName} ACP server exited with code=${code} signal=${signal}`);
       this.cancelPendingApprovals();
       const sessions = [...this.sessions.keys()];
       for (const sid of sessions) {
         if (this.clearSessionWorkAfterFailure(sid)) {
-          this.emitError(sid, this.makeError(PROVIDER_ERROR_CODES.CONNECTION_LOST, err.message, false));
+          this.emitError(sid, this.makeError(PROVIDER_ERROR_CODES.CONNECTION_LOST, err.message, true));
         }
       }
       this.child = null;
@@ -865,6 +872,7 @@ export class KimiSdkProvider implements TransportProvider {
       this.sessionListSupported = false;
     });
     child.on('error', (err) => {
+      if (this.isDisconnecting) return;
       logger.error(
         { provider: this.id, errorCode: (err as NodeJS.ErrnoException).code ?? 'spawn_failed' },
         `${this.profile.displayName} ACP spawn error`,
@@ -873,7 +881,7 @@ export class KimiSdkProvider implements TransportProvider {
       const sessions = [...this.sessions.keys()];
       for (const sid of sessions) {
         if (this.clearSessionWorkAfterFailure(sid)) {
-          this.emitError(sid, this.makeError(PROVIDER_ERROR_CODES.CONNECTION_LOST, err.message, false));
+          this.emitError(sid, this.makeError(PROVIDER_ERROR_CODES.CONNECTION_LOST, err.message, true));
         }
       }
       this.child = null;
@@ -995,6 +1003,10 @@ export class KimiSdkProvider implements TransportProvider {
           this.cacheModelsFromSessionResponse({ models: _params as any } as NewSessionResponse);
           return;
         }
+        if (method === '_x.ai/session/update' && _params && typeof _params === 'object') {
+          this.handleSessionUpdate(_params as unknown as SessionNotification);
+          return;
+        }
         // Grok publishes MCP catalog refreshes through an xAI extension. The
         // provider does not need the payload because managed MCP state is
         // already owned by the session configuration, but registering the
@@ -1097,6 +1109,7 @@ export class KimiSdkProvider implements TransportProvider {
     state.emittedToolSignatures.clear();
     this.cancelPendingApprovals(sessionId);
     this.clearStatus(sessionId, state);
+    if (this.isDisconnecting) return;
     this.emitError(sessionId, this.normalizeError(error));
   }
 
@@ -1460,6 +1473,9 @@ export class KimiSdkProvider implements TransportProvider {
       this.emitRuntimeSubagentNotification(routeId, state, updateRecord);
       return;
     }
+    if (updateRecord.sessionUpdate === 'turn_completed') {
+      return;
+    }
     const turnScopedUpdate = update.sessionUpdate === 'agent_message_chunk'
       || update.sessionUpdate === 'agent_thought_chunk'
       || update.sessionUpdate === 'tool_call'
@@ -1510,9 +1526,6 @@ export class KimiSdkProvider implements TransportProvider {
           const sessionState = this.sessions.get(routeId);
           if (sessionState) sessionState.lastTurnUsage = tokens;
         }
-        this.emitSessionInfo(routeId, {
-          ...(tokens ? { quotaMeta: tokens as Record<string, unknown> as never } : {}),
-        });
         return;
       }
       case 'plan':
@@ -1760,6 +1773,15 @@ export class KimiSdkProvider implements TransportProvider {
       return err as ProviderError;
     }
     const message = err instanceof Error ? err.message : String(err);
+    const isConnectionLost = /closed|epipe|econnreset|broken pipe|stream (?:closed|ended)|socket closed|server exited|process exited|channel closed|connection (?:lost|closed|ended|reset)|premature close|unexpected end of json/i.test(message);
+    if (isConnectionLost || this.isDisconnecting) {
+      return this.makeError(
+        PROVIDER_ERROR_CODES.CONNECTION_LOST,
+        this.profile.privacySafeErrors ? `${this.profile.displayName} connection was lost.` : message,
+        true,
+        this.profile.privacySafeErrors ? undefined : err,
+      );
+    }
     if (this.profile.privacySafeErrors) {
       if (/auth|login|credential|unauthorized|forbidden/i.test(message)) {
         return this.makeError(

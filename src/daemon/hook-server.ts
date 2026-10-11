@@ -995,6 +995,32 @@ export async function startHookServer(
       return;
     }
 
+    if (url === '/daemon/embedding' && req.method === 'POST') {
+      try {
+        const body = JSON.parse(await readBody(req, 256 * 1024)) as { text?: unknown; texts?: unknown };
+        const { generateEmbeddingDirect, generateEmbeddingsDirect } = await import('../context/embedding.js');
+        if (typeof body.text === 'string' && body.text) {
+          const vec = await generateEmbeddingDirect(body.text);
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, embedding: vec ? Array.from(vec) : null }));
+          return;
+        }
+        if (Array.isArray(body.texts)) {
+          const texts = body.texts.filter((t): t is string => typeof t === 'string');
+          const vecs = await generateEmbeddingsDirect(texts);
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, embeddings: vecs.map((v) => (v ? Array.from(v) : null)) }));
+          return;
+        }
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'text_or_texts_required' }));
+      } catch (err) {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: err instanceof Error ? err.message : String(err) }));
+      }
+      return;
+    }
+
     if (url === MEMORY_MCP_DAEMON_RPC_PATH) {
       const senderHeader = req.headers['x-imcodes-session'];
       const senderSessionName = Array.isArray(senderHeader) ? senderHeader[0] : senderHeader;

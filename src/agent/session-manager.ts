@@ -76,7 +76,7 @@ import { resolveStructuredSessionBootstrap } from './structured-session-bootstra
 import { getQwenRuntimeConfig } from './qwen-runtime-config.js';
 import { getQwenDisplayMetadata } from './provider-display.js';
 import { getQwenOAuthQuotaUsageLabel } from './provider-quota.js';
-import { getClaudeSdkRuntimeConfig, normalizeClaudeSdkModelForProvider } from './sdk-runtime-config.js';
+import { getClaudeSdkRuntimeConfig, getGrokSdkRuntimeConfig, normalizeClaudeSdkModelForProvider } from './sdk-runtime-config.js';
 import { peekClaudeUsageQuotaCached } from './claude-usage-quota.js';
 import { peekAgyUsageQuotaCached } from './agy-usage-quota.js';
 import { getCodexRuntimeConfig } from './codex-runtime-config.js';
@@ -3698,6 +3698,9 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
     // continuity comes exclusively from providerResumeId, so a stale route key
     // must never make us skip session creation without a real resume target.
     effectiveSkipCreate = !!transportResumeId;
+    if (agentType === 'grok-sdk') {
+      sdkDisplay = await getGrokSdkRuntimeConfig().catch(() => ({}));
+    }
   }
 
   // `preserveStartupMemoryInject` is declared earlier so the bootstrap

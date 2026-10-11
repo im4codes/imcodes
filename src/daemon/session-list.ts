@@ -4,7 +4,7 @@ import { listSessions, upsertSession } from '../store/session-store.js';
 import { getQwenRuntimeConfig } from '../agent/qwen-runtime-config.js';
 import { getQwenDisplayMetadata } from '../agent/provider-display.js';
 import { getQwenOAuthQuotaUsageLabel } from '../agent/provider-quota.js';
-import { getClaudeSdkRuntimeConfig } from '../agent/sdk-runtime-config.js';
+import { getClaudeSdkRuntimeConfig, getGrokSdkRuntimeConfig } from '../agent/sdk-runtime-config.js';
 import { getClaudeUsageQuota } from '../agent/claude-usage-quota.js';
 import { getCodexRuntimeConfig } from '../agent/codex-runtime-config.js';
 import { mergeCodexDisplayMetadata } from '../agent/codex-display.js';
@@ -248,8 +248,10 @@ export async function buildSessionList(): Promise<SessionListItem[]> {
   const needsCopilotHydration = sessions.some((s) => s.agentType === 'copilot-sdk');
   const needsCursorHydration = sessions.some((s) => s.agentType === 'cursor-headless');
   const needsAgySdkHydration = sessions.some((s) => s.agentType === 'agy-sdk');
+  const needsGrokSdkHydration = sessions.some((s) => s.agentType === 'grok-sdk');
   const qwenRuntime = needsQwenHydration ? await getQwenRuntimeConfig().catch(() => null) : null;
   const claudeSdkRuntime = needsClaudeSdkHydration ? await getClaudeSdkRuntimeConfig().catch(() => ({}) as import('../agent/sdk-runtime-config.js').SdkRuntimeConfig) : null;
+  const grokSdkRuntime = needsGrokSdkHydration ? await getGrokSdkRuntimeConfig().catch(() => ({}) as import('../agent/sdk-runtime-config.js').SdkRuntimeConfig) : null;
   // Option B (best-effort, ≤1 fetch / 30min): proactive 5h+weekly quota pulled
   // from /api/oauth/usage. null → fall back to the SDK rate_limit_event quota.
   const claudeUsageQuota = needsClaudeSdkHydration ? await getClaudeUsageQuota().catch(() => null) : null;
@@ -348,6 +350,15 @@ export async function buildSessionList(): Promise<SessionListItem[]> {
         ...(available?.length ? { cursorAvailableModels: available } : {}),
       };
       if (!arraysEqual(hydrated.cursorAvailableModels, s.cursorAvailableModels)) {
+        upsertSession({ ...s, ...hydrated, updatedAt: Date.now() });
+      }
+      return { ...baseItem(s), ...hydrated };
+    }
+    if (s.agentType === 'grok-sdk') {
+      const hydrated: Partial<SessionRecord> = {
+        ...(grokSdkRuntime?.planLabel ? { planLabel: grokSdkRuntime.planLabel } : {}),
+      };
+      if (hydrated.planLabel && hydrated.planLabel !== s.planLabel) {
         upsertSession({ ...s, ...hydrated, updatedAt: Date.now() });
       }
       return { ...baseItem(s), ...hydrated };

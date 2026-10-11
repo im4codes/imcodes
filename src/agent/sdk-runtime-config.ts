@@ -45,6 +45,50 @@ export async function getClaudeSdkRuntimeConfig(force = false): Promise<SdkRunti
   }
 }
 
+let grokCache: { expiresAt: number; value: SdkRuntimeConfig } | null = null;
+
+async function readGrokSubscriptionType(): Promise<string | undefined> {
+  try {
+    const raw = await readFile(join(homedir(), '.grok', 'settings_cache.json'), 'utf8');
+    const parsed = JSON.parse(raw) as {
+      payload?: string | {
+        settings?: {
+          subscription_tier_display?: string;
+          subscription_tier?: string;
+        };
+      };
+    };
+    let payload = parsed.payload;
+    if (typeof payload === 'string') {
+      try {
+        payload = JSON.parse(payload);
+      } catch {
+        payload = undefined;
+      }
+    }
+    const settings = (payload as { settings?: { subscription_tier_display?: string; subscription_tier?: string } })?.settings;
+    const tier = settings?.subscription_tier_display || settings?.subscription_tier;
+    return typeof tier === 'string' && tier.trim() ? tier.trim() : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+export async function getGrokSdkRuntimeConfig(force = false): Promise<SdkRuntimeConfig> {
+  const now = Date.now();
+  if (!force && grokCache && grokCache.expiresAt > now) return grokCache.value;
+  try {
+    const tier = await readGrokSubscriptionType();
+    const value = { ...(tier ? { planLabel: tier } : {}) };
+    grokCache = { expiresAt: now + CACHE_TTL_MS, value };
+    return value;
+  } catch {
+    const value = {};
+    grokCache = { expiresAt: now + CACHE_TTL_MS, value };
+    return value;
+  }
+}
+
 export function getClaudeSdkAvailableModels(): readonly string[] {
   return CLAUDE_CODE_MODEL_IDS;
 }

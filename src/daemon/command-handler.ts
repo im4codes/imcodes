@@ -224,7 +224,7 @@ import {
 } from '../context/summary-sync.js';
 import { CLAUDE_CODE_MODEL_IDS, CODEX_MODEL_IDS, GEMINI_MODEL_IDS, normalizeClaudeCodeModelId } from '../shared/models/options.js';
 import type { TransportSessionRuntime } from '../agent/transport-session-runtime.js';
-import { getClaudeSdkRuntimeConfig, normalizeClaudeSdkModelForProvider } from '../agent/sdk-runtime-config.js';
+import { getClaudeSdkRuntimeConfig, getGrokSdkRuntimeConfig, normalizeClaudeSdkModelForProvider } from '../agent/sdk-runtime-config.js';
 import { getCodexRuntimeConfig } from '../agent/codex-runtime-config.js';
 import { mergeCodexDisplayMetadata } from '../agent/codex-display.js';
 import { P2P_TERMINAL_RUN_STATUSES } from '../../shared/p2p-status.js';
@@ -3039,6 +3039,7 @@ async function applyTransportModelSwitch(
       DAEMON_USER_NOTICE_CODE.MODEL_SWITCH_PROOF_GATED,
     );
   } else if (isGenericModelSwitchAgent(agentType)) {
+    let grokPlanLabel: string | undefined;
     if (agentType === 'grok-sdk') {
       const availableModels = validated?.models ?? [];
       if (!availableModels.includes(requestedModel)) {
@@ -3049,6 +3050,8 @@ async function applyTransportModelSwitch(
           availableModels,
         );
       }
+      const grokSdkDisplay = await getGrokSdkRuntimeConfig(true).catch(() => ({}) as import('../agent/sdk-runtime-config.js').SdkRuntimeConfig);
+      grokPlanLabel = grokSdkDisplay.planLabel;
     }
     transportRuntime?.setAgentId(requestedModel);
     nextRecord = {
@@ -3056,6 +3059,7 @@ async function applyTransportModelSwitch(
       requestedModel,
       activeModel: requestedModel,
       modelDisplay: requestedModel,
+      ...(grokPlanLabel ? { planLabel: grokPlanLabel } : {}),
       updatedAt: Date.now(),
     };
     contextWindow = resolveContextWindow(undefined, requestedModel);

@@ -54,6 +54,21 @@ export function getServerFallbackDisableReason(): string | null {
   return unavailableReason;
 }
 
+/**
+ * Check whether server fallback is configured and eligible (daemon is bound
+ * to a server and not sticky-disabled). Does not make a network call.
+ */
+export async function isServerFallbackReady(): Promise<boolean> {
+  if (unavailable) return false;
+  const creds = await getCredentials();
+  if (!creds) {
+    unavailable = true;
+    unavailableReason = 'not_bound';
+    return false;
+  }
+  return true;
+}
+
 interface MinimalCredentials {
   serverId: string;
   token: string;

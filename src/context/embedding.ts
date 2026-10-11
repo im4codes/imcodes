@@ -10,7 +10,13 @@ import { join } from 'node:path';
 
 import { EMBEDDING_MODEL, EMBEDDING_DTYPE, EMBEDDING_DIM } from '../../shared/embedding-config.js';
 import logger from '../util/logger.js';
-import { isServerFallbackUnavailable, tryServerEmbedding } from './embedding-server-fallback.js';
+import {
+  isServerFallbackUnavailable,
+  isServerFallbackReady,
+  tryServerEmbedding,
+  getServerFallbackDisableReason,
+} from './embedding-server-fallback.js';
+import { getLoadedConfig } from '../config.js';
 import {
   spawnChildProcessWorker,
   type ChildProcessWorkerHandle,
@@ -85,6 +91,54 @@ function getEngine(): EmbeddingEngine {
 export function __setEmbeddingEngineKindForTests(kind: 'worker' | 'inprocess' | null): void {
   _resetEmbeddingStateForTests();
   forcedEngineKindForTests = kind;
+}
+
+export type ConfiguredEmbeddingMode = 'auto' | 'local' | 'server' | 'off';
+
+let forcedEmbeddingModeForTests: ConfiguredEmbeddingMode | null = null;
+
+/**
+ * Resolve the configured embedding mode:
+ * - 'server': Offload embeddings to the cloud server endpoint (POST /api/embedding).
+ *             Zero local CPU inference, zero ONNX runtime, zero worker process spawned.
+ * - 'off':    Disable embedding generation entirely. Gracefully falls back to local
+ *             substring / keyword search in memory recall.
+ * - 'local':  Run local CPU inference via transformers.js / onnxruntime-node.
+ * - 'auto':   Default: attempts local engine, falling back to server if local is unavailable.
+ */
+export function getEmbeddingMode(): ConfiguredEmbeddingMode {
+  if (forcedEmbeddingModeForTests) return forcedEmbeddingModeForTests;
+
+  const envMode = process.env.IMCODES_EMBEDDING_MODE?.trim().toLowerCase();
+  if (envMode === 'server' || envMode === 'remote') return 'server';
+  if (envMode === 'off' || envMode === 'disabled' || envMode === 'none') return 'off';
+  if (envMode === 'local' || envMode === 'worker' || envMode === 'inprocess') return 'local';
+  if (envMode === 'auto') return 'auto';
+
+  if (process.env.IMCODES_EMBEDDING_DISABLED === '1' || process.env.IMCODES_EMBEDDING_DISABLED === 'true') {
+    return 'off';
+  }
+  if (process.env.IMCODES_DISABLE_LOCAL_EMBEDDING === '1' || process.env.IMCODES_DISABLE_LOCAL_EMBEDDING === 'true') {
+    return 'server';
+  }
+
+  // In test runs, don't read host config.yaml unless explicitly configured via env var
+  if (process.env.VITEST || process.env.NODE_ENV === 'test') {
+    return 'auto';
+  }
+
+  const loadedConfig = getLoadedConfig();
+  const configMode = loadedConfig?.memory?.embeddingMode?.trim().toLowerCase();
+  if (configMode === 'server' || configMode === 'remote') return 'server';
+  if (configMode === 'off' || configMode === 'disabled' || configMode === 'none') return 'off';
+  if (configMode === 'local' || configMode === 'worker' || configMode === 'inprocess') return 'local';
+
+  return 'auto';
+}
+
+/** Test-only: force a specific embedding mode. */
+export function __setEmbeddingModeForTests(mode: ConfiguredEmbeddingMode | null): void {
+  forcedEmbeddingModeForTests = mode;
 }
 
 // In-process engine: the original transformers.js path, kept verbatim so the
@@ -298,6 +352,211 @@ export function _resetEmbeddingStateForTests(): void {
   loadingPromise = null;
   unavailable = false;
   unavailableReason = null;
+  forcedEmbeddingModeForTests = null;
+  embeddingCache.clear();
+  inFlightEmbeddings.clear();
+  delete process.env.IMCODES_EMBEDDING_MODE;
+  delete process.env.IMCODES_DISABLE_LOCAL_EMBEDDING;
+  delete process.env.IMCODES_EMBEDDING_DISABLED;
+}
+
+const MAX_EMBEDDING_CACHE_SIZE = 2048;
+const embeddingCache = new Map<string, Float32Array>();
+const inFlightEmbeddings = new Map<string, Promise<Float32Array | null>>();
+
+function cacheEmbedding(text: string, vec: Float32Array): void {
+  if (embeddingCache.size >= MAX_EMBEDDING_CACHE_SIZE) {
+    const oldest = embeddingCache.keys().next().value;
+    if (oldest !== undefined) embeddingCache.delete(oldest);
+  }
+  embeddingCache.set(text, vec);
+}
+
+/**
+ * Attempt to delegate embedding generation to the machine-wide daemon hook server.
+ * Returns undefined if not applicable or daemon unreachable, so caller falls back to direct.
+ */
+async function tryDaemonEmbedding(text: string): Promise<Float32Array | null | undefined> {
+  if (process.env.VITEST || process.env.NODE_ENV === 'test') {
+    return undefined;
+  }
+
+  try {
+    const { isDaemonProcess } = await import('../daemon/process-role.js');
+    if (isDaemonProcess()) return undefined;
+  } catch {
+    return undefined;
+  }
+
+  try {
+    const { readSavedHookPort } = await import('../daemon/hook-port.js');
+    const port = readSavedHookPort();
+    if (!port) return undefined;
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 10_000);
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}/daemon/embedding`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text }),
+        signal: controller.signal,
+      });
+      if (!res.ok) return undefined;
+      const body = await res.json() as { ok?: boolean; embedding?: number[] | null };
+      if (body.ok) {
+        if (Array.isArray(body.embedding)) {
+          const vec = new Float32Array(body.embedding);
+          cacheEmbedding(text, vec);
+          return vec;
+        }
+        if (body.embedding === null) return null;
+      }
+    } finally {
+      clearTimeout(timer);
+    }
+  } catch {
+    return undefined;
+  }
+  return undefined;
+}
+
+async function tryDaemonEmbeddings(texts: string[]): Promise<(Float32Array | null)[] | undefined> {
+  if (process.env.VITEST || process.env.NODE_ENV === 'test') {
+    return undefined;
+  }
+
+  try {
+    const { isDaemonProcess } = await import('../daemon/process-role.js');
+    if (isDaemonProcess()) return undefined;
+  } catch {
+    return undefined;
+  }
+
+  try {
+    const { readSavedHookPort } = await import('../daemon/hook-port.js');
+    const port = readSavedHookPort();
+    if (!port) return undefined;
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 30_000);
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}/daemon/embedding`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ texts }),
+        signal: controller.signal,
+      });
+      if (!res.ok) return undefined;
+      const body = await res.json() as { ok?: boolean; embeddings?: (number[] | null)[] };
+      if (body.ok && Array.isArray(body.embeddings)) {
+        return body.embeddings.map((arr, i) => {
+          if (Array.isArray(arr)) {
+            const vec = new Float32Array(arr);
+            cacheEmbedding(texts[i], vec);
+            return vec;
+          }
+          return null;
+        });
+      }
+    } finally {
+      clearTimeout(timer);
+    }
+  } catch {
+    return undefined;
+  }
+  return undefined;
+}
+
+/**
+ * Direct generation in this process (bypassing daemon hook delegation).
+ * Used by the daemon itself to fulfill incoming embedding RPCs or internal calls.
+ */
+export async function generateEmbeddingDirect(text: string): Promise<Float32Array | null> {
+  const cached = embeddingCache.get(text);
+  if (cached) return cached;
+
+  const inFlight = inFlightEmbeddings.get(text);
+  if (inFlight) return await inFlight;
+
+  const runPromise = (async () => {
+    try {
+      const mode = getEmbeddingMode();
+      if (mode === 'off') return null;
+
+      if (mode === 'server') {
+        if (isServerFallbackUnavailable()) return null;
+        const vec = await tryServerEmbedding(text);
+        if (vec) cacheEmbedding(text, vec);
+        return vec;
+      }
+
+      try {
+        await ensureEngineLoaded();
+        const vec = await getEngine().embed(text);
+        if (vec) cacheEmbedding(text, vec);
+        return vec;
+      } catch {
+        if (unavailable) {
+          if (isServerFallbackUnavailable()) return null;
+          const vec = await tryServerEmbedding(text);
+          if (vec) cacheEmbedding(text, vec);
+          return vec;
+        }
+        return null;
+      }
+    } finally {
+      inFlightEmbeddings.delete(text);
+    }
+  })();
+
+  inFlightEmbeddings.set(text, runPromise);
+  return await runPromise;
+}
+
+export async function generateEmbeddingsDirect(texts: string[]): Promise<(Float32Array | null)[]> {
+  if (texts.length === 0) return [];
+
+  const results: (Float32Array | null | undefined)[] = texts.map((t) => embeddingCache.get(t));
+  const missingIndices: number[] = [];
+  const missingTexts: string[] = [];
+
+  for (let i = 0; i < texts.length; i++) {
+    if (results[i] === undefined) {
+      missingIndices.push(i);
+      missingTexts.push(texts[i]);
+    }
+  }
+
+  if (missingTexts.length === 0) {
+    return results as (Float32Array | null)[];
+  }
+
+  const mode = getEmbeddingMode();
+  if (mode === 'off') {
+    for (const idx of missingIndices) results[idx] = null;
+    return results as (Float32Array | null)[];
+  }
+
+  if (mode === 'local' || mode === 'auto') {
+    try {
+      await ensureEngineLoaded();
+      const vecs = await getEngine().embedBatch(missingTexts);
+      for (let j = 0; j < missingIndices.length; j++) {
+        const v = vecs[j];
+        if (v) cacheEmbedding(missingTexts[j], v);
+        results[missingIndices[j]] = v;
+      }
+      return results as (Float32Array | null)[];
+    } catch {
+      // Local failed; fall through to generateEmbeddingDirect
+    }
+  }
+
+  for (let j = 0; j < missingIndices.length; j++) {
+    results[missingIndices[j]] = await generateEmbeddingDirect(missingTexts[j]);
+  }
+  return results as (Float32Array | null)[];
 }
 
 /** Returns the sticky-failure reason (e.g. 'ERR_DLOPEN_FAILED') if embedding
@@ -305,6 +564,11 @@ export function _resetEmbeddingStateForTests(): void {
  *  surfacing actionable diagnostics in memory-recall code paths so the UI
  *  can degrade gracefully instead of silently returning empty results. */
 export function getEmbeddingUnavailableReason(): string | null {
+  const mode = getEmbeddingMode();
+  if (mode === 'off') return 'configured_off';
+  if (mode === 'server') {
+    return isServerFallbackUnavailable() ? (getServerFallbackDisableReason() ?? 'server_unavailable') : null;
+  }
   return unavailable ? unavailableReason : null;
 }
 
@@ -319,6 +583,17 @@ export function getEmbeddingUnavailableReason(): string | null {
 export type { EmbeddingStatus } from '../../shared/embedding-status.js';
 
 export function getEmbeddingStatus(): import('../../shared/embedding-status.js').EmbeddingStatus {
+  const mode = getEmbeddingMode();
+  if (mode === 'off') {
+    return { state: 'unavailable', reason: 'configured_off' };
+  }
+  if (mode === 'server') {
+    if (isServerFallbackUnavailable()) {
+      return { state: 'unavailable', reason: getServerFallbackDisableReason() ?? 'server_unavailable' };
+    }
+    return { state: 'fallback', reason: 'configured_server_offload' };
+  }
+
   if (engineReady) return { state: 'ready', reason: null };
   if (loadingPromise) return { state: 'loading', reason: null };
   if (!unavailable) return { state: 'idle', reason: null };
@@ -337,29 +612,27 @@ export function getEmbeddingStatus(): import('../../shared/embedding-status.js')
  * Generate a normalized embedding vector for a text string.
  *
  * Resolution order:
- *   1. Local pipeline via `@huggingface/transformers` (fast path, ~5 ms).
- *   2. Server fallback via `POST /api/embedding` if the daemon is bound
- *      and the local pipeline is permanently unavailable (sharp empty
- *      placeholders, onnxruntime DLOPEN failure on old CPUs, etc.).
- *
- * Returns a Float32Array of EMBEDDING_DIM dimensions, or null when both
- * paths fail. The fallback only fires when the LOCAL pipeline has
- * sticky-disabled — we never round-trip the network on the happy path.
+ *   1. In-process LRU cache hit (0ms).
+ *   2. In-flight promise deduplication.
+ *   3. If non-daemon process: delegate to daemon hook RPC to reuse the daemon's
+ *      single shared engine without spawning separate worker processes.
+ *   4. Direct generation via server offload or local engine.
  */
 export async function generateEmbedding(text: string): Promise<Float32Array | null> {
-  try {
-    await ensureEngineLoaded();
-    return await getEngine().embed(text);
-  } catch {
-    // Local failed. If it's sticky-disabled (deterministic per-host),
-    // try the server fallback. Transient local failures fall through to
-    // null without burning a network call.
-    if (unavailable) {
-      if (isServerFallbackUnavailable()) return null;
-      return await tryServerEmbedding(text);
-    }
-    return null;
+  const cached = embeddingCache.get(text);
+  if (cached) return cached;
+
+  const inFlight = inFlightEmbeddings.get(text);
+  if (inFlight) return await inFlight;
+
+  // In non-daemon helper processes (e.g. context-store-worker or memory mcp),
+  // reuse the daemon's shared embedding service instead of spawning separate workers.
+  const delegated = await tryDaemonEmbedding(text);
+  if (delegated !== undefined) {
+    return delegated;
   }
+
+  return await generateEmbeddingDirect(text);
 }
 
 /**
@@ -368,40 +641,57 @@ export async function generateEmbedding(text: string): Promise<Float32Array | nu
  */
 export async function generateEmbeddings(texts: string[]): Promise<(Float32Array | null)[]> {
   if (texts.length === 0) return [];
-  try {
-    await ensureEngineLoaded();
-    return await getEngine().embedBatch(texts);
-  } catch {
-    // Local pipeline dead. Fall back to server one-at-a-time when the
-    // local failure is deterministic. Server doesn't have a batch endpoint
-    // yet — sequential is fine because the batch path is only hot during
-    // recall and a sticky-disabled local pipeline is rare overall.
-    if (unavailable) {
-      if (isServerFallbackUnavailable()) return texts.map(() => null);
-      const out: (Float32Array | null)[] = [];
-      for (const text of texts) {
-        out.push(await tryServerEmbedding(text));
-        if (isServerFallbackUnavailable()) {
-          // Server became unavailable mid-batch — fill the rest with null
-          // and break, don't keep firing requests at a sticky-disabled server.
-          while (out.length < texts.length) out.push(null);
-          break;
-        }
-      }
-      return out;
+
+  const results: (Float32Array | null | undefined)[] = texts.map((t) => embeddingCache.get(t));
+  const missingIndices: number[] = [];
+  const missingTexts: string[] = [];
+
+  for (let i = 0; i < texts.length; i++) {
+    if (results[i] === undefined) {
+      missingIndices.push(i);
+      missingTexts.push(texts[i]);
     }
-    return texts.map(() => null);
   }
+
+  if (missingTexts.length === 0) {
+    return results as (Float32Array | null)[];
+  }
+
+  // In non-daemon helper processes, delegate batch to daemon hook RPC
+  const delegated = await tryDaemonEmbeddings(missingTexts);
+  if (delegated && delegated.length === missingTexts.length) {
+    for (let j = 0; j < missingIndices.length; j++) {
+      results[missingIndices[j]] = delegated[j];
+    }
+    return results as (Float32Array | null)[];
+  }
+
+  const direct = await generateEmbeddingsDirect(missingTexts);
+  for (let j = 0; j < missingIndices.length; j++) {
+    results[missingIndices[j]] = direct[j];
+  }
+  return results as (Float32Array | null)[];
 }
 
 /**
  * Check if the embedding model is available (loaded or loadable).
  */
 export async function isEmbeddingAvailable(): Promise<boolean> {
+  const mode = getEmbeddingMode();
+  if (mode === 'off') return false;
+
+  if (mode === 'server') {
+    if (isServerFallbackUnavailable()) return false;
+    return await isServerFallbackReady();
+  }
+
   try {
     await ensureEngineLoaded();
     return true;
   } catch {
+    if (unavailable && !isServerFallbackUnavailable()) {
+      return await isServerFallbackReady();
+    }
     return false;
   }
 }

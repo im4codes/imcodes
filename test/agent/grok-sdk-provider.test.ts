@@ -579,4 +579,27 @@ describe('GrokSdkProvider contract', () => {
       isAuthenticated: true,
     });
   });
+
+  it('maps connection drops to recoverable CONNECTION_LOST without leaking details', () => {
+    const provider = new GrokSdkProvider();
+    const error = (provider as any).normalizeError(new Error('Connection closed prematurely'));
+    expect(error).toMatchObject({
+      code: PROVIDER_ERROR_CODES.CONNECTION_LOST,
+      message: 'Grok connection was lost.',
+      recoverable: true,
+    });
+    expect(JSON.stringify(error)).not.toContain('prematurely');
+  });
+
+  it('suppresses error emissions during intentional disconnect', async () => {
+    const provider = new GrokSdkProvider();
+    const { state } = attachRoute(provider, 'disconnect-test');
+    const errors: any[] = [];
+    provider.onError((_sessionId, err) => errors.push(err));
+
+    (provider as any).isDisconnecting = true;
+    (provider as any).failTurn('disconnect-test', state, 1, new Error('Child process killed'));
+    expect(errors).toHaveLength(0);
+  });
 });
+
