@@ -11,6 +11,12 @@ describe('task-pair display identity', () => {
     expect(taskPairDisplayTitle(' ', id)).toBeUndefined();
     expect(taskPairDisplayTitle('修复排序任务', id)).toBe('修复排序任务');
   });
+  it('falls back to brief description when title is absent or generic placeholder', () => {
+    expect(taskPairDisplayTitle('未命名任务', 'task-1', '## 目标\n修复登录页面跳转异常')).toBe('修复登录页面跳转异常');
+    expect(taskPairDisplayTitle('Untitled task', 'task-1', 'contractRef: std/v1\n\n## Goal\nImplement dark mode toggle')).toBe('Implement dark mode toggle');
+    expect(taskPairDisplayTitle(undefined, 'task-1', 'Add export to CSV button')).toBe('Add export to CSV button');
+    expect(taskPairDisplayTitle('我的自定义任务', 'task-1', '## Goal\nOther text')).toBe('我的自定义任务');
+  });
   it.each(['executor', 'auditor'] as const)('projects the complete old %s label, including truncated CJK and absent title', (role) => {
     for (const taskId of ['tsk_service_preexecution_fee_20261010', 'task-1', '7c52-450a']) {
       for (const ending of ['', ': 中文任务', `: ${'中'.repeat(37)}...`]) {

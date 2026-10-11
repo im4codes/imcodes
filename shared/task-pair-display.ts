@@ -1,9 +1,14 @@
 import { TASK_PAIR_ID_CHAR_CLASS, TASK_PAIR_SESSION_ID_PREFIX } from './task-pair.js';
-import { isUsableTaskPairTitle } from './supervision-task-identity.js';
+import { deriveSupervisionTaskTitleFromBrief, isUsableTaskPairTitle } from './supervision-task-identity.js';
 
 /** Display only; never change a task's protocol identity or persisted title. */
-export function taskPairDisplayTitle(title: unknown, taskId: string): string | undefined {
-  return isUsableTaskPairTitle(title, taskId) ? title.trim() : undefined;
+export function taskPairDisplayTitle(title: unknown, taskId: string, brief?: unknown): string | undefined {
+  if (isUsableTaskPairTitle(title, taskId)) return (title as string).trim();
+  if (brief) {
+    const derived = deriveSupervisionTaskTitleFromBrief(brief);
+    if (derived && isUsableTaskPairTitle(derived, taskId)) return derived.trim();
+  }
+  return undefined;
 }
 
 export function taskPairSessionLabel(role: 'executor' | 'auditor'): string {

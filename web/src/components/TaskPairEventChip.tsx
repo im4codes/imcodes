@@ -111,7 +111,7 @@ export function TaskPairEventChip({ eventId, payload, timestamp, sessions }: { e
     : '';
   const held = event.verdictJudgement === 'inconsistent' || event.verdictJudgement === 'missing_severity';
   const verdict = typeof event.verdictJudgement === 'string' ? event.verdictJudgement : '';
-  const title = taskPairDisplayTitle(event.title, taskId) ?? t('taskPair.card_untitled');
+  const title = taskPairDisplayTitle(event.title, taskId, (event as Record<string, unknown>).brief) ?? t('taskPair.card_untitled');
   const displayPayload = {
     ...payload,
     title,
@@ -231,12 +231,30 @@ export function TaskPairEventChip({ eventId, payload, timestamp, sessions }: { e
       window.dispatchEvent(new CustomEvent('deck:navigate', { detail: { session: id } }));
     }}>{text}</button>;
   };
-  const roleLabel = (id: unknown, label: unknown, _model: unknown, _thinking: unknown, role: 'executor' | 'auditor') => {
-    const session = sessionLabel(id, label);
-    return <span class="task-pair-card-role"><span class="task-pair-card-role-label">{t(`taskPair.card_${role}`)}</span>{session ?? <span class="task-pair-card-unassigned">{t(id === 'none' ? 'taskPair.panel_no_audit' : 'taskPair.card_unassigned')}</span>}</span>;
+  const resolveModel = (id: unknown, payloadModel: unknown): string | undefined => {
+    if (typeof payloadModel === 'string' && payloadModel.trim()) return payloadModel.trim();
+    if (typeof id !== 'string' || !id) return undefined;
+    const session = sessions?.find((entry) => entry.name === id);
+    return session?.activeModel?.trim() || session?.requestedModel?.trim() || undefined;
   };
-  const previewRole = (id: unknown, label: unknown, model: unknown, thinking: unknown, role: 'executor' | 'auditor') =>
-    <div class="task-pair-card-hover-role">{roleLabel(id, label, model, thinking, role)}</div>;
+  const roleLabel = (id: unknown, label: unknown, modelValue: unknown, _thinking: unknown, role: 'executor' | 'auditor') => {
+    const session = sessionLabel(id, label);
+    const model = resolveModel(id, modelValue);
+    return <span class="task-pair-card-role">
+      <span class="task-pair-card-role-label">{t(`taskPair.card_${role}`)}</span>
+      {session ?? <span class="task-pair-card-unassigned">{t(id === 'none' ? 'taskPair.panel_no_audit' : 'taskPair.card_unassigned')}</span>}
+      {session && model && <span class="task-pair-card-role-model">{t('taskPair.card_model', { value: model })}</span>}
+    </span>;
+  };
+  const previewRole = (id: unknown, label: unknown, modelValue: unknown, _thinking: unknown, role: 'executor' | 'auditor') => {
+    const session = sessionLabel(id, label);
+    const model = resolveModel(id, modelValue);
+    return <div class="task-pair-card-hover-role">
+      <span class="task-pair-card-hover-role-name">{t(`taskPair.card_${role}`)}</span>
+      {session ?? <span class="task-pair-card-unassigned">{t(id === 'none' ? 'taskPair.panel_no_audit' : 'taskPair.card_unassigned')}</span>}
+      {session && model && <span class="task-pair-card-hover-role-meta">{t('taskPair.card_model', { value: model })}</span>}
+    </div>;
+  };
   const renderHoverPreview = () => {
     if (!hoverPreviewAnchor || typeof document === 'undefined' || expanded) return null;
     const margin = 10;

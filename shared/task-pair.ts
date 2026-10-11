@@ -447,7 +447,17 @@ export const TASK_PAIR_AUDIT_HELD_STATUSES: readonly TaskPairStatus[] = ['in_aud
  * title is presumed deliberate (explicit or already regenerated) and is
  * never touched.
  */
-export const TASK_PAIR_GENERIC_TITLE_PLACEHOLDERS = ['Delegated supervised task', '(untitled task)'] as const;
+export const TASK_PAIR_GENERIC_TITLE_PLACEHOLDERS = [
+  'Delegated supervised task',
+  '(untitled task)',
+  'Untitled task',
+  '未命名任务',
+  '未命名任務',
+  'Tarea sin título',
+  'Задача без названия',
+  '無題のタスク',
+  '제목 없는 작업',
+] as const;
 
 /**
  * The workspace rules every pair participant gets, in the marker contract and

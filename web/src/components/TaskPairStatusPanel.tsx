@@ -110,6 +110,19 @@ function normalizeSnapshot(detail: TaskPairConsoleSnapshotDetail): readonly Reco
 
 type SessionLabelEntry = { name: string; label?: string | null; activeModel?: string | null; requestedModel?: string | null; effort?: string | null };
 
+function resolveSessionModel(
+  id: string,
+  payloadModel: unknown,
+  sessions: readonly SessionLabelEntry[] | undefined,
+  projectionSessions: readonly { sessionName: string; title: string; activeModel?: string | null; requestedModel?: string | null }[],
+): string | undefined {
+  if (typeof payloadModel === 'string' && payloadModel.trim()) return payloadModel.trim();
+  const session = sessions?.find((entry) => entry.name === id);
+  if (session?.activeModel?.trim() || session?.requestedModel?.trim()) return session.activeModel?.trim() || session.requestedModel?.trim() || undefined;
+  const projected = projectionSessions.find((entry) => entry.sessionName === id);
+  return projected?.activeModel?.trim() || projected?.requestedModel?.trim() || undefined;
+}
+
 function hasPairActivity(events: readonly TimelineEvent[]): boolean {
   if (events.some((event) => event.type === TASK_PAIR_TIMELINE_EVENT)) return true;
   const snapshot = (window as Window & { __imcodesTaskPairSnapshot?: { tasks?: readonly unknown[]; authorityUnavailable?: boolean } }).__imcodesTaskPairSnapshot;
@@ -234,16 +247,24 @@ export function TaskPairStatusPanel({ events, sessions, serverId, scopeSessionId
     toggle();
   };
   const projectionSessions = watchProjectionStore.getSnapshot().sessions;
-  const session = (id: unknown, label: unknown, _model: unknown, _thinking: unknown, role: 'executor' | 'auditor') => {
+  const session = (id: unknown, label: unknown, model: unknown, _thinking: unknown, role: 'executor' | 'auditor') => {
     // 'none' is a real, deliberate value (auditor=none): there is no session
     // to open, so it must not render as a dangling clickable placeholder.
     if (typeof id !== 'string' || !id || id === 'none') return null;
     const text = taskPairResolveDisplaySessionLabel(id, label, sessions?.find((entry) => entry.name === id), projectionSessions.find((entry) => entry.sessionName === id)?.title) || t(`taskPair.panel_${role}`);
+    const resolvedModel = resolveSessionModel(id, model, sessions, projectionSessions);
     return <button type="button" class="task-pair-status-session" data-session-name={id} onClick={() => window.dispatchEvent(new CustomEvent('deck:navigate', { detail: { session: id } }))}>
-      <span class="task-pair-status-session-main"><span class="task-pair-status-session-label">{text}</span><small class="task-pair-status-session-id">{id}</small></span>
+      <span class="task-pair-status-session-main">
+        <span class="task-pair-status-session-label">{text}</span>
+        <small class="task-pair-status-session-id">{id}</small>
+        {resolvedModel && <small class="task-pair-status-session-model">{resolvedModel}</small>}
+      </span>
     </button>;
   };
-  const unassigned = (_model: unknown, _thinking: unknown) => <small>{t('taskPair.panel_unassigned')}</small>;
+  const unassigned = (model: unknown, _thinking: unknown) => {
+    const modelText = typeof model === 'string' && model.trim() ? model.trim() : '';
+    return <small class="task-pair-role-unassigned">{t('taskPair.panel_unassigned')}{modelText ? `${t('taskPair.panel_model_separator')}${modelText}` : ''}</small>;
+  };
   const durationUnits = {
     hour: t('taskPair.panel_duration_hour'),
     day: t('taskPair.panel_duration_day'),
@@ -275,7 +296,7 @@ export function TaskPairStatusPanel({ events, sessions, serverId, scopeSessionId
     {!collapsed && <div class="task-pair-status-rows" data-testid="task-pair-status-rows">
       {(() => { let sequence = 0; return groups.map((group) => {
         const heading = <h4>{group.key === 'awaiting_brain_decision' ? t('taskPair.status.awaiting_brain_decision') : t(`taskPair.panel_group_${group.key}`)} <small>({group.rows.length})</small></h4>;
-        const content = group.rows.map((row, index) => { const payload = row.payload; const sequenceNumber = ++sequence; const queued = group.key === 'queued'; const terminal = TASK_PAIR_TERMINAL_STATUSES.includes(payload.toStatus as TaskPairStatus); const duration = formatTaskDuration({ startedAt: row.startedAt, finishedAt: payload.finishedAt, endedAt: payload.endedAt, updatedAt: row.updatedAt, now, durationMs: payload.durationMs, terminal }, durationUnits); const title = taskPairDisplayTitle(payload.title, String(payload.taskId)) ?? t('taskPair.panel_untitled'); const taskStatus = String(payload.toStatus); const reworkCount = Math.max(1, reworkCounts.get(String(payload.taskId)) ?? 0); const auditRound = Number(payload.round ?? 0); const deliveryRound = Math.max(1, Number(payload.deliveryRound ?? 1)); return <div class={`task-pair-status-row task-pair-chip--${taskStatus}`} data-status={taskStatus} key={String(payload.taskId)}>
+        const content = group.rows.map((row, index) => { const payload = row.payload; const sequenceNumber = ++sequence; const queued = group.key === 'queued'; const terminal = TASK_PAIR_TERMINAL_STATUSES.includes(payload.toStatus as TaskPairStatus); const duration = formatTaskDuration({ startedAt: row.startedAt, finishedAt: payload.finishedAt, endedAt: payload.endedAt, updatedAt: row.updatedAt, now, durationMs: payload.durationMs, terminal }, durationUnits); const title = taskPairDisplayTitle(payload.title, String(payload.taskId), payload.brief) ?? t('taskPair.panel_untitled'); const taskStatus = String(payload.toStatus); const reworkCount = Math.max(1, reworkCounts.get(String(payload.taskId)) ?? 0); const auditRound = Number(payload.round ?? 0); const deliveryRound = Math.max(1, Number(payload.deliveryRound ?? 1)); return <div class={`task-pair-status-row task-pair-chip--${taskStatus}`} data-status={taskStatus} key={String(payload.taskId)}>
           <span class="task-pair-status-sequence" aria-label={`#${sequenceNumber}`}>{sequenceNumber}</span>
           <div class="task-pair-status-row-head">
             <span class={`task-pair-status-badge task-pair-chip--${taskStatus}`}>

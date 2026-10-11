@@ -6,7 +6,12 @@ import { TaskPairStatusPanel } from '../../src/components/TaskPairStatusPanel.js
 import { SupervisionTaskConsoleView } from '../../src/components/SupervisionTaskConsole.js';
 import { createSupervisionTaskConsoleState, SUPERVISION_TASK_CONSOLE_PHASE } from '../../src/supervision-task-console-reducer.js';
 
-vi.mock('react-i18next', () => ({ useTranslation: () => ({ t: (key: string) => key, i18n: { language: 'en' } }) }));
+vi.mock('react-i18next', () => ({
+  useTranslation: () => ({
+    t: (key: string, values?: Record<string, unknown>) => (values ? `${key}:${JSON.stringify(values)}` : key),
+    i18n: { language: 'en' },
+  }),
+}));
 const taskId = 'tsk_service_preexecution_fee_20261010';
 const exec = 'deck_sub_pair_auto_0123456789abcdef';
 const audit = 'deck_sub_pair_auto_fedcba9876543210';
@@ -37,9 +42,11 @@ describe('compact pair identities (screenshot counterexamples)', () => {
     const roles = container.querySelector('.task-pair-status-row-roles')!;
     expect(roles.textContent).toContain(`Pair executor${exec}`);
     expect(roles.textContent).toContain(`Pair auditor${audit}`);
+    expect(roles.textContent).toContain('secret-model');
+    expect(roles.textContent).toContain('other-model');
     expect(roles.textContent).not.toContain(taskId);
     expect(roles.textContent).not.toContain('产品排序任务');
-    expect(roles.textContent).not.toMatch(/secret-model|other-model|card_thinking/);
+    expect(roles.textContent).not.toMatch(/card_thinking/);
   });
   it('compacts all legacy protocol punctuation and keeps exact role navigation', () => {
     const navigate = vi.fn();
@@ -104,12 +111,13 @@ describe('compact pair identities (screenshot counterexamples)', () => {
     expect(navigate).toHaveBeenLastCalledWith(audit);
     window.removeEventListener('deck:navigate', listener);
   });
-  it('shows event role identities without model/thinking and never links none', () => {
+  it('shows event role identities with model and never links none', () => {
     const { container } = render(<TaskPairEventChip eventId="roles" payload={{ ...payload, auditor: 'none' }} />);
     fireEvent.click(container.querySelector('.task-pair-card-toggle')!);
     const roles = container.querySelectorAll('.task-pair-card-role');
     expect(roles[0]!.textContent).toContain(`Pair executor (${exec})`);
-    expect(roles[0]!.textContent).not.toMatch(/产品排序任务|secret-model|card_thinking/);
+    expect(roles[0]!.textContent).toContain('secret-model');
+    expect(roles[0]!.textContent).not.toMatch(/产品排序任务|card_thinking/);
     expect(roles[1]!.querySelector('button')).toBeNull();
     expect(roles[1]!.textContent).toContain('taskPair.panel_no_audit');
   });
@@ -127,7 +135,7 @@ describe('compact pair identities (screenshot counterexamples)', () => {
     expect(card.textContent).not.toContain(taskId);
     const button = card.querySelector<HTMLButtonElement>('.supervision-task-console-session')!;
     expect(button.textContent).toContain(`Pair executor (${exec})`);
-    expect(button.textContent).not.toContain('secret-model');
+    expect(button.textContent).toContain('secret-model');
     fireEvent.click(button);
     expect(navigate).toHaveBeenCalledWith(exec);
     fireEvent.click(card.querySelector('.supervision-task-console-details-toggle')!);

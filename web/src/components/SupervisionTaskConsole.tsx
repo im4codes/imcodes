@@ -371,6 +371,7 @@ function SessionButton(props: {
       <span class="supervision-task-console-session-icon" aria-hidden="true" />
       <span class="supervision-task-console-session-copy">
         <strong>{label || name}</strong>{label && <small> ({name})</small>}
+        {assignment.observedModel && <small class="supervision-task-console-session-model">{assignment.observedModel}</small>}
       </span>
       <span class="supervision-task-console-session-state">{stateLabel}{showRuntimeState ? ` · ${assignment.sessionStateSource ?? 'registry'}` : ''}</span>
       <span
@@ -440,7 +441,7 @@ function TaskCard(props: {
         <div class="supervision-task-console-task-summary">
           <ExpandableTaskObjective
             className="supervision-task-console-task-title"
-            text={taskPairDisplayTitle(props.task.title, props.task.taskId) ?? t('taskPair.panel_untitled')}
+            text={taskPairDisplayTitle(props.task.title, props.task.taskId, (props.task.pair as { brief?: string } | undefined)?.brief) ?? t('taskPair.panel_untitled')}
             onActivate={props.onToggle}
             activateExpanded={props.expanded}
             activateControls={`task-console-details-${props.task.taskId}`}

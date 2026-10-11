@@ -83,7 +83,7 @@ describe('TaskPairEventChip', () => {
     const preview = document.body.querySelector('.task-pair-card-hover-preview')!;
     expect(preview.textContent).toContain('Inspect handoff context');
     expect(preview.textContent).toContain('taskPair.status.passed');
-    expect(preview.textContent).not.toContain('provider/model-x');
+    expect(preview.textContent).toContain('provider/model-x');
     expect(preview.textContent).toContain('exec-session');
     expect(preview.textContent).not.toContain('taskPair.card_thinking');
     expect(preview.textContent).toContain('Readable human summary');
@@ -186,7 +186,7 @@ describe('TaskPairEventChip', () => {
     window.removeEventListener('deck:navigate', listener);
   });
 
-  it('shows only session identities instead of models in the expanded card', () => {
+  it('shows session identities and models in the expanded card', () => {
     const { container } = render(<TaskPairEventChip eventId="e-models" sessions={[
       { name: 'deck_sub_exec', activeModel: 'provider/active-executor', effort: 'high' },
       { name: 'deck_sub_aud', requestedModel: 'provider/requested-auditor', effort: 'medium' },
@@ -197,24 +197,23 @@ describe('TaskPairEventChip', () => {
     const card = container.querySelector('.task-pair-event-card')!;
     expect(card.textContent).not.toContain('provider/active-executor');
     fireEvent.click(card.querySelector('.task-pair-card-toggle')!);
-    expect(card.textContent).not.toContain('taskPair.card_model:{"value":"provider/active-executor"}');
-    expect(card.textContent).not.toContain('taskPair.card_model:{"value":"provider/requested-auditor"}');
+    expect(card.textContent).toContain('taskPair.card_model:{"value":"provider/active-executor"}');
+    expect(card.textContent).toContain('taskPair.card_model:{"value":"provider/requested-auditor"}');
     expect(card.textContent).not.toContain('taskPair.card_thinking:{"value":"high"}');
     expect(card.textContent).not.toContain('taskPair.card_thinking:{"value":"medium"}');
   });
 
-  it('never displays payload models or thinking for roles', () => {
+  it('displays payload models for roles while hiding thinking levels', () => {
     const { container } = render(<TaskPairEventChip eventId="e-model-payload" payload={{
       taskId: 'model-payload', title: 'Payload model', writer: 'daemon', verb: 'PASS', toStatus: 'passed',
       executor: 'deck_exec', executorLabel: 'Executor', executorModel: 'provider/pinned', executorThinking: 'low', auditor: 'deck_aud', auditorLabel: 'Auditor', unusual: false,
     }} />);
     const card = container.querySelector('.task-pair-event-card')!;
     fireEvent.click(card.querySelector('.task-pair-card-toggle')!);
-    expect(card.textContent).not.toContain('provider/pinned');
+    expect(card.textContent).toContain('provider/pinned');
     expect(card.textContent).not.toContain('taskPair.card_model:{"value":"taskPair.card_model_unknown"}');
     expect(card.textContent).not.toContain('taskPair.card_thinking:{"value":"low"}');
     expect(card.textContent).not.toContain('taskPair.card_thinking:{"value":"taskPair.card_thinking_unknown"}');
-    expect(card.textContent).not.toContain('provider/active');
   });
 
   it('marks a held verdict and an unusual event, and names the daemon', () => {
@@ -854,7 +853,7 @@ describe('TaskPairStatusPanel', () => {
     expect(screen.queryByText(/taskPair.panel_round/)).toBeNull();
   });
 
-  it('shows unassigned roles without requested models and no audit for auditor=none', () => {
+  it('shows unassigned roles with requested models and no audit for auditor=none', () => {
     render(<TaskPairStatusPanel events={[{
       eventId: 'queued-models', type: 'task_pair.event', ts: Date.now(),
       payload: {
@@ -865,8 +864,9 @@ describe('TaskPairStatusPanel', () => {
       eventId: 'queued-none', type: 'task_pair.event', ts: Date.now(),
       payload: { taskId: 'Q-none', title: 'Queued no audit', toStatus: 'queued', auditor: 'none', executorModel: 'gpt-6-luna' },
     }] as never} />);
-    expect(screen.getAllByText('taskPair.panel_unassigned').length).toBe(3);
-    expect(screen.queryByText(/gpt-6-(luna|sol)/)).toBeNull();
+    expect(screen.getAllByText(/taskPair\.panel_unassigned/).length).toBe(3);
+    expect(screen.getAllByText(/gpt-6-luna/).length).toBe(2);
+    expect(screen.getByText(/gpt-6-sol/)).toBeTruthy();
     expect(screen.getByText('taskPair.panel_no_audit')).toBeTruthy();
   });
 
@@ -978,7 +978,7 @@ describe('TaskPairStatusPanel', () => {
     }
   });
 
-  it('shows live names and exact ids, hides models, and navigates roles', () => {
+  it('shows live names, exact ids, and models, and navigates roles', () => {
     const navigate = vi.fn();
     const listener = (event: Event) => navigate((event as CustomEvent).detail.session);
     window.addEventListener('deck:navigate', listener);
@@ -988,7 +988,8 @@ describe('TaskPairStatusPanel', () => {
     }] as never} />);
     expect(screen.getByText('Cx1')).toBeTruthy();
     expect(screen.getByText('deck_sub_exec')).toBeTruthy();
-    expect(screen.queryByText(/gpt-6-(sol|astra|luna)/)).toBeNull();
+    expect(screen.getByText('gpt-6-sol')).toBeTruthy();
+    expect(screen.getByText('gpt-6-astra')).toBeTruthy();
     fireEvent.click(screen.getByRole('button', { name: /Cx1.*deck_sub_exec/ }));
     expect(navigate).toHaveBeenCalledWith('deck_sub_exec');
     window.removeEventListener('deck:navigate', listener);

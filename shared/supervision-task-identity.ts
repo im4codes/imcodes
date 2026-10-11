@@ -116,26 +116,62 @@ export function deriveSupervisionTaskTitle(objective: unknown): string | undefin
  */
 export function deriveSupervisionTaskTitleFromBrief(value: unknown, explicitTitle?: unknown): string | undefined {
   const explicit = readSupervisionTaskTitle(explicitTitle);
-  if (explicit) return explicit;
+  if (explicit && !TASK_PAIR_GENERIC_TITLE_PLACEHOLDERS.includes(explicit as never)) return explicit;
   if (typeof value !== 'string') return undefined;
   const projected = projectSupervisionTaskObjective(value);
   if (!projected) return undefined;
   const lines = projected.split('\n').map((line) => line.trim()).filter(Boolean);
-  const titleLine = lines.find((line) => /^title\s*:/iu.test(line));
-  if (titleLine) {
-    const candidate = titleLine.replace(/^title\s*:\s*/iu, '').trim().replace(/^['"“]|['"”]$/gu, '');
-    const title = readSupervisionTaskTitle(candidate);
-    if (title) return title;
+
+  // 1. Explicit title line
+  for (const line of lines) {
+    const m = /^(?:#+\s*)?(?:title|标题)\s*[:：]\s*(.+)/iu.exec(line);
+    if (m && m[1]?.trim()) {
+      const candidate = m[1].trim().replace(/^['"“]|['"”]$/gu, '');
+      const title = readSupervisionTaskTitle(candidate);
+      if (title && !TASK_PAIR_GENERIC_TITLE_PLACEHOLDERS.includes(title as never)) return title;
+    }
   }
-  const owner = lines.find((line) => /^owner\s+request\s*:/iu.test(line));
-  if (owner) {
-    const candidate = owner.replace(/^owner\s+request\s*:\s*/iu, '').trim().replace(/^['"“]|['"”]$/gu, '');
-    const title = readSupervisionTaskTitle(candidate);
-    if (title) return title;
+
+  // 2. Owner request
+  for (const line of lines) {
+    const m = /^(?:#+\s*)?owner\s+request\s*[:：]\s*(.+)/iu.exec(line);
+    if (m && m[1]?.trim()) {
+      const candidate = m[1].trim().replace(/^['"“]|['"”]$/gu, '');
+      const title = readSupervisionTaskTitle(candidate);
+      if (title && !TASK_PAIR_GENERIC_TITLE_PLACEHOLDERS.includes(title as never)) return title;
+    }
   }
-  const boilerplate = /^(?:\[brain\]|\[im\.codes task\]|you are the (?:executor|auditor)\b|repo\s*:|base\s*:|auditor\s*:|executor\s*:|rules?\s*:|process\s*:|phase\s+[a-z]\b|message from im\.codes\b)/iu;
-  const candidate = lines.find((line) => !boilerplate.test(line));
-  return readSupervisionTaskTitle(candidate ?? lines[0]);
+
+  // 3. Goal / Objective / 目标 / 任务 section or line
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]!;
+    const m = /^(?:#+\s*)?(?:goal|objective|task|目标|任务)\s*[:：]?\s*(.*)$/iu.exec(line);
+    if (m) {
+      if (m[1]?.trim()) {
+        const candidate = m[1].trim().replace(/^['"“]|['"”]$/gu, '');
+        const title = readSupervisionTaskTitle(candidate);
+        if (title && !TASK_PAIR_GENERIC_TITLE_PLACEHOLDERS.includes(title as never)) return title;
+      }
+      for (let j = i + 1; j < lines.length; j++) {
+        const next = lines[j]!;
+        if (/^#+/u.test(next)) break;
+        if (next) {
+          const cleaned = next.replace(/^用户[：“:"' ]*/u, '').replace(/^['"“]|['"”]$/gu, '');
+          const title = readSupervisionTaskTitle(cleaned);
+          if (title && !TASK_PAIR_GENERIC_TITLE_PLACEHOLDERS.includes(title as never)) return title;
+        }
+      }
+    }
+  }
+
+  const boilerplate = /^(?:\[brain\]|\[im\.codes task\]|you are the (?:executor|auditor)\b|repo\s*:|base\s*:|auditor\s*:|executor\s*:|rules?\s*:|process\s*:|phase\s+[a-z]\b|message from im\.codes\b|contractref\s*:|params\s*:|blocking\s*:|proven\s*:|workspace\s*:|branch\s*:|status\s*:|mode\s*:)/iu;
+  const candidate = lines.find((line) => !boilerplate.test(line) && !/^#+\s*(?:proven|suspected|direction|acceptance|boundary|evidence|out of scope)\b/iu.test(line));
+  if (candidate) {
+    const cleaned = candidate.replace(/^#+\s*/u, '').replace(/^['"“]|['"”]$/gu, '');
+    const title = readSupervisionTaskTitle(cleaned);
+    if (title && !TASK_PAIR_GENERIC_TITLE_PLACEHOLDERS.includes(title as never)) return title;
+  }
+  return readSupervisionTaskTitle(lines[0]);
 }
 
 /**
