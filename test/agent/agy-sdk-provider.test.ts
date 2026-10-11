@@ -242,6 +242,20 @@ describe('AgySdkProvider (fake agy process)', () => {
     expect(completes[0][1].content).toBe('Hello');
   });
 
+  it('cancelAndWait confirms child exit and next send resumes the conversation', async () => {
+    const sid = await provider.createSession({ sessionKey: 's5-wait', cwd: dir });
+    await provider.send(sid, 'HANG');
+    await waitFor(() => infos.length > 0);
+    const convId = infos[0][1].resumeId!;
+    await provider.cancelAndWait(sid);
+    expect(errors.some(([, e]) => e.code === PROVIDER_ERROR_CODES.CANCELLED)).toBe(true);
+    await provider.send(sid, 'resumed-after-cancel-and-wait');
+    await waitFor(() => completes.length === 1);
+    const resumed = launches()[1];
+    expect(resumed.slice(resumed.indexOf('--conversation'), resumed.indexOf('--conversation') + 2)).toEqual(['--conversation', convId]);
+    expect(completes[0][1].content).toBe('Hello');
+  });
+
   it('resumes a persisted conversation id passed through createSession and applies the model', async () => {
     const sid = await provider.createSession({ sessionKey: 's6', cwd: dir, resumeId: 'persisted-1', agentId: 'claude-sonnet-5-5-low' });
     await provider.send(sid, 'hi');

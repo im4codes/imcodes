@@ -43,6 +43,7 @@ import {
   agyMcpEnsureOptionsFromConfig,
   type AgyMcpEnsureResult,
 } from '../../daemon/agy-mcp-config.js';
+import { confirmChildStop, confirmCapturedChildExit } from '../provider-stop-confirmation.js';
 import { IMCODES_MEMORY_MCP_SERVER_NAME } from '../../../shared/memory-mcp-server-name.js';
 import { getDefaultMcpServers } from './getDefaultMcpServers.js';
 import {
@@ -322,6 +323,16 @@ export class AgySdkProvider implements TransportProvider {
     this.emitError(sessionId, PROVIDER_ERROR_CODES.CANCELLED, 'Turn cancelled', true);
   }
 
+  cancelAndWait(sessionId: string): Promise<void> {
+    const state = this.sessions.get(sessionId);
+    if (!state) return Promise.reject(new Error(`Session ${sessionId} not found`));
+    const capturedChild = state.child;
+    if (!capturedChild || capturedChild.killed || capturedChild.exitCode != null) {
+      return Promise.resolve();
+    }
+    return confirmChildStop(capturedChild, () => this.cancel(sessionId), () => this.sessions.get(sessionId) === state);
+  }
+
   setSessionAgentId(sessionId: string, agentId: string): void {
     const state = this.sessions.get(sessionId);
     if (!state || !agentId || state.model === agentId) return;
@@ -487,6 +498,7 @@ export class AgySdkProvider implements TransportProvider {
       );
     });
     child.once('exit', (code, signal) => {
+      confirmCapturedChildExit(child);
       rl.close();
       if (state.child !== child) return;
       state.child = null;
