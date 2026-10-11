@@ -6,8 +6,13 @@ import {
   AGY_USAGE_CACHE_FILE_NAME,
   AGY_USAGE_CACHE_TTL_MS,
   AGY_USAGE_CLI_ARGS,
+  AGY_USAGE_DEFAULT_TTL_MS,
   AGY_USAGE_FAILURE_BACKOFF_MS,
   AGY_USAGE_IDLE_SUPPRESS_MS,
+  AGY_USAGE_INACTIVE_TTL_MS,
+  AGY_USAGE_INACTIVE_WINDOW_MS,
+  AGY_USAGE_INTERACTIVE_TTL_MS,
+  AGY_USAGE_INTERACTIVE_WINDOW_MS,
   AGY_USAGE_KNOWN_GROUP_ORDER,
   AGY_USAGE_MAX_PERSISTED_AGE_MS,
   AGY_USAGE_TIMEOUT_MS,
@@ -32,10 +37,13 @@ export type AgyUsageExecFn = (
   options: { timeout: number; cwd: string },
 ) => Promise<{ stdout: string; stderr: string }>;
 
-export type FetchAgyUsageQuotaOptions = {
+export interface FetchAgyUsageQuotaOptions {
   forceRefresh?: boolean;
   execFn?: AgyUsageExecFn;
-};
+  isInteracting?: boolean;
+  lastActivityAt?: number;
+  ttlMs?: number;
+}
 
 function slugify(raw: string): string {
   return raw
@@ -367,6 +375,32 @@ let lastFailureAt = 0;
 let diskLoaded = false;
 let customExecFn: AgyUsageExecFn | null = null;
 
+export interface ResolveAgyUsageTtlOptions {
+  isInteracting?: boolean;
+  lastActivityAt?: number;
+  now?: number;
+}
+
+export function resolveAgyUsageTtl(opts?: ResolveAgyUsageTtlOptions): number {
+  const isInteracting = opts?.isInteracting ?? false;
+  const now = opts?.now ?? Date.now();
+  const activityAt = opts?.lastActivityAt !== undefined ? opts.lastActivityAt : lastActivityAt;
+
+  if (isInteracting || (activityAt > 0 && now - activityAt < AGY_USAGE_INTERACTIVE_WINDOW_MS)) {
+    return AGY_USAGE_INTERACTIVE_TTL_MS;
+  }
+
+  if (activityAt === 0 || now - activityAt >= AGY_USAGE_INACTIVE_WINDOW_MS) {
+    return AGY_USAGE_INACTIVE_TTL_MS;
+  }
+
+  return AGY_USAGE_DEFAULT_TTL_MS;
+}
+
+export function getLastAgyQuotaActivityAt(): number {
+  return lastActivityAt;
+}
+
 export function recordAgyQuotaActivity(now = Date.now()): void {
   lastActivityAt = now;
 }
@@ -435,12 +469,12 @@ async function executeProbe(execFn?: AgyUsageExecFn): Promise<string> {
  * Fetches usage quota snapshot from `agy --print /usage`.
  *
  * Guarantees:
+ * - Dynamic cadence: 10m interactive, 15m default, 30m inactive.
  * - Single-flight: concurrent callers share one in-flight probe.
- * - TTL cache (15 min): serves memory/disk cache without hitting process.
+ * - Dynamic TTL cache: serves memory/disk cache without hitting process.
  * - Persisted snapshot: survives daemon restart, dropped if older than 24h.
  * - Failure backoff (5 min): prevents retry storms on auth/network errors.
- * - Idle suppression (15 min): only probes when an agy-sdk session was active recently.
- * - On-demand forceRefresh: bypasses TTL, backoff, and idle gate.
+ * - On-demand forceRefresh: bypasses TTL, backoff, and inactive gate.
  * - Never throws to callers; returns last good snapshot on error.
  */
 export async function fetchAgyUsageQuota(
@@ -448,22 +482,24 @@ export async function fetchAgyUsageQuota(
 ): Promise<AgyUsageQuota | null> {
   const force = typeof optsOrForce === 'boolean' ? optsOrForce : !!optsOrForce?.forceRefresh;
   const execFn = typeof optsOrForce === 'object' && optsOrForce ? optsOrForce.execFn : undefined;
+  const optionsObj = typeof optsOrForce === 'object' && optsOrForce ? optsOrForce : undefined;
 
   loadPersistedCacheOnce();
   const now = Date.now();
 
-  // Fresh cache (served within TTL unless forceRefresh)
-  if (!force && cache && now - cache.at < AGY_USAGE_CACHE_TTL_MS) {
+  const effectiveTtl = optionsObj?.ttlMs ?? resolveAgyUsageTtl({
+    isInteracting: optionsObj?.isInteracting,
+    lastActivityAt: optionsObj?.lastActivityAt,
+    now,
+  });
+
+  // Fresh cache (served within dynamic TTL unless forceRefresh)
+  if (!force && cache && now - cache.at < effectiveTtl) {
     return cache.value;
   }
 
   // Failure backoff
   if (!force && lastFailureAt > 0 && now - lastFailureAt < AGY_USAGE_FAILURE_BACKOFF_MS) {
-    return cache?.value ?? null;
-  }
-
-  // Idle suppression: no agy-sdk session active within the idle window
-  if (!force && (lastActivityAt === 0 || now - lastActivityAt > AGY_USAGE_IDLE_SUPPRESS_MS)) {
     return cache?.value ?? null;
   }
 
@@ -498,10 +534,12 @@ export async function fetchAgyUsageQuota(
 
 /**
  * Refresh quota metadata for all agy-sdk sessions, and persist/broadcast any change.
- * Throttled by TTL cache so calling it on turn completion is safe and non-blocking.
+ * Throttled by dynamic TTL cache so calling it on turn completion is safe and non-blocking.
  */
-export async function refreshAgyQuotaMetadata(force = false): Promise<AgyUsageQuota | null> {
-  const quota = await fetchAgyUsageQuota(force).catch(() => null);
+export async function refreshAgyQuotaMetadata(
+  optsOrForce?: boolean | FetchAgyUsageQuotaOptions,
+): Promise<AgyUsageQuota | null> {
+  const quota = await fetchAgyUsageQuota(optsOrForce).catch(() => null);
   if (!quota) return null;
   const { listSessions, upsertSession } = await import('../store/session-store.js');
   const { persistSessionRecord } = await import('./session-manager.js');

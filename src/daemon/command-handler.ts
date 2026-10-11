@@ -143,7 +143,7 @@ import {
 } from './p2p-target-selection.js';
 import { buildSessionList } from './session-list.js';
 import { setClaudeUsageQuotaOptIn, recordClaudeQuotaActivity } from '../agent/claude-usage-quota.js';
-import { recordAgyQuotaActivity, refreshAgyQuotaMetadata } from '../agent/agy-usage-quota.js';
+import { getLastAgyQuotaActivityAt, recordAgyQuotaActivity, refreshAgyQuotaMetadata } from '../agent/agy-usage-quota.js';
 import { CLAUDE_QUOTA_MSG } from '../../shared/claude-quota.js';
 import { CODEX_RESET_CREDITS_MSG } from '../../shared/codex-reset-credits.js';
 import { CODEX_CREDIT_HISTORY_MSG, type CodexCreditSnapshot } from '../../shared/codex-credit-history.js';
@@ -1510,16 +1510,27 @@ export async function refreshClaudeSdkSubQuotaMetadata(serverLink?: ServerLink):
 
 /**
  * Periodic quota refresh for agy-sdk sessions (main sessions and sub-sessions).
- * Probes `agy --print /usage` (throttled to 15m by AGY_USAGE_CACHE_TTL_MS) and pushes
- * updated quota metadata to connected clients via handleGetSessions / sendSubSessionSync.
+ * Probes `agy --print /usage` (dynamic cadence: 10m interactive, 15m default, 30m inactive)
+ * and pushes updated quota metadata to connected clients via handleGetSessions / sendSubSessionSync.
  */
 export async function refreshAgyQuotaMetadataForSessions(serverLink?: ServerLink): Promise<void> {
   const sessions = listSessions();
   const agySessions = sessions.filter((s) => s.agentType === AGY_SDK_PROVIDER_ID && s.state !== 'stopped' && s.state !== 'error');
   if (agySessions.length === 0) return;
 
-  recordAgyQuotaActivity();
-  const quota = await refreshAgyQuotaMetadata().catch(() => null);
+  const isInteracting = agySessions.some((s) => {
+    if (s.state === 'running' || (s as any).status === 'running') return true;
+    const runtime = getTransportRuntime(s.name);
+    if (runtime?.sending) return true;
+    return false;
+  });
+  const latestSessionActivityAt = Math.max(0, ...agySessions.map((s) => s.updatedAt || 0));
+  const effectiveLastActivityAt = Math.max(getLastAgyQuotaActivityAt(), latestSessionActivityAt);
+
+  const quota = await refreshAgyQuotaMetadata({
+    isInteracting,
+    lastActivityAt: effectiveLastActivityAt,
+  }).catch(() => null);
   if (!quota) return;
 
   if (serverLink) {

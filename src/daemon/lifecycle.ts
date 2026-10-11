@@ -2632,7 +2632,7 @@ function startCodexQuotaPoller(serverLink: ServerLink | null): void {
     void refreshClaudeSdkSubQuotaMetadata(serverLink).catch((err) => {
       logger.warn({ err }, 'Claude SDK sub-session quota refresh failed');
     });
-    // agy-sdk sessions probe `agy --print /usage` (throttled to 15m by AGY_USAGE_CACHE_TTL_MS).
+    // agy-sdk sessions probe `agy --print /usage` (dynamic cadence: 10m interactive, 15m default, 30m inactive).
     void refreshAgyQuotaMetadataForSessions(serverLink).catch((err) => {
       logger.warn({ err }, 'Antigravity quota refresh failed');
     });

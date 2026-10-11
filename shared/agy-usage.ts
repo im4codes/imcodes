@@ -45,11 +45,26 @@ export const AGY_USAGE_WINDOW_LABEL_TO_MINS: Readonly<Record<string, number>> = 
   [AGY_USAGE_WINDOW_LABEL.WEEKLY]: AGY_USAGE_WINDOW_MINS.WEEKLY,
 };
 
-/** Throttle TTL for caching usage probe results (15 min). */
-export const AGY_USAGE_CACHE_TTL_MS = 15 * 60 * 1000;
+/** Quota refresh TTL when any agy session is actively interacting (10 min). */
+export const AGY_USAGE_INTERACTIVE_TTL_MS = 10 * 60 * 1000;
 
-/** Idle suppression interval: skip probing if no agy-sdk session active within this window (15 min). */
-export const AGY_USAGE_IDLE_SUPPRESS_MS = 15 * 60 * 1000;
+/** Default background refresh TTL for agy usage quota (15 min). */
+export const AGY_USAGE_DEFAULT_TTL_MS = 15 * 60 * 1000;
+
+/** Quota refresh TTL when agy sessions are inactive (30 min). */
+export const AGY_USAGE_INACTIVE_TTL_MS = 30 * 60 * 1000;
+
+/** Throttle TTL for caching usage probe results (15 min default). */
+export const AGY_USAGE_CACHE_TTL_MS = AGY_USAGE_DEFAULT_TTL_MS;
+
+/** Window within which an agy session is considered actively interacting (10 min). */
+export const AGY_USAGE_INTERACTIVE_WINDOW_MS = 10 * 60 * 1000;
+
+/** Window after which an idle agy session is considered inactive (30 min). */
+export const AGY_USAGE_INACTIVE_WINDOW_MS = 30 * 60 * 1000;
+
+/** Inactive suppression threshold (30 min). */
+export const AGY_USAGE_IDLE_SUPPRESS_MS = AGY_USAGE_INACTIVE_WINDOW_MS;
 
 /** Failure backoff interval before retrying a failed probe (5 min). */
 export const AGY_USAGE_FAILURE_BACKOFF_MS = 5 * 60 * 1000;

@@ -11,9 +11,22 @@ import {
   peekAgyUsageQuotaCached,
   setAgyUsageExecFn,
   __resetAgyUsageQuotaCache,
+  resolveAgyUsageTtl,
+  getLastAgyQuotaActivityAt,
   type AgyUsageQuota,
 } from '../../src/agent/agy-usage-quota.js';
-import { AGY_USAGE_CACHE_FILE_NAME, AGY_USAGE_CACHE_TTL_MS, AGY_USAGE_FAILURE_BACKOFF_MS, AGY_USAGE_IDLE_SUPPRESS_MS, AGY_USAGE_MAX_PERSISTED_AGE_MS } from '../../shared/agy-usage.js';
+import {
+  AGY_USAGE_CACHE_FILE_NAME,
+  AGY_USAGE_CACHE_TTL_MS,
+  AGY_USAGE_DEFAULT_TTL_MS,
+  AGY_USAGE_FAILURE_BACKOFF_MS,
+  AGY_USAGE_IDLE_SUPPRESS_MS,
+  AGY_USAGE_INACTIVE_TTL_MS,
+  AGY_USAGE_INACTIVE_WINDOW_MS,
+  AGY_USAGE_INTERACTIVE_TTL_MS,
+  AGY_USAGE_INTERACTIVE_WINDOW_MS,
+  AGY_USAGE_MAX_PERSISTED_AGE_MS,
+} from '../../shared/agy-usage.js';
 import { AGY_CLI_PATH_ENV } from '../../shared/agy-agent.js';
 import { formatProviderQuotaLabel } from '../../shared/provider-quota.js';
 import { imcodesStateDir, imcodesStatePath } from '../../src/util/imcodes-state-dir.js';
@@ -275,6 +288,53 @@ describe('parseAgyUsageOutput', () => {
   });
 });
 
+describe('resolveAgyUsageTtl', () => {
+  it('returns 10 minutes when isInteracting is true regardless of lastActivityAt', () => {
+    const now = 1_000_000_000;
+    expect(resolveAgyUsageTtl({ isInteracting: true, now, lastActivityAt: 0 })).toBe(AGY_USAGE_INTERACTIVE_TTL_MS);
+    expect(resolveAgyUsageTtl({ isInteracting: true, now, lastActivityAt: now - 60 * 60 * 1000 })).toBe(AGY_USAGE_INTERACTIVE_TTL_MS);
+  });
+
+  it('returns 10 minutes when activity is within the 10-minute interactive window', () => {
+    const now = 1_000_000_000;
+    // 5 minutes ago (< 10 min window)
+    expect(resolveAgyUsageTtl({ isInteracting: false, now, lastActivityAt: now - 5 * 60 * 1000 })).toBe(AGY_USAGE_INTERACTIVE_TTL_MS);
+    // 9 minutes 59 seconds ago
+    expect(resolveAgyUsageTtl({ isInteracting: false, now, lastActivityAt: now - 599 * 1000 })).toBe(AGY_USAGE_INTERACTIVE_TTL_MS);
+  });
+
+  it('returns 15 minutes default when activity is between 10m and 30m ago', () => {
+    const now = 1_000_000_000;
+    // 12 minutes ago
+    expect(resolveAgyUsageTtl({ isInteracting: false, now, lastActivityAt: now - 12 * 60 * 1000 })).toBe(AGY_USAGE_DEFAULT_TTL_MS);
+    // 25 minutes ago
+    expect(resolveAgyUsageTtl({ isInteracting: false, now, lastActivityAt: now - 25 * 60 * 1000 })).toBe(AGY_USAGE_DEFAULT_TTL_MS);
+  });
+
+  it('returns 30 minutes when activity is >= 30m ago or never recorded', () => {
+    const now = 1_000_000_000;
+    // exactly 30 minutes ago
+    expect(resolveAgyUsageTtl({ isInteracting: false, now, lastActivityAt: now - 30 * 60 * 1000 })).toBe(AGY_USAGE_INACTIVE_TTL_MS);
+    // 45 minutes ago
+    expect(resolveAgyUsageTtl({ isInteracting: false, now, lastActivityAt: now - 45 * 60 * 1000 })).toBe(AGY_USAGE_INACTIVE_TTL_MS);
+    // never recorded (0)
+    expect(resolveAgyUsageTtl({ isInteracting: false, now, lastActivityAt: 0 })).toBe(AGY_USAGE_INACTIVE_TTL_MS);
+  });
+
+  it('uses recorded global activity when lastActivityAt option is omitted', () => {
+    const now = Date.now();
+    recordAgyQuotaActivity(now - 3 * 60 * 1000);
+    expect(getLastAgyQuotaActivityAt()).toBe(now - 3 * 60 * 1000);
+    expect(resolveAgyUsageTtl({ now })).toBe(AGY_USAGE_INTERACTIVE_TTL_MS);
+
+    recordAgyQuotaActivity(now - 15 * 60 * 1000);
+    expect(resolveAgyUsageTtl({ now })).toBe(AGY_USAGE_DEFAULT_TTL_MS);
+
+    recordAgyQuotaActivity(now - 35 * 60 * 1000);
+    expect(resolveAgyUsageTtl({ now })).toBe(AGY_USAGE_INACTIVE_TTL_MS);
+  });
+});
+
 describe('fetchAgyUsageQuota fetcher & cache logic', () => {
   let tempStateDir: string;
   let originalImcodesHome: string | undefined;
@@ -382,13 +442,13 @@ describe('fetchAgyUsageQuota fetcher & cache logic', () => {
     expect(calls).toBe(2);
   });
 
-  it('idle suppression serves persisted snapshot without probing', async () => {
+  it('idle suppression serves persisted snapshot without probing when within inactive TTL', async () => {
     // Seed persisted snapshot on disk
     mkdirSync(imcodesStateDir(), { recursive: true });
     const cachePath = imcodesStatePath(AGY_USAGE_CACHE_FILE_NAME);
     const meta = parseAgyUsageTsv(SAMPLE_TSV)!;
     const persistedEntry = {
-      at: Date.now() - 30 * 60 * 1000, // 30 min old (>15m TTL)
+      at: Date.now() - 20 * 60 * 1000, // 20 min old (>15m default TTL, but within 30m inactive TTL)
       value: { quotaMeta: meta, quotaLabel: 'persisted-agy-label' },
     };
     writeFileSync(cachePath, JSON.stringify(persistedEntry), 'utf8');
@@ -399,6 +459,70 @@ describe('fetchAgyUsageQuota fetcher & cache logic', () => {
 
     expect(mockExec).not.toHaveBeenCalled();
     expect(result?.quotaLabel).toBe('persisted-agy-label');
+  });
+
+  it('dynamic cadence: probes after 10m when session is actively interacting', async () => {
+    vi.useFakeTimers();
+    const now = Date.now();
+    vi.setSystemTime(now);
+
+    const mockExec = vi.fn(async () => ({ stdout: SAMPLE_TSV, stderr: '' }));
+    await fetchAgyUsageQuota({ execFn: mockExec });
+    expect(mockExec).toHaveBeenCalledTimes(1);
+
+    // 9 minutes later with active interaction: still within 10m TTL -> no probe
+    vi.setSystemTime(now + 9 * 60 * 1000);
+    await fetchAgyUsageQuota({ isInteracting: true, execFn: mockExec });
+    expect(mockExec).toHaveBeenCalledTimes(1);
+
+    // 11 minutes later with active interaction: exceeds 10m TTL -> probes
+    vi.setSystemTime(now + 11 * 60 * 1000);
+    await fetchAgyUsageQuota({ isInteracting: true, execFn: mockExec });
+    expect(mockExec).toHaveBeenCalledTimes(2);
+  });
+
+  it('dynamic cadence: probes after 15m default when session had activity between 10m and 30m', async () => {
+    vi.useFakeTimers();
+    const now = Date.now();
+    vi.setSystemTime(now);
+
+    const mockExec = vi.fn(async () => ({ stdout: SAMPLE_TSV, stderr: '' }));
+    await fetchAgyUsageQuota({ execFn: mockExec });
+    expect(mockExec).toHaveBeenCalledTimes(1);
+
+    // Activity recorded 12 minutes ago -> TTL is 15 min
+    // Advance cache age to 14 minutes: 14m < 15m -> no probe
+    vi.setSystemTime(now + 14 * 60 * 1000);
+    const lastActivityAt = (now + 14 * 60 * 1000) - 12 * 60 * 1000;
+    await fetchAgyUsageQuota({ lastActivityAt, execFn: mockExec });
+    expect(mockExec).toHaveBeenCalledTimes(1);
+
+    // Advance cache age to 16 minutes: 16m >= 15m -> probes
+    vi.setSystemTime(now + 16 * 60 * 1000);
+    const updatedLastActivityAt = (now + 16 * 60 * 1000) - 14 * 60 * 1000;
+    await fetchAgyUsageQuota({ lastActivityAt: updatedLastActivityAt, execFn: mockExec });
+    expect(mockExec).toHaveBeenCalledTimes(2);
+  });
+
+  it('dynamic cadence: probes after 30m when inactive (extending refresh to 30 min)', async () => {
+    vi.useFakeTimers();
+    const now = Date.now();
+    vi.setSystemTime(now);
+
+    const mockExec = vi.fn(async () => ({ stdout: SAMPLE_TSV, stderr: '' }));
+    await fetchAgyUsageQuota({ execFn: mockExec });
+    expect(mockExec).toHaveBeenCalledTimes(1);
+
+    // Inactive: no activity recorded
+    // Advance to 25 minutes: 25m < 30m inactive TTL -> no probe
+    vi.setSystemTime(now + 25 * 60 * 1000);
+    await fetchAgyUsageQuota({ execFn: mockExec });
+    expect(mockExec).toHaveBeenCalledTimes(1);
+
+    // Advance to 31 minutes: 31m >= 30m inactive TTL -> probes
+    vi.setSystemTime(now + 31 * 60 * 1000);
+    await fetchAgyUsageQuota({ execFn: mockExec });
+    expect(mockExec).toHaveBeenCalledTimes(2);
   });
 
   it('persisted snapshot older than 24h is dropped', async () => {
