@@ -2,12 +2,14 @@ import { describe, expect, it } from 'vitest';
 import {
   sessionIdentityProjectKey,
   sessionIdentitySessionKey,
+  sessionIdentityPairKey,
   SESSION_IDENTITY_BLOCK_CLOSE_TAG,
   SESSION_IDENTITY_BLOCK_OPEN_TAG,
   SESSION_IDENTITY_COMBINED_MAX_CHARS,
   SESSION_IDENTITY_MAX_CHARS,
   SESSION_IDENTITY_SOURCE_FILE_MAX_BYTES,
   SESSION_IDENTITY_PROJECT_MAX_CHARS,
+  SESSION_IDENTITY_PAIR_MAX_CHARS,
   SESSION_IDENTITY_SCOPES,
   SESSION_IDENTITY_SESSION_MAX_CHARS,
   SESSION_IDENTITY_USER_MAX_CHARS,
@@ -37,24 +39,27 @@ function profile(scope: SessionIdentityProfile['scope'], content: string): Sessi
 }
 
 describe('session identity contracts', () => {
-  it('renders user -> project -> session in deterministic override order', () => {
+  it('renders user -> project -> pair -> session in deterministic override order', () => {
     const rendered = renderSessionIdentityProfiles([
       profile(SESSION_IDENTITY_SCOPES.SESSION, 'session rule'),
       profile(SESSION_IDENTITY_SCOPES.USER, 'user rule'),
+      profile(SESSION_IDENTITY_SCOPES.PAIR, 'pair rule'),
       profile(SESSION_IDENTITY_SCOPES.PROJECT, 'project rule'),
     ])!;
     expect(rendered.indexOf('<user>')).toBeLessThan(rendered.indexOf('<project>'));
-    expect(rendered.indexOf('<project>')).toBeLessThan(rendered.indexOf('<session>'));
+    expect(rendered.indexOf('<project>')).toBeLessThan(rendered.indexOf('<pair>'));
+    expect(rendered.indexOf('<pair>')).toBeLessThan(rendered.indexOf('<session>'));
     expect(rendered).toContain('Later sections override');
     expect(rendered).toContain('latest explicit instruction overrides every conflicting identity section');
     expect(rendered).toContain('Platform system/developer instructions');
   });
 
-  it('enforces user 100k, project 300k, and session 300k character limits', () => {
+  it('enforces user 100k, project 300k, pair 200k, and session 300k character limits', () => {
     // Pinned on purpose: these are product decisions, so a change should have
     // to be made here too rather than slipping through as a side effect.
     expect(SESSION_IDENTITY_USER_MAX_CHARS).toBe(100_000);
     expect(SESSION_IDENTITY_PROJECT_MAX_CHARS).toBe(300_000);
+    expect(SESSION_IDENTITY_PAIR_MAX_CHARS).toBe(200_000);
     expect(SESSION_IDENTITY_SESSION_MAX_CHARS).toBe(300_000);
     // Derived, not restated: the file pre-read must track the session cap, and
     // a second literal is how the two drift apart into a profile that validates
@@ -64,6 +69,7 @@ describe('session identity contracts', () => {
     for (const [scope, limit] of [
       [SESSION_IDENTITY_SCOPES.USER, SESSION_IDENTITY_USER_MAX_CHARS],
       [SESSION_IDENTITY_SCOPES.PROJECT, SESSION_IDENTITY_PROJECT_MAX_CHARS],
+      [SESSION_IDENTITY_SCOPES.PAIR, SESSION_IDENTITY_PAIR_MAX_CHARS],
       [SESSION_IDENTITY_SCOPES.SESSION, SESSION_IDENTITY_SESSION_MAX_CHARS],
     ] as const) {
       expect(sessionIdentityContentError('x'.repeat(limit), scope)).toBeNull();
@@ -74,19 +80,21 @@ describe('session identity contracts', () => {
     expect(sessionIdentityContentError('\0')).toBe('identity_content_invalid');
   });
 
-  it('requires scope keys only for project and session profiles', () => {
+  it('requires scope keys only for project, pair, and session profiles', () => {
     expect(sessionIdentityScopeKeyError('user', '')).toBeNull();
     expect(sessionIdentityScopeKeyError('user', 'unexpected')).toBe('identity_scope_key_forbidden');
     expect(sessionIdentityScopeKeyError('project', '')).toBe('identity_scope_key_required');
+    expect(sessionIdentityScopeKeyError('pair', '')).toBe('identity_scope_key_required');
+    expect(sessionIdentityScopeKeyError('pair', 'tsk_123')).toBeNull();
     expect(sessionIdentityScopeKeyError('session', 'srv:deck_proj_brain')).toBeNull();
   });
 });
 
 describe('identity limit propagation', () => {
-  it('derives the combined ceiling from the three scopes', () => {
+  it('derives the combined ceiling from the four scopes', () => {
     expect(SESSION_IDENTITY_COMBINED_MAX_CHARS)
-      .toBe(SESSION_IDENTITY_USER_MAX_CHARS + SESSION_IDENTITY_PROJECT_MAX_CHARS + SESSION_IDENTITY_SESSION_MAX_CHARS);
-    expect(SESSION_IDENTITY_COMBINED_MAX_CHARS).toBe(700_000);
+      .toBe(SESSION_IDENTITY_USER_MAX_CHARS + SESSION_IDENTITY_PROJECT_MAX_CHARS + SESSION_IDENTITY_PAIR_MAX_CHARS + SESSION_IDENTITY_SESSION_MAX_CHARS);
+    expect(SESSION_IDENTITY_COMBINED_MAX_CHARS).toBe(900_000);
   });
 
   it('accepts every scope at exactly its limit in 4-byte code points and rejects one more', () => {
@@ -95,6 +103,7 @@ describe('identity limit propagation', () => {
     for (const [scope, limit] of [
       [SESSION_IDENTITY_SCOPES.USER, SESSION_IDENTITY_USER_MAX_CHARS],
       [SESSION_IDENTITY_SCOPES.PROJECT, SESSION_IDENTITY_PROJECT_MAX_CHARS],
+      [SESSION_IDENTITY_SCOPES.PAIR, SESSION_IDENTITY_PAIR_MAX_CHARS],
       [SESSION_IDENTITY_SCOPES.SESSION, SESSION_IDENTITY_SESSION_MAX_CHARS],
     ] as const) {
       expect(sessionIdentityContentError('😀'.repeat(limit), scope)).toBeNull();
@@ -122,6 +131,7 @@ describe('identity limit propagation', () => {
     const description = JSON.stringify(contract.inputSchema);
     expect(description).toContain(`user scope up to ${SESSION_IDENTITY_USER_MAX_CHARS.toLocaleString('en-US')} characters`);
     expect(description).toContain(`project up to ${SESSION_IDENTITY_PROJECT_MAX_CHARS.toLocaleString('en-US')}`);
+    expect(description).toContain(`pair up to ${SESSION_IDENTITY_PAIR_MAX_CHARS.toLocaleString('en-US')}`);
     expect(description).toContain(`session up to ${SESSION_IDENTITY_SESSION_MAX_CHARS.toLocaleString('en-US')} characters`);
     // The previous description advertised limits the code no longer enforced.
     expect(description).not.toContain('40,000');
@@ -133,6 +143,7 @@ describe('identity limit boundaries and normalization', () => {
   const scopes = [
     [SESSION_IDENTITY_SCOPES.USER, SESSION_IDENTITY_USER_MAX_CHARS],
     [SESSION_IDENTITY_SCOPES.PROJECT, SESSION_IDENTITY_PROJECT_MAX_CHARS],
+    [SESSION_IDENTITY_SCOPES.PAIR, SESSION_IDENTITY_PAIR_MAX_CHARS],
     [SESSION_IDENTITY_SCOPES.SESSION, SESSION_IDENTITY_SESSION_MAX_CHARS],
   ] as const;
 
@@ -198,12 +209,18 @@ describe('session identity scope keys', () => {
   it('keys a session identity by server and session name', () => {
     expect(sessionIdentitySessionKey('srv-1', 'deck_proj_brain')).toBe('srv-1:deck_proj_brain');
   });
+
+  it('keys a pair identity by the trimmed task id', () => {
+    expect(sessionIdentityPairKey('  tsk_abc123  ')).toBe('tsk_abc123');
+  });
 });
 
 describe('identity-over-lease handle (phase 2)', () => {
-  it('round-trips scope and scope key for both project and session scope', () => {
+  it('round-trips scope and scope key for project, pair, and session scope', () => {
     expect(decodeSessionIdentityDirectHandle(encodeSessionIdentityDirectHandle('project', 'repo-1')))
       .toEqual({ scope: 'project', scopeKey: 'repo-1' });
+    expect(decodeSessionIdentityDirectHandle(encodeSessionIdentityDirectHandle('pair', 'tsk_abc123')))
+      .toEqual({ scope: 'pair', scopeKey: 'tsk_abc123' });
     expect(decodeSessionIdentityDirectHandle(encodeSessionIdentityDirectHandle('session', 'srv-1:deck_proj_brain')))
       .toEqual({ scope: 'session', scopeKey: 'srv-1:deck_proj_brain' });
   });

@@ -11,7 +11,7 @@ import { runExclusive } from '../util/keyed-mutex.js';
 import logger from '../util/logger.js';
 import { randomUUID } from 'node:crypto';
 import { parseTaskPairChecklist, taskPairChecklistCounts, updateTaskPairChecklist } from '../../shared/task-pair-checklist.js';
-import { isTerminalTaskPairStatus, TASK_PAIR_CREATE_REQUIRED_MESSAGE, TASK_PAIR_MANUAL_MODE_NOTE, TASK_PAIR_MCP_DELIVERY_EVENT, TASK_PAIR_MCP_DISPATCH_EVENT, TASK_PAIR_NO_AUDITOR, TASK_PAIR_WORKSPACE_REQUESTS, isTaskPairWorkspaceRequest, taskPairRoleOf, type TaskPairWorkspaceRequest } from '../../shared/task-pair.js';
+import { isTerminalTaskPairStatus, TASK_PAIR_CREATE_REQUIRED_MESSAGE, TASK_PAIR_MANUAL_MODE_NOTE, TASK_PAIR_MCP_DELIVERY_EVENT, TASK_PAIR_MCP_DISPATCH_EVENT, TASK_PAIR_NO_AUDITOR, TASK_PAIR_PARTICIPANT_STATUSES, TASK_PAIR_WORKSPACE_REQUESTS, isTaskPairWorkspaceRequest, taskPairRoleOf, type TaskPairWorkspaceRequest } from '../../shared/task-pair.js';
 import { TASK_PAIR_WORKSPACE_PICK_GUIDANCE, taskPairWorkspaceCreateNote } from '../../shared/task-pair-workspace.js';
 import { z } from 'zod';
 import type { CapabilityMcpToolDeps } from './capability-mcp-tools.js';
@@ -162,6 +162,7 @@ import { publishRuntimeMemoryCacheInvalidation } from '../context/runtime-memory
 import { isMemoryInjectionEnabled, setMemoryInjectionEnabled } from '../context/memory-injection-toggle.js';
 import { getMemoryFeatureConfigStoreDiagnostics, getPersistedMemoryFeatureFlagValues, getRuntimeMemoryFeatureFlagValues } from '../store/memory-feature-config-store.js';
 import { getContextStoreClient } from '../store/context-store-worker-client.js';
+import type { ContextNamespaceRow, ContextObservationRow } from '../store/context-store.js';
 import { getSession, listSessions as listStoredSessions, loadStore, type SessionRecord } from '../store/session-store.js';
 import { dispatchDestroyExecutionClone, dispatchSendMessage, dispatchSendStop, listSendTargets, resolveProjectAuthoritativeSupervisionSnapshot, type SendMessageAgentIdentity, type SendMessageCloneRequest, type SendToolDeps } from './send-tool.js';
 import {
@@ -229,6 +230,7 @@ import {
   sessionIdentityContentError,
   sessionIdentityProjectKey,
   sessionIdentitySessionKey,
+  sessionIdentityPairKey,
   type SessionIdentityScope,
 } from '../../shared/session-identity.js';
 import {
@@ -238,6 +240,9 @@ import {
   setSessionIdentityProfile,
   type SessionIdentityClientOptions,
 } from './session-identity-mcp-client.js';
+import { getLocalSessionIdentityProfile } from './session-identity-local-store.js';
+import { defaultActivePairTaskIdForSession } from './session-identity-resolver.js';
+import { taskPairFocusOf } from './task-pairs/focus.js';
 import {
   VERIFICATION_MACHINE_KIND_LIST,
   VERIFICATION_MACHINE_KINDS,
@@ -1536,6 +1541,31 @@ async function resolveProjectionRefArg(
   return resolved.id;
 }
 
+type MemoryRefTarget = { kind: 'projection' | 'observation'; id: string };
+
+async function resolveMemoryRefArg(
+  args: Record<string, unknown>,
+  namespace: ContextNamespace,
+): Promise<MemoryRefTarget | ToolResult> {
+  const projectionId = stringArg(args, 'projectionId');
+  const observationId = stringArg(args, 'observationId');
+  const ref = stringArg(args, 'ref');
+  const count = (projectionId ? 1 : 0) + (observationId ? 1 : 0) + (ref ? 1 : 0);
+  if (count > 1) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'provide at most one of projectionId, observationId, or ref');
+  if (projectionId) return { kind: 'projection', id: projectionId };
+  if (observationId) return { kind: 'observation', id: observationId };
+  if (!ref) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'projectionId, observationId, or ref is required');
+  const resolved = await resolveMemoryShortRefWithStore(ref, namespace);
+  if (!resolved) {
+    return error(MCP_ERROR_REASONS.PROJECTION_UNAVAILABLE, 'memory is not available in the caller namespace');
+  }
+  return { kind: resolved.kind, id: resolved.id };
+}
+
+function isMemoryRefTarget(value: MemoryRefTarget | ToolResult): value is MemoryRefTarget {
+  return typeof value === 'object' && value !== null && 'kind' in value && 'id' in value && !('status' in value && value.status === 'error');
+}
+
 async function loadManageableProjection(
   projectionId: string,
   scopedCaller: McpRuntimeCaller,
@@ -1963,19 +1993,87 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
     return { status: 'ok', target };
   };
 
-  const identityScopeKey = (scope: SessionIdentityScope, target: SessionRecord): string => {
+  const resolvePairForIdentity = async (
+    rawTarget?: string,
+    rawTaskId?: string,
+  ): Promise<
+    | { status: 'ok'; pair: NonNullable<ReturnType<ReturnType<typeof getTaskPairStore>['getPair']>>; taskId: string }
+    | { status: 'error'; result: ToolResult }
+  > => {
+    const sessions = await sendSessions();
+    const callerRecord = caller.sessionName
+      ? sessions.find((session) => session.name === caller.sessionName)
+      : undefined;
+    if (!callerRecord) {
+      return { status: 'error', result: error(MCP_ERROR_REASONS.IDENTITY_REJECTED, 'current session identity is unavailable') };
+    }
+    const store = getTaskPairStore();
+    const project = resolveEffectiveProjectName(callerRecord, sessions)
+      ?? callerRecord.projectName
+      ?? projectOfSession(caller.sessionName ?? '');
+    if (!project) {
+      return { status: 'error', result: error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'project is unavailable') };
+    }
+
+    const explicitTaskId = rawTaskId?.trim();
+    const targetSessionMatches = rawTarget?.trim() ? sessions.some((s) => s.name === rawTarget.trim()) : false;
+    const taskIdCandidate = explicitTaskId || (rawTarget?.trim() && !targetSessionMatches ? rawTarget.trim() : undefined);
+
+    let pair: NonNullable<ReturnType<ReturnType<typeof getTaskPairStore>['getPair']>> | undefined;
+    if (taskIdCandidate) {
+      pair = store.getPair(project, taskIdCandidate) ?? undefined;
+      if (!pair) {
+        const allPairs = store.listPairs(project);
+        pair = allPairs.find((p) => p.state.taskId === taskIdCandidate) ?? undefined;
+      }
+    } else {
+      const targetSessionName = (targetSessionMatches ? rawTarget?.trim() : undefined) || caller.sessionName!;
+      const pairs = store.pairsForSession(targetSessionName);
+      const active = pairs.filter((p) => TASK_PAIR_PARTICIPANT_STATUSES.includes(p.state.status));
+      const focus = taskPairFocusOf(targetSessionName);
+      pair = (focus ? active.find((p) => p.state.taskId === focus) : undefined) ?? active[0] ?? pairs[0];
+    }
+
+    if (!pair) {
+      return { status: 'error', result: error(MCP_ERROR_REASONS.PROJECTION_UNAVAILABLE, 'task pair not found') };
+    }
+
+    const isAuthorized = callerRecord.role === 'brain'
+      || pair.state.brain === caller.sessionName
+      || pair.state.executor === caller.sessionName
+      || pair.state.auditor === caller.sessionName;
+
+    if (!isAuthorized) {
+      return {
+        status: 'error',
+        result: error(MCP_ERROR_REASONS.SCOPE_FORBIDDEN, 'only the project Brain or a current pair participant may access this pair identity'),
+      };
+    }
+
+    return { status: 'ok', pair, taskId: pair.state.taskId };
+  };
+
+  const identityScopeKey = (scope: SessionIdentityScope, target: SessionRecord, taskId?: string): string => {
     if (scope === SESSION_IDENTITY_SCOPES.USER) return '';
     if (scope === SESSION_IDENTITY_SCOPES.PROJECT) {
       return sessionIdentityProjectKey({ contextNamespace: target.contextNamespace, project: target.projectName });
     }
+    if (scope === SESSION_IDENTITY_SCOPES.PAIR) {
+      if (taskId?.trim()) return sessionIdentityPairKey(taskId);
+      return '';
+    }
     return sessionIdentitySessionKey(caller.serverId ?? 'local', target.name);
   };
 
-  const refreshIdentityTarget = async (target: SessionRecord) => {
+  const refreshIdentityTarget = async (target: SessionRecord, explicitPairTaskId?: unknown) => {
     try {
+      const pairTaskId = typeof explicitPairTaskId === 'string' && explicitPairTaskId.trim()
+        ? explicitPairTaskId.trim()
+        : (await defaultActivePairTaskIdForSession(target.name));
       const effective = await identityGetEffective({
         projectKey: identityScopeKey(SESSION_IDENTITY_SCOPES.PROJECT, target),
         sessionKey: identityScopeKey(SESSION_IDENTITY_SCOPES.SESSION, target),
+        ...(pairTaskId ? { pairKey: sessionIdentityPairKey(pairTaskId) } : {}),
       }, identityOptions);
       if (effective.status !== 'ok') {
         return { status: 'error' as const, target: target.name, state: 'stale' as const, error: effective.message };
@@ -2015,7 +2113,25 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
     scope: SessionIdentityScope,
     target: SessionRecord,
     all: boolean,
+    pair?: NonNullable<ReturnType<ReturnType<typeof getTaskPairStore>['getPair']>>,
   ): Promise<SessionRecord[]> => {
+    if (scope === SESSION_IDENTITY_SCOPES.PAIR) {
+      const sessions = await sendSessions();
+      let pairRecord = pair;
+      if (!pairRecord) {
+        const activeTaskId = await defaultActivePairTaskIdForSession(target.name);
+        if (activeTaskId) {
+          const project = resolveEffectiveProjectName(target, sessions) ?? target.projectName;
+          pairRecord = getTaskPairStore().getPair(project, activeTaskId) ?? undefined;
+        }
+      }
+      if (pairRecord) {
+        const participantNames = [pairRecord.state.executor, pairRecord.state.auditor].filter((name): name is string => Boolean(name));
+        const matched = sessions.filter((session) => session.state !== 'stopped' && participantNames.includes(session.name));
+        if (matched.length > 0) return matched;
+      }
+      return [target];
+    }
     if (!all) return [target];
     if (scope === SESSION_IDENTITY_SCOPES.SESSION) return [target, ...(await sessionScopeSubSessions(target))];
     const sessions = await sendSessions();
@@ -2031,9 +2147,14 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       && identityScopeKey(SESSION_IDENTITY_SCOPES.PROJECT, session) === targetProjectKey);
   };
 
-  const refreshAffectedIdentities = async (scope: SessionIdentityScope, target: SessionRecord, all: boolean) => {
-    const affected = await affectedIdentitySessions(scope, target, all);
-    return Promise.all(affected.map((session) => refreshIdentityTarget(session)));
+  const refreshAffectedIdentities = async (
+    scope: SessionIdentityScope,
+    target: SessionRecord,
+    all: boolean,
+    pair?: NonNullable<ReturnType<ReturnType<typeof getTaskPairStore>['getPair']>>,
+  ) => {
+    const affected = await affectedIdentitySessions(scope, target, all, pair);
+    return Promise.all(affected.map((session) => refreshIdentityTarget(session, pair?.state.taskId)));
   };
   const refreshedTargetNames = (results: readonly { status: string; target?: string }[]) => results
     .filter((item) => (item.status === 'applied' || item.status === 'pending') && item.target)
@@ -2086,7 +2207,12 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       const taskId = typeof input === 'object' && input !== null && typeof (input as Record<string, unknown>).taskId === 'string' ? String((input as Record<string, unknown>).taskId) : undefined;
       const access = pairChecklistAccess(caller, await sendSessions(), taskId);
       if (access.status !== 'ok') return pairAccessError(access);
-      return pairChecklistView(access.pair, await participantViewRequired())!;
+      const view = pairChecklistView(access.pair, await participantViewRequired())!;
+      const profile = await getLocalSessionIdentityProfile(SESSION_IDENTITY_SCOPES.PAIR, sessionIdentityPairKey(access.pair.state.taskId)).catch(() => null);
+      return {
+        ...view,
+        pairIdentity: profile?.content ?? null,
+      };
     },
     [MEMORY_MCP_TOOL_NAMES.PAIR_TASK_UPDATE]: async (input) => {
       const args = (input && typeof input === 'object' ? input : {}) as Record<string, unknown>;
@@ -2331,36 +2457,84 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
     [MEMORY_MCP_TOOL_NAMES.DELETE_MEMORY]: async (input) => {
       const gate = memorySurfaceGate(deps);
       if (gate) return gate;
-      const args = pickAllowedMcpArgs(input, ['projectionId', 'ref']);
+      const args = pickAllowedMcpArgs(input, ['projectionId', 'observationId', 'ref']);
       const scopedCaller = scopedCallerForDeps(caller, deps);
-      const projectionId = await resolveProjectionRefArg(args, scopedCaller.namespace);
-      if (typeof projectionId !== 'string') return projectionId;
-      const projection = await loadManageableProjection(projectionId, scopedCaller, getProcessedProjectionById);
+      const target = await resolveMemoryRefArg(args, scopedCaller.namespace);
+      if (!isMemoryRefTarget(target)) return target;
+      if (target.kind === 'observation') {
+        const observation = await getContextStoreClient().run<ContextObservationRow | null>('getContextObservationById', [target.id]);
+        if (!observation) {
+          return error(MCP_ERROR_REASONS.PROJECTION_UNAVAILABLE, 'observation not found');
+        }
+        const callerProj = callerProjectId(scopedCaller);
+        if (callerProj) {
+          const namespaces = await getContextStoreClient().run<ContextNamespaceRow[]>('listContextNamespaces', []);
+          const ns = namespaces.find((n) => n.id === observation.namespaceId);
+          if (ns?.projectId && ns.projectId !== callerProj) {
+            return error(MCP_ERROR_REASONS.SCOPE_FORBIDDEN, 'observation is outside caller project');
+          }
+        }
+        const changed = await getContextStoreClient().run<boolean>('deleteContextObservation', [target.id]);
+        if (changed) {
+          publishRuntimeMemoryCacheInvalidation({
+            kind: 'observation',
+            observationId: target.id,
+            namespace: scopedCaller.namespace,
+          });
+        }
+        return { status: 'ok', observationId: target.id, changed };
+      }
+      const projection = await loadManageableProjection(target.id, scopedCaller, getProcessedProjectionById);
       if (isToolResultValue(projection)) return projection;
-      const changed = await deleteMemory(projectionId);
-      if (changed) publishRuntimeMemoryCacheInvalidation({ kind: 'projection', projectionId, namespace: projection.namespace });
-      return { status: 'ok', projectionId, changed };
+      const changed = await deleteMemory(target.id);
+      if (changed) publishRuntimeMemoryCacheInvalidation({ kind: 'projection', projectionId: target.id, namespace: projection.namespace });
+      return { status: 'ok', projectionId: target.id, changed };
     },
     [MEMORY_MCP_TOOL_NAMES.UPDATE_MEMORY]: async (input) => {
       const gate = memorySurfaceGate(deps);
       if (gate) return gate;
-      const args = pickAllowedMcpArgs(input, ['projectionId', 'ref', 'text']);
+      const args = pickAllowedMcpArgs(input, ['projectionId', 'observationId', 'ref', 'text']);
       const text = stringArg(args, 'text');
       if (!text) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'text is required');
       const scopedCaller = scopedCallerForDeps(caller, deps);
-      const projectionId = await resolveProjectionRefArg(args, scopedCaller.namespace);
-      if (typeof projectionId !== 'string') return projectionId;
-      const projection = await loadManageableProjection(projectionId, scopedCaller, getProcessedProjectionById);
+      const target = await resolveMemoryRefArg(args, scopedCaller.namespace);
+      if (!isMemoryRefTarget(target)) return target;
+      if (target.kind === 'observation') {
+        const observation = await getContextStoreClient().run<ContextObservationRow | null>('getContextObservationById', [target.id]);
+        if (!observation) {
+          return error(MCP_ERROR_REASONS.PROJECTION_UNAVAILABLE, 'observation not found');
+        }
+        const callerProj = callerProjectId(scopedCaller);
+        if (callerProj) {
+          const namespaces = await getContextStoreClient().run<ContextNamespaceRow[]>('listContextNamespaces', []);
+          const ns = namespaces.find((n) => n.id === observation.namespaceId);
+          if (ns?.projectId && ns.projectId !== callerProj) {
+            return error(MCP_ERROR_REASONS.SCOPE_FORBIDDEN, 'observation is outside caller project');
+          }
+        }
+        const updated = await getContextStoreClient().run<ContextObservationRow | null>('updateContextObservationText', [{
+          id: target.id,
+          text,
+        }]);
+        if (!updated) return error(MCP_ERROR_REASONS.PROJECTION_UNAVAILABLE, 'observation could not be updated');
+        publishRuntimeMemoryCacheInvalidation({
+          kind: 'observation',
+          observationId: target.id,
+          namespace: scopedCaller.namespace,
+        });
+        return { status: 'ok', observationId: target.id, changed: true };
+      }
+      const projection = await loadManageableProjection(target.id, scopedCaller, getProcessedProjectionById);
       if (isToolResultValue(projection)) return projection;
       const updated = await updateProcessedProjectionSummary({
-        projectionId,
+        projectionId: target.id,
         summary: text,
         ownerUserId: scopedCaller.userId,
         updatedByUserId: scopedCaller.userId,
       });
       if (!updated) return error(MCP_ERROR_REASONS.PROJECTION_UNAVAILABLE, 'projection is not available in the caller namespace');
-      publishRuntimeMemoryCacheInvalidation({ kind: 'projection', projectionId, namespace: updated.namespace });
-      return { status: 'ok', projectionId, changed: true };
+      publishRuntimeMemoryCacheInvalidation({ kind: 'projection', projectionId: target.id, namespace: updated.namespace });
+      return { status: 'ok', projectionId: target.id, changed: true };
     },
     [MEMORY_MCP_TOOL_NAMES.MEMORY_FEEDBACK]: async (input) => {
       const gate = memorySurfaceGate(deps);
@@ -2387,7 +2561,35 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
     [MEMORY_MCP_TOOL_NAMES.SAVE_OBSERVATION]: async (input) => {
       const gate = memoryGate(deps, MEMORY_FEATURE_FLAGS_BY_NAME.observationStore, MEMORY_MCP_DISABLED_FLAGS.OBSERVATION_STORE);
       if (gate) return gate;
-      return await saveObservationTool(pickAllowedMcpArgs(input, ['content', 'tags', 'turnId', 'idempotencyKey']), memoryCaller()) as unknown as ToolResult;
+      const args = pickAllowedMcpArgs(input, ['content', 'tags', 'turnId', 'idempotencyKey', 'replacesRef']);
+      const replacesRef = stringArg(args, 'replacesRef');
+      if (replacesRef) {
+        const scopedCaller = scopedCallerForDeps(caller, deps);
+        const resolvedReplaces = await resolveMemoryRefArg({ ref: replacesRef }, scopedCaller.namespace);
+        if (isMemoryRefTarget(resolvedReplaces)) {
+          if (resolvedReplaces.kind === 'observation') {
+            await getContextStoreClient().run('deleteContextObservation', [resolvedReplaces.id]).catch(() => {});
+            publishRuntimeMemoryCacheInvalidation({ kind: 'observation', observationId: resolvedReplaces.id, namespace: scopedCaller.namespace });
+          } else {
+            try {
+              await deleteMemory(resolvedReplaces.id);
+            } catch {}
+            publishRuntimeMemoryCacheInvalidation({ kind: 'projection', projectionId: resolvedReplaces.id, namespace: scopedCaller.namespace });
+          }
+        }
+      }
+      const memoryCallerInstance = memoryCaller();
+      const result = await saveObservationTool(pickAllowedMcpArgs(args, ['content', 'tags', 'turnId', 'idempotencyKey']), memoryCallerInstance) as unknown as ToolResult;
+      if (result && typeof result === 'object' && 'status' in result && result.status === 'ok' && 'observationId' in result) {
+        const observationId = String(result.observationId);
+        await getContextStoreClient().run('activateContextObservation', [observationId]).catch(() => {});
+        publishRuntimeMemoryCacheInvalidation({
+          kind: 'observation',
+          observationId,
+          namespace: memoryCallerInstance.namespace,
+        });
+      }
+      return result;
     },
     [MEMORY_MCP_TOOL_NAMES.SAVE_PREFERENCE]: async (input) => {
       const gate = memoryGate(deps, MEMORY_FEATURE_FLAGS_BY_NAME.preferences, MEMORY_MCP_DISABLED_FLAGS.PREFERENCES);
@@ -2410,29 +2612,124 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       return { status: 'ok', enabled };
     },
     [MEMORY_MCP_TOOL_NAMES.SESSION_IDENTITY_GET]: async (input) => {
-      const args = pickAllowedMcpArgs(input, ['target']);
-      const resolved = await resolveIdentityTarget(stringArg(args, 'target'));
+      const args = pickAllowedMcpArgs(input, ['target', 'taskId']);
+      const taskIdArg = stringArg(args, 'taskId');
+      const targetArg = stringArg(args, 'target');
+      const sessions = await sendSessions();
+      const isTargetTaskId = targetArg ? !sessions.some((s) => s.name === targetArg.trim()) : false;
+
+      if (taskIdArg || isTargetTaskId) {
+        const pairResolved = await resolvePairForIdentity(targetArg, taskIdArg);
+        if (pairResolved.status === 'ok') {
+          const { pair, taskId } = pairResolved;
+          const pairKey = sessionIdentityPairKey(taskId);
+          const projectKey = sessionIdentityProjectKey({ project: pair.project });
+          const result = await identityGetEffective({
+            projectKey,
+            pairKey,
+          }, identityOptions);
+          if (result.status !== 'ok') return result;
+          const prompt = renderSessionIdentityProfiles(result.profiles);
+          const pairProfile = result.profiles.find((p) => p.scope === SESSION_IDENTITY_SCOPES.PAIR);
+          return {
+            status: 'ok',
+            taskId,
+            project: pair.project,
+            profiles: result.profiles,
+            pairIdentity: pairProfile?.content ?? null,
+            effectiveIdentity: prompt ?? null,
+          };
+        } else if (taskIdArg) {
+          return pairResolved.result;
+        }
+      }
+
+      const resolved = await resolveIdentityTarget(targetArg);
       if (resolved.status === 'error') return resolved.result;
       const { target } = resolved;
+      const activePairTaskId = await defaultActivePairTaskIdForSession(target.name);
       const result = await identityGetEffective({
         projectKey: identityScopeKey(SESSION_IDENTITY_SCOPES.PROJECT, target),
         sessionKey: identityScopeKey(SESSION_IDENTITY_SCOPES.SESSION, target),
+        pairKey: activePairTaskId ? sessionIdentityPairKey(activePairTaskId) : undefined,
       }, identityOptions);
       if (result.status !== 'ok') return result;
       const prompt = renderSessionIdentityProfiles(result.profiles);
+      const pairProfile = result.profiles.find((p) => p.scope === SESSION_IDENTITY_SCOPES.PAIR);
       return {
         status: 'ok',
         target: target.name,
         projectName: target.projectName,
+        pairTaskId: activePairTaskId ?? null,
+        pairIdentity: pairProfile?.content ?? null,
         profiles: result.profiles,
         effectiveIdentity: prompt ?? null,
       };
     },
     [MEMORY_MCP_TOOL_NAMES.SESSION_IDENTITY_SET]: async (input) => {
-      const args = pickAllowedMcpArgs(input, ['identityScope', 'target', 'content', 'filePath', 'expectedRevision', 'all']);
+      const args = pickAllowedMcpArgs(input, ['identityScope', 'target', 'taskId', 'content', 'filePath', 'expectedRevision', 'all', 'append']);
       const scopeValue = stringArg(args, 'identityScope');
       if (!isSessionIdentityScope(scopeValue)) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'scope is invalid');
       const all = boolArg(args, 'all') ?? defaultIdentityRefreshAll(scopeValue);
+      const append = boolArg(args, 'append') ?? false;
+
+      if (scopeValue === SESSION_IDENTITY_SCOPES.PAIR) {
+        const pairResolved = await resolvePairForIdentity(stringArg(args, 'target'), stringArg(args, 'taskId'));
+        if (pairResolved.status === 'error') return pairResolved.result;
+        const { pair, taskId } = pairResolved;
+        const inline = stringArg(args, 'content');
+        const filePath = stringArg(args, 'filePath');
+        if (Boolean(inline) === Boolean(filePath)) {
+          return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'provide exactly one of content or filePath');
+        }
+        let content: string;
+        try {
+          const sessions = await sendSessions();
+          const targetSession = sessions.find((s) => s.name === pair.state.executor || s.name === pair.state.auditor || s.name === pair.state.brain);
+          content = filePath
+            ? await readIdentityFile(
+              filePath,
+              targetSession?.projectDir ?? pair.project,
+              true,
+            )
+            : inline ?? '';
+        } catch (err) {
+          return error(MCP_ERROR_REASONS.VALIDATION_FAILED, err instanceof Error ? err.message : 'identity_file_invalid');
+        }
+        const pairKey = sessionIdentityPairKey(taskId);
+        if (append) {
+          const existing = await identityGet(scopeValue, pairKey, identityOptions);
+          if (existing.status === 'ok' && existing.profile?.content) {
+            const existingContent = existing.profile.content.trim();
+            if (existingContent) {
+              content = `${existingContent}\n\n${content.trim()}`;
+            }
+          }
+        }
+        const contentReason = sessionIdentityContentError(content, scopeValue);
+        if (contentReason) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, contentReason);
+        const saved = await identitySet({
+          scope: scopeValue,
+          scopeKey: pairKey,
+          content: normalizeSessionIdentityContent(content),
+          ...(filePath ? { sourceFile: filePath } : {}),
+        }, identityOptions);
+        if (saved.status !== 'ok') return saved;
+        const sessions = await sendSessions();
+        const dummyTarget = sessions.find((s) => s.name === pair.state.executor || s.name === pair.state.auditor || s.name === pair.state.brain)
+          ?? sessions.find((s) => s.name === caller.sessionName)!;
+        const refreshed = await refreshAffectedIdentities(scopeValue, dummyTarget, all, pair);
+        return {
+          status: 'ok',
+          saved: true,
+          taskId,
+          all,
+          profile: { ...saved.profile, content: undefined },
+          written: [taskId],
+          refreshed: refreshedTargetNames(refreshed),
+        };
+      }
+
       const resolved = await resolveIdentityTarget(stringArg(args, 'target'));
       if (resolved.status === 'error') return resolved.result;
       const { target } = resolved;
@@ -2458,11 +2755,22 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       } catch (err) {
         return error(MCP_ERROR_REASONS.VALIDATION_FAILED, err instanceof Error ? err.message : 'identity_file_invalid');
       }
+      const targetScopeKey = identityScopeKey(scopeValue, target);
+      const rawChunk = content;
+      if (append) {
+        const existing = await identityGet(scopeValue, targetScopeKey, identityOptions);
+        if (existing.status === 'ok' && existing.profile?.content) {
+          const existingContent = existing.profile.content.trim();
+          if (existingContent) {
+            content = `${existingContent}\n\n${content.trim()}`;
+          }
+        }
+      }
       const contentReason = sessionIdentityContentError(content, scopeValue);
       if (contentReason) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, contentReason);
       const saved = await identitySet({
         scope: scopeValue,
-        scopeKey: identityScopeKey(scopeValue, target),
+        scopeKey: targetScopeKey,
         content: normalizeSessionIdentityContent(content),
         ...(filePath ? { sourceFile: filePath } : {}),
       }, identityOptions);
@@ -2474,15 +2782,24 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       let fanoutFailed: string[] = [];
       if (scopeValue === SESSION_IDENTITY_SCOPES.SESSION && all) {
         const subSessions = await sessionScopeSubSessions(target);
-        const results = await Promise.all(subSessions.map(async (session) => ({
-          session,
-          result: await identitySet({
-            scope: scopeValue,
-            scopeKey: identityScopeKey(scopeValue, session),
-            content: normalizeSessionIdentityContent(content),
-            ...(filePath ? { sourceFile: filePath } : {}),
-          }, identityOptions),
-        })));
+        const results = await Promise.all(subSessions.map(async (session) => {
+          let subContent = content;
+          if (append) {
+            const subKey = identityScopeKey(scopeValue, session);
+            const subExisting = await identityGet(scopeValue, subKey, identityOptions);
+            const subExistingContent = subExisting.status === 'ok' && subExisting.profile?.content ? subExisting.profile.content.trim() : '';
+            subContent = subExistingContent ? `${subExistingContent}\n\n${rawChunk.trim()}` : rawChunk;
+          }
+          return {
+            session,
+            result: await identitySet({
+              scope: scopeValue,
+              scopeKey: identityScopeKey(scopeValue, session),
+              content: normalizeSessionIdentityContent(subContent),
+              ...(filePath ? { sourceFile: filePath } : {}),
+            }, identityOptions),
+          };
+        }));
         fanoutWritten = results.filter((entry) => entry.result.status === 'ok').map((entry) => entry.session.name);
         fanoutFailed = results.filter((entry) => entry.result.status !== 'ok').map((entry) => entry.session.name);
       }
@@ -2499,10 +2816,37 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       };
     },
     [MEMORY_MCP_TOOL_NAMES.SESSION_IDENTITY_CLEAR]: async (input) => {
-      const args = pickAllowedMcpArgs(input, ['identityScope', 'target', 'expectedRevision', 'all']);
+      const args = pickAllowedMcpArgs(input, ['identityScope', 'target', 'taskId', 'expectedRevision', 'all']);
       const scopeValue = stringArg(args, 'identityScope');
       if (!isSessionIdentityScope(scopeValue)) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'scope is invalid');
       const all = boolArg(args, 'all') ?? defaultIdentityRefreshAll(scopeValue);
+
+      if (scopeValue === SESSION_IDENTITY_SCOPES.PAIR) {
+        const pairResolved = await resolvePairForIdentity(stringArg(args, 'target'), stringArg(args, 'taskId'));
+        if (pairResolved.status === 'error') return pairResolved.result;
+        const { pair, taskId } = pairResolved;
+        const pairKey = sessionIdentityPairKey(taskId);
+        const cleared = await identityClear(
+          SESSION_IDENTITY_SCOPES.PAIR,
+          pairKey,
+          undefined,
+          identityOptions,
+        );
+        if (cleared.status !== 'ok') return cleared;
+        const sessions = await sendSessions();
+        const dummyTarget = sessions.find((s) => s.name === pair.state.executor || s.name === pair.state.auditor || s.name === pair.state.brain)
+          ?? sessions.find((s) => s.name === caller.sessionName)!;
+        const refreshed = await refreshAffectedIdentities(scopeValue, dummyTarget, all, pair);
+        return {
+          status: 'ok',
+          deleted: cleared.deleted,
+          taskId,
+          all,
+          cleared: [taskId],
+          refreshed: refreshedTargetNames(refreshed),
+        };
+      }
+
       const resolved = await resolveIdentityTarget(stringArg(args, 'target'));
       if (resolved.status === 'error') return resolved.result;
       const { target } = resolved;
@@ -2564,7 +2908,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
           if (targetProject !== callerProject) return error(MCP_ERROR_REASONS.SCOPE_FORBIDDEN, `target "${name}" is outside the caller project`);
           if (!selected.some((entry) => entry.name === target.name)) selected.push(target);
         }
-        const results = await Promise.all(selected.map(refreshIdentityTarget));
+        const results = await Promise.all(selected.map((session) => refreshIdentityTarget(session)));
         return {
           status: results.some((result) => result.status === 'error') ? 'error' : 'ok',
           targets: results,
@@ -2584,7 +2928,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
         if (callerProject !== anchorProject) return error(MCP_ERROR_REASONS.SCOPE_FORBIDDEN, 'target is outside the caller project');
         const selected = sessions.filter((session) => session.state !== 'stopped'
           && (resolveEffectiveProjectName(session, sessions) ?? session.projectName) === callerProject);
-        const results = await Promise.all(selected.map(refreshIdentityTarget));
+        const results = await Promise.all(selected.map((session) => refreshIdentityTarget(session)));
         return {
           status: results.some((result) => result.status === 'error') ? 'error' : 'ok',
           all: true,
@@ -2990,10 +3334,12 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
         : new Map<string, number>();
       const participantView = await participantViewRequired();
       const events = getTaskPairStore().listEvents(context.project, taskId, eventLimit);
+      const profile = await getLocalSessionIdentityProfile(SESSION_IDENTITY_SCOPES.PAIR, sessionIdentityPairKey(taskId)).catch(() => null);
       return {
         status: 'ok',
         pair: {
           ...pairProjection(stored, context.sessions, queuePositions, participantView),
+          pairIdentity: profile?.content ?? null,
           // Marker attrs can contain titles/models and arbitrary brief or report text under different keys. Keep transition metadata,
           // not raw attrs, for the entire history (including older stored events); the owner's view and stored records are unchanged.
           events: participantView ? events.map((event) => ({ ...event, attrs: {} })) : events,
@@ -4496,11 +4842,13 @@ const schemas = {
   }),
   [MEMORY_MCP_TOOL_NAMES.DELETE_MEMORY]: z.object({
     projectionId: z.string().optional(),
-    ref: z.string().optional().describe('Compact proj: ref.'),
+    observationId: z.string().optional(),
+    ref: z.string().optional().describe('Compact proj: or obs: ref.'),
   }),
   [MEMORY_MCP_TOOL_NAMES.UPDATE_MEMORY]: z.object({
     projectionId: z.string().optional(),
-    ref: z.string().optional().describe('Compact proj: ref.'),
+    observationId: z.string().optional(),
+    ref: z.string().optional().describe('Compact proj: or obs: ref.'),
     text: z.string().describe('Replacement summary.'),
   }),
   [MEMORY_MCP_TOOL_NAMES.MEMORY_FEEDBACK]: z.object({
@@ -4514,6 +4862,7 @@ const schemas = {
     tags: z.array(z.string()).optional(),
     turnId: z.string().optional().describe('Source turn/event id.'),
     idempotencyKey: z.string().optional().describe('Retry key.'),
+    replacesRef: z.string().optional().describe('Optional observation or projection reference to delete atomically when replacing.'),
   }),
   [MEMORY_MCP_TOOL_NAMES.SAVE_PREFERENCE]: z.object({
     text: z.string().describe('Stable preference text.'),
@@ -4524,15 +4873,18 @@ const schemas = {
     enabled: z.boolean().describe('true to enable (the default), false to disable.'),
   }).strict(),
   [MEMORY_MCP_TOOL_NAMES.SESSION_IDENTITY_GET]: z.object({
-    target: z.string().optional().describe('Exact session name; defaults to the current session.'),
+    target: z.string().optional().describe('Exact session name or taskId; defaults to the current session.'),
+    taskId: z.string().optional().describe('Optional taskId for pair scope.'),
   }).strict(),
   [MEMORY_MCP_TOOL_NAMES.SESSION_IDENTITY_SET]: z.object({
     identityScope: z.enum(SESSION_IDENTITY_SCOPE_LIST),
-    target: z.string().optional().describe('Exact session name used to resolve project/session scope.'),
+    target: z.string().optional().describe('Exact session name or taskId used to resolve project/pair/session scope.'),
+    taskId: z.string().optional().describe('Optional taskId for pair scope; defaults to current session task.'),
     content: z.string().optional().describe('Inline identity contract.'),
-    filePath: z.string().optional().describe('UTF-8 identity file. User/project scope is project-relative; session scope also accepts an absolute daemon-host path.'),
+    filePath: z.string().optional().describe('UTF-8 identity file. User/project scope is project-relative; session/pair scope also accepts an absolute daemon-host path.'),
     expectedRevision: z.number().int().nonnegative().optional(),
     all: z.boolean().optional(),
+    append: z.boolean().optional().describe('When true, appends content to the existing identity profile (separated by newlines) rather than overwriting.'),
   }).strict().superRefine((value, context) => {
     if (Boolean(value.content) === Boolean(value.filePath)) {
       context.addIssue({ code: z.ZodIssueCode.custom, message: 'provide exactly one of content or filePath' });
@@ -4540,7 +4892,8 @@ const schemas = {
   }),
   [MEMORY_MCP_TOOL_NAMES.SESSION_IDENTITY_CLEAR]: z.object({
     identityScope: z.enum(SESSION_IDENTITY_SCOPE_LIST),
-    target: z.string().optional().describe('Exact session name used to resolve project/session scope.'),
+    target: z.string().optional().describe('Exact session name or taskId used to resolve project/pair/session scope.'),
+    taskId: z.string().optional().describe('Optional taskId for pair scope; defaults to current session task.'),
     expectedRevision: z.number().int().nonnegative().optional(),
     all: z.boolean().optional(),
   }).strict(),

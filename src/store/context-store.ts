@@ -4089,6 +4089,12 @@ export function listContextNamespaces(filters: {
     .filter((row) => !filters.sessionTreeId || row.sessionTreeId === filters.sessionTreeId);
 }
 
+export function getContextNamespaceById(id: string): ContextNamespaceRow | null {
+  const database = ensureDb();
+  const row = database.prepare('SELECT * FROM context_namespaces WHERE id = ?').get(id) as Record<string, unknown> | undefined;
+  return row ? namespaceRowFromDb(row) : null;
+}
+
 export function writeContextObservation(input: ContextObservationInput): ContextObservationRow {
   const database = ensureDb();
   database.exec('BEGIN IMMEDIATE');
@@ -4495,6 +4501,13 @@ export function deleteContextObservation(observationId: string): boolean {
   const database = ensureDb();
   const result = database.prepare('DELETE FROM context_observations WHERE id = ?').run(observationId);
   return ((result as { changes: number }).changes ?? 0) > 0;
+}
+
+export function activateContextObservation(observationId: string, now = Date.now()): boolean {
+  const database = ensureDb();
+  const result = database.prepare('UPDATE context_observations SET state = ?, updated_at = ? WHERE id = ?')
+    .run('active', now, observationId);
+  return ((result as { changes?: number }).changes ?? 0) > 0;
 }
 
 

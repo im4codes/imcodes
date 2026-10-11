@@ -3,6 +3,7 @@
 export const SESSION_IDENTITY_SCOPES = {
   USER: 'user',
   PROJECT: 'project',
+  PAIR: 'pair',
   SESSION: 'session',
 } as const;
 
@@ -13,14 +14,22 @@ export const SESSION_IDENTITY_SCOPE_LIST = Object.freeze(
   Object.values(SESSION_IDENTITY_SCOPES),
 ) as readonly SessionIdentityScope[];
 
+export const SESSION_SETTING_IDENTITY_SCOPES = Object.freeze([
+  SESSION_IDENTITY_SCOPES.USER,
+  SESSION_IDENTITY_SCOPES.PROJECT,
+  SESSION_IDENTITY_SCOPES.SESSION,
+]) as readonly ('user' | 'project' | 'session')[];
+
 export const SESSION_IDENTITY_USER_MAX_CHARS = 100_000;
 export const SESSION_IDENTITY_PROJECT_MAX_CHARS = 300_000;
+export const SESSION_IDENTITY_PAIR_MAX_CHARS = 200_000;
 export const SESSION_IDENTITY_SESSION_MAX_CHARS = 300_000;
 /** Backward-compatible alias for the largest single profile (session scope). */
 export const SESSION_IDENTITY_MAX_CHARS = SESSION_IDENTITY_SESSION_MAX_CHARS;
 export const SESSION_IDENTITY_MAX_CHARS_BY_SCOPE: Readonly<Record<SessionIdentityScope, number>> = Object.freeze({
   [SESSION_IDENTITY_SCOPES.USER]: SESSION_IDENTITY_USER_MAX_CHARS,
   [SESSION_IDENTITY_SCOPES.PROJECT]: SESSION_IDENTITY_PROJECT_MAX_CHARS,
+  [SESSION_IDENTITY_SCOPES.PAIR]: SESSION_IDENTITY_PAIR_MAX_CHARS,
   [SESSION_IDENTITY_SCOPES.SESSION]: SESSION_IDENTITY_SESSION_MAX_CHARS,
 });
 /**
@@ -37,6 +46,7 @@ export const SESSION_IDENTITY_SOURCE_FILE_MAX_BYTES = SESSION_IDENTITY_SESSION_M
  */
 export const SESSION_IDENTITY_COMBINED_MAX_CHARS = SESSION_IDENTITY_USER_MAX_CHARS
   + SESSION_IDENTITY_PROJECT_MAX_CHARS
+  + SESSION_IDENTITY_PAIR_MAX_CHARS
   + SESSION_IDENTITY_SESSION_MAX_CHARS;
 /**
  * Delimiters of the rendered identity block. Providers never search composed text
@@ -101,6 +111,11 @@ export function sessionIdentitySessionKey(serverId: string, sessionName: string)
   return `${serverId}:${sessionName}`;
 }
 
+/** The scope key a task pair's PAIR identity lives under: the normalized task id. */
+export function sessionIdentityPairKey(taskId: string): string {
+  return typeof taskId === 'string' ? taskId.trim() : String(taskId ?? '').trim();
+}
+
 export function isSessionIdentityScope(value: unknown): value is SessionIdentityScope {
   return typeof value === 'string'
     && (SESSION_IDENTITY_SCOPE_LIST as readonly string[]).includes(value);
@@ -131,28 +146,32 @@ export function isSessionIdentityScope(value: unknown): value is SessionIdentity
  * unchanged. `-` remains a safe, unambiguous delimiter: it never appears in
  * hex output either.
  *
- * PROJECT/SESSION only, never USER: USER scope stays server-authoritative
+ * PROJECT/PAIR/SESSION only, never USER: USER scope stays server-authoritative
  * (phase 1) and is never reachable over the lease. `decode` rejects a
  * `user` handle explicitly rather than relying on every caller to check --
  * a browser (malicious or merely buggy) could otherwise ask the daemon to
  * read/write the local USER-scope profile through this path.
  */
 const SESSION_IDENTITY_DIRECT_HANDLE_PREFIX = 'imcodes-identity-';
-const SESSION_IDENTITY_DIRECT_SCOPES = new Set<string>([SESSION_IDENTITY_SCOPES.PROJECT, SESSION_IDENTITY_SCOPES.SESSION]);
+const SESSION_IDENTITY_DIRECT_SCOPES = new Set<string>([
+  SESSION_IDENTITY_SCOPES.PROJECT,
+  SESSION_IDENTITY_SCOPES.PAIR,
+  SESSION_IDENTITY_SCOPES.SESSION,
+]);
 
-export function encodeSessionIdentityDirectHandle(scope: 'project' | 'session', scopeKey: string): string {
+export function encodeSessionIdentityDirectHandle(scope: 'project' | 'pair' | 'session', scopeKey: string): string {
   const hex = Buffer.from(scopeKey, 'utf8').toString('hex');
   return `${SESSION_IDENTITY_DIRECT_HANDLE_PREFIX}${scope}-${hex}`;
 }
 
 export function decodeSessionIdentityDirectHandle(
   handle: string,
-): { scope: 'project' | 'session'; scopeKey: string } | null {
+): { scope: 'project' | 'pair' | 'session'; scopeKey: string } | null {
   if (!handle.startsWith(SESSION_IDENTITY_DIRECT_HANDLE_PREFIX)) return null;
   const rest = handle.slice(SESSION_IDENTITY_DIRECT_HANDLE_PREFIX.length);
   const separator = rest.indexOf('-');
   if (separator < 0) return null;
-  const scope = rest.slice(0, separator) as 'project' | 'session';
+  const scope = rest.slice(0, separator) as 'project' | 'pair' | 'session';
   if (!SESSION_IDENTITY_DIRECT_SCOPES.has(scope)) return null;
   const hex = rest.slice(separator + 1);
   if (!/^[0-9a-f]*$/u.test(hex) || hex.length % 2 !== 0) return null;

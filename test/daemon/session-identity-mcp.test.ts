@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -6,8 +6,10 @@ import { MEMORY_MCP_TOOL_NAMES } from '../../shared/memory-mcp-contracts.js';
 import { createMemoryMcpToolHandlers } from '../../src/daemon/memory-mcp-tools.js';
 import type { McpRuntimeCaller } from '../../src/daemon/memory-mcp-caller.js';
 import type { SessionRecord } from '../../src/store/session-store.js';
+import { getTaskPairStore, setTaskPairStoreForTests, TaskPairStore } from '../../src/daemon/task-pairs/store.js';
 import {
   SESSION_IDENTITY_PROJECT_MAX_CHARS,
+  SESSION_IDENTITY_PAIR_MAX_CHARS,
   SESSION_IDENTITY_SESSION_MAX_CHARS,
   SESSION_IDENTITY_USER_MAX_CHARS,
 } from '../../shared/session-identity.js';
@@ -438,5 +440,259 @@ describe('session identity MCP tools', () => {
       .resolves.toMatchObject({ status: 'error', reason: 'scope_forbidden' });
     await expect(handlers[MEMORY_MCP_TOOL_NAMES.SESSION_IDENTITY_SET]({ identityScope: 'user', content: 'x' }))
       .resolves.toMatchObject({ status: 'error', reason: 'scope_forbidden' });
+  });
+});
+
+describe('pair identity in MCP tools', () => {
+  const PROJECT = 'proj';
+  const BRAIN = 'deck_proj_brain';
+  const EXEC = 'deck_sub_exec';
+  const AUD = 'deck_sub_aud';
+  const SIBLING = 'deck_sub_sibling';
+
+  const pairCaller = (sessionName: string): McpRuntimeCaller => ({
+    userId: 'user-1',
+    namespace: { scope: 'user_private', userId: 'user-1', projectId: 'repo-1' },
+    sessionName,
+    projectName: PROJECT,
+    projectRoot: '/tmp/proj',
+    serverId: 'srv-1',
+    providerId: 'codex-sdk',
+    transport: 'in_process',
+  });
+
+  const pairSessions = [
+    session({ name: BRAIN, role: 'brain' }),
+    session({ name: EXEC, role: 'w1' }),
+    session({ name: AUD, role: 'w2' }),
+    session({ name: SIBLING, role: 'w3' }),
+  ];
+
+  beforeEach(() => {
+    setTaskPairStoreForTests(new TaskPairStore(':memory:'));
+    getTaskPairStore().savePair(PROJECT, {
+      taskId: 'task-pair-1',
+      brain: BRAIN,
+      executor: EXEC,
+      auditor: AUD,
+      title: 'Test Pair',
+      status: 'working',
+      flags: [],
+      flagSides: {},
+      round: 1,
+      blocking: ['P0'],
+      previousAuditors: [],
+      capCounts: {},
+      capRound: 1,
+      createdAt: 10,
+      updatedAt: 20,
+    });
+  });
+
+  afterEach(() => {
+    setTaskPairStoreForTests(undefined);
+  });
+
+  it('allows executor to set pair identity and fans out to both executor and auditor immediately', async () => {
+    const applyEffectiveIdentity = vi.fn(async () => ({ applied: true, runtimeType: 'transport' as const }));
+    const setIdentityProfile = vi.fn(async (input: { scope: string; scopeKey: string; content: string }) => ({
+      status: 'ok' as const,
+      profile: identity(input.scope as any, input.scopeKey, input.content),
+    }));
+    const getEffectiveIdentityProfiles = vi.fn(async (input: { projectKey: string; pairKey?: string }) => ({
+      status: 'ok' as const,
+      profiles: [
+        identity('user', '', 'user rules'),
+        identity('project', 'repo-1', 'project rules'),
+        ...(input.pairKey ? [identity('pair', input.pairKey, 'shared pair rules from executor')] : []),
+      ],
+    }));
+
+    const execHandlers = createMemoryMcpToolHandlers(pairCaller(EXEC), {
+      sendDeps: { listSessions: () => pairSessions },
+      setIdentityProfile: setIdentityProfile as never,
+      getEffectiveIdentityProfiles,
+      applyEffectiveIdentity,
+    });
+
+    const result = await execHandlers[MEMORY_MCP_TOOL_NAMES.SESSION_IDENTITY_SET]({
+      identityScope: 'pair',
+      content: 'shared pair rules from executor',
+    });
+
+    expect(result).toMatchObject({
+      status: 'ok',
+      saved: true,
+      taskId: 'task-pair-1',
+    });
+    expect(setIdentityProfile).toHaveBeenCalledWith(expect.objectContaining({
+      scope: 'pair',
+      scopeKey: 'task-pair-1',
+      content: 'shared pair rules from executor',
+    }), {});
+    // Instant two-sided sync: both EXEC and AUD refreshed
+    expect(applyEffectiveIdentity).toHaveBeenCalledWith(EXEC, expect.stringContaining('<pair>\nshared pair rules from executor\n</pair>'), { refresh: true });
+    expect(applyEffectiveIdentity).toHaveBeenCalledWith(AUD, expect.stringContaining('<pair>\nshared pair rules from executor\n</pair>'), { refresh: true });
+    expect(applyEffectiveIdentity).not.toHaveBeenCalledWith(SIBLING, expect.anything(), expect.anything());
+  });
+
+  it('allows auditor to set and clear pair identity', async () => {
+    const setIdentityProfile = vi.fn(async (input: { scope: string; scopeKey: string; content: string }) => ({
+      status: 'ok' as const,
+      profile: identity(input.scope as any, input.scopeKey, input.content),
+    }));
+    const clearIdentityProfile = vi.fn(async () => ({ status: 'ok' as const, deleted: true }));
+    const audHandlers = createMemoryMcpToolHandlers(pairCaller(AUD), {
+      sendDeps: { listSessions: () => pairSessions },
+      setIdentityProfile: setIdentityProfile as never,
+      clearIdentityProfile: clearIdentityProfile as never,
+      getEffectiveIdentityProfiles: async () => ({ status: 'ok', profiles: [] }),
+      applyEffectiveIdentity: vi.fn(async () => ({ applied: true })),
+    });
+
+    await expect(audHandlers[MEMORY_MCP_TOOL_NAMES.SESSION_IDENTITY_SET]({
+      identityScope: 'pair',
+      content: 'auditor notes',
+    })).resolves.toMatchObject({ status: 'ok', saved: true, taskId: 'task-pair-1' });
+
+    await expect(audHandlers[MEMORY_MCP_TOOL_NAMES.SESSION_IDENTITY_CLEAR]({
+      identityScope: 'pair',
+    })).resolves.toMatchObject({ status: 'ok', deleted: true, taskId: 'task-pair-1' });
+  });
+
+  it('rejects an uninvolved sibling session from setting pair identity', async () => {
+    const siblingHandlers = createMemoryMcpToolHandlers(pairCaller(SIBLING), {
+      sendDeps: { listSessions: () => pairSessions },
+    });
+
+    await expect(siblingHandlers[MEMORY_MCP_TOOL_NAMES.SESSION_IDENTITY_SET]({
+      identityScope: 'pair',
+      taskId: 'task-pair-1',
+      content: 'malicious rules',
+    })).resolves.toMatchObject({
+      status: 'error',
+      reason: 'scope_forbidden',
+    });
+  });
+
+  it('enforces pair 200,000 character limit', async () => {
+    const setIdentityProfile = vi.fn();
+    const execHandlers = createMemoryMcpToolHandlers(pairCaller(EXEC), {
+      sendDeps: { listSessions: () => pairSessions },
+      setIdentityProfile,
+    });
+
+    await expect(execHandlers[MEMORY_MCP_TOOL_NAMES.SESSION_IDENTITY_SET]({
+      identityScope: 'pair',
+      content: 'x'.repeat(SESSION_IDENTITY_PAIR_MAX_CHARS + 1),
+    })).resolves.toMatchObject({
+      status: 'error',
+      reason: 'validation_failed',
+      message: 'identity_content_too_large',
+    });
+    expect(setIdentityProfile).not.toHaveBeenCalled();
+  });
+
+  it('allows Brain to read pair identity via session_identity_get and pair_task_get', async () => {
+    const brainHandlers = createMemoryMcpToolHandlers(pairCaller(BRAIN), {
+      sendDeps: { listSessions: () => pairSessions },
+      getEffectiveIdentityProfiles: async (input: { pairKey?: string }) => ({
+        status: 'ok' as const,
+        profiles: [
+          identity('user', '', 'user rules'),
+          identity('project', 'repo-1', 'project rules'),
+          ...(input.pairKey ? [identity('pair', input.pairKey, 'consensus facts')] : []),
+        ],
+      }),
+    });
+
+    const identityGet = await brainHandlers[MEMORY_MCP_TOOL_NAMES.SESSION_IDENTITY_GET]({
+      taskId: 'task-pair-1',
+    });
+    expect(identityGet).toMatchObject({
+      status: 'ok',
+      taskId: 'task-pair-1',
+      pairIdentity: 'consensus facts',
+      effectiveIdentity: expect.stringContaining('<pair>\nconsensus facts\n</pair>'),
+    });
+
+    const taskGet = await brainHandlers[MEMORY_MCP_TOOL_NAMES.PAIR_TASK_GET]({
+      taskId: 'task-pair-1',
+    });
+    expect(taskGet).toMatchObject({
+      taskId: 'task-pair-1',
+      executor: EXEC,
+      auditor: AUD,
+    });
+  });
+
+  it('supports append: true to concatenate onto existing pair identity', async () => {
+    let storedContent = 'initial pair facts';
+    const setIdentityProfile = vi.fn(async (input: { content: string }) => {
+      storedContent = input.content;
+      return { status: 'ok' as const, profile: identity('pair', 'task-pair-1', input.content) };
+    });
+    const getIdentityProfile = vi.fn(async () => ({
+      status: 'ok' as const,
+      profile: identity('pair', 'task-pair-1', storedContent),
+    }));
+
+    const execHandlers = createMemoryMcpToolHandlers(pairCaller(EXEC), {
+      sendDeps: { listSessions: () => pairSessions },
+      setIdentityProfile,
+      getIdentityProfile,
+      applyEffectiveIdentity: async () => ({ applied: true, runtimeType: 'transport' }),
+    });
+
+    const res = await execHandlers[MEMORY_MCP_TOOL_NAMES.SESSION_IDENTITY_SET]({
+      identityScope: 'pair',
+      content: 'appended facts',
+      append: true,
+    });
+
+    expect(res).toMatchObject({ status: 'ok', saved: true, taskId: 'task-pair-1' });
+    expect(setIdentityProfile).toHaveBeenCalledWith(
+      expect.objectContaining({
+        scope: 'pair',
+        scopeKey: 'task-pair-1',
+        content: 'initial pair facts\n\nappended facts',
+      }),
+      {},
+    );
+  });
+
+  it('supports append: true on session identity to avoid read-modify-write race', async () => {
+    const existingSessionIdentity = 'deployment role: worker\nport: 8080';
+    const setIdentityProfile = vi.fn(async (input: { content: string }) => ({
+      status: 'ok' as const,
+      profile: identity('session', 'srv-1:deck_proj_brain', input.content),
+    }));
+    const getIdentityProfile = vi.fn(async () => ({
+      status: 'ok' as const,
+      profile: identity('session', 'srv-1:deck_proj_brain', existingSessionIdentity),
+    }));
+
+    const brainHandlers = createMemoryMcpToolHandlers(caller, {
+      sendDeps: { listSessions: () => [session()] },
+      setIdentityProfile,
+      getIdentityProfile,
+      applyEffectiveIdentity: async () => ({ applied: true, runtimeType: 'transport' }),
+    });
+
+    const res = await brainHandlers[MEMORY_MCP_TOOL_NAMES.SESSION_IDENTITY_SET]({
+      identityScope: 'session',
+      content: 'status: deployed successfully',
+      append: true,
+    });
+
+    expect(res).toMatchObject({ status: 'ok', saved: true, target: 'deck_proj_brain' });
+    expect(setIdentityProfile).toHaveBeenCalledWith(
+      expect.objectContaining({
+        scope: 'session',
+        scopeKey: 'srv-1:deck_proj_brain',
+        content: 'deployment role: worker\nport: 8080\n\nstatus: deployed successfully',
+      }),
+      {},
+    );
   });
 });

@@ -27,6 +27,7 @@ export interface IdentitySessionRef {
   name: string;
   projectName?: string;
   contextNamespace?: { projectId?: unknown } | null;
+  pairTaskId?: string;
 }
 
 export interface ResolvedIdentity {
@@ -45,6 +46,7 @@ export interface IdentityResolverDeps {
   listProfiles?: () => Promise<readonly SessionIdentityProfile[]>;
   /** This daemon's bound serverId (the SESSION-scope key is `<serverId>:<sessionName>`). */
   boundServerId?: () => Promise<string | undefined>;
+  pairTaskIdForSession?: (sessionName: string) => string | undefined;
 }
 
 async function defaultBoundServerId(): Promise<string | undefined> {
@@ -56,19 +58,53 @@ async function defaultBoundServerId(): Promise<string | undefined> {
   }
 }
 
+export async function defaultActivePairTaskIdForSession(sessionName: string): Promise<string | undefined> {
+  try {
+    const { getTaskPairStore } = await import('./task-pairs/store.js');
+    const { taskPairFocusOf } = await import('./task-pairs/focus.js');
+    const { TASK_PAIR_PARTICIPANT_STATUSES } = await import('../../shared/task-pair.js');
+    const candidates: string[] = [];
+    for (const stored of getTaskPairStore().pairsForSession(sessionName)) {
+      const pair = stored.state;
+      if (!TASK_PAIR_PARTICIPANT_STATUSES.includes(pair.status)) continue;
+      const role = pair.executor === sessionName ? 'executor' : pair.auditor === sessionName ? 'auditor' : undefined;
+      if (!role || pair.brain === sessionName) continue;
+      candidates.push(pair.taskId);
+    }
+    if (candidates.length === 0) return undefined;
+    const focus = taskPairFocusOf(sessionName);
+    if (focus && candidates.includes(focus)) return focus;
+    return candidates[0];
+  } catch {
+    return undefined;
+  }
+}
+
+async function resolvePairTaskId(
+  session: IdentitySessionRef,
+  deps: IdentityResolverDeps,
+): Promise<string | undefined> {
+  if (session.pairTaskId) return session.pairTaskId;
+  if (deps.pairTaskIdForSession) return deps.pairTaskIdForSession(session.name);
+  return defaultActivePairTaskIdForSession(session.name);
+}
+
 export function profilesForSession(
   profiles: readonly SessionIdentityProfile[],
   session: IdentitySessionRef,
   serverId: string,
+  pairTaskId?: string,
 ): SessionIdentityProfile[] {
   const sessionKey = sessionIdentitySessionKey(serverId, session.name);
   const projectKey = sessionIdentityProjectKey({
     contextNamespace: session.contextNamespace,
     project: session.projectName,
   });
+  const effectivePairTaskId = (pairTaskId ?? session.pairTaskId)?.trim();
   return profiles.filter((profile) => (
     (profile.scope === SESSION_IDENTITY_SCOPES.USER && profile.scopeKey === '')
     || (profile.scope === SESSION_IDENTITY_SCOPES.PROJECT && profile.scopeKey === projectKey)
+    || (profile.scope === SESSION_IDENTITY_SCOPES.PAIR && Boolean(effectivePairTaskId) && profile.scopeKey === effectivePairTaskId)
     || (profile.scope === SESSION_IDENTITY_SCOPES.SESSION && profile.scopeKey === sessionKey)
   ));
 }
@@ -87,7 +123,8 @@ export async function resolveEffectiveIdentities(
   const rendered = new Map<string, ResolvedIdentity>();
   const out = new Map<string, ResolvedIdentity>();
   for (const session of sessions) {
-    const applicable = profilesForSession(profiles, session, serverId);
+    const pairTaskId = await resolvePairTaskId(session, deps);
+    const applicable = profilesForSession(profiles, session, serverId, pairTaskId);
     // The same profiles at the same revisions render the same text.
     const shareKey = applicable.map((profile) => `${profile.scope}\0${profile.scopeKey}\0${profile.contentHash}`).join('\n');
     let resolved = rendered.get(shareKey);

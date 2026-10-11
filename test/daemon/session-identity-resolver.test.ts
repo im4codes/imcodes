@@ -42,6 +42,32 @@ describe('the single derivation of a session identity prompt', () => {
     expect(applicable.map((entry) => entry.content)).toEqual(['by name']);
   });
 
+  it('renders pair profile in scope order when session is participating in a task pair', async () => {
+    const pairProfile = profile('pair', 'task-100', 'shared pair rules');
+    const localDeps = {
+      listProfiles: async () => [...PROFILES, pairProfile],
+      boundServerId: async () => SERVER,
+      pairTaskIdForSession: (name: string) => (name === 'deck_sub_exec' || name === 'deck_sub_audit' ? 'task-100' : undefined),
+    };
+    const execPrompt = await resolveEffectiveIdentityPrompt({
+      name: 'deck_sub_exec',
+      projectName: 'proj',
+      contextNamespace: { projectId: 'repo-1' },
+    }, localDeps);
+    expect(execPrompt).toContain('<user>');
+    expect(execPrompt).toContain('<project>');
+    expect(execPrompt).toContain('<pair>\nshared pair rules\n</pair>');
+    expect(execPrompt!.indexOf('<project>')).toBeLessThan(execPrompt!.indexOf('<pair>'));
+
+    const otherTaskPrompt = await resolveEffectiveIdentityPrompt({
+      name: 'deck_sub_other',
+      projectName: 'proj',
+      contextNamespace: { projectId: 'repo-1' },
+      pairTaskId: 'task-999',
+    }, localDeps);
+    expect(otherTaskPrompt).not.toContain('shared pair rules');
+  });
+
   it('no applicable profile means no identity, and the same profiles are rendered once for many sessions', async () => {
     const names = Array.from({ length: 120 }, (_, index) => ({ name: `deck_many_w${index}`, projectName: 'proj', contextNamespace: { projectId: 'repo-1' } }));
     const resolved = await resolveEffectiveIdentities([...names, { name: 'deck_nobody', projectName: 'x', contextNamespace: { projectId: 'none' } }], {

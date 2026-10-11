@@ -113,7 +113,7 @@ export async function clearSessionIdentityProfile(
 }
 
 export async function getEffectiveSessionIdentityProfiles(
-  input: { projectKey: string; sessionKey?: string; sessionName?: string },
+  input: { projectKey: string; sessionKey?: string; sessionName?: string; pairKey?: string },
   options: SessionIdentityClientOptions = {},
 ): Promise<{ status: 'ok'; serverId: string; profiles: SessionIdentityProfile[] } | Failure> {
   const serverId = await resolveServerId(options);
@@ -121,15 +121,16 @@ export async function getEffectiveSessionIdentityProfiles(
     ? sessionIdentitySessionKey(serverId, input.sessionName)
     : input.sessionKey ?? '';
   try {
-    const [userProfile, projectProfile, sessionProfile] = await Promise.all([
+    const [userProfile, projectProfile, pairProfile, sessionProfile] = await Promise.all([
       getLocalSessionIdentityProfile(SESSION_IDENTITY_SCOPES.USER, ''),
-      getLocalSessionIdentityProfile(SESSION_IDENTITY_SCOPES.PROJECT, input.projectKey),
-      getLocalSessionIdentityProfile(SESSION_IDENTITY_SCOPES.SESSION, sessionKey),
+      input.projectKey ? getLocalSessionIdentityProfile(SESSION_IDENTITY_SCOPES.PROJECT, input.projectKey) : Promise.resolve(null),
+      input.pairKey ? getLocalSessionIdentityProfile(SESSION_IDENTITY_SCOPES.PAIR, input.pairKey) : Promise.resolve(null),
+      sessionKey ? getLocalSessionIdentityProfile(SESSION_IDENTITY_SCOPES.SESSION, sessionKey) : Promise.resolve(null),
     ]);
     return {
       status: 'ok',
       serverId,
-      profiles: [userProfile, projectProfile, sessionProfile].flatMap((profile) => (profile ? [profile] : [])),
+      profiles: [userProfile, projectProfile, pairProfile, sessionProfile].flatMap((profile) => (profile ? [profile] : [])),
     };
   } catch (err) {
     return failure(MCP_ERROR_REASONS.INTERNAL_ERROR, err instanceof Error ? err.message : String(err));

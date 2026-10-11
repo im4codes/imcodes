@@ -342,6 +342,12 @@ export class AgySdkProvider implements TransportProvider {
     if (state.conversationId) this.emitSessionInfo(sessionId, { resumeId: state.conversationId, model: agentId });
   }
 
+  refreshSessionSystemText(sessionId: string): void {
+    const state = this.sessions.get(sessionId);
+    if (!state) return;
+    state.sessionSystemTextSent = false;
+  }
+
   // ── Callbacks ──────────────────────────────────────────────────────────────
 
   onDelta(cb: (sessionId: string, delta: MessageDelta) => void): () => void {

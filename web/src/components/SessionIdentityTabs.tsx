@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import {
-  SESSION_IDENTITY_SCOPE_LIST,
+  SESSION_SETTING_IDENTITY_SCOPES,
   SESSION_IDENTITY_SCOPES,
   normalizeSessionIdentityContent,
   sessionIdentityContentError,
@@ -67,7 +67,7 @@ export function SessionIdentityTabs({
 
   useEffect(() => {
     let live = true;
-    void Promise.all(SESSION_IDENTITY_SCOPE_LIST.map(async (scope) => {
+    void Promise.all(SESSION_SETTING_IDENTITY_SCOPES.map(async (scope) => {
       const key = scopeKey[scope];
       const shouldSkipFetch = (scope === SESSION_IDENTITY_SCOPES.SESSION && !sessionName)
         || (scope === SESSION_IDENTITY_SCOPES.PROJECT && !key && !sessionName);
@@ -172,7 +172,7 @@ export function SessionIdentityTabs({
     <div class="session-settings-field session-identity-tabs">
       <div class="session-settings-label">{t('session.identityTitle')}</div>
       <div class="session-identity-tab-list" role="tablist">
-        {SESSION_IDENTITY_SCOPE_LIST.map((scope) => (
+        {SESSION_SETTING_IDENTITY_SCOPES.map((scope) => (
           <button type="button" role="tab" aria-selected={activeScope === scope} class={activeScope === scope ? 'active' : ''}
             onClick={() => { setActiveScope(scope); setError(''); }}>
             {t(`session.identityScope_${scope}`)}

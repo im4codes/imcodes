@@ -488,6 +488,26 @@ function buildBrainSupervisedWorkDelegationContractObject() {
       delegateRemainingIsAdvance: false,
       sentAndNoIndependentSafeWork: SUPERVISION_EXECUTION_STATUS_MARKERS.WAITING,
     },
+    projectIdentityGovernance: {
+      curator: 'Brain',
+      scope: 'project',
+      contentQuality: 'concise_high_signal_shared_knowledge_and_rules',
+      forbid: ['verbose_debug_logs', 'transient_execution_history'],
+      tool: 'session_identity_set',
+      appendSupport: true,
+    },
+    taskSessionIdentityInjection: {
+      purpose: 'persist_task_parameters_across_model_switches_or_resets',
+      targetScope: 'session',
+      tool: 'session_identity_set',
+      appendSupport: true,
+    },
+    observationLifecycle: {
+      storage: 'save_observation_automatically_activates_for_startup_load',
+      prune: 'delete_memory_by_observation_ref_or_id',
+      replace: 'save_observation_with_replacesRef',
+      sync: 'immediate_runtime_cache_invalidation',
+    },
   });
 }
 

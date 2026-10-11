@@ -3427,7 +3427,10 @@ html.native-ios-mac .chat-dl-btn {
 .mobile-server-btn-chevron { width: 24px; height: 24px; border-radius: 8px; display: inline-flex; align-items: center; justify-content: center; flex: 0 0 auto; color: #67e8f9; background: rgba(15,23,42,0.52); }
 .mobile-server-actions { display: flex; gap: 5px; align-items: center; flex: 0 0 auto; }
 .mobile-server-backdrop { position: fixed; inset: 0; z-index: 6499; }
-.mobile-server-menu { position: absolute; top: calc(100% + 8px); left: 0; width: min(300px, calc(100vw - 18px)); background: #1e293b; border: 1px solid rgba(125,211,252,0.20); border-radius: 12px; min-width: min(240px, calc(100vw - 18px)); box-shadow: 0 14px 34px #00000090, 0 0 20px rgba(34,211,238,0.10); z-index: 50; overflow: hidden; }
+.mobile-server-menu { position: absolute; top: calc(100% + 8px); left: 0; width: min(300px, calc(100vw - 18px)); max-height: min(60vh, calc(100vh - 80px)); max-height: min(60vh, calc(100dvh - 80px - env(safe-area-inset-bottom, 0px))); background: #1e293b; border: 1px solid rgba(125,211,252,0.20); border-radius: 12px; min-width: min(240px, calc(100vw - 18px)); box-shadow: 0 14px 34px #00000090, 0 0 20px rgba(34,211,238,0.10); z-index: 50; overflow-x: hidden; overflow-y: auto; -webkit-overflow-scrolling: touch; overscroll-behavior: contain; scrollbar-width: thin; scrollbar-color: rgba(125, 211, 252, 0.28) transparent; }
+.mobile-server-menu::-webkit-scrollbar { width: 5px; }
+.mobile-server-menu::-webkit-scrollbar-track { background: transparent; }
+.mobile-server-menu::-webkit-scrollbar-thumb { background: rgba(125, 211, 252, 0.28); border-radius: 999px; }
 .mobile-server-menu-item { display: flex; align-items: center; gap: 7px; width: 100%; padding: 10px 14px; background: none; border: none; color: #cbd5e1; font-size: 13px; font-family: inherit; text-align: left; cursor: pointer; }
 .mobile-server-menu-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .mobile-server-menu-item > .share-state-indicator { margin-left: auto; flex: 0 0 auto; }
