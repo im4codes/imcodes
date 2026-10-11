@@ -20,6 +20,8 @@ export const SESSION_SETTING_IDENTITY_SCOPES = Object.freeze([
   SESSION_IDENTITY_SCOPES.SESSION,
 ]) as readonly ('user' | 'project' | 'session')[];
 
+export type SessionSettingIdentityScope = typeof SESSION_SETTING_IDENTITY_SCOPES[number];
+
 export const SESSION_IDENTITY_USER_MAX_CHARS = 100_000;
 export const SESSION_IDENTITY_PROJECT_MAX_CHARS = 300_000;
 export const SESSION_IDENTITY_PAIR_MAX_CHARS = 200_000;

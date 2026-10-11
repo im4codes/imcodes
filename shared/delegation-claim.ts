@@ -213,6 +213,65 @@ const readPersistedDelegationDispatchFact = (value: unknown): DelegationDispatch
 };
 
 /**
+ * Form the stable identity key for a delegation dispatch fact.
+ *
+ * Dispatches bound to the same task assignment represent legs of work for
+ * the same worker process. When both taskId and assignmentId are present,
+ * their combination uniquely identifies the assignment.
+ */
+export const delegationDispatchKey = (dispatch: DelegationDispatchFact): string => {
+  if (dispatch.taskId && dispatch.assignmentId) {
+    return `${dispatch.taskId}\0${dispatch.assignmentId}`;
+  }
+  if (dispatch.assignmentId) {
+    return dispatch.assignmentId;
+  }
+  if (dispatch.taskId) {
+    return `${dispatch.taskId}\0${dispatch.dispatchId}`;
+  }
+  return dispatch.dispatchId;
+};
+
+/**
+ * Deduplicate dispatches belonging to the same task assignment within a single
+ * turn projection.
+ *
+ * Brain turns often exchange multiple messages with the same worker / assignment
+ * (e.g. follow-up instructions or status checks). Rendering every message leg
+ * produces repetitive spam (e.g. 76 cards for 7 tasks).
+ * Deduplicating by task + assignment retains the authoritative unique dispatches,
+ * keeping the latest dispatch facts while preserving task title and execution
+ * context.
+ */
+export const deduplicateDelegationDispatches = (
+  dispatches: readonly DelegationDispatchFact[],
+): DelegationDispatchFact[] => {
+  const byKey = new Map<string, DelegationDispatchFact>();
+  for (const dispatch of dispatches) {
+    const key = delegationDispatchKey(dispatch);
+    const existing = byKey.get(key);
+    if (!existing) {
+      byKey.set(key, dispatch);
+      continue;
+    }
+    const existingExecution = existing.deliveries.find((d) => d.execution)?.execution;
+    const currentExecution = dispatch.deliveries.find((d) => d.execution)?.execution;
+    const deliveries = (!currentExecution && existingExecution)
+      ? dispatch.deliveries.map((d) => (d.execution ? d : { ...d, execution: existingExecution }))
+      : dispatch.deliveries;
+
+    byKey.set(key, {
+      ...existing,
+      ...dispatch,
+      taskTitle: dispatch.taskTitle ?? existing.taskTitle,
+      taskObjective: dispatch.taskObjective ?? existing.taskObjective,
+      deliveries,
+    });
+  }
+  return Array.from(byKey.values());
+};
+
+/**
  * Project the turn's delegation authority from its dispatch facts alone.
  *
  * Zero facts yields `unsubstantiated` with an empty dispatch list, so a
@@ -223,9 +282,10 @@ const readPersistedDelegationDispatchFact = (value: unknown): DelegationDispatch
 export const projectDelegationClaim = (
   dispatches: readonly DelegationDispatchFact[],
 ): DelegationClaimProjection => {
-  const taskDispatches = dispatches
+  const validDispatches = dispatches
     .map(readPersistedDelegationDispatchFact)
     .filter((dispatch): dispatch is DelegationDispatchFact => dispatch !== null);
+  const taskDispatches = deduplicateDelegationDispatches(validDispatches);
   return {
     status: taskDispatches.length > 0 ? 'substantiated' : 'unsubstantiated',
     dispatches: taskDispatches,
@@ -241,8 +301,9 @@ export const readDelegationClaim = (
   const status = asMeaningfulString(claim.status);
   if (status !== 'substantiated' && status !== 'unsubstantiated') return null;
   if (status !== 'substantiated' || !Array.isArray(claim.dispatches)) return null;
-  const dispatches = claim.dispatches
+  const validDispatches = claim.dispatches
     .map(readPersistedDelegationDispatchFact)
     .filter((dispatch): dispatch is DelegationDispatchFact => dispatch !== null);
+  const dispatches = deduplicateDelegationDispatches(validDispatches);
   return dispatches.length > 0 ? { status: 'substantiated', dispatches } : null;
 };

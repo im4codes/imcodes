@@ -9,7 +9,7 @@ import {
   sessionIdentityMaxChars,
   sessionIdentitySessionKey,
   type SessionIdentityProfile,
-  type SessionIdentityScope,
+  type SessionSettingIdentityScope,
 } from '@shared/session-identity.js';
 import {
   clearSessionIdentityProfileDirectFirst,
@@ -44,11 +44,11 @@ export function SessionIdentityTabs({
   disabled?: boolean;
 }) {
   const { t } = useTranslation();
-  const [activeScope, setActiveScope] = useState<SessionIdentityScope>(SESSION_IDENTITY_SCOPES.SESSION);
-  const [drafts, setDrafts] = useState<Record<SessionIdentityScope, Draft>>({
+  const [activeScope, setActiveScope] = useState<SessionSettingIdentityScope>(SESSION_IDENTITY_SCOPES.SESSION);
+  const [drafts, setDrafts] = useState<Record<SessionSettingIdentityScope, Draft>>({
     user: emptyDraft(), project: emptyDraft(), session: emptyDraft(),
   });
-  const [resolvedScopeKeys, setResolvedScopeKeys] = useState<Record<SessionIdentityScope, string>>({
+  const [resolvedScopeKeys, setResolvedScopeKeys] = useState<Record<SessionSettingIdentityScope, string>>({
     user: '', project: '', session: '',
   });
   const [showBrowser, setShowBrowser] = useState(false);
@@ -63,7 +63,7 @@ export function SessionIdentityTabs({
   }), [projectKey, serverId, sessionName]);
   const accessContext = useMemo(() => (sessionName ? { serverId, sessionName } : { serverId }), [serverId, sessionName]);
 
-  const effectiveScopeKey = (scope: SessionIdentityScope) => resolvedScopeKeys[scope] || scopeKey[scope];
+  const effectiveScopeKey = (scope: SessionSettingIdentityScope) => resolvedScopeKeys[scope] || scopeKey[scope];
 
   useEffect(() => {
     let live = true;
@@ -84,10 +84,10 @@ export function SessionIdentityTabs({
       }, profile?.scopeKey ?? ''] as const;
     })).then((entries) => {
       if (!live) return;
-      const nextDrafts: Record<SessionIdentityScope, Draft> = {
+      const nextDrafts: Record<SessionSettingIdentityScope, Draft> = {
         user: emptyDraft(), project: emptyDraft(), session: emptyDraft(),
       };
-      const nextKeys: Record<SessionIdentityScope, string> = {
+      const nextKeys: Record<SessionSettingIdentityScope, string> = {
         user: '', project: '', session: '',
       };
       for (const [scope, draft, resolvedKey] of entries) {

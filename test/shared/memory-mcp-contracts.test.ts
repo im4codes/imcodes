@@ -171,7 +171,7 @@ describe('memory MCP shared contracts', () => {
     const update = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.UPDATE_MEMORY].inputSchema.properties ?? {};
     const feedback = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.MEMORY_FEEDBACK].inputSchema.properties ?? {};
     expect(Object.keys(archive)).toEqual(['projectionId', 'ref']);
-    expect(Object.keys(update)).toEqual(['projectionId', 'ref', 'text']);
+    expect(Object.keys(update)).toEqual(['projectionId', 'observationId', 'ref', 'text']);
     expect(Object.keys(feedback)).toEqual(['projectionId', 'ref', 'feedback', 'reason']);
     expect(archive).not.toHaveProperty('projectId');
     expect(update).not.toHaveProperty('namespace');

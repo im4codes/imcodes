@@ -3,6 +3,8 @@ import {
   readDelegationDispatchFact,
   projectDelegationClaim,
   readDelegationClaim,
+  deduplicateDelegationDispatches,
+  delegationDispatchKey,
   isDelegationDispatchTool,
   DELEGATION_AUTHORITY_MCP_SERVER,
   DELEGATION_CLAIM_METADATA_FIELD,
@@ -249,6 +251,134 @@ describe('delegation claim projection', () => {
     expect(readDelegationClaim(metadata)).toEqual(projection);
     expect(readDelegationClaim(undefined)).toBeNull();
     expect(readDelegationClaim({ other: 1 })).toBeNull();
+  });
+});
+
+describe('delegation dispatch deduplication within a turn', () => {
+  it('deduplicates multiple dispatches for the same task and assignment, keeping latest details and preserving first-seen order', () => {
+    const d1 = {
+      dispatchId: 'disp_t1_v1',
+      taskId: 'task_alpha',
+      assignmentId: 'asg_alpha_exec',
+      taskTitle: 'Alpha Title v1',
+      deliveries: [{ target: 'worker_alpha', status: 'delivered', messageId: 'm1' }],
+    };
+    const d2 = {
+      dispatchId: 'disp_t2_v1',
+      taskId: 'task_beta',
+      assignmentId: 'asg_beta_exec',
+      taskTitle: 'Beta Title v1',
+      deliveries: [{ target: 'worker_beta', status: 'delivered', messageId: 'm2' }],
+    };
+    const d3 = {
+      dispatchId: 'disp_t1_v2',
+      taskId: 'task_alpha',
+      assignmentId: 'asg_alpha_exec',
+      taskTitle: 'Alpha Title v2',
+      deliveries: [{ target: 'worker_alpha', status: 'delivered', messageId: 'm3' }],
+    };
+
+    const projection = projectDelegationClaim([d1, d2, d3]);
+    expect(projection.status).toBe('substantiated');
+    expect(projection.dispatches).toHaveLength(2);
+
+    // First-seen order: task_alpha is index 0, task_beta is index 1.
+    expect(projection.dispatches[0].taskId).toBe('task_alpha');
+    expect(projection.dispatches[0].assignmentId).toBe('asg_alpha_exec');
+    expect(projection.dispatches[0].dispatchId).toBe('disp_t1_v2'); // latest dispatch
+    expect(projection.dispatches[0].taskTitle).toBe('Alpha Title v2');
+    expect(projection.dispatches[0].deliveries[0].messageId).toBe('m3');
+
+    expect(projection.dispatches[1].taskId).toBe('task_beta');
+    expect(projection.dispatches[1].assignmentId).toBe('asg_beta_exec');
+    expect(projection.dispatches[1].dispatchId).toBe('disp_t2_v1');
+  });
+
+  it('keeps distinct assignments for the same task (e.g. executor and auditor)', () => {
+    const exec1 = {
+      dispatchId: 'disp_exec_1',
+      taskId: 'task_pair',
+      assignmentId: 'pair:task_pair:executor',
+      deliveries: [{ target: 'exec_session', status: 'delivered' }],
+    };
+    const aud1 = {
+      dispatchId: 'disp_aud_1',
+      taskId: 'task_pair',
+      assignmentId: 'pair:task_pair:auditor',
+      deliveries: [{ target: 'aud_session', status: 'delivered' }],
+    };
+    const exec2 = {
+      dispatchId: 'disp_exec_2',
+      taskId: 'task_pair',
+      assignmentId: 'pair:task_pair:executor',
+      deliveries: [{ target: 'exec_session', status: 'delivered' }],
+    };
+
+    const projection = projectDelegationClaim([exec1, aud1, exec2]);
+    expect(projection.dispatches).toHaveLength(2);
+    expect(projection.dispatches.map((d) => d.assignmentId)).toEqual([
+      'pair:task_pair:executor',
+      'pair:task_pair:auditor',
+    ]);
+    expect(projection.dispatches[0].dispatchId).toBe('disp_exec_2');
+  });
+
+  it('deduplicates historical dispatches when readDelegationClaim is called on raw metadata', () => {
+    const rawDispatches = [
+      {
+        dispatchId: 'disp_1',
+        taskId: 'task_x',
+        assignmentId: 'asg_x',
+        deliveries: [{ target: 'w1', status: 'delivered' }],
+      },
+      {
+        dispatchId: 'disp_2',
+        taskId: 'task_x',
+        assignmentId: 'asg_x',
+        deliveries: [{ target: 'w1', status: 'delivered' }],
+      },
+      {
+        dispatchId: 'disp_3',
+        taskId: 'task_x',
+        assignmentId: 'asg_x',
+        deliveries: [{ target: 'w1', status: 'delivered' }],
+      },
+    ];
+    const metadata = {
+      [DELEGATION_CLAIM_METADATA_FIELD]: {
+        status: 'substantiated',
+        dispatches: rawDispatches,
+      },
+    };
+    const claim = readDelegationClaim(metadata);
+    expect(claim?.status).toBe('substantiated');
+    expect(claim?.dispatches).toHaveLength(1);
+    expect(claim?.dispatches[0].dispatchId).toBe('disp_3');
+  });
+
+  it('carries forward prior execution context if later dispatch omitted it', () => {
+    const execution = {
+      sessionName: 'worker_1',
+      agentType: 'claude-code-sdk',
+      providerFamily: 'anthropic',
+      model: 'opus',
+      pool: 'primary',
+      source: 'assignment',
+    };
+    const d1 = {
+      dispatchId: 'disp_1',
+      taskId: 'task_x',
+      assignmentId: 'asg_x',
+      deliveries: [{ target: 'w1', status: 'delivered', execution }],
+    };
+    const d2 = {
+      dispatchId: 'disp_2',
+      taskId: 'task_x',
+      assignmentId: 'asg_x',
+      deliveries: [{ target: 'w1', status: 'delivered' }], // no execution
+    };
+    const projection = projectDelegationClaim([d1, d2]);
+    expect(projection.dispatches[0].deliveries[0].execution).toEqual(execution);
   });
 });
 

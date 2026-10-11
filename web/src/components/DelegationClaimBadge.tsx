@@ -14,7 +14,10 @@
  */
 
 import { useTranslation } from 'react-i18next';
-import { readDelegationClaim } from '@shared/delegation-claim.js';
+import {
+  deduplicateDelegationDispatches,
+  readDelegationClaim,
+} from '@shared/delegation-claim.js';
 import type { SupervisionExecutionSummary } from '@shared/supervision-execution-summary.js';
 import { readSupervisionTaskTitle } from '@shared/supervision-task-identity.js';
 import { ExpandableTaskObjective } from './ExpandableTaskObjective.js';
@@ -108,7 +111,8 @@ export function DelegationClaimBadge({ metadata, liveAssignmentStatuses, message
   // Authority comes from task facts, not from the label on them. The shared
   // reader already rejects empty, malformed and legacy machine-control-only
   // projections, so there is no neutral or OCU badge to render here.
-  const dispatches = Array.isArray(claim.dispatches) ? claim.dispatches : [];
+  const rawDispatches = Array.isArray(claim.dispatches) ? claim.dispatches : [];
+  const dispatches = deduplicateDelegationDispatches(rawDispatches);
   const substantiated = claim.status === 'substantiated' && dispatches.length > 0;
   if (!substantiated) return null;
 

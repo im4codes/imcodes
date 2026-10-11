@@ -449,6 +449,48 @@ describe('DelegationClaimBadge', () => {
       .map((el) => el.getAttribute('data-delegation-dispatch'));
     expect(rows).toEqual(['dsp_a', 'dsp_b']);
   });
+
+  it('deduplicates multiple dispatches for the same task assignment, showing unique count and latest dispatch', () => {
+    const { container } = render(h(DelegationClaimBadge, {
+      metadata: withClaim({
+        status: 'substantiated',
+        dispatches: [
+          { dispatchId: 'dsp_a1', taskId: 'task_a', assignmentId: 'asg_a', deliveries: [{ target: 'w1', status: 'delivered' }] },
+          { dispatchId: 'dsp_b1', taskId: 'task_b', assignmentId: 'asg_b', deliveries: [{ target: 'w2', status: 'delivered' }] },
+          { dispatchId: 'dsp_a2', taskId: 'task_a', assignmentId: 'asg_a', deliveries: [{ target: 'w1', status: 'delivered' }] },
+          { dispatchId: 'dsp_a3', taskId: 'task_a', assignmentId: 'asg_a', deliveries: [{ target: 'w1', status: 'delivered' }] },
+        ],
+      }),
+    }));
+
+    const rows = [...container.querySelectorAll('[data-delegation-dispatch]')]
+      .map((el) => el.getAttribute('data-delegation-dispatch'));
+    expect(rows).toEqual(['dsp_a3', 'dsp_b1']);
+
+    const countText = container.querySelector('.delegation-claim-count')?.textContent ?? '';
+    expect(countText).toContain('2');
+  });
+
+  it('renders both executor and auditor dispatches for a task pair without repeating duplicates', () => {
+    const { container } = render(h(DelegationClaimBadge, {
+      metadata: withClaim({
+        status: 'substantiated',
+        dispatches: [
+          { dispatchId: 'dsp_exec_1', taskId: 'task_pair', assignmentId: 'pair:task_pair:executor', deliveries: [{ target: 'w_exec', status: 'delivered' }] },
+          { dispatchId: 'dsp_aud_1', taskId: 'task_pair', assignmentId: 'pair:task_pair:auditor', deliveries: [{ target: 'w_aud', status: 'delivered' }] },
+          { dispatchId: 'dsp_exec_2', taskId: 'task_pair', assignmentId: 'pair:task_pair:executor', deliveries: [{ target: 'w_exec', status: 'delivered' }] },
+          { dispatchId: 'dsp_aud_2', taskId: 'task_pair', assignmentId: 'pair:task_pair:auditor', deliveries: [{ target: 'w_aud', status: 'delivered' }] },
+        ],
+      }),
+    }));
+
+    const rows = [...container.querySelectorAll('[data-delegation-dispatch]')]
+      .map((el) => el.getAttribute('data-delegation-dispatch'));
+    expect(rows).toEqual(['dsp_exec_2', 'dsp_aud_2']);
+
+    const countText = container.querySelector('.delegation-claim-count')?.textContent ?? '';
+    expect(countText).toContain('2');
+  });
 });
 
 describe('readDelegationClaimMetadata', () => {
