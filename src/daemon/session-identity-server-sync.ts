@@ -30,7 +30,7 @@ import { syncSessionIdentities } from './session-identity-sync.js';
 export async function handleSessionIdentityLocalRequest(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
   const requestId = typeof cmd.requestId === 'string' ? cmd.requestId : undefined;
   const op = cmd.op;
-  const scope = cmd.scope === 'project' || cmd.scope === 'session' ? cmd.scope : undefined;
+  const scope = cmd.scope === 'project' || cmd.scope === 'session' || cmd.scope === 'pair' ? cmd.scope : undefined;
   const scopeKey = typeof cmd.scopeKey === 'string' ? cmd.scopeKey : undefined;
   const reply = (payload: Record<string, unknown>) => {
     serverLink.send({ type: SESSION_IDENTITY_WS.LOCAL_RESPONSE, requestId, op, scope, scopeKey, ...payload });

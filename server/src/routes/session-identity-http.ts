@@ -93,7 +93,7 @@ async function callDaemonLocal<
 >(
   c: Context<IdentityHttpEnv<TVariables>, TPath, TInput>,
   serverId: string | undefined,
-  payload: { op: 'get' | 'set' | 'delete'; scope: 'project' | 'session'; scopeKey: string; content?: string; source?: 'web' | 'mcp'; sourceFile?: string },
+  payload: { op: 'get' | 'set' | 'delete'; scope: 'project' | 'session' | 'pair'; scopeKey: string; content?: string; source?: 'web' | 'mcp'; sourceFile?: string },
   sessionCoveredParticipant = false,
 ): Promise<{ ok: true; body: Record<string, unknown> } | { ok: false; response: Response }> {
   if (!serverId) {

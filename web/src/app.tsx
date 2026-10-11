@@ -8279,6 +8279,14 @@ export function App() {
               onShareSession={selectedShareTarget ? undefined : openShareDialogForSession}
               onViewRepo={() => openRepoPage({ sessionId: sub.sessionName, projectDir: sub.cwd, initialTab: 'branches', parentSubId: sub.id })}
               onTransportConfigSaved={(transportConfig) => updateSubLocal(sub.id, { transportConfig })}
+              onLiveSessionStateChange={(liveState) => updateSubLocal(sub.id, {
+                state: liveState,
+                ...(liveState === 'idle'
+                  ? { authoritativeIdleAt: Date.now() }
+                  : liveState === 'running'
+                    ? { authoritativeIdleAt: undefined }
+                    : {}),
+              })}
               onPreviewFile={(request) => handlePreviewFileRequest({ ...request, sourcePreviewLive: false })}
               onOpenLocalWebPreview={openLocalWebPreviewFromChat}
               zIndex={getDesktopWindowZIndex(DESKTOP_WINDOW_IDS.subSession(sub.id), 6000)}

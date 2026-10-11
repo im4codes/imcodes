@@ -93,6 +93,7 @@ interface Props {
   onShareSession?: (session: SessionInfo, subSessionId?: string | null) => void;
   onViewRepo?: () => void;
   onTransportConfigSaved?: (transportConfig: Record<string, unknown> | null) => void;
+  onLiveSessionStateChange?: (state: SubSession['state']) => void;
   /** Open a file preview in the shared floating preview host. */
   onPreviewFile?: (request: FileBrowserPreviewRequest) => void;
   /** Open a loopback URL in the shared local-web-preview host. */
@@ -281,7 +282,7 @@ function saveLocal(id: string, geom: WindowGeometry, viewMode: ViewMode) {
 }
 
 export function SubSessionWindow({
-  sub, ws, connected, active, visible = true, onPendingQuestion, idleFlashToken, onDiff, onHistory, onMinimize, onClose, maximized = false, onToggleMaximized, onRestoreBeforeClose, getMaximizeBounds, desktopLayoutCapable = true, onRestart, onRename, onSettings, onShareSession, onViewRepo, onTransportConfigSaved, onPreviewFile, onOpenLocalWebPreview, zIndex, onFocus, desktopFileBrowserZIndex, onDesktopFileBrowserOpen, onDesktopFileBrowserFocus, onDesktopFileBrowserClose, onPin, sessions, subSessions, serverId, pendingPrefillText, onPendingPrefillApplied, onVersionSensitiveAction, detectedModelHint, inP2p, sharedState, accentColor = DEFAULT_SUBSESSION_ACCENT_COLOR, daemonOnline, onOpenRemoteDesktop, remoteDesktopCanSetUp = true,
+  sub, ws, connected, active, visible = true, onPendingQuestion, idleFlashToken, onDiff, onHistory, onMinimize, onClose, maximized = false, onToggleMaximized, onRestoreBeforeClose, getMaximizeBounds, desktopLayoutCapable = true, onRestart, onRename, onSettings, onShareSession, onViewRepo, onTransportConfigSaved, onLiveSessionStateChange, onPreviewFile, onOpenLocalWebPreview, zIndex, onFocus, desktopFileBrowserZIndex, onDesktopFileBrowserOpen, onDesktopFileBrowserFocus, onDesktopFileBrowserClose, onPin, sessions, subSessions, serverId, pendingPrefillText, onPendingPrefillApplied, onVersionSensitiveAction, detectedModelHint, inP2p, sharedState, accentColor = DEFAULT_SUBSESSION_ACCENT_COLOR, daemonOnline, onOpenRemoteDesktop, remoteDesktopCanSetUp = true,
 }: Props) {
   recordPerfRender(visible ? 'SubSessionWindow:visible' : 'SubSessionWindow:hidden');
   const { t } = useTranslation();
@@ -369,6 +370,17 @@ export function SubSessionWindow({
     }),
     [activeThinkingTs, activeTimelineTurn, activeToolCall, sub.authoritativeIdleAt, sub.state, timelineLastEventTs, timelineSessionState, timelineSessionStateInfo.ts],
   );
+
+  const handleLiveSessionStateChange = useStableCallback((state: SubSession['state']) => {
+    onLiveSessionStateChange?.(state);
+  });
+
+  useEffect(() => {
+    if (!liveSessionState || liveSessionState === sub.state) return;
+    if (liveSessionState === 'running' || liveSessionState === 'idle' || liveSessionState === 'queued') {
+      handleLiveSessionStateChange(liveSessionState as SubSession['state']);
+    }
+  }, [liveSessionState, sub.state, handleLiveSessionStateChange]);
 
   // Dedicated per-sub-session file browser state. Each sub-session has its own
   // cwd, so opening 📁 here should browse THIS sub-session's working directory

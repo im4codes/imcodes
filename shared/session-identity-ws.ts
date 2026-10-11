@@ -82,7 +82,7 @@ export interface SessionIdentityLocalRequest {
   type: typeof SESSION_IDENTITY_WS.LOCAL_REQUEST;
   requestId: string;
   op: SessionIdentityLocalOp;
-  scope: 'project' | 'session';
+  scope: 'project' | 'session' | 'pair';
   scopeKey: string;
   /** SET only. */
   content?: string;
@@ -95,7 +95,7 @@ export interface SessionIdentityLocalResponse {
   requestId: string;
   status: 'ok' | 'error';
   op: SessionIdentityLocalOp;
-  scope: 'project' | 'session';
+  scope: 'project' | 'session' | 'pair';
   scopeKey: string;
   /** GET only, when found. */
   content?: string;

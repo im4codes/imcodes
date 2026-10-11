@@ -12,7 +12,7 @@ import {
 } from '../api.js';
 import type { WsClient } from '../ws-client.js';
 import { isRunningTimelineEvent } from '../timeline-running.js';
-import { isOlderActivityGeneration, type ActivityGenerationLike } from '@shared/session-activity-types.js';
+import { isOlderActivityGeneration, isWorkingSessionState, type ActivityGenerationLike } from '@shared/session-activity-types.js';
 import { mergeTransportConfigPreservingSupervision } from '@shared/supervision-config.js';
 import {
   buildTransportQueueEventPatch,
@@ -583,8 +583,25 @@ export function useSubSessions(
           return;
         }
         if (ev.type === 'session.state') {
-          state = String(ev.payload.state ?? '');
+          const rawState = String(ev.payload?.state ?? '');
+          const payload = (ev.payload && typeof ev.payload === 'object' ? ev.payload : {}) as Record<string, unknown>;
+          const blockingWorkCount = Number(payload.blockingWorkCount ?? 0);
+          const activeWorkCount = Number(payload.activeWorkCount ?? 0);
+          const activeToolCount = Number(payload.activeToolCount ?? 0);
+          if (rawState === 'idle' && (blockingWorkCount > 0 || activeWorkCount > 0 || activeToolCount > 0)) {
+            state = 'running';
+          } else {
+            state = rawState;
+          }
           sessionName = ev.sessionId;
+        } else if (ev.type === 'agent.status') {
+          const agentStatus = ev.payload?.status;
+          if (typeof agentStatus === 'string' && (isWorkingSessionState(agentStatus) || agentStatus === 'working' || agentStatus === 'compacting')) {
+            state = 'running';
+            sessionName = ev.sessionId;
+          } else {
+            return;
+          }
         } else if (isRunningTimelineEvent(ev)) {
           state = 'running';
           sessionName = ev.sessionId;
@@ -790,9 +807,20 @@ export function useSubSessions(
     'type' | 'runtimeType' | 'label' | 'description' | 'cwd' | 'state' | 'authoritativeIdleAt' | 'transportConfig'
     | 'requestedModel' | 'activeModel' | 'modelDisplay'
   >>) => {
-    setSubSessions((prev) => prev.map((s) =>
-      s.id === id ? { ...s, ...fields } : s,
-    ));
+    setSubSessions((prev) => {
+      const idx = prev.findIndex((s) => s.id === id);
+      if (idx === -1) return prev;
+      const existing = prev[idx];
+      let changed = false;
+      for (const key of Object.keys(fields) as Array<keyof typeof fields>) {
+        if (existing[key] !== fields[key]) {
+          changed = true;
+          break;
+        }
+      }
+      if (!changed) return prev;
+      return replaceAtIfChanged(prev, idx, { ...existing, ...fields });
+    });
   }, []);
 
   // Filter sub-sessions by active main session (show only those belonging to it).

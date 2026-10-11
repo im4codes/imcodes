@@ -156,7 +156,7 @@ export interface DirectFileTransferRouterHooks {
    */
   authorizeIdentityOperation(
     socket: WebSocket,
-    scope: 'project' | 'session',
+    scope: 'project' | 'session' | 'pair',
     scopeKey: string,
     sessionName: string | undefined,
   ): boolean;

@@ -5415,15 +5415,19 @@ export class WsBridge {
    */
   private canonicalIdentityScopeKeyForSocket(
     ws: WebSocket,
-    scope: 'project' | 'session',
+    scope: 'project' | 'session' | 'pair',
     sessionName: string,
   ): string | null {
     if (!sessionName) return null;
     const shareState = this.browserShareStates.get(ws);
     if (shareState && !shareStateMayUseIdentity(shareState, sessionName)) return null;
-    return scope === 'session'
-      ? sessionIdentitySessionKey(this.serverId, sessionName)
-      : this.resolveSessionIdentityProjectKey(sessionName);
+    if (scope === 'session') {
+      return sessionIdentitySessionKey(this.serverId, sessionName);
+    }
+    if (scope === 'pair') {
+      return null;
+    }
+    return this.resolveSessionIdentityProjectKey(sessionName);
   }
 
   /**
@@ -12974,7 +12978,7 @@ export class WsBridge {
   /** Rejects with 'daemon_offline' or 'timeout'; never HTTP. */
   sendSessionIdentityLocalRequest(
     requestId: string,
-    payload: { op: 'get' | 'set' | 'delete'; scope: 'project' | 'session'; scopeKey: string; content?: string; source?: 'web' | 'mcp'; sourceFile?: string },
+    payload: { op: 'get' | 'set' | 'delete'; scope: 'project' | 'session' | 'pair'; scopeKey: string; content?: string; source?: 'web' | 'mcp'; sourceFile?: string },
     timeoutMs: number = SESSION_IDENTITY_LOCAL_RPC_TIMEOUT_MS,
   ): Promise<Record<string, unknown>> {
     if (!this.isDaemonConnected()) {

@@ -7,11 +7,13 @@ import type {
   ProviderConfig,
   ProviderError,
   ProviderModelList,
+  ProviderStatusUpdate,
   ProviderUsageUpdate,
   SessionConfig,
   SessionInfoUpdate,
   TransportProvider,
 } from '../transport-provider.js';
+import type { ProviderActiveWorkSnapshot, SessionActivityBusyReason } from '../../../shared/session-activity-types.js';
 import {
   CONNECTION_MODES,
   normalizeProviderPayload,
@@ -87,6 +89,7 @@ interface AgySessionState {
   sessionSystemTextSent: boolean;
   stderrTail: string;
   toolSteps: Map<number, string>;
+  lastStatusSignature?: string;
 }
 
 function asRecord(value: unknown): Record<string, unknown> {
@@ -197,6 +200,7 @@ export class AgySdkProvider implements TransportProvider {
   private readonly toolCallCallbacks = new Set<(sessionId: string, tool: ToolCallEvent) => void>();
   private readonly sessionInfoCallbacks = new Set<(sessionId: string, info: SessionInfoUpdate) => void>();
   private readonly usageCallbacks = new Set<(sessionId: string, update: ProviderUsageUpdate) => void>();
+  private readonly statusCallbacks = new Set<(sessionId: string, status: ProviderStatusUpdate) => void>();
   private modelCache: { at: number; list: ProviderModelList } | null = null;
 
   // ── Lifecycle ──────────────────────────────────────────────────────────────
@@ -306,10 +310,12 @@ export class AgySdkProvider implements TransportProvider {
     state.cancelled = false;
     state.sessionSystemTextSent = true;
     state.inflightTurns += 1;
+    this.emitStatus(sessionId, state, { status: 'thinking', label: 'Thinking...' });
     // Appending while a turn is running is intentional: agy queues user events and runs them in order.
     child.stdin.write(encodeAgyUserLine(prompt), (err) => {
       if (!err) return;
       state.inflightTurns = Math.max(0, state.inflightTurns - 1);
+      this.emitStatus(sessionId, state, { status: null, label: null });
       this.emitError(sessionId, PROVIDER_ERROR_CODES.CONNECTION_LOST, 'Failed to write to the agy process', true);
     });
   }
@@ -318,6 +324,7 @@ export class AgySdkProvider implements TransportProvider {
     const state = this.sessions.get(sessionId);
     if (!state?.child || state.child.killed) return;
     state.cancelled = true;
+    this.emitStatus(sessionId, state, { status: null, label: null });
     await this.terminateChild(state);
     // The next send resumes the same conversation via --conversation; agy persisted it.
     this.emitError(sessionId, PROVIDER_ERROR_CODES.CANCELLED, 'Turn cancelled', true);
@@ -377,6 +384,30 @@ export class AgySdkProvider implements TransportProvider {
   onUsage(cb: (sessionId: string, update: ProviderUsageUpdate) => void): () => void {
     this.usageCallbacks.add(cb);
     return () => { this.usageCallbacks.delete(cb); };
+  }
+
+  onStatus(cb: (sessionId: string, status: ProviderStatusUpdate) => void): () => void {
+    this.statusCallbacks.add(cb);
+    return () => { this.statusCallbacks.delete(cb); };
+  }
+
+  getActiveWorkSnapshot(sessionId: string): ProviderActiveWorkSnapshot | null {
+    const state = this.sessions.get(sessionId);
+    if (!state) return null;
+    const activeToolCount = state.toolSteps.size;
+    const inflight = state.inflightTurns > 0;
+    const activeWorkCount = (inflight ? 1 : 0) + activeToolCount;
+    const busyReasons: SessionActivityBusyReason[] = [];
+    if (inflight) busyReasons.push('provider_wait');
+    if (activeToolCount > 0) busyReasons.push('open_tool_call');
+    return {
+      status: 'current',
+      activeWorkCount,
+      activeToolCount,
+      busyReasons,
+      providerDiagnosticGeneration: state.conversationId ?? null,
+      updatedAt: Date.now(),
+    };
   }
 
   // ── Models ─────────────────────────────────────────────────────────────────
@@ -495,6 +526,8 @@ export class AgySdkProvider implements TransportProvider {
       if (state.child !== child) return;
       state.child = null;
       state.inflightTurns = 0;
+      this.clearOpenToolSteps(sessionId, state);
+      this.emitStatus(sessionId, state, { status: null, label: null });
       const code = (err as NodeJS.ErrnoException).code;
       this.emitError(
         sessionId,
@@ -510,6 +543,8 @@ export class AgySdkProvider implements TransportProvider {
       state.child = null;
       const hadTurns = state.inflightTurns > 0;
       state.inflightTurns = 0;
+      this.clearOpenToolSteps(sessionId, state);
+      this.emitStatus(sessionId, state, { status: null, label: null });
       if (state.cancelled || !hadTurns) return;
       logger.warn({ sessionId, code, signal }, 'agy process exited with turns in flight');
       const tail = state.stderrTail.trim();
@@ -526,10 +561,25 @@ export class AgySdkProvider implements TransportProvider {
     return child;
   }
 
+  private clearOpenToolSteps(sessionId: string, state: AgySessionState): void {
+    if (state.toolSteps.size === 0) return;
+    for (const [, id] of state.toolSteps) {
+      const tool: ToolCallEvent = {
+        id,
+        name: 'tool',
+        status: 'complete',
+      };
+      for (const cb of this.toolCallCallbacks) cb(sessionId, tool);
+    }
+    state.toolSteps.clear();
+  }
+
   private async terminateChild(state: AgySessionState): Promise<void> {
     const child = state.child;
     state.child = null;
     state.inflightTurns = 0;
+    this.clearOpenToolSteps(state.routeId, state);
+    this.emitStatus(state.routeId, state, { status: null, label: null });
     if (!child) return;
     try { child.stdin?.end(); } catch { /* already closed */ }
     await killProcessTree(child, { gracefulMs: KILL_GRACE_MS, ownsProcessGroup: process.platform !== 'win32' });
@@ -583,6 +633,7 @@ export class AgySdkProvider implements TransportProvider {
       // The DONE frame carries a trailing "\n" separator, not user-visible text,
       // but only skip if the delta is actually empty/whitespace-only.
       if (!text || (stepState === AGY_STEP_STATE.DONE && !text.trim())) return;
+      this.emitStatus(sessionId, state, { status: 'streaming', label: null });
       const stepIndex = asNumber(step.step_index);
       const prefix = state.conversationId ?? state.routeId;
       const targetMessageId = stepIndex !== undefined
@@ -634,7 +685,18 @@ export class AgySdkProvider implements TransportProvider {
         ...(done && output !== undefined ? { output } : {}),
       };
       for (const cb of this.toolCallCallbacks) cb(sessionId, tool);
-      if (done) state.toolSteps.delete(stepIndex);
+      if (done) {
+        state.toolSteps.delete(stepIndex);
+        this.emitStatus(sessionId, state, {
+          status: state.toolSteps.size > 0 ? 'tool_running' : 'thinking',
+          label: state.toolSteps.size > 0 ? 'Running tool...' : 'Thinking...',
+        });
+      } else {
+        this.emitStatus(sessionId, state, {
+          status: 'tool_running',
+          label: `Running ${name}...`,
+        });
+      }
     }
   }
 
@@ -647,7 +709,8 @@ export class AgySdkProvider implements TransportProvider {
     state.currentMessageId = null;
     state.currentText = '';
     state.sawToolCall = false;
-    state.toolSteps.clear();
+    this.clearOpenToolSteps(sessionId, state);
+    this.emitStatus(sessionId, state, { status: null, label: null });
     if (state.cancelled) return;
 
     const usage = asRecord(result.usage) as AgyUsage;
@@ -728,6 +791,13 @@ export class AgySdkProvider implements TransportProvider {
 
   private emitSessionInfo(sessionId: string, info: SessionInfoUpdate): void {
     for (const cb of this.sessionInfoCallbacks) cb(sessionId, info);
+  }
+
+  private emitStatus(sessionId: string, state: AgySessionState, status: ProviderStatusUpdate): void {
+    const signature = JSON.stringify({ status: status.status, label: status.label ?? null });
+    if (state.lastStatusSignature === signature) return;
+    state.lastStatusSignature = signature;
+    for (const cb of this.statusCallbacks) cb(sessionId, status);
   }
 
   private emitError(sessionId: string, code: string, message: string, recoverable: boolean): void {
