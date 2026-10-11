@@ -181,6 +181,168 @@ export function parseAgyUsageTsv(stdout: string | null | undefined): ProviderQuo
   return { groups: validGroups };
 }
 
+/**
+ * Pure parser for `agy --output-format json --print /usage` output.
+ * Parses high-precision float `remaining_fraction` (e.g. 0.8424968... -> used 15.75%, remaining 84.25%).
+ */
+export function parseAgyUsageJson(raw: string | null | undefined): ProviderQuotaMeta | undefined {
+  if (typeof raw !== 'string' || !raw.trim()) return undefined;
+
+  let parsed: any;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    const firstBrace = raw.indexOf('{');
+    const lastBrace = raw.lastIndexOf('}');
+    if (firstBrace >= 0 && lastBrace > firstBrace) {
+      try {
+        parsed = JSON.parse(raw.slice(firstBrace, lastBrace + 1));
+      } catch {
+        return undefined;
+      }
+    } else {
+      return undefined;
+    }
+  }
+
+  if (!parsed || typeof parsed !== 'object') return undefined;
+
+  const rawGroups = parsed?.command?.data?.groups
+    ?? parsed?.data?.groups
+    ?? parsed?.groups;
+
+  if (!Array.isArray(rawGroups) || rawGroups.length === 0) {
+    if (typeof parsed?.response === 'string' && parsed.response.trim()) {
+      return parseAgyUsageTsv(parsed.response);
+    }
+    return undefined;
+  }
+
+  const groupMap = new Map<string, {
+    id: string;
+    label: string;
+    primary?: ProviderQuotaWindow;
+    secondary?: ProviderQuotaWindow;
+    order: number;
+  }>();
+
+  let unknownOrderCounter = AGY_USAGE_KNOWN_GROUP_ORDER.length;
+
+  for (const rawGroup of rawGroups) {
+    if (!rawGroup || typeof rawGroup !== 'object') continue;
+    const tier = typeof rawGroup.name === 'string' ? rawGroup.name.trim() : '';
+    if (!tier) continue;
+
+    const buckets = Array.isArray(rawGroup.buckets) ? rawGroup.buckets : [];
+    for (const bucket of buckets) {
+      if (!bucket || typeof bucket !== 'object') continue;
+
+      const windowLabel = typeof bucket.name === 'string' ? bucket.name.trim() : '';
+      const windowKey = typeof bucket.window === 'string' ? bucket.window.trim().toLowerCase() : '';
+
+      let windowDurationMins: number | undefined;
+      let isPrimary: boolean | undefined;
+
+      if (windowKey === '5h' || windowLabel === AGY_USAGE_WINDOW_LABEL.FIVE_HOUR) {
+        windowDurationMins = AGY_USAGE_WINDOW_MINS.FIVE_HOUR;
+        isPrimary = true;
+      } else if (windowKey === 'weekly' || windowKey === '7d' || windowLabel === AGY_USAGE_WINDOW_LABEL.WEEKLY) {
+        windowDurationMins = AGY_USAGE_WINDOW_MINS.WEEKLY;
+        isPrimary = false;
+      } else {
+        continue;
+      }
+
+      let usedPercent: number | undefined;
+      if (typeof bucket.remaining_fraction === 'number' && Number.isFinite(bucket.remaining_fraction)) {
+        let frac = bucket.remaining_fraction;
+        if (frac > 1) {
+          frac = frac / 100;
+        }
+        usedPercent = Math.max(0, Math.min(100, Math.round((1 - frac) * 10000) / 100));
+      } else if (typeof bucket.remaining_percent === 'number' && Number.isFinite(bucket.remaining_percent)) {
+        usedPercent = Math.max(0, Math.min(100, Math.round((100 - bucket.remaining_percent) * 100) / 100));
+      }
+
+      if (usedPercent === undefined) continue;
+
+      const resetTimeStr = typeof bucket.reset_time === 'string'
+        ? bucket.reset_time
+        : (typeof bucket.resets_at === 'string' ? bucket.resets_at : '');
+      const resetsAt = resetTimeStr ? parseResetTimestamp(resetTimeStr) : undefined;
+
+      const quotaWindow: ProviderQuotaWindow = {
+        windowDurationMins,
+        usedPercent,
+        percentPrecision: 2,
+        ...(resetsAt !== undefined ? { resetsAt } : {}),
+      };
+
+      const knownGroupId = AGY_USAGE_TIER_TO_GROUP_ID[tier];
+      let groupId: string;
+      let groupLabel: string;
+      let order: number;
+
+      if (knownGroupId) {
+        groupId = knownGroupId;
+        groupLabel = AGY_USAGE_TIER_TO_GROUP_LABEL[tier] ?? tier;
+        order = AGY_USAGE_KNOWN_GROUP_ORDER.indexOf(knownGroupId);
+        if (order < 0) order = 0;
+      } else {
+        groupId = slugify(tier);
+        groupLabel = tier;
+        const existing = groupMap.get(groupId);
+        order = existing ? existing.order : unknownOrderCounter++;
+      }
+
+      let group = groupMap.get(groupId);
+      if (!group) {
+        group = { id: groupId, label: groupLabel, order };
+        groupMap.set(groupId, group);
+      }
+
+      if (isPrimary) {
+        group.primary = quotaWindow;
+      } else {
+        group.secondary = quotaWindow;
+      }
+    }
+  }
+
+  const validGroups: ProviderQuotaGroup[] = [];
+  const sortedEntries = Array.from(groupMap.values()).sort((a, b) => a.order - b.order);
+
+  for (const entry of sortedEntries) {
+    if (!entry.primary && !entry.secondary) continue;
+    validGroups.push({
+      id: entry.id,
+      label: entry.label,
+      ...(entry.primary ? { primary: entry.primary } : {}),
+      ...(entry.secondary ? { secondary: entry.secondary } : {}),
+    });
+  }
+
+  if (validGroups.length === 0) {
+    if (typeof parsed?.response === 'string' && parsed.response.trim()) {
+      return parseAgyUsageTsv(parsed.response);
+    }
+    return undefined;
+  }
+  return { groups: validGroups };
+}
+
+/**
+ * Unified parser for `agy` usage probe output.
+ * Tries JSON format first (providing high precision 2-decimal floats from `remaining_fraction`),
+ * then falls back to TSV / column-aligned text.
+ */
+export function parseAgyUsageOutput(stdout: string | null | undefined): ProviderQuotaMeta | undefined {
+  if (typeof stdout !== 'string' || !stdout.trim()) return undefined;
+  const jsonMeta = parseAgyUsageJson(stdout);
+  if (jsonMeta) return jsonMeta;
+  return parseAgyUsageTsv(stdout);
+}
+
 async function defaultExecAgyProbe(
   file: string,
   args: string[],
@@ -311,7 +473,7 @@ export async function fetchAgyUsageQuota(
   inflight = (async () => {
     try {
       const stdout = await executeProbe(execFn);
-      const quotaMeta = parseAgyUsageTsv(stdout);
+      const quotaMeta = parseAgyUsageOutput(stdout);
       if (quotaMeta) {
         const quotaLabel = formatProviderQuotaLabel(quotaMeta);
         const value: AgyUsageQuota = { quotaMeta, ...(quotaLabel ? { quotaLabel } : {}) };

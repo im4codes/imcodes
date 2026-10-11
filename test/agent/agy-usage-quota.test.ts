@@ -4,6 +4,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   parseAgyUsageTsv,
+  parseAgyUsageJson,
+  parseAgyUsageOutput,
   fetchAgyUsageQuota,
   recordAgyQuotaActivity,
   peekAgyUsageQuotaCached,
@@ -18,6 +20,8 @@ import { imcodesStateDir, imcodesStatePath } from '../../src/util/imcodes-state-
 
 const SAMPLE_PATH = join(__dirname, '../fixtures/agy-usage/sample.tsv');
 const SAMPLE_TSV = readFileSync(SAMPLE_PATH, 'utf8');
+const SAMPLE_JSON_PATH = join(__dirname, '../fixtures/agy-usage/sample.json');
+const SAMPLE_JSON = readFileSync(SAMPLE_JSON_PATH, 'utf8');
 
 describe('parseAgyUsageTsv', () => {
   it('parses the 4-line happy path sample.tsv with exact inverted percent and epoch seconds', () => {
@@ -173,6 +177,101 @@ describe('parseAgyUsageTsv', () => {
     expect(parseAgyUsageTsv(undefined)).toBeUndefined();
     expect(parseAgyUsageTsv(null)).toBeUndefined();
     expect(parseAgyUsageTsv('only errors\nand nothing valid\n')).toBeUndefined();
+  });
+});
+
+describe('parseAgyUsageJson', () => {
+  it('parses sample.json with high-precision float remaining_fraction and exact percent', () => {
+    const meta = parseAgyUsageJson(SAMPLE_JSON);
+    expect(meta).toBeDefined();
+    expect(meta?.groups).toHaveLength(2);
+
+    const [gemini, claudeGpt] = meta!.groups!;
+
+    // Gemini Models
+    expect(gemini.id).toBe('gemini');
+    expect(gemini.label).toBe('Gemini');
+    expect(gemini.primary).toEqual({
+      windowDurationMins: 300,
+      usedPercent: 1.01, // 1 - 0.9898775219917297 = 1.01%
+      percentPrecision: 2,
+      resetsAt: 1791705060, // 2026-10-11T07:51:00Z
+    });
+    expect(gemini.secondary).toEqual({
+      windowDurationMins: 10080,
+      usedPercent: 2.3, // 1 - 0.9770231246948242 = 2.30%
+      percentPrecision: 2,
+      resetsAt: 1792253677, // 2026-10-17T16:14:37Z
+    });
+
+    // Claude and GPT models
+    expect(claudeGpt.id).toBe('claude-gpt');
+    expect(claudeGpt.label).toBe('Claude/GPT');
+    expect(claudeGpt.primary).toEqual({
+      windowDurationMins: 300,
+      usedPercent: 0, // remaining_fraction = 1 -> used 0%
+      percentPrecision: 2,
+      resetsAt: 1791705428, // 2026-10-11T07:57:08Z
+    });
+    expect(claudeGpt.secondary).toEqual({
+      windowDurationMins: 10080,
+      usedPercent: 15.75, // 1 - 0.8424968123435974 = 15.75% (remaining 84.25%)
+      percentPrecision: 2,
+      resetsAt: 1792253797, // 2026-10-17T16:16:37Z
+    });
+
+    const label = formatProviderQuotaLabel(meta);
+    expect(label).toContain('15.75%');
+    expect(label).toContain('1.01%');
+    expect(label).toContain('2.30%');
+  });
+
+  it('handles JSON with surrounding banner or text preamble/epilogue', () => {
+    const wrapped = `Some banner information before json\n${SAMPLE_JSON}\nSome trailing log line`;
+    const meta = parseAgyUsageJson(wrapped);
+    expect(meta).toBeDefined();
+    expect(meta?.groups).toHaveLength(2);
+    expect(meta?.groups?.[1].secondary?.usedPercent).toBe(15.75);
+  });
+
+  it('falls back to parsed.response TSV if command.data.groups is missing', () => {
+    const jsonWithOnlyResponse = JSON.stringify({
+      response: SAMPLE_TSV,
+    });
+    const meta = parseAgyUsageJson(jsonWithOnlyResponse);
+    expect(meta).toBeDefined();
+    expect(meta?.groups).toHaveLength(2);
+    expect(meta?.groups?.[0].primary?.usedPercent).toBe(6);
+  });
+
+  it('returns undefined for non-json, empty, or garbage input', () => {
+    expect(parseAgyUsageJson('')).toBeUndefined();
+    expect(parseAgyUsageJson('   ')).toBeUndefined();
+    expect(parseAgyUsageJson(null)).toBeUndefined();
+    expect(parseAgyUsageJson(undefined)).toBeUndefined();
+    expect(parseAgyUsageJson('not json at all')).toBeUndefined();
+    expect(parseAgyUsageJson('{"foo": "bar"}')).toBeUndefined();
+  });
+});
+
+describe('parseAgyUsageOutput', () => {
+  it('parses JSON format when valid JSON is provided', () => {
+    const meta = parseAgyUsageOutput(SAMPLE_JSON);
+    expect(meta).toBeDefined();
+    expect(meta?.groups).toHaveLength(2);
+    expect(meta?.groups?.[1].secondary?.usedPercent).toBe(15.75);
+  });
+
+  it('falls back to TSV parsing when text output is provided', () => {
+    const meta = parseAgyUsageOutput(SAMPLE_TSV);
+    expect(meta).toBeDefined();
+    expect(meta?.groups).toHaveLength(2);
+    expect(meta?.groups?.[0].primary?.usedPercent).toBe(6);
+  });
+
+  it('returns undefined for completely invalid input', () => {
+    expect(parseAgyUsageOutput('')).toBeUndefined();
+    expect(parseAgyUsageOutput('random string without columns or json')).toBeUndefined();
   });
 });
 
@@ -341,8 +440,12 @@ describe('fake agy script integration via real execFile', () => {
     fakeAgyPath = join(tempDir, 'fake-agy');
     const fakeScript = `#!/usr/bin/env node
 const args = process.argv.slice(2);
-if (args[0] === '--print' && args[1] === '/usage') {
-  process.stdout.write(${JSON.stringify(SAMPLE_TSV)});
+if (args.includes('/usage')) {
+  if (args.includes('json')) {
+    process.stdout.write(${JSON.stringify(SAMPLE_JSON)});
+  } else {
+    process.stdout.write(${JSON.stringify(SAMPLE_TSV)});
+  }
   process.exit(0);
 }
 process.exit(1);
@@ -362,12 +465,12 @@ process.exit(1);
     __resetAgyUsageQuotaCache();
   });
 
-  it('spawns fake agy script, parses TSV, and produces formatted one-line label', async () => {
+  it('spawns fake agy script, parses JSON, and produces formatted one-line label with real decimals', async () => {
     const quota = await fetchAgyUsageQuota({ forceRefresh: true });
     expect(quota).toBeDefined();
     expect(quota?.quotaMeta.groups).toHaveLength(2);
     expect(quota?.quotaLabel).toBeDefined();
     // One line label containing Gemini and Claude/GPT groups separated by ' | '
-    expect(quota?.quotaLabel).toMatch(/^Gemini 5h 6\.00% .* · 7d 0\.00% .* \| Claude\/GPT 5h 20\.00% .* · 7d 11\.00% /);
+    expect(quota?.quotaLabel).toMatch(/^Gemini 5h 1\.01% .* · 7d 2\.30% .* \| Claude\/GPT 5h 0\.00% .* · 7d 15\.75% /);
   });
 });

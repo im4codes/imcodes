@@ -1,7 +1,7 @@
 import { PROVIDER_QUOTA_GROUP_ID, PROVIDER_QUOTA_GROUP_LABEL } from './agy-agent.js';
 
 /** CLI arguments used to probe quota/usage from `agy`. */
-export const AGY_USAGE_CLI_ARGS = ['--print', '/usage'] as const;
+export const AGY_USAGE_CLI_ARGS = ['--output-format', 'json', '--print', '/usage'] as const;
 
 /** Raw tier labels reported by `agy --print /usage`. */
 export const AGY_USAGE_TIER_LABEL = {
