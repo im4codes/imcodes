@@ -103,10 +103,9 @@ export function getDefaultSharedContextModelForBackend(backend: SharedContextRun
 }
 
 export function doesSharedContextBackendSupportPresets(backend: SharedContextRuntimeBackend | null | undefined): boolean {
-  // Anthropic-compatible third-party presets (ANTHROPIC_BASE_URL/API_KEY/MODEL)
-  // run either through the Qwen OpenAI-compat transport or natively on the
-  // Claude Code SDK. The CC SDK path is preferred (it strips leaked <think>).
-  return backend === 'qwen' || backend === 'claude-code-sdk';
+  // Compatible third-party presets (OpenAI or Anthropic compatible API)
+  // run through Qwen, Claude Code SDK, or Codex SDK.
+  return backend === 'qwen' || backend === 'claude-code-sdk' || backend === 'codex-sdk';
 }
 
 /**

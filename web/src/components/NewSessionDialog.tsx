@@ -33,6 +33,10 @@ import {
   buildCcPresetFromDraft,
   createCcPresetDraftFromPreset,
   createDefaultCcPresetDraft,
+  DEFAULT_CC_PRESET_BASE_URL,
+  DEFAULT_CC_PRESET_MODEL,
+  DEFAULT_OPENAI_PRESET_BASE_URL,
+  DEFAULT_OPENAI_PRESET_MODEL,
   type CcPresetDraft,
   type CcPresetEntry,
 } from "./cc-preset-form.js";
@@ -43,6 +47,7 @@ import {
   getCcPresetEffectiveModel,
   normalizeCcPresetName,
   type CcPreset,
+  type CcPresetAuthType,
 } from "@shared/cc-presets.js";
 import { CODEX_MODEL_IDS, GEMINI_MODEL_IDS, mergeModelSuggestions } from "../../../src/shared/models/options.js";
 import { loadCodexModelPreference } from "../codex-model-preference.js";
@@ -147,6 +152,7 @@ export function NewSessionDialog({
   // New preset form
   const defaultPresetDraft = createDefaultCcPresetDraft();
   const [newPresetName, setNewPresetName] = useState("");
+  const [newPresetAuthType, setNewPresetAuthType] = useState<CcPresetAuthType>(defaultPresetDraft.authType);
   const [newPresetBaseUrl, setNewPresetBaseUrl] = useState(defaultPresetDraft.baseUrl);
   const [newPresetToken, setNewPresetToken] = useState("");
   const [newPresetModel, setNewPresetModel] = useState(defaultPresetDraft.model);
@@ -170,6 +176,7 @@ export function NewSessionDialog({
   };
   const applyPresetDraft = (draft: CcPresetDraft) => {
     setNewPresetName(draft.name);
+    setNewPresetAuthType(draft.authType);
     setNewPresetBaseUrl(draft.baseUrl);
     setNewPresetToken(draft.token);
     setNewPresetModel(draft.model);
@@ -180,6 +187,7 @@ export function NewSessionDialog({
   };
   const buildCurrentPresetDraft = (): CcPresetDraft => ({
     name: newPresetName,
+    authType: newPresetAuthType,
     baseUrl: newPresetBaseUrl,
     token: newPresetToken,
     model: newPresetModel,
@@ -1083,6 +1091,49 @@ export function NewSessionDialog({
                 >
                   Stored locally on daemon (~/.imcodes/cc-presets.json)
                 </div>
+                <div style={{ marginBottom: 8 }}>
+                  <div style={{ fontSize: 10, color: "#64748b", marginBottom: 2 }}>
+                    API Protocol
+                  </div>
+                  <div style={{ display: "flex", gap: 12 }}>
+                    <label style={{ display: "flex", alignItems: "center", gap: 4, cursor: "pointer", fontSize: 11, color: "#e2e8f0" }}>
+                      <input
+                        type="radio"
+                        name="new-session-preset-auth-type"
+                        value="anthropic"
+                        checked={newPresetAuthType === "anthropic"}
+                        onChange={() => {
+                          setNewPresetAuthType("anthropic");
+                          if (!newPresetBaseUrl || newPresetBaseUrl === DEFAULT_OPENAI_PRESET_BASE_URL) {
+                            setNewPresetBaseUrl(DEFAULT_CC_PRESET_BASE_URL);
+                          }
+                          if (!newPresetModel || newPresetModel === DEFAULT_OPENAI_PRESET_MODEL) {
+                            setNewPresetModel(DEFAULT_CC_PRESET_MODEL);
+                          }
+                        }}
+                      />
+                      Anthropic Compatible
+                    </label>
+                    <label style={{ display: "flex", alignItems: "center", gap: 4, cursor: "pointer", fontSize: 11, color: "#e2e8f0" }}>
+                      <input
+                        type="radio"
+                        name="new-session-preset-auth-type"
+                        value="openai"
+                        checked={newPresetAuthType === "openai"}
+                        onChange={() => {
+                          setNewPresetAuthType("openai");
+                          if (!newPresetBaseUrl || newPresetBaseUrl === DEFAULT_CC_PRESET_BASE_URL) {
+                            setNewPresetBaseUrl(DEFAULT_OPENAI_PRESET_BASE_URL);
+                          }
+                          if (!newPresetModel || newPresetModel === DEFAULT_CC_PRESET_MODEL) {
+                            setNewPresetModel(DEFAULT_OPENAI_PRESET_MODEL);
+                          }
+                        }}
+                      />
+                      OpenAI Compatible
+                    </label>
+                  </div>
+                </div>
                 {[
                   {
                     label: "Preset Name",
@@ -1093,14 +1144,14 @@ export function NewSessionDialog({
                   },
                   {
                     label: "API Base URL",
-                    envKey: "ANTHROPIC_BASE_URL",
-                    ph: "https://api.minimax.io/anthropic",
+                    envKey: newPresetAuthType === "openai" ? "OPENAI_BASE_URL" : "ANTHROPIC_BASE_URL",
+                    ph: newPresetAuthType === "openai" ? DEFAULT_OPENAI_PRESET_BASE_URL : DEFAULT_CC_PRESET_BASE_URL,
                     val: newPresetBaseUrl,
                     set: setNewPresetBaseUrl,
                   },
                   {
                     label: "API Key",
-                    envKey: "ANTHROPIC_AUTH_TOKEN",
+                    envKey: newPresetAuthType === "openai" ? "OPENAI_API_KEY" : "ANTHROPIC_API_KEY",
                     ph: "your-api-key",
                     val: newPresetToken,
                     set: setNewPresetToken,
@@ -1108,8 +1159,8 @@ export function NewSessionDialog({
                   },
                   {
                     label: "Model",
-                    envKey: "ANTHROPIC_MODEL",
-                    ph: "e.g. MiniMax-M2.7",
+                    envKey: newPresetAuthType === "openai" ? "OPENAI_MODEL" : "ANTHROPIC_MODEL",
+                    ph: newPresetAuthType === "openai" ? `e.g. ${DEFAULT_OPENAI_PRESET_MODEL}` : `e.g. ${DEFAULT_CC_PRESET_MODEL}`,
                     val: newPresetModel,
                     set: setNewPresetModel,
                   },

@@ -592,10 +592,12 @@ describe('NewSessionDialog', () => {
     expect(screen.getByText('custom_provider_preset')).toBeDefined();
 
     // DSH and Pi are selectable compatibility layers; unsupported transports
-    // are removed from the expanded card selector.
+    // DSH, Pi, and Codex are selectable compatibility layers; unsupported transports
+    // (such as gemini-sdk) are removed from the expanded card selector.
     expect(getAgentButton('deepseek-harness')).toBeDefined();
     expect(getAgentButton('pi')).toBeDefined();
-    expect(document.querySelector('[data-agent-type="codex-sdk"]')).toBeNull();
+    expect(getAgentButton('codex-sdk')).toBeDefined();
+    expect(document.querySelector('[data-agent-type="gemini-sdk"]')).toBeNull();
 
     selectAgent('deepseek-harness');
     // Confirm the agent-type state actually changed to dsh by checking the
@@ -632,7 +634,7 @@ describe('NewSessionDialog', () => {
     });
 
     render(<NewSessionDialog ws={ws as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
-    selectAgent('codex-sdk');
+    selectAgent('gemini-sdk');
 
     const toggle = screen.getByLabelText(/custom_provider_sdk/i) as HTMLInputElement;
     expect(toggle.checked).toBe(false);
@@ -767,6 +769,41 @@ describe('NewSessionDialog', () => {
             API_TIMEOUT_MS: '3000000',
             CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
             CLAUDE_CODE_ATTRIBUTION_HEADER: '0',
+          }),
+        }),
+      ],
+    }));
+  });
+
+  it('saves OpenAI compatible preset when selected in preset editor', async () => {
+    const ws = makeWs();
+    render(<NewSessionDialog ws={ws as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
+
+    selectAgent('qwen');
+    await waitFor(() => expect(screen.getByText('compatible_api_via_qwen')).toBeDefined());
+
+    fireEvent.click(screen.getByText('api_provider_add_edit'));
+    const openaiRadio = screen.getByLabelText(/OpenAI Compatible/i);
+    fireEvent.click(openaiRadio);
+
+    expect((screen.getByDisplayValue('https://api.minimax.chat/v1') as HTMLInputElement)).toBeDefined();
+    expect((screen.getByDisplayValue('MiniMax-Text-01') as HTMLInputElement)).toBeDefined();
+
+    fireEvent.input(screen.getByPlaceholderText('e.g. MiniMax'), { target: { value: 'MiniMax-OpenAI' } });
+    fireEvent.click(screen.getByRole('button', { name: /save preset/i }));
+
+    expect(ws.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'cc.presets.save',
+      requestId: expect.any(String),
+      presets: [
+        expect.objectContaining({
+          name: 'MiniMax-OpenAI',
+          transportMode: 'qwen-compatible-api',
+          authType: 'openai',
+          defaultModel: 'MiniMax-Text-01',
+          env: expect.objectContaining({
+            OPENAI_BASE_URL: 'https://api.minimax.chat/v1',
+            OPENAI_MODEL: 'MiniMax-Text-01',
           }),
         }),
       ],

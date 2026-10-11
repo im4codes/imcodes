@@ -314,7 +314,7 @@ export async function startSubSession(sub: SubSessionRecord): Promise<void> {
     ...hookCredentialEnv(hookCredential),
   };
   let presetInitMessage: string | undefined;
-  if (sub.ccPreset && agentType === 'claude-code') {
+  if (sub.ccPreset && (agentType === 'claude-code' || agentType === 'codex')) {
     const { resolvePresetEnv, getPreset, getPresetInitMessage } = await import('./cc-presets.js');
     const presetEnv = await resolvePresetEnv(sub.ccPreset, sub.ccSessionId ?? undefined);
     Object.assign(launchEnv, presetEnv);

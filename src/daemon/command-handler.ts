@@ -1126,7 +1126,7 @@ async function relaunchFreshTransportConversation(record: SessionRecord): Promis
     requestedModel: record.requestedModel,
     effort: record.effort,
     transportConfig: record.transportConfig,
-    ccPreset: (record.agentType === 'claude-code-sdk' || record.agentType === 'qwen') ? record.ccPreset : undefined,
+    ccPreset: CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(record.agentType) ? record.ccPreset : undefined,
     ...(record.agentType === 'claude-code-sdk' ? { ccSessionId: randomUUID() } : {}),
     ...(record.agentType === 'openclaw' && record.providerSessionId ? { bindExistingKey: record.providerSessionId } : {}),
     ...(record.parentSession ? { parentSession: record.parentSession } : {}),
@@ -2610,7 +2610,7 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
   try {
     // Resolve CC env preset if specified
     let extraEnv: Record<string, string> | undefined;
-    if (ccPresetName && (agentType === 'claude-code' || agentType === 'claude-code-sdk')) {
+    if (ccPresetName && (agentType === 'claude-code' || agentType === 'claude-code-sdk' || agentType === 'codex' || agentType === 'codex-sdk')) {
       const { resolvePresetEnv } = await import('./cc-presets.js');
       extraEnv = await resolvePresetEnv(ccPresetName);
     }
@@ -2678,6 +2678,8 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
         agentType: 'codex-sdk',
         projectDir: dir,
         fresh: true,
+        extraEnv,
+        ccPreset: ccPresetName,
         ...(requestedModel ? { requestedModel } : {}),
         label,
         effort,
@@ -2886,6 +2888,11 @@ async function resolveValidatedModelList(record: SessionRecord): Promise<{ model
       return { models: preset ? getPresetAvailableModelIds(preset) : [] };
     }
     case 'codex-sdk': {
+      if (record.ccPreset) {
+        const { getPreset, getPresetAvailableModelIds } = await import('./cc-presets.js');
+        const preset = await getPreset(record.ccPreset);
+        if (preset) return { models: getPresetAvailableModelIds(preset) };
+      }
       const sdkRuntime = await getCodexRuntimeConfig(true).catch(() => ({}) as import('../agent/codex-runtime-config.js').CodexRuntimeConfig);
       const models = sdkRuntime.availableModels?.length
         ? sdkRuntime.availableModels
@@ -3010,6 +3017,7 @@ async function applyTransportModelSwitch(
     requestedModel = selectedModel;
     contextWindow = resolveContextWindow(presetContextWindow, selectedModel);
   } else if (agentType === 'codex-sdk') {
+    let presetContextWindow = record.presetContextWindow;
     const sdkRuntime = await getCodexRuntimeConfig(true).catch(() => ({}) as import('../agent/codex-runtime-config.js').CodexRuntimeConfig);
     const sdkDisplay = mergeCodexDisplayMetadata(sdkRuntime, record);
     const availableModels = validated?.models ?? [];
@@ -3022,16 +3030,25 @@ async function applyTransportModelSwitch(
       );
     }
     transportRuntime?.setAgentId(requestedModel);
+    if (record.ccPreset) {
+      const { getPresetTransportOverrides } = await import('./cc-presets.js');
+      const presetOverrides = await getPresetTransportOverrides(record.ccPreset, requestedModel);
+      presetContextWindow = presetOverrides.contextWindow ?? presetContextWindow;
+      if (presetOverrides.systemPrompt) {
+        transportRuntime?.setSystemPrompt(presetOverrides.systemPrompt);
+      }
+    }
     nextRecord = {
       ...record,
       requestedModel,
       activeModel: requestedModel,
       modelDisplay: requestedModel,
       ...(availableModels.length ? { codexAvailableModels: availableModels } : {}),
+      ...(presetContextWindow ? { presetContextWindow } : {}),
       ...sdkDisplay,
       updatedAt: Date.now(),
     };
-    contextWindow = resolveContextWindow(undefined, requestedModel);
+    contextWindow = resolveContextWindow(presetContextWindow, requestedModel);
   } else if (agentType === 'qoder-sdk') {
     return refuse(
       SESSION_MODEL_CONTROL_ERROR.PROOF_GATED,
@@ -3334,7 +3351,6 @@ function cancelTransportTurnNow(
   if (!isTransportStop) return false;
 
   clearResend(sessionName, 'user_stopped');
-  stopRuntime?.clearPendingMessages?.('user_stopped');
   if (commandId) emitCommandAck(sessionName, commandId, 'accepted', undefined, serverLink);
   emitSessionControlTimelineFeedback(sessionName, 'stop');
   // Reflect idle PROMPTLY so the "working" spinner clears on STOP even when the

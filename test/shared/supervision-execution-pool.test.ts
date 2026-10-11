@@ -203,8 +203,11 @@ describe('supervision execution pools', () => {
       expect(normalizeSupervisionExecutionConfig({ ...preset, ccPresetId }), String(ccPresetId)).toBeUndefined();
     }
     expect(() => buildSupervisionExecutionCapabilityId({
-      agentType: 'codex-sdk', providerFamily: 'openai', runtimeType: 'transport', model: 'gpt-5.6', ccPresetId: 'preset-a',
+      agentType: 'openclaw', providerFamily: 'openai', runtimeType: 'transport', model: 'gpt-5.6', ccPresetId: 'preset-a',
     })).toThrow('invalid_supervision_execution_cc_preset');
+    expect(buildSupervisionExecutionCapabilityId({
+      agentType: 'codex-sdk', providerFamily: 'openai', runtimeType: 'transport', model: 'gpt-5.6', ccPresetId: 'preset-a',
+    })).toBe('supervision-exec-v1-cc-preset:transport:codex-sdk:openai:preset-a:gpt-5.6');
     expect(normalizeSupervisionExecutionConfig({ ...preset, capabilityId: opus.capabilityId })).toBeUndefined();
 
     expect(evaluateSupervisionObservedIdentity({ config: preset, actual: actual(preset), pool: 'primary' }))

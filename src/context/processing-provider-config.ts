@@ -56,6 +56,20 @@ export async function resolveProcessingProviderSessionConfig(
           ...(resolvedModel ? { agentId: resolvedModel } : {}),
         };
       }
+      case 'codex-sdk': {
+        const { getCodexPresetTransportConfig } = await import('../daemon/cc-presets.js');
+        const presetConfig = await getCodexPresetTransportConfig(preset, model);
+        return {
+          cacheKey: JSON.stringify({
+            backend: selection.backend,
+            preset,
+            model: presetConfig.model ?? model ?? null,
+            env: presetConfig.env,
+          }),
+          ...(presetConfig.env ? { env: presetConfig.env } : {}),
+          ...(presetConfig.model ?? model ? { agentId: presetConfig.model ?? model } : {}),
+        };
+      }
     }
   }
 

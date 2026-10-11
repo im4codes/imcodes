@@ -16,6 +16,7 @@ import {
   normalizeCcPresetContextWindow,
   normalizeCcPresetName,
   type CcPreset,
+  type CcPresetAuthType,
   type CcPresetModelInfo,
 } from '../../shared/cc-presets.js';
 import type { DshLlmConfig } from '../../shared/deepseek-harness.js';
@@ -87,7 +88,7 @@ function normalizePreset(raw: unknown): CcPreset | null {
     ...(record.transportMode === 'qwen-compatible-api' || record.transportMode === 'claude-cli-preset'
       ? { transportMode: record.transportMode }
       : {}),
-    ...(record.authType === 'anthropic' ? { authType: record.authType } : {}),
+    ...(record.authType === 'anthropic' || record.authType === 'openai' ? { authType: record.authType } : {}),
     ...(availableModels?.length ? { availableModels } : {}),
     ...(defaultModel ? { defaultModel } : {}),
     ...(typeof record.lastDiscoveredAt === 'number' ? { lastDiscoveredAt: record.lastDiscoveredAt } : {}),
@@ -214,8 +215,22 @@ export async function resolvePresetEnv(
   if (env['ANTHROPIC_AUTH_TOKEN'] && !env['ANTHROPIC_API_KEY']) {
     env['ANTHROPIC_API_KEY'] = env['ANTHROPIC_AUTH_TOKEN'];
   }
+  // Cross-align OpenAI and Anthropic credentials for multi-agent interoperability
+  if (env['ANTHROPIC_API_KEY'] && !env['OPENAI_API_KEY']) {
+    env['OPENAI_API_KEY'] = env['ANTHROPIC_API_KEY'];
+  } else if (env['OPENAI_API_KEY'] && !env['ANTHROPIC_API_KEY']) {
+    env['ANTHROPIC_API_KEY'] = env['OPENAI_API_KEY'];
+  }
+  if (env['ANTHROPIC_BASE_URL'] && !env['OPENAI_BASE_URL']) {
+    env['OPENAI_BASE_URL'] = env['ANTHROPIC_BASE_URL'];
+  } else if (env['OPENAI_BASE_URL'] && !env['ANTHROPIC_BASE_URL']) {
+    env['ANTHROPIC_BASE_URL'] = env['OPENAI_BASE_URL'];
+  }
   const effectiveModel = modelOverride?.trim() || getPresetEffectiveModel(preset);
-  if (effectiveModel) env['ANTHROPIC_MODEL'] = effectiveModel;
+  if (effectiveModel) {
+    env['ANTHROPIC_MODEL'] = effectiveModel;
+    env['OPENAI_MODEL'] = effectiveModel;
+  }
   // Auto-fill model aliases from ANTHROPIC_MODEL
   if (env['ANTHROPIC_MODEL']) {
     for (const alias of MODEL_ALIASES) {
@@ -348,6 +363,62 @@ export async function getQwenPresetTransportConfig(presetName: string, requested
   return {
     env,
     ...(settings ? { settings } : {}),
+    ...(model ? { model } : {}),
+    ...(availableModels.length ? { availableModels } : {}),
+    ...(runtimeFacts ? { systemPrompt: runtimeFacts } : {}),
+    ...(preset.contextWindow ? { contextWindow: preset.contextWindow } : {}),
+  };
+}
+
+export async function getCodexPresetTransportConfig(presetName: string, requestedModel?: string): Promise<{
+  env: Record<string, string>;
+  model?: string;
+  availableModels?: string[];
+  systemPrompt?: string;
+  contextWindow?: number;
+}> {
+  const preset = await getPreset(presetName);
+  if (!preset) return { env: {} };
+
+  const availableModels = getPresetAvailableModelIds(preset);
+  const model = selectPresetModel(preset, requestedModel);
+  const resolvedEnv = await resolvePresetEnv(presetName, undefined, model);
+  const baseUrl = resolvedEnv['OPENAI_BASE_URL']?.trim()
+    || resolvedEnv['ANTHROPIC_BASE_URL']?.trim()
+    || undefined;
+  const apiKey = resolvedEnv['OPENAI_API_KEY']?.trim()
+    || resolvedEnv['ANTHROPIC_API_KEY']?.trim()
+    || resolvedEnv['ANTHROPIC_AUTH_TOKEN']?.trim()
+    || undefined;
+
+  const env: Record<string, string> = {};
+  if (baseUrl) {
+    env['OPENAI_BASE_URL'] = baseUrl;
+    env['ANTHROPIC_BASE_URL'] = baseUrl;
+  }
+  if (apiKey) {
+    env['OPENAI_API_KEY'] = apiKey;
+    env['ANTHROPIC_API_KEY'] = apiKey;
+  }
+  if (model) {
+    env['OPENAI_MODEL'] = model;
+    env['ANTHROPIC_MODEL'] = model;
+  }
+  if (resolvedEnv['IMCODES_CONTEXT_WINDOW']) {
+    env['IMCODES_CONTEXT_WINDOW'] = resolvedEnv['IMCODES_CONTEXT_WINDOW'];
+  }
+
+  const runtimeFacts = (model || baseUrl) ? [
+    `Authoritative runtime fact: this Codex session is routed through the "${preset.name}" API provider preset.`,
+    baseUrl ? `Authoritative provider endpoint: ${baseUrl}.` : undefined,
+    model ? `Authoritative runtime model: ${model}.` : undefined,
+    model ? `If the user asks which model you are using, answer exactly with "${model}".` : 'If the user asks which model or provider you are using, answer with the authoritative runtime facts above.',
+    baseUrl ? `If the user asks which provider or endpoint you are using, mention "${baseUrl}".` : undefined,
+    'These runtime facts override any generic default model or provider identity.',
+  ].filter(Boolean).join(' ') : undefined;
+
+  return {
+    env,
     ...(model ? { model } : {}),
     ...(availableModels.length ? { availableModels } : {}),
     ...(runtimeFacts ? { systemPrompt: runtimeFacts } : {}),
@@ -506,27 +577,35 @@ export async function discoverPresetModels(preset: CcPreset): Promise<{
   endpoint: string;
 }> {
   const env = { ...preset.env };
-  const baseUrl = env['ANTHROPIC_BASE_URL']?.trim() || '';
-  const apiKey = env['ANTHROPIC_API_KEY']?.trim() || env['ANTHROPIC_AUTH_TOKEN']?.trim() || '';
-  if (!baseUrl) throw new Error('Preset is missing ANTHROPIC_BASE_URL');
-  if (!apiKey) throw new Error('Preset is missing ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN');
+  const authType: CcPresetAuthType = preset.authType ?? (
+    env['OPENAI_BASE_URL'] && !env['ANTHROPIC_BASE_URL'] ? 'openai' : 'anthropic'
+  );
+  const baseUrl = authType === 'openai'
+    ? (env['OPENAI_BASE_URL']?.trim() || env['ANTHROPIC_BASE_URL']?.trim() || '')
+    : (env['ANTHROPIC_BASE_URL']?.trim() || env['OPENAI_BASE_URL']?.trim() || '');
+  const apiKey = authType === 'openai'
+    ? (env['OPENAI_API_KEY']?.trim() || env['ANTHROPIC_API_KEY']?.trim() || env['ANTHROPIC_AUTH_TOKEN']?.trim() || '')
+    : (env['ANTHROPIC_API_KEY']?.trim() || env['ANTHROPIC_AUTH_TOKEN']?.trim() || env['OPENAI_API_KEY']?.trim() || '');
+
+  if (!baseUrl) {
+    throw new Error(authType === 'openai' ? 'Preset is missing OPENAI_BASE_URL' : 'Preset is missing ANTHROPIC_BASE_URL');
+  }
+  if (!apiKey) {
+    throw new Error(authType === 'openai' ? 'Preset is missing OPENAI_API_KEY' : 'Preset is missing ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN');
+  }
 
   let lastError: Error | null = null;
   for (const endpoint of getDiscoveryCandidates(baseUrl)) {
     try {
       const availableModels: CcPresetModelInfo[] = [];
       const seen = new Set<string>();
-      let afterId: string | undefined;
-      // Anthropic's list endpoint is cursor-paginated. The page cap prevents a
-      // broken compatible gateway from returning an endless has_more loop.
-      for (let page = 0; page < 100; page += 1) {
+
+      if (authType === 'openai') {
         const url = new URL(endpoint);
-        url.searchParams.set('limit', '1000');
-        if (afterId) url.searchParams.set('after_id', afterId);
+        const bearerToken = apiKey.startsWith('Bearer ') ? apiKey : `Bearer ${apiKey}`;
         const response = await fetch(url, {
           headers: {
-            'x-api-key': apiKey,
-            'anthropic-version': '2023-06-01',
+            Authorization: bearerToken,
             accept: 'application/json',
           },
         });
@@ -535,9 +614,6 @@ export async function discoverPresetModels(preset: CcPreset): Promise<{
           if (response.status === 404 || response.status === 405) {
             throw new CompatibleModelsEndpointUnavailableError(message);
           }
-          // Authentication, rate-limit, and provider failures prove that this
-          // endpoint exists. Do not replace a useful 401/429/5xx diagnosis
-          // with the fallback endpoint's likely 404.
           throw new Error(message);
         }
         const payload = await response.json() as unknown;
@@ -546,21 +622,54 @@ export async function discoverPresetModels(preset: CcPreset): Promise<{
           seen.add(model.id);
           availableModels.push(model);
         }
-        const payloadRecord = payload && typeof payload === 'object'
-          ? payload as Record<string, unknown>
-          : {};
-        if (payloadRecord.has_more !== true) break;
-        const nextAfterId = typeof payloadRecord.last_id === 'string'
-          ? payloadRecord.last_id.trim()
-          : '';
-        if (!nextAfterId || nextAfterId === afterId) {
-          throw new Error('Compatible models API returned an invalid pagination cursor');
-        }
-        afterId = nextAfterId;
-        if (page === 99) {
-          throw new Error('Compatible models API exceeded the pagination limit');
+      } else {
+        let afterId: string | undefined;
+        // Anthropic's list endpoint is cursor-paginated. The page cap prevents a
+        // broken compatible gateway from returning an endless has_more loop.
+        for (let page = 0; page < 100; page += 1) {
+          const url = new URL(endpoint);
+          url.searchParams.set('limit', '1000');
+          if (afterId) url.searchParams.set('after_id', afterId);
+          const response = await fetch(url, {
+            headers: {
+              'x-api-key': apiKey,
+              'anthropic-version': '2023-06-01',
+              accept: 'application/json',
+            },
+          });
+          if (!response.ok) {
+            const message = `HTTP ${response.status} ${response.statusText}`.trim();
+            if (response.status === 404 || response.status === 405) {
+              throw new CompatibleModelsEndpointUnavailableError(message);
+            }
+            // Authentication, rate-limit, and provider failures prove that this
+            // endpoint exists. Do not replace a useful 401/429/5xx diagnosis
+            // with the fallback endpoint's likely 404.
+            throw new Error(message);
+          }
+          const payload = await response.json() as unknown;
+          for (const model of parseDiscoveredModels(payload)) {
+            if (seen.has(model.id)) continue;
+            seen.add(model.id);
+            availableModels.push(model);
+          }
+          const payloadRecord = payload && typeof payload === 'object'
+            ? payload as Record<string, unknown>
+            : {};
+          if (payloadRecord.has_more !== true) break;
+          const nextAfterId = typeof payloadRecord.last_id === 'string'
+            ? payloadRecord.last_id.trim()
+            : '';
+          if (!nextAfterId || nextAfterId === afterId) {
+            throw new Error('Compatible models API returned an invalid pagination cursor');
+          }
+          afterId = nextAfterId;
+          if (page === 99) {
+            throw new Error('Compatible models API exceeded the pagination limit');
+          }
         }
       }
+
       if (availableModels.length === 0) {
         throw new Error('No models returned by compatible API');
       }
@@ -613,10 +722,12 @@ export async function refreshPresetModels(presetName: string): Promise<CcPresetM
     const latestPreset = latestPresets.find(
       (item) => normalizeCcPresetName(item.name) === normalizedName,
     ) ?? preset;
+    const effectiveAuthType: CcPresetAuthType = latestPreset.authType
+      ?? (latestPreset.env['OPENAI_BASE_URL'] && !latestPreset.env['ANTHROPIC_BASE_URL'] ? 'openai' : 'anthropic');
     const updatedPreset: CcPreset = {
       ...latestPreset,
       transportMode: latestPreset.transportMode ?? 'qwen-compatible-api',
-      authType: latestPreset.authType ?? 'anthropic',
+      authType: effectiveAuthType,
       availableModels: discovered.availableModels,
       lastDiscoveredAt: Date.now(),
       modelDiscoveryError: undefined,

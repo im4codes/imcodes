@@ -18,6 +18,10 @@ import {
   buildCcPresetFromDraft,
   createCcPresetDraftFromPreset,
   createDefaultCcPresetDraft,
+  DEFAULT_CC_PRESET_BASE_URL,
+  DEFAULT_CC_PRESET_MODEL,
+  DEFAULT_OPENAI_PRESET_BASE_URL,
+  DEFAULT_OPENAI_PRESET_MODEL,
   type CcPresetEntry,
   type CcPresetDraft,
 } from './cc-preset-form.js';
@@ -28,6 +32,7 @@ import {
   getCcPresetEffectiveModel,
   normalizeCcPresetName,
   type CcPreset,
+  type CcPresetAuthType,
 } from '@shared/cc-presets.js';
 import { CODEX_MODEL_IDS, GEMINI_MODEL_IDS, mergeModelSuggestions } from '../../../src/shared/models/options.js';
 import { loadCodexModelPreference } from '../codex-model-preference.js';
@@ -106,6 +111,7 @@ export function StartSubSessionDialog({ ws, defaultCwd, allowedAgentTypes, overl
   const [showPresetEditor, setShowPresetEditor] = useState(false);
   const defaultPresetDraft = createDefaultCcPresetDraft();
   const [newPresetName, setNewPresetName] = useState('');
+  const [newPresetAuthType, setNewPresetAuthType] = useState<CcPresetAuthType>(defaultPresetDraft.authType);
   const [newPresetBaseUrl, setNewPresetBaseUrl] = useState(defaultPresetDraft.baseUrl);
   const [newPresetToken, setNewPresetToken] = useState('');
   const [newPresetModel, setNewPresetModel] = useState(defaultPresetDraft.model);
@@ -118,6 +124,7 @@ export function StartSubSessionDialog({ ws, defaultCwd, allowedAgentTypes, overl
   const fmtCtx = (v: string) => { const n = parseInt(v, 10); if (!n) return ''; if (n >= 1000000) return `${(n/1000000).toFixed(n%1000000===0?0:1)}M`; if (n >= 1000) return `${(n/1000).toFixed(0)}K`; return String(n); };
   const applyPresetDraft = (draft: CcPresetDraft) => {
     setNewPresetName(draft.name);
+    setNewPresetAuthType(draft.authType);
     setNewPresetBaseUrl(draft.baseUrl);
     setNewPresetToken(draft.token);
     setNewPresetModel(draft.model);
@@ -128,6 +135,7 @@ export function StartSubSessionDialog({ ws, defaultCwd, allowedAgentTypes, overl
   };
   const buildCurrentPresetDraft = (): CcPresetDraft => ({
     name: newPresetName,
+    authType: newPresetAuthType,
     baseUrl: newPresetBaseUrl,
     token: newPresetToken,
     model: newPresetModel,
@@ -687,11 +695,71 @@ export function StartSubSessionDialog({ ws, defaultCwd, allowedAgentTypes, overl
                 <div style={{ background: '#0f172a', border: '1px solid #334155', borderRadius: 6, padding: 10, fontSize: 11 }}>
                   <div style={{ color: '#64748b', marginBottom: 4, fontSize: 10 }}>Stored locally (~/.imcodes/cc-presets.json)</div>
                   {presetError && <div style={{ color: '#ef4444', fontSize: 11, marginBottom: 4 }}>{presetError}</div>}
+                  <div style={{ marginBottom: 6 }}>
+                    <div style={{ fontSize: 9, color: '#64748b', marginBottom: 2 }}>API Protocol</div>
+                    <div style={{ display: 'flex', gap: 12 }}>
+                      <label style={{ display: 'flex', alignItems: 'center', gap: 4, cursor: 'pointer', fontSize: 10, color: '#e2e8f0' }}>
+                        <input
+                          type="radio"
+                          name="subsession-preset-auth-type"
+                          value="anthropic"
+                          checked={newPresetAuthType === 'anthropic'}
+                          onChange={() => {
+                            setNewPresetAuthType('anthropic');
+                            if (!newPresetBaseUrl || newPresetBaseUrl === DEFAULT_OPENAI_PRESET_BASE_URL) {
+                              setNewPresetBaseUrl(DEFAULT_CC_PRESET_BASE_URL);
+                            }
+                            if (!newPresetModel || newPresetModel === DEFAULT_OPENAI_PRESET_MODEL) {
+                              setNewPresetModel(DEFAULT_CC_PRESET_MODEL);
+                            }
+                          }}
+                        />
+                        Anthropic Compatible
+                      </label>
+                      <label style={{ display: 'flex', alignItems: 'center', gap: 4, cursor: 'pointer', fontSize: 10, color: '#e2e8f0' }}>
+                        <input
+                          type="radio"
+                          name="subsession-preset-auth-type"
+                          value="openai"
+                          checked={newPresetAuthType === 'openai'}
+                          onChange={() => {
+                            setNewPresetAuthType('openai');
+                            if (!newPresetBaseUrl || newPresetBaseUrl === DEFAULT_CC_PRESET_BASE_URL) {
+                              setNewPresetBaseUrl(DEFAULT_OPENAI_PRESET_BASE_URL);
+                            }
+                            if (!newPresetModel || newPresetModel === DEFAULT_CC_PRESET_MODEL) {
+                              setNewPresetModel(DEFAULT_OPENAI_PRESET_MODEL);
+                            }
+                          }}
+                        />
+                        OpenAI Compatible
+                      </label>
+                    </div>
+                  </div>
                   {[
                     { label: 'Preset Name', envKey: '', ph: 'e.g. MiniMax', val: newPresetName, set: setNewPresetName },
-                    { label: 'API Base URL', envKey: 'ANTHROPIC_BASE_URL', ph: 'https://api.minimax.io/anthropic', val: newPresetBaseUrl, set: setNewPresetBaseUrl },
-                    { label: 'API Key', envKey: 'ANTHROPIC_AUTH_TOKEN', ph: 'your-api-key', val: newPresetToken, set: setNewPresetToken, type: 'password' as const },
-                    { label: 'Model', envKey: 'ANTHROPIC_MODEL', ph: 'e.g. MiniMax-M2.7', val: newPresetModel, set: setNewPresetModel },
+                    {
+                      label: 'API Base URL',
+                      envKey: newPresetAuthType === 'openai' ? 'OPENAI_BASE_URL' : 'ANTHROPIC_BASE_URL',
+                      ph: newPresetAuthType === 'openai' ? DEFAULT_OPENAI_PRESET_BASE_URL : DEFAULT_CC_PRESET_BASE_URL,
+                      val: newPresetBaseUrl,
+                      set: setNewPresetBaseUrl,
+                    },
+                    {
+                      label: 'API Key',
+                      envKey: newPresetAuthType === 'openai' ? 'OPENAI_API_KEY' : 'ANTHROPIC_AUTH_TOKEN',
+                      ph: 'your-api-key',
+                      val: newPresetToken,
+                      set: setNewPresetToken,
+                      type: 'password' as const,
+                    },
+                    {
+                      label: 'Model',
+                      envKey: newPresetAuthType === 'openai' ? 'OPENAI_MODEL' : 'ANTHROPIC_MODEL',
+                      ph: newPresetAuthType === 'openai' ? `e.g. ${DEFAULT_OPENAI_PRESET_MODEL}` : `e.g. ${DEFAULT_CC_PRESET_MODEL}`,
+                      val: newPresetModel,
+                      set: setNewPresetModel,
+                    },
                   ].map(({ label, envKey, ph, val, set, type }) => (
                     <div key={label} style={{ marginBottom: 4 }}>
                       <div style={{ fontSize: 9, color: '#64748b', marginBottom: 1 }}>{label}{envKey && <span style={{ color: '#334155', marginLeft: 4 }}>{envKey}</span>}</div>
@@ -817,7 +885,7 @@ export function StartSubSessionDialog({ ws, defaultCwd, allowedAgentTypes, overl
           {supportsModelSelection && (
             <div>
               <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 8 }}>{t('session.supervision.model')}</div>
-              {CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(type) && modelSuggestions.length > 0 ? (
+              {((type === 'qwen' || type === 'claude-code-sdk') || (Boolean(selectedCcPreset) && CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(type))) && modelSuggestions.length > 0 ? (
                 <select
                   class="input"
                   value={requestedModel}

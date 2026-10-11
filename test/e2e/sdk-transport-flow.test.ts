@@ -174,6 +174,9 @@ vi.mock('../../src/daemon/cc-presets.js', () => ({
   getQwenPresetTransportConfig: presetRouteMocks.qwen,
   getDshPresetTransportConfig: presetRouteMocks.dsh,
   getPiPresetTransportConfig: presetRouteMocks.pi,
+  getPresetEffectiveModel: vi.fn((preset: { defaultModel?: string; env?: Record<string, string> }) => (
+    preset.env?.ANTHROPIC_MODEL ?? preset.defaultModel ?? preset.env?.OPENAI_MODEL
+  )),
   invalidateCache: vi.fn(),
 }));
 

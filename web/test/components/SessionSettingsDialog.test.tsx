@@ -1006,7 +1006,7 @@ describe('SessionSettingsDialog supervision', () => {
         makePeerAuditSession({ sessionName: 'deck_sub_cc_a1', label: 'CC A1', type: 'claude-code-sdk', providerId: 'anthropic', activeModel: 'MiniMax-M3', ccPresetId: 'preset-a' }),
         makePeerAuditSession({ sessionName: 'deck_sub_cc_a2', label: 'CC A2', type: 'claude-code-sdk', providerId: 'anthropic', activeModel: 'MiniMax-M3', ccPresetId: 'preset-a' }),
         makePeerAuditSession({ sessionName: 'deck_sub_cc_b', label: 'CC B', type: 'claude-code-sdk', providerId: 'anthropic', activeModel: 'MiniMax-M3', ccPresetId: 'preset-b' }),
-        makePeerAuditSession({ sessionName: 'deck_sub_bad_preset', type: 'codex-sdk', ccPresetId: 'preset-a' }),
+        makePeerAuditSession({ sessionName: 'deck_sub_bad_preset', type: 'openclaw', ccPresetId: 'preset-a' }),
         makePeerAuditSession({ sessionName: 'deck_sub_clone', executionCloneKind: 'supervision-execution', parentRunId: 'run-1' }),
         makePeerAuditSession({ sessionName: 'deck_sub_parent_run', parentRunId: 'run-2' }),
         makePeerAuditSession({ sessionName: 'deck_sub_stopped', state: 'stopped' }),

@@ -266,10 +266,10 @@ export async function buildSessionList(): Promise<SessionListItem[]> {
   // qwenRuntime available models for display so preset sessions (e.g. MiniMax)
   // show the correct model even when qwenRuntime hasn't loaded yet.
   const presetModelBySession = new Map<string, { defaultModel?: string; availableModels: string[] }>();
-  if (needsQwenHydration) {
+  if (needsQwenHydration || needsCodexHydration) {
     const { getPreset, getPresetAvailableModelIds, getPresetEffectiveModel } = await import('./cc-presets.js');
     for (const s of sessions) {
-      if (s.agentType === 'qwen' && s.ccPreset) {
+      if ((s.agentType === 'qwen' || s.agentType === 'codex' || s.agentType === 'codex-sdk') && s.ccPreset) {
         const preset = await getPreset(s.ccPreset);
         presetModelBySession.set(s.name, {
           defaultModel: preset ? getPresetEffectiveModel(preset) : undefined,
@@ -314,9 +314,11 @@ export async function buildSessionList(): Promise<SessionListItem[]> {
       return { ...baseItem(s), ...hydrated };
     }
     if (s.agentType === 'codex' || s.agentType === 'codex-sdk') {
+      const presetInfo = presetModelBySession.get(s.name);
       const hydrated: Partial<SessionRecord> = {
         ...mergeCodexDisplayMetadata(codexRuntime, s),
         permissionLabel: getPermissionLabel(s.agentType),
+        ...(presetInfo?.availableModels?.length ? { codexAvailableModels: presetInfo.availableModels } : {}),
       };
       if (
         hydrated.planLabel !== s.planLabel

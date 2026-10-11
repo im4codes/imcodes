@@ -465,8 +465,9 @@ describe('StartSubSessionDialog', () => {
     fireEvent.click(screen.getByLabelText(/custom_provider_sdk/i));
 
     await waitFor(() => expect(screen.getByRole('button', { name: /claude_code_sdk/i }).className).toContain('active'));
-    // Non-SDK types (e.g., codex-sdk) are filtered out and no longer rendered.
-    expect(screen.queryByRole('button', { name: /codex_sdk/i })).toBeNull();
+    // Non-supported types (e.g., gemini-sdk) are filtered out and no longer rendered.
+    expect(screen.queryByRole('button', { name: /gemini_sdk/i })).toBeNull();
+    expect(screen.getByRole('button', { name: /codex_sdk/i })).toBeDefined();
     // dsh (deepseek-harness) is now a visible, selectable button when custom provider SDK is on.
     const dshBtn = screen.getByRole('button', { name: /deepseek_harness/i }) as HTMLButtonElement;
     expect(dshBtn.disabled).toBe(false);
@@ -613,6 +614,50 @@ describe('StartSubSessionDialog', () => {
     expect(screen.getByDisplayValue('API_TIMEOUT_MS')).toBeDefined();
     expect(screen.getByDisplayValue('3000000')).toBeDefined();
     expect(screen.getByDisplayValue('CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC')).toBeDefined();
+  });
+
+  it('saves OpenAI compatible preset when selected in subsession preset editor', async () => {
+    const ws = makeWs();
+    render(
+      <StartSubSessionDialog
+        ws={ws as any}
+        defaultCwd="/tmp"
+        isProviderConnected={() => false}
+        getRemoteSessions={() => []}
+        refreshSessions={vi.fn()}
+        onStart={vi.fn()}
+        onClose={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(document.querySelector('[data-agent-type="qwen"]') as HTMLButtonElement);
+    await waitFor(() => expect(screen.getByText('compatible_api_via_qwen')).toBeDefined());
+    fireEvent.click(screen.getByRole('button', { name: /api_provider_add_edit/i }));
+
+    const openaiRadio = screen.getByLabelText(/OpenAI Compatible/i);
+    fireEvent.click(openaiRadio);
+
+    expect((screen.getByDisplayValue('https://api.minimax.chat/v1') as HTMLInputElement)).toBeDefined();
+    expect((screen.getByDisplayValue('MiniMax-Text-01') as HTMLInputElement)).toBeDefined();
+
+    fireEvent.input(screen.getByPlaceholderText('e.g. MiniMax'), { target: { value: 'OpenAI-Sub' } });
+    fireEvent.click(screen.getByRole('button', { name: /^Save$/i }));
+
+    expect(ws.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'cc.presets.save',
+      requestId: expect.any(String),
+      presets: [
+        expect.objectContaining({
+          name: 'OpenAI-Sub',
+          authType: 'openai',
+          defaultModel: 'MiniMax-Text-01',
+          env: expect.objectContaining({
+            OPENAI_BASE_URL: 'https://api.minimax.chat/v1',
+            OPENAI_MODEL: 'MiniMax-Text-01',
+          }),
+        }),
+      ],
+    }));
   });
 
   it('passes thinking level for qwen sub-sessions', () => {

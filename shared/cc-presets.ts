@@ -22,6 +22,8 @@ export const CUSTOM_PROVIDER_SDK_AGENT_TYPES: ReadonlySet<string> = new Set([
   'qwen',
   'deepseek-harness',
   'pi',
+  'codex-sdk',
+  'codex',
 ]);
 
 export interface CcPresetSaveResponse {
@@ -35,7 +37,7 @@ export type CcPresetTransportMode =
   | 'qwen-compatible-api'
   | 'claude-cli-preset';
 
-export type CcPresetAuthType = 'anthropic';
+export type CcPresetAuthType = 'anthropic' | 'openai';
 
 export interface CcPresetModelInfo {
   id: string;
@@ -92,11 +94,14 @@ function addUniqueModel(target: string[], value: string | undefined): void {
  * Prefer the launch env model so stale discovery data cannot override what the
  * preset actually pins for provider startup.
  */
-export function getCcPresetEffectiveModel(preset: Pick<CcPreset, 'defaultModel' | 'env'>): string | undefined {
-  const model = preset.env['ANTHROPIC_MODEL']?.trim()
-    || preset.defaultModel?.trim()
-    || preset.env['OPENAI_MODEL']?.trim()
-    || '';
+export function getCcPresetEffectiveModel(
+  preset: Pick<CcPreset, 'defaultModel' | 'env'> & Partial<Pick<CcPreset, 'authType'>>,
+): string | undefined {
+  const isOpenAi = preset.authType === 'openai'
+    || Boolean(preset.env['OPENAI_BASE_URL'] && !preset.env['ANTHROPIC_BASE_URL']);
+  const model = isOpenAi
+    ? (preset.env['OPENAI_MODEL']?.trim() || preset.defaultModel?.trim() || preset.env['ANTHROPIC_MODEL']?.trim() || '')
+    : (preset.env['ANTHROPIC_MODEL']?.trim() || preset.defaultModel?.trim() || preset.env['OPENAI_MODEL']?.trim() || '');
   return model || undefined;
 }
 

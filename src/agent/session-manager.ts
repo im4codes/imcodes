@@ -1682,7 +1682,7 @@ async function recoverTransportRuntimeAfterError(
       requestedModel: record.requestedModel,
       effort: record.effort,
       transportConfig: record.transportConfig,
-      ccPreset: (record.agentType === 'claude-code-sdk' || record.agentType === 'qwen' || record.agentType === 'deepseek-harness' || record.agentType === 'pi') ? record.ccPreset : undefined,
+      ccPreset: (record.agentType === 'claude-code-sdk' || record.agentType === 'qwen' || record.agentType === 'deepseek-harness' || record.agentType === 'pi' || record.agentType === 'codex-sdk') ? record.ccPreset : undefined,
       // Qwen-compatible API providers can reject a resumed conversation when
       // their persisted tool-call chain is invalid (e.g. "tool call result
       // does not follow tool call"). Auto-recovery must rotate the provider
@@ -3653,6 +3653,14 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
     if (!opts.fresh && transportResumeId) {
       effectiveSkipCreate = true;
     }
+    if (effectiveCcPreset) {
+      const { getCodexPresetTransportConfig } = await import('../daemon/cc-presets.js');
+      const presetConfig = await getCodexPresetTransportConfig(effectiveCcPreset, requestedTransportModel);
+      transportEnv = { ...(transportEnv ?? {}), ...presetConfig.env };
+      if (presetConfig.model) requestedTransportModel = presetConfig.model;
+      presetContextWindow = presetConfig.contextWindow ?? presetContextWindow;
+      if (presetConfig.systemPrompt) transportSystemPrompt = presetConfig.systemPrompt;
+    }
     sdkDisplay = mergeCodexDisplayMetadata(
       await getCodexRuntimeConfig({ probe: false }).catch(() => ({})),
       existing,
@@ -4080,7 +4088,7 @@ export async function launchSession(opts: LaunchOpts): Promise<void> {
   }
 
   // Cache context window for preset so watcher can use it in usage.update
-  if (opts.ccPreset && agentType === 'claude-code') {
+  if (opts.ccPreset && (agentType === 'claude-code' || agentType === 'codex')) {
     const { resolvePresetEnv } = await import('../daemon/cc-presets.js');
     await resolvePresetEnv(opts.ccPreset, ccSessionId);
   }
