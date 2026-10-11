@@ -1,5 +1,8 @@
 import type { Agent as AcpAgent, NewSessionResponse } from '@agentclientprotocol/sdk';
-import type { ProviderConfig } from '../transport-provider.js';
+import type {
+  ProviderConfig,
+  ProviderDelegationNotification,
+} from '../transport-provider.js';
 import { PROVIDER_ERROR_CODES } from '../transport-provider.js';
 import { normalizeTransportCwd } from '../transport-paths.js';
 import { KimiSdkProvider, type AcpCliProviderProfile } from './kimi-sdk.js';
@@ -7,6 +10,10 @@ import {
   SDK_SUBAGENT_PROVIDER_KINDS,
   SDK_SUBAGENT_PROVIDERS,
 } from '../../../shared/sdk-subagent-status.js';
+import {
+  AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES,
+  type AgentDelegationNotificationResult,
+} from '../../../shared/agent-delegation.js';
 
 const GROK_PROFILE: AcpCliProviderProfile = {
   id: 'grok-sdk',
@@ -41,6 +48,14 @@ const GROK_PROFILE: AcpCliProviderProfile = {
 export class GrokSdkProvider extends KimiSdkProvider {
   constructor() {
     super(GROK_PROFILE);
+    this.capabilities.activeDelegationNotification = AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE;
+  }
+
+  notifyActiveDelegation(
+    sessionId: string,
+    notification: ProviderDelegationNotification,
+  ): Promise<AgentDelegationNotificationResult> {
+    return this.queueActiveAcpPrompt(sessionId, notification);
   }
 
   protected override async validateConnectedAgent(
@@ -104,6 +119,7 @@ export class GrokSdkProvider extends KimiSdkProvider {
         cwd: normalizeTransportCwd(process.cwd()) ?? process.cwd(),
         mcpServers: [],
       });
+      this.cacheModelsFromSessionResponse(probe);
       const closer = (this.connection as AcpAgent).closeSession;
       if (typeof closer === 'function') {
         await closer.call(this.connection, { sessionId: probe.sessionId }).catch(() => {});

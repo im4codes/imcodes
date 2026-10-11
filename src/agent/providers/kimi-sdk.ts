@@ -227,6 +227,8 @@ interface KimiSdkSessionState {
   turnGeneration: number;
   /** Most recent generation that emitted a terminal completion/error. */
   settledGeneration: number;
+  /** Active and queued prompt generations currently in flight on the ACP session. */
+  activePromptGenerations?: Set<number>;
   /** Set while `loadSession` is actively streaming history replay updates.
    *  During this window we drop `agent_message_chunk` / `tool_call` events so
    *  prior-turn content doesn't leak into the current turn's delta stream. */
@@ -427,6 +429,7 @@ export class KimiSdkProvider implements TransportProvider {
       activePromptAdmissions: existing?.activePromptAdmissions ?? new Map(),
       turnGeneration: existing?.turnGeneration ?? 0,
       settledGeneration: existing?.settledGeneration ?? 0,
+      activePromptGenerations: existing?.activePromptGenerations ?? new Set(),
       replaying: false,
       cancelled: false,
       currentMessageId: null,
@@ -688,7 +691,7 @@ export class KimiSdkProvider implements TransportProvider {
     const existing = state.activePromptAdmissions.get(notification.notificationId);
     if (existing) return existing.promise;
     if (!state.promptInFlight
-      || state.promptSubmittedGeneration !== state.turnGeneration
+      || state.promptSubmittedGeneration === null
       || state.cancelled
       || !state.loaded
       || !state.acpSessionId
@@ -747,6 +750,8 @@ export class KimiSdkProvider implements TransportProvider {
       const activePromptText = this.profile.activePromptPrefix
         ? `${this.profile.activePromptPrefix}${notification.text}`
         : notification.text;
+      const queuedGeneration = ++state.turnGeneration;
+      (state.activePromptGenerations ??= new Set()).add(queuedGeneration);
       const queuedPrompt = connection.prompt({
         sessionId: state.acpSessionId,
         prompt: [{ type: 'text', text: activePromptText }],
@@ -757,25 +762,41 @@ export class KimiSdkProvider implements TransportProvider {
         // this id to correlate a replay across their own history.
         messageId: stableAcpMessageId(notification.notificationId),
       });
+      this.promptTerminals.set(state, queuedPrompt);
       void queuedPrompt.then((result) => {
         if (result.stopReason === 'cancelled') {
           logger.debug({ provider: this.id, sessionId }, 'ACP active-turn queued prompt later settled as cancelled');
         }
+        this.settleTurn(
+          sessionId,
+          state,
+          queuedGeneration,
+          result.stopReason,
+        );
       }).catch((error: unknown) => {
         logger.warn({
           provider: this.id,
           sessionId,
           ...this.errorLogFields(error),
         }, 'ACP active-turn queued prompt failed after submission');
+        this.failTurn(sessionId, state, queuedGeneration, error);
       });
       // ClientSideConnection.prompt() resolves at the end of the queued turn,
       // while sendRequest() writes through an internal serialized writeQueue.
       // Wait for that exact write to flush, not for the model turn, before
       // committing the durable IM.codes row. If the writable failed, ACP closes
       // the connection and the abort signal is authoritative.
-      return await this.waitForAcpWrite(connection, true)
-        ? AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED
-        : AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE;
+      const writeOk = await this.waitForAcpWrite(connection, true);
+      if (!writeOk) {
+        state.activePromptGenerations?.delete(queuedGeneration);
+        if ((state.activePromptGenerations?.size ?? 0) === 0) {
+          state.promptInFlight = false;
+          state.promptSubmittedGeneration = null;
+        }
+        return AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE;
+      }
+      state.promptSubmittedGeneration = queuedGeneration;
+      return AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED;
     } catch (error) {
       logger.debug({
         provider: this.id,
@@ -970,6 +991,10 @@ export class KimiSdkProvider implements TransportProvider {
         this.handleSessionUpdate(params);
       },
       extNotification: async (method: string, _params: Record<string, unknown>): Promise<void> => {
+        if (method === '_x.ai/models/update' && _params && typeof _params === 'object') {
+          this.cacheModelsFromSessionResponse({ models: _params as any } as NewSessionResponse);
+          return;
+        }
         // Grok publishes MCP catalog refreshes through an xAI extension. The
         // provider does not need the payload because managed MCP state is
         // already owned by the session configuration, but registering the
@@ -1001,6 +1026,7 @@ export class KimiSdkProvider implements TransportProvider {
   ): Promise<void> {
     state.promptInFlight = true;
     state.promptSubmittedGeneration = null;
+    (state.activePromptGenerations ??= new Set()).add(generation);
     try {
       await this.ensureSessionReady(sessionId, state);
       // Start the turn's delta buffer clean. (During loadSession the replay
@@ -1037,6 +1063,7 @@ export class KimiSdkProvider implements TransportProvider {
         this.failTurn(sessionId, state, generation, err);
       });
       if (!await this.waitForAcpWrite(connection, true)) {
+        state.activePromptGenerations?.delete(generation);
         throw this.makeError(
           PROVIDER_ERROR_CODES.CONNECTION_LOST,
           `${this.profile.displayName} ACP prompt write failed`,
@@ -1060,8 +1087,9 @@ export class KimiSdkProvider implements TransportProvider {
     generation: number,
     error: unknown,
   ): void {
-    if (state.settledGeneration === generation) return;
-    state.settledGeneration = generation;
+    if (state.settledGeneration >= generation) return;
+    state.settledGeneration = state.turnGeneration;
+    state.activePromptGenerations?.clear();
     state.promptInFlight = false;
     state.promptSubmittedGeneration = null;
     state.cancelled = false;
@@ -1208,7 +1236,7 @@ export class KimiSdkProvider implements TransportProvider {
     return true;
   }
 
-  private cacheModelsFromSessionResponse(result: NewSessionResponse | import('@agentclientprotocol/sdk').LoadSessionResponse | undefined): void {
+  protected cacheModelsFromSessionResponse(result: NewSessionResponse | import('@agentclientprotocol/sdk').LoadSessionResponse | undefined): void {
     if (this.cachedModels && this.profile.modelDiscovery !== 'session-metadata-only') return;
     if (!result) return;
     const models = (result as NewSessionResponse).models;
@@ -1323,10 +1351,16 @@ export class KimiSdkProvider implements TransportProvider {
     sessionSystemTextToCommit?: string,
     compactControl = false,
   ): void {
-    if (state.settledGeneration === generation) return;
+    if (state.settledGeneration >= generation) return;
     state.settledGeneration = generation;
-    state.promptInFlight = false;
-    state.promptSubmittedGeneration = null;
+    state.activePromptGenerations?.delete(generation);
+    const hasRemainingPrompts = (state.activePromptGenerations?.size ?? 0) > 0;
+    if (!hasRemainingPrompts) {
+      state.promptInFlight = false;
+      state.promptSubmittedGeneration = null;
+    } else {
+      state.promptSubmittedGeneration = state.turnGeneration;
+    }
     this.clearStatus(sessionId, state);
     const text = state.currentText;
     const messageId = state.currentMessageId ?? `${sessionId}:${randomUUID()}`;
@@ -1338,6 +1372,10 @@ export class KimiSdkProvider implements TransportProvider {
 
     if (stopReason === 'cancelled' || state.cancelled) {
       state.cancelled = false;
+      state.activePromptGenerations?.clear();
+      state.promptInFlight = false;
+      state.promptSubmittedGeneration = null;
+      state.settledGeneration = state.turnGeneration;
       this.emitError(
         sessionId,
         this.makeError(PROVIDER_ERROR_CODES.CANCELLED, `${this.profile.displayName} turn cancelled`, true),
@@ -1833,6 +1871,7 @@ export class KimiSdkProvider implements TransportProvider {
     if (!state) return false;
     const hadActiveWork = state.promptInFlight || state.replaying || state.toolCalls.size > 0;
     if (hadActiveWork) state.settledGeneration = state.turnGeneration;
+    state.activePromptGenerations?.clear();
     state.promptInFlight = false;
     state.promptSubmittedGeneration = null;
     state.activePromptAdmissions.clear();

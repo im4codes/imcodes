@@ -1,4 +1,8 @@
 import { describe, expect, it, vi } from 'vitest';
+import {
+  AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES,
+  AGENT_DELEGATION_NOTIFICATION_RESULTS,
+} from '../../shared/agent-delegation.js';
 import { GrokSdkProvider } from '../../src/agent/providers/grok-sdk.js';
 import { BACKGROUND_SUBAGENT_WAKE_MODES, PROVIDER_ERROR_CODES, type ToolCallEvent } from '../../src/agent/transport-provider.js';
 import {
@@ -478,5 +482,101 @@ describe('GrokSdkProvider contract', () => {
     (provider as any).settleTurn('grok-route', state, 1, 'end_turn');
     (provider as any).settleTurn('grok-route', state, 1, 'end_turn');
     expect(completions).toEqual(['message-1']);
+  });
+
+  it('declares native active delegation capability for direct in-flight append', () => {
+    const provider = new GrokSdkProvider();
+    expect(provider.capabilities.activeDelegationNotification).toBe(
+      AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE,
+    );
+  });
+
+  it('supports native in-flight append via notifyActiveDelegation and sequential multi-turn settlement', async () => {
+    const provider = new GrokSdkProvider();
+    const { acpSessionId, state } = attachRoute(provider);
+    const tracker = {
+      writeQueue: Promise.resolve(),
+      abortController: new AbortController(),
+    };
+    let resolveTurn2: (res: { stopReason: 'end_turn' }) => void;
+    const queuedTurnPromise = new Promise<{ stopReason: 'end_turn' }>((resolve) => {
+      resolveTurn2 = resolve;
+    });
+    const prompt = vi.fn().mockReturnValue(queuedTurnPromise);
+    (provider as any).connection = { prompt, connection: tracker };
+
+    const deltas: string[] = [];
+    const completions: { id: string; content: string }[] = [];
+    provider.onDelta((_sessionId, delta) => deltas.push(delta.delta));
+    provider.onComplete((_sessionId, msg) => completions.push({ id: msg.id, content: msg.content }));
+
+    const notification = {
+      notificationId: 'grok-append-1',
+      delegationId: 'queue-append:grok-append-1',
+      sourceSessionName: 'grok-source',
+      text: 'Say BANANA now.',
+      deliveryKind: 'mcp_message' as const,
+    };
+
+    const admissionResult = await provider.notifyActiveDelegation('grok-route', notification);
+    expect(admissionResult).toBe(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+    expect(prompt).toHaveBeenCalledWith(expect.objectContaining({
+      sessionId: acpSessionId,
+      prompt: [{ type: 'text', text: 'Say BANANA now.' }],
+    }));
+
+    // Turn 1 stream arrives
+    (provider as any).handleSessionUpdate({
+      sessionId: acpSessionId,
+      update: { sessionUpdate: 'agent_message_chunk', messageId: 'turn-1-msg', content: { type: 'text', text: 'Counting 1 to 5' } },
+    });
+    expect(deltas).toEqual(['Counting 1 to 5']);
+
+    // Settle Turn 1
+    (provider as any).settleTurn('grok-route', state, 1, 'end_turn');
+    expect(completions).toEqual([{ id: 'turn-1-msg', content: 'Counting 1 to 5' }]);
+    expect(state.promptInFlight).toBe(true);
+
+    // Turn 2 stream arrives (not dropped because promptInFlight is preserved)
+    (provider as any).handleSessionUpdate({
+      sessionId: acpSessionId,
+      update: { sessionUpdate: 'agent_message_chunk', messageId: 'turn-2-msg', content: { type: 'text', text: 'BANANA' } },
+    });
+    expect(deltas).toEqual(['Counting 1 to 5', 'BANANA']);
+
+    // Settle Turn 2
+    resolveTurn2!({ stopReason: 'end_turn' });
+    await queuedTurnPromise;
+    await new Promise((r) => setTimeout(r, 10));
+
+    expect(completions).toEqual([
+      { id: 'turn-1-msg', content: 'Counting 1 to 5' },
+      { id: 'turn-2-msg', content: 'BANANA' },
+    ]);
+    expect(state.promptInFlight).toBe(false);
+  });
+
+  it('captures dynamic model catalog update from _x.ai/models/update notification', async () => {
+    const provider = new GrokSdkProvider();
+    attachRoute(provider);
+    const client = (provider as any).createClientImpl();
+
+    await client.extNotification('_x.ai/models/update', {
+      availableModels: [
+        { modelId: 'grok-4.7', name: 'Grok 4.7' },
+        { modelId: 'grok-4.7-mini', name: 'Grok 4.7 Mini' },
+      ],
+      currentModelId: 'grok-4.7',
+    });
+
+    const models = await provider.listModels();
+    expect(models).toEqual({
+      models: [
+        { id: 'grok-4.7', name: 'Grok 4.7' },
+        { id: 'grok-4.7-mini', name: 'Grok 4.7 Mini' },
+      ],
+      defaultModel: 'grok-4.7',
+      isAuthenticated: true,
+    });
   });
 });
