@@ -145,9 +145,11 @@ export function deriveSupervisionTaskTitleFromBrief(value: unknown, explicitTitl
   // 3. Goal / Objective / 目标 / 任务 section or line
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i]!;
-    const m = /^(?:#+\s*)?(?:goal|objective|task|目标|任务)\s*[:：]?\s*(.*)$/iu.exec(line);
-    if (m) {
-      if (m[1]?.trim()) {
+    const isHeading = /^#+\s*(?:(?:goal|objective|task)\b|目标|任务)/iu.test(line);
+    const hasColon = /^(?:#+\s*)?(?:goal|objective|task|目标|任务)\s*[:：]/iu.test(line);
+    if (isHeading || hasColon) {
+      const m = /^(?:#+\s*)?(?:goal|objective|task|目标|任务)\s*[:：]?\s*(.*)$/iu.exec(line);
+      if (m && m[1]?.trim()) {
         const candidate = m[1].trim().replace(/^['"“]|['"”]$/gu, '');
         const title = readSupervisionTaskTitle(candidate);
         if (title && !TASK_PAIR_GENERIC_TITLE_PLACEHOLDERS.includes(title as never)) return title;

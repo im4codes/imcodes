@@ -69,6 +69,7 @@ async function freshStore(): Promise<void> {
   resetIdentityBackupCleanupForTests();
   configureSessionStoreWriteAuthority(currentDaemonProcessIdentity());
   await loadStore({ probe: false });
+  await waitForCompatExportForTests();
 }
 function bytesOfStateFiles(): string {
   const parts: string[] = [];
@@ -122,6 +123,7 @@ beforeEach(async () => {
 });
 afterEach(async () => {
   setSessionDbFailAfterRowWritesForTests(null);
+  await waitForCompatExportForTests().catch(() => undefined);
   await waitForSessionStoreSnapshotForTests().catch(() => undefined);
   resetSessionStoreAuthorityForTests();
   vi.unstubAllEnvs();
