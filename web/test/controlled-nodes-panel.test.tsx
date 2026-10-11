@@ -17,7 +17,10 @@ import { stubDisplayMode } from './support/display-mode.js';
 import { RemoteDesktopWindowBlockedNotice } from '../src/components/RemoteDesktopWindowBlockedNotice.js';
 import { resetRemoteDesktopWindowNoticeForTests } from '../src/remote-desktop-window-notice.js';
 import { CONTROLLED_NODE_AUTO_UNLOCK_CAPABILITY } from '@shared/controlled-node-auto-unlock.js';
-import { REMOTE_DESKTOP_INSTALLABLE_CAPABILITY } from '@shared/remote-desktop-install.js';
+import {
+  REMOTE_DESKTOP_INSTALLABLE_CAPABILITY,
+  REMOTE_DESKTOP_LINUX_SUDO_REQUIRED_CAPABILITY,
+} from '@shared/remote-desktop-install.js';
 import { REMOTE_DESKTOP_LOCAL_DISCLOSURE_CAPABILITY } from '@shared/remote-desktop-access.js';
 import {
   REMOTE_DESKTOP_LOCAL_MANAGEMENT,
@@ -1138,6 +1141,34 @@ describe('ControlledNodesPanel (12.3)', () => {
     fireEvent.click(button);
     await waitFor(() => expect(installMachineRemoteDesktopWorker).toHaveBeenCalledWith('missing'));
     expect(refetch).toHaveBeenCalled();
+  });
+
+  it('opens manual install dialog for Linux machine when sudo is required, without calling API', async () => {
+    machines = [machine({
+      serverId: 'linux-sudo-needed',
+      displayName: 'Linux No Sudo',
+      os: 'linux',
+      accessRole: 'owner',
+      online: true,
+      capabilities: [
+        REMOTE_DESKTOP_INSTALLABLE_CAPABILITY,
+        REMOTE_DESKTOP_LINUX_SUDO_REQUIRED_CAPABILITY,
+      ],
+    })];
+    const { container } = render(<ControlledNodesPanel />);
+    const button = await waitFor(() => {
+      const candidate = container.querySelector('.controlled-nodes-install-worker');
+      if (!(candidate instanceof HTMLButtonElement)) throw new Error('install button not found');
+      return candidate;
+    });
+
+    expect(button.textContent).toBe('remote_desktop.linux_manual_command');
+    fireEvent.click(button);
+
+    expect(installMachineRemoteDesktopWorker).not.toHaveBeenCalled();
+    expect(container.querySelector('[data-testid="linux-desktop-manual-install-dialog"]')).not.toBeNull();
+    expect(container.textContent).toContain('remote_desktop.linux_manual_install_title');
+    expect(container.textContent).toContain('remote_desktop.linux_manual_install_sudo_notice');
   });
 
   it('keeps the quick-install action visible after a bounded install failure', async () => {

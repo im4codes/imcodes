@@ -1,5 +1,5 @@
 import { randomBytes } from 'node:crypto';
-import { type ChildProcessByStdio, spawn } from 'node:child_process';
+import { type ChildProcessByStdio, spawn, execFileSync, type ExecFileSyncOptions } from 'node:child_process';
 import type { Readable, Writable } from 'node:stream';
 import { existsSync } from 'node:fs';
 import { dirname, join } from 'node:path';
@@ -63,6 +63,41 @@ const WORKER_SIDECAR_RELATIVE_PATH = [
 
 export function resolveLinuxRemoteDesktopWorkerPath(execPath: string = process.execPath): string {
   return join(dirname(execPath), ...WORKER_SIDECAR_RELATIVE_PATH);
+}
+
+/**
+ * Checks whether the worker binary can resolve all its dynamic shared library dependencies.
+ * If dynamic libraries (e.g. libXtst.so.6, libXrandr.so.2) are missing, ld-linux cannot link
+ * the worker executable and spawning it would immediately crash with exit status 127.
+ */
+export function checkLinuxWorkerLibraries(
+  workerPath: string,
+  execSync: (cmd: string, args: readonly string[], opts: ExecFileSyncOptions) => Buffer | string = execFileSync,
+): boolean {
+  if (!existsSync(workerPath)) return false;
+  try {
+    const output = execSync(workerPath, [], {
+      env: { ...process.env, LD_TRACE_LOADED_OBJECTS: '1' },
+      timeout: 3000,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    }).toString('utf8');
+    return !output.includes('not found');
+  } catch {
+    try {
+      const output = execSync('ldd', [workerPath], {
+        timeout: 3000,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      }).toString('utf8');
+      return !output.includes('not found');
+    } catch {
+      return false;
+    }
+  }
+}
+
+export interface LinuxRemoteDesktopWorkerHostOptions {
+  workerPath?: string;
+  checkLibraries?: (workerPath: string) => boolean;
 }
 
 /**
@@ -130,15 +165,18 @@ export function resolveWorkerDisplayEnv(
  */
 export class LinuxRemoteDesktopWorkerHost implements ControlledNodeRemoteDesktopWorker {
   private readonly workerPath: string;
+  private readonly checkLibraries: (workerPath: string) => boolean;
   private readonly core: RemoteDesktopWorkerHostCore<Record<string, never>>;
+  private librariesAvailableCache: boolean | null = null;
   private child: ChildProcessByStdio<Writable, Readable, null> | null = null;
   private connectionGeneration = 0;
 
   constructor(
     private readonly onMessage: (message: RemoteDesktopDaemonMessage) => void,
-    options: { workerPath?: string } = {},
+    options: LinuxRemoteDesktopWorkerHostOptions = {},
   ) {
     this.workerPath = options.workerPath ?? resolveLinuxRemoteDesktopWorkerPath();
+    this.checkLibraries = options.checkLibraries ?? checkLinuxWorkerLibraries;
     this.core = new RemoteDesktopWorkerHostCore({
       nonce: randomBytes(16).toString('hex'),
       onWatchdogTimeout: (event) => {
@@ -151,56 +189,30 @@ export class LinuxRemoteDesktopWorkerHost implements ControlledNodeRemoteDesktop
     return existsSync(this.workerPath);
   }
 
+  librariesAvailable(): boolean {
+    if (!this.available()) return false;
+    if (this.librariesAvailableCache !== null) {
+      return this.librariesAvailableCache;
+    }
+    this.librariesAvailableCache = this.checkLibraries(this.workerPath);
+    return this.librariesAvailableCache;
+  }
+
   /** Restart the sidecar after the refresh coordinator atomically swaps it. */
   reloadFromDisk(): boolean {
     this.close();
+    this.librariesAvailableCache = null;
     return this.available();
   }
 
   /**
-   * The v3 profile, once the worker binary is present -- NOT the bare
-   * legacy REMOTE_DESKTOP_CAPABILITY token. resolveRemoteDesktopSessionProfile
-   * (shared/remote-desktop-platform.ts) treats a bare legacy token as the
-   * LEGACY v2 profile and hard-codes it to `platform: 'windows', capture:
-   * 'windows_dxgi'` -- there is no "legacy Linux" shape, only "legacy
-   * Windows". Advertising the bare token here would make a Linux node's
-   * session look like a Windows one to every downstream consumer of
-   * `profile.platform`/`profile.capture`.
-   *
-   * REMOTE_DESKTOP_LOCAL_DISCLOSURE_CAPABILITY is NOT included here even
-   * though it is real (see adapterCapabilities() below) -- runtime.ts's
-   * refreshRemoteDesktopCapabilityState() filters this method's return
-   * value against REMOTE_DESKTOP_SESSION_PROFILE_CAPABILITIES only, which
-   * does not contain the adapter-capability tokens (LOCAL_DISCLOSURE,
-   * LOCAL_CONSENT, CAPTURE_PRIVACY, INPUT, LOCK_SCREEN, CANONICAL_BRANDING).
-   * Putting it here silently dropped it before it ever reached
-   * resolveRemoteDesktopSessionProfile, which requires it for the v3
-   * profile to resolve at all -- observed in production as a worker that
-   * was present, running, and fully wired, still advertising zero remote-
-   * desktop capabilities, because the one token profile resolution needs
-   * was filtered out one layer up. Windows' RemoteDesktopWorkerHost gets
-   * this right by advertising LOCAL_DISCLOSURE (among others) from its own
-   * adapterCapabilities(), never from sessionCapabilities() -- mirrored
-   * below instead of inventing a different split for Linux.
-   *
-   * REMOTE_DESKTOP_CAPTURE_CAPABILITY.LINUX_X11, not the portal/PipeWire
-   * token: PortalCaptureAdapter (linux_platform_adapters.cc) exists but its
-   * own readiness probe always reports unavailable ("portal stream
-   * negotiation not implemented in this slice") -- X11 direct capture is
-   * the only backend that has ever actually passed a real session end to
-   * end (the qualification tests this file's own header describes). VNC is
-   * a last-resort fallback for machines with no X11 access at all
-   * (linux_capture_selection.h) and is not advertised as the platform
-   * capability either, for the same reason: it is not the primary path.
-   *
-   * REMOTE_DESKTOP_INPUT_CAPABILITY is real now too (see adapterCapabilities()
-   * below for why it lives there, not here) -- the data-channel wire
-   * protocol for pointer/keyboard messages is wired to the input adapters.
-   * Clipboard/display-selection/scale/auto-unlock remain unadvertised; see
-   * linux_remote_desktop_session.h's own header comment for that boundary.
+   * The v3 profile, once the worker binary is present and all dynamic libraries
+   * are resolved -- NOT the bare legacy REMOTE_DESKTOP_CAPABILITY token.
+   * If shared libraries are missing, returns empty array so broken worker is
+   * never advertised as active.
    */
   sessionCapabilities(): readonly string[] {
-    if (!this.available()) return [];
+    if (!this.available() || !this.librariesAvailable()) return [];
     return [
       REMOTE_DESKTOP_SESSION_CAPABILITY,
       REMOTE_DESKTOP_PLATFORM_CAPABILITY.LINUX,
@@ -230,7 +242,7 @@ export class LinuxRemoteDesktopWorkerHost implements ControlledNodeRemoteDesktop
    * against. The explicit clipboard is advertised with the session tokens.
    */
   adapterCapabilities(): readonly RemoteDesktopAdapterCapability[] {
-    if (!this.available()) return [];
+    if (!this.available() || !this.librariesAvailable()) return [];
     return [REMOTE_DESKTOP_LOCAL_DISCLOSURE_CAPABILITY, REMOTE_DESKTOP_INPUT_CAPABILITY];
   }
 
@@ -248,19 +260,27 @@ export class LinuxRemoteDesktopWorkerHost implements ControlledNodeRemoteDesktop
 
   /** Keep the X11 local affordance alive even before the first PREPARE. */
   async start(): Promise<void> {
+    if (!this.librariesAvailable()) {
+      logger.info('linux remote desktop worker shared libraries missing, skipping start');
+      return;
+    }
     this.ensureSpawned();
   }
 
   setAccessPaused(paused: boolean): void {
-    if (!this.child) return;
-    this.child.stdin.write(`${JSON.stringify({
-      type: REMOTE_DESKTOP_LOCAL_WORKER_MSG.ACCESS_STATE,
-      paused,
-    })}\n`);
+    if (!this.child || !this.child.stdin.writable) return;
+    try {
+      this.child.stdin.write(`${JSON.stringify({
+        type: REMOTE_DESKTOP_LOCAL_WORKER_MSG.ACCESS_STATE,
+        paused,
+      })}\n`);
+    } catch (err) {
+      logger.warn({ err }, 'linux remote desktop worker write access state failed');
+    }
   }
 
   async handle(message: unknown): Promise<boolean> {
-    if (!this.available()) return false;
+    if (!this.available() || !this.librariesAvailable()) return false;
     const parsed = validateRemoteDesktopDaemonCommand(message);
     if (!parsed.ok) return false;
     const command = parsed.value;
@@ -268,9 +288,14 @@ export class LinuxRemoteDesktopWorkerHost implements ControlledNodeRemoteDesktop
       this.core.track(command, {});
     }
     if (!this.ensureSpawned()) return false;
-    // child is non-null: ensureSpawned() only returns true after assigning it.
-    this.child!.stdin.write(this.core.frameOutbound(command));
-    return true;
+    if (!this.child || !this.child.stdin.writable) return false;
+    try {
+      this.child.stdin.write(this.core.frameOutbound(command));
+      return true;
+    } catch (err) {
+      logger.warn({ err }, 'linux remote desktop worker write command failed');
+      return false;
+    }
   }
 
   onDaemonDisconnected(): void {
@@ -292,6 +317,7 @@ export class LinuxRemoteDesktopWorkerHost implements ControlledNodeRemoteDesktop
    * just started successfully. */
   private ensureSpawned(): boolean {
     if (this.child) return true;
+    if (!this.librariesAvailable()) return false;
     let child: ChildProcessByStdio<Writable, Readable, null>;
     try {
       child = spawn(this.workerPath, [], {
@@ -302,6 +328,9 @@ export class LinuxRemoteDesktopWorkerHost implements ControlledNodeRemoteDesktop
       logger.warn({ err }, 'linux remote desktop worker spawn failed');
       return false;
     }
+    child.stdin.on('error', (err) => {
+      logger.warn({ err }, 'linux remote desktop worker stdin error');
+    });
     this.connectionGeneration = this.core.beginConnection();
     child.stdout.on('data', (chunk: Buffer) => {
       const result = this.core.pushInbound(chunk.toString('utf8'), this.connectionGeneration);

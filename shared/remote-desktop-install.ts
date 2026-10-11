@@ -29,6 +29,18 @@ export const REMOTE_DESKTOP_INSTALLABLE_CAPABILITY = 'remote.desktop.windows.ins
 export const REMOTE_DESKTOP_MACOS_INSTALLABLE_CAPABILITY = 'remote.desktop.macos.installable.v1' as const;
 
 /**
+ * Linux: advertised when remote desktop is installable but passwordless sudo
+ * (or root execution) is unavailable, signalling that manual operator elevation
+ * is required to install system packages.
+ */
+export const REMOTE_DESKTOP_LINUX_SUDO_REQUIRED_CAPABILITY = 'remote.desktop.linux.sudo_required.v1' as const;
+
+export const LINUX_DESKTOP_MANUAL_INSTALL_COMMANDS = {
+  ubuntu: 'sudo apt-get update && sudo apt-get install -y xvfb x11-xserver-utils dbus-x11 xfce4 xfce4-whiskermenu-plugin fonts-noto-core fonts-noto-color-emoji pulseaudio',
+  centos: 'sudo dnf install -y epel-release && sudo dnf install -y xorg-x11-server-Xvfb xorg-x11-xauth dbus-x11 xfce4-session xfwm4 xfce4-panel xfdesktop xfce4-terminal pulseaudio',
+} as const;
+
+/**
  * Browser → node: ask the machine to put its permission dialog on screen.
  *
  * Separate from the install request because it asks for something different:

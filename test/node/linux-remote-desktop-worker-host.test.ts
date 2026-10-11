@@ -12,6 +12,7 @@ import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import {
   LinuxRemoteDesktopWorkerHost,
+  checkLinuxWorkerLibraries,
   resolveLinuxRemoteDesktopWorkerPath,
   resolveWorkerDisplayEnv,
 } from '../../src/node/linux-remote-desktop-worker-host.js';
@@ -63,6 +64,41 @@ describe('LinuxRemoteDesktopWorkerHost', () => {
   it('is available once the sidecar binary exists on disk', () => {
     const { host } = makeHost({ workerExists: true });
     expect(host.available()).toBe(true);
+  });
+
+  it('advertises nothing and reports libraries missing when checkLibraries returns false', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'imcodes-linux-worker-host-test-'));
+    cleanupDirs.push(dir);
+    const workerPath = join(dir, 'imcodes-linux-remote-desktop-worker');
+    writeFileSync(workerPath, '#!/bin/sh\nexit 0\n');
+    chmodSync(workerPath, 0o755);
+
+    const host = new LinuxRemoteDesktopWorkerHost(() => {}, {
+      workerPath,
+      checkLibraries: () => false,
+    });
+    expect(host.available()).toBe(true);
+    expect(host.librariesAvailable()).toBe(false);
+    expect(host.sessionCapabilities()).toEqual([]);
+    expect(host.adapterCapabilities()).toEqual([]);
+  });
+
+  it('checkLinuxWorkerLibraries detects missing shared libraries via output', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'imcodes-linux-worker-host-test-'));
+    cleanupDirs.push(dir);
+    const workerPath = join(dir, 'worker');
+    writeFileSync(workerPath, 'dummy');
+
+    const okMockExec = () => 'libc.so.6 => /lib/x86_64-linux-gnu/libc.so.6\nlibX11.so.6 => /lib/libX11.so.6';
+    expect(checkLinuxWorkerLibraries(workerPath, okMockExec as never)).toBe(true);
+
+    const missingMockExec = () => 'libc.so.6 => /lib/libc.so.6\nlibXtst.so.6 => not found';
+    expect(checkLinuxWorkerLibraries(workerPath, missingMockExec as never)).toBe(false);
+
+    const throwingMockExec = () => { throw new Error('ldd not found'); };
+    expect(checkLinuxWorkerLibraries(workerPath, throwingMockExec as never)).toBe(false);
+
+    expect(checkLinuxWorkerLibraries('/nonexistent/worker/path')).toBe(false);
   });
 
   /**

@@ -98,7 +98,10 @@ import {
   MacosRemoteDesktopWorkerHost,
   type MacosRemoteDesktopWorkerHostOptions,
 } from './macos-remote-desktop-worker-host.js';
-import { LinuxRemoteDesktopWorkerHost } from './linux-remote-desktop-worker-host.js';
+import {
+  LinuxRemoteDesktopWorkerHost,
+  type LinuxRemoteDesktopWorkerHostOptions,
+} from './linux-remote-desktop-worker-host.js';
 import {
   REMOTE_DESKTOP_SESSION_PROFILE_CAPABILITIES,
   resolveRemoteDesktopSessionProfile,
@@ -114,6 +117,7 @@ import {
 } from '../../shared/remote-desktop-platform.js';
 import {
   REMOTE_DESKTOP_INSTALLABLE_CAPABILITY,
+  REMOTE_DESKTOP_LINUX_SUDO_REQUIRED_CAPABILITY,
   REMOTE_DESKTOP_MACOS_INSTALLABLE_CAPABILITY,
   REMOTE_DESKTOP_PERMISSION_MSG,
   REMOTE_DESKTOP_INSTALL_MSG,
@@ -162,6 +166,8 @@ import {
 import type { WorkerPrivacyInboundFrame } from './remote-desktop-privacy-ipc.js';
 import { refreshX11DisplayProbe, x11DisplayProbeIsStale } from './linux-x11-display.js';
 import {
+  checkLinuxPasswordlessSudo,
+  isLinuxRootUser,
   linuxDesktopProvisionSupported,
   linuxGraphicalDisplayAvailable,
   provisionLinuxDesktopEnvironment,
@@ -207,6 +213,7 @@ export function isControlledNodeAuthAck(message: Record<string, unknown>): boole
 
 export interface ControlledNodeRemoteDesktopWorker {
   available(): boolean;
+  librariesAvailable?(): boolean;
   /** Reload a newly published sidecar after an atomic on-disk swap. */
   reloadFromDisk?(): boolean;
   sessionCapabilities?(): readonly string[];
@@ -259,6 +266,7 @@ export function createPlatformRemoteDesktopWorkerHost(input: {
   onMessage(message: RemoteDesktopDaemonMessage): void;
   windows?: RemoteDesktopWorkerHostOptions;
   macos?: MacosRemoteDesktopWorkerHostOptions;
+  linux?: LinuxRemoteDesktopWorkerHostOptions;
   headless?: boolean;
 }): PlatformRemoteDesktopWorkerSelection {
   if (input.headless) return { worker: new UnavailableRemoteDesktopWorkerHost() };
@@ -278,9 +286,15 @@ export function createPlatformRemoteDesktopWorkerHost(input: {
     return { worker, startup: () => worker.start() };
   }
   if (input.platform === 'linux' && input.arch === 'x64') {
-    const worker = new LinuxRemoteDesktopWorkerHost(input.onMessage);
+    const worker = new LinuxRemoteDesktopWorkerHost(input.onMessage, input.linux);
     return worker.available()
-      ? { worker, startup: () => worker.start() }
+      ? {
+        worker,
+        startup: async () => {
+          if (!worker.librariesAvailable()) return;
+          await worker.start();
+        },
+      }
       : { worker };
   }
   return { worker: new UnavailableRemoteDesktopWorkerHost() };
@@ -418,7 +432,9 @@ export interface ControlledNodeRuntimeOptions {
     displayAvailable(): boolean;
     provisionSupported(): boolean;
     provision(): Promise<LinuxDesktopProvisionResult>;
+    checkElevation?(): Promise<boolean>;
   };
+  linuxRemoteDesktopWorker?: LinuxRemoteDesktopWorkerHostOptions;
   /** Test seam for the normal Server-requested upgrade path. */
   startSelfUpgrade?: typeof startControlledNodeSelfUpgrade;
   /** Test seam for crash-left self-upgrade staging recovery at process start. */
@@ -503,6 +519,7 @@ export function createControlledNodeRuntime(
           onMacosRemoteDesktopProfileChanged();
         },
       } : undefined,
+      linux: options.linuxRemoteDesktopWorker,
       windows: {
         platform,
         onWorkerCrash: (crash) => {
@@ -566,9 +583,26 @@ export function createControlledNodeRuntime(
     displayAvailable: () => linuxGraphicalDisplayAvailable(),
     provisionSupported: () => linuxDesktopProvisionSupported(),
     provision: () => provisionLinuxDesktopEnvironment(),
+    checkElevation: async () => isLinuxRootUser() || await checkLinuxPasswordlessSudo(),
   };
   let linuxDesktopMissing = false;
   let linuxDesktopProvisionInFlight = false;
+  let linuxSudoRequired = false;
+  const refreshLinuxElevationState = async (): Promise<void> => {
+    if (platform !== 'linux') return;
+    try {
+      const canElevate = await (linuxDesktop.checkElevation?.()
+        ?? (isLinuxRootUser() || await checkLinuxPasswordlessSudo()));
+      const nextRequired = !canElevate;
+      if (linuxSudoRequired !== nextRequired) {
+        linuxSudoRequired = nextRequired;
+        refreshRemoteDesktopCapabilityState();
+        republishCapabilitiesIfChanged();
+      }
+    } catch {
+      linuxSudoRequired = true;
+    }
+  };
   /**
    * A display socket is not a usable display (a Wayland desktop's or login
    * greeter's Xwayland rejects the worker), so on Linux the node probes each
@@ -712,8 +746,8 @@ export function createControlledNodeRuntime(
       && remoteDesktopFeatureEnabled
       && profile !== null;
     linuxDesktopMissing = platform === 'linux'
-      && remoteDesktopEnabled
-      && !linuxDesktop.displayAvailable();
+      && remoteDesktopFeatureEnabled
+      && (!linuxDesktop.displayAvailable() || !(remoteDesktopWorker.librariesAvailable?.() ?? true));
     if (linuxDesktopMissing) remoteDesktopEnabled = false;
     const captureCapabilities = Object.values(REMOTE_DESKTOP_CAPTURE_CAPABILITY) as readonly string[];
     permissionRequiredCapabilities = remoteDesktopWorkerAvailable
@@ -1243,6 +1277,15 @@ export function createControlledNodeRuntime(
       const result = await linuxDesktop.provision();
       if (result.ok) {
         logger.info({ user: result.user }, 'basic desktop environment installed');
+        remoteDesktopWorker.reloadFromDisk?.();
+        if (linuxDesktop.displayAvailable() && (remoteDesktopWorker.librariesAvailable?.() ?? true)) {
+          try {
+            await remoteDesktopWorkerStartup?.();
+            await remoteDesktopWorker.setAccessPaused?.(remoteDesktopAccessPaused);
+          } catch (error) {
+            logger.warn({ err: error }, 'failed to start worker after desktop provision');
+          }
+        }
       } else {
         logger.warn({ reason: result.reason, detail: result.detail }, 'basic desktop environment install failed');
       }
@@ -1250,6 +1293,7 @@ export function createControlledNodeRuntime(
       logger.warn({ err: error }, 'basic desktop environment install failed');
     } finally {
       linuxDesktopProvisionInFlight = false;
+      void refreshLinuxElevationState();
       // A display that came up turns this into an ordinary enabled remote
       // desktop; one that did not keeps offering the (idempotent) install.
       refreshRemoteDesktopCapabilityState();
@@ -1491,7 +1535,12 @@ export function createControlledNodeRuntime(
         ? [REMOTE_DESKTOP_LOCAL_MANAGEMENT.PAUSED_CAPABILITY]
         : []),
       ...(remoteDesktopWorkerNeedsRepair() || linuxDesktopInstallable()
-        ? [REMOTE_DESKTOP_INSTALLABLE_CAPABILITY]
+        ? [
+          REMOTE_DESKTOP_INSTALLABLE_CAPABILITY,
+          ...(linuxDesktopInstallable() && linuxSudoRequired
+            ? [REMOTE_DESKTOP_LINUX_SUDO_REQUIRED_CAPABILITY]
+            : []),
+        ]
         : []),
       ...(macosRemoteDesktopComponentsInstallable()
         ? [REMOTE_DESKTOP_MACOS_INSTALLABLE_CAPABILITY]
@@ -2167,11 +2216,15 @@ export function createControlledNodeRuntime(
       // its first session ended -- so every upgrade brought a fixed worker bug
       // back for one session (node m3). Installing starts the new set itself.
       if (platform !== 'darwin' || await isInstalledForThisRelease().catch(() => false)) {
-        try {
-          await remoteDesktopWorkerStartup();
-          await remoteDesktopWorker.setAccessPaused?.(remoteDesktopAccessPaused);
-        } catch (error) {
-          reportAuthenticationError(error);
+        if (platform === 'linux' && (!linuxDesktop.displayAvailable() || !(remoteDesktopWorker.librariesAvailable?.() ?? true))) {
+          logger.info('headless or missing worker libraries on Linux; deferring remote desktop worker startup');
+        } else {
+          try {
+            await remoteDesktopWorkerStartup();
+            await remoteDesktopWorker.setAccessPaused?.(remoteDesktopAccessPaused);
+          } catch (error) {
+            reportAuthenticationError(error);
+          }
         }
       }
       // This gated startup runs exactly once, before the first socket -- the
@@ -2199,6 +2252,7 @@ export function createControlledNodeRuntime(
   } else {
     client = new AuthenticatedWebSocketClient(clientOptions);
   }
+  void refreshLinuxElevationState();
   const runtimeClient = client as ControlledNodeRuntimeClient;
   runtimeClient.connectionStatus = () => connection.status();
   runtimeClient.remoteDesktopAccessStatus = () => ({

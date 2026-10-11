@@ -45,6 +45,8 @@ import { copyToClipboardWhenReady } from '../util/clipboard.js';
 import { useMachines } from '../hooks/useMachines.js';
 import { isNative } from '../native.js';
 import { ShareSessionDialog } from './ShareSessionDialog.js';
+import { LinuxDesktopManualInstallDialog } from './LinuxDesktopManualInstallDialog.js';
+import { REMOTE_DESKTOP_LINUX_SUDO_REQUIRED_CAPABILITY } from '@shared/remote-desktop-install.js';
 import type { MachineListItem } from '../api/machines.js';
 import { canOpenRemoteDesktopMachine } from '../remote-desktop-profile.js';
 import { openRemoteDesktopWindow } from '../remote-desktop-window.js';
@@ -192,6 +194,7 @@ export function ControlledNodesPanel({
   const [renameValue, setRenameValue] = useState('');
   const [sharingMachine, setSharingMachine] = useState<MachineListItem | null>(null);
   const [sharingMachineSection, setSharingMachineSection] = useState<'account' | 'remote-desktop'>('account');
+  const [manualInstallDialogMachine, setManualInstallDialogMachine] = useState<MachineListItem | null>(null);
   const [mobileActions, setMobileActions] = useState(
     () => typeof window !== 'undefined' && window.innerWidth <= CONTROLLED_NODES_MOBILE_ACTIONS_MAX_WIDTH,
   );
@@ -583,13 +586,20 @@ export function ControlledNodesPanel({
     setBusyServerId(null);
   };
 
-  const onInstallRemoteDesktopWorker = async (serverId: string) => {
+  const onInstallRemoteDesktopWorker = async (machine: MachineListItem) => {
     setActionError(null);
-    setBusyServerId(serverId);
+    if (machine.capabilities?.includes(REMOTE_DESKTOP_LINUX_SUDO_REQUIRED_CAPABILITY)) {
+      setManualInstallDialogMachine(machine);
+      return;
+    }
+    setBusyServerId(machine.serverId);
     try {
-      await installMachineRemoteDesktopWorker(serverId);
+      await installMachineRemoteDesktopWorker(machine.serverId);
     } catch {
       setActionError(t('remote_desktop.install_failed'));
+      if (machine.os === 'linux') {
+        setManualInstallDialogMachine(machine);
+      }
       setBusyServerId(null);
       return;
     }
@@ -811,23 +821,53 @@ export function ControlledNodesPanel({
     );
   };
 
-  const renderInstallAction = (machine: MachineListItem, inMobileMenu: boolean) => (
-    canInstallRemoteDesktopWorker(machine) && (
-      <button
-        type="button"
-        class="controlled-nodes-install-worker"
-        disabled={busyServerId === machine.serverId}
-        onClick={() => {
-          if (inMobileMenu) closeMobileActionMenu();
-          void onInstallRemoteDesktopWorker(machine.serverId);
-        }}
-      >
-        {busyServerId === machine.serverId
-          ? t('remote_desktop.installing')
-          : t('remote_desktop.install_worker')}
-      </button>
-    )
-  );
+  const renderInstallAction = (machine: MachineListItem, inMobileMenu: boolean) => {
+    if (!canInstallRemoteDesktopWorker(machine)) return null;
+    const isLinux = machine.os === 'linux';
+    const sudoRequired = Boolean(machine.capabilities?.includes(REMOTE_DESKTOP_LINUX_SUDO_REQUIRED_CAPABILITY));
+    return (
+      <div style={{ display: 'inline-flex', gap: '4px', alignItems: 'center' }}>
+        <button
+          type="button"
+          class="controlled-nodes-install-worker"
+          disabled={busyServerId === machine.serverId}
+          onClick={() => {
+            if (inMobileMenu) closeMobileActionMenu();
+            void onInstallRemoteDesktopWorker(machine);
+          }}
+        >
+          {busyServerId === machine.serverId
+            ? t('remote_desktop.installing')
+            : sudoRequired
+              ? t('remote_desktop.linux_manual_command')
+              : t('remote_desktop.install_worker')}
+        </button>
+        {isLinux && !sudoRequired && (
+          <button
+            type="button"
+            class="controlled-nodes-install-manual-btn"
+            style={{
+              padding: '6px 8px',
+              minHeight: '34px',
+              fontSize: '12px',
+              background: 'transparent',
+              border: '1px dashed rgb(94 165 214 / 26%)',
+              borderRadius: '9px',
+              color: '#94a3b8',
+              cursor: 'pointer',
+            }}
+            title={t('remote_desktop.linux_manual_command')}
+            onClick={() => {
+              if (inMobileMenu) closeMobileActionMenu();
+              setManualInstallDialogMachine(machine);
+            }}
+          >
+            {t('remote_desktop.linux_manual_command')}
+          </button>
+        )}
+      </div>
+    );
+  };
 
   const renderUpgradeAction = (machine: MachineListItem, inMobileMenu: boolean) => {
     if (!machine.updateAvailable || machineAccessRole(machine) === 'viewer') return null;
@@ -1484,6 +1524,13 @@ export function ControlledNodesPanel({
           initialMachineSection={sharingMachineSection}
           onClose={() => setSharingMachine(null)}
           onSharesChanged={() => { void refreshPresence(); }}
+        />
+      )}
+
+      {manualInstallDialogMachine && (
+        <LinuxDesktopManualInstallDialog
+          machine={manualInstallDialogMachine}
+          onClose={() => setManualInstallDialogMachine(null)}
         />
       )}
     </div>
