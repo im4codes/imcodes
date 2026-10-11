@@ -322,7 +322,8 @@
       "thinking_level_switched": "Switched thinking level to {{level}}.",
       "message_send_failed": "⚠️ Sending the message failed.",
       "compact_failed": "⚠️ Compacting the conversation failed.",
-      "session_inline_error": "⚠️ The session reported an error."
+      "session_inline_error": "⚠️ The session reported an error.",
+      "turn_stopped_for_queue": "⚠️ Stopped previous turn — sending queued message(s)"
     },
     "execution_status": {
       "waiting": "Waiting",

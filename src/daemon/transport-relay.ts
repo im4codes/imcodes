@@ -27,7 +27,8 @@ import type { MessageDelta, AgentMessage, ToolCallEvent } from '../../shared/age
 import { readDelegationClaim } from '../../shared/delegation-claim.js';
 import { TASK_PAIR_TERMINAL_FLUSH_FIELD } from '../../shared/task-pair.js';
 import { TRANSPORT_EVENT, TRANSPORT_MSG } from '../../shared/transport-events.js';
-import { resolveSessionName, isEphemeralProviderSid } from '../agent/session-manager.js';
+import { resolveSessionName, isEphemeralProviderSid, getTransportRuntime } from '../agent/session-manager.js';
+import { attachDaemonUserNotice, DAEMON_USER_NOTICE_CODE } from '../../shared/daemon-user-notices.js';
 import { timelineEmitter } from './timeline-emitter.js';
 import {
   enforceObservedNativeCollaboration,
@@ -559,20 +560,32 @@ export function wireProviderToRelay(provider: TransportProvider): void {
         ? error.details as Record<string, unknown>
         : null;
       const staleWatchdogRecovery = errorDetails?.cancelOrigin === PROVIDER_CANCEL_ORIGINS.STALE_WATCHDOG;
+      const runtime = getTransportRuntime(sessionName);
+      const isQueueDispatch = Boolean(runtime?.isStoppingForQueue);
       const terminalNotice = staleWatchdogRecovery
         ? '⚠️ OpenCode was unresponsive and was automatically recovered.'
-        : '⚠️ Turn cancelled';
+        : isQueueDispatch
+          ? '⚠️ Stopped previous turn — sending queued message(s)'
+          : '⚠️ Turn cancelled';
       // Preserve the partial streamed content up to the stop point and persist it.
       // Previously this replaced the in-place streaming event (same eventId) with
       // ONLY the cancel notice, so pressing Esc/Stop mid-stream made the visible
       // assistant text "suddenly lose a big chunk" and the partial never hit disk.
       // Mirror the error branch below: keep `tracked.text` + a terminal marker, and
       // append the transport event so the partial survives refresh/reconnect (落盘).
+      const cleanErrorMessage = error.message && error.message !== 'Turn cancelled' && !error.message.startsWith('Turn cancelled:')
+        ? `⚠️ Turn cancelled: ${error.message}`
+        : terminalNotice;
       const cancelledText = tracked?.text
         ? `${tracked.text}\n\n${terminalNotice}`
         : staleWatchdogRecovery
           ? terminalNotice
-          : `⚠️ Turn cancelled: ${error.message}`;
+          : isQueueDispatch
+            ? terminalNotice
+            : cleanErrorMessage;
+      const noticeMetadata = isQueueDispatch && !tracked?.text
+        ? attachDaemonUserNotice(DAEMON_USER_NOTICE_CODE.TURN_STOPPED_FOR_QUEUE, cancelledText)
+        : {};
       timelineEmitter.emit(sessionName, 'assistant.text', {
         text: cancelledText,
         streaming: false,
@@ -582,6 +595,7 @@ export function wireProviderToRelay(provider: TransportProvider): void {
         [TASK_PAIR_TERMINAL_FLUSH_FIELD]: true,
         providerErrorCode: error.code,
         providerErrorRecoverable: error.recoverable,
+        ...noticeMetadata,
         ...(staleWatchdogRecovery ? {
           automation: true,
           providerCancelOrigin: PROVIDER_CANCEL_ORIGINS.STALE_WATCHDOG,

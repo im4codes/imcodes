@@ -322,7 +322,8 @@
       "thinking_level_switched": "思考レベルを {{level}} に切り替えました。",
       "message_send_failed": "⚠️ メッセージを送信できませんでした。",
       "compact_failed": "⚠️ 会話を圧縮できませんでした。",
-      "session_inline_error": "⚠️ セッションでエラーが発生しました。"
+      "session_inline_error": "⚠️ セッションでエラーが発生しました。",
+      "turn_stopped_for_queue": "⚠️ 前のターンを停止しました。キュー内のメッセージを送信しています"
     },
     "execution_status": {
       "waiting": "待機中",

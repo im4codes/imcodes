@@ -27,6 +27,7 @@ vi.mock('../../src/daemon/transport-history.js', () => ({
 // Mock resolveSessionName to return identity mapping (providerSid === sessionName for tests)
 vi.mock('../../src/agent/session-manager.js', () => ({
   resolveSessionName: (providerSid: string) => providerSid,
+  getTransportRuntime: vi.fn(),
 }));
 
 vi.mock('../../src/store/session-store.js', () => ({
@@ -1119,6 +1120,45 @@ describe('transport-relay (timeline-emitter based)', () => {
       // Nothing streamed → nothing to persist.
       expect(appendMock.mock.calls.some(c => c[1]?.type === 'assistant.text')).toBe(false);
       expect(emitMock.mock.calls.some(c => c[1] === 'session.state')).toBe(false);
+    });
+
+    it('does not duplicate "Turn cancelled: Turn cancelled" when provider message is "Turn cancelled"', async () => {
+      const { provider, fireError } = makeMockProvider();
+      wireProviderToRelay(provider);
+      emitMock.mockClear();
+      appendMock.mockClear();
+
+      fireError('sess-cancel-turn', { code: PROVIDER_ERROR_CODES.CANCELLED, message: 'Turn cancelled', recoverable: true });
+      await Promise.resolve();
+
+      const textCall = emitMock.mock.calls.find(c => c[1] === 'assistant.text');
+      expect(textCall![2]).toMatchObject({
+        text: '⚠️ Turn cancelled',
+        streaming: false,
+        memoryExcluded: true,
+      });
+      expect(textCall![2].text).not.toContain('Turn cancelled: Turn cancelled');
+    });
+
+    it('labels cancel for queue dispatch distinctly and attaches noticeCode', async () => {
+      const { provider, fireError } = makeMockProvider();
+      wireProviderToRelay(provider);
+      emitMock.mockClear();
+      appendMock.mockClear();
+
+      const { getTransportRuntime } = await import('../../src/agent/session-manager.js');
+      vi.mocked(getTransportRuntime).mockReturnValueOnce({ isStoppingForQueue: true } as never);
+
+      fireError('sess-cancel-queue', { code: PROVIDER_ERROR_CODES.CANCELLED, message: 'Turn cancelled', recoverable: true });
+      await Promise.resolve();
+
+      const textCall = emitMock.mock.calls.find(c => c[1] === 'assistant.text');
+      expect(textCall![2]).toMatchObject({
+        text: '⚠️ Stopped previous turn — sending queued message(s)',
+        noticeCode: 'turn_stopped_for_queue',
+        streaming: false,
+        memoryExcluded: true,
+      });
     });
 
     it('labels watchdog recovery distinctly from a user cancellation and persists it', async () => {

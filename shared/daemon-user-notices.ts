@@ -61,6 +61,7 @@ export const DAEMON_USER_NOTICE_CODE = {
   MESSAGE_SEND_FAILED: 'message_send_failed',
   COMPACT_FAILED: 'compact_failed',
   SESSION_INLINE_ERROR: 'session_inline_error',
+  TURN_STOPPED_FOR_QUEUE: 'turn_stopped_for_queue',
 } as const;
 
 export type DaemonUserNoticeCode = typeof DAEMON_USER_NOTICE_CODE[keyof typeof DAEMON_USER_NOTICE_CODE];
@@ -266,6 +267,8 @@ export function formatDaemonUserNoticeEnglish(
       return 'Compacting the conversation failed.';
     case DAEMON_USER_NOTICE_CODE.SESSION_INLINE_ERROR:
       return 'The session reported an error.';
+    case DAEMON_USER_NOTICE_CODE.TURN_STOPPED_FOR_QUEUE:
+      return 'Stopped previous turn — sending queued message(s).';
   }
 }
 

@@ -322,7 +322,8 @@
       "thinking_level_switched": "Nivel de razonamiento cambiado a {{level}}.",
       "message_send_failed": "⚠️ No se pudo enviar el mensaje.",
       "compact_failed": "⚠️ No se pudo compactar la conversación.",
-      "session_inline_error": "⚠️ La sesión informó de un error."
+      "session_inline_error": "⚠️ La sesión informó de un error.",
+      "turn_stopped_for_queue": "⚠️ Se detuvo el turno anterior: enviando los mensajes en cola"
     },
     "execution_status": {
       "waiting": "En espera",

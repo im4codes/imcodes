@@ -322,7 +322,8 @@
       "thinking_level_switched": "已切换到思考级别 {{level}}。",
       "message_send_failed": "⚠️ 消息发送失败。",
       "compact_failed": "⚠️ 压缩对话失败。",
-      "session_inline_error": "⚠️ 会话报告了错误。"
+      "session_inline_error": "⚠️ 会话报告了错误。",
+      "turn_stopped_for_queue": "⚠️ 已停止上一轮，正在发送排队消息"
     },
     "execution_status": {
       "waiting": "等待中",

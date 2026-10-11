@@ -3579,6 +3579,11 @@ export class TransportSessionRuntime implements SessionRuntime {
     this._lateStopConfirmationDisposers.clear();
   }
   private _stopQueueIds = new Set<string>();
+  private _lastStopQueueDispatchedAt = 0;
+
+  get isStoppingForQueue(): boolean {
+    return this._stopQueueOperation !== null || (Date.now() - this._lastStopQueueDispatchedAt < 3000);
+  }
 
   /** User Stop only: native admission, or confirmed priority cancel + same ids. */
   stopAndSendPendingMessages(ids: string[], notificationId: string): NonNullable<TransportSessionRuntime['_stopQueueOperation']> {
@@ -3638,6 +3643,7 @@ export class TransportSessionRuntime implements SessionRuntime {
       if (!this._drainPending(ids)) {
         return { status: this._pendingMessages.some((entry) => ids.has(entry.clientMessageId)) ? 'retry' : 'not_found' };
       }
+      this._lastStopQueueDispatchedAt = Date.now();
       return { status: TRANSPORT_STOP_QUEUE_OUTCOMES.STOPPED_AND_DISPATCHED };
     } finally {
       this._stopQueueBarrier = false;

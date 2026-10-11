@@ -322,7 +322,8 @@
       "thinking_level_switched": "Уровень рассуждения переключён на {{level}}.",
       "message_send_failed": "⚠️ Не удалось отправить сообщение.",
       "compact_failed": "⚠️ Не удалось сжать разговор.",
-      "session_inline_error": "⚠️ Сеанс сообщил об ошибке."
+      "session_inline_error": "⚠️ Сеанс сообщил об ошибке.",
+      "turn_stopped_for_queue": "⚠️ Предыдущий раунд остановлен — отправка сообщений из очереди"
     },
     "execution_status": {
       "waiting": "Ожидание",

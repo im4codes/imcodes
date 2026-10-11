@@ -322,7 +322,8 @@
       "thinking_level_switched": "사고 수준을 {{level}}(으)로 전환했습니다.",
       "message_send_failed": "⚠️ 메시지 전송에 실패했습니다.",
       "compact_failed": "⚠️ 대화 압축에 실패했습니다.",
-      "session_inline_error": "⚠️ 세션에서 오류를 보고했습니다."
+      "session_inline_error": "⚠️ 세션에서 오류를 보고했습니다.",
+      "turn_stopped_for_queue": "⚠️ 이전 턴을 중지했습니다 — 대기열 메시지 전송 중"
     },
     "execution_status": {
       "waiting": "대기 중",
