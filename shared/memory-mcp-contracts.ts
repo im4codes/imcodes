@@ -948,10 +948,11 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
   },
   [MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE]: {
     name: MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE,
-    description: 'Send to an exact send_list_targets target; Callers and labels are invalid targets. Inter-session sends append by default; busy turns use provider append with durable FIFO fallback, idle turns start immediately. queue is opt-in FIFO only. Returns status. ' + TASK_PAIR_SUBSESSION_TERM_SHORT,
+    description: 'Send to an exact send_list_targets target; Callers and labels are invalid targets. Inter-session sends append by default; busy turns use provider append with durable FIFO fallback, idle turns start immediately. queue is opt-in FIFO only. emergency=true auto-stops busy targets that cannot append. Returns status. ' + TASK_PAIR_SUBSESSION_TERM_SHORT,
     inputSchema: objectSchema({
       target: stringSchema('Exact target session. May be omitted only when task.autoProvision=true; auto-provision requests also require a top-level idempotencyKey.'),
       message: stringSchema(`Required complete task/request text to deliver, up to ${MEMORY_MCP_CAPS.SEND_MESSAGE_MAX_BYTES} UTF-8 bytes. Include the desired role and output, such as audit findings, discussion input, plan, implementation request, or verification result.`),
+      emergency: booleanSchema('Optional emergency flag. When true, if the target session is busy and does not support in-flight turn append, the daemon automatically force-stops the target before delivering the message, ensuring immediate steering/interruption instead of waiting in the FIFO queue.'),
       deliveryMode: {
         type: 'string',
         enum: [...Object.values(MEMORY_MCP_SEND_DELIVERY_MODES)],

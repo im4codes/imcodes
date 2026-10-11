@@ -3411,7 +3411,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
     [MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE]: async (input) => {
       const sessions = await sendSessions();
       const effectiveProjectRoot = sendIdentityProjectRoot(caller, sessions);
-      const args = pickAllowedMcpArgs(input, ['target', 'message', 'files', 'reply', 'command', 'audit', 'task', 'identity', 'broadcast', 'idempotencyKey', 'deliveryMode', 'clone']);
+      const args = pickAllowedMcpArgs(input, ['target', 'message', 'files', 'reply', 'command', 'audit', 'task', 'identity', 'broadcast', 'idempotencyKey', 'deliveryMode', 'clone', 'emergency', 'enmergency', 'enmergacy']);
       const clone = parseCloneArg(args.clone);
       if (clone === 'invalid') return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'clone request is invalid');
       const audit = parseAuditArg(args.audit);
@@ -3426,12 +3426,14 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       if (identity === 'invalid') return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'identity is invalid');
       const deliveryMode = sendDeliveryModeArg(args.deliveryMode);
       if (deliveryMode === 'invalid') return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'deliveryMode is invalid');
+      const emergency = boolArg(args, 'emergency') ?? boolArg(args, 'enmergency') ?? boolArg(args, 'enmergacy');
       return dispatchSendMessage({ ...caller, projectRoot: effectiveProjectRoot }, {
         target: stringArg(args, 'target'),
         message: stringArg(args, 'message'),
         files: stringArrayArg(args, 'files'),
         reply: boolArg(args, 'reply'),
         ...(boolArg(args, SEND_COMMAND_FIELD) === true ? { command: true } : {}),
+        ...(emergency ? { emergency: true } : {}),
         ...(audit ? { audit } : {}),
         ...(task ? { task } : {}),
         ...(identity ? { identity } : {}),
@@ -4701,6 +4703,9 @@ const schemas = {
   [MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE]: z.object({
     target: z.string().optional().describe('Exact target; omit only for autoProvision.'),
     message: z.string().describe('Request and expected output.'),
+    emergency: z.boolean().optional().describe('When true, auto-stops busy targets that do not support in-flight turn append before delivery.'),
+    enmergency: z.boolean().optional(),
+    enmergacy: z.boolean().optional(),
     deliveryMode: z.enum(Object.values(MEMORY_MCP_SEND_DELIVERY_MODES) as [MemoryMcpSendDeliveryMode, ...MemoryMcpSendDeliveryMode[]])
       .optional(),
     files: z.array(z.string()).optional(),

@@ -100,6 +100,10 @@ export interface SessionDispatchMessageOptions {
    * process target skips memory recall and sandbox path rewriting.
    */
   command?: true;
+  /** Emergency steering: auto-stops busy targets that cannot append before delivering this message. */
+  emergency?: boolean;
+  /** Injected cancel hook for testability / explicit cancel delegation. */
+  cancelSession?: (target: SessionRecord) => Promise<boolean> | boolean;
 }
 
 export type SessionDispatchOptions = SessionDispatchMessageOptions;
@@ -285,7 +289,9 @@ export async function dispatchSessionMessage(
   // Appending into a running turn records the sender's origin (via _appendedTurnOrigins),
   // so participant restrictions and machine authority taints are preserved safely without
   // blocking in-flight steer/append.
-  const deliveryMode = options.deliveryMode ?? MEMORY_MCP_SEND_DELIVERY_MODES.APPEND;
+  const deliveryMode = options.emergency
+    ? MEMORY_MCP_SEND_DELIVERY_MODES.APPEND
+    : (options.deliveryMode ?? MEMORY_MCP_SEND_DELIVERY_MODES.APPEND);
   if ((target.runtimeType ?? getSessionRuntimeType(target.agentType)) === 'transport') {
     // `/clear` is daemon-managed: a fresh provider conversation, exactly as
     // from the browser. Handing it to runtime.send made it ordinary model text
@@ -399,6 +405,14 @@ export async function dispatchSessionMessage(
       if (result !== 'sent' && result !== 'appended' && result !== 'queued') {
         // Unsupported providers and active-turn races retain the old durable
         // delivery guarantee. Prefer append, but never drop a peer message.
+        if (options.emergency) {
+          if (options.cancelSession) {
+            await options.cancelSession(target);
+          } else {
+            const commandHandler = await import('./command-handler.js') as { stopSessionNow?: (name: string) => boolean };
+            if (typeof commandHandler.stopSessionNow === 'function') commandHandler.stopSessionNow(target.name);
+          }
+        }
         const fallback = runtime.send(message, options.messageId, undefined, undefined, {
           deliveryMode,
           ...(options.sharedActor ? { sharedActor: options.sharedActor } : {}),
@@ -467,6 +481,14 @@ export async function dispatchSessionMessage(
   }
 
   const { sendProcessSessionMessageForAutomation } = await import('./command-handler.js');
+  if (options.emergency && target.state === 'running') {
+    if (options.cancelSession) {
+      await options.cancelSession(target);
+    } else {
+      const commandHandler = await import('./command-handler.js') as { stopSessionNow?: (name: string) => boolean };
+      if (typeof commandHandler.stopSessionNow === 'function') commandHandler.stopSessionNow(target.name);
+    }
+  }
   // A participant-stamped message makes this process session's next turn a participant turn (the window the machine tools consult).
   const participantBinding = options.sharedActor?.effectiveActorRole === 'participant'
     && target.sessionInstanceId && target.runtimeEpoch

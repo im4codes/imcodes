@@ -618,6 +618,9 @@ interface SendRequest {
   /** Only meaningful on SEND_COMMAND_HOOK_PATH; rejected on `/send` (see handleSend). */
   command?: boolean;
   deliveryMode?: MemoryMcpSendDeliveryMode;
+  emergency?: boolean;
+  enmergency?: boolean;
+  enmergacy?: boolean;
   supervision?: { taskId: string; assignmentId: string; auditAttemptId?: string; auditRevision?: string };
   messageId?: SendMessageId;
 }
@@ -750,6 +753,7 @@ async function handleSend(
       files: body.files,
       projectRoot,
       reply: body.reply === true,
+      ...(body.emergency === true || body.enmergency === true || body.enmergacy === true ? { emergency: true } : {}),
       ...(commandMode ? { command: true } : {}),
       ...(body.deliveryMode ? { deliveryMode: body.deliveryMode } : {}),
       ...(body.supervision ? { supervision: body.supervision } : {}),

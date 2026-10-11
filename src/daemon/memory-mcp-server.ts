@@ -945,6 +945,7 @@ export function mergeDefaultToolDeps(
             to: target.name,
             message,
             depth: 0,
+            ...(options.emergency ? { emergency: true } : {}),
             ...(options.deliveryMode ? { deliveryMode: options.deliveryMode } : {}),
             ...(options.supervision ? {
               supervision: options.supervision,

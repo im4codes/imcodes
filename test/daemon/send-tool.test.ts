@@ -1840,3 +1840,55 @@ describe('send-tool auto-provision identity limit', () => {
     expect(result.error).not.toBe('identity_content_too_large');
   });
 });
+
+describe('send-tool emergency mode', () => {
+  const brain = session({ name: 'deck_alpha_brain', projectName: 'alpha', role: 'brain', label: 'Brain' });
+  const worker = session({ name: 'deck_alpha_w1', projectName: 'alpha', role: 'w1', label: 'Worker' });
+
+  it('passes emergency: true and cancelSession to dispatchMessage', async () => {
+    const dispatchMessage = vi.fn().mockResolvedValue('sent');
+    const cancelSession = vi.fn().mockResolvedValue(true);
+
+    const result = await dispatchSendMessage(caller, {
+      target: worker.name,
+      message: 'emergency interrupt and steer',
+      emergency: true,
+    }, {
+      listSessions: () => [brain, worker],
+      dispatchMessage,
+      cancelSession,
+    });
+
+    expect(result.status).toBe('accepted');
+    expect(dispatchMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ name: worker.name }),
+      expect.stringContaining('emergency interrupt and steer'),
+      expect.objectContaining({
+        emergency: true,
+        cancelSession,
+      }),
+    );
+  });
+
+  it('rejects emergency send when deliveryMode is queue', async () => {
+    const dispatchMessage = vi.fn();
+
+    const result = await dispatchSendMessage(caller, {
+      target: worker.name,
+      message: 'emergency cannot queue',
+      emergency: true,
+      deliveryMode: 'queue',
+    }, {
+      listSessions: () => [brain, worker],
+      dispatchMessage,
+    });
+
+    expect(result).toMatchObject({
+      status: 'error',
+      reason: 'validation_failed',
+      error: 'emergency send cannot use deliveryMode=queue',
+    });
+    expect(dispatchMessage).not.toHaveBeenCalled();
+  });
+});
+

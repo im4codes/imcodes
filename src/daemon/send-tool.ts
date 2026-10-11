@@ -363,6 +363,12 @@ export interface SendMessageInput {
   idempotencyKey?: string;
   /** Defaults to append; queue explicitly preserves ordinary durable FIFO. */
   deliveryMode?: MemoryMcpSendDeliveryMode;
+  /**
+   * Emergency steering / redirection: when true, if the target session is busy and
+   * does not support in-flight turn append, the daemon automatically stops the target's
+   * active turn before delivering this message, ensuring immediate execution.
+   */
+  emergency?: boolean;
   /** Strict supervision-only metadata. Never infer this purpose from message text. */
   audit?: AgentDelegationAuditRequest;
   /** Optional execution-clone request — see {@link SendMessageCloneRequest}. */
@@ -524,6 +530,8 @@ export interface HookSendDispatchInput {
   command?: boolean;
   /** Internal MCP path only: prefer native append, retain FIFO fallback. */
   deliveryMode?: MemoryMcpSendDeliveryMode;
+  /** Emergency steering: auto-stop busy targets that cannot append. */
+  emergency?: boolean;
   /** This `/send` spawns work; see {@link SendMessageInput.newWorkload}. */
   newWorkload?: boolean;
   /**
@@ -1549,6 +1557,13 @@ export async function dispatchSendMessage(
   if (input.deliveryMode !== undefined
     && !Object.values(MEMORY_MCP_SEND_DELIVERY_MODES).includes(input.deliveryMode)) {
     return { status: 'error', reason: MCP_ERROR_REASONS.VALIDATION_FAILED, error: 'deliveryMode is invalid' };
+  }
+  if (input.emergency && input.deliveryMode === MEMORY_MCP_SEND_DELIVERY_MODES.QUEUE) {
+    return {
+      status: 'error',
+      reason: MCP_ERROR_REASONS.VALIDATION_FAILED,
+      error: 'emergency send cannot use deliveryMode=queue',
+    };
   }
   if (input.task?.taskId?.trim()
     && input.deliveryMode === MEMORY_MCP_SEND_DELIVERY_MODES.QUEUE) {
@@ -3003,6 +3018,8 @@ export async function dispatchSendMessage(
           ? { queueSupervisionReference: input.internalQueueSupervisionReference }
           : {}),
         deliveryMode: input.deliveryMode ?? MEMORY_MCP_SEND_DELIVERY_MODES.APPEND,
+        ...(input.emergency ? { emergency: true } : {}),
+        ...(deps?.cancelSession ? { cancelSession: deps.cancelSession } : {}),
         ...(supervisedTaskId && supervisedAssignmentId
           ? { supervision: { taskId: supervisedTaskId, assignmentId: supervisedAssignmentId } }
           : {}),
@@ -5725,6 +5742,8 @@ async function dispatchCommandSend(
         messageOrigin: CHAT_MESSAGE_ORIGINS.AGENT,
         deliveryMode: input.deliveryMode ?? MEMORY_MCP_SEND_DELIVERY_MODES.APPEND,
         command: true,
+        ...(input.emergency ? { emergency: true } : {}),
+        ...(deps?.cancelSession ? { cancelSession: deps.cancelSession } : {}),
         ...buildSharedServerMemberSharedActorOption(caller, callerRecord, target, messageId, now),
       });
       deliveries.push({
@@ -5930,6 +5949,8 @@ export async function dispatchHookSend(input: HookSendDispatchInput, deps?: Send
         messageOrigin: input.from === IMCODES_EXTERNAL_CLI_SENDER ? CHAT_MESSAGE_ORIGINS.SYSTEM : CHAT_MESSAGE_ORIGINS.AGENT,
         deliveryMode,
         ...(input.command ? { command: true as const } : {}),
+        ...(input.emergency ? { emergency: true } : {}),
+        ...(deps?.cancelSession ? { cancelSession: deps.cancelSession } : {}),
         ...buildSharedServerMemberSharedActorOption(
           {
             userId: input.from,

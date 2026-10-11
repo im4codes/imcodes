@@ -1137,6 +1137,24 @@ describe('memory MCP stdio server', () => {
         message: `${buildAgentDelegationSenderLine('deck_sub_worker', 'Worker')}\n\nhello late peer`,
         depth: 0,
       });
+
+      const emergencySend = await callLazyTool(client, 'send_message', {
+        target: 'deck_sub_peer',
+        message: 'urgent emergency steer',
+        emergency: true,
+      });
+      expect(emergencySend.structuredContent).toMatchObject({
+        status: 'accepted',
+        deliveries: [expect.objectContaining({ target: 'deck_sub_peer', status: 'delivered' })],
+      });
+      expect(hookBodies.at(-1)).toMatchObject({
+        from: 'deck_sub_worker',
+        to: 'deck_sub_peer',
+        message: `${buildAgentDelegationSenderLine('deck_sub_worker', 'Worker')}\n\nurgent emergency steer`,
+        depth: 0,
+        deliveryMode: 'append',
+        emergency: true,
+      });
     } finally {
       await client.close();
       await new Promise<void>((resolve, reject) => hookServer.close((err) => (err ? reject(err) : resolve())));
