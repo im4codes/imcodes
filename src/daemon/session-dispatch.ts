@@ -45,7 +45,7 @@ import { getSession as getStoredSession, type SessionRecord } from '../store/ses
 import { drainTransportResendQueueForDispatch, ensureTransportRuntimeForPendingResend, getTransportRuntime } from '../agent/session-manager.js';
 import { getSessionRuntimeType } from '../../shared/agent-types.js';
 import { buildTransportQueueSnapshotPayload } from './transport-queue-projection.js';
-import { enqueueResend, recipientFromSessionRecord } from './transport-resend-queue.js';
+import { clearResend, enqueueResend, recipientFromSessionRecord } from './transport-resend-queue.js';
 import { injectPeerAuditBriefIntoProcessSession, type PeerAuditProcessInjectError } from './peer-audit-process-injector.js';
 import { timelineEmitter } from './timeline-emitter.js';
 import { isPairsEngineSession } from './task-pairs/engine.js';
@@ -355,6 +355,9 @@ export async function dispatchSessionMessage(
       return 'queued';
     }
     if (!runtime?.providerSessionId) {
+      if (options.emergency) {
+        clearResend(target.name, 'user_stopped');
+      }
       const queued = enqueueResend(target.name, {
         // Bind the durable row to the live runtime, not to the reusable name.
         ...(recipientFromSessionRecord(target) ? { recipient: recipientFromSessionRecord(target) } : {}),
@@ -406,6 +409,12 @@ export async function dispatchSessionMessage(
         // Unsupported providers and active-turn races retain the old durable
         // delivery guarantee. Prefer append, but never drop a peer message.
         if (options.emergency) {
+          if (typeof (runtime as { clearPendingMessages?: (reason: string) => unknown }).clearPendingMessages === 'function') {
+            (runtime as { clearPendingMessages: (reason: string) => unknown }).clearPendingMessages('user_stopped');
+          } else {
+            const { clearResend: clearQueueResend } = await import('./transport-resend-queue.js');
+            clearQueueResend(target.name, 'user_stopped');
+          }
           if (options.cancelSession) {
             await options.cancelSession(target);
           } else {
@@ -415,6 +424,7 @@ export async function dispatchSessionMessage(
         }
         const fallback = runtime.send(message, options.messageId, undefined, undefined, {
           deliveryMode,
+          ...(options.emergency ? { queuePlacement: 'front' as const, emergency: true as const } : {}),
           ...(options.sharedActor ? { sharedActor: options.sharedActor } : {}),
           ...(options.sharedMachineAuthority ? { sharedMachineAuthority: options.sharedMachineAuthority } : {}),
           ...(options.suppressTimeline ? { timelineCommitted: true } : {}),

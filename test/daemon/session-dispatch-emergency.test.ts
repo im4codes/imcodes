@@ -4,6 +4,7 @@ import type { SessionRecord } from '../../src/store/session-store.js';
 const mocks = vi.hoisted(() => ({
   runtimeSend: vi.fn((): 'sent' | 'queued' => 'sent'),
   appendExternal: vi.fn(async (): Promise<string> => 'sent'),
+  clearPendingMessages: vi.fn(() => []),
   processSend: vi.fn(async () => undefined),
   stopSessionNow: vi.fn(() => true),
   runtime: { current: undefined as undefined | Record<string, unknown> },
@@ -45,12 +46,14 @@ describe('session dispatch emergency mode', () => {
     clearAllResend();
     mocks.runtimeSend.mockReset().mockReturnValue('sent');
     mocks.appendExternal.mockReset().mockResolvedValue('sent');
+    mocks.clearPendingMessages.mockReset().mockReturnValue([]);
     mocks.processSend.mockClear();
     mocks.stopSessionNow.mockClear();
     mocks.runtime.current = {
       providerSessionId: 'provider-1',
       send: mocks.runtimeSend,
       appendExternalMessageToActiveTurn: mocks.appendExternal,
+      clearPendingMessages: mocks.clearPendingMessages,
     };
   });
 
@@ -60,7 +63,7 @@ describe('session dispatch emergency mode', () => {
   });
 
   describe('transport session', () => {
-    it('stops active turn when appendExternal returns unsupported and emergency is true', async () => {
+    it('clears pending messages, stops active turn, and places emergency send at front when appendExternal returns unsupported and emergency is true', async () => {
       mocks.appendExternal.mockResolvedValue('unsupported');
       mocks.runtimeSend.mockReturnValue('sent');
       const cancelSessionMock = vi.fn().mockResolvedValue(true);
@@ -73,13 +76,14 @@ describe('session dispatch emergency mode', () => {
         cancelSession: cancelSessionMock,
       } as never);
 
+      expect(mocks.clearPendingMessages).toHaveBeenCalledWith('user_stopped');
       expect(cancelSessionMock).toHaveBeenCalledWith(target);
       expect(mocks.runtimeSend).toHaveBeenCalledWith(
         'emergency redirect',
         'send_message_emg1',
         undefined,
         undefined,
-        expect.objectContaining({ deliveryMode: 'append' }),
+        expect.objectContaining({ deliveryMode: 'append', queuePlacement: 'front', emergency: true }),
       );
       expect(res).toBe('sent');
     });
@@ -95,6 +99,7 @@ describe('session dispatch emergency mode', () => {
         emergency: true,
       } as never);
 
+      expect(mocks.clearPendingMessages).toHaveBeenCalledWith('user_stopped');
       expect(mocks.stopSessionNow).toHaveBeenCalledWith('deck_sub_emgrx');
       expect(mocks.runtimeSend).toHaveBeenCalled();
     });

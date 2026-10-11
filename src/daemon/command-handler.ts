@@ -3334,6 +3334,7 @@ function cancelTransportTurnNow(
   if (!isTransportStop) return false;
 
   clearResend(sessionName, 'user_stopped');
+  stopRuntime?.clearPendingMessages?.('user_stopped');
   if (commandId) emitCommandAck(sessionName, commandId, 'accepted', undefined, serverLink);
   emitSessionControlTimelineFeedback(sessionName, 'stop');
   // Reflect idle PROMPTLY so the "working" spinner clears on STOP even when the

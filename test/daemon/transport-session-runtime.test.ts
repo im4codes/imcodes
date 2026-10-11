@@ -7158,6 +7158,47 @@ ${PREFERENCE_CONTEXT_END}`;
     expect(runtime.pendingCount).toBe(0);
   });
 
+  it('clearPendingMessages() removes all queued messages and prevents auto-drain on cancel', async () => {
+    runtime.send('first');
+    await waitForProviderSendCount(mock.provider, 1);
+    runtime.send('queued1', 'msg-q1');
+    runtime.send('queued2', 'msg-q2');
+    expect(runtime.pendingCount).toBe(2);
+
+    const cleared = runtime.clearPendingMessages('user_stopped');
+    expect(cleared.map((c) => c.clientMessageId)).toEqual(['msg-q1', 'msg-q2']);
+    expect(runtime.pendingCount).toBe(0);
+
+    runtime.cancel();
+    mock.fireError('sess-1', { code: 'CANCELLED', message: 'cancelled', recoverable: true });
+
+    expect(mock.provider.send).toHaveBeenCalledTimes(1);
+    expect(runtime.getStatus()).toBe('idle');
+  });
+
+  it('emergency send with queuePlacement front is isolated and drains alone ahead of other messages', async () => {
+    runtime.send('first');
+    await waitForProviderSendCount(mock.provider, 1);
+    runtime.send('normal queued', 'msg-norm');
+    runtime.send('emergency message', 'msg-emg', undefined, undefined, {
+      queuePlacement: 'front',
+      emergency: true,
+    });
+    expect(runtime.pendingCount).toBe(2);
+
+    runtime.cancel();
+    mock.fireError('sess-1', { code: 'CANCELLED', message: 'cancelled', recoverable: true });
+    await waitForProviderSendCount(mock.provider, 2);
+
+    expect(mock.provider.send).toHaveBeenCalledTimes(2);
+    expect(mock.provider.send).toHaveBeenNthCalledWith(2, 'sess-1', expect.objectContaining({
+      userMessage: 'emergency message',
+      assembledMessage: 'emergency message',
+    }));
+    expect(runtime.pendingCount).toBe(1);
+    expect(runtime.pendingEntries[0]?.clientMessageId).toBe('msg-norm');
+  });
+
   it('cancel() closes open tools before draining queued messages when provider cancel is silent', async () => {
     runtime.send('first');
     await waitForProviderSendCount(mock.provider, 1);

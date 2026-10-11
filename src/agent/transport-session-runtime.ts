@@ -121,7 +121,7 @@ import { resolveTaskPairPromptEngineState } from '../daemon/task-pairs/engine.js
 import { resolveTaskPairTurnCwd } from '../daemon/task-pairs/turn-cwd.js';
 import { type TaskPairEngineState } from '../../shared/task-pair.js';
 import type { DiscardTransportQueueStateResult, LegacyQueueOwnershipEvidence, QueueRecipientIdentity } from '../daemon/transport-queue-store.js';
-import type { QueueDeliveryFact, QueuePlacement, QueueSnapshot, QueueSupervisionAdmission, QueueSupervisionReference } from '../../shared/transport-queue-types.js';
+import type { QueueDeliveryFact, QueueDropReason, QueuePlacement, QueueSnapshot, QueueSupervisionAdmission, QueueSupervisionReference } from '../../shared/transport-queue-types.js';
 import type { PeerAuditCompletedTurnEvidence } from '../../shared/peer-audit.js';
 import { getTransportContextBudgetMs, readBoundedTimeoutMs } from './transport-context-budget.js';
 import { withTimeoutOutcome } from '../util/timeout-outcome.js';
@@ -194,6 +194,11 @@ export interface PendingTransportMessage {
    * is dispatched alone rather than merged with neighbouring queued messages.
    */
   commandMode?: true;
+  /**
+   * @internal: emergency steering message. Dispatched alone at the head of the
+   * queue, never merged with neighbouring queued messages.
+   */
+  emergency?: true;
   /** @internal: daemon-owned lifecycle authority, never inferred from text. */
   supervisionReference?: QueueSupervisionReference;
   /** @internal: exact resend lease already transferred into this runtime. */
@@ -281,6 +286,7 @@ function publicPendingEntry(entry: PendingTransportMessage): PendingTransportMes
   delete publicEntry.peerAudit;
   delete publicEntry.delegationReply;
   delete publicEntry.commandMode;
+  delete publicEntry.emergency;
   delete publicEntry.supervisionReference;
   delete publicEntry.queueHandoff;
   delete publicEntry.registeredSystemContract;
@@ -328,6 +334,8 @@ export interface TransportSendMetadata {
   };
   /** @internal: command-mode send, delivered verbatim (see PendingTransportMessage.commandMode). */
   commandMode?: true;
+  /** @internal: emergency steering send, delivered alone without merging into other queued messages. */
+  emergency?: true;
   /** @internal: daemon-owned lifecycle authority revalidated before provider admission. */
   supervisionReference?: QueueSupervisionReference;
   /** @internal: existing durable lease transferred by drainResend. */
@@ -499,7 +507,7 @@ function isTransportSlashControl(message: string | undefined): boolean {
  */
 function takeDrainBatch(
   entries: PendingTransportMessage[],
-  isolate: (entry: PendingTransportMessage) => boolean = (entry) => entry.commandMode === true,
+  isolate: (entry: PendingTransportMessage) => boolean = (entry) => entry.commandMode === true || entry.emergency === true,
 ): PendingTransportMessage[] {
   const firstCommand = entries.findIndex(isolate);
   if (firstCommand < 0) return entries;
@@ -2819,6 +2827,7 @@ export class TransportSessionRuntime implements SessionRuntime {
       ...(metadata?.peerAudit ? { peerAudit: { ...metadata.peerAudit } } : {}),
       ...(metadata?.delegationReply ? { delegationReply: { ...metadata.delegationReply } } : {}),
       ...(metadata?.commandMode ? { commandMode: true as const } : {}),
+      ...(metadata?.emergency ? { emergency: true as const } : {}),
       ...(metadata?.supervisionReference
         ? { supervisionReference: { ...metadata.supervisionReference } }
         : {}),
@@ -3564,6 +3573,25 @@ export class TransportSessionRuntime implements SessionRuntime {
       for (const entry of removed) this._pendingAuthorityRetryAttempts.delete(entry.clientMessageId);
       this._pendingVersion++;
     }
+    return removed;
+  }
+
+  /**
+   * Clear all queued pending messages locally and from the SQLite queue store.
+   * Used when force-stopping / emergency-steering a session to prevent old queued work
+   * from auto-draining ahead of an emergency message.
+   */
+  clearPendingMessages(reason: QueueDropReason = 'user_cleared'): PendingTransportMessage[] {
+    if (this._pendingMessages.length === 0) return [];
+    const removed = [...this._pendingMessages];
+    this._pendingMessages = [];
+    this._pendingAuthorityRetryAttempts.clear();
+    try {
+      getTransportQueueStore().dropAll(this.sessionKey, reason);
+    } catch (err) {
+      logger.warn({ err, sessionKey: this.sessionKey, reason }, 'transport queue sqlite dropAll failed; preserving runtime-local clear');
+    }
+    this._pendingVersion++;
     return removed;
   }
 
