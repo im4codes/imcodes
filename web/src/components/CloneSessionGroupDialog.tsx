@@ -43,7 +43,8 @@ interface CloneUiState {
   skippedCronJobs: number;
   skippedOrchestrationRuns: number;
   warnings: SessionGroupCloneWarning[];
-  errorCode: SessionGroupCloneErrorCode | null;
+  errorCode: SessionGroupCloneErrorCode | 'daemon_offline' | null;
+  missingCapability: string | null;
   cleanupRequired: boolean;
   cleanupResources: SessionGroupCloneCleanupResource[];
 }
@@ -60,6 +61,7 @@ const INITIAL_UI_STATE: CloneUiState = {
   skippedOrchestrationRuns: 0,
   warnings: [],
   errorCode: null,
+  missingCapability: null,
   cleanupRequired: false,
   cleanupResources: [],
 };
@@ -145,7 +147,6 @@ function canUseKnownCloneCapability(ws: WsClient | null): boolean {
   if (!ws) return true;
   const snapshot = ws.getDaemonCapabilitySnapshot?.() ?? null;
   if (!snapshot) return true;
-  if (ws.isDaemonCapabilityStale?.()) return true;
   return snapshot.capabilities.includes(SESSION_GROUP_CLONE_CAPABILITY_V1);
 }
 
@@ -153,17 +154,36 @@ function canUseKnownGitRemoteCloneCapability(ws: WsClient | null): boolean {
   if (!ws) return false;
   const snapshot = ws.getDaemonCapabilitySnapshot?.() ?? null;
   if (!snapshot) return false;
-  if (ws.isDaemonCapabilityStale?.()) return false;
   return snapshot.capabilities.includes(GIT_REMOTE_CLONE_CAPABILITY_V1);
 }
 
-function cloneErrorCodeFromError(error: unknown): SessionGroupCloneErrorCode {
+function parseCloneApiError(error: unknown): {
+  errorCode: SessionGroupCloneErrorCode | 'daemon_offline';
+  missingCapability: string | null;
+} {
   if (error instanceof ApiError) {
-    if (error.code) return error.code as SessionGroupCloneErrorCode;
-    if (error.status === 403) return 'forbidden';
-    if (error.status === 404) return 'source_not_found';
+    let missingCapability: string | null = null;
+    let code: string | null = error.code;
+    try {
+      const parsed = JSON.parse(error.body) as { error?: string; missingCapability?: string };
+      if (typeof parsed?.missingCapability === 'string') {
+        missingCapability = parsed.missingCapability;
+      }
+      if (typeof parsed?.error === 'string') {
+        code = parsed.error;
+      }
+    } catch {}
+
+    if (code === 'daemon_offline' || error.status === 503) {
+      return { errorCode: 'daemon_offline', missingCapability: null };
+    }
+    if (code) {
+      return { errorCode: code as SessionGroupCloneErrorCode, missingCapability };
+    }
+    if (error.status === 403) return { errorCode: 'forbidden', missingCapability: null };
+    if (error.status === 404) return { errorCode: 'source_not_found', missingCapability: null };
   }
-  return 'internal_error';
+  return { errorCode: 'internal_error', missingCapability: null };
 }
 
 export function CloneSessionGroupDialog({
@@ -199,6 +219,27 @@ export function CloneSessionGroupDialog({
   const [showDirBrowser, setShowDirBrowser] = useState(false);
   const [localError, setLocalError] = useState<string | null>(null);
   const [uiState, setUiState] = useState<CloneUiState>(INITIAL_UI_STATE);
+  const [, setCapabilityRevision] = useState(0);
+
+  useEffect(() => {
+    if (!ws?.onDaemonCapabilitiesChange) return;
+    return ws.onDaemonCapabilitiesChange(() => {
+      setCapabilityRevision((rev) => rev + 1);
+    });
+  }, [ws]);
+
+  const clearFailedState = () => {
+    setLocalError(null);
+    if (uiState.submission === 'failed') {
+      idempotencyKeyRef.current = createIdempotencyKey();
+      setUiState((current) => ({
+        ...current,
+        submission: 'idle',
+        errorCode: null,
+        missingCapability: null,
+      }));
+    }
+  };
 
   const idempotencyKey = idempotencyKeyRef.current;
   const directChildSessions = useMemo(
@@ -214,7 +255,6 @@ export function CloneSessionGroupDialog({
     : '';
   const busy = uiState.submission === 'pending';
   const terminal = uiState.submission === 'succeeded'
-    || uiState.submission === 'failed'
     || uiState.submission === 'cleanup_required'
     || uiState.submission === 'cancelled';
 
@@ -240,6 +280,7 @@ export function CloneSessionGroupDialog({
           ?? msg.clonedMainSessionName
           ?? current.clonedMainSessionName;
         const errorCode = msg.errorCode ?? current.errorCode;
+        const missingCapability = msg.missingCapability ?? current.missingCapability;
         const cleanupRequired = msg.cleanupRequired
           || msg.state === 'cleanup_required'
           || errorCode === 'cleanup_required'
@@ -263,6 +304,7 @@ export function CloneSessionGroupDialog({
           skippedOrchestrationRuns: msg.result?.skippedOrchestrationRuns ?? msg.skippedOrchestrationRuns ?? current.skippedOrchestrationRuns,
           warnings,
           errorCode,
+          missingCapability,
           cleanupRequired,
           cleanupResources: msg.cleanupResources ?? current.cleanupResources,
         };
@@ -327,6 +369,11 @@ export function CloneSessionGroupDialog({
       return;
     }
 
+    const currentKey = idempotencyKeyRef.current;
+    const activeKey = uiState.submission === 'failed'
+      ? (idempotencyKeyRef.current = createIdempotencyKey())
+      : currentKey;
+
     setLocalError(null);
     setUiState({
       ...INITIAL_UI_STATE,
@@ -339,28 +386,45 @@ export function CloneSessionGroupDialog({
         targetProjectName: trimmed,
         cwdOverride: useCwdOverride ? cwdOverride.trim() : null,
         gitRemoteUrl: useCwdOverride && gitRemoteUrl.trim() ? gitRemoteUrl.trim() : null,
-        idempotencyKey,
+        idempotencyKey: activeKey,
       })).catch((error) => {
+        const parsed = parseCloneApiError(error);
         setUiState({
           ...INITIAL_UI_STATE,
           submission: 'failed',
-          errorCode: cloneErrorCodeFromError(error),
+          errorCode: parsed.errorCode,
+          missingCapability: parsed.missingCapability,
         });
       });
     } catch (error) {
+      const parsed = parseCloneApiError(error);
       setUiState({
         ...INITIAL_UI_STATE,
         submission: 'failed',
-        errorCode: cloneErrorCodeFromError(error),
+        errorCode: parsed.errorCode,
+        missingCapability: parsed.missingCapability,
       });
     }
   };
 
-  const errorText = uiState.errorCode
-    ? t(getTranslationKey('session.clone.errorCode', uiState.errorCode), {
+  const errorText = useMemo(() => {
+    if (!uiState.errorCode) return null;
+    if (uiState.errorCode === 'daemon_offline') {
+      return t('session.clone.daemonOffline');
+    }
+    if (uiState.errorCode === 'unsupported_command') {
+      if (
+        uiState.missingCapability === GIT_REMOTE_CLONE_CAPABILITY_V1
+        || (gitRemoteUrl.trim() && uiState.missingCapability !== SESSION_GROUP_CLONE_CAPABILITY_V1)
+      ) {
+        return t('session.clone.gitRemoteCapabilityMissing');
+      }
+      return t(getTranslationKey('session.clone.errorCode', uiState.errorCode), {
         capability: SESSION_GROUP_CLONE_CAPABILITY_V1,
-      })
-    : null;
+      });
+    }
+    return t(getTranslationKey('session.clone.errorCode', uiState.errorCode));
+  }, [t, uiState.errorCode, uiState.missingCapability, gitRemoteUrl]);
   const operationLabel = uiState.state
     ? t(getTranslationKey('session.clone.state', uiState.state))
     : null;
@@ -400,7 +464,7 @@ export function CloneSessionGroupDialog({
               data-1p-ignore
               onInput={(event) => {
                 setTargetProjectName((event.target as HTMLInputElement).value);
-                setLocalError(null);
+                clearFailedState();
               }}
             />
           </div>
@@ -441,7 +505,7 @@ export function CloneSessionGroupDialog({
                 const checked = (event.target as HTMLInputElement).checked;
                 setUseCwdOverride(checked);
                 if (!checked) setGitRemoteUrl('');
-                setLocalError(null);
+                clearFailedState();
               }}
               style={{ marginTop: 2 }}
             />
@@ -478,7 +542,7 @@ export function CloneSessionGroupDialog({
                   data-1p-ignore
                   onInput={(event) => {
                     setCwdOverride((event.target as HTMLInputElement).value);
-                    setLocalError(null);
+                    clearFailedState();
                   }}
                 />
                 {ws && (
@@ -513,7 +577,7 @@ export function CloneSessionGroupDialog({
                 data-1p-ignore
                 onInput={(event) => {
                   setGitRemoteUrl((event.target as HTMLInputElement).value);
-                  setLocalError(null);
+                  clearFailedState();
                 }}
               />
               <div style={{ color: '#94a3b8', fontSize: 12, marginTop: 4, lineHeight: 1.4 }}>

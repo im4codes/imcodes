@@ -8,6 +8,7 @@ import { GIT_REMOTE_CLONE_CAPABILITY_V1 } from '../../shared/git-remote-url.js';
 
 const mockResolveServerRole = vi.fn<() => Promise<string>>().mockResolvedValue('owner');
 const mockSendToDaemon = vi.fn();
+const mockIsDaemonConnected = vi.fn(() => true);
 const mockHasDaemonCapability = vi.fn(() => true);
 const mockLogAudit = vi.fn().mockResolvedValue(undefined);
 const mockRegisterCloneContext = vi.fn();
@@ -35,6 +36,7 @@ vi.mock('../src/db/queries.js', () => ({
 
 vi.mock('../src/security/audit.js', () => ({
   logAudit: (...args: unknown[]) => mockLogAudit(...args),
+  auditSessionGroupClone: vi.fn().mockResolvedValue(undefined),
 }));
 
 vi.mock('../src/security/crypto.js', () => ({
@@ -45,6 +47,7 @@ vi.mock('../src/ws/bridge.js', () => ({
   WsBridge: {
     get: () => ({
       sendToDaemon: mockSendToDaemon,
+      isDaemonConnected: mockIsDaemonConnected,
       hasDaemonCapability: mockHasDaemonCapability,
       registerSessionGroupCloneOperationContext: mockRegisterCloneContext,
       getSessionGroupCloneOperationEvent: mockGetCloneOperationEvent,
@@ -71,6 +74,7 @@ describe('session group clone routes', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mockResolveServerRole.mockResolvedValue('owner');
+    mockIsDaemonConnected.mockReturnValue(true);
     mockHasDaemonCapability.mockReturnValue(true);
     mockGetCloneOperationEvent.mockReturnValue(null);
     mockGetDbSessionsByServer.mockResolvedValue([]);
@@ -196,6 +200,23 @@ describe('session group clone routes', () => {
       }),
     }), {});
     expect(JSON.stringify(mockLogAudit.mock.calls)).not.toContain('/private/source/tree');
+  });
+
+  it('rejects group clone requests when the daemon is offline', async () => {
+    mockIsDaemonConnected.mockReturnValue(false);
+    const app = await buildApp();
+    const res = await app.request('/api/server/srv-1/sessions/deck_cd_brain/group-clone', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        idempotencyKey: 'idem-offline',
+        targetProjectName: 'cd_1',
+      }),
+    });
+
+    expect(res.status).toBe(503);
+    await expect(res.json()).resolves.toEqual({ error: 'daemon_offline' });
+    expect(mockSendToDaemon).not.toHaveBeenCalled();
   });
 
   it('rejects stale daemons without the clone capability before forwarding', async () => {

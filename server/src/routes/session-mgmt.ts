@@ -951,6 +951,15 @@ sessionMgmtRoutes.post('/:id/sessions/:rootSession/group-clone', async (c) => {
     }
   }
 
+  if (!bridge.isDaemonConnected()) {
+    await auditSessionGroupClone(c, {
+      ...auditBase,
+      outcome: 'failed',
+      errorCode: 'daemon_offline',
+    });
+    return c.json({ error: 'daemon_offline' }, 503);
+  }
+
   if (!bridge.hasDaemonCapability(SESSION_GROUP_CLONE_CAPABILITY_V1)) {
     await auditSessionGroupClone(c, {
       ...auditBase,

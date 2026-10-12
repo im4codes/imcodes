@@ -8368,6 +8368,11 @@ export class WsBridge {
       }
     }
 
+    if (!this.isDaemonConnected()) {
+      sendError('daemon_offline');
+      return;
+    }
+
     if (!this.hasDaemonCapability(SESSION_GROUP_CLONE_CAPABILITY_V1)) {
       sendError('unsupported_command', { missingCapability: SESSION_GROUP_CLONE_CAPABILITY_V1 });
       return;
