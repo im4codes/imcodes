@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import {
+  defaultActivePairTaskIdForSession,
   profilesForSession,
   resolveEffectiveIdentities,
   resolveEffectiveIdentityPrompt,
@@ -106,5 +107,25 @@ describe('the single derivation of a session identity prompt', () => {
       listProfiles: async () => { throw new Error('unreadable'); },
       boundServerId: async () => SERVER,
     })).rejects.toThrow('unreadable');
+  });
+
+  it('defaultActivePairTaskIdForSession falls back to session pairCreatedMetadata when pair store has no active participant', async () => {
+    const { upsertSession } = await import('../../src/store/session-store.js');
+    upsertSession({
+      name: 'deck_sub_pair_created_fallback',
+      projectName: 'proj',
+      state: 'running',
+      pairCreatedMetadata: {
+        autoCreated: true,
+        source: 'pair_create',
+        createdBy: 'deck_proj_brain',
+        pairTaskId: 'task-fallback-999',
+        role: 'executor',
+        createdAt: Date.now(),
+      },
+    });
+
+    const resolved = await defaultActivePairTaskIdForSession('deck_sub_pair_created_fallback');
+    expect(resolved).toBe('task-fallback-999');
   });
 });

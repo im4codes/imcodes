@@ -1028,6 +1028,7 @@
     "identityPairTaskPlaceholder": "페어 작업 ID 입력 (예: tsk_123)",
     "identityPairLoadTask": "불러오기",
     "identityPairSwitchTask": "작업 전환",
+    "identityPairResetTask": "활성 작업으로 초기화",
     "identitySaveAfterCreate": "세션 생성 후 저장",
     "identityTooLargeScoped": "ID는 {{limit}}자(유니코드 코드 포인트) 이내의 유효한 텍스트여야 합니다.",
     "identityCreateSaveFailed": "세션은 시작되었지만 세션 ID를 저장하지 못했습니다.",

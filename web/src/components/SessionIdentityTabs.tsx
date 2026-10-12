@@ -53,6 +53,7 @@ export function SessionIdentityTabs({
   const [resolvedScopeKeys, setResolvedScopeKeys] = useState<Record<SessionSettingIdentityScope, string>>({
     user: '', project: '', pair: '', session: '',
   });
+  const [defaultPairTaskId, setDefaultPairTaskId] = useState('');
   const [manualPairTaskId, setManualPairTaskId] = useState('');
   const [showBrowser, setShowBrowser] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -99,7 +100,12 @@ export function SessionIdentityTabs({
       };
       for (const [scope, draft, resolvedKey] of entries) {
         nextDrafts[scope] = draft;
-        if (resolvedKey) nextKeys[scope] = resolvedKey;
+        if (resolvedKey) {
+          nextKeys[scope] = resolvedKey;
+          if (scope === SESSION_IDENTITY_SCOPES.PAIR) {
+            setDefaultPairTaskId(resolvedKey);
+          }
+        }
       }
       setDrafts(nextDrafts);
       setResolvedScopeKeys((prev) => ({ ...prev, ...nextKeys }));
@@ -247,6 +253,35 @@ export function SessionIdentityTabs({
               >
                 {t('session.identityPairLoadTask')}
               </button>
+              {defaultPairTaskId && (
+                <button
+                  type="button"
+                  class="btn btn-secondary btn-sm"
+                  style={{ fontSize: 10, padding: '1px 6px' }}
+                  disabled={disabled || saving}
+                  onClick={() => {
+                    setManualPairTaskId('');
+                    setDrafts((prev) => ({ ...prev, pair: { ...prev.pair, loaded: false } }));
+                    fetchSessionIdentityProfileDirectFirst(SESSION_IDENTITY_SCOPES.PAIR, defaultPairTaskId, accessContext, ws)
+                      .then((profile) => {
+                        setDrafts((prev) => ({
+                          ...prev,
+                          pair: {
+                            content: profile?.content ?? '', initial: profile?.content ?? '',
+                            revision: profile?.revision ?? 0, sourceFile: profile?.sourceFile ?? '', loaded: true,
+                          },
+                        }));
+                        setResolvedScopeKeys((prev) => ({ ...prev, pair: defaultPairTaskId }));
+                      })
+                      .catch((err) => {
+                        setError(err instanceof Error ? err.message : String(err));
+                        setDrafts((prev) => ({ ...prev, pair: { ...prev.pair, loaded: true } }));
+                      });
+                  }}
+                >
+                  {t('session.identityPairResetTask')}
+                </button>
+              )}
             </div>
           )}
         </div>

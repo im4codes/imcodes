@@ -1028,6 +1028,7 @@
     "identityPairTaskPlaceholder": "Enter task pair ID (e.g. tsk_123)",
     "identityPairLoadTask": "Load",
     "identityPairSwitchTask": "Switch Task",
+    "identityPairResetTask": "Reset to Active Task",
     "identitySaveAfterCreate": "Saved after the session is created",
     "identityTooLargeScoped": "Identity must be valid text within {{limit}} Unicode characters.",
     "identityCreateSaveFailed": "The session started, but its session identity could not be saved.",

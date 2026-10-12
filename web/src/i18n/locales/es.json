@@ -1028,6 +1028,7 @@
     "identityPairTaskPlaceholder": "Introduce el ID de la tarea en pareja",
     "identityPairLoadTask": "Cargar",
     "identityPairSwitchTask": "Cambiar tarea",
+    "identityPairResetTask": "Restablecer a tarea activa",
     "identitySaveAfterCreate": "Guardar tras crear la sesión",
     "identityTooLargeScoped": "La identidad debe ser texto válido de hasta {{limit}} caracteres Unicode.",
     "identityCreateSaveFailed": "La sesión comenzó, pero no se pudo guardar su identidad.",

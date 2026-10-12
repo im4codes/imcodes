@@ -156,4 +156,52 @@ describe('SessionIdentityTabs in shared sessions without pre-known projectKey', 
       expect((view.getByLabelText('session-identity-content') as HTMLTextAreaElement).value).toBe('Owner user prompt');
     });
   });
+
+  it('automatically shows active pair task and identity without requiring manual task input', async () => {
+    vi.mocked(fetchSessionIdentityProfile).mockImplementation(async (scope) => {
+      if (scope === 'pair') {
+        return {
+          scope: 'pair',
+          scopeKey: 'task-pair-auto-456',
+          content: '',
+          revision: 0,
+          updatedAt: 0,
+        } as never;
+      }
+      return null;
+    });
+
+    const view = render(h(SessionIdentityTabs, {
+      serverId: 'srv',
+      sessionName: 'deck_sub_pair_auto_456',
+    }));
+
+    // Switch to pair scope
+    fireEvent.click(view.getByText('session.identityScope_pair'));
+
+    // Should display the active task ID directly
+    await waitFor(() => {
+      expect(view.getByText('task-pair-auto-456')).toBeTruthy();
+      expect(view.getByText('session.identityPairTask:')).toBeTruthy();
+    });
+
+    // Manual input box should NOT be rendered when active task is resolved
+    expect(view.queryByLabelText('session-identity-pair-task-id')).toBeNull();
+
+    // Click Switch Task to go into manual mode
+    fireEvent.click(view.getByText('session.identityPairSwitchTask'));
+
+    // Now the manual input box and reset button should appear
+    expect(view.getByLabelText('session-identity-pair-task-id')).toBeTruthy();
+    expect(view.getByText('session.identityPairResetTask')).toBeTruthy();
+
+    // Click reset to active task
+    fireEvent.click(view.getByText('session.identityPairResetTask'));
+
+    // It should switch back to active task mode
+    await waitFor(() => {
+      expect(view.getByText('task-pair-auto-456')).toBeTruthy();
+      expect(view.queryByLabelText('session-identity-pair-task-id')).toBeNull();
+    });
+  });
 });

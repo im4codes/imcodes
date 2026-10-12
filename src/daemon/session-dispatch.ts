@@ -408,7 +408,8 @@ export async function dispatchSessionMessage(
       if (result !== 'sent' && result !== 'appended' && result !== 'queued') {
         // Unsupported providers and active-turn races retain the old durable
         // delivery guarantee. Prefer append, but never drop a peer message.
-        if (options.emergency) {
+        const shouldStop = options.emergency || deliveryMode === MEMORY_MCP_SEND_DELIVERY_MODES.APPEND;
+        if (shouldStop) {
           if (typeof (runtime as { clearPendingMessages?: (reason: string) => unknown }).clearPendingMessages === 'function') {
             (runtime as { clearPendingMessages: (reason: string) => unknown }).clearPendingMessages('user_stopped');
           } else {
@@ -424,7 +425,7 @@ export async function dispatchSessionMessage(
         }
         const fallback = runtime.send(message, options.messageId, undefined, undefined, {
           deliveryMode,
-          ...(options.emergency ? { queuePlacement: 'front' as const, emergency: true as const } : {}),
+          ...(shouldStop ? { queuePlacement: 'front' as const, emergency: true as const } : {}),
           ...(options.sharedActor ? { sharedActor: options.sharedActor } : {}),
           ...(options.sharedMachineAuthority ? { sharedMachineAuthority: options.sharedMachineAuthority } : {}),
           ...(options.suppressTimeline ? { timelineCommitted: true } : {}),
@@ -491,7 +492,9 @@ export async function dispatchSessionMessage(
   }
 
   const { sendProcessSessionMessageForAutomation } = await import('./command-handler.js');
-  if (options.emergency && target.state === 'running') {
+  const shouldAutoStopProcess = (options.emergency || deliveryMode === MEMORY_MCP_SEND_DELIVERY_MODES.APPEND)
+    && target.state === 'running';
+  if (shouldAutoStopProcess) {
     if (options.cancelSession) {
       await options.cancelSession(target);
     } else {

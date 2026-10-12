@@ -1028,6 +1028,7 @@
     "identityPairTaskPlaceholder": "ペアタスク ID を入力 (例: tsk_123)",
     "identityPairLoadTask": "読み込み",
     "identityPairSwitchTask": "タスク切替",
+    "identityPairResetTask": "アクティブタスクに戻す",
     "identitySaveAfterCreate": "セッション作成後に保存",
     "identityTooLargeScoped": "ID は有効なテキストで、{{limit}} Unicode 文字以内にしてください。",
     "identityCreateSaveFailed": "セッションは開始しましたが、ID を保存できませんでした。",

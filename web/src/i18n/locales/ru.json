@@ -1028,6 +1028,7 @@
     "identityPairTaskPlaceholder": "Введите ID парной задачи",
     "identityPairLoadTask": "Загрузить",
     "identityPairSwitchTask": "Сменить задачу",
+    "identityPairResetTask": "Сбросить на активную задачу",
     "identitySaveAfterCreate": "Сохранить после создания",
     "identityTooLargeScoped": "Идентификатор должен быть корректным текстом длиной не более {{limit}} символов Unicode.",
     "identityCreateSaveFailed": "Сеанс запущен, но его идентификатор не удалось сохранить.",

@@ -104,15 +104,39 @@ describe('session dispatch emergency mode', () => {
       expect(mocks.runtimeSend).toHaveBeenCalled();
     });
 
-    it('does NOT stop session when appendExternal returns unsupported but emergency is false/omitted', async () => {
+    it('stops active turn and places send at front when appendExternal returns unsupported on append deliveryMode', async () => {
       mocks.appendExternal.mockResolvedValue('unsupported');
+      mocks.runtimeSend.mockReturnValue('sent');
+      const cancelSessionMock = vi.fn().mockResolvedValue(true);
+
+      const target = transport();
+      const res = await dispatchSessionMessage(target, 'ordinary append message', {
+        messageId: 'send_message_emg3',
+        ...AGENT,
+        cancelSession: cancelSessionMock,
+      } as never);
+
+      expect(mocks.clearPendingMessages).toHaveBeenCalledWith('user_stopped');
+      expect(cancelSessionMock).toHaveBeenCalledWith(target);
+      expect(mocks.runtimeSend).toHaveBeenCalledWith(
+        'ordinary append message',
+        'send_message_emg3',
+        undefined,
+        undefined,
+        expect.objectContaining({ deliveryMode: 'append', queuePlacement: 'front', emergency: true }),
+      );
+      expect(res).toBe('sent');
+    });
+
+    it('does NOT stop session when deliveryMode is explicitly queue', async () => {
       mocks.runtimeSend.mockReturnValue('queued');
       const cancelSessionMock = vi.fn().mockResolvedValue(true);
 
       const target = transport();
-      const res = await dispatchSessionMessage(target, 'ordinary message', {
-        messageId: 'send_message_emg3',
+      const res = await dispatchSessionMessage(target, 'queued message', {
+        messageId: 'send_message_queue',
         ...AGENT,
+        deliveryMode: 'queue',
         cancelSession: cancelSessionMock,
       } as never);
 
@@ -198,13 +222,32 @@ describe('session dispatch emergency mode', () => {
       );
     });
 
-    it('does NOT stop running process session when emergency is false/omitted', async () => {
+    it('stops running process session when deliveryMode is append even when emergency is omitted', async () => {
       const cancelSessionMock = vi.fn().mockResolvedValue(true);
       const target = processAgent({ state: 'running' });
 
-      await dispatchSessionMessage(target, 'regular message', {
+      await dispatchSessionMessage(target, 'append message', {
         messageId: 'send_message_emg8',
         ...AGENT,
+        cancelSession: cancelSessionMock,
+      } as never);
+
+      expect(cancelSessionMock).toHaveBeenCalledWith(target);
+      expect(mocks.processSend).toHaveBeenCalledWith(
+        'deck_sub_emgproc',
+        'append message',
+        expect.anything(),
+      );
+    });
+
+    it('does NOT stop running process session when deliveryMode is explicitly queue', async () => {
+      const cancelSessionMock = vi.fn().mockResolvedValue(true);
+      const target = processAgent({ state: 'running' });
+
+      await dispatchSessionMessage(target, 'queued message', {
+        messageId: 'send_message_emg9',
+        ...AGENT,
+        deliveryMode: 'queue',
         cancelSession: cancelSessionMock,
       } as never);
 

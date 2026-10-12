@@ -527,11 +527,23 @@ export async function fetchSessionIdentityProfile(
   scopeKey: string,
   context?: SessionIdentityAccessContext,
 ): Promise<SessionIdentityProfile | null> {
-  const response = await apiFetch<{ profile: SessionIdentityProfile | null }>(
+  const response = await apiFetch<{ profile: SessionIdentityProfile | null; scopeKey?: string }>(
     sessionIdentityQuery(scope, scopeKey, context),
     { cache: 'no-store' },
   );
-  return response.profile;
+  if (response.profile) return response.profile;
+  if (response.scopeKey) {
+    return {
+      scope,
+      scopeKey: response.scopeKey,
+      content: '',
+      contentHash: '',
+      revision: 0,
+      updatedAt: 0,
+      source: 'web',
+    };
+  }
+  return null;
 }
 
 export async function saveSessionIdentityProfile(input: {

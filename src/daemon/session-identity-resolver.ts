@@ -71,7 +71,14 @@ export async function defaultActivePairTaskIdForSession(sessionName: string): Pr
       if (!role || pair.brain === sessionName) continue;
       candidates.push(pair.taskId);
     }
-    if (candidates.length === 0) return undefined;
+    if (candidates.length === 0) {
+      const { getSession } = await import('../store/session-store.js');
+      const session = getSession(sessionName);
+      if (session?.pairCreatedMetadata?.pairTaskId) {
+        return session.pairCreatedMetadata.pairTaskId;
+      }
+      return undefined;
+    }
     const focus = taskPairFocusOf(sessionName);
     if (focus && candidates.includes(focus)) return focus;
     return candidates[0];

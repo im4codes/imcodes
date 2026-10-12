@@ -167,8 +167,10 @@ export async function handleSessionIdentityGet<
     return daemon.response;
   }
   const body = daemon.body;
-  if (body.contentHash === undefined) return c.json({ profile: null });
-  const returnedScopeKey = typeof body.scopeKey === 'string' && body.scopeKey ? body.scopeKey : scopeKey;
+  const returnedScopeKey = typeof body.scopeKey === 'string' && body.scopeKey ? body.scopeKey : (scopeKey || undefined);
+  if (body.contentHash === undefined) {
+    return c.json({ profile: null, ...(returnedScopeKey ? { scopeKey: returnedScopeKey } : {}) });
+  }
   return c.json({
     profile: {
       scope, scopeKey: returnedScopeKey,

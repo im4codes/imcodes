@@ -1028,6 +1028,7 @@
     "identityPairTaskPlaceholder": "输入结对任务 ID (例如: tsk_123)",
     "identityPairLoadTask": "加载",
     "identityPairSwitchTask": "切换任务",
+    "identityPairResetTask": "恢复当前任务",
     "identitySaveAfterCreate": "创建会话后保存",
     "identityTooLargeScoped": "身份内容必须是有效文本，不超过 {{limit}} 个 Unicode 字符。",
     "identityCreateSaveFailed": "会话已启动，但会话身份保存失败。",
