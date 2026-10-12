@@ -1392,7 +1392,7 @@ async function auditSessionGroupClone(
     sourceMainSessionName: string;
     idempotencyKey?: string;
     targetProjectName?: string | null;
-    errorCode?: SessionGroupCloneErrorCode;
+    errorCode?: SessionGroupCloneErrorCode | 'daemon_offline';
     missingCapability?: string;
   },
 ): Promise<void> {

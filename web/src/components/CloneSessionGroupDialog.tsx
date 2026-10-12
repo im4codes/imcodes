@@ -222,8 +222,8 @@ export function CloneSessionGroupDialog({
   const [, setCapabilityRevision] = useState(0);
 
   useEffect(() => {
-    if (!ws?.onDaemonCapabilitiesChange) return;
-    return ws.onDaemonCapabilitiesChange(() => {
+    if (!ws?.onDaemonCapabilitySnapshot) return;
+    return ws.onDaemonCapabilitySnapshot(() => {
       setCapabilityRevision((rev) => rev + 1);
     });
   }, [ws]);
