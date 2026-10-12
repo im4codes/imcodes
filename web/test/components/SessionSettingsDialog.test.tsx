@@ -402,7 +402,7 @@ describe('SessionSettingsDialog supervision', () => {
     }), { serverId: 'srv-1', sessionName: 'deck_proj_brain' });
   });
 
-  it('edits synchronized user and project identities from the three-tab settings surface', async () => {
+  it('edits synchronized user and project identities from the four-tab settings surface', async () => {
     render(
       <SessionSettingsDialog
         surface="session"
@@ -420,7 +420,8 @@ describe('SessionSettingsDialog supervision', () => {
       />,
     );
 
-    expect(await screen.findAllByRole('tab')).toHaveLength(3);
+    expect(await screen.findAllByRole('tab')).toHaveLength(4);
+    expect(screen.getByRole('tab', { name: 'identityScope_pair' })).toBeDefined();
     fireEvent.click(screen.getByRole('tab', { name: 'identityScope_user' }));
     const userIdentity = screen.getByLabelText('session-identity-content') as HTMLTextAreaElement;
     await waitFor(() => expect(userIdentity.disabled).toBe(false));
