@@ -104,6 +104,7 @@ interface Props {
   modelDisplay?: string | null;
   providerId?: string | null;
   projectKey?: string;
+  pairTaskId?: string;
   /**
    * Ordinary sub-sessions already loaded by the App's HTTP session APIs and
    * enriched by live session sync. Settings must render this list directly;
@@ -784,6 +785,7 @@ export function SessionSettingsDialog({
   requestedModel,
   modelDisplay,
   projectKey,
+  pairTaskId,
   peerAuditSessions = [],
   onAddPoolSession,
   poolSessionDialogOpen = false,
@@ -2059,6 +2061,7 @@ export function SessionSettingsDialog({
             serverId={serverId}
             sessionName={sessionName}
             projectKey={projectKey}
+            pairTaskId={pairTaskId}
             ws={ws}
             disabled={saving}
           />

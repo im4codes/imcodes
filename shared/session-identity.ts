@@ -17,8 +17,9 @@ export const SESSION_IDENTITY_SCOPE_LIST = Object.freeze(
 export const SESSION_SETTING_IDENTITY_SCOPES = Object.freeze([
   SESSION_IDENTITY_SCOPES.USER,
   SESSION_IDENTITY_SCOPES.PROJECT,
+  SESSION_IDENTITY_SCOPES.PAIR,
   SESSION_IDENTITY_SCOPES.SESSION,
-]) as readonly ('user' | 'project' | 'session')[];
+]) as readonly ('user' | 'project' | 'pair' | 'session')[];
 
 export type SessionSettingIdentityScope = typeof SESSION_SETTING_IDENTITY_SCOPES[number];
 

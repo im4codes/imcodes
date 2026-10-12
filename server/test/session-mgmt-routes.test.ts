@@ -1399,6 +1399,30 @@ describe('session-mgmt persistence routes', () => {
     );
   });
 
+  it('relays pair identity get with sessionName when scopeKey is omitted', async () => {
+    mockResolveHttpShareAccessForCoveredSession.mockResolvedValue({
+      actor: { kind: 'share', effectiveActorRole: 'participant' },
+    });
+    sendSessionIdentityLocalRequestMock.mockResolvedValueOnce({
+      status: 'ok', scopeKey: 'tsk_pair_123', content: 'Pair identity prompt', contentHash: 'phash', revision: 1, updatedAt: 50,
+    });
+    const app = await buildApp();
+
+    const read = await app.request('/api/server/srv-1/sessions/deck_proj_brain/identity?scope=pair');
+    expect(read.status).toBe(200);
+    const body = await read.json() as { profile?: { scope: string; scopeKey: string; content: string } };
+    expect(body.profile).toEqual(expect.objectContaining({
+      scope: 'pair',
+      scopeKey: 'tsk_pair_123',
+      content: 'Pair identity prompt',
+    }));
+    expect(sendSessionIdentityLocalRequestMock).toHaveBeenLastCalledWith(
+      expect.stringContaining('identity-'),
+      { op: 'get', scope: 'pair', scopeKey: '', sessionName: 'deck_proj_brain' },
+      expect.any(Number),
+    );
+  });
+
   it('serves the machine owner\'s identity to a whole-server participant before any session exists', async () => {
     mockResolveHttpShareAccess.mockResolvedValue({
       membership: 'none',

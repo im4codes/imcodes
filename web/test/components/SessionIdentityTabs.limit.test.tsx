@@ -66,11 +66,12 @@ function displayed(container: HTMLElement): { count: number; limit: number } {
 /** Render the panel with `content` in `scope` (loaded profile for user/project, pending draft for session). */
 async function renderScope(scope: SessionIdentityScope, content: string) {
   vi.mocked(fetchSessionIdentityProfile).mockImplementation(async (requested) => (
-    requested === scope ? { scope, scopeKey: '', content, revision: 1, updatedAt: 0 } as never : null
+    requested === scope ? { scope, scopeKey: scope === 'pair' ? 'task-test' : '', content, revision: 1, updatedAt: 0 } as never : null
   ));
   const view = render(h(SessionIdentityTabs, {
     serverId: 'srv',
     projectKey: 'github.com/acme/repo',
+    pairTaskId: 'task-test',
     ...(scope === SESSION_IDENTITY_SCOPES.SESSION ? { pendingSessionIdentity: content } : {}),
   }));
   if (scope !== SESSION_IDENTITY_SCOPES.SESSION) {
@@ -90,7 +91,7 @@ describe('SessionIdentityTabs counts in the authoritative unit (NFC + trim code 
     ['content at the limit with surrounding whitespace', (limit) => padded(limit), 0, false],
     ['content one over the limit with surrounding whitespace', (limit) => padded(limit + 1), 1, true],
   ];
-  for (const scope of [SESSION_IDENTITY_SCOPES.USER, SESSION_IDENTITY_SCOPES.PROJECT, SESSION_IDENTITY_SCOPES.SESSION]) {
+  for (const scope of [SESSION_IDENTITY_SCOPES.USER, SESSION_IDENTITY_SCOPES.PROJECT, SESSION_IDENTITY_SCOPES.PAIR, SESSION_IDENTITY_SCOPES.SESSION]) {
     for (const [label, build, over, tooLarge] of cases) {
       it(`${scope}: ${label}`, async () => {
         const limit = sessionIdentityMaxChars(scope);
@@ -110,7 +111,7 @@ describe('SessionIdentityTabs counts in the authoritative unit (NFC + trim code 
 });
 
 describe('SessionIdentityTabs in shared sessions without pre-known projectKey', () => {
-  it('loads all 3 scopes and allows persistence for project scope via sessionName', async () => {
+  it('loads all 4 scopes and allows persistence for project scope via sessionName', async () => {
     vi.mocked(fetchSessionIdentityProfile).mockImplementation(async (scope) => {
       if (scope === 'project') {
         return { scope: 'project', scopeKey: 'canonical-proj-key', content: 'Shared project prompt', revision: 1, updatedAt: 1234 } as never;
@@ -127,9 +128,10 @@ describe('SessionIdentityTabs in shared sessions without pre-known projectKey', 
       // projectKey intentionally omitted
     }));
 
-    // Verify all 3 identity scopes are visible in UI
+    // Verify all 4 identity scopes are visible in UI
     expect(view.getByText('session.identityScope_user')).toBeTruthy();
     expect(view.getByText('session.identityScope_project')).toBeTruthy();
+    expect(view.getByText('session.identityScope_pair')).toBeTruthy();
     expect(view.getByText('session.identityScope_session')).toBeTruthy();
 
     // Switch to project scope

@@ -31,12 +31,25 @@ export async function handleSessionIdentityLocalRequest(cmd: Record<string, unkn
   const requestId = typeof cmd.requestId === 'string' ? cmd.requestId : undefined;
   const op = cmd.op;
   const scope = cmd.scope === 'project' || cmd.scope === 'session' || cmd.scope === 'pair' ? cmd.scope : undefined;
-  const scopeKey = typeof cmd.scopeKey === 'string' ? cmd.scopeKey : undefined;
+  let scopeKey = typeof cmd.scopeKey === 'string' && cmd.scopeKey.trim() ? cmd.scopeKey.trim() : undefined;
+  const sessionName = typeof cmd.sessionName === 'string' ? cmd.sessionName.trim() : undefined;
+  if (scope === 'pair' && !scopeKey && sessionName) {
+    const { defaultActivePairTaskIdForSession } = await import('./session-identity-resolver.js');
+    scopeKey = await defaultActivePairTaskIdForSession(sessionName);
+  }
   const reply = (payload: Record<string, unknown>) => {
     serverLink.send({ type: SESSION_IDENTITY_WS.LOCAL_RESPONSE, requestId, op, scope, scopeKey, ...payload });
   };
-  if (!requestId || !scope || !scopeKey) {
+  if (!requestId || !scope) {
     reply({ status: 'error', error: 'identity_local_request_invalid' });
+    return;
+  }
+  if (!scopeKey) {
+    if (op === 'get') {
+      reply({ status: 'ok' });
+    } else {
+      reply({ status: 'error', error: 'identity_local_request_invalid' });
+    }
     return;
   }
   try {

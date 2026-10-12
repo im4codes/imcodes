@@ -627,21 +627,21 @@ sessionMgmtRoutes.get('/:id/sessions/:name/identity', async (c) => {
   const resolved = await resolveSupervisorDefaultsOwner(c);
   if (!resolved.ok) return resolved.response;
   return handleSessionIdentityGet(c, resolved.ownerUserId,
-    canonicalSessionIdentityScopeKey(c.req.param('id')!, c.req.param('name')!), c.req.param('id')!, true);
+    canonicalSessionIdentityScopeKey(c.req.param('id')!, c.req.param('name')!), c.req.param('id')!, true, c.req.param('name')!);
 });
 
 sessionMgmtRoutes.put('/:id/sessions/:name/identity', async (c) => {
   const resolved = await resolveSupervisorDefaultsOwner(c);
   if (!resolved.ok) return resolved.response;
   return handleSessionIdentityPut(c, resolved.ownerUserId,
-    canonicalSessionIdentityScopeKey(c.req.param('id')!, c.req.param('name')!), c.req.param('id')!, true);
+    canonicalSessionIdentityScopeKey(c.req.param('id')!, c.req.param('name')!), c.req.param('id')!, true, c.req.param('name')!);
 });
 
 sessionMgmtRoutes.delete('/:id/sessions/:name/identity', async (c) => {
   const resolved = await resolveSupervisorDefaultsOwner(c);
   if (!resolved.ok) return resolved.response;
   return handleSessionIdentityDelete(c, resolved.ownerUserId,
-    canonicalSessionIdentityScopeKey(c.req.param('id')!, c.req.param('name')!), c.req.param('id')!, true);
+    canonicalSessionIdentityScopeKey(c.req.param('id')!, c.req.param('name')!), c.req.param('id')!, true, c.req.param('name')!);
 });
 
 /** PATCH /api/server/:id/sessions/:name — update session settings (label, description, cwd) */

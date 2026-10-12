@@ -93,7 +93,7 @@ async function callDaemonLocal<
 >(
   c: Context<IdentityHttpEnv<TVariables>, TPath, TInput>,
   serverId: string | undefined,
-  payload: { op: 'get' | 'set' | 'delete'; scope: 'project' | 'session' | 'pair'; scopeKey: string; content?: string; source?: 'web' | 'mcp'; sourceFile?: string },
+  payload: { op: 'get' | 'set' | 'delete'; scope: 'project' | 'session' | 'pair'; scopeKey: string; content?: string; source?: 'web' | 'mcp'; sourceFile?: string; sessionName?: string },
   sessionCoveredParticipant = false,
 ): Promise<{ ok: true; body: Record<string, unknown> } | { ok: false; response: Response }> {
   if (!serverId) {
@@ -138,29 +138,40 @@ export async function handleSessionIdentityGet<
   canonicalScopeKey?: SessionIdentityCanonicalScopeKey,
   serverId?: string,
   sessionCoveredParticipant = false,
+  sessionName?: string,
 ): Promise<Response> {
   const scope = readScope(c);
   if (!scope) return c.json({ error: 'identity_scope_invalid' }, 400);
-  const scopeKey = resolveScopeKey(scope, c.req.query('scopeKey'), canonicalScopeKey);
-  if (scopeKey === null) return c.json({ error: 'identity_scope_key_invalid' }, 400);
+  let scopeKey = resolveScopeKey(scope, c.req.query('scopeKey'), canonicalScopeKey);
+  if (scopeKey === null) {
+    if (scope === SESSION_IDENTITY_SCOPES.PAIR && (sessionCoveredParticipant || sessionName)) {
+      scopeKey = '';
+    } else {
+      return c.json({ error: 'identity_scope_key_invalid' }, 400);
+    }
+  }
   if (scope === SESSION_IDENTITY_SCOPES.USER) {
     const profile = await getSessionIdentityProfile(c.env.DB, ownerUserId, scope, scopeKey);
     return c.json({ profile });
   }
-  const daemon = await callDaemonLocal(c, serverId, { op: 'get', scope, scopeKey }, sessionCoveredParticipant);
+  const daemon = await callDaemonLocal(c, serverId, {
+    op: 'get', scope, scopeKey,
+    ...(scope === SESSION_IDENTITY_SCOPES.PAIR && sessionName ? { sessionName } : {}),
+  }, sessionCoveredParticipant);
   if (!daemon.ok) {
     // The daemon (the only content source for this scope) is unreachable --
     // fall back to the metadata row so the editor can at least show hash/
     // revision instead of an opaque failure, with no content.
-    const metadata = await getSessionIdentityMetadata(c.env.DB, ownerUserId, scope, scopeKey);
+    const metadata = scopeKey ? await getSessionIdentityMetadata(c.env.DB, ownerUserId, scope, scopeKey) : null;
     if (metadata) return c.json({ profile: metadata, contentUnavailable: true });
     return daemon.response;
   }
   const body = daemon.body;
   if (body.contentHash === undefined) return c.json({ profile: null });
+  const returnedScopeKey = typeof body.scopeKey === 'string' && body.scopeKey ? body.scopeKey : scopeKey;
   return c.json({
     profile: {
-      scope, scopeKey,
+      scope, scopeKey: returnedScopeKey,
       content: typeof body.content === 'string' ? body.content : '',
       contentHash: body.contentHash,
       revision: typeof body.revision === 'number' ? body.revision : 1,
@@ -180,13 +191,20 @@ export async function handleSessionIdentityPut<
   canonicalScopeKey?: SessionIdentityCanonicalScopeKey,
   serverId?: string,
   sessionCoveredParticipant = false,
+  sessionName?: string,
 ): Promise<Response> {
   const body = await c.req.json().catch(() => null) as Record<string, unknown> | null;
   if (!body) return c.json({ error: 'identity_request_invalid' }, 400);
   const scope = isSessionIdentityScope(body.scope) ? body.scope : null;
   if (!scope) return c.json({ error: 'identity_scope_invalid' }, 400);
-  const scopeKey = resolveScopeKey(scope, body.scopeKey, canonicalScopeKey);
-  if (scopeKey === null) return c.json({ error: 'identity_scope_key_invalid' }, 400);
+  let scopeKey = resolveScopeKey(scope, body.scopeKey, canonicalScopeKey);
+  if (scopeKey === null) {
+    if (scope === SESSION_IDENTITY_SCOPES.PAIR && (sessionCoveredParticipant || sessionName)) {
+      scopeKey = '';
+    } else {
+      return c.json({ error: 'identity_scope_key_invalid' }, 400);
+    }
+  }
   const contentReason = sessionIdentityContentError(body.content, scope);
   if (contentReason) return c.json({ error: contentReason }, 400);
   const content = normalizeSessionIdentityContent(String(body.content));
@@ -215,9 +233,13 @@ export async function handleSessionIdentityPut<
   }
   const daemon = await callDaemonLocal(c, serverId, {
     op: 'set', scope, scopeKey, content, source: 'web', sourceFile: sourceFile || undefined,
+    ...(scope === SESSION_IDENTITY_SCOPES.PAIR && sessionName ? { sessionName } : {}),
   }, sessionCoveredParticipant);
   if (!daemon.ok) return daemon.response;
   const daemonBody = daemon.body;
+  if (typeof daemonBody.scopeKey === 'string' && daemonBody.scopeKey) {
+    scopeKey = daemonBody.scopeKey;
+  }
   const contentHash = typeof daemonBody.contentHash === 'string' ? daemonBody.contentHash : createHash('sha256').update(content, 'utf8').digest('hex');
   const revision = typeof daemonBody.revision === 'number' ? daemonBody.revision : 1;
   const updatedAt = typeof daemonBody.updatedAt === 'number' ? daemonBody.updatedAt : Date.now();
@@ -251,18 +273,29 @@ export async function handleSessionIdentityDelete<
   canonicalScopeKey?: SessionIdentityCanonicalScopeKey,
   serverId?: string,
   sessionCoveredParticipant = false,
+  sessionName?: string,
 ): Promise<Response> {
   const scope = readScope(c);
   if (!scope) return c.json({ error: 'identity_scope_invalid' }, 400);
-  const scopeKey = resolveScopeKey(scope, c.req.query('scopeKey'), canonicalScopeKey);
-  if (scopeKey === null) return c.json({ error: 'identity_scope_key_invalid' }, 400);
+  let scopeKey = resolveScopeKey(scope, c.req.query('scopeKey'), canonicalScopeKey);
+  if (scopeKey === null) {
+    if (scope === SESSION_IDENTITY_SCOPES.PAIR && (sessionCoveredParticipant || sessionName)) {
+      scopeKey = '';
+    } else {
+      return c.json({ error: 'identity_scope_key_invalid' }, 400);
+    }
+  }
   if (scope === SESSION_IDENTITY_SCOPES.USER) {
     const result = await deleteSessionIdentityProfile(c.env.DB, ownerUserId, scope, scopeKey);
     if (result === 'deleted') void WsBridge.pushSessionIdentityUserDeleteToOnlineDaemonsForUser(ownerUserId).catch(() => {});
     return c.json({ deleted: result === 'deleted' });
   }
-  const daemon = await callDaemonLocal(c, serverId, { op: 'delete', scope, scopeKey }, sessionCoveredParticipant);
+  const daemon = await callDaemonLocal(c, serverId, {
+    op: 'delete', scope, scopeKey,
+    ...(scope === SESSION_IDENTITY_SCOPES.PAIR && sessionName ? { sessionName } : {}),
+  }, sessionCoveredParticipant);
   if (!daemon.ok) return daemon.response;
-  const deleted = await deleteSessionIdentityMetadata(c.env.DB, ownerUserId, scope, scopeKey);
+  const deletedScopeKey = typeof daemon.body.scopeKey === 'string' && daemon.body.scopeKey ? daemon.body.scopeKey : scopeKey;
+  const deleted = deletedScopeKey ? await deleteSessionIdentityMetadata(c.env.DB, ownerUserId, scope, deletedScopeKey) : false;
   return c.json({ deleted });
 }

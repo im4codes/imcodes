@@ -30,6 +30,7 @@ export function SessionIdentityTabs({
   serverId,
   sessionName,
   projectKey,
+  pairTaskId,
   ws,
   pendingSessionIdentity,
   onPendingSessionIdentityChange,
@@ -38,6 +39,7 @@ export function SessionIdentityTabs({
   serverId: string;
   sessionName?: string;
   projectKey?: string;
+  pairTaskId?: string;
   ws?: WsClient | null;
   pendingSessionIdentity?: string;
   onPendingSessionIdentityChange?: (content: string, sourceFile: string) => void;
@@ -46,21 +48,25 @@ export function SessionIdentityTabs({
   const { t } = useTranslation();
   const [activeScope, setActiveScope] = useState<SessionSettingIdentityScope>(SESSION_IDENTITY_SCOPES.SESSION);
   const [drafts, setDrafts] = useState<Record<SessionSettingIdentityScope, Draft>>({
-    user: emptyDraft(), project: emptyDraft(), session: emptyDraft(),
+    user: emptyDraft(), project: emptyDraft(), pair: emptyDraft(), session: emptyDraft(),
   });
   const [resolvedScopeKeys, setResolvedScopeKeys] = useState<Record<SessionSettingIdentityScope, string>>({
-    user: '', project: '', session: '',
+    user: '', project: '', pair: '', session: '',
   });
+  const [manualPairTaskId, setManualPairTaskId] = useState('');
   const [showBrowser, setShowBrowser] = useState(false);
   const [saving, setSaving] = useState(false);
   const [refreshPending, setRefreshPending] = useState(false);
   const [error, setError] = useState('');
 
+  const effectivePairTaskId = (pairTaskId?.trim() || manualPairTaskId.trim());
+
   const scopeKey = useMemo(() => ({
     user: '',
     project: projectKey?.trim() ?? '',
+    pair: effectivePairTaskId,
     session: sessionName ? sessionIdentitySessionKey(serverId, sessionName) : '',
-  }), [projectKey, serverId, sessionName]);
+  }), [effectivePairTaskId, projectKey, serverId, sessionName]);
   const accessContext = useMemo(() => (sessionName ? { serverId, sessionName } : { serverId }), [serverId, sessionName]);
 
   const effectiveScopeKey = (scope: SessionSettingIdentityScope) => resolvedScopeKeys[scope] || scopeKey[scope];
@@ -70,7 +76,8 @@ export function SessionIdentityTabs({
     void Promise.all(SESSION_SETTING_IDENTITY_SCOPES.map(async (scope) => {
       const key = scopeKey[scope];
       const shouldSkipFetch = (scope === SESSION_IDENTITY_SCOPES.SESSION && !sessionName)
-        || (scope === SESSION_IDENTITY_SCOPES.PROJECT && !key && !sessionName);
+        || (scope === SESSION_IDENTITY_SCOPES.PROJECT && !key && !sessionName)
+        || (scope === SESSION_IDENTITY_SCOPES.PAIR && !key && !sessionName);
       if (shouldSkipFetch) {
         return [scope, {
           content: scope === SESSION_IDENTITY_SCOPES.SESSION ? pendingSessionIdentity ?? '' : '',
@@ -85,10 +92,10 @@ export function SessionIdentityTabs({
     })).then((entries) => {
       if (!live) return;
       const nextDrafts: Record<SessionSettingIdentityScope, Draft> = {
-        user: emptyDraft(), project: emptyDraft(), session: emptyDraft(),
+        user: emptyDraft(), project: emptyDraft(), pair: emptyDraft(), session: emptyDraft(),
       };
       const nextKeys: Record<SessionSettingIdentityScope, string> = {
-        user: '', project: '', session: '',
+        user: '', project: '', pair: '', session: '',
       };
       for (const [scope, draft, resolvedKey] of entries) {
         nextDrafts[scope] = draft;
@@ -110,7 +117,8 @@ export function SessionIdentityTabs({
   const currentKey = effectiveScopeKey(activeScope);
   const canPersist = activeScope === SESSION_IDENTITY_SCOPES.USER
     || Boolean(currentKey)
-    || (activeScope === SESSION_IDENTITY_SCOPES.PROJECT && Boolean(sessionName));
+    || (activeScope === SESSION_IDENTITY_SCOPES.PROJECT && Boolean(sessionName))
+    || (activeScope === SESSION_IDENTITY_SCOPES.PAIR && Boolean(sessionName || currentKey));
 
   const updateDraft = (next: Partial<Draft>) => {
     setDrafts((current) => ({ ...current, [activeScope]: { ...current[activeScope], ...next } }));
@@ -180,6 +188,69 @@ export function SessionIdentityTabs({
         ))}
       </div>
       <div class="session-settings-help">{t(`session.identityHelp_${activeScope}`)}</div>
+      {activeScope === SESSION_IDENTITY_SCOPES.PAIR && (
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, margin: '8px 0', flexWrap: 'wrap', fontSize: 12 }}>
+          {currentKey ? (
+            <>
+              <span class="session-settings-muted">{t('session.identityPairTask')}:</span>
+              <span style={{ fontFamily: 'monospace', fontWeight: 600, color: 'var(--chrome-accent, #38bdf8)' }}>{currentKey}</span>
+              {!pairTaskId && (
+                <button
+                  type="button"
+                  class="btn btn-secondary btn-sm"
+                  style={{ fontSize: 10, padding: '1px 6px' }}
+                  onClick={() => {
+                    setManualPairTaskId('');
+                    setResolvedScopeKeys((prev) => ({ ...prev, pair: '' }));
+                    updateDraft({ content: '', initial: '', revision: 0, loaded: true });
+                  }}
+                >
+                  {t('session.identityPairSwitchTask')}
+                </button>
+              )}
+            </>
+          ) : (
+            <div style={{ display: 'flex', alignItems: 'center', gap: 6, width: '100%' }}>
+              <input
+                class="input"
+                aria-label="session-identity-pair-task-id"
+                value={manualPairTaskId}
+                onInput={(e) => setManualPairTaskId((e.target as HTMLInputElement).value)}
+                placeholder={t('session.identityPairTaskPlaceholder')}
+                style={{ flex: 1, maxWidth: 280, fontSize: 12 }}
+                disabled={disabled || saving}
+              />
+              <button
+                type="button"
+                class="btn btn-secondary btn-sm"
+                disabled={disabled || saving || !manualPairTaskId.trim()}
+                onClick={() => {
+                  const tid = manualPairTaskId.trim();
+                  if (!tid) return;
+                  setDrafts((prev) => ({ ...prev, pair: { ...prev.pair, loaded: false } }));
+                  fetchSessionIdentityProfileDirectFirst(SESSION_IDENTITY_SCOPES.PAIR, tid, accessContext, ws)
+                    .then((profile) => {
+                      setDrafts((prev) => ({
+                        ...prev,
+                        pair: {
+                          content: profile?.content ?? '', initial: profile?.content ?? '',
+                          revision: profile?.revision ?? 0, sourceFile: profile?.sourceFile ?? '', loaded: true,
+                        },
+                      }));
+                      setResolvedScopeKeys((prev) => ({ ...prev, pair: tid }));
+                    })
+                    .catch((err) => {
+                      setError(err instanceof Error ? err.message : String(err));
+                      setDrafts((prev) => ({ ...prev, pair: { ...prev.pair, loaded: true } }));
+                    });
+                }}
+              >
+                {t('session.identityPairLoadTask')}
+              </button>
+            </div>
+          )}
+        </div>
+      )}
       <textarea
         class="input"
         aria-label="session-identity-content"
