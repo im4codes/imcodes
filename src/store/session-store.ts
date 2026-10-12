@@ -1466,11 +1466,28 @@ export function upsertSession(record: SessionRecord): void {
   scheduleWrite();
 }
 
+export type SessionRemoveListener = (sessionName: string) => void;
+const sessionRemoveListeners = new Set<SessionRemoveListener>();
+
+export function onSessionRemoved(listener: SessionRemoveListener): () => void {
+  sessionRemoveListeners.add(listener);
+  return () => {
+    sessionRemoveListeners.delete(listener);
+  };
+}
+
 export function removeSession(name: string): void {
   delete store.sessions[name];
   sessionValuesCache = null;
   markDirty(name);
   scheduleWrite();
+  for (const listener of sessionRemoveListeners) {
+    try {
+      listener(name);
+    } catch (err) {
+      logger.warn({ err, sessionName: name }, 'Session remove listener threw');
+    }
+  }
 }
 
 export function listSessions(projectName?: string): SessionRecord[] {

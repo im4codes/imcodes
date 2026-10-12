@@ -1,7 +1,11 @@
 import { createHash } from 'node:crypto';
-import { mkdir, open, rename, stat, writeFile } from 'node:fs/promises';
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
+import { createRequire } from 'node:module';
 import { resolveImcodesHome } from '../util/windows-daemon-lock.js';
+import { assertNotRealImcodesPathInTests } from '../util/test-home-guard.js';
+import { suppressSqliteExperimentalWarning } from '../util/suppress-sqlite-warning.js';
+import logger from '../util/logger.js';
 import {
   normalizeSessionIdentityContent,
   sessionIdentityContentError,
@@ -11,6 +15,11 @@ import {
 } from '../../shared/session-identity.js';
 import { SESSION_IDENTITY_WS } from '../../shared/session-identity-ws.js';
 import { registerMemoryProbe } from './memory-probes.js';
+
+const require = createRequire(import.meta.url);
+suppressSqliteExperimentalWarning();
+const { DatabaseSync } = require('node:sqlite') as typeof import('node:sqlite');
+type DatabaseSyncInstance = InstanceType<typeof DatabaseSync>;
 
 /**
  * Set once at daemon startup (lifecycle.ts, where the server WS connection
@@ -37,6 +46,7 @@ function report(payload: Record<string, unknown>): void {
 
 const STORE_VERSION = 1;
 const STORE_FILE = 'session-identities.json';
+const DB_FILE = 'session-identities.sqlite';
 
 interface DiskProfile extends Omit<SessionIdentityProfile, 'content'> {
   content: string;
@@ -53,8 +63,14 @@ function key(scope: SessionIdentityScope, scopeKey: string): string {
   return `${scope}\0${scopeKey}`;
 }
 
-function storePath(): string {
+export function localSessionIdentityStorePath(): string {
   return join(resolveImcodesHome(), STORE_FILE);
+}
+
+export function localSessionIdentityDbPath(): string {
+  const envPath = process.env.IMCODES_SESSION_IDENTITIES_DB_PATH?.trim();
+  if (envPath) return envPath;
+  return join(resolveImcodesHome(), DB_FILE);
 }
 
 function contentHash(content: string): string {
@@ -65,24 +81,6 @@ function emptyStore(): DiskStore {
   return { version: STORE_VERSION, profiles: {} };
 }
 
-function normalizeParsedStore(parsed: Partial<DiskStore>): DiskStore {
-  if (parsed.version !== STORE_VERSION || !parsed.profiles || typeof parsed.profiles !== 'object') return emptyStore();
-  return {
-    version: STORE_VERSION,
-    profiles: parsed.profiles as Record<string, DiskProfile>,
-    ...(typeof parsed.migratedAt === 'number' ? { migratedAt: parsed.migratedAt } : {}),
-  };
-}
-
-/**
- * The file is the whole repository: 33.5 MB on 158 (184 sessions, prompts of 250-550 KB), and every list/get used to read and parse
- * all of it. `fs.promises.readFile(path, 'utf8')` of a big file decodes it in 512 KB chunks into one growing string, so N concurrent
- * readers hold N half-built copies at once: 20 readers of that file peak at 2 GB of heap, ~200 of them (one per session: a server
- * `get`, an MCP call, a launch each) exhausted the 8 GB heap, in a few seconds, in `StringDecoder::DecodeData`
- * (158, 2026-10-08, four guard restarts). Readers now share ONE in-flight read and then the parsed store, as long as the file is
- * unchanged (identity: inode, size, mtime, taken from the very handle the bytes came from); the bytes are read into one flat
- * buffer and decoded once.
- */
 interface StoreSnapshot {
   signature: string;
   bytes: number;
@@ -101,57 +99,346 @@ registerMemoryProbe('identityStore', () => ({
   cachedBytes: cachedSnapshot?.bytes ?? 0,
 }));
 
-function fileSignature(info: { ino: number; size: number; mtimeMs: number }): string {
-  return `${storePath()}:${info.ino}:${info.size}:${info.mtimeMs}`;
+let activeDb: DatabaseSyncInstance | null = null;
+let activeDbPath: string | null = null;
+let lastExportedJsonMtime = 0;
+
+function currentJsonSignature(): string {
+  const jsonPath = localSessionIdentityStorePath();
+  if (!existsSync(jsonPath)) return '0:0:0';
+  try {
+    const st = statSync(jsonPath);
+    return `${st.ino}:${st.size}:${st.mtimeMs}`;
+  } catch {
+    return '0:0:0';
+  }
 }
 
-/** Read and parse the file once. Resolves null when the file does not exist; rejects on any other read error. */
-async function loadSnapshot(): Promise<StoreSnapshot | null> {
-  let handle;
-  try {
-    handle = await open(storePath(), 'r');
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
-    throw error;
+function migrateLegacyJson(db: DatabaseSyncInstance): void {
+  const check = db.prepare(`SELECT value FROM session_identity_meta WHERE key = 'legacy_json_migrated'`).get() as { value: string } | undefined;
+  if (check?.value === '1') return;
+
+  const jsonPath = localSessionIdentityStorePath();
+  if (!existsSync(jsonPath)) {
+    db.prepare(`INSERT OR REPLACE INTO session_identity_meta (key, value) VALUES ('legacy_json_migrated', '1')`).run();
+    return;
   }
+
   try {
-    const info = await handle.stat();
-    // No encoding: one Buffer of the file's size, decoded in one call (an encoding makes the runtime build the string chunk by chunk).
-    const bytes = await handle.readFile();
-    readStats.loads += 1;
-    const text = bytes.toString('utf8');
-    let store: DiskStore;
+    const raw = readFileSync(jsonPath, 'utf8');
+    let parsed: Partial<DiskStore>;
     try {
-      store = normalizeParsedStore(JSON.parse(text) as Partial<DiskStore>);
+      parsed = JSON.parse(raw);
     } catch {
-      // A file that is not JSON holds nothing usable; the next write replaces it.
-      store = emptyStore();
+      db.prepare(`INSERT OR REPLACE INTO session_identity_meta (key, value) VALUES ('legacy_json_migrated', '1')`).run();
+      return;
     }
-    return { signature: fileSignature(info), bytes: bytes.length, store };
-  } finally {
-    await handle.close().catch(() => undefined);
+
+    if (parsed && typeof parsed === 'object' && parsed.profiles && typeof parsed.profiles === 'object') {
+      const insert = db.prepare(`
+        INSERT OR REPLACE INTO session_identity_profiles
+          (scope, scope_key, content, content_hash, revision, updated_at, source, source_file)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `);
+      db.exec('BEGIN IMMEDIATE');
+      try {
+        for (const profile of Object.values(parsed.profiles)) {
+          if (!profile || typeof profile !== 'object') continue;
+          insert.run(
+            profile.scope,
+            profile.scopeKey,
+            profile.content,
+            profile.contentHash,
+            profile.revision,
+            profile.updatedAt,
+            profile.source,
+            profile.sourceFile ?? null,
+          );
+        }
+        if (typeof parsed.migratedAt === 'number') {
+          db.prepare(`INSERT OR REPLACE INTO session_identity_meta (key, value) VALUES ('migrated_at', ?)`).run(String(parsed.migratedAt));
+        }
+        db.prepare(`INSERT OR REPLACE INTO session_identity_meta (key, value) VALUES ('legacy_json_migrated', '1')`).run();
+        db.exec('COMMIT');
+        try {
+          lastExportedJsonMtime = statSync(jsonPath).mtimeMs;
+        } catch {
+          lastExportedJsonMtime = Date.now();
+        }
+        logger.info({ profiles: Object.keys(parsed.profiles).length }, 'Migrated session-identities.json to SQLite');
+      } catch (err) {
+        db.exec('ROLLBACK');
+        throw err;
+      }
+    } else {
+      db.prepare(`INSERT OR REPLACE INTO session_identity_meta (key, value) VALUES ('legacy_json_migrated', '1')`).run();
+    }
+  } catch (err) {
+    logger.warn({ err, jsonPath }, 'Could not read legacy session-identities.json for migration');
   }
 }
 
-/** The store as of the file's current content. Shared and read-only: never mutate what this returns (mutators use readStoreForUpdate). */
-async function readSnapshot(): Promise<StoreSnapshot | null> {
-  let signature: string | undefined;
+function syncExternalJsonChangesIfAny(db: DatabaseSyncInstance): void {
+  const jsonPath = localSessionIdentityStorePath();
+  if (!existsSync(jsonPath)) return;
+  let st;
   try {
-    signature = fileSignature(await stat(storePath()));
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') { cachedSnapshot = null; return null; }
-    throw error;
+    st = statSync(jsonPath);
+  } catch {
+    return;
   }
+  if (Math.abs(st.mtimeMs - lastExportedJsonMtime) < 1) return;
+
+  let raw: string;
+  try {
+    raw = readFileSync(jsonPath, 'utf8');
+  } catch (err) {
+    throw err;
+  }
+
+  let parsed: Partial<DiskStore>;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    // A file that is not JSON reads as empty and is replaced by the next write
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      db.exec('DELETE FROM session_identity_profiles');
+      db.exec('COMMIT');
+      lastExportedJsonMtime = st.mtimeMs;
+    } catch {
+      db.exec('ROLLBACK');
+    }
+    return;
+  }
+
+  if (parsed && typeof parsed === 'object' && parsed.profiles && typeof parsed.profiles === 'object') {
+    const insert = db.prepare(`
+      INSERT OR REPLACE INTO session_identity_profiles
+        (scope, scope_key, content, content_hash, revision, updated_at, source, source_file)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      db.exec('DELETE FROM session_identity_profiles');
+      for (const profile of Object.values(parsed.profiles)) {
+        if (!profile || typeof profile !== 'object') continue;
+        insert.run(
+          profile.scope,
+          profile.scopeKey,
+          profile.content,
+          profile.contentHash,
+          profile.revision,
+          profile.updatedAt,
+          profile.source,
+          profile.sourceFile ?? null,
+        );
+      }
+      if (typeof parsed.migratedAt === 'number') {
+        db.prepare(`INSERT OR REPLACE INTO session_identity_meta (key, value) VALUES ('migrated_at', ?)`).run(String(parsed.migratedAt));
+      } else {
+        db.prepare(`DELETE FROM session_identity_meta WHERE key = 'migrated_at'`).run();
+      }
+      db.exec('COMMIT');
+      lastExportedJsonMtime = st.mtimeMs;
+    } catch (err) {
+      db.exec('ROLLBACK');
+      throw err;
+    }
+  }
+}
+
+function exportCompatJsonSync(db: DatabaseSyncInstance): void {
+  const jsonPath = localSessionIdentityStorePath();
+  assertNotRealImcodesPathInTests(jsonPath, STORE_FILE);
+  mkdirSync(dirname(jsonPath), { recursive: true });
+
+  const rows = db.prepare(`
+    SELECT scope, scope_key, content, content_hash, revision, updated_at, source, source_file
+    FROM session_identity_profiles
+    ORDER BY rowid ASC
+  `).all() as Array<{
+    scope: SessionIdentityScope;
+    scope_key: string;
+    content: string;
+    content_hash: string;
+    revision: number;
+    updated_at: number;
+    source: 'web' | 'mcp';
+    source_file: string | null;
+  }>;
+
+  const profiles: Record<string, DiskProfile> = {};
+  for (const row of rows) {
+    profiles[key(row.scope, row.scope_key)] = {
+      scope: row.scope,
+      scopeKey: row.scope_key,
+      content: row.content,
+      contentHash: row.content_hash,
+      revision: row.revision,
+      updatedAt: row.updated_at,
+      source: row.source,
+      ...(row.source_file ? { sourceFile: row.source_file } : {}),
+    };
+  }
+
+  const metaRow = db.prepare(`SELECT value FROM session_identity_meta WHERE key = 'migrated_at'`).get() as { value: string } | undefined;
+  const migratedAt = metaRow ? Number(metaRow.value) : undefined;
+
+  const store: DiskStore = {
+    version: STORE_VERSION,
+    profiles,
+    ...(typeof migratedAt === 'number' && Number.isFinite(migratedAt) ? { migratedAt } : {}),
+  };
+
+  const temporary = `${jsonPath}.${process.pid}.${Date.now()}.tmp`;
+  writeFileSync(temporary, `${JSON.stringify(store)}\n`, { mode: 0o600 });
+  renameSync(temporary, jsonPath);
+
+  try {
+    lastExportedJsonMtime = statSync(jsonPath).mtimeMs;
+  } catch {
+    lastExportedJsonMtime = Date.now();
+  }
+}
+
+function getDb(): DatabaseSyncInstance {
+  const dbPath = localSessionIdentityDbPath();
+  if (activeDb && activeDbPath === dbPath) {
+    if (!existsSync(dbPath)) {
+      try { activeDb.close(); } catch { /* ignore */ }
+      activeDb = null;
+    } else {
+      syncExternalJsonChangesIfAny(activeDb);
+      return activeDb;
+    }
+  }
+
+  if (activeDb) {
+    try { activeDb.close(); } catch { /* ignore */ }
+    activeDb = null;
+  }
+
+  assertNotRealImcodesPathInTests(dbPath, DB_FILE);
+  if (dbPath !== ':memory:') {
+    mkdirSync(dirname(dbPath), { recursive: true });
+  }
+
+  const db = new DatabaseSync(dbPath);
+  db.exec(`
+    PRAGMA journal_mode = WAL;
+    PRAGMA busy_timeout = 5000;
+
+    CREATE TABLE IF NOT EXISTS session_identity_meta (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS session_identity_profiles (
+      scope TEXT NOT NULL,
+      scope_key TEXT NOT NULL,
+      content TEXT NOT NULL,
+      content_hash TEXT NOT NULL,
+      revision INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      source TEXT NOT NULL,
+      source_file TEXT,
+      PRIMARY KEY (scope, scope_key)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_session_identity_scope
+      ON session_identity_profiles(scope);
+  `);
+
+  activeDb = db;
+  activeDbPath = dbPath;
+
+  migrateLegacyJson(db);
+  syncExternalJsonChangesIfAny(db);
+
+  return db;
+}
+
+function fileSignature(): string {
+  const dbPath = localSessionIdentityDbPath();
+  return `${dbPath}:${currentJsonSignature()}`;
+}
+
+async function loadSnapshot(): Promise<StoreSnapshot | null> {
+  const jsonPath = localSessionIdentityStorePath();
+  if (existsSync(jsonPath)) {
+    try {
+      const fd = openSync(jsonPath, 'r');
+      closeSync(fd);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+        // file absent
+      } else {
+        throw error;
+      }
+    }
+  }
+
+  const db = getDb();
+  readStats.loads += 1;
+
+  const rows = db.prepare(`
+    SELECT scope, scope_key, content, content_hash, revision, updated_at, source, source_file
+    FROM session_identity_profiles
+    ORDER BY rowid ASC
+  `).all() as Array<{
+    scope: SessionIdentityScope;
+    scope_key: string;
+    content: string;
+    content_hash: string;
+    revision: number;
+    updated_at: number;
+    source: 'web' | 'mcp';
+    source_file: string | null;
+  }>;
+
+  const profiles: Record<string, DiskProfile> = {};
+  for (const row of rows) {
+    profiles[key(row.scope, row.scope_key)] = {
+      scope: row.scope,
+      scopeKey: row.scope_key,
+      content: row.content,
+      contentHash: row.content_hash,
+      revision: row.revision,
+      updatedAt: row.updated_at,
+      source: row.source,
+      ...(row.source_file ? { sourceFile: row.source_file } : {}),
+    };
+  }
+
+  const metaRow = db.prepare(`SELECT value FROM session_identity_meta WHERE key = 'migrated_at'`).get() as { value: string } | undefined;
+  const migratedAt = metaRow ? Number(metaRow.value) : undefined;
+
+  const store: DiskStore = {
+    version: STORE_VERSION,
+    profiles,
+    ...(typeof migratedAt === 'number' && Number.isFinite(migratedAt) ? { migratedAt } : {}),
+  };
+
+  return {
+    signature: fileSignature(),
+    bytes: Object.keys(profiles).length * 1024,
+    store,
+  };
+}
+
+async function readSnapshot(): Promise<StoreSnapshot | null> {
+  const signature = fileSignature();
   if (cachedSnapshot && cachedSnapshot.signature === signature) {
     readStats.cacheHits += 1;
     return cachedSnapshot;
   }
-  // Only a read of THIS version of the file is shared: a read that started before a write finished must not answer the next
-  // read-modify-write, or that write's change would be lost.
+
   if (inFlightLoad && inFlightLoad.signature === signature) {
     readStats.sharedLoads += 1;
     return inFlightLoad.promise;
   }
+
   readStats.inFlightLoads += 1;
   const entry = {
     signature,
@@ -169,7 +456,6 @@ async function readSnapshot(): Promise<StoreSnapshot | null> {
   }
 }
 
-/** Read-only view for list/get. An unreadable store reads as empty, as it always did. */
 async function readStore(): Promise<DiskStore> {
   try {
     return (await readSnapshot())?.store ?? emptyStore();
@@ -178,52 +464,29 @@ async function readStore(): Promise<DiskStore> {
   }
 }
 
-/**
- * The store for a read-modify-write: a private copy of the profile map (the profiles themselves are replaced, never edited, so the
- * copy is cheap and the shared snapshot stays untouched when the write fails). A store that cannot be READ (I/O error) rejects the
- * mutation instead of reading as empty: writing back "empty + one change" over a store that merely failed to open would wipe it.
- */
 async function readStoreForUpdate(): Promise<DiskStore> {
-  const store = (await readSnapshot())?.store ?? emptyStore();
+  const snapshot = await readSnapshot();
+  const store = snapshot?.store ?? emptyStore();
   return { ...store, profiles: { ...store.profiles } };
 }
 
-/** Whether the one-time server->daemon content migration has already run here. */
 export async function isSessionIdentityMigrated(): Promise<boolean> {
-  return typeof (await readStore()).migratedAt === 'number';
+  const db = getDb();
+  const row = db.prepare(`SELECT value FROM session_identity_meta WHERE key = 'migrated_at'`).get() as { value: string } | undefined;
+  return row !== undefined && Number.isFinite(Number(row.value));
 }
 
 export async function markSessionIdentityMigrated(now = Date.now()): Promise<void> {
   return enqueueMutation(async () => {
-    const store = await readStoreForUpdate();
-    if (typeof store.migratedAt === 'number') return;
-    store.migratedAt = now;
-    await writeStore(store);
+    const db = getDb();
+    db.prepare(`
+      INSERT OR REPLACE INTO session_identity_meta (key, value) VALUES ('migrated_at', ?)
+    `).run(String(now));
+    exportCompatJsonSync(db);
+    cachedSnapshot = null;
   });
 }
 
-async function writeStore(store: DiskStore): Promise<void> {
-  const target = storePath();
-  const temporary = `${target}.${process.pid}.${Date.now()}.tmp`;
-  await mkdir(dirname(target), { recursive: true });
-  await writeFile(temporary, `${JSON.stringify(store)}\n`, { mode: 0o600 });
-  await rename(temporary, target);
-  // The next reader compares the file's signature with the cached one: the rename changed it, so it loads the new content once.
-  cachedSnapshot = null;
-}
-
-/**
- * Every mutator below does readStore() -> mutate -> writeStore(): a
- * read-modify-write on the whole shared file. Without serialization, two
- * concurrent mutations for DIFFERENT scope/scopeKey keys (an MCP write
- * racing a browser-triggered LOCAL_REQUEST, or two agent sessions on the
- * same daemon writing PROJECT vs SESSION scope) can interleave so the
- * second call's writeStore() overwrites the file with a snapshot that never
- * saw the first call's change -- silently discarding it. Queuing every
- * mutation's full read+mutate+write body here (mirroring session-store.ts's
- * writeQueue) makes them serialize regardless of which key they touch.
- * Reads stay outside the queue; eventual consistency for reads is fine.
- */
 let mutationQueue: Promise<unknown> = Promise.resolve();
 
 function enqueueMutation<T>(fn: () => Promise<T>): Promise<T> {
@@ -241,11 +504,6 @@ export interface LocalIdentityWrite {
   sourceFile?: string;
 }
 
-/**
- * The daemon-local identity repository. The file is deliberately kept below
- * resolveImcodesHome(), so scoped daemons never read or write the default
- * user's home. Writes use a same-directory rename for crash-safe recovery.
- */
 export async function listLocalSessionIdentityProfiles(): Promise<SessionIdentityProfile[]> {
   const store = await readStore();
   return Object.values(store.profiles).map((profile) => ({ ...profile }));
@@ -264,23 +522,46 @@ export async function putLocalSessionIdentityProfile(input: LocalIdentityWrite):
   const content = normalizeSessionIdentityContent(input.content);
   const error = sessionIdentityContentError(content, input.scope);
   if (error) throw new Error(error);
+
   const profile = await enqueueMutation(async () => {
     const store = await readStoreForUpdate();
     const previous = store.profiles[key(input.scope, input.scopeKey)];
+    const revision = Math.max(previous?.revision ?? 0, input.revision ?? 0) + 1;
+    const hash = contentHash(content);
+    const now = Date.now();
+
+    const db = getDb();
+    db.prepare(`
+      INSERT OR REPLACE INTO session_identity_profiles
+        (scope, scope_key, content, content_hash, revision, updated_at, source, source_file)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      input.scope,
+      input.scopeKey,
+      content,
+      hash,
+      revision,
+      now,
+      input.source,
+      input.sourceFile ?? null,
+    );
+
+    exportCompatJsonSync(db);
+    cachedSnapshot = null;
+
     const next: DiskProfile = {
       scope: input.scope,
       scopeKey: input.scopeKey,
       content,
-      contentHash: contentHash(content),
-      revision: Math.max(previous?.revision ?? 0, input.revision ?? 0) + 1,
-      updatedAt: Date.now(),
+      contentHash: hash,
+      revision,
+      updatedAt: now,
       source: input.source,
       ...(input.sourceFile ? { sourceFile: input.sourceFile } : {}),
     };
-    store.profiles[key(input.scope, input.scopeKey)] = next;
-    await writeStore(store);
     return next;
   });
+
   if (profile.scope === 'user') {
     report({
       type: SESSION_IDENTITY_WS.USER_REPORT, content: profile.content,
@@ -297,12 +578,6 @@ export async function putLocalSessionIdentityProfile(input: LocalIdentityWrite):
   return { ...profile };
 }
 
-/**
- * Apply content the SERVER already considers authoritative (a USER-scope
- * PUSH, or a migration pull's own rows) -- stores the exact revision/
- * updatedAt given rather than bumping a local counter, and never reports
- * back (reporting the server's own data back to it would loop).
- */
 export async function putLocalSessionIdentityProfileExact(input: {
   scope: SessionIdentityScope;
   scopeKey: string;
@@ -315,8 +590,26 @@ export async function putLocalSessionIdentityProfileExact(input: {
 }): Promise<SessionIdentityProfile> {
   const content = normalizeSessionIdentityContent(input.content);
   return enqueueMutation(async () => {
-    const store = await readStoreForUpdate();
-    const profile: DiskProfile = {
+    const db = getDb();
+    db.prepare(`
+      INSERT OR REPLACE INTO session_identity_profiles
+        (scope, scope_key, content, content_hash, revision, updated_at, source, source_file)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      input.scope,
+      input.scopeKey,
+      content,
+      input.contentHash,
+      input.revision,
+      input.updatedAt,
+      input.source,
+      input.sourceFile ?? null,
+    );
+
+    exportCompatJsonSync(db);
+    cachedSnapshot = null;
+
+    return {
       scope: input.scope,
       scopeKey: input.scopeKey,
       content,
@@ -326,21 +619,23 @@ export async function putLocalSessionIdentityProfileExact(input: {
       source: input.source,
       ...(input.sourceFile ? { sourceFile: input.sourceFile } : {}),
     };
-    store.profiles[key(input.scope, input.scopeKey)] = profile;
-    await writeStore(store);
-    return { ...profile };
   });
 }
 
-/** Removes without reporting -- used to apply a server-initiated USER-scope delete push. */
 export async function removeLocalSessionIdentityProfileQuiet(
   scope: SessionIdentityScope,
   scopeKey: string,
 ): Promise<boolean> {
   return enqueueMutation(async () => {
-    const store = await readStoreForUpdate();
-    const existed = delete store.profiles[key(scope, scopeKey)];
-    if (existed) await writeStore(store);
+    const db = getDb();
+    const result = db.prepare(`
+      DELETE FROM session_identity_profiles WHERE scope = ? AND scope_key = ?
+    `).run(scope, scopeKey);
+    const existed = Number(result.changes) > 0;
+    if (existed) {
+      exportCompatJsonSync(db);
+      cachedSnapshot = null;
+    }
     return existed;
   });
 }
@@ -349,18 +644,37 @@ export async function removeLocalSessionIdentityProfile(
   scope: SessionIdentityScope,
   scopeKey: string,
 ): Promise<boolean> {
-  const existed = await enqueueMutation(async () => {
-    const store = await readStoreForUpdate();
-    const found = delete store.profiles[key(scope, scopeKey)];
-    if (found) await writeStore(store);
-    return found;
-  });
+  const existed = await removeLocalSessionIdentityProfileQuiet(scope, scopeKey);
   if (existed) {
     report(scope === 'user'
       ? { type: SESSION_IDENTITY_WS.USER_REPORT, deleted: true }
       : { type: SESSION_IDENTITY_WS.LOCAL_REPORT, scope, scopeKey, deleted: true });
   }
   return existed;
+}
+
+/**
+ * Immediately purges all session-scoped identity profiles for the specified session name.
+ * Handles both `${serverId}:${sessionName}` and `${sessionName}` scopeKey formats.
+ */
+export async function removeSessionIdentitiesForSession(sessionName: string): Promise<number> {
+  if (!sessionName || !sessionName.trim()) return 0;
+  const name = sessionName.trim();
+  return enqueueMutation(async () => {
+    const db = getDb();
+    const result = db.prepare(`
+      DELETE FROM session_identity_profiles
+      WHERE scope = 'session'
+        AND (scope_key = ? OR scope_key LIKE '%:' || ?)
+    `).run(name, name);
+    const deleted = Number(result.changes);
+    if (deleted > 0) {
+      exportCompatJsonSync(db);
+      cachedSnapshot = null;
+      logger.info({ sessionName: name, deleted }, 'Removed session-scoped identity profiles');
+    }
+    return deleted;
+  });
 }
 
 /**
@@ -371,38 +685,55 @@ export async function pruneOrphanedSessionIdentityProfiles(
   activeSessionNames: ReadonlySet<string>,
 ): Promise<number> {
   return enqueueMutation(async () => {
-    const store = await readStoreForUpdate();
-    let removed = 0;
-    for (const [profileKey, profile] of Object.entries(store.profiles)) {
-      if (profile.scope === 'session') {
-        const parts = profile.scopeKey.split(':');
-        const sessionName = parts.length > 1 ? parts.slice(1).join(':') : parts[0];
-        if (!activeSessionNames.has(sessionName)) {
-          delete store.profiles[profileKey];
-          removed += 1;
-        }
+    const db = getDb();
+    const rows = db.prepare(`
+      SELECT scope_key FROM session_identity_profiles WHERE scope = 'session'
+    `).all() as Array<{ scope_key: string }>;
+
+    const toDelete: string[] = [];
+    for (const row of rows) {
+      const parts = row.scope_key.split(':');
+      const sessionName = parts.length > 1 ? parts.slice(1).join(':') : parts[0];
+      if (!activeSessionNames.has(sessionName)) {
+        toDelete.push(row.scope_key);
       }
     }
-    if (removed > 0) {
-      await writeStore(store);
+
+    if (toDelete.length === 0) return 0;
+
+    const del = db.prepare(`DELETE FROM session_identity_profiles WHERE scope = 'session' AND scope_key = ?`);
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      for (const scopeKey of toDelete) {
+        del.run(scopeKey);
+      }
+      db.exec('COMMIT');
+    } catch (err) {
+      db.exec('ROLLBACK');
+      throw err;
     }
-    return removed;
+
+    exportCompatJsonSync(db);
+    cachedSnapshot = null;
+    return toDelete.length;
   });
 }
 
-/** Test seam: how the reads were served (counters never include content), and a way to start from a cold cache. */
 export function identityStoreReadStatsForTests(): { loads: number; cacheHits: number; sharedLoads: number } {
   return { loads: readStats.loads, cacheHits: readStats.cacheHits, sharedLoads: readStats.sharedLoads };
 }
 
 export function resetIdentityStoreCacheForTests(): void {
+  if (activeDb) {
+    try { activeDb.close(); } catch { /* ignore */ }
+    activeDb = null;
+  }
+  activeDbPath = null;
   cachedSnapshot = null;
   inFlightLoad = null;
+  lastExportedJsonMtime = 0;
   readStats.loads = 0;
   readStats.cacheHits = 0;
   readStats.sharedLoads = 0;
-}
-
-export function localSessionIdentityStorePath(): string {
-  return storePath();
+  readStats.inFlightLoads = 0;
 }

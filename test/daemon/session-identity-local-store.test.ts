@@ -1,18 +1,28 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
-import { readFile, rm } from 'node:fs/promises';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { readFile, rm, writeFile, mkdir } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import {
   getLocalSessionIdentityProfile,
   listLocalSessionIdentityProfiles,
+  localSessionIdentityDbPath,
   localSessionIdentityStorePath,
   pruneOrphanedSessionIdentityProfiles,
   putLocalSessionIdentityProfile,
   removeLocalSessionIdentityProfile,
+  removeSessionIdentitiesForSession,
+  resetIdentityStoreCacheForTests,
 } from '../../src/daemon/session-identity-local-store.js';
 
 const home = join(process.cwd(), '.tmp-identity-local-store');
 
+beforeEach(async () => {
+  resetIdentityStoreCacheForTests();
+  await rm(home, { recursive: true, force: true });
+});
+
 afterEach(async () => {
+  resetIdentityStoreCacheForTests();
   vi.unstubAllEnvs();
   await rm(home, { recursive: true, force: true });
 });
@@ -26,6 +36,9 @@ describe('daemon-local session identity store', () => {
     expect(saved.content).toBe('local identity');
     expect(saved.contentHash).toMatch(/^[a-f0-9]{64}$/u);
     expect(localSessionIdentityStorePath()).toBe(join(home, 'session-identities.json'));
+    expect(localSessionIdentityDbPath()).toBe(join(home, 'session-identities.sqlite'));
+    expect(existsSync(localSessionIdentityDbPath())).toBe(true);
+
     expect(await getLocalSessionIdentityProfile('user', '')).toMatchObject({ content: 'local identity', revision: 1 });
     expect(JSON.parse(await readFile(localSessionIdentityStorePath(), 'utf8')).profiles['user\0'].content)
       .toBe('local identity');
@@ -77,5 +90,44 @@ describe('daemon-local session identity store', () => {
 
     const remaining = await listLocalSessionIdentityProfiles();
     expect(remaining.map((p) => p.content).sort()).toEqual(['keep-me', 'project', 'user']);
+  });
+
+  it('immediately purges session-scoped identity profiles when removeSessionIdentitiesForSession is called', async () => {
+    vi.stubEnv('IMCODES_HOME', home);
+    await putLocalSessionIdentityProfile({ scope: 'session', scopeKey: 'srv-1:deck_sub_123', content: 'sub-identity', source: 'mcp' });
+    await putLocalSessionIdentityProfile({ scope: 'session', scopeKey: 'deck_sub_456', content: 'sub-identity-bare', source: 'mcp' });
+    await putLocalSessionIdentityProfile({ scope: 'project', scopeKey: 'repo', content: 'keep-project', source: 'mcp' });
+
+    expect(await getLocalSessionIdentityProfile('session', 'srv-1:deck_sub_123')).not.toBeNull();
+    const deleted = await removeSessionIdentitiesForSession('deck_sub_123');
+    expect(deleted).toBe(1);
+    expect(await getLocalSessionIdentityProfile('session', 'srv-1:deck_sub_123')).toBeNull();
+
+    const deletedBare = await removeSessionIdentitiesForSession('deck_sub_456');
+    expect(deletedBare).toBe(1);
+    expect(await getLocalSessionIdentityProfile('session', 'deck_sub_456')).toBeNull();
+
+    expect(await getLocalSessionIdentityProfile('project', 'repo')).toMatchObject({ content: 'keep-project' });
+  });
+
+  it('automatically migrates existing legacy session-identities.json into SQLite on first access', async () => {
+    vi.stubEnv('IMCODES_HOME', home);
+    await mkdir(home, { recursive: true });
+    const legacy = {
+      version: 1,
+      profiles: {
+        'user\0': { scope: 'user', scopeKey: '', content: 'legacy-user', contentHash: 'h1', revision: 3, updatedAt: 100, source: 'web' },
+        'project\0my-repo': { scope: 'project', scopeKey: 'my-repo', content: 'legacy-project', contentHash: 'h2', revision: 2, updatedAt: 200, source: 'mcp' },
+      },
+      migratedAt: 12345678,
+    };
+    await writeFile(join(home, 'session-identities.json'), JSON.stringify(legacy));
+
+    // Access store -- should auto-migrate into SQLite
+    const profiles = await listLocalSessionIdentityProfiles();
+    expect(profiles).toHaveLength(2);
+    expect(await getLocalSessionIdentityProfile('user', '')).toMatchObject({ content: 'legacy-user', revision: 3 });
+    expect(await getLocalSessionIdentityProfile('project', 'my-repo')).toMatchObject({ content: 'legacy-project', revision: 2 });
+    expect(existsSync(localSessionIdentityDbPath())).toBe(true);
   });
 });

@@ -1,8 +1,9 @@
 import { applyEffectiveSessionIdentity } from '../agent/session-manager.js';
-import { listSessions } from '../store/session-store.js';
+import { listSessions, onSessionRemoved } from '../store/session-store.js';
 import {
   listLocalSessionIdentityProfiles,
   pruneOrphanedSessionIdentityProfiles,
+  removeSessionIdentitiesForSession,
 } from './session-identity-local-store.js';
 import { resolveEffectiveIdentities, type IdentityResolverDeps } from './session-identity-resolver.js';
 
@@ -124,13 +125,24 @@ export async function syncSessionIdentitiesForCommand(
   }
 }
 
+let sessionRemovedUnsubscribe: (() => void) | null = null;
+
 export function startSessionIdentitySync(
   onError: (message: string) => void = () => undefined,
 ): void {
+  if (!sessionRemovedUnsubscribe) {
+    sessionRemovedUnsubscribe = onSessionRemoved((sessionName) => {
+      void removeSessionIdentitiesForSession(sessionName).catch(() => {});
+    });
+  }
   if (syncTimer) return;
   const runCycle = async () => {
     try {
-      const activeNames = new Set(listSessions().map((s) => s.name));
+      const activeNames = new Set(
+        listSessions()
+          .filter((s) => !s.name.startsWith('deck_sub_') || s.state !== 'stopped')
+          .map((s) => s.name),
+      );
       await pruneOrphanedSessionIdentityProfiles(activeNames);
     } catch {
       // Best-effort orphan cleanup
@@ -148,4 +160,8 @@ export function startSessionIdentitySync(
 export function stopSessionIdentitySync(): void {
   if (syncTimer) clearInterval(syncTimer);
   syncTimer = null;
+  if (sessionRemovedUnsubscribe) {
+    sessionRemovedUnsubscribe();
+    sessionRemovedUnsubscribe = null;
+  }
 }
