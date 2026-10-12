@@ -15,6 +15,8 @@ import {
   getCcPresetEffectiveModel,
   normalizeCcPresetContextWindow,
   normalizeCcPresetName,
+  normalizeCodexBaseUrl,
+  normalizeCodexProviderId,
   type CcPreset,
   type CcPresetAuthType,
   type CcPresetModelInfo,
@@ -370,12 +372,21 @@ export async function getQwenPresetTransportConfig(presetName: string, requested
   };
 }
 
+export interface CodexModelProviderConfig {
+  providerId: string;
+  baseUrl: string;
+  apiKey?: string;
+  wireApi?: 'responses';
+  httpHeaders?: Record<string, string>;
+}
+
 export async function getCodexPresetTransportConfig(presetName: string, requestedModel?: string): Promise<{
   env: Record<string, string>;
   model?: string;
   availableModels?: string[];
   systemPrompt?: string;
   contextWindow?: number;
+  codexModelProvider?: CodexModelProviderConfig;
 }> {
   const preset = await getPreset(presetName);
   if (!preset) return { env: {} };
@@ -383,7 +394,7 @@ export async function getCodexPresetTransportConfig(presetName: string, requeste
   const availableModels = getPresetAvailableModelIds(preset);
   const model = selectPresetModel(preset, requestedModel);
   const resolvedEnv = await resolvePresetEnv(presetName, undefined, model);
-  const baseUrl = resolvedEnv['OPENAI_BASE_URL']?.trim()
+  const rawBaseUrl = resolvedEnv['OPENAI_BASE_URL']?.trim()
     || resolvedEnv['ANTHROPIC_BASE_URL']?.trim()
     || undefined;
   const apiKey = resolvedEnv['OPENAI_API_KEY']?.trim()
@@ -391,29 +402,47 @@ export async function getCodexPresetTransportConfig(presetName: string, requeste
     || resolvedEnv['ANTHROPIC_AUTH_TOKEN']?.trim()
     || undefined;
 
+  const normalizedBaseUrl = rawBaseUrl ? normalizeCodexBaseUrl(rawBaseUrl) : undefined;
+  const providerId = normalizeCodexProviderId(preset.name);
+
   const env: Record<string, string> = {};
-  if (baseUrl) {
-    env['OPENAI_BASE_URL'] = baseUrl;
-    env['ANTHROPIC_BASE_URL'] = baseUrl;
+  if (normalizedBaseUrl) {
+    env['OPENAI_BASE_URL'] = normalizedBaseUrl;
+    env['CODEX_BASE_URL'] = normalizedBaseUrl;
+  }
+  if (resolvedEnv['ANTHROPIC_BASE_URL']) {
+    env['ANTHROPIC_BASE_URL'] = resolvedEnv['ANTHROPIC_BASE_URL'];
+  } else if (rawBaseUrl) {
+    env['ANTHROPIC_BASE_URL'] = rawBaseUrl;
   }
   if (apiKey) {
     env['OPENAI_API_KEY'] = apiKey;
     env['ANTHROPIC_API_KEY'] = apiKey;
+    env['CODEX_API_KEY'] = apiKey;
   }
   if (model) {
     env['OPENAI_MODEL'] = model;
     env['ANTHROPIC_MODEL'] = model;
+    env['CODEX_MODEL'] = model;
   }
   if (resolvedEnv['IMCODES_CONTEXT_WINDOW']) {
     env['IMCODES_CONTEXT_WINDOW'] = resolvedEnv['IMCODES_CONTEXT_WINDOW'];
   }
+  env['IMCODES_CC_PRESET'] = preset.name;
 
-  const runtimeFacts = (model || baseUrl) ? [
+  const codexModelProvider: CodexModelProviderConfig | undefined = normalizedBaseUrl ? {
+    providerId,
+    baseUrl: normalizedBaseUrl,
+    ...(apiKey ? { apiKey } : {}),
+    wireApi: 'responses',
+  } : undefined;
+
+  const runtimeFacts = (model || normalizedBaseUrl || rawBaseUrl) ? [
     `Authoritative runtime fact: this Codex session is routed through the "${preset.name}" API provider preset.`,
-    baseUrl ? `Authoritative provider endpoint: ${baseUrl}.` : undefined,
+    normalizedBaseUrl ? `Authoritative provider endpoint: ${normalizedBaseUrl}.` : undefined,
     model ? `Authoritative runtime model: ${model}.` : undefined,
     model ? `If the user asks which model you are using, answer exactly with "${model}".` : 'If the user asks which model or provider you are using, answer with the authoritative runtime facts above.',
-    baseUrl ? `If the user asks which provider or endpoint you are using, mention "${baseUrl}".` : undefined,
+    normalizedBaseUrl ? `If the user asks which provider or endpoint you are using, mention "${normalizedBaseUrl}".` : undefined,
     'These runtime facts override any generic default model or provider identity.',
   ].filter(Boolean).join(' ') : undefined;
 
@@ -423,6 +452,7 @@ export async function getCodexPresetTransportConfig(presetName: string, requeste
     ...(availableModels.length ? { availableModels } : {}),
     ...(runtimeFacts ? { systemPrompt: runtimeFacts } : {}),
     ...(preset.contextWindow ? { contextWindow: preset.contextWindow } : {}),
+    ...(codexModelProvider ? { codexModelProvider } : {}),
   };
 }
 

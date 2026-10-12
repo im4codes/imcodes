@@ -3040,12 +3040,12 @@ async function applyTransportModelSwitch(
     }
     nextRecord = {
       ...record,
+      ...sdkDisplay,
       requestedModel,
       activeModel: requestedModel,
       modelDisplay: requestedModel,
       ...(availableModels.length ? { codexAvailableModels: availableModels } : {}),
       ...(presetContextWindow ? { presetContextWindow } : {}),
-      ...sdkDisplay,
       updatedAt: Date.now(),
     };
     contextWindow = resolveContextWindow(presetContextWindow, requestedModel);

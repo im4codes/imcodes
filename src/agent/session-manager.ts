@@ -3653,6 +3653,7 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
     if (!opts.fresh && transportResumeId) {
       effectiveSkipCreate = true;
     }
+    let availableCodexModels: string[] | undefined;
     if (effectiveCcPreset) {
       const { getCodexPresetTransportConfig } = await import('../daemon/cc-presets.js');
       const presetConfig = await getCodexPresetTransportConfig(effectiveCcPreset, requestedTransportModel);
@@ -3660,11 +3661,24 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
       if (presetConfig.model) requestedTransportModel = presetConfig.model;
       presetContextWindow = presetConfig.contextWindow ?? presetContextWindow;
       if (presetConfig.systemPrompt) transportSystemPrompt = presetConfig.systemPrompt;
+      if (presetConfig.availableModels?.length) {
+        availableCodexModels = presetConfig.availableModels;
+      }
+      if (presetConfig.codexModelProvider) {
+        transportSettings = {
+          ...(typeof transportSettings === 'object' && transportSettings ? transportSettings : {}),
+          codexModelProvider: presetConfig.codexModelProvider,
+        };
+      }
     }
-    sdkDisplay = mergeCodexDisplayMetadata(
+    const rawSdkDisplay = mergeCodexDisplayMetadata(
       await getCodexRuntimeConfig({ probe: false }).catch(() => ({})),
       existing,
     );
+    sdkDisplay = {
+      ...rawSdkDisplay,
+      ...(availableCodexModels?.length ? { codexAvailableModels: availableCodexModels } : {}),
+    };
   } else if (agentType === 'qoder-sdk') {
     effectiveSessionKey = randomUUID();
     effectiveBindExistingKey = undefined;
@@ -4169,12 +4183,25 @@ export async function launchSession(opts: LaunchOpts): Promise<void> {
     }
   }
 
-  let familyDisplay: Pick<SessionRecord, 'planLabel' | 'quotaLabel' | 'quotaUsageLabel' | 'quotaMeta'> | undefined;
+  let familyDisplay: Partial<SessionRecord> | undefined;
   if (agentType === 'codex') {
-    familyDisplay = mergeCodexDisplayMetadata(
+    let availableCodexModels: string[] | undefined;
+    if (opts.ccPreset) {
+      const { getPreset, getPresetAvailableModelIds } = await import('../daemon/cc-presets.js');
+      const preset = await getPreset(opts.ccPreset);
+      if (preset) {
+        const models = getPresetAvailableModelIds(preset);
+        if (models.length > 0) availableCodexModels = models;
+      }
+    }
+    const rawDisplay = mergeCodexDisplayMetadata(
       await getCodexRuntimeConfig({ probe: false }).catch(() => ({})),
       getSession(name),
     );
+    familyDisplay = {
+      ...rawDisplay,
+      ...(availableCodexModels?.length ? { codexAvailableModels: availableCodexModels } : {}),
+    };
   } else if (agentType === 'claude-code' && !opts.ccPreset) {
     familyDisplay = undefined;
   }
@@ -4203,6 +4230,11 @@ export async function launchSession(opts: LaunchOpts): Promise<void> {
       ...(geminiSessionId ? { geminiSessionId } : {}),
       ...(opencodeSessionId ? { opencodeSessionId } : {}),
       ...(opts.ccPreset ? { ccPreset: opts.ccPreset } : {}),
+      ...(opts.requestedModel ? {
+        requestedModel: opts.requestedModel,
+        activeModel: opts.requestedModel,
+        modelDisplay: opts.requestedModel,
+      } : {}),
       ...(label ? { label } : {}),
       ...(opts.description ? { description: opts.description } : {}),
       ...(opts.identityPrompt ? { appliedIdentityHash: identityPromptHash(opts.identityPrompt) } : {}),

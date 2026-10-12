@@ -2114,7 +2114,26 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     activeSession?.copilotAvailableModels,
     activeSession?.cursorAvailableModels,
   ]);
+  const legacyCodexModel = loadLegacyCodexModelPreferenceForModelessSession(activeSession, detectedModel);
+  const genericTransportModel = resolveEffectiveSessionModel(activeSession, detectedModel, legacyCodexModel) ?? null;
+  const displayedCodexModel = activeSession?.agentType === 'codex-sdk'
+    ? genericTransportModel
+    : (genericTransportModel ?? codexModel);
   const codexModelSuggestions: readonly string[] = useMemo(() => {
+    if (activeSession?.ccPreset) {
+      const candidates: string[] = [];
+      if (displayedCodexModel) candidates.push(displayedCodexModel);
+      if (activeSession.requestedModel && !candidates.includes(activeSession.requestedModel)) {
+        candidates.push(activeSession.requestedModel);
+      }
+      if (activeSession.activeModel && !candidates.includes(activeSession.activeModel)) {
+        candidates.push(activeSession.activeModel);
+      }
+      const dynamicIds = dynamicTransportModels.models.map((m) => m.id);
+      const probed = activeSession.codexAvailableModels ?? [];
+      const merged = mergeModelSuggestions(candidates, [...dynamicIds, ...probed]);
+      return merged.length > 0 ? merged : (displayedCodexModel ? [displayedCodexModel] : []);
+    }
     if (activeSession?.agentType !== 'codex-sdk') return CODEX_MODELS;
     if (dynamicTransportModels.models.length > 0) {
       return dynamicTransportModels.models.map((m) => m.id);
@@ -2123,14 +2142,13 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     return CODEX_MODELS;
   }, [
     activeSession?.agentType,
+    activeSession?.ccPreset,
+    activeSession?.requestedModel,
+    activeSession?.activeModel,
     activeSession?.codexAvailableModels,
+    displayedCodexModel,
     dynamicTransportModels.models,
   ]);
-  const legacyCodexModel = loadLegacyCodexModelPreferenceForModelessSession(activeSession, detectedModel);
-  const genericTransportModel = resolveEffectiveSessionModel(activeSession, detectedModel, legacyCodexModel) ?? null;
-  const displayedCodexModel = activeSession?.agentType === 'codex-sdk'
-    ? genericTransportModel
-    : (genericTransportModel ?? codexModel);
   const claudeSessionModel = activeSession?.agentType === 'claude-code-sdk'
     ? (resolveEffectiveSessionModel(activeSession, detectedModel) ?? null)
     : null;

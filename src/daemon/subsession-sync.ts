@@ -79,6 +79,16 @@ export async function buildSubSessionSyncPayload(
     return null;
   }
 
+  let codexAvailableModels: string[] | undefined = r.codexAvailableModels;
+  if (isCodexFamilySession(r.agentType) && r.ccPreset) {
+    const { getPreset, getPresetAvailableModelIds } = await import('./cc-presets.js');
+    const preset = await getPreset(r.ccPreset);
+    if (preset) {
+      const models = getPresetAvailableModelIds(preset);
+      if (models.length > 0) codexAvailableModels = models;
+    }
+  }
+
   const freshDisplay: Partial<Pick<SessionRecord, 'modelDisplay' | 'codexAvailableModels' | 'planLabel' | 'quotaLabel' | 'quotaUsageLabel' | 'quotaMeta' | 'codexCreditsBalance' | 'codexCreditsHasCredits' | 'codexCreditsUnlimited'>> = isQwenSession(r.agentType)
     ? getQwenDisplayMetadata({
         model: r.qwenModel,
@@ -89,7 +99,10 @@ export async function buildSubSessionSyncPayload(
     : isClaudeSdkSession(r.agentType)
       ? await getClaudeSdkRuntimeConfig().catch(() => ({}))
       : isCodexFamilySession(r.agentType)
-        ? mergeCodexDisplayMetadata(await getCodexRuntimeConfig({ probe: false }).catch(() => ({})), r)
+        ? {
+            ...mergeCodexDisplayMetadata(await getCodexRuntimeConfig({ probe: false }).catch(() => ({})), r),
+            ...(codexAvailableModels?.length ? { codexAvailableModels } : {}),
+          }
         : r.agentType === 'grok-sdk'
           ? await getGrokSdkRuntimeConfig().catch(() => ({}))
           : {};

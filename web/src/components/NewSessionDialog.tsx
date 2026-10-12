@@ -636,7 +636,7 @@ export function NewSessionDialog({
   });
 
   useEffect(() => {
-    if (agentType !== "codex-sdk") return;
+    if (agentType !== "codex-sdk" || selectedCcPreset) return;
     setRequestedModel((current) => {
       const trimmed = current.trim();
       if (trimmed && (modelSuggestions.length === 0 || modelSuggestions.includes(trimmed))) return trimmed;

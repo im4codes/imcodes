@@ -461,13 +461,22 @@ describe('cc presets', () => {
         model: 'MiniMax-M2.7',
         contextWindow: 200_000,
         env: expect.objectContaining({
-          OPENAI_BASE_URL: 'https://api.minimax.io/anthropic',
+          OPENAI_BASE_URL: 'https://api.minimax.io/v1',
           OPENAI_API_KEY: 'test-token',
           OPENAI_MODEL: 'MiniMax-M2.7',
+          CODEX_BASE_URL: 'https://api.minimax.io/v1',
+          CODEX_API_KEY: 'test-token',
+          CODEX_MODEL: 'MiniMax-M2.7',
           ANTHROPIC_BASE_URL: 'https://api.minimax.io/anthropic',
           ANTHROPIC_API_KEY: 'test-token',
           ANTHROPIC_MODEL: 'MiniMax-M2.7',
         }),
+        codexModelProvider: {
+          providerId: 'minimax',
+          baseUrl: 'https://api.minimax.io/v1',
+          apiKey: 'test-token',
+          wireApi: 'responses',
+        },
       });
       expect(result.systemPrompt).toContain('MiniMax');
       expect(result.systemPrompt).toContain('Authoritative runtime model: MiniMax-M2.7');
@@ -498,7 +507,16 @@ describe('cc presets', () => {
           OPENAI_BASE_URL: 'https://api.minimax.chat/v1',
           OPENAI_API_KEY: 'openai-test-key',
           OPENAI_MODEL: 'MiniMax-Text-01',
+          CODEX_BASE_URL: 'https://api.minimax.chat/v1',
+          CODEX_API_KEY: 'openai-test-key',
+          CODEX_MODEL: 'MiniMax-Text-01',
         }),
+        codexModelProvider: {
+          providerId: 'minimax-openai',
+          baseUrl: 'https://api.minimax.chat/v1',
+          apiKey: 'openai-test-key',
+          wireApi: 'responses',
+        },
       });
       expect(result.systemPrompt).toContain('MiniMax');
     });

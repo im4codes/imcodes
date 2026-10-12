@@ -52,11 +52,13 @@ function creditsOrExisting(runtime: CodexRuntimeConfig | null | undefined, exist
 
 export function mergeCodexDisplayMetadata(
   runtime: CodexRuntimeConfig | null | undefined,
-  existing?: Partial<CodexDisplayFields> | null,
+  existing?: Partial<CodexDisplayFields & { ccPreset?: string | null }> | null,
 ): Partial<CodexDisplayFields> {
-  const availableModels = runtime?.availableModels?.length
-    ? runtime.availableModels
-    : existing?.codexAvailableModels;
+  const availableModels = existing?.ccPreset && existing?.codexAvailableModels?.length
+    ? existing.codexAvailableModels
+    : (runtime?.availableModels?.length
+      ? runtime.availableModels
+      : existing?.codexAvailableModels);
   const planLabel = nonEmpty(runtime?.planLabel) ?? nonEmpty(existing?.planLabel);
   const quotaLabel = nonEmpty(runtime?.quotaLabel) ?? nonEmpty(existing?.quotaLabel);
   const quotaUsageLabel = nonEmpty(runtime?.quotaUsageLabel) ?? nonEmpty(existing?.quotaUsageLabel);

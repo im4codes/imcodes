@@ -83,6 +83,10 @@ import {
   NATIVE_AGENT_FENCES,
   type NativeAgentFence,
 } from '../../../shared/native-collaboration-policy.js';
+import {
+  normalizeCodexBaseUrl,
+  normalizeCodexProviderId,
+} from '../../../shared/cc-presets.js';
 import type { NativeAgentFenceResolver } from '../transport-provider.js';
 import { getDefaultMcpServers } from './getDefaultMcpServers.js';
 import { IMCODES_MEMORY_MCP_SERVER_NAME } from '../../../shared/memory-mcp-server-name.js';
@@ -1081,6 +1085,14 @@ export interface CodexDiscoveredModel {
   isDefault?: boolean;
 }
 
+export interface CodexModelProviderConfig {
+  providerId: string;
+  baseUrl: string;
+  apiKey?: string;
+  wireApi?: 'responses';
+  httpHeaders?: Record<string, string>;
+}
+
 interface CodexSdkSessionState {
   routeId: string;
   /**
@@ -1099,6 +1111,8 @@ interface CodexSdkSessionState {
   turnCwd?: string;
   env?: Record<string, string>;
   mcpConfig?: Record<string, unknown>;
+  /** Custom model provider (third-party / OpenAI-compatible endpoint) */
+  customModelProvider?: CodexModelProviderConfig;
   /** Exact thread-scoped MCP generation observed closed and not yet rehydrated. */
   imcodesMcpRecoveryRequired: boolean;
   imcodesMcpRecoveryPromise?: Promise<void>;
@@ -2821,16 +2835,42 @@ export class CodexSdkProvider implements TransportProvider {
     await this.stopAppServer({ clearSessions: true });
   }
 
+  private extractCustomModelProvider(
+    config: SessionConfig,
+    existing?: CodexModelProviderConfig,
+  ): CodexModelProviderConfig | undefined {
+    if (config.settings && typeof config.settings === 'object' && 'codexModelProvider' in config.settings) {
+      const p = (config.settings as Record<string, unknown>).codexModelProvider as CodexModelProviderConfig | undefined;
+      if (p?.providerId && p?.baseUrl) return p;
+    }
+    const env = (config.env as Record<string, string> | undefined) ?? {};
+    const rawBaseUrl = env['OPENAI_BASE_URL']?.trim() || env['CODEX_BASE_URL']?.trim() || env['ANTHROPIC_BASE_URL']?.trim();
+    if (rawBaseUrl) {
+      const apiKey = env['OPENAI_API_KEY']?.trim() || env['CODEX_API_KEY']?.trim() || env['ANTHROPIC_API_KEY']?.trim() || env['ANTHROPIC_AUTH_TOKEN']?.trim();
+      const presetName = env['IMCODES_CC_PRESET']?.trim();
+      const providerId = presetName ? normalizeCodexProviderId(presetName) : (existing?.providerId ?? 'custom');
+      return {
+        providerId,
+        baseUrl: normalizeCodexBaseUrl(rawBaseUrl),
+        ...(apiKey ? { apiKey } : {}),
+        wireApi: 'responses',
+      };
+    }
+    return existing;
+  }
+
   async createSession(config: SessionConfig): Promise<string> {
     await this.refreshAppServerForLatestAuth('create-session');
     const routeId = config.bindExistingKey ?? config.sessionKey;
     const existing = config.fresh ? undefined : this.sessions.get(routeId);
+    const customModelProvider = this.extractCustomModelProvider(config, existing?.customModelProvider);
     this.sessions.set(routeId, {
       routeId,
       ...(config.sessionName ? { imcodesSessionName: config.sessionName } : existing?.imcodesSessionName ? { imcodesSessionName: existing.imcodesSessionName } : {}),
       cwd: normalizeTransportCwd(config.cwd) ?? existing?.cwd ?? normalizeTransportCwd(process.cwd())!,
       env: { ...(existing?.env ?? {}), ...((config.env as Record<string, string> | undefined) ?? {}) },
       mcpConfig: buildCodexMcpThreadConfig(config) ?? existing?.mcpConfig,
+      customModelProvider,
       imcodesMcpRecoveryRequired: false,
       imcodesMcpRecoveryPromise: undefined,
       model: typeof config.agentId === 'string' ? config.agentId : existing?.model,
@@ -2964,7 +3004,10 @@ export class CodexSdkProvider implements TransportProvider {
   setSessionAgentId(sessionId: string, agentId: string): void {
     const state = this.sessions.get(sessionId);
     if (!state) return;
-    state.model = agentId;
+    if (state.model !== agentId) {
+      state.model = agentId;
+      state.loaded = false;
+    }
   }
 
   setSessionEffort(sessionId: string, effort: TransportEffortLevel): void {
@@ -4073,10 +4116,11 @@ export class CodexSdkProvider implements TransportProvider {
     // resolution priority (override > stored history > model default)
     // means supplying it on resume is the only way to repair them
     // mid-flight.
+    const threadConfigParams = this.sessionThreadConfigParams(state, false);
     const result = await this.request('thread/resume', {
       threadId: state.threadId,
       ...this.sessionEnvironmentParams(state),
-      ...this.sessionMcpConfigParams(state),
+      ...threadConfigParams,
       ...(state.model ? { model: state.model } : {}),
       baseInstructions,
     });
@@ -4102,11 +4146,12 @@ export class CodexSdkProvider implements TransportProvider {
     const fenced = this.nativeAgentFence.required(sessionId, state.imcodesSessionName);
     const fence = fenceOf(fenced);
     state.pendingThreadFence = fence;
+    const threadConfigParams = this.sessionThreadConfigParams(state, fenced);
     try {
       const result = await this.request('thread/start', {
         cwd: state.cwd,
         ...this.sessionEnvironmentParams(state),
-        ...(fenced ? { config: withCodexNativeAgentFence(state.mcpConfig) } : this.sessionMcpConfigParams(state)),
+        ...threadConfigParams,
         approvalPolicy: 'never',
         sandbox: 'danger-full-access',
         personality: 'none',
@@ -4177,8 +4222,34 @@ export class CodexSdkProvider implements TransportProvider {
     return state.env && Object.keys(state.env).length > 0 ? { env: state.env } : {};
   }
 
-  private sessionMcpConfigParams(state: CodexSdkSessionState): { config?: Record<string, unknown> } {
-    return state.mcpConfig ? { config: state.mcpConfig } : {};
+  private sessionThreadConfigParams(
+    state: CodexSdkSessionState,
+    fenced?: boolean,
+  ): { config?: Record<string, unknown>; modelProvider?: string } {
+    const rawMcp = fenced ? withCodexNativeAgentFence(state.mcpConfig) : (state.mcpConfig ?? {});
+    const baseConfig = rawMcp ? { ...rawMcp } : {};
+    const provider = state.customModelProvider;
+    if (!provider) {
+      return Object.keys(baseConfig).length > 0 ? { config: baseConfig } : {};
+    }
+    const existingModelProviders = (baseConfig['model_providers'] as Record<string, unknown> | undefined) ?? {};
+    const config = {
+      ...baseConfig,
+      model_providers: {
+        ...existingModelProviders,
+        [provider.providerId]: {
+          name: provider.providerId,
+          base_url: provider.baseUrl,
+          wire_api: provider.wireApi ?? 'responses',
+          ...(provider.apiKey ? { experimental_bearer_token: provider.apiKey } : {}),
+          ...(provider.httpHeaders ? { http_headers: provider.httpHeaders } : {}),
+        },
+      },
+    };
+    return {
+      config,
+      modelProvider: provider.providerId,
+    };
   }
 
   private codexGeneratedImageEnv(state: CodexSdkSessionState): Record<string, string | undefined> {

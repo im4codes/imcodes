@@ -4674,6 +4674,71 @@ describe('CodexSdkProvider', () => {
     codexRuntimeConfigMock.reset();
   });
 
+  it('injects modelProvider and model_providers config on thread/start for custom model provider', async () => {
+    const provider = createCodexProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({
+      sessionKey: 'route-custom-provider',
+      cwd: '/tmp/project',
+      agentId: 'MiniMax-M3',
+      settings: {
+        codexModelProvider: {
+          providerId: 'minimax',
+          baseUrl: 'https://api.minimax.io/v1',
+          apiKey: 'test-api-key',
+          wireApi: 'responses',
+        },
+      },
+    });
+    await provider.send('route-custom-provider', 'hello');
+    const child = childProcessMock.children[0];
+    const threadStartReq = child.requests.find((req) => req.method === 'thread/start');
+    expect(threadStartReq?.params?.model).toBe('MiniMax-M3');
+    expect(threadStartReq?.params?.modelProvider).toBe('minimax');
+    expect(threadStartReq?.params?.config?.model_providers?.minimax).toEqual({
+      name: 'minimax',
+      base_url: 'https://api.minimax.io/v1',
+      experimental_bearer_token: 'test-api-key',
+      wire_api: 'responses',
+    });
+  });
+
+  it('updates model and sends thread/resume on next turn when setSessionAgentId is called', async () => {
+    const provider = createCodexProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({
+      sessionKey: 'route-switch-model',
+      cwd: '/tmp/project',
+      agentId: 'MiniMax-M2.7',
+      settings: {
+        codexModelProvider: {
+          providerId: 'minimax',
+          baseUrl: 'https://api.minimax.io/v1',
+          apiKey: 'test-api-key',
+          wireApi: 'responses',
+        },
+      },
+    });
+    await provider.send('route-switch-model', 'turn 1');
+    const child = childProcessMock.children[0];
+    const firstTurnStart = child.requests.find((req) => req.method === 'turn/start');
+    expect(firstTurnStart?.params?.model).toBe('MiniMax-M2.7');
+
+    child.emits({
+      method: 'turn/completed',
+      params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed', error: null } },
+    });
+
+    provider.setSessionAgentId('route-switch-model', 'MiniMax-M3');
+    await provider.send('route-switch-model', 'turn 2');
+
+    const resumeReq = child.requests.find((req) => req.method === 'thread/resume');
+    expect(resumeReq?.params?.model).toBe('MiniMax-M3');
+    expect(resumeReq?.params?.modelProvider).toBe('minimax');
+    const secondTurnStart = child.requests.filter((req) => req.method === 'turn/start')[1];
+    expect(secondTurnStart?.params?.model).toBe('MiniMax-M3');
+  });
+
   it('carries per-thread shell_environment_policy.set identity on the thread/start RPC (not just the builder)', async () => {
     const provider = createCodexProvider();
     await provider.connect({ binaryPath: 'codex' });

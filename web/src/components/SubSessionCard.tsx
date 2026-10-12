@@ -125,6 +125,7 @@ function buildCompactSessionInfo(sub: SubSession): SessionInfo {
     sessionInstanceId: sub.sessionInstanceId ?? undefined,
     runtimeEpoch: sub.runtimeEpoch ?? undefined,
     providerId: sub.providerId ?? undefined,
+    ccPreset: sub.ccPresetId ?? undefined,
     qwenModel: sub.qwenModel ?? undefined,
     qwenAuthType: sub.qwenAuthType ?? undefined,
     qwenAvailableModels: sub.qwenAvailableModels ?? undefined,

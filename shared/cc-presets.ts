@@ -115,3 +115,22 @@ export function getCcPresetAvailableModelIds(
   for (const model of preset.availableModels ?? []) addUniqueModel(models, model.id);
   return models;
 }
+
+export function normalizeCodexBaseUrl(rawUrl: string): string {
+  let url = rawUrl.trim().replace(/\/+$/, '');
+  if (url.endsWith('/anthropic')) {
+    url = `${url.slice(0, -'/anthropic'.length)}/v1`;
+  } else if (!url.endsWith('/v1') && !url.includes('/v1/')) {
+    url = `${url}/v1`;
+  }
+  return url;
+}
+
+export function normalizeCodexProviderId(presetName: string): string {
+  const clean = presetName.trim().toLowerCase().replace(/[^a-z0-9_-]/g, '_');
+  const reserved = new Set(['responses', 'openai', 'amazon-bedrock', 'amazon-bedrock-runtime', 'ollama']);
+  if (!clean || reserved.has(clean)) {
+    return `custom_${clean || 'provider'}`;
+  }
+  return clean;
+}

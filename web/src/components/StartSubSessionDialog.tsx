@@ -408,7 +408,7 @@ export function StartSubSessionDialog({ ws, defaultCwd, allowedAgentTypes, overl
   });
 
   useEffect(() => {
-    if (type !== 'codex-sdk') return;
+    if (type !== 'codex-sdk' || selectedCcPreset) return;
     setRequestedModel((current) => {
       const trimmed = current.trim();
       if (trimmed && (modelSuggestions.length === 0 || modelSuggestions.includes(trimmed))) return trimmed;
