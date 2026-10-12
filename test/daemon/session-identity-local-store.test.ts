@@ -5,6 +5,7 @@ import {
   getLocalSessionIdentityProfile,
   listLocalSessionIdentityProfiles,
   localSessionIdentityStorePath,
+  pruneOrphanedSessionIdentityProfiles,
   putLocalSessionIdentityProfile,
   removeLocalSessionIdentityProfile,
 } from '../../src/daemon/session-identity-local-store.js';
@@ -61,5 +62,20 @@ describe('daemon-local session identity store', () => {
     ]);
     const profiles = await listLocalSessionIdentityProfiles();
     expect(profiles.map((profile) => profile.content).sort()).toEqual(['a', 'b', 'c']);
+  });
+
+  it('prunes session-scoped profiles when sessions are not active, preserving user/project/pair', async () => {
+    vi.stubEnv('IMCODES_HOME', home);
+    await putLocalSessionIdentityProfile({ scope: 'project', scopeKey: 'repo-a', content: 'project', source: 'mcp' });
+    await putLocalSessionIdentityProfile({ scope: 'user', scopeKey: '', content: 'user', source: 'mcp' });
+    await putLocalSessionIdentityProfile({ scope: 'session', scopeKey: 'srv-1:active_session', content: 'keep-me', source: 'mcp' });
+    await putLocalSessionIdentityProfile({ scope: 'session', scopeKey: 'srv-1:dead_session', content: 'delete-me', source: 'mcp' });
+    await putLocalSessionIdentityProfile({ scope: 'session', scopeKey: 'dead_no_prefix', content: 'delete-me-too', source: 'mcp' });
+
+    const removed = await pruneOrphanedSessionIdentityProfiles(new Set(['active_session']));
+    expect(removed).toBe(2);
+
+    const remaining = await listLocalSessionIdentityProfiles();
+    expect(remaining.map((p) => p.content).sort()).toEqual(['keep-me', 'project', 'user']);
   });
 });

@@ -1,6 +1,9 @@
 import { applyEffectiveSessionIdentity } from '../agent/session-manager.js';
 import { listSessions } from '../store/session-store.js';
-import { listLocalSessionIdentityProfiles } from './session-identity-local-store.js';
+import {
+  listLocalSessionIdentityProfiles,
+  pruneOrphanedSessionIdentityProfiles,
+} from './session-identity-local-store.js';
 import { resolveEffectiveIdentities, type IdentityResolverDeps } from './session-identity-resolver.js';
 
 /**
@@ -125,13 +128,19 @@ export function startSessionIdentitySync(
   onError: (message: string) => void = () => undefined,
 ): void {
   if (syncTimer) return;
-  void syncSessionIdentities().then((result) => {
+  const runCycle = async () => {
+    try {
+      const activeNames = new Set(listSessions().map((s) => s.name));
+      await pruneOrphanedSessionIdentityProfiles(activeNames);
+    } catch {
+      // Best-effort orphan cleanup
+    }
+    const result = await syncSessionIdentities();
     if (result.status === 'error' && result.message) onError(result.message);
-  });
+  };
+  void runCycle();
   syncTimer = setInterval(() => {
-    void syncSessionIdentities().then((result) => {
-      if (result.status === 'error' && result.message) onError(result.message);
-    });
+    void runCycle();
   }, SESSION_IDENTITY_SYNC_INTERVAL_MS);
   syncTimer.unref?.();
 }

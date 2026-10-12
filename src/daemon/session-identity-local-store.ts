@@ -363,6 +363,33 @@ export async function removeLocalSessionIdentityProfile(
   return existed;
 }
 
+/**
+ * Drops session-scoped profiles whose sessionName is not among the active sessions.
+ * User, project and pair profiles are preserved.
+ */
+export async function pruneOrphanedSessionIdentityProfiles(
+  activeSessionNames: ReadonlySet<string>,
+): Promise<number> {
+  return enqueueMutation(async () => {
+    const store = await readStoreForUpdate();
+    let removed = 0;
+    for (const [profileKey, profile] of Object.entries(store.profiles)) {
+      if (profile.scope === 'session') {
+        const parts = profile.scopeKey.split(':');
+        const sessionName = parts.length > 1 ? parts.slice(1).join(':') : parts[0];
+        if (!activeSessionNames.has(sessionName)) {
+          delete store.profiles[profileKey];
+          removed += 1;
+        }
+      }
+    }
+    if (removed > 0) {
+      await writeStore(store);
+    }
+    return removed;
+  });
+}
+
 /** Test seam: how the reads were served (counters never include content), and a way to start from a cold cache. */
 export function identityStoreReadStatsForTests(): { loads: number; cacheHits: number; sharedLoads: number } {
   return { loads: readStats.loads, cacheHits: readStats.cacheHits, sharedLoads: readStats.sharedLoads };

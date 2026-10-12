@@ -341,16 +341,21 @@ function backfillNamespaceFilterColumnsForTable(
   table: 'context_staged_events' | 'context_dirty_targets' | 'context_jobs' | 'context_processed_local',
   idColumn: 'id' | 'target_key',
   limit = 256,
-): number {
+): { updated: number; done: boolean } {
   const cursorKey = `namespace_filter_cursor_${table}`;
-  const cursor = Number(internalGetContextMeta(database, cursorKey) ?? 0) || 0;
+  const cursorVal = internalGetContextMeta(database, cursorKey);
+  if (cursorVal === 'done') return { updated: 0, done: true };
+  const cursor = Number(cursorVal ?? 0) || 0;
   const rows = database.prepare(`
     SELECT rowid, ${idColumn} AS row_id, namespace_key
     FROM ${table}
     WHERE rowid > ? AND (scope IS NULL OR scope = '')
     ORDER BY rowid ASC LIMIT ?
   `).all(cursor, limit) as Array<{ rowid: number; row_id: string; namespace_key: string }>;
-  if (rows.length === 0) return 0;
+  if (rows.length === 0) {
+    internalSetContextMeta(database, cursorKey, 'done');
+    return { updated: 0, done: true };
+  }
   const update = database.prepare(`
     UPDATE ${table}
     SET scope = ?,
@@ -366,20 +371,25 @@ function backfillNamespaceFilterColumnsForTable(
     const result = update.run(...values, String(row.row_id)) as { changes?: number };
     updated += result.changes ?? 0;
   }
-  internalSetContextMeta(database, cursorKey, String(rows[rows.length - 1]!.rowid));
-  return updated;
+  const isDone = rows.length < limit;
+  internalSetContextMeta(database, cursorKey, isDone ? 'done' : String(rows[rows.length - 1]!.rowid));
+  return { updated, done: isDone };
 }
 
 function backfillNamespaceFilterColumnsForDb(database: DatabaseSyncInstance, limit = 256): void {
+  if (internalGetContextMeta(database, 'migration_namespace_filter_columns_done') === '1') return;
   try {
     database.exec('BEGIN');
-    const updated =
-      backfillNamespaceFilterColumnsForTable(database, 'context_staged_events', 'id', limit) +
-      backfillNamespaceFilterColumnsForTable(database, 'context_dirty_targets', 'target_key', limit) +
-      backfillNamespaceFilterColumnsForTable(database, 'context_jobs', 'id', limit) +
-      backfillNamespaceFilterColumnsForTable(database, 'context_processed_local', 'id', limit);
+    const r1 = backfillNamespaceFilterColumnsForTable(database, 'context_staged_events', 'id', limit);
+    const r2 = backfillNamespaceFilterColumnsForTable(database, 'context_dirty_targets', 'target_key', limit);
+    const r3 = backfillNamespaceFilterColumnsForTable(database, 'context_jobs', 'id', limit);
+    const r4 = backfillNamespaceFilterColumnsForTable(database, 'context_processed_local', 'id', limit);
+    const updated = r1.updated + r2.updated + r3.updated + r4.updated;
     if (updated > 0) {
       internalSetContextMeta(database, 'migration_namespace_filter_columns_backfilled', String(Date.now()));
+    }
+    if (r1.done && r2.done && r3.done && r4.done) {
+      internalSetContextMeta(database, 'migration_namespace_filter_columns_done', '1');
     }
     database.exec('COMMIT');
   } catch (error) {
@@ -919,6 +929,9 @@ export function ensureContextStoreMaintenanceIndexes(): { created: number; done:
  * latency proportional to the size of a historical store. */
 export function backfillProcessedNoiseBatch(limit = 256): { processed: number; done: boolean } {
   const database = ensureDb();
+  if (internalGetContextMeta(database, 'processed_noise_backfill_complete') === '1') {
+    return { processed: 0, done: true };
+  }
   const safeLimit = Math.max(1, Math.min(1000, Math.floor(limit)));
   const cursor = Number(internalGetContextMeta(database, PROCESSED_NOISE_BACKFILL_CURSOR_KEY) ?? 0) || 0;
   const rows = database.prepare(`
@@ -1600,6 +1613,9 @@ function purgeMemoryNoiseProjectionsBatchForDb(
   persistCursor = true,
   cursorOverride?: number,
 ): NoisePurgeBatchResult {
+  if (persistCursor && internalGetContextMeta(database, 'memory_noise_purge_complete') === '1') {
+    return { deleted: 0, done: true, nextCursor: 0 };
+  }
   const safeLimit = Math.max(1, Math.min(1000, Math.floor(limit)));
   const cursorRaw = persistCursor ? internalGetContextMeta(database, MEMORY_NOISE_PURGE_CURSOR_KEY) : undefined;
   const cursor = cursorOverride ?? (cursorRaw && Number.isSafeInteger(Number(cursorRaw)) ? Number(cursorRaw) : 0);
@@ -1611,14 +1627,20 @@ function purgeMemoryNoiseProjectionsBatchForDb(
     LIMIT ?
   `).all(cursor, safeLimit) as Array<{ rowid: number; id: string; summary: string }>;
   const nextCursor = rows.length > 0 ? Number(rows[rows.length - 1].rowid) : cursor;
-  if (persistCursor) internalSetContextMeta(database, MEMORY_NOISE_PURGE_CURSOR_KEY, String(nextCursor));
+  if (persistCursor && nextCursor !== cursor) {
+    internalSetContextMeta(database, MEMORY_NOISE_PURGE_CURSOR_KEY, String(nextCursor));
+  }
+  const done = rows.length < safeLimit;
+  if (persistCursor && done) {
+    internalSetContextMeta(database, 'memory_noise_purge_complete', '1');
+  }
 
   const badIds = rows.filter((row) => isMemoryNoiseSummary(row.summary)).map((row) => row.id);
-  if (badIds.length === 0) return { deleted: 0, done: rows.length < safeLimit, nextCursor };
+  if (badIds.length === 0) return { deleted: 0, done, nextCursor };
   const placeholders = badIds.map(() => '?').join(', ');
   database.prepare(`DELETE FROM context_processed_local WHERE id IN (${placeholders})`).run(...badIds);
   removeProjectionIdsFromReplicationState(database, badIds);
-  return { deleted: badIds.length, done: rows.length < safeLimit, nextCursor };
+  return { deleted: badIds.length, done, nextCursor };
 }
 
 function purgeMemoryNoiseProjections(database: DatabaseSyncInstance): number {
@@ -2475,6 +2497,14 @@ function readTurnUsageSyncRecordForDb(database: DatabaseSyncInstance, rowid: num
 
 export function backfillTurnUsageSyncMetadata(limit = 500): { backfilled: number } {
   const database = ensureDb();
+  const newestUsage = database.prepare('SELECT id FROM context_turn_usage ORDER BY id DESC LIMIT 1').get() as { id: number } | undefined;
+  if (!newestUsage) return { backfilled: 0 };
+  const existingSync = database.prepare('SELECT turn_usage_rowid FROM context_turn_usage_sync WHERE turn_usage_rowid = ?').get(newestUsage.id);
+  if (existingSync) {
+    const uCount = (database.prepare('SELECT COUNT(*) as c FROM context_turn_usage').get() as { c: number }).c;
+    const sCount = (database.prepare('SELECT COUNT(*) as c FROM context_turn_usage_sync').get() as { c: number }).c;
+    if (uCount === sCount) return { backfilled: 0 };
+  }
   const rows = database.prepare(`
     SELECT u.id
     FROM context_turn_usage u
@@ -5296,7 +5326,9 @@ function reconcileMaterializedStagedEventsBatchForDb(
     LIMIT ?
   `).all(cursor, safeLimit) as Array<{ rowid: number; source_event_ids_json: string }>;
   const nextCursor = projectionRows.length > 0 ? Number(projectionRows[projectionRows.length - 1].rowid) : cursor;
-  internalSetContextMeta(database, STAGED_RECONCILE_CURSOR_KEY, String(nextCursor));
+  if (nextCursor !== cursor) {
+    internalSetContextMeta(database, STAGED_RECONCILE_CURSOR_KEY, String(nextCursor));
+  }
   const matchedIds: string[] = [];
   for (const row of projectionRows) {
     const sourceIds = parseJson<string[]>(row.source_event_ids_json, []);

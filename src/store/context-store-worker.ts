@@ -233,6 +233,7 @@ function maintenanceTick(): void {
     return;
   }
   if (busy && now - lastMaintenanceAt < MAINTENANCE_FORCE_INTERVAL_MS) return;
+  if (!busy && now - lastMaintenanceAt < 10_000) return;
   const step = cursorSteps[maintenanceCursor % cursorSteps.length]!;
   maintenanceCursor = (maintenanceCursor + 1) % cursorSteps.length;
   lastMaintenanceAt = now;
