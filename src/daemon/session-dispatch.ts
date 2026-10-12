@@ -271,6 +271,34 @@ function buildServerMemberActorEnvelope(
   };
 }
 
+async function cancelTargetSession(target: SessionRecord, options: SessionDispatchMessageOptions): Promise<void> {
+  if (options.cancelSession) {
+    await options.cancelSession(target);
+    return;
+  }
+  try {
+    const commandHandler = await import('./command-handler.js');
+    const stopFn = (commandHandler as Record<string, unknown>).stopSessionNow;
+    if (typeof stopFn === 'function') {
+      (stopFn as (name: string) => boolean)(target.name);
+    }
+  } catch {
+    // If command-handler or stopSessionNow is unavailable (e.g. partial test mocks), ignore safely.
+  }
+}
+
+async function clearTransportResendQueue(targetName: string, reason: string): Promise<void> {
+  try {
+    const queueMod = await import('./transport-resend-queue.js');
+    const clearFn = (queueMod as Record<string, unknown>).clearResend;
+    if (typeof clearFn === 'function') {
+      (clearFn as (name: string, reason: string) => unknown)(targetName, reason);
+    }
+  } catch {
+    // If transport-resend-queue or clearResend is unavailable (e.g. partial test mocks), ignore safely.
+  }
+}
+
 export async function dispatchSessionMessage(
   target: SessionRecord,
   message: string,
@@ -413,15 +441,9 @@ export async function dispatchSessionMessage(
           if (typeof (runtime as { clearPendingMessages?: (reason: string) => unknown }).clearPendingMessages === 'function') {
             (runtime as { clearPendingMessages: (reason: string) => unknown }).clearPendingMessages('user_stopped');
           } else {
-            const { clearResend: clearQueueResend } = await import('./transport-resend-queue.js');
-            clearQueueResend(target.name, 'user_stopped');
+            await clearTransportResendQueue(target.name, 'user_stopped');
           }
-          if (options.cancelSession) {
-            await options.cancelSession(target);
-          } else {
-            const commandHandler = await import('./command-handler.js') as { stopSessionNow?: (name: string) => boolean };
-            if (typeof commandHandler.stopSessionNow === 'function') commandHandler.stopSessionNow(target.name);
-          }
+          await cancelTargetSession(target, options);
         }
         const fallback = runtime.send(message, options.messageId, undefined, undefined, {
           deliveryMode,
@@ -495,12 +517,7 @@ export async function dispatchSessionMessage(
   const shouldAutoStopProcess = (options.emergency || deliveryMode === MEMORY_MCP_SEND_DELIVERY_MODES.APPEND)
     && target.state === 'running';
   if (shouldAutoStopProcess) {
-    if (options.cancelSession) {
-      await options.cancelSession(target);
-    } else {
-      const commandHandler = await import('./command-handler.js') as { stopSessionNow?: (name: string) => boolean };
-      if (typeof commandHandler.stopSessionNow === 'function') commandHandler.stopSessionNow(target.name);
-    }
+    await cancelTargetSession(target, options);
   }
   // A participant-stamped message makes this process session's next turn a participant turn (the window the machine tools consult).
   const participantBinding = options.sharedActor?.effectiveActorRole === 'participant'

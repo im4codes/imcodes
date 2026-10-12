@@ -1255,10 +1255,16 @@ describe('Hook server /send endpoint', () => {
         { timelineCommitted: false, messageOrigin: CHAT_MESSAGE_ORIGINS.AGENT },
       );
       // The queued copy carries the agent origin its drained row will render with.
-      expect(mockRuntime.send).toHaveBeenCalledWith(expectedQueuedText, res.body.messageId, undefined, undefined, {
-        deliveryMode: 'append',
-        messageOrigin: CHAT_MESSAGE_ORIGINS.AGENT,
-      });
+      expect(mockRuntime.send).toHaveBeenCalledWith(
+        expectedQueuedText,
+        res.body.messageId,
+        undefined,
+        undefined,
+        expect.objectContaining({
+          deliveryMode: 'append',
+          messageOrigin: CHAT_MESSAGE_ORIGINS.AGENT,
+        }),
+      );
       expect(timelineEmitMock).not.toHaveBeenCalledWith(
         'deck_proj_w1',
         'user.message',

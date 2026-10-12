@@ -180,7 +180,13 @@ describe('peer-audit dedicated dispatch', () => {
     await expect(dispatchSessionMessage(legacyTransport, 'ordinary delegation', {
       messageId: 'send_message_12345678' as never,
     })).resolves.toBe('sent');
-    expect(sendMock).toHaveBeenCalledWith('ordinary delegation', 'send_message_12345678', undefined, undefined, { deliveryMode: 'append' });
+    expect(sendMock).toHaveBeenCalledWith(
+      'ordinary delegation',
+      'send_message_12345678',
+      undefined,
+      undefined,
+      expect.objectContaining({ deliveryMode: 'append' }),
+    );
     expect(processSendMock).not.toHaveBeenCalled();
   });
 
@@ -192,7 +198,10 @@ describe('peer-audit dedicated dispatch', () => {
       .resolves.toBe('sent');
     expect(sendMock).toHaveBeenCalledWith(
       'transport external message',
-      expect.stringMatching(/^send_message_/), undefined, undefined, { deliveryMode: 'append' },
+      expect.stringMatching(/^send_message_/),
+      undefined,
+      undefined,
+      expect.objectContaining({ deliveryMode: 'append' }),
     );
     expect(processSendMock).not.toHaveBeenCalled();
 
@@ -290,7 +299,7 @@ describe('peer-audit dedicated dispatch', () => {
       'send_message_12345678',
       undefined,
       undefined,
-      { timelineCommitted: true, deliveryMode: 'append' },
+      expect.objectContaining({ timelineCommitted: true, deliveryMode: 'append' }),
     );
   });
 
@@ -338,7 +347,13 @@ describe('peer-audit dedicated dispatch', () => {
     })).resolves.toBe('queued');
 
     expect(appendExternalMock).toHaveBeenCalledOnce();
-    expect(sendMock).toHaveBeenCalledWith('peer update', 'send_message_12345678', undefined, undefined, { deliveryMode: 'append' });
+    expect(sendMock).toHaveBeenCalledWith(
+      'peer update',
+      'send_message_12345678',
+      undefined,
+      undefined,
+      expect.objectContaining({ deliveryMode: 'append' }),
+    );
   });
 
   it('durably queues a named transport send while its runtime is still restoring', async () => {

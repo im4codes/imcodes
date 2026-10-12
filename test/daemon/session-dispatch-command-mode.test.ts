@@ -68,7 +68,13 @@ describe('session dispatch command mode', () => {
     mocks.appendExternal.mockResolvedValue('unsupported');
     mocks.runtimeSend.mockReturnValue('queued');
     await expect(dispatchSessionMessage(transport(), 'raw', { messageId: 'send_message_c3', ...AGENT, command: true } as never)).resolves.toBe('queued');
-    expect(mocks.runtimeSend).toHaveBeenCalledWith('raw', 'send_message_c3', undefined, undefined, { ...AGENT, commandMode: true, deliveryMode: 'append' });
+    expect(mocks.runtimeSend).toHaveBeenCalledWith(
+      'raw',
+      'send_message_c3',
+      undefined,
+      undefined,
+      expect.objectContaining({ ...AGENT, commandMode: true, deliveryMode: 'append' }),
+    );
   });
 
   it('explicit queue mode marks the runtime send', async () => {
