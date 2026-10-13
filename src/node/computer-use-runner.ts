@@ -1,8 +1,10 @@
 import { execFile, spawn, type ChildProcess, type ChildProcessWithoutNullStreams } from 'node:child_process';
+import { realpathSync } from 'node:fs';
 import { access, mkdtemp, rm, stat } from 'node:fs/promises';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve, win32 as pathWin32 } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import WebSocket from 'ws';
 import {
   COMPUTER_USE_DEFAULT_TIMEOUT_MS,
@@ -30,6 +32,11 @@ import {
   MACOS_COMPUTER_USE_RUNTIME_ROOT,
   verifyMacosComputerUseExecutable,
 } from './macos-computer-use.js';
+import {
+  allowLinuxComputerUseHelperFiles,
+  resolveActiveLinuxDesktopUser,
+  resolveLinuxDesktopSessionEnv,
+} from './linux-desktop-session.js';
 import {
   registerBrowserProcessResource,
   registerMcpProcessResource,
@@ -146,11 +153,21 @@ function openComputerUseCandidateBinaries(options: OpenComputerUseResolutionOpti
   ];
 
   if (options.moduleFilePath) {
-    pushPackagedHelperCandidates(candidates, dirname(resolve(options.moduleFilePath)), key, platform, binary);
+    let realModule = options.moduleFilePath;
+    try { realModule = realpathSync(options.moduleFilePath); } catch { /* best effort */ }
+    pushPackagedHelperCandidates(candidates, dirname(resolve(realModule)), key, platform, binary);
+    if (realModule !== options.moduleFilePath) {
+      pushPackagedHelperCandidates(candidates, dirname(resolve(options.moduleFilePath)), key, platform, binary);
+    }
   }
   const entryFilePath = options.entryFilePath === undefined ? process.argv[1] : options.entryFilePath;
   if (entryFilePath) {
-    pushPackagedHelperCandidates(candidates, dirname(resolve(entryFilePath)), key, platform, binary);
+    let realEntry = entryFilePath;
+    try { realEntry = realpathSync(entryFilePath); } catch { /* best effort */ }
+    pushPackagedHelperCandidates(candidates, dirname(resolve(realEntry)), key, platform, binary);
+    if (realEntry !== entryFilePath) {
+      pushPackagedHelperCandidates(candidates, dirname(resolve(entryFilePath)), key, platform, binary);
+    }
   }
   candidates.push(
     ...(platform === 'darwin' ? [
@@ -163,6 +180,12 @@ function openComputerUseCandidateBinaries(options: OpenComputerUseResolutionOpti
     // controlled-node / manually-installed sidecar next to the running executable.
     join(dirname(process.execPath), 'computer-use-helper', binary),
     join(dirname(process.execPath), 'computer-use-helper', key, binary),
+    ...(platform === 'linux' ? [
+      `/usr/lib/node_modules/imcodes/dist/computer-use-helper/${key}/${binary}`,
+      `/usr/local/lib/node_modules/imcodes/dist/computer-use-helper/${key}/${binary}`,
+      `/var/lib/imcodes-node/computer-use-helper/${binary}`,
+      `/var/lib/imcodes-node/computer-use-helper/${key}/${binary}`,
+    ] : []),
     platform === 'win32' ? WINDOWS_DEFAULT_OCU_EXE : undefined,
     binary,
   );
@@ -195,10 +218,15 @@ export async function resolveOpenComputerUseBinaryForTest(options: OpenComputerU
   });
 }
 
+const currentModuleFilePath = typeof import.meta !== 'undefined' && import.meta?.url
+  ? fileURLToPath(import.meta.url)
+  : undefined;
+
 async function resolveOpenComputerUseBinary(): Promise<string> {
   return resolveOpenComputerUseBinaryForCurrentProcessForTest({
     platform: process.platform,
     arch: process.arch,
+    moduleFilePath: currentModuleFilePath,
     env: process.env,
     cwd: process.cwd(),
     fileExists,
@@ -216,14 +244,10 @@ async function resolveOpenComputerUseBinary(): Promise<string> {
   });
 }
 
-export async function resolveOpenComputerUseBinaryForCurrentProcessForTest(options: Omit<
-  Parameters<typeof resolveOpenComputerUseBinaryForTest>[0],
-  'moduleFilePath'
->): Promise<string> {
+export async function resolveOpenComputerUseBinaryForCurrentProcessForTest(options: Parameters<typeof resolveOpenComputerUseBinaryForTest>[0]): Promise<string> {
   // The controlled-node executable is an esbuild CJS/SEA bundle. In that
-  // format `import.meta.url` is undefined. Resolve from the running entry and
-  // cwd candidates instead; both ESM daemon builds and SEA executables put the
-  // helper beside that entry, and neither route can throw ERR_INVALID_ARG_TYPE.
+  // format `import.meta.url` is undefined. When running under ESM daemon or node,
+  // moduleFilePath locates the packaged helper beside the module.
   return resolveOpenComputerUseBinaryForTest(options);
 }
 
@@ -418,13 +442,33 @@ class OpenComputerUseMcpClient {
   private async start(): Promise<void> {
     await this.close();
     await verifyOpenComputerUseBinaryForLaunch(this.binary);
-    const env = process.platform === 'win32'
-      ? { ...process.env, OPEN_COMPUTER_USE_WINDOWS_ALLOW_UIA_TEXT_FALLBACK: '1' }
-      : process.env;
+    let env: NodeJS.ProcessEnv = process.env;
+    let spawnUid: number | undefined;
+    let spawnGid: number | undefined;
+    let spawnCwd: string | undefined;
+
+    if (process.platform === 'win32') {
+      env = { ...process.env, OPEN_COMPUTER_USE_WINDOWS_ALLOW_UIA_TEXT_FALLBACK: '1' };
+    } else if (process.platform === 'linux') {
+      env = resolveLinuxDesktopSessionEnv(process.env);
+      if (typeof process.getuid === 'function' && process.getuid() === 0) {
+        const guiUser = resolveActiveLinuxDesktopUser();
+        if (guiUser) {
+          spawnUid = guiUser.uid;
+          spawnGid = guiUser.gid;
+          spawnCwd = guiUser.home;
+          await allowLinuxComputerUseHelperFiles();
+        }
+      }
+    }
+
     const child = spawn(this.binary, ['mcp'], {
       windowsHide: true,
       env,
       detached: process.platform !== 'win32',
+      ...(spawnUid !== undefined ? { uid: spawnUid } : {}),
+      ...(spawnGid !== undefined ? { gid: spawnGid } : {}),
+      ...(spawnCwd ? { cwd: spawnCwd } : {}),
     });
     this.child = child;
     if (this.resourceOwner && child.pid) {
@@ -615,8 +659,13 @@ export function openComputerUseCallArgs(tool: string, argsJson: string): string[
 }
 
 export function openComputerUseEnv(tool: string, baseEnv: NodeJS.ProcessEnv = process.env, platform: NodeJS.Platform = process.platform): NodeJS.ProcessEnv | undefined {
-  if (platform !== 'win32' || tool !== 'type_text') return undefined;
-  return { ...baseEnv, OPEN_COMPUTER_USE_WINDOWS_ALLOW_UIA_TEXT_FALLBACK: '1' };
+  if (platform === 'win32' && tool === 'type_text') {
+    return { ...baseEnv, OPEN_COMPUTER_USE_WINDOWS_ALLOW_UIA_TEXT_FALLBACK: '1' };
+  }
+  if (platform === 'linux') {
+    return resolveLinuxDesktopSessionEnv(baseEnv);
+  }
+  return undefined;
 }
 
 const ACTION_TOOLS: ReadonlySet<string> = new Set([
@@ -1126,7 +1175,10 @@ function actionableComputerUseError(
   if (isBrowserUseTool(tool) && text.includes('browser_executable_not_found')) {
     return 'No supported browser is installed on this machine. Install Google Chrome, Chromium, or Microsoft Edge, then retry the browser request.';
   }
-  if (platform === 'linux' && /Namespace Atspi not available|No module named ['"]pyatspi['"]/.test(text)) {
+  if (platform === 'linux' && (
+    /Namespace Atspi not available|No module named ['"]pyatspi['"]/.test(text)
+    || /Linux runtime requires an active desktop session/i.test(text)
+  )) {
     return 'Desktop app control is unavailable because this Linux host is missing AT-SPI accessibility support or a graphical desktop session. Browser automation is separate: install Google Chrome, Chromium, or Microsoft Edge and use a browser_* tool.';
   }
   if (platform === 'darwin' && text.includes('signed_macos_open_computer_use_helper_unavailable')) {

@@ -1,5 +1,6 @@
-import { resolve } from 'node:path';
-import { readFileSync } from 'node:fs';
+import { join, resolve } from 'node:path';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { describe, expect, it, vi } from 'vitest';
 import {
   browserExecutableCandidatesForTest,
@@ -332,6 +333,32 @@ describe('computer use runner open-computer-use CLI', () => {
     expect(result.error).toContain('Open Computer Use helper is not installed');
     expect(result.error).toContain('browser_* tools');
     expect(result.error).not.toContain('ENOENT');
+  });
+
+  it('turns missing Linux active desktop session into an actionable accessibility error', () => {
+    const errorText = 'Traceback (most recent call last):\n  File "runtime.py", line 66, in require_desktop_session\nRuntimeError: Linux runtime requires an active desktop session; missing XDG_RUNTIME_DIR, DBUS_SESSION_BUS_ADDRESS';
+    const result = normalizeComputerUseErrorForTest('list_apps', errorText, 'linux');
+    expect(result.error).toContain('missing AT-SPI accessibility support or a graphical desktop session');
+    expect(result.error).toContain('browser_* tool');
+    expect(result.error).not.toContain('RuntimeError');
+  });
+
+  it('dereferences symlinks in entryFilePath candidate binary discovery', () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'symlink-candidate-test-'));
+    try {
+      const realDir = join(tempDir, 'lib', 'dist', 'src');
+      mkdirSync(realDir, { recursive: true });
+      const targetScript = join(realDir, 'index.js');
+      writeFileSync(targetScript, '');
+      const symlinkScript = join(tempDir, 'imcodes-symlink');
+      symlinkSync(targetScript, symlinkScript);
+
+      const candidates = openComputerUseCandidateBinariesForTest(undefined, symlinkScript, 'linux', 'x64');
+      const expectedHelper = resolve(tempDir, 'lib', 'dist', 'computer-use-helper', 'linux-x64', 'open-computer-use');
+      expect(candidates).toContain(expectedHelper);
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
   });
 
   it('makes Windows fast coordinate pointer actions per-monitor DPI-aware before geometry calls', () => {

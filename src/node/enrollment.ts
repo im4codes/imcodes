@@ -494,8 +494,9 @@ async function assertWritablePathIsNotSymlink(path: string, errorCode: string): 
 
 async function writeProtectedJson(path: string, value: unknown): Promise<void> {
   const dir = dirname(path);
-  await mkdir(dir, { recursive: true, mode: 0o700 });
-  if (process.platform !== 'win32') await chmod(dir, 0o700);
+  const dirMode = process.platform === 'linux' && dir === '/var/lib/imcodes-node' ? 0o755 : 0o700;
+  await mkdir(dir, { recursive: true, mode: dirMode });
+  if (process.platform !== 'win32') await chmod(dir, dirMode);
   const temp = `${path}.${process.pid}.tmp`;
   const handle = await open(temp, 'w', 0o600);
   try {

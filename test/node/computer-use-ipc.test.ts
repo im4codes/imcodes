@@ -806,4 +806,76 @@ describe('computer use IPC macOS GUI-session boundary', () => {
       host.close();
     }
   });
+
+  it('launches the Linux helper with discovered desktop environment and active user', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'imcodes-ipc-linux-test-'));
+    dirs.push(dir);
+    const execPath = join(dir, 'imcodes-node-linux');
+    await writeFile(execPath, 'binary');
+
+    const fakeUser = {
+      uid: 1000,
+      gid: 1000,
+      username: 'desktop-user',
+      home: '/home/desktop-user',
+    };
+
+    let launchedWithUser: typeof fakeUser | null | undefined;
+    let launchedWithEnv: NodeJS.ProcessEnv | undefined;
+
+    const launchHelper = vi.fn((_exe: string, pipe: string, user: typeof fakeUser | null | undefined, env: NodeJS.ProcessEnv) => {
+      launchedWithUser = user;
+      launchedWithEnv = env;
+      const socket = net.createConnection(pipe, () => {
+        socket.write(`${JSON.stringify({ hello: COMPUTER_USE_IPC_HELPER_HELLO })}\n`);
+      });
+      socket.setEncoding('utf8');
+      socket.once('data', (chunk) => {
+        const request = JSON.parse(String(chunk).trim()) as {
+          id: string;
+          request: { correlationId: string; tool: 'list_apps' };
+        };
+        socket.write(`${JSON.stringify({
+          id: request.id,
+          result: {
+            type: DAEMON_MSG.COMPUTER_USE_RESULT,
+            correlationId: request.request.correlationId,
+            ok: true,
+            tool: request.request.tool,
+            content: [{ type: 'text', text: 'linux-apps' }],
+            durationMs: 1,
+          },
+        })}\n`);
+      });
+    });
+
+    const allowFiles = vi.fn(async () => {});
+    const authorizeSocket = vi.fn(async () => {});
+
+    const host = new ComputerUseIpcHost({
+      platform: 'linux',
+      arch: 'x64',
+      execPath,
+      resolveLinuxSessionUser: async () => fakeUser,
+      allowLinuxHelperFiles: allowFiles,
+      authorizeLinuxComputerUseSocket: authorizeSocket,
+      launchLinuxUserSessionHelper: launchHelper,
+    });
+
+    try {
+      const result = await host.call({
+        type: DAEMON_COMMAND_TYPES.COMPUTER_USE,
+        correlationId: 'corr-linux-1',
+        tool: 'list_apps',
+      });
+      expect(result.ok).toBe(true);
+      expect(result.content[0]?.text).toBe('linux-apps');
+      expect(allowFiles).toHaveBeenCalledWith(execPath);
+      expect(authorizeSocket).toHaveBeenCalledOnce();
+      expect(launchHelper).toHaveBeenCalledOnce();
+      expect(launchedWithEnv?.DISPLAY).toBeDefined();
+    } finally {
+      host.close();
+    }
+  });
 });

@@ -50,6 +50,12 @@ import {
   quoteWindowsArgument,
   windowsNamedPipeClientAclCommand,
 } from './windows-user-session.js';
+import {
+  allowLinuxComputerUseHelperFiles,
+  resolveActiveLinuxDesktopUser,
+  resolveLinuxDesktopSessionEnv,
+  type LinuxDesktopUser,
+} from './linux-desktop-session.js';
 
 /**
  * The request never reached the helper.
@@ -187,6 +193,15 @@ export interface ComputerUseIpcHostOptions {
     user: MacosConsoleUser,
     runtime: MacosComputerUseRuntime,
     pipe: string,
+  ) => void;
+  resolveLinuxSessionUser?: () => Promise<LinuxDesktopUser | null> | LinuxDesktopUser | null;
+  allowLinuxHelperFiles?: (execPath: string) => Promise<void>;
+  authorizeLinuxComputerUseSocket?: (path: string, user?: LinuxDesktopUser | null) => Promise<void>;
+  launchLinuxUserSessionHelper?: (
+    exe: string,
+    pipe: string,
+    user: LinuxDesktopUser | null | undefined,
+    env: NodeJS.ProcessEnv,
   ) => void;
 }
 
@@ -394,6 +409,8 @@ export class ComputerUseIpcHost {
                 // transfer it to the exact console user once resolved.
                 await chmod(this.path, 0o600);
                 await this.launchMacosHelper(tool);
+              } else if (platform === 'linux') {
+                await this.launchLinuxHelper();
               } else {
                 launchSameSessionHelper(this.options.execPath ?? process.execPath, this.path);
               }
@@ -412,6 +429,33 @@ export class ComputerUseIpcHost {
     // already happened instead of starting a helper.
     void ready.then(clearReady, () => { /* every rejection path already cleared it. */ });
     return ready;
+  }
+
+  private async launchLinuxHelper(): Promise<void> {
+    const execPath = this.options.execPath ?? process.execPath;
+    const resolveUser = this.options.resolveLinuxSessionUser ?? resolveActiveLinuxDesktopUser;
+    const allowFiles = this.options.allowLinuxHelperFiles ?? allowLinuxComputerUseHelperFiles;
+    const authorizeSocket = this.options.authorizeLinuxComputerUseSocket ?? (async (path: string) => {
+      await chmod(path, 0o666);
+    });
+    const launchHelper = this.options.launchLinuxUserSessionHelper ?? ((exe, pipe, user, env) => {
+      const child = spawn(exe, helperArgv(pipe), {
+        detached: true,
+        stdio: 'ignore',
+        windowsHide: true,
+        ...(user ? { uid: user.uid, gid: user.gid, cwd: user.home } : {}),
+        env,
+      });
+      child.unref();
+    });
+
+    const isRoot = typeof process.getuid === 'function' && process.getuid() === 0;
+    const user = isRoot ? await resolveUser() : null;
+    const desktopEnv = resolveLinuxDesktopSessionEnv(process.env, { user });
+
+    await allowFiles(execPath);
+    await authorizeSocket(this.path, user ?? undefined);
+    launchHelper(execPath, this.path, user, { ...process.env, ...desktopEnv });
   }
 
   private async launchMacosHelper(tool: ComputerUseToolName): Promise<void> {
