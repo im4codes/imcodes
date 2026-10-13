@@ -1916,6 +1916,12 @@ function sdkAgentsProviderLabel(t: ChatTranslate, row: Pick<SdkSubagentStatusRow
       return t('chat.sdk_agents_provider_qwen');
     case SDK_SUBAGENT_PROVIDERS.GEMINI_SDK:
       return t('chat.sdk_agents_provider_gemini');
+    case SDK_SUBAGENT_PROVIDERS.GROK_SDK:
+      return t('chat.sdk_agents_provider_grok');
+    case SDK_SUBAGENT_PROVIDERS.AGY_SDK:
+      return t('chat.sdk_agents_provider_agy');
+    case SDK_SUBAGENT_PROVIDERS.MUSE_CODE_SDK:
+      return t('chat.sdk_agents_provider_muse');
     default:
       return t('chat.sdk_agents_provider_unknown');
   }
@@ -1933,6 +1939,8 @@ function sdkAgentsTaskKindLabel(t: ChatTranslate, row: SdkSubagentStatusRow): st
     case SDK_SUBAGENT_PROVIDER_KINDS.QWEN_RUNTIME_AGENT:
     case SDK_SUBAGENT_PROVIDER_KINDS.GEMINI_RUNTIME_AGENT:
     case SDK_SUBAGENT_PROVIDER_KINDS.GROK_RUNTIME_AGENT:
+    case SDK_SUBAGENT_PROVIDER_KINDS.AGY_RUNTIME_AGENT:
+    case SDK_SUBAGENT_PROVIDER_KINDS.MUSE_RUNTIME_AGENT:
       return t('chat.sdk_agents_task_agent');
     default:
       return t('chat.sdk_agents_task_background');

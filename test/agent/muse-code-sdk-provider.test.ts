@@ -15,6 +15,12 @@ import {
 import { MUSE_SDK_EFFORT_LEVELS } from '../../shared/effort-levels.js';
 import { NATIVE_AGENT_ADMISSION_MODES } from '../../shared/native-collaboration-policy.js';
 import type { MessageDelta } from '../../shared/agent-message.js';
+import {
+  SDK_SUBAGENT_DETAIL_KIND,
+  SDK_SUBAGENT_PROVIDERS,
+  SDK_SUBAGENT_PROVIDER_KINDS,
+  SDK_SUBAGENT_STATUS,
+} from '../../shared/sdk-subagent-status.js';
 
 describe('MuseCodeSdkProvider contract', () => {
   it('declares the official Muse Code transport capabilities and configuration', () => {
@@ -54,8 +60,9 @@ describe('MuseCodeSdkProvider contract', () => {
     const result = await provider.listModels();
     expect(result.models.length).toBeGreaterThanOrEqual(3);
     expect(result.models.map((m) => m.id)).toEqual(
-      expect.arrayContaining(['muse-spark', 'muse-wonder', 'muse-fast']),
+      expect.arrayContaining(['wander', 'muse-spark', 'muse-wonder', 'muse-fast']),
     );
+    expect(result.defaultModel).toBe('wander');
     for (const m of result.models) {
       expect(m.supportsReasoningEffort).toBe(true);
       expect(m.supportedEffortLevels).toEqual(MUSE_SDK_EFFORT_LEVELS);
@@ -92,6 +99,56 @@ describe('MuseCodeSdkProvider contract', () => {
         supportedEffortLevels: MUSE_SDK_EFFORT_LEVELS,
       },
     ]);
+  });
+
+  it('queries models using real wire format with modelId and displayLabel', async () => {
+    const provider = new MuseCodeSdkProvider();
+    const mockCommand = vi.fn().mockResolvedValue({
+      models: [
+        { modelId: 'muse-spark-1.3', displayLabel: 'muse-spark-1.3', providerId: 'meta' },
+      ],
+      profileId: 'tbh',
+      providerId: 'meta',
+      source: 'bundledCatalog',
+    });
+    (provider as any).spawned = {
+      connection: {
+        command: mockCommand,
+      },
+    };
+
+    const result = await provider.listModels();
+    expect(result.models).toEqual([
+      {
+        id: 'muse-spark-1.3',
+        name: 'muse-spark-1.3',
+        supportsReasoningEffort: true,
+        supportedEffortLevels: MUSE_SDK_EFFORT_LEVELS,
+      },
+    ]);
+    expect(result.defaultModel).toBe('muse-spark-1.3');
+  });
+
+  it('reports memory MCP status as ready when client is connected, degraded when registration failed', () => {
+    const provider = new MuseCodeSdkProvider();
+    expect(provider.getMemoryMcpStatus()).toMatchObject({
+      status: 'unknown',
+      connected: false,
+    });
+
+    (provider as any).client = {};
+    expect(provider.getMemoryMcpStatus()).toMatchObject({
+      status: 'ready',
+      connected: true,
+      degradedReasons: [],
+    });
+
+    (provider as any).mcpRegistration = { degraded: true, reason: 'test_reason' };
+    expect(provider.getMemoryMcpStatus()).toMatchObject({
+      status: 'degraded',
+      connected: true,
+      degradedReasons: ['test_reason'],
+    });
   });
 });
 
@@ -154,6 +211,7 @@ describe('MuseCodeSdkProvider session and turn lifecycle', () => {
     expect(mockClient.startSession).toHaveBeenCalledWith({
       workspaceRoot: '/home/k/project',
       modelId: 'muse-spark',
+      providerId: 'meta',
     });
 
     const receivedDeltas: string[] = [];
@@ -322,5 +380,94 @@ describe('MuseCodeSdkProvider session and turn lifecycle', () => {
     });
 
     expect(result).toBe('stale');
+  });
+
+  it('streams subagent items and emits ToolCallEvent with SdkSubagentDetail', async () => {
+    const provider = new MuseCodeSdkProvider();
+    const mockTurn = {
+      turnId: 'turn-subagent-1',
+      deltas: async function* () {},
+      items: async function* () {
+        yield {
+          kind: 'subagent',
+          itemId: 'item-sub-1',
+          subagentId: 'sub-agent-uuid-42',
+          role: 'Researcher',
+          agentPath: 'agents/research',
+          objective: 'Analyze project codebase',
+          status: 'inProgress',
+          controlStatus: 'running',
+        };
+        yield {
+          kind: 'subagent',
+          itemId: 'item-sub-1',
+          subagentId: 'sub-agent-uuid-42',
+          role: 'Researcher',
+          agentPath: 'agents/research',
+          objective: 'Analyze project codebase',
+          status: 'completed',
+          controlStatus: 'closed',
+          result: { text: 'Analysis finished successfully.' },
+          durationMs: 450,
+          usage: { totalTokens: 1500 },
+        };
+      },
+      completed: Promise.resolve({
+        kind: 'completed' as const,
+        params: {
+          turnId: 'turn-subagent-1',
+          terminal: 'succeeded' as const,
+          durationMs: 500,
+        },
+      }),
+    };
+
+    const sessionObj = {
+      sessionId: 'muse-sess-subagent',
+      onApproval: vi.fn(),
+      sendUserTurn: vi.fn().mockResolvedValue(mockTurn),
+    };
+    (provider as any).client = {
+      startSession: vi.fn().mockResolvedValue(sessionObj),
+    };
+
+    const routeId = await provider.createSession({ cwd: '/home/k/project' });
+    const receivedTools: ToolCallEvent[] = [];
+    provider.onToolCall((_sessionId, tool) => {
+      receivedTools.push(tool);
+    });
+
+    await provider.send(routeId, 'Run research subagent');
+
+    expect(receivedTools.length).toBe(2);
+    expect(receivedTools[0].detail).toMatchObject({
+      kind: SDK_SUBAGENT_DETAIL_KIND,
+      summary: 'Muse sub-agent Researcher',
+      meta: {
+        isSdkSubagent: true,
+        provider: SDK_SUBAGENT_PROVIDERS.MUSE_CODE_SDK,
+        providerKind: SDK_SUBAGENT_PROVIDER_KINDS.MUSE_RUNTIME_AGENT,
+        normalizedStatus: SDK_SUBAGENT_STATUS.RUNNING,
+        active: true,
+        terminal: false,
+        backgrounded: true,
+      },
+    });
+    expect(receivedTools[1].detail).toMatchObject({
+      kind: SDK_SUBAGENT_DETAIL_KIND,
+      summary: 'Muse sub-agent Researcher',
+      output: 'Analysis finished successfully.',
+      meta: {
+        isSdkSubagent: true,
+        provider: SDK_SUBAGENT_PROVIDERS.MUSE_CODE_SDK,
+        providerKind: SDK_SUBAGENT_PROVIDER_KINDS.MUSE_RUNTIME_AGENT,
+        normalizedStatus: SDK_SUBAGENT_STATUS.COMPLETE,
+        active: false,
+        terminal: true,
+        backgrounded: true,
+        usageTotalTokens: 1500,
+        usageDurationMs: 450,
+      },
+    });
   });
 });

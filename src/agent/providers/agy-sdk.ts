@@ -15,11 +15,23 @@ import type {
 } from '../transport-provider.js';
 import type { ProviderActiveWorkSnapshot, SessionActivityBusyReason } from '../../../shared/session-activity-types.js';
 import {
+  BACKGROUND_SUBAGENT_WAKE_MODES,
   CONNECTION_MODES,
   normalizeProviderPayload,
   PROVIDER_ERROR_CODES,
   SESSION_OWNERSHIP,
 } from '../transport-provider.js';
+import {
+  SDK_SUBAGENT_DETAIL_KIND,
+  SDK_SUBAGENT_PROVIDERS,
+  SDK_SUBAGENT_PROVIDER_KINDS,
+  SDK_SUBAGENT_SCHEMA_VERSION,
+  SDK_SUBAGENT_STATUS,
+  buildSdkSubagentSafeDetail,
+  makeAgySubagentCanonicalKey,
+  type SdkSubagentDetail,
+  type SdkSubagentNormalizedStatus,
+} from '../../../shared/sdk-subagent-status.js';
 import type { AgentMessage, MessageDelta, ToolCallEvent } from '../../../shared/agent-message.js';
 import type { ProviderContextPayload } from '../../../shared/context-types.js';
 import type { TransportAttachment } from '../../../shared/transport-attachments.js';
@@ -90,6 +102,15 @@ interface AgySessionState {
   stderrTail: string;
   toolSteps: Map<number, string>;
   lastStatusSignature?: string;
+  runtimeSubagentStartedAtByKey?: Map<string, number>;
+  runtimeSubagentToolCalls?: Map<string, {
+    canonicalKey: string;
+    agentName?: string;
+    agentPath?: string;
+    model?: string;
+    prompt?: string;
+    startedAtMs: number;
+  }>;
 }
 
 function asRecord(value: unknown): Record<string, unknown> {
@@ -109,6 +130,52 @@ function asNumber(value: unknown): number | undefined {
 function buildAgyMemoryMcpEnv(config: SessionConfig): Record<string, string> | undefined {
   const env = getDefaultMcpServers(config)[IMCODES_MEMORY_MCP_SERVER_NAME]?.env;
   return env && Object.keys(env).length > 0 ? env : undefined;
+}
+
+function isAgySubagentTool(name: string): boolean {
+  const normalized = name.toLowerCase().replace(/[-_]/g, '');
+  return normalized === 'invokesubagent'
+    || normalized === 'browsersubagent'
+    || normalized === 'managesubagents'
+    || normalized === 'subagent'
+    || normalized === 'agent';
+}
+
+function parseAgySubagentInput(input: unknown): {
+  agentName?: string;
+  agentPath?: string;
+  model?: string;
+  prompt?: string;
+} {
+  const rec = asRecord(input);
+  if (Array.isArray(rec.Subagents) && rec.Subagents.length > 0) {
+    const first = asRecord(rec.Subagents[0]);
+    const role = asString(first.Role) ?? asString(first.role);
+    const typeName = asString(first.TypeName) ?? asString(first.type);
+    const prompt = asString(first.Prompt) ?? asString(first.prompt);
+    const model = asString(first.Model) ?? asString(first.model);
+    const names = rec.Subagents.map((s) => {
+      const item = asRecord(s);
+      return asString(item.Role) ?? asString(item.TypeName) ?? asString(item.role) ?? asString(item.type);
+    }).filter(Boolean);
+    return {
+      agentName: names.length > 1 ? `(${names.length}) ${names.join(', ')}` : (role ?? typeName ?? 'Subagent'),
+      agentPath: typeName ?? role,
+      model,
+      prompt,
+    };
+  }
+  const role = asString(rec.Role) ?? asString(rec.role);
+  const typeName = asString(rec.TypeName) ?? asString(rec.type) ?? asString(rec.subagent_type);
+  const name = asString(rec.name) ?? asString(rec.Name);
+  const prompt = asString(rec.Prompt) ?? asString(rec.prompt) ?? asString(rec.description);
+  const model = asString(rec.Model) ?? asString(rec.model);
+  return {
+    agentName: role ?? typeName ?? name,
+    agentPath: typeName ?? role ?? name,
+    model,
+    prompt,
+  };
 }
 
 /**
@@ -181,6 +248,7 @@ export class AgySdkProvider implements TransportProvider {
     // Reasoning effort is part of the model id (`…-high|medium|low`), not a separate knob.
     reasoningEffort: false,
     contextSupport: 'degraded-message-side-context-mapping',
+    backgroundSubagentWake: BACKGROUND_SUBAGENT_WAKE_MODES.RUNTIME,
     nativeAgentAdmission: NATIVE_AGENT_ADMISSION_MODES.SESSION_FENCE,
     compact: {
       execution: 'unsupported',
@@ -564,10 +632,43 @@ export class AgySdkProvider implements TransportProvider {
   private clearOpenToolSteps(sessionId: string, state: AgySessionState): void {
     if (state.toolSteps.size === 0) return;
     for (const [, id] of state.toolSteps) {
+      const subagentInfo = state.runtimeSubagentToolCalls?.get(id);
+      let detail: SdkSubagentDetail | undefined;
+      if (subagentInfo) {
+        detail = buildSdkSubagentSafeDetail({
+          kind: SDK_SUBAGENT_DETAIL_KIND,
+          summary: subagentInfo.agentName ? `Antigravity sub-agent ${subagentInfo.agentName}` : 'Antigravity sub-agent',
+          input: {
+            action: 'invoke_subagent',
+            ...(subagentInfo.prompt ? { description: subagentInfo.prompt } : {}),
+          },
+          meta: {
+            isSdkSubagent: true,
+            schemaVersion: SDK_SUBAGENT_SCHEMA_VERSION,
+            provider: SDK_SUBAGENT_PROVIDERS.AGY_SDK,
+            providerKind: SDK_SUBAGENT_PROVIDER_KINDS.AGY_RUNTIME_AGENT,
+            canonicalKey: subagentInfo.canonicalKey,
+            normalizedStatus: SDK_SUBAGENT_STATUS.COMPLETE,
+            rawStatus: 'complete',
+            active: false,
+            terminal: true,
+            parentSessionId: state.conversationId ?? sessionId,
+            parentToolUseId: id,
+            parentItemId: id,
+            agentPath: subagentInfo.agentPath ?? id,
+            ...(subagentInfo.agentName ? { agentName: subagentInfo.agentName } : {}),
+            ...(subagentInfo.model ? { model: subagentInfo.model } : {}),
+            startedAtMs: subagentInfo.startedAtMs,
+            backgrounded: true,
+          },
+        }, { allowRaw: false });
+        state.runtimeSubagentToolCalls?.delete(id);
+      }
       const tool: ToolCallEvent = {
         id,
-        name: 'tool',
+        name: subagentInfo ? 'Agent' : 'tool',
         status: 'complete',
+        ...(detail ? { detail } : {}),
       };
       for (const cb of this.toolCallCallbacks) cb(sessionId, tool);
     }
@@ -620,6 +721,83 @@ export class AgySdkProvider implements TransportProvider {
 
   private handleInit(sessionId: string, state: AgySessionState, event: Record<string, unknown>): void {
     this.noteConversationId(sessionId, state, asString(event.conversation_id));
+  }
+
+  private syncAgyManagedSubagents(sessionId: string, state: AgySessionState, output: string): void {
+    try {
+      const parsed = JSON.parse(output);
+      const items = Array.isArray(parsed) ? parsed : (Array.isArray((parsed as Record<string, unknown>)?.subagents) ? (parsed as Record<string, unknown>).subagents : null);
+      if (!Array.isArray(items)) return;
+      for (const item of items) {
+        if (!item || typeof item !== 'object') continue;
+        const subagent = item as Record<string, unknown>;
+        const conversationId = asString(subagent.conversationId)
+          ?? asString(subagent.conversation_id)
+          ?? asString(subagent.id);
+        if (!conversationId) continue;
+        const role = asString(subagent.role) ?? asString(subagent.Role);
+        const type = asString(subagent.type) ?? asString(subagent.TypeName);
+        const agentName = role ?? type ?? 'Subagent';
+        const rawState = (asString(subagent.state) ?? 'running').toLowerCase();
+        const stateDetail = asString(subagent.stateDetail) ?? asString(subagent.state_detail);
+        const canonicalKey = makeAgySubagentCanonicalKey(state.conversationId ?? state.routeId, conversationId);
+
+        const normalizedStatus: SdkSubagentNormalizedStatus =
+          /^(completed|complete|idle|done|success)$/.test(rawState)
+            ? SDK_SUBAGENT_STATUS.COMPLETE
+            : /^(failed|error|errored)$/.test(rawState)
+              ? SDK_SUBAGENT_STATUS.ERROR
+              : /^(canceling|canceled|cancelled|interrupted|stopped)$/.test(rawState)
+                ? SDK_SUBAGENT_STATUS.INTERRUPTED
+                : SDK_SUBAGENT_STATUS.RUNNING;
+        const terminal = normalizedStatus === SDK_SUBAGENT_STATUS.COMPLETE
+          || normalizedStatus === SDK_SUBAGENT_STATUS.ERROR
+          || normalizedStatus === SDK_SUBAGENT_STATUS.INTERRUPTED;
+
+        const startedAtByKey = state.runtimeSubagentStartedAtByKey ??= new Map<string, number>();
+        const startedAtMs = startedAtByKey.get(canonicalKey) ?? Date.now();
+        if (!terminal) startedAtByKey.set(canonicalKey, startedAtMs);
+
+        const detail = buildSdkSubagentSafeDetail({
+          kind: SDK_SUBAGENT_DETAIL_KIND,
+          summary: `Antigravity sub-agent ${agentName}`,
+          input: {
+            action: 'agy-manage-subagents',
+            ...(stateDetail ? { description: stateDetail } : {}),
+          },
+          ...(stateDetail ? { output: stateDetail } : {}),
+          meta: {
+            isSdkSubagent: true,
+            schemaVersion: SDK_SUBAGENT_SCHEMA_VERSION,
+            provider: SDK_SUBAGENT_PROVIDERS.AGY_SDK,
+            providerKind: SDK_SUBAGENT_PROVIDER_KINDS.AGY_RUNTIME_AGENT,
+            canonicalKey,
+            normalizedStatus,
+            rawStatus: rawState,
+            active: !terminal,
+            terminal,
+            parentSessionId: state.conversationId ?? sessionId,
+            parentItemId: conversationId,
+            agentPath: conversationId,
+            agentName,
+            startedAtMs,
+            backgrounded: true,
+          },
+        }, { allowRaw: false });
+
+        const subagentTool: ToolCallEvent = {
+          id: canonicalKey,
+          name: 'Agent',
+          status: terminal ? (normalizedStatus === SDK_SUBAGENT_STATUS.COMPLETE ? 'complete' : 'error') : 'running',
+          ...(detail.input ? { input: detail.input } : {}),
+          ...(detail.output ? { output: detail.output } : {}),
+          detail,
+        };
+        for (const cb of this.toolCallCallbacks) cb(sessionId, subagentTool);
+      }
+    } catch {
+      // Ignore non-JSON output
+    }
   }
 
   private handleStep(sessionId: string, state: AgySessionState, step: Record<string, unknown>): void {
@@ -684,7 +862,81 @@ export class AgySdkProvider implements TransportProvider {
         input: info.parameters,
         ...(done && output !== undefined ? { output } : {}),
       };
+
+      if (isAgySubagentTool(name)) {
+        const inputParsed = parseAgySubagentInput(info.parameters);
+        const existing = state.runtimeSubagentToolCalls?.get(id);
+        const agentName = existing?.agentName ?? inputParsed.agentName;
+        const agentPath = existing?.agentPath ?? inputParsed.agentPath ?? id;
+        const model = existing?.model ?? inputParsed.model ?? state.model;
+        const prompt = existing?.prompt ?? inputParsed.prompt;
+        const canonicalKey = existing?.canonicalKey
+          ?? makeAgySubagentCanonicalKey(state.conversationId ?? state.routeId, id);
+
+        const startedAtByKey = state.runtimeSubagentStartedAtByKey ??= new Map<string, number>();
+        const startedAtMs = existing?.startedAtMs ?? startedAtByKey.get(canonicalKey) ?? Date.now();
+        if (!done && !existing) {
+          startedAtByKey.set(canonicalKey, startedAtMs);
+          const toolCalls = state.runtimeSubagentToolCalls ??= new Map();
+          toolCalls.set(id, {
+            canonicalKey,
+            agentName,
+            agentPath,
+            model,
+            prompt,
+            startedAtMs,
+          });
+        }
+        const isError = Boolean(
+          done && output && (
+            output.toLowerCase().includes('error:')
+            || output.toLowerCase().startsWith('error')
+            || output.toLowerCase().includes('failed')
+          )
+        );
+        const normalizedStatus: SdkSubagentNormalizedStatus = !done
+          ? SDK_SUBAGENT_STATUS.RUNNING
+          : isError
+            ? SDK_SUBAGENT_STATUS.ERROR
+            : SDK_SUBAGENT_STATUS.COMPLETE;
+
+        const detail = buildSdkSubagentSafeDetail({
+          kind: SDK_SUBAGENT_DETAIL_KIND,
+          summary: agentName ? `Antigravity sub-agent ${agentName}` : 'Antigravity sub-agent',
+          input: {
+            action: name,
+            ...(prompt ? { description: prompt } : {}),
+          },
+          ...(done && output !== undefined ? { output } : {}),
+          meta: {
+            isSdkSubagent: true,
+            schemaVersion: SDK_SUBAGENT_SCHEMA_VERSION,
+            provider: SDK_SUBAGENT_PROVIDERS.AGY_SDK,
+            providerKind: SDK_SUBAGENT_PROVIDER_KINDS.AGY_RUNTIME_AGENT,
+            canonicalKey,
+            normalizedStatus,
+            rawStatus: !done ? 'running' : isError ? 'error' : 'complete',
+            active: !done,
+            terminal: done,
+            parentSessionId: state.conversationId ?? sessionId,
+            parentToolUseId: id,
+            parentItemId: id,
+            agentPath,
+            ...(agentName ? { agentName } : {}),
+            ...(model ? { model } : {}),
+            startedAtMs,
+            backgrounded: true,
+          },
+        }, { allowRaw: false });
+        tool.detail = detail;
+      }
+
       for (const cb of this.toolCallCallbacks) cb(sessionId, tool);
+
+      if (done && name === 'manage_subagents' && output) {
+        this.syncAgyManagedSubagents(sessionId, state, output);
+      }
+
       if (done) {
         state.toolSteps.delete(stepIndex);
         this.emitStatus(sessionId, state, {

@@ -7,6 +7,7 @@ import {
   buildCronRunTimelineProjection,
   buildRegisteredCronSystemContract,
   buildLegacyCronControlBlock,
+  isCronExprShortInterval,
   normalizeCronExecutionDetail,
   normalizeCronSendActionForInterval,
   registerCronControlAction,
@@ -65,6 +66,19 @@ describe('cron idle-only schedule default', () => {
   it('never overrides an explicit true or false choice', () => {
     expect(normalizeCronSendActionForInterval({ ...send, onlyWhenIdle: true }, 16 * 60_000)).toMatchObject({ onlyWhenIdle: true });
     expect(normalizeCronSendActionForInterval({ ...send, onlyWhenIdle: false }, 5 * 60_000)).toMatchObject({ onlyWhenIdle: false });
+  });
+
+  it('detects short cron schedule expressions', () => {
+    expect(isCronExprShortInterval('*/5 * * * *')).toBe(true);
+    expect(isCronExprShortInterval('*/10 * * * *')).toBe(true);
+    expect(isCronExprShortInterval('*/15 * * * *')).toBe(true);
+    expect(isCronExprShortInterval('* * * * *')).toBe(true);
+    expect(isCronExprShortInterval('*/20 * * * *')).toBe(false);
+    expect(isCronExprShortInterval('*/30 * * * *')).toBe(false);
+    expect(isCronExprShortInterval('0 * * * *')).toBe(false);
+    expect(isCronExprShortInterval('0 9 * * *')).toBe(false);
+    expect(isCronExprShortInterval('')).toBe(false);
+    expect(isCronExprShortInterval(undefined)).toBe(false);
   });
 });
 

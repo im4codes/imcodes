@@ -56,6 +56,32 @@ describe('sdk-subagent-status shared contract', () => {
     expect(parseSdkSubagentDetail(detail)).toEqual(expect.objectContaining({ kind: 'ok' }));
   });
 
+  it('accepts explicitly structured Antigravity runtime subagent details', () => {
+    const detail = makeDetail({
+      meta: {
+        ...makeDetail().meta,
+        provider: SDK_SUBAGENT_PROVIDERS.AGY_SDK,
+        providerKind: SDK_SUBAGENT_PROVIDER_KINDS.AGY_RUNTIME_AGENT,
+        canonicalKey: 'agy:deck:subagent-1',
+      },
+    });
+
+    expect(parseSdkSubagentDetail(detail)).toEqual(expect.objectContaining({ kind: 'ok' }));
+  });
+
+  it('accepts explicitly structured Muse runtime subagent details', () => {
+    const detail = makeDetail({
+      meta: {
+        ...makeDetail().meta,
+        provider: SDK_SUBAGENT_PROVIDERS.MUSE_CODE_SDK,
+        providerKind: SDK_SUBAGENT_PROVIDER_KINDS.MUSE_RUNTIME_AGENT,
+        canonicalKey: 'muse:deck:subagent-1',
+      },
+    });
+
+    expect(parseSdkSubagentDetail(detail)).toEqual(expect.objectContaining({ kind: 'ok' }));
+  });
+
   it('rejects malformed enum values instead of accepting any string', () => {
     const detail = makeDetail({
       meta: {

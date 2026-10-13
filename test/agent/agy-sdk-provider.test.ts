@@ -9,6 +9,12 @@ import {
   parseAgyModelList,
 } from '../../src/agent/providers/agy-sdk.js';
 import { AGY_CLI_FLAG, AGY_SDK_PROVIDER_ID } from '../../shared/agy-agent.js';
+import {
+  SDK_SUBAGENT_DETAIL_KIND,
+  SDK_SUBAGENT_PROVIDERS,
+  SDK_SUBAGENT_PROVIDER_KINDS,
+  SDK_SUBAGENT_STATUS,
+} from '../../shared/sdk-subagent-status.js';
 import { PROVIDER_ERROR_CODES } from '../../src/agent/transport-provider.js';
 import type { AgentMessage, MessageDelta, ToolCallEvent } from '../../shared/agent-message.js';
 import type { ProviderError, SessionInfoUpdate } from '../../src/agent/transport-provider.js';
@@ -63,6 +69,11 @@ process.stdin.on('data', (d) => {
       const idx = step++;
       emit({ event: 'step_update', step_update: { conversation_id: convId, step_index: idx, state: 'ACTIVE', step_type: 'tool', tool_name: 'run_command', tool_info: { name: 'run_command', parameters: { CommandLine: 'echo hi' } } } });
       emit({ event: 'step_update', step_update: { conversation_id: convId, step_index: idx, state: 'DONE', step_type: 'tool', tool_name: 'run_command', tool_info: { name: 'run_command', parameters: { CommandLine: 'echo hi' }, output: 'hi\\r\\n' } } });
+    }
+    if (text.includes('SUBAGENT')) {
+      const idx = step++;
+      emit({ event: 'step_update', step_update: { conversation_id: convId, step_index: idx, state: 'ACTIVE', step_type: 'tool', tool_name: 'invoke_subagent', tool_info: { name: 'invoke_subagent', parameters: { Subagents: [{ TypeName: 'research', Role: 'Researcher', Prompt: 'find info' }] } } } });
+      emit({ event: 'step_update', step_update: { conversation_id: convId, step_index: idx, state: 'DONE', step_type: 'tool', tool_name: 'invoke_subagent', tool_info: { name: 'invoke_subagent', parameters: { Subagents: [{ TypeName: 'research', Role: 'Researcher', Prompt: 'find info' }] }, output: 'subagent task-1 launched' } } });
     }
     const idx = step++;
     emit({ event: 'step_update', step_update: { conversation_id: convId, step_index: idx, state: 'ACTIVE', step_type: 'agent_response', text_delta: 'Hel' } });
@@ -293,5 +304,31 @@ describe('AgySdkProvider (fake agy process)', () => {
     await expect(broken.connect({ binaryPath: path.join(dir, 'does-not-exist') }))
       .rejects.toMatchObject({ code: PROVIDER_ERROR_CODES.CONFIG_ERROR });
     expect(await broken.listModels()).toMatchObject({ models: [], isAuthenticated: false });
+  });
+
+  it('emits subagent tool call with normalized SdkSubagentDetail for invoke_subagent', async () => {
+    const sid = await provider.createSession({ sessionKey: 'subagent-sess', cwd: dir });
+    const toolEvents: ToolCallEvent[] = [];
+    provider.onToolCall((_s, tool) => toolEvents.push(tool));
+    await provider.send(sid, 'SUBAGENT run');
+    await waitFor(() => completes.length === 1);
+
+    const subagentCalls = toolEvents.filter((t) => t.detail?.kind === SDK_SUBAGENT_DETAIL_KIND);
+    expect(subagentCalls.length).toBeGreaterThanOrEqual(1);
+    const subagentCall = subagentCalls[subagentCalls.length - 1];
+    expect(subagentCall.name).toBe('invoke_subagent');
+    expect(subagentCall.detail).toMatchObject({
+      kind: SDK_SUBAGENT_DETAIL_KIND,
+      summary: 'Antigravity sub-agent Researcher',
+      meta: {
+        isSdkSubagent: true,
+        provider: SDK_SUBAGENT_PROVIDERS.AGY_SDK,
+        providerKind: SDK_SUBAGENT_PROVIDER_KINDS.AGY_RUNTIME_AGENT,
+        normalizedStatus: SDK_SUBAGENT_STATUS.COMPLETE,
+        active: false,
+        terminal: true,
+        backgrounded: true,
+      },
+    });
   });
 });

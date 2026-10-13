@@ -1,5 +1,7 @@
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
+import { join } from 'node:path';
+import { homedir } from 'node:os';
 import {
   MuseClient,
   readSessionDurability,
@@ -41,7 +43,11 @@ import {
 import type { AgentMessage, MessageDelta } from '../../../shared/agent-message.js';
 import type { ProviderContextPayload } from '../../../shared/context-types.js';
 import type { TransportAttachment } from '../../../shared/transport-attachments.js';
-import { MEMORY_MCP_STATUS, type MemoryMcpProviderStatusView } from '../../../shared/memory-ws.js';
+import {
+  MEMORY_MCP_PROVIDER_STATUS_REASON,
+  MEMORY_MCP_STATUS,
+  type MemoryMcpProviderStatusView,
+} from '../../../shared/memory-ws.js';
 import {
   MUSE_SDK_EFFORT_LEVELS,
   type TransportEffortLevel,
@@ -49,11 +55,40 @@ import {
 import { NATIVE_AGENT_ADMISSION_MODES } from '../../../shared/native-collaboration-policy.js';
 import { composeMessageSideProviderPrompt } from '../provider-context-routing.js';
 import { normalizeTransportCwd, resolveExecutableForSpawn, resolveMuseCodePathForSdk } from '../transport-paths.js';
+import {
+  ensureMuseMcpConfigHasImcodesEntry,
+  museMcpEnsureOptionsFromConfig,
+  type MuseMcpEnsureResult,
+} from '../../daemon/muse-mcp-config.js';
+import {
+  SDK_SUBAGENT_DETAIL_KIND,
+  SDK_SUBAGENT_PROVIDERS,
+  SDK_SUBAGENT_PROVIDER_KINDS,
+  SDK_SUBAGENT_SCHEMA_VERSION,
+  SDK_SUBAGENT_STATUS,
+  buildSdkSubagentSafeDetail,
+  makeMuseSubagentCanonicalKey,
+  type SdkSubagentDetail,
+  type SdkSubagentNormalizedStatus,
+} from '../../../shared/sdk-subagent-status.js';
+import type { ProviderActiveWorkSnapshot, SessionActivityBusyReason } from '../../../shared/session-activity-types.js';
 import logger from '../../util/logger.js';
 
 export const MUSE_CODE_SDK_PROVIDER_ID = 'muse-code-sdk';
 
 export const DEFAULT_MUSE_MODELS: ProviderModelInfo[] = [
+  {
+    id: 'wander',
+    name: 'Wander',
+    supportsReasoningEffort: true,
+    supportedEffortLevels: MUSE_SDK_EFFORT_LEVELS,
+  },
+  {
+    id: 'muse-spark-1.3',
+    name: 'Muse Spark 1.3',
+    supportsReasoningEffort: true,
+    supportedEffortLevels: MUSE_SDK_EFFORT_LEVELS,
+  },
   {
     id: 'muse-spark',
     name: 'Muse Spark',
@@ -73,6 +108,25 @@ export const DEFAULT_MUSE_MODELS: ProviderModelInfo[] = [
     supportedEffortLevels: MUSE_SDK_EFFORT_LEVELS,
   },
 ];
+
+function readStoredMuseApiKey(): string | undefined {
+  try {
+    const credPath = process.env.MUSE_AUTH_PATH?.trim()
+      || (process.env.XDG_CONFIG_HOME?.trim()
+        ? join(process.env.XDG_CONFIG_HOME.trim(), 'muse', 'auth.json')
+        : join(homedir(), '.config', 'muse', 'auth.json'));
+    if (existsSync(credPath)) {
+      const parsed = JSON.parse(readFileSync(credPath, 'utf8'));
+      const key = parsed?.providers?.meta?.api_key || parsed?.providers?.meta?.access_token;
+      if (typeof key === 'string' && key.trim()) {
+        return key.trim();
+      }
+    }
+  } catch {
+    // Ignore read errors
+  }
+  return undefined;
+}
 
 type MuseApprovalRequest = Parameters<ApprovalHandler>[0];
 type MuseItemDelta = ReturnType<Turn['deltas']> extends AsyncIterableIterator<infer D> ? D : { delta: string; field?: string };
@@ -100,6 +154,56 @@ interface MuseSessionState {
   pendingApprovals: Map<string, PendingApprovalEntry>;
   sessionSystemTextSent: boolean;
   toolCalls: Map<string, ToolCallEvent>;
+  runtimeSubagentStartedAtByKey?: Map<string, number>;
+}
+
+function asRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {};
+}
+
+function asString(value: unknown): string | undefined {
+  return typeof value === 'string' ? value : undefined;
+}
+
+function isMuseSubagentTool(name?: string): boolean {
+  if (!name) return false;
+  const normalized = name.toLowerCase().replace(/[-_]/g, '');
+  return normalized === 'subagent'
+    || normalized === 'agent'
+    || normalized === 'spawnsubagent'
+    || normalized === 'invokesubagent';
+}
+
+function mapMuseSubagentStatus(
+  status?: string,
+  controlStatus?: string,
+): {
+  toolStatus: 'running' | 'complete' | 'error';
+  normalizedStatus: SdkSubagentNormalizedStatus;
+  active: boolean;
+  terminal: boolean;
+} {
+  const normStatus = (status || '').toLowerCase();
+  const normControl = (controlStatus || '').toLowerCase();
+
+  if (normStatus === 'inprogress' || normStatus === 'in_progress') {
+    if (normControl === 'accepted' || normControl === 'starting') {
+      return { toolStatus: 'running', normalizedStatus: SDK_SUBAGENT_STATUS.PENDING, active: true, terminal: false };
+    }
+    return { toolStatus: 'running', normalizedStatus: SDK_SUBAGENT_STATUS.RUNNING, active: true, terminal: false };
+  }
+  if (normStatus === 'completed' || normStatus === 'complete' || normStatus === 'done' || normStatus === 'success' || normControl === 'closed' || normControl === 'resultready') {
+    return { toolStatus: 'complete', normalizedStatus: SDK_SUBAGENT_STATUS.COMPLETE, active: false, terminal: true };
+  }
+  if (normStatus === 'failed' || normStatus === 'failure' || normStatus === 'error') {
+    return { toolStatus: 'error', normalizedStatus: SDK_SUBAGENT_STATUS.ERROR, active: false, terminal: true };
+  }
+  if (normStatus === 'cancelled' || normStatus === 'canceled' || normStatus === 'interrupted' || normStatus === 'stopped') {
+    return { toolStatus: 'error', normalizedStatus: SDK_SUBAGENT_STATUS.INTERRUPTED, active: false, terminal: true };
+  }
+  return { toolStatus: 'running', normalizedStatus: SDK_SUBAGENT_STATUS.RUNNING, active: true, terminal: false };
 }
 
 function parseJsonSafe(value: unknown): unknown {
@@ -143,6 +247,7 @@ export class MuseCodeSdkProvider implements TransportProvider {
   private client: MuseClient | null = null;
   private spawned: SpawnedMspConnection | null = null;
   private sessions = new Map<string, MuseSessionState>();
+  private mcpRegistration: MuseMcpEnsureResult | null = null;
 
   private deltaCallbacks = new Set<(sessionId: string, delta: MessageDelta) => void>();
   private completeCallbacks = new Set<(sessionId: string, message: AgentMessage) => void>();
@@ -158,6 +263,11 @@ export class MuseCodeSdkProvider implements TransportProvider {
       await this.disconnect();
     }
     this.config = config;
+
+    this.mcpRegistration = await ensureMuseMcpConfigHasImcodesEntry(museMcpEnsureOptionsFromConfig(config)).catch((err) => {
+      logger.warn({ err }, 'Failed to ensure Muse MCP configuration');
+      return null;
+    });
 
     const rawPath = typeof config.cliPath === 'string' && config.cliPath.trim()
       ? config.cliPath.trim()
@@ -178,6 +288,12 @@ export class MuseCodeSdkProvider implements TransportProvider {
       args.push('--provider', config.provider.trim());
     }
 
+    const apiKey = typeof config.apiKey === 'string' && config.apiKey.trim()
+      ? config.apiKey.trim()
+      : ((config.env as Record<string, string> | undefined)?.META_API_KEY
+        || process.env.META_API_KEY
+        || readStoredMuseApiKey());
+
     try {
       const handshake = spawnMspConnection({
         command: resolved.executable,
@@ -186,6 +302,7 @@ export class MuseCodeSdkProvider implements TransportProvider {
         env: {
           ...process.env,
           ...(config.env as Record<string, string> | undefined),
+          ...(apiKey ? { META_API_KEY: apiKey } : {}),
         },
         onStderr: (chunk: string) => {
           logger.debug({ chunk }, 'muse serve stderr');
@@ -262,7 +379,7 @@ export class MuseCodeSdkProvider implements TransportProvider {
       ? config.agentId.trim()
       : (typeof (config as any).model === 'string' && (config as any).model.trim()
         ? (config as any).model.trim()
-        : undefined);
+        : 'wander');
     let session: Session;
 
     try {
@@ -273,7 +390,8 @@ export class MuseCodeSdkProvider implements TransportProvider {
       } else {
         session = await this.client.startSession({
           workspaceRoot,
-          ...(requestedModel ? { modelId: requestedModel } : {}),
+          modelId: requestedModel,
+          providerId: 'meta',
         });
       }
     } catch (err) {
@@ -412,16 +530,128 @@ export class MuseCodeSdkProvider implements TransportProvider {
             const folded = item as FoldedItem;
             if (folded.kind === 'toolCall' && folded.tool) {
               const toolId = folded.callId || folded.itemId;
+              const isSubagent = isMuseSubagentTool(folded.tool) || Boolean((folded as Record<string, unknown>).subagentId);
               const toolStatus: 'running' | 'complete' | 'error' =
                 folded.status === 'inProgress' ? 'running' : folded.status === 'failed' ? 'error' : 'complete';
+              const argsParsed = parseJsonSafe(folded.args);
+              let detail: SdkSubagentDetail | undefined;
+
+              if (isSubagent) {
+                const subagentId = asString((folded as Record<string, unknown>).subagentId) || toolId;
+                const canonicalKey = makeMuseSubagentCanonicalKey(sessionId, subagentId);
+                const rec = asRecord(argsParsed);
+                const prompt = asString(rec.prompt) ?? asString(rec.description) ?? asString(rec.task) ?? asString((folded as Record<string, unknown>).objective);
+                const agentName = asString(rec.name) ?? asString(rec.role) ?? asString((folded as Record<string, unknown>).role) ?? asString((folded as Record<string, unknown>).agentPath) ?? folded.tool;
+                const rawItemStatus = String(folded.status ?? '');
+                const statusMapping = mapMuseSubagentStatus(rawItemStatus, asString((folded as Record<string, unknown>).controlStatus));
+                const startedAtByKey = state.runtimeSubagentStartedAtByKey ??= new Map<string, number>();
+                const startedAtMs = startedAtByKey.get(canonicalKey) ?? Date.now();
+                if (statusMapping.active && !statusMapping.terminal) {
+                  startedAtByKey.set(canonicalKey, startedAtMs);
+                }
+                const output = folded.visibleOutput || asString((folded as Record<string, unknown>).failureReason);
+                detail = buildSdkSubagentSafeDetail({
+                  kind: SDK_SUBAGENT_DETAIL_KIND,
+                  summary: agentName ? `Muse sub-agent ${agentName}` : 'Muse sub-agent',
+                  input: {
+                    action: folded.tool,
+                    ...(prompt ? { description: prompt } : {}),
+                  },
+                  ...(output ? { output } : {}),
+                  meta: {
+                    isSdkSubagent: true,
+                    schemaVersion: SDK_SUBAGENT_SCHEMA_VERSION,
+                    provider: SDK_SUBAGENT_PROVIDERS.MUSE_CODE_SDK,
+                    providerKind: SDK_SUBAGENT_PROVIDER_KINDS.MUSE_RUNTIME_AGENT,
+                    canonicalKey,
+                    normalizedStatus: statusMapping.normalizedStatus,
+                    rawStatus: asString((folded as Record<string, unknown>).controlStatus) || rawItemStatus,
+                    active: statusMapping.active,
+                    terminal: statusMapping.terminal,
+                    parentSessionId: sessionId,
+                    parentToolUseId: toolId,
+                    parentItemId: folded.itemId,
+                    ...(asString((folded as Record<string, unknown>).agentPath) ? { agentPath: asString((folded as Record<string, unknown>).agentPath) } : {}),
+                    ...(agentName ? { agentName } : {}),
+                    ...(subagentId ? { taskId: subagentId } : {}),
+                    startedAtMs,
+                    backgrounded: true,
+                  },
+                }, { allowRaw: false });
+              }
+
               const toolEvent: ToolCallEvent = {
-                id: toolId,
-                name: folded.tool,
-                status: toolStatus,
-                input: parseJsonSafe(folded.args),
+                id: isSubagent && detail ? detail.meta.canonicalKey : toolId,
+                name: isSubagent ? 'Agent' : folded.tool,
+                status: isSubagent && detail
+                  ? (detail.meta.terminal ? (detail.meta.normalizedStatus === SDK_SUBAGENT_STATUS.COMPLETE ? 'complete' : 'error') : 'running')
+                  : toolStatus,
+                input: argsParsed,
                 output: folded.visibleOutput,
+                ...(detail ? { detail } : {}),
               };
-              state.toolCalls.set(toolId, toolEvent);
+              state.toolCalls.set(toolEvent.id, toolEvent);
+              this.emitToolCall(sessionId, toolEvent);
+            } else if (folded.kind === 'subagent') {
+              const subagentRecord = folded as Record<string, unknown>;
+              const subagentKey = asString(subagentRecord.subagentId) || folded.itemId;
+              const canonicalKey = makeMuseSubagentCanonicalKey(sessionId, subagentKey);
+              const rawItemStatus = String(folded.status ?? '');
+              const statusMapping = mapMuseSubagentStatus(rawItemStatus, asString(subagentRecord.controlStatus));
+              const prompt = asString(subagentRecord.objective) || asString(subagentRecord.text);
+              const agentName = asString(subagentRecord.role) || asString(subagentRecord.agentPath) || 'Muse Agent';
+              const resultObj = asRecord(subagentRecord.result);
+              const output = asString(resultObj.text) || asString(resultObj.summary) || folded.visibleOutput || asString(subagentRecord.failureReason);
+
+              const startedAtByKey = state.runtimeSubagentStartedAtByKey ??= new Map<string, number>();
+              const startedAtMs = startedAtByKey.get(canonicalKey) ?? Date.now();
+              if (statusMapping.active && !statusMapping.terminal) {
+                startedAtByKey.set(canonicalKey, startedAtMs);
+              }
+
+              const usageObj = asRecord(subagentRecord.usage);
+              const totalTokens = typeof usageObj.totalTokens === 'number' ? usageObj.totalTokens : undefined;
+              const durationMs = typeof subagentRecord.durationMs === 'number' ? subagentRecord.durationMs : undefined;
+
+              const detail = buildSdkSubagentSafeDetail({
+                kind: SDK_SUBAGENT_DETAIL_KIND,
+                summary: `Muse sub-agent ${agentName}`,
+                input: {
+                  action: 'muse-runtime-subagent',
+                  ...(prompt ? { description: prompt } : {}),
+                },
+                ...(output ? { output } : {}),
+                meta: {
+                  isSdkSubagent: true,
+                  schemaVersion: SDK_SUBAGENT_SCHEMA_VERSION,
+                  provider: SDK_SUBAGENT_PROVIDERS.MUSE_CODE_SDK,
+                  providerKind: SDK_SUBAGENT_PROVIDER_KINDS.MUSE_RUNTIME_AGENT,
+                  canonicalKey,
+                  normalizedStatus: statusMapping.normalizedStatus,
+                  rawStatus: asString(subagentRecord.controlStatus) || rawItemStatus,
+                  active: statusMapping.active,
+                  terminal: statusMapping.terminal,
+                  parentSessionId: sessionId,
+                  parentItemId: folded.itemId,
+                  ...(asString(subagentRecord.agentPath) ? { agentPath: asString(subagentRecord.agentPath) } : {}),
+                  ...(agentName ? { agentName } : {}),
+                  ...(subagentKey ? { taskId: subagentKey } : {}),
+                  startedAtMs,
+                  backgrounded: true,
+                  ...(totalTokens ? { usageTotalTokens: totalTokens } : {}),
+                  ...(durationMs ? { usageDurationMs: durationMs } : {}),
+                },
+              }, { allowRaw: false });
+
+              const toolEvent: ToolCallEvent = {
+                id: canonicalKey,
+                name: 'Agent',
+                status: statusMapping.terminal ? (statusMapping.normalizedStatus === SDK_SUBAGENT_STATUS.COMPLETE ? 'complete' : 'error') : 'running',
+                ...(detail.input ? { input: detail.input } : {}),
+                ...(detail.output ? { output: detail.output } : {}),
+                detail,
+              };
+              state.toolCalls.set(canonicalKey, toolEvent);
               this.emitToolCall(sessionId, toolEvent);
             } else if (folded.kind === 'agentMessage' && folded.text) {
               if (!state.currentText) {
@@ -609,15 +839,18 @@ export class MuseCodeSdkProvider implements TransportProvider {
     try {
       if (this.spawned) {
         const raw = (await this.spawned.connection.command('model/list', {})) as {
-          models?: Array<{ id: string; name?: string; supportsReasoningEffort?: boolean }>;
+          models?: Array<{ id?: string; modelId?: string; name?: string; displayLabel?: string; supportsReasoningEffort?: boolean }>;
         };
         if (Array.isArray(raw?.models) && raw.models.length > 0) {
-          const models: ProviderModelInfo[] = raw.models.map((m) => ({
-            id: m.id,
-            name: m.name || m.id,
-            supportsReasoningEffort: m.supportsReasoningEffort ?? true,
-            supportedEffortLevels: MUSE_SDK_EFFORT_LEVELS,
-          }));
+          const models: ProviderModelInfo[] = raw.models.map((m) => {
+            const id = m.modelId || m.id || 'muse-spark-1.3';
+            return {
+              id,
+              name: m.displayLabel || m.name || id,
+              supportsReasoningEffort: m.supportsReasoningEffort ?? true,
+              supportedEffortLevels: MUSE_SDK_EFFORT_LEVELS,
+            };
+          });
           const list: ProviderModelList = {
             models,
             defaultModel: models[0]?.id,
@@ -656,11 +889,41 @@ export class MuseCodeSdkProvider implements TransportProvider {
   }
 
   getMemoryMcpStatus(): MemoryMcpProviderStatusView {
+    if (this.mcpRegistration?.degraded) {
+      return {
+        providerId: this.id,
+        status: MEMORY_MCP_STATUS.DEGRADED,
+        connected: Boolean(this.client),
+        degradedReasons: [
+          this.mcpRegistration.reason ?? MEMORY_MCP_PROVIDER_STATUS_REASON.MCP_REGISTRATION_FAILED,
+        ],
+      };
+    }
     return {
       providerId: this.id,
       status: this.client ? MEMORY_MCP_STATUS.READY : MEMORY_MCP_STATUS.UNKNOWN,
       connected: Boolean(this.client),
       degradedReasons: [],
+    };
+  }
+
+  getActiveWorkSnapshot(sessionId: string): ProviderActiveWorkSnapshot | null {
+    const state = this.sessions.get(sessionId);
+    if (!state) return null;
+    const pendingApprovalCount = state.pendingApprovals.size;
+    const activeToolCount = [...state.toolCalls.values()]
+      .filter((tool) => tool.status === 'running').length;
+    const activeWorkCount = (state.inFlight ? 1 : 0) + pendingApprovalCount + activeToolCount;
+    const busyReasons: SessionActivityBusyReason[] = [];
+    if (state.inFlight || pendingApprovalCount > 0) busyReasons.push('provider_wait');
+    if (activeToolCount > 0) busyReasons.push('open_tool_call');
+    return {
+      status: 'current',
+      activeWorkCount,
+      activeToolCount,
+      busyReasons,
+      providerDiagnosticGeneration: state.activeTurnId ?? null,
+      updatedAt: Date.now(),
     };
   }
 

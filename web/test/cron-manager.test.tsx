@@ -815,4 +815,48 @@ describe('CronManager', () => {
 
     expect(await screen.findByText('MCP job')).toBeDefined();
   });
+
+  it('renders onlyWhenIdle badge for send action when enabled explicitly or inferred from short interval', async () => {
+    apiFetch.mockResolvedValueOnce({
+      jobs: [
+        cronJob({
+          id: 'job-send-short',
+          name: 'Short send job',
+          cron_expr: '*/5 * * * *',
+          action: JSON.stringify({ type: 'send', target: 'w1', message: 'check' }),
+        }),
+        cronJob({
+          id: 'job-send-explicit-false',
+          name: 'Send explicit false',
+          cron_expr: '*/5 * * * *',
+          action: JSON.stringify({ type: 'send', target: 'w1', message: 'check', onlyWhenIdle: false }),
+        }),
+        cronJob({
+          id: 'job-send-explicit-true',
+          name: 'Send explicit true',
+          cron_expr: '0 9 * * *',
+          action: JSON.stringify({ type: 'send', target: 'w1', message: 'check', onlyWhenIdle: true }),
+        }),
+      ],
+    });
+
+    render(
+      <CronManager
+        serverId="srv-current"
+        projectName="cd"
+        sessions={sessions}
+        subSessions={subSessions}
+        onBack={vi.fn()}
+      />,
+    );
+
+    expect(await screen.findByText('Short send job')).toBeDefined();
+    expect(screen.getByText('Send explicit false')).toBeDefined();
+    expect(screen.getByText('Send explicit true')).toBeDefined();
+
+    // 2 badges rendered (Short send job inferred + Send explicit true)
+    const badges = screen.getAllByText('cron.only_when_idle_badge');
+    expect(badges.length).toBe(2);
+  });
 });
+

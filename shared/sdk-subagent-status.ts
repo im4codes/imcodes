@@ -44,6 +44,8 @@ export const SDK_SUBAGENT_PROVIDERS = {
   QWEN: 'qwen',
   GEMINI_SDK: 'gemini-sdk',
   GROK_SDK: 'grok-sdk',
+  AGY_SDK: 'agy-sdk',
+  MUSE_CODE_SDK: 'muse-code-sdk',
 } as const;
 
 export const SDK_SUBAGENT_PROVIDER_KINDS = {
@@ -55,6 +57,8 @@ export const SDK_SUBAGENT_PROVIDER_KINDS = {
   QWEN_RUNTIME_AGENT: 'qwenRuntimeAgent',
   GEMINI_RUNTIME_AGENT: 'geminiRuntimeAgent',
   GROK_RUNTIME_AGENT: 'grokRuntimeAgent',
+  AGY_RUNTIME_AGENT: 'agyRuntimeAgent',
+  MUSE_RUNTIME_AGENT: 'museRuntimeAgent',
 } as const;
 
 export const SDK_SUBAGENT_TASK_TYPES = {
@@ -267,6 +271,14 @@ export function makeQwenSubagentCanonicalKey(sessionId: string, itemId: string):
 
 export function makeGeminiSubagentCanonicalKey(sessionId: string, itemId: string): string {
   return normalizeSdkSubagentCanonicalKey(`gemini:${normalizeSdkSubagentKeyComponent(sessionId)}:${normalizeSdkSubagentKeyComponent(itemId)}`);
+}
+
+export function makeAgySubagentCanonicalKey(sessionId: string, itemId: string): string {
+  return normalizeSdkSubagentCanonicalKey(`agy:${normalizeSdkSubagentKeyComponent(sessionId)}:${normalizeSdkSubagentKeyComponent(itemId)}`);
+}
+
+export function makeMuseSubagentCanonicalKey(sessionId: string, itemId: string): string {
+  return normalizeSdkSubagentCanonicalKey(`muse:${normalizeSdkSubagentKeyComponent(sessionId)}:${normalizeSdkSubagentKeyComponent(itemId)}`);
 }
 
 const SDK_RUNTIME_SUBAGENT_TAG_START = '<subagent_notification>';

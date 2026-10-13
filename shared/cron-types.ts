@@ -188,6 +188,20 @@ export function normalizeCronSendActionForInterval(
   return { ...action, onlyWhenIdle: true };
 }
 
+/** Check if a cron expression represents a short recurring interval (<= 15 minutes). */
+export function isCronExprShortInterval(cronExpr?: string): boolean {
+  if (!cronExpr) return false;
+  const parts = cronExpr.trim().split(/\s+/);
+  if (parts.length < 5) return false;
+  const minute = parts[0];
+  if (minute === '*') return true;
+  if (minute.startsWith('*/')) {
+    const step = parseInt(minute.slice(2), 10);
+    return !isNaN(step) && step > 0 && step <= 15;
+  }
+  return false;
+}
+
 export type CronAction = CronCommandAction | CronP2pAction | CronSendAction;
 
 export type CronControlValidationReason =

@@ -3429,6 +3429,8 @@ describe('TransportSessionRuntime', () => {
     ['Codex runtime', SDK_SUBAGENT_PROVIDERS.CODEX_SDK, SDK_SUBAGENT_PROVIDER_KINDS.CODEX_RUNTIME_AGENT],
     ['Qwen runtime', SDK_SUBAGENT_PROVIDERS.QWEN, SDK_SUBAGENT_PROVIDER_KINDS.QWEN_RUNTIME_AGENT],
     ['Gemini runtime', SDK_SUBAGENT_PROVIDERS.GEMINI_SDK, SDK_SUBAGENT_PROVIDER_KINDS.GEMINI_RUNTIME_AGENT],
+    ['Antigravity runtime', SDK_SUBAGENT_PROVIDERS.AGY_SDK, SDK_SUBAGENT_PROVIDER_KINDS.AGY_RUNTIME_AGENT],
+    ['Muse runtime', SDK_SUBAGENT_PROVIDERS.MUSE_CODE_SDK, SDK_SUBAGENT_PROVIDER_KINDS.MUSE_RUNTIME_AGENT],
   ] as const)('treats backgrounded %s SDK sub-agent heartbeats as non-blocking display state', async (_label, provider, providerKind) => {
     runtime.send('spawn a long helper', 'cmd-parent');
     await waitForProviderSendCount(mock.provider, 1);

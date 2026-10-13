@@ -13,6 +13,8 @@ import {
   validateRegisteredCronControlAction,
 } from '../../shared/cron-types.js';
 import { isRawCommandSessionAgentType } from '../../shared/agent-types.js';
+import { AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES } from '../../shared/agent-delegation.js';
+import { MEMORY_MCP_SEND_DELIVERY_MODES } from '../../shared/memory-mcp-contracts.js';
 import { getSession, listSessions, type SessionRecord } from '../store/session-store.js';
 import {
   ensureTransportRuntimeAvailable,
@@ -298,13 +300,21 @@ export async function executeCronJob(msg: CronDispatchMessage, serverLink: Serve
         const transportRuntime = runtime;
         let timelineProjected = false;
         const dispatchAttempt = async (attempt: number): Promise<void> => {
-          if (attempt > 1 && transportRuntime.getStatus() !== 'idle') {
-            await transportRuntime.cancel();
+          const isBusy = typeof transportRuntime.getStatus === 'function' && transportRuntime.getStatus() !== 'idle';
+          if (attempt > 1 && isBusy) {
+            if (typeof transportRuntime.cancel === 'function') await transportRuntime.cancel();
+          } else if (managedAgent && isBusy) {
+            const supportsAppend = (transportRuntime as any).provider?.capabilities?.activeDelegationNotification === AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE
+              && typeof (transportRuntime as any).provider?.notifyActiveDelegation === 'function';
+            if (!supportsAppend) {
+              if (typeof transportRuntime.cancel === 'function') await transportRuntime.cancel();
+            }
           }
           const clientMessageId = `cron:${jobId}:${executionId ?? 'dispatch'}:attempt:${attempt}`;
           await transportRuntime.send(command, clientMessageId, undefined, undefined, {
             timelineCommitted: true,
             messageOrigin: CHAT_MESSAGE_ORIGINS.SYSTEM,
+            ...(managedAgent ? { deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND } : {}),
           });
           if (!timelineProjected && cronRun) {
             timelineEmitter.emit(name, 'user.message', {

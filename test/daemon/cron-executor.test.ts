@@ -425,9 +425,57 @@ describe('executeCronJob', () => {
     expect(prompt).toContain('"contractRef":"supervision_cron_control_v2"');
     expect(prompt).toContain('\nInspect transport progress.\n</imcodes-cron-control>');
     expect(clientMessageId).toBe('cron:job-registered-transport:run-transport-1:attempt:1');
-    expect(attachments).toBeUndefined();
-    expect(preamble).toBeUndefined();
-    expect(metadata).toEqual({ timelineCommitted: true, messageOrigin: CHAT_MESSAGE_ORIGINS.SYSTEM });
+    expect(metadata).toEqual({
+      timelineCommitted: true,
+      messageOrigin: CHAT_MESSAGE_ORIGINS.SYSTEM,
+      deliveryMode: 'append',
+    });
+  });
+
+  it('self-managed cron dispatches with append and cancels busy target session only if provider lacks native append', async () => {
+    const cancelMock = vi.fn().mockResolvedValue(undefined);
+    const mockRuntime = {
+      providerSessionId: 'connected-provider-session',
+      getStatus: vi.fn().mockReturnValue('streaming'),
+      cancel: cancelMock,
+      provider: {
+        capabilities: {
+          activeDelegationNotification: 'native',
+        },
+        notifyActiveDelegation: vi.fn(),
+      },
+      send: vi.fn().mockReturnValue('queued'),
+    };
+    (getSession as ReturnType<typeof vi.fn>).mockReturnValue(
+      makeSession({ runtimeType: 'transport', agentType: 'codex-sdk' }),
+    );
+    (getTransportRuntime as ReturnType<typeof vi.fn>).mockReturnValue(mockRuntime);
+
+    // Native append supported: does not cancel
+    await executeCronJob(makeMsg({
+      jobId: 'job-registered-transport-busy-append',
+      executionId: 'run-transport-busy-1',
+      action: selfManagedAction('job-registered-transport-busy-append', 'In-flight check.'),
+    }), mockServerLink);
+
+    expect(cancelMock).not.toHaveBeenCalled();
+    expect(mockRuntime.send).toHaveBeenCalledWith(
+      expect.stringContaining('In-flight check.'),
+      'cron:job-registered-transport-busy-append:run-transport-busy-1:attempt:1',
+      undefined,
+      undefined,
+      expect.objectContaining({ deliveryMode: 'append' }),
+    );
+
+    // Unsupported append: cancels session first (stop mode)
+    (mockRuntime.provider as any).capabilities.activeDelegationNotification = 'unsupported';
+    await executeCronJob(makeMsg({
+      jobId: 'job-registered-transport-busy-no-append',
+      executionId: 'run-transport-busy-2',
+      action: selfManagedAction('job-registered-transport-busy-no-append', 'In-flight check 2.'),
+    }), mockServerLink);
+
+    expect(cancelMock).toHaveBeenCalledOnce();
   });
 
   it('sends command to transport session via runtime.send(), skipping busy check', async () => {
