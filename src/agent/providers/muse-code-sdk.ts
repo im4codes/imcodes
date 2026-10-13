@@ -210,6 +210,68 @@ function parseJsonSafe(value: unknown): unknown {
   }
 }
 
+/**
+ * How long a turn may produce NO agent-side activity (no text delta, no
+ * non-user item) before it is treated as a stalled upstream stream.
+ *
+ * Measured on a healthy host: slow-but-healthy first-token latency reaches
+ * ~46s on muse-wonder-full-1.0, while stalled turns sit at `opening_stream`
+ * with no event for 90-100s+ until interrupted. Override for tests or tuning
+ * with IMCODES_MUSE_FIRST_ACTIVITY_TIMEOUT_MS.
+ */
+export const MUSE_FIRST_ACTIVITY_TIMEOUT_DEFAULT_MS = 90_000;
+/** After the watchdog interrupts, how long to wait for the host to settle the turn before giving up on it. */
+const MUSE_STALL_INTERRUPT_GRACE_MS = 10_000;
+function museFirstActivityTimeoutMs(): number {
+  const raw = Number(process.env.IMCODES_MUSE_FIRST_ACTIVITY_TIMEOUT_MS);
+  return Number.isFinite(raw) && raw > 0 ? raw : MUSE_FIRST_ACTIVITY_TIMEOUT_DEFAULT_MS;
+}
+
+/** Muse's closed approval-mode vocabulary (`ApprovalMode` in the MSP schema). */
+export const MUSE_APPROVAL_MODES = ['allowAll', 'promptUnmatched', 'onRequest', 'denyUnmatched'] as const;
+export type MuseApprovalMode = typeof MUSE_APPROVAL_MODES[number];
+
+/**
+ * Highest-permission posture: no approval prompts and no shell sandbox. This
+ * is Muse's equivalent of claude's `bypassPermissions` / codex's
+ * `approvalPolicy: never` + `danger-full-access` / gemini's `yolo`, and is the
+ * default like those providers. Two independent layers, both required:
+ *  - host process: `--disable-sandbox` (fixed for the host's lifetime; the
+ *    default bubblewrap sandbox also fails outright on hosts that forbid user
+ *    namespaces, which made every shell command error out);
+ *  - session: approval mode `allowAll` (selected on the wire; Muse has no
+ *    approval flag on `serve`).
+ * Opt out with `dangerouslySkipPermissions: false` in the provider config, and
+ * pick a specific mode with `approvalMode`.
+ */
+export function resolveMusePermissionPosture(config: Record<string, unknown> | null | undefined): {
+  maxPermissions: boolean;
+  approvalMode: MuseApprovalMode | undefined;
+} {
+  const maxPermissions = config?.dangerouslySkipPermissions !== false;
+  const requested = typeof config?.approvalMode === 'string' ? config.approvalMode : undefined;
+  const explicit = (MUSE_APPROVAL_MODES as readonly string[]).includes(requested ?? '')
+    ? (requested as MuseApprovalMode)
+    : undefined;
+  return { maxPermissions, approvalMode: explicit ?? (maxPermissions ? 'allowAll' : undefined) };
+}
+
+/** Argv for `muse serve` (without the executable's own prepend args). */
+export function buildMuseServeArgs(config: Record<string, unknown>, defaultModel?: string): string[] {
+  const args = ['serve', ...(Array.isArray(config.args) ? (config.args as string[]) : ['--trust-workspace'])];
+  if (resolveMusePermissionPosture(config).maxPermissions && !args.includes('--disable-sandbox')) {
+    args.push('--disable-sandbox');
+  }
+  if (!args.includes('--provider')) {
+    const provider = typeof config.provider === 'string' && config.provider.trim() ? config.provider.trim() : 'meta';
+    args.push('--provider', provider);
+  }
+  if (!args.includes('--model') && defaultModel) {
+    args.push('--model', defaultModel);
+  }
+  return args;
+}
+
 function mapEffortLevel(effort?: TransportEffortLevel): 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra' | undefined {
   if (!effort) return undefined;
   if (effort === 'off') return 'none';
@@ -285,14 +347,7 @@ export class MuseCodeSdkProvider implements TransportProvider {
           ? (config as any).model.trim()
           : 'muse-spark-1.3'),
     );
-    const args = ['serve', ...(Array.isArray(config.args) ? (config.args as string[]) : ['--trust-workspace'])];
-    if (!args.includes('--provider')) {
-      const provider = typeof config.provider === 'string' && config.provider.trim() ? config.provider.trim() : 'meta';
-      args.push('--provider', provider);
-    }
-    if (!args.includes('--model') && defaultModel) {
-      args.push('--model', defaultModel);
-    }
+    const args = buildMuseServeArgs(config as Record<string, unknown>, defaultModel);
 
     const explicitApiKey = typeof config.apiKey === 'string' && config.apiKey.trim()
       ? config.apiKey.trim()
@@ -389,12 +444,25 @@ export class MuseCodeSdkProvider implements TransportProvider {
           : 'muse-spark-1.3'),
     );
     let session: Session;
+    const posture = resolveMusePermissionPosture(this.config as Record<string, unknown> | null);
 
     try {
       if (config.resumeId) {
         session = await this.client.resumeSession({
           sessionId: config.resumeId,
         });
+        if (posture.approvalMode && this.spawned) {
+          // `session/resume` has no approvalMode member; select it explicitly.
+          await this.spawned.connection
+            .command('session/setApprovalMode', {
+              commandId: randomUUID(),
+              sessionId: session.sessionId,
+              mode: posture.approvalMode,
+            })
+            .catch((err) => {
+              logger.warn({ err, mode: posture.approvalMode }, 'Failed to set approval mode on resumed Muse session');
+            });
+        }
         if (requestedModel && this.spawned) {
           void this.spawned.connection
             .command('session/setModel', {
@@ -411,6 +479,7 @@ export class MuseCodeSdkProvider implements TransportProvider {
           workspaceRoot,
           modelId: requestedModel,
           providerId: 'meta',
+          ...(posture.approvalMode ? { approvalMode: posture.approvalMode } : {}),
         });
       }
     } catch (err) {
@@ -513,6 +582,39 @@ export class MuseCodeSdkProvider implements TransportProvider {
 
     const effort = mapEffortLevel(state.reasoningEffort);
 
+    // The runtime re-checks provider busy state synchronously inside the
+    // complete/error callbacks (to flip the session idle and drain queued
+    // messages). In-flight state must therefore be cleared BEFORE emitting,
+    // not in `finally`; otherwise the daemon sees `provider_wait`, defers the
+    // idle transition, and nothing ever re-triggers it. The once-only guard
+    // keeps the trailing `finally` from clobbering a follow-up turn that was
+    // started from inside one of those callbacks.
+    let turnSettled = false;
+    // First-activity watchdog state (see museFirstActivityTimeoutMs).
+    let sawAgentActivity = false;
+    let stalled = false;
+    let stallTimer: ReturnType<typeof setTimeout> | null = null;
+    let stallEscapeTimer: ReturnType<typeof setTimeout> | null = null;
+    let abandonStalledWait: () => void = () => {};
+    const stallEscape = new Promise<{ kind: 'stallAbandoned' }>((resolve) => {
+      abandonStalledWait = () => resolve({ kind: 'stallAbandoned' });
+    });
+    const settleTurn = (): void => {
+      if (turnSettled) return;
+      turnSettled = true;
+      if (stallTimer) {
+        clearTimeout(stallTimer);
+        stallTimer = null;
+      }
+      if (stallEscapeTimer) {
+        clearTimeout(stallEscapeTimer);
+        stallEscapeTimer = null;
+      }
+      state.inFlight = false;
+      state.activeTurn = null;
+      state.activeTurnId = null;
+    };
+
     try {
       const turn = await state.session.sendUserTurn({
         input: [{ type: 'text', text: prompt }],
@@ -522,17 +624,41 @@ export class MuseCodeSdkProvider implements TransportProvider {
       state.activeTurn = turn;
       state.activeTurnId = turn.turnId;
 
+      // An upstream stream that never opens shows no event at all and would
+      // otherwise leave the session "working" until the user presses stop.
+      stallTimer = setTimeout(() => {
+        stallTimer = null;
+        if (turnSettled || sawAgentActivity || state.cancelled) return;
+        stalled = true;
+        logger.warn(
+          { sessionId, turnId: turn.turnId, timeoutMs: museFirstActivityTimeoutMs() },
+          'Muse turn produced no agent activity; interrupting stalled turn',
+        );
+        void this.cancel(sessionId);
+        stallEscapeTimer = setTimeout(() => {
+          stallEscapeTimer = null;
+          abandonStalledWait();
+        }, MUSE_STALL_INTERRUPT_GRACE_MS);
+        stallEscapeTimer.unref?.();
+      }, museFirstActivityTimeoutMs());
+      stallTimer.unref?.();
+
       const deltasTask = (async () => {
         try {
           for await (const delta of turn.deltas()) {
+            sawAgentActivity = true;
             if (state.cancelled) break;
             const deltaItem = delta as MuseItemDelta;
             if (!deltaItem.field || deltaItem.field === 'text') {
               state.currentText += deltaItem.delta;
+              // Contract with transport-relay: `delta` carries the cumulative
+              // text so far (same as codex/claude). The relay replaces the
+              // streaming event text with each frame and coalesces to the
+              // latest, so a raw fragment would show only the newest chunk.
               this.emitDelta(sessionId, {
                 messageId: state.currentMessageId!,
                 type: 'text',
-                delta: deltaItem.delta,
+                delta: state.currentText,
                 role: 'assistant',
               });
             }
@@ -545,6 +671,7 @@ export class MuseCodeSdkProvider implements TransportProvider {
       const itemsTask = (async () => {
         try {
           for await (const item of turn.items()) {
+            if ((item as FoldedItem).kind !== 'userMessage') sawAgentActivity = true;
             if (state.cancelled) break;
             const folded = item as FoldedItem;
             if (folded.kind === 'toolCall' && folded.tool) {
@@ -683,10 +810,32 @@ export class MuseCodeSdkProvider implements TransportProvider {
         }
       })();
 
-      const outcome = await turn.completed;
-      await Promise.allSettled([deltasTask, itemsTask]);
+      const outcome = await Promise.race([turn.completed, stallEscape]);
+      // When the wait was abandoned the streams may never end; do not block on them.
+      if (outcome.kind === 'stallAbandoned') {
+        stalled = true;
+      } else {
+        await Promise.allSettled([deltasTask, itemsTask]);
+      }
 
-      if (state.cancelled) {
+      // Snapshot before settling: a queued follow-up may start (and reset
+      // `cancelled`) as soon as the runtime sees us idle.
+      const wasStalled = stalled;
+      const wasCancelled = state.cancelled;
+      const finalText = state.currentText;
+      const finalMessageId = state.currentMessageId!;
+      settleTurn();
+
+      if (wasStalled) {
+        this.emitError(sessionId, {
+          code: PROVIDER_ERROR_CODES.PROVIDER_ERROR,
+          message: `Muse model produced no response within ${Math.round(museFirstActivityTimeoutMs() / 1000)}s (upstream stream stalled). The turn was interrupted; please send the message again.`,
+          recoverable: true,
+        });
+        return;
+      }
+
+      if (wasCancelled) {
         logger.info({ sessionId }, 'Muse turn completed after cancellation');
         return;
       }
@@ -709,11 +858,11 @@ export class MuseCodeSdkProvider implements TransportProvider {
         }
 
         const agentMessage: AgentMessage = {
-          id: state.currentMessageId!,
+          id: finalMessageId,
           sessionId,
           kind: 'text',
           role: 'assistant',
-          content: state.currentText,
+          content: finalText,
           timestamp: Date.now(),
           status: 'complete',
           metadata: {
@@ -739,15 +888,15 @@ export class MuseCodeSdkProvider implements TransportProvider {
       }
     } catch (err) {
       logger.error({ err, sessionId }, 'Failed during Muse turn execution');
+      settleTurn();
       this.emitError(sessionId, {
         code: PROVIDER_ERROR_CODES.PROVIDER_ERROR,
         message: err instanceof Error ? err.message : String(err),
         recoverable: true,
       });
     } finally {
-      state.inFlight = false;
-      state.activeTurn = null;
-      state.activeTurnId = null;
+      // No-op when the turn was already settled before emitting.
+      settleTurn();
     }
   }
 

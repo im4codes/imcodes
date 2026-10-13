@@ -1,9 +1,11 @@
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   DEFAULT_MUSE_MODELS,
   MUSE_CODE_SDK_PROVIDER_ID,
   MuseCodeSdkProvider,
+  buildMuseServeArgs,
   normalizeMuseModelId,
+  resolveMusePermissionPosture,
 } from '../../src/agent/providers/muse-code-sdk.js';
 import {
   BACKGROUND_SUBAGENT_WAKE_MODES,
@@ -213,6 +215,7 @@ describe('MuseCodeSdkProvider session and turn lifecycle', () => {
       workspaceRoot: '/home/k/project',
       modelId: 'muse-spark-1.3',
       providerId: 'meta',
+      approvalMode: 'allowAll',
     });
 
     const receivedDeltas: string[] = [];
@@ -232,7 +235,8 @@ describe('MuseCodeSdkProvider session and turn lifecycle', () => {
 
     await provider.send(routeId, 'Say hello');
 
-    expect(receivedDeltas).toEqual(['Hello ', 'world!']);
+    // transport-relay contract: each frame carries the cumulative text so far.
+    expect(receivedDeltas).toEqual(['Hello ', 'Hello world!']);
     expect(receivedTools.length).toBeGreaterThanOrEqual(1);
     expect(receivedTools[0]).toMatchObject({
       id: 'call-1',
@@ -243,6 +247,199 @@ describe('MuseCodeSdkProvider session and turn lifecycle', () => {
     });
 
     await provider.endSession(routeId);
+  });
+
+  it('is already idle inside onComplete so the runtime can flip the session idle (stuck "working" regression)', async () => {
+    const provider = new MuseCodeSdkProvider();
+    const { sessionObj } = createMockSession();
+    (provider as any).client = { startSession: vi.fn().mockResolvedValue(sessionObj) };
+    const routeId = await provider.createSession({ cwd: '/home/k/project', model: 'muse-spark-1.3' });
+
+    const inFlightSeenInsideCallback: boolean[] = [];
+    provider.onComplete((sessionId) => {
+      inFlightSeenInsideCallback.push((provider as any).sessions.get(sessionId).inFlight);
+    });
+
+    await provider.send(routeId, 'Say hello');
+
+    expect(inFlightSeenInsideCallback).toEqual([false]);
+    await provider.endSession(routeId);
+  });
+
+  it('is already idle inside onError when the turn fails', async () => {
+    const provider = new MuseCodeSdkProvider();
+    const { sessionObj, mockTurn } = createMockSession();
+    (mockTurn as any).completed = Promise.resolve({
+      kind: 'completed' as const,
+      params: { turnId: 'turn-test-1', terminal: 'failed' as const, error: { message: 'boom', retryable: false } },
+    });
+    (provider as any).client = { startSession: vi.fn().mockResolvedValue(sessionObj) };
+    const routeId = await provider.createSession({ cwd: '/home/k/project', model: 'muse-spark-1.3' });
+
+    const inFlightSeenInsideCallback: boolean[] = [];
+    provider.onError((sessionId) => {
+      inFlightSeenInsideCallback.push((provider as any).sessions.get(sessionId).inFlight);
+    });
+
+    await provider.send(routeId, 'Say hello');
+
+    expect(inFlightSeenInsideCallback).toEqual([false]);
+    await provider.endSession(routeId);
+  });
+
+  it('does not clobber a follow-up turn started from inside onComplete', async () => {
+    const provider = new MuseCodeSdkProvider();
+    const { sessionObj, mockTurn } = createMockSession();
+    // The second turn never completes, so it must stay in flight after the first send() returns.
+    let secondTurnStarted = false;
+    sessionObj.sendUserTurn
+      .mockResolvedValueOnce(mockTurn)
+      .mockImplementationOnce(async () => {
+        secondTurnStarted = true;
+        return {
+          turnId: 'turn-test-2',
+          deltas: async function* () {},
+          items: async function* () {},
+          completed: new Promise(() => {}),
+        };
+      });
+    (provider as any).client = { startSession: vi.fn().mockResolvedValue(sessionObj) };
+    const routeId = await provider.createSession({ cwd: '/home/k/project', model: 'muse-spark-1.3' });
+
+    provider.onComplete((sessionId) => {
+      // What the runtime does when it drains a queued message on idle.
+      void provider.send(sessionId, 'queued follow-up');
+    });
+
+    await provider.send(routeId, 'first');
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(secondTurnStarted).toBe(true);
+    expect((provider as any).sessions.get(routeId).inFlight).toBe(true);
+    expect((provider as any).sessions.get(routeId).activeTurnId).toBe('turn-test-2');
+  });
+
+  describe('first-activity watchdog (stalled upstream stream)', () => {
+    const ENV = 'IMCODES_MUSE_FIRST_ACTIVITY_TIMEOUT_MS';
+    let prevEnv: string | undefined;
+    beforeEach(() => {
+      prevEnv = process.env[ENV];
+      process.env[ENV] = '40';
+    });
+    afterEach(() => {
+      vi.useRealTimers();
+      if (prevEnv === undefined) delete process.env[ENV]; else process.env[ENV] = prevEnv;
+    });
+
+    function stalledTurn(onInterrupt?: () => void) {
+      let settle!: (v: unknown) => void;
+      const completed = new Promise((resolve) => { settle = resolve; });
+      const turn = {
+        turnId: 'turn-stalled',
+        // The user's own message is replayed immediately and must NOT count as agent activity.
+        items: async function* () { yield { kind: 'userMessage', itemId: 'u1', text: 'hi' }; await completed; },
+        deltas: async function* () { await completed; },
+        completed,
+      };
+      const command = vi.fn().mockImplementation(async (method: string) => {
+        if (method === 'turn/interrupt') {
+          onInterrupt?.();
+          settle({ kind: 'completed', params: { turnId: 'turn-stalled', terminal: 'cancelled' } });
+        }
+        return {};
+      });
+      return { turn, command, settle };
+    }
+
+    it('interrupts a turn with no agent activity and reports a recoverable error', async () => {
+      const provider = new MuseCodeSdkProvider();
+      const { sessionObj } = createMockSession();
+      const { turn, command } = stalledTurn();
+      sessionObj.sendUserTurn.mockResolvedValue(turn);
+      (provider as any).client = { startSession: vi.fn().mockResolvedValue(sessionObj) };
+      (provider as any).spawned = { connection: { command } };
+      const routeId = await provider.createSession({ cwd: '/home/k/project', model: 'muse-wonder-full-1.0' });
+
+      const errors: Array<{ message: string; recoverable: boolean }> = [];
+      const inFlightInsideError: boolean[] = [];
+      provider.onError((sessionId, err) => {
+        errors.push(err as any);
+        inFlightInsideError.push((provider as any).sessions.get(sessionId).inFlight);
+      });
+      const completes: unknown[] = [];
+      provider.onComplete((_s, m) => completes.push(m));
+
+      await provider.send(routeId, 'hi');
+
+      expect(command).toHaveBeenCalledWith('turn/interrupt', expect.objectContaining({ turnId: 'turn-stalled' }));
+      expect(errors).toHaveLength(1);
+      expect(errors[0]).toMatchObject({ recoverable: true });
+      expect(errors[0].message).toMatch(/no response/i);
+      expect(inFlightInsideError).toEqual([false]);
+      expect(completes).toHaveLength(0);
+      await provider.endSession(routeId);
+    });
+
+    it('gives up on a host that never answers the interrupt (bounded, not an infinite wait)', async () => {
+      vi.useFakeTimers();
+      const provider = new MuseCodeSdkProvider();
+      const { sessionObj } = createMockSession();
+      // A host that ignores turn/interrupt: `completed` never settles.
+      const never = new Promise(() => {});
+      sessionObj.sendUserTurn.mockResolvedValue({
+        turnId: 'turn-deaf',
+        items: async function* () { await never; },
+        deltas: async function* () { await never; },
+        completed: never,
+      });
+      (provider as any).client = { startSession: vi.fn().mockResolvedValue(sessionObj) };
+      (provider as any).spawned = { connection: { command: vi.fn().mockResolvedValue({}) } };
+      const routeId = await provider.createSession({ cwd: '/home/k/project', model: 'muse-wonder-full-1.0' });
+
+      const errors: string[] = [];
+      provider.onError((_s, err) => errors.push(err.message));
+
+      const sending = provider.send(routeId, 'hi');
+      await vi.advanceTimersByTimeAsync(40 + 10_000 + 50);
+      await sending;
+
+      expect(errors).toHaveLength(1);
+      expect((provider as any).sessions.get(routeId).inFlight).toBe(false);
+      await provider.endSession(routeId);
+    });
+
+    it('does not fire when the model produces output, even if the turn is slow overall', async () => {
+      const provider = new MuseCodeSdkProvider();
+      const { sessionObj } = createMockSession();
+      let settle!: (v: unknown) => void;
+      const completed = new Promise((resolve) => { settle = resolve; });
+      sessionObj.sendUserTurn.mockResolvedValue({
+        turnId: 'turn-slow',
+        deltas: async function* () { yield { delta: 'ok', field: 'text' }; await completed; },
+        items: async function* () { await completed; },
+        completed,
+      });
+      const command = vi.fn().mockResolvedValue({});
+      (provider as any).client = { startSession: vi.fn().mockResolvedValue(sessionObj) };
+      (provider as any).spawned = { connection: { command } };
+      const routeId = await provider.createSession({ cwd: '/home/k/project', model: 'muse-wonder-full-1.0' });
+
+      const errors: string[] = [];
+      provider.onError((_s, err) => errors.push(err.message));
+      let message: any = null;
+      provider.onComplete((_s, m) => { message = m; });
+
+      const sending = provider.send(routeId, 'hi');
+      // Well past the watchdog timeout, with output already seen (the post-reply reminder-check tail).
+      await new Promise((r) => setTimeout(r, 120));
+      expect(command).not.toHaveBeenCalledWith('turn/interrupt', expect.anything());
+      settle({ kind: 'completed', params: { turnId: 'turn-slow', terminal: 'completed', durationMs: 1 } });
+      await sending;
+
+      expect(errors).toEqual([]);
+      expect(message).toMatchObject({ content: 'ok' });
+      await provider.endSession(routeId);
+    });
   });
 
   it('handles approvals correctly via session.onApproval and respondApproval', async () => {
@@ -561,6 +758,84 @@ describe('MuseCodeSdkProvider session and turn lifecycle', () => {
       sessionId: 'muse-sess-resumed-1',
       model: { modelId: 'muse-spark-1.3' },
     }));
+  });
+
+  describe('maximum-permission posture (--dangerously-skip-permissions equivalent)', () => {
+    it('is on by default: allowAll approval mode and a disabled host sandbox', () => {
+      expect(resolveMusePermissionPosture({})).toEqual({ maxPermissions: true, approvalMode: 'allowAll' });
+      expect(resolveMusePermissionPosture(null)).toEqual({ maxPermissions: true, approvalMode: 'allowAll' });
+
+      const args = buildMuseServeArgs({}, 'muse-wonder-1.0');
+      expect(args).toEqual(['serve', '--trust-workspace', '--disable-sandbox', '--provider', 'meta', '--model', 'muse-wonder-1.0']);
+    });
+
+    it('adds --disable-sandbox to caller-supplied args exactly once', () => {
+      const withFlag = buildMuseServeArgs({ args: ['--trust-workspace', '--disable-sandbox'] }, 'm');
+      expect(withFlag.filter((a) => a === '--disable-sandbox')).toHaveLength(1);
+      const without = buildMuseServeArgs({ args: ['--trust-workspace'] }, 'm');
+      expect(without).toContain('--disable-sandbox');
+    });
+
+    it('can be opted out of with dangerouslySkipPermissions: false', () => {
+      expect(resolveMusePermissionPosture({ dangerouslySkipPermissions: false })).toEqual({ maxPermissions: false, approvalMode: undefined });
+      const args = buildMuseServeArgs({ dangerouslySkipPermissions: false }, 'm');
+      expect(args).not.toContain('--disable-sandbox');
+    });
+
+    it('honors an explicit valid approvalMode and ignores an invalid one', () => {
+      expect(resolveMusePermissionPosture({ approvalMode: 'onRequest' }).approvalMode).toBe('onRequest');
+      expect(resolveMusePermissionPosture({ approvalMode: 'onRequest', dangerouslySkipPermissions: false }))
+        .toEqual({ maxPermissions: false, approvalMode: 'onRequest' });
+      expect(resolveMusePermissionPosture({ approvalMode: 'nonsense' }).approvalMode).toBe('allowAll');
+    });
+
+    it('starts new sessions in allowAll, or without a mode when opted out', async () => {
+      for (const [cfg, expected] of [[{}, 'allowAll'], [{ dangerouslySkipPermissions: false }, undefined], [{ approvalMode: 'onRequest' }, 'onRequest']] as const) {
+        const provider = new MuseCodeSdkProvider();
+        const { sessionObj } = createMockSession();
+        const startSession = vi.fn().mockResolvedValue(sessionObj);
+        (provider as any).client = { startSession };
+        (provider as any).config = cfg;
+        await provider.createSession({ cwd: '/home/k/project', model: 'muse-wonder-1.0' });
+        const params = startSession.mock.calls[0][0];
+        if (expected === undefined) expect(params).not.toHaveProperty('approvalMode');
+        else expect(params.approvalMode).toBe(expected);
+      }
+    });
+
+    it('selects allowAll on a resumed session via session/setApprovalMode (resume has no such member)', async () => {
+      const provider = new MuseCodeSdkProvider();
+      const mockCommand = vi.fn().mockResolvedValue({ status: 'ok' });
+      (provider as any).spawned = { connection: { command: mockCommand } };
+      (provider as any).client = {
+        resumeSession: vi.fn().mockResolvedValue({ sessionId: 'muse-sess-resumed-2', onApproval: vi.fn() }),
+      };
+      (provider as any).config = {};
+
+      await provider.createSession({ cwd: '/home/k/project', resumeId: 'muse-sess-resumed-2', agentId: 'muse-wonder-1.0' });
+
+      expect(mockCommand).toHaveBeenCalledWith('session/setApprovalMode', expect.objectContaining({
+        sessionId: 'muse-sess-resumed-2',
+        mode: 'allowAll',
+      }));
+    });
+
+    it('does not fail session resume when setting the approval mode errors', async () => {
+      const provider = new MuseCodeSdkProvider();
+      const mockCommand = vi.fn().mockImplementation(async (method: string) => {
+        if (method === 'session/setApprovalMode') throw new Error('rejected');
+        return {};
+      });
+      (provider as any).spawned = { connection: { command: mockCommand } };
+      (provider as any).client = {
+        resumeSession: vi.fn().mockResolvedValue({ sessionId: 'muse-sess-resumed-3', onApproval: vi.fn() }),
+      };
+      (provider as any).config = {};
+
+      await expect(
+        provider.createSession({ cwd: '/home/k/project', resumeId: 'muse-sess-resumed-3', agentId: 'muse-wonder-1.0' }),
+      ).resolves.toBeDefined();
+    });
   });
 
   it('normalizes legacy or misspelled model ids to supported muse models', () => {
