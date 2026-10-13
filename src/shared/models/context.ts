@@ -93,15 +93,16 @@ export function inferContextWindow(model?: string | null): number | undefined {
 
   // Google Gemini / Antigravity models
   if (
-    /^gemini[-_ ]?(?:3\.8|2\.5|1\.5)?[-_ ]?pro(?:$|[-_.\s(])/.test(m)
+    /^gemini[-_ ]?(?:4|3\.8|2\.5|1\.5)?[-_ ]?pro(?:$|[-_.\s(])/.test(m)
     || m === 'pro'
     || m === 'gemini-pro'
   ) {
     return GEMINI_CONTEXT_WINDOWS.PRO_FAMILY;
   }
   if (
-    /^gemini[-_ ]?(?:3\.8|2\.5|1\.5)?[-_ ]?flash(?:$|[-_.\s(])/.test(m)
-    || /^gemini[-_ ]?(?:3\.8|2\.5|1\.5)(?:$|[-_.\s(])/.test(m)
+    /^gemini[-_ ]?(?:4|3\.8|2\.5|1\.5)?[-_ ]?flash(?:$|[-_.\s(])/.test(m)
+    || /^gemini[-_ ]?(?:4|3\.8|2\.5|1\.5)(?:$|[-_.\s(])/.test(m)
+    || /^gemini[-_ ]4[-_ ]argon(?:$|[-_.\s(])/.test(m)
     || m === 'flash'
     || m === 'gemini-flash'
   ) {

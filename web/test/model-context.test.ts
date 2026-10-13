@@ -28,6 +28,8 @@ describe('web model context resolution', () => {
   it('resolves gemini flash to 1M and pro to 2M', () => {
     expect(inferContextWindow('flash')).toBe(1_000_000);
     expect(inferContextWindow('gemini-3.8-flash-high')).toBe(1_000_000);
+    expect(inferContextWindow('gemini-4-argon-medium')).toBe(1_000_000);
+    expect(inferContextWindow('gemini-4-argon-low')).toBe(1_000_000);
     expect(inferContextWindow('pro')).toBe(2_000_000);
     expect(inferContextWindow('gemini-3.8-pro')).toBe(2_000_000);
   });

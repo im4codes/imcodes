@@ -201,7 +201,7 @@ export function buildAgyArgs(opts: { conversationId?: string; model?: string }):
 export function parseAgyModelList(stdout: string): ProviderModelList['models'] {
   const models: ProviderModelList['models'] = [];
   for (const rawLine of stdout.split(/\r?\n/)) {
-    const line = rawLine.trim();
+    const line = (rawLine.includes('\r') ? (rawLine.split('\r').pop() ?? '') : rawLine).trim();
     if (!line) continue;
     const parts = line.includes('\t') ? line.split('\t') : line.split(/\s{2,}/);
     if (parts.length === 0) continue;

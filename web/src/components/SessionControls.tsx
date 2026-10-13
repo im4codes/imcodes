@@ -1381,6 +1381,9 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const machinePickerRef = useRef<HTMLDivElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
   const modelRef = useRef<HTMLDivElement>(null);
+  const modelDropdownRef = useRef<HTMLDivElement | null>(null);
+  const modelButtonRef = useRef<HTMLButtonElement | null>(null);
+  const [modelLayoutTick, setModelLayoutTick] = useState(0);
   const autoRef = useRef<HTMLDivElement>(null);
   const thinkingRef = useRef<HTMLDivElement>(null);
   const p2pRef = useRef<HTMLDivElement>(null);
@@ -2856,7 +2859,12 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         setConfirm(null);
         setConfirmLevel(0);
       }
-      if (modelOpen && modelRef.current && !modelRef.current.contains(target)) {
+      if (
+        modelOpen
+        && modelRef.current
+        && !modelRef.current.contains(target)
+        && !modelDropdownRef.current?.contains(target)
+      ) {
         setModelOpen(false);
       }
       if (autoOpen && autoRef.current && !autoRef.current.contains(target)) {
@@ -3455,6 +3463,92 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       viewport?.removeEventListener('scroll', refreshLayout);
     };
   }, [openSpecOpen]);
+
+  useEffect(() => {
+    if (!modelOpen || typeof window === 'undefined') return;
+    const refreshLayout = () => setModelLayoutTick((tick) => tick + 1);
+    const viewport = window.visualViewport;
+    window.addEventListener('resize', refreshLayout);
+    window.addEventListener('scroll', refreshLayout, true);
+    viewport?.addEventListener('resize', refreshLayout);
+    viewport?.addEventListener('scroll', refreshLayout);
+    return () => {
+      window.removeEventListener('resize', refreshLayout);
+      window.removeEventListener('scroll', refreshLayout, true);
+      viewport?.removeEventListener('resize', refreshLayout);
+      viewport?.removeEventListener('scroll', refreshLayout);
+    };
+  }, [modelOpen]);
+
+  const modelDropdownStyle = useMemo((): React.CSSProperties | undefined => {
+    if (!modelOpen || typeof window === 'undefined') return undefined;
+    const trigger = modelButtonRef.current ?? modelRef.current;
+    if (!trigger) return undefined;
+    const rect = trigger.getBoundingClientRect();
+
+    const viewportWidth = window.innerWidth;
+    const viewportHeight = window.innerHeight;
+    const horizontalInset = 8;
+    const verticalInset = 8;
+    const triggerGap = 4;
+
+    const rawAbove = Math.floor(rect.top - verticalInset);
+    const rawBelow = Math.floor(viewportHeight - rect.bottom - verticalInset);
+    const shouldOpenBelow = rawAbove < 180 && rawBelow > rawAbove;
+    const availableHeight = Math.max(96, shouldOpenBelow ? rawBelow : rawAbove);
+
+    const isRightHalf = rect.left + rect.width / 2 > viewportWidth / 2;
+
+    const style: React.CSSProperties = {
+      position: 'fixed',
+      zIndex: 2147483646,
+      width: 'max-content',
+      minWidth: `${Math.min(200, viewportWidth - horizontalInset * 2)}px`,
+      maxHeight: `${availableHeight}px`,
+      overflowY: 'auto',
+      overscrollBehavior: 'contain',
+    };
+
+    if (shouldOpenBelow) {
+      style.top = `${Math.max(horizontalInset, Math.round(rect.bottom + triggerGap))}px`;
+      style.bottom = 'auto';
+    } else {
+      style.bottom = `${Math.max(horizontalInset, Math.round(viewportHeight - rect.top + triggerGap))}px`;
+      style.top = 'auto';
+    }
+
+    if (isRightHalf) {
+      const rightOffset = Math.max(horizontalInset, viewportWidth - rect.right);
+      const maxAvailableWidth = Math.max(160, rect.right - horizontalInset);
+      style.right = `${Math.round(rightOffset)}px`;
+      style.left = 'auto';
+      style.maxWidth = `${Math.round(Math.min(maxAvailableWidth, viewportWidth - horizontalInset * 2))}px`;
+    } else {
+      const leftOffset = Math.max(horizontalInset, rect.left);
+      const maxAvailableWidth = Math.max(160, viewportWidth - leftOffset - horizontalInset);
+      style.left = `${Math.round(leftOffset)}px`;
+      style.right = 'auto';
+      style.maxWidth = `${Math.round(Math.min(maxAvailableWidth, viewportWidth - horizontalInset * 2))}px`;
+    }
+
+    return style;
+  }, [modelLayoutTick, modelOpen]);
+
+  const renderModelDropdown = useCallback((content: ComponentChildren) => {
+    const dropdown = (
+      <div
+        class="menu-dropdown menu-dropdown-models"
+        ref={modelDropdownRef}
+        style={modelDropdownStyle}
+      >
+        {content}
+      </div>
+    );
+    if (typeof document !== 'undefined') {
+      return createPortal(dropdown, document.body);
+    }
+    return dropdown;
+  }, [modelDropdownStyle]);
 
   const activeSub = (subSessions ?? []).find((s) => s.sessionName === activeSession?.name);
   const rootSession = activeSub?.parentSession || activeSession?.name || '';
@@ -4057,8 +4151,12 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       }
     }
 
+    if (isShellLike) {
+      extra.verbatim = true;
+    }
+
     // Prepend quotes (delegation sends must be a clean task only; validation blocks quotes).
-    if (!pendingDelegateTarget && quotes && quotes.length > 0) {
+    if (!pendingDelegateTarget && quotes && quotes.length > 0 && !isShellLike) {
       const quoteBlock = quotes.map((q) => `> ${q.replace(/\n/g, '\n> ')}`).join('\n\n');
       text = text ? `${quoteBlock}\n\n${text}` : quoteBlock;
     }
@@ -4067,8 +4165,12 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     // but map it to the full daemon path, not just the display filename.
     // The path is what the receiving LLM can actually open.
     if (!pendingDelegateTarget && attachments.length > 0) {
-      const refs = attachments.map((a) => `#${a.seq}:(${a.path})`).join(' ');
-      text = text ? `${refs} ${text}` : refs;
+      if (!isShellLike) {
+        const refs = attachments.map((a) => `#${a.seq}:(${a.path})`).join(' ');
+        text = text ? `${refs} ${text}` : refs;
+      } else if (!text) {
+        text = attachments.map((a) => a.path).join(' ');
+      }
     }
     // Compose-time alias resolution (A′). Resolve ONLY against the user's own
     // composed body (`composerBody`) — NOT the concatenated `text` that now also
@@ -4096,7 +4198,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     // and is simply not resolved — the server re-validates every serverId.
     Object.assign(extra, buildMachineSendExtra(composerBody, machineAll));
     return { text, extra, ...(delegation ? { delegation } : {}) };
-  }, [activeSession, aliasAll, aliasError, aliasLoaded, machineAll, applySavedP2pConfigSelection, attachments, pendingDelegateTarget, executionRouting.enabled, executionRouting.templateSessionName, executionRouting.limits, i18n?.language, onRemoveQuote, p2pExcludeSameType, p2pMode, p2pSavedConfig, quotes, refetchAliases, rootSession, sessions, showSendWarning, subSessions, t]);
+  }, [activeSession, aliasAll, aliasError, aliasLoaded, isShellLike, machineAll, applySavedP2pConfigSelection, attachments, pendingDelegateTarget, executionRouting.enabled, executionRouting.templateSessionName, executionRouting.limits, i18n?.language, onRemoveQuote, p2pExcludeSameType, p2pMode, p2pSavedConfig, quotes, refetchAliases, rootSession, sessions, showSendWarning, subSessions, t]);
 
   const buildModeOnlySendPayload = useCallback((rawText: string, modeOverride?: string): PendingSendPayload | null => {
     const text = rawText.trim();
@@ -5321,7 +5423,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   ): Promise<VoiceNotepadSendOutcome> => {
     const transcript = request.transcript.trim();
     if (!transcript) return 'rejected';
-    const attachAsFile = needsNotepadTranscriptAttachment(transcript);
+    const attachAsFile = !isShellLike && needsNotepadTranscriptAttachment(transcript);
     if (attachAsFile && !serverId) {
       showSendWarning(t('upload.long_text_requires_attachment'));
       return 'rejected';
@@ -5365,7 +5467,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       instruction ? `${instruction}\n\n${reference}` : reference,
       request.onAccepted,
     );
-  }, [handleRemoveAttachment, sendVoiceNotepadWhenReady, serverId, showSendWarning, t, uploadAttachmentFiles]);
+  }, [handleRemoveAttachment, isShellLike, sendVoiceNotepadWhenReady, serverId, showSendWarning, t, uploadAttachmentFiles]);
 
   // Attachment changes land on later renders: send a waiting notepad once
   // the composer is ready for it, and remove abandoned notepad uploads.
@@ -5474,7 +5576,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     e.preventDefault();
     const text = ce.clipboardData?.getData('text/plain') ?? '';
     if (!text) return;
-    if (text.length > INLINE_PASTE_TEXT_CHAR_LIMIT) {
+    if (text.length > INLINE_PASTE_TEXT_CHAR_LIMIT && !isShellLike) {
       if (!serverId) {
         showSendWarning(t('upload.long_text_requires_attachment'));
         return;
@@ -5496,7 +5598,16 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     aliasPasteSuppressRef.current = true;
     machinePasteSuppressRef.current = true;
     quickPhraseInputSuppressRef.current = true;
-    document.execCommand('insertText', false, text);
+    let inserted = false;
+    try {
+      inserted = document.execCommand('insertText', false, text);
+    } catch {
+      inserted = false;
+    }
+    if (!inserted && divRef.current) {
+      const current = readComposerElementText(divRef.current);
+      setComposerElementText(divRef.current, current + text);
+    }
     queueMicrotask(() => { quickPhraseInputSuppressRef.current = false; });
     setHasText(!!(divRef.current ? readComposerElementText(divRef.current).trim() : ''));
   };
@@ -6271,6 +6382,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
           <div class="shortcuts-model" ref={modelRef}>
             <button
               class="shortcut-btn"
+              ref={modelButtonRef}
               onClick={() => toggleModelMenu({
                 refreshDynamic: activeSession?.agentType === 'claude-code-sdk',
               })}
@@ -6280,8 +6392,8 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
             >
               {displayedClaudeModel ?? 'unknown'}
             </button>
-            {modelOpen && (
-              <div class="menu-dropdown">
+            {modelOpen && renderModelDropdown(
+              <>
                 {claudeModelSuggestions.map((m) => (
                   <button
                     key={m}
@@ -6291,7 +6403,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
                     {displayedClaudeModel === m ? '● ' : '○ '}{m.charAt(0).toUpperCase() + m.slice(1)}
                   </button>
                 ))}
-              </div>
+              </>
             )}
           </div>
         )}
@@ -6299,6 +6411,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
           <div class="shortcuts-model" ref={modelRef}>
             <button
               class="shortcut-btn"
+              ref={modelButtonRef}
               onClick={() => toggleModelMenu({
                 refreshDynamic: activeSession?.agentType === 'codex-sdk',
               })}
@@ -6308,8 +6421,8 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
             >
               {displayedCodexModel ?? 'default'}
             </button>
-            {modelOpen && (
-              <div class="menu-dropdown">
+            {modelOpen && renderModelDropdown(
+              <>
                 {codexModelSuggestions.map((m) => (
                   <button
                     key={m}
@@ -6319,7 +6432,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
                     {displayedCodexModel === m ? '● ' : '○ '}{m}
                   </button>
                 ))}
-              </div>
+              </>
             )}
           </div>
         )}
@@ -6343,6 +6456,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
           <div class="shortcuts-model" ref={modelRef}>
             <button
               class="shortcut-btn"
+              ref={modelButtonRef}
               onClick={() => setModelOpen((o) => !o)}
               disabled={modelSwitchDisabled}
               title={qwenModel
@@ -6352,8 +6466,8 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
             >
               {qwenTierLabel}
             </button>
-            {modelOpen && (
-              <div class="menu-dropdown menu-dropdown-models">
+            {modelOpen && renderModelDropdown(
+              <>
                 {qwenChoices.map((m) => (
                   <button
                     key={m.id}
@@ -6364,7 +6478,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
                     {qwenModel === m.id ? '● ' : '○ '}{m.id}
                   </button>
                 ))}
-              </div>
+              </>
             )}
           </div>
         )}
@@ -6372,6 +6486,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
           <div class="shortcuts-model" ref={modelRef}>
             <button
               class="shortcut-btn"
+              ref={modelButtonRef}
               onClick={() => toggleModelMenu({ refreshDynamic: true })}
               disabled={modelSwitchDisabled}
               title={genericTransportModel ? `Model: ${genericTransportModel}` : 'Model: default — tap to select'}
@@ -6379,8 +6494,8 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
             >
               {genericTransportModel ?? 'default'}
             </button>
-            {modelOpen && (
-              <div class="menu-dropdown">
+            {modelOpen && renderModelDropdown(
+              <>
                 {genericTransportModelSuggestions.map((m) => (
                   <button
                     key={m}
@@ -6390,7 +6505,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
                     {genericTransportModel === m ? '● ' : '○ '}{m}
                   </button>
                 ))}
-              </div>
+              </>
             )}
           </div>
         )}
@@ -6920,7 +7035,11 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
             onClose={() => setQuickOpen(false)}
             onSelect={fillInput}
             onSend={(text: string) => {
-              requestSend(buildModeOnlySendPayload(text));
+              if (isShellLike) {
+                requestSend({ text, extra: { verbatim: true } });
+              } else {
+                requestSend(buildModeOnlySendPayload(text));
+              }
             }}
             agentType={activeSession?.agentType ?? 'claude-code'}
             sessionName={activeSession?.name ?? ''}

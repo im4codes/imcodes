@@ -117,6 +117,14 @@ describe('agy-sdk helpers', () => {
     ]);
   });
 
+  it('parses models when progress spinner overwrites the first line via carriage return', () => {
+    const raw = '⠋ Fetching available models...\r⠙ Fetching available models...\r⠦ Fetching available models...\rgemini-4-argon-medium     Gemini 4 Argon (Medium)\ngemini-4-argon-high       Gemini 4 Argon (High)\n';
+    expect(parseAgyModelList(raw)).toEqual([
+      { id: 'gemini-4-argon-medium', name: 'Gemini 4 Argon (Medium)' },
+      { id: 'gemini-4-argon-high', name: 'Gemini 4 Argon (High)' },
+    ]);
+  });
+
   it('encodes one NDJSON user line', () => {
     const line = encodeAgyUserLine('hi\nthere');
     expect(line.endsWith('\n')).toBe(true);

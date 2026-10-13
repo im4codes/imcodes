@@ -646,6 +646,23 @@ describe('styles.css regression contracts', () => {
     expect(mobileP2pRule![0]).toMatch(/overflow-y:\s*auto/);
   });
 
+  it('model dropdown is portaled and adapts to width without line wrapping', () => {
+    const sessionControls = readFileSync(resolve(__dirname, '../src/components/SessionControls.tsx'), 'utf8');
+    const helper = sessionControls.match(/const renderModelDropdown = useCallback\([\s\S]*?\}, \[modelDropdownStyle\]\);/);
+    expect(helper?.[0]).toContain('createPortal');
+    expect(helper?.[0]).toContain('document.body');
+    expect(sessionControls).toMatch(/modelDropdownRef\.current\?\.contains/);
+
+    const modelsRule = css.match(/\.menu-dropdown-models\s*\{[^}]*\}/);
+    expect(modelsRule).not.toBeNull();
+    expect(modelsRule![0]).toMatch(/width:\s*max-content/);
+    expect(modelsRule![0]).toMatch(/z-index:\s*2147483646/);
+
+    const nowrapRule = css.match(/\.menu-dropdown-models \.menu-item,\s*\.menu-dropdown \.menu-item\s*\{[^}]*\}/);
+    expect(nowrapRule).not.toBeNull();
+    expect(nowrapRule![0]).toMatch(/white-space:\s*nowrap/);
+  });
+
   it('lets the terminal shortcut strip own remaining width and scroll horizontally', () => {
     const shortcutStripRule = css.match(/\.shortcuts\s*\{[^}]*\}/);
     expect(shortcutStripRule).not.toBeNull();

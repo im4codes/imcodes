@@ -77,6 +77,9 @@ describe('model context inference', () => {
     expect(inferContextWindow('gemini-3.8-flash-high')).toBe(1_000_000);
     expect(inferContextWindow('gemini-3.8-flash-medium')).toBe(1_000_000);
     expect(inferContextWindow('gemini-2.5-flash')).toBe(1_000_000);
+    expect(inferContextWindow('gemini-4-argon-medium')).toBe(1_000_000);
+    expect(inferContextWindow('gemini-4-argon-high')).toBe(1_000_000);
+    expect(inferContextWindow('gemini-4-argon-low')).toBe(1_000_000);
     expect(inferContextWindow('pro')).toBe(2_000_000);
     expect(inferContextWindow('gemini-3.8-pro')).toBe(2_000_000);
     expect(inferContextWindow('gemini-2.5-pro')).toBe(2_000_000);
