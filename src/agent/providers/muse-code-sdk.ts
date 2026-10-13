@@ -269,9 +269,20 @@ export class MuseCodeSdkProvider implements TransportProvider {
       } satisfies ProviderError;
     }
 
+    const defaultModel = normalizeMuseModelId(
+      typeof config.agentId === 'string' && config.agentId.trim()
+        ? config.agentId.trim()
+        : (typeof (config as any).model === 'string' && (config as any).model.trim()
+          ? (config as any).model.trim()
+          : 'muse-spark-1.3'),
+    );
     const args = ['serve', ...(Array.isArray(config.args) ? (config.args as string[]) : ['--trust-workspace'])];
-    if (typeof config.provider === 'string' && config.provider.trim() && !args.includes('--provider')) {
-      args.push('--provider', config.provider.trim());
+    if (!args.includes('--provider')) {
+      const provider = typeof config.provider === 'string' && config.provider.trim() ? config.provider.trim() : 'meta';
+      args.push('--provider', provider);
+    }
+    if (!args.includes('--model') && defaultModel) {
+      args.push('--model', defaultModel);
     }
 
     const explicitApiKey = typeof config.apiKey === 'string' && config.apiKey.trim()

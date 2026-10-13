@@ -37,6 +37,7 @@ describe('buildTransportResumeLaunchOpts', () => {
     expect(usesProviderResumeId('opencode-sdk')).toBe(true);
     expect(usesProviderResumeId('deepseek-harness')).toBe(true);
     expect(usesProviderResumeId('pi')).toBe(true);
+    expect(usesProviderResumeId('muse-code-sdk')).toBe(true);
     expect(usesProviderResumeId(CODEBUDDY_PROVIDER_IDS.CHINA)).toBe(true);
     expect(usesProviderResumeId(CODEBUDDY_PROVIDER_IDS.INTERNATIONAL)).toBe(true);
     expect(usesProviderResumeId('gemini-sdk')).toBe(false);

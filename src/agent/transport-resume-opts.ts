@@ -18,6 +18,7 @@ export function usesProviderResumeId(agentType: string | undefined): boolean {
     || agentType === 'opencode-sdk'
     || agentType === 'deepseek-harness'
     || agentType === 'pi'
+    || agentType === 'muse-code-sdk'
     || isCodeBuddyProviderId(agentType);
 }
 
