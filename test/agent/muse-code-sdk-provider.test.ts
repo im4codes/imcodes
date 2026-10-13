@@ -4,9 +4,11 @@ import {
   MUSE_CODE_SDK_PROVIDER_ID,
   MuseCodeSdkProvider,
   buildMuseServeArgs,
+  buildMuseUsage,
   normalizeMuseModelId,
   resolveMusePermissionPosture,
 } from '../../src/agent/providers/muse-code-sdk.js';
+import { __testing__ as relayTesting } from '../../src/daemon/transport-relay.js';
 import {
   BACKGROUND_SUBAGENT_WAKE_MODES,
   CONNECTION_MODES,
@@ -24,6 +26,8 @@ import {
   SDK_SUBAGENT_PROVIDER_KINDS,
   SDK_SUBAGENT_STATUS,
 } from '../../shared/sdk-subagent-status.js';
+
+const relayNormalizeUsageUpdatePayload = relayTesting.normalizeUsageUpdatePayload;
 
 describe('MuseCodeSdkProvider contract', () => {
   it('declares the official Muse Code transport capabilities and configuration', () => {
@@ -835,6 +839,128 @@ describe('MuseCodeSdkProvider session and turn lifecycle', () => {
       await expect(
         provider.createSession({ cwd: '/home/k/project', resumeId: 'muse-sess-resumed-3', agentId: 'muse-wonder-1.0' }),
       ).resolves.toBeDefined();
+    });
+  });
+
+  describe('context window usage sync', () => {
+    // Values captured from a live muse-wonder-1.0 run (second turn, with a tool call).
+    const liveFold = (overrides: { context?: unknown; token?: unknown } = {}) => ({
+      sessionState: {
+        get: (family: string) => {
+          if (family === 'session/contextUsage') {
+            return 'context' in overrides
+              ? overrides.context
+              : { usedTokens: 33537, windowTokens: 1007997, pressure: 'normal' };
+          }
+          if (family === 'session/tokenUsage') {
+            return 'token' in overrides
+              ? overrides.token
+              : {
+                promptTokens: 33522,
+                totalTokens: 33537,
+                usage: { inputTokens: 33522, outputTokens: 15, cachedTokens: 33140, cacheReadTokens: 33140, cacheWriteTokens: 0, reasoningTokens: 4 },
+                cumulative: { promptTokens: 99951, outputTokens: 205, totalTokens: 100156, cacheReadTokens: 66280 },
+              };
+          }
+          return undefined;
+        },
+      },
+    });
+
+    it('reports the latest counted-once occupancy split into non-cached input and cache, with the real window', () => {
+      const usage = buildMuseUsage({ fold: liveFold() });
+      expect(usage).toEqual({
+        input_tokens: 397,
+        cache_read_input_tokens: 33140,
+        output_tokens: 15,
+        model_context_window: 1007997,
+      });
+      // The UI meter is input + cache and must equal the host's own occupancy.
+      expect(usage!.input_tokens + (usage!.cache_read_input_tokens ?? 0)).toBe(33537);
+    });
+
+    it('uses the latest model call, never the summed cumulative counters', () => {
+      const usage = buildMuseUsage({ fold: liveFold() })!;
+      expect(usage.input_tokens + (usage.cache_read_input_tokens ?? 0)).toBeLessThan(99951);
+    });
+
+    it('omits the cache field when nothing was cached', () => {
+      const usage = buildMuseUsage({
+        fold: liveFold({
+          context: { usedTokens: 33210, windowTokens: 1007997, pressure: 'normal' },
+          token: { promptTokens: 33194, usage: { inputTokens: 33194, outputTokens: 16, cachedTokens: 0 } },
+        }),
+      });
+      expect(usage).toEqual({ input_tokens: 33210, output_tokens: 16, model_context_window: 1007997 });
+    });
+
+    it('omits the window when the host reports none instead of inventing one', () => {
+      const usage = buildMuseUsage({
+        fold: liveFold({ context: { usedTokens: 1000, pressure: 'normal' } }),
+      })!;
+      expect(usage).not.toHaveProperty('model_context_window');
+    });
+
+    it('falls back to the token counters when the context snapshot is absent', () => {
+      const usage = buildMuseUsage({ fold: liveFold({ context: null }) })!;
+      // promptTokens 33522 + latest output 15
+      expect(usage.input_tokens + (usage.cache_read_input_tokens ?? 0)).toBe(33537);
+    });
+
+    it('falls back to the turn counters when there is no session state', () => {
+      expect(buildMuseUsage({}, { inputTokens: 1000, cachedTokens: 400, outputTokens: 50 })).toEqual({
+        input_tokens: 650,
+        cache_read_input_tokens: 400,
+        output_tokens: 50,
+      });
+    });
+
+    it('never clamps cache above the occupancy', () => {
+      const usage = buildMuseUsage({
+        fold: liveFold({
+          context: { usedTokens: 100, pressure: 'normal' },
+          token: { promptTokens: 90, usage: { inputTokens: 90, outputTokens: 10, cachedTokens: 5000 } },
+        }),
+      })!;
+      expect(usage.input_tokens).toBe(0);
+      expect(usage.cache_read_input_tokens).toBe(100);
+    });
+
+    it('returns undefined rather than inventing numbers when nothing is available', () => {
+      expect(buildMuseUsage({})).toBeUndefined();
+      expect(buildMuseUsage(null)).toBeUndefined();
+      expect(buildMuseUsage({ fold: liveFold({ context: null, token: null }) })).toBeUndefined();
+    });
+
+    it('does not throw when the session state cannot be read', () => {
+      const exploding = { fold: { sessionState: { get: () => { throw new Error('boom'); } } } };
+      // Occupancy follows the host's own definition (prompt + output of the driving call): 10 + 2.
+      expect(buildMuseUsage(exploding, { inputTokens: 10, outputTokens: 2 })).toEqual({ input_tokens: 12, output_tokens: 2 });
+      expect(buildMuseUsage(exploding)).toBeUndefined();
+    });
+
+    it('attaches the normalized usage to the completion message, which the relay turns into the UI meter payload', async () => {
+      const provider = new MuseCodeSdkProvider();
+      const { sessionObj } = createMockSession();
+      (sessionObj as any).fold = liveFold();
+      (provider as any).client = { startSession: vi.fn().mockResolvedValue(sessionObj) };
+      const routeId = await provider.createSession({ cwd: '/home/k/project', model: 'muse-wonder-1.0' });
+
+      let message: any = null;
+      provider.onComplete((_s, m) => { message = m; });
+      await provider.send(routeId, 'hi');
+
+      expect(message.metadata.usage).toEqual({
+        input_tokens: 397,
+        cache_read_input_tokens: 33140,
+        output_tokens: 15,
+        model_context_window: 1007997,
+      });
+
+      const payload = relayNormalizeUsageUpdatePayload('deck_muse_ctx', message.metadata.usage, message.metadata.model) as Record<string, number>;
+      expect(payload.inputTokens + payload.cacheTokens).toBe(33537);
+      expect(payload.contextWindow).toBe(1007997);
+      await provider.endSession(routeId);
     });
   });
 

@@ -272,6 +272,77 @@ export function buildMuseServeArgs(config: Record<string, unknown>, defaultModel
   return args;
 }
 
+type MuseUsageRelayShape = {
+  input_tokens: number;
+  output_tokens?: number;
+  cache_read_input_tokens?: number;
+  model_context_window?: number;
+};
+
+function finiteNonNegative(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : undefined;
+}
+
+/**
+ * Context-window usage for a completed Muse turn, in the snake_case shape
+ * transport-relay consumes. The relay's meter is `input + cache`, where
+ * `input_tokens` is the NON-cached part and `cache_read_input_tokens` the
+ * cached part; Muse's prompt count includes the cached tokens.
+ *
+ * Source preference:
+ *  1. the host's session state (`session/contextUsage` = counted-once
+ *     occupancy + the real window; `session/tokenUsage` = latest completion's
+ *     cache split). Both are folded by the SDK before `turn/completed`
+ *     resolves, and they describe the LATEST model call (the meter), not the
+ *     turn's summed cumulative counters.
+ *  2. the turn's own `usage` counters, when the host supplied them.
+ * Returns undefined when neither is available, so nothing is invented.
+ */
+export function buildMuseUsage(session: unknown, turnUsage?: unknown): MuseUsageRelayShape | undefined {
+  let context: Record<string, unknown> | null | undefined;
+  let token: Record<string, unknown> | null | undefined;
+  try {
+    const sessionState = (session as { fold?: { sessionState?: { get?: (family: string) => unknown } } } | null | undefined)
+      ?.fold?.sessionState;
+    if (sessionState && typeof sessionState.get === 'function') {
+      context = sessionState.get('session/contextUsage') as Record<string, unknown> | null | undefined;
+      token = sessionState.get('session/tokenUsage') as Record<string, unknown> | null | undefined;
+    }
+  } catch {
+    // A fold that cannot be read must never fail the turn; fall through.
+  }
+
+  const raw = (token?.usage ?? undefined) as Record<string, unknown> | undefined;
+  const latestOutput = finiteNonNegative(raw?.outputTokens);
+  const aggregate = (turnUsage ?? undefined) as Record<string, unknown> | undefined;
+  const outputTokens = finiteNonNegative(aggregate?.outputTokens) ?? latestOutput;
+
+  let occupancy = finiteNonNegative(context?.usedTokens);
+  if (occupancy === undefined) {
+    const prompt = finiteNonNegative(token?.promptTokens);
+    if (prompt !== undefined) occupancy = prompt + (latestOutput ?? 0);
+  }
+  let cacheSource = raw;
+  if (occupancy === undefined && aggregate) {
+    const input = finiteNonNegative(aggregate.inputTokens);
+    if (input !== undefined) occupancy = input + (finiteNonNegative(aggregate.outputTokens) ?? 0);
+    cacheSource = aggregate;
+  }
+  if (occupancy === undefined) return undefined;
+
+  const cached = Math.min(
+    finiteNonNegative(cacheSource?.cacheReadTokens) ?? finiteNonNegative(cacheSource?.cachedTokens) ?? 0,
+    occupancy,
+  );
+  const windowTokens = finiteNonNegative(context?.windowTokens);
+  return {
+    input_tokens: occupancy - cached,
+    ...(cached > 0 ? { cache_read_input_tokens: cached } : {}),
+    ...(outputTokens !== undefined ? { output_tokens: outputTokens } : {}),
+    ...(windowTokens ? { model_context_window: windowTokens } : {}),
+  };
+}
+
 function mapEffortLevel(effort?: TransportEffortLevel): 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra' | undefined {
   if (!effort) return undefined;
   if (effort === 'off') return 'none';
@@ -857,6 +928,7 @@ export class MuseCodeSdkProvider implements TransportProvider {
           return;
         }
 
+        const museUsage = buildMuseUsage(state.session, outcome.params.usage);
         const agentMessage: AgentMessage = {
           id: finalMessageId,
           sessionId,
@@ -869,7 +941,7 @@ export class MuseCodeSdkProvider implements TransportProvider {
             turnId: outcome.params.turnId,
             durationMs: outcome.params.durationMs,
             ...(state.model ? { model: state.model } : {}),
-            ...(outcome.params.usage ? { usage: outcome.params.usage } : {}),
+            ...(museUsage ? { usage: museUsage } : {}),
           },
         };
         this.emitComplete(sessionId, agentMessage);
