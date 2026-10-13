@@ -2104,6 +2104,22 @@ describe('handleWebCommand memory context timeline', () => {
         && (payload as { commandId?: string } | undefined)?.commandId === commandId,
     );
 
+    it.each(['shell', 'script'] as const)('%s chat sends keep long multiline commands and leading ! verbatim without memory', async (agentType) => {
+      getSessionMock.mockReturnValue(shellSession(agentType));
+      const text = '! true\n' + 'printf "中文 $HOME @file ; literal\\n"\n'.repeat(20);
+      handleWebCommand({
+        type: 'session.send',
+        session: 'deck_process_brain',
+        text,
+        commandId: `cmd-shell-verbatim-${agentType}`,
+      }, serverLink as any);
+      await flushAsync();
+      expect(sendKeysDelayedEnterMock).toHaveBeenCalledWith('deck_process_brain', text, { verbatim: true });
+      expect(searchLocalMemorySemanticMock).not.toHaveBeenCalled();
+      expect(collectRecentSummarySyncCandidatesMock).not.toHaveBeenCalled();
+      expect(userMessageEmit(`cmd-shell-verbatim-${agentType}`)?.[2]).toMatchObject({ text });
+    });
+
     it('12.5 shell inline: substituted value reaches the agent; timeline keeps the marker', async () => {
       searchLocalMemorySemanticMock.mockResolvedValue(emptyRecall);
       getSessionMock.mockReturnValue(shellSession('shell'));
