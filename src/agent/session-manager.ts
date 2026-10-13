@@ -1344,7 +1344,7 @@ export async function relaunchSessionWithSettings(
       bindExistingKey: record.providerSessionId,
       skipCreate: true,
     } : {}),
-    ...(!targetFresh && usesProviderResumeId(targetAgentType) && record.providerResumeId
+    ...(!targetFresh && record.agentType === targetAgentType && usesProviderResumeId(targetAgentType) && record.providerResumeId
       ? { providerResumeId: record.providerResumeId }
       : {}),
     ...compatibleIds,
@@ -3513,7 +3513,9 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
   let dshLlmConfig: DshLlmConfig | undefined;
   let piLlmConfig: PiLlmConfig | undefined;
   const storedRequestedModel = !opts.fresh ? existing?.requestedModel : undefined;
-  const storedProviderResumeId = !opts.fresh ? existing?.providerResumeId : undefined;
+  const storedProviderResumeId = (!opts.fresh && (existing?.providerId ?? existing?.agentType) === agentType)
+    ? existing?.providerResumeId
+    : undefined;
   let requestedTransportModel = opts.requestedModel ?? storedRequestedModel ?? (agentType === 'qwen' ? (opts.qwenModel ?? existing?.qwenModel) : undefined);
   if (agentType === 'codex-sdk') {
     requestedTransportModel = sanitizeCodexSdkStartupModel(requestedTransportModel);

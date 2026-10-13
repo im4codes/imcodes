@@ -629,7 +629,7 @@ export async function rebuildSubSessions(subSessions: SubSessionRecord[]): Promi
         requestedModel: sub.requestedModel ?? existing?.requestedModel,
         activeModel: sub.activeModel ?? existing?.activeModel,
         providerSessionId: sub.providerSessionId ?? existing?.providerSessionId,
-        providerResumeId: sub.providerResumeId ?? existing?.providerResumeId,
+        providerResumeId: sub.providerResumeId ?? ((existing?.providerId ?? existing?.agentType) === (sub.providerId ?? sub.type) ? existing?.providerResumeId : undefined),
         ccSessionId: sub.ccSessionId ?? existing?.ccSessionId,
         codexSessionId: sub.codexSessionId ?? existing?.codexSessionId,
         effort: sub.effort ?? existing?.effort,

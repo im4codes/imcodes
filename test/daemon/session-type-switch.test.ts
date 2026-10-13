@@ -33,4 +33,17 @@ describe('getCompatibleSessionIds', () => {
       codexSessionId: 'codex-thread-999',
     });
   });
+
+  it('returns empty compatible ids for non-family targets like grok-sdk and agy-sdk', () => {
+    const record = {
+      ccSessionId: 'cc-session-123',
+      codexSessionId: 'codex-thread-999',
+      geminiSessionId: 'gem-1',
+      opencodeSessionId: 'oc-1',
+    };
+
+    expect(getCompatibleSessionIds(record, 'grok-sdk')).toEqual({});
+    expect(getCompatibleSessionIds(record, 'agy-sdk')).toEqual({});
+    expect(getCompatibleSessionIds(record, 'kimi-sdk')).toEqual({});
+  });
 });
