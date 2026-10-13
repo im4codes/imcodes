@@ -7,7 +7,10 @@ import {
   IMCODES_MEMORY_MCP_LAUNCH_ARGS,
   IMCODES_MEMORY_MCP_LAUNCH_COMMAND,
 } from '../../src/agent/providers/getDefaultMcpServers.js';
-import { ensureMuseMcpConfigHasImcodesEntry } from '../../src/daemon/muse-mcp-config.js';
+import {
+  ensureMuseMcpConfigHasImcodesEntry,
+  ensureMuseModelCatalogSeeded,
+} from '../../src/daemon/muse-mcp-config.js';
 
 vi.mock('../../src/util/logger.js', () => ({
   default: {
@@ -127,5 +130,63 @@ describe('ensureMuseMcpConfigHasImcodesEntry', () => {
       env: {},
       mode: 'optional',
     });
+  });
+});
+
+describe('ensureMuseModelCatalogSeeded', () => {
+  let dir = '';
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'imcodes-muse-catalog-'));
+  });
+
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it('seeds default catalog when catalog file does not exist', async () => {
+    const catalogPath = join(dir, '6d657461__p746268.json');
+    const seeded = await ensureMuseModelCatalogSeeded({ catalogPath, skipTestDefaultPath: false });
+
+    expect(seeded).toBe(true);
+    const content = JSON.parse(await readFile(catalogPath, 'utf8'));
+    expect(content.provider_id).toBe('meta');
+    expect(content.rows.length).toBeGreaterThan(0);
+    expect(content.rows.some((r: any) => r.model_id === 'muse-spark-1.3')).toBe(true);
+  });
+
+  it('repairs and seeds catalog when catalog file has empty rows', async () => {
+    const catalogPath = join(dir, '6d657461__p746268.json');
+    await writeFile(catalogPath, JSON.stringify({
+      schema_version: 2,
+      provider_id: 'meta',
+      profile_id: 'tbh',
+      source: 'provider_catalog',
+      rows: [],
+    }), 'utf8');
+
+    const seeded = await ensureMuseModelCatalogSeeded({ catalogPath, skipTestDefaultPath: false });
+
+    expect(seeded).toBe(true);
+    const content = JSON.parse(await readFile(catalogPath, 'utf8'));
+    expect(content.rows.length).toBeGreaterThan(0);
+    expect(content.rows[0].model_id).toBe('muse-spark-1.3');
+  });
+
+  it('does not overwrite when catalog already has visible models', async () => {
+    const catalogPath = join(dir, '6d657461__p746268.json');
+    await writeFile(catalogPath, JSON.stringify({
+      schema_version: 2,
+      provider_id: 'meta',
+      profile_id: 'tbh',
+      source: 'provider_catalog',
+      rows: [{ model_id: 'custom-spark', visibility: 'visible' }],
+    }), 'utf8');
+
+    const seeded = await ensureMuseModelCatalogSeeded({ catalogPath, skipTestDefaultPath: false });
+
+    expect(seeded).toBe(false);
+    const content = JSON.parse(await readFile(catalogPath, 'utf8'));
+    expect(content.rows[0].model_id).toBe('custom-spark');
   });
 });

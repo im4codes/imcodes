@@ -16,6 +16,7 @@ function noticeMarker(): string { return join(resolveImcodesHome(), 'muse-mcp-no
 
 export interface MuseMcpEnsureOptions {
   configPath?: string;
+  catalogPath?: string;
   noticeMarkerPath?: string;
   skipTestDefaultPath?: boolean;
 }
@@ -33,6 +34,129 @@ export function defaultMuseSettingsPath(): string {
   const xdg = process.env.XDG_CONFIG_HOME?.trim();
   const base = xdg || join(homedir(), '.config');
   return join(base, 'muse', 'settings.json');
+}
+
+export function defaultMuseModelCatalogPath(): string {
+  const xdg = process.env.XDG_DATA_HOME?.trim();
+  const base = xdg || join(homedir(), '.local', 'share');
+  return join(base, 'muse', 'model-catalog', '6d657461__p746268.json');
+}
+
+export const DEFAULT_MUSE_CATALOG_PAYLOAD = {
+  schema_version: 2,
+  provider_id: 'meta',
+  profile_id: 'tbh',
+  source: 'provider_catalog',
+  rows: [
+    {
+      model_id: 'muse-spark-1.3',
+      provider_id: 'meta',
+      profile_id: 'tbh',
+      display_label: 'Muse Spark 1.3',
+      visibility: 'visible',
+      release_date: null,
+      display_order: 0,
+      is_current: true,
+      is_default: true,
+      roles: ['chat', 'edit'],
+      context_limit: 1000000,
+      output_limit: 64000,
+      description: 'Muse Spark 1.3',
+      reasoning_effort_variants: [],
+      supports_video: false,
+      supports_image_generation: false,
+    },
+    {
+      model_id: 'muse-spark',
+      provider_id: 'meta',
+      profile_id: 'tbh',
+      display_label: 'Muse Spark',
+      visibility: 'visible',
+      release_date: null,
+      display_order: 1,
+      is_current: true,
+      is_default: false,
+      roles: ['chat', 'edit'],
+      context_limit: 1000000,
+      output_limit: 64000,
+      description: 'Muse Spark',
+      reasoning_effort_variants: [],
+      supports_video: false,
+      supports_image_generation: false,
+    },
+    {
+      model_id: 'muse-wonder',
+      provider_id: 'meta',
+      profile_id: 'tbh',
+      display_label: 'Muse Wonder',
+      visibility: 'visible',
+      release_date: null,
+      display_order: 2,
+      is_current: true,
+      is_default: false,
+      roles: ['chat', 'edit'],
+      context_limit: 1000000,
+      output_limit: 64000,
+      description: 'Muse Wonder',
+      reasoning_effort_variants: [],
+      supports_video: false,
+      supports_image_generation: false,
+    },
+    {
+      model_id: 'muse-fast',
+      provider_id: 'meta',
+      profile_id: 'tbh',
+      display_label: 'Muse Fast',
+      visibility: 'visible',
+      release_date: null,
+      display_order: 3,
+      is_current: true,
+      is_default: false,
+      roles: ['chat', 'edit'],
+      context_limit: 1000000,
+      output_limit: 64000,
+      description: 'Muse Fast',
+      reasoning_effort_variants: [],
+      supports_video: false,
+      supports_image_generation: false,
+    },
+  ],
+};
+
+export async function ensureMuseModelCatalogSeeded(options: { catalogPath?: string; skipTestDefaultPath?: boolean } = {}): Promise<boolean> {
+  const catalogPath = options.catalogPath ?? defaultMuseModelCatalogPath();
+  if (!options.catalogPath && options.skipTestDefaultPath !== false && process.env.VITEST === 'true') {
+    return false;
+  }
+  try {
+    let needsSeeding = false;
+    try {
+      const raw = await readFile(catalogPath, 'utf8');
+      const parsed = JSON.parse(raw);
+      if (!Array.isArray(parsed.rows) || parsed.rows.length === 0) {
+        needsSeeding = true;
+      }
+    } catch (err: any) {
+      if (err?.code === 'ENOENT' || err instanceof SyntaxError) {
+        needsSeeding = true;
+      } else {
+        throw err;
+      }
+    }
+
+    if (needsSeeding) {
+      await mkdir(dirname(catalogPath), { recursive: true });
+      const tmpPath = `${catalogPath}.tmp-${process.pid}-${Date.now()}`;
+      await writeFile(tmpPath, `${JSON.stringify(DEFAULT_MUSE_CATALOG_PAYLOAD, null, 2)}\n`, 'utf8');
+      await rename(tmpPath, catalogPath);
+      logger.info({ catalogPath }, 'Seeded Muse Code model catalog cache');
+      return true;
+    }
+    return false;
+  } catch (err) {
+    logger.warn({ err, catalogPath }, 'Failed to seed Muse Code model catalog');
+    return false;
+  }
 }
 
 function daemonEntry(): Record<string, unknown> {
@@ -131,6 +255,8 @@ export async function ensureMuseMcpConfigHasImcodesEntry(options: MuseMcpEnsureO
     if (hadPoisonedModel) {
       delete parsed.model;
     }
+
+    await ensureMuseModelCatalogSeeded({ catalogPath: options.catalogPath, skipTestDefaultPath: options.skipTestDefaultPath }).catch(() => false);
 
     if (!hadPoisonedModel && !hadSnakeCase && (isSameDaemonEntry(mcpServers[IMCODES_MEMORY_MCP_SERVER_NAME]) || isSameDaemonEntry(mcpServers[DAEMON_CONFLICT_SERVER_NAME]))) {
       return {
