@@ -25,6 +25,38 @@ export function resolveGrokBinaryPath(config?: ProviderConfig | { binaryPath?: s
   return resolveGrokPathForSdk(raw);
 }
 
+/** Grok's `--permission-mode` vocabulary (from `grok --help`). */
+export const GROK_PERMISSION_MODES = ['default', 'acceptEdits', 'auto', 'dontAsk', 'bypassPermissions', 'plan'] as const;
+export type GrokPermissionMode = typeof GROK_PERMISSION_MODES[number];
+
+/**
+ * Permission mode to launch Grok with. Defaults to the highest-permission
+ * `bypassPermissions` (like claude's bypassPermissions / codex's
+ * danger-full-access / gemini's yolo). Opt out with
+ * `dangerouslySkipPermissions: false`; pick another mode with `permissionMode`.
+ * Returns undefined when no flag should be passed.
+ */
+export function resolveGrokPermissionMode(config: Record<string, unknown> | null | undefined): GrokPermissionMode | undefined {
+  const requested = typeof config?.permissionMode === 'string' ? config.permissionMode : '';
+  if ((GROK_PERMISSION_MODES as readonly string[]).includes(requested)) {
+    return requested === 'default' ? undefined : (requested as GrokPermissionMode);
+  }
+  return config?.dangerouslySkipPermissions === false ? undefined : 'bypassPermissions';
+}
+
+/**
+ * Insert `--permission-mode <mode>` ahead of the `agent stdio` subcommand
+ * (global flags must precede it). A caller-provided flag is never overridden.
+ */
+export function buildGrokAcpArgs(baseArgs: readonly string[], config: Record<string, unknown> | null | undefined): string[] {
+  const args = [...baseArgs];
+  const mode = resolveGrokPermissionMode(config);
+  if (!mode || args.includes('--permission-mode')) return args;
+  const at = args.indexOf('agent');
+  args.splice(at >= 0 ? at : 0, 0, '--permission-mode', mode);
+  return args;
+}
+
 const GROK_PROFILE: AcpCliProviderProfile = {
   id: 'grok-sdk',
   displayName: 'Grok',
@@ -70,6 +102,10 @@ export class GrokSdkProvider extends KimiSdkProvider {
 
   protected override resolveBinaryPath(config: ProviderConfig | null): string {
     return resolveGrokBinaryPath(config);
+  }
+
+  protected override buildAcpArgs(config: ProviderConfig): string[] {
+    return buildGrokAcpArgs(this.profile.args, config as Record<string, unknown>);
   }
 
   notifyActiveDelegation(

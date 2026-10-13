@@ -827,12 +827,17 @@ export class KimiSdkProvider implements TransportProvider {
 
   // ── ACP client-side glue ────────────────────────────────────────────────
 
+  /** Process arguments for the ACP agent. Override to adapt them to `config`. */
+  protected buildAcpArgs(_config: ProviderConfig): string[] {
+    return [...this.profile.args];
+  }
+
   private async startAcpServer(config: ProviderConfig): Promise<void> {
     await this.teardownChild();
 
     const binaryPath = this.resolveBinaryPath(config);
     const resolved = resolveExecutableForSpawn(binaryPath);
-    const args = [...resolved.prependArgs, ...this.profile.args];
+    const args = [...resolved.prependArgs, ...this.buildAcpArgs(config)];
     const child = spawn(resolved.executable, args, {
       // Own process group and session on POSIX. A reparented descendant keeps
       // its PGID but loses its PPID, so after the agent parent dies this is the

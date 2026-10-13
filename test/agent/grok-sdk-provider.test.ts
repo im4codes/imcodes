@@ -5,7 +5,9 @@ import {
 } from '../../shared/agent-delegation.js';
 import {
   GrokSdkProvider,
+  buildGrokAcpArgs,
   resolveGrokBinaryPath,
+  resolveGrokPermissionMode,
   GROK_CLI_PATH_ENV,
   GROK_CLI_BINARY,
 } from '../../src/agent/providers/grok-sdk.js';
@@ -96,6 +98,40 @@ describe('GrokSdkProvider contract', () => {
       },
     });
     expect((provider as any).profile.args).toEqual(['--no-auto-update', 'agent', 'stdio']);
+  });
+
+  describe('maximum-permission launch posture (--dangerously-skip-permissions equivalent)', () => {
+    it('launches `grok agent stdio` with --permission-mode bypassPermissions by default, ahead of the subcommand', () => {
+      const provider = new GrokSdkProvider();
+      expect((provider as any).buildAcpArgs({})).toEqual([
+        '--no-auto-update', '--permission-mode', 'bypassPermissions', 'agent', 'stdio',
+      ]);
+      // The static profile argv is untouched; the posture is applied per connect().
+      expect((provider as any).profile.args).toEqual(['--no-auto-update', 'agent', 'stdio']);
+    });
+
+    it('can be opted out of with dangerouslySkipPermissions: false', () => {
+      expect(resolveGrokPermissionMode({ dangerouslySkipPermissions: false })).toBeUndefined();
+      const provider = new GrokSdkProvider();
+      expect((provider as any).buildAcpArgs({ dangerouslySkipPermissions: false })).toEqual(['--no-auto-update', 'agent', 'stdio']);
+    });
+
+    it('honors an explicit permissionMode, treats "default" as no flag, and ignores invalid values', () => {
+      expect(resolveGrokPermissionMode({ permissionMode: 'acceptEdits' })).toBe('acceptEdits');
+      expect(resolveGrokPermissionMode({ permissionMode: 'plan', dangerouslySkipPermissions: false })).toBe('plan');
+      expect(resolveGrokPermissionMode({ permissionMode: 'default' })).toBeUndefined();
+      expect(resolveGrokPermissionMode({ permissionMode: 'nonsense' })).toBe('bypassPermissions');
+      expect(resolveGrokPermissionMode(null)).toBe('bypassPermissions');
+    });
+
+    it('never duplicates or overrides a caller-provided --permission-mode', () => {
+      const args = buildGrokAcpArgs(['--no-auto-update', '--permission-mode', 'plan', 'agent', 'stdio'], {});
+      expect(args).toEqual(['--no-auto-update', '--permission-mode', 'plan', 'agent', 'stdio']);
+    });
+
+    it('keeps bridging approval requests so an opted-out or non-bypass mode still prompts the user', () => {
+      expect(new GrokSdkProvider().capabilities.approval).toBe(true);
+    });
   });
 
   it('normalizes Grok background-subagent lifecycle events for parent wake', () => {
