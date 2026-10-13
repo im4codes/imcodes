@@ -102,6 +102,8 @@ interface AgySessionState {
   stderrTail: string;
   toolSteps: Map<number, string>;
   lastStatusSignature?: string;
+  latestStepUsage?: AgyUsage;
+  turnOutputTokens?: number;
   runtimeSubagentStartedAtByKey?: Map<string, number>;
   runtimeSubagentToolCalls?: Map<string, {
     canonicalKey: string;
@@ -310,7 +312,9 @@ export class AgySdkProvider implements TransportProvider {
       cwd: normalizeTransportCwd(config.cwd) ?? existing?.cwd ?? normalizeTransportCwd(process.cwd())!,
       env: config.env ?? existing?.env,
       mcpEnv: buildAgyMemoryMcpEnv(config) ?? existing?.mcpEnv,
-      model: typeof config.agentId === 'string' && config.agentId ? config.agentId : existing?.model,
+      model: (typeof config.agentId === 'string' && config.agentId)
+        || (typeof (config as { model?: string }).model === 'string' && (config as { model?: string }).model)
+        || existing?.model,
       conversationId: config.resumeId ?? existing?.conversationId,
       child: existing?.child ?? null,
       inflightTurns: existing?.inflightTurns ?? 0,
@@ -679,6 +683,8 @@ export class AgySdkProvider implements TransportProvider {
     const child = state.child;
     state.child = null;
     state.inflightTurns = 0;
+    state.latestStepUsage = undefined;
+    state.turnOutputTokens = undefined;
     this.clearOpenToolSteps(state.routeId, state);
     this.emitStatus(state.routeId, state, { status: null, label: null });
     if (!child) return;
@@ -806,17 +812,36 @@ export class AgySdkProvider implements TransportProvider {
     const stepType = asString(step.step_type);
     const stepState = asString(step.state);
 
+    const stepIndex = asNumber(step.step_index);
+    const prefix = state.conversationId ?? state.routeId;
+    const targetMessageId = stepIndex !== undefined
+      ? `${prefix}:step:${stepIndex}`
+      : (state.currentMessageId ?? randomUUID());
+
+    const stepUsageRecord = asRecord(step.usage);
+    const inputTokens = asNumber(stepUsageRecord.input_tokens);
+    const outputTokens = asNumber(stepUsageRecord.output_tokens);
+    const cacheTokens = asNumber(stepUsageRecord.cache_read_tokens);
+    if (inputTokens !== undefined || outputTokens !== undefined) {
+      const stepUsage: AgyUsage = {
+        ...(inputTokens !== undefined ? { input_tokens: inputTokens } : {}),
+        ...(outputTokens !== undefined ? { output_tokens: outputTokens } : {}),
+        ...(cacheTokens !== undefined ? { cache_read_tokens: cacheTokens } : {}),
+      };
+      state.latestStepUsage = stepUsage;
+      if (outputTokens !== undefined) {
+        state.turnOutputTokens = (state.turnOutputTokens ?? 0) + outputTokens;
+      }
+      const usageMessageId = state.currentMessageId ?? targetMessageId;
+      this.emitUsage(sessionId, state, usageMessageId, stepUsage, false);
+    }
+
     if (stepType === AGY_STEP_TYPE.AGENT_RESPONSE) {
       const text = asString(step.text_delta);
       // The DONE frame carries a trailing "\n" separator, not user-visible text,
       // but only skip if the delta is actually empty/whitespace-only.
       if (!text || (stepState === AGY_STEP_STATE.DONE && !text.trim())) return;
       this.emitStatus(sessionId, state, { status: 'streaming', label: null });
-      const stepIndex = asNumber(step.step_index);
-      const prefix = state.conversationId ?? state.routeId;
-      const targetMessageId = stepIndex !== undefined
-        ? `${prefix}:step:${stepIndex}`
-        : (state.currentMessageId ?? randomUUID());
       if (state.currentMessageId !== targetMessageId) {
         // If the ID changed only because conversationId was learned mid-turn,
         // preserve the accumulated text so the streaming prefix does not flicker/reset.
@@ -965,8 +990,22 @@ export class AgySdkProvider implements TransportProvider {
     this.emitStatus(sessionId, state, { status: null, label: null });
     if (state.cancelled) return;
 
-    const usage = asRecord(result.usage) as AgyUsage;
-    this.emitUsage(sessionId, state, messageId, usage);
+    const resultUsage = asRecord(result.usage) as AgyUsage;
+    const turnUsage: AgyUsage = {
+      ...(state.latestStepUsage?.input_tokens !== undefined || asNumber(resultUsage.input_tokens) !== undefined
+        ? { input_tokens: state.latestStepUsage?.input_tokens ?? asNumber(resultUsage.input_tokens) }
+        : {}),
+      ...(state.turnOutputTokens !== undefined || state.latestStepUsage?.output_tokens !== undefined || asNumber(resultUsage.output_tokens) !== undefined
+        ? { output_tokens: state.turnOutputTokens ?? state.latestStepUsage?.output_tokens ?? asNumber(resultUsage.output_tokens) }
+        : {}),
+      ...(state.latestStepUsage?.cache_read_tokens !== undefined || asNumber(resultUsage.cache_read_tokens) !== undefined
+        ? { cache_read_tokens: state.latestStepUsage?.cache_read_tokens ?? asNumber(resultUsage.cache_read_tokens) }
+        : {}),
+    };
+    state.latestStepUsage = undefined;
+    state.turnOutputTokens = undefined;
+
+    this.emitUsage(sessionId, state, messageId, turnUsage, true);
 
     if (result.status !== AGY_RESULT_STATUS.SUCCESS) {
       const message = asString(result.error) ?? 'agy turn failed';
@@ -1013,9 +1052,9 @@ export class AgySdkProvider implements TransportProvider {
         ...(state.model ? { model: state.model } : {}),
         ...(state.conversationId ? { conversationId: state.conversationId } : {}),
         usage: {
-          input_tokens: usage.input_tokens,
-          output_tokens: usage.output_tokens,
-          cache_read_input_tokens: usage.cache_read_tokens,
+          input_tokens: turnUsage.input_tokens,
+          output_tokens: turnUsage.output_tokens,
+          cache_read_input_tokens: turnUsage.cache_read_tokens,
         },
       },
     };
@@ -1026,11 +1065,18 @@ export class AgySdkProvider implements TransportProvider {
 
   // ── Emit helpers ───────────────────────────────────────────────────────────
 
-  private emitUsage(sessionId: string, state: AgySessionState, messageId: string, usage: AgyUsage): void {
+  private emitUsage(
+    sessionId: string,
+    state: AgySessionState,
+    messageId: string,
+    usage: AgyUsage,
+    finalized?: boolean,
+  ): void {
     if (this.usageCallbacks.size === 0) return;
     if (usage.input_tokens === undefined && usage.output_tokens === undefined) return;
     const update: ProviderUsageUpdate = {
       messageId,
+      finalized: Boolean(finalized),
       usage: {
         input_tokens: usage.input_tokens,
         output_tokens: usage.output_tokens,

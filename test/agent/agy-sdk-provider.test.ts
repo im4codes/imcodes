@@ -17,7 +17,7 @@ import {
 } from '../../shared/sdk-subagent-status.js';
 import { PROVIDER_ERROR_CODES } from '../../src/agent/transport-provider.js';
 import type { AgentMessage, MessageDelta, ToolCallEvent } from '../../shared/agent-message.js';
-import type { ProviderError, SessionInfoUpdate } from '../../src/agent/transport-provider.js';
+import type { ProviderError, ProviderUsageUpdate, SessionInfoUpdate } from '../../src/agent/transport-provider.js';
 
 /**
  * A fake `agy` that speaks the verified stream-json wire format. Behaviour is
@@ -55,14 +55,14 @@ process.stdin.on('data', (d) => {
     if (text.includes('MULTI_STEP')) {
       const idx1 = step++;
       emit({ event: 'step_update', step_update: { conversation_id: convId, step_index: idx1, state: 'ACTIVE', step_type: 'agent_response', text_delta: 'Before' } });
-      emit({ event: 'step_update', step_update: { conversation_id: convId, step_index: idx1, state: 'DONE', step_type: 'agent_response', text_delta: '\\n' } });
+      emit({ event: 'step_update', step_update: { conversation_id: convId, step_index: idx1, state: 'DONE', step_type: 'agent_response', text_delta: '\\n', usage: { input_tokens: 100, output_tokens: 10 } } });
       const idxTool = step++;
       emit({ event: 'step_update', step_update: { conversation_id: convId, step_index: idxTool, state: 'ACTIVE', step_type: 'tool', tool_name: 'run_command', tool_info: { name: 'run_command', parameters: { CommandLine: 'echo mid' } } } });
       emit({ event: 'step_update', step_update: { conversation_id: convId, step_index: idxTool, state: 'DONE', step_type: 'tool', tool_name: 'run_command', tool_info: { name: 'run_command', parameters: { CommandLine: 'echo mid' }, output: 'mid\\r\\n' } } });
       const idx2 = step++;
       emit({ event: 'step_update', step_update: { conversation_id: convId, step_index: idx2, state: 'ACTIVE', step_type: 'agent_response', text_delta: 'After' } });
-      emit({ event: 'step_update', step_update: { conversation_id: convId, step_index: idx2, state: 'DONE', step_type: 'agent_response', text_delta: '\\n' } });
-      emit({ event: 'result', result: { conversation_id: convId, status: 'SUCCESS', response: 'Before\\nAfter\\n', num_turns: 1, usage: {} } });
+      emit({ event: 'step_update', step_update: { conversation_id: convId, step_index: idx2, state: 'DONE', step_type: 'agent_response', text_delta: '\\n', usage: { input_tokens: 120, output_tokens: 15 } } });
+      emit({ event: 'result', result: { conversation_id: convId, status: 'SUCCESS', response: 'Before\\nAfter\\n', num_turns: 1, usage: { input_tokens: 220, output_tokens: 25 } } });
       continue;
     }
     if (text.includes('TOOL')) {
@@ -134,6 +134,7 @@ describe('AgySdkProvider (fake agy process)', () => {
   const errors: Array<[string, ProviderError]> = [];
   const tools: Array<[string, ToolCallEvent]> = [];
   const infos: Array<[string, SessionInfoUpdate]> = [];
+  const usages: Array<[string, ProviderUsageUpdate]> = [];
 
   function waitFor(predicate: () => boolean, timeoutMs = 8_000): Promise<void> {
     return new Promise((resolve, reject) => {
@@ -154,13 +155,14 @@ describe('AgySdkProvider (fake agy process)', () => {
     chmodSync(bin, 0o755);
     argsFile = path.join(dir, 'args.log');
     writeFileSync(argsFile, '');
-    completes.length = 0; deltas.length = 0; errors.length = 0; tools.length = 0; infos.length = 0;
+    completes.length = 0; deltas.length = 0; errors.length = 0; tools.length = 0; infos.length = 0; usages.length = 0;
     provider = new AgySdkProvider();
     provider.onComplete((s, m) => completes.push([s, m]));
     provider.onDelta((s, d) => deltas.push([s, d]));
     provider.onError((s, e) => errors.push([s, e]));
     provider.onToolCall((s, t) => tools.push([s, t]));
     provider.onSessionInfo((s, i) => infos.push([s, i]));
+    provider.onUsage?.((s, u) => usages.push([s, u]));
     await provider.connect({ binaryPath: bin, env: { FAKE_AGY_ARGS_FILE: argsFile } });
   });
 
@@ -228,6 +230,44 @@ describe('AgySdkProvider (fake agy process)', () => {
     expect(tools.map(([, t]) => t.status)).toEqual(['running', 'complete']);
     expect(completes[0][1].content).toBe('After');
     expect(completes[0][1].id).toBe(deltas[1][1].messageId);
+    expect(completes[0][1].metadata?.usage).toEqual({
+      input_tokens: 120,
+      output_tokens: 25,
+      cache_read_input_tokens: undefined,
+    });
+  });
+
+  it('emits live step usage and finalized turn usage for context window syncing', async () => {
+    const sid = await provider.createSession({ sessionKey: 's-usage', cwd: dir, agentId: 'gemini-3.8-flash-high' });
+    await provider.send(sid, 'say hello');
+    await waitFor(() => completes.length === 1);
+
+    expect(usages.length).toBeGreaterThanOrEqual(2);
+    // Live step usage
+    const stepUsage = usages.find(([, u]) => u.finalized === false);
+    expect(stepUsage).toBeDefined();
+    expect(stepUsage![1].usage).toMatchObject({
+      input_tokens: 5,
+      output_tokens: 2,
+    });
+    expect(stepUsage![1].model).toBe('gemini-3.8-flash-high');
+
+    // Finalized result usage
+    const finalUsage = usages.find(([, u]) => u.finalized === true);
+    expect(finalUsage).toBeDefined();
+    expect(finalUsage![1].usage).toMatchObject({
+      input_tokens: 5,
+      output_tokens: 2,
+      cache_read_input_tokens: 7,
+    });
+    expect(finalUsage![1].model).toBe('gemini-3.8-flash-high');
+
+    // Completion message metadata matches prompt context usage
+    expect(completes[0][1].metadata?.usage).toMatchObject({
+      input_tokens: 5,
+      output_tokens: 2,
+      cache_read_input_tokens: 7,
+    });
   });
 
   it('maps a failed result to a provider error without completing', async () => {

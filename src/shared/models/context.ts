@@ -41,6 +41,12 @@ export const QWEN_CONTEXT_WINDOWS = {
   KIMI_K25: 262_144,
 } as const;
 
+export const GEMINI_CONTEXT_WINDOWS = {
+  PRO_FAMILY: 2_000_000,
+  FLASH_FAMILY: 1_000_000,
+  GPT_OSS_120B: 131_072,
+} as const;
+
 function isGpt55Model(model: string): boolean {
   return /^gpt[-_ ]?5\.5(?:$|[-_.\s(])/.test(model);
 }
@@ -77,13 +83,31 @@ export function inferContextWindow(model?: string | null): number | undefined {
   if (/^claude-fable-5(?:$|[-_.])/.test(m)) return CLAUDE_CONTEXT_WINDOWS.MYTHOS_5_FAMILY;
   if (/^claude-mythos-5(?:$|[-_.])/.test(m)) return CLAUDE_CONTEXT_WINDOWS.MYTHOS_5_FAMILY;
   if (m == 'opus[1m]') return CLAUDE_CONTEXT_WINDOWS.OPUS_1M_ALIAS;
-  if (/^claude-opus-4(?:$|[-_.])/.test(m)) return CLAUDE_CONTEXT_WINDOWS.OPUS_4_FAMILY;
+  if (/^claude-opus-[45](?:$|[-_.])/.test(m)) return CLAUDE_CONTEXT_WINDOWS.OPUS_4_FAMILY;
   if (m == 'sonnet') return CLAUDE_CONTEXT_WINDOWS.SONNET_4_FAMILY;
-  if (/^claude-sonnet-4(?:$|[-_.])/.test(m)) return CLAUDE_CONTEXT_WINDOWS.SONNET_4_FAMILY;
+  if (/^claude-sonnet-[45](?:$|[-_.])/.test(m)) return CLAUDE_CONTEXT_WINDOWS.SONNET_4_FAMILY;
   if (m == 'haiku') return CLAUDE_CONTEXT_WINDOWS.HAIKU_5_FAMILY;
   if (/^claude-haiku-5(?:$|[-_.])/.test(m)) return CLAUDE_CONTEXT_WINDOWS.HAIKU_5_FAMILY;
   if (/^claude-haiku-4(?:$|[-_.])/.test(m)) return CLAUDE_CONTEXT_WINDOWS.HAIKU_4_FAMILY;
   if (/^claude-3(?:[.-]|$)/.test(m)) return CLAUDE_CONTEXT_WINDOWS.CLAUDE_3_FAMILY;
+
+  // Google Gemini / Antigravity models
+  if (
+    /^gemini[-_ ]?(?:3\.8|2\.5|1\.5)?[-_ ]?pro(?:$|[-_.\s(])/.test(m)
+    || m === 'pro'
+    || m === 'gemini-pro'
+  ) {
+    return GEMINI_CONTEXT_WINDOWS.PRO_FAMILY;
+  }
+  if (
+    /^gemini[-_ ]?(?:3\.8|2\.5|1\.5)?[-_ ]?flash(?:$|[-_.\s(])/.test(m)
+    || /^gemini[-_ ]?(?:3\.8|2\.5|1\.5)(?:$|[-_.\s(])/.test(m)
+    || m === 'flash'
+    || m === 'gemini-flash'
+  ) {
+    return GEMINI_CONTEXT_WINDOWS.FLASH_FAMILY;
+  }
+  if (/^gpt-oss-120b(?:$|[-_.\s(])/.test(m)) return GEMINI_CONTEXT_WINDOWS.GPT_OSS_120B;
 
   if (/^coder-model$/.test(m)) return QWEN_CONTEXT_WINDOWS.CODER_MODEL;
   if (/^qwen3\.5-plus(?:$|[-_.])/.test(m)) return QWEN_CONTEXT_WINDOWS.QWEN35_PLUS;
