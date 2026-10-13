@@ -10,7 +10,6 @@ import {
 import {
   ensureMuseMcpConfigHasImcodesEntry,
   ensureMuseModelCatalogSeeded,
-  sanitizeMuseAuthConfig,
 } from '../../src/daemon/muse-mcp-config.js';
 
 vi.mock('../../src/util/logger.js', () => ({
@@ -189,64 +188,5 @@ describe('ensureMuseModelCatalogSeeded', () => {
     expect(seeded).toBe(false);
     const content = JSON.parse(await readFile(catalogPath, 'utf8'));
     expect(content.rows[0].model_id).toBe('custom-spark');
-  });
-});
-
-describe('sanitizeMuseAuthConfig', () => {
-  let dir = '';
-
-  beforeEach(async () => {
-    dir = await mkdtemp(join(tmpdir(), 'imcodes-muse-auth-'));
-  });
-
-  afterEach(async () => {
-    await rm(dir, { recursive: true, force: true });
-  });
-
-  it('strips masking LLM api key when OAuth mechanism exists', async () => {
-    const authPath = join(dir, 'auth.json');
-    await writeFile(authPath, JSON.stringify({
-      schema_version: 1,
-      providers: {
-        meta: {
-          access_token: 'dca:test-token',
-          api_key: 'LLM|12345|secret',
-          mechanism: 'oauth',
-          subs_active: true,
-        },
-      },
-    }, null, 2), 'utf8');
-
-    const sanitized = await sanitizeMuseAuthConfig({ authPath, skipTestDefaultPath: false });
-    expect(sanitized).toBe(true);
-
-    const parsed = JSON.parse(await readFile(authPath, 'utf8'));
-    expect(parsed.providers.meta.api_key).toBeUndefined();
-    expect(parsed.providers.meta.access_token).toBe('dca:test-token');
-    expect(parsed.providers.meta.mechanism).toBe('oauth');
-  });
-
-  it('leaves non-LLM api keys intact', async () => {
-    const authPath = join(dir, 'auth.json');
-    await writeFile(authPath, JSON.stringify({
-      schema_version: 1,
-      providers: {
-        meta: {
-          api_key: 'sk-custom-valid-key',
-        },
-      },
-    }, null, 2), 'utf8');
-
-    const sanitized = await sanitizeMuseAuthConfig({ authPath, skipTestDefaultPath: false });
-    expect(sanitized).toBe(false);
-
-    const parsed = JSON.parse(await readFile(authPath, 'utf8'));
-    expect(parsed.providers.meta.api_key).toBe('sk-custom-valid-key');
-  });
-
-  it('handles missing auth file gracefully', async () => {
-    const authPath = join(dir, 'nonexistent-auth.json');
-    const sanitized = await sanitizeMuseAuthConfig({ authPath, skipTestDefaultPath: false });
-    expect(sanitized).toBe(false);
   });
 });

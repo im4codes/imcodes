@@ -17,7 +17,6 @@ function noticeMarker(): string { return join(resolveImcodesHome(), 'muse-mcp-no
 export interface MuseMcpEnsureOptions {
   configPath?: string;
   catalogPath?: string;
-  authPath?: string;
   noticeMarkerPath?: string;
   skipTestDefaultPath?: boolean;
 }
@@ -35,12 +34,6 @@ export function defaultMuseSettingsPath(): string {
   const xdg = process.env.XDG_CONFIG_HOME?.trim();
   const base = xdg || join(homedir(), '.config');
   return join(base, 'muse', 'settings.json');
-}
-
-export function defaultMuseAuthPath(): string {
-  const xdg = process.env.XDG_CONFIG_HOME?.trim();
-  const base = xdg || join(homedir(), '.config');
-  return join(base, 'muse', 'auth.json');
 }
 
 export function defaultMuseModelCatalogPath(): string {
@@ -169,40 +162,6 @@ export async function ensureMuseModelCatalogSeeded(options: { catalogPath?: stri
   }
 }
 
-export async function sanitizeMuseAuthConfig(options: { authPath?: string; skipTestDefaultPath?: boolean } = {}): Promise<boolean> {
-  const authPath = options.authPath ?? defaultMuseAuthPath();
-  if (!options.authPath && options.skipTestDefaultPath !== false && process.env.VITEST === 'true') {
-    return false;
-  }
-  try {
-    const raw = await readFile(authPath, 'utf8');
-    const parsed = JSON.parse(raw);
-    const meta = parsed?.providers?.meta;
-    if (meta && typeof meta === 'object') {
-      let changed = false;
-      // If OAuth credentials exist, an invalid LLM| api_key masks OAuth and yields empty model catalog
-      if ((meta.mechanism === 'oauth' || meta.access_token) && typeof meta.api_key === 'string' && meta.api_key.startsWith('LLM|')) {
-        delete meta.api_key;
-        changed = true;
-      }
-      if (changed) {
-        await mkdir(dirname(authPath), { recursive: true });
-        const tmpPath = `${authPath}.tmp-${process.pid}-${Date.now()}`;
-        await writeFile(tmpPath, `${JSON.stringify(parsed, null, 2)}\n`, 'utf8');
-        await rename(tmpPath, authPath);
-        logger.info({ authPath }, 'Sanitized Muse auth.json: removed masking LLM API key');
-        return true;
-      }
-    }
-    return false;
-  } catch (err: any) {
-    if (err?.code !== 'ENOENT') {
-      logger.warn({ err, authPath }, 'Failed to inspect or sanitize Muse auth.json');
-    }
-    return false;
-  }
-}
-
 function daemonEntry(): Record<string, unknown> {
   return {
     type: 'stdio',
@@ -301,7 +260,6 @@ export async function ensureMuseMcpConfigHasImcodesEntry(options: MuseMcpEnsureO
     }
 
     await ensureMuseModelCatalogSeeded({ catalogPath: options.catalogPath, skipTestDefaultPath: options.skipTestDefaultPath }).catch(() => false);
-    await sanitizeMuseAuthConfig({ authPath: options.authPath, skipTestDefaultPath: options.skipTestDefaultPath }).catch(() => false);
 
     if (!hadPoisonedModel && !hadSnakeCase && (isSameDaemonEntry(mcpServers[IMCODES_MEMORY_MCP_SERVER_NAME]) || isSameDaemonEntry(mcpServers[DAEMON_CONFLICT_SERVER_NAME]))) {
       return {
