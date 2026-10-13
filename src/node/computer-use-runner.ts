@@ -4,7 +4,6 @@ import { access, mkdtemp, rm, stat } from 'node:fs/promises';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve, win32 as pathWin32 } from 'node:path';
-import { fileURLToPath } from 'node:url';
 import WebSocket from 'ws';
 import {
   COMPUTER_USE_DEFAULT_TIMEOUT_MS,
@@ -218,15 +217,10 @@ export async function resolveOpenComputerUseBinaryForTest(options: OpenComputerU
   });
 }
 
-const currentModuleFilePath = typeof import.meta !== 'undefined' && import.meta?.url
-  ? fileURLToPath(import.meta.url)
-  : undefined;
-
 async function resolveOpenComputerUseBinary(): Promise<string> {
   return resolveOpenComputerUseBinaryForCurrentProcessForTest({
     platform: process.platform,
     arch: process.arch,
-    moduleFilePath: currentModuleFilePath,
     env: process.env,
     cwd: process.cwd(),
     fileExists,
@@ -244,10 +238,14 @@ async function resolveOpenComputerUseBinary(): Promise<string> {
   });
 }
 
-export async function resolveOpenComputerUseBinaryForCurrentProcessForTest(options: Parameters<typeof resolveOpenComputerUseBinaryForTest>[0]): Promise<string> {
+export async function resolveOpenComputerUseBinaryForCurrentProcessForTest(options: Omit<
+  Parameters<typeof resolveOpenComputerUseBinaryForTest>[0],
+  'moduleFilePath'
+>): Promise<string> {
   // The controlled-node executable is an esbuild CJS/SEA bundle. In that
-  // format `import.meta.url` is undefined. When running under ESM daemon or node,
-  // moduleFilePath locates the packaged helper beside the module.
+  // format `import.meta.url` is undefined. Resolve from the running entry and
+  // cwd candidates instead; both ESM daemon builds and SEA executables put the
+  // helper beside that entry, and neither route can throw ERR_INVALID_ARG_TYPE.
   return resolveOpenComputerUseBinaryForTest(options);
 }
 

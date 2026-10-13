@@ -211,6 +211,7 @@ describe('agent delegation shared contract', () => {
       HERMES_AGENT_PROVIDER_ID,
       'deepseek-harness',
       'pi',
+      'muse-code-sdk',
       'codebuddy-cn',
       'codebuddy-international',
     ]);
