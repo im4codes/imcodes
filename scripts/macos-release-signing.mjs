@@ -349,8 +349,30 @@ export function notarizeAndStaple(input) {
   const submission = submitForNotarization(input);
   // Stapled onto the artifact itself, which for an app is the bundle and not
   // the archive it travelled in.
-  run(MACOS_RELEASE_SIGNING_TOOLS.xcrun, ['stapler', 'staple', artifactPath]);
-  run(MACOS_RELEASE_SIGNING_TOOLS.xcrun, ['stapler', 'validate', artifactPath]);
+  // Notarization ticket replication across Apple's CloudKit CDN can take a few
+  // seconds after `notarytool` reports acceptance. Retry stapling with backoff
+  // so a transient propagation delay does not fail the build.
+  const attempts = input.stapleAttempts ?? 6;
+  let lastError;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      run(MACOS_RELEASE_SIGNING_TOOLS.xcrun, ['stapler', 'staple', artifactPath]);
+      run(MACOS_RELEASE_SIGNING_TOOLS.xcrun, ['stapler', 'validate', artifactPath]);
+      lastError = undefined;
+      break;
+    } catch (error) {
+      lastError = error;
+      if (attempt < attempts) {
+        try {
+          execFileSync('sleep', [String(attempt * 5)]);
+        } catch {
+          // ignore sleep error
+        }
+      }
+    }
+  }
+  if (lastError) throw lastError;
+
   const ticketSha256 = createHash('sha256')
     .update(readFileSync(macosArtifactCanBeSubmittedDirectly(artifactPath)
       ? artifactPath
