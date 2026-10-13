@@ -24,6 +24,7 @@ import type {
   SessionInfoUpdate,
   ToolCallEvent,
   TransportProvider,
+  ProviderDelegationNotification,
 } from '../transport-provider.js';
 import {
   BACKGROUND_SUBAGENT_WAKE_MODES,
@@ -32,6 +33,11 @@ import {
   PROVIDER_ERROR_CODES,
   SESSION_OWNERSHIP,
 } from '../transport-provider.js';
+import {
+  AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES,
+  AGENT_DELEGATION_NOTIFICATION_RESULTS,
+  type AgentDelegationNotificationResult,
+} from '../../../shared/agent-delegation.js';
 import type { AgentMessage, MessageDelta } from '../../../shared/agent-message.js';
 import type { ProviderContextPayload } from '../../../shared/context-types.js';
 import type { TransportAttachment } from '../../../shared/transport-attachments.js';
@@ -130,6 +136,7 @@ export class MuseCodeSdkProvider implements TransportProvider {
     contextSupport: 'full-normalized-context-injection',
     backgroundSubagentWake: BACKGROUND_SUBAGENT_WAKE_MODES.RUNTIME,
     nativeAgentAdmission: NATIVE_AGENT_ADMISSION_MODES.SESSION_FENCE,
+    activeDelegationNotification: AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE,
   };
 
   private config: ProviderConfig | null = null;
@@ -515,6 +522,33 @@ export class MuseCodeSdkProvider implements TransportProvider {
     const start = Date.now();
     while (state.inFlight && Date.now() - start < 5000) {
       await new Promise((r) => setTimeout(r, 50));
+    }
+  }
+
+  async notifyActiveDelegation(
+    sessionId: string,
+    notification: ProviderDelegationNotification,
+  ): Promise<AgentDelegationNotificationResult> {
+    const state = this.sessions.get(sessionId);
+    const turnId = state?.activeTurnId;
+    if (!state?.inFlight || !turnId || state.cancelled || !state.museSessionId || !this.spawned) {
+      return AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE;
+    }
+    try {
+      await this.spawned.connection.command('turn/steer', {
+        commandId: randomUUID(),
+        sessionId: state.museSessionId,
+        expectedTurnId: turnId,
+        input: [{ type: 'text', text: notification.text }],
+      });
+      return AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED;
+    } catch (error) {
+      logger.warn({ error, sessionId, turnId }, 'Failed to steer active Muse turn');
+      const latest = this.sessions.get(sessionId);
+      if (!latest || latest.activeTurnId !== turnId || latest.cancelled || !latest.inFlight) {
+        return AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE;
+      }
+      return AGENT_DELEGATION_NOTIFICATION_RESULTS.UNSUPPORTED;
     }
   }
 

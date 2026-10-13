@@ -260,4 +260,67 @@ describe('MuseCodeSdkProvider session and turn lifecycle', () => {
     });
     expect(state.cancelled).toBe(true);
   });
+
+  it('steers/appends to active turn using connection turn/steer command', async () => {
+    const provider = new MuseCodeSdkProvider();
+    const mockCommand = vi.fn().mockResolvedValue({});
+    (provider as any).spawned = {
+      connection: {
+        command: mockCommand,
+      },
+    };
+
+    const state = {
+      routeId: 'route-steer-test',
+      cwd: '/tmp',
+      museSessionId: 'muse-sess-steer',
+      activeTurnId: 'turn-123',
+      inFlight: true,
+      cancelled: false,
+      pendingApprovals: new Map(),
+    };
+    (provider as any).sessions.set('route-steer-test', state);
+
+    const result = await provider.notifyActiveDelegation('route-steer-test', {
+      notificationId: 'notif-1',
+      delegationId: 'deleg-1',
+      sourceSessionName: 'source',
+      text: 'Please also fix the typo',
+    });
+
+    expect(result).toBe('delivered');
+    expect(mockCommand).toHaveBeenCalledWith('turn/steer', {
+      commandId: expect.any(String),
+      sessionId: 'muse-sess-steer',
+      expectedTurnId: 'turn-123',
+      input: [{ type: 'text', text: 'Please also fix the typo' }],
+    });
+  });
+
+  it('returns stale when steering an idle or non-in-flight session', async () => {
+    const provider = new MuseCodeSdkProvider();
+    (provider as any).spawned = {
+      connection: {
+        command: vi.fn(),
+      },
+    };
+    const state = {
+      routeId: 'route-idle',
+      cwd: '/tmp',
+      museSessionId: 'muse-sess-idle',
+      activeTurnId: null,
+      inFlight: false,
+      cancelled: false,
+    };
+    (provider as any).sessions.set('route-idle', state);
+
+    const result = await provider.notifyActiveDelegation('route-idle', {
+      notificationId: 'notif-2',
+      delegationId: 'deleg-2',
+      sourceSessionName: 'source',
+      text: 'hello',
+    });
+
+    expect(result).toBe('stale');
+  });
 });
