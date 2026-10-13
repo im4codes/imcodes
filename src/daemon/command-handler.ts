@@ -144,6 +144,7 @@ import {
 import { buildSessionList } from './session-list.js';
 import { setClaudeUsageQuotaOptIn, recordClaudeQuotaActivity } from '../agent/claude-usage-quota.js';
 import { getLastAgyQuotaActivityAt, recordAgyQuotaActivity, refreshAgyQuotaMetadata } from '../agent/agy-usage-quota.js';
+import { getLastGrokQuotaActivityAt, recordGrokQuotaActivity, refreshGrokQuotaMetadata } from '../agent/grok-usage-quota.js';
 import { CLAUDE_QUOTA_MSG } from '../../shared/claude-quota.js';
 import { CODEX_RESET_CREDITS_MSG } from '../../shared/codex-reset-credits.js';
 import { CODEX_CREDIT_HISTORY_MSG, type CodexCreditSnapshot } from '../../shared/codex-credit-history.js';
@@ -1544,6 +1545,41 @@ export async function refreshAgyQuotaMetadataForSessions(serverLink?: ServerLink
 
   if (!serverLink) return;
   for (const session of agySessions) {
+    if (!session.name.startsWith('deck_sub_')) continue;
+    const subId = session.name.replace(/^deck_sub_/, '');
+    try {
+      await sendSubSessionSync(serverLink, subId, undefined, getSubSessionSyncOptions(session.name));
+    } catch {
+      // not connected
+    }
+  }
+}
+
+/**
+ * Periodic quota refresh for grok-sdk sessions (main sessions and sub-sessions).
+ * Hits Grok CLI billing endpoint and pushes updated quota metadata to connected clients via handleGetSessions / sendSubSessionSync.
+ */
+export async function refreshGrokQuotaMetadataForSessions(serverLink?: ServerLink): Promise<void> {
+  const sessions = listSessions();
+  const grokSessions = sessions.filter((s) => s.agentType === 'grok-sdk' && s.state !== 'stopped' && s.state !== 'error');
+  if (grokSessions.length === 0) return;
+
+  const latestSessionActivityAt = Math.max(0, ...grokSessions.map((s) => s.updatedAt || 0));
+  const effectiveLastActivityAt = Math.max(getLastGrokQuotaActivityAt(), latestSessionActivityAt);
+
+  const quota = await refreshGrokQuotaMetadata({
+    lastActivityAt: effectiveLastActivityAt,
+  }).catch(() => null);
+  if (!quota) return;
+
+  if (serverLink) {
+    await handleGetSessions(serverLink);
+  } else {
+    await buildSessionList();
+  }
+
+  if (!serverLink) return;
+  for (const session of grokSessions) {
     if (!session.name.startsWith('deck_sub_')) continue;
     const subId = session.name.replace(/^deck_sub_/, '');
     try {
@@ -4175,6 +4211,7 @@ async function handleSendBound(cmd: Record<string, unknown>, serverLink: ServerL
   // Cheap sync Map lookup — does not touch the send hot-path ack latency.
   if (getSession(sessionName)?.agentType === 'claude-code-sdk') recordClaudeQuotaActivity();
   if (getSession(sessionName)?.agentType === 'agy-sdk') recordAgyQuotaActivity();
+  if (getSession(sessionName)?.agentType === 'grok-sdk') recordGrokQuotaActivity();
 
   // Fallback: legacy clients that don't send commandId get a server-generated one
   const isLegacy = !commandId;

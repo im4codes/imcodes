@@ -88,4 +88,33 @@ describe('subsession-sync transport queue projection', () => {
     });
     expect((payload?.supervisionHeartbeat as { updatedAt: number }).updatedAt).toBeGreaterThanOrEqual(before);
   });
+
+  it('hydrates quotaLabel and quotaMeta for grok-sdk sub-sessions', async () => {
+    upsertSession({
+      name: 'deck_sub_groktest',
+      projectName: 'demo',
+      role: 'w1',
+      agentType: 'grok-sdk',
+      runtimeType: 'transport',
+      providerId: 'grok-sdk',
+      providerSessionId: 'provider-sub-grok',
+      parentSession: 'deck_demo_brain',
+      state: 'idle',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      quotaLabel: '31d 0% 18d16h',
+      quotaMeta: {
+        primary: { windowDurationMins: 44640, usedPercent: 0, resetsAt: 1730000000 },
+      },
+    });
+
+    const payload = await buildSubSessionSyncPayload('groktest');
+    expect(payload?.sessionType).toBe('grok-sdk');
+    expect(payload?.quotaLabel).toBe('31d 0% 18d16h');
+    expect(payload?.quotaMeta).toEqual({
+      primary: { windowDurationMins: 44640, usedPercent: 0, resetsAt: 1730000000 },
+    });
+  });
 });

@@ -49,6 +49,21 @@ let grokCache: { expiresAt: number; value: SdkRuntimeConfig } | null = null;
 
 async function readGrokSubscriptionType(): Promise<string | undefined> {
   try {
+    const rawAuth = await readFile(join(homedir(), '.grok', 'auth.json'), 'utf8');
+    const parsedAuth = JSON.parse(rawAuth) as Record<string, unknown>;
+    for (const entry of Object.values(parsedAuth)) {
+      if (entry && typeof entry === 'object') {
+        const e = entry as Record<string, unknown>;
+        if (typeof e.team_id === 'string' && e.team_id.trim()) {
+          return 'Team';
+        }
+      }
+    }
+  } catch {
+    // Missing or invalid ~/.grok/auth.json
+  }
+
+  try {
     const raw = await readFile(join(homedir(), '.grok', 'settings_cache.json'), 'utf8');
     const parsed = JSON.parse(raw) as {
       payload?: string | {
@@ -68,7 +83,7 @@ async function readGrokSubscriptionType(): Promise<string | undefined> {
     }
     const settings = (payload as { settings?: { subscription_tier_display?: string; subscription_tier?: string } })?.settings;
     const tier = settings?.subscription_tier_display || settings?.subscription_tier;
-    return typeof tier === 'string' && tier.trim() ? tier.trim() : undefined;
+    return typeof tier === 'string' && tier.trim() ? capitalize(tier.trim()) : undefined;
   } catch {
     return undefined;
   }

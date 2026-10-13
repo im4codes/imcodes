@@ -5,6 +5,7 @@ import { getQwenOAuthQuotaUsageLabel } from '../agent/provider-quota.js';
 import { getClaudeSdkRuntimeConfig, getGrokSdkRuntimeConfig } from '../agent/sdk-runtime-config.js';
 import { getClaudeUsageQuota } from '../agent/claude-usage-quota.js';
 import { fetchAgyUsageQuota } from '../agent/agy-usage-quota.js';
+import { getGrokUsageQuota } from '../agent/grok-usage-quota.js';
 import { getSession, type SessionRecord } from '../store/session-store.js';
 import type { ServerLink } from './server-link.js';
 import { EXECUTION_CLONE_KIND, type ExecutionCloneMetadata } from '../../shared/execution-clone.js';
@@ -111,6 +112,7 @@ export async function buildSubSessionSyncPayload(
   // claude-code-sdk sub-session. null → fall back to the rate_limit_event quota.
   const usageQuota = isClaudeSdkSession(r.agentType) ? await getClaudeUsageQuota().catch(() => null) : null;
   const agyUsageQuota = r.agentType === 'agy-sdk' ? await fetchAgyUsageQuota().catch(() => null) : null;
+  const grokUsageQuota = r.agentType === 'grok-sdk' ? await getGrokUsageQuota().catch(() => null) : null;
   void options;
   let transportQueue: TransportQueueSnapshotPayload | null = null;
   if (r.runtimeType === 'transport') {
@@ -165,9 +167,9 @@ export async function buildSubSessionSyncPayload(
     codexAvailableModels: freshDisplay.codexAvailableModels ?? r.codexAvailableModels ?? null,
     modelDisplay: freshDisplay.modelDisplay ?? r.modelDisplay ?? null,
     planLabel: freshDisplay.planLabel ?? r.planLabel ?? null,
-    quotaLabel: usageQuota?.quotaLabel ?? agyUsageQuota?.quotaLabel ?? freshDisplay.quotaLabel ?? r.quotaLabel ?? null,
+    quotaLabel: usageQuota?.quotaLabel ?? agyUsageQuota?.quotaLabel ?? grokUsageQuota?.quotaLabel ?? freshDisplay.quotaLabel ?? r.quotaLabel ?? null,
     quotaUsageLabel: freshDisplay.quotaUsageLabel ?? r.quotaUsageLabel ?? null,
-    quotaMeta: usageQuota?.quotaMeta ?? agyUsageQuota?.quotaMeta ?? freshDisplay.quotaMeta ?? r.quotaMeta ?? null,
+    quotaMeta: usageQuota?.quotaMeta ?? agyUsageQuota?.quotaMeta ?? grokUsageQuota?.quotaMeta ?? freshDisplay.quotaMeta ?? r.quotaMeta ?? null,
     codexCreditsBalance: freshDisplay.codexCreditsBalance ?? r.codexCreditsBalance ?? null,
     codexCreditsHasCredits: freshDisplay.codexCreditsHasCredits ?? r.codexCreditsHasCredits ?? null,
     codexCreditsUnlimited: freshDisplay.codexCreditsUnlimited ?? r.codexCreditsUnlimited ?? null,

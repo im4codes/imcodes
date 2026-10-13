@@ -11,6 +11,7 @@ import { mergeCodexDisplayMetadata } from '../agent/codex-display.js';
 import { getCopilotRuntimeConfig } from '../agent/copilot-runtime-config.js';
 import { getCursorRuntimeConfig } from '../agent/cursor-runtime-config.js';
 import { fetchAgyUsageQuota } from '../agent/agy-usage-quota.js';
+import { getGrokUsageQuota } from '../agent/grok-usage-quota.js';
 import { providerQuotaMetaEquals } from '../../shared/provider-quota.js';
 import { QWEN_AUTH_TYPES } from '../../shared/qwen-auth.js';
 import { getTransportRuntime } from '../agent/session-manager.js';
@@ -256,6 +257,7 @@ export async function buildSessionList(): Promise<SessionListItem[]> {
   // from /api/oauth/usage. null → fall back to the SDK rate_limit_event quota.
   const claudeUsageQuota = needsClaudeSdkHydration ? await getClaudeUsageQuota().catch(() => null) : null;
   const agyUsageQuota = needsAgySdkHydration ? await fetchAgyUsageQuota().catch(() => null) : null;
+  const grokUsageQuota = needsGrokSdkHydration ? await getGrokUsageQuota().catch(() => null) : null;
   const codexRuntime = needsCodexHydration ? await getCodexRuntimeConfig({ probe: false }).catch(() => ({}) as import('../agent/codex-runtime-config.js').CodexRuntimeConfig) : null;
   const copilotRuntime = needsCopilotHydration ? await getCopilotRuntimeConfig({ probe: false }).catch(() => null) : null;
   const cursorRuntime = needsCursorHydration ? await getCursorRuntimeConfig({ probe: false }).catch(() => null) : null;
@@ -357,10 +359,18 @@ export async function buildSessionList(): Promise<SessionListItem[]> {
       return { ...baseItem(s), ...hydrated };
     }
     if (s.agentType === 'grok-sdk') {
+      const quotaOverride = grokUsageQuota
+        ? { quotaLabel: grokUsageQuota.quotaLabel, quotaMeta: grokUsageQuota.quotaMeta }
+        : {};
       const hydrated: Partial<SessionRecord> = {
         ...(grokSdkRuntime?.planLabel ? { planLabel: grokSdkRuntime.planLabel } : {}),
+        ...quotaOverride,
       };
-      if (hydrated.planLabel && hydrated.planLabel !== s.planLabel) {
+      if (
+        (hydrated.planLabel && hydrated.planLabel !== s.planLabel)
+        || (hydrated.quotaLabel && hydrated.quotaLabel !== s.quotaLabel)
+        || !providerQuotaMetaEquals(hydrated.quotaMeta, s.quotaMeta)
+      ) {
         upsertSession({ ...s, ...hydrated, updatedAt: Date.now() });
       }
       return { ...baseItem(s), ...hydrated };
