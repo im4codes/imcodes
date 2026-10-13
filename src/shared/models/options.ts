@@ -52,10 +52,10 @@ export const GEMINI_MODEL_IDS = [
 export type GeminiModelId = typeof GEMINI_MODEL_IDS[number];
 
 export const MUSE_MODEL_IDS = [
+  'muse-wonder-full-1.0',
+  'muse-wonder-1.0',
   'muse-spark-1.3',
-  'muse-spark',
-  'muse-wonder',
-  'muse-fast',
+  'muse-spark-1.2',
 ] as const;
 export type MuseModelId = typeof MUSE_MODEL_IDS[number];
 

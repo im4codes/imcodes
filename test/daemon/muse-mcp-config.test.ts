@@ -170,7 +170,7 @@ describe('ensureMuseModelCatalogSeeded', () => {
     expect(seeded).toBe(true);
     const content = JSON.parse(await readFile(catalogPath, 'utf8'));
     expect(content.rows.length).toBeGreaterThan(0);
-    expect(content.rows[0].model_id).toBe('muse-spark-1.3');
+    expect(content.rows[0].model_id).toBe('muse-wonder-full-1.0');
   });
 
   it('does not overwrite when catalog already has visible models', async () => {

@@ -78,26 +78,26 @@ export const MUSE_CODE_SDK_PROVIDER_ID = 'muse-code-sdk';
 
 export const DEFAULT_MUSE_MODELS: ProviderModelInfo[] = [
   {
+    id: 'muse-wonder-full-1.0',
+    name: 'Muse Wonder Full 1.0',
+    supportsReasoningEffort: true,
+    supportedEffortLevels: MUSE_SDK_EFFORT_LEVELS,
+  },
+  {
+    id: 'muse-wonder-1.0',
+    name: 'Muse Wonder 1.0',
+    supportsReasoningEffort: true,
+    supportedEffortLevels: MUSE_SDK_EFFORT_LEVELS,
+  },
+  {
     id: 'muse-spark-1.3',
     name: 'Muse Spark 1.3',
     supportsReasoningEffort: true,
     supportedEffortLevels: MUSE_SDK_EFFORT_LEVELS,
   },
   {
-    id: 'muse-spark',
-    name: 'Muse Spark',
-    supportsReasoningEffort: true,
-    supportedEffortLevels: MUSE_SDK_EFFORT_LEVELS,
-  },
-  {
-    id: 'muse-wonder',
-    name: 'Muse Wonder',
-    supportsReasoningEffort: true,
-    supportedEffortLevels: MUSE_SDK_EFFORT_LEVELS,
-  },
-  {
-    id: 'muse-fast',
-    name: 'Muse Fast',
+    id: 'muse-spark-1.2',
+    name: 'Muse Spark 1.2',
     supportsReasoningEffort: true,
     supportedEffortLevels: MUSE_SDK_EFFORT_LEVELS,
   },
@@ -105,11 +105,20 @@ export const DEFAULT_MUSE_MODELS: ProviderModelInfo[] = [
 
 export function normalizeMuseModelId(model: string | undefined): string {
   const trimmed = model?.trim();
-  if (!trimmed) return 'muse-spark-1.3';
-  if (trimmed === 'wonder' || trimmed === 'wander-pro') return 'muse-wonder';
-  if (trimmed === 'spark') return 'muse-spark';
-  if (trimmed === 'fast' || trimmed === 'wander-fast') return 'muse-fast';
-  if (trimmed === 'wander' || trimmed === 'wander-code') return 'muse-spark-1.3';
+  if (!trimmed) return 'muse-wonder-full-1.0';
+  if (
+    trimmed === 'wonder' ||
+    trimmed === 'wander' ||
+    trimmed === 'wander-pro' ||
+    trimmed === 'wander-code' ||
+    trimmed === 'wander-fast' ||
+    trimmed === 'fast' ||
+    trimmed === 'muse-wonder' ||
+    trimmed === 'muse-fast'
+  ) {
+    return 'muse-wonder-full-1.0';
+  }
+  if (trimmed === 'spark' || trimmed === 'muse-spark') return 'muse-spark-1.3';
   return trimmed;
 }
 

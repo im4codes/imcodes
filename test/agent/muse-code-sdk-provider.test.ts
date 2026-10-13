@@ -61,9 +61,9 @@ describe('MuseCodeSdkProvider contract', () => {
     const result = await provider.listModels();
     expect(result.models.length).toBeGreaterThanOrEqual(3);
     expect(result.models.map((m) => m.id)).toEqual(
-      expect.arrayContaining(['muse-spark-1.3', 'muse-spark', 'muse-wonder', 'muse-fast']),
+      expect.arrayContaining(['muse-wonder-full-1.0', 'muse-wonder-1.0', 'muse-spark-1.3', 'muse-spark-1.2']),
     );
-    expect(result.defaultModel).toBe('muse-spark-1.3');
+    expect(result.defaultModel).toBe('muse-wonder-full-1.0');
     for (const m of result.models) {
       expect(m.supportsReasoningEffort).toBe(true);
       expect(m.supportedEffortLevels).toEqual(MUSE_SDK_EFFORT_LEVELS);
@@ -494,12 +494,12 @@ describe('MuseCodeSdkProvider session and turn lifecycle', () => {
       sessionInfoUpdates.push(info);
     });
 
-    provider.setSessionAgentId(routeId, 'muse-wonder');
+    provider.setSessionAgentId(routeId, 'muse-wonder-full-1.0');
 
-    expect(sessionInfoUpdates).toContainEqual({ model: 'muse-wonder' });
+    expect(sessionInfoUpdates).toContainEqual({ model: 'muse-wonder-full-1.0' });
     expect(mockCommand).toHaveBeenCalledWith('session/setModel', expect.objectContaining({
       sessionId: 'muse-sess-model-1',
-      model: { modelId: 'muse-wonder' },
+      model: { modelId: 'muse-wonder-full-1.0' },
     }));
   });
 
@@ -553,29 +553,29 @@ describe('MuseCodeSdkProvider session and turn lifecycle', () => {
     const routeId = await provider.createSession({
       cwd: '/home/k/project',
       resumeId: 'muse-sess-resumed-1',
-      agentId: 'muse-spark',
+      agentId: 'muse-spark-1.3',
     });
 
     expect(routeId).toBeDefined();
     expect(mockCommand).toHaveBeenCalledWith('session/setModel', expect.objectContaining({
       sessionId: 'muse-sess-resumed-1',
-      model: { modelId: 'muse-spark' },
+      model: { modelId: 'muse-spark-1.3' },
     }));
   });
 
   it('normalizes legacy or misspelled model ids to supported muse models', () => {
-    expect(normalizeMuseModelId('wonder')).toBe('muse-wonder');
-    expect(normalizeMuseModelId('spark')).toBe('muse-spark');
-    expect(normalizeMuseModelId('fast')).toBe('muse-fast');
-    expect(normalizeMuseModelId('muse-wonder')).toBe('muse-wonder');
-    expect(normalizeMuseModelId('muse-spark')).toBe('muse-spark');
+    expect(normalizeMuseModelId('wonder')).toBe('muse-wonder-full-1.0');
+    expect(normalizeMuseModelId('spark')).toBe('muse-spark-1.3');
+    expect(normalizeMuseModelId('fast')).toBe('muse-wonder-full-1.0');
+    expect(normalizeMuseModelId('muse-wonder')).toBe('muse-wonder-full-1.0');
+    expect(normalizeMuseModelId('muse-spark')).toBe('muse-spark-1.3');
     expect(normalizeMuseModelId('muse-spark-1.3')).toBe('muse-spark-1.3');
-    expect(normalizeMuseModelId('muse-fast')).toBe('muse-fast');
-    expect(normalizeMuseModelId('wander')).toBe('muse-spark-1.3');
-    expect(normalizeMuseModelId('wander-code')).toBe('muse-spark-1.3');
-    expect(normalizeMuseModelId('wander-fast')).toBe('muse-fast');
-    expect(normalizeMuseModelId('wander-pro')).toBe('muse-wonder');
-    expect(normalizeMuseModelId('')).toBe('muse-spark-1.3');
-    expect(normalizeMuseModelId(undefined)).toBe('muse-spark-1.3');
+    expect(normalizeMuseModelId('muse-fast')).toBe('muse-wonder-full-1.0');
+    expect(normalizeMuseModelId('wander')).toBe('muse-wonder-full-1.0');
+    expect(normalizeMuseModelId('wander-code')).toBe('muse-wonder-full-1.0');
+    expect(normalizeMuseModelId('wander-fast')).toBe('muse-wonder-full-1.0');
+    expect(normalizeMuseModelId('wander-pro')).toBe('muse-wonder-full-1.0');
+    expect(normalizeMuseModelId('')).toBe('muse-wonder-full-1.0');
+    expect(normalizeMuseModelId(undefined)).toBe('muse-wonder-full-1.0');
   });
 });
