@@ -26,7 +26,7 @@ import { ALIAS_REASONS } from '../../shared/alias-types.js';
 import { classifyCodexFastCommand, isCodexFastServiceTier } from '../../shared/codex-service-tier.js';
 import type { AliasSendAudit, SendAliasNotes, SendAliasResolution } from '../../shared/alias-types.js';
 import { buildAliasSendAudit } from './alias-audit.js';
-import { BACKEND, sendKeys, sendKeysDelayedEnter, sendRawInput, resizeSession, sendKey, getPaneStartCommand, preparePrivateInputWriter } from '../agent/tmux.js';
+import { BACKEND, sendKeys, sendKeysDelayedEnter, sendRawInput, resizeSession, sendKey, getPaneStartCommand, preparePrivateInputWriter, type SendKeysOptions } from '../agent/tmux.js';
 import { listSessions, getSession, upsertSession, removeSession, type SessionRecord } from '../store/session-store.js';
 import { routeMessage, type InboundMessage, type RouterContext } from '../router/message-router.js';
 import { terminalStreamer, type StreamSubscriber } from './terminal-streamer.js';
@@ -3517,10 +3517,16 @@ export function stopSessionNow(sessionName: string): boolean {
 /** Agents with sandboxed file access — temp files must be in project dir. */
 const SANDBOXED_AGENTS = new Set(['gemini']);
 
-function resolveProcessSendOptions(sessionName: string, agentType: string): { cwd: string } | undefined {
+function resolveProcessSendOptions(sessionName: string, agentType: string, verbatim?: boolean): SendKeysOptions | undefined {
   const record = getSession(sessionName);
   const cwd = SANDBOXED_AGENTS.has(agentType) ? record?.projectDir : undefined;
-  return cwd ? { cwd } : undefined;
+  const isShellLike = agentType === 'shell' || agentType === 'script';
+  const isVerbatim = Boolean(verbatim || isShellLike);
+  if (!cwd && !isVerbatim) return undefined;
+  return {
+    ...(cwd ? { cwd } : {}),
+    ...(isVerbatim ? { verbatim: true } : {}),
+  };
 }
 
 /**
@@ -3552,8 +3558,15 @@ export async function prepareProcessSessionPrivateWriter(sessionName: string): P
   return preparePrivateInputWriter(sessionName);
 }
 
-async function sendShellAwareCommand(sessionName: string, text: string, agentType: string): Promise<void> {
-  const opts = resolveProcessSendOptions(sessionName, agentType);
+async function sendShellAwareCommand(sessionName: string, text: string, agentType: string, verbatim?: boolean): Promise<void> {
+  const isShellLike = agentType === 'shell' || agentType === 'script';
+  const isVerbatim = Boolean(verbatim || isShellLike);
+  const opts = resolveProcessSendOptions(sessionName, agentType, isVerbatim);
+  if (isShellLike) {
+    // Shell/script session: deliver verbatim directly, never treat leading '!' as claude-code escape
+    await sendKeysDelayedEnter(sessionName, text, opts);
+    return;
+  }
   if (text.startsWith('!')) {
     const shellCmd = text.slice(1).trimStart();
     if (agentType === 'codex') {
@@ -5401,11 +5414,15 @@ async function handleSendBound(cmd: Record<string, unknown>, serverLink: ServerL
   // once per provider conversation, and reset the gate on clear/compact.
   // The agent-bound copy is the expanded text (`aliasExpansion.text`); the
   // human-facing timeline still shows the original markers via `displayText`.
-  const finalText = prepareProcessPreferenceProviderText({
-    sessionName,
-    providerText: aliasExpansion.text,
-    preferenceContext: preferenceMessagePreamble,
-  });
+  const isShellLike = record?.agentType === 'shell' || record?.agentType === 'script';
+  const isVerbatimRequested = Boolean((cmd as any).verbatim || isShellLike);
+  const finalText = isVerbatimRequested
+    ? aliasExpansion.text
+    : prepareProcessPreferenceProviderText({
+        sessionName,
+        providerText: aliasExpansion.text,
+        preferenceContext: preferenceMessagePreamble,
+      });
 
   if (isSessionControlCommandText(text, 'clear') && record?.runtimeType !== 'transport' && supportsProcessClear(record?.agentType)) {
     emitTransportUserMessage(text);
@@ -5460,12 +5477,13 @@ async function handleSendBound(cmd: Record<string, unknown>, serverLink: ServerL
     await sendProcessSessionMessage(sessionName, finalText, attachments, {
       onTyped: () => authorityBinding.current?.typed(),
       originalText: displayText,
-      ...(attachmentRetentionPreamble ? { agentMessagePreamble: attachmentRetentionPreamble } : {}),
+      ...((attachmentRetentionPreamble && !isVerbatimRequested) ? { agentMessagePreamble: attachmentRetentionPreamble } : {}),
       commandId: effectiveId,
       isLegacy,
       ackAlreadySent: receiptAcked,
       serverLink,
       ...(aliasAudit ? { aliasAudit } : {}),
+      ...(isVerbatimRequested ? { verbatim: true } : {}),
     });
   } catch (err) {
     logger.error({ sessionName, err }, 'session.send failed');
@@ -5559,13 +5577,15 @@ async function sendProcessSessionMessage(
 
   const deliveryTurn = reserveProcessDeliveryTurn(sessionName);
   const agentType = getSession(sessionName)?.agentType ?? 'unknown';
+  const isShellLike = agentType === 'shell' || agentType === 'script';
+  const isVerbatim = Boolean(options?.verbatim || isShellLike);
 
   // ── Step 2: Prepare advisory context outside the per-session delivery lock ──
   // Path sandboxing and memory recall can touch disk/SQLite/embedding state.
   // They must not block earlier queued tmux writes any longer than necessary.
   let sendText = finalText;
   try {
-    if (!options?.verbatim && (agentType === 'gemini' || agentType === 'codex')) {
+    if (!isVerbatim && (agentType === 'gemini' || agentType === 'codex')) {
       sendText = await rewritePathsForSandbox(sessionName, finalText);
     }
   } catch (rewriteErr) {
@@ -5576,7 +5596,7 @@ async function sendProcessSessionMessage(
   let memoryContext: Awaited<ReturnType<typeof prependLocalMemory>> = { text: sendText };
   let memoryRecallCancelled = false;
   try {
-    if (!options?.verbatim) {
+    if (!isVerbatim) {
       const deadlineAt = Date.now() + PROCESS_MEMORY_RECALL_DEADLINE_MS;
       memoryContext = await withDeadline(
         prependLocalMemory(sendText, sessionName, {
@@ -5595,7 +5615,7 @@ async function sendProcessSessionMessage(
   }
 
   const agentMessagePreamble = options?.agentMessagePreamble?.trim();
-  if (agentMessagePreamble) {
+  if (agentMessagePreamble && !isVerbatim) {
     sendText = `${agentMessagePreamble}\n\n${sendText}`;
   }
 
@@ -5605,7 +5625,7 @@ async function sendProcessSessionMessage(
   await deliveryTurn.waitForTurn();
   const release = await getMutex(sessionName).acquire();
   try {
-    await sendShellAwareCommand(sessionName, sendText, agentType);
+    await sendShellAwareCommand(sessionName, sendText, agentType, isVerbatim);
     options?.onTyped?.();
   } catch (sendErr) {
     rollbackSummarySyncReservation(memoryContext.summaryReservation);

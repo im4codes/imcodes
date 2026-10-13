@@ -427,6 +427,30 @@ export interface SendKeysOptions {
   chunked?: boolean;
   /** Project directory — used to place temp files inside the project for sandboxed agents (Gemini). */
   cwd?: string;
+  /** Send keys verbatim (never convert to .imcodes-prompt temp file / "Read and execute all instructions in @..."). */
+  verbatim?: boolean;
+}
+
+/**
+ * Paste text into a tmux session via load-buffer + paste-buffer.
+ * Safe for arbitrary length text (bypasses tmux command-line length limits).
+ */
+export async function tmuxPasteBuffer(session: string, text: string): Promise<void> {
+  requireTmux('tmuxPasteBuffer');
+  const bufName = `cd_paste_${process.pid}_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+  await new Promise<void>((resolve, reject) => {
+    const proc = spawn('tmux', ['load-buffer', '-b', bufName, '-'], { stdio: ['pipe', 'ignore', 'pipe'] });
+    let stderr = '';
+    proc.stderr?.on('data', (d) => { stderr += String(d); });
+    proc.on('error', reject);
+    proc.on('close', (code) => {
+      if (code === 0) resolve();
+      else reject(new Error(`tmux load-buffer failed (code ${code}): ${stderr}`));
+    });
+    proc.stdin.write(text, 'utf-8');
+    proc.stdin.end();
+  });
+  await tmuxRun('paste-buffer', '-b', bufName, '-p', '-d', '-t', session);
 }
 
 /**
@@ -457,7 +481,7 @@ export async function sendKeys(session: string, keys: string, opts?: SendKeysOpt
     // Safety net: delayed Enter for long text only (empty-line Enter is a no-op).
     // Reduced 3s → 1.2s — long enough for the agent to render its prompt, short
     // enough not to interfere with the next message.
-    if (isLong) {
+    if (isLong && !opts?.verbatim) {
       setTimeout(async () => {
         try { c.conptySendEnter(session); } catch { /* ignore */ }
       }, 1_200);
@@ -467,7 +491,7 @@ export async function sendKeys(session: string, keys: string, opts?: SendKeysOpt
 
   const isLong = keys.length > 200 || keys.includes('\n');
 
-  if (isLong) {
+  if (isLong && !opts?.verbatim) {
     // Write to temp file + send read instruction
     // With cwd: file in project dir (Gemini sandbox), without: os.tmpdir() (CC etc.)
     const hash = createHash('md5').update(session + Date.now()).digest('hex').slice(0, 8);
@@ -488,8 +512,12 @@ export async function sendKeys(session: string, keys: string, opts?: SendKeysOpt
       try { await removeTrackedTempFile(filePath); } catch { /* ignore */ }
     }, 30 * 60_000);
   } else {
-    // Short text: simple send (no shell quoting needed with execFile)
-    await rawSendText(session, keys);
+    // Short text or verbatim send: deliver keys directly
+    if (BACKEND === 'tmux' && (keys.length > 2000 || keys.includes('\n'))) {
+      await tmuxPasteBuffer(session, keys);
+    } else {
+      await rawSendText(session, keys);
+    }
   }
 
   // Delay before Enter — small floor so the foreground app has time to
@@ -504,7 +532,7 @@ export async function sendKeys(session: string, keys: string, opts?: SendKeysOpt
   // Enter is harmless for idle agents but accumulates churn during rapid back
   // and forth, and was contributing to perceived latency. 1.2s is enough to
   // clear the agent's input handler.
-  if (isLong) {
+  if (isLong && !opts?.verbatim) {
     setTimeout(async () => {
       try { await rawSendEnter(session); } catch { /* ignore */ }
     }, 1_200);
