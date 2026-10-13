@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 // ── Hoisted mocks ─────────────────────────────────────────────────────────────
 
-const { mockConnect, mockDisconnect, MockOpenClawProvider, MockQwenProvider, MockClaudeCodeSdkProvider, MockCodexSdkProvider, MockQoderSdkProvider, MockCursorHeadlessProvider, MockCopilotSdkProvider, MockOpenCodeSdkProvider, MockKimiSdkProvider, MockHermesAcpProvider, MockGrokSdkProvider, MockAgySdkProvider, MockDeepseekHarnessProvider, MockPiProvider } = vi.hoisted(() => {
+const { mockConnect, mockDisconnect, MockOpenClawProvider, MockQwenProvider, MockClaudeCodeSdkProvider, MockCodexSdkProvider, MockQoderSdkProvider, MockCursorHeadlessProvider, MockCopilotSdkProvider, MockOpenCodeSdkProvider, MockKimiSdkProvider, MockHermesAcpProvider, MockGrokSdkProvider, MockAgySdkProvider, MockDeepseekHarnessProvider, MockPiProvider, MockMuseCodeSdkProvider } = vi.hoisted(() => {
   const mockConnect = vi.fn().mockResolvedValue(undefined);
   const mockDisconnect = vi.fn().mockResolvedValue(undefined);
   const MockOpenClawProvider = vi.fn().mockImplementation(() => ({
@@ -301,8 +301,34 @@ const { mockConnect, mockDisconnect, MockOpenClawProvider, MockQwenProvider, Moc
     createSession: vi.fn().mockResolvedValue('session-pi'),
     endSession: vi.fn().mockResolvedValue(undefined),
   }));
-  return { mockConnect, mockDisconnect, MockOpenClawProvider, MockQwenProvider, MockClaudeCodeSdkProvider, MockCodexSdkProvider, MockQoderSdkProvider, MockCursorHeadlessProvider, MockCopilotSdkProvider, MockOpenCodeSdkProvider, MockKimiSdkProvider, MockHermesAcpProvider, MockGrokSdkProvider, MockAgySdkProvider, MockDeepseekHarnessProvider, MockPiProvider };
+  const MockMuseCodeSdkProvider = vi.fn().mockImplementation(() => ({
+    id: 'muse-code-sdk',
+    connectionMode: 'local-sdk',
+    sessionOwnership: 'shared',
+    capabilities: {
+      streaming: true,
+      toolCalling: true,
+      approval: true,
+      sessionRestore: true,
+      multiTurn: true,
+      attachments: true,
+      reasoningEffort: true,
+    },
+    connect: mockConnect,
+    disconnect: mockDisconnect,
+    send: vi.fn().mockResolvedValue(undefined),
+    onDelta: vi.fn(),
+    onComplete: vi.fn(),
+    onError: vi.fn(),
+    createSession: vi.fn().mockResolvedValue('session-muse'),
+    endSession: vi.fn().mockResolvedValue(undefined),
+  }));
+  return { mockConnect, mockDisconnect, MockOpenClawProvider, MockQwenProvider, MockClaudeCodeSdkProvider, MockCodexSdkProvider, MockQoderSdkProvider, MockCursorHeadlessProvider, MockCopilotSdkProvider, MockOpenCodeSdkProvider, MockKimiSdkProvider, MockHermesAcpProvider, MockGrokSdkProvider, MockAgySdkProvider, MockDeepseekHarnessProvider, MockPiProvider, MockMuseCodeSdkProvider };
 });
+
+vi.mock('../../src/agent/providers/muse-code-sdk.js', () => ({
+  MuseCodeSdkProvider: MockMuseCodeSdkProvider,
+}));
 
 vi.mock('../../src/agent/providers/openclaw.js', () => ({
   OpenClawProvider: MockOpenClawProvider,
@@ -475,6 +501,13 @@ describe('getProvider', () => {
     expect(provider!.id).toBe('kimi-sdk');
   });
 
+  it('returns muse-code-sdk after connectProvider()', async () => {
+    await connectProvider('muse-code-sdk', CONFIG);
+    const provider = getProvider('muse-code-sdk');
+    expect(provider).toBeDefined();
+    expect(provider!.id).toBe('muse-code-sdk');
+  });
+
   it('returns hermes-acp after connectProvider()', async () => {
     await connectProvider('hermes-acp', CONFIG);
     const provider = getProvider('hermes-acp');
@@ -566,6 +599,12 @@ describe('connectProvider', () => {
   it('instantiates KimiSdkProvider and calls connect()', async () => {
     await connectProvider('kimi-sdk', CONFIG);
     expect(MockKimiSdkProvider).toHaveBeenCalledOnce();
+    expect(mockConnect).toHaveBeenCalledWith(CONFIG);
+  });
+
+  it('instantiates MuseCodeSdkProvider and calls connect()', async () => {
+    await connectProvider('muse-code-sdk', CONFIG);
+    expect(MockMuseCodeSdkProvider).toHaveBeenCalledOnce();
     expect(mockConnect).toHaveBeenCalledWith(CONFIG);
   });
 

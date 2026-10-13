@@ -1347,6 +1347,7 @@ export function SessionSettingsDialog({
       case 'cursor-headless': return t('session.agentType.cursor_headless');
       case 'grok-sdk': return t('session.agentType.grok_sdk');
       case 'kimi-sdk': return t('session.agentType.kimi_sdk');
+      case 'muse-code-sdk': return t('session.agentType.muse_code_sdk');
       case HERMES_AGENT_PROVIDER_ID: return t('session.agentType.hermes_agent');
       case AGY_SDK_PROVIDER_ID: return t('session.agentType.agy_sdk');
       case 'deepseek-harness': return t('session.agentType.deepseek_harness');

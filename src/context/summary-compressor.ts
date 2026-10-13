@@ -304,6 +304,8 @@ function agentInstallHint(backend: string): string {
       return 'install qwen CLI on PATH';
     case 'gemini-sdk':
       return 'install Gemini CLI on PATH';
+    case 'muse-code-sdk':
+      return 'install Muse Code CLI on PATH (see api.meta.ai/muse-launcher.sh)';
     default:
       return `install the ${backend} CLI on PATH or configure a different primaryContextBackend`;
   }

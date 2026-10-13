@@ -65,6 +65,7 @@
     "@github/copilot-sdk": "^0.2.2",
     "@huggingface/transformers": "^4.3.0",
     "@modelcontextprotocol/sdk": "^1.32.1",
+    "@muse-code/sdk": "^1.4.6",
     "@opencode-ai/sdk": "^1.18.34",
     "add-mcp": "2.4.1",
     "commander": "^12.1.0",

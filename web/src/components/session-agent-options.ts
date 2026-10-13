@@ -113,6 +113,14 @@ const SESSION_AGENT_CHOICES: SessionAgentChoice[] = [
     surfaces: ['new-session', 'sub-session'],
   },
   {
+    id: 'muse-code-sdk',
+    icon: 'M',
+    fallbackLabel: 'Muse Code',
+    labelKey: 'session.agentType.muse_code_sdk',
+    group: 'transport',
+    surfaces: ['new-session', 'sub-session'],
+  },
+  {
     id: HERMES_AGENT_PROVIDER_ID,
     icon: 'H',
     fallbackLabel: 'Hermes Agent',
@@ -247,6 +255,6 @@ export function getSessionAgentLabel(
 export const PROJECT_ROLE_AGENT_TYPES: string[] = [
   AGY_SDK_PROVIDER_ID, 'claude-code', 'claude-code-sdk', 'codex', 'codex-sdk', 'qoder-sdk', 'copilot-sdk',
   'cursor-headless', 'opencode-sdk', 'opencode', 'gemini', 'gemini-sdk', 'grok-sdk',
-  'kimi-sdk', HERMES_AGENT_PROVIDER_ID, 'deepseek-harness', 'pi',
+  'kimi-sdk', 'muse-code-sdk', HERMES_AGENT_PROVIDER_ID, 'deepseek-harness', 'pi',
   CODEBUDDY_PROVIDER_IDS.CHINA, CODEBUDDY_PROVIDER_IDS.INTERNATIONAL,
 ];

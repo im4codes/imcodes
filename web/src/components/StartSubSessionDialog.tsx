@@ -7,7 +7,7 @@ import type { WsClient } from '../ws-client.js';
 import type { RemoteSession } from '../hooks/useProviderStatus.js';
 import { parseString, usePref } from '../hooks/usePref.js';
 import { PREF_KEY_DEFAULT_SHELL } from '../constants/prefs.js';
-import { CLAUDE_SDK_EFFORT_LEVELS, CODEX_SDK_EFFORT_LEVELS, COPILOT_SDK_EFFORT_LEVELS, OPENCLAW_THINKING_LEVELS, PI_EFFORT_LEVELS, QWEN_EFFORT_LEVELS, clampTransportEffort, formatEffortLevel, type TransportEffortLevel } from '@shared/effort-levels.js';
+import { CLAUDE_SDK_EFFORT_LEVELS, CODEX_SDK_EFFORT_LEVELS, COPILOT_SDK_EFFORT_LEVELS, MUSE_SDK_EFFORT_LEVELS, OPENCLAW_THINKING_LEVELS, PI_EFFORT_LEVELS, QWEN_EFFORT_LEVELS, clampTransportEffort, formatEffortLevel, type TransportEffortLevel } from '@shared/effort-levels.js';
 import { getSessionAgentGroups, getSessionAgentLabel, SESSION_AGENT_GROUP_LABEL_KEYS } from './session-agent-options.js';
 import { SdkModeRecommendation } from './SdkModeRecommendation.js';
 import { QwenCodingPlanHint } from './QwenCodingPlanHint.js';
@@ -52,6 +52,7 @@ const CURSOR_HEADLESS_MODEL_SUGGESTIONS = ['gpt-5.2'] as const;
 const COPILOT_SDK_MODEL_SUGGESTIONS = ['gpt-5.4', 'gpt-5.4-mini'] as const;
 const CODEX_SDK_MODEL_SUGGESTIONS = [...CODEX_MODEL_IDS] as const;
 const GEMINI_SDK_MODEL_SUGGESTIONS = [...GEMINI_MODEL_IDS] as const;
+const MUSE_SDK_MODEL_SUGGESTIONS = ['muse-spark', 'muse-wonder', 'muse-fast'] as const;
 const responsiveDialogStyle = {
   // Hard-cap against the visual viewport instead of relying on flex padding.
   // iOS can still render a 380px fixed-ish dialog inside a 390px viewport,
@@ -328,8 +329,8 @@ export function StartSubSessionDialog({ ws, defaultCwd, allowedAgentTypes, overl
     if (desc) extra.description = desc;
     if (ccPreset && (type === 'claude-code' || CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(type))) extra.ccPreset = ccPreset;
     if (ccInitPrompt.trim() && type === 'claude-code') extra.ccInitPrompt = ccInitPrompt.trim();
-    if ((type === 'claude-code-sdk' || type === 'codex-sdk' || type === 'copilot-sdk' || type === 'cursor-headless' || type === 'opencode-sdk' || type === 'gemini-sdk' || type === 'grok-sdk' || type === 'kimi-sdk' || type === HERMES_AGENT_PROVIDER_ID || type === AGY_SDK_PROVIDER_ID || type === 'deepseek-harness' || type === 'pi' || isCodeBuddyProviderId(type) || type === 'qwen') && requestedModel.trim()) extra.requestedModel = requestedModel.trim();
-    if (type === 'claude-code-sdk' || type === 'codex-sdk' || type === 'copilot-sdk' || type === 'pi' || type === 'qwen') extra.thinking = thinking;
+    if ((type === 'claude-code-sdk' || type === 'codex-sdk' || type === 'copilot-sdk' || type === 'cursor-headless' || type === 'opencode-sdk' || type === 'gemini-sdk' || type === 'grok-sdk' || type === 'kimi-sdk' || type === 'muse-code-sdk' || type === HERMES_AGENT_PROVIDER_ID || type === AGY_SDK_PROVIDER_ID || type === 'deepseek-harness' || type === 'pi' || isCodeBuddyProviderId(type) || type === 'qwen') && requestedModel.trim()) extra.requestedModel = requestedModel.trim();
+    if (type === 'claude-code-sdk' || type === 'codex-sdk' || type === 'copilot-sdk' || type === 'muse-code-sdk' || type === 'pi' || type === 'qwen') extra.thinking = thinking;
     if (launchCount > 1) extra.launchCount = launchCount;
     onStart(type, selectedShell, cwd || undefined, label || undefined, Object.keys(extra).length > 0 ? extra : undefined);
   };
@@ -347,13 +348,15 @@ export function StartSubSessionDialog({ ws, defaultCwd, allowedAgentTypes, overl
       ? (selectedDynamicModel?.supportedEffortLevels ?? CODEX_SDK_EFFORT_LEVELS)
       : type === 'copilot-sdk'
         ? COPILOT_SDK_EFFORT_LEVELS
-        : type === 'qwen'
-          ? QWEN_EFFORT_LEVELS
-          : type === 'pi'
-            ? PI_EFFORT_LEVELS
-          : type === 'openclaw'
-            ? OPENCLAW_THINKING_LEVELS
-            : [];
+        : type === 'muse-code-sdk'
+          ? (selectedDynamicModel?.supportedEffortLevels ?? MUSE_SDK_EFFORT_LEVELS)
+          : type === 'qwen'
+            ? QWEN_EFFORT_LEVELS
+            : type === 'pi'
+              ? PI_EFFORT_LEVELS
+            : type === 'openclaw'
+              ? OPENCLAW_THINKING_LEVELS
+              : [];
   const supportsCcPreset = type === 'claude-code' || CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(type);
   const showCcPresetControls = customProviderSdk || supportsCcPreset;
   const providerPresetLabel = customProviderSdk
@@ -362,11 +365,11 @@ export function StartSubSessionDialog({ ws, defaultCwd, allowedAgentTypes, overl
       ? t('new_session.compatible_api_via_qwen')
       : t('new_session.api_provider');
   useEffect(() => {
-    if (type !== 'codex-sdk' || !selectedDynamicModel?.supportedEffortLevels?.length) return;
+    if ((type !== 'codex-sdk' && type !== 'muse-code-sdk') || !selectedDynamicModel?.supportedEffortLevels?.length) return;
     const clamped = clampTransportEffort(thinking, selectedDynamicModel.supportedEffortLevels);
     if (clamped && clamped !== thinking) setThinking(clamped);
   }, [selectedDynamicModel?.id, selectedDynamicModel?.supportedEffortLevels, thinking, type]);
-  const supportsModelSelection = type === 'claude-code-sdk' || type === 'codex-sdk' || type === 'copilot-sdk' || type === 'cursor-headless' || type === 'opencode-sdk' || type === 'gemini-sdk' || type === 'grok-sdk' || type === 'kimi-sdk' || type === HERMES_AGENT_PROVIDER_ID || type === AGY_SDK_PROVIDER_ID || type === 'deepseek-harness' || type === 'pi' || isCodeBuddyProviderId(type) || (type === 'qwen' && !!selectedCcPreset);
+  const supportsModelSelection = type === 'claude-code-sdk' || type === 'codex-sdk' || type === 'copilot-sdk' || type === 'cursor-headless' || type === 'opencode-sdk' || type === 'gemini-sdk' || type === 'grok-sdk' || type === 'kimi-sdk' || type === 'muse-code-sdk' || type === HERMES_AGENT_PROVIDER_ID || type === AGY_SDK_PROVIDER_ID || type === 'deepseek-harness' || type === 'pi' || isCodeBuddyProviderId(type) || (type === 'qwen' && !!selectedCcPreset);
   const modelSuggestions = useMemo(() => (
     CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(type) && selectedCcPreset
       ? mergeModelSuggestions(
@@ -389,6 +392,8 @@ export function StartSubSessionDialog({ ws, defaultCwd, allowedAgentTypes, overl
         ? [...COPILOT_SDK_MODEL_SUGGESTIONS]
         : type === 'cursor-headless'
           ? [...CURSOR_HEADLESS_MODEL_SUGGESTIONS]
+        : type === 'muse-code-sdk'
+          ? [...MUSE_SDK_MODEL_SUGGESTIONS]
         : type === 'qwen'
             ? selectedPresetModels
             : type === 'gemini-sdk'
@@ -433,6 +438,17 @@ export function StartSubSessionDialog({ ws, defaultCwd, allowedAgentTypes, overl
       if (trimmed && modelSuggestions.includes(trimmed)) return trimmed;
       if (modelSuggestions.includes(preferred)) return preferred;
       return modelSuggestions[0] ?? preferred;
+    });
+  }, [type, modelSuggestions, transportModels.defaultModel]);
+
+  useEffect(() => {
+    if (type !== 'muse-code-sdk') return;
+    setRequestedModel((current) => {
+      const trimmed = current.trim();
+      if (trimmed && (modelSuggestions.length === 0 || modelSuggestions.includes(trimmed))) return trimmed;
+      const fallback = transportModels.defaultModel ?? MUSE_SDK_MODEL_SUGGESTIONS[0];
+      if (modelSuggestions.length === 0 || modelSuggestions.includes(fallback)) return fallback;
+      return modelSuggestions[0] ?? fallback;
     });
   }, [type, modelSuggestions, transportModels.defaultModel]);
 

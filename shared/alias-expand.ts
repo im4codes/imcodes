@@ -49,6 +49,7 @@ export const ALIAS_EXPANSION_MODE_BY_AGENT: Record<SessionAgentType, AliasExpans
   [HERMES_AGENT_PROVIDER_ID]: 'legend',
   'deepseek-harness': 'legend',
   'pi': 'legend',
+  'muse-code-sdk': 'legend',
   [CODEBUDDY_PROVIDER_IDS.CHINA]: 'legend',
   [CODEBUDDY_PROVIDER_IDS.INTERNATIONAL]: 'legend',
   'shell': 'inline',

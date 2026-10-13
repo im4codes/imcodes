@@ -15,6 +15,7 @@ import {
   CLAUDE_SDK_EFFORT_LEVELS,
   CODEX_SDK_EFFORT_LEVELS,
   COPILOT_SDK_EFFORT_LEVELS,
+  MUSE_SDK_EFFORT_LEVELS,
   OPENCLAW_THINKING_LEVELS,
   PI_EFFORT_LEVELS,
   QWEN_EFFORT_LEVELS,
@@ -73,6 +74,7 @@ const CURSOR_HEADLESS_MODEL_FALLBACK = ["auto", "composer-2-fast", "gpt-5.2"] as
 const COPILOT_SDK_MODEL_FALLBACK = ["gpt-5.4", "gpt-5.4-mini"] as const;
 const CODEX_SDK_MODEL_FALLBACK = [...CODEX_MODEL_IDS] as const;
 const GEMINI_SDK_MODEL_FALLBACK = [...GEMINI_MODEL_IDS];
+const MUSE_SDK_MODEL_FALLBACK = ["muse-spark", "muse-wonder", "muse-fast"] as const;
 const responsiveDialogStyle = {
   // Hard-cap against the visual viewport instead of relying on flex padding.
   // iOS can still render a 380px fixed-ish dialog inside a 390px viewport,
@@ -514,6 +516,7 @@ export function NewSessionDialog({
           || agentType === "gemini-sdk"
           || agentType === "grok-sdk"
           || agentType === "kimi-sdk"
+          || agentType === "muse-code-sdk"
           || agentType === HERMES_AGENT_PROVIDER_ID
           || agentType === AGY_SDK_PROVIDER_ID
           || agentType === "deepseek-harness"
@@ -534,6 +537,7 @@ export function NewSessionDialog({
         ...(agentType === "claude-code-sdk" ||
         agentType === "codex-sdk" ||
         agentType === "copilot-sdk" ||
+        agentType === "muse-code-sdk" ||
         agentType === "pi" ||
         agentType === "qwen"
           ? { thinking }
@@ -545,7 +549,7 @@ export function NewSessionDialog({
   const agentFlavor =
     agentType === "claude-code" || agentType === "codex"
       ? "cli"
-      : agentType === "claude-code-sdk" || agentType === "codex-sdk" || agentType === "qoder-sdk" || agentType === "opencode-sdk" || agentType === "grok-sdk" || agentType === "kimi-sdk" || agentType === HERMES_AGENT_PROVIDER_ID || agentType === AGY_SDK_PROVIDER_ID || agentType === "deepseek-harness" || agentType === "pi" || isCodeBuddyProviderId(agentType)
+      : agentType === "claude-code-sdk" || agentType === "codex-sdk" || agentType === "qoder-sdk" || agentType === "opencode-sdk" || agentType === "grok-sdk" || agentType === "kimi-sdk" || agentType === "muse-code-sdk" || agentType === HERMES_AGENT_PROVIDER_ID || agentType === AGY_SDK_PROVIDER_ID || agentType === "deepseek-harness" || agentType === "pi" || isCodeBuddyProviderId(agentType)
         ? "sdk"
         : null;
   const qwenCompatibleApiPresetSelected = agentType === "qwen" && !!selectedCcPreset;
@@ -563,15 +567,17 @@ export function NewSessionDialog({
         ? (selectedDynamicModel?.supportedEffortLevels ?? CODEX_SDK_EFFORT_LEVELS)
         : agentType === "copilot-sdk"
           ? COPILOT_SDK_EFFORT_LEVELS
-          : agentType === "qwen"
-            ? (qwenCompatibleApiPresetSelected ? ["high"] : QWEN_EFFORT_LEVELS)
-            : agentType === "pi"
-              ? PI_EFFORT_LEVELS
-            : agentType === "openclaw"
-              ? OPENCLAW_THINKING_LEVELS
-              : [];
+          : agentType === "muse-code-sdk"
+            ? (selectedDynamicModel?.supportedEffortLevels ?? MUSE_SDK_EFFORT_LEVELS)
+            : agentType === "qwen"
+              ? (qwenCompatibleApiPresetSelected ? ["high"] : QWEN_EFFORT_LEVELS)
+              : agentType === "pi"
+                ? PI_EFFORT_LEVELS
+              : agentType === "openclaw"
+                ? OPENCLAW_THINKING_LEVELS
+                : [];
   useEffect(() => {
-    if (agentType !== 'codex-sdk' || !selectedDynamicModel?.supportedEffortLevels?.length) return;
+    if ((agentType !== 'codex-sdk' && agentType !== 'muse-code-sdk') || !selectedDynamicModel?.supportedEffortLevels?.length) return;
     const clamped = clampTransportEffort(thinking, selectedDynamicModel.supportedEffortLevels);
     if (!clamped || clamped === thinking) return;
     setThinking(clamped);
@@ -597,6 +603,7 @@ export function NewSessionDialog({
     || agentType === "gemini-sdk"
     || agentType === "grok-sdk"
     || agentType === "kimi-sdk"
+    || agentType === "muse-code-sdk"
     || agentType === HERMES_AGENT_PROVIDER_ID
     || agentType === AGY_SDK_PROVIDER_ID
     || agentType === "deepseek-harness"
@@ -623,6 +630,7 @@ export function NewSessionDialog({
     if (agentType === "codex-sdk") return [...CODEX_SDK_MODEL_FALLBACK];
     if (agentType === "cursor-headless") return [...CURSOR_HEADLESS_MODEL_FALLBACK];
     if (agentType === "gemini-sdk") return [...GEMINI_SDK_MODEL_FALLBACK];
+    if (agentType === "muse-code-sdk") return [...MUSE_SDK_MODEL_FALLBACK];
     if (agentType === CODEBUDDY_PROVIDER_IDS.CHINA) return [...CODEBUDDY_CHINA_MODEL_FALLBACK];
     if (agentType === CODEBUDDY_PROVIDER_IDS.INTERNATIONAL) return [...CODEBUDDY_INTERNATIONAL_MODEL_FALLBACK];
     return [] as string[];
@@ -661,6 +669,17 @@ export function NewSessionDialog({
       if (trimmed && modelSuggestions.includes(trimmed)) return trimmed;
       if (modelSuggestions.includes(preferred)) return preferred;
       return modelSuggestions[0] ?? preferred;
+    });
+  }, [agentType, modelSuggestions, transportModels.defaultModel]);
+
+  useEffect(() => {
+    if (agentType !== "muse-code-sdk") return;
+    setRequestedModel((current) => {
+      const trimmed = current.trim();
+      if (trimmed && (modelSuggestions.length === 0 || modelSuggestions.includes(trimmed))) return trimmed;
+      const fallback = transportModels.defaultModel ?? MUSE_SDK_MODEL_FALLBACK[0];
+      if (modelSuggestions.length === 0 || modelSuggestions.includes(fallback)) return fallback;
+      return modelSuggestions[0] ?? fallback;
     });
   }, [agentType, modelSuggestions, transportModels.defaultModel]);
 

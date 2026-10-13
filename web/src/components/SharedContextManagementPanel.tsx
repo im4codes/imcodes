@@ -1142,6 +1142,7 @@ const MCP_PROVIDER_LABEL_KEY: Record<MemoryMcpProviderId, string> = {
   'gemini-sdk': 'sharedContext.management.mcpProviderGeminiAcp',
   'grok-sdk': 'sharedContext.management.mcpProviderGrokAcp',
   'kimi-sdk': 'sharedContext.management.mcpProviderKimiAcp',
+  'muse-code-sdk': 'session.agentType.muse_code_sdk',
   [HERMES_AGENT_PROVIDER_ID]: 'sharedContext.management.mcpProviderHermesAcp',
   'copilot-sdk': 'sharedContext.management.mcpProviderCopilotSdk',
   'codex-sdk': 'sharedContext.management.mcpProviderCodexSdk',

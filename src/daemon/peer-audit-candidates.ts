@@ -126,6 +126,8 @@ function peerAuditTypeLabel(agentType: string): string {
       return 'Gm';
     case 'grok-sdk':
       return 'Gx';
+    case 'muse-code-sdk':
+      return 'Mu';
     case AGY_SDK_PROVIDER_ID:
       return 'Ag';
     case 'qwen':

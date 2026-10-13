@@ -322,6 +322,7 @@ const PEER_AUDIT_PROVIDER_FAMILY_BY_ID: Readonly<Record<string, string>> = {
   deepseek: 'deepseek',
   'deepseek-harness': 'deepseek',
   pi: 'pi',
+  'muse-code-sdk': 'meta',
   [CODEBUDDY_PROVIDER_IDS.CHINA]: 'codebuddy',
   [CODEBUDDY_PROVIDER_IDS.INTERNATIONAL]: 'codebuddy',
 };

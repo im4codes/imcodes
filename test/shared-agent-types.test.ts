@@ -10,6 +10,7 @@ describe('shared agent type helpers', () => {
     expect(isTransportSessionAgentType('codex-sdk')).toBe(true);
     expect(isTransportSessionAgentType('qoder-sdk')).toBe(true);
     expect(isTransportSessionAgentType('kimi-sdk')).toBe(true);
+    expect(isTransportSessionAgentType('muse-code-sdk')).toBe(true);
     expect(isTransportSessionAgentType(HERMES_AGENT_PROVIDER_ID)).toBe(true);
     expect(isTransportSessionAgentType('grok-sdk')).toBe(true);
     expect(isTransportSessionAgentType(AGY_SDK_PROVIDER_ID)).toBe(true);
@@ -28,6 +29,7 @@ describe('shared agent type helpers', () => {
     expect(getSessionRuntimeType('codex-sdk')).toBe('transport');
     expect(getSessionRuntimeType('qoder-sdk')).toBe('transport');
     expect(getSessionRuntimeType('kimi-sdk')).toBe('transport');
+    expect(getSessionRuntimeType('muse-code-sdk')).toBe('transport');
     expect(getSessionRuntimeType(HERMES_AGENT_PROVIDER_ID)).toBe('transport');
     expect(getSessionRuntimeType('grok-sdk')).toBe('transport');
     expect(getSessionRuntimeType(AGY_SDK_PROVIDER_ID)).toBe('transport');

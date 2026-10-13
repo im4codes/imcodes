@@ -229,6 +229,39 @@ export function resolveAgyPathForSdk(name = 'agy'): string {
   return name;
 }
 
+function getUnixMuseCodeInstallCandidates(): string[] {
+  const home = process.env.HOME;
+  return uniqueNonEmpty([
+    home ? path.join(home, '.local', 'bin', 'muse') : undefined,
+    home ? path.join(home, '.muse', 'bin', 'muse') : undefined,
+    home ? path.join(home, '.npm-global', 'bin', 'muse') : undefined,
+    '/usr/local/bin/muse',
+    '/opt/homebrew/bin/muse',
+    '/usr/bin/muse',
+    '/bin/muse',
+  ]);
+}
+
+/** Resolve a CLI path for Muse Code (`muse`).
+ *  Under systemd/launchd, PATH is often sparse and omits ~/.local/bin/muse.
+ *  Checks explicit config, per-user paths, system paths, and PATH. */
+export function resolveMuseCodePathForSdk(name = 'muse'): string {
+  if (process.platform === 'win32') {
+    return name;
+  }
+  if (name !== 'muse') {
+    if (path.isAbsolute(name)) return name;
+    for (const candidate of getUnixMuseCodeInstallCandidates()) {
+      if (path.basename(candidate) === name && existsSync(candidate)) return candidate;
+    }
+    return name;
+  }
+  for (const candidate of getUnixMuseCodeInstallCandidates()) {
+    if (existsSync(candidate)) return candidate;
+  }
+  return name;
+}
+
 
 /** Result of resolving a binary that may be an npm .cmd shim.
  *  When the resolved path is a real .exe, just `{ executable }`.

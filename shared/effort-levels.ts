@@ -11,6 +11,7 @@ export const COPILOT_SDK_EFFORT_LEVELS = ['low', 'medium', 'high', 'max'] as con
 export const QWEN_EFFORT_LEVELS = ['off', 'low', 'medium', 'high'] as const satisfies readonly TransportEffortLevel[];
 export const PI_EFFORT_LEVELS = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'] as const satisfies readonly TransportEffortLevel[];
 export const OPENCLAW_THINKING_LEVELS = ['off', 'minimal', 'low', 'medium', 'high', 'adaptive'] as const satisfies readonly TransportEffortLevel[];
+export const MUSE_SDK_EFFORT_LEVELS = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'] as const satisfies readonly TransportEffortLevel[];
 
 export function isTransportEffortLevel(value: unknown): value is TransportEffortLevel {
   return typeof value === 'string' && (TRANSPORT_EFFORT_LEVELS as readonly string[]).includes(value);

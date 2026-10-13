@@ -324,6 +324,7 @@ import {
   COPILOT_SDK_EFFORT_LEVELS,
   DEFAULT_TRANSPORT_EFFORT,
   clampTransportEffort,
+  MUSE_SDK_EFFORT_LEVELS,
   OPENCLAW_THINKING_LEVELS,
   PI_EFFORT_LEVELS,
   QWEN_EFFORT_LEVELS,
@@ -1178,7 +1179,9 @@ function getSupportedEffortLevels(agentType: string | undefined): readonly Trans
             ? OPENCLAW_THINKING_LEVELS
             : agentType === 'pi'
               ? PI_EFFORT_LEVELS
-              : [];
+              : agentType === 'muse-code-sdk'
+                ? MUSE_SDK_EFFORT_LEVELS
+                : [];
 }
 
 async function resolveSupportedEffortLevels(
@@ -2629,7 +2632,7 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
       targetDir: requestedDir,
     });
 
-    if (agentType === 'claude-code-sdk' || agentType === 'codex-sdk' || agentType === 'copilot-sdk' || agentType === 'cursor-headless' || agentType === 'opencode-sdk' || agentType === 'gemini-sdk' || agentType === 'kimi-sdk' || agentType === HERMES_AGENT_PROVIDER_ID || agentType === 'grok-sdk' || agentType === AGY_SDK_PROVIDER_ID) {
+    if (agentType === 'claude-code-sdk' || agentType === 'codex-sdk' || agentType === 'copilot-sdk' || agentType === 'cursor-headless' || agentType === 'opencode-sdk' || agentType === 'gemini-sdk' || agentType === 'kimi-sdk' || agentType === HERMES_AGENT_PROVIDER_ID || agentType === 'grok-sdk' || agentType === AGY_SDK_PROVIDER_ID || agentType === 'muse-code-sdk') {
       logger.info({ project, agentType }, 'SDK fresh session.start removing stale main-session store record');
       // The fresh session starts under the SAME name, so its predecessor's
       // durable queue must be cleared and its authority rotated first.
@@ -2646,7 +2649,7 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
       brainType: agentType as ProjectConfig['brainType'],
       workerTypes: [],
       label,
-      fresh: agentType === 'claude-code-sdk' || agentType === 'codex-sdk' || agentType === 'opencode-sdk' || agentType === 'gemini-sdk' || agentType === 'kimi-sdk' || agentType === HERMES_AGENT_PROVIDER_ID || agentType === 'grok-sdk' || agentType === AGY_SDK_PROVIDER_ID || isCodeBuddyProviderId(agentType),
+      fresh: agentType === 'claude-code-sdk' || agentType === 'codex-sdk' || agentType === 'opencode-sdk' || agentType === 'gemini-sdk' || agentType === 'kimi-sdk' || agentType === HERMES_AGENT_PROVIDER_ID || agentType === 'grok-sdk' || agentType === AGY_SDK_PROVIDER_ID || agentType === 'muse-code-sdk' || isCodeBuddyProviderId(agentType),
       extraEnv,
       ccPreset: ccPresetName,
       effort,
@@ -2699,7 +2702,7 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
         effort,
         identityPrompt,
       });
-    } else if (agentType === 'opencode-sdk' || agentType === 'gemini-sdk' || agentType === 'kimi-sdk' || agentType === HERMES_AGENT_PROVIDER_ID || agentType === 'grok-sdk' || agentType === AGY_SDK_PROVIDER_ID || agentType === 'deepseek-harness' || agentType === 'pi' || isCodeBuddyProviderId(agentType)) {
+    } else if (agentType === 'opencode-sdk' || agentType === 'gemini-sdk' || agentType === 'kimi-sdk' || agentType === HERMES_AGENT_PROVIDER_ID || agentType === 'grok-sdk' || agentType === AGY_SDK_PROVIDER_ID || agentType === 'deepseek-harness' || agentType === 'pi' || agentType === 'muse-code-sdk' || isCodeBuddyProviderId(agentType)) {
       // Transport providers share the codex-sdk launch shape. DSH/Pi additionally
       // receive ccPreset so their adapters can bind the selected third-party
       // provider and model atomically before the first turn.
@@ -2850,7 +2853,7 @@ function isGenericModelSwitchAgent(agentType: string | undefined): boolean {
   return agentType === 'copilot-sdk' || agentType === 'cursor-headless' || agentType === 'opencode-sdk'
     || agentType === 'gemini-sdk' || agentType === 'kimi-sdk' || agentType === HERMES_AGENT_PROVIDER_ID
     || agentType === 'grok-sdk' || agentType === AGY_SDK_PROVIDER_ID || agentType === 'deepseek-harness' || agentType === 'pi'
-    || isCodeBuddyProviderId(agentType);
+    || agentType === 'muse-code-sdk' || isCodeBuddyProviderId(agentType);
 }
 
 function isModelSwitchAgent(agentType: string | undefined): boolean {
@@ -11662,7 +11665,7 @@ async function loadTransportListModels(agentType: string, force: boolean): Promi
   // caller explicitly forces a live probe.
   if (!provider && !force) return await loadPassiveTransportListModels(agentType);
 
-  if (!provider && force && (agentType === 'gemini-sdk' || agentType === 'kimi-sdk' || agentType === HERMES_AGENT_PROVIDER_ID || agentType === 'grok-sdk' || agentType === AGY_SDK_PROVIDER_ID || agentType === 'opencode-sdk' || agentType === 'claude-code-sdk' || agentType === 'codex-sdk' || agentType === 'copilot-sdk' || agentType === 'cursor-headless' || isCodeBuddyProviderId(agentType))) {
+  if (!provider && force && (agentType === 'gemini-sdk' || agentType === 'kimi-sdk' || agentType === HERMES_AGENT_PROVIDER_ID || agentType === 'grok-sdk' || agentType === AGY_SDK_PROVIDER_ID || agentType === 'opencode-sdk' || agentType === 'claude-code-sdk' || agentType === 'codex-sdk' || agentType === 'copilot-sdk' || agentType === 'cursor-headless' || agentType === 'muse-code-sdk' || isCodeBuddyProviderId(agentType))) {
     try {
       provider = await ensureProviderConnected(agentType, {});
     } catch (err) {

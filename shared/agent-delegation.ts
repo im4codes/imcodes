@@ -411,6 +411,7 @@ export const DELEGATION_REPLY_CAPABLE_AGENT_TYPES = [
   HERMES_AGENT_PROVIDER_ID,
   'deepseek-harness',
   'pi',
+  'muse-code-sdk',
   CODEBUDDY_PROVIDER_IDS.CHINA,
   CODEBUDDY_PROVIDER_IDS.INTERNATIONAL,
 ] as const;

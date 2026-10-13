@@ -146,6 +146,10 @@ async function createProvider(id: string): Promise<TransportProvider> {
       const { PiProvider } = await import('./providers/pi.js');
       return new PiProvider();
     }
+    case 'muse-code-sdk': {
+      const { MuseCodeSdkProvider } = await import('./providers/muse-code-sdk.js');
+      return new MuseCodeSdkProvider();
+    }
     case CODEBUDDY_PROVIDER_IDS.CHINA: {
       const { CodeBuddyChinaProvider } = await import('./providers/codebuddy.js');
       return new CodeBuddyChinaProvider();

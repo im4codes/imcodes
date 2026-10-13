@@ -27,6 +27,7 @@ export const AGENT_BADGE_CONFIG: Record<string, AgentBadgeConfig> = {
   [AGY_SDK_PROVIDER_ID]: { label: 'ag', color: '#2563eb', autoLabelPrefix: 'Ag' },
   'deepseek-harness': { label: 'ds', color: '#4d6bfe', autoLabelPrefix: 'Ds' },
   pi: { label: 'pi', color: '#06b6d4', autoLabelPrefix: 'Pi' },
+  'muse-code-sdk': { label: 'mu', color: '#0081fb', autoLabelPrefix: 'Mu' },
   [CODEBUDDY_PROVIDER_IDS.CHINA]: { label: 'cb', color: '#22c55e', autoLabelPrefix: 'CB' },
   [CODEBUDDY_PROVIDER_IDS.INTERNATIONAL]: { label: 'cb', color: '#38bdf8', autoLabelPrefix: 'CB' },
   'shell': { label: 'sh', color: '#475569', autoLabelPrefix: 'Sh' },
@@ -45,6 +46,7 @@ const LEGACY_AUTO_LABEL_PATTERNS: Array<{ pattern: RegExp; prefix: string }> = [
   { pattern: /^agy-sdk(\d+)?$/i, prefix: 'Ag' },
   { pattern: /^deepseek-harness(\d+)?$/i, prefix: 'Ds' },
   { pattern: /^pi(\d+)?$/i, prefix: 'Pi' },
+  { pattern: /^muse-code-sdk(\d+)?$/i, prefix: 'Mu' },
   { pattern: /^codebuddy-cn(\d+)?$/i, prefix: 'CB' },
   { pattern: /^codebuddy-international(\d+)?$/i, prefix: 'CB' },
 ];

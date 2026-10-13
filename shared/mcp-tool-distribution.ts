@@ -62,6 +62,7 @@ export const MCP_TOOL_RUNTIME_BOUNDARIES = Object.freeze({
   'hermes-acp': { delivery: 'host_refresh_with_exact_fallback', boundary: 'managed_mcp' },
   'deepseek-harness': { delivery: 'host_refresh_with_exact_fallback', boundary: 'managed_mcp' },
   pi: { delivery: 'shared_catalog_with_exact_fallback', boundary: 'managed_mcp' },
+  'muse-code-sdk': { delivery: 'host_refresh_with_exact_fallback', boundary: 'managed_mcp' },
   'codebuddy-cn': { delivery: 'host_refresh_with_exact_fallback', boundary: 'managed_mcp' },
   'codebuddy-international': { delivery: 'host_refresh_with_exact_fallback', boundary: 'managed_mcp' },
   shell: { delivery: 'not_applicable', boundary: 'raw_command' },
