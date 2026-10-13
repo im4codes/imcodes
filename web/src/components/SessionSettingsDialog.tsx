@@ -941,7 +941,7 @@ export function SessionSettingsDialog({
         : agentType === 'qwen'
           ? getKnownQwenModelOptions().map((entry) => entry.id)
           : agentType === 'muse-code-sdk'
-            ? ['wander', 'wander-code', 'wander-fast', 'wander-pro']
+            ? ['muse-spark-1.3', 'muse-spark', 'muse-wonder', 'muse-fast', 'wander']
             : [];
     return mergeModelSuggestions(
       [sessionModel, initialSessionModel, sessionDynamicModels.defaultModel, ...staticOptions].filter((value): value is string => !!value),

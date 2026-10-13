@@ -74,7 +74,7 @@ const CURSOR_HEADLESS_MODEL_FALLBACK = ["auto", "composer-2-fast", "gpt-5.2"] as
 const COPILOT_SDK_MODEL_FALLBACK = ["gpt-5.4", "gpt-5.4-mini"] as const;
 const CODEX_SDK_MODEL_FALLBACK = [...CODEX_MODEL_IDS] as const;
 const GEMINI_SDK_MODEL_FALLBACK = [...GEMINI_MODEL_IDS];
-const MUSE_SDK_MODEL_FALLBACK = ["wander", "wander-code", "wander-fast", "wander-pro"] as const;
+const MUSE_SDK_MODEL_FALLBACK = ["muse-spark-1.3", "muse-spark", "muse-wonder", "muse-fast", "wander"] as const;
 const responsiveDialogStyle = {
   // Hard-cap against the visual viewport instead of relying on flex padding.
   // iOS can still render a 380px fixed-ish dialog inside a 390px viewport,

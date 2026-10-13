@@ -51,7 +51,13 @@ export const GEMINI_MODEL_IDS = [
 ] as const;
 export type GeminiModelId = typeof GEMINI_MODEL_IDS[number];
 
-export const MUSE_MODEL_IDS = ['wander', 'wander-code', 'wander-fast', 'wander-pro'] as const;
+export const MUSE_MODEL_IDS = [
+  'muse-spark-1.3',
+  'muse-spark',
+  'muse-wonder',
+  'muse-fast',
+  'wander',
+] as const;
 export type MuseModelId = typeof MUSE_MODEL_IDS[number];
 
 export function mergeModelSuggestions(...groups: ReadonlyArray<readonly string[]>): string[] {

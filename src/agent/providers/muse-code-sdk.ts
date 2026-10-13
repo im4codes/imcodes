@@ -78,26 +78,32 @@ export const MUSE_CODE_SDK_PROVIDER_ID = 'muse-code-sdk';
 
 export const DEFAULT_MUSE_MODELS: ProviderModelInfo[] = [
   {
+    id: 'muse-spark-1.3',
+    name: 'Muse Spark 1.3',
+    supportsReasoningEffort: true,
+    supportedEffortLevels: MUSE_SDK_EFFORT_LEVELS,
+  },
+  {
+    id: 'muse-spark',
+    name: 'Muse Spark',
+    supportsReasoningEffort: true,
+    supportedEffortLevels: MUSE_SDK_EFFORT_LEVELS,
+  },
+  {
+    id: 'muse-wonder',
+    name: 'Muse Wonder',
+    supportsReasoningEffort: true,
+    supportedEffortLevels: MUSE_SDK_EFFORT_LEVELS,
+  },
+  {
+    id: 'muse-fast',
+    name: 'Muse Fast',
+    supportsReasoningEffort: true,
+    supportedEffortLevels: MUSE_SDK_EFFORT_LEVELS,
+  },
+  {
     id: 'wander',
     name: 'Wander',
-    supportsReasoningEffort: true,
-    supportedEffortLevels: MUSE_SDK_EFFORT_LEVELS,
-  },
-  {
-    id: 'wander-code',
-    name: 'Wander Code',
-    supportsReasoningEffort: true,
-    supportedEffortLevels: MUSE_SDK_EFFORT_LEVELS,
-  },
-  {
-    id: 'wander-fast',
-    name: 'Wander Fast',
-    supportsReasoningEffort: true,
-    supportedEffortLevels: MUSE_SDK_EFFORT_LEVELS,
-  },
-  {
-    id: 'wander-pro',
-    name: 'Wander Pro',
     supportsReasoningEffort: true,
     supportedEffortLevels: MUSE_SDK_EFFORT_LEVELS,
   },
@@ -105,34 +111,14 @@ export const DEFAULT_MUSE_MODELS: ProviderModelInfo[] = [
 
 export function normalizeMuseModelId(model: string | undefined): string {
   const trimmed = model?.trim();
-  if (!trimmed) return 'wander';
-  if (trimmed === 'wonder' || trimmed === 'muse-wonder' || trimmed === 'muse-spark' || trimmed === 'muse-spark-1.3') {
-    return 'wander';
-  }
-  if (trimmed === 'muse-fast') {
-    return 'wander-fast';
-  }
+  if (!trimmed) return 'muse-spark-1.3';
+  if (trimmed === 'wonder' || trimmed === 'wander-pro') return 'muse-wonder';
+  if (trimmed === 'spark') return 'muse-spark';
+  if (trimmed === 'fast' || trimmed === 'wander-fast') return 'muse-fast';
+  if (trimmed === 'wander-code') return 'muse-spark-1.3';
   return trimmed;
 }
 
-function readStoredMuseApiKey(): string | undefined {
-  try {
-    const credPath = process.env.MUSE_AUTH_PATH?.trim()
-      || (process.env.XDG_CONFIG_HOME?.trim()
-        ? join(process.env.XDG_CONFIG_HOME.trim(), 'muse', 'auth.json')
-        : join(homedir(), '.config', 'muse', 'auth.json'));
-    if (existsSync(credPath)) {
-      const parsed = JSON.parse(readFileSync(credPath, 'utf8'));
-      const key = parsed?.providers?.meta?.api_key || parsed?.providers?.meta?.access_token;
-      if (typeof key === 'string' && key.trim()) {
-        return key.trim();
-      }
-    }
-  } catch {
-    // Ignore read errors
-  }
-  return undefined;
-}
 
 type MuseApprovalRequest = Parameters<ApprovalHandler>[0];
 type MuseItemDelta = ReturnType<Turn['deltas']> extends AsyncIterableIterator<infer D> ? D : { delta: string; field?: string };
@@ -294,11 +280,10 @@ export class MuseCodeSdkProvider implements TransportProvider {
       args.push('--provider', config.provider.trim());
     }
 
-    const apiKey = typeof config.apiKey === 'string' && config.apiKey.trim()
+    const explicitApiKey = typeof config.apiKey === 'string' && config.apiKey.trim()
       ? config.apiKey.trim()
       : ((config.env as Record<string, string> | undefined)?.META_API_KEY
-        || process.env.META_API_KEY
-        || readStoredMuseApiKey());
+        || process.env.META_API_KEY);
 
     try {
       const handshake = spawnMspConnection({
@@ -308,7 +293,7 @@ export class MuseCodeSdkProvider implements TransportProvider {
         env: {
           ...process.env,
           ...(config.env as Record<string, string> | undefined),
-          ...(apiKey ? { META_API_KEY: apiKey } : {}),
+          ...(explicitApiKey ? { META_API_KEY: explicitApiKey } : {}),
         },
         onStderr: (chunk: string) => {
           logger.debug({ chunk }, 'muse serve stderr');
@@ -317,6 +302,7 @@ export class MuseCodeSdkProvider implements TransportProvider {
 
       this.spawned = await handshake.initialize({
         clientInfo: { name: 'imcodes', version: '1.0.0' },
+        capabilities: { experimentalApi: true },
       });
 
       this.client = new MuseClient(this.spawned.connection, {
@@ -386,7 +372,7 @@ export class MuseCodeSdkProvider implements TransportProvider {
         ? config.agentId.trim()
         : (typeof (config as any).model === 'string' && (config as any).model.trim()
           ? (config as any).model.trim()
-          : 'wander'),
+          : 'muse-spark-1.3'),
     );
     let session: Session;
 
@@ -695,9 +681,14 @@ export class MuseCodeSdkProvider implements TransportProvider {
         const terminal = outcome.params.terminal;
         if (terminal === 'failed') {
           const err = outcome.params.error;
+          const rawMessage = err?.message || outcome.params.reason || 'Muse turn failed';
+          const isAuthError = /lack access|not logged in|unauthorized|not exist/i.test(rawMessage);
+          const message = isAuthError
+            ? `${rawMessage} (Run \`muse login\` in terminal to authenticate your Meta account)`
+            : rawMessage;
           this.emitError(sessionId, {
             code: PROVIDER_ERROR_CODES.PROVIDER_ERROR,
-            message: err?.message || outcome.params.reason || 'Muse turn failed',
+            message,
             recoverable: err?.retryable ?? true,
           });
           return;
@@ -872,7 +863,7 @@ export class MuseCodeSdkProvider implements TransportProvider {
           });
           const list: ProviderModelList = {
             models,
-            defaultModel: models.some((m) => m.id === 'wander') ? 'wander' : models[0]?.id,
+            defaultModel: models.some((m) => m.id === 'muse-spark-1.3') ? 'muse-spark-1.3' : (models[0]?.id || 'muse-spark-1.3'),
             isAuthenticated: true,
           };
           this.modelCache = { at: now, list };
