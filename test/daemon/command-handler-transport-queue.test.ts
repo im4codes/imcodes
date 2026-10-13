@@ -3763,7 +3763,7 @@ describe('handleWebCommand transport queue behavior', () => {
       agentType: 'muse-code-sdk',
       requestId: 'passive-muse-models',
       defaultModel: expect.any(String),
-      models: expect.arrayContaining([expect.objectContaining({ id: 'wander' })]),
+      models: expect.arrayContaining([expect.objectContaining({ id: 'muse-spark-1.3' })]),
     }));
   });
 
@@ -6770,7 +6770,7 @@ describe('handleWebCommand transport queue behavior', () => {
       agentType: 'muse-code-sdk',
       runtimeType: 'transport',
       state: 'running',
-      requestedModel: 'wander',
+      requestedModel: 'muse-spark',
     });
     getTransportRuntimeMock.mockReturnValue({
       providerSessionId: 'provider-route-muse',

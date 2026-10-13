@@ -56,7 +56,6 @@ export const MUSE_MODEL_IDS = [
   'muse-spark',
   'muse-wonder',
   'muse-fast',
-  'wander',
 ] as const;
 export type MuseModelId = typeof MUSE_MODEL_IDS[number];
 

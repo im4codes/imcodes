@@ -127,7 +127,12 @@ export async function ensureMuseMcpConfigHasImcodesEntry(options: MuseMcpEnsureO
       mcpServers = { ...mcpServers, ...(parsed.mcpServers as Record<string, unknown>) };
     }
 
-    if (!hadSnakeCase && (isSameDaemonEntry(mcpServers[IMCODES_MEMORY_MCP_SERVER_NAME]) || isSameDaemonEntry(mcpServers[DAEMON_CONFLICT_SERVER_NAME]))) {
+    const hadPoisonedModel = parsed.model === 'wander' || parsed.model === 'wander-code';
+    if (hadPoisonedModel) {
+      delete parsed.model;
+    }
+
+    if (!hadPoisonedModel && !hadSnakeCase && (isSameDaemonEntry(mcpServers[IMCODES_MEMORY_MCP_SERVER_NAME]) || isSameDaemonEntry(mcpServers[DAEMON_CONFLICT_SERVER_NAME]))) {
       return {
         serverName: isSameDaemonEntry(mcpServers[IMCODES_MEMORY_MCP_SERVER_NAME]) ? IMCODES_MEMORY_MCP_SERVER_NAME : DAEMON_CONFLICT_SERVER_NAME,
         configPath,
@@ -155,12 +160,6 @@ export async function ensureMuseMcpConfigHasImcodesEntry(options: MuseMcpEnsureO
         [serverName]: daemonEntry(),
       },
     };
-    if (!next.provider) {
-      next.provider = 'meta';
-    }
-    if (!next.model) {
-      next.model = 'wander';
-    }
 
     const tmpPath = `${configPath}.tmp-${process.pid}-${Date.now()}`;
     await writeFile(tmpPath, `${JSON.stringify(next, null, 2)}\n`, 'utf8');

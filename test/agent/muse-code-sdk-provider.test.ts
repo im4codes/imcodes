@@ -494,12 +494,12 @@ describe('MuseCodeSdkProvider session and turn lifecycle', () => {
       sessionInfoUpdates.push(info);
     });
 
-    provider.setSessionAgentId(routeId, 'wander');
+    provider.setSessionAgentId(routeId, 'muse-wonder');
 
-    expect(sessionInfoUpdates).toContainEqual({ model: 'wander' });
+    expect(sessionInfoUpdates).toContainEqual({ model: 'muse-wonder' });
     expect(mockCommand).toHaveBeenCalledWith('session/setModel', expect.objectContaining({
       sessionId: 'muse-sess-model-1',
-      model: { modelId: 'wander' },
+      model: { modelId: 'muse-wonder' },
     }));
   });
 
@@ -553,13 +553,13 @@ describe('MuseCodeSdkProvider session and turn lifecycle', () => {
     const routeId = await provider.createSession({
       cwd: '/home/k/project',
       resumeId: 'muse-sess-resumed-1',
-      agentId: 'wander',
+      agentId: 'muse-spark',
     });
 
     expect(routeId).toBeDefined();
     expect(mockCommand).toHaveBeenCalledWith('session/setModel', expect.objectContaining({
       sessionId: 'muse-sess-resumed-1',
-      model: { modelId: 'wander' },
+      model: { modelId: 'muse-spark' },
     }));
   });
 
@@ -571,7 +571,7 @@ describe('MuseCodeSdkProvider session and turn lifecycle', () => {
     expect(normalizeMuseModelId('muse-spark')).toBe('muse-spark');
     expect(normalizeMuseModelId('muse-spark-1.3')).toBe('muse-spark-1.3');
     expect(normalizeMuseModelId('muse-fast')).toBe('muse-fast');
-    expect(normalizeMuseModelId('wander')).toBe('wander');
+    expect(normalizeMuseModelId('wander')).toBe('muse-spark-1.3');
     expect(normalizeMuseModelId('wander-code')).toBe('muse-spark-1.3');
     expect(normalizeMuseModelId('wander-fast')).toBe('muse-fast');
     expect(normalizeMuseModelId('wander-pro')).toBe('muse-wonder');

@@ -101,12 +101,6 @@ export const DEFAULT_MUSE_MODELS: ProviderModelInfo[] = [
     supportsReasoningEffort: true,
     supportedEffortLevels: MUSE_SDK_EFFORT_LEVELS,
   },
-  {
-    id: 'wander',
-    name: 'Wander',
-    supportsReasoningEffort: true,
-    supportedEffortLevels: MUSE_SDK_EFFORT_LEVELS,
-  },
 ];
 
 export function normalizeMuseModelId(model: string | undefined): string {
@@ -115,7 +109,7 @@ export function normalizeMuseModelId(model: string | undefined): string {
   if (trimmed === 'wonder' || trimmed === 'wander-pro') return 'muse-wonder';
   if (trimmed === 'spark') return 'muse-spark';
   if (trimmed === 'fast' || trimmed === 'wander-fast') return 'muse-fast';
-  if (trimmed === 'wander-code') return 'muse-spark-1.3';
+  if (trimmed === 'wander' || trimmed === 'wander-code') return 'muse-spark-1.3';
   return trimmed;
 }
 
@@ -853,7 +847,7 @@ export class MuseCodeSdkProvider implements TransportProvider {
         };
         if (Array.isArray(raw?.models) && raw.models.length > 0) {
           const models: ProviderModelInfo[] = raw.models.map((m) => {
-            const id = m.modelId || m.id || 'wander';
+            const id = m.modelId || m.id || 'muse-spark-1.3';
             return {
               id,
               name: m.displayLabel || m.name || id,
