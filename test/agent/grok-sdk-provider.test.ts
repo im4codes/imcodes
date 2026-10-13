@@ -3,7 +3,12 @@ import {
   AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES,
   AGENT_DELEGATION_NOTIFICATION_RESULTS,
 } from '../../shared/agent-delegation.js';
-import { GrokSdkProvider } from '../../src/agent/providers/grok-sdk.js';
+import {
+  GrokSdkProvider,
+  resolveGrokBinaryPath,
+  GROK_CLI_PATH_ENV,
+  GROK_CLI_BINARY,
+} from '../../src/agent/providers/grok-sdk.js';
 import { BACKGROUND_SUBAGENT_WAKE_MODES, PROVIDER_ERROR_CODES, type ToolCallEvent } from '../../src/agent/transport-provider.js';
 import {
   SDK_SUBAGENT_PROVIDER_KINDS,
@@ -50,6 +55,24 @@ describe('GrokSdkProvider contract', () => {
       recoverable: false,
     });
     await provider.disconnect();
+  });
+
+  it('resolves Grok binary path honoring config override and GROK_CLI_PATH', () => {
+    expect(resolveGrokBinaryPath({ binaryPath: '/custom/path/grok' })).toBe('/custom/path/grok');
+
+    const origEnv = process.env[GROK_CLI_PATH_ENV];
+    try {
+      process.env[GROK_CLI_PATH_ENV] = '/env/path/grok';
+      expect(resolveGrokBinaryPath()).toBe('/env/path/grok');
+      // Explicit config overrides env
+      expect(resolveGrokBinaryPath({ binaryPath: '/override/grok' })).toBe('/override/grok');
+    } finally {
+      if (origEnv === undefined) {
+        delete process.env[GROK_CLI_PATH_ENV];
+      } else {
+        process.env[GROK_CLI_PATH_ENV] = origEnv;
+      }
+    }
   });
 
   it('declares the official Grok ACP transport capabilities', () => {

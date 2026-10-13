@@ -4,7 +4,7 @@ import type {
   ProviderDelegationNotification,
 } from '../transport-provider.js';
 import { PROVIDER_ERROR_CODES } from '../transport-provider.js';
-import { normalizeTransportCwd } from '../transport-paths.js';
+import { normalizeTransportCwd, resolveGrokPathForSdk } from '../transport-paths.js';
 import { KimiSdkProvider, type AcpCliProviderProfile } from './kimi-sdk.js';
 import {
   SDK_SUBAGENT_PROVIDER_KINDS,
@@ -15,10 +15,20 @@ import {
   type AgentDelegationNotificationResult,
 } from '../../../shared/agent-delegation.js';
 
+export const GROK_CLI_PATH_ENV = 'GROK_CLI_PATH';
+export const GROK_CLI_BINARY = 'grok';
+
+/** Resolve the `grok` executable to spawn, honoring `config.binaryPath`, `GROK_CLI_PATH`, candidate directories, and PATH. */
+export function resolveGrokBinaryPath(config?: ProviderConfig | { binaryPath?: string } | null): string {
+  const direct = typeof config?.binaryPath === 'string' ? config.binaryPath.trim() : '';
+  const raw = direct || process.env[GROK_CLI_PATH_ENV]?.trim() || GROK_CLI_BINARY;
+  return resolveGrokPathForSdk(raw);
+}
+
 const GROK_PROFILE: AcpCliProviderProfile = {
   id: 'grok-sdk',
   displayName: 'Grok',
-  binary: 'grok',
+  binary: GROK_CLI_BINARY,
   args: ['--no-auto-update', 'agent', 'stdio'],
   approval: 'bridge',
   loadFailure: 'error',
@@ -49,6 +59,17 @@ export class GrokSdkProvider extends KimiSdkProvider {
   constructor() {
     super(GROK_PROFILE);
     this.capabilities.activeDelegationNotification = AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE;
+  }
+
+  override async connect(config: ProviderConfig): Promise<void> {
+    await super.connect({
+      ...config,
+      binaryPath: resolveGrokBinaryPath(config),
+    });
+  }
+
+  protected override resolveBinaryPath(config: ProviderConfig | null): string {
+    return resolveGrokBinaryPath(config);
   }
 
   notifyActiveDelegation(

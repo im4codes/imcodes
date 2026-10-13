@@ -1744,7 +1744,7 @@ export class KimiSdkProvider implements TransportProvider {
     for (const cb of this.errorCallbacks) cb(sessionId, error);
   }
 
-  private resolveBinaryPath(config: ProviderConfig | null): string {
+  protected resolveBinaryPath(config: ProviderConfig | null): string {
     return typeof config?.binaryPath === 'string' && config.binaryPath.trim()
       ? config.binaryPath
       : this.profile.binary;

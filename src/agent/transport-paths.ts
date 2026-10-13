@@ -262,6 +262,62 @@ export function resolveMuseCodePathForSdk(name = 'muse'): string {
   return name;
 }
 
+function getWindowsGrokInstallCandidates(name: string): string[] {
+  const basename = path.basename(name);
+  const hasExt = /\.[^\\/]+$/.test(basename);
+  const fileNames = hasExt ? [basename] : [basename, `${basename}.exe`, `${basename}.cmd`, `${basename}.bat`];
+  const grokHome = process.env.GROK_HOME;
+  const dirs = uniqueNonEmpty([
+    ...getWindowsGlobalCliDirs(),
+    grokHome ? path.join(grokHome, 'bin') : undefined,
+    process.env.USERPROFILE ? path.join(process.env.USERPROFILE, '.grok', 'bin') : undefined,
+    process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'Programs', 'grok', 'bin') : undefined,
+    process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'Programs', 'grok') : undefined,
+    process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'grok', 'bin') : undefined,
+    process.env.USERPROFILE ? path.join(process.env.USERPROFILE, '.local', 'bin') : undefined,
+  ]);
+  return dirs.flatMap((dir) => fileNames.map((fileName) => path.join(dir, fileName)));
+}
+
+function getUnixGrokInstallCandidates(): string[] {
+  const home = process.env.HOME;
+  const grokHome = process.env.GROK_HOME;
+  return uniqueNonEmpty([
+    grokHome ? path.join(grokHome, 'bin', 'grok') : undefined,
+    home ? path.join(home, '.grok', 'bin', 'grok') : undefined,
+    home ? path.join(home, '.local', 'bin', 'grok') : undefined,
+    home ? path.join(home, '.npm-global', 'bin', 'grok') : undefined,
+    '/usr/local/bin/grok',
+    '/opt/homebrew/bin/grok',
+    '/usr/bin/grok',
+    '/bin/grok',
+  ]);
+}
+
+/** Resolve a CLI path for Grok (`grok`).
+ *  Under systemd/launchd, PATH is often sparse and omits ~/.grok/bin or ~/.local/bin.
+ *  Checks explicit config, per-user paths, system paths, and PATH. */
+export function resolveGrokPathForSdk(name = 'grok'): string {
+  if (process.platform === 'win32') {
+    const resolved = resolveBinaryWithWindowsFallbacks(name, getWindowsGrokInstallCandidates(name));
+    if (/\.(cmd|bat)$/i.test(resolved)) {
+      return parseNpmCmdShim(resolved) ?? resolved;
+    }
+    return resolved;
+  }
+  if (name !== 'grok') {
+    if (path.isAbsolute(name)) return name;
+    for (const candidate of getUnixGrokInstallCandidates()) {
+      if (path.basename(candidate) === name && existsSync(candidate)) return candidate;
+    }
+    return name;
+  }
+  for (const candidate of getUnixGrokInstallCandidates()) {
+    if (existsSync(candidate)) return candidate;
+  }
+  return name;
+}
+
 
 /** Result of resolving a binary that may be an npm .cmd shim.
  *  When the resolved path is a real .exe, just `{ executable }`.
