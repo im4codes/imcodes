@@ -1,5 +1,5 @@
 import { join, resolve } from 'node:path';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { describe, expect, it, vi } from 'vitest';
 import {
@@ -344,7 +344,7 @@ describe('computer use runner open-computer-use CLI', () => {
   });
 
   it('dereferences symlinks in entryFilePath candidate binary discovery', () => {
-    const tempDir = mkdtempSync(join(tmpdir(), 'symlink-candidate-test-'));
+    const tempDir = realpathSync(mkdtempSync(join(tmpdir(), 'symlink-candidate-test-')));
     try {
       const realDir = join(tempDir, 'lib', 'dist', 'src');
       mkdirSync(realDir, { recursive: true });
