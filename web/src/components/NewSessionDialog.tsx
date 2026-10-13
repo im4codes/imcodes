@@ -74,7 +74,7 @@ const CURSOR_HEADLESS_MODEL_FALLBACK = ["auto", "composer-2-fast", "gpt-5.2"] as
 const COPILOT_SDK_MODEL_FALLBACK = ["gpt-5.4", "gpt-5.4-mini"] as const;
 const CODEX_SDK_MODEL_FALLBACK = [...CODEX_MODEL_IDS] as const;
 const GEMINI_SDK_MODEL_FALLBACK = [...GEMINI_MODEL_IDS];
-const MUSE_SDK_MODEL_FALLBACK = ["muse-spark", "muse-wonder", "muse-fast"] as const;
+const MUSE_SDK_MODEL_FALLBACK = ["wander", "wander-code", "wander-fast", "wander-pro"] as const;
 const responsiveDialogStyle = {
   // Hard-cap against the visual viewport instead of relying on flex padding.
   // iOS can still render a 380px fixed-ish dialog inside a 390px viewport,
@@ -621,6 +621,7 @@ export function NewSessionDialog({
       const dynamicModelIds = transportModels.models.map((m) => m.id);
       if (agentType === "gemini-sdk") return mergeModelSuggestions(GEMINI_SDK_MODEL_FALLBACK, dynamicModelIds);
       if (agentType === "codex-sdk") return mergeModelSuggestions(CODEX_SDK_MODEL_FALLBACK, dynamicModelIds);
+      if (agentType === "muse-code-sdk") return mergeModelSuggestions(MUSE_SDK_MODEL_FALLBACK, dynamicModelIds);
       if (agentType === CODEBUDDY_PROVIDER_IDS.CHINA) return mergeModelSuggestions(CODEBUDDY_CHINA_MODEL_FALLBACK, dynamicModelIds);
       if (agentType === CODEBUDDY_PROVIDER_IDS.INTERNATIONAL) return mergeModelSuggestions(CODEBUDDY_INTERNATIONAL_MODEL_FALLBACK, dynamicModelIds);
       return dynamicModelIds;

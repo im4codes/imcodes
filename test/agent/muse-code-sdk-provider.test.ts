@@ -3,6 +3,7 @@ import {
   DEFAULT_MUSE_MODELS,
   MUSE_CODE_SDK_PROVIDER_ID,
   MuseCodeSdkProvider,
+  normalizeMuseModelId,
 } from '../../src/agent/providers/muse-code-sdk.js';
 import {
   BACKGROUND_SUBAGENT_WAKE_MODES,
@@ -60,7 +61,7 @@ describe('MuseCodeSdkProvider contract', () => {
     const result = await provider.listModels();
     expect(result.models.length).toBeGreaterThanOrEqual(3);
     expect(result.models.map((m) => m.id)).toEqual(
-      expect.arrayContaining(['wander', 'muse-spark', 'muse-wonder', 'muse-fast']),
+      expect.arrayContaining(['wander', 'wander-code', 'wander-fast', 'wander-pro']),
     );
     expect(result.defaultModel).toBe('wander');
     for (const m of result.models) {
@@ -205,12 +206,12 @@ describe('MuseCodeSdkProvider session and turn lifecycle', () => {
 
     const routeId = await provider.createSession({
       cwd: '/home/k/project',
-      model: 'muse-spark',
+      model: 'wander',
     });
     expect(routeId).toBeDefined();
     expect(mockClient.startSession).toHaveBeenCalledWith({
       workspaceRoot: '/home/k/project',
-      modelId: 'muse-spark',
+      modelId: 'wander',
       providerId: 'meta',
     });
 
@@ -469,5 +470,110 @@ describe('MuseCodeSdkProvider session and turn lifecycle', () => {
         usageDurationMs: 450,
       },
     });
+  });
+
+  it('propagates setSessionAgentId to connection via session/setModel', async () => {
+    const provider = new MuseCodeSdkProvider();
+    const mockCommand = vi.fn().mockResolvedValue({ status: 'ok' });
+    (provider as any).spawned = {
+      connection: {
+        command: mockCommand,
+      },
+    };
+    const sessionObj = {
+      sessionId: 'muse-sess-model-1',
+      onApproval: vi.fn(),
+    };
+    (provider as any).client = {
+      startSession: vi.fn().mockResolvedValue(sessionObj),
+    };
+
+    const routeId = await provider.createSession({ cwd: '/home/k/project' });
+    const sessionInfoUpdates: any[] = [];
+    provider.onSessionInfo((_sessId, info) => {
+      sessionInfoUpdates.push(info);
+    });
+
+    provider.setSessionAgentId(routeId, 'wander');
+
+    expect(sessionInfoUpdates).toContainEqual({ model: 'wander' });
+    expect(mockCommand).toHaveBeenCalledWith('session/setModel', expect.objectContaining({
+      sessionId: 'muse-sess-model-1',
+      model: { modelId: 'wander' },
+    }));
+  });
+
+  it('propagates setSessionEffort to connection via session/setReasoningEffort', async () => {
+    const provider = new MuseCodeSdkProvider();
+    const mockCommand = vi.fn().mockResolvedValue({ status: 'ok' });
+    (provider as any).spawned = {
+      connection: {
+        command: mockCommand,
+      },
+    };
+    const sessionObj = {
+      sessionId: 'muse-sess-effort-1',
+      onApproval: vi.fn(),
+    };
+    (provider as any).client = {
+      startSession: vi.fn().mockResolvedValue(sessionObj),
+    };
+
+    const routeId = await provider.createSession({ cwd: '/home/k/project' });
+    const sessionInfoUpdates: any[] = [];
+    provider.onSessionInfo((_sessId, info) => {
+      sessionInfoUpdates.push(info);
+    });
+
+    provider.setSessionEffort(routeId, 'high');
+
+    expect(sessionInfoUpdates).toContainEqual({ effort: 'high' });
+    expect(mockCommand).toHaveBeenCalledWith('session/setReasoningEffort', expect.objectContaining({
+      sessionId: 'muse-sess-effort-1',
+      reasoningEffort: 'high',
+    }));
+  });
+
+  it('propagates requestedModel on resume to connection via session/setModel', async () => {
+    const provider = new MuseCodeSdkProvider();
+    const mockCommand = vi.fn().mockResolvedValue({ status: 'ok' });
+    (provider as any).spawned = {
+      connection: {
+        command: mockCommand,
+      },
+    };
+    const sessionObj = {
+      sessionId: 'muse-sess-resumed-1',
+      onApproval: vi.fn(),
+    };
+    (provider as any).client = {
+      resumeSession: vi.fn().mockResolvedValue(sessionObj),
+    };
+
+    const routeId = await provider.createSession({
+      cwd: '/home/k/project',
+      resumeId: 'muse-sess-resumed-1',
+      agentId: 'wander',
+    });
+
+    expect(routeId).toBeDefined();
+    expect(mockCommand).toHaveBeenCalledWith('session/setModel', expect.objectContaining({
+      sessionId: 'muse-sess-resumed-1',
+      model: { modelId: 'wander' },
+    }));
+  });
+
+  it('normalizes legacy or misspelled model ids to supported wander models', () => {
+    expect(normalizeMuseModelId('wonder')).toBe('wander');
+    expect(normalizeMuseModelId('muse-wonder')).toBe('wander');
+    expect(normalizeMuseModelId('muse-spark')).toBe('wander');
+    expect(normalizeMuseModelId('muse-spark-1.3')).toBe('wander');
+    expect(normalizeMuseModelId('muse-fast')).toBe('wander-fast');
+    expect(normalizeMuseModelId('wander')).toBe('wander');
+    expect(normalizeMuseModelId('wander-code')).toBe('wander-code');
+    expect(normalizeMuseModelId('wander-fast')).toBe('wander-fast');
+    expect(normalizeMuseModelId('wander-pro')).toBe('wander-pro');
+    expect(normalizeMuseModelId('')).toBe('wander');
+    expect(normalizeMuseModelId(undefined)).toBe('wander');
   });
 });

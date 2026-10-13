@@ -127,7 +127,7 @@ import type { P2pWorkflowDraft } from '@shared/p2p-workflow-types.js';
 import { getQwenAuthTier, QWEN_AUTH_TIERS, QWEN_AUTH_TYPES } from '@shared/qwen-auth.js';
 import { getKnownQwenModelDescription, getKnownQwenModelOptions } from '@shared/qwen-models.js';
 import { CLAUDE_CODE_MODEL_IDS, CODEX_MODEL_IDS, GEMINI_MODEL_IDS, mergeModelSuggestions, normalizeClaudeCodeModelId } from '../../../src/shared/models/options.js';
-import { CLAUDE_SDK_EFFORT_LEVELS, CODEX_SDK_EFFORT_LEVELS, COPILOT_SDK_EFFORT_LEVELS, OPENCLAW_THINKING_LEVELS, QWEN_EFFORT_LEVELS, clampTransportEffort, formatEffortLevel, type TransportEffortLevel } from '@shared/effort-levels.js';
+import { CLAUDE_SDK_EFFORT_LEVELS, CODEX_SDK_EFFORT_LEVELS, COPILOT_SDK_EFFORT_LEVELS, MUSE_SDK_EFFORT_LEVELS, OPENCLAW_THINKING_LEVELS, QWEN_EFFORT_LEVELS, clampTransportEffort, formatEffortLevel, type TransportEffortLevel } from '@shared/effort-levels.js';
 import { resolveEffectiveSessionModel } from '@shared/session-model.js';
 import { CUSTOM_PROVIDER_SDK_AGENT_TYPES } from '@shared/cc-presets.js';
 import { useTransportModels, supportsDynamicTransportModels } from '../hooks/useTransportModels.js';
@@ -932,6 +932,7 @@ const CODEX_MODELS: CodexModelChoice[] = [...CODEX_MODEL_IDS];
 const CURSOR_HEADLESS_MODEL_SUGGESTIONS = ['gpt-5.2'] as const;
 const COPILOT_SDK_MODEL_SUGGESTIONS = ['gpt-5.4', 'gpt-5.4-mini'] as const;
 const GEMINI_SDK_MODEL_SUGGESTIONS = [...GEMINI_MODEL_IDS] as const;
+const MUSE_SDK_MODEL_SUGGESTIONS = ['wander', 'wander-code', 'wander-fast', 'wander-pro'] as const;
 const P2P_BASE_MODES = ['solo', 'audit', 'review', 'plan', 'brainstorm', 'discuss', P2P_CONFIG_MODE] as const;
 const P2P_DROPDOWN_ROUND_OPTIONS = [1, 2, 3, 5] as const;
 const P2P_MODE_I18N: Record<string, string> = { solo: 'p2p.mode_solo', audit: 'p2p.mode_audit', review: 'p2p.mode_review', plan: 'p2p.mode_plan', brainstorm: 'p2p.mode_brainstorm', discuss: 'p2p.mode_discuss', [P2P_CONFIG_MODE]: 'p2p.mode_config' };
@@ -2045,7 +2046,8 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const isAgySdk = activeSession?.agentType === AGY_SDK_PROVIDER_ID;
   const isOpenCodeSdk = activeSession?.agentType === 'opencode-sdk';
   const isCodeBuddy = isCodeBuddyProviderId(activeSession?.agentType);
-  const supportsGenericTransportModelSelect = isCopilot || isCursorHeadless || isDeepseekHarness || isPi || isGeminiSdk || isGrokSdk || isKimiSdk || isHermesAgent || isAgySdk || isOpenCodeSdk || isCodeBuddy;
+  const isMuseSdk = activeSession?.agentType === 'muse-code-sdk';
+  const supportsGenericTransportModelSelect = isCopilot || isCursorHeadless || isDeepseekHarness || isPi || isGeminiSdk || isGrokSdk || isKimiSdk || isHermesAgent || isAgySdk || isOpenCodeSdk || isCodeBuddy || isMuseSdk;
   // Source-of-truth priority for the model picker:
   //   1. `useTransportModels` — live daemon probe via `transport.list_models`
   //      WS round-trip. Works uniformly for main sessions AND sub-sessions
@@ -2071,7 +2073,9 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       const dynamicModelIds = dynamicTransportModels.models.map((m) => m.id);
       return isGeminiSdk
         ? mergeModelSuggestions(GEMINI_SDK_MODEL_SUGGESTIONS, dynamicModelIds)
-        : dynamicModelIds;
+        : isMuseSdk
+          ? mergeModelSuggestions(MUSE_SDK_MODEL_SUGGESTIONS, dynamicModelIds)
+          : dynamicModelIds;
     }
     if (isCopilot) {
       const probed = activeSession?.copilotAvailableModels;
@@ -2085,6 +2089,9 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     }
     if (isGeminiSdk) {
       return GEMINI_SDK_MODEL_SUGGESTIONS;
+    }
+    if (isMuseSdk) {
+      return MUSE_SDK_MODEL_SUGGESTIONS;
     }
     if (isKimiSdk || isHermesAgent) {
       return dynamicTransportModels.models.map((m) => m.id);
@@ -2110,6 +2117,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     isAgySdk,
     isOpenCodeSdk,
     isCodeBuddy,
+    isMuseSdk,
     activeSession?.agentType,
     activeSession?.copilotAvailableModels,
     activeSession?.cursorAvailableModels,
@@ -2183,6 +2191,8 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
           ? (qwenCompatibleApiSession ? ['high'] : QWEN_EFFORT_LEVELS)
           : activeSession?.agentType === 'copilot-sdk'
             ? COPILOT_SDK_EFFORT_LEVELS
+          : activeSession?.agentType === 'muse-code-sdk'
+            ? (selectedDynamicModel?.supportedEffortLevels ?? MUSE_SDK_EFFORT_LEVELS)
           : activeSession?.agentType === 'openclaw'
             ? OPENCLAW_THINKING_LEVELS
             : []

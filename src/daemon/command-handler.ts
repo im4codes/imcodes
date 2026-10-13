@@ -222,7 +222,7 @@ import {
   collectRecentSummarySyncCandidates,
   fingerprintRecentSummary,
 } from '../context/summary-sync.js';
-import { CLAUDE_CODE_MODEL_IDS, CODEX_MODEL_IDS, GEMINI_MODEL_IDS, normalizeClaudeCodeModelId } from '../shared/models/options.js';
+import { CLAUDE_CODE_MODEL_IDS, CODEX_MODEL_IDS, GEMINI_MODEL_IDS, MUSE_MODEL_IDS, normalizeClaudeCodeModelId } from '../shared/models/options.js';
 import type { TransportSessionRuntime } from '../agent/transport-session-runtime.js';
 import { getClaudeSdkRuntimeConfig, normalizeClaudeSdkModelForProvider } from '../agent/sdk-runtime-config.js';
 import { getCodexRuntimeConfig } from '../agent/codex-runtime-config.js';
@@ -11790,6 +11790,13 @@ async function loadPassiveTransportListModels(agentType: string): Promise<Transp
     return {
       models: modelIdsToTransportModels(CODEBUDDY_INTERNATIONAL_MODEL_FALLBACK),
       defaultModel: CODEBUDDY_INTERNATIONAL_MODEL_FALLBACK[0],
+    };
+  }
+  if (agentType === 'muse-code-sdk') {
+    return {
+      models: modelIdsToTransportModels(MUSE_MODEL_IDS),
+      defaultModel: MUSE_MODEL_IDS[0],
+      isAuthenticated: true,
     };
   }
   if (agentType === 'cursor-headless' || agentType === 'kimi-sdk' || agentType === HERMES_AGENT_PROVIDER_ID || agentType === 'grok-sdk' || agentType === AGY_SDK_PROVIDER_ID

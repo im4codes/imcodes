@@ -3748,6 +3748,25 @@ describe('handleWebCommand transport queue behavior', () => {
     }));
   });
 
+  it('serves passive transport.list_models for muse-code-sdk without connecting provider', async () => {
+    getProviderMock.mockReturnValue(undefined);
+
+    handleWebCommand({ type: 'transport.list_models', agentType: 'muse-code-sdk', requestId: 'passive-muse-models' }, serverLink as any);
+    await waitForAsync(() => serverLink.send.mock.calls.some((call) => (
+      (call[0] as Record<string, unknown>).type === 'transport.models_response'
+        && (call[0] as Record<string, unknown>).requestId === 'passive-muse-models'
+    )));
+
+    expect(ensureProviderConnectedMock).not.toHaveBeenCalled();
+    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'transport.models_response',
+      agentType: 'muse-code-sdk',
+      requestId: 'passive-muse-models',
+      defaultModel: expect.any(String),
+      models: expect.arrayContaining([expect.objectContaining({ id: 'wander' })]),
+    }));
+  });
+
   it('serves a CC preset model catalog without starting a provider runtime', async () => {
     getPresetModelCatalogMock.mockResolvedValue({
       preset: { name: 'MiniMax', env: {} },
@@ -6739,6 +6758,38 @@ describe('handleWebCommand transport queue behavior', () => {
       requestedModel: 'gemini-2.5-flash',
       activeModel: 'gemini-2.5-flash',
       modelDisplay: 'gemini-2.5-flash',
+    }));
+  });
+
+  it('switches model for muse-code-sdk transport sessions via /model', async () => {
+    const setAgentId = vi.fn();
+    getSessionMock.mockReturnValue({
+      name: 'deck_transport_brain',
+      projectName: 'transport',
+      role: 'brain',
+      agentType: 'muse-code-sdk',
+      runtimeType: 'transport',
+      state: 'running',
+      requestedModel: 'wander',
+    });
+    getTransportRuntimeMock.mockReturnValue({
+      providerSessionId: 'provider-route-muse',
+      setAgentId,
+    });
+
+    handleWebCommand({
+      type: 'session.send',
+      session: 'deck_transport_brain',
+      text: '/model muse-spark-1.3',
+      commandId: 'cmd-model-muse',
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(setAgentId).toHaveBeenCalledWith('muse-spark-1.3');
+    expect(upsertSessionMock).toHaveBeenCalledWith(expect.objectContaining({
+      requestedModel: 'muse-spark-1.3',
+      activeModel: 'muse-spark-1.3',
+      modelDisplay: 'muse-spark-1.3',
     }));
   });
 

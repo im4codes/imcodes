@@ -84,30 +84,36 @@ export const DEFAULT_MUSE_MODELS: ProviderModelInfo[] = [
     supportedEffortLevels: MUSE_SDK_EFFORT_LEVELS,
   },
   {
-    id: 'muse-spark-1.3',
-    name: 'Muse Spark 1.3',
+    id: 'wander-code',
+    name: 'Wander Code',
     supportsReasoningEffort: true,
     supportedEffortLevels: MUSE_SDK_EFFORT_LEVELS,
   },
   {
-    id: 'muse-spark',
-    name: 'Muse Spark',
+    id: 'wander-fast',
+    name: 'Wander Fast',
     supportsReasoningEffort: true,
     supportedEffortLevels: MUSE_SDK_EFFORT_LEVELS,
   },
   {
-    id: 'muse-wonder',
-    name: 'Muse Wonder',
-    supportsReasoningEffort: true,
-    supportedEffortLevels: MUSE_SDK_EFFORT_LEVELS,
-  },
-  {
-    id: 'muse-fast',
-    name: 'Muse Fast',
+    id: 'wander-pro',
+    name: 'Wander Pro',
     supportsReasoningEffort: true,
     supportedEffortLevels: MUSE_SDK_EFFORT_LEVELS,
   },
 ];
+
+export function normalizeMuseModelId(model: string | undefined): string {
+  const trimmed = model?.trim();
+  if (!trimmed) return 'wander';
+  if (trimmed === 'wonder' || trimmed === 'muse-wonder' || trimmed === 'muse-spark' || trimmed === 'muse-spark-1.3') {
+    return 'wander';
+  }
+  if (trimmed === 'muse-fast') {
+    return 'wander-fast';
+  }
+  return trimmed;
+}
 
 function readStoredMuseApiKey(): string | undefined {
   try {
@@ -375,11 +381,13 @@ export class MuseCodeSdkProvider implements TransportProvider {
     }
 
     const workspaceRoot = normalizeTransportCwd(config.cwd) ?? process.cwd();
-    const requestedModel = typeof config.agentId === 'string' && config.agentId.trim()
-      ? config.agentId.trim()
-      : (typeof (config as any).model === 'string' && (config as any).model.trim()
-        ? (config as any).model.trim()
-        : 'wander');
+    const requestedModel = normalizeMuseModelId(
+      typeof config.agentId === 'string' && config.agentId.trim()
+        ? config.agentId.trim()
+        : (typeof (config as any).model === 'string' && (config as any).model.trim()
+          ? (config as any).model.trim()
+          : 'wander'),
+    );
     let session: Session;
 
     try {
@@ -387,6 +395,17 @@ export class MuseCodeSdkProvider implements TransportProvider {
         session = await this.client.resumeSession({
           sessionId: config.resumeId,
         });
+        if (requestedModel && this.spawned) {
+          void this.spawned.connection
+            .command('session/setModel', {
+              commandId: randomUUID(),
+              sessionId: session.sessionId,
+              model: { modelId: requestedModel },
+            })
+            .catch((err) => {
+              logger.debug({ err, requestedModel }, 'Failed to set model on resumed Muse session');
+            });
+        }
       } else {
         session = await this.client.startSession({
           workspaceRoot,
@@ -843,7 +862,7 @@ export class MuseCodeSdkProvider implements TransportProvider {
         };
         if (Array.isArray(raw?.models) && raw.models.length > 0) {
           const models: ProviderModelInfo[] = raw.models.map((m) => {
-            const id = m.modelId || m.id || 'muse-spark-1.3';
+            const id = m.modelId || m.id || 'wander';
             return {
               id,
               name: m.displayLabel || m.name || id,
@@ -853,7 +872,7 @@ export class MuseCodeSdkProvider implements TransportProvider {
           });
           const list: ProviderModelList = {
             models,
-            defaultModel: models[0]?.id,
+            defaultModel: models.some((m) => m.id === 'wander') ? 'wander' : models[0]?.id,
             isAuthenticated: true,
           };
           this.modelCache = { at: now, list };
@@ -876,8 +895,20 @@ export class MuseCodeSdkProvider implements TransportProvider {
   setSessionAgentId(sessionId: string, agentId: string): void {
     const state = this.sessions.get(sessionId);
     if (state) {
-      state.model = agentId;
-      this.emitSessionInfo(sessionId, { model: agentId });
+      const normalizedModel = normalizeMuseModelId(agentId);
+      state.model = normalizedModel;
+      this.emitSessionInfo(sessionId, { model: normalizedModel });
+      if (this.spawned && state.museSessionId) {
+        void this.spawned.connection
+          .command('session/setModel', {
+            commandId: randomUUID(),
+            sessionId: state.museSessionId,
+            model: { modelId: normalizedModel },
+          })
+          .catch((err) => {
+            logger.warn({ err, sessionId, agentId: normalizedModel }, 'Failed to propagate session/setModel to Muse');
+          });
+      }
     }
   }
 
@@ -885,6 +916,18 @@ export class MuseCodeSdkProvider implements TransportProvider {
     const state = this.sessions.get(sessionId);
     if (state) {
       state.reasoningEffort = effort;
+      this.emitSessionInfo(sessionId, { effort });
+      if (this.spawned && state.museSessionId) {
+        void this.spawned.connection
+          .command('session/setReasoningEffort', {
+            commandId: randomUUID(),
+            sessionId: state.museSessionId,
+            reasoningEffort: effort,
+          })
+          .catch((err) => {
+            logger.warn({ err, sessionId, effort }, 'Failed to propagate session/setReasoningEffort to Muse');
+          });
+      }
     }
   }
 
