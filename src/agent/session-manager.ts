@@ -80,6 +80,7 @@ import { getClaudeSdkRuntimeConfig, getGrokSdkRuntimeConfig, normalizeClaudeSdkM
 import { peekClaudeUsageQuotaCached } from './claude-usage-quota.js';
 import { peekAgyUsageQuotaCached } from './agy-usage-quota.js';
 import { peekGrokUsageQuotaCached, getGrokUsageQuota } from './grok-usage-quota.js';
+import { peekMuseUsageQuotaCached, getMuseUsageQuota } from './muse-usage-quota.js';
 import { getCodexRuntimeConfig } from './codex-runtime-config.js';
 import { mergeCodexDisplayMetadata } from './codex-display.js';
 import type { TransportEffortLevel } from '../../shared/effort-levels.js';
@@ -2389,6 +2390,12 @@ function wireTransportSessionInfo(
       }
     } else if (agentType === 'grok-sdk') {
       const proactive = peekGrokUsageQuotaCached();
+      if (proactive?.quotaMeta) {
+        effQuotaLabel = proactive.quotaLabel;
+        effQuotaMeta = proactive.quotaMeta;
+      }
+    } else if (agentType === 'muse-code-sdk') {
+      const proactive = peekMuseUsageQuotaCached();
       if (proactive?.quotaMeta) {
         effQuotaLabel = proactive.quotaLabel;
         effQuotaMeta = proactive.quotaMeta;

@@ -12,6 +12,7 @@ import { getCopilotRuntimeConfig } from '../agent/copilot-runtime-config.js';
 import { getCursorRuntimeConfig } from '../agent/cursor-runtime-config.js';
 import { fetchAgyUsageQuota } from '../agent/agy-usage-quota.js';
 import { getGrokUsageQuota } from '../agent/grok-usage-quota.js';
+import { getMuseUsageQuota } from '../agent/muse-usage-quota.js';
 import { providerQuotaMetaEquals } from '../../shared/provider-quota.js';
 import { QWEN_AUTH_TYPES } from '../../shared/qwen-auth.js';
 import { getTransportRuntime } from '../agent/session-manager.js';
@@ -250,6 +251,7 @@ export async function buildSessionList(): Promise<SessionListItem[]> {
   const needsCursorHydration = sessions.some((s) => s.agentType === 'cursor-headless');
   const needsAgySdkHydration = sessions.some((s) => s.agentType === 'agy-sdk');
   const needsGrokSdkHydration = sessions.some((s) => s.agentType === 'grok-sdk');
+  const needsMuseSdkHydration = sessions.some((s) => s.agentType === 'muse-code-sdk');
   const qwenRuntime = needsQwenHydration ? await getQwenRuntimeConfig().catch(() => null) : null;
   const claudeSdkRuntime = needsClaudeSdkHydration ? await getClaudeSdkRuntimeConfig().catch(() => ({}) as import('../agent/sdk-runtime-config.js').SdkRuntimeConfig) : null;
   const grokSdkRuntime = needsGrokSdkHydration ? await getGrokSdkRuntimeConfig().catch(() => ({}) as import('../agent/sdk-runtime-config.js').SdkRuntimeConfig) : null;
@@ -258,6 +260,7 @@ export async function buildSessionList(): Promise<SessionListItem[]> {
   const claudeUsageQuota = needsClaudeSdkHydration ? await getClaudeUsageQuota().catch(() => null) : null;
   const agyUsageQuota = needsAgySdkHydration ? await fetchAgyUsageQuota().catch(() => null) : null;
   const grokUsageQuota = needsGrokSdkHydration ? await getGrokUsageQuota().catch(() => null) : null;
+  const museUsageQuota = needsMuseSdkHydration ? await getMuseUsageQuota().catch(() => null) : null;
   const codexRuntime = needsCodexHydration ? await getCodexRuntimeConfig({ probe: false }).catch(() => ({}) as import('../agent/codex-runtime-config.js').CodexRuntimeConfig) : null;
   const copilotRuntime = needsCopilotHydration ? await getCopilotRuntimeConfig({ probe: false }).catch(() => null) : null;
   const cursorRuntime = needsCursorHydration ? await getCursorRuntimeConfig({ probe: false }).catch(() => null) : null;
@@ -369,6 +372,21 @@ export async function buildSessionList(): Promise<SessionListItem[]> {
       if (
         (hydrated.planLabel && hydrated.planLabel !== s.planLabel)
         || (hydrated.quotaLabel && hydrated.quotaLabel !== s.quotaLabel)
+        || !providerQuotaMetaEquals(hydrated.quotaMeta, s.quotaMeta)
+      ) {
+        upsertSession({ ...s, ...hydrated, updatedAt: Date.now() });
+      }
+      return { ...baseItem(s), ...hydrated };
+    }
+    if (s.agentType === 'muse-code-sdk') {
+      const quotaOverride = museUsageQuota
+        ? { quotaLabel: museUsageQuota.quotaLabel, quotaMeta: museUsageQuota.quotaMeta }
+        : {};
+      const hydrated: Partial<SessionRecord> = {
+        ...quotaOverride,
+      };
+      if (
+        (hydrated.quotaLabel && hydrated.quotaLabel !== s.quotaLabel)
         || !providerQuotaMetaEquals(hydrated.quotaMeta, s.quotaMeta)
       ) {
         upsertSession({ ...s, ...hydrated, updatedAt: Date.now() });

@@ -50,7 +50,7 @@ import {
   type CcPreset,
   type CcPresetAuthType,
 } from "@shared/cc-presets.js";
-import { CODEX_MODEL_IDS, GEMINI_MODEL_IDS, mergeModelSuggestions } from "../../../src/shared/models/options.js";
+import { AGY_MODEL_IDS, CODEX_MODEL_IDS, GEMINI_MODEL_IDS, mergeModelSuggestions } from "../../../src/shared/models/options.js";
 import { loadCodexModelPreference } from "../codex-model-preference.js";
 import { GIT_REMOTE_CLONE_CAPABILITY_V1 } from "@shared/git-remote-url.js";
 import type { SessionAgentType } from "@shared/agent-types.js";
@@ -75,6 +75,7 @@ const COPILOT_SDK_MODEL_FALLBACK = ["gpt-5.4", "gpt-5.4-mini"] as const;
 const CODEX_SDK_MODEL_FALLBACK = [...CODEX_MODEL_IDS] as const;
 const GEMINI_SDK_MODEL_FALLBACK = [...GEMINI_MODEL_IDS];
 const MUSE_SDK_MODEL_FALLBACK = ["muse-spark-1.3", "muse-spark", "muse-wonder", "muse-fast", "wander"] as const;
+const AGY_SDK_MODEL_FALLBACK = [...AGY_MODEL_IDS] as const;
 const responsiveDialogStyle = {
   // Hard-cap against the visual viewport instead of relying on flex padding.
   // iOS can still render a 380px fixed-ish dialog inside a 390px viewport,
@@ -622,6 +623,7 @@ export function NewSessionDialog({
       if (agentType === "gemini-sdk") return mergeModelSuggestions(GEMINI_SDK_MODEL_FALLBACK, dynamicModelIds);
       if (agentType === "codex-sdk") return mergeModelSuggestions(CODEX_SDK_MODEL_FALLBACK, dynamicModelIds);
       if (agentType === "muse-code-sdk") return mergeModelSuggestions(MUSE_SDK_MODEL_FALLBACK, dynamicModelIds);
+      if (agentType === AGY_SDK_PROVIDER_ID) return mergeModelSuggestions(AGY_SDK_MODEL_FALLBACK, dynamicModelIds);
       if (agentType === CODEBUDDY_PROVIDER_IDS.CHINA) return mergeModelSuggestions(CODEBUDDY_CHINA_MODEL_FALLBACK, dynamicModelIds);
       if (agentType === CODEBUDDY_PROVIDER_IDS.INTERNATIONAL) return mergeModelSuggestions(CODEBUDDY_INTERNATIONAL_MODEL_FALLBACK, dynamicModelIds);
       return dynamicModelIds;
@@ -632,6 +634,7 @@ export function NewSessionDialog({
     if (agentType === "cursor-headless") return [...CURSOR_HEADLESS_MODEL_FALLBACK];
     if (agentType === "gemini-sdk") return [...GEMINI_SDK_MODEL_FALLBACK];
     if (agentType === "muse-code-sdk") return [...MUSE_SDK_MODEL_FALLBACK];
+    if (agentType === AGY_SDK_PROVIDER_ID) return [...AGY_SDK_MODEL_FALLBACK];
     if (agentType === CODEBUDDY_PROVIDER_IDS.CHINA) return [...CODEBUDDY_CHINA_MODEL_FALLBACK];
     if (agentType === CODEBUDDY_PROVIDER_IDS.INTERNATIONAL) return [...CODEBUDDY_INTERNATIONAL_MODEL_FALLBACK];
     return [] as string[];
@@ -679,6 +682,17 @@ export function NewSessionDialog({
       const trimmed = current.trim();
       if (trimmed && (modelSuggestions.length === 0 || modelSuggestions.includes(trimmed))) return trimmed;
       const fallback = transportModels.defaultModel ?? MUSE_SDK_MODEL_FALLBACK[0];
+      if (modelSuggestions.length === 0 || modelSuggestions.includes(fallback)) return fallback;
+      return modelSuggestions[0] ?? fallback;
+    });
+  }, [agentType, modelSuggestions, transportModels.defaultModel]);
+
+  useEffect(() => {
+    if (agentType !== AGY_SDK_PROVIDER_ID) return;
+    setRequestedModel((current) => {
+      const trimmed = current.trim();
+      if (trimmed && (modelSuggestions.length === 0 || modelSuggestions.includes(trimmed))) return trimmed;
+      const fallback = transportModels.defaultModel ?? AGY_SDK_MODEL_FALLBACK[0];
       if (modelSuggestions.length === 0 || modelSuggestions.includes(fallback)) return fallback;
       return modelSuggestions[0] ?? fallback;
     });

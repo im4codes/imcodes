@@ -126,7 +126,7 @@ import { migrateLegacyWorkflowDraft, normalizeWorkflowLibrary } from '@shared/p2
 import type { P2pWorkflowDraft } from '@shared/p2p-workflow-types.js';
 import { getQwenAuthTier, QWEN_AUTH_TIERS, QWEN_AUTH_TYPES } from '@shared/qwen-auth.js';
 import { getKnownQwenModelDescription, getKnownQwenModelOptions } from '@shared/qwen-models.js';
-import { CLAUDE_CODE_MODEL_IDS, CODEX_MODEL_IDS, GEMINI_MODEL_IDS, mergeModelSuggestions, normalizeClaudeCodeModelId } from '../../../src/shared/models/options.js';
+import { AGY_MODEL_IDS, CLAUDE_CODE_MODEL_IDS, CODEX_MODEL_IDS, GEMINI_MODEL_IDS, mergeModelSuggestions, normalizeClaudeCodeModelId } from '../../../src/shared/models/options.js';
 import { CLAUDE_SDK_EFFORT_LEVELS, CODEX_SDK_EFFORT_LEVELS, COPILOT_SDK_EFFORT_LEVELS, MUSE_SDK_EFFORT_LEVELS, OPENCLAW_THINKING_LEVELS, QWEN_EFFORT_LEVELS, clampTransportEffort, formatEffortLevel, type TransportEffortLevel } from '@shared/effort-levels.js';
 import { resolveEffectiveSessionModel } from '@shared/session-model.js';
 import { CUSTOM_PROVIDER_SDK_AGENT_TYPES } from '@shared/cc-presets.js';
@@ -933,6 +933,7 @@ const CURSOR_HEADLESS_MODEL_SUGGESTIONS = ['gpt-5.2'] as const;
 const COPILOT_SDK_MODEL_SUGGESTIONS = ['gpt-5.4', 'gpt-5.4-mini'] as const;
 const GEMINI_SDK_MODEL_SUGGESTIONS = [...GEMINI_MODEL_IDS] as const;
 const MUSE_SDK_MODEL_SUGGESTIONS = ['muse-spark-1.3', 'muse-spark', 'muse-wonder', 'muse-fast'] as const;
+const AGY_SDK_MODEL_SUGGESTIONS = [...AGY_MODEL_IDS] as const;
 const P2P_BASE_MODES = ['solo', 'audit', 'review', 'plan', 'brainstorm', 'discuss', P2P_CONFIG_MODE] as const;
 const P2P_DROPDOWN_ROUND_OPTIONS = [1, 2, 3, 5] as const;
 const P2P_MODE_I18N: Record<string, string> = { solo: 'p2p.mode_solo', audit: 'p2p.mode_audit', review: 'p2p.mode_review', plan: 'p2p.mode_plan', brainstorm: 'p2p.mode_brainstorm', discuss: 'p2p.mode_discuss', [P2P_CONFIG_MODE]: 'p2p.mode_config' };
@@ -2078,7 +2079,9 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         ? mergeModelSuggestions(GEMINI_SDK_MODEL_SUGGESTIONS, dynamicModelIds)
         : isMuseSdk
           ? mergeModelSuggestions(MUSE_SDK_MODEL_SUGGESTIONS, dynamicModelIds)
-          : dynamicModelIds;
+          : isAgySdk
+            ? mergeModelSuggestions(AGY_SDK_MODEL_SUGGESTIONS, dynamicModelIds)
+            : dynamicModelIds;
     }
     if (isCopilot) {
       const probed = activeSession?.copilotAvailableModels;
@@ -2096,10 +2099,10 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     if (isMuseSdk) {
       return MUSE_SDK_MODEL_SUGGESTIONS;
     }
-    if (isKimiSdk || isHermesAgent) {
-      return dynamicTransportModels.models.map((m) => m.id);
+    if (isAgySdk) {
+      return AGY_SDK_MODEL_SUGGESTIONS;
     }
-    if (isGrokSdk || isAgySdk) {
+    if (isKimiSdk || isHermesAgent || isGrokSdk) {
       return dynamicTransportModels.models.map((m) => m.id);
     }
     if (activeSession?.agentType === CODEBUDDY_PROVIDER_IDS.CHINA) {

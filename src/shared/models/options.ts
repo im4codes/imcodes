@@ -59,6 +59,23 @@ export const MUSE_MODEL_IDS = [
 ] as const;
 export type MuseModelId = typeof MUSE_MODEL_IDS[number];
 
+export const AGY_MODEL_IDS = [
+  'gemini-4-argon-medium',
+  'gemini-4-argon-high',
+  'gemini-4-argon-low',
+  'gemini-3.8-flash-high',
+  'gemini-3.8-flash-medium',
+  'gemini-3.8-flash-low',
+  'claude-opus-5-5-medium',
+  'claude-opus-5-5-high',
+  'claude-opus-5-5-low',
+  'claude-sonnet-5-5-medium',
+  'claude-sonnet-5-5-high',
+  'claude-sonnet-5-5-low',
+  'gpt-oss-120b-medium',
+] as const;
+export type AgyModelId = typeof AGY_MODEL_IDS[number];
+
 export function mergeModelSuggestions(...groups: ReadonlyArray<readonly string[]>): string[] {
   return [...new Set(groups.flat())];
 }

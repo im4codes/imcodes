@@ -145,6 +145,7 @@ import { buildSessionList } from './session-list.js';
 import { setClaudeUsageQuotaOptIn, recordClaudeQuotaActivity } from '../agent/claude-usage-quota.js';
 import { getLastAgyQuotaActivityAt, recordAgyQuotaActivity, refreshAgyQuotaMetadata } from '../agent/agy-usage-quota.js';
 import { getLastGrokQuotaActivityAt, recordGrokQuotaActivity, refreshGrokQuotaMetadata } from '../agent/grok-usage-quota.js';
+import { getLastMuseQuotaActivityAt, recordMuseQuotaActivity, refreshMuseQuotaMetadata } from '../agent/muse-usage-quota.js';
 import { CLAUDE_QUOTA_MSG } from '../../shared/claude-quota.js';
 import { CODEX_RESET_CREDITS_MSG } from '../../shared/codex-reset-credits.js';
 import { CODEX_CREDIT_HISTORY_MSG, type CodexCreditSnapshot } from '../../shared/codex-credit-history.js';
@@ -223,7 +224,7 @@ import {
   collectRecentSummarySyncCandidates,
   fingerprintRecentSummary,
 } from '../context/summary-sync.js';
-import { CLAUDE_CODE_MODEL_IDS, CODEX_MODEL_IDS, GEMINI_MODEL_IDS, MUSE_MODEL_IDS, normalizeClaudeCodeModelId } from '../shared/models/options.js';
+import { AGY_MODEL_IDS, CLAUDE_CODE_MODEL_IDS, CODEX_MODEL_IDS, GEMINI_MODEL_IDS, MUSE_MODEL_IDS, normalizeClaudeCodeModelId } from '../shared/models/options.js';
 import type { TransportSessionRuntime } from '../agent/transport-session-runtime.js';
 import { getClaudeSdkRuntimeConfig, normalizeClaudeSdkModelForProvider } from '../agent/sdk-runtime-config.js';
 import { getCodexRuntimeConfig } from '../agent/codex-runtime-config.js';
@@ -1580,6 +1581,41 @@ export async function refreshGrokQuotaMetadataForSessions(serverLink?: ServerLin
 
   if (!serverLink) return;
   for (const session of grokSessions) {
+    if (!session.name.startsWith('deck_sub_')) continue;
+    const subId = session.name.replace(/^deck_sub_/, '');
+    try {
+      await sendSubSessionSync(serverLink, subId, undefined, getSubSessionSyncOptions(session.name));
+    } catch {
+      // not connected
+    }
+  }
+}
+
+/**
+ * Periodic quota refresh for muse-code-sdk sessions (main sessions and sub-sessions).
+ * Reads MSP subscription usage and pushes updated quota metadata to connected clients via handleGetSessions / sendSubSessionSync.
+ */
+export async function refreshMuseQuotaMetadataForSessions(serverLink?: ServerLink): Promise<void> {
+  const sessions = listSessions();
+  const museSessions = sessions.filter((s) => s.agentType === 'muse-code-sdk' && s.state !== 'stopped' && s.state !== 'error');
+  if (museSessions.length === 0) return;
+
+  const latestSessionActivityAt = Math.max(0, ...museSessions.map((s) => s.updatedAt || 0));
+  const effectiveLastActivityAt = Math.max(getLastMuseQuotaActivityAt(), latestSessionActivityAt);
+
+  const quota = await refreshMuseQuotaMetadata({
+    lastActivityAt: effectiveLastActivityAt,
+  }).catch(() => null);
+  if (!quota) return;
+
+  if (serverLink) {
+    await handleGetSessions(serverLink);
+  } else {
+    await buildSessionList();
+  }
+
+  if (!serverLink) return;
+  for (const session of museSessions) {
     if (!session.name.startsWith('deck_sub_')) continue;
     const subId = session.name.replace(/^deck_sub_/, '');
     try {
@@ -4225,6 +4261,7 @@ async function handleSendBound(cmd: Record<string, unknown>, serverLink: ServerL
   if (getSession(sessionName)?.agentType === 'claude-code-sdk') recordClaudeQuotaActivity();
   if (getSession(sessionName)?.agentType === 'agy-sdk') recordAgyQuotaActivity();
   if (getSession(sessionName)?.agentType === 'grok-sdk') recordGrokQuotaActivity();
+  if (getSession(sessionName)?.agentType === 'muse-code-sdk') recordMuseQuotaActivity();
 
   // Fallback: legacy clients that don't send commandId get a server-generated one
   const isLegacy = !commandId;
@@ -11856,7 +11893,20 @@ async function loadPassiveTransportListModels(agentType: string): Promise<Transp
       isAuthenticated: true,
     };
   }
-  if (agentType === 'cursor-headless' || agentType === 'kimi-sdk' || agentType === HERMES_AGENT_PROVIDER_ID || agentType === 'grok-sdk' || agentType === AGY_SDK_PROVIDER_ID
+  if (agentType === AGY_SDK_PROVIDER_ID) {
+    const { getProvider } = await import('../agent/provider-registry.js');
+    const provider = getProvider(AGY_SDK_PROVIDER_ID) as import('../agent/providers/agy-sdk.js').AgySdkProvider | undefined;
+    const cached = provider?.getCachedModels?.();
+    if (cached?.models?.length) {
+      return cached;
+    }
+    return {
+      models: modelIdsToTransportModels(AGY_MODEL_IDS),
+      defaultModel: AGY_MODEL_IDS[0],
+      isAuthenticated: true,
+    };
+  }
+  if (agentType === 'cursor-headless' || agentType === 'kimi-sdk' || agentType === HERMES_AGENT_PROVIDER_ID || agentType === 'grok-sdk'
     || agentType === 'deepseek-harness' || agentType === 'pi') {
     // DeepSeek Harness resolves provider routes and model catalogues from its
     // own `~/.dsh` configuration; IM.codes advertises no static list.

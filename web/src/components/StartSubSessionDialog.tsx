@@ -34,7 +34,7 @@ import {
   type CcPreset,
   type CcPresetAuthType,
 } from '@shared/cc-presets.js';
-import { CODEX_MODEL_IDS, GEMINI_MODEL_IDS, mergeModelSuggestions } from '../../../src/shared/models/options.js';
+import { AGY_MODEL_IDS, CODEX_MODEL_IDS, GEMINI_MODEL_IDS, mergeModelSuggestions } from '../../../src/shared/models/options.js';
 import { loadCodexModelPreference } from '../codex-model-preference.js';
 import {
   CODEBUDDY_CHINA_DEFAULT_MODEL,
@@ -53,6 +53,7 @@ const COPILOT_SDK_MODEL_SUGGESTIONS = ['gpt-5.4', 'gpt-5.4-mini'] as const;
 const CODEX_SDK_MODEL_SUGGESTIONS = [...CODEX_MODEL_IDS] as const;
 const GEMINI_SDK_MODEL_SUGGESTIONS = [...GEMINI_MODEL_IDS] as const;
 const MUSE_SDK_MODEL_SUGGESTIONS = ['muse-spark-1.3', 'muse-spark', 'muse-wonder', 'muse-fast'] as const;
+const AGY_SDK_MODEL_SUGGESTIONS = [...AGY_MODEL_IDS] as const;
 const responsiveDialogStyle = {
   // Hard-cap against the visual viewport instead of relying on flex padding.
   // iOS can still render a 380px fixed-ish dialog inside a 390px viewport,
@@ -383,6 +384,8 @@ export function StartSubSessionDialog({ ws, defaultCwd, allowedAgentTypes, overl
           ? mergeModelSuggestions(CODEX_SDK_MODEL_SUGGESTIONS, transportModels.models.map((model) => model.id))
         : type === 'muse-code-sdk'
           ? mergeModelSuggestions(MUSE_SDK_MODEL_SUGGESTIONS, transportModels.models.map((model) => model.id))
+        : type === AGY_SDK_PROVIDER_ID
+          ? mergeModelSuggestions(AGY_SDK_MODEL_SUGGESTIONS, transportModels.models.map((model) => model.id))
         : type === CODEBUDDY_PROVIDER_IDS.CHINA
           ? mergeModelSuggestions(CODEBUDDY_CHINA_MODEL_FALLBACK, transportModels.models.map((model) => model.id))
         : type === CODEBUDDY_PROVIDER_IDS.INTERNATIONAL
@@ -396,6 +399,8 @@ export function StartSubSessionDialog({ ws, defaultCwd, allowedAgentTypes, overl
           ? [...CURSOR_HEADLESS_MODEL_SUGGESTIONS]
         : type === 'muse-code-sdk'
           ? [...MUSE_SDK_MODEL_SUGGESTIONS]
+        : type === AGY_SDK_PROVIDER_ID
+          ? [...AGY_SDK_MODEL_SUGGESTIONS]
         : type === 'qwen'
             ? selectedPresetModels
             : type === 'gemini-sdk'
@@ -449,6 +454,17 @@ export function StartSubSessionDialog({ ws, defaultCwd, allowedAgentTypes, overl
       const trimmed = current.trim();
       if (trimmed && (modelSuggestions.length === 0 || modelSuggestions.includes(trimmed))) return trimmed;
       const fallback = transportModels.defaultModel ?? MUSE_SDK_MODEL_SUGGESTIONS[0];
+      if (modelSuggestions.length === 0 || modelSuggestions.includes(fallback)) return fallback;
+      return modelSuggestions[0] ?? fallback;
+    });
+  }, [type, modelSuggestions, transportModels.defaultModel]);
+
+  useEffect(() => {
+    if (type !== AGY_SDK_PROVIDER_ID) return;
+    setRequestedModel((current) => {
+      const trimmed = current.trim();
+      if (trimmed && (modelSuggestions.length === 0 || modelSuggestions.includes(trimmed))) return trimmed;
+      const fallback = transportModels.defaultModel ?? AGY_SDK_MODEL_SUGGESTIONS[0];
       if (modelSuggestions.length === 0 || modelSuggestions.includes(fallback)) return fallback;
       return modelSuggestions[0] ?? fallback;
     });

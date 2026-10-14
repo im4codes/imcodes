@@ -75,7 +75,7 @@ import {
   RuntimeModelPresetSelector,
   type RuntimeModelPresetEntry,
 } from './RuntimeModelPresetSelector.js';
-import { CLAUDE_CODE_MODEL_IDS, CODEX_MODEL_IDS, mergeModelSuggestions } from '../../../src/shared/models/options.js';
+import { AGY_MODEL_IDS, CLAUDE_CODE_MODEL_IDS, CODEX_MODEL_IDS, mergeModelSuggestions } from '../../../src/shared/models/options.js';
 import { getKnownQwenModelOptions } from '@shared/qwen-models.js';
 import { SessionIdentityTabs } from './SessionIdentityTabs.js';
 import { dispatchSessionModelSwitch } from '../session-model-switch.js';
@@ -942,7 +942,9 @@ export function SessionSettingsDialog({
           ? getKnownQwenModelOptions().map((entry) => entry.id)
           : agentType === 'muse-code-sdk'
             ? ['muse-spark-1.3', 'muse-spark', 'muse-wonder', 'muse-fast', 'wander']
-            : [];
+            : agentType === AGY_SDK_PROVIDER_ID
+              ? [...AGY_MODEL_IDS]
+              : [];
     return mergeModelSuggestions(
       [sessionModel, initialSessionModel, sessionDynamicModels.defaultModel, ...staticOptions].filter((value): value is string => !!value),
       sessionDynamicModels.models.map((entry) => entry.id),

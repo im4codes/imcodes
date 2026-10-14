@@ -383,6 +383,7 @@ export interface TransportRuntimeDiagnosticSnapshot {
 }
 
 const DEFAULT_TRANSPORT_PROVIDER_SEND_TIMEOUT_MS = 60_000;
+const DEFAULT_MUSE_TRANSPORT_PROVIDER_SEND_TIMEOUT_MS = 180_000;
 const DEFAULT_ACTIVE_DELEGATION_NOTIFICATION_TIMEOUT_MS = 10_000;
 const DEFAULT_TRANSPORT_STALE_PENDING_RECOVERY_MS = 300_000;
 const DEFAULT_TRANSPORT_STALE_PENDING_CANCEL_FALLBACK_MS = 5_000;
@@ -446,7 +447,30 @@ function isRecoverableProviderBusyError(error: ProviderError): boolean {
     && /already busy|session is busy|provider is busy/i.test(error.message);
 }
 
-export function getTransportProviderSendTimeoutMs(): number {
+export function getTransportProviderSendTimeoutMs(providerId?: string): number {
+  if (providerId === 'muse-code-sdk') {
+    const museSpecific = process.env.IMCODES_TRANSPORT_MUSE_PROVIDER_SEND_TIMEOUT_MS;
+    if (museSpecific) {
+      return readBoundedTimeoutMs(
+        'IMCODES_TRANSPORT_MUSE_PROVIDER_SEND_TIMEOUT_MS',
+        DEFAULT_MUSE_TRANSPORT_PROVIDER_SEND_TIMEOUT_MS,
+        MIN_TRANSPORT_PROVIDER_SEND_TIMEOUT_MS,
+        MAX_TRANSPORT_PROVIDER_SEND_TIMEOUT_MS,
+        { allowZero: true },
+      );
+    }
+    const genericEnv = process.env.IMCODES_TRANSPORT_PROVIDER_SEND_TIMEOUT_MS;
+    if (genericEnv) {
+      return readBoundedTimeoutMs(
+        'IMCODES_TRANSPORT_PROVIDER_SEND_TIMEOUT_MS',
+        DEFAULT_MUSE_TRANSPORT_PROVIDER_SEND_TIMEOUT_MS,
+        MIN_TRANSPORT_PROVIDER_SEND_TIMEOUT_MS,
+        MAX_TRANSPORT_PROVIDER_SEND_TIMEOUT_MS,
+        { allowZero: true },
+      );
+    }
+    return DEFAULT_MUSE_TRANSPORT_PROVIDER_SEND_TIMEOUT_MS;
+  }
   return readBoundedTimeoutMs(
     'IMCODES_TRANSPORT_PROVIDER_SEND_TIMEOUT_MS',
     DEFAULT_TRANSPORT_PROVIDER_SEND_TIMEOUT_MS,
@@ -4889,7 +4913,7 @@ export class TransportSessionRuntime implements SessionRuntime {
             filePath: input.authoredContextFilePath,
           });
         },
-        sendTimeoutMs: getTransportProviderSendTimeoutMs(),
+        sendTimeoutMs: getTransportProviderSendTimeoutMs(this.provider.id),
         onBeforeProviderSend: () => {
           if (this.isDispatchLocallyCancelled(dispatchId)) {
             throw makeCancelledProviderError();

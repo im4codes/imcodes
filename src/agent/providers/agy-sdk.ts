@@ -67,7 +67,7 @@ import {
 } from '../../../shared/memory-ws.js';
 import { recordAgyQuotaActivity, refreshAgyQuotaMetadata } from '../agy-usage-quota.js';
 
-const MODEL_CACHE_TTL_MS = 60_000;
+const MODEL_CACHE_TTL_MS = 10 * 60_000;
 const MODEL_PROBE_TIMEOUT_MS = 30_000;
 const KILL_GRACE_MS = 2_000;
 const STDERR_TAIL_BYTES = 2_048;
@@ -272,6 +272,10 @@ export class AgySdkProvider implements TransportProvider {
   private readonly usageCallbacks = new Set<(sessionId: string, update: ProviderUsageUpdate) => void>();
   private readonly statusCallbacks = new Set<(sessionId: string, status: ProviderStatusUpdate) => void>();
   private modelCache: { at: number; list: ProviderModelList } | null = null;
+
+  getCachedModels(): ProviderModelList | null {
+    return this.modelCache?.list ?? null;
+  }
 
   // ── Lifecycle ──────────────────────────────────────────────────────────────
 
@@ -497,10 +501,15 @@ export class AgySdkProvider implements TransportProvider {
       const models = parseAgyModelList(stdout);
       const list: ProviderModelList = models.length > 0
         ? { models, defaultModel: models[0]?.id, isAuthenticated: true }
-        : { models: [], isAuthenticated: false, error: 'agy returned no models. Run `agy` once to sign in.' };
+        : (this.modelCache?.list?.models?.length
+          ? this.modelCache.list
+          : { models: [], isAuthenticated: false, error: 'agy returned no models. Run `agy` once to sign in.' });
       if (models.length > 0) this.modelCache = { at: now, list };
       return list;
     } catch (err) {
+      if (this.modelCache?.list?.models?.length) {
+        return this.modelCache.list;
+      }
       const code = (err as NodeJS.ErrnoException).code;
       const error = code === 'ENOENT'
         ? `The Antigravity CLI (\`${AGY_CLI_BINARY}\`) was not found.`

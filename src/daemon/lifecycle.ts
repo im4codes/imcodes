@@ -18,7 +18,7 @@ import { repoCache, RepoCache } from '../repo/cache.js';
 import { ServerLink, setServerLinkDisconnectSecurityHandler, setServerLinkReconnectResyncHandler } from './server-link.js';
 import { DaemonRemoteDesktop } from './remote-desktop-daemon.js';
 import { closeDaemonRemoteDesktop, refreshDaemonRemoteDesktop, setDaemonRemoteDesktop } from './remote-desktop-registry.js';
-import { handleWebCommand, setRouterContext, refreshCodexQuotaMetadata, refreshClaudeSdkSubQuotaMetadata, refreshAgyQuotaMetadataForSessions, refreshGrokQuotaMetadataForSessions } from './command-handler.js';
+import { handleWebCommand, setRouterContext, refreshCodexQuotaMetadata, refreshClaudeSdkSubQuotaMetadata, refreshAgyQuotaMetadataForSessions, refreshGrokQuotaMetadataForSessions, refreshMuseQuotaMetadataForSessions } from './command-handler.js';
 import { dispatchSessionMessageByName } from './session-dispatch.js';
 import { dispatchReadyAuditSweep } from './send-tool.js';
 import { initFileTransfer, startCleanupTimer } from './file-transfer-handler.js';
@@ -2639,6 +2639,10 @@ function startCodexQuotaPoller(serverLink: ServerLink | null): void {
     // grok-sdk sessions probe Grok CLI billing endpoint.
     void refreshGrokQuotaMetadataForSessions(serverLink).catch((err) => {
       logger.warn({ err }, 'Grok quota refresh failed');
+    });
+    // muse-code-sdk sessions probe Muse MSP subscription usage.
+    void refreshMuseQuotaMetadataForSessions(serverLink).catch((err) => {
+      logger.warn({ err }, 'Muse quota refresh failed');
     });
   }, CODEX_QUOTA_REFRESH_MS);
 }

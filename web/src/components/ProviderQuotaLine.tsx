@@ -8,7 +8,7 @@ import { AGY_SDK_PROVIDER_ID } from '@shared/agy-agent.js';
 import { isMobileLayout } from '../mobile-device.js';
 
 export function isCompactProviderQuotaAgent(agentType: string | null | undefined): boolean {
-  return agentType === 'codex' || agentType === 'codex-sdk' || agentType === 'claude-code-sdk' || agentType === AGY_SDK_PROVIDER_ID || agentType === 'grok-sdk';
+  return agentType === 'codex' || agentType === 'codex-sdk' || agentType === 'claude-code-sdk' || agentType === AGY_SDK_PROVIDER_ID || agentType === 'grok-sdk' || agentType === 'muse-code-sdk';
 }
 
 /**

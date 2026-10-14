@@ -28,6 +28,7 @@ const ALLOWED: Record<string, string> = {
   'src/agent/provider-quota.ts': 'tmpdir() store under test',
   'src/agent/claude-usage-quota.ts': 'tmpdir() store under test',
   'src/agent/grok-usage-quota.ts': 'tmpdir() store under test',
+  'src/agent/muse-usage-quota.ts': 'tmpdir() store under test',
   'shared/skill-store.ts': 'getUserSkillRoot(homeDir, stateDir): the explicit-account-home default; shared/ cannot import src/',
   'shared/capability-management.ts': 'managed-skill root segments under an explicit account home',
   'scripts/restart-daemon.sh': 'restarts the DEFAULT launchd service (label imcodes.daemon), which by definition lives in $HOME/.imcodes',

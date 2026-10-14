@@ -73,6 +73,14 @@ import {
 } from '../../../shared/sdk-subagent-status.js';
 import type { ProviderActiveWorkSnapshot, SessionActivityBusyReason } from '../../../shared/session-activity-types.js';
 import logger from '../../util/logger.js';
+import {
+  recordMuseQuotaActivity,
+  refreshMuseQuotaMetadata,
+  registerMuseUsageReader,
+  updateMuseUsageQuota,
+  peekMuseUsageQuotaCached,
+  type MuseSubscriptionUsage,
+} from '../muse-usage-quota.js';
 
 export const MUSE_CODE_SDK_PROVIDER_ID = 'muse-code-sdk';
 
@@ -219,7 +227,7 @@ function parseJsonSafe(value: unknown): unknown {
  * with no event for 90-100s+ until interrupted. Override for tests or tuning
  * with IMCODES_MUSE_FIRST_ACTIVITY_TIMEOUT_MS.
  */
-export const MUSE_FIRST_ACTIVITY_TIMEOUT_DEFAULT_MS = 90_000;
+export const MUSE_FIRST_ACTIVITY_TIMEOUT_DEFAULT_MS = 180_000;
 /** After the watchdog interrupts, how long to wait for the host to settle the turn before giving up on it. */
 const MUSE_STALL_INTERRUPT_GRACE_MS = 10_000;
 function museFirstActivityTimeoutMs(): number {
@@ -376,6 +384,7 @@ export class MuseCodeSdkProvider implements TransportProvider {
   private spawned: SpawnedMspConnection | null = null;
   private sessions = new Map<string, MuseSessionState>();
   private mcpRegistration: MuseMcpEnsureResult | null = null;
+  private unregisterUsageReader: (() => void) | null = null;
 
   private deltaCallbacks = new Set<(sessionId: string, delta: MessageDelta) => void>();
   private completeCallbacks = new Set<(sessionId: string, message: AgentMessage) => void>();
@@ -450,6 +459,29 @@ export class MuseCodeSdkProvider implements TransportProvider {
         durability: readSessionDurability(this.spawned.initializeResult),
       });
 
+      this.spawned.connection.onNotification((notif) => {
+        if (notif.method === 'usage/changed' && notif.params) {
+          const rawUsage = (notif.params as any).usage ?? notif.params;
+          if (rawUsage && typeof rawUsage === 'object') {
+            recordMuseQuotaActivity();
+            updateMuseUsageQuota(rawUsage as any);
+            this.emitQuotaUpdate();
+            void refreshMuseQuotaMetadata().catch(() => {});
+          }
+        }
+      });
+
+      this.unregisterUsageReader?.();
+      this.unregisterUsageReader = registerMuseUsageReader(async () => {
+        if (!this.spawned?.connection) return null;
+        try {
+          const res = await this.spawned.connection.request('usage/read', {});
+          return (res?.usage as MuseSubscriptionUsage) ?? null;
+        } catch {
+          return null;
+        }
+      });
+
       logger.info(
         {
           provider: this.id,
@@ -487,6 +519,8 @@ export class MuseCodeSdkProvider implements TransportProvider {
       }
       this.client = null;
     }
+    this.unregisterUsageReader?.();
+    this.unregisterUsageReader = null;
     this.spawned = null;
     this.config = null;
   }
@@ -584,9 +618,12 @@ export class MuseCodeSdkProvider implements TransportProvider {
     session.onApproval((request) => this.handleApprovalRequest(routeId, request));
 
     this.sessions.set(routeId, state);
+    const cachedQuota = peekMuseUsageQuotaCached();
     this.emitSessionInfo(routeId, {
       resumeId: session.sessionId,
       ...(state.model ? { model: state.model } : {}),
+      ...(cachedQuota?.quotaLabel ? { quotaLabel: cachedQuota.quotaLabel } : {}),
+      ...(cachedQuota?.quotaMeta ? { quotaMeta: cachedQuota.quotaMeta } : {}),
     });
 
     return routeId;
@@ -945,6 +982,19 @@ export class MuseCodeSdkProvider implements TransportProvider {
           },
         };
         this.emitComplete(sessionId, agentMessage);
+        recordMuseQuotaActivity();
+        if (this.spawned?.connection) {
+          try {
+            const res = await this.spawned.connection.request('usage/read', {});
+            if (res?.usage) {
+              updateMuseUsageQuota(res.usage as any);
+              this.emitQuotaUpdate();
+            }
+          } catch (err) {
+            logger.debug({ err }, 'Failed to read usage from Muse connection');
+          }
+        }
+        void refreshMuseQuotaMetadata().catch(() => {});
       } else if (outcome.kind === 'unqueued') {
         this.emitError(sessionId, {
           code: PROVIDER_ERROR_CODES.PROVIDER_ERROR,
@@ -1304,6 +1354,17 @@ export class MuseCodeSdkProvider implements TransportProvider {
       } catch (err) {
         logger.error({ err }, 'Error in onSessionInfo callback');
       }
+    }
+  }
+
+  private emitQuotaUpdate(): void {
+    const quota = peekMuseUsageQuotaCached();
+    if (!quota) return;
+    for (const [routeId] of this.sessions) {
+      this.emitSessionInfo(routeId, {
+        ...(quota.quotaLabel ? { quotaLabel: quota.quotaLabel } : {}),
+        ...(quota.quotaMeta ? { quotaMeta: quota.quotaMeta } : {}),
+      });
     }
   }
 }

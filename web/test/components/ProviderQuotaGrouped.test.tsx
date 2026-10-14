@@ -98,6 +98,7 @@ describe('ProviderQuotaLine and UsageFooter grouped quota rendering', () => {
     expect(isCompactProviderQuotaAgent('codex-sdk')).toBe(true);
     expect(isCompactProviderQuotaAgent('claude-code-sdk')).toBe(true);
     expect(isCompactProviderQuotaAgent('grok-sdk')).toBe(true);
+    expect(isCompactProviderQuotaAgent('muse-code-sdk')).toBe(true);
     expect(isCompactProviderQuotaAgent('gemini')).toBe(false);
     expect(isCompactProviderQuotaAgent('shell')).toBe(false);
     expect(isCompactProviderQuotaAgent('script')).toBe(false);

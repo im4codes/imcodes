@@ -63,3 +63,22 @@ export const PROVIDER_QUOTA_GROUP_LABEL = {
   GEMINI: 'Gemini',
   CLAUDE_GPT: 'Claude/GPT',
 } as const;
+
+/** Canonical static/fallback models for `agy-sdk` used when CLI probe is pending or unauthenticated. */
+export const AGY_FALLBACK_MODEL_IDS = [
+  'gemini-4-argon-medium',
+  'gemini-4-argon-high',
+  'gemini-4-argon-low',
+  'gemini-3.8-flash-high',
+  'gemini-3.8-flash-medium',
+  'gemini-3.8-flash-low',
+  'claude-opus-5-5-medium',
+  'claude-opus-5-5-high',
+  'claude-opus-5-5-low',
+  'claude-sonnet-5-5-medium',
+  'claude-sonnet-5-5-high',
+  'claude-sonnet-5-5-low',
+  'gpt-oss-120b-medium',
+] as const;
+
+export const AGY_DEFAULT_MODEL_ID = 'gemini-4-argon-medium' as const;
