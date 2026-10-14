@@ -350,10 +350,9 @@ export function useTransportModels(
       }));
     });
 
-    // Grok, Hermes, and OpenCode have no safe hardcoded model roster. Their live
-    // provider catalogs are the authoritative binary/authentication check, so
-    // the first picker load must actively connect instead of asking for the
-    // passive fallback (which is intentionally empty for these providers).
+    // Grok, Hermes, Antigravity, and OpenCode require a live provider catalog
+    // check on load: their models depend on the local binary/auth state and
+    // must actively probe (`force: true`) so dynamic models and auth status are resolved.
     // DeepSeek Harness deliberately stays off this list: `dsh` resolves its
     // provider routes and model ids from its own `~/.dsh` config, so the
     // daemon's catalog is a constant empty list and a forced probe would only
@@ -361,6 +360,7 @@ export function useTransportModels(
     if (wsConnected) fetchModels(
       agentType === 'grok-sdk'
       || agentType === HERMES_AGENT_PROVIDER_ID
+      || agentType === AGY_SDK_PROVIDER_ID
       || agentType === 'opencode-sdk',
     );
     return unsub;
