@@ -28,7 +28,7 @@ const fs = require('node:fs');
 const args = process.argv.slice(2);
 if (process.env.FAKE_AGY_ARGS_FILE) fs.appendFileSync(process.env.FAKE_AGY_ARGS_FILE, JSON.stringify(args) + '\\n');
 if (args[0] === 'models') {
-  process.stdout.write('Fetching available models...\\ngemini-3.8-flash-high\\tGemini 3.8 Flash (High)\\nclaude-sonnet-5-5-low\\tClaude Sonnet 5.5 (Low)\\n');
+  process.stdout.write('Fetching available models...\\nclaude-sonnet-5-5-low\\tClaude Sonnet 5.5 (Low)\\ngemini-3.8-flash-high\\tGemini 3.8 Flash (High)\\n');
   process.exit(0);
 }
 if (args[0] === '--help') { process.stdout.write('Usage of agy:\\n'); process.exit(0); }
@@ -125,6 +125,14 @@ describe('agy-sdk helpers', () => {
     ]);
   });
 
+  it('defaults fresh and resumed launch argv to Flash High without overwriting explicit models', () => {
+    for (const opts of [{}, { model: '' }, { conversationId: 'persisted-1' }]) {
+      const args = buildAgyArgs(opts);
+      expect(args.slice(args.indexOf('--model'), args.indexOf('--model') + 2)).toEqual(['--model', 'gemini-3.8-flash-high']);
+      expect(args.at(-1)).toBe(AGY_CLI_FLAG.PRINT_STDIN);
+    }
+  });
+
   it('encodes one NDJSON user line', () => {
     const line = encodeAgyUserLine('hi\nthere');
     expect(line.endsWith('\n')).toBe(true);
@@ -206,6 +214,8 @@ describe('AgySdkProvider (fake agy process)', () => {
     expect(completes[0][1].id).toBe(deltas[0][1].messageId);
     expect(infos.some(([, i]) => typeof i.resumeId === 'string' && i.resumeId.startsWith('conv-'))).toBe(true);
     expect(launches()[0]).toContain('--dangerously-skip-permissions');
+    const args = launches()[0];
+    expect(args.slice(args.indexOf('--model'), args.indexOf('--model') + 2)).toEqual(['--model', 'gemini-3.8-flash-high']);
     expect(launches()[0]).not.toContain('--conversation');
   });
 
@@ -339,12 +349,20 @@ describe('AgySdkProvider (fake agy process)', () => {
   it('lists models from `agy models` with caching', async () => {
     const first = await provider.listModels();
     expect(first.isAuthenticated).toBe(true);
-    expect(first.models.map((m) => m.id)).toEqual(['gemini-3.8-flash-high', 'claude-sonnet-5-5-low']);
+    expect(first.models.map((m) => m.id)).toEqual(['claude-sonnet-5-5-low', 'gemini-3.8-flash-high']);
+    expect(first.defaultModel).toBe('gemini-3.8-flash-high');
     await provider.listModels();
     const modelProbes = readFileSync(argsFile, 'utf8').trim().split('\n').filter((l) => l.includes('"models"'));
     expect(modelProbes).toHaveLength(1);
     await provider.listModels(true);
     expect(readFileSync(argsFile, 'utf8').trim().split('\n').filter((l) => l.includes('"models"'))).toHaveLength(2);
+  });
+
+  it('uses an advertised model as the catalog fallback when the preferred model is unavailable', async () => {
+    writeFileSync(path.join(dir, 'agy'), FAKE_AGY.replaceAll('gemini-3.8-flash-high', 'gemini-4-argon-medium'));
+    const list = await provider.listModels(true);
+    expect(list.defaultModel).toBe('claude-sonnet-5-5-low');
+    expect(list.models.map((model) => model.id)).toContain(list.defaultModel);
   });
 
   it('reports a config error when the binary is missing', async () => {

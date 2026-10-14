@@ -1187,6 +1187,15 @@ describe('NewSessionDialog', () => {
     expect((await screen.findByRole('alert')).textContent).toContain('grok_prerequisite_error');
   });
 
+  it('keeps Antigravity options and Flash High default available offline', async () => {
+    const ws = Object.assign(makeWs(), { connected: false });
+    render(<NewSessionDialog ws={ws as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
+    selectAgent(AGY_SDK_PROVIDER_ID);
+    expect(await screen.findByRole('option', { name: 'gemini-3.8-flash-high' })).toBeDefined();
+    const option = screen.getByRole('option', { name: 'gemini-3.8-flash-high' });
+    expect((option.parentElement as HTMLSelectElement).value).toBe('gemini-3.8-flash-high');
+  });
+
   it('uses dynamically discovered agy-sdk models when starting a session', async () => {
     const ws = makeWs();
     render(<NewSessionDialog ws={ws as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);

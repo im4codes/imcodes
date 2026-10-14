@@ -1,7 +1,7 @@
 /**
  * @vitest-environment jsdom
  */
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { supportsDynamicTransportModels } from '../../src/hooks/useTransportModels.js';
 import { CODEBUDDY_PROVIDER_IDS } from '@shared/codebuddy.js';
 import { AGY_SDK_PROVIDER_ID } from '@shared/agy-agent.js';
@@ -74,12 +74,13 @@ describe('useTransportModels caching and fallbacks', () => {
     expect(fallback).not.toBeNull();
     expect(fallback?.models.length).toBeGreaterThan(0);
     expect(fallback?.models.map((m) => m.id)).toContain('gemini-4-argon-medium');
-    expect(fallback?.defaultModel).toBe('gemini-4-argon-medium');
+    expect(fallback?.defaultModel).toBe('gemini-3.8-flash-high');
   });
 
   it('initializes useTransportModels with static fallback for AGY so initial state is never empty', () => {
     const { result } = renderHook(() => useTransportModels(null, AGY_SDK_PROVIDER_ID));
     expect(result.current.models.length).toBeGreaterThan(0);
+    expect(result.current.defaultModel).toBe('gemini-3.8-flash-high');
     expect(result.current.models.map((m) => m.id)).toContain('gemini-4-argon-medium');
   });
 
@@ -153,4 +154,122 @@ describe('useTransportModels caching and fallbacks', () => {
     expect(result.current.models.length).toBe(initialCount);
     expect(result.current.error).toBe('timeout probe');
   });
+  it('keeps the fallback and default when refresh is clicked while disconnected', () => {
+    const { result } = renderHook(() => useTransportModels(null, AGY_SDK_PROVIDER_ID));
+    act(() => result.current.refresh());
+    expect(result.current.models.length).toBeGreaterThan(0);
+    expect(result.current.defaultModel).toBe('gemini-3.8-flash-high');
+    expect(result.current.loading).toBe(false);
+  });
+
+  it('uses Antigravity fallback when agent information arrives after mount without a socket', () => {
+    const { result, rerender } = renderHook(({ agent }) => useTransportModels(null, agent), { initialProps: { agent: null as string | null } });
+    expect(result.current.models).toEqual([]);
+    rerender({ agent: AGY_SDK_PROVIDER_ID });
+    expect(result.current.models.length).toBeGreaterThan(0);
+    expect(result.current.defaultModel).toBe('gemini-3.8-flash-high');
+  });
+
+  it('retains models and reports errors when the live catalog dispatch throws', () => {
+    const ws = {
+      connected: true,
+      onMessage: () => () => {},
+      requestTransportModels: () => { throw new Error('socket went away'); },
+    } as unknown as WsClient;
+    const { result } = renderHook(() => useTransportModels(ws, AGY_SDK_PROVIDER_ID));
+    expect(result.current.models.length).toBeGreaterThan(0);
+    expect(result.current.defaultModel).toBe('gemini-3.8-flash-high');
+    expect(result.current.error).toBe('socket went away');
+    expect(result.current.loading).toBe(false);
+  });
+
+  it('keeps a live catalog and its metadata through refresh failure and an empty error reply', () => {
+    let listener: ((msg: unknown) => void) | undefined;
+    const request = vi.fn(() => 'live-request');
+    const ws = { connected: true, onMessage: (cb: (msg: unknown) => void) => { listener = cb; return () => {}; }, requestTransportModels: request } as unknown as WsClient;
+    const { result } = renderHook(() => useTransportModels(ws, AGY_SDK_PROVIDER_ID));
+    act(() => listener?.({ type: TRANSPORT_MSG.MODELS_RESPONSE, agentType: AGY_SDK_PROVIDER_ID, requestId: 'live-request', models: [{ id: 'live-only' }], defaultModel: 'live-only', isAuthenticated: true }));
+    request.mockImplementationOnce(() => { throw new Error('refresh failed'); });
+    act(() => result.current.refresh());
+    expect(result.current.models).toEqual([{ id: 'live-only' }]);
+    expect(result.current.defaultModel).toBe('live-only');
+    act(() => listener?.({ type: TRANSPORT_MSG.MODELS_RESPONSE, agentType: AGY_SDK_PROVIDER_ID, models: [], error: 'probe timeout' }));
+    expect(result.current.models).toEqual([{ id: 'live-only' }]);
+    expect(result.current.defaultModel).toBe('live-only');
+    expect(result.current.isAuthenticated).toBe(true);
+    expect(result.current.error).toBe('probe timeout');
+  });
+
+  it('does not replace the refreshed catalog with an older response or another session broadcast', () => {
+    let listener: ((msg: unknown) => void) | undefined;
+    let seq = 0;
+    const ws = { connected: true, onMessage: (cb: (msg: unknown) => void) => { listener = cb; return () => {}; }, requestTransportModels: () => `req-${++seq}` } as unknown as WsClient;
+    const { result } = renderHook(() => useTransportModels(ws, AGY_SDK_PROVIDER_ID, null, 'current-session'));
+    act(() => result.current.refresh());
+    act(() => listener?.({ type: TRANSPORT_MSG.MODELS_RESPONSE, agentType: AGY_SDK_PROVIDER_ID, requestId: 'req-2', models: [{ id: 'current' }] }));
+    act(() => listener?.({ type: TRANSPORT_MSG.MODELS_RESPONSE, agentType: AGY_SDK_PROVIDER_ID, requestId: 'req-1', models: [{ id: 'stale' }] }));
+    act(() => listener?.({ type: TRANSPORT_MSG.MODELS_RESPONSE, agentType: AGY_SDK_PROVIDER_ID, sessionName: 'other-session', models: [{ id: 'foreign' }] }));
+    expect(result.current.models).toEqual([{ id: 'current' }]);
+  });
+
+  it('settles synchronous queue-full responses instead of leaving the fallback loading forever', () => {
+    let listener: ((msg: unknown) => void) | undefined;
+    const ws = {
+      connected: true,
+      onMessage: (cb: (msg: unknown) => void) => { listener = cb; return () => {}; },
+      requestTransportModels: () => {
+        listener?.({ type: TRANSPORT_MSG.MODELS_RESPONSE, agentType: AGY_SDK_PROVIDER_ID, requestId: 'queue-full', models: [], error: 'queue_full' });
+        return 'queue-full';
+      },
+    } as unknown as WsClient;
+    const { result } = renderHook(() => useTransportModels(ws, AGY_SDK_PROVIDER_ID));
+    expect(result.current.models.length).toBeGreaterThan(0);
+    expect(result.current.defaultModel).toBe('gemini-3.8-flash-high');
+    expect(result.current.loading).toBe(false);
+    expect(result.current.error).toBe('queue_full');
+  });
+
+  it('rejects blank model IDs instead of replacing fallback options with invisible rows', () => {
+    let listener: ((msg: unknown) => void) | undefined;
+    const ws = { connected: true, onMessage: (cb: (msg: unknown) => void) => { listener = cb; return () => {}; }, requestTransportModels: () => 'invalid-ids' } as unknown as WsClient;
+    const { result } = renderHook(() => useTransportModels(ws, AGY_SDK_PROVIDER_ID));
+    const before = result.current.models;
+    act(() => listener?.({ type: TRANSPORT_MSG.MODELS_RESPONSE, agentType: AGY_SDK_PROVIDER_ID, requestId: 'invalid-ids', models: [{ id: '' }, { id: '  ' }, { id: null }] }));
+    expect(result.current.models).toEqual(before);
+    expect(result.current.loading).toBe(false);
+  });
+
+  it('refreshes on reconnect using the live socket flag and retains models during the probe', () => {
+    let listener: ((msg: unknown) => void) | undefined;
+    const request = vi.fn(() => 'reconnect');
+    const ws = { connected: false, onMessage: (cb: (msg: unknown) => void) => { listener = cb; return () => {}; }, requestTransportModels: request } as unknown as WsClient;
+    const { result } = renderHook(() => useTransportModels(ws, AGY_SDK_PROVIDER_ID));
+    expect(request).not.toHaveBeenCalled();
+    (ws as unknown as { connected: boolean }).connected = true;
+    act(() => listener?.({ type: 'daemon.reconnected' }));
+    expect(request).toHaveBeenCalled();
+    expect(result.current.models.length).toBeGreaterThan(0);
+    expect(result.current.loading).toBe(true);
+    act(() => listener?.({ type: TRANSPORT_MSG.MODELS_RESPONSE, agentType: AGY_SDK_PROVIDER_ID, requestId: 'reconnect', models: [{ id: 'live-reconnected' }] }));
+    expect(result.current.models).toEqual([{ id: 'live-reconnected' }]);
+    expect(result.current.loading).toBe(false);
+  });
+
+  it.each(['cached-session\0agy-sdk\0', '\0agy-sdk\0'])('ignores persisted blank catalogs at %s and falls back immediately', (key) => {
+    window.sessionStorage.setItem('imcodes:transport-models:' + key, JSON.stringify({ models: [{ id: '' }, { id: '  ' }] }));
+    const { result } = renderHook(() => useTransportModels(null, AGY_SDK_PROVIDER_ID, null, 'cached-session'));
+    expect(result.current.models.length).toBeGreaterThan(0);
+    expect(result.current.models.every((model) => model.id.trim().length > 0)).toBe(true);
+  });
+
+  it('updates old persisted catalog defaults to Flash High without losing model options', () => {
+    window.sessionStorage.setItem('imcodes:transport-models:old-session\0agy-sdk\0', JSON.stringify({
+      models: [{ id: 'gemini-4-argon-medium' }, { id: 'gemini-3.8-flash-high' }],
+      defaultModel: 'gemini-4-argon-medium',
+    }));
+    const { result } = renderHook(() => useTransportModels(null, AGY_SDK_PROVIDER_ID, null, 'old-session'));
+    expect(result.current.models).toHaveLength(2);
+    expect(result.current.defaultModel).toBe('gemini-3.8-flash-high');
+  });
+
 });

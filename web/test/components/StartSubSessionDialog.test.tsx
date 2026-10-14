@@ -3,7 +3,7 @@
  */
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { h } from 'preact';
-import { render, screen, cleanup, fireEvent, waitFor } from '@testing-library/preact';
+import { render, screen, cleanup, fireEvent, waitFor, act } from '@testing-library/preact';
 import { DEFAULT_CODEX_SESSION_MODEL } from '../../../src/shared/models/options.js';
 import { AGY_SDK_PROVIDER_ID } from '../../../shared/agy-agent.js';
 import { HERMES_AGENT_PROVIDER_ID } from '../../../shared/hermes-agent.js';
@@ -892,6 +892,15 @@ describe('StartSubSessionDialog', () => {
     expect(onStart).toHaveBeenCalledWith('grok-sdk', undefined, '/tmp', undefined, {
       requestedModel: 'grok-build',
     });
+  });
+
+  it('shows Antigravity sub-session options while disconnected', async () => {
+    render(<StartSubSessionDialog ws={Object.assign(makeWs(), { connected: false }) as any} defaultCwd="/tmp" isProviderConnected={() => false} getRemoteSessions={() => []} refreshSessions={vi.fn()} onStart={vi.fn()} onClose={vi.fn()} />);
+    fireEvent.click(screen.getByRole('button', { name: /agy_sdk/i }));
+    const input = screen.getByPlaceholderText('selectModel') as HTMLInputElement;
+    act(() => input.focus());
+    await waitFor(() => expect(screen.getByRole('option', { name: 'gemini-3.8-flash-high' })).toBeDefined());
+    expect(input.value).toBe('gemini-3.8-flash-high');
   });
 
   it('passes a dynamically selected model for agy-sdk sub-sessions', () => {

@@ -150,7 +150,7 @@ import { CLAUDE_QUOTA_MSG } from '../../shared/claude-quota.js';
 import { CODEX_RESET_CREDITS_MSG } from '../../shared/codex-reset-credits.js';
 import { CODEX_CREDIT_HISTORY_MSG, type CodexCreditSnapshot } from '../../shared/codex-credit-history.js';
 import { HERMES_AGENT_PROVIDER_ID } from '../../shared/hermes-agent.js';
-import { AGY_SDK_PROVIDER_ID } from '../../shared/agy-agent.js';
+import { AGY_DEFAULT_MODEL_ID, AGY_SDK_PROVIDER_ID } from '../../shared/agy-agent.js';
 import { PROVIDER_ERROR_CODES } from '../agent/transport-provider.js';
 import { refreshCodexQuotaMetadataForSessions } from './codex-quota-refresh.js';
 import { fetchCodexResetCredits, consumeCodexResetCredit } from '../agent/codex-reset-credits.js';
@@ -11902,7 +11902,7 @@ async function loadPassiveTransportListModels(agentType: string): Promise<Transp
     }
     return {
       models: modelIdsToTransportModels(AGY_MODEL_IDS),
-      defaultModel: AGY_MODEL_IDS[0],
+      defaultModel: AGY_DEFAULT_MODEL_ID,
       isAuthenticated: true,
     };
   }

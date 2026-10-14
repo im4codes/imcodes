@@ -263,6 +263,12 @@ describe('SessionSettingsDialog supervision', () => {
     expect(screen.queryByRole('button', { name: 'apply' })).toBeNull();
   });
 
+  it('keeps Antigravity settings options when model discovery cannot dispatch', () => {
+    const ws = Object.assign(makeIdentityAckWs(), { requestTransportModels: () => { throw new Error('offline probe'); } });
+    render(<SessionSettingsDialog serverId="srv-1" sessionName="agy-settings" label="AG" description="" cwd="/proj" type="agy-sdk" activeModel={null} requestedModel={null} transportConfig={null} surface="session" ws={ws as any} onClose={vi.fn()} onSaved={vi.fn()} />);
+    expect(screen.getByRole('option', { name: 'gemini-3.8-flash-high' })).toBeDefined();
+  });
+
   it('reports a model command dispatch failure without closing the settings dialog', async () => {
     const ws = makeIdentityAckWs();
     ws.sendSessionMessage.mockImplementation(() => { throw new Error('offline'); });

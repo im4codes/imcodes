@@ -81,4 +81,4 @@ export const AGY_FALLBACK_MODEL_IDS = [
   'gpt-oss-120b-medium',
 ] as const;
 
-export const AGY_DEFAULT_MODEL_ID = 'gemini-4-argon-medium' as const;
+export const AGY_DEFAULT_MODEL_ID = 'gemini-3.8-flash-high' as const;

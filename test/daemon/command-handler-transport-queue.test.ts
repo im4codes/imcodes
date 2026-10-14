@@ -3748,6 +3748,22 @@ describe('handleWebCommand transport queue behavior', () => {
     }));
   });
 
+  it('advertises Flash High as the passive Antigravity default without launching a provider', async () => {
+    getProviderMock.mockReturnValue(undefined);
+    handleWebCommand({ type: 'transport.list_models', agentType: AGY_SDK_PROVIDER_ID, requestId: 'passive-agy-default' }, serverLink as any);
+    await waitForAsync(() => serverLink.send.mock.calls.some((call) => (
+      (call[0] as Record<string, unknown>).requestId === 'passive-agy-default'
+    )));
+    expect(ensureProviderConnectedMock).not.toHaveBeenCalled();
+    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'transport.models_response',
+      agentType: AGY_SDK_PROVIDER_ID,
+      requestId: 'passive-agy-default',
+      defaultModel: 'gemini-3.8-flash-high',
+      models: expect.arrayContaining([expect.objectContaining({ id: 'gemini-3.8-flash-high' })]),
+    }));
+  });
+
   it('serves passive transport.list_models for muse-code-sdk without connecting provider', async () => {
     getProviderMock.mockReturnValue(undefined);
 

@@ -127,60 +127,56 @@ export function getStaticFallbackModels(agentType: string | undefined | null): T
   return null;
 }
 
+function validTransportModels(value: unknown): TransportModelInfo[] {
+  return Array.isArray(value)
+    ? value.filter((model) => model && typeof model.id === 'string' && model.id.trim().length > 0)
+    : [];
+}
+
+function normalizeCatalog(entry: CachedTransportModelCatalog | null | undefined, agentType?: string | null): CachedTransportModelCatalog | null {
+  if (!entry) return null;
+  const models = validTransportModels(entry.models);
+  if (!models.length) return null;
+  return {
+    models,
+    ...(typeof entry.defaultModel === 'string' ? { defaultModel: entry.defaultModel } : {}),
+    ...(typeof entry.isAuthenticated === 'boolean' ? { isAuthenticated: entry.isAuthenticated } : {}),
+    // Old stored catalogs can still carry the previous Antigravity default.
+    // Model selections live in session settings, not this catalog default.
+    ...(agentType === AGY_SDK_PROVIDER_ID && models.some((model) => model.id === AGY_DEFAULT_MODEL_ID)
+      ? { defaultModel: AGY_DEFAULT_MODEL_ID }
+      : {}),
+  };
+}
+
 export function readCachedTransportModels(
   catalogIdentity: string,
   agentType?: string | null,
 ): CachedTransportModelCatalog | null {
-  // 1. Direct memory hit
-  const exact = memoryModelCatalogCache.get(catalogIdentity);
-  if (exact && exact.models.length > 0) return exact;
-
-  // 2. Exact match in sessionStorage
   const storage = getSessionStorage();
-  if (storage) {
-    try {
-      const raw = storage.getItem(STORAGE_PREFIX + catalogIdentity);
-      if (raw) {
-        const parsed = JSON.parse(raw) as CachedTransportModelCatalog;
-        if (parsed && Array.isArray(parsed.models) && parsed.models.length > 0) {
-          memoryModelCatalogCache.set(catalogIdentity, parsed);
-          return parsed;
-        }
-      }
-    } catch { /* ignore corrupt entry */ }
-  }
-
-  // 3. Fallback to generic agentType cache if switching sessions for the same provider
-  if (agentType) {
-    const genericKey = `\0${agentType}\0`;
-    const genericCached = memoryModelCatalogCache.get(genericKey);
-    if (genericCached && genericCached.models.length > 0) return genericCached;
-
+  // Preserve exact-target precedence, then the existing same-provider cache.
+  const keys = agentType ? [catalogIdentity, `\0${agentType}\0`] : [catalogIdentity];
+  for (const key of keys) {
+    // Entries enter this map only after normalization; renders get an O(1) hit.
+    const cached = memoryModelCatalogCache.get(key);
+    if (cached) return cached;
     if (storage) {
       try {
-        const raw = storage.getItem(STORAGE_PREFIX + genericKey);
-        if (raw) {
-          const parsed = JSON.parse(raw) as CachedTransportModelCatalog;
-          if (parsed && Array.isArray(parsed.models) && parsed.models.length > 0) {
-            memoryModelCatalogCache.set(genericKey, parsed);
-            return parsed;
-          }
+        const raw = storage.getItem(STORAGE_PREFIX + key);
+        const parsed = raw ? normalizeCatalog(JSON.parse(raw), agentType) : null;
+        if (parsed) {
+          memoryModelCatalogCache.set(key, parsed);
+          return parsed;
         }
-      } catch { /* ignore */ }
-    }
-
-    // 4. Static fallback for known providers
-    const staticFallback = getStaticFallbackModels(agentType);
-    if (staticFallback && staticFallback.models.length > 0) {
-      return {
-        models: staticFallback.models,
-        defaultModel: staticFallback.defaultModel,
-        isAuthenticated: staticFallback.isAuthenticated,
-      };
+      } catch { /* corrupt or inaccessible storage: use the next cache or fallback */ }
     }
   }
-
-  return null;
+  const fallback = getStaticFallbackModels(agentType);
+  return fallback ? {
+    models: fallback.models,
+    defaultModel: fallback.defaultModel,
+    isAuthenticated: fallback.isAuthenticated,
+  } : null;
 }
 
 export function writeCachedTransportModels(
@@ -188,15 +184,16 @@ export function writeCachedTransportModels(
   agentType: string | undefined | null,
   entry: CachedTransportModelCatalog,
 ): void {
-  if (!entry.models.length) return;
-  memoryModelCatalogCache.set(catalogIdentity, entry);
+  const catalog = normalizeCatalog(entry, agentType);
+  if (!catalog) return;
+  memoryModelCatalogCache.set(catalogIdentity, catalog);
   if (agentType) {
-    memoryModelCatalogCache.set(`\0${agentType}\0`, entry);
+    memoryModelCatalogCache.set(`\0${agentType}\0`, catalog);
   }
   const storage = getSessionStorage();
   if (storage) {
     try {
-      const serialized = JSON.stringify(entry);
+      const serialized = JSON.stringify(catalog);
       storage.setItem(STORAGE_PREFIX + catalogIdentity, serialized);
       if (agentType) {
         storage.setItem(STORAGE_PREFIX + `\0${agentType}\0`, serialized);
@@ -230,27 +227,53 @@ export function useTransportModels(
   // shared owner machines can resolve to completely different providers and
   // model sets. Never retain one owner's entries while switching sessions.
   const catalogIdentity = `${sessionName?.trim() ?? ''}\0${agentType ?? ''}\0${ccPreset?.trim().toLowerCase() ?? ''}`;
-  const initialCached = readCachedTransportModels(catalogIdentity, agentType);
-  const [state, setState] = useState<TransportModelState>({
-    models: initialCached?.models ?? [],
-    defaultModel: initialCached?.defaultModel,
-    isAuthenticated: initialCached?.isAuthenticated,
-    loading: false,
+  const [state, setState] = useState<TransportModelState>(() => {
+    const cached = readCachedTransportModels(catalogIdentity, agentType);
+    return {
+      models: cached?.models ?? [],
+      defaultModel: cached?.defaultModel,
+      isAuthenticated: cached?.isAuthenticated,
+      loading: false,
+    };
   });
-  const pendingRequestId = useRef<string | null>(null);
+  const latestRequestId = useRef<string | null>(null);
+  const acceptedReplySequence = useRef(0);
   const currentCatalogIdentity = useRef(catalogIdentity);
   const wsConnected = !!ws?.connected;
 
   const fetchModels = useCallback(
     (force: boolean) => {
-      // Read the live socket flag at dispatch time. A daemon.reconnected event
-      // can reach this handler before Preact has rendered the new `connected`
-      // prop value; a closure over the previous false value would otherwise
-      // discard the first authoritative participant catalogue after reconnect.
-      if (!ws || !ws.connected || !supportsDynamicTransportModels(agentType)) {
+      const providerChanged = currentCatalogIdentity.current !== catalogIdentity;
+      currentCatalogIdentity.current = catalogIdentity;
+      const cached = readCachedTransportModels(catalogIdentity, agentType);
+      const retainCatalog = (loading: boolean, error?: string) => {
+        setState((prev) => ({
+          ...(!providerChanged && prev.models.length > 0 ? prev : {
+            models: cached?.models ?? [],
+            defaultModel: cached?.defaultModel,
+            isAuthenticated: cached?.isAuthenticated,
+          }),
+          loading,
+          error,
+        }));
+      };
+      if (!supportsDynamicTransportModels(agentType)) {
+        latestRequestId.current = null;
         setState({ models: [], loading: false });
         return;
       }
+      // A refresh can race a disconnect. Keep this target's last good catalog
+      // or static fallback; a socket failure is not an authoritative empty list.
+      if (!ws || !ws.connected) {
+        latestRequestId.current = null;
+        retainCatalog(false);
+        return;
+      }
+      // Queue-full responses can arrive synchronously inside the request call.
+      // Subscribe before dispatch and do not overwrite a completed response
+      // with loading:true after the request method returns.
+      latestRequestId.current = null;
+      const replySequenceBeforeDispatch = acceptedReplySequence.current;
       let requestId: string;
       try {
         const request = {
@@ -274,51 +297,36 @@ export function useTransportModels(
           });
         }
       } catch (err) {
-        setState({
-          models: [],
-          loading: false,
-          error: err instanceof Error ? err.message : String(err),
-        });
+        retainCatalog(false, err instanceof Error ? err.message : String(err));
         return;
       }
-      // When changing provider/identity, show the cached catalog for the new
-      // target immediately (or static fallback) with loading: true. Reconnects
-      // and repeated refreshes for the same provider keep the last good catalog
-      // visible until its replacement arrives.
-      const providerChanged = currentCatalogIdentity.current !== catalogIdentity;
-      currentCatalogIdentity.current = catalogIdentity;
-      if (providerChanged) {
-        const cached = readCachedTransportModels(catalogIdentity, agentType);
-        setState({
-          models: cached?.models ?? [],
-          defaultModel: cached?.defaultModel,
-          isAuthenticated: cached?.isAuthenticated,
-          loading: true,
-          error: undefined,
-        });
-      } else {
-        setState((prev) => ({ ...prev, loading: true, error: undefined }));
-      }
+      latestRequestId.current = requestId;
+      if (acceptedReplySequence.current === replySequenceBeforeDispatch) retainCatalog(true);
     },
     [ws, wsConnected, agentType, ccPreset, sessionName, catalogIdentity],
   );
 
   useEffect(() => {
-    if (!ws) return;
+    if (!ws) {
+      fetchModels(false);
+      return;
+    }
     if (!supportsDynamicTransportModels(agentType)) {
       setState({ models: [], loading: false });
-      pendingRequestId.current = null;
+      latestRequestId.current = null;
       currentCatalogIdentity.current = catalogIdentity;
       return;
     }
 
     const unsub = ws.onMessage((msg) => {
+      if (currentCatalogIdentity.current !== catalogIdentity) return;
       const raw = msg as unknown as Record<string, unknown>;
       if (raw.type === DAEMON_MSG.RECONNECTED) {
         fetchModels(false);
         return;
       }
       if (raw.type !== TRANSPORT_MSG.MODELS_RESPONSE) return;
+      if (typeof raw.sessionName === 'string' && raw.sessionName !== (sessionName?.trim() ?? '')) return;
       const replyAgent = raw.agentType;
       if (replyAgent !== agentType) return;
       const replyPreset = typeof raw.ccPreset === 'string'
@@ -327,21 +335,18 @@ export function useTransportModels(
       if (replyPreset !== (ccPreset?.trim().toLowerCase() ?? '')) return;
       // Accept both single-cast (requestId-matched) and broadcast replies.
       const replyId = typeof raw.requestId === 'string' ? raw.requestId : undefined;
-      if (replyId && pendingRequestId.current && replyId !== pendingRequestId.current) return;
-      pendingRequestId.current = null;
-      const models = Array.isArray(raw.models)
-        ? (raw.models as TransportModelInfo[]).filter((m) => m && typeof m.id === 'string')
-        : [];
-      if (models.length > 0) {
-        writeCachedTransportModels(catalogIdentity, agentType, {
-          models,
-          defaultModel: typeof raw.defaultModel === 'string' ? raw.defaultModel : undefined,
-          isAuthenticated: typeof raw.isAuthenticated === 'boolean' ? raw.isAuthenticated : undefined,
-        });
-      }
-      setState((prev) => ({
-        models: models.length > 0 ? models : prev.models,
+      if (replyId && latestRequestId.current && replyId !== latestRequestId.current) return;
+      acceptedReplySequence.current += 1;
+      const catalog = normalizeCatalog({
+        models: validTransportModels(raw.models),
         ...(typeof raw.defaultModel === 'string' ? { defaultModel: raw.defaultModel } : {}),
+        ...(typeof raw.isAuthenticated === 'boolean' ? { isAuthenticated: raw.isAuthenticated } : {}),
+      }, agentType);
+      if (catalog) writeCachedTransportModels(catalogIdentity, agentType, catalog);
+      setState((prev) => ({
+        ...(catalog ?? prev),
+        error: undefined,
+        ...(!catalog && typeof raw.defaultModel === 'string' ? { defaultModel: raw.defaultModel } : {}),
         ...(typeof raw.isAuthenticated === 'boolean'
           ? { isAuthenticated: raw.isAuthenticated }
           : {}),
@@ -357,7 +362,7 @@ export function useTransportModels(
     // provider routes and model ids from its own `~/.dsh` config, so the
     // daemon's catalog is a constant empty list and a forced probe would only
     // spend a round trip to re-learn that. Its picker is free text, like Kimi.
-    if (wsConnected) fetchModels(
+    fetchModels(
       agentType === 'grok-sdk'
       || agentType === HERMES_AGENT_PROVIDER_ID
       || agentType === AGY_SDK_PROVIDER_ID

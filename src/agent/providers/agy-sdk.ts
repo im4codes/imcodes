@@ -40,6 +40,7 @@ import {
   AGY_CLI_BINARY,
   AGY_CLI_FLAG,
   AGY_CLI_PATH_ENV,
+  AGY_DEFAULT_MODEL_ID,
   AGY_RESULT_STATUS,
   AGY_SDK_PROVIDER_ID,
   AGY_STEP_STATE,
@@ -191,7 +192,7 @@ export function buildAgyArgs(opts: { conversationId?: string; model?: string }):
     AGY_CLI_FLAG.OUTPUT_FORMAT, AGY_CLI_FLAG.STREAM_JSON,
     AGY_CLI_FLAG.SKIP_PERMISSIONS,
     ...(opts.conversationId ? [AGY_CLI_FLAG.CONVERSATION, opts.conversationId] : []),
-    ...(opts.model ? [AGY_CLI_FLAG.MODEL, opts.model] : []),
+    AGY_CLI_FLAG.MODEL, opts.model || AGY_DEFAULT_MODEL_ID,
     // Must stay last: `-p`/`--print` without `=` would swallow the next argv as its prompt.
     AGY_CLI_FLAG.PRINT_STDIN,
   ];
@@ -318,7 +319,7 @@ export class AgySdkProvider implements TransportProvider {
       mcpEnv: buildAgyMemoryMcpEnv(config) ?? existing?.mcpEnv,
       model: (typeof config.agentId === 'string' && config.agentId)
         || (typeof (config as { model?: string }).model === 'string' && (config as { model?: string }).model)
-        || existing?.model,
+        || existing?.model || AGY_DEFAULT_MODEL_ID,
       conversationId: config.resumeId ?? existing?.conversationId,
       child: existing?.child ?? null,
       inflightTurns: existing?.inflightTurns ?? 0,
@@ -500,7 +501,7 @@ export class AgySdkProvider implements TransportProvider {
       });
       const models = parseAgyModelList(stdout);
       const list: ProviderModelList = models.length > 0
-        ? { models, defaultModel: models[0]?.id, isAuthenticated: true }
+        ? { models, defaultModel: models.some((model) => model.id === AGY_DEFAULT_MODEL_ID) ? AGY_DEFAULT_MODEL_ID : models[0]?.id, isAuthenticated: true }
         : (this.modelCache?.list?.models?.length
           ? this.modelCache.list
           : { models: [], isAuthenticated: false, error: 'agy returned no models. Run `agy` once to sign in.' });

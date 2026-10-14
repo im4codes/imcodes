@@ -11169,6 +11169,14 @@ afterEach(() => {
     });
   });
 
+  it('keeps the Antigravity footer dropdown populated when a refresh throws', () => {
+    const ws = Object.assign(makeWs(), { requestTransportModels: () => { throw new Error('offline probe'); } });
+    render(<SessionControls ws={ws as any} activeSession={makeSession({ name: 'agy-refresh-failed', agentType: AGY_SDK_PROVIDER_ID, runtimeType: 'transport', activeModel: 'gemini-3.8-flash-high' })} quickData={makeQuickData() as any} />);
+    fireEvent.click(screen.getByRole('button', { name: /^gemini-3\.8-flash-high$/i }));
+    const menu = document.querySelector('.menu-dropdown') as HTMLElement;
+    expect(within(menu).getByRole('button', { name: /gemini-3\.8-flash-high/i })).toBeDefined();
+  });
+
   it('shows only dynamically discovered agy-sdk models and sends /model', async () => {
     const ws = makeWs();
     render(
