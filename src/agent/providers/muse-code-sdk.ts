@@ -459,18 +459,9 @@ export class MuseCodeSdkProvider implements TransportProvider {
         durability: readSessionDurability(this.spawned.initializeResult),
       });
 
-      this.spawned.connection.onNotification((notif) => {
-        if (notif.method === 'usage/changed' && notif.params) {
-          const rawUsage = (notif.params as any).usage ?? notif.params;
-          if (rawUsage && typeof rawUsage === 'object') {
-            recordMuseQuotaActivity();
-            updateMuseUsageQuota(rawUsage as any);
-            this.emitQuotaUpdate();
-            void refreshMuseQuotaMetadata().catch(() => {});
-          }
-        }
-      });
-
+      // MuseClient owns Connection's single notification handler. Registering a
+      // quota observer here replaces its inbound pump, dropping every turn/item/
+      // approval notification. Use usage/read below and after completion instead.
       this.unregisterUsageReader?.();
       this.unregisterUsageReader = registerMuseUsageReader(async () => {
         if (!this.spawned?.connection) return null;
@@ -686,10 +677,33 @@ export class MuseCodeSdkProvider implements TransportProvider {
     const prompt = composeMessageSideProviderPrompt(normalized, {
       includeSessionSystemText: !state.sessionSystemTextSent,
     });
-    state.sessionSystemTextSent = true;
-
     const effort = mapEffortLevel(state.reasoningEffort);
 
+    let turn: Turn;
+    try {
+      turn = await state.session.sendUserTurn({
+        input: [{ type: 'text', text: prompt }],
+        ...(effort ? { reasoningEffort: effort } : {}),
+      });
+    } catch (err) {
+      state.inFlight = false;
+      throw {
+        code: PROVIDER_ERROR_CODES.PROVIDER_ERROR,
+        message: err instanceof Error ? err.message : String(err),
+        recoverable: true,
+      } satisfies ProviderError;
+    }
+    state.sessionSystemTextSent = true;
+    state.activeTurn = turn;
+    state.activeTurnId = turn.turnId;
+    // send() confirms native admission, not terminal completion. The runtime
+    // owns a separate callback-driven completion waiter and admission deadline.
+    // Keeping this promise pending for a whole model turn caused false timeouts
+    // (and hid genuinely delivered work from the durable delivery ledger).
+    void this.consumeTurn(sessionId, state, turn);
+  }
+
+  private async consumeTurn(sessionId: string, state: MuseSessionState, turn: Turn): Promise<void> {
     // The runtime re-checks provider busy state synchronously inside the
     // complete/error callbacks (to flip the session idle and drain queued
     // messages). In-flight state must therefore be cleared BEFORE emitting,
@@ -724,14 +738,6 @@ export class MuseCodeSdkProvider implements TransportProvider {
     };
 
     try {
-      const turn = await state.session.sendUserTurn({
-        input: [{ type: 'text', text: prompt }],
-        ...(effort ? { reasoningEffort: effort } : {}),
-      });
-
-      state.activeTurn = turn;
-      state.activeTurnId = turn.turnId;
-
       // An upstream stream that never opens shows no event at all and would
       // otherwise leave the session "working" until the user presses stop.
       stallTimer = setTimeout(() => {

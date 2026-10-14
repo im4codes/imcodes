@@ -238,6 +238,7 @@ describe('MuseCodeSdkProvider session and turn lifecycle', () => {
     });
 
     await provider.send(routeId, 'Say hello');
+    await vi.waitFor(() => expect(completedMessage).not.toBeNull());
 
     // transport-relay contract: each frame carries the cumulative text so far.
     expect(receivedDeltas).toEqual(['Hello ', 'Hello world!']);
@@ -253,6 +254,19 @@ describe('MuseCodeSdkProvider session and turn lifecycle', () => {
     await provider.endSession(routeId);
   });
 
+  it('rejects a refused native submission without leaving the session busy or marking system context sent', async () => {
+    const provider = new MuseCodeSdkProvider();
+    const { sessionObj } = createMockSession();
+    sessionObj.sendUserTurn.mockRejectedValue(new Error('native submission refused'));
+    (provider as any).client = { startSession: vi.fn().mockResolvedValue(sessionObj) };
+    const routeId = await provider.createSession({ sessionKey: 'refused', cwd: process.cwd() });
+    await expect(provider.send(routeId, 'hello')).rejects.toMatchObject({
+      code: PROVIDER_ERROR_CODES.PROVIDER_ERROR, message: 'native submission refused', recoverable: true,
+    });
+    expect(provider.getActiveWorkSnapshot(routeId)?.activeWorkCount).toBe(0);
+    expect((provider as any).sessions.get(routeId).sessionSystemTextSent).toBe(false);
+  });
+
   it('is already idle inside onComplete so the runtime can flip the session idle (stuck "working" regression)', async () => {
     const provider = new MuseCodeSdkProvider();
     const { sessionObj } = createMockSession();
@@ -266,7 +280,7 @@ describe('MuseCodeSdkProvider session and turn lifecycle', () => {
 
     await provider.send(routeId, 'Say hello');
 
-    expect(inFlightSeenInsideCallback).toEqual([false]);
+    await vi.waitFor(() => expect(inFlightSeenInsideCallback).toEqual([false]));
     await provider.endSession(routeId);
   });
 
@@ -287,7 +301,7 @@ describe('MuseCodeSdkProvider session and turn lifecycle', () => {
 
     await provider.send(routeId, 'Say hello');
 
-    expect(inFlightSeenInsideCallback).toEqual([false]);
+    await vi.waitFor(() => expect(inFlightSeenInsideCallback).toEqual([false]));
     await provider.endSession(routeId);
   });
 
@@ -375,6 +389,7 @@ describe('MuseCodeSdkProvider session and turn lifecycle', () => {
 
       await provider.send(routeId, 'hi');
 
+      await vi.waitFor(() => expect(errors).toHaveLength(1));
       expect(command).toHaveBeenCalledWith('turn/interrupt', expect.objectContaining({ turnId: 'turn-stalled' }));
       expect(errors).toHaveLength(1);
       expect(errors[0]).toMatchObject({ recoverable: true });
@@ -441,7 +456,7 @@ describe('MuseCodeSdkProvider session and turn lifecycle', () => {
       await sending;
 
       expect(errors).toEqual([]);
-      expect(message).toMatchObject({ content: 'ok' });
+      await vi.waitFor(() => expect(message).toMatchObject({ content: 'ok' }));
       await provider.endSession(routeId);
     });
   });
@@ -641,7 +656,7 @@ describe('MuseCodeSdkProvider session and turn lifecycle', () => {
 
     await provider.send(routeId, 'Run research subagent');
 
-    expect(receivedTools.length).toBe(2);
+    await vi.waitFor(() => expect(receivedTools.length).toBe(2));
     expect(receivedTools[0].detail).toMatchObject({
       kind: SDK_SUBAGENT_DETAIL_KIND,
       summary: 'Muse sub-agent Researcher',
@@ -950,6 +965,7 @@ describe('MuseCodeSdkProvider session and turn lifecycle', () => {
       provider.onComplete((_s, m) => { message = m; });
       await provider.send(routeId, 'hi');
 
+      await vi.waitFor(() => expect(message).not.toBeNull());
       expect(message.metadata.usage).toEqual({
         input_tokens: 397,
         cache_read_input_tokens: 33140,
