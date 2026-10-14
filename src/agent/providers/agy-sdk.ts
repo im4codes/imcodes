@@ -41,6 +41,7 @@ import {
   AGY_CLI_FLAG,
   AGY_CLI_PATH_ENV,
   AGY_DEFAULT_MODEL_ID,
+  AGY_INDIVIDUAL_QUOTA_ERROR_PREFIX,
   AGY_RESULT_STATUS,
   AGY_SDK_PROVIDER_ID,
   AGY_STEP_STATE,
@@ -102,6 +103,16 @@ interface AgySessionState {
   sessionSystemTextSent: boolean;
   stderrTail: string;
   toolSteps: Map<number, string>;
+  mayHaveHistoricalQuota: boolean;
+  /** Evidence is reset by the streamed user_input boundary, not send(): inputs can queue. */
+  turnEvidence?: {
+    conversationId?: string;
+    userStepIndex: number;
+    latestStepIndex: number;
+    completedResponseStepIndex?: number;
+    sawError: boolean;
+    responseText: string;
+  };
   lastStatusSignature?: string;
   latestStepUsage?: AgyUsage;
   turnOutputTokens?: number;
@@ -331,6 +342,7 @@ export class AgySdkProvider implements TransportProvider {
       sessionSystemTextSent: !!(config.resumeId ?? existing?.conversationId) && !config.fresh,
       stderrTail: '',
       toolSteps: new Map(),
+      mayHaveHistoricalQuota: !!(config.resumeId ?? existing?.conversationId) && !config.fresh,
     };
     if (existing?.child && existing.conversationId !== state.conversationId) {
       await this.terminateChild(existing);
@@ -828,6 +840,35 @@ export class AgySdkProvider implements TransportProvider {
       ? `${prefix}:step:${stepIndex}`
       : (state.currentMessageId ?? randomUUID());
 
+    if (stepType === AGY_STEP_TYPE.USER_INPUT) {
+      // An old DONE response (or result.response alone) is not evidence for this turn.
+      state.turnEvidence = stepIndex !== undefined && Number.isInteger(stepIndex) && stepIndex >= 0
+        ? { conversationId: state.conversationId, userStepIndex: stepIndex, latestStepIndex: stepIndex, sawError: false, responseText: '' }
+        : undefined;
+    }
+    const evidence = state.turnEvidence;
+    if (evidence) {
+      if (stepType === AGY_STEP_TYPE.AGENT_RESPONSE && stepIndex !== undefined && stepIndex > evidence.userStepIndex) {
+        // result.response may be the final response or all assistant steps in a tool turn.
+        evidence.responseText += asString(step.text_delta) ?? '';
+      }
+      const errorDetails = step.error_details;
+      const hasErrorDetails = typeof errorDetails === 'string'
+        ? !!errorDetails.trim()
+        : !!errorDetails && typeof errorDetails === 'object' && Object.keys(errorDetails).length > 0;
+      if (stepType === AGY_STEP_TYPE.SYSTEM_ERROR || /^(ERROR|FAILED|CANCELLED)$/i.test(stepState ?? '') || hasErrorDetails) {
+        evidence.sawError = true;
+      }
+      if (stepIndex === undefined || !Number.isInteger(stepIndex) || stepIndex <= evidence.userStepIndex) {
+        evidence.completedResponseStepIndex = undefined;
+      } else if (stepIndex >= evidence.latestStepIndex) {
+        evidence.latestStepIndex = stepIndex;
+        evidence.completedResponseStepIndex = stepType === AGY_STEP_TYPE.AGENT_RESPONSE && stepState === AGY_STEP_STATE.DONE
+          ? stepIndex
+          : undefined;
+      }
+    }
+
     const stepUsageRecord = asRecord(step.usage);
     const inputTokens = asNumber(stepUsageRecord.input_tokens);
     const outputTokens = asNumber(stepUsageRecord.output_tokens);
@@ -992,6 +1033,27 @@ export class AgySdkProvider implements TransportProvider {
     state.inflightTurns = Math.max(0, state.inflightTurns - 1);
     const messageId = state.currentMessageId ?? randomUUID();
     const streamed = state.currentText;
+    const response = asString(result.response)?.trimEnd();
+    const evidence = state.turnEvidence;
+    // AG can aggregate a quota error from an older conversation step into the
+    // terminal result of a later successful turn (upstream #1048). Do not trust
+    // nonempty response text alone: partial output on a real failure is common.
+    // Require a new user boundary, a matching final DONE response, no subsequent
+    // step/open tool or current error, and the same conversation. No replay,
+    // conversation reset, quota probe or suppression of an unproven error.
+    const historicalQuotaResult = result.status === AGY_RESULT_STATUS.ERROR
+      && state.mayHaveHistoricalQuota
+      && (asString(result.error) ?? '').startsWith(AGY_INDIVIDUAL_QUOTA_ERROR_PREFIX)
+      && !!response?.trim()
+      && !!evidence
+      && (response === streamed.trimEnd() || response === evidence.responseText.trimEnd())
+      && !!evidence.conversationId
+      && evidence.conversationId === asString(result.conversation_id)
+      && evidence.completedResponseStepIndex !== undefined
+      && evidence.completedResponseStepIndex === evidence.latestStepIndex
+      && !evidence.sawError
+      && state.toolSteps.size === 0;
+    state.turnEvidence = undefined;
     const sawTool = state.sawToolCall;
     state.currentMessageId = null;
     state.currentText = '';
@@ -1017,8 +1079,9 @@ export class AgySdkProvider implements TransportProvider {
 
     this.emitUsage(sessionId, state, messageId, turnUsage, true);
 
-    if (result.status !== AGY_RESULT_STATUS.SUCCESS) {
+    if (result.status !== AGY_RESULT_STATUS.SUCCESS && !historicalQuotaResult) {
       const message = asString(result.error) ?? 'agy turn failed';
+      if (message.startsWith(AGY_INDIVIDUAL_QUOTA_ERROR_PREFIX)) state.mayHaveHistoricalQuota = true;
       const code = AUTH_FAILURE_PATTERN.test(message)
         ? PROVIDER_ERROR_CODES.AUTH_FAILED
         : RATE_LIMIT_PATTERN.test(message)
@@ -1028,7 +1091,6 @@ export class AgySdkProvider implements TransportProvider {
       return;
     }
 
-    const response = asString(result.response)?.trimEnd();
     // Authoritative complete response from agy. If no tool was called, response is
     // the single complete turn response. Prefer it over potentially truncated streaming text.
     // When tools were called (multi-step), preserve the streamed step text unless empty.

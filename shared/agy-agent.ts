@@ -25,6 +25,7 @@ export const AGY_STREAM_EVENT = {
 export const AGY_STEP_TYPE = {
   USER_INPUT: 'user_input',
   AGENT_RESPONSE: 'agent_response',
+  SYSTEM_ERROR: 'system_error',
   TOOL: 'tool',
 } as const;
 
@@ -37,6 +38,9 @@ export const AGY_RESULT_STATUS = {
   SUCCESS: 'SUCCESS',
   ERROR: 'ERROR',
 } as const;
+
+/** Native individual-quota diagnostic that can leak from AG conversation history. */
+export const AGY_INDIVIDUAL_QUOTA_ERROR_PREFIX = 'Individual quota reached.';
 
 /** `agy` CLI flags used by the transport. */
 export const AGY_CLI_FLAG = {

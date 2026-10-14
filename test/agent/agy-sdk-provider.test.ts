@@ -46,7 +46,38 @@ process.stdin.on('data', (d) => {
     if (!line.trim()) continue;
     const msg = JSON.parse(line);
     const text = msg.message.content;
-    emit({ event: 'step_update', step_update: { conversation_id: convId, step_index: step++, state: 'DONE', step_type: 'user_input' } });
+    if (text.includes('QUOTA_OLD_RESPONSE')) {
+      emit({ event: 'step_update', step_update: { conversation_id: convId, step_index: step++, state: 'DONE', step_type: 'agent_response', text_delta: 'Hello\\n' } });
+    }
+    if (!text.includes('QUOTA_NO_BOUNDARY')) {
+      emit({ event: 'step_update', step_update: { conversation_id: convId, step_index: step++, state: 'DONE', step_type: 'user_input' } });
+    }
+    if (text.includes('QUOTA_')) {
+      const quota = 'Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 50m15s.';
+      const hasResponse = !text.includes('QUOTA_EMPTY') && !text.includes('QUOTA_OLD_RESPONSE');
+      if (text.includes('QUOTA_MULTISTEP')) {
+        emit({ event: 'step_update', step_update: { conversation_id: convId, step_index: step++, state: 'DONE', step_type: 'agent_response', text_delta: 'Before\\n' } });
+      }
+      if (text.includes('QUOTA_COMPLETED_TOOL') || text.includes('QUOTA_MULTISTEP')) {
+        const toolIdx = step++;
+        emit({ event: 'step_update', step_update: { conversation_id: convId, step_index: toolIdx, state: 'ACTIVE', step_type: 'tool', tool_name: 'run_command', tool_info: { name: 'run_command', parameters: {} } } });
+        emit({ event: 'step_update', step_update: { conversation_id: convId, step_index: toolIdx, state: 'DONE', step_type: 'tool', tool_name: 'run_command', tool_info: { name: 'run_command', parameters: {}, output: 'ok' } } });
+      }
+
+      const idx = step++;
+      if (hasResponse) {
+        const stepIndex = text.includes('QUOTA_NO_INDEX') ? undefined : idx;
+        emit({ event: 'step_update', step_update: { conversation_id: convId, step_index: stepIndex, state: 'ACTIVE', step_type: 'agent_response', text_delta: 'Hello' } });
+        if (!text.includes('QUOTA_PARTIAL')) {
+          emit({ event: 'step_update', step_update: { conversation_id: convId, step_index: stepIndex, state: 'DONE', step_type: 'agent_response', text_delta: '\\n', ...(text.includes('QUOTA_DETAILS') ? { error_details: { message: quota } } : {}) } });
+        }
+      }
+      if (text.includes('QUOTA_TOOL')) emit({ event: 'step_update', step_update: { conversation_id: convId, step_index: step++, state: 'ACTIVE', step_type: 'tool', tool_name: 'run_command', tool_info: { name: 'run_command', parameters: {} } } });
+      if (text.includes('QUOTA_CURRENT_ERROR')) emit({ event: 'step_update', step_update: { conversation_id: convId, step_index: text.includes('NO_INDEX_ERROR') ? undefined : step++, state: 'DONE', step_type: 'system_error', text_delta: quota } });
+      if (text.includes('QUOTA_ACTIVE_AFTER_DONE')) emit({ event: 'step_update', step_update: { conversation_id: convId, step_index: idx, state: 'ACTIVE', step_type: 'agent_response', text_delta: ' more' } });
+      emit({ event: 'result', result: { conversation_id: convId, status: 'ERROR', response: text.includes('QUOTA_MISMATCH') ? 'Other response' : text.includes('QUOTA_MULTISTEP') ? 'Before\\nHello\\n' : hasResponse ? 'Hello\\n' : '', error: text.includes('QUOTA_NEW_FAILURE') ? 'boom unauthorized' : quota, num_turns: 1, usage: {} } });
+      continue;
+    }
     if (text.includes('HANG')) return;
     if (text.includes('FAIL')) {
       emit({ event: 'result', result: { conversation_id: convId, status: 'ERROR', response: '', error: 'boom unauthorized', num_turns: 0, usage: {} } });
@@ -226,6 +257,69 @@ describe('AgySdkProvider (fake agy process)', () => {
     await waitFor(() => completes.length === 2);
     expect(launches()).toHaveLength(1);
     expect(completes[0][1].id).not.toBe(completes[1][1].id);
+  });
+
+  it('completes repeated successful turns despite AG historical quota result errors, without restarting or replaying', async () => {
+    const sid = await provider.createSession({ sessionKey: 'quota-history', cwd: dir, resumeId: 'existing-conversation' });
+    await provider.send(sid, 'QUOTA_STALE');
+    await waitFor(() => completes.length + errors.length === 1);
+    expect(errors).toHaveLength(0);
+    expect(completes[0][1].content).toBe('Hello');
+    await provider.send(sid, 'QUOTA_STALE');
+    await waitFor(() => completes.length + errors.length === 2);
+    expect(errors).toHaveLength(0);
+    expect(completes).toHaveLength(2);
+    expect(launches()).toHaveLength(1);
+    expect(launches()[0]).toContain('existing-conversation');
+    expect(provider.getSessionDiagnostics(sid)).toMatchObject({ inflightTurns: 0 });
+  });
+
+  it('does not infer historical quota on a fresh conversation, but can recover after an observed quota failure', async () => {
+    const sid = await provider.createSession({ sessionKey: 'quota-fresh', cwd: dir, fresh: true });
+    await provider.send(sid, 'QUOTA_STALE');
+    await waitFor(() => errors.length === 1);
+    expect(completes).toHaveLength(0);
+    await provider.send(sid, 'QUOTA_STALE');
+    await waitFor(() => errors.length + completes.length === 2);
+    expect(errors).toHaveLength(1);
+    expect(completes[0][1].content).toBe('Hello');
+    expect(launches()).toHaveLength(1);
+  });
+
+  it('recognizes a completed tool turn when result.response includes earlier assistant steps', async () => {
+    const sid = await provider.createSession({ sessionKey: 'quota-multistep', cwd: dir, resumeId: 'existing-conversation' });
+    await provider.send(sid, 'QUOTA_MULTISTEP');
+    await waitFor(() => completes.length + errors.length === 1);
+    expect(errors).toHaveLength(0);
+    expect(completes[0][1].content).toBe('Hello');
+    expect(tools.map(([, tool]) => tool.status)).toEqual(['running', 'complete']);
+  });
+
+  it('keeps per-turn evidence isolated when queued inputs include a new quota failure between successes', async () => {
+    const sid = await provider.createSession({ sessionKey: 'quota-queued', cwd: dir, resumeId: 'existing-conversation' });
+    await provider.send(sid, 'QUOTA_STALE');
+    await provider.send(sid, 'QUOTA_EMPTY');
+    await provider.send(sid, 'QUOTA_COMPLETED_TOOL');
+    await waitFor(() => completes.length + errors.length === 3);
+    expect(completes.map(([, m]) => m.content)).toEqual(['Hello', 'Hello']);
+    expect(errors).toHaveLength(1);
+    expect(errors[0][1].code).toBe(PROVIDER_ERROR_CODES.RATE_LIMITED);
+    expect(launches()).toHaveLength(1);
+    expect(provider.getSessionDiagnostics(sid)).toMatchObject({ inflightTurns: 0 });
+  });
+
+  it.each([
+    'QUOTA_EMPTY', 'QUOTA_PARTIAL', 'QUOTA_TOOL', 'QUOTA_CURRENT_ERROR',
+    'QUOTA_DETAILS', 'QUOTA_MISMATCH', 'QUOTA_ACTIVE_AFTER_DONE',
+    'QUOTA_NO_BOUNDARY', 'QUOTA_NO_INDEX', 'QUOTA_OLD_RESPONSE', 'QUOTA_NEW_FAILURE',
+    'QUOTA_CURRENT_ERROR_NO_INDEX_ERROR',
+  ])('preserves a real or unproven current failure: %s', async (prompt) => {
+    const sid = await provider.createSession({ sessionKey: prompt, cwd: dir, resumeId: 'existing-conversation' });
+    await provider.send(sid, prompt);
+    await waitFor(() => completes.length + errors.length === 1);
+    expect(completes).toHaveLength(0);
+    expect(errors).toHaveLength(1);
+    expect(errors[0][1].message).toContain(prompt === 'QUOTA_NEW_FAILURE' ? 'unauthorized' : 'Individual quota reached');
   });
 
   it('emits tool call lifecycle events with parameters and output', async () => {
