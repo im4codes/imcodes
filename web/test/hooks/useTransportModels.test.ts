@@ -272,4 +272,24 @@ describe('useTransportModels caching and fallbacks', () => {
     expect(result.current.defaultModel).toBe('gemini-3.8-flash-high');
   });
 
+  it('fully overwrites memory and stored catalogs with newer models and reuses the cache on remount', () => {
+    const key = 'replace-session\0agy-sdk\0';
+    writeCachedTransportModels(key, AGY_SDK_PROVIDER_ID, { models: [{ id: 'old-only' }], defaultModel: 'old-only' });
+    let listener: ((msg: unknown) => void) | undefined;
+    const ws = { connected: true, onMessage: (cb: (msg: unknown) => void) => { listener = cb; return () => {}; }, requestTransportModels: () => 'replace-request' } as unknown as WsClient;
+    const { result, unmount } = renderHook(() => useTransportModels(ws, AGY_SDK_PROVIDER_ID, null, 'replace-session'));
+    expect(result.current.models).toEqual([{ id: 'old-only' }]);
+    const fresh = [{ id: 'gemini-3.8-flash-high' }, { id: 'new-only' }];
+    act(() => listener?.({ type: TRANSPORT_MSG.MODELS_RESPONSE, agentType: AGY_SDK_PROVIDER_ID, requestId: 'replace-request', models: fresh, defaultModel: 'gemini-3.8-flash-high', isAuthenticated: true }));
+    expect(result.current.models).toEqual(fresh);
+    expect(readCachedTransportModels(key, AGY_SDK_PROVIDER_ID)?.models).toEqual(fresh);
+    expect(JSON.parse(window.sessionStorage.getItem('imcodes:transport-models:' + key)!).models).toEqual(fresh);
+    act(() => listener?.({ type: TRANSPORT_MSG.MODELS_RESPONSE, agentType: AGY_SDK_PROVIDER_ID, requestId: 'replace-request', models: [], error: 'probe failed' }));
+    expect(result.current.models).toEqual(fresh);
+    unmount();
+    const next = renderHook(() => useTransportModels(null, AGY_SDK_PROVIDER_ID, null, 'replace-session'));
+    expect(next.result.current.models).toEqual(fresh);
+    expect(next.result.current.defaultModel).toBe('gemini-3.8-flash-high');
+  });
+
 });

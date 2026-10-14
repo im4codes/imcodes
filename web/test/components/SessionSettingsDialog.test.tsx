@@ -269,6 +269,16 @@ describe('SessionSettingsDialog supervision', () => {
     expect(screen.getByRole('option', { name: 'gemini-3.8-flash-high' })).toBeDefined();
   });
 
+  it('replaces Antigravity settings fallback options while preserving the current explicit choice', async () => {
+    const handlers = new Set<(message: unknown) => void>();
+    const ws = { connected: true, send: vi.fn(), onMessage: (cb: (message: unknown) => void) => { handlers.add(cb); return () => handlers.delete(cb); }, requestTransportModels: () => 'settings-cache-refresh' };
+    render(<SessionSettingsDialog serverId="srv-1" sessionName="agy-catalog-settings" label="AG" description="" cwd="/proj" type="agy-sdk" activeModel="user-chosen-model" requestedModel="user-chosen-model" transportConfig={null} surface="session" ws={ws as any} onClose={vi.fn()} onSaved={vi.fn()} />);
+    act(() => handlers.forEach(cb => cb({ type: 'transport.models_response', agentType: 'agy-sdk', requestId: 'settings-cache-refresh', models: [{ id: 'new-live-model' }], defaultModel: 'new-live-model' })));
+    await waitFor(() => expect(screen.getByRole('option', { name: 'new-live-model' })).toBeDefined());
+    expect(screen.queryByRole('option', { name: 'gemini-4-argon-medium' })).toBeNull();
+    expect(screen.getByRole('option', { name: 'user-chosen-model' })).toBeDefined();
+  });
+
   it('reports a model command dispatch failure without closing the settings dialog', async () => {
     const ws = makeIdentityAckWs();
     ws.sendSessionMessage.mockImplementation(() => { throw new Error('offline'); });

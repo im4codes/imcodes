@@ -2080,7 +2080,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         : isMuseSdk
           ? mergeModelSuggestions(MUSE_SDK_MODEL_SUGGESTIONS, dynamicModelIds)
           : isAgySdk
-            ? mergeModelSuggestions(AGY_SDK_MODEL_SUGGESTIONS, dynamicModelIds)
+            ? dynamicModelIds
             : dynamicModelIds;
     }
     if (isCopilot) {

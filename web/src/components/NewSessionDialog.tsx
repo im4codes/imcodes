@@ -623,7 +623,7 @@ export function NewSessionDialog({
       if (agentType === "gemini-sdk") return mergeModelSuggestions(GEMINI_SDK_MODEL_FALLBACK, dynamicModelIds);
       if (agentType === "codex-sdk") return mergeModelSuggestions(CODEX_SDK_MODEL_FALLBACK, dynamicModelIds);
       if (agentType === "muse-code-sdk") return mergeModelSuggestions(MUSE_SDK_MODEL_FALLBACK, dynamicModelIds);
-      if (agentType === AGY_SDK_PROVIDER_ID) return mergeModelSuggestions(AGY_SDK_MODEL_FALLBACK, dynamicModelIds);
+      if (agentType === AGY_SDK_PROVIDER_ID) return dynamicModelIds;
       if (agentType === CODEBUDDY_PROVIDER_IDS.CHINA) return mergeModelSuggestions(CODEBUDDY_CHINA_MODEL_FALLBACK, dynamicModelIds);
       if (agentType === CODEBUDDY_PROVIDER_IDS.INTERNATIONAL) return mergeModelSuggestions(CODEBUDDY_INTERNATIONAL_MODEL_FALLBACK, dynamicModelIds);
       return dynamicModelIds;

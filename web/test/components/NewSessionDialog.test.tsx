@@ -1221,6 +1221,7 @@ describe('NewSessionDialog', () => {
     }));
 
     await waitFor(() => expect(screen.getByRole('option', { name: 'gemini-2.5-pro' })).toBeDefined());
+    expect(screen.queryByRole('option', { name: 'gemini-4-argon-medium' })).toBeNull();
     const selects = screen.getAllByRole('combobox') as HTMLSelectElement[];
     fireEvent.input(selects[0], { target: { value: 'gemini-2.5-pro' } });
     fireEvent.click(screen.getByRole('button', { name: /start/i }));

@@ -385,7 +385,7 @@ export function StartSubSessionDialog({ ws, defaultCwd, allowedAgentTypes, overl
         : type === 'muse-code-sdk'
           ? mergeModelSuggestions(MUSE_SDK_MODEL_SUGGESTIONS, transportModels.models.map((model) => model.id))
         : type === AGY_SDK_PROVIDER_ID
-          ? mergeModelSuggestions(AGY_SDK_MODEL_SUGGESTIONS, transportModels.models.map((model) => model.id))
+          ? transportModels.models.map((model) => model.id)
         : type === CODEBUDDY_PROVIDER_IDS.CHINA
           ? mergeModelSuggestions(CODEBUDDY_CHINA_MODEL_FALLBACK, transportModels.models.map((model) => model.id))
         : type === CODEBUDDY_PROVIDER_IDS.INTERNATIONAL

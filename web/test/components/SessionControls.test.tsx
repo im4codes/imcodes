@@ -11209,6 +11209,8 @@ afterEach(() => {
 
     fireEvent.click(screen.getByRole('button', { name: /^gemini-2\.5-pro$/i }));
     const menu = document.querySelector('.menu-dropdown') as HTMLElement;
+    expect(within(menu).queryByRole('button', { name: /gemini-4-argon-medium/i })).toBeNull();
+    expect(within(menu).getAllByRole('button')).toHaveLength(2);
     fireEvent.click(within(menu).getByRole('button', { name: /gemini-2\.5-flash/i }));
 
     expectSendPayload(ws, {

@@ -903,6 +903,19 @@ describe('StartSubSessionDialog', () => {
     expect(input.value).toBe('gemini-3.8-flash-high');
   });
 
+  it('replaces Antigravity sub-session fallback options with the refreshed catalog', async () => {
+    const handlers = new Set<(message: unknown) => void>();
+    const ws = { ...makeWs(), connected: true, onMessage: (cb: (message: unknown) => void) => { handlers.add(cb); return () => handlers.delete(cb); } };
+    render(<StartSubSessionDialog ws={ws as any} defaultCwd="/tmp" isProviderConnected={() => false} getRemoteSessions={() => []} refreshSessions={vi.fn()} onStart={vi.fn()} onClose={vi.fn()} />);
+    fireEvent.click(screen.getByRole('button', { name: /agy_sdk/i }));
+    const request = ws.send.mock.calls.find(([msg]) => msg.type === 'transport.list_models' && msg.agentType === AGY_SDK_PROVIDER_ID)?.[0];
+    expect(request).toBeDefined();
+    act(() => handlers.forEach(cb => cb({ type: 'transport.models_response', agentType: AGY_SDK_PROVIDER_ID, requestId: request.requestId, models: [{ id: 'gemini-3.8-flash-high' }, { id: 'new-live-model' }], defaultModel: 'gemini-3.8-flash-high' })));
+    act(() => (screen.getByPlaceholderText('selectModel') as HTMLInputElement).focus());
+    await waitFor(() => expect(screen.getByRole('option', { name: 'new-live-model' })).toBeDefined());
+    expect(screen.queryByRole('option', { name: 'gemini-4-argon-medium' })).toBeNull();
+  });
+
   it('passes a dynamically selected model for agy-sdk sub-sessions', () => {
     const onStart = vi.fn();
     render(

@@ -934,6 +934,15 @@ export function SessionSettingsDialog({
     sessionName,
   );
   const sessionModelOptions = useMemo(() => {
+    if (agentType === AGY_SDK_PROVIDER_ID && sessionDynamicModels.models.length > 0) {
+      // The hook already supplies fallback options until a real catalog arrives.
+      // Keep an explicit current selection visible, but do not append stale
+      // hardcoded catalog entries to the provider's newer model list.
+      return mergeModelSuggestions(
+        [sessionModel, initialSessionModel].filter((value): value is string => !!value),
+        sessionDynamicModels.models.map((entry) => entry.id),
+      );
+    }
     const staticOptions = agentType === 'claude-code' || agentType === 'claude-code-sdk'
       ? [...CLAUDE_CODE_MODEL_IDS]
       : agentType === 'codex' || agentType === 'codex-sdk'
