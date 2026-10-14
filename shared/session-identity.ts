@@ -24,9 +24,9 @@ export const SESSION_SETTING_IDENTITY_SCOPES = Object.freeze([
 export type SessionSettingIdentityScope = typeof SESSION_SETTING_IDENTITY_SCOPES[number];
 
 export const SESSION_IDENTITY_USER_MAX_CHARS = 100_000;
-export const SESSION_IDENTITY_PROJECT_MAX_CHARS = 300_000;
+export const SESSION_IDENTITY_PROJECT_MAX_CHARS = 500_000;
 export const SESSION_IDENTITY_PAIR_MAX_CHARS = 200_000;
-export const SESSION_IDENTITY_SESSION_MAX_CHARS = 300_000;
+export const SESSION_IDENTITY_SESSION_MAX_CHARS = 500_000;
 /** Backward-compatible alias for the largest single profile (session scope). */
 export const SESSION_IDENTITY_MAX_CHARS = SESSION_IDENTITY_SESSION_MAX_CHARS;
 export const SESSION_IDENTITY_MAX_CHARS_BY_SCOPE: Readonly<Record<SessionIdentityScope, number>> = Object.freeze({

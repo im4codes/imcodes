@@ -363,6 +363,32 @@ describe('session identity MCP tools', () => {
     ]);
   });
 
+  it.each(['project', 'session'] as const)('accepts 500k code points through MCP for %s and rejects one more', async (identityScope) => {
+    const setIdentityProfile = vi.fn(async (input: {
+      scope: SessionIdentityProfile['scope']; scopeKey: string; content: string;
+    }) => ({ status: 'ok' as const, profile: identity(input.scope, input.scopeKey, input.content) }));
+    const handlers = createMemoryMcpToolHandlers(caller, {
+      sendDeps: { listSessions: () => [session()] },
+      setIdentityProfile: setIdentityProfile as never,
+      getEffectiveIdentityProfiles: async () => ({ status: 'ok', profiles: [] }),
+      applyEffectiveIdentity: vi.fn(async () => ({ applied: true })),
+    });
+    const content = '😀'.repeat(500_000);
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.SESSION_IDENTITY_SET]({
+      identityScope, content,
+    })).resolves.toMatchObject({ status: 'ok', saved: true });
+    expect(setIdentityProfile).toHaveBeenCalledWith(expect.objectContaining({
+      scope: identityScope, content,
+    }), {});
+
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.SESSION_IDENTITY_SET]({
+      identityScope, content: `${content}x`,
+    })).resolves.toMatchObject({
+      status: 'error', reason: 'validation_failed', message: 'identity_content_too_large',
+    });
+    expect(setIdentityProfile).toHaveBeenCalledTimes(1);
+  });
+
   it('enforces the scope-specific character budget before online storage', async () => {
     const setIdentityProfile = vi.fn();
     const handlers = createMemoryMcpToolHandlers(caller, {

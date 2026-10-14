@@ -54,13 +54,13 @@ describe('session identity contracts', () => {
     expect(rendered).toContain('Platform system/developer instructions');
   });
 
-  it('enforces user 100k, project 300k, pair 200k, and session 300k character limits', () => {
+  it('enforces user 100k, project 500k, pair 200k, and session 500k character limits', () => {
     // Pinned on purpose: these are product decisions, so a change should have
     // to be made here too rather than slipping through as a side effect.
     expect(SESSION_IDENTITY_USER_MAX_CHARS).toBe(100_000);
-    expect(SESSION_IDENTITY_PROJECT_MAX_CHARS).toBe(300_000);
+    expect(SESSION_IDENTITY_PROJECT_MAX_CHARS).toBe(500_000);
     expect(SESSION_IDENTITY_PAIR_MAX_CHARS).toBe(200_000);
-    expect(SESSION_IDENTITY_SESSION_MAX_CHARS).toBe(300_000);
+    expect(SESSION_IDENTITY_SESSION_MAX_CHARS).toBe(500_000);
     // Derived, not restated: the file pre-read must track the session cap, and
     // a second literal is how the two drift apart into a profile that validates
     // but cannot be read back off disk.
@@ -94,7 +94,7 @@ describe('identity limit propagation', () => {
   it('derives the combined ceiling from the four scopes', () => {
     expect(SESSION_IDENTITY_COMBINED_MAX_CHARS)
       .toBe(SESSION_IDENTITY_USER_MAX_CHARS + SESSION_IDENTITY_PROJECT_MAX_CHARS + SESSION_IDENTITY_PAIR_MAX_CHARS + SESSION_IDENTITY_SESSION_MAX_CHARS);
-    expect(SESSION_IDENTITY_COMBINED_MAX_CHARS).toBe(900_000);
+    expect(SESSION_IDENTITY_COMBINED_MAX_CHARS).toBe(1_300_000);
   });
 
   it('accepts every scope at exactly its limit in 4-byte code points and rejects one more', () => {

@@ -44,6 +44,22 @@ describe('daemon-local session identity store', () => {
       .toBe('local identity');
   });
 
+  it.each(['project', 'session'] as const)('persists and reopens 500k code points for %s without accepting one more', async (scope) => {
+    vi.stubEnv('IMCODES_HOME', home);
+    const content = '😀'.repeat(500_000);
+    const saved = await putLocalSessionIdentityProfile({ scope, scopeKey: 'limit-test', content, source: 'mcp' });
+    expect(saved.content).toBe(content);
+
+    resetIdentityStoreCacheForTests();
+    expect(await getLocalSessionIdentityProfile(scope, 'limit-test')).toEqual(saved);
+    await expect(putLocalSessionIdentityProfile({
+      scope, scopeKey: 'limit-test', content: `${content}x`, source: 'mcp',
+    })).rejects.toThrow('identity_content_too_large');
+
+    resetIdentityStoreCacheForTests();
+    expect(await getLocalSessionIdentityProfile(scope, 'limit-test')).toEqual(saved);
+  });
+
   it('preserves independent scopes and removes only the requested key', async () => {
     vi.stubEnv('IMCODES_HOME', home);
     await putLocalSessionIdentityProfile({ scope: 'user', scopeKey: '', content: 'user', source: 'mcp' });
