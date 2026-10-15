@@ -1389,7 +1389,7 @@ function redactPairValue(value: unknown, state: ShareScopedSocketState): unknown
   return out;
 }
 
-/** All admitted console frame variants share the same title rule; no grant metadata reaches a share. */
+/** All console frame variants use the same participant/viewer policy; obsolete grant identities never reach a share. */
 function redactPairInfoDeep(msg: Record<string, unknown>, _state: ShareScopedSocketState): Record<string, unknown> | null {
   return redactPairValue(msg, _state) as Record<string, unknown>;
 }

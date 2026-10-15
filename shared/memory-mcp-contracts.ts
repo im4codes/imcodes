@@ -1055,7 +1055,7 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
   },
   [MEMORY_MCP_TOOL_NAMES.PAIR_TASK_UPDATE]: {
     name: MEMORY_MCP_TOOL_NAMES.PAIR_TASK_UPDATE,
-    description: 'Replace the complete pair brief, set a Brain-only title, or append owner-origin task-specific title viewer grants. Brief edits do not close or advance the pair; use pair_close for terminal lifecycle decisions.',
+    description: 'Replace the complete pair brief, set a Brain-only title, or update legacy title viewer metadata. Participants use the same Pair access as owners; no separate title grant is required. Brief edits do not close or advance the pair; use pair_close for terminal lifecycle decisions.',
     inputSchema: objectSchema({ taskId: stringSchema('Optional task id.'), markdown: { type: 'string', description: 'Complete Markdown brief.' }, title: { type: 'string', minLength: 1, description: 'Owner-locale title.' }, titleViewerUserIds: { type: 'array', minItems: 1, maxItems: TASK_PAIR_TITLE_ACCESS_MAX_USERS, items: { type: 'string', minLength: 1, maxLength: TASK_PAIR_TITLE_ACCESS_MAX_USER_CHARS }, description: 'Brain only: update legacy title viewer metadata. Not required for Pair access or display.' } }),
     outputSchema: statusSchema,
   },
