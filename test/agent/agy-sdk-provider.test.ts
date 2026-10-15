@@ -37,6 +37,7 @@ const convId = resumeIdx >= 0 ? args[resumeIdx + 1] : 'conv-' + process.pid;
 const emit = (o) => process.stdout.write(JSON.stringify(o) + '\\n');
 emit({ event: 'init', conversation_id: convId, init: { cwd: process.cwd(), tools: [], permission_mode: 'always-proceed' } });
 let step = 0;
+let poisoned = false;
 let buf = '';
 process.stdin.on('data', (d) => {
   buf += d.toString();
@@ -46,6 +47,28 @@ process.stdin.on('data', (d) => {
     if (!line.trim()) continue;
     const msg = JSON.parse(line);
     const text = msg.message.content;
+    if (process.env.FAKE_AGY_ARGS_FILE) fs.appendFileSync(process.env.FAKE_AGY_ARGS_FILE + '.inputs', JSON.stringify({ pid: process.pid, text }) + '\\n');
+    if (text.startsWith('CACHE_QUOTA_BEGIN') || (poisoned && text !== 'CACHE_QUOTA_PENDING')) {
+      poisoned = true;
+      // Model the native process retaining an old terminal quota result. No
+      // new response is delivered until this process has actually exited.
+      emit({ event: 'result', result: { conversation_id: convId, status: 'ERROR', response: '', error: 'Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 50m15s.' } });
+      if (text.includes('LATE')) {
+        emit({ event: 'step_update', step_update: { conversation_id: convId, step_index: step++, state: 'DONE', step_type: 'agent_response', text_delta: 'old late frame' } });
+        emit({ event: 'result', result: { conversation_id: convId, status: 'SUCCESS', response: 'old late frame' } });
+      }
+      continue;
+    }
+    if (text === 'CACHE_QUOTA_PENDING') {
+      const finishPending = () => {
+        if (!fs.existsSync(process.env.FAKE_AGY_ARGS_FILE + '.release')) return setTimeout(finishPending, 10);
+        const idx = step++;
+        emit({ event: 'step_update', step_update: { conversation_id: convId, step_index: idx, state: 'DONE', step_type: 'agent_response', text_delta: 'Already admitted' } });
+        emit({ event: 'result', result: { conversation_id: convId, status: 'SUCCESS', response: 'Already admitted' } });
+      };
+      finishPending();
+      continue;
+    }
     if (text.includes('QUOTA_OLD_RESPONSE')) {
       emit({ event: 'step_update', step_update: { conversation_id: convId, step_index: step++, state: 'DONE', step_type: 'agent_response', text_delta: 'Hello\\n' } });
     }
@@ -259,6 +282,92 @@ describe('AgySdkProvider (fake agy process)', () => {
     expect(completes[0][1].id).not.toBe(completes[1][1].id);
   });
 
+  it('recycles a quota-poisoned process and resumes the same conversation without replaying', async () => {
+    const sid = await provider.createSession({ sessionKey: 'quota-recycle', cwd: dir, resumeId: 'same-conversation' });
+    await provider.send(sid, 'CACHE_QUOTA_BEGIN');
+    await waitFor(() => errors.length === 1);
+    expect(errors[0][1].code).toBe(PROVIDER_ERROR_CODES.RATE_LIMITED);
+    expect(completes).toHaveLength(0); // Never pretend the lost answer was delivered.
+    await provider.send(sid, 'next user turn');
+    await waitFor(() => completes.length === 1 || errors.length > 1);
+    expect(errors).toHaveLength(1);
+    expect(completes[0][1].content).toBe('Hello');
+    expect(launches()).toHaveLength(2);
+    expect(launches()[1]).toContain('same-conversation');
+    const inputs = readFileSync(argsFile + '.inputs', 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+    expect(inputs.map((input) => input.text)).toEqual(['CACHE_QUOTA_BEGIN', 'next user turn']);
+    expect(new Set(inputs.map((input) => input.pid)).size).toBe(2);
+    expect(provider.getSessionDiagnostics(sid)).toMatchObject({ inflightTurns: 0 });
+  });
+
+  it('does not kill already admitted inputs when one quota result poisons the process', async () => {
+    const sid = await provider.createSession({ sessionKey: 'quota-inflight', cwd: dir, resumeId: 'same-conversation' });
+    await provider.send(sid, 'CACHE_QUOTA_BEGIN');
+    await provider.send(sid, 'CACHE_QUOTA_PENDING');
+    await waitFor(() => errors.length === 1);
+    expect(provider.getSessionDiagnostics(sid)).toMatchObject({ alive: true, inflightTurns: 1 });
+    writeFileSync(argsFile + '.release', 'release owned pending turn');
+    await waitFor(() => completes.length === 1);
+    expect(completes[0][1].content).toBe('Already admitted');
+    await provider.send(sid, 'next user turn');
+    await waitFor(() => completes.length === 2 || errors.length > 1);
+    expect(errors).toHaveLength(1);
+    expect(launches()).toHaveLength(2);
+    expect(completes[1][1].content).toBe('Hello');
+  });
+
+  it('still reports a real quota failure on the replacement instead of retrying indefinitely', async () => {
+    const sid = await provider.createSession({ sessionKey: 'quota-still-limited', cwd: dir, resumeId: 'same-conversation' });
+    for (let i = 1; i <= 2; i++) {
+      await provider.send(sid, 'CACHE_QUOTA_BEGIN');
+      await waitFor(() => errors.length === i);
+    }
+    expect(launches()).toHaveLength(2);
+    expect(errors.every(([, error]) => error.code === PROVIDER_ERROR_CODES.RATE_LIMITED)).toBe(true);
+    expect(completes).toHaveLength(0);
+    await provider.disconnect();
+    expect(launches()).toHaveLength(2); // Recycling never starts another model turn itself.
+  });
+
+  it('coalesces recovery for concurrent sends and drops late frames from the retired child', async () => {
+    const sid = await provider.createSession({ sessionKey: 'quota-late-frames', cwd: dir, resumeId: 'same-conversation' });
+    await provider.send(sid, 'CACHE_QUOTA_BEGIN_LATE');
+    await waitFor(() => errors.length === 1);
+    await Promise.all([provider.send(sid, 'next one'), provider.send(sid, 'next two')]);
+    await waitFor(() => completes.length === 2 || errors.length > 1);
+    expect(errors).toHaveLength(1);
+    expect(completes.map(([, message]) => message.content)).toEqual(['Hello', 'Hello']);
+    expect(deltas.some(([, delta]) => delta.delta.includes('old late frame'))).toBe(false);
+    expect(launches()).toHaveLength(2);
+  });
+
+  it('Stop invalidates a send waiting for retirement, with physical exit proof and no relaunch', async () => {
+    const sid = await provider.createSession({ sessionKey: 'quota-stop-race', cwd: dir, resumeId: 'same-conversation' });
+    await provider.send(sid, 'CACHE_QUOTA_BEGIN');
+    await waitFor(() => errors.length === 1);
+    const pending = provider.send(sid, 'must not start after stop').then(() => null, (error) => error as ProviderError);
+    await provider.cancelAndWait(sid);
+    expect(await pending).toMatchObject({ code: PROVIDER_ERROR_CODES.CANCELLED });
+    expect(launches()).toHaveLength(1);
+    expect(completes).toHaveLength(0);
+    await provider.send(sid, 'explicit turn after stop');
+    await waitFor(() => completes.length === 1);
+    expect(launches()).toHaveLength(2);
+    expect(launches()[1]).toContain('same-conversation');
+  });
+
+  it('ending a session during retirement cannot resurrect it through a pending send', async () => {
+    const sid = await provider.createSession({ sessionKey: 'quota-end-race', cwd: dir, resumeId: 'same-conversation' });
+    await provider.send(sid, 'CACHE_QUOTA_BEGIN');
+    await waitFor(() => errors.length === 1);
+    const pending = provider.send(sid, 'must not resurrect').then(() => null, (error) => error as ProviderError);
+    await provider.endSession(sid);
+    expect(await pending).toMatchObject({ code: PROVIDER_ERROR_CODES.SESSION_NOT_FOUND });
+    expect(provider.getSessionDiagnostics(sid)).toBeNull();
+    expect(launches()).toHaveLength(1);
+    expect(completes).toHaveLength(0);
+  });
+
   it('completes repeated successful turns despite AG historical quota result errors, without restarting or replaying', async () => {
     const sid = await provider.createSession({ sessionKey: 'quota-history', cwd: dir, resumeId: 'existing-conversation' });
     await provider.send(sid, 'QUOTA_STALE');
@@ -283,7 +392,7 @@ describe('AgySdkProvider (fake agy process)', () => {
     await waitFor(() => errors.length + completes.length === 2);
     expect(errors).toHaveLength(1);
     expect(completes[0][1].content).toBe('Hello');
-    expect(launches()).toHaveLength(1);
+    expect(launches()).toHaveLength(2);
   });
 
   it('recognizes a completed tool turn when result.response includes earlier assistant steps', async () => {
