@@ -6100,7 +6100,7 @@ function toTargetInfo(
   defaultExecution = false,
   participantView = false,
 ): SendTargetInfo {
-  // A participant view carries no model of the project's sessions and no open-pair title (see listSendTargets).
+  // Session model discovery keeps its existing policy; Pair metadata is shared equally within the admitted project.
   const model = participantView ? undefined : resolveEffectiveSessionModel(s);
   const activeModel = participantView ? undefined : optionalModelField(s.activeModel);
   const requestedModel = participantView ? undefined : optionalModelField(s.requestedModel);
@@ -6108,7 +6108,7 @@ function toTargetInfo(
   const qwenModel = participantView ? undefined : optionalModelField(s.qwenModel);
   const activity = sessionActivityOf(s.name);
   const creationMarker = readCreationMarker(s);
-  const openPairs = participantView ? [] : getTaskPairStore().pairsForSession(s.name)
+  const openPairs = getTaskPairStore().pairsForSession(s.name)
     .filter((pair) => pair.state.brain === s.name || pair.state.executor === s.name || pair.state.auditor === s.name)
     .map((pair) => ({
       taskId: pair.state.taskId,
@@ -6133,7 +6133,7 @@ function toTargetInfo(
     ...(activity?.lastMessageAt === undefined ? {} : { lastMessageAt: activity.lastMessageAt }),
     ...(activity?.lastToolCallAt === undefined ? {} : { lastToolCallAt: activity.lastToolCallAt }),
     ...(openPairs.length === 0 ? {} : { openPairs }),
-    ...(creationMarker ? { autoCreated: { createdBy: creationMarker.createdBy, ...(creationMarker.pairTaskId && !participantView ? { pairTaskId: creationMarker.pairTaskId } : {}) } } : {}),
+    ...(creationMarker ? { autoCreated: { createdBy: creationMarker.createdBy, ...(creationMarker.pairTaskId ? { pairTaskId: creationMarker.pairTaskId } : {}) } } : {}),
     providerFamily: resolvePeerAuditProviderFamily(s),
     availability: availability.availability,
     ...(eligiblePools === undefined ? {} : {

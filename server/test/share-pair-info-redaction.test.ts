@@ -1,9 +1,5 @@
-/**
- * Owner decision (audit tsk_854675e1e2, Q3c "names are information"): a share -- viewer OR participant -- never receives a pair's title,
- * models or brief text. The pair console frames and `task_pair.event` timeline events reach a share socket through
- * `filterShareDaemonMessage`; the owner's own sockets carry no share state and are never filtered; a user the share does not cover
- * receives nothing at all.
- */
+/** Covered Pair participants have owner-equivalent access. Viewer redaction
+ * and outside-session/server filtering are unchanged. */
 import { describe, expect, it } from 'vitest';
 import { filterShareDaemonMessage } from '../src/ws/share-policy.js';
 import { WsBridge } from '../src/ws/bridge.js';
@@ -58,39 +54,57 @@ const ordinaryEvent = { type: 'timeline.event', event: { sessionId: SESSION, typ
 const text = (value: unknown) => JSON.stringify(value);
 
 describe.each([['participant'], ['viewer']] as const)('a %s share', (role) => {
-  it.each(frames)('gets %s without any pair title, model or brief, and still renders (ids, statuses, labels stay)', (_type, frame) => {
+  it.each(frames)('gets owner-equivalent %s as a participant; viewers retain redaction', (_type, frame) => {
     const out = filterShareDaemonMessage(frame, socket(role));
     expect(out).not.toBeNull();
-    expect(text(out)).not.toContain(TITLE);
-    expect(text(out)).not.toContain(BRIEF);
-    expect(text(out)).not.toContain(MODEL);
-    expect(text(out)).not.toContain('briefRevision');
+    expect(text(out).includes(TITLE)).toBe(role === 'participant');
+    expect(text(out).includes(JSON.stringify(BRIEF).slice(1, -1))).toBe(role === 'participant');
+    expect(text(out).includes(MODEL)).toBe(role === 'participant');
+    expect(text(out).includes('briefRevision')).toBe(role === 'participant');
     expect(text(out)).toContain('task-1');
-    expect(text(out)).toContain('"title":"task-1"'); // the row keeps a title: its id
+    expect(text(out)).toContain(JSON.stringify(role === 'participant' ? TITLE : 'task-1'));
     expect(text(out)).toContain('deck_sub_x');
   });
 
-  it('gets the brief reply as a well-formed "no brief", never the text', () => {
-    expect(filterShareDaemonMessage(briefResponse, socket(role))).toMatchObject({ taskId: 'task-1', brief: null, briefRevision: null });
+  it('gets the full brief as participant, or a well-formed "no brief" as viewer', () => {
+    expect(filterShareDaemonMessage(briefResponse, socket(role))).toEqual(role === 'participant' ? briefResponse : { ...briefResponse, brief: null, briefRevision: null });
   });
 
-  it('gets a task_pair.event without title and models; every other event is untouched', () => {
+  it('keeps full participant event fields, with viewer-only redaction', () => {
     const out = filterShareDaemonMessage(pairEvent, socket(role)) as { event: { payload: Record<string, unknown> } };
     expect(out.event.payload).toMatchObject({ taskId: 'task-1', verb: 'DISPATCH', executor: 'deck_sub_x', executorLabel: 'Exec', round: 1, blocking: ['P0'] });
-    for (const key of ['title', 'executorModel', 'auditorModel', 'executorThinking', 'auditorThinking', 'noticeText', 'blockedNote', 'auditDetails', 'cancelReason', 'checklistAutoTickNotice', 'futurePrivateNotice']) expect(out.event.payload, key).not.toHaveProperty(key);
+    expect(out.event.payload.title).toBe(role === 'participant' ? TITLE : undefined);
+    if (role === 'participant') expect(out.event).toEqual(pairEvent.event);
+    else for (const key of ['executorModel', 'auditorModel', 'executorThinking', 'auditorThinking', 'noticeText', 'blockedNote', 'auditDetails', 'cancelReason', 'checklistAutoTickNotice', 'futurePrivateNotice']) expect(out.event.payload, key).not.toHaveProperty(key);
     expect(filterShareDaemonMessage(ordinaryEvent, socket(role))).toEqual(ordinaryEvent);
   });
 
-  it('gets chat history with its task_pair.event entries redacted and the rest untouched', () => {
+  it('applies the same participant/viewer rule to chat history', () => {
     const history = { type: TRANSPORT_MSG.CHAT_HISTORY, sessionId: SESSION, events: [pairEvent.event, ordinaryEvent.event] };
     const out = filterShareDaemonMessage(history, socket(role)) as { events: Array<Record<string, any>> };
-    expect(text(out.events[0])).not.toContain(TITLE);
-    expect(text(out.events[0])).not.toContain(MODEL);
+    expect(text(out.events[0]).includes(TITLE)).toBe(role === 'participant');
+    expect(text(out.events[0]).includes(MODEL)).toBe(role === 'participant');
+    if (role === 'participant') expect(out.events[0]).toEqual(pairEvent.event);
     expect(out.events[1]).toEqual(ordinaryEvent.event);
   });
 });
 
 describe('everyone else', () => {
+  it.each(['participant', 'viewer'] as const)('uses the same role rule through the real bridge relay (%s)', (role) => {
+    const relay = (WsBridge.prototype as unknown as { filterShareOutgoingJson(ws: unknown, msg: Record<string, unknown>, json: string): string | null }).filterShareOutgoingJson;
+    const ws = {};
+    const bridge = { browserShareStates: new Map([[ws, socket(role)]]) };
+    for (const frame of [...frames.map(([, msg]) => msg), pairEvent, briefResponse]) {
+      const result = relay.call(bridge, ws, frame, text(frame));
+      expect(result).not.toBeNull();
+      if (role === 'participant') expect(JSON.parse(result!)).toEqual(frame);
+      else {
+        expect(result).not.toContain(MODEL);
+        expect(result).not.toContain(TITLE);
+      }
+    }
+  });
+
   it('a user whose share does not cover the session receives none of it', () => {
     const other: ShareTarget = { kind: 'main', serverId, sessionName: 'deck_other_brain' };
     for (const [, frame] of frames) expect(filterShareDaemonMessage(frame, socket('participant', other))).toBeNull();
@@ -117,9 +131,9 @@ describe('everyone else', () => {
   });
 });
 
-describe('explicit task-level title visibility', () => {
+describe('task title visibility follows admitted participant coverage, not legacy grants', () => {
   const titleAccess = { brief: { version: 1, serverId, userIds: ['shared-user'] } };
-  it.each(frames)('preserves an authorized title on %s, but never other private fields or grant identities', (_name, frame) => {
+  it.each(frames)('preserves an authorized title on %s, including models/brief, but never obsolete grant identities', (_name, frame) => {
     const input = structuredClone(frame) as any;
     if (input.tasks) input.tasks[0].titleAccess = titleAccess;
     if (input.task) input.task.titleAccess = titleAccess;
@@ -127,33 +141,37 @@ describe('explicit task-level title visibility', () => {
     const original = structuredClone(input);
     const out = filterShareDaemonMessage(input, socket('participant'));
     expect(text(out)).toContain(TITLE);
-    for (const secret of [BRIEF, MODEL, 'titleAccess', 'shared-user']) expect(text(out)).not.toContain(secret);
+    expect(text(out)).toContain(BRIEF.replaceAll('\n', '\\n'));
+    expect(text(out)).toContain(MODEL);
+    for (const secret of ['titleAccess', 'shared-user']) expect(text(out)).not.toContain(secret);
     expect(input).toEqual(original);
     expect(text(filterShareDaemonMessage(input, socket('viewer')))).not.toContain(TITLE);
-    expect(text(filterShareDaemonMessage(input, { ...socket('participant'), userId: 'different-user' }))).not.toContain(TITLE);
+    expect(text(filterShareDaemonMessage(input, { ...socket('participant'), userId: 'different-user' }))).toContain(TITLE);
   });
   it('keeps grant identities protected by older servers that drop only known private keys', () => {
     const oldProjection = JSON.stringify({ titleAccess }, (key, value) => key === 'brief' ? undefined : value);
     expect(oldProjection).not.toContain('shared-user');
     expect(oldProjection).not.toContain(serverId);
   });
-  it('does not reveal another private task in the same Brain console', () => {
+  it('names every admitted task in the covered Brain console without requiring a backfill', () => {
     const input = { ...frames[0]![1], tasks: [{ ...taskRow, titleAccess }, { ...taskRow, taskId: 'private-task', title: 'Another user private title' }] };
     const out = filterShareDaemonMessage(input, socket('participant'));
     expect(text(out)).toContain(TITLE);
-    expect(text(out)).not.toContain('Another user private title');
+    expect(text(out)).toContain('Another user private title');
   });
-  it('applies the exact same grant to live and stored events, preserving the free-text allowlist', () => {
+  it('applies the same participant access to live and stored events, including free text, not just the former allowlist', () => {
     const event = { ...pairEvent.event, payload: { ...pairEvent.event.payload, titleAccess } };
     const live = filterShareDaemonMessage({ ...pairEvent, event }, socket('participant'));
     const history = filterShareDaemonMessage({ type: TRANSPORT_MSG.CHAT_HISTORY, sessionId: SESSION, events: [event] }, socket('participant'));
     for (const out of [live, history]) {
       expect(text(out)).toContain(TITLE);
-      for (const secret of [BRIEF, MODEL, 'noticeText', 'auditDetails', 'titleAccess', 'shared-user']) expect(text(out)).not.toContain(secret);
+      for (const value of [MODEL, 'noticeText', 'auditDetails']) expect(text(out)).toContain(value);
+      for (const secret of ['titleAccess', 'shared-user']) expect(text(out)).not.toContain(secret);
     }
   });
-  it.each([undefined, { brief: { ...titleAccess.brief, serverId: 'foreign' } }, { brief: { ...titleAccess.brief, version: 99 } }, { brief: { ...titleAccess.brief, userIds: ['other'] } }])('fails closed for missing/mismatched grant %j', (grant) => {
+  it.each([undefined, { brief: { ...titleAccess.brief, serverId: 'foreign' } }, { brief: { ...titleAccess.brief, version: 99 } }, { brief: { ...titleAccess.brief, userIds: ['other'] } }])('shows legacy participant names even with absent/stale grant %j', (grant) => {
     const input = { ...frames[0]![1], tasks: [{ ...taskRow, titleAccess: grant }] };
-    expect(text(filterShareDaemonMessage(input, socket('participant')))).not.toContain(TITLE);
+    expect(text(filterShareDaemonMessage(input, socket('participant')))).toContain(TITLE);
+    expect(text(filterShareDaemonMessage(input, socket('viewer')))).not.toContain(TITLE);
   });
 });

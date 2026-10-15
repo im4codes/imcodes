@@ -69,7 +69,7 @@ describe.each([true, false])('scoped real SDK pair lifecycle (participant=%s)', 
       upsertSession(sessions.find((entry) => entry.name === EXEC)!);
       const dispatch = await call(brain.client, N.PAIR_DISPATCH, { taskId, idempotencyKey: 'sdk-dispatch' });
       expect(dispatch, JSON.stringify(dispatch)).toMatchObject({ status: 'ok' });
-      expect(await call(brain.client, N.PAIR_TASK_GET, { taskId })).toMatchObject({ taskId, title: participant ? null : args.title, markdown: participant ? null : args.brief });
+      expect(await call(brain.client, N.PAIR_TASK_GET, { taskId })).toMatchObject({ taskId, title: args.title, markdown: args.brief });
       // The executor's normal marker opens a material-backed report audit; no production session or agent is launched.
       taskPairService.applyMarker({ project: PROJECT, writer: EXEC, marker: { verb: 'READY_FOR_AUDIT', knownVerb: 'READY_FOR_AUDIT', taskId, attrs: {} }, source: 'explicit_marker', eventId: 'sdk-ready', turnText: 'Scoped validation report: all checks passed.' });
       expect(getTaskPairStore().getPair(PROJECT, taskId)?.state.status).toBe('in_audit');
@@ -86,8 +86,8 @@ describe.each([true, false])('scoped real SDK pair lifecycle (participant=%s)', 
   });
 });
 
-describe('trusted creator title provenance via real MCP', () => {
-  it.each([false, true])('persists creator grants across restart, never grants replayers, and accepts owner-only legacy grants (fallback=%s)', async (fallback) => {
+describe('participant Pair access requires no separate title authority', () => {
+  it.each([false, true])('legacy pairs stay fully readable across restart and legacy grant updates (fallback=%s)', async (fallback) => {
     const oldEngine = process.env.IMCODES_SUPERVISION_ENGINE;
     process.env.IMCODES_SUPERVISION_ENGINE = 'pairs';
     const dbPath = join(process.env.HOME!, `pair-title-sdk-${fallback}.sqlite`);
@@ -113,19 +113,19 @@ describe('trusted creator title provenance via real MCP', () => {
       const created = await call(N.PAIR_CREATE, args);
       expect(created).toMatchObject({ status: 'ok', created: true });
       const taskId = String(created.taskId);
-      expect(store!.getPair(PROJECT, taskId)?.state.titleAccess).toEqual({ version: 1, serverId: 'sdk-source', userIds: ['alice'] });
+      expect(store!.getPair(PROJECT, taskId)?.state.titleAccess).toBeUndefined();
       setTaskPairStoreForTests(undefined); store = new TaskPairStore(dbPath); setTaskPairStoreForTests(store);
-      expect(await call(N.PAIR_TASK_GET, { taskId })).toMatchObject({ title: args.title, markdown: null });
-      expect(await call(N.PAIR_TASK_UPDATE, { taskId, title: '主站BI发布准备' })).toMatchObject({ title: '主站BI发布准备', markdown: null });
+      expect(await call(N.PAIR_TASK_GET, { taskId })).toMatchObject({ title: args.title, markdown: '- [ ][ ] private brief' });
+      expect(await call(N.PAIR_TASK_UPDATE, { taskId, title: '主站BI发布准备' })).toMatchObject({ title: '主站BI发布准备', markdown: '- [ ][ ] private brief' });
       userId = 'bob';
       expect(await call(N.PAIR_CREATE, args)).toMatchObject({ status: 'ok', idempotentReplay: true });
-      expect(store!.getPair(PROJECT, taskId)?.state.titleAccess?.userIds).toEqual(['alice']);
-      expect(await call(N.PAIR_TASK_GET, { taskId })).toMatchObject({ title: null });
-      expect(await call(N.PAIR_TASK_UPDATE, { taskId, titleViewerUserIds: ['bob'] })).toMatchObject({ status: 'error', reason: 'scope_forbidden' });
+      expect(store!.getPair(PROJECT, taskId)?.state.titleAccess).toBeUndefined();
+      expect(await call(N.PAIR_TASK_GET, { taskId })).toMatchObject({ title: '主站BI发布准备', markdown: '- [ ][ ] private brief' });
+      expect(await call(N.PAIR_TASK_UPDATE, { taskId, titleViewerUserIds: ['bob'] })).toMatchObject({ title: '主站BI发布准备' });
       participantView = false;
       expect(await call(N.PAIR_TASK_UPDATE, { taskId, titleViewerUserIds: ['bob'] })).toMatchObject({ title: '主站BI发布准备' });
       participantView = true;
-      expect(await call(N.PAIR_TASK_GET, { taskId })).toMatchObject({ title: '主站BI发布准备', markdown: null });
+      expect(await call(N.PAIR_TASK_GET, { taskId })).toMatchObject({ title: '主站BI发布准备', markdown: '- [ ][ ] private brief' });
     } finally {
       await client.close(); await server.close();
       if (oldEngine === undefined) delete process.env.IMCODES_SUPERVISION_ENGINE; else process.env.IMCODES_SUPERVISION_ENGINE = oldEngine;

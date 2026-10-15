@@ -1,4 +1,4 @@
-import { canReadTaskPairWireTitle, TASK_PAIR_TITLE_ACCESS_FIELD } from '../../../shared/task-pair-title-access.js';
+import { TASK_PAIR_TITLE_ACCESS_FIELD } from '../../../shared/task-pair-title-access.js';
 import type { Database } from '../db/client.js';
 import { resolveEffectiveShareCoverage } from '../db/tab-sharing.js';
 import { evaluateP2pSendTargetScope } from '../share/p2p-send-scope.js';
@@ -357,8 +357,7 @@ export const SHARE_SCOPED_DAEMON_MESSAGE_POLICY = new Map<string, DaemonMessageP
     target: timelineEventTarget,
     redact: redactTimelineEventPairInfo,
   }],
-  // Pair titles, models and brief text are the project's work, not the shared session's: a share (viewer OR participant) gets the pair
-  // console without them (owner decision on audit tsk_854675e1e2, Q3c). The frames keep their shape so the console still renders.
+  // Covered participants have the same Pair view as owners. Only viewers retain the restricted projection.
   [SUPERVISION_TASK_CONSOLE_MSG.SNAPSHOT, { target: supervisionTaskConsoleTarget, mainOrServerShareOnly: true, redact: redactPairInfoDeep }],
   [SUPERVISION_TASK_CONSOLE_MSG.DELTA, { target: supervisionTaskConsoleTarget, mainOrServerShareOnly: true, redact: redactPairInfoDeep }],
   [SUPERVISION_TASK_CONSOLE_MSG.RESYNC_REQUIRED, { target: supervisionTaskConsoleTarget, mainOrServerShareOnly: true }],
@@ -1363,7 +1362,7 @@ function redactTransportHistory(msg: Record<string, unknown>, _state: ShareScope
   return { ...msg, events: msg.events.map((event) => redactPairTimelineEvent(event, _state)) };
 }
 
-// ── pair information: only task-authorized participants may see titles; models/briefs stay private ──────────────────────────────
+// ── Pair information: participants have owner-equivalent views; viewers stay restricted ──────────────────────────────
 
 /** Keys that carry a pair's model / brief / objective on console rows and pair events. */
 const SHARE_HIDDEN_PAIR_KEYS: ReadonlySet<string> = new Set([
@@ -1378,28 +1377,29 @@ function redactPairValue(value: unknown, state: ShareScopedSocketState): unknown
   const record = value as Record<string, unknown>;
   const out: Record<string, unknown> = {};
   for (const [key, inner] of Object.entries(record)) {
-    if (SHARE_HIDDEN_PAIR_KEYS.has(key) || key === TASK_PAIR_TITLE_ACCESS_FIELD) continue;
+    if (key === TASK_PAIR_TITLE_ACCESS_FIELD || (state.snapshot.effectiveRole !== 'participant' && SHARE_HIDDEN_PAIR_KEYS.has(key))) continue;
     out[key] = redactPairValue(inner, state);
   }
-  // Legacy/private tasks retain the id fallback; trusted per-task grants reveal only the title.
+  // Coverage is checked before this projection. Participants receive the
+  // same Pair fields as owners; only obsolete grant identities are omitted.
+  // Viewer redaction is unchanged.
   if (typeof record.taskId === 'string' && typeof record.title === 'string') {
-    out.title = state.snapshot.effectiveRole === 'participant'
-      && canReadTaskPairWireTitle(record.titleAccess, { serverId: state.target.serverId, userId: state.userId }) ? record.title : record.taskId;
+    out.title = state.snapshot.effectiveRole === 'participant' ? record.title : record.taskId;
   }
   return out;
 }
 
-/** All console frame variants use the same title-only task grant; no grant metadata reaches a share. */
+/** All admitted console frame variants share the same title rule; no grant metadata reaches a share. */
 function redactPairInfoDeep(msg: Record<string, unknown>, _state: ShareScopedSocketState): Record<string, unknown> | null {
   return redactPairValue(msg, _state) as Record<string, unknown>;
 }
 
-/** The brief itself is never sent: the reply stays well-formed ("no brief") so the console does not wait for one. */
+/** Participants receive the normal brief reply; viewers retain the well-formed "no brief" projection. */
 function redactBriefResponse(msg: Record<string, unknown>, _state: ShareScopedSocketState): Record<string, unknown> | null {
-  return { ...msg, brief: null, briefRevision: null };
+  return _state.snapshot.effectiveRole === 'participant' ? msg : { ...msg, brief: null, briefRevision: null };
 }
 
-// Only operational metadata is public to a share. Free-text notices (including cancellation/checklist/audit messages) originate in
+// Only operational metadata is public to a viewer. Free-text notices (including cancellation/checklist/audit messages) originate in
 // private pair turns and can quote the title, model or assigned brief under any key. An allowlist closes that entire class, including
 // stored frames from older/newer daemons, without changing ordinary shared-session chat or the owner's unfiltered copy.
 const SHARE_PAIR_EVENT_OPERATIONAL_KEYS: ReadonlySet<string> = new Set([
@@ -1410,17 +1410,15 @@ const SHARE_PAIR_EVENT_OPERATIONAL_KEYS: ReadonlySet<string> = new Set([
   'executorPool', 'auditorPool', 'checklistAutoTickReason',
 ]);
 
-/** Only a task-authorized participant keeps the title; models and private notices remain redacted. */
+/** Covered participants receive full Pair history; viewers retain the operational allowlist. */
 function redactPairTimelineEvent(event: unknown, state: ShareScopedSocketState): unknown {
   if (!event || typeof event !== 'object' || Array.isArray(event)) return event;
   const record = event as Record<string, unknown>;
   if (record.type !== TASK_PAIR_TIMELINE_EVENT) return event;
+  if (state.snapshot.effectiveRole === 'participant') return redactPairValue(event, state);
   const payload = record.payload && typeof record.payload === 'object' && !Array.isArray(record.payload)
     ? Object.fromEntries(Object.entries(record.payload).filter(([key]) => SHARE_PAIR_EVENT_OPERATIONAL_KEYS.has(key)))
     : {};
-  const original = record.payload as Record<string, unknown> | undefined;
-  if (state.snapshot.effectiveRole === 'participant' && typeof original?.title === 'string'
-    && canReadTaskPairWireTitle(original.titleAccess, { serverId: state.target.serverId, userId: state.userId })) payload.title = original.title;
   return { ...record, payload };
 }
 
@@ -1525,4 +1523,3 @@ function redactRepoDaemonMessage(
   }
   return null;
 }
-

@@ -1,7 +1,7 @@
 /**
  * Only exec_remote is refused solely because a shared-session participant started the current turn.
  * Other registered tools retain their original authority checks; unknown names are still rejected by registration/discovery.
- * Participant provenance and private pair-field projections are independent of this execution restriction.
+ * Pair tools and projections add no participant-only restrictions; their normal task/session role checks still apply.
  */
 import { MEMORY_MCP_TOOL_NAMES } from './memory-mcp-contracts.js';
 

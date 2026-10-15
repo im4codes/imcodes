@@ -1,4 +1,4 @@
-import { canReadTaskPairTitle, TASK_PAIR_TITLE_ACCESS_MAX_USERS, TASK_PAIR_TITLE_ACCESS_MAX_USER_CHARS, type TaskPairTitleTurn } from '../../shared/task-pair-title-access.js';
+import { TASK_PAIR_TITLE_ACCESS_MAX_USERS, TASK_PAIR_TITLE_ACCESS_MAX_USER_CHARS, type TaskPairTitleTurn } from '../../shared/task-pair-title-access.js';
 import { installMcpErrorResultBoundary } from './mcp-error-result-boundary.js';
 import { withPairsLegacyTools } from './task-pairs/legacy-tools.js';
 import { SEND_COMMAND_DESCRIPTION, SEND_COMMAND_FIELD } from '../../shared/send-command-mode.js';
@@ -343,7 +343,7 @@ export interface MemoryMcpToolDeps {
    * It must resolve true when the answer cannot be obtained -- an unknown turn is treated as a participant turn.
    */
   participantTurnRequired?: () => Promise<boolean>;
-  /** Trusted per-operation turn identity; never taken from tool input or caller.userId. */
+  /** Legacy injection seam; Pair visibility no longer depends on separate title authority. */
   pairTitleTurn?: () => Promise<TaskPairTitleTurn>;
   /** MCP child only: hand legacy supervision tool calls to the daemon (pairs engine). */
   legacyToolForwarder?: import('./task-pairs/legacy-tools.js').TaskPairLegacyToolForwarder;
@@ -1644,10 +1644,10 @@ function pairAccessError(access: PairChecklistAccess): ToolResult {
     : error(MCP_ERROR_REASONS.PROJECTION_UNAVAILABLE, 'task pair not found');
 }
 
-function pairChecklistView(pair: ReturnType<typeof pairChecklistTarget>, participantView = false, titleVisible = !participantView) {
+function pairChecklistView(pair: ReturnType<typeof pairChecklistTarget>) {
   if (!pair) return undefined;
   const markdown = pair.state.brief ?? '';
-  return { taskId: pair.state.taskId, title: titleVisible ? (pair.state.title ?? null) : null, markdown: participantView ? null : markdown, status: pair.state.status, executor: pair.state.executor, auditor: pair.state.auditor, brain: pair.state.brain, round: pair.state.round, flags: pair.state.flags, blocking: pair.state.blocking, previousAuditors: pair.state.previousAuditors, capCounts: pair.state.capCounts, workspaceKind: pair.state.workspaceKind, lastVerdict: pair.state.lastVerdict, createdAt: pair.state.createdAt, updatedAt: pair.state.updatedAt, workspace: pair.state.workspace, material: pair.state.material, output: pair.state.output, resourceClaims: pair.state.resourceClaims ?? [], resourceCleanup: pair.state.resourceCleanup ?? null, ...taskPairChecklistCounts(markdown) };
+  return { taskId: pair.state.taskId, title: pair.state.title ?? null, markdown, status: pair.state.status, executor: pair.state.executor, auditor: pair.state.auditor, brain: pair.state.brain, round: pair.state.round, flags: pair.state.flags, blocking: pair.state.blocking, previousAuditors: pair.state.previousAuditors, capCounts: pair.state.capCounts, workspaceKind: pair.state.workspaceKind, lastVerdict: pair.state.lastVerdict, createdAt: pair.state.createdAt, updatedAt: pair.state.updatedAt, workspace: pair.state.workspace, material: pair.state.material, output: pair.state.output, resourceClaims: pair.state.resourceClaims ?? [], resourceCleanup: pair.state.resourceCleanup ?? null, ...taskPairChecklistCounts(markdown) };
 }
 
 function savePairBrief(pair: NonNullable<ReturnType<typeof pairChecklistTarget>>, markdown: string, writer: string) {
@@ -1798,40 +1798,31 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
     if (!deps.participantTurnRequired) return false;
     try { return await deps.participantTurnRequired(); } catch { return true; }
   };
-  const pairTitleTurn = async (project: string): Promise<TaskPairTitleTurn> => {
-    if (!deps.pairTitleTurn) return { participantView: await participantViewRequired() };
-    try {
-      const turn = await deps.pairTitleTurn();
-      if (turn.participantView === false) return { participantView: false };
-      return { participantView: true, ...(turn.actor?.sessionName === caller.sessionName && turn.actor.projectName === project ? { actor: turn.actor } : {}) };
-    } catch { return { participantView: true }; }
-  };
-  const titleVisible = (pair: StoredTaskPair, turn: TaskPairTitleTurn) => !turn.participantView || canReadTaskPairTitle(pair.state.titleAccess, turn.actor);
+  // Task/session access is checked before projection. A title is part of an
+  // admitted task's identity, including legacy tasks with no titleAccess.
   const pairProjection = (
     stored: StoredTaskPair,
     sessions: SessionRecord[],
     queuePositions: Map<string, number> = new Map(),
-    participantView = false,
-    titleAllowed = !participantView,
   ) => {
     const state = stored.state;
     return {
       taskId: state.taskId,
-      title: titleAllowed ? (state.title ?? null) : null,
+      title: state.title ?? null,
       status: state.status,
       round: state.round,
       blocking: state.blocking,
       executor: pairParticipant(state.executor, sessions),
       auditor: pairParticipant(state.auditor, sessions),
-      executorModel: participantView ? null : (state.executorModel ?? null),
-      auditorModel: participantView ? null : (state.auditor === 'none' ? 'none' : (state.auditorModel ?? null)),
+      executorModel: state.executorModel ?? null,
+      auditorModel: state.auditor === 'none' ? 'none' : (state.auditorModel ?? null),
       queuePosition: state.status === 'queued' ? (queuePositions.get(state.taskId) ?? null) : null,
       urgent: (state as TaskPairState & { urgent?: boolean }).urgent === true,
       queuedAt: state.createdAt,
       startedAt: state.status === 'queued' ? null : (state.startedAt ?? state.createdAt),
       updatedAt: state.updatedAt,
       flags: state.flags,
-      brief: participantView ? null : (state.brief ?? null),
+      brief: state.brief ?? null,
       // What Brain asked for (auto when it left the choice to the daemon) and what exists on disk now.
       workspace: {
         requested: state.workspaceKind ?? 'auto',
@@ -2229,10 +2220,9 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       const taskId = typeof input === 'object' && input !== null && typeof (input as Record<string, unknown>).taskId === 'string' ? String((input as Record<string, unknown>).taskId) : undefined;
       const access = pairChecklistAccess(caller, await sendSessions(), taskId);
       if (access.status !== 'ok') return pairAccessError(access);
-      const turn = await pairTitleTurn(access.pair.project);
       const current = refreshPairChecklistAccess(caller, access.pair);
       if (current.status !== 'ok') return pairAccessError(current);
-      const view = pairChecklistView(current.pair, turn.participantView, titleVisible(current.pair, turn))!;
+      const view = pairChecklistView(current.pair)!;
       const profile = await getLocalSessionIdentityProfile(SESSION_IDENTITY_SCOPES.PAIR, sessionIdentityPairKey(access.pair.state.taskId)).catch(() => null);
       return {
         ...view,
@@ -2248,12 +2238,11 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       if (markdown === undefined && !title && viewers === undefined) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'markdown, title or titleViewerUserIds is required');
       const access = pairChecklistAccess(caller, await sendSessions(), typeof args.taskId === 'string' ? args.taskId : undefined);
       if (access.status !== 'ok') return pairAccessError(access);
-      const turn = await pairTitleTurn(access.pair.project);
       const current = refreshPairChecklistAccess(caller, access.pair);
       if (current.status !== 'ok') return pairAccessError(current);
       const pair = current.pair;
       if (viewers !== undefined) {
-        if (turn.participantView || !caller.serverId || pair.state.brain !== caller.sessionName) return error(MCP_ERROR_REASONS.SCOPE_FORBIDDEN, 'only an owner-origin Brain turn may grant task title visibility');
+        if (!caller.serverId || pair.state.brain !== caller.sessionName) return error(MCP_ERROR_REASONS.SCOPE_FORBIDDEN, 'only the project Brain may update legacy title viewer metadata');
         if (!taskPairService.grantTaskPairTitle(pair.project, pair.state.taskId, caller.serverId, viewers as string[], caller.sessionName, title)) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'invalid title or title viewer grant');
       } else if (title) {
         const savedTitle = taskPairService.setTaskPairTitle(pair.project, pair.state.taskId, title, caller.sessionName ?? 'unknown');
@@ -2262,7 +2251,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       const latest = getTaskPairStore().getPair(pair.project, pair.state.taskId);
       const saved = markdown !== undefined && latest ? savePairBrief(latest, markdown, caller.sessionName ?? 'unknown') : latest;
       if (!saved) return pairAccessError({ status: 'forbidden', pair });
-      return pairChecklistView(saved, turn.participantView, titleVisible(saved, turn))!;
+      return pairChecklistView(saved)!;
     },
     [MEMORY_MCP_TOOL_NAMES.PAIR_TASK_CHECK]: async (input) => {
       const args = (input && typeof input === 'object' ? input : {}) as Record<string, unknown>;
@@ -2271,14 +2260,13 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       if (!items || !box || typeof args.checked !== 'boolean') return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'items, box and checked are required');
       const access = pairChecklistAccess(caller, await sendSessions(), typeof args.taskId === 'string' ? args.taskId : undefined);
       if (access.status !== 'ok') return pairAccessError(access);
-      const turn = await pairTitleTurn(access.pair.project);
       const current = refreshPairChecklistAccess(caller, access.pair);
       if (current.status !== 'ok') return pairAccessError(current);
       const pair = current.pair;
       const markdown = updateTaskPairChecklist(pair.state.brief ?? '', items, box, args.checked);
       const saved = savePairBrief(pair, markdown, caller.sessionName ?? 'unknown');
       if (!saved) return pairAccessError({ status: 'forbidden', pair });
-      return pairChecklistView(saved, turn.participantView, titleVisible(saved, turn))!;
+      return pairChecklistView(saved)!;
     },
     [MEMORY_MCP_TOOL_NAMES.PAIR_RESOURCE_CLAIM]: async (input) => {
       const args = (input && typeof input === 'object' ? input : {}) as Record<string, unknown>;
@@ -3353,8 +3341,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       const queued = pairs.filter((pair) => pair.state.status === 'queued').sort(compareQueuedTaskPairs);
       const rest = pairs.filter((pair) => pair.state.status !== 'queued');
       const ordered = [...queued, ...rest];
-      const turn = await pairTitleTurn(context.project);
-      return { status: 'ok', pairs: ordered.map((pair) => pairProjection(pair, context.sessions, queuePositions, turn.participantView, titleVisible(pair, turn))) };
+      return { status: 'ok', pairs: ordered.map((pair) => pairProjection(pair, context.sessions, queuePositions)) };
     },
     [MEMORY_MCP_TOOL_NAMES.PAIR_GET]: async (input) => {
       const context = await pairCallerContext();
@@ -3372,20 +3359,18 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       const queuePositions = stored.state.status === 'queued'
         ? queuePositionsOf(getTaskPairStore().listPairsForBrain(caller.sessionName!, context.project, false, 500))
         : new Map<string, number>();
-      const turn = await pairTitleTurn(context.project);
       const current = refreshPairChecklistAccess(caller, stored);
       if (current.status !== 'ok') return pairAccessError(current);
-      const participantView = turn.participantView;
       const events = getTaskPairStore().listEvents(context.project, taskId, eventLimit);
       const profile = await getLocalSessionIdentityProfile(SESSION_IDENTITY_SCOPES.PAIR, sessionIdentityPairKey(taskId)).catch(() => null);
       return {
         status: 'ok',
         pair: {
-          ...pairProjection(current.pair, context.sessions, queuePositions, participantView, titleVisible(current.pair, turn)),
+          ...pairProjection(current.pair, context.sessions, queuePositions),
           pairIdentity: profile?.content ?? null,
-          // Marker attrs can contain titles/models and arbitrary brief or report text under different keys. Keep transition metadata,
-          // not raw attrs, for the entire history (including older stored events); the owner's view and stored records are unchanged.
-          events: participantView ? events.map((event) => ({ ...event, attrs: {} })) : events,
+          // Task/session and role checks above apply equally to owner and
+          // participant turns; Pair history is not a separate restricted view.
+          events,
         },
       };
     },
@@ -3400,7 +3385,6 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
         return error(MCP_ERROR_REASONS.CONTROL_PLANE_UNAVAILABLE, `project '${context.project}' has no Brain session, so pair_create cannot start a pair here`);
       }
       const brainName = caller.sessionName;
-      const creationTurn = await pairTitleTurn(context.project);
       const args = pickAllowedMcpArgs(input, ['taskId', 'title', 'brief', 'executor', 'auditor', 'executorModel', 'auditorModel', 'createExecutor', 'createAuditor', 'executionPool', 'workspace', 'idempotencyKey']);
       const executorArg = stringArg(args, 'executor');
       const workspaceArg = stringArg(args, 'workspace');
@@ -3512,7 +3496,6 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
               eventId,
               suppressAutomaticBrief: true,
             });
-        if (transition?.effect === 'created' && creationTurn.actor) taskPairService.grantTaskPairTitle(context.project, taskId, creationTurn.actor.serverId, [creationTurn.actor.userId], brainName);
         // A pair with no named executor starts through the queue right away (the daemon picks from the pool, or the no-pool default).
         if (!executor && transition) await taskPairAutomation.runQueue(context.project, brainName);
         const stored = store.getPair(context.project, taskId);
@@ -4860,7 +4843,7 @@ function toolResult(result: ToolResult, name?: MemoryMcpToolName): CallToolResul
 
 const schemas = {
   [MEMORY_MCP_TOOL_NAMES.PAIR_TASK_GET]: z.object({ taskId: z.string().optional().describe('Pair task id.') }),
-  [MEMORY_MCP_TOOL_NAMES.PAIR_TASK_UPDATE]: z.object({ taskId: z.string().optional().describe('Pair task id.'), markdown: z.string().optional().describe('Complete Markdown brief.'), title: z.string().min(1).optional().describe('Short specific title in the owner UI language; Brain only.'), titleViewerUserIds: z.array(z.string().min(1).max(TASK_PAIR_TITLE_ACCESS_MAX_USER_CHARS)).min(1).max(TASK_PAIR_TITLE_ACCESS_MAX_USERS).optional().describe('Owner-origin Brain only: append explicit title-only viewer user ids for this task. Does not reveal brief/models or authorize other tasks.') }).refine((value) => value.markdown !== undefined || value.title !== undefined || value.titleViewerUserIds !== undefined, { message: 'markdown, title or titleViewerUserIds is required' }),
+  [MEMORY_MCP_TOOL_NAMES.PAIR_TASK_UPDATE]: z.object({ taskId: z.string().optional().describe('Pair task id.'), markdown: z.string().optional().describe('Complete Markdown brief.'), title: z.string().min(1).optional().describe('Short specific title in the owner UI language; Brain only.'), titleViewerUserIds: z.array(z.string().min(1).max(TASK_PAIR_TITLE_ACCESS_MAX_USER_CHARS)).min(1).max(TASK_PAIR_TITLE_ACCESS_MAX_USERS).optional().describe('Brain only: update legacy title viewer metadata. Not required for Pair access or display.') }).refine((value) => value.markdown !== undefined || value.title !== undefined || value.titleViewerUserIds !== undefined, { message: 'markdown, title or titleViewerUserIds is required' }),
   [MEMORY_MCP_TOOL_NAMES.PAIR_TASK_CHECK]: z.object({ taskId: z.string().optional().describe('Pair task id.'), items: z.array(z.number().int().positive()).describe('1-based checklist item numbers.'), box: z.enum(['implemented', 'audited']).describe('Box to update.'), checked: z.boolean().describe('New state.') }),
   [MEMORY_MCP_TOOL_NAMES.PAIR_RESOURCE_CLAIM]: z.object({ taskId: z.string().optional(), resource: z.string().min(1).max(500), mode: z.enum(['exclusive', 'shared']), ttlMs: z.number().int().min(60000).max(86400000).optional(), renew: z.boolean().optional() }),
   [MEMORY_MCP_TOOL_NAMES.SEARCH_MEMORY]: z.object({
