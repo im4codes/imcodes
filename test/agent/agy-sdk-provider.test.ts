@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -15,6 +15,7 @@ import {
   SDK_SUBAGENT_PROVIDER_KINDS,
   SDK_SUBAGENT_STATUS,
 } from '../../shared/sdk-subagent-status.js';
+import { AgyHistoryReader } from '../../src/agent/agy-native-history.js';
 import { PROVIDER_ERROR_CODES } from '../../src/agent/transport-provider.js';
 import type { AgentMessage, MessageDelta, ToolCallEvent } from '../../shared/agent-message.js';
 import type { ProviderError, ProviderUsageUpdate, SessionInfoUpdate } from '../../src/agent/transport-provider.js';
@@ -46,6 +47,13 @@ process.stdin.on('data', (d) => {
     if (!line.trim()) continue;
     const msg = JSON.parse(line);
     const text = msg.message.content;
+    if (text.includes('CRASH_NOW')) process.exit(1);
+    if (text.includes('NATIVE_LOST')) {
+      const fixture = require(process.env.FAKE_AGY_NATIVE_FIXTURE);
+      fixture.persist(process.env.HOME, text, { currentError: text.includes('NATIVE_LOST_REAL_ERROR'), answer: text });
+      emit({ event:'result', result:{ conversation_id:convId, status:'ERROR', response:'', error:fixture.ERROR } });
+      continue;
+    }
     if (text.includes('QUOTA_OLD_RESPONSE')) {
       emit({ event: 'step_update', step_update: { conversation_id: convId, step_index: step++, state: 'DONE', step_type: 'agent_response', text_delta: 'Hello\\n' } });
     }
@@ -76,6 +84,7 @@ process.stdin.on('data', (d) => {
       if (text.includes('QUOTA_CURRENT_ERROR')) emit({ event: 'step_update', step_update: { conversation_id: convId, step_index: text.includes('NO_INDEX_ERROR') ? undefined : step++, state: 'DONE', step_type: 'system_error', text_delta: quota } });
       if (text.includes('QUOTA_ACTIVE_AFTER_DONE')) emit({ event: 'step_update', step_update: { conversation_id: convId, step_index: idx, state: 'ACTIVE', step_type: 'agent_response', text_delta: ' more' } });
       emit({ event: 'result', result: { conversation_id: convId, status: 'ERROR', response: text.includes('QUOTA_MISMATCH') ? 'Other response' : text.includes('QUOTA_MULTISTEP') ? 'Before\\nHello\\n' : hasResponse ? 'Hello\\n' : '', error: text.includes('QUOTA_NEW_FAILURE') ? 'boom unauthorized' : quota, num_turns: 1, usage: {} } });
+      if (text.includes('QUOTA_EMPTY_EXIT')) process.exit(0);
       continue;
     }
     if (text.includes('HANG')) return;
@@ -214,6 +223,7 @@ describe('AgySdkProvider (fake agy process)', () => {
   });
 
   afterEach(async () => {
+    vi.restoreAllMocks();
     await provider.disconnect();
     rmSync(dir, { recursive: true, force: true });
   });
@@ -272,6 +282,130 @@ describe('AgySdkProvider (fake agy process)', () => {
     expect(launches()).toHaveLength(1);
     expect(launches()[0]).toContain('existing-conversation');
     expect(provider.getSessionDiagnostics(sid)).toMatchObject({ inflightTurns: 0 });
+  });
+
+  it('recovers DB-only answers on repeated turns and a fresh CLI process, without replay or deleting history', async () => {
+    await provider.disconnect();
+    await provider.connect({binaryPath:path.join(dir,'agy'),env:{HOME:dir,FAKE_AGY_ARGS_FILE:argsFile,
+      FAKE_AGY_NATIVE_FIXTURE:path.resolve('test/fixtures/agy-native-history/fixture.cjs')}});
+    const key = 'native-lost';
+    const conversation = '11111111-1111-4111-8111-111111111111';
+    let sid = await provider.createSession({sessionKey:key,cwd:dir,resumeId:conversation});
+    await provider.send(sid,'NATIVE_LOST first');
+    await provider.send(sid,'NATIVE_LOST second');
+    await waitFor(() => completes.length+errors.length===2);
+    expect(errors).toHaveLength(0);
+    expect(completes.map(([,m])=>m.content)).toEqual(['NATIVE_LOST first','NATIVE_LOST second']);
+    expect(launches()).toHaveLength(1);
+    await provider.endSession(sid);
+    sid = await provider.createSession({sessionKey:key,cwd:dir,resumeId:conversation});
+    await provider.send(sid,'NATIVE_LOST third');
+    await waitFor(() => completes.length+errors.length===3);
+    expect(errors).toHaveLength(0);
+    expect(completes[2][1].content).toBe('NATIVE_LOST third');
+    expect(launches()).toHaveLength(2); // only the EXPLICIT session end started a new CLI
+    expect(provider.getSessionDiagnostics(sid)).toMatchObject({inflightTurns:0});
+  });
+
+  it('keeps genuine current native quota failures even when a completed answer precedes them', async () => {
+    await provider.disconnect();
+    await provider.connect({binaryPath:path.join(dir,'agy'),env:{HOME:dir,FAKE_AGY_ARGS_FILE:argsFile,
+      FAKE_AGY_NATIVE_FIXTURE:path.resolve('test/fixtures/agy-native-history/fixture.cjs')}});
+    const sid = await provider.createSession({sessionKey:'native-error',cwd:dir,resumeId:'11111111-1111-4111-8111-111111111111'});
+    await provider.send(sid,'NATIVE_LOST_REAL_ERROR');
+    await waitFor(() => completes.length+errors.length===1);
+    expect(completes).toHaveLength(0);
+    expect(errors[0][1].code).toBe(PROVIDER_ERROR_CODES.RATE_LIMITED);
+  });
+
+  it('clears failed-process input bindings before the next user turn resumes the conversation', async () => {
+    await provider.disconnect();
+    await provider.connect({binaryPath:path.join(dir,'agy'),env:{HOME:dir,FAKE_AGY_ARGS_FILE:argsFile,
+      FAKE_AGY_NATIVE_FIXTURE:path.resolve('test/fixtures/agy-native-history/fixture.cjs')}});
+    const sid=await provider.createSession({sessionKey:'unexpected-exit',cwd:dir,resumeId:'11111111-1111-4111-8111-111111111111'});
+    await provider.send(sid,'CRASH_NOW');
+    await waitFor(()=>errors.length===1);
+    expect(errors[0][1].code).toBe(PROVIDER_ERROR_CODES.CONNECTION_LOST);
+    await provider.send(sid,'NATIVE_LOST after unexpected exit');
+    await waitFor(()=>completes.length+errors.length===2);
+    expect(errors).toHaveLength(1);
+    expect(completes[0][1].content).toBe('NATIVE_LOST after unexpected exit');
+    expect(provider.getSessionDiagnostics(sid)).toMatchObject({inflightTurns:0});
+  });
+
+  it('serializes queued frames across a slow recovery without replaying or mixing answers', async () => {
+    let finish!: (value: {userStepIndex:number;responseStepIndex:number;text:string}) => void;
+    const read = vi.spyOn(AgyHistoryReader.prototype,'read').mockImplementation(() => new Promise(resolve => { finish=resolve; }));
+    const sid=await provider.createSession({sessionKey:'slow-read',cwd:dir,resumeId:'11111111-1111-4111-8111-111111111111'});
+    await provider.send(sid,'QUOTA_EMPTY');
+    await waitFor(() => read.mock.calls.length===1);
+    await provider.send(sid,'next ordinary input');
+    expect(completes).toHaveLength(0);
+    finish({userStepIndex:0,responseStepIndex:1,text:'Recovered first'});
+    await waitFor(() => completes.length===2);
+    expect(errors).toHaveLength(0);
+    expect(completes.map(([,m])=>m.content)).toEqual(['Recovered first','Hello']);
+    expect(launches()).toHaveLength(1);
+  });
+
+  it.each(['stop','end','fresh','disconnect'])('does not publish late recovery after %s', async action => {
+    let finish!: (value: {userStepIndex:number;responseStepIndex:number;text:string}) => void;
+    const read = vi.spyOn(AgyHistoryReader.prototype,'read').mockImplementation(() => new Promise(resolve => { finish=resolve; }));
+    const key='late-read';
+    const sid=await provider.createSession({sessionKey:key,cwd:dir,resumeId:'11111111-1111-4111-8111-111111111111'});
+    await provider.send(sid,'QUOTA_EMPTY');
+    await waitFor(() => read.mock.calls.length===1);
+    if(action==='stop') await provider.cancelAndWait(sid);
+    else if(action==='end') await provider.endSession(sid);
+    else if(action==='fresh') await provider.createSession({sessionKey:key,cwd:dir,fresh:true});
+    else await provider.disconnect();
+    finish({userStepIndex:0,responseStepIndex:1,text:'MUST NOT APPEAR'});
+    await new Promise(resolve=>setTimeout(resolve,30));
+    expect(completes).toHaveLength(0);
+    expect(deltas).toHaveLength(0);
+    expect(errors.every(([,e])=>e.code===PROVIDER_ERROR_CODES.CANCELLED)).toBe(true);
+    if(action==='stop'||action==='fresh') {
+      await provider.send(sid,'new turn');
+      await waitFor(()=>completes.length===1);
+      expect(completes[0][1].content).toBe('Hello');
+    }
+  });
+
+  it('Stop wins over a late history read even after the CLI has already physically exited', async () => {
+    let finish!: (value: {userStepIndex:number;responseStepIndex:number;text:string}) => void;
+    const read=vi.spyOn(AgyHistoryReader.prototype,'read').mockImplementation(()=>new Promise(resolve=>{finish=resolve;}));
+    const sid=await provider.createSession({sessionKey:'exited-reader',cwd:dir,resumeId:'11111111-1111-4111-8111-111111111111'});
+    await provider.send(sid,'QUOTA_EMPTY_EXIT');
+    await waitFor(()=>read.mock.calls.length===1);
+    const states=(provider as unknown as {sessions:Map<string,{child:{exitCode:number|null}|null}>}).sessions;
+    await waitFor(()=>states.get(sid)?.child?.exitCode===0);
+    await provider.cancelAndWait(sid);
+    await provider.send(sid,'next turn after the confirmed physical exit');
+    await waitFor(()=>completes.length===1);
+    expect(completes[0][1].content).toBe('Hello');
+    expect(provider.getSessionDiagnostics(sid)).toMatchObject({inflightTurns:0});
+    finish({userStepIndex:0,responseStepIndex:1,text:'MUST NOT APPEAR'});
+    await new Promise(resolve=>setTimeout(resolve,30));
+    expect(completes).toHaveLength(1);
+    expect(deltas.every(([,delta])=>!delta.delta.includes('MUST NOT APPEAR'))).toBe(true);
+    expect(errors).toHaveLength(0);
+  });
+
+  it('preserves the listener-bound state and input evidence when an existing session is rebound', async () => {
+    let finish!: (value: {userStepIndex:number;responseStepIndex:number;text:string}) => void;
+    const read=vi.spyOn(AgyHistoryReader.prototype,'read').mockImplementation(()=>new Promise(resolve=>{finish=resolve;}));
+    const config={sessionKey:'rebound',cwd:dir,resumeId:'11111111-1111-4111-8111-111111111111'};
+    const sid=await provider.createSession(config);
+    await provider.send(sid,'QUOTA_EMPTY');
+    await waitFor(()=>read.mock.calls.length===1);
+    expect(await provider.createSession(config)).toBe(sid);
+    finish({userStepIndex:0,responseStepIndex:1,text:'Recovered bound turn'});
+    await waitFor(()=>completes.length===1);
+    await provider.send(sid,'next');
+    await waitFor(()=>completes.length===2);
+    expect(completes.map(([,m])=>m.content)).toEqual(['Recovered bound turn','Hello']);
+    expect(launches()).toHaveLength(1);
+    expect(provider.getSessionDiagnostics(sid)).toMatchObject({inflightTurns:0});
   });
 
   it('does not infer historical quota on a fresh conversation, but can recover after an observed quota failure', async () => {

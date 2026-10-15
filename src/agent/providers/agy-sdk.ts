@@ -68,6 +68,7 @@ import {
   type MemoryMcpProviderStatusView,
 } from '../../../shared/memory-ws.js';
 import { recordAgyQuotaActivity, refreshAgyQuotaMetadata } from '../agy-usage-quota.js';
+import { AgyHistoryReader, hashAgyPrompt } from '../agy-native-history.js';
 
 const MODEL_CACHE_TTL_MS = 10 * 60_000;
 const MODEL_PROBE_TIMEOUT_MS = 30_000;
@@ -104,6 +105,7 @@ interface AgySessionState {
   stderrTail: string;
   toolSteps: Map<number, string>;
   mayHaveHistoricalQuota: boolean;
+  pendingInputs: Array<{ promptHash: string; sentAt: number }>;
   /** Evidence is reset by the streamed user_input boundary, not send(): inputs can queue. */
   turnEvidence?: {
     conversationId?: string;
@@ -247,6 +249,7 @@ export function resolveAgyBinary(config?: ProviderConfig | { binaryPath?: string
  * Authentication is agy's own login; no API key is handled here.
  */
 export class AgySdkProvider implements TransportProvider {
+  private readonly historyReader = new AgyHistoryReader();
   readonly id = AGY_SDK_PROVIDER_ID;
   readonly connectionMode = CONNECTION_MODES.LOCAL_SDK;
   readonly sessionOwnership = SESSION_OWNERSHIP.SHARED;
@@ -316,13 +319,14 @@ export class AgySdkProvider implements TransportProvider {
   async disconnect(): Promise<void> {
     const states = [...this.sessions.values()];
     this.sessions.clear();
-    await Promise.all(states.map((state) => this.terminateChild(state)));
+    await Promise.all([this.historyReader.dispose(), ...states.map((state) => this.terminateChild(state))]);
     this.config = null;
   }
 
   async createSession(config: SessionConfig): Promise<string> {
     const routeId = config.bindExistingKey ?? config.sessionKey;
-    const existing = config.fresh ? undefined : this.sessions.get(routeId);
+    const prior = this.sessions.get(routeId);
+    const existing = config.fresh ? undefined : prior;
     const state: AgySessionState = {
       routeId,
       cwd: normalizeTransportCwd(config.cwd) ?? existing?.cwd ?? normalizeTransportCwd(process.cwd())!,
@@ -343,11 +347,19 @@ export class AgySdkProvider implements TransportProvider {
       stderrTail: '',
       toolSteps: new Map(),
       mayHaveHistoricalQuota: !!(config.resumeId ?? existing?.conversationId) && !config.fresh,
+      pendingInputs: [],
     };
-    if (existing?.child && existing.conversationId !== state.conversationId) {
-      await this.terminateChild(existing);
+    if (prior?.child && (config.fresh || prior.conversationId !== state.conversationId)) {
+      await this.terminateChild(prior);
       state.child = null;
       state.inflightTurns = 0;
+    }
+    if (existing?.child && existing.child === state.child) {
+      existing.cwd = state.cwd;
+      existing.env = state.env;
+      existing.mcpEnv = state.mcpEnv;
+      existing.model = state.model;
+      return routeId;
     }
     this.sessions.set(routeId, state);
     if (state.conversationId) {
@@ -399,10 +411,14 @@ export class AgySdkProvider implements TransportProvider {
     state.cancelled = false;
     state.sessionSystemTextSent = true;
     state.inflightTurns += 1;
+    const input = { promptHash: hashAgyPrompt(prompt), sentAt: Date.now() };
+    state.pendingInputs.push(input);
     this.emitStatus(sessionId, state, { status: 'thinking', label: 'Thinking...' });
     // Appending while a turn is running is intentional: agy queues user events and runs them in order.
     child.stdin.write(encodeAgyUserLine(prompt), (err) => {
-      if (!err) return;
+      if (!err || state.child !== child || state.cancelled || this.sessions.get(sessionId) !== state) return;
+      const index = state.pendingInputs.indexOf(input);
+      if (index >= 0) state.pendingInputs.splice(index, 1);
       state.inflightTurns = Math.max(0, state.inflightTurns - 1);
       this.emitStatus(sessionId, state, { status: null, label: null });
       this.emitError(sessionId, PROVIDER_ERROR_CODES.CONNECTION_LOST, 'Failed to write to the agy process', true);
@@ -411,8 +427,9 @@ export class AgySdkProvider implements TransportProvider {
 
   async cancel(sessionId: string): Promise<void> {
     const state = this.sessions.get(sessionId);
-    if (!state?.child || state.child.killed) return;
+    if (!state) return;
     state.cancelled = true;
+    if (!state.child || state.child.killed) return;
     this.emitStatus(sessionId, state, { status: null, label: null });
     await this.terminateChild(state);
     // The next send resumes the same conversation via --conversation; agy persisted it.
@@ -423,7 +440,12 @@ export class AgySdkProvider implements TransportProvider {
     const state = this.sessions.get(sessionId);
     if (!state) return Promise.reject(new Error(`Session ${sessionId} not found`));
     const capturedChild = state.child;
-    if (!capturedChild || capturedChild.killed || capturedChild.exitCode != null) {
+    if (!capturedChild || capturedChild.exitCode != null) {
+      // A physical exit does not authorize a late asynchronous history result.
+      state.cancelled = true;
+      state.child = null;
+      this.resetTurnState(state);
+      this.emitStatus(sessionId, state, { status: null, label: null });
       return Promise.resolve();
     }
     return confirmChildStop(capturedChild, () => this.cancel(sessionId), () => this.sessions.get(sessionId) === state);
@@ -612,15 +634,22 @@ export class AgySdkProvider implements TransportProvider {
     });
     child.stdin?.on('error', () => { /* surfaced through the exit handler */ });
     const rl = readline.createInterface({ input: gateChildStream(child.stdout!) });
+    // A read-only recovery may await IPC. Keep frames/results in wire order so
+    // the next turn cannot overwrite the evidence of the one being recovered.
+    let output = Promise.resolve();
     rl.on('line', (line) => {
-      if (state.child !== child) return;
-      this.handleLine(sessionId, state, line);
+      output = output.then(async () => {
+        if (state.child !== child || this.sessions.get(sessionId) !== state) return;
+        await this.handleLine(sessionId, state, line);
+      }).catch(() => {
+        // Callback exceptions must not leave the output chain permanently rejected.
+        logger.warn({ sessionId }, 'Failed to handle agy output');
+      });
     });
     child.once('error', (err) => {
       if (state.child !== child) return;
       state.child = null;
-      state.inflightTurns = 0;
-      this.clearOpenToolSteps(sessionId, state);
+      this.resetTurnState(state);
       this.emitStatus(sessionId, state, { status: null, label: null });
       const code = (err as NodeJS.ErrnoException).code;
       this.emitError(
@@ -633,24 +662,25 @@ export class AgySdkProvider implements TransportProvider {
     child.once('exit', (code, signal) => {
       confirmCapturedChildExit(child);
       rl.close();
-      if (state.child !== child) return;
-      state.child = null;
-      const hadTurns = state.inflightTurns > 0;
-      state.inflightTurns = 0;
-      this.clearOpenToolSteps(sessionId, state);
-      this.emitStatus(sessionId, state, { status: null, label: null });
-      if (state.cancelled || !hadTurns) return;
-      logger.warn({ sessionId, code, signal }, 'agy process exited with turns in flight');
-      const tail = state.stderrTail.trim();
-      const authFailure = AUTH_FAILURE_PATTERN.test(tail);
-      this.emitError(
-        sessionId,
-        authFailure ? PROVIDER_ERROR_CODES.AUTH_FAILED : PROVIDER_ERROR_CODES.CONNECTION_LOST,
-        authFailure
-          ? 'Antigravity authentication is required. Run `agy` once to sign in.'
-          : 'The agy process exited before finishing the turn',
-        !authFailure,
-      );
+      void output.then(() => {
+        if (state.child !== child || this.sessions.get(sessionId) !== state) return;
+        state.child = null;
+        const hadTurns = state.inflightTurns > 0;
+        this.resetTurnState(state);
+        this.emitStatus(sessionId, state, { status: null, label: null });
+        if (state.cancelled || !hadTurns) return;
+        logger.warn({ sessionId, code, signal }, 'agy process exited with turns in flight');
+        const tail = state.stderrTail.trim();
+        const authFailure = AUTH_FAILURE_PATTERN.test(tail);
+        this.emitError(
+          sessionId,
+          authFailure ? PROVIDER_ERROR_CODES.AUTH_FAILED : PROVIDER_ERROR_CODES.CONNECTION_LOST,
+          authFailure
+            ? 'Antigravity authentication is required. Run `agy` once to sign in.'
+            : 'The agy process exited before finishing the turn',
+          !authFailure,
+        );
+      });
     });
     return child;
   }
@@ -701,13 +731,22 @@ export class AgySdkProvider implements TransportProvider {
     state.toolSteps.clear();
   }
 
-  private async terminateChild(state: AgySessionState): Promise<void> {
-    const child = state.child;
-    state.child = null;
+  private resetTurnState(state: AgySessionState): void {
     state.inflightTurns = 0;
+    state.pendingInputs = [];
+    state.turnEvidence = undefined;
+    state.currentMessageId = null;
+    state.currentText = '';
+    state.sawToolCall = false;
     state.latestStepUsage = undefined;
     state.turnOutputTokens = undefined;
     this.clearOpenToolSteps(state.routeId, state);
+  }
+
+  private async terminateChild(state: AgySessionState): Promise<void> {
+    const child = state.child;
+    state.child = null;
+    this.resetTurnState(state);
     this.emitStatus(state.routeId, state, { status: null, label: null });
     if (!child) return;
     try { child.stdin?.end(); } catch { /* already closed */ }
@@ -716,7 +755,7 @@ export class AgySdkProvider implements TransportProvider {
 
   // ── Stream parsing ─────────────────────────────────────────────────────────
 
-  private handleLine(sessionId: string, state: AgySessionState, line: string): void {
+  private handleLine(sessionId: string, state: AgySessionState, line: string): void | Promise<void> {
     const trimmed = line.trim();
     if (!trimmed) return;
     let parsed: unknown;
@@ -734,8 +773,7 @@ export class AgySdkProvider implements TransportProvider {
         this.handleStep(sessionId, state, asRecord(event.step_update));
         return;
       case AGY_STREAM_EVENT.RESULT:
-        this.handleResult(sessionId, state, asRecord(event.result));
-        return;
+        return this.handleResult(sessionId, state, asRecord(event.result));
       default:
         return;
     }
@@ -1028,7 +1066,28 @@ export class AgySdkProvider implements TransportProvider {
     }
   }
 
-  private handleResult(sessionId: string, state: AgySessionState, result: Record<string, unknown>): void {
+  private async handleResult(sessionId: string, state: AgySessionState, result: Record<string, unknown>): Promise<void> {
+    const input = state.pendingInputs.shift();
+    const child = state.child;
+    let recovered = false;
+    const error = asString(result.error) ?? '';
+    if (input && !state.cancelled && result.status === AGY_RESULT_STATUS.ERROR
+      && error.startsWith(AGY_INDIVIDUAL_QUOTA_ERROR_PREFIX) && !asString(result.response)?.trim()
+      && state.conversationId && state.conversationId === asString(result.conversation_id)
+      && !state.turnEvidence?.sawError && state.toolSteps.size === 0) {
+      const env = this.spawnEnv(state.env, state.mcpEnv);
+      const home = env.HOME || env.USERPROFILE;
+      const response = home ? await this.historyReader.read({
+        home, conversationId: state.conversationId, ...input, resultAt: Date.now(), error,
+      }) : undefined;
+      // Stop/end/rebind wins over a late reader result. Never complete another instance.
+      if (state.cancelled || this.sessions.get(sessionId) !== state || state.child !== child) return;
+      if (response && (!state.turnEvidence || state.turnEvidence.userStepIndex === response.userStepIndex)) {
+        recovered = true;
+        state.currentMessageId = `${state.conversationId}:step:${response.responseStepIndex}`;
+        result = { ...result, response: response.text };
+      }
+    }
     this.noteConversationId(sessionId, state, asString(result.conversation_id));
     state.inflightTurns = Math.max(0, state.inflightTurns - 1);
     const messageId = state.currentMessageId ?? randomUUID();
@@ -1041,7 +1100,7 @@ export class AgySdkProvider implements TransportProvider {
     // Require a new user boundary, a matching final DONE response, no subsequent
     // step/open tool or current error, and the same conversation. No replay,
     // conversation reset, quota probe or suppression of an unproven error.
-    const historicalQuotaResult = result.status === AGY_RESULT_STATUS.ERROR
+    const historicalQuotaResult = recovered || result.status === AGY_RESULT_STATUS.ERROR
       && state.mayHaveHistoricalQuota
       && (asString(result.error) ?? '').startsWith(AGY_INDIVIDUAL_QUOTA_ERROR_PREFIX)
       && !!response?.trim()
@@ -1094,7 +1153,7 @@ export class AgySdkProvider implements TransportProvider {
     // Authoritative complete response from agy. If no tool was called, response is
     // the single complete turn response. Prefer it over potentially truncated streaming text.
     // When tools were called (multi-step), preserve the streamed step text unless empty.
-    const content = (!sawTool && response && response.trim()
+    const content = ((recovered || !sawTool) && response && response.trim()
       ? response
       : (streamed && streamed.trim() ? streamed : (response && response.trim() ? response : streamed))
     ).trimEnd();
