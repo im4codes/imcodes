@@ -93,10 +93,6 @@ interface AgySessionState {
   /** agy conversation id; durable resume handle (persisted by the daemon as providerResumeId). */
   conversationId?: string;
   child: ChildProcess | null;
-  /** A terminal quota error can poison the long-lived CLI's next result. */
-  recycleAfterQuota: boolean;
-  retiringChild?: { child: ChildProcess; promise: Promise<void> };
-  stopGeneration: number;
   /** User turns written to stdin that have not produced a `result` yet. */
   inflightTurns: number;
   cancelled: boolean;
@@ -338,9 +334,6 @@ export class AgySdkProvider implements TransportProvider {
       conversationId: config.resumeId ?? existing?.conversationId,
       child: existing?.child ?? null,
       inflightTurns: existing?.inflightTurns ?? 0,
-      recycleAfterQuota: existing?.recycleAfterQuota ?? false,
-      retiringChild: existing?.retiringChild,
-      stopGeneration: existing?.stopGeneration ?? 0,
       cancelled: false,
       currentMessageId: null,
       currentText: '',
@@ -398,20 +391,6 @@ export class AgySdkProvider implements TransportProvider {
       throw this.makeError(PROVIDER_ERROR_CODES.PROVIDER_ERROR, 'Cannot send an empty message to agy', false);
     }
 
-    const retiring = state.retiringChild;
-    if (retiring) {
-      const stopGeneration = state.stopGeneration;
-      // No second process may open this conversation until the old child has
-      // physically exited. Stop/end/replace must also invalidate this waiter.
-      await retiring.promise;
-      if (this.sessions.get(sessionId) !== state) {
-        throw this.makeError(PROVIDER_ERROR_CODES.SESSION_NOT_FOUND, 'Antigravity session changed during process recovery', true);
-      }
-      if (state.stopGeneration !== stopGeneration) {
-        throw this.makeError(PROVIDER_ERROR_CODES.CANCELLED, 'Turn cancelled during Antigravity process recovery', true);
-      }
-      if (state.retiringChild === retiring) state.retiringChild = undefined;
-    }
     const child = this.ensureChild(sessionId, state);
     if (!child.stdin || child.stdin.destroyed || !child.stdin.writable) {
       state.child = null;
@@ -432,13 +411,8 @@ export class AgySdkProvider implements TransportProvider {
 
   async cancel(sessionId: string): Promise<void> {
     const state = this.sessions.get(sessionId);
-    if (!state) return;
-    state.stopGeneration += 1;
+    if (!state?.child || state.child.killed) return;
     state.cancelled = true;
-    if (!state.child || state.child.killed) {
-      await state.retiringChild?.promise;
-      return;
-    }
     this.emitStatus(sessionId, state, { status: null, label: null });
     await this.terminateChild(state);
     // The next send resumes the same conversation via --conversation; agy persisted it.
@@ -448,11 +422,6 @@ export class AgySdkProvider implements TransportProvider {
   cancelAndWait(sessionId: string): Promise<void> {
     const state = this.sessions.get(sessionId);
     if (!state) return Promise.reject(new Error(`Session ${sessionId} not found`));
-    if (!state.child && state.retiringChild) {
-      state.stopGeneration += 1;
-      state.cancelled = true;
-      return state.retiringChild.promise;
-    }
     const capturedChild = state.child;
     if (!capturedChild || capturedChild.killed || capturedChild.exitCode != null) {
       return Promise.resolve();
@@ -740,30 +709,9 @@ export class AgySdkProvider implements TransportProvider {
     state.turnOutputTokens = undefined;
     this.clearOpenToolSteps(state.routeId, state);
     this.emitStatus(state.routeId, state, { status: null, label: null });
-    if (!child) {
-      await state.retiringChild?.promise;
-      return;
-    }
+    if (!child) return;
     try { child.stdin?.end(); } catch { /* already closed */ }
     await killProcessTree(child, { gracefulMs: KILL_GRACE_MS, ownsProcessGroup: process.platform !== 'win32' });
-  }
-
-  private retireQuotaChild(state: AgySessionState): void {
-    const child = state.child;
-    if (!child || state.inflightTurns !== 0 || !state.recycleAfterQuota) return;
-    state.recycleAfterQuota = false;
-    // Detach BEFORE callbacks: late lines/exit from the poisoned process must
-    // not settle a newly admitted turn. Keep the durable conversation untouched.
-    state.child = null;
-    const retiring = { child, promise: Promise.resolve() };
-    state.retiringChild = retiring;
-    retiring.promise = confirmChildStop(child, async () => {
-      try { child.stdin?.end(); } catch { /* already closed */ }
-      await killProcessTree(child, { gracefulMs: KILL_GRACE_MS, ownsProcessGroup: process.platform !== 'win32' });
-    }, () => state.retiringChild === retiring);
-    // A failed terminal confirmation remains a barrier, never permission to
-    // launch a concurrent writer or replay the failed user's message.
-    void retiring.promise.catch((err) => logger.warn({ err, sessionId: state.routeId }, 'agy quota process retirement failed'));
   }
 
   // ── Stream parsing ─────────────────────────────────────────────────────────
@@ -1110,13 +1058,6 @@ export class AgySdkProvider implements TransportProvider {
     state.currentMessageId = null;
     state.currentText = '';
     state.sawToolCall = false;
-    if (result.status === AGY_RESULT_STATUS.ERROR && !historicalQuotaResult
-      && (asString(result.error) ?? '').startsWith(AGY_INDIVIDUAL_QUOTA_ERROR_PREFIX)) {
-      state.recycleAfterQuota = true;
-    }
-    // Inputs already written to stdin belong to this process. Let their
-    // results settle before retiring it; a later send waits for physical exit.
-    this.retireQuotaChild(state);
     this.clearOpenToolSteps(sessionId, state);
     this.emitStatus(sessionId, state, { status: null, label: null });
     if (state.cancelled) return;
