@@ -1018,7 +1018,7 @@ jobs:
           # every consumer reject the set as tampered with.
           APP="dist-node-exe/aiDesk.to by IM.codes.app"
           node scripts/macos-release-signing.mjs notarize "$APP"
-          xcrun stapler validate "$APP"
+          # notarize already staples and validates with bounded CloudKit retries.
       - name: Build, sign and notarize the aiDesk disk image
         if: runner.os == 'macOS'
         env:
@@ -1032,7 +1032,7 @@ jobs:
           # can be stapled, but one is a drag and the other is a wizard.
           DMG="$(node scripts/build-aidesk-app.mjs dmg dist-node-exe)"
           node scripts/macos-release-signing.mjs notarize "$DMG"
-          xcrun stapler validate "$DMG"
+          # notarize already staples and validates with bounded CloudKit retries.
       # The macOS remote-desktop components. Without this the image ships a
       # macOS node that can self-upgrade but has no components to fetch: the
       # server answers `remote_desktop_worker_not_built` and macOS remote

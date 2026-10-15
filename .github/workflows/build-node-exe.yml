@@ -158,7 +158,7 @@ jobs:
           # every consumer reject the set as tampered with.
           APP="dist-node-exe/aiDesk.to by IM.codes.app"
           node scripts/macos-release-signing.mjs notarize "$APP"
-          xcrun stapler validate "$APP"
+          # notarize already staples and validates with bounded CloudKit retries.
       - name: Build, sign and notarize the aiDesk disk image
         if: runner.os == 'macOS'
         env:
@@ -172,7 +172,7 @@ jobs:
           # can be stapled, but one is a drag and the other is a wizard.
           DMG="$(node scripts/build-aidesk-app.mjs dmg dist-node-exe)"
           node scripts/macos-release-signing.mjs notarize "$DMG"
-          xcrun stapler validate "$DMG"
+          # notarize already staples and validates with bounded CloudKit retries.
       # The macOS remote-desktop components, built from the published
       # immutable SDK. Both architectures are produced here because each ships
       # thin -- the build plan sets universalBinary = false and the runtime
