@@ -573,6 +573,7 @@ export class TaskPairAutomation implements TaskPairScheduler {
    * restart budget, so daemon ticks cannot create an unbounded restart loop.
    */
   async #recoverParticipant(stored: StoredTaskPair, now: number): Promise<boolean> {
+    if (!this.#scheduleStillCurrent(stored.project, stored.state)) return true;
     const pair = stored.state;
     if (!TASK_PAIR_OPEN_STATUSES.includes(pair.status)
       || pair.status === TASK_PAIR_STATUS_AWAITING_BRAIN_DECISION
@@ -646,6 +647,7 @@ export class TaskPairAutomation implements TaskPairScheduler {
       const ok = await inFlight;
       const fresh = getTaskPairStore().getPair(stored.project, pair.taskId);
       if (!fresh) return ok;
+      if (!this.#scheduleStillCurrent(stored.project, pair)) return true;
       // One notice per participant/pair recovery episode, not one per tick or
       // one per retry in the bounded restart window.  The durable key also
       // survives a daemon restart without re-spamming Brain.
@@ -681,6 +683,7 @@ export class TaskPairAutomation implements TaskPairScheduler {
             pair.taskId,
             'recovery-resume',
             buildParticipantRecoveryMessage(fresh.state, candidate.side, instruction),
+            undefined, [{ project: stored.project, taskId: pair.taskId, epoch: pair.scheduling?.epoch ?? 0 }],
           );
         }
         if (!wasNotified) {
@@ -703,6 +706,7 @@ export class TaskPairAutomation implements TaskPairScheduler {
 
   /** Prompt an executor once for a stalled implementing/validation phase, then escalate once. */
   async #checkStageStall(stored: StoredTaskPair, now: number): Promise<void> {
+    if (!this.#scheduleStillCurrent(stored.project, stored.state)) return;
     const pair = stored.state;
     if (!['working', 'in_audit', 'awaiting_audit', 'rework'].includes(pair.status)) return;
     const store = getTaskPairStore();
@@ -780,6 +784,7 @@ export class TaskPairAutomation implements TaskPairScheduler {
       { role: 'auditor' as const, name: pair.auditor && pair.auditor !== TASK_PAIR_NO_AUDITOR ? pair.auditor : undefined, observed: 'participantObservedAuditorEpoch' as const, observedSession: 'participantObservedAuditorSession' as const, watermark: 'participantRecoveryAuditorRestartId' as const },
     ]) {
       if (!candidate.name) continue;
+      if (!this.#scheduleStillCurrent(stored.project, pair)) return delivered;
       const record = getSession(candidate.name);
       const epoch = record?.runtimeEpoch;
       if (!epoch) continue;
@@ -810,6 +815,7 @@ export class TaskPairAutomation implements TaskPairScheduler {
         pair.taskId,
         'recovery-resume',
         buildParticipantRecoveryMessage(pair, candidate.role, candidate.role === 'executor' ? live.lastInstructionExecutor : live.lastInstructionAuditor),
+        undefined, [{ project: stored.project, taskId: pair.taskId, epoch: pair.scheduling?.epoch ?? 0 }],
       );
       delivered = true;
     }
@@ -1395,7 +1401,7 @@ export class TaskPairAutomation implements TaskPairScheduler {
   }
 
   async #tickPair(stored: StoredTaskPair, now: number): Promise<void> {
-    if (isTaskPairSuspended(stored.state)) return;
+    if (!this.#scheduleStillCurrent(stored.project, stored.state)) return;
     if (stored.state.scheduling?.resumedAt && now - stored.state.scheduling.resumedAt < this.#intervalMs) return;
     let pair = stored.state;
     const store = getTaskPairStore();
@@ -1635,7 +1641,7 @@ export class TaskPairAutomation implements TaskPairScheduler {
    */
   async #nudgeBothIdleTarget(project: string, pair: TaskPairState, liveness: TaskPairLiveness, now: number): Promise<boolean> {
     const executor = pair.executor;
-    if (!executor) return false;
+    if (!executor || !this.#scheduleStillCurrent(project, pair)) return false;
     // Defence in depth for every caller: no acting side, no nudge target.
     const side = taskPairSideToAct(pair);
     if (!side) {

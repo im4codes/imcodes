@@ -8,7 +8,7 @@ import { queuedPairWakeAllowed } from '../../../src/daemon/task-pairs/wake-autho
 import { resolveTransportQueueEntryAdmission } from '../../../src/daemon/delegation-reply-task-liveness.js';
 import { isTaskPairSuspended, TASK_PAIR_MAX_DEPENDENCIES, TASK_PAIR_RESUME_REASON } from '../../../shared/task-pair-suspension.js';
 import { taskPairSideToAct, type TaskPairState } from '../../../shared/task-pair.js';
-import { removeSession, upsertSession, type SessionRecord } from '../../../src/store/session-store.js';
+import { getSession, removeSession, upsertSession, type SessionRecord } from '../../../src/store/session-store.js';
 import { taskPairService } from '../../../src/daemon/task-pairs/service.js';
 
 const P = 'pair-pause-test', B = 'deck_e2e_pause_brain', E = 'deck_e2e_pause_exec', A = 'deck_e2e_pause_aud';
@@ -218,4 +218,20 @@ describe('bounded reconciliation cost', () => {
     console.info(`pause-reconcile: 502 active pairs, 20KB unrelated briefs, 10 passes = ${elapsed.toFixed(2)}ms`);
     expect(elapsed).toBeLessThan(5_000); expect(messages).toEqual([]);
   });
+});
+
+
+it('does not replay an old recovery handoff after pause/resume during restart', async () => {
+  save('task'); upsertSession({ ...getSession(E)!, state: 'error' });
+  let started!: () => void, finish!: (ok: boolean) => void;
+  const entered = new Promise<void>((resolve) => { started = resolve; });
+  const restarting = new Promise<boolean>((resolve) => { finish = resolve; });
+  const recovery = new TaskPairAutomation({ now: () => now, isBusy: () => false, importLegacy: () => undefined,
+    mainCheckoutRoots: () => [], brainMainCheckoutActive: () => false,
+    restartParticipant: async () => { started(); return restarting; } });
+  const pending = recovery.tick(); await entered;
+  pausePair(P, 'task', B, 'manual'); resumePair(P, 'task', B); await automation.reconcileSuspensions();
+  messages.length = 0; finish(true); await pending;
+  expect(messages.filter((m) => m.id.includes('recovery-resume'))).toEqual([]);
+  recovery.stop();
 });
