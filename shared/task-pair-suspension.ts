@@ -18,6 +18,7 @@ export interface TaskPairScheduling {
   resumePending?: boolean;
   admitted?: boolean;
   resumedAt?: number;
+  resumeRetryAt?: number;
   failureNotified?: boolean;
   /** Wire-only count remains safe when an older server removes private details. */
   dependencyCount?: number;

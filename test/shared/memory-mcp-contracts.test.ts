@@ -102,6 +102,8 @@ describe('memory MCP shared contracts', () => {
       'pair_create',
       'pair_dispatch',
       'pair_close',
+      'pair_pause',
+      'pair_resume',
       'pair_reassign',
       'pair_next_round',
       'pair_verdict',

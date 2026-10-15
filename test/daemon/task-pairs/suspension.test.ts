@@ -200,8 +200,10 @@ describe('asynchronous scheduling epochs', () => {
     save('task'); pausePair(P, 'task', B, 'manual'); resumePair(P, 'task', B);
     const ids: string[] = [];
     setTaskPairDeliveryDepsForTests({ send: async (_target, _text, id) => { ids.push(id); if (ids.length === 1) throw new Error('uncertain send'); } });
-    await expect(automation.reconcileSuspensions()).rejects.toThrow('uncertain send');
     await automation.reconcileSuspensions();
+    expect(get('task').scheduling).toMatchObject({ admitted: false, resumePending: true });
+    await automation.reconcileSuspensions(); expect(ids).toHaveLength(1);
+    now += 30_001; await automation.reconcileSuspensions();
     expect(ids).toHaveLength(2); expect(ids[0]).toBe(ids[1]);
     expect(isTaskPairSuspended(get('task'))).toBe(false);
   });
@@ -234,4 +236,15 @@ it('does not replay an old recovery handoff after pause/resume during restart', 
   messages.length = 0; finish(true); await pending;
   expect(messages.filter((m) => m.id.includes('recovery-resume'))).toEqual([]);
   recovery.stop();
+});
+
+
+it('a missing resume target releases capacity without a CAS-listener retry spin', async () => {
+  save('task'); pausePair(P, 'task', B, 'manual'); resumePair(P, 'task', B);
+  removeSession(E); setTaskPairDeliveryDepsForTests(undefined);
+  automation.start(1_000_000);
+  await automation.reconcileSuspensions(); await automation.waitForSuspensionIdle();
+  expect(get('task').scheduling).toMatchObject({ admitted: false, resumePending: true });
+  expect(get('task').scheduling!.resumeRetryAt).toBeGreaterThan(now);
+  await automation.reconcileSuspensions(); expect(messages).toEqual([]);
 });

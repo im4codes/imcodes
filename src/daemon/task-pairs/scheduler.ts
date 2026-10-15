@@ -299,7 +299,7 @@ export class TaskPairAutomation implements TaskPairScheduler {
           stored = saved; s = next;
         }
       }
-      if (s.manual || s.dependsOn.length || !s.resumePending) continue;
+      if (s.manual || s.dependsOn.length || !s.resumePending || (s.resumeRetryAt ?? 0) > this.#now()) continue;
       const busy = [stored.state.executor, stored.state.auditor].some((name) => !!name && name !== TASK_PAIR_NO_AUDITOR && this.#liveBusy(name));
       if (busy) continue;
       if (!s.admitted && stored.state.status !== 'queued') {
@@ -313,11 +313,19 @@ export class TaskPairAutomation implements TaskPairScheduler {
       const side = taskPairSideToAct({ ...stored.state, scheduling: undefined });
       const target = side === 'auditor' ? stored.state.auditor : side === 'executor' ? stored.state.executor : undefined;
       if (stored.state.status !== 'queued' && target && target !== TASK_PAIR_NO_AUDITOR) {
-        result = await sendTaskPairMessage(target, stored.state.taskId, TASK_PAIR_RESUME_REASON,
-          `Resume ${stored.state.taskId} at its existing ${stored.state.status} stage. Preserve its round, material and workspace; do not create a new task or repeat completed work.`, `epoch-${s.epoch}`);
+        try {
+          result = await sendTaskPairMessage(target, stored.state.taskId, TASK_PAIR_RESUME_REASON,
+            `Resume ${stored.state.taskId} at its existing ${stored.state.status} stage. Preserve its round, material and workspace; do not create a new task or repeat completed work.`, `epoch-${s.epoch}`);
+        } catch { result = 'failed'; }
       }
-      if (result !== 'sent' && result !== 'queued' && result !== 'skipped_pending') continue;
-      const saved = store.patchScheduling(stored.project, stored.state.taskId, s, { ...s, resumePending: false, admitted: false, resumedAt: this.#now() }, this.#now());
+      if (result !== 'sent' && result !== 'queued' && result !== 'skipped_pending') {
+        // A missing/disconnected target is still waiting, not executing. Release
+        // admission and back off so the save listener cannot spin on its own CAS.
+        store.patchScheduling(stored.project, stored.state.taskId, s,
+          { ...s, admitted: false, resumeRetryAt: this.#now() + TASK_PAIR_BOTH_IDLE_CHECK_INTERVAL_MS }, this.#now());
+        continue;
+      }
+      const saved = store.patchScheduling(stored.project, stored.state.taskId, s, { ...s, resumePending: false, admitted: false, resumeRetryAt: undefined, resumedAt: this.#now() }, this.#now());
       if (!saved) continue;
       const now = this.#now();
       store.saveLiveness(saved.project, saved.state.taskId, { ...saved.liveness,
