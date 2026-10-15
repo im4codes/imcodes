@@ -1,3 +1,5 @@
+import { pausePair, resumePair, initialPairWait, validatePairDependencies } from './task-pairs/suspension.js';
+import { TASK_PAIR_MAX_DEPENDENCIES, TASK_PAIR_PAUSE_MODES } from '../../shared/task-pair-suspension.js';
 import { TASK_PAIR_TITLE_ACCESS_MAX_USERS, TASK_PAIR_TITLE_ACCESS_MAX_USER_CHARS, type TaskPairTitleTurn } from '../../shared/task-pair-title-access.js';
 import { installMcpErrorResultBoundary } from './mcp-error-result-boundary.js';
 import { withPairsLegacyTools } from './task-pairs/legacy-tools.js';
@@ -1647,7 +1649,7 @@ function pairAccessError(access: PairChecklistAccess): ToolResult {
 function pairChecklistView(pair: ReturnType<typeof pairChecklistTarget>) {
   if (!pair) return undefined;
   const markdown = pair.state.brief ?? '';
-  return { taskId: pair.state.taskId, title: pair.state.title ?? null, markdown, status: pair.state.status, executor: pair.state.executor, auditor: pair.state.auditor, brain: pair.state.brain, round: pair.state.round, flags: pair.state.flags, blocking: pair.state.blocking, previousAuditors: pair.state.previousAuditors, capCounts: pair.state.capCounts, workspaceKind: pair.state.workspaceKind, lastVerdict: pair.state.lastVerdict, createdAt: pair.state.createdAt, updatedAt: pair.state.updatedAt, workspace: pair.state.workspace, material: pair.state.material, output: pair.state.output, resourceClaims: pair.state.resourceClaims ?? [], resourceCleanup: pair.state.resourceCleanup ?? null, ...taskPairChecklistCounts(markdown) };
+  return { taskId: pair.state.taskId, scheduling: pair.state.scheduling ?? null, title: pair.state.title ?? null, markdown, status: pair.state.status, executor: pair.state.executor, auditor: pair.state.auditor, brain: pair.state.brain, round: pair.state.round, flags: pair.state.flags, blocking: pair.state.blocking, previousAuditors: pair.state.previousAuditors, capCounts: pair.state.capCounts, workspaceKind: pair.state.workspaceKind, lastVerdict: pair.state.lastVerdict, createdAt: pair.state.createdAt, updatedAt: pair.state.updatedAt, workspace: pair.state.workspace, material: pair.state.material, output: pair.state.output, resourceClaims: pair.state.resourceClaims ?? [], resourceCleanup: pair.state.resourceCleanup ?? null, ...taskPairChecklistCounts(markdown) };
 }
 
 function savePairBrief(pair: NonNullable<ReturnType<typeof pairChecklistTarget>>, markdown: string, writer: string) {
@@ -1808,6 +1810,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
     const state = stored.state;
     return {
       taskId: state.taskId,
+      scheduling: state.scheduling ?? null,
       title: state.title ?? null,
       status: state.status,
       round: state.round,
@@ -3385,7 +3388,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
         return error(MCP_ERROR_REASONS.CONTROL_PLANE_UNAVAILABLE, `project '${context.project}' has no Brain session, so pair_create cannot start a pair here`);
       }
       const brainName = caller.sessionName;
-      const args = pickAllowedMcpArgs(input, ['taskId', 'title', 'brief', 'executor', 'auditor', 'executorModel', 'auditorModel', 'createExecutor', 'createAuditor', 'executionPool', 'workspace', 'idempotencyKey']);
+      const args = pickAllowedMcpArgs(input, ['taskId', 'title', 'brief', 'executor', 'auditor', 'executorModel', 'auditorModel', 'createExecutor', 'createAuditor', 'executionPool', 'workspace', 'idempotencyKey', 'dependsOn']);
       const executorArg = stringArg(args, 'executor');
       const workspaceArg = stringArg(args, 'workspace');
       // An unknown value is refused before anything is created or persisted.
@@ -3402,6 +3405,8 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       const idempotencyKey = stringArg(args, 'idempotencyKey');
       const taskId = stringArg(args, 'taskId')
         ?? taskPairService.mintTaskId(context.project, idempotencyKey ? `${caller.sessionName}\0${idempotencyKey}` : undefined);
+      let dependencies: string[] = [];
+      try { if (args.dependsOn !== undefined) dependencies = validatePairDependencies(context.project, taskId, args.dependsOn); } catch (err) { return error(MCP_ERROR_REASONS.VALIDATION_FAILED, err instanceof Error ? err.message : 'invalid dependencies'); }
       const eventId = `mcp:pair-create:${context.project}:${idempotencyKey ?? taskId}`;
       const store = getTaskPairStore();
       if (store.hasEvent(eventId)) {
@@ -3459,10 +3464,11 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
         }
         const busyTarget = executorRecord?.state === 'running'
           || (auditor && auditor !== TASK_PAIR_NO_AUDITOR && byName.get(auditor)?.state === 'running');
-        const transition = busyTarget || !executor
+        const transition = dependencies.length > 0 || busyTarget || !executor
           ? taskPairService.applyMarker({
               project: context.project,
               writer: brainName,
+              ...(dependencies.length ? { initialScheduling: initialPairWait(brainName, dependencies) } : {}),
               marker: {
                 verb: 'QUEUE', knownVerb: 'QUEUE', taskId,
                 attrs: {
@@ -3497,6 +3503,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
               suppressAutomaticBrief: true,
             });
         // A pair with no named executor starts through the queue right away (the daemon picks from the pool, or the no-pool default).
+        if (dependencies.length) await taskPairAutomation.reconcileSuspensions();
         if (!executor && transition) await taskPairAutomation.runQueue(context.project, brainName);
         const stored = store.getPair(context.project, taskId);
         if (!transition || !stored) return abort(error(MCP_ERROR_REASONS.CONTROL_PLANE_UNAVAILABLE, 'pair creation was not persisted'));
@@ -3561,6 +3568,33 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
         return cancelPairNotLive(context.project, caller.sessionName, taskId, eventId, unreachable.map((receipt) => ({ role: receipt.role, session: receipt.target, problem: 'the session does not exist' })), []);
       }
       return { status: 'ok', taskId, idempotentReplay: false, state: after.state.status, ...supervisionFields(context.project), deliveries };
+    },
+    [MEMORY_MCP_TOOL_NAMES.PAIR_PAUSE]: async (input) => {
+      const args = pickAllowedMcpArgs(input, ['taskId', 'mode', 'dependsOn', 'note']);
+      const taskId = stringArg(args, 'taskId');
+      const access = pairChecklistAccess(caller, await sendSessions(), taskId);
+      if (access.status !== 'ok') return pairAccessError(access);
+      const mode = stringArg(args, 'mode') ?? TASK_PAIR_PAUSE_MODES[0];
+      if (!(TASK_PAIR_PAUSE_MODES as readonly string[]).includes(mode)) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'unknown pause mode');
+      try {
+        pausePair(access.pair.project, access.pair.state.taskId, caller.sessionName ?? '', mode as 'manual' | 'dependencies', args.dependsOn, stringArg(args, 'note'));
+        await taskPairAutomation.reconcileSuspensions();
+        taskPairAutomation.publishBadges();
+        const view = pairChecklistView(getTaskPairStore().getPair(access.pair.project, access.pair.state.taskId))!;
+        return { ...view, state: view.status, status: 'ok' };
+      } catch (err) { return error(MCP_ERROR_REASONS.VALIDATION_FAILED, err instanceof Error ? err.message : 'pause failed'); }
+    },
+    [MEMORY_MCP_TOOL_NAMES.PAIR_RESUME]: async (input) => {
+      const args = pickAllowedMcpArgs(input, ['taskId']);
+      const access = pairChecklistAccess(caller, await sendSessions(), stringArg(args, 'taskId'));
+      if (access.status !== 'ok') return pairAccessError(access);
+      try {
+        resumePair(access.pair.project, access.pair.state.taskId, caller.sessionName ?? '');
+        await taskPairAutomation.reconcileSuspensions();
+        taskPairAutomation.publishBadges();
+        const view = pairChecklistView(getTaskPairStore().getPair(access.pair.project, access.pair.state.taskId))!;
+        return { ...view, state: view.status, status: 'ok' };
+      } catch (err) { return error(MCP_ERROR_REASONS.VALIDATION_FAILED, err instanceof Error ? err.message : 'resume failed'); }
     },
     [MEMORY_MCP_TOOL_NAMES.PAIR_CLOSE]: async (input) => {
       const context = await pairCallerContext();
@@ -5013,7 +5047,10 @@ const schemas = {
     taskId: z.string().min(1),
     eventLimit: z.number().int().min(1).max(200).optional(),
   }).strict(),
+  [MEMORY_MCP_TOOL_NAMES.PAIR_PAUSE]: z.object({ taskId: z.string().min(1), mode: z.enum(TASK_PAIR_PAUSE_MODES).optional(), dependsOn: z.array(z.string().min(1)).max(TASK_PAIR_MAX_DEPENDENCIES).optional(), note: z.string().max(2000).optional() }),
+  [MEMORY_MCP_TOOL_NAMES.PAIR_RESUME]: z.object({ taskId: z.string().min(1) }),
   [MEMORY_MCP_TOOL_NAMES.PAIR_CREATE]: z.object({
+    dependsOn: z.array(z.string().min(1)).max(TASK_PAIR_MAX_DEPENDENCIES).optional(),
     taskId: z.string().trim().min(1).optional(),
     title: z.string().trim().min(1).optional(),
     brief: z.string().min(1),

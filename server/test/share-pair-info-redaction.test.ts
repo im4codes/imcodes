@@ -1,3 +1,4 @@
+import { projectPairScheduling } from '../../shared/task-pair-suspension.js';
 /** Covered Pair participants have owner-equivalent access. Viewer redaction
  * and outside-session/server filtering are unchanged. */
 import { describe, expect, it } from 'vitest';
@@ -173,5 +174,21 @@ describe('task title visibility follows admitted participant coverage, not legac
     const input = { ...frames[0]![1], tasks: [{ ...taskRow, titleAccess: grant }] };
     expect(text(filterShareDaemonMessage(input, socket('participant')))).toContain(TITLE);
     expect(text(filterShareDaemonMessage(input, socket('viewer')))).not.toContain(TITLE);
+  });
+});
+
+
+describe('suspension details do not widen viewer or old-server visibility', () => {
+  const scheduling = projectPairScheduling({ epoch: 1, manual: false, since: now, writer: SESSION, dependsOn: ['private-dependency-id'], note: 'private suspension reason' });
+  it.each(frames)('preserves participant details but strips them for viewers (%s)', (_name, frame) => {
+    const input = structuredClone(frame) as any;
+    const task = input.tasks?.[0] ?? input.task ?? input.upserts?.[0]?.task;
+    task.pair.scheduling = scheduling;
+    const participant = text(filterShareDaemonMessage(input, socket('participant')));
+    const viewer = text(filterShareDaemonMessage(input, socket('viewer')));
+    expect(participant).toContain('private-dependency-id'); expect(participant).toContain('private suspension reason');
+    expect(viewer).not.toContain('private-dependency-id'); expect(viewer).not.toContain('private suspension reason');
+    const oldRedactor = JSON.stringify(input, (key, value) => key === 'brief' ? undefined : value);
+    expect(oldRedactor).not.toContain('private-dependency-id'); expect(oldRedactor).not.toContain('private suspension reason');
   });
 });

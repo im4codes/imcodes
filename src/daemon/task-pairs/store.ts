@@ -1,3 +1,4 @@
+import { TASK_PAIR_SCHEDULING_FIELD, type TaskPairScheduling } from '../../../shared/task-pair-suspension.js';
 import { TASK_PAIR_TITLE_ACCESS_FIELD, type TaskPairTitleAccess } from '../../../shared/task-pair-title-access.js';
 /**
  * Durable store for marker-driven task pairs (`~/.imcodes/task-pairs.sqlite`).
@@ -577,6 +578,9 @@ export class TaskPairStore {
     const liveness = options.liveness ?? existing?.liveness ?? emptyLiveness(state.updatedAt);
     const queueOrder = existing?.queueOrder ?? this.#nextQueueOrder();
     const legacyTaskId = options.legacyTaskId ?? existing?.legacyTaskId;
+    const titleState = `CASE WHEN json_type(task_pairs.state_json, '$.${TASK_PAIR_TITLE_ACCESS_FIELD}') IS NOT NULL
+      THEN json_set(excluded.state_json, '$.${TASK_PAIR_TITLE_ACCESS_FIELD}', json_extract(task_pairs.state_json, '$.${TASK_PAIR_TITLE_ACCESS_FIELD}'))
+      ELSE json_remove(excluded.state_json, '$.${TASK_PAIR_TITLE_ACCESS_FIELD}') END`;
     const saved = this.#db.prepare(`
       INSERT INTO task_pairs (project, task_id, status, brain, executor, auditor, queue_order, legacy_task_id, state_json, liveness_json, updated_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -584,16 +588,18 @@ export class TaskPairStore {
         status = excluded.status, brain = excluded.brain, executor = excluded.executor, auditor = excluded.auditor,
         legacy_task_id = excluded.legacy_task_id,
         -- Audience grants belong to the explicit metadata patch, not stale full-state copies (workspace/role/lifecycle writers).
-        state_json = CASE WHEN json_type(task_pairs.state_json, '$.${TASK_PAIR_TITLE_ACCESS_FIELD}') IS NOT NULL
-          THEN json_set(excluded.state_json, '$.${TASK_PAIR_TITLE_ACCESS_FIELD}', json_extract(task_pairs.state_json, '$.${TASK_PAIR_TITLE_ACCESS_FIELD}'))
-          ELSE json_remove(excluded.state_json, '$.${TASK_PAIR_TITLE_ACCESS_FIELD}') END,
+        state_json = CASE WHEN json_type(task_pairs.state_json, '$.${TASK_PAIR_SCHEDULING_FIELD}') IS NOT NULL
+          THEN json_set(${titleState}, '$.${TASK_PAIR_SCHEDULING_FIELD}', json_extract(task_pairs.state_json, '$.${TASK_PAIR_SCHEDULING_FIELD}'))
+          ELSE json_remove(${titleState}, '$.${TASK_PAIR_SCHEDULING_FIELD}') END,
         liveness_json = excluded.liveness_json, updated_at = excluded.updated_at
-      RETURNING json_quote(json_extract(state_json, '$.${TASK_PAIR_TITLE_ACCESS_FIELD}')) AS title_access_json
+      RETURNING json_quote(json_extract(state_json, '$.${TASK_PAIR_TITLE_ACCESS_FIELD}')) AS title_access_json, json_quote(json_extract(state_json, '$.${TASK_PAIR_SCHEDULING_FIELD}')) AS scheduling_json
     `).get(
       project, state.taskId, state.status, state.brain, state.executor ?? null, state.auditor ?? null,
       queueOrder, legacyTaskId ?? null, JSON.stringify(state), JSON.stringify(liveness), state.updatedAt,
-    ) as { title_access_json: string | null };
+    ) as { title_access_json: string | null; scheduling_json: string | null };
     const savedState = { ...state };
+    if (!saved.scheduling_json || saved.scheduling_json === 'null') delete savedState.scheduling;
+    else savedState.scheduling = JSON.parse(saved.scheduling_json) as TaskPairScheduling;
     if (saved.title_access_json === null || saved.title_access_json === 'null') delete savedState.titleAccess;
     else savedState.titleAccess = JSON.parse(saved.title_access_json) as TaskPairTitleAccess;
     this.#pendingLiveness.delete(pairKey(project, state.taskId));
@@ -623,6 +629,16 @@ export class TaskPairStore {
     if (Number(result.changes) === 0) return undefined;
     this.#refreshIndexEntry(project, taskId);
     for (const listener of this.#listeners) { try { listener(project, taskId); } catch { /* observers never break a write */ } }
+    return this.getPair(project, taskId);
+  }
+
+  /** CAS-only scheduling writes cannot overwrite lifecycle, materials, roles or resource claims. */
+  patchScheduling(project: string, taskId: string, expected: TaskPairScheduling | undefined, next: TaskPairScheduling, at: number): StoredTaskPair | undefined {
+    const result = this.#db.prepare(`UPDATE task_pairs SET state_json = json_set(state_json, '$.${TASK_PAIR_SCHEDULING_FIELD}', json(?), '$.updatedAt', ?), updated_at = ? WHERE project = ? AND task_id = ? AND status NOT IN (${TASK_PAIR_TERMINAL_STATUSES.map(() => '?').join(',')}) AND json_extract(state_json, '$.${TASK_PAIR_SCHEDULING_FIELD}') IS json(?)`)
+      .run(JSON.stringify(next), at, at, project, taskId, ...TASK_PAIR_TERMINAL_STATUSES, expected ? JSON.stringify(expected) : null);
+    if (!Number(result.changes)) return undefined;
+    this.#refreshIndexEntry(project, taskId);
+    for (const listener of this.#listeners) { try { listener(project, taskId); } catch { /* observers cannot break commit */ } }
     return this.getPair(project, taskId);
   }
 

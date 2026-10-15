@@ -1,3 +1,4 @@
+import { taskPairWaitKind, readPairScheduling, TASK_PAIR_WAIT_KINDS, type TaskPairScheduling } from '@shared/task-pair-suspension.js';
 import { taskPairDisplayTitle, taskPairResolveDisplaySessionLabel } from '@shared/task-pair-display.js';
 import { isMobileLayout } from '../mobile-device.js';
 import { bindTaskPairPanelFit } from '../task-pair-panel-fit.js';
@@ -86,6 +87,7 @@ function normalizeSnapshot(detail: TaskPairConsoleSnapshotDetail): readonly Reco
       : undefined;
     return {
       ...pair,
+      scheduling: readPairScheduling(pair.scheduling as TaskPairScheduling | undefined),
       taskId: task.taskId,
       title: task.title,
       brief: typeof task.brief === 'string' && task.brief.trim() ? task.brief : pair.brief,
@@ -230,23 +232,25 @@ export function TaskPairStatusPanel({ events, sessions, serverId, scopeSessionId
     if (!scopeSessionId) return true;
     return String(row.payload.executor ?? '') === scopeSessionId || String(row.payload.auditor ?? '') === scopeSessionId;
   });
-  const groupFor = (value: TaskPairStatus) => value === 'queued' ? 'queued' : value === 'awaiting_brain_decision' ? 'awaiting_brain_decision' : value === 'rework' ? 'rework' : value === 'in_audit' || value === 'awaiting_audit' ? 'audit' : value === 'done' || value === 'cancelled' || value === 'passed' ? 'recent' : 'working';
-  const groups = (['working', 'audit', 'rework', 'queued', 'awaiting_brain_decision', 'recent'] as const).map((key) => {
-    const rows = allRows.filter((row) => groupFor(row.payload.toStatus as TaskPairStatus) === key);
+  const waitKind = (payload: Record<string, unknown>) => taskPairWaitKind({ scheduling: payload.scheduling as TaskPairScheduling | undefined, status: payload.toStatus as TaskPairStatus });
+  const groupFor = (value: TaskPairStatus, payload: Record<string, unknown>) => waitKind(payload) ?? ( value === 'queued' ? 'queued' : value === 'awaiting_brain_decision' ? 'awaiting_brain_decision' : value === 'rework' ? 'rework' : value === 'in_audit' || value === 'awaiting_audit' ? 'audit' : value === 'done' || value === 'cancelled' || value === 'passed' ? 'recent' : 'working');
+  const groups = (['working', 'audit', 'rework', 'queued', 'awaiting_brain_decision', ...TASK_PAIR_WAIT_KINDS, 'recent'] as const).map((key) => {
+    const rows = allRows.filter((row) => groupFor(row.payload.toStatus as TaskPairStatus, row.payload) === key);
     if (key === 'queued') rows.sort((a, b) => Number(a.payload.queuePosition ?? Number.MAX_SAFE_INTEGER) - Number(b.payload.queuePosition ?? Number.MAX_SAFE_INTEGER));
     return { key, rows: key === 'recent' ? rows.slice(-MAX_ROWS) : rows };
   }).filter((group) => group.rows.length > 0);
   const scopedDefaultTaskId = scopeSessionId
     ? (allRows.find((row) => ['working', 'in_audit', 'awaiting_audit', 'rework'].includes(String(row.payload.toStatus)))?.payload.taskId ?? allRows[0]?.payload.taskId)
     : undefined;
-  const counts = allRows.reduce<{ working: number; audit: number; queued: number; awaitingBrain: number }>((result, row) => {
+  const counts = allRows.reduce<{ working: number; audit: number; queued: number; awaitingBrain: number; waiting: number }>((result, row) => {
+    if (waitKind(row.payload)) { result.waiting += 1; return result; }
     const value = row.payload.toStatus;
     if (value === 'working' || value === 'rework') result.working += 1;
     else if (value === 'in_audit' || value === 'awaiting_audit') result.audit += 1;
     else if (value === 'awaiting_brain_decision') result.awaitingBrain += 1;
     else if (value === 'queued') result.queued += 1;
     return result;
-  }, { working: 0, audit: 0, queued: 0, awaitingBrain: 0 });
+  }, { working: 0, audit: 0, queued: 0, awaitingBrain: 0, waiting: 0 });
   if (latest.size === 0 || allRows.length === 0) return null;
   // What is shown: the user's own choice if there is one, else the default (a phone sub-session: closed); too little room on a phone
   // shows the strip without touching the choice.
@@ -285,6 +289,7 @@ export function TaskPairStatusPanel({ events, sessions, serverId, scopeSessionId
   };
   const toggleLabel = `${t(collapsed ? 'taskPair.panel_expand' : 'taskPair.panel_collapse')} — ${t('taskPair.panel_title')}`;
   const toggleContent = collapsed ? <span class={`task-pair-status-icons${isMobile ? ' task-pair-status-mobile-content' : ''}`} role="group" aria-label={t('taskPair.panel_title')}>
+    {counts.waiting > 0 && <span class="task-pair-status-icon" title={t('taskPair.status.paused')} aria-label={t('taskPair.status.paused')}><span aria-hidden="true">⏸</span><b>{counts.waiting}</b></span>}
     {isMobile && <span class="task-pair-status-mobile-label">{t('taskPair.panel_title')}</span>}
     <span class={`task-pair-status-icon task-pair-status-icon--working${counts.working === 0 ? ' is-zero' : ''}`} title={t('taskPair.panel_icon_working')} aria-label={t('taskPair.panel_icon_working')}><span aria-hidden="true">▶</span><b>{counts.working}</b></span>
     <span class={`task-pair-status-icon task-pair-status-icon--audit${counts.audit === 0 ? ' is-zero' : ''}`} title={t('taskPair.panel_icon_audit')} aria-label={t('taskPair.panel_icon_audit')}><span aria-hidden="true">◉</span><b>{counts.audit}</b></span>
@@ -306,19 +311,20 @@ export function TaskPairStatusPanel({ events, sessions, serverId, scopeSessionId
     </button>}
     {!collapsed && <div class="task-pair-status-rows" data-testid="task-pair-status-rows">
       {(() => { let sequence = 0; return groups.map((group) => {
-        const heading = <h4>{group.key === 'awaiting_brain_decision' ? t('taskPair.status.awaiting_brain_decision') : t(`taskPair.panel_group_${group.key}`)} <small>({group.rows.length})</small></h4>;
+        const heading = <h4>{TASK_PAIR_WAIT_KINDS.includes(group.key as typeof TASK_PAIR_WAIT_KINDS[number]) ? t(`taskPair.status.${group.key}`) : group.key === 'awaiting_brain_decision' ? t('taskPair.status.awaiting_brain_decision') : t(`taskPair.panel_group_${group.key}`)} <small>({group.rows.length})</small></h4>;
         const content = group.rows.map((row, index) => { const payload = row.payload; const sequenceNumber = ++sequence; const queued = group.key === 'queued'; const terminal = TASK_PAIR_TERMINAL_STATUSES.includes(payload.toStatus as TaskPairStatus); const duration = formatTaskDuration({ startedAt: row.startedAt, finishedAt: payload.finishedAt, endedAt: payload.endedAt, updatedAt: row.updatedAt, now, durationMs: payload.durationMs, terminal }, durationUnits); const title = taskPairDisplayTitle(payload.title, String(payload.taskId), payload.brief) ?? t('taskPair.panel_untitled'); const taskStatus = String(payload.toStatus); const reworkCount = Math.max(1, reworkCounts.get(String(payload.taskId)) ?? 0); const auditRound = Number(payload.round ?? 0); const deliveryRound = Math.max(1, Number(payload.deliveryRound ?? 1)); return <div class={`task-pair-status-row task-pair-chip--${taskStatus}`} data-status={taskStatus} key={String(payload.taskId)}>
           <span class="task-pair-status-sequence" aria-label={`#${sequenceNumber}`}>{sequenceNumber}</span>
           <div class="task-pair-status-row-head">
             <span class={`task-pair-status-badge task-pair-chip--${taskStatus}`}>
               <span class="task-pair-status-badge-dot" aria-hidden="true" />
-              {taskStatus === 'rework' ? t('taskPair.panel_rework_count', { count: reworkCount }) : taskStatus === 'working' && deliveryRound > 1 ? t('taskPair.panel_round_in_progress', { round: deliveryRound }) : t(`taskPair.status.${taskStatus}`)}
+              {waitKind(payload) ? t(`taskPair.status.${waitKind(payload)}`) : taskStatus === 'rework' ? t('taskPair.panel_rework_count', { count: reworkCount }) : taskStatus === 'working' && deliveryRound > 1 ? t('taskPair.panel_round_in_progress', { round: deliveryRound }) : t(`taskPair.status.${taskStatus}`)}
             </span>
             {!queued && auditRound > 0 && <span class="task-pair-status-round-badge">{deliveryRound > 1 ? t('taskPair.panel_round_of', { delivery: deliveryRound, audit: auditRound }) : t('taskPair.panel_round', { round: auditRound })}</span>}
             {!queued && <span class="task-pair-status-round-badge task-pair-status-blocking-badge">{t('taskPair.blocking', { levels: Array.isArray(payload.blocking) ? payload.blocking.join(',') : 'P0' })}</span>}
             {queued && payload.urgent === true && <span class="task-pair-status-urgent">!</span>}
           </div>
           <strong class="task-pair-status-row-title">{queued && <em>#{Number(payload.queuePosition ?? index + 1)} </em>}{title}</strong>
+          {waitKind(payload) && <small class="task-pair-status-row-meta">{(payload.scheduling as TaskPairScheduling).note}{(payload.scheduling as TaskPairScheduling).dependsOn.length > 0 && t('taskPair.waiting_for_tasks', { tasks: (payload.scheduling as TaskPairScheduling).dependsOn.map((id) => String(latest.get(id)?.payload.title ?? id)).join(', ') })}</small>}
           <TaskPairBrief brief={typeof payload.brief === 'string' ? payload.brief : undefined} briefRevision={typeof payload.briefRevision === 'string' ? payload.briefRevision : undefined} checklist={payload.checklist as { total: number; implemented: number; audited: number } | undefined} taskId={String(payload.taskId)} defaultOpen={String(payload.taskId) === String(scopedDefaultTaskId)} />
           {duration !== undefined && <small class="task-pair-status-row-meta"><span class="task-pair-status-row-meta-icon" aria-hidden="true">⏱</span>{Number.isFinite(row.startedAt) && <>{t('taskPair.panel_started', { time: new Date(row.startedAt).toLocaleTimeString() })} · </>}{queued ? t('taskPair.panel_queued', { duration }) : t('taskPair.panel_elapsed', { duration })}</small>}
           <div class="task-pair-status-row-roles">

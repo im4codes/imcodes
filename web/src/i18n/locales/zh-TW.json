@@ -4644,7 +4644,10 @@
       "done": "已完成",
       "cancelled": "已取消",
       "rework_round": "返工第{{round}}輪",
-      "awaiting_brain_decision": "等待 Brain 決定"
+      "awaiting_brain_decision": "等待 Brain 決定",
+      "paused": "已暫停",
+      "waiting_dependencies": "等待相依任務",
+      "resuming": "等待恢復"
     },
     "flag": {
       "blocked": "受阻",
@@ -4739,6 +4742,7 @@
     "card_reason": "Reason",
     "card_next_step": "Next step",
     "card_details_unavailable": "Detailed information was not provided; see the original notice below.",
-    "card_no_blocking": "No blocking findings."
+    "card_no_blocking": "No blocking findings.",
+    "waiting_for_tasks": "等待任務：{{tasks}}"
   }
 }

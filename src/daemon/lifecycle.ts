@@ -2018,10 +2018,11 @@ async function performShutdown(exitCode: number): Promise<void> {
   // real chance to land before exit -- bounded, so a stalled send or a
   // wedged git call can never hang shutdown itself.
   try {
+    taskPairAutomation.stop();
     const pairsDrainStart = Date.now();
     const pendingAtStart = taskPairService.pendingCount;
     const abandoned = await Promise.race([
-      taskPairService.dispose().then(() => 0),
+      Promise.all([taskPairService.dispose(), taskPairAutomation.waitForSuspensionIdle()]).then(() => 0),
       new Promise<number>((resolve) => {
         setTimeout(() => resolve(taskPairService.pendingCount), 3_000).unref?.();
       }),

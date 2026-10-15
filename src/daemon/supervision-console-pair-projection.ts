@@ -1,3 +1,4 @@
+import { projectPairScheduling } from '../../shared/task-pair-suspension.js';
 import { taskPairTitleWireAccess } from '../../shared/task-pair-title-access.js';
 /**
  * Console rows for `pairs`-engine projects, and the per-scope view that lets a
@@ -88,6 +89,7 @@ export function buildPairConsoleRow(
     updatedAt: pair.updatedAt,
     lastEventId: 0,
     pair: {
+      ...(pair.scheduling ? { scheduling: projectPairScheduling(pair.scheduling) } : {}),
       status: pair.status,
       flags: [...pair.flags],
       ...(pair.executor ? { executor: pair.executor } : {}),

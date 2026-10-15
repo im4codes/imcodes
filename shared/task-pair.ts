@@ -1,3 +1,4 @@
+import { isTaskPairSuspended, type TaskPairScheduling } from './task-pair-suspension.js';
 import type { TaskPairTitleAccess, TaskPairTitleWireAccess } from './task-pair-title-access.js';
 /**
  * Marker-driven executor + auditor task pairs (the `pairs` supervision engine).
@@ -73,12 +74,12 @@ export const TASK_PAIR_MCP_DELIVERY_EVENT = 'PAIR_DELIVERY' as const;
  * Every outcome of handing a daemon-authored message to a session. `skipped_pending`
  * means an earlier identical message is still waiting in the target's queue.
  */
-export const TASK_PAIR_DELIVERY_RESULTS = ['sent', 'queued', 'skipped_pending', 'no_session', 'failed'] as const;
+export const TASK_PAIR_DELIVERY_RESULTS = ['sent', 'queued', 'skipped_pending', 'no_session', 'failed', 'suspended'] as const;
 export type TaskPairDeliveryResult = typeof TASK_PAIR_DELIVERY_RESULTS[number];
 /** Durable event verb recording what became of a daemon notice addressed to Brain. */
 export const TASK_PAIR_BRAIN_NOTICE_EVENT = 'BRAIN_NOTICE' as const;
 /** Outcomes worth recording for a Brain notice (a pending duplicate changes nothing). */
-export const TASK_PAIR_BRAIN_NOTICE_STATUSES = ['sent', 'queued', 'no_session', 'failed'] as const;
+export const TASK_PAIR_BRAIN_NOTICE_STATUSES = ['sent', 'queued', 'no_session', 'failed', 'suspended'] as const;
 export type TaskPairBrainNoticeStatus = typeof TASK_PAIR_BRAIN_NOTICE_STATUSES[number];
 /** The last notice the daemon addressed to Brain for one pair, as the pair card shows it. */
 export interface TaskPairBrainNotice {
@@ -1200,6 +1201,7 @@ export interface TaskPairLastVerdict {
 }
 
 export interface TaskPairState {
+  scheduling?: TaskPairScheduling;
   /** Trusted creator / explicit owner title-only grants; never inferred from role slots. */
   titleAccess?: TaskPairTitleAccess;
   taskId: string;
@@ -1957,6 +1959,7 @@ export function applyTaskPairMarker(
   const pair = clonePair(existing);
   pair.updatedAt = ctx.now;
   const terminal = isTerminalTaskPairStatus(pair.status);
+  if ((ctx.source === 'heartbeat' || ctx.source === 'queue') && isTaskPairSuspended(pair)) return recorded(existing, false);
   let unusual = role === 'other';
   if ((PROGRESS_VERBS.includes(verb) && !(terminal && verb === 'DISPATCH'))
     || (roleAuthority && (verb === 'QUEUE' || verb === 'REASSIGN'))) {
@@ -2459,6 +2462,7 @@ function isAboutAuditor(attrs: Record<string, string>): boolean {
 
 /** The side whose turn it is, or undefined for statuses nobody is nudged in. */
 export function taskPairSideToAct(pair: TaskPairState): 'executor' | 'auditor' | undefined {
+  if (isTaskPairSuspended(pair)) return undefined;
   switch (pair.status) {
     case 'working':
     case 'rework':
@@ -2494,6 +2498,7 @@ export const TASK_PAIR_CONSOLE_LEGACY_STATUS = {
 // ---------------------------------------------------------------------------
 
 export interface TaskPairEventPayload {
+  scheduling?: TaskPairScheduling;
   titleAccess?: TaskPairTitleWireAccess;
   taskId: string;
   verb: string;
@@ -2608,6 +2613,7 @@ export function buildTaskPairMarkerContract(): string {
     TASK_PAIR_READY_SELF_CHECK_RULE,
     TASK_PAIR_SELF_SUFFICIENCY_RULE,
     TASK_PAIR_SCOPE_DECISION_RULE,
+    'Waiting costs no model turns: use pair_pause mode=manual for a manual hold, or mode=dependencies with same-project dependsOn ids; pair_resume clears only the manual hold. Dependencies wait for Brain-accepted DONE, not PASS. Paused pairs retain their stage/material/workspace; do not keep replying that you are waiting. pair_create also accepts dependsOn.',
     'Automatic pairing policy: multi-step, cross-file, test/real-machine, integration, performance, security or substantial tasks use an executor plus auditor and heartbeat; small edits and queries use one executor with no auditor. Explicit user choices always win. With an empty or unconfigured pool the daemon uses idle sub-sessions of the Brain in the SAME provider family that run the secondary model of that family (Anthropic Sonnet, OpenAI Sol, DeepSeek Pro; never another vendor, never the flagship, no session is created); executor and auditor are different sessions, and when none is available the daemon tells you how to fix it (create a sub-session, name executor/auditor, or execution_pool_set). Prefer configured Luna→Sol, then Haiku→Sonnet, then DeepSeek Flash→Pro tiers.',
     TASK_PAIR_BRAIN_MCP_ONLY_RULE,
     TASK_PAIR_PROJECT_PRECEDENCE_CLAUSE,

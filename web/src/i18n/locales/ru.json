@@ -4643,7 +4643,10 @@
       "done": "Готово",
       "cancelled": "Отменена",
       "rework_round": "Доработка, раунд {{round}}",
-      "awaiting_brain_decision": "Ожидает решения Brain"
+      "awaiting_brain_decision": "Ожидает решения Brain",
+      "paused": "Приостановлено",
+      "waiting_dependencies": "Ожидание зависимостей",
+      "resuming": "Ожидание возобновления"
     },
     "flag": {
       "blocked": "Заблокирована",
@@ -4738,6 +4741,7 @@
     "card_reason": "Reason",
     "card_next_step": "Next step",
     "card_details_unavailable": "Detailed information was not provided; see the original notice below.",
-    "card_no_blocking": "No blocking findings."
+    "card_no_blocking": "No blocking findings.",
+    "waiting_for_tasks": "Ожидание: {{tasks}}"
   }
 }

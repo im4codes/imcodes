@@ -1,3 +1,5 @@
+import { queuedPairWakeAllowed } from './task-pairs/wake-authority.js';
+import { isTaskPairSuspended, TASK_PAIR_WAKE_BINDING_TAG } from '../../shared/task-pair-suspension.js';
 import { isEndedSupervisionTaskStatus } from '../../shared/supervision-config.js';
 import {
   isTerminalTaskPairStatus,
@@ -114,16 +116,26 @@ function resolveQueuedTaskPairNudgeAdmission(
   sessionName: string,
   entry: { clientMessageId?: string; commandId?: string },
 ): QueueSupervisionAdmission {
+  if ((entry.commandId ?? entry.clientMessageId ?? '').includes(TASK_PAIR_WAKE_BINDING_TAG)) return 'authorized';
   const taskId = taskPairIdFromNudgeId(entry.commandId)
     ?? taskPairIdFromNudgeId(entry.clientMessageId);
-  if (!taskId) return 'authorized';
+  if (!taskId) {
+    const id = entry.commandId ?? entry.clientMessageId ?? '';
+    if (id.startsWith(`${TASK_PAIR_NUDGE_ID_PREFIX}__aggregate__:`) && getTaskPairStore().pairsForSession(sessionName).some((p) => p.state.brain === sessionName && p.state.scheduling)) return 'stale';
+    return 'authorized';
+  }
   // A notice ABOUT the end of a pair (its workspace was kept) is only ever sent after the pair ended.
   const reason = taskPairNudgeReasonFromId(entry.commandId) ?? taskPairNudgeReasonFromId(entry.clientMessageId);
   if (reason && TASK_PAIR_ENDED_PAIR_NOTICE_REASONS.includes(reason)) return 'authorized';
   const project = getSession(sessionName)?.projectName;
   if (!project) return 'authorized';
   try {
-    const pair = getTaskPairStore().getPair(project, taskId);
+    const rawId = entry.commandId ?? entry.clientMessageId ?? '';
+    // Legacy ids did not escape ':': match the longest known task prefix.
+    const known = getTaskPairStore().pairsForSession(sessionName).filter((p) => rawId.startsWith(`${TASK_PAIR_NUDGE_ID_PREFIX}${p.state.taskId}:`)).sort((a, b) => b.state.taskId.length - a.state.taskId.length)[0];
+    const pair = known ?? getTaskPairStore().getPair(project, taskId);
+    // Legacy nudges have no epoch; once this pair has ever paused, they are obsolete even after resume.
+    if (pair?.state.scheduling || (pair && isTaskPairSuspended(pair.state))) return 'stale';
     if (!pair || !isTerminalTaskPairStatus(pair.state.status)) return 'authorized';
     logger.info({ sessionName, taskId, status: pair.state.status }, 'dropping a queued task-pair nudge: pair already ended');
     return 'stale';
@@ -183,6 +195,7 @@ export function resolveTransportQueueEntryAdmission(sessionName: string, entry: 
   supervisionReference?: Parameters<typeof resolveQueuedSupervisionHeartbeatDelivery>[0]['supervisionReference'];
   delegationReply?: { delegationId: string };
 }): QueueSupervisionAdmission {
+  if (!queuedPairWakeAllowed(sessionName, entry.commandId ?? entry.clientMessageId ?? '')) return 'stale';
   const integrationDigest = resolveQueuedIntegrationDigestAdmission(sessionName, entry);
   if (integrationDigest !== 'authorized') return integrationDigest;
   const taskPairNudge = resolveQueuedTaskPairNudgeAdmission(sessionName, entry);

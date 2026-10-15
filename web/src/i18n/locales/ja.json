@@ -4643,7 +4643,10 @@
       "done": "完了",
       "cancelled": "キャンセル",
       "rework_round": "再作業 第{{round}}ラウンド",
-      "awaiting_brain_decision": "Brain の判断待ち"
+      "awaiting_brain_decision": "Brain の判断待ち",
+      "paused": "一時停止中",
+      "waiting_dependencies": "依存タスク待ち",
+      "resuming": "再開待ち"
     },
     "flag": {
       "blocked": "ブロック",
@@ -4738,6 +4741,7 @@
     "card_reason": "Reason",
     "card_next_step": "Next step",
     "card_details_unavailable": "Detailed information was not provided; see the original notice below.",
-    "card_no_blocking": "No blocking findings."
+    "card_no_blocking": "No blocking findings.",
+    "waiting_for_tasks": "待機中: {{tasks}}"
   }
 }

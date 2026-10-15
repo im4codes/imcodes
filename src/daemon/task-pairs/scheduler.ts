@@ -1,3 +1,4 @@
+import { isTaskPairSuspended, taskPairHoldsExecutionSlot, TASK_PAIR_DEPENDENCY_FAILURE_REASON, TASK_PAIR_RESUME_REASON } from '../../../shared/task-pair-suspension.js';
 /**
  * Daemon-owned automation for task pairs: the pair heartbeat (D6), automatic
  * auditor replacement (D6.5), executor escalation (D6.5a), and the
@@ -240,10 +241,104 @@ export class TaskPairAutomation implements TaskPairScheduler {
   #participantRecoveryNoticeKeys = new Set<string>();
   #recoveryCountThisTick = 0;
 
+  #suspensionListener?: () => void;
+  #suspensionRefresh?: Promise<void>;
+  #suspensionRefreshAgain = false;
+  #suspensionStopped = false;
+  async waitForSuspensionIdle(): Promise<void> { await this.#suspensionRefresh; }
+
+  /** Durable/event-driven dependency reconciliation. Never calls a model merely to check a dependency. */
+  reconcileSuspensions(): Promise<void> {
+    if (this.#suspensionStopped) return Promise.resolve();
+    if (this.#suspensionRefresh) { this.#suspensionRefreshAgain = true; return this.#suspensionRefresh; }
+    const run = async () => {
+      do {
+        this.#suspensionRefreshAgain = false;
+        await this.#reconcileSuspensionsOnce();
+      } while (this.#suspensionRefreshAgain && !this.#suspensionStopped);
+    };
+    this.#suspensionRefresh = Promise.resolve().then(run).finally(() => { this.#suspensionRefresh = undefined; });
+    return this.#suspensionRefresh;
+  }
+
+  /** An async automatic action belongs to the scheduling epoch that started it. */
+  #scheduleStillCurrent(project: string, pair: TaskPairState): boolean {
+    const current = getTaskPairStore().getPair(project, pair.taskId)?.state;
+    return !!current && !isTerminalTaskPairStatus(current.status) && !isTaskPairSuspended(current)
+      && (current.scheduling?.epoch ?? 0) === (pair.scheduling?.epoch ?? 0);
+  }
+
+  #occupiesSlot(stored: StoredTaskPair): boolean {
+    return taskPairHoldsExecutionSlot(stored.state, (name) => this.#liveBusy(name));
+  }
+
+  async #reconcileSuspensionsOnce(): Promise<void> {
+    const store = getTaskPairStore();
+    const queues = new Set<string>();
+    for (const original of store.listActivePairsShared()) {
+      if (this.#suspensionStopped) return;
+      if (!original.state.scheduling) continue;
+      let stored = store.getPair(original.project, original.state.taskId) ?? original;
+      let s = stored.state.scheduling;
+      if (!s) continue;
+      if (s.dependsOn.length) {
+        const deps = s.dependsOn.map((id) => store.getPair(stored.project, id));
+        if (deps.some((dep) => !dep || dep.state.status === 'cancelled')) {
+          if (!s.failureNotified) {
+            const saved = store.patchScheduling(stored.project, stored.state.taskId, s, { ...s, failureNotified: true }, this.#now());
+            if (saved) await sendTaskPairMessage(saved.state.brain, saved.state.taskId, TASK_PAIR_DEPENDENCY_FAILURE_REASON,
+              `Dependency unavailable/cancelled; ${saved.state.taskId} remains waiting. Inspect dependencies or update the wait; no automatic retry will wake its workers.`, `epoch-${s.epoch}`);
+          }
+          continue;
+        }
+        // PASS is not completion: only the Brain's accepted DONE unlocks work.
+        if (deps.every((dep) => dep?.state.status === 'done')) {
+          const next = { ...s, dependsOn: [], resumePending: !s.manual, admitted: false };
+          const saved = store.patchScheduling(stored.project, stored.state.taskId, s, next, this.#now());
+          if (!saved) continue;
+          stored = saved; s = next;
+        }
+      }
+      if (s.manual || s.dependsOn.length || !s.resumePending) continue;
+      const busy = [stored.state.executor, stored.state.auditor].some((name) => !!name && name !== TASK_PAIR_NO_AUDITOR && this.#liveBusy(name));
+      if (busy) continue;
+      if (!s.admitted && stored.state.status !== 'queued') {
+        const occupied = store.listActivePairsShared(stored.project).filter((p) => p.state.brain === stored.state.brain && p.state.taskId !== stored.state.taskId && this.#occupiesSlot(p)).length;
+        if (occupied >= resolveTaskPairMaxConcurrency(stored.state.brain)) continue;
+        const saved = store.patchScheduling(stored.project, stored.state.taskId, s, { ...s, admitted: true }, this.#now());
+        if (!saved) continue;
+        stored = saved; s = saved.state.scheduling!;
+      }
+      let result: 'sent' | 'queued' | 'skipped_pending' | 'no_session' | 'failed' | 'suspended' = 'sent';
+      const side = taskPairSideToAct({ ...stored.state, scheduling: undefined });
+      const target = side === 'auditor' ? stored.state.auditor : side === 'executor' ? stored.state.executor : undefined;
+      if (stored.state.status !== 'queued' && target && target !== TASK_PAIR_NO_AUDITOR) {
+        result = await sendTaskPairMessage(target, stored.state.taskId, TASK_PAIR_RESUME_REASON,
+          `Resume ${stored.state.taskId} at its existing ${stored.state.status} stage. Preserve its round, material and workspace; do not create a new task or repeat completed work.`, `epoch-${s.epoch}`);
+      }
+      if (result !== 'sent' && result !== 'queued' && result !== 'skipped_pending') continue;
+      const saved = store.patchScheduling(stored.project, stored.state.taskId, s, { ...s, resumePending: false, admitted: false, resumedAt: this.#now() }, this.#now());
+      if (!saved) continue;
+      const now = this.#now();
+      store.saveLiveness(saved.project, saved.state.taskId, { ...saved.liveness,
+        activityExecutorAt: now, activityAuditorAt: now, lastTickAt: now,
+        phaseStartedAt: now, stageStallPromptAt: undefined, stageStallEscalatedAt: undefined,
+        silenceExecutor: 0, silenceAuditor: 0, bothIdleNudgedAt: undefined, bothIdleNudgeCount: 0,
+      });
+      queues.add(`${saved.project}\0${saved.state.brain}`);
+    }
+    for (const key of queues) { const [project, brain] = key.split('\0'); if (project && brain) await this.runQueue(project, brain); }
+  }
+
   start(intervalMs = resolveTaskPairHeartbeatMs()): void {
     if (this.#timer) return;
+    this.#suspensionStopped = false;
     this.#intervalMs = intervalMs;
     this.#nextTickAt = this.#now() + intervalMs;
+    this.#suspensionListener = getTaskPairStore().onPairSaved(() => {
+      void this.reconcileSuspensions().catch((err) => logger.warn({ err }, 'pair suspension reconciliation failed'));
+    });
+    void this.reconcileSuspensions().catch((err) => logger.warn({ err }, 'pair suspension startup reconciliation failed'));
     this.publishBadges();
     // Admit queued work immediately after a daemon restart instead of waiting
     // for the first heartbeat interval.
@@ -263,6 +358,9 @@ export class TaskPairAutomation implements TaskPairScheduler {
   }
 
   stop(): void {
+    this.#suspensionStopped = true;
+    this.#suspensionListener?.();
+    this.#suspensionListener = undefined;
     if (this.#timer) clearInterval(this.#timer);
     this.#timer = undefined;
     if (this.#bothIdleTimer) clearInterval(this.#bothIdleTimer);
@@ -395,6 +493,7 @@ export class TaskPairAutomation implements TaskPairScheduler {
 
   /** Safety admission sweep; bounded to 30s so missed lifecycle events cannot stall a queue. */
   async #runQueueSweep(): Promise<void> {
+    await this.reconcileSuspensions();
     const keys = new Set<string>();
     for (const stored of getTaskPairStore().listActivePairs()) {
       if (isPairsEngineProject(stored.project) && stored.state.status === 'queued') {
@@ -750,6 +849,7 @@ export class TaskPairAutomation implements TaskPairScheduler {
   // ---- intents from marker ingestion ------------------------------------
 
   async onIntent(project: string, pair: TaskPairState, intent: TaskPairIntent): Promise<void> {
+    if (isTaskPairSuspended(getTaskPairStore().getPair(project, pair.taskId)?.state ?? pair) && intent.kind !== 'slot_changed') return;
     switch (intent.kind) {
       case 'pick_auditor':
       case 'replace_auditor':
@@ -771,6 +871,7 @@ export class TaskPairAutomation implements TaskPairScheduler {
   // ---- heartbeat ---------------------------------------------------------
 
   async tick(): Promise<void> {
+    await this.reconcileSuspensions();
     const now = this.#now();
     const store = getTaskPairStore();
     const activeForGuard = store.listActivePairs().filter((pair) => isPairsEngineProject(pair.project));
@@ -818,11 +919,12 @@ export class TaskPairAutomation implements TaskPairScheduler {
     this.#recoveryCountThisTick = 0;
     try {
     for (const stored of store.listActivePairs()) {
-        if (!isPairsEngineProject(stored.project)) continue;
+        if (!isPairsEngineProject(stored.project) || isTaskPairSuspended(stored.state)) continue;
         brains.set(stored.state.brain, stored.project);
         try {
           await ensureTaskPairWorkspaceAvailable(stored.project, stored.state.taskId);
           await refreshTaskPairWorkspaceHead(stored.project, stored.state.taskId);
+          if (isTaskPairSuspended(store.getPair(stored.project, stored.state.taskId)?.state ?? stored.state)) continue;
           // A participant that is not a session at all cannot be nudged, restarted or recovered: Brain is told its name instead.
           const missingParticipant = this.#reportMissingParticipants(stored);
           const externallyRecovered = !missingParticipant && await this.#detectExternalParticipantRestart(stored);
@@ -905,8 +1007,12 @@ export class TaskPairAutomation implements TaskPairScheduler {
   async #flushPendingNotices(): Promise<void> {
     const pending = this.#pendingNotices;
     if (!pending) return;
-    for (const [brain, entries] of pending) {
+    for (const [brain, allEntries] of pending) {
+      const entries = allEntries.filter((e) => !getTaskPairStore().pairsForSession(brain).some((p) => p.state.taskId === e.pair.taskId && isTaskPairSuspended(p.state)));
       if (entries.length === 0) continue;
+      const expected = (pair: TaskPairState) => getTaskPairStore().pairsForSession(pair.brain)
+        .filter((stored) => stored.state.taskId === pair.taskId)
+        .map((stored) => ({ project: stored.project, taskId: pair.taskId, epoch: pair.scheduling?.epoch ?? 0 }));
       const lineEntries = entries.filter((entry): entry is PendingBrainLineNotice => 'text' in entry);
       const flagEntries = entries.filter((entry): entry is PendingBrainFlagNotice => !('text' in entry));
       // Line notices batch per reason: N brief-less pairs found in one
@@ -921,16 +1027,16 @@ export class TaskPairAutomation implements TaskPairScheduler {
       for (const [reason, group] of lineByReason) {
         if (group.length === 1) {
           const notice = group[0]!;
-          await sendTaskPairMessage(brain, notice.pair.taskId, notice.reason, buildBrainLine(notice.pair, notice.text));
+          await sendTaskPairMessage(brain, notice.pair.taskId, notice.reason, buildBrainLine(notice.pair, notice.text), undefined, expected(notice.pair));
         } else {
-          await sendTaskPairMessage(brain, TASK_PAIR_AGGREGATE_NOTICE_ID, `${reason}-digest`, buildNoBriefDigestMessage(group.map((notice) => notice.pair.taskId)));
+          await sendTaskPairMessage(brain, TASK_PAIR_AGGREGATE_NOTICE_ID, `${reason}-digest`, buildNoBriefDigestMessage(group.map((notice) => notice.pair.taskId)), undefined, group.flatMap((notice) => expected(notice.pair)));
         }
       }
       if (flagEntries.length === 1) {
         const notice = flagEntries[0]!;
-        await sendTaskPairMessage(brain, notice.pair.taskId, `brain-${notice.flag}`, buildBrainNoticeMessage(notice.pair, notice.flag, notice.detail));
+        await sendTaskPairMessage(brain, notice.pair.taskId, `brain-${notice.flag}`, buildBrainNoticeMessage(notice.pair, notice.flag, notice.detail), undefined, expected(notice.pair));
       } else if (flagEntries.length > 1) {
-        await sendTaskPairMessage(brain, TASK_PAIR_AGGREGATE_NOTICE_ID, 'brain-aggregate', buildAggregatedBrainNoticeMessage(flagEntries));
+        await sendTaskPairMessage(brain, TASK_PAIR_AGGREGATE_NOTICE_ID, 'brain-aggregate', buildAggregatedBrainNoticeMessage(flagEntries), undefined, flagEntries.flatMap((notice) => expected(notice.pair)));
       }
     }
   }
@@ -955,6 +1061,7 @@ export class TaskPairAutomation implements TaskPairScheduler {
     // pair change and session state change, and used to re-read and re-parse
     // every open pair -- briefs included -- from SQLite each time.
     for (const original of getTaskPairStore().listActivePairsShared()) {
+      if (isTaskPairSuspended(original.state)) continue;
       const stored = this.#refreshBrainReminder(original, now);
       if (!TASK_PAIR_OPEN_STATUSES.includes(stored.state.status) || !isPairsProject(stored.project)) continue;
       for (const session of [stored.state.executor, stored.state.auditor]) {
@@ -1126,7 +1233,7 @@ export class TaskPairAutomation implements TaskPairScheduler {
     };
     const onlyAwaitingDecision = deliveryPairs.length === 1 && deliveryPairs[0]!.state.status === TASK_PAIR_STATUS_AWAITING_BRAIN_DECISION;
     const aggregateReason = onlyAwaitingDecision ? 'brain-decision-reminder' : TASK_PAIR_BRAIN_HEARTBEAT_REASON;
-    void sendTaskPairMessage(brain, TASK_PAIR_AGGREGATE_NOTICE_ID, aggregateReason, buildBrainHeartbeatMessage(deliveryPairs.map((stored) => stored.state)))
+    void sendTaskPairMessage(brain, TASK_PAIR_AGGREGATE_NOTICE_ID, aggregateReason, buildBrainHeartbeatMessage(deliveryPairs.map((stored) => stored.state)), undefined, deliveryPairs.map((p) => ({ project: p.project, taskId: p.state.taskId, epoch: p.state.scheduling?.epoch ?? 0 })))
       .then((result) => {
         // An aggregate names no single pair, so the delivery layer cannot
         // attribute it: record what became of it on every pair it covered.
@@ -1288,6 +1395,8 @@ export class TaskPairAutomation implements TaskPairScheduler {
   }
 
   async #tickPair(stored: StoredTaskPair, now: number): Promise<void> {
+    if (isTaskPairSuspended(stored.state)) return;
+    if (stored.state.scheduling?.resumedAt && now - stored.state.scheduling.resumedAt < this.#intervalMs) return;
     let pair = stored.state;
     const store = getTaskPairStore();
     // Owner report (tsk_cd_limit_failover addendum): needs_auditor must never
@@ -1626,6 +1735,7 @@ export class TaskPairAutomation implements TaskPairScheduler {
   // ---- auditor replacement ------------------------------------------------
 
   async replaceAuditor(project: string, taskId: string, reason: string, opts: { dueToLimit?: boolean } = {}): Promise<boolean> {
+    if (isTaskPairSuspended(getTaskPairStore().getPair(project, taskId)?.state ?? {})) return false;
     const store = getTaskPairStore();
     const stored = store.getPair(project, taskId);
     if (!stored || isTerminalTaskPairStatus(stored.state.status) || stored.state.auditor === TASK_PAIR_NO_AUDITOR) return false;
@@ -1687,6 +1797,7 @@ export class TaskPairAutomation implements TaskPairScheduler {
     const pickInput = { brain: pair.brain, role: 'auditor' as const, pool: 'primary' as const, exclude, project, requestedModel, avoidProviderFamily };
     const picked = this.#pick(pickInput);
     const next = picked ?? await this.#provision({ ...pickInput, taskId });
+    if (!this.#scheduleStillCurrent(project, pair)) return false;
     // Injectable pickers are used by tests and integrations, so enforce the
     // same idle/non-reserved contract here as the default pool picker.
     if (next && (exclude.has(next) || this.#busy(next))) {
@@ -1744,11 +1855,11 @@ export class TaskPairAutomation implements TaskPairScheduler {
         flags: updated.flags.filter((flag) => flag !== 'waiting_for_capacity' && flag !== 'all_providers_limited'),
       });
     }
-    await sendTaskPairMessage(next, taskId, 'handoff', buildAuditorHandoffMessage(updated));
-    if (updated.executor) await sendTaskPairMessage(updated.executor, taskId, 'resend', buildExecutorResendMessage(updated, previousAuditor));
+    await sendTaskPairMessage(next, taskId, 'handoff', buildAuditorHandoffMessage(updated), undefined, [{ project, taskId: updated.taskId, epoch: updated.scheduling?.epoch ?? 0 }]);
+    if (updated.executor) await sendTaskPairMessage(updated.executor, taskId, 'resend', buildExecutorResendMessage(updated, previousAuditor), undefined, [{ project, taskId: updated.taskId, epoch: updated.scheduling?.epoch ?? 0 }]);
     const defaultNote = this.#defaultSelectionNote(updated.brain, [{ session: next, named: !!requestedModel }]);
     if (defaultNote) logger.info({ project, taskId, auditor: next, source: SUPERVISION_EXECUTION_SELECTION_SOURCES.DEFAULT_SAME_VENDOR_SECONDARY }, 'task-pair: auditor picked by the no-pool default');
-    await sendTaskPairMessage(updated.brain, taskId, 'brain-line-reassign', buildBrainLine(updated, `auditor ${previousAuditor ?? '(none)'} → ${next}: ${reason}.${defaultNote}`));
+    await sendTaskPairMessage(updated.brain, taskId, 'brain-line-reassign', buildBrainLine(updated, `auditor ${previousAuditor ?? '(none)'} → ${next}: ${reason}.${defaultNote}`), undefined, [{ project, taskId: updated.taskId, epoch: updated.scheduling?.epoch ?? 0 }]);
     return true;
   }
 
@@ -1769,6 +1880,7 @@ export class TaskPairAutomation implements TaskPairScheduler {
     const avoidProviderFamily = opts.dueToLimit ? providerFamilyOfSession(pair.executor!) : undefined;
     const pickInput = { brain: pair.brain, role: 'executor' as const, pool, exclude, project, requestedModel, avoidProviderFamily };
     const next = this.#pick(pickInput) ?? await this.#provision({ ...pickInput, taskId });
+    if (!this.#scheduleStillCurrent(project, pair)) return false;
     if (!next) {
       if (opts.dueToLimit) {
         // See replaceAuditor: the limited executor itself must stay IN this
@@ -1806,8 +1918,8 @@ export class TaskPairAutomation implements TaskPairScheduler {
         flags: updated.flags.filter((flag) => flag !== 'all_providers_limited'),
       });
     }
-    await sendTaskPairMessage(next, taskId, 'executor-handoff', buildExecutorHandoffMessage(updated, previousExecutor, reason));
-    await sendTaskPairMessage(updated.brain, taskId, 'brain-line-reassign', buildBrainLine(updated, `executor ${previousExecutor ?? '(none)'} → ${next}: ${reason}.`));
+    await sendTaskPairMessage(next, taskId, 'executor-handoff', buildExecutorHandoffMessage(updated, previousExecutor, reason), undefined, [{ project, taskId: updated.taskId, epoch: updated.scheduling?.epoch ?? 0 }]);
+    await sendTaskPairMessage(updated.brain, taskId, 'brain-line-reassign', buildBrainLine(updated, `executor ${previousExecutor ?? '(none)'} → ${next}: ${reason}.`), undefined, [{ project, taskId: updated.taskId, epoch: updated.scheduling?.epoch ?? 0 }]);
     return true;
   }
 
@@ -1836,6 +1948,7 @@ export class TaskPairAutomation implements TaskPairScheduler {
     const exclude = new Set<string>([pair.brain, ...(pair.auditor ? [pair.auditor] : [])]);
     const next = this.#pick({ brain: pair.brain, role: 'executor', pool, exclude, project, requestedModel })
       ?? await this.#provision({ brain: pair.brain, role: 'executor', pool, project, taskId, requestedModel });
+    if (!this.#scheduleStillCurrent(project, pair)) return;
     if (!next) {
       this.#flagOnce(
         project, taskId, 'waiting_for_capacity',
@@ -1937,7 +2050,7 @@ export class TaskPairAutomation implements TaskPairScheduler {
     if (brainHasConfiguredPools(brain)) return;
     const store = getTaskPairStore();
     const waiting = store.listActivePairs(project).filter((stored) => (
-      stored.state.brain === brain && stored.state.flags.includes('no_pool_configured')
+      stored.state.brain === brain && !isTaskPairSuspended(stored.state) && stored.state.flags.includes('no_pool_configured')
     ));
     if (waiting.length === 0) return;
     const key = `no_pool_ask_notice:${project}:${brain}`;
@@ -1959,7 +2072,7 @@ export class TaskPairAutomation implements TaskPairScheduler {
   async #checkQueueStalls(project: string, brain: string, now: number): Promise<void> {
     const store = getTaskPairStore();
     const queued = store.listActivePairs(project).filter((stored) => (
-      stored.state.brain === brain && stored.state.status === 'queued'
+      stored.state.brain === brain && stored.state.status === 'queued' && !isTaskPairSuspended(stored.state)
     ));
     // Queue misses are recorded per pair. Report once any queued work has
     // remained capacity-blocked for the stall interval; the scheduler may
@@ -2029,14 +2142,15 @@ export class TaskPairAutomation implements TaskPairScheduler {
     const store = getTaskPairStore();
     const max = resolveTaskPairMaxConcurrency(brain);
     const pairs = store.listActivePairs(project).filter((pair) => pair.state.brain === brain);
-    let open = pairs.filter((pair) => TASK_PAIR_OPEN_STATUSES.includes(pair.state.status)).length;
-    const queued = pairs.filter((pair) => pair.state.status === 'queued').sort(compareQueuedTaskPairs);
+    let open = pairs.filter((pair) => this.#occupiesSlot(pair)).length;
+    const queued = pairs.filter((pair) => pair.state.status === 'queued' && !isTaskPairSuspended(pair.state)).sort(compareQueuedTaskPairs);
     for (const stored of queued) {
       if (open >= max) {
         this.#flagQuiet(project, stored.state.taskId, 'waiting_for_capacity', `waiting for concurrency capacity (${open}/${max} open pairs)`);
         return;
       }
       const pair = stored.state;
+      if (!this.#scheduleStillCurrent(project, pair)) continue;
       // A brief-less pair imported from legacy supervision has no real work to
       // start: park it (one batched Brain notice) until Brain adds a brief.
       // A bare DISPATCH that was auto-queued (no brief, no legacy id) is
@@ -2097,11 +2211,13 @@ export class TaskPairAutomation implements TaskPairScheduler {
       const executor = pair.executor
         ?? this.#pick({ brain, role: 'executor', pool, exclude: new Set([brain, ...(pair.auditor ? [pair.auditor] : [])]), project, requestedModel: pair.executorModel })
         ?? await this.#queueProvision({ brain, role: 'executor', pool, project, taskId: pair.taskId, requestedModel: pair.executorModel });
+      if (!this.#scheduleStillCurrent(project, pair)) continue;
       const auditor = pair.auditor
         ?? (executor
           ? this.#pick({ brain, role: 'auditor', pool: 'primary', exclude: new Set([brain, executor]), project, requestedModel: pair.auditorModel })
             ?? await this.#queueProvision({ brain, role: 'auditor', pool: 'primary', project, taskId: pair.taskId, requestedModel: pair.auditorModel })
           : undefined);
+      if (!this.#scheduleStillCurrent(project, pair)) continue;
       if (!executor || !auditor || executor === auditor) {
         // No per-pair notice here (owner correction): a queue miss is common
         // and self-resolving as soon as a matching session frees up or is
@@ -2121,6 +2237,7 @@ export class TaskPairAutomation implements TaskPairScheduler {
         this.#logQueueSkip(project, pair, detail);
         continue;
       }
+      if (!this.#scheduleStillCurrent(project, pair)) continue;
       const result = taskPairService.applyMarker({
         project,
         writer: 'daemon',
@@ -2137,8 +2254,8 @@ export class TaskPairAutomation implements TaskPairScheduler {
       if (pair.brief !== undefined) {
         // The executor's worktree exists before the brief that names it is sent.
         const withWorkspace = await taskPairService.ensureWorkspace(project, pair.taskId) ?? cleaned;
-        await sendTaskPairMessage(executor, pair.taskId, 'dispatch', `${pair.brief}${buildDispatchTrailer(withWorkspace)}`);
-        if (auditor !== TASK_PAIR_NO_AUDITOR) await sendTaskPairMessage(auditor, pair.taskId, 'auditor-assigned', buildAuditorAssignmentMessage(cleaned));
+        await sendTaskPairMessage(executor, pair.taskId, 'dispatch', `${pair.brief}${buildDispatchTrailer(withWorkspace)}`, undefined, [{ project, taskId: pair.taskId, epoch: pair.scheduling?.epoch ?? 0 }]);
+        if (auditor !== TASK_PAIR_NO_AUDITOR) await sendTaskPairMessage(auditor, pair.taskId, 'auditor-assigned', buildAuditorAssignmentMessage(cleaned), undefined, [{ project, taskId: pair.taskId, epoch: pair.scheduling?.epoch ?? 0 }]);
       } else {
         // DISPATCH never required a brief (unlike QUEUE); a queued pair that
         // reached here without one -- a bare DISPATCH the queue could not
@@ -2151,7 +2268,7 @@ export class TaskPairAutomation implements TaskPairScheduler {
         { session: auditor, named: !!pair.auditor || !!pair.auditorModel },
       ]);
       if (defaultNote) logger.info({ project, taskId: pair.taskId, executor, auditor, source: SUPERVISION_EXECUTION_SELECTION_SOURCES.DEFAULT_SAME_VENDOR_SECONDARY }, 'task-pair: participants picked by the no-pool default');
-      await sendTaskPairMessage(brain, pair.taskId, 'brain-line-dispatch', buildBrainLine(cleaned, `dispatched from the queue: executor ${executor}, auditor ${auditor}.${defaultNote}`));
+      await sendTaskPairMessage(brain, pair.taskId, 'brain-line-dispatch', buildBrainLine(cleaned, `dispatched from the queue: executor ${executor}, auditor ${auditor}.${defaultNote}`), undefined, [{ project, taskId: pair.taskId, epoch: pair.scheduling?.epoch ?? 0 }]);
     }
   }
 

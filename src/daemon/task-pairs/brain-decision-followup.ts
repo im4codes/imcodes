@@ -1,3 +1,4 @@
+import { isTaskPairSuspended } from '../../../shared/task-pair-suspension.js';
 /**
  * One short follow-up when Brain's turn ended without deciding a pair that
  * awaits its decision.
@@ -39,6 +40,7 @@ interface ArmedNotice {
   /** Message-id prefix of the notice (`taskPairMessageIdPrefix`), matched against `transport.queue.delivery`. */
   prefix: string;
   taskIds: readonly string[];
+  epochs: Map<string, number>;
   armedAt: number;
   /** When the notice reached the model: the queue delivery fact, else the send time of an immediate send. */
   deliveredAt: number | undefined;
@@ -82,6 +84,7 @@ export class BrainDecisionFollowUps {
     list.push({
       prefix: input.messageIdPrefix,
       taskIds: [...input.taskIds],
+      epochs: new Map(getTaskPairStore().pairsForSession(input.brain).map((p) => [p.state.taskId, p.state.scheduling?.epoch ?? 0])),
       armedAt: now,
       deliveredAt: input.result === 'sent' ? now : undefined,
       touched: new Set(),
@@ -169,7 +172,7 @@ export class BrainDecisionFollowUps {
     for (const entry of answered) {
       for (const taskId of entry.taskIds) {
         const stored = owned.get(taskId);
-        if (!stored || stored.state.status !== TASK_PAIR_STATUS_AWAITING_BRAIN_DECISION) continue;
+        if (!stored || (stored.state.scheduling?.epoch ?? 0) !== (entry.epochs.get(taskId) ?? 0) || isTaskPairSuspended(stored.state) || stored.state.status !== TASK_PAIR_STATUS_AWAITING_BRAIN_DECISION) continue;
         if (entry.touched.has(taskId)) continue;
         // An action on the pair this turn (a lifecycle marker or its MCP twin) is on the event log.
         const since = entry.deliveredAt ?? entry.armedAt;

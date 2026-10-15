@@ -626,3 +626,49 @@ it('restart-accept-restart does not inject a restored pack twice', async () => {
   expect(secondProvider.send.mock.calls[0]?.[1]?.messagePreamble ?? '').not.toContain('restored once');
   await second.kill();
 });
+
+describe('Pair pause during asynchronous pre-provider assembly', () => {
+  it.each([false, true])('drops a stale wake but preserves ordinary text and ids (mixed=%s)', async (mixed) => {
+    const { getTaskPairStore, TaskPairStore, setTaskPairStoreForTests } = await import('../../src/daemon/task-pairs/store.js');
+    const { pausePair } = await import('../../src/daemon/task-pairs/suspension.js');
+    const { sendTaskPairMessage, setTaskPairDeliveryDepsForTests } = await import('../../src/daemon/task-pairs/delivery.js');
+    const { resolveTransportQueueEntryAdmission } = await import('../../src/daemon/delegation-reply-task-liveness.js');
+    resetTransportQueueStoreForTests(); resetContextStoreClientForTests();
+    setTaskPairStoreForTests(new TaskPairStore(':memory:'));
+    const session = 'deck_e2e_pause_transport';
+    const brain = 'deck_e2e_pause_transport_brain';
+    const store = getTaskPairStore();
+    store.savePair('pause-runtime', { taskId: 'pause-runtime-task', brain, executor: session, auditor: 'none', status: 'working', flags: [], flagSides: {}, round: 0, blocking: ['P0'], previousAuditors: [], capCounts: {}, capRound: 0, createdAt: 1, updatedAt: 1 });
+    let messageId = '';
+    setTaskPairDeliveryDepsForTests({ send: async (_target, _text, id) => { messageId = id; } });
+    await sendTaskPairMessage(session, 'pause-runtime-task', 'nudge-executor', 'obsolete pair wake');
+    const provider = makeProvider();
+    let complete: ((id: string, message: AgentMessage) => void) | undefined;
+    provider.onComplete = (callback) => { complete = callback; return () => {}; };
+    const runtime = new TransportSessionRuntime(provider, session);
+    runtime.pendingDrainAdmission = (entry) => resolveTransportQueueEntryAdmission(session, entry);
+    let release!: () => void;
+    let called!: () => void;
+    const entered = new Promise<void>((resolve) => { called = resolve; });
+    const blocked = new Promise<void>((resolve) => { release = resolve; });
+    try {
+      await runtime.initialize({ sessionKey: session });
+      if (mixed) { runtime.send('owner turn', 'pause-owner'); await waitForProviderSend(provider); }
+      runtime.setContextBootstrapResolver(async () => { called(); await blocked; return { diagnostics: [], localProcessedFreshness: 'fresh' }; });
+      runtime.send('obsolete pair wake', messageId);
+      runtime.send('ordinary text must survive', 'pause-ordinary-id');
+      if (mixed) complete?.('provider-session-1', { id: 'owner-done', sessionId: 'provider-session-1', kind: 'text', role: 'assistant', content: 'done', timestamp: Date.now(), status: 'complete' });
+      await entered;
+      pausePair('pause-runtime', 'pause-runtime-task', brain, 'manual');
+      release();
+      await vi.waitFor(() => expect(provider.send).toHaveBeenCalledTimes(mixed ? 2 : 1));
+      const calls = (provider.send as ReturnType<typeof vi.fn>).mock.calls;
+      const payload = calls[calls.length - 1]![1];
+      expect(typeof payload === 'string' ? payload : payload.userMessage).toBe('ordinary text must survive');
+      expect(runtime.activeDispatchEntriesForResend.map((entry) => entry.clientMessageId)).toEqual(['pause-ordinary-id']);
+    } finally {
+      release(); await runtime.kill(); setTaskPairDeliveryDepsForTests(undefined); setTaskPairStoreForTests(undefined);
+      resetTransportQueueStoreForTests(); resetContextStoreClientForTests();
+    }
+  });
+});

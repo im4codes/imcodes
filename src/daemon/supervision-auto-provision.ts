@@ -359,9 +359,10 @@ export async function defaultCountActiveSupervisionAssignments(
   const pairs = await import('./task-pairs/engine.js');
   if (!registryOverride && pairs.isPairsEngineProject(parent.projectName)) {
     const { getTaskPairStore } = await import('./task-pairs/store.js');
-    const { TASK_PAIR_OPEN_STATUSES } = await import('../../shared/task-pair.js');
+    const { taskPairHoldsExecutionSlot } = await import('../../shared/task-pair-suspension.js');
+    const { isSessionBusy } = await import('./task-pairs/pool.js');
     return getTaskPairStore().listActivePairs(parent.projectName).filter((pair) => (
-      TASK_PAIR_OPEN_STATUSES.includes(pair.state.status)
+      taskPairHoldsExecutionSlot(pair.state, isSessionBusy)
       && (pair.state.executorPool ?? 'primary') === pool
     )).length;
   }

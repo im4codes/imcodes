@@ -2366,4 +2366,17 @@ describe('handleWebCommand memory context timeline', () => {
       });
     });
   });
+  it('drops a superseded Pair wake after waiting for process typing, but releases the lock for ordinary work', async () => {
+    let release!: () => void;
+    sendKeysDelayedEnterMock.mockImplementationOnce(() => new Promise<void>((resolve) => { release = resolve; }));
+    const first = sendProcessSessionMessageForAutomation('deck_process_brain', 'first', { verbatim: true, suppressTimeline: true });
+    await vi.waitFor(() => expect(sendKeysDelayedEnterMock).toHaveBeenCalledTimes(1));
+    let allowed = true;
+    const stale = sendProcessSessionMessageForAutomation('deck_process_brain', 'obsolete wake', { verbatim: true, suppressTimeline: true, beforeTyping: () => allowed });
+    await flushAsync(); allowed = false; release();
+    await Promise.all([first, stale]);
+    await sendProcessSessionMessageForAutomation('deck_process_brain', 'ordinary work', { verbatim: true, suppressTimeline: true });
+    expect(sendKeysDelayedEnterMock.mock.calls.map((call) => call[1])).toEqual(['first', 'ordinary work']);
+  });
+
 });

@@ -1,3 +1,5 @@
+import { queuedPairWakeAllowed } from './task-pairs/wake-authority.js';
+import { TASK_PAIR_NUDGE_ID_PREFIX } from '../../shared/task-pair.js';
 import { CHAT_MESSAGE_ORIGINS, USER_MESSAGE_ORIGIN_FIELDS, type ChatMessageOrigin } from '../../shared/chat-message-origin.js';
 import {
   SESSION_MODEL_COMMAND,
@@ -514,6 +516,7 @@ export async function dispatchSessionMessage(
   }
 
   const { sendProcessSessionMessageForAutomation } = await import('./command-handler.js');
+  if (!queuedPairWakeAllowed(target.name, options.messageId)) throw new Error('pair wake is no longer current');
   const shouldAutoStopProcess = (options.emergency || deliveryMode === MEMORY_MCP_SEND_DELIVERY_MODES.APPEND)
     && target.state === 'running';
   if (shouldAutoStopProcess) {
@@ -539,6 +542,7 @@ export async function dispatchSessionMessage(
   // sandbox path rewriting or preamble.
   const processCommandMode = options.command ? { verbatim: true as const } : {};
   const processOptions = {
+    ...(options.messageId.startsWith(TASK_PAIR_NUDGE_ID_PREFIX) ? { beforeTyping: () => queuedPairWakeAllowed(target.name, options.messageId) } : {}),
     ...(options.suppressTimeline ? { suppressTimeline: true as const } : {}),
     ...processDeliveryMode,
     ...userMessageMetadata,

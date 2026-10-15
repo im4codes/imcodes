@@ -1,3 +1,4 @@
+import { projectPairScheduling, type TaskPairScheduling } from '../../../shared/task-pair-suspension.js';
 import { TASK_PAIR_TITLE_ACCESS_MAX_USERS, TASK_PAIR_TITLE_ACCESS_VERSION, taskPairTitleWireAccess, isTaskPairTitleAccess } from '../../../shared/task-pair-title-access.js';
 /**
  * Marker ingestion for the `pairs` supervision engine.
@@ -154,6 +155,8 @@ export interface TaskPairScheduler {
 }
 
 export interface ApplyMarkerInput {
+  /** Internal create-only scheduling, persisted before any dispatch intent. */
+  initialScheduling?: TaskPairScheduling;
   project: string;
   writer: string;
   marker: Pick<TaskPairMarker, 'verb' | 'knownVerb' | 'taskId' | 'attrs' | 'brief' | 'briefMissing'>;
@@ -821,6 +824,7 @@ export class TaskPairService {
     if (!recorded) return { effect: 'replayed', unusual: false, intents: [] };
     let stored: StoredTaskPair | undefined = existing;
     if (transition.pair) {
+      if (!existing && input.initialScheduling) transition.pair.scheduling = input.initialScheduling;
       if (transition.verdict && transition.pair.lastVerdict) {
         const noticeText = input.turnText ? stripTaskPairMarkersForDisplay(input.turnText).trim().slice(0, 4000) : '';
         const auditDetails = noticeText ? parseTaskPairAuditDetails(noticeText) : undefined;
@@ -2478,15 +2482,17 @@ export class TaskPairService {
     roles?: ReadonlySet<TaskPairBriefDelivery['role']>,
   ): Promise<TaskPairBriefDelivery[]> {
     const deliveries: TaskPairBriefDelivery[] = [];
+    const epoch = getTaskPairStore().getPair(project, taskId)?.state.scheduling?.epoch ?? 0;
+    const bindings = [{ project, taskId, epoch }];
     try {
       const pair = await this.ensureWorkspace(project, taskId);
       if (!pair) return deliveries;
       if (pair.executor && (!roles || roles.has('executor'))) {
-        const status = await sendTaskPairMessage(pair.executor, pair.taskId, 'pair-brief', buildExecutorPairBrief(pair));
+        const status = await sendTaskPairMessage(pair.executor, pair.taskId, 'pair-brief', buildExecutorPairBrief(pair), undefined, bindings);
         deliveries.push({ role: 'executor', target: pair.executor, status });
       }
       if (pair.auditor && pair.auditor !== TASK_PAIR_NO_AUDITOR && (!roles || roles.has('auditor'))) {
-        const status = await sendTaskPairMessage(pair.auditor, pair.taskId, 'auditor-assigned', buildAuditorAssignmentMessage(pair));
+        const status = await sendTaskPairMessage(pair.auditor, pair.taskId, 'auditor-assigned', buildAuditorAssignmentMessage(pair), undefined, bindings);
         deliveries.push({ role: 'auditor', target: pair.auditor, status });
       }
     } catch (error) {
@@ -2693,6 +2699,7 @@ export function emitTaskPairTimelineEvent(
   const payload: TaskPairEventPayload = {
     ...base,
     ...(pair ? {
+      ...(pair.scheduling ? { scheduling: projectPairScheduling(pair.scheduling) } : {}),
       ...(pair.title ? { title: pair.title } : {}),
       ...(pair.titleAccess ? { titleAccess: taskPairTitleWireAccess(pair.titleAccess) } : {}),
       ...(pair.executor ? { executor: pair.executor } : {}),

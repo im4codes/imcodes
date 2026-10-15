@@ -1,3 +1,5 @@
+import { encodePairWake, pairWakeAllowed, pairWakeBindings } from './wake-authority.js';
+import { TASK_PAIR_RESUME_REASON, type TaskPairWakeBinding } from '../../../shared/task-pair-suspension.js';
 /**
  * Daemon-authored messages to pair participants (nudges, reminders, handoffs,
  * dispatched briefs, Brain notices).
@@ -81,8 +83,9 @@ export async function sendTaskPairMessage(
   reason: string,
   text: string,
   dedupeScope?: string,
+  wakeBindings?: TaskPairWakeBinding[],
 ): Promise<TaskPairDeliveryResult> {
-  const result = await deliverTaskPairMessage(target, taskId, reason, text, dedupeScope);
+  const result = await deliverTaskPairMessage(target, taskId, reason, text, dedupeScope, wakeBindings);
   // Brain's side of a pair: remember what became of the notice. Aggregate
   // notices (`__...` ids) name no single pair; their senders record per pair.
   if (!taskId.startsWith('__')) {
@@ -99,8 +102,14 @@ async function deliverTaskPairMessage(
   reason: string,
   text: string,
   dedupeScope?: string,
+  wakeBindings?: TaskPairWakeBinding[],
 ): Promise<TaskPairDeliveryResult> {
-  const messageId = `${taskPairMessageIdPrefix(taskId, reason, dedupeScope)}${randomUUID()}`;
+  const bindings = wakeBindings ?? pairWakeBindings(target, taskId);
+  if (!pairWakeAllowed(bindings, reason)) return 'suspended';
+  // Empty aggregate means every covered pair is paused: there is no work to chase.
+  if (taskId.startsWith('__') && getTaskPairStore().pairsForSession(target).some((p) => p.state.brain === target) && !bindings.length) return 'suspended';
+  const binding = bindings.length ? encodePairWake(bindings, reason) : '';
+  const messageId = `${taskPairMessageIdPrefix(taskId, reason, dedupeScope)}${binding}${reason === TASK_PAIR_RESUME_REASON ? 'resume' : randomUUID()}`;
   // Most reasons are once-pending per pair.  A few state-machine notices are
   // explicitly once per lifecycle scope (for example, one in-audit warning
   // per round); callers provide that scope without changing the durable

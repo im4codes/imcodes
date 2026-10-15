@@ -1,3 +1,4 @@
+import { queuedPairWakeAllowed } from '../daemon/task-pairs/wake-authority.js';
 import { onConfirmedProviderStop } from './provider-stop-confirmation.js';
 import { transportQueueSnapshotToPayload } from '../../shared/transport-queue-wire.js';
 import { TRANSPORT_STOP_QUEUE_OUTCOMES, TRANSPORT_STOP_QUEUE_TIMEOUT_MS } from '../../shared/transport-queue-types.js';
@@ -4915,6 +4916,22 @@ export class TransportSessionRuntime implements SessionRuntime {
         },
         sendTimeoutMs: getTransportProviderSendTimeoutMs(this.provider.id),
         onBeforeProviderSend: () => {
+          // Context assembly/recall can await after FIFO admission. Invalidate
+          // pre-pause automation at the actual provider boundary, preserving
+          // ordinary entries of a mixed batch under their original ids.
+          const stale = this._activeDispatchEntries.filter((entry) => !queuedPairWakeAllowed(this.sessionKey, entry.clientMessageId));
+          if (stale.length && !this._activeDispatchProviderStarted) {
+            const staleIds = new Set(stale.map((entry) => entry.clientMessageId));
+            const valid = this._activeDispatchEntries.filter((entry) => !staleIds.has(entry.clientMessageId));
+            this.releaseDispatchHandoffs(this._activeDispatchEntries);
+            for (const entry of stale) getTransportQueueStore().drop(this.sessionKey, entry.clientMessageId, 'user_cleared', undefined, this.queueRecipient ?? null);
+            this._activeDispatchEntries = [];
+            for (const entry of valid) delete entry.queueHandoff;
+            this._pendingMessages.unshift(...valid);
+            this._pendingVersion++;
+            this.cancelActiveDispatchLocally(dispatchId);
+            throw makeCancelledProviderError();
+          }
           if (this.isDispatchLocallyCancelled(dispatchId)) {
             throw makeCancelledProviderError();
           }

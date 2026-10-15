@@ -4643,7 +4643,10 @@
       "done": "완료",
       "cancelled": "취소됨",
       "rework_round": "재작업 {{round}}차",
-      "awaiting_brain_decision": "Brain 결정 대기"
+      "awaiting_brain_decision": "Brain 결정 대기",
+      "paused": "일시 중지됨",
+      "waiting_dependencies": "종속 작업 대기 중",
+      "resuming": "재개 대기 중"
     },
     "flag": {
       "blocked": "막힘",
@@ -4738,6 +4741,7 @@
     "card_reason": "Reason",
     "card_next_step": "Next step",
     "card_details_unavailable": "Detailed information was not provided; see the original notice below.",
-    "card_no_blocking": "No blocking findings."
+    "card_no_blocking": "No blocking findings.",
+    "waiting_for_tasks": "대기 중: {{tasks}}"
   }
 }

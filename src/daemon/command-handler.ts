@@ -5565,6 +5565,8 @@ async function sendProcessSessionMessage(
   options?: {
     /** Called once the text has been written to the terminal (not before: recall and the delivery lock come first). */
     onTyped?: () => void;
+    /** Rechecked after async recall and the delivery lock, before any terminal typing. */
+    beforeTyping?: () => boolean;
     originalText?: string;
     commandId?: string;
     isLegacy?: boolean;
@@ -5662,6 +5664,7 @@ async function sendProcessSessionMessage(
   await deliveryTurn.waitForTurn();
   const release = await getMutex(sessionName).acquire();
   try {
+    if (options?.beforeTyping && !options.beforeTyping()) { rollbackSummarySyncReservation(memoryContext.summaryReservation); return; }
     await sendShellAwareCommand(sessionName, sendText, agentType, isVerbatim);
     options?.onTyped?.();
   } catch (sendErr) {
@@ -5706,6 +5709,8 @@ export async function sendProcessSessionMessageForAutomation(
     verbatim?: boolean;
     /** The text reached the terminal (an idle edge after this ends the turn it started). */
     onTyped?: () => void;
+    /** Rechecked after async recall and the delivery lock, before any terminal typing. */
+    beforeTyping?: () => boolean;
     userMessageMetadata?: Readonly<{
       allowDuplicate?: boolean;
       memoryExcluded?: boolean;
@@ -5723,6 +5728,7 @@ export async function sendProcessSessionMessageForAutomation(
     ...(options?.verbatim ? { verbatim: true } : {}),
     ...(options?.suppressTimeline ? { suppressTimeline: true } : {}),
     ...(options?.onTyped ? { onTyped: options.onTyped } : {}),
+    ...(options?.beforeTyping ? { beforeTyping: options.beforeTyping } : {}),
     ...(options?.userMessageMetadata ? { userMessageMetadata: options.userMessageMetadata } : {}),
   });
 }

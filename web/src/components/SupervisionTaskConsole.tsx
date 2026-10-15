@@ -1,3 +1,4 @@
+import { taskPairWaitKind } from '@shared/task-pair-suspension.js';
 import { taskPairDisplayTitle, taskPairDisplaySessionLabel } from '@shared/task-pair-display.js';
 import type { ComponentChildren, RefObject } from 'preact';
 import { useMemo, useRef, useState, useEffect } from 'preact/hooks';
@@ -229,6 +230,8 @@ function displayStatusKey(status: unknown, unknownStatus?: string): string {
 }
 
 function pairStatusLabel(t: (key: string, options?: Record<string, unknown>) => string, pair: SupervisionConsolePairInfo): string {
+  const wait = taskPairWaitKind(pair);
+  if (wait) return t(`taskPair.status.${wait}`);
   if (pair.status === 'rework') return t('taskPair.status.rework_round', { round: pair.round });
   return t(`taskPair.status.${pair.status}`);
 }

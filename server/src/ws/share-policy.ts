@@ -1,3 +1,4 @@
+import { TASK_PAIR_SCHEDULING_FIELD } from '../../../shared/task-pair-suspension.js';
 import { TASK_PAIR_TITLE_ACCESS_FIELD } from '../../../shared/task-pair-title-access.js';
 import type { Database } from '../db/client.js';
 import { resolveEffectiveShareCoverage } from '../db/tab-sharing.js';
@@ -1366,6 +1367,7 @@ function redactTransportHistory(msg: Record<string, unknown>, _state: ShareScope
 
 /** Keys that carry a pair's model / brief / objective on console rows and pair events. */
 const SHARE_HIDDEN_PAIR_KEYS: ReadonlySet<string> = new Set([
+  TASK_PAIR_SCHEDULING_FIELD,
   'executorModel', 'auditorModel', 'executorThinking', 'auditorThinking',
   'observedModel', 'observedThinking',
   'brief', 'briefRevision', 'objective',

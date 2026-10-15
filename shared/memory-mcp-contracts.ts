@@ -1,3 +1,4 @@
+import { TASK_PAIR_MAX_DEPENDENCIES, TASK_PAIR_PAUSE_MODES } from './task-pair-suspension.js';
 import { TASK_PAIR_TITLE_ACCESS_MAX_USERS, TASK_PAIR_TITLE_ACCESS_MAX_USER_CHARS } from './task-pair-title-access.js';
 import { MCP_ERROR_REASONS, isRecoverableMcpErrorReason, type MCPErrorReason } from './memory-mcp-errors.js';
 import { SEND_COMMAND_DESCRIPTION } from './send-command-mode.js';
@@ -125,6 +126,8 @@ export const MEMORY_MCP_TOOL_NAMES = {
   PAIR_CREATE: 'pair_create',
   PAIR_DISPATCH: 'pair_dispatch',
   PAIR_CLOSE: 'pair_close',
+  PAIR_PAUSE: 'pair_pause',
+  PAIR_RESUME: 'pair_resume',
   PAIR_REASSIGN: 'pair_reassign',
   PAIR_NEXT_ROUND: 'pair_next_round',
   PAIR_VERDICT: 'pair_verdict',
@@ -201,6 +204,8 @@ export const MEMORY_MCP_TOOL_NAME_LIST = [
   MEMORY_MCP_TOOL_NAMES.PAIR_CREATE,
   MEMORY_MCP_TOOL_NAMES.PAIR_DISPATCH,
   MEMORY_MCP_TOOL_NAMES.PAIR_CLOSE,
+  MEMORY_MCP_TOOL_NAMES.PAIR_PAUSE,
+  MEMORY_MCP_TOOL_NAMES.PAIR_RESUME,
   MEMORY_MCP_TOOL_NAMES.PAIR_REASSIGN,
   MEMORY_MCP_TOOL_NAMES.PAIR_NEXT_ROUND,
   MEMORY_MCP_TOOL_NAMES.PAIR_VERDICT,
@@ -308,6 +313,8 @@ export function advertisedMcpToolNames(role: NodeRole): readonly MemoryMcpToolNa
 export const PAIR_BRAIN_ACTION_TOOL_NAMES: readonly string[] = [
   MEMORY_MCP_TOOL_NAMES.PAIR_DISPATCH,
   MEMORY_MCP_TOOL_NAMES.PAIR_CLOSE,
+  MEMORY_MCP_TOOL_NAMES.PAIR_PAUSE,
+  MEMORY_MCP_TOOL_NAMES.PAIR_RESUME,
   MEMORY_MCP_TOOL_NAMES.PAIR_REASSIGN,
   MEMORY_MCP_TOOL_NAMES.PAIR_NEXT_ROUND,
   MEMORY_MCP_TOOL_NAMES.PAIR_TASK_UPDATE,
@@ -800,6 +807,7 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
       taskId: stringSchema('Optional stable task id. When omitted, idempotencyKey deterministically derives one.'),
       title: stringSchema('Short specific title in the owner UI language.'),
       brief: stringSchema('Complete Markdown task brief, including checkable acceptance and boundaries.'),
+      dependsOn: { type: 'array', maxItems: TASK_PAIR_MAX_DEPENDENCIES, items: { type: 'string', minLength: 1 }, description: 'Optional same-project task dependencies; wait silently until all reach accepted done.' },
       executor: stringSchema('Exact executor session name. Optional: when omitted the daemon picks or creates one.'),
       auditor: stringSchema('Exact auditor session name, or none to disable audit. Optional: when omitted the daemon picks or creates a different session.'),
       executorModel: stringSchema('Optional explicit executor model.'),
@@ -841,6 +849,18 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
       idempotencyKey: stringSchema('Stable retry key for this close request.'),
     }, ['taskId', 'action']),
     outputSchema: objectSchema({ status: stringSchema('ok or error.'), taskId: stringSchema('Closed task id.'), state: stringSchema('Current pair state.'), effect: stringSchema('State-machine effect.'), idempotentReplay: booleanSchema('Whether this request replayed a durable event.') }),
+  },
+  [MEMORY_MCP_TOOL_NAMES.PAIR_PAUSE]: {
+    name: MEMORY_MCP_TOOL_NAMES.PAIR_PAUSE,
+    description: 'Brain: cooperatively pause an open pair, or wait for dependencies accepted as done. Stops model wakeups; preserves lifecycle, audit material, workspace and resource claims. Manual pause needs explicit pair_resume.',
+    inputSchema: objectSchema({ taskId: stringSchema('Existing pair id.'), mode: { type: 'string', enum: [...TASK_PAIR_PAUSE_MODES] }, dependsOn: { type: 'array', maxItems: TASK_PAIR_MAX_DEPENDENCIES, items: { type: 'string', minLength: 1 }, description: 'Same-project task ids; all must reach accepted done. Required in dependencies mode; an empty list explicitly clears the dependency wait.' }, note: { type: 'string', maxLength: 2000, description: 'Optional pause/wait reason.' } }, ['taskId']),
+    outputSchema: statusSchema,
+  },
+  [MEMORY_MCP_TOOL_NAMES.PAIR_RESUME]: {
+    name: MEMORY_MCP_TOOL_NAMES.PAIR_RESUME,
+    description: 'Brain: clear manual pause without bypassing outstanding dependencies. Resumes the preserved stage once capacity and both participants are idle. Never reopens a closed pair.',
+    inputSchema: objectSchema({ taskId: stringSchema('Existing pair id.') }, ['taskId']),
+    outputSchema: statusSchema,
   },
   [MEMORY_MCP_TOOL_NAMES.PAIR_REASSIGN]: {
     name: MEMORY_MCP_TOOL_NAMES.PAIR_REASSIGN,

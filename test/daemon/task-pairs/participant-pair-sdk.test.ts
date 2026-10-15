@@ -132,3 +132,37 @@ describe('participant Pair access requires no separate title authority', () => {
     }
   });
 });
+
+describe('participant pause and dependency wait through real MCP', () => {
+  it.each([false, true])('creates held work, preserves manual pause, then resumes once (fallback=%s)', async (fallback) => {
+    const oldEngine = process.env.IMCODES_SUPERVISION_ENGINE; process.env.IMCODES_SUPERVISION_ENGINE = 'pairs';
+    store = new TaskPairStore(join(process.env.HOME!, `pause-sdk-${fallback}.sqlite`)); setTaskPairStoreForTests(store);
+    sessions.find((s) => s.name === EXEC)!.state = 'running'; sessions.forEach(upsertSession);
+    const sent: string[] = []; setTaskPairDeliveryDepsForTests({ send: async (_target, text) => { sent.push(text); } });
+    const server = createMemoryMcpServer(caller, { participantTurnRequired: async () => true, sendDeps: { listSessions: () => sessions } });
+    const client = new Client({ name: 'pair-pause-sdk', version: '1' });
+    const [a, b] = InMemoryTransport.createLinkedPair(); await Promise.all([server.connect(b), client.connect(a)]);
+    const call = async (name: string, args: Record<string, unknown>) => {
+      await client.callTool({ name: MCP_TOOL_DISCOVERY_NAME, arguments: { query: name } });
+      return mcpToolPayload(await client.callTool(fallback ? { name: MCP_TOOL_DISCOVERY_NAME, arguments: { query: name, fallbackCall: { name, arguments: args } } } : { name, arguments: args }));
+    };
+    try {
+      const create = { brief: '- [ ][ ] scoped report', title: '等待前置验收', executor: EXEC, auditor: AUD, workspace: 'none' };
+      const upstream = await call(N.PAIR_CREATE, { ...create, idempotencyKey: 'pause-upstream' });
+      const child = await call(N.PAIR_CREATE, { ...create, dependsOn: [upstream.taskId], idempotencyKey: 'pause-child' });
+      expect(child).toMatchObject({ status: 'ok', state: 'queued' });
+      expect(await call(N.PAIR_TASK_GET, { taskId: child.taskId })).toMatchObject({ scheduling: { manual: false, dependsOn: [upstream.taskId] } });
+      expect(await call(N.PAIR_PAUSE, { taskId: child.taskId })).toMatchObject({ status: 'ok', scheduling: { manual: true } });
+      expect(await call(N.PAIR_CLOSE, { taskId: upstream.taskId, action: 'done', force: true })).toMatchObject({ status: 'ok', state: 'done' });
+      // The dependency completing never cancels a manual pause.
+      expect(await call(N.PAIR_TASK_GET, { taskId: child.taskId })).toMatchObject({ scheduling: { manual: true } });
+      sessions.find((s) => s.name === EXEC)!.state = 'idle'; sessions.forEach(upsertSession);
+      expect(await call(N.PAIR_RESUME, { taskId: child.taskId })).toMatchObject({ status: 'ok' });
+      const got = await call(N.PAIR_TASK_GET, { taskId: child.taskId });
+      expect(got).toMatchObject({ status: 'working', markdown: create.brief, scheduling: { manual: false, dependsOn: [], resumePending: false } });
+      await call(N.PAIR_PAUSE, { taskId: child.taskId });
+      await call(N.PAIR_RESUME, { taskId: child.taskId }); const count = sent.length;
+      await call(N.PAIR_RESUME, { taskId: child.taskId }); expect(sent).toHaveLength(count);
+    } finally { await client.close(); await server.close(); await taskPairService.waitForIdle(); if (oldEngine === undefined) delete process.env.IMCODES_SUPERVISION_ENGINE; else process.env.IMCODES_SUPERVISION_ENGINE = oldEngine; }
+  });
+});

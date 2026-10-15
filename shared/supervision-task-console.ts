@@ -1,3 +1,4 @@
+import type { TaskPairScheduling } from './task-pair-suspension.js';
 import type { TaskPairTitleWireAccess } from './task-pair-title-access.js';
 /**
  * Browser-safe supervision task console wire contract (V1).
@@ -474,6 +475,7 @@ export interface SupervisionTaskConsoleProgress {
 
 /** Pair details on a console row of a `pairs`-engine project. */
 export interface SupervisionConsolePairInfo {
+  scheduling?: TaskPairScheduling;
   status: TaskPairStatus;
   flags: TaskPairFlag[];
   executor?: string;

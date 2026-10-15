@@ -4644,7 +4644,10 @@
       "done": "Terminada",
       "cancelled": "Cancelada",
       "rework_round": "Revisión ronda {{round}}",
-      "awaiting_brain_decision": "Esperando decisión de Brain"
+      "awaiting_brain_decision": "Esperando decisión de Brain",
+      "paused": "En pausa",
+      "waiting_dependencies": "Esperando dependencias",
+      "resuming": "Esperando reanudación"
     },
     "flag": {
       "blocked": "Bloqueada",
@@ -4739,6 +4742,7 @@
     "card_reason": "Reason",
     "card_next_step": "Next step",
     "card_details_unavailable": "Detailed information was not provided; see the original notice below.",
-    "card_no_blocking": "No blocking findings."
+    "card_no_blocking": "No blocking findings.",
+    "waiting_for_tasks": "Esperando: {{tasks}}"
   }
 }
