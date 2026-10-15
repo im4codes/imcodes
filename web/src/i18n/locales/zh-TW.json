@@ -1059,6 +1059,12 @@
     "state_error_detail": "錯誤：{{error}}"
   },
   "server": {
+    "devices": "裝置",
+    "online": "在線",
+    "offline": "離線",
+    "added_on": "新增於 {{date}}",
+    "list_empty": "尚無裝置，可使用以下命令新增：",
+    "delete_error": "刪除伺服器失敗：{{error}}",
     "upgrade_daemon": "↑ 升級 Daemon",
     "upgrade_all": "↑ 升級全部裝置",
     "delete": "✕ 刪除伺服器",

@@ -1059,6 +1059,12 @@
     "state_error_detail": "错误：{{error}}"
   },
   "server": {
+    "devices": "设备",
+    "online": "在线",
+    "offline": "离线",
+    "added_on": "添加于 {{date}}",
+    "list_empty": "暂无设备，可使用以下命令添加：",
+    "delete_error": "删除服务器失败：{{error}}",
     "upgrade_daemon": "↑ 升级 Daemon",
     "upgrade_all": "↑ 升级全部设备",
     "delete": "✕ 删除 server",

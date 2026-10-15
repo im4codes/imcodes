@@ -1059,6 +1059,12 @@
     "state_error_detail": "エラー: {{error}}"
   },
   "server": {
+    "devices": "デバイス",
+    "online": "オンライン",
+    "offline": "オフライン",
+    "added_on": "追加日 {{date}}",
+    "list_empty": "デバイスはまだありません。次のコマンドで追加：",
+    "delete_error": "サーバーを削除できませんでした：{{error}}",
     "upgrade_daemon": "↑ Daemonをアップグレード",
     "upgrade_all": "↑ 全デバイス更新",
     "delete": "✕ サーバーを削除",

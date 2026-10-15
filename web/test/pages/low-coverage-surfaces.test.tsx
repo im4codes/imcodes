@@ -488,6 +488,25 @@ describe('low-coverage page and component surfaces', () => {
     expect((screen.getByRole('button', { name: 'admin.previous_page' }) as HTMLButtonElement).disabled).toBe(true);
   });
 
+  it('DashboardPage offers deletion offline and removes a deleted server from its controlled list', async () => {
+    const server = { id: 'offline', name: 'Offline box', status: 'offline', lastHeartbeatAt: null, createdAt: 1 };
+    dashboardApi.apiFetch.mockImplementation(async (path: string) => (
+      path === '/api/server' ? { servers: [server] } : { keys: [] }
+    ));
+    const onDeleteServer = vi.fn();
+    const props = {
+      servers: [server], onSelectServer: vi.fn(), onDeleteServer, onLogout: vi.fn(), onOpenUsageSummary: vi.fn(),
+      sharedEntries: [], sharedEntriesLoading: false, sharedEntriesLoaded: true, sharedEntriesError: null,
+      openingSharedEntryId: null, onOpenSharedEntry: vi.fn(), onRefreshSharedEntries: vi.fn(),
+    };
+    const view = render(<DashboardPage {...props} />);
+    fireEvent.click(await screen.findByTestId('delete-server-offline'));
+    expect(onDeleteServer).toHaveBeenCalledWith(server);
+    expect(props.onSelectServer).not.toHaveBeenCalled();
+    view.rerender(<DashboardPage {...props} servers={[]} />);
+    await waitFor(() => expect(screen.queryByText('Offline box')).toBeNull());
+  });
+
   it('DashboardPage shows authorized shared resources instead of device onboarding when no server is owned', async () => {
     const sharedEntry = {
       id: 'share-dashboard',

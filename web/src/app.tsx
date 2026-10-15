@@ -1605,14 +1605,21 @@ export function App() {
       setServers((prev) => prev.filter((s) => s.id !== server.id));
       ownedServerIdsRef.current.delete(server.id);
       if (server.id === selectedServerId) {
+        autoEntryRunRef.current++;
+        setManualDashboard(true);
+        selectedServerIdRef.current = null;
         setSelectedServerId(null);
         setSelectedServerName(null);
         localStorage.removeItem('rcc_server');
         localStorage.removeItem('rcc_server_name');
+        localStorage.removeItem('rcc_session');
       }
-    } catch { /* ignore */ }
-    setDeleteTarget(null);
-  }, [selectedServerId]);
+      setDeleteTarget(null);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      try { window.alert(trans('server.delete_error', { error: message })); } catch { /* ignore */ }
+    }
+  }, [selectedServerId, trans]);
 
   // Load servers list whenever auth is available
   const loadServers = useCallback(async () => {
@@ -4873,7 +4880,12 @@ export function App() {
           clearTimeout(daemonOfflineGraceTimerRef.current);
           daemonOfflineGraceTimerRef.current = null;
         }
+        if (sessionListRetryRef.current) {
+          clearTimeout(sessionListRetryRef.current);
+          sessionListRetryRef.current = null;
+        }
         setDaemonOnline(false);
+        setSessionsLoaded(true);
         setServers((prev) => markServerOffline(prev, selectedServerId));
         watchProjectionStore.setSnapshotStatus('stale');
       }
@@ -6569,16 +6581,19 @@ export function App() {
   // Show full-screen connecting indicator while waiting for initial WS + session data.
   // After 8s, show escape buttons so the user is never stuck.
   const [connectTimeout, setConnectTimeout] = useState(false);
-  const showInitialConnectingGate = initialAuthVerificationPending || shouldShowInitialConnectingGate(
+  const selectedServerInfo = selectedServerId
+    ? servers.find((server) => server.id === selectedServerId) ?? null
+    : null;
+  // A confirmed offline daemon cannot satisfy the initial connection gate.
+  // Keep server management (including deletion) available without waiting for WS.
+  const selectedServerKnownOffline = serversLoaded && selectedServerInfo !== null && !isServerOnline(selectedServerInfo);
+  const showInitialConnectingGate = initialAuthVerificationPending || (!selectedServerKnownOffline && shouldShowInitialConnectingGate(
     Boolean(auth),
     selectedServerId,
     connected,
     sessionsLoaded,
-  );
+  ));
   const resolvedActiveSessionExists = hasResolvedActiveSession(activeSession, navigableMainSessions);
-  const selectedServerInfo = selectedServerId
-    ? servers.find((server) => server.id === selectedServerId) ?? null
-    : null;
   const daemonVersionForDisplay = daemonStats?.daemonVersion ?? selectedServerInfo?.daemonVersion ?? null;
   const latestDaemonVersionForDisplay = daemonStats?.latestDaemonVersion ?? selectedServerInfo?.latestDaemonVersion ?? null;
   const daemonUpgradeRequest = selectedServerId
@@ -7014,7 +7029,9 @@ export function App() {
             )}
             <Suspense fallback={<div style={{ textAlign: 'center', padding: 48, color: '#64748b' }}>Loading...</div>}>
               <DashboardPage
+                servers={servers}
                 onSelectServer={handleSelectServer}
+                onDeleteServer={(server) => setDeleteTarget(server)}
                 onLogout={handleLogout}
                 onOpenUsageSummary={() => setShowUsageSummaryPage(true)}
                 onServersLoaded={setServers}
@@ -7072,6 +7089,7 @@ export function App() {
                           key={s.id}
                           class={`mobile-server-menu-item${s.id === selectedServerId ? ' active' : ''}${showSharedReturnGuide && s.id === sharedReturnServer?.id ? ' server-return-hint' : ''}`}
                           onClick={() => { handleSelectServer(s.id, s.name); setShowMobileServerMenu(false); }}
+                          onContextMenu={(e) => { e.preventDefault(); setShowMobileServerMenu(false); setServerCtxMenu({ server: s, x: e.clientX, y: e.clientY }); }}
                         >
                           <span style={{ color: online ? '#4ade80' : '#475569' }}>{online ? '●' : '○'}</span>
                           <span class="mobile-server-menu-name">{s.name}</span>
@@ -7638,6 +7656,7 @@ export function App() {
                         key={s.id}
                         class={`server-item${s.id === selectedServerId ? ' active' : ''}${online ? '' : ' offline'}${showSharedReturnGuide && s.id === sharedReturnServer?.id ? ' server-return-hint' : ''}`}
                         onClick={() => { handleSelectServer(s.id, s.name); closeSidebar(); }}
+                        onContextMenu={(e) => { e.preventDefault(); closeSidebar(); setServerCtxMenu({ server: s, x: e.clientX, y: e.clientY }); }}
                       >
                         <span class="server-item-dot" style={{ color: online ? '#4ade80' : '#475569' }}>
                           {online ? '●' : '○'}

@@ -1059,6 +1059,12 @@
     "state_error_detail": "Error: {{error}}"
   },
   "server": {
+    "devices": "Devices",
+    "online": "Online",
+    "offline": "Offline",
+    "added_on": "Added {{date}}",
+    "list_empty": "No devices yet. Add one with",
+    "delete_error": "Failed to delete server: {{error}}",
     "upgrade_daemon": "↑ Upgrade Daemon",
     "upgrade_all": "↑ Upgrade All Devices",
     "delete": "✕ Delete server",

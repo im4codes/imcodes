@@ -1059,6 +1059,12 @@
     "state_error_detail": "Error: {{error}}"
   },
   "server": {
+    "devices": "Dispositivos",
+    "online": "En línea",
+    "offline": "Sin conexión",
+    "added_on": "Añadido {{date}}",
+    "list_empty": "Aún no hay dispositivos. Añade uno con",
+    "delete_error": "No se pudo eliminar el servidor: {{error}}",
     "upgrade_daemon": "↑ Actualizar Daemon",
     "upgrade_all": "↑ Actualizar Todos",
     "delete": "✕ Eliminar servidor",

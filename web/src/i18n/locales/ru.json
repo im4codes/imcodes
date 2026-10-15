@@ -1059,6 +1059,12 @@
     "state_error_detail": "Ошибка: {{error}}"
   },
   "server": {
+    "devices": "Устройства",
+    "online": "В сети",
+    "offline": "Не в сети",
+    "added_on": "Добавлено {{date}}",
+    "list_empty": "Устройств пока нет. Добавьте с помощью",
+    "delete_error": "Не удалось удалить сервер: {{error}}",
     "upgrade_daemon": "↑ Обновить Daemon",
     "upgrade_all": "↑ Обновить все устройства",
     "delete": "✕ Удалить сервер",

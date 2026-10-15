@@ -1059,6 +1059,12 @@
     "state_error_detail": "오류: {{error}}"
   },
   "server": {
+    "devices": "기기",
+    "online": "온라인",
+    "offline": "오프라인",
+    "added_on": "추가 날짜 {{date}}",
+    "list_empty": "기기가 없습니다. 다음 명령으로 추가하세요:",
+    "delete_error": "서버를 삭제하지 못했습니다: {{error}}",
     "upgrade_daemon": "↑ Daemon 업그레이드",
     "upgrade_all": "↑ 전체 기기 업그레이드",
     "delete": "✕ 서버 삭제",

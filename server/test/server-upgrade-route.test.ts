@@ -317,6 +317,25 @@ describe('server routes', () => {
     expect(mockSendToDaemon).not.toHaveBeenCalled();
   });
 
+  it('deletes an offline server even when its daemon cannot be notified', async () => {
+    mockGetServerById.mockResolvedValueOnce({ id: 'srv-1', user_id: 'owner-user', status: 'offline' });
+    mockSendToDaemon.mockImplementationOnce(() => { throw new Error('offline'); });
+    const app = await buildTestApp();
+    const res = await app.request('/api/server/srv-1', { method: 'DELETE' });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ ok: true });
+    expect(mockDeleteServer).toHaveBeenCalledOnce();
+  });
+
+  it.each(['participant', 'viewer', null])('rejects deletion by %s before touching data or daemon', async (role) => {
+    mockResolveServerRole.mockResolvedValueOnce(role);
+    const app = await buildTestApp();
+    const res = await app.request('/api/server/srv-1', { method: 'DELETE' });
+    expect(res.status).toBe(404);
+    expect(mockDeleteServer).not.toHaveBeenCalled();
+    expect(mockSendToDaemon).not.toHaveBeenCalled();
+  });
+
   it('notifies daemon only after an authorized server delete succeeds', async () => {
     mockDeleteServer.mockResolvedValueOnce(true);
     const app = await buildTestApp();

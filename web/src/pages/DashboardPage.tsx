@@ -10,7 +10,9 @@ import { SharedEntriesPanel } from '../components/SharedEntriesPanel.js';
 import { apiFetch, type SharedEntrySummary } from '../api.js';
 
 interface Props {
+  servers?: ServerInfo[];
   onSelectServer: (serverId: string, serverName: string) => void;
+  onDeleteServer?: (server: ServerInfo) => void;
   onLogout: () => void;
   onOpenUsageSummary: () => void;
   onServersLoaded?: (servers: ServerInfo[]) => void;
@@ -29,6 +31,7 @@ interface ServerInfo {
   status: string;
   lastHeartbeatAt: number | null;
   daemonVersion?: string | null;
+  latestDaemonVersion?: string | null;
   createdAt: number;
 }
 
@@ -40,7 +43,9 @@ interface KeyInfo {
 }
 
 export function DashboardPage({
+  servers: externalServers,
   onSelectServer,
+  onDeleteServer,
   onLogout,
   onOpenUsageSummary,
   onServersLoaded,
@@ -53,9 +58,15 @@ export function DashboardPage({
   onRefreshSharedEntries,
 }: Props) {
   const { t } = useTranslation();
-  const [servers, setServers] = useState<ServerInfo[]>([]);
+  const [servers, setServers] = useState<ServerInfo[]>(externalServers ?? []);
   const [keys, setKeys] = useState<KeyInfo[]>([]);
   const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    if (externalServers) {
+      setServers(externalServers);
+    }
+  }, [externalServers]);
 
   const loadData = async () => {
     try {
@@ -102,7 +113,7 @@ export function DashboardPage({
       ) : (
         <>
           {servers.length > 0 && (
-            <ServerList servers={servers} onSelectServer={onSelectServer} />
+            <ServerList servers={servers} onSelectServer={onSelectServer} onDeleteServer={onDeleteServer} />
           )}
           {showSharedInventory && (
             <SharedEntriesPanel

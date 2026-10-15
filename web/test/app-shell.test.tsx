@@ -394,10 +394,11 @@ vi.mock('../src/pages/ServerSetupPage.js', () => ({
 }));
 vi.mock('../src/pages/NativeAuthBridge.js', () => ({ NativeAuthBridge: textComponent('native-auth-bridge') }));
 vi.mock('../src/pages/DashboardPage.js', () => ({
-  DashboardPage: ({ sharedEntries = [] }: { sharedEntries?: Array<{ id: string }> }) => (
+  DashboardPage: ({ sharedEntries = [], servers = [], onDeleteServer }: any) => (
     <div>
       <span>dashboard-page</span>
       <span data-testid="dashboard-shared-count">{sharedEntries.length}</span>
+      {servers.map((server: any) => <button key={server.id} onClick={() => onDeleteServer?.(server)}>dashboard-delete-{server.id}</button>)}
     </div>
   ),
 }));
@@ -1112,6 +1113,75 @@ afterEach(() => {
 });
 
 describe('App shell', () => {
+  it('deletes an offline server from the dashboard without a daemon connection', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    let servers = [{ ...serverList().servers[0], status: 'offline', lastHeartbeatAt: null }];
+    apiFetchMock.mockImplementation(async (path: string, options?: { method?: string }) => {
+      if (path === '/api/auth/user/me') return { id: 'user-1' };
+      if (path === '/api/server') return { servers };
+      if (path === '/api/server/srv-1' && options?.method === 'DELETE') { servers = []; return { ok: true }; }
+      return {};
+    });
+    const { App } = await importApp();
+    render(<App />);
+    fireEvent.click(await screen.findByText('server-home'));
+    fireEvent.click(await screen.findByText('dashboard-delete-srv-1'));
+    fireEvent.click(await screen.findByText('delete-confirm'));
+    await waitFor(() => expect(screen.queryByText('dashboard-delete-srv-1')).toBeNull());
+    expect(screen.queryByText('delete-server-dialog')).toBeNull();
+    expect(apiFetchMock).toHaveBeenCalledWith('/api/server/srv-1', { method: 'DELETE' });
+    expect(wsInstances.every((ws) => ws.sendSessionCommand.mock.calls.length === 0)).toBe(true);
+  });
+
+  it('deletes the selected offline server through its menu and does not auto-enter it again', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_server_name', 'Alpha Server');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    apiFetchMock.mockImplementation(async (path: string) => {
+      if (path === '/api/auth/user/me') return { id: 'user-1' };
+      if (path === '/api/server') return { servers: [{ ...serverList().servers[0], status: 'offline', lastHeartbeatAt: null }] };
+      return {};
+    });
+    const { App } = await importApp();
+    render(<App />);
+    fireEvent.click(await screen.findByText('server-menu'));
+    fireEvent.click(await screen.findByText('server-menu-delete'));
+    fireEvent.click(await screen.findByText('delete-confirm'));
+    expect(await screen.findByText('dashboard-page')).toBeTruthy();
+    await waitFor(() => expect(screen.queryByText('dashboard-delete-srv-1')).toBeNull());
+    expect(localStorage.getItem('rcc_server')).toBeNull();
+    expect(localStorage.getItem('rcc_server_name')).toBeNull();
+    expect(localStorage.getItem('rcc_session')).toBeNull();
+    expect(screen.queryByText('delete-server-dialog')).toBeNull();
+  });
+
+  it('keeps the offline deletion dialog and server visible on failure, then permits retry', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    const alert = vi.spyOn(window, 'alert').mockImplementation(() => {});
+    let attempts = 0;
+    apiFetchMock.mockImplementation(async (path: string, options?: { method?: string }) => {
+      if (path === '/api/auth/user/me') return { id: 'user-1' };
+      if (path === '/api/server') return { servers: [{ ...serverList().servers[0], status: 'offline', lastHeartbeatAt: null }] };
+      if (path === '/api/server/srv-1' && options?.method === 'DELETE') {
+        if (attempts++ === 0) throw new Error('database unavailable');
+        return { ok: true };
+      }
+      return {};
+    });
+    const { App } = await importApp();
+    render(<App />);
+    fireEvent.click(await screen.findByText('server-home'));
+    fireEvent.click(await screen.findByText('dashboard-delete-srv-1'));
+    fireEvent.click(await screen.findByText('delete-confirm'));
+    await waitFor(() => expect(alert).toHaveBeenCalledOnce());
+    expect(screen.getByText('delete-server-dialog')).toBeTruthy();
+    expect(screen.getByText('dashboard-delete-srv-1')).toBeTruthy();
+    fireEvent.click(screen.getByText('delete-confirm'));
+    await waitFor(() => expect(screen.queryByText('dashboard-delete-srv-1')).toBeNull());
+    expect(screen.queryByText('delete-server-dialog')).toBeNull();
+  });
+
   it('keeps Safari viewport height bounded and corrects it on visual viewport scrolling', async () => {
     const originalVisualViewport = Object.getOwnPropertyDescriptor(window, 'visualViewport');
     const originalInnerHeight = Object.getOwnPropertyDescriptor(window, 'innerHeight');

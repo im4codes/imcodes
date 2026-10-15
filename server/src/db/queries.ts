@@ -574,11 +574,32 @@ export async function updateServerToken(db: Database, id: string, userId: string
 }
 
 export async function deleteServer(db: Database, id: string, userId: string): Promise<boolean> {
-  await deleteTokenUsageFactsForServer(db, id);
-  await db.execute('DELETE FROM channel_bindings WHERE server_id = $1', [id]);
-  await db.execute('DELETE FROM sessions WHERE server_id = $1', [id]);
-  const result = await db.execute('DELETE FROM servers WHERE id = $1 AND user_id = $2', [id, userId]);
-  return (result.changes ?? 0) > 0;
+  return db.transaction(async (tx) => {
+    // Authorize before touching dependents and serialize deletion/retries with
+    // FK writers. A failed cleanup must leave the complete server intact.
+    const server = await tx.queryOne<{ id: string }>(
+      'SELECT id FROM servers WHERE id = $1 AND user_id = $2 FOR UPDATE', [id, userId],
+    );
+    if (!server) return false;
+
+    await deleteTokenUsageFactsForServer(tx, id);
+    await tx.execute('DELETE FROM cron_jobs WHERE server_id = $1', [id]);
+    await tx.execute('DELETE FROM channel_bindings WHERE server_id = $1', [id]);
+    await tx.execute('DELETE FROM sessions WHERE server_id = $1', [id]);
+    // ON DELETE SET NULL alone violates the legacy redemption check. Revoke
+    // that consumed identity as well: clearing used_at must not rearm its code.
+    // Reusable installers and other installations are not removed.
+    await tx.execute(
+      `UPDATE controlled_node_enrollments_v2
+          SET used_at = NULL, redeemed_server_id = NULL, install_id = NULL, node_token_hash = NULL,
+              revoked_at = COALESCE(revoked_at, $2)
+        WHERE redeemed_server_id = $1`,
+      [id, Date.now()],
+    );
+    await tx.execute('UPDATE servers SET host_server_id = NULL WHERE host_server_id = $1', [id]);
+    const result = await tx.execute('DELETE FROM servers WHERE id = $1 AND user_id = $2', [id, userId]);
+    return result.changes > 0;
+  });
 }
 
 export async function getServersByUserId(db: Database, userId: string): Promise<DbServer[]> {

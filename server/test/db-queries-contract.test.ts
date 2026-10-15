@@ -32,6 +32,16 @@ describe('db queries contracts', () => {
     ]);
   });
 
+  it('does not touch any server data when the owner lock does not match', async () => {
+    const db = makeDb();
+    expect(await queries.deleteServer(db, 'srv-other', 'wrong-owner')).toBe(false);
+    expect(db.transaction).toHaveBeenCalledOnce();
+    expect(db.queryOne).toHaveBeenCalledWith(
+      'SELECT id FROM servers WHERE id = $1 AND user_id = $2 FOR UPDATE', ['srv-other', 'wrong-owner'],
+    );
+    expect(db.execute).not.toHaveBeenCalled();
+  });
+
   it('bounds and classifies session text tail cache items', () => {
     const many = Array.from({ length: queries.SESSION_TEXT_TAIL_CACHE_LIMIT + 5 }, (_, index) => ({
       eventId: `evt-${index.toString().padStart(3, '0')}`,
@@ -120,7 +130,14 @@ describe('db queries contracts', () => {
     await queries.updateProviderRemoteSessions(db, 'srv-1', 'codex-sdk', [{ id: 'remote-1' }]);
     expect(await queries.updateServerName(db, 'srv-1', 'user-1', 'Renamed')).toBe(true);
     expect(await queries.updateServerToken(db, 'srv-1', 'user-1', 'hash-2', 'Renamed', 'key-2')).toBe(true);
+    db.queryOne.mockResolvedValueOnce({ id: 'srv-1' });
     expect(await queries.deleteServer(db, 'srv-1', 'user-1')).toBe(true);
+    expect(db.execute).toHaveBeenCalledWith('DELETE FROM cron_jobs WHERE server_id = $1', ['srv-1']);
+    expect(db.execute).toHaveBeenCalledWith(
+      expect.stringContaining('revoked_at = COALESCE(revoked_at, $2)'),
+      ['srv-1', expect.any(Number)],
+    );
+    expect(db.execute).toHaveBeenCalledWith('UPDATE servers SET host_server_id = NULL WHERE host_server_id = $1', ['srv-1']);
 
     db.query.mockResolvedValueOnce([{ id: 'srv-1' }]).mockResolvedValueOnce([{ id: 'srv-1' }, { id: 'srv-2' }]);
     expect(await queries.getServersByUserId(db, 'user-1')).toEqual([{ id: 'srv-1' }, { id: 'srv-2' }]);
