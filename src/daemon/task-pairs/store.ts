@@ -1,3 +1,4 @@
+import { TASK_PAIR_TITLE_ACCESS_FIELD, type TaskPairTitleAccess } from '../../../shared/task-pair-title-access.js';
 /**
  * Durable store for marker-driven task pairs (`~/.imcodes/task-pairs.sqlite`).
  *
@@ -594,6 +595,27 @@ export class TaskPairStore {
       try { listener(project, state.taskId); } catch { /* observers never break a write */ }
     }
     return { project, state, liveness, queueOrder, ...(legacyTaskId ? { legacyTaskId } : {}) };
+  }
+
+  /** Atomic metadata patch: never replace lifecycle, liveness or another MCP writer's unrelated fields. */
+  patchPairMetadata(project: string, taskId: string, writer: string, patch: { title?: string; brief?: string; titleAccess?: TaskPairTitleAccess }, at: number, expectedTitleAccess?: TaskPairTitleAccess): StoredTaskPair | undefined {
+    const fields: Array<[string, unknown]> = [
+      ...(patch.title !== undefined ? [['$.title', patch.title] as [string, unknown]] : []),
+      ...(patch.brief !== undefined ? [['$.brief', patch.brief] as [string, unknown]] : []),
+      ...(patch.titleAccess !== undefined ? [[`$.${TASK_PAIR_TITLE_ACCESS_FIELD}`, patch.titleAccess] as [string, unknown]] : []),
+    ];
+    const values = fields.flatMap(([path, value]) => [path, JSON.stringify(value)]);
+    const brainOnly = patch.title !== undefined || patch.titleAccess !== undefined;
+    const rolePredicate = brainOnly ? 'brain = ?' : '(brain = ? OR executor = ? OR auditor = ?)';
+    const roleArgs = brainOnly ? [writer] : [writer, writer, writer];
+    const cas = patch.titleAccess !== undefined ? ' AND json_extract(state_json, ?) IS json(?)' : '';
+    const casArgs = patch.titleAccess !== undefined ? [`$.${TASK_PAIR_TITLE_ACCESS_FIELD}`, expectedTitleAccess ? JSON.stringify(expectedTitleAccess) : null] : [];
+    const result = this.#db.prepare(`UPDATE task_pairs SET state_json = json_set(state_json, '$.updatedAt', ?${fields.map(() => ', ?, json(?)').join('')}), updated_at = ? WHERE project = ? AND task_id = ? AND ${rolePredicate}${cas}`)
+      .run(at, ...values, at, project, taskId, ...roleArgs, ...casArgs);
+    if (Number(result.changes) === 0) return undefined;
+    this.#refreshIndexEntry(project, taskId);
+    for (const listener of this.#listeners) { try { listener(project, taskId); } catch { /* observers never break a write */ } }
+    return this.getPair(project, taskId);
   }
 
   saveLiveness(project: string, taskId: string, liveness: TaskPairLiveness): void {

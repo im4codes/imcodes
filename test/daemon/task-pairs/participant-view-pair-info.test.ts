@@ -213,6 +213,29 @@ describe('task-authorized participant titles', () => {
     await owner.pair_task_update!({ taskId: 'private-task', titleViewerUserIds: ['bob'] });
     expect(getTaskPairStore().getPair(PROJECT, 'private-task')!.state.titleAccess?.userIds).toEqual(['alice', 'bob']);
   });
+  it('preserves title, grant and brief when updating them together', async () => {
+    const owner = createMemoryMcpToolHandlers(caller, { sendDeps: { listSessions: () => SESSIONS } });
+    await owner.pair_task_update!({ taskId: 'private-task', title: '主站BI发布准备', titleViewerUserIds: ['alice'], markdown: '- [ ][ ] new private brief' });
+    const saved = getTaskPairStore().getPair(PROJECT, 'private-task')!.state;
+    expect(saved.title).toBe('主站BI发布准备'); expect(saved.titleAccess?.userIds).toEqual(['alice']);
+    expect(saved.brief).toBe('- [ ][ ] new private brief');
+    expect(await titledHandlers().pair_task_get!({ taskId: 'private-task' })).toMatchObject({ title: '主站BI发布准备', markdown: null });
+  });
+  it.each(['update', 'check', 'reassign'] as const)('re-resolves current metadata and role after the authority await (%s)', async (operation) => {
+    const h = createMemoryMcpToolHandlers({ ...caller, sessionName: EXEC }, {
+      sendDeps: { listSessions: () => SESSIONS },
+      pairTitleTurn: async () => {
+        const now = getTaskPairStore().getPair(PROJECT, 'own-task')!;
+        getTaskPairStore().savePair(PROJECT, { ...now.state, title: 'Concurrent title', brief: '- [ ][ ] latest check', titleAccess: { version: 1, serverId: 'srv', userIds: ['alice', 'bob'] }, ...(operation === 'reassign' ? { executor: 'replacement' } : {}) });
+        return { participantView: true, actor: { ...actor, sessionName: EXEC } };
+      },
+    });
+    const result = operation === 'check' ? await h.pair_task_check!({ taskId: 'own-task', items: [1], box: 'implemented', checked: true }) : await h.pair_task_update!({ taskId: 'own-task', markdown: '- [ ][ ] replacement brief' });
+    const saved = getTaskPairStore().getPair(PROJECT, 'own-task')!.state;
+    expect(saved.title).toBe('Concurrent title'); expect(saved.titleAccess?.userIds).toEqual(['alice', 'bob']);
+    if (operation === 'reassign') { expect(result).toMatchObject({ status: 'error', reason: 'scope_forbidden' }); expect(saved.brief).toBe('- [ ][ ] latest check'); }
+    else if (operation === 'check') expect(saved.brief).toBe('- [x][ ] latest check');
+  });
   it('does not treat a caller-supplied creator/grant as trusted provenance', async () => {
     const h = titledHandlers();
     expect(await h.pair_task_update!({ taskId: 'private-task', markdown: '- [ ][ ] private', titleAccess: { version: 1, serverId: 'srv', userIds: ['alice'] }, creatorUserId: 'alice' })).toMatchObject({ title: null, markdown: null });

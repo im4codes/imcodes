@@ -2610,19 +2610,22 @@ export class TaskPairService {
   /** Called only with a verified creator or an explicit owner-turn grant. Never accepts marker attrs. */
   grantTaskPairTitle(project: string, taskId: string, serverId: string, userIds: string[], writer: string, title?: string): StoredTaskPair | undefined {
     const store = getTaskPairStore();
-    const stored = store.getPair(project, taskId);
-    if (!stored || stored.state.brain !== writer || !serverId || userIds.some((id) => !id.trim())
-      || (title !== undefined && !isUsableTaskPairTitle(title, taskId))) return undefined;
-    const previous = stored.state.titleAccess;
-    if (previous && (!isTaskPairTitleAccess(previous) || previous.serverId !== serverId)) return undefined;
-    const users = [...new Set([...(previous?.userIds ?? []), ...userIds])];
-    if (users.length > TASK_PAIR_TITLE_ACCESS_MAX_USERS) return undefined;
-    if (users.length === (previous?.userIds.length ?? 0) && title === undefined) return stored;
-    const next: TaskPairState = { ...stored.state, ...(title !== undefined ? { title: title.trim() } : {}), titleAccess: { version: TASK_PAIR_TITLE_ACCESS_VERSION, serverId, userIds: users }, updatedAt: Date.now() };
-    store.savePair(project, next);
-    this.#recordTitleEvent(project, next, 'title_generated');
-    if (title !== undefined) this.#clearTitleRequest(next.brain, taskId);
-    return store.getPair(project, taskId);
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const stored = store.getPair(project, taskId);
+      if (!stored || stored.state.brain !== writer || !serverId || userIds.some((id) => !id.trim())
+        || (title !== undefined && !isUsableTaskPairTitle(title, taskId))) return undefined;
+      const previous = stored.state.titleAccess;
+      if (previous && (!isTaskPairTitleAccess(previous) || previous.serverId !== serverId)) return undefined;
+      const users = [...new Set([...(previous?.userIds ?? []), ...userIds])];
+      if (users.length > TASK_PAIR_TITLE_ACCESS_MAX_USERS) return undefined;
+      if (users.length === (previous?.userIds.length ?? 0) && title === undefined) return stored;
+      const saved = store.patchPairMetadata(project, taskId, writer, { ...(title !== undefined ? { title: title.trim() } : {}), titleAccess: { version: TASK_PAIR_TITLE_ACCESS_VERSION, serverId, userIds: users } }, Date.now(), previous);
+      if (!saved) continue; // A concurrent grant won: re-read and merge, never replace its audience.
+      this.#recordTitleEvent(project, saved.state, 'title_generated');
+      if (title !== undefined) this.#clearTitleRequest(saved.state.brain, taskId);
+      return saved;
+    }
+    return undefined;
   }
 
   /** Brain-only title setter used by pair_task_update and title markers. */
@@ -2630,11 +2633,11 @@ export class TaskPairService {
     const store = getTaskPairStore();
     const stored = store.getPair(project, taskId);
     if (!stored || stored.state.brain !== writer || !isUsableTaskPairTitle(title, taskId)) return undefined;
-    const next = { ...stored.state, title: title.trim(), updatedAt: Date.now() };
-    store.savePair(project, next);
-    this.#recordTitleEvent(project, next, 'title_generated');
-    this.#clearTitleRequest(next.brain, taskId);
-    return store.getPair(project, taskId);
+    const saved = store.patchPairMetadata(project, taskId, writer, { title: title.trim() }, Date.now());
+    if (!saved) return undefined;
+    this.#recordTitleEvent(project, saved.state, 'title_generated');
+    this.#clearTitleRequest(saved.state.brain, taskId);
+    return saved;
   }
 
   #recordTitleEvent(project: string, pair: TaskPairState, effect: 'title_placeholder' | 'title_generated'): void {

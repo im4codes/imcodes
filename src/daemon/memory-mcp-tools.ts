@@ -1630,6 +1630,14 @@ function pairChecklistAccess(caller: McpRuntimeCaller, sessions: readonly Sessio
   return stored ? { status: 'forbidden', pair: stored } : { status: 'missing' };
 }
 
+/** Authority may await the network: refresh both the metadata and role slots before reading/writing. */
+function refreshPairChecklistAccess(caller: McpRuntimeCaller, previous: NonNullable<ReturnType<typeof pairChecklistTarget>>): PairChecklistAccess {
+  const pair = getTaskPairStore().getPair(previous.project, previous.state.taskId);
+  if (!pair) return { status: 'missing' };
+  const role = taskPairRoleOf(pair.state, caller.sessionName ?? '');
+  return role === 'other' || role === 'daemon' ? { status: 'forbidden', pair } : { status: 'ok', pair };
+}
+
 function pairAccessError(access: PairChecklistAccess): ToolResult {
   return access.status === 'forbidden'
     ? error(MCP_ERROR_REASONS.SCOPE_FORBIDDEN, 'only the project Brain or a current pair participant may query this task pair')
@@ -1645,8 +1653,9 @@ function pairChecklistView(pair: ReturnType<typeof pairChecklistTarget>, partici
 function savePairBrief(pair: NonNullable<ReturnType<typeof pairChecklistTarget>>, markdown: string, writer: string) {
   const store = getTaskPairStore();
   const previous = pair.state;
-  const next = { ...previous, brief: markdown, updatedAt: Date.now() };
-  const saved = store.savePair(pair.project, next);
+  const saved = store.patchPairMetadata(pair.project, previous.taskId, writer, { brief: markdown }, Date.now());
+  if (!saved) return undefined;
+  const next = saved.state;
   const eventId = `pair-brief:${pair.state.taskId}:${randomUUID()}`;
   const role = taskPairRoleOf(previous, writer);
   store.recordEvent({ id: eventId, project: pair.project, taskId: pair.state.taskId, writer, role, verb: 'BRIEF_UPDATED', attrs: {}, effect: 'brief_updated', unusual: false, source: 'mcp', fromStatus: previous.status, toStatus: next.status, at: next.updatedAt });
@@ -2221,7 +2230,9 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       const access = pairChecklistAccess(caller, await sendSessions(), taskId);
       if (access.status !== 'ok') return pairAccessError(access);
       const turn = await pairTitleTurn(access.pair.project);
-      const view = pairChecklistView(access.pair, turn.participantView, titleVisible(access.pair, turn))!;
+      const current = refreshPairChecklistAccess(caller, access.pair);
+      if (current.status !== 'ok') return pairAccessError(current);
+      const view = pairChecklistView(current.pair, turn.participantView, titleVisible(current.pair, turn))!;
       const profile = await getLocalSessionIdentityProfile(SESSION_IDENTITY_SCOPES.PAIR, sessionIdentityPairKey(access.pair.state.taskId)).catch(() => null);
       return {
         ...view,
@@ -2237,8 +2248,10 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       if (markdown === undefined && !title && viewers === undefined) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'markdown, title or titleViewerUserIds is required');
       const access = pairChecklistAccess(caller, await sendSessions(), typeof args.taskId === 'string' ? args.taskId : undefined);
       if (access.status !== 'ok') return pairAccessError(access);
-      const pair = access.pair;
-      const turn = await pairTitleTurn(pair.project);
+      const turn = await pairTitleTurn(access.pair.project);
+      const current = refreshPairChecklistAccess(caller, access.pair);
+      if (current.status !== 'ok') return pairAccessError(current);
+      const pair = current.pair;
       if (viewers !== undefined) {
         if (turn.participantView || !caller.serverId || pair.state.brain !== caller.sessionName) return error(MCP_ERROR_REASONS.SCOPE_FORBIDDEN, 'only an owner-origin Brain turn may grant task title visibility');
         if (!taskPairService.grantTaskPairTitle(pair.project, pair.state.taskId, caller.serverId, viewers as string[], caller.sessionName, title)) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'invalid title or title viewer grant');
@@ -2246,8 +2259,10 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
         const savedTitle = taskPairService.setTaskPairTitle(pair.project, pair.state.taskId, title, caller.sessionName ?? 'unknown');
         if (!savedTitle) return error(MCP_ERROR_REASONS.SCOPE_FORBIDDEN, 'only the project Brain may set a valid task title');
       }
-      const saved = markdown === undefined ? getTaskPairStore().getPair(pair.project, pair.state.taskId) : savePairBrief(pair, markdown, caller.sessionName ?? 'unknown');
-      return pairChecklistView(saved, turn.participantView, saved ? titleVisible(saved, turn) : false)!;
+      const latest = getTaskPairStore().getPair(pair.project, pair.state.taskId);
+      const saved = markdown !== undefined && latest ? savePairBrief(latest, markdown, caller.sessionName ?? 'unknown') : latest;
+      if (!saved) return pairAccessError({ status: 'forbidden', pair });
+      return pairChecklistView(saved, turn.participantView, titleVisible(saved, turn))!;
     },
     [MEMORY_MCP_TOOL_NAMES.PAIR_TASK_CHECK]: async (input) => {
       const args = (input && typeof input === 'object' ? input : {}) as Record<string, unknown>;
@@ -2256,10 +2271,14 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       if (!items || !box || typeof args.checked !== 'boolean') return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'items, box and checked are required');
       const access = pairChecklistAccess(caller, await sendSessions(), typeof args.taskId === 'string' ? args.taskId : undefined);
       if (access.status !== 'ok') return pairAccessError(access);
-      const pair = access.pair;
+      const turn = await pairTitleTurn(access.pair.project);
+      const current = refreshPairChecklistAccess(caller, access.pair);
+      if (current.status !== 'ok') return pairAccessError(current);
+      const pair = current.pair;
       const markdown = updateTaskPairChecklist(pair.state.brief ?? '', items, box, args.checked);
-      const turn = await pairTitleTurn(pair.project);
-      return pairChecklistView(savePairBrief(pair, markdown, caller.sessionName ?? 'unknown'), turn.participantView, titleVisible(pair, turn))!;
+      const saved = savePairBrief(pair, markdown, caller.sessionName ?? 'unknown');
+      if (!saved) return pairAccessError({ status: 'forbidden', pair });
+      return pairChecklistView(saved, turn.participantView, titleVisible(saved, turn))!;
     },
     [MEMORY_MCP_TOOL_NAMES.PAIR_RESOURCE_CLAIM]: async (input) => {
       const args = (input && typeof input === 'object' ? input : {}) as Record<string, unknown>;
@@ -3354,13 +3373,15 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
         ? queuePositionsOf(getTaskPairStore().listPairsForBrain(caller.sessionName!, context.project, false, 500))
         : new Map<string, number>();
       const turn = await pairTitleTurn(context.project);
+      const current = refreshPairChecklistAccess(caller, stored);
+      if (current.status !== 'ok') return pairAccessError(current);
       const participantView = turn.participantView;
       const events = getTaskPairStore().listEvents(context.project, taskId, eventLimit);
       const profile = await getLocalSessionIdentityProfile(SESSION_IDENTITY_SCOPES.PAIR, sessionIdentityPairKey(taskId)).catch(() => null);
       return {
         status: 'ok',
         pair: {
-          ...pairProjection(stored, context.sessions, queuePositions, participantView, titleVisible(stored, turn)),
+          ...pairProjection(current.pair, context.sessions, queuePositions, participantView, titleVisible(current.pair, turn)),
           pairIdentity: profile?.content ?? null,
           // Marker attrs can contain titles/models and arbitrary brief or report text under different keys. Keep transition metadata,
           // not raw attrs, for the entire history (including older stored events); the owner's view and stored records are unchanged.
