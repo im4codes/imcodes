@@ -561,17 +561,17 @@ describe('controlled-node executable release wiring', () => {
       const workflow = readFileSync(file, 'utf8');
       const build = workflow.indexOf('run: npm run build:node-exe');
       const notarize = workflow.indexOf('macos-release-signing.mjs notarize "$APP"');
-      const validate = workflow.indexOf('xcrun stapler validate "$APP"');
       // Uploaded only inside containers that keep permissions -- see the
       // test below for why the bare directory must not be one of them.
       const upload = workflow.indexOf('dist-node-exe/*.dmg');
 
-      expect([build, notarize, validate, upload].every((at) => at >= 0), file).toBe(true);
+      expect([build, notarize, upload].every((at) => at >= 0), file).toBe(true);
       expect(build, file).toBeLessThan(notarize);
-      // Validating is the only step that proves the ticket actually attached;
-      // `stapler staple` reports failure in ways a successful-looking run can
-      // hide.
-      expect(notarize, file).toBeLessThan(validate);
+      // The notarize command includes stapling AND bounded validation before
+      // returning. macos-notarization-workflow.test.ts exercises that gate's
+      // normal, transient and permanent failures. Do not require a second raw
+      // validate here: it bypasses those retries and repeats the CloudKit call.
+      expect(notarize, file).toBeLessThan(upload);
     }
   });
 
@@ -581,16 +581,15 @@ describe('controlled-node executable release wiring', () => {
     // holding an unstapled copy -- and dragging it out would need the network.
     for (const file of ['.github/workflows/ci.yml', '.github/workflows/build-node-exe.yml']) {
       const workflow = readFileSync(file, 'utf8');
-      const stapleApp = workflow.indexOf('xcrun stapler validate "$APP"');
+      const stapleApp = workflow.indexOf('macos-release-signing.mjs notarize "$APP"');
       const buildDmg = workflow.indexOf('node scripts/build-aidesk-app.mjs dmg dist-node-exe');
       const notarizeDmg = workflow.indexOf('macos-release-signing.mjs notarize "$DMG"');
-      const validateDmg = workflow.indexOf('xcrun stapler validate "$DMG"');
       const upload = workflow.indexOf('dist-node-exe/*.dmg');
 
-      expect([stapleApp, buildDmg, notarizeDmg, validateDmg, upload].every((at) => at >= 0), file).toBe(true);
+      expect([stapleApp, buildDmg, notarizeDmg, upload].every((at) => at >= 0), file).toBe(true);
       expect(stapleApp, file).toBeLessThan(buildDmg);
       expect(buildDmg, file).toBeLessThan(notarizeDmg);
-      expect(notarizeDmg, file).toBeLessThan(validateDmg);
+      expect(notarizeDmg, file).toBeLessThan(upload);
     }
   });
 
