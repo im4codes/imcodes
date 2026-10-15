@@ -160,3 +160,82 @@ describe('a participant-started turn gets no open-pair titles, models or briefs'
     });
   });
 });
+
+describe('task-authorized participant titles', () => {
+  const actor = { serverId: 'srv', userId: 'alice', sessionName: BRAIN, projectName: PROJECT };
+  let currentActor: typeof actor | undefined;
+  const titledHandlers = (sessionName = BRAIN) => createMemoryMcpToolHandlers({ ...caller, sessionName }, {
+    sendDeps: { listSessions: () => SESSIONS },
+    participantTurnRequired: async () => true,
+    pairTitleTurn: async () => ({ participantView: true, actor: currentActor ? { ...currentActor, sessionName } : undefined }),
+  });
+  beforeEach(() => {
+    setTaskPairStoreForTests(new TaskPairStore(':memory:'));
+    getTaskPairStore().savePair(PROJECT, { ...pair('own-task'), titleAccess: { version: 1, serverId: 'srv', userIds: ['alice'] } });
+    getTaskPairStore().savePair(PROJECT, pair('private-task'));
+    currentActor = actor;
+  });
+  afterEach(() => setTaskPairStoreForTests(undefined));
+
+  it.each([BRAIN, EXEC, AUD])('reads own titles through list/get/check/update without exposing brief/models (%s)', async (sessionName) => {
+    const h = titledHandlers(sessionName);
+    if (sessionName === BRAIN) {
+      expect((await h.pair_list!({}) as any).pairs.find((p: any) => p.taskId === 'own-task').title).toBe(SECRET_TITLE);
+      expect((await h.pair_list!({}) as any).pairs.find((p: any) => p.taskId === 'private-task').title).toBeNull();
+    }
+    expect((await h.pair_get!({ taskId: 'own-task' }) as any).pair).toMatchObject({ title: SECRET_TITLE, brief: null, executorModel: null });
+    expect(await h.pair_task_get!({ taskId: 'own-task' })).toMatchObject({ title: SECRET_TITLE, markdown: null });
+    expect(await h.pair_task_update!({ taskId: 'own-task', markdown: '- [ ][ ] private task work' })).toMatchObject({ title: SECRET_TITLE, markdown: null });
+    expect(await h.pair_task_check!({ taskId: 'own-task', items: [1], box: 'implemented', checked: true })).toMatchObject({ title: SECRET_TITLE, markdown: null });
+    if (sessionName === BRAIN) expect(await h.pair_task_update!({ taskId: 'own-task', title: '主站BI发布准备' })).toMatchObject({ title: '主站BI发布准备', markdown: null });
+  });
+  it.each(['bob', undefined])('cannot read another actor\'s title despite sharing the same Brain: %s', async (userId) => {
+    currentActor = userId ? { ...actor, userId } : undefined;
+    expect(await titledHandlers().pair_task_get!({ taskId: 'own-task' })).toMatchObject({ title: null, markdown: null });
+  });
+  it('does not trust caller user id, source/project hints or role slots', async () => {
+    for (const override of [{ serverId: 'foreign' }, { projectName: 'foreign' }]) {
+      currentActor = { ...actor, ...override };
+      expect(await titledHandlers().pair_task_get!({ taskId: 'own-task' })).toMatchObject({ title: null });
+    }
+  });
+  it('requires an explicit owner-origin Brain grant for legacy tasks, scoped to that task only', async () => {
+    const owner = createMemoryMcpToolHandlers(caller, { sendDeps: { listSessions: () => SESSIONS }, pairTitleTurn: async () => ({ participantView: false }) });
+    const before = getTaskPairStore().getPair(PROJECT, 'private-task')!.state;
+    expect(await titledHandlers().pair_task_update!({ taskId: 'private-task', titleViewerUserIds: ['alice'] })).toMatchObject({ status: 'error', reason: 'scope_forbidden' });
+    expect(getTaskPairStore().getPair(PROJECT, 'private-task')!.state).toEqual(before);
+    await owner.pair_task_update!({ taskId: 'private-task', titleViewerUserIds: ['alice'], title: '测试站升级1.18.15与上线验收' });
+    expect(await titledHandlers().pair_task_get!({ taskId: 'private-task' })).toMatchObject({ title: '测试站升级1.18.15与上线验收', markdown: null });
+    const saved = getTaskPairStore().getPair(PROJECT, 'private-task')!.state;
+    expect(saved.status).toBe(before.status); expect(saved.round).toBe(before.round);
+    expect(saved.titleAccess?.userIds).toEqual(['alice']);
+    // Owner grants are additive; changing models/roles/restarting does not infer or erase grants.
+    await owner.pair_task_update!({ taskId: 'private-task', titleViewerUserIds: ['bob'] });
+    expect(getTaskPairStore().getPair(PROJECT, 'private-task')!.state.titleAccess?.userIds).toEqual(['alice', 'bob']);
+  });
+  it('does not treat a caller-supplied creator/grant as trusted provenance', async () => {
+    const h = titledHandlers();
+    expect(await h.pair_task_update!({ taskId: 'private-task', markdown: '- [ ][ ] private', titleAccess: { version: 1, serverId: 'srv', userIds: ['alice'] }, creatorUserId: 'alice' })).toMatchObject({ title: null, markdown: null });
+    expect(getTaskPairStore().getPair(PROJECT, 'private-task')!.state.titleAccess).toBeUndefined();
+  });
+  it('grants the maximum audience without reopening a finished task and refuses overflow atomically', async () => {
+    const closed = { ...pair('closed-task'), status: 'done' as const };
+    getTaskPairStore().savePair(PROJECT, closed);
+    const owner = createMemoryMcpToolHandlers(caller, { sendDeps: { listSessions: () => SESSIONS } });
+    const audience = ['alice', ...Array.from({ length: 63 }, (_, i) => `user-${i}`)];
+    await owner.pair_task_update!({ taskId: 'closed-task', titleViewerUserIds: audience });
+    const saved = getTaskPairStore().getPair(PROJECT, 'closed-task')!.state;
+    expect(saved.status).toBe('done'); expect(saved.titleAccess?.userIds).toHaveLength(64);
+    expect(await owner.pair_task_update!({ taskId: 'closed-task', titleViewerUserIds: ['extra'], title: 'Must not change' })).toMatchObject({ status: 'error' });
+    expect(getTaskPairStore().getPair(PROJECT, 'closed-task')!.state).toEqual(saved);
+    expect(await titledHandlers().pair_task_get!({ taskId: 'closed-task' })).toMatchObject({ title: SECRET_TITLE, markdown: null, status: 'done' });
+  });
+  it('rejects invalid grants/title before writing either metadata field', async () => {
+    const owner = createMemoryMcpToolHandlers(caller, { sendDeps: { listSessions: () => SESSIONS } });
+    const original = getTaskPairStore().getPair(PROJECT, 'private-task')!.state;
+    for (const args of [{ titleViewerUserIds: ['alice'], title: 'private-task' }, { titleViewerUserIds: Array(65).fill('alice'), title: 'Valid' }, { titleViewerUserIds: [''] }]) {
+      expect(await owner.pair_task_update!({ taskId: 'private-task', ...args })).toMatchObject({ status: 'error' });
+      expect(getTaskPairStore().getPair(PROJECT, 'private-task')!.state).toEqual(original);
+    }
+  });
+});

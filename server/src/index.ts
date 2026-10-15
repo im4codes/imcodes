@@ -1,3 +1,5 @@
+import { taskPairTitleAuthorityRoutes } from './routes/task-pair-title-authority.js';
+import { TASK_PAIR_TITLE_AUTHORITY_PATH } from '../../shared/task-pair-title-access.js';
 import { MachineGroupInvalidationRuntime } from './services/machine-group-invalidation.js';
 import { applyMachineGroupInvalidation, failClosedMachineGroupConnections } from './ws/machine-group-revalidation.js';
 /**
@@ -250,6 +252,7 @@ export function buildApp(env: Env, options: BuildAppOptions = {}) {
   // phone screen and dictated over the phone. It serves a script, never data.
   app.route(CONTROLLED_NODE_INSTALL_COMMAND_PATH, controlledNodeInstallCommandRoutes);
   app.route('/api/machines', machinesRoutes);
+  app.route(TASK_PAIR_TITLE_AUTHORITY_PATH, taskPairTitleAuthorityRoutes);
   app.route('/api/machine/exec', machineExecRoutes);
   app.route('/api/machine/computer-use', machineComputerUseRoutes);
   app.route('/api/server', serverRoutes);

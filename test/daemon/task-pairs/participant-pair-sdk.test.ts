@@ -85,3 +85,50 @@ describe.each([true, false])('scoped real SDK pair lifecycle (participant=%s)', 
     }
   });
 });
+
+describe('trusted creator title provenance via real MCP', () => {
+  it.each([false, true])('persists creator grants across restart, never grants replayers, and accepts owner-only legacy grants (fallback=%s)', async (fallback) => {
+    const oldEngine = process.env.IMCODES_SUPERVISION_ENGINE;
+    process.env.IMCODES_SUPERVISION_ENGINE = 'pairs';
+    const dbPath = join(process.env.HOME!, `pair-title-sdk-${fallback}.sqlite`);
+    store = new TaskPairStore(dbPath); setTaskPairStoreForTests(store);
+    sessions.find((entry) => entry.name === EXEC)!.state = 'running';
+    sessions.forEach(upsertSession);
+    setTaskPairDeliveryDepsForTests({ send: async () => {} });
+    let userId = 'alice', participantView = true;
+    const server = createMemoryMcpServer(caller, {
+      sendDeps: { listSessions: () => sessions },
+      participantTurnRequired: async () => participantView,
+      pairTitleTurn: async () => ({ participantView, actor: participantView ? { serverId: 'sdk-source', userId, sessionName: BRAIN, projectName: PROJECT } : undefined }),
+    });
+    const client = new Client({ name: 'pair-title-sdk', version: '1' });
+    const [a, b] = InMemoryTransport.createLinkedPair();
+    await Promise.all([server.connect(b), client.connect(a)]);
+    const call = async (name: string, args: Record<string, unknown>) => {
+      await client.callTool({ name: MCP_TOOL_DISCOVERY_NAME, arguments: { query: name } });
+      return mcpToolPayload(await client.callTool(fallback ? { name: MCP_TOOL_DISCOVERY_NAME, arguments: { query: name, fallbackCall: { name, arguments: args } } } : { name, arguments: args }));
+    };
+    try {
+      const args = { title: '测试站升级1.18.15与上线验收', brief: '- [ ][ ] private brief', executor: EXEC, auditor: AUD, workspace: 'none', idempotencyKey: 'title-creator' };
+      const created = await call(N.PAIR_CREATE, args);
+      expect(created).toMatchObject({ status: 'ok', created: true });
+      const taskId = String(created.taskId);
+      expect(store!.getPair(PROJECT, taskId)?.state.titleAccess).toEqual({ version: 1, serverId: 'sdk-source', userIds: ['alice'] });
+      setTaskPairStoreForTests(undefined); store = new TaskPairStore(dbPath); setTaskPairStoreForTests(store);
+      expect(await call(N.PAIR_TASK_GET, { taskId })).toMatchObject({ title: args.title, markdown: null });
+      expect(await call(N.PAIR_TASK_UPDATE, { taskId, title: '主站BI发布准备' })).toMatchObject({ title: '主站BI发布准备', markdown: null });
+      userId = 'bob';
+      expect(await call(N.PAIR_CREATE, args)).toMatchObject({ status: 'ok', idempotentReplay: true });
+      expect(store!.getPair(PROJECT, taskId)?.state.titleAccess?.userIds).toEqual(['alice']);
+      expect(await call(N.PAIR_TASK_GET, { taskId })).toMatchObject({ title: null });
+      expect(await call(N.PAIR_TASK_UPDATE, { taskId, titleViewerUserIds: ['bob'] })).toMatchObject({ status: 'error', reason: 'scope_forbidden' });
+      participantView = false;
+      expect(await call(N.PAIR_TASK_UPDATE, { taskId, titleViewerUserIds: ['bob'] })).toMatchObject({ title: '主站BI发布准备' });
+      participantView = true;
+      expect(await call(N.PAIR_TASK_GET, { taskId })).toMatchObject({ title: '主站BI发布准备', markdown: null });
+    } finally {
+      await client.close(); await server.close();
+      if (oldEngine === undefined) delete process.env.IMCODES_SUPERVISION_ENGINE; else process.env.IMCODES_SUPERVISION_ENGINE = oldEngine;
+    }
+  });
+});

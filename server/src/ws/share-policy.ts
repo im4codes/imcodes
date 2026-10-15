@@ -1,3 +1,4 @@
+import { canReadTaskPairWireTitle, TASK_PAIR_TITLE_ACCESS_FIELD } from '../../../shared/task-pair-title-access.js';
 import type { Database } from '../db/client.js';
 import { resolveEffectiveShareCoverage } from '../db/tab-sharing.js';
 import { evaluateP2pSendTargetScope } from '../share/p2p-send-scope.js';
@@ -1359,10 +1360,10 @@ function redactSessionList(msg: Record<string, unknown>, state: ShareScopedSocke
 
 function redactTransportHistory(msg: Record<string, unknown>, _state: ShareScopedSocketState): Record<string, unknown> | null {
   if (!Array.isArray(msg.events)) return msg;
-  return { ...msg, events: msg.events.map((event) => redactPairTimelineEvent(event)) };
+  return { ...msg, events: msg.events.map((event) => redactPairTimelineEvent(event, _state)) };
 }
 
-// ── pair information a share must not see (titles, models, brief text) ──────────────────────────────
+// ── pair information: only task-authorized participants may see titles; models/briefs stay private ──────────────────────────────
 
 /** Keys that carry a pair's model / brief / objective on console rows and pair events. */
 const SHARE_HIDDEN_PAIR_KEYS: ReadonlySet<string> = new Set([
@@ -1371,23 +1372,26 @@ const SHARE_HIDDEN_PAIR_KEYS: ReadonlySet<string> = new Set([
   'brief', 'briefRevision', 'objective',
 ]);
 
-function redactPairValue(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map(redactPairValue);
+function redactPairValue(value: unknown, state: ShareScopedSocketState): unknown {
+  if (Array.isArray(value)) return value.map((item) => redactPairValue(item, state));
   if (!value || typeof value !== 'object') return value;
   const record = value as Record<string, unknown>;
   const out: Record<string, unknown> = {};
   for (const [key, inner] of Object.entries(record)) {
-    if (SHARE_HIDDEN_PAIR_KEYS.has(key)) continue;
-    out[key] = redactPairValue(inner);
+    if (SHARE_HIDDEN_PAIR_KEYS.has(key) || key === TASK_PAIR_TITLE_ACCESS_FIELD) continue;
+    out[key] = redactPairValue(inner, state);
   }
-  // A console task row must keep a title (the UI requires one): its id stands in for the text.
-  if (typeof record.taskId === 'string' && typeof record.title === 'string') out.title = record.taskId;
+  // Legacy/private tasks retain the id fallback; trusted per-task grants reveal only the title.
+  if (typeof record.taskId === 'string' && typeof record.title === 'string') {
+    out.title = state.snapshot.effectiveRole === 'participant'
+      && canReadTaskPairWireTitle(record.titleAccess, { serverId: state.target.serverId, userId: state.userId }) ? record.title : record.taskId;
+  }
   return out;
 }
 
-/** Console snapshot / delta / pair_delta frames: every row loses title text, models and brief text, at any depth. */
+/** All console frame variants use the same title-only task grant; no grant metadata reaches a share. */
 function redactPairInfoDeep(msg: Record<string, unknown>, _state: ShareScopedSocketState): Record<string, unknown> | null {
-  return redactPairValue(msg) as Record<string, unknown>;
+  return redactPairValue(msg, _state) as Record<string, unknown>;
 }
 
 /** The brief itself is never sent: the reply stays well-formed ("no brief") so the console does not wait for one. */
@@ -1406,19 +1410,22 @@ const SHARE_PAIR_EVENT_OPERATIONAL_KEYS: ReadonlySet<string> = new Set([
   'executorPool', 'auditorPool', 'checklistAutoTickReason',
 ]);
 
-/** A `task_pair.event` loses its pair title and models; every other timeline event is returned as is. */
-function redactPairTimelineEvent(event: unknown): unknown {
+/** Only a task-authorized participant keeps the title; models and private notices remain redacted. */
+function redactPairTimelineEvent(event: unknown, state: ShareScopedSocketState): unknown {
   if (!event || typeof event !== 'object' || Array.isArray(event)) return event;
   const record = event as Record<string, unknown>;
   if (record.type !== TASK_PAIR_TIMELINE_EVENT) return event;
   const payload = record.payload && typeof record.payload === 'object' && !Array.isArray(record.payload)
     ? Object.fromEntries(Object.entries(record.payload).filter(([key]) => SHARE_PAIR_EVENT_OPERATIONAL_KEYS.has(key)))
     : {};
+  const original = record.payload as Record<string, unknown> | undefined;
+  if (state.snapshot.effectiveRole === 'participant' && typeof original?.title === 'string'
+    && canReadTaskPairWireTitle(original.titleAccess, { serverId: state.target.serverId, userId: state.userId })) payload.title = original.title;
   return { ...record, payload };
 }
 
 function redactTimelineEventPairInfo(msg: Record<string, unknown>, _state: ShareScopedSocketState): Record<string, unknown> | null {
-  return { ...msg, event: redactPairTimelineEvent(msg.event) };
+  return { ...msg, event: redactPairTimelineEvent(msg.event, _state) };
 }
 
 function redactParticipantModelCatalog(msg: Record<string, unknown>, state: ShareScopedSocketState): Record<string, unknown> | null {

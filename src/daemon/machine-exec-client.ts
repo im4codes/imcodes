@@ -93,7 +93,7 @@ function authHeaders(sourceServerId: string, sourceToken: string, sharedMachineA
  * over-cap body is cancelled without full buffering; falls back to text/json for
  * injected mocks. Returns null on over-cap or any read error.
  */
-async function readBoundedText(res: Response, maxBytes: number): Promise<string | null> {
+export async function readBoundedText(res: Response, maxBytes: number): Promise<string | null> {
   const anyRes = res as unknown as {
     body?: { getReader?: () => ReadableStreamDefaultReader<Uint8Array> };
     text?: () => Promise<string>;

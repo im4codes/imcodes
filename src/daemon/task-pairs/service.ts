@@ -1,3 +1,4 @@
+import { TASK_PAIR_TITLE_ACCESS_MAX_USERS, TASK_PAIR_TITLE_ACCESS_VERSION, taskPairTitleWireAccess, isTaskPairTitleAccess } from '../../../shared/task-pair-title-access.js';
 /**
  * Marker ingestion for the `pairs` supervision engine.
  *
@@ -2606,6 +2607,24 @@ export class TaskPairService {
     );
   }
 
+  /** Called only with a verified creator or an explicit owner-turn grant. Never accepts marker attrs. */
+  grantTaskPairTitle(project: string, taskId: string, serverId: string, userIds: string[], writer: string, title?: string): StoredTaskPair | undefined {
+    const store = getTaskPairStore();
+    const stored = store.getPair(project, taskId);
+    if (!stored || stored.state.brain !== writer || !serverId || userIds.some((id) => !id.trim())
+      || (title !== undefined && !isUsableTaskPairTitle(title, taskId))) return undefined;
+    const previous = stored.state.titleAccess;
+    if (previous && (!isTaskPairTitleAccess(previous) || previous.serverId !== serverId)) return undefined;
+    const users = [...new Set([...(previous?.userIds ?? []), ...userIds])];
+    if (users.length > TASK_PAIR_TITLE_ACCESS_MAX_USERS) return undefined;
+    if (users.length === (previous?.userIds.length ?? 0) && title === undefined) return stored;
+    const next: TaskPairState = { ...stored.state, ...(title !== undefined ? { title: title.trim() } : {}), titleAccess: { version: TASK_PAIR_TITLE_ACCESS_VERSION, serverId, userIds: users }, updatedAt: Date.now() };
+    store.savePair(project, next);
+    this.#recordTitleEvent(project, next, 'title_generated');
+    if (title !== undefined) this.#clearTitleRequest(next.brain, taskId);
+    return store.getPair(project, taskId);
+  }
+
   /** Brain-only title setter used by pair_task_update and title markers. */
   setTaskPairTitle(project: string, taskId: string, title: string, writer: string): StoredTaskPair | undefined {
     const store = getTaskPairStore();
@@ -2672,6 +2691,7 @@ export function emitTaskPairTimelineEvent(
     ...base,
     ...(pair ? {
       ...(pair.title ? { title: pair.title } : {}),
+      ...(pair.titleAccess ? { titleAccess: taskPairTitleWireAccess(pair.titleAccess) } : {}),
       ...(pair.executor ? { executor: pair.executor } : {}),
       ...(pair.auditor ? { auditor: pair.auditor } : {}),
       round: pair.round,

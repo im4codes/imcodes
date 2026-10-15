@@ -1,3 +1,4 @@
+import { resolveTaskPairTitleTurn } from './task-pair-title-authority.js';
 import { installMcpErrorResultBoundary } from './mcp-error-result-boundary.js';
 import { TASK_PAIR_LEGACY_TOOL_HOOK_PATH } from '../../shared/task-pair.js';
 import { SEND_COMMAND_ERRORS, SEND_COMMAND_HOOK_PATH } from '../../shared/send-command-mode.js';
@@ -693,6 +694,9 @@ export function mergeDefaultToolDeps(
     : null;
   return {
     ...toolDeps,
+    pairTitleTurn: toolDeps.pairTitleTurn ?? (postSharedMachineAuthorityHook
+      ? () => resolveTaskPairTitleTurn({ postAuthorityHook: postSharedMachineAuthorityHook, sessionName: caller.sessionName! })
+      : undefined),
     participantTurnRequired: toolDeps.participantTurnRequired
       ?? (postSharedMachineAuthorityHook ? participantTurnFromAuthorityHook(postSharedMachineAuthorityHook) : undefined),
     invokeDaemonMemoryTool: toolDeps.invokeDaemonMemoryTool

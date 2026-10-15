@@ -1,3 +1,4 @@
+import { TASK_PAIR_TITLE_AUTHORITY_PATH } from './task-pair-title-access.js';
 import { NODE_ROLE, type NodeRole } from './remote-exec.js';
 import { ALIAS_API_PATH } from './alias-types.js';
 import { VERIFICATION_MACHINE_API_PATH } from './verification-machine.js';
@@ -28,6 +29,7 @@ const server = '/api/server/:serverId';
  * WS authenticates its own handshake. None of those is a REST account grant.
  */
 export const DAEMON_TOKEN_ROUTES: readonly DaemonTokenRoute[] = [
+  full('GET', TASK_PAIR_TITLE_AUTHORITY_PATH),
   full('GET', VERIFICATION_MACHINE_API_PATH),
   full('PUT', VERIFICATION_MACHINE_API_PATH),
   full('DELETE', `${VERIFICATION_MACHINE_API_PATH}/:id`),

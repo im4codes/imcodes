@@ -1,3 +1,4 @@
+import type { TaskPairTitleAccess, TaskPairTitleWireAccess } from './task-pair-title-access.js';
 /**
  * Marker-driven executor + auditor task pairs (the `pairs` supervision engine).
  *
@@ -1199,6 +1200,8 @@ export interface TaskPairLastVerdict {
 }
 
 export interface TaskPairState {
+  /** Trusted creator / explicit owner title-only grants; never inferred from role slots. */
+  titleAccess?: TaskPairTitleAccess;
   taskId: string;
   brain: string;
   executor?: string;
@@ -2491,6 +2494,7 @@ export const TASK_PAIR_CONSOLE_LEGACY_STATUS = {
 // ---------------------------------------------------------------------------
 
 export interface TaskPairEventPayload {
+  titleAccess?: TaskPairTitleWireAccess;
   taskId: string;
   verb: string;
   writer: string;

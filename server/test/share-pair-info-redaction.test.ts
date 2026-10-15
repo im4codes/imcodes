@@ -116,3 +116,44 @@ describe('everyone else', () => {
     expect(text(frame)).toContain(TITLE);
   });
 });
+
+describe('explicit task-level title visibility', () => {
+  const titleAccess = { brief: { version: 1, serverId, userIds: ['shared-user'] } };
+  it.each(frames)('preserves an authorized title on %s, but never other private fields or grant identities', (_name, frame) => {
+    const input = structuredClone(frame) as any;
+    if (input.tasks) input.tasks[0].titleAccess = titleAccess;
+    if (input.task) input.task.titleAccess = titleAccess;
+    if (input.upserts) input.upserts[0].task.titleAccess = titleAccess;
+    const original = structuredClone(input);
+    const out = filterShareDaemonMessage(input, socket('participant'));
+    expect(text(out)).toContain(TITLE);
+    for (const secret of [BRIEF, MODEL, 'titleAccess', 'shared-user']) expect(text(out)).not.toContain(secret);
+    expect(input).toEqual(original);
+    expect(text(filterShareDaemonMessage(input, socket('viewer')))).not.toContain(TITLE);
+    expect(text(filterShareDaemonMessage(input, { ...socket('participant'), userId: 'different-user' }))).not.toContain(TITLE);
+  });
+  it('keeps grant identities protected by older servers that drop only known private keys', () => {
+    const oldProjection = JSON.stringify({ titleAccess }, (key, value) => key === 'brief' ? undefined : value);
+    expect(oldProjection).not.toContain('shared-user');
+    expect(oldProjection).not.toContain(serverId);
+  });
+  it('does not reveal another private task in the same Brain console', () => {
+    const input = { ...frames[0]![1], tasks: [{ ...taskRow, titleAccess }, { ...taskRow, taskId: 'private-task', title: 'Another user private title' }] };
+    const out = filterShareDaemonMessage(input, socket('participant'));
+    expect(text(out)).toContain(TITLE);
+    expect(text(out)).not.toContain('Another user private title');
+  });
+  it('applies the exact same grant to live and stored events, preserving the free-text allowlist', () => {
+    const event = { ...pairEvent.event, payload: { ...pairEvent.event.payload, titleAccess } };
+    const live = filterShareDaemonMessage({ ...pairEvent, event }, socket('participant'));
+    const history = filterShareDaemonMessage({ type: TRANSPORT_MSG.CHAT_HISTORY, sessionId: SESSION, events: [event] }, socket('participant'));
+    for (const out of [live, history]) {
+      expect(text(out)).toContain(TITLE);
+      for (const secret of [BRIEF, MODEL, 'noticeText', 'auditDetails', 'titleAccess', 'shared-user']) expect(text(out)).not.toContain(secret);
+    }
+  });
+  it.each([undefined, { brief: { ...titleAccess.brief, serverId: 'foreign' } }, { brief: { ...titleAccess.brief, version: 99 } }, { brief: { ...titleAccess.brief, userIds: ['other'] } }])('fails closed for missing/mismatched grant %j', (grant) => {
+    const input = { ...frames[0]![1], tasks: [{ ...taskRow, titleAccess: grant }] };
+    expect(text(filterShareDaemonMessage(input, socket('participant')))).not.toContain(TITLE);
+  });
+});

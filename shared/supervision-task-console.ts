@@ -1,3 +1,4 @@
+import type { TaskPairTitleWireAccess } from './task-pair-title-access.js';
 /**
  * Browser-safe supervision task console wire contract (V1).
  *
@@ -509,6 +510,7 @@ export interface SupervisionConsolePairInfo {
 }
 
 export interface SupervisionTaskConsoleTaskRow {
+  titleAccess?: TaskPairTitleWireAccess;
   taskId: string;
   /** Present on `pairs`-engine projects; `status` then holds the closest legacy lifecycle for grouping. */
   pair?: SupervisionConsolePairInfo;

@@ -1,3 +1,4 @@
+import { taskPairTitleWireAccess } from '../../shared/task-pair-title-access.js';
 /**
  * Console rows for `pairs`-engine projects, and the per-scope view that lets a
  * single pair change be sent as a one-pair delta instead of a rebuilt snapshot.
@@ -74,6 +75,7 @@ export function buildPairConsoleRow(
   const task: SupervisionTaskConsoleTaskRow = {
     taskId: pair.taskId,
     title: pair.title ?? pair.taskId,
+    ...(pair.titleAccess ? { titleAccess: taskPairTitleWireAccess(pair.titleAccess) } : {}),
     status,
     phase,
     ...(pair.executor ? { ownerSessionName: pair.executor } : {}),

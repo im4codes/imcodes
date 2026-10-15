@@ -13,3 +13,6 @@ export const CONTENT_ENCODING_HEADER = 'Content-Encoding';
  * cannot silently execute an owner-scoped action under a different account.
  */
 export const EXPECTED_USER_ID_HEADER = 'x-imcodes-expected-user-id';
+
+export const CACHE_CONTROL_HEADER = 'Cache-Control';
+export const CACHE_CONTROL_NO_STORE = 'no-store';

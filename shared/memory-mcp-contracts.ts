@@ -1,3 +1,4 @@
+import { TASK_PAIR_TITLE_ACCESS_MAX_USERS, TASK_PAIR_TITLE_ACCESS_MAX_USER_CHARS } from './task-pair-title-access.js';
 import { MCP_ERROR_REASONS, isRecoverableMcpErrorReason, type MCPErrorReason } from './memory-mcp-errors.js';
 import { SEND_COMMAND_DESCRIPTION } from './send-command-mode.js';
 import { MEMORY_FEATURE_FLAGS_BY_NAME } from './feature-flags.js';
@@ -392,6 +393,7 @@ type JsonSchema = {
   readonly maxLength?: number;
   readonly pattern?: string;
   readonly maxItems?: number;
+  readonly minItems?: number;
   readonly anyOf?: readonly JsonSchema[];
 };
 
@@ -1053,8 +1055,8 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
   },
   [MEMORY_MCP_TOOL_NAMES.PAIR_TASK_UPDATE]: {
     name: MEMORY_MCP_TOOL_NAMES.PAIR_TASK_UPDATE,
-    description: 'Replace the complete pair brief or set a Brain-only title. Brief edits do not close or advance the pair; use pair_close for terminal lifecycle decisions.',
-    inputSchema: objectSchema({ taskId: stringSchema('Optional task id.'), markdown: { type: 'string', description: 'Complete Markdown brief.' }, title: { type: 'string', minLength: 1, description: 'Owner-locale title.' } }),
+    description: 'Replace the complete pair brief, set a Brain-only title, or append owner-origin task-specific title viewer grants. Brief edits do not close or advance the pair; use pair_close for terminal lifecycle decisions.',
+    inputSchema: objectSchema({ taskId: stringSchema('Optional task id.'), markdown: { type: 'string', description: 'Complete Markdown brief.' }, title: { type: 'string', minLength: 1, description: 'Owner-locale title.' }, titleViewerUserIds: { type: 'array', minItems: 1, maxItems: TASK_PAIR_TITLE_ACCESS_MAX_USERS, items: { type: 'string', minLength: 1, maxLength: TASK_PAIR_TITLE_ACCESS_MAX_USER_CHARS }, description: 'Owner-origin Brain only: append title-only viewer user ids for this task; historical tasks need an explicit grant.' } }),
     outputSchema: statusSchema,
   },
   [MEMORY_MCP_TOOL_NAMES.PAIR_TASK_CHECK]: {
