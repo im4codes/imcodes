@@ -46,6 +46,7 @@ import { isEmbeddingStatus } from '../../../shared/embedding-status.js';
 import { DAEMON_STATS_MSG, DAEMON_STATS_NUMERIC_KEYS } from '../../../shared/daemon-stats.js';
 import { isDirectConnectivityRuntimeStatus } from '../../../shared/direct-file-transfer.js';
 import { sanitizeProviderQuotaMeta } from '../../../shared/provider-quota.js';
+import { isTransportEffortLevel } from '../../../shared/effort-levels.js';
 
 export { shareTargetKey };
 export type { EffectiveCoverage, ShareTarget };
@@ -1214,12 +1215,15 @@ function redactDaemonStatsForParticipant(
  * Deliberately absent: `transportConfig` (provider blob that can carry env and
  * endpoints), `providerId` /
  * `providerSessionId`, every `*AuthType` / `*AuthLimit` / `*AvailableModels`,
- * `planLabel`, `permissionLabel`, `contextNamespace*`, `effort`,
+ * `planLabel`, `permissionLabel`, `contextNamespace*`,
  * `ccPreset`, `requestedModel`.
  *
  * Participant shares receive only the bounded display projection of `quota*`
  * below. Quota percentages/reset clocks are already user-facing session
  * telemetry; provider/account configuration and credit balances remain hidden.
+ * Participants also receive the validated thinking/effort enum: they can change
+ * it, so omitting it makes the control falsely fall back to the default high.
+ * Viewers retain their existing projection; no arbitrary settings blobs are exposed.
  */
 const SHARE_VISIBLE_SESSION_FIELDS = new Set([
   'name',
@@ -1251,7 +1255,7 @@ function projectQuotaText(value: unknown): string | undefined {
     : undefined;
 }
 
-function projectParticipantProviderQuota(row: Record<string, unknown>): Record<string, unknown> {
+function projectParticipantSessionTelemetry(row: Record<string, unknown>): Record<string, unknown> {
   const quotaLabel = projectQuotaText(row.quotaLabel);
   const quotaUsageLabel = projectQuotaText(row.quotaUsageLabel);
   const quotaMeta = sanitizeProviderQuotaMeta(row.quotaMeta);
@@ -1259,6 +1263,7 @@ function projectParticipantProviderQuota(row: Record<string, unknown>): Record<s
     ...(quotaLabel ? { quotaLabel } : {}),
     ...(quotaUsageLabel ? { quotaUsageLabel } : {}),
     ...(quotaMeta ? { quotaMeta } : {}),
+    ...(isTransportEffortLevel(row.effort) ? { effort: row.effort } : {}),
   };
 }
 
@@ -1270,7 +1275,7 @@ function redactSessionRow(row: Record<string, unknown>, includeParticipantFields
   if (includeParticipantFields && Object.prototype.hasOwnProperty.call(row, 'activeDispatchId')) {
     redacted.activeDispatchId = row.activeDispatchId;
   }
-  if (includeParticipantFields) Object.assign(redacted, projectParticipantProviderQuota(row));
+  if (includeParticipantFields) Object.assign(redacted, projectParticipantSessionTelemetry(row));
   const supervisionMode = projectSharedSessionSupervisionMode(row.transportConfig);
   if (supervisionMode) redacted[SUPERVISION_MODE_PROJECTION_KEY] = supervisionMode;
   return redacted;
@@ -1312,7 +1317,7 @@ function redactSubsessionCreated(
   const supervisionMode = projectSharedSessionSupervisionMode(msg.transportConfig);
   if (supervisionMode) redacted[SUPERVISION_MODE_PROJECTION_KEY] = supervisionMode;
   if (state.snapshot.effectiveRole === 'participant') {
-    Object.assign(redacted, projectParticipantProviderQuota(msg));
+    Object.assign(redacted, projectParticipantSessionTelemetry(msg));
   }
   return redacted;
 }

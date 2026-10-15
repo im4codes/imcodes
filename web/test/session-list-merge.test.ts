@@ -255,6 +255,16 @@ describe('mergeSessionListEntry — general field behavior', () => {
     expect(merged.planLabel).toBe('Pro');
   });
 
+  it('applies shared thinking switches and retains the last known value across sparse broadcasts', () => {
+    let current=makeExisting({effort:'high',sharedState:{effectiveRole:'participant',status:'active'}});
+    for(const effort of ['max','xhigh','medium'] as const) {
+      current=mergeSessionListEntry({...BASE_INCOMING,effort},current);
+      expect(current.effort).toBe(effort);
+      current=mergeSessionListEntry(BASE_INCOMING,current);
+      expect(current.effort).toBe(effort);
+    }
+  });
+
   it('falls back to existing for fields omitted by the broadcast', () => {
     const merged = mergeSessionListEntry(BASE_INCOMING, makeExisting({
       label: 'Main Brain',

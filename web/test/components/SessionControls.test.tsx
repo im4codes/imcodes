@@ -10239,6 +10239,23 @@ afterEach(() => {
     });
   });
 
+  it('updates shared participant thinking from authoritative broadcasts instead of staying high', () => {
+    const ws=makeWs();
+    const session=makeSession({name:'shared-thinking',agentType:'codex-sdk',runtimeType:'transport',effort:'high',
+      sharedState:{effectiveRole:'participant',status:'active'}});
+    const view=render(<SessionControls ws={ws as any} serverId="shared-server" activeSession={session} quickData={makeQuickData() as any} />);
+    fireEvent.click(screen.getByRole('button',{name:/^high$/i}));
+    fireEvent.click(screen.getByRole('button',{name:'○ Max'}));
+    expectSendPayload(ws,{sessionName:'shared-thinking',text:'/thinking max'});
+    // A send/receipt alone is not proof that the daemon accepted the setting.
+    expect(screen.getByRole('button',{name:/^high$/i})).toBeDefined();
+    for(const effort of ['max','xhigh','medium'] as const) {
+      view.rerender(<SessionControls ws={ws as any} serverId="shared-server" activeSession={{...session,effort}} quickData={makeQuickData() as any} />);
+      expect(screen.getByRole('button',{name:new RegExp(`^${effort}$`,'i')})).toBeDefined();
+      expect(screen.queryByRole('button',{name:/^high$/i})).toBeNull();
+    }
+  });
+
   it('renders the selected Codex model effort metadata, including Max and Ultra', async () => {
     const ws = makeWs();
     const view = render(

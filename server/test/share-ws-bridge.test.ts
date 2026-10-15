@@ -720,6 +720,7 @@ describe('WsBridge share-scoped sockets', () => {
             primary: { usedPercent: 55, windowDurationMins: 10_080, resetsAt: 1_790_419_157 },
           },
           codexCreditsBalance: '99.00',
+          effort: 'max',
         },
         { name: 'deck_other_brain', runtimeType: 'transport' },
       ],
@@ -744,6 +745,7 @@ describe('WsBridge share-scoped sockets', () => {
       runtimeType: 'transport',
       projectDir: '/owner/project',
       activeDispatchId: null,
+      effort: 'max',
       supervisionMode: 'supervised_audit',
       supervisionHeartbeat: {
         state: 'armed', kind: 'audit', nextHeartbeatAt: 2_000, updatedAt: 1_000,
@@ -755,6 +757,14 @@ describe('WsBridge share-scoped sockets', () => {
     }]);
     expect((participantList?.sessions as Array<Record<string, unknown>>)[0]).not.toHaveProperty('codexCreditsBalance');
     expect((sharedList?.sessions as Array<Record<string, unknown>>)[0]).not.toHaveProperty('transportConfig');
+    for (const effort of ['xhigh', 'medium', 'max']) {
+      daemon.emit('message', JSON.stringify({ type:'session_list', sessions:[{name:'deck_proj_brain',agentType:'codex-sdk',effort}] }));
+      await flushAsync();
+      const latest = reconnectedParticipant.sentJson.filter(msg=>msg.type==='session_list').at(-1);
+      expect((latest?.sessions as Array<Record<string,unknown>>)[0].effort).toBe(effort);
+      const viewer = shared.sentJson.filter(msg=>msg.type==='session_list').at(-1);
+      expect((viewer?.sessions as Array<Record<string,unknown>>)[0]).not.toHaveProperty('effort');
+    }
   });
 
   it('projects only supervision mode for a covered shared sub-session event', () => {
@@ -848,6 +858,7 @@ describe('WsBridge share-scoped sockets', () => {
       parentSession: 'deck_proj_brain',
       sessionType: 'codex-sdk',
       state: 'idle',
+      effort: 'xhigh',
       quotaLabel: '7d 55% 5d05h 9/26 18:39',
       quotaMeta: {
         primary: { usedPercent: 55, windowDurationMins: 10_080, resetsAt: 1_790_419_157 },
@@ -860,6 +871,7 @@ describe('WsBridge share-scoped sockets', () => {
 
     expect(participant.sentJson.find((msg) => msg.type === 'subsession.created')).toMatchObject({
       sessionName: 'deck_sub_child',
+      effort: 'xhigh',
       quotaLabel: '7d 55% 5d05h 9/26 18:39',
       supervisionMode: 'supervised_audit',
       supervisionHeartbeat: { state: 'armed', kind: 'audit', nextHeartbeatAt: 12_000, updatedAt: 2_000 },
