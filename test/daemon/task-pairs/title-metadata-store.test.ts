@@ -26,6 +26,23 @@ describe('atomic title/brief metadata patches across SQLite connections', () => 
     expect(saved.state).toMatchObject({ title: 'Concurrent title', titleAccess: grant, brief: 'new brief', status: 'working', round: 1 });
     expect(b.getPair('project', initial.taskId)?.state).toEqual(saved.state);
   });
+  it('preserves current grants even when an asynchronous lifecycle/workspace writer saves a stale full state', () => {
+    const { a, b } = setup();
+    const stale = a.getPair('project', initial.taskId)!.state;
+    b.patchPairMetadata('project', initial.taskId, 'brain', { titleAccess: grant }, 2);
+    const saved = a.savePair('project', { ...stale, executor: 'replacement', updatedAt: 3 });
+    expect(saved.state.titleAccess).toEqual(grant);
+    expect(b.getPair('project', initial.taskId)!.state.titleAccess).toEqual(grant);
+    expect(a.savePair('project', { ...saved.state, titleAccess: { ...grant, userIds: ['forged'] } }).state.titleAccess).toEqual(grant);
+  });
+  it.each(['unknown-format', 42, ['future-format']])('keeps unknown stored grant shapes private without blocking lifecycle updates: %j', (value) => {
+    const { a } = setup();
+    const taskId = 'tsk_unknown_title_access';
+    a.savePair('project', { ...initial, taskId, titleAccess: value as unknown as TaskPairTitleAccess });
+    const saved = a.savePair('project', { ...initial, taskId, status: 'done', updatedAt: 3 });
+    expect(saved.state.status).toBe('done');
+    expect(saved.state.titleAccess).toEqual(value);
+  });
   it('CAS refuses stale audiences without changing title/brief, and a re-merged grant preserves both writers', () => {
     const { a, b } = setup();
     a.patchPairMetadata('project', initial.taskId, 'brain', { titleAccess: grant }, 2);

@@ -226,7 +226,8 @@ describe('task-authorized participant titles', () => {
       sendDeps: { listSessions: () => SESSIONS },
       pairTitleTurn: async () => {
         const now = getTaskPairStore().getPair(PROJECT, 'own-task')!;
-        getTaskPairStore().savePair(PROJECT, { ...now.state, title: 'Concurrent title', brief: '- [ ][ ] latest check', titleAccess: { version: 1, serverId: 'srv', userIds: ['alice', 'bob'] }, ...(operation === 'reassign' ? { executor: 'replacement' } : {}) });
+        getTaskPairStore().savePair(PROJECT, { ...now.state, ...(operation === 'reassign' ? { executor: 'replacement' } : {}) });
+        getTaskPairStore().patchPairMetadata(PROJECT, now.state.taskId, BRAIN, { title: 'Concurrent title', brief: '- [ ][ ] latest check', titleAccess: { version: 1, serverId: 'srv', userIds: ['alice', 'bob'] } }, Date.now(), now.state.titleAccess);
         return { participantView: true, actor: { ...actor, sessionName: EXEC } };
       },
     });

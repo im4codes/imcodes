@@ -577,24 +577,32 @@ export class TaskPairStore {
     const liveness = options.liveness ?? existing?.liveness ?? emptyLiveness(state.updatedAt);
     const queueOrder = existing?.queueOrder ?? this.#nextQueueOrder();
     const legacyTaskId = options.legacyTaskId ?? existing?.legacyTaskId;
-    this.#db.prepare(`
+    const saved = this.#db.prepare(`
       INSERT INTO task_pairs (project, task_id, status, brain, executor, auditor, queue_order, legacy_task_id, state_json, liveness_json, updated_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT (project, task_id) DO UPDATE SET
         status = excluded.status, brain = excluded.brain, executor = excluded.executor, auditor = excluded.auditor,
-        legacy_task_id = excluded.legacy_task_id, state_json = excluded.state_json,
+        legacy_task_id = excluded.legacy_task_id,
+        -- Audience grants belong to the explicit metadata patch, not stale full-state copies (workspace/role/lifecycle writers).
+        state_json = CASE WHEN json_type(task_pairs.state_json, '$.${TASK_PAIR_TITLE_ACCESS_FIELD}') IS NOT NULL
+          THEN json_set(excluded.state_json, '$.${TASK_PAIR_TITLE_ACCESS_FIELD}', json_extract(task_pairs.state_json, '$.${TASK_PAIR_TITLE_ACCESS_FIELD}'))
+          ELSE json_remove(excluded.state_json, '$.${TASK_PAIR_TITLE_ACCESS_FIELD}') END,
         liveness_json = excluded.liveness_json, updated_at = excluded.updated_at
-    `).run(
+      RETURNING json_quote(json_extract(state_json, '$.${TASK_PAIR_TITLE_ACCESS_FIELD}')) AS title_access_json
+    `).get(
       project, state.taskId, state.status, state.brain, state.executor ?? null, state.auditor ?? null,
       queueOrder, legacyTaskId ?? null, JSON.stringify(state), JSON.stringify(liveness), state.updatedAt,
-    );
+    ) as { title_access_json: string | null };
+    const savedState = { ...state };
+    if (saved.title_access_json === null || saved.title_access_json === 'null') delete savedState.titleAccess;
+    else savedState.titleAccess = JSON.parse(saved.title_access_json) as TaskPairTitleAccess;
     this.#pendingLiveness.delete(pairKey(project, state.taskId));
     this.#livenessDbWriteAt.delete(pairKey(project, state.taskId));
     this.#refreshIndexEntry(project, state.taskId);
     for (const listener of this.#listeners) {
       try { listener(project, state.taskId); } catch { /* observers never break a write */ }
     }
-    return { project, state, liveness, queueOrder, ...(legacyTaskId ? { legacyTaskId } : {}) };
+    return { project, state: savedState, liveness, queueOrder, ...(legacyTaskId ? { legacyTaskId } : {}) };
   }
 
   /** Atomic metadata patch: never replace lifecycle, liveness or another MCP writer's unrelated fields. */
