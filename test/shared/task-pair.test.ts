@@ -876,3 +876,16 @@ describe('hasTaskPairNeedsDecisionMarker', () => {
     expect(hasTaskPairNeedsDecisionMarker('plain reply, no marker')).toBe(false);
   });
 });
+
+
+describe('history-based child supervision contract', () => {
+  it('teaches scoped, on-demand progress reads without waking or inferring completion', () => {
+    const contract = buildTaskPairMarkerContract();
+    expect(contract).toContain('session_history({sessionId:');
+    expect(contract).toContain('same main-session tree');
+    expect(contract).toContain('kind:"tool"');
+    expect(contract).toContain('without waking it');
+    expect(contract).toContain('silence or a last invocation does not prove completion');
+    expect(contract).toContain('not heartbeat polling');
+  });
+});

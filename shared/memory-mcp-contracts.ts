@@ -930,8 +930,8 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
   },
   [MEMORY_MCP_TOOL_NAMES.SESSION_TEXT_HISTORY]: {
     name: MEMORY_MCP_TOOL_NAMES.SESSION_TEXT_HISTORY,
-    description: 'Read current-session latest N texts (default, oldest first) or summaries (newest first). No tools/system prompts; secrets redacted, truncation marked. Recover provider-switch context.',
-    inputSchema: objectSchema({ kind: { type: 'string', enum: [...SESSION_HISTORY_KINDS] }, limit: { type: 'integer', minimum: 1, maximum: SESSION_TEXT_HISTORY_MAX_LIMIT, description: `Default ${SESSION_TEXT_HISTORY_DEFAULT_LIMIT}.` } }),
+    description: 'Read local texts, summaries or calls/results. sessionId: exact name/instance/provider ID; defaults to current. Same main-session tree only, siblings included. Raw stored content; truncation marked.',
+    inputSchema: objectSchema({ sessionId: stringSchema('Exact local session ID; omit for current.'), kind: { type: 'string', enum: [...SESSION_HISTORY_KINDS], description: 'text (default), summary, or tool (call/result JSON).' }, limit: { type: 'integer', minimum: 1, maximum: SESSION_TEXT_HISTORY_MAX_LIMIT, description: `Default ${SESSION_TEXT_HISTORY_DEFAULT_LIMIT}.` } }),
     outputSchema: statusSchema,
   },
   [MEMORY_MCP_TOOL_NAMES.SESSION_RUNTIME_IDENTITY_GET]: {

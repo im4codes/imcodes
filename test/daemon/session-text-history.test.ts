@@ -5,7 +5,7 @@ import { createMemoryMcpServer } from '../../src/daemon/memory-mcp-server.js';
 import { MCP_TOOL_DISCOVERY_NAME } from '../../shared/mcp-tool-discovery.js';
 import { mcpToolPayload } from '../helpers/mcp-tool-result.js';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { readSessionTextMessages, readSessionSummaries } from '../../src/daemon/session-history.js';
+import { readSessionTextMessages, readSessionSummaries, readSessionToolEvents, resolveHistorySession, canReadSessionHistory } from '../../src/daemon/session-history.js';
 import { timelineStore } from '../../src/daemon/timeline-store.js';
 import { createMemoryMcpToolHandlers } from '../../src/daemon/memory-mcp-tools.js';
 import { MEMORY_MCP_TOOL_NAMES as N } from '../../shared/memory-mcp-contracts.js';
@@ -99,5 +99,88 @@ describe('recent current-session summaries', () => {
       const result = await client.callTool({ name: N.SESSION_TEXT_HISTORY, arguments: { target: 'other', limit: 1 } });
       expect(result.isError).toBe(true);
     } finally { await client.close(); await server.close(); }
+  });
+});
+
+
+describe('explicit local session history within one main-session tree', () => {
+  const child = { ...session, name: 'deck_sub_history_a', parentSession: name, sessionInstanceId: 'instance-a', providerResumeId: 'native-a', contextNamespace: { scope: 'personal' as const, userId: 'target-user' } };
+  const sibling = { ...session, name: 'deck_sub_history_b', parentSession: name };
+  const nested = { ...session, name: 'deck_sub_history_nested', parentSession: child.name };
+  // Same project is NOT enough to grant access to another main session.
+  const foreign = { ...session, name: 'deck_other_brain' };
+  const directory = [session, child, sibling, nested, foreign];
+  const deps = { sendDeps: { listSessions: () => directory } };
+  it.each([child.name, 'instance-a', 'native-a'])('reads an exact target %s without redacting stored text', async (sessionId) => {
+    const read = vi.spyOn(timelineStore, 'readCompletedTextTail').mockResolvedValue([event(1, 'password=example-only')]);
+    const result = await createMemoryMcpToolHandlers(caller, deps)[N.SESSION_TEXT_HISTORY]({ sessionId, limit: 100 });
+    expect(result).toMatchObject({ status: 'ok', count: 1, messages: [{ text: 'password=example-only' }] });
+    expect(read).toHaveBeenCalledWith(child.name, 100, { visibleOnly: true });
+  });
+  it('permits main, sibling and nested descendants in both directions', () => {
+    for (const from of directory.slice(0, 4)) for (const to of directory.slice(0, 4)) {
+      expect(canReadSessionHistory(from.name, to.name, directory)).toBe(true);
+    }
+    for (const from of directory.slice(0, 4)) {
+      expect(canReadSessionHistory(from.name, foreign.name, directory)).toBe(false);
+      expect(canReadSessionHistory(foreign.name, from.name, directory)).toBe(false);
+    }
+  });
+  it('rejects cross-main reads for every kind before touching stores', async () => {
+    const text = vi.spyOn(timelineStore, 'readCompletedTextTail');
+    const tools = vi.spyOn(timelineStore, 'readByTypesPreferred');
+    const summary = vi.spyOn(getContextStoreClient(), 'run');
+    for (const kind of ['text', 'summary', 'tool']) {
+      expect(await createMemoryMcpToolHandlers({ ...caller, sessionName: child.name }, deps)[N.SESSION_TEXT_HISTORY]({ kind, sessionId: foreign.name })).toMatchObject({ status: 'error', reason: 'scope_forbidden' });
+    }
+    expect(text).not.toHaveBeenCalled(); expect(tools).not.toHaveBeenCalled(); expect(summary).not.toHaveBeenCalled();
+  });
+  it('uses the target namespace for raw summaries and lets siblings read each other', async () => {
+    const run = vi.spyOn(getContextStoreClient(), 'run').mockResolvedValue([{ id: 'raw', summary: 'password=example-only', content: { sessionName: child.name }, updatedAt: 10 }]);
+    const result = await createMemoryMcpToolHandlers({ ...caller, sessionName: sibling.name }, deps)[N.SESSION_TEXT_HISTORY]({ kind: 'summary', sessionId: child.name, limit: 1 });
+    expect(result).toMatchObject({ status: 'ok', items: [{ summary: 'password=example-only' }] });
+    expect(run).toHaveBeenCalledWith('listProcessedProjections', [child.contextNamespace, 'recent_summary', { sessionName: child.name, excludeArchived: true, limit: 1 }]);
+  });
+  it('rejects missing, blank, wrong-type and ambiguous IDs without guessing', async () => {
+    const handlers = createMemoryMcpToolHandlers(caller, { sendDeps: { listSessions: () => [...directory, { ...sibling, providerResumeId: 'native-a' }] } });
+    for (const sessionId of ['', '  ', 123, 'missing', 'native-a', '../timeline']) {
+      expect(await handlers[N.SESSION_TEXT_HISTORY]({ sessionId })).toMatchObject({ status: 'error', reason: 'validation_failed' });
+    }
+    expect(await createMemoryMcpToolHandlers({ ...caller, sessionName: null }, deps)[N.SESSION_TEXT_HISTORY]({ sessionId: child.name })).toMatchObject({ status: 'error', reason: 'identity_rejected' });
+  });
+  it('canonical names win over conflicting backend IDs, never display labels', () => {
+    const sameId = { ...sibling, providerSessionId: child.name, label: 'visible-name' };
+    expect(resolveHistorySession([child, sameId], child.name)).toEqual([child]);
+    expect(resolveHistorySession([child, sameId], 'visible-name')).toEqual([]);
+  });
+  it('fails closed for broken/cyclic parent chains, while preserving self reads', () => {
+    const broken = { ...child, parentSession: 'missing' };
+    expect(canReadSessionHistory(broken.name, sibling.name, [session, broken, sibling])).toBe(false);
+    const cycle = [{ ...child, parentSession: sibling.name }, { ...sibling, parentSession: child.name }];
+    expect(canReadSessionHistory(child.name, sibling.name, cycle)).toBe(false);
+    expect(canReadSessionHistory(child.name, child.name, cycle)).toBe(true);
+  });
+  it.each([false, true])('exposes target + tool mode through real MCP schemas (fallback=%s)', async (fallback) => {
+    const read = vi.spyOn(timelineStore, 'readByTypesPreferred').mockResolvedValue([event(1, 'tool raw', 'tool.call', { toolCallId: 'call-1', input: { password: 'example-only' } }), event(2, 'result', 'tool.result', { toolCallId: 'call-1' })]);
+    const server = createMemoryMcpServer({ ...caller, sessionName: sibling.name }, deps);
+    const client = new Client({ name: 'tree-history-test', version: '1' });
+    const [a, b] = InMemoryTransport.createLinkedPair(); await Promise.all([server.connect(b), client.connect(a)]);
+    try {
+      const args = { kind: 'tool', sessionId: child.name, limit: 100 };
+      const result = mcpToolPayload(await client.callTool(fallback
+        ? { name: MCP_TOOL_DISCOVERY_NAME, arguments: { query: N.SESSION_TEXT_HISTORY, fallbackCall: { name: N.SESSION_TEXT_HISTORY, arguments: args } } }
+        : { name: N.SESSION_TEXT_HISTORY, arguments: args }));
+      expect(result).toMatchObject({ status: 'ok', kind: 'tool', count: 2, events: [{ type: 'tool.call', toolCallId: 'call-1' }, { type: 'tool.result', toolCallId: 'call-1' }] });
+      expect(JSON.stringify(result)).toContain('example-only');
+      expect(read).toHaveBeenCalledWith(child.name, ['tool.call', 'tool.result'], { limit: 100 });
+    } finally { await client.close(); await server.close(); }
+  });
+  it('bounds raw tool payloads, preserves correlation and excludes hidden/non-tool events', async () => {
+    vi.spyOn(timelineStore, 'readByTypesPreferred').mockResolvedValue([event(1, 'x'.repeat(140000), 'tool.call', { toolCallId: 'large-call' }), event(2, 'ok', 'tool.result', { toolCallId: 'large-call' }), event(3, 'hidden', 'tool.call', { hidden: true }), event(4, 'text')]);
+    const result = await readSessionToolEvents(child.name, 100);
+    expect(result).toHaveLength(2);
+    expect(result[0]).toMatchObject({ toolCallId: 'large-call', truncated: true });
+    expect(result.reduce((sum, item) => sum + item.payload.length, 0)).toBeLessThanOrEqual(SESSION_TEXT_HISTORY_MAX_CHARS);
+    for (const limit of [0, -1, 201, 1.5]) await expect(readSessionToolEvents(child.name, limit)).rejects.toThrow();
   });
 });
