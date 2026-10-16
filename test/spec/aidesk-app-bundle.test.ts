@@ -57,9 +57,9 @@ describe('aiDesk application bundle', () => {
     const plist = buildAideskInfoPlist({ version: '2026.9.1', minimumSystemVersion: '12.3' });
     expect(plist).toContain(`<string>${MACOS_AIDESK_BUNDLE_ID}</string>`);
     expect(plist).toContain(`<string>${AIDESK_MAIN_EXECUTABLE}</string>`);
-    // The same signed app is now the user's explicit local-management entry;
-    // it must be visible in Dock while running, not hidden as an LSUIElement.
-    expect(plist).not.toContain('<key>LSUIElement</key>');
+    // Helper/probe instances must start hidden, before any Objective-C code
+    // can run. The user-facing role explicitly promotes itself to Regular.
+    expect(plist).toContain('<key>LSUIElement</key>\n  <true/>');
   });
 
   it('advertises the filesystem delegation capability the node looks for (an app without it is an older app)', () => {

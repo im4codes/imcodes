@@ -65,8 +65,10 @@ function sh(file, args, options = {}) {
 /**
  * The Info.plist for the bundle.
  *
- * This bundle is also the user's local management entry, so it intentionally
- * remains a normal Dock application while running. `LSMinimumSystemVersion`
+ * This bundle also runs background commands and helper launchers. Start as an
+ * agent so LaunchServices never briefly adds a Dock icon for each one. The
+ * user-facing role explicitly switches to Regular in aidesk_agent_main.mm,
+ * preserving its Dock entry. `LSMinimumSystemVersion`
  * matches the remote-desktop components' declared floor so one bundle cannot
  * claim support the helpers inside it lack.
  */
@@ -85,6 +87,7 @@ export function buildAideskInfoPlist(input) {
     ['CFBundleExecutable', AIDESK_MAIN_EXECUTABLE],
     ['CFBundleIconFile', AIDESK_ICON_FILE],
     ['CFBundlePackageType', 'APPL'],
+    ['LSUIElement', true],
     ['CFBundleShortVersionString', String(version)],
     ['CFBundleVersion', String(version)],
     ['LSMinimumSystemVersion', String(minimumSystemVersion)],

@@ -45,17 +45,18 @@ describe('aiDesk persistent local affordance', () => {
     expect(source).toContain('LocalIndicatorEdge::kRight');
   });
 
-  it('keeps the signed macOS app in Dock and uses background launch without opening the panel', async () => {
+  it('shows only the user-facing macOS role in Dock, not freshly launched helper/probe instances', async () => {
     const app = await readSourceAsync('native/macos-remote-desktop/aidesk_agent_main.mm');
     const build = await readSourceAsync('scripts/build-aidesk-app.mjs');
     expect(app).toContain('NSApplicationActivationPolicyRegular');
+    expect(app).toMatch(/if \(ui_role\) \{\s*\[NSApplication sharedApplication\];\s*\[NSApp setActivationPolicy:NSApplicationActivationPolicyRegular\];/u);
     expect(app).toContain('--aidesk-background');
     expect(app).toContain('applicationShouldHandleReopen');
     expect(app).toContain('initWithString:@"■"');
     expect(app).toContain('HTTPShouldSetCookies = YES');
     expect(app).toContain('dockTile].badgeLabel');
     expect(app).toContain('LocalIndicatorBadgeText(viewers)');
-    expect(build).not.toContain("['LSUIElement'");
+    expect(build).toContain("['LSUIElement', true]");
   });
 
   it('keeps compact badges, cap and edge-direction arrows shared across platforms', async () => {
