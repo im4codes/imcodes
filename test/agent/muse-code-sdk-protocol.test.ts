@@ -3,6 +3,9 @@ import { Connection, spawnMspConnection, type DuplexTransport } from '@muse-code
 import { MuseCodeSdkProvider } from '../../src/agent/providers/muse-code-sdk.js';
 import type { AgentMessage, MessageDelta } from '../../shared/agent-message.js';
 import type { ProviderError } from '../../src/agent/transport-provider.js';
+import { MEMORY_MCP_ENV_KEYS as E } from '../../shared/memory-mcp-env.js';
+import { IMCODES_MEMORY_MCP_SERVER_NAME } from '../../shared/memory-mcp-server-name.js';
+import { MUSE_SESSION_MCP_CAPABILITY } from '../../shared/muse-mcp.js';
 
 // Keep the real Connection, MuseClient, Session and Turn; only replace process startup.
 vi.mock('@muse-code/sdk', async (original) => ({
@@ -74,7 +77,7 @@ describe('Muse provider over real SDK notification pump', () => {
   beforeEach(async () => {
     host = peer(); completed.length = 0; deltas.length = 0; errors.length = 0;
     vi.mocked(spawnMspConnection).mockReturnValue({ initialize: async () => ({
-      connection: host.connection, initializeResult: { serverInfo: { name: 'scripted-muse', version: '1.4.6' } },
+      connection: host.connection, initializeResult: { serverInfo: { name: 'scripted-muse', version: '1.4.6' }, grantedCapabilities: [MUSE_SESSION_MCP_CAPABILITY] },
     }) } as never);
     provider = new MuseCodeSdkProvider();
     provider.onComplete((_sid, message) => completed.push(message));
@@ -86,6 +89,34 @@ describe('Muse provider over real SDK notification pump', () => {
     // Abnormal EOF settles even an old broken provider's SDK waiter; no orphan test timers.
     await host.connection.close();
     await provider.disconnect();
+  });
+
+  it('sends isolated runtime-bound MCP configuration on concurrent managed session starts through the real SDK facade', async () => {
+    await Promise.all(['a', 'b'].map((id) => provider.createSession({ sessionKey: id, sessionName: `deck_sub_muse_${id}`, sessionInstanceId: `instance-${id}`, runtimeEpoch: `epoch-${id}`, cwd: process.cwd() })));
+    const opens = host.requests.filter((r) => r.method === 'session/start');
+    expect(opens).toHaveLength(2);
+    for (const [i, id] of ['a', 'b'].entries()) {
+      expect(opens[i].params).toMatchObject({ config: { mcpServers: { [IMCODES_MEMORY_MCP_SERVER_NAME]: {
+        transport: 'stdio', env: { [E.SESSION_NAME]: `deck_sub_muse_${id}`, [E.SESSION_INSTANCE_ID]: `instance-${id}`, [E.RUNTIME_EPOCH]: `epoch-${id}` },
+      } } } });
+    }
+  });
+
+  it('rebinds a resumed managed session instead of inheriting the global anonymous MCP server', async () => {
+    await provider.createSession({ sessionName: 'deck_sub_muse_resume', sessionInstanceId: 'same-instance', runtimeEpoch: 'new-epoch', resumeId: 'native-resume', cwd: process.cwd() });
+    expect(host.requests.find((r) => r.method === 'session/resume')?.params).toMatchObject({ sessionId: 'native-resume', config: { mcpServers: { [IMCODES_MEMORY_MCP_SERVER_NAME]: {
+      env: { [E.SESSION_NAME]: 'deck_sub_muse_resume', [E.SESSION_INSTANCE_ID]: 'same-instance', [E.RUNTIME_EPOCH]: 'new-epoch' },
+    } } } });
+  });
+
+  it('refuses managed MCP binding without the native sessionMcp grant', async () => {
+    await provider.disconnect();
+    await host.connection.close();
+    host = peer();
+    vi.mocked(spawnMspConnection).mockReturnValue({ initialize: async () => ({ connection: host.connection, initializeResult: { grantedCapabilities: [] } }) } as never);
+    await provider.connect({ cliPath: process.execPath });
+    await expect(provider.createSession({ sessionName: 'deck_sub_muse_denied', cwd: process.cwd() })).rejects.toMatchObject({ message: expect.stringContaining('did not grant sessionMcp') });
+    expect(host.requests.filter((r) => r.method === 'session/start')).toHaveLength(0);
   });
 
   it('preserves the SDK pump: live text and completion arrive despite quota telemetry', async () => {

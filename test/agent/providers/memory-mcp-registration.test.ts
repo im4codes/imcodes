@@ -1,4 +1,5 @@
 import { readFile } from 'node:fs/promises';
+import { parseMcpRuntimeCallerFromEnv } from '../../../src/daemon/memory-mcp-caller.js';
 import { describe, expect, it } from 'vitest';
 import {
   PROCESS_SESSION_AGENT_TYPES,
@@ -28,6 +29,7 @@ import { getDefaultCodexMcpArgs, getCodexAppServerArgs } from '../../../src/agen
 import {
   getDefaultAcpMcpServers,
   getDefaultMcpServers,
+  withMemoryMcpSessionEnv,
   IMCODES_MEMORY_MCP_ARGS,
   IMCODES_MEMORY_MCP_COMMAND,
   IMCODES_MEMORY_MCP_LAUNCH_ARGS,
@@ -60,6 +62,35 @@ const sessionConfig = {
 };
 
 describe('managed provider MCP registration helpers', () => {
+  it.each([...MEMORY_MCP_PROVIDER_IDS, AGY_SDK_PROVIDER_ID])('retains all identity fields through %s session-state rebuilds without borrowing the parent identity', (providerId) => {
+    const input = { ...sessionConfig, providerId, sessionName: 'deck_alpha_brain', env: { ...sessionConfig.env, [IMCODES_SESSION_ENV]: 'deck_alpha_brain' } };
+    const normalized = withMemoryMcpSessionEnv(input);
+    expect(input.env).not.toHaveProperty(SESSION_RESOURCE_OWNER_ENV.RUNTIME_EPOCH);
+    const rebuilt = getDefaultMcpServers({ sessionKey: 'opaque-native-route', cwd: input.cwd, env: normalized.env })[IMCODES_MEMORY_MCP_SERVER_NAME];
+    const env = rebuilt.env;
+    expect(env[IMCODES_DAEMON_SESSION_NAME_ENV]).toBe(input.sessionName);
+    expect(parseMcpRuntimeCallerFromEnv(env)).toMatchObject({ sessionName: input.sessionName, namespace: input.contextNamespace, serverId: input.serverId, providerId });
+    expect(env[SESSION_RESOURCE_OWNER_ENV.SESSION_INSTANCE_ID]).toBe(input.sessionInstanceId);
+    expect(env[SESSION_RESOURCE_OWNER_ENV.RUNTIME_EPOCH]).toBe(input.runtimeEpoch);
+    expect(env[IMCODES_DAEMON_PROVIDER_ID_ENV]).toBe(providerId);
+    expect(env[IMCODES_DAEMON_SERVER_ID_ENV]).toBe(input.serverId);
+    expect(JSON.parse(env[IMCODES_DAEMON_NAMESPACE_ENV])).toEqual(input.contextNamespace);
+    expect(normalized.env?.IMCODES_SERVER_TOKEN).toBe('server-secret');
+    expect(env.IMCODES_SERVER_TOKEN).toBeUndefined();
+    const [acp] = getDefaultAcpMcpServers({ cwd: input.cwd, env: normalized.env });
+    expect(Object.fromEntries(acp.env.map(({ name, value }) => [name, value]))).toEqual(env);
+  });
+
+  it('explicit current runtime identity replaces stale stored env fields without leaking into another session', () => {
+    const a = withMemoryMcpSessionEnv(sessionConfig);
+    const b = withMemoryMcpSessionEnv({ ...sessionConfig, sessionName: 'deck_beta_worker', sessionInstanceId: 'new-instance', runtimeEpoch: 'new-epoch', env: a.env });
+    expect(b.env?.[IMCODES_DAEMON_SESSION_NAME_ENV]).toBe('deck_beta_worker');
+    expect(b.env?.[IMCODES_SESSION_ENV]).toBe('deck_beta_worker');
+    expect(b.env?.[SESSION_RESOURCE_OWNER_ENV.SESSION_INSTANCE_ID]).toBe('new-instance');
+    expect(b.env?.[SESSION_RESOURCE_OWNER_ENV.RUNTIME_EPOCH]).toBe('new-epoch');
+    expect(a.env?.[IMCODES_DAEMON_SESSION_NAME_ENV]).toBe(sessionConfig.sessionName);
+    expect(a.env?.[SESSION_RESOURCE_OWNER_ENV.RUNTIME_EPOCH]).toBe(sessionConfig.runtimeEpoch);
+  });
   it('pins the exact sixteen managed provider matrix and excludes process/OpenClaw providers', () => {
     expect(MEMORY_MCP_PROVIDER_IDS).toEqual([
       MEMORY_MCP_PROVIDER_ID.CLAUDE_CODE_SDK,

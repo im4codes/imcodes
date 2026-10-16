@@ -9,6 +9,10 @@ import { resetContextStoreClientForTests } from '../../src/store/context-store-w
 import { SESSION_CONTROL_METADATA_COMMAND_FIELD } from '../../shared/session-control-commands.js';
 import { CRON_CONTROL_TRUSTED_SYSTEM_CLAUSE } from '../../shared/cron-types.js';
 import { TASK_PAIR_BRAIN_CONTRACT_ID } from '../../shared/task-pair.js';
+import { MEMORY_MCP_PROVIDER_IDS } from '../../shared/memory-ws.js';
+import { AGY_SDK_PROVIDER_ID } from '../../shared/agy-agent.js';
+import { MEMORY_MCP_ENV_KEYS as E } from '../../shared/memory-mcp-env.js';
+import { IMCODES_SESSION_ENV } from '../../shared/imcodes-send.js';
 
 const timelineEmitterEmitMock = vi.hoisted(() => vi.fn());
 const searchLocalMemorySemanticMock = vi.hoisted(() => vi.fn());
@@ -86,6 +90,30 @@ describe('TransportSessionRuntime memory provenance', () => {
   afterEach(() => {
     resetTransportQueueStoreForTests();
     resetContextStoreClientForTests();
+  });
+
+  it.each([...MEMORY_MCP_PROVIDER_IDS, AGY_SDK_PROVIDER_ID])('binds fresh and restored %s sessions at the common SDK entry point', async (providerId) => {
+    for (const resumeId of [undefined, 'opaque-native-resume']) {
+      const provider = makeProvider();
+      provider.id = providerId;
+      const config = {
+        sessionName: 'deck_sdk_identity_brain', sessionInstanceId: 'instance-test', runtimeEpoch: 'epoch-test',
+        resumeId, serverId: 'server-test', projectName: 'sdk_identity', cwd: process.cwd(),
+        contextNamespace: { scope: 'user_private' as const, userId: 'owner-test', projectId: 'project-test' },
+        env: { SDK_TEST_FLAG: 'preserved' },
+      };
+      const runtime = new TransportSessionRuntime(provider, config.sessionName);
+      try {
+        await runtime.initialize(config);
+        expect(provider.createSession).toHaveBeenCalledWith(expect.objectContaining({ resumeId, env: expect.objectContaining({
+          [IMCODES_SESSION_ENV]: config.sessionName, [E.SESSION_NAME]: config.sessionName,
+          [E.SESSION_INSTANCE_ID]: config.sessionInstanceId, [E.RUNTIME_EPOCH]: config.runtimeEpoch,
+          [E.SERVER_ID]: config.serverId, [E.PROVIDER_ID]: providerId,
+          [E.NAMESPACE]: JSON.stringify(config.contextNamespace), SDK_TEST_FLAG: 'preserved',
+        }) }));
+        expect(config.env).toEqual({ SDK_TEST_FLAG: 'preserved' });
+      } finally { await runtime.kill(); }
+    }
   });
 
   describe('automatic compaction', () => {

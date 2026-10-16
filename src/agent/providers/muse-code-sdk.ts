@@ -73,6 +73,9 @@ import {
 } from '../../../shared/sdk-subagent-status.js';
 import type { ProviderActiveWorkSnapshot, SessionActivityBusyReason } from '../../../shared/session-activity-types.js';
 import logger from '../../util/logger.js';
+import { createMuseSessionMcpScope } from './muse-session-mcp.js';
+import { MUSE_SESSION_MCP_CAPABILITY } from '../../../shared/muse-mcp.js';
+import { IMCODES_MEMORY_MCP_SERVER_NAME } from '../../../shared/memory-mcp-server-name.js';
 import {
   recordMuseQuotaActivity,
   refreshMuseQuotaMetadata,
@@ -381,6 +384,7 @@ export class MuseCodeSdkProvider implements TransportProvider {
 
   private config: ProviderConfig | null = null;
   private client: MuseClient | null = null;
+  private sessionMcpScope: ReturnType<typeof createMuseSessionMcpScope> | null = null;
   private spawned: SpawnedMspConnection | null = null;
   private sessions = new Map<string, MuseSessionState>();
   private mcpRegistration: MuseMcpEnsureResult | null = null;
@@ -451,10 +455,11 @@ export class MuseCodeSdkProvider implements TransportProvider {
 
       this.spawned = await handshake.initialize({
         clientInfo: { name: 'imcodes', version: '1.0.0' },
-        capabilities: { experimentalApi: true },
+        capabilities: { experimentalApi: true, requestedCapabilities: [MUSE_SESSION_MCP_CAPABILITY] },
       });
 
-      this.client = new MuseClient(this.spawned.connection, {
+      this.sessionMcpScope = createMuseSessionMcpScope(this.spawned.connection, this.spawned.initializeResult.grantedCapabilities ?? []);
+      this.client = new MuseClient(this.sessionMcpScope.connection, {
         host: this.spawned,
         durability: readSessionDurability(this.spawned.initializeResult),
       });
@@ -513,6 +518,7 @@ export class MuseCodeSdkProvider implements TransportProvider {
     this.unregisterUsageReader?.();
     this.unregisterUsageReader = null;
     this.spawned = null;
+    this.sessionMcpScope = null;
     this.config = null;
   }
 
@@ -544,9 +550,10 @@ export class MuseCodeSdkProvider implements TransportProvider {
 
     try {
       if (config.resumeId) {
-        session = await this.client.resumeSession({
-          sessionId: config.resumeId,
-        });
+        const resumeId = config.resumeId;
+        session = await this.withSessionMcp(config, () => this.client!.resumeSession({
+          sessionId: resumeId,
+        }));
         if (posture.approvalMode && this.spawned) {
           // `session/resume` has no approvalMode member; select it explicitly.
           await this.spawned.connection
@@ -571,12 +578,12 @@ export class MuseCodeSdkProvider implements TransportProvider {
             });
         }
       } else {
-        session = await this.client.startSession({
+        session = await this.withSessionMcp(config, () => this.client!.startSession({
           workspaceRoot,
           modelId: requestedModel,
           providerId: 'meta',
           ...(posture.approvalMode ? { approvalMode: posture.approvalMode } : {}),
-        });
+        }));
       }
     } catch (err) {
       logger.error({ err, routeId, resumeId: config.resumeId }, 'Failed to open Muse Code session');
@@ -618,6 +625,12 @@ export class MuseCodeSdkProvider implements TransportProvider {
     });
 
     return routeId;
+  }
+
+  private withSessionMcp<T>(config: SessionConfig, operation: () => Promise<T>): Promise<T> {
+    return this.sessionMcpScope
+      ? this.sessionMcpScope.run(config, this.mcpRegistration?.serverName ?? IMCODES_MEMORY_MCP_SERVER_NAME, operation)
+      : operation();
   }
 
   async endSession(sessionId: string): Promise<void> {

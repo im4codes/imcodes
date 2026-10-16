@@ -1,4 +1,5 @@
 import { queuedPairWakeAllowed } from '../daemon/task-pairs/wake-authority.js';
+import { withMemoryMcpSessionEnv } from './providers/getDefaultMcpServers.js';
 import { onConfirmedProviderStop } from './provider-stop-confirmation.js';
 import { transportQueueSnapshotToPayload } from '../../shared/transport-queue-wire.js';
 import { TRANSPORT_STOP_QUEUE_OUTCOMES, TRANSPORT_STOP_QUEUE_TIMEOUT_MS } from '../../shared/transport-queue-types.js';
@@ -2692,6 +2693,7 @@ export class TransportSessionRuntime implements SessionRuntime {
   }
 
   async initialize(config: SessionConfig): Promise<void> {
+    config = withMemoryMcpSessionEnv({ ...config, providerId: this.provider.id });
     this._pendingHandoff = config.pendingHandoff ?? null;
     // When resuming/restoring an existing conversation, mark startup memory
     // injected BEFORE applyContextBootstrap runs so the bootstrap's

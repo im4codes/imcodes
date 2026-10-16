@@ -1,4 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { withMemoryMcpSessionEnv } from '../../src/agent/providers/getDefaultMcpServers.js';
+import { MEMORY_MCP_ENV_KEYS as E } from '../../shared/memory-mcp-env.js';
+import { IMCODES_SESSION_ENV } from '../../shared/imcodes-send.js';
 import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -33,6 +36,7 @@ if (args[0] === 'models') {
   process.exit(0);
 }
 if (args[0] === '--help') { process.stdout.write('Usage of agy:\\n'); process.exit(0); }
+if (process.env.FAKE_AGY_IDENTITY_FILE) fs.appendFileSync(process.env.FAKE_AGY_IDENTITY_FILE, JSON.stringify(Object.fromEntries(${JSON.stringify([IMCODES_SESSION_ENV,E.SESSION_NAME,E.SESSION_INSTANCE_ID,E.RUNTIME_EPOCH,E.PROVIDER_ID])}.map(k => [k, process.env[k]]))) + '\\n');
 const resumeIdx = args.indexOf('--conversation');
 const convId = resumeIdx >= 0 ? args[resumeIdx + 1] : 'conv-' + process.pid;
 const emit = (o) => process.stdout.write(JSON.stringify(o) + '\\n');
@@ -236,6 +240,25 @@ describe('AgySdkProvider (fake agy process)', () => {
     expect(provider.capabilities.streaming).toBe(true);
     expect(provider.capabilities.sessionRestore).toBe(true);
     expect(provider.capabilities.approval).toBe(false);
+  });
+
+  it('passes isolated runtime identity to actual Antigravity child processes for new and resumed sessions', async () => {
+    const output = path.join(dir, 'identity.jsonl');
+    for (const id of ['fresh', 'resume']) {
+      const sid = await provider.createSession(withMemoryMcpSessionEnv({
+        sessionKey: id, sessionName: `deck_sub_agy_${id}`, sessionInstanceId: `instance-${id}`, runtimeEpoch: `epoch-${id}`,
+        providerId: provider.id, cwd: dir, resumeId: id === 'resume' ? 'persisted-identity-test' : undefined,
+        env: { FAKE_AGY_IDENTITY_FILE: output },
+      }));
+      await provider.send(sid, 'hello');
+    }
+    await waitFor(() => completes.length === 2);
+    const actual = readFileSync(output, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+    expect(actual).toHaveLength(2);
+    for (const [i, id] of ['fresh', 'resume'].entries()) expect(actual[i]).toEqual({
+      [IMCODES_SESSION_ENV]: `deck_sub_agy_${id}`, [E.SESSION_NAME]: `deck_sub_agy_${id}`,
+      [E.SESSION_INSTANCE_ID]: `instance-${id}`, [E.RUNTIME_EPOCH]: `epoch-${id}`, [E.PROVIDER_ID]: provider.id,
+    });
   });
 
   it('reports memory MCP status ready or degraded', () => {

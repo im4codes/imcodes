@@ -12,6 +12,7 @@ import {
   IMCODES_DAEMON_SOURCE_SESSION_NAME_ENV,
   IMCODES_DAEMON_USER_ID_ENV,
   IMCODES_MCP_TOOL_CATALOG_MODE_ENV,
+  MEMORY_MCP_IDENTITY_ENV_KEYS,
 } from '../../../shared/memory-mcp-env.js';
 import { SESSION_RESOURCE_OWNER_ENV } from '../../../shared/session-resource-lifecycle.js';
 import { IMCODES_MEMORY_MCP_SERVER_NAME } from '../../../shared/memory-mcp-server-name.js';
@@ -134,7 +135,8 @@ function projectNameFromSessionName(sessionName: string | undefined): string | u
  * under a different namespace and redeemed to nothing.
  */
 function namespaceForMcp(config: SessionConfig): SessionConfig['contextNamespace'] {
-  const namespace = config.contextNamespace ?? undefined;
+  const serialized = stringValue(config.env?.[IMCODES_DAEMON_NAMESPACE_ENV]);
+  const namespace = config.contextNamespace ?? (serialized ? JSON.parse(serialized) as SessionConfig['contextNamespace'] : undefined);
   if (!namespace) return undefined;
   return normalizeDaemonLocalMemoryNamespace(namespace);
 }
@@ -142,19 +144,29 @@ function namespaceForMcp(config: SessionConfig): SessionConfig['contextNamespace
 function buildIdentityEnv(config: SessionConfig): Record<string, string> {
   const namespace = namespaceForMcp(config);
   const sessionName = stringValue(config.sessionName)
-    ?? stringValue(config.env?.[IMCODES_SESSION_ENV]);
+    ?? stringValue(config.env?.[IMCODES_SESSION_ENV])
+    ?? stringValue(config.env?.[IMCODES_DAEMON_SESSION_NAME_ENV]);
   return buildMemoryMcpServerEnv({
-    [IMCODES_DAEMON_USER_ID_ENV]: namespace?.userId ?? DAEMON_LOCAL_MEMORY_USER_ID,
+    [IMCODES_DAEMON_USER_ID_ENV]: namespace?.userId ?? stringValue(config.env?.[IMCODES_DAEMON_USER_ID_ENV]) ?? DAEMON_LOCAL_MEMORY_USER_ID,
     [IMCODES_DAEMON_NAMESPACE_ENV]: namespace ? JSON.stringify(namespace) : undefined,
     [IMCODES_DAEMON_SESSION_NAME_ENV]: sessionName,
     [IMCODES_DAEMON_SOURCE_SESSION_NAME_ENV]: stringValue(config.env?.[IMCODES_DAEMON_SOURCE_SESSION_NAME_ENV]),
-    [IMCODES_DAEMON_PROJECT_NAME_ENV]: stringValue(config.projectName) ?? projectNameFromSessionName(sessionName),
+    [IMCODES_DAEMON_PROJECT_NAME_ENV]: stringValue(config.projectName) ?? stringValue(config.env?.[IMCODES_DAEMON_PROJECT_NAME_ENV]) ?? projectNameFromSessionName(sessionName),
     [IMCODES_DAEMON_PROJECT_ROOT_ENV]: stringValue(config.cwd),
-    [IMCODES_DAEMON_SERVER_ID_ENV]: stringValue(config.serverId),
-    [IMCODES_DAEMON_PROVIDER_ID_ENV]: stringValue(config.providerId),
-    [SESSION_RESOURCE_OWNER_ENV.SESSION_INSTANCE_ID]: stringValue(config.sessionInstanceId),
-    [SESSION_RESOURCE_OWNER_ENV.RUNTIME_EPOCH]: stringValue(config.runtimeEpoch),
+    [IMCODES_DAEMON_SERVER_ID_ENV]: stringValue(config.serverId) ?? stringValue(config.env?.[IMCODES_DAEMON_SERVER_ID_ENV]),
+    [IMCODES_DAEMON_PROVIDER_ID_ENV]: stringValue(config.providerId) ?? stringValue(config.env?.[IMCODES_DAEMON_PROVIDER_ID_ENV]),
+    [SESSION_RESOURCE_OWNER_ENV.SESSION_INSTANCE_ID]: stringValue(config.sessionInstanceId) ?? stringValue(config.env?.[SESSION_RESOURCE_OWNER_ENV.SESSION_INSTANCE_ID]),
+    [SESSION_RESOURCE_OWNER_ENV.RUNTIME_EPOCH]: stringValue(config.runtimeEpoch) ?? stringValue(config.env?.[SESSION_RESOURCE_OWNER_ENV.RUNTIME_EPOCH]),
   });
+}
+
+/** Carry the daemon-owned binding through every provider's per-session state. */
+export function withMemoryMcpSessionEnv(config: SessionConfig): SessionConfig {
+  if (!stringValue(config.sessionName) && !stringValue(config.env?.[IMCODES_SESSION_ENV])) return config;
+  const env = getDefaultMcpServers(config)[IMCODES_MEMORY_MCP_SERVER_NAME].env;
+  const identity = Object.fromEntries(Object.entries(env).filter(([key]) =>
+    (MEMORY_MCP_IDENTITY_ENV_KEYS as readonly string[]).includes(key) || key === IMCODES_MCP_TOOL_CATALOG_MODE_ENV));
+  return { ...config, env: { ...config.env, ...identity, [IMCODES_SESSION_ENV]: env[IMCODES_DAEMON_SESSION_NAME_ENV] } };
 }
 
 export function getDefaultMcpServers(

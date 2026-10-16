@@ -1,4 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
+import { withMemoryMcpSessionEnv } from '../../src/agent/providers/getDefaultMcpServers.js';
+import { MEMORY_MCP_ENV_KEYS as E } from '../../shared/memory-mcp-env.js';
 import {
   AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES,
   AGENT_DELEGATION_NOTIFICATION_RESULTS,
@@ -355,25 +357,27 @@ describe('GrokSdkProvider contract', () => {
     expect(result.models).toEqual([{ id: 'grok-build', name: 'Grok Build' }]);
   });
 
-  it('registers managed MCP identity only on a real user session', async () => {
+  it.each([undefined, 'native-resume'])('registers the complete managed MCP binding on a real Grok session (resume=%s)', async (resumeId) => {
     const provider = new GrokSdkProvider();
     const connection = {
       newSession: vi.fn().mockResolvedValue({ sessionId: 'real-session' }),
+      loadSession: vi.fn().mockResolvedValue({}),
     };
     (provider as any).connection = connection;
     (provider as any).initPromise = Promise.resolve();
-    await provider.createSession({
+    await provider.createSession(withMemoryMcpSessionEnv({
       sessionKey: 'route-real',
+      sessionInstanceId: 'instance-grok', runtimeEpoch: 'epoch-grok', providerId: provider.id, resumeId,
       sessionName: 'deck_sub_grok',
       projectName: 'alpha',
       serverId: 'server-1',
       cwd: '/tmp/project',
       contextNamespace: { scope: 'project_shared', userId: 'user-1', projectId: 'alpha' },
-    });
+    }));
     const state = (provider as any).sessions.get('route-real');
     await (provider as any).ensureSessionReady('route-real', state);
 
-    const request = connection.newSession.mock.calls[0]?.[0];
+    const request = (resumeId ? connection.loadSession : connection.newSession).mock.calls[0]?.[0];
     expect(request.mcpServers).toHaveLength(1);
     expect(request.mcpServers[0]).toMatchObject({ name: 'imcodes-memory' });
     const env = Object.fromEntries(request.mcpServers[0].env.map((entry: { name: string; value: string }) => [entry.name, entry.value]));
@@ -381,6 +385,7 @@ describe('GrokSdkProvider contract', () => {
       IMCODES_DAEMON_SESSION_NAME: 'deck_sub_grok',
       IMCODES_DAEMON_PROJECT_NAME: 'alpha',
       IMCODES_DAEMON_SERVER_ID: 'server-1',
+      [E.SESSION_INSTANCE_ID]: 'instance-grok', [E.RUNTIME_EPOCH]: 'epoch-grok', [E.PROVIDER_ID]: provider.id,
     });
     expect(JSON.stringify(request.mcpServers)).not.toContain('IMCODES_SERVER_TOKEN');
   });

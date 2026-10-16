@@ -297,7 +297,7 @@ export async function ensureMuseMcpConfigHasImcodesEntry(options: MuseMcpEnsureO
       `Added Muse Code MCP entry "${serverName}" to ${configPath}.`,
       `Remove it by deleting mcpServers.${serverName} from that file.`,
       backupPath ? `Restore the previous file from ${backupPath}.` : 'No previous file existed, so no backup was needed.',
-      'IM.codes supplies MCP identity through the daemon-spawned muse process environment for each managed session.',
+      'IM.codes supplies MCP identity through session-scoped MSP configuration for each managed session.',
     ].join(' ');
     await writeNoticeOnce(options.noticeMarkerPath ?? noticeMarker(), message);
     return {
