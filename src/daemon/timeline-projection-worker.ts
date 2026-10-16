@@ -1,3 +1,4 @@
+import type { TimelineTextTailOptions } from './timeline-projection-types.js';
 import { parentPort, workerData } from 'node:worker_threads';
 import { createRequire } from 'node:module';
 import { mkdirSync, statSync, existsSync, readFileSync, openSync, readSync, closeSync } from 'node:fs';
@@ -527,13 +528,19 @@ async function handleQueryLatest(sessionId: string): Promise<{ epoch: number; se
   return { epoch: Number(row.epoch), seq: Number(row.seq) };
 }
 
-async function handleQueryCompletedTextTail(sessionId: string, limit = 50): Promise<{ source: 'sqlite'; events: TimelineEvent[] }> {
+async function handleQueryCompletedTextTail(sessionId: string, limit = 50, options?: TimelineTextTailOptions): Promise<{ source: 'sqlite'; events: TimelineEvent[] }> {
   if (!prepareSqliteRead(sessionId)) return { source: 'sqlite', events: [] };
   const boundedLimit = Math.max(1, Math.min(limit, 500));
+  const boundary = options?.through;
+  const params: Array<string | number> = [sessionId];
+  const through = boundary ? `AND append_ordinal <= COALESCE((SELECT MAX(append_ordinal) FROM timeline_projection_events WHERE session_id = ? AND ts = ? AND epoch = ? AND seq = ?), -1)` : '';
+  if (boundary) params.push(sessionId, boundary.ts, boundary.epoch, boundary.seq);
   const rows = ensureDb().prepare(`
     SELECT *
     FROM timeline_projection_events
     WHERE session_id = ?
+      ${options?.visibleOnly ? 'AND hidden = 0' : ''}
+      ${through}
       AND (
         (type = 'user.message' AND text IS NOT NULL AND trim(text) <> '')
         OR
@@ -541,7 +548,7 @@ async function handleQueryCompletedTextTail(sessionId: string, limit = 50): Prom
       )
     ORDER BY ts DESC, append_ordinal DESC
     LIMIT ?
-  `).all(sessionId, boundedLimit) as Array<Record<string, unknown>>;
+  `).all(...params, boundedLimit) as Array<Record<string, unknown>>;
   return { source: 'sqlite', events: rows.reverse().map(rowToEvent) };
 }
 
@@ -625,7 +632,7 @@ async function handleRequest(message: WorkerRequest): Promise<unknown> {
     case 'queryLatest':
       return handleQueryLatest(message.payload.sessionId);
     case 'queryCompletedTextTail':
-      return handleQueryCompletedTextTail(message.payload.sessionId, message.payload.limit);
+      return handleQueryCompletedTextTail(message.payload.sessionId, message.payload.limit, message.payload.options);
     case 'queryByTypes':
       return handleQueryByTypes(message.payload.sessionId, message.payload.types, message.payload.afterTs, message.payload.afterSeq, message.payload.epoch, message.payload.beforeTs, message.payload.limit);
     case 'rebuildSession': {

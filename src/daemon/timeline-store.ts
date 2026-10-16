@@ -1,3 +1,4 @@
+import type { TimelineTextTailOptions } from './timeline-projection-types.js';
 import { resolveImcodesHome } from '../util/windows-daemon-lock.js';
 /**
  * Timeline event store.
@@ -372,8 +373,8 @@ class TimelineStore {
     return events;
   }
 
-  async readCompletedTextTail(sessionName: string, limit = 50): Promise<TimelineEvent[]> {
-    const events = await timelineProjection.queryCompletedTextTail(sessionName, limit);
+  async readCompletedTextTail(sessionName: string, limit = 50, options?: TimelineTextTailOptions): Promise<TimelineEvent[]> {
+    const events = await timelineProjection.queryCompletedTextTail(sessionName, limit, options);
     if (events === null) throw new TimelinePreferredReadError(TIMELINE_HISTORY_ERROR_REASONS.PROJECTION_UNAVAILABLE);
     return events;
   }

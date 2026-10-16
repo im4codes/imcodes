@@ -1,3 +1,4 @@
+import { SESSION_TEXT_HISTORY_DEFAULT_LIMIT, SESSION_TEXT_HISTORY_MAX_LIMIT, SESSION_HISTORY_KINDS } from './session-history.js';
 import { TASK_PAIR_MAX_DEPENDENCIES, TASK_PAIR_PAUSE_MODES } from './task-pair-suspension.js';
 import { TASK_PAIR_TITLE_ACCESS_MAX_USERS, TASK_PAIR_TITLE_ACCESS_MAX_USER_CHARS } from './task-pair-title-access.js';
 import { MCP_ERROR_REASONS, isRecoverableMcpErrorReason, type MCPErrorReason } from './memory-mcp-errors.js';
@@ -134,6 +135,7 @@ export const MEMORY_MCP_TOOL_NAMES = {
   PAIR_SET_MAX_CONCURRENCY: 'pair_set_max_concurrency',
   PAIR_GET_MAX_CONCURRENCY: 'pair_get_max_concurrency',
   PAIR_WORKSPACE_GC: 'pair_workspace_gc',
+  SESSION_TEXT_HISTORY: 'session_history',
   SESSION_RUNTIME_IDENTITY_GET: 'session_runtime_identity_get',
   SESSION_RESTART: 'session_restart',
   SESSION_CLOSE: 'session_close',
@@ -212,6 +214,7 @@ export const MEMORY_MCP_TOOL_NAME_LIST = [
   MEMORY_MCP_TOOL_NAMES.PAIR_SET_MAX_CONCURRENCY,
   MEMORY_MCP_TOOL_NAMES.PAIR_GET_MAX_CONCURRENCY,
   MEMORY_MCP_TOOL_NAMES.PAIR_WORKSPACE_GC,
+  MEMORY_MCP_TOOL_NAMES.SESSION_TEXT_HISTORY,
   MEMORY_MCP_TOOL_NAMES.SESSION_RUNTIME_IDENTITY_GET,
   MEMORY_MCP_TOOL_NAMES.SESSION_RESTART,
   MEMORY_MCP_TOOL_NAMES.SESSION_CLOSE,
@@ -445,7 +448,7 @@ const statusSchema = objectSchema({
 export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, MemoryMcpToolContract>> = {
   [MEMORY_MCP_TOOL_NAMES.SEARCH_MEMORY]: {
     name: MEMORY_MCP_TOOL_NAMES.SEARCH_MEMORY,
-    description: 'Search caller-bound memory when prior project or user context may matter. Returns compact hits with a typed sourceLookup; use those fields for source expansion when a summary is not enough. Query is text; vectorization is internal.',
+    description: 'Search caller-bound memory by text (internally vectorized). Hits carry typed sourceLookup; use those fields for source expansion when needed.',
     inputSchema: objectSchema({
       query: stringSchema('Required text query to search for. Do not send embeddings, vectors, identity, or namespace fields.'),
       limit: numberSchema(`Optional maximum hit count; defaults to ${MEMORY_MCP_CAPS.SEARCH_MEMORY_DEFAULT_LIMIT} and is clamped to ${MEMORY_MCP_CAPS.SEARCH_MEMORY_MAX_LIMIT}.`, { minimum: 1, maximum: MEMORY_MCP_CAPS.SEARCH_MEMORY_MAX_LIMIT }),
@@ -471,7 +474,7 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
   },
   [MEMORY_MCP_TOOL_NAMES.GET_MEMORY_SOURCES]: {
     name: MEMORY_MCP_TOOL_NAMES.GET_MEMORY_SOURCES,
-    description: 'Fetch source snippets by projection id, observation id, or compact ref, after a memory-search result or startup memory. Missing and cross-namespace ids both return an empty list. An ambiguous ref sets ambiguousRef with empty sources and up to four candidates; candidateCount and truncated say how many exist. That empty sources is not no memory: pick a candidate and cite its own id.',
+    description: 'Expand projection id, observation id or compact ref from search/startup. Missing/cross-namespace: []. ambiguousRef: empty sources plus up to four candidates, candidateCount/truncated; not no memory. Choose a candidate id.',
     inputSchema: objectSchema({
       projectionId: stringSchema('Projection id from a memory-search result sourceLookup. Caller identity and namespace are runtime-bound.'),
       observationId: stringSchema('Observation id from a memory-search result sourceLookup. Caller identity and namespace are runtime-bound.'),
@@ -576,7 +579,7 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
   },
   [MEMORY_MCP_TOOL_NAMES.MEMORY_INJECTION_SET]: {
     name: MEMORY_MCP_TOOL_NAMES.MEMORY_INJECTION_SET,
-    description: 'Turn automatic memory injection (recent project memory / related past work, at session startup and before each message) on or off, project-wide. Brain-only: applies to every session under the project, including the Brain\'s own future restarts and every sub-session — there is nothing separate to set per sub-session. Managed Skills are a separate concept and stay injected either way.',
+    description: 'Brain-only project-wide automatic memory injection toggle (startup/per-message recent memory and related past work). Covers Brain restarts and all sub-sessions; no per-sub-session setting. Managed Skills remain injected.',
     inputSchema: objectSchema({
       enabled: { type: 'boolean', description: 'true to enable (the default), false to disable startup-memory auto-injection for the whole project.' },
     }, ['enabled']),
@@ -596,7 +599,7 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
   },
   [MEMORY_MCP_TOOL_NAMES.SESSION_IDENTITY_SET]: {
     name: MEMORY_MCP_TOOL_NAMES.SESSION_IDENTITY_SET,
-    description: 'Set a deterministic Agent identity contract at user, project, pair, or exact-session scope. Project/user writes require the project Brain, while pair writes allow the task executor, auditor, or Brain. Supply exactly one of content or filePath; session-scoped files may be absolute paths explicitly selected on the daemon host, while user/project files remain project-confined. Only content is synchronized online.',
+    description: 'Set deterministic user/project/pair/session identity. User/project require Brain; pair allows executor/auditor/Brain. Exactly one of content/filePath. Explicit session files may be absolute on the daemon; user/project files stay project-confined. Only content syncs online.',
     inputSchema: objectSchema({
       identityScope: { type: 'string', enum: [...SESSION_IDENTITY_SCOPE_LIST], description: 'user, project, pair, or session.' },
       target: stringSchema('Exact session name or taskId. Omit for the current session.'),
@@ -924,6 +927,12 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
       limit: numberSchema('Pairs examined per call, oldest end first; default 50.'),
     }),
     outputSchema: objectSchema({ status: stringSchema('ok or error.'), dryRun: booleanSchema('Whether nothing was removed.'), entries: { type: 'array', items: { type: 'object' } } }),
+  },
+  [MEMORY_MCP_TOOL_NAMES.SESSION_TEXT_HISTORY]: {
+    name: MEMORY_MCP_TOOL_NAMES.SESSION_TEXT_HISTORY,
+    description: 'Read current-session latest N texts (default, oldest first) or summaries (newest first). No tools/system prompts; secrets redacted, truncation marked. Recover provider-switch context.',
+    inputSchema: objectSchema({ kind: { type: 'string', enum: [...SESSION_HISTORY_KINDS] }, limit: { type: 'integer', minimum: 1, maximum: SESSION_TEXT_HISTORY_MAX_LIMIT, description: `Default ${SESSION_TEXT_HISTORY_DEFAULT_LIMIT}.` } }),
+    outputSchema: statusSchema,
   },
   [MEMORY_MCP_TOOL_NAMES.SESSION_RUNTIME_IDENTITY_GET]: {
     name: MEMORY_MCP_TOOL_NAMES.SESSION_RUNTIME_IDENTITY_GET,

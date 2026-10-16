@@ -1,3 +1,5 @@
+import { readSessionTextMessages, readSessionSummaries } from './session-history.js';
+import { SESSION_TEXT_HISTORY_DEFAULT_LIMIT, SESSION_TEXT_HISTORY_MAX_LIMIT, SESSION_HISTORY_KINDS } from '../../shared/session-history.js';
 import { pausePair, resumePair, initialPairWait, validatePairDependencies } from './task-pairs/suspension.js';
 import { TASK_PAIR_MAX_DEPENDENCIES, TASK_PAIR_PAUSE_MODES } from '../../shared/task-pair-suspension.js';
 import { TASK_PAIR_TITLE_ACCESS_MAX_USERS, TASK_PAIR_TITLE_ACCESS_MAX_USER_CHARS, type TaskPairTitleTurn } from '../../shared/task-pair-title-access.js';
@@ -3775,6 +3777,27 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       });
       return { status: 'ok', dryRun, entries };
     },
+    [MEMORY_MCP_TOOL_NAMES.SESSION_TEXT_HISTORY]: async (input) => {
+      const args = pickAllowedMcpArgs(input, ['kind', 'limit']);
+      if (input && typeof input === 'object' && Object.keys(input).some((key) => key !== 'limit' && key !== 'kind')) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'session_history accepts only kind/limit; the session is runtime-bound');
+      if (!caller.sessionName) return error(MCP_ERROR_REASONS.IDENTITY_REJECTED, 'bound caller session is unavailable');
+      const session = (await sendSessions()).find((candidate) => candidate.name === caller.sessionName);
+      if (!session) return error(MCP_ERROR_REASONS.IDENTITY_REJECTED, 'bound caller session is unavailable');
+      const limit = args.limit ?? SESSION_TEXT_HISTORY_DEFAULT_LIMIT;
+      if (typeof limit !== 'number' || !Number.isInteger(limit) || limit < 1 || limit > SESSION_TEXT_HISTORY_MAX_LIMIT) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, `limit must be 1..${SESSION_TEXT_HISTORY_MAX_LIMIT}`);
+      const kind = args.kind ?? SESSION_HISTORY_KINDS[0];
+      if (!(SESSION_HISTORY_KINDS as readonly unknown[]).includes(kind)) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'kind must be text or summary');
+      try {
+        if (kind === 'summary') {
+          const gate = memorySurfaceGate(deps, { items: [] });
+          if (gate) return gate;
+          const items = await readSessionSummaries(session.name, memoryCaller().namespace, limit);
+          return { status: 'ok', kind, requested: limit, count: items.length, items };
+        }
+        const messages = await readSessionTextMessages(session.name, limit);
+        return { status: 'ok', kind, requested: limit, count: messages.length, messages };
+      } catch { return error(MCP_ERROR_REASONS.CONTROL_PLANE_UNAVAILABLE, 'session history is temporarily unavailable; retry, do not infer empty history'); }
+    },
     [MEMORY_MCP_TOOL_NAMES.SESSION_RUNTIME_IDENTITY_GET]: async (input) => {
       if (input && typeof input === 'object' && !Array.isArray(input) && Object.keys(input as Record<string, unknown>).length > 0) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'session_runtime_identity_get takes no arguments');
       if (!caller.sessionName) return error(MCP_ERROR_REASONS.IDENTITY_REJECTED, 'bound caller session is unavailable');
@@ -5117,6 +5140,7 @@ const schemas = {
     minAgeHours: z.number().min(0).optional(),
     limit: z.number().int().min(1).max(200).optional(),
   }).strict(),
+  [MEMORY_MCP_TOOL_NAMES.SESSION_TEXT_HISTORY]: z.object({ kind: z.enum(SESSION_HISTORY_KINDS).optional(), limit: z.number().int().min(1).max(SESSION_TEXT_HISTORY_MAX_LIMIT).default(SESSION_TEXT_HISTORY_DEFAULT_LIMIT).optional() }).strict(),
   [MEMORY_MCP_TOOL_NAMES.SESSION_RUNTIME_IDENTITY_GET]: z.object({}).strict(),
   [MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE]: z.object({
     target: z.string().optional().describe('Exact target; omit only for autoProvision.'),

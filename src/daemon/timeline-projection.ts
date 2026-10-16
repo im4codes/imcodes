@@ -12,6 +12,7 @@ import type {
   ProjectionWorkerRequestType,
   ProjectionWorkerResponse,
   TimelineProjectionQuery,
+  TimelineTextTailOptions,
 } from './timeline-projection-types.js';
 
 export type TimelineProjectionQueryOpts = Omit<TimelineProjectionQuery, 'sessionId' | 'types'>;
@@ -212,9 +213,9 @@ class TimelineProjectionClient {
     return this.queryLatest(sessionId);
   }
 
-  async queryCompletedTextTail(sessionId: string, limit = 50): Promise<TimelineEvent[] | null> {
+  async queryCompletedTextTail(sessionId: string, limit = 50, options?: TimelineTextTailOptions): Promise<TimelineEvent[] | null> {
     try {
-      const result = await this.request<{ source: 'sqlite'; events: TimelineEvent[] }, 'queryCompletedTextTail'>('queryCompletedTextTail', { sessionId, limit }, DEFAULT_QUERY_TIMEOUT_MS);
+      const result = await this.request<{ source: 'sqlite'; events: TimelineEvent[] }, 'queryCompletedTextTail'>('queryCompletedTextTail', { sessionId, limit, ...(options ? { options } : {}) }, DEFAULT_QUERY_TIMEOUT_MS);
       return result.events;
     } catch (err) {
       logger.debug({ err, sessionId }, 'TimelineProjection: queryCompletedTextTail unavailable');

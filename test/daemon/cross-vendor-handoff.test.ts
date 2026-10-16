@@ -70,13 +70,13 @@ describe('cross-vendor handoff contract', () => {
     expect(sourceConversationKey({ agentType: 'qoder-sdk', providerSessionId: 'qoder-native' })).toBe('qoder-native');
   });
 
-  it('builds a redacted, hard-bounded pack and keeps tool previews opt-in', async () => {
-    vi.spyOn(timelineStore, 'readPreferred').mockResolvedValue([
+  it('builds a redacted, hard-bounded text-only pack even with legacy tool-preview settings', async () => {
+    vi.spyOn(timelineStore, 'readCompletedTextTail').mockResolvedValue([
       event('user.message', { text: 'Bearer abcdefghijklmnopqrst secret request' }, 1, 10),
       event('assistant.text', { text: 'A'.repeat(20_000), streaming: false }, 2, 11),
       event('tool.call', { tool: 'shell', status: 'complete', output: 'password=hunter2' }, 3, 12),
     ]);
-    const pack = await buildCrossVendorHandoffPack(record('claude-code-sdk'), { epoch: 7, seq: 3, ts: 20 }, 'codex-sdk', 'transport', { maxTokens: 40, includeToolPreviews: false });
+    const pack = await buildCrossVendorHandoffPack(record('claude-code-sdk'), { epoch: 7, seq: 3, ts: 20 }, 'codex-sdk', 'transport', { maxTokens: 40, includeToolPreviews: true });
     expect(pack).toBeDefined();
     expect(pack!.tokenCount).toBeLessThanOrEqual(40);
     expect(pack!.text).toContain('Non-authoritative prior context');
@@ -85,22 +85,22 @@ describe('cross-vendor handoff contract', () => {
     expect(pack!.text).not.toContain('password=');
   });
 
-  it('requests only the switch-back delta after the target provider cutoff', async () => {
-    const read = vi.spyOn(timelineStore, 'readPreferred').mockResolvedValue([
+  it('reads the inclusive frozen text tail even on a switch back', async () => {
+    const read = vi.spyOn(timelineStore, 'readCompletedTextTail').mockResolvedValue([
       event('user.message', { text: 'delta' }, 9, 100),
     ]);
     await buildCrossVendorHandoffPack(record('codex-sdk'), { epoch: 7, seq: 20, ts: 200 }, 'claude-code-sdk', 'transport', undefined, { epoch: 7, seq: 8, ts: 99 });
-    expect(read).toHaveBeenCalledWith('handoff-test', expect.objectContaining({ afterTs: 99, beforeTs: 200 }));
+    expect(read).toHaveBeenCalledWith('handoff-test', 10, { visibleOnly: true, through: { epoch: 7, seq: 20, ts: 200 } });
   });
 
   it('disables generation explicitly and preserves the one-shot configuration bounds', async () => {
-    const read = vi.spyOn(timelineStore, 'readPreferred');
+    const read = vi.spyOn(timelineStore, 'readCompletedTextTail');
     await expect(buildCrossVendorHandoffPack(record('qoder-sdk'), { epoch: 1, seq: 1, ts: 1 }, 'claude-code-sdk', 'transport', { enabled: false })).resolves.toBeUndefined();
     expect(read).not.toHaveBeenCalled();
     expect(normalizeCrossVendorHandoffConfig({ maxTokens: 6_001 }).maxTokens).toBe(6_000);
   });
   it('degrades to no handoff when the projection is busy or unavailable', async () => {
-    vi.spyOn(timelineStore, 'readPreferred').mockRejectedValue(new Error('projection busy'));
+    vi.spyOn(timelineStore, 'readCompletedTextTail').mockRejectedValue(new Error('projection busy'));
     await expect(buildCrossVendorHandoffPack(record('claude-code-sdk'), { epoch: 1, seq: 1, ts: 1 }, 'codex-sdk', 'transport')).resolves.toBeUndefined();
   });
 
@@ -127,4 +127,22 @@ describe('cross-vendor handoff contract', () => {
     expect(Date.now() - started).toBeLessThan(250);
   });
 
+});
+
+
+describe('reported lost provider-switch context counterexamples', () => {
+  it('includes the user message that is itself the frozen cutoff', async () => {
+    const rows = [event('user.message', { text: 'REMEMBER_SWITCH_GOAL_7B' }, 1, 100)];
+    vi.spyOn(timelineStore, 'readCompletedTextTail').mockImplementation(async (_name, limit, options) => rows.filter((e) => (e.type === 'user.message' || (e.type === 'assistant.text' && e.payload.streaming !== true)) && (!options?.through || e.seq <= options.through.seq)).slice(-(limit ?? 50)));
+    const pack = await buildCrossVendorHandoffPack(record('codex-sdk'), { epoch: 7, seq: 1, ts: 100 }, 'agy-sdk', 'transport');
+    expect(pack?.text).toContain('REMEMBER_SWITCH_GOAL_7B');
+  });
+  it('does not let tool events crowd completed conversation out of the handoff', async () => {
+    const rows = [event('user.message', { text: 'CURRENT_GOAL_8C' }, 1, 1), event('assistant.text', { text: 'CONFIRMED_DECISION_8C', streaming: false }, 2, 2),
+      ...Array.from({ length: 200 }, (_, i) => event('tool.result', { tool: 'shell', status: 'complete' }, i + 3, i + 3))];
+    vi.spyOn(timelineStore, 'readCompletedTextTail').mockImplementation(async (_name, limit, options) => rows.filter((e) => (e.type === 'user.message' || (e.type === 'assistant.text' && e.payload.streaming !== true)) && (!options?.through || e.seq <= options.through.seq)).slice(-(limit ?? 50)));
+    const pack = await buildCrossVendorHandoffPack(record('codex-sdk'), { epoch: 7, seq: 202, ts: 202 }, 'agy-sdk', 'transport');
+    expect(pack?.text).toContain('CURRENT_GOAL_8C');
+    expect(pack?.text).toContain('CONFIRMED_DECISION_8C');
+  });
 });

@@ -12,6 +12,12 @@ export interface ProjectionSessionMeta {
   lastRebuiltAt: number | null;
 }
 
+export interface TimelineTextTailOptions {
+  visibleOnly?: boolean;
+  /** Inclusive append boundary; timestamp is only used for its indexed lookup. */
+  through?: { epoch: number; seq: number; ts: number };
+}
+
 export interface TimelineProjectionQuery {
   sessionId: string;
   limit?: number;
@@ -38,7 +44,7 @@ export interface ProjectionWorkerRequestMap {
   recordAppendedEvent: { event: TimelineEvent };
   queryHistory: TimelineProjectionQuery;
   queryByTypes: Required<Pick<TimelineProjectionQuery, 'sessionId' | 'types'>> & Omit<TimelineProjectionQuery, 'types'>;
-  queryCompletedTextTail: { sessionId: string; limit?: number };
+  queryCompletedTextTail: { sessionId: string; limit?: number; options?: TimelineTextTailOptions };
   queryLatest: { sessionId: string };
   rebuildSession: { sessionId: string };
   pruneSessionToAuthoritative: { sessionId: string; keepLast: number };
