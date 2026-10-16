@@ -14,7 +14,7 @@ vi.mock('@muse-code/sdk', async (original) => ({
 }));
 vi.mock('../../src/daemon/muse-mcp-config.js', () => ({
   museMcpEnsureOptionsFromConfig: () => ({}),
-  ensureMuseMcpConfigHasImcodesEntry: async () => ({ degraded: false }),
+  prepareMuseSessionMcp: async () => ({ degraded: false }),
 }));
 
 function peer() {

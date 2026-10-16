@@ -56,7 +56,7 @@ import { NATIVE_AGENT_ADMISSION_MODES } from '../../../shared/native-collaborati
 import { composeMessageSideProviderPrompt } from '../provider-context-routing.js';
 import { normalizeTransportCwd, resolveExecutableForSpawn, resolveMuseCodePathForSdk } from '../transport-paths.js';
 import {
-  ensureMuseMcpConfigHasImcodesEntry,
+  prepareMuseSessionMcp,
   museMcpEnsureOptionsFromConfig,
   type MuseMcpEnsureResult,
 } from '../../daemon/muse-mcp-config.js';
@@ -405,7 +405,7 @@ export class MuseCodeSdkProvider implements TransportProvider {
     }
     this.config = config;
 
-    this.mcpRegistration = await ensureMuseMcpConfigHasImcodesEntry(museMcpEnsureOptionsFromConfig(config)).catch((err) => {
+    this.mcpRegistration = await prepareMuseSessionMcp(museMcpEnsureOptionsFromConfig(config)).catch((err) => {
       logger.warn({ err }, 'Failed to ensure Muse MCP configuration');
       return null;
     });
