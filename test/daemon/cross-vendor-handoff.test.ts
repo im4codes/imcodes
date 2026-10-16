@@ -41,7 +41,7 @@ describe('cross-vendor handoff contract', () => {
     });
     expect(normalizeCrossVendorHandoffConfig({ maxTokens: 99_999, recentTurns: 0, timeoutMs: 1 })).toMatchObject({
       maxTokens: CROSS_VENDOR_HANDOFF_DEFAULTS.hardMaxTokens,
-      recentTurns: 1,
+      recentTurns: 30,
       timeoutMs: 250,
     });
   });
@@ -90,14 +90,14 @@ describe('cross-vendor handoff contract', () => {
       event('user.message', { text: 'delta' }, 9, 100),
     ]);
     await buildCrossVendorHandoffPack(record('codex-sdk'), { epoch: 7, seq: 20, ts: 200 }, 'claude-code-sdk', 'transport', undefined, { epoch: 7, seq: 8, ts: 99 });
-    expect(read).toHaveBeenCalledWith('handoff-test', 10, { visibleOnly: true, through: { epoch: 7, seq: 20, ts: 200 } });
+    expect(read).toHaveBeenCalledWith('handoff-test', 30, { visibleOnly: true, through: { epoch: 7, seq: 20, ts: 200 } });
   });
 
   it('disables generation explicitly and preserves the one-shot configuration bounds', async () => {
     const read = vi.spyOn(timelineStore, 'readCompletedTextTail');
     await expect(buildCrossVendorHandoffPack(record('qoder-sdk'), { epoch: 1, seq: 1, ts: 1 }, 'claude-code-sdk', 'transport', { enabled: false })).resolves.toBeUndefined();
     expect(read).not.toHaveBeenCalled();
-    expect(normalizeCrossVendorHandoffConfig({ maxTokens: 6_001 }).maxTokens).toBe(6_000);
+    expect(normalizeCrossVendorHandoffConfig({ maxTokens: CROSS_VENDOR_HANDOFF_DEFAULTS.hardMaxTokens + 1 }).maxTokens).toBe(CROSS_VENDOR_HANDOFF_DEFAULTS.hardMaxTokens);
   });
   it('degrades to no handoff when the projection is busy or unavailable', async () => {
     vi.spyOn(timelineStore, 'readCompletedTextTail').mockRejectedValue(new Error('projection busy'));
@@ -131,6 +131,15 @@ describe('cross-vendor handoff contract', () => {
 
 
 describe('reported lost provider-switch context counterexamples', () => {
+  it.each([undefined, 3000])('upgrades the old ten-message setting and preserves all thirty messages (budget=%s)', async (maxTokens) => {
+    expect(normalizeCrossVendorHandoffConfig({ recentTurns: 10 }).recentTurns).toBe(30);
+    const rows = Array.from({ length: 30 }, (_, i) => event(i % 2 ? 'assistant.text' : 'user.message', { text: `消息${i}开始：${'这是需要保留的历史正文。'.repeat(120)}` }, i + 1, i + 1));
+    vi.spyOn(timelineStore, 'readCompletedTextTail').mockResolvedValue(rows);
+    const pack = await buildCrossVendorHandoffPack(record('codex-sdk'), { epoch: 7, seq: 30, ts: 30 }, 'agy-sdk', 'transport', { maxTokens });
+    expect(pack).toBeDefined();
+    for (let i = 0; i < 30; i++) expect(pack!.text).toContain(`消息${i}开始`);
+    expect(pack!.tokenCount).toBeLessThanOrEqual(maxTokens ?? CROSS_VENDOR_HANDOFF_DEFAULTS.maxTokens);
+  });
   it('includes the user message that is itself the frozen cutoff', async () => {
     const rows = [event('user.message', { text: 'REMEMBER_SWITCH_GOAL_7B' }, 1, 100)];
     vi.spyOn(timelineStore, 'readCompletedTextTail').mockImplementation(async (_name, limit, options) => rows.filter((e) => (e.type === 'user.message' || (e.type === 'assistant.text' && e.payload.streaming !== true)) && (!options?.through || e.seq <= options.through.seq)).slice(-(limit ?? 50)));

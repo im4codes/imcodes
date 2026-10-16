@@ -50,31 +50,29 @@ export async function buildCrossVendorHandoffPack(record: SessionRecord, cutoff:
   }
   // Identity/system instructions are reapplied by the normal launch bootstrap.
   // The handoff is conversation text only, never tools or processed memory.
-  const text = redactSensitiveText([
+  const render = (maxTextChars: number) => redactSensitiveText([
     CROSS_VENDOR_HANDOFF_HEADINGS.title,
     CROSS_VENDOR_HANDOFF_HEADINGS.notice,
-    ...messages.map((message) => `${message.role === 'user' ? 'User' : 'Assistant'}: ${message.text.slice(0, 1200)}`),
+    ...messages.map((message) => `${message.role === 'user' ? 'User' : 'Assistant'}: ${message.text.slice(0, maxTextChars)}${message.text.length > maxTextChars ? '…' : ''}`),
   ].join('\n\n'));
   const hardCap = CROSS_VENDOR_HANDOFF_DEFAULTS.hardMaxTokens;
   const maxTokens = Math.min(config.maxTokens, hardCap);
-  // Count the complete pack once, then choose a conservative proportional
-  // prefix. The old implementation performed an async worker round-trip for
-  // every 15% shrink and again for a binary search; a cold worker therefore
-  // routinely exceeded providerWaitMs before the first turn could dispatch.
-  const sourceTokens = await countTokensAsync(text);
-  let bounded = text;
-  if (sourceTokens > maxTokens && text.length > 32) {
-    bounded = text.slice(0, Math.max(32, Math.floor(text.length * (maxTokens / sourceTokens) * 0.85)));
-  }
+  // Shorten each message fairly rather than dropping the newest messages
+  // from the end of the pack. Keep tokenizer worker round-trips bounded.
+  let maxTextChars = Math.min(CROSS_VENDOR_HANDOFF_DEFAULTS.maxTextChars, Math.max(0, ...messages.map((message) => message.text.length)));
+  let bounded = render(maxTextChars);
   let tokenCount = await countTokensAsync(bounded);
-  // Provider token boundaries can make the proportional prefix slightly high.
-  // Correct with at most two further proportional probes; this is bounded and
-  // avoids the previous unbounded O(log n) worker loop while retaining exact
-  // provider semantics for the final pack.
-  for (let attempt = 0; tokenCount > maxTokens && bounded.length > 32 && attempt < 2; attempt += 1) {
-    const nextLength = Math.max(32, Math.floor(bounded.length * (maxTokens / tokenCount) * 0.85));
-    if (nextLength >= bounded.length) break;
-    bounded = bounded.slice(0, nextLength);
+  for (let attempt = 0; tokenCount > maxTokens && bounded.length > 1 && attempt < 4; attempt += 1) {
+    const ratio = (maxTokens / tokenCount) * 0.85;
+    const nextTextChars = Math.floor(maxTextChars * ratio);
+    if (attempt < 3 && nextTextChars > 0 && nextTextChars < maxTextChars) {
+      maxTextChars = nextTextChars;
+      bounded = render(maxTextChars);
+    } else {
+      // An explicitly tiny custom budget may not even fit the headings/roles.
+      maxTextChars = 0;
+      bounded = bounded.slice(0, Math.max(1, Math.floor(bounded.length * ratio)));
+    }
     tokenCount = await countTokensAsync(bounded);
   }
   return { text: bounded, sourceAgentType: record.agentType, sourceRuntimeType: record.runtimeType ?? 'process', sourceConversationKey: sourceConversationKey(record), cutoff, createdAt: Date.now(), tokenCount };

@@ -1,9 +1,10 @@
 /** Shared cross-vendor handoff contract and bounded configuration. */
 export const CROSS_VENDOR_HANDOFF_DEFAULTS = {
   enabled: true,
-  maxTokens: 3000,
-  hardMaxTokens: 6000,
-  recentTurns: 10,
+  maxTokens: 9000,
+  hardMaxTokens: 18000,
+  recentTurns: 30,
+  maxTextChars: 1200,
   timeoutMs: 3000,
   providerWaitMs: 2000,
   includeToolPreviews: false,
@@ -85,7 +86,7 @@ export function normalizeCrossVendorHandoffConfig(input?: Partial<CrossVendorHan
   return {
     enabled: input?.enabled !== false,
     maxTokens: Math.max(1, Math.min(CROSS_VENDOR_HANDOFF_DEFAULTS.hardMaxTokens, maxTokens)),
-    recentTurns: Math.max(1, Math.min(100, Math.trunc(input?.recentTurns ?? CROSS_VENDOR_HANDOFF_DEFAULTS.recentTurns))),
+    recentTurns: Math.max(CROSS_VENDOR_HANDOFF_DEFAULTS.recentTurns, Math.min(100, Math.trunc(input?.recentTurns ?? CROSS_VENDOR_HANDOFF_DEFAULTS.recentTurns))),
     timeoutMs: Math.max(250, Math.min(30_000, Math.trunc(input?.timeoutMs ?? CROSS_VENDOR_HANDOFF_DEFAULTS.timeoutMs))),
     providerWaitMs: Math.max(0, Math.min(CROSS_VENDOR_HANDOFF_DEFAULTS.timeoutMs, Math.trunc(input?.providerWaitMs ?? CROSS_VENDOR_HANDOFF_DEFAULTS.providerWaitMs))),
     includeToolPreviews: input?.includeToolPreviews === true,
