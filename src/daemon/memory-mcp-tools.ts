@@ -3791,7 +3791,9 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
         if (kind === 'summary') {
           const gate = memorySurfaceGate(deps, { items: [] });
           if (gate) return gate;
-          const items = await readSessionSummaries(session.name, memoryCaller().namespace, limit);
+          // History follows the session's persisted namespace, not project
+          // recall's user_private -> personal scope reclassification.
+          const items = await readSessionSummaries(session.name, session.contextNamespace ?? caller.namespace, limit);
           return { status: 'ok', kind, requested: limit, count: items.length, items };
         }
         const messages = await readSessionTextMessages(session.name, limit);

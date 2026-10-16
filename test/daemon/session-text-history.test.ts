@@ -64,6 +64,18 @@ describe('provider-independent current-session text history', () => {
 
 
 describe('recent current-session summaries', () => {
+  it('reads the session stored namespace without reclassifying legacy user_private summaries as personal', async () => {
+    const storedNamespace = caller.namespace;
+    const run = vi.spyOn(getContextStoreClient(), 'run').mockImplementation(async (_method, args) => {
+      const [namespace, kind] = args as unknown[];
+      return JSON.stringify(namespace) === JSON.stringify(storedNamespace) && kind === 'recent_summary'
+        ? [{ id: 'stored-summary', summary: 'existing decision', content: { sessionName: name }, updatedAt: 10 }]
+        : [];
+    });
+    const handlers = createMemoryMcpToolHandlers(caller, { sendDeps: { listSessions: () => [{ ...session, contextNamespace: storedNamespace }] } });
+    expect(await handlers[N.SESSION_TEXT_HISTORY]({ kind: 'summary', limit: 1 })).toMatchObject({ status: 'ok', count: 1, items: [{ id: 'stored-summary' }] });
+    expect(run).toHaveBeenCalledWith('listProcessedProjections', [storedNamespace, 'recent_summary', { sessionName: name, excludeArchived: true, limit: 1 }]);
+  });
   it('reuses namespace/session indexed summary queries, merges recent/master newest-first and excludes archived/other sessions', async () => {
     const row = (id: string, sessionName: string, updatedAt: number, status?: string) => ({ id, namespace: caller.namespace, summary: `summary-${id}`, content: { sessionName }, updatedAt, status });
     const run = vi.spyOn(getContextStoreClient(), 'run').mockResolvedValueOnce([row('older', name, 1), row('foreign', 'another-session', 999), row('archived', name, 100, 'archived')]).mockResolvedValueOnce([row('newer', name, 2)]);
