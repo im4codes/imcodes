@@ -1,5 +1,9 @@
 import { ProviderStopConfirmation } from '../../src/agent/provider-stop-confirmation.js';
 import { CHAT_MESSAGE_ORIGINS } from '../../shared/chat-message-origin.js';
+import { MEMORY_MCP_ENV_KEYS } from '../../shared/memory-mcp-env.js';
+import { IMCODES_SESSION_ENV } from '../../shared/imcodes-send.js';
+import { MCP_TOOL_CATALOG_MODES } from '../../shared/mcp-tool-discovery.js';
+import { LEGACY_DAEMON_LOCAL_USER_ID } from '../../shared/memory-namespace.js';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
@@ -333,7 +337,8 @@ describe('TransportSessionRuntime', () => {
 
   it('initialize() calls provider.createSession', async () => {
     expect(runtime.providerSessionId).toBe('sess-1');
-    expect(mock.provider.createSession).toHaveBeenCalledWith(defaultConfig);
+    expect(mock.provider.createSession).toHaveBeenCalledWith({ ...defaultConfig, providerId: mock.provider.id });
+    expect(defaultConfig).toEqual({ sessionKey: 'deck_test_brain' });
   });
 
   it('passes registered-node identity without minting a second capability credential', async () => {
@@ -346,11 +351,22 @@ describe('TransportSessionRuntime', () => {
       serverId: 'server-1',
     });
 
+    // The common SDK boundary now enriches each managed session. Keep this
+    // exact, including the env allowlist: no second credential may be minted.
     expect(restored.provider.createSession).toHaveBeenCalledWith({
       sessionKey: 'restore-route',
       sessionName: 'deck_restore_brain',
       providerId: 'codex-sdk',
       serverId: 'server-1',
+      env: {
+        [IMCODES_SESSION_ENV]: 'deck_restore_brain',
+        [MEMORY_MCP_ENV_KEYS.SESSION_NAME]: 'deck_restore_brain',
+        [MEMORY_MCP_ENV_KEYS.PROJECT_NAME]: 'restore',
+        [MEMORY_MCP_ENV_KEYS.PROVIDER_ID]: 'codex-sdk',
+        [MEMORY_MCP_ENV_KEYS.SERVER_ID]: 'server-1',
+        [MEMORY_MCP_ENV_KEYS.USER_ID]: LEGACY_DAEMON_LOCAL_USER_ID,
+        [MEMORY_MCP_ENV_KEYS.TOOL_CATALOG_MODE]: MCP_TOOL_CATALOG_MODES.STATIC_FULL,
+      },
     });
     await restoredRuntime.kill();
   });
