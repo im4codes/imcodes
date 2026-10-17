@@ -73,6 +73,7 @@ afterEach(() => {
 });
 
 // ── i18n stub ─────────────────────────────────────────────────────────────
+const fileBrowserI18n = vi.hoisted(() => ({ freshTCalls: 0 }));
 vi.mock('react-i18next', () => {
   // t must be reference-stable — a new function ref each render causes
   // fetchPreview to be recreated, triggering infinite re-renders via
@@ -118,7 +119,13 @@ vi.mock('react-i18next', () => {
     return map[key] ?? key;
   };
   const translation = { t };
-  return { useTranslation: () => translation };
+  return { useTranslation: () => {
+    if (fileBrowserI18n.freshTCalls > 0) {
+      fileBrowserI18n.freshTCalls -= 1;
+      return { t: (key: string, opts?: Record<string, unknown>) => t(key, opts) };
+    }
+    return translation;
+  } };
 });
 
 // ── WsClient factory ──────────────────────────────────────────────────────
@@ -207,6 +214,7 @@ describe('FileBrowser', () => {
     directFileTransferMocks.selectPreviewDownloadDestination.mockResolvedValue(null);
     directFileTransferMocks.isDirectFileTransferStaleHandleError.mockReturnValue(false);
     filePreviewPropsState.current = null;
+    fileBrowserI18n.freshTCalls = 0;
     localStorage.clear();
     __resetFileBrowserSharedChangesForTests();
     __resetDownloadTransfersForTests();
@@ -2501,6 +2509,26 @@ describe('FileBrowser', () => {
     expect((ws.fsGitDiff as any).mock.calls).toHaveLength(1);
     expect((ws.fsReadFile as any).mock.calls[0]?.[0]).toBe('/home/user/foo.ts');
     expect((ws.fsGitDiff as any).mock.calls[0]?.[0]).toBe('/home/user/foo.ts');
+  });
+
+  it('keeps chat auto-preview bounded when i18n changes t identity', async () => {
+    const { ws, respond } = makeWsFactory();
+    fileBrowserI18n.freshTCalls = Number.POSITIVE_INFINITY;
+    render(
+      <FileBrowser
+        ws={ws}
+        mode="file-single"
+        layout="panel"
+        initialPath="/home/user"
+        autoPreviewPath="/home/user/foo.ts"
+        onConfirm={vi.fn()}
+      />,
+    );
+
+    await act(async () => { respond([{ name: 'foo.ts', isDir: false }], '/home/user'); });
+    await waitFor(() => expect((ws.fsReadFile as any).mock.calls).toHaveLength(1));
+    expect(document.querySelector('.fb-preview-loading')).not.toBeNull();
+    fileBrowserI18n.freshTCalls = 0;
   });
 
   it('dispatches at most one current read/diff cycle per visible target', async () => {
