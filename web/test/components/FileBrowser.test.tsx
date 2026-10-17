@@ -2513,7 +2513,7 @@ describe('FileBrowser', () => {
 
   it('keeps chat auto-preview bounded when i18n changes t identity', async () => {
     const { ws, respond } = makeWsFactory();
-    fileBrowserI18n.freshTCalls = 4;
+    fileBrowserI18n.freshTCalls = Number.POSITIVE_INFINITY;
     render(
       <FileBrowser
         ws={ws}
