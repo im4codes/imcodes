@@ -36,8 +36,8 @@ if (args[0] === 'models') {
   process.exit(0);
 }
 if (args[0] === '--help') { process.stdout.write('Usage of agy:\\n'); process.exit(0); }
-if (process.env.FAKE_AGY_IDENTITY_FILE) fs.appendFileSync(process.env.FAKE_AGY_IDENTITY_FILE, JSON.stringify(Object.fromEntries(${JSON.stringify([IMCODES_SESSION_ENV,E.SESSION_NAME,E.SESSION_INSTANCE_ID,E.RUNTIME_EPOCH,E.PROVIDER_ID])}.map(k => [k, process.env[k]]))) + '\\n');
 const resumeIdx = args.indexOf('--conversation');
+if (process.env.FAKE_AGY_IDENTITY_FILE) fs.appendFileSync(process.env.FAKE_AGY_IDENTITY_FILE, JSON.stringify({ resumeId: resumeIdx >= 0 ? args[resumeIdx + 1] : null, ...Object.fromEntries(${JSON.stringify([IMCODES_SESSION_ENV,E.SESSION_NAME,E.SESSION_INSTANCE_ID,E.RUNTIME_EPOCH,E.PROVIDER_ID])}.map(k => [k, process.env[k]])) }) + '\\n');
 const convId = resumeIdx >= 0 ? args[resumeIdx + 1] : 'conv-' + process.pid;
 const emit = (o) => process.stdout.write(JSON.stringify(o) + '\\n');
 emit({ event: 'init', conversation_id: convId, init: { cwd: process.cwd(), tools: [], permission_mode: 'always-proceed' } });
@@ -242,23 +242,33 @@ describe('AgySdkProvider (fake agy process)', () => {
     expect(provider.capabilities.approval).toBe(false);
   });
 
-  it('passes isolated runtime identity to actual Antigravity child processes for new and resumed sessions', async () => {
+  it.each([false, true])('passes isolated runtime identity to actual Antigravity child processes for new and resumed sessions (reverse startup=%s)', async (reverseStartup) => {
     const output = path.join(dir, 'identity.jsonl');
-    for (const id of ['fresh', 'resume']) {
+    const order = reverseStartup ? ['resume', 'fresh'] : ['fresh', 'resume'];
+    for (const [index, id] of order.entries()) {
       const sid = await provider.createSession(withMemoryMcpSessionEnv({
         sessionKey: id, sessionName: `deck_sub_agy_${id}`, sessionInstanceId: `instance-${id}`, runtimeEpoch: `epoch-${id}`,
         providerId: provider.id, cwd: dir, resumeId: id === 'resume' ? 'persisted-identity-test' : undefined,
         env: { FAKE_AGY_IDENTITY_FILE: output },
       }));
       await provider.send(sid, 'hello');
+      // Completion follows the fixture's identity write: reverse the observed
+      // order deterministically instead of depending on OS process scheduling.
+      if (reverseStartup) await waitFor(() => completes.length === index + 1);
     }
     await waitFor(() => completes.length === 2);
     const actual = readFileSync(output, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
     expect(actual).toHaveLength(2);
-    for (const [i, id] of ['fresh', 'resume'].entries()) expect(actual[i]).toEqual({
-      [IMCODES_SESSION_ENV]: `deck_sub_agy_${id}`, [E.SESSION_NAME]: `deck_sub_agy_${id}`,
-      [E.SESSION_INSTANCE_ID]: `instance-${id}`, [E.RUNTIME_EPOCH]: `epoch-${id}`, [E.PROVIDER_ID]: provider.id,
-    });
+    // A fresh CLI and a resumed CLI start independently. Attribute captures
+    // using native resume argv, not arrival order or the identity being tested.
+    for (const id of ['fresh', 'resume']) {
+      const resumeId = id === 'resume' ? 'persisted-identity-test' : null;
+      expect(actual.find((record) => record.resumeId === resumeId)).toEqual({
+        resumeId,
+        [IMCODES_SESSION_ENV]: `deck_sub_agy_${id}`, [E.SESSION_NAME]: `deck_sub_agy_${id}`,
+        [E.SESSION_INSTANCE_ID]: `instance-${id}`, [E.RUNTIME_EPOCH]: `epoch-${id}`, [E.PROVIDER_ID]: provider.id,
+      });
+    }
   });
 
   it('reports memory MCP status ready or degraded', () => {
