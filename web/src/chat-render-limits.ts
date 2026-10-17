@@ -42,3 +42,16 @@ export const PREVIEW_EVENT_TAIL_LIMIT = 200;
 export function shouldSkipRichTextEnhancement(text: string): boolean {
   return text.length > RICH_TEXT_ENHANCEMENT_CHAR_LIMIT;
 }
+
+/** Bound parsing/layout work for collapsed tool rows; expanded views retain all data. */
+export const TOOL_COLLAPSED_PREVIEW_MAX_CHARS = 1024;
+
+export function toolFoldDisplayText(text: string | null | undefined, expanded: boolean): string {
+  if (!text) return '';
+  if (expanded || text.length <= TOOL_COLLAPSED_PREVIEW_MAX_CHARS) return text;
+  // Do not cut an astral character in half at the preview boundary.
+  let end = TOOL_COLLAPSED_PREVIEW_MAX_CHARS;
+  const last = text.charCodeAt(end - 1);
+  if (last >= 0xD800 && last <= 0xDBFF) end -= 1;
+  return text.slice(0, end) + '…';
+}

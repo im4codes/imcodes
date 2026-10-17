@@ -360,3 +360,67 @@ test('message arrival stays flat as the conversation grows', async ({ page }) =>
   ).toBeLessThanOrEqual(FLATNESS_LIMIT);
   expect(largest, 'per-arrival work in the longest session').toBeLessThanOrEqual(WORST_CASE_UPDATE_MS);
 });
+
+
+test('collapsed large tool outputs stay bounded and expand without losing data', async ({ page }) => {
+  test.setTimeout(45_000);
+  await isolateFixtureNetwork(page);
+  await page.goto(`${FIXTURE}?size=smoke&rows=100`);
+  await waitForHarness(page);
+  const cdp = await page.context().newCDPSession(page);
+  await cdp.send('Emulation.setCPUThrottlingRate', { rate: 4 });
+  const results = [];
+  for (const size of [1_024, 128_000, 300_000]) {
+    const result = await page.evaluate(async (payloadSize) => {
+      const harness = (window as unknown as { __chatTimelineHarness: import('../src/fixtures/chat-timeline/main.js').ChatTimelineHarnessApi }).__chatTimelineHarness;
+      const base = { sessionId: 'fixture', epoch: 1, source: 'daemon' as const, confidence: 'high' as const };
+      const messages = Array.from({ length: 100 }, (_, i) => ({
+        ...base, eventId: `u-${i}`, seq: i + 1, ts: i + 1,
+        type: 'user.message' as const, payload: { text: `previous message ${i}` },
+      }));
+      const call = {
+        ...base, eventId: 'call', seq: 101, ts: 101, type: 'tool.call' as const,
+        payload: { toolCallId: 'tool-1', tool: 'session_history', input: { kind: 'tool', limit: 100 } },
+      };
+      const data = { status: 'ok', events: [{ payload: 'x'.repeat(payloadSize) + 'FULL_TOOL_TAIL_7283' }] };
+      const settle = async () => { await Promise.resolve(); await Promise.resolve(); await Promise.resolve(); };
+      const times: number[] = [];
+      for (let i = 0; i < 25; i++) {
+        const start = performance.now();
+        harness.setEvents([...messages, call, {
+          ...base, eventId: 'result', seq: 102, ts: 102, type: 'tool.result',
+          payload: { toolCallId: 'tool-1', output: { ...data, sample: i } },
+        }]);
+        await settle();
+        document.querySelector('.chat-view')?.getBoundingClientRect();
+        if (i >= 5) times.push(performance.now() - start);
+        await new Promise(requestAnimationFrame);
+      }
+      times.sort((a, b) => a - b);
+      const fold = document.querySelector('.chat-tool-block-fold')!;
+      const collapsedChars = fold.textContent?.length ?? 0;
+      const collapsedHasTail = fold.textContent?.includes('FULL_TOOL_TAIL_7283');
+      (fold.querySelector('.chat-tool-block-toggle') as HTMLElement).click();
+      await settle();
+      const expandedHasTail = fold.textContent?.includes('FULL_TOOL_TAIL_7283');
+      (fold.querySelector('.chat-tool-block-toggle') as HTMLElement).click();
+      await settle();
+      return {
+        size: payloadSize, collapsedChars, collapsedHasTail, expandedHasTail,
+        recollapsedChars: fold.textContent?.length ?? 0,
+        medianMs: times[Math.floor(times.length / 2)]!,
+        p95Ms: times[Math.floor(times.length * 0.95)]!,
+        domChars: document.querySelector('.chat-view')?.textContent?.length ?? 0,
+      };
+    }, size);
+    expect(result.domChars).toBeGreaterThan(0);
+    expect(result.collapsedChars).toBeLessThan(4_096);
+    expect(result.recollapsedChars).toBeLessThan(4_096);
+    expect(result.collapsedHasTail).toBe(false);
+    expect(result.expandedHasTail).toBe(true);
+    results.push(result);
+  }
+  console.log('LARGE_TOOL_COST', JSON.stringify(results));
+  expect(results[results.length - 1]!.medianMs).toBeLessThanOrEqual(WORST_CASE_UPDATE_MS);
+  expect(growthRatio(results.map((r) => r.medianMs)).ratio).toBeLessThanOrEqual(FLATNESS_LIMIT);
+});
