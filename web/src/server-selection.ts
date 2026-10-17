@@ -66,6 +66,22 @@ export function hasSelectedServer(
   return servers.some((server) => server.id === selectedServerId);
 }
 
+/** Refresh full-server data without dropping visited, still-shared navigation entries.
+ * This list is not an ownership/coverage grant; callers keep that authority separate.
+ */
+export function mergeServerNavigation<T extends SelectableServerInfo>(
+  incoming: readonly T[],
+  previous: readonly T[],
+  activeSharedServerIds: ReadonlySet<string>,
+): T[] {
+  const ids = new Set(incoming.map((server) => server.id));
+  return [...incoming, ...previous.filter((server) => {
+    if (ids.has(server.id) || !activeSharedServerIds.has(server.id)) return false;
+    ids.add(server.id);
+    return true;
+  })];
+}
+
 export function getSelectedServerName(
   selectedServerId: string | null,
   servers: readonly SelectableServerInfo[],

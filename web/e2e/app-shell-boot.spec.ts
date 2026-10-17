@@ -39,3 +39,69 @@ test('serves the production app shell and mounts its pre-authentication surface'
     .toMatch(/INITIALIZING|Sign in|Passkey|codes/i);
   expect(consoleErrors, `unexpected console errors: ${consoleErrors.join(' | ')}`).toEqual([]);
 });
+
+// Exercise the production switcher with HTTP/WS boundary fixtures, not a CSS clone.
+test.describe('mobile server switcher', () => {
+  test.use({ userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 Mobile/15E148', viewport: { width: 390, height: 844 } });
+
+  for (const sharedCount of [1, 30]) {
+    test(`fills available height and keeps all ${sharedCount} shares reachable`, async ({ page }) => {
+      await page.addInitScript(() => {
+        localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'browser-nav-user', baseUrl: location.origin }));
+        localStorage.setItem('rcc_server', 'browser-nav-server');
+        localStorage.setItem('rcc_server_name', 'Local');
+        localStorage.setItem('i18nextLng', 'en');
+      });
+      await page.route('**/api/**', async (route) => {
+        const path = new URL(route.request().url()).pathname;
+        let json: unknown = {};
+        if (path === '/api/auth/user/me') json = { id: 'browser-nav-user' };
+        else if (path === '/api/server') json = { servers: [{ id: 'browser-nav-server', name: 'Local', status: 'online', lastHeartbeatAt: Date.now(), createdAt: Date.now() }] };
+        else if (path === '/api/shares') json = { entries: Array.from({ length: sharedCount }, (_, index) => ({
+          id: `browser-share-${index}`, serverId: `browser-server-${index}`, serverName: `Shared server ${index}`,
+          targetLabel: `Shared project ${index}`, role: 'participant', status: 'active',
+          target: { kind: 'main', serverId: `browser-server-${index}`, sessionName: `deck_e2e_nav_${index}_brain` },
+        })) };
+        else if (path.endsWith('/ws-ticket')) json = { ticket: 'browser-nav-ticket' };
+        else if (path.endsWith('/sessions')) json = { sessions: [] };
+        await route.fulfill({ json });
+      });
+      await page.routeWebSocket('**/api/server/**/ws?*', (socket) => {
+        socket.onMessage((message) => {
+          if (typeof message === 'string' && JSON.parse(message).type === 'ping') socket.send(JSON.stringify({ type: 'pong' }));
+        });
+      });
+      await page.goto('/#/browser-nav-server');
+      const trigger = page.locator('.mobile-server-btn');
+      await trigger.click();
+      const menu = page.locator('.mobile-server-menu');
+      await expect(menu).toBeVisible();
+      const checkHeight = async () => {
+        const box = (await menu.boundingBox())!;
+        const viewport = page.viewportSize()!;
+        expect(box.height).toBeGreaterThan(viewport.height * 0.7);
+        expect(Math.abs(box.y + box.height - (viewport.height - 8))).toBeLessThanOrEqual(2);
+        expect(box.x).toBeGreaterThanOrEqual(0);
+        expect(box.x + box.width).toBeLessThanOrEqual(viewport.width);
+      };
+      await checkHeight();
+      const expand = menu.locator('.shared-entries-toggle[aria-expanded="false"]');
+      if (await expand.count()) await expand.click();
+      const lastEntry = menu.locator('.shared-entry-title').filter({ hasText: `Shared project ${sharedCount - 1}` });
+      await lastEntry.scrollIntoViewIfNeeded();
+      await expect(lastEntry).toBeInViewport();
+      if (sharedCount > 1) {
+        expect(await menu.evaluate((element) => element.scrollTop)).toBeGreaterThan(0);
+        expect(await menu.locator('.shared-entries-list').evaluate((element) => element.scrollHeight <= element.clientHeight + 1)).toBe(true);
+      }
+      await page.setViewportSize({ width: 844, height: 390 });
+      await expect.poll(async () => (await menu.boundingBox())!.y + (await menu.boundingBox())!.height).toBeCloseTo(382, 0);
+      await checkHeight();
+      await page.mouse.click(820, 200);
+      await expect(menu).not.toBeVisible();
+      await trigger.click();
+      await expect(menu).toBeVisible();
+      await checkHeight();
+    });
+  }
+});

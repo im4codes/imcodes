@@ -5308,6 +5308,72 @@ describe('App shell', () => {
 
     fireEvent.click(screen.getByRole('button', { name: 'share.sharedWithMe.guideDismiss' }));
     expect(screen.queryByTestId('shared-return-guide')).toBeNull();
+    expect(screen.getByText('server-select-srv-1')).toBeTruthy();
+  }, 20_000);
+
+  it.each([false, true])('retains the previous shared server after dismiss and inventory refresh (mobile=%s)', async (mobile) => {
+    const originalUserAgent = navigator.userAgent;
+    if (mobile) Object.defineProperty(navigator, 'userAgent', { configurable: true, value: 'iPhone' });
+    const intervals = vi.spyOn(globalThis, 'setInterval');
+    try {
+      localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+      localStorage.setItem('rcc_server', 'srv-1');
+      localStorage.setItem('rcc_session', 'deck_alpha_brain');
+      const entries = ['local', 'other'].map((id) => ({
+        id: `share-${id}`, serverId: `srv-${id}`, serverName: id === 'local' ? '本机' : 'Other Server',
+        role: 'participant', status: 'active', targetLabel: `Project ${id}`,
+        target: { kind: 'main', serverId: `srv-${id}`, sessionName: `deck_${id}_brain` },
+      }));
+      discoverSharedEntriesMock.mockResolvedValue(entries);
+      openSharedEntryMock.mockImplementation(async (target: typeof entries[number]['target']) => ({
+        ...sharedMainOpenResult(`share-${target.serverId.slice(4)}`, 'dispatch-nav'),
+        server: { id: target.serverId, name: entries.find((entry) => entry.serverId === target.serverId)!.serverName,
+          status: 'online', lastHeartbeatAt: Date.now() },
+        target,
+        sessions: [{ sessionName: target.sessionName, title: target.sessionName, state: 'running', agentType: 'codex-sdk' }],
+      }));
+      const { App } = await importApp();
+      const view = render(<App />);
+      const openProject = async (label: string) => {
+        if (mobile) fireEvent.click(view.container.querySelector('.mobile-sidebar-toggle')!);
+        fireEvent.click((await screen.findByText(label)).closest('button')!);
+      };
+      await screen.findByTestId('session-pane-deck_alpha_brain');
+      await openProject('Project local');
+      await screen.findByTestId('session-pane-deck_local_brain');
+      await openProject('Project other');
+      await screen.findByTestId('session-pane-deck_other_brain');
+      fireEvent.click(within(screen.getByTestId('shared-return-guide')).getByRole('button', { name: 'share.sharedWithMe.guideDismiss' }));
+      expect(screen.queryByTestId('shared-return-guide')).toBeNull();
+      const refresh = intervals.mock.calls.find(([, ms]) => ms === 30_000)![0] as () => void;
+      await act(async () => { refresh(); await Promise.resolve(); });
+      if (mobile) {
+        fireEvent.click(view.container.querySelector('.mobile-server-btn')!);
+        const menu = view.container.querySelector('.mobile-server-menu')!;
+        expect(within(menu as HTMLElement).getByText('本机', { selector: '.mobile-server-menu-name' })).toBeTruthy();
+        expect(within(menu as HTMLElement).getByText('Alpha Server', { selector: '.mobile-server-menu-name' })).toBeTruthy();
+      } else {
+        expect(screen.getByText('server-select-srv-local')).toBeTruthy();
+        expect(screen.getByText('server-select-srv-1')).toBeTruthy();
+      }
+      // The preserved entry remains navigation only: revisiting must ask for share coverage again.
+      const count = openSharedEntryMock.mock.calls.length;
+      await navigateExternally('/#/srv-local/deck_local_brain?shared=share-local');
+      await waitFor(() => expect(openSharedEntryMock.mock.calls.length).toBe(count + 1));
+      expect(await screen.findByTestId('session-pane-deck_local_brain')).toBeTruthy();
+      discoverSharedEntriesMock.mockResolvedValue(entries.filter((entry) => entry.id !== 'share-local'));
+      if (mobile) fireEvent.click(view.container.querySelector('.mobile-sidebar-toggle')!);
+      fireEvent.click(screen.getAllByRole('button', { name: 'share.sharedWithMe.refresh' })[0]!);
+      await waitFor(() => expect(screen.queryByText('Project local')).toBeNull());
+      if (mobile) {
+        fireEvent.click(view.container.querySelector('.mobile-server-btn')!);
+        expect(view.container.querySelector('.mobile-server-menu')!.textContent).not.toContain('本机');
+      } else {
+        expect(screen.queryByText('server-select-srv-local')).toBeNull();
+      }
+    } finally {
+      Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUserAgent });
+    }
   }, 20_000);
 
   it('gives a shared-server participant owner operations while keeping every re-share entry absent', async () => {

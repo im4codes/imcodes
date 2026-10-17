@@ -50,6 +50,7 @@ import { PENDING_START_TIMEOUT_MS, DISCUSSION_RECONCILE_HIDDEN_MS } from '@share
 import { LOGIN_SESSION_NOT_STUCK_KEY } from './login-session-not-stuck.js';
 import { useTranslation } from 'react-i18next';
 import { ErrorBoundary } from './components/ErrorBoundary.js';
+import { MobileServerMenu } from './components/MobileServerMenu.js';
 import { LanguageSwitcher } from './components/LanguageSwitcher.js';
 import { LoginPage } from './pages/LoginPage.js';
 import { isActiveTurnFinishedError } from './session-live-status.js';
@@ -284,6 +285,7 @@ import { buildDocumentTitle } from './tab-title.js';
 import {
   getDaemonBadgeState,
   getSelectedServerName,
+  mergeServerNavigation,
   hasResolvedActiveSession,
   isServerOnline,
   pickAutoEntryServer,
@@ -699,6 +701,9 @@ export function App() {
   const remoteDesktopConnectionManager = remoteDesktopConnectionManagerRef.current;
   /** Server ids this account actually owns, sourced only from /api/server. */
   const ownedServerIdsRef = useRef<Set<string>>(new Set());
+  // Only successful share discovery updates this set; a transient fetch failure
+  // must not erase navigation back to a server the user just left.
+  const sharedNavigationServerIdsRef = useRef<Set<string>>(new Set());
   const initialHashStateRef = useRef(resolveInitialRouteState());
   const initialSharedTabRestoreRef = useRef(readSharedTabRestoreMarker());
   const sharedOpenGenerationRef = useRef(0);
@@ -836,6 +841,7 @@ export function App() {
     setAuth(null);
     setServers([]);
     ownedServerIdsRef.current = new Set();
+    sharedNavigationServerIdsRef.current = new Set();
     setServersLoaded(false);
     setServersSynced(false);
     setSessions([]);
@@ -1621,20 +1627,24 @@ export function App() {
     }
   }, [selectedServerId, trans]);
 
+  const applyServerInventory = useCallback((incoming: ServerInfo[]) => {
+    // Authoritative ownership, kept apart from `servers` on purpose.
+    // `handleOpenSharedEntry` merges the shared server into `servers` so the
+    // rest of the UI can render it, which makes that array a MIXED inventory:
+    // membership there proves the app has seen a server, never that this
+    // account owns it. Ownership decides whether a route may skip the
+    // /api/shares/open coverage check, so it must come from /api/server and
+    // nowhere else.
+    ownedServerIdsRef.current = new Set(incoming.map((server) => server.id));
+    setServers((previous) => mergeServerNavigation(incoming, previous, sharedNavigationServerIdsRef.current));
+  }, []);
+
   // Load servers list whenever auth is available
   const loadServers = useCallback(async () => {
     if (!auth) return;
     try {
       const data = await apiFetch<{ servers: ServerInfo[] }>('/api/server');
-      setServers(data.servers);
-      // Authoritative ownership, kept apart from `servers` on purpose.
-      // `handleOpenSharedEntry` merges the shared server into `servers` so the
-      // rest of the UI can render it, which makes that array a MIXED inventory:
-      // membership there proves the app has seen a server, never that this
-      // account owns it. Ownership decides whether a route may skip the
-      // /api/shares/open coverage check, so it must come from /api/server and
-      // nowhere else.
-      ownedServerIdsRef.current = new Set(data.servers.map((server) => server.id));
+      applyServerInventory(data.servers);
       setServersSynced(true);
     } catch {
       // Preserve the last known list on refresh failures. The request is still
@@ -1642,7 +1652,7 @@ export function App() {
     } finally {
       setServersLoaded(true);
     }
-  }, [auth]);
+  }, [auth, applyServerInventory]);
 
   useEffect(() => {
     setServersLoaded(false);
@@ -1679,7 +1689,13 @@ export function App() {
     setSharedEntriesLoaded(false);
     setSharedEntriesError(null);
     try {
-      setSharedEntries(await discoverSharedEntries());
+      const entries = await discoverSharedEntries();
+      const activeIds = new Set(entries.filter((entry) => entry.status === 'active').map((entry) => entry.serverId));
+      sharedNavigationServerIdsRef.current = activeIds;
+      setSharedEntries(entries);
+      // A successful refresh can revoke a previous shortcut; failed requests
+      // leave the last known navigation intact, never granting route authority.
+      setServers((previous) => previous.filter((server) => ownedServerIdsRef.current.has(server.id) || activeIds.has(server.id)));
     } catch (err) {
       setSharedEntries([]);
       setSharedEntriesError(formatSharedAccessError(err));
@@ -5469,6 +5485,9 @@ export function App() {
     clearMessagePinNavigation();
     configureExpectedUserId(null);
     setAuth(null);
+    setServers([]);
+    ownedServerIdsRef.current = new Set();
+    sharedNavigationServerIdsRef.current = new Set();
     setSessions([]);
     setActiveSession(null);
     setSelectedServerId(null);
@@ -7034,7 +7053,7 @@ export function App() {
                 onDeleteServer={(server) => setDeleteTarget(server)}
                 onLogout={handleLogout}
                 onOpenUsageSummary={() => setShowUsageSummaryPage(true)}
-                onServersLoaded={setServers}
+                onServersLoaded={applyServerInventory}
                 sharedEntries={sharedEntries}
                 sharedEntriesLoading={sharedEntriesLoading}
                 sharedEntriesLoaded={sharedEntriesLoaded}
@@ -7063,7 +7082,7 @@ export function App() {
                 </button>
                 {showMobileServerMenu && (
                   <>
-                  <div class="mobile-server-menu">
+                  <MobileServerMenu>
                     <button class="mobile-server-menu-item" onClick={() => { setShowMobileServerMenu(false); handleBackToDashboard(); }}>
                       ← Home
                     </button>
@@ -7113,7 +7132,7 @@ export function App() {
                     <div style={{ padding: '6px 12px', borderTop: '1px solid #334155' }}>
                       <LanguageSwitcher />
                     </div>
-                  </div>
+                  </MobileServerMenu>
                   </>
                 )}
               </div>
