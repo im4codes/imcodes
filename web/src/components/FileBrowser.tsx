@@ -735,6 +735,10 @@ export function FileBrowser({
   const previewScrollSnapshotRef = useRef<PreviewScrollSnapshot | null>(null);
   const mountedRef = useRef(true);
   const dismissedAutoPreviewPathRef = useRef<string | null>(null);
+  // A terminal error from the current request must not be treated as a fresh
+  // auto-preview target on every render, but an error supplied as the initial
+  // cached state must get one real retry when the chat opens it again.
+  const previewErrorPathRef = useRef<string | null>(null);
   const autoPreviewPathRef = useRef(autoPreviewPath);
   useEffect(() => { autoPreviewPathRef.current = autoPreviewPath; }, [autoPreviewPath]);
   const previewTabOverridePathRef = useRef<string | null>(null);
@@ -834,6 +838,22 @@ export function FileBrowser({
     pendingPreviewTimersRef.current.clear();
   }, []);
 
+  const finishPreviewError = useCallback((
+    path: string,
+    error: string,
+    downloadId?: string,
+  ) => {
+    previewErrorPathRef.current = path;
+    activePreviewCycleRef.current = null;
+    for (const [requestId, pending] of pendingGitDiffRef.current) {
+      if (pending.path === path) clearPendingPreviewRequest('diff', requestId);
+    }
+    for (const key of pendingPreviewDiffRef.current.keys()) {
+      if (key.endsWith(`\0${path}`)) pendingPreviewDiffRef.current.delete(key);
+    }
+    setPreview({ status: 'error', path, error, ...(downloadId ? { downloadId } : {}) });
+  }, [clearPendingPreviewRequest]);
+
   const handlePreviewRequestTimeout = useCallback((kind: 'read' | 'diff', requestId: string) => {
     const request = clearPendingPreviewRequest(kind, requestId);
     if (!request || !mountedRef.current) return;
@@ -844,9 +864,8 @@ export function FileBrowser({
     if (kind === 'diff') return;
     const active = getActivePreviewCycle();
     if (!active || active.path !== request.path || active.cycleId !== request.cycleId) return;
-    activePreviewCycleRef.current = null;
-    setPreview({ status: 'error', path: request.path, error: tRef.current('file_browser.preview_error') });
-  }, [clearPendingPreviewRequest, getActivePreviewCycle]);
+    finishPreviewError(request.path, tRef.current('file_browser.preview_error'));
+  }, [clearPendingPreviewRequest, finishPreviewError, getActivePreviewCycle]);
 
   const trackPendingPreviewRequest = useCallback((
     kind: 'read' | 'diff',
@@ -951,6 +970,7 @@ export function FileBrowser({
         const loadingPath = previewRef.current.status === 'loading' ? previewRef.current.path : null;
         activePreviewCycleRef.current = null;
         if (loadingPath) {
+          previewErrorPathRef.current = loadingPath;
           setPreview({ status: 'error', path: loadingPath, error: tRef.current('file_browser.preview_error') });
         }
         // Re-fetch root and changes
@@ -1098,7 +1118,7 @@ export function FileBrowser({
           const errKey = msg.error === FS_READ_ERROR_CODES.FILE_TOO_LARGE ? 'file_browser.preview_too_large'
             : msg.error === FS_READ_ERROR_CODES.FORBIDDEN_PATH ? 'file_browser.preview_error'
             : 'file_browser.preview_error';
-          setPreview({ status: 'error', path: filePath, error: t(errKey), downloadId: dlId });
+          finishPreviewError(filePath, t(errKey), dlId);
           return;
         }
         previewRefreshBackoffUntilRef.current = 0;
@@ -1126,7 +1146,7 @@ export function FileBrowser({
               if (!mountedRef.current) return;
               const stillActive = getActivePreviewCycle(filePath);
               if (!stillActive || stillActive.cycleId !== pending.cycleId) return;
-              setPreview({ status: 'error', path: filePath, error: t('file_browser.preview_error'), downloadId: dlId });
+              finishPreviewError(filePath, t('file_browser.preview_error'), dlId);
             });
           return;
         }
@@ -1150,7 +1170,7 @@ export function FileBrowser({
               if (!mountedRef.current) return;
               const stillActive = getActivePreviewCycle(filePath);
               if (!stillActive || stillActive.cycleId !== pending.cycleId) return;
-              setPreview({ status: 'error', path: filePath, error: t('file_browser.preview_error'), downloadId: dlId });
+              finishPreviewError(filePath, t('file_browser.preview_error'), dlId);
             });
           return;
         }
@@ -1172,7 +1192,7 @@ export function FileBrowser({
               if (!mountedRef.current) return;
               const stillActive = getActivePreviewCycle(filePath);
               if (!stillActive || stillActive.cycleId !== pending.cycleId) return;
-              setPreview({ status: 'error', path: filePath, error: t('file_browser.preview_error'), downloadId: dlId });
+              finishPreviewError(filePath, t('file_browser.preview_error'), dlId);
             });
           return;
         }
@@ -1198,7 +1218,7 @@ export function FileBrowser({
               if (!mountedRef.current) return;
               const stillActive = getActivePreviewCycle(filePath);
               if (!stillActive || stillActive.cycleId !== pending.cycleId) return;
-              setPreview({ status: 'error', path: filePath, error: t('file_browser.preview_error'), downloadId: dlId });
+              finishPreviewError(filePath, t('file_browser.preview_error'), dlId);
             });
           return;
         }
@@ -1210,13 +1230,13 @@ export function FileBrowser({
         // so any streamed response that reaches here cannot be rendered and must
         // say so instead of pretending to be an empty document.
         if ((msg as { previewMode?: string }).previewMode === 'stream') {
-          setPreview({ status: 'error', path: filePath, error: t('file_browser.preview_error'), downloadId: dlId });
+          finishPreviewError(filePath, t('file_browser.preview_error'), dlId);
           return;
         }
 
         const content = msg.content ?? '';
         if (isBinaryContent(content)) {
-          setPreview({ status: 'error', path: filePath, error: t('file_browser.preview_binary'), downloadId: dlId });
+          finishPreviewError(filePath, t('file_browser.preview_binary'), dlId);
           return;
         }
 
@@ -1391,7 +1411,7 @@ export function FileBrowser({
         return;
       }
     });
-  }, [clearAllPendingPreviewRequests, clearPendingPreviewRequest, fetchDir, getActivePreviewCycle, onDirectoryCreated, sessionName, startPath, showHidden, highlightPath, t, ws]);
+  }, [clearAllPendingPreviewRequests, clearPendingPreviewRequest, fetchDir, finishPreviewError, getActivePreviewCycle, onDirectoryCreated, sessionName, startPath, showHidden, highlightPath, t, ws]);
 
   const fetchPreview = useCallback((
     filePath: string,
@@ -1399,6 +1419,7 @@ export function FileBrowser({
     requestedViewMode?: HtmlPreviewViewMode,
   ) => {
     const nextViewMode = requestedViewMode ?? (preferDiff ? 'diff' : 'source');
+    previewErrorPathRef.current = null;
     const shouldFetchDiff = nextViewMode !== 'html-render';
     if (editDirtyRef.current) {
       if (!window.confirm(tRef.current('fileBrowser.unsavedChanges'))) return;
@@ -1704,6 +1725,10 @@ export function FileBrowser({
     if (dismissedAutoPreviewPathRef.current === autoPreviewPath) return;
     const currentPreviewPath = preview.status !== 'idle' ? (preview as { path: string }).path : null;
     if (currentPreviewPath === autoPreviewPath && preview.status !== 'idle') {
+      if (preview.status === 'error' && previewErrorPathRef.current !== autoPreviewPath) {
+        fetchPreview(autoPreviewPath, autoPreviewPreferDiff, initialPreviewViewMode);
+        return;
+      }
       if (previewTabOverridePathRef.current !== autoPreviewPath) {
         const nextMode = initialPreviewViewMode ?? (autoPreviewPreferDiff ? 'diff' : 'source');
         setPreviewViewMode(nextMode);

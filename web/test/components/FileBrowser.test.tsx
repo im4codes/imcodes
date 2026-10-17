@@ -2783,6 +2783,46 @@ describe('FileBrowser', () => {
     expect(document.querySelector('.fb-preview-error')?.textContent).toBe('file_browser.preview_error');
   });
 
+  it('retries a cached chat preview error once when the same path is opened again', async () => {
+    const { ws, sendMsg } = makeWsFactory();
+    const view = render(
+      <FileBrowser
+        ws={ws}
+        mode="file-single"
+        layout="panel"
+        initialPath="/home/user"
+        autoPreviewPath="/home/user/missing.ts"
+        initialPreview={{ status: 'error', path: '/home/user/missing.ts', error: 'file_browser.preview_error' }}
+        onConfirm={vi.fn()}
+      />,
+    );
+
+    await waitFor(() => expect(ws.fsReadFile).toHaveBeenCalledTimes(1));
+    expect(view.container.querySelector('.fb-preview-loading')).not.toBeNull();
+
+    await act(async () => {
+      sendMsg({
+        type: 'fs.read_response',
+        requestId: 'mock-read-id',
+        path: '/home/user/missing.ts',
+        status: 'error',
+        error: 'not_found',
+      });
+      // A diff response can arrive after the read failed. It must not revive
+      // the failed chat preview or overwrite its error state.
+      sendMsg({
+        type: 'fs.git_diff_response',
+        requestId: 'mock-git-diff-id',
+        path: '/home/user/missing.ts',
+        status: 'ok',
+        diff: '+late response',
+      });
+    });
+
+    expect(view.container.querySelector('.fb-preview-error')?.textContent).toBe('file_browser.preview_error');
+    expect(ws.fsReadFile).toHaveBeenCalledTimes(1);
+  });
+
   it('times out a missing preview read and allows same-file retry', async () => {
     vi.useFakeTimers();
     const { ws, respond } = makeWsFactory();
