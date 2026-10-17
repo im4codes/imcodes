@@ -1014,6 +1014,8 @@ describe('styles.css regression contracts', () => {
     expect(menuRule![0]).toMatch(/max-height:\s*calc\(var\(--vvh,\s*100dvh\)\s*-\s*var\(--sat,\s*0px\)\s*-\s*68px\s*-\s*env\(safe-area-inset-bottom,\s*0px\)\)/);
     expect(menuRule![0]).not.toMatch(/max-height:\s*min\(60vh/);
     expect(menuRule![0]).toMatch(/padding-bottom:\s*max\(16px,\s*env\(safe-area-inset-bottom,\s*0px\)\)/);
+    expect(menuRule![0]).toMatch(/scroll-padding-bottom:\s*max\(16px,\s*env\(safe-area-inset-bottom,\s*0px\)\)/);
+    expect(menuRule![0]).toMatch(/overflow-y:\s*auto/);
 
     const menuItemRule = css.match(/\.mobile-server-menu-item\s*\{[^}]*\}/);
     expect(menuItemRule).not.toBeNull();

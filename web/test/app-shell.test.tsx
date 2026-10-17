@@ -3019,6 +3019,58 @@ describe('App shell', () => {
     }
   }, 20_000);
 
+  it('keeps the final server reachable in a long narrow mobile menu', async () => {
+    const originalUserAgent = navigator.userAgent;
+    const originalInnerWidth = window.innerWidth;
+    const servers = Array.from({ length: 24 }, (_, index) => ({
+      id: `srv-${index + 1}`,
+      name: index === 0 ? 'Alpha Server' : `Server ${index + 1}`,
+      status: 'online',
+      lastHeartbeatAt: Date.now(),
+      createdAt: Date.now(),
+      daemonVersion: '2026.5.11',
+    }));
+    Object.defineProperty(navigator, 'userAgent', { configurable: true, value: 'Android' });
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 320 });
+    apiFetchMock.mockImplementation(async (path: string) => {
+      if (path === '/api/auth/user/me') return { id: 'user-1' };
+      if (path === '/api/server') return { servers };
+      if (path === '/api/server/srv-1/sessions') return sessionList();
+      if (path.startsWith('/api/watch/sessions')) return { sessions: [] };
+      return {};
+    });
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+    try {
+      const { App } = await importApp();
+      const view = render(<App />);
+      await waitFor(() => expect(wsInstances.length).toBe(1));
+      fireEvent.click(view.container.querySelector('.mobile-server-btn')!);
+
+      const menuPanel = await waitFor(() => {
+        const panel = view.container.querySelector('.mobile-server-menu');
+        expect(panel).toBeTruthy();
+        return panel as HTMLElement;
+      });
+      const menu = within(menuPanel).getByText('Server 24');
+      expect(menuPanel.querySelectorAll('.mobile-server-menu-item')).toHaveLength(26);
+
+      Object.defineProperties(menuPanel, {
+        clientHeight: { configurable: true, value: 228 },
+        scrollHeight: { configurable: true, value: 1_200 },
+      });
+      menuPanel.scrollTop = menuPanel.scrollHeight - menuPanel.clientHeight;
+      fireEvent.scroll(menuPanel);
+      expect(menuPanel.scrollTop + menuPanel.clientHeight).toBe(menuPanel.scrollHeight);
+      expect(menuPanel.contains(menu)).toBe(true);
+    } finally {
+      Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUserAgent });
+      Object.defineProperty(window, 'innerWidth', { configurable: true, value: originalInnerWidth });
+    }
+  }, 20_000);
+
   it('refreshes the session list when the daemon reconnects behind an open browser socket', async () => {
     localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
     localStorage.setItem('rcc_server', 'srv-1');
