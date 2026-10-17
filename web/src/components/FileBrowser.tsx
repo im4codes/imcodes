@@ -574,6 +574,11 @@ export function FileBrowser({
   directoryQuery = false,
 }: FileBrowserProps) {
   const { t, i18n } = useTranslation();
+  // react-i18next may provide a new `t` function after every render. Keep
+  // preview callbacks stable: auto-preview effects depend on them, and a
+  // changing callback would re-dispatch the same chat preview indefinitely.
+  const tRef = useRef(t);
+  tRef.current = t;
   const uiLocale = i18n?.language || 'en';
   const includeFiles = mode !== 'dir-only';
   const scopedSessionName = scopeToSessionRoot ? sessionName : undefined;
@@ -840,8 +845,8 @@ export function FileBrowser({
     const active = getActivePreviewCycle();
     if (!active || active.path !== request.path || active.cycleId !== request.cycleId) return;
     activePreviewCycleRef.current = null;
-    setPreview({ status: 'error', path: request.path, error: t('file_browser.preview_error') });
-  }, [clearPendingPreviewRequest, getActivePreviewCycle, t]);
+    setPreview({ status: 'error', path: request.path, error: tRef.current('file_browser.preview_error') });
+  }, [clearPendingPreviewRequest, getActivePreviewCycle]);
 
   const trackPendingPreviewRequest = useCallback((
     kind: 'read' | 'diff',
@@ -906,11 +911,11 @@ export function FileBrowser({
         // nothing over the wire, guaranteeing the retry also times out.
         ws.forgetOwnedDataRequest(requestId);
         setData((prev) => updateNode(prev, nodePath, { isLoading: false }));
-        setError(t('file_browser.timeout_detail', { defaultValue: t('file_browser.timeout') }));
+        setError(tRef.current('file_browser.timeout_detail', { defaultValue: tRef.current('file_browser.timeout') }));
       }
     }, REQUEST_TIMEOUT_MS);
     timersRef.current.set(requestId, timer);
-  }, [directoryQuery, includeFiles, listView, scopedSessionName, showHidden, t, ws]);
+  }, [directoryQuery, includeFiles, listView, scopedSessionName, showHidden, ws]);
 
   // Ask for a directory again with the sort/filter now in force, replacing a
   // request still in flight for it: only the answer to the LAST ask is ever
@@ -946,7 +951,7 @@ export function FileBrowser({
         const loadingPath = previewRef.current.status === 'loading' ? previewRef.current.path : null;
         activePreviewCycleRef.current = null;
         if (loadingPath) {
-          setPreview({ status: 'error', path: loadingPath, error: t('file_browser.preview_error') });
+          setPreview({ status: 'error', path: loadingPath, error: tRef.current('file_browser.preview_error') });
         }
         // Re-fetch root and changes
         if (mountedRef.current) fetchDir(startPath);
@@ -1396,7 +1401,7 @@ export function FileBrowser({
     const nextViewMode = requestedViewMode ?? (preferDiff ? 'diff' : 'source');
     const shouldFetchDiff = nextViewMode !== 'html-render';
     if (editDirtyRef.current) {
-      if (!window.confirm(t('fileBrowser.unsavedChanges'))) return;
+      if (!window.confirm(tRef.current('fileBrowser.unsavedChanges'))) return;
     }
     // Keep the left tree in sync with the previewed file without discarding the
     // user's expanded tree. If the file's parent already exists in the current
@@ -1460,7 +1465,7 @@ export function FileBrowser({
       const diffId = scopedSessionName ? ws.fsGitDiff(filePath, scopedSessionName) : ws.fsGitDiff(filePath);
       trackPendingPreviewRequest('diff', diffId, { path: filePath, cycleId, reason: 'interactive' });
     }
-  }, [autoPreviewPath, fetchDir, getActivePreviewCycle, hasPendingPreviewWork, onPreviewFile, onPreviewStateChange, scopedSessionName, t, trackPendingPreviewRequest, ws]);
+  }, [autoPreviewPath, fetchDir, getActivePreviewCycle, hasPendingPreviewWork, onPreviewFile, onPreviewStateChange, scopedSessionName, trackPendingPreviewRequest, ws]);
 
   const [expandedPaths, setExpandedPaths] = useState<Set<string>>(() => new Set([startPath]));
 
