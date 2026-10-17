@@ -30,6 +30,7 @@ import {
   directFileTransferDaemonCapabilities,
   setServerLinkReconnectResyncHandler,
 } from '../../src/daemon/server-link.js';
+import { CoreLaneSocket } from '../../src/daemon/core-lane-socket.js';
 import { TIMELINE_DELIVERY_METRICS } from '../../shared/timeline-delivery-telemetry.js';
 import { getCounter, resetMetricsForTests } from '../../src/util/metrics.js';
 import { recordDaemonServerLinkStatus } from '../../src/util/daemon-status.js';
@@ -211,6 +212,50 @@ describe('ServerLink', () => {
     await new Promise<void>((resolve) => setImmediate(resolve));
     expect(mockWsInstance.send).toHaveBeenCalledTimes(2);
     expect(JSON.parse(mockWsInstance.send.mock.calls[1][0] as string).type).toBe('chat.history');
+  });
+
+  it('turns a core-lane normal queue rejection into a priority preview error', async () => {
+    const sends: Array<{ raw: string; priority?: string }> = [];
+    const coreLane = Object.create(CoreLaneSocket.prototype) as CoreLaneSocket & {
+      readyState: number;
+      bufferedAmount: number;
+      send(raw: string, priority?: string): void;
+    };
+    coreLane.readyState = CoreLaneSocket.OPEN;
+    coreLane.bufferedAmount = 0;
+    (coreLane as unknown as { worker: { postMessage: () => void; terminate: () => Promise<void> } }).worker = {
+      postMessage: vi.fn(),
+      terminate: vi.fn(async () => {}),
+    };
+    let first = true;
+    coreLane.send = (raw, priority) => {
+      if (first) {
+        first = false;
+        throw new Error('core lane normal queue is full');
+      }
+      sends.push({ raw, priority });
+    };
+    (link as unknown as { ws: CoreLaneSocket }).ws = coreLane;
+
+    link.send({
+      type: 'fs.read_response',
+      requestId: 'preview-overloaded',
+      path: '/repo/large.log',
+      status: 'ok',
+      content: 'x'.repeat(256),
+    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    expect(sends).toHaveLength(1);
+    expect(sends[0]?.priority).toBe('priority');
+    expect(JSON.parse(sends[0]!.raw)).toMatchObject({
+      type: 'fs.read_response',
+      requestId: 'preview-overloaded',
+      status: 'error',
+      error: 'preview_worker_queue_full',
+      recoverable: true,
+    });
+    expect(link.dataPlaneQueueStatsForTests().depth).toBe(0);
   });
 
   it('does not queue live timeline events behind bulk history sends', async () => {

@@ -43,6 +43,7 @@ import {
 } from '../../shared/timeline-protocol.js';
 import { TIMELINE_REQUEST_ERROR_REASONS } from '../../shared/timeline-history-errors.js';
 import { FS_GENERIC_ERROR_CODES } from '../../shared/fs-error-codes.js';
+import { FS_READ_ERROR_CODES } from '../../shared/fs-read-error-codes.js';
 import { TRANSPORT_MSG } from '../../shared/transport-events.js';
 import {
   FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY,
@@ -425,7 +426,9 @@ function compactDataPlaneBackpressureResponse(msg: unknown): Record<string, unkn
       ...common,
       ...(typeof input.path === 'string' ? { path: input.path } : {}),
       status: 'error',
-      error: FS_GENERIC_ERROR_CODES.FS_LIST_WORKER_QUEUE_FULL,
+      error: type === 'fs.read_response'
+        ? FS_READ_ERROR_CODES.PREVIEW_WORKER_QUEUE_FULL
+        : FS_GENERIC_ERROR_CODES.FS_LIST_WORKER_QUEUE_FULL,
       recoverable: true,
       ...(type === 'fs.git_status_response' ? { files: [] } : {}),
       ...(type === 'file.search_response' ? { results: [] } : {}),
@@ -455,6 +458,11 @@ function compactDataPlaneBackpressureResponse(msg: unknown): Record<string, unkn
   }
 
   return null;
+}
+
+function isCoreLaneQueueFullError(error: unknown): boolean {
+  return error instanceof Error
+    && /^core lane (?:normal|priority) queue is full$/.test(error.message);
 }
 
 export function __setServerLinkDataPlaneQueueConfigForTests(options: {
@@ -981,6 +989,50 @@ export class ServerLink {
       });
       return true;
     } catch (err) {
+      // A data-plane payload rejected by the worker socket's normal queue must
+      // not remain at the head of the deferred queue forever.  Convert it to a
+      // compact, priority-lane request error so the browser can leave loading
+      // and retry/close while command acks and heartbeats retain their lane.
+      // Only handle the explicit queue-cap error; reconnect/socket failures
+      // still keep the original payload for the existing retry path.
+      if (
+        isCoreLaneQueueFullError(err)
+        && this.ws instanceof CoreLaneSocket
+        && this.shouldDeferDataPlaneSend(msg)
+      ) {
+        const fallback = compactDataPlaneBackpressureResponse(msg);
+        if (fallback) {
+          try {
+            this.seq++;
+            const serialized = stringifyForServerSend(fallback, this.seq);
+            this.ws.send(serialized.payload, 'priority');
+            recordServerSend({
+              msgType: serialized.msgType,
+              commandId: serialized.commandId,
+              jsonBytes: serialized.jsonBytes,
+              stringifyMs: serialized.stringifyMs,
+              wsSendMs: 0,
+              bufferedAmountBefore: undefined,
+              bufferedAmountAfter: undefined,
+              sendBacklogAgeMs: undefined,
+              outboundQueueDepth: this.dataPlaneSendQueue.length,
+              outboundQueueBytes: this.dataPlaneSendQueueBytes,
+              outboundQueueAgeMs: this.dataPlaneQueueStartedAt === null
+                ? 0
+                : performance.now() - this.dataPlaneQueueStartedAt,
+              recipientCount: 1,
+              success: true,
+            });
+            incrementCounter('serverlink_data_plane_queue_full_response', {
+              msgType: serialized.msgType ?? 'unknown',
+            });
+            return true;
+          } catch {
+            // Preserve the original failure path if the reserved priority lane
+            // is also unavailable.
+          }
+        }
+      }
       clearServerLinkSecurity('socket_send_error');
       recordServerSend({
         msgType: typeof (msg as { type?: unknown })?.type === 'string' ? (msg as { type: string }).type : undefined,
