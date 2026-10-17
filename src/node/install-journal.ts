@@ -1,3 +1,4 @@
+import { normalizeControlledNodeAbiProfile, type ControlledNodeAbiProfile } from '../../shared/controlled-node-abi.js';
 // Recoverable install journal for the controlled node (10.10). Each phase is
 // persisted with fsync + atomic rename so a reboot resumes from the last
 // completed phase. The critical ordering fix: elevation + protected-dir creation
@@ -53,6 +54,19 @@ export function isInstallComplete(phase: InstallPhase): boolean {
 
 export type SourceCleanupStatus = 'pending' | 'cleaned' | 'skipped' | 'failed';
 
+/**
+ * Cryptographic identity of the installer the human actually launched.
+ *
+ * The download LOCATION is not an identity: a retry legitimately arrives from
+ * `... (1).exe`, a fresh temp directory, or a different Downloads folder, and
+ * an attacker running their own binary picks their own path anyway. The bytes
+ * are the identity, so they are what the journal pins.
+ */
+export interface SourceArtifactIdentity {
+  sha256: string;
+  size: number;
+}
+
 export interface ServiceReceipt {
   name: string;
   platform: NodeJS.Platform;
@@ -65,6 +79,7 @@ export interface ServiceReceipt {
 }
 
 export interface InstallJournal {
+  abiProfile?: ControlledNodeAbiProfile;
   version?: typeof INSTALL_JOURNAL_VERSION;
   phase: InstallPhase;
   updatedAt: number;
@@ -73,6 +88,7 @@ export interface InstallJournal {
   nodeTokenHash?: string;
   sourceExePath?: string;
   stagedExePath?: string;
+  sourceArtifact?: SourceArtifactIdentity;
   stagedReceipt?: StagedExecutableReceipt;
   serverId?: string;
   serviceName?: string;
@@ -101,6 +117,15 @@ function isFileIdentity(value: unknown): value is FileIdentity {
     && Number.isFinite(record.mtimeMs)
     && typeof record.ctimeMs === 'number'
     && Number.isFinite(record.ctimeMs);
+}
+
+function isSourceArtifact(value: unknown): value is SourceArtifactIdentity {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const record = value as Record<string, unknown>;
+  return isNonEmptyString(record.sha256, 256)
+    && typeof record.size === 'number'
+    && Number.isSafeInteger(record.size)
+    && record.size > 0;
 }
 
 function isStagedReceipt(value: unknown): value is StagedExecutableReceipt {
@@ -138,10 +163,12 @@ function validateJournalMetadata(journal: InstallJournal): void {
     && journal.phase === 'uninstalled'
     && journal.updatedAt === 0;
   if (journal.version !== INSTALL_JOURNAL_VERSION && !isFreshDefault) invalidJournal('install journal version is invalid');
+  if (!normalizeControlledNodeAbiProfile(journal.abiProfile)) invalidJournal('install journal ABI profile is invalid');
   if (!Number.isSafeInteger(journal.updatedAt) || journal.updatedAt < 0) invalidJournal('install journal updatedAt is invalid');
   if (journal.installId !== undefined && !isNonEmptyString(journal.installId, 512)) invalidJournal('install journal installId is invalid');
   if (journal.nodeTokenHash !== undefined && !isEnrollmentNodeTokenHash(journal.nodeTokenHash)) invalidJournal('install journal nodeTokenHash is invalid');
   if (journal.sourceExePath !== undefined && !isNonEmptyString(journal.sourceExePath)) invalidJournal('install journal sourceExePath is invalid');
+  if (journal.sourceArtifact !== undefined && !isSourceArtifact(journal.sourceArtifact)) invalidJournal('install journal sourceArtifact is invalid');
   if (journal.stagedExePath !== undefined && !isNonEmptyString(journal.stagedExePath)) invalidJournal('install journal stagedExePath is invalid');
   if (journal.stagedReceipt !== undefined && !isStagedReceipt(journal.stagedReceipt)) invalidJournal('install journal stagedReceipt is invalid');
   if (journal.serverId !== undefined && !isNonEmptyString(journal.serverId, 512)) invalidJournal('install journal serverId is invalid');
@@ -162,8 +189,15 @@ function validateJournalMetadata(journal: InstallJournal): void {
 
   const hasIdentityMetadata = journal.installId !== undefined
     || journal.nodeTokenHash !== undefined
-    || journal.sourceExePath !== undefined;
+    || journal.sourceExePath !== undefined
+    || journal.sourceArtifact !== undefined;
   if (index < credentialIndex && hasIdentityMetadata) invalidJournal('install identity metadata precedes credential_prepared');
+  // `sourceArtifact` is deliberately NOT required here. Journals written before
+  // it existed are already on disk at credential_prepared/files_staged, and
+  // refusing to LOAD them would kill the upgrade before the freshly downloaded
+  // executable is ever inspected — strictly worse than the bug this all started
+  // from. Those journals adopt an artifact at the verification boundary in
+  // bootstrap instead; once adopted it is immutable like any other.
   if (index >= credentialIndex && (!journal.installId || !journal.nodeTokenHash || !journal.sourceExePath)) {
     invalidJournal('credential_prepared requires durable install identity metadata');
   }
@@ -184,14 +218,40 @@ function validateJournalMetadata(journal: InstallJournal): void {
   if (index >= healthyIndex && journal.healthyAt === undefined) invalidJournal('service_healthy requires healthyAt');
 }
 
+/**
+ * Fields no later phase may contradict, compared by value.
+ *
+ * `sourceExePath` is NOT here — not because it is unguarded, but because a
+ * blanket equality rule is both too strict and too weak for it. Too strict:
+ * it killed every interrupted-install retry, because a re-download legitimately
+ * lands on `... (1).exe` or a new temp directory. Too weak: it happily accepted
+ * DIFFERENT BYTES arriving at the SAME path. `assertImmutableMetadata` governs
+ * it instead with `sourceArtifact` equality plus a phase bound, which refuses
+ * both of those.
+ */
 const IMMUTABLE_JOURNAL_FIELDS = [
+  'abiProfile',
   'installId',
   'nodeTokenHash',
-  'sourceExePath',
   'stagedExePath',
   'serverId',
   'serviceName',
 ] as const satisfies readonly (keyof InstallJournal)[];
+
+/**
+ * The last phase at which a re-download may still be adopted.
+ *
+ * Everything before `enrolled` is the interrupted-install retry window: the
+ * human downloads, it fails part-way, they download again and re-run. From
+ * `enrolled` onwards the install owns a server-side identity and a registered
+ * service, so a source executable appearing from somewhere new is not a retry —
+ * it is something else, and it fails closed.
+ */
+const SOURCE_PATH_MIGRATION_LAST_PHASE: InstallPhase = 'files_staged';
+
+function sameSourceArtifact(a: SourceArtifactIdentity, b: SourceArtifactIdentity): boolean {
+  return a.sha256 === b.sha256 && a.size === b.size;
+}
 
 function assertImmutableMetadata(existing: InstallJournal, patch: Partial<InstallJournal>): void {
   for (const field of IMMUTABLE_JOURNAL_FIELDS) {
@@ -199,6 +259,64 @@ function assertImmutableMetadata(existing: InstallJournal, patch: Partial<Instal
     const next = patch[field];
     if (current !== undefined && next !== undefined && current !== next) {
       throw new InstallJournalTransitionError(`install journal immutable field changed: ${field}`);
+    }
+  }
+
+  // The artifact IS the identity, so it is absolutely immutable. A different
+  // package, a re-signed package, or any byte change lands here.
+  if (existing.sourceArtifact !== undefined && patch.sourceArtifact !== undefined
+    && !sameSourceArtifact(existing.sourceArtifact, patch.sourceArtifact)) {
+    throw new InstallJournalTransitionError('install journal immutable field changed: sourceArtifact');
+  }
+
+  // The staged TARGET is pinned; the staged CONTENT is not.
+  //
+  // Pinning the content outright was wrong: re-staging is a legitimate repair.
+  // An already-registered machine whose service copy was corrupted, deleted, or
+  // replaced by a newer verified package must be able to write a fresh receipt,
+  // and a blanket content lock made that impossible.
+  //
+  // What must never move is WHERE the service runs from. `stagedExePath` is in
+  // the blanket immutable list above, and a receipt is only accepted when it
+  // describes exactly that path — so a receipt can refresh the bytes at the
+  // pinned target, and can never redirect the service somewhere else.
+  const pinnedTarget = existing.stagedExePath ?? patch.stagedExePath;
+  if (patch.stagedReceipt !== undefined && pinnedTarget !== undefined
+    && patch.stagedReceipt.path !== pinnedTarget) {
+    throw new InstallJournalTransitionError(
+      'install journal staged receipt must describe the pinned staged target',
+    );
+  }
+
+  // `sourceExePath` may move, but only as a bounded, evidence-backed migration:
+  // still inside the retry window, and only when the NEW download is byte-for-byte
+  // the artifact this install already committed to. Anything else fails closed.
+  if (existing.sourceExePath !== undefined && patch.sourceExePath !== undefined
+    && existing.sourceExePath !== patch.sourceExePath) {
+    if (phaseIndex(existing.phase) > phaseIndex(SOURCE_PATH_MIGRATION_LAST_PHASE)) {
+      throw new InstallJournalTransitionError(
+        `install journal source path may not change after ${SOURCE_PATH_MIGRATION_LAST_PHASE}`,
+      );
+    }
+    if (patch.sourceArtifact === undefined) {
+      throw new InstallJournalTransitionError(
+        'install journal source path change requires an identical verified source artifact',
+      );
+    }
+    if (existing.sourceArtifact === undefined) {
+      // One-time compatibility adoption for a journal written before
+      // `sourceArtifact` existed. There is nothing to compare against, so the
+      // guarantee comes from the caller: this write only happens after
+      // publisher trust and the verified enrollment source have vouched for the
+      // bytes, and the phase bound above still confines it to the
+      // pre-enrollment retry window. Everything else about the install —
+      // installId, nodeTokenHash, stagedExePath, stagedReceipt — is unchanged
+      // and still checked. From the next write onwards the adopted artifact is
+      // as immutable as any other.
+    } else if (!sameSourceArtifact(existing.sourceArtifact, patch.sourceArtifact)) {
+      throw new InstallJournalTransitionError(
+        'install journal source path change requires an identical verified source artifact',
+      );
     }
   }
 }
@@ -209,9 +327,11 @@ function mergeJournal(existing: InstallJournal | null, patch: Partial<InstallJou
     ...base,
     ...patch,
     version: INSTALL_JOURNAL_VERSION,
+    abiProfile: patch.abiProfile !== undefined ? patch.abiProfile : base.abiProfile,
     installId: patch.installId ?? base.installId,
     nodeTokenHash: patch.nodeTokenHash ?? base.nodeTokenHash,
     sourceExePath: patch.sourceExePath ?? base.sourceExePath,
+    sourceArtifact: patch.sourceArtifact ?? base.sourceArtifact,
     stagedExePath: patch.stagedExePath ?? base.stagedExePath,
     stagedReceipt: patch.stagedReceipt ?? base.stagedReceipt,
     serverId: patch.serverId ?? base.serverId,
@@ -272,11 +392,13 @@ export async function loadInstallJournal(path: string): Promise<InstallJournal> 
     }
     const journal = mergeJournal(null, {
       version: parsed.version,
+      abiProfile: parsed.abiProfile,
       phase: parsed.phase,
       updatedAt: parsed.updatedAt ?? 0,
       installId: parsed.installId,
       nodeTokenHash: parsed.nodeTokenHash,
       sourceExePath: parsed.sourceExePath,
+      sourceArtifact: parsed.sourceArtifact,
       stagedExePath: parsed.stagedExePath,
       stagedReceipt: parsed.stagedReceipt,
       serverId: parsed.serverId,
@@ -303,8 +425,10 @@ export async function writeInstallPhase(
   extra: {
     installId?: string;
     nodeTokenHash?: string;
+    abiProfile?: ControlledNodeAbiProfile;
     sourceExePath?: string;
     stagedExePath?: string;
+    sourceArtifact?: SourceArtifactIdentity;
     stagedReceipt?: StagedExecutableReceipt;
     serverId?: string;
     serviceName?: string;
@@ -338,9 +462,11 @@ export async function writeInstallPhase(
   const patch: Partial<InstallJournal> = {
     phase,
     updatedAt: extra.now,
+    abiProfile: extra.abiProfile,
     installId: extra.installId,
     nodeTokenHash: extra.nodeTokenHash,
     sourceExePath: extra.sourceExePath,
+    sourceArtifact: extra.sourceArtifact,
     stagedExePath: extra.stagedExePath,
     stagedReceipt: extra.stagedReceipt,
     serverId: extra.serverId,

@@ -104,6 +104,26 @@ describe('LiveContextIngestion', () => {
     });
   });
 
+  it('never ingests a user-deleted message as memory, live or through backfill', async () => {
+    const ingestion = new LiveContextIngestion({ compressor: localOnlyCompressor,
+      thresholds: { eventCount: 99, idleMs: 60_000, scheduleMs: 60_000 },
+      sessionLookup: () => session,
+      resolveBootstrap: async () => ({ namespace, diagnostics: ['test'] }),
+    });
+    // What a delete of a mid-stream message emits: hidden, non-streaming, userDeleted.
+    const tombstone = { ...makeEvent('assistant.text', 110, { text: 'partial text the user deleted', streaming: false, userDeleted: true }), hidden: true };
+    const tombstonedUser = { ...makeEvent('user.message', 120, { text: 'phantom', userDeleted: true }), hidden: true };
+
+    await ingestion.handleTimelineEvent(tombstone);
+    await ingestion.handleTimelineEvent(tombstonedUser);
+    expect(listContextEvents({ namespace, kind: 'session', sessionName: session.name })).toHaveLength(0);
+
+    // Backfill reads persisted rows, which now contain tombstones (and the original before it).
+    const original = makeEvent('assistant.text', 100, { text: 'partial text the user deleted', streaming: false });
+    await ingestion.backfillSessionFromEvents(session.name, [{ ...original, eventId: tombstone.eventId, seq: 100 }, tombstone]);
+    expect(listContextEvents({ namespace, kind: 'session', sessionName: session.name })).toHaveLength(0);
+  });
+
   it('ignores streaming assistant deltas and only records the finalized assistant text', async () => {
     const ingestion = new LiveContextIngestion({ compressor: localOnlyCompressor,
       thresholds: { eventCount: 99, idleMs: 60_000, scheduleMs: 60_000 },
@@ -542,6 +562,48 @@ describe('LiveContextIngestion', () => {
     expect(maxActive).toBeLessThanOrEqual(8);
     expect(getCounter('mem.ingest.buffer.transient_retry')).toBe(10);
     ingestion.dispose();
+  });
+
+  it('bounds the sessions draining at once across the backoff timers too, not only within one sweep', async () => {
+    // Many sessions failing for the same reason have their backoff timers fall due together. Each timer drains its own session, so without
+    // a bound that is shared with the sweep, all of them hit the overloaded store at once.
+    vi.useFakeTimers();
+    try {
+      const ingestion = new LiveContextIngestion({ compressor: localOnlyCompressor,
+        thresholds: { eventCount: 99, idleMs: 60_000, scheduleMs: 60_000 },
+        sessionLookup: (sessionName) => ({ ...session, name: sessionName }),
+        resolveBootstrap: async () => ({ namespace, diagnostics: ['test'] }),
+      });
+      let active = 0;
+      let maxActive = 0;
+      let started = 0;
+      vi.spyOn(ingestion.coordinator, 'ingestEvent').mockImplementation(async () => {
+        active += 1;
+        started += 1;
+        maxActive = Math.max(maxActive, active);
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        active -= 1;
+        throw new ContextStoreError(CONTEXT_STORE_RPC_ERROR.overloaded, 'worker saturated');
+      });
+      for (let index = 0; index < 10; index += 1) {
+        const sessionName = `${session.name}_timers_${index}`;
+        enqueuePreparedRetryableEventForTest(
+          ingestion,
+          makePreparedIngest(makeEvent('user.message', 2_000 + index, { text: `buffered ${index}` }, sessionName), namespace, sessionName, `timers:${index}`),
+          new ContextStoreError(CONTEXT_STORE_RPC_ERROR.unavailable, 'initial outage'),
+          0,
+        );
+      }
+      // Every session's first backoff timer (250 ms) falls due in this one step.
+      await vi.advanceTimersByTimeAsync(300);
+      await vi.advanceTimersByTimeAsync(50);
+      expect(started).toBeGreaterThanOrEqual(10);
+      expect(maxActive).toBeGreaterThan(1);
+      expect(maxActive).toBeLessThanOrEqual(8);
+      ingestion.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('does not stage a duplicate when backfill replays the same logical live event', async () => {

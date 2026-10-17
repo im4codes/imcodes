@@ -27,7 +27,6 @@
  * loader accepts them verbatim while we avoid hand-rolling YAML escaping.
  */
 import { mkdir, rm, writeFile } from 'node:fs/promises';
-import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import {
@@ -38,12 +37,27 @@ import {
   type DshLlmConfig,
 } from '../../../../shared/deepseek-harness.js';
 import { IMCODES_MEMORY_MCP_SERVER_NAME } from '../../../../shared/memory-mcp-server-name.js';
+import { imcodesStateDir } from '../../../util/imcodes-state-dir.js';
 
 /** Stock profile we overlay. `dsh` owns its bootstrap and dependency install. */
 export const DSH_BASE_PROFILE = 'headless';
 
 /** One-shot rows the overlay disables so the process stays alive for a session. */
 export const DSH_DISABLED_ROW_IDS = ['headless-runner', 'headless-startup'] as const;
+
+/**
+ * dsh-base rows that start, orchestrate or hand more work to native agents:
+ * spawn and fork sub-agents, the follow-up `send_message` control, workflows
+ * and Ralph iteration. A managed session's overlay disables all of them
+ * (patched by id like the stock headless rows).
+ */
+export const DSH_NATIVE_AGENT_ROW_IDS = [
+  'tool-subagent',
+  'tool-subagent-fork',
+  'tool-subagent-control',
+  'tool-workflow',
+  'tool-ralph',
+] as const;
 
 /** Package that connects one external MCP server and registers its tools. */
 export const DSH_MCP_CLIENT_PACKAGE = '@deepseek-ai/dsh-mcp-client';
@@ -93,7 +107,7 @@ export function resolveBridgeEntry(): string {
 
 /** Directory holding generated per-session overlays. */
 export function dshOverlayDir(): string {
-  return join(homedir(), '.imcodes', 'dsh');
+  return join(imcodesStateDir(), 'dsh');
 }
 
 /** Minimal stdio MCP server description the overlay can mount. */
@@ -110,6 +124,8 @@ export interface DshOverlayOptions {
   memoryMcp?: DshMcpServer;
   /** LLM route registered with dsh's generic provider adapter. */
   llm?: DshLlmConfig;
+  /** Withhold native agent tools (`DSH_NATIVE_AGENT_ROW_IDS`) for a managed session. */
+  nativeAgentsFenced?: boolean;
 }
 
 interface DshPatchRow {
@@ -129,9 +145,12 @@ interface DshPatchRow {
  * its value must never be serialized into this on-disk overlay.
  */
 export function buildDshOverlay(
-  options: Pick<DshOverlayOptions, 'memoryMcp' | 'llm'>,
+  options: Pick<DshOverlayOptions, 'memoryMcp' | 'llm' | 'nativeAgentsFenced'>,
 ): DshPatchRow[] {
-  const rows: DshPatchRow[] = DSH_DISABLED_ROW_IDS.map((id) => ({ id, disabled: true }));
+  const rows: DshPatchRow[] = [
+    ...DSH_DISABLED_ROW_IDS,
+    ...(options.nativeAgentsFenced ? DSH_NATIVE_AGENT_ROW_IDS : []),
+  ].map((id) => ({ id, disabled: true }));
   const insert: DshPatchRow[] = [];
   if (options.memoryMcp) {
     insert.push({

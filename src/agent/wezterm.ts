@@ -11,15 +11,15 @@
  * from persisted SessionRecord.paneId values.
  */
 
-import { execFile as execFileCb, execFileSync } from 'child_process';
-import { promisify } from 'util';
+import { execFileSync } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import { Readable } from 'stream';
 import { TMUX_KEY_TO_ESCAPE } from './key-map.js';
+import { execFileOffMain as execFile } from '../util/exec-helper.js';
+import { imcodesStateDir } from '../util/imcodes-state-dir.js';
 
-const execFile = promisify(execFileCb);
 
 // ── Name → pane_id mapping ─────────────────────────────────────────────────────
 
@@ -123,7 +123,7 @@ export async function weztermNewSession(
   // Shell commands (set, cd /d, &&) won't work. Write to a temp .bat file instead.
   let tmpBat: string | null = null;
   if (command && process.platform === 'win32') {
-    const batDir = path.join(os.homedir(), '.imcodes', 'tmp');
+    const batDir = path.join(imcodesStateDir(), 'tmp');
     fs.mkdirSync(batDir, { recursive: true });
     tmpBat = path.join(batDir, `session-${name}.bat`);
     fs.writeFileSync(tmpBat, `@echo off\r\n${command}\r\n`, 'utf8');

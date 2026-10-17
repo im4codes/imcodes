@@ -171,7 +171,7 @@ describe('tmux shell-injection prevention', () => {
     await tmux.capturePaneVisible('deck_test_brain');
     const call = execFileCalls.find((c) => c.args[0] === 'capture-pane' && c.args.includes('-e'));
     expect(call).toBeDefined();
-    expect(call!.args).toEqual(['capture-pane', '-e', '-p', '-t', 'deck_test_brain']);
+    expect(call!.args).toEqual(['capture-pane', '-e', '-J', '-p', '-t', 'deck_test_brain']);
   });
 
   it('retries once when tmux server exits between commands', async () => {

@@ -179,16 +179,9 @@ export async function buildSessionBootstrapContextWithItems(
   return { text: parts.join('\n\n'), items };
 }
 
-/**
- * Append inter-agent communication docs to a memory string.
- * Returns the combined memory with send docs appended.
- */
-export function appendAgentSendDocs(memory: string | null): string {
-  if (memory?.trim()) {
-    return `${memory.trim()}\n\n${AGENT_SEND_DOCS}`;
-  }
-  return AGENT_SEND_DOCS;
-}
+// Pure string helper; it lives beside the docs so callers and tests do not
+// have to load this module's memory/timeline/recall graph to use it.
+export { appendAgentSendDocs } from './imcodes-workflow-docs.js';
 
 // ── Codex rollout helpers ──────────────────────────────────────────────────────
 

@@ -1,4 +1,9 @@
+import { CODEBUDDY_PROVIDER_IDS } from './codebuddy.js';
+import { AGY_SDK_PROVIDER_ID } from './agy-agent.js';
+import { HERMES_AGENT_PROVIDER_ID } from './hermes-agent.js';
+
 export const SESSION_AGENT_TYPES = [
+  AGY_SDK_PROVIDER_ID,
   'claude-code-sdk',
   'claude-code',
   'codex-sdk',
@@ -14,8 +19,12 @@ export const SESSION_AGENT_TYPES = [
   'qwen',
   'openclaw',
   'kimi-sdk',
+  HERMES_AGENT_PROVIDER_ID,
   'deepseek-harness',
   'pi',
+  'muse-code-sdk',
+  CODEBUDDY_PROVIDER_IDS.CHINA,
+  CODEBUDDY_PROVIDER_IDS.INTERNATIONAL,
   'shell',
   'script',
 ] as const;
@@ -24,7 +33,9 @@ export type SessionAgentType = typeof SESSION_AGENT_TYPES[number];
 
 export const CLAUDE_CODE_FAMILY = ['claude-code-sdk', 'claude-code'] as const;
 export const CODEX_FAMILY = ['codex-sdk', 'codex'] as const;
+export const MUSE_CODE_FAMILY = ['muse-code-sdk'] as const;
 export const TRANSPORT_SESSION_AGENT_TYPES = [
+  AGY_SDK_PROVIDER_ID,
   'claude-code-sdk',
   'codex-sdk',
   'qoder-sdk',
@@ -34,8 +45,12 @@ export const TRANSPORT_SESSION_AGENT_TYPES = [
   'gemini-sdk',
   'grok-sdk',
   'kimi-sdk',
+  HERMES_AGENT_PROVIDER_ID,
   'deepseek-harness',
   'pi',
+  'muse-code-sdk',
+  CODEBUDDY_PROVIDER_IDS.CHINA,
+  CODEBUDDY_PROVIDER_IDS.INTERNATIONAL,
   'qwen',
   'openclaw',
 ] as const;
@@ -52,6 +67,10 @@ export function isClaudeCodeFamily(value: string): value is typeof CLAUDE_CODE_F
 
 export function isCodexFamily(value: string): value is typeof CODEX_FAMILY[number] {
   return (CODEX_FAMILY as readonly string[]).includes(value);
+}
+
+export function isMuseCodeFamily(value: string): value is typeof MUSE_CODE_FAMILY[number] {
+  return (MUSE_CODE_FAMILY as readonly string[]).includes(value);
 }
 
 export function isTransportSessionAgentType(value: string): value is typeof TRANSPORT_SESSION_AGENT_TYPES[number] {

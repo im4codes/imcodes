@@ -5,6 +5,8 @@
 import { describe, it, expect } from 'vitest';
 import type { TimelineEvent } from '../src/ws-client.js';
 import { mergeTimelineEvents } from '../../src/shared/timeline/merge.js';
+import { AGENT_DELEGATION_REPLY_TIMELINE_EVENT } from '../../shared/agent-delegation.js';
+import { PEER_AUDIT_VERDICTS } from '../../shared/peer-audit.js';
 
 // Reproduce the requestId filtering logic from useTimeline
 function shouldProcessReplay(
@@ -234,6 +236,50 @@ describe('timeline epoch mismatch handling', () => {
     expect(merged).toHaveLength(1);
     expect(merged[0].payload.text).toBe('complete answer');
     expect(merged[0].payload.streaming).toBe(false);
+  });
+
+  it('lets a truncated exact audit verdict replace same-eventId completion prose', () => {
+    const eventId = 'delegation-reply:audit:stable-attempt';
+    const prose = {
+      ...makeEvent({ seq: 20, epoch: 100 }),
+      eventId,
+      type: AGENT_DELEGATION_REPLY_TIMELINE_EVENT,
+      payload: {
+        memoryExcluded: true,
+        sourceSessionName: 'deck_sub_auditor',
+        result: 'Earlier full free-form completion prose.',
+        completeness: 'full',
+      },
+    } as TimelineEvent;
+    const exactVerdict = {
+      ...makeEvent({ seq: 21, epoch: 100 }),
+      eventId,
+      type: AGENT_DELEGATION_REPLY_TIMELINE_EVENT,
+      payload: {
+        memoryExcluded: true,
+        sourceSessionName: 'deck_sub_auditor',
+        result: 'Authoritative findings preview…',
+        verdict: PEER_AUDIT_VERDICTS[0],
+        round: 2,
+        completeness: 'preview',
+        payloadTruncated: true,
+      },
+    } as TimelineEvent;
+
+    const live = mergeTimelineEvents([prose], [exactVerdict], 50);
+    const reloaded = mergeTimelineEvents([exactVerdict], [prose], 50);
+
+    for (const merged of [live, reloaded]) {
+      expect(merged).toHaveLength(1);
+      expect(merged[0]).toMatchObject({
+        eventId,
+        payload: {
+          verdict: PEER_AUDIT_VERDICTS[0],
+          round: 2,
+          result: 'Authoritative findings preview…',
+        },
+      });
+    }
   });
 
   it('truncated replay should trigger snapshot request', () => {

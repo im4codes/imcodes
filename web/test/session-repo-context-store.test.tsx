@@ -9,6 +9,7 @@ import {
   getSessionRepoContext,
   ingestSessionRepoContext,
 } from '../src/session-repo-context-store.js';
+import { FS_SESSION_ROOT_PATH } from '../../src/shared/transport/fs.js';
 import { SessionRepoBranchSummary } from '../src/components/SessionRepoBranchSummary.js';
 
 vi.mock('react-i18next', () => ({
@@ -154,4 +155,38 @@ describe('session repo context store and summary', () => {
     expect(onOpenRepo).toHaveBeenCalledTimes(1);
     expect(screen.queryByText('Repository information')).toBeNull();
   });
+
+  it('falls back between FS_SESSION_ROOT_PATH and concrete projectDir for session lookups', () => {
+    // Ingest under FS_SESSION_ROOT_PATH for a session (e.g. from tab share auto-detect)
+    ingestSessionRepoContext({
+      sessionId: 'deck_proj_brain',
+      projectDir: FS_SESSION_ROOT_PATH,
+      context: {
+        status: 'ok',
+        info: { currentBranch: 'feature/tab-branch' },
+        repoGeneration: 5,
+        detectedAt: 5000,
+      },
+    });
+
+    // Lookup with concrete projectDir should fall back to FS_SESSION_ROOT_PATH
+    expect(getSessionRepoContext('deck_proj_brain', '/real/host/path')?.currentBranch).toBe('feature/tab-branch');
+
+    // Ingest under concrete path for another session
+    ingestSessionRepoContext({
+      sessionId: 'deck_proj_other',
+      projectDir: '/real/host/path',
+      context: {
+        status: 'ok',
+        info: { currentBranch: 'feature/concrete-branch' },
+        repoGeneration: 6,
+        detectedAt: 6000,
+      },
+    });
+
+    // Lookup with FS_SESSION_ROOT_PATH should fall back to the session's concrete path
+    expect(getSessionRepoContext('deck_proj_other', FS_SESSION_ROOT_PATH)?.currentBranch).toBe('feature/concrete-branch');
+  });
 });
+
+

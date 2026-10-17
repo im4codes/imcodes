@@ -16,9 +16,16 @@ import {
 } from './share-http-auth.js';
 import { WsBridge } from '../ws/bridge.js';
 import logger from '../util/logger.js';
+import { listActiveSharesForUser } from '../db/tab-sharing.js';
+import { rawSubSessionIdFromDisplayName } from '../../../shared/tab-sharing.js';
 import { isSessionAgentType } from '../../../shared/agent-types.js';
 import { DAEMON_COMMAND_TYPES } from '../../../shared/daemon-command-types.js';
 import { isKnownTestSessionLike } from '../../../shared/test-session-guard.js';
+import {
+  extractSessionSupervisionSnapshot,
+  hasInvalidSessionSupervisionSnapshot,
+  SUPERVISION_MODE,
+} from '../../../shared/supervision-config.js';
 
 export const subSessionRoutes = new Hono<{ Bindings: Env; Variables: { userId: string; role: string } }>();
 type SubSessionRouteContext = Context<{ Bindings: Env; Variables: { userId: string; role: string } }>;
@@ -90,17 +97,82 @@ subSessionRoutes.post('/:id/sub-sessions', async (c) => {
   const parentSession = typeof body.parent_session === 'string' ? body.parent_session.trim() : '';
   const member = await resolveServerMemberAccessOrShareDeny(c.env.DB, { serverId, userId });
   const memberMayCreate = member.ok && (member.role === 'owner' || member.role === 'admin');
-  const access = !member.ok && parentSession
-    ? await resolveHttpShareAccess(c.env.DB, {
-      serverId,
-      userId,
-      target: { kind: 'main', serverId, sessionName: parentSession },
-    })
-    : null;
-  const mayCreate = memberMayCreate
-    || (access?.actor.kind === 'share' && access.actor.effectiveActorRole === 'participant');
+  let mayCreate = memberMayCreate;
+  let shareReason: string | undefined;
+  let effectiveParentSession = parentSession;
+
+  if (!member.ok) {
+    // 1. If parentSession is provided, check coverage under main or sub-session first
+    if (parentSession) {
+      const subId = rawSubSessionIdFromDisplayName(parentSession)
+        || (/^[a-z0-9]{8}$/i.test(parentSession) ? parentSession : null);
+      if (subId) {
+        const subAccess = await resolveHttpShareAccessForCoveredSession(c.env.DB, {
+          serverId,
+          userId,
+          target: { kind: 'subsession', serverId, subSessionId: subId },
+        });
+        if (subAccess.actor.kind === 'share') {
+          if (subAccess.actor.effectiveActorRole === 'participant') {
+            mayCreate = true;
+          } else {
+            shareReason = 'share-role-denied';
+          }
+        }
+      } else {
+        const mainAccess = await resolveHttpShareAccess(c.env.DB, {
+          serverId,
+          userId,
+          target: { kind: 'main', serverId, sessionName: parentSession },
+        });
+        if (mainAccess.actor.kind === 'share') {
+          if (mainAccess.actor.effectiveActorRole === 'participant') {
+            mayCreate = true;
+          } else {
+            shareReason = 'share-role-denied';
+          }
+        }
+      }
+    }
+
+    // 2. If not permitted yet, check whole-server participant share
+    if (!mayCreate) {
+      const serverAccess = await resolveHttpShareAccess(c.env.DB, {
+        serverId,
+        userId,
+        target: { kind: 'server', serverId },
+      });
+      if (serverAccess.actor.kind === 'share') {
+        if (serverAccess.actor.effectiveActorRole === 'participant') {
+          mayCreate = true;
+        } else if (!shareReason) {
+          shareReason = 'share-role-denied';
+        }
+      }
+    }
+
+    // 3. If parentSession is omitted or not yet permitted, check user's active shares on this server
+    if (!mayCreate && typeof (c.env.DB as any)?.query === 'function') {
+      const shares = await listActiveSharesForUser(c.env.DB, userId, Date.now());
+      const participantShare = shares.find((s) => s.serverId === serverId && s.role === 'participant');
+      if (participantShare) {
+        mayCreate = true;
+        if (!effectiveParentSession) {
+          if (participantShare.target.kind === 'main' && participantShare.target.sessionName) {
+            effectiveParentSession = participantShare.target.sessionName;
+          } else if (participantShare.target.kind === 'subsession' && participantShare.target.subSessionId) {
+            effectiveParentSession = `deck_sub_${participantShare.target.subSessionId}`;
+          }
+        }
+      } else if (!shareReason) {
+        const viewerShare = shares.find((s) => s.serverId === serverId && s.role === 'viewer');
+        if (viewerShare) shareReason = 'share-role-denied';
+      }
+    }
+  }
+
   if (!mayCreate) {
-    const reason = access?.actor.kind === 'share' ? 'share-role-denied' : (member.ok ? 'share-role-denied' : member.reason);
+    const reason = shareReason ?? (member.ok ? 'share-role-denied' : member.reason);
     return c.json({ error: 'forbidden', reason }, 403);
   }
   // Generate 8-char id
@@ -119,7 +191,7 @@ subSessionRoutes.post('/:id/sub-sessions', async (c) => {
     body.label ?? null,
     body.cc_session_id ?? null,
     body.gemini_session_id ?? null,
-    parentSession || null,
+    effectiveParentSession || null,
     null, null, null,
     body.description ?? null,
     body.cc_preset_id ?? null,
@@ -196,6 +268,15 @@ subSessionRoutes.patch('/:id/sub-sessions/:subId', async (c) => {
     return c.json({ error: 'invalid_json' }, 400);
   }
 
+  // Share participants may edit the existing non-transport presentation
+  // fields above, but transportConfig carries the owner Brain's supervision
+  // authority. Reject every shape (including null/empty/partial) before a DB
+  // write or daemon relay, using the server-resolved share capability rather
+  // than any client/projected session role.
+  if (access?.actor.kind === 'share' && Object.prototype.hasOwnProperty.call(body, 'transportConfig')) {
+    return c.json({ error: 'forbidden', reason: 'share-role-denied' }, 403);
+  }
+
   const fields: {
     label?: string | null;
     closed_at?: number | null;
@@ -223,6 +304,13 @@ subSessionRoutes.patch('/:id/sub-sessions/:subId', async (c) => {
   if ('activeModel' in body) fields.active_model = body.activeModel ?? null;
   if ('effort' in body) fields.effort = body.effort ?? null;
   if ('transportConfig' in body) fields.transport_config = body.transportConfig ?? null;
+  if (hasInvalidSessionSupervisionSnapshot(body.transportConfig ?? null)) {
+    return c.json({ error: 'invalid_supervision_config' }, 400);
+  }
+  const requestedSupervision = extractSessionSupervisionSnapshot(body.transportConfig ?? null);
+  if (requestedSupervision && requestedSupervision.mode !== SUPERVISION_MODE.OFF) {
+    return c.json({ error: 'forbidden', reason: 'brain_session_required' }, 403);
+  }
 
   await updateSubSession(c.env.DB, subId, serverId, fields);
 

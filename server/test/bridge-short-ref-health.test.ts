@@ -35,7 +35,7 @@ class MockWs extends EventEmitter {
 
 function makeDb() {
   return {
-    queryOne: async () => ({ token_hash: 'valid-hash', node_role: 'full', revoked_at: null }),
+    queryOne: async () => ({ token_hash: 'valid-hash', owner_status: 'active', node_role: 'full', revoked_at: null }),
     query: async () => [],
     execute: async () => ({ changes: 1 }),
     exec: async () => {},
@@ -122,5 +122,22 @@ describe('WsBridge forwards memory-handle persistence health to browsers', () =>
     await flushAsync();
 
     expect(statsSeenByBrowser(browser)).not.toHaveProperty('shortRefHealth');
+  });
+
+  it('forwards core-lane busy metadata from a heartbeat to browsers', async () => {
+    const { daemon, browser } = await connect();
+    daemon.emit('message', JSON.stringify({
+      type: 'heartbeat',
+      ...baseStats,
+      mainEventLoopLagMs: 31,
+      mainEventLoopBlockedMs: 30_000,
+      mainEventLoopBusy: true,
+    }));
+    await flushAsync();
+    expect(statsSeenByBrowser(browser)).toMatchObject({
+      mainEventLoopLagMs: 31,
+      mainEventLoopBlockedMs: 30_000,
+      mainEventLoopBusy: true,
+    });
   });
 });

@@ -82,7 +82,11 @@ if (!distReady && distRequired) {
           type: 'fs.read_response',
           requestId: 'r-missing',
           status: 'error',
-          error: FS_READ_ERROR_CODES.INTERNAL_ERROR,
+          // ENOENT/ENOTDIR now maps to the more actionable PARENT_NOT_FOUND
+          // reason instead of a generic internal error (chat download errors
+          // must state a concrete cause: not found / forbidden / too large /
+          // invalid path).
+          error: FS_READ_ERROR_CODES.PARENT_NOT_FOUND,
         }),
       ]));
       const missing = responses.find((response) => response.requestId === 'r-missing');

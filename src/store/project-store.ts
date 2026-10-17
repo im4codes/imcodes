@@ -1,10 +1,10 @@
+import { resolveImcodesHome } from '../util/windows-daemon-lock.js';
 import { readFile, writeFile, mkdir } from 'fs/promises';
 import { join } from 'path';
-import { homedir } from 'os';
 import logger from '../util/logger.js';
 
-const STORE_DIR = join(homedir(), '.imcodes');
-const STORE_PATH = join(STORE_DIR, 'projects.json');
+function storeDir(): string { return resolveImcodesHome(); }
+function storePath(): string { return join(storeDir(), 'projects.json'); }
 const DEBOUNCE_MS = 500;
 
 export interface ProjectTrackerConfig {
@@ -41,9 +41,10 @@ let writeTimer: ReturnType<typeof setTimeout> | null = null;
 let store: ProjectStore = { projects: {} };
 
 export async function loadProjectStore(): Promise<ProjectStore> {
-  await mkdir(STORE_DIR, { recursive: true });
+  const path = storePath();
+  await mkdir(storeDir(), { recursive: true });
   try {
-    const raw = await readFile(STORE_PATH, 'utf8');
+    const raw = await readFile(path, 'utf8');
     store = JSON.parse(raw) as ProjectStore;
   } catch {
     store = { projects: {} };
@@ -56,8 +57,10 @@ export async function loadProjectStore(): Promise<ProjectStore> {
 let writeChain: Promise<void> = Promise.resolve();
 
 async function writeStoreOnce(): Promise<void> {
-  await mkdir(STORE_DIR, { recursive: true });
-  await writeFile(STORE_PATH, JSON.stringify(store, null, 2), 'utf8');
+  const dir = storeDir();
+  const path = storePath();
+  await mkdir(dir, { recursive: true });
+  await writeFile(path, JSON.stringify(store, null, 2), 'utf8');
 }
 
 function chainWrite(propagateErrors: boolean): Promise<void> {
@@ -72,7 +75,7 @@ function chainWrite(propagateErrors: boolean): Promise<void> {
   // production it would crash the daemon. Warn and move on; the next mutation
   // reschedules, and flushProjectStore() remains the error-propagating path.
   return run.catch((err) => {
-    logger.warn({ err, path: STORE_PATH }, 'project-store debounced write failed');
+    logger.warn({ err, path: storePath() }, 'project-store debounced write failed');
   });
 }
 

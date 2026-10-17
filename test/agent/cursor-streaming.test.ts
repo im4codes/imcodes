@@ -30,6 +30,18 @@ describe('CursorHeadlessProvider streaming accumulator', () => {
     cursorHeadlessRuntimeHooks.loadChildProcess = originalLoadChildProcess;
   });
 
+  it('confirms Stop from actual captured child close, not a successful kill request', async () => {
+    const provider = new CursorHeadlessProvider();
+    await provider.connect({ binaryPath: 'cursor-agent' });
+    const route = await provider.createSession({ sessionKey: 'route-cursor-stop', cwd: '/tmp/project', resumeId: 'cursor-chat-stop' });
+    await provider.send(route, 'foreground');
+    const spawned = harness.lastSpawn();
+    const stopping = provider.cancelAndWait(route);
+    await stopping;
+    expect(spawned.child.kill).toHaveBeenCalledWith('SIGTERM');
+    await provider.disconnect();
+  });
+
   it('resets the streaming accumulator across messages so a second message is not prefixed with the first', async () => {
     // A single tool-using turn produces TWO assistant messages (m1 → tool →
     // m2), each with its own message_id. The second message's streaming deltas

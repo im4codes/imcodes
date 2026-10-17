@@ -1,3 +1,5 @@
+import { isUserActive } from '../security/user-status.js';
+import { AUTH_ERROR_CODES } from '../../../shared/auth-error-codes.js';
 import { Hono } from 'hono';
 import type { Env } from '../env.js';
 import type { BotConfig } from '../platform/types.js';
@@ -40,6 +42,11 @@ webhookRoutes.post('/:platform/:botId', async (c) => {
 
   if (!row) {
     return c.json({ error: 'bot_not_found' }, 404);
+  }
+
+  // A bot acts as the user who registered it: a disabled (or pending) owner's bots route nothing (security/user-status.ts).
+  if (!await isUserActive(c.env.DB, row.user_id)) {
+    return c.json({ error: AUTH_ERROR_CODES.ACCOUNT_DISABLED }, 403);
   }
 
   let decryptedConfig: Record<string, string>;

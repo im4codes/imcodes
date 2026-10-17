@@ -6,7 +6,7 @@
  * without the standard methods which makes `localStorage.clear()` throw.
  */
 
-import { afterEach } from 'vitest';
+import { afterAll, afterEach, vi } from 'vitest';
 import { resetWebSharedCachesForTests } from './reset-shared-caches.js';
 
 function ensureStorage(name: 'localStorage' | 'sessionStorage'): void {
@@ -71,4 +71,15 @@ if (typeof globalThis.cancelAnimationFrame !== 'function') {
 
 afterEach(async () => {
   await resetWebSharedCachesForTests();
+});
+
+// preact/hooks flushes effects after the next paint via requestAnimationFrame
+// PLUS a 35 ms setTimeout fallback. When a file's last render lands just
+// before teardown, that fallback fires into a torn-down jsdom and throws
+// `cancelAnimationFrame is not defined` (reported as an unhandled error).
+// Drain it while the environment is still alive.
+afterAll(async () => {
+  vi.useRealTimers();
+  await new Promise<void>((resolve) => setTimeout(resolve, 60));
+  await new Promise<void>((resolve) => setTimeout(resolve, 0));
 });

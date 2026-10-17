@@ -11,6 +11,7 @@ import {
   reportDownloadTransferProgress,
   setDownloadTransferSave,
   setDownloadTransferRetry,
+  setDownloadTransferSavedFile,
   updateDownloadTransfer,
 } from '../../src/download-transfer-store.js';
 import { DownloadTransferCenter } from '../../src/components/DownloadTransferCenter.js';
@@ -47,6 +48,24 @@ describe('DownloadTransferCenter', () => {
     expect(transfer.signal.aborted).toBe(true);
     expect(getDownloadTransfers()[0]?.status).toBe(DOWNLOAD_TRANSFER_STATUS.CANCELED);
     expect(screen.getByText('downloads.status.canceled')).toBeTruthy();
+  });
+
+  it('offers pause and continue while retaining the downloaded prefix', () => {
+    const now = Date.now();
+    const transfer = beginDownloadTransfer('large.iso', now);
+    updateDownloadTransfer(transfer.id, DOWNLOAD_TRANSFER_ROUTE.DIRECT, DOWNLOAD_TRANSFER_STATUS.TRANSFERRING, now);
+    reportDownloadTransferProgress(transfer.id, 512, 1_024, now + 250);
+    setDownloadTransferRetry(transfer.id, vi.fn(async () => undefined));
+    render(<DownloadTransferCenter />);
+
+    fireEvent.click(screen.getByText('downloads.pause'));
+    expect(screen.getByText('downloads.status.paused')).toBeTruthy();
+    expect(getDownloadTransfers()[0]?.loadedBytes).toBe(512);
+    expect(screen.getByText('downloads.resume')).toBeTruthy();
+    // A paused transfer can still be canceled explicitly; the pause itself
+    // never discards the durable prefix.
+    fireEvent.click(screen.getByText('downloads.cancel'));
+    expect(getDownloadTransfers()[0]?.status).toBe(DOWNLOAD_TRANSFER_STATUS.CANCELED);
   });
 
   it('middle-truncates a long filename while exposing the complete name on hover', () => {
@@ -110,5 +129,37 @@ describe('DownloadTransferCenter', () => {
     await vi.waitFor(() => expect(save).toHaveBeenCalledOnce());
     expect(getDownloadTransfers()[0]?.status).toBe(DOWNLOAD_TRANSFER_STATUS.READY_TO_SAVE);
     expect(screen.getByText('downloads.save_share')).toBeTruthy();
+  });
+
+  it('offers Show in folder, and no web-address Open file, on a download saved through the picker', () => {
+    const picker = vi.fn(async () => []);
+    (globalThis as typeof globalThis & { showOpenFilePicker?: unknown }).showOpenFilePicker = picker;
+    const open = vi.spyOn(window, 'open');
+    try {
+      const saved = beginDownloadTransfer('build.js');
+      completeDownloadTransfer(saved.id);
+      const handle = { getFile: vi.fn(async () => new File(['x'], 'build.js')), createWritable: vi.fn() };
+      setDownloadTransferSavedFile(saved.id, handle);
+
+      // Handed to the browser's download manager: nothing the page can reach.
+      const handedOff = beginDownloadTransfer('elsewhere.zip');
+      completeDownloadTransfer(handedOff.id, true);
+
+      render(<DownloadTransferCenter />);
+
+      // A page cannot open a local file in its local app, so there is no
+      // button that would only show the file at a blob: web address.
+      expect(screen.queryByText('downloads.open_file')).toBeNull();
+      const folderButtons = screen.getAllByText('downloads.open_folder');
+      expect(folderButtons).toHaveLength(1);
+      expect(folderButtons[0]!.getAttribute('title')).toBe('downloads.open_folder_hint');
+
+      fireEvent.click(folderButtons[0]!);
+      expect(picker).toHaveBeenCalledWith({ startIn: handle });
+      expect(open).not.toHaveBeenCalled();
+    } finally {
+      delete (globalThis as typeof globalThis & { showOpenFilePicker?: unknown }).showOpenFilePicker;
+      open.mockRestore();
+    }
   });
 });

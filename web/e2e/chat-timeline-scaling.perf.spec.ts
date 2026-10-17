@@ -1,4 +1,10 @@
 import { expect, test, type Page } from '@playwright/test';
+import { STREAMING_MARKDOWN_REFRESH_MS } from '../src/streaming-markdown.js';
+
+// Keep the perf samples isolated. Running the two long-session probes in
+// parallel on a shared CI runner makes the 8,000-row sample measure worker
+// contention instead of renderer growth, which turns the flatness guard flaky.
+test.describe.configure({ mode: 'serial' });
 
 /**
  * Does the chat get slower as the conversation gets longer?
@@ -58,6 +64,21 @@ const FLATNESS_LIMIT = 4;
 const WORST_CASE_UPDATE_MS = 12;
 
 /**
+ * A streamed chunk reaches the DOM within the Markdown refresh interval, not
+ * synchronously (ChatMarkdown re-parses a streaming block at most every
+ * STREAMING_MARKDOWN_REFRESH_MS; it never shows the un-parsed text meanwhile).
+ * The arrival contract is that interval plus this slack: two frames (one for
+ * the paint, one for this probe's rAF polling) and some scheduling noise for a
+ * shared CI host. Text that never arrives, or arrives far later, still fails.
+ */
+const ARRIVAL_SLACK_MS = 2 * (1000 / 60) + 30;
+const ARRIVAL_LIMIT_MS = STREAMING_MARKDOWN_REFRESH_MS + ARRIVAL_SLACK_MS;
+
+/** Chunks and cadence (25 Hz, a busy reply) of the arrival probe. */
+const ARRIVAL_CHUNKS = 30;
+const ARRIVAL_CADENCE_MS = 40;
+
+/**
  * Growth across the measured sizes, divided by the FASTEST size rather than the
  * first one.
  *
@@ -78,6 +99,62 @@ interface UpdateCost {
   medianMs: number;
   p95Ms: number;
   reflected: number;
+}
+
+interface StreamingArrival {
+  /** Chunks whose text never reached the DOM. */
+  missing: number;
+  /** Worst append-to-DOM delay over the chunks that arrived. */
+  maxLagMs: number;
+  medianLagMs: number;
+}
+
+interface FixtureNetworkIsolation {
+  preferenceRequests: number;
+  imageRequests: number;
+}
+
+/**
+ * Keep the production-renderer benchmark independent of services and public
+ * internet that are deliberately absent from its static fixture server.
+ *
+ * Two fixture inputs otherwise participate in the document's `load` event:
+ * ChatView loads the real `show_tool_calls` preference, and generated markdown
+ * includes delayed picsum.photos images to exercise layout shifts. Vite preview
+ * proxies the preference request to port 8787 (there is no backend in this CI
+ * job), while a slow or blocked public image can keep `page.goto(..., load)`
+ * pending even though the harness is already rendered and ready. Neither
+ * dependency is part of the per-update renderer cost this spec measures.
+ *
+ * Fulfil both at the browser boundary rather than relaxing navigation or test
+ * timeouts. The SVG preserves each generated image's requested dimensions, so
+ * image rows still have realistic layout without nondeterministic network I/O.
+ */
+async function isolateFixtureNetwork(page: Page): Promise<FixtureNetworkIsolation> {
+  const observed: FixtureNetworkIsolation = { preferenceRequests: 0, imageRequests: 0 };
+
+  await page.route('**/api/preferences/show_tool_calls', async (route) => {
+    observed.preferenceRequests += 1;
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({ value: true }),
+    });
+  });
+
+  await page.route('https://picsum.photos/**', async (route) => {
+    observed.imageRequests += 1;
+    const match = new URL(route.request().url()).pathname.match(/\/(\d+)\/(\d+)$/u);
+    const width = Number(match?.[1] ?? 320);
+    const height = Number(match?.[2] ?? 180);
+    await route.fulfill({
+      status: 200,
+      contentType: 'image/svg+xml',
+      body: `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}"><rect width="100%" height="100%" fill="#111827"/></svg>`,
+    });
+  });
+
+  return observed;
 }
 
 async function waitForHarness(page: Page): Promise<void> {
@@ -129,6 +206,63 @@ async function measureStreamingUpdates(page: Page, updates: number): Promise<Upd
   }, updates);
 }
 
+/**
+ * When does each streamed chunk's text reach the DOM?
+ *
+ * The cost probe above appends back to back and never yields to a timer, so it
+ * can only see text that arrives synchronously; the throttled Markdown refresh
+ * is a timer. This probe paces chunks like a real stream and polls every frame.
+ * Streamed text is cumulative, so a marker being present proves every earlier
+ * one arrived: pending markers are checked newest first and all older ones
+ * are credited to that same poll.
+ */
+async function measureStreamingArrival(page: Page, chunks: number, cadenceMs: number, limitMs: number): Promise<StreamingArrival> {
+  return page.evaluate(async ({ count, cadence, limit }) => {
+    const harness = (window as unknown as {
+      __chatTimelineHarness: {
+        appendStreamingChunk(chunk?: string): { eventId: string; length: number };
+      };
+    }).__chatTimelineHarness;
+    const scroller = document.querySelector('.chat-view') as HTMLElement;
+    const appendedAt: number[] = [];
+    const arrivedAt: Array<number | null> = new Array(count).fill(null);
+    let seenUpTo = -1;
+    const poll = () => {
+      const text = scroller.textContent ?? '';
+      const now = performance.now();
+      for (let j = appendedAt.length - 1; j > seenUpTo; j -= 1) {
+        if (!text.includes(` arrival-${j}.`)) continue;
+        for (let k = seenUpTo + 1; k <= j; k += 1) arrivedAt[k] = now;
+        seenUpTo = j;
+        break;
+      }
+    };
+    let polling = true;
+    const frame = () => { poll(); if (polling) requestAnimationFrame(frame); };
+    requestAnimationFrame(frame);
+    for (let i = 0; i < count; i += 1) {
+      // '.' terminates the marker (arrival-1. is not a prefix of arrival-10.); display text is trimmed, so no trailing space.
+      harness.appendStreamingChunk(` arrival-${i}.`);
+      appendedAt.push(performance.now());
+      await new Promise((resolve) => setTimeout(resolve, cadence));
+    }
+    // The tail: nothing more is appended, so only the refresh timer can deliver it.
+    const deadline = performance.now() + limit * 3;
+    while (seenUpTo < count - 1 && performance.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    polling = false;
+    poll();
+    const lags = arrivedAt.map((at, i) => (at === null ? Number.POSITIVE_INFINITY : at - appendedAt[i]!));
+    const arrived = lags.filter((lag) => Number.isFinite(lag)).sort((a, b) => a - b);
+    return {
+      missing: count - arrived.length,
+      maxLagMs: arrived.length ? arrived[arrived.length - 1]! : Number.POSITIVE_INFINITY,
+      medianLagMs: arrived.length ? arrived[Math.floor(arrived.length / 2)]! : Number.POSITIVE_INFINITY,
+    };
+  }, { count: chunks, cadence: cadenceMs, limit: limitMs });
+}
+
 /** Cost of a new message arriving, which changes the row count as well. */
 async function measureAppendUpdates(page: Page, updates: number): Promise<UpdateCost> {
   return page.evaluate(async (count) => {
@@ -160,25 +294,36 @@ async function measureAppendUpdates(page: Page, updates: number): Promise<Update
 }
 
 test('streaming stays flat as the conversation grows', async ({ page }) => {
-  const results: Array<{ size: number; cost: UpdateCost }> = [];
+  const isolated = await isolateFixtureNetwork(page);
+  const results: Array<{ size: number; cost: UpdateCost; arrival: StreamingArrival }> = [];
   for (const size of SIZES) {
     await page.goto(`${FIXTURE}?size=${size}`);
     await waitForHarness(page);
     await measureStreamingUpdates(page, WARMUP_UPDATES); // warm-up, discarded
-    results.push({ size, cost: await measureStreamingUpdates(page, UPDATES) });
+    const cost = await measureStreamingUpdates(page, UPDATES);
+    const arrival = await measureStreamingArrival(page, ARRIVAL_CHUNKS, ARRIVAL_CADENCE_MS, ARRIVAL_LIMIT_MS);
+    results.push({ size, cost, arrival });
   }
 
   const table = results
-    .map((r) => `${r.size}: median ${r.cost.medianMs.toFixed(2)}ms p95 ${r.cost.p95Ms.toFixed(2)}ms reflected ${(r.cost.reflected * 100).toFixed(0)}%`)
+    .map((r) => `${r.size}: median ${r.cost.medianMs.toFixed(2)}ms p95 ${r.cost.p95Ms.toFixed(2)}ms arrival median ${r.arrival.medianLagMs.toFixed(0)}ms max ${r.arrival.maxLagMs.toFixed(0)}ms`)
     .join('  |  ');
   // eslint-disable-next-line no-console
-  console.log(`[streaming] ${table}`);
+  console.log(`[streaming] ${table} (arrival limit ${ARRIVAL_LIMIT_MS.toFixed(0)}ms = ${STREAMING_MARKDOWN_REFRESH_MS}ms refresh + slack)`);
 
-  // A sample that never reached the DOM describes nothing; fail loudly rather
-  // than reporting a fast number for an update that did not happen.
+  // Text has to reach the DOM: an update that never rendered describes nothing,
+  // and a fast cost number for it would be a lie. The synchronous cost above is
+  // still measured, but arrival is judged against the throttle contract: every
+  // chunk within the refresh interval plus slack, none lost.
   for (const result of results) {
-    expect(result.cost.reflected, `${result.size} updates reached the DOM`).toBeGreaterThan(0.9);
+    expect(result.arrival.missing, `${result.size}: streamed chunks that never reached the DOM`).toBe(0);
+    expect(
+      result.arrival.maxLagMs,
+      `${result.size}: worst append-to-DOM delay (refresh interval ${STREAMING_MARKDOWN_REFRESH_MS}ms + slack)`,
+    ).toBeLessThanOrEqual(ARRIVAL_LIMIT_MS);
   }
+  expect(isolated.preferenceRequests, 'fixture preference reads stayed inside the browser harness').toBe(SIZES.length);
+  expect(isolated.imageRequests, 'fixture images stayed inside the browser harness').toBeGreaterThan(0);
   const { ratio, baseline, largest } = growthRatio(results.map((r) => r.cost.medianMs));
   expect(
     ratio,
@@ -188,6 +333,7 @@ test('streaming stays flat as the conversation grows', async ({ page }) => {
 });
 
 test('message arrival stays flat as the conversation grows', async ({ page }) => {
+  const isolated = await isolateFixtureNetwork(page);
   const results: Array<{ size: number; cost: UpdateCost }> = [];
   for (const size of SIZES) {
     await page.goto(`${FIXTURE}?size=${size}`);
@@ -205,10 +351,76 @@ test('message arrival stays flat as the conversation grows', async ({ page }) =>
   for (const result of results) {
     expect(result.cost.reflected, `${result.size} updates reached the DOM`).toBeGreaterThan(0.9);
   }
+  expect(isolated.preferenceRequests, 'fixture preference reads stayed inside the browser harness').toBe(SIZES.length);
+  expect(isolated.imageRequests, 'fixture images stayed inside the browser harness').toBeGreaterThan(0);
   const { ratio, baseline, largest } = growthRatio(results.map((r) => r.cost.medianMs));
   expect(
     ratio,
     `per-arrival work grew from ${baseline.toFixed(2)}ms at its fastest size to ${largest.toFixed(2)}ms at ${SIZES[SIZES.length - 1]} rows`,
   ).toBeLessThanOrEqual(FLATNESS_LIMIT);
   expect(largest, 'per-arrival work in the longest session').toBeLessThanOrEqual(WORST_CASE_UPDATE_MS);
+});
+
+
+test('collapsed large tool outputs stay bounded and expand without losing data', async ({ page }) => {
+  test.setTimeout(45_000);
+  await isolateFixtureNetwork(page);
+  await page.goto(`${FIXTURE}?size=smoke&rows=100`);
+  await waitForHarness(page);
+  const cdp = await page.context().newCDPSession(page);
+  await cdp.send('Emulation.setCPUThrottlingRate', { rate: 4 });
+  const results = [];
+  for (const size of [1_024, 128_000, 300_000]) {
+    const result = await page.evaluate(async (payloadSize) => {
+      const harness = (window as unknown as { __chatTimelineHarness: import('../src/fixtures/chat-timeline/main.js').ChatTimelineHarnessApi }).__chatTimelineHarness;
+      const base = { sessionId: 'fixture', epoch: 1, source: 'daemon' as const, confidence: 'high' as const };
+      const messages = Array.from({ length: 100 }, (_, i) => ({
+        ...base, eventId: `u-${i}`, seq: i + 1, ts: i + 1,
+        type: 'user.message' as const, payload: { text: `previous message ${i}` },
+      }));
+      const call = {
+        ...base, eventId: 'call', seq: 101, ts: 101, type: 'tool.call' as const,
+        payload: { toolCallId: 'tool-1', tool: 'session_history', input: { kind: 'tool', limit: 100 } },
+      };
+      const data = { status: 'ok', events: [{ payload: 'x'.repeat(payloadSize) + 'FULL_TOOL_TAIL_7283' }] };
+      const settle = async () => { await Promise.resolve(); await Promise.resolve(); await Promise.resolve(); };
+      const times: number[] = [];
+      for (let i = 0; i < 25; i++) {
+        const start = performance.now();
+        harness.setEvents([...messages, call, {
+          ...base, eventId: 'result', seq: 102, ts: 102, type: 'tool.result',
+          payload: { toolCallId: 'tool-1', output: { ...data, sample: i } },
+        }]);
+        await settle();
+        document.querySelector('.chat-view')?.getBoundingClientRect();
+        if (i >= 5) times.push(performance.now() - start);
+        await new Promise(requestAnimationFrame);
+      }
+      times.sort((a, b) => a - b);
+      const fold = document.querySelector('.chat-tool-block-fold')!;
+      const collapsedChars = fold.textContent?.length ?? 0;
+      const collapsedHasTail = fold.textContent?.includes('FULL_TOOL_TAIL_7283');
+      (fold.querySelector('.chat-tool-block-toggle') as HTMLElement).click();
+      await settle();
+      const expandedHasTail = fold.textContent?.includes('FULL_TOOL_TAIL_7283');
+      (fold.querySelector('.chat-tool-block-toggle') as HTMLElement).click();
+      await settle();
+      return {
+        size: payloadSize, collapsedChars, collapsedHasTail, expandedHasTail,
+        recollapsedChars: fold.textContent?.length ?? 0,
+        medianMs: times[Math.floor(times.length / 2)]!,
+        p95Ms: times[Math.floor(times.length * 0.95)]!,
+        domChars: document.querySelector('.chat-view')?.textContent?.length ?? 0,
+      };
+    }, size);
+    expect(result.domChars).toBeGreaterThan(0);
+    expect(result.collapsedChars).toBeLessThan(4_096);
+    expect(result.recollapsedChars).toBeLessThan(4_096);
+    expect(result.collapsedHasTail).toBe(false);
+    expect(result.expandedHasTail).toBe(true);
+    results.push(result);
+  }
+  console.log('LARGE_TOOL_COST', JSON.stringify(results));
+  expect(results[results.length - 1]!.medianMs).toBeLessThanOrEqual(WORST_CASE_UPDATE_MS);
+  expect(growthRatio(results.map((r) => r.medianMs)).ratio).toBeLessThanOrEqual(FLATNESS_LIMIT);
 });

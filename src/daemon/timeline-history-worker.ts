@@ -1,7 +1,5 @@
 import { parentPort, workerData } from 'node:worker_threads';
 import { createRequire } from 'node:module';
-import { homedir } from 'node:os';
-import { join } from 'node:path';
 import type { TimelineEvent } from './timeline-event.js';
 import { shapeTimelineEventsForTransport } from './timeline-response-shaper.js';
 import {
@@ -23,9 +21,11 @@ const { DatabaseSync } = require('node:sqlite') as typeof import('node:sqlite');
 type DatabaseSyncInstance = InstanceType<typeof DatabaseSync>;
 
 const EXPECTED_TIMELINE_PROJECTION_VERSION = 1;
-const dbPath = typeof workerData?.dbPath === 'string' && workerData.dbPath
-  ? workerData.dbPath
-  : join(homedir(), '.imcodes', 'timeline.sqlite');
+// The pool resolves the (IMCODES_HOME aware) projection db path and passes it in; a worker never guesses a home directory itself.
+if (typeof workerData?.dbPath !== 'string' || !workerData.dbPath) {
+  throw new Error('timeline history worker requires workerData.dbPath (resolved by the pool)');
+}
+const dbPath: string = workerData.dbPath;
 
 let db: DatabaseSyncInstance | null = null;
 
@@ -60,19 +60,39 @@ function workerError(message: TimelineHistoryWorkerRequest, reason: TimelineHist
   };
 }
 
-function sessionProjectionReady(sessionName: string): boolean {
+/**
+ * Three outcomes, deliberately not two.
+ *
+ * `absent` means the projection answered and said it cannot serve this session
+ * (no row, wrong version, not finished building). That is durable, and it is
+ * the ONLY state that may send the request to the main thread.
+ *
+ * `busy` means the probe could not answer at all -- it raised. Under peak load
+ * that is SQLITE_BUSY after busy_timeout expires while a writer checkpoints the
+ * WAL. Previously this was swallowed into `false` and reported as absence, so
+ * saturation was answered by running heavy SQLite, synthesize and sanitize on
+ * the event loop: the incident. An unanswered probe now fails closed to a
+ * retryable signal rather than being read as a durable verdict.
+ */
+type ProjectionReadiness = 'ready' | 'absent' | 'busy';
+
+function sessionProjectionReadiness(sessionName: string): ProjectionReadiness {
+  let row: Record<string, unknown> | undefined;
   try {
-    const row = ensureDb().prepare(`
+    row = ensureDb().prepare(`
       SELECT status, projection_version
       FROM timeline_projection_sessions
       WHERE session_id = ?
     `).get(sessionName) as Record<string, unknown> | undefined;
-    return !!row
-      && String(row.status) === 'ready'
-      && Number(row.projection_version) === EXPECTED_TIMELINE_PROJECTION_VERSION;
   } catch {
-    return false;
+    // No verdict was produced. Do not invent one.
+    return 'busy';
   }
+  return !!row
+    && String(row.status) === 'ready'
+    && Number(row.projection_version) === EXPECTED_TIMELINE_PROJECTION_VERSION
+    ? 'ready'
+    : 'absent';
 }
 
 function rowToEvent(row: Record<string, unknown>): TimelineEvent {
@@ -95,10 +115,26 @@ function compareTimelineEventsForReplay(a: TimelineEvent, b: TimelineEvent): num
   return a.ts - b.ts || a.seq - b.seq || a.eventId.localeCompare(b.eventId);
 }
 
-function buildRangeSql(base: string, afterTs?: number, beforeTs?: number): { sql: string; params: unknown[] } {
+function buildRangeSql(
+  base: string,
+  afterTs?: number,
+  afterSeq?: number,
+  epoch?: number,
+  beforeTs?: number,
+): { sql: string; params: unknown[] } {
   const clauses = [base];
   const params: unknown[] = [];
-  if (afterTs !== undefined) {
+  if (epoch !== undefined) {
+    clauses.push('AND epoch = ?');
+    params.push(epoch);
+  }
+  if (afterSeq !== undefined) {
+    clauses.push('AND seq > ?');
+    params.push(afterSeq);
+  }
+  // A validated same-epoch sequence cursor is authoritative. Combining it
+  // with a timestamp using AND would drop events sharing the boundary ts.
+  if (afterTs !== undefined && (afterSeq === undefined || epoch === undefined)) {
     clauses.push('AND ts > ?');
     params.push(afterTs);
   }
@@ -114,6 +150,8 @@ function queryByTypes(
   types: readonly string[],
   limit: number,
   afterTs?: number,
+  afterSeq?: number,
+  epoch?: number,
   beforeTs?: number,
 ): TimelineEvent[] {
   if (types.length === 0) return [];
@@ -122,6 +160,8 @@ function queryByTypes(
   const { sql, params } = buildRangeSql(
     `SELECT * FROM timeline_projection_events WHERE session_id = ? AND type IN (${placeholders})`,
     afterTs,
+    afterSeq,
+    epoch,
     beforeTs,
   );
   const rows = ensureDb().prepare(`${sql} ORDER BY ts DESC, append_ordinal DESC LIMIT ?`)
@@ -159,8 +199,11 @@ export async function handleTimelineHistoryWorkerRequest(
 ): Promise<TimelineHistoryWorkerResult> {
   const tRead = Date.now();
   try {
-    if (!sessionProjectionReady(message.sessionName)) {
-      return workerError(message, TIMELINE_HISTORY_WORKER_ERROR_REASONS.PROJECTION_UNAVAILABLE);
+    const readiness = sessionProjectionReadiness(message.sessionName);
+    if (readiness !== 'ready') {
+      return workerError(message, readiness === 'busy'
+        ? TIMELINE_HISTORY_WORKER_ERROR_REASONS.PROJECTION_BUSY
+        : TIMELINE_HISTORY_WORKER_ERROR_REASONS.PROJECTION_UNAVAILABLE);
     }
 
     const limit = Math.max(1, Math.min(Math.trunc(message.limit), 2000));
@@ -169,6 +212,8 @@ export async function handleTimelineHistoryWorkerRequest(
       message.contentTypes,
       limit + 1,
       message.afterTs,
+      message.afterSeq,
+      message.epoch,
       message.beforeTs,
     );
     let stateEvents: TimelineEvent[] = [];
@@ -180,6 +225,8 @@ export async function handleTimelineHistoryWorkerRequest(
         message.stateTypes,
         Math.max(limit * 2, 100),
         stateAfterTs,
+        message.afterSeq,
+        message.epoch,
         message.beforeTs,
       );
     }

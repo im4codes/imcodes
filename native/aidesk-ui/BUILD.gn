@@ -1,0 +1,46 @@
+# aiDesk native main-window sources. The release SDK scripts build FLTK 1.4.5
+# separately and pass its static archive/include root; phase-one IPC remains a
+# toolkit-neutral dependency and does not import this target.
+import("//webrtc.gni")
+
+declare_args() {
+  aidesk_fltk_include_dir = ""
+  aidesk_fltk_static_library = ""
+}
+
+if (aidesk_fltk_include_dir != "" && aidesk_fltk_static_library != "") {
+  config("aidesk_fltk_config") {
+    include_dirs = [ aidesk_fltk_include_dir ]
+    libs = [ aidesk_fltk_static_library ]
+    if (is_win) {
+      libs += [ "oleacc.lib", "shell32.lib", "user32.lib", "comctl32.lib" ]
+    } else if (is_mac) {
+      frameworks = [ "AppKit.framework", "Foundation.framework" ]
+    } else {
+      libs += [ "pthread" ]
+    }
+  }
+
+  rtc_executable("aidesk_local_ui") {
+    sources = [
+      "aidesk_ui.cc",
+      "aidesk_ui.h",
+      "aidesk_ui_main.cc",
+      "aidesk_ui_strings.cc",
+      "aidesk_ui_strings.h",
+      "accessibility_bridge.h",
+      "local_management_session.cc",
+      "local_management_session.h",
+    ]
+    if (is_mac) {
+      sources += [ "accessibility_bridge_macos.mm" ]
+      cflags_objcc = [ "-fobjc-arc" ]
+    } else if (is_win) {
+      sources += [ "accessibility_bridge_windows.cc" ]
+    } else {
+      sources += [ "accessibility_bridge_linux.cc" ]
+    }
+    configs += [ ":aidesk_fltk_config" ]
+    deps = [ "//native/remote-desktop-common:remote_desktop_common" ]
+  }
+}

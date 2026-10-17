@@ -13,11 +13,19 @@ import { constants as fsConstants } from 'node:fs';
 import { lstat, open, type FileHandle } from 'node:fs/promises';
 import { join } from 'node:path';
 import {
-  CONTROLLED_NODE_CANONICAL_ARTIFACTS,
+  CONTROLLED_NODE_ARTIFACT_VARIANTS,
+  controlledNodeArtifactKey,
   type ControlledNodeArtifactArch,
   type ControlledNodeOs,
 } from '../../../shared/controlled-node-artifacts.js';
 import { DAEMON_UPGRADE_TARGET_LATEST, normalizeDaemonUpgradeTargetVersion } from '../../../shared/daemon-upgrade.js';
+import {
+  CONTROLLED_NODE_ABI_MODERN,
+  CONTROLLED_NODE_ABI_GLIBC217,
+  CONTROLLED_NODE_ABI_PROFILES,
+  normalizeControlledNodeAbiProfile,
+  type ControlledNodeAbiProfile,
+} from '../../../shared/controlled-node-abi.js';
 import type { Database } from '../db/client.js';
 
 export type SupportedOs = ControlledNodeOs;
@@ -34,6 +42,7 @@ interface ArtifactIdentity {
 export interface ArtifactDescriptor {
   os: SupportedOs;
   arch: SupportedArch;
+  abiProfile?: ControlledNodeAbiProfile;
   filename: string;
   sizeBytes: number;
   sha256: string;
@@ -80,8 +89,8 @@ const NODE_EXE_FILENAMES = new Map<string, string>([
   ['linux:x64', 'imcodes-node-linux'],
 ]);
 
-function cacheKey(dir: string, os: SupportedOs, arch: SupportedArch): string {
-  return `${dir}::${os}::${arch}`;
+function cacheKey(dir: string, os: SupportedOs, arch: SupportedArch, abiProfile?: ControlledNodeAbiProfile): string {
+  return `${dir}::${controlledNodeArtifactKey(os, arch, abiProfile)}`;
 }
 
 function fileIdentity(stat: {
@@ -117,8 +126,11 @@ async function probeArtifact(
   dir: string,
   os: SupportedOs,
   arch: SupportedArch,
+  abiProfile: ControlledNodeAbiProfile,
 ): Promise<ArtifactProbe | null> {
-  const filename = NODE_EXE_FILENAMES.get(`${os}:${arch}`);
+  const filename = abiProfile === CONTROLLED_NODE_ABI_GLIBC217
+    ? (os === 'linux' && arch === 'x64' ? CONTROLLED_NODE_ABI_PROFILES.GLIBC217.fileName : undefined)
+    : NODE_EXE_FILENAMES.get(`${os}:${arch}`);
   if (!filename) return null;
   const manifestPath = join(dir, `${filename}.manifest.json`);
   const artifactPath = join(dir, filename);
@@ -139,10 +151,21 @@ async function probeArtifact(
       schemaVersion?: unknown;
       artifact?: Record<string, unknown>;
       build?: Record<string, unknown>;
+      toolchain?: Record<string, unknown>;
     };
     if (raw.schemaVersion !== 1 || !raw.artifact || typeof raw.artifact !== 'object') return null;
     const artifact = raw.artifact;
-    if (artifact.fileName !== filename || artifact.arch !== arch) return null;
+    if (artifact.fileName !== filename || artifact.arch !== arch
+      || normalizeControlledNodeAbiProfile(artifact.abiProfile) !== abiProfile) return null;
+    if (abiProfile === CONTROLLED_NODE_ABI_GLIBC217) {
+      const pin = CONTROLLED_NODE_ABI_PROFILES.GLIBC217;
+      const toolchain = raw.toolchain;
+      if (!toolchain || toolchain.nodeProvider !== pin.provider
+        || toolchain.nodeVersion !== pin.nodeVersion || toolchain.nodeArchive !== pin.nodeArchive
+        || toolchain.nodeArchiveSha256 !== pin.nodeArchiveSha256
+        || toolchain.nodeBinarySha256 !== pin.nodeBinarySha256
+        || typeof toolchain.seaBlobSha256 !== 'string' || !/^[a-f0-9]{64}$/.test(toolchain.seaBlobSha256)) return null;
+    }
     const rawOs = typeof artifact.os === 'string' ? artifact.os.toLowerCase() : '';
     const mappedOs = rawOs === 'darwin' ? 'mac' : rawOs === 'win32' ? 'win' : rawOs;
     if (mappedOs !== os) return null;
@@ -181,6 +204,7 @@ async function probeArtifact(
       descriptor: {
         os,
         arch,
+        ...(abiProfile !== CONTROLLED_NODE_ABI_MODERN ? { abiProfile } : {}),
         filename,
         sizeBytes: artifact.size,
         ...(authenticodeSignerSha256 ? { authenticodeSignerSha256 } : {}),
@@ -269,9 +293,10 @@ export class ArtifactCatalog {
     dir: string,
     os: SupportedOs,
     arch: SupportedArch,
+    abiProfile: ControlledNodeAbiProfile = CONTROLLED_NODE_ABI_MODERN,
   ): Promise<ArtifactVerification> {
-    const key = cacheKey(dir, os, arch);
-    const probe = await probeArtifact(dir, os, arch);
+    const key = cacheKey(dir, os, arch, abiProfile);
+    const probe = await probeArtifact(dir, os, arch, abiProfile);
     if (!probe) {
       this.cache.delete(key);
       return { ok: false, reason: 'not_a_file', until: Date.now() + NEGATIVE_TTL_MS };
@@ -312,8 +337,8 @@ export class ArtifactCatalog {
   }
 
   async listAvailable(dir: string, db?: Database): Promise<ArtifactDescriptor[]> {
-    const descriptors = await Promise.all(CONTROLLED_NODE_CANONICAL_ARTIFACTS.map(async ({ os, arch }) => {
-      const result = await this.ensureVerified(dir, os, arch);
+    const descriptors = await Promise.all(CONTROLLED_NODE_ARTIFACT_VARIANTS.map(async ({ os, arch, abiProfile }) => {
+      const result = await this.ensureVerified(dir, os, arch, abiProfile);
       return result.ok ? result.descriptor : null;
     }));
     const available = descriptors.filter((value): value is ArtifactDescriptor => value !== null);
@@ -326,9 +351,11 @@ export class ArtifactCatalog {
           source: string;
         }>(
           `SELECT filename, size_bytes, sha256, source
-             FROM controlled_node_artifact_manifests
-            WHERE os = $1 AND arch = $2`,
-          [descriptor.os, descriptor.arch],
+             FROM ${descriptor.abiProfile === CONTROLLED_NODE_ABI_GLIBC217
+               ? 'controlled_node_artifact_variants' : 'controlled_node_artifact_manifests'}
+            WHERE os = $1 AND arch = $2${descriptor.abiProfile === CONTROLLED_NODE_ABI_GLIBC217 ? ' AND abi_profile = $3' : ''}`,
+          descriptor.abiProfile === CONTROLLED_NODE_ABI_GLIBC217
+            ? [descriptor.os, descriptor.arch, descriptor.abiProfile] : [descriptor.os, descriptor.arch],
         );
         if (existing
           && existing.filename === descriptor.filename
@@ -341,23 +368,25 @@ export class ArtifactCatalog {
     return available;
   }
 
-  invalidate(dir: string, os: SupportedOs, arch: SupportedArch): void {
-    this.cache.delete(cacheKey(dir, os, arch));
+  invalidate(dir: string, os: SupportedOs, arch: SupportedArch, abiProfile: ControlledNodeAbiProfile = CONTROLLED_NODE_ABI_MODERN): void {
+    this.cache.delete(cacheKey(dir, os, arch, abiProfile));
   }
 
   async persistDescriptor(db: Database, descriptor: ArtifactDescriptor): Promise<void> {
     const now = Date.now();
+    const compat = descriptor.abiProfile === CONTROLLED_NODE_ABI_GLIBC217;
     await db.execute(
-      `INSERT INTO controlled_node_artifact_manifests
-         (os, arch, filename, size_bytes, sha256, source, created_at, updated_at)
-       VALUES ($1, $2, $3, $4, $5, 'manifest_json', $6, $6)
-       ON CONFLICT (os, arch) DO UPDATE
+      `INSERT INTO ${compat ? 'controlled_node_artifact_variants' : 'controlled_node_artifact_manifests'}
+         (os, arch, filename, size_bytes, sha256, source, created_at, updated_at${compat ? ', abi_profile' : ''})
+       VALUES ($1, $2, $3, $4, $5, 'manifest_json', $6, $6${compat ? ', $7' : ''})
+       ON CONFLICT (os, arch${compat ? ', abi_profile' : ''}) DO UPDATE
          SET filename = EXCLUDED.filename,
              size_bytes = EXCLUDED.size_bytes,
              sha256 = EXCLUDED.sha256,
              source = EXCLUDED.source,
              updated_at = EXCLUDED.updated_at`,
-      [descriptor.os, descriptor.arch, descriptor.filename, descriptor.sizeBytes, descriptor.sha256, now],
+      [descriptor.os, descriptor.arch, descriptor.filename, descriptor.sizeBytes, descriptor.sha256, now,
+        ...(compat ? [descriptor.abiProfile] : [])],
     );
   }
 

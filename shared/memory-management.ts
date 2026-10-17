@@ -6,6 +6,7 @@ import type { SkillRegistryEntry } from './skill-registry-types.js';
 
 export const MEMORY_MANAGEMENT_ERROR_CODES = {
   ACTION_FAILED: 'action_failed',
+  STORE_UNAVAILABLE: 'store_unavailable',
   FEATURE_DISABLED: 'feature_disabled',
   MISSING_PREFERENCE_TEXT: 'missing_preference_text',
   MISSING_MEMORY_TEXT: 'missing_memory_text',

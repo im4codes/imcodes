@@ -17,6 +17,7 @@ describe('normalizeClaudeCodeModelId', () => {
     expect(normalizeClaudeCodeModelId('claude-opus-4-8')).toBe('opus[1M]');
     expect(normalizeClaudeCodeModelId('claude-3-5-sonnet-20241022')).toBe('sonnet');
     expect(normalizeClaudeCodeModelId('claude-haiku-4')).toBe('haiku');
+    expect(normalizeClaudeCodeModelId('claude-haiku-5-5')).toBe('haiku');
   });
 
   it('maps Claude Fable 5 / Mythos 5 to the fable picker option', () => {

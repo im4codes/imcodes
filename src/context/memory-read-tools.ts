@@ -1,4 +1,3 @@
-import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { readFileSync } from 'node:fs';
 import type { ContextNamespace, LocalContextEvent, ProcessedContextProjection } from '../../shared/context-types.js';
@@ -13,6 +12,7 @@ import type {
   ProjectionSourceRow,
 } from '../store/context-store.js';
 import { getContextStoreClient } from '../store/context-store-worker-client.js';
+import { resolveImcodesHome } from '../util/windows-daemon-lock.js';
 
 const MEMORY_TOOL_CALLER_BRAND: unique symbol = Symbol('MemoryToolCaller');
 const INTERNAL_MEMORY_TOOL_CALLER_BRAND: unique symbol = Symbol('InternalMemoryToolCaller');
@@ -88,7 +88,7 @@ function isInternalCaller(caller: AnyCaller): caller is InternalMemoryToolCaller
 }
 
 export function getBoundMemoryToolUserId(): string | undefined {
-  const path = process.env.IMCODES_SERVER_CONFIG_PATH ?? join(homedir(), '.imcodes', 'server.json');
+  const path = process.env.IMCODES_SERVER_CONFIG_PATH ?? join(resolveImcodesHome(), 'server.json');
   try {
     const parsed = JSON.parse(readFileSync(path, 'utf8')) as { userId?: string };
     return typeof parsed.userId === 'string' && parsed.userId.trim() ? parsed.userId.trim() : DAEMON_LOCAL_MEMORY_USER_ID;

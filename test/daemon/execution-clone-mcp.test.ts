@@ -242,6 +242,25 @@ describe('execution-clone send dispatch', () => {
     expect(dispatchMessage.mock.calls[0][0].name).not.toBe(TEMPLATE);
   });
 
+  it('preserves a queued clone dispatch in the accepted delivery status', async () => {
+    const dispatchMessage = vi.fn(async () => 'queued' as const);
+    cloneMocks.createExecutionClone.mockResolvedValue(createdResult());
+    const result = await dispatchSendMessage(brainCaller, {
+      target: TEMPLATE,
+      message: 'queue the work',
+      clone: { ...canonicalClone },
+    }, {
+      listSessions: () => baseSessions(),
+      getSession: sessionAfterCloneCreation,
+      dispatchMessage,
+    });
+
+    expect(result).toMatchObject({
+      status: 'accepted',
+      deliveries: [{ target: CLONE, status: 'queued' }],
+    });
+  });
+
   it('forces reply:true so the worker message carries a reply instruction', async () => {
     const dispatchMessage = vi.fn(async () => {});
     cloneMocks.createExecutionClone.mockResolvedValue(createdResult());
@@ -256,8 +275,11 @@ describe('execution-clone send dispatch', () => {
     });
 
     const sentMessage = dispatchMessage.mock.calls[0][1] as string;
-    expect(sentMessage).toContain('imcodes send');
-    expect(sentMessage).toContain(BRAIN);
+    expect(sentMessage).toContain('<imcodes-agent-delegation-reply-instruction-v2>');
+    expect(sentMessage).toContain('"contractRefs":["supervision_messaging_v1"]');
+    expect(sentMessage).toContain('"tool":"delegation_reply"');
+    expect(sentMessage).toContain(`"target":"${BRAIN}"`);
+    expect(sentMessage).not.toContain('imcodes send');
   });
 
   it('rolls back (destroys) the clone when dispatch fails after creation — no orphan', async () => {

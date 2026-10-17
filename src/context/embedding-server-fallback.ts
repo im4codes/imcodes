@@ -29,6 +29,7 @@
 
 import { EMBEDDING_DIM } from '../../shared/embedding-config.js';
 import logger from '../util/logger.js';
+import { daemonServerAuthHeaders } from '../../shared/daemon-server-auth.js';
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
 
@@ -51,6 +52,21 @@ export function isServerFallbackUnavailable(): boolean {
 
 export function getServerFallbackDisableReason(): string | null {
   return unavailableReason;
+}
+
+/**
+ * Check whether server fallback is configured and eligible (daemon is bound
+ * to a server and not sticky-disabled). Does not make a network call.
+ */
+export async function isServerFallbackReady(): Promise<boolean> {
+  if (unavailable) return false;
+  const creds = await getCredentials();
+  if (!creds) {
+    unavailable = true;
+    unavailableReason = 'not_bound';
+    return false;
+  }
+  return true;
 }
 
 interface MinimalCredentials {
@@ -114,8 +130,7 @@ export async function tryServerEmbedding(
     const res = await fetchImpl(`${creds.workerUrl.replace(/\/$/, '')}/api/embedding`, {
       method: 'POST',
       headers: {
-        Authorization: `Bearer ${creds.token}`,
-        'X-Server-Id': creds.serverId,
+        ...daemonServerAuthHeaders(creds),
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({ text }),

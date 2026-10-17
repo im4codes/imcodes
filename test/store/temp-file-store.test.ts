@@ -9,6 +9,8 @@ let tempHome: string;
 beforeEach(() => {
   tempHome = mkdtempSync(join(tmpdir(), 'imcodes-temp-files-'));
   vi.stubEnv('HOME', tempHome);
+  vi.stubEnv('USERPROFILE', tempHome);
+  vi.stubEnv('IMCODES_HOME', join(tempHome, '.imcodes'));
   vi.useFakeTimers();
 });
 

@@ -27,6 +27,30 @@ export interface AutoEntrySelection {
   sessionName: string | null;
 }
 
+/** Resolve a remembered tab against the current server's navigable sessions. */
+export function resolveServerSessionSnapshot(
+  serverId: string,
+  rememberedSession: string | null | undefined,
+  candidates: readonly RecentSessionCandidate[],
+  fallbackRememberedSession?: string | null,
+): string | null {
+  const serverCandidates = candidates.filter((candidate) => candidate.serverId === serverId);
+  const isNavigable = (candidate: RecentSessionCandidate): boolean => (
+    !candidate.isSubSession && !isWorkerSessionName(candidate.sessionName)
+  );
+  if (rememberedSession && serverCandidates.some((candidate) => (
+    candidate.sessionName === rememberedSession && isNavigable(candidate)
+  ))) {
+    return rememberedSession;
+  }
+  if (fallbackRememberedSession && serverCandidates.some((candidate) => (
+    candidate.sessionName === fallbackRememberedSession && isNavigable(candidate)
+  ))) {
+    return fallbackRememberedSession;
+  }
+  return pickMostRecentMainSession(serverCandidates)?.sessionName ?? null;
+}
+
 export function isServerOnline(server: Pick<OnlineServerInfo, 'status' | 'lastHeartbeatAt'> | null | undefined): boolean {
   if (!server) return false;
   if (server.status === 'offline') return false;

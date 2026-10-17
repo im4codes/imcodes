@@ -10,7 +10,7 @@
 import { spawnSync } from 'node:child_process';
 import { existsSync, readFileSync, realpathSync, rmSync } from 'node:fs';
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const SELF = fileURLToPath(import.meta.url);
 const DEFAULT_PACKAGE_ROOT = resolve(dirname(SELF), '..', '..', '..');
@@ -61,10 +61,34 @@ export function resolveNpmCliJs(npmCommand, nodeExecPath = process.execPath, env
   return '';
 }
 
+function resolveLocalNodeDatachannelEntry(packageRoot) {
+  const dependencyDir = join(packageRoot, 'node_modules', 'node-datachannel');
+  try {
+    const manifest = JSON.parse(readFileSync(join(dependencyDir, 'package.json'), 'utf8'));
+    const rootExport = manifest?.exports?.['.'] ?? manifest?.exports;
+    const target = typeof rootExport === 'string'
+      ? rootExport
+      : rootExport?.import ?? rootExport?.default ?? rootExport?.require ?? manifest?.main ?? './index.js';
+    if (typeof target !== 'string' || target.length === 0) return '';
+    const entry = resolve(dependencyDir, target);
+    const root = resolve(dependencyDir);
+    const separator = process.platform === 'win32' ? '\\' : '/';
+    return entry === root || entry.startsWith(`${root}${separator}`) ? entry : '';
+  } catch {
+    return '';
+  }
+}
+
 function verify(packageRoot) {
+  // Do not use a bare package import: Node walks parent node_modules folders,
+  // so a shared /tmp/node_modules or global test dependency can make a missing
+  // package appear healthy after a half-install removed the local copy.
+  const entry = resolveLocalNodeDatachannelEntry(packageRoot);
+  if (!entry || !existsSync(entry)) return false;
+  const moduleUrl = pathToFileURL(entry).href;
   const result = run(process.execPath, [
     '-e',
-    "import('node-datachannel').then(() => process.exit(0)).catch(() => process.exit(1))",
+    `import(${JSON.stringify(moduleUrl)}).then(() => process.exit(0)).catch(() => process.exit(1))`,
   ], {
     cwd: packageRoot,
     stdio: 'ignore',

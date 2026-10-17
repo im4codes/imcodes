@@ -25,7 +25,7 @@ function makeMemDb(state: { servers: Map<string, ServerRow> }): Database {
       if (s.includes('from servers where id = $1')) {
         const row = state.servers.get(params[0] as string);
         if (!row) return null;
-        return { team_id: row.team_id, user_id: row.user_id, token_hash: 'x' } as unknown as T;
+        return { team_id: row.team_id, user_id: row.user_id, token_hash: 'x', owner_status: 'active' } as unknown as T;
       }
       if (s.includes('select role from team_members')) return null;
       return null;

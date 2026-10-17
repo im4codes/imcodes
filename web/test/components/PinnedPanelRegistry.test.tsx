@@ -88,6 +88,7 @@ describe('pinned cron manager panel', () => {
     expect(screen.getByTestId('mock-cron-manager')).toBeTruthy();
     expect(cronManagerProps).toHaveLength(1);
     expect(cronManagerProps[0].ws).toBe(ws);
+    expect(cronManagerProps[0].portalSubPanels).toBe(true);
   });
 });
 
@@ -146,6 +147,35 @@ describe('pinned file browser panel', () => {
       sessionName: 'deck_shared_brain',
       scopeToSessionRoot: true,
       readOnly: true,
+    });
+  });
+
+  it('allows full machine file browsing and write mode for a shared server participant', () => {
+    fileBrowserProps.length = 0;
+    render(
+      <>{renderPanelContent(
+        { id: 'filebrowser:shared-server', type: 'filebrowser', props: { projectDir: '/home/user/project' } },
+        {
+          ws: {} as any,
+          connected: true,
+          serverId: 'srv',
+          subSessions: [],
+          activeSession: 'deck_shared_brain',
+          activeProjectDir: '/home/user/project',
+          sharedAccessRole: 'participant',
+          shareTargetKind: 'server',
+          inputRefsMap: { current: new Map() },
+          t: (key: string) => key,
+        },
+      )}</>,
+    );
+
+    expect(fileBrowserProps[0]).toMatchObject({
+      initialPath: '/home/user/project',
+      changesRootPath: '/home/user/project',
+      sessionName: 'deck_shared_brain',
+      scopeToSessionRoot: false,
+      readOnly: false,
     });
   });
 });

@@ -1,6 +1,6 @@
 /**
  * Machine quick-reference insert + compose-time resolution helpers (web),
- * mirroring `alias-insert.ts` but for a `^^(refName)` machine target marker.
+ * mirroring `alias-insert.ts` but for a canonical `^^(nodeId)` target marker.
  *
  * Unlike an alias (a secret value replaced out of band), a machine marker is a
  * visible reference: it stays literal in the delivered text so the agent sees
@@ -15,7 +15,7 @@ import {
 } from '@shared/machine-reference.js';
 
 /**
- * Insert a `^^(refName)-(displayName)` reference at the caret of a focused
+ * Insert a `^^(nodeId)-(displayName)` reference at the caret of a focused
  * contenteditable/textarea composer via `execCommand('insertText', ...)`,
  * mirroring the alias insert path. The marker remains the routing identity;
  * the suffix is render-only context. This does not resolve or send anything.
@@ -23,11 +23,11 @@ import {
  * @returns `true` if the insert command was issued, `false` when unavailable
  *   (e.g. SSR / no `document`).
  */
-export function insertMachineMarkerAtCaret(refName: string, displayName?: string): boolean {
+export function insertMachineMarkerAtCaret(nodeId: string, displayName?: string): boolean {
   if (typeof document === 'undefined' || typeof document.execCommand !== 'function') {
     return false;
   }
-  return document.execCommand('insertText', false, buildMachineComposerReference(refName, displayName));
+  return document.execCommand('insertText', false, buildMachineComposerReference(nodeId, displayName));
 }
 
 /**

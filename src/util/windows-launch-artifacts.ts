@@ -3,18 +3,22 @@ import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'fs';
 import { execFileSync, execSync } from 'child_process';
 import path, { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
-import { homedir, tmpdir } from 'os';
+import { tmpdir } from 'os';
+import {
+  resolveImcodesHome,
+  resolveWindowsDefaultHome,
+} from './windows-daemon-lock.js';
+import { parseWatchdogProcessListing, windowsTaskName, normalizeWindowsTaskHome } from './windows-daemon-watchdog.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
-const TASK_NAME = 'imcodes-daemon';
 const TASK_WATCHDOG_INTERVAL = 'PT1M';
 const WINDOWS_COMMAND_TIMEOUT_MS = 15_000;
 
 /** Sentinel file that tells the watchdog loop to pause.
  *  Created by the upgrade batch before npm install, deleted after restart. */
-export const UPGRADE_LOCK_FILE = join(homedir(), '.imcodes', 'upgrade.lock');
+export const UPGRADE_LOCK_FILE = join(resolveImcodesHome(), 'upgrade.lock');
 
 export interface LaunchPaths {
   nodeExe: string;
@@ -22,6 +26,55 @@ export interface LaunchPaths {
   watchdogPath: string;
   vbsPath: string;
   logPath: string;
+}
+
+export function windowsDaemonTaskName(paths: LaunchPaths): string {
+  const stateHome = path.win32.dirname(paths.watchdogPath);
+  const defaultHome = resolveWindowsDefaultHome();
+  return windowsTaskName('daemon', stateHome, defaultHome);
+}
+
+/**
+ * Refuse to write machine-wide Windows launch artifacts from an isolated
+ * instance.  A child may override USERPROFILE, but that must never make its
+ * scoped state look like the default account home or let it overwrite the
+ * `imcodes-daemon` task and default watchdog files.
+ */
+export function assertWindowsLaunchIdentity(paths: LaunchPaths): void {
+  const stateHome = path.win32.dirname(paths.watchdogPath);
+  const currentHome = resolveImcodesHome();
+  const defaultHome = resolveWindowsDefaultHome();
+  const currentIsScoped = normalizeWindowsTaskHome(currentHome) !== normalizeWindowsTaskHome(defaultHome);
+  const writesDefaultPath = normalizeWindowsTaskHome(stateHome) === normalizeWindowsTaskHome(defaultHome);
+  const taskName = windowsTaskName('daemon', stateHome, defaultHome);
+  if (currentIsScoped && (writesDefaultPath || taskName === 'imcodes-daemon')) {
+    throw new Error('windows_scoped_instance_refuses_default_daemon_artifacts');
+  }
+}
+
+function scopedEnvironmentPrefix(paths: LaunchPaths): string {
+  // Synthetic test paths are left on the legacy env-var form. Production
+  // artifacts for a non-default home bake the state/home values into the
+  // launcher so Task Scheduler cannot relaunch the default instance.
+  const stateHome = path.win32.dirname(paths.watchdogPath);
+  const currentHome = resolveImcodesHome();
+  const defaultHome = resolveWindowsDefaultHome();
+  if (normalizeWindowsTaskHome(stateHome) !== normalizeWindowsTaskHome(currentHome)
+    || normalizeWindowsTaskHome(currentHome) === normalizeWindowsTaskHome(defaultHome)) return '';
+  const userHome = path.win32.dirname(stateHome);
+  const quote = (value: string) => value.replaceAll('^', '^^').replaceAll('&', '^&').replaceAll('|', '^|');
+  // Keep USERPROFILE inherited from the real Windows account.  On Windows
+  // Node's homedir() uses USERPROFILE; overriding it here would make a
+  // scoped daemon mistake its isolated home for the legacy default and
+  // register/launch the machine-wide task name.  IMCODES_HOME is the state
+  // identity, while HOME is the scoped shell-home override.
+  return `set "IMCODES_HOME=${quote(stateHome)}"\r\nset "HOME=${quote(userHome)}"\r\nset "IMCODES_DEFAULT_HOME=${quote(path.win32.dirname(defaultHome))}"\r\n`;
+}
+
+/** Home lines for the watchdog .cmd: the scoped prefix, or the default install's %USERPROFILE%-based home. */
+function homeEnvironmentLines(paths: LaunchPaths): string[] {
+  const scoped = scopedEnvironmentPrefix(paths).trimEnd().split('\r\n').filter(Boolean);
+  return scoped.length > 0 ? scoped : ['set "IMCODES_HOME=%USERPROFILE%\\.imcodes"'];
 }
 
 function escapeXmlText(value: string): string {
@@ -136,13 +189,14 @@ export function encodeWindowsDaemonScheduledTaskXml(xml: string): Buffer {
 
 /** Replace legacy ONLOGON registrations with the durable task definition. */
 export function installWindowsScheduledTask(paths: LaunchPaths): boolean {
+  assertWindowsLaunchIdentity(paths);
   let taskDir: string | null = null;
   try {
     taskDir = mkdtempSync(join(tmpdir(), 'imcodes-daemon-task-'));
     const taskXmlPath = join(taskDir, 'imcodes-daemon.xml');
     const xml = windowsDaemonScheduledTaskXml(paths);
     writeFileSync(taskXmlPath, encodeWindowsDaemonScheduledTaskXml(xml), { mode: 0o600 });
-    execFileSync('schtasks', ['/Create', '/TN', TASK_NAME, '/XML', taskXmlPath, '/F'], {
+    execFileSync('schtasks', ['/Create', '/TN', windowsDaemonTaskName(paths), '/XML', taskXmlPath, '/F'], {
       stdio: 'ignore',
       windowsHide: true,
       timeout: WINDOWS_COMMAND_TIMEOUT_MS,
@@ -160,7 +214,7 @@ export function installWindowsScheduledTask(paths: LaunchPaths): boolean {
 
 /** Resolve all paths needed for the Windows daemon launch chain. */
 export function resolveLaunchPaths(): LaunchPaths {
-  const baseDir = join(homedir(), '.imcodes');
+  const baseDir = resolveImcodesHome();
   return {
     nodeExe: process.execPath,
     imcodesScript: join(__dirname, '..', 'index.js'),
@@ -268,7 +322,7 @@ export async function writeWatchdogCmd(paths: LaunchPaths): Promise<void> {
     ? '%APPDATA%\\npm\\imcodes-launch-preflight.cmd'
     : preflightShimPath;
   const preflightLine = preflightShimExists
-    ? `call "${preflightShimTarget}" >> "%USERPROFILE%\\.imcodes\\watchdog.log" 2>&1`
+    ? `call "${preflightShimTarget}" >> "%IMCODES_HOME%\\watchdog.log" 2>&1`
     : null;
 
   // CRITICAL: use `ping`-based sleep instead of `timeout /t N /nobreak`.
@@ -296,8 +350,13 @@ export async function writeWatchdogCmd(paths: LaunchPaths): Promise<void> {
   const watchdog = [
     '@echo off',
     'chcp 65001 >nul 2>&1',
+    // Every path below goes through %IMCODES_HOME%. A scoped home bakes it in;
+    // the default install must still define it (via %USERPROFILE% so cmd.exe
+    // expands non-ASCII profile names natively), or it would expand to empty
+    // and the lock/log would land at the drive root.
+    ...homeEnvironmentLines(paths),
     ':loop',
-    'if exist "%USERPROFILE%\\.imcodes\\upgrade.lock" goto wait_lock',
+    'if exist "%IMCODES_HOME%\\upgrade.lock" goto wait_lock',
     // Preflight FIRST (when the shim is installed): detects half-
     // installed node_modules / missing dist/ from a killed
     // `npm install -g imcodes@…` and reinstalls the pinned version
@@ -305,23 +364,23 @@ export async function writeWatchdogCmd(paths: LaunchPaths): Promise<void> {
     // at first import. Older installs that pre-date the preflight
     // shim simply skip this line — graceful degradation.
     ...(preflightLine ? [preflightLine] : []),
-    `${launchCmd} >> "%USERPROFILE%\\.imcodes\\watchdog.log" 2>&1`,
+    `${launchCmd} >> "%IMCODES_HOME%\\watchdog.log" 2>&1`,
     'ping -n 6 127.0.0.1 >nul 2>&1',
     'goto loop',
     ':wait_lock',
-    'echo [%date% %time%] Upgrade in progress, waiting for lock to clear... >> "%USERPROFILE%\\.imcodes\\watchdog.log"',
+    'echo [%date% %time%] Upgrade in progress, waiting for lock to clear... >> "%IMCODES_HOME%\\watchdog.log"',
     ':wait_loop',
     'ping -n 31 127.0.0.1 >nul 2>&1',
-    'if not exist "%USERPROFILE%\\.imcodes\\upgrade.lock" goto lock_cleared',
+    'if not exist "%IMCODES_HOME%\\upgrade.lock" goto lock_cleared',
     // Stale-lock probe: if the lock file mtime is >10 minutes old, the
     // upgrade script crashed before its `:done` cleanup ran — remove the
     // lock ourselves so the daemon can come back up.
-    'powershell -NoProfile -NonInteractive -Command "$f=\'%USERPROFILE%\\.imcodes\\upgrade.lock\'; if((Test-Path $f) -and ((Get-Item $f).LastWriteTime -lt (Get-Date).AddMinutes(-10))){Remove-Item -Force -ErrorAction SilentlyContinue $f}" >nul 2>&1',
-    'if exist "%USERPROFILE%\\.imcodes\\upgrade.lock" goto wait_loop',
-    'echo [%date% %time%] Upgrade lock was stale ^(>10min^) -- removed by watchdog self-heal. >> "%USERPROFILE%\\.imcodes\\watchdog.log"',
+    'powershell -NoProfile -NonInteractive -Command "$f=\'%IMCODES_HOME%\\upgrade.lock\'; if((Test-Path $f) -and ((Get-Item $f).LastWriteTime -lt (Get-Date).AddMinutes(-10))){Remove-Item -Force -ErrorAction SilentlyContinue $f}" >nul 2>&1',
+    'if exist "%IMCODES_HOME%\\upgrade.lock" goto wait_loop',
+    'echo [%date% %time%] Upgrade lock was stale ^(>10min^) -- removed by watchdog self-heal. >> "%IMCODES_HOME%\\watchdog.log"',
     'goto loop',
     ':lock_cleared',
-    'echo [%date% %time%] Upgrade lock cleared, resuming. >> "%USERPROFILE%\\.imcodes\\watchdog.log"',
+    'echo [%date% %time%] Upgrade lock cleared, resuming. >> "%IMCODES_HOME%\\watchdog.log"',
     'goto loop',
     '',
   ].join('\r\n');
@@ -355,7 +414,18 @@ export function encodeCmdAsUtf8Bom(content: string): Buffer {
  *  `On Error Resume Next` ensures wscript NEVER pops up an error dialog. */
 export async function writeVbsLauncher(paths: LaunchPaths): Promise<void> {
   await mkdir(dirname(paths.vbsPath), { recursive: true });
-  const vbs = `On Error Resume Next\r\nSet WshShell = CreateObject("WScript.Shell")\r\nWshShell.Run """${paths.watchdogPath}""", 0, True\r\n`;
+  const stateHome = path.win32.dirname(paths.watchdogPath);
+  const currentHome = resolveImcodesHome();
+  const defaultHome = resolveWindowsDefaultHome();
+  const scoped = normalizeWindowsTaskHome(stateHome) === normalizeWindowsTaskHome(currentHome)
+    && normalizeWindowsTaskHome(currentHome) !== normalizeWindowsTaskHome(defaultHome);
+  const vbsQuote = (value: string) => value.replaceAll('"', '""');
+  const env = scoped
+    ? `WshShell.Environment("Process")("IMCODES_HOME") = "${vbsQuote(stateHome)}"\r\n`
+      + `WshShell.Environment("Process")("HOME") = "${vbsQuote(path.win32.dirname(stateHome))}"\r\n`
+      + `WshShell.Environment("Process")("IMCODES_DEFAULT_HOME") = "${vbsQuote(path.win32.dirname(defaultHome))}"\r\n`
+    : '';
+  const vbs = `On Error Resume Next\r\nSet WshShell = CreateObject("WScript.Shell")\r\n${env}WshShell.Run """${paths.watchdogPath}""", 0, True\r\n`;
   await writeFile(paths.vbsPath, encodeVbsAsUtf16(vbs));
 }
 
@@ -371,7 +441,7 @@ export function updateSchtasks(paths: LaunchPaths): boolean {
   try {
     execSync([
       'schtasks', '/Change',
-      '/TN', TASK_NAME,
+      '/TN', windowsDaemonTaskName(paths),
       '/TR', `wscript "${paths.vbsPath}"`,
     ].join(' '), {
       stdio: 'ignore', windowsHide: true,
@@ -408,8 +478,9 @@ export async function rotateWatchdogLog(paths: LaunchPaths): Promise<void> {
  *  language-independent — works on en-US, zh-CN, ja-JP and any other Windows
  *  locale. */
 export async function regenerateAllArtifacts(): Promise<void> {
-  killAllStaleWatchdogsBeforeRegen();
   const paths = resolveLaunchPaths();
+  assertWindowsLaunchIdentity(paths);
+  killAllStaleWatchdogsBeforeRegen();
   await writeWatchdogCmd(paths);
   await writeVbsLauncher(paths);
   // Re-create the whole registration. `/Change /TR` preserves the legacy
@@ -421,6 +492,11 @@ export async function regenerateAllArtifacts(): Promise<void> {
 
 function killAllStaleWatchdogsBeforeRegen(): void {
   if (process.platform !== 'win32') return;
+  // Bind cleanup to the exact resolved state-home artifact for both default
+  // and scoped homes. The default pipe remains backward-compatible, but a
+  // default restart must not kill another isolated instance's watchdog.
+  const currentHome = resolveImcodesHome();
+  const defaultHome = resolveWindowsDefaultHome();
   // PowerShell first (works on every Windows including ones where wmic is gone)
   // CRITICAL: use a temp .ps1 file, NOT `-Command "..."` — nested double
   // quotes inside the script body get truncated by cmd.exe→powershell
@@ -433,8 +509,8 @@ function killAllStaleWatchdogsBeforeRegen(): void {
     writeFileSync(
       scriptPath,
       "Get-CimInstance Win32_Process -Filter \"Name='cmd.exe'\" | " +
-        "Where-Object { $_.CommandLine -like '*daemon-watchdog*' } | " +
-        "ForEach-Object { $_.ProcessId }\r\n",
+      "Where-Object { $_.CommandLine -like '*daemon-watchdog*' } | " +
+        "ForEach-Object { \"$($_.ProcessId)`t$($_.CommandLine)\" }\r\n",
     );
     const out = execSync(
       `powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "${scriptPath}"`,
@@ -443,10 +519,7 @@ function killAllStaleWatchdogsBeforeRegen(): void {
         timeout: WINDOWS_COMMAND_TIMEOUT_MS, killSignal: 'SIGKILL',
       },
     );
-    for (const line of out.split(/\r?\n/)) {
-      const pid = parseInt(line.trim(), 10);
-      if (Number.isFinite(pid) && pid > 0) pids.push(pid);
-    }
+    pids.push(...parseWatchdogProcessListing(out, currentHome, defaultHome));
   } catch { /* fall through */ } finally {
     if (scriptDir) {
       try { rmSync(scriptDir, { recursive: true, force: true }); } catch { /* ignore */ }
@@ -455,18 +528,13 @@ function killAllStaleWatchdogsBeforeRegen(): void {
   if (pids.length === 0) {
     try {
       const out = execSync(
-        'wmic process where "Name=\'cmd.exe\' and CommandLine like \'%daemon-watchdog%\'" get ProcessId /format:list',
+        `wmic process where "Name='cmd.exe' and CommandLine like '%daemon-watchdog%'" get ProcessId,CommandLine /format:list`,
         {
           encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true,
           timeout: WINDOWS_COMMAND_TIMEOUT_MS, killSignal: 'SIGKILL',
         },
       );
-      pids = out
-        .split(/\r?\n/)
-        .map((line) => line.match(/^ProcessId=(\d+)/))
-        .filter((m): m is RegExpMatchArray => m !== null)
-        .map((m) => parseInt(m[1], 10))
-        .filter((pid) => Number.isFinite(pid) && pid > 0);
+      pids = parseWatchdogProcessListing(out, currentHome, defaultHome);
     } catch { /* both methods failed */ }
   }
   for (const pid of pids) {

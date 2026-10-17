@@ -17,8 +17,13 @@
  * Pure-function harness — file IO is injected via `readSentinel` so
  * the tests don't need a tmpdir. Production wiring in
  * handleDaemonUpgrade reads ~/.imcodes/last-upgrade-at; upgrade.sh
- * writes it on a successful step 5 health check.
+ * writes it UNCONDITIONALLY after every upgrade attempt (a slow-but-
+ * successful restart used to miss the 14s health check and never write
+ * it, so the cooldown never armed and the node thrashed).
  */
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { evaluateAutoUpgradeCooldown } from '../../src/daemon/command-handler.js';
 
@@ -156,5 +161,41 @@ describe('evaluateAutoUpgradeCooldown', () => {
     });
     expect(v.onCooldown).toBe(true);
     expect(v.lastAt).toBe(lastAt);
+  });
+});
+
+/**
+ * The cooldown function above is only half the fix. The other half lives in the
+ * generated upgrade.sh: the sentinel must be written whether or not the 14s
+ * post-restart health check saw the new daemon. Gating it on the health check
+ * meant a slow-but-successful startup never armed the cooldown, so a busy node
+ * re-upgraded on every dev-tag poll (endless restart thrash). This is a
+ * source-level guard because the shell template is built inline inside
+ * handleDaemonUpgrade and is not separately invocable.
+ */
+describe('upgrade.sh cooldown sentinel is written unconditionally', () => {
+  const source = readFileSync(
+    join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'src', 'util', 'posix-upgrade-script.ts'),
+    'utf8',
+  );
+
+  it('writes the sentinel outside the health-check success branch', () => {
+    const write = `printf '%s\\n' "$(( $(date +%s) * 1000 ))" > "$IMCODES_STATE_DIR/last-upgrade-at" 2>/dev/null || true`;
+    const writeAt = source.indexOf(write);
+    expect(writeAt).toBeGreaterThan(-1);
+    // Top level of the script (column 0): not nested in any if/else, so neither a slow start nor
+    // a failed health check can skip it.
+    expect(source.lastIndexOf('\n', writeAt) + 1).toBe(writeAt);
+    // It comes after the health check and after the rollback decision, and before the rolled-back
+    // exit -- so a rolled-back upgrade arms the cooldown too (it was attempted).
+    const healthAt = source.indexOf('if wait_for_new_daemon "$HEALTH_FIRST_WAIT_SEC"; then');
+    const rollbackAt = source.indexOf('[step 5.5] ROLLBACK');
+    const rolledBackExitAt = source.indexOf('if [ "$ROLLED_BACK" = "1" ]; then');
+    expect(healthAt).toBeGreaterThan(-1);
+    expect(rollbackAt).toBeGreaterThan(healthAt);
+    expect(writeAt).toBeGreaterThan(rollbackAt);
+    expect(rolledBackExitAt).toBeGreaterThan(writeAt);
+    // Nothing between the health check and the sentinel exits the script.
+    expect(source.slice(healthAt, writeAt)).not.toMatch(/^\s*exit\b/m);
   });
 });

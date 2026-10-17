@@ -1,3 +1,4 @@
+import { resolveImcodesHome } from '../util/windows-daemon-lock.js';
 /**
  * Full CC hook suite setup.
  *
@@ -23,14 +24,16 @@ import path from 'path';
 import os from 'os';
 import { activeHookPort } from '../daemon/hook-server.js';
 
-const IMCODES_DIR = path.join(os.homedir(), '.imcodes');
-const CC_SETTINGS_PATH = path.join(os.homedir(), '.claude', 'settings.json');
+function imcodesDir(): string { return resolveImcodesHome(); }
+function ccSettingsPath(): string { return path.join(os.homedir(), '.claude', 'settings.json'); }
 const IS_WINDOWS = process.platform === 'win32';
 
 // ── Signal file API ────────────────────────────────────────────────────────────
 
 /** Directory where idle signal files are written by hooks and consumed by the daemon. */
-export const SIGNAL_DIR = path.join(IMCODES_DIR, 'signals');
+function signalDir(): string { return path.join(imcodesDir(), 'signals'); }
+/** @deprecated Prefer the lazy signalDir resolution used by the APIs. */
+export const SIGNAL_DIR = signalDir();
 
 interface IdleSignal {
   session: string;
@@ -40,16 +43,16 @@ interface IdleSignal {
 
 /** Write an idle signal file for a session (atomic rename). */
 export async function writeIdleSignal(signal: IdleSignal): Promise<void> {
-  await fs.mkdir(SIGNAL_DIR, { recursive: true });
-  const tmp = path.join(SIGNAL_DIR, `${signal.session}.tmp`);
-  const dest = path.join(SIGNAL_DIR, `${signal.session}.signal`);
+  await fs.mkdir(signalDir(), { recursive: true });
+  const tmp = path.join(signalDir(), `${signal.session}.tmp`);
+  const dest = path.join(signalDir(), `${signal.session}.signal`);
   await fs.writeFile(tmp, JSON.stringify(signal));
   await fs.rename(tmp, dest);
 }
 
 /** Read and consume an idle signal for a session. Returns null if none exists. */
 export async function checkIdleSignal(session: string): Promise<IdleSignal | null> {
-  const filePath = path.join(SIGNAL_DIR, `${session}.signal`);
+  const filePath = path.join(signalDir(), `${session}.signal`);
   try {
     const raw = await fs.readFile(filePath, 'utf8');
     await fs.unlink(filePath).catch(() => {});
@@ -268,14 +271,14 @@ function buildScripts(port: number): Array<{ name: string; content: string }> {
 
 /** Write all hook scripts to ~/.imcodes/ and register them in ~/.claude/settings.json. */
 export async function setupCCHooks(): Promise<void> {
-  await fs.mkdir(IMCODES_DIR, { recursive: true });
+  await fs.mkdir(imcodesDir(), { recursive: true });
   const port = activeHookPort;
   const scripts = buildScripts(port);
   const names = hookScripts();
 
   // ── 1. Write hook scripts ───────────────────────────────────────────────────
   for (const { name, content } of scripts) {
-    const scriptPath = path.join(IMCODES_DIR, name);
+    const scriptPath = path.join(imcodesDir(), name);
     await fs.writeFile(scriptPath, content);
     await fs.chmod(scriptPath, 0o755).catch(() => {}); // chmod may fail on Windows, that's fine
   }
@@ -283,7 +286,7 @@ export async function setupCCHooks(): Promise<void> {
   // ── 2. Update ~/.claude/settings.json ──────────────────────────────────────
   let settings: Record<string, unknown> = {};
   try {
-    const raw = await fs.readFile(CC_SETTINGS_PATH, 'utf-8');
+    const raw = await fs.readFile(ccSettingsPath(), 'utf-8');
     settings = JSON.parse(raw);
   } catch {
     // file may not exist yet — start fresh
@@ -294,7 +297,7 @@ export async function setupCCHooks(): Promise<void> {
   type HookEntry = { matcher?: string; hooks?: Array<{ type: string; command: string }> };
 
   for (const [eventName, scriptName] of Object.entries(names)) {
-    const scriptPath = path.join(IMCODES_DIR, scriptName);
+    const scriptPath = path.join(imcodesDir(), scriptName);
     // On Windows, CC needs "node <path>" as the command since .mjs isn't directly executable
     const command = IS_WINDOWS ? `node "${scriptPath}"` : scriptPath;
     const entries = ((hooks[eventName] as unknown[]) ?? []) as HookEntry[];
@@ -326,8 +329,8 @@ export async function setupCCHooks(): Promise<void> {
   const json = JSON.stringify(settings, null, 2);
   JSON.parse(json); // throws if invalid
 
-  await fs.mkdir(path.dirname(CC_SETTINGS_PATH), { recursive: true });
-  await fs.writeFile(CC_SETTINGS_PATH, json);
+  await fs.mkdir(path.dirname(ccSettingsPath()), { recursive: true });
+  await fs.writeFile(ccSettingsPath(), json);
 }
 
 /** @deprecated Use setupCCHooks() instead */

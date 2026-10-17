@@ -174,6 +174,151 @@ export function resolveClaudeCodePathForSdk(name = 'claude'): string {
   return name;
 }
 
+function getWindowsAgyInstallCandidates(name: string): string[] {
+  const basename = path.basename(name);
+  const hasExt = /\.[^\\/]+$/.test(basename);
+  const fileNames = hasExt ? [basename] : [basename, `${basename}.exe`, `${basename}.cmd`, `${basename}.bat`];
+  const dirs = uniqueNonEmpty([
+    ...getWindowsGlobalCliDirs(),
+    process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'Programs', 'antigravity', 'bin') : undefined,
+    process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'antigravity-cli', 'bin') : undefined,
+    process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'bin') : undefined,
+    process.env.USERPROFILE ? path.join(process.env.USERPROFILE, '.gemini', 'antigravity-cli', 'bin') : undefined,
+    process.env.USERPROFILE ? path.join(process.env.USERPROFILE, '.local', 'bin') : undefined,
+  ]);
+  return dirs.flatMap((dir) => fileNames.map((fileName) => path.join(dir, fileName)));
+}
+
+/** Common per-user `agy` install locations on macOS/Linux, checked when the
+ *  daemon's (systemd/launchd) PATH is too sparse to contain `agy`. */
+function getUnixAgyInstallCandidates(): string[] {
+  const home = process.env.HOME;
+  return uniqueNonEmpty([
+    home ? path.join(home, '.local', 'bin', 'agy') : undefined,
+    home ? path.join(home, '.gemini', 'antigravity-cli', 'bin', 'agy') : undefined,
+    home ? path.join(home, '.gemini', 'antigravity', 'bin', 'agy') : undefined,
+    home ? path.join(home, '.npm-global', 'bin', 'agy') : undefined,
+    '/usr/local/bin/agy',
+    '/opt/homebrew/bin/agy',
+    '/usr/bin/agy',
+    '/bin/agy',
+  ]);
+}
+
+/** Resolve a CLI path for Google Antigravity (`agy`).
+ *  Under systemd/launchd, PATH is often sparse and omits ~/.local/bin/agy.
+ *  Checks explicit config, per-user paths, system paths, and PATH. */
+export function resolveAgyPathForSdk(name = 'agy'): string {
+  if (process.platform === 'win32') {
+    const resolved = resolveBinaryWithWindowsFallbacks(name, getWindowsAgyInstallCandidates(name));
+    if (/\.(cmd|bat)$/i.test(resolved)) {
+      return parseNpmCmdShim(resolved) ?? resolved;
+    }
+    return resolved;
+  }
+  if (name !== 'agy') {
+    if (path.isAbsolute(name)) return name;
+    for (const candidate of getUnixAgyInstallCandidates()) {
+      if (path.basename(candidate) === name && existsSync(candidate)) return candidate;
+    }
+    return name;
+  }
+  for (const candidate of getUnixAgyInstallCandidates()) {
+    if (existsSync(candidate)) return candidate;
+  }
+  return name;
+}
+
+function getUnixMuseCodeInstallCandidates(): string[] {
+  const home = process.env.HOME;
+  return uniqueNonEmpty([
+    home ? path.join(home, '.local', 'bin', 'muse') : undefined,
+    home ? path.join(home, '.muse', 'bin', 'muse') : undefined,
+    home ? path.join(home, '.npm-global', 'bin', 'muse') : undefined,
+    '/usr/local/bin/muse',
+    '/opt/homebrew/bin/muse',
+    '/usr/bin/muse',
+    '/bin/muse',
+  ]);
+}
+
+/** Resolve a CLI path for Muse Code (`muse`).
+ *  Under systemd/launchd, PATH is often sparse and omits ~/.local/bin/muse.
+ *  Checks explicit config, per-user paths, system paths, and PATH. */
+export function resolveMuseCodePathForSdk(name = 'muse'): string {
+  if (process.platform === 'win32') {
+    return name;
+  }
+  if (name !== 'muse') {
+    if (path.isAbsolute(name)) return name;
+    for (const candidate of getUnixMuseCodeInstallCandidates()) {
+      if (path.basename(candidate) === name && existsSync(candidate)) return candidate;
+    }
+    return name;
+  }
+  for (const candidate of getUnixMuseCodeInstallCandidates()) {
+    if (existsSync(candidate)) return candidate;
+  }
+  return name;
+}
+
+function getWindowsGrokInstallCandidates(name: string): string[] {
+  const basename = path.basename(name);
+  const hasExt = /\.[^\\/]+$/.test(basename);
+  const fileNames = hasExt ? [basename] : [basename, `${basename}.exe`, `${basename}.cmd`, `${basename}.bat`];
+  const grokHome = process.env.GROK_HOME;
+  const dirs = uniqueNonEmpty([
+    ...getWindowsGlobalCliDirs(),
+    grokHome ? path.join(grokHome, 'bin') : undefined,
+    process.env.USERPROFILE ? path.join(process.env.USERPROFILE, '.grok', 'bin') : undefined,
+    process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'Programs', 'grok', 'bin') : undefined,
+    process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'Programs', 'grok') : undefined,
+    process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'grok', 'bin') : undefined,
+    process.env.USERPROFILE ? path.join(process.env.USERPROFILE, '.local', 'bin') : undefined,
+  ]);
+  return dirs.flatMap((dir) => fileNames.map((fileName) => path.join(dir, fileName)));
+}
+
+function getUnixGrokInstallCandidates(): string[] {
+  const home = process.env.HOME;
+  const grokHome = process.env.GROK_HOME;
+  return uniqueNonEmpty([
+    grokHome ? path.join(grokHome, 'bin', 'grok') : undefined,
+    home ? path.join(home, '.grok', 'bin', 'grok') : undefined,
+    home ? path.join(home, '.local', 'bin', 'grok') : undefined,
+    home ? path.join(home, '.npm-global', 'bin', 'grok') : undefined,
+    '/usr/local/bin/grok',
+    '/opt/homebrew/bin/grok',
+    '/usr/bin/grok',
+    '/bin/grok',
+  ]);
+}
+
+/** Resolve a CLI path for Grok (`grok`).
+ *  Under systemd/launchd, PATH is often sparse and omits ~/.grok/bin or ~/.local/bin.
+ *  Checks explicit config, per-user paths, system paths, and PATH. */
+export function resolveGrokPathForSdk(name = 'grok'): string {
+  if (process.platform === 'win32') {
+    const resolved = resolveBinaryWithWindowsFallbacks(name, getWindowsGrokInstallCandidates(name));
+    if (/\.(cmd|bat)$/i.test(resolved)) {
+      return parseNpmCmdShim(resolved) ?? resolved;
+    }
+    return resolved;
+  }
+  if (name !== 'grok') {
+    if (path.isAbsolute(name)) return name;
+    for (const candidate of getUnixGrokInstallCandidates()) {
+      if (path.basename(candidate) === name && existsSync(candidate)) return candidate;
+    }
+    return name;
+  }
+  for (const candidate of getUnixGrokInstallCandidates()) {
+    if (existsSync(candidate)) return candidate;
+  }
+  return name;
+}
+
+
 /** Result of resolving a binary that may be an npm .cmd shim.
  *  When the resolved path is a real .exe, just `{ executable }`.
  *  When it's a Windows .cmd shim, returns the underlying node script so

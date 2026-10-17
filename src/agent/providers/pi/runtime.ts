@@ -1,8 +1,8 @@
-import { homedir } from 'node:os';
 import { existsSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { PiLlmConfig } from '../../../../shared/pi-agent.js';
+import { imcodesStateDir } from '../../../util/imcodes-state-dir.js';
 
 export const PI_BINARY_ENV = 'IMCODES_PI_BIN';
 export const PI_DEFAULT_BINARY = 'pi';
@@ -14,7 +14,7 @@ export function resolvePiBinary(): string {
 }
 
 export function piSessionDir(): string {
-  return join(homedir(), '.imcodes', 'pi', 'sessions');
+  return join(imcodesStateDir(), 'pi', 'sessions');
 }
 
 export function resolvePiExtensionEntry(): string {

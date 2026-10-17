@@ -15,6 +15,9 @@ vi.mock('node:os', () => ({
 describe('project-store contracts', () => {
   beforeEach(() => {
     vi.resetModules();
+    vi.stubEnv('HOME', projectStoreState.home);
+    vi.stubEnv('USERPROFILE', projectStoreState.home);
+    vi.stubEnv('IMCODES_HOME', join(projectStoreState.home, '.imcodes'));
     vi.useFakeTimers();
     vi.setSystemTime(new Date('2026-05-11T00:00:00.000Z'));
     rmSync(projectStoreState.home, { recursive: true, force: true });
@@ -23,6 +26,7 @@ describe('project-store contracts', () => {
   afterEach(() => {
     vi.useRealTimers();
     vi.restoreAllMocks();
+    vi.unstubAllEnvs();
     rmSync(projectStoreState.home, { recursive: true, force: true });
   });
 

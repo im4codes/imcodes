@@ -53,6 +53,11 @@ vi.mock('../src/hooks/usePref.js', () => ({
 import { ChatView } from '../src/components/ChatView.js';
 import type { TimelineEvent } from '../src/ws-client.js';
 import { downloadAttachment } from '../src/api.js';
+import {
+  DOWNLOAD_TRANSFER_STATUS,
+  __resetDownloadTransfersForTests,
+  getDownloadTransfers,
+} from '../src/download-transfer-store.js';
 
 function makeEvent(overrides: Partial<TimelineEvent> & { type: string; payload: Record<string, unknown> }): TimelineEvent {
   return {
@@ -261,7 +266,53 @@ describe('ChatView tool payload formatting', () => {
     expect(screen.getByText('output')).toBeDefined();
   });
 
-  it('preserves complete commands and outputs in the one-line preview and bounded expansion', () => {
+  it.each(['tool.call', 'tool.result'])('keeps large %s payloads out of the collapsed DOM and reveals them on demand', (type) => {
+    const tail = 'FULL_PAYLOAD_TAIL_7246';
+    const text = 'x'.repeat(300_000) + tail;
+    const event = makeEvent({ type, payload: type === 'tool.call'
+      ? { tool: 'Bash', input: { command: text } }
+      : { output: { content: text, ok: true } } });
+    const { container, rerender } = render(<ChatView events={[event]} loading={false} />);
+    const fold = container.querySelector('.chat-tool-block-fold')!;
+    expect(fold.textContent!.length).toBeLessThan(4096);
+    expect(fold.textContent).not.toContain(tail);
+    expect(fold.querySelector('.chat-tool-detail')).toBeNull();
+    fireEvent.click(fold.querySelector('.chat-tool-block-toggle')!);
+    expect(fold.textContent).toContain(tail);
+    // Hydration/retries can replace a payload under the same ID while open.
+    const updated = { ...event, payload: type === 'tool.call'
+      ? { tool: 'Bash', input: { command: text + '-updated' } }
+      : { output: { content: text + '-updated', ok: true } } };
+    rerender(<ChatView events={[updated]} loading={false} />);
+    expect(fold.textContent).toContain(tail + '-updated');
+    fireEvent.click(fold.querySelector('.chat-tool-block-toggle')!);
+    expect(fold.textContent!.length).toBeLessThan(4096);
+    expect(fold.textContent).not.toContain(tail);
+    expect(event.payload).toEqual(type === 'tool.call'
+      ? { tool: 'Bash', input: { command: text } }
+      : { output: { content: text, ok: true } });
+  });
+
+  it('bounds multiline merged outputs and errors without discarding their original content', () => {
+    const tail = 'RESULT_ERROR_TAIL_6382';
+    const output = 'row\n'.repeat(60_000) + tail;
+    const call = makeEvent({ type: 'tool.call', payload: { tool: 'Bash', toolCallId: 'large' } });
+    const result = makeEvent({ type: 'tool.result', payload: { toolCallId: 'large', output } });
+    const { container, rerender } = render(<ChatView events={[call, result]} loading={false} />);
+    let fold = container.querySelector('.chat-tool-block-fold')!;
+    expect(fold.textContent!.length).toBeLessThan(4096);
+    expect(fold.textContent).not.toContain(tail);
+    fireEvent.click(fold.querySelector('.chat-tool-block-toggle')!);
+    expect(fold.textContent).toContain(output);
+    rerender(<ChatView events={[makeEvent({ type: 'tool.result', payload: { error: output } })]} loading={false} />);
+    fold = container.querySelector('.chat-tool-block-fold')!;
+    expect(fold.textContent!.length).toBeLessThan(4096);
+    fireEvent.click(fold.querySelector('.chat-tool-block-toggle')!);
+    expect(fold.textContent).toContain(tail);
+    expect(fold.querySelector('.chat-tool-fold-continuation')?.textContent).toBe(output.slice(output.indexOf('\n') + 1));
+  });
+
+  it('bounds collapsed output previews and preserves complete commands and outputs on expansion', () => {
     const command = `printf '${'command-segment-'.repeat(24)}COMMAND_TAIL_9f6e'`;
     const output = `${'output-segment-'.repeat(360)}OUTPUT_TAIL_4c21`;
     const events = [
@@ -290,10 +341,10 @@ describe('ChatView tool payload formatting', () => {
     expect(command.length).toBeGreaterThan(240);
     expect(output.length).toBeGreaterThan(4_096);
     expect(commandPreview?.textContent).toBe(` ${command}`);
-    expect(outputPreview?.textContent).toBe(output);
+    expect(outputPreview?.textContent!.length).toBeLessThan(4096);
     expect(commandPreview?.textContent).toContain('COMMAND_TAIL_9f6e');
-    expect(outputPreview?.textContent).toContain('OUTPUT_TAIL_4c21');
-    expect(container.textContent).not.toContain('…');
+    expect(outputPreview?.textContent).not.toContain('OUTPUT_TAIL_4c21');
+    expect(outputPreview?.textContent).toContain('…');
 
     const toggle = screen.getByRole('button', { name: 'details' });
     expect(toggle.textContent).toBe('▸');
@@ -305,6 +356,7 @@ describe('ChatView tool payload formatting', () => {
     fireEvent.click(toolName);
     expect(fold?.classList.contains('is-expanded')).toBe(true);
     expect(toggle.getAttribute('aria-expanded')).toBe('true');
+    expect(container.querySelector('.chat-tool-output')?.textContent).toBe(output);
     fireEvent.click(toolName);
     expect(fold?.classList.contains('is-collapsed')).toBe(true);
     expect(toggle.getAttribute('aria-expanded')).toBe('false');
@@ -600,9 +652,18 @@ describe('ChatView tool payload formatting', () => {
     expect(link?.textContent).toBe('C:\\Users\\admin\\screenshot.png');
     expect(button).not.toBeNull();
 
+    // An image path is also read by the inline preview, so count the reads the
+    // click adds rather than matching an earlier call with the same path.
+    const readsBeforeClick = fsReadFile.mock.calls.length;
     fireEvent.click(button!);
 
-    expect(fsReadFile).toHaveBeenCalledWith('C:\\Users\\admin\\screenshot.png');
+    // The save dialog opens first (it needs the click), so the handle request
+    // follows a tick later rather than synchronously.
+    await waitFor(() => expect(fsReadFile).toHaveBeenCalledTimes(readsBeforeClick + 1));
+    // The daemon now resolves chat-referenced paths itself (candidate roots,
+    // real stat verification), so the client sends the exact bytes the click
+    // target carried instead of pre-resolving them.
+    expect(fsReadFile).toHaveBeenLastCalledWith('C:\\Users\\admin\\screenshot.png', undefined, { chatFileReference: true });
     for (const [handler] of onMessage.mock.calls) {
       handler({
         type: 'fs.read_response',
@@ -611,12 +672,15 @@ describe('ChatView tool payload formatting', () => {
       });
     }
     await waitFor(() => {
-      expect(downloadAttachment).toHaveBeenCalledWith('server-1', 'dl-win-path');
+      // No save picker in this browser: the HTTP download is the fallback, now
+      // cancellable from the download center.
+      expect(downloadAttachment).toHaveBeenCalledWith('server-1', 'dl-win-path', undefined, expect.any(AbortSignal));
     });
   });
 
   it('downloads relative Chinese file paths from chat text through the current workdir', async () => {
     vi.mocked(downloadAttachment).mockClear();
+    __resetDownloadTransfersForTests();
     const fsReadFile = vi.fn(() => 'req-cn-ppt');
     const onMessage = vi.fn(() => vi.fn());
     const events = [
@@ -646,9 +710,21 @@ describe('ChatView tool payload formatting', () => {
     expect(container.textContent).toContain('!');
     expect(button).not.toBeNull();
 
+    // An image path is also read by the inline preview, so count the reads the
+    // click adds rather than matching an earlier call with the same path.
+    const readsBeforeClick = fsReadFile.mock.calls.length;
     fireEvent.click(button!);
 
-    expect(fsReadFile).toHaveBeenCalledWith('/repo/project/ppt/qisi_antidrug/广西缉毒AI嗅觉方案_政企4K.pptx');
+    // The save dialog opens first (it needs the click), so the handle request
+    // follows a tick later rather than synchronously.
+    await waitFor(() => expect(fsReadFile).toHaveBeenCalledTimes(readsBeforeClick + 1));
+    // The daemon now resolves the relative reference itself against the
+    // session's candidate roots (cwd/worktree/project/home) instead of the
+    // client pre-joining it with `workdir`, so the raw relative bytes are
+    // what's sent -- matching acceptance item 3 (relative-path resolution).
+    expect(fsReadFile).toHaveBeenLastCalledWith(
+      'ppt/qisi_antidrug/广西缉毒AI嗅觉方案_政企4K.pptx', undefined, { chatFileReference: true },
+    );
     for (const [handler] of onMessage.mock.calls) {
       handler({
         type: 'fs.read_response',
@@ -657,8 +733,21 @@ describe('ChatView tool payload formatting', () => {
       });
     }
     await waitFor(() => {
-      expect(downloadAttachment).toHaveBeenCalledWith('server-1', 'dl-cn-ppt');
+      // No save picker in this browser: the HTTP download is the fallback, now
+      // cancellable from the download center.
+      expect(downloadAttachment).toHaveBeenCalledWith('server-1', 'dl-cn-ppt', undefined, expect.any(AbortSignal));
     });
+    // A chat download now shows up in the download center like the file
+    // browser's, which is where its Show in folder button lives.
+    // Without a save picker this browser hands the file to its own download
+    // manager, so the row settles as handed off.
+    await waitFor(() => {
+      expect(getDownloadTransfers()).toEqual([expect.objectContaining({
+        name: '广西缉毒AI嗅觉方案_政企4K.pptx',
+        status: DOWNLOAD_TRANSFER_STATUS.HANDED_OFF,
+      })]);
+    });
+    __resetDownloadTransfersForTests();
   });
 
   it('keeps adjacent Chinese-punctuated URLs as external links instead of file paths', () => {

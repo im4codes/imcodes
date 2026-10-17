@@ -1,6 +1,15 @@
+import { confirmChildStop, confirmCapturedChildExit } from '../provider-stop-confirmation.js';
 import { randomUUID } from 'node:crypto';
+import { gateChildStream } from '../../util/event-loop-backpressure.js';
 import path from 'node:path';
 import type { ChildProcess } from 'node:child_process';
+import {
+  agentResourceOwner,
+  bindAgentProcessResource,
+  type AgentProcessResource,
+} from './agent-process-resource.js';
+import type { SessionResourceOwner } from '../../daemon/session-resource-registry.js';
+import { killProcessTree } from '../../util/kill-process-tree.js';
 import readline from 'node:readline';
 import type {
   TransportProvider,
@@ -28,7 +37,6 @@ import {
   normalizeTransportCwd,
   resolveBinaryWithWindowsFallbacks,
   resolveExecutableForSpawn,
-  terminateChildProcess,
 } from '../transport-paths.js';
 import {
   parseCursorStreamLine,
@@ -47,11 +55,18 @@ import {
   MEMORY_MCP_STATUS,
   type MemoryMcpProviderStatusView,
 } from '../../../shared/memory-ws.js';
+import { NATIVE_AGENT_ADMISSION_MODES } from '../../../shared/native-collaboration-policy.js';
 
 const CURSOR_BIN = 'cursor-agent';
 const CONNECT_PROBE_TIMEOUT_MS = 15_000;
 const CANCEL_ESCALATION_MS = 2_000;
 const MIN_CURSOR_VERSION = { major: 1, minor: 0, patch: 0 };
+// `cursor-agent --list-models` exposes ids made of these characters.  The
+// stream's `system.init.model` is not guaranteed to be an id: recent Cursor
+// builds report a human label such as "Claude Sonnet 5 300K Medium No
+// Thinking" there.  Passing that label back to `--model` makes the next turn
+// fail with "Cannot use this model".
+const CURSOR_MODEL_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 
 export interface CursorHeadlessRuntimeHooks {
   loadChildProcess(): Promise<typeof import('node:child_process')>;
@@ -68,6 +83,10 @@ interface CursorSessionState {
   model?: string;
   mcpEnv?: Record<string, string>;
   child: ChildProcess | null;
+  /** Owner identity for the registry lease on the spawned agent CLI. */
+  resourceOwner?: SessionResourceOwner | null;
+  /** Registry lease for `child`; released when the child exits or is reaped. */
+  agentResource?: AgentProcessResource;
   currentMessageId: string | null;
   currentText: string;
   pendingFinalText?: string;
@@ -82,6 +101,12 @@ interface CursorSessionState {
 
 function isTruthyString(value: unknown): value is string {
   return typeof value === 'string' && value.trim().length > 0;
+}
+
+function normalizeCursorModelId(value: unknown): string | undefined {
+  if (!isTruthyString(value)) return undefined;
+  const model = value.trim();
+  return CURSOR_MODEL_ID_RE.test(model) ? model : undefined;
 }
 
 function extractString(record: Record<string, unknown>, ...keys: string[]): string | undefined {
@@ -145,6 +170,9 @@ export class CursorHeadlessProvider implements TransportProvider {
       cancellation: 'none',
       reason: 'Verified with cursor-agent 2026.05.05-84a231c: CLI help exposes no compact/compress command or compact API for the headless adapter.',
     },
+    // No per-call veto and no per-session disable for native agents: this
+    // runtime cannot send or receive supervised work.
+    nativeAgentAdmission: NATIVE_AGENT_ADMISSION_MODES.UNENFORCEABLE,
   };
 
   private config: ProviderConfig | null = null;
@@ -275,7 +303,13 @@ export class CursorHeadlessProvider implements TransportProvider {
   async disconnect(): Promise<void> {
     for (const state of this.sessions.values()) {
       if (state.child && !state.child.killed) {
-        terminateChildProcess(state.child, CANCEL_ESCALATION_MS);
+        // Reap the group this provider owns. terminateChildProcess signals a
+        // single pid and walks nothing, so it cannot reach a descendant whose
+        // parent already exited.
+        await killProcessTree(state.child, {
+          gracefulMs: CANCEL_ESCALATION_MS,
+          ownsProcessGroup: true,
+        });
       }
     }
     this.sessions.clear();
@@ -287,7 +321,8 @@ export class CursorHeadlessProvider implements TransportProvider {
     const existingEntry = this.findSessionByRouteId(routeId);
     if (existingEntry && !config.fresh) {
       const [sessionId, state] = existingEntry;
-      if (isTruthyString(config.agentId)) state.model = config.agentId;
+      const requestedModel = normalizeCursorModelId(config.agentId);
+      if (requestedModel) state.model = requestedModel;
       this.emitSessionInfo(sessionId, {
         resumeId: state.resumeId,
         ...(state.model ? { model: state.model } : {}),
@@ -300,7 +335,7 @@ export class CursorHeadlessProvider implements TransportProvider {
     }
 
     const cwd = normalizeTransportCwd(config.cwd) ?? normalizeTransportCwd(process.cwd())!;
-    const model = isTruthyString(config.agentId) ? config.agentId : this.resolveDefaultModel();
+    const model = normalizeCursorModelId(config.agentId) ?? this.resolveDefaultModel();
     const resumeId =
       isTruthyString(config.resumeId)
         ? config.resumeId
@@ -312,6 +347,7 @@ export class CursorHeadlessProvider implements TransportProvider {
 
     const carryExistingHistory = !!existingEntry && !config.fresh;
     const state: CursorSessionState = {
+      resourceOwner: agentResourceOwner(config) ?? existingEntry?.[1]?.resourceOwner ?? null,
       routeId,
       resumeId,
       cwd,
@@ -340,7 +376,10 @@ export class CursorHeadlessProvider implements TransportProvider {
     const [resolvedId, state] = this.findSessionByAnyId(sessionId) ?? [];
     if (!state) return;
     if (state.child && !state.child.killed) {
-      terminateChildProcess(state.child, CANCEL_ESCALATION_MS);
+      await killProcessTree(state.child, {
+        gracefulMs: CANCEL_ESCALATION_MS,
+        ownsProcessGroup: true,
+      });
     }
     this.sessions.delete(resolvedId ?? sessionId);
   }
@@ -392,10 +431,15 @@ export class CursorHeadlessProvider implements TransportProvider {
   setSessionAgentId(sessionId: string, agentId: string): void {
     const state = this.getSessionState(sessionId);
     if (!state) return;
-    state.model = agentId;
+    const model = normalizeCursorModelId(agentId);
+    // Model switching is a void provider contract.  Refuse an invalid value
+    // here rather than poisoning the live session so that the next send can
+    // never pass a display label (or other malformed value) to Cursor.
+    if (!model) return;
+    state.model = model;
     this.emitSessionInfo(this.findSessionIdForState(state) ?? sessionId, {
       resumeId: state.resumeId,
-      model: agentId,
+      model,
     });
   }
 
@@ -442,6 +486,11 @@ export class CursorHeadlessProvider implements TransportProvider {
     ];
     const { spawn } = await cursorHeadlessRuntimeHooks.loadChildProcess();
     const child = spawn(resolved.executable, args, {
+      // Own process group and session on POSIX. A reparented descendant keeps
+      // its PGID but loses its PPID, so after the agent parent dies this is the
+      // only ownership token teardown still has. Without it the eight vitest
+      // workers of the incident were unreachable on PPID=1.
+      detached: process.platform !== 'win32',
       cwd: state.cwd,
       env: {
         ...process.env,
@@ -453,6 +502,9 @@ export class CursorHeadlessProvider implements TransportProvider {
       windowsHide: true,
     });
     state.child = child;
+    // Crash coverage: if the daemon dies without running teardown, the startup
+    // sweep reaps this group using the registry's process-start fingerprint.
+    state.agentResource = bindAgentProcessResource(state.resourceOwner ?? null, child);
 
     let completed = false;
     let sawError = false;
@@ -501,7 +553,7 @@ export class CursorHeadlessProvider implements TransportProvider {
       this.emitSessionInfo(sessionKey, info);
     };
 
-    const rl = readline.createInterface({ input: child.stdout! });
+    const rl = readline.createInterface({ input: gateChildStream(child.stdout!) });
     rl.on('line', (line) => {
       const event = parseCursorStreamLine(line);
       if (!event) return;
@@ -510,9 +562,10 @@ export class CursorHeadlessProvider implements TransportProvider {
         if (event.sessionId) {
           state.resumeId = event.sessionId;
         }
-        if (event.model) {
-          state.model = event.model;
-        }
+        // Cursor's init event is telemetry and can carry a human-readable
+        // display label. Never promote it to the launch id: an omitted model
+        // intentionally means "use Cursor's current default", while a model
+        // selected at session creation/model-switch time remains canonical.
         emitSessionInfoUpdate({
           resumeId: state.resumeId,
           ...(state.model ? { model: state.model } : {}),
@@ -627,6 +680,7 @@ export class CursorHeadlessProvider implements TransportProvider {
     });
 
     child.once('close', (code, signal) => {
+      confirmCapturedChildExit(child);
       rl.close();
       state.child = null;
       clearStatus();
@@ -691,11 +745,21 @@ export class CursorHeadlessProvider implements TransportProvider {
     }
   }
 
+  cancelAndWait(sessionId: string): Promise<void> {
+    const state = this.getSessionState(sessionId);
+    const capturedChild = state?.child;
+    if (!state || !capturedChild) return Promise.reject(new Error('Provider has no captured child to confirm stop'));
+    return confirmChildStop(capturedChild, () => this.cancel(sessionId), () => this.getSessionState(sessionId) === state);
+  }
+
   async cancel(sessionId: string): Promise<void> {
     const state = this.getSessionState(sessionId);
     if (!state?.child || state.child.killed) return;
     state.cancelled = true;
-    terminateChildProcess(state.child, CANCEL_ESCALATION_MS);
+    await killProcessTree(state.child, {
+      gracefulMs: CANCEL_ESCALATION_MS,
+      ownsProcessGroup: true,
+    });
   }
 
   private resolveBinaryPath(config: ProviderConfig | null): string {
@@ -715,7 +779,7 @@ export class CursorHeadlessProvider implements TransportProvider {
   }
 
   private resolveDefaultModel(): string | undefined {
-    return isTruthyString(this.config?.agentId) ? this.config!.agentId : undefined;
+    return normalizeCursorModelId(this.config?.agentId);
   }
 
   private parseCursorVersion(output: string): { major: number; minor: number; patch: number; raw: string } | null {

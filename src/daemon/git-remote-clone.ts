@@ -1,14 +1,12 @@
-import { execFile } from 'node:child_process';
 import { mkdir, realpath } from 'node:fs/promises';
 import path from 'node:path';
-import { promisify } from 'node:util';
 import {
   assertSupportedGitRemoteUrl,
   normalizeOptionalGitRemoteUrl,
   redactGitRemoteUrl,
 } from '../../shared/git-remote-url.js';
+import { execFileOffMain as execFileAsync } from '../util/exec-helper.js';
 
-const execFileAsync = promisify(execFile);
 const GIT_CLONE_TIMEOUT_MS = 10 * 60 * 1000;
 
 export type GitRemoteCloneErrorCode = 'invalid_git_remote' | 'invalid_cwd' | 'git_clone_failed';

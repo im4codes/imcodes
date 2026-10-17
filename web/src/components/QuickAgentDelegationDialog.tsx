@@ -8,6 +8,7 @@ import {
 import { getAgentBadgeConfig, getAutoSessionLabelPrefix } from '../agent-display.js';
 
 export interface QuickAgentDelegationCandidate {
+  /** Exact send_message target ID; pass directly without a target-list lookup. */
   sessionName: string;
   agentType: string;
   label?: string | null;
@@ -21,7 +22,12 @@ interface QuickAgentDelegationDialogProps {
   candidates: QuickAgentDelegationCandidate[];
   error?: string | null;
   onClose: () => void;
-  onDispatch: (input: { sessionName: string; label: string; task: string }) => void;
+  onDispatch: (input: {
+    sessionName: string;
+    label: string;
+    task: string;
+    preset: QuickAgentDelegationPreset;
+  }) => void;
 }
 
 const QUICK_TARGET_STORAGE_KEY = 'quickAgentDelegationTargets:v1';
@@ -87,7 +93,7 @@ export function QuickAgentDelegationDialog({
   onClose,
   onDispatch,
 }: QuickAgentDelegationDialogProps) {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
   const remembered = readRememberedTarget(currentSessionName);
   const [preset, setPreset] = useState<QuickAgentDelegationPreset>('audit');
   const [customTask, setCustomTask] = useState('');
@@ -119,7 +125,11 @@ export function QuickAgentDelegationDialog({
     }
     return labels;
   }, [orderedCandidates]);
-  const task = buildQuickAgentDelegationTask(preset, customTask);
+  const task = buildQuickAgentDelegationTask(
+    preset,
+    customTask,
+    i18n.resolvedLanguage ?? i18n.language,
+  );
 
   const dispatch = (candidate: QuickAgentDelegationCandidate) => {
     if (!task) return;
@@ -128,6 +138,7 @@ export function QuickAgentDelegationDialog({
       sessionName: candidate.sessionName,
       label: candidateLabels.get(candidate.sessionName) ?? visibleCandidateLabel(candidate),
       task,
+      preset,
     });
   };
 

@@ -48,13 +48,144 @@ TEST(QualityLadderTest, ClampsBitrateAndFps) {
   EXPECT_EQ(high.fps, 30);
 }
 
+TEST(QualityLadderTest, OffersSixtyFpsOnlyWhenTheViewerAllowsIt) {
+  QualityPreference sixty;
+  sixty.max_fps = 60;
+  EXPECT_STREQ(SelectQuality(15'000'000, 2560, 1440).id, "1440p30");
+  EXPECT_STREQ(SelectQuality(15'000'000, 2560, 1440, sixty).id, "1440p60");
+  EXPECT_STREQ(SelectQuality(9'000'000, 1920, 1080, sixty).id, "1080p60");
+}
+
+TEST(QualityLadderTest, SmoothKeepsFrameRateByShedResolution) {
+  QualityPreference smooth;
+  smooth.max_height = 1080;
+  smooth.priority = QualityPriority::kFramerate;
+  EXPECT_STREQ(SelectQuality(15'000'000, 5120, 2880, smooth).id, "1080p30");
+  EXPECT_STREQ(SelectQuality(2'000'000, 5120, 2880, smooth).id, "540p30");
+  EXPECT_STREQ(SelectQuality(800'000, 5120, 2880, smooth).id, "360p30");
+  // Below every 30 fps rung the frame rate finally gives way.
+  EXPECT_STREQ(SelectQuality(500'000, 5120, 2880, smooth).id, "720p10");
+}
+
+TEST(QualityLadderTest, SharpKeepsResolutionByShedFrameRate) {
+  QualityPreference sharp;
+  sharp.priority = QualityPriority::kResolution;
+  EXPECT_STREQ(SelectQuality(12'000'000, 3840, 2160, sharp).id, "2160p15");
+  EXPECT_STREQ(SelectQuality(800'000, 1920, 1080, sharp).id, "720p10");
+}
+
+TEST(QualityLadderTest, SaverCapsResolutionFrameRateAndBitrate) {
+  QualityPreference saver;
+  saver.max_height = 720;
+  saver.max_fps = 15;
+  saver.max_bitrate_bps = 1'800'000;
+  const QualitySelection selected = SelectQuality(15'000'000, 1920, 1080, saver);
+  EXPECT_STREQ(selected.id, "720p15");
+  EXPECT_EQ(selected.bitrate_bps, 1'800'000u);
+}
+
+TEST(QualityLadderTest, RelayCapBindsOnlyRelayedSessions) {
+  const TransportBitratePolicy relayed = SelectTransportBitratePolicy(false, 500'000);
+  EXPECT_EQ(relayed.start_bps, 500'000u);
+  EXPECT_EQ(relayed.max_bps, 500'000u);
+  EXPECT_EQ(relayed.min_bps, 350'000u);
+  EXPECT_EQ(SelectTransportBitratePolicy(true, 500'000).max_bps, 15'000'000u);
+  EXPECT_EQ(EffectiveBitrateCap(0, 500'000, false), 500'000u);
+  EXPECT_EQ(EffectiveBitrateCap(0, 500'000, true), 0u);
+  EXPECT_EQ(EffectiveBitrateCap(2'000'000, 500'000, false), 500'000u);
+  QualityPreference capped;
+  capped.max_bitrate_bps = EffectiveBitrateCap(0, 500'000, false);
+  const QualitySelection selected = SelectQuality(15'000'000, 1920, 1080, capped);
+  EXPECT_STREQ(selected.id, "720p10");
+  EXPECT_EQ(selected.bitrate_bps, 500'000u);
+}
+
 TEST(QualityLadderTest, EnforcesPerPeerAndAggregateBitrateBudgets) {
-  EXPECT_EQ(ClampAggregateVideoBitrate(20'000'000, 0, 0), 15'000'000u);
+  // The per-viewer ceiling is the estimator's bound (15 Mbps unless the
+  // viewer raised it); the budget itself never exceeds the Ultra maximum.
+  EXPECT_EQ(ClampAggregateVideoBitrate(40'000'000, 0, 0), 30'000'000u);
   EXPECT_EQ(ClampAggregateVideoBitrate(15'000'000, 0, 50'000'000),
             10'000'000u);
   EXPECT_EQ(ClampAggregateVideoBitrate(15'000'000, 12'000'000, 57'000'000),
             15'000'000u);
   EXPECT_EQ(ClampAggregateVideoBitrate(1'000'000, 0, 60'000'000), 0u);
+}
+
+TEST(QualityLadderTest, UltraRaisesTheViewerCeilingAndNothingElseDoes) {
+  QualityPreference standard;
+  EXPECT_EQ(ViewerVideoBitrateCeiling(standard), 15'000'000u);
+  standard.max_bitrate_bps = 8'000'000;
+  EXPECT_EQ(ViewerVideoBitrateCeiling(standard), 15'000'000u);
+  EXPECT_EQ(SelectTransportBitratePolicy(true).max_bps, 15'000'000u);
+
+  QualityPreference ultra;
+  ultra.max_height = 2160;
+  ultra.max_bitrate_bps = 30'000'000;
+  ultra.priority = QualityPriority::kResolution;
+  EXPECT_EQ(ViewerVideoBitrateCeiling(ultra), 30'000'000u);
+  ultra.max_bitrate_bps = 90'000'000;
+  EXPECT_EQ(ViewerVideoBitrateCeiling(ultra), 30'000'000u);
+  ultra.max_bitrate_bps = 30'000'000;
+
+  const TransportBitratePolicy direct =
+      SelectTransportBitratePolicy(true, 0, ViewerVideoBitrateCeiling(ultra));
+  EXPECT_EQ(direct.max_bps, 30'000'000u);
+  EXPECT_EQ(direct.start_bps, 12'000'000u);
+  // A relay ceiling still binds a relayed Ultra viewer.
+  EXPECT_EQ(SelectTransportBitratePolicy(false, 2'000'000,
+                                         ViewerVideoBitrateCeiling(ultra))
+                .max_bps,
+            2'000'000u);
+
+  // A 5K display is encoded at 4K with the raised target; the default viewer
+  // stays at its 15 Mbps ceiling on the same estimate.
+  const QualitySelection sharp4k = SelectQuality(30'000'000, 5120, 2880, ultra);
+  EXPECT_STREQ(sharp4k.id, "2160p30");
+  EXPECT_EQ(sharp4k.width, 3840);
+  EXPECT_EQ(sharp4k.height, 2160);
+  EXPECT_EQ(sharp4k.bitrate_bps, 30'000'000u);
+  EXPECT_EQ(SelectQuality(30'000'000, 5120, 2880).bitrate_bps, 15'000'000u);
+}
+
+TEST(QualityLadderTest, BacklogPressureLeavesAnUnstrugglingEncoderAlone) {
+  EXPECT_EQ(ApplyEncodeBacklogPressure(6'000'000, 0), 6'000'000u);
+}
+
+TEST(QualityLadderTest, BacklogPressureNeverIncreasesTheTarget) {
+  uint32_t previous = 6'000'000;
+  for (uint32_t pressure = 1; pressure <= 24; ++pressure) {
+    const uint32_t current = ApplyEncodeBacklogPressure(6'000'000, pressure);
+    EXPECT_LE(current, previous);
+    EXPECT_LE(current, 6'000'000u);
+    EXPECT_GE(current, kMinVideoBitrateBps);
+    previous = current;
+  }
+}
+
+TEST(QualityLadderTest, BacklogPressureNeverDropsBelowTheMinimumFloor) {
+  EXPECT_EQ(ApplyEncodeBacklogPressure(400'000, 12), kMinVideoBitrateBps);
+  EXPECT_EQ(ApplyEncodeBacklogPressure(400'000, 24), kMinVideoBitrateBps);
+}
+
+TEST(QualityLadderTest, BacklogPressureLeavesATargetBelowTheFloorAlone) {
+  // A fresh path reports targets below the floor; there is nothing left to
+  // discount, and the result must never be raised above the target.
+  EXPECT_EQ(ApplyEncodeBacklogPressure(34'167, 3), 34'167u);
+  EXPECT_EQ(ApplyEncodeBacklogPressure(kMinVideoBitrateBps, 12),
+            kMinVideoBitrateBps);
+}
+
+TEST(QualityLadderTest, BacklogPressureFeedsBackIntoALowerLadderRung) {
+  // Sustained local backlog lands on a smaller/slower rung than the network
+  // alone would have chosen, entirely independent of congestion control.
+  const QualitySelection unpressured = SelectQuality(6'000'000, 1920, 1080);
+  EXPECT_STREQ(unpressured.id, "1080p30");
+
+  const uint32_t pressured_bitrate =
+      ApplyEncodeBacklogPressure(6'000'000, 9);
+  const QualitySelection pressured =
+      SelectQuality(pressured_bitrate, 1920, 1080);
+  EXPECT_STRNE(pressured.id, unpressured.id);
 }
 
 }  // namespace

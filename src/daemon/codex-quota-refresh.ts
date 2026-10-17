@@ -17,7 +17,10 @@ function codexDisplayChanged(next: Partial<SessionRecord>, current: SessionRecor
     || next.quotaLabel !== current.quotaLabel
     || next.quotaUsageLabel !== current.quotaUsageLabel
     || !providerQuotaMetaEquals(next.quotaMeta, current.quotaMeta)
-    || !stringArraysEqual(next.codexAvailableModels, current.codexAvailableModels);
+    || !stringArraysEqual(next.codexAvailableModels, current.codexAvailableModels)
+    || next.codexCreditsBalance !== current.codexCreditsBalance
+    || next.codexCreditsHasCredits !== current.codexCreditsHasCredits
+    || next.codexCreditsUnlimited !== current.codexCreditsUnlimited;
 }
 
 /**

@@ -24,6 +24,14 @@ export {
   MIN_PREVIEW_READ_WORKERS_TARGET,
 } from './file-preview-read-types.js';
 export const DEFAULT_PREVIEW_READ_WORKER_RESTART_BACKOFF_MS = 250;
+/**
+ * Ceiling for a slot whose worker keeps dying before it finishes a job. The
+ * delay doubles per consecutive crash: a worker that cannot start (seen live:
+ * the daemon's own package half-replaced by an in-progress upgrade) otherwise
+ * respawned every 250 ms per slot, ~1000 isolates in five minutes, and that
+ * churn alone stalled the daemon's main thread.
+ */
+export const MAX_PREVIEW_READ_WORKER_RESTART_BACKOFF_MS = 60_000;
 export const DEFAULT_PREVIEW_READ_WORKER_RECYCLE_JOB_COUNT = 50;
 export const DEFAULT_PREVIEW_READ_ACTIVE_JOB_TIMEOUT_MS = 18_000;
 
@@ -63,6 +71,8 @@ interface WorkerSlot {
   jobCount: number;
   restartTimer: ReturnType<typeof setTimeout> | null;
   stopping: boolean;
+  /** Consecutive crashes without a completed job in between. */
+  crashStreak: number;
 }
 
 interface ActiveJob {
@@ -204,6 +214,7 @@ export class PreviewReadWorkerPool {
         jobCount: 0,
         restartTimer: null,
         stopping: false,
+        crashStreak: 0,
       };
       this.slots.push(slot);
       this.startSlot(slot);
@@ -260,6 +271,8 @@ export class PreviewReadWorkerPool {
     slot.currentJob = null;
     slot.state = 'idle';
     slot.jobCount += 1;
+    // A completed job proves this worker healthy: the next crash starts over.
+    slot.crashStreak = 0;
     current.resolve(message);
     if (this.workerRecycleJobCount !== null && slot.jobCount >= this.workerRecycleJobCount) {
       this.recycleSlot(slot);
@@ -271,7 +284,18 @@ export class PreviewReadWorkerPool {
   private handleWorkerFailure(slot: WorkerSlot, generation: PreviewReadWorkerGeneration, error: Error): void {
     if (slot.generation !== generation || slot.stopping) return;
     recordPreviewReadMetric(PREVIEW_READ_METRICS.WORKER_CRASH);
-    logger.warn({ errorKind: describeWorkerError(error), slotId: slot.slotId, generation }, 'PreviewReadWorkerPool: worker failed');
+    slot.crashStreak += 1;
+    // 1st, 2nd, 4th, 8th... crash of a streak: a crash loop is visible without
+    // writing thousands of identical lines.
+    if ((slot.crashStreak & (slot.crashStreak - 1)) === 0) {
+      logger.warn({
+        errorKind: describeWorkerError(error),
+        errorMessage: error.message.slice(0, 200),
+        slotId: slot.slotId,
+        generation,
+        crashStreak: slot.crashStreak,
+      }, 'PreviewReadWorkerPool: worker failed');
+    }
     const active = slot.currentJob;
     if (active) this.clearActiveJobTimer(active);
     slot.currentJob = null;
@@ -290,8 +314,13 @@ export class PreviewReadWorkerPool {
     slot.restartTimer = setTimeout(() => {
       slot.restartTimer = null;
       this.startSlot(slot);
-    }, this.restartBackoffMs);
+    }, this.restartDelayFor(slot));
     slot.restartTimer.unref?.();
+  }
+
+  private restartDelayFor(slot: WorkerSlot): number {
+    const doublings = Math.min(Math.max(0, slot.crashStreak - 1), 20);
+    return Math.min(this.restartBackoffMs * 2 ** doublings, MAX_PREVIEW_READ_WORKER_RESTART_BACKOFF_MS);
   }
 
   private recycleSlot(slot: WorkerSlot): void {

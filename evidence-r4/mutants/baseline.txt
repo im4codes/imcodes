@@ -1,0 +1,37 @@
+
+ RUN  v3.2.7 /Users/k/.imcodes/worktrees/imcodes/deck_sub_0610320z/asg_nbp/repo
+
+ ✓ |daemon| test/agent/priority-preserving-context-cap.test.ts (21 tests) 7ms
+ ✓ |daemon| test/shared/session-identity.test.ts (20 tests) 111ms
+ ✓ |daemon| test/agent/provider-context-routing.test.ts (8 tests) 4ms
+ ✓ |daemon| test/agent/transport-runtime-assembly.test.ts (41 tests) 39ms
+ ✓ |daemon| test/store/session-store.test.ts (19 tests) 1534ms
+   ✓ session-store > loadStore reconcile (runtimeType backfill + error recovery) > restores a filled three-scope multibyte identity byte-for-byte in a fresh process  395ms
+   ✓ session-store > loadStore reconcile (runtimeType backfill + error recovery) > migrates missing identities once and preserves them across daemon reload  454ms
+ ✓ |daemon| test/daemon/session-identity-mcp.test.ts (6 tests) 21ms
+ ✓ |daemon| test/agent/qwen-provider.test.ts (46 tests) 801ms
+   ✓ QwenProvider > retries a transient Premature close once before surfacing an error  358ms
+ ✓ |daemon| test/daemon/send-tool.test.ts (35 tests) 541ms
+   ✓ send-tool > lets the persisted binding outrank a same-name live runtime that now reports otherwise  481ms
+ ✓ |daemon| test/daemon/memory-mcp-tools-schema-firewall.test.ts (47 tests) 97ms
+ ✓ |daemon| test/daemon/command-handler-transport-queue.test.ts (171 tests) 574ms
+ ✓ |daemon| test/agent/codex-sdk-provider.test.ts (186 tests) 8980ms
+   ✓ CodexSdkProvider > polls the Codex rollout briefly for raw update_plan calls without waiting for token usage  2019ms
+   ✓ CodexSdkProvider > merges a task_name-only spawn with its child thread rollout instead of duplicating the UI row  2026ms
+   ✓ CodexSdkProvider > discovers child rollout sub-agents by IM.codes session identity when Codex parent id differs  2015ms
+   ✓ CodexSdkProvider > settles a turn from rollout task_complete when the app-server sends only idle/completed hints  346ms
+   ✓ CodexSdkProvider > terminalizes a WebSearch started event when rollout settles a turn without turn/completed  346ms
+   ✓ CodexSdkProvider > settles from rollout task_complete when turn/start response never returns and ignores its late response  351ms
+   ✓ CodexSdkProvider > ignores a late id-less interrupted notification from a previous stop and still settles the newer turn  345ms
+
+ Test Files  11 passed (11)
+      Tests  600 passed (600)
+   Start at  01:29:44
+   Duration  10.64s (transform 5.41s, setup 961ms, collect 14.61s, tests 12.71s, environment 1ms, prepare 762ms)
+
+npm notice
+npm notice New minor version of npm available! 11.8.0 -> 11.19.1
+npm notice Changelog: https://github.com/npm/cli/releases/tag/v11.19.1
+npm notice To update run: npm install -g npm@11.19.1
+npm notice
+baseline exit=0

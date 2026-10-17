@@ -1,3 +1,4 @@
+import { activeUserAnswer } from './helpers/user-status.js';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { EventEmitter } from 'node:events';
 import { buildApp } from '../src/index.js';
@@ -53,7 +54,7 @@ class MockDaemonWs extends EventEmitter {
   close() { this.closed = true; this.readyState = 3; this.emit('close', 1000, Buffer.from('')); }
 }
 
-type ServerRow = { id: string; user_id: string; team_id: string | null; token_hash: string };
+type ServerRow = { id: string; user_id: string; team_id: string | null; token_hash: string, owner_status: 'active' };
 type ApiKeyRow = { id: string; user_id: string; key_hash: string; revoked_at: number | null; grace_expires_at: number | null };
 type ServerShareRow = {
   id: string;
@@ -86,26 +87,29 @@ function makeMemDb() {
       if (row) row.user_id = userId;
     },
     queryOne: async <T = unknown>(sql: string, params: unknown[] = []) => {
+      { const activeUser = activeUserAnswer(sql); if (activeUser) return activeUser as never; }
       const s = sql.toLowerCase().replace(/\s+/g, ' ').trim();
       if (s.includes('select token_hash, user_id') && s.includes('from servers where id = $1')) {
         const row = servers.get(params[0] as string);
-        return (row ? { token_hash: row.token_hash, user_id: row.user_id, node_role: 'full', revoked_at: null } : null) as T | null;
+        return (row ? { token_hash: row.token_hash, owner_status: 'active', user_id: row.user_id, node_role: 'full', revoked_at: null } : null) as T | null;
       }
-      if (s.includes('select team_id, user_id from servers where id = $1')) {
+      if ((s.startsWith('select user_id') && s.includes('from servers where id = $1'))) {
         const row = servers.get(params[0] as string);
-        return (row ? { team_id: row.team_id, user_id: row.user_id } : null) as T | null;
+        return (row ? { user_id: row.user_id, owner_status: 'active', actor_status: 'active' } : null) as T | null;
       }
-      if (s.includes('select id, user_id from api_keys')) {
+      if ((s.startsWith('select id, user_id') && s.includes('from api_keys'))) {
         const keyHash = params[0] as string;
         const now = params[1] as number;
         for (const row of apiKeys.values()) {
           if (row.key_hash === keyHash && row.revoked_at === null && (row.grace_expires_at === null || row.grace_expires_at > now)) {
-            return ({ id: row.id, user_id: row.user_id } as T);
+            return ({ id: row.id, user_id: row.user_id, user_status: 'active' } as T);
           }
         }
         return null;
       }
-      if (s.includes('select role from team_members')) {
+      // Group membership lives in `machine_groups` now, keyed by machine
+      // rather than by a single column on the server row.
+      if (s.includes('from machine_groups')) {
         return null;
       }
       return null;
@@ -168,7 +172,7 @@ describe('local web preview routes', () => {
     serverId = `srv-preview-routes-${Math.random().toString(36).slice(2)}`;
     userId = `user-preview-${Math.random().toString(36).slice(2)}`;
     db = makeMemDb();
-    db.seedServer({ id: serverId, user_id: userId, team_id: null, token_hash: sha256Hex('daemon-token') });
+    db.seedServer({ id: serverId, user_id: userId, team_id: null, token_hash: sha256Hex('daemon-token'), owner_status: 'active' });
     db.seedApiKey({ id: 'key1', user_id: userId, key_hash: sha256Hex('deck_test_key'), revoked_at: null, grace_expires_at: null });
     app = buildApp(makeEnv(db));
   });

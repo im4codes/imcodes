@@ -253,3 +253,29 @@ describe('controlled-node executable artifact verification', () => {
     )).toThrow(/version mismatch/);
   });
 });
+
+describe('headless glibc217 artifact provenance', () => {
+  it('binds the compatibility profile to its explicit reviewed provider/runtime rather than an official mirror', async () => {
+    const dir = tempDir();
+    const artifactPath = join(dir, 'imcodes-node-linux-glibc217');
+    writeFileSync(artifactPath, 'compatible-sea');
+    const { default: pins } = await import('../../shared/controlled-node-abi-profiles.json', { with: { type: 'json' } });
+    const pin = pins.GLIBC217;
+    const input = {
+      artifactPath, os: 'linux', arch: 'x64', abiProfile: 'linux-glibc217',
+      nodeVersion: pin.nodeVersion, nodeArchive: pin.nodeArchive,
+      nodeArchiveSha256: pin.nodeArchiveSha256, nodeBinarySha256: pin.nodeBinarySha256,
+      nodeProvider: pin.provider, seaBlobSha256: 'e'.repeat(64),
+      postjectVersion: '1.0.0-alpha.6', buildCommit: 'a'.repeat(40), buildVersion: '2026.10.1-dev.1',
+    };
+    expect((await createNodeExeManifest(input)).artifact.abiProfile).toBe('linux-glibc217');
+    for (const change of [
+      { abiProfile: undefined }, { abiProfile: 'unknown' }, { arch: 'arm64' },
+      { nodeVersion: 'v22.11.0' }, { nodeProvider: 'nodejs-official' },
+      { nodeArchiveSha256: 'a'.repeat(64) }, { nodeBinarySha256: 'a'.repeat(64) },
+      { seaBlobSha256: undefined },
+    ]) {
+      await expect(createNodeExeManifest({ ...input, ...change })).rejects.toThrow();
+    }
+  });
+});

@@ -5,6 +5,7 @@ import {
   createTurnIceServers,
   readTurnServiceConfig,
 } from '../src/ws/turn-credentials.js';
+import { TURN_SERVICE_DEFAULTS } from '../../shared/turn-service.js';
 
 const env = {
   TURN_ENABLED: 'true',
@@ -50,6 +51,23 @@ describe('temporary TURN credentials', () => {
     expect(authority.credentialExpiresAt).toBe(nowMs + 24 * 60 * 60 * 1000);
   });
 
+  it('hands out a relay bitrate cap only when the operator set a valid one', () => {
+    const nowMs = Date.UTC(2026, 0, 1);
+    // Default: no limit at all.
+    expect(readTurnServiceConfig(env)?.bitrateCapBps).toBeUndefined();
+    expect(createTurnIceServerAuthority('user-a', { env, nowMs })).not.toHaveProperty('relayBitrateCapBps');
+    const capped = { ...env, TURN_BITRATE_CAP_BPS: '500000' };
+    expect(readTurnServiceConfig(capped)).toMatchObject({ bitrateCapBps: 500_000 });
+    expect(createTurnIceServerAuthority('user-a', { env: capped, nowMs }))
+      .toMatchObject({ relayBitrateCapBps: 500_000 });
+    // A malformed cap is ignored rather than breaking TURN for everyone.
+    for (const bad of ['0', '100000', '99000000', 'fast', '1.5e6x']) {
+      const config = readTurnServiceConfig({ ...env, TURN_BITRATE_CAP_BPS: bad });
+      expect(config).toBeDefined();
+      expect(config?.bitrateCapBps).toBeUndefined();
+    }
+  });
+
   it('fails closed to STUN for incomplete or out-of-bounds configuration', () => {
     expect(readTurnServiceConfig({ ...env, TURN_SHARED_SECRET: 'short' })).toBeUndefined();
     expect(readTurnServiceConfig({ ...env, TURN_EXTERNAL_IP: '' })).toBeUndefined();
@@ -57,9 +75,102 @@ describe('temporary TURN credentials', () => {
     expect(readTurnServiceConfig({ ...env, TURN_CREDENTIAL_TTL_SECONDS: '60' })).toBeUndefined();
     expect(readTurnServiceConfig({ ...env, TURN_RELAY_MIN_PORT: '50000', TURN_RELAY_MAX_PORT: '49000' })).toBeUndefined();
     expect(readTurnServiceConfig({ ...env, TURN_PORT: '49180' })).toBeUndefined();
-    expect(readTurnServiceConfig({ ...env, TURN_RELAY_MIN_PORT: '49000', TURN_RELAY_MAX_PORT: '49256' })).toBeUndefined();
+    // CONTRACT CHANGE, deliberate and now complete: this file first encoded a
+    // 256-port ceiling, which silently invalidated the production 49201-50200
+    // range. That was replaced by a 4096-port resource cap, which was still a
+    // number in application code and still able to refuse a correctly
+    // configured TURN service — coturn's own default span is 16384 ports. The
+    // width limit is gone entirely; the relay range is deployment
+    // configuration, and only protocol-valid checks reject.
+    expect(readTurnServiceConfig({ ...env, TURN_RELAY_MIN_PORT: '49000', TURN_RELAY_MAX_PORT: '49256' })).toMatchObject({
+      relayMinPort: 49_000,
+      relayMaxPort: 49_256,
+    });
+    expect(readTurnServiceConfig({ ...env, TURN_RELAY_MIN_PORT: '49152', TURN_RELAY_MAX_PORT: '65535' }),
+      "coturn's own default relay range must be usable").toMatchObject({
+      relayMinPort: 49_152,
+      relayMaxPort: 65_535,
+    });
     expect(createTurnIceServers('user-a', { env: { ...env, TURN_ENABLED: 'false' } })).toEqual([
       'stun:stun.cloudflare.com:3478',
     ]);
+  });
+});
+
+/**
+ * The production incident (2026-09-09): a phone on 5G could not open a direct
+ * file transfer, and the Windows node downstairs could not open a remote
+ * desktop session. Both reached SDP answer in two or three seconds and then
+ * died with nothing to nominate, and coturn itself was healthy.
+ *
+ * The cause was here. im.zhinet.work publishes relay UDP 49201-50200, a span of
+ * 999, and this module rejected the whole configuration over that span alone —
+ * silently, falling back to a STUN-only list. So no client of either feature
+ * ever received a TURN URL, and no relay candidate could exist.
+ *
+ * The installer, meanwhile, wrote that very range into .env, into coturn's
+ * min-port/max-port and into the Docker publish range. The two halves of the
+ * product disagreed about what a valid relay range is; that is what these pin.
+ */
+const PRODUCTION_ENV = {
+  TURN_ENABLED: 'true',
+  TURN_HOST: 'im.zhinet.work',
+  TURN_PORT: '3480',
+  TURN_EXTERNAL_IP: '43.248.99.95',
+  // Correct LENGTH only. The real shared secret is never needed to exercise
+  // range validation and must never appear in a test.
+  TURN_SHARED_SECRET: 'x'.repeat(64),
+  TURN_CREDENTIAL_TTL_SECONDS: '86400',
+  TURN_RELAY_MIN_PORT: '49201',
+  TURN_RELAY_MAX_PORT: '50200',
+} as const;
+
+function relayTransports(servers: ReturnType<typeof createTurnIceServers>): string[] {
+  return servers
+    .filter((entry): entry is Exclude<typeof entry, string> => typeof entry !== 'string')
+    .flatMap((entry) => entry.urls);
+}
+
+describe('the production relay range is a valid relay range', () => {
+  const nowMs = 1_780_000_000_000;
+
+  it('accepts im.zhinet.work 49201-50200 and mints UDP + TCP relay material', () => {
+    const authority = createTurnIceServerAuthority('user-mobile', { env: PRODUCTION_ENV, nowMs });
+    expect(readTurnServiceConfig(PRODUCTION_ENV)).toMatchObject({
+      host: 'im.zhinet.work',
+      port: 3480,
+      relayMinPort: 49_201,
+      relayMaxPort: 50_200,
+    });
+    expect(relayTransports(authority.iceServers)).toEqual([
+      'turn:im.zhinet.work:3480?transport=udp',
+      'turn:im.zhinet.work:3480?transport=tcp',
+    ]);
+    expect(authority.credentialExpiresAt).toBe(nowMs + 86_400_000);
+    expect(JSON.stringify(authority)).not.toContain(PRODUCTION_ENV.TURN_SHARED_SECRET);
+  });
+
+  it('still fails closed for ranges that are genuinely wrong', () => {
+    // Inverted, out of bounds, listener inside the range, and a range so wide
+    // that publishing it would be a typo rather than a deployment.
+    expect(readTurnServiceConfig({ ...PRODUCTION_ENV, TURN_RELAY_MIN_PORT: '50201' })).toBeUndefined();
+    expect(readTurnServiceConfig({ ...PRODUCTION_ENV, TURN_RELAY_MAX_PORT: '70000' })).toBeUndefined();
+    expect(readTurnServiceConfig({ ...PRODUCTION_ENV, TURN_PORT: '49500' })).toBeUndefined();
+    // A wide span is NOT "genuinely wrong": it is a deployment decision that
+    // coturn honours, so the runtime must honour it too.
+    expect(readTurnServiceConfig({
+      ...PRODUCTION_ENV,
+      TURN_RELAY_MIN_PORT: '10000',
+      TURN_RELAY_MAX_PORT: '60000',
+    })).toMatchObject({ relayMinPort: 10_000, relayMaxPort: 60_000 });
+  });
+
+  it('still hands out STUN only when TURN is deliberately switched off', () => {
+    const off = createTurnIceServerAuthority('user-mobile', {
+      env: { ...PRODUCTION_ENV, TURN_ENABLED: 'false' },
+      nowMs,
+    });
+    expect(relayTransports(off.iceServers)).toEqual([]);
+    expect(off.iceServers).toEqual(['stun:stun.cloudflare.com:3478']);
   });
 });

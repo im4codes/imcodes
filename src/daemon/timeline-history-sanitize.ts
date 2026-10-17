@@ -13,6 +13,8 @@ import {
 } from '../../shared/sdk-subagent-status.js';
 import { isClaudeSyntheticSeedAssistantTextEvent } from '../shared/claude-synthetic-seed.js';
 import { preferTimelineEvent } from '../shared/timeline/merge.js';
+import { AGENT_DELEGATION_REPLY_TIMELINE_EVENT } from '../../shared/agent-delegation.js';
+import { PEER_AUDIT_FINDINGS_BYTES, isPeerAuditVerdict } from '../../shared/peer-audit.js';
 
 export const DEFAULT_TIMELINE_HISTORY_MAX_EVENT_BYTES = TIMELINE_PAYLOAD_BUDGET_BYTES.DEFAULT_EVENT;
 export const DEFAULT_TIMELINE_HISTORY_MAX_RESPONSE_BYTES = TIMELINE_PAYLOAD_BUDGET_BYTES.DEFAULT_ENVELOPE;
@@ -290,6 +292,16 @@ function sanitizeTextPayload(
 
 function sanitizePayload(event: TimelineEvent, stats: MutableSanitizeStats, policy = NORMAL_POLICY): Record<string, unknown> {
   const payload = event.payload ?? {};
+  if (event.type === AGENT_DELEGATION_REPLY_TIMELINE_EVENT
+    && isPeerAuditVerdict(payload.verdict)
+    && typeof payload.result === 'string') {
+    const sanitized = sanitizeValue(payload, policy, stats) as Record<string, unknown>;
+    // peer_audit_reply already enforces PEER_AUDIT_FINDINGS_BYTES. Preserve
+    // that bounded markdown whole so history replay never injects the generic
+    // "[history truncated]" marker into an authoritative audit card.
+    sanitized.result = truncateStringByUtf8Bytes(payload.result, PEER_AUDIT_FINDINGS_BYTES);
+    return sanitized;
+  }
   if (event.type === 'tool.call' || event.type === 'tool.result') {
     const sdkDetail = parseSdkSubagentDetail(payload.detail);
     if (sdkDetail.kind === 'ok') {

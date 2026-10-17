@@ -3,9 +3,12 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { ContextNamespace, ContextTargetRef } from '../../shared/context-types.js';
 import {
   archiveMemory,
+  backfillProcessedNoiseBatch,
   claimContextJob,
   deleteMemory,
   clearDirtyTarget,
+  listCodexCreditSnapshots,
+  recordCodexCreditSnapshot,
   enqueueContextJob,
   ensureContextNamespace,
   estimateStagedTokenUpperBound,
@@ -14,6 +17,7 @@ import {
   getReplicationState,
   getLatestMasterSummaryUpdatedAt,
   getLatestRecentSummaryUpdatedAtForTarget,
+  getContextMeta,
   hasProcessedProjectionsInNamespace,
   listContextEvents,
   listDirtyTargets,
@@ -23,6 +27,7 @@ import {
   queryPendingContextEvents,
   queryProcessedProjections,
   removeMemoryNoiseProjections,
+  purgeMemoryNoiseProjectionsBatch,
   recordContextEvent,
   recordMemoryHits,
   resetContextStoreForTests,
@@ -451,6 +456,51 @@ describe('context-store', () => {
     });
   });
 
+  it('does not expose legacy noise rows before the semantic backfill fence completes', () => {
+    const now = Date.now();
+    writeProcessedProjection({
+      id: 'legacy-clean-row',
+      namespace,
+      class: 'recent_summary',
+      sourceEventIds: [],
+      summary: 'A useful deployment summary',
+      content: {},
+      createdAt: now - 2,
+      updatedAt: now - 2,
+    });
+    // Simulate an upgraded legacy store: ALTER TABLE supplied is_noise=0 for
+    // both rows and no semantic cursor has run yet. The panel must not mistake
+    // those defaults for a confirmed non-noise classification.
+    const database = new DatabaseSync(process.env.IMCODES_CONTEXT_DB_PATH!);
+    database.prepare(`
+      INSERT INTO context_processed_local
+        (id, namespace_key, scope, user_id, project_id, class,
+         source_event_ids_json, summary, content_json, created_at, updated_at,
+         status, hit_count, is_noise)
+      VALUES (?, ?, 'personal', 'user-1', 'repo', 'recent_summary', '[]', ?, '{}', ?, ?, 'active', 0, 0)
+    `).run(
+      'legacy-noise-row',
+      'personal::::user-1:repo',
+      '[API Error: Connection error. (cause: fetch failed)]',
+      now - 1,
+      now - 1,
+    );
+    database.prepare('UPDATE context_processed_local SET is_noise = 0').run();
+    database.prepare("DELETE FROM context_meta WHERE key IN ('processed_noise_backfill_complete', 'processed_noise_backfill_rowid')").run();
+    database.close();
+
+    expect(queryProcessedProjections({ scope: 'personal', projectId: 'repo', limit: 10 })).toEqual([]);
+    expect(getProcessedProjectionStats({ scope: 'personal', projectId: 'repo' }).totalRecords).toBe(0);
+
+    // Once the bounded cursor pass classifies the rows, only the useful row is
+    // visible and the completion sentinel removes the temporary fence.
+    expect(backfillProcessedNoiseBatch(256)).toMatchObject({ processed: 2, done: true });
+    expect(queryProcessedProjections({ scope: 'personal', projectId: 'repo', limit: 10 })).toEqual([
+      expect.objectContaining({ id: 'legacy-clean-row', summary: 'A useful deployment summary' }),
+    ]);
+    expect(getProcessedProjectionStats({ scope: 'personal', projectId: 'repo' }).totalRecords).toBe(1);
+  });
+
   it('queries pending staged events separately from processed memory', () => {
     recordContextEvent({ target, eventType: 'user.turn', content: 'raw pending question', createdAt: 10 });
     recordContextEvent({ target, eventType: 'assistant.turn', content: 'raw pending answer', createdAt: 20 });
@@ -589,6 +639,36 @@ describe('context-store', () => {
     expect(removeMemoryNoiseProjections()).toBeLessThanOrEqual(1);
     expect(listProcessedProjections(namespace).map((row) => row.id)).toEqual([clean.id]);
     expect(getReplicationState(namespace)?.pendingProjectionIds).toEqual([clean.id]);
+  });
+
+  it('cleans legacy noise in bounded cursor batches instead of scanning the whole projection table', () => {
+    getContextMeta('__noise_batch_fixture__');
+    const dbPath = process.env.IMCODES_CONTEXT_DB_PATH;
+    expect(dbPath).toBeTruthy();
+    // Seed enough rows to cross several maintenance batches without routing
+    // each fixture row through the normal materialization path.
+    const sqlite = new DatabaseSync(dbPath!);
+    sqlite.exec('BEGIN');
+    const insert = sqlite.prepare(`
+      INSERT INTO context_processed_local
+        (id, namespace_key, class, source_event_ids_json, summary, content_json, created_at, updated_at, status, hit_count)
+      VALUES (?, ?, 'recent_summary', '[]', ?, '{}', ?, ?, 'active', 0)
+    `);
+    for (let index = 0; index < 300; index += 1) {
+      const now = 1000 + index;
+      insert.run(`noise-${index}`, 'personal::repo::user-1::::', '**Assistant:** [API Error: Connection error. (cause: fetch failed)]', now, now);
+    }
+    sqlite.exec('COMMIT');
+    sqlite.close();
+
+    const first = purgeMemoryNoiseProjectionsBatch(64);
+    expect(first).toBeLessThanOrEqual(64);
+    let removed = first;
+    for (let pass = 0; pass < 10 && removed < 300; pass += 1) {
+      removed += purgeMemoryNoiseProjectionsBatch(64);
+    }
+    expect(removed).toBe(300);
+    expect(removeMemoryNoiseProjections()).toBe(0);
   });
 
   it('reconciles stale staged events that were already referenced by processed projections', () => {
@@ -1123,6 +1203,51 @@ describe('context-store', () => {
       const restored = afterRestore.find((r) => r.id === projection.id);
       expect(restored).toBeDefined();
       expect(restored!.status).toBe('active');
+    });
+  });
+
+  describe('Codex credit snapshots', () => {
+    it('records a snapshot and lists it back, newest first', () => {
+      recordCodexCreditSnapshot({
+        capturedAt: 1_000, planType: 'pro', balance: '10.00', hasCredits: true, unlimited: false,
+      });
+      recordCodexCreditSnapshot({
+        capturedAt: 2_000, planType: 'pro', balance: '7.50', hasCredits: true, unlimited: false,
+        fiveHourLeftPercent: 40, weeklyLeftPercent: 60,
+      });
+      const rows = listCodexCreditSnapshots();
+      expect(rows).toEqual([
+        {
+          capturedAt: 2_000, planType: 'pro', balance: '7.50', hasCredits: true, unlimited: false,
+          fiveHourLeftPercent: 40, weeklyLeftPercent: 60,
+        },
+        { capturedAt: 1_000, planType: 'pro', balance: '10.00', hasCredits: true, unlimited: false },
+      ]);
+    });
+
+    it('skips an unchanged reading so idle refreshes do not spam identical rows', () => {
+      recordCodexCreditSnapshot({ capturedAt: 1_000, balance: '5.00', hasCredits: true, unlimited: false });
+      recordCodexCreditSnapshot({ capturedAt: 2_000, balance: '5.00', hasCredits: true, unlimited: false });
+      expect(listCodexCreditSnapshots()).toHaveLength(1);
+      expect(listCodexCreditSnapshots()[0]!.capturedAt).toBe(1_000);
+    });
+
+    it('records a new row once the balance, hasCredits, or unlimited actually changes', () => {
+      recordCodexCreditSnapshot({ capturedAt: 1_000, balance: '5.00', hasCredits: true, unlimited: false });
+      recordCodexCreditSnapshot({ capturedAt: 2_000, balance: '4.00', hasCredits: true, unlimited: false });
+      recordCodexCreditSnapshot({ capturedAt: 3_000, balance: '4.00', hasCredits: false, unlimited: false });
+      recordCodexCreditSnapshot({ capturedAt: 4_000, balance: '4.00', hasCredits: false, unlimited: true });
+      const rows = listCodexCreditSnapshots();
+      expect(rows.map((r) => r.capturedAt)).toEqual([4_000, 3_000, 2_000, 1_000]);
+    });
+
+    it('respects limit and returns an empty list when nothing has been recorded', () => {
+      expect(listCodexCreditSnapshots()).toEqual([]);
+      for (let i = 0; i < 5; i++) {
+        recordCodexCreditSnapshot({ capturedAt: 1_000 + i, balance: String(i), hasCredits: true, unlimited: false });
+      }
+      const rows = listCodexCreditSnapshots({ limit: 2 });
+      expect(rows.map((r) => r.capturedAt)).toEqual([1_004, 1_003]);
     });
   });
 });

@@ -11,7 +11,7 @@
  */
 import { describe, it, expect } from 'vitest';
 import { spawn } from 'node:child_process';
-import { collectDescendantPids, killProcessTree } from '../../src/util/kill-process-tree.js';
+import { collectDescendantPids, killProcessTree, useProcessTreeExecFile } from '../../src/util/kill-process-tree.js';
 
 const isWin = process.platform === 'win32';
 const describeOrSkip = isWin ? describe.skip : describe;
@@ -123,5 +123,25 @@ describeOrSkip('killProcessTree (POSIX)', () => {
     expect(pidAlive(wrapperPid)).toBe(false);
     // Second call must not throw.
     await expect(killProcessTree(wrapperPid, { gracefulMs: 50 })).resolves.toBeUndefined();
+  });
+});
+
+describeOrSkip('ps walks can be pointed at the daemon exec helper', () => {
+  it('collectDescendantPids reads the process table through the injected exec, and falls back to direct spawn when reset', async () => {
+    const calls: string[][] = [];
+    useProcessTreeExecFile((async (file: string, args: string[]) => {
+      calls.push([file, ...args]);
+      return { stdout: 'PID PPID\n 10 1\n 11 10\n 12 11\n 13 99\n', stderr: '' };
+    }) as never);
+    try {
+      expect(await collectDescendantPids(10)).toEqual(expect.arrayContaining([11, 12]));
+      expect((await collectDescendantPids(10)).includes(13)).toBe(false);
+      expect(calls[0]).toEqual(['ps', '-A', '-o', 'pid,ppid']);
+    } finally {
+      useProcessTreeExecFile(null);
+    }
+    calls.length = 0;
+    expect(await collectDescendantPids(process.pid)).toEqual(expect.any(Array));
+    expect(calls).toHaveLength(0); // reset: the injected exec is no longer used
   });
 });

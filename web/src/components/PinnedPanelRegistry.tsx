@@ -41,6 +41,10 @@ export interface PanelRenderContext {
   activeProjectDir?: string;
   /** Present only while connected through a received share entry. */
   sharedAccessRole?: 'viewer' | 'participant' | null;
+  /** Share target kind: 'server' for whole-server share, 'main' or 'subsession' for tab share */
+  shareTargetKind?: 'main' | 'subsession' | 'server' | null;
+  /** Canonical session name for shared scope authorization */
+  sharedSessionName?: string;
   /** Quote callback — adds quoted text to the main session's input */
   onQuote?: (text: string) => void;
   /** Main sessions list — for panels that need session info (e.g., cron manager) */

@@ -7,16 +7,21 @@ import type { WsClient } from '../ws-client.js';
 import type { RemoteSession } from '../hooks/useProviderStatus.js';
 import { parseString, usePref } from '../hooks/usePref.js';
 import { PREF_KEY_DEFAULT_SHELL } from '../constants/prefs.js';
-import { CLAUDE_SDK_EFFORT_LEVELS, CODEX_SDK_EFFORT_LEVELS, COPILOT_SDK_EFFORT_LEVELS, OPENCLAW_THINKING_LEVELS, PI_EFFORT_LEVELS, QWEN_EFFORT_LEVELS, formatEffortLevel, type TransportEffortLevel } from '@shared/effort-levels.js';
+import { CLAUDE_SDK_EFFORT_LEVELS, CODEX_SDK_EFFORT_LEVELS, COPILOT_SDK_EFFORT_LEVELS, MUSE_SDK_EFFORT_LEVELS, OPENCLAW_THINKING_LEVELS, PI_EFFORT_LEVELS, QWEN_EFFORT_LEVELS, clampTransportEffort, formatEffortLevel, type TransportEffortLevel } from '@shared/effort-levels.js';
 import { getSessionAgentGroups, getSessionAgentLabel, SESSION_AGENT_GROUP_LABEL_KEYS } from './session-agent-options.js';
 import { SdkModeRecommendation } from './SdkModeRecommendation.js';
 import { QwenCodingPlanHint } from './QwenCodingPlanHint.js';
 import { useTransportModels, supportsDynamicTransportModels } from '../hooks/useTransportModels.js';
+import { ModelCombobox } from './ModelCombobox.js';
 import { usePresetModelSelection } from '../hooks/usePresetModelSelection.js';
 import {
   buildCcPresetFromDraft,
   createCcPresetDraftFromPreset,
   createDefaultCcPresetDraft,
+  DEFAULT_CC_PRESET_BASE_URL,
+  DEFAULT_CC_PRESET_MODEL,
+  DEFAULT_OPENAI_PRESET_BASE_URL,
+  DEFAULT_OPENAI_PRESET_MODEL,
   type CcPresetEntry,
   type CcPresetDraft,
 } from './cc-preset-form.js';
@@ -27,14 +32,28 @@ import {
   getCcPresetEffectiveModel,
   normalizeCcPresetName,
   type CcPreset,
+  type CcPresetAuthType,
 } from '@shared/cc-presets.js';
-import { CODEX_MODEL_IDS, GEMINI_MODEL_IDS, mergeModelSuggestions } from '../../../src/shared/models/options.js';
+import { AGY_MODEL_IDS, CODEX_MODEL_IDS, GEMINI_MODEL_IDS, mergeModelSuggestions } from '../../../src/shared/models/options.js';
 import { loadCodexModelPreference } from '../codex-model-preference.js';
+import {
+  CODEBUDDY_CHINA_DEFAULT_MODEL,
+  CODEBUDDY_CHINA_MODEL_FALLBACK,
+  CODEBUDDY_INTERNATIONAL_MODEL_FALLBACK,
+  CODEBUDDY_PROVIDER_IDS,
+  isCodeBuddyProviderId,
+} from '@shared/codebuddy.js';
+import { HERMES_AGENT_PROVIDER_ID } from '@shared/hermes-agent.js';
+import { AGY_SDK_PROVIDER_ID } from '@shared/agy-agent.js';
 
+/** Upper bound on how many identical sub-sessions one launch can request at once. */
+const MAX_SUB_SESSION_LAUNCH_COUNT = 20;
 const CURSOR_HEADLESS_MODEL_SUGGESTIONS = ['gpt-5.2'] as const;
 const COPILOT_SDK_MODEL_SUGGESTIONS = ['gpt-5.4', 'gpt-5.4-mini'] as const;
 const CODEX_SDK_MODEL_SUGGESTIONS = [...CODEX_MODEL_IDS] as const;
 const GEMINI_SDK_MODEL_SUGGESTIONS = [...GEMINI_MODEL_IDS] as const;
+const MUSE_SDK_MODEL_SUGGESTIONS = ['muse-spark-1.3', 'muse-spark', 'muse-wonder', 'muse-fast'] as const;
+const AGY_SDK_MODEL_SUGGESTIONS = [...AGY_MODEL_IDS] as const;
 const responsiveDialogStyle = {
   // Hard-cap against the visual viewport instead of relying on flex padding.
   // iOS can still render a 380px fixed-ish dialog inside a 390px viewport,
@@ -51,6 +70,10 @@ const responsiveDialogStyle = {
 interface Props {
   ws: WsClient | null;
   defaultCwd?: string;
+  /** Optional consumer-owned filter. The ordinary launcher remains unchanged. */
+  allowedAgentTypes?: readonly string[];
+  /** Lets a caller place the reused launcher above another modal. */
+  overlayClassName?: string;
   isProviderConnected: (id: string) => boolean;
   getRemoteSessions: (providerId: string) => RemoteSession[];
   refreshSessions: (providerId: string) => void;
@@ -61,7 +84,7 @@ interface Props {
 
 type OpenClawMode = 'new' | 'bind';
 
-export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _isProviderConnected, getRemoteSessions, refreshSessions, onStart, onClose, onToast }: Props) {
+export function StartSubSessionDialog({ ws, defaultCwd, allowedAgentTypes, overlayClassName, isProviderConnected: _isProviderConnected, getRemoteSessions, refreshSessions, onStart, onClose, onToast }: Props) {
   const { t } = useTranslation();
   const [type, setType] = useState('claude-code-sdk');
   const [lastUnlockedType, setLastUnlockedType] = useState('claude-code-sdk');
@@ -70,6 +93,7 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
   const [shellBin, setShellBin] = useState<string>('/bin/bash');
   const cwd = defaultCwd ?? '';
   const [label, setLabel] = useState('');
+  const [countInput, setCountInput] = useState('1');
   const [scriptCmd, setScriptCmd] = useState('');
   const [scriptInterval, setScriptInterval] = useState('5');
   const [detectingShells, setDetectingShells] = useState(false);
@@ -89,6 +113,7 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
   const [showPresetEditor, setShowPresetEditor] = useState(false);
   const defaultPresetDraft = createDefaultCcPresetDraft();
   const [newPresetName, setNewPresetName] = useState('');
+  const [newPresetAuthType, setNewPresetAuthType] = useState<CcPresetAuthType>(defaultPresetDraft.authType);
   const [newPresetBaseUrl, setNewPresetBaseUrl] = useState(defaultPresetDraft.baseUrl);
   const [newPresetToken, setNewPresetToken] = useState('');
   const [newPresetModel, setNewPresetModel] = useState(defaultPresetDraft.model);
@@ -101,6 +126,7 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
   const fmtCtx = (v: string) => { const n = parseInt(v, 10); if (!n) return ''; if (n >= 1000000) return `${(n/1000000).toFixed(n%1000000===0?0:1)}M`; if (n >= 1000) return `${(n/1000).toFixed(0)}K`; return String(n); };
   const applyPresetDraft = (draft: CcPresetDraft) => {
     setNewPresetName(draft.name);
+    setNewPresetAuthType(draft.authType);
     setNewPresetBaseUrl(draft.baseUrl);
     setNewPresetToken(draft.token);
     setNewPresetModel(draft.model);
@@ -111,6 +137,7 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
   };
   const buildCurrentPresetDraft = (): CcPresetDraft => ({
     name: newPresetName,
+    authType: newPresetAuthType,
     baseUrl: newPresetBaseUrl,
     token: newPresetToken,
     model: newPresetModel,
@@ -184,6 +211,16 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
   const ocRemoteSessions = getRemoteSessions('openclaw');
 
   const agentGroups = getSessionAgentGroups('sub-session');
+  const allowedAgentTypeSet = useMemo(
+    () => allowedAgentTypes ? new Set(allowedAgentTypes) : null,
+    [allowedAgentTypes],
+  );
+
+  useEffect(() => {
+    if (!allowedAgentTypeSet || allowedAgentTypeSet.has(type)) return;
+    const fallback = allowedAgentTypes?.[0];
+    if (fallback) setType(fallback);
+  }, [allowedAgentTypeSet, allowedAgentTypes, type]);
 
   // Load saved shell preference from server
   const defaultShellPref = usePref<string>(PREF_KEY_DEFAULT_SHELL, { parse: parseString });
@@ -248,6 +285,14 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
     if (!ccPreset && ccPresets.length > 0) setCcPreset(ccPresets[0].name);
   }, [ccPreset, ccPresets, customProviderSdk, type]);
 
+  // A bind-mode OpenClaw launch connects to one specific EXISTING external
+  // session, so repeating it does not mean "N sessions" -- it always launches
+  // exactly one, regardless of the quantity field.
+  const canLaunchMultiple = !(type === 'openclaw' && ocMode === 'bind');
+  const launchCount = canLaunchMultiple
+    ? Math.min(MAX_SUB_SESSION_LAUNCH_COUNT, Math.max(1, parseInt(countInput, 10) || 1))
+    : 1;
+
   const handleStart = () => {
     const desc = description.trim() || undefined;
     if (customProviderSdk && !ccPreset) {
@@ -260,14 +305,20 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
       const interval = Math.max(1, parseInt(scriptInterval, 10) || 5);
       const escaped = scriptCmd.trim().replace(/'/g, "'\\''");
       const wrapper = `bash -c 'while true; do clear; ${escaped}; sleep ${interval}; done'`;
-      onStart('script', wrapper, cwd || undefined, label || scriptCmd.trim().slice(0, 30), desc ? { description: desc } : undefined);
+      onStart('script', wrapper, cwd || undefined, label || scriptCmd.trim().slice(0, 30), {
+        ...(desc ? { description: desc } : {}),
+        ...(launchCount > 1 ? { launchCount } : {}),
+      });
       return;
     }
     if (type === 'openclaw') {
       const extra =
         ocMode === 'bind'
           ? { ocMode: 'bind', ocSessionId: ocSelectedSession, description: desc, thinking }
-          : { ocMode: 'new', ocSessionKey: ocSessionKey.trim(), description: desc, thinking };
+          : {
+            ocMode: 'new', ocSessionKey: ocSessionKey.trim(), description: desc, thinking,
+            ...(launchCount > 1 ? { launchCount } : {}),
+          };
       onStart('openclaw', undefined, cwd || undefined, label || undefined, extra);
       return;
     }
@@ -279,24 +330,34 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
     if (desc) extra.description = desc;
     if (ccPreset && (type === 'claude-code' || CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(type))) extra.ccPreset = ccPreset;
     if (ccInitPrompt.trim() && type === 'claude-code') extra.ccInitPrompt = ccInitPrompt.trim();
-    if ((type === 'claude-code-sdk' || type === 'codex-sdk' || type === 'copilot-sdk' || type === 'cursor-headless' || type === 'opencode-sdk' || type === 'gemini-sdk' || type === 'grok-sdk' || type === 'kimi-sdk' || type === 'deepseek-harness' || type === 'pi' || type === 'qwen') && requestedModel.trim()) extra.requestedModel = requestedModel.trim();
-    if (type === 'claude-code-sdk' || type === 'codex-sdk' || type === 'copilot-sdk' || type === 'pi' || type === 'qwen') extra.thinking = thinking;
+    if ((type === 'claude-code-sdk' || type === 'codex-sdk' || type === 'copilot-sdk' || type === 'cursor-headless' || type === 'opencode-sdk' || type === 'gemini-sdk' || type === 'grok-sdk' || type === 'kimi-sdk' || type === 'muse-code-sdk' || type === HERMES_AGENT_PROVIDER_ID || type === AGY_SDK_PROVIDER_ID || type === 'deepseek-harness' || type === 'pi' || isCodeBuddyProviderId(type) || type === 'qwen') && requestedModel.trim()) extra.requestedModel = requestedModel.trim();
+    if (type === 'claude-code-sdk' || type === 'codex-sdk' || type === 'copilot-sdk' || type === 'muse-code-sdk' || type === 'pi' || type === 'qwen') extra.thinking = thinking;
+    if (launchCount > 1) extra.launchCount = launchCount;
     onStart(type, selectedShell, cwd || undefined, label || undefined, Object.keys(extra).length > 0 ? extra : undefined);
   };
 
+  const dynamicModelsAgentType = supportsDynamicTransportModels(type) ? type : null;
+  const transportModels = useTransportModels(
+    ws,
+    dynamicModelsAgentType,
+    CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(type) ? ccPreset : undefined,
+  );
+  const selectedDynamicModel = transportModels.models.find((model) => model.id === requestedModel);
   const thinkingLevels = type === 'claude-code-sdk'
     ? CLAUDE_SDK_EFFORT_LEVELS
     : type === 'codex-sdk'
-      ? CODEX_SDK_EFFORT_LEVELS
+      ? (selectedDynamicModel?.supportedEffortLevels ?? CODEX_SDK_EFFORT_LEVELS)
       : type === 'copilot-sdk'
         ? COPILOT_SDK_EFFORT_LEVELS
-        : type === 'qwen'
-          ? QWEN_EFFORT_LEVELS
-          : type === 'pi'
-            ? PI_EFFORT_LEVELS
-          : type === 'openclaw'
-            ? OPENCLAW_THINKING_LEVELS
-            : [];
+        : type === 'muse-code-sdk'
+          ? (selectedDynamicModel?.supportedEffortLevels ?? MUSE_SDK_EFFORT_LEVELS)
+          : type === 'qwen'
+            ? QWEN_EFFORT_LEVELS
+            : type === 'pi'
+              ? PI_EFFORT_LEVELS
+            : type === 'openclaw'
+              ? OPENCLAW_THINKING_LEVELS
+              : [];
   const supportsCcPreset = type === 'claude-code' || CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(type);
   const showCcPresetControls = customProviderSdk || supportsCcPreset;
   const providerPresetLabel = customProviderSdk
@@ -304,13 +365,12 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
     : type === 'qwen'
       ? t('new_session.compatible_api_via_qwen')
       : t('new_session.api_provider');
-  const dynamicModelsAgentType = supportsDynamicTransportModels(type) ? type : null;
-  const transportModels = useTransportModels(
-    ws,
-    dynamicModelsAgentType,
-    CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(type) ? ccPreset : undefined,
-  );
-  const supportsModelSelection = type === 'claude-code-sdk' || type === 'codex-sdk' || type === 'copilot-sdk' || type === 'cursor-headless' || type === 'opencode-sdk' || type === 'gemini-sdk' || type === 'grok-sdk' || type === 'kimi-sdk' || type === 'deepseek-harness' || type === 'pi' || (type === 'qwen' && !!selectedCcPreset);
+  useEffect(() => {
+    if ((type !== 'codex-sdk' && type !== 'muse-code-sdk') || !selectedDynamicModel?.supportedEffortLevels?.length) return;
+    const clamped = clampTransportEffort(thinking, selectedDynamicModel.supportedEffortLevels);
+    if (clamped && clamped !== thinking) setThinking(clamped);
+  }, [selectedDynamicModel?.id, selectedDynamicModel?.supportedEffortLevels, thinking, type]);
+  const supportsModelSelection = type === 'claude-code-sdk' || type === 'codex-sdk' || type === 'copilot-sdk' || type === 'cursor-headless' || type === 'opencode-sdk' || type === 'gemini-sdk' || type === 'grok-sdk' || type === 'kimi-sdk' || type === 'muse-code-sdk' || type === HERMES_AGENT_PROVIDER_ID || type === AGY_SDK_PROVIDER_ID || type === 'deepseek-harness' || type === 'pi' || isCodeBuddyProviderId(type) || (type === 'qwen' && !!selectedCcPreset);
   const modelSuggestions = useMemo(() => (
     CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(type) && selectedCcPreset
       ? mergeModelSuggestions(
@@ -322,6 +382,14 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
         ? mergeModelSuggestions(GEMINI_SDK_MODEL_SUGGESTIONS, transportModels.models.map((model) => model.id))
         : type === 'codex-sdk'
           ? mergeModelSuggestions(CODEX_SDK_MODEL_SUGGESTIONS, transportModels.models.map((model) => model.id))
+        : type === 'muse-code-sdk'
+          ? mergeModelSuggestions(MUSE_SDK_MODEL_SUGGESTIONS, transportModels.models.map((model) => model.id))
+        : type === AGY_SDK_PROVIDER_ID
+          ? transportModels.models.map((model) => model.id)
+        : type === CODEBUDDY_PROVIDER_IDS.CHINA
+          ? mergeModelSuggestions(CODEBUDDY_CHINA_MODEL_FALLBACK, transportModels.models.map((model) => model.id))
+        : type === CODEBUDDY_PROVIDER_IDS.INTERNATIONAL
+          ? mergeModelSuggestions(CODEBUDDY_INTERNATIONAL_MODEL_FALLBACK, transportModels.models.map((model) => model.id))
         : transportModels.models.map((model) => model.id))
       : type === 'codex-sdk'
         ? [...CODEX_SDK_MODEL_SUGGESTIONS]
@@ -329,10 +397,18 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
         ? [...COPILOT_SDK_MODEL_SUGGESTIONS]
         : type === 'cursor-headless'
           ? [...CURSOR_HEADLESS_MODEL_SUGGESTIONS]
+        : type === 'muse-code-sdk'
+          ? [...MUSE_SDK_MODEL_SUGGESTIONS]
+        : type === AGY_SDK_PROVIDER_ID
+          ? [...AGY_SDK_MODEL_SUGGESTIONS]
         : type === 'qwen'
             ? selectedPresetModels
             : type === 'gemini-sdk'
               ? [...GEMINI_SDK_MODEL_SUGGESTIONS]
+              : type === CODEBUDDY_PROVIDER_IDS.CHINA
+                ? [...CODEBUDDY_CHINA_MODEL_FALLBACK]
+                : type === CODEBUDDY_PROVIDER_IDS.INTERNATIONAL
+                  ? [...CODEBUDDY_INTERNATIONAL_MODEL_FALLBACK]
               : []
   ), [transportModels.models, type, selectedPresetModels, selectedCcPreset]);
 
@@ -344,7 +420,7 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
   });
 
   useEffect(() => {
-    if (type !== 'codex-sdk') return;
+    if (type !== 'codex-sdk' || selectedCcPreset) return;
     setRequestedModel((current) => {
       const trimmed = current.trim();
       if (trimmed && (modelSuggestions.length === 0 || modelSuggestions.includes(trimmed))) return trimmed;
@@ -359,8 +435,43 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
     });
   }, [type, modelSuggestions, transportModels.defaultModel]);
 
+  useEffect(() => {
+    if (!isCodeBuddyProviderId(type)) return;
+    setRequestedModel((current) => {
+      const preferred = type === CODEBUDDY_PROVIDER_IDS.CHINA
+        ? CODEBUDDY_CHINA_DEFAULT_MODEL
+        : transportModels.defaultModel ?? CODEBUDDY_INTERNATIONAL_MODEL_FALLBACK[0];
+      const trimmed = current.trim();
+      if (trimmed && modelSuggestions.includes(trimmed)) return trimmed;
+      if (modelSuggestions.includes(preferred)) return preferred;
+      return modelSuggestions[0] ?? preferred;
+    });
+  }, [type, modelSuggestions, transportModels.defaultModel]);
+
+  useEffect(() => {
+    if (type !== 'muse-code-sdk') return;
+    setRequestedModel((current) => {
+      const trimmed = current.trim();
+      if (trimmed && (modelSuggestions.length === 0 || modelSuggestions.includes(trimmed))) return trimmed;
+      const fallback = transportModels.defaultModel ?? MUSE_SDK_MODEL_SUGGESTIONS[0];
+      if (modelSuggestions.length === 0 || modelSuggestions.includes(fallback)) return fallback;
+      return modelSuggestions[0] ?? fallback;
+    });
+  }, [type, modelSuggestions, transportModels.defaultModel]);
+
+  useEffect(() => {
+    if (type !== AGY_SDK_PROVIDER_ID) return;
+    setRequestedModel((current) => {
+      const trimmed = current.trim();
+      if (trimmed && (modelSuggestions.length === 0 || modelSuggestions.includes(trimmed))) return trimmed;
+      const fallback = transportModels.defaultModel ?? AGY_SDK_MODEL_SUGGESTIONS[0];
+      if (modelSuggestions.length === 0 || modelSuggestions.includes(fallback)) return fallback;
+      return modelSuggestions[0] ?? fallback;
+    });
+  }, [type, modelSuggestions, transportModels.defaultModel]);
+
   return (
-    <div class="dialog-overlay">
+    <div class={`dialog-overlay${overlayClassName ? ` ${overlayClassName}` : ''}`}>
       <div class="dialog session-launch-dialog" style={responsiveDialogStyle}>
         <div class="dialog-header">
           <span>{t('subsessionBar.new_sub_session')}</span>
@@ -373,9 +484,12 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
             <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 8 }}>{t('session.type')}</div>
             <div class="session-agent-groups">
               {agentGroups.map((group) => {
-                const visibleItems = customProviderSdk
-                  ? group.items.filter((choice) => CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(choice.id))
+                const allowedItems = allowedAgentTypeSet
+                  ? group.items.filter((choice) => allowedAgentTypeSet.has(choice.id))
                   : group.items;
+                const visibleItems = customProviderSdk
+                  ? allowedItems.filter((choice) => CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(choice.id))
+                  : allowedItems;
                 if (visibleItems.length === 0) return null;
                 return (
                   <div key={group.id} class="session-agent-group">
@@ -387,6 +501,17 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
                           type="button"
                           class={`session-agent-card${type === choice.id ? ' active' : ''}`}
                           data-agent-type={choice.id}
+                          // Hidden choices (e.g. qwen) stay real DOM nodes --
+                          // just invisible and out of the tab/accessibility
+                          // order -- rather than being omitted from
+                          // visibleItems, so the underlying data/behavior
+                          // stays fully intact for any test still querying
+                          // it directly. A hidden choice that was explicitly
+                          // allow-listed via allowedAgentTypes (e.g. the
+                          // supervision-pool worker-type picker, which still
+                          // legitimately offers qwen as a backend) is a
+                          // deliberate exception and renders normally.
+                          style={(choice.hidden && !allowedAgentTypeSet?.has(choice.id)) ? { display: 'none' } : undefined}
                           disabled={customProviderSdk && !CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(choice.id)}
                           aria-pressed={type === choice.id}
                           onClick={() => selectType(choice.id)}
@@ -604,11 +729,71 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
                 <div style={{ background: '#0f172a', border: '1px solid #334155', borderRadius: 6, padding: 10, fontSize: 11 }}>
                   <div style={{ color: '#64748b', marginBottom: 4, fontSize: 10 }}>Stored locally (~/.imcodes/cc-presets.json)</div>
                   {presetError && <div style={{ color: '#ef4444', fontSize: 11, marginBottom: 4 }}>{presetError}</div>}
+                  <div style={{ marginBottom: 6 }}>
+                    <div style={{ fontSize: 9, color: '#64748b', marginBottom: 2 }}>API Protocol</div>
+                    <div style={{ display: 'flex', gap: 12 }}>
+                      <label style={{ display: 'flex', alignItems: 'center', gap: 4, cursor: 'pointer', fontSize: 10, color: '#e2e8f0' }}>
+                        <input
+                          type="radio"
+                          name="subsession-preset-auth-type"
+                          value="anthropic"
+                          checked={newPresetAuthType === 'anthropic'}
+                          onChange={() => {
+                            setNewPresetAuthType('anthropic');
+                            if (!newPresetBaseUrl || newPresetBaseUrl === DEFAULT_OPENAI_PRESET_BASE_URL) {
+                              setNewPresetBaseUrl(DEFAULT_CC_PRESET_BASE_URL);
+                            }
+                            if (!newPresetModel || newPresetModel === DEFAULT_OPENAI_PRESET_MODEL) {
+                              setNewPresetModel(DEFAULT_CC_PRESET_MODEL);
+                            }
+                          }}
+                        />
+                        Anthropic Compatible
+                      </label>
+                      <label style={{ display: 'flex', alignItems: 'center', gap: 4, cursor: 'pointer', fontSize: 10, color: '#e2e8f0' }}>
+                        <input
+                          type="radio"
+                          name="subsession-preset-auth-type"
+                          value="openai"
+                          checked={newPresetAuthType === 'openai'}
+                          onChange={() => {
+                            setNewPresetAuthType('openai');
+                            if (!newPresetBaseUrl || newPresetBaseUrl === DEFAULT_CC_PRESET_BASE_URL) {
+                              setNewPresetBaseUrl(DEFAULT_OPENAI_PRESET_BASE_URL);
+                            }
+                            if (!newPresetModel || newPresetModel === DEFAULT_CC_PRESET_MODEL) {
+                              setNewPresetModel(DEFAULT_OPENAI_PRESET_MODEL);
+                            }
+                          }}
+                        />
+                        OpenAI Compatible
+                      </label>
+                    </div>
+                  </div>
                   {[
                     { label: 'Preset Name', envKey: '', ph: 'e.g. MiniMax', val: newPresetName, set: setNewPresetName },
-                    { label: 'API Base URL', envKey: 'ANTHROPIC_BASE_URL', ph: 'https://api.minimax.io/anthropic', val: newPresetBaseUrl, set: setNewPresetBaseUrl },
-                    { label: 'API Key', envKey: 'ANTHROPIC_AUTH_TOKEN', ph: 'your-api-key', val: newPresetToken, set: setNewPresetToken, type: 'password' as const },
-                    { label: 'Model', envKey: 'ANTHROPIC_MODEL', ph: 'e.g. MiniMax-M2.7', val: newPresetModel, set: setNewPresetModel },
+                    {
+                      label: 'API Base URL',
+                      envKey: newPresetAuthType === 'openai' ? 'OPENAI_BASE_URL' : 'ANTHROPIC_BASE_URL',
+                      ph: newPresetAuthType === 'openai' ? DEFAULT_OPENAI_PRESET_BASE_URL : DEFAULT_CC_PRESET_BASE_URL,
+                      val: newPresetBaseUrl,
+                      set: setNewPresetBaseUrl,
+                    },
+                    {
+                      label: 'API Key',
+                      envKey: newPresetAuthType === 'openai' ? 'OPENAI_API_KEY' : 'ANTHROPIC_AUTH_TOKEN',
+                      ph: 'your-api-key',
+                      val: newPresetToken,
+                      set: setNewPresetToken,
+                      type: 'password' as const,
+                    },
+                    {
+                      label: 'Model',
+                      envKey: newPresetAuthType === 'openai' ? 'OPENAI_MODEL' : 'ANTHROPIC_MODEL',
+                      ph: newPresetAuthType === 'openai' ? `e.g. ${DEFAULT_OPENAI_PRESET_MODEL}` : `e.g. ${DEFAULT_CC_PRESET_MODEL}`,
+                      val: newPresetModel,
+                      set: setNewPresetModel,
+                    },
                   ].map(({ label, envKey, ph, val, set, type }) => (
                     <div key={label} style={{ marginBottom: 4 }}>
                       <div style={{ fontSize: 9, color: '#64748b', marginBottom: 1 }}>{label}{envKey && <span style={{ color: '#334155', marginLeft: 4 }}>{envKey}</span>}</div>
@@ -725,7 +910,7 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
                 style={{ width: '100%' }}
               >
                 {thinkingLevels.map((level) => (
-                  <option key={level} value={level}>{formatEffortLevel(level)}</option>
+                  <option key={level} value={level}>{formatEffortLevel(level)}{level === 'ultra' ? ` — ${t('session.thinking_ultra_hint')}` : ''}</option>
                 ))}
               </select>
             </div>
@@ -734,7 +919,7 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
           {supportsModelSelection && (
             <div>
               <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 8 }}>{t('session.supervision.model')}</div>
-              {CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(type) && modelSuggestions.length > 0 ? (
+              {((type === 'qwen' || type === 'claude-code-sdk') || (Boolean(selectedCcPreset) && CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(type))) && modelSuggestions.length > 0 ? (
                 <select
                   class="input"
                   value={requestedModel}
@@ -746,26 +931,29 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
                   ))}
                 </select>
               ) : (
-                <input
-                  class="input"
-                  type="text"
-                  list={`sub-session-model-options-${type}`}
+                <ModelCombobox
+                  className="input"
+                  id={`sub-session-model-${type}`}
+                  options={modelSuggestions}
                   placeholder={t('session.supervision.selectModel')}
                   value={requestedModel}
-                  onInput={(e) => setRequestedModel((e.target as HTMLInputElement).value)}
+                  onChange={setRequestedModel}
                   style={{ width: '100%' }}
                 />
-              )}
-              {modelSuggestions.length > 0 && (
-                <datalist id={`sub-session-model-options-${type}`}>
-                  {modelSuggestions.map((model) => (
-                    <option key={model} value={model} />
-                  ))}
-                </datalist>
               )}
               {type === 'grok-sdk' && transportModels.error && (
                 <div role="alert" style={{ marginTop: 6, color: '#fca5a5', fontSize: 12 }}>
                   {t('new_session.grok_prerequisite_error', { error: transportModels.error })}
+                </div>
+              )}
+              {type === HERMES_AGENT_PROVIDER_ID && transportModels.error && (
+                <div role="alert" style={{ marginTop: 6, color: '#fca5a5', fontSize: 12 }}>
+                  {t('new_session.hermes_prerequisite_error', { error: transportModels.error })}
+                </div>
+              )}
+              {type === AGY_SDK_PROVIDER_ID && transportModels.error && (
+                <div role="alert" style={{ marginTop: 6, color: '#fca5a5', fontSize: 12 }}>
+                  {t('new_session.agy_prerequisite_error', { error: transportModels.error })}
                 </div>
               )}
             </div>
@@ -800,6 +988,28 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
               style={{ width: '100%' }}
             />
           </div>
+
+          {/* Quantity: launch several identical sub-sessions at once */}
+          {canLaunchMultiple && (
+            <div>
+              <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 8 }}>{t('new_session.launch_count')}</div>
+              <input
+                class="input"
+                type="number"
+                min={1}
+                max={MAX_SUB_SESSION_LAUNCH_COUNT}
+                value={countInput}
+                onInput={(e) => setCountInput((e.target as HTMLInputElement).value)}
+                style={{ width: 120 }}
+                aria-label={t('new_session.launch_count')}
+              />
+              {launchCount > 1 && (
+                <div style={{ color: '#94a3b8', fontSize: 12, marginTop: 4, lineHeight: 1.4 }}>
+                  {t('new_session.launch_count_hint', { count: launchCount })}
+                </div>
+              )}
+            </div>
+          )}
 
           {/* Description / persona */}
           <div>

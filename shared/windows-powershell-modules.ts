@@ -19,8 +19,3 @@ export const WINDOWS_POWERSHELL_UTILITY_MODULE_PREFLIGHT = modulePreflight(
   'Microsoft.PowerShell.Utility',
   'utilityModulePath',
 );
-
-export const WINDOWS_POWERSHELL_PKI_MODULE_PREFLIGHT = modulePreflight(
-  'PKI',
-  'pkiModulePath',
-);

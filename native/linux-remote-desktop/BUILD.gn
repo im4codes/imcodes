@@ -1,0 +1,62 @@
+# Linux remote-desktop platform adapters.
+#
+# Split in two on purpose:
+#
+#   linux_remote_desktop_policy  — capability and backend-selection rules with
+#     no platform headers, so the advertisement logic builds and is tested on
+#     every host rather than only on a Linux runner.
+#
+#   linux_remote_desktop         — the concrete X11/portal adapters, which need
+#     a live X server's development headers and therefore only build on Linux.
+#
+# Neither target restates protocol, session, transport, quality or input-ledger
+# logic; those stay in //native/remote-desktop-common.
+
+source_set("linux_remote_desktop_policy") {
+  sources = [
+    "linux_capability_probe.cc",
+    "linux_capability_probe.h",
+    "linux_capture_selection.cc",
+    "linux_capture_selection.h",
+  ]
+
+  public = [
+    "linux_capability_probe.h",
+    "linux_capture_selection.h",
+  ]
+
+  public_deps = [ "//native/remote-desktop-common:remote_desktop_common" ]
+}
+
+if (is_linux) {
+  config("x11_backend_config") {
+    libs = [
+      "X11",
+      "Xext",
+      "Xtst",
+      "Xfixes",
+      "Xrandr",
+    ]
+  }
+
+  source_set("linux_remote_desktop") {
+    sources = [
+      "linux_platform_adapters.cc",
+      "linux_platform_adapters.h",
+      "linux_x11_backend.cc",
+      "linux_x11_backend.h",
+    ]
+
+    public = [
+      "linux_platform_adapters.h",
+      "linux_x11_backend.h",
+    ]
+
+    public_configs = [ ":x11_backend_config" ]
+
+    public_deps = [
+      ":linux_remote_desktop_policy",
+      "//native/remote-desktop-common:remote_desktop_common",
+    ]
+  }
+}

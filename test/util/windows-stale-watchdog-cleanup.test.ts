@@ -83,7 +83,12 @@ function spawnFakeWatchdog(stagingDir: string): number {
 
 /** Run a small script in a fresh Node process so test-time vi.mock() calls
  *  can't affect the production module under test. */
-function runInChildProcess(driverSource: string): { status: number; stdout: string; stderr: string } {
+/**
+ * Cleanup is scoped to one state home: it only kills artifacts that belong to
+ * the home it runs for. `stateHome` makes the driver act for the test's
+ * staging home instead of the worker's isolated IMCODES_HOME.
+ */
+function runInChildProcess(driverSource: string, stateHome?: string): { status: number; stdout: string; stderr: string } {
   const dir = mkdtempSync(join(tmpdir(), 'imcodes-stale-driver-'));
   try {
     const driverPath = join(dir, 'driver.mjs');
@@ -91,6 +96,7 @@ function runInChildProcess(driverSource: string): { status: number; stdout: stri
     const result = spawnSync(process.execPath, [driverPath], {
       encoding: 'utf8',
       windowsHide: true,
+      ...(stateHome ? { env: { ...process.env, IMCODES_HOME: stateHome } } : {}),
     });
     return {
       status: result.status ?? -1,
@@ -129,7 +135,7 @@ describe('stale watchdog cleanup (Windows-only end-to-end)', () => {
         killAllStaleWatchdogs();
         console.error('[driver] after kill');
       `;
-      const result = runInChildProcess(driverSource);
+      const result = runInChildProcess(driverSource, dir);
       expect(result.status, `driver failed: status=${result.status} stdout=${result.stdout} stderr=${result.stderr}`).toBe(0);
 
       // Wait up to 15s for the PowerShell+taskkill chain to complete.
@@ -179,7 +185,7 @@ describe('stale watchdog cleanup (Windows-only end-to-end)', () => {
         await writeWatchdogCmd(${JSON.stringify(stagingPaths)});
         await writeVbsLauncher(${JSON.stringify(stagingPaths)});
       `;
-      const result = runInChildProcess(driverSource);
+      const result = runInChildProcess(driverSource, dir);
       expect(result.status, `driver failed: status=${result.status} stdout=${result.stdout} stderr=${result.stderr}`).toBe(0);
 
       const dead = await waitFor(() => !pidAlive(fakePid!), 15000);
@@ -256,7 +262,10 @@ describe('stale watchdog cleanup (Windows-only end-to-end)', () => {
       const fakePath = join(fakeDir, 'index.js');
       writeFileSync(fakePath, 'setInterval(() => {}, 60_000);');
 
-      const child = spawn(process.execPath, [fakePath], {
+      // A daemon is only attributable to a home when its command line names
+      // that state home, so name the staging home the driver acts for.
+      const stateHome = join(dir, '.imcodes');
+      const child = spawn(process.execPath, [fakePath, 'start', '--foreground', `--imcodes-home=${stateHome}`], {
         detached: true,
         stdio: 'ignore',
         windowsHide: true,
@@ -273,7 +282,7 @@ describe('stale watchdog cleanup (Windows-only end-to-end)', () => {
         `import { killOrphanDaemonProcesses } from ${JSON.stringify(moduleUrl)};\n` +
         `const k = killOrphanDaemonProcesses();\n` +
         `console.error('[driver] killed=' + k);\n`;
-      const result = runInChildProcess(driverSource);
+      const result = runInChildProcess(driverSource, stateHome);
       expect(result.status, `driver: ${result.stderr}`).toBe(0);
 
       // PowerShell startup is slow on CI runners → 15s grace

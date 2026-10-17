@@ -6,13 +6,23 @@ import { GettingStarted } from '../components/GettingStarted.js';
 import { LanguageSwitcher } from '../components/LanguageSwitcher.js';
 import { PasskeyManager } from '../components/PasskeyManager.js';
 import { DeleteAccount } from '../components/DeleteAccount.js';
-import { apiFetch } from '../api.js';
+import { SharedEntriesPanel } from '../components/SharedEntriesPanel.js';
+import { apiFetch, type SharedEntrySummary } from '../api.js';
 
 interface Props {
+  servers?: ServerInfo[];
   onSelectServer: (serverId: string, serverName: string) => void;
+  onDeleteServer?: (server: ServerInfo) => void;
   onLogout: () => void;
   onOpenUsageSummary: () => void;
   onServersLoaded?: (servers: ServerInfo[]) => void;
+  sharedEntries: SharedEntrySummary[];
+  sharedEntriesLoading: boolean;
+  sharedEntriesLoaded: boolean;
+  sharedEntriesError: string | null;
+  openingSharedEntryId: string | null;
+  onOpenSharedEntry: (entry: SharedEntrySummary) => void;
+  onRefreshSharedEntries: () => void;
 }
 
 interface ServerInfo {
@@ -21,6 +31,7 @@ interface ServerInfo {
   status: string;
   lastHeartbeatAt: number | null;
   daemonVersion?: string | null;
+  latestDaemonVersion?: string | null;
   createdAt: number;
 }
 
@@ -31,11 +42,31 @@ interface KeyInfo {
   revokedAt: number | null;
 }
 
-export function DashboardPage({ onSelectServer, onLogout, onOpenUsageSummary, onServersLoaded }: Props) {
+export function DashboardPage({
+  servers: externalServers,
+  onSelectServer,
+  onDeleteServer,
+  onLogout,
+  onOpenUsageSummary,
+  onServersLoaded,
+  sharedEntries,
+  sharedEntriesLoading,
+  sharedEntriesLoaded,
+  sharedEntriesError,
+  openingSharedEntryId,
+  onOpenSharedEntry,
+  onRefreshSharedEntries,
+}: Props) {
   const { t } = useTranslation();
-  const [servers, setServers] = useState<ServerInfo[]>([]);
+  const [servers, setServers] = useState<ServerInfo[]>(externalServers ?? []);
   const [keys, setKeys] = useState<KeyInfo[]>([]);
   const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    if (externalServers) {
+      setServers(externalServers);
+    }
+  }, [externalServers]);
 
   const loadData = async () => {
     try {
@@ -57,6 +88,15 @@ export function DashboardPage({ onSelectServer, onLogout, onOpenUsageSummary, on
     loadData();
   }, []);
 
+  const showSharedInventory = sharedEntriesLoading
+    || sharedEntriesError !== null
+    || sharedEntries.length > 0;
+  const showGettingStarted = servers.length === 0
+    && sharedEntriesLoaded
+    && !sharedEntriesLoading
+    && sharedEntriesError === null
+    && sharedEntries.length === 0;
+
   return (
     <div style={{ maxWidth: 800, margin: '0 auto', padding: 24 }}>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 24 }}>
@@ -72,10 +112,21 @@ export function DashboardPage({ onSelectServer, onLogout, onOpenUsageSummary, on
         <div style={{ textAlign: 'center', padding: 48, color: '#64748b' }}>Loading...</div>
       ) : (
         <>
-          {servers.length === 0 ? (
+          {servers.length > 0 && (
+            <ServerList servers={servers} onSelectServer={onSelectServer} onDeleteServer={onDeleteServer} />
+          )}
+          {showSharedInventory && (
+            <SharedEntriesPanel
+              entries={sharedEntries}
+              loading={sharedEntriesLoading}
+              error={sharedEntriesError}
+              openingEntryId={openingSharedEntryId}
+              onOpen={onOpenSharedEntry}
+              onRefresh={onRefreshSharedEntries}
+            />
+          )}
+          {showGettingStarted && (
             <GettingStarted keys={keys} onKeyCreated={loadData} onDeviceAppeared={loadData} />
-          ) : (
-            <ServerList servers={servers} onSelectServer={onSelectServer} />
           )}
           <ApiKeyManager keys={keys} onKeysChanged={loadData} />
           <PasskeyManager />

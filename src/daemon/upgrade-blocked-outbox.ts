@@ -1,3 +1,4 @@
+import { resolveImcodesHome } from '../util/windows-daemon-lock.js';
 /**
  * Crash-safe single-record outbox for detached daemon-upgrade failures.
  *
@@ -8,7 +9,6 @@
  */
 
 import { mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises';
-import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { DAEMON_MSG } from '../../shared/daemon-events.js';
 import {
@@ -19,7 +19,7 @@ import {
 import logger from '../util/logger.js';
 
 const UPGRADE_BLOCKED_OUTBOX_TTL_MS = 7 * 24 * 60 * 60 * 1000;
-const DEFAULT_FILE = join(homedir(), '.imcodes', 'pending-upgrade-blocked.json');
+function defaultFile(): string { return join(resolveImcodesHome(), 'pending-upgrade-blocked.json'); }
 
 export interface UpgradeInstallFailedMessage {
   type: typeof DAEMON_MSG.UPGRADE_BLOCKED;
@@ -85,7 +85,7 @@ export class UpgradeBlockedOutbox {
   private operation: Promise<unknown> = Promise.resolve();
 
   constructor(
-    private readonly filePath = DEFAULT_FILE,
+    private readonly filePath = defaultFile(),
     private readonly now: () => number = Date.now,
   ) {}
 

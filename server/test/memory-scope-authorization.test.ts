@@ -59,6 +59,7 @@ function makeMockDb() {
     origin: 'chat_compacted' | 'user_note';
     content_json: Record<string, unknown>;
     content_hash?: string | null;
+    server_id?: string;
   }>([
     ['shared-1', {
       id: 'shared-1',
@@ -70,6 +71,7 @@ function makeMockDb() {
       origin: 'chat_compacted',
       content_json: { note: 'raw source must not be returned' },
       content_hash: null,
+      server_id: 'server-shared-1',
     }],
   ]);
   const citations = new Map<string, {
@@ -133,6 +135,7 @@ function makeMockDb() {
             updated_at: projection.id === 'shared-1' ? 10 : 1,
             hit_count: 0,
             cite_count: citeCounts.get(projection.id) ?? 0,
+            origin_server_id: projection.server_id ?? 'server-test',
           })) as T[];
       }
       if (s.includes('from owner_private_memories')) return [] as T[];
@@ -209,7 +212,10 @@ describe('memory scope authorization and same-shape citation lookup', () => {
     expect(res.status).toBe(200);
     const json = await res.json() as { results: Array<Record<string, unknown>> };
     expect(json.results).toEqual([
-      expect.objectContaining({ id: 'shared-1', scope: 'org_shared', preview: 'Authorized summary', origin: 'chat_compacted' }),
+      expect.objectContaining({
+        id: 'shared-1', scope: 'org_shared', preview: 'Authorized summary',
+        origin: 'chat_compacted', originServerId: 'server-shared-1',
+      }),
     ]);
     expect(JSON.stringify(json)).not.toContain('raw source');
     expect(JSON.stringify(json)).not.toContain('ent-1');

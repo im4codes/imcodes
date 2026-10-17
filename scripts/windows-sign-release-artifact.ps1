@@ -1,5 +1,5 @@
 param(
-  [ValidateSet('Remove', 'Sign', 'Verify')]
+  [ValidateSet('Remove', 'Sign', 'Verify', 'Manifest')]
   [string]$Mode = 'Sign',
 
   [Parameter(Mandatory = $true)]
@@ -9,7 +9,12 @@ param(
 
   [string]$ExpectedSignerSha256 = '',
 
-  [string]$TimestampUrl = 'http://timestamp.digicert.com'
+  [string]$TimestampUrl = 'http://timestamp.digicert.com',
+
+  # Manifest mode only. The requested execution level to write into the PE
+  # application manifest.
+  [ValidateSet('asInvoker', 'requireAdministrator', 'highestAvailable')]
+  [string]$RequestedExecutionLevel = 'requireAdministrator'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -25,13 +30,78 @@ if (-not (Test-Path -LiteralPath $SecurityModulePath -PathType Leaf)) {
 Import-Module -Name $SecurityModulePath -ErrorAction Stop
 $ResolvedArtifact = (Resolve-Path -LiteralPath $ArtifactPath).Path
 $KitRoot = 'C:\Program Files (x86)\Windows Kits\10\bin'
-$VersionedSignTools = @(Get-ChildItem $KitRoot -Directory -ErrorAction Stop |
-  Where-Object { $_.Name -match '^\d+\.\d+\.\d+\.\d+$' } |
-  Sort-Object { [version]$_.Name } -Descending |
-  ForEach-Object { Join-Path $_.FullName 'x64\signtool.exe' } |
-  Where-Object { Test-Path -LiteralPath $_ -PathType Leaf })
-$UnversionedSignTool = Join-Path $KitRoot 'x64\signtool.exe'
-$SignTool = @($VersionedSignTools + $(if (Test-Path -LiteralPath $UnversionedSignTool -PathType Leaf) { $UnversionedSignTool }))[0]
+# Newest versioned SDK bin first, then the unversioned fallback. Shared by every
+# SDK tool this script drives so signtool.exe and mt.exe can never be resolved
+# from two different SDK installs.
+function Resolve-WindowsSdkTool {
+  param([Parameter(Mandatory = $true)][string]$ToolName)
+  $Versioned = @(Get-ChildItem $KitRoot -Directory -ErrorAction Stop |
+    Where-Object { $_.Name -match '^\d+\.\d+\.\d+\.\d+$' } |
+    Sort-Object { [version]$_.Name } -Descending |
+    ForEach-Object { Join-Path $_.FullName "x64\$ToolName" } |
+    Where-Object { Test-Path -LiteralPath $_ -PathType Leaf })
+  $Unversioned = Join-Path $KitRoot "x64\$ToolName"
+  return @($Versioned + $(if (Test-Path -LiteralPath $Unversioned -PathType Leaf) { $Unversioned }))[0]
+}
+
+if ($Mode -eq 'Manifest') {
+  # Raise the UAC requested execution level.
+  #
+  # Without this the artifact inherits official node.exe's `asInvoker`, so a
+  # double-clicked installer runs unelevated, fails its own Administrator
+  # precondition, and closes its console before anyone can read why.
+  #
+  # ORDERING IS LOAD-BEARING: mt.exe rewrites the resource section and drops the
+  # Authenticode certificate table while doing so (measured on Windows 10
+  # 19045 + SDK 10.0.26100: an 81,471,184-byte signed artifact became
+  # 81,463,296 bytes and NotSigned, exactly the 7,888-byte certificate table).
+  # This mode must therefore run AFTER postject and BEFORE Sign, or the release
+  # ships unsigned.
+  $ManifestTool = Resolve-WindowsSdkTool -ToolName 'mt.exe'
+  if (-not $ManifestTool) { throw 'Windows SDK mt.exe was not found.' }
+  $Work = Join-Path ([System.IO.Path]::GetTempPath()) ("imcodes-manifest-" + [guid]::NewGuid().ToString('N'))
+  New-Item -ItemType Directory -Path $Work | Out-Null
+  try {
+    $ManifestFile = Join-Path $Work 'app.manifest'
+    & $ManifestTool -nologo -inputresource:"$ResolvedArtifact;#1" -out:$ManifestFile
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $ManifestFile -PathType Leaf)) {
+      throw 'Reading the existing PE application manifest failed.'
+    }
+    $Xml = Get-Content -LiteralPath $ManifestFile -Raw
+    if ($Xml -notmatch 'requestedExecutionLevel') {
+      throw 'The PE application manifest declares no requestedExecutionLevel to raise.'
+    }
+    # Replace only the level attribute; uiAccess and every other element of the
+    # inherited manifest (supportedOS compatibility ids in particular) must
+    # survive untouched.
+    $Updated = [regex]::Replace(
+      $Xml,
+      '(<requestedExecutionLevel[^>]*\slevel=")[^"]*(")',
+      ('${1}' + $RequestedExecutionLevel + '${2}'))
+    if ($Updated -eq $Xml -and $Xml -notmatch ('level="' + [regex]::Escape($RequestedExecutionLevel) + '"')) {
+      throw 'Rewriting the requestedExecutionLevel produced no change.'
+    }
+    Set-Content -LiteralPath $ManifestFile -Value $Updated -Encoding UTF8
+    & $ManifestTool -nologo -manifest $ManifestFile -outputresource:"$ResolvedArtifact;#1"
+    if ($LASTEXITCODE -ne 0) { throw 'Writing the updated PE application manifest failed.' }
+
+    # Read the level back out of the artifact itself. Trusting mt.exe's exit
+    # code alone would let a silently-unchanged binary ship.
+    $VerifyFile = Join-Path $Work 'verify.manifest'
+    & $ManifestTool -nologo -inputresource:"$ResolvedArtifact;#1" -out:$VerifyFile
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $VerifyFile -PathType Leaf)) {
+      throw 'Reading back the updated PE application manifest failed.'
+    }
+    if ((Get-Content -LiteralPath $VerifyFile -Raw) -notmatch ('level="' + [regex]::Escape($RequestedExecutionLevel) + '"')) {
+      throw "The PE application manifest does not declare level=$RequestedExecutionLevel after the update."
+    }
+  } finally {
+    Remove-Item -LiteralPath $Work -Recurse -Force -ErrorAction SilentlyContinue
+  }
+  exit 0
+}
+
+$SignTool = Resolve-WindowsSdkTool -ToolName 'signtool.exe'
 if (-not $SignTool) { throw 'Windows SDK signtool.exe was not found.' }
 
 if ($Mode -eq 'Remove') {

@@ -22,7 +22,7 @@ export function buildBashNodeDatachannelRepair(): string {
   return `# node-datachannel repair: invoke the newly installed package's
 # pure-builtins repair utility. This is best effort: relay remains available
 # when a platform has no compatible binary/toolchain.
-GLOBAL_ROOT_CHECK=$(eval "$NPM_RUN root -g" 2>/dev/null)
+GLOBAL_ROOT_CHECK="\${IMCODES_REPAIR_ROOT:-$(eval "$NPM_RUN root -g" 2>/dev/null)}"
 IMCODES_PACKAGE_DIR="$GLOBAL_ROOT_CHECK/imcodes"
 NODE_DATACHANNEL_REPAIR="$IMCODES_PACKAGE_DIR/dist/src/util/node-datachannel-repair.mjs"
 if [ -f "$NODE_DATACHANNEL_REPAIR" ]; then

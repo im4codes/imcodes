@@ -24,13 +24,16 @@ import {
   validateAliasValue,
   validateAliasDescription,
   validateAliasTags,
+  isAliasId,
 } from '../../../shared/alias-types.js';
 import {
   upsertAlias,
   getAliasByName,
+  getAliasById,
   deleteAlias,
   listAliases,
 } from '../db/alias-queries.js';
+import { SERVER_ID_HEADER } from '../../../shared/http-header-names.js';
 
 export const aliasRoutes = new Hono<{ Bindings: Env; Variables: { userId: string } }>();
 
@@ -63,7 +66,7 @@ aliasRoutes.get('/', async (c) => {
 aliasRoutes.post('/', async (c) => {
   const userId = c.get('userId' as never) as string;
 
-  let body: { name?: unknown; value?: unknown; description?: unknown; tags?: unknown };
+  let body: { id?: unknown; name?: unknown; value?: unknown; description?: unknown; tags?: unknown };
   try {
     body = await c.req.json() as typeof body;
   } catch {
@@ -89,10 +92,17 @@ aliasRoutes.post('/', async (c) => {
   const name = nfc(rawName);
   const description = rawDescription != null ? nfc(rawDescription) : null;
   const tags = normalizeRequestTags(body.tags);
+  const existingId = body.id === undefined ? undefined : body.id;
+  if (existingId !== undefined && !isAliasId(existingId)) {
+    return c.json({ error: ALIAS_REASONS.NOT_FOUND }, 404);
+  }
+  if (existingId && !(await getAliasById(c.env.DB, userId, existingId))) {
+    return c.json({ error: ALIAS_REASONS.NOT_FOUND }, 404);
+  }
 
   // Provenance: the daemon (MCP agent write) authenticates with X-Server-Id +
   // Bearer; a browser (web app) uses the session cookie and never sends it.
-  const source = c.req.header('X-Server-Id') ? 'mcp' : 'web';
+  const source = c.req.header(SERVER_ID_HEADER) ? 'mcp' : 'web';
 
   const entry = await upsertAlias(c.env.DB, {
     id: randomHex(16),
@@ -102,6 +112,7 @@ aliasRoutes.post('/', async (c) => {
     description,
     tags,
     source,
+    ...(existingId ? { existingId } : {}),
   });
   return c.json({ alias: entry });
 });

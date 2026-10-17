@@ -57,6 +57,11 @@ ${workerList}
 
 ${coreCommands}${autoFixCommands}
 
+## Project & Session Identity Governance
+- **Project Identity**: You are the sole curator of project-level identity (\`session_identity_set\` with \`identityScope: 'project'\`). Keep it concise and high-signal (core architectural rules, environment baselines, universal invariants; strictly avoid verbose debug logs).
+- **Session Identity Injection**: When assigning critical tasks (e.g. deployment or infrastructure tasks), write core parameters and invariants into the worker's session identity (\`identityScope: 'session'\`). Sessions can append new facts with \`append: true\`. This ensures parameters persist across model switches and context resets.
+- **Observations Lifecycle**: Facts saved via \`save_observation\` automatically become active startup memories. When facts become obsolete, purge them via \`delete_memory\` (using \`observationId\` or \`obs:...\`) or overwrite via \`save_observation\` with \`replacesRef\`.
+
 ## Behavior rules
 
 - Issue commands on their own line, one at a time

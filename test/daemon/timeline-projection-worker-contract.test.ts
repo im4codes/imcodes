@@ -50,7 +50,7 @@ describe('timeline projection worker contract', () => {
       return { ...actual, homedir: () => tempHome! };
     });
     vi.doMock('node:worker_threads', () => ({
-      workerData: { dbPath },
+      workerData: { dbPath, stateDir: join(tempHome!, '.imcodes') },
       parentPort: {
         on: vi.fn((_event: string, cb: WorkerHandler) => {
           handler = cb;

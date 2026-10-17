@@ -65,10 +65,12 @@ function finitePositive(value: number): number {
 export function clampRemoteDesktopViewport(
   viewport: RemoteDesktopViewport,
   geometry: RemoteDesktopViewportGeometry,
+  /** The most this content may be zoomed (the image lightbox allows more for a picture shown far below its own pixels). */
+  maxScale = REMOTE_DESKTOP_MAX_ZOOM,
 ): RemoteDesktopViewport {
   const scale = Math.max(
     REMOTE_DESKTOP_MIN_ZOOM,
-    Math.min(REMOTE_DESKTOP_MAX_ZOOM, Number.isFinite(viewport.scale) ? viewport.scale : 1),
+    Math.min(Math.max(REMOTE_DESKTOP_MIN_ZOOM, Number.isFinite(maxScale) ? maxScale : REMOTE_DESKTOP_MAX_ZOOM), Number.isFinite(viewport.scale) ? viewport.scale : 1),
   );
   const stageWidth = finitePositive(geometry.stageWidth);
   const stageHeight = finitePositive(geometry.stageHeight);
@@ -92,6 +94,7 @@ export function viewportFromRemoteDesktopPinch(
   currentCenter: { x: number; y: number },
   nextScale: number,
   geometry: RemoteDesktopViewportGeometry,
+  maxScale = REMOTE_DESKTOP_MAX_ZOOM,
 ): RemoteDesktopViewport {
   const stageCenterX = finitePositive(geometry.stageWidth) / 2;
   const stageCenterY = finitePositive(geometry.stageHeight) / 2;
@@ -102,7 +105,7 @@ export function viewportFromRemoteDesktopPinch(
     scale: nextScale,
     x: currentCenter.x - stageCenterX - sourceOffsetX * nextScale,
     y: currentCenter.y - stageCenterY - sourceOffsetY * nextScale,
-  }, geometry);
+  }, geometry, maxScale);
 }
 
 /** Chooses a readable phone scale while keeping user zoom bounded. */

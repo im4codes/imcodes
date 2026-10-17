@@ -1,4 +1,4 @@
-import { randomUUID } from 'crypto';
+import { createHash, randomUUID } from 'crypto';
 
 export const SEND_DISPATCH_ID_PREFIX = 'send_dispatch_' as const;
 export const SEND_MESSAGE_ID_PREFIX = 'send_message_' as const;
@@ -16,6 +16,28 @@ export function createSendDispatchId(): SendDispatchId {
 
 export function createSendMessageId(): SendMessageId {
   return `${SEND_MESSAGE_ID_PREFIX}${randomUUID()}`;
+}
+
+/** Stable identity for daemon-owned exactly-once control traffic. */
+export function deterministicSendMessageId(seed: string): SendMessageId {
+  const hex = createHash('sha256').update(seed).digest('hex');
+  const uuid = `${hex.slice(0, 8)}-${hex.slice(8, 12)}-5${hex.slice(13, 16)}-a${hex.slice(17, 20)}-${hex.slice(20, 32)}`;
+  return `${SEND_MESSAGE_ID_PREFIX}${uuid}`;
+}
+
+/** Exact delivery identity for one automatic-audit assignment generation. */
+export function deterministicAutomaticAuditDeliveryMessageId(
+  assignmentId: string,
+  attemptId: string,
+  generation: number,
+): SendMessageId {
+  if (!assignmentId.trim() || !attemptId.trim()
+    || !Number.isSafeInteger(generation) || generation < 1) {
+    throw new Error('automatic audit delivery identity requires assignment, attempt, and positive generation');
+  }
+  return deterministicSendMessageId(generation === 1
+    ? `auto-audit:${assignmentId}:${attemptId}`
+    : `auto-audit-rebind:${assignmentId}:${attemptId}:${generation}`);
 }
 
 export function isSendDispatchId(value: unknown): value is SendDispatchId {

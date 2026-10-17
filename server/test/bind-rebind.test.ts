@@ -1,6 +1,7 @@
 /**
  * Integration tests: bind/direct and bind/rebind flows
  */
+import { activeUserAnswer } from './helpers/user-status.js';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { buildApp } from '../src/index.js';
 import type { Env } from '../src/env.js';
@@ -24,7 +25,7 @@ vi.mock('../src/security/crypto.js', async (importOriginal) => {
 function makeMemDb(): Database {
   const users = new Map<string, { id: string; created_at: number }>();
   const apiKeys = new Map<string, { id: string; user_id: string; key_hash: string; created_at: number }>();
-  const servers = new Map<string, { id: string; user_id: string; name: string; token_hash: string; status: string; last_heartbeat_at: number | null; created_at: number }>();
+  const servers = new Map<string, { id: string; user_id: string; name: string; token_hash: string; status: string; last_heartbeat_at: number | null; created_at: number, owner_status: 'active' }>();
   const idempotency = new Map<string, { body: string; status: number }>();
   const auditLog: unknown[] = [];
 
@@ -34,6 +35,7 @@ function makeMemDb(): Database {
 
   return {
     queryOne: async <T = unknown>(sql: string, params: unknown[] = []): Promise<T | null> => {
+      { const activeUser = activeUserAnswer(sql); if (activeUser) return activeUser as never; }
       const s = normalize(sql);
 
       if (s.includes('from users where id')) {
@@ -41,7 +43,7 @@ function makeMemDb(): Database {
       }
       if (s.includes('from api_keys where key_hash')) {
         for (const k of apiKeys.values()) {
-          if (k.key_hash === params[0]) return { id: k.id, user_id: k.user_id } as T;
+          if (k.key_hash === params[0]) return { id: k.id, user_id: k.user_id, user_status: 'active' } as T;
         }
         return null;
       }
@@ -83,7 +85,7 @@ function makeMemDb(): Database {
           id: params[0] as string,
           user_id: params[1] as string,
           name: params[2] as string,
-          token_hash: params[3] as string,
+          token_hash: params[3] as string, owner_status: 'active',
           status: 'offline',
           last_heartbeat_at: null,
           created_at: params[5] as number,

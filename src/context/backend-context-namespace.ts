@@ -1,11 +1,13 @@
 import type { SharedContextNamespaceResolution } from '../../shared/context-types.js';
 import type { BackendAuthoredContextCredentials } from './backend-authored-context.js';
+import { backendContextFetchSignal } from './backend-fetch-timeout.js';
 
 type BackendNamespaceResolutionResponse = SharedContextNamespaceResolution;
 
 export async function fetchBackendSharedContextNamespace(
   credentials: BackendAuthoredContextCredentials,
   canonicalRepoId: string,
+  options: { timeoutMs?: number } = {},
 ): Promise<SharedContextNamespaceResolution | null> {
   const response = await fetch(`${credentials.workerUrl}/api/server/${credentials.serverId}/shared-context/resolve-namespace`, {
     method: 'POST',
@@ -14,6 +16,7 @@ export async function fetchBackendSharedContextNamespace(
       Authorization: `Bearer ${credentials.token}`,
     },
     body: JSON.stringify({ canonicalRepoId }),
+    signal: backendContextFetchSignal(options.timeoutMs),
   });
   if (!response.ok) {
     throw new Error(`backend_context_namespace_resolution_failed:${response.status}`);

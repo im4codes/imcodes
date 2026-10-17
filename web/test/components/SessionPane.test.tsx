@@ -122,6 +122,37 @@ describe('SessionPane', () => {
     cleanup();
   });
 
+  it('keeps the main timeline passive while a sub-session owns keyboard focus', () => {
+    render(
+      <SessionPane
+        serverId="s1"
+        session={{
+          name: 'deck_test_brain',
+          project: 'test',
+          role: 'brain',
+          agentType: 'codex',
+          state: 'idle',
+          projectDir: '/tmp/test',
+        } as any}
+        sessions={[]}
+        subSessions={[]}
+        ws={null}
+        connected={false}
+        isActive={true}
+        keyboardActive={false}
+        viewMode="chat"
+        quickData={{} as any}
+      />,
+    );
+
+    expect(useTimelineMock).toHaveBeenCalledWith(
+      'deck_test_brain',
+      null,
+      's1',
+      expect.objectContaining({ isActiveSession: false }),
+    );
+  });
+
   it('renders UsageFooter for codex CLI when only quota metadata exists', () => {
     render(
       <SessionPane
@@ -526,9 +557,9 @@ describe('SessionPane', () => {
     );
 
     expect(chatViewSpy).toHaveBeenCalled();
-    expect(terminalViewSpy).toHaveBeenCalled();
-    const lastTerminalProps = terminalViewSpy.mock.calls.at(-1)?.[0];
-    expect(lastTerminalProps?.active).toBe(false);
+    // Transport sessions stay in chat mode; the inactive terminal is now
+    // lazily unmounted rather than keeping an xterm instance alive.
+    expect(terminalViewSpy).not.toHaveBeenCalled();
     fireEvent.click(screen.getByRole('button', { name: 'send' }));
     expect(addOptimisticUserMessageMock).toHaveBeenCalledWith('queued text', 'test-cmd-1', {});
   });

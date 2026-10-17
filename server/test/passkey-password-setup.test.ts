@@ -1,3 +1,4 @@
+import { activeUserAnswer } from './helpers/user-status.js';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const {
@@ -78,7 +79,7 @@ function makeMemDb(): MemDb {
   const challenges = new Map<string, MemChallenge>();
   const apiKeys = new Map<string, { user_id: string; key_hash: string; revoked_at: number | null }>();
   const authNonces = new Map<string, { nonce: string; api_key: string; user_id: string; key_id: string; expires_at: number; created_at: number }>();
-  const refreshTokens = new Map<string, { user_id: string; token_hash: string }>();
+  const refreshTokens = new Map<string, { user_id: string; token_hash: string, owner_status: 'active' }>();
   const auditLog: unknown[] = [];
   let failNextUsernameUpdateWithUniqueViolation = false;
   let failNextUsernameUpdateWithGenericError = false;
@@ -89,6 +90,7 @@ function makeMemDb(): MemDb {
 
   const db = {
     queryOne: async <T = unknown>(sql: string, params: unknown[] = []): Promise<T | null> => {
+      { const activeUser = activeUserAnswer(sql); if (activeUser) return activeUser as never; }
       const s = normalize(sql);
       if (s.includes('from users where id')) return (users.get(String(params[0])) ?? null) as T | null;
       if (s.includes('from users where username')) {
@@ -230,7 +232,7 @@ function makeMemDb(): MemDb {
         if (user) user.status = String(params[0]) as MemUser['status'];
       }
       if (s.includes('insert into refresh_tokens')) {
-        refreshTokens.set(String(params[0]), { user_id: String(params[1]), token_hash: String(params[2]) });
+        refreshTokens.set(String(params[0]), { user_id: String(params[1]), token_hash: String(params[2]), owner_status: 'active' });
       }
       if (s.includes('insert into auth_nonces')) {
         authNonces.set(String(params[0]), {

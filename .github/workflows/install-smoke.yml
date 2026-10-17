@@ -59,6 +59,8 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
+    # Ends a hung job itself instead of holding the concurrency group for the 6 h default (normal 2-10 min, Windows max 13.9).
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -97,6 +99,8 @@ jobs:
   install-script-syntax:
     name: Install Script Syntax
     runs-on: ubuntu-latest
+    # Ends a hung job itself instead of holding the concurrency group for the 6 h default (normal 0.1 min).
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
       - name: Bash syntax check (install.sh, gen-env.sh)

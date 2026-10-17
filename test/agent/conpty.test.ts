@@ -55,17 +55,17 @@ vi.mock('node-pty', () => {
   };
 });
 
-// Mock child_process.execSync for taskkill
+// Mock child_process.execFile for taskkill
 vi.mock('child_process', async (importOriginal) => {
   const actual = await importOriginal<typeof import('child_process')>();
   return {
     ...actual,
-    execSync: vi.fn(),
+    execFile: vi.fn((_file: string, _args: string[], _options: unknown, callback: (error: Error | null) => void) => callback(null)),
   };
 });
 
-import { execSync } from 'child_process';
-const execSyncMock = vi.mocked(execSync);
+import { execFile } from 'child_process';
+const execFileMock = vi.mocked(execFile);
 
 // ── Import conpty module ───────────────────────────────────────────────────────
 
@@ -78,10 +78,10 @@ beforeEach(async () => {
   conpty = await import('../../src/agent/conpty.js');
 });
 
-afterEach(() => {
+afterEach(async () => {
   // Clean up all sessions
   for (const name of conpty.conptyListSessions()) {
-    try { conpty.conptyKillSession(name); } catch { /* ignore */ }
+    try { await conpty.conptyKillSession(name); } catch { /* ignore */ }
   }
 });
 
@@ -260,20 +260,20 @@ describe('conpty backend', () => {
       await conpty.conptyNewSession('kill-me', 'cmd');
       expect(conpty.conptySessionExists('kill-me')).toBe(true);
 
-      conpty.conptyKillSession('kill-me');
+      await conpty.conptyKillSession('kill-me');
       expect(conpty.conptySessionExists('kill-me')).toBe(false);
     });
 
     it('calls pty.kill()', async () => {
       await conpty.conptyNewSession('kill-test', 'cmd');
-      conpty.conptyKillSession('kill-test');
+      await conpty.conptyKillSession('kill-test');
 
       expect(mockPty.kill).toHaveBeenCalled();
     });
 
-    it('is a no-op for non-existent sessions', () => {
+    it('is a no-op for non-existent sessions', async () => {
       // Should not throw
-      conpty.conptyKillSession('doesnt-exist');
+      await conpty.conptyKillSession('doesnt-exist');
     });
 
     it('calls taskkill on Windows', async () => {
@@ -281,12 +281,9 @@ describe('conpty backend', () => {
       Object.defineProperty(process, 'platform', { value: 'win32' });
 
       await conpty.conptyNewSession('win-kill', 'cmd');
-      conpty.conptyKillSession('win-kill');
+      await conpty.conptyKillSession('win-kill');
 
-      expect(execSyncMock).toHaveBeenCalledWith(
-        `taskkill /F /T /PID ${mockPty.pid}`,
-        { stdio: 'ignore' },
-      );
+      expect(execFileMock).toHaveBeenCalledWith('taskkill.exe', ['/F', '/T', '/PID', String(mockPty.pid)], expect.objectContaining({ windowsHide: true, timeout: 2_000 }), expect.any(Function));
 
       Object.defineProperty(process, 'platform', { value: origPlatform });
     });

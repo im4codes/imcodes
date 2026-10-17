@@ -1,19 +1,25 @@
 import { readFile, writeFile, mkdir } from 'fs/promises';
-import { existsSync as existsSyncFs } from 'fs';
-import { join } from 'path';
+import { existsSync as existsSyncFs, readFileSync as readFileSyncFs, realpathSync as realpathSyncFs } from 'fs';
+import { dirname, join } from 'path';
 import { homedir, hostname } from 'os';
 import { execSync } from 'child_process';
 import logger from '../util/logger.js';
 import { BACKEND } from '../agent/tmux.js';
 import { restartWindowsDaemon } from '../util/windows-daemon.js';
-import { resolveDaemonLaunchTarget, renderSystemdExecStart, renderPlistProgramArguments } from '../util/launch-target.js';
+import { resolveDaemonLaunchTarget, renderSystemdExecStart } from '../util/launch-target.js';
+import { planMacosPlistProgramArguments, renderMacosLaunchAgentPlist, resolveMacosDaemonLaunchFacts } from '../util/macos-launch-agent.js';
 import { enableSystemdUserLinger, formatSystemdLingerFailureMessage } from '../util/systemd-linger.js';
+import { renderRecoveryExecStart, renderSystemdStartLimitBlock, renderSystemdTerminalDiagnostics } from '../util/systemd-unit.js';
+import { installRecoveryUnits } from '../util/systemd-recovery-install.js';
+import { resolveImcodesHome } from '../util/windows-daemon-lock.js';
+import { resolvePosixDaemonServicePaths } from '../util/posix-daemon-service.js';
+import { daemonFatalReportNodeOptions } from '../../shared/daemon-memory-guard.js';
+import { reportExcludeEnvFlagUsable } from '../util/report-privacy.js';
 
-const CREDS_DIR = join(homedir(), '.imcodes');
-const CREDS_PATH = join(CREDS_DIR, 'server.json');
-const PLIST_LABEL = 'imcodes.daemon';
-const PLIST_PATH = join(homedir(), 'Library', 'LaunchAgents', `${PLIST_LABEL}.plist`);
-const OLD_PLIST_PATH = join(homedir(), 'Library', 'LaunchAgents', 'cc.imcodes.daemon.plist');
+/** Resolve the instance state directory lazily so scoped daemons never read or
+ * write the default user's credentials when IMCODES_HOME is overridden. */
+function credentialsDir(): string { return resolveImcodesHome(); }
+function credentialsPath(): string { return join(credentialsDir(), 'server.json'); }
 
 interface ServerCredentials {
   serverId: string;
@@ -72,8 +78,8 @@ export async function bindFlow(bindUrl: string, deviceName?: string, _opts?: { f
       }
       const { token } = await rebindRes.json() as { token: string };
       const creds: ServerCredentials = { serverId: existing.serverId, token, workerUrl, serverName, boundAt: Date.now() };
-      await mkdir(CREDS_DIR, { recursive: true });
-      await writeFile(CREDS_PATH, JSON.stringify(creds, null, 2), { encoding: 'utf8', mode: 0o600 });
+      await mkdir(credentialsDir(), { recursive: true });
+      await writeFile(credentialsPath(), JSON.stringify(creds, null, 2), { encoding: 'utf8', mode: 0o600 });
       console.log(`\nRe-bound! Device "${serverName}" updated.`);
       await ensureServiceInstalled();
       restartDaemon();
@@ -106,8 +112,8 @@ export async function bindFlow(bindUrl: string, deviceName?: string, _opts?: { f
 
   // Save credentials (0600 permissions)
   const creds: ServerCredentials = { serverId, token, workerUrl, serverName, boundAt: Date.now() };
-  await mkdir(CREDS_DIR, { recursive: true });
-  await writeFile(CREDS_PATH, JSON.stringify(creds, null, 2), { encoding: 'utf8', mode: 0o600 });
+  await mkdir(credentialsDir(), { recursive: true });
+  await writeFile(credentialsPath(), JSON.stringify(creds, null, 2), { encoding: 'utf8', mode: 0o600 });
   logger.info({ serverId, serverName }, 'Daemon bound');
 
   await ensureServiceInstalled();
@@ -118,13 +124,14 @@ export async function bindFlow(bindUrl: string, deviceName?: string, _opts?: { f
 
 function restartDaemon(): void {
   try {
+    const service = resolvePosixDaemonServicePaths();
     if (process.platform === 'darwin') {
-      const plist = join(homedir(), 'Library', 'LaunchAgents', `${PLIST_LABEL}.plist`);
+      const plist = service.launchAgentPath;
       execSync(`launchctl unload "${plist}" 2>/dev/null; launchctl load -w "${plist}"`, { stdio: 'ignore' });
     } else if (process.platform === 'linux') {
-      const userService = join(homedir(), '.config/systemd/user/imcodes.service');
+      const userService = service.systemdUnitPath;
       if (existsSyncFs(userService)) {
-        execSync('systemctl --user restart imcodes', { stdio: 'ignore' });
+        execSync(`systemctl --user restart ${service.systemdUnitName}`, { stdio: 'ignore' });
       } else {
         throw new Error('No user service found');
       }
@@ -138,33 +145,50 @@ function restartDaemon(): void {
 }
 
 // writeWindowsWatchdogFiles now delegates to the centralized launch-artifacts module.
-async function writeWindowsWatchdogFiles(): Promise<void> {
-  const { resolveLaunchPaths, writeWatchdogCmd, writeVbsLauncher, rotateWatchdogLog } = await import('../util/windows-launch-artifacts.js');
+async function writeWindowsWatchdogFiles(): Promise<import('../util/windows-launch-artifacts.js').LaunchPaths> {
+  const {
+    resolveLaunchPaths,
+    assertWindowsLaunchIdentity,
+    writeWatchdogCmd,
+    writeVbsLauncher,
+    rotateWatchdogLog,
+  } = await import('../util/windows-launch-artifacts.js');
   const paths = resolveLaunchPaths();
+  try {
+    assertWindowsLaunchIdentity(paths);
+  } catch (error) {
+    logger.error({ error, watchdogPath: paths.watchdogPath }, 'Refusing to write default Windows daemon artifacts from a scoped instance');
+    throw error;
+  }
   await writeWatchdogCmd(paths);
   await writeVbsLauncher(paths);
   await rotateWatchdogLog(paths);
+  return paths;
 }
 
 async function installWindowsStartup(): Promise<void> {
-  await writeWindowsWatchdogFiles();
+  const paths = await writeWindowsWatchdogFiles();
+
+  const { windowsDaemonTaskName } = await import('../util/windows-launch-artifacts.js');
+  const taskName = windowsDaemonTaskName(paths);
+  const scoped = taskName !== 'imcodes-daemon';
+  const startupStem = scoped ? taskName : 'imcodes-daemon';
 
   // Remove legacy Startup folder CMD/VBS if present
   const startupDir = join(homedir(), 'AppData', 'Roaming', 'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup');
-  for (const old of ['imcodes-daemon.cmd', 'imcodes-daemon.vbs']) {
+  for (const old of [`${startupStem}.cmd`, `${startupStem}.vbs`]) {
     try { await import('fs/promises').then((fs) => fs.unlink(join(startupDir, old))); } catch { /* ignore */ }
   }
 
   // Replace legacy ONLOGON-only registrations with a durable Task Scheduler
   // definition: boot + logon + one-minute liveness trigger, direct ownership
   // of the waiting VBS/watchdog process, and failure restart policy.
-  const { installWindowsScheduledTask, resolveLaunchPaths } = await import('../util/windows-launch-artifacts.js');
-  const paths = resolveLaunchPaths();
+  const { installWindowsScheduledTask } = await import('../util/windows-launch-artifacts.js');
   if (!installWindowsScheduledTask(paths)) {
     // schtasks may require elevation — fall back to startup folder CMD
     console.warn('Task Scheduler registration failed (may need admin). Falling back to Startup folder.');
     await mkdir(startupDir, { recursive: true });
-    const cmdPath = join(startupDir, 'imcodes-daemon.cmd');
+    const cmdPath = join(startupDir, `${startupStem}.cmd`);
     const cmd = `@echo off\r\nchcp 65001 >nul 2>&1\r\nstart "" /min wscript "${paths.vbsPath}"\r\n`;
     await writeFile(cmdPath, cmd, 'utf8');
     return;
@@ -180,6 +204,18 @@ async function ensureServiceInstalled(): Promise<void> {
     // ConPTY is built-in on Windows 10+, nothing to install
   } else {
     await ensureTmux();
+  }
+
+  // A scoped POSIX daemon deliberately has no launchd/systemd registration.
+  // Registering a per-instance plist under the user's LaunchAgents directory
+  // still mutates the default service domain (and launchd may respawn it as
+  // root), so scoped instances stay foreground/manual like the Windows guard.
+  if (process.platform === 'darwin' || process.platform === 'linux') {
+    const service = resolvePosixDaemonServicePaths();
+    if (service.scoped) {
+      console.log('Scoped daemon: skipped POSIX service installation to preserve default-service isolation.');
+      return;
+    }
   }
 
   if (process.platform === 'darwin') {
@@ -254,82 +290,82 @@ async function ensureTmux(): Promise<void> {
 }
 
 async function installLaunchAgent(): Promise<void> {
-  const logPath = join(CREDS_DIR, 'daemon.log');
+  const service = resolvePosixDaemonServicePaths();
+  if (service.scoped) {
+    console.log('Scoped daemon: skipped launchd service installation to preserve default-service isolation.');
+    return;
+  }
+  const logPath = join(credentialsDir(), 'daemon.log');
   const launchAgentsDir = join(homedir(), 'Library', 'LaunchAgents');
 
-  // Prefer the self-healing launcher when this install ships it. See
-  // `src/util/launch-target.ts` for rationale.
-  const target = resolveDaemonLaunchTarget();
+  // The launch agent runs the node binary itself (shared/macos-daemon-launch.ts): macOS attributes Full Disk Access to the program
+  // launchd starts, and a script in front of node makes that `/usr/bin/env`. The self-healing runs inside node (bin/imcodes-launch.mjs).
+  // A node binary a re-bind finds in the existing plist is kept, so a grant the user already made keeps applying.
+  let existingPlist: string | undefined;
+  try { existingPlist = readFileSyncFs(service.launchAgentPath, 'utf8'); } catch { /* first install */ }
+  const programArguments = planMacosPlistProgramArguments(resolveMacosDaemonLaunchFacts(), existingPlist);
+  let launchProgram = programArguments[0]!;
+  try { launchProgram = realpathSyncFs(launchProgram); } catch { /* the path is checked at start */ }
 
-  const plist = `<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key>
-  <string>${PLIST_LABEL}</string>
-  <key>ProgramArguments</key>
-  <array>
-${renderPlistProgramArguments(target)}
-  </array>
-  <key>EnvironmentVariables</key>
-  <dict>
-    <key>PATH</key>
-    <string>${process.env.PATH ?? '/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin'}</string>
-    <key>HOME</key>
-    <string>${homedir()}</string>
-    <!-- See bind-flow.ts.installSystemdService for rationale on these flags
-         (V8 lazy-GC + heap-limit OOM cascade observed on production daemons). -->
-    <key>NODE_OPTIONS</key>
-    <string>--expose-gc --max-old-space-size=8192</string>
-  </dict>
-  <key>RunAtLoad</key>
-  <true/>
-  <key>KeepAlive</key>
-  <true/>
-  <key>StandardOutPath</key>
-  <string>${logPath}</string>
-  <key>StandardErrorPath</key>
-  <string>${logPath}</string>
-</dict>
-</plist>`;
+  const plist = renderMacosLaunchAgentPlist({
+    label: service.launchAgentLabel,
+    programArguments,
+    logPath,
+    pathEnv: process.env.PATH ?? '/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin',
+    home: homedir(),
+    // See bind-flow.ts.installSystemdService for rationale on these flags (V8 lazy-GC + heap-limit OOM cascade on production daemons).
+    nodeOptions: `--expose-gc --max-old-space-size=8192 ${daemonFatalReportNodeOptions(service.stateHome, 'plain', reportExcludeEnvFlagUsable(launchProgram))}`,
+  });
 
   await mkdir(launchAgentsDir, { recursive: true });
-  await writeFile(PLIST_PATH, plist, 'utf8');
+  await writeFile(service.launchAgentPath, plist, 'utf8');
 
   // Migrate: unload and remove old cc.imcodes.daemon plist if present
   const { existsSync, unlinkSync } = await import('fs');
-  if (existsSync(OLD_PLIST_PATH)) {
-    try { execSync(`launchctl unload "${OLD_PLIST_PATH}" 2>/dev/null`, { stdio: 'ignore' }); } catch { /* ok */ }
-    try { unlinkSync(OLD_PLIST_PATH); } catch { /* ok */ }
+  if (!service.scoped && existsSync(service.legacyLaunchAgentPath)) {
+    try { execSync(`launchctl unload "${service.legacyLaunchAgentPath}" 2>/dev/null`, { stdio: 'ignore' }); } catch { /* ok */ }
+    try { unlinkSync(service.legacyLaunchAgentPath); } catch { /* ok */ }
     console.log('Removed old cc.imcodes.daemon.plist');
   }
 
   // Unload existing (ignore error), then load fresh
-  try { execSync(`launchctl unload "${PLIST_PATH}" 2>/dev/null`, { stdio: 'ignore' }); } catch { /* ok */ }
-  execSync(`launchctl load -w "${PLIST_PATH}"`);
-  console.log(`Launch agent loaded: ${PLIST_PATH}`);
+  try { execSync(`launchctl unload "${service.launchAgentPath}" 2>/dev/null`, { stdio: 'ignore' }); } catch { /* ok */ }
+  execSync(`launchctl load -w "${service.launchAgentPath}"`);
+  console.log(`Launch agent loaded: ${service.launchAgentPath}`);
 }
 
 async function installSystemdService(): Promise<void> {
-  const logPath = join(CREDS_DIR, 'daemon.log');
+  const service = resolvePosixDaemonServicePaths();
+  if (service.scoped) {
+    console.log('Scoped daemon: skipped systemd service installation to preserve default-service isolation.');
+    return;
+  }
+  const logPath = join(credentialsDir(), 'daemon.log');
   const serviceDir = join(homedir(), '.config', 'systemd', 'user');
-  const servicePath = join(serviceDir, 'imcodes.service');
+  const servicePath = service.systemdUnitPath;
 
   // Prefer the self-healing launcher when this install ships it. See
   // `src/util/launch-target.ts` for rationale.
   const target = resolveDaemonLaunchTarget();
 
   const unit = `[Unit]
-Description=IM.codes Daemon
+Description=IM.codes Daemon${service.scoped ? ` (${service.stateHome})` : ''}
 After=network.target
+${renderSystemdStartLimitBlock()}
 
 [Service]
 ExecStart=${renderSystemdExecStart(target)}
 Restart=always
 RestartSec=5
-KillMode=process
+KillMode=control-group
+${renderSystemdTerminalDiagnostics()}
+TimeoutStopSec=45s
+SendSIGKILL=yes
 Environment=PATH=${process.env.PATH ?? '/usr/local/bin:/usr/bin:/bin'}
 Environment=HOME=${homedir()}
+${service.scoped ? `Environment=IMCODES_HOME=${service.stateHome}
+Environment=IMCODES_DEFAULT_HOME=${dirname(service.defaultHome)}
+` : ''}
 # --expose-gc lets the daemon's startGcPoller proactively trigger major
 # GC, keeping RSS bounded near the live working set. Without this flag,
 # V8 lazy major GC lets old-gen garbage accumulate to many GB before
@@ -340,7 +376,7 @@ Environment=HOME=${homedir()}
 # default so transient working-set spikes (transformers tokenizer,
 # large timeline batches) cannot OOM during the GC poll interval.
 # Both can be overridden via a drop-in.
-Environment="NODE_OPTIONS=--expose-gc --max-old-space-size=8192"
+Environment="NODE_OPTIONS=--expose-gc --max-old-space-size=8192 ${daemonFatalReportNodeOptions(service.stateHome, 'systemd', reportExcludeEnvFlagUsable(target.program))}"
 # MALLOC_ARENA_MAX=2 caps glibc's per-thread malloc arenas. On multi-core
 # hosts glibc permits up to 8×cores arenas; native thread pools
 # (onnxruntime embedding inference, sharp/libvips image work) scatter
@@ -361,7 +397,18 @@ WantedBy=default.target
   await writeFile(servicePath, unit, 'utf8');
 
   execSync('systemctl --user daemon-reload', { stdio: 'inherit' });
-  execSync('systemctl --user enable --now imcodes', { stdio: 'inherit' });
+  execSync(`systemctl --user enable --now ${service.systemdUnitName}`, { stdio: 'inherit' });
+
+  // External recovery trigger. Installed as its own timer/oneshot pair so it can
+  // still act when imcodes.service itself is wedged falsely-active.
+  if (!service.scoped) {
+    const recovery = installRecoveryUnits(renderRecoveryExecStart(process.execPath, process.argv[1]));
+    if (recovery.serviceWritten || recovery.timerWritten) {
+      console.log('Installed daemon recovery timer (imcodes-recovery.timer).');
+    }
+  } else {
+    console.log('Scoped daemon: skipped the shared recovery timer to preserve default-service isolation.');
+  }
 
   const linger = enableSystemdUserLinger();
   if (linger.ok) {
@@ -375,7 +422,7 @@ WantedBy=default.target
 
 export async function loadCredentials(): Promise<ServerCredentials | null> {
   try {
-    const raw = await readFile(CREDS_PATH, 'utf8');
+    const raw = await readFile(credentialsPath(), 'utf8');
     return JSON.parse(raw) as ServerCredentials;
   } catch {
     return null;

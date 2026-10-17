@@ -233,4 +233,94 @@ describe('FloatingPanel maximize integration', () => {
     expect(panel.style.left).toBe(before.left);
     expect(panel.style.top).toBe(before.top);
   });
+
+  describe('double-clicking the window chrome toggles the same in-window maximize', () => {
+    it('toggles on a title-bar double-click and again on the next one (restore)', () => {
+      const onToggleMaximized = vi.fn();
+      const onFocus = vi.fn();
+      render(
+        <FloatingPanel
+          id="filebrowser" title="Files" onClose={() => {}} onFocus={onFocus}
+          enableMaximize isMaximized={false} onToggleMaximized={onToggleMaximized}
+        >
+          <div>content</div>
+        </FloatingPanel>,
+      );
+      const titlebar = document.querySelector('.floating-panel-titlebar') as HTMLElement;
+      fireEvent.dblClick(screen.getByTitle('Files'));
+      expect(onToggleMaximized).toHaveBeenCalledTimes(1);
+      expect(onFocus).toHaveBeenCalled();
+      fireEvent.dblClick(titlebar);
+      expect(onToggleMaximized).toHaveBeenCalledTimes(2);
+    });
+
+    it('does not toggle when the double-click lands on a title-bar button', () => {
+      const onToggleMaximized = vi.fn();
+      render(
+        <FloatingPanel
+          id="filebrowser" title="Files" onClose={() => {}} onPin={() => {}}
+          enableMaximize isMaximized={false} onToggleMaximized={onToggleMaximized}
+        >
+          <div>content</div>
+        </FloatingPanel>,
+      );
+      fireEvent.dblClick(screen.getByRole('button', { name: 'Minimize' }));
+      fireEvent.dblClick(screen.getByRole('button', { name: 'Close' }));
+      fireEvent.dblClick(screen.getByRole('button', { name: 'Maximize' }));
+      fireEvent.dblClick(screen.getByTitle('Pin to sidebar'));
+      expect(onToggleMaximized).not.toHaveBeenCalled();
+    });
+
+    it('does not toggle from the panel body, when maximize is not enabled, or without desktop capability', () => {
+      const onToggleMaximized = vi.fn();
+      const view = render(
+        <FloatingPanel id="a" title="A" onClose={() => {}} enableMaximize isMaximized={false} onToggleMaximized={onToggleMaximized}>
+          <div data-testid="body">content</div>
+        </FloatingPanel>,
+      );
+      fireEvent.dblClick(screen.getByTestId('body'));
+      expect(onToggleMaximized).not.toHaveBeenCalled();
+      view.unmount();
+
+      render(
+        <FloatingPanel id="b" title="B" onClose={() => {}} isMaximized={false} onToggleMaximized={onToggleMaximized}>
+          <div>content</div>
+        </FloatingPanel>,
+      );
+      fireEvent.dblClick(screen.getByTitle('B'));
+      cleanup();
+
+      render(
+        <FloatingPanel id="c" title="C" onClose={() => {}} enableMaximize desktopLayoutCapable={false} isMaximized={false} onToggleMaximized={onToggleMaximized}>
+          <div>content</div>
+        </FloatingPanel>,
+      );
+      fireEvent.dblClick(screen.getByTitle('C'));
+      expect(onToggleMaximized).not.toHaveBeenCalled();
+    });
+
+    it('supports a hidden title bar through its declared drag handle (remote desktop window)', () => {
+      const onToggleMaximized = vi.fn();
+      render(
+        <FloatingPanel
+          id="remote-desktop-srv" title="Remote" onClose={() => {}} hideTitleBar
+          dragHandleSelector=".remote-desktop-toolbar"
+          enableMaximize isMaximized={false} onToggleMaximized={onToggleMaximized}
+        >
+          <div class="remote-desktop-toolbar">
+            <span data-testid="toolbar-status">connected</span>
+            <select data-testid="toolbar-select"><option>a</option></select>
+            <button type="button">Files</button>
+          </div>
+          <div data-testid="canvas">frame</div>
+        </FloatingPanel>,
+      );
+      fireEvent.dblClick(screen.getByTestId('canvas'));
+      fireEvent.dblClick(screen.getByTestId('toolbar-select'));
+      fireEvent.dblClick(screen.getByRole('button', { name: 'Files' }));
+      expect(onToggleMaximized).not.toHaveBeenCalled();
+      fireEvent.dblClick(screen.getByTestId('toolbar-status'));
+      expect(onToggleMaximized).toHaveBeenCalledTimes(1);
+    });
+  });
 });

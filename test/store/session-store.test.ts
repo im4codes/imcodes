@@ -3,9 +3,18 @@ import { mkdtempSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { readFile } from 'node:fs/promises';
+import { persistedSessionBlobs, persistedSessions } from '../helpers/session-store-db.js';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { vi } from 'vitest';
+import { markSessionLaunchIdentity } from '../../shared/session-resource-lifecycle.js';
+import { identityContentHash, identityPromptHash } from '../../src/util/identity-prompt-hash.js';
+import {
+  SESSION_IDENTITY_PROJECT_MAX_CHARS,
+  SESSION_IDENTITY_SESSION_MAX_CHARS,
+  SESSION_IDENTITY_USER_MAX_CHARS,
+  renderSessionIdentityProfiles,
+} from '../../shared/session-identity.js';
 
 // This suite exercises the real persistence module. `vi.unmock` is hoisted by
 // Vitest, so it clears any worker-inherited session-store mock BEFORE module
@@ -20,36 +29,108 @@ const execFileAsync = promisify(execFile);
 async function loadStoreInFreshProcess(sessionName: string): Promise<{
   sessionInstanceId?: string;
   runtimeEpoch?: string;
+  appliedIdentityHash?: string;
+  provisionedIdentityHash?: string;
 }> {
   const resultMarker = '__IMCODES_SESSION_STORE_RESULT__';
   const moduleUrl = new URL('../../src/store/session-store.ts', import.meta.url).href;
   const script = `
+    const { readFileSync } = await import('node:fs');
+    const { join } = await import('node:path');
+    const { homedir } = await import('node:os');
+    const childHome = homedir();
+    const childStorePath = join(childHome, '.imcodes', 'sessions.sqlite');
+    const readStoreSnapshot = () => {
+      try {
+        return { bytes: readFileSync(childStorePath).length };
+      } catch (error) {
+        return { error: { code: error?.code, message: error?.message } };
+      }
+    };
+    const beforeLoad = readStoreSnapshot();
     const store = await import(process.env.IMCODES_TEST_SESSION_STORE_MODULE_URL);
     await store.loadStore();
     await store.flushStore();
-    console.log(${JSON.stringify(resultMarker)} + JSON.stringify(store.getSession(${JSON.stringify(sessionName)})));
+    console.log(${JSON.stringify(resultMarker)} + JSON.stringify({
+      session: store.getSession(${JSON.stringify(sessionName)}) ?? null,
+      diagnostics: {
+        envHome: process.env.HOME,
+        homedir: childHome,
+        storePath: childStorePath,
+        beforeLoad,
+        afterFlush: readStoreSnapshot(),
+      },
+    }));
   `;
-  const { stdout } = await execFileAsync(process.execPath, [
-    '--import',
-    'tsx',
-    '--input-type=module',
-    '--eval',
-    script,
-  ], {
-    cwd: process.cwd(),
-    env: {
-      ...process.env,
-      HOME: tempDir,
-      IMCODES_TEST_SESSION_STORE_MODULE_URL: moduleUrl,
-    },
-  });
+  let stdout = '';
+  let stderr = '';
+  let exit: string | number = 0;
+  try {
+    ({ stdout, stderr } = await execFileAsync(process.execPath, [
+      '--import',
+      'tsx',
+      '--input-type=module',
+      '--eval',
+      script,
+    ], {
+      cwd: process.cwd(),
+      // The child prints the whole restored session record. A session carrying a
+      // filled three-scope identity is legitimately larger than Node's 1 MiB
+      // default, which would otherwise surface as a harness failure rather than
+      // a persistence result.
+      maxBuffer: 64 * 1024 * 1024,
+      env: {
+        ...process.env,
+        HOME: tempDir,
+        IMCODES_HOME: join(tempDir, '.imcodes'),
+        IMCODES_TEST_SESSION_STORE_MODULE_URL: moduleUrl,
+      },
+    }));
+  } catch (error) {
+    const childError = error as {
+      code?: string | number;
+      signal?: string;
+      stdout?: string;
+      stderr?: string;
+    };
+    stdout = childError.stdout ?? stdout;
+    stderr = childError.stderr ?? stderr;
+    exit = childError.code ?? childError.signal ?? 'unknown';
+    const actualStore = JSON.stringify(persistedSessions(tempDir));
+    throw new Error(
+      `fresh session-store process failed; exit=${String(exit)}; stdout=${JSON.stringify(stdout)}; `
+      + `stderr=${JSON.stringify(stderr)}; persisted sessions=${JSON.stringify(actualStore)}`,
+    );
+  }
   const resultLine = stdout.split(/\r?\n/).find((line) => line.startsWith(resultMarker));
   if (!resultLine) {
-    throw new Error(`fresh session-store process did not emit its result: ${stdout}`);
+    const actualStore = JSON.stringify(persistedSessions(tempDir));
+    throw new Error(
+      `fresh session-store process did not emit its result; exit=${String(exit)}; stdout=${JSON.stringify(stdout)}; `
+      + `stderr=${JSON.stringify(stderr)}; persisted sessions=${JSON.stringify(actualStore)}`,
+    );
   }
-  return JSON.parse(resultLine.slice(resultMarker.length)) as {
+  const payload = JSON.parse(resultLine.slice(resultMarker.length)) as {
+    session: {
+      sessionInstanceId?: string;
+      runtimeEpoch?: string;
+    } | null;
+    diagnostics: object;
+  };
+  if (!payload.session) {
+    const actualStore = JSON.stringify(persistedSessions(tempDir));
+    throw new Error(
+      `fresh session-store process lost ${JSON.stringify(sessionName)}; exit=${String(exit)}; `
+      + `stdout=${JSON.stringify(stdout)}; stderr=${JSON.stringify(stderr)}; `
+      + `child=${JSON.stringify(payload.diagnostics)}; `
+      + `persisted sessions=${JSON.stringify(actualStore)}`,
+    );
+  }
+  return payload.session as {
     sessionInstanceId?: string;
     runtimeEpoch?: string;
+    appliedIdentityHash?: string;
+    provisionedIdentityHash?: string;
   };
 }
 
@@ -72,6 +153,7 @@ async function importSessionStore() {
 beforeEach(() => {
   tempDir = mkdtempSync(join(tmpdir(), 'deck-test-'));
   vi.stubEnv('HOME', tempDir);
+  vi.stubEnv('IMCODES_HOME', join(tempDir, '.imcodes')); // the state directory wins over HOME: move both
 });
 
 afterEach(() => {
@@ -173,7 +255,7 @@ describe('session-store', () => {
   });
 
   describe('loadStore reconcile (runtimeType backfill + error recovery)', () => {
-    async function writeSessionsFixture(content: object): Promise<void> {
+    async function writeSessionsFixture(content: object, root = tempDir): Promise<void> {
       // Full-suite workers can be reused after files that register partial
       // `node:fs/promises` mocks. A normal dynamic import can inherit that
       // worker-local mock, turning this fixture write into a no-op while the
@@ -181,10 +263,111 @@ describe('session-store', () => {
       // Vitest's mock registry so the parent and child always observe the same
       // on-disk sessions.json.
       const { mkdir, writeFile } = await vi.importActual<typeof import('node:fs/promises')>('node:fs/promises');
-      const dir = join(tempDir, '.imcodes');
+      const dir = join(root, '.imcodes');
       await mkdir(dir, { recursive: true });
       await writeFile(join(dir, 'sessions.json'), JSON.stringify(content), 'utf8');
     }
+
+    it('purges the leaked existing-project fixture before restoring sessions', async () => {
+      await writeSessionsFixture({
+        sessions: {
+          deck_existing_brain: {
+            name: 'deck_existing_brain', projectName: 'existing', projectDir: '/tmp/existing-project',
+            role: 'brain', agentType: 'claude-code', state: 'idle', createdAt: 1, updatedAt: 1,
+          },
+          deck_real_brain: {
+            name: 'deck_real_brain', projectName: 'real', projectDir: '/Users/me/project',
+            role: 'brain', agentType: 'claude-code', state: 'idle', createdAt: 1, updatedAt: 1,
+          },
+        },
+      });
+
+      const store = await importSessionStore();
+      await store.loadStore();
+      expect(store.getSession('deck_existing_brain')).toBeUndefined();
+      expect(store.getSession('deck_real_brain')).toBeDefined();
+      await store.flushStore();
+      const persisted = persistedSessions(tempDir);
+      expect(persisted.deck_existing_brain).toBeUndefined();
+      expect(persisted.deck_real_brain).toBeDefined();
+    });
+
+    it('never persists an identity prompt: 60 sessions that carry a 80 KB one store none of it', async () => {
+      const prompt = `shared identity\n${'provider-safe instructions\n'.repeat(3_000)}`;
+      const store = await importSessionStore();
+      for (let index = 0; index < 60; index += 1) {
+        store.upsertSession({
+          name: `deck_dedup_${index}_brain`,
+          projectName: `dedup_${index}`,
+          role: 'brain',
+          agentType: 'codex-sdk',
+          projectDir: `/tmp/dedup-${index}`,
+          state: 'idle',
+          restarts: 0,
+          restartTimestamps: [],
+          createdAt: index + 1,
+          updatedAt: index + 1,
+          identityPrompt: prompt,
+        } as Parameters<typeof store.upsertSession>[0]);
+      }
+
+      await store.flushStore();
+      const persisted = persistedSessions(tempDir);
+      expect(Object.keys(persisted)).toHaveLength(60);
+      expect(Object.values(persisted).every((entry) => !('identityPrompt' in entry) && !('identityPromptRef' in entry))).toBe(true);
+      expect(Object.values(persisted).every((entry) => JSON.stringify(entry).length < 1_000)).toBe(true);
+      expect(persistedSessionBlobs(tempDir).size).toBe(0);
+
+      vi.resetModules();
+      const reloaded = await importSessionStore();
+      await reloaded.loadStore({ probe: false });
+      expect(reloaded.getSession('deck_dedup_37_brain')).toBeDefined();
+      expect(reloaded.getSession('deck_dedup_37_brain')).not.toHaveProperty('identityPrompt');
+    });
+
+    it('migrates legacy inline identity prompts from sessions.json: the text is dropped, a digest replaces it', async () => {
+      const prompt = 'legacy identity\nwith exact content';
+      await writeSessionsFixture({
+        sessions: {
+          deck_legacy_prompt_brain: {
+            name: 'deck_legacy_prompt_brain', projectName: 'legacy-prompt', role: 'brain',
+            agentType: 'codex-sdk', projectDir: '/tmp/legacy-prompt', identityPrompt: prompt,
+            state: 'idle', restarts: 0, restartTimestamps: [], createdAt: 1, updatedAt: 1,
+          },
+        },
+      });
+
+      const store = await importSessionStore();
+      await store.loadStore();
+      expect(store.getSession('deck_legacy_prompt_brain')).not.toHaveProperty('identityPrompt');
+      expect(store.getSession('deck_legacy_prompt_brain')?.appliedIdentityHash).toBe(identityPromptHash(prompt));
+      await store.flushStore();
+
+      const row = persistedSessions(tempDir).deck_legacy_prompt_brain!;
+      expect(row).toMatchObject({ appliedIdentityHash: identityPromptHash(prompt) });
+      expect(row).not.toHaveProperty('identityPrompt');
+      expect(row).not.toHaveProperty('identityPromptRef');
+    });
+
+    it('fails closed when a compact snapshot contains a missing identity prompt reference', async () => {
+      await writeSessionsFixture({
+        version: 2,
+        identityPrompts: {},
+        sessions: {
+          deck_missing_prompt_brain: {
+            name: 'deck_missing_prompt_brain', projectName: 'missing-prompt', role: 'brain',
+            agentType: 'codex-sdk', projectDir: '/tmp/missing-prompt', identityPromptRef: 'p404',
+            state: 'idle', restarts: 0, restartTimestamps: [], createdAt: 1, updatedAt: 1,
+          },
+        },
+      });
+
+      const store = await importSessionStore();
+      await store.loadStore({ probe: false });
+      expect(store.getSession('deck_missing_prompt_brain')).toBeDefined();
+      expect(store.getSession('deck_missing_prompt_brain')?.identityPrompt).toBeUndefined();
+      expect(store.getSession('deck_missing_prompt_brain')).not.toHaveProperty('identityPromptRef');
+    });
 
     it('writes fixtures through the real filesystem when a worker-local fs mock is registered', async () => {
       vi.doMock('node:fs/promises', () => ({
@@ -198,6 +381,49 @@ describe('session-store', () => {
       } finally {
         vi.doUnmock('node:fs/promises');
       }
+    });
+
+    it('a legacy filled three-scope multibyte identity is reduced to its digest in a fresh process (the text itself comes from the identity store: session-identity-resolver.test.ts)', async () => {
+      const profile = (scope: 'user' | 'project' | 'session', content: string) => ({
+        scope, scopeKey: scope === 'user' ? '' : `${scope}-key`, content, contentHash: scope, revision: 1, updatedAt: 1, source: 'web' as const,
+      });
+      const identityPrompt = renderSessionIdentityProfiles([
+        profile('user', `${'中'.repeat(SESSION_IDENTITY_USER_MAX_CHARS - 2)}\n!`),
+        profile('project', `${'😀'.repeat(SESSION_IDENTITY_PROJECT_MAX_CHARS - 2)}\n!`),
+        profile('session', `${'é'.repeat(SESSION_IDENTITY_SESSION_MAX_CHARS - 2)}\n!`),
+      ])!;
+      await writeSessionsFixture({
+        sessions: {
+          deck_identitycap_brain: {
+            name: 'deck_identitycap_brain', projectName: 'identitycap', role: 'brain',
+            agentType: 'codex-sdk', projectDir: '/tmp/identitycap',
+            state: 'idle', restarts: 0, restartTimestamps: [], createdAt: 1, updatedAt: 1,
+            identityPrompt,
+          },
+        },
+      });
+
+      const restored = await loadStoreInFreshProcess('deck_identitycap_brain');
+
+      expect(restored).not.toHaveProperty('identityPrompt');
+      expect(restored.appliedIdentityHash).toBe(identityPromptHash(identityPrompt));
+      // An Agent provisioned with a session identity is still found by it: the hash of the session section is stamped.
+      expect(restored.provisionedIdentityHash).toBe(identityContentHash(`${'é'.repeat(SESSION_IDENTITY_SESSION_MAX_CHARS - 2)}\n!`));
+    });
+
+    it('reports child and disk evidence when a fresh process cannot find the requested session', async () => {
+      await writeSessionsFixture({
+        sessions: {
+          deck_present_brain: {
+            name: 'deck_present_brain', projectName: 'present', role: 'brain',
+            agentType: 'codex-sdk', projectDir: '/tmp/present',
+            state: 'idle', restarts: 0, restartTimestamps: [], createdAt: 1, updatedAt: 1,
+          },
+        },
+      });
+      await expect(loadStoreInFreshProcess('deck_missing_brain')).rejects.toThrow(
+        /lost "deck_missing_brain"; exit=0; stdout=.*stderr=.*child=.*persisted sessions=.*deck_present_brain/,
+      );
     });
 
     it('backfills runtimeType=transport for SDK sessions persisted before the field existed', async () => {
@@ -277,6 +503,25 @@ describe('session-store', () => {
       expect(s?.restartTimestamps).toEqual([]);
     });
 
+    it('preserves a cwd-missing error across daemon reloads so restore does not retry it', async () => {
+      await writeSessionsFixture({
+        sessions: {
+          deck_missing_cwd_brain: {
+            name: 'deck_missing_cwd_brain', projectName: 'missing', role: 'brain',
+            agentType: 'shell', projectDir: 'C:\\work\\gone', state: 'error',
+            error: 'Working directory not found: C:\\work\\gone', restarts: 1,
+            restartTimestamps: [Date.now() - 1_000], createdAt: 1, updatedAt: 1,
+          },
+        },
+      });
+      const { loadStore, getSession } = await importSessionStore();
+      await loadStore();
+      expect(getSession('deck_missing_cwd_brain')).toEqual(expect.objectContaining({
+        state: 'error',
+        error: 'Working directory not found: C:\\work\\gone',
+      }));
+    });
+
     it('does not touch sessions in healthy states (idle / running / stopped)', async () => {
       await writeSessionsFixture({
         sessions: {
@@ -292,6 +537,68 @@ describe('session-store', () => {
       expect(getSession('b')?.restarts).toBe(1);
       expect(getSession('c')?.state).toBe('stopped');
       expect(getSession('c')?.restarts).toBe(2);
+    });
+
+    it('keeps a delayed startup probe write bound to the store path it loaded', async () => {
+      const firstHome = tempDir;
+      const secondHome = mkdtempSync(join(tmpdir(), 'deck-test-next-'));
+      let releaseDetection!: (state: 'idle' | 'running') => void;
+      const detection = new Promise<'idle' | 'running'>((resolve) => {
+        releaseDetection = resolve;
+      });
+      let observeEmit!: () => void;
+      const emitted = new Promise<void>((resolve) => {
+        observeEmit = resolve;
+      });
+      vi.doMock('../../src/agent/detect.js', () => ({
+        detectStatusAsync: vi.fn(() => detection),
+      }));
+      vi.doMock('../../src/store/session-state-probe-events.js', () => ({
+        emitSessionStateProbeCorrection: vi.fn(() => observeEmit()),
+      }));
+      vi.doMock('../../src/daemon/timeline-emitter.js', () => {
+        throw new Error('session-store startup probing must not load timeline-emitter');
+      });
+      try {
+        await writeSessionsFixture({
+          sessions: {
+            deck_probe_brain: {
+              name: 'deck_probe_brain', projectName: 'probe', role: 'brain',
+              agentType: 'claude-code', projectDir: '/tmp/probe',
+              state: 'running', restarts: 0, restartTimestamps: [], createdAt: 1, updatedAt: 1,
+            },
+          },
+        });
+        const store = await importSessionStore();
+        await store.loadStore();
+
+        vi.stubEnv('HOME', secondHome);
+        vi.stubEnv('IMCODES_HOME', join(secondHome, '.imcodes'));
+        await writeSessionsFixture({
+          sessions: {
+            deck_next_brain: {
+              name: 'deck_next_brain', projectName: 'next', role: 'brain',
+              agentType: 'claude-code', projectDir: '/tmp/next',
+              state: 'idle', restarts: 0, restartTimestamps: [], createdAt: 2, updatedAt: 2,
+            },
+          },
+        }, secondHome);
+
+        releaseDetection('idle');
+        await emitted;
+        await store.flushStore();
+
+        // The second home only ever got its fixture (never migrated: nothing loaded it).
+        expect(Object.keys(persistedSessions(secondHome))).toEqual([]);
+        expect(persistedSessions(firstHome).deck_probe_brain?.state).toBe('idle');
+      } finally {
+        vi.doUnmock('../../src/agent/detect.js');
+        vi.doUnmock('../../src/store/session-state-probe-events.js');
+        vi.doUnmock('../../src/daemon/timeline-emitter.js');
+        vi.stubEnv('HOME', firstHome);
+        vi.stubEnv('IMCODES_HOME', join(firstHome, '.imcodes'));
+        rmSync(secondHome, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 });
+      }
     });
 
     it('migrates missing identities once and preserves them across daemon reload', async () => {
@@ -337,6 +644,23 @@ describe('session-store', () => {
     expect(getSession(base.name)?.sessionInstanceId).not.toBe(firstId);
   });
 
+  it('preserves an explicitly minted resource owner only on the trusted launch path', async () => {
+    const { upsertSession, removeSession, getSession } = await importSessionStore();
+    const base = {
+      name: 'deck_launch_identity_brain', projectName: 'identity', projectDir: '/tmp/identity',
+      role: 'brain' as const, agentType: 'codex-sdk', state: 'idle' as const,
+      restarts: 0, restartTimestamps: [], createdAt: 1, updatedAt: 1,
+      sessionInstanceId: 'launch-instance', runtimeEpoch: 'launch-epoch',
+    };
+    upsertSession(markSessionLaunchIdentity({ ...base }));
+    expect(getSession(base.name)).toMatchObject({
+      sessionInstanceId: 'launch-instance', runtimeEpoch: 'launch-epoch',
+    });
+    removeSession(base.name);
+    upsertSession({ ...base });
+    expect(getSession(base.name)?.sessionInstanceId).not.toBe('launch-instance');
+  });
+
   it('rotates runtimeEpoch only when runtime authority is replaced', async () => {
     const { upsertSession, getSession } = await importSessionStore();
     const base = {
@@ -359,7 +683,7 @@ describe('session-store', () => {
     expect(getSession(base.name)?.runtimeEpoch).toBe(replacedEpoch);
   });
 
-  it('does not persist known leaked e2e sessions to sessions.json', async () => {
+  it('does not persist known leaked e2e sessions', async () => {
     const { upsertSession, flushStore } = await importSessionStore();
     upsertSession({
       name: 'deck_bootmainabc123_brain',
@@ -387,8 +711,7 @@ describe('session-store', () => {
     });
 
     await flushStore();
-    const raw = await readFile(join(tempDir, '.imcodes', 'sessions.json'), 'utf8');
-    expect(raw).not.toContain('deck_bootmainabc123_brain');
-    expect(raw).toContain('deck_cd_brain');
+    const persisted = persistedSessions(tempDir);
+    expect(Object.keys(persisted)).toEqual(['deck_cd_brain']);
   });
 });

@@ -4,9 +4,11 @@ import {
   getActiveP2pRunsBlockingDaemonUpgrade,
   getActiveSessionsBlockingDaemonUpgrade,
   getActiveTransportSessionsBlockingDaemonUpgrade,
+  getTransportSessionPendingWorkBlockReason,
   getTransportSessionUpgradeBlockReason,
 } from '../../src/daemon/command-handler.js';
 import * as sessionManager from '../../src/agent/session-manager.js';
+import * as resendQueue from '../../src/daemon/transport-resend-queue.js';
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -377,5 +379,55 @@ describe('getTransportSessionUpgradeBlockReason — phantom-turn staleness', () 
     );
 
     expect(blocked.map((r) => r.name)).toEqual(['deck_live']);
+  });
+});
+
+
+// ── Work that waits on disk for a runtime that is not rebuilt yet ─────────────
+//
+// After a restart the durable queue is rehydrated when the runtime is rebuilt, minutes after the first upgrade
+// decision. A session with queued/resend messages and NO runtime is work about to resume, so it blocks; a session
+// that has a runtime is judged by that runtime (incl. its phantom-turn guard), and one that cannot drain
+// (stopped/errored) must never pin the version.
+describe('getTransportSessionPendingWorkBlockReason / durable queue in the busy gate', () => {
+  const durable = (entries: Record<string, number>) => new Map(Object.entries(entries));
+
+  it('blocks a runtime-less session that has durable queued messages', () => {
+    vi.spyOn(sessionManager, 'getTransportRuntime').mockReturnValue(undefined);
+    expect(getTransportSessionPendingWorkBlockReason({ name: 'deck_a_brain', state: 'idle' }, durable({ deck_a_brain: 3 })))
+      .toEqual({ status: 'no_runtime', sending: false, pendingCount: 3, blockReason: 'durable_queue' });
+  });
+
+  it('blocks a runtime-less session that has messages waiting in the resend queue', () => {
+    vi.spyOn(sessionManager, 'getTransportRuntime').mockReturnValue(undefined);
+    vi.spyOn(resendQueue, 'getResendCount').mockReturnValue(2);
+    expect(getTransportSessionPendingWorkBlockReason({ name: 'deck_a_brain', state: 'idle' }, durable({})))
+      .toEqual({ status: 'no_runtime', sending: false, pendingCount: 2, blockReason: 'resend_queue' });
+  });
+
+  it('does not block when nothing is queued', () => {
+    vi.spyOn(sessionManager, 'getTransportRuntime').mockReturnValue(undefined);
+    vi.spyOn(resendQueue, 'getResendCount').mockReturnValue(0);
+    expect(getTransportSessionPendingWorkBlockReason({ name: 'deck_a_brain', state: 'idle' }, durable({ deck_other: 5 }))).toBeNull();
+  });
+
+  it('leaves a session WITH a runtime to that runtime (its own pending count and phantom guard decide)', () => {
+    vi.spyOn(sessionManager, 'getTransportRuntime').mockReturnValue({ getStatus: () => 'idle', sending: false, pendingCount: 0 } as any);
+    expect(getTransportSessionPendingWorkBlockReason({ name: 'deck_a_brain', state: 'idle' }, durable({ deck_a_brain: 3 }))).toBeNull();
+  });
+
+  it.each(['stopped', 'error'])('a %s session cannot drain its queue and must not pin the version', (state) => {
+    vi.spyOn(sessionManager, 'getTransportRuntime').mockReturnValue(undefined);
+    expect(getTransportSessionPendingWorkBlockReason({ name: 'deck_a_brain', state }, durable({ deck_a_brain: 3 }))).toBeNull();
+  });
+
+  it('is part of getActiveSessionsBlockingDaemonUpgrade for transport sessions only, and names the session', () => {
+    vi.spyOn(sessionManager, 'getTransportRuntime').mockReturnValue(undefined);
+    vi.spyOn(resendQueue, 'getResendCount').mockReturnValue(0);
+    const blocked = getActiveSessionsBlockingDaemonUpgrade([
+      { name: 'deck_a_brain', runtimeType: 'transport', state: 'idle' },
+      { name: 'deck_a_w1', runtimeType: 'process', state: 'idle' },
+    ] as any, { durableQueuePending: durable({ deck_a_brain: 1, deck_a_w1: 4 }) });
+    expect(blocked.map((reason) => [reason.name, reason.transport?.blockReason])).toEqual([['deck_a_brain', 'durable_queue']]);
   });
 });

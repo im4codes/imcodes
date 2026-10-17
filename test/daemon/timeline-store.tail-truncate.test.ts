@@ -6,6 +6,7 @@ import { tmpdir } from 'os';
 describe('timeline-store truncate', () => {
   const originalHome = process.env.HOME;
   const originalUserProfile = process.env.USERPROFILE;
+  const originalImcodesHome = process.env.IMCODES_HOME;
   let tempHome: string | null = null;
   let importedProjection: typeof import('../../src/daemon/timeline-projection.js').timelineProjection | null = null;
 
@@ -20,6 +21,8 @@ describe('timeline-store truncate', () => {
     else process.env.HOME = originalHome;
     if (originalUserProfile === undefined) delete process.env.USERPROFILE;
     else process.env.USERPROFILE = originalUserProfile;
+    if (originalImcodesHome === undefined) delete process.env.IMCODES_HOME;
+    else process.env.IMCODES_HOME = originalImcodesHome;
     if (tempHome) rmSync(tempHome, { recursive: true, force: true });
     tempHome = null;
   });
@@ -28,6 +31,7 @@ describe('timeline-store truncate', () => {
     tempHome = mkdtempSync(join(tmpdir(), 'imcodes-timeline-store-'));
     process.env.HOME = tempHome;
     process.env.USERPROFILE = tempHome;
+    process.env.IMCODES_HOME = join(tempHome, '.imcodes');
 
     vi.doMock('fs', async () => {
       const actual = await vi.importActual<typeof import('fs')>('fs');
@@ -79,6 +83,7 @@ describe('timeline-store truncate', () => {
     tempHome = mkdtempSync(join(tmpdir(), 'imcodes-timeline-store-'));
     process.env.HOME = tempHome;
     process.env.USERPROFILE = tempHome;
+    process.env.IMCODES_HOME = join(tempHome, '.imcodes');
 
     const [{ timelineStore }, { timelineProjection }] = await Promise.all([
       import('../../src/daemon/timeline-store.js'),

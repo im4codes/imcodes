@@ -1,0 +1,18 @@
+{
+  "schemaVersion": 1,
+  "note": "The fixed WebView2 SDK the panel window host is built with. The build downloads it (build time only, never at run time), refuses any file whose sha256 differs, and requires every listed file to exist after extraction. Changing the pin means re-hashing the new file from two independent downloads.",
+  "package": {
+    "name": "Microsoft.Web.WebView2",
+    "version": "1.0.3967.48",
+    "url": "https://api.nuget.org/v3-flatcontainer/microsoft.web.webview2/1.0.3967.48/microsoft.web.webview2.1.0.3967.48.nupkg",
+    "sha256": "c66357ac7f324ec9bcafe5241706a023b4122d8c22300c31de4b0eb220db689e",
+    "files": [
+      "build/native/include/WebView2.h",
+      "build/native/include/WebView2EnvironmentOptions.h",
+      "build/native/x64/WebView2LoaderStatic.lib",
+      "build/native/arm64/WebView2LoaderStatic.lib",
+      "LICENSE.txt",
+      "NOTICE.txt"
+    ]
+  }
+}

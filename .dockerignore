@@ -16,3 +16,4 @@ tmp
 *.sqlite
 *.sqlite-shm
 *.sqlite-wal
+**/._*

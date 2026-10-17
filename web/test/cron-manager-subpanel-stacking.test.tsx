@@ -64,4 +64,52 @@ describe('cron nested panels join the owning window band', () => {
     form.onFocus?.();
     expect(onWindowFocus).toHaveBeenCalled();
   });
+
+  it.each([
+    ['desktop', 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)'],
+    ['mobile', 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X)'],
+  ])('portals a pinned cron edit form outside the clipping sidebar panel on %s', async (_mode, userAgent) => {
+    Object.defineProperty(navigator, 'userAgent', { value: userAgent, configurable: true });
+    apiFetch.mockResolvedValueOnce({
+      jobs: [{
+        id: 'pinned-job',
+        server_id: 'srv-current',
+        name: 'Pinned reminder',
+        cron_expr: '0 9 * * *',
+        project_name: 'cd',
+        target_role: 'brain',
+        target_session_name: null,
+        action: JSON.stringify({ type: 'command', command: 'echo hello' }),
+        status: 'active',
+        last_run_at: null,
+        next_run_at: null,
+        expires_at: null,
+        created_at: Date.now(),
+      }],
+    });
+
+    const { container } = render(
+      <div class="sidebar-pinned-panel">
+        <div class="sidebar-pinned-content">
+          <CronManager
+            serverId="srv-current"
+            projectName="cd"
+            sessions={sessions}
+            activeSession="deck_cd_brain"
+            portalSubPanels
+            onBack={vi.fn()}
+          />
+        </div>
+      </div>,
+    );
+
+    fireEvent.click(await screen.findByText('✎'));
+    const form = await screen.findByTestId('panel-cron-form');
+
+    expect(container.querySelector('.sidebar-pinned-panel')).toBeTruthy();
+    expect(form.closest('.sidebar-pinned-panel')).toBeNull();
+    expect(document.body.contains(form)).toBe(true);
+    expect(screen.getByDisplayValue('Pinned reminder')).toBeTruthy();
+    expect(screen.getByDisplayValue('echo hello')).toBeTruthy();
+  });
 });
