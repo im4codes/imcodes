@@ -220,7 +220,7 @@ describe('ImageLightbox', () => {
     });
   });
 
-  it('keeps the native desktop image context menu', () => {
+  it('shows explicit copy and save actions from the desktop image context menu', async () => {
     Object.defineProperty(navigator, 'maxTouchPoints', {
       configurable: true,
       value: 0,
@@ -233,6 +233,18 @@ describe('ImageLightbox', () => {
       configurable: true,
       value: () => ({ matches: false }),
     });
+    const clipboardWrite = vi.fn().mockResolvedValue(undefined);
+    class TestClipboardItem {
+      constructor(public readonly items: Record<string, Blob>) {}
+    }
+    (globalThis as typeof globalThis & { ClipboardItem?: typeof TestClipboardItem }).ClipboardItem = TestClipboardItem;
+    Object.defineProperty(navigator, 'clipboard', {
+      configurable: true,
+      value: { write: clipboardWrite },
+    });
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue({
+      blob: () => Promise.resolve(new Blob(['image'], { type: 'image/png' })),
+    } as Response);
     const { container } = render(
       <ImageLightbox
         src="data:image/png;base64,aW1n"
@@ -244,7 +256,12 @@ describe('ImageLightbox', () => {
     const image = container.querySelector('.fb-lightbox img') as HTMLImageElement;
     fireEvent.contextMenu(image);
 
-    expect(container.querySelector('.fb-lightbox-actions')).toBeNull();
+    const actions = container.querySelector('.fb-lightbox-actions');
+    expect(actions).not.toBeNull();
+    const copyButton = container.querySelectorAll('.fb-lightbox-action')[1] as HTMLButtonElement;
+    fireEvent.click(copyButton);
+    await waitFor(() => expect(clipboardWrite).toHaveBeenCalledTimes(1));
+    expect(copyButton.textContent).toBe('image_copied');
   });
 
   it('reveals image actions from the mobile image context menu', () => {
@@ -261,6 +278,39 @@ describe('ImageLightbox', () => {
     fireEvent.contextMenu(image);
 
     expect(container.querySelector('.fb-lightbox-actions')).not.toBeNull();
+  });
+
+  it('starts the mobile save action from a touch long press even when touch capabilities are not advertised', async () => {
+    vi.useFakeTimers();
+    Object.defineProperty(navigator, 'maxTouchPoints', {
+      configurable: true,
+      value: 0,
+    });
+    Object.defineProperty(window, 'innerWidth', {
+      configurable: true,
+      value: 390,
+    });
+    Object.defineProperty(window, 'matchMedia', {
+      configurable: true,
+      value: () => ({ matches: false }),
+    });
+    const onDownload = vi.fn().mockResolvedValue(undefined);
+    const { container } = render(
+      <ImageLightbox
+        src="data:image/png;base64,aW1n"
+        alt="result.png"
+        onDownload={onDownload}
+        onClose={vi.fn()}
+      />,
+    );
+    const image = container.querySelector('.fb-lightbox img') as HTMLImageElement;
+    fireEvent.touchStart(image, { touches: [{ clientX: 100, clientY: 100 }] });
+    act(() => vi.advanceTimersByTime(540));
+    const saveButton = container.querySelector('.fb-lightbox-action') as HTMLButtonElement;
+    expect(saveButton).not.toBeNull();
+    vi.useRealTimers();
+    fireEvent.click(saveButton);
+    await waitFor(() => expect(onDownload).toHaveBeenCalledTimes(1));
   });
 
   describe('zoom and pan (tsk_v0v)', () => {
