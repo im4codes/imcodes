@@ -56,6 +56,7 @@ vi.mock('../../src/components/FilePreviewPane.js', () => ({
 vi.mock('../../src/direct-file-transfer.js', () => directFileTransferMocks);
 
 import { FileBrowser, __resetFileBrowserSharedChangesForTests, mergePreviewState, getParentDir } from '../../src/components/FileBrowser.js';
+import { resolvePreviewPath } from '../../src/components/ChatView.js';
 import type { WsClient, ServerMessage } from '../../src/ws-client.js';
 import { FS_READ_ERROR_CODES } from '../../../shared/fs-read-error-codes.js';
 import { FILE_TRANSFER_DIRECTORY_LIST_ERROR, FILE_TRANSFER_DIRECTORY_PATH } from '../../../shared/transport/file-transfer.js';
@@ -2752,6 +2753,49 @@ describe('FileBrowser', () => {
       path: '/home/user/bar.ts',
       preview: { status: 'ok', path: '/home/user/bar.ts', content: 'new bar', diff: '+new bar' },
     });
+  });
+
+  it('does not issue a second read for equivalent hidden chat path aliases', async () => {
+    const { ws, sendMsg } = makeWsFactory();
+    const aliasPath = resolvePreviewPath('./.hidden/../.config/settings.json', '/home/user');
+    const canonicalPath = resolvePreviewPath('./.config/settings.json', '/home/user');
+    const view = render(
+      <FileBrowser
+        ws={ws}
+        mode="file-single"
+        layout="panel"
+        initialPath="/home/user"
+        autoPreviewPath={aliasPath}
+        onConfirm={vi.fn()}
+      />,
+    );
+
+    await waitFor(() => expect(ws.fsReadFile).toHaveBeenCalledTimes(1));
+    view.rerender(
+      <FileBrowser
+        ws={ws}
+        mode="file-single"
+        layout="panel"
+        initialPath="/home/user"
+        autoPreviewPath={canonicalPath}
+        onConfirm={vi.fn()}
+      />,
+    );
+
+    await act(async () => {
+      await Promise.resolve();
+      sendMsg({
+        type: 'fs.read_response',
+        requestId: 'mock-read-id',
+        path: canonicalPath,
+        status: 'error',
+        error: 'not_found',
+      });
+    });
+
+    expect(ws.fsReadFile).toHaveBeenCalledTimes(1);
+    expect(aliasPath).toBe(canonicalPath);
+    expect(view.container.querySelector('.fb-preview-error')).not.toBeNull();
   });
 
   it.each([
