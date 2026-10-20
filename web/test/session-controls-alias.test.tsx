@@ -170,7 +170,10 @@ describe('inline skill trigger', () => {
       { name: 'writer', description: 'Concise prose', source: 'team/skills' },
     ]);
     const { editor, container } = renderControls();
-    await waitFor(() => expect(listAgentSkillsMock).toHaveBeenCalledWith('srv1'));
+    await waitFor(() => expect(listAgentSkillsMock).toHaveBeenCalledWith('srv1', {
+      projectDir: '/work/app',
+      sessionName: 'deck_app_brain',
+    }));
     typeInto(editor, '$w');
     await waitFor(() => expect(container.querySelector('[data-skill-name="writer"]')).toBeTruthy());
     fireEvent.click(container.querySelector('[data-skill-name="writer"]')!);

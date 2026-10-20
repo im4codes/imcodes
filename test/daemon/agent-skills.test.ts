@@ -50,7 +50,13 @@ describe('listAgentSkills', () => {
     }));
 
     expect(await listAgentSkills(root)).toEqual([
-      { name: 'handmade', description: 'Made by hand' },
+      {
+        name: 'handmade',
+        description: 'Made by hand',
+        layer: 'user_default',
+        displayPath: '~/.agents/skills/handmade',
+        uri: 'skill://user_default/handmade',
+      },
       {
         name: 'wecomcli-doc',
         // Extra frontmatter keys belong to the skill; they are not a reason to hide it.
@@ -59,6 +65,9 @@ describe('listAgentSkills', () => {
         sourceUrl: 'https://github.com/WeComTeam/wecom-cli.git',
         installedAt: '2026-09-19T03:33:55.955Z',
         updatedAt: '2026-09-19T03:33:55.955Z',
+        layer: 'user_default',
+        displayPath: '~/.agents/skills/wecomcli-doc',
+        uri: 'skill://user_default/wecomcli-doc',
       },
     ]);
   });
@@ -80,7 +89,13 @@ describe('listAgentSkills', () => {
     await writeFile(join(root, '.agents', 'skills', 'stray.txt'), 'x');
     await skill(root, 'Bad Name', 'description: x');
     await skill(root, 'no-frontmatter-description', 'name: x');
-    expect(await listAgentSkills(root)).toEqual([{ name: 'no-frontmatter-description', description: '' }]);
+    expect(await listAgentSkills(root)).toEqual([{
+      name: 'no-frontmatter-description',
+      description: '',
+      layer: 'user_default',
+      displayPath: '~/.agents/skills/no-frontmatter-description',
+      uri: 'skill://user_default/no-frontmatter-description',
+    }]);
   });
 });
 
@@ -157,7 +172,17 @@ describe('agent skill requests', () => {
     expect(await run({ action: AGENT_SKILLS_ACTION.UPDATE })).toEqual({ ok: false, error: AGENT_SKILLS_ERROR.BUSY, skills: [] });
     await skill(root, 'fresh', 'description: fresh');
     release();
-    expect(await first).toEqual({ ok: true, output: 'Installed 1 skill', skills: [{ name: 'fresh', description: 'fresh' }] });
+    expect(await first).toEqual({
+      ok: true,
+      output: 'Installed 1 skill',
+      skills: [{
+        name: 'fresh',
+        description: 'fresh',
+        layer: 'user_default',
+        displayPath: '~/.agents/skills/fresh',
+        uri: 'skill://user_default/fresh',
+      }],
+    });
     expect(runCli).toHaveBeenCalledTimes(1);
   });
 

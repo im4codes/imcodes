@@ -645,7 +645,10 @@ describe('AtPicker', () => {
     render(pickerWithQuery('', { serverId: 'srv1', onSelectSkill }));
     fireEvent.click(screen.getAllByText('category')[1]);
     await flush();
-    expect(listAgentSkillsMock).toHaveBeenCalledWith('srv1');
+    expect(listAgentSkillsMock).toHaveBeenCalledWith('srv1', {
+      projectDir: '/tmp/proj',
+      sessionName: undefined,
+    });
     expect(screen.getByText('writer')).toBeDefined();
     expect(screen.getByText('team/skills')).toBeDefined();
     fireEvent.click(screen.getByText('writer'));
