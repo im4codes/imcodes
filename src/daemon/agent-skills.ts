@@ -20,7 +20,7 @@ import {
   type AgentSkillsError,
   type AgentSkillsRunRequest,
 } from '../../shared/agent-skills.js';
-import { parseAgentSkillMarkers, parseAgentSkillReference } from '../../shared/agent-skill-references.js';
+import { isTopLevelAgentSkillEntry, parseAgentSkillMarkers, parseAgentSkillReference } from '../../shared/agent-skill-references.js';
 import { resolveNpmCliJs } from '../util/node-datachannel-repair.mjs';
 import { getSkillRegistryManagementSnapshot } from '../context/skill-registry.js';
 
@@ -142,7 +142,11 @@ async function readLock(homeDir: string): Promise<Record<string, Record<string, 
  * Every skill in `~/.agents/skills`: a directory (or a link to one -- a Windows
  * junction included, which `stat` follows) holding a SKILL.md.
  */
-export async function listAgentSkills(homeDir: string = homedir(), context: { projectDir?: string } = {}): Promise<AgentSkillEntry[]> {
+async function listAgentSkillsInternal(
+  homeDir: string,
+  context: { projectDir?: string },
+  topLevelOnly: boolean,
+): Promise<AgentSkillEntry[]> {
   const root = join(homeDir, ...AGENT_SKILLS_DIRECTORY_SEGMENTS);
   let names: string[];
   try {
@@ -192,10 +196,17 @@ export async function listAgentSkills(homeDir: string = homedir(), context: { pr
       if (!(await registryPayloadPath(entry.path))) continue;
       const name = entry.metadata.name?.trim() || entry.key;
       if (!name || skills.length >= AGENT_SKILLS_LIMITS.SKILLS * 2) break;
-      skills.push({ name, description: entry.metadata.description ?? '', layer: entry.layer, displayPath: entry.displayPath, uri: entry.uri });
+      const listed = { name, description: entry.metadata.description ?? '', layer: entry.layer, displayPath: entry.displayPath, uri: entry.uri } satisfies AgentSkillEntry;
+      if (topLevelOnly && !isTopLevelAgentSkillEntry(listed)) continue;
+      skills.push(listed);
     }
   } catch { /* registry is optional; local skills remain available */ }
   return skills;
+}
+
+/** List only the direct skills that the composer should offer. */
+export async function listAgentSkills(homeDir: string = homedir(), context: { projectDir?: string } = {}): Promise<AgentSkillEntry[]> {
+  return listAgentSkillsInternal(homeDir, context, true);
 }
 
 /**
@@ -212,7 +223,9 @@ export async function expandAgentSkillReferences(
 ): Promise<AgentSkillExpansion> {
   const markers = parseAgentSkillMarkers(text);
   if (markers.length === 0) return { text, unresolved: [], expanded: [] };
-  const skills = await listAgentSkills(homeDir, context);
+  // Expansion keeps compatibility with explicit legacy/nested references;
+  // only the picker-facing list is narrowed to top-level entries.
+  const skills = await listAgentSkillsInternal(homeDir, context, false);
   const root = join(homeDir, ...AGENT_SKILLS_DIRECTORY_SEGMENTS);
   const unresolved: string[] = [];
   const expanded: string[] = [];

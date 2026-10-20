@@ -97,6 +97,33 @@ describe('listAgentSkills', () => {
       uri: 'skill://user_default/no-frontmatter-description',
     }]);
   });
+
+  it('lists only top-level registry payloads while nested references remain expandable', async () => {
+    const root = await home();
+    const project = join(root, '项目 space');
+    const projectRoot = join(project, '.imc', 'skills');
+    await mkdir(join(projectRoot, 'nested'), { recursive: true });
+    const topFile = join(projectRoot, 'top.md');
+    const topDirectory = join(projectRoot, 'directory', 'SKILL.md');
+    const nestedFile = join(projectRoot, 'nested', 'child.md');
+    await mkdir(join(projectRoot, 'directory'), { recursive: true });
+    await writeFile(topFile, '# Top\n');
+    await writeFile(topDirectory, '# Directory\n');
+    await writeFile(nestedFile, '# Child\n');
+    const paths = getSkillRegistryPathsForManagement({ projectDir: project, homeDir: root });
+    writeSkillRegistryManagementSnapshot(paths.project!, [
+      { schemaVersion: 1, key: 'top', layer: 'project_escape_hatch', metadata: { name: 'top' }, path: topFile, displayPath: '.imc/skills/top.md', uri: makeSkillUri('project_escape_hatch', 'top'), fingerprint: 'top', updatedAt: 1 },
+      { schemaVersion: 1, key: 'directory', layer: 'project_escape_hatch', metadata: { name: 'directory' }, path: topDirectory, displayPath: '.imc/skills/directory/SKILL.md', uri: makeSkillUri('project_escape_hatch', 'directory'), fingerprint: 'directory', updatedAt: 2 },
+      { schemaVersion: 1, key: 'nested/child', layer: 'project_escape_hatch', metadata: { name: 'child' }, path: nestedFile, displayPath: '.imc/skills/nested/child.md', uri: makeSkillUri('project_escape_hatch', 'nested/child'), fingerprint: 'nested', updatedAt: 3 },
+    ]);
+
+    expect((await listAgentSkills(root, { projectDir: project })).map((entry) => entry.name).sort()).toEqual(['directory', 'top']);
+    const marker = '$$(child@skill://project_escape_hatch/nested%2Fchild)';
+    await expect(expandAgentSkillReferences(marker, root, { projectDir: project })).resolves.toMatchObject({
+      expanded: ['child@skill://project_escape_hatch/nested%2Fchild'],
+      text: expect.stringContaining('# Child'),
+    });
+  });
 });
 
 describe('required commands', () => {

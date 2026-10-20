@@ -11,6 +11,47 @@ export interface AgentSkillReference {
   source?: string;
 }
 
+/**
+ * Whether a listed skill is a direct payload of one of the supported skill
+ * roots. Registry builders intentionally recurse so that runtime resolution
+ * can still find legacy/nested entries, but the composer should only expose
+ * the root's own skills. Keep this test on the redacted display/URI fields so
+ * no host path is ever sent to the browser.
+ */
+export function isTopLevelAgentSkillEntry(
+  skill: Pick<AgentSkillEntry, 'displayPath' | 'uri'>,
+): boolean {
+  const value = skill.displayPath?.trim() || skill.uri?.trim();
+  if (!value) return true;
+  const normalized = value.replace(/\\/gu, '/');
+  const roots = ['~/.agents/skills', '~/.imcodes/skills', '.agents/skills', '.imc/skills'];
+  const root = roots.find((candidate) => normalized === candidate || normalized.startsWith(`${candidate}/`));
+  if (root) {
+    const relative = normalized.slice(root.length).replace(/^\/+/, '');
+    const segments = relative.split('/').filter(Boolean);
+    return segments.length === 1
+      || (segments.length === 2 && segments[1]!.toLocaleLowerCase() === 'skill.md');
+  }
+  if (normalized.toLocaleLowerCase().startsWith('skill://')) {
+    // Registry URIs encode the registry key (which may contain `/`) into one
+    // URI segment. Decode before applying the same direct-payload rule.
+    const slash = normalized.indexOf('/', 'skill://'.length);
+    if (slash < 0) return true;
+    let key = normalized.slice(slash + 1);
+    try { key = decodeURIComponent(key); } catch { return true; }
+    const segments = key.split('/').filter(Boolean);
+    // Managed/opaque registry URIs do not expose a filesystem hierarchy; the
+    // registry entry itself is the top-level payload.
+    const layer = normalized.slice('skill://'.length, slash).toLocaleLowerCase();
+    if (layer === 'managed' || layer === 'managed_registry') return true;
+    return segments.length === 1
+      || (segments.length === 2 && segments[1]!.toLocaleLowerCase() === 'skill.md');
+  }
+  // Opaque source URIs and redacted paths cannot prove nesting. Keep them so
+  // a valid top-level managed/source entry is not hidden fail-closed.
+  return true;
+}
+
 /** Build the safe marker shown in the human-facing composer/timeline. */
 export function buildAgentSkillMarker(skill: Pick<AgentSkillEntry, 'name' | 'source' | 'sourceUrl' | 'uri' | 'displayPath'>): string {
   const source = skill.source?.trim() || skill.sourceUrl?.trim() || skill.uri?.trim() || skill.displayPath?.trim();
