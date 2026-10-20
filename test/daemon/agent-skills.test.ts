@@ -2,6 +2,8 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { makeSkillUri } from '../../shared/skill-registry-types.js';
+import { getSkillRegistryPathsForManagement, writeSkillRegistryManagementSnapshot } from '../../src/context/skill-registry.js';
 import {
   AGENT_SKILLS_ACTION,
   AGENT_SKILLS_ERROR,
@@ -206,5 +208,30 @@ describe('composer skill references', () => {
     const root = await home();
     const text = 'cash $5, $$(bad name), $$(writer';
     await expect(expandAgentSkillReferences(text, root)).resolves.toEqual({ text, unresolved: [], expanded: [] });
+  });
+
+  it('expands a project registry skill only when project context is supplied', async () => {
+    const root = await home();
+    const project = join(root, '项目 space');
+    const payload = join(project, 'skill.md');
+    await mkdir(project, { recursive: true });
+    await writeFile(payload, '# Project writer\n');
+    const paths = getSkillRegistryPathsForManagement({ projectDir: project, homeDir: root });
+    writeSkillRegistryManagementSnapshot(paths.project!, [{
+      schemaVersion: 1,
+      key: 'project-writer',
+      layer: 'project_escape_hatch',
+      metadata: { name: 'project-writer', description: 'project only' },
+      path: payload,
+      displayPath: 'skill://project_escape_hatch/project-writer',
+      uri: makeSkillUri('project_escape_hatch', 'project-writer'),
+      fingerprint: 'fingerprint',
+      updatedAt: Date.now(),
+    }]);
+    const marker = '$$(project-writer@skill://project_escape_hatch/project-writer)';
+    await expect(expandAgentSkillReferences(marker, root)).resolves.toMatchObject({ unresolved: ['project-writer@skill://project_escape_hatch/project-writer'] });
+    const expanded = await expandAgentSkillReferences(marker, root, { projectDir: project });
+    expect(expanded.expanded).toEqual(['project-writer@skill://project_escape_hatch/project-writer']);
+    expect(expanded.text).toContain('# Project writer');
   });
 });
