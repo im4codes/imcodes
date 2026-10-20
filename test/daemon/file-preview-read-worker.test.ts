@@ -25,6 +25,7 @@ function deps(overrides: Partial<PreviewReadWorkerDependencies> = {}): PreviewRe
       staleRead: FS_READ_ERROR_CODES.STALE_READ,
       invalidRequest: FS_READ_ERROR_CODES.INVALID_REQUEST,
       internalError: FS_READ_ERROR_CODES.INTERNAL_ERROR,
+      parentNotFound: FS_READ_ERROR_CODES.PARENT_NOT_FOUND,
       isDirectory: FS_READ_ERROR_CODES.IS_DIRECTORY,
     },
     previewReasons: {
@@ -128,7 +129,7 @@ describe('file preview read worker', () => {
     });
   });
 
-  it('snapshots text, base64 image, stream media metadata, too-large, and binary responses', async () => {
+  it('snapshots text inline, streams image/media metadata, too-large, and binary responses', async () => {
     const text = await handlePreviewReadWorkerRequest(snapshotRequest('/real/file.txt'), deps());
     expect(text).toMatchObject({ phase: 'snapshot', kind: 'success', payload: { mode: 'text', content: 'hello world' } });
 
@@ -138,7 +139,9 @@ describe('file preview read worker', () => {
       stat: vi.fn(async () => ({ mtimeMs: 1000, size: 4, isFile: () => true })),
       readFile: vi.fn(async () => Buffer.from([1, 2, 3, 4])),
     }));
-    expect(image).toMatchObject({ payload: { mode: 'base64', encoding: 'base64', mimeType: 'image/png' } });
+    // Images now stream: the worker returns metadata + handle and never reads
+    // the file, so no inline payload can monopolise the WebSocket.
+    expect(image).toMatchObject({ payload: { mode: 'stream', previewMode: 'stream', mimeType: 'image/png' } });
 
     const videoReq = snapshotRequest('/real/movie.mp4');
     videoReq.classification = classifyFile({ realPath: videoReq.realPath, size: 11, mtimeMs: 1000 });
@@ -201,5 +204,20 @@ describe('file preview read worker', () => {
       sanitized: true,
     });
     expect(JSON.stringify(result)).not.toContain('/home/user/project');
+  });
+
+  it('returns a stable missing-file reason without exposing the host path', async () => {
+    const request: PreviewReadWorkerRequest = { ...identity, phase: 'preflight', rawPath: 'cleaned.pdf' };
+    const missing = Object.assign(new Error('/home/user/.work/cleaned.pdf does not exist'), { code: 'ENOENT' });
+    const result = await handlePreviewReadWorkerRequest(request, deps({
+      resolveCanonicalStrict: vi.fn(async () => { throw missing; }),
+    }));
+
+    expect(result).toMatchObject({
+      kind: 'error',
+      error: FS_READ_ERROR_CODES.PARENT_NOT_FOUND,
+      sanitized: true,
+    });
+    expect(JSON.stringify(result)).not.toContain('/home/user');
   });
 });

@@ -1,0 +1,365 @@
+
+ RUN  v3.2.7 /Users/k/.imcodes/worktrees/imcodes/deck_sub_0610320z/asg_nbp/repo
+
+(node:63243) Warning: `--localstorage-file` was provided without a valid path
+(Use `node --trace-warnings ...` to show where the warning was created)
+(node:63241) Warning: `--localstorage-file` was provided without a valid path
+(Use `node --trace-warnings ...` to show where the warning was created)
+(node:63238) Warning: `--localstorage-file` was provided without a valid path
+(Use `node --trace-warnings ...` to show where the warning was created)
+(node:63242) Warning: `--localstorage-file` was provided without a valid path
+(Use `node --trace-warnings ...` to show where the warning was created)
+(node:63236) Warning: `--localstorage-file` was provided without a valid path
+(Use `node --trace-warnings ...` to show where the warning was created)
+(node:63235) Warning: `--localstorage-file` was provided without a valid path
+(Use `node --trace-warnings ...` to show where the warning was created)
+(node:63239) Warning: `--localstorage-file` was provided without a valid path
+(Use `node --trace-warnings ...` to show where the warning was created)
+(node:63237) Warning: `--localstorage-file` was provided without a valid path
+(Use `node --trace-warnings ...` to show where the warning was created)
+(node:63240) Warning: `--localstorage-file` was provided without a valid path
+(Use `node --trace-warnings ...` to show where the warning was created)
+ ✓ |web| test/components/FontPrefsDropdown.test.tsx (11 tests) 2696ms
+   ✓ FontPrefsDropdown > updates font size on pointer down so Android taps do not depend on synthetic click  998ms
+   ✓ FontPrefsDropdown > can expand from platform CJK fonts to all Mac and Windows built-ins  469ms
+ ✓ |web| test/components/FileBrowser.test.tsx (110 tests) 1908ms
+   ✓ FileBrowser > keeps an active download in the page store after File Browser closes  317ms
+(node:63571) Warning: `--localstorage-file` was provided without a valid path
+(Use `node --trace-warnings ...` to show where the warning was created)
+(node:63593) Warning: `--localstorage-file` was provided without a valid path
+(Use `node --trace-warnings ...` to show where the warning was created)
+ ✓ |web| test/components/SupervisionTaskConsole.test.tsx (31 tests) 3027ms
+   ✓ SupervisionTaskConsole > keeps a cancelled-heavy production projection out of the default active tab  1443ms
+(node:63615) Warning: `--localstorage-file` was provided without a valid path
+(Use `node --trace-warnings ...` to show where the warning was created)
+ ✓ |web| test/components/ChatView-sdk-agents.test.tsx (13 tests) 944ms
+   ✓ ChatView SDK agents panel > remembers desired-open state, keeps all retained agent statuses visible, and honors manual close  342ms
+(node:63762) Warning: `--localstorage-file` was provided without a valid path
+(Use `node --trace-warnings ...` to show where the warning was created)
+ ✓ |web| test/components/SessionControls.quick-input.test.tsx (18 tests) 1262ms
+ ✓ |web| test/components/SessionSettingsDialog.test.tsx (40 tests) 2493ms
+   ✓ SessionSettingsDialog supervision > saves a manually entered exact-session identity online and requests an immediate runtime refresh  344ms
+ ✓ |web| test/components/SharedContextManagementPanel.test.tsx (25 tests) 5695ms
+   ✓ SharedContextManagementPanel > loads enterprise data and renders members, workspaces, projects, and documents  514ms
+   ✓ SharedContextManagementPanel > creates invite, workspace, document version, and binding  652ms
+   ✓ SharedContextManagementPanel > shows advanced scoring controls only after toggling and saves custom weights  323ms
+   ✓ SharedContextManagementPanel > loads local, cloud, and enterprise memory views and saves personal sync settings  501ms
+   ✓ SharedContextManagementPanel > renders requested-on dependency-blocked memory features as blocked instead of plain disabled  519ms
+   ✓ SharedContextManagementPanel > exposes post-1.1 preference, skill, markdown, and observation management controls  434ms
+ ✓ |web| test/components/SettingsPage.test.tsx (6 tests) 714ms
+   ✓ SettingsPage > renders password setup flow for passkey-only accounts and completes it after passkey verification  406ms
+(node:63849) Warning: `--localstorage-file` was provided without a valid path
+(Use `node --trace-warnings ...` to show where the warning was created)
+(node:63852) Warning: `--localstorage-file` was provided without a valid path
+(Use `node --trace-warnings ...` to show where the warning was created)
+(node:63854) Warning: `--localstorage-file` was provided without a valid path
+(Use `node --trace-warnings ...` to show where the warning was created)
+(node:63860) Warning: `--localstorage-file` was provided without a valid path
+(Use `node --trace-warnings ...` to show where the warning was created)
+ ✓ |web| test/components/QuickInputPanel.test.tsx (30 tests) 937ms
+ ✓ |web| test/components/ControlledNodeQuickMenu.test.tsx (18 tests) 902ms
+   ✓ ControlledNodeQuickMenu > lists every node and resolves eligibility without trusting OS metadata  387ms
+ ✓ |web| test/components/SessionTabs.test.tsx (27 tests) 1371ms
+ ✓ |web| test/components/P2pConfigPanel.test.tsx (74 tests) 8050ms
+   ✓ P2pConfigPanel > shows rounds selector with buttons for 1, 2, 3, 5  407ms
+   ✓ P2pConfigPanel > loads saved rounds from getUserPref on mount  352ms
+   ✓ P2pConfigPanel > changing rounds updates the config passed to onSave  347ms
+   ✓ P2pConfigPanel > preserves hidden sdk entries when saving from the cli filter  453ms
+ ✓ |web| test/components/ChatView-refresh-repin.test.tsx (4 tests) 1453ms
+   ✓ ChatView — post-refresh re-pin to bottom > re-pins to the bottom when the viewport shrinks right after mount  515ms
+   ✓ ChatView — post-refresh re-pin to bottom > leaves the view alone if the user scrolled up before the content grew  456ms
+(node:64009) Warning: `--localstorage-file` was provided without a valid path
+(Use `node --trace-warnings ...` to show where the warning was created)
+(node:64058) Warning: `--localstorage-file` was provided without a valid path
+(Use `node --trace-warnings ...` to show where the warning was created)
+ ✓ |web| test/components/NewSessionDialog.test.tsx (42 tests) 8744ms
+   ✓ NewSessionDialog > sends selected identity file content in session.start so the first SDK system prompt has it  567ms
+   ✓ NewSessionDialog > cancel button calls onClose  412ms
+   ✓ NewSessionDialog > includes optional git remote URL for main-session starts  327ms
+   ✓ NewSessionDialog > matches started events for non-ASCII project names deterministically  309ms
+   ✓ NewSessionDialog > selects a CC SDK model from one compatible-provider preset  300ms
+   ✓ NewSessionDialog > shows CC preset controls and submits preset for qwen  396ms
+   ✓ NewSessionDialog > shows a toast when qwen preset JSON is copied to the clipboard  358ms
+   ✓ NewSessionDialog > keeps the preset env model authoritative for qwen after discovery  667ms
+   ✓ NewSessionDialog > uses dynamically discovered kimi-sdk models when starting a session  329ms
+   ✓ NewSessionDialog > uses a provider-qualified OpenCode SDK model when starting a session  343ms
+   ✓ NewSessionDialog > uses dynamically discovered grok-sdk models when starting a session  355ms
+ ✓ |web| test/components/StartSubSessionDialog.test.tsx (27 tests) 8831ms
+   ✓ StartSubSessionDialog > shows Claude, Codex, Qoder, OpenCode, Grok, Hermes, DeepSeek Harness, and Pi options  619ms
+   ✓ StartSubSessionDialog > passes thinking level for codex-sdk sub-sessions  428ms
+   ✓ StartSubSessionDialog > passes requestedModel for codex-sdk sub-sessions  514ms
+   ✓ StartSubSessionDialog > replaces the Claude default with the ChatGPT-compatible Codex default when switching to codex-sdk  435ms
+   ✓ StartSubSessionDialog > starts qoder-sdk sub-sessions without proof-gated model or thinking extras  416ms
+   ✓ StartSubSessionDialog > passes a provider-qualified model for OpenCode SDK sub-sessions  375ms
+   ✓ StartSubSessionDialog > shows CC preset controls and passes preset for qwen sub-sessions  354ms
+   ✓ StartSubSessionDialog > opens third-party API selection from an incompatible sub-session agent and keeps the switch mounted  421ms
+   ✓ StartSubSessionDialog > shows a toast when qwen sub-session preset JSON is copied to the clipboard  659ms
+   ✓ StartSubSessionDialog > prefills default qwen preset values instead of leaving placeholders only  371ms
+   ✓ StartSubSessionDialog > passes thinking level for qwen sub-sessions  465ms
+   ✓ StartSubSessionDialog > passes requestedModel for copilot-sdk sub-sessions  321ms
+   ✓ StartSubSessionDialog > passes requestedModel for Hermes ACP sub-sessions  401ms
+   ✓ StartSubSessionDialog > passes requestedModel for deepseek-harness sub-sessions  317ms
+   ✓ StartSubSessionDialog > passes requestedModel for cursor-headless sub-sessions  429ms
+   ✓ StartSubSessionDialog > passes requestedModel for gemini-sdk sub-sessions  395ms
+(node:64114) Warning: `--localstorage-file` was provided without a valid path
+(Use `node --trace-warnings ...` to show where the warning was created)
+(node:64141) Warning: `--localstorage-file` was provided without a valid path
+(Use `node --trace-warnings ...` to show where the warning was created)
+(node:64147) Warning: `--localstorage-file` was provided without a valid path
+(Use `node --trace-warnings ...` to show where the warning was created)
+ ✓ |web| test/components/CloneSessionGroupDialog.test.tsx (13 tests) 943ms
+(node:64260) Warning: `--localstorage-file` was provided without a valid path
+(Use `node --trace-warnings ...` to show where the warning was created)
+(node:64257) Warning: `--localstorage-file` was provided without a valid path
+(Use `node --trace-warnings ...` to show where the warning was created)
+ ✓ |web| test/components/HtmlFullscreenPreview.test.tsx (9 tests) 612ms
+   ✓ HtmlFullscreenPreview new-window lifecycle > closes the owner only after confirmed creation and retains the blob token until the child loads  321ms
+ ✓ |web| test/components/FloatingPanel.maximize.test.tsx (11 tests) 724ms
+   ✓ FloatingPanel maximize integration > shows a maximize control for an opted-in file browser panel  354ms
+ ✓ |web| test/components/SubSessionBar.test.tsx (44 tests) 1195ms
+ ✓ |web| test/components/ChatView.test.tsx (65 tests) 9872ms
+   ✓ ChatView > renders only the recent tail of very large cached timelines on first mount  730ms
+   ✓ ChatView > reveals locally cached older messages at the top while preserving the reading position  604ms
+   ✓ ChatView > does not move the viewport when a near-top scroll auto-reveals older items  528ms
+   ✓ ChatView > preview mode caps rendered items to PREVIEW_RENDER_ITEM_LIMIT (sub-session thumbnails)  359ms
+   ✓ ChatView > does not move the main chat viewport on same-timestamp streamed updates after the user scrolls away from bottom  1420ms
+   ✓ ChatView > does not move the main chat viewport when a newer-timestamp message arrives while follow is paused  1424ms
+   ✓ ChatView > shows a new-message count on the floating jump button while follow is paused  1364ms
+   ✓ ChatView > counts one new message for many streamed updates of the same event while follow is paused  1467ms
+ ✓ |web| test/components/LoginPage.test.tsx (14 tests) 1263ms
+(node:64435) Warning: `--localstorage-file` was provided without a valid path
+(Use `node --trace-warnings ...` to show where the warning was created)
+(node:64502) Warning: `--localstorage-file` was provided without a valid path
+(Use `node --trace-warnings ...` to show where the warning was created)
+(node:64515) Warning: `--localstorage-file` was provided without a valid path
+(Use `node --trace-warnings ...` to show where the warning was created)
+ ✓ |web| test/components/ChatAttachment.test.tsx (9 tests) 926ms
+   ✓ ChatView attachment download > renders download buttons when user.message has attachments and serverId is set  444ms
+(node:64522) Warning: `--localstorage-file` was provided without a valid path
+(Use `node --trace-warnings ...` to show where the warning was created)
+(node:64526) Warning: `--localstorage-file` was provided without a valid path
+(Use `node --trace-warnings ...` to show where the warning was created)
+ ✓ |web| test/components/AdvancedWorkflowCanvasEditor.test.tsx (13 tests) 548ms
+(node:64525) Warning: `--localstorage-file` was provided without a valid path
+(Use `node --trace-warnings ...` to show where the warning was created)
+ ✓ |web| test/components/VerificationMachinesSection.test.tsx (3 tests) 572ms
+   ✓ VerificationMachinesSection > loads both synchronized scopes and renames by stable id  401ms
+ ✓ |web| test/components/SessionControls.shared-participant-settings.test.tsx (7 tests) 1451ms
+   ✓ SessionControls shared participant settings entry points > opens the owner settings surface from the Auto dropdown for an active participant  462ms
+   ✓ SessionControls shared participant settings entry points > removes both settings entries when an open participant surface is downgraded to viewer  487ms
+ ✓ |web| test/components/ChatView.render-contract.test.tsx (95 tests) 741ms
+(node:64619) Warning: `--localstorage-file` was provided without a valid path
+(Use `node --trace-warnings ...` to show where the warning was created)
+ ✓ |web| test/components/sidebar-discussion-contract.test.tsx (4 tests) 655ms
+   ✓ StartDiscussionDialog contract > saves preferences and submits a mixed new/reused-session discussion via onStartRequested  321ms
+ ✓ |web| test/components/SharedContextManagementPanel.mcp-tab.test.tsx (3 tests) 747ms
+   ✓ SharedContextManagementPanel MCP tab > renders MCP status, degraded reasons, disabled gates, and redacted calls without console warnings  677ms
+ ✓ |web| test/components/P2pConfigPanel-stale-banner.test.tsx (4 tests) 578ms
+   ✓ P2pConfigPanel capability_stale banner — N4 follow-up (7c2570e9) > hides banner when source.isStale() returns false even if observedAt is far past TTL  366ms
+(node:64623) Warning: `--localstorage-file` was provided without a valid path
+(Use `node --trace-warnings ...` to show where the warning was created)
+(node:64707) Warning: `--localstorage-file` was provided without a valid path
+(Use `node --trace-warnings ...` to show where the warning was created)
+(node:64666) Warning: `--localstorage-file` was provided without a valid path
+(Use `node --trace-warnings ...` to show where the warning was created)
+(node:64713) Warning: `--localstorage-file` was provided without a valid path
+(Use `node --trace-warnings ...` to show where the warning was created)
+(node:64741) Warning: `--localstorage-file` was provided without a valid path
+(Use `node --trace-warnings ...` to show where the warning was created)
+(node:64743) Warning: `--localstorage-file` was provided without a valid path
+(Use `node --trace-warnings ...` to show where the warning was created)
+(node:64742) Warning: `--localstorage-file` was provided without a valid path
+(Use `node --trace-warnings ...` to show where the warning was created)
+ ✓ |web| test/components/P2pConfigPanel-stale-banner-e2e.test.tsx (3 tests) 639ms
+   ✓ P2P stale banner e2e — WsClient ↔ panel integration (7c2570e9) > healthy long-lived daemon: banner stays hidden across multiple TTL windows  588ms
+ ✓ |web| test/components/ChatView-message-pins.test.tsx (11 tests) 759ms
+   ✓ ChatView message pin action > places the compact pin counter after the font and branch controls  309ms
+ ✓ |web| test/components/SubSessionWindow.test.tsx (36 tests) 390ms
+ ✓ |web| test/components/zero-component-surfaces.test.tsx (5 tests) 759ms
+ ✓ |web| test/components/SessionPane.test.tsx (19 tests) 318ms
+ ✓ |web| test/components/AtPicker.test.tsx (22 tests) 540ms
+ ✓ |web| test/components/ChatView-pinned-last-sent.test.tsx (12 tests) 467ms
+ ✓ |web| test/components/SubSessionBar.entry-gesture.test.tsx (21 tests) 459ms
+(node:64818) Warning: `--localstorage-file` was provided without a valid path
+(Use `node --trace-warnings ...` to show where the warning was created)
+(node:64817) Warning: `--localstorage-file` was provided without a valid path
+(Use `node --trace-warnings ...` to show where the warning was created)
+(node:64861) Warning: `--localstorage-file` was provided without a valid path
+(Use `node --trace-warnings ...` to show where the warning was created)
+(node:64847) Warning: `--localstorage-file` was provided without a valid path
+(Use `node --trace-warnings ...` to show where the warning was created)
+(node:64863) Warning: `--localstorage-file` was provided without a valid path
+(Use `node --trace-warnings ...` to show where the warning was created)
+(node:64862) Warning: `--localstorage-file` was provided without a valid path
+(Use `node --trace-warnings ...` to show where the warning was created)
+(node:64864) Warning: `--localstorage-file` was provided without a valid path
+(Use `node --trace-warnings ...` to show where the warning was created)
+(node:64879) Warning: `--localstorage-file` was provided without a valid path
+(Use `node --trace-warnings ...` to show where the warning was created)
+ ✓ |web| test/components/OpenSpecAutoDeliver.test.tsx (11 tests) 290ms
+ ✓ |web| test/components/SubSessionWindow.maximize.test.tsx (12 tests) 419ms
+ ✓ |web| test/components/AutoFixWidgets.test.tsx (3 tests) 354ms
+ ✓ |web| test/components/DesktopWindowMaximizeButton.test.tsx (4 tests) 362ms
+   ✓ DesktopWindowMaximizeButton > uses localized maximize labels in normal state  303ms
+ ✓ |web| test/components/ApiKeyManager.test.tsx (2 tests) 366ms
+ ✓ |web| test/components/MessagePinsBar.test.tsx (7 tests) 427ms
+ ✓ |web| test/components/AdvancedWorkflowCanvasEditor-dropdown-restrictions.test.tsx (27 tests) 520ms
+(node:64979) Warning: `--localstorage-file` was provided without a valid path
+(Use `node --trace-warnings ...` to show where the warning was created)
+ ✓ |web| test/components/OfficePreview.test.tsx (6 tests) 840ms
+   ✓ OfficePreview PDF worker setup > cancels stale overlapping PDF renders so resized previews do not duplicate later pages  340ms
+(node:64981) Warning: `--localstorage-file` was provided without a valid path
+(Use `node --trace-warnings ...` to show where the warning was created)
+(node:64983) Warning: `--localstorage-file` was provided without a valid path
+(Use `node --trace-warnings ...` to show where the warning was created)
+(node:64984) Warning: `--localstorage-file` was provided without a valid path
+(Use `node --trace-warnings ...` to show where the warning was created)
+(node:65011) Warning: `--localstorage-file` was provided without a valid path
+(Use `node --trace-warnings ...` to show where the warning was created)
+ ✓ |web| test/components/ContextDiagnosticsPanel.test.tsx (2 tests) 292ms
+(node:65013) Warning: `--localstorage-file` was provided without a valid path
+(Use `node --trace-warnings ...` to show where the warning was created)
+(node:65032) Warning: `--localstorage-file` was provided without a valid path
+(Use `node --trace-warnings ...` to show where the warning was created)
+ ✓ |web| test/components/DownloadTransferCenter.test.tsx (7 tests) 385ms
+   ✓ DownloadTransferCenter > shows route, progress, speed, and cancels from the main-window list  370ms
+ ✓ |web| test/components/P2pProgressCard.test.tsx (19 tests) 245ms
+ ✓ |web| test/components/CapabilityInventoryPanel.test.tsx (3 tests) 227ms
+ ✓ |web| test/components/AskQuestionDialog.test.tsx (2 tests) 308ms
+(node:65078) Warning: `--localstorage-file` was provided without a valid path
+(Use `node --trace-warnings ...` to show where the warning was created)
+ ✓ |web| test/components/TaskCard.test.tsx (3 tests) 326ms
+ ✓ |web| test/components/ChatView.file-change.test.tsx (20 tests) 265ms
+(node:65083) Warning: `--localstorage-file` was provided without a valid path
+(Use `node --trace-warnings ...` to show where the warning was created)
+(node:65085) Warning: `--localstorage-file` was provided without a valid path
+(Use `node --trace-warnings ...` to show where the warning was created)
+ ✓ |web| test/components/DelegationClaimBadge.test.tsx (28 tests) 269ms
+(node:65090) Warning: `--localstorage-file` was provided without a valid path
+(Use `node --trace-warnings ...` to show where the warning was created)
+(node:65087) Warning: `--localstorage-file` was provided without a valid path
+(Use `node --trace-warnings ...` to show where the warning was created)
+(node:65096) Warning: `--localstorage-file` was provided without a valid path
+(Use `node --trace-warnings ...` to show where the warning was created)
+ ✓ |web| test/components/AdvancedWorkflowCanvasEditor-nodekind-onchange.test.tsx (9 tests) 281ms
+ ✓ |web| test/components/MobileDpad.test.tsx (8 tests) 225ms
+(node:65102) Warning: `--localstorage-file` was provided without a valid path
+(Use `node --trace-warnings ...` to show where the warning was created)
+(node:65144) Warning: `--localstorage-file` was provided without a valid path
+(Use `node --trace-warnings ...` to show where the warning was created)
+ ✓ |web| test/components/LocalWebPreviewPanel.test.tsx (3 tests) 327ms
+ ✓ |web| test/components/ChatMarkdown.test.tsx (22 tests) 320ms
+ ✓ |web| test/components/SubSessionCard.test.tsx (25 tests) 391ms
+ ✓ |web| test/components/CapabilityOperationNotice.test.tsx (4 tests) 283ms
+(node:65192) Warning: `--localstorage-file` was provided without a valid path
+(Use `node --trace-warnings ...` to show where the warning was created)
+(node:65197) Warning: `--localstorage-file` was provided without a valid path
+(Use `node --trace-warnings ...` to show where the warning was created)
+(node:65198) Warning: `--localstorage-file` was provided without a valid path
+(Use `node --trace-warnings ...` to show where the warning was created)
+ ✓ |web| test/components/ChatView.unrenderable-window.test.tsx (3 tests) 256ms
+ ✓ |web| test/components/LocalWebPreviewPanel-history-nav.test.tsx (3 tests) 236ms
+(node:65211) Warning: `--localstorage-file` was provided without a valid path
+(Use `node --trace-warnings ...` to show where the warning was created)
+ ✓ |web| test/components/HtmlSafePreview.test.tsx (8 tests) 248ms
+(node:65210) Warning: `--localstorage-file` was provided without a valid path
+(Use `node --trace-warnings ...` to show where the warning was created)
+ ✓ |web| test/components/FloatingPanel.test.tsx (11 tests) 298ms
+(node:65241) Warning: `--localstorage-file` was provided without a valid path
+(Use `node --trace-warnings ...` to show where the warning was created)
+(node:65303) Warning: `--localstorage-file` was provided without a valid path
+(Use `node --trace-warnings ...` to show where the warning was created)
+ ✓ |web| test/components/TerminalView.test.tsx (10 tests) 188ms
+ ✓ |web| test/components/OfficePreview.docx.test.tsx (2 tests) 211ms
+ ✓ |web| test/components/EmbeddingStatusIcon.test.tsx (8 tests) 135ms
+(node:65389) Warning: `--localstorage-file` was provided without a valid path
+(Use `node --trace-warnings ...` to show where the warning was created)
+ ✓ |web| test/components/FloatingPanel.raise.test.tsx (1 test) 165ms
+(node:65391) Warning: `--localstorage-file` was provided without a valid path
+(Use `node --trace-warnings ...` to show where the warning was created)
+(node:65438) Warning: `--localstorage-file` was provided without a valid path
+(Use `node --trace-warnings ...` to show where the warning was created)
+ ✓ |web| test/components/ZoomedTextDialog.test.tsx (7 tests) 213ms
+(node:65440) Warning: `--localstorage-file` was provided without a valid path
+(Use `node --trace-warnings ...` to show where the warning was created)
+ ✓ |web| test/components/FilePreviewPane.test.tsx (24 tests) 139ms
+(node:65493) Warning: `--localstorage-file` was provided without a valid path
+(Use `node --trace-warnings ...` to show where the warning was created)
+ ✓ |web| test/components/NativeAuthBridge.test.tsx (2 tests) 132ms
+(node:65498) Warning: `--localstorage-file` was provided without a valid path
+(Use `node --trace-warnings ...` to show where the warning was created)
+(node:65503) Warning: `--localstorage-file` was provided without a valid path
+(Use `node --trace-warnings ...` to show where the warning was created)
+(node:65532) Warning: `--localstorage-file` was provided without a valid path
+(Use `node --trace-warnings ...` to show where the warning was created)
+ ✓ |web| test/components/SessionIdentityTabs.limit.test.tsx (15 tests) 336ms
+ ✓ |web| test/components/ChatLoopbackLink.test.tsx (4 tests) 140ms
+ ✓ |web| test/components/ImageLightbox.navigation.test.tsx (9 tests) 139ms
+ ✓ |web| test/components/SessionTree.test.tsx (4 tests) 97ms
+ ✓ |web| test/components/DaemonRemoteDesktopControl.test.tsx (14 tests) 131ms
+(node:65600) Warning: `--localstorage-file` was provided without a valid path
+(Use `node --trace-warnings ...` to show where the warning was created)
+(node:65615) Warning: `--localstorage-file` was provided without a valid path
+(Use `node --trace-warnings ...` to show where the warning was created)
+(node:65646) Warning: `--localstorage-file` was provided without a valid path
+(Use `node --trace-warnings ...` to show where the warning was created)
+ ✓ |web| test/components/ImageLightbox.test.tsx (5 tests) 97ms
+(node:65648) Warning: `--localstorage-file` was provided without a valid path
+(Use `node --trace-warnings ...` to show where the warning was created)
+ ✓ |web| test/components/VoiceInput.test.ts (2 tests) 260ms
+(node:65649) Warning: `--localstorage-file` was provided without a valid path
+(Use `node --trace-warnings ...` to show where the warning was created)
+(node:65652) Warning: `--localstorage-file` was provided without a valid path
+(Use `node --trace-warnings ...` to show where the warning was created)
+ ✓ |web| test/components/SubSessionWindow.raise.test.tsx (1 test) 43ms
+(node:65653) Warning: `--localstorage-file` was provided without a valid path
+(Use `node --trace-warnings ...` to show where the warning was created)
+(node:65656) Warning: `--localstorage-file` was provided without a valid path
+(Use `node --trace-warnings ...` to show where the warning was created)
+ ✓ |web| test/components/ChatLocalImagePreview.test.tsx (4 tests) 139ms
+ ✓ |web| test/components/PinnedPanelRegistry.test.tsx (4 tests) 140ms
+ ✓ |web| test/components/multi-window-maximize.test.tsx (2 tests) 111ms
+ ✓ |web| test/components/escape-no-maximize-binding.test.tsx (1 test) 53ms
+ ✓ |web| test/components/chat-image-preview-cache.test.ts (3 tests) 9ms
+stderr | test/components/SessionControls.test.tsx > SessionControls > keeps the completed attachment and draft when daemon deletion fails
+[upload] delete failed: Error: delete failed
+    at [90m/Users/k/.imcodes/worktrees/imcodes/deck_sub_0610320z/asg_nbp/repo/[39mweb/test/components/SessionControls.test.tsx:8955:48
+    at file:///Users/k/codes/codedeck/codedeck/node_modules/[4m@vitest/runner[24m/dist/chunk-hooks.js:155:11
+    at file:///Users/k/codes/codedeck/codedeck/node_modules/[4m@vitest/runner[24m/dist/chunk-hooks.js:752:26
+    at file:///Users/k/codes/codedeck/codedeck/node_modules/[4m@vitest/runner[24m/dist/chunk-hooks.js:1897:20
+    at new Promise (<anonymous>)
+    at runWithTimeout (file:///Users/k/codes/codedeck/codedeck/node_modules/[4m@vitest/runner[24m/dist/chunk-hooks.js:1863:10)
+    at runTest (file:///Users/k/codes/codedeck/codedeck/node_modules/[4m@vitest/runner[24m/dist/chunk-hooks.js:1574:12)
+    at runSuite (file:///Users/k/codes/codedeck/codedeck/node_modules/[4m@vitest/runner[24m/dist/chunk-hooks.js:1729:8)
+    at runSuite (file:///Users/k/codes/codedeck/codedeck/node_modules/[4m@vitest/runner[24m/dist/chunk-hooks.js:1729:8)
+    at runFiles (file:///Users/k/codes/codedeck/codedeck/node_modules/[4m@vitest/runner[24m/dist/chunk-hooks.js:1787:3)
+
+ ✓ |web| test/components/SessionControls.test.tsx (288 tests | 8 skipped) 23194ms
+   ✓ SessionControls > updates the p2p dropdown when custom combos are created without a page refresh  638ms
+   ✓ SessionControls > lists openspec changes and appends the selected reference to the input  451ms
+   ✓ SessionControls > renders cached OpenSpec task stats immediately while refreshing task stats in the background  314ms
+   ✓ SessionControls > keeps Auto Deliver launch bound to OpenSpec changes while sending combo id and materialized limits  334ms
+   ✓ SessionControls > opens Auto Deliver details after a matching launch ack projection  332ms
+   ✓ SessionControls > opens an openspec change folder in the file browser and can insert files from it  318ms
+   ✓ SessionControls > inserts an openspec implementation-audit prompt without sending immediately  419ms
+   ✓ SessionControls > inserts an openspec spec-audit prompt without sending immediately  356ms
+   ✓ SessionControls > inserts an openspec implement prompt without sending immediately  305ms
+   ✓ SessionControls > inserts an openspec propose-from-description prompt without sending immediately  339ms
+   ✓ SessionControls > keeps the desktop openspec audit submenu open when clicking inside the portal submenu  329ms
+   ✓ SessionControls > collapses openspec actions behind a disclosure toggle on mobile  318ms
+   ✓ SessionControls > anchors the openspec audit submenu to the audit button on mobile  365ms
+   ✓ SessionControls > opens the openspec audit submenu below the trigger when the trigger is high in the viewport  313ms
+   ✓ SessionControls > cancels an armed Append all when its context changes  760ms
+   ✓ SessionControls > renders independent progress rows for a concurrent multi-file upload batch  361ms
+
+ Test Files  84 passed (84)
+      Tests  1553 passed | 8 skipped (1561)
+   Start at  01:58:39
+   Duration  26.90s (transform 9.96s, setup 2.05s, collect 33.13s, tests 109.01s, environment 47.55s, prepare 5.14s)
+
+npm notice
+npm notice New minor version of npm available! 11.8.0 -> 11.19.1
+npm notice Changelog: https://github.com/npm/cli/releases/tag/v11.19.1
+npm notice To update run: npm install -g npm@11.19.1
+npm notice
+exit=0

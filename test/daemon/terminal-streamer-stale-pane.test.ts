@@ -29,6 +29,7 @@ vi.mock('../../src/agent/tmux.js', () => ({
   capturePaneVisible: vi.fn().mockResolvedValue('snapshot\nlines'),
   capturePaneHistory: vi.fn().mockResolvedValue(''),
   getPaneId: vi.fn().mockResolvedValue('%fresh'),
+  getPaneIdentity: vi.fn().mockResolvedValue(undefined),
   getPaneSize: vi.fn().mockResolvedValue({ cols: 80, rows: 24 }),
   paneExists: vi.fn().mockResolvedValue(true),
   sessionExists: vi.fn().mockResolvedValue(true),
@@ -41,11 +42,12 @@ vi.mock('../../src/store/session-store.js', () => ({
   upsertSession: vi.fn(),
 }));
 
-import { getPaneId, paneExists, startPipePaneStream } from '../../src/agent/tmux.js';
+import { getPaneId, getPaneIdentity, paneExists, startPipePaneStream } from '../../src/agent/tmux.js';
 import { getSession, upsertSession } from '../../src/store/session-store.js';
 import { TerminalStreamer } from '../../src/daemon/terminal-streamer.js';
 
 const mockGetPaneId = getPaneId as ReturnType<typeof vi.fn>;
+const mockGetPaneIdentity = getPaneIdentity as ReturnType<typeof vi.fn>;
 const mockPaneExists = paneExists as ReturnType<typeof vi.fn>;
 const mockStartPipe = startPipePaneStream as ReturnType<typeof vi.fn>;
 const mockGetSession = getSession as ReturnType<typeof vi.fn>;
@@ -62,6 +64,7 @@ describe('TerminalStreamer — stale stored paneId self-heal', () => {
     const noopStream = { on: vi.fn(), destroy: vi.fn() };
     mockStartPipe.mockReset().mockResolvedValue({ stream: noopStream, cleanup: vi.fn().mockResolvedValue(undefined) });
     mockGetPaneId.mockReset().mockResolvedValue('%fresh');
+    mockGetPaneIdentity.mockReset().mockResolvedValue(undefined);
     mockPaneExists.mockReset().mockResolvedValue(true);
     mockGetSession.mockReset();
     mockUpsert.mockReset();
@@ -119,5 +122,66 @@ describe('TerminalStreamer — stale stored paneId self-heal', () => {
     // Live stored pane → no re-resolution, no store churn.
     expect(mockGetPaneId).not.toHaveBeenCalled();
     expect(mockUpsert).not.toHaveBeenCalled();
+  });
+
+  it('restarts the pipe when the session was killed and recreated even though tmux reused the same paneId', async () => {
+    // Real bug (tsk_cd_resubscribe_after_reconnect): tmux's `%N` pane-id
+    // counter is scoped to the whole server and gets REUSED once every other
+    // session is gone -- a lone kill-session + new-session under the same
+    // name routinely reallocates the exact same paneId. A staleness check
+    // that compares paneId alone can never see this: the pipe reads from a
+    // dead pane forever and new keystrokes are silently lost. session_created
+    // changes on every fresh session even when the paneId coincidentally
+    // repeats, so it is the signal that must catch this.
+    const session = 'deck_reconnect_w1';
+    mockGetSession.mockReturnValue(undefined); // e.g. an ad-hoc/raw tmux session, no store record
+    mockPaneExists.mockResolvedValue(true);
+    // startPipe resolves the paneId it actually pipes into via getPaneId
+    // (getPaneIdentity is only consulted for the extra staleness signal), so
+    // both must agree on the reused "%0" for this test to isolate the
+    // session_created-only change.
+    mockGetPaneId.mockResolvedValue('%0');
+    mockGetPaneIdentity.mockResolvedValue({ paneId: '%0', sessionCreated: '1000' });
+
+    // First subscribe: starts a pipe for "generation 1" of the session.
+    streamer.subscribe({ sessionName: session, send: vi.fn() });
+    await flush();
+    expect(mockStartPipe).toHaveBeenCalledTimes(1);
+    const firstStream = mockStartPipe.mock.results[0]!.value as Promise<{ stream: { destroy: ReturnType<typeof vi.fn> } }>;
+    const { stream: firstStreamHandle } = await firstStream;
+
+    // The session was killed and recreated under the same name; tmux
+    // reallocates the exact same "%0" (the reported real bug), but
+    // session_created moves forward.
+    mockGetPaneIdentity.mockResolvedValue({ paneId: '%0', sessionCreated: '2000' });
+
+    // Second subscribe: simulates the resubscribe that follows a daemon or
+    // browser reconnect, while the OLD (now-dead) pipe is still registered.
+    streamer.subscribe({ sessionName: session, send: vi.fn() });
+    await flush();
+
+    // The stale pipe must be torn down (never left silently forwarding
+    // nothing) and a fresh one started for the new session.
+    expect(firstStreamHandle.destroy).toHaveBeenCalled();
+    expect(mockStartPipe).toHaveBeenCalledTimes(2);
+  });
+
+  it('does NOT restart the pipe across a resubscribe when neither the paneId nor session_created changed', async () => {
+    const session = 'deck_stable_w1';
+    mockGetSession.mockReturnValue(undefined);
+    mockPaneExists.mockResolvedValue(true);
+    mockGetPaneId.mockResolvedValue('%0');
+    mockGetPaneIdentity.mockResolvedValue({ paneId: '%0', sessionCreated: '1000' });
+
+    streamer.subscribe({ sessionName: session, send: vi.fn() });
+    await flush();
+    expect(mockStartPipe).toHaveBeenCalledTimes(1);
+
+    // Same session, same pane: an ordinary re-subscribe (e.g. a second
+    // browser tab) must reuse the live pipe, not restart it.
+    streamer.subscribe({ sessionName: session, send: vi.fn() });
+    await flush();
+
+    expect(mockStartPipe).toHaveBeenCalledTimes(1);
   });
 });

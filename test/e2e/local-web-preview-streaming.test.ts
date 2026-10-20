@@ -114,7 +114,7 @@ class MockBrowserWs extends EventEmitter {
 
 function makeDb() {
   return {
-    queryOne: async () => ({ token_hash: 'valid-hash', user_id: 'u' }),
+    queryOne: async () => ({ token_hash: 'valid-hash', user_id: 'u', owner_status: 'active' }),
     query: async () => [],
     execute: async () => ({ changes: 1 }),
     exec: async () => {},

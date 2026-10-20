@@ -1,5 +1,18 @@
 import { describe, expect, it, vi } from 'vitest';
-import { GrokSdkProvider } from '../../src/agent/providers/grok-sdk.js';
+import { withMemoryMcpSessionEnv } from '../../src/agent/providers/getDefaultMcpServers.js';
+import { MEMORY_MCP_ENV_KEYS as E } from '../../shared/memory-mcp-env.js';
+import {
+  AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES,
+  AGENT_DELEGATION_NOTIFICATION_RESULTS,
+} from '../../shared/agent-delegation.js';
+import {
+  GrokSdkProvider,
+  buildGrokAcpArgs,
+  resolveGrokBinaryPath,
+  resolveGrokPermissionMode,
+  GROK_CLI_PATH_ENV,
+  GROK_CLI_BINARY,
+} from '../../src/agent/providers/grok-sdk.js';
 import { BACKGROUND_SUBAGENT_WAKE_MODES, PROVIDER_ERROR_CODES, type ToolCallEvent } from '../../src/agent/transport-provider.js';
 import {
   SDK_SUBAGENT_PROVIDER_KINDS,
@@ -19,6 +32,8 @@ function attachRoute(provider: GrokSdkProvider, routeId = 'grok-route') {
     loaded: true,
     modeApplied: true,
     promptInFlight: true,
+    promptSubmittedGeneration: 1,
+    activePromptAdmissions: new Map(),
     turnGeneration: 1,
     settledGeneration: 0,
     replaying: false,
@@ -46,6 +61,24 @@ describe('GrokSdkProvider contract', () => {
     await provider.disconnect();
   });
 
+  it('resolves Grok binary path honoring config override and GROK_CLI_PATH', () => {
+    expect(resolveGrokBinaryPath({ binaryPath: '/custom/path/grok' })).toBe('/custom/path/grok');
+
+    const origEnv = process.env[GROK_CLI_PATH_ENV];
+    try {
+      process.env[GROK_CLI_PATH_ENV] = '/env/path/grok';
+      expect(resolveGrokBinaryPath()).toBe('/env/path/grok');
+      // Explicit config overrides env
+      expect(resolveGrokBinaryPath({ binaryPath: '/override/grok' })).toBe('/override/grok');
+    } finally {
+      if (origEnv === undefined) {
+        delete process.env[GROK_CLI_PATH_ENV];
+      } else {
+        process.env[GROK_CLI_PATH_ENV] = origEnv;
+      }
+    }
+  });
+
   it('declares the official Grok ACP transport capabilities', () => {
     const provider = new GrokSdkProvider();
     expect(provider.id).toBe('grok-sdk');
@@ -67,6 +100,40 @@ describe('GrokSdkProvider contract', () => {
       },
     });
     expect((provider as any).profile.args).toEqual(['--no-auto-update', 'agent', 'stdio']);
+  });
+
+  describe('maximum-permission launch posture (--dangerously-skip-permissions equivalent)', () => {
+    it('launches `grok agent stdio` with --permission-mode bypassPermissions by default, ahead of the subcommand', () => {
+      const provider = new GrokSdkProvider();
+      expect((provider as any).buildAcpArgs({})).toEqual([
+        '--no-auto-update', '--permission-mode', 'bypassPermissions', 'agent', 'stdio',
+      ]);
+      // The static profile argv is untouched; the posture is applied per connect().
+      expect((provider as any).profile.args).toEqual(['--no-auto-update', 'agent', 'stdio']);
+    });
+
+    it('can be opted out of with dangerouslySkipPermissions: false', () => {
+      expect(resolveGrokPermissionMode({ dangerouslySkipPermissions: false })).toBeUndefined();
+      const provider = new GrokSdkProvider();
+      expect((provider as any).buildAcpArgs({ dangerouslySkipPermissions: false })).toEqual(['--no-auto-update', 'agent', 'stdio']);
+    });
+
+    it('honors an explicit permissionMode, treats "default" as no flag, and ignores invalid values', () => {
+      expect(resolveGrokPermissionMode({ permissionMode: 'acceptEdits' })).toBe('acceptEdits');
+      expect(resolveGrokPermissionMode({ permissionMode: 'plan', dangerouslySkipPermissions: false })).toBe('plan');
+      expect(resolveGrokPermissionMode({ permissionMode: 'default' })).toBeUndefined();
+      expect(resolveGrokPermissionMode({ permissionMode: 'nonsense' })).toBe('bypassPermissions');
+      expect(resolveGrokPermissionMode(null)).toBe('bypassPermissions');
+    });
+
+    it('never duplicates or overrides a caller-provided --permission-mode', () => {
+      const args = buildGrokAcpArgs(['--no-auto-update', '--permission-mode', 'plan', 'agent', 'stdio'], {});
+      expect(args).toEqual(['--no-auto-update', '--permission-mode', 'plan', 'agent', 'stdio']);
+    });
+
+    it('keeps bridging approval requests so an opted-out or non-bypass mode still prompts the user', () => {
+      expect(new GrokSdkProvider().capabilities.approval).toBe(true);
+    });
   });
 
   it('normalizes Grok background-subagent lifecycle events for parent wake', () => {
@@ -290,25 +357,27 @@ describe('GrokSdkProvider contract', () => {
     expect(result.models).toEqual([{ id: 'grok-build', name: 'Grok Build' }]);
   });
 
-  it('registers managed MCP identity only on a real user session', async () => {
+  it.each([undefined, 'native-resume'])('registers the complete managed MCP binding on a real Grok session (resume=%s)', async (resumeId) => {
     const provider = new GrokSdkProvider();
     const connection = {
       newSession: vi.fn().mockResolvedValue({ sessionId: 'real-session' }),
+      loadSession: vi.fn().mockResolvedValue({}),
     };
     (provider as any).connection = connection;
     (provider as any).initPromise = Promise.resolve();
-    await provider.createSession({
+    await provider.createSession(withMemoryMcpSessionEnv({
       sessionKey: 'route-real',
+      sessionInstanceId: 'instance-grok', runtimeEpoch: 'epoch-grok', providerId: provider.id, resumeId,
       sessionName: 'deck_sub_grok',
       projectName: 'alpha',
       serverId: 'server-1',
       cwd: '/tmp/project',
       contextNamespace: { scope: 'project_shared', userId: 'user-1', projectId: 'alpha' },
-    });
+    }));
     const state = (provider as any).sessions.get('route-real');
     await (provider as any).ensureSessionReady('route-real', state);
 
-    const request = connection.newSession.mock.calls[0]?.[0];
+    const request = (resumeId ? connection.loadSession : connection.newSession).mock.calls[0]?.[0];
     expect(request.mcpServers).toHaveLength(1);
     expect(request.mcpServers[0]).toMatchObject({ name: 'imcodes-memory' });
     const env = Object.fromEntries(request.mcpServers[0].env.map((entry: { name: string; value: string }) => [entry.name, entry.value]));
@@ -316,6 +385,7 @@ describe('GrokSdkProvider contract', () => {
       IMCODES_DAEMON_SESSION_NAME: 'deck_sub_grok',
       IMCODES_DAEMON_PROJECT_NAME: 'alpha',
       IMCODES_DAEMON_SERVER_ID: 'server-1',
+      [E.SESSION_INSTANCE_ID]: 'instance-grok', [E.RUNTIME_EPOCH]: 'epoch-grok', [E.PROVIDER_ID]: provider.id,
     });
     expect(JSON.stringify(request.mcpServers)).not.toContain('IMCODES_SERVER_TOKEN');
   });
@@ -477,4 +547,123 @@ describe('GrokSdkProvider contract', () => {
     (provider as any).settleTurn('grok-route', state, 1, 'end_turn');
     expect(completions).toEqual(['message-1']);
   });
+
+  it('declares native active delegation capability for direct in-flight append', () => {
+    const provider = new GrokSdkProvider();
+    expect(provider.capabilities.activeDelegationNotification).toBe(
+      AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE,
+    );
+  });
+
+  it('supports native in-flight append via notifyActiveDelegation and sequential multi-turn settlement', async () => {
+    const provider = new GrokSdkProvider();
+    const { acpSessionId, state } = attachRoute(provider);
+    const tracker = {
+      writeQueue: Promise.resolve(),
+      abortController: new AbortController(),
+    };
+    let resolveTurn2: (res: { stopReason: 'end_turn' }) => void;
+    const queuedTurnPromise = new Promise<{ stopReason: 'end_turn' }>((resolve) => {
+      resolveTurn2 = resolve;
+    });
+    const prompt = vi.fn().mockReturnValue(queuedTurnPromise);
+    (provider as any).connection = { prompt, connection: tracker };
+
+    const deltas: string[] = [];
+    const completions: { id: string; content: string }[] = [];
+    provider.onDelta((_sessionId, delta) => deltas.push(delta.delta));
+    provider.onComplete((_sessionId, msg) => completions.push({ id: msg.id, content: msg.content }));
+
+    const notification = {
+      notificationId: 'grok-append-1',
+      delegationId: 'queue-append:grok-append-1',
+      sourceSessionName: 'grok-source',
+      text: 'Say BANANA now.',
+      deliveryKind: 'mcp_message' as const,
+    };
+
+    const admissionResult = await provider.notifyActiveDelegation('grok-route', notification);
+    expect(admissionResult).toBe(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+    expect(prompt).toHaveBeenCalledWith(expect.objectContaining({
+      sessionId: acpSessionId,
+      prompt: [{ type: 'text', text: 'Say BANANA now.' }],
+    }));
+
+    // Turn 1 stream arrives
+    (provider as any).handleSessionUpdate({
+      sessionId: acpSessionId,
+      update: { sessionUpdate: 'agent_message_chunk', messageId: 'turn-1-msg', content: { type: 'text', text: 'Counting 1 to 5' } },
+    });
+    expect(deltas).toEqual(['Counting 1 to 5']);
+
+    // Settle Turn 1
+    (provider as any).settleTurn('grok-route', state, 1, 'end_turn');
+    expect(completions).toEqual([{ id: 'turn-1-msg', content: 'Counting 1 to 5' }]);
+    expect(state.promptInFlight).toBe(true);
+
+    // Turn 2 stream arrives (not dropped because promptInFlight is preserved)
+    (provider as any).handleSessionUpdate({
+      sessionId: acpSessionId,
+      update: { sessionUpdate: 'agent_message_chunk', messageId: 'turn-2-msg', content: { type: 'text', text: 'BANANA' } },
+    });
+    expect(deltas).toEqual(['Counting 1 to 5', 'BANANA']);
+
+    // Settle Turn 2
+    resolveTurn2!({ stopReason: 'end_turn' });
+    await queuedTurnPromise;
+    await new Promise((r) => setTimeout(r, 10));
+
+    expect(completions).toEqual([
+      { id: 'turn-1-msg', content: 'Counting 1 to 5' },
+      { id: 'turn-2-msg', content: 'BANANA' },
+    ]);
+    expect(state.promptInFlight).toBe(false);
+  });
+
+  it('captures dynamic model catalog update from _x.ai/models/update notification', async () => {
+    const provider = new GrokSdkProvider();
+    attachRoute(provider);
+    const client = (provider as any).createClientImpl();
+
+    await client.extNotification('_x.ai/models/update', {
+      availableModels: [
+        { modelId: 'grok-4.7', name: 'Grok 4.7' },
+        { modelId: 'grok-4.7-mini', name: 'Grok 4.7 Mini' },
+      ],
+      currentModelId: 'grok-4.7',
+    });
+
+    const models = await provider.listModels();
+    expect(models).toEqual({
+      models: [
+        { id: 'grok-4.7', name: 'Grok 4.7' },
+        { id: 'grok-4.7-mini', name: 'Grok 4.7 Mini' },
+      ],
+      defaultModel: 'grok-4.7',
+      isAuthenticated: true,
+    });
+  });
+
+  it('maps connection drops to recoverable CONNECTION_LOST without leaking details', () => {
+    const provider = new GrokSdkProvider();
+    const error = (provider as any).normalizeError(new Error('Connection closed prematurely'));
+    expect(error).toMatchObject({
+      code: PROVIDER_ERROR_CODES.CONNECTION_LOST,
+      message: 'Grok connection was lost.',
+      recoverable: true,
+    });
+    expect(JSON.stringify(error)).not.toContain('prematurely');
+  });
+
+  it('suppresses error emissions during intentional disconnect', async () => {
+    const provider = new GrokSdkProvider();
+    const { state } = attachRoute(provider, 'disconnect-test');
+    const errors: any[] = [];
+    provider.onError((_sessionId, err) => errors.push(err));
+
+    (provider as any).isDisconnecting = true;
+    (provider as any).failTurn('disconnect-test', state, 1, new Error('Child process killed'));
+    expect(errors).toHaveLength(0);
+  });
 });
+

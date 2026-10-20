@@ -569,6 +569,23 @@ describe('SessionTabs', () => {
     expect(onStopProject).toHaveBeenCalledWith('proj-1');
   });
 
+  it('removes whole-project stop from a concrete shared-session surface', () => {
+    const sessions = makeSessions([{ name: 'session_w1', project: 'proj-1' }]);
+    render(
+      <SessionTabs
+        sessions={sessions}
+        activeSession={null}
+        onSelect={vi.fn()}
+        sessionsLoaded={true}
+        {...defaultProps}
+        canStopProject={false}
+      />,
+    );
+
+    fireEvent.contextMenu(screen.getByRole('tab'));
+    expect(screen.queryByRole('button', { name: /^Stop$/ })).toBeNull();
+  });
+
   it('uses typed icons and plain labels in the tab context menu', () => {
     const sessions = makeSessions([
       { name: 'deck_proj_brain', project: 'proj-1', role: 'brain', agentType: 'codex-sdk', userCreated: true },

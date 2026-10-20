@@ -4,20 +4,22 @@
 
 import { Hono } from 'hono';
 import type { Env } from '../env.js';
-import { getUserById, listAllUsers, updateUserStatus, deleteUser, countActiveAdmins, getAllSettings, setSetting } from '../db/queries.js';
+import { getUserById, listAllUsers, updateUserStatus, disableUserEndingSessions, deleteUser, countActiveAdmins, getAllSettings, setSetting } from '../db/queries.js';
 import { logAudit } from '../security/audit.js';
 import { requireAuth } from '../security/authorization.js';
+import { USER_STATUS, isUserStatusActive, userStatusDenialCode } from '../../../shared/user-status.js';
+import { closeConnectionsOfInactiveUsers } from '../ws/account-watch.js';
 
 export const adminRoutes = new Hono<{ Bindings: Env }>();
 
 // ── Admin middleware — reuses global requireAuth + checks is_admin ────────
 
-adminRoutes.use('*', requireAuth());
+adminRoutes.use('*', requireAuth({ refuseDaemonCredential: true }));
 adminRoutes.use('*', async (c, next) => {
   const userId = c.get('userId' as never) as string;
   const user = await getUserById(c.env.DB, userId);
   if (!user || !user.is_admin) return c.json({ error: 'forbidden' }, 403);
-  if (user.status !== 'active') return c.json({ error: 'account_disabled' }, 403);
+  if (!isUserStatusActive(user.status)) return c.json({ error: userStatusDenialCode(user.status) }, 403);
 
   c.set('adminUserId' as never, userId);
   return next();
@@ -44,9 +46,11 @@ adminRoutes.post('/users/:id/approve', async (c) => {
   const target = await getUserById(c.env.DB, targetId);
   if (!target) return c.json({ error: 'not_found' }, 404);
 
-  await updateUserStatus(c.env.DB, targetId, 'active');
+  // Approving / enabling restores the STATUS and nothing else: the API keys and sessions a disable ended stay ended
+  // (users.sessions_valid_after, revoked keys), so the user signs in again.
+  await updateUserStatus(c.env.DB, targetId, USER_STATUS.ACTIVE);
   const ip = c.get('clientIp' as never) as string ?? 'unknown';
-  await logAudit({ userId: c.get('adminUserId' as never) as string, action: 'admin.approve_user', ip, details: { targetId } }, c.env.DB);
+  await logAudit({ userId: c.get('adminUserId' as never) as string, action: 'admin.approve_user', ip, details: { targetId, previousStatus: target.status } }, c.env.DB);
   return c.json({ ok: true });
 });
 
@@ -67,9 +71,17 @@ adminRoutes.post('/users/:id/disable', async (c) => {
     if (adminCount <= 1) return c.json({ error: 'last_admin' }, 403);
   }
 
-  await updateUserStatus(c.env.DB, targetId, 'disabled');
+  const ended = await disableUserEndingSessions(c.env.DB, targetId, Date.now());
+  // This replica's live sockets (browser terminals, share participants, the user's daemons) close now; every other replica closes its own
+  // within ACCOUNT_CONNECTION_WATCH_INTERVAL_MS (ws/account-watch.ts).
+  const closed = await closeConnectionsOfInactiveUsers(c.env.DB).catch(() => ({ inactiveUsers: 0, browserSockets: 0, daemons: 0 }));
   const ip = c.get('clientIp' as never) as string ?? 'unknown';
-  await logAudit({ userId: c.get('adminUserId' as never) as string, action: 'admin.disable_user', ip, details: { targetId } }, c.env.DB);
+  await logAudit({
+    userId: c.get('adminUserId' as never) as string,
+    action: 'admin.disable_user',
+    ip,
+    details: { targetId, previousStatus: target.status, ...ended, browserSocketsClosed: closed.browserSockets, daemonsClosed: closed.daemons },
+  }, c.env.DB);
   return c.json({ ok: true });
 });
 
@@ -91,6 +103,7 @@ adminRoutes.delete('/users/:id', async (c) => {
   }
 
   await deleteUser(c.env.DB, targetId);
+  await closeConnectionsOfInactiveUsers(c.env.DB).catch(() => undefined);
   const ip = c.get('clientIp' as never) as string ?? 'unknown';
   await logAudit({ userId: c.get('adminUserId' as never) as string, action: 'admin.delete_user', ip, details: { targetId } }, c.env.DB);
   return c.json({ ok: true });

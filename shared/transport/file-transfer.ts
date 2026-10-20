@@ -3,6 +3,13 @@
  * Used by server, daemon, and web.
  */
 
+import {
+  FILE_BROWSER_FILTER_MAX_QUERY_CHARS,
+  FILE_BROWSER_SORT_DIRECTIONS,
+  FILE_BROWSER_SORT_KEY_LIST,
+  type FileBrowserSortState,
+} from '../file-browser-sort.js';
+
 // ── Object model ──────────────────────────────────────────────────────────────
 
 export type AttachmentSource = 'upload' | 'camera' | 'paste' | 'local' | 'generated';
@@ -20,6 +27,19 @@ export interface AttachmentRef {
   downloadable: boolean;
 }
 
+/**
+ * Filesystem identity of a controlled-node download source. This is carried
+ * only on the authenticated machine-transfer control path; it is deliberately
+ * separate from AttachmentRef so ordinary chat attachments do not expose host
+ * filesystem metadata.
+ */
+export interface FileTransferSourceIdentity {
+  size: number;
+  mtimeMs: number;
+  device: number;
+  inode: number;
+}
+
 export type PreviewType = 'text' | 'image' | 'pdf' | 'unsupported';
 export type PreviewReason = 'too_large' | 'binary' | 'unknown_type' | 'render_failed';
 
@@ -31,6 +51,30 @@ export interface PreviewMeta {
 }
 
 // ── Phase 1 limits ────────────────────────────────────────────────────────────
+
+/** Maximum extension bytes kept in the legacy flat upload filename. */
+export const FILE_TRANSFER_LEGACY_EXTENSION_MAX_CHARS = 20;
+
+/**
+ * The flat filename understood by pre-upload-layout daemons.  Keep this
+ * protocol value alongside the new metadata fields: old daemons use it as
+ * their on-disk basename, while new daemons strip the extension and use the
+ * id as the directory name.
+ */
+export function fileTransferLegacyFilename(storageId: string, originalName: string): string {
+  const basename = originalName.split(/[\\/]/).pop() ?? '';
+  const dot = basename.lastIndexOf('.');
+  const extension = (dot > 0 ? basename.slice(dot) : '')
+    .replace(/[^a-zA-Z0-9.]/g, '')
+    .slice(0, FILE_TRANSFER_LEGACY_EXTENSION_MAX_CHARS);
+  return `${storageId}${extension}`;
+}
+
+/** Recover the stable upload id from either the new or legacy filename shape. */
+export function fileTransferStorageId(filename: string): string {
+  const match = /^([a-f0-9]{32})(?:\.[A-Za-z0-9]{1,20})?$/i.exec(filename);
+  return match?.[1] ?? filename;
+}
 
 export const FILE_TRANSFER_LIMITS = {
   /** Maximum single file size in bytes (2 GB). */
@@ -60,6 +104,14 @@ export const FILE_TRANSFER_LIMITS = {
    *  for genuinely large files where avoiding base64-over-WS bloat matters.
    *  1 MiB raw ≈ 1.37 MiB base64. */
   DOWNLOAD_INLINE_MAX_BYTES: 1024 * 1024,
+  /** Daemon→server relay HTTP calls that fail before any byte is sent (connect
+   *  timeout, DNS failure, TLS dropped before the handshake) are retried this
+   *  many times in total, with exponential backoff between BASE and MAX. Sized
+   *  to ride out a multi-second gateway/proxy hiccup while staying well inside
+   *  STAGED_UPLOAD_TTL_MS. */
+  RELAY_PRE_CONNECT_MAX_ATTEMPTS: 5,
+  RELAY_PRE_CONNECT_BASE_DELAY_MS: 500,
+  RELAY_PRE_CONNECT_MAX_DELAY_MS: 4_000,
   /** Temporary uploaded files are cleaned after this duration (ms). 24 hours. */
   TEMP_TTL_MS: 24 * 60 * 60 * 1000,
   /** Project-file download handles expire after this duration (ms). 4 hours. */
@@ -68,19 +120,168 @@ export const FILE_TRANSFER_LIMITS = {
   UPLOAD_DIR: '/tmp/imcodes-uploads',
 } as const;
 
+/**
+ * The MCP resource guard must not apply the ordinary short request budget to a
+ * machine transfer.  A transfer is already bounded per HTTP/direct attempt;
+ * this outer budget is a safety net for the whole resumable operation.  The
+ * size component makes the budget grow with legitimate payloads while the cap
+ * still prevents a permanently stalled operation from occupying the MCP
+ * process forever.
+ */
+export const FILE_TRANSFER_MCP_TIMEOUT = {
+  MIN_MS: FILE_TRANSFER_LIMITS.DOWNLOAD_TIMEOUT_MS,
+  /** Conservative floor used when a remote fetch size is not known locally. */
+  PER_MIB_MS: 250,
+  MAX_MS: 60 * 60 * 1000,
+} as const;
+
+export function fileTransferMcpTimeoutMs(sizeBytes?: number): number {
+  const size = Number.isSafeInteger(sizeBytes) && (sizeBytes as number) >= 0 ? sizeBytes as number : 0;
+  const sizeBudget = Math.ceil(size / (1024 * 1024)) * FILE_TRANSFER_MCP_TIMEOUT.PER_MIB_MS;
+  return Math.min(
+    FILE_TRANSFER_MCP_TIMEOUT.MAX_MS,
+    Math.max(FILE_TRANSFER_MCP_TIMEOUT.MIN_MS, FILE_TRANSFER_MCP_TIMEOUT.MIN_MS + sizeBudget),
+  );
+}
+
 // ── Capability advertisement ────────────────────────────────────────────────
 
 export const FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY = 'file.transfer.upload_fetch.v1' as const;
 export const FILE_TRANSFER_DOWNLOAD_STREAM_CAPABILITY = 'file.transfer.download_stream.v1' as const;
 export const FILE_TRANSFER_PATH_HANDLE_CAPABILITY = 'file.transfer.path_handle.v1' as const;
+
+/** Headers on the node's relay PUT (node -> server staged download sink). */
+export const FILE_TRANSFER_RELAY_HEADER = {
+  FILENAME: 'x-imcodes-filename',
+  /** Byte the PUT body starts at; absent means the whole file. */
+  OFFSET: 'x-imcodes-offset',
+} as const;
+
+export const FILE_TRANSFER_HTTP_HEADER = {
+  RANGE: 'range',
+  CONTENT_RANGE: 'content-range',
+  ACCEPT_RANGES: 'Accept-Ranges',
+} as const;
+
+/** Browser -> Server resumable upload multipart fields. */
+export const FILE_TRANSFER_RESUMABLE_UPLOAD_FIELD = {
+  FILE: 'file',
+  CLIENT_UPLOAD_ID: 'clientUploadId',
+  DESTINATION_DIRECTORY: 'destinationDirectory',
+  OFFSET: 'uploadOffset',
+  TOTAL_SIZE: 'uploadTotalSize',
+  ORIGINAL_NAME: 'uploadOriginalName',
+  LAST_MODIFIED: 'uploadLastModified',
+} as const;
+
+export const FILE_TRANSFER_RESUMABLE_UPLOAD = {
+  /** Keeps multipart overhead bounded while avoiding hundreds of round trips. */
+  CHUNK_BYTES: 8 * 1024 * 1024,
+  MAX_ATTEMPTS_WITHOUT_PROGRESS: 5,
+  // Machine-to-machine relay attempts must not inherit the five-minute
+  // browser upload budget: a dead target otherwise leaves send_file_to_machine
+  // without a terminal result while every retry waits on the same request.
+  ATTEMPT_TIMEOUT_MS: 15_000,
+  RETRY_BACKOFF_MS: [500, 1_000, 2_000, 4_000, 8_000] as const,
+} as const;
+
+export const FILE_TRANSFER_RESUMABLE_UPLOAD_ERROR = {
+  IDENTITY_MISMATCH: 'upload_identity_mismatch',
+  CONTENT_MISMATCH: 'upload_content_mismatch',
+  EXPIRED: 'upload_expired',
+} as const;
+
+export const FILE_TRANSFER_DOWNLOAD_RESUME = {
+  MAX_ATTEMPTS_WITHOUT_PROGRESS: 4,
+  MAX_RESUMES: 40,
+  BACKOFF_MS: [1_000, 2_000, 4_000, 8_000] as const,
+  /** Native download managers may spend one request per Range retry. */
+  TOKEN_MAX_USES: 42,
+} as const;
+
+/**
+ * HTTP resume of an attachment download. Only the one shape the browser sends
+ * is understood -- an open-ended `bytes=N-`. Anything else is ignored and the
+ * whole file is served, which RFC 9110 allows.
+ */
+export function formatFileTransferRangeRequest(offset: number): string {
+  return `bytes=${offset}-`;
+}
+
+export function parseFileTransferRangeRequest(header: string | null | undefined): number {
+  const match = /^bytes=(\d{1,16})-$/.exec((header ?? '').trim());
+  if (!match) return 0;
+  const offset = Number(match[1]);
+  return Number.isSafeInteger(offset) ? offset : 0;
+}
+
+export function formatFileTransferContentRange(start: number, total: number): string {
+  return `bytes ${start}-${total - 1}/${total}`;
+}
+
+export function parseFileTransferContentRange(
+  header: string | null | undefined,
+): { start: number; end: number; total: number } | null {
+  const match = /^bytes (\d{1,16})-(\d{1,16})\/(\d{1,16})$/.exec((header ?? '').trim());
+  if (!match) return null;
+  const [start, end, total] = [Number(match[1]), Number(match[2]), Number(match[3])];
+  if (![start, end, total].every(Number.isSafeInteger) || start > end || end >= total) return null;
+  return { start, end, total };
+}
 export const FILE_TRANSFER_DIRECTORY_CAPABILITY = 'file.transfer.directory.v1' as const;
+/**
+ * The node can filter and order a directory listing itself (`query` on the list
+ * request) and report size/mtime/birthtime per entry plus `truncated`/`total`.
+ * Peers that do not advertise it get the plain listing, byte for byte.
+ */
+export const FILE_TRANSFER_DIRECTORY_QUERY_CAPABILITY = 'file.transfer.directory.query.v1' as const;
+/** A query stats at most this many entries; a larger match set is ordered over its first ones and reported `partial`. */
+export const FILE_TRANSFER_DIRECTORY_QUERY_MAX_STAT_ENTRIES = 50_000;
+/** Wall-clock budget of one query's stat pass; entries not stat'd by then sort last and the answer is `partial`. */
+export const FILE_TRANSFER_DIRECTORY_QUERY_BUDGET_MS = 8_000;
 export const FILE_TRANSFER_PATH_MAX_BYTES = 4 * 1024;
 export const FILE_TRANSFER_ERROR_MAX_BYTES = 256;
 export const FILE_TRANSFER_DIRECTORY_MAX_ENTRIES = 512;
+/**
+ * Sentinel paths the daemon resolves on the REMOTE machine's behalf.
+ *
+ * Only the daemon knows where these actually live: `Downloads` may have been
+ * redirected on Windows, and on Linux it is whatever `user-dirs.dirs` says --
+ * possibly localized ("Téléchargements"). So the browser asks by NAME and the
+ * daemon answers with the real path in `resolvedPath`.
+ *
+ * They ride in the existing `path` field on purpose. `validateFileDirectoryListRequest`
+ * enforces `hasOnlyKeys(['type','requestId','path'])` and the server route
+ * re-checks the same key set, so a new request field would be a breaking change
+ * across three layers; a new sentinel value is not. `:drives:` already
+ * established the pattern.
+ */
 export const FILE_TRANSFER_DIRECTORY_PATH = {
   WINDOWS_DRIVES: ':drives:',
   WINDOWS_DRIVES_ROOT: '__imcodes_windows_drives__',
+  HOME: ':home:',
+  DESKTOP: ':desktop:',
+  DOWNLOADS: ':downloads:',
+  DOCUMENTS: ':documents:',
 } as const;
+
+/** The sentinels that resolve to a well-known user directory. */
+export const FILE_TRANSFER_WELL_KNOWN_DIRECTORY_PATHS = [
+  FILE_TRANSFER_DIRECTORY_PATH.HOME,
+  FILE_TRANSFER_DIRECTORY_PATH.DESKTOP,
+  FILE_TRANSFER_DIRECTORY_PATH.DOWNLOADS,
+  FILE_TRANSFER_DIRECTORY_PATH.DOCUMENTS,
+] as const;
+
+export type FileTransferWellKnownDirectoryPath =
+  (typeof FILE_TRANSFER_WELL_KNOWN_DIRECTORY_PATHS)[number];
+
+export function isFileTransferWellKnownDirectoryPath(
+  value: unknown,
+): value is FileTransferWellKnownDirectoryPath {
+  return typeof value === 'string'
+    && (FILE_TRANSFER_WELL_KNOWN_DIRECTORY_PATHS as readonly string[]).includes(value);
+}
 
 /** Machine-readable upload-error codes shared by the daemon (producer), server
  *  (relay) and web (localized display). */
@@ -110,6 +311,11 @@ export const FILE_TRANSFER_MSG = {
   DELETE: 'file.delete_attachment',
   DELETE_DONE: 'file.delete_attachment_done',
   DELETE_ERROR: 'file.delete_attachment_error',
+  /** Server -> controlled node: reveal the native Full Disk Access settings
+   *  pane, macOS only. See `MACOS_OPEN_FULL_DISK_ACCESS_ERROR`. */
+  MACOS_OPEN_FULL_DISK_ACCESS: 'file.macos_open_full_disk_access',
+  MACOS_OPEN_FULL_DISK_ACCESS_DONE: 'file.macos_open_full_disk_access_done',
+  MACOS_OPEN_FULL_DISK_ACCESS_ERROR: 'file.macos_open_full_disk_access_error',
 } as const;
 
 export const FILE_TRANSFER_DELETE_ERROR = {
@@ -130,11 +336,60 @@ export const FILE_PATH_HANDLE_ERROR = {
 
 export type FilePathHandleErrorReason = typeof FILE_PATH_HANDLE_ERROR[keyof typeof FILE_PATH_HANDLE_ERROR];
 
+/**
+ * Machine-readable `file.directory_list_error` codes shared by the daemon
+ * (producer), server (relay) and web (localized display + remediation UI).
+ * Generic failures (not found, forbidden, timeout, ...) ride as free-form
+ * strings already; this is only for reasons the web needs to react to
+ * specifically rather than just display.
+ */
+export const FILE_TRANSFER_DIRECTORY_LIST_ERROR = {
+  /**
+   * macOS denied access to a well-known user folder (Desktop/Downloads/
+   * Documents) because the daemon binary lacks Full Disk Access. The web
+   * client shows a persistent prompt with a button that asks the daemon to
+   * open the native Full Disk Access settings pane, instead of silently
+   * falling back to the home directory.
+   */
+  MACOS_FULL_DISK_ACCESS_REQUIRED: 'macos_full_disk_access_required',
+  /**
+   * Same condition, but the node asked the signed aiDesk.to app to read the folder (shared/macos-fs-delegate.ts) and macOS refused
+   * THE APP: the app, not the node's bare executable, is the entry to enable under Full Disk Access. A browser that predates this
+   * code shows its generic error text for it (and no prompt); a daemon that predates it never sends it.
+   */
+  MACOS_FULL_DISK_ACCESS_REQUIRED_APP: 'macos_full_disk_access_required_app',
+} as const;
+
+export type FileTransferDirectoryListErrorReason =
+  typeof FILE_TRANSFER_DIRECTORY_LIST_ERROR[keyof typeof FILE_TRANSFER_DIRECTORY_LIST_ERROR];
+
+/** Which identity is missing Full Disk Access: the aiDesk.to app (`app`), or the node's own executable (`node`, the long-standing case). */
+export type MacosFullDiskAccessTarget = 'app' | 'node';
+
+/** The identity a `file.directory_list_error` code says needs Full Disk Access, or `null` when the code is not about it. */
+export function macosFullDiskAccessTargetOfError(code: unknown): MacosFullDiskAccessTarget | null {
+  if (code === FILE_TRANSFER_DIRECTORY_LIST_ERROR.MACOS_FULL_DISK_ACCESS_REQUIRED) return 'node';
+  if (code === FILE_TRANSFER_DIRECTORY_LIST_ERROR.MACOS_FULL_DISK_ACCESS_REQUIRED_APP) return 'app';
+  return null;
+}
+
+/** Why the daemon could not reveal the native Full Disk Access settings pane. */
+export const MACOS_OPEN_FULL_DISK_ACCESS_ERROR = {
+  /** The controlled node is not running on macOS. */
+  UNSUPPORTED_PLATFORM: 'unsupported_platform',
+  /** No signed-in Aqua console user to open System Settings in front of. */
+  NO_ACTIVE_GUI_SESSION: 'no_active_gui_session',
+} as const;
+
+export type MacosOpenFullDiskAccessErrorReason =
+  typeof MACOS_OPEN_FULL_DISK_ACCESS_ERROR[keyof typeof MACOS_OPEN_FULL_DISK_ACCESS_ERROR];
+
 export interface FileUploadRequest {
   type: 'file.upload';
   uploadId: string;
   filename: string;
   originalName?: string;
+  sanitizedName?: string;
   mime?: string;
   size: number;
   content: string; // base64
@@ -149,6 +404,7 @@ export interface FileUploadFetchRequest {
   uploadId: string;
   filename: string;
   originalName?: string;
+  sanitizedName?: string;
   mime?: string;
   size: number;
   downloadUrl: string;
@@ -169,6 +425,8 @@ export interface FileDownloadStreamRequest {
   downloadId: string;
   attachmentId: string;
   uploadUrl: string;
+  /** Resume an interrupted HTTP download from this byte. */
+  offset?: number;
 }
 
 /** Server -> controlled node: mint a short-lived handle for one explicit path. */
@@ -178,17 +436,58 @@ export interface FilePathHandleRequest {
   path: string;
 }
 
+/**
+ * What a node does to a listing before it truncates it to
+ * FILE_TRANSFER_DIRECTORY_MAX_ENTRIES: keep the entries whose name matches
+ * `nameFilter` (every whitespace-separated term, case-insensitive substring;
+ * never a pattern, never applied to the path), then order them by `sort`.
+ * Only sent to a node that advertises FILE_TRANSFER_DIRECTORY_QUERY_CAPABILITY.
+ */
+export interface FileDirectoryListQuery {
+  sort: FileBrowserSortState;
+  nameFilter?: string;
+}
+
 export interface FileDirectoryListRequest {
   type: typeof FILE_TRANSFER_MSG.DIRECTORY_LIST;
   requestId: string;
   path: string;
+  /** Absent for a plain listing (every peer that predates the query capability). */
+  query?: FileDirectoryListQuery;
 }
 
 export interface FileDirectoryEntry {
   name: string;
   path: string;
-  isDir: true;
+  isDir: boolean;
   hidden: boolean;
+  /**
+   * Capacity of the filesystem this entry sits on, when the daemon could
+   * measure it. Only populated for volume roots -- a per-file `statfs` on a
+   * 512-entry listing would be 512 syscalls for a number that is the same for
+   * every one of them.
+   */
+  totalBytes?: number;
+  freeBytes?: number;
+  /**
+   * Present only in answer to a `query`. Bytes (files only); last-modified and
+   * creation time in epoch ms. `birthtimeMs` is left out where the platform
+   * cannot report a creation time (Linux): a ctime is never sent in its place.
+   */
+  size?: number;
+  mtimeMs?: number;
+  birthtimeMs?: number;
+}
+
+/** Non-negative, finite, and small enough to be a real byte count. */
+function isByteCount(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0
+    && value <= Number.MAX_SAFE_INTEGER;
+}
+
+/** A timestamp in epoch milliseconds: finite, non-negative, within the range a Date can hold. */
+function isEpochMs(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= 8.64e15;
 }
 
 export interface FileDirectoryListDone {
@@ -197,6 +496,17 @@ export interface FileDirectoryListDone {
   path: string;
   resolvedPath: string;
   entries: FileDirectoryEntry[];
+  /** Present (true) only when a query matched more entries than `entries` carries. */
+  truncated?: true;
+  /** Entries that matched the query (before truncation); only present with `truncated`. */
+  total?: number;
+  /**
+   * The order was computed over only part of the matching entries: more matched
+   * than the stat limit allows, or the time budget ran out before every one
+   * had been stat'd. Independent of `truncated`; `total` is still the full
+   * count of matches.
+   */
+  partial?: true;
 }
 
 export interface FileDirectoryListError {
@@ -209,6 +519,17 @@ export interface FileDeleteRequest {
   type: typeof FILE_TRANSFER_MSG.DELETE;
   requestId: string;
   attachmentId: string;
+}
+
+/**
+ * Server -> controlled node: reveal the native Full Disk Access settings
+ * pane in the signed-in user's own session, macOS only. Issued after a
+ * `file.directory_list_error` carrying
+ * `FILE_TRANSFER_DIRECTORY_LIST_ERROR.MACOS_FULL_DISK_ACCESS_REQUIRED`.
+ */
+export interface MacosOpenFullDiskAccessRequest {
+  type: typeof FILE_TRANSFER_MSG.MACOS_OPEN_FULL_DISK_ACCESS;
+  requestId: string;
 }
 
 // ── Daemon → Server messages ──────────────────────────────────────────────────
@@ -248,7 +569,10 @@ export interface FileDownloadStreamReady {
   downloadId: string;
   mime?: string;
   filename?: string;
+  /** Size of the whole file, even when streaming from an offset. */
   size?: number;
+  /** The offset the stream actually starts at; absent means 0. */
+  offset?: number;
 }
 
 export interface FileDownloadError {
@@ -261,6 +585,8 @@ export interface FilePathHandleDone {
   type: typeof FILE_TRANSFER_MSG.PATH_HANDLE_DONE;
   requestId: string;
   attachment: AttachmentRef;
+  /** Required by machine-file callers before reusing a durable partial. */
+  sourceIdentity?: FileTransferSourceIdentity;
 }
 
 export interface FilePathHandleError {
@@ -272,6 +598,18 @@ export interface FilePathHandleError {
 export interface FileDeleteDone {
   type: typeof FILE_TRANSFER_MSG.DELETE_DONE;
   requestId: string;
+}
+
+/** The settings pane was told to open. Not proof the user granted access. */
+export interface MacosOpenFullDiskAccessDone {
+  type: typeof FILE_TRANSFER_MSG.MACOS_OPEN_FULL_DISK_ACCESS_DONE;
+  requestId: string;
+}
+
+export interface MacosOpenFullDiskAccessError {
+  type: typeof FILE_TRANSFER_MSG.MACOS_OPEN_FULL_DISK_ACCESS_ERROR;
+  requestId: string;
+  error: MacosOpenFullDiskAccessErrorReason;
 }
 
 export interface FileDeleteError {
@@ -292,7 +630,9 @@ export type FileTransferDaemonMessage =
   | FileDirectoryListDone
   | FileDirectoryListError
   | FileDeleteDone
-  | FileDeleteError;
+  | FileDeleteError
+  | MacosOpenFullDiskAccessDone
+  | MacosOpenFullDiskAccessError;
 
 export type FileTransferServerMessage =
   | FileUploadRequest
@@ -301,7 +641,8 @@ export type FileTransferServerMessage =
   | FileDownloadStreamRequest
   | FilePathHandleRequest
   | FileDirectoryListRequest
-  | FileDeleteRequest;
+  | FileDeleteRequest
+  | MacosOpenFullDiskAccessRequest;
 
 export type ControlledFileTransferResponse =
   | FileUploadDone
@@ -315,7 +656,9 @@ export type ControlledFileTransferResponse =
   | FileDirectoryListDone
   | FileDirectoryListError
   | FileDeleteDone
-  | FileDeleteError;
+  | FileDeleteError
+  | MacosOpenFullDiskAccessDone
+  | MacosOpenFullDiskAccessError;
 
 export type ControlledFileTransferRequest =
   | FileUploadFetchRequest
@@ -323,7 +666,8 @@ export type ControlledFileTransferRequest =
   | FileDownloadStreamRequest
   | FilePathHandleRequest
   | FileDirectoryListRequest
-  | FileDeleteRequest;
+  | FileDeleteRequest
+  | MacosOpenFullDiskAccessRequest;
 
 export type FileTransferValidationResult<T> =
   | { ok: true; value: T }
@@ -342,6 +686,18 @@ function utf8Bytes(value: string): number {
 
 function isObject(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+export function validateFileTransferSourceIdentity(value: unknown): FileTransferSourceIdentity | null {
+  if (!isObject(value)
+    || !hasOnlyKeys(value, new Set(['size', 'mtimeMs', 'device', 'inode']))
+    || !isSafeSize(value.size)
+    || typeof value.mtimeMs !== 'number' || !Number.isFinite(value.mtimeMs) || value.mtimeMs < 0
+    || typeof value.device !== 'number' || !Number.isSafeInteger(value.device) || value.device < 0
+    || typeof value.inode !== 'number' || !Number.isSafeInteger(value.inode) || value.inode < 0) {
+    return null;
+  }
+  return value as unknown as FileTransferSourceIdentity;
 }
 
 function hasOnlyKeys(value: Record<string, unknown>, allowed: ReadonlySet<string>): boolean {
@@ -393,12 +749,27 @@ export function validateFilePathHandleRequest(value: unknown): FileTransferValid
   return { ok: true, value: value as unknown as FilePathHandleRequest };
 }
 
+/** Exact shape only: unknown keys, an unknown sort key, or a name filter over the length limit are all rejected. */
+export function isFileDirectoryListQuery(value: unknown): value is FileDirectoryListQuery {
+  if (!isObject(value) || !hasOnlyKeys(value, new Set(['sort', 'nameFilter']))) return false;
+  const sort = value.sort;
+  if (!isObject(sort) || !hasOnlyKeys(sort, new Set(['key', 'direction', 'dirsFirst']))) return false;
+  if (!FILE_BROWSER_SORT_KEY_LIST.includes(sort.key as never)
+    || (sort.direction !== FILE_BROWSER_SORT_DIRECTIONS.ASC && sort.direction !== FILE_BROWSER_SORT_DIRECTIONS.DESC)
+    || typeof sort.dirsFirst !== 'boolean') return false;
+  if (value.nameFilter === undefined) return true;
+  return typeof value.nameFilter === 'string'
+    && value.nameFilter.length <= FILE_BROWSER_FILTER_MAX_QUERY_CHARS
+    && utf8Bytes(value.nameFilter) <= FILE_BROWSER_FILTER_MAX_QUERY_CHARS * 4;
+}
+
 export function validateFileDirectoryListRequest(value: unknown): FileTransferValidationResult<FileDirectoryListRequest> {
   if (!isObject(value)) return { ok: false, error: 'invalid_object' };
-  if (!hasOnlyKeys(value, new Set(['type', 'requestId', 'path']))) return { ok: false, error: 'unknown_field' };
+  if (!hasOnlyKeys(value, new Set(['type', 'requestId', 'path', 'query']))) return { ok: false, error: 'unknown_field' };
   if (value.type !== FILE_TRANSFER_MSG.DIRECTORY_LIST) return { ok: false, error: 'invalid_type' };
   if (!isTransferId(value.requestId)) return { ok: false, error: 'invalid_request_id' };
   if (!isBoundedString(value.path, FILE_TRANSFER_PATH_MAX_BYTES)) return { ok: false, error: 'invalid_path' };
+  if (value.query !== undefined && !isFileDirectoryListQuery(value.query)) return { ok: false, error: 'invalid_query' };
   return { ok: true, value: value as unknown as FileDirectoryListRequest };
 }
 
@@ -411,6 +782,16 @@ export function validateFileDeleteRequest(value: unknown): FileTransferValidatio
   return { ok: true, value: value as unknown as FileDeleteRequest };
 }
 
+export function validateMacosOpenFullDiskAccessRequest(
+  value: unknown,
+): FileTransferValidationResult<MacosOpenFullDiskAccessRequest> {
+  if (!isObject(value)) return { ok: false, error: 'invalid_object' };
+  if (!hasOnlyKeys(value, new Set(['type', 'requestId']))) return { ok: false, error: 'unknown_field' };
+  if (value.type !== FILE_TRANSFER_MSG.MACOS_OPEN_FULL_DISK_ACCESS) return { ok: false, error: 'invalid_type' };
+  if (!isTransferId(value.requestId)) return { ok: false, error: 'invalid_request_id' };
+  return { ok: true, value: value as unknown as MacosOpenFullDiskAccessRequest };
+}
+
 /** Strict validator for the bounded file controls accepted by the thin node. */
 export function validateControlledFileTransferRequest(
   value: unknown,
@@ -419,11 +800,13 @@ export function validateControlledFileTransferRequest(
   if (value.type === FILE_TRANSFER_MSG.PATH_HANDLE) return validateFilePathHandleRequest(value);
   if (value.type === FILE_TRANSFER_MSG.DIRECTORY_LIST) return validateFileDirectoryListRequest(value);
   if (value.type === FILE_TRANSFER_MSG.DELETE) return validateFileDeleteRequest(value);
+  if (value.type === FILE_TRANSFER_MSG.MACOS_OPEN_FULL_DISK_ACCESS) return validateMacosOpenFullDiskAccessRequest(value);
   if (value.type === 'file.upload_fetch') {
-    if (!hasOnlyKeys(value, new Set(['type', 'uploadId', 'filename', 'originalName', 'mime', 'size', 'downloadUrl', 'clientUploadId', 'destinationDirectory']))
+    if (!hasOnlyKeys(value, new Set(['type', 'uploadId', 'filename', 'originalName', 'sanitizedName', 'mime', 'size', 'downloadUrl', 'clientUploadId', 'destinationDirectory']))
       || !isTransferId(value.uploadId)
       || typeof value.filename !== 'string' || !/^[a-f0-9]{16,128}(\.[A-Za-z0-9]{1,20})?$/.test(value.filename)
       || (value.originalName !== undefined && !isBoundedString(value.originalName, 1024))
+      || (value.sanitizedName !== undefined && !isBoundedString(value.sanitizedName, 255))
       || (value.mime !== undefined && !isBoundedString(value.mime, 256))
       || (value.clientUploadId !== undefined && !isTransferId(value.clientUploadId))
       || (value.destinationDirectory !== undefined && !isBoundedString(value.destinationDirectory, FILE_TRANSFER_PATH_MAX_BYTES))
@@ -441,9 +824,10 @@ export function validateControlledFileTransferRequest(
     return { ok: true, value: value as unknown as FileDownloadRequest };
   }
   if (value.type === FILE_TRANSFER_MSG.DOWNLOAD_STREAM) {
-    if (!hasOnlyKeys(value, new Set(['type', 'downloadId', 'attachmentId', 'uploadUrl']))
+    if (!hasOnlyKeys(value, new Set(['type', 'downloadId', 'attachmentId', 'uploadUrl', 'offset']))
       || !isTransferId(value.downloadId) || !isTransferId(value.attachmentId)
-      || !isBoundedString(value.uploadUrl, 8192)) {
+      || !isBoundedString(value.uploadUrl, 8192)
+      || (value.offset !== undefined && !isSafeSize(value.offset))) {
       return { ok: false, error: 'invalid_download_stream' };
     }
     return { ok: true, value: value as unknown as FileDownloadStreamRequest };
@@ -489,11 +873,14 @@ export function validateControlledFileTransferResponse(
     return { ok: true, value: v as unknown as FileDownloadDone };
   }
   if (v.type === FILE_TRANSFER_MSG.DOWNLOAD_STREAM_READY) {
-    if (!hasOnlyKeys(v, new Set(['type', 'downloadId', 'mime', 'filename', 'size']))
+    if (!hasOnlyKeys(v, new Set(['type', 'downloadId', 'mime', 'filename', 'size', 'offset']))
       || !isTransferId(v.downloadId)
       || (v.mime !== undefined && !isBoundedString(v.mime, 256))
       || (v.filename !== undefined && !isBoundedString(v.filename, 1024))
-      || (v.size !== undefined && !isSafeSize(v.size))) return { ok: false, error: 'invalid_download_ready' };
+      || (v.size !== undefined && !isSafeSize(v.size))
+      || (v.offset !== undefined && (!isSafeSize(v.offset) || v.size === undefined || v.offset > v.size))) {
+      return { ok: false, error: 'invalid_download_ready' };
+    }
     return { ok: true, value: v as unknown as FileDownloadStreamReady };
   }
   if (v.type === 'file.download_error') {
@@ -504,9 +891,21 @@ export function validateControlledFileTransferResponse(
   }
   if (v.type === FILE_TRANSFER_MSG.PATH_HANDLE_DONE) {
     const attachment = validateAttachmentRef(v.attachment);
-    if (!hasOnlyKeys(v, new Set(['type', 'requestId', 'attachment']))
-      || !isTransferId(v.requestId) || !attachment) return { ok: false, error: 'invalid_path_handle_done' };
-    return { ok: true, value: { type: v.type, requestId: v.requestId, attachment } };
+    const sourceIdentity = v.sourceIdentity === undefined
+      ? undefined
+      : validateFileTransferSourceIdentity(v.sourceIdentity);
+    if (!hasOnlyKeys(v, new Set(['type', 'requestId', 'attachment', 'sourceIdentity']))
+      || !isTransferId(v.requestId) || !attachment
+      || (v.sourceIdentity !== undefined && !sourceIdentity)) return { ok: false, error: 'invalid_path_handle_done' };
+    return {
+      ok: true,
+      value: {
+        type: v.type,
+        requestId: v.requestId,
+        attachment,
+        ...(sourceIdentity ? { sourceIdentity } : {}),
+      },
+    };
   }
   if (v.type === FILE_TRANSFER_MSG.PATH_HANDLE_ERROR) {
     const errors = new Set<string>(Object.values(FILE_PATH_HANDLE_ERROR));
@@ -517,7 +916,7 @@ export function validateControlledFileTransferResponse(
     return { ok: true, value: v as unknown as FilePathHandleError };
   }
   if (v.type === FILE_TRANSFER_MSG.DIRECTORY_LIST_DONE) {
-    if (!hasOnlyKeys(v, new Set(['type', 'requestId', 'path', 'resolvedPath', 'entries']))
+    if (!hasOnlyKeys(v, new Set(['type', 'requestId', 'path', 'resolvedPath', 'entries', 'truncated', 'total', 'partial']))
       || !isTransferId(v.requestId)
       || !isBoundedString(v.path, FILE_TRANSFER_PATH_MAX_BYTES)
       || !isBoundedString(v.resolvedPath, FILE_TRANSFER_PATH_MAX_BYTES)
@@ -525,17 +924,43 @@ export function validateControlledFileTransferResponse(
       || v.entries.length > FILE_TRANSFER_DIRECTORY_MAX_ENTRIES) {
       return { ok: false, error: 'invalid_directory_list_done' };
     }
+    // `total` means something only next to `truncated`, and a total below what
+    // was actually delivered is a lie. `partial` stands on its own: a listing
+    // that was not cut can still have been ordered over only part of itself
+    // (the time budget ran out before every entry was stat'd).
+    const truncatedFlags = (v.truncated === undefined
+      ? v.total === undefined
+      : v.truncated === true && Number.isSafeInteger(v.total) && (v.total as number) >= v.entries.length)
+      && (v.partial === undefined || v.partial === true);
+    if (!truncatedFlags) return { ok: false, error: 'invalid_directory_list_done' };
     const entries: FileDirectoryEntry[] = [];
     for (const entry of v.entries) {
       if (!isObject(entry)
-        || !hasOnlyKeys(entry, new Set(['name', 'path', 'isDir', 'hidden']))
+        || !hasOnlyKeys(entry, new Set(['name', 'path', 'isDir', 'hidden', 'totalBytes', 'freeBytes', 'size', 'mtimeMs', 'birthtimeMs']))
         || !isBoundedString(entry.name, 1024)
         || !isBoundedString(entry.path, FILE_TRANSFER_PATH_MAX_BYTES)
-        || entry.isDir !== true
-        || typeof entry.hidden !== 'boolean') {
+        || typeof entry.isDir !== 'boolean'
+        || typeof entry.hidden !== 'boolean'
+        || (entry.totalBytes !== undefined && !isByteCount(entry.totalBytes))
+        || (entry.freeBytes !== undefined && !isByteCount(entry.freeBytes))
+        || (entry.size !== undefined && !isByteCount(entry.size))
+        || (entry.mtimeMs !== undefined && !isEpochMs(entry.mtimeMs))
+        || (entry.birthtimeMs !== undefined && !isEpochMs(entry.birthtimeMs))) {
         return { ok: false, error: 'invalid_directory_entry' };
       }
-      entries.push(entry as unknown as FileDirectoryEntry);
+      // Rebuilt field by field, so anything not listed here is dropped rather
+      // than forwarded; the capacity fields have to be carried explicitly.
+      entries.push({
+        name: entry.name,
+        path: entry.path,
+        isDir: entry.isDir,
+        hidden: entry.hidden,
+        ...(entry.totalBytes !== undefined ? { totalBytes: entry.totalBytes } : {}),
+        ...(entry.freeBytes !== undefined ? { freeBytes: entry.freeBytes } : {}),
+        ...(entry.size !== undefined ? { size: entry.size } : {}),
+        ...(entry.mtimeMs !== undefined ? { mtimeMs: entry.mtimeMs } : {}),
+        ...(entry.birthtimeMs !== undefined ? { birthtimeMs: entry.birthtimeMs } : {}),
+      } as FileDirectoryEntry);
     }
     return {
       ok: true,
@@ -545,6 +970,8 @@ export function validateControlledFileTransferResponse(
         path: v.path,
         resolvedPath: v.resolvedPath,
         entries,
+        ...(v.truncated === true ? { truncated: true as const, total: v.total as number } : {}),
+        ...(v.partial === true ? { partial: true as const } : {}),
       },
     };
   }
@@ -570,6 +997,20 @@ export function validateControlledFileTransferResponse(
       return { ok: false, error: 'invalid_lifecycle_error' };
     }
     return { ok: true, value: v as unknown as FileDeleteError };
+  }
+  if (v.type === FILE_TRANSFER_MSG.MACOS_OPEN_FULL_DISK_ACCESS_DONE) {
+    if (!hasOnlyKeys(v, new Set(['type', 'requestId'])) || !isTransferId(v.requestId)) {
+      return { ok: false, error: 'invalid_lifecycle_done' };
+    }
+    return { ok: true, value: v as unknown as MacosOpenFullDiskAccessDone };
+  }
+  if (v.type === FILE_TRANSFER_MSG.MACOS_OPEN_FULL_DISK_ACCESS_ERROR) {
+    if (!hasOnlyKeys(v, new Set(['type', 'requestId', 'error']))
+      || !isTransferId(v.requestId)
+      || !Object.values(MACOS_OPEN_FULL_DISK_ACCESS_ERROR).includes(v.error as MacosOpenFullDiskAccessErrorReason)) {
+      return { ok: false, error: 'invalid_lifecycle_error' };
+    }
+    return { ok: true, value: v as unknown as MacosOpenFullDiskAccessError };
   }
   return { ok: false, error: 'invalid_type' };
 }

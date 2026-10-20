@@ -163,6 +163,13 @@ export function reduceTransportQueueEvent(
         ...state,
         pendingMessageVersion: Math.max(state.pendingMessageVersion, event.pendingMessageVersion),
         pendingMessageEntries: state.pendingMessageEntries.filter((entry) => entry.clientMessageId !== event.clientMessageId),
+        // A terminal failure is just as final as delivery for replay purposes.
+        // Keep a tombstone so an equal-version snapshot arriving after the
+        // failure cannot resurrect the failed message into the live queue.
+        deliveredTombstones: {
+          ...state.deliveredTombstones,
+          [`${event.queueEpoch}:${event.clientMessageId}`]: true,
+        },
       };
     default:
       return state;

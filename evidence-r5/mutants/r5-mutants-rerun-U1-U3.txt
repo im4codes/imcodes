@@ -1,0 +1,6 @@
+KILLED               U1 UI counter uses raw code points  <- ['project: NFC-decomposed content at the limit']
+KILLED               U2 UI counter skips NFC  <- ['project: NFC-decomposed content at the limit']
+KILLED               U3 UI counter skips trim  <- ['project: content at the limit with surrounding whitespace']
+
+KILLED 3/3
+INTEGRITY OK: all source bytes restored

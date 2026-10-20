@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import {
   buildTransportPendingSyncPatch,
+  buildTransportQueueEventPatch,
   extractTransportPendingMessageEntries,
   extractTransportPendingMessages,
   extractTransportPendingVersion,
@@ -311,6 +312,86 @@ describe('nextTransportQueueVersion', () => {
 });
 
 describe('buildTransportPendingSyncPatch new queue protocol', () => {
+  it('retains delivery tombstones across a same-version stale snapshot', () => {
+    const initial = buildTransportPendingSyncPatch({}, {
+      queueEpoch: 'epoch-1',
+      queueAuthorityId: 'authority-1',
+      pendingMessageVersion: 1,
+      pendingMessageEntries: [{ clientMessageId: 'msg-1', text: 'send once' }],
+    }, 'deck_test');
+    const delivered = buildTransportQueueEventPatch({ ...initial }, {
+      type: 'transport.queue.delivery',
+      sessionName: 'deck_test',
+      queueEpoch: 'epoch-1',
+      queueAuthorityId: 'authority-1',
+      pendingMessageVersion: 2,
+      clientMessageId: 'msg-1',
+      deliveryFrameId: 'frame-1',
+      deliveryFrameVersion: 1,
+    }, 'deck_test');
+    expect(delivered.transportPendingMessageEntries).toEqual([]);
+    expect(delivered.transportPendingSettledMessageIds).toEqual(['msg-1']);
+
+    const staleSameVersion = buildTransportPendingSyncPatch({ ...delivered }, {
+      queueEpoch: 'epoch-1',
+      queueAuthorityId: 'authority-1',
+      pendingMessageVersion: 2,
+      pendingMessageEntries: [{ clientMessageId: 'msg-1', text: 'send once' }],
+    }, 'deck_test');
+    expect(staleSameVersion.transportPendingMessageEntries).toEqual([]);
+    expect(staleSameVersion.transportPendingSettledMessageIds).toEqual(['msg-1']);
+  });
+
+  it('retains failure tombstones across a same-version stale snapshot', () => {
+    const initial = buildTransportPendingSyncPatch({}, {
+      queueEpoch: 'epoch-1',
+      queueAuthorityId: 'authority-1',
+      pendingMessageVersion: 1,
+      pendingMessageEntries: [{ clientMessageId: 'msg-1', text: 'do not retry' }],
+    }, 'deck_test');
+    const failed = buildTransportQueueEventPatch({ ...initial }, {
+      type: 'transport.queue.failure',
+      sessionName: 'deck_test',
+      queueEpoch: 'epoch-1',
+      queueAuthorityId: 'authority-1',
+      pendingMessageVersion: 2,
+      clientMessageId: 'msg-1',
+      failureReason: 'dispatch_failed',
+    }, 'deck_test');
+    expect(failed.transportPendingMessageEntries).toEqual([]);
+    expect(failed.transportPendingSettledMessageIds).toEqual(['msg-1']);
+
+    const staleSameVersion = buildTransportPendingSyncPatch({ ...failed }, {
+      queueEpoch: 'epoch-1',
+      queueAuthorityId: 'authority-1',
+      pendingMessageVersion: 2,
+      pendingMessageEntries: [{ clientMessageId: 'msg-1', text: 'do not retry' }],
+    }, 'deck_test');
+    expect(staleSameVersion.transportPendingMessageEntries).toEqual([]);
+  });
+
+  it('clears settlement tombstones when an authoritative snapshot starts a new queue epoch', () => {
+    const nextEpoch = buildTransportPendingSyncPatch({
+      queueEpoch: 'epoch-1',
+      queueAuthorityId: 'authority-1',
+      transportPendingMessageVersion: 2,
+      transportPendingMessageEntries: [],
+      transportPendingMessages: [],
+      transportPendingSettledMessageIds: ['msg-1'],
+    }, {
+      queueEpoch: 'epoch-2',
+      queueAuthorityId: 'authority-2',
+      pendingMessageVersion: 1,
+      pendingMessageEntries: [{ clientMessageId: 'msg-1', text: 'new epoch send' }],
+      resetReason: 'runtime_recreated',
+    }, 'deck_test');
+
+    expect(nextEpoch.transportPendingMessageEntries).toEqual([
+      { clientMessageId: 'msg-1', text: 'new epoch send' },
+    ]);
+    expect(nextEpoch.transportPendingSettledMessageIds).toEqual([]);
+  });
+
   it('applies structured epoch/authority snapshots without normalizing multiline text', () => {
     const patch = buildTransportPendingSyncPatch({}, {
       queueEpoch: 'epoch-1',
@@ -403,5 +484,25 @@ describe('buildTransportPendingSyncPatch new queue protocol', () => {
     }, 'deck_test');
 
     expect(patch).toEqual({});
+  });
+});
+
+
+describe('append delivery policy projection', () => {
+  it('preserves pending/fallback policy through canonical snapshot, reconnect, and delivery facts', () => {
+    const entry = { clientMessageId: 'append-policy', text: '中文\n原文', deliveryMode: 'append', appendFallbackReason: 'unsupported' };
+    const first = buildTransportPendingSyncPatch({}, { queueEpoch: 'epoch', queueAuthorityId: 'authority', pendingMessageVersion: 1, pendingMessageEntries: [entry] }, 'deck_policy');
+    expect(first.transportPendingMessageEntries).toEqual([entry]);
+    const reconnect = buildTransportPendingSyncPatch(first, { queueEpoch: 'epoch', queueAuthorityId: 'authority', pendingMessageVersion: 2, pendingMessageEntries: [entry] }, 'deck_policy');
+    expect(reconnect.transportPendingMessageEntries).toEqual([entry]);
+    const delivered = buildTransportQueueEventPatch(reconnect, { type: 'transport.queue.delivery', sessionName: 'deck_policy', queueEpoch: 'epoch', queueAuthorityId: 'authority', pendingMessageVersion: 3, clientMessageId: 'append-policy', deliveryFrameId: 'native-frame', deliveryFrameVersion: 3 }, 'deck_policy');
+    expect(delivered.transportPendingMessageEntries).toEqual([]);
+    expect(buildTransportPendingSyncPatch(delivered, { queueEpoch: 'epoch', queueAuthorityId: 'authority', pendingMessageVersion: 2, pendingMessageEntries: [entry] }, 'deck_policy')).toEqual({});
+  });
+  it('missing and unknown old-peer policy fields retain the safe ordinary queue projection', () => {
+    expect(extractTransportPendingMessageEntries([
+      { clientMessageId: 'old', text: 'old peer' },
+      { clientMessageId: 'unknown', text: 'future peer', deliveryMode: 'future', appendFallbackReason: 'future', providerText: 'private' },
+    ])).toEqual([{ clientMessageId: 'old', text: 'old peer' }, { clientMessageId: 'unknown', text: 'future peer' }]);
   });
 });

@@ -10,11 +10,28 @@ import { TRANSPORT_MSG } from '@shared/transport-events.js';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const mcpTranslations = vi.hoisted(() => ({
+  session: {
+    agentType: {
+      codebuddy_china: 'CodeBuddy China',
+      codebuddy_international: 'CodeBuddy International',
+    },
+  },
   sharedContext: {
     refresh: 'Refresh',
     management: {
       noneValue: 'None',
-      tabs: { mcp: 'MCP' },
+      tabs: { mcp: 'MCP', skills: 'Skills' },
+      capabilityInventory: {
+        chatInstallHint: 'Ask the AI directly in chat to install or change capabilities.',
+        noServer: 'Select a connected server.',
+        searchPlaceholder: 'Search installed capabilities',
+        searchLabel: 'Search installed capabilities',
+        bindingActive: 'Active binding',
+        bindingInactive: 'Inactive binding',
+        delete: 'Delete',
+        mcp: { title: 'Installed MCP services', description: 'Installed MCP inventory', empty: 'No MCP services installed' },
+        skills: { title: 'Installed Skills', description: 'Installed Skill inventory', empty: 'No Skills installed' },
+      },
       mcpTitle: 'Model Context Protocol',
       mcpSummaryLine1: 'Managed providers can expose the IM.codes memory, send, and cron tool families through the daemon-controlled MCP server.',
       mcpSummaryLine2: 'This view shows provider readiness, degraded setup reasons, feature gates, and recent redacted tool calls when the daemon reports them.',
@@ -140,7 +157,36 @@ const apiMock = vi.hoisted(() => ({
   deleteEnterpriseSharedMemory: vi.fn(),
 }));
 
+const capabilityApiMock = vi.hoisted(() => ({
+  listCapabilities: vi.fn(),
+  manageCapability: vi.fn(),
+}));
+
+vi.mock('../../src/api/capabilities.js', () => ({
+  listCapabilities: (...args: unknown[]) => capabilityApiMock.listCapabilities(...args),
+  manageCapability: (...args: unknown[]) => capabilityApiMock.manageCapability(...args),
+  CapabilityRequestError: class CapabilityRequestError extends Error {},
+}));
+
+const agentMcpApiMock = vi.hoisted(() => ({
+  listAgentMcp: vi.fn(async () => ({
+    servers: [{ name: 'github', transport: 'http', url: 'https://api.githubcopilot.com/mcp/', envNames: [], headerNames: ['Authorization'], agents: ['codex'] }],
+    agents: [{ agent: 'codex', displayName: 'Codex' }],
+  })),
+}));
+vi.mock('../../src/api/agent-mcp.js', () => ({
+  listAgentMcp: (serverId: string) => agentMcpApiMock.listAgentMcp(serverId),
+  runAgentMcp: vi.fn(async () => ({ ok: true })),
+  searchAgentMcpRegistry: vi.fn(async () => []),
+}));
+
+vi.mock('../../src/api/agent-skills.js', () => ({
+  listAgentSkills: vi.fn(async () => [{ name: 'wecomcli-doc', description: 'WeCom docs' }]),
+  runAgentSkills: vi.fn(async () => ({ ok: true })),
+}));
+
 vi.mock('../../src/api.js', () => ({
+  apiFetch: vi.fn(async () => ({ servers: [] })),
   ApiError: class ApiError extends Error {
     code: string | null;
     constructor(public status: number, public body: string) {
@@ -191,6 +237,16 @@ describe('SharedContextManagementPanel MCP tab', () => {
     apiMock.listTeams.mockResolvedValue([]);
     apiMock.getPersonalCloudMemory.mockResolvedValue({ stats: {}, records: [], pendingRecords: [], projects: [] });
     apiMock.getEnterpriseSharedMemory.mockResolvedValue({ stats: {}, records: [], pendingRecords: [], projects: [] });
+    capabilityApiMock.listCapabilities.mockResolvedValue({ items: [
+      {
+        id: 'mcp-1', revision: 1, kind: 'mcp', name: 'Docs MCP', state: 'active', scope: 'account',
+        readiness: 'runtime_pending', findings: [], tools: ['search_docs'], bindings: [], updatedAt: 1,
+      },
+      {
+        id: 'skill-1', revision: 1, kind: 'skill', name: 'Release Skill', state: 'active', scope: 'account',
+        readiness: 'ready', findings: [], bindings: [], updatedAt: 1,
+      },
+    ] });
     consoleWarn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     consoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
   });
@@ -225,7 +281,13 @@ describe('SharedContextManagementPanel MCP tab', () => {
     });
 
     expect(await screen.findByText('Model Context Protocol')).toBeDefined();
+    // The machine's MCP servers, read from its agents' own configs.
+    expect(await screen.findByText('github')).toBeDefined();
+    expect(agentMcpApiMock.listAgentMcp).toHaveBeenCalledWith('srv-1');
+    expect(screen.queryByText('Release Skill')).toBeNull();
     expect(screen.queryByText('sharedContext.management.mcpTitle')).toBeNull();
+    expect(screen.getByText('CodeBuddy China')).toBeDefined();
+    expect(screen.getByText('CodeBuddy International')).toBeDefined();
     await waitFor(() => expect(sent.some((message) => message.type === MEMORY_WS.MCP_STATUS_QUERY)).toBe(true));
 
     const requestId = [...sent].reverse().find((message) => message.type === MEMORY_WS.MCP_STATUS_QUERY)?.requestId as string | undefined;
@@ -274,6 +336,17 @@ describe('SharedContextManagementPanel MCP tab', () => {
     expect(screen.getByText((content) => content.includes('Provider connected'))).toBeDefined();
     expect(consoleWarn).not.toHaveBeenCalled();
     expect(consoleError).not.toHaveBeenCalled();
+  });
+
+  it('shows the machine\'s ~/.agents/skills in a dedicated top-level tab', async () => {
+    render(<SharedContextManagementPanel serverId="srv-1" />);
+    await flush();
+
+    fireEvent.click(screen.getByText('Skills'));
+
+    expect(await screen.findByText('wecomcli-doc')).toBeDefined();
+    expect(screen.getByText('WeCom docs')).toBeDefined();
+    expect(screen.queryByText('Docs MCP')).toBeNull();
   });
 
   it('keeps MCP locale keys resolvable in every supported locale', () => {

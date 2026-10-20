@@ -1,3 +1,4 @@
+import { activeUserAnswer } from './helpers/user-status.js';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { Hono } from 'hono';
 import type { Env } from '../src/env.js';
@@ -59,6 +60,7 @@ const baseFact: UsageFact = {
 function makeDb(): Database {
   return {
     queryOne: async <T>(sql: string, params: unknown[] = []) => {
+      { const activeUser = activeUserAnswer(sql); if (activeUser) return activeUser as never; }
       if (sql.toLowerCase().includes('from servers')) {
         if (params.length === 1) {
           if (params[0] === 'srv-1' || params[0] === 'empty-srv') {
@@ -70,7 +72,7 @@ function makeDb(): Database {
           return null as T;
         }
         return params[0] === 'srv-1' && params[1] === 'hash:daemon-token'
-          ? { id: 'srv-1', user_id: 'user-owner' } as T
+          ? { id: 'srv-1', user_id: 'user-owner', owner_status: 'active' } as T
           : null as T;
       }
       return null as T;

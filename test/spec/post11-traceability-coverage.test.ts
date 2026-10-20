@@ -1,5 +1,6 @@
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
+import { readSource } from '../helpers/read-source.js';
 
 const CHANGE_DIR = 'openspec/changes/memory-system-post-1-1-integration';
 const hasOpenSpecChange = existsSync(CHANGE_DIR);
@@ -28,7 +29,7 @@ const TRACEABILITY_EVIDENCE: Record<string, string[]> = {
 };
 
 function read(path: string): string {
-  return readFileSync(path, 'utf8');
+  return readSource(path);
 }
 
 function explicitTestAnchorPaths(...artifacts: string[]): string[] {

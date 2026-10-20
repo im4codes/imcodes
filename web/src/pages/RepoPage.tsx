@@ -282,6 +282,10 @@ export function RepoPage({ ws, sessionId, projectDir, focusLatestAction, onCiEve
 
   const applyDetectContext = useCallback((rawContext: unknown): boolean => {
     const accepted = ingestSessionRepoContext({ sessionId, projectDir, context: rawContext });
+    const realDir = (rawContext as any)?.projectDir;
+    if (typeof realDir === 'string' && realDir.trim() && realDir !== projectDir) {
+      ingestSessionRepoContext({ sessionId, projectDir: realDir.trim(), context: rawContext });
+    }
     if (!accepted) return false;
     const shared = getSessionRepoContext(sessionId, projectDir);
     const nextContext = mapDetectToContext(rawContext);
@@ -607,10 +611,7 @@ export function RepoPage({ ws, sessionId, projectDir, focusLatestAction, onCiEve
 
       // Passive detect push — only accept if projectDir matches
       if (msg.type === REPO_MSG.DETECTED) {
-        // Shared views use an opaque virtual root and receive only their own
-        // request-scoped responses; an unsolicited host-path push must not
-        // become a second source of shared repository state.
-        if (scopeToSessionRoot || msg.projectDir !== projectDir) return;
+        if (!responseMatchesProject(msg.projectDir)) return;
         applyDetectContext(msg.context);
         return;
       }

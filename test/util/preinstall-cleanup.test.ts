@@ -109,6 +109,7 @@ function runPreinstall(sb: Sandbox, env: Record<string, string | null> = {}): {
   for (const [k, v] of Object.entries(process.env)) {
     if (typeof v === 'string') baseEnv[k] = v;
   }
+  delete baseEnv.IMCODES_HOME; // a developer's / CI's scoped daemon must not redirect the sandboxed lookup
   const finalEnv: Record<string, string> = {
     ...baseEnv,
     PATH: `${sb.shimDir}:${process.env.PATH ?? ''}`,
@@ -182,6 +183,22 @@ describeUnix('src/util/preinstall-cleanup.mjs', () => {
       expect(r.status).toBe(0);
       expect(existsSync(join(sb.homeDir, '.imcodes', 'upgrade.lock.d'))).toBe(false);
       expect(r.stdout).toMatch(/clearing stale upgrade.lock.d/);
+    } finally {
+      rmSync(sb.root, { recursive: true, force: true });
+    }
+  });
+
+  it('sweeps the stale lock in IMCODES_HOME (the state directory itself), not in HOME/.imcodes', () => {
+    const sb = makeSandbox({ staleLockSec: 7200 });
+    try {
+      const scoped = join(sb.root, 'scoped-state');
+      const scopedLock = join(scoped, 'upgrade.lock.d');
+      mkdirSync(scopedLock, { recursive: true });
+      writeFileSync(join(scopedLock, 'started'), '0');
+      const r = runPreinstall(sb, { npm_config_prefix: sb.prefix, IMCODES_HOME: scoped });
+      expect(r.status).toBe(0);
+      expect(existsSync(scopedLock)).toBe(false);
+      expect(existsSync(join(sb.homeDir, '.imcodes', 'upgrade.lock.d'))).toBe(true);
     } finally {
       rmSync(sb.root, { recursive: true, force: true });
     }

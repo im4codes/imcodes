@@ -111,6 +111,7 @@ export const USAGE_UNSAFE_FIELD_NAMES = [
   'secret',
   'rawSharedActorEnvelope',
   'sharedActorEnvelope',
+  'sharedMachineAuthority',
   'childTranscript',
   'internalRuntimeFlags',
 ] as const;

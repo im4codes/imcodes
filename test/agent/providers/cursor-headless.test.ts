@@ -210,6 +210,66 @@ describe('CursorHeadlessProvider', () => {
     expect(infos).toContainEqual({ resumeId: 'cursor-chat-2', model: 'gpt-5.2' });
   });
 
+  it('does not reuse Cursor display labels as the model id on the next turn', async () => {
+    const provider = new CursorHeadlessProvider();
+    await provider.connect({ binaryPath: 'cursor-agent' });
+    const sessionId = await provider.createSession({
+      sessionKey: 'route-cursor-model-label',
+      cwd: '/tmp/project',
+      agentId: 'gpt-5.3-codex',
+      resumeId: 'cursor-chat-model-label',
+    });
+
+    await provider.send(sessionId, 'first turn');
+    const first = harness.lastSpawn();
+    expect(first.args).toContainEqual('--model');
+    expect(first.args[first.args.indexOf('--model') + 1]).toBe('gpt-5.3-codex');
+    first.child.stdout.write(`${JSON.stringify({
+      type: 'system.init',
+      session_id: 'cursor-chat-model-label',
+      // Cursor reports a display label here, not an id accepted by --model.
+      model: 'Claude Sonnet 5 300K Medium No Thinking',
+    })}\n`);
+    first.child.stdout.write(`${JSON.stringify({
+      type: 'result.success',
+      session_id: 'cursor-chat-model-label',
+      result: 'first response',
+      model: 'Claude Sonnet 5 300K Medium No Thinking',
+    })}\n`);
+    first.child.emit('close', 0, null);
+    await harness.flush();
+
+    // The second turn is the user-reported failure boundary.  It must retain
+    // the canonical id instead of passing the display label back to Cursor.
+    await provider.send(sessionId, 'second turn');
+    const second = harness.lastSpawn();
+    expect(second.args[second.args.indexOf('--model') + 1]).toBe('gpt-5.3-codex');
+    second.child.emit('close', 0, null);
+    await harness.flush();
+  });
+
+  it('refuses a display label as a configured or live model id', async () => {
+    const provider = new CursorHeadlessProvider();
+    await provider.connect({ binaryPath: 'cursor-agent' });
+    const sessionId = await provider.createSession({
+      sessionKey: 'route-cursor-invalid-model',
+      cwd: '/tmp/project',
+      agentId: 'Claude Sonnet 5 300K Medium No Thinking',
+      resumeId: 'cursor-chat-invalid-model',
+    });
+
+    await provider.send(sessionId, 'use the safe default');
+    const spawned = harness.lastSpawn();
+    expect(spawned.args).not.toContain('--model');
+    spawned.child.emit('close', 0, null);
+    await harness.flush();
+    provider.setSessionAgentId(sessionId, 'Claude Sonnet 5 300K Medium No Thinking');
+    await provider.send(sessionId, 'still use the safe default');
+    expect(harness.lastSpawn().args).not.toContain('--model');
+    harness.lastSpawn().child.emit('close', 0, null);
+    await harness.flush();
+  });
+
   it('passes per-session Memory MCP identity env to the cursor-agent process', async () => {
     harness.state.createChatOutput = 'cursor-chat-mcp\n';
     const provider = new CursorHeadlessProvider();

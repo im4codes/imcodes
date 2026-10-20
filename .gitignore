@@ -69,3 +69,5 @@ dist-node-exe
 web/dist-fixtures/
 web/test-results/
 web/playwright-report/
+
+deliverable/

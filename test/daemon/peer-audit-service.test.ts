@@ -36,6 +36,10 @@ const { PeerAuditService } = await import('../../src/daemon/peer-audit-service.j
 const { resolvePeerAuditCandidateList } = await import('../../src/daemon/peer-audit-candidates.js');
 const { getSession, removeSession, upsertSession, listSessions } = await import('../../src/store/session-store.js');
 const { timelineEmitter } = await import('../../src/daemon/timeline-emitter.js');
+const {
+  getSupervisionTaskRegistry,
+  resetSupervisionTaskRegistryForTests,
+} = await import('../../src/daemon/supervision-state-store.js');
 
 function session(name: string, patch: Partial<SessionRecord> = {}): SessionRecord {
   const main = name.endsWith('_brain');
@@ -66,6 +70,7 @@ async function flush(): Promise<void> {
 
 describe('PeerAuditService integration', () => {
   beforeEach(() => {
+    resetSupervisionTaskRegistryForTests();
     for (const record of listSessions()) {
       if (record.projectName === 'peer-service') removeSession(record.name);
     }
@@ -142,8 +147,30 @@ describe('PeerAuditService integration', () => {
     expect(dispatchMock).toHaveBeenCalledTimes(1);
     expect(emitStatusMock.mock.calls.map((call) => call[0]?.phase)).toEqual(['preparing', 'sent', 'waiting_reply']);
     const brief = String(dispatchMock.mock.calls[0]?.[0]?.brief);
-    const capability = /--capability ([A-Za-z0-9_-]+)/.exec(brief)?.[1];
-    expect(capability).toBeTruthy();
+    expect(brief).not.toContain('--capability');
+    expect(brief).not.toContain('replyCapability');
+    expect(brief).toContain('No accepted implementer report is bound to this attempt');
+    expect(brief).not.toContain('"kind": "accepted_implementer_validation"');
+    const registry = getSupervisionTaskRegistry();
+    expect(registry.createOrGet({
+      taskId: 'task-peer-service-receipt', projectName: 'peer-service',
+      objective: 'persist peer audit receipt', currentRevision: list.list.revision,
+      classification: 'independent_top_level',
+    }).ok).toBe(true);
+    expect(registry.createAssignment({
+      assignmentId: 'assignment-peer-service-implementer', taskId: 'task-peer-service-receipt',
+      role: 'implementer', identity: {
+        sessionName: main.name, sessionInstanceId: main.sessionInstanceId!, runtimeEpoch: main.runtimeEpoch!,
+        agentType: main.agentType, providerFamily: 'openai',
+      },
+    }).ok).toBe(true);
+    expect(registry.createAssignment({
+      assignmentId: 'assignment-peer-service-auditor', taskId: 'task-peer-service-receipt',
+      role: 'auditor', identity: {
+        sessionName: peer.name, sessionInstanceId: peer.sessionInstanceId!, runtimeEpoch: peer.runtimeEpoch!,
+        agentType: peer.agentType, providerFamily: 'anthropic',
+      }, auditAttemptId: result.attemptId, auditRevision: list.list.revision,
+    }).ok).toBe(true);
     const saved = getSession(main.name)!;
     expect(saved.transportConfig).toMatchObject({
       supervision: {
@@ -153,19 +180,10 @@ describe('PeerAuditService integration', () => {
       },
     });
     expect((saved.transportConfig?.supervision as Record<string, unknown>).auditMode).toBeUndefined();
-    if (!result.ok || !capability) return;
+    if (!result.ok) return;
     await expect(service.acceptReply({
       version: PEER_AUDIT_REPLY_VERSION,
       attemptId: result.attemptId,
-      replyCapability: 'B'.repeat(32),
-      verdict: 'PASS',
-      findings: 'forged',
-      validations: [],
-    }, peer, Date.now())).resolves.toEqual({ ok: false, error: 'invalid_capability' });
-    await expect(service.acceptReply({
-      version: PEER_AUDIT_REPLY_VERSION,
-      attemptId: result.attemptId,
-      replyCapability: capability,
       verdict: 'PASS',
       findings: 'static review only',
       validations: [],
@@ -173,7 +191,6 @@ describe('PeerAuditService integration', () => {
     await expect(service.acceptReply({
       version: PEER_AUDIT_REPLY_VERSION,
       attemptId: result.attemptId,
-      replyCapability: capability,
       verdict: 'PASS',
       findings: 'wrong sender',
       validations: [{ kind: 'test', label: 'focused', outcome: 'passed', summary: '12 passed' }],
@@ -181,7 +198,6 @@ describe('PeerAuditService integration', () => {
     await expect(service.acceptReply({
       version: PEER_AUDIT_REPLY_VERSION,
       attemptId: result.attemptId,
-      replyCapability: capability,
       verdict: 'PASS',
       findings: 'wrong runtime identity',
       validations: [{ kind: 'test', label: 'focused', outcome: 'passed', summary: '12 passed' }],
@@ -189,33 +205,35 @@ describe('PeerAuditService integration', () => {
     await expect(service.acceptReply({
       version: PEER_AUDIT_REPLY_VERSION,
       attemptId: result.attemptId,
-      replyCapability: capability,
       verdict: 'PASS',
       findings: 'Focused tests passed.',
       validations: [{ kind: 'test', label: 'focused', outcome: 'passed', summary: '12 passed' }],
     }, peer, Date.now())).resolves.toEqual({ ok: true });
     await flush();
+    expect(registry.getAssignment('assignment-peer-service-implementer')).toMatchObject({
+      status: 'ready_for_integration', verdict: 'PASS',
+      auditAttemptId: result.attemptId, auditRevision: list.list.revision,
+    });
+    expect(registry.get('task-peer-service-receipt')).toMatchObject({ status: 'ready_for_integration' });
     expect(emitResultMock).toHaveBeenCalledTimes(1);
     expect(emitResultMock).toHaveBeenCalledWith(expect.objectContaining({ outcome: 'pass', trigger: 'quick' }));
     await expect(service.acceptReply({
       version: PEER_AUDIT_REPLY_VERSION,
       attemptId: result.attemptId,
-      replyCapability: capability,
       verdict: 'PASS',
       findings: 'duplicate',
       validations: [{ kind: 'test', label: 'focused', outcome: 'passed', summary: '12 passed' }],
-    }, peer, Date.now())).resolves.toEqual({ ok: false, error: 'invalid_capability' });
+    }, peer, Date.now())).resolves.toEqual({ ok: false, error: 'attempt_mismatch' });
     expect(emitResultMock).toHaveBeenCalledTimes(1);
     service.shutdown();
     const restarted = new PeerAuditService();
     await expect(restarted.acceptReply({
       version: PEER_AUDIT_REPLY_VERSION,
       attemptId: result.attemptId,
-      replyCapability: capability,
       verdict: 'PASS',
       findings: 'late after restart',
       validations: [{ kind: 'test', label: 'focused', outcome: 'passed', summary: '12 passed' }],
-    }, peer, Date.now())).resolves.toEqual({ ok: false, error: 'invalid_capability' });
+    }, peer, Date.now())).resolves.toEqual({ ok: false, error: 'attempt_mismatch' });
   });
 
   it('moves an exact queued audit delivery to waiting so cancellation does not remove an already delivered row', async () => {
@@ -797,17 +815,46 @@ describe('PeerAuditService integration', () => {
     if (!result.ok) throw new Error(result.error);
     await flush();
     const brief = String(dispatchMock.mock.calls[0]?.[0]?.brief);
-    const capability = /--capability ([A-Za-z0-9_-]+)/.exec(brief)?.[1];
-    if (!result.ok || !capability) return;
+    expect(brief).not.toContain('--capability');
+    if (!result.ok) return;
     await service.acceptReply({
       version: PEER_AUDIT_REPLY_VERSION,
       attemptId: result.attemptId,
-      replyCapability: capability,
       verdict: 'REWORK',
       findings: 'Add the missing race test.',
       validations: [],
     }, peer, Date.now());
     await flush();
     expect(onTerminal).toHaveBeenCalledWith(expect.objectContaining({ outcome: 'rework', findings: 'Add the missing race test.' }));
+
+    const acceptedTerminal = vi.fn();
+    const accepted = await service.startAutomatic({
+      audited: main,
+      taskCommandId: 'task_3',
+      generationOrEpoch: 3,
+      userText: 'audit from exact report',
+      assistantText: 'done and validated',
+      validations: [{ kind: 'test', label: 'focused', outcome: 'passed', summary: '42 passed' }],
+      isStillValid: () => true,
+      onTerminal: acceptedTerminal,
+    });
+    if (!accepted.ok) throw new Error(accepted.error);
+    await flush();
+    const acceptedBrief = String(dispatchMock.mock.calls.at(-1)?.[0]?.brief);
+    expect(acceptedBrief).toContain('"kind": "accepted_implementer_validation"');
+    await expect(service.acceptReply({
+      version: PEER_AUDIT_REPLY_VERSION,
+      attemptId: accepted.attemptId,
+      verdict: 'PASS',
+      findings: 'Code and exact-attempt report are coherent.',
+      validations: [{
+        kind: 'accepted_implementer_validation',
+        label: 'focused',
+        outcome: 'passed',
+        summary: '42 passed',
+      }],
+    }, peer, Date.now())).resolves.toEqual({ ok: true });
+    await flush();
+    expect(acceptedTerminal).toHaveBeenCalledWith(expect.objectContaining({ outcome: 'pass' }));
   });
 });

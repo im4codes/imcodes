@@ -25,11 +25,14 @@ vi.mock('node:os', async (importOriginal) => {
 describe('dsh overlay files', () => {
   beforeEach(async () => {
     state.home = await mkdtemp(join(tmpdir(), 'dsh-overlay-'));
+    // The state directory is IMCODES_HOME (set by the test setup), not homedir(): move it with the mocked home.
+    vi.stubEnv('IMCODES_HOME', join(state.home, '.imcodes'));
   });
 
   afterEach(async () => {
     if (state.home) await rm(state.home, { recursive: true, force: true });
     state.home = '';
+    vi.unstubAllEnvs();
     vi.resetModules();
   });
 

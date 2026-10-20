@@ -12,6 +12,12 @@ export default defineConfig({
     environment: 'jsdom',
     fakeTimers: { ...WEB_FAKE_TIMERS },
     globals: false,
+    // Must match vitest.components.config.ts, which is the config CI actually
+    // gates on for this file. Without the storage shim jsdom hands back a plain
+    // object and every test dies on `localStorage.clear is not a function` — so
+    // this "run it in isolation" helper disagreed with CI, which is the worst
+    // possible failure mode for a debugging tool.
+    setupFiles: ['./test/setup-jsdom-storage.ts'],
     poolOptions: { forks: { execArgv: ['--max-old-space-size=6144'] } },
   },
 });

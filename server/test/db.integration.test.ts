@@ -580,6 +580,19 @@ describe('queries.ts', () => {
   it('deleteServer cascades and returns boolean', async () => {
     const sid = 'del-srv-' + Math.random().toString(36).slice(2);
     await createServer(db, sid, userId, 'to-delete', 'hash-del');
+    const now = Date.now();
+    await db.execute(
+      `INSERT INTO cron_jobs (id, server_id, user_id, name, cron_expr, project_name, target_role, action, status, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+      ['cron-' + sid, sid, userId, 'job', '0 * * * *', 'proj', 'brain', '{}', 'active', now, now],
+    );
+    await db.execute(
+      `INSERT INTO controlled_node_enrollments_v2 (
+         ticket_hash, code_hash, owner_user_id, os, arch, artifact_sha256, encrypted_code,
+         ticket_expires_at, expires_at, created_at, used_at, redeemed_server_id, install_id, node_token_hash
+       ) VALUES ($1, $2, $3, 'linux', 'x64', $4, 'enc', $5, $5, $5, $5, $6, 'inst-1', 'tok-hash-1')`,
+      ['th-' + sid, 'ch-' + sid, userId, 'a'.repeat(64), now + 60_000, sid],
+    );
     const ok = await deleteServer(db, sid, userId);
     expect(ok).toBe(true);
     expect(await getServerById(db, sid)).toBeNull();

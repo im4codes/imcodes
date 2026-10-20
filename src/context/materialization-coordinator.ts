@@ -16,6 +16,7 @@ import { isMemoryNoiseSummary, isMemoryNoiseTurn } from '../../shared/memory-noi
 import type {
   IngestContextEventResult,
   LatestRecentSummarySession,
+  ListProcessedProjectionsOptions,
   MaterializationCommitInput,
   MaterializationCommitResult,
   PinnedNote,
@@ -24,7 +25,7 @@ import type {
 import { getContextStoreClient } from '../store/context-store-worker-client.js';
 import { CONTEXT_STORE_RPC_TIMEOUT_MS } from '../../shared/context-store-rpc.js';
 import { serializeContextNamespace, serializeContextTarget } from './context-keys.js';
-import { countTokens } from './tokenizer.js';
+import { countTokensAsync } from './tokenizer.js';
 import { loadMemoryConfig, type MemoryConfig } from './memory-config.js';
 import { createMemoryConfigResolver, resolveMemoryConfigForNamespace, type MemoryConfigResolver } from './memory-config-resolver.js';
 import { computeFingerprint } from '../../shared/memory-fingerprint.js';
@@ -336,9 +337,11 @@ export class MaterializationCoordinator {
     // Recent summaries are delta-only. Do not feed the previous recent summary
     // back into the compressor, or every small batch snowballs into another
     // full handoff and burns tokens when synced into sub-sessions.
-    const previousProjections = (await client.run<ProcessedContextProjection[]>(
-      'listProcessedProjections', [target.namespace, 'recent_summary'],
-    )).filter((projection) => projection.status !== 'archived' && projection.status !== 'archived_dedup');
+    // Only existence matters: ask for one non-archived row instead of pulling
+    // (and structured-cloning) every recent summary of the namespace.
+    const previousProjections = await client.run<ProcessedContextProjection[]>(
+      'listProcessedProjections', [target.namespace, 'recent_summary', { excludeArchived: true, limit: 1 } satisfies ListProcessedProjectionsOptions],
+    );
     const hadPreviousSummary = previousProjections.length > 0;
 
     // Compress with SDK (primary → backup). When all SDK attempts fail the
@@ -356,9 +359,14 @@ export class MaterializationCoordinator {
         previousSummary: undefined,
         modelConfig: this.modelConfig,
         mode: 'auto',
-        targetTokens: memoryConfig.autoMaterializationTargetTokens > 0
-          ? memoryConfig.autoMaterializationTargetTokens
-          : computeTargetTokens(countTokens(events.map((event) => event.content ?? '').join('\n')), 'auto'),
+        // Let the compressor derive the exact provider-backed target when the
+        // memory config does not override it. Computing the same budget here
+        // first adds an avoidable worker round-trip before the post-response
+        // background path can finish (and can make skill-review scheduling
+        // appear blocked on a cold tokenizer worker).
+        ...(memoryConfig.autoMaterializationTargetTokens > 0
+          ? { targetTokens: memoryConfig.autoMaterializationTargetTokens }
+          : {}),
         maxEventChars: memoryConfig.maxEventChars,
         previousSummaryMaxTokens: memoryConfig.previousSummaryMaxTokens,
         extraRedactPatterns: memoryConfig.extraRedactPatterns,
@@ -907,7 +915,7 @@ async function collectPinnedNotesForNamespace(namespace: ContextNamespace): Prom
   const notes: string[] = [];
   let tokenTotal = 0;
   for (const note of await getContextStoreClient().run<PinnedNote[]>('listPinnedNotes', [namespaceKey])) {
-    const noteTokens = countTokens(note.content);
+    const noteTokens = await countTokensAsync(note.content);
     if (tokenTotal + noteTokens > 1000) {
       incrementCounter('mem.pinned_notes_overflow', { namespace: namespaceKey });
       warnOncePerHour('pinned_notes_overflow', { namespace: namespaceKey });
@@ -967,11 +975,11 @@ export async function materializeMasterSummary(sessionName: string, namespace?: 
       highSignalEventCount: archiveEvents.length,
       targetTokens: effectiveMemoryConfig.manualCompactTargetTokens > 0
         ? effectiveMemoryConfig.manualCompactTargetTokens
-        : computeTargetTokens(countTokens(summary), 'manual'),
+        : computeTargetTokens(await countTokensAsync(summary), 'manual'),
     },
     createdAt: previousMaster?.createdAt ?? now,
     updatedAt: now,
-  }]);
+  }], { priority: 'low' });
   // Best-effort, fire-and-forget write-time embedding (see materializeTarget).
   void ensureProjectionEmbeddingForProjection(masterProjection);
   return masterProjection;
@@ -990,15 +998,13 @@ async function findNamespaceForSessionSummaries(sessionName: string): Promise<Co
 }
 
 async function findLatestMasterSummary(sessionName: string, namespace: ContextNamespace): Promise<ProcessedContextProjection | undefined> {
-  return (await getContextStoreClient().run<ProcessedContextProjection[]>('listProcessedProjections', [namespace, 'master_summary']))
-    .filter((projection) => projection.status !== 'archived' && projection.status !== 'archived_dedup')
-    .find((projection) => projection.content.sessionName === sessionName);
+  const options: ListProcessedProjectionsOptions = { sessionName, excludeArchived: true, limit: 1 };
+  return (await getContextStoreClient().run<ProcessedContextProjection[]>('listProcessedProjections', [namespace, 'master_summary', options]))[0];
 }
 
 async function queryBatchSummariesForMaster(sessionName: string, namespace: ContextNamespace, since = 0): Promise<ProcessedContextProjection[]> {
-  return (await getContextStoreClient().run<ProcessedContextProjection[]>('listProcessedProjections', [namespace, 'recent_summary']))
-    .filter((projection) => projection.status !== 'archived' && projection.status !== 'archived_dedup')
-    .filter((projection) => projection.content.sessionName === sessionName && projection.updatedAt > since)
+  const options: ListProcessedProjectionsOptions = { sessionName, updatedAfter: since, excludeArchived: true };
+  return (await getContextStoreClient().run<ProcessedContextProjection[]>('listProcessedProjections', [namespace, 'recent_summary', options]))
     .sort((a, b) => a.updatedAt - b.updatedAt);
 }
 

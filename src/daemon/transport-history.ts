@@ -1,3 +1,4 @@
+import { resolveImcodesHome } from '../util/windows-daemon-lock.js';
 /**
  * Transport session JSONL history — local cache for transport-backed agent messages.
  * Each session gets a JSONL file at ~/.imcodes/transport/{sessionKey}.jsonl
@@ -6,7 +7,6 @@
 
 import { appendFile, mkdir, open } from 'node:fs/promises';
 import { join } from 'node:path';
-import { homedir } from 'node:os';
 import { TIMELINE_PAYLOAD_BUDGET_BYTES } from '../../shared/timeline-payload-budget.js';
 import {
   SDK_TURN_LOST_RECOVERY_STATUS,
@@ -16,7 +16,7 @@ import {
 import { isClaudeSyntheticSeedAssistantTextEvent } from '../shared/claude-synthetic-seed.js';
 import logger from '../util/logger.js';
 
-const TRANSPORT_DIR = join(homedir(), '.imcodes', 'transport');
+function transportDir(): string { return join(resolveImcodesHome(), 'transport'); }
 const MAX_REPLAY_LINES = 200;
 export const TRANSPORT_HISTORY_REPLAY_BUDGET_BYTES = TIMELINE_PAYLOAD_BUDGET_BYTES.CHAT_HISTORY_TRACE_HARD_LIMIT;
 /**
@@ -53,14 +53,14 @@ let dirEnsured = false;
 
 async function ensureDir(): Promise<void> {
   if (dirEnsured) return;
-  await mkdir(TRANSPORT_DIR, { recursive: true });
+  await mkdir(transportDir(), { recursive: true });
   dirEnsured = true;
 }
 
 function sessionFile(sessionId: string): string {
   // Sanitize session ID for filesystem (replace non-alphanumeric except dash/underscore)
   const safe = sessionId.replace(/[^a-zA-Z0-9_-]/g, '_');
-  return join(TRANSPORT_DIR, `${safe}.jsonl`);
+  return join(transportDir(), `${safe}.jsonl`);
 }
 
 function shouldKeepTransportHistoryEvent(event: Record<string, unknown>): boolean {

@@ -161,22 +161,23 @@ exit ${opts.npmExitCode ?? 0}
   return { root, pkgRoot, binDir, launcher, homeDir, npmCallLog };
 }
 
-function runLauncher(sb: Sandbox): { stdout: string; stderr: string; status: number | null } {
+function runLauncher(sb: Sandbox, envOverride?: (env: NodeJS.ProcessEnv) => NodeJS.ProcessEnv): { stdout: string; stderr: string; status: number | null } {
   // systemd ExecStart / launchctl ProgramArguments ALWAYS pass
   // "start --foreground" — that's what the unit/plist generators write
   // (see `src/util/launch-target.ts`). Replicate that calling convention
   // here so the launcher's `exec "$NODE" "$ENTRY" "$@"` sees real args.
   const r = spawnSync(sb.launcher, ['start', '--foreground'], {
-    env: {
+    env: (envOverride ?? ((e) => e))({
       ...process.env,
       // PATH: shims first so `command -v node`/`command -v npm` resolve to the shims.
       PATH: `${sb.binDir}:${process.env.PATH ?? ''}`,
       HOME: sb.homeDir,
-      IMCODES_HOME: sb.homeDir,
+      // IMCODES_HOME is the state directory itself (not an account home), exactly as the daemon reads it.
+      IMCODES_HOME: join(sb.homeDir, '.imcodes'),
       // Repair log goes inside the sandbox so the assertion file lookups
       // don't depend on the real $HOME.
       IMCODES_LAUNCH_REPAIR_LOG: join(sb.homeDir, '.imcodes', 'launch-repair.log'),
-    },
+    }),
     encoding: 'utf8',
     timeout: 15_000,
   });
@@ -290,6 +291,37 @@ describeUnix('bin/imcodes-launch.sh', () => {
       mkdirSync(lockDir, { recursive: true });
       writeFileSync(join(lockDir, 'started'), '0');  // epoch 1970 → very stale
       runLauncher(sb);
+      expect(existsSync(lockDir)).toBe(false);
+    } finally {
+      rmSync(sb.root, { recursive: true, force: true });
+    }
+  });
+
+  it('sweeps the lock in IMCODES_HOME (the state directory itself) and leaves HOME/.imcodes alone', () => {
+    const sb = makeSandbox({});
+    try {
+      const scoped = join(sb.root, 'scoped-state');
+      const scopedLock = join(scoped, 'upgrade.lock.d');
+      const realLock = join(sb.homeDir, '.imcodes', 'upgrade.lock.d');
+      for (const lock of [scopedLock, realLock]) {
+        mkdirSync(lock, { recursive: true });
+        writeFileSync(join(lock, 'started'), '0');
+      }
+      runLauncher(sb, (env) => ({ ...env, IMCODES_HOME: scoped }));
+      expect(existsSync(scopedLock)).toBe(false);
+      expect(existsSync(realLock)).toBe(true);
+    } finally {
+      rmSync(sb.root, { recursive: true, force: true });
+    }
+  });
+
+  it('without IMCODES_HOME the state directory is $HOME/.imcodes (default unchanged)', () => {
+    const sb = makeSandbox({});
+    try {
+      const lockDir = join(sb.homeDir, '.imcodes', 'upgrade.lock.d');
+      mkdirSync(lockDir, { recursive: true });
+      writeFileSync(join(lockDir, 'started'), '0');
+      runLauncher(sb, (env) => { const { IMCODES_HOME: _unused, ...rest } = env; return rest; });
       expect(existsSync(lockDir)).toBe(false);
     } finally {
       rmSync(sb.root, { recursive: true, force: true });

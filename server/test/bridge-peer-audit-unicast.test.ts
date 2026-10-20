@@ -55,7 +55,7 @@ class MockWs extends EventEmitter {
 
 function makeDb(tokenHash = 'valid-hash') {
   return {
-    queryOne: async () => ({ token_hash: tokenHash, node_role: 'full', revoked_at: null }),
+    queryOne: async () => ({ token_hash: tokenHash, owner_status: 'active', node_role: 'full', revoked_at: null }),
     query: async () => [],
     execute: async () => ({ changes: 1 }),
     exec: async () => {},

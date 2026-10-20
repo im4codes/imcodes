@@ -15,6 +15,7 @@ describe('MCP runtime caller env parsing', () => {
       projectName: null,
       projectRoot: null,
       serverId: null,
+      providerId: null,
       transport: 'stdio',
     });
     expect(Object.isFrozen(caller)).toBe(true);
@@ -41,6 +42,7 @@ describe('MCP runtime caller env parsing', () => {
       [MEMORY_MCP_ENV_KEYS.SESSION_NAME]: 'deck_sub_worker',
       [MEMORY_MCP_ENV_KEYS.PROJECT_NAME]: 'proj',
       [MEMORY_MCP_ENV_KEYS.SERVER_ID]: 'srv-1',
+      [MEMORY_MCP_ENV_KEYS.PROVIDER_ID]: 'codex-sdk',
     });
 
     expect(deriveMemoryToolCaller(caller)).toMatchObject({
@@ -48,6 +50,20 @@ describe('MCP runtime caller env parsing', () => {
       sourceSessionName: 'deck_sub_worker',
       sourceProjectName: 'proj',
       sourceServerId: 'srv-1',
+    });
+    expect(caller.providerId).toBe('codex-sdk');
+  });
+
+  it('keeps supervised helper attribution separate from owner authorization', () => {
+    const caller = parseMcpRuntimeCallerFromEnv({
+      [MEMORY_MCP_ENV_KEYS.USER_ID]: 'user-1',
+      [MEMORY_MCP_ENV_KEYS.NAMESPACE]: JSON.stringify({ scope: 'personal', userId: 'user-1', projectId: 'repo' }),
+      [MEMORY_MCP_ENV_KEYS.SESSION_NAME]: 'deck_sub_owner',
+      [MEMORY_MCP_ENV_KEYS.SOURCE_SESSION_NAME]: 'deck_sub_supervision_owner',
+    });
+    expect(caller).toMatchObject({ sessionName: 'deck_sub_owner', sourceSessionName: 'deck_sub_supervision_owner' });
+    expect(deriveMemoryToolCaller(caller)).toMatchObject({
+      sourceSessionName: 'deck_sub_supervision_owner',
     });
   });
 
@@ -65,5 +81,14 @@ describe('MCP runtime caller env parsing', () => {
       [MEMORY_MCP_ENV_KEYS.NAMESPACE]: JSON.stringify({ scope: 'personal', userId: 'user-1', projectId: 'repo' }),
       [MEMORY_MCP_ENV_KEYS.SESSION_NAME]: 'deck_sub_$(whoami)',
     })).toThrow('IMCODES_DAEMON_SESSION_NAME is invalid');
+  });
+
+  it('ignores a provider-host UUID left in a resumed MCP environment', () => {
+    const caller = parseMcpRuntimeCallerFromEnv({
+      [MEMORY_MCP_ENV_KEYS.USER_ID]: 'user-1',
+      [MEMORY_MCP_ENV_KEYS.SESSION_NAME]: 'ef801947-be9a-4bb7-966d-87be08a40015',
+    });
+    expect(caller.sessionName).toBeNull();
+    expect(caller.userId).toBe('user-1');
   });
 });

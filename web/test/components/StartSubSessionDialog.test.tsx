@@ -3,8 +3,10 @@
  */
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { h } from 'preact';
-import { render, screen, cleanup, fireEvent, waitFor } from '@testing-library/preact';
+import { render, screen, cleanup, fireEvent, waitFor, act } from '@testing-library/preact';
 import { DEFAULT_CODEX_SESSION_MODEL } from '../../../src/shared/models/options.js';
+import { AGY_SDK_PROVIDER_ID } from '../../../shared/agy-agent.js';
+import { HERMES_AGENT_PROVIDER_ID } from '../../../shared/hermes-agent.js';
 
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({
@@ -35,7 +37,7 @@ describe('StartSubSessionDialog', () => {
     cleanup();
   });
 
-  it('shows Claude, Codex, Qoder, OpenCode, Grok, DeepSeek Harness, and Pi options', () => {
+  it('shows Claude, Codex, Qoder, OpenCode, Grok, Hermes, DeepSeek Harness, and Pi options', () => {
     render(
       <StartSubSessionDialog
         ws={makeWs() as any}
@@ -53,6 +55,8 @@ describe('StartSubSessionDialog', () => {
     expect(screen.getByRole('button', { name: /qoder_sdk/i })).toBeDefined();
     expect(screen.getByRole('button', { name: /opencode_sdk/i })).toBeDefined();
     expect(screen.getByRole('button', { name: /grok_sdk/i })).toBeDefined();
+    expect(screen.getByRole('button', { name: /agy_sdk/i })).toBeDefined();
+    expect(screen.getByRole('button', { name: /hermes_agent/i })).toBeDefined();
     expect(screen.getByRole('button', { name: /deepseek_harness/i })).toBeDefined();
     expect(screen.getByRole('button', { name: /^pi$/i })).toBeDefined();
   });
@@ -86,6 +90,30 @@ describe('StartSubSessionDialog', () => {
     expect(groups[1].textContent).toMatch(/claude_code_cli/i);
     expect(groups[1].textContent).toMatch(/codex_cli/i);
     expect(screen.getByText('qwen_provider_hint')).toBeDefined();
+  });
+
+  it('can reuse the launcher for a supervision pool without exposing unsupported session types', () => {
+    const { container } = render(
+      <StartSubSessionDialog
+        ws={makeWs() as any}
+        defaultCwd="/tmp"
+        allowedAgentTypes={['claude-code-sdk', 'codex-sdk', 'qwen', 'openclaw']}
+        overlayClassName="session-settings-child-overlay"
+        isProviderConnected={() => false}
+        getRemoteSessions={() => []}
+        refreshSessions={vi.fn()}
+        onStart={vi.fn()}
+        onClose={vi.fn()}
+      />,
+    );
+
+    expect(container.querySelector('.session-settings-child-overlay')).toBeTruthy();
+    expect(screen.getByRole('button', { name: /claude_code_sdk/i })).toBeDefined();
+    expect(screen.getByRole('button', { name: /codex_sdk/i })).toBeDefined();
+    expect(screen.getByRole('button', { name: /^qwen$/i })).toBeDefined();
+    expect(screen.getByRole('button', { name: /^openclaw$/i })).toBeDefined();
+    expect(screen.queryByRole('button', { name: /qoder_sdk/i })).toBeNull();
+    expect(screen.queryByRole('button', { name: /codex_cli/i })).toBeNull();
   });
 
   it('defaults level to high for supported transports', () => {
@@ -338,7 +366,14 @@ describe('StartSubSessionDialog', () => {
       />,
     );
 
-    fireEvent.click(screen.getByRole('button', { name: /qwen/i }));
+    // qwen's card is intentionally hidden (display: none) from the default
+    // picker now -- still a real, clickable DOM node. getByRole's `name`
+    // match can't find it even with `hidden: true`: accessible-name
+    // computation excludes text from display:none descendants regardless of
+    // that option, which only bypasses the "is this role excluded" gate, not
+    // name computation. A plain attribute query sidesteps that entirely,
+    // without changing what the test actually verifies.
+    fireEvent.click(document.querySelector('[data-agent-type="qwen"]') as HTMLButtonElement);
 
     await waitFor(() => expect(screen.getByText('qwen_provider_selected_hint')).toBeDefined());
   });
@@ -373,7 +408,14 @@ describe('StartSubSessionDialog', () => {
       />,
     );
 
-    fireEvent.click(screen.getByRole('button', { name: /qwen/i }));
+    // qwen's card is intentionally hidden (display: none) from the default
+    // picker now -- still a real, clickable DOM node. getByRole's `name`
+    // match can't find it even with `hidden: true`: accessible-name
+    // computation excludes text from display:none descendants regardless of
+    // that option, which only bypasses the "is this role excluded" gate, not
+    // name computation. A plain attribute query sidesteps that entirely,
+    // without changing what the test actually verifies.
+    fireEvent.click(document.querySelector('[data-agent-type="qwen"]') as HTMLButtonElement);
     await waitFor(() => expect(screen.getByText('compatible_api_via_qwen')).toBeDefined());
     expect(screen.getByText('qwen_provider_selected_hint')).toBeDefined();
     const presetSelect = (screen.getAllByRole('combobox') as HTMLSelectElement[])
@@ -423,8 +465,9 @@ describe('StartSubSessionDialog', () => {
     fireEvent.click(screen.getByLabelText(/custom_provider_sdk/i));
 
     await waitFor(() => expect(screen.getByRole('button', { name: /claude_code_sdk/i }).className).toContain('active'));
-    // Non-SDK types (e.g., codex-sdk) are filtered out and no longer rendered.
-    expect(screen.queryByRole('button', { name: /codex_sdk/i })).toBeNull();
+    // Non-supported types (e.g., gemini-sdk) are filtered out and no longer rendered.
+    expect(screen.queryByRole('button', { name: /gemini_sdk/i })).toBeNull();
+    expect(screen.getByRole('button', { name: /codex_sdk/i })).toBeDefined();
     // dsh (deepseek-harness) is now a visible, selectable button when custom provider SDK is on.
     const dshBtn = screen.getByRole('button', { name: /deepseek_harness/i }) as HTMLButtonElement;
     expect(dshBtn.disabled).toBe(false);
@@ -522,7 +565,14 @@ describe('StartSubSessionDialog', () => {
       />,
     );
 
-    fireEvent.click(screen.getByRole('button', { name: /qwen/i }));
+    // qwen's card is intentionally hidden (display: none) from the default
+    // picker now -- still a real, clickable DOM node. getByRole's `name`
+    // match can't find it even with `hidden: true`: accessible-name
+    // computation excludes text from display:none descendants regardless of
+    // that option, which only bypasses the "is this role excluded" gate, not
+    // name computation. A plain attribute query sidesteps that entirely,
+    // without changing what the test actually verifies.
+    fireEvent.click(document.querySelector('[data-agent-type="qwen"]') as HTMLButtonElement);
     await waitFor(() => expect(screen.getByText('compatible_api_via_qwen')).toBeDefined());
 
     fireEvent.click(screen.getByRole('button', { name: /api_provider_add_edit/i }));
@@ -548,7 +598,14 @@ describe('StartSubSessionDialog', () => {
       />,
     );
 
-    fireEvent.click(screen.getByRole('button', { name: /qwen/i }));
+    // qwen's card is intentionally hidden (display: none) from the default
+    // picker now -- still a real, clickable DOM node. getByRole's `name`
+    // match can't find it even with `hidden: true`: accessible-name
+    // computation excludes text from display:none descendants regardless of
+    // that option, which only bypasses the "is this role excluded" gate, not
+    // name computation. A plain attribute query sidesteps that entirely,
+    // without changing what the test actually verifies.
+    fireEvent.click(document.querySelector('[data-agent-type="qwen"]') as HTMLButtonElement);
     await waitFor(() => expect(screen.getByText('compatible_api_via_qwen')).toBeDefined());
     fireEvent.click(screen.getByRole('button', { name: /api_provider_add_edit/i }));
 
@@ -557,6 +614,50 @@ describe('StartSubSessionDialog', () => {
     expect(screen.getByDisplayValue('API_TIMEOUT_MS')).toBeDefined();
     expect(screen.getByDisplayValue('3000000')).toBeDefined();
     expect(screen.getByDisplayValue('CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC')).toBeDefined();
+  });
+
+  it('saves OpenAI compatible preset when selected in subsession preset editor', async () => {
+    const ws = makeWs();
+    render(
+      <StartSubSessionDialog
+        ws={ws as any}
+        defaultCwd="/tmp"
+        isProviderConnected={() => false}
+        getRemoteSessions={() => []}
+        refreshSessions={vi.fn()}
+        onStart={vi.fn()}
+        onClose={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(document.querySelector('[data-agent-type="qwen"]') as HTMLButtonElement);
+    await waitFor(() => expect(screen.getByText('compatible_api_via_qwen')).toBeDefined());
+    fireEvent.click(screen.getByRole('button', { name: /api_provider_add_edit/i }));
+
+    const openaiRadio = screen.getByLabelText(/OpenAI Compatible/i);
+    fireEvent.click(openaiRadio);
+
+    expect((screen.getByDisplayValue('https://api.minimax.chat/v1') as HTMLInputElement)).toBeDefined();
+    expect((screen.getByDisplayValue('MiniMax-Text-01') as HTMLInputElement)).toBeDefined();
+
+    fireEvent.input(screen.getByPlaceholderText('e.g. MiniMax'), { target: { value: 'OpenAI-Sub' } });
+    fireEvent.click(screen.getByRole('button', { name: /^Save$/i }));
+
+    expect(ws.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'cc.presets.save',
+      requestId: expect.any(String),
+      presets: [
+        expect.objectContaining({
+          name: 'OpenAI-Sub',
+          authType: 'openai',
+          defaultModel: 'MiniMax-Text-01',
+          env: expect.objectContaining({
+            OPENAI_BASE_URL: 'https://api.minimax.chat/v1',
+            OPENAI_MODEL: 'MiniMax-Text-01',
+          }),
+        }),
+      ],
+    }));
   });
 
   it('passes thinking level for qwen sub-sessions', () => {
@@ -573,12 +674,83 @@ describe('StartSubSessionDialog', () => {
       />,
     );
 
-    fireEvent.click(screen.getByRole('button', { name: /qwen/i }));
+    // qwen's card is intentionally hidden (display: none) from the default
+    // picker now -- still a real, clickable DOM node. getByRole's `name`
+    // match can't find it even with `hidden: true`: accessible-name
+    // computation excludes text from display:none descendants regardless of
+    // that option, which only bypasses the "is this role excluded" gate, not
+    // name computation. A plain attribute query sidesteps that entirely,
+    // without changing what the test actually verifies.
+    fireEvent.click(document.querySelector('[data-agent-type="qwen"]') as HTMLButtonElement);
     const selects = screen.getAllByRole('combobox') as HTMLSelectElement[];
     fireEvent.input(selects[0], { target: { value: 'high' } });
     fireEvent.click(screen.getByRole('button', { name: /launch/i }));
 
     expect(onStart).toHaveBeenCalledWith('qwen', undefined, '/tmp', undefined, { thinking: 'high' });
+  });
+
+  it('omits launchCount for the default quantity of one, keeping a single launch unchanged', () => {
+    const onStart = vi.fn();
+    render(
+      <StartSubSessionDialog
+        ws={makeWs() as any}
+        defaultCwd="/tmp"
+        isProviderConnected={() => false}
+        getRemoteSessions={() => []}
+        refreshSessions={vi.fn()}
+        onStart={onStart}
+        onClose={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /launch/i }));
+
+    expect(onStart).toHaveBeenCalledTimes(1);
+    const extra = onStart.mock.calls[0]?.[4] as Record<string, unknown> | undefined;
+    expect(extra).not.toHaveProperty('launchCount');
+  });
+
+  it('passes launchCount when a quantity greater than one is requested', () => {
+    const onStart = vi.fn();
+    render(
+      <StartSubSessionDialog
+        ws={makeWs() as any}
+        defaultCwd="/tmp"
+        isProviderConnected={() => false}
+        getRemoteSessions={() => []}
+        refreshSessions={vi.fn()}
+        onStart={onStart}
+        onClose={vi.fn()}
+      />,
+    );
+
+    fireEvent.input(screen.getByLabelText('launch_count'), { target: { value: '3' } });
+    fireEvent.click(screen.getByRole('button', { name: /launch/i }));
+
+    expect(onStart).toHaveBeenCalledTimes(1);
+    expect(onStart).toHaveBeenCalledWith('claude-code-sdk', undefined, '/tmp', undefined,
+      expect.objectContaining({ launchCount: 3 }));
+  });
+
+  it('clamps an out-of-range quantity into [1, MAX] instead of trusting raw input', () => {
+    const onStart = vi.fn();
+    render(
+      <StartSubSessionDialog
+        ws={makeWs() as any}
+        defaultCwd="/tmp"
+        isProviderConnected={() => false}
+        getRemoteSessions={() => []}
+        refreshSessions={vi.fn()}
+        onStart={onStart}
+        onClose={vi.fn()}
+      />,
+    );
+
+    fireEvent.input(screen.getByLabelText('launch_count'), { target: { value: '999' } });
+    fireEvent.click(screen.getByRole('button', { name: /launch/i }));
+
+    expect(onStart).toHaveBeenCalledWith('claude-code-sdk', undefined, '/tmp', undefined,
+      expect.objectContaining({ launchCount: 20 }));
   });
 
   it('passes requestedModel for copilot-sdk sub-sessions', () => {
@@ -652,6 +824,29 @@ describe('StartSubSessionDialog', () => {
     });
   });
 
+  it('passes requestedModel for Hermes ACP sub-sessions', () => {
+    const onStart = vi.fn();
+    render(
+      <StartSubSessionDialog
+        ws={makeWs() as any}
+        defaultCwd="/tmp"
+        isProviderConnected={() => false}
+        getRemoteSessions={() => []}
+        refreshSessions={vi.fn()}
+        onStart={onStart}
+        onClose={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /hermes_agent/i }));
+    fireEvent.input(screen.getByPlaceholderText('selectModel'), { target: { value: 'nous-free' } });
+    fireEvent.click(screen.getByRole('button', { name: /launch/i }));
+
+    expect(onStart).toHaveBeenCalledWith(HERMES_AGENT_PROVIDER_ID, undefined, '/tmp', undefined, {
+      requestedModel: 'nous-free',
+    });
+  });
+
   it('passes requestedModel for deepseek-harness sub-sessions', () => {
     const onStart = vi.fn();
     render(
@@ -696,6 +891,51 @@ describe('StartSubSessionDialog', () => {
 
     expect(onStart).toHaveBeenCalledWith('grok-sdk', undefined, '/tmp', undefined, {
       requestedModel: 'grok-build',
+    });
+  });
+
+  it('shows Antigravity sub-session options while disconnected', async () => {
+    render(<StartSubSessionDialog ws={Object.assign(makeWs(), { connected: false }) as any} defaultCwd="/tmp" isProviderConnected={() => false} getRemoteSessions={() => []} refreshSessions={vi.fn()} onStart={vi.fn()} onClose={vi.fn()} />);
+    fireEvent.click(screen.getByRole('button', { name: /agy_sdk/i }));
+    const input = screen.getByPlaceholderText('selectModel') as HTMLInputElement;
+    act(() => input.focus());
+    await waitFor(() => expect(screen.getByRole('option', { name: 'gemini-3.8-flash-high' })).toBeDefined());
+    expect(input.value).toBe('gemini-3.8-flash-high');
+  });
+
+  it('replaces Antigravity sub-session fallback options with the refreshed catalog', async () => {
+    const handlers = new Set<(message: unknown) => void>();
+    const ws = { ...makeWs(), connected: true, onMessage: (cb: (message: unknown) => void) => { handlers.add(cb); return () => handlers.delete(cb); } };
+    render(<StartSubSessionDialog ws={ws as any} defaultCwd="/tmp" isProviderConnected={() => false} getRemoteSessions={() => []} refreshSessions={vi.fn()} onStart={vi.fn()} onClose={vi.fn()} />);
+    fireEvent.click(screen.getByRole('button', { name: /agy_sdk/i }));
+    const request = ws.send.mock.calls.find(([msg]) => msg.type === 'transport.list_models' && msg.agentType === AGY_SDK_PROVIDER_ID)?.[0];
+    expect(request).toBeDefined();
+    act(() => handlers.forEach(cb => cb({ type: 'transport.models_response', agentType: AGY_SDK_PROVIDER_ID, requestId: request.requestId, models: [{ id: 'gemini-3.8-flash-high' }, { id: 'new-live-model' }], defaultModel: 'gemini-3.8-flash-high' })));
+    act(() => (screen.getByPlaceholderText('selectModel') as HTMLInputElement).focus());
+    await waitFor(() => expect(screen.getByRole('option', { name: 'new-live-model' })).toBeDefined());
+    expect(screen.queryByRole('option', { name: 'gemini-4-argon-medium' })).toBeNull();
+  });
+
+  it('passes a dynamically selected model for agy-sdk sub-sessions', () => {
+    const onStart = vi.fn();
+    render(
+      <StartSubSessionDialog
+        ws={makeWs() as any}
+        defaultCwd="/tmp"
+        isProviderConnected={() => false}
+        getRemoteSessions={() => []}
+        refreshSessions={vi.fn()}
+        onStart={onStart}
+        onClose={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /agy_sdk/i }));
+    fireEvent.input(screen.getByPlaceholderText('selectModel'), { target: { value: 'gemini-2.5-pro' } });
+    fireEvent.click(screen.getByRole('button', { name: /launch/i }));
+
+    expect(onStart).toHaveBeenCalledWith(AGY_SDK_PROVIDER_ID, undefined, '/tmp', undefined, {
+      requestedModel: 'gemini-2.5-pro',
     });
   });
 

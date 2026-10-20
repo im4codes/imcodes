@@ -42,16 +42,48 @@ describe('model context inference', () => {
     expect(inferContextWindow('claude-mythos-5')).toBe(1_000_000);
   });
 
+  it('maps the haiku alias and Haiku 5 ids to 1M context, and keeps Haiku 4 / Claude 3 at 200k', () => {
+    // `haiku` resolves to Haiku 5.5 from Agent SDK 0.3.293; the bundled binary reports contextWindow 1_000_000 for it
+    // (0.3.291 reported 200_000 for claude-haiku-4-5-20251001).
+    expect(inferContextWindow('haiku')).toBe(1_000_000);
+    expect(inferContextWindow('claude-haiku-5-5')).toBe(1_000_000);
+    expect(inferContextWindow('claude-haiku-5')).toBe(1_000_000);
+    expect(inferContextWindow('claude-haiku-4-5-20251001')).toBe(200_000);
+    expect(inferContextWindow('claude-haiku-4-5')).toBe(200_000);
+    expect(inferContextWindow('claude-3-haiku-20240307')).toBe(200_000);
+  });
+
   it('maps claude opus family to 1M context', () => {
     expect(inferContextWindow('opus[1M]')).toBe(1_000_000);
     expect(inferContextWindow('claude-opus-4-1')).toBe(1_000_000);
     expect(inferContextWindow('claude-opus-4-6')).toBe(1_000_000);
   });
 
-  it('maps claude sonnet 4 family to 1M context', () => {
+  it('maps claude sonnet 4 and 5 family to 1M context', () => {
     expect(inferContextWindow('sonnet')).toBe(1_000_000);
     expect(inferContextWindow('claude-sonnet-4')).toBe(1_000_000);
     expect(inferContextWindow('claude-sonnet-4-6')).toBe(1_000_000);
+    expect(inferContextWindow('claude-sonnet-5-5-high')).toBe(1_000_000);
+    expect(inferContextWindow('claude-sonnet-5-5-low')).toBe(1_000_000);
+  });
+
+  it('maps claude opus 4 and 5 family to 1M context', () => {
+    expect(inferContextWindow('claude-opus-5-5-high')).toBe(1_000_000);
+    expect(inferContextWindow('claude-opus-5-5-low')).toBe(1_000_000);
+  });
+
+  it('maps gemini flash and pro families to appropriate context windows', () => {
+    expect(inferContextWindow('flash')).toBe(1_000_000);
+    expect(inferContextWindow('gemini-3.8-flash-high')).toBe(1_000_000);
+    expect(inferContextWindow('gemini-3.8-flash-medium')).toBe(1_000_000);
+    expect(inferContextWindow('gemini-2.5-flash')).toBe(1_000_000);
+    expect(inferContextWindow('gemini-4-argon-medium')).toBe(1_000_000);
+    expect(inferContextWindow('gemini-4-argon-high')).toBe(1_000_000);
+    expect(inferContextWindow('gemini-4-argon-low')).toBe(1_000_000);
+    expect(inferContextWindow('pro')).toBe(2_000_000);
+    expect(inferContextWindow('gemini-3.8-pro')).toBe(2_000_000);
+    expect(inferContextWindow('gemini-2.5-pro')).toBe(2_000_000);
+    expect(inferContextWindow('gpt-oss-120b-medium')).toBe(131_072);
   });
 
   it('prefers model mapping over stale explicit fallback values', () => {

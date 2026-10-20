@@ -25,6 +25,11 @@ export function closeDaemonRemoteDesktop(): void {
   active = null;
 }
 
+/** Re-check a signed worker at daemon hello/reconnect and idle edges. */
+export async function refreshDaemonRemoteDesktop(): Promise<void> {
+  await active?.refresh();
+}
+
 /** Returns false when the message is not a remote-desktop message, or no host exists. */
 export async function handleDaemonRemoteDesktopMessage(
   message: Record<string, unknown>,

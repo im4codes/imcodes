@@ -20,6 +20,7 @@ import {
 import { warnOncePerHour } from '../util/rate-limited-warn.js';
 import { incrementCounter } from '../util/metrics.js';
 import { MEMORY_DEFAULTS } from '../../shared/memory-defaults.js';
+import { imcodesStateDirForHome } from '../util/imcodes-state-dir.js';
 
 const EMPTY_SNAPSHOT: SkillRegistrySnapshot = {
   schemaVersion: SKILL_REGISTRY_SCHEMA_VERSION,
@@ -55,7 +56,7 @@ export interface SkillRegistryOptions {
 }
 
 function userRegistryPath(homeDir = homedir()): string {
-  return join(getUserSkillRoot(homeDir), SKILL_REGISTRY_FILE_NAME);
+  return join(getUserSkillRoot(homeDir, imcodesStateDirForHome(homeDir)), SKILL_REGISTRY_FILE_NAME);
 }
 
 function projectRegistryPath(projectDir: string | undefined): string | undefined {

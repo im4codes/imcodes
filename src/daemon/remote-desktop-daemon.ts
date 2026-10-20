@@ -1,8 +1,6 @@
-import { execFile } from 'node:child_process';
-import { readFileSync } from 'node:fs';
-import { homedir } from 'node:os';
+import { existsSync, readFileSync } from 'node:fs';
+import { mkdtemp, mkdir, rename, rm } from 'node:fs/promises';
 import { join } from 'node:path';
-import { promisify } from 'node:util';
 import {
   REMOTE_DESKTOP_CAPABILITY,
   isRemoteDesktopMessageType,
@@ -25,16 +23,20 @@ import {
   CONTROLLED_NODE_ARCH_X64,
   CONTROLLED_NODE_OS_WIN,
 } from '../../shared/controlled-node-artifacts.js';
+import { compareImcodesVersions } from '../../shared/imcodes-version.js';
 import {
   REMOTE_DESKTOP_LOGIN_SCREEN_ERROR,
   REMOTE_DESKTOP_LOGIN_SCREEN_MSG,
   REMOTE_DESKTOP_LOGIN_SCREEN_STATE,
+  controlledNodeInstallHereCapability,
+  readRemoteDesktopLoginScreenInstallCode,
   readRemoteDesktopLoginScreenTicket,
   type RemoteDesktopLoginScreenError,
   type RemoteDesktopLoginScreenState,
 } from '../../shared/remote-desktop-login-screen.js';
 import { dispatchRemoteDesktopCommand } from '../node/remote-desktop-dispatch.js';
 import { installLoginScreenControl } from './remote-desktop-login-screen.js';
+import { controlledNodeInstallHereTarget, installControlledNodeHere } from './controlled-node-install-here.js';
 import {
   REMOTE_DESKTOP_COMPILED_SIGNER_SHA256,
   RemoteDesktopWorkerHost,
@@ -44,11 +46,14 @@ import {
 } from '../node/remote-desktop-worker-host.js';
 import { launchWindowsWorkerInCurrentSession } from '../node/windows-user-session.js';
 import type { RemoteDesktopCommandTarget } from '../node/remote-desktop-dispatch.js';
-import { downloadControlledNodeRemoteDesktopWorker } from '../node/self-upgrade.js';
+import {
+  downloadControlledNodeRemoteDesktopWorker,
+  extractWindowsRemoteDesktopVirtualDisplay,
+} from '../node/self-upgrade.js';
 import { loadDaemonCredential, type DaemonCredential } from './machine-mcp-deps.js';
 import logger from '../util/logger.js';
+import { imcodesStateDir } from '../util/imcodes-state-dir.js';
 
-const execFileAsync = promisify(execFile);
 const SHA256_RE = /^[a-f0-9]{64}$/;
 
 /**
@@ -60,8 +65,8 @@ const SHA256_RE = /^[a-f0-9]{64}$/;
  * process's search order. The daemon runs as the user who owns this directory,
  * so it passes the artifact in explicitly instead.
  */
-export function daemonRemoteDesktopRoot(home = homedir()): string {
-  return join(home, '.imcodes');
+export function daemonRemoteDesktopRoot(home?: string): string {
+  return home ? join(home, '.imcodes') : imcodesStateDir();
 }
 
 function workerExecutablePath(root: string): string {
@@ -71,6 +76,7 @@ function workerExecutablePath(root: string): string {
 /** The part of the native worker host this class depends on. */
 export interface RemoteDesktopWorkerLike extends RemoteDesktopCommandTarget {
   close(): void;
+  activeConnections?(): readonly unknown[];
 }
 
 export interface DaemonRemoteDesktopDeps {
@@ -99,6 +105,7 @@ export interface DaemonRemoteDesktopDeps {
     onMessage: (message: Record<string, unknown>) => void,
   ) => RemoteDesktopWorkerLike;
   installLoginScreen?: typeof installLoginScreenControl;
+  installHere?: typeof installControlledNodeHere;
 }
 
 /**
@@ -121,6 +128,7 @@ export class DaemonRemoteDesktop {
   private artifact: VerifiedRemoteDesktopWorkerArtifact | null = null;
   private installing: Promise<void> | null = null;
   private installingLoginScreen: Promise<void> | null = null;
+  private pendingAutoUpdate = false;
 
   constructor(private readonly deps: DaemonRemoteDesktopDeps) {
     this.platform = deps.platform ?? process.platform;
@@ -151,10 +159,23 @@ export class DaemonRemoteDesktop {
    * "this machine cannot do it" apart from "this machine needs one download".
    */
   capabilities(): readonly string[] {
+    const installHere = this.installHereTarget();
+    if (installHere) return [controlledNodeInstallHereCapability(installHere)];
     if (!this.supported()) return [];
     return this.available()
       ? [REMOTE_DESKTOP_INSTALLABLE_CAPABILITY, REMOTE_DESKTOP_CAPABILITY]
       : [REMOTE_DESKTOP_INSTALLABLE_CAPABILITY];
+  }
+
+  /**
+   * Linux and macOS: remote desktop there is the controlled node, which this
+   * daemon can install on its own computer when the owner asks.
+   */
+  private installHereTarget() {
+    if (!isRemoteDesktopFeatureEnabled(process.env.IMCODES_REMOTE_DESKTOP_ENABLED, process.env.NODE_ENV)) {
+      return null;
+    }
+    return controlledNodeInstallHereTarget(this.platform, this.arch);
   }
 
   installState(): RemoteDesktopInstallState {
@@ -172,7 +193,11 @@ export class DaemonRemoteDesktop {
       return true;
     }
     if (message.type === REMOTE_DESKTOP_LOGIN_SCREEN_MSG.REQUEST) {
-      await this.installLoginScreen(readRemoteDesktopLoginScreenTicket(message));
+      if (this.installHereTarget()) {
+        await this.installNodeHere(readRemoteDesktopLoginScreenInstallCode(message));
+      } else {
+        await this.installLoginScreen(readRemoteDesktopLoginScreenTicket(message));
+      }
       return true;
     }
     if (typeof message.type !== 'string' || !isRemoteDesktopMessageType(message.type)) return false;
@@ -185,7 +210,13 @@ export class DaemonRemoteDesktop {
       target: host ?? { handle: async () => false },
       send: (reply) => this.deps.send(reply),
     });
+    if (this.pendingAutoUpdate && !this.workerBusy()) void this.install({ checkLatest: true });
     return true;
+  }
+
+  /** Re-check the independently released worker at reconnect/idle boundaries. */
+  async refresh(): Promise<void> {
+    if (this.available()) await this.install({ checkLatest: true });
   }
 
   /**
@@ -193,7 +224,7 @@ export class DaemonRemoteDesktop {
    * in-flight install rather than racing a second download into the same
    * directory, which would break the exact-entry verification.
    */
-  async install(): Promise<void> {
+  async install(options: { checkLatest?: boolean } = {}): Promise<void> {
     if (!this.supported()) {
       this.publish(
         REMOTE_DESKTOP_INSTALL_STATE.UNSUPPORTED,
@@ -201,18 +232,34 @@ export class DaemonRemoteDesktop {
       );
       return;
     }
-    if (this.available()) {
+    if (this.available() && !options.checkLatest) {
       this.publish(REMOTE_DESKTOP_INSTALL_STATE.INSTALLED);
       return;
     }
+    if (this.available() && this.workerBusy()) {
+      this.pendingAutoUpdate = true;
+      return;
+    }
     if (this.installing) return this.installing;
+    const replacing = this.available();
+    this.pendingAutoUpdate = false;
     this.publish(REMOTE_DESKTOP_INSTALL_STATE.DOWNLOADING);
-    this.installing = this.runInstall().finally(() => { this.installing = null; });
+    this.installing = this.runInstall(replacing).finally(() => { this.installing = null; });
     return this.installing;
   }
 
-  private async runInstall(): Promise<void> {
+  private async runInstall(replacing: boolean): Promise<void> {
+    // A normal daemon's state root already exists; the existence check also
+    // keeps injected test roots on the legacy direct path without creating
+    // arbitrary absolute directories.
+    let stagingRoot: string | null = null;
+    const cleanup = async (): Promise<void> => {
+      if (stagingRoot) await rm(stagingRoot, { recursive: true, force: true }).catch(() => {});
+    };
     try {
+      stagingRoot = replacing && existsSync(this.root)
+        ? await mkdtemp(join(this.root, '.remote-desktop-worker-update-'))
+        : null;
       const credential = await (this.deps.loadCredential ?? loadDaemonCredential)();
       if (!credential) {
         this.publish(REMOTE_DESKTOP_INSTALL_STATE.FAILED, REMOTE_DESKTOP_INSTALL_ERROR.NOT_BOUND);
@@ -221,7 +268,7 @@ export class DaemonRemoteDesktop {
       const downloaded = await (this.deps.downloadWorker ?? downloadControlledNodeRemoteDesktopWorker)({
         credential,
         target: { os: CONTROLLED_NODE_OS_WIN, arch: CONTROLLED_NODE_ARCH_X64 },
-        dir: this.root,
+        dir: stagingRoot ?? this.root,
         fetchImpl: this.deps.fetchImpl ?? fetch,
       });
       if (!downloaded) {
@@ -235,7 +282,7 @@ export class DaemonRemoteDesktop {
       // no such script, so it does the same step here. The extracted files are
       // then hash- and signer-verified by the shared artifact verifier below,
       // and again by Authenticode at launch.
-      await (this.deps.extractVirtualDisplay ?? extractVirtualDisplayArchive)(
+      await (this.deps.extractVirtualDisplay ?? extractWindowsRemoteDesktopVirtualDisplay)(
         join(downloaded.workerDir, REMOTE_DESKTOP_VIRTUAL_DISPLAY_ARCHIVE_FILENAME),
         join(downloaded.workerDir, 'virtual-display'),
       );
@@ -245,22 +292,97 @@ export class DaemonRemoteDesktop {
         REMOTE_DESKTOP_INSTALL_STATE.FAILED,
         REMOTE_DESKTOP_INSTALL_ERROR.DOWNLOAD_FAILED,
       );
+      await cleanup();
       return;
     }
     // The bundle landed; it is only an install once the shared verifier accepts
     // its hashes, manifest and pinned signer.
-    const artifact = this.resolveArtifact();
+    const artifact = this.resolveArtifact(
+      stagingRoot ? workerExecutablePath(stagingRoot) : workerExecutablePath(this.root),
+    );
     if (!artifact) {
       this.publish(
         REMOTE_DESKTOP_INSTALL_STATE.FAILED,
         REMOTE_DESKTOP_INSTALL_ERROR.VERIFICATION_FAILED,
       );
+      await cleanup();
       return;
     }
-    this.artifact = artifact;
-    this.publish(REMOTE_DESKTOP_INSTALL_STATE.INSTALLED);
-    // Only now does this daemon claim it can serve remote control.
-    this.deps.onCapabilityChange?.();
+    // Worker releases are independent of the daemon release. A reconnect
+    // check downloads the signed latest manifest, then skips the atomic swap
+    // when the worker generation is already identical.
+    if (replacing) {
+      const installedVersion = this.artifact?.manifest.workerVersion;
+      const targetVersion = artifact.manifest.workerVersion;
+      const releaseOrder = typeof installedVersion === 'string'
+        && typeof targetVersion === 'string'
+        ? compareImcodesVersions(installedVersion, targetVersion)
+        : null;
+      // A worker manifest is trusted for integrity, not for release ordering.
+      // Never replace a known-good worker when either side is unparseable or
+      // the downloaded bundle is not strictly newer. This keeps downgrade,
+      // malformed and missing-version releases fail-closed while preserving
+      // the old worker for service and a bounded, observable failure state.
+      if (releaseOrder === null || releaseOrder >= 0) {
+        this.publish(
+          releaseOrder === 0
+            ? REMOTE_DESKTOP_INSTALL_STATE.INSTALLED
+            : REMOTE_DESKTOP_INSTALL_STATE.FAILED,
+          releaseOrder === 0 ? undefined : REMOTE_DESKTOP_INSTALL_ERROR.VERIFICATION_FAILED,
+        );
+        await cleanup();
+        return;
+      }
+    }
+    // A connection may have started while the release was downloading. Do
+    // not tear it down after the initial idle check; leave the staged bundle
+    // for the next idle edge instead.
+    if (replacing && this.workerBusy()) {
+      this.pendingAutoUpdate = true;
+      this.publish(REMOTE_DESKTOP_INSTALL_STATE.INSTALLED);
+      await cleanup();
+      return;
+    }
+    try {
+      if (stagingRoot) {
+        this.close();
+        const stagedPlatform = join(stagingRoot, 'remote-desktop-worker', 'win32-x64');
+        const finalPlatform = join(this.root, 'remote-desktop-worker', 'win32-x64');
+        const backupPlatform = `${finalPlatform}.previous`;
+        await mkdir(join(this.root, 'remote-desktop-worker'), { recursive: true });
+        await rm(backupPlatform, { recursive: true, force: true });
+        await rename(finalPlatform, backupPlatform);
+        try {
+          await rename(stagedPlatform, finalPlatform);
+          const published = this.resolveArtifact();
+          if (!published) throw new Error('remote_desktop_worker_publish_verification_failed');
+          this.artifact = published;
+        } catch (error) {
+          await rm(finalPlatform, { recursive: true, force: true }).catch(() => {});
+          await rename(backupPlatform, finalPlatform).catch(() => {});
+          throw error;
+        }
+        await rm(backupPlatform, { recursive: true, force: true });
+      } else {
+        this.artifact = artifact;
+      }
+      this.publish(REMOTE_DESKTOP_INSTALL_STATE.INSTALLED);
+      // Only now does this daemon claim it can serve remote control.
+      this.deps.onCapabilityChange?.();
+    } catch (err) {
+      logger.warn({ err }, 'remote desktop worker publication failed; retaining previous worker');
+      this.publish(REMOTE_DESKTOP_INSTALL_STATE.FAILED, REMOTE_DESKTOP_INSTALL_ERROR.VERIFICATION_FAILED);
+    } finally {
+      await cleanup();
+    }
+  }
+
+  private workerBusy(): boolean {
+    try {
+      if (!this.host) return false;
+      if (!this.host.activeConnections) return true;
+      return this.host.activeConnections().length > 0;
+    } catch { return true; }
   }
 
   /**
@@ -276,8 +398,7 @@ export class DaemonRemoteDesktop {
    * across worker, driver and catalogue, and a real Authenticode verification of
    * all three at launch.
    */
-  private resolveArtifact(): VerifiedRemoteDesktopWorkerArtifact | null {
-    const executablePath = workerExecutablePath(this.root);
+  private resolveArtifact(executablePath = workerExecutablePath(this.root)): VerifiedRemoteDesktopWorkerArtifact | null {
     const signer = SHA256_RE.test(this.trustedSignerSha256)
       ? this.trustedSignerSha256
       : (this.deps.readInstalledSigner ?? installedWorkerSigner)(executablePath);
@@ -342,34 +463,61 @@ export class DaemonRemoteDesktop {
       );
       return;
     }
-    if (this.installingLoginScreen) return this.installingLoginScreen;
-    this.installingLoginScreen = this.runLoginScreenInstall(ticket)
-      .finally(() => { this.installingLoginScreen = null; });
-    return this.installingLoginScreen;
+    return this.runNodeInstall((onState) => (this.deps.installLoginScreen ?? installLoginScreenControl)({
+      ticket,
+      root: this.root,
+      loadCredential: this.deps.loadCredential ?? loadDaemonCredential,
+      ...(this.deps.fetchImpl ? { fetchImpl: this.deps.fetchImpl } : {}),
+      onState,
+    }));
   }
 
-  private async runLoginScreenInstall(ticket: string): Promise<void> {
-    let failure: RemoteDesktopLoginScreenError | null;
-    try {
-      failure = await (this.deps.installLoginScreen ?? installLoginScreenControl)({
-        ticket,
-        root: this.root,
-        loadCredential: this.deps.loadCredential ?? loadDaemonCredential,
-        ...(this.deps.fetchImpl ? { fetchImpl: this.deps.fetchImpl } : {}),
-        onState: (state) => this.publishLoginScreen(
+  /**
+   * Install the controlled node on this Linux or macOS computer with the install
+   * code the owner minted for this daemon. Joins an attempt already in flight,
+   * like the Windows install, rather than prompting twice.
+   */
+  private async installNodeHere(installCode: string | null): Promise<void> {
+    if (!installCode) {
+      this.publishLoginScreen(
+        REMOTE_DESKTOP_LOGIN_SCREEN_STATE.FAILED,
+        REMOTE_DESKTOP_LOGIN_SCREEN_ERROR.DOWNLOAD_FAILED,
+      );
+      return;
+    }
+    return this.runNodeInstall((onState) => (this.deps.installHere ?? installControlledNodeHere)({
+      installCode,
+      platform: this.platform,
+      root: this.root,
+      loadCredential: this.deps.loadCredential ?? loadDaemonCredential,
+      ...(this.deps.fetchImpl ? { fetchImpl: this.deps.fetchImpl } : {}),
+      onState,
+    }));
+  }
+
+  private runNodeInstall(
+    install: (onState: (state: 'downloading' | 'elevating') => void) => Promise<RemoteDesktopLoginScreenError | null>,
+  ): Promise<void> {
+    if (this.installingLoginScreen) return this.installingLoginScreen;
+    const attempt = async (): Promise<void> => {
+      let failure: RemoteDesktopLoginScreenError | null;
+      try {
+        failure = await install((state) => this.publishLoginScreen(
           state === 'downloading'
             ? REMOTE_DESKTOP_LOGIN_SCREEN_STATE.DOWNLOADING
             : REMOTE_DESKTOP_LOGIN_SCREEN_STATE.ELEVATING,
-        ),
-      });
-    } catch (err) {
-      logger.warn({ err }, 'login screen control install failed');
-      failure = REMOTE_DESKTOP_LOGIN_SCREEN_ERROR.DOWNLOAD_FAILED;
-    }
-    this.publishLoginScreen(
-      failure ? REMOTE_DESKTOP_LOGIN_SCREEN_STATE.FAILED : REMOTE_DESKTOP_LOGIN_SCREEN_STATE.COMPLETED,
-      failure ?? undefined,
-    );
+        ));
+      } catch (err) {
+        logger.warn({ err }, 'controlled node install from the daemon failed');
+        failure = REMOTE_DESKTOP_LOGIN_SCREEN_ERROR.DOWNLOAD_FAILED;
+      }
+      this.publishLoginScreen(
+        failure ? REMOTE_DESKTOP_LOGIN_SCREEN_STATE.FAILED : REMOTE_DESKTOP_LOGIN_SCREEN_STATE.COMPLETED,
+        failure ?? undefined,
+      );
+    };
+    this.installingLoginScreen = attempt().finally(() => { this.installingLoginScreen = null; });
+    return this.installingLoginScreen;
   }
 
   private publishLoginScreen(
@@ -436,22 +584,3 @@ function installedWorkerSigner(executablePath: string): string {
  * Expand the signed virtual-display archive. PowerShell is the only unzip this
  * project can rely on, and this path is Windows-only by construction.
  */
-async function extractVirtualDisplayArchive(
-  archivePath: string,
-  destination: string,
-): Promise<void> {
-  await execFileAsync(
-    join(process.env.WINDIR ?? 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe'),
-    [
-      '-NoProfile',
-      '-NonInteractive',
-      '-ExecutionPolicy', 'Bypass',
-      '-Command',
-      'Expand-Archive -LiteralPath $env:IMCODES_RD_ARCHIVE -DestinationPath $env:IMCODES_RD_DEST -Force',
-    ],
-    {
-      windowsHide: true,
-      env: { ...process.env, IMCODES_RD_ARCHIVE: archivePath, IMCODES_RD_DEST: destination },
-    },
-  );
-}

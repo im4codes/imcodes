@@ -282,3 +282,36 @@ describe('mergeTimelineEvents', () => {
     expect(merged[0]?.payload.text).toContain('Turn cancelled');
   });
 });
+
+describe('user-deleted tombstones are sticky in the merge', () => {
+  const tombstone = (overrides: Partial<TimelineEvent> = {}): TimelineEvent => makeEvent({
+    eventId: 'evt-del', seq: 10, ts: 100, hidden: true, payload: { text: 'gone', streaming: false, userDeleted: true }, ...overrides,
+  });
+
+  it('beats a HYDRATED (fuller) copy of the same event, in either merge order', () => {
+    const hydrated = makeEvent({ eventId: 'evt-del', seq: 50, ts: 100, payload: { text: 'gone', completeness: 'hydrated' } });
+    expect(preferTimelineEvent(hydrated, tombstone())).toEqual(expect.objectContaining({ hidden: true }));
+    expect(preferTimelineEvent(tombstone(), hydrated)).toEqual(expect.objectContaining({ hidden: true }));
+  });
+
+  it('beats a later streaming delta and a later terminal update (higher seq)', () => {
+    const delta = makeEvent({ eventId: 'evt-del', seq: 99, payload: { text: 'more', streaming: true } });
+    const terminal = makeEvent({ eventId: 'evt-del', seq: 100, payload: { text: 'done', streaming: false } });
+    expect(preferTimelineEvent(tombstone(), delta).hidden).toBe(true);
+    expect(preferTimelineEvent(tombstone(), terminal).hidden).toBe(true);
+    expect(mergeTimelineEvents([terminal], [tombstone()])[0]?.hidden).toBe(true);
+    expect(mergeTimelineEvents([tombstone()], [terminal])[0]?.hidden).toBe(true);
+  });
+
+  it('an event that is merely hidden (daemon-internal) is NOT sticky', () => {
+    const internalHidden = makeEvent({ eventId: 'evt-x', seq: 1, hidden: true, payload: { text: 'internal' } });
+    const visibleUpdate = makeEvent({ eventId: 'evt-x', seq: 2, payload: { text: 'revised' } });
+    expect(preferTimelineEvent(internalHidden, visibleUpdate)).toBe(visibleUpdate);
+  });
+
+  it('between two tombstones the newer one wins as usual', () => {
+    const older = tombstone({ seq: 10 });
+    const newer = tombstone({ seq: 11 });
+    expect(preferTimelineEvent(older, newer)).toBe(newer);
+  });
+});

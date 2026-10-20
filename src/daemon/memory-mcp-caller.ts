@@ -11,9 +11,12 @@ export interface McpRuntimeCaller {
   userId: string;
   namespace: ContextNamespace;
   sessionName: string | null;
+  /** Separate write attribution for supervised helpers; authorization stays owner-scoped. */
+  sourceSessionName?: string | null;
   projectName: string | null;
   projectRoot: string | null;
   serverId: string | null;
+  providerId: string | null;
   transport: MemoryMcpTransport;
 }
 
@@ -78,6 +81,15 @@ function runtimeUserId(rawUserId: string | null, namespace: ContextNamespace): s
   return namespaceUserId ?? rawUserId ?? DAEMON_LOCAL_MEMORY_USER_ID;
 }
 
+// Some provider hosts (notably a long-lived Codex app-server) historically
+// put their opaque provider session UUID in IMCODES_DAEMON_SESSION_NAME when
+// the daemon could not inject the canonical deck_* name into a resumed MCP
+// config.  It is not an IM.codes session and must never be used for routing,
+// but rejecting it makes the bootstrap crash-loop forever after a daemon
+// restart.  Treat only UUID-shaped values as this legacy provider identity;
+// all other malformed names still fail closed.
+const PROVIDER_HOST_SESSION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
 export function parseMcpRuntimeCallerFromEnv(
   env: MemoryMcpEnvSource = process.env,
   transport: MemoryMcpTransport = 'stdio',
@@ -86,17 +98,21 @@ export function parseMcpRuntimeCallerFromEnv(
   const envUserId = optionalString(env[MEMORY_MCP_ENV_KEYS.USER_ID]);
   const namespace = namespaceJson ? parseNamespace(namespaceJson) : localNamespace(envUserId ?? undefined);
   const userId = runtimeUserId(envUserId, namespace);
-  const sessionName = optionalString(env[MEMORY_MCP_ENV_KEYS.SESSION_NAME]);
-  if (sessionName && !isValidImcodesSessionName(sessionName)) {
+  const rawSessionName = optionalString(env[MEMORY_MCP_ENV_KEYS.SESSION_NAME]);
+  const sourceSessionName = optionalString(env[MEMORY_MCP_ENV_KEYS.SOURCE_SESSION_NAME]);
+  if (rawSessionName && !isValidImcodesSessionName(rawSessionName) && !PROVIDER_HOST_SESSION_ID.test(rawSessionName)) {
     throw new MemoryMcpCallerEnvError('[memory-mcp] fail-fast: IMCODES_DAEMON_SESSION_NAME is invalid');
   }
+  const sessionName = rawSessionName && isValidImcodesSessionName(rawSessionName) ? rawSessionName : null;
   return Object.freeze({
     userId,
     namespace,
     sessionName,
+    sourceSessionName,
     projectName: optionalString(env[MEMORY_MCP_ENV_KEYS.PROJECT_NAME]),
     projectRoot: optionalString(env[MEMORY_MCP_ENV_KEYS.PROJECT_ROOT]),
     serverId: optionalString(env[MEMORY_MCP_ENV_KEYS.SERVER_ID]),
+    providerId: optionalString(env[MEMORY_MCP_ENV_KEYS.PROVIDER_ID]),
     transport,
   });
 }
@@ -106,6 +122,7 @@ export function deriveMemoryToolCaller(caller: McpRuntimeCaller): MemoryToolCall
     userId: caller.userId,
     namespace: caller.namespace,
     sessionName: caller.sessionName,
+    sourceSessionName: caller.sourceSessionName,
     projectName: caller.projectName,
     serverId: caller.serverId,
   });

@@ -34,6 +34,8 @@ interface Props {
   initialSelectedId?: string | null;
   initialTab?: 'auto' | 'team';
   requestScope?: P2pWorkflowRequestScope;
+  /** tsk_5rf: needed to build authenticated URLs for streamed image previews. */
+  serverId?: string | null;
   /** Live discussion state from app (progress, nodes). */
   liveDiscussions?: P2pProgressDiscussion[];
   onStopDiscussion?: (id: string) => void;
@@ -41,7 +43,7 @@ interface Props {
 
 // Global marked config (breaks, gfm, target=_blank) is set in main.tsx
 
-export function DiscussionsPage({ ws, initialSelectedId, initialTab = 'team', requestScope, liveDiscussions = [], onStopDiscussion }: Props) {
+export function DiscussionsPage({ ws, initialSelectedId, initialTab = 'team', requestScope, serverId, liveDiscussions = [], onStopDiscussion }: Props) {
   const { t } = useTranslation();
   const [progressHidden, setProgressHidden] = useState(false);
   const [listTab, setListTab] = useState<'auto' | 'team'>(initialTab);
@@ -464,10 +466,11 @@ export function DiscussionsPage({ ws, initialSelectedId, initialTab = 'team', re
     if (!ws) return Promise.reject(new Error(t('file_browser.preview_error')));
     return loadFsLocalImagePreview(ws, path, {
       sessionName: stableRequestScope?.sessionName,
+      serverId: serverId ?? undefined,
       errorMessage: t('file_browser.preview_error'),
       timeoutMessage: t('file_browser.timeout'),
     });
-  }, [stableRequestScope?.sessionName, t, ws]);
+  }, [serverId, stableRequestScope?.sessionName, t, ws]);
   const selectedAutoDeliverRow = useMemo(
     () => (selectedAutoRunId ? autoDeliverRows.find((row) => row.runId === selectedAutoRunId) ?? null : null),
     [autoDeliverRows, selectedAutoRunId],

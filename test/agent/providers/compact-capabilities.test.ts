@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
+import { AgySdkProvider } from '../../../src/agent/providers/agy-sdk.js';
 import { CursorHeadlessProvider } from '../../../src/agent/providers/cursor-headless.js';
 import { GeminiSdkProvider } from '../../../src/agent/providers/gemini-sdk.js';
 import { GrokSdkProvider } from '../../../src/agent/providers/grok-sdk.js';
@@ -49,6 +50,15 @@ describe('provider compact capabilities', () => {
     expect(new OpenClawProvider().capabilities.compact).toMatchObject({
       execution: 'unsupported',
       verified: true,
+    });
+  });
+
+  it('keeps Antigravity (agy) compact unsupported because agy compacts its own context automatically', () => {
+    expect(new AgySdkProvider().capabilities.compact).toMatchObject({
+      execution: 'unsupported',
+      verified: true,
+      completion: 'none',
+      cancellation: 'none',
     });
   });
 });

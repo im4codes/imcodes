@@ -1,3 +1,5 @@
+import { daemonApiUrl, type DaemonHttpMethod } from '../../shared/daemon-token-routes.js';
+import { daemonServerAuthHeaders } from '../../shared/daemon-server-auth.js';
 // Daemon MCP → server channel for user-owned pinned messages. The daemon uses
 // its bound credential; the server derives the owner and re-authorizes every
 // referenced session. Tool callers never supply user/server/session identity.
@@ -75,10 +77,10 @@ async function getEndpoint(options: MessagePinMcpClientOptions): Promise<Message
   return endpoint;
 }
 
-function pinUrl(endpoint: MessagePinServerEndpoint, suffix = '', params?: URLSearchParams): string {
+function pinUrl(endpoint: MessagePinServerEndpoint, suffix: string, params: URLSearchParams, method: DaemonHttpMethod): string {
   const query = params ?? new URLSearchParams();
   query.set('serverId', endpoint.serverId);
-  return `${endpoint.workerUrl.replace(/\/+$/, '')}${MESSAGE_PINS_API_PATH}${suffix}?${query.toString()}`;
+  return daemonApiUrl(endpoint.workerUrl, method, `${MESSAGE_PINS_API_PATH}${suffix}?${query.toString()}`);
 }
 
 async function parseJson(res: Response): Promise<unknown> {
@@ -134,11 +136,10 @@ async function request(
   timer.unref?.();
   try {
     const headers: Record<string, string> = {
-      Authorization: `Bearer ${endpoint.token}`,
-      'X-Server-Id': endpoint.serverId,
+      ...daemonServerAuthHeaders(endpoint),
     };
     if (body !== undefined) headers['Content-Type'] = 'application/json';
-    const res = await (options.fetchImpl ?? fetch)(pinUrl(endpoint, suffix, params), {
+    const res = await (options.fetchImpl ?? fetch)(pinUrl(endpoint, suffix, params, method), {
       method,
       headers,
       ...(body !== undefined ? { body: JSON.stringify(body) } : {}),

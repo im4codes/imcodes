@@ -18,11 +18,14 @@ vi.mock('../../src/util/kill-process-tree.js', () => ({
 
 import { PiProvider } from '../../src/agent/providers/pi.js';
 import {
+  PI_MCP_CONFIG_ENV,
   PI_PROVIDER_API_KEY_ENV,
   PI_RPC_COMMAND,
   PI_RPC_FRAME,
 } from '../../shared/pi-agent.js';
 import type { AgentMessage, MessageDelta, ToolCallEvent } from '../../shared/agent-message.js';
+import { IMCODES_MCP_TOOL_CATALOG_MODE_ENV } from '../../shared/memory-mcp-env.js';
+import { MCP_TOOL_CATALOG_MODES } from '../../shared/mcp-tool-discovery.js';
 
 class FakePiChild extends EventEmitter {
   stdout = new PassThrough();
@@ -115,6 +118,19 @@ describe('PiProvider', () => {
     });
   }
 
+  it('confirms Stop only after the captured child agent terminal, not abort ACK', async () => {
+    const sessionId = await start();
+    await provider.send(sessionId, 'foreground');
+    let settled = false;
+    const stopping = provider.cancelAndWait(sessionId).then(() => { settled = true; });
+    await flush();
+    expect(child.written.some((command) => command.type === PI_RPC_COMMAND.ABORT)).toBe(true);
+    expect(settled).toBe(false);
+    child.emitFrame({ type: PI_RPC_FRAME.AGENT_SETTLED });
+    await stopping;
+    expect(settled).toBe(true);
+  });
+
   it('streams strict LF JSONL, tool lifecycle, usage and final completion', async () => {
     const sessionId = await start();
     await provider.send(sessionId, 'inspect this');
@@ -174,5 +190,7 @@ describe('PiProvider', () => {
     expect(args).toEqual(expect.arrayContaining(['--mode', 'rpc', '--session-id', 'pi-session-1', '--provider', 'minimax', '--model', 'MiniMax-M2.7']));
     expect(args.join(' ')).not.toContain('sk-child-only');
     expect(options.env[PI_PROVIDER_API_KEY_ENV]).toBe('sk-child-only');
+    const memoryMcp = JSON.parse(options.env[PI_MCP_CONFIG_ENV]) as { env: Record<string, string> };
+    expect(memoryMcp.env[IMCODES_MCP_TOOL_CATALOG_MODE_ENV]).toBe(MCP_TOOL_CATALOG_MODES.DYNAMIC);
   });
 });

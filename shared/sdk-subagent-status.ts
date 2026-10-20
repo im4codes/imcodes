@@ -6,6 +6,34 @@ import {
   type ToolTerminalReason,
   type ToolTerminalStatus,
 } from './session-activity-types.js';
+import {
+  boundNativeCollaborationRequestText,
+  classifyNativeCollaborationRequest,
+  formatNativeCollaborationSignals,
+  readNativeCollaborationClassification,
+  type NativeCollaborationParticipation,
+} from './native-collaboration-policy.js';
+
+const FULL_REQUEST_KEYS = ['full_request', 'fullRequest', 'prompt', 'description', 'instruction', 'instructions', 'message', 'task'] as const;
+
+/**
+ * The untruncated native agent request, for policy classification only.
+ *
+ * Provider display helpers cap prompts (Codex at 160 characters, the safe
+ * detail at 240), which would hide task wording that appears later in the
+ * request. An oversized request keeps its head AND tail and stays marked as
+ * truncated for the classifier, so a trailing directive is never cut off.
+ * Callers pass this as `input.fullRequest`; it is never persisted.
+ */
+export function readSdkSubagentFullRequest(record: Record<string, unknown> | undefined): string | undefined {
+  if (!record) return undefined;
+  for (const key of FULL_REQUEST_KEYS) {
+    const value = record[key];
+    if (typeof value !== 'string' || !value.trim()) continue;
+    return boundNativeCollaborationRequestText(value);
+  }
+  return undefined;
+}
 
 export const SDK_SUBAGENT_DETAIL_KIND = 'sdkSubagent' as const;
 export const SDK_SUBAGENT_SCHEMA_VERSION = 1 as const;
@@ -16,6 +44,8 @@ export const SDK_SUBAGENT_PROVIDERS = {
   QWEN: 'qwen',
   GEMINI_SDK: 'gemini-sdk',
   GROK_SDK: 'grok-sdk',
+  AGY_SDK: 'agy-sdk',
+  MUSE_CODE_SDK: 'muse-code-sdk',
 } as const;
 
 export const SDK_SUBAGENT_PROVIDER_KINDS = {
@@ -27,6 +57,8 @@ export const SDK_SUBAGENT_PROVIDER_KINDS = {
   QWEN_RUNTIME_AGENT: 'qwenRuntimeAgent',
   GEMINI_RUNTIME_AGENT: 'geminiRuntimeAgent',
   GROK_RUNTIME_AGENT: 'grokRuntimeAgent',
+  AGY_RUNTIME_AGENT: 'agyRuntimeAgent',
+  MUSE_RUNTIME_AGENT: 'museRuntimeAgent',
 } as const;
 
 export const SDK_SUBAGENT_TASK_TYPES = {
@@ -127,6 +159,14 @@ export interface SdkSubagentDetailMeta {
   /** Stable provider/daemon-observed start timestamp in epoch milliseconds. */
   startedAtMs?: number;
   diagnosticCode?: SdkSubagentDiagnosticCode;
+  /**
+   * Brain task-participation classification of the native request, computed
+   * once from the FULL prompt before the display preview is truncated. Only
+   * the daemon's Brain enforcement acts on it; it never hides the agent.
+   */
+  taskParticipation?: NativeCollaborationParticipation;
+  /** Comma-separated NATIVE_COLLABORATION_TASK_SIGNALS for `taskParticipation`. */
+  taskParticipationSignals?: string;
 }
 
 export interface SdkSubagentDetail extends ToolCallDetail {
@@ -136,6 +176,8 @@ export interface SdkSubagentDetail extends ToolCallDetail {
     action?: string;
     receiverCount?: number;
     description?: string;
+    /** Untruncated request for policy classification; never kept in the safe projection. */
+    fullRequest?: string;
   };
   output?: string;
   meta: SdkSubagentDetailMeta;
@@ -231,6 +273,14 @@ export function makeGeminiSubagentCanonicalKey(sessionId: string, itemId: string
   return normalizeSdkSubagentCanonicalKey(`gemini:${normalizeSdkSubagentKeyComponent(sessionId)}:${normalizeSdkSubagentKeyComponent(itemId)}`);
 }
 
+export function makeAgySubagentCanonicalKey(sessionId: string, itemId: string): string {
+  return normalizeSdkSubagentCanonicalKey(`agy:${normalizeSdkSubagentKeyComponent(sessionId)}:${normalizeSdkSubagentKeyComponent(itemId)}`);
+}
+
+export function makeMuseSubagentCanonicalKey(sessionId: string, itemId: string): string {
+  return normalizeSdkSubagentCanonicalKey(`muse:${normalizeSdkSubagentKeyComponent(sessionId)}:${normalizeSdkSubagentKeyComponent(itemId)}`);
+}
+
 const SDK_RUNTIME_SUBAGENT_TAG_START = '<subagent_notification>';
 const SDK_RUNTIME_SUBAGENT_TAG_RE = /^<subagent_notification>([\s\S]+)<\/subagent_notification>$/;
 
@@ -318,6 +368,7 @@ export function buildGenericRuntimeSubagentTool(options: GenericRuntimeSubagentT
   const agentName = sanitizeSdkSubagentText(record.name ?? record.nickname, 80);
   const model = sanitizeSdkSubagentText(record.model ?? options.fallbackModel, 120);
   const prompt = sanitizeSdkSubagentText(record.prompt ?? record.description);
+  const fullRequest = readSdkSubagentFullRequest(record);
   const canonicalKey = normalizeSdkSubagentCanonicalKey(
     `${options.provider}:${normalizeSdkSubagentKeyComponent(options.sessionId)}:runtime:${normalizeSdkSubagentKeyComponent(agentPath)}`,
   );
@@ -327,6 +378,7 @@ export function buildGenericRuntimeSubagentTool(options: GenericRuntimeSubagentT
     input: {
       action: options.action,
       ...(prompt ? { description: prompt } : {}),
+      ...(fullRequest ? { fullRequest } : {}),
     },
     ...(output ? { output } : {}),
     meta: {
@@ -507,6 +559,22 @@ export function buildSdkSubagentSafeDetail(
   const action = sanitizeSdkSubagentText(inputRecord?.action, 80);
   const receiverCount = safeFiniteNumber(inputRecord?.receiverCount, SDK_SUBAGENT_MAX_CHILD_COUNT);
   const description = sanitizeSdkSubagentText(inputRecord?.description, SDK_SUBAGENT_SAFE_TEXT_MAX_LENGTH);
+  // Classify from the untruncated request exactly once. A detail that already
+  // carries a valid classification (re-normalized on the relay, replayed from
+  // history) keeps it: the preview below is truncated, and re-classifying it
+  // could silently downgrade a task request to analysis.
+  const priorClassification = readNativeCollaborationClassification(
+    detail.meta?.taskParticipation,
+    detail.meta?.taskParticipationSignals,
+  );
+  // `fullRequest` is classification-only input and is deliberately dropped from
+  // the safe projection below; `description` is the fallback for callers whose
+  // description is already the whole request.
+  const fullRequest = typeof inputRecord?.fullRequest === 'string'
+    ? inputRecord.fullRequest
+    : typeof inputRecord?.description === 'string' ? inputRecord.description : undefined;
+  const classification = priorClassification
+    ?? (fullRequest && fullRequest.trim() ? classifyNativeCollaborationRequest(fullRequest) : undefined);
   const safeInput = action !== undefined || receiverCount !== undefined || description !== undefined
     ? {
         ...(action !== undefined ? { action } : {}),
@@ -519,7 +587,13 @@ export function buildSdkSubagentSafeDetail(
     ...(summary !== undefined ? { summary } : {}),
     ...(safeInput ? { input: safeInput } : {}),
     ...(output !== undefined ? { output } : {}),
-    meta: safeMeta(detail.meta),
+    meta: {
+      ...safeMeta(detail.meta),
+      ...(classification ? {
+        taskParticipation: classification.participation,
+        taskParticipationSignals: formatNativeCollaborationSignals(classification.signals),
+      } : {}),
+    },
     ...(options.allowRaw && detail.raw !== undefined ? { raw: sanitizeSdkSubagentRawValue(detail.raw) } : {}),
   };
 }

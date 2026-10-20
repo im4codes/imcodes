@@ -1,0 +1,207 @@
+/**
+ * @vitest-environment jsdom
+ */
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { h } from 'preact';
+import { cleanup, fireEvent, render, waitFor } from '@testing-library/preact';
+import {
+  SESSION_IDENTITY_SCOPES,
+  SESSION_IDENTITY_SESSION_MAX_CHARS,
+  sessionIdentityContentError,
+  sessionIdentityMaxChars,
+  type SessionIdentityScope,
+} from '@shared/session-identity.js';
+
+vi.mock('react-i18next', () => ({
+  useTranslation: () => ({
+    t: (key: string, options?: Record<string, unknown>) => (options ? `${key}|${JSON.stringify(options)}` : key),
+  }),
+}));
+vi.mock('../../src/api.js', () => ({
+  fetchSessionIdentityProfile: vi.fn(async () => null),
+  saveSessionIdentityProfile: vi.fn(),
+  clearSessionIdentityProfile: vi.fn(),
+}));
+vi.mock('../../src/session-identity-refresh.js', () => ({ requestSessionIdentityRefresh: vi.fn() }));
+vi.mock('../../src/components/file-browser-lazy.js', () => ({ FileBrowser: () => null }));
+
+import { SessionIdentityTabs } from '../../src/components/SessionIdentityTabs.js';
+import { fetchSessionIdentityProfile } from '../../src/api.js';
+
+afterEach(() => { cleanup(); vi.mocked(fetchSessionIdentityProfile).mockReset(); });
+
+function renderPending(content: string) {
+  return render(h(SessionIdentityTabs, { serverId: 'srv', pendingSessionIdentity: content }));
+}
+
+describe('SessionIdentityTabs session limit', () => {
+  it('shows the raised limit and no error at exactly the session limit', async () => {
+    const { container } = renderPending('😀'.repeat(SESSION_IDENTITY_SESSION_MAX_CHARS));
+    await waitFor(() => expect(container.textContent).toContain('session.identityCharacterCount'));
+    expect(container.textContent).toContain(`"limit":${SESSION_IDENTITY_SESSION_MAX_CHARS}`);
+    expect(container.textContent).toContain(`"count":${SESSION_IDENTITY_SESSION_MAX_CHARS}`);
+    expect(container.textContent).not.toContain('session.identityTooLargeScoped');
+  });
+
+  it('accepts limit-1 without an error', async () => {
+    const { container } = renderPending('😀'.repeat(SESSION_IDENTITY_SESSION_MAX_CHARS - 1));
+    await waitFor(() => expect(container.textContent).toContain('session.identityCharacterCount'));
+    expect(container.textContent).not.toContain('session.identityTooLargeScoped');
+  });
+
+  it('reports the scoped limit one code point over it', async () => {
+    const { container } = renderPending('😀'.repeat(SESSION_IDENTITY_SESSION_MAX_CHARS + 1));
+    await waitFor(() => expect(container.textContent).toContain('session.identityTooLargeScoped'));
+    expect(container.textContent).toContain(`session.identityTooLargeScoped|{"limit":${SESSION_IDENTITY_SESSION_MAX_CHARS}}`);
+  });
+});
+
+/** The counter text `session.identityCharacterCount|{"count":N,"limit":L}` rendered by the panel. */
+function displayed(container: HTMLElement): { count: number; limit: number } {
+  const match = /session\.identityCharacterCount\|(\{[^}]*\})/.exec(container.textContent ?? '');
+  if (!match) throw new Error('character counter not rendered');
+  return JSON.parse(match[1]!) as { count: number; limit: number };
+}
+
+/** Render the panel with `content` in `scope` (loaded profile for user/project, pending draft for session). */
+async function renderScope(scope: SessionIdentityScope, content: string) {
+  vi.mocked(fetchSessionIdentityProfile).mockImplementation(async (requested) => (
+    requested === scope ? { scope, scopeKey: scope === 'pair' ? 'task-test' : '', content, revision: 1, updatedAt: 0 } as never : null
+  ));
+  const view = render(h(SessionIdentityTabs, {
+    serverId: 'srv',
+    projectKey: 'github.com/acme/repo',
+    pairTaskId: 'task-test',
+    ...(scope === SESSION_IDENTITY_SCOPES.SESSION ? { pendingSessionIdentity: content } : {}),
+  }));
+  if (scope !== SESSION_IDENTITY_SCOPES.SESSION) {
+    fireEvent.click(view.getByText(`session.identityScope_${scope}`));
+  }
+  await waitFor(() => expect(view.container.textContent).toContain(`"limit":${sessionIdentityMaxChars(scope)}`));
+  await waitFor(() => expect((view.getByLabelText('session-identity-content') as HTMLTextAreaElement).value).toBe(content));
+  return view;
+}
+
+describe('SessionIdentityTabs counts in the authoritative unit (NFC + trim code points) for every scope', () => {
+  const decomposed = (n: number) => 'e\u0301'.repeat(n); // NFC composes each pair into one code point (é)
+  const padded = (n: number) => ` \n\t${'a'.repeat(n)}\n  `;
+  const cases: Array<[string, (limit: number) => string, number, boolean]> = [
+    ['NFC-decomposed content at the limit', (limit) => decomposed(limit), 0, false],
+    ['NFC-decomposed content one over the limit', (limit) => decomposed(limit + 1), 1, true],
+    ['content at the limit with surrounding whitespace', (limit) => padded(limit), 0, false],
+    ['content one over the limit with surrounding whitespace', (limit) => padded(limit + 1), 1, true],
+  ];
+  for (const scope of [SESSION_IDENTITY_SCOPES.USER, SESSION_IDENTITY_SCOPES.PROJECT, SESSION_IDENTITY_SCOPES.PAIR, SESSION_IDENTITY_SCOPES.SESSION]) {
+    for (const [label, build, over, tooLarge] of cases) {
+      it(`${scope}: ${label}`, async () => {
+        const limit = sessionIdentityMaxChars(scope);
+        const content = build(limit);
+        // The raw string is far longer than the authoritative length; a raw counter would disagree.
+        expect(Array.from(content).length).toBeGreaterThan(limit + over);
+        const { container } = await renderScope(scope, content);
+
+        expect(displayed(container)).toEqual({ count: limit + over, limit });
+        // The displayed count and the gate agree: over the displayed limit <=> the gate rejects.
+        expect(sessionIdentityContentError(content, scope) !== null).toBe(tooLarge);
+        expect(displayed(container).count > limit).toBe(tooLarge);
+        expect(container.textContent?.includes('session.identityTooLargeScoped')).toBe(tooLarge);
+      });
+    }
+  }
+});
+
+describe('SessionIdentityTabs in shared sessions without pre-known projectKey', () => {
+  it('loads all 4 scopes and allows persistence for project scope via sessionName', async () => {
+    vi.mocked(fetchSessionIdentityProfile).mockImplementation(async (scope) => {
+      if (scope === 'project') {
+        return { scope: 'project', scopeKey: 'canonical-proj-key', content: 'Shared project prompt', revision: 1, updatedAt: 1234 } as never;
+      }
+      if (scope === 'user') {
+        return { scope: 'user', scopeKey: '', content: 'Owner user prompt', revision: 1, updatedAt: 1234 } as never;
+      }
+      return null;
+    });
+
+    const view = render(h(SessionIdentityTabs, {
+      serverId: 'srv',
+      sessionName: 'deck_shared_sub_123',
+      // projectKey intentionally omitted
+    }));
+
+    // Verify all 4 identity scopes are visible in UI
+    expect(view.getByText('session.identityScope_user')).toBeTruthy();
+    expect(view.getByText('session.identityScope_project')).toBeTruthy();
+    expect(view.getByText('session.identityScope_pair')).toBeTruthy();
+    expect(view.getByText('session.identityScope_session')).toBeTruthy();
+
+    // Switch to project scope
+    fireEvent.click(view.getByText('session.identityScope_project'));
+
+    await waitFor(() => {
+      expect((view.getByLabelText('session-identity-content') as HTMLTextAreaElement).value).toBe('Shared project prompt');
+    });
+
+    // The Apply button text is rendered (not "Save after create")
+    const applyButton = view.getByText('session.identityApply') as HTMLButtonElement;
+    expect(applyButton).toBeTruthy();
+
+    // Modify content -> Apply button becomes active
+    const textarea = view.getByLabelText('session-identity-content') as HTMLTextAreaElement;
+    fireEvent.input(textarea, { target: { value: 'Updated shared project prompt' } });
+    expect(applyButton.disabled).toBe(false);
+
+    // Switch to user scope -> loads user prompt
+    fireEvent.click(view.getByText('session.identityScope_user'));
+    await waitFor(() => {
+      expect((view.getByLabelText('session-identity-content') as HTMLTextAreaElement).value).toBe('Owner user prompt');
+    });
+  });
+
+  it('automatically shows active pair task and identity without requiring manual task input', async () => {
+    vi.mocked(fetchSessionIdentityProfile).mockImplementation(async (scope) => {
+      if (scope === 'pair') {
+        return {
+          scope: 'pair',
+          scopeKey: 'task-pair-auto-456',
+          content: '',
+          revision: 0,
+          updatedAt: 0,
+        } as never;
+      }
+      return null;
+    });
+
+    const view = render(h(SessionIdentityTabs, {
+      serverId: 'srv',
+      sessionName: 'deck_sub_pair_auto_456',
+    }));
+
+    // Switch to pair scope
+    fireEvent.click(view.getByText('session.identityScope_pair'));
+
+    // Should display the active task ID directly
+    await waitFor(() => {
+      expect(view.getByText('task-pair-auto-456')).toBeTruthy();
+      expect(view.getByText('session.identityPairTask:')).toBeTruthy();
+    });
+
+    // Manual input box should NOT be rendered when active task is resolved
+    expect(view.queryByLabelText('session-identity-pair-task-id')).toBeNull();
+
+    // Click Switch Task to go into manual mode
+    fireEvent.click(view.getByText('session.identityPairSwitchTask'));
+
+    // Now the manual input box and reset button should appear
+    expect(view.getByLabelText('session-identity-pair-task-id')).toBeTruthy();
+    expect(view.getByText('session.identityPairResetTask')).toBeTruthy();
+
+    // Click reset to active task
+    fireEvent.click(view.getByText('session.identityPairResetTask'));
+
+    // It should switch back to active task mode
+    await waitFor(() => {
+      expect(view.getByText('task-pair-auto-456')).toBeTruthy();
+      expect(view.queryByLabelText('session-identity-pair-task-id')).toBeNull();
+    });
+  });
+});

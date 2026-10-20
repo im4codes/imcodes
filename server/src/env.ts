@@ -61,6 +61,7 @@ export interface EnvConfig {
   TURN_CREDENTIAL_TTL_SECONDS?: string;
   TURN_RELAY_MIN_PORT?: string;
   TURN_RELAY_MAX_PORT?: string;
+  TURN_BITRATE_CAP_BPS?: string;
 
   // APNs push notifications (iOS)
   /** APNs auth key (.p8 file content, base64 encoded) */
@@ -136,6 +137,7 @@ export function loadEnv(): EnvConfig {
     TURN_CREDENTIAL_TTL_SECONDS: process.env.TURN_CREDENTIAL_TTL_SECONDS,
     TURN_RELAY_MIN_PORT: process.env.TURN_RELAY_MIN_PORT,
     TURN_RELAY_MAX_PORT: process.env.TURN_RELAY_MAX_PORT,
+    TURN_BITRATE_CAP_BPS: process.env.TURN_BITRATE_CAP_BPS,
     APNS_KEY: process.env.APNS_KEY,
     APNS_KEY_ID: process.env.APNS_KEY_ID,
     APNS_TEAM_ID: process.env.APNS_TEAM_ID,

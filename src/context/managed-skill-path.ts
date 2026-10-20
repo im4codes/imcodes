@@ -2,6 +2,7 @@ import { lstatSync, realpathSync, statSync } from 'node:fs';
 import { dirname, isAbsolute, relative, resolve, sep } from 'node:path';
 import { homedir } from 'node:os';
 import { getProjectSkillEscapeHatchDir, getUserSkillRoot } from '../../shared/skill-store.js';
+import { imcodesStateDirForHome } from '../util/imcodes-state-dir.js';
 
 export type ManagedSkillRootKind = 'user' | 'project';
 export type ManagedSkillPathRejectReason =
@@ -55,7 +56,7 @@ export function assertManagedSkillPathSync(input: {
   if (input.path.includes('\0')) throw new ManagedSkillPathError('nul_byte');
   const absolute = resolve(input.path);
   const candidates: Array<{ kind: ManagedSkillRootKind; root: string }> = [
-    { kind: 'user', root: resolve(getUserSkillRoot(input.homeDir ?? homedir())) },
+    { kind: 'user', root: resolve(getUserSkillRoot(input.homeDir ?? homedir(), imcodesStateDirForHome(input.homeDir ?? homedir()))) },
   ];
   if (input.projectDir) {
     candidates.push({ kind: 'project', root: resolve(getProjectSkillEscapeHatchDir(input.projectDir)) });

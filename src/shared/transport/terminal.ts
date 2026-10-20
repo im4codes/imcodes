@@ -14,6 +14,23 @@ export interface TerminalDiff {
   snapshotRequested?: boolean;
   scrolled?: boolean;
   newLineCount?: number;
+  /**
+   * `fullFrame` only. Where the application left the cursor (0-based screen
+   * cell). A browser that repaints from a snapshot must put its cursor here, or
+   * every cursor-relative byte that follows (`\r` + counter, an echoed key, a
+   * status-line redraw) lands on the wrong row. Absent from older daemons and
+   * from backends that cannot report it: the browser then keeps its old
+   * behaviour.
+   */
+  cursor?: { x: number; y: number; visible: boolean };
+  /**
+   * `fullFrame` only. The pane is showing its ALTERNATE screen (vim, less,
+   * htop...). `lines` is that screen and `normalLines` the one the application
+   * returns to on exit; a browser that ignores this paints the alternate screen
+   * into its normal buffer and never restores the shell screen afterwards.
+   */
+  altScreen?: boolean;
+  normalLines?: Array<[number, string]>;
 }
 
 export interface TerminalHistory {

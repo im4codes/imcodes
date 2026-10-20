@@ -113,6 +113,34 @@ describe('ChatView attachment download', () => {
     ));
   });
 
+  it('recovers the opaque upload handle from legacy daemon paths', async () => {
+    const events = [makeEvent({
+      type: 'user.message',
+      payload: {
+        text: '#1:(/home/ai/.imcodes/uploads/f670d9589bc3d1b2647a7cd4a98efdeb/image.png)',
+        attachments: [{
+          id: '/home/ai/.imcodes/uploads/f670d9589bc3d1b2647a7cd4a98efdeb/image.png',
+          daemonPath: '/home/ai/.imcodes/uploads/f670d9589bc3d1b2647a7cd4a98efdeb/image.png',
+          mime: 'image/png',
+          size: 2048,
+        }],
+      },
+    })];
+    const { container } = render(<ChatView events={events} loading={false} serverId="srv-215" />);
+    const buttons = Array.from(container.querySelectorAll('.chat-attachment-row button'));
+
+    expect(screen.getByTitle('image.png')).toBeDefined();
+    expect(container.textContent).not.toContain('/home/ai/.imcodes/uploads');
+    fireEvent.click(buttons[0]);
+    await waitFor(() => expect(previewAttachment).toHaveBeenCalledWith(
+      'srv-215', 'f670d9589bc3d1b2647a7cd4a98efdeb',
+    ));
+    fireEvent.click(buttons[1]);
+    await waitFor(() => expect(downloadAttachment).toHaveBeenCalledWith(
+      'srv-215', 'f670d9589bc3d1b2647a7cd4a98efdeb',
+    ));
+  });
+
   it('falls back to id when originalName is missing', () => {
     const events = [makeEvent({
       type: 'user.message',
@@ -223,7 +251,10 @@ describe('ChatView attachment download', () => {
     expect(onPreviewFile.mock.calls[0][0].previewViewMode).not.toBe('html-render');
 
     fireEvent.click(buttons[2]);
-    expect(ws.fsReadFile).toHaveBeenCalledWith('/repo/./page.HTML');
+    // The daemon now resolves chat-referenced paths itself instead of the
+    // client pre-joining them with `workdir`, so the exact attachment
+    // daemonPath is sent as-is.
+    expect(ws.fsReadFile).toHaveBeenCalledWith('./page.HTML', undefined, { chatFileReference: true });
     expect(onPreviewFile).toHaveBeenCalledTimes(1);
     expect(container.querySelector('.html-fullscreen-preview')).toBeNull();
     expect(document.body.querySelector('.html-fullscreen-preview')).not.toBeNull();

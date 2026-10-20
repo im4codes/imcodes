@@ -46,6 +46,25 @@ vi.mock('node:child_process', async () => {
   };
 });
 
+// The repo status / numstat reads spawn git through the exec helper (the daemon must not fork itself). This suite asserts on
+// those command lines through the recording `exec` mock the daemon used before, so exactly those two reads are routed to it
+// ([file, ...args] joined is the command); every other helper call keeps going to the mocked `execFile`.
+vi.mock('../../src/util/exec-helper.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../src/util/exec-helper.js')>();
+  const isRepoRead = (file: string, args: readonly string[]) => file === 'git'
+    && ((args[0] === 'status' && args[1] === '--porcelain=v1') || (args[0] === 'diff' && args[1] === '--numstat'));
+  const routed = (fallback: (...p: any[]) => Promise<unknown>) => async (file: string, args: readonly string[] = [], options?: unknown) => {
+    if (!isRepoRead(file, args)) return fallback(file, args, options);
+    const promisified = (childProcess.exec as any)[Symbol.for('nodejs.util.promisify.custom')] as (command: string, options?: unknown) => Promise<{ stdout: string; stderr: string }>;
+    return promisified([file, ...args].join(' '), options);
+  };
+  return {
+    ...actual,
+    execFileOffMain: routed(actual.execFileOffMain as never),
+    execFileOffMainIdempotent: routed(actual.execFileOffMainIdempotent as never),
+  };
+});
+
 import { handleWebCommand, __resetFsGitCachesForTests } from '../../src/daemon/command-handler.js';
 import * as sessionStore from '../../src/store/session-store.js';
 import { FsGitStatusWorkerPool, __setDefaultFsGitStatusWorkerPoolForTests, type FsGitStatusWorkerThreadLike } from '../../src/daemon/fs-git-status-pool.js';

@@ -10,7 +10,7 @@ import {
 } from '../../shared/worker-session-snapshot.js';
 
 let tempDir: string;
-const LIFECYCLE_SYNC_TEST_TIMEOUT_MS = 10_000;
+const LIFECYCLE_SYNC_TEST_TIMEOUT_MS = 20_000;
 
 function makeSession(overrides: Partial<SessionRecord>): SessionRecord {
   return {

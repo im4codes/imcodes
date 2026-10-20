@@ -30,6 +30,35 @@ describe('useOpenSpecAutoDeliver', () => {
     vi.restoreAllMocks();
   });
 
+  it('coalesces startup status reads for a retained window', () => {
+    vi.useFakeTimers();
+    const ws = makeWs();
+    const { result } = renderHook(() => useOpenSpecAutoDeliver({
+      ws,
+      serverId: 'server-1',
+      sessionName: 'deck_sub_sdk-window',
+    }));
+
+    const initial = ws.send.mock.calls.filter(([payload]) => (
+      (payload as { type?: string }).type === 'openspec_auto_deliver.status_request'
+    ));
+    expect(initial).toHaveLength(1);
+    act(() => {
+      result.current.requestStatus();
+      result.current.requestStatus();
+      result.current.requestStatus();
+    });
+    expect(ws.send.mock.calls.filter(([payload]) => (
+      (payload as { type?: string }).type === 'openspec_auto_deliver.status_request'
+    ))).toHaveLength(1);
+
+    act(() => { vi.advanceTimersByTime(1_001); });
+    act(() => { result.current.requestStatus(); });
+    expect(ws.send.mock.calls.filter(([payload]) => (
+      (payload as { type?: string }).type === 'openspec_auto_deliver.status_request'
+    ))).toHaveLength(2);
+  });
+
   it('clears launch pending on timeout and allows retry with the same selection', () => {
     vi.useFakeTimers();
     const ws = makeWs();

@@ -25,9 +25,20 @@ export function normalizeClaudeCodeModelId(value: string | null | undefined): Cl
 }
 
 export const DEFAULT_CODEX_AUTOMATION_MODEL = 'gpt-5.3-codex-spark' as const;
-export const DEFAULT_CODEX_SESSION_MODEL = 'gpt-5.6-sol' as const;
-export const CODEX_MODEL_IDS = [DEFAULT_CODEX_SESSION_MODEL, 'gpt-5.6', 'gpt-5.5', 'gpt-5.4', 'gpt-5.4-mini', DEFAULT_CODEX_AUTOMATION_MODEL, 'gpt-5.2'] as const;
+export const DEFAULT_CODEX_SESSION_MODEL = 'gpt-6-sol' as const;
+export const CODEX_MODEL_IDS = [DEFAULT_CODEX_SESSION_MODEL, 'gpt-5.6-sol', 'gpt-5.6', 'gpt-5.5', 'gpt-5.4', 'gpt-5.4-mini', DEFAULT_CODEX_AUTOMATION_MODEL, 'gpt-5.2'] as const;
 export type CodexModelId = typeof CODEX_MODEL_IDS[number];
+
+/**
+ * Pattern match for a Codex/OpenAI-shaped model id that the static
+ * `CODEX_MODEL_IDS` list doesn't know about yet (a newly released model such
+ * as `gpt-6-luna` or `gpt-6-astra`). Used to classify a live/user-named model
+ * by naming convention rather than rejecting it for being absent from the
+ * static fallback list.
+ */
+export function looksLikeCodexModelId(value: string): boolean {
+  return /^(gpt-\d|o\d(?:$|[-_.])|codex[-_])/i.test(value.trim());
+}
 
 export const GEMINI_MODEL_IDS = [
   'auto',
@@ -39,6 +50,31 @@ export const GEMINI_MODEL_IDS = [
   'gemini-1.5-flash',
 ] as const;
 export type GeminiModelId = typeof GEMINI_MODEL_IDS[number];
+
+export const MUSE_MODEL_IDS = [
+  'muse-wonder-full-1.0',
+  'muse-wonder-1.0',
+  'muse-spark-1.3',
+  'muse-spark-1.2',
+] as const;
+export type MuseModelId = typeof MUSE_MODEL_IDS[number];
+
+export const AGY_MODEL_IDS = [
+  'gemini-4-argon-medium',
+  'gemini-4-argon-high',
+  'gemini-4-argon-low',
+  'gemini-3.8-flash-high',
+  'gemini-3.8-flash-medium',
+  'gemini-3.8-flash-low',
+  'claude-opus-5-5-medium',
+  'claude-opus-5-5-high',
+  'claude-opus-5-5-low',
+  'claude-sonnet-5-5-medium',
+  'claude-sonnet-5-5-high',
+  'claude-sonnet-5-5-low',
+  'gpt-oss-120b-medium',
+] as const;
+export type AgyModelId = typeof AGY_MODEL_IDS[number];
 
 export function mergeModelSuggestions(...groups: ReadonlyArray<readonly string[]>): string[] {
   return [...new Set(groups.flat())];

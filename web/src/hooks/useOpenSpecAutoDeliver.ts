@@ -19,6 +19,12 @@ import { normalizeOpenSpecAutoDeliverProjection } from '../openspec-auto-deliver
 const OPEN_SPEC_AUTO_DELIVER_LAUNCH_TIMEOUT_MS = 30_000;
 const OPEN_SPEC_AUTO_DELIVER_STOP_TIMEOUT_MS = 15_000;
 const OPEN_SPEC_AUTO_DELIVER_CONTINUE_TIMEOUT_MS = 30_000;
+const OPEN_SPEC_STATUS_REQUEST_DEDUPE_MS = 1_000;
+
+// Retained window shells can ask for the same read-only projection during one
+// startup burst. Coalesce those requests per session/socket so metadata churn
+// cannot turn into an outbound status-request loop.
+const recentStatusRequests = new Map<string, { ws: WsClient; requestId: string; at: number }>();
 
 interface Options {
   ws: WsClient | null;
@@ -252,6 +258,11 @@ export function useOpenSpecAutoDeliver({
 
   const requestStatus = useCallback(() => {
     if (!ws || !sessionName) return null;
+    const key = `${serverId ?? ''}:${sessionName}`;
+    const previous = recentStatusRequests.get(key);
+    if (previous?.ws === ws && Date.now() - previous.at < OPEN_SPEC_STATUS_REQUEST_DEDUPE_MS) {
+      return previous.requestId;
+    }
     const requestId = makeRequestId('openspec-auto-status');
     const payload: OpenSpecAutoDeliverStatusRequestPayload = {
       type: OPENSPEC_AUTO_DELIVER_MSG.STATUS_REQUEST,
@@ -260,6 +271,13 @@ export function useOpenSpecAutoDeliver({
       sessionName,
     };
     ws.send(payload);
+    recentStatusRequests.set(key, { ws, requestId, at: Date.now() });
+    if (recentStatusRequests.size > 512) {
+      const cutoff = Date.now() - OPEN_SPEC_STATUS_REQUEST_DEDUPE_MS;
+      for (const [entryKey, entry] of recentStatusRequests) {
+        if (entry.at < cutoff) recentStatusRequests.delete(entryKey);
+      }
+    }
     return requestId;
   }, [serverId, sessionName, ws]);
 

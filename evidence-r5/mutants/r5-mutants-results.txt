@@ -1,0 +1,10 @@
+NOT-COMPILE-CLEAN    U1 UI counter uses raw code points
+NOT-COMPILE-CLEAN    U2 UI counter skips NFC
+NOT-COMPILE-CLEAN    U3 UI counter skips trim
+KILLED               U4 shared length skips normalization  <- ['NFC-decomposed']
+KILLED               U5 shared length skips normalization (UI view)  <- ['project: NFC-decomposed content at the limit']
+KILLED               S4 validator counts UTF-16 units  <- ['accepts every scope at exactly its limit in 4-byte code points and rejects one more']
+KILLED               G6 web panel validation gate removed  <- ['project: NFC-decomposed content one over the limit']
+
+KILLED 4/7
+INTEGRITY OK: all source bytes restored

@@ -1,0 +1,263 @@
+import { beforeEach, describe, expect, it } from 'vitest';
+import {
+  PROCESS_SHARED_MACHINE_IDLE_GUARD_MS,
+  PROCESS_SHARED_MACHINE_WINDOW_QUIET_MS,
+  bindProcessSharedMachineActivity,
+  bindProcessSharedMachineCommand,
+  clearProcessSharedMachineAuthoritiesForTests,
+  readProcessSharedMachineAuthority,
+  releaseProcessSharedMachineAuthority,
+} from '../../src/daemon/shared-machine-authority-context.js';
+import { SHARED_MACHINE_ACTIVITY_KIND, type SharedMachineActivity } from '../../shared/shared-machine-authority.js';
+
+const identity = { sessionInstanceId: 'instance-1', runtimeEpoch: 'epoch-1' };
+const SESSION = 'deck_a';
+const CLOSED = { required: true, authority: null };
+const OPEN = { required: false, authority: null };
+
+const owner: SharedMachineActivity = { kind: SHARED_MACHINE_ACTIVITY_KIND.OWNER };
+const participant = (actorUserId: string, authority?: string): SharedMachineActivity => (
+  { kind: SHARED_MACHINE_ACTIVITY_KIND.PARTICIPANT, actorUserId, authority }
+);
+
+type Step =
+  | {
+    act: SharedMachineActivity;
+    startsTurn?: boolean;
+    /** The session record said 'running' when this input was bound. */
+    running?: boolean;
+    /** Not written to the terminal yet (recall, delivery lock); `'typed'` writes the oldest such one. */
+    undelivered?: boolean;
+  }
+  | 'idle'
+  | 'typed';
+
+/** Replays steps at 10s spacing (past the idle guard) and returns the hook answer at the end. */
+function replay(steps: readonly Step[]): { required: boolean; authority: string | null } {
+  let now = 1_000_000;
+  const waiting: Array<{ typed(at?: number): void }> = [];
+  for (const step of steps) {
+    now += 10_000;
+    if (step === 'idle') releaseProcessSharedMachineAuthority(SESSION, now);
+    else if (step === 'typed') waiting.shift()?.typed(now);
+    else {
+      const binding = bindProcessSharedMachineActivity(SESSION, identity, step.act, {
+        now,
+        ...(step.startsTurn === undefined ? {} : { startsTurn: step.startsTurn }),
+        ...(step.running ? { sessionRunning: true } : {}),
+      });
+      if (step.undelivered) waiting.push(binding);
+      else binding.typed(now);
+    }
+  }
+  return readProcessSharedMachineAuthority(SESSION, identity, now + 1);
+}
+
+describe('process shared machine authority context', () => {
+  beforeEach(clearProcessSharedMachineAuthoritiesForTests);
+
+  describe('every order of participant send / participant input / owner activity / idle', () => {
+    const send = { act: participant('alice', 'tok-send') } as const;
+    const input = { act: participant('alice', 'tok-input') } as const;
+    const ownerAct = { act: owner } as const;
+    const other = { act: participant('bob', 'tok-bob') } as const;
+    const typing = { act: participant('alice', 'tok-typing'), startsTurn: false } as const;
+    const submit = { act: participant('alice', 'tok-submit'), startsTurn: true } as const;
+    const BOUND = { required: true, authority: 'tok-send' };
+
+    const table: Array<[string, readonly Step[], { required: boolean; authority: string | null }]> = [
+      ['nothing yet', [], OPEN],
+      ['participant send', [send], { required: true, authority: 'tok-send' }],
+      ['participant input', [input], { required: true, authority: 'tok-input' }],
+      ['input then send (same participant): the latest token', [input, send], { required: true, authority: 'tok-send' }],
+      ['send then input (same participant): the latest token', [send, input], { required: true, authority: 'tok-input' }],
+      ['owner only', [ownerAct], OPEN],
+      ['owner input then owner send', [ownerAct, ownerAct], OPEN],
+      ['D2: participant send, then owner send while the turn runs', [send, ownerAct], CLOSED],
+      ['D6: owner turn, then participant keystrokes', [ownerAct, input], CLOSED],
+      ['owner turn, then participant send', [ownerAct, send], CLOSED],
+      ['participant input, then owner input', [input, ownerAct], CLOSED],
+      ['participant send, owner, participant again: stays closed', [send, ownerAct, send], CLOSED],
+      ['two different participants in one turn', [send, other], CLOSED],
+      ['participant, owner, idle: the owner\'s queued turn runs bound to the participant (never owner)', [send, ownerAct, 'idle'], BOUND],
+      ['participant, owner, idle, idle: released', [send, ownerAct, 'idle', 'idle'], OPEN],
+      ['participant, idle: released', [send, 'idle'], OPEN],
+      ['participant, idle, owner: owner runs unrestricted', [send, 'idle', ownerAct], OPEN],
+      ['owner, idle, participant: participant bound', [ownerAct, 'idle', send], { required: true, authority: 'tok-send' }],
+      ['participant, idle, other participant: only the new one', [send, 'idle', other], { required: true, authority: 'tok-bob' }],
+      ['idle with nothing bound', ['idle'], OPEN],
+      // Input queued in the TUI during a running turn starts right after the idle edge: one idle ends one turn.
+      ['A: participant sends twice (second queued), first idle: the queued turn stays bound', [send, send, 'idle'], BOUND],
+      ['A: ... second idle releases', [send, send, 'idle', 'idle'], OPEN],
+      ['A: no over-carry, a single participant turn is released by its idle', [send, 'idle'], OPEN],
+      ['B: owner turn running, participant queued behind it, first idle: participant turn bound', [ownerAct, send, 'idle'], BOUND],
+      ['B: ... second idle releases', [ownerAct, send, 'idle', 'idle'], OPEN],
+      ['FIFO: participant turn, owner queued, participant queued; owner\'s turn restricted', [send, ownerAct, send, 'idle'], BOUND],
+      ['FIFO: ... the participant\'s queued turn after the owner\'s is still bound', [send, ownerAct, send, 'idle', 'idle'], BOUND],
+      ['FIFO: ... and only the third idle releases', [send, ownerAct, send, 'idle', 'idle', 'idle'], OPEN],
+      ['two owner turns queued behind a participant turn are each covered, then released', [send, ownerAct, ownerAct, 'idle', 'idle'], BOUND],
+      ['two owner turns queued behind a participant turn: third idle releases', [send, ownerAct, ownerAct, 'idle', 'idle', 'idle'], OPEN],
+      // An owner-only window carries too (it reads as unrestricted): the count survives so a participant that joins later is placed behind the owner turns still ahead.
+      ['owner-only queued turns stay unrestricted while they drain, then release', [ownerAct, ownerAct, ownerAct, 'idle'], OPEN],
+      ['P0-b: owner A, owner B (queued), idle, participant C queued behind B, idle: C is still bound', [ownerAct, ownerAct, 'idle', send, 'idle'], BOUND],
+      ['P0-b: ... and the next idle releases', [ownerAct, ownerAct, 'idle', send, 'idle', 'idle'], OPEN],
+      ['P0-a: participant message while a turn the daemon never saw is running: the first idle ends THAT turn', [{ act: participant('alice', 'tok-send'), running: true }, 'idle'], BOUND],
+      ['P0-a: ... the second idle ends the participant turn', [{ act: participant('alice', 'tok-send'), running: true }, 'idle', 'idle'], OPEN],
+      ['P0-a regression: the same message on an idle record is released by its idle', [send, 'idle'], OPEN],
+      ['P0-a: plain typing while a turn is running still accounts for the in-flight turn', [{ act: participant('alice', 'tok-typing'), startsTurn: false, running: true }, submit, 'idle'], { required: true, authority: 'tok-submit' }],
+      // A bound message is typed only after recall and the delivery lock: an idle edge in that gap ended an EARLIER turn.
+      ['delivery gap: an idle edge before the message is typed does not release it (turn 0 untracked, record idle)', [{ act: participant('alice', 'tok-send'), undelivered: true }, 'idle'], BOUND],
+      ['delivery gap: ... once typed, its own idle ends it', [{ act: participant('alice', 'tok-send'), undelivered: true }, 'idle', 'typed', 'idle'], OPEN],
+      ['delivery gap with the in-flight turn counted (record running): the edge ends turn 0, the message stays', [{ act: participant('alice', 'tok-send'), running: true, undelivered: true }, 'idle'], BOUND],
+      ['delivery gap with the in-flight turn counted: typed, then its idle releases', [{ act: participant('alice', 'tok-send'), running: true, undelivered: true }, 'idle', 'typed', 'idle'], OPEN],
+      ['plain typing never counts as a queued turn', [typing, typing, typing, submit, 'idle'], OPEN],
+      ['two submitted lines: the second is a queued turn', [submit, submit, 'idle'], { required: true, authority: 'tok-submit' }],
+      ['typing alone then idle: released', [typing, typing, 'idle'], OPEN],
+      ['participant without any token fails closed', [{ act: participant('alice') }], CLOSED],
+      ['participant without token, then owner', [{ act: participant('alice') }, ownerAct], CLOSED],
+      ['tokenless keystroke then the same participant sends with a token', [{ act: participant('alice') }, send], { required: true, authority: 'tok-send' }],
+      ['tokenless keystroke then another participant sends', [{ act: participant('alice') }, other], CLOSED],
+    ];
+
+    it.each(table)('%s', (_name, steps, expected) => {
+      expect(replay(steps)).toEqual(expected);
+    });
+  });
+
+  it('never returns authority for a required context that cannot be resolved', () => {
+    // No token at all.
+    bindProcessSharedMachineActivity(SESSION, identity, participant('alice'), { now: 1_000 });
+    expect(readProcessSharedMachineAuthority(SESSION, identity, 1_001)).toEqual(CLOSED);
+    // A session record without a runtime identity cannot match any caller.
+    clearProcessSharedMachineAuthoritiesForTests();
+    bindProcessSharedMachineActivity(SESSION, null, participant('alice', 'tok'), { now: 1_000 });
+    expect(readProcessSharedMachineAuthority(SESSION, identity, 1_001)).toEqual(CLOSED);
+    // A stale hook child of an earlier runtime.
+    clearProcessSharedMachineAuthoritiesForTests();
+    bindProcessSharedMachineActivity(SESSION, identity, participant('alice', 'tok'), { now: 1_000 });
+    expect(readProcessSharedMachineAuthority(SESSION, { ...identity, runtimeEpoch: 'epoch-2' }, 1_001)).toEqual(CLOSED);
+    expect(readProcessSharedMachineAuthority(SESSION, { ...identity, sessionInstanceId: 'instance-2' }, 1_001)).toEqual(CLOSED);
+  });
+
+  it('a restarted runtime starts a fresh window instead of inheriting the old one', () => {
+    bindProcessSharedMachineActivity(SESSION, identity, participant('alice', 'tok'), { now: 1_000 });
+    const restarted = { sessionInstanceId: 'instance-2', runtimeEpoch: 'epoch-2' };
+    bindProcessSharedMachineActivity(SESSION, restarted, owner, { now: 2_000 });
+    expect(readProcessSharedMachineAuthority(SESSION, restarted, 2_001)).toEqual(OPEN);
+  });
+
+  it('ignores an idle signal that is only the tail of the previous turn', () => {
+    bindProcessSharedMachineActivity(SESSION, identity, participant('alice', 'tok'), { now: 5_000 }).typed(5_000);
+    releaseProcessSharedMachineAuthority(SESSION, 5_000 + PROCESS_SHARED_MACHINE_IDLE_GUARD_MS - 1);
+    expect(readProcessSharedMachineAuthority(SESSION, identity, 6_000)).toEqual({ required: true, authority: 'tok' });
+    releaseProcessSharedMachineAuthority(SESSION, 5_000 + PROCESS_SHARED_MACHINE_IDLE_GUARD_MS);
+    expect(readProcessSharedMachineAuthority(SESSION, identity, 6_600)).toEqual(OPEN);
+  });
+
+  it('keeps the restriction while the session still reports a running turn, however long it is quiet', () => {
+    bindProcessSharedMachineActivity(SESSION, identity, participant('alice', 'tok'), { now: 1_000 });
+    const later = 1_000 + PROCESS_SHARED_MACHINE_WINDOW_QUIET_MS * 3;
+    expect(readProcessSharedMachineAuthority(SESSION, identity, later, true)).toEqual({ required: true, authority: 'tok' });
+    // A running turn is not released by an owner message either.
+    bindProcessSharedMachineActivity(SESSION, identity, owner, { now: later, sessionRunning: true });
+    expect(readProcessSharedMachineAuthority(SESSION, identity, later + 1, true)).toEqual(CLOSED);
+  });
+
+  it('releases a window that has been quiet on a session that is no longer running (no idle edge was seen)', () => {
+    bindProcessSharedMachineActivity(SESSION, identity, participant('alice', 'tok'), { now: 1_000 });
+    expect(readProcessSharedMachineAuthority(SESSION, identity, 1_000 + PROCESS_SHARED_MACHINE_WINDOW_QUIET_MS - 1, false))
+      .toEqual({ required: true, authority: 'tok' });
+    expect(readProcessSharedMachineAuthority(SESSION, identity, 1_000 + PROCESS_SHARED_MACHINE_WINDOW_QUIET_MS, false)).toEqual(OPEN);
+    // And a bind after that starts fresh rather than mixing with the dead window.
+    bindProcessSharedMachineActivity(SESSION, identity, participant('alice', 'tok'), { now: 1_000 });
+    bindProcessSharedMachineActivity(SESSION, identity, owner, { now: 1_000 + PROCESS_SHARED_MACHINE_WINDOW_QUIET_MS });
+    expect(readProcessSharedMachineAuthority(SESSION, identity, 1_000 + PROCESS_SHARED_MACHINE_WINDOW_QUIET_MS + 1)).toEqual(OPEN);
+  });
+
+  describe('settle(): a bound input that never reached the terminal is not a turn', () => {
+    it('a rejected or rerouted send leaves no phantom queued turn behind', () => {
+      const first = bindProcessSharedMachineActivity(SESSION, identity, participant('alice', 'tok'), { now: 1_000 });
+      first.typed(1_000);
+      const second = bindProcessSharedMachineActivity(SESSION, identity, participant('alice', 'tok2'), { now: 2_000 });
+      second.settle(); // e.g. the send failed after the bind
+      second.typed(3_000); // idempotent: no effect after settle
+      releaseProcessSharedMachineAuthority(SESSION, 20_000);
+      expect(readProcessSharedMachineAuthority(SESSION, identity, 20_001)).toEqual(OPEN);
+    });
+
+    it('a settled/typed handle after the window was replaced does not touch the new window', () => {
+      const old = bindProcessSharedMachineActivity(SESSION, identity, participant('alice', 'tok'), { now: 1_000 });
+      releaseProcessSharedMachineAuthority(SESSION, 1_000 + PROCESS_SHARED_MACHINE_IDLE_GUARD_MS + 10_000); // no-op: undelivered
+      clearProcessSharedMachineAuthoritiesForTests();
+      bindProcessSharedMachineActivity(SESSION, identity, participant('alice', 'tok'), { now: 50_000 }).typed(50_000);
+      old.settle();
+      releaseProcessSharedMachineAuthority(SESSION, 80_000);
+      expect(readProcessSharedMachineAuthority(SESSION, identity, 80_001)).toEqual(OPEN);
+    });
+  });
+
+  describe('bindProcessSharedMachineCommand (what the daemon does with a browser command)', () => {
+    const record = { ...identity, state: 'idle' };
+    const stamped = (role: string) => ({ sharedActor: { actorUserId: 'alice', effectiveActorRole: role } });
+
+    it('treats a server-stamped participant command as participant activity and anything unstamped as owner activity', () => {
+      bindProcessSharedMachineCommand(SESSION, record, { ...stamped('participant'), sharedMachineAuthority: ' tok ' }, 1_000);
+      expect(readProcessSharedMachineAuthority(SESSION, identity, 1_001)).toEqual({ required: true, authority: 'tok' });
+      clearProcessSharedMachineAuthoritiesForTests();
+      bindProcessSharedMachineCommand(SESSION, record, { data: 'x' }, 1_000);
+      expect(readProcessSharedMachineAuthority(SESSION, identity, 1_001)).toEqual(OPEN);
+      clearProcessSharedMachineAuthoritiesForTests();
+      bindProcessSharedMachineCommand(SESSION, record, stamped('owner'), 1_000);
+      expect(readProcessSharedMachineAuthority(SESSION, identity, 1_001)).toEqual(OPEN);
+    });
+
+    it('a participant keystroke without a token binds the participant context with no authority', () => {
+      bindProcessSharedMachineCommand(SESSION, record, stamped('participant'), 1_000);
+      expect(readProcessSharedMachineAuthority(SESSION, identity, 1_001)).toEqual(CLOSED);
+    });
+
+    it('a record without a runtime identity fails closed for a participant command', () => {
+      bindProcessSharedMachineCommand(SESSION, undefined, { ...stamped('participant'), sharedMachineAuthority: 'tok' }, 1_000);
+      expect(readProcessSharedMachineAuthority(SESSION, identity, 1_001)).toEqual(CLOSED);
+    });
+
+    it('an owner command during a participant turn does not unlock it; ESC from either side stays a plain input', () => {
+      bindProcessSharedMachineCommand(SESSION, record, { ...stamped('participant'), sharedMachineAuthority: 'tok' }, 1_000);
+      bindProcessSharedMachineCommand(SESSION, record, { data: '\u001b' }, 20_000);
+      expect(readProcessSharedMachineAuthority(SESSION, identity, 20_001)).toEqual(CLOSED);
+    });
+  });
+});
+
+/**
+ * tsk_9a8c291594 — the origin of a turn is the WEAKEST sender among everything that fed it; exec / file / computer-use are execute-class
+ * and a participant anywhere in the chain makes them unavailable (the server refuses them again at admission).
+ */
+describe('process session: origin chain rows', () => {
+  beforeEach(() => clearProcessSharedMachineAuthoritiesForTests());
+
+  it('owner then participant in one turn: participant-origin, no authority to borrow', () => {
+    bindProcessSharedMachineActivity(SESSION, identity, owner, { now: 1_000, sessionRunning: true });
+    bindProcessSharedMachineActivity(SESSION, identity, participant('p-1', 'TOKEN'), { now: 2_000, sessionRunning: true });
+    expect(readProcessSharedMachineAuthority(SESSION, identity, 3_000, true)).toEqual(CLOSED);
+  });
+
+  it('participant queued while an owner turn is running: the window is participant-origin from that input on, never owner-open', () => {
+    bindProcessSharedMachineActivity(SESSION, identity, owner, { now: 1_000, sessionRunning: false });
+    expect(readProcessSharedMachineAuthority(SESSION, identity, 1_500, true)).toEqual(OPEN);
+    bindProcessSharedMachineActivity(SESSION, identity, participant('p-1', 'TOKEN'), { now: 2_000, sessionRunning: true });
+    expect(readProcessSharedMachineAuthority(SESSION, identity, 2_500, true).required).toBe(true);
+  });
+
+  it('a participant\'s token alone is borrowed only by that participant\'s turn; a second participant closes it', () => {
+    bindProcessSharedMachineActivity(SESSION, identity, participant('p-1', 'TOKEN-1'), { now: 1_000 });
+    expect(readProcessSharedMachineAuthority(SESSION, identity, 1_500, true)).toEqual({ required: true, authority: 'TOKEN-1' });
+    bindProcessSharedMachineActivity(SESSION, identity, participant('p-2', 'TOKEN-2'), { now: 2_000 });
+    expect(readProcessSharedMachineAuthority(SESSION, identity, 2_500, true)).toEqual(CLOSED);
+  });
+
+  it('a forged or stale runtime identity never reads an open window', () => {
+    bindProcessSharedMachineActivity(SESSION, identity, participant('p-1', 'TOKEN'), { now: 1_000 });
+    expect(readProcessSharedMachineAuthority(SESSION, { sessionInstanceId: 'other', runtimeEpoch: 'epoch-1' }, 1_500, true)).toEqual(CLOSED);
+  });
+});

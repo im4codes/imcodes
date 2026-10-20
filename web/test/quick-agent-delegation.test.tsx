@@ -3,14 +3,20 @@ import { fireEvent, render, screen } from '@testing-library/preact';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { QuickAgentDelegationDialog } from '../src/components/QuickAgentDelegationDialog.js';
 
+const { mockI18n } = vi.hoisted(() => ({
+  mockI18n: { language: 'en', resolvedLanguage: 'en' },
+}));
+
 vi.mock('react-i18next', () => ({
-  useTranslation: () => ({ t: (key: string) => key }),
+  useTranslation: () => ({ t: (key: string) => key, i18n: mockI18n }),
 }));
 
 describe('QuickAgentDelegationDialog', () => {
   afterEach(() => {
     document.body.innerHTML = '';
     localStorage.clear();
+    mockI18n.language = 'en';
+    mockI18n.resolvedLanguage = 'en';
   });
 
   const candidates = [
@@ -67,6 +73,7 @@ describe('QuickAgentDelegationDialog', () => {
       sessionName: 'deck_sub_reviewer',
       label: 'Reviewer',
       task: 'Review the retry race only.',
+      preset: 'custom',
     });
     const stored = [...Array(localStorage.length)].map((_, index) => {
       const key = localStorage.key(index) ?? '';
@@ -91,6 +98,26 @@ describe('QuickAgentDelegationDialog', () => {
 
     expect(onDispatch).toHaveBeenCalledTimes(1);
     expect(onDispatch.mock.calls[0]?.[0].task).toContain('independently audit this session\'s most recent work');
+    expect(onDispatch.mock.calls[0]?.[0].preset).toBe('audit');
+  });
+
+  it('builds the audit task in the active UI locale', () => {
+    mockI18n.language = 'zh-CN';
+    mockI18n.resolvedLanguage = 'zh-CN';
+    const onDispatch = vi.fn();
+    render(
+      <QuickAgentDelegationDialog
+        currentSessionName="deck_project_brain"
+        candidates={candidates}
+        onClose={vi.fn()}
+        onDispatch={onDispatch}
+      />,
+    );
+
+    fireEvent.click(screen.getAllByTestId('quick-agent-delegation-candidate')[0]!);
+
+    expect(onDispatch.mock.calls[0]?.[0].task).toContain('独立审计本会话最近的工作');
+    expect(onDispatch.mock.calls[0]?.[0].task).not.toContain('Ask the selected delegate');
   });
 
   it.each([
@@ -109,6 +136,7 @@ describe('QuickAgentDelegationDialog', () => {
     fireEvent.click(screen.getByText(`peerAuditQuick.mode.${preset}`));
     fireEvent.click(screen.getAllByTestId('quick-agent-delegation-candidate')[0]!);
     expect(onDispatch.mock.calls[0]?.[0].task).toContain(expectedText);
+    expect(onDispatch.mock.calls[0]?.[0].preset).toBe(preset);
   });
 
   it('sanitizes embedded internal ids without applying lifecycle-state policy', () => {

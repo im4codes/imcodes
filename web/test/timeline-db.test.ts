@@ -98,6 +98,17 @@ describe('TimelineDB — memory fallback mode', () => {
     expect(results).toHaveLength(3);
   });
 
+  it('collapses last-value signal churn while IndexedDB is unavailable', async () => {
+    await db.putEvents([
+      makeEvent({ eventId: 'state-old', seq: 1, type: 'session.state' }),
+      makeEvent({ eventId: 'state-new', seq: 2, type: 'session.state' }),
+    ]);
+
+    const results = await db.getRecentEvents('session-a');
+    expect(results.filter((event) => event.type === 'session.state').map((event) => event.eventId))
+      .toEqual(['state-new']);
+  });
+
   it('putEvents with empty array is a no-op', async () => {
     await expect(db.putEvents([])).resolves.toBeUndefined();
     const results = await db.getEvents('session-a', 100);

@@ -1,0 +1,289 @@
+import type { Database } from './client.js';
+import {
+  SESSION_IDENTITY_SYNC_MAX_BYTES,
+  SESSION_IDENTITY_SYNC_MAX_PROFILES,
+  SESSION_IDENTITY_SYNC_STATEMENT_TIMEOUT_MS,
+  type SessionIdentityProfile,
+  type SessionIdentityScope,
+} from '../../../shared/session-identity.js';
+
+interface IdentityProfileRow {
+  scope: SessionIdentityScope;
+  scope_key: string;
+  /**
+   * NULL once a PROJECT/SESSION row's content has been migrated to (and
+   * hash-confirmed by) its owning daemon -- see WsBridge's
+   * handleSessionIdentityMigrateConfirm. USER-scope rows are never null.
+   */
+  content: string | null;
+  content_hash: string;
+  revision: number;
+  updated_at: number;
+  source: 'web' | 'mcp';
+  source_file: string | null;
+}
+
+export interface SessionIdentityProfileSnapshot {
+  profiles: SessionIdentityProfile[];
+  truncated: boolean;
+}
+
+interface IdentityMetadataRow {
+  scope: SessionIdentityScope;
+  scope_key: string;
+  content_hash: string;
+  content_length: number;
+  revision: number;
+  updated_at: number;
+  source: 'web' | 'mcp';
+  source_file: string | null;
+}
+
+function mapMetadataRow(row: IdentityMetadataRow): SessionIdentityProfile {
+  return {
+    scope: row.scope,
+    scopeKey: row.scope_key,
+    content: '',
+    contentHash: row.content_hash,
+    revision: Number(row.revision),
+    updatedAt: Number(row.updated_at),
+    source: row.source,
+    ...(row.source_file ? { sourceFile: row.source_file } : {}),
+  };
+}
+
+export async function getSessionIdentityMetadata(
+  db: Database,
+  userId: string,
+  scope: SessionIdentityScope,
+  scopeKey: string,
+): Promise<SessionIdentityProfile | null> {
+  const row = await db.queryOne<IdentityMetadataRow>(
+    `SELECT scope, scope_key, content_hash, content_length, revision, updated_at, source, source_file
+       FROM session_identity_metadata
+      WHERE user_id = $1 AND scope = $2 AND scope_key = $3`,
+    [userId, scope, scopeKey],
+  );
+  return row ? mapMetadataRow(row) : null;
+}
+
+export async function upsertSessionIdentityMetadata(
+  db: Database,
+  input: {
+    userId: string;
+    scope: SessionIdentityScope;
+    scopeKey: string;
+    contentHash: string;
+    contentLength: number;
+    source: 'web' | 'mcp';
+    sourceFile?: string;
+  },
+): Promise<SessionIdentityProfile> {
+  const now = Date.now();
+  const row = await db.queryOne<IdentityMetadataRow>(
+    `INSERT INTO session_identity_metadata
+       (user_id, scope, scope_key, content_hash, content_length, source, revision, updated_at, source_file)
+     VALUES ($1, $2, $3, $4, $5, $6, 1, $7, $8)
+     ON CONFLICT (user_id, scope, scope_key) DO UPDATE SET
+       content_hash = excluded.content_hash,
+       content_length = excluded.content_length,
+       source = excluded.source,
+       source_file = excluded.source_file,
+       revision = session_identity_metadata.revision + 1,
+       updated_at = excluded.updated_at
+     RETURNING scope, scope_key, content_hash, content_length, revision, updated_at, source, source_file`,
+    [input.userId, input.scope, input.scopeKey, input.contentHash, input.contentLength, input.source, now, input.sourceFile ?? null],
+  );
+  if (!row) throw new Error('identity metadata write failed');
+  return mapMetadataRow(row);
+}
+
+export async function deleteSessionIdentityMetadata(
+  db: Database,
+  userId: string,
+  scope: SessionIdentityScope,
+  scopeKey: string,
+): Promise<boolean> {
+  const result = await db.execute(
+    `DELETE FROM session_identity_metadata WHERE user_id = $1 AND scope = $2 AND scope_key = $3`,
+    [userId, scope, scopeKey],
+  );
+  return result.changes > 0;
+}
+
+export async function listSessionIdentityMetadata(
+  db: Database,
+  userId: string,
+): Promise<SessionIdentityProfileSnapshot> {
+  const rows = await db.query<IdentityMetadataRow>(
+    `SELECT scope, scope_key, content_hash, content_length, revision, updated_at, source, source_file
+       FROM session_identity_metadata
+      WHERE user_id = $1
+      ORDER BY CASE scope WHEN 'user' THEN 0 WHEN 'project' THEN 1 ELSE 2 END, scope_key ASC`,
+    [userId],
+  );
+  return { profiles: rows.map(mapMetadataRow), truncated: false };
+}
+
+function mapRow(row: IdentityProfileRow): SessionIdentityProfile {
+  return {
+    scope: row.scope,
+    scopeKey: row.scope_key,
+    // NULL (a migrated PROJECT/SESSION row) reads as "no content here" --
+    // callers that need PROJECT/SESSION content now read it from the daemon.
+    content: row.content ?? '',
+    contentHash: row.content_hash,
+    revision: Number(row.revision),
+    updatedAt: Number(row.updated_at),
+    source: row.source,
+    ...(row.source_file ? { sourceFile: row.source_file } : {}),
+  };
+}
+
+export async function getSessionIdentityProfile(
+  db: Database,
+  userId: string,
+  scope: SessionIdentityScope,
+  scopeKey: string,
+): Promise<SessionIdentityProfile | null> {
+  const row = await db.queryOne<IdentityProfileRow>(
+    `SELECT scope, scope_key, content, content_hash, revision, updated_at, source, source_file
+       FROM session_identity_profiles
+      WHERE user_id = $1 AND scope = $2 AND scope_key = $3`,
+    [userId, scope, scopeKey],
+  );
+  return row ? mapRow(row) : null;
+}
+
+export async function listSessionIdentityProfiles(
+  db: Database,
+  userId: string,
+  serverId?: string,
+): Promise<SessionIdentityProfileSnapshot> {
+  const params: unknown[] = [userId];
+  // The daemon owns the authoritative live-session projection (including
+  // contextNamespace project IDs and sub-sessions). The server cannot safely
+  // reconstruct those keys from sessions alone, so serverId only selects the
+  // bounded sync mode; the daemon applies profilesForSession locally.
+  const relevant = serverId ? 'TRUE' : `scope = 'user'`;
+  params.push(SESSION_IDENTITY_SYNC_MAX_PROFILES, SESSION_IDENTITY_SYNC_MAX_BYTES);
+  const query = async (queryDb: Database): Promise<SessionIdentityProfileSnapshot> => {
+    const bounds = await queryDb.queryOne<{ total_profiles: number | string; total_bytes: number | string }>(
+      `SELECT COUNT(*)::int AS total_profiles,
+              COALESCE(SUM(octet_length(content)), 0)::bigint AS total_bytes
+         FROM session_identity_profiles
+        WHERE user_id = $1 AND ${relevant}`,
+      [userId],
+    );
+    const rows = await queryDb.query<IdentityProfileRow>(
+      `WITH candidates AS (
+       SELECT scope, scope_key, octet_length(content) AS content_bytes,
+              ROW_NUMBER() OVER (
+                ORDER BY CASE scope WHEN 'user' THEN 0 WHEN 'project' THEN 1 ELSE 2 END, scope_key ASC
+              ) AS profile_rank
+         FROM session_identity_profiles
+        WHERE user_id = $1 AND ${relevant}
+        ORDER BY CASE scope WHEN 'user' THEN 0 WHEN 'project' THEN 1 ELSE 2 END, scope_key ASC
+        LIMIT $2::int
+     ), bounded AS (
+       SELECT scope, scope_key, profile_rank,
+              SUM(content_bytes) OVER (
+                ORDER BY CASE scope WHEN 'user' THEN 0 WHEN 'project' THEN 1 ELSE 2 END, scope_key ASC
+                ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+              ) AS bytes_so_far
+         FROM candidates
+     )
+     SELECT profile.scope, profile.scope_key, profile.content, profile.content_hash,
+            profile.revision, profile.updated_at, profile.source, profile.source_file
+       FROM bounded
+       JOIN session_identity_profiles AS profile
+         ON profile.user_id = $1 AND profile.scope = bounded.scope AND profile.scope_key = bounded.scope_key
+      WHERE profile_rank <= $2::int
+        AND (bytes_so_far <= $3::bigint OR profile_rank = 1)
+      ORDER BY profile_rank ASC`,
+      params,
+    );
+    return {
+      profiles: rows.map(mapRow),
+      truncated: Number(bounds?.total_profiles ?? 0) > SESSION_IDENTITY_SYNC_MAX_PROFILES
+        || Number(bounds?.total_bytes ?? 0) > SESSION_IDENTITY_SYNC_MAX_BYTES,
+    };
+  };
+  let snapshot: SessionIdentityProfileSnapshot;
+  // Keep the timeout local to the pooled connection. Test doubles from the
+  // route unit tests do not implement transactions, so retain their direct
+  // query path while production PostgreSQL always gets the bound.
+  if (typeof (db as Database & { transaction?: unknown }).transaction === 'function') {
+    snapshot = await db.transaction(async (tx) => {
+      await tx.exec(`SET LOCAL statement_timeout = '${SESSION_IDENTITY_SYNC_STATEMENT_TIMEOUT_MS}ms'`);
+      return query(tx);
+    });
+  } else {
+    snapshot = await query(db);
+  }
+  return snapshot;
+}
+
+export async function upsertSessionIdentityProfile(
+  db: Database,
+  input: {
+    userId: string;
+    scope: SessionIdentityScope;
+    scopeKey: string;
+    content: string;
+    contentHash: string;
+    source: 'web' | 'mcp';
+    expectedRevision?: number;
+    sourceFile?: string;
+  },
+): Promise<SessionIdentityProfile | 'revision_conflict'> {
+  const now = Date.now();
+  const values: unknown[] = [
+    input.userId,
+    input.scope,
+    input.scopeKey,
+    input.content,
+    input.contentHash,
+    input.source,
+    now,
+    input.expectedRevision ?? null,
+    input.sourceFile ?? null,
+  ];
+  const row = await db.queryOne<IdentityProfileRow>(
+    `INSERT INTO session_identity_profiles
+       (user_id, scope, scope_key, content, content_hash, source, revision, updated_at, source_file)
+     SELECT $1, $2, $3, $4, $5, $6, 1, $7, $9
+      WHERE $8::bigint IS NULL OR $8::bigint = 0
+     ON CONFLICT (user_id, scope, scope_key) DO UPDATE SET
+       content = excluded.content,
+       content_hash = excluded.content_hash,
+       source = excluded.source,
+       source_file = excluded.source_file,
+       revision = session_identity_profiles.revision + 1,
+       updated_at = excluded.updated_at
+      WHERE $8::bigint IS NULL OR session_identity_profiles.revision = $8::bigint
+     RETURNING scope, scope_key, content, content_hash, revision, updated_at, source, source_file`,
+    values,
+  );
+  return row ? mapRow(row) : 'revision_conflict';
+}
+
+export async function deleteSessionIdentityProfile(
+  db: Database,
+  userId: string,
+  scope: SessionIdentityScope,
+  scopeKey: string,
+  expectedRevision?: number,
+): Promise<'deleted' | 'not_found' | 'revision_conflict'> {
+  const result = await db.execute(
+    `DELETE FROM session_identity_profiles
+      WHERE user_id = $1 AND scope = $2 AND scope_key = $3
+        AND ($4::bigint IS NULL OR revision = $4::bigint)`,
+    [userId, scope, scopeKey, expectedRevision ?? null],
+  );
+  if (result.changes > 0) return 'deleted';
+  if (expectedRevision === undefined) return 'not_found';
+  return await getSessionIdentityProfile(db, userId, scope, scopeKey)
+    ? 'revision_conflict'
+    : 'not_found';
+}

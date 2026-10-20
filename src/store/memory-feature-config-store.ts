@@ -1,5 +1,4 @@
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
-import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import {
@@ -9,6 +8,7 @@ import {
   type MemoryFeatureFlagValues,
 } from '../../shared/feature-flags.js';
 import logger from '../util/logger.js';
+import { imcodesStateDir } from '../util/imcodes-state-dir.js';
 
 const STORE_VERSION = 1;
 const STORE_PATH_ENV = 'IMCODES_MEMORY_FEATURE_CONFIG_PATH';
@@ -26,7 +26,7 @@ let runtimeOverride: MemoryFeatureFlagValues | undefined;
 function storePath(): string {
   const override = process.env[STORE_PATH_ENV]?.trim();
   if (override) return override;
-  return join(homedir(), '.imcodes', 'memory-feature-flags.json');
+  return join(imcodesStateDir(), 'memory-feature-flags.json');
 }
 
 function normalizeStore(raw: unknown): MemoryFeatureConfigStorePayload | null {

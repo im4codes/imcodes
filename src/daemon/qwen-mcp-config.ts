@@ -1,15 +1,18 @@
-import { execFile, type ExecFileOptions } from 'node:child_process';
+import { resolveImcodesHome } from '../util/windows-daemon-lock.js';
+import { type ExecFileOptions } from 'node:child_process';
 import { mkdir, rm, stat, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
-import { homedir } from 'node:os';
-import { promisify } from 'node:util';
 import logger from '../util/logger.js';
-import { IMCODES_MEMORY_MCP_ARGS, IMCODES_MEMORY_MCP_COMMAND } from '../agent/providers/getDefaultMcpServers.js';
+import {
+  IMCODES_MEMORY_MCP_LAUNCH_ARGS,
+  IMCODES_MEMORY_MCP_LAUNCH_COMMAND,
+  isImcodesMemoryMcpLaunch,
+} from '../agent/providers/getDefaultMcpServers.js';
 import { IMCODES_MEMORY_MCP_SERVER_NAME } from '../../shared/memory-mcp-server-name.js';
 import { MEMORY_MCP_PROVIDER_STATUS_REASON } from '../../shared/memory-ws.js';
+import { execFileOffMain as execFileAsync } from '../util/exec-helper.js';
 
-const execFileAsync = promisify(execFile);
-const NOTICE_MARKER = join(homedir(), '.imcodes', 'qwen-mcp-notice-shown');
+function noticeMarker(): string { return join(resolveImcodesHome(), 'qwen-mcp-notice-shown'); }
 const DAEMON_CONFLICT_SERVER_NAME = `${IMCODES_MEMORY_MCP_SERVER_NAME}-daemon`;
 
 export interface QwenMcpEnsureOptions {
@@ -65,10 +68,7 @@ function execOutput(result: { stdout: string; stderr: string } | string): string
 }
 
 function isSameDaemonServer(server: QwenMcpListedServer | undefined): boolean {
-  return server?.command === IMCODES_MEMORY_MCP_COMMAND
-    && Array.isArray(server.args)
-    && server.args.length === IMCODES_MEMORY_MCP_ARGS.length
-    && server.args.every((arg, index) => arg === IMCODES_MEMORY_MCP_ARGS[index]);
+  return isImcodesMemoryMcpLaunch(server?.command, server?.args);
 }
 
 function parseQwenMcpList(output: string): Map<string, QwenMcpListedServer> | null {
@@ -160,7 +160,7 @@ async function writeNoticeOnce(markerPath: string, message: string): Promise<voi
 export async function ensureQwenMcpHasImcodesEntry(options: QwenMcpEnsureOptions = {}): Promise<QwenMcpEnsureResult> {
   const qwenBinary = options.qwenBinary ?? 'qwen';
   const run = options.execFileImpl ?? ((file, args, opts) => execFileAsync(file, args, opts) as Promise<{ stdout: string; stderr: string }>);
-  const lockPath = join(homedir(), '.imcodes', 'qwen-mcp.lock');
+  const lockPath = join(resolveImcodesHome(), 'qwen-mcp.lock');
   try {
     return await withLock(lockPath, async () => {
       const listed = await run(qwenBinary, ['mcp', 'list'], { windowsHide: true, timeout: 10_000 });
@@ -198,8 +198,8 @@ export async function ensureQwenMcpHasImcodesEntry(options: QwenMcpEnsureOptions
         'mcp',
         'add',
         serverName,
-        IMCODES_MEMORY_MCP_COMMAND,
-        ...IMCODES_MEMORY_MCP_ARGS,
+        IMCODES_MEMORY_MCP_LAUNCH_COMMAND,
+        ...IMCODES_MEMORY_MCP_LAUNCH_ARGS,
       ], { windowsHide: true, timeout: 10_000 });
       const message = [
         `Added Qwen MCP server "${serverName}".`,
@@ -207,7 +207,7 @@ export async function ensureQwenMcpHasImcodesEntry(options: QwenMcpEnsureOptions
         'IM.codes never removes user MCP entries automatically.',
         'IM.codes supplies MCP identity through the daemon-spawned qwen process environment for each managed session.',
       ].join(' ');
-      await writeNoticeOnce(options.noticeMarkerPath ?? NOTICE_MARKER, message);
+      await writeNoticeOnce(options.noticeMarkerPath ?? noticeMarker(), message);
       return {
         serverName,
         changed: true,

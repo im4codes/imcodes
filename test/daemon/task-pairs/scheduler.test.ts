@@ -1,0 +1,1931 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import type { SessionRecord } from '../../../src/store/session-store.js';
+import { removeSession, upsertSession } from '../../../src/store/session-store.js';
+import { TaskPairStore, getTaskPairStore, setTaskPairStoreForTests } from '../../../src/daemon/task-pairs/store.js';
+import { setTaskPairDeliveryDepsForTests } from '../../../src/daemon/task-pairs/delivery.js';
+import { taskPairService } from '../../../src/daemon/task-pairs/service.js';
+import { mainCheckoutGuard } from '../../../src/daemon/task-pairs/main-checkout-guard.js';
+import { TaskPairAutomation, isTaskPairBrainReminderDue, isTaskPairBrainReminderGapSatisfied, resolveTaskPairBrainReminderInterval } from '../../../src/daemon/task-pairs/scheduler.js';
+import { isSessionWorking } from '../../../src/daemon/session-working.js';
+import { timelineEmitter } from '../../../src/daemon/timeline-emitter.js';
+import { TASK_PAIR_BRAIN_NOTICE_EVENT, TASK_PAIR_TIMELINE_EVENT } from '../../../shared/task-pair.js';
+import { listTaskPairCandidates } from '../../../src/daemon/task-pairs/pool.js';
+import { getSupervisionTaskRegistry } from '../../../src/daemon/supervision-state-store.js';
+import {
+  defaultCountActiveSupervisionAssignments,
+  defaultHasActiveSupervisionLease,
+} from '../../../src/daemon/supervision-auto-provision.js';
+import type { TaskPairState } from '../../../shared/task-pair.js';
+import { clearSupervisionHeartbeatProjectionsForTests, getSupervisionHeartbeatProjection } from '../../../src/daemon/supervision-heartbeat-projection.js';
+import { normalizeSessionSupervisionSnapshot, SUPERVISION_MODE } from '../../../shared/supervision-config.js';
+import { buildSupervisionExecutionCapabilityId, normalizeSupervisionExecutionModel } from '../../../shared/supervision-execution-pool.js';
+
+const PROJECT = 'schedproj';
+const BRAIN = 'deck_schedproj_brain';
+const EXEC = 'deck_sub_schedexec';
+const AUD = 'deck_sub_schedaud';
+const SPARE = 'deck_sub_schedspare';
+const SPARE2 = 'deck_sub_schedspare2';
+
+describe('Brain reminder cadence contract', () => {
+  it('uses 5 minutes, then 10, then a capped 15-minute interval', () => {
+    expect(resolveTaskPairBrainReminderInterval(0)).toBe(5 * 60_000);
+    expect(resolveTaskPairBrainReminderInterval(1)).toBe(10 * 60_000);
+    expect(resolveTaskPairBrainReminderInterval(2)).toBe(15 * 60_000);
+    expect(resolveTaskPairBrainReminderInterval(99)).toBe(15 * 60_000);
+    expect(isTaskPairBrainReminderDue(0, 5 * 60_000, 0)).toBe(true);
+    expect(isTaskPairBrainReminderDue(0, 5 * 60_000 - 1, 0)).toBe(false);
+    expect(isTaskPairBrainReminderDue(0, 15 * 60_000, 1)).toBe(true);
+    expect(isTaskPairBrainReminderGapSatisfied(10 * 60_000 - 1, 0, 0)).toBe(true);
+    expect(isTaskPairBrainReminderGapSatisfied(10 * 60_000 - 1, 1, 1)).toBe(false);
+    expect(isTaskPairBrainReminderGapSatisfied(11 * 60_000, 1, 1)).toBe(true);
+  });
+});
+
+function session(name: string, role: SessionRecord['role'], extra: Partial<SessionRecord> = {}): SessionRecord {
+  return {
+    name, projectName: PROJECT, role, agentType: 'claude-code-sdk', projectDir: `/tmp/${PROJECT}`, state: 'idle',
+    sessionInstanceId: `instance_${name}`, runtimeEpoch: `epoch_${name}`,
+    restarts: 0, restartTimestamps: [], createdAt: 1, updatedAt: 1, ...extra,
+  } as SessionRecord;
+}
+
+let now = 1_000_000;
+let sent: Array<{ target: string; text: string; id: string }>;
+let busy: Set<string>;
+let limited: Set<string>;
+let candidates: string[];
+let provisioned: string | undefined;
+let throwDelivery = false;
+let automation: TaskPairAutomation;
+let turn = 0;
+
+function marker(writer: string, line: string) {
+  turn += 1;
+  return taskPairService.ingestText(PROJECT, writer, line, `sched-turn-${turn}`, now);
+}
+
+function pair(taskId: string) {
+  return getTaskPairStore().getPair(PROJECT, taskId)!.state;
+}
+
+/** A `queued` pair injected directly (as a legacy import would), with or without a brief, bypassing marker timing. */
+function queuePairDirect(taskId: string, brief?: string): void {
+  getTaskPairStore().savePair(PROJECT, {
+    taskId, brain: BRAIN, status: 'queued', flags: [], flagSides: {}, round: 0,
+    blocking: ['P0'], previousAuditors: [], capCounts: {}, capRound: 0, createdAt: now, updatedAt: now,
+    ...(brief !== undefined ? { brief } : {}),
+  } satisfies TaskPairState);
+}
+
+/**
+ * A `queued` pair with no brief, as legacy import produces it (it carries a
+ * legacy task id). A bare DISPATCH that was auto-queued also has no brief but
+ * no legacy id, and is started normally rather than parked.
+ */
+function queueBriefLessPair(taskId: string): void {
+  getTaskPairStore().savePair(PROJECT, {
+    taskId, brain: BRAIN, status: 'queued', flags: [], flagSides: {}, round: 0,
+    blocking: ['P0'], previousAuditors: [], capCounts: {}, capRound: 0, createdAt: now, updatedAt: now,
+  } satisfies TaskPairState, { legacyTaskId: `legacy_${taskId}` });
+}
+
+async function tick(times = 1) {
+  for (let i = 0; i < times; i += 1) {
+    now += 6 * 60_000;
+    await automation.tick();
+  }
+}
+
+// The lightweight both-idle check runs independently of, and much more
+// frequently than, the 6-minute heartbeat tick (30s by default in
+// production); tests drive it directly rather than waiting on that timer.
+async function bothIdleCheck(times = 1, stepMs = 30_000) {
+  for (let i = 0; i < times; i += 1) {
+    now += stepMs;
+    await automation.checkBothIdlePairs();
+  }
+}
+
+// A fixed number of event-loop turns raced the service's tracked background
+// work (intents → queue run → dispatch send) on slower CI runners (Node 22),
+// so a dispatch could land after the assertion. Drain until the service is
+// idle and stays idle across a turn.
+async function flush() {
+  for (let i = 0; i < 50; i += 1) {
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    await taskPairService.waitForIdle();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    if (taskPairService.pendingCount === 0) return;
+  }
+}
+
+function sentTo(target: string, reasonPart?: string) {
+  return sent.filter((entry) => entry.target === target && (!reasonPart || entry.id.includes(`:${reasonPart}`)));
+}
+
+describe('task-pair heartbeat, replacement and queue', () => {
+  const previousEngine = process.env.IMCODES_SUPERVISION_ENGINE;
+
+  beforeEach(() => {
+    process.env.IMCODES_SUPERVISION_ENGINE = 'pairs';
+    clearSupervisionHeartbeatProjectionsForTests();
+    setTaskPairStoreForTests(new TaskPairStore(':memory:'));
+    sent = [];
+    busy = new Set();
+    limited = new Set();
+    candidates = [SPARE];
+    provisioned = undefined;
+    throwDelivery = false;
+    setTaskPairDeliveryDepsForTests({ send: async (target, text, id) => {
+      if (throwDelivery) throw new Error('synthetic transport failure');
+      sent.push({ target, text, id });
+    } });
+    for (const record of [session(BRAIN, 'brain'), session(EXEC, 'w1'), session(AUD, 'w2'), session(SPARE, 'w3'), session(SPARE2, 'w4')]) {
+      upsertSession(record);
+    }
+    automation = new TaskPairAutomation({
+      now: () => now,
+      isBusy: (name) => busy.has(name),
+      isLimited: (name) => limited.has(name),
+      pickCandidate: ({ exclude }) => candidates.find((name) => !exclude.has(name)),
+      provision: async () => provisioned,
+      poolOf: () => 'primary',
+      importLegacy: () => undefined,
+    });
+    taskPairService.setScheduler(automation);
+  });
+
+  afterEach(() => {
+    clearSupervisionHeartbeatProjectionsForTests();
+    taskPairService.setScheduler(undefined);
+    setTaskPairDeliveryDepsForTests(undefined);
+    setTaskPairStoreForTests(undefined);
+    for (const name of [BRAIN, EXEC, AUD, SPARE, SPARE2]) removeSession(name);
+    if (previousEngine === undefined) delete process.env.IMCODES_SUPERVISION_ENGINE;
+    else process.env.IMCODES_SUPERVISION_ENGINE = previousEngine;
+  });
+
+  it('checks free space on the worktree volume on every heartbeat tick, without waiting for a reclaim', async () => {
+    const check = vi.spyOn(taskPairService, 'checkDiskPressure').mockResolvedValue(undefined);
+    await automation.tick();
+    expect(check).toHaveBeenCalledTimes(1);
+    expect(check).toHaveBeenCalledWith(now);
+    check.mockRestore();
+  });
+
+  it('guards the production main checkout once, prioritizes credentials, and ignores Brain activity', async () => {
+    marker(BRAIN, '<!-- IMCODES_TASK DISPATCH GUARD executor=' + EXEC + ' auditor=' + AUD + ' -->');
+    await flush();
+    sent = [];
+    mainCheckoutGuard.reset(PROJECT, '/tmp/' + PROJECT);
+    automation = new TaskPairAutomation({ now: () => now, isBusy: () => false, importLegacy: () => undefined, mainCheckoutRoots: () => [{ project: PROJECT, root: '/tmp/' + PROJECT }], brainMainCheckoutActive: () => false });
+    taskPairService.setScheduler(automation);
+    const inspect = vi.spyOn(mainCheckoutGuard, 'inspect').mockResolvedValue({ project: PROJECT, root: '/tmp/' + PROJECT, paths: ['.env.token', 'src/main.ts'], credentialPaths: ['.env.token'] });
+    await automation.tick();
+    expect(sentTo(BRAIN, 'main-checkout-guard')).toHaveLength(1);
+    expect(sentTo(EXEC, 'main-checkout-guard')).toHaveLength(0);
+    expect(sentTo(AUD, 'main-checkout-guard')).toHaveLength(0);
+    expect(sentTo(BRAIN, 'main-checkout-guard')[0]!.text).toContain('.env.token');
+    inspect.mockRestore();
+  });
+
+  it('nudges an idle executor, then escalates once and stops nudging', async () => {
+    marker(BRAIN, `<!-- IMCODES_TASK DISPATCH T1 executor=${EXEC} auditor=${AUD} -->`);
+    await flush();
+    sent = [];
+    await tick(5);
+    expect(sentTo(EXEC, 'nudge-executor')).toHaveLength(2);
+    expect(pair('T1').flags).toContain('executor_silent');
+    expect(sentTo(BRAIN, 'brain-executor_silent')).toHaveLength(1);
+    expect(getTaskPairStore().listEvents(PROJECT, 'T1').some((event) => event.verb === 'NUDGE')).toBe(true);
+    expect(getTaskPairStore().getPair(PROJECT, 'T1')?.liveness.lastNudgedAt).toBeDefined();
+    // Progress clears the silence and nudging resumes on the next idle ticks.
+    now += 1;
+    marker(EXEC, '<!-- IMCODES_TASK WORKING T1 -->');
+    await tick(1);
+    expect(sentTo(EXEC, 'nudge-executor')).toHaveLength(2);
+    await tick(1);
+    expect(sentTo(EXEC, 'nudge-executor')).toHaveLength(3);
+  });
+
+  it('restarts an errored participant once, re-delivers its instruction, and notifies Brain once', async () => {
+    marker(BRAIN, `<!-- IMCODES_TASK DISPATCH RECOVER executor=${EXEC} auditor=${AUD} -->\nDo the recovery work\n<!-- IMCODES_TASK_END RECOVER -->`);
+    await flush();
+    sent = [];
+    const errored = session(EXEC, 'w1', { state: 'error', error: 'provider exited', updatedAt: now });
+    upsertSession(errored);
+    let restarts = 0;
+    automation = new TaskPairAutomation({
+      now: () => now,
+      isBusy: (name) => busy.has(name),
+      restartParticipant: async (record) => {
+        restarts += 1;
+        upsertSession({ ...record, state: 'idle', error: undefined, restarts: record.restarts + 1, restartTimestamps: [now], updatedAt: now });
+        return true;
+      },
+      importLegacy: () => undefined,
+    });
+    taskPairService.setScheduler(automation);
+    await tick(1);
+    await flush();
+    expect(restarts).toBe(1);
+    expect(sentTo(EXEC, 'recovery-resume')).toHaveLength(1);
+    expect(sentTo(EXEC, 'recovery-resume')[0]!.text).toContain('Do the recovery work');
+    expect(sentTo(BRAIN, 'participant-recovered')).toHaveLength(1);
+    await tick(1);
+    await flush();
+    expect(restarts).toBe(1);
+    expect(sentTo(EXEC, 'recovery-resume')).toHaveLength(1);
+    expect(sentTo(BRAIN, 'participant-recovered')).toHaveLength(1);
+  });
+
+  it('a participant that keeps retrying provider capacity is busy and waiting: for 4 hours no nudge, recovery, escalation or replacement', async () => {
+    marker(BRAIN, `<!-- IMCODES_TASK DISPATCH RETRYING executor=${EXEC} auditor=${AUD} -->\nwork\n<!-- IMCODES_TASK_END RETRYING -->`);
+    await flush();
+    sent = [];
+    // What the real runtime reports during a capacity retry (see the runtime test 'reports busy to the pair heartbeat').
+    upsertSession(session(EXEC, 'w1', { state: 'running', updatedAt: now }));
+    let restarts = 0;
+    let provisions = 0;
+    automation = new TaskPairAutomation({
+      now: () => now,
+      busyProbe: {
+        getDiagnosticSnapshot: () => ({
+          status: 'thinking', sending: false, activeDispatchCount: 0, pendingCount: 1, blockingWorkCount: 1,
+          backgroundWorkCount: 0, activeToolCount: 0, busyReasons: ['capacity_retry'],
+          lastActivityAt: now, lastActivityAgeMs: 0, lastProviderOutputAgeMs: null,
+          capacityRetry: { attempt: 999, retryAt: now + 15_000, since: 1, error: 'Selected model is at capacity. Please try a different model.' },
+        }) as never,
+      },
+      restartParticipant: async () => { restarts += 1; return false; },
+      provision: async () => { provisions += 1; return SPARE; },
+      poolOf: () => 'primary',
+      importLegacy: () => undefined,
+    });
+    taskPairService.setScheduler(automation);
+    await tick(40); // 40 heartbeats × 6 min = 4 h of continuous retrying
+    await bothIdleCheck(40);
+    await flush();
+    expect(restarts).toBe(0);
+    expect(provisions).toBe(0);
+    expect(pair('RETRYING').executor).toBe(EXEC);
+    expect(pair('RETRYING').flags).not.toContain('executor_silent');
+    expect(sentTo(EXEC, 'nudge-executor')).toHaveLength(0);
+    expect(sentTo(BRAIN, 'participant-recovery-failed')).toHaveLength(0);
+    expect(sentTo(BRAIN, 'brain-executor_silent')).toHaveLength(0);
+    expect(sentTo(BRAIN, 'brain-line-reassign')).toHaveLength(0);
+  });
+
+  it('COUNTEREXAMPLE for the test above: the same participant in a bare error state IS recovered (so the retry state is what protects it)', async () => {
+    marker(BRAIN, `<!-- IMCODES_TASK DISPATCH DEADSESSION executor=${EXEC} auditor=${AUD} -->\nwork\n<!-- IMCODES_TASK_END DEADSESSION -->`);
+    await flush();
+    sent = [];
+    upsertSession(session(EXEC, 'w1', { state: 'error', error: 'Selected model is at capacity. Please try a different model.', updatedAt: now }));
+    let restarts = 0;
+    automation = new TaskPairAutomation({
+      now: () => now,
+      busyProbe: { getDiagnosticSnapshot: () => undefined },
+      restartParticipant: async () => { restarts += 1; return false; },
+      importLegacy: () => undefined,
+    });
+    taskPairService.setScheduler(automation);
+    await tick(1);
+    await flush();
+    expect(restarts).toBe(1);
+    expect(sentTo(BRAIN, 'participant-recovery-failed')).toHaveLength(1);
+  });
+
+  it('prompts once for a stalled phase, then escalates once to Brain', async () => {
+    const previousPrompt = process.env.IMCODES_TASK_PAIR_STAGE_STALL_MS;
+    const previousEscalate = process.env.IMCODES_TASK_PAIR_STAGE_STALL_ESCALATE_MS;
+    process.env.IMCODES_TASK_PAIR_STAGE_STALL_MS = '1000';
+    process.env.IMCODES_TASK_PAIR_STAGE_STALL_ESCALATE_MS = '1000';
+    try {
+      marker(BRAIN, `<!-- IMCODES_TASK DISPATCH STALL executor=${EXEC} auditor=${AUD} -->\nstall work\n<!-- IMCODES_TASK_END STALL -->`);
+      await flush();
+      sent = [];
+      now += 2_000;
+      await automation.tick();
+      await flush();
+      expect(sentTo(EXEC, 'stage-stall-prompt')).toHaveLength(1);
+      now += 1_000;
+      await automation.tick();
+      await flush();
+      expect(sentTo(EXEC, 'stage-stall-prompt')).toHaveLength(1);
+      expect(sentTo(BRAIN, 'stage-stall')).toHaveLength(1);
+      now += 1_000;
+      await automation.tick();
+      await flush();
+      expect(sentTo(BRAIN, 'stage-stall')).toHaveLength(1);
+    } finally {
+      if (previousPrompt === undefined) delete process.env.IMCODES_TASK_PAIR_STAGE_STALL_MS;
+      else process.env.IMCODES_TASK_PAIR_STAGE_STALL_MS = previousPrompt;
+      if (previousEscalate === undefined) delete process.env.IMCODES_TASK_PAIR_STAGE_STALL_ESCALATE_MS;
+      else process.env.IMCODES_TASK_PAIR_STAGE_STALL_ESCALATE_MS = previousEscalate;
+    }
+  });
+
+  it('does not persist skipped heartbeat nudges', async () => {
+    marker(BRAIN, `<!-- IMCODES_TASK DISPATCH SKIP executor=${EXEC} auditor=${AUD} -->`);
+    await flush();
+    busy.add(EXEC);
+    now += 10 * 60_000;
+    await automation.checkBothIdlePairs();
+    const skipped = getTaskPairStore().listEvents(PROJECT, 'SKIP')
+      .filter((event) => event.verb === 'NUDGE' && event.effect === 'skipped');
+    expect(skipped).toHaveLength(0);
+  });
+
+  it('caps repeated recovery attempts and escalates once instead of looping', async () => {
+    marker(BRAIN, `<!-- IMCODES_TASK DISPATCH CAP executor=${EXEC} auditor=${AUD} -->`);
+    await flush();
+    sent = [];
+    upsertSession(session(EXEC, 'w1', { state: 'error', error: 'provider exited', updatedAt: now }));
+    let attempts = 0;
+    automation = new TaskPairAutomation({
+      now: () => now,
+      isBusy: () => false,
+      restartParticipant: async () => { attempts += 1; return false; },
+      importLegacy: () => undefined,
+    });
+    taskPairService.setScheduler(automation);
+    await automation.tick();
+    await automation.tick();
+    await automation.tick();
+    await automation.tick();
+    await flush();
+    expect(attempts).toBe(3);
+    expect(sentTo(BRAIN, 'participant-recovery-failed')).toHaveLength(1);
+    expect(sentTo(BRAIN, 'participant-recovery-cap')).toHaveLength(1);
+  });
+
+  it('queues a named participant held by another pair, then starts it when that pair ends', async () => {
+    marker(BRAIN, `<!-- IMCODES_TASK DISPATCH HOLD executor=${EXEC} auditor=${AUD} -->`);
+    await flush();
+    marker(BRAIN, `<!-- IMCODES_TASK DISPATCH WAIT executor=${EXEC} auditor=${AUD} -->`);
+    await flush();
+    expect(pair('WAIT')).toMatchObject({ status: 'queued', executor: EXEC, auditor: AUD, flags: ['waiting_for_capacity'] });
+    expect(sentTo(BRAIN, 'participant-busy')).toHaveLength(1);
+
+    marker(BRAIN, '<!-- IMCODES_TASK CANCEL HOLD -->');
+    await flush();
+    expect(pair('WAIT')).toMatchObject({ status: 'working', executor: EXEC, auditor: AUD });
+  });
+
+  it('re-runs admission when a named busy participant transitions idle', async () => {
+    queuePairDirect('IDLE-ADMIT', 'brief');
+    const queued = getTaskPairStore().getPair(PROJECT, 'IDLE-ADMIT')!.state;
+    getTaskPairStore().savePair(PROJECT, { ...queued, executor: EXEC, auditor: 'none' });
+    busy.add(EXEC);
+    await automation.runQueue(PROJECT, BRAIN);
+    expect(pair('IDLE-ADMIT').status).toBe('queued');
+    expect(pair('IDLE-ADMIT').capacityWaitReason).toContain(`waiting for ${EXEC}`);
+
+    busy.delete(EXEC);
+    automation.observeTimelineEvent({ sessionId: EXEC, type: 'session.state', payload: { state: 'idle' } });
+    await flush();
+    expect(pair('IDLE-ADMIT')).toMatchObject({ status: 'working', executor: EXEC, auditor: 'none' });
+  });
+
+  it('reports persisted participant double-bookings once at startup without cancelling either pair', async () => {
+    const state = (taskId: string): TaskPairState => ({
+      taskId, brain: BRAIN, executor: EXEC, auditor: AUD, status: 'working', flags: [], flagSides: {},
+      round: 0, blocking: ['P0'], previousAuditors: [], capCounts: {}, capRound: 0,
+      createdAt: now, startedAt: now, updatedAt: now,
+    });
+    getTaskPairStore().savePair(PROJECT, state('STARTUP-A'));
+    getTaskPairStore().savePair(PROJECT, state('STARTUP-B'));
+    await automation.tick();
+    await flush();
+    expect(sentTo(BRAIN, 'participant-conflicts-startup')).toHaveLength(1);
+    expect(pair('STARTUP-A').status).toBe('working');
+    expect(pair('STARTUP-B').status).toBe('working');
+    sent = [];
+    await automation.tick();
+    await flush();
+    expect(sentTo(BRAIN, 'participant-conflicts-startup')).toHaveLength(0);
+  });
+
+  it('never nudges a running side or a side that made progress', async () => {
+    marker(BRAIN, `<!-- IMCODES_TASK DISPATCH T2 executor=${EXEC} auditor=${AUD} -->`);
+    await flush();
+    sent = [];
+    busy.add(EXEC);
+    await tick(3);
+    // (This suite's project directory does not exist, so the daemon tells Brain once that the pair has no workspace: not a nudge.)
+    const nudges = () => sent.filter((entry) => !entry.id.includes(':brain-workspace-unprovisioned'));
+    expect(nudges()).toHaveLength(0);
+    busy.delete(EXEC);
+    taskPairService.recordProgress(EXEC, now + 1);
+    await tick(1);
+    expect(nudges()).toHaveLength(0);
+  });
+
+  it('does not nudge a side that flagged itself blocked', async () => {
+    marker(BRAIN, `<!-- IMCODES_TASK DISPATCH T3 executor=${EXEC} auditor=${AUD} -->`);
+    marker(EXEC, '<!-- IMCODES_TASK BLOCKED T3 note="need DB creds" -->');
+    await flush();
+    sent = [];
+    await tick(3);
+    expect(sentTo(EXEC)).toHaveLength(0);
+  });
+
+  it('nudges an executor awaiting audit to send its materials', async () => {
+    marker(BRAIN, `<!-- IMCODES_TASK DISPATCH T4 executor=${EXEC} auditor=${AUD} -->`);
+    marker(EXEC, '<!-- IMCODES_TASK DONE T4 -->');
+    await flush();
+    expect(sentTo(EXEC, 'policy-rejection')[0]?.text).toContain('material-backed audit round');
+    sent = [];
+    await tick(1);
+    expect(pair('T4').status).toBe('working');
+  });
+
+  it('holds a no-auditor completion in the concurrency slot, reminds Brain once, and releases only on Brain decision', async () => {
+    candidates = [SPARE, SPARE2];
+    marker(BRAIN, '<!-- IMCODES_TASK QUEUE - max=1 -->');
+    marker(BRAIN, `<!-- IMCODES_TASK DISPATCH NO_AUD executor=${EXEC} auditor=none -->`);
+    marker(EXEC, '<!-- IMCODES_TASK DONE NO_AUD -->');
+    marker(BRAIN, '<!-- IMCODES_TASK QUEUE NEXT title="Next" -->\nDo next\n<!-- IMCODES_TASK_END NEXT -->');
+    await flush();
+    expect(pair('NO_AUD').status).toBe('awaiting_brain_decision');
+    expect(pair('NEXT').status).toBe('queued');
+    expect(sentTo(BRAIN, 'brain-line-done-no-auditor')[0]?.text).toContain('awaiting your decision');
+
+    sent = [];
+    await tick(4);
+    // The first reminder is constrained by the ten-minute inter-message gap;
+    // later cadence is covered by the pure interval contract test above.
+    expect(sentTo(BRAIN, 'brain-decision-reminder')).toHaveLength(1);
+    expect(sentTo(BRAIN, 'brain-decision-reminder')[0]?.text).toContain('pair_close action=cancel');
+
+    marker(BRAIN, '<!-- IMCODES_TASK DONE NO_AUD force=true -->');
+    await flush();
+    expect(pair('NO_AUD').status).toBe('done');
+    expect(pair('NEXT').status).toBe('working');
+  });
+
+  it('records the Brain decision notice, and a repeated DONE card says Brain was already told instead of looking like a fresh undelivered notification', async () => {
+    const cards: Array<Record<string, unknown>> = [];
+    const off = timelineEmitter.on((event) => {
+      if (event.type === TASK_PAIR_TIMELINE_EVENT && event.sessionId === BRAIN) cards.push(event.payload as Record<string, unknown>);
+    });
+    try {
+      marker(BRAIN, `<!-- IMCODES_TASK DISPATCH REPEAT_DONE executor=${EXEC} auditor=none -->`);
+      marker(EXEC, '<!-- IMCODES_TASK DONE REPEAT_DONE -->');
+      await flush();
+      expect(sentTo(BRAIN, 'brain-line-done-no-auditor')).toHaveLength(1);
+      expect(getTaskPairStore().listEvents(PROJECT, 'REPEAT_DONE').filter((event) => event.verb === TASK_PAIR_BRAIN_NOTICE_EVENT && event.attrs.reason === 'brain-line-done-no-auditor'))
+        .toMatchObject([{ effect: 'sent' }]);
+      now += 60_000;
+      marker(EXEC, '<!-- IMCODES_TASK DONE REPEAT_DONE -->');
+      await flush();
+      const repeat = cards.filter((card) => card.taskId === 'REPEAT_DONE' && card.verb === 'DONE').at(-1)!;
+      expect(repeat).toMatchObject({ unusual: true, effect: 'recorded', brainNotice: { status: 'sent', reason: 'brain-line-done-no-auditor' } });
+      // The repeat was not a second delivery: still exactly one notice.
+      expect(sentTo(BRAIN, 'brain-line-done-no-auditor')).toHaveLength(1);
+    } finally {
+      off();
+    }
+  });
+
+  describe("a pair awaiting Brain's decision is followed up once when Brain's turn ends without deciding it", () => {
+    function brainEvent(type: string, payload: Record<string, unknown>) {
+      automation.observeTimelineEvent({ sessionId: BRAIN, type, payload });
+    }
+    /** One Brain turn: the notice is consumed at its start, optional tool calls, then the turn ends idle. */
+    async function brainTurn(opts: { noticeId?: string; toolCalls?: Array<Record<string, unknown>>; others?: boolean } = {}) {
+      brainEvent('session.state', { state: 'running' });
+      if (opts.noticeId) brainEvent('transport.queue.delivery', { clientMessageId: opts.noticeId });
+      for (const input of opts.toolCalls ?? []) brainEvent('tool.call', { tool: 'mcp__imcodes-memory__pair_get', input });
+      brainEvent('assistant.text', { text: 'ok' });
+      brainEvent('session.state', { state: 'idle' });
+      await flush();
+    }
+    function lastNoticeId(reason: string) { return sentTo(BRAIN, reason).at(-1)!.id; }
+    async function awaitingPair(taskId: string) {
+      marker(BRAIN, `<!-- IMCODES_TASK DISPATCH ${taskId} executor=${EXEC} auditor=none -->`);
+      marker(EXEC, `<!-- IMCODES_TASK DONE ${taskId} -->`);
+      await flush();
+      expect(pair(taskId).status).toBe('awaiting_brain_decision');
+      now += 1_000; // Brain's own earlier DISPATCH must not look like an action in the notice's turn
+    }
+
+    it('Brain worked on something else and ended with a no-op: one follow-up that says a reply is not an answer', async () => {
+      await awaitingPair('FU_NOOP');
+      const noticeId = lastNoticeId('brain-line-done-no-auditor');
+      sent = [];
+      await brainTurn({ noticeId });
+      const followUps = sentTo(BRAIN, 'brain-decision-followup');
+      expect(followUps).toHaveLength(1);
+      expect(followUps[0]!.text).toContain('FU_NOOP');
+      expect(followUps[0]!.text).toContain('pair_close action=done force=true');
+      expect(followUps[0]!.text).not.toContain('IMCODES_TASK');
+      expect(followUps[0]!.text).toContain('is NOT an answer');
+      expect(getTaskPairStore().listEvents(PROJECT, 'FU_NOOP').some((event) => event.verb === TASK_PAIR_BRAIN_NOTICE_EVENT && event.attrs.reason === 'brain-decision-followup')).toBe(true);
+    });
+
+    it('a legacy "nothing to do" text in Brain\'s reply is not a marker: no transition, no unusual event, the pair is untouched', async () => {
+      await awaitingPair('FU_LEGACY');
+      const before = pair('FU_LEGACY');
+      const eventsBefore = getTaskPairStore().listEvents(PROJECT, 'FU_LEGACY').length;
+      expect(marker(BRAIN, 'ok <!-- IMCODES_TASK_NOOP -->')).toEqual([]);
+      expect(pair('FU_LEGACY')).toEqual(before);
+      expect(getTaskPairStore().listEvents(PROJECT, 'FU_LEGACY')).toHaveLength(eventsBefore);
+    });
+
+    it('at most once per notice: the turn that answers the follow-up ending the same way sends nothing more', async () => {
+      await awaitingPair('FU_ONCE');
+      const noticeId = lastNoticeId('brain-line-done-no-auditor');
+      await brainTurn({ noticeId });
+      const followUpId = lastNoticeId('brain-decision-followup');
+      sent = [];
+      await brainTurn({ noticeId: followUpId });
+      await brainTurn();
+      expect(sent).toHaveLength(0);
+    });
+
+    it('a Brain that decides the pair in that turn (a lifecycle marker) is not followed up', async () => {
+      await awaitingPair('FU_ACTED');
+      const noticeId = lastNoticeId('brain-line-done-no-auditor');
+      sent = [];
+      marker(BRAIN, '<!-- IMCODES_TASK DONE FU_ACTED force=true -->');
+      await flush();
+      await brainTurn({ noticeId });
+      expect(sentTo(BRAIN, 'brain-decision-followup')).toHaveLength(0);
+    });
+
+    it('a Brain that touched the pair without changing its status (an event of its own on it) is not followed up either', async () => {
+      await awaitingPair('FU_EVENT');
+      const noticeId = lastNoticeId('brain-line-done-no-auditor');
+      sent = [];
+      // Brain wrote to the pair (a brief edit/CHECK-style event) but left it awaiting.
+      getTaskPairStore().recordEvent({
+        id: 'fu-event-brain-touch', project: PROJECT, taskId: 'FU_EVENT', writer: BRAIN, role: 'brain', verb: 'CHECK',
+        attrs: {}, effect: 'applied', unusual: false, source: 'mcp', fromStatus: 'awaiting_brain_decision', toStatus: 'awaiting_brain_decision', at: now + 10,
+      });
+      await brainTurn({ noticeId });
+      expect(sentTo(BRAIN, 'brain-decision-followup')).toHaveLength(0);
+    });
+
+    it('a pair Brain acted on through a pair tool is left alone, reading a pair or merely naming it in a shell command is not an action, and the rest come in one merged message', async () => {
+      await awaitingPair('FU_MERGE_A');
+      const idA = lastNoticeId('brain-line-done-no-auditor');
+      await awaitingPair('FU_MERGE_B');
+      const idB = lastNoticeId('brain-line-done-no-auditor');
+      await awaitingPair('FU_MERGE_C');
+      const idC = lastNoticeId('brain-line-done-no-auditor');
+      sent = [];
+      brainEvent('session.state', { state: 'running' });
+      for (const id of [idA, idB, idC]) brainEvent('transport.queue.delivery', { clientMessageId: id });
+      brainEvent('tool.call', { tool: 'mcp__imcodes-memory__pair_task_update', input: { taskId: 'FU_MERGE_A', markdown: 'continue' } });
+      brainEvent('tool.call', { tool: 'mcp__imcodes-memory__pair_get', input: { taskId: 'FU_MERGE_B' } });
+      brainEvent('tool.call', { tool: 'Bash', input: { command: 'cd /w/pair_FU_MERGE_C/repo && git log' } });
+      brainEvent('session.state', { state: 'idle' });
+      await flush();
+      const followUps = sentTo(BRAIN, 'brain-decision-followup');
+      expect(followUps).toHaveLength(1);
+      expect(followUps[0]!.text).not.toContain('FU_MERGE_A');
+      expect(followUps[0]!.text).toContain('FU_MERGE_B');
+      expect(followUps[0]!.text).toContain('FU_MERGE_C');
+    });
+
+    it('a notice armed as queued is not answered by an unrelated turn, only by the turn that receives it', async () => {
+      await awaitingPair('FU_Q2');
+      const noticeId = lastNoticeId('brain-line-done-no-auditor');
+      // A scheduler that knows only the queued notice (the service armed the original on `automation`).
+      const queuedOnly = new TaskPairAutomation({ now: () => now, isBusy: () => false, importLegacy: () => undefined });
+      queuedOnly.armBrainDecisionFollowUp({ brain: BRAIN, taskIds: ['FU_Q2'], messageIdPrefix: noticeId.slice(0, noticeId.lastIndexOf(':') + 1), result: 'queued' });
+      const observe = (type: string, payload: Record<string, unknown>) => queuedOnly.observeTimelineEvent({ sessionId: BRAIN, type, payload });
+      sent = [];
+      observe('session.state', { state: 'running' });
+      observe('session.state', { state: 'idle' });
+      await flush();
+      expect(sentTo(BRAIN, 'brain-decision-followup')).toHaveLength(0);
+      observe('session.state', { state: 'running' });
+      observe('transport.queue.delivery', { clientMessageId: noticeId });
+      observe('session.state', { state: 'idle' });
+      await flush();
+      expect(sentTo(BRAIN, 'brain-decision-followup')).toHaveLength(1);
+    });
+
+    for (const [verb, line] of [['DONE', 'DONE FU_MARKER force=true'], ['CANCEL', 'CANCEL FU_MARKER']] as const) {
+      it(`a ${verb} marker in Brain's closing reply is a decision even though the service applies it after the idle event (real ingest order)`, async () => {
+        taskPairService.init();
+        const off = timelineEmitter.on((event) => automation.observeTimelineEvent(event));
+        const emit = (type: string, payload: Record<string, unknown>) => timelineEmitter.emit(BRAIN, type, payload, { source: 'daemon', confidence: 'high', eventId: `fu-${verb}-${type}-${turn += 1}` });
+        try {
+          await awaitingPair('FU_MARKER');
+          const noticeId = lastNoticeId('brain-line-done-no-auditor');
+          sent = [];
+          emit('session.state', { state: 'running' });
+          emit('transport.queue.delivery', { clientMessageId: noticeId });
+          // Exactly the provider's order: the final text, then idle, in one synchronous segment.
+          emit('assistant.text', { text: `decided\n<!-- IMCODES_TASK ${line} -->`, streaming: false });
+          emit('session.state', { state: 'idle' });
+          expect(pair('FU_MARKER').status).toBe('awaiting_brain_decision'); // the marker is not applied yet
+          await flush();
+          await new Promise<void>((resolve) => setImmediate(resolve));
+          await flush();
+          expect(pair('FU_MARKER').status).toBe(verb === 'DONE' ? 'done' : 'cancelled');
+          expect(sentTo(BRAIN, 'brain-decision-followup')).toHaveLength(0);
+        } finally {
+          off();
+          await taskPairService.dispose();
+        }
+      });
+    }
+
+    it('a marker naming another pair does not suppress the follow-up', async () => {
+      taskPairService.init();
+      const off = timelineEmitter.on((event) => automation.observeTimelineEvent(event));
+      const emit = (type: string, payload: Record<string, unknown>) => timelineEmitter.emit(BRAIN, type, payload, { source: 'daemon', confidence: 'high', eventId: `fu-other-${type}-${turn += 1}` });
+      try {
+        await awaitingPair('FU_MARKER_A');
+        const noticeId = lastNoticeId('brain-line-done-no-auditor');
+        sent = [];
+        emit('session.state', { state: 'running' });
+        emit('transport.queue.delivery', { clientMessageId: noticeId });
+        emit('assistant.text', { text: 'ok\n<!-- IMCODES_TASK DONE SOME_OTHER_PAIR force=true -->', streaming: false });
+        emit('session.state', { state: 'idle' });
+        await flush();
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        await flush();
+        expect(sentTo(BRAIN, 'brain-decision-followup')).toHaveLength(1);
+      } finally {
+        off();
+        await taskPairService.dispose();
+      }
+    });
+
+    it('a pair that already ended, or never awaited a decision, or belongs to another Brain, gets no follow-up', async () => {
+      await awaitingPair('FU_ENDED');
+      const noticeId = lastNoticeId('brain-line-done-no-auditor');
+      marker(BRAIN, '<!-- IMCODES_TASK CANCEL FU_ENDED -->');
+      await flush();
+      sent = [];
+      await brainTurn({ noticeId });
+      automation.observeTimelineEvent({ sessionId: SPARE, type: 'session.state', payload: { state: 'idle' } });
+      await flush();
+      expect(sentTo(BRAIN, 'brain-decision-followup')).toHaveLength(0);
+      expect(sent).toHaveLength(0);
+    });
+
+    it('a follow-up is a Brain delivery: the ordinary reminder keeps its ten-minute gap after it', async () => {
+      await awaitingPair('FU_GAP');
+      await brainTurn({ noticeId: lastNoticeId('brain-line-done-no-auditor') });
+      expect(sentTo(BRAIN, 'brain-decision-followup')).toHaveLength(1);
+      sent = [];
+      await tick(1); // six minutes: still inside the shared gap
+      expect(sentTo(BRAIN, 'brain-decision-reminder')).toHaveLength(0);
+      await tick(2);
+      expect(sentTo(BRAIN, 'brain-decision-reminder')).toHaveLength(1);
+    });
+  });
+
+  it('enforces the ten-minute Brain gap across two pairs sharing one Brain', async () => {
+    marker(BRAIN, `<!-- IMCODES_TASK DISPATCH GAP_A executor=${EXEC} auditor=none -->`);
+    marker(EXEC, '<!-- IMCODES_TASK DONE GAP_A -->');
+    await flush();
+    sent = [];
+    await tick(4); // first reminder for GAP_A
+    expect(sentTo(BRAIN, 'brain-decision-reminder')).toHaveLength(1);
+    const gapA = getTaskPairStore().getPair(PROJECT, 'GAP_A')!;
+    // Make the prior aggregate boundary explicit at the test clock so the
+    // cross-pair gate is exercised independently of async delivery timing.
+    getTaskPairStore().saveLiveness(PROJECT, 'GAP_A', {
+      ...gapA.liveness,
+      brainGlobalLastDeliveryAt: now,
+    });
+
+    marker(BRAIN, `<!-- IMCODES_TASK DISPATCH GAP_B executor=${SPARE} auditor=none -->`);
+    marker(SPARE, '<!-- IMCODES_TASK DONE GAP_B -->');
+    await flush();
+    const gapB = getTaskPairStore().getPair(PROJECT, 'GAP_B')!;
+    getTaskPairStore().saveLiveness(PROJECT, 'GAP_B', {
+      ...gapB.liveness,
+      brainWaitStartedAt: now - 20 * 60_000,
+      brainLastActivityAt: now - 20 * 60_000,
+    });
+    sent = [];
+    await tick(1); // GAP_B is due, but only six minutes after GAP_A delivery
+    expect(sentTo(BRAIN, 'brain-decision-reminder')).toHaveLength(0);
+    expect(getTaskPairStore().listEvents(PROJECT, 'GAP_B').some((event) => (
+      event.verb === 'REMIND' && event.effect === 'skipped' && event.attrs.reason === 'min_gap'
+    ))).toBe(true);
+
+    await tick(1); // the shared watermark has aged past ten minutes
+    expect(sentTo(BRAIN)).toHaveLength(1);
+  });
+
+  it('clears a reserved global watermark when the Brain transport rejects so the next tick retries', async () => {
+    marker(BRAIN, `<!-- IMCODES_TASK DISPATCH GAP_RETRY executor=${EXEC} auditor=none -->`);
+    marker(EXEC, '<!-- IMCODES_TASK DONE GAP_RETRY -->');
+    await flush();
+    sent = [];
+    throwDelivery = true;
+    await tick(4);
+    await flush();
+    expect(sentTo(BRAIN)).toHaveLength(0);
+    expect(getTaskPairStore().getPair(PROJECT, 'GAP_RETRY')?.liveness.brainGlobalLastDeliveryAt).toBeUndefined();
+
+    throwDelivery = false;
+    await tick(1);
+    expect(sentTo(BRAIN)).toHaveLength(1);
+  });
+
+  it('does not deliver merely when a busy Brain becomes idle before the first cadence slot', async () => {
+    getTaskPairStore().savePair(PROJECT, {
+      taskId: 'brain-idle-transition', brain: BRAIN, status: 'working', flags: ['blocked'],
+      flagSides: { blocked: 'executor' }, round: 1, blocking: ['P0'], previousAuditors: [],
+      capCounts: {}, capRound: 0, createdAt: now - 60_000, updatedAt: now - 60_000,
+      executor: EXEC, auditor: AUD,
+    } satisfies TaskPairState);
+    busy.add(BRAIN);
+    automation.publishBadges();
+    expect(sentTo(BRAIN)).toHaveLength(0);
+
+    busy.delete(BRAIN);
+    automation.publishBadges();
+    expect(sentTo(BRAIN)).toHaveLength(0);
+    expect(getTaskPairStore().listEvents(PROJECT, 'brain-idle-transition').some((event) => (
+      event.verb === 'REMIND' && event.effect === 'skipped' && event.attrs.reason === 'cadence_not_due'
+    ))).toBe(true);
+
+    now += 5 * 60_000;
+    automation.publishBadges();
+    expect(sentTo(BRAIN)).toHaveLength(1);
+  });
+
+  it('nudges whoever holds the ball when both sides are idle (in_audit with a real auditor: the auditor), but stands down when either side has activity', async () => {
+    marker(BRAIN, `<!-- IMCODES_TASK DISPATCH BOTH_IDLE executor=${EXEC} auditor=${AUD} -->`);
+    marker(EXEC, '<!-- IMCODES_TASK READY_FOR_AUDIT BOTH_IDLE -->');
+    await flush();
+    sent = [];
+    await tick(1);
+    expect(pair('BOTH_IDLE').status).toBe('in_audit');
+    expect(sentTo(AUD, 'nudge-auditor')).toHaveLength(1);
+    expect(sentTo(EXEC, 'nudge-executor')).toHaveLength(0);
+
+    sent = [];
+    now += 1;
+    taskPairService.recordActivity(AUD, now);
+    await tick(1);
+    expect(sent).toHaveLength(0);
+  });
+
+  describe('lightweight both-idle check (checkBothIdlePairs, independent of the 6-minute heartbeat)', () => {
+    it('nudges the executor once both sides have been idle for the threshold, and not again for the same idle spell', async () => {
+      marker(BRAIN, `<!-- IMCODES_TASK DISPATCH FAST1 executor=${EXEC} auditor=${AUD} -->`);
+      await flush();
+      sent = [];
+      await bothIdleCheck(3); // 90s: under the 2-minute threshold
+      expect(sent).toHaveLength(0);
+      await bothIdleCheck(1); // 120s: threshold reached
+      expect(sentTo(EXEC, 'nudge-executor')).toHaveLength(1);
+      await bothIdleCheck(3); // still the same idle spell: no repeat within the threshold window
+      expect(sentTo(EXEC, 'nudge-executor')).toHaveLength(1);
+    });
+
+    it('keeps fast idle nudges bounded across a long quiet window', async () => {
+      marker(BRAIN, `<!-- IMCODES_TASK DISPATCH FAST_BOUND executor=${EXEC} auditor=${AUD} -->`);
+      await flush();
+      sent = [];
+      // Two hours of 30-second polls must not produce one nudge per threshold
+      // interval. The fast path is one nudge per idle spell; the regular
+      // heartbeat still owns the existing silence-limit escalation.
+      await bothIdleCheck(240);
+      expect(sentTo(EXEC, 'nudge-executor')).toHaveLength(1);
+      expect(getTaskPairStore().listEvents(PROJECT, 'FAST_BOUND').filter((event) => event.verb === 'NUDGE' && event.effect === 'sent')).toHaveLength(1);
+    });
+
+    it('does not treat an automation response as participant activity that reopens the idle spell', async () => {
+      marker(BRAIN, `<!-- IMCODES_TASK DISPATCH FAST_AUTOMATION executor=${EXEC} auditor=${AUD} -->`);
+      await flush();
+      sent = [];
+      await bothIdleCheck(4);
+      expect(sentTo(EXEC, 'nudge-executor')).toHaveLength(1);
+
+      const activityBeforeAutomation = getTaskPairStore().getPair(PROJECT, 'FAST_AUTOMATION')!.liveness.activityExecutorAt;
+      taskPairService.recordActivity(EXEC, now, { automation: true });
+      expect(getTaskPairStore().getPair(PROJECT, 'FAST_AUTOMATION')!.liveness.activityExecutorAt).toBe(activityBeforeAutomation);
+      sent = [];
+      await bothIdleCheck(4);
+      expect(sent).toHaveLength(0);
+    });
+
+    it("nudges the auditor when it is clearly the auditor's turn (in_audit, material delivered)", async () => {
+      marker(BRAIN, `<!-- IMCODES_TASK DISPATCH FAST2 executor=${EXEC} auditor=${AUD} -->`);
+      marker(EXEC, '<!-- IMCODES_TASK READY_FOR_AUDIT FAST2 -->');
+      await flush();
+      sent = [];
+      await bothIdleCheck(4);
+      expect(sentTo(AUD, 'nudge-auditor')).toHaveLength(1);
+      expect(sentTo(EXEC, 'nudge-executor')).toHaveLength(0);
+    });
+
+    it('never nudges while one side is busy', async () => {
+      marker(BRAIN, `<!-- IMCODES_TASK DISPATCH FAST3 executor=${EXEC} auditor=${AUD} -->`);
+      await flush();
+      sent = [];
+      busy.add(EXEC);
+      await bothIdleCheck(4);
+      expect(sent).toHaveLength(0);
+    });
+
+    it('never nudges a rate-limited (provider usage limit) session', async () => {
+      marker(BRAIN, `<!-- IMCODES_TASK DISPATCH FAST4 executor=${EXEC} auditor=${AUD} -->`);
+      await flush();
+      sent = [];
+      limited.add(EXEC);
+      await bothIdleCheck(4);
+      expect(sentTo(EXEC, 'nudge-executor')).toHaveLength(0);
+    });
+
+    it('resets the idle timer on activity, so the threshold has to elapse again', async () => {
+      marker(BRAIN, `<!-- IMCODES_TASK DISPATCH FAST5 executor=${EXEC} auditor=${AUD} -->`);
+      await flush();
+      sent = [];
+      await bothIdleCheck(4);
+      expect(sentTo(EXEC, 'nudge-executor')).toHaveLength(1);
+      now += 1;
+      taskPairService.recordActivity(EXEC, now);
+      sent = [];
+      await bothIdleCheck(3); // 90s since the fresh activity: still under threshold
+      expect(sent).toHaveLength(0);
+      await bothIdleCheck(1); // 120s since the fresh activity: threshold reached again
+      expect(sentTo(EXEC, 'nudge-executor')).toHaveLength(1);
+    });
+
+    it('re-arms after activity at the exact fast-nudge timestamp', async () => {
+      marker(BRAIN, `<!-- IMCODES_TASK DISPATCH FAST5_EQUAL executor=${EXEC} auditor=${AUD} -->`);
+      await flush();
+      sent = [];
+      await bothIdleCheck(4);
+      expect(sentTo(EXEC, 'nudge-executor')).toHaveLength(1);
+      // Deliberately use the exact same millisecond as the nudge. Equality
+      // must not be mistaken for the original idle spell.
+      taskPairService.recordActivity(EXEC, now);
+      sent = [];
+      await bothIdleCheck(4);
+      expect(sentTo(EXEC, 'nudge-executor')).toHaveLength(1);
+    });
+
+    it('counts the fast nudge toward the existing silence escalation and continues the 6-minute heartbeat cadence', async () => {
+      marker(BRAIN, `<!-- IMCODES_TASK DISPATCH FAST6 executor=${EXEC} auditor=${AUD} -->`);
+      await flush();
+      sent = [];
+      // The 2-minute check is the first nudge. The normal heartbeat resumes
+      // after its 6-minute interval, rather than being replaced by the fast
+      // trigger. Silence still escalates after the same number of ticks.
+      await bothIdleCheck(4);
+      expect(sentTo(EXEC, 'nudge-executor')).toHaveLength(1);
+      now += 1;
+      await automation.tick();
+      expect(sentTo(EXEC, 'nudge-executor')).toHaveLength(1); // fast nudge is too recent
+      await tick(1);
+      expect(sentTo(EXEC, 'nudge-executor')).toHaveLength(2);
+      await tick(1);
+      expect(pair('FAST6').flags).toContain('executor_silent');
+      expect(sentTo(BRAIN, 'brain-executor_silent')).toHaveLength(1);
+      expect(sentTo(EXEC, 'nudge-executor')).toHaveLength(2);
+      await tick(1);
+      expect(sentTo(EXEC, 'nudge-executor')).toHaveLength(2);
+      expect(sentTo(BRAIN, 'brain-executor_silent')).toHaveLength(1);
+    });
+
+    it('for an auditor=none pair, "both idle" collapses to the executor alone', async () => {
+      marker(BRAIN, `<!-- IMCODES_TASK DISPATCH FAST7 executor=${EXEC} auditor=none -->`);
+      await flush();
+      sent = [];
+      await bothIdleCheck(4);
+      expect(sentTo(EXEC, 'nudge-executor')).toHaveLength(1);
+    });
+
+    it('never nudges the executor of a pair that is awaiting Brain\'s decision: the executor has nothing left to do, and a nudge only makes it re-report DONE', async () => {
+      marker(BRAIN, `<!-- IMCODES_TASK DISPATCH AWAIT_NONUDGE executor=${EXEC} auditor=none -->`);
+      marker(EXEC, '<!-- IMCODES_TASK DONE AWAIT_NONUDGE -->');
+      await flush();
+      expect(pair('AWAIT_NONUDGE').status).toBe('awaiting_brain_decision');
+      sent = [];
+      // Two hours of fast polls plus several heartbeat ticks: no executor nudge at all.
+      await bothIdleCheck(240);
+      await tick(4);
+      expect(sentTo(EXEC)).toHaveLength(0);
+      expect(getTaskPairStore().listEvents(PROJECT, 'AWAIT_NONUDGE').filter((event) => event.verb === 'NUDGE')).toHaveLength(0);
+    });
+
+    it('the awaiting-decision exemption applies to the whole class of states with no acting side, and a passed pair (executor owes its DONE) is still nudged', async () => {
+      marker(BRAIN, `<!-- IMCODES_TASK DISPATCH AWAIT_PASSED executor=${EXEC} auditor=${AUD} -->`);
+      marker(EXEC, `<!-- IMCODES_TASK READY_FOR_AUDIT AWAIT_PASSED worktree=/ws/AWAIT_PASSED head=${'1'.repeat(40)} -->`);
+      await flush();
+      marker(AUD, '<!-- IMCODES_TASK PASS AWAIT_PASSED blocking=P0 -->');
+      await flush();
+      expect(pair('AWAIT_PASSED').status).toBe('passed');
+      sent = [];
+      await bothIdleCheck(4);
+      expect(sentTo(EXEC, 'nudge-executor')).toHaveLength(1);
+    });
+
+    it('does not send a double nudge when both the fast check and the ordinary heartbeat tick fire for the same idle spell', async () => {
+      marker(BRAIN, `<!-- IMCODES_TASK DISPATCH FAST8 executor=${EXEC} auditor=${AUD} -->`);
+      await flush();
+      sent = [];
+      await bothIdleCheck(4); // 2 minutes: the fast check nudges first
+      expect(sentTo(EXEC, 'nudge-executor')).toHaveLength(1);
+      // The ordinary heartbeat tick reaches the same still-idle pair moments
+      // later: it must see the fast check's own nudge and stand down.
+      now += 1;
+      await automation.tick();
+      expect(sentTo(EXEC, 'nudge-executor')).toHaveLength(1);
+    });
+  });
+
+  it('treats unfinished provider background work (such as an SDK subagent) as working', () => {
+    const snapshot = {
+      status: 'idle', sending: false, pendingCount: 0, pendingVersion: 0,
+      activeDispatchCount: 0, stalePendingRecoveryActive: false, providerSessionBound: true,
+      lastActivityAt: 1, lastActivityAgeMs: 0, lastProviderOutputAt: 1, lastProviderOutputAgeMs: 0,
+      activityGeneration: { scope: 'session', sessionName: EXEC, generation: 1 },
+      blockingWorkCount: 0, backgroundWorkCount: 1, activeToolCount: 0, busyReasons: ['provider_background'],
+    } as const;
+    expect(isSessionWorking(EXEC, {
+      getSession: () => session(EXEC, 'worker'),
+      getDiagnosticSnapshot: () => snapshot as never,
+    })).toBe(true);
+  });
+
+  it('escalates a repeatedly quiet pair once after the configured silence limit', async () => {
+    marker(BRAIN, `<!-- IMCODES_TASK DISPATCH QUIET_ESC executor=${EXEC} auditor=${AUD} -->`);
+    await flush();
+    sent = [];
+    await tick(3);
+    expect(sentTo(EXEC, 'nudge-executor')).toHaveLength(2);
+    expect(sentTo(BRAIN, 'brain-executor_silent')).toHaveLength(1);
+    await tick(2);
+    expect(sentTo(BRAIN, 'brain-executor_silent')).toHaveLength(1);
+  });
+
+  it('judges liveness per side: a busy executor does not mask a silent auditor, which is replaced', async () => {
+    marker(BRAIN, `<!-- IMCODES_TASK DISPATCH T5 executor=${EXEC} auditor=${AUD} -->`);
+    marker(EXEC, '<!-- IMCODES_TASK READY_FOR_AUDIT T5 -->');
+    await flush();
+    sent = [];
+    busy.add(EXEC);
+    await tick(3);
+    await flush();
+    expect(sentTo(AUD, 'nudge-auditor')).toHaveLength(2);
+    expect(pair('T5')).toMatchObject({ auditor: SPARE, previousAuditors: [AUD], status: 'in_audit' });
+    expect(sentTo(SPARE, 'handoff')[0]?.text).toContain('You are now the auditor');
+    expect(sentTo(EXEC, 'resend')).toHaveLength(1);
+    expect(sentTo(BRAIN, 'brain-line-reassign')[0]?.text).toContain(`${AUD} → ${SPARE}`);
+    // The new auditor starts with a clean silence count.
+    sent = [];
+    await tick(1);
+    expect(sentTo(SPARE, 'nudge-auditor')).toHaveLength(1);
+  });
+
+  it('replaces a usage-limited auditor at once', async () => {
+    marker(BRAIN, `<!-- IMCODES_TASK DISPATCH T6 executor=${EXEC} auditor=${AUD} -->`);
+    marker(EXEC, '<!-- IMCODES_TASK READY_FOR_AUDIT T6 -->');
+    await flush();
+    limited.add(AUD);
+    await tick(1);
+    expect(pair('T6').auditor).toBe(SPARE);
+  });
+
+  it('asks Brain exactly once when no candidate exists and provisioning fails', async () => {
+    candidates = [];
+    marker(BRAIN, `<!-- IMCODES_TASK DISPATCH T7 executor=${EXEC} auditor=${AUD} -->`);
+    marker(EXEC, '<!-- IMCODES_TASK READY_FOR_AUDIT T7 -->');
+    await flush();
+    limited.add(AUD);
+    await tick(4);
+    expect(sentTo(BRAIN, 'brain-needs_auditor')).toHaveLength(1);
+    expect(pair('T7').flags).toContain('needs_auditor');
+    marker(BRAIN, `<!-- IMCODES_TASK REASSIGN T7 auditor=${SPARE2} -->`);
+    expect(pair('T7')).toMatchObject({ auditor: SPARE2 });
+    expect(pair('T7').flags).not.toContain('needs_auditor');
+  });
+
+  it('uses a provisioned auditor when none is idle', async () => {
+    candidates = [];
+    provisioned = SPARE2;
+    marker(BRAIN, `<!-- IMCODES_TASK DISPATCH T8 executor=${EXEC} auditor=${AUD} -->`);
+    marker(EXEC, '<!-- IMCODES_TASK READY_FOR_AUDIT T8 -->');
+    await flush();
+    limited.add(AUD);
+    await tick(1);
+    expect(pair('T8').auditor).toBe(SPARE2);
+  });
+
+  it('picks an auditor immediately when a dispatch names none', async () => {
+    marker(BRAIN, `<!-- IMCODES_TASK DISPATCH T9 executor=${EXEC} -->`);
+    await flush();
+    expect(pair('T9').auditor).toBe(SPARE);
+  });
+
+  it('auto-dispatches queued briefs unchanged within the limit, and refills when a slot frees', async () => {
+    candidates = [SPARE, SPARE2, AUD, EXEC];
+    marker(BRAIN, '<!-- IMCODES_TASK QUEUE - max=1 -->');
+    const brief = 'Implement CSV export.\n```ts\nexport const x = 1;\n```\nKeep tests green.';
+    marker(BRAIN, `<!-- IMCODES_TASK QUEUE Q1 title="Export" executor=${EXEC} auditor=${AUD} -->\n${brief}\n<!-- IMCODES_TASK_END Q1 -->`);
+    marker(BRAIN, '<!-- IMCODES_TASK QUEUE Q2 title="Import" -->\nImplement import.\n<!-- IMCODES_TASK_END Q2 -->');
+    await flush();
+    expect(pair('Q1').status).toBe('working');
+    expect(pair('Q2').status).toBe('queued');
+    const dispatch = sentTo(EXEC, 'dispatch')[0]!;
+    expect(dispatch.text.startsWith(brief)).toBe(true);
+    expect(dispatch.text).toContain(`auditor: ${AUD}`);
+    expect(sentTo(AUD, 'auditor-assigned')).toHaveLength(1);
+    expect(sentTo(BRAIN, 'brain-line-dispatch')).toHaveLength(1);
+
+    marker(BRAIN, '<!-- IMCODES_TASK DONE Q1 force=true -->');
+    await flush();
+    const q2 = pair('Q2');
+    expect(q2.status).toBe('working');
+    expect(q2.executor).toBe(SPARE);
+    expect(q2.auditor).toBe(SPARE2);
+    expect(q2.executor).not.toBe(q2.auditor);
+  });
+
+  it('QUEUE with executormodel=-only and auditor=none starts the pair and never picks an auditor, even though a candidate is available', async () => {
+    candidates = [SPARE, SPARE2, AUD, EXEC];
+    marker(BRAIN, `<!-- IMCODES_TASK QUEUE Q9 title="Bump a config value" executormodel=sonnet auditor=none -->\nbump the value\n<!-- IMCODES_TASK_END Q9 -->`);
+    await flush();
+    const q9 = pair('Q9');
+    expect(q9.status).toBe('working');
+    expect(q9.executor).toBeTruthy();
+    expect(q9.auditor).toBe('none');
+    expect(sentTo(q9.executor!, 'dispatch')).toHaveLength(1);
+    // No auditor-assigned message went anywhere -- no auditor was picked.
+    expect(sent.filter((entry) => entry.id.includes(':auditor-assigned'))).toHaveLength(0);
+
+    // A later heartbeat tick must not retroactively pick one either.
+    await tick(3);
+    expect(pair('Q9').auditor).toBe('none');
+    expect(sent.filter((entry) => entry.id.includes(':auditor-assigned'))).toHaveLength(0);
+  });
+
+  it('urgent=true jumps a queued pair ahead of earlier-queued normal work', async () => {
+    candidates = [SPARE, SPARE2, AUD, EXEC];
+    marker(BRAIN, '<!-- IMCODES_TASK QUEUE - max=1 -->');
+    marker(BRAIN, `<!-- IMCODES_TASK QUEUE Q4 title="First" executor=${EXEC} auditor=${AUD} -->\nfirst brief\n<!-- IMCODES_TASK_END Q4 -->`);
+    marker(BRAIN, '<!-- IMCODES_TASK QUEUE Q5 title="Second (normal)" -->\nsecond brief\n<!-- IMCODES_TASK_END Q5 -->');
+    marker(BRAIN, '<!-- IMCODES_TASK QUEUE Q6 title="Third (urgent)" urgent=true -->\nthird brief\n<!-- IMCODES_TASK_END Q6 -->');
+    await flush();
+    // max=1: Q4 dispatches immediately, Q5 and Q6 both wait.
+    expect(pair('Q4').status).toBe('working');
+    expect(pair('Q5').status).toBe('queued');
+    expect(pair('Q6').status).toBe('queued');
+    expect(pair('Q6').urgent).toBe(true);
+
+    marker(BRAIN, '<!-- IMCODES_TASK DONE Q4 force=true -->');
+    await flush();
+    // Q6 (urgent, queued last) fills the freed slot before Q5 (queued first).
+    expect(pair('Q6').status).toBe('working');
+    expect(pair('Q5').status).toBe('queued');
+
+    marker(BRAIN, '<!-- IMCODES_TASK DONE Q6 force=true -->');
+    await flush();
+    expect(pair('Q5').status).toBe('working');
+  });
+
+  it('keeps a queued task waiting for capacity quietly and retries on the heartbeat', async () => {
+    candidates = [];
+    marker(BRAIN, '<!-- IMCODES_TASK QUEUE Q3 -->\nbrief\n<!-- IMCODES_TASK_END Q3 -->');
+    await flush();
+    await tick(2);
+    expect(pair('Q3')).toMatchObject({ status: 'queued', flags: ['waiting_for_capacity'] });
+    // Owner correction: an ordinary, self-resolving queue miss gets no
+    // per-pair Brain notice at all -- only the combined stall notice, and
+    // only once it has actually persisted (see the test below).
+    expect(sentTo(BRAIN, 'brain-waiting_for_capacity')).toHaveLength(0);
+    candidates = [SPARE, SPARE2];
+    await tick(1);
+    expect(pair('Q3')).toMatchObject({ status: 'working', executor: SPARE, auditor: SPARE2 });
+    expect(pair('Q3').flags).not.toContain('waiting_for_capacity');
+  });
+
+  it('skips a capacity miss so a later pair with different needs can start', async () => {
+    queuePairDirect('HOL1', 'blocked brief');
+    queuePairDirect('HOL2', 'good brief');
+    const first = getTaskPairStore().getPair(PROJECT, 'HOL1')!.state;
+    const second = getTaskPairStore().getPair(PROJECT, 'HOL2')!.state;
+    getTaskPairStore().savePair(PROJECT, { ...first, executorModel: 'blocked', auditor: 'none' });
+    getTaskPairStore().savePair(PROJECT, { ...second, executorModel: 'good', auditor: 'none' });
+    candidates = [SPARE];
+    automation = new TaskPairAutomation({
+      now: () => now,
+      pickCandidate: ({ requestedModel }) => requestedModel === 'blocked' ? undefined : SPARE,
+      provision: async () => undefined,
+      importLegacy: () => undefined,
+    });
+    taskPairService.setScheduler(automation);
+    await automation.runQueue(PROJECT, BRAIN);
+    expect(pair('HOL1').status).toBe('queued');
+    expect(pair('HOL2')).toMatchObject({ status: 'working', executor: SPARE, auditor: 'none' });
+  });
+
+  it('bounds a hung provisioning attempt and still drains later queued work', async () => {
+    const previous = process.env.IMCODES_TASK_PAIR_QUEUE_OPERATION_TIMEOUT_MS;
+    process.env.IMCODES_TASK_PAIR_QUEUE_OPERATION_TIMEOUT_MS = '10';
+    try {
+      queuePairDirect('HANG1', 'blocked brief');
+      queuePairDirect('HANG2', 'good brief');
+      const first = getTaskPairStore().getPair(PROJECT, 'HANG1')!.state;
+      const second = getTaskPairStore().getPair(PROJECT, 'HANG2')!.state;
+      getTaskPairStore().savePair(PROJECT, { ...first, executorModel: 'blocked', auditor: 'none' });
+      getTaskPairStore().savePair(PROJECT, { ...second, executorModel: 'good', auditor: 'none' });
+      automation = new TaskPairAutomation({
+        now: () => now,
+        pickCandidate: ({ requestedModel }) => requestedModel === 'good' ? SPARE : undefined,
+        provision: () => new Promise<string | undefined>(() => {}),
+        importLegacy: () => undefined,
+      });
+      taskPairService.setScheduler(automation);
+      await automation.runQueue(PROJECT, BRAIN);
+      expect(pair('HANG1').status).toBe('queued');
+      expect(pair('HANG2')).toMatchObject({ status: 'working', executor: SPARE, auditor: 'none' });
+      await flush();
+    } finally {
+      if (previous === undefined) delete process.env.IMCODES_TASK_PAIR_QUEUE_OPERATION_TIMEOUT_MS;
+      else process.env.IMCODES_TASK_PAIR_QUEUE_OPERATION_TIMEOUT_MS = previous;
+    }
+  });
+
+  it('marks waiting_for_capacity before provisioning a missing auditor on an assigned-executor pair', async () => {
+    const previous = process.env.IMCODES_TASK_PAIR_QUEUE_OPERATION_TIMEOUT_MS;
+    process.env.IMCODES_TASK_PAIR_QUEUE_OPERATION_TIMEOUT_MS = '10';
+    try {
+      queuePairDirect('AUDWAIT', 'brief');
+      const queued = getTaskPairStore().getPair(PROJECT, 'AUDWAIT')!.state;
+      getTaskPairStore().savePair(PROJECT, { ...queued, executor: EXEC });
+      automation = new TaskPairAutomation({
+        now: () => now,
+        pickCandidate: () => undefined,
+        provision: () => new Promise<string | undefined>(() => {}),
+        importLegacy: () => undefined,
+      });
+      taskPairService.setScheduler(automation);
+      await automation.runQueue(PROJECT, BRAIN);
+      expect(pair('AUDWAIT').status).toBe('queued');
+      expect(pair('AUDWAIT').flags).toContain('waiting_for_capacity');
+    } finally {
+      if (previous === undefined) delete process.env.IMCODES_TASK_PAIR_QUEUE_OPERATION_TIMEOUT_MS;
+      else process.env.IMCODES_TASK_PAIR_QUEUE_OPERATION_TIMEOUT_MS = previous;
+    }
+  });
+
+  it('sends one combined notice for queued tasks stalled a long time, not one per pair or per tick', async () => {
+    candidates = [];
+    marker(BRAIN, '<!-- IMCODES_TASK QUEUE Q3a -->\nbrief a\n<!-- IMCODES_TASK_END Q3a -->');
+    marker(BRAIN, '<!-- IMCODES_TASK QUEUE Q3b -->\nbrief b\n<!-- IMCODES_TASK_END Q3b -->');
+    await flush();
+    // Under 30 minutes: still quiet.
+    await tick(4);
+    expect(sentTo(BRAIN, 'brain-queue-stall')).toHaveLength(0);
+    // Past 30 minutes: one combined notice naming both pairs.
+    await tick(2);
+    const stallNotices = sentTo(BRAIN, 'brain-queue-stall');
+    expect(stallNotices).toHaveLength(1);
+    expect(stallNotices[0]!.text).toContain('Q3a');
+    expect(stallNotices[0]!.text).toContain('Q3b');
+    // Rate-limited: further ticks while still stalled do not repeat it.
+    await tick(3);
+    expect(sentTo(BRAIN, 'brain-queue-stall')).toHaveLength(1);
+  });
+
+  it('a queued task with no brief and no available candidate stays queued silently -- an ordinary capacity miss, not a brief-specific stall', async () => {
+    candidates = [];
+    marker(BRAIN, '<!-- IMCODES_TASK QUEUE Q4 -->');
+    await flush();
+    await tick(2);
+    expect(pair('Q4').status).toBe('queued');
+    expect(pair('Q4').flags).toContain('waiting_for_capacity');
+    // No project UI locale is available in this headless fixture, so the
+    // title request waits for the later locale/backfill pass.
+    expect(sentTo(BRAIN, 'title-request')).toHaveLength(0);
+  });
+
+  it('auto-dispatches a queued task with no brief once candidates are available, briefing the executor instead of stalling forever', async () => {
+    marker(BRAIN, `<!-- IMCODES_TASK DISPATCH Q4b executor=${EXEC} auditor=${AUD} -->`);
+    await flush();
+    expect(pair('Q4b').status).toBe('working');
+    const brief = sentTo(EXEC, 'pair-brief')[0];
+    expect(brief).toBeDefined();
+    expect(brief!.text).not.toContain('undefined');
+    expect(brief!.text).toContain('executor of this task pair');
+  });
+
+  it('DISPATCH with a brief under the limit starts right away and delivers the brief, same as QUEUE', async () => {
+    marker(BRAIN, `<!-- IMCODES_TASK DISPATCH DB1 title="Dispatch with a brief" executor=${EXEC} auditor=${AUD} -->\nfix the thing\n<!-- IMCODES_TASK_END DB1 -->`);
+    await flush();
+    expect(pair('DB1')).toMatchObject({ status: 'working', executor: EXEC, auditor: AUD, brief: 'fix the thing' });
+    const dispatch = sentTo(EXEC, 'dispatch')[0]!;
+    expect(dispatch.text.startsWith('fix the thing')).toBe(true);
+    // Owner rule (tsk_cd_dispatch_default): ask, don't just reply -- in the auditor brief too.
+    expect(sentTo(AUD, 'auditor-assigned')[0]?.text).toContain('Ask, don\'t just reply');
+  });
+
+  it('tells Brain immediately when the executor writes BLOCKED, instead of waiting for it to go silent', async () => {
+    marker(BRAIN, `<!-- IMCODES_TASK DISPATCH DBL executor=${EXEC} auditor=${AUD} -->`);
+    marker(EXEC, '<!-- IMCODES_TASK BLOCKED DBL note="need a decision on scope" -->');
+    await flush();
+    const notice = sentTo(BRAIN, 'brain-blocked');
+    expect(notice).toHaveLength(1);
+    expect(notice[0]!.text).toContain('need a decision on scope');
+    // A second BLOCKED from the same side, still blocked, is not re-notified.
+    marker(EXEC, '<!-- IMCODES_TASK BLOCKED DBL note="still need a decision on scope" -->');
+    await flush();
+    expect(sentTo(BRAIN, 'brain-blocked')).toHaveLength(1);
+  });
+
+  it('does not replace a healthy auditor while the executor is waiting for an owner decision', async () => {
+    marker(BRAIN, `<!-- IMCODES_TASK DISPATCH WAIT_DECISION executor=${EXEC} auditor=${AUD} -->`);
+    marker(EXEC, '<!-- IMCODES_TASK READY_FOR_AUDIT WAIT_DECISION -->');
+    await flush();
+    marker(EXEC, '<!-- IMCODES_TASK BLOCKED WAIT_DECISION about=auditor note="waiting for Brain decision" -->');
+    await flush();
+    expect(pair('WAIT_DECISION')).toMatchObject({ auditor: AUD, status: 'in_audit' });
+    expect(pair('WAIT_DECISION').previousAuditors).toEqual([]);
+    expect(sentTo(BRAIN, 'auditor-reassignment-held')).toHaveLength(1);
+  });
+
+  it('pins a Brain-selected auditor against healthy automatic replacement', async () => {
+    marker(BRAIN, `<!-- IMCODES_TASK DISPATCH PINNED executor=${EXEC} auditor=${AUD} -->`);
+    marker(BRAIN, `<!-- IMCODES_TASK REASSIGN PINNED auditor=${SPARE} -->`);
+    await flush();
+    expect(pair('PINNED')).toMatchObject({ auditor: SPARE, auditorPinned: SPARE });
+    candidates = [SPARE2];
+    expect(await automation.replaceAuditor(PROJECT, 'PINNED', 'auditor silent for 3 heartbeats')).toBe(false);
+    expect(pair('PINNED')).toMatchObject({ auditor: SPARE, status: 'working' });
+  });
+
+  it('retains an in-audit pair when the only replacement candidate is busy', async () => {
+    marker(BRAIN, `<!-- IMCODES_TASK DISPATCH BUSY_REPL executor=${EXEC} auditor=${AUD} -->`);
+    marker(EXEC, '<!-- IMCODES_TASK READY_FOR_AUDIT BUSY_REPL -->');
+    await flush();
+    candidates = [SPARE];
+    busy.add(SPARE);
+    expect(await automation.replaceAuditor(PROJECT, 'BUSY_REPL', 'auditor silent for 3 heartbeats')).toBe(false);
+    expect(pair('BUSY_REPL')).toMatchObject({ auditor: AUD, status: 'in_audit' });
+    expect(sentTo(BRAIN, 'auditor-reassignment-held')).toHaveLength(1);
+  });
+
+  it('still replaces an auditor that is genuinely errored', async () => {
+    marker(BRAIN, `<!-- IMCODES_TASK DISPATCH ERR_AUD executor=${EXEC} auditor=${AUD} -->`);
+    marker(EXEC, '<!-- IMCODES_TASK READY_FOR_AUDIT ERR_AUD -->');
+    await flush();
+    upsertSession(session(AUD, 'w2', { state: 'error', error: 'provider exited' }));
+    expect(await automation.replaceAuditor(PROJECT, 'ERR_AUD', 'auditor silent for 3 heartbeats')).toBe(true);
+    expect(pair('ERR_AUD')).toMatchObject({ auditor: SPARE, status: 'in_audit' });
+  });
+
+  it('DISPATCH over the concurrency limit auto-queues instead of starting, then auto-starts once a slot frees', async () => {
+    marker(BRAIN, '<!-- IMCODES_TASK QUEUE - max=1 -->');
+    marker(BRAIN, `<!-- IMCODES_TASK DISPATCH D1 executor=${EXEC} auditor=${AUD} -->`);
+    await flush();
+    expect(pair('D1').status).toBe('working');
+
+    // Brain still just writes DISPATCH -- no need to pick QUEUE to defer it.
+    marker(BRAIN, `<!-- IMCODES_TASK DISPATCH D2 title="Second" executor=${SPARE} auditor=${SPARE2} -->\nsecond brief\n<!-- IMCODES_TASK_END D2 -->`);
+    await flush();
+    expect(pair('D2')).toMatchObject({ status: 'queued', executor: SPARE, auditor: SPARE2 });
+    expect(sentTo(SPARE)).toHaveLength(0);
+
+    marker(BRAIN, '<!-- IMCODES_TASK DONE D1 force=true -->');
+    await flush();
+    expect(pair('D2').status).toBe('working');
+    expect(sentTo(SPARE, 'dispatch')[0]?.text.startsWith('second brief')).toBe(true);
+  });
+
+  it('a DISPATCH naming a busy session queues and starts once that session frees, never silently substituting another', async () => {
+    busy.add(EXEC);
+    marker(BRAIN, `<!-- IMCODES_TASK DISPATCH D3 executor=${EXEC} auditor=${AUD} -->`);
+    await flush();
+    expect(pair('D3')).toMatchObject({ status: 'queued', executor: EXEC });
+    expect(pair('D3').flags).toContain('waiting_for_capacity');
+
+    busy.delete(EXEC);
+    await tick(1);
+    expect(pair('D3').status).toBe('working');
+  });
+
+  it('does not start a queued pair from a task-bound send to its executor: admission starts it once, with its brief', async () => {
+    queuePairDirect('BOUND_SEND', 'bound brief');
+    const queued = pair('BOUND_SEND');
+    getTaskPairStore().savePair(PROJECT, {
+      ...queued,
+      executor: EXEC,
+      auditor: AUD,
+      flags: ['waiting_for_capacity'],
+    });
+    busy.add(EXEC); // held: admission cannot start it right now
+    const transition = taskPairService.implicitDispatch({
+      project: PROJECT,
+      sender: BRAIN,
+      target: EXEC,
+      taskId: 'BOUND_SEND',
+      eventId: 'bound-send-recorded',
+      brief: 'bound brief',
+    });
+    await flush();
+    expect(transition?.effect).toBe('recorded');
+    expect(pair('BOUND_SEND')).toMatchObject({ status: 'queued', executor: EXEC, auditor: AUD });
+    expect(pair('BOUND_SEND').startedAt).toBeUndefined();
+    expect(pair('BOUND_SEND').workspace).toBeUndefined();
+    expect(sentTo(EXEC, 'dispatch')).toHaveLength(0);
+
+    busy.delete(EXEC);
+    await automation.runQueue(PROJECT, BRAIN);
+    expect(pair('BOUND_SEND')).toMatchObject({ status: 'working', executor: EXEC, auditor: AUD });
+    expect(pair('BOUND_SEND').flags).not.toContain('waiting_for_capacity');
+    expect(sentTo(EXEC, 'dispatch')).toHaveLength(1);
+    expect(sentTo(EXEC, 'dispatch')[0]!.text.startsWith('bound brief')).toBe(true);
+    await automation.runQueue(PROJECT, BRAIN);
+    expect(sentTo(EXEC, 'dispatch')).toHaveLength(1); // exactly once
+  });
+
+  it('starts a queued pair on the executor STARTED marker with a fresh start time', async () => {
+    queuePairDirect('BOUND_STARTED', 'started brief');
+    const queued = pair('BOUND_STARTED');
+    getTaskPairStore().savePair(PROJECT, {
+      ...queued,
+      executor: EXEC,
+      auditor: AUD,
+      flags: ['waiting_for_capacity', 'no_pool_configured'],
+    });
+    const queuedAt = pair('BOUND_STARTED').createdAt;
+    now += 5_000;
+    marker(EXEC, '<!-- IMCODES_TASK STARTED BOUND_STARTED -->');
+    expect(pair('BOUND_STARTED').status).toBe('working');
+    expect(pair('BOUND_STARTED').startedAt).toBe(now);
+    expect(pair('BOUND_STARTED').startedAt).toBeGreaterThan(queuedAt);
+    expect(pair('BOUND_STARTED').flags).not.toContain('waiting_for_capacity');
+    expect(pair('BOUND_STARTED').flags).not.toContain('no_pool_configured');
+  });
+
+  it('does not start queued work from an auditor-directed task-bound send', async () => {
+    queuePairDirect('AUDITOR_SEND', 'auditor-only brief');
+    const queued = pair('AUDITOR_SEND');
+    getTaskPairStore().savePair(PROJECT, {
+      ...queued,
+      executor: EXEC,
+      auditor: AUD,
+      flags: ['waiting_for_capacity'],
+    });
+    const transition = taskPairService.implicitDispatch({
+      project: PROJECT,
+      sender: BRAIN,
+      target: AUD,
+      taskId: 'AUDITOR_SEND',
+      eventId: 'auditor-send-recorded',
+    });
+    expect(transition?.effect).toBe('recorded');
+    expect(pair('AUDITOR_SEND').status).toBe('queued');
+    expect(pair('AUDITOR_SEND').startedAt).toBeUndefined();
+  });
+
+  it('keeps a queued pair waiting when its named executor is busy with another task', async () => {
+    busy.add(EXEC);
+    queuePairDirect('BUSY_OTHER', 'busy brief');
+    const queued = pair('BUSY_OTHER');
+    getTaskPairStore().savePair(PROJECT, { ...queued, executor: EXEC, auditor: AUD });
+    await automation.runQueue(PROJECT, BRAIN);
+    expect(pair('BUSY_OTHER').status).toBe('queued');
+    expect(pair('BUSY_OTHER').flags).toContain('waiting_for_capacity');
+    expect(pair('BUSY_OTHER').startedAt).toBeUndefined();
+  });
+
+  it('urgent=true on DISPATCH jumps a queued pair ahead of earlier-queued normal work, same as QUEUE', async () => {
+    candidates = [SPARE, SPARE2, AUD, EXEC];
+    marker(BRAIN, '<!-- IMCODES_TASK QUEUE - max=1 -->');
+    marker(BRAIN, `<!-- IMCODES_TASK DISPATCH DU1 title="First" executor=${EXEC} auditor=${AUD} -->`);
+    marker(BRAIN, '<!-- IMCODES_TASK DISPATCH DU2 title="Second (normal)" -->');
+    marker(BRAIN, '<!-- IMCODES_TASK DISPATCH DU3 title="Third (urgent)" urgent=true -->');
+    await flush();
+    expect(pair('DU1').status).toBe('working');
+    expect(pair('DU2').status).toBe('queued');
+    expect(pair('DU3')).toMatchObject({ status: 'queued', urgent: true });
+
+    marker(BRAIN, '<!-- IMCODES_TASK DONE DU1 force=true -->');
+    await flush();
+    expect(pair('DU3').status).toBe('working');
+    expect(pair('DU2').status).toBe('queued');
+  });
+
+  it('batches several brief-less queued pairs found in one heartbeat into one digest naming them all, with one example marker (not one per pair)', async () => {
+    queueBriefLessPair('Q5');
+    queueBriefLessPair('Q6');
+    queueBriefLessPair('Q7');
+    await tick(1);
+    expect(pair('Q5').status).toBe('queued');
+    expect(pair('Q6').status).toBe('queued');
+    expect(pair('Q7').status).toBe('queued');
+    // Never one individual "queued without a brief" message per pair (reasonPart
+    // needs its trailing colon: 'brain-no_brief' is also a substring of the
+    // digest's own reason, 'brain-no_brief-digest').
+    expect(sentTo(BRAIN, 'brain-no_brief:')).toHaveLength(0);
+    const digest = sentTo(BRAIN, 'brain-no_brief-digest');
+    expect(digest).toHaveLength(1);
+    expect(digest[0]!.text).toContain('Q5');
+    expect(digest[0]!.text).toContain('Q6');
+    expect(digest[0]!.text).toContain('Q7');
+    // One example of the fix-up tools, not the same instruction repeated per pair -- and no marker.
+    expect(digest[0]!.text.match(/pair_task_update/g)).toHaveLength(1);
+    expect(digest[0]!.text).not.toMatch(/IMCODES_TASK/);
+  });
+
+  it('never lets brief-less queued pairs hold a slot: a briefed pair queued behind them still dispatches under max=1', async () => {
+    candidates = [SPARE, SPARE2];
+    getTaskPairStore().setMaxConcurrency(BRAIN, 1);
+    queueBriefLessPair('Q8');
+    queueBriefLessPair('Q9');
+    queuePairDirect('Q10', 'brief for Q10');
+    await tick(1);
+    expect(pair('Q10')).toMatchObject({ status: 'working', executor: SPARE });
+    expect(pair('Q8').status).toBe('queued');
+    expect(pair('Q9').status).toBe('queued');
+    expect(pair('Q8').executor).toBeUndefined();
+    expect(pair('Q9').executor).toBeUndefined();
+  });
+
+  it('shows the pair heartbeat on the badges of open-pair participants and clears it when the pair ends', async () => {
+    marker(BRAIN, `<!-- IMCODES_TASK DISPATCH T11 executor=${EXEC} auditor=${AUD} -->`);
+    await flush();
+    automation.publishBadges();
+    expect(getSupervisionHeartbeatProjection(EXEC)).toMatchObject({ state: 'armed', kind: 'pair' });
+    expect(getSupervisionHeartbeatProjection(AUD)).toMatchObject({ state: 'armed', kind: 'pair' });
+    marker(BRAIN, '<!-- IMCODES_TASK DONE T11 force=true -->');
+    await flush();
+    automation.publishBadges();
+    expect(getSupervisionHeartbeatProjection(EXEC)?.state ?? 'off').toBe('off');
+  });
+
+  it('arms the main Brain only for actionable idle pairs and defers without stacking while busy', async () => {
+    getTaskPairStore().savePair(PROJECT, {
+      taskId: 'brain-pass', brain: BRAIN, status: 'passed', flags: [], flagSides: {}, round: 1,
+      blocking: ['P0'], previousAuditors: [], capCounts: {}, capRound: 0, createdAt: now, updatedAt: now,
+      executor: EXEC, auditor: AUD,
+    } satisfies TaskPairState);
+    busy.add(BRAIN);
+    automation.publishBadges();
+    expect(getSupervisionHeartbeatProjection(BRAIN)?.state ?? 'off').toBe('off');
+    expect(sentTo(BRAIN, 'brain-heartbeat')).toHaveLength(0);
+    busy.delete(BRAIN);
+    automation.publishBadges();
+    expect(getSupervisionHeartbeatProjection(BRAIN)).toMatchObject({ state: 'armed', kind: 'pair' });
+    await flush();
+    expect(sentTo(BRAIN, 'brain-heartbeat')).toHaveLength(0);
+    // The user reply is also Brain activity, so the hard ten-minute global
+    // gap is the later boundary for this re-armed wait.
+    now += 10 * 60_000;
+    automation.publishBadges();
+    await flush();
+    expect(sentTo(BRAIN, 'brain-heartbeat')).toHaveLength(1);
+    automation.publishBadges();
+    await flush();
+    expect(sentTo(BRAIN, 'brain-heartbeat')).toHaveLength(1);
+  });
+
+  it('records one deduplicated REMIND skip while Brain is busy, then delivers when idle', async () => {
+    getTaskPairStore().savePair(PROJECT, {
+      taskId: 'brain-remind-skip', brain: BRAIN, status: 'working', flags: ['blocked'], flagSides: { blocked: 'executor' }, round: 1,
+      blocking: ['P0'], previousAuditors: [], capCounts: {}, capRound: 0, createdAt: now - 6 * 60_000, updatedAt: now - 6 * 60_000,
+      executor: EXEC, auditor: AUD,
+    } satisfies TaskPairState);
+    busy.add(BRAIN);
+    automation.publishBadges();
+    const skipped = getTaskPairStore().listEvents(PROJECT, 'brain-remind-skip').filter((event) => event.verb === 'REMIND');
+    expect(skipped).toHaveLength(1);
+    expect(skipped[0]?.effect).toBe('skipped');
+    automation.publishBadges();
+    expect(getTaskPairStore().listEvents(PROJECT, 'brain-remind-skip').filter((event) => event.verb === 'REMIND')).toHaveLength(1);
+    busy.delete(BRAIN);
+    automation.publishBadges();
+    await flush();
+    expect(sentTo(BRAIN, 'brain-heartbeat')).toHaveLength(1);
+  });
+
+  it('stops listing a blocked pair after Brain WORKING, while a participant re-raise is actionable again', async () => {
+    marker(BRAIN, `<!-- IMCODES_TASK DISPATCH brain-working-resolve executor=${EXEC} auditor=${AUD} -->`);
+    marker(EXEC, '<!-- IMCODES_TASK BLOCKED brain-working-resolve note="needs Brain decision" -->');
+    await flush();
+    sent = [];
+
+    marker(BRAIN, '<!-- IMCODES_TASK WORKING brain-working-resolve note="resolved" -->');
+    expect(pair('brain-working-resolve')).toMatchObject({ status: 'working', flags: [] });
+    automation.publishBadges();
+    await flush();
+    expect(sentTo(BRAIN, 'brain-heartbeat')).toHaveLength(0);
+
+    marker(EXEC, '<!-- IMCODES_TASK BLOCKED brain-working-resolve note="blocked again" -->');
+    expect(pair('brain-working-resolve')).toMatchObject({ flags: ['blocked'], blockedNote: 'blocked again' });
+    now += 10 * 60_000;
+    automation.publishBadges();
+    await flush();
+    expect(sentTo(BRAIN, 'brain-heartbeat').length).toBeGreaterThanOrEqual(1);
+  });
+
+  it('does not resurrect a stale blocked flag after a persisted Brain resolution', async () => {
+    getTaskPairStore().savePair(PROJECT, {
+      taskId: 'brain-stale-resolved', brain: BRAIN, status: 'working', flags: ['blocked'],
+      flagSides: { blocked: 'executor' }, blockedNote: 'old wait',
+      lastWaitResolution: { writer: BRAIN, note: 'resolved earlier', at: now - 1_000 },
+      round: 1, blocking: ['P0'], previousAuditors: [], capCounts: {}, capRound: 0,
+      createdAt: now - 60_000, updatedAt: now - 60_000, executor: EXEC, auditor: AUD,
+    } satisfies TaskPairState);
+    automation.publishBadges();
+    await flush();
+    expect(sentTo(BRAIN, 'brain-heartbeat')).toHaveLength(0);
+    expect(getSupervisionHeartbeatProjection(BRAIN)?.state ?? 'off').toBe('off');
+  });
+
+  it('pauses the main heartbeat on NEEDS_INPUT and re-arms after a real user message', async () => {
+    getTaskPairStore().savePair(PROJECT, {
+      taskId: 'brain-blocked', brain: BRAIN, status: 'passed', flags: ['blocked'], flagSides: {}, round: 1,
+      blocking: ['P0'], previousAuditors: [], capCounts: {}, capRound: 0, createdAt: now, updatedAt: now,
+      executor: EXEC, auditor: AUD,
+    } satisfies TaskPairState);
+    automation.publishBadges();
+    expect(getSupervisionHeartbeatProjection(BRAIN)?.state).toBe('armed');
+    automation.observeTimelineEvent({ sessionId: BRAIN, type: 'agent.status', payload: { status: 'supervision_needs_input' } });
+    expect(getSupervisionHeartbeatProjection(BRAIN)).toMatchObject({ state: 'paused_needs_input', kind: 'pair' });
+    automation.observeTimelineEvent({ sessionId: BRAIN, type: 'user.message', payload: { text: 'I have decided', automation: false } });
+    expect(getSupervisionHeartbeatProjection(BRAIN)).toMatchObject({ state: 'armed', kind: 'pair' });
+    await flush();
+    expect(sentTo(BRAIN, 'brain-heartbeat')).toHaveLength(0);
+    now += 10 * 60_000;
+    automation.publishBadges();
+    await flush();
+    expect(sentTo(BRAIN, 'brain-heartbeat')).toHaveLength(1);
+  });
+
+  it('pauses the main heartbeat on the Brain NEEDS_DECISION marker (final reply only), leaves pair state alone, and re-arms after the user replies', async () => {
+    getTaskPairStore().savePair(PROJECT, {
+      taskId: 'brain-needs-decision', brain: BRAIN, status: 'passed', flags: [], flagSides: {}, round: 1,
+      blocking: ['P0'], previousAuditors: [], capCounts: {}, capRound: 0, createdAt: now, updatedAt: now,
+      executor: EXEC, auditor: AUD,
+    } satisfies TaskPairState);
+    automation.publishBadges();
+    expect(getSupervisionHeartbeatProjection(BRAIN)?.state).toBe('armed');
+    // A streamed delta is not the final reply: it must not pause.
+    automation.observeTimelineEvent({ sessionId: BRAIN, type: 'assistant.text', payload: { text: '<!-- IMCODES_TASK NEEDS_DECISION - note="x" -->', streaming: true } });
+    expect(getSupervisionHeartbeatProjection(BRAIN)?.state).toBe('armed');
+    automation.observeTimelineEvent({
+      sessionId: BRAIN, type: 'assistant.text',
+      payload: { text: 'Stuck on the schema choice.\n<!-- IMCODES_TASK NEEDS_DECISION - note="pick A or B" -->', streaming: false },
+    });
+    expect(getSupervisionHeartbeatProjection(BRAIN)).toMatchObject({ state: 'paused_needs_input', kind: 'pair' });
+    expect(pair('brain-needs-decision')).toMatchObject({ status: 'passed', flags: [] });
+    now += 10 * 60_000;
+    automation.publishBadges();
+    await flush();
+    expect(sentTo(BRAIN, 'brain-heartbeat')).toHaveLength(0);
+    automation.observeTimelineEvent({ sessionId: BRAIN, type: 'user.message', payload: { text: 'option A', automation: false } });
+    expect(getSupervisionHeartbeatProjection(BRAIN)).toMatchObject({ state: 'armed', kind: 'pair' });
+  });
+
+  it('NEEDS_DECISION: ignores a participant and an automation echo; the pause outlives a stretch with nothing for Brain and ends with the last open pair', async () => {
+    const save = (taskId: string, status: TaskPairState['status']) => getTaskPairStore().savePair(PROJECT, {
+      taskId, brain: BRAIN, status, flags: [], flagSides: {}, round: 1,
+      blocking: ['P0'], previousAuditors: [], capCounts: {}, capRound: 0, createdAt: now, updatedAt: now,
+      executor: EXEC, auditor: AUD,
+    } satisfies TaskPairState);
+    const text = 'Stuck.\n<!-- IMCODES_TASK NEEDS_DECISION - note="pick A or B" -->';
+    save('nd-keep', 'passed');
+    automation.publishBadges();
+    expect(getSupervisionHeartbeatProjection(BRAIN)?.state).toBe('armed');
+    // A participant writing it, or a daemon-authored automation text, pauses nothing.
+    automation.observeTimelineEvent({ sessionId: EXEC, type: 'assistant.text', payload: { text, streaming: false } });
+    automation.observeTimelineEvent({ sessionId: BRAIN, type: 'assistant.text', payload: { text, streaming: false, automation: true } });
+    expect(getSupervisionHeartbeatProjection(BRAIN)?.state).toBe('armed');
+    // Paused by the Brain; then nothing needs Brain for a while (the pair goes back to working).
+    automation.observeTimelineEvent({ sessionId: BRAIN, type: 'assistant.text', payload: { text, streaming: false } });
+    expect(getSupervisionHeartbeatProjection(BRAIN)?.state).toBe('paused_needs_input');
+    save('nd-keep', 'working');
+    automation.publishBadges();
+    expect(getSupervisionHeartbeatProjection(BRAIN)?.state ?? 'off').toBe('off');
+    // The pair needs Brain again: still paused, nothing delivered, the user has not replied.
+    save('nd-keep', 'passed');
+    now += 10 * 60_000;
+    automation.publishBadges();
+    await flush();
+    expect(getSupervisionHeartbeatProjection(BRAIN)).toMatchObject({ state: 'paused_needs_input' });
+    expect(sentTo(BRAIN, 'brain-heartbeat')).toHaveLength(0);
+    // All tasks finished: the pause is dropped with the last open pair, so a later task starts clean.
+    save('nd-keep', 'done');
+    automation.publishBadges();
+    save('nd-next', 'passed');
+    automation.publishBadges();
+    expect(getSupervisionHeartbeatProjection(BRAIN)).toMatchObject({ state: 'armed' });
+  });
+
+  it('judges the Brain busy at the moment of sending, not by the first look of a tick that is still running', async () => {
+    getTaskPairStore().savePair(PROJECT, {
+      taskId: 'brain-stale-busy', brain: BRAIN, status: 'passed', flags: [], flagSides: {}, round: 1,
+      blocking: ['P0'], previousAuditors: [], capCounts: {}, capRound: 0, createdAt: now, updatedAt: now,
+      executor: EXEC, auditor: AUD,
+    } satisfies TaskPairState);
+    // Events call publishBadges() while a tick is awaiting: do the same from inside the tick (the
+    // busy probe is read by it), once with the Brain idle (that look enters the tick snapshot) and
+    // once after the Brain became busy.
+    let interleaved = 0;
+    const seen: string[] = []; // asserted after the tick: it swallows errors thrown inside it
+    const probing = new TaskPairAutomation({
+      now: () => now,
+      importLegacy: () => undefined,
+      mainCheckoutRoots: () => [],
+      brainMainCheckoutActive: () => false,
+      isBusy: (name) => {
+        if (name !== BRAIN && interleaved === 0) {
+          interleaved += 1;
+          probing.publishBadges();
+          seen.push(getSupervisionHeartbeatProjection(BRAIN)?.state ?? 'off');
+          busy.add(BRAIN);
+          probing.publishBadges();
+          seen.push(getSupervisionHeartbeatProjection(BRAIN)?.state ?? 'off');
+        }
+        return busy.has(name);
+      },
+    });
+    taskPairService.setScheduler(probing);
+    await probing.tick();
+    expect(interleaved).toBe(1);
+    expect(seen).toEqual(['armed', 'off']);
+    expect(sentTo(BRAIN, 'brain-heartbeat')).toHaveLength(0);
+  });
+
+  describe('NEXT_ROUND: what changes for the logic that depends on the passed state', () => {
+    async function passRoundOne(taskId: string) {
+      marker(BRAIN, `<!-- IMCODES_TASK DISPATCH ${taskId} executor=${EXEC} auditor=${AUD} -->`);
+      await flush();
+      marker(EXEC, `<!-- IMCODES_TASK READY_FOR_AUDIT ${taskId} worktree=/ws/${taskId} head=${'1'.repeat(40)} -->`);
+      await flush();
+      marker(AUD, `<!-- IMCODES_TASK PASS ${taskId} blocking=P0 -->`);
+      await flush();
+      expect(pair(taskId).status).toBe('passed');
+    }
+
+    it('Brain heartbeat: a passed pair is an actionable Brain wait, a working round is not', async () => {
+      await passRoundOne('NR1');
+      automation.publishBadges();
+      expect(getSupervisionHeartbeatProjection(BRAIN)).toMatchObject({ state: 'armed', kind: 'pair' });
+      marker(BRAIN, '<!-- IMCODES_TASK NEXT_ROUND NR1 -->');
+      await flush();
+      expect(pair('NR1').status).toBe('working');
+      automation.publishBadges();
+      expect(getSupervisionHeartbeatProjection(BRAIN)?.state ?? 'off').toBe('off');
+      // No "audit passed; commit and DONE" reminder reaches Brain for the new round.
+      now += 30 * 60_000;
+      automation.publishBadges();
+      await flush();
+      expect(sentTo(BRAIN, 'brain-heartbeat')).toHaveLength(0);
+    });
+
+    it('participant heartbeat: the new round is nudged as ordinary work, not with the passed "commit and DONE" text', async () => {
+      await passRoundOne('NR2');
+      marker(BRAIN, '<!-- IMCODES_TASK NEXT_ROUND NR2 -->');
+      await flush();
+      sent = [];
+      await tick(2);
+      const nudges = sentTo(EXEC, 'nudge-executor');
+      expect(nudges.length).toBeGreaterThan(0);
+      expect(nudges[0]!.text).toContain('Continue the task');
+      expect(nudges[0]!.text).not.toContain('PASS received');
+    });
+
+    it('concurrency slot: the pair holds its slot through passed -> next round -> DONE, and the queue only drains when it ends', async () => {
+      candidates = [SPARE, SPARE2];
+      marker(BRAIN, '<!-- IMCODES_TASK QUEUE - max=1 -->');
+      await passRoundOne('NR3');
+      marker(BRAIN, '<!-- IMCODES_TASK QUEUE NRQ title="Waiting" -->\nbrief\n<!-- IMCODES_TASK_END NRQ -->');
+      await flush();
+      await tick(1);
+      expect(pair('NRQ').status).toBe('queued');
+      marker(BRAIN, '<!-- IMCODES_TASK NEXT_ROUND NR3 -->');
+      await flush();
+      await tick(1);
+      expect(pair('NR3').status).toBe('working');
+      expect(pair('NRQ').status).toBe('queued');
+      marker(EXEC, `<!-- IMCODES_TASK READY_FOR_AUDIT NR3 worktree=/ws/NR3 head=${'2'.repeat(40)} -->`);
+      await flush();
+      marker(AUD, '<!-- IMCODES_TASK PASS NR3 blocking=P0 -->');
+      await flush();
+      expect(pair('NR3').status).toBe('passed');
+      marker(EXEC, '<!-- IMCODES_TASK DONE NR3 -->');
+      await flush();
+      expect(pair('NR3').status).toBe('done');
+      await tick(1);
+      expect(pair('NRQ').status).not.toBe('queued');
+    });
+
+    it('the next round stays the same single pair with the same participants (no duplicate pair)', async () => {
+      await passRoundOne('NR4');
+      marker(BRAIN, '<!-- IMCODES_TASK NEXT_ROUND NR4 -->');
+      await flush();
+      expect(getTaskPairStore().listActivePairs(PROJECT).filter((entry) => entry.state.taskId === 'NR4')).toHaveLength(1);
+      expect(pair('NR4')).toMatchObject({ deliveryRound: 2, executor: EXEC, auditor: AUD });
+    });
+  });
+
+  it('clears the Brain projection when the last open pair ends', () => {
+    getTaskPairStore().savePair(PROJECT, {
+      taskId: 'brain-clear', brain: BRAIN, status: 'passed', flags: [], flagSides: {}, round: 1,
+      blocking: ['P0'], previousAuditors: [], capCounts: {}, capRound: 0, createdAt: now, updatedAt: now,
+      executor: EXEC, auditor: AUD,
+    } satisfies TaskPairState);
+    automation.publishBadges();
+    expect(getSupervisionHeartbeatProjection(BRAIN)?.state).toBe('armed');
+    getTaskPairStore().savePair(PROJECT, { ...pair('brain-clear'), status: 'done', updatedAt: now });
+    automation.publishBadges();
+    expect(getSupervisionHeartbeatProjection(BRAIN)?.state ?? 'off').toBe('off');
+  });
+
+  it('reconstructs a paused Brain projection from the durable awaiting-decision state after restart', () => {
+    getTaskPairStore().savePair(PROJECT, {
+      taskId: 'brain-restart', brain: BRAIN, status: 'awaiting_brain_decision', flags: [], flagSides: {}, round: 1,
+      blocking: ['P0'], previousAuditors: [], capCounts: {}, capRound: 0, createdAt: now, updatedAt: now,
+      executor: EXEC, auditor: AUD,
+    } satisfies TaskPairState);
+    automation.publishBadges();
+    expect(getSupervisionHeartbeatProjection(BRAIN)).toMatchObject({ state: 'paused_needs_input', kind: 'pair' });
+    clearSupervisionHeartbeatProjectionsForTests();
+    const restarted = new TaskPairAutomation({ now: () => now, isBusy: (name) => busy.has(name) });
+    restarted.publishBadges();
+    expect(getSupervisionHeartbeatProjection(BRAIN)).toMatchObject({ state: 'paused_needs_input', kind: 'pair' });
+  });
+
+  it('imports in-flight legacy tasks of a project switched back to pairs on the next tick, without a restart', async () => {
+    const registry = getSupervisionTaskRegistry();
+    delete process.env.IMCODES_SUPERVISION_ENGINE;
+    getTaskPairStore().setProjectEngine(PROJECT, 'legacy');
+    expect(registry.createOrGet({
+      taskId: 'tsk_flip', projectName: PROJECT, classification: 'independent_top_level', objective: 'created during rollback',
+    } as never).ok).toBe(true);
+    const live = new TaskPairAutomation({ now: () => now, importLegacy: undefined, isBusy: () => true, isLimited: () => false });
+    await live.tick();
+    expect(getTaskPairStore().getPairByLegacyTaskId('tsk_flip')).toBeUndefined();
+    getTaskPairStore().setProjectEngine(PROJECT, 'pairs');
+    await live.tick();
+    expect(getTaskPairStore().getPairByLegacyTaskId('tsk_flip')?.state).toMatchObject({ taskId: 'tsk_flip', title: '(untitled task)' });
+  });
+
+  it('answers pool leases and counts from open pairs on the pairs engine', async () => {
+    marker(BRAIN, `<!-- IMCODES_TASK DISPATCH T10 executor=${EXEC} auditor=${AUD} pool=economy -->`);
+    await flush();
+    expect(await defaultHasActiveSupervisionLease(EXEC)).toBe(true);
+    expect(await defaultHasActiveSupervisionLease(SPARE)).toBe(false);
+    const brain = session(BRAIN, 'brain');
+    expect(await defaultCountActiveSupervisionAssignments(brain, 'economy')).toBe(1);
+    expect(await defaultCountActiveSupervisionAssignments(brain, 'primary')).toBe(0);
+  });
+});
+
+describe('task-pair pool candidates', () => {
+  const previousEngine = process.env.IMCODES_SUPERVISION_ENGINE;
+  beforeEach(() => {
+    process.env.IMCODES_SUPERVISION_ENGINE = 'pairs';
+    setTaskPairStoreForTests(new TaskPairStore(':memory:'));
+  });
+  afterEach(() => {
+    setTaskPairStoreForTests(undefined);
+    if (previousEngine === undefined) delete process.env.IMCODES_SUPERVISION_ENGINE;
+    else process.env.IMCODES_SUPERVISION_ENGINE = previousEngine;
+  });
+
+  it('with no execution pool configured an automatic (unnamed) role picks only idle same-vendor secondary-tier sub-sessions (sonnet for an anthropic Brain)', () => {
+    const sessions = [
+      session(BRAIN, 'brain'),
+      session('deck_sub_codex', 'w1', { parentSession: BRAIN, agentType: 'codex-sdk', activeModel: 'gpt-5.5', updatedAt: 1 }),
+      session('deck_sub_opus_new', 'w2', { parentSession: BRAIN, activeModel: 'claude-opus-5-5', updatedAt: 50 }),
+      session('deck_sub_opus_old', 'w3', { parentSession: BRAIN, activeModel: 'claude-opus-4-8', updatedAt: 10 }),
+      session('deck_sub_sonnet', 'w7', { parentSession: BRAIN, activeModel: 'claude-sonnet-5', updatedAt: 1 }),
+      session('deck_sub_haiku', 'w4', { parentSession: BRAIN, activeModel: 'claude-haiku-4-5', updatedAt: 5 }),
+      session('deck_sub_busy', 'w5', { parentSession: BRAIN, activeModel: 'claude-opus-5-5', state: 'running', updatedAt: 2 }),
+      session('deck_sub_foreign', 'w6', { parentSession: 'deck_other_brain', projectName: 'otherproj', activeModel: 'claude-opus-5-5', updatedAt: 3 }),
+      session('deck_schedproj_w9', 'w9', { activeModel: 'claude-opus-5-5', updatedAt: 4 }),
+      session('deck_sub_nomodel', 'w8', { parentSession: BRAIN, updatedAt: 0 }),
+    ];
+    const picked = listTaskPairCandidates({
+      brain: BRAIN, role: 'auditor', pool: 'primary', exclude: new Set(),
+    }, { listSessions: () => sessions, hasPendingMessages: () => false });
+    // Owner rule (2026-10): with no execution pool configured the default is the Brain's idle sub-sessions of the SAME provider family
+    // running that family's secondary model: sonnet for an anthropic Brain. Not the flagship (opus), not the small model (haiku), not
+    // another vendor (codex), not a busy, foreign-project, non-sub-session or model-less session.
+    expect(picked.map((entry) => entry.name)).toEqual(['deck_sub_sonnet']);
+    // A named model still wins regardless (unaffected by this owner rule).
+    const namedPick = listTaskPairCandidates({
+      brain: BRAIN, role: 'auditor', pool: 'primary', exclude: new Set(), requestedModel: 'claude-opus-4-8',
+    }, { listSessions: () => sessions, hasPendingMessages: () => false });
+    expect(namedPick.map((entry) => entry.name)).toEqual(['deck_sub_opus_old']);
+  });
+});
+
+describe('no execution pool configured: ask the user instead of guessing (owner rule)', () => {
+  const NP_EXEC = 'deck_sub_noolexec';
+  const NP_AUD = 'deck_sub_noolaud';
+  const previousEngine = process.env.IMCODES_SUPERVISION_ENGINE;
+  let npNow = 2_000_000;
+  let npSent: Array<{ target: string; text: string; id: string }>;
+  let npAutomation: TaskPairAutomation;
+
+  function brainSession(executionPools?: unknown): SessionRecord {
+    return session(BRAIN, 'brain', executionPools ? {
+      transportConfig: { supervision: normalizeSessionSupervisionSnapshot({ mode: SUPERVISION_MODE.OFF, executionPools }) },
+    } as Partial<SessionRecord> : {});
+  }
+  function npMarker(writer: string, line: string) {
+    return taskPairService.ingestText(PROJECT, writer, line, `noolturn-${Math.random()}`, npNow);
+  }
+  function npPair(taskId: string) {
+    return getTaskPairStore().getPair(PROJECT, taskId)!.state;
+  }
+  async function npTick(times = 1) {
+    for (let i = 0; i < times; i += 1) { npNow += 6 * 60_000; await npAutomation.tick(); }
+  }
+  async function npFlush() {
+    for (let i = 0; i < 5; i += 1) await new Promise<void>((resolve) => setImmediate(resolve));
+  }
+  function npSentTo(target: string, reasonPart?: string) {
+    return npSent.filter((entry) => entry.target === target && (!reasonPart || entry.id.includes(`:${reasonPart}`)));
+  }
+
+  beforeEach(() => {
+    process.env.IMCODES_SUPERVISION_ENGINE = 'pairs';
+    setTaskPairStoreForTests(new TaskPairStore(':memory:'));
+    npSent = [];
+    setTaskPairDeliveryDepsForTests({ send: async (target, text, id) => { npSent.push({ target, text, id }); } });
+    upsertSession(brainSession());
+    upsertSession(session(NP_EXEC, 'w1', { parentSession: BRAIN, agentType: 'codex-sdk', activeModel: 'gpt-5.6' }));
+    upsertSession(session(NP_AUD, 'w2', { parentSession: BRAIN, agentType: 'claude-code-sdk', activeModel: 'opus' }));
+    // No pickCandidate/provision deps injected: the real pool.ts logic (and
+    // therefore the real no-pool-configured gate) runs for these tests.
+    npAutomation = new TaskPairAutomation({ now: () => npNow, importLegacy: () => undefined });
+    taskPairService.setScheduler(npAutomation);
+  });
+  afterEach(() => {
+    taskPairService.setScheduler(undefined);
+    setTaskPairDeliveryDepsForTests(undefined);
+    setTaskPairStoreForTests(undefined);
+    for (const name of [BRAIN, NP_EXEC, NP_AUD]) removeSession(name);
+    if (previousEngine === undefined) delete process.env.IMCODES_SUPERVISION_ENGINE;
+    else process.env.IMCODES_SUPERVISION_ENGINE = previousEngine;
+  });
+
+  it('picks nothing for a no-pool project and sends one batched ask-the-user notice, not repeated every tick', async () => {
+    npMarker(BRAIN, '<!-- IMCODES_TASK QUEUE NP1 -->\nbrief\n<!-- IMCODES_TASK_END NP1 -->');
+    await npFlush();
+    await npTick(1);
+    expect(npPair('NP1')).toMatchObject({ status: 'queued', flags: ['no_pool_configured'] });
+    expect(npSentTo(BRAIN, 'brain-no-pool-ask')).toHaveLength(1);
+    expect(npSentTo(BRAIN, 'brain-no-pool-ask')[0]!.text).toContain('NP1');
+    await npTick(1);
+    expect(npSentTo(BRAIN, 'brain-no-pool-ask')).toHaveLength(1);
+  });
+
+  it('naming executormodel=/auditormodel= on QUEUE starts the pair even with no pool configured', async () => {
+    npMarker(BRAIN, '<!-- IMCODES_TASK QUEUE NP2 executormodel=gpt-5.6 auditormodel=opus -->\nbrief\n<!-- IMCODES_TASK_END NP2 -->');
+    await npFlush();
+    await npTick(1);
+    expect(npPair('NP2')).toMatchObject({ status: 'working', executor: NP_EXEC, auditor: NP_AUD });
+  });
+
+  it('configuring a pool starts a previously-waiting pair automatically', async () => {
+    npMarker(BRAIN, '<!-- IMCODES_TASK QUEUE NP3 -->\nbrief\n<!-- IMCODES_TASK_END NP3 -->');
+    await npFlush();
+    await npTick(1);
+    expect(npPair('NP3').flags).toContain('no_pool_configured');
+
+    const auditorModel = normalizeSupervisionExecutionModel('claude-code-sdk', 'opus');
+    const auditorConfig = { agentType: 'claude-code-sdk', providerFamily: 'anthropic', runtimeType: 'process' as const, model: auditorModel };
+    const pools = {
+      state: 'configured' as const,
+      economyTaskPool: { configs: [], controls: { leaseMs: 900000, maxSpawned: 2, changeBudget: 40, maxConcurrency: 4, auditHeadroomPerProviderFamily: 1 } },
+      primaryDevelopmentPool: {
+        configs: [
+          { agentType: 'codex-sdk', providerFamily: 'openai', runtimeType: 'process' as const, model: 'gpt-5.6', capabilityId: 'supervision-exec-v1:process:codex-sdk:openai:gpt-5.6', role: 'executor' as const },
+          { ...auditorConfig, capabilityId: buildSupervisionExecutionCapabilityId(auditorConfig), role: 'auditor' as const },
+        ],
+        controls: { leaseMs: 1800000, maxSpawned: 2, changeBudget: 200, maxConcurrency: 4, auditHeadroomPerProviderFamily: 1 },
+      },
+    };
+    upsertSession(brainSession(pools));
+    await npTick(1);
+    expect(npPair('NP3')).toMatchObject({ status: 'working' });
+  });
+
+  it('auditor=none still needs an executor model when no pool is configured', async () => {
+    npMarker(BRAIN, '<!-- IMCODES_TASK QUEUE NP4 auditor=none -->\nbrief\n<!-- IMCODES_TASK_END NP4 -->');
+    await npFlush();
+    await npTick(1);
+    expect(npPair('NP4')).toMatchObject({ status: 'queued', flags: ['no_pool_configured'] });
+
+    // Naming the executor model alone is enough (no auditor model needed for auditor=none).
+    npMarker(BRAIN, '<!-- IMCODES_TASK QUEUE NP4 executormodel=gpt-5.6 -->');
+    await npFlush();
+    await npTick(1);
+    expect(npPair('NP4')).toMatchObject({ status: 'working', executor: NP_EXEC, auditor: 'none' });
+  });
+});

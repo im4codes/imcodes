@@ -10,6 +10,7 @@ import {
 } from '../../shared/peer-audit.js';
 import { timelineEmitter } from './timeline-emitter.js';
 import { incrementCounter } from '../util/metrics.js';
+import { getSupervisionTaskRegistry } from './supervision-state-store.js';
 
 const PEER_AUDIT_METRIC_REASONS = new Set([
   'none',
@@ -78,6 +79,22 @@ export function emitPeerAuditResult(input: {
   const reason = input.reason
     ? truncateUtf8(sanitizePeerAuditUntrustedText(input.reason), 256)
     : undefined;
+  // A formal audit's attempt id is daemon-minted and uniquely bound to its
+  // auditor assignment in the registry. Resolve the objective there rather
+  // than trusting findings text or a renderer-side task lookup. Quick/legacy
+  // audits have no such row and retain their existing generic card safely.
+  let supervisionTask;
+  let round: number | undefined;
+  try {
+    const registry = getSupervisionTaskRegistry();
+    supervisionTask = registry.getAuditSupervisionTaskProjection(input.attemptId);
+    round = supervisionTask
+      ? registry.getAuditRound(supervisionTask.taskId, input.attemptId)
+      : undefined;
+  } catch {
+    supervisionTask = undefined;
+    round = undefined;
+  }
   timelineEmitter.emit(input.auditedSessionName, 'peer_audit.result', {
     memoryExcluded: true,
     trigger: input.trigger,
@@ -88,6 +105,8 @@ export function emitPeerAuditResult(input: {
     ...(input.disposition ? { disposition: input.disposition } : {}),
     ...(findingsPreview ? { findingsPreview } : {}),
     ...(reason ? { reason } : {}),
+    ...(round ? { round } : {}),
+    ...(supervisionTask ? { supervisionTask } : {}),
   }, { source: 'daemon', confidence: 'high', eventId });
   incrementCounter('peer_audit.terminal', {
     contractVersion: PEER_AUDIT_CONTRACT_VERSION,

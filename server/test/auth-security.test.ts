@@ -1,10 +1,12 @@
 /**
  * Security tests: cookie path, per-user rate limiting, JWT_SIGNING_KEY length
  */
+import { activeUserAnswer } from './helpers/user-status.js';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { buildApp } from '../src/index.js';
 import type { Env } from '../src/env.js';
 import type { Database } from '../src/db/client.js';
+import { buildAppContentSecurityPolicy } from '../../shared/app-content-security-policy.js';
 import { COOKIE_SESSION } from '../../shared/cookie-names.js';
 import { EXPECTED_USER_ID_HEADER } from '../../shared/http-header-names.js';
 import { AUTH_IDENTITY_ERRORS } from '../../shared/auth-identity.js';
@@ -14,7 +16,7 @@ import { AUTH_IDENTITY_ERRORS } from '../../shared/auth-identity.js';
 function makeMemDb(): Database {
   const users = new Map<string, { id: string; created_at: number; is_admin: boolean; status: string }>();
   const apiKeys = new Map<string, { id: string; user_id: string; key_hash: string; created_at: number; revoked_at: number | null; grace_expires_at: number | null }>();
-  const refreshTokens = new Map<string, { id: string; user_id: string; token_hash: string; family_id: string; expires_at: number; created_at: number; used_at: number | null }>();
+  const refreshTokens = new Map<string, { id: string; user_id: string; token_hash: string; family_id: string; expires_at: number; created_at: number; used_at: number | null, owner_status: 'active' }>();
   // auth_lockout: identity → { fail_count, first_fail_at, locked_until }
   const lockout = new Map<string, { identity: string; fail_count: number; first_fail_at: Date; locked_until: Date | null }>();
   const auditLog: unknown[] = [];
@@ -25,6 +27,7 @@ function makeMemDb(): Database {
 
   return {
     queryOne: async <T = unknown>(sql: string, params: unknown[] = []): Promise<T | null> => {
+      { const activeUser = activeUserAnswer(sql); if (activeUser) return activeUser as never; }
       const s = normalize(sql);
 
       if (s.includes('from users where id')) {
@@ -32,7 +35,7 @@ function makeMemDb(): Database {
       }
       if (s.includes('from api_keys where key_hash')) {
         for (const k of apiKeys.values()) {
-          if (k.key_hash === params[0] && !k.revoked_at) return { user_id: k.user_id } as T;
+          if (k.key_hash === params[0] && !k.revoked_at) return { user_id: k.user_id, user_status: 'active' } as T;
         }
         return null;
       }
@@ -98,7 +101,7 @@ function makeMemDb(): Database {
         refreshTokens.set(params[0] as string, {
           id: params[0] as string,
           user_id: params[1] as string,
-          token_hash: params[2] as string,
+          token_hash: params[2] as string, owner_status: 'active',
           family_id: params[3] as string,
           expires_at: params[4] as number,
           created_at: params[5] as number,
@@ -187,6 +190,73 @@ describe('share ticket auth boundary', () => {
 
     expect(bearerAuth).toBeNull();
     expect(cookieAuth).toBeNull();
+  });
+
+  it('does not accept shared machine authority as ordinary API auth', async () => {
+    const env = makeEnv();
+    const { resolveAuth } = await import('../src/security/authorization.js');
+    const { signJwt } = await import('../src/security/crypto.js');
+    const token = signJwt({
+      type: 'shared-session-machine-authority', sub: 'participant-1', sourceServerId: 'srv-1',
+      sessionName: 'deck_a', projectName: 'project-a',
+      shareTarget: { kind: 'main', serverId: 'srv-1', sessionName: 'deck_a' }, actionId: 'action-1',
+    }, env.JWT_SIGNING_KEY, 60);
+    for (const headers of [
+      { authorization: `Bearer ${token}` },
+      { cookie: `${COOKIE_SESSION}=${encodeURIComponent(token)}` },
+    ]) {
+      await expect(resolveAuth({
+        env,
+        req: { header: (name: string) => headers[name.toLowerCase() as keyof typeof headers] },
+      } as never)).resolves.toBeNull();
+    }
+  });
+});
+
+/**
+ * tsk_854675e1e2: a special-purpose JWT (the 24 h shared-session machine authority minted for a share participant, the capability
+ * blob token, a relay token) is signed with the same key and carries `sub`. The account-session checks in /api/auth/* excluded only
+ * the two ws tickets by name, so such a token was accepted as the user's login: a malicious daemon that saw a participant's
+ * machine-authority token could mint a persistent API key for that participant. Account auth now accepts ONLY tokens that are login
+ * tokens (no `type`, or type `web`), whatever other types are added later.
+ */
+describe('special-purpose JWTs are not account sessions', () => {
+  const SPECIAL_TYPES = ['shared-session-machine-authority', 'capability-blob', 'auth-relay', 'ws-ticket', 'share-ws-ticket', 'something-added-next-year'];
+
+  it.each(SPECIAL_TYPES)('%s is refused as a Bearer token and as a session cookie, a login token is accepted', async (type) => {
+    const env = makeEnv();
+    const app = buildApp(env);
+    const { signJwt } = await import('../src/security/crypto.js');
+    const registered = await app.request('/api/auth/register', { method: 'POST' });
+    const { userId } = await registered.json() as { userId: string };
+
+    const special = signJwt({ type, sub: userId, sourceServerId: 'srv-1' }, env.JWT_SIGNING_KEY, 60);
+    const viaBearer = await app.request('/api/auth/user/me', { headers: { Authorization: `Bearer ${special}` } });
+    const viaCookie = await app.request('/api/auth/user/me', { headers: { Cookie: `${COOKIE_SESSION}=${encodeURIComponent(special)}` } });
+    expect(viaBearer.status).toBe(401);
+    expect(viaCookie.status).toBe(401);
+
+    for (const login of [signJwt({ sub: userId }, env.JWT_SIGNING_KEY, 60), signJwt({ sub: userId, type: 'web' }, env.JWT_SIGNING_KEY, 60)]) {
+      expect((await app.request('/api/auth/user/me', { headers: { Authorization: `Bearer ${login}` } })).status).toBe(200);
+      expect((await app.request('/api/auth/user/me', { headers: { Cookie: `${COOKIE_SESSION}=${encodeURIComponent(login)}` } })).status).toBe(200);
+    }
+  });
+});
+
+describe('isAccountSessionJwt (the one place that decides what a login token is)', () => {
+  it('accepts a subject with no type or the web type, and nothing else', async () => {
+    const { isAccountSessionJwt } = await import('../src/security/account-session-jwt.js');
+    expect(isAccountSessionJwt({ sub: 'u' })).toBe(true);
+    expect(isAccountSessionJwt({ sub: 'u', type: 'web' })).toBe(true);
+    expect(isAccountSessionJwt({ sub: 'u', type: 'ws-ticket' })).toBe(false);
+    expect(isAccountSessionJwt({ sub: 'u', type: 'shared-session-machine-authority' })).toBe(false);
+    expect(isAccountSessionJwt({ sub: 'u', type: '' })).toBe(false);
+    expect(isAccountSessionJwt({ sub: 'u', type: null })).toBe(false);
+    expect(isAccountSessionJwt({ type: 'web' })).toBe(false);
+    expect(isAccountSessionJwt({ sub: '' })).toBe(false);
+    expect(isAccountSessionJwt({ sub: 7 })).toBe(false);
+    expect(isAccountSessionJwt(null)).toBe(false);
+    expect(isAccountSessionJwt(undefined)).toBe(false);
   });
 });
 
@@ -487,8 +557,11 @@ describe('Security headers on HTML responses', () => {
     expect(source).toContain("'Referrer-Policy': 'no-referrer'");
     expect(source).toContain('Permissions-Policy');
     expect(source).toContain('Content-Security-Policy');
-    expect(source).toContain("worker-src 'self' blob:");
-    expect(source).toContain("frame-ancestors 'none'");
+    // The policy itself is one shared definition; the header is built from it.
+    expect(source).toContain('buildAppContentSecurityPolicy()');
+    const csp = buildAppContentSecurityPolicy();
+    expect(csp).toContain("worker-src 'self' blob:");
+    expect(csp).toContain("frame-ancestors 'none'");
   });
 
   it('SECURITY_HEADERS are applied to HTML responses, not non-HTML', async () => {

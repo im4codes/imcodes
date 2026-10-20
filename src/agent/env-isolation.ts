@@ -78,7 +78,7 @@ export function getAgentEnvVars(agentType: 'claude-code' | 'codex' | 'opencode')
     case 'claude-code':
       return ['ANTHROPIC_API_KEY'];
     case 'codex':
-      return ['OPENAI_API_KEY', 'OPENAI_BASE_URL'];
+      return ['OPENAI_API_KEY', 'OPENAI_BASE_URL', 'OPENAI_MODEL'];
     case 'opencode':
       return ['ANTHROPIC_API_KEY', 'OPENAI_API_KEY'];
   }

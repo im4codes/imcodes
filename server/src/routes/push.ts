@@ -12,6 +12,7 @@
  * servers detect "I have no push credentials configured" and relay everything
  * via POST /api/push/relay back to the central server.
  */
+import { activeUserExistsSql } from '../security/user-status.js';
 import { Hono } from 'hono';
 import type { Env } from '../env.js';
 import type { Database } from '../db/client.js';
@@ -156,7 +157,8 @@ export async function dispatchPush(payload: PushPayload, envOrDb: Env | Database
   let tokens: Array<{ token: string; platform: string }> = [];
   try {
     tokens = await db.query<{ token: string; platform: string }>(
-      'SELECT token, platform FROM push_tokens WHERE user_id = $1',
+      // A disabled user's devices receive nothing (security/user-status.ts); their registrations stay, so enabling the account resumes it.
+      `SELECT t.token, t.platform FROM push_tokens t WHERE t.user_id = $1 AND ${activeUserExistsSql('t.user_id')}`,
       [payload.userId],
     );
   } catch (err) {

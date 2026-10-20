@@ -1,11 +1,12 @@
 import { describe, expect, it } from 'vitest';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync } from 'node:fs';
 import { MEMORY_DEFAULTS } from '../../shared/memory-defaults.js';
+import { readSource } from '../helpers/read-source.js';
 
 const DESIGN_PATH = 'openspec/changes/memory-system-post-1-1-integration/design.md';
 
 function readDesignDefaults(): Record<string, number> {
-  const design = readFileSync(DESIGN_PATH, 'utf8');
+  const design = readSource(DESIGN_PATH);
   const match = design.match(/```json5\n\/\/ design-defaults\n(?<body>\{[\s\S]*?\})\n```/);
   if (!match?.groups?.body) throw new Error('design-defaults JSON5 block not found');
   const entries = [...match.groups.body.matchAll(/^\s*(?<key>[A-Za-z][A-Za-z0-9]*):\s*(?<value>\d+),?\s*$/gm)];

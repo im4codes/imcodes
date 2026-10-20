@@ -1,5 +1,6 @@
 import { spawn } from 'child_process';
 import { cwdPrefix, type AgentDriver, type LaunchOptions, type DeleteBufferFn } from './base.js';
+import { ensureGeminiNativeAgentPolicyFile, geminiNativeAgentFenceFlags } from '../native-agent-fence.js';
 import type { AgentStatus } from '../detect.js';
 import { detectStatus } from '../detect.js';
 
@@ -96,11 +97,13 @@ export class GeminiDriver implements AgentDriver {
 
   buildLaunchCommand(_sessionName: string, opts?: LaunchOptions): string {
     const cwd = cwdPrefix(opts?.cwd);
+    // A process-scoped policy: it applies to resumed conversations too.
+    const fence = opts?.nativeAgentsFenced ? geminiNativeAgentFenceFlags(ensureGeminiNativeAgentPolicyFile()) : '';
     if (opts?.geminiSessionId) {
-      return `${cwd}gemini --yolo --resume ${opts.geminiSessionId}`;
+      return `${cwd}gemini --yolo${fence} --resume ${opts.geminiSessionId}`;
     }
     // Always launch fresh when no UUID — never use --resume latest
-    return `${cwd}gemini --yolo`;
+    return `${cwd}gemini --yolo${fence}`;
   }
 
   buildResumeCommand(_sessionName: string, opts?: LaunchOptions): string {

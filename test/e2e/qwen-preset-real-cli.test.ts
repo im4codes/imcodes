@@ -52,6 +52,12 @@ describeIfQwen('qwen preset real CLI integration', () => {
 
   beforeEach(async () => {
     state.home = await mkdtemp(join(tmpdir(), 'imcodes-qwen-preset-real-'));
+    // The production resolver deliberately honors IMCODES_HOME first. Keep
+    // this mocked-homedir fixture aligned with that explicit state directory
+    // instead of relying on a resolver special case for Vitest.
+    vi.stubEnv('HOME', state.home);
+    vi.stubEnv('USERPROFILE', state.home);
+    vi.stubEnv('IMCODES_HOME', join(state.home, '.imcodes'));
     await mkdir(join(state.home, '.imcodes'), { recursive: true });
     await writeFile(
       join(state.home, '.imcodes', 'cc-presets.json'),
@@ -72,6 +78,7 @@ describeIfQwen('qwen preset real CLI integration', () => {
 
   afterEach(async () => {
     vi.resetModules();
+    vi.unstubAllEnvs();
     if (state.home) await rm(state.home, { recursive: true, force: true });
     state.home = '';
   });

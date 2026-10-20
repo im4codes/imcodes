@@ -1,9 +1,10 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { homedir, tmpdir } from 'node:os';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { imcodesStateDir } from '../util/imcodes-state-dir.js';
 
 const IS_TEST_ENV = !!process.env.VITEST || process.env.NODE_ENV === 'test';
-const STORE_DIR = join(IS_TEST_ENV ? tmpdir() : homedir(), '.imcodes');
+const STORE_DIR = IS_TEST_ENV ? join(tmpdir(), '.imcodes') : imcodesStateDir();
 const STORE_PATH = join(STORE_DIR, 'provider-usage.json');
 const QWEN_OAUTH_DAY_LIMIT = 1000;
 const QWEN_OAUTH_MINUTE_LIMIT = 60;

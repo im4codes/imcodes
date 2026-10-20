@@ -2,8 +2,9 @@
  * P2pChainStatus — chain visualization and status display for P2P Quick Discussion runs.
  * Shows the hop chain (initiator -> targets -> initiator) with status icons and a cancel button.
  */
-import { useMemo, useState, useEffect } from 'preact/hooks';
+import { useMemo } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
+import { ConfirmButton } from './ConfirmButton.js';
 import { mapP2pStatusToUiState } from '@shared/p2p-status.js';
 
 interface Target {
@@ -246,31 +247,19 @@ export function P2pChainStatus({ run, onCancel }: P2pChainStatusProps) {
             )}
           </span>
         )}
-        {isActive(run.status) && (() => {
-          const [confirming, setConfirming] = useState(false);
-          useEffect(() => {
-            if (!confirming) return;
-            const timer = setTimeout(() => setConfirming(false), 3000);
-            return () => clearTimeout(timer);
-          }, [confirming]);
-          return confirming ? (
-            <button
-              type="button"
-              style={{ ...cancelBtnStyle, background: 'rgba(239, 68, 68, 0.3)', borderColor: '#ef4444' }}
-              onClick={() => { onCancel(run.id); setConfirming(false); }}
-            >
-              {t('p2p.confirm_cancel')}
-            </button>
-          ) : (
-            <button
-              type="button"
-              style={cancelBtnStyle}
-              onClick={() => setConfirming(true)}
-            >
-              {t('common.cancel', 'Cancel')}
-            </button>
-          );
-        })()}
+        {/* Was an inline copy of this, with useState/useEffect called inside a
+            conditional IIFE in JSX -- so the hooks ran or did not depending on
+            run.status, and the hook order broke the moment a rendered run went
+            inactive. One component, invoked unconditionally. */}
+        {isActive(run.status) && (
+          <ConfirmButton
+            label={t('common.cancel', 'Cancel')}
+            confirmLabel={t('p2p.confirm_cancel')}
+            onConfirm={() => onCancel(run.id)}
+            style={cancelBtnStyle}
+            confirmStyle={{ ...cancelBtnStyle, background: 'rgba(239, 68, 68, 0.3)', borderColor: '#ef4444' }}
+          />
+        )}
       </div>
 
       {/* Result summary */}

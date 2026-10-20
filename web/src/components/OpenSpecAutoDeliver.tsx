@@ -16,6 +16,7 @@ import {
   type OpenSpecAutoDeliverProjection,
 } from '../openspec-auto-deliver.js';
 import { useNowTicker } from '../hooks/useNowTicker.js';
+import { resolveTaskDurationMs } from '../util/tool-duration.js';
 import { comboModeLabel, useP2pCustomCombos } from './p2p-combos.js';
 
 export interface OpenSpecAutoDeliverLauncherProps {
@@ -126,8 +127,8 @@ function writeDetailsSizePreference(size: { width: number; height: number }): vo
   } catch { /* ignore */ }
 }
 
-function formatElapsed(ms: number): string {
-  const safe = Math.max(0, Math.floor(ms / 1000));
+function formatElapsed(ms: number | undefined): string {
+  const safe = Math.max(0, Math.floor((ms ?? 0) / 1000));
   const h = Math.floor(safe / 3600);
   const m = Math.floor((safe % 3600) / 60);
   const s = safe % 60;
@@ -356,11 +357,14 @@ function formatEvidenceSummary(summary: string | undefined, t: (key: string, opt
   return translateAutoDeliverMessage(summary, t);
 }
 
-function projectionElapsedMs(projection: OpenSpecAutoDeliverProjection, now: number): number {
+function projectionElapsedMs(projection: OpenSpecAutoDeliverProjection, now: number): number | undefined {
   if (projection.visibility !== 'full') return 0;
-  if (typeof projection.elapsedMs === 'number' && Number.isFinite(projection.elapsedMs)) return projection.elapsedMs;
-  if (typeof projection.startedAt === 'number' && Number.isFinite(projection.startedAt)) return now - projection.startedAt;
-  return 0;
+  return resolveTaskDurationMs({
+    durationMs: projection.elapsedMs,
+    startedAt: projection.startedAt,
+    now,
+    terminal: isOpenSpecAutoDeliverTerminalStatus(projection.status),
+  });
 }
 
 function progressPercentText(metric: ProgressMetric, t: TranslationFn): string {

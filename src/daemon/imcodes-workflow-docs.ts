@@ -28,14 +28,30 @@ Notes:
 - Choose targets only from \`imcodes send --list\`. Do not guess raw
   \`deck_<project>_wN\` names: unlisted legacy workers are hidden compatibility
   sessions and are not user-visible conversation targets.
-- Messages are delivered via the daemon's hook server. If the target is busy, the message is queued.
+- Messages are delivered via the daemon's hook server. Inter-session sends append by default (with durable FIFO fallback only when the provider cannot append); use an explicit queue mode only when FIFO waiting is intentional.
 - A \`--reply\` send already arranges for the target's response to be delivered back to this session as a normal incoming message. The send command returns after dispatch; do not poll session state, logs, transcripts, or the target while waiting for that reply.
 - The \`--files\` flag attaches file references; format depends on the target agent type.
+- \`--command\` sends exactly the given text (trimmed) with no sender line, context, files, reply instruction or task binding, for slash commands or raw input (e.g. \`imcodes send --command <target> "/compact"\`). It cannot be combined with \`--reply\` or \`--files\`; the \`send_message\` MCP tool has the same \`command\` parameter.
 - Your session identity is auto-detected from $${IMCODES_SESSION_ENV}. SDK/transport sessions also expose
   $${IMCODES_SESSION_LABEL_ENV} for display only; prefer $${IMCODES_SESSION_ENV} in generated commands because labels
   can be duplicated.
 - If the user wants the agent to coordinate with another session, ask another worker to help, or hand work/results to a sibling session, this is usually actionable through \`imcodes send\` and should not by itself force human intervention.
 `.trim();
+
+/**
+ * Append inter-agent communication docs to a memory string.
+ * Returns the combined memory with send docs appended.
+ *
+ * Kept in this dependency-light module (not memory-inject) on purpose: it is a
+ * pure function of AGENT_SEND_DOCS, and loading memory-inject pulls in ~100
+ * daemon modules (memory recall, timeline, summary sync, metrics).
+ */
+export function appendAgentSendDocs(memory: string | null): string {
+  if (memory?.trim()) {
+    return `${memory.trim()}\n\n${AGENT_SEND_DOCS}`;
+  }
+  return AGENT_SEND_DOCS;
+}
 
 export const OPENSPEC_WORKFLOW_DOCS = `
 ## OpenSpec Workflow

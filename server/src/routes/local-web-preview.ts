@@ -1,4 +1,5 @@
 import { Hono } from 'hono';
+import { NODE_ROLE } from '../../../shared/remote-exec.js';
 import { getCookie, setCookie } from 'hono/cookie';
 import type { Env } from '../env.js';
 import { requireAuth, resolveAuth } from '../security/authorization.js';
@@ -138,6 +139,14 @@ localWebPreviewRoutes.all('/:id/local-web/:previewId/*', async (c) => {
   const previewId = c.req.param('previewId')!;
   const previewAccessToken = new URL(c.req.url).searchParams.get(PREVIEW_ACCESS_TOKEN_QUERY_PARAM) ?? getCookie(c, COOKIE_PREVIEW_ACCESS) ?? null;
   const auth = await resolveAuth(c);
+  // A controlled node's credential resolves to the userId of the account that
+  // owns it, and `resolveLocalPreviewAccess` lets a session stand in for the
+  // preview token. Without this it could read the owner's local previews by
+  // presenting its own token. A controlled node may be controlled; it may not
+  // act as its owner.
+  const previewSession = auth && auth.nodeRole !== NODE_ROLE.CONTROLLED
+    ? { userId: auth.userId }
+    : null;
 
   // Pure peek/verify — NO side effects (no touch / no Set-Cookie / no TTL
   // renewal) until owner + current role + token/session ALL pass. HTTP and WS
@@ -147,7 +156,7 @@ localWebPreviewRoutes.all('/:id/local-web/:previewId/*', async (c) => {
     serverId,
     previewId,
     previewAccessToken,
-    session: auth ? { userId: auth.userId } : null,
+    session: previewSession,
   });
   if (!access.ok) {
     return c.json({ error: access.error }, access.status);
