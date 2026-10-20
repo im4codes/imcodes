@@ -226,7 +226,7 @@ export async function expandAgentSkillReferences(
       if (!skill.displayPath?.startsWith('~/.agents/skills/')) {
         const registry = getSkillRegistryManagementSnapshot({ projectDir: context.projectDir, homeDir });
         const entry = registry.entries.find((candidate) => candidate.uri === skill.uri);
-        if (entry?.path) skillPath = join(entry.path, AGENT_SKILL_FILE_NAME);
+        if (entry?.path) skillPath = entry.path.endsWith(AGENT_SKILL_FILE_NAME) ? entry.path : join(entry.path, AGENT_SKILL_FILE_NAME);
       }
       const content = await readFile(skillPath, 'utf8');
       if (!content.trim() || Buffer.byteLength(content, 'utf8') > MAX_SKILL_FILE_BYTES) {
