@@ -4908,7 +4908,7 @@ async function handleSendBound(cmd: Record<string, unknown>, serverLink: ServerL
   // Skill markers are kept in the user-facing timeline, while the daemon
   // reads only known ~/.agents/skills/<name>/SKILL.md files for the provider
   // copy. Unknown or malformed references remain literal and recoverable.
-  const skillExpansion = await expandAgentSkillReferences(displayText);
+  const skillExpansion = await expandAgentSkillReferences(displayText, undefined, { projectDir: record.projectDir });
   const skillProviderText = skillExpansion.text !== displayText ? skillExpansion.text : undefined;
   // Alias quick-insert expansion (A′) — pure/synchronous, computed ONCE here and
   // reused by every dispatch branch below. The timeline ALWAYS uses `displayText`
