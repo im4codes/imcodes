@@ -8,6 +8,7 @@
  */
 
 import { MACHINE_CONFIG_REQUEST_ERROR } from './machine-config-request.js';
+import type { SkillLayer } from './skill-store.js';
 
 /** The `skills` CLI every daemon runs, pinned so one release behaves one way. */
 export const AGENT_SKILLS_CLI_PACKAGE = 'skills@1.7.0' as const;
@@ -79,6 +80,12 @@ export interface AgentSkillEntry {
    * not have: installed, the skill would load but could not work.
    */
   missingBins?: string[];
+  /** Runtime registry layer that made this skill visible. */
+  layer?: SkillLayer;
+  /** Provider-safe path or opaque skill:// URI; never an absolute host path. */
+  displayPath?: string;
+  /** Stable registry identity used to disambiguate duplicate names. */
+  uri?: string;
 }
 
 /** A command name a skill may require; anything else is ignored. */
@@ -127,6 +134,14 @@ export interface AgentSkillsListResponse {
   type: typeof AGENT_SKILLS_MSG.LIST_RESPONSE;
   requestId: string;
   skills: AgentSkillEntry[];
+}
+
+export interface AgentSkillsListRequest {
+  type: typeof AGENT_SKILLS_MSG.LIST_REQUEST;
+  requestId: string;
+  /** Optional trusted session context used to select project-scoped entries. */
+  sessionName?: string;
+  projectDir?: string;
 }
 
 export interface AgentSkillsRunRequest {

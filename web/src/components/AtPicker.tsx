@@ -287,7 +287,7 @@ export function AtPicker({
   useEffect(() => {
     if (!visible || category !== 'skills' || !serverId) return;
     let cancelled = false;
-    void listAgentSkills(serverId).then((skills) => {
+    void listAgentSkills(serverId, (sessionName || projectDir) ? { sessionName, projectDir } : undefined).then((skills) => {
       if (!cancelled) setSkillResults(skills);
     }).catch(() => {
       if (!cancelled) setSkillResults([]);

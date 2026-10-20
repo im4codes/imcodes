@@ -12,8 +12,8 @@ export interface AgentSkillReference {
 }
 
 /** Build the safe marker shown in the human-facing composer/timeline. */
-export function buildAgentSkillMarker(skill: Pick<AgentSkillEntry, 'name' | 'source' | 'sourceUrl'>): string {
-  const source = skill.source?.trim() || skill.sourceUrl?.trim();
+export function buildAgentSkillMarker(skill: Pick<AgentSkillEntry, 'name' | 'source' | 'sourceUrl' | 'uri' | 'displayPath'>): string {
+  const source = skill.source?.trim() || skill.sourceUrl?.trim() || skill.uri?.trim() || skill.displayPath?.trim();
   return `${AGENT_SKILL_REFERENCE_MARKER}${skill.name}${source ? `@${source}` : ''})`;
 }
 
@@ -46,6 +46,10 @@ export function parseAgentSkillMarkers(text: string): string[] {
 }
 
 /** Human-facing source label, with a stable fallback for hand-made skills. */
-export function agentSkillSourceLabel(skill: Pick<AgentSkillEntry, 'name' | 'source' | 'sourceUrl'>): string {
-  return skill.source?.trim() || skill.sourceUrl?.trim() || `~/.agents/skills/${skill.name}`;
+export function agentSkillSourceLabel(skill: Pick<AgentSkillEntry, 'name' | 'source' | 'sourceUrl' | 'uri' | 'displayPath' | 'layer'>): string {
+  return skill.source?.trim()
+    || skill.sourceUrl?.trim()
+    || skill.displayPath?.trim()
+    || skill.uri?.trim()
+    || (skill.layer ? `${skill.layer}:${skill.name}` : `~/.agents/skills/${skill.name}`);
 }

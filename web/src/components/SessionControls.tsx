@@ -1290,13 +1290,13 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   useEffect(() => {
     if (!serverId) { setAgentSkills([]); return; }
     let cancelled = false;
-    void listAgentSkills(serverId).then((skills) => {
+    void listAgentSkills(serverId, activeSession ? { sessionName: activeSession.name, projectDir: activeSession.projectDir } : undefined).then((skills) => {
       if (!cancelled) setAgentSkills(skills);
     }).catch(() => {
       if (!cancelled) setAgentSkills([]);
     });
     return () => { cancelled = true; };
-  }, [serverId]);
+  }, [serverId, activeSession?.name, activeSession?.projectDir]);
   const [modelOpen, setModelOpen] = useState(false);
   const [autoOpen, setAutoOpen] = useState(false);
   const [peerAuditOpen, setPeerAuditOpen] = useState(false);

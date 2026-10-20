@@ -22,6 +22,7 @@ import {
 } from '../../shared/agent-skills.js';
 import { parseAgentSkillMarkers, parseAgentSkillReference } from '../../shared/agent-skill-references.js';
 import { resolveNpmCliJs } from '../util/node-datachannel-repair.mjs';
+import { getSkillRegistryManagementSnapshot } from '../context/skill-registry.js';
 
 /** A SKILL.md larger than this is not read for its description. */
 const MAX_SKILL_FILE_BYTES = 256 * 1024;
@@ -41,7 +42,7 @@ export function resolveAgentSkillReference(
 ): AgentSkillEntry | undefined {
   const candidates = skills.filter((skill) => skill.name === reference.name);
   if (reference.source) {
-    return candidates.find((skill) => skill.source === reference.source || skill.sourceUrl === reference.source);
+    return candidates.find((skill) => skill.source === reference.source || skill.sourceUrl === reference.source || skill.uri === reference.source || skill.displayPath === reference.source || `${skill.layer ?? ''}:${skill.name}` === reference.source);
   }
   return candidates.length === 1 ? candidates[0] : undefined;
 }
@@ -132,7 +133,7 @@ async function readLock(homeDir: string): Promise<Record<string, Record<string, 
  * Every skill in `~/.agents/skills`: a directory (or a link to one -- a Windows
  * junction included, which `stat` follows) holding a SKILL.md.
  */
-export async function listAgentSkills(homeDir: string = homedir()): Promise<AgentSkillEntry[]> {
+export async function listAgentSkills(homeDir: string = homedir(), context: { projectDir?: string } = {}): Promise<AgentSkillEntry[]> {
   const root = join(homeDir, ...AGENT_SKILLS_DIRECTORY_SEGMENTS);
   let names: string[];
   try {
@@ -163,6 +164,9 @@ export async function listAgentSkills(homeDir: string = homedir()): Promise<Agen
     skills.push({
       name,
       description: frontMatter.description,
+      layer: 'user_default',
+      displayPath: `~/.agents/skills/${name}`,
+      uri: `skill://user_default/${encodeURIComponent(name)}`,
       ...(missingBins.length > 0 ? { missingBins } : {}),
       ...(firstString(locked, 'source', AGENT_SKILLS_LIMITS.SOURCE_CHARS) ? { source: firstString(locked, 'source', AGENT_SKILLS_LIMITS.SOURCE_CHARS) } : {}),
       ...(firstString(locked, 'sourceUrl', AGENT_SKILLS_LIMITS.SOURCE_CHARS) ? { sourceUrl: firstString(locked, 'sourceUrl', AGENT_SKILLS_LIMITS.SOURCE_CHARS) } : {}),
@@ -170,6 +174,14 @@ export async function listAgentSkills(homeDir: string = homedir()): Promise<Agen
       ...(firstString(locked, 'updatedAt', 40) ? { updatedAt: firstString(locked, 'updatedAt', 40) } : {}),
     });
   }
+  try {
+    const snapshot = getSkillRegistryManagementSnapshot({ projectDir: context.projectDir, homeDir });
+    for (const entry of snapshot.entries) {
+      const name = entry.metadata.name?.trim() || entry.key;
+      if (!name || skills.length >= AGENT_SKILLS_LIMITS.SKILLS * 2) break;
+      skills.push({ name, description: entry.metadata.description ?? '', layer: entry.layer, displayPath: entry.displayPath, uri: entry.uri });
+    }
+  } catch { /* registry is optional; local skills remain available */ }
   return skills;
 }
 
@@ -183,10 +195,11 @@ export async function listAgentSkills(homeDir: string = homedir()): Promise<Agen
 export async function expandAgentSkillReferences(
   text: string,
   homeDir: string = homedir(),
+  context: { projectDir?: string } = {},
 ): Promise<AgentSkillExpansion> {
   const markers = parseAgentSkillMarkers(text);
   if (markers.length === 0) return { text, unresolved: [], expanded: [] };
-  const skills = await listAgentSkills(homeDir);
+  const skills = await listAgentSkills(homeDir, context);
   const root = join(homeDir, ...AGENT_SKILLS_DIRECTORY_SEGMENTS);
   const unresolved: string[] = [];
   const expanded: string[] = [];
@@ -209,7 +222,13 @@ export async function expandAgentSkillReferences(
     }
     if (emitted.has(body)) continue;
     try {
-      const content = await readFile(join(root, skill.name, AGENT_SKILL_FILE_NAME), 'utf8');
+      let skillPath = join(root, skill.name, AGENT_SKILL_FILE_NAME);
+      if (!skill.displayPath?.startsWith('~/.agents/skills/')) {
+        const registry = getSkillRegistryManagementSnapshot({ projectDir: context.projectDir, homeDir });
+        const entry = registry.entries.find((candidate) => candidate.uri === skill.uri);
+        if (entry?.path) skillPath = join(entry.path, AGENT_SKILL_FILE_NAME);
+      }
+      const content = await readFile(skillPath, 'utf8');
       if (!content.trim() || Buffer.byteLength(content, 'utf8') > MAX_SKILL_FILE_BYTES) {
         unresolved.push(body);
         result.push(match[0]);
@@ -350,7 +369,8 @@ export async function handleAgentSkillsCommand(
   const requestId = typeof cmd.requestId === 'string' && cmd.requestId.length <= 128 ? cmd.requestId : undefined;
   if (!requestId) return;
   if (cmd.type === AGENT_SKILLS_MSG.LIST_REQUEST) {
-    send({ type: AGENT_SKILLS_MSG.LIST_RESPONSE, requestId, skills: await listAgentSkills() });
+    const projectDir = typeof cmd.projectDir === 'string' && cmd.projectDir.length < 4096 ? cmd.projectDir : undefined;
+    send({ type: AGENT_SKILLS_MSG.LIST_RESPONSE, requestId, skills: await listAgentSkills(homedir(), { projectDir }) });
     return;
   }
   if (cmd.type !== AGENT_SKILLS_MSG.RUN_REQUEST) return;
