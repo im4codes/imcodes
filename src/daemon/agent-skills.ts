@@ -20,10 +20,31 @@ import {
   type AgentSkillsError,
   type AgentSkillsRunRequest,
 } from '../../shared/agent-skills.js';
+import { parseAgentSkillMarkers, parseAgentSkillReference } from '../../shared/agent-skill-references.js';
 import { resolveNpmCliJs } from '../util/node-datachannel-repair.mjs';
 
 /** A SKILL.md larger than this is not read for its description. */
 const MAX_SKILL_FILE_BYTES = 256 * 1024;
+
+const SKILL_CONTENT_START = '[skill:';
+
+export interface AgentSkillExpansion {
+  text: string;
+  unresolved: string[];
+  expanded: string[];
+}
+
+/** Resolve a marker without silently choosing between same-name sources. */
+export function resolveAgentSkillReference(
+  reference: { name: string; source?: string },
+  skills: readonly AgentSkillEntry[],
+): AgentSkillEntry | undefined {
+  const candidates = skills.filter((skill) => skill.name === reference.name);
+  if (reference.source) {
+    return candidates.find((skill) => skill.source === reference.source || skill.sourceUrl === reference.source);
+  }
+  return candidates.length === 1 ? candidates[0] : undefined;
+}
 
 function firstString(record: Record<string, unknown>, key: string, max: number): string | undefined {
   const value = record[key];
@@ -148,6 +169,60 @@ export async function listAgentSkills(homeDir: string = homedir()): Promise<Agen
     });
   }
   return skills;
+}
+
+/**
+ * Expand composer `$$()` references using only known entries in this daemon's
+ * own ~/.agents/skills directory. The marker remains in the timeline text;
+ * this copy is provider-bound and never logged. Repeated references are
+ * removed after the first expansion so retries/queue drains cannot duplicate
+ * a skill body in one prompt.
+ */
+export async function expandAgentSkillReferences(
+  text: string,
+  homeDir: string = homedir(),
+): Promise<AgentSkillExpansion> {
+  const markers = parseAgentSkillMarkers(text);
+  if (markers.length === 0) return { text, unresolved: [], expanded: [] };
+  const skills = await listAgentSkills(homeDir);
+  const root = join(homeDir, ...AGENT_SKILLS_DIRECTORY_SEGMENTS);
+  const unresolved: string[] = [];
+  const expanded: string[] = [];
+  const emitted = new Set<string>();
+  const pattern = /\$\$\(([^()\r\n]{1,300})\)/gu;
+  const result = [] as string[];
+  let last = 0;
+  for (const match of text.matchAll(pattern)) {
+    const index = match.index ?? 0;
+    const body = match[1]?.trim() ?? '';
+    const reference = parseAgentSkillReference(body);
+    if (!reference) continue;
+    result.push(text.slice(last, index));
+    last = index + match[0].length;
+    const skill = resolveAgentSkillReference(reference, skills);
+    if (!skill) {
+      unresolved.push(body);
+      result.push(match[0]);
+      continue;
+    }
+    if (emitted.has(body)) continue;
+    try {
+      const content = await readFile(join(root, skill.name, AGENT_SKILL_FILE_NAME), 'utf8');
+      if (!content.trim() || Buffer.byteLength(content, 'utf8') > MAX_SKILL_FILE_BYTES) {
+        unresolved.push(body);
+        result.push(match[0]);
+        continue;
+      }
+      emitted.add(body);
+      expanded.push(body);
+      result.push(`\n${SKILL_CONTENT_START} ${skill.name}]\n${content.trim()}\n[/skill: ${skill.name}]`);
+    } catch {
+      unresolved.push(body);
+      result.push(match[0]);
+    }
+  }
+  result.push(text.slice(last));
+  return { text: result.join(''), unresolved: [...new Set(unresolved)], expanded };
 }
 
 /** The CLI arguments for one request; the request is already validated. */

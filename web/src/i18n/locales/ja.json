@@ -34,6 +34,12 @@
       "generic": "問題が発生しました。もう一度お試しください。"
     }
   },
+  "skill": {
+    "category": "スキル",
+    "category_desc": "スキル参照を挿入",
+    "empty": "利用可能なスキルはありません",
+    "no_results": "検索に一致するスキルはありません"
+  },
   "machine": {
     "feature_label": "マシン",
     "category": "マシン",

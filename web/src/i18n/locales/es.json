@@ -34,6 +34,12 @@
       "generic": "Algo salió mal. Inténtalo de nuevo."
     }
   },
+  "skill": {
+    "category": "Habilidades",
+    "category_desc": "Insertar una referencia de habilidad",
+    "empty": "No hay habilidades disponibles",
+    "no_results": "Ninguna habilidad coincide con la búsqueda"
+  },
   "machine": {
     "feature_label": "Máquina",
     "category": "Máquina",

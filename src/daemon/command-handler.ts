@@ -9,7 +9,7 @@ import { AGENT_SKILLS_MSG } from '../../shared/agent-skills.js';
 import { AGENT_MCP_MSG } from '../../shared/agent-mcp.js';
 import type { CronRunTimelineProjection } from '../../shared/cron-types.js';
 import { handleAgentMcpCommand } from './agent-mcp.js';
-import { handleAgentSkillsCommand } from './agent-skills.js';
+import { expandAgentSkillReferences, handleAgentSkillsCommand } from './agent-skills.js';
 import {
   SESSION_MODEL_APPLIED,
   SESSION_MODEL_CONTROL_ERROR,
@@ -4905,6 +4905,11 @@ async function handleSendBound(cmd: Record<string, unknown>, serverLink: ServerL
     incrementCounter(event.counter, { sendOrigin: event.sendOrigin });
   }
   const displayText = preferenceIngest.providerText;
+  // Skill markers are kept in the user-facing timeline, while the daemon
+  // reads only known ~/.agents/skills/<name>/SKILL.md files for the provider
+  // copy. Unknown or malformed references remain literal and recoverable.
+  const skillExpansion = await expandAgentSkillReferences(displayText);
+  const skillProviderText = skillExpansion.text !== displayText ? skillExpansion.text : undefined;
   // Alias quick-insert expansion (A′) — pure/synchronous, computed ONCE here and
   // reused by every dispatch branch below. The timeline ALWAYS uses `displayText`
   // (original `;;(name)` markers); only the agent-bound copy is expanded:
@@ -4915,7 +4920,7 @@ async function handleSendBound(cmd: Record<string, unknown>, serverLink: ServerL
   // `aliasProviderText` is set only when the agent-bound text actually differs, so
   // the no-alias path stays byte-identical. Values are never logged.
   const aliasMode = aliasExpansionModeFor(record.agentType ?? '');
-  const aliasExpansion = expandForAgent(displayText, resolvedAliases, aliasMode, resolvedAliasNotes);
+  const aliasExpansion = expandForAgent(skillProviderText ?? displayText, resolvedAliases, aliasMode, resolvedAliasNotes);
   // ── Alias fail-closed guard (A′, CRITICAL) ─────────────────────────────────
   // `deliver === false` ONLY for a raw executor (inline mode: shell/script, or an
   // unknown agent type that defaults to inline) with an UNRESOLVED `;;(name)`

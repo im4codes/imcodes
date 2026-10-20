@@ -34,6 +34,12 @@
       "generic": "문제가 발생했습니다. 다시 시도해 주세요."
     }
   },
+  "skill": {
+    "category": "스킬",
+    "category_desc": "스킬 참조 삽입",
+    "empty": "사용 가능한 스킬이 없습니다",
+    "no_results": "검색과 일치하는 스킬이 없습니다"
+  },
   "machine": {
     "feature_label": "머신",
     "category": "머신",

@@ -13,7 +13,7 @@
  *    name+description.
  */
 import { render, cleanup, fireEvent, waitFor } from '@testing-library/preact';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { AliasEntry } from '@shared/alias-types.js';
 import type { UseQuickDataResult } from '../src/components/QuickInputPanel.js';
 
@@ -62,7 +62,12 @@ vi.mock('../src/hooks/useAliases.js', async (importOriginal) => {
   };
 });
 
-import { SessionControls, matchInlineAliasTrigger } from '../src/components/SessionControls.js';
+const listAgentSkillsMock = vi.fn();
+vi.mock('../src/api/agent-skills.js', () => ({
+  listAgentSkills: (...args: unknown[]) => listAgentSkillsMock(...args),
+}));
+
+import { SessionControls, matchInlineAliasTrigger, matchInlineSkillTrigger } from '../src/components/SessionControls.js';
 
 const quickData: UseQuickDataResult = {
   data: { history: [], sessionHistory: {}, commands: [], phrases: [] },
@@ -109,6 +114,7 @@ function typeInto(editor: HTMLElement, text: string) {
 }
 
 afterEach(() => { cleanup(); vi.clearAllMocks(); });
+beforeEach(() => { listAgentSkillsMock.mockResolvedValue([]); });
 
 describe('SessionControls — alias send path (A′)', () => {
   it('includes resolvedAliases in the session.send payload; text keeps markers; bubble shows marker not value', async () => {
@@ -147,6 +153,28 @@ describe('SessionControls — alias send path (A′)', () => {
     const [, payload] = ws.sendSessionCommand.mock.calls[0];
     expect('resolvedAliases' in payload).toBe(false);
     expect(payload.text).toContain(';;(missing)');
+  });
+});
+
+describe('inline skill trigger', () => {
+  it('only treats a non-numeric dollar word as a skill query', () => {
+    expect(matchInlineSkillTrigger('$writer')).toBe('writer');
+    expect(matchInlineSkillTrigger('please $writer')).toBe('writer');
+    expect(matchInlineSkillTrigger('$5')).toBeNull();
+    expect(matchInlineSkillTrigger('price $')).toBeNull();
+    expect(matchInlineSkillTrigger('$$writer')).toBeNull();
+  });
+
+  it('opens the skill quick picker and inserts a source-qualified marker', async () => {
+    listAgentSkillsMock.mockResolvedValue([
+      { name: 'writer', description: 'Concise prose', source: 'team/skills' },
+    ]);
+    const { editor, container } = renderControls();
+    await waitFor(() => expect(listAgentSkillsMock).toHaveBeenCalledWith('srv1'));
+    typeInto(editor, '$w');
+    await waitFor(() => expect(container.querySelector('[data-skill-name="writer"]')).toBeTruthy());
+    fireEvent.click(container.querySelector('[data-skill-name="writer"]')!);
+    expect(editor.textContent).toContain('$$(writer@team/skills)');
   });
 });
 

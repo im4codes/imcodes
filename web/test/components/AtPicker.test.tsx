@@ -22,6 +22,11 @@ vi.mock('../../src/api.js', () => ({
   saveUserPref: (...args: unknown[]) => saveUserPrefMock(...args),
 }));
 
+const listAgentSkillsMock = vi.fn();
+vi.mock('../../src/api/agent-skills.js', () => ({
+  listAgentSkills: (...args: unknown[]) => listAgentSkillsMock(...args),
+}));
+
 if (!HTMLElement.prototype.scrollIntoView) {
   HTMLElement.prototype.scrollIntoView = vi.fn();
 }
@@ -49,6 +54,7 @@ describe('AtPicker', () => {
   beforeEach(() => {
     getUserPrefMock.mockResolvedValue(null);
     saveUserPrefMock.mockResolvedValue(undefined);
+    listAgentSkillsMock.mockResolvedValue([]);
   });
 
   afterEach(() => {
@@ -56,7 +62,7 @@ describe('AtPicker', () => {
     vi.clearAllMocks();
   });
 
-  function pickerWithQuery(query: string) {
+  function pickerWithQuery(query: string, options: { serverId?: string; onSelectSkill?: (skill: unknown) => void } = {}) {
     const wsClient = {
       connected: true,
       send: vi.fn(),
@@ -78,6 +84,8 @@ describe('AtPicker', () => {
         onSelectFile={vi.fn()}
         onSelectAgent={vi.fn()}
         onSelectDelegateAgent={vi.fn()}
+        onSelectSkill={options.onSelectSkill as never}
+        serverId={options.serverId}
         onClose={vi.fn()}
         visible
       />
@@ -627,6 +635,21 @@ describe('AtPicker', () => {
 
     expect(screen.getByText('files')).toBeDefined();
     expect(screen.getByText('agents')).toBeDefined();
+  });
+
+  it('lists skills with source labels and selects a source-qualified entry', async () => {
+    listAgentSkillsMock.mockResolvedValue([
+      { name: 'writer', description: 'Concise prose', source: 'team/skills' },
+    ]);
+    const onSelectSkill = vi.fn();
+    render(pickerWithQuery('', { serverId: 'srv1', onSelectSkill }));
+    fireEvent.click(screen.getAllByText('category')[1]);
+    await flush();
+    expect(listAgentSkillsMock).toHaveBeenCalledWith('srv1');
+    expect(screen.getByText('writer')).toBeDefined();
+    expect(screen.getByText('team/skills')).toBeDefined();
+    fireEvent.click(screen.getByText('writer'));
+    expect(onSelectSkill).toHaveBeenCalledWith(expect.objectContaining({ name: 'writer', source: 'team/skills' }));
   });
   it('returns to the chooser after Escape even when a filter query is still typed', () => {
     // Every back/Escape handler returns to the chooser WITHOUT clearing the

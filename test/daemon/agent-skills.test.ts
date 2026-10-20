@@ -12,9 +12,11 @@ import {
 import {
   agentSkillsCliArguments,
   createAgentSkillsRunner,
+  expandAgentSkillReferences,
   handleAgentSkillsCommand,
   hasCommand,
   listAgentSkills,
+  resolveAgentSkillReference,
 } from '../../src/daemon/agent-skills.js';
 
 const cleanup: string[] = [];
@@ -167,5 +169,42 @@ describe('agent skill requests', () => {
     );
     expect(run).not.toHaveBeenCalled();
     expect(sent).toEqual([{ type: AGENT_SKILLS_MSG.RUN_RESPONSE, requestId: 'r1', ok: false, error: AGENT_SKILLS_ERROR.INVALID_REQUEST }]);
+  });
+});
+
+describe('composer skill references', () => {
+  it('requires a source when duplicate names are present', () => {
+    const entries = [
+      { name: 'writer', description: '', source: 'team/a' },
+      { name: 'writer', description: '', source: 'team/b' },
+    ] as const;
+    expect(resolveAgentSkillReference({ name: 'writer' }, entries)).toBeUndefined();
+    expect(resolveAgentSkillReference({ name: 'writer', source: 'team/b' }, entries)).toEqual(entries[1]);
+  });
+
+  it('expands safe known references, disambiguates source, and removes duplicates', async () => {
+    const root = await home();
+    await skill(root, 'writer', 'description: writer');
+    await writeFile(join(root, '.agents', 'skills', 'writer', 'SKILL.md'), '# Writer\nUse concise prose.\n');
+    await writeFile(join(root, '.agents', '.skill-lock.json'), JSON.stringify({
+      skills: { writer: { source: 'team/skills' } },
+    }));
+
+    const expanded = await expandAgentSkillReferences(
+      'before $$(writer@team/skills) after $$(writer@team/skills) bad $$(writer@other) literal $$(unknown)',
+      root,
+    );
+    expect(expanded.expanded).toEqual(['writer@team/skills']);
+    expect(expanded.unresolved).toEqual(['writer@other', 'unknown']);
+    expect(expanded.text).toContain('[skill: writer]');
+    expect(expanded.text.match(/\[skill: writer\]/gu)).toHaveLength(1);
+    expect(expanded.text).toContain('$$(writer@other)');
+    expect(expanded.text).toContain('$$(unknown)');
+  });
+
+  it('leaves malformed and unclosed markers untouched', async () => {
+    const root = await home();
+    const text = 'cash $5, $$(bad name), $$(writer';
+    await expect(expandAgentSkillReferences(text, root)).resolves.toEqual({ text, unresolved: [], expanded: [] });
   });
 });

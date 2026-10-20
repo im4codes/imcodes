@@ -17,6 +17,9 @@ import { useAliases } from '../hooks/useAliases.js';
 import { useMachines } from '../hooks/useMachines.js';
 import { useListboxNavigation } from '../hooks/useListboxNavigation.js';
 import { MACHINE_IDENTITY_UNAVAILABLE } from '@shared/machine-reference.js';
+import { listAgentSkills } from '../api/agent-skills.js';
+import { agentSkillSourceLabel } from '@shared/agent-skill-references.js';
+import type { AgentSkillEntry } from '@shared/agent-skills.js';
 
 interface SessionEntry {
   name: string;
@@ -51,19 +54,21 @@ interface AtPickerProps {
   onSelectAlias?: (name: string) => void;
   /** Insert the canonical nodeId marker plus its human-readable display note. */
   onSelectMachine?: (nodeId: string, displayName: string) => void;
+  onSelectSkill?: (skill: AgentSkillEntry) => void;
+  serverId?: string;
   onSelectAllConfig?: (config: P2pSavedConfig, rounds: number, modeOverride: string) => void;
   /** Launch a Team discussion directly with the chosen combo/mode and round count. */
   onLaunchTeam?: (modeKey: string, rounds: number) => void;
   p2pConfig?: P2pSavedConfig | null;
   onClose: () => void;
-  onStageChange?: (stage: 'choose' | 'files' | 'agents' | 'mode' | 'team' | 'aliases' | 'machines') => void;
+  onStageChange?: (stage: 'choose' | 'files' | 'agents' | 'mode' | 'team' | 'aliases' | 'machines' | 'skills') => void;
   visible: boolean;
 }
 
-type Category = 'choose' | 'files' | 'agents' | 'team' | 'aliases' | 'machines';
+type Category = 'choose' | 'files' | 'agents' | 'team' | 'aliases' | 'machines' | 'skills';
 
-/** Number of rows in the category chooser (files, team, agents, aliases, machines). */
-const CHOOSER_ROW_COUNT = 5;
+/** Number of rows in the category chooser (files, team, agents, aliases, skills, machines). */
+const CHOOSER_ROW_COUNT = 6;
 
 const DEBOUNCE_MS = 200;
 
@@ -167,6 +172,8 @@ export function AtPicker({
   onSelectDelegateAgent,
   onSelectAlias,
   onSelectMachine,
+  onSelectSkill,
+  serverId,
   onLaunchTeam,
   onClose,
   onStageChange,
@@ -184,6 +191,7 @@ export function AtPicker({
   // that may run after the node reconnects.
   const { filtered: machineResults } = useMachines(category === 'machines' ? query : undefined);
   const [fileResults, setFileResults] = useState<Array<{ path: string; basename: string; dir: string }>>([]);
+  const [skillResults, setSkillResults] = useState<AgentSkillEntry[]>([]);
   const [highlightIdx, setHighlightIdx] = useState(0);
   const [teamRoundsIdx, setTeamRoundsIdx] = useState(0);
   const CONFIG_ROUNDS_OPTIONS = [1, 2, 3, 5] as const;
@@ -239,12 +247,20 @@ export function AtPicker({
       .sort((a, b) => Number(a.disabled) - Number(b.disabled));
   }, [sessions, query, rootSession]);
 
+  const filteredSkills = useMemo(() => {
+    const needle = query.trim().toLocaleLowerCase();
+    return skillResults.filter((skill) => !needle || [skill.name, skill.description, skill.source, skill.sourceUrl]
+      .some((value) => value?.toLocaleLowerCase().includes(needle)));
+  }, [query, skillResults]);
+
   const navigationItemCount = category === 'choose'
     ? CHOOSER_ROW_COUNT
     : category === 'aliases'
       ? aliasResults.length
       : category === 'machines'
         ? machineResults.length
+      : category === 'skills'
+        ? filteredSkills.length
         : category === 'team'
           ? teamComboOptions.length
           : category === 'files'
@@ -267,6 +283,17 @@ export function AtPicker({
     selectableIndices: navigationSelectableIndices,
     setActiveIndex: setHighlightIdx,
   });
+
+  useEffect(() => {
+    if (!visible || category !== 'skills' || !serverId) return;
+    let cancelled = false;
+    void listAgentSkills(serverId).then((skills) => {
+      if (!cancelled) setSkillResults(skills);
+    }).catch(() => {
+      if (!cancelled) setSkillResults([]);
+    });
+    return () => { cancelled = true; };
+  }, [category, serverId, visible]);
 
   // Debounced file search — only when in files category
   useEffect(() => {
@@ -370,7 +397,8 @@ export function AtPicker({
           e.preventDefault(); e.stopPropagation();
           if (activeNavigationIndex === 1) { setCategory('team'); setHighlightIdx(0); setTeamRoundsIdx(0); }
           else if (activeNavigationIndex === 3) { setCategory('aliases'); setHighlightIdx(0); }
-          else if (activeNavigationIndex === 4) { setCategory('machines'); setHighlightIdx(0); }
+          else if (activeNavigationIndex === 4) { setCategory('skills'); setHighlightIdx(0); }
+          else if (activeNavigationIndex === 5) { setCategory('machines'); setHighlightIdx(0); }
           else { setCategory(activeNavigationIndex === 0 ? 'files' : 'agents'); setHighlightIdx(0); }
           return;
         }
@@ -395,13 +423,25 @@ export function AtPicker({
       // is informational and never prevents composing a stable node reference.
       if (category === 'machines') {
         const count = machineResults.length;
-        if (e.key === 'Escape') { consumeEscapeKey(e); setCategory('choose'); setHighlightIdx(4); return; }
+        if (e.key === 'Escape') { consumeEscapeKey(e); setCategory('choose'); setHighlightIdx(5); return; }
         if (handleNavigationKey(e)) return;
         if ((e.key === 'Enter' || e.key === 'Tab') && count > 0) {
           e.preventDefault(); e.stopPropagation();
           const m = machineResults[activeNavigationIndex];
           if (m?.nodeId) onSelectMachine?.(m.nodeId, m.displayName);
           return;
+        }
+        return;
+      }
+
+      if (category === 'skills') {
+        const count = filteredSkills.length;
+        if (e.key === 'Escape') { consumeEscapeKey(e); setCategory('choose'); setHighlightIdx(4); return; }
+        if (handleNavigationKey(e)) return;
+        if ((e.key === 'Enter' || e.key === 'Tab') && count > 0) {
+          e.preventDefault(); e.stopPropagation();
+          const skill = filteredSkills[activeNavigationIndex];
+          if (skill) onSelectSkill?.(skill);
         }
         return;
       }
@@ -441,7 +481,7 @@ export function AtPicker({
         }
       }
     },
-    [visible, category, activeNavigationIndex, fileResults, delegateAgents, aliasResults, machineResults, teamRoundsIdx, teamComboOptions, handleNavigationKey, onClose, onSelectFile, onSelectDelegateAgent, onSelectAlias, onSelectMachine, onLaunchTeam],
+    [visible, category, activeNavigationIndex, fileResults, delegateAgents, aliasResults, machineResults, filteredSkills, teamRoundsIdx, teamComboOptions, handleNavigationKey, onClose, onSelectFile, onSelectDelegateAgent, onSelectAlias, onSelectMachine, onSelectSkill, onLaunchTeam],
   );
 
   // Keep one capture listener for the lifetime of the open picker. Rebinding a
@@ -507,8 +547,18 @@ export function AtPicker({
         <div
           data-hl={activeNavigationIndex === 4 ? 'true' : undefined}
           style={activeNavigationIndex === 4 ? categoryHighlightStyle : categoryStyle}
-          onClick={() => { setCategory('machines'); setHighlightIdx(0); }}
+          onClick={() => { setCategory('skills'); setHighlightIdx(0); }}
           onMouseEnter={() => setHighlightIdx(4)}
+        >
+          <span style={{ fontSize: 16 }}>🧩</span>
+          <span style={{ fontWeight: 500 }}>{t('skill.category')}</span>
+          <span style={dimStyle}>{t('skill.category_desc')}</span>
+        </div>
+        <div
+          data-hl={activeNavigationIndex === 5 ? 'true' : undefined}
+          style={activeNavigationIndex === 5 ? categoryHighlightStyle : categoryStyle}
+          onClick={() => { setCategory('machines'); setHighlightIdx(0); }}
+          onMouseEnter={() => setHighlightIdx(5)}
         >
           <span style={{ fontSize: 16 }}>🖥️</span>
           <span style={{ fontWeight: 500 }}>{t('machine.category')}</span>
@@ -554,7 +604,7 @@ export function AtPicker({
   if (category === 'machines') {
     return (
       <div ref={containerRef} style={containerStyle}>
-        <div style={backBtnStyle} onClick={() => { setCategory('choose'); setHighlightIdx(4); }}>← {t('p2p.picker.back')}</div>
+        <div style={backBtnStyle} onClick={() => { setCategory('choose'); setHighlightIdx(5); }}>← {t('p2p.picker.back')}</div>
         <div style={groupLabelStyle}>
           {t('machine.category')} {query ? `— "${query}"` : ''}
         </div>
@@ -586,6 +636,37 @@ export function AtPicker({
               <span style={{ fontWeight: 500, color: '#e2e8f0' }}>{m.displayName}</span>
               <span style={dimStyle}>{m.nodeId ?? MACHINE_IDENTITY_UNAVAILABLE}</span>
               {!m.online && <span style={dimStyle}>{t('machine.offline_hint')}</span>}
+            </div>
+          );
+        })}
+      </div>
+    );
+  }
+
+  if (category === 'skills') {
+    return (
+      <div ref={containerRef} style={containerStyle}>
+        <div style={backBtnStyle} onClick={() => { setCategory('choose'); setHighlightIdx(4); }}>← {t('p2p.picker.back')}</div>
+        <div style={groupLabelStyle}>{t('skill.category')} {query ? `— "${query}"` : ''}</div>
+        {filteredSkills.length === 0 && (
+          <div style={{ ...itemStyle, color: '#64748b', justifyContent: 'center' }}>
+            {query ? t('skill.no_results') : t('skill.empty')}
+          </div>
+        )}
+        {filteredSkills.map((skill, idx) => {
+          const hl = idx === activeNavigationIndex;
+          return (
+            <div
+              key={`${skill.name}:${skill.source ?? skill.sourceUrl ?? ''}`}
+              data-hl={hl ? 'true' : undefined}
+              style={hl ? itemHighlightStyle : itemStyle}
+              onClick={() => onSelectSkill?.(skill)}
+              onMouseEnter={() => setHighlightIdx(idx)}
+              title={skill.description || undefined}
+            >
+              <span style={{ fontWeight: 500, color: '#e2e8f0' }}>{skill.name}</span>
+              <span style={dimStyle}>{agentSkillSourceLabel(skill)}</span>
+              {skill.description ? <span style={dimStyle}>{skill.description}</span> : null}
             </div>
           );
         })}

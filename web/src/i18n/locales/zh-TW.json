@@ -34,6 +34,12 @@
       "generic": "發生錯誤，請重試。"
     }
   },
+  "skill": {
+    "category": "技能",
+    "category_desc": "插入技能引用",
+    "empty": "目前沒有可用技能",
+    "no_results": "沒有符合搜尋的技能"
+  },
   "machine": {
     "feature_label": "機器",
     "category": "機器",

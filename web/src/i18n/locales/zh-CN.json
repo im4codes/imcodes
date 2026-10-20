@@ -34,6 +34,12 @@
       "generic": "出错了，请重试。"
     }
   },
+  "skill": {
+    "category": "技能",
+    "category_desc": "插入技能引用",
+    "empty": "暂无可用技能",
+    "no_results": "没有匹配的技能"
+  },
   "machine": {
     "feature_label": "机器",
     "category": "机器",

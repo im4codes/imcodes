@@ -34,6 +34,12 @@
       "generic": "Something went wrong. Please try again."
     }
   },
+  "skill": {
+    "category": "Skills",
+    "category_desc": "Insert a skill reference",
+    "empty": "No skills available",
+    "no_results": "No skills match your search"
+  },
   "machine": {
     "feature_label": "Machine",
     "category": "Machine",

@@ -35,6 +35,9 @@ import {
   type VoiceNotepadSendRequest,
 } from '../voice-notepad.js';
 import { AtPicker } from './AtPicker.js';
+import { listAgentSkills } from '../api/agent-skills.js';
+import type { AgentSkillEntry } from '@shared/agent-skills.js';
+import { agentSkillSourceLabel, buildAgentSkillMarker } from '@shared/agent-skill-references.js';
 import { FS_SESSION_ROOT_PATH } from '../../../src/shared/transport/fs.js';
 import { QuickAgentDelegationDialog, type QuickAgentDelegationCandidate } from './QuickAgentDelegationDialog.js';
 import { useAliases } from '../hooks/useAliases.js';
@@ -654,6 +657,20 @@ export function matchInlineAliasTrigger(text: string): string | null {
   return m[1];
 }
 
+/** Inline `$` skill autocomplete. Numeric-only queries stay ordinary amounts. */
+export function matchInlineSkillTrigger(text: string): string | null {
+  const m = /(?:^|\s)\$([a-z0-9._-]*)$/iu.exec(text);
+  if (!m) return null;
+  const query = m[1] ?? '';
+  // A lone dollar is ordinary prose/currency; autocomplete starts once the
+  // user has typed at least one skill-name character.
+  if (!query) return null;
+  if (query && /^\d[\d._-]*$/u.test(query)) return null;
+  const dollarIdx = text.length - query.length - 1;
+  if (dollarIdx > 0 && text[dollarIdx - 1] === '$') return null;
+  return query;
+}
+
 // Inline `;` alias dropdown styles — mirror the AtPicker dropdown look so the
 // two inline autocompletes feel identical.
 const aliasPickerContainerStyle: Record<string, string | number> = {
@@ -1235,7 +1252,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const [menuOpen, setMenuOpen] = useState(false);
   const [atPickerOpen, setAtPickerOpen] = useState(false);
   const [atQuery, setAtQuery] = useState('');
-  const [atPickerStage, setAtPickerStage] = useState<'choose' | 'files' | 'agents' | 'mode' | 'team' | 'aliases' | 'machines'>('choose');
+  const [atPickerStage, setAtPickerStage] = useState<'choose' | 'files' | 'agents' | 'mode' | 'team' | 'aliases' | 'machines' | 'skills'>('choose');
   const atJustClosedRef = useRef(false);
   const atSelectionLockRef = useRef(false);
   const atSelectionSnapshotRef = useRef('');
@@ -1261,14 +1278,25 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   // paste may contain attachment-like `#...` text, so suppress their one
   // corresponding input event without disabling later keyboard edits.
   const quickPhraseInputSuppressRef = useRef(false);
-  const [quickSuggestionKind, setQuickSuggestionKind] = useState<'command' | 'phrase' | 'model' | null>(null);
+  const [quickSuggestionKind, setQuickSuggestionKind] = useState<'command' | 'phrase' | 'model' | 'skill' | null>(null);
   const [quickSuggestionQuery, setQuickSuggestionQuery] = useState('');
   const [quickSuggestionHighlightIdx, setQuickSuggestionHighlightIdx] = useState(0);
+  const [agentSkills, setAgentSkills] = useState<AgentSkillEntry[]>([]);
   const closeQuickSuggestions = useCallback(() => {
     setQuickSuggestionKind(null);
     setQuickSuggestionQuery('');
     setQuickSuggestionHighlightIdx(0);
   }, []);
+  useEffect(() => {
+    if (!serverId) { setAgentSkills([]); return; }
+    let cancelled = false;
+    void listAgentSkills(serverId).then((skills) => {
+      if (!cancelled) setAgentSkills(skills);
+    }).catch(() => {
+      if (!cancelled) setAgentSkills([]);
+    });
+    return () => { cancelled = true; };
+  }, [serverId]);
   const [modelOpen, setModelOpen] = useState(false);
   const [autoOpen, setAutoOpen] = useState(false);
   const [peerAuditOpen, setPeerAuditOpen] = useState(false);
@@ -2271,6 +2299,12 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     quickSuggestionKind,
     quickSuggestionQuery,
   ]);
+  const skillSuggestions = useMemo(() => {
+    if (quickSuggestionKind !== 'skill') return [] as AgentSkillEntry[];
+    const needle = quickSuggestionQuery.trim().toLocaleLowerCase();
+    return agentSkills.filter((skill) => !needle || [skill.name, skill.description, skill.source, skill.sourceUrl]
+      .some((value) => value?.toLocaleLowerCase().includes(needle)));
+  }, [agentSkills, quickSuggestionKind, quickSuggestionQuery]);
   const quickSuggestionPickerRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
     if (quickSuggestionKind === 'phrase' && quickSuggestions.length === 0) {
@@ -2283,7 +2317,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   } = useListboxNavigation({
     activeIndex: quickSuggestionHighlightIdx,
     containerRef: quickSuggestionPickerRef,
-    itemCount: quickSuggestions.length,
+    itemCount: quickSuggestionKind === 'skill' ? skillSuggestions.length : quickSuggestions.length,
     open: quickSuggestionKind !== null,
     setActiveIndex: setQuickSuggestionHighlightIdx,
   });
@@ -3124,6 +3158,13 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     setQuickSuggestionQuery('');
     fillInput(quickSuggestionKind === 'model' ? `${SESSION_MODEL_COMMAND} ${value}` : value);
   };
+
+  const selectSkillSuggestion = useCallback((skill: AgentSkillEntry) => {
+    const current = divRef.current ? readComposerElementText(divRef.current) : '';
+    const before = current.replace(/(?:^|\s)\$[a-z0-9._-]*$/iu, (match) => match.startsWith(' ') ? ' ' : '');
+    fillInput(`${before}${before && !before.endsWith(' ') ? ' ' : ''}${buildAgentSkillMarker(skill)} `);
+    closeQuickSuggestions();
+  }, [closeQuickSuggestions]);
 
   const appendToInput = (paths: string[]) => {
     if (!paths.length) return;
@@ -5002,6 +5043,18 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         setQuickSuggestionKind(null);
         setQuickSuggestionQuery('');
         return;
+      }
+      if (quickSuggestionKind === 'skill' && (e.key === 'Tab' || e.key === 'Enter')) {
+        if (skillSuggestions.length > 0) {
+          e.preventDefault();
+          e.stopPropagation();
+          const skill = skillSuggestions[activeQuickSuggestionIndex];
+          if (skill) selectSkillSuggestion(skill);
+          return;
+        }
+        // A failed/empty skill lookup must not consume Enter; it remains the
+        // ordinary send key so typing can continue without a dead composer.
+        if (e.key === 'Tab') return;
       }
       const exactCommand = quickSuggestionKind === 'command'
         ? quickSuggestions.find(
@@ -7273,6 +7326,29 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
               setTimeout(() => { atJustClosedRef.current = false; atSelectionLockRef.current = false; }, 150);
               insertMachineMarker(refName, displayName);
             }}
+            onSelectSkill={(skill) => {
+              const text = divRef.current ? readComposerElementText(divRef.current) : '';
+              const before = text.replace(/@[^\s@]*$/, '');
+              const nextText = `${before}${before && !before.endsWith(' ') ? ' ' : ''}${buildAgentSkillMarker(skill)} `;
+              if (divRef.current) setComposerElementText(divRef.current, nextText);
+              atSelectionSnapshotRef.current = nextText;
+              atSelectionLockRef.current = true;
+              setAtPickerOpen(false);
+              setAtPickerStage('choose');
+              atJustClosedRef.current = true;
+              setTimeout(() => { atJustClosedRef.current = false; atSelectionLockRef.current = false; }, 150);
+              setHasText(true);
+              publishComposerText(nextText);
+              try {
+                const sel = window.getSelection();
+                const range = document.createRange();
+                range.selectNodeContents(divRef.current!);
+                range.collapse(false);
+                sel?.removeAllRanges();
+                sel?.addRange(range);
+              } catch { /* jsdom lacks Selection API */ }
+            }}
+            serverId={serverId}
             p2pConfig={p2pSavedConfig}
             onClose={() => { setAtPickerOpen(false); setAtPickerStage('choose'); }}
             onStageChange={setAtPickerStage}
@@ -7282,7 +7358,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
 
         {quickSuggestionKind !== null
           && activeSession
-          && (quickSuggestionKind !== 'phrase' || quickSuggestions.length > 0) && (
+          && (quickSuggestionKind === 'skill' || quickSuggestionKind !== 'phrase' || quickSuggestions.length > 0) && (
           <div
             ref={quickSuggestionPickerRef}
             class="controls-slash-picker"
@@ -7291,7 +7367,9 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
               ? 'quick_input.commands'
               : quickSuggestionKind === 'phrase'
                 ? 'quick_input.phrases'
-                : 'quick_input.models')}
+                : quickSuggestionKind === 'skill'
+                  ? 'skill.category'
+                  : 'quick_input.models')}
             style={aliasPickerContainerStyle}
           >
             <div style={aliasPickerGroupLabelStyle}>
@@ -7299,18 +7377,41 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
                 ? 'quick_input.commands'
                 : quickSuggestionKind === 'phrase'
                   ? 'quick_input.phrases'
-                  : 'quick_input.models')}
+                  : quickSuggestionKind === 'skill'
+                    ? 'skill.category'
+                    : 'quick_input.models')}
             </div>
-            {quickSuggestions.length === 0 && (
+            {((quickSuggestionKind === 'skill' ? skillSuggestions.length : quickSuggestions.length) === 0) && (
               <div style={aliasPickerEmptyStyle}>
                 {t(quickSuggestionKind === 'command'
                   ? 'quick_input.no_command_matches'
                   : quickSuggestionKind === 'phrase'
                     ? 'quick_input.no_phrase_matches'
-                    : 'quick_input.no_model_matches')}
+                    : quickSuggestionKind === 'skill'
+                      ? 'skill.no_results'
+                      : 'quick_input.no_model_matches')}
               </div>
             )}
-            {quickSuggestions.map((suggestion, idx) => {
+            {quickSuggestionKind === 'skill' ? skillSuggestions.map((skill, idx) => {
+              const highlighted = idx === activeQuickSuggestionIndex;
+              return (
+                <div
+                  key={`${skill.name}:${skill.source ?? skill.sourceUrl ?? ''}`}
+                  role="option"
+                  aria-selected={highlighted}
+                  data-hl={highlighted ? 'true' : undefined}
+                  data-skill-name={skill.name}
+                  style={highlighted ? aliasPickerItemHighlightStyle : aliasPickerItemStyle}
+                  onMouseDown={(event) => event.preventDefault()}
+                  onClick={() => selectSkillSuggestion(skill)}
+                  title={skill.description || undefined}
+                >
+                  <code>{buildAgentSkillMarker(skill)}</code>
+                  <span style={aliasPickerDimStyle}>{agentSkillSourceLabel(skill)}</span>
+                  {skill.description ? <span style={aliasPickerDimStyle}>{skill.description}</span> : null}
+                </div>
+              );
+            }) : quickSuggestions.map((suggestion, idx) => {
               const highlighted = idx === activeQuickSuggestionIndex;
               return (
                 <div
@@ -7486,9 +7587,17 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
               const suppressQuickPhrase = quickPhraseInputSuppressRef.current;
               quickPhraseInputSuppressRef.current = false;
 
+              const skillTrigger = inputIsComposing ? null : matchInlineSkillTrigger(text);
               const modelTrigger = inputIsComposing ? null : matchModelCommandTrigger(text);
               const slashTrigger = inputIsComposing ? null : matchSlashCommandTrigger(text);
-              if (modelTrigger !== null) {
+              const hasSkillSuggestions = skillTrigger !== null
+                && agentSkills.some((skill) => !skillTrigger || [skill.name, skill.description, skill.source, skill.sourceUrl]
+                  .some((value) => value?.toLocaleLowerCase().includes(skillTrigger.toLocaleLowerCase())));
+              if (skillTrigger !== null && hasSkillSuggestions) {
+                setQuickSuggestionKind('skill');
+                setQuickSuggestionQuery(skillTrigger);
+                setQuickSuggestionHighlightIdx(0);
+              } else if (modelTrigger !== null) {
                 setQuickSuggestionKind('model');
                 setQuickSuggestionQuery(modelTrigger);
                 setQuickSuggestionHighlightIdx(0);
