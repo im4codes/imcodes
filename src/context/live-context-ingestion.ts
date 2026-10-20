@@ -669,7 +669,16 @@ function mapTimelineEvent(event: TimelineEvent): Pick<LocalContextEvent, 'eventT
     }
     case 'assistant.text': {
       const text = stringifyContent(event.payload.text);
-      if (event.payload.streaming === true || event.payload.memoryExcluded === true) return null;
+      // Provider failures are emitted as assistant.text for the current-turn
+      // diagnostic, but are not model output.  The explicit marker is present
+      // on new events; providerErrorCode/recoverable also protects persisted
+      // rows written by older daemons that predate memoryExcluded.
+      if (
+        event.payload.streaming === true
+        || event.payload.memoryExcluded === true
+        || (typeof event.payload.providerErrorCode === 'string' && event.payload.providerErrorCode.length > 0)
+        || typeof event.payload.providerErrorRecoverable === 'boolean'
+      ) return null;
       if (isMemoryNoiseTurn(text)) return null;
       return {
         eventType: 'assistant.turn',

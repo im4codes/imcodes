@@ -610,6 +610,10 @@ export function wireProviderToRelay(provider: TransportProvider): void {
           type: 'assistant.text',
           sessionId: sessionName,
           text: cancelledText,
+          // Keep interrupted output visible/replayable, but never feed the
+          // cancellation diagnostic back into memory or the next provider
+          // context after a reconnect.
+          memoryExcluded: true,
           [TASK_PAIR_TERMINAL_FLUSH_FIELD]: true,
         });
       }
@@ -618,6 +622,7 @@ export function wireProviderToRelay(provider: TransportProvider): void {
           type: 'assistant.text',
           sessionId: sessionName,
           text: cancelledText,
+          memoryExcluded: true,
         });
       }
       return;
@@ -657,7 +662,10 @@ export function wireProviderToRelay(provider: TransportProvider): void {
       providerErrorCode: error.code,
       providerErrorRecoverable: error.recoverable,
       ...(tracked ? { [TASK_PAIR_TERMINAL_FLUSH_FIELD]: true } : {}),
-      ...(!tracked?.text ? { memoryExcluded: true } : {}),
+      // Provider failures are diagnostic UI output, not assistant content.
+      // Mark both empty and partial error bubbles so live ingestion and
+      // history backfill cannot carry the failure into a later prompt.
+      memoryExcluded: true,
     }, {
       source: 'daemon',
       confidence: 'high',

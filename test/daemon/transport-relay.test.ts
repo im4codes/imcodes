@@ -985,6 +985,7 @@ describe('transport-relay (timeline-emitter based)', () => {
       expect(textCall![0]).toBe('sess-err');
       expect(textCall![2].text).toBe('⚠️ Error: Too many requests');
       expect(textCall![2].streaming).toBe(false);
+      expect(textCall![2].memoryExcluded).toBe(true);
       expect(timelineCalls.some(c => c[1] === 'session.state')).toBe(false);
     });
 
@@ -1000,6 +1001,7 @@ describe('transport-relay (timeline-emitter based)', () => {
       const textCall = emitMock.mock.calls.find(c => c[1] === 'assistant.text');
       expect(textCall?.[2].text).toBe(message);
       expect(textCall?.[2].text.match(/Connection closed mid-response/g)).toHaveLength(1);
+      expect(textCall?.[2].memoryExcluded).toBe(true);
       expect(emitMock.mock.calls.some(c => c[1] === 'session.state')).toBe(false);
     });
 
@@ -1192,6 +1194,7 @@ describe('transport-relay (timeline-emitter based)', () => {
         type: 'assistant.text',
         sessionId: 'sess-watchdog',
         text: '⚠️ OpenCode was unresponsive and was automatically recovered.',
+        memoryExcluded: true,
       });
     });
 
