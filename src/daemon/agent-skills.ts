@@ -177,6 +177,17 @@ export async function listAgentSkills(homeDir: string = homedir(), context: { pr
   try {
     const snapshot = getSkillRegistryManagementSnapshot({ projectDir: context.projectDir, homeDir });
     for (const entry of snapshot.entries) {
+      // The picker is device-local: registry metadata without a readable local
+      // payload must not be offered as an installable/expandable skill.
+      if (!entry.path) continue;
+      try {
+        const payload = entry.path.endsWith(AGENT_SKILL_FILE_NAME)
+          ? entry.path
+          : join(entry.path, AGENT_SKILL_FILE_NAME);
+        if (!(await stat(payload)).isFile()) continue;
+      } catch {
+        continue;
+      }
       const name = entry.metadata.name?.trim() || entry.key;
       if (!name || skills.length >= AGENT_SKILLS_LIMITS.SKILLS * 2) break;
       skills.push({ name, description: entry.metadata.description ?? '', layer: entry.layer, displayPath: entry.displayPath, uri: entry.uri });
