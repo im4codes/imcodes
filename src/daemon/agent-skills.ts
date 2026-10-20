@@ -29,6 +29,15 @@ const MAX_SKILL_FILE_BYTES = 256 * 1024;
 
 const SKILL_CONTENT_START = '[skill:';
 
+async function registryPayloadPath(path: string): Promise<string | undefined> {
+  try {
+    if ((await stat(path)).isFile()) return path;
+    const payload = join(path, AGENT_SKILL_FILE_NAME);
+    if ((await stat(payload)).isFile()) return payload;
+  } catch { /* unavailable on this device */ }
+  return undefined;
+}
+
 export interface AgentSkillExpansion {
   text: string;
   unresolved: string[];
@@ -180,14 +189,7 @@ export async function listAgentSkills(homeDir: string = homedir(), context: { pr
       // The picker is device-local: registry metadata without a readable local
       // payload must not be offered as an installable/expandable skill.
       if (!entry.path) continue;
-      try {
-        const payload = entry.path.endsWith(AGENT_SKILL_FILE_NAME)
-          ? entry.path
-          : join(entry.path, AGENT_SKILL_FILE_NAME);
-        if (!(await stat(payload)).isFile()) continue;
-      } catch {
-        continue;
-      }
+      if (!(await registryPayloadPath(entry.path))) continue;
       const name = entry.metadata.name?.trim() || entry.key;
       if (!name || skills.length >= AGENT_SKILLS_LIMITS.SKILLS * 2) break;
       skills.push({ name, description: entry.metadata.description ?? '', layer: entry.layer, displayPath: entry.displayPath, uri: entry.uri });
@@ -237,7 +239,7 @@ export async function expandAgentSkillReferences(
       if (!skill.displayPath?.startsWith('~/.agents/skills/')) {
         const registry = getSkillRegistryManagementSnapshot({ projectDir: context.projectDir, homeDir });
         const entry = registry.entries.find((candidate) => candidate.uri === skill.uri);
-        if (entry?.path) skillPath = entry.path.endsWith(AGENT_SKILL_FILE_NAME) ? entry.path : join(entry.path, AGENT_SKILL_FILE_NAME);
+        if (entry?.path) skillPath = (await registryPayloadPath(entry.path)) ?? skillPath;
       }
       const content = await readFile(skillPath, 'utf8');
       if (!content.trim() || Buffer.byteLength(content, 'utf8') > MAX_SKILL_FILE_BYTES) {
