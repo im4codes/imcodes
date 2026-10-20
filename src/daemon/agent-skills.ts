@@ -138,7 +138,9 @@ export async function listAgentSkills(homeDir: string = homedir()): Promise<Agen
   try {
     names = await readdir(root);
   } catch {
-    return [];
+    // A project may provide registry skills even when the user's local
+    // ~/.agents/skills root has never been created on this device.
+    names = [];
   }
   const lock = await readLock(homeDir);
   const skills: AgentSkillEntry[] = [];
