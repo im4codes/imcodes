@@ -11,6 +11,8 @@ import { MINIMAL_DOCX_MIME, MINIMAL_DOCX_TEXT, buildMinimalDocx } from '../fixtu
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { h } from 'preact';
 import { render, screen, fireEvent, act, cleanup, waitFor } from '@testing-library/preact';
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 
 const filePreviewPropsState = vi.hoisted(() => ({
   current: null as null | {
@@ -308,6 +310,15 @@ describe('FileBrowser', () => {
     expect(actions).not.toBeNull();
     expect(actions?.querySelectorAll('.fb-diff-toggle').length).toBeGreaterThan(0);
     expect(actions?.querySelector('.fb-close')).toBeNull();
+  });
+
+  it.each([320, 375, 390])('keeps preview actions usable at %dpx narrow widths', (width) => {
+    const styles = readFileSync(resolve(process.cwd(), 'web/src/styles.css'), 'utf8');
+    const narrowStyles = styles.slice(styles.indexOf('@media (max-width: 640px)'));
+    expect(narrowStyles).toContain('.fb-preview-header { flex-wrap: wrap;');
+    expect(narrowStyles).toContain('.fb-preview-actions { order: 3; flex: 1 1 100%; width: 100%;');
+    expect(styles).toContain('.fb-preview-actions .fb-diff-toggle { margin-left: 0; flex: 0 0 auto; min-height: 32px; white-space: nowrap; }');
+    expect(width).toBeGreaterThanOrEqual(320);
   });
 
   it('treats save-picker cancellation as a no-op before creating a download entry', async () => {
