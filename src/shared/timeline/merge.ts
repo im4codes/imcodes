@@ -322,6 +322,7 @@ export function mergeTimelineEventsWithTextPriority(
   incomingEvents: TimelineEvent[],
   maxDetailEvents = 300,
   maxTextEvents = maxDetailEvents,
+  maxTotalEvents = Math.max(maxDetailEvents, maxTextEvents),
 ): TimelineEvent[] {
   const merged = mergeTimelineEvents(
     existingEvents,
@@ -329,8 +330,32 @@ export function mergeTimelineEventsWithTextPriority(
     Math.max(maxDetailEvents, maxTextEvents, existingEvents.length + incomingEvents.length),
   );
   const textTypes = TIMELINE_TEXT_HISTORY_EVENT_TYPES as readonly string[];
-  const text = merged.filter((event) => textTypes.includes(event.type)).slice(-maxTextEvents);
-  const detail = merged.filter((event) => !textTypes.includes(event.type)).slice(-maxDetailEvents);
+  // Text is the user-visible conversation and must win when the two class
+  // tails cannot fit in one window. Keep as much text as the total budget
+  // allows, then spend the remaining rows on the newest tool/state details.
+  // This preserves the independent class budget without allowing the final
+  // cache bound to chronologically trim the text tail away again.
+  const totalBudget = Math.max(0, maxTotalEvents);
+  const text = merged
+    .filter((event) => textTypes.includes(event.type))
+    .slice(-Math.min(maxTextEvents, totalBudget));
+  const detailBudget = Math.max(0, totalBudget - text.length);
+  const detail = merged
+    .filter((event) => !textTypes.includes(event.type))
+    .slice(-Math.min(maxDetailEvents, detailBudget));
+  // Interleaved history (for example, one text row every few tool rows)
+  // needs a contiguous tail: selecting each class independently would punch
+  // holes through the visible timeline. Grouped tool bursts still use the
+  // class-priority selection above, which keeps a contiguous text block from
+  // being displaced by detail rows.
+  let transitions = 0;
+  let previousIsText: boolean | undefined;
+  for (const event of merged) {
+    const currentIsText = textTypes.includes(event.type);
+    if (previousIsText !== undefined && currentIsText !== previousIsText) transitions += 1;
+    previousIsText = currentIsText;
+  }
+  if (merged.length > totalBudget && transitions > 2) return merged.slice(-totalBudget);
   const retained = [...text, ...detail].sort((left, right) => left.ts - right.ts || left.seq - right.seq);
   if (retained.length === merged.length && retained.every((event, index) => event === merged[index])) {
     return merged;

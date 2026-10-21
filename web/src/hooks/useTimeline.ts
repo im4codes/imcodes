@@ -534,11 +534,10 @@ function retainedTimelineMergeLimit(...eventSets: readonly TimelineEvent[][]): n
  * no cross-window LRU: a busy peer may fill its own window, but can never make
  * an unrelated visible/minimized chat lose its instant seed.
  */
-// Expanded windows retain an independent text tail as large as the detail
-// window.  Keep enough room for both classes (plus a bounded pin context), or
-// the cache's final chronological trim would undo the class-aware merge and
-// evict older text rows immediately after a page/realtime update.
-const MAX_WINDOW_CACHED_EVENTS = MAX_HISTORY_EVENTS * 2 + MAX_PIN_CONTEXT_EVENTS * 2;
+// Expanded windows retain an independent text tail, but each window still has
+// one bounded budget. Text is selected first inside this budget so a dense
+// tool burst cannot evict the conversation history.
+const MAX_WINDOW_CACHED_EVENTS = MAX_HISTORY_EVENTS + MAX_TEXT_MEMORY_EVENTS + MAX_PIN_CONTEXT_EVENTS;
 
 function isTimelineTextHistoryEvent(event: TimelineEvent): boolean {
   return (TIMELINE_TEXT_HISTORY_EVENT_TYPES as readonly string[]).includes(event.type);
@@ -559,6 +558,7 @@ function mergeTimelineEventsForWindow(
     incomingEvents,
     maxDetailEvents,
     maxTextEvents,
+    MAX_WINDOW_CACHED_EVENTS,
   );
 }
 

@@ -277,6 +277,29 @@ describe('useTimeline window-isolated cache bounds', () => {
     expect(merged.at(-1)?.eventId).toBe(`${sessionName}-live`);
   });
 
+  it('keeps the text tail when expanded text and tool detail exceed one window budget', () => {
+    const sessionName = `deck_budgeted_text_priority_${Date.now()}`;
+    const text = makeEvents(sessionName, 2000);
+    const tools = Array.from({ length: 2000 }, (_, index) => ({
+      eventId: `${sessionName}-tool-${index}`,
+      sessionId: sessionName,
+      ts: 3000 + index,
+      epoch: 1,
+      seq: 3000 + index,
+      source: 'daemon' as const,
+      confidence: 'high' as const,
+      type: 'tool.result' as const,
+      payload: { output: `tool-${index}` },
+    } satisfies TimelineEvent));
+
+    const merged = __mergeTimelineEventsForTests(text, tools, 2000);
+    expect(merged).toHaveLength(2361);
+    expect(merged.filter((event) => event.type === 'assistant.text')).toHaveLength(2000);
+    expect(merged.filter((event) => event.type === 'tool.result')).toHaveLength(361);
+    expect(merged[0]?.eventId).toBe(`${sessionName}-0`);
+    expect(merged.at(-1)?.eventId).toBe(`${sessionName}-tool-1999`);
+  });
+
   it('pushes cache updates to already-mounted hooks for the same session', async () => {
     function Probe({ name }: { name: string }) {
       const { events } = useTimeline('deck_sub_codex', null, 'srv');
