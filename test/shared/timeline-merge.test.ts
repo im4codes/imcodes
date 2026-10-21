@@ -1,5 +1,9 @@
 import { describe, expect, it } from 'vitest';
-import { mergeTimelineEvents, preferTimelineEvent } from '../../src/shared/timeline/merge.js';
+import {
+  mergeTimelineEvents,
+  mergeTimelineEventsWithTextPriority,
+  preferTimelineEvent,
+} from '../../src/shared/timeline/merge.js';
 import type { TimelineEvent } from '../../src/shared/timeline/types.js';
 
 function makeEvent(overrides: Partial<TimelineEvent> & { eventId: string }): TimelineEvent {
@@ -280,6 +284,32 @@ describe('mergeTimelineEvents', () => {
 
     expect(merged.map((event) => event.eventId)).toEqual(['old-assistant', 'new-user']);
     expect(merged[0]?.payload.text).toContain('Turn cancelled');
+  });
+});
+
+describe('mergeTimelineEventsWithTextPriority', () => {
+  it('retains text when a large tool burst fills the detail window', () => {
+    const text = makeEvent({
+      eventId: 'assistant-before-tools',
+      type: 'assistant.text',
+      ts: 1,
+      seq: 1,
+      payload: { text: 'visible reply' },
+    });
+    const tools = Array.from({ length: 288 }, (_, index) => makeEvent({
+      eventId: `tool-${index}`,
+      type: index === 287 ? 'tool.call' : 'tool.result',
+      ts: 10 + index,
+      seq: 10 + index,
+      payload: { toolCallId: `call-${index}`, output: 'x'.repeat(1024) },
+    }));
+
+    const merged = mergeTimelineEventsWithTextPriority(tools, [text], 300, 300);
+
+    expect(merged.find((event) => event.eventId === text.eventId)?.payload.text).toBe('visible reply');
+    expect(merged.filter((event) => event.type === 'tool.result')).toHaveLength(287);
+    expect(merged.filter((event) => event.type === 'tool.call')).toHaveLength(1);
+    expect(merged.at(-1)?.eventId).toBe('tool-287');
   });
 });
 

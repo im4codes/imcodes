@@ -1,5 +1,6 @@
 import type { TimelineEvent } from './types.js';
 import {
+  TIMELINE_TEXT_HISTORY_EVENT_TYPES,
   TIMELINE_USER_DELETED_PAYLOAD_KEY,
   TIMELINE_DETAIL_FIELD_PATHS as SHARED_TIMELINE_DETAIL_FIELD_PATHS,
   type TimelineDetailFieldPath,
@@ -305,4 +306,34 @@ export function mergeTimelineEvents(
   }
 
   return bounded;
+}
+
+/**
+ * Merge a chat window with independent text/detail tails.
+ *
+ * A normal newest-N trim is unsafe for a tool-heavy turn: a burst of tool
+ * results can evict an older assistant/user message before the text-only
+ * history request is applied. Keep bounded text rows separately, then retain
+ * the requested detail window. The caller still controls both bounds, and the
+ * durable timeline remains authoritative outside them.
+ */
+export function mergeTimelineEventsWithTextPriority(
+  existingEvents: TimelineEvent[],
+  incomingEvents: TimelineEvent[],
+  maxDetailEvents = 300,
+  maxTextEvents = maxDetailEvents,
+): TimelineEvent[] {
+  const merged = mergeTimelineEvents(
+    existingEvents,
+    incomingEvents,
+    Math.max(maxDetailEvents, maxTextEvents, existingEvents.length + incomingEvents.length),
+  );
+  const textTypes = TIMELINE_TEXT_HISTORY_EVENT_TYPES as readonly string[];
+  const text = merged.filter((event) => textTypes.includes(event.type)).slice(-maxTextEvents);
+  const detail = merged.filter((event) => !textTypes.includes(event.type)).slice(-maxDetailEvents);
+  const retained = [...text, ...detail].sort((left, right) => left.ts - right.ts || left.seq - right.seq);
+  if (retained.length === merged.length && retained.every((event, index) => event === merged[index])) {
+    return merged;
+  }
+  return retained;
 }

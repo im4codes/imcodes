@@ -21,6 +21,7 @@ import {
   __getTimelineCacheForTests,
   __getTimelineCacheKeysForTests,
   __getTimelineSnapshotBookkeepingKeysForTests,
+  __mergeTimelineEventsForTests,
   __getSharedTimelineBaseForTests,
   __resetLocalHistoryPruneStateForTests,
   __resetTimelineCacheForTests,
@@ -130,8 +131,45 @@ describe('useTimeline window-isolated cache bounds', () => {
     expect(keys).toContain('server:b');
     expect(keys).toContain('server:c');
     expect(keys).toContain('server:d');
-    expect(__getTimelineCacheForTests('server:a')?.length).toBeLessThanOrEqual(2_061);
-    expect(__getTimelineCacheForTests('server:d')?.length).toBeLessThanOrEqual(2_061);
+    // Text and detail rows have independent bounded tails.  The cache keeps
+    // the 2,000-event detail window plus the 300-event text window and pin
+    // context, so tool bursts cannot evict conversation text.
+    expect(__getTimelineCacheForTests('server:a')?.length).toBeLessThanOrEqual(2_361);
+    expect(__getTimelineCacheForTests('server:d')?.length).toBeLessThanOrEqual(2_361);
+  });
+
+  it('keeps text visible when a 288-event tool burst shares the history window', () => {
+    const text: TimelineEvent = {
+      eventId: 'text-before-tools',
+      sessionId: 'mixed',
+      ts: 1,
+      epoch: 1,
+      seq: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'assistant.text',
+      payload: { text: 'conversation text' },
+    };
+    const tools = Array.from({ length: 288 }, (_, index) => ({
+      eventId: `tool-${index}`,
+      sessionId: 'mixed',
+      ts: index + 2,
+      epoch: 1,
+      seq: index + 2,
+      source: 'daemon' as const,
+      confidence: 'high' as const,
+      type: (index === 287 ? 'tool.call' : 'tool.result') as TimelineEvent['type'],
+      payload: {
+        toolCallId: `call-${index}`,
+        status: index === 287 ? 'running' : 'complete',
+        output: 'x'.repeat(1024),
+      },
+    } satisfies TimelineEvent));
+
+    const merged = __mergeTimelineEventsForTests(tools, [text], 300);
+    expect(merged.some((event) => event.eventId === text.eventId)).toBe(true);
+    expect(merged.filter((event) => event.type === 'tool.call' || event.type === 'tool.result')).toHaveLength(288);
+    expect(merged.find((event) => event.eventId === text.eventId)?.payload.text).toBe('conversation text');
   });
 
   it('keeps snapshot bookkeeping independent when peer-window count exceeds the old cap', () => {

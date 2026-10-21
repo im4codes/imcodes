@@ -245,6 +245,48 @@ describe('useTimeline — stale window: latest first, then newest→oldest', () 
     expect(hook.current!.events.length).toBeGreaterThan(0);
   });
 
+  it('asks for a text tail when the local cache contains only tool events', async () => {
+    const sessionName = `deck_stale_tool_only_${Date.now()}`;
+    const now = Date.now();
+    const tools = Array.from({ length: 288 }, (_, index) => ({
+      eventId: `${sessionName}-tool-${index}`,
+      sessionId: sessionName,
+      ts: now - 288 + index,
+      epoch: 1,
+      seq: index + 1,
+      source: 'daemon' as const,
+      confidence: 'high' as const,
+      type: (index === 287 ? 'tool.call' : 'tool.result') as TimelineEvent['type'],
+      payload: { toolCallId: `${sessionName}-call-${index}`, output: 'x'.repeat(1024) },
+    } satisfies TimelineEvent));
+    const text: TimelineEvent = {
+      eventId: `${sessionName}-text`,
+      sessionId: sessionName,
+      ts: now + 1,
+      epoch: 1,
+      seq: 289,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'assistant.text',
+      payload: { text: 'latest conversation text' },
+    };
+    const cacheKey = `${SERVER_ID}:${sessionName}`;
+    __setTimelineCacheForTests(cacheKey, tools);
+    const daemon = makeDaemon([...tools, text], sessionName);
+    installHttp([...tools, text], daemon.requests);
+    const hook: { current: ReturnType<typeof useTimeline> | null } = { current: null };
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    render(h(Probe, { sessionName, ws: daemon.ws, hook }));
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(20); });
+    expect(daemon.requests[0]).toMatchObject({
+      via: 'ws',
+      limit: TIMELINE_STALE_WINDOW_TAIL_PEEK_LIMIT,
+      filter: TIMELINE_HISTORY_CONTENT_FILTERS.TEXT,
+    });
+    expect(hook.current!.events.some((event) => event.eventId === text.eventId)).toBe(true);
+  });
+
   it('version skew: a daemon that ignores contentFilter answers the peek with a mixed newest-30; everything still stitches', async () => {
     const sessionName = `deck_stale_skew_${Date.now()}`;
     const { all, hook } = await openStale(sessionName, 900, 60, undefined, { ignoreContentFilter: true });

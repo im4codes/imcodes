@@ -12,6 +12,7 @@ import {
   TIMELINE_MESSAGES,
   TIMELINE_PROTOCOL_REVISION,
   TIMELINE_HISTORY_CONTENT_FILTERS,
+  TIMELINE_TEXT_HISTORY_EVENT_TYPES,
   TIMELINE_RESPONSE_STATUS,
   TIMELINE_STALE_WINDOW_TAIL_PEEK_LIMIT,
   type TimelineCursor,
@@ -95,7 +96,7 @@ import { TimelineDB, type DrainCursor } from '../timeline-db.js';
 import { getTimelineStore, __resetTimelineStoresForTests } from '../stores/timeline-store.js';
 import {
   TIMELINE_DETAIL_FIELD_PATHS,
-  mergeTimelineEvents,
+  mergeTimelineEventsWithTextPriority,
   preferTimelineEvent,
   type TimelineDetailFieldPath,
 } from '../../../src/shared/timeline/merge.js';
@@ -501,6 +502,15 @@ export function __setStaleWindowPeekMinAgeMsForTests(ms: number | null): void {
 /** The peek is a handful of messages; a small budget keeps its reply tiny on a mobile link. */
 const STALE_WINDOW_PEEK_BUDGET_BYTES = 256 * 1024;
 const MAX_HISTORY_EVENTS = 2000;
+/**
+ * Conversation rows and tool/state rows have separate in-memory budgets.  A
+ * generic newest-N merge lets a burst of tool results evict an older
+ * assistant message before the text-only history request can fill the gap.
+ * Keep the newest text rows in their own bounded tail, then retain the normal
+ * detail window independently.  The durable store remains the source of truth
+ * for anything outside either tail.
+ */
+const MAX_TEXT_MEMORY_EVENTS = MAX_MEMORY_EVENTS;
 const MAX_PIN_CONTEXT_EVENTS = MESSAGE_PIN_LIMITS.CONTEXT_EVENTS_BEFORE
   + 1
   + MESSAGE_PIN_LIMITS.CONTEXT_EVENTS_AFTER;
@@ -524,7 +534,33 @@ function retainedTimelineMergeLimit(...eventSets: readonly TimelineEvent[][]): n
  * no cross-window LRU: a busy peer may fill its own window, but can never make
  * an unrelated visible/minimized chat lose its instant seed.
  */
-const MAX_WINDOW_CACHED_EVENTS = MAX_HISTORY_EVENTS + MAX_PIN_CONTEXT_EVENTS;
+const MAX_WINDOW_CACHED_EVENTS = MAX_HISTORY_EVENTS + MAX_TEXT_MEMORY_EVENTS + MAX_PIN_CONTEXT_EVENTS;
+
+function isTimelineTextHistoryEvent(event: TimelineEvent): boolean {
+  return (TIMELINE_TEXT_HISTORY_EVENT_TYPES as readonly string[]).includes(event.type);
+}
+
+function mergeTimelineEventsForWindow(
+  existingEvents: TimelineEvent[],
+  incomingEvents: TimelineEvent[],
+  maxDetailEvents = MAX_MEMORY_EVENTS,
+): TimelineEvent[] {
+  return mergeTimelineEventsWithTextPriority(
+    existingEvents,
+    incomingEvents,
+    maxDetailEvents,
+    MAX_TEXT_MEMORY_EVENTS,
+  );
+}
+
+/** Test seam for the class-aware bounded merge; production callers use the hook paths above. */
+export function __mergeTimelineEventsForTests(
+  existingEvents: TimelineEvent[],
+  incomingEvents: TimelineEvent[],
+  maxDetailEvents = MAX_MEMORY_EVENTS,
+): TimelineEvent[] {
+  return mergeTimelineEventsForWindow(existingEvents, incomingEvents, maxDetailEvents);
+}
 /**
  * How long a cold timeline may report the daemon fetch as still coming while
  * the socket is down.
@@ -695,7 +731,7 @@ async function refreshCachedWindowAfterDrain(
   // to drop the rows we know were deleted — returning early would leave them
   // in the cache indefinitely.
   const merged = refreshed.length > 0
-    ? mergeTimelineEvents(survivors, refreshed, retainedTimelineMergeLimit(survivors, refreshed))
+    ? mergeTimelineEventsForWindow(survivors, refreshed, retainedTimelineMergeLimit(survivors, refreshed))
     : survivors;
   if (merged !== existing) setCachedEvents(cacheKey, merged);
 
@@ -1466,7 +1502,7 @@ function flushPendingTimelineCacheIngests(): void {
     const incoming = [...byEventId.values()];
     if (incoming.length === 0) continue;
     const existing = getCachedEvents(cacheKey) ?? [];
-    const merged = mergeTimelineEvents(existing, incoming, retainedTimelineMergeLimit(existing));
+    const merged = mergeTimelineEventsForWindow(existing, incoming, retainedTimelineMergeLimit(existing));
     if (merged !== existing) setCachedEvents(cacheKey, merged);
     persistTimelineEvents(cacheKey, incoming);
   }
@@ -1513,7 +1549,7 @@ function getSharedTimelineBase(
   const effectiveMax = maxEvents === MAX_MEMORY_EVENTS
     ? retainedTimelineMergeLimit(shared, localEvents)
     : maxEvents;
-  return mergeTimelineEvents(shared, localEvents, effectiveMax);
+  return mergeTimelineEventsForWindow(shared, localEvents, effectiveMax);
 }
 
 /**
@@ -1717,7 +1753,7 @@ export function ingestTimelineEventForCache(event: TimelineEvent, serverId?: str
   }
   dropPendingTimelineCacheIngest(cacheKey, event.eventId);
   const existing = getCachedEvents(cacheKey) ?? [];
-  const merged = mergeTimelineEvents(existing, [event], retainedTimelineMergeLimit(existing));
+  const merged = mergeTimelineEventsForWindow(existing, [event], retainedTimelineMergeLimit(existing));
   if (merged !== existing) setCachedEvents(cacheKey, merged);
   persistTimelineEvents(cacheKey, [event]);
 }
@@ -2472,15 +2508,17 @@ export function useTimeline(
    * the local read has not answered yet (a stale cache may be about to appear; a cold one just gets 30 messages
    * it would have got anyway). Never for a settled-empty (cold) window, and at most once a minute per window.
    */
-  const sendStaleWindowPeek = useCallback((): void => {
+  const sendStaleWindowPeek = useCallback((force = false): void => {
     if (!ws?.connected || !sessionId || !cacheKey) return;
     if (!Number.isFinite(staleWindowPeekMinAgeMs)) return;
     const now = Date.now();
     const cursorTs = getLocalCacheCursorTs();
-    if (cursorTs !== undefined) {
-      if (now - cursorTs < staleWindowPeekMinAgeMs) return;
-    } else if (localReadSettledKeyRef.current === cacheKey) {
-      return;
+    if (!force) {
+      if (cursorTs !== undefined) {
+        if (now - cursorTs < staleWindowPeekMinAgeMs) return;
+      } else if (localReadSettledKeyRef.current === cacheKey) {
+        return;
+      }
     }
     const last = lastPeekRef.current;
     if (last && last.key === cacheKey && now - last.at < STALE_WINDOW_PEEK_REPEAT_MS) return;
@@ -2844,7 +2882,14 @@ export function useTimeline(
       } else {
         markDaemonHistoryBackground();
       }
-      sendStaleWindowPeekRef.current();
+      const peekSource = sourceEvents ?? eventsRef.current;
+      // A cache containing only tool/state rows is not stale merely by age: it
+      // is incomplete for the conversation. Ask for a text-only tail anyway,
+      // but keep a genuinely cold empty cache on the normal bounded bootstrap
+      // path (there is no cursor to peek from yet).
+      sendStaleWindowPeekRef.current(
+        peekSource.length > 0 && !peekSource.some(isTimelineTextHistoryEvent),
+      );
       sendForwardHistoryRequest('bootstrap', buildForwardHistoryArgs(limit, sourceEvents));
     };
 
@@ -3045,7 +3090,7 @@ export function useTimeline(
       );
       if (stored.length > 0) {
         const existing = getSharedTimelineBase(cacheKey!, eventsRef.current, MAX_MEMORY_EVENTS);
-        const restored = mergeTimelineEvents(existing, stored, retainedTimelineMergeLimit(existing));
+        const restored = mergeTimelineEventsForWindow(existing, stored, retainedTimelineMergeLimit(existing));
         setCachedEvents(cacheKey!, restored);
         setEvents((prev) => (prev === restored ? prev : restored));
         setLoading(false);
@@ -3854,7 +3899,7 @@ export function useTimeline(
     setEvents((prev) => {
       const sharedBase = getSharedTimelineBase(cacheKeyRef.current, prev, MAX_MEMORY_EVENTS);
       const base = removeReconciledLocalUserMessages(sharedBase, [event]);
-      const result = mergeTimelineEvents(base, [event], retainedTimelineMergeLimit(base));
+      const result = mergeTimelineEventsForWindow(base, [event], retainedTimelineMergeLimit(base));
       if (result === base) return base;
       if (cacheKeyRef.current) setCachedEvents(cacheKeyRef.current, result);
       return result;
@@ -3875,7 +3920,7 @@ export function useTimeline(
         : maxEvents;
       const sharedBase = getSharedTimelineBase(cacheKeyRef.current, prev, effectiveMax);
       const base = removeReconciledLocalUserMessages(sharedBase, incoming);
-      const result = mergeTimelineEvents(base, incoming, effectiveMax);
+      const result = mergeTimelineEventsForWindow(base, incoming, effectiveMax);
       if (result === base) return base;
       if (cacheKeyRef.current) {
         if (options?.updateCache === false) {
@@ -4045,7 +4090,7 @@ export function useTimeline(
           ? shared.slice(shared.length - MAX_HISTORY_EVENTS)
           : shared;
         const base = removeReconciledLocalUserMessages(recent, context);
-        const result = mergeTimelineEvents(base, context, MAX_HISTORY_EVENTS + context.length);
+        const result = mergeTimelineEventsForWindow(base, context, MAX_HISTORY_EVENTS + context.length);
         if (cacheKeyRef.current) setCachedEvents(cacheKeyRef.current, result);
         return result;
       });
@@ -4706,7 +4751,7 @@ export function useTimeline(
     const localSnapshot = loadPersistedTimelineSnapshotWithFallback(key, rawSessionId);
     if (localSnapshot.length > 0) {
       const existing = getSharedTimelineBase(key, eventsRef.current, MAX_MEMORY_EVENTS);
-      const restored = mergeTimelineEvents(existing, localSnapshot, retainedTimelineMergeLimit(existing));
+      const restored = mergeTimelineEventsForWindow(existing, localSnapshot, retainedTimelineMergeLimit(existing));
       setCachedEvents(key, restored);
       setEvents((prev) => (prev === restored ? prev : restored));
       const snapshotCursor = deriveLocalCursor(localSnapshot);
@@ -4723,7 +4768,7 @@ export function useTimeline(
     }
     if (stored.length > 0) {
       const existing = getSharedTimelineBase(key, eventsRef.current, MAX_MEMORY_EVENTS);
-      const restored = mergeTimelineEvents(existing, stored, retainedTimelineMergeLimit(existing));
+      const restored = mergeTimelineEventsForWindow(existing, stored, retainedTimelineMergeLimit(existing));
       setCachedEvents(key, restored);
       setEvents((prev) => (prev === restored ? prev : restored));
       // Single completeness gate (forceRefresh path): don't lock path-2 on a
@@ -4943,7 +4988,9 @@ export function useTimeline(
       backfillDebug('isActiveSession false→true: firing backfill', { sessionId });
       // Tapping a chat that was not on screen: its latest messages first (tiny text-only tail), before the
       // window request below is even sent.
-      sendStaleWindowPeekRef.current();
+      sendStaleWindowPeekRef.current(
+        eventsRef.current.length > 0 && !eventsRef.current.some(isTimelineTextHistoryEvent),
+      );
       // Short on-screen timeline → also re-read local history (idempotent merge).
       // Same rationale as the activation-event handler above
       // (ACTIVE_LOCAL_RELOAD_MAX_EVENTS): recover a truncated reopen without
@@ -5139,7 +5186,7 @@ export function useTimeline(
                 rememberSettledCommandId(echoCommandId);
                 if (idx >= 0) {
                   const withoutOptimistic = base.filter((_, index) => index !== idx);
-                  const updated = mergeTimelineEvents(
+                  const updated = mergeTimelineEventsForWindow(
                     withoutOptimistic,
                     [event],
                     retainedTimelineMergeLimit(withoutOptimistic),
@@ -5170,7 +5217,7 @@ export function useTimeline(
                 rememberSettledCommandId(removedCommandId);
               }
               const withoutOptimistic = base.filter((_, index) => index !== optimisticTextIdx);
-              const updated = mergeTimelineEvents(
+              const updated = mergeTimelineEventsForWindow(
                 withoutOptimistic,
                 [event],
                 retainedTimelineMergeLimit(withoutOptimistic),
@@ -5331,7 +5378,7 @@ export function useTimeline(
           if (hadProvisionalTransportHistory) {
             const next = withoutProvisionalTransportHistory.length === 0
               ? msg.events
-              : mergeTimelineEvents(
+              : mergeTimelineEventsForWindow(
                 withoutProvisionalTransportHistory,
                 msg.events,
                 retainedTimelineMergeLimit(withoutProvisionalTransportHistory),
