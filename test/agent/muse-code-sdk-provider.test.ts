@@ -1,4 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync } from 'node:fs';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
 import {
   DEFAULT_MUSE_MODELS,
   MUSE_CODE_SDK_PROVIDER_ID,
@@ -252,6 +255,75 @@ describe('MuseCodeSdkProvider session and turn lifecycle', () => {
     });
 
     await provider.endSession(routeId);
+  });
+
+  it('canonicalizes a symlinked workspace root before starting Muse', async () => {
+    const tempRoot = mkdtempSync(join(tmpdir(), 'muse-workspace-'));
+    const realRoot = join(tempRoot, 'real-project');
+    const nestedAlias = join(tempRoot, 'nested-alias');
+    const symlinkRoot = join(tempRoot, 'project-alias');
+    mkdirSync(realRoot);
+    symlinkSync(realRoot, nestedAlias, 'dir');
+    symlinkSync(nestedAlias, symlinkRoot, 'dir');
+
+    try {
+      const provider = new MuseCodeSdkProvider();
+      const { sessionObj } = createMockSession();
+      const startSession = vi.fn().mockResolvedValue(sessionObj);
+      (provider as any).client = { startSession };
+
+      await provider.createSession({ cwd: symlinkRoot, model: 'muse-spark-1.3' });
+
+      expect(startSession).toHaveBeenCalledWith(expect.objectContaining({
+        workspaceRoot: realpathSync.native(realRoot),
+      }));
+    } finally {
+      rmSync(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('canonicalizes the fallback start when a stale resume id is supplied through a symlink', async () => {
+    const tempRoot = mkdtempSync(join(tmpdir(), 'muse-workspace-'));
+    const realRoot = join(tempRoot, 'real-project');
+    const symlinkRoot = join(tempRoot, 'project-alias');
+    mkdirSync(realRoot);
+    symlinkSync(realRoot, symlinkRoot, 'dir');
+
+    try {
+      const provider = new MuseCodeSdkProvider();
+      const { sessionObj } = createMockSession();
+      const resumeSession = vi.fn().mockRejectedValue(new Error('session stale-id not found'));
+      const startSession = vi.fn().mockResolvedValue(sessionObj);
+      (provider as any).client = { resumeSession, startSession };
+
+      await provider.createSession({ cwd: symlinkRoot, resumeId: 'stale-id' });
+
+      expect(startSession).toHaveBeenCalledWith(expect.objectContaining({
+        workspaceRoot: realpathSync.native(realRoot),
+      }));
+    } finally {
+      rmSync(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps a normalized absolute workspace root when the directory does not exist', async () => {
+    const tempRoot = mkdtempSync(join(tmpdir(), 'muse-workspace-'));
+    const missingRoot = join(tempRoot, 'missing-project');
+
+    try {
+      const provider = new MuseCodeSdkProvider();
+      const { sessionObj } = createMockSession();
+      const startSession = vi.fn().mockResolvedValue(sessionObj);
+      (provider as any).client = { startSession };
+
+      await provider.createSession({ cwd: missingRoot, model: 'muse-spark-1.3' });
+
+      expect(startSession).toHaveBeenCalledWith(expect.objectContaining({
+        workspaceRoot: missingRoot,
+      }));
+    } finally {
+      rmSync(tempRoot, { recursive: true, force: true });
+    }
   });
 
   it('rejects a refused native submission without leaving the session busy or marking system context sent', async () => {

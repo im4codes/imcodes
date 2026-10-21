@@ -54,7 +54,12 @@ import {
 } from '../../../shared/effort-levels.js';
 import { NATIVE_AGENT_ADMISSION_MODES } from '../../../shared/native-collaboration-policy.js';
 import { composeMessageSideProviderPrompt } from '../provider-context-routing.js';
-import { normalizeTransportCwd, resolveExecutableForSpawn, resolveMuseCodePathForSdk } from '../transport-paths.js';
+import {
+  canonicalizeTransportCwd,
+  normalizeTransportCwd,
+  resolveExecutableForSpawn,
+  resolveMuseCodePathForSdk,
+} from '../transport-paths.js';
 import {
   prepareMuseSessionMcp,
   museMcpEnsureOptionsFromConfig,
@@ -555,7 +560,11 @@ export class MuseCodeSdkProvider implements TransportProvider {
       } satisfies ProviderError;
     }
 
-    const workspaceRoot = normalizeTransportCwd(config.cwd) ?? process.cwd();
+    // Muse's Agent Definitions loader rejects a symlink/reparse-point source
+    // root.  Canonicalize existing directories before handing them to the SDK;
+    // canonicalizeTransportCwd retains the normalized absolute spelling when
+    // the project directory is temporarily unavailable.
+    const workspaceRoot = canonicalizeTransportCwd(config.cwd) ?? process.cwd();
     const requestedModel = normalizeMuseModelId(
       typeof config.agentId === 'string' && config.agentId.trim()
         ? config.agentId.trim()
