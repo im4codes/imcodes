@@ -173,6 +173,24 @@ function asString(value: unknown): string | undefined {
   return typeof value === 'string' ? value : undefined;
 }
 
+/**
+ * Resume failures are only recoverable when the server explicitly says that
+ * the requested session no longer exists.  Do not treat arbitrary "not
+ * found"/transport errors as an expired session: doing so can silently start
+ * a different conversation and hide a real outage.
+ */
+function isMuseSessionNotFoundError(error: unknown): boolean {
+  const record = asRecord(error);
+  const code = String(record.code ?? record.errorCode ?? record.type ?? '').toLowerCase();
+  const message = error instanceof Error
+    ? error.message
+    : typeof error === 'string'
+      ? error
+      : String(record.message ?? record.error ?? '');
+  const detail = `${code} ${message}`.toLowerCase();
+  return /(?:session[\s\S]{0,120}(?:not[\s_-]*found|does[\s_-]*not[\s_-]+exist|unknown|不存在)|(?:not[\s_-]*found|does[\s_-]*not[\s_-]+exist|unknown)[\s\S]{0,120}session|sessionnotfound)/.test(detail);
+}
+
 function isMuseSubagentTool(name?: string): boolean {
   if (!name) return false;
   const normalized = name.toLowerCase().replace(/[-_]/g, '');
@@ -546,15 +564,28 @@ export class MuseCodeSdkProvider implements TransportProvider {
           : 'muse-spark-1.3'),
     );
     let session: Session;
+    let resumedSession = false;
     const posture = resolveMusePermissionPosture(this.config as Record<string, unknown> | null);
 
     try {
       if (config.resumeId) {
         const resumeId = config.resumeId;
-        session = await this.withSessionMcp(config, () => this.client!.resumeSession({
-          sessionId: resumeId,
-        }));
-        if (posture.approvalMode && this.spawned) {
+        try {
+          session = await this.withSessionMcp(config, () => this.client!.resumeSession({
+            sessionId: resumeId,
+          }));
+          resumedSession = true;
+        } catch (err) {
+          if (!isMuseSessionNotFoundError(err)) throw err;
+          logger.info({ routeId }, 'Muse resume session is stale; starting a new session');
+          session = await this.withSessionMcp(config, () => this.client!.startSession({
+            workspaceRoot,
+            modelId: requestedModel,
+            providerId: 'meta',
+            ...(posture.approvalMode ? { approvalMode: posture.approvalMode } : {}),
+          }));
+        }
+        if (resumedSession && posture.approvalMode && this.spawned) {
           // `session/resume` has no approvalMode member; select it explicitly.
           await this.spawned.connection
             .command('session/setApprovalMode', {
@@ -566,7 +597,7 @@ export class MuseCodeSdkProvider implements TransportProvider {
               logger.warn({ err, mode: posture.approvalMode }, 'Failed to set approval mode on resumed Muse session');
             });
         }
-        if (requestedModel && this.spawned) {
+        if (resumedSession && requestedModel && this.spawned) {
           void this.spawned.connection
             .command('session/setModel', {
               commandId: randomUUID(),
@@ -609,7 +640,7 @@ export class MuseCodeSdkProvider implements TransportProvider {
       currentText: '',
       reasoningEffort: config.effort ?? existing?.reasoningEffort,
       pendingApprovals: new Map(),
-      sessionSystemTextSent: !!config.resumeId && !config.fresh,
+      sessionSystemTextSent: resumedSession && !config.fresh,
       toolCalls: new Map(),
     };
 

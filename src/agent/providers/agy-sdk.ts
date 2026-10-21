@@ -74,7 +74,7 @@ const MODEL_CACHE_TTL_MS = 10 * 60_000;
 const MODEL_PROBE_TIMEOUT_MS = 30_000;
 const KILL_GRACE_MS = 2_000;
 const STDERR_TAIL_BYTES = 2_048;
-const AUTH_FAILURE_PATTERN = /auth|log ?in|credential|unauthori[sz]ed|license|permission denied|401\b|403\b/i;
+const AUTH_FAILURE_PATTERN = /auth|log(?:ged)?\s*in|credential|unauthori[sz]ed|license|permission denied|401\b|403\b/i;
 const RATE_LIMIT_PATTERN = /quota|rate.?limit|too many requests|resource.?exhausted|429\b/i;
 
 interface AgyUsage {
@@ -105,6 +105,8 @@ interface AgySessionState {
   stderrTail: string;
   toolSteps: Map<number, string>;
   mayHaveHistoricalQuota: boolean;
+  /** A quota result is being checked against durable history; cancellation wins over this read. */
+  historyReadInFlight: boolean;
   pendingInputs: Array<{ promptHash: string; sentAt: number }>;
   /** Evidence is reset by the streamed user_input boundary, not send(): inputs can queue. */
   turnEvidence?: {
@@ -347,6 +349,7 @@ export class AgySdkProvider implements TransportProvider {
       stderrTail: '',
       toolSteps: new Map(),
       mayHaveHistoricalQuota: !!(config.resumeId ?? existing?.conversationId) && !config.fresh,
+      historyReadInFlight: existing?.historyReadInFlight ?? false,
       pendingInputs: [],
     };
     if (prior?.child && (config.fresh || prior.conversationId !== state.conversationId)) {
@@ -639,7 +642,7 @@ export class AgySdkProvider implements TransportProvider {
     let output = Promise.resolve();
     rl.on('line', (line) => {
       output = output.then(async () => {
-        if (state.child !== child || this.sessions.get(sessionId) !== state) return;
+        if (state.child !== child || child.exitCode !== null || this.sessions.get(sessionId) !== state) return;
         await this.handleLine(sessionId, state, line);
       }).catch(() => {
         // Callback exceptions must not leave the output chain permanently rejected.
@@ -648,39 +651,43 @@ export class AgySdkProvider implements TransportProvider {
     });
     child.once('error', (err) => {
       if (state.child !== child) return;
+      const detail = `${(err as Error)?.message ?? ''} ${state.stderrTail}`.trim();
+      const authFailure = AUTH_FAILURE_PATTERN.test(detail);
       state.child = null;
       this.resetTurnState(state);
       this.emitStatus(sessionId, state, { status: null, label: null });
       const code = (err as NodeJS.ErrnoException).code;
       this.emitError(
         sessionId,
-        code === 'ENOENT' ? PROVIDER_ERROR_CODES.CONFIG_ERROR : PROVIDER_ERROR_CODES.PROVIDER_ERROR,
-        code === 'ENOENT' ? `The Antigravity CLI (\`${AGY_CLI_BINARY}\`) was not found.` : 'Failed to start the agy process',
-        code !== 'ENOENT',
+        authFailure
+          ? PROVIDER_ERROR_CODES.AUTH_FAILED
+          : code === 'ENOENT' ? PROVIDER_ERROR_CODES.CONFIG_ERROR : PROVIDER_ERROR_CODES.PROVIDER_ERROR,
+        authFailure
+          ? 'Antigravity authentication is required. Run `agy` once to sign in.'
+          : code === 'ENOENT' ? `The Antigravity CLI (\`${AGY_CLI_BINARY}\`) was not found.` : 'Failed to start the agy process',
+        !authFailure && code !== 'ENOENT',
       );
     });
     child.once('exit', (code, signal) => {
       confirmCapturedChildExit(child);
       rl.close();
-      void output.then(() => {
-        if (state.child !== child || this.sessions.get(sessionId) !== state) return;
-        state.child = null;
-        const hadTurns = state.inflightTurns > 0;
-        this.resetTurnState(state);
-        this.emitStatus(sessionId, state, { status: null, label: null });
-        if (state.cancelled || !hadTurns) return;
-        logger.warn({ sessionId, code, signal }, 'agy process exited with turns in flight');
-        const tail = state.stderrTail.trim();
-        const authFailure = AUTH_FAILURE_PATTERN.test(tail);
-        this.emitError(
-          sessionId,
-          authFailure ? PROVIDER_ERROR_CODES.AUTH_FAILED : PROVIDER_ERROR_CODES.CONNECTION_LOST,
-          authFailure
-            ? 'Antigravity authentication is required. Run `agy` once to sign in.'
-            : 'The agy process exited before finishing the turn',
-          !authFailure,
-        );
-      });
+      if (state.child !== child || this.sessions.get(sessionId) !== state) return;
+      const hadTurns = state.inflightTurns > 0;
+      const historyReadInFlight = state.historyReadInFlight;
+      const tail = state.stderrTail.trim();
+      this.resetTurnState(state);
+      this.emitStatus(sessionId, state, { status: null, label: null });
+      if (state.cancelled || !hadTurns || historyReadInFlight) return;
+      logger.warn({ sessionId, code, signal }, 'agy process exited with turns in flight');
+      const authFailure = AUTH_FAILURE_PATTERN.test(tail);
+      this.emitError(
+        sessionId,
+        authFailure ? PROVIDER_ERROR_CODES.AUTH_FAILED : PROVIDER_ERROR_CODES.CONNECTION_LOST,
+        authFailure
+          ? 'Antigravity authentication is required. Run `agy` once to sign in.'
+          : 'The agy process exited before finishing the turn',
+        !authFailure,
+      );
     });
     return child;
   }
@@ -734,6 +741,7 @@ export class AgySdkProvider implements TransportProvider {
   private resetTurnState(state: AgySessionState): void {
     state.inflightTurns = 0;
     state.pendingInputs = [];
+    state.historyReadInFlight = false;
     state.turnEvidence = undefined;
     state.currentMessageId = null;
     state.currentText = '';
@@ -1077,9 +1085,15 @@ export class AgySdkProvider implements TransportProvider {
       && !state.turnEvidence?.sawError && state.toolSteps.size === 0) {
       const env = this.spawnEnv(state.env, state.mcpEnv);
       const home = env.HOME || env.USERPROFILE;
-      const response = home ? await this.historyReader.read({
-        home, conversationId: state.conversationId, ...input, resultAt: Date.now(), error,
-      }) : undefined;
+      state.historyReadInFlight = true;
+      let response: { userStepIndex: number; responseStepIndex: number; text: string } | undefined;
+      try {
+        response = home ? await this.historyReader.read({
+          home, conversationId: state.conversationId, ...input, resultAt: Date.now(), error,
+        }) : undefined;
+      } finally {
+        state.historyReadInFlight = false;
+      }
       // Stop/end/rebind wins over a late reader result. Never complete another instance.
       if (state.cancelled || this.sessions.get(sessionId) !== state || state.child !== child) return;
       if (response && (!state.turnEvidence || state.turnEvidence.userStepIndex === response.userStepIndex)) {

@@ -52,6 +52,11 @@ process.stdin.on('data', (d) => {
     const msg = JSON.parse(line);
     const text = msg.message.content;
     if (text.includes('CRASH_NOW')) process.exit(1);
+    if (text.includes('AUTH_EXIT')) {
+      process.stderr.write('You are not logged into Antigravity.\\n');
+      setTimeout(() => process.exit(1), 100);
+      return;
+    }
     if (text.includes('NATIVE_LOST')) {
       const fixture = require(process.env.FAKE_AGY_NATIVE_FIXTURE);
       fixture.persist(process.env.HOME, text, { currentError: text.includes('NATIVE_LOST_REAL_ERROR'), answer: text });
@@ -364,6 +369,16 @@ describe('AgySdkProvider (fake agy process)', () => {
     expect(errors).toHaveLength(1);
     expect(completes[0][1].content).toBe('NATIVE_LOST after unexpected exit');
     expect(provider.getSessionDiagnostics(sid)).toMatchObject({inflightTurns:0});
+  });
+
+  it('classifies authentication failures on child exit as non-recoverable', async () => {
+    const sid=await provider.createSession({sessionKey:'auth-exit',cwd:dir,resumeId:'11111111-1111-4111-8111-111111111111'});
+    await provider.send(sid,'AUTH_EXIT');
+    await waitFor(()=>errors.length===1);
+    expect(errors[0][1].code).toBe(PROVIDER_ERROR_CODES.AUTH_FAILED);
+    expect(errors[0][1].recoverable).toBe(false);
+    await new Promise(resolve=>setTimeout(resolve,30));
+    expect(errors).toHaveLength(1);
   });
 
   it('serializes queued frames across a slow recovery without replaying or mixing answers', async () => {

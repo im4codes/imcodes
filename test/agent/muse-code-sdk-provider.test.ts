@@ -779,6 +779,46 @@ describe('MuseCodeSdkProvider session and turn lifecycle', () => {
     }));
   });
 
+  it('falls back once to a new session when a resume id is explicitly stale', async () => {
+    const provider = new MuseCodeSdkProvider();
+    const { sessionObj } = createMockSession();
+    const resumedSession = {
+      ...sessionObj,
+      sessionId: 'muse-sess-fresh-after-stale-resume',
+    };
+    const resumeSession = vi.fn().mockRejectedValue(new Error('session old-resume-id not found'));
+    const startSession = vi.fn().mockResolvedValue(resumedSession);
+    (provider as any).client = { resumeSession, startSession };
+
+    const routeId = await provider.createSession({
+      cwd: '/home/k/project',
+      resumeId: 'old-resume-id',
+    });
+
+    expect(resumeSession).toHaveBeenCalledTimes(1);
+    expect(startSession).toHaveBeenCalledTimes(1);
+    expect(startSession).toHaveBeenCalledWith(expect.objectContaining({
+      workspaceRoot: '/home/k/project',
+      providerId: 'meta',
+    }));
+    expect((provider as any).sessions.get(routeId).sessionSystemTextSent).toBe(false);
+  });
+
+  it('does not hide unknown resume failures behind a new session', async () => {
+    const provider = new MuseCodeSdkProvider();
+    const resumeSession = vi.fn().mockRejectedValue(new Error('upstream connection reset'));
+    const startSession = vi.fn();
+    (provider as any).client = { resumeSession, startSession };
+
+    await expect(provider.createSession({
+      cwd: '/home/k/project',
+      resumeId: 'resume-id',
+    })).rejects.toMatchObject({
+      message: expect.stringContaining('upstream connection reset'),
+    });
+    expect(startSession).not.toHaveBeenCalled();
+  });
+
   describe('maximum-permission posture (--dangerously-skip-permissions equivalent)', () => {
     it('is on by default: allowAll approval mode and a disabled host sandbox', () => {
       expect(resolveMusePermissionPosture({})).toEqual({ maxPermissions: true, approvalMode: 'allowAll' });
