@@ -53,7 +53,8 @@ import {
   type TransportEffortLevel,
 } from '../../../shared/effort-levels.js';
 import { NATIVE_AGENT_ADMISSION_MODES } from '../../../shared/native-collaboration-policy.js';
-import { composeMessageSideProviderPrompt } from '../provider-context-routing.js';
+import { composeMessageSideProviderPrompt, getProviderSystemTextParts } from '../provider-context-routing.js';
+import { sessionSystemContractKey, shouldInjectSessionSystemContract } from '../session-system-contract.js';
 import {
   canonicalizeTransportCwd,
   normalizeTransportCwd,
@@ -163,7 +164,8 @@ interface MuseSessionState {
   currentText: string;
   reasoningEffort?: TransportEffortLevel;
   pendingApprovals: Map<string, PendingApprovalEntry>;
-  sessionSystemTextSent: boolean;
+  /** Versioned key for the stable contract delivered to this Muse session. */
+  sessionSystemTextInjected?: string;
   toolCalls: Map<string, ToolCallEvent>;
   runtimeSubagentStartedAtByKey?: Map<string, number>;
 }
@@ -649,7 +651,7 @@ export class MuseCodeSdkProvider implements TransportProvider {
       currentText: '',
       reasoningEffort: config.effort ?? existing?.reasoningEffort,
       pendingApprovals: new Map(),
-      sessionSystemTextSent: resumedSession && !config.fresh,
+      sessionSystemTextInjected: undefined,
       toolCalls: new Map(),
     };
 
@@ -727,9 +729,13 @@ export class MuseCodeSdkProvider implements TransportProvider {
     state.currentText = '';
 
     const normalized = normalizeProviderPayload(payload, attachments, extraSystemPrompt);
-    const prompt = composeMessageSideProviderPrompt(normalized, {
-      includeSessionSystemText: !state.sessionSystemTextSent,
-    });
+    const sessionSystemText = getProviderSystemTextParts(normalized).sessionSystemText;
+    const sessionContractKey = sessionSystemContractKey(sessionSystemText);
+    const includeSessionSystemText = shouldInjectSessionSystemContract(
+      state.sessionSystemTextInjected,
+      sessionSystemText,
+    );
+    const prompt = composeMessageSideProviderPrompt(normalized, { includeSessionSystemText });
     const effort = mapEffortLevel(state.reasoningEffort);
 
     let turn: Turn;
@@ -746,7 +752,7 @@ export class MuseCodeSdkProvider implements TransportProvider {
         recoverable: true,
       } satisfies ProviderError;
     }
-    state.sessionSystemTextSent = true;
+    if (includeSessionSystemText) state.sessionSystemTextInjected = sessionContractKey;
     state.activeTurn = turn;
     state.activeTurnId = turn.turnId;
     // send() confirms native admission, not terminal completion. The runtime
@@ -1245,6 +1251,12 @@ export class MuseCodeSdkProvider implements TransportProvider {
           });
       }
     }
+  }
+
+  refreshSessionSystemText(sessionId: string): void {
+    const state = this.sessions.get(sessionId);
+    if (!state) return;
+    state.sessionSystemTextInjected = undefined;
   }
 
   setSessionEffort(sessionId: string, effort: TransportEffortLevel): void {

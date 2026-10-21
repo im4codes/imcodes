@@ -51,6 +51,7 @@ process.stdin.on('data', (d) => {
     if (!line.trim()) continue;
     const msg = JSON.parse(line);
     const text = msg.message.content;
+    if (process.env.FAKE_AGY_INPUT_FILE) fs.appendFileSync(process.env.FAKE_AGY_INPUT_FILE, JSON.stringify(text) + '\\n');
     if (text.includes('CRASH_NOW')) process.exit(1);
     if (text.includes('AUTH_EXIT')) {
       process.stderr.write('You are not logged into Antigravity.\\n');
@@ -193,6 +194,7 @@ describe('agy-sdk helpers', () => {
 describe('AgySdkProvider (fake agy process)', () => {
   let dir: string;
   let argsFile: string;
+  let inputFile: string;
   let provider: AgySdkProvider;
   const completes: Array<[string, AgentMessage]> = [];
   const deltas: Array<[string, MessageDelta]> = [];
@@ -219,7 +221,9 @@ describe('AgySdkProvider (fake agy process)', () => {
     writeFileSync(bin, FAKE_AGY);
     chmodSync(bin, 0o755);
     argsFile = path.join(dir, 'args.log');
+    inputFile = path.join(dir, 'inputs.log');
     writeFileSync(argsFile, '');
+    writeFileSync(inputFile, '');
     completes.length = 0; deltas.length = 0; errors.length = 0; tools.length = 0; infos.length = 0; usages.length = 0;
     provider = new AgySdkProvider();
     provider.onComplete((s, m) => completes.push([s, m]));
@@ -228,7 +232,7 @@ describe('AgySdkProvider (fake agy process)', () => {
     provider.onToolCall((s, t) => tools.push([s, t]));
     provider.onSessionInfo((s, i) => infos.push([s, i]));
     provider.onUsage?.((s, u) => usages.push([s, u]));
-    await provider.connect({ binaryPath: bin, env: { FAKE_AGY_ARGS_FILE: argsFile } });
+    await provider.connect({ binaryPath: bin, env: { FAKE_AGY_ARGS_FILE: argsFile, FAKE_AGY_INPUT_FILE: inputFile } });
   });
 
   afterEach(async () => {
@@ -239,6 +243,19 @@ describe('AgySdkProvider (fake agy process)', () => {
 
   const launches = () => readFileSync(argsFile, 'utf8').trim().split('\n').filter(Boolean)
     .map((l) => JSON.parse(l) as string[]).filter((a) => a[0] !== '--help' && a[0] !== 'models');
+  const inputs = () => readFileSync(inputFile, 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l) as string);
+
+  function contextPayload(sessionSystemText: string, userMessage = 'hello'): any {
+    return {
+      userMessage,
+      assembledMessage: userMessage,
+      sessionSystemText,
+      context: { sessionSystemText, requiredAuthoredContext: [], advisoryAuthoredContext: [], appliedDocumentVersionIds: [], diagnostics: [] },
+      authority: {},
+      supportClass: 'degraded-message-side-context-mapping',
+      diagnostics: [],
+    };
+  }
 
   it('declares the provider identity and capabilities', () => {
     expect(provider.id).toBe(AGY_SDK_PROVIDER_ID);
@@ -281,6 +298,35 @@ describe('AgySdkProvider (fake agy process)', () => {
     expect(status.providerId).toBe(AGY_SDK_PROVIDER_ID);
     expect(status.connected).toBe(true);
     expect(['ready', 'degraded']).toContain(status.status);
+  });
+
+  it('re-seeds the current IM.codes contract on resume, version changes, clear, and process restart', async () => {
+    const sid = await provider.createSession({ sessionKey: 'contract-persistence', cwd: dir, resumeId: 'persisted-contract' });
+    const contractV1 = 'IM.codes system contract v1: prefer managed sub-sessions for delegation.';
+    const contractV2 = 'IM.codes system contract v2: prefer managed sub-sessions and preserve Brain rules.';
+
+    await provider.send(sid, contextPayload(contractV1, 'first'));
+    await waitFor(() => completes.length === 1);
+    await provider.send(sid, contextPayload(contractV1, 'second'));
+    await waitFor(() => completes.length === 2);
+    expect(inputs()).toHaveLength(2);
+    expect(inputs()[0]).toContain(contractV1);
+    expect(inputs()[1]).not.toContain(contractV1);
+
+    await provider.send(sid, contextPayload(contractV2, 'version changed'));
+    await waitFor(() => completes.length === 3);
+    expect(inputs()[2]).toContain(contractV2);
+
+    provider.refreshSessionSystemText(sid);
+    await provider.send(sid, contextPayload(contractV2, 'after clear reseed'));
+    await waitFor(() => completes.length === 4);
+    expect(inputs()[3]).toContain(contractV2);
+
+    await provider.send(sid, 'CRASH_NOW');
+    await waitFor(() => errors.length === 1);
+    await provider.send(sid, contextPayload(contractV2, 'after process restart'));
+    await waitFor(() => completes.length === 5);
+    expect(inputs()[5]).toContain(contractV2);
   });
 
   it('streams deltas, completes the turn and reports the conversation id for resume', async () => {

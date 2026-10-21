@@ -52,7 +52,7 @@ import logger from '../../util/logger.js';
 import { killProcessTree } from '../../util/kill-process-tree.js';
 import { execFileOffMain as execFileAsync } from '../../util/exec-helper.js';
 import { gateChildStream } from '../../util/event-loop-backpressure.js';
-import { composeMessageSideProviderPrompt } from '../provider-context-routing.js';
+import { composeMessageSideProviderPrompt, getProviderSystemTextParts } from '../provider-context-routing.js';
 import { normalizeTransportCwd, resolveAgyPathForSdk, resolveExecutableForSpawn } from '../transport-paths.js';
 import {
   ensureAgyMcpConfigHasImcodesEntry,
@@ -69,6 +69,7 @@ import {
 } from '../../../shared/memory-ws.js';
 import { recordAgyQuotaActivity, refreshAgyQuotaMetadata } from '../agy-usage-quota.js';
 import { AgyHistoryReader, hashAgyPrompt } from '../agy-native-history.js';
+import { sessionSystemContractKey, shouldInjectSessionSystemContract } from '../session-system-contract.js';
 
 const MODEL_CACHE_TTL_MS = 10 * 60_000;
 const MODEL_PROBE_TIMEOUT_MS = 30_000;
@@ -100,8 +101,8 @@ interface AgySessionState {
   currentMessageId: string | null;
   currentText: string;
   sawToolCall: boolean;
-  /** The stable session system text is sent once per conversation; agy persists it in history. */
-  sessionSystemTextSent: boolean;
+  /** Versioned key for the stable contract delivered to the current agy process. */
+  sessionSystemTextInjected?: string;
   stderrTail: string;
   toolSteps: Map<number, string>;
   mayHaveHistoricalQuota: boolean;
@@ -344,8 +345,10 @@ export class AgySdkProvider implements TransportProvider {
       currentMessageId: null,
       currentText: '',
       sawToolCall: false,
-      // A resumed conversation already carries the system text in agy's own history.
-      sessionSystemTextSent: !!(config.resumeId ?? existing?.conversationId) && !config.fresh,
+      // A resumed conversation may have an old or missing contract. Keep no
+      // optimistic marker: the first turn must compare the current payload and
+      // re-seed the contract when needed.
+      sessionSystemTextInjected: existing?.sessionSystemTextInjected,
       stderrTail: '',
       toolSteps: new Map(),
       mayHaveHistoricalQuota: !!(config.resumeId ?? existing?.conversationId) && !config.fresh,
@@ -399,9 +402,13 @@ export class AgySdkProvider implements TransportProvider {
     const state = this.sessions.get(sessionId);
     if (!state) throw this.makeError(PROVIDER_ERROR_CODES.SESSION_NOT_FOUND, `Session ${sessionId} not found`, false);
     const normalized = normalizeProviderPayload(payload, attachments, extraSystemPrompt);
-    const prompt = composeMessageSideProviderPrompt(normalized, {
-      includeSessionSystemText: !state.sessionSystemTextSent,
-    });
+    const sessionSystemText = getProviderSystemTextParts(normalized).sessionSystemText;
+    const sessionContractKey = sessionSystemContractKey(sessionSystemText);
+    const includeSessionSystemText = shouldInjectSessionSystemContract(
+      state.sessionSystemTextInjected,
+      sessionSystemText,
+    );
+    const prompt = composeMessageSideProviderPrompt(normalized, { includeSessionSystemText });
     if (!prompt.trim()) {
       throw this.makeError(PROVIDER_ERROR_CODES.PROVIDER_ERROR, 'Cannot send an empty message to agy', false);
     }
@@ -412,7 +419,7 @@ export class AgySdkProvider implements TransportProvider {
       throw this.makeError(PROVIDER_ERROR_CODES.CONNECTION_LOST, 'agy process is not accepting input', true);
     }
     state.cancelled = false;
-    state.sessionSystemTextSent = true;
+    if (includeSessionSystemText) state.sessionSystemTextInjected = sessionContractKey;
     state.inflightTurns += 1;
     const input = { promptHash: hashAgyPrompt(prompt), sentAt: Date.now() };
     state.pendingInputs.push(input);
@@ -466,7 +473,7 @@ export class AgySdkProvider implements TransportProvider {
   refreshSessionSystemText(sessionId: string): void {
     const state = this.sessions.get(sessionId);
     if (!state) return;
-    state.sessionSystemTextSent = false;
+    state.sessionSystemTextInjected = undefined;
   }
 
   // ── Callbacks ──────────────────────────────────────────────────────────────
@@ -631,6 +638,9 @@ export class AgySdkProvider implements TransportProvider {
     });
     state.child = child;
     state.stderrTail = '';
+    // A restarted agy process cannot be assumed to retain the contract marker;
+    // force the next turn to carry the current session-level instructions.
+    state.sessionSystemTextInjected = undefined;
 
     child.stderr?.on('data', (chunk: Buffer) => {
       state.stderrTail = (state.stderrTail + chunk.toString('utf8')).slice(-STDERR_TAIL_BYTES);
@@ -654,6 +664,7 @@ export class AgySdkProvider implements TransportProvider {
       const detail = `${(err as Error)?.message ?? ''} ${state.stderrTail}`.trim();
       const authFailure = AUTH_FAILURE_PATTERN.test(detail);
       state.child = null;
+      state.sessionSystemTextInjected = undefined;
       this.resetTurnState(state);
       this.emitStatus(sessionId, state, { status: null, label: null });
       const code = (err as NodeJS.ErrnoException).code;
@@ -675,6 +686,7 @@ export class AgySdkProvider implements TransportProvider {
       const hadTurns = state.inflightTurns > 0;
       const historyReadInFlight = state.historyReadInFlight;
       const tail = state.stderrTail.trim();
+      state.sessionSystemTextInjected = undefined;
       this.resetTurnState(state);
       this.emitStatus(sessionId, state, { status: null, label: null });
       if (state.cancelled || !hadTurns || historyReadInFlight) return;

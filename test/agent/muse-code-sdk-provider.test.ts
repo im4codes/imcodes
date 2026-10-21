@@ -257,6 +257,54 @@ describe('MuseCodeSdkProvider session and turn lifecycle', () => {
     await provider.endSession(routeId);
   });
 
+  it('re-seeds the versioned IM.codes contract after resume-style clear and changes', async () => {
+    const provider = new MuseCodeSdkProvider();
+    const { sessionObj } = createMockSession();
+    const sendUserTurn = sessionObj.sendUserTurn;
+    (provider as any).client = {
+      startSession: vi.fn().mockResolvedValue(sessionObj),
+      resumeSession: vi.fn().mockResolvedValue(sessionObj),
+    };
+    const routeId = await provider.createSession({ cwd: '/home/k/project', resumeId: 'old-muse-session' });
+    const payload = (sessionSystemText: string, userMessage: string) => ({
+      userMessage,
+      assembledMessage: userMessage,
+      sessionSystemText,
+      context: {
+        sessionSystemText,
+        requiredAuthoredContext: [],
+        advisoryAuthoredContext: [],
+        appliedDocumentVersionIds: [],
+        diagnostics: [],
+      },
+      authority: {},
+      supportClass: 'degraded-message-side-context-mapping',
+      diagnostics: [],
+    });
+    const v1 = 'IM.codes contract v1';
+    const v2 = 'IM.codes contract v2';
+
+    await provider.send(routeId, payload(v1, 'first') as any);
+    await vi.waitFor(() => expect(sendUserTurn).toHaveBeenCalledTimes(1));
+    await vi.waitFor(() => expect((provider as any).sessions.get(routeId).inFlight).toBe(false));
+    expect(sendUserTurn.mock.calls[0][0].input[0].text).toContain(v1);
+    await provider.send(routeId, payload(v1, 'second') as any);
+    await vi.waitFor(() => expect(sendUserTurn).toHaveBeenCalledTimes(2));
+    await vi.waitFor(() => expect((provider as any).sessions.get(routeId).inFlight).toBe(false));
+    expect(sendUserTurn.mock.calls[1][0].input[0].text).not.toContain(v1);
+
+    await provider.send(routeId, payload(v2, 'changed') as any);
+    await vi.waitFor(() => expect(sendUserTurn).toHaveBeenCalledTimes(3));
+    await vi.waitFor(() => expect((provider as any).sessions.get(routeId).inFlight).toBe(false));
+    expect(sendUserTurn.mock.calls[2][0].input[0].text).toContain(v2);
+    provider.refreshSessionSystemText(routeId);
+    await provider.send(routeId, payload(v2, 'reseed') as any);
+    await vi.waitFor(() => expect(sendUserTurn).toHaveBeenCalledTimes(4));
+    await vi.waitFor(() => expect((provider as any).sessions.get(routeId).inFlight).toBe(false));
+    expect(sendUserTurn.mock.calls[3][0].input[0].text).toContain(v2);
+    await provider.endSession(routeId);
+  });
+
   it('canonicalizes a symlinked workspace root before starting Muse', async () => {
     const tempRoot = mkdtempSync(join(tmpdir(), 'muse-workspace-'));
     const realRoot = join(tempRoot, 'real-project');
@@ -336,7 +384,7 @@ describe('MuseCodeSdkProvider session and turn lifecycle', () => {
       code: PROVIDER_ERROR_CODES.PROVIDER_ERROR, message: 'native submission refused', recoverable: true,
     });
     expect(provider.getActiveWorkSnapshot(routeId)?.activeWorkCount).toBe(0);
-    expect((provider as any).sessions.get(routeId).sessionSystemTextSent).toBe(false);
+    expect((provider as any).sessions.get(routeId).sessionSystemTextInjected).toBeUndefined();
   });
 
   it('is already idle inside onComplete so the runtime can flip the session idle (stuck "working" regression)', async () => {
@@ -873,7 +921,7 @@ describe('MuseCodeSdkProvider session and turn lifecycle', () => {
       workspaceRoot: '/home/k/project',
       providerId: 'meta',
     }));
-    expect((provider as any).sessions.get(routeId).sessionSystemTextSent).toBe(false);
+    expect((provider as any).sessions.get(routeId).sessionSystemTextInjected).toBeUndefined();
   });
 
   it('does not hide unknown resume failures behind a new session', async () => {
