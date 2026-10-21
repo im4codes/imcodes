@@ -253,6 +253,30 @@ describe('useTimeline window-isolated cache bounds', () => {
     expect(retained?.at(-1)?.eventId).toBe(`${sessionName}-live`);
   });
 
+  it('keeps every expanded text row when the realtime merge uses the wide detail window', () => {
+    const sessionName = `deck_expanded_text_realtime_${Date.now()}`;
+    const history = makeEvents(sessionName, 600);
+    const live = {
+      eventId: `${sessionName}-live`,
+      sessionId: sessionName,
+      ts: 601,
+      epoch: 1,
+      seq: 601,
+      source: 'daemon' as const,
+      confidence: 'high' as const,
+      type: 'assistant.text' as const,
+      payload: { text: 'new live turn' },
+    } satisfies TimelineEvent;
+
+    // This is the direct counterexample for the P0 regression: a paged
+    // 600-row text window must not be reduced to MAX_TEXT_MEMORY_EVENTS (300)
+    // merely because one realtime row arrives.
+    const merged = __mergeTimelineEventsForTests(history, [live], 2000);
+    expect(merged).toHaveLength(601);
+    expect(merged[0]?.eventId).toBe(`${sessionName}-0`);
+    expect(merged.at(-1)?.eventId).toBe(`${sessionName}-live`);
+  });
+
   it('pushes cache updates to already-mounted hooks for the same session', async () => {
     function Probe({ name }: { name: string }) {
       const { events } = useTimeline('deck_sub_codex', null, 'srv');
