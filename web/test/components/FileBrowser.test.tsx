@@ -291,6 +291,25 @@ describe('FileBrowser', () => {
     expect(directFileTransferMocks.selectPreviewDownloadDestination).toHaveBeenCalledWith('report.pdf');
   });
 
+  it('keeps preview action buttons in a dedicated responsive container', () => {
+    const { ws } = makeWsFactory();
+    const view = render(
+      <FileBrowser
+        ws={ws}
+        mode="file-single"
+        layout="panel"
+        initialPath="/home/user"
+        initialPreview={{ status: 'ok', path: '/home/user/report.txt', content: 'preview' }}
+        onConfirm={vi.fn()}
+      />,
+    );
+
+    const actions = view.container.querySelector('.fb-preview-actions');
+    expect(actions).not.toBeNull();
+    expect(actions?.querySelectorAll('.fb-diff-toggle').length).toBeGreaterThan(0);
+    expect(actions?.querySelector('.fb-close')).toBeNull();
+  });
+
   it('treats save-picker cancellation as a no-op before creating a download entry', async () => {
     const canceled = new DOMException('canceled', 'AbortError');
     directFileTransferMocks.selectPreviewDownloadDestination.mockRejectedValueOnce(canceled);

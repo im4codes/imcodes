@@ -2301,6 +2301,7 @@ export function FileBrowser({
           dismissPreview();
         }}>←</button>
         <span class="fb-preview-name">{previewPath!.split(/[/\\]/).pop()}</span>
+        <div class="fb-preview-actions">
         {preview.status === 'ok' && !isEditing && !readOnly && (
           <button class="fb-diff-toggle" onClick={() => {
             setIsEditing(true);
@@ -2420,6 +2421,7 @@ export function FileBrowser({
             {t('fileBrowser.insertPath')}
           </button>
         )}
+        </div>
         <button class="fb-close" onClick={() => {
           dismissPreview();
         }}>✕</button>
