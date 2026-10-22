@@ -75,6 +75,36 @@ describe('provider-neutral local auth context', () => {
     await expect(detectLocalAuthContext('copilot-sdk', { ANTHROPIC_API_KEY: 'wrong-provider-key' })).resolves.toMatchObject({ method: 'unsupported', authenticated: false, reusable: false });
   });
 
+  it('fails closed for Gemini/Grok credential files unless a non-expired JWT is verifiable', async () => {
+    const home = `/tmp/imcodes-json-auth-${process.pid}`;
+    await mkdir(`${home}/.gemini`, { recursive: true, mode: 0o700 });
+    await mkdir(`${home}/.grok`, { recursive: true, mode: 0o700 });
+    const geminiPath = `${home}/.gemini/oauth_creds.json`;
+    const grokPath = `${home}/.grok/auth.json`;
+    const jwt = (exp: number) => `header.${Buffer.from(JSON.stringify({ exp })).toString('base64url')}.signature`;
+    try {
+      await writeFile(geminiPath, '{bad-json', { mode: 0o600 });
+      await writeFile(grokPath, JSON.stringify({ access_token: 'opaque-token' }), { mode: 0o600 });
+      await expect(detectLocalAuthContext('gemini-sdk', { HOME: home })).resolves.toMatchObject({ authenticated: false, reusable: false });
+      await expect(detectLocalAuthContext('grok-sdk', { HOME: home })).resolves.toMatchObject({ authenticated: false, reusable: false });
+      await writeFile(geminiPath, JSON.stringify({ access_token: jwt(1) }));
+      await expect(detectLocalAuthContext('gemini-sdk', { HOME: home })).resolves.toMatchObject({ authenticated: false, reusable: false });
+      await writeFile(grokPath, JSON.stringify({ access_token: jwt(Math.floor(Date.now() / 1000) + 3600) }));
+      await expect(detectLocalAuthContext('grok-sdk', { HOME: home })).resolves.toMatchObject({ method: 'credential-file', authenticated: true, reusable: true });
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  it('returns explicit unsupported contexts for every registry provider without a verified adapter', async () => {
+    const unsupported = ['openclaw', 'agy-sdk', 'qoder-sdk', 'cursor-headless', 'opencode-sdk', 'deepseek-harness', 'pi', 'hermes-acp', 'codebuddy-cn', 'codebuddy-international'];
+    for (const providerId of unsupported) {
+      await expect(detectLocalAuthContext(providerId, {})).resolves.toMatchObject({
+        providerId, method: 'unsupported', authenticated: false, reusable: false,
+      });
+    }
+  });
+
   it('caches the verified context at createSession and reuses its env projection', async () => {
     const provider = new ClaudeCodeSdkProvider();
     const context = {

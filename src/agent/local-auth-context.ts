@@ -3,6 +3,14 @@ import { constants as fsConstants, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { isClaudeCodeFamily, isCodexFamily } from '../../shared/agent-types.js';
 import { claudeAuthUdsEnv, checkClaudeAuthUds } from './claude-auth-uds.js';
+import { MEMORY_MCP_PROVIDER_IDS } from '../../shared/memory-ws.js';
+
+/** Providers currently constructible by provider-registry.  Entries without
+ * a proven local auth protocol must still return an explicit unsupported
+ * context rather than silently bypassing the shared contract. */
+const REGISTRY_PROVIDER_IDS = new Set([
+  'openclaw', ...MEMORY_MCP_PROVIDER_IDS,
+]);
 
 export type LocalAuthMethod = 'uds' | 'env-token' | 'credential-file' | 'cli-session' | 'unsupported';
 
@@ -79,6 +87,20 @@ async function jsonCredentialAuth(providerId: string, authPath: string): Promise
     };
     const token = findToken(parsed);
     if (!token) return unsupported(providerId, `Credential file has no verifiable token: ${authPath}`);
+    // Credential files are only reusable when their token format and lifetime
+    // are verifiable.  Do not treat arbitrary fixture strings or provider-
+    // specific opaque values as proof of an authenticated session.
+    const parts = token.split('.');
+    if (parts.length !== 3) return unsupported(providerId, `Credential token format is unverifiable: ${authPath}`);
+    let payload: { exp?: unknown };
+    try {
+      payload = JSON.parse(Buffer.from(parts[1]!, 'base64url').toString('utf8')) as { exp?: unknown };
+    } catch {
+      return unsupported(providerId, `Credential token is malformed: ${authPath}`);
+    }
+    if (typeof payload.exp !== 'number' || !Number.isFinite(payload.exp) || payload.exp <= Date.now() / 1000) {
+      return unsupported(providerId, `Credential token is expired or has no verifiable expiry: ${authPath}`);
+    }
     return { providerId, method: 'credential-file', source: authPath, authenticated: true, reusable: true, env: {} };
   } catch (error) {
     const code = (error as NodeJS.ErrnoException)?.code;
@@ -106,7 +128,10 @@ async function configuredProviderAuth(providerId: string, env: NodeJS.ProcessEnv
   };
   const relative = knownFiles[providerId];
   if (home && relative) return jsonCredentialAuth(providerId, join(home, relative));
-  return unsupported(providerId, `No verified local auth context for provider ${providerId}`);
+  if (REGISTRY_PROVIDER_IDS.has(providerId)) {
+    return unsupported(providerId, `No verified local auth adapter is defined for provider ${providerId}; provider-native auth remains provider-owned`);
+  }
+  return unsupported(providerId, `Unknown provider ${providerId} has no local auth adapter`);
 }
 
 /** Detect only provider mechanisms with a known, testable protocol or file contract. */
