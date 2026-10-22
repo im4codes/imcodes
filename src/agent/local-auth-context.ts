@@ -1,5 +1,5 @@
 import { access, readFile, stat } from 'node:fs/promises';
-import { constants as fsConstants } from 'node:fs';
+import { constants as fsConstants, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { isClaudeCodeFamily, isCodexFamily } from '../../shared/agent-types.js';
 import { claudeAuthUdsEnv, checkClaudeAuthUds } from './claude-auth-uds.js';
@@ -158,7 +158,7 @@ export function hasLocalAuthCandidate(providerId: string, env: NodeJS.ProcessEnv
   if (isClaudeCodeFamily(providerId)) {
     return Boolean(env.CLAUDE_CODE_MESSAGING_SOCKET?.trim() || env.IMCODES_CLAUDE_AUTH_UDS?.trim());
   }
-  if (isCodexFamily(providerId)) return Boolean(env.OPENAI_API_KEY?.trim() || env.CODEX_HOME?.trim());
+  if (isCodexFamily(providerId)) return Boolean(env.OPENAI_API_KEY?.trim() || env.CODEX_HOME?.trim() || (env.HOME && existsSync(join(env.HOME, '.codex', 'auth.json'))));
   const candidates: Record<string, string[]> = {
     'gemini-sdk': ['GEMINI_API_KEY'],
     'grok-sdk': ['XAI_API_KEY'],
@@ -167,5 +167,11 @@ export function hasLocalAuthCandidate(providerId: string, env: NodeJS.ProcessEnv
     'kimi-sdk': ['KIMI_API_KEY'],
     'muse-code-sdk': ['MUSE_API_KEY'],
   };
-  return (candidates[providerId] ?? []).some((key) => Boolean(env[key]?.trim()));
+  if ((candidates[providerId] ?? []).some((key) => Boolean(env[key]?.trim()))) return true;
+  const home = env.HOME?.trim();
+  const knownFiles: Record<string, string> = {
+    'gemini-sdk': '.gemini/oauth_creds.json',
+    'grok-sdk': '.grok/auth.json',
+  };
+  return Boolean(home && knownFiles[providerId] && existsSync(join(home, knownFiles[providerId])));
 }
