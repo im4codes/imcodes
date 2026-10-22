@@ -78,22 +78,47 @@ export async function checkClaudeAuthUds(env: NodeJS.ProcessEnv = process.env): 
     await access(parsed.context.socketPath, fsConstants.R_OK | fsConstants.W_OK);
     await new Promise<void>((resolve, reject) => {
       const socket = createConnection(parsed.context!.socketPath);
-      const timer = setTimeout(() => {
+      let settled = false;
+      let response = '';
+      let timer: ReturnType<typeof setTimeout>;
+      const finish = (error?: Error): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
         socket.destroy();
-        reject(new Error('timeout'));
+        if (error) reject(error);
+        else resolve();
+      };
+      timer = setTimeout(() => {
+        finish(new Error('timeout'));
       }, PROBE_TIMEOUT_MS);
       timer.unref?.();
       socket.once('connect', () => {
-        clearTimeout(timer);
         // Send only Claude Code's documented auth frame. No user message is
         // posted and the token is never persisted or transformed.
         socket.write(`${JSON.stringify({ type: 'auth', token: parsed.context!.env[CLAUDE_CODE_MESSAGING_TOKEN] })}\n`);
-        socket.end();
-        resolve();
+      });
+      socket.on('data', (chunk: Buffer) => {
+        response += chunk.toString('utf8');
+        const newline = response.indexOf('\n');
+        if (newline < 0) return;
+        const line = response.slice(0, newline).trim();
+        let frame: unknown;
+        try { frame = JSON.parse(line); } catch { finish(new Error('invalid auth response')); return; }
+        if (!frame || typeof frame !== 'object' || Array.isArray(frame)) {
+          finish(new Error('invalid auth response'));
+          return;
+        }
+        const type = (frame as { type?: unknown }).type;
+        if (type === 'auth_ok') finish();
+        else if (type === 'auth_error' || type === 'error') finish(new Error('auth rejected'));
+        else finish(new Error('unverifiable auth response'));
       });
       socket.once('error', (error) => {
-        clearTimeout(timer);
-        reject(error);
+        finish(error);
+      });
+      socket.once('close', () => {
+        if (!settled) finish(new Error('auth response ended before auth_ok'));
       });
     });
     return parsed;

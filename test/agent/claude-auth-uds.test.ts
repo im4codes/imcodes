@@ -18,10 +18,15 @@ afterEach(async () => {
   await rm(socketPath, { force: true });
 });
 
-async function listen(): Promise<void> {
+async function listen(response?: string, closeImmediately = false): Promise<void> {
   await mkdir(root, { recursive: true, mode: 0o700 });
   await chmod(root, 0o700);
-  server = createServer((socket) => { socket.on('data', () => {}); });
+  server = createServer((socket) => {
+    socket.on('data', () => {
+      if (response) socket.write(response);
+      if (closeImmediately) socket.end();
+    });
+  });
   await new Promise<void>((resolve, reject) => {
     server!.once('error', reject);
     server!.listen(socketPath, resolve);
@@ -31,7 +36,7 @@ async function listen(): Promise<void> {
 
 describe('Claude auth UDS context', () => {
   it('accepts the real uds address form and preserves only the UDS env', async () => {
-    await listen();
+    await listen('{"type":"auth_ok"}\n');
     const result = await checkClaudeAuthUds({
       [CLAUDE_CODE_MESSAGING_SOCKET]: `uds:${socketPath}`,
       [CLAUDE_CODE_MESSAGING_TOKEN]: 'token-is-inherited-not-reused-as-a-source',
@@ -64,15 +69,33 @@ describe('Claude auth UDS context', () => {
     });
   });
 
-  it('reports a stale socket handshake failure instead of authenticated', async () => {
-    await listen();
-    server!.close();
-    server = undefined;
+  it('rejects an explicit auth error response', async () => {
+    await listen('{"type":"auth_error","reason":"denied"}\n');
     const result = await checkClaudeAuthUds({
       [CLAUDE_CODE_MESSAGING_SOCKET]: socketPath,
       [CLAUDE_CODE_MESSAGING_TOKEN]: 'token',
     });
     expect(result.context).toBeUndefined();
-    expect(result.reason).toMatch(/unavailable|handshake failed/);
+    expect(result.reason).toContain('handshake failed');
+  });
+
+  it('rejects silent and immediately closed sockets without an auth_ok frame', async () => {
+    await listen();
+    const silent = await checkClaudeAuthUds({
+      [CLAUDE_CODE_MESSAGING_SOCKET]: socketPath,
+      [CLAUDE_CODE_MESSAGING_TOKEN]: 'token',
+    });
+    expect(silent.context).toBeUndefined();
+    expect(silent.reason).toContain('handshake failed');
+
+    await new Promise<void>((resolve) => server!.close(() => resolve()));
+    server = undefined;
+    await listen(undefined, true);
+    const closed = await checkClaudeAuthUds({
+      [CLAUDE_CODE_MESSAGING_SOCKET]: socketPath,
+      [CLAUDE_CODE_MESSAGING_TOKEN]: 'token',
+    });
+    expect(closed.context).toBeUndefined();
+    expect(closed.reason).toContain('handshake failed');
   });
 });
