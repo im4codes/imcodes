@@ -27,4 +27,16 @@ describe('memory MCP bootstrap catalog', () => {
     expect(catalog.static_full).toEqual(staticFull);
     expect(mcpToolSurfaceBytes(catalog.dynamic)).toBeLessThanOrEqual(MCP_TOOL_SURFACE_BOOTSTRAP_BUDGET_BYTES);
   });
+
+  it('keeps the Computer Use request and result tool enums aligned', () => {
+    for (const mode of ['dynamic', 'static_full'] as const) {
+      const tool = catalog[mode].find((entry) => entry.name === 'computer_use_call') as {
+        inputSchema?: { properties?: { tool?: { enum?: unknown[] } } };
+        outputSchema?: { properties?: { result?: { properties?: { tool?: { enum?: unknown[] } } } } };
+      } | undefined;
+      if (!tool) continue;
+      expect(tool.outputSchema?.properties?.result?.properties?.tool?.enum)
+        .toEqual(tool.inputSchema?.properties?.tool?.enum);
+    }
+  });
 });

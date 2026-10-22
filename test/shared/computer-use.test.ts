@@ -26,6 +26,13 @@ describe('computer use protocol', () => {
     expect(computerUseDocs('browser')).toContain('Chrome DevTools Protocol');
   });
 
+  it('classifies accessibility_tree as read-only and documents the native fallback', async () => {
+    const { isReadOnlyComputerUseTool } = await import('../../shared/computer-use.js');
+    expect(isReadOnlyComputerUseTool('accessibility_tree')).toBe(true);
+    expect(computerUseDocs('tools')).toContain('AX on macOS');
+    expect(computerUseDocs('tools')).toContain('UI Automation on Windows');
+  });
+
   it('presents canonical nodeId as primary without prescribing list_machines preflight', () => {
     const overview = computerUseDocs('overview');
     const workflow = computerUseDocs('workflow');
