@@ -52,6 +52,8 @@ import { getDefaultMcpServers } from './getDefaultMcpServers.js';
 import { claudeRateLimitsToQuotaMeta, type ClaudeRateLimitInfo } from '../claude-rate-limit.js';
 import { formatProviderQuotaLabel } from '../../../shared/provider-quota.js';
 import { claudeRateLimitSignal } from '../claude-rate-limit.js';
+import { buildClaudeAgentEnv } from '../env-isolation.js';
+import { checkClaudeAuthUds } from '../claude-auth-uds.js';
 import { IMCODES_MEMORY_MCP_SERVER_NAME } from '../../../shared/memory-mcp-server-name.js';
 import {
   AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES,
@@ -573,10 +575,12 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
       Promise.resolve(getClaudeSdkAvailableModels()),
       getClaudeSdkRuntimeConfig(false),
     ]);
+    const auth = await checkClaudeAuthUds();
     return {
       models: models.map((id) => ({ id })),
       defaultModel: models[0],
-      isAuthenticated: true,
+      isAuthenticated: !!auth.context,
+      ...(!auth.context ? { error: `Claude auth UDS unavailable: ${auth.reason ?? 'unknown reason'}` } : {}),
       ...(cfg.planLabel ? {} : {}), // planLabel lives in session-info, not model list
     };
   }
@@ -1067,7 +1071,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     } : undefined;
     const options: Record<string, unknown> = {
       cwd: payload.turnCwd ?? state.cwd,
-      ...(state.env ? { env: { ...process.env, ...state.env } } : {}),
+      env: buildClaudeAgentEnv(state.env ?? {}),
       permissionMode: state.permissionMode,
       disallowedTools: DISALLOWED_NATIVE_TOOLS,
       hooks: {

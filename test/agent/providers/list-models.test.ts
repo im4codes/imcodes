@@ -25,7 +25,11 @@ describe('ClaudeCodeSdkProvider.listModels', () => {
     const result = await provider.listModels();
     expect(result.models.length).toBeGreaterThan(0);
     expect(result.models.every((m) => typeof m.id === 'string' && m.id.length > 0)).toBe(true);
-    expect(result.isAuthenticated).toBe(true);
+    // Claude authentication is deliberately limited to a reachable local
+    // auth UDS; this test process has no such session and must not fall back to
+    // credentials files or API keys.
+    expect(result.isAuthenticated).toBe(false);
+    expect(result.error).toContain('Claude auth UDS unavailable');
     // Default model is the first in the list
     expect(result.defaultModel).toBe(result.models[0]?.id);
   });

@@ -85,6 +85,7 @@ import { getCodexRuntimeConfig } from './codex-runtime-config.js';
 import { mergeCodexDisplayMetadata } from './codex-display.js';
 import type { TransportEffortLevel } from '../../shared/effort-levels.js';
 import { getSessionRuntimeType, isClaudeCodeFamily, isCodexFamily } from '../../shared/agent-types.js';
+import { claudeAuthUdsEnv } from './claude-auth-uds.js';
 import { providerQuotaMetaEquals } from '../../shared/provider-quota.js';
 import { DEFAULT_CODEX_SESSION_MODEL } from '../shared/models/options.js';
 import {
@@ -1556,8 +1557,10 @@ function buildTransportSessionEnv(
   sessionName: string,
   label: string | null | undefined,
   extraEnv?: Record<string, string>,
+  providerId?: string,
 ): Record<string, string> {
   return {
+    ...(providerId && isClaudeCodeFamily(providerId) ? claudeAuthUdsEnv() : {}),
     ...(extraEnv ?? {}),
     [IMCODES_SESSION_ENV]: sessionName,
     [IMCODES_SESSION_LABEL_ENV]: label?.trim() || sessionName,
@@ -3208,7 +3211,7 @@ export async function restoreTransportSessions(
         fresh: freshOnRestore,
         bindExistingKey: freshOnRestore ? undefined : (needsEphemeralRouteKey ? s.providerSessionId : s.providerSessionId),
         skipCreate: !freshOnRestore && !!s.providerSessionId,
-        env: buildTransportSessionEnv(s.name, s.label, extraEnv),
+        env: buildTransportSessionEnv(s.name, s.label, extraEnv, provider.id),
         // Directory-scoped providers may persist a symlinked path spelling.
         // Reuse the provider's authoritative spelling for the resume RPC while
         // keeping the local projectDir unchanged for product configuration.
@@ -3780,7 +3783,7 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
     serverId: boundServerId,
     providerId: provider.id,
     fresh: !!opts.fresh,
-    env: buildTransportSessionEnv(name, label, transportEnv),
+    env: buildTransportSessionEnv(name, label, transportEnv, agentType),
     cwd: projectDir,
     label: label || name,
     description,

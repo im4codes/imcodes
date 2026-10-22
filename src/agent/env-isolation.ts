@@ -6,6 +6,8 @@
  * environment are explicitly excluded.
  */
 
+import { claudeAuthUdsEnv } from './claude-auth-uds.js';
+
 /** Safe env vars that agents always need */
 const ALWAYS_ALLOWED = [
   'PATH',
@@ -96,7 +98,25 @@ export function buildAgentEnvFromProcess(
     const val = process.env[key];
     if (val) agentVars[key] = val;
   }
-  return buildAgentEnv(agentVars);
+  const safe = buildAgentEnv(agentVars);
+  if (agentType === 'claude-code') {
+    // Claude's local auth mount is the only credential context this path may
+    // inherit. It is intentionally added after the generic secret filter,
+    // which rejects token/key-shaped names by default.
+    Object.assign(safe, claudeAuthUdsEnv());
+  }
+  return safe;
+}
+
+/**
+ * Build the Claude child environment while preserving only an approved local
+ * UDS auth context. API keys, OAuth credential files and arbitrary sockets are
+ * never projected by this helper.
+ */
+export function buildClaudeAgentEnv(extra: Record<string, string> = {}): Record<string, string> {
+  const safe = buildAgentEnv(extra);
+  Object.assign(safe, claudeAuthUdsEnv({ ...process.env, ...extra }));
+  return safe;
 }
 
 function isBlocked(key: string): boolean {
