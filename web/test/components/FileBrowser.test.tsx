@@ -313,7 +313,7 @@ describe('FileBrowser', () => {
   });
 
   it.each([320, 375, 390])('keeps preview actions usable at %dpx narrow widths', (width) => {
-    const styles = readFileSync(resolve(process.cwd(), 'web/src/styles.css'), 'utf8');
+    const styles = readFileSync(resolve(__dirname, '../../src/styles.css'), 'utf8');
     const narrowStyles = styles.slice(styles.indexOf('@media (max-width: 640px)'));
     expect(narrowStyles).toContain('.fb-preview-header { flex-wrap: wrap;');
     expect(narrowStyles).toContain('.fb-preview-actions { order: 3; flex: 1 1 100%; width: 100%;');
