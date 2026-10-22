@@ -8,6 +8,18 @@
 
 import { claudeAuthUdsEnv } from './claude-auth-uds.js';
 
+/** Explicit Claude provider inputs allowed in a session-scoped SDK launch. */
+const CLAUDE_PROVIDER_ENV_KEYS = [
+  'ANTHROPIC_API_KEY',
+  'ANTHROPIC_AUTH_TOKEN',
+  'ANTHROPIC_BASE_URL',
+  'ANTHROPIC_MODEL',
+  'ANTHROPIC_SMALL_FAST_MODEL',
+  'ANTHROPIC_DEFAULT_SONNET_MODEL',
+  'ANTHROPIC_DEFAULT_OPUS_MODEL',
+  'ANTHROPIC_DEFAULT_HAIKU_MODEL',
+];
+
 /** Safe env vars that agents always need */
 const ALWAYS_ALLOWED = [
   'PATH',
@@ -78,7 +90,7 @@ export function buildAgentEnv(agentSpecificVars: Record<string, string> = {}): R
 export function getAgentEnvVars(agentType: 'claude-code' | 'codex' | 'opencode'): string[] {
   switch (agentType) {
     case 'claude-code':
-      return ['ANTHROPIC_API_KEY'];
+      return [...CLAUDE_PROVIDER_ENV_KEYS];
     case 'codex':
       return ['OPENAI_API_KEY', 'OPENAI_BASE_URL', 'OPENAI_MODEL'];
     case 'opencode':
@@ -98,14 +110,9 @@ export function buildAgentEnvFromProcess(
     const val = process.env[key];
     if (val) agentVars[key] = val;
   }
-  const safe = buildAgentEnv(agentVars);
-  if (agentType === 'claude-code') {
-    // Claude's local auth mount is the only credential context this path may
-    // inherit. It is intentionally added after the generic secret filter,
-    // which rejects token/key-shaped names by default.
-    Object.assign(safe, claudeAuthUdsEnv());
-  }
-  return safe;
+  return agentType === 'claude-code'
+    ? buildClaudeAgentEnv(agentVars)
+    : buildAgentEnv(agentVars);
 }
 
 /**
@@ -114,7 +121,19 @@ export function buildAgentEnvFromProcess(
  * never projected by this helper.
  */
 export function buildClaudeAgentEnv(extra: Record<string, string> = {}): Record<string, string> {
-  const safe = buildAgentEnv(extra);
+  // `extra` is already the session/provider route, not process.env. Preserve
+  // only Claude's explicit provider variables here: the generic isolation
+  // helper intentionally blocks key/token-shaped names, while applying it
+  // directly would silently drop the configured Claude credentials. Do not
+  // widen this to all of extra, since Anthropic-compatible presets may also
+  // carry OPENAI_* or unrelated provider credentials.
+  const claudeEnv: Record<string, string> = {};
+  for (const key of CLAUDE_PROVIDER_ENV_KEYS) {
+    const value = extra[key]?.trim();
+    if (value) claudeEnv[key] = value;
+  }
+  const safe = buildAgentEnv();
+  Object.assign(safe, claudeEnv);
   Object.assign(safe, claudeAuthUdsEnv({ ...process.env, ...extra }));
   return safe;
 }
