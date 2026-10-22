@@ -20,6 +20,7 @@ import type { SessionContextBootstrapState } from '../../shared/session-context-
 import type { ProviderLimitSignal } from '../../shared/delegation-availability.js';
 import type { ProviderQuotaMeta } from '../../shared/provider-quota.js';
 import type { TransportAttachment } from '../../shared/transport-attachments.js';
+import type { LocalAuthContext } from './local-auth-context.js';
 import type { MemoryMcpProviderStatusView } from '../../shared/memory-ws.js';
 import type { DshLlmConfig } from '../../shared/deepseek-harness.js';
 import type { PiLlmConfig } from '../../shared/pi-agent.js';
@@ -330,6 +331,8 @@ export interface SessionConfig {
   fresh?: boolean;
   /** Environment variables to pass through for SDK-backed local providers. */
   env?: Record<string, string>;
+  /** Provider-neutral authenticated local context resolved at launch boundary. */
+  authContext?: LocalAuthContext;
   /** Working directory for providers that need local project context. */
   cwd?: string;
   /** Provider-side agent/model identifier (overrides ProviderConfig.agentId). */

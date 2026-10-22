@@ -85,7 +85,7 @@ import { getCodexRuntimeConfig } from './codex-runtime-config.js';
 import { mergeCodexDisplayMetadata } from './codex-display.js';
 import type { TransportEffortLevel } from '../../shared/effort-levels.js';
 import { getSessionRuntimeType, isClaudeCodeFamily, isCodexFamily } from '../../shared/agent-types.js';
-import { localAuthContextEnv } from './local-auth-context.js';
+import { detectLocalAuthContext, hasLocalAuthCandidate, localAuthContextEnv, type LocalAuthContext } from './local-auth-context.js';
 import { providerQuotaMetaEquals } from '../../shared/provider-quota.js';
 import { DEFAULT_CODEX_SESSION_MODEL } from '../shared/models/options.js';
 import {
@@ -1566,6 +1566,16 @@ function buildTransportSessionEnv(
     [IMCODES_SESSION_LABEL_ENV]: label?.trim() || sessionName,
     ...imcodesStateDirEnv(),
   };
+}
+
+async function resolveLaunchAuthContext(providerId: string, extraEnv?: Record<string, string>): Promise<LocalAuthContext | undefined> {
+  const env = { ...process.env, ...(extraEnv ?? {}) };
+  if (!hasLocalAuthCandidate(providerId, env)) return undefined;
+  const context = await detectLocalAuthContext(providerId, env);
+  if (!context.authenticated || !context.reusable) {
+    throw new Error(`Local auth unavailable for ${providerId}: ${context.reason ?? 'authentication context could not be verified'}`);
+  }
+  return context;
 }
 
 async function loadBoundServerIdForManagedMcp(): Promise<string | undefined> {
@@ -3187,6 +3197,7 @@ export async function restoreTransportSessions(
         await runtime.kill({ detachProviderSession: true }).catch(() => {});
         return;
       }
+      const restoreAuthContext = await resolveLaunchAuthContext(provider.id, extraEnv);
       // The persisted identity is the startup sweep's ownership authority.
       // Omitting it makes `agentResourceOwner()` return null, so a restored
       // per-session provider registers no AGENT lease — and after a daemon
@@ -3211,7 +3222,8 @@ export async function restoreTransportSessions(
         fresh: freshOnRestore,
         bindExistingKey: freshOnRestore ? undefined : (needsEphemeralRouteKey ? s.providerSessionId : s.providerSessionId),
         skipCreate: !freshOnRestore && !!s.providerSessionId,
-        env: buildTransportSessionEnv(s.name, s.label, extraEnv, provider.id),
+        env: buildTransportSessionEnv(s.name, s.label, { ...(extraEnv ?? {}), ...(restoreAuthContext?.env ?? {}) }, provider.id),
+        authContext: restoreAuthContext,
         // Directory-scoped providers may persist a symlinked path spelling.
         // Reuse the provider's authoritative spelling for the resume RPC while
         // keeping the local projectDir unchanged for product configuration.
@@ -3774,6 +3786,7 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
   }
 
   // Create session on provider
+  const launchAuthContext = await resolveLaunchAuthContext(provider.id, transportEnv);
   await runtime.initialize({
     sessionKey: effectiveSessionKey,
     sessionName: name,
@@ -3783,7 +3796,8 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
     serverId: boundServerId,
     providerId: provider.id,
     fresh: !!opts.fresh,
-    env: buildTransportSessionEnv(name, label, transportEnv, agentType),
+    env: buildTransportSessionEnv(name, label, { ...(transportEnv ?? {}), ...(launchAuthContext?.env ?? {}) }, agentType),
+    authContext: launchAuthContext,
     cwd: projectDir,
     label: label || name,
     description,

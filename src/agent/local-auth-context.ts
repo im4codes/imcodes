@@ -1,4 +1,4 @@
-import { access, stat } from 'node:fs/promises';
+import { access, readFile, stat } from 'node:fs/promises';
 import { constants as fsConstants } from 'node:fs';
 import { join } from 'node:path';
 import { isClaudeCodeFamily, isCodexFamily } from '../../shared/agent-types.js';
@@ -44,11 +44,69 @@ async function codexAuth(providerId: string, env: NodeJS.ProcessEnv): Promise<Lo
     await access(authPath, fsConstants.R_OK);
     const metadata = await stat(authPath);
     if (!metadata.isFile() || metadata.size <= 0) return unsupported(providerId, `Codex auth file is unusable: ${authPath}`);
+    const parsed = JSON.parse(await readFile(authPath, 'utf8')) as Record<string, unknown>;
+    const token = [parsed.access_token, parsed.id_token, parsed.token].find((value): value is string => typeof value === 'string' && value.trim().length > 0);
+    if (!token) return unsupported(providerId, `Codex auth file has no usable token: ${authPath}`);
+    const jwtParts = token.split('.');
+    if (jwtParts.length === 3) {
+      try {
+        const payload = JSON.parse(Buffer.from(jwtParts[1]!, 'base64url').toString('utf8')) as { exp?: unknown };
+        if (typeof payload.exp === 'number' && payload.exp <= Date.now() / 1000) return unsupported(providerId, `Codex auth token is expired: ${authPath}`);
+      } catch {
+        return unsupported(providerId, `Codex auth token is malformed: ${authPath}`);
+      }
+    }
     return { providerId, method: 'credential-file', source: authPath, authenticated: true, reusable: true, env: {} };
   } catch (error) {
     const code = (error as NodeJS.ErrnoException)?.code;
     return unsupported(providerId, `Codex auth context unavailable${code ? ` (${code})` : ''}`);
   }
+}
+
+async function jsonCredentialAuth(providerId: string, authPath: string): Promise<LocalAuthContext> {
+  try {
+    const metadata = await stat(authPath);
+    if (!metadata.isFile() || metadata.size <= 0) return unsupported(providerId, `Credential file is unusable: ${authPath}`);
+    const parsed = JSON.parse(await readFile(authPath, 'utf8')) as Record<string, unknown>;
+    const findToken = (value: unknown, hinted = false): string | undefined => {
+      if (typeof value === 'string' && hinted && value.trim()) return value.trim();
+      if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+      for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
+        const found = findToken(child, hinted || /token|key|oauth|credential/i.test(key));
+        if (found) return found;
+      }
+      return undefined;
+    };
+    const token = findToken(parsed);
+    if (!token) return unsupported(providerId, `Credential file has no verifiable token: ${authPath}`);
+    return { providerId, method: 'credential-file', source: authPath, authenticated: true, reusable: true, env: {} };
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException)?.code;
+    return unsupported(providerId, `Credential context unavailable${code ? ` (${code})` : ''}`);
+  }
+}
+
+async function configuredProviderAuth(providerId: string, env: NodeJS.ProcessEnv): Promise<LocalAuthContext> {
+  const envKeys: Record<string, string[]> = {
+    'gemini-sdk': ['GEMINI_API_KEY'],
+    'grok-sdk': ['XAI_API_KEY'],
+    'copilot-sdk': ['GITHUB_TOKEN', 'GH_TOKEN'],
+    qwen: ['QWEN_API_KEY'],
+    'kimi-sdk': ['KIMI_API_KEY'],
+    'muse-code-sdk': ['MUSE_API_KEY'],
+  };
+  for (const key of envKeys[providerId] ?? []) {
+    const found = envToken(providerId, key, env);
+    if (found) return found;
+  }
+  const home = env.HOME?.trim();
+  const knownFiles: Record<string, string> = {
+    'gemini-sdk': '.gemini/oauth_creds.json',
+    'grok-sdk': '.grok/auth.json',
+  };
+  const relative = knownFiles[providerId];
+  if (home && relative) return jsonCredentialAuth(providerId, join(home, relative));
+  return unsupported(providerId, `No verified local auth context for provider ${providerId}`);
 }
 
 /** Detect only provider mechanisms with a known, testable protocol or file contract. */
@@ -70,7 +128,7 @@ export async function detectLocalAuthContext(
       : unsupported(providerId, result.reason ?? 'Claude auth UDS unavailable');
   }
   if (isCodexFamily(providerId)) return codexAuth(providerId, env);
-  return unsupported(providerId, `No verified local auth adapter for provider ${providerId}`);
+  return configuredProviderAuth(providerId, env);
 }
 
 /** Synchronous projection for launch environments; detection remains authoritative. */
@@ -80,5 +138,34 @@ export function localAuthContextEnv(providerId: string, env: NodeJS.ProcessEnv =
     const value = env.OPENAI_API_KEY?.trim();
     return value ? { OPENAI_API_KEY: value } : {};
   }
+  const envKeys: Record<string, string[]> = {
+    'gemini-sdk': ['GEMINI_API_KEY'],
+    'grok-sdk': ['XAI_API_KEY'],
+    'copilot-sdk': ['GITHUB_TOKEN', 'GH_TOKEN'],
+    qwen: ['QWEN_API_KEY'],
+    'kimi-sdk': ['KIMI_API_KEY'],
+    'muse-code-sdk': ['MUSE_API_KEY'],
+  };
+  for (const key of envKeys[providerId] ?? []) {
+    const value = env[key]?.trim();
+    if (value) return { [key]: value };
+  }
   return {};
+}
+
+/** True only when the caller supplied a provider auth candidate we must verify. */
+export function hasLocalAuthCandidate(providerId: string, env: NodeJS.ProcessEnv = process.env): boolean {
+  if (isClaudeCodeFamily(providerId)) {
+    return Boolean(env.CLAUDE_CODE_MESSAGING_SOCKET?.trim() || env.IMCODES_CLAUDE_AUTH_UDS?.trim());
+  }
+  if (isCodexFamily(providerId)) return Boolean(env.OPENAI_API_KEY?.trim() || env.CODEX_HOME?.trim());
+  const candidates: Record<string, string[]> = {
+    'gemini-sdk': ['GEMINI_API_KEY'],
+    'grok-sdk': ['XAI_API_KEY'],
+    'copilot-sdk': ['GITHUB_TOKEN', 'GH_TOKEN'],
+    qwen: ['QWEN_API_KEY'],
+    'kimi-sdk': ['KIMI_API_KEY'],
+    'muse-code-sdk': ['MUSE_API_KEY'],
+  };
+  return (candidates[providerId] ?? []).some((key) => Boolean(env[key]?.trim()));
 }
