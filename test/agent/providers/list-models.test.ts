@@ -29,7 +29,7 @@ describe('ClaudeCodeSdkProvider.listModels', () => {
     // auth UDS; this test process has no such session and must not fall back to
     // credentials files or API keys.
     expect(result.isAuthenticated).toBe(false);
-    expect(result.error).toContain('Claude auth UDS unavailable');
+    expect(result.error).toContain('Claude local auth unavailable');
     // Default model is the first in the list
     expect(result.defaultModel).toBe(result.models[0]?.id);
   });

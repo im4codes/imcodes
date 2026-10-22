@@ -85,7 +85,7 @@ import { getCodexRuntimeConfig } from './codex-runtime-config.js';
 import { mergeCodexDisplayMetadata } from './codex-display.js';
 import type { TransportEffortLevel } from '../../shared/effort-levels.js';
 import { getSessionRuntimeType, isClaudeCodeFamily, isCodexFamily } from '../../shared/agent-types.js';
-import { claudeAuthUdsEnv } from './claude-auth-uds.js';
+import { localAuthContextEnv } from './local-auth-context.js';
 import { providerQuotaMetaEquals } from '../../shared/provider-quota.js';
 import { DEFAULT_CODEX_SESSION_MODEL } from '../shared/models/options.js';
 import {
@@ -1560,7 +1560,7 @@ function buildTransportSessionEnv(
   providerId?: string,
 ): Record<string, string> {
   return {
-    ...(providerId && isClaudeCodeFamily(providerId) ? claudeAuthUdsEnv() : {}),
+    ...(providerId ? localAuthContextEnv(providerId) : {}),
     ...(extraEnv ?? {}),
     [IMCODES_SESSION_ENV]: sessionName,
     [IMCODES_SESSION_LABEL_ENV]: label?.trim() || sessionName,

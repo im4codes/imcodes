@@ -53,7 +53,7 @@ import { claudeRateLimitsToQuotaMeta, type ClaudeRateLimitInfo } from '../claude
 import { formatProviderQuotaLabel } from '../../../shared/provider-quota.js';
 import { claudeRateLimitSignal } from '../claude-rate-limit.js';
 import { buildClaudeAgentEnv } from '../env-isolation.js';
-import { checkClaudeAuthUds } from '../claude-auth-uds.js';
+import { detectLocalAuthContext } from '../local-auth-context.js';
 import { IMCODES_MEMORY_MCP_SERVER_NAME } from '../../../shared/memory-mcp-server-name.js';
 import {
   AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES,
@@ -575,12 +575,12 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
       Promise.resolve(getClaudeSdkAvailableModels()),
       getClaudeSdkRuntimeConfig(false),
     ]);
-    const auth = await checkClaudeAuthUds();
+    const auth = await detectLocalAuthContext(this.id);
     return {
       models: models.map((id) => ({ id })),
       defaultModel: models[0],
-      isAuthenticated: !!auth.context,
-      ...(!auth.context ? { error: `Claude auth UDS unavailable: ${auth.reason ?? 'unknown reason'}` } : {}),
+      isAuthenticated: auth.authenticated && auth.reusable,
+      ...(!(auth.authenticated && auth.reusable) ? { error: `Claude local auth unavailable: ${auth.reason ?? 'unknown reason'}` } : {}),
       ...(cfg.planLabel ? {} : {}), // planLabel lives in session-info, not model list
     };
   }
