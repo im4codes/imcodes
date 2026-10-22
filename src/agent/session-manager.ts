@@ -85,7 +85,7 @@ import { getCodexRuntimeConfig } from './codex-runtime-config.js';
 import { mergeCodexDisplayMetadata } from './codex-display.js';
 import type { TransportEffortLevel } from '../../shared/effort-levels.js';
 import { getSessionRuntimeType, isClaudeCodeFamily, isCodexFamily } from '../../shared/agent-types.js';
-import { detectLocalAuthContext, hasLocalAuthCandidate, localAuthContextEnv, type LocalAuthContext } from './local-auth-context.js';
+import { detectLocalAuthContext, hasLocalAuthCandidate, isExplicitlyUnsupportedLocalAuthProvider, localAuthContextEnv, type LocalAuthContext } from './local-auth-context.js';
 import { providerQuotaMetaEquals } from '../../shared/provider-quota.js';
 import { DEFAULT_CODEX_SESSION_MODEL } from '../shared/models/options.js';
 import {
@@ -1568,11 +1568,17 @@ function buildTransportSessionEnv(
   };
 }
 
-async function resolveLaunchAuthContext(providerId: string, extraEnv?: Record<string, string>): Promise<LocalAuthContext | undefined> {
+export async function resolveLaunchAuthContext(providerId: string, extraEnv?: Record<string, string>): Promise<LocalAuthContext | undefined> {
   const env = { ...process.env, ...(extraEnv ?? {}) };
-  if (!hasLocalAuthCandidate(providerId, env)) return undefined;
+  const candidate = hasLocalAuthCandidate(providerId, env);
+  // Known providers without a proven adapter still receive an explicit
+  // unsupported context at launch. This keeps status and runtime behavior
+  // aligned without guessing credentials or blocking providers that own
+  // their native login flow (for example Claude with no UDS candidate).
+  if (!candidate && !isExplicitlyUnsupportedLocalAuthProvider(providerId)) return undefined;
   const context = await detectLocalAuthContext(providerId, env);
   if (!context.authenticated || !context.reusable) {
+    if (!candidate && isExplicitlyUnsupportedLocalAuthProvider(providerId)) return context;
     throw new Error(`Local auth unavailable for ${providerId}: ${context.reason ?? 'authentication context could not be verified'}`);
   }
   return context;

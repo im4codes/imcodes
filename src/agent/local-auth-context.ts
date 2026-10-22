@@ -11,6 +11,18 @@ import { MEMORY_MCP_PROVIDER_IDS } from '../../shared/memory-ws.js';
 const REGISTRY_PROVIDER_IDS = new Set([
   'openclaw', ...MEMORY_MCP_PROVIDER_IDS,
 ]);
+const EXPLICITLY_UNSUPPORTED_PROVIDER_IDS = new Set([
+  'openclaw', 'agy-sdk', 'qoder-sdk', 'cursor-headless', 'opencode-sdk',
+  'deepseek-harness', 'pi', 'hermes-acp', 'codebuddy-cn', 'codebuddy-international',
+]);
+
+export function isKnownLocalAuthProvider(providerId: string): boolean {
+  return REGISTRY_PROVIDER_IDS.has(providerId);
+}
+
+export function isExplicitlyUnsupportedLocalAuthProvider(providerId: string): boolean {
+  return EXPLICITLY_UNSUPPORTED_PROVIDER_IDS.has(providerId);
+}
 
 export type LocalAuthMethod = 'uds' | 'env-token' | 'credential-file' | 'cli-session' | 'unsupported';
 
