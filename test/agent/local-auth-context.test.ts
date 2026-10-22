@@ -68,6 +68,10 @@ describe('provider-neutral local auth context', () => {
   it('uses real provider-specific environment auth adapters and rejects unsupported methods', async () => {
     await expect(detectLocalAuthContext('gemini-sdk', { GEMINI_API_KEY: 'gemini-key' })).resolves.toMatchObject({ method: 'env-token', authenticated: true, reusable: true });
     await expect(detectLocalAuthContext('grok-sdk', { XAI_API_KEY: 'xai-key' })).resolves.toMatchObject({ method: 'env-token', authenticated: true, reusable: true });
+    await expect(detectLocalAuthContext('copilot-sdk', { GITHUB_TOKEN: 'github-token' })).resolves.toMatchObject({ method: 'env-token', authenticated: true, reusable: true });
+    await expect(detectLocalAuthContext('qwen', { QWEN_API_KEY: 'qwen-key' })).resolves.toMatchObject({ method: 'env-token', authenticated: true, reusable: true });
+    await expect(detectLocalAuthContext('kimi-sdk', { KIMI_API_KEY: 'kimi-key' })).resolves.toMatchObject({ method: 'env-token', authenticated: true, reusable: true });
+    await expect(detectLocalAuthContext('muse-code-sdk', { MUSE_API_KEY: 'muse-key' })).resolves.toMatchObject({ method: 'env-token', authenticated: true, reusable: true });
     await expect(detectLocalAuthContext('copilot-sdk', { ANTHROPIC_API_KEY: 'wrong-provider-key' })).resolves.toMatchObject({ method: 'unsupported', authenticated: false, reusable: false });
   });
 
