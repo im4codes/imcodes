@@ -11303,4 +11303,29 @@ afterEach(() => {
     }
   });
 
+  it.each(['insertReplacementText', 'insertFromDictation'])('syncs macOS Dictation %s into the composer and send payload', async (inputType) => {
+    const ws = makeWs();
+    render(<SessionControls ws={ws as any} activeSession={makeSession({ name: 'dictation-session' })} quickData={makeQuickData() as any} />);
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    input.focus();
+    input.textContent = 'dictated text';
+    input.dispatchEvent(new InputEvent('beforeinput', { bubbles: true, inputType, data: 'dictated text' }));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(input.textContent).toBe('dictated text');
+    fireEvent.click(screen.getByRole('button', { name: /send/i }));
+    expectSendPayload(ws, { sessionName: 'dictation-session', text: 'dictated text' });
+  });
+
+  it('does not steal another focused field for a Dictation replacement', () => {
+    render(<SessionControls ws={makeWs() as any} activeSession={makeSession({ name: 'dictation-focus' })} quickData={makeQuickData() as any} />);
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    const other = document.createElement('input');
+    document.body.appendChild(other);
+    other.focus();
+    input.textContent = 'dictated text';
+    input.dispatchEvent(new InputEvent('beforeinput', { bubbles: true, inputType: 'insertFromDictation', data: 'dictated text' }));
+    expect(document.activeElement).toBe(other);
+    other.remove();
+  });
+
 });
