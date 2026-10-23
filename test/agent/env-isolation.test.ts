@@ -36,4 +36,24 @@ describe('Claude SDK environment isolation', () => {
     expect(env).not.toHaveProperty('GEMINI_API_KEY');
     expect(getAgentEnvVars('claude-code')).toContain('ANTHROPIC_API_KEY');
   });
+
+  it('preserves scoped session identity and mise runtime vars without widening the env', () => {
+    const env = buildClaudeAgentEnv({
+      IMCODES_SESSION: 'deck_test_claude',
+      IMCODES_SESSION_LABEL: 'Claude test',
+      IMCODES_DAEMON_SESSION_NAME: 'deck_test_claude',
+      MISE_PYTHON_VERSION: '3.12',
+      OPENAI_API_KEY: 'must-not-cross-provider',
+      RANDOM_SECRET: 'must-not-leak',
+    });
+
+    expect(env).toMatchObject({
+      IMCODES_SESSION: 'deck_test_claude',
+      IMCODES_SESSION_LABEL: 'Claude test',
+      IMCODES_DAEMON_SESSION_NAME: 'deck_test_claude',
+      MISE_PYTHON_VERSION: '3.12',
+    });
+    expect(env).not.toHaveProperty('OPENAI_API_KEY');
+    expect(env).not.toHaveProperty('RANDOM_SECRET');
+  });
 });

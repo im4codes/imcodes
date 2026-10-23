@@ -7,6 +7,8 @@
  */
 
 import { claudeAuthUdsEnv } from './claude-auth-uds.js';
+import { IMCODES_DAEMON_SESSION_NAME_ENV } from '../../shared/memory-mcp-env.js';
+import { IMCODES_SESSION_ENV, IMCODES_SESSION_LABEL_ENV } from '../../shared/imcodes-send.js';
 
 /** Explicit Claude provider inputs allowed in a session-scoped SDK launch. */
 const CLAUDE_PROVIDER_ENV_KEYS = [
@@ -19,6 +21,13 @@ const CLAUDE_PROVIDER_ENV_KEYS = [
   'ANTHROPIC_DEFAULT_OPUS_MODEL',
   'ANTHROPIC_DEFAULT_HAIKU_MODEL',
 ];
+
+/** Non-secret runtime identity/context that must survive SDK launches. */
+const SAFE_CLAUDE_RUNTIME_ENV_KEYS = [
+  IMCODES_DAEMON_SESSION_NAME_ENV,
+  IMCODES_SESSION_ENV,
+  IMCODES_SESSION_LABEL_ENV,
+] as const;
 
 /** Safe env vars that agents always need */
 const ALWAYS_ALLOWED = [
@@ -132,7 +141,18 @@ export function buildClaudeAgentEnv(extra: Record<string, string> = {}): Record<
     const value = extra[key]?.trim();
     if (value) claudeEnv[key] = value;
   }
-  const safe = buildAgentEnv();
+  const runtimeEnv: Record<string, string> = {};
+  for (const key of SAFE_CLAUDE_RUNTIME_ENV_KEYS) {
+    const value = extra[key]?.trim();
+    if (value) runtimeEnv[key] = value;
+  }
+  // mise exports are non-secret toolchain/runtime selection, not provider
+  // credentials. Keep only the explicit MISE_* namespace from the session
+  // route; never pass arbitrary extra keys through this boundary.
+  for (const [key, value] of Object.entries(extra)) {
+    if (key.startsWith('MISE_') && value.trim()) runtimeEnv[key] = value;
+  }
+  const safe = buildAgentEnv(runtimeEnv);
   Object.assign(safe, claudeEnv);
   Object.assign(safe, claudeAuthUdsEnv({ ...process.env, ...extra }));
   return safe;

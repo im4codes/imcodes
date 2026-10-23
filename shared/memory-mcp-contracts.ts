@@ -1430,7 +1430,7 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
   },
   [MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_CALL]: {
     name: MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_CALL,
-    description: 'GUI/browser control; CLI/executable requests use exec_remote or shell_session1. Prefer browser_open/browser_snapshot. Canonical 10-digit nodeId targets need no list_machines preflight; legacy ref_name is compatibility-only. GUI max 120000; shell_session1 max 900000. FULL nodes only.',
+    description: 'GUI/browser control. Do not use GUI OCU for a shell/CLI/executable request; use exec_remote or shell_session1 only for active-user semantics. A helper failure does not mean the machine is unauthorized or uncontrollable. Prefer browser_open/browser_snapshot. Pass canonical 10-digit nodeId or complete ^^(nodeId) marker without calling list_machines first; deprecated noncanonical legacy ref_name is compatibility-only. accessibility_tree read-only.',
     inputSchema: objectSchema({
       machine: stringSchema('Canonical nodeId, complete ^^(nodeId) marker, deprecated noncanonical legacy ref_name, or local/localhost/self/this.', { minLength: 1, maxLength: MACHINE_TARGET_MAX, pattern: MACHINE_TARGET_PATTERN.source }),
       tool: stringSchema(`Typed method name; one of ${COMPUTER_USE_TOOLS.join(', ')}.`, { enum: [...COMPUTER_USE_TOOLS] }),
