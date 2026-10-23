@@ -11312,6 +11312,8 @@ afterEach(() => {
     input.dispatchEvent(new InputEvent('beforeinput', { bubbles: true, inputType, data: 'dictated text' }));
     await new Promise((resolve) => setTimeout(resolve, 0));
     expect(input.textContent).toBe('dictated text');
+    fireEvent.input(input);
+    expect(input.textContent).toBe('dictated text');
     fireEvent.click(screen.getByRole('button', { name: /send/i }));
     expectSendPayload(ws, { sessionName: 'dictation-session', text: 'dictated text' });
   });
