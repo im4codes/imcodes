@@ -5668,6 +5668,25 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     setHasText(!!(divRef.current ? readComposerElementText(divRef.current).trim() : ''));
   };
 
+  // macOS Dictation commonly commits through beforeinput with
+  // insertReplacementText/insertFromDictation and may omit a follow-up input
+  // event. Keep the contenteditable focused only when focus is otherwise on
+  // the document (never steal focus from another field or terminal), then
+  // resync after the browser applies the replacement.
+  const handleComposerBeforeInput = (event: Event): void => {
+    const input = event as InputEvent;
+    if (!['insertReplacementText', 'insertFromDictation'].includes(input.inputType)) return;
+    const editor = divRef.current;
+    if (!editor || inputDisabled) return;
+    const active = document.activeElement;
+    if (active === document.body || active === document.documentElement || active === editor) {
+      if (active !== editor) editor.focus();
+      window.setTimeout(() => {
+        if (divRef.current === editor) editor.dispatchEvent(new Event('input', { bubbles: true }));
+      }, 0);
+    }
+  };
+
   const handleShortcut = (data: string) => {
     if (!ws || !activeSession) return;
     ws.sendInput(activeSession.name, data);
@@ -7557,6 +7576,8 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
             role="textbox"
             aria-multiline="true"
             aria-label="Message input"
+            inputmode="text"
+            autocapitalize="sentences"
             data-placeholder={placeholder}
             spellcheck={false}
             enterkeyhint={isMobileLayout ? 'send' : undefined}
@@ -7570,6 +7591,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
             }}
             onFocus={handleFocus}
             onBlur={handleBlur}
+            onBeforeInput={handleComposerBeforeInput}
             onInput={(event) => {
               const currentText = divRef.current ? readComposerElementText(divRef.current) : '';
               setHasText(!!currentText.trim());
