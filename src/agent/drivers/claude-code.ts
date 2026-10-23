@@ -25,10 +25,36 @@ const STARTUP_PROMPTS: Array<{
   // "Resume from summary (recommended)" chooser shown on restart/resume.
   // The default selection is already "Resume from summary", so Enter confirms it.
   { pattern: /resume from summary|resume full session as-is|don't ask me again/i, keys: ['Enter'], label: 'resume-summary' },
-  // "Security guide" / "Do you trust the files in this folder?" — select "Yes, I trust"
-  // Newer CC versions use a numbered menu (1=Yes, 2=No); older use Enter for default.
-  // Sending "1" then Enter covers both: numbered picks option 1, legacy confirms default.
-  { pattern: /security guide|trust.*folder|do you trust/i, keys: ['1', 'Enter'], label: 'trust-folder' },
+  // Newer CC versions use an arrow menu with "No, exit" selected by default.
+  // Require both menu entries before moving the selection so an unrelated
+  // security dialog can never be accepted accidentally.
+  // Numbered menus are handled first, even when they also show "No, exit".
+  {
+    pattern: /(?=[\s\S]*\b1[.)]\s*yes,\s*i\s*trust\s*this\s*folder\b)(?=[\s\S]*\b2[.)]\s*no,\s*exit\b)/i,
+    keys: ['1', 'Enter'],
+    label: 'trust-folder-numbered',
+  },
+  {
+    pattern: /(?=[\s\S]*\bno,\s*exit\b)(?=[\s\S]*\byes,\s*i\s*trust\s*this\s*folder\b)/i,
+    keys: ['Down', 'Enter'],
+    label: 'trust-folder-arrow',
+  },
+  // Older CC versions use a numbered menu (1=Yes). Match the explicit trust
+  // choice rather than the generic "Security guide" heading; sending "1"
+  // then Enter keeps that compatibility path intact.
+  {
+    pattern: /\byes,\s*i\s*trust\s*this\s*folder\b/i,
+    keys: ['1', 'Enter'],
+    label: 'trust-folder',
+  },
+  // The legacy default-confirmation prompt has no numbered Yes row, but does
+  // include an explicit confirmation affordance. Require that affordance too;
+  // a question paired with only "No" must never receive an authorization key.
+  {
+    pattern: /\bdo\s+you\s+trust\s+(?:the\s+)?files?\s+in\s+this\s+folder\b[\s\S]*(?:\[y\/n\]|press\s+enter(?:\s+to\s+confirm)?|enter\s+to\s+confirm)/i,
+    keys: ['Enter'],
+    label: 'trust-folder-default',
+  },
   // Update available / Press enter to continue
   { pattern: /update available|press enter to continue/i, keys: ['Enter'], label: 'update' },
   // "Bypass Permissions mode" dialog — "No, exit" is selected, Down selects "Yes, I accept"
