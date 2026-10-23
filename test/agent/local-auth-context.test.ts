@@ -26,6 +26,48 @@ describe('provider-neutral local auth context', () => {
     }
   });
 
+  it('detects Codex ChatGPT nested tokens and refresh_token fallback', async () => {
+    const home = `/tmp/imcodes-local-auth-chatgpt-${process.pid}`;
+    await mkdir(`${home}/.codex`, { recursive: true, mode: 0o700 });
+    const path = `${home}/.codex/auth.json`;
+    try {
+      // 1. Nested tokens with active access_token
+      const future = Math.floor(Date.now() / 1000) + 3600;
+      const futureJwt = `a.${Buffer.from(JSON.stringify({ exp: future })).toString('base64url')}.c`;
+      await writeFile(path, JSON.stringify({
+        auth_mode: 'chatgpt',
+        tokens: {
+          access_token: futureJwt,
+          refresh_token: 'valid-refresh-token',
+        },
+      }), { mode: 0o600 });
+      let context = await detectLocalAuthContext('codex-sdk', { HOME: home });
+      expect(context).toMatchObject({ method: 'credential-file', authenticated: true, reusable: true });
+
+      // 2. Expired access_token with refresh_token fallback (auto-refreshable by Codex CLI)
+      const expiredJwt = `a.${Buffer.from(JSON.stringify({ exp: 1 })).toString('base64url')}.c`;
+      await writeFile(path, JSON.stringify({
+        auth_mode: 'chatgpt',
+        tokens: {
+          access_token: expiredJwt,
+          refresh_token: 'valid-refresh-token',
+        },
+      }), { mode: 0o600 });
+      context = await detectLocalAuthContext('codex-sdk', { HOME: home });
+      expect(context).toMatchObject({ method: 'credential-file', authenticated: true, reusable: true });
+
+      // 3. OPENAI_API_KEY in auth.json
+      await writeFile(path, JSON.stringify({
+        auth_mode: 'api_key',
+        OPENAI_API_KEY: 'sk-test-stored-key',
+      }), { mode: 0o600 });
+      context = await detectLocalAuthContext('codex-sdk', { HOME: home });
+      expect(context).toMatchObject({ method: 'credential-file', authenticated: true, reusable: true });
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
   it('rejects malformed, tokenless and expired Codex credential files', async () => {
     const home = `/tmp/imcodes-local-auth-invalid-${process.pid}`;
     await mkdir(`${home}/.codex`, { recursive: true, mode: 0o700 });

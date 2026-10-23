@@ -65,17 +65,51 @@ async function codexAuth(providerId: string, env: NodeJS.ProcessEnv): Promise<Lo
     const metadata = await stat(authPath);
     if (!metadata.isFile() || metadata.size <= 0) return unsupported(providerId, `Codex auth file is unusable: ${authPath}`);
     const parsed = JSON.parse(await readFile(authPath, 'utf8')) as Record<string, unknown>;
-    const token = [parsed.access_token, parsed.id_token, parsed.token].find((value): value is string => typeof value === 'string' && value.trim().length > 0);
-    if (!token) return unsupported(providerId, `Codex auth file has no usable token: ${authPath}`);
-    const jwtParts = token.split('.');
-    if (jwtParts.length === 3) {
-      try {
-        const payload = JSON.parse(Buffer.from(jwtParts[1]!, 'base64url').toString('utf8')) as { exp?: unknown };
-        if (typeof payload.exp === 'number' && payload.exp <= Date.now() / 1000) return unsupported(providerId, `Codex auth token is expired: ${authPath}`);
-      } catch {
-        return unsupported(providerId, `Codex auth token is malformed: ${authPath}`);
+
+    const fileApiKey = typeof parsed.OPENAI_API_KEY === 'string' && parsed.OPENAI_API_KEY.trim()
+      ? parsed.OPENAI_API_KEY.trim()
+      : undefined;
+    if (fileApiKey) {
+      return { providerId, method: 'credential-file', source: authPath, authenticated: true, reusable: true, env: {} };
+    }
+
+    const tokensObj = (parsed.tokens && typeof parsed.tokens === 'object' && !Array.isArray(parsed.tokens))
+      ? (parsed.tokens as Record<string, unknown>)
+      : undefined;
+
+    const accessToken = [tokensObj?.access_token, parsed.access_token, tokensObj?.token, parsed.token].find(
+      (value): value is string => typeof value === 'string' && value.trim().length > 0,
+    );
+    const idToken = [tokensObj?.id_token, parsed.id_token].find(
+      (value): value is string => typeof value === 'string' && value.trim().length > 0,
+    );
+    const refreshToken = [tokensObj?.refresh_token, parsed.refresh_token].find(
+      (value): value is string => typeof value === 'string' && value.trim().length > 0,
+    );
+
+    const primaryToken = accessToken ?? idToken;
+    if (!primaryToken && !refreshToken) {
+      return unsupported(providerId, `Codex auth file has no usable token: ${authPath}`);
+    }
+
+    if (primaryToken) {
+      const jwtParts = primaryToken.split('.');
+      if (jwtParts.length === 3) {
+        try {
+          const payload = JSON.parse(Buffer.from(jwtParts[1]!, 'base64url').toString('utf8')) as { exp?: unknown };
+          if (typeof payload.exp === 'number' && payload.exp <= Date.now() / 1000) {
+            if (!refreshToken) {
+              return unsupported(providerId, `Codex auth token is expired: ${authPath}`);
+            }
+          }
+        } catch {
+          if (!refreshToken) {
+            return unsupported(providerId, `Codex auth token is malformed: ${authPath}`);
+          }
+        }
       }
     }
+
     return { providerId, method: 'credential-file', source: authPath, authenticated: true, reusable: true, env: {} };
   } catch (error) {
     const code = (error as NodeJS.ErrnoException)?.code;
