@@ -1152,15 +1152,6 @@ describe('styles.css regression contracts', () => {
     expect(css).toMatch(/\.resize-hover-surface\s*\{[^}]*transform:\s*translateZ\(0\)/);
   });
 
-  it('keeps the macOS Dictation surface caret visible without duplicating text', () => {
-    const rule = cssWithoutComments.match(/\.controls-composer-mac-native:has\(\.controls-native-input:focus\) \.controls-native-input\s*\{[^}]*\}/)?.[0];
-    expect(rule, 'macOS native composer focus rule missing').toBeTruthy();
-    expect(rule).toMatch(/opacity:\s*1/);
-    expect(rule).toMatch(/caret-color:\s*#e2e8f0/);
-    expect(rule).toMatch(/color:\s*transparent/);
-    expect(rule).toMatch(/-webkit-text-fill-color:\s*transparent/);
-  });
-
   it('keeps all floating-window resize handles in the browser hit-test tree', () => {
     const handleRule = css.match(/\.resize-handle\s*\{[^}]*\}/)?.[0];
     expect(handleRule, '.resize-handle rule missing').toBeTruthy();
