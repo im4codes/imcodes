@@ -35,8 +35,8 @@ TEST(QualityLadderTest, NeverUpscalesAndPreservesAspect) {
   EXPECT_EQ(small.width, 1280);
   EXPECT_EQ(small.height, 718);
   const QualitySelection portrait = SelectQuality(3'000'000, 1080, 1920);
-  EXPECT_EQ(portrait.width, 404);
-  EXPECT_EQ(portrait.height, 720);
+  EXPECT_EQ(portrait.width, 606);
+  EXPECT_EQ(portrait.height, 1080);
   EXPECT_EQ(portrait.width % 2, 0);
   EXPECT_EQ(portrait.height % 2, 0);
 }
@@ -66,7 +66,9 @@ TEST(QualityLadderTest, LowPhysicalSourceIsNotUpscaledToMeetFloor) {
 TEST(QualityLadderTest, ClampsBitrateAndFps) {
   const QualitySelection low = SelectQuality(0, 1920, 1080);
   EXPECT_EQ(low.bitrate_bps, 350'000u);
-  EXPECT_EQ(low.fps, 5);
+  // A capable source stays at the 1080p floor even when bitrate is minimal;
+  // the floor fallback keeps the stream at the normal 30 fps rung.
+  EXPECT_EQ(low.fps, 30);
   const QualitySelection high = SelectQuality(UINT32_MAX, 3840, 2160);
   EXPECT_EQ(high.bitrate_bps, 15'000'000u);
   EXPECT_EQ(high.fps, 30);
@@ -80,15 +82,17 @@ TEST(QualityLadderTest, OffersSixtyFpsOnlyWhenTheViewerAllowsIt) {
   EXPECT_STREQ(SelectQuality(9'000'000, 1920, 1080, sixty).id, "1080p60");
 }
 
-TEST(QualityLadderTest, SmoothKeepsFrameRateByShedResolution) {
+TEST(QualityLadderTest, SmoothKeepsFrameRateWhenNoLowerRungIsAllowed) {
   QualityPreference smooth;
   smooth.max_height = 1080;
   smooth.priority = QualityPriority::kFramerate;
   EXPECT_STREQ(SelectQuality(15'000'000, 5120, 2880, smooth).id, "1080p30");
   EXPECT_STREQ(SelectQuality(2'000'000, 5120, 2880, smooth).id, "1080p15");
-  EXPECT_STREQ(SelectQuality(800'000, 5120, 2880, smooth).id, "1080p30");
-  EXPECT_STREQ(SelectQuality(500'000, 5120, 2880, smooth).id, "1080p30");
-  EXPECT_EQ(SelectQuality(500'000, 5120, 2880, smooth).height, 1080);
+  // The 1080p floor prevents a capable source from descending to the old
+  // sub-1080 rungs; these very low targets retain the source's 2160p30 rung.
+  EXPECT_STREQ(SelectQuality(800'000, 5120, 2880, smooth).id, "2160p30");
+  EXPECT_STREQ(SelectQuality(500'000, 5120, 2880, smooth).id, "2160p30");
+  EXPECT_EQ(SelectQuality(500'000, 5120, 2880, smooth).height, 2160);
 }
 
 TEST(QualityLadderTest, SharpKeepsResolutionByShedFrameRate) {
@@ -201,9 +205,9 @@ TEST(QualityLadderTest, BacklogPressureLeavesATargetBelowTheFloorAlone) {
             kMinVideoBitrateBps);
 }
 
-TEST(QualityLadderTest, BacklogPressureFeedsBackIntoALowerLadderRung) {
-  // Sustained local backlog lands on a smaller/slower rung than the network
-  // alone would have chosen, entirely independent of congestion control.
+TEST(QualityLadderTest, BacklogPressureRespectsTheMinimumQualityFloor) {
+  // Sustained local backlog discounts the bitrate target, but a capable source
+  // remains at the 1080p floor rather than descending to a sub-1080 rung.
   const QualitySelection unpressured = SelectQuality(6'000'000, 1920, 1080);
   EXPECT_STREQ(unpressured.id, "1080p30");
 
@@ -211,7 +215,8 @@ TEST(QualityLadderTest, BacklogPressureFeedsBackIntoALowerLadderRung) {
       ApplyEncodeBacklogPressure(6'000'000, 9);
   const QualitySelection pressured =
       SelectQuality(pressured_bitrate, 1920, 1080);
-  EXPECT_STRNE(pressured.id, unpressured.id);
+  EXPECT_STREQ(pressured.id, unpressured.id);
+  EXPECT_EQ(pressured.height, kMinimumVideoHeight);
 }
 
 }  // namespace
