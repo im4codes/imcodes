@@ -5668,21 +5668,63 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     setHasText(!!(divRef.current ? readComposerElementText(divRef.current).trim() : ''));
   };
 
-  // macOS Dictation commonly commits through beforeinput with
-  // insertReplacementText/insertFromDictation and may omit a follow-up input
-  // event. Keep the contenteditable focused only when focus is otherwise on
-  // the document (never steal focus from another field or terminal), then
-  // resync after the browser applies the replacement.
+  // macOS Dictation commonly commits through beforeinput and may omit both the
+  // DOM mutation and a follow-up input event. Keep the contenteditable focused
+  // only when focus is otherwise on the document (never steal focus from
+  // another field or terminal), then resync after the browser applies the
+  // replacement. Some WebKit paths expose only InputEvent.data, so the
+  // fallback below inserts it only when the native path left the DOM unchanged.
   const handleComposerBeforeInput = (event: Event): void => {
     const input = event as InputEvent;
-    if (!['insertReplacementText', 'insertFromDictation'].includes(input.inputType)) return;
+    if (event.defaultPrevented) return;
+    const supportedInputTypes = new Set([
+      'insertText',
+      'insertCompositionText',
+      'insertReplacementText',
+      'insertFromDictation',
+    ]);
+    if (!supportedInputTypes.has(input.inputType)) return;
     const editor = divRef.current;
     if (!editor || inputDisabled) return;
     const active = document.activeElement;
     if (active === document.body || active === document.documentElement || active === editor) {
       if (active !== editor) editor.focus();
+      const beforeText = readComposerElementText(editor);
+      const selection = window.getSelection();
+      let savedRange: Range | null = null;
+      if (selection?.rangeCount) {
+        const candidate = selection.getRangeAt(0);
+        if (editor.contains(candidate.commonAncestorContainer)) savedRange = candidate.cloneRange();
+      }
       window.setTimeout(() => {
-        if (divRef.current === editor) editor.dispatchEvent(new Event('input', { bubbles: true }));
+        if (divRef.current !== editor) return;
+        const afterNativeText = readComposerElementText(editor);
+        if (afterNativeText === beforeText && input.data && beforeText !== input.data) {
+          // Native beforeinput is not guaranteed to mutate a contenteditable
+          // on macOS. Insert into the captured selection so replacements keep
+          // their range semantics; dispatch input to run the existing draft,
+          // suggestion and send-state synchronisation.
+          try {
+            const range = savedRange ?? document.createRange();
+            if (!savedRange) {
+              range.selectNodeContents(editor);
+              range.collapse(false);
+            }
+            range.deleteContents();
+            const node = document.createTextNode(input.data);
+            range.insertNode(node);
+            range.setStartAfter(node);
+            range.collapse(true);
+            const nextSelection = window.getSelection();
+            nextSelection?.removeAllRanges();
+            nextSelection?.addRange(range);
+          } catch {
+            // A browser may invalidate the selection while committing IME
+            // text. Leave native content untouched rather than appending in
+            // an unrelated location.
+          }
+        }
+        editor.dispatchEvent(new Event('input', { bubbles: true }));
       }, 0);
     }
   };

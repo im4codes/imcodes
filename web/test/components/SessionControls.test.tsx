@@ -11318,6 +11318,70 @@ afterEach(() => {
     expectSendPayload(ws, { sessionName: 'dictation-session', text: 'dictated text' });
   });
 
+  it.each(['insertText', 'insertCompositionText', 'insertReplacementText', 'insertFromDictation'])('injects %s data when beforeinput leaves the DOM empty', async (inputType) => {
+    const ws = makeWs();
+    render(<SessionControls ws={ws as any} activeSession={makeSession({ name: 'dictation-data-only' })} quickData={makeQuickData() as any} />);
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    input.focus();
+    input.dispatchEvent(new InputEvent('beforeinput', { bubbles: true, inputType, data: 'dictated text' }));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(input.textContent).toBe('dictated text');
+    fireEvent.click(screen.getByRole('button', { name: /send/i }));
+    expectSendPayload(ws, { sessionName: 'dictation-data-only', text: 'dictated text' });
+  });
+
+  it('replaces the captured selection when native beforeinput leaves the DOM unchanged', async () => {
+    const ws = makeWs();
+    render(<SessionControls ws={ws as any} activeSession={makeSession({ name: 'dictation-selection' })} quickData={makeQuickData() as any} />);
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    input.focus();
+    input.textContent = 'hello';
+    const textNode = input.firstChild as Text;
+    const selection = window.getSelection();
+    const range = document.createRange();
+    range.setStart(textNode, 1);
+    range.setEnd(textNode, 4);
+    selection?.removeAllRanges();
+    selection?.addRange(range);
+    input.dispatchEvent(new InputEvent('beforeinput', { bubbles: true, inputType: 'insertReplacementText', data: 'i' }));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(input.textContent).toBe('hio');
+    fireEvent.click(screen.getByRole('button', { name: /send/i }));
+    expectSendPayload(ws, { sessionName: 'dictation-selection', text: 'hio' });
+  });
+
+  it('keeps multiline continuous dictation data in the composer payload', async () => {
+    const ws = makeWs();
+    render(<SessionControls ws={ws as any} activeSession={makeSession({ name: 'dictation-multiline' })} quickData={makeQuickData() as any} />);
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    input.focus();
+    input.dispatchEvent(new InputEvent('beforeinput', {
+      bubbles: true,
+      inputType: 'insertCompositionText',
+      data: '你好\n世界',
+    }));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(input.textContent).toBe('你好\n世界');
+    fireEvent.click(screen.getByRole('button', { name: /send/i }));
+    expectSendPayload(ws, { sessionName: 'dictation-multiline', text: '你好\n世界' });
+  });
+
+  it('does not inject data from a canceled beforeinput event', async () => {
+    render(<SessionControls ws={makeWs() as any} activeSession={makeSession({ name: 'dictation-canceled' })} quickData={makeQuickData() as any} />);
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    input.focus();
+    const event = new InputEvent('beforeinput', {
+      bubbles: true,
+      cancelable: true,
+      inputType: 'insertFromDictation',
+      data: 'must not be inserted',
+    });
+    event.preventDefault();
+    input.dispatchEvent(event);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(input.textContent).toBe('');
+  });
+
   it('does not steal another focused field for a Dictation replacement', () => {
     render(<SessionControls ws={makeWs() as any} activeSession={makeSession({ name: 'dictation-focus' })} quickData={makeQuickData() as any} />);
     const input = screen.getByRole('textbox') as HTMLDivElement;
