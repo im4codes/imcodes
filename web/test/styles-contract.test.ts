@@ -1157,8 +1157,8 @@ describe('styles.css regression contracts', () => {
     expect(rule, 'macOS native composer focus rule missing').toBeTruthy();
     expect(rule).toMatch(/opacity:\s*1/);
     expect(rule).toMatch(/caret-color:\s*#e2e8f0/);
-    expect(rule).toMatch(/color:\s*#e2e8f0/);
-    expect(rule).toMatch(/-webkit-text-fill-color:\s*#e2e8f0/);
+    expect(rule).toMatch(/color:\s*transparent/);
+    expect(rule).toMatch(/-webkit-text-fill-color:\s*transparent/);
   });
 
   it('keeps all floating-window resize handles in the browser hit-test tree', () => {

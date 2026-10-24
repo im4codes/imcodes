@@ -18,7 +18,6 @@ import type { SubSession } from '../hooks/useSubSessions.js';
 import type { FileBrowserPreviewRequest, FileBrowserPreviewUpdate } from './FileBrowser.js';
 import type { SessionContextBootstrapState } from '@shared/session-context-bootstrap.js';
 import type { ChatLocalWebPreviewOpenHandler } from './ChatLoopbackLink.js';
-import type { ComposerInputElement } from '../composer-input-value.js';
 
 export interface PanelRenderContext {
   ws: WsClient | null;
@@ -27,7 +26,7 @@ export interface PanelRenderContext {
   /** All live sub-sessions — for sub-session panel type */
   subSessions: SubSession[];
   /** Input refs map for file insertion */
-  inputRefsMap?: { current: Map<string, ComposerInputElement> };
+  inputRefsMap?: { current: Map<string, HTMLElement> };
   /** For repo/file browser CI events */
   onCiEvent?: (run: { name: string; status: string; conclusion?: string | null }) => void;
   /** Open a file preview in a large floating window (used by pinned file browser) */

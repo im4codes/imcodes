@@ -11427,39 +11427,14 @@ afterEach(() => {
     });
     try {
       render(<SessionControls ws={makeWs() as any} activeSession={makeSession({ name: 'native-mac-focus' })} quickData={makeQuickData() as any} />);
+      const input = screen.getByRole('textbox') as HTMLDivElement;
       const native = document.querySelector('[data-composer-native-input="true"]') as HTMLTextAreaElement;
-      expect(screen.getByRole('textbox')).toBe(native);
-      native.focus();
+      input.focus();
       expect(document.activeElement).toBe(native);
       expect(native.closest('.controls-composer')?.classList.contains('controls-composer-mac-native')).toBe(true);
       native.value = 'mac dictation';
       native.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: native.value }));
-      expect(native.value).toBe('mac dictation');
-    } finally {
-      Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUserAgent });
-    }
-  });
-
-  it('uses the visible macOS textarea for composition/input when beforeinput is absent', () => {
-    const originalUserAgent = navigator.userAgent;
-    Object.defineProperty(navigator, 'userAgent', {
-      configurable: true,
-      value: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/605.1.15 Chrome/140.0 Safari/605.1.15',
-    });
-    try {
-      const ws = makeWs();
-      render(<SessionControls ws={ws as any} activeSession={makeSession({ name: 'native-composition-mac' })} quickData={makeQuickData() as any} />);
-      const native = screen.getByRole('textbox') as HTMLTextAreaElement;
-      expect(native.tagName).toBe('TEXTAREA');
-      fireEvent.compositionStart(native);
-      native.value = '你';
-      fireEvent.input(native, { inputType: 'insertCompositionText', data: '你', isComposing: true });
-      native.value = '你好';
-      fireEvent.input(native, { inputType: 'insertText', data: '好' });
-      fireEvent.compositionEnd(native, { data: '你好' });
-      expect(native.value).toBe('你好');
-      fireEvent.click(screen.getByRole('button', { name: /send/i }));
-      expectSendPayload(ws, { sessionName: 'native-composition-mac', text: '你好' });
+      expect(input.textContent).toBe('mac dictation');
     } finally {
       Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUserAgent });
     }

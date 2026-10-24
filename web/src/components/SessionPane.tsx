@@ -33,8 +33,6 @@ import { resolveEffectiveSessionModel } from '@shared/session-model.js';
 import { loadLegacyCodexModelPreferenceForModelessSession } from '../codex-model-preference.js';
 import type { FileBrowserPreviewRequest } from './file-browser-lazy.js';
 import { EXECUTION_CLONE_KIND } from '@shared/execution-clone.js';
-import type { ComposerInputElement } from '../composer-input-value.js';
-import { readComposerInputValue } from '../composer-input-value.js';
 import type { SessionSettingsOpenIntent } from '../session-settings-open-intent.js';
 import type { ChatLocalWebPreviewOpenHandler } from './ChatLoopbackLink.js';
 
@@ -96,7 +94,7 @@ export interface SessionPaneProps {
   /** Called with the chat scroll-to-bottom function. */
   onChatScrollFn?: (fn: () => void) => void;
   /** Called with the chat input element ref so app.tsx can route keystrokes to it. */
-  onInputRef?: (el: ComposerInputElement | null) => void;
+  onInputRef?: (el: HTMLDivElement | null) => void;
   /** Called with the terminal diff applier for this session. */
   onDiff?: (apply: (diff: TerminalDiff) => void) => void | (() => void);
   /** Called with the terminal history applier for this session. */
@@ -354,7 +352,7 @@ export function SessionPane({
   }, [onScrollBottomFn]);
 
   // inputRef for SessionControls — expose to app.tsx via onInputRef
-  const inputRef = useRef<ComposerInputElement>(null);
+  const inputRef = useRef<HTMLDivElement>(null);
   const fileDropTargetRef = useRef<HTMLDivElement>(null);
   // Re-register with app.tsx when session becomes active/inactive
   useEffect(() => {
@@ -397,14 +395,14 @@ export function SessionPane({
     ? t('chat.execution_clone_run_offline')
     : !hasValidExecutionTemplate
       ? t('chat.execution_clone_run_no_template')
-      : !(composerText.trim() || readComposerInputValue(inputRef.current).trim())
+      : !(composerText.trim() || inputRef.current?.textContent?.trim())
         ? t('chat.execution_clone_run_empty')
         : t('chat.execution_clone_run_with_template', {
             count: executionCloneCount,
             name: executionTemplateDisplayName,
           });
   const handleRunExecutionClones = useCallback(() => {
-    const text = (readComposerInputValue(inputRef.current) || composerText).trim();
+    const text = (inputRef.current?.textContent ?? composerText).trim();
     if (!ws || !connected || !hasValidExecutionTemplate || !executionRouting.templateSessionName || !text) return;
     launchExecutionClones({
       text,
@@ -515,7 +513,7 @@ export function SessionPane({
             || !connected
             || !ws
             || !hasValidExecutionTemplate
-            || !(composerText.trim() || readComposerInputValue(inputRef.current).trim())
+            || !(composerText.trim() || inputRef.current?.textContent?.trim())
           }
           runExecutionClonesTitle={runExecutionClonesTitle}
           runExecutionClonesCount={executionCloneCount}
