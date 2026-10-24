@@ -57,6 +57,77 @@ printf '%s\\n' '{"type":"result","result":"Hello"}'
     }
   });
 
+  it('extracts text from assistant message frames when partial stream events are absent', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'imcodes-cc-cli-sdk-assistant-'));
+    const script = join(dir, 'fake-claude');
+    await writeFile(script, `#!/bin/sh
+printf '%s\\n' '{"type":"assistant","session_id":"assistant-session","message":{"role":"assistant","content":[{"type":"text","text":"assistant-frame"}]}}'
+printf '%s\\n' '{"type":"result","result":"assistant-frame"}'
+`, 'utf8');
+    await chmod(script, 0o755);
+    try {
+      const provider = new ClaudeCodeCliSdkProvider();
+      await provider.connect({ binaryPath: script });
+      const deltas: string[] = [];
+      const done = new Promise<string>((resolve, reject) => {
+        provider.onDelta((_id, delta) => deltas.push(delta.delta));
+        provider.onComplete((_id, message) => resolve(message.content));
+        provider.onError((_id, error) => reject(new Error(error.message)));
+      });
+      const id = await provider.createSession({ sessionKey: 'assistant-session', cwd: dir });
+      await provider.send(id, 'assistant frame');
+      await expect(done).resolves.toBe('assistant-frame');
+      expect(deltas).toEqual(['assistant-frame']);
+      await provider.disconnect();
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('does not let a previous child close settle a resumed turn', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'imcodes-cc-cli-sdk-close-race-'));
+    const script = join(dir, 'fake-claude');
+    await writeFile(script, `#!/bin/sh
+count=0
+[ -f "$PWD/count" ] && count=$(cat "$PWD/count")
+count=$((count + 1)); printf '%s' "$count" > "$PWD/count"
+if [ "$count" -eq 1 ]; then
+  printf '%s\\n' '{"type":"result","session_id":"race-session","result":"first"}'
+  sleep 1
+else
+  sleep 0.2
+  printf '%s\\n' '{"type":"result","session_id":"race-session","result":"second"}'
+fi
+`, 'utf8');
+    await chmod(script, 0o755);
+    try {
+      const provider = new ClaudeCodeCliSdkProvider();
+      await provider.connect({ binaryPath: script });
+      const completions: string[] = [];
+      const waitFor = (expected: string) => new Promise<void>((resolve, reject) => {
+        const onComplete = (_id: string, message: { content: string }) => {
+          completions.push(message.content);
+          if (message.content === expected) resolve();
+        };
+        provider.onComplete(onComplete);
+        provider.onError((_id, error) => reject(new Error(error.message)));
+      });
+      const id = await provider.createSession({ sessionKey: 'close-race-session', cwd: dir });
+      const first = waitFor('first');
+      await provider.send(id, 'first turn');
+      await expect(first).resolves.toBeUndefined();
+      const second = waitFor('second');
+      await provider.send(id, 'second turn');
+      await expect(second).resolves.toBeUndefined();
+      expect(completions).toContain('first');
+      expect(completions).toContain('second');
+      expect(completions).not.toContain('');
+      await provider.disconnect();
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   it('delivers normalized session and turn context to the CLI while keeping slash controls clean', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'imcodes-cc-cli-context-'));
     const script = join(dir, 'fake-claude');

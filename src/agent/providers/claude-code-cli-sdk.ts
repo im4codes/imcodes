@@ -1,5 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
+import { access } from 'node:fs/promises';
+import { constants as fsConstants } from 'node:fs';
 import readline from 'node:readline';
 import { killProcessTree } from '../../util/kill-process-tree.js';
 import { agentResourceOwner, bindAgentProcessResource, type AgentProcessResource } from './agent-process-resource.js';
@@ -12,7 +14,7 @@ import type {
   SessionInfoUpdate, ProviderStatusUpdate, ProviderUsageUpdate, ProviderModelList,
 } from '../transport-provider.js';
 import { CONNECTION_MODES, SESSION_OWNERSHIP, PROVIDER_ERROR_CODES, normalizeProviderPayload, BACKGROUND_SUBAGENT_WAKE_MODES } from '../transport-provider.js';
-import { normalizeTransportCwd, resolveExecutableForSpawn } from '../transport-paths.js';
+import { normalizeTransportCwd, resolveClaudeCodePathForSdk, resolveExecutableForSpawn } from '../transport-paths.js';
 import { buildClaudeAgentEnv } from '../env-isolation.js';
 import { gateChildStream } from '../../util/event-loop-backpressure.js';
 import { composeMessageSideProviderPrompt, getProviderSystemTextParts } from '../provider-context-routing.js';
@@ -61,7 +63,17 @@ function eventText(event: ClaudeCliStreamEvent): string {
     const inner = row.delta;
     if (inner && typeof inner === 'object' && typeof (inner as Record<string, unknown>).text === 'string') return (inner as Record<string, unknown>).text as string;
   }
-  return textFromContent(event.content) || textFromContent(event.message);
+  const message = event.message;
+  if (message && typeof message === 'object' && !Array.isArray(message)) {
+    const row = message as Record<string, unknown>;
+    const messageDelta = row.delta;
+    if (messageDelta && typeof messageDelta === 'object' && typeof (messageDelta as Record<string, unknown>).text === 'string') {
+      return (messageDelta as Record<string, unknown>).text as string;
+    }
+    const messageContent = textFromContent(row.content);
+    if (messageContent) return messageContent;
+  }
+  return textFromContent(event.content) || textFromContent(message);
 }
 
 function sessionIdFromEvent(event: ClaudeCliStreamEvent): string | undefined {
@@ -114,7 +126,24 @@ export class ClaudeCodeCliSdkProvider implements TransportProvider {
   private statusCallbacks: Array<(id: string, status: ProviderStatusUpdate) => void> = [];
   private usageCallbacks: Array<(id: string, usage: ProviderUsageUpdate) => void> = [];
 
-  async connect(config: ProviderConfig): Promise<void> { this.config = config; }
+  async connect(config: ProviderConfig): Promise<void> {
+    // The daemon's launch PATH is intentionally sparse. Match the existing
+    // Claude SDK provider and resolve the bundled/per-user CLI before probing
+    // it; otherwise this provider reports connected and only fails later with a
+    // silent `spawn claude ENOENT` on the first message.
+    const configuredBinary = this.getConfiguredBinaryPath(config);
+    const binaryPath = process.platform === 'win32'
+      ? configuredBinary
+      : resolveClaudeCodePathForSdk(configuredBinary);
+    const resolved = resolveExecutableForSpawn(binaryPath);
+    await access(resolved.executable, fsConstants.X_OK).catch(async () => {
+      const { execFile } = await import('node:child_process');
+      await new Promise<void>((resolve, reject) => {
+        execFile(resolved.executable, [...resolved.prependArgs, '--version'], { windowsHide: true }, (err) => (err ? reject(err) : resolve()));
+      });
+    });
+    this.config = { ...config, binaryPath };
+  }
   async listModels(): Promise<ProviderModelList> {
     return { models: CLAUDE_CODE_MODEL_IDS.map((id) => ({ id })), defaultModel: CLAUDE_CODE_MODEL_IDS[0] };
   }
@@ -166,16 +195,18 @@ export class ClaudeCodeCliSdkProvider implements TransportProvider {
     const sessionSystemTextToInject = includeSessionSystemText ? systemParts.sessionSystemText : undefined;
     s.busy = true; s.cancelled = false; s.text = ''; s.messageId = randomUUID();
     const args = [...CLAUDE_CODE_CLI_SDK_ARGS, ...(s.model ? ['--model', s.model] : []), ...(s.started ? ['--resume', s.resumeId] : [])];
-    const resolved = resolveExecutableForSpawn((this.config?.binary as string | undefined) ?? 'claude');
+    const resolved = resolveExecutableForSpawn(this.getConfiguredBinaryPath(this.config));
     // Never inherit the daemon's ambient environment. Claude's child may only
     // receive explicitly scoped Claude variables, safe runtime variables, and
     // the verified auth UDS projection from buildClaudeAgentEnv.
     const childEnv = buildClaudeAgentEnv({ ...(this.config?.env as Record<string, string> | undefined), ...(s.env ?? {}) });
     const child = spawn(resolved.executable, [...resolved.prependArgs, ...args], { cwd: s.cwd, detached: process.platform !== 'win32', env: childEnv, stdio: ['pipe', 'pipe', 'pipe'], shell: false, windowsHide: true });
     s.child = child; s.agentResource = bindAgentProcessResource(s.resourceOwner ?? null, child);
-    const emitDelta = (text: string) => { if (!text || s.cancelled) return; s.text += text; this.deltaCallbacks.forEach((cb) => cb(id, { messageId: s.messageId, type: 'text', delta: text, role: 'assistant' })); };
+    const turnMessageId = s.messageId;
+    const isCurrentTurn = () => s.messageId === turnMessageId && s.child === child;
+    const emitDelta = (text: string) => { if (!text || s.cancelled || !isCurrentTurn()) return; s.text += text; this.deltaCallbacks.forEach((cb) => cb(id, { messageId: turnMessageId, type: 'text', delta: text, role: 'assistant' })); };
     const finish = (metadata?: Record<string, unknown>) => {
-      if (!s.busy) return;
+      if (!s.busy || !isCurrentTurn()) return;
       s.busy = false; s.started = true;
       if (sessionSystemTextToInject) s.sessionSystemTextInjected = sessionSystemTextToInject;
       const resultText = typeof metadata?.result === 'string' ? metadata.result : undefined;
@@ -183,7 +214,7 @@ export class ClaudeCodeCliSdkProvider implements TransportProvider {
       const msg: AgentMessage = { id: s.messageId, sessionId: id, kind: 'text', role: 'assistant', content, timestamp: Date.now(), status: 'complete', ...(metadata ? { metadata } : {}) };
       this.completeCallbacks.forEach((cb) => cb(id, msg));
     };
-    const fail = (message: string) => { if (!s.busy) return; s.busy = false; this.errorCallbacks.forEach((cb) => cb(id, this.error(PROVIDER_ERROR_CODES.PROVIDER_ERROR, message, true))); };
+    const fail = (message: string) => { if (!s.busy || !isCurrentTurn()) return; s.busy = false; this.errorCallbacks.forEach((cb) => cb(id, this.error(PROVIDER_ERROR_CODES.PROVIDER_ERROR, message, true))); };
     const rl = readline.createInterface({ input: gateChildStream(child.stdout) });
     rl.on('line', (line) => {
       const event = parseClaudeCliStreamJsonLine(line); if (!event) return;
@@ -206,20 +237,22 @@ export class ClaudeCodeCliSdkProvider implements TransportProvider {
       const text = eventText(event); if (text) emitDelta(text);
       if (type === 'error' || event.error) fail(typeof event.error === 'string' ? event.error : 'Claude CLI stream-json error');
     });
-    let stderr = ''; child.stderr.on('data', (chunk) => { stderr += String(chunk); s.stderr = stderr.slice(-4_000); });
+    let stderr = ''; child.stderr.on('data', (chunk) => { if (!isCurrentTurn()) return; stderr += String(chunk); s.stderr = stderr.slice(-4_000); });
     child.once('error', (err) => fail(err.message));
     child.stdin.on('error', (err) => {
       // The CLI may exit after emitting its final frame before the parent has
       // finished writing the request. Handle that expected EPIPE without an
       // unhandled exception; other write failures still reach the provider.
-      if (s.busy && (err as NodeJS.ErrnoException).code !== 'EPIPE') fail(err.message);
+      if (isCurrentTurn() && s.busy && (err as NodeJS.ErrnoException).code !== 'EPIPE') fail(err.message);
     });
     child.once('close', (code) => {
       rl.close();
+      if (s.child !== child || s.messageId !== turnMessageId) return;
+      if (s.busy) {
+        if (code === 0) finish();
+        else fail(s.stderr || `Claude CLI exited with code ${code ?? 'unknown'}`);
+      }
       s.child = null;
-      if (!s.busy) return;
-      if (code === 0) finish();
-      else fail(s.stderr || `Claude CLI exited with code ${code ?? 'unknown'}`);
     });
     const input = JSON.stringify({ type: 'user', session_id: s.resumeId, message: { role: 'user', content: prompt } });
     try {
@@ -229,6 +262,12 @@ export class ClaudeCodeCliSdkProvider implements TransportProvider {
       const errno = error as NodeJS.ErrnoException;
       if (errno.code !== 'EPIPE') fail(errno.message);
     }
+  }
+  private getConfiguredBinaryPath(config: ProviderConfig | null): string {
+    const configured = typeof config?.binaryPath === 'string' && config.binaryPath.trim()
+      ? config.binaryPath
+      : (typeof config?.binary === 'string' && config.binary.trim() ? config.binary : 'claude');
+    return process.platform === 'win32' ? configured : resolveClaudeCodePathForSdk(configured);
   }
   private emitInfo(id: string, info: SessionInfoUpdate): void { this.infoCallbacks.forEach((cb) => cb(id, info)); }
   private error(code: string, message: string, recoverable: boolean): ProviderError { return { code, message, recoverable }; }
