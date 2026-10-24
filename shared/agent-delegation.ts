@@ -5,6 +5,7 @@ import { isSessionAgentType } from './agent-types.js';
 import { CODEBUDDY_PROVIDER_IDS } from './codebuddy.js';
 import { AGY_SDK_PROVIDER_ID } from './agy-agent.js';
 import { HERMES_AGENT_PROVIDER_ID } from './hermes-agent.js';
+import { CLAUDE_CODE_CLI_SDK_AGENT_TYPE } from './agent-types.js';
 import { isValidImcodesSessionName } from './session-scope.js';
 import {
   PEER_AUDIT_ID_MAX_BYTES,
@@ -394,6 +395,7 @@ export type DelegationContextStatus = 'ok' | 'truncated' | 'omitted';
 
 export const DELEGATION_REPLY_CAPABLE_AGENT_TYPES = [
   'claude-code-sdk',
+  CLAUDE_CODE_CLI_SDK_AGENT_TYPE,
   'claude-code',
   'codex-sdk',
   'codex',

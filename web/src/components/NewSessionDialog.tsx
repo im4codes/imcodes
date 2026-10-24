@@ -53,7 +53,7 @@ import {
 import { AGY_MODEL_IDS, CODEX_MODEL_IDS, GEMINI_MODEL_IDS, mergeModelSuggestions } from "../../../src/shared/models/options.js";
 import { loadCodexModelPreference } from "../codex-model-preference.js";
 import { GIT_REMOTE_CLONE_CAPABILITY_V1 } from "@shared/git-remote-url.js";
-import type { SessionAgentType } from "@shared/agent-types.js";
+import { CLAUDE_CODE_CLI_SDK_AGENT_TYPE, type SessionAgentType } from "@shared/agent-types.js";
 import {
   CODEBUDDY_CHINA_DEFAULT_MODEL,
   CODEBUDDY_CHINA_MODEL_FALLBACK,
@@ -510,6 +510,7 @@ export function NewSessionDialog({
         extra.ccInitPrompt = ccInitPrompt.trim();
       if (
         (agentType === "claude-code-sdk"
+          || agentType === CLAUDE_CODE_CLI_SDK_AGENT_TYPE
           || agentType === "codex-sdk"
           || agentType === "copilot-sdk"
           || agentType === "cursor-headless"
@@ -536,6 +537,7 @@ export function NewSessionDialog({
         ...extra,
         ...(identityPrompt ? { identityPrompt } : {}),
         ...(agentType === "claude-code-sdk" ||
+        agentType === CLAUDE_CODE_CLI_SDK_AGENT_TYPE ||
         agentType === "codex-sdk" ||
         agentType === "copilot-sdk" ||
         agentType === "muse-code-sdk" ||
@@ -550,7 +552,7 @@ export function NewSessionDialog({
   const agentFlavor =
     agentType === "claude-code" || agentType === "codex"
       ? "cli"
-      : agentType === "claude-code-sdk" || agentType === "codex-sdk" || agentType === "qoder-sdk" || agentType === "opencode-sdk" || agentType === "grok-sdk" || agentType === "kimi-sdk" || agentType === "muse-code-sdk" || agentType === HERMES_AGENT_PROVIDER_ID || agentType === AGY_SDK_PROVIDER_ID || agentType === "deepseek-harness" || agentType === "pi" || isCodeBuddyProviderId(agentType)
+      : agentType === "claude-code-sdk" || agentType === CLAUDE_CODE_CLI_SDK_AGENT_TYPE || agentType === "codex-sdk" || agentType === "qoder-sdk" || agentType === "opencode-sdk" || agentType === "grok-sdk" || agentType === "kimi-sdk" || agentType === "muse-code-sdk" || agentType === HERMES_AGENT_PROVIDER_ID || agentType === AGY_SDK_PROVIDER_ID || agentType === "deepseek-harness" || agentType === "pi" || isCodeBuddyProviderId(agentType)
         ? "sdk"
         : null;
   const qwenCompatibleApiPresetSelected = agentType === "qwen" && !!selectedCcPreset;
@@ -562,7 +564,7 @@ export function NewSessionDialog({
   );
   const selectedDynamicModel = transportModels.models.find((model) => model.id === requestedModel);
   const thinkingLevels: readonly TransportEffortLevel[] =
-    agentType === "claude-code-sdk"
+    (agentType === "claude-code-sdk" || agentType === CLAUDE_CODE_CLI_SDK_AGENT_TYPE)
       ? CLAUDE_SDK_EFFORT_LEVELS
       : agentType === "codex-sdk"
         ? (selectedDynamicModel?.supportedEffortLevels ?? CODEX_SDK_EFFORT_LEVELS)
@@ -597,6 +599,7 @@ export function NewSessionDialog({
       : t("new_session.api_provider");
   const supportsModelSelection =
     agentType === "claude-code-sdk"
+    || agentType === CLAUDE_CODE_CLI_SDK_AGENT_TYPE
     || agentType === "codex-sdk"
     || agentType === "copilot-sdk"
     || agentType === "cursor-headless"

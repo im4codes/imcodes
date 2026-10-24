@@ -1,4 +1,4 @@
-import type { SessionAgentType } from './agent-types.js';
+import { CLAUDE_CODE_CLI_SDK_AGENT_TYPE, type SessionAgentType } from './agent-types.js';
 import { AGY_SDK_PROVIDER_ID } from './agy-agent.js';
 
 /** Canonical shared contract for every IM.codes MCP-consuming runtime. */
@@ -44,6 +44,7 @@ interface McpToolRuntimeBoundary {
  */
 export const MCP_TOOL_RUNTIME_BOUNDARIES = Object.freeze({
   'claude-code-sdk': { delivery: 'host_refresh_with_exact_fallback', boundary: 'managed_mcp' },
+  [CLAUDE_CODE_CLI_SDK_AGENT_TYPE]: { delivery: 'external_config_with_exact_fallback', boundary: 'external_mcp_config' },
   'claude-code': { delivery: 'external_config_with_exact_fallback', boundary: 'external_mcp_config' },
   'codex-sdk': { delivery: 'host_refresh_with_exact_fallback', boundary: 'managed_mcp' },
   'qoder-sdk': { delivery: 'host_refresh_with_exact_fallback', boundary: 'managed_mcp' },

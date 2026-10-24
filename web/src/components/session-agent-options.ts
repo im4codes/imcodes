@@ -1,4 +1,4 @@
-import type { SessionAgentType } from '@shared/agent-types.js';
+import { CLAUDE_CODE_CLI_SDK_AGENT_TYPE, type SessionAgentType } from '@shared/agent-types.js';
 import { CODEBUDDY_PROVIDER_IDS } from '@shared/codebuddy.js';
 import { HERMES_AGENT_PROVIDER_ID } from '@shared/hermes-agent.js';
 import { AGY_SDK_PROVIDER_ID } from '@shared/agy-agent.js';
@@ -45,6 +45,14 @@ const SESSION_AGENT_CHOICES: SessionAgentChoice[] = [
     icon: '⚡',
     fallbackLabel: 'Claude Code SDK',
     labelKey: 'session.agentType.claude_code_sdk',
+    group: 'transport',
+    surfaces: ['new-session', 'sub-session'],
+  },
+  {
+    id: CLAUDE_CODE_CLI_SDK_AGENT_TYPE,
+    icon: '⚡',
+    fallbackLabel: 'CC CLI SDK',
+    labelKey: 'session.agentType.cc_cli_sdk',
     group: 'transport',
     surfaces: ['new-session', 'sub-session'],
   },
@@ -253,7 +261,7 @@ export function getSessionAgentLabel(
  * array could.
  */
 export const PROJECT_ROLE_AGENT_TYPES: string[] = [
-  AGY_SDK_PROVIDER_ID, 'claude-code', 'claude-code-sdk', 'codex', 'codex-sdk', 'qoder-sdk', 'copilot-sdk',
+  AGY_SDK_PROVIDER_ID, 'claude-code', 'claude-code-sdk', CLAUDE_CODE_CLI_SDK_AGENT_TYPE, 'codex', 'codex-sdk', 'qoder-sdk', 'copilot-sdk',
   'cursor-headless', 'opencode-sdk', 'opencode', 'gemini', 'gemini-sdk', 'grok-sdk',
   'kimi-sdk', 'muse-code-sdk', HERMES_AGENT_PROVIDER_ID, 'deepseek-harness', 'pi',
   CODEBUDDY_PROVIDER_IDS.CHINA, CODEBUDDY_PROVIDER_IDS.INTERNATIONAL,

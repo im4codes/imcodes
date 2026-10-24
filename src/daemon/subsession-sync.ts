@@ -14,6 +14,7 @@ import logger from '../util/logger.js';
 import type { QueueSnapshot } from '../../shared/transport-queue-types.js';
 import { buildTransportQueueSnapshotPayload, type TransportQueueSnapshotPayload } from './transport-queue-projection.js';
 import { getSupervisionHeartbeatProjectionForWire } from './supervision-heartbeat-projection.js';
+import { isClaudeCodeSdkAgentType } from '../../shared/agent-types.js';
 
 /**
  * Runtime-identity fields that MUST NOT replicate to Postgres for an execution
@@ -56,7 +57,7 @@ function isQwenSession(agentType: string | null | undefined): boolean {
 }
 
 function isClaudeSdkSession(agentType: string | null | undefined): boolean {
-  return agentType === 'claude-code-sdk';
+  return isClaudeCodeSdkAgentType(agentType ?? undefined);
 }
 
 function isCodexFamilySession(agentType: string | null | undefined): boolean {

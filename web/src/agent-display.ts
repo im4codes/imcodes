@@ -1,6 +1,7 @@
 import { CODEBUDDY_PROVIDER_IDS } from '@shared/codebuddy.js';
 import { HERMES_AGENT_PROVIDER_ID } from '@shared/hermes-agent.js';
 import { AGY_SDK_PROVIDER_ID } from '@shared/agy-agent.js';
+import { CLAUDE_CODE_CLI_SDK_AGENT_TYPE } from '@shared/agent-types.js';
 
 export interface AgentBadgeConfig {
   label: string;
@@ -11,6 +12,7 @@ export interface AgentBadgeConfig {
 export const AGENT_BADGE_CONFIG: Record<string, AgentBadgeConfig> = {
   'claude-code': { label: 'cc', color: '#7c3aed', autoLabelPrefix: 'CC' },
   'claude-code-sdk': { label: 'cc', color: '#7c3aed', autoLabelPrefix: 'CC' },
+  [CLAUDE_CODE_CLI_SDK_AGENT_TYPE]: { label: 'cc', color: '#7c3aed', autoLabelPrefix: 'CC' },
   'codex': { label: 'cx', color: '#d97706', autoLabelPrefix: 'Cx' },
   'codex-sdk': { label: 'cx', color: '#d97706', autoLabelPrefix: 'Cx' },
   'copilot-sdk': { label: 'co', color: '#2563eb', autoLabelPrefix: 'Co' },
@@ -36,6 +38,7 @@ export const AGENT_BADGE_CONFIG: Record<string, AgentBadgeConfig> = {
 
 const LEGACY_AUTO_LABEL_PATTERNS: Array<{ pattern: RegExp; prefix: string }> = [
   { pattern: /^claude-code-sdk(\d+)?$/i, prefix: 'CC' },
+  { pattern: /^claude-code-cli-sdk(\d+)?$/i, prefix: 'CC' },
   { pattern: /^codex-sdk(\d+)?$/i, prefix: 'Cx' },
   { pattern: /^copilot-sdk(\d+)?$/i, prefix: 'Co' },
   { pattern: /^cursor-headless(\d+)?$/i, prefix: 'Cu' },

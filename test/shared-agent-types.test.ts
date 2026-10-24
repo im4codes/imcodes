@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { getSessionRuntimeType, isTransportSessionAgentType } from '../shared/agent-types.js';
+import { CLAUDE_CODE_CLI_SDK_AGENT_TYPE, getSessionRuntimeType, isTransportSessionAgentType } from '../shared/agent-types.js';
 import { CODEBUDDY_PROVIDER_IDS } from '../shared/codebuddy.js';
 import { AGY_SDK_PROVIDER_ID } from '../shared/agy-agent.js';
 import { HERMES_AGENT_PROVIDER_ID } from '../shared/hermes-agent.js';
@@ -7,6 +7,7 @@ import { HERMES_AGENT_PROVIDER_ID } from '../shared/hermes-agent.js';
 describe('shared agent type helpers', () => {
   it('recognizes transport-backed session agent types', () => {
     expect(isTransportSessionAgentType('claude-code-sdk')).toBe(true);
+    expect(isTransportSessionAgentType(CLAUDE_CODE_CLI_SDK_AGENT_TYPE)).toBe(true);
     expect(isTransportSessionAgentType('codex-sdk')).toBe(true);
     expect(isTransportSessionAgentType('qoder-sdk')).toBe(true);
     expect(isTransportSessionAgentType('kimi-sdk')).toBe(true);
@@ -26,6 +27,7 @@ describe('shared agent type helpers', () => {
 
   it('maps session agent types to runtime types', () => {
     expect(getSessionRuntimeType('claude-code-sdk')).toBe('transport');
+    expect(getSessionRuntimeType(CLAUDE_CODE_CLI_SDK_AGENT_TYPE)).toBe('transport');
     expect(getSessionRuntimeType('codex-sdk')).toBe('transport');
     expect(getSessionRuntimeType('qoder-sdk')).toBe('transport');
     expect(getSessionRuntimeType('kimi-sdk')).toBe('transport');

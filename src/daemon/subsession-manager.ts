@@ -18,6 +18,7 @@ import { usesProviderResumeId } from '../agent/transport-resume-opts.js';
 import { isCodeBuddyProviderId } from '../../shared/codebuddy.js';
 import { HERMES_AGENT_PROVIDER_ID } from '../../shared/hermes-agent.js';
 import { AGY_SDK_PROVIDER_ID } from '../../shared/agy-agent.js';
+import { isClaudeCodeSdkAgentType } from '../../shared/agent-types.js';
 
 import logger from '../util/logger.js';
 import { getAgentVersion } from '../agent/agent-version.js';
@@ -174,7 +175,7 @@ export async function startSubSession(sub: SubSessionRecord): Promise<void> {
         transportConfig: sub.transportConfig ?? undefined,
         skipCreate: false,
         fresh: true,
-        ...(agentType === 'claude-code-sdk' ? { ccSessionId: randomUUID() } : {}),
+        ...(isClaudeCodeSdkAgentType(agentType) ? { ccSessionId: randomUUID() } : {}),
         ...(sub.effort ? { effort: sub.effort } : {}),
         ...(sub.ccPreset ? { ccPreset: sub.ccPreset } : {}),
         userCreated: true,
@@ -201,7 +202,7 @@ export async function startSubSession(sub: SubSessionRecord): Promise<void> {
         ? { providerResumeId }
         : {}),
       ...(sub.providerSessionId ? { ccSessionId: sub.ccSessionId ?? undefined, codexSessionId: sub.codexSessionId ?? undefined, fresh: sub.fresh } : {}),
-      ...(!sub.providerSessionId && agentType === 'claude-code-sdk' ? { ccSessionId: randomUUID(), fresh: true } : {}),
+      ...(!sub.providerSessionId && isClaudeCodeSdkAgentType(agentType) ? { ccSessionId: randomUUID(), fresh: true } : {}),
       ...((agentType === 'codex-sdk' && !sub.providerSessionId)
         || ((agentType === 'kimi-sdk' || agentType === HERMES_AGENT_PROVIDER_ID || agentType === 'grok-sdk' || agentType === AGY_SDK_PROVIDER_ID || agentType === 'deepseek-harness' || agentType === 'pi' || isCodeBuddyProviderId(agentType)) && !providerResumeId)
         ? { fresh: true }

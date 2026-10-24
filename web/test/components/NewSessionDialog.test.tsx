@@ -8,6 +8,7 @@ import { GIT_REMOTE_CLONE_CAPABILITY_V1 } from '../../../shared/git-remote-url.j
 import { DEFAULT_CODEX_SESSION_MODEL } from '../../../src/shared/models/options.js';
 import { AGY_SDK_PROVIDER_ID } from '../../../shared/agy-agent.js';
 import { HERMES_AGENT_PROVIDER_ID } from '../../../shared/hermes-agent.js';
+import { CLAUDE_CODE_CLI_SDK_AGENT_TYPE } from '../../../shared/agent-types.js';
 
 const {
   fetchSessionIdentityProfileMock,
@@ -160,6 +161,7 @@ describe('NewSessionDialog', () => {
     render(<NewSessionDialog ws={makeWs() as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
     expect(document.querySelector('.session-agent-groups')).toBeDefined();
     expect(getAgentButton('claude-code-sdk')).toBeDefined();
+    expect(getAgentButton(CLAUDE_CODE_CLI_SDK_AGENT_TYPE)).toBeDefined();
     expect(getAgentButton('pi')).toBeDefined();
   });
 
@@ -168,9 +170,10 @@ describe('NewSessionDialog', () => {
     const groups = Array.from(document.querySelectorAll('.session-agent-group'));
     expect(groups.map((group) => group.querySelector('.session-agent-group-title')?.textContent)).toEqual(['SDK', 'CLI']);
     const options = groups.flatMap((group) => Array.from(group.querySelectorAll<HTMLButtonElement>('[data-agent-type]')).map((button) => button.dataset.agentType));
-    expect(options.slice(0, 18)).toEqual([
+    expect(options.slice(0, 19)).toEqual([
       AGY_SDK_PROVIDER_ID,
       'claude-code-sdk',
+      CLAUDE_CODE_CLI_SDK_AGENT_TYPE,
       'codex-sdk',
       'qoder-sdk',
       'copilot-sdk',
@@ -188,7 +191,7 @@ describe('NewSessionDialog', () => {
       'qwen',
       'openclaw',
     ]);
-    expect(options.slice(18)).toEqual([
+    expect(options.slice(19)).toEqual([
       'claude-code',
       'codex',
       'opencode',
@@ -230,6 +233,20 @@ describe('NewSessionDialog', () => {
       agentType: 'claude-code-sdk',
       thinking: 'high',
     });
+  });
+
+  it('starts the independent CC CLI SDK agent type without changing the legacy SDK choice', () => {
+    const ws = makeWs();
+    render(<NewSessionDialog ws={ws as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
+    selectAgent(CLAUDE_CODE_CLI_SDK_AGENT_TYPE);
+    fireEvent.input(screen.getByPlaceholderText('my-project'), { target: { value: 'cli-sdk-app' } });
+    fireEvent.input(screen.getByPlaceholderText('~/projects/my-project'), { target: { value: '~/projects/cli-sdk-app' } });
+    fireEvent.click(screen.getByRole('button', { name: /start/i }));
+    expect(ws.sendSessionCommand).toHaveBeenCalledWith('start', expect.objectContaining({
+      project: 'cli-sdk-app',
+      agentType: CLAUDE_CODE_CLI_SDK_AGENT_TYPE,
+    }));
+    expect(getAgentButton('claude-code-sdk').getAttribute('aria-pressed')).toBe('false');
   });
 
   it('includes optional git remote URL for main-session starts', () => {

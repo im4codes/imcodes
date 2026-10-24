@@ -9,14 +9,16 @@ import type { ProviderActiveWorkSnapshot } from '../../../shared/session-activit
 import type { ProviderContextPayload } from '../../../shared/context-types.js';
 import type {
   TransportProvider, ProviderCapabilities, ProviderConfig, ProviderError, SessionConfig,
-  SessionInfoUpdate, ProviderStatusUpdate, ProviderUsageUpdate,
+  SessionInfoUpdate, ProviderStatusUpdate, ProviderUsageUpdate, ProviderModelList,
 } from '../transport-provider.js';
 import { CONNECTION_MODES, SESSION_OWNERSHIP, PROVIDER_ERROR_CODES, normalizeProviderPayload, BACKGROUND_SUBAGENT_WAKE_MODES } from '../transport-provider.js';
 import { normalizeTransportCwd, resolveExecutableForSpawn } from '../transport-paths.js';
 import { gateChildStream } from '../../util/event-loop-backpressure.js';
 import { composeMessageSideProviderPrompt, getProviderSystemTextParts } from '../provider-context-routing.js';
+import { CLAUDE_CODE_CLI_SDK_AGENT_TYPE } from '../../../shared/agent-types.js';
+import { CLAUDE_CODE_MODEL_IDS } from '../../shared/models/options.js';
 
-export const CLAUDE_CODE_CLI_SDK_ID = 'claude-code-cli-sdk' as const;
+export const CLAUDE_CODE_CLI_SDK_ID = CLAUDE_CODE_CLI_SDK_AGENT_TYPE;
 export const CLAUDE_CODE_CLI_SDK_ARGS = [
   '-p', '--output-format', 'stream-json', '--input-format', 'stream-json', '--verbose',
   '--include-partial-messages', '--permission-mode', 'bypassPermissions',
@@ -112,6 +114,9 @@ export class ClaudeCodeCliSdkProvider implements TransportProvider {
   private usageCallbacks: Array<(id: string, usage: ProviderUsageUpdate) => void> = [];
 
   async connect(config: ProviderConfig): Promise<void> { this.config = config; }
+  async listModels(): Promise<ProviderModelList> {
+    return { models: CLAUDE_CODE_MODEL_IDS.map((id) => ({ id })), defaultModel: CLAUDE_CODE_MODEL_IDS[0] };
+  }
   async disconnect(): Promise<void> { for (const id of this.sessions.keys()) await this.endSession(id); this.config = null; }
   async createSession(config: SessionConfig): Promise<string> {
     const id = config.bindExistingKey ?? config.sessionKey;

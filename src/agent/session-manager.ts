@@ -84,7 +84,7 @@ import { peekMuseUsageQuotaCached, getMuseUsageQuota } from './muse-usage-quota.
 import { getCodexRuntimeConfig } from './codex-runtime-config.js';
 import { mergeCodexDisplayMetadata } from './codex-display.js';
 import type { TransportEffortLevel } from '../../shared/effort-levels.js';
-import { getSessionRuntimeType, isClaudeCodeFamily, isCodexFamily } from '../../shared/agent-types.js';
+import { getSessionRuntimeType, isClaudeCodeFamily, isClaudeCodeSdkAgentType, isCodexFamily } from '../../shared/agent-types.js';
 import { detectLocalAuthContext, hasLocalAuthCandidate, isExplicitlyUnsupportedLocalAuthProvider, localAuthContextEnv, type LocalAuthContext } from './local-auth-context.js';
 import { providerQuotaMetaEquals } from '../../shared/provider-quota.js';
 import { DEFAULT_CODEX_SESSION_MODEL } from '../shared/models/options.js';
@@ -272,7 +272,7 @@ function startStructuredWatcher(
     startOpenCodeWatching(name, projectDir, ids?.opencodeSessionId).catch((e) =>
       logger.warn({ err: e, session: name }, 'opencode-watcher start failed'),
     );
-  } else if (agentType === 'claude-code-sdk' && ids?.ccSessionId) {
+  } else if (isClaudeCodeSdkAgentType(agentType) && ids?.ccSessionId) {
     // claude-code-sdk sessions get their structured events from the provider
     // stream, not from tailing a JSONL file — no jsonl-watcher is started for
     // them. The underlying claude binary still writes a transcript to disk
@@ -677,7 +677,7 @@ export async function restoreFromStore(): Promise<void> {
   // another session's directory-scan/rotation logic (e.g. a stopped
   // sub-session whose watcher gets restarted below) can freely adopt it.
   for (const s of all) {
-    if ((s.agentType === 'claude-code' || s.agentType === 'claude-code-sdk') && s.ccSessionId) {
+    if (isClaudeCodeFamily(s.agentType) && s.ccSessionId) {
       reserveSessionFile(s.name, s.ccSessionId);
     }
   }
@@ -1319,7 +1319,7 @@ export async function relaunchSessionWithSettings(
     // preserve it. Claude/Codex SDKs keep their provider continuity in ccSessionId /
     // codexSessionId; Kimi/Grok use providerResumeId, so these providers use a fresh
     // local route key on relaunch.
-    && targetAgentType !== 'claude-code-sdk'
+    && !isClaudeCodeSdkAgentType(targetAgentType)
     && targetAgentType !== 'codex-sdk'
     && targetAgentType !== 'qoder-sdk'
     && !usesProviderResumeId(targetAgentType)
@@ -1340,7 +1340,7 @@ export async function relaunchSessionWithSettings(
     requestedModel: targetRequestedModel ?? undefined,
     effort: targetEffort ?? undefined,
     transportConfig: targetTransportConfig ?? undefined,
-    ccPreset: (targetAgentType === 'claude-code' || targetAgentType === 'claude-code-sdk' || targetAgentType === 'qwen' || targetAgentType === 'deepseek-harness' || targetAgentType === 'pi')
+    ccPreset: (targetAgentType === 'claude-code' || isClaudeCodeSdkAgentType(targetAgentType) || targetAgentType === 'qwen' || targetAgentType === 'deepseek-harness' || targetAgentType === 'pi')
       ? (targetCcPreset ?? undefined)
       : undefined,
     ...(preserveTransportBinding ? {
@@ -1703,13 +1703,13 @@ async function recoverTransportRuntimeAfterError(
       requestedModel: record.requestedModel,
       effort: record.effort,
       transportConfig: record.transportConfig,
-      ccPreset: (record.agentType === 'claude-code-sdk' || record.agentType === 'qwen' || record.agentType === 'deepseek-harness' || record.agentType === 'pi' || record.agentType === 'codex-sdk') ? record.ccPreset : undefined,
+      ccPreset: (isClaudeCodeSdkAgentType(record.agentType) || record.agentType === 'qwen' || record.agentType === 'deepseek-harness' || record.agentType === 'pi' || record.agentType === 'codex-sdk') ? record.ccPreset : undefined,
       // Qwen-compatible API providers can reject a resumed conversation when
       // their persisted tool-call chain is invalid (e.g. "tool call result
       // does not follow tool call"). Auto-recovery must rotate the provider
       // conversation instead of binding the same poisoned qwen session again.
       ...(record.agentType === 'qwen' ? { fresh: true } : {}),
-      ...(record.agentType === 'claude-code-sdk' && record.ccSessionId ? { ccSessionId: record.ccSessionId } : {}),
+      ...(isClaudeCodeSdkAgentType(record.agentType) && record.ccSessionId ? { ccSessionId: record.ccSessionId } : {}),
       ...(record.agentType === 'codex-sdk' && record.codexSessionId ? { codexSessionId: record.codexSessionId } : {}),
       ...(usesProviderResumeId(record.agentType) && record.providerResumeId
         ? { providerResumeId: record.providerResumeId }
@@ -2346,7 +2346,7 @@ function wireTransportSessionInfo(
     let changed = false;
 
     if (typeof info.resumeId === 'string' && info.resumeId) {
-      if (agentType === 'claude-code-sdk' && next.ccSessionId !== info.resumeId) {
+      if (isClaudeCodeSdkAgentType(agentType) && next.ccSessionId !== info.resumeId) {
         reassignSessionFile(sessionName, next.ccSessionId, info.resumeId);
         next.ccSessionId = info.resumeId;
         changed = true;
@@ -2367,7 +2367,7 @@ function wireTransportSessionInfo(
       }
     }
 
-    const presetSelectedModelIsAuthoritative = agentType === 'claude-code-sdk'
+    const presetSelectedModelIsAuthoritative = isClaudeCodeSdkAgentType(agentType)
       && !!next.ccPreset
       && !!next.requestedModel;
     if (typeof info.model === 'string' && info.model && !presetSelectedModelIsAuthoritative) {
@@ -3068,7 +3068,7 @@ export async function restoreTransportSessions(
       let requestedTransportModel = s.requestedModel ?? s.qwenModel;
       if (s.providerId === 'codex-sdk') {
         requestedTransportModel = sanitizeCodexSdkStartupModel(requestedTransportModel);
-      } else if (s.providerId === 'claude-code-sdk' && requestedTransportModel) {
+      } else if (isClaudeCodeSdkAgentType(s.providerId) && requestedTransportModel) {
         // Resolve the picker alias (e.g. "fable") to the documented API id before the
         // SDK sees it — symmetric with the model-change path (command-handler) and the
         // codex branch above. Without this, a restored session passed the raw alias and
@@ -3102,12 +3102,12 @@ export async function restoreTransportSessions(
       // never-materialized history -- and the restored runtime still settles idle.
       const freshQoderRestore = s.providerId === 'qoder-sdk';
       const freshOnRestore = freshAfterCancel || freshQoderRestore;
-      const needsEphemeralRouteKey = s.providerId === 'claude-code-sdk'
+      const needsEphemeralRouteKey = isClaudeCodeSdkAgentType(s.providerId)
         || s.providerId === 'codex-sdk'
         || s.providerId === 'qoder-sdk'
         || usesProviderResumeId(s.providerId);
       const effectiveSessionKey = freshOnRestore || needsEphemeralRouteKey ? randomUUID() : s.providerSessionId;
-      const resumeId = s.providerId === 'claude-code-sdk'
+      const resumeId = isClaudeCodeSdkAgentType(s.providerId)
         ? s.ccSessionId
         : s.providerId === 'codex-sdk'
           ? s.codexSessionId
@@ -3145,7 +3145,7 @@ export async function restoreTransportSessions(
       const { bootstrap: contextBootstrap, deferred: deferredContextBootstrap } = await resolveLaunchContextBootstrap(s.name, resolveRuntimeContextBootstrap);
       runtime.setContextBootstrapResolver(() => resolveRuntimeContextBootstrap());
       if (deferredContextBootstrap) runtime.deferContextBootstrap(deferredContextBootstrap);
-      if (s.providerId === 'claude-code-sdk' && s.ccPreset) {
+      if (isClaudeCodeSdkAgentType(s.providerId) && s.ccPreset) {
         const { resolvePresetEnv, getPresetTransportOverrides } = await import('../daemon/cc-presets.js');
         extraEnv = await resolvePresetEnv(
           s.ccPreset,
@@ -3488,7 +3488,7 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
   const resourceRuntimeEpoch = randomUUID();
   if (opts.fresh || !existing) clearSummarySyncHistory(name);
   const inheritedClaudeResumeId = opts.ccSessionId ?? (!opts.fresh ? existing?.ccSessionId : undefined);
-  const shouldResumeClaudeCliConversation = agentType === 'claude-code-sdk'
+  const shouldResumeClaudeCliConversation = isClaudeCodeSdkAgentType(agentType)
     && existing?.agentType === 'claude-code'
     && existing?.runtimeType !== RUNTIME_TYPES.TRANSPORT
     && typeof inheritedClaudeResumeId === 'string'
@@ -3554,7 +3554,7 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
   let requestedTransportModel = opts.requestedModel ?? storedRequestedModel ?? (agentType === 'qwen' ? (opts.qwenModel ?? existing?.qwenModel) : undefined);
   if (agentType === 'codex-sdk') {
     requestedTransportModel = sanitizeCodexSdkStartupModel(requestedTransportModel);
-  } else if (agentType === 'claude-code-sdk' && requestedTransportModel) {
+  } else if (isClaudeCodeSdkAgentType(agentType) && requestedTransportModel) {
     // Resolve the picker alias (e.g. "fable") to the documented API id at launch —
     // symmetric with the restore path and command-handler's model-change path.
     requestedTransportModel = normalizeClaudeSdkModelForProvider(requestedTransportModel);
@@ -3649,7 +3649,7 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
       effectiveBindExistingKey = undefined;
       effectiveSkipCreate = false;
     }
-  } else if (agentType === 'claude-code-sdk') {
+  } else if (isClaudeCodeSdkAgentType(agentType)) {
     effectiveSessionKey = randomUUID();
     effectiveBindExistingKey = undefined;
     transportResumeId = opts.ccSessionId ?? (!opts.fresh ? getSession(name)?.ccSessionId : undefined) ?? randomUUID();
@@ -3662,7 +3662,8 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
     if (shouldResumeClaudeCliConversation) {
       effectiveSkipCreate = true;
     }
-    if (effectiveCcPreset) {
+    const ccPresetAgent = agentType === 'claude-code-sdk' || isClaudeCodeSdkAgentType(agentType);
+    if (ccPresetAgent && effectiveCcPreset) {
       const { resolvePresetEnv, getPresetTransportOverrides } = await import('../daemon/cc-presets.js');
       transportEnv = {
         ...(transportEnv ?? {}),
@@ -3860,7 +3861,7 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
         ...(usesProviderResumeId(agentType) && (latestSessionInfo?.resumeId ?? transportResumeId)
           ? { providerResumeId: latestSessionInfo?.resumeId ?? transportResumeId }
           : {}),
-        ...(agentType === 'claude-code-sdk' && transportResumeId ? { ccSessionId: transportResumeId } : {}),
+        ...(isClaudeCodeSdkAgentType(agentType) && transportResumeId ? { ccSessionId: transportResumeId } : {}),
         ...(agentType === 'codex-sdk' && transportResumeId ? { codexSessionId: transportResumeId } : {}),
         contextNamespace: contextBootstrap.namespace,
         contextNamespaceDiagnostics: contextBootstrap.diagnostics,

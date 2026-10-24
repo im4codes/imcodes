@@ -23,6 +23,7 @@ import { validateExecutionTemplateCandidate } from './execution-clone.js';
 import { isWorkingSessionState } from '../../shared/session-activity-types.js';
 import type { SupervisionHeartbeatSnapshot } from '../../shared/supervision-heartbeat.js';
 import { getSupervisionHeartbeatProjectionForWire } from './supervision-heartbeat-projection.js';
+import { CLAUDE_CODE_CLI_SDK_AGENT_TYPE } from '../../shared/agent-types.js';
 
 export interface SessionListItem extends SessionContextBootstrapState {
   name: string;
@@ -213,7 +214,7 @@ function baseItem(s: SessionRecord): SessionListItem {
 }
 
 function getPermissionLabel(agentType: string): string | undefined {
-  return (agentType === 'claude-code' || agentType === 'claude-code-sdk' || agentType === 'codex' || agentType === 'codex-sdk')
+  return (agentType === 'claude-code' || agentType === 'claude-code-sdk' || agentType === CLAUDE_CODE_CLI_SDK_AGENT_TYPE || agentType === 'codex' || agentType === 'codex-sdk')
     ? 'all'
     : undefined;
 }
@@ -285,6 +286,11 @@ export async function buildSessionList(): Promise<SessionListItem[]> {
   }
 
   return sessions.map((s) => {
+    if (s.agentType === CLAUDE_CODE_CLI_SDK_AGENT_TYPE) {
+      const hydrated: Partial<SessionRecord> = { permissionLabel: getPermissionLabel(s.agentType) };
+      if (hydrated.permissionLabel !== s.permissionLabel) upsertSession({ ...s, ...hydrated, updatedAt: Date.now() });
+      return { ...baseItem(s), ...hydrated };
+    }
     if (s.agentType === 'claude-code-sdk') {
       const hydrated: Partial<SessionRecord> = {
         ...(claudeSdkRuntime?.planLabel ? { planLabel: claudeSdkRuntime.planLabel } : {}),

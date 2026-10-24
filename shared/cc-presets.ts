@@ -1,3 +1,5 @@
+import { CLAUDE_CODE_CLI_SDK_AGENT_TYPE } from './agent-types.js';
+
 export const CC_PRESET_MSG = {
   LIST: 'cc.presets.list',
   LIST_RESPONSE: 'cc.presets.list_response',
@@ -19,6 +21,7 @@ export const CC_PRESET_MSG = {
 export const CUSTOM_PROVIDER_SDK_AGENT_TYPES: ReadonlySet<string> = new Set([
   'claude-code',
   'claude-code-sdk',
+  CLAUDE_CODE_CLI_SDK_AGENT_TYPE,
   'qwen',
   'deepseek-harness',
   'pi',

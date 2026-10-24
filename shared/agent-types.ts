@@ -5,6 +5,7 @@ import { HERMES_AGENT_PROVIDER_ID } from './hermes-agent.js';
 export const SESSION_AGENT_TYPES = [
   AGY_SDK_PROVIDER_ID,
   'claude-code-sdk',
+  'claude-code-cli-sdk',
   'claude-code',
   'codex-sdk',
   'qoder-sdk',
@@ -31,12 +32,15 @@ export const SESSION_AGENT_TYPES = [
 
 export type SessionAgentType = typeof SESSION_AGENT_TYPES[number];
 
-export const CLAUDE_CODE_FAMILY = ['claude-code-sdk', 'claude-code'] as const;
+export const CLAUDE_CODE_CLI_SDK_AGENT_TYPE = 'claude-code-cli-sdk' as const;
+export const CLAUDE_CODE_SDK_AGENT_TYPES = ['claude-code-sdk', CLAUDE_CODE_CLI_SDK_AGENT_TYPE] as const;
+export const CLAUDE_CODE_FAMILY = ['claude-code-sdk', CLAUDE_CODE_CLI_SDK_AGENT_TYPE, 'claude-code'] as const;
 export const CODEX_FAMILY = ['codex-sdk', 'codex'] as const;
 export const MUSE_CODE_FAMILY = ['muse-code-sdk'] as const;
 export const TRANSPORT_SESSION_AGENT_TYPES = [
   AGY_SDK_PROVIDER_ID,
   'claude-code-sdk',
+  CLAUDE_CODE_CLI_SDK_AGENT_TYPE,
   'codex-sdk',
   'qoder-sdk',
   'copilot-sdk',
@@ -63,6 +67,10 @@ export function isSessionAgentType(value: string): value is SessionAgentType {
 
 export function isClaudeCodeFamily(value: string): value is typeof CLAUDE_CODE_FAMILY[number] {
   return (CLAUDE_CODE_FAMILY as readonly string[]).includes(value);
+}
+
+export function isClaudeCodeSdkAgentType(value: string | undefined): value is typeof CLAUDE_CODE_SDK_AGENT_TYPES[number] {
+  return !!value && (CLAUDE_CODE_SDK_AGENT_TYPES as readonly string[]).includes(value);
 }
 
 export function isCodexFamily(value: string): value is typeof CODEX_FAMILY[number] {

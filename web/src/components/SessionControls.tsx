@@ -90,6 +90,7 @@ import { isImeComposingKeyEvent } from '../ime-keyboard.js';
 import { collectSettledQueuedIds } from '../session-controls-queue.js';
 import { deriveSessionLiveStatus, isRunningSessionState } from '../session-live-status.js';
 import { DAEMON_MSG } from '@shared/daemon-events.js';
+import { isClaudeCodeSdkAgentType } from '@shared/agent-types.js';
 import {
   TRANSPORT_STOP_QUEUE_FIELDS,
   TRANSPORT_STOP_QUEUE_OUTCOMES,
@@ -2038,7 +2039,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   // session. Viewers and inactive shares remain read-only.
   const disabled = participantControlDisabled;
   const modelSwitchDisabled = participantControlDisabled;
-  const isClaudeCode = activeSession?.agentType === 'claude-code' || activeSession?.agentType === 'claude-code-sdk';
+  const isClaudeCode = activeSession?.agentType === 'claude-code' || isClaudeCodeSdkAgentType(activeSession?.agentType);
   const isShellLike = activeSession?.agentType === 'shell' || activeSession?.agentType === 'script';
   const isTransport = effectiveRuntimeType === 'transport';
   const currentTransportConfig = localTransportConfig ?? activeSession?.transportConfig ?? null;
@@ -2191,7 +2192,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     displayedCodexModel,
     dynamicTransportModels.models,
   ]);
-  const claudeSessionModel = activeSession?.agentType === 'claude-code-sdk'
+  const claudeSessionModel = isClaudeCodeSdkAgentType(activeSession?.agentType)
     ? (resolveEffectiveSessionModel(activeSession, detectedModel) ?? null)
     : null;
   const claudePinnedModel = claudeSessionModel && (
@@ -2201,7 +2202,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     ? claudeSessionModel
     : null;
   const displayedClaudeModel = claudePinnedModel ?? model;
-  const claudeModelSuggestions = activeSession?.agentType === 'claude-code-sdk'
+  const claudeModelSuggestions = isClaudeCodeSdkAgentType(activeSession?.agentType)
     && activeSession.ccPreset
     ? mergeModelSuggestions(
         claudePinnedModel ? [claudePinnedModel] : [],
@@ -2217,7 +2218,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     [displayedCodexModel, genericTransportModel, dynamicTransportModels.models],
   );
   const thinkingLevels = useMemo((): readonly TransportEffortLevel[] => (
-    activeSession?.agentType === 'claude-code-sdk'
+    isClaudeCodeSdkAgentType(activeSession?.agentType)
       ? CLAUDE_SDK_EFFORT_LEVELS
       : activeSession?.agentType === 'codex-sdk'
         ? (selectedDynamicModel?.supportedEffortLevels ?? CODEX_SDK_EFFORT_LEVELS)
@@ -6501,7 +6502,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
               class="shortcut-btn"
               ref={modelButtonRef}
               onClick={() => toggleModelMenu({
-                refreshDynamic: activeSession?.agentType === 'claude-code-sdk',
+              refreshDynamic: isClaudeCodeSdkAgentType(activeSession?.agentType),
               })}
               disabled={modelSwitchDisabled}
               title={displayedClaudeModel ? `Model: ${displayedClaudeModel}` : 'Model: Unknown — tap to select'}

@@ -21,6 +21,7 @@ import {
   GEMINI_MODEL_IDS,
   MUSE_MODEL_IDS,
 } from '../../../src/shared/models/options.js';
+import { CLAUDE_CODE_CLI_SDK_AGENT_TYPE } from '@shared/agent-types.js';
 
 export interface TransportModelInfo {
   id: string;
@@ -86,7 +87,7 @@ export function getStaticFallbackModels(agentType: string | undefined | null): T
       loading: false,
     };
   }
-  if (agentType === 'claude-code-sdk') {
+  if (agentType === 'claude-code-sdk' || agentType === CLAUDE_CODE_CLI_SDK_AGENT_TYPE) {
     return {
       models: CLAUDE_CODE_MODEL_IDS.map((id) => ({ id })),
       defaultModel: CLAUDE_CODE_MODEL_IDS[0],
@@ -203,12 +204,12 @@ export function writeCachedTransportModels(
 }
 
 /** Agent types that support dynamic model discovery via `transport.list_models`. */
-export type TransportAgentTypeWithModels = 'claude-code-sdk' | 'copilot-sdk' | 'cursor-headless' | 'codex-sdk' | 'opencode-sdk' | 'gemini-sdk' | 'grok-sdk' | 'kimi-sdk' | 'muse-code-sdk' | typeof HERMES_AGENT_PROVIDER_ID | typeof AGY_SDK_PROVIDER_ID | 'deepseek-harness' | 'pi' | 'qwen' | typeof CODEBUDDY_PROVIDER_IDS.CHINA | typeof CODEBUDDY_PROVIDER_IDS.INTERNATIONAL;
+export type TransportAgentTypeWithModels = 'claude-code-sdk' | typeof CLAUDE_CODE_CLI_SDK_AGENT_TYPE | 'copilot-sdk' | 'cursor-headless' | 'codex-sdk' | 'opencode-sdk' | 'gemini-sdk' | 'grok-sdk' | 'kimi-sdk' | 'muse-code-sdk' | typeof HERMES_AGENT_PROVIDER_ID | typeof AGY_SDK_PROVIDER_ID | 'deepseek-harness' | 'pi' | 'qwen' | typeof CODEBUDDY_PROVIDER_IDS.CHINA | typeof CODEBUDDY_PROVIDER_IDS.INTERNATIONAL;
 
 export function supportsDynamicTransportModels(
   agentType: string | undefined | null,
 ): agentType is TransportAgentTypeWithModels {
-  return agentType === 'claude-code-sdk' || agentType === 'copilot-sdk' || agentType === 'cursor-headless' || agentType === 'codex-sdk' || agentType === 'opencode-sdk' || agentType === 'gemini-sdk' || agentType === 'grok-sdk' || agentType === 'kimi-sdk' || agentType === 'muse-code-sdk' || agentType === HERMES_AGENT_PROVIDER_ID || agentType === AGY_SDK_PROVIDER_ID || agentType === 'deepseek-harness' || agentType === 'pi' || agentType === 'qwen' || isCodeBuddyProviderId(agentType ?? undefined);
+  return agentType === 'claude-code-sdk' || agentType === CLAUDE_CODE_CLI_SDK_AGENT_TYPE || agentType === 'copilot-sdk' || agentType === 'cursor-headless' || agentType === 'codex-sdk' || agentType === 'opencode-sdk' || agentType === 'gemini-sdk' || agentType === 'grok-sdk' || agentType === 'kimi-sdk' || agentType === 'muse-code-sdk' || agentType === HERMES_AGENT_PROVIDER_ID || agentType === AGY_SDK_PROVIDER_ID || agentType === 'deepseek-harness' || agentType === 'pi' || agentType === 'qwen' || isCodeBuddyProviderId(agentType ?? undefined);
 }
 
 /** Fetch and cache the list of available models for a transport agent type.

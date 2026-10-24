@@ -12,6 +12,7 @@ import { describe, expect, it } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { CUSTOM_PROVIDER_SDK_AGENT_TYPES } from '../../shared/cc-presets.js';
+import { CLAUDE_CODE_CLI_SDK_AGENT_TYPE } from '../../shared/agent-types.js';
 
 const ROOT = join(import.meta.dirname, '..', '..');
 
@@ -38,6 +39,13 @@ describe('custom provider SDK agent types', () => {
         .filter((line) => line.includes('ccPreset'))
         .flatMap((line) => [...line.matchAll(/agentType === '([a-z-]+)'/g)].map((m) => m[1])),
     );
+    // The two Claude SDK transports share the guarded helper branch so the
+    // implementation cannot accidentally route the new provider through the
+    // legacy SDK. Account for that shared branch in this source-level guard.
+    if (src.includes('isClaudeCodeSdkAgentType')) {
+      presetBranches.add('claude-code-sdk');
+      presetBranches.add(CLAUDE_CODE_CLI_SDK_AGENT_TYPE);
+    }
 
     for (const agentType of CUSTOM_PROVIDER_SDK_AGENT_TYPES) {
       expect(

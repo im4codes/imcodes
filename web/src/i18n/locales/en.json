@@ -803,6 +803,7 @@
       "openclaw": "OpenClaw",
       "qwen": "Qwen Code",
       "claude_code_sdk": "Claude Code SDK",
+      "cc_cli_sdk": "CC CLI SDK",
       "codex_sdk": "Codex SDK",
       "qoder_sdk": "Qoder SDK",
       "claude_code_cli": "Claude Code CLI",

@@ -21,6 +21,7 @@ import {
 import { startProject, stopProject, teardownProject, getTransportRuntime, launchTransportSession, isProviderSessionBound, persistSessionRecord, relaunchSessionWithSettings, stopTransportRuntimeSession, type ProjectConfig } from '../agent/session-manager.js';
 import { buildTransportResumeLaunchOpts } from '../agent/transport-resume-opts.js';
 import { isTransportAgent, type AgentType } from '../agent/detect.js';
+import { CLAUDE_CODE_CLI_SDK_AGENT_TYPE, isClaudeCodeSdkAgentType } from '../../shared/agent-types.js';
 import { aliasExpansionModeFor, expandForAgent } from '../../shared/alias-expand.js';
 import { ALIAS_REASONS } from '../../shared/alias-types.js';
 import { classifyCodexFastCommand, isCodexFastServiceTier } from '../../shared/codex-service-tier.js';
@@ -1047,8 +1048,8 @@ async function handleSubSessionTransportConfigUpdate(cmd: Record<string, unknown
   }
 }
 
-function supportsEffort(agentType: string | undefined): agentType is 'claude-code-sdk' | 'codex-sdk' | 'copilot-sdk' | 'openclaw' | 'pi' | 'qwen' {
-  return agentType === 'claude-code-sdk'
+function supportsEffort(agentType: string | undefined): agentType is AgentType {
+  return isClaudeCodeSdkAgentType(agentType)
     || agentType === 'codex-sdk'
     || agentType === 'copilot-sdk'
     || agentType === 'openclaw'
@@ -1058,7 +1059,7 @@ function supportsEffort(agentType: string | undefined): agentType is 'claude-cod
 
 /** Does this transport agent start a fresh conversation for `/clear`? */
 export function supportsTransportClear(agentType: string | undefined): boolean {
-  return agentType === 'claude-code-sdk'
+  return isClaudeCodeSdkAgentType(agentType)
     || agentType === 'codex-sdk'
     || agentType === 'copilot-sdk'
     || agentType === 'cursor-headless'
@@ -1130,7 +1131,7 @@ async function relaunchFreshTransportConversation(record: SessionRecord): Promis
     effort: record.effort,
     transportConfig: record.transportConfig,
     ccPreset: CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(record.agentType) ? record.ccPreset : undefined,
-    ...(record.agentType === 'claude-code-sdk' ? { ccSessionId: randomUUID() } : {}),
+    ...(isClaudeCodeSdkAgentType(record.agentType) ? { ccSessionId: randomUUID() } : {}),
     ...(record.agentType === 'openclaw' && record.providerSessionId ? { bindExistingKey: record.providerSessionId } : {}),
     ...(record.parentSession ? { parentSession: record.parentSession } : {}),
     ...(record.userCreated ? { userCreated: true } : {}),
@@ -1169,7 +1170,7 @@ async function resumeTransportRuntimeAfterLoss(record: SessionRecord): Promise<v
 }
 
 function getSupportedEffortLevels(agentType: string | undefined): readonly TransportEffortLevel[] {
-  return agentType === 'claude-code-sdk'
+  return isClaudeCodeSdkAgentType(agentType)
     ? CLAUDE_SDK_EFFORT_LEVELS
     : agentType === 'codex-sdk'
       ? CODEX_SDK_EFFORT_LEVELS
@@ -2685,7 +2686,7 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
   try {
     // Resolve CC env preset if specified
     let extraEnv: Record<string, string> | undefined;
-    if (ccPresetName && (agentType === 'claude-code' || agentType === 'claude-code-sdk' || agentType === 'codex' || agentType === 'codex-sdk')) {
+    if (ccPresetName && (agentType === 'claude-code' || agentType === 'claude-code-sdk' || isClaudeCodeSdkAgentType(agentType) || agentType === 'codex' || agentType === 'codex-sdk')) {
       const { resolvePresetEnv } = await import('./cc-presets.js');
       extraEnv = await resolvePresetEnv(ccPresetName);
     }
@@ -2704,7 +2705,7 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
       targetDir: requestedDir,
     });
 
-    if (agentType === 'claude-code-sdk' || agentType === 'codex-sdk' || agentType === 'copilot-sdk' || agentType === 'cursor-headless' || agentType === 'opencode-sdk' || agentType === 'gemini-sdk' || agentType === 'kimi-sdk' || agentType === HERMES_AGENT_PROVIDER_ID || agentType === 'grok-sdk' || agentType === AGY_SDK_PROVIDER_ID || agentType === 'muse-code-sdk') {
+    if (isClaudeCodeSdkAgentType(agentType) || agentType === 'codex-sdk' || agentType === 'copilot-sdk' || agentType === 'cursor-headless' || agentType === 'opencode-sdk' || agentType === 'gemini-sdk' || agentType === 'kimi-sdk' || agentType === HERMES_AGENT_PROVIDER_ID || agentType === 'grok-sdk' || agentType === AGY_SDK_PROVIDER_ID || agentType === 'muse-code-sdk') {
       logger.info({ project, agentType }, 'SDK fresh session.start removing stale main-session store record');
       // The fresh session starts under the SAME name, so its predecessor's
       // durable queue must be cleared and its authority rotated first.
@@ -2721,19 +2722,19 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
       brainType: agentType as ProjectConfig['brainType'],
       workerTypes: [],
       label,
-      fresh: agentType === 'claude-code-sdk' || agentType === 'codex-sdk' || agentType === 'opencode-sdk' || agentType === 'gemini-sdk' || agentType === 'kimi-sdk' || agentType === HERMES_AGENT_PROVIDER_ID || agentType === 'grok-sdk' || agentType === AGY_SDK_PROVIDER_ID || agentType === 'muse-code-sdk' || isCodeBuddyProviderId(agentType),
+      fresh: isClaudeCodeSdkAgentType(agentType) || agentType === 'codex-sdk' || agentType === 'opencode-sdk' || agentType === 'gemini-sdk' || agentType === 'kimi-sdk' || agentType === HERMES_AGENT_PROVIDER_ID || agentType === 'grok-sdk' || agentType === AGY_SDK_PROVIDER_ID || agentType === 'muse-code-sdk' || isCodeBuddyProviderId(agentType),
       extraEnv,
       ccPreset: ccPresetName,
       effort,
       identityPrompt,
     };
-    if (agentType === 'claude-code-sdk') {
+    if (isClaudeCodeSdkAgentType(agentType)) {
       logger.info({ project }, 'SDK fresh session.start launching new Claude SDK main session');
       await launchTransportSession({
         name: `deck_${project}_brain`,
         projectName: project,
         role: 'brain',
-        agentType: 'claude-code-sdk',
+        agentType,
         projectDir: dir,
         fresh: true,
         ccSessionId: randomUUID(),
@@ -2929,7 +2930,7 @@ function isGenericModelSwitchAgent(agentType: string | undefined): boolean {
 }
 
 function isModelSwitchAgent(agentType: string | undefined): boolean {
-  return agentType === 'qwen' || agentType === 'claude-code-sdk' || agentType === 'codex-sdk'
+  return agentType === 'qwen' || isClaudeCodeSdkAgentType(agentType) || agentType === 'codex-sdk'
     || agentType === 'qoder-sdk' || isGenericModelSwitchAgent(agentType);
 }
 
@@ -2956,7 +2957,8 @@ async function resolveValidatedModelList(record: SessionRecord): Promise<{ model
       const models = sessionModels.length ? sessionModels : (runtimeModels.length ? runtimeModels : [...QWEN_MODEL_IDS]);
       return { models: [...models], qwenRuntime };
     }
-    case 'claude-code-sdk': {
+    case 'claude-code-sdk':
+    case CLAUDE_CODE_CLI_SDK_AGENT_TYPE: {
       if (!record.ccPreset) return { models: [...CLAUDE_CODE_MODEL_IDS] };
       const { getPreset, getPresetAvailableModelIds } = await import('./cc-presets.js');
       const preset = await getPreset(record.ccPreset);
@@ -3056,7 +3058,7 @@ async function applyTransportModelSwitch(
       updatedAt: Date.now(),
     };
     contextWindow = resolveContextWindow(undefined, requestedModel);
-  } else if (agentType === 'claude-code-sdk') {
+  } else if (isClaudeCodeSdkAgentType(agentType)) {
     let presetContextWindow = record.presetContextWindow;
     let selectedModel: string | undefined;
     const presetModels = validated?.models ?? [];
@@ -3281,7 +3283,7 @@ export async function listSessionModelsNow(sessionName: string): Promise<Session
       models: validated.models,
       thinkingLevels: [...await resolveSupportedEffortLevels(record, agentType)],
       acceptsAnyModel: false,
-      ...(record.ccPreset && agentType === 'claude-code-sdk' ? { note: `preset ${record.ccPreset}` } : {}),
+      ...(record.ccPreset && isClaudeCodeSdkAgentType(agentType) ? { note: `preset ${record.ccPreset}` } : {}),
     };
   }
   const listed = await getTransportListModels({
@@ -7662,7 +7664,7 @@ async function handleSubSessionStart(cmd: Record<string, unknown>, serverLink: S
         transportConfig: (cmd.transportConfig as Record<string, unknown> | undefined) ?? undefined,
         bindExistingKey,
         ...(ccPreset ? { ccPreset } : {}),
-        ...(type === 'claude-code-sdk' ? { ccSessionId: randomUUID(), fresh: true } : {}),
+        ...(isClaudeCodeSdkAgentType(type) ? { ccSessionId: randomUUID(), fresh: true } : {}),
         ...(type === 'codex-sdk' || type === 'opencode-sdk' || type === 'kimi-sdk' || type === HERMES_AGENT_PROVIDER_ID || type === 'grok-sdk' || type === AGY_SDK_PROVIDER_ID || type === 'deepseek-harness' || type === 'pi' || isCodeBuddyProviderId(type) ? { fresh: true } : {}),
         ...(effort ? { effort } : {}),
         userCreated: true,
@@ -11770,7 +11772,7 @@ async function loadTransportListModels(agentType: string, force: boolean): Promi
   // caller explicitly forces a live probe.
   if (!provider && !force) return await loadPassiveTransportListModels(agentType);
 
-  if (!provider && force && (agentType === 'gemini-sdk' || agentType === 'kimi-sdk' || agentType === HERMES_AGENT_PROVIDER_ID || agentType === 'grok-sdk' || agentType === AGY_SDK_PROVIDER_ID || agentType === 'opencode-sdk' || agentType === 'claude-code-sdk' || agentType === 'codex-sdk' || agentType === 'copilot-sdk' || agentType === 'cursor-headless' || agentType === 'muse-code-sdk' || isCodeBuddyProviderId(agentType))) {
+  if (!provider && force && (agentType === 'gemini-sdk' || agentType === 'kimi-sdk' || agentType === HERMES_AGENT_PROVIDER_ID || agentType === 'grok-sdk' || agentType === AGY_SDK_PROVIDER_ID || agentType === 'opencode-sdk' || isClaudeCodeSdkAgentType(agentType) || agentType === 'codex-sdk' || agentType === 'copilot-sdk' || agentType === 'cursor-headless' || agentType === 'muse-code-sdk' || isCodeBuddyProviderId(agentType))) {
     try {
       provider = await ensureProviderConnected(agentType, {});
     } catch (err) {
@@ -11866,7 +11868,7 @@ async function loadPassiveTransportListModels(agentType: string): Promise<Transp
       ...(cfg?.planLabel ? { isAuthenticated: true } : {}),
     };
   }
-  if (agentType === 'claude-code-sdk') {
+  if (isClaudeCodeSdkAgentType(agentType)) {
     return {
       models: modelIdsToTransportModels(CLAUDE_CODE_MODEL_IDS),
       defaultModel: CLAUDE_CODE_MODEL_IDS[0],

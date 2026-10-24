@@ -21,7 +21,7 @@ import {
   nextTransportQueueVersion,
   removeTransportPendingEntryForUserMessage,
 } from '../transport-queue.js';
-import { getSessionRuntimeType, isTransportSessionAgentType } from '@shared/agent-types.js';
+import { CLAUDE_CODE_CLI_SDK_AGENT_TYPE, getSessionRuntimeType, isTransportSessionAgentType } from '@shared/agent-types.js';
 import { getAutoSessionLabelPrefix } from '../agent-display.js';
 import { EXECUTION_CLONE_KIND } from '@shared/execution-clone.js';
 import { AGY_SDK_PROVIDER_ID } from '@shared/agy-agent.js';
@@ -69,7 +69,7 @@ function isCodexFamily(agentType: string | null | undefined): boolean {
 }
 
 function isQuotaPreservingSubSessionType(agentType: string | null | undefined): boolean {
-  return isCodexFamily(agentType) || agentType === 'claude-code-sdk' || agentType === AGY_SDK_PROVIDER_ID;
+  return isCodexFamily(agentType) || agentType === 'claude-code-sdk' || agentType === CLAUDE_CODE_CLI_SDK_AGENT_TYPE || agentType === AGY_SDK_PROVIDER_ID;
 }
 
 function toSessionName(id: string): string {

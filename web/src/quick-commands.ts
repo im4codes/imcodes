@@ -12,10 +12,12 @@ import {
 import { CODEBUDDY_PROVIDER_IDS } from '@shared/codebuddy.js';
 import { HERMES_AGENT_PROVIDER_ID } from '@shared/hermes-agent.js';
 import { AGY_SDK_PROVIDER_ID } from '@shared/agy-agent.js';
+import { CLAUDE_CODE_CLI_SDK_AGENT_TYPE } from '@shared/agent-types.js';
 
 const DEFAULT_QUICK_COMMANDS: Readonly<Record<string, readonly string[]>> = {
   'claude-code': [SESSION_COMPACT_COMMAND, SESSION_CLEAR_COMMAND, '/usage', '/cost', '/status', '/help'],
   'claude-code-sdk': [SESSION_COMPACT_COMMAND, SESSION_CLEAR_COMMAND, SESSION_MODEL_COMMAND, '/thinking'],
+  [CLAUDE_CODE_CLI_SDK_AGENT_TYPE]: [SESSION_CLEAR_COMMAND, SESSION_MODEL_COMMAND],
   'copilot-sdk': [SESSION_COMPACT_COMMAND, SESSION_CLEAR_COMMAND, SESSION_MODEL_COMMAND, '/thinking'],
   codex: [SESSION_COMPACT_COMMAND, '/help', SESSION_MODEL_COMMAND, '/approval', SESSION_CLEAR_COMMAND],
   'codex-sdk': [

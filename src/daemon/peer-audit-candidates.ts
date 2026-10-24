@@ -17,6 +17,7 @@ import type { SessionRecord } from '../store/session-store.js';
 import { CODEBUDDY_PROVIDER_IDS } from '../../shared/codebuddy.js';
 import { HERMES_AGENT_PROVIDER_ID } from '../../shared/hermes-agent.js';
 import { AGY_SDK_PROVIDER_ID } from '../../shared/agy-agent.js';
+import { CLAUDE_CODE_CLI_SDK_AGENT_TYPE } from '../../shared/agent-types.js';
 import { DELEGATION_AVAILABILITY, type DelegationTargetAvailability } from '../../shared/delegation-availability.js';
 import type { SupervisionAuditDegradedReason } from '../../shared/supervision-execution-pool.js';
 
@@ -112,6 +113,7 @@ function peerAuditTypeLabel(agentType: string): string {
   switch (agentType) {
     case 'claude-code':
     case 'claude-code-sdk':
+    case CLAUDE_CODE_CLI_SDK_AGENT_TYPE:
       return 'CC';
     case 'codex':
     case 'codex-sdk':
