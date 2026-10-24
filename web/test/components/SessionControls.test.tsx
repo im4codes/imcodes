@@ -11382,6 +11382,63 @@ afterEach(() => {
     expect(input.textContent).toBe('');
   });
 
+  it('syncs native textarea dictation input into the visible composer and send payload', () => {
+    const ws = makeWs();
+    render(<SessionControls ws={ws as any} activeSession={makeSession({ name: 'native-dictation' })} quickData={makeQuickData() as any} />);
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    const native = document.querySelector('[data-composer-native-input="true"]') as HTMLTextAreaElement;
+    expect(native).toBeTruthy();
+    native.focus();
+    native.value = 'dictated from native input';
+    native.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: native.value }));
+    expect(input.textContent).toBe('dictated from native input');
+    fireEvent.click(screen.getByRole('button', { name: /send/i }));
+    expectSendPayload(ws, { sessionName: 'native-dictation', text: 'dictated from native input' });
+    expect(native.value).toBe('');
+  });
+
+  it('keeps native textarea composition, selection replacement, and newlines', () => {
+    const ws = makeWs();
+    render(<SessionControls ws={ws as any} activeSession={makeSession({ name: 'native-composition' })} quickData={makeQuickData() as any} />);
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    const native = document.querySelector('[data-composer-native-input="true"]') as HTMLTextAreaElement;
+    native.focus();
+    native.value = 'hello';
+    native.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: 'hello' }));
+    native.selectionStart = 1;
+    native.selectionEnd = 4;
+    native.value = 'h你好o';
+    native.dispatchEvent(new CompositionEvent('compositionstart', { bubbles: true }));
+    native.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertCompositionText', data: '你好' }));
+    native.dispatchEvent(new CompositionEvent('compositionend', { bubbles: true, data: '你好' }));
+    expect(input.textContent).toBe('h你好o');
+    native.value = 'h你好o\n下一行';
+    native.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: '\n下一行' }));
+    expect(input.textContent).toBe('h你好o\n下一行');
+    fireEvent.click(screen.getByRole('button', { name: /send/i }));
+    expectSendPayload(ws, { sessionName: 'native-composition', text: 'h你好o\n下一行' });
+  });
+
+  it('focuses the native input surface for a macOS desktop user agent', () => {
+    const originalUserAgent = navigator.userAgent;
+    Object.defineProperty(navigator, 'userAgent', {
+      configurable: true,
+      value: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/605.1.15 Safari/605.1.15',
+    });
+    try {
+      render(<SessionControls ws={makeWs() as any} activeSession={makeSession({ name: 'native-mac-focus' })} quickData={makeQuickData() as any} />);
+      const input = screen.getByRole('textbox') as HTMLDivElement;
+      const native = document.querySelector('[data-composer-native-input="true"]') as HTMLTextAreaElement;
+      input.focus();
+      expect(document.activeElement).toBe(native);
+      native.value = 'mac dictation';
+      native.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: native.value }));
+      expect(input.textContent).toBe('mac dictation');
+    } finally {
+      Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUserAgent });
+    }
+  });
+
   it('does not steal another focused field for a Dictation replacement', () => {
     render(<SessionControls ws={makeWs() as any} activeSession={makeSession({ name: 'dictation-focus' })} quickData={makeQuickData() as any} />);
     const input = screen.getByRole('textbox') as HTMLDivElement;

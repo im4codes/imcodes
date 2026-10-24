@@ -636,6 +636,12 @@ function setComposerElementText(root: HTMLElement, text: string): void {
   root.textContent = text.replace(/\r\n?/g, '\n');
 }
 
+function isMacDesktopInputPlatform(): boolean {
+  if (typeof navigator === 'undefined') return false;
+  const ua = navigator.userAgent || '';
+  return /Macintosh|Mac OS X/u.test(ua) && !/iPhone|iPad|iPod/u.test(ua);
+}
+
 /**
  * Inline `;` alias-autocomplete trigger. Matches a single `;` that sits at a
  * word boundary (start of text or after whitespace) and is followed by ZERO or
@@ -1599,6 +1605,15 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   ), [activeSession]);
   // Internal ref for contenteditable — also written to the external inputRef
   const divRef = useRef<HTMLDivElement>(null);
+  // Safari/WebKit can route system Dictation through a native textarea rather
+  // than a contenteditable. Keep this rendered (not display:none) so the OS
+  // can target it, while the contenteditable remains the visible composer.
+  const nativeInputRef = useRef<HTMLTextAreaElement>(null);
+  const macNativeInput = isMacDesktopInputPlatform();
+  const hasSession = !!activeSession;
+  // Input only disabled when there's no session or the active share cannot
+  // dispatch messages. Declared before the native input callbacks below.
+  const inputDisabled = !hasSession || !canSharedSessionSend;
   const stopComposerResize = useCallback(() => {
     composerResizeCleanupRef.current?.();
     composerResizeCleanupRef.current = null;
@@ -1705,6 +1720,59 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const publishComposerText = useCallback((text: string) => {
     onComposerTextChange?.(text);
   }, [onComposerTextChange]);
+
+  const syncNativeComposerValue = useCallback((text: string, moveCaret = false) => {
+    const nativeInput = nativeInputRef.current;
+    if (!nativeInput) return;
+    const normalized = text.replace(/\r\n?/g, '\n');
+    if (nativeInput.value !== normalized) nativeInput.value = normalized;
+    if (moveCaret) {
+      try {
+        nativeInput.selectionStart = normalized.length;
+        nativeInput.selectionEnd = normalized.length;
+      } catch { /* jsdom or an unavailable selection surface */ }
+    }
+  }, []);
+
+  const focusNativeComposerInput = useCallback(() => {
+    const nativeInput = nativeInputRef.current;
+    const editor = divRef.current;
+    if (!nativeInput || !editor) return;
+    syncNativeComposerValue(readComposerElementText(editor), true);
+    nativeInput.focus({ preventScroll: true });
+  }, [syncNativeComposerValue]);
+
+  const handleNativeComposerInput = useCallback((event: Event) => {
+    const nativeInput = nativeInputRef.current;
+    const editor = divRef.current;
+    if (!nativeInput || !editor || inputDisabled) return;
+    const nextText = nativeInput.value.replace(/\r\n?/g, '\n');
+    if (readComposerElementText(editor) !== nextText) setComposerElementText(editor, nextText);
+    // Reuse the existing contenteditable input path so draft persistence,
+    // suggestions, mobile metrics and send state stay identical.
+    const source = event as InputEvent;
+    let forwarded: Event;
+    try {
+      forwarded = new InputEvent('input', {
+        bubbles: true,
+        inputType: source.inputType || 'insertText',
+        data: source.data ?? null,
+      });
+    } catch {
+      forwarded = new Event('input', { bubbles: true });
+    }
+    editor.dispatchEvent(forwarded);
+  }, [inputDisabled]);
+
+  const handleNativeComposerCompositionStart = useCallback(() => {
+    imeComposingRef.current = true;
+  }, []);
+
+  const handleNativeComposerCompositionEnd = useCallback(() => {
+    imeComposingRef.current = false;
+    const nativeInput = nativeInputRef.current;
+    if (nativeInput) nativeInput.dispatchEvent(new Event('input', { bubbles: true }));
+  }, []);
   // History navigation state
   const histIdxRef = useRef(-1);   // -1 = not navigating; 0 = most recent
   const draftRef = useRef('');      // saved unsent text while navigating
@@ -2021,7 +2089,6 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     }
   }, [activeSession?.agentType, activeSession?.qwenModel, qwenModel]);
 
-  const hasSession = !!activeSession;
   const canShowCloneGroupAction = !!activeSession
     && !subSessionId
     && !compact
@@ -2032,8 +2099,6 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     && !subSessionId
     && !compact
     && !!onToggleSessionPin;
-  // Input only disabled when there's no session or the active share cannot dispatch messages.
-  const inputDisabled = !hasSession || !canSharedSessionSend;
   const participantControlDisabled = !connected || !hasSession || !canSharedSessionSend;
   // A participant can use every session-scoped action except stopping the
   // session. Viewers and inactive shares remain read-only.
@@ -4510,6 +4575,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       pendingConfigOverrideRef.current = null;
       setPendingDelegateTarget(null);
       if (divRef.current) setComposerElementText(divRef.current, '');
+      syncNativeComposerValue('');
       setHasText(false);
       publishComposerText('');
       setMobileComposerExpanded(false);
@@ -4627,7 +4693,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       clearComposerState();
     }
     return localFailure ? 'rejected' : 'accepted';
-  }, [activeSession, attachmentDraftKey, cancelActiveTransportTurn, directAppendMode, draftKey, editingQueuedMessageId, effectiveRuntimeType, incomingQueuedTransportEntries, incomingQueuedTransportVersion, makeCommandId, onRemoveQuote, onSend, publishComposerText, quickData, queuedTransportEntries, quotes, sendQueuedMessageMutation, sendSessionMessage, showSendWarning, showStopFeedback, t, transportSendShouldQueue, uploading]);
+  }, [activeSession, attachmentDraftKey, cancelActiveTransportTurn, directAppendMode, draftKey, editingQueuedMessageId, effectiveRuntimeType, incomingQueuedTransportEntries, incomingQueuedTransportVersion, makeCommandId, onRemoveQuote, onSend, publishComposerText, quickData, queuedTransportEntries, quotes, sendQueuedMessageMutation, sendSessionMessage, showSendWarning, showStopFeedback, syncNativeComposerValue, t, transportSendShouldQueue, uploading]);
 
   const handleQueuedMessageEdit = useCallback((entry: { clientMessageId: string; text: string }) => {
     if (!isEditableQueuedEntry(entry)) return;
@@ -5220,6 +5286,9 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     if (window.scrollY !== 0) window.scrollTo(0, 0);
     if (document.documentElement.scrollTop !== 0) document.documentElement.scrollTop = 0;
     if (document.body.scrollTop !== 0) document.body.scrollTop = 0;
+    if (macNativeInput && document.activeElement !== nativeInputRef.current) {
+      focusNativeComposerInput();
+    }
   };
 
   const handleBlur = () => {
@@ -5655,6 +5724,17 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     aliasPasteSuppressRef.current = true;
     machinePasteSuppressRef.current = true;
     quickPhraseInputSuppressRef.current = true;
+    const nativeInput = nativeInputRef.current;
+    if (nativeInput && document.activeElement === nativeInput) {
+      const start = nativeInput.selectionStart ?? nativeInput.value.length;
+      const end = nativeInput.selectionEnd ?? start;
+      nativeInput.value = `${nativeInput.value.slice(0, start)}${text}${nativeInput.value.slice(end)}`;
+      nativeInput.selectionStart = start + text.length;
+      nativeInput.selectionEnd = start + text.length;
+      nativeInput.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertFromPaste', data: text }));
+      queueMicrotask(() => { quickPhraseInputSuppressRef.current = false; });
+      return;
+    }
     let inserted = false;
     try {
       inserted = document.execCommand('insertText', false, text);
@@ -7781,6 +7861,23 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
             onDragOver={handleFileDragOver}
             onDragLeave={handleFileDragLeave}
             onDrop={handleFileDrop}
+          />
+          <textarea
+            ref={nativeInputRef}
+            class="controls-native-input"
+            data-composer-native-input="true"
+            aria-hidden="true"
+            tabIndex={-1}
+            defaultValue=""
+            autoCapitalize="sentences"
+            spellcheck={false}
+            onFocus={handleFocus}
+            onBlur={handleBlur}
+            onInput={handleNativeComposerInput}
+            onCompositionStart={handleNativeComposerCompositionStart}
+            onCompositionEnd={handleNativeComposerCompositionEnd}
+            onKeyDown={handleKeyDown}
+            onPaste={handlePaste}
           />
           {embeddedComposerActionCount > 0 && (
             <div class="controls-composer-trailing-actions">
