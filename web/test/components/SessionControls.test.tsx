@@ -11431,12 +11431,19 @@ afterEach(() => {
       const native = document.querySelector('[data-composer-native-input="true"]') as HTMLTextAreaElement;
       input.focus();
       expect(document.activeElement).toBe(native);
+      expect(native.closest('.controls-composer')?.classList.contains('controls-composer-mac-native')).toBe(true);
       native.value = 'mac dictation';
       native.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: native.value }));
       expect(input.textContent).toBe('mac dictation');
     } finally {
       Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUserAgent });
     }
+  });
+
+  it('does not enable the native caret overlay for non-macOS browsers', () => {
+    render(<SessionControls ws={makeWs() as any} activeSession={makeSession({ name: 'non-mac-focus' })} quickData={makeQuickData() as any} />);
+    const native = document.querySelector('[data-composer-native-input="true"]') as HTMLTextAreaElement;
+    expect(native.closest('.controls-composer')?.classList.contains('controls-composer-mac-native')).toBe(false);
   });
 
   it('does not steal another focused field for a Dictation replacement', () => {
