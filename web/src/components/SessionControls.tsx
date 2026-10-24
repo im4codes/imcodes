@@ -26,7 +26,6 @@ import { SupervisionHeartbeatBadge } from './SupervisionHeartbeatBadge.js';
 import * as VoiceInput from './VoiceInput.js';
 import { VoiceOverlay } from './VoiceOverlay.js';
 import { INLINE_PASTE_TEXT_CHAR_LIMIT } from '../composer-inline-limit.js';
-import type { ComposerInputElement } from '../composer-input-value.js';
 import {
   buildNotepadInlineMessage,
   buildNotepadTranscriptFileName,
@@ -260,7 +259,7 @@ interface Props {
   activeSession: SessionInfo | null;
   /** React-owned browser/server WS state. Prefer this over ws.connected, which can change without a render. */
   connected?: boolean;
-  inputRef?: RefObject<ComposerInputElement>;
+  inputRef?: RefObject<HTMLDivElement>;
   /** Called after each shortcut/action button click — use to restore focus to xterm on desktop. */
   onAfterAction?: () => void;
   /** Called when stop is confirmed — immediately removes tab from state. */
@@ -1604,11 +1603,10 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const isEditableQueuedEntry = useCallback((entry: { clientMessageId: string }) => (
     !!activeSession && !!entry.clientMessageId
   ), [activeSession]);
-  // Internal ref for contenteditable — also written to the external inputRef
+  // Internal ref for contenteditable. On macOS the native textarea below is
+  // the actual keyboard/text-input host; the contenteditable remains a hidden
+  // compatibility mirror so the existing draft/send pipeline stays shared.
   const divRef = useRef<HTMLDivElement>(null);
-  // Safari/WebKit can route system Dictation through a native textarea rather
-  // than a contenteditable. Keep this rendered (not display:none) so the OS
-  // can target it, while the contenteditable remains the visible composer.
   const nativeInputRef = useRef<HTMLTextAreaElement>(null);
   const macNativeInput = isMacDesktopInputPlatform();
   const hasSession = !!activeSession;
@@ -1743,6 +1741,11 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     nativeInput.focus({ preventScroll: true });
   }, [syncNativeComposerValue]);
 
+  const focusComposerInput = useCallback(() => {
+    if (macNativeInput) focusNativeComposerInput();
+    else divRef.current?.focus();
+  }, [focusNativeComposerInput, macNativeInput]);
+
   const handleNativeComposerInput = useCallback((event: Event) => {
     const nativeInput = nativeInputRef.current;
     const editor = divRef.current;
@@ -1774,6 +1777,20 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     const nativeInput = nativeInputRef.current;
     if (nativeInput) nativeInput.dispatchEvent(new Event('input', { bubbles: true }));
   }, []);
+
+  // Programmatic history/prefill/quick-action updates write the compatibility
+  // editor directly. Keep the visible macOS textarea in lockstep without
+  // synthesizing input events (which would duplicate sends or suggestions).
+  useEffect(() => {
+    if (!macNativeInput) return;
+    const editor = divRef.current;
+    if (!editor) return;
+    const sync = () => syncNativeComposerValue(readComposerElementText(editor));
+    sync();
+    const observer = new MutationObserver(sync);
+    observer.observe(editor, { childList: true, subtree: true, characterData: true });
+    return () => observer.disconnect();
+  }, [macNativeInput, syncNativeComposerValue]);
   // History navigation state
   const histIdxRef = useRef(-1);   // -1 = not navigating; 0 = most recent
   const draftRef = useRef('');      // saved unsent text while navigating
@@ -1835,7 +1852,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   useEffect(() => {
     if (inputRef) {
       const target = macNativeInput ? nativeInputRef.current : divRef.current;
-      (inputRef as RefObject<ComposerInputElement>).current = target as ComposerInputElement | null;
+      (inputRef as { current: HTMLDivElement | null }).current = target as HTMLDivElement | null;
     }
   }, [inputRef, macNativeInput]);
 
@@ -1891,7 +1908,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     setHasText(!!nextText.trim());
     publishComposerText(nextText);
     divRef.current.dispatchEvent(new Event('input', { bubbles: true }));
-    divRef.current.focus();
+    focusComposerInput();
     try {
       const sel = window.getSelection();
       const range = document.createRange();
@@ -1901,7 +1918,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       sel?.addRange(range);
     } catch { /* ignore selection API failures */ }
     onPendingPrefillApplied?.();
-  }, [closeQuickSuggestions, pendingPrefillText, onPendingPrefillApplied, publishComposerText]);
+  }, [closeQuickSuggestions, focusComposerInput, pendingPrefillText, onPendingPrefillApplied, publishComposerText]);
 
   const clearSendWarning = useCallback(() => {
     if (sendWarningTimerRef.current) {
@@ -3206,7 +3223,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       range.collapse(false);
       sel?.removeAllRanges();
       sel?.addRange(range);
-      divRef.current.focus();
+      focusComposerInput();
     }
     setHasText(!!text.trim());
     publishComposerText(text);
@@ -3234,7 +3251,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     const before = current.replace(/(?:^|\s)\$[a-z0-9._-]*$/iu, (match) => match.startsWith(' ') ? ' ' : '');
     fillInput(`${before}${before && !before.endsWith(' ') ? ' ' : ''}${buildAgentSkillMarker(skill)} `);
     closeQuickSuggestions();
-  }, [closeQuickSuggestions]);
+  }, [closeQuickSuggestions, focusComposerInput]);
 
   const appendToInput = (paths: string[]) => {
     if (!paths.length) return;
@@ -3251,7 +3268,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       range.collapse(false);
       sel?.removeAllRanges();
       sel?.addRange(range);
-      divRef.current.focus();
+      focusComposerInput();
     }
     setHasText(true);
     publishComposerText(nextText);
@@ -5717,7 +5734,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         const uploaded = await uploadAttachmentFiles([textFile]);
         if (uploaded) {
           showSendWarning(t('upload.long_text_attached', { name: fileName }));
-          divRef.current?.focus();
+          focusComposerInput();
         }
       })();
       return;
@@ -5762,14 +5779,12 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const handleComposerBeforeInput = (event: Event): void => {
     const input = event as InputEvent;
     if (event.defaultPrevented) return;
-    // On macOS the native textarea is the source of truth for ordinary
-    // dictation/typing. WebKit can still echo the same edit as a contenteditable
-    // beforeinput; allowing the fallback to inject insertText there appends the
-    // native text a second time. Replacement/dictation events remain supported
-    // for browsers that do not mutate the editor themselves.
-    const supportedInputTypes = macNativeInput
-      ? new Set(['insertReplacementText', 'insertFromDictation'])
-      : new Set(['insertText', 'insertCompositionText', 'insertReplacementText', 'insertFromDictation']);
+    const supportedInputTypes = new Set([
+      'insertText',
+      'insertCompositionText',
+      'insertReplacementText',
+      'insertFromDictation',
+    ]);
     if (!supportedInputTypes.has(input.inputType)) return;
     const editor = divRef.current;
     if (!editor || inputDisabled) return;
@@ -7219,7 +7234,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
               onMouseDown={(e) => e.preventDefault()}
               onClick={() => {
                 setMobileComposerExpanded((prev) => !prev);
-                setTimeout(() => divRef.current?.focus(), 0);
+                setTimeout(() => focusComposerInput(), 0);
               }}
               title={mobileComposerExpanded ? 'collapse composer' : 'expand composer'}
               aria-label={mobileComposerExpanded ? 'collapse composer' : 'expand composer'}
@@ -7702,9 +7717,10 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
             class={`controls-input${inputDisabled ? ' controls-input-disabled' : ''}${p2pMode !== 'solo' ? ' controls-input-p2p' : ''}${embeddedComposerActionCount > 0 ? ` controls-input-with-trailing controls-input-with-trailing-${embeddedComposerActionCount}` : ''}${fileDragActive ? ' controls-input-file-drag-over' : ''}`}
             data-onboarding="chat-input"
             contenteditable={inputDisabled ? 'false' : 'true'}
-            role="textbox"
-            aria-multiline="true"
-            aria-label="Message input"
+            role={macNativeInput ? undefined : 'textbox'}
+            aria-hidden={macNativeInput ? 'true' : undefined}
+            aria-multiline={macNativeInput ? undefined : 'true'}
+            aria-label={macNativeInput ? undefined : 'Message input'}
             inputmode="text"
             autocapitalize="sentences"
             data-placeholder={placeholder}
@@ -7872,8 +7888,12 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
             ref={nativeInputRef}
             class="controls-native-input"
             data-composer-native-input="true"
-            aria-hidden="true"
-            tabIndex={-1}
+            role={macNativeInput ? 'textbox' : undefined}
+            aria-hidden={macNativeInput ? undefined : 'true'}
+            aria-multiline={macNativeInput ? 'true' : undefined}
+            aria-label={macNativeInput ? 'Message input' : undefined}
+            tabIndex={macNativeInput ? 0 : -1}
+            placeholder={macNativeInput ? placeholder : undefined}
             defaultValue=""
             autoCapitalize="sentences"
             spellcheck={false}
