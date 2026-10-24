@@ -13,6 +13,7 @@ import type {
 } from '../transport-provider.js';
 import { CONNECTION_MODES, SESSION_OWNERSHIP, PROVIDER_ERROR_CODES, normalizeProviderPayload, BACKGROUND_SUBAGENT_WAKE_MODES } from '../transport-provider.js';
 import { normalizeTransportCwd, resolveExecutableForSpawn } from '../transport-paths.js';
+import { buildClaudeAgentEnv } from '../env-isolation.js';
 import { gateChildStream } from '../../util/event-loop-backpressure.js';
 import { composeMessageSideProviderPrompt, getProviderSystemTextParts } from '../provider-context-routing.js';
 import { CLAUDE_CODE_CLI_SDK_AGENT_TYPE } from '../../../shared/agent-types.js';
@@ -166,7 +167,11 @@ export class ClaudeCodeCliSdkProvider implements TransportProvider {
     s.busy = true; s.cancelled = false; s.text = ''; s.messageId = randomUUID();
     const args = [...CLAUDE_CODE_CLI_SDK_ARGS, ...(s.model ? ['--model', s.model] : []), ...(s.started ? ['--resume', s.resumeId] : [])];
     const resolved = resolveExecutableForSpawn((this.config?.binary as string | undefined) ?? 'claude');
-    const child = spawn(resolved.executable, [...resolved.prependArgs, ...args], { cwd: s.cwd, detached: process.platform !== 'win32', env: { ...process.env, ...(this.config?.env as Record<string, string> | undefined), ...(s.env ?? {}) }, stdio: ['pipe', 'pipe', 'pipe'], shell: false, windowsHide: true });
+    // Never inherit the daemon's ambient environment. Claude's child may only
+    // receive explicitly scoped Claude variables, safe runtime variables, and
+    // the verified auth UDS projection from buildClaudeAgentEnv.
+    const childEnv = buildClaudeAgentEnv({ ...(this.config?.env as Record<string, string> | undefined), ...(s.env ?? {}) });
+    const child = spawn(resolved.executable, [...resolved.prependArgs, ...args], { cwd: s.cwd, detached: process.platform !== 'win32', env: childEnv, stdio: ['pipe', 'pipe', 'pipe'], shell: false, windowsHide: true });
     s.child = child; s.agentResource = bindAgentProcessResource(s.resourceOwner ?? null, child);
     const emitDelta = (text: string) => { if (!text || s.cancelled) return; s.text += text; this.deltaCallbacks.forEach((cb) => cb(id, { messageId: s.messageId, type: 'text', delta: text, role: 'assistant' })); };
     const finish = (metadata?: Record<string, unknown>) => {

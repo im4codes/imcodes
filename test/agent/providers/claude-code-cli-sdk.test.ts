@@ -37,7 +37,7 @@ printf '%s\\n' '{"type":"result","result":"Hello"}'
       expect(provider.id).toBe('claude-code-cli-sdk');
       expect(CLAUDE_CODE_CLI_SDK_ARGS).toContain('--permission-mode');
       expect(CLAUDE_CODE_CLI_SDK_ARGS).toContain('bypassPermissions');
-      await provider.connect({ binary: script, env: { CC_CLI_TEST: '1' } });
+      await provider.connect({ binary: script });
       const deltas: string[] = [];
       const infos: string[] = [];
       const done = new Promise<{ content: string }>((resolve, reject) => {
@@ -60,16 +60,15 @@ printf '%s\\n' '{"type":"result","result":"Hello"}'
   it('delivers normalized session and turn context to the CLI while keeping slash controls clean', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'imcodes-cc-cli-context-'));
     const script = join(dir, 'fake-claude');
-    const capture = join(dir, 'input.jsonl');
     await writeFile(script, `#!/bin/sh
 IFS= read -r line
-printf '%s' "$line" > "$CC_CLI_CAPTURE"
+printf '%s' "$line" > "$PWD/input.jsonl"
 printf '%s\\n' '{"type":"result","result":"ok"}'
 `, 'utf8');
     await chmod(script, 0o755);
     try {
       const provider = new ClaudeCodeCliSdkProvider();
-      await provider.connect({ binary: script, env: { CC_CLI_CAPTURE: capture } });
+      await provider.connect({ binary: script });
       const done = new Promise<void>((resolve, reject) => {
         provider.onComplete(() => resolve());
         provider.onError((_id, error) => reject(new Error(error.message)));
@@ -82,7 +81,7 @@ printf '%s\\n' '{"type":"result","result":"ok"}'
       const id = await provider.createSession({ sessionKey: 'context-session', cwd: dir });
       await provider.send(id, payload);
       await expect(done).resolves.toBeUndefined();
-      const frame = JSON.parse(await readFile(capture, 'utf8')) as { message?: { content?: string } };
+      const frame = JSON.parse(await readFile(join(dir, 'input.jsonl'), 'utf8')) as { message?: { content?: string } };
       expect(frame.message?.content).toContain('stable session guidance');
       expect(frame.message?.content).toContain('turn-specific MCP guidance');
       expect(frame.message?.content).toContain('hello context');
@@ -92,7 +91,7 @@ printf '%s\\n' '{"type":"result","result":"ok"}'
       });
       await provider.send(id, '/compact');
       await expect(slashDone).resolves.toBeUndefined();
-      const slashFrame = JSON.parse(await readFile(capture, 'utf8')) as { message?: { content?: string } };
+      const slashFrame = JSON.parse(await readFile(join(dir, 'input.jsonl'), 'utf8')) as { message?: { content?: string } };
       expect(slashFrame.message?.content).toBe('/compact');
       await provider.disconnect();
     } finally {
@@ -103,21 +102,19 @@ printf '%s\\n' '{"type":"result","result":"ok"}'
   it('re-sends stable context after a child failure before input acceptance', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'imcodes-cc-cli-retry-'));
     const script = join(dir, 'fake-claude');
-    const capture = join(dir, 'input.jsonl');
-    const count = join(dir, 'count');
     await writeFile(script, `#!/bin/sh
 IFS= read -r line
 count=0
-[ -f "$CC_CLI_COUNT" ] && count=$(cat "$CC_CLI_COUNT")
-count=$((count + 1)); printf '%s' "$count" > "$CC_CLI_COUNT"
-printf '%s' "$line" > "$CC_CLI_CAPTURE"
+[ -f "$PWD/count" ] && count=$(cat "$PWD/count")
+count=$((count + 1)); printf '%s' "$count" > "$PWD/count"
+printf '%s' "$line" > "$PWD/input.jsonl"
 [ "$count" -eq 1 ] && exit 1
 printf '%s\\n' '{"type":"result","result":"retry-ok"}'
 `, 'utf8');
     await chmod(script, 0o755);
     try {
       const provider = new ClaudeCodeCliSdkProvider();
-      await provider.connect({ binary: script, env: { CC_CLI_CAPTURE: capture, CC_CLI_COUNT: count } });
+      await provider.connect({ binary: script });
       const firstError = new Promise<void>((resolve) => provider.onError(() => resolve()));
       const id = await provider.createSession({ sessionKey: 'retry-session', cwd: dir });
       const payload = normalizeProviderPayload('retry context');
@@ -133,7 +130,7 @@ printf '%s\\n' '{"type":"result","result":"retry-ok"}'
       });
       await provider.send(id, payload);
       await expect(secondDone).resolves.toBeUndefined();
-      const frame = JSON.parse(await readFile(capture, 'utf8')) as { message?: { content?: string } };
+      const frame = JSON.parse(await readFile(join(dir, 'input.jsonl'), 'utf8')) as { message?: { content?: string } };
       expect(frame.message?.content).toContain('stable retry guidance');
       expect(frame.message?.content).toContain('retry MCP guidance');
       await provider.disconnect();
@@ -161,6 +158,44 @@ printf '%s\\n' '{"type":"result","result":"result-only-content"}'
       await expect(done).resolves.toBe('result-only-content');
       await provider.disconnect();
     } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('filters ambient unrelated secrets while preserving explicit Claude env in a real child process', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'imcodes-cc-cli-env-'));
+    const script = join(dir, 'fake-claude');
+    await writeFile(script, `#!/bin/sh
+env > "$PWD/env.txt"
+printf '%s\\n' '{"type":"result","result":"env-ok"}'
+`, 'utf8');
+    await chmod(script, 0o755);
+    const previousOpenAi = process.env.OPENAI_API_KEY;
+    const previousGemini = process.env.GEMINI_API_KEY;
+    const previousSecret = process.env.UNRELATED_SENTINEL_SECRET;
+    process.env.OPENAI_API_KEY = 'openai-sentinel';
+    process.env.GEMINI_API_KEY = 'gemini-sentinel';
+    process.env.UNRELATED_SENTINEL_SECRET = 'unrelated-sentinel';
+    try {
+      const provider = new ClaudeCodeCliSdkProvider();
+      await provider.connect({ binary: script, env: { ANTHROPIC_BASE_URL: 'https://claude.example.test' } });
+      const done = new Promise<void>((resolve, reject) => {
+        provider.onComplete(() => resolve());
+        provider.onError((_id, error) => reject(new Error(error.message)));
+      });
+      const id = await provider.createSession({ sessionKey: 'env-isolation-session', cwd: dir });
+      await provider.send(id, 'check env');
+      await expect(done).resolves.toBeUndefined();
+      const childEnv = await readFile(join(dir, 'env.txt'), 'utf8');
+      expect(childEnv).toContain('ANTHROPIC_BASE_URL=https://claude.example.test');
+      expect(childEnv).not.toContain('OPENAI_API_KEY=');
+      expect(childEnv).not.toContain('GEMINI_API_KEY=');
+      expect(childEnv).not.toContain('UNRELATED_SENTINEL_SECRET=');
+      await provider.disconnect();
+    } finally {
+      if (previousOpenAi === undefined) delete process.env.OPENAI_API_KEY; else process.env.OPENAI_API_KEY = previousOpenAi;
+      if (previousGemini === undefined) delete process.env.GEMINI_API_KEY; else process.env.GEMINI_API_KEY = previousGemini;
+      if (previousSecret === undefined) delete process.env.UNRELATED_SENTINEL_SECRET; else process.env.UNRELATED_SENTINEL_SECRET = previousSecret;
       await rm(dir, { recursive: true, force: true });
     }
   });
