@@ -25,6 +25,7 @@ import { ContextDiagnosticsPanel } from './ContextDiagnosticsPanel.js';
 import { resolveEffectiveSessionModel } from '@shared/session-model.js';
 import { resolveTimelineBackedSessionState } from '../session-live-status.js';
 import { FS_SESSION_ROOT_PATH } from '../../../src/shared/transport/fs.js';
+import { readComposerInputValue, writeComposerInputValue } from '../composer-input-value.js';
 
 export const LOCAL_WEB_PREVIEW_PANEL_TYPE = 'localwebpreview';
 export const SHARED_CONTEXT_MANAGEMENT_PANEL_TYPE = 'sharedcontext-management';
@@ -197,7 +198,7 @@ registerPanelType('filebrowser', {
             const rel = projectDir
               ? paths.map((p) => '@' + (p.startsWith(projectDir + '/') ? p.slice(projectDir.length + 1) : p) + ' ')
               : paths.map((p) => '@' + p + ' ');
-            inputEl.textContent = (inputEl.textContent || '') + rel.join('');
+            writeComposerInputValue(inputEl, `${readComposerInputValue(inputEl)}${rel.join('')}`);
             inputEl.dispatchEvent(new Event('input', { bubbles: true }));
             inputEl.focus();
           }

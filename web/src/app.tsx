@@ -306,6 +306,8 @@ import {
 import { looselyEqual, markSessionRunningIfNeeded, updateSessionIfChanged } from './session-state-updates.js';
 import { createMapUpdateBatcher, type MapUpdateBatcher } from './map-update-batcher.js';
 import { useStructuralIdentity } from './hooks/useStructuralIdentity.js';
+import type { ComposerInputElement } from './composer-input-value.js';
+import { readComposerInputValue, writeComposerInputValue } from './composer-input-value.js';
 import { CapabilityOperationNotice } from './components/CapabilityOperationNotice.js';
 import { RemoteDesktopWindowBlockedNotice } from './components/RemoteDesktopWindowBlockedNotice.js';
 import {
@@ -328,7 +330,13 @@ const DashboardPage = lazy(() => lazyImportWithAppUpdateNotice(() => import('./p
 const DiscussionsPage = lazy(() => lazyImportWithAppUpdateNotice(() => import('./pages/DiscussionsPage.js')).then((m) => ({ default: m.DiscussionsPage })));
 const UsageSummaryPage = lazy(() => lazyImportWithAppUpdateNotice(() => import('./pages/UsageSummaryPage.js')).then((m) => ({ default: m.UsageSummaryPage })));
 
-function appendContentEditableTextPreservingNewlines(element: HTMLElement, suffix: string): void {
+function appendContentEditableTextPreservingNewlines(element: ComposerInputElement, suffix: string): void {
+  if (element.tagName === 'TEXTAREA') {
+    writeComposerInputValue(element, `${readComposerInputValue(element)}${suffix}`.replace(/\r\n?/g, '\n'));
+    element.dispatchEvent(new Event('input', { bubbles: true }));
+    element.focus();
+    return;
+  }
   const parts: string[] = [];
   const appendNewline = () => {
     if (parts.length === 0 || parts[parts.length - 1] !== '\n') parts.push('\n');
@@ -352,7 +360,7 @@ function appendContentEditableTextPreservingNewlines(element: HTMLElement, suffi
   };
   element.childNodes.forEach(walk);
   const current = parts.join('').replace(/\n+$/g, '');
-  element.textContent = `${current}${suffix}`.replace(/\r\n?/g, '\n');
+  writeComposerInputValue(element, `${current}${suffix}`.replace(/\r\n?/g, '\n'));
   element.dispatchEvent(new Event('input', { bubbles: true }));
   element.focus();
 }
@@ -3673,7 +3681,7 @@ export function App() {
   const diffApplyersRef = useRef(new TerminalDiffRegistry());
   const historyApplyersRef = useRef<Map<string, (content: string) => void>>(new Map());
   // Per-session input refs (chat input element in SessionPane) — used by global keyboard handler
-  const inputRefsMap = useRef<Map<string, HTMLDivElement>>(new Map());
+  const inputRefsMap = useRef<Map<string, ComposerInputElement>>(new Map());
   const termFocusFnsRef = useRef<Map<string, () => void>>(new Map());
   const termFitFnsRef = useRef<Map<string, () => void>>(new Map());
   const termScrollFnsRef = useRef<Map<string, () => void>>(new Map());

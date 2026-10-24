@@ -26,6 +26,7 @@ import { SupervisionHeartbeatBadge } from './SupervisionHeartbeatBadge.js';
 import * as VoiceInput from './VoiceInput.js';
 import { VoiceOverlay } from './VoiceOverlay.js';
 import { INLINE_PASTE_TEXT_CHAR_LIMIT } from '../composer-inline-limit.js';
+import type { ComposerInputElement } from '../composer-input-value.js';
 import {
   buildNotepadInlineMessage,
   buildNotepadTranscriptFileName,
@@ -259,7 +260,7 @@ interface Props {
   activeSession: SessionInfo | null;
   /** React-owned browser/server WS state. Prefer this over ws.connected, which can change without a render. */
   connected?: boolean;
-  inputRef?: RefObject<HTMLDivElement>;
+  inputRef?: RefObject<ComposerInputElement>;
   /** Called after each shortcut/action button click — use to restore focus to xterm on desktop. */
   onAfterAction?: () => void;
   /** Called when stop is confirmed — immediately removes tab from state. */
@@ -1832,8 +1833,11 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
 
   // Keep external inputRef in sync so parent can call .focus()
   useEffect(() => {
-    if (inputRef) (inputRef as { current: HTMLDivElement | null }).current = divRef.current;
-  });
+    if (inputRef) {
+      const target = macNativeInput ? nativeInputRef.current : divRef.current;
+      (inputRef as RefObject<ComposerInputElement>).current = target as ComposerInputElement | null;
+    }
+  }, [inputRef, macNativeInput]);
 
   useEffect(() => {
     const el = divRef.current;

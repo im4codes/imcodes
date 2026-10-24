@@ -30,6 +30,8 @@ import { useSharedGitChanges } from '../git-status-store.js';
 import type { WsClient } from '../ws-client.js';
 import type { TerminalDiff, SessionInfo } from '../types.js';
 import type { SharedStateSummary } from '../tab-sharing-ui.js';
+import type { ComposerInputElement } from '../composer-input-value.js';
+import { readComposerInputValue, writeComposerInputValue } from '../composer-input-value.js';
 import type { SubSession } from '../hooks/useSubSessions.js';
 import { extractLatestUsage } from '../usage-data.js';
 import { IdleFlashLayer } from './IdleFlashLayer.js';
@@ -482,7 +484,7 @@ export function SubSessionWindow({
   const [maximizeBoundsVersion, setMaximizeBoundsVersion] = useState(0);
   // confirmClose removed — × now minimizes instead of terminating
 
-  const inputRef = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<ComposerInputElement>(null);
   const fileDropTargetRef = useRef<HTMLDivElement>(null);
   const termFitFnRef = useRef<(() => void) | null>(null);
   const geomRef = useRef(geom);
@@ -646,14 +648,14 @@ export function SubSessionWindow({
     ? t('chat.execution_clone_run_offline')
     : !hasValidExecutionTemplate
       ? t('chat.execution_clone_run_no_template')
-      : !(composerText.trim() || inputRef.current?.textContent?.trim())
+      : !(composerText.trim() || readComposerInputValue(inputRef.current).trim())
         ? t('chat.execution_clone_run_empty')
         : t('chat.execution_clone_run_with_template', {
             count: executionCloneCount,
             name: executionTemplateDisplayName,
           });
   const handleRunExecutionClones = useCallback(() => {
-    const text = (inputRef.current?.textContent ?? composerText).trim();
+    const text = (readComposerInputValue(inputRef.current) || composerText).trim();
     if (!ws || !connected || !hasValidExecutionTemplate || !executionRouting.templateSessionName || !text) return;
     // Alias A′ scope boundary (Cx1-2): the composer text is wrapped into a
     // generated worker prompt (buildGenericExecutionCloneWorkerPrompt) and
@@ -1135,7 +1137,7 @@ export function SubSessionWindow({
             || !connected
             || !ws
             || !hasValidExecutionTemplate
-            || !(composerText.trim() || inputRef.current?.textContent?.trim())
+            || !(composerText.trim() || readComposerInputValue(inputRef.current).trim())
           }
           runExecutionClonesTitle={runExecutionClonesTitle}
           runExecutionClonesCount={executionCloneCount}
@@ -1261,7 +1263,7 @@ export function SubSessionWindow({
                   : paths.map((p) => '@' + p + ' ');
                 const inputEl = inputRef.current;
                 if (inputEl) {
-                  inputEl.textContent = (inputEl.textContent || '') + rel.join('');
+                  writeComposerInputValue(inputEl, `${readComposerInputValue(inputEl)}${rel.join('')}`);
                   inputEl.dispatchEvent(new Event('input', { bubbles: true }));
                   inputEl.focus();
                 }
@@ -1299,7 +1301,7 @@ export function SubSessionWindow({
                   : paths.map((p) => '@' + p + ' ');
                 const inputEl = inputRef.current;
                 if (inputEl) {
-                  inputEl.textContent = (inputEl.textContent || '') + rel.join('');
+                  writeComposerInputValue(inputEl, `${readComposerInputValue(inputEl)}${rel.join('')}`);
                   inputEl.dispatchEvent(new Event('input', { bubbles: true }));
                   inputEl.focus();
                 }
