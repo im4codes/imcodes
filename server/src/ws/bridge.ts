@@ -6528,7 +6528,7 @@ export class WsBridge {
         const pushType = msg.type as string;
         if (pushType === 'session.idle') {
           this.scheduleIdleEventPush(db, env, msg);
-        } else if (pushType === 'session.notification' || pushType === 'session.error') {
+        } else if (pushType === 'session.error') {
           this.dispatchEventPush(db, env, msg).catch((err) =>
             logger.error({ err }, 'Push dispatch failed'),
           );
@@ -6540,6 +6540,8 @@ export class WsBridge {
             this.dispatchEventPush(db, env, {
               type: 'ask.question',
               session: event.sessionId ?? '',
+              eventId: event.eventId,
+              eventTs: event.ts,
               ...event.payload as Record<string, unknown>,
             }).catch((err) => logger.error({ err }, 'Push dispatch failed'));
           }
@@ -6567,6 +6569,8 @@ export class WsBridge {
               type: 'session.idle',
               session: event.sessionId ?? '',
               lastText: (msg as Record<string, unknown>).lastText ?? '',
+              eventId: event.eventId,
+              eventTs: event.ts,
             });
           }
         }
@@ -13794,9 +13798,15 @@ export class WsBridge {
 
   // ── Push notifications ──────────────────────────────────────────────────────
 
-  /** Dedup: last push timestamp per session to avoid duplicate notifications. */
-  private lastPushAt = new Map<string, number>();
-  private static readonly PUSH_DEDUP_MS = 10_000;
+  /**
+   * Completion/event identities already handed to dispatchPush.  Unlike the
+   * legacy time window this survives reconnects and hook/timeline replay while
+   * still allowing two turns with identical text (their assistant event ids
+   * differ) to notify independently.
+   */
+  private deliveredPushKeys = new Map<string, number>();
+  private inFlightPushKeys = new Set<string>();
+  private static readonly PUSH_KEY_TTL_MS = 24 * 60 * 60 * 1_000;
 
   private async resolveReadablePushDisplay(
     db: Database,
@@ -13934,24 +13944,40 @@ export class WsBridge {
     this.pendingIdlePushes.set(key, { timer, db, env, msg: mergedMsg });
   }
 
-  private resolveLatestAssistantTextForPush(sessionName: string, daemonLastText: string): string {
+  private resolveLatestAssistantForPush(sessionName: string, daemonLastText: string): { text: string; eventId?: string } {
     const rows = this.recentTextBySession.get(sessionName) ?? [];
     for (let i = rows.length - 1; i >= 0; i -= 1) {
       const row = rows[i];
-      if (row.type === 'assistant.text') return row.text.slice(0, 200);
-      if (row.type === 'user.message') return '';
+      if (row.type === 'assistant.text') return { text: row.text.slice(0, 200), eventId: row.eventId };
+      if (row.type === 'user.message') return { text: '' };
     }
-    return daemonLastText;
+    return { text: daemonLastText };
+  }
+
+  private pushIdentity(msg: Record<string, unknown>, eventType: string, sessionName: string, body: string, assistantEventId?: string): string {
+    const markerKeys = ['eventId', 'turnId', 'turn_id', 'completionId', 'completion_id', 'runId', 'run_id', 'requestId'];
+    for (const key of markerKeys) {
+      const marker = msg[key];
+      if (typeof marker === 'string' && marker.trim()) {
+        return `${eventType}:${sessionName}:marker:${marker.trim()}`;
+      }
+    }
+    if (assistantEventId) return `${eventType}:${sessionName}:assistant:${assistantEventId}`;
+    const eventTs = msg.eventTs ?? msg.ts;
+    if (typeof eventTs === 'number' && Number.isFinite(eventTs)) {
+      return `${eventType}:${sessionName}:ts:${eventTs}:${body}`;
+    }
+    return `${eventType}:${sessionName}:body:${body}`;
+  }
+
+  private wasPushDelivered(key: string, now: number): boolean {
+    for (const [knownKey, at] of this.deliveredPushKeys) {
+      if (now - at > WsBridge.PUSH_KEY_TTL_MS) this.deliveredPushKeys.delete(knownKey);
+    }
+    return this.deliveredPushKeys.has(key) || this.inFlightPushKeys.has(key);
   }
 
   private async dispatchEventPush(db: Database, env: Env, msg: Record<string, unknown>): Promise<void> {
-    // Dedup: same session idle/error can fire from both hook and timeline paths
-    const sessionKey = `${msg.type}:${msg.session ?? msg.sessionId ?? ''}`;
-    const now = Date.now();
-    const lastPush = this.lastPushAt.get(sessionKey);
-    if (lastPush && now - lastPush < WsBridge.PUSH_DEDUP_MS) return;
-    this.lastPushAt.set(sessionKey, now);
-
     const server = await db.queryOne<{ user_id: string; name: string }>('SELECT user_id, name FROM servers WHERE id = $1', [this.serverId]);
     if (!server) return;
 
@@ -13978,20 +14004,16 @@ export class WsBridge {
     const titleParts = [server.name, displayName];
     if (agentType) titleParts.push(agentType);
     const daemonLastText = String(msg.lastText ?? '').slice(0, 200);
-    const messageText = String(msg.message ?? '').slice(0, 200);
 
     let title: string;
     let body: string;
+    let assistantEventId: string | undefined;
     switch (eventType) {
       case 'session.idle':
         title = titleParts.join(' · ');
-        body = this.resolveLatestAssistantTextForPush(sessionName, daemonLastText) || 'Task complete — ready for input';
+        ({ text: body, eventId: assistantEventId } = this.resolveLatestAssistantForPush(sessionName, daemonLastText));
+        body = body || 'Task complete — ready for input';
         break;
-      case 'session.notification': {
-        title = titleParts.join(' · ');
-        body = messageText || 'Notification';
-        break;
-      }
       case 'session.error':
         title = titleParts.join(' · ');
         body = `Error: ${String(msg.error ?? 'unknown')}`;
@@ -14004,12 +14026,25 @@ export class WsBridge {
         return;
     }
 
-    await dispatchPush({
-      userId: server.user_id,
-      title,
-      body,
-      data: { serverId: this.serverId, session: sessionName, type: eventType },
-    }, env);
+    const pushKey = this.pushIdentity(msg, eventType, sessionName, body, assistantEventId);
+    const now = Date.now();
+    if (this.wasPushDelivered(pushKey, now)) return;
+    // Mark before awaiting the provider so concurrent hook/timeline events
+    // cannot both increment badge_count. A dispatch attempt is intentionally
+    // retained as delivered even when a provider later rejects it: dispatchPush
+    // owns token cleanup and badge semantics for that attempt.
+    this.inFlightPushKeys.add(pushKey);
+    try {
+      await dispatchPush({
+        userId: server.user_id,
+        title,
+        body,
+        data: { serverId: this.serverId, session: sessionName, type: eventType },
+      }, env);
+      this.deliveredPushKeys.set(pushKey, now);
+    } finally {
+      this.inFlightPushKeys.delete(pushKey);
+    }
   }
 
   private extractAskQuestionBody(msg: Record<string, unknown>): string {

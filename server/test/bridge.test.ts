@@ -7580,6 +7580,66 @@ describe('WsBridge', () => {
       expect(payload.body).toContain('ready for input');
     });
 
+    it('does not send ordinary session.notification events to mobile push', async () => {
+      const { dispatchPush } = await import('../src/routes/push.js');
+      const { daemonWs } = await setupPushBridge();
+
+      daemonWs.emit('message', JSON.stringify({
+        type: 'session.notification', session: 'deck_cd_brain', message: 'streaming chunk',
+      }));
+      await flushAsync();
+
+      expect(dispatchPush).not.toHaveBeenCalled();
+    });
+
+    it('deduplicates timeline and hook idle events for one assistant completion', async () => {
+      const { dispatchPush } = await import('../src/routes/push.js');
+      const { daemonWs } = await setupPushBridge();
+
+      daemonWs.emit('message', JSON.stringify({
+        type: 'timeline.event',
+        event: {
+          sessionId: 'deck_cd_brain', eventId: 'assistant-final-1', ts: Date.now(),
+          type: 'assistant.text', payload: { text: 'Completed once.', streaming: false },
+        },
+      }));
+      daemonWs.emit('message', JSON.stringify({
+        type: 'timeline.event',
+        event: {
+          sessionId: 'deck_cd_brain', eventId: 'idle-timeline-1', ts: Date.now(),
+          type: 'session.state', payload: { state: 'idle' },
+        },
+      }));
+      daemonWs.emit('message', JSON.stringify({
+        type: 'session.idle', session: 'deck_cd_brain', lastText: 'Completed once.',
+      }));
+      await flushAsync();
+
+      expect(dispatchPush).toHaveBeenCalledTimes(1);
+      expect(vi.mocked(dispatchPush).mock.calls[0][0].body).toBe('Completed once.');
+    });
+
+    it('allows identical text from distinct assistant event ids in different turns', async () => {
+      const { dispatchPush } = await import('../src/routes/push.js');
+      const { daemonWs } = await setupPushBridge();
+
+      for (const [eventId, ts] of [['assistant-turn-1', 1], ['assistant-turn-2', 2]] as const) {
+        daemonWs.emit('message', JSON.stringify({
+          type: 'timeline.event',
+          event: {
+            sessionId: 'deck_cd_brain', eventId, ts,
+            type: 'assistant.text', payload: { text: 'No changes needed.', streaming: false },
+          },
+        }));
+        daemonWs.emit('message', JSON.stringify({
+          type: 'session.idle', session: 'deck_cd_brain', lastText: 'No changes needed.',
+        }));
+        await flushAsync();
+      }
+
+      expect(dispatchPush).toHaveBeenCalledTimes(2);
+    });
+
     it('suppresses push when a mobile client is connected', async () => {
       const { dispatchPush } = await import('../src/routes/push.js');
       const { bridge, daemonWs } = await setupPushBridge();
