@@ -197,8 +197,28 @@ export class ClaudeCodeCliSdkProvider implements TransportProvider {
       if (type === 'error' || event.error) fail(typeof event.error === 'string' ? event.error : 'Claude CLI stream-json error');
     });
     let stderr = ''; child.stderr.on('data', (chunk) => { stderr += String(chunk); s.stderr = stderr.slice(-4_000); });
-    child.once('error', (err) => fail(err.message)); child.once('close', (code) => { rl.close(); s.child = null; if (s.busy) code === 0 ? finish() : fail(s.stderr || `Claude CLI exited with code ${code ?? 'unknown'}`); });
-    const input = JSON.stringify({ type: 'user', session_id: s.resumeId, message: { role: 'user', content: prompt } }); child.stdin.write(`${input}\n`); child.stdin.end();
+    child.once('error', (err) => fail(err.message));
+    child.stdin.on('error', (err) => {
+      // The CLI may exit after emitting its final frame before the parent has
+      // finished writing the request. Handle that expected EPIPE without an
+      // unhandled exception; other write failures still reach the provider.
+      if (s.busy && (err as NodeJS.ErrnoException).code !== 'EPIPE') fail(err.message);
+    });
+    child.once('close', (code) => {
+      rl.close();
+      s.child = null;
+      if (!s.busy) return;
+      if (code === 0) finish();
+      else fail(s.stderr || `Claude CLI exited with code ${code ?? 'unknown'}`);
+    });
+    const input = JSON.stringify({ type: 'user', session_id: s.resumeId, message: { role: 'user', content: prompt } });
+    try {
+      child.stdin.write(`${input}\n`);
+      child.stdin.end();
+    } catch (error) {
+      const errno = error as NodeJS.ErrnoException;
+      if (errno.code !== 'EPIPE') fail(errno.message);
+    }
   }
   private emitInfo(id: string, info: SessionInfoUpdate): void { this.infoCallbacks.forEach((cb) => cb(id, info)); }
   private error(code: string, message: string, recoverable: boolean): ProviderError { return { code, message, recoverable }; }
