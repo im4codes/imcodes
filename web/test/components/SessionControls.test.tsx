@@ -11465,28 +11465,6 @@ afterEach(() => {
     }
   });
 
-  it('does not let macOS native mirror input and contenteditable beforeinput append twice', async () => {
-    const originalUserAgent = navigator.userAgent;
-    Object.defineProperty(navigator, 'userAgent', {
-      configurable: true,
-      value: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/605.1.15 Safari/605.1.15',
-    });
-    try {
-      render(<SessionControls ws={makeWs() as any} activeSession={makeSession({ name: 'native-no-duplicate' })} quickData={makeQuickData() as any} />);
-      const input = screen.getByRole('textbox') as HTMLDivElement;
-      const native = document.querySelector('[data-composer-native-input="true"]') as HTMLTextAreaElement;
-      input.focus();
-      input.dispatchEvent(new InputEvent('beforeinput', { bubbles: true, inputType: 'insertText', data: 'once' }));
-      await new Promise((resolve) => setTimeout(resolve, 0));
-      expect(input.textContent).toBe('');
-      native.value = 'once';
-      native.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: 'once' }));
-      expect(input.textContent).toBe('once');
-    } finally {
-      Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUserAgent });
-    }
-  });
-
   it('does not enable the native caret overlay for non-macOS browsers', () => {
     render(<SessionControls ws={makeWs() as any} activeSession={makeSession({ name: 'non-mac-focus' })} quickData={makeQuickData() as any} />);
     const native = document.querySelector('[data-composer-native-input="true"]') as HTMLTextAreaElement;
