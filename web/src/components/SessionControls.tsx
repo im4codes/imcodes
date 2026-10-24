@@ -5758,12 +5758,14 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const handleComposerBeforeInput = (event: Event): void => {
     const input = event as InputEvent;
     if (event.defaultPrevented) return;
-    const supportedInputTypes = new Set([
-      'insertText',
-      'insertCompositionText',
-      'insertReplacementText',
-      'insertFromDictation',
-    ]);
+    // On macOS the native textarea is the source of truth for ordinary
+    // dictation/typing. WebKit can still echo the same edit as a contenteditable
+    // beforeinput; allowing the fallback to inject insertText there appends the
+    // native text a second time. Replacement/dictation events remain supported
+    // for browsers that do not mutate the editor themselves.
+    const supportedInputTypes = macNativeInput
+      ? new Set(['insertReplacementText', 'insertFromDictation'])
+      : new Set(['insertText', 'insertCompositionText', 'insertReplacementText', 'insertFromDictation']);
     if (!supportedInputTypes.has(input.inputType)) return;
     const editor = divRef.current;
     if (!editor || inputDisabled) return;
