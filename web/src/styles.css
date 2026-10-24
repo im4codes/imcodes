@@ -1299,41 +1299,6 @@ html.native-ios-mac .chat-dl-btn {
   transform: translateZ(0);
 }
 .controls-composer { position: relative; flex: 1; min-width: 0; display: flex; align-items: stretch; }
-.controls-native-input {
-  position: absolute;
-  inset: 0;
-  z-index: 2;
-  width: 100%;
-  height: 100%;
-  resize: none;
-  border: 0;
-  outline: 0;
-  padding: 0;
-  margin: 0;
-  background: transparent;
-  color: transparent;
-  caret-color: transparent;
-  opacity: 0;
-  pointer-events: none;
-  box-sizing: border-box;
-  font: inherit;
-  line-height: 1.45;
-  white-space: pre-wrap;
-  overflow: hidden;
-}
-.controls-native-input:focus { outline: 0; }
-/* The native surface owns focus on macOS so WebKit can deliver system
-   Dictation. Keep its text invisible (the contenteditable remains the source
-   of truth) but expose its caret; opacity: 0 also hides a CSS caret. */
-.controls-composer-mac-native:has(.controls-native-input:focus) .controls-native-input {
-  color: transparent;
-  -webkit-text-fill-color: transparent;
-  caret-color: #e2e8f0;
-  opacity: 1;
-}
-.controls-composer-mac-native .controls-native-input {
-  padding: 7px 11px;
-}
 .controls-composer-resize-edge {
   position: absolute;
   top: -4px;
@@ -2035,7 +2000,6 @@ html.native-ios-mac .chat-dl-btn {
     min-height: calc((2 * 1.45em) + 10px);
     max-height: 240px;
   }
-  .controls-composer-mac-native .controls-native-input { padding: 5px 3px; }
   .controls-input:focus {
     background: transparent;
     border-color: transparent;
@@ -2043,8 +2007,7 @@ html.native-ios-mac .chat-dl-btn {
   }
 
   /* State feedback moves to the box, since the input no longer draws one. */
-  .controls:has(.controls-input:focus),
-  .controls:has(.controls-native-input:focus) {
+  .controls:has(.controls-input:focus) {
     border-color: rgba(34,211,238,0.62);
     box-shadow: 0 0 0 1px rgba(34,211,238,0.14), 0 0 16px rgba(34,211,238,0.12), inset 0 1px 0 rgba(255,255,255,0.055);
     background: linear-gradient(180deg, rgba(15,40,62,0.72), rgba(8,13,22,0.94));

@@ -66,8 +66,6 @@ let _webRec: any = null;
 let _webStream: MediaStream | null = null;
 let _webAudioCtx: AudioContext | null = null;
 let _webLevelRAF: number | null = null;
-let _webRestartTimer: ReturnType<typeof setTimeout> | null = null;
-let _webWantsListening = false;
 
 function setListening(next: boolean): void {
   _listening = next;
@@ -235,7 +233,6 @@ function startWebListening(): boolean {
   stopWebLevelMeter();
 
   const generation = ++_generation;
-  _webWantsListening = true;
   try {
     const rec = new Ctor();
     rec.lang = pickWebLocale();
@@ -255,25 +252,13 @@ function startWebListening(): boolean {
       // 'no-speech' / 'aborted' are routine; only surface real failures.
       if (e?.error && e.error !== 'no-speech' && e.error !== 'aborted') {
         console.warn('[voice] web speech error:', e.error);
-        if (e.error === 'not-allowed' || e.error === 'service-not-allowed' || e.error === 'audio-capture') {
-          _webWantsListening = false;
-        }
       }
     };
     rec.onend = (): void => {
       if (generation !== _generation) return;
+      // Browser auto-ends on silence; reflect not-listening so the UI updates.
       setListening(false);
       stopWebLevelMeter();
-      // Safari/Chromium may end continuous recognition on silence or when the
-      // tab briefly backgrounds. Restart while the user still intends to
-      // dictate; explicit stopListening clears this intent.
-      if (_webWantsListening) {
-        if (_webRestartTimer) clearTimeout(_webRestartTimer);
-        _webRestartTimer = setTimeout(() => {
-          _webRestartTimer = null;
-          if (generation === _generation && _webWantsListening) startWebListening();
-        }, 120);
-      }
     };
     _webRec = rec;
     rec.start();
@@ -288,11 +273,6 @@ function startWebListening(): boolean {
 }
 
 function stopWebListening(): void {
-  _webWantsListening = false;
-  if (_webRestartTimer) {
-    clearTimeout(_webRestartTimer);
-    _webRestartTimer = null;
-  }
   _generation++;
   setListening(false);
   stopWebLevelMeter();
