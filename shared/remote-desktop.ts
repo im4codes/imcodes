@@ -346,6 +346,7 @@ export const REMOTE_DESKTOP_QUALITY_PRESET = {
   P1440_30: '1440p30',
   P1080_60: '1080p60',
   P1080_30: '1080p30',
+  P1080_15: '1080p15',
   P720_60: '720p60',
   P900_30: '900p30',
   P720_30: '720p30',
@@ -372,6 +373,8 @@ export type RemoteDesktopQualityPriority =
 
 /** Resolution ceilings a viewer may pick; 0 = native, 2160 = 4K. */
 export const REMOTE_DESKTOP_QUALITY_MAX_HEIGHTS = [0, 720, 1080, 1440, 2160] as const;
+/** Minimum encoded height for a source that can provide a full HD frame. */
+export const REMOTE_DESKTOP_QUALITY_MIN_HEIGHT = 1080;
 export const REMOTE_DESKTOP_QUALITY_MAX_FPS = [15, 30, 60] as const;
 
 /** Per-viewer quality preference sent with `set_quality_preference`. */
@@ -410,7 +413,8 @@ export const REMOTE_DESKTOP_QUALITY_MODE_PREFERENCES: Readonly<Record<
   balanced: { maxHeight: 1440, maxFps: 30, maxBitrateBps: 0, priority: 'balanced' },
   sharp: { maxHeight: 0, maxFps: 30, maxBitrateBps: 0, priority: 'resolution' },
   ultra: { maxHeight: 2160, maxFps: 30, maxBitrateBps: 30_000_000, priority: 'resolution' },
-  saver: { maxHeight: 720, maxFps: 15, maxBitrateBps: 1_800_000, priority: 'balanced' },
+  // Saver lowers bitrate and frame rate, never the 1080p resolution floor.
+  saver: { maxHeight: 1080, maxFps: 15, maxBitrateBps: 1_800_000, priority: 'balanced' },
 });
 
 /** Bounds for a viewer-chosen bitrate cap (matches the native ladder). */
@@ -569,6 +573,7 @@ export const REMOTE_DESKTOP_QUALITY_LADDER = [
   { id: REMOTE_DESKTOP_QUALITY_PRESET.P1440_30, width: 2560, height: 1440, fps: 30, targetBitrateBps: 10_000_000 },
   { id: REMOTE_DESKTOP_QUALITY_PRESET.P1080_60, width: 1920, height: 1080, fps: 60, targetBitrateBps: 9_000_000 },
   { id: REMOTE_DESKTOP_QUALITY_PRESET.P1080_30, width: 1920, height: 1080, fps: 30, targetBitrateBps: 6_000_000 },
+  { id: REMOTE_DESKTOP_QUALITY_PRESET.P1080_15, width: 1920, height: 1080, fps: 15, targetBitrateBps: 1_800_000 },
   { id: REMOTE_DESKTOP_QUALITY_PRESET.P720_60, width: 1280, height: 720, fps: 60, targetBitrateBps: 4_800_000 },
   { id: REMOTE_DESKTOP_QUALITY_PRESET.P900_30, width: 1600, height: 900, fps: 30, targetBitrateBps: 4_500_000 },
   { id: REMOTE_DESKTOP_QUALITY_PRESET.P720_30, width: 1280, height: 720, fps: 30, targetBitrateBps: 3_000_000 },
@@ -1508,6 +1513,20 @@ export function isRemoteDesktopQualityPreference(value: unknown): value is Remot
 }
 
 /**
+ * Normalize a viewer preference before it reaches a worker. A 720p cap was
+ * accepted by older clients, but a capable source must not be instructed to
+ * send below the 1080p floor. Keeping 720 in the wire union preserves decode
+ * compatibility while making new sends safe.
+ */
+export function normalizeRemoteDesktopQualityPreference(
+  preference: RemoteDesktopQualityPreference,
+): RemoteDesktopQualityPreference {
+  return preference.maxHeight > 0 && preference.maxHeight < REMOTE_DESKTOP_QUALITY_MIN_HEIGHT
+    ? { ...preference, maxHeight: REMOTE_DESKTOP_QUALITY_MIN_HEIGHT }
+    : { ...preference };
+}
+
+/**
  * The same preference for a worker that does not advertise `qualityUltra`,
  * which refuses 2160 and a raised ceiling. Its ladder tops out at 2160, so
  * native picks the same rungs; the bitrate falls back to its default ceiling.
@@ -1515,12 +1534,13 @@ export function isRemoteDesktopQualityPreference(value: unknown): value is Remot
 export function legacyRemoteDesktopQualityPreference(
   preference: RemoteDesktopQualityPreference,
 ): RemoteDesktopQualityPreference {
+  const normalized = normalizeRemoteDesktopQualityPreference(preference);
   return {
-    ...preference,
-    maxHeight: preference.maxHeight === 2160 ? 0 : preference.maxHeight,
-    maxBitrateBps: preference.maxBitrateBps > REMOTE_DESKTOP_QUALITY_BITRATE_CAP.MAX_BPS
+    ...normalized,
+    maxHeight: normalized.maxHeight === 2160 ? 0 : normalized.maxHeight,
+    maxBitrateBps: normalized.maxBitrateBps > REMOTE_DESKTOP_QUALITY_BITRATE_CAP.MAX_BPS
       ? 0
-      : preference.maxBitrateBps,
+      : normalized.maxBitrateBps,
   };
 }
 

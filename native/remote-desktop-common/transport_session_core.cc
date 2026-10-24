@@ -476,7 +476,7 @@ bool TransportSessionCore::ApplyQualityTarget(const QualityTarget& target) {
 bool TransportSessionCore::SetQualityPreference(
     const imcodes::rd::QualityPreference& preference) {
   if (!started_ || terminal_) return false;
-  viewer_preference_ = preference;
+  viewer_preference_ = imcodes::rd::NormalizeQualityPreference(preference);
   if (!last_quality_target_) return true;
   return ApplyQualityTarget(*last_quality_target_);
 }

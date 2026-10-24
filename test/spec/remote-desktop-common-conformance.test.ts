@@ -64,6 +64,7 @@ describe.skipIf(process.platform === 'win32')('remote-desktop common conformance
         '-I', COMMON,
         resolve(COMMON, 'value_types.cc'),
         resolve(COMMON, 'input_ledger.cc'),
+        resolve(COMMON, 'quality_ladder.cc'),
         resolve(COMMON, 'session_core.cc'),
         FAKE,
         '-o', executable,

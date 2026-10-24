@@ -14,9 +14,11 @@
 #include "input_ledger.h"
 #include "platform_interfaces.h"
 #include "protocol_contracts.h"
+#include "quality_ladder.h"
 #include "session_core.h"
 
 namespace common = imcodes::remote_desktop::common;
+namespace rd = imcodes::rd;
 
 namespace {
 
@@ -793,6 +795,30 @@ int main() {
               selection.encoded_pixels.height == 982 &&
               selection.bitrate_bps == 3'000'000,
           "quality-ladder seam consumes encoded pixels only");
+
+  // Regression: a capable source never falls through to the old 720p rung,
+  // even when the estimate is below every historical 1080p bitrate threshold
+  // or an older viewer asks for maxHeight=720. A genuinely smaller source is
+  // kept at its real dimensions instead of being upscaled.
+  const rd::QualitySelection floor =
+      rd::SelectQuality(1, 1920, 1080);
+  Require(floor.width >= rd::kMinimumVideoWidth &&
+              floor.height >= rd::kMinimumVideoHeight,
+          "capable source keeps the 1080p floor under congestion");
+  rd::QualityPreference legacy;
+  legacy.max_height = 720;
+  legacy.max_fps = 15;
+  const rd::QualitySelection normalized =
+      rd::SelectQuality(1, 2560, 1440, legacy);
+  Require(normalized.width >= rd::kMinimumVideoWidth &&
+              normalized.height >= rd::kMinimumVideoHeight &&
+              normalized.fps <= 15,
+          "legacy sub-1080 preference sheds rate, not resolution");
+  const rd::QualitySelection small_source =
+      rd::SelectQuality(15'000'000, 1366, 768);
+  Require(small_source.width < rd::kMinimumVideoWidth &&
+              small_source.height < rd::kMinimumVideoHeight,
+          "small physical source is not falsely upscaled");
 
   return 0;
 }

@@ -34,8 +34,8 @@ class Bytes final : public common::FrameStorage {
   std::vector<std::byte> bytes_;
 };
 
-constexpr std::uint32_t kWidth = 1280;
-constexpr std::uint32_t kHeight = 720;
+constexpr std::uint32_t kWidth = 2560;
+constexpr std::uint32_t kHeight = 1440;
 
 common::CapturedFrame Frame(std::uint32_t width = kWidth,
                             std::uint32_t height = kHeight,
@@ -207,9 +207,9 @@ bool TestSlowEncoderStepsDownOnceAndTheCaptureIsTold() {
   // The next frame re-applies the ladder's request at the new level.
   (void)rig.encoder->Encode(Frame(), false);
   const auto configuration = rig.encoder->Configuration();
-  return Check(configuration.has_value() && configuration->encoded_pixels.width == 960 &&
-                   configuration->encoded_pixels.height == 540,
-               "the encoder is rebuilt at the next-smaller size (960x540)") &&
+  return Check(configuration.has_value() && configuration->encoded_pixels.width == 1920 &&
+                   configuration->encoded_pixels.height == 1080,
+               "the encoder is rebuilt at the next-smaller size (1920x1080 floor)") &&
          Check(configuration->latency_first, "the mode survives the rebuild") &&
          Check(rig.observed == 1, "the observer (capture retarget) is told exactly once") &&
          Check(rig.backend->configurations.size() == 2, "exactly one rebuild");

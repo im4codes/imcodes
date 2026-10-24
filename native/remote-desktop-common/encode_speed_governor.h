@@ -42,8 +42,11 @@ inline constexpr double kEncodeLevelLinearScale = 0.75;
 inline constexpr double kEncodeLevelPixelRatio =
     kEncodeLevelLinearScale * kEncodeLevelLinearScale;
 inline constexpr int kEncodeMaxLevel = 4;
-inline constexpr int kEncodeMinWidth = 640;
-inline constexpr int kEncodeMinHeight = 360;
+// A governor step must not undo the transport ladder's 1080p floor. Sources
+// below this capability are never upscaled and therefore have no downscale
+// levels available.
+inline constexpr int kEncodeMinWidth = 1920;
+inline constexpr int kEncodeMinHeight = 1080;
 inline constexpr std::size_t kEncodeWindowFrames = 12;
 inline constexpr std::int64_t kEncodeStepDownHoldMs = 4'000;
 inline constexpr std::int64_t kEncodeStepUpHoldMs = 20'000;
@@ -67,7 +70,7 @@ inline EncodeSize ApplyEncodeSpeedLevel(int width, int height, int level) {
                     EvenAtLeastTwoGovernor(height * scale)};
 }
 
-// The deepest level that still leaves a legible picture (>= 640x360).
+// The deepest level that still preserves the 1080p transport floor.
 inline int MaxEncodeSpeedLevel(int width, int height) {
   int level = 0;
   while (level < kEncodeMaxLevel) {

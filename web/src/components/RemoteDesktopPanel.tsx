@@ -9,6 +9,7 @@ import {
   REMOTE_DESKTOP_ERROR,
   REMOTE_DESKTOP_QUALITY_MAX_FPS,
   REMOTE_DESKTOP_QUALITY_MAX_HEIGHTS,
+  REMOTE_DESKTOP_QUALITY_MIN_HEIGHT,
   REMOTE_DESKTOP_QUALITY_MODE,
   REMOTE_DESKTOP_QUALITY_PRIORITY,
   REMOTE_DESKTOP_ROUTE,
@@ -3318,7 +3319,9 @@ export function RemoteDesktopPanel({
                           maxHeight: Number((event.target as HTMLSelectElement).value) as RemoteDesktopQualityPreference['maxHeight'],
                         })}
                       >
-                        {REMOTE_DESKTOP_QUALITY_MAX_HEIGHTS.map((height) => (
+                        {REMOTE_DESKTOP_QUALITY_MAX_HEIGHTS.filter((height) => (
+                          height === 0 || height >= REMOTE_DESKTOP_QUALITY_MIN_HEIGHT
+                        )).map((height) => (
                           <option key={height} value={String(height)}>
                             {height === 0
                               ? t('remote_desktop.quality_resolution_native')

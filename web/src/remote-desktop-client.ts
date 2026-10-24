@@ -31,6 +31,7 @@ import {
   REMOTE_DESKTOP_TERMINAL_REASON,
   isRemoteDesktopPresentedFrameCompatible,
   isRemoteDesktopQualityPreference,
+  normalizeRemoteDesktopQualityPreference,
   legacyRemoteDesktopQualityPreference,
   validateRemoteDesktopAuthorized,
   validateRemoteDesktopDataMessage,
@@ -790,7 +791,7 @@ export class RemoteDesktopClient {
     options: { latencyGuard?: boolean } = {},
   ): boolean {
     if (!isRemoteDesktopQualityPreference(preference)) return false;
-    this.desiredQualityPreference = { ...preference };
+    this.desiredQualityPreference = normalizeRemoteDesktopQualityPreference(preference);
     this.latencyGuardEnabled = options.latencyGuard !== false;
     if (!this.latencyGuardEnabled) this.resetLatencyGuard();
     this.flushQualityPreference();

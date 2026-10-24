@@ -37,6 +37,17 @@ struct QualityPreference {
   QualityPriority priority = QualityPriority::kBalanced;
 };
 
+// A normal desktop stream keeps at least one 1080p frame when the physical
+// source can provide it. A smaller source is never upscaled: its real capture
+// dimensions remain the explicit capability limit.
+inline constexpr int kMinimumVideoWidth = 1920;
+inline constexpr int kMinimumVideoHeight = 1080;
+
+// Normalize preferences at every native entry point. Older viewers may send
+// maxHeight=720 (or omit the field entirely); neither case is allowed to turn
+// a capable source into a sub-1080 stream.
+QualityPreference NormalizeQualityPreference(QualityPreference preference);
+
 struct TransportBitratePolicy {
   uint32_t min_bps;
   uint32_t start_bps;

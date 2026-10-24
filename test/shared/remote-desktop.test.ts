@@ -177,7 +177,7 @@ describe('remote desktop production contract', () => {
       KEYBOARD: 'imcodes-rd-keyboard',
       POINTER: 'imcodes-rd-pointer',
     });
-    expect(WINDOWS_REMOTE_DESKTOP_QUALIFICATION_PLAN.qualityLadder).toHaveLength(16);
+    expect(WINDOWS_REMOTE_DESKTOP_QUALIFICATION_PLAN.qualityLadder).toHaveLength(17);
     expect(WINDOWS_REMOTE_DESKTOP_QUALIFICATION_PLAN.qualityLadder[0]).toMatchObject({
       id: '2160p30', width: 3840, height: 2160, fps: 30,
     });

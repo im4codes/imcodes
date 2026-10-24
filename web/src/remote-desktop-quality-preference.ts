@@ -4,6 +4,7 @@ import {
   REMOTE_DESKTOP_QUALITY_MODE_PREFERENCES,
   REMOTE_DESKTOP_QUALITY_PRIORITY,
   isRemoteDesktopQualityPreference,
+  normalizeRemoteDesktopQualityPreference,
   type RemoteDesktopQualityMode,
   type RemoteDesktopQualityPreference,
 } from '@shared/remote-desktop.js';
@@ -69,7 +70,7 @@ export function loadRemoteDesktopQualityChoice(
     mode: stored.mode,
     custom: isRemoteDesktopQualityPreference(stored.custom)
       && (REMOTE_DESKTOP_QUALITY_BITRATE_OPTIONS as readonly number[]).includes(stored.custom.maxBitrateBps)
-      ? { ...stored.custom }
+      ? normalizeRemoteDesktopQualityPreference(stored.custom)
       : { ...DEFAULT_CUSTOM_QUALITY_PREFERENCE },
   };
 }
@@ -92,7 +93,8 @@ export function saveRemoteDesktopQualityChoice(
 export function resolveRemoteDesktopQualityPreference(
   choice: RemoteDesktopQualityChoice,
 ): RemoteDesktopQualityPreference {
-  return choice.mode === REMOTE_DESKTOP_QUALITY_MODE.CUSTOM
+  const preference = choice.mode === REMOTE_DESKTOP_QUALITY_MODE.CUSTOM
     ? { ...choice.custom }
     : { ...REMOTE_DESKTOP_QUALITY_MODE_PREFERENCES[choice.mode] };
+  return normalizeRemoteDesktopQualityPreference(preference);
 }
