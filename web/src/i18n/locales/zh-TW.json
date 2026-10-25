@@ -1483,12 +1483,7 @@
     "notepad_resume": "繼續",
     "notepad_sending": "傳送中…",
     "notepad_send_failed": "傳送失敗。記事本仍保存在本裝置上。",
-    "notepad_draft_indicator": "本裝置上有未完成的語音記事本",
-    "dictation_test_title": "聽寫測試輸入",
-    "dictation_test_hint": "此隔離測試僅擷取瀏覽器聽寫事件，無法擷取系統層級麥克風輸入。",
-    "dictation_test_input_label": "聽寫測試輸入",
-    "dictation_test_cancel": "取消",
-    "dictation_test_send": "傳送"
+    "notepad_draft_indicator": "本裝置上有未完成的語音記事本"
   },
   "p2p": {
     "final_original_request_reminder": "在完成討論綜合後，務必直接落實並完整回應使用者的原始請求，不要只停留在討論總結。\n使用者的原始請求是：「{{request}}」",

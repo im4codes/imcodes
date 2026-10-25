@@ -25,8 +25,6 @@ import { SessionActionMenuIcon } from './SessionActionMenuIcon.js';
 import { SupervisionHeartbeatBadge } from './SupervisionHeartbeatBadge.js';
 import * as VoiceInput from './VoiceInput.js';
 import { VoiceOverlay } from './VoiceOverlay.js';
-import { DictationTestOverlay } from './DictationTestOverlay.js';
-import { captureSelectionOffsets, isDictationInputType, restoreSelectionOffsets, type SelectionOffsets } from '../dictation-test-input.js';
 import { INLINE_PASTE_TEXT_CHAR_LIMIT } from '../composer-inline-limit.js';
 import {
   buildNotepadInlineMessage,
@@ -1251,8 +1249,6 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const [hasText, setHasText] = useState(false);
   const [composerFocused, setComposerFocused] = useState(false);
   const [voiceOpen, setVoiceOpen] = useState(false);
-  const [dictationTestOpen, setDictationTestOpen] = useState(false);
-  const [dictationTestText, setDictationTestText] = useState('');
   const [menuOpen, setMenuOpen] = useState(false);
   const [atPickerOpen, setAtPickerOpen] = useState(false);
   const [atQuery, setAtQuery] = useState('');
@@ -1602,11 +1598,6 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   ), [activeSession]);
   // Internal ref for contenteditable — also written to the external inputRef
   const divRef = useRef<HTMLDivElement>(null);
-  const dictationSnapshotRef = useRef<{ html: string; selection: SelectionOffsets | null; text: string } | null>(null);
-  const dictationPendingBeforeInputRef = useRef<{ html: string; text: string; inputType: string; data: string } | null>(null);
-  const dictationLastFallbackRef = useRef<{ html: string; text: string; inputType: string; data: string } | null>(null);
-  const dictationPendingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const dictationSendPendingRef = useRef(false);
   const stopComposerResize = useCallback(() => {
     composerResizeCleanupRef.current?.();
     composerResizeCleanupRef.current = null;
@@ -1713,81 +1704,6 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const publishComposerText = useCallback((text: string) => {
     onComposerTextChange?.(text);
   }, [onComposerTextChange]);
-  const captureDictationSnapshot = useCallback(() => {
-    const root = divRef.current;
-    if (!root) return null;
-    const snapshot = {
-      html: root.innerHTML,
-      selection: captureSelectionOffsets(root),
-      text: readComposerElementText(root),
-    };
-    dictationSnapshotRef.current = snapshot;
-    return snapshot;
-  }, []);
-  const restoreDictationSnapshot = useCallback(() => {
-    const root = divRef.current;
-    const snapshot = dictationSnapshotRef.current;
-    if (!root || !snapshot) return;
-    if (root.innerHTML !== snapshot.html) root.innerHTML = snapshot.html;
-    restoreSelectionOffsets(root, snapshot.selection);
-  }, []);
-  const openDictationTest = useCallback((text: string) => {
-    setDictationTestText((previous) => previous ? `${previous}${text}` : text);
-    setDictationTestOpen(true);
-  }, []);
-  const cancelDictationTest = useCallback(() => {
-    if (dictationPendingTimerRef.current) clearTimeout(dictationPendingTimerRef.current);
-    dictationPendingTimerRef.current = null;
-    dictationPendingBeforeInputRef.current = null;
-    dictationLastFallbackRef.current = null;
-    dictationSendPendingRef.current = false;
-    setDictationTestText('');
-    setDictationTestOpen(false);
-  }, []);
-  const handleDictationBeforeInput = useCallback((event: Event) => {
-    const inputEvent = event as InputEvent;
-    if (!isDictationInputType(inputEvent.inputType)) return;
-    const snapshot = captureDictationSnapshot();
-    event.preventDefault();
-    event.stopPropagation();
-    if (!snapshot) return;
-    const sequence = {
-      html: snapshot.html,
-      text: snapshot.text,
-      inputType: inputEvent.inputType,
-      data: inputEvent.data ?? '',
-    };
-    const pending = dictationPendingBeforeInputRef.current;
-    if (
-      pending
-      && pending.html === sequence.html
-      && pending.text === sequence.text
-      && pending.inputType === sequence.inputType
-      && pending.data === sequence.data
-    ) {
-      return;
-    }
-    if (dictationPendingTimerRef.current) clearTimeout(dictationPendingTimerRef.current);
-    dictationPendingBeforeInputRef.current = sequence;
-    dictationLastFallbackRef.current = null;
-    // A browser normally emits the matching input immediately. Keep the
-    // sequence briefly so duplicate beforeinput notifications in the same
-    // browser turn cannot append the same speech fragment twice.
-    dictationPendingTimerRef.current = setTimeout(() => {
-      dictationPendingBeforeInputRef.current = null;
-      dictationPendingTimerRef.current = null;
-    }, 100);
-    openDictationTest(inputEvent.data ?? '');
-  }, [captureDictationSnapshot, openDictationTest]);
-  useEffect(() => {
-    captureDictationSnapshot();
-  }, [captureDictationSnapshot]);
-  useEffect(() => {
-    const el = divRef.current;
-    if (!el) return;
-    el.addEventListener('beforeinput', handleDictationBeforeInput);
-    return () => el.removeEventListener('beforeinput', handleDictationBeforeInput);
-  }, [handleDictationBeforeInput]);
   // History navigation state
   const histIdxRef = useRef(-1);   // -1 = not navigating; 0 = most recent
   const draftRef = useRef('');      // saved unsent text while navigating
@@ -2456,7 +2372,6 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     || openSpecProposeMenuOpen
     || !!openSpecFolderPath
     || voiceOpen
-    || dictationTestOpen
     || !!mobileFileBrowserOpen;
 
   useEffect(() => {
@@ -4977,21 +4892,6 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     requestSend(buildSendPayload(), { clearComposer: true });
   }, [buildSendPayload, requestSend]);
 
-  const handleDictationTestSend = useCallback(() => {
-    if (dictationSendPendingRef.current || !dictationTestText.trim()) return;
-    dictationSendPendingRef.current = true;
-    const existingText = divRef.current ? readComposerElementText(divRef.current) : '';
-    const combinedText = existingText.trim()
-      ? `${existingText}${existingText.endsWith('\n') ? '' : '\n'}${dictationTestText}`
-      : dictationTestText;
-    // Reuse the existing composer fill/send path so attachments, @ references,
-    // alias/machine markers, and queue/append mode remain authoritative.
-    fillInput(combinedText);
-    const result = requestSend(buildSendPayload(), { clearComposer: true });
-    dictationSendPendingRef.current = false;
-    if (result === 'accepted') cancelDictationTest();
-  }, [buildSendPayload, cancelDictationTest, dictationTestText, fillInput, requestSend]);
-
   const handleQuickAgentDelegationDispatch = useCallback((input: {
     sessionName: string;
     label: string;
@@ -5986,13 +5886,6 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
 
   return (
     <>
-    <DictationTestOverlay
-      open={dictationTestOpen}
-      value={dictationTestText}
-      onChange={setDictationTestText}
-      onSend={handleDictationTestSend}
-      onCancel={cancelDictationTest}
-    />
     {appendSuccessNotice && typeof document !== 'undefined' && createPortal(
       <div class="queue-append-success-toast" role="status" aria-live="polite">
         <span class="queue-append-success-toast-icon" aria-hidden="true">↗</span>
@@ -7678,54 +7571,6 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
             onFocus={handleFocus}
             onBlur={handleBlur}
             onInput={(event) => {
-              const inputEvent = event as unknown as InputEvent;
-              if (isDictationInputType(inputEvent.inputType)) {
-                const snapshot = dictationSnapshotRef.current;
-                const root = divRef.current;
-                const currentText = root ? readComposerElementText(root) : '';
-                const currentHtml = root?.innerHTML ?? '';
-                const sequence = {
-                  html: snapshot?.html ?? '',
-                  text: snapshot?.text ?? '',
-                  inputType: inputEvent.inputType,
-                  data: inputEvent.data ?? '',
-                };
-                const pending = dictationPendingBeforeInputRef.current;
-                const matchesPending = !!pending
-                  && pending.html === sequence.html
-                  && pending.text === sequence.text
-                  && pending.inputType === sequence.inputType
-                  && pending.data === sequence.data;
-                if (dictationPendingTimerRef.current) clearTimeout(dictationPendingTimerRef.current);
-                dictationPendingTimerRef.current = null;
-                dictationPendingBeforeInputRef.current = null;
-                if (matchesPending) {
-                  // Keep the handled sequence briefly so a browser that emits
-                  // duplicate input after the matching beforeinput cannot
-                  // append the same fragment a second time.
-                  dictationLastFallbackRef.current = { ...sequence };
-                  restoreDictationSnapshot();
-                  return;
-                }
-                const previousFallback = dictationLastFallbackRef.current;
-                if (
-                  previousFallback
-                  && previousFallback.html === sequence.html
-                  && previousFallback.text === sequence.text
-                  && previousFallback.inputType === sequence.inputType
-                  && previousFallback.data === sequence.data
-                  && currentHtml === sequence.html
-                  && currentText === sequence.text
-                ) {
-                  restoreDictationSnapshot();
-                  return;
-                }
-                const data = inputEvent.data ?? (snapshot ? currentText.slice(snapshot.text.length) : '');
-                dictationLastFallbackRef.current = { ...sequence, data };
-                restoreDictationSnapshot();
-                openDictationTest(data);
-                return;
-              }
               const currentText = divRef.current ? readComposerElementText(divRef.current) : '';
               setHasText(!!currentText.trim());
               publishComposerText(currentText);
@@ -7864,8 +7709,6 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
                 setMachinePickerOpen(false);
                 setMachineQuery('');
               }
-              captureDictationSnapshot();
-              dictationLastFallbackRef.current = null;
             }}
             onKeyDown={handleKeyDown}
             onPaste={handlePaste}
