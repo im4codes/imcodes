@@ -1483,7 +1483,12 @@
     "notepad_resume": "继续",
     "notepad_sending": "发送中…",
     "notepad_send_failed": "发送失败。记事本仍保存在本设备上。",
-    "notepad_draft_indicator": "本设备上有未完成的语音记事本"
+    "notepad_draft_indicator": "本设备上有未完成的语音记事本",
+    "dictation_test_title": "听写测试输入",
+    "dictation_test_hint": "此隔离测试仅捕获浏览器听写事件，不能捕获系统级麦克风输入。",
+    "dictation_test_input_label": "听写测试输入",
+    "dictation_test_cancel": "取消",
+    "dictation_test_send": "发送"
   },
   "p2p": {
     "final_original_request_reminder": "在完成讨论综合后，务必直接落实并完整回应用户的原始请求，不要只停留在讨论总结。\n用户的原始请求是：\"{{request}}\"",

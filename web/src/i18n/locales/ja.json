@@ -1483,7 +1483,12 @@
     "notepad_resume": "再開",
     "notepad_sending": "送信中…",
     "notepad_send_failed": "送信できませんでした。メモはこの端末に保存されたままです。",
-    "notepad_draft_indicator": "この端末に未完了の音声メモがあります"
+    "notepad_draft_indicator": "この端末に未完了の音声メモがあります",
+    "dictation_test_title": "音声入力テスト",
+    "dictation_test_hint": "この分離テストはブラウザの音声入力イベントのみを取得し、システム全体のマイク入力は取得できません。",
+    "dictation_test_input_label": "音声入力テスト",
+    "dictation_test_cancel": "キャンセル",
+    "dictation_test_send": "送信"
   },
   "p2p": {
     "final_original_request_reminder": "議論の要約だけで終わらせず、議論を統合した後は必ず元のユーザー依頼に直接対応してください。\n元のユーザー依頼: \"{{request}}\"",

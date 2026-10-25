@@ -1483,7 +1483,12 @@
     "notepad_resume": "이어서 녹음",
     "notepad_sending": "보내는 중…",
     "notepad_send_failed": "보내지 못했습니다. 메모는 이 기기에 그대로 저장되어 있습니다.",
-    "notepad_draft_indicator": "이 기기에 완료되지 않은 음성 메모가 있습니다"
+    "notepad_draft_indicator": "이 기기에 완료되지 않은 음성 메모가 있습니다",
+    "dictation_test_title": "받아쓰기 테스트 입력",
+    "dictation_test_hint": "이 격리 테스트는 브라우저 받아쓰기 이벤트만 캡처하며 시스템 전체 마이크 입력은 캡처할 수 없습니다.",
+    "dictation_test_input_label": "받아쓰기 테스트 입력",
+    "dictation_test_cancel": "취소",
+    "dictation_test_send": "보내기"
   },
   "p2p": {
     "final_original_request_reminder": "토론 요약으로 끝내지 말고, 논의를 종합한 뒤에는 반드시 원래 사용자 요청을 직접 완전히 처리하세요.\n원래 사용자 요청: \"{{request}}\"",

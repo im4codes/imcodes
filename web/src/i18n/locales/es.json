@@ -1483,7 +1483,12 @@
     "notepad_resume": "Reanudar",
     "notepad_sending": "Enviando…",
     "notepad_send_failed": "No se pudo enviar. Las notas siguen guardadas en este dispositivo.",
-    "notepad_draft_indicator": "Notas de voz sin terminar guardadas en este dispositivo"
+    "notepad_draft_indicator": "Notas de voz sin terminar guardadas en este dispositivo",
+    "dictation_test_title": "Entrada de prueba de dictado",
+    "dictation_test_hint": "Esta prueba aislada solo captura eventos de dictado del navegador; no puede capturar el micrófono del sistema.",
+    "dictation_test_input_label": "Entrada de prueba de dictado",
+    "dictation_test_cancel": "Cancelar",
+    "dictation_test_send": "Enviar"
   },
   "p2p": {
     "final_original_request_reminder": "No te quedes solo en el resumen de la discusión. Después de sintetizarla, asegúrate de responder y ejecutar directamente la solicitud original del usuario.\nLa solicitud original del usuario es: \"{{request}}\"",

@@ -1483,7 +1483,12 @@
     "notepad_resume": "Resume",
     "notepad_sending": "Sending…",
     "notepad_send_failed": "Couldn't send. The notepad is still saved on this device.",
-    "notepad_draft_indicator": "Unfinished voice notepad saved on this device"
+    "notepad_draft_indicator": "Unfinished voice notepad saved on this device",
+    "dictation_test_title": "Dictation test input",
+    "dictation_test_hint": "This isolated test captures browser Dictation events only; it cannot capture system-wide microphone input.",
+    "dictation_test_input_label": "Dictation test input",
+    "dictation_test_cancel": "Cancel",
+    "dictation_test_send": "Send"
   },
   "p2p": {
     "final_original_request_reminder": "After synthesizing the discussion, directly address and fulfill the user's original request instead of stopping at a discussion summary.\nThe original user request is: \"{{request}}\"",
