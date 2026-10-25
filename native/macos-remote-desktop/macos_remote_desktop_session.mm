@@ -656,6 +656,9 @@ class MacosRemoteDesktopSession::Impl final
       }
       stamp.daemon_generation = authority->identity.daemon_generation;
       stamp.route_generation = authority->identity.route_generation;
+      if (!transport_core_.BeginIceRestart(stamp)) {
+        return false;
+      }
       negotiator = dependencies_.negotiate_offer;
     }
 

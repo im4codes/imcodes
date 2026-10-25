@@ -927,6 +927,7 @@ describe('remote desktop worker artifact and IPC host', () => {
     const helpers: net.Socket[] = [];
     const terminated: number[] = [];
     const lifecycle: RemoteDesktopWorkerDiagnosticEvent[] = [];
+    let launchCount = 0;
     const host = new RemoteDesktopWorkerHost((message) => received.push(message), {
       ...trustedHostOptions,
       platform: 'win32',
@@ -937,13 +938,14 @@ describe('remote desktop worker artifact and IPC host', () => {
       terminateProcess: (pid) => terminated.push(pid),
       launch: (_executable, argsLine) => {
         if (argsLine.includes('--release-all-input')) return;
+        launchCount += 1;
         const nonce = quotedArgs(argsLine)[3]!;
         const helper = net.createConnection(pipePath, () => {
           helper.write(`${JSON.stringify({
             type: REMOTE_DESKTOP_WORKER_HELLO_TYPE,
             ipcVersion: REMOTE_DESKTOP_WORKER_IPC_VERSION,
             nonce,
-            pid: 4242,
+            pid: 4241 + launchCount,
           })}\n`);
         });
         helpers.push(helper);
@@ -988,6 +990,111 @@ describe('remote desktop worker artifact and IPC host', () => {
       cleanupReason: 'worker_terminal',
       terminalReason: REMOTE_DESKTOP_TERMINAL_REASON.WORKER_FAILED,
     })), { timeout: 1_000 });
+
+    // A replacement PREPARE must use a fresh worker generation after the
+    // terminal socket was retired; it must not inherit the wedged pipe.
+    const replacementSessionId = `${sessionId}-replacement`;
+    await expect(host.handle({
+      type: REMOTE_DESKTOP_MSG.PREPARE,
+      requestId: `${requestId}-replacement`,
+      sessionId: replacementSessionId,
+      capability,
+      expiresAt: Date.now() + 60_000,
+      leaseExpiresAt: Date.now() + 15_000,
+      daemonGeneration: 7,
+      mode: REMOTE_DESKTOP_ACCESS_MODE.VIEW,
+      inputEpoch: 0,
+      iceServers: [],
+    })).resolves.toBe(true);
+    await vi.waitFor(() => expect(helpers).toHaveLength(2), { timeout: 1_000 });
+    expect(launchCount).toBe(2);
+    expect(terminated).toEqual([4242]);
+  });
+
+  it('keeps other shared viewers on the worker socket after one terminal', async () => {
+    const temp = await mkdtemp(join(tmpdir(), 'imcodes-rd-host-terminal-shared-'));
+    cleanup.push(() => rm(temp, { recursive: true, force: true }));
+    const pipePath = workerTestPipePath(temp);
+    const received: RemoteDesktopDaemonMessage[] = [];
+    const helpers: net.Socket[] = [];
+    const terminated: number[] = [];
+    let launchCount = 0;
+    const host = new RemoteDesktopWorkerHost((message) => received.push(message), {
+      ...trustedHostOptions,
+      platform: 'win32',
+      artifact,
+      pipePath,
+      allowPipeClients: () => {},
+      terminateProcess: (pid) => terminated.push(pid),
+      launch: (_executable, argsLine) => {
+        if (argsLine.includes('--release-all-input')) return;
+        launchCount += 1;
+        const nonce = quotedArgs(argsLine)[3]!;
+        const helper = net.createConnection(pipePath, () => {
+          helper.write(`${JSON.stringify({
+            type: REMOTE_DESKTOP_WORKER_HELLO_TYPE,
+            ipcVersion: REMOTE_DESKTOP_WORKER_IPC_VERSION,
+            nonce,
+            pid: 6000 + launchCount,
+          })}\n`);
+        });
+        helpers.push(helper);
+      },
+    });
+    cleanup.push(() => { host.close(); helpers.forEach((helper) => helper.destroy()); });
+
+    const prepare = (id: string) => ({
+      type: REMOTE_DESKTOP_MSG.PREPARE,
+      requestId: `${requestId}-${id}`,
+      sessionId: `${sessionId}-${id}`,
+      capability,
+      expiresAt: Date.now() + 60_000,
+      leaseExpiresAt: Date.now() + 15_000,
+      daemonGeneration: 7,
+      mode: REMOTE_DESKTOP_ACCESS_MODE.VIEW,
+      inputEpoch: 0,
+      iceServers: [],
+    } as const);
+    await expect(host.handle(prepare('one'))).resolves.toBe(true);
+    await vi.waitFor(() => expect(helpers).toHaveLength(1));
+    await expect(host.handle(prepare('two'))).resolves.toBe(true);
+    expect(helpers).toHaveLength(1);
+
+    const first = prepare('one');
+    helpers[0]!.write(`${JSON.stringify({
+      type: REMOTE_DESKTOP_MSG.TERMINAL,
+      requestId: first.requestId,
+      sessionId: first.sessionId,
+      capability,
+      reason: REMOTE_DESKTOP_TERMINAL_REASON.PROTOCOL_ERROR,
+    })}\n`);
+    await vi.waitFor(() => expect(received).toContainEqual(expect.objectContaining({
+      type: REMOTE_DESKTOP_MSG.TERMINAL,
+      sessionId: first.sessionId,
+      reason: REMOTE_DESKTOP_TERMINAL_REASON.PROTOCOL_ERROR,
+    })), { timeout: 1_000 });
+
+    // The second viewer remains tracked and can continue signaling through the
+    // same socket; the first viewer's terminal must not reap the shared PID.
+    expect(terminated).toEqual([]);
+    expect((host as unknown as { tracked: ReadonlyMap<string, unknown> }).tracked.size).toBe(1);
+    await expect(host.handle({
+      type: REMOTE_DESKTOP_MSG.OFFER,
+      requestId: `${requestId}-two`,
+      sessionId: `${sessionId}-two`,
+      capability,
+      sdp: 'v=0',
+    })).resolves.toBe(true);
+
+    const second = prepare('two');
+    helpers[0]!.write(`${JSON.stringify({
+      type: REMOTE_DESKTOP_MSG.TERMINAL,
+      requestId: second.requestId,
+      sessionId: second.sessionId,
+      capability,
+      reason: REMOTE_DESKTOP_TERMINAL_REASON.WORKER_FAILED,
+    })}\n`);
+    await vi.waitFor(() => expect(terminated).toEqual([6001]), { timeout: 1_000 });
   });
 
   it('does not reap on a controller stop, so a graceful worker exits on its own', async () => {

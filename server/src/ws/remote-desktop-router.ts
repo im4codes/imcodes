@@ -1659,6 +1659,16 @@ export class RemoteDesktopRouter {
         return;
       }
       const iceRestartAttempt = route.offerCount;
+      // ICE candidate budgets are per offer/generation, not per logical
+      // viewer route. Preserve candidates that may have gathered before the
+      // initial offer, but reset both directions before each later offer;
+      // otherwise a healthy shared viewer that recovers through enough ICE
+      // restarts is terminated as protocol_error despite each generation
+      // staying within the bounded flood limit.
+      if (iceRestartAttempt > 0) {
+        route.browserIceCandidates = 0;
+        route.daemonIceCandidates = 0;
+      }
       route.offerCount++;
       if (iceRestartAttempt > 0) {
         await this.renewLease(route);

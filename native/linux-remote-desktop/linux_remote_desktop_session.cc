@@ -538,6 +538,9 @@ bool LinuxRemoteDesktopSession::ApplyOffer(
 
   auto remote_offer =
       webrtc::CreateSessionDescription(webrtc::SdpType::kOffer, offer_sdp);
+  if (!remote_offer || !transport_core_.BeginIceRestart(CallbackStamp())) {
+    return false;
+  }
   auto* peer = peer_.get();
   auto self = shared_from_this();
   peer->SetRemoteDescription(

@@ -1768,6 +1768,46 @@ describe('RemoteDesktopRouter', () => {
     expect(f.daemonMessages.filter((message) => message.type === REMOTE_DESKTOP_MSG.STOP)).toHaveLength(stoppedCount);
   });
 
+  it('resets browser and daemon ICE budgets for each offer generation', async () => {
+    const f = fixture();
+    const authority = await authorize(f);
+    const offer = (sdp: string) => ({
+      type: REMOTE_DESKTOP_MSG.OFFER,
+      ...authority,
+      sdp,
+    } as const);
+    const browserIce = (index: string | number) => ({
+      type: REMOTE_DESKTOP_MSG.ICE,
+      ...authority,
+      candidate: `candidate:browser-${index}`,
+      mid: '0',
+    } as const);
+    const daemonIce = (index: string | number) => ({
+      type: REMOTE_DESKTOP_MSG.ICE,
+      ...authority,
+      candidate: `candidate:daemon-${index}`,
+      mid: '0',
+    } as const);
+
+    await f.router.handleBrowser(f.browserA, 'owner-user', offer('v=0\\r\\na=ice-ufrag:first'));
+    for (let index = 0; index < REMOTE_DESKTOP_LIMITS.MAX_ICE_CANDIDATES - 1; index += 1) {
+      await f.router.handleBrowser(f.browserA, 'owner-user', browserIce(index));
+      expect(f.messages(f.browserA).at(-1)?.type).not.toBe(REMOTE_DESKTOP_MSG.TERMINAL);
+      expect(f.router.handleDaemon(daemonIce(index), 7)).toBe(true);
+    }
+
+    // The second offer starts a new ICE generation on the same shared viewer
+    // route. Two candidates now exceed the old cumulative budget but are legal
+    // in the fresh generation and must not terminate the route.
+    await f.router.handleBrowser(f.browserA, 'owner-user', offer('v=0\\r\\na=ice-ufrag:second'));
+    for (let index = 0; index < 2; index += 1) {
+      await f.router.handleBrowser(f.browserA, 'owner-user', browserIce(`restart-${index}`));
+      expect(f.messages(f.browserA).at(-1)?.type).not.toBe(REMOTE_DESKTOP_MSG.TERMINAL);
+      expect(f.router.handleDaemon(daemonIce(`restart-${index}`), 7)).toBe(true);
+    }
+    expect(f.router.stats().active).toBe(1);
+  });
+
   it('bounds per-session mode churn without introducing a global controller lock', async () => {
     const f = fixture();
     const authority = await authorize(f);

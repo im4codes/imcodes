@@ -231,6 +231,8 @@ describe("remote-desktop common transport/session core contract", () => {
       "caller limits cannot exceed the compiled hard bounds",
       "remote ICE remains bounded before remote description",
       "local ICE remains bounded before signaling emission is ready",
+      "ICE restart clears the superseded generation queues",
+      "fresh ICE generation remains live at the same per-generation bound",
       "candidate overflow terminates and erases queued material",
       "local candidate overflow is bounded and terminal",
       "required channel failure is terminal",

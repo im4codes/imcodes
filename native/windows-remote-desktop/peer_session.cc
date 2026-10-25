@@ -540,6 +540,7 @@ bool PeerSession::ApplyOffer(const std::string& sdp) {
   std::unique_ptr<webrtc::SessionDescriptionInterface> offer =
       webrtc::CreateSessionDescription(webrtc::SdpType::kOffer, sdp, &error);
   if (!offer) return false;
+  if (!transport_core_.BeginIceRestart(CallbackStamp())) return false;
   setting_remote_description_ = true;
   std::weak_ptr<PeerSession> weak = shared_from_this();
   peer_->SetRemoteDescription(
