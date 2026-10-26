@@ -918,6 +918,50 @@ describe('RemoteDesktopRouter', () => {
     ]));
   });
 
+  it('isolates a shared viewer terminal from another viewer on the same route', async () => {
+    const f = fixture();
+    const first = await authorize(f, f.browserA, 'owner-user', 'request_viewer_a');
+    const second = await authorize(f, f.browserB, 'owner-user', 'request_viewer_b');
+
+    await f.router.handleBrowser(f.browserA, 'owner-user', {
+      type: REMOTE_DESKTOP_MSG.OFFER,
+      ...first,
+      sdp: 'v=0\r\na=ice-ufrag:viewer-a',
+    });
+    await f.router.handleBrowser(f.browserB, 'owner-user', {
+      type: REMOTE_DESKTOP_MSG.OFFER,
+      ...second,
+      sdp: 'v=0\r\na=ice-ufrag:viewer-b',
+    });
+    expect(f.daemonMessages.filter((message) => message.type === REMOTE_DESKTOP_MSG.OFFER))
+      .toHaveLength(2);
+
+    expect(f.router.handleDaemon({
+      type: REMOTE_DESKTOP_MSG.TERMINAL,
+      ...first,
+      reason: REMOTE_DESKTOP_TERMINAL_REASON.PROTOCOL_ERROR,
+    }, 7)).toBe(true);
+
+    // The failed viewer is closed, but the other shared viewer keeps its
+    // authority and remains eligible for signaling.
+    expect(f.messages(f.browserA).at(-1)).toMatchObject({
+      type: REMOTE_DESKTOP_MSG.TERMINAL,
+      reason: REMOTE_DESKTOP_TERMINAL_REASON.PROTOCOL_ERROR,
+    });
+    expect(f.messages(f.browserB).some((message) => message.type === REMOTE_DESKTOP_MSG.TERMINAL))
+      .toBe(false);
+    expect(f.router.handleDaemon({
+      type: REMOTE_DESKTOP_MSG.ICE,
+      ...second,
+      candidate: 'candidate:viewer-b-still-live',
+      mid: '0',
+    }, 7)).toBe(true);
+    expect(f.messages(f.browserB).at(-1)).toMatchObject({
+      type: REMOTE_DESKTOP_MSG.ICE,
+      candidate: 'candidate:viewer-b-still-live',
+    });
+  });
+
   it.each([
     ['viewer', { access_role: 'viewer' }, REMOTE_DESKTOP_ERROR.ACCESS_DENIED],
     ['disabled', { exec_enabled: false }, REMOTE_DESKTOP_ERROR.EXECUTION_DISABLED],
