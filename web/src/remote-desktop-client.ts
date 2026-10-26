@@ -162,6 +162,8 @@ export interface RemoteDesktopSnapshot {
   error?: string;
   /** Server-authoritative retry guidance for an ERROR response. */
   retryable?: boolean;
+  /** A requested mode change was rejected while the live session stayed up. */
+  modeError?: string;
   viewerCount?: number;
   controllerCount?: number;
   /** The node is showing the Windows sign-in/lock screen. */
@@ -548,6 +550,7 @@ export class RemoteDesktopClient {
   private keyboardChannel: RTCDataChannel | null = null;
   private pointerChannel: RTCDataChannel | null = null;
   private requestId: string | null = null;
+  private pendingModeRequest: RemoteDesktopAccessMode | null = null;
   private sessionId: string | null = null;
   private capability: string | null = null;
   private daemonGeneration = 0;
@@ -690,17 +693,23 @@ export class RemoteDesktopClient {
 
   setMode(mode: RemoteDesktopAccessMode): void {
     if (!this.sessionId || !this.capability || this.stopped) return;
+    this.pendingModeRequest = mode;
+    this.publish({ modeError: undefined });
     if (mode === REMOTE_DESKTOP_ACCESS_MODE.VIEW) {
       this.releaseAll();
       this.publish({ inputEnabled: false });
     }
-    this.signaling.send({
+    const sent = this.signaling.send({
       type: REMOTE_DESKTOP_MSG.MODE_SET,
       requestId: this.requestId,
       sessionId: this.sessionId,
       capability: this.capability,
       mode,
     });
+    if (!sent) {
+      this.pendingModeRequest = null;
+      this.publish({ modeError: REMOTE_DESKTOP_ERROR.DAEMON_OFFLINE });
+    }
   }
 
   selectDisplay(displayId: string): boolean {
@@ -1381,6 +1390,11 @@ export class RemoteDesktopClient {
     // ERROR by design. Otherwise the browser waits for its negotiation timeout
     // and loses the Server's retryable guidance.
     if (message.type === REMOTE_DESKTOP_MSG.ERROR) {
+      if (this.pendingModeRequest !== null && message.error === REMOTE_DESKTOP_ERROR.ACCESS_DENIED) {
+        this.pendingModeRequest = null;
+        this.publish({ modeError: message.error, retryable: message.retryable });
+        return;
+      }
       this.fail(message.error, message.retryable);
       return;
     }
@@ -1439,7 +1453,9 @@ export class RemoteDesktopClient {
         mode: message.mode,
         inputEpoch: message.inputEpoch,
         inputEnabled: false,
+        modeError: undefined,
       });
+      this.pendingModeRequest = null;
       if (message.mode === REMOTE_DESKTOP_ACCESS_MODE.VIEW) this.releaseAll();
       return;
     }

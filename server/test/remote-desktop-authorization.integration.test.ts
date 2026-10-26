@@ -224,7 +224,7 @@ describe('remote desktop real-PostgreSQL authorization and teardown', () => {
     });
   });
 
-  it('revocation and reconnect retain independent live group View coverage, but losing the final group closes', async () => {
+  it('revocation and reconnect retain independent live group Control coverage, but losing the final group closes', async () => {
     const ownerId = `rd-owner-${hex(5)}`;
     const participantId = `rd-participant-${hex(5)}`;
     await Promise.all([createUser(db, ownerId), createUser(db, participantId)]);
@@ -234,7 +234,7 @@ describe('remote desktop real-PostgreSQL authorization and teardown', () => {
     await db.execute('INSERT INTO machine_groups (server_id, team_id, added_at) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING', [serverId, teamId, Date.now()]);
     const f = fixture(serverId);
     const groupSocket = {} as WebSocket;
-    expect(await start(f, participantId, groupSocket)).toMatchObject({ type: REMOTE_DESKTOP_MSG.AUTHORIZED, mode: REMOTE_DESKTOP_ACCESS_MODE.VIEW });
+    expect(await start(f, participantId, groupSocket)).toMatchObject({ type: REMOTE_DESKTOP_MSG.AUTHORIZED, mode: REMOTE_DESKTOP_ACCESS_MODE.CONTROL });
     f.router.stopAll();
     const share = await grant(ownerId, participantId, serverId, 'participant');
     const socket = {} as WebSocket;
@@ -244,7 +244,7 @@ describe('remote desktop real-PostgreSQL authorization and teardown', () => {
     expect(f.router.stats().active).toBe(1);
     expect(f.messages(socket).at(-1)).not.toMatchObject({ type: REMOTE_DESKTOP_MSG.TERMINAL });
     f.router.stopAll();
-    expect(await start(f, participantId, {} as WebSocket)).toMatchObject({ type: REMOTE_DESKTOP_MSG.AUTHORIZED, mode: REMOTE_DESKTOP_ACCESS_MODE.VIEW });
+    expect(await start(f, participantId, {} as WebSocket)).toMatchObject({ type: REMOTE_DESKTOP_MSG.AUTHORIZED, mode: REMOTE_DESKTOP_ACCESS_MODE.CONTROL });
     await db.execute('DELETE FROM machine_groups WHERE server_id=$1 AND team_id=$2', [serverId, teamId]);
     await f.router.revalidateUser(participantId);
     expect(f.router.stats().active).toBe(0);

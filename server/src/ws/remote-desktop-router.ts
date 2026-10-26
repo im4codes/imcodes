@@ -2,7 +2,6 @@ import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypt
 import type WebSocket from 'ws';
 import type { Database } from '../db/client.js';
 import { machineGroupInvalidationReady, machineGroupInvalidationRevision } from '../services/machine-group-invalidation.js';
-import { evaluateMachineAction, MACHINE_ACTION } from '../../../shared/machine-access-policy.js';
 import {
   canOperateControlledMachine,
   resolveRemoteDesktopHostAccess,
@@ -365,21 +364,11 @@ export class RemoteDesktopRouter {
       : REMOTE_DESKTOP_ACCESS_MODE.CONTROL;
   }
 
-  /**
-   * The highest mode an account's ACCESS allows. Remote-desktop CONTROL injects keyboard and mouse input, which can launch anything as
-   * the signed-in user, so it is GUI_INPUT in the one rule table (shared/machine-access-policy.ts): the device owner, or a share
-   * participant holding the owner's execute grant. Everyone else who can operate the device (a group member, a participant without the
-   * grant) may only watch. The exec switch is judged separately by `accessFault`, so it is assumed on here.
-   */
+  /** Explicit viewers are read-only; owner and participants are controllers. */
   private accessModeCeiling(access: ControlledMachineAccessRow): typeof REMOTE_DESKTOP_ACCESS_MODE[keyof typeof REMOTE_DESKTOP_ACCESS_MODE] {
-    const decision = evaluateMachineAction({
-      accessRole: access.access_role,
-      accessSource: access.access_source,
-      execGranted: access.exec_granted === true,
-      execEnabled: true,
-      participantTurn: false,
-    }, MACHINE_ACTION.GUI_INPUT);
-    return decision.allowed ? REMOTE_DESKTOP_ACCESS_MODE.CONTROL : REMOTE_DESKTOP_ACCESS_MODE.VIEW;
+    return access.access_role === 'viewer'
+      ? REMOTE_DESKTOP_ACCESS_MODE.VIEW
+      : REMOTE_DESKTOP_ACCESS_MODE.CONTROL;
   }
 
   handlesType(type: unknown): boolean {

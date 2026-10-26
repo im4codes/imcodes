@@ -1068,6 +1068,18 @@ describe('RemoteDesktopClient', () => {
       reason: REMOTE_DESKTOP_MODE_REASON.USER_SELECTED,
     });
     await vi.waitFor(() => expect(client.current()).toMatchObject({ mode: 'view', inputEpoch: 2, inputEnabled: false }));
+    client.setMode(REMOTE_DESKTOP_ACCESS_MODE.CONTROL);
+    socket.receive({
+      type: REMOTE_DESKTOP_MSG.ERROR,
+      requestId: start.requestId,
+      error: REMOTE_DESKTOP_ERROR.ACCESS_DENIED,
+      retryable: false,
+    });
+    await vi.waitFor(() => expect(client.current()).toMatchObject({
+      mode: REMOTE_DESKTOP_ACCESS_MODE.VIEW,
+      modeError: REMOTE_DESKTOP_ERROR.ACCESS_DENIED,
+    }));
+    expect(client.current().state).not.toBe(REMOTE_DESKTOP_STATE.FAILED);
     expect(snapshots.length).toBeGreaterThan(3);
     control.receive({
       type: REMOTE_DESKTOP_DATA_MSG.QUALITY,
