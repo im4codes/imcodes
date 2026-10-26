@@ -133,7 +133,7 @@ const contracts: Contract[] = [
       {
         path: 'server/src/ws/remote-desktop-router.ts',
         method: "resolveStableAccountAccess",
-        needle: "this.hooks.resolveAccess ?? resolveRemoteDesktopHostOperatorAccess",
+        needle: "this.hooks.resolveAccess ?? resolveRemoteDesktopHostAccess",
       },
       {
         path: 'server/src/ws/remote-desktop-router.ts',
@@ -1411,14 +1411,14 @@ const mutations: Mutation[] = [
     name: 'remove access revalidation',
     contract: 'continuous access revalidation',
     path: 'server/src/ws/remote-desktop-router.ts',
-    needle: 'this.hooks.resolveAccess ?? resolveRemoteDesktopHostOperatorAccess',
+    needle: 'this.hooks.resolveAccess ?? resolveRemoteDesktopHostAccess',
   },
   {
     name: "remove centralized authority resolver",
     contract: 'continuous access revalidation',
     path: 'server/src/ws/remote-desktop-router.ts',
     method: "resolveStableAccountAccess",
-    needle: "this.hooks.resolveAccess ?? resolveRemoteDesktopHostOperatorAccess",
+    needle: "this.hooks.resolveAccess ?? resolveRemoteDesktopHostAccess",
   },
   {
     name: "remove pre-query durable revision",

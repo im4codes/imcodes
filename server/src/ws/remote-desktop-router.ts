@@ -5,7 +5,7 @@ import { machineGroupInvalidationReady, machineGroupInvalidationRevision } from 
 import { evaluateMachineAction, MACHINE_ACTION } from '../../../shared/machine-access-policy.js';
 import {
   canOperateControlledMachine,
-  resolveRemoteDesktopHostOperatorAccess,
+  resolveRemoteDesktopHostAccess,
   type ControlledMachineAccessRow,
 } from '../share/machine-access.js';
 import {
@@ -1511,7 +1511,13 @@ export class RemoteDesktopRouter {
     access: ControlledMachineAccessRow | null,
     now: number,
   ): RemoteDesktopAccessFault | null {
-    if (!access || !canOperateControlledMachine(access.access_role)) return 'denied';
+    if (!access) return 'denied';
+    // Controlled nodes expose a read-only remote-desktop surface to an
+    // explicit Viewer share. The browser WS is quarantined to the
+    // remote-desktop namespace, and accessModeCeiling() keeps input disabled.
+    // Full daemons retain the older operator-only account path.
+    const controlledNode = access.node_role === NODE_ROLE.CONTROLLED;
+    if (!controlledNode && !canOperateControlledMachine(access.access_role)) return 'denied';
     // A normal (FULL) daemon serves remote control from the same native worker,
     // but the controlled-node columns do not describe it: `exec_enabled` is the
     // controlled-node exec switch (and is false on daemon rows predating its
@@ -1520,7 +1526,6 @@ export class RemoteDesktopRouter {
     // daemon those three facts are instead proven live — it advertises the
     // remote-desktop capability only on win32 with the worker installed, which
     // `daemonSupportsRemoteDesktop()` checks before and after this admission.
-    const controlledNode = access.node_role === NODE_ROLE.CONTROLLED;
     if (access.access_role !== 'owner'
       && access.access_expires_at !== null
       && (typeof access.access_expires_at !== 'number'
@@ -1894,7 +1899,7 @@ export class RemoteDesktopRouter {
     for (let attempt = 0; attempt < 3; attempt++) {
       const epoch = this.authorizationEpoch;
       const before = await machineGroupInvalidationRevision(db);
-      const access = await (this.hooks.resolveAccess ?? resolveRemoteDesktopHostOperatorAccess)(db, userId, this.hooks.serverId(), now);
+      const access = await (this.hooks.resolveAccess ?? resolveRemoteDesktopHostAccess)(db, userId, this.hooks.serverId(), now);
       const revision = await machineGroupInvalidationRevision(db);
       if (access?.node_role === NODE_ROLE.CONTROLLED && !machineGroupInvalidationReady(db)) {
         return { access: null, epoch, revision };

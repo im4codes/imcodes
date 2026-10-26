@@ -964,6 +964,7 @@ describe('RemoteDesktopRouter', () => {
 
   it.each([
     ['direct owner control', 'owner-user', {}, REMOTE_DESKTOP_ACCESS_MODE.CONTROL],
+    ['direct share viewer', 'share-viewer', { access_role: 'viewer', access_source: 'share', exec_granted: false }, REMOTE_DESKTOP_ACCESS_MODE.VIEW],
     ['direct share view', 'share-viewer', { access_role: 'participant', access_source: 'share', exec_granted: false }, REMOTE_DESKTOP_ACCESS_MODE.VIEW],
     ['group inherited view', 'group-viewer', { access_role: 'participant', access_source: 'group', exec_granted: false }, REMOTE_DESKTOP_ACCESS_MODE.VIEW],
     ['direct share control grant', 'share-controller', { access_role: 'participant', access_source: 'share', exec_granted: true }, REMOTE_DESKTOP_ACCESS_MODE.CONTROL],
@@ -982,7 +983,7 @@ describe('RemoteDesktopRouter', () => {
   });
 
   it.each([
-    ['viewer', { access_role: 'viewer' }, REMOTE_DESKTOP_ERROR.ACCESS_DENIED],
+    ['viewer with disabled exec', { access_role: 'viewer', exec_enabled: false }, REMOTE_DESKTOP_ERROR.EXECUTION_DISABLED],
     ['disabled', { exec_enabled: false }, REMOTE_DESKTOP_ERROR.EXECUTION_DISABLED],
     // Enrolled as linux but still advertising the bare legacy Windows token
     // (validAccess()'s default capabilities) -- a genuine mismatch, not the

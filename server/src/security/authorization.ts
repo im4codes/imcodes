@@ -15,7 +15,7 @@ import {
   // Keep it on the same host resolver as the signaling router so a shared
   // controlled node cannot be listed by one permission path and rejected by
   // another one before the router can select View vs Control.
-  resolveRemoteDesktopHostOperatorAccess,
+  resolveRemoteDesktopHostAccess,
 } from '../share/machine-access.js';
 import { resolveEffectiveShareCoverage } from '../db/tab-sharing.js';
 import { isAccountSessionJwt } from './account-session-jwt.js';
@@ -327,7 +327,7 @@ export function requireTeamRole(minRole: 'owner' | 'admin' | 'member' = 'member'
 export type ServerRole = 'owner' | 'admin' | 'member' | 'none';
 export type ServerWebSocketAccess =
   | { kind: 'standard'; role: Exclude<ServerRole, 'none'> }
-  | { kind: 'controlled'; role: 'owner' | 'participant' };
+  | { kind: 'controlled'; role: 'owner' | 'participant' | 'viewer' };
 
 /**
  * Resolve the user's role for a specific server.
@@ -394,8 +394,8 @@ export async function resolveServerRole(
 }
 
 /**
- * WebSocket admission includes active Owner/Participant controlled-machine
- * grants, while keeping Viewers and unrelated users out. Returning the target
+ * WebSocket admission includes every active controlled-machine share grant,
+ * including read-only Viewers, while keeping unrelated users out. Returning the target
  * kind lets WsBridge default-deny every non-remote-desktop browser frame even
  * while the controlled daemon is offline or reconnecting.
  */
@@ -412,7 +412,7 @@ export async function resolveServerWebSocketAccess(
   if (!target) return null;
 
   if (target.node_role === NODE_ROLE.CONTROLLED) {
-    const host = await resolveRemoteDesktopHostOperatorAccess(db, userId, serverId, now);
+    const host = await resolveRemoteDesktopHostAccess(db, userId, serverId, now);
     if (!host) return null;
     return { kind: 'controlled', role: host.access_role };
   }
