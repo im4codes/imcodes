@@ -16,7 +16,7 @@ const AUTHORITY_MATRIX = [
   ['OCU / Computer Use', '../src/routes/machine-computer-use.ts', 'gateMachineAction'],
   ['file operations and transfers', '../src/routes/file-transfer.ts', 'resolveControlledMachineOperatorAccess'],
   ['status and device actions', '../src/routes/machines.ts', 'resolveControlledMachineManagementAccess'],
-  ['controlled-device websocket admission', '../src/security/authorization.ts', 'resolveControlledMachineOperatorAccess'],
+  ['controlled-device websocket admission', '../src/security/authorization.ts', 'resolveRemoteDesktopHostOperatorAccess'],
   ['remote desktop and control', '../src/ws/remote-desktop-router.ts', 'resolveRemoteDesktopHostOperatorAccess'],
 ] as const;
 

@@ -11,6 +11,7 @@ import { ensureCanonicalHostForServer } from '../src/services/remote-desktop-hos
 import { createOrUpdateShare } from '../src/db/tab-sharing.js';
 import { RemoteDesktopRouter } from '../src/ws/remote-desktop-router.js';
 import { generateControlledNodeId } from '../src/services/controlled-node-identity.js';
+import { resolveServerWebSocketAccess } from '../src/security/authorization.js';
 
 const hex = (bytes: number) => randomBytes(bytes).toString('hex');
 const sha256 = (value: string) => createHash('sha256').update(value).digest('hex');
@@ -133,6 +134,35 @@ async function start(
 }
 
 describe('remote desktop real-PostgreSQL authorization and teardown', () => {
+  it('uses the same shared host authority for account WebSocket tickets and signaling', async () => {
+    const ownerId = `rd-owner-${hex(5)}`;
+    const directId = `rd-direct-${hex(5)}`;
+    const groupId = `rd-group-${hex(5)}`;
+    const viewerId = `rd-viewer-${hex(5)}`;
+    await Promise.all([createUser(db, ownerId), createUser(db, directId), createUser(db, groupId), createUser(db, viewerId)]);
+    const serverId = await createControlledNode(ownerId);
+    await grant(ownerId, directId, serverId, 'participant');
+    await grant(ownerId, viewerId, serverId, 'viewer');
+    const teamId = await seedDesk(ownerId);
+    await db.execute(
+      'INSERT INTO team_members (team_id, user_id, role, joined_at) VALUES ($1,$2,$3,$4)',
+      [teamId, groupId, 'member', Date.now()],
+    );
+    await db.execute(
+      'INSERT INTO machine_groups (server_id, team_id, added_at) VALUES ($1,$2,$3)',
+      [serverId, teamId, Date.now()],
+    );
+
+    // This is the exact account-ticket gate used before the browser reaches
+    // RemoteDesktopRouter. All three operable identities must cross it; a
+    // Viewer and an unrelated account must not.
+    await expect(resolveServerWebSocketAccess(db, serverId, ownerId)).resolves.toMatchObject({ kind: 'controlled', role: 'owner' });
+    await expect(resolveServerWebSocketAccess(db, serverId, directId)).resolves.toMatchObject({ kind: 'controlled', role: 'participant' });
+    await expect(resolveServerWebSocketAccess(db, serverId, groupId)).resolves.toMatchObject({ kind: 'controlled', role: 'participant' });
+    await expect(resolveServerWebSocketAccess(db, serverId, viewerId)).resolves.toBeNull();
+    await expect(resolveServerWebSocketAccess(db, serverId, `rd-outsider-${hex(5)}`)).resolves.toBeNull();
+  });
+
   it('fails active Participant sessions closed after committed downgrade and expiry', async () => {
     const ownerId = `rd-owner-${hex(5)}`;
     const participantId = `rd-participant-${hex(5)}`;
