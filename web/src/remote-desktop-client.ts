@@ -1387,7 +1387,17 @@ export class RemoteDesktopClient {
       if (!this.peer || !this.awaitingAnswer) return;
       await this.peer.setRemoteDescription({ type: 'answer', sdp: message.sdp });
       this.awaitingAnswer = false;
-      await this.pendingRemoteCandidates.flush((candidate) => this.peer?.addIceCandidate(candidate));
+      const peer = this.peer;
+      try {
+        await this.pendingRemoteCandidates.flush((candidate) => peer.addIceCandidate(candidate));
+      } catch {
+        // A shared relay can deliver a candidate from the superseded offer
+        // after the answer is installed. WebRTC rejects that stale/duplicate
+        // candidate even though the authenticated signaling frame is valid.
+        // Recover with the bounded ICE-restart path instead of mapping this
+        // recoverable peer error to a terminal protocol_error.
+        await this.recoverRemoteIceFailure(peer);
+      }
       return;
     }
     if (message.type === REMOTE_DESKTOP_MSG.ICE) {
@@ -1399,8 +1409,16 @@ export class RemoteDesktopClient {
       const candidate = { candidate: message.candidate, sdpMid: message.mid };
       if (!this.peer?.remoteDescription || this.awaitingAnswer) {
         this.pendingRemoteCandidates.push(candidate);
+      } else {
+        const peer = this.peer;
+        try {
+          await peer.addIceCandidate(candidate);
+        } catch {
+          // See the queued-candidate path above: late candidates are a
+          // recoverable shared-viewer relay race, not a protocol violation.
+          await this.recoverRemoteIceFailure(peer);
+        }
       }
-      else await this.peer.addIceCandidate(candidate);
       return;
     }
     if (message.type === REMOTE_DESKTOP_MSG.MODE_STATE) {
@@ -2099,6 +2117,18 @@ export class RemoteDesktopClient {
     } catch {
       this.fail(REMOTE_DESKTOP_TERMINAL_REASON.PEER_FAILED);
     }
+  }
+
+  /**
+   * Recover a WebRTC candidate application failure without weakening wire
+   * validation. The signaling frame has already passed the strict protocol
+   * parser; only the browser's peer state rejected it (typically a stale or
+   * duplicate candidate relayed to one shared viewer). A restart is bounded
+   * by the existing ICE-restart budget and reports peer_failed when exhausted.
+   */
+  private async recoverRemoteIceFailure(peer: RTCPeerConnection): Promise<void> {
+    if (this.stopped || this.peer !== peer || this.iceRestartInFlight) return;
+    await this.restartIce(peer);
   }
 
   private handleSignalingClose(): void {
