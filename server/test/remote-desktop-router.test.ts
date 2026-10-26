@@ -227,7 +227,7 @@ describe('RemoteDesktopRouter', () => {
       mode: REMOTE_DESKTOP_ACCESS_MODE.VIEW,
     });
     expect(f.daemonMessages.find((message) => message.type === REMOTE_DESKTOP_MSG.PREPARE))
-      .toMatchObject({ mode: REMOTE_DESKTOP_ACCESS_MODE.VIEW });
+      .toMatchObject({ mode: REMOTE_DESKTOP_ACCESS_MODE.VIEW, inputEpoch: 0 });
   });
 
   // tsk_9a8c291594: remote-desktop CONTROL injects keyboard/mouse input, which can launch anything as the signed-in user. It is
@@ -240,7 +240,7 @@ describe('RemoteDesktopRouter', () => {
         const authority = f.messages(f.browserA).at(-1)!;
         expect(authority).toMatchObject({ type: REMOTE_DESKTOP_MSG.AUTHORIZED, mode: REMOTE_DESKTOP_ACCESS_MODE.VIEW });
         expect(f.daemonMessages.find((message) => message.type === REMOTE_DESKTOP_MSG.PREPARE))
-          .toMatchObject({ mode: REMOTE_DESKTOP_ACCESS_MODE.VIEW });
+          .toMatchObject({ mode: REMOTE_DESKTOP_ACCESS_MODE.VIEW, inputEpoch: 0 });
 
         await f.router.handleBrowser(f.browserA, 'someone', {
           type: REMOTE_DESKTOP_MSG.MODE_SET,

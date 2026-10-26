@@ -1122,6 +1122,21 @@ function validateAuthority(value: Record<string, unknown>): boolean {
     && value.iceServers.every(isDirectFileTransferIceServerConfig);
 }
 
+/**
+ * PREPARE establishes the first input fence for a route.  A viewer has no
+ * input authority (epoch zero); a control route may be a fresh route or a
+ * bounded worker replacement carrying a newer, still-live epoch.  Keeping
+ * this rule in the shared validator prevents the TypeScript daemon and the
+ * native worker from disagreeing and turning a valid shared viewer into a
+ * terminal protocol error.
+ */
+function validateInitialAuthority(value: Record<string, unknown>): boolean {
+  if (typeof value.inputEpoch !== 'number') return false;
+  return value.mode === REMOTE_DESKTOP_ACCESS_MODE.VIEW
+    ? value.inputEpoch === 0
+    : value.inputEpoch > 0;
+}
+
 function validateSdp(value: Record<string, unknown>): boolean {
   return hasSessionCorrelation(value) && isBoundedString(value.sdp, REMOTE_DESKTOP_LIMITS.SDP_BYTES);
 }
@@ -1204,6 +1219,7 @@ export function validateRemoteDesktopDaemonCommand(value: unknown): RemoteDeskto
   if (value.type === REMOTE_DESKTOP_MSG.PREPARE) {
     if (!hasExactKeys(value, ['type', 'requestId', 'sessionId', 'capability', 'expiresAt', 'leaseExpiresAt', 'daemonGeneration', 'mode', 'inputEpoch', 'iceServers'], ['routeGeneration', 'reconnectAttempt', 'relayBitrateCapBps'])
       || !validateAuthority(value)
+      || !validateInitialAuthority(value)
       || (value.relayBitrateCapBps !== undefined && !isRelayBitrateCap(value.relayBitrateCapBps))
       || (value.routeGeneration !== undefined && !isSafeNonNegative(value.routeGeneration))
       || (value.reconnectAttempt !== undefined

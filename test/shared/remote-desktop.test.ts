@@ -268,6 +268,20 @@ describe('remote desktop production contract', () => {
       type: REMOTE_DESKTOP_MSG.PREPARE,
       ...authority,
     })).toMatchObject({ ok: true });
+    // The native Windows worker admits a viewer only with an empty input
+    // authority.  A view+1 PREPARE is a server/worker contract mismatch, not
+    // a valid shared session that should be allowed to reach the worker.
+    expect(validateRemoteDesktopDaemonCommand({
+      type: REMOTE_DESKTOP_MSG.PREPARE,
+      ...authority,
+      inputEpoch: 1,
+    })).toEqual({ ok: false, error: REMOTE_DESKTOP_ERROR.INVALID_REQUEST });
+    expect(validateRemoteDesktopDaemonCommand({
+      type: REMOTE_DESKTOP_MSG.PREPARE,
+      ...authority,
+      mode: REMOTE_DESKTOP_ACCESS_MODE.CONTROL,
+      inputEpoch: 2,
+    })).toMatchObject({ ok: true });
     expect(hasRemoteDesktopIndependentRouteGeneration({})).toBe(false);
     expect(hasRemoteDesktopIndependentRouteGeneration({ routeGeneration: 0 })).toBe(true);
     expect(validateRemoteDesktopDaemonCommand({

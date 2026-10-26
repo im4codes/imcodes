@@ -1256,6 +1256,9 @@ export class RemoteDesktopRouter {
       authorizedAt + REMOTE_DESKTOP_LIMITS.LEASE_DURATION_MS,
       expiresAt,
     );
+    const initialMode = accessModeCeiling === REMOTE_DESKTOP_ACCESS_MODE.VIEW
+      ? REMOTE_DESKTOP_ACCESS_MODE.VIEW
+      : this.admittedMode();
     const route = this.createRoute({
       requestId: start.requestId,
       sessionId,
@@ -1286,8 +1289,12 @@ export class RemoteDesktopRouter {
       // Accessibility is not granted -- refuses a Control PREPARE outright, so
       // admitting it as Control failed every attempt with worker_failed and
       // the browser retried forever. It is admitted to View instead.
-      mode: accessModeCeiling === REMOTE_DESKTOP_ACCESS_MODE.VIEW ? REMOTE_DESKTOP_ACCESS_MODE.VIEW : this.admittedMode(),
-      inputEpoch: 1,
+      mode: initialMode,
+      // A read-only route has no input authority yet.  Windows PREPARE
+      // validates this initial fence as view+0; control routes start at the
+      // first control epoch.  Sending view+1 makes the worker reject an
+      // otherwise authorized shared viewer as protocol_error.
+      inputEpoch: initialMode === REMOTE_DESKTOP_ACCESS_MODE.VIEW ? 0 : 1,
       reconnectAttempt: start.reconnectAttempt ?? 0,
       registryIdentity,
     });
@@ -1433,6 +1440,9 @@ export class RemoteDesktopRouter {
       return;
     }
     const capability = this.deriveCapability(start.requestId, pending.sessionId);
+    const initialMode = pending.actor.modeCeiling === REMOTE_DESKTOP_ACCESS_MODE.VIEW
+      ? REMOTE_DESKTOP_ACCESS_MODE.VIEW
+      : this.admittedMode();
     const route = this.createRoute({
       requestId: start.requestId,
       sessionId: pending.sessionId,
@@ -1444,8 +1454,10 @@ export class RemoteDesktopRouter {
       createdAt: now,
       expiresAt,
       leaseExpiresAt: Math.min(now + REMOTE_DESKTOP_LIMITS.LEASE_DURATION_MS, expiresAt),
-      mode: pending.actor.modeCeiling,
-      inputEpoch: 1,
+      mode: initialMode,
+      // Keep the native PREPARE contract aligned for attended/group viewers:
+      // view starts at epoch zero, while control starts with an owned epoch.
+      inputEpoch: initialMode === REMOTE_DESKTOP_ACCESS_MODE.VIEW ? 0 : 1,
       reconnectAttempt: start.reconnectAttempt ?? 0,
       registryIdentity: pending.registryIdentity,
     });
