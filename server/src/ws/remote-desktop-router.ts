@@ -1823,6 +1823,14 @@ export class RemoteDesktopRouter {
         this.failRoute(route, terminalReason, true);
         return;
       }
+      // A live session is bound to the role that admitted it. A participant
+      // downgraded to Viewer must reconnect to receive a read-only session;
+      // silently mutating an existing route would retain stale authority and
+      // makes revocation/expiry indistinguishable from a harmless mode change.
+      if (route.accessRole !== undefined && route.accessRole !== access!.access_role) {
+        this.failRoute(route, REMOTE_DESKTOP_TERMINAL_REASON.AUTHORITY_REVOKED, true);
+        return;
+      }
       // The execute grant can be revoked (or the role downgraded) while the route lives: CONTROL ends at this revalidation, exactly as
       // the exec switch ends the route.
       const ceiling = this.accessModeCeiling(access!);

@@ -154,12 +154,12 @@ describe('remote desktop real-PostgreSQL authorization and teardown', () => {
     );
 
     // This is the exact account-ticket gate used before the browser reaches
-    // RemoteDesktopRouter. All three operable identities must cross it; a
-    // Viewer and an unrelated account must not.
+    // RemoteDesktopRouter. Owner, participant and read-only Viewer shares,
+    // plus group members, cross it; an unrelated account must not.
     await expect(resolveServerWebSocketAccess(db, serverId, ownerId)).resolves.toMatchObject({ kind: 'controlled', role: 'owner' });
     await expect(resolveServerWebSocketAccess(db, serverId, directId)).resolves.toMatchObject({ kind: 'controlled', role: 'participant' });
     await expect(resolveServerWebSocketAccess(db, serverId, groupId)).resolves.toMatchObject({ kind: 'controlled', role: 'participant' });
-    await expect(resolveServerWebSocketAccess(db, serverId, viewerId)).resolves.toBeNull();
+    await expect(resolveServerWebSocketAccess(db, serverId, viewerId)).resolves.toMatchObject({ kind: 'controlled', role: 'viewer' });
     await expect(resolveServerWebSocketAccess(db, serverId, `rd-outsider-${hex(5)}`)).resolves.toBeNull();
   });
 
