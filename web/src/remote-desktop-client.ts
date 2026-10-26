@@ -2129,7 +2129,10 @@ export class RemoteDesktopClient {
   }
 
   private remoteCandidateKey(candidate: RTCIceCandidateInit): string {
-    return `${candidate.sdpMid ?? ''}\u0000${candidate.sdpMLineIndex ?? ''}\u0000${candidate.candidate ?? ''}`;
+    // A client instance owns one authenticated session; include that session
+    // identity explicitly so keys cannot cross a reused authority. Generation
+    // is represented by the applied-vs-retired sets below.
+    return `${this.sessionId ?? ''}\u0000${candidate.sdpMid ?? ''}\u0000${candidate.sdpMLineIndex ?? ''}\u0000${candidate.candidate ?? ''}`;
   }
 
   private retireRemoteIceGeneration(): void {
