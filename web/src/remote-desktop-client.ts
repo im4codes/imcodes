@@ -517,6 +517,10 @@ class RemoteDesktopSignalingSocket {
 export class RemoteDesktopClient {
   private readonly signaling: RemoteDesktopSignalingSocket;
   private readonly pendingRemoteCandidates = new PendingWebRtcCandidates<RTCIceCandidateInit>();
+  /** Candidate keys are tracked so only known stale/duplicate relay frames recover. */
+  private readonly pendingRemoteCandidateKeys = new Set<string>();
+  private readonly appliedRemoteCandidateKeys = new Set<string>();
+  private readonly retiredRemoteCandidateKeys = new Set<string>();
   private peer: RTCPeerConnection | null = null;
   /** The grant this session was authorized with, replayed on a worker handover. */
   private authorized: Extract<RemoteDesktopServerMessage, { type: typeof REMOTE_DESKTOP_MSG.AUTHORIZED }> | null = null;
@@ -1261,6 +1265,8 @@ export class RemoteDesktopClient {
       this.localIceCandidates = 0;
       this.remoteIceCandidates = 0;
       this.pendingRemoteCandidates.clear();
+      this.pendingRemoteCandidateKeys.clear();
+      this.retireRemoteIceGeneration();
       if (this.statsTimer) clearInterval(this.statsTimer);
       this.statsTimer = null;
       this.previousInboundStats = null;
@@ -1389,14 +1395,14 @@ export class RemoteDesktopClient {
       this.awaitingAnswer = false;
       const peer = this.peer;
       try {
-        await this.pendingRemoteCandidates.flush((candidate) => peer.addIceCandidate(candidate));
+        await this.pendingRemoteCandidates.flush(async (candidate) => {
+          const key = this.remoteCandidateKey(candidate);
+          this.pendingRemoteCandidateKeys.delete(key);
+          await this.applyRemoteIceCandidate(peer, candidate, key);
+        });
       } catch {
-        // A shared relay can deliver a candidate from the superseded offer
-        // after the answer is installed. WebRTC rejects that stale/duplicate
-        // candidate even though the authenticated signaling frame is valid.
-        // Recover with the bounded ICE-restart path instead of mapping this
-        // recoverable peer error to a terminal protocol_error.
-        await this.recoverRemoteIceFailure(peer);
+        // applyRemoteIceCandidate has already classified the failure. This
+        // catch only protects the event callback from an unexpected exception.
       }
       return;
     }
@@ -1408,16 +1414,16 @@ export class RemoteDesktopClient {
       }
       const candidate = { candidate: message.candidate, sdpMid: message.mid };
       if (!this.peer?.remoteDescription || this.awaitingAnswer) {
-        this.pendingRemoteCandidates.push(candidate);
+        const key = this.remoteCandidateKey(candidate);
+        if (!this.appliedRemoteCandidateKeys.has(key)
+          && !this.retiredRemoteCandidateKeys.has(key)
+          && !this.pendingRemoteCandidateKeys.has(key)) {
+          this.pendingRemoteCandidates.push(candidate);
+          this.pendingRemoteCandidateKeys.add(key);
+        }
       } else {
         const peer = this.peer;
-        try {
-          await peer.addIceCandidate(candidate);
-        } catch {
-          // See the queued-candidate path above: late candidates are a
-          // recoverable shared-viewer relay race, not a protocol violation.
-          await this.recoverRemoteIceFailure(peer);
-        }
+        await this.applyRemoteIceCandidate(peer, candidate, this.remoteCandidateKey(candidate));
       }
       return;
     }
@@ -2090,6 +2096,9 @@ export class RemoteDesktopClient {
     // into a protocol_error.
     this.localIceCandidates = 0;
     this.remoteIceCandidates = 0;
+    this.retireRemoteIceGeneration();
+    this.pendingRemoteCandidates.clear();
+    this.pendingRemoteCandidateKeys.clear();
     this.releaseAll();
     this.workerInputEnabled = false;
     this.requirePresentedFrameForCurrentTopology();
@@ -2116,6 +2125,41 @@ export class RemoteDesktopClient {
       );
     } catch {
       this.fail(REMOTE_DESKTOP_TERMINAL_REASON.PEER_FAILED);
+    }
+  }
+
+  private remoteCandidateKey(candidate: RTCIceCandidateInit): string {
+    return `${candidate.sdpMid ?? ''}\u0000${candidate.sdpMLineIndex ?? ''}\u0000${candidate.candidate ?? ''}`;
+  }
+
+  private retireRemoteIceGeneration(): void {
+    for (const key of this.appliedRemoteCandidateKeys) this.retiredRemoteCandidateKeys.add(key);
+    this.appliedRemoteCandidateKeys.clear();
+    // Keep the stale-key memory bounded with the wire candidate cap.
+    while (this.retiredRemoteCandidateKeys.size > REMOTE_DESKTOP_LIMITS.MAX_ICE_CANDIDATES) {
+      const oldest = this.retiredRemoteCandidateKeys.values().next().value as string | undefined;
+      if (oldest === undefined) break;
+      this.retiredRemoteCandidateKeys.delete(oldest);
+    }
+  }
+
+  private async applyRemoteIceCandidate(
+    peer: RTCPeerConnection,
+    candidate: RTCIceCandidateInit,
+    key: string,
+  ): Promise<void> {
+    if (this.appliedRemoteCandidateKeys.has(key)) return;
+    if (this.retiredRemoteCandidateKeys.has(key)) {
+      await this.recoverRemoteIceFailure(peer);
+      return;
+    }
+    try {
+      await peer.addIceCandidate(candidate);
+      this.appliedRemoteCandidateKeys.add(key);
+    } catch {
+      // An unknown candidate rejection is not evidence of a stale relay. Keep
+      // strict protocol semantics for malformed/mismatched candidates.
+      this.fail(REMOTE_DESKTOP_TERMINAL_REASON.PROTOCOL_ERROR);
     }
   }
 

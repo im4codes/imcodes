@@ -963,6 +963,25 @@ describe('RemoteDesktopRouter', () => {
   });
 
   it.each([
+    ['direct owner control', 'owner-user', {}, REMOTE_DESKTOP_ACCESS_MODE.CONTROL],
+    ['direct share view', 'share-viewer', { access_role: 'participant', access_source: 'share', exec_granted: false }, REMOTE_DESKTOP_ACCESS_MODE.VIEW],
+    ['group inherited view', 'group-viewer', { access_role: 'participant', access_source: 'group', exec_granted: false }, REMOTE_DESKTOP_ACCESS_MODE.VIEW],
+    ['direct share control grant', 'share-controller', { access_role: 'participant', access_source: 'share', exec_granted: true }, REMOTE_DESKTOP_ACCESS_MODE.CONTROL],
+  ] as const)('%s keeps per-viewer authority and mode boundaries', async (_label, userId, access, expectedMode) => {
+    const f = fixture({ resolveAccess: async () => ({ ...validAccess(), ...access }) });
+    await f.router.handleBrowser(f.browserA, userId, { ...start, requestId: 'request_viewer_a' });
+    await f.router.handleBrowser(f.browserB, userId, { ...start, requestId: 'request_viewer_b' });
+    const first = f.messages(f.browserA).at(-1)!;
+    const second = f.messages(f.browserB).at(-1)!;
+    expect(first).toMatchObject({ type: REMOTE_DESKTOP_MSG.AUTHORIZED, mode: expectedMode });
+    expect(second).toMatchObject({ type: REMOTE_DESKTOP_MSG.AUTHORIZED, mode: expectedMode });
+    expect(first.sessionId).not.toBe(second.sessionId);
+    expect(first.capability).not.toBe(second.capability);
+    expect(first.daemonGeneration).toBe(second.daemonGeneration);
+    expect(f.daemonMessages.filter((message) => message.type === REMOTE_DESKTOP_MSG.PREPARE)).toHaveLength(2);
+  });
+
+  it.each([
     ['viewer', { access_role: 'viewer' }, REMOTE_DESKTOP_ERROR.ACCESS_DENIED],
     ['disabled', { exec_enabled: false }, REMOTE_DESKTOP_ERROR.EXECUTION_DISABLED],
     // Enrolled as linux but still advertising the bare legacy Windows token
