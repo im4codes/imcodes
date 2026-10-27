@@ -300,6 +300,25 @@ export function notarizeExecutable(input) {
 const NOTARIZATION_TRANSPORT_FAILURE =
   /HTTPClientError\.(?:connectTimeout|connectionLost|deadlineExceeded)|NSURLErrorDomain|The request timed out|Could not connect to the server|connection was lost/iu;
 
+/**
+ * Apple can accept a submission before the ticket is visible to stapler's
+ * CloudKit edge. Keep this window bounded, but longer than the 75 seconds that
+ * proved insufficient for the DMG in CI. The final value is the maximum sleep;
+ * there are seven sleeps and therefore eight total staple attempts.
+ */
+export const MACOS_STAPLE_RETRY_DELAYS_SECONDS = Object.freeze([5, 10, 20, 30, 45, 60, 60]);
+
+const STAPLER_TRANSIENT_FAILURE =
+  /HTTPClientError\.(?:connectTimeout|connectionLost|deadlineExceeded)|NSURLErrorDomain|(?:request|operation|connection|network) (?:timed out|was lost)|Could not connect to the server|CloudKit query .* failed|The staple and validate action failed! Error (?:65|73)\b/iu;
+
+function errorText(error) {
+  return `${error?.stderr ?? ''}${error?.stdout ?? ''}${error?.message ?? ''}`;
+}
+
+export function isTransientStaplerFailure(error) {
+  return STAPLER_TRANSIENT_FAILURE.test(errorText(error));
+}
+
 function submitForNotarization(input) {
   const { artifactPath, apiKeyPath, apiKeyId, apiIssuer } = input;
   const direct = macosArtifactCanBeSubmittedDirectly(artifactPath);
@@ -349,10 +368,12 @@ export function notarizeAndStaple(input) {
   const submission = submitForNotarization(input);
   // Stapled onto the artifact itself, which for an app is the bundle and not
   // the archive it travelled in.
-  // Notarization ticket replication across Apple's CloudKit CDN can take a few
-  // seconds after `notarytool` reports acceptance. Retry stapling with backoff
-  // so a transient propagation delay does not fail the build.
-  const attempts = input.stapleAttempts ?? 6;
+  // Notarization ticket replication across Apple's CloudKit CDN can take longer
+  // than `notarytool --wait` after it reports acceptance. Retry only classified
+  // transport/propagation failures; malformed artifacts and other permanent
+  // stapler verdicts still fail immediately and can never produce a record.
+  const delays = input.stapleRetryDelaysSeconds ?? MACOS_STAPLE_RETRY_DELAYS_SECONDS;
+  const attempts = input.stapleAttempts ?? delays.length + 1;
   let lastError;
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
     try {
@@ -362,9 +383,13 @@ export function notarizeAndStaple(input) {
       break;
     } catch (error) {
       lastError = error;
+      const retryable = isTransientStaplerFailure(error);
+      if (!retryable || attempt >= attempts) break;
       if (attempt < attempts) {
+        const delay = delays[attempt - 1];
+        process.stderr.write(`[macOS stapler] transient failure for ${artifactPath}; retry ${attempt + 1}/${attempts} in ${delay ?? 0}s\n`);
         try {
-          execFileSync('sleep', [String(attempt * 5)]);
+          if (delay > 0) execFileSync('sleep', [String(delay)]);
         } catch {
           // ignore sleep error
         }
