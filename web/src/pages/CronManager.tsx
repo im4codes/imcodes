@@ -101,6 +101,8 @@ interface Props {
   ws?: WsClient | null;
   /** Concrete covered session used to authorize a received share. */
   sharedSessionName?: string;
+  /** Any incoming share (server-wide or session-scoped), used to keep list scope fixed. */
+  sharedScope?: boolean;
   /** Viewer shares can inspect schedules and history but cannot mutate them. */
   readOnly?: boolean;
   /**
@@ -232,7 +234,7 @@ function isCurrentContextJob(job: Pick<CronJob, 'server_id' | 'project_name'>, s
 
 // ── Component ────────────────────────────────────────────────────────────
 
-export function CronManager({ serverId, projectName, sessions, subSessions = [], activeSession, onBack: _onBack, onViewDiscussion, onNavigateSession, servers = [], ws, sharedSessionName, readOnly = false, windowZIndex, onWindowFocus, portalSubPanels = false }: Props) {
+export function CronManager({ serverId, projectName, sessions, subSessions = [], activeSession, onBack: _onBack, onViewDiscussion, onNavigateSession, servers = [], ws, sharedSessionName, sharedScope = false, readOnly = false, windowZIndex, onWindowFocus, portalSubPanels = false }: Props) {
   const subPanelZIndex = windowZIndex !== undefined
     ? windowZIndex + 1
     : portalSubPanels ? PINNED_CRON_SUBPANEL_Z_INDEX : undefined;
@@ -257,7 +259,7 @@ export function CronManager({ serverId, projectName, sessions, subSessions = [],
     const join = path.includes('?') ? '&' : '?';
     return `${path}${join}sessionName=${encodeURIComponent(sharedSessionName)}`;
   }, [sharedSessionName]);
-  const effectiveShowAllServers = !sharedSessionName && showAllServers;
+  const effectiveShowAllServers = !sharedScope && !sharedSessionName && showAllServers;
 
   // Wrap onNavigateSession to close internal panels before navigating
   const handleNavigateSession = useMemo(() => {
@@ -414,7 +416,7 @@ export function CronManager({ serverId, projectName, sessions, subSessions = [],
             {t('cron.history')}
           </button>
         </div>
-        {!sharedSessionName && <label style={{ color: '#94a3b8', fontSize: '12px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '4px' }}>
+        {!sharedScope && !sharedSessionName && <label style={{ color: '#94a3b8', fontSize: '12px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '4px' }}>
           <input type="checkbox" checked={showAllServers} onChange={toggleShowAll} />
           {t('cron.show_all_servers')}
         </label>}

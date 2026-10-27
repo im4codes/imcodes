@@ -433,9 +433,10 @@ vi.mock('../src/pages/AdminPage.js', () => ({
   AdminPage: ({ onBack }: any) => <button onClick={onBack}>admin-page</button>,
 }));
 vi.mock('../src/pages/CronManager.js', () => ({
-  CronManager: ({ onBack, onNavigateSession, onViewDiscussion }: any) => (
+  CronManager: ({ onBack, onNavigateSession, onViewDiscussion, readOnly, sharedScope, sharedSessionName }: any) => (
     <div>
       cron-manager
+      <span data-testid="cron-manager-access" data-read-only={String(!!readOnly)} data-shared-scope={String(!!sharedScope)} data-shared-session={sharedSessionName ?? ''} />
       <button onClick={() => onNavigateSession?.('deck_alpha_brain', 'quote')}>cron-navigate</button>
       <button onClick={() => onViewDiscussion?.('disc-1')}>cron-discussion</button>
       <button onClick={onBack}>cron-back</button>
@@ -5701,6 +5702,11 @@ describe('App shell', () => {
     await waitFor(() => expect(window.location.hash).toBe(
       '#/srv-shared/deck_beta_brain?shared=share-whole-server',
     ));
+    fireEvent.click(screen.getByText('subbar-cron'));
+    const cronAccess = await screen.findByTestId('cron-manager-access');
+    expect(cronAccess.getAttribute('data-read-only')).toBe('false');
+    expect(cronAccess.getAttribute('data-shared-scope')).toBe('true');
+    fireEvent.click(screen.getByText('cron-back'));
 
     await navigateExternally('/#/srv-late/deck_late_brain?shared=share-late-session-route');
     await waitFor(() => expect(openSharedEntryMock).toHaveBeenCalledWith(lateEntry.target));

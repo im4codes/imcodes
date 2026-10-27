@@ -6118,8 +6118,14 @@ export function App() {
   }
 
   const activeSessionInfo = sessions.find((s) => s.name === activeSession) ?? null;
+  // Session list refreshes can replace the initially hydrated sharedState. Keep
+  // the share entry's role as the durable fallback so a whole-server
+  // participant does not briefly become a viewer (and lose cron controls).
+  const selectedSharedEntry = selectedSharedEntryId
+    ? sharedEntries.find((entry) => entry.id === selectedSharedEntryId)
+    : null;
   const sharedAccessRole = selectedShareTarget
-    ? (activeSessionInfo?.sharedState?.effectiveRole ?? 'viewer')
+    ? (selectedSharedEntry?.role ?? activeSessionInfo?.sharedState?.effectiveRole ?? 'viewer')
     : null;
   const supervisionTaskConsoleVisibility = {
     session: activeSessionInfo,
@@ -7991,6 +7997,7 @@ export function App() {
               subSessions={subSessionsSlim}
               activeSession={activeSession}
               sharedSessionName={canonicalSharedSessionName}
+              sharedScope={Boolean(selectedShareTarget)}
               readOnly={sharedAccessRole === 'viewer'}
               onNavigateSession={(sessionName, quote) => {
                 setShowCronManager(false);
