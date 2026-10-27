@@ -12,7 +12,8 @@
  *   Only EXEC (exec_remote) additionally refuses participant-origin turns. Other actions use the actor's real access and grant.
  *
  * Reading files is EXECUTE-class on purpose: the node's account can read credentials, keys and browser profiles, so "read any path"
- * is a privilege escalation for whoever holds it. Loosen it here, in one place, if the owner decides otherwise.
+ * is a privilege escalation for whoever holds it. Directory listing is the bounded exception for group participants: it powers the
+ * shared remote-desktop picker without granting file fetch, upload, or command execution.
  */
 import { COMPUTER_USE_TOOLS, isReadOnlyComputerUseTool, type ComputerUseToolName } from './computer-use.js';
 
@@ -101,6 +102,11 @@ export function evaluateMachineAction(subject: MachineAccessSubject, action: Mac
   // list_machines does not need the exec switch (a device can be listed while its exec is off).
   if (action === MACHINE_ACTION.LIST) return { allowed: true };
   if (!subject.execEnabled) return { allowed: false, reason: MACHINE_DENIAL_REASON.EXEC_DISABLED };
+  if (action === MACHINE_ACTION.FILE_LIST
+    && subject.accessRole === 'participant'
+    && subject.accessSource === MACHINE_ACCESS_SOURCE.GROUP) {
+    return { allowed: true };
+  }
   if (!machineActionRequiresExecute(action)) return { allowed: true };
   if (action === MACHINE_ACTION.EXEC && subject.participantTurn) return { allowed: false, reason: MACHINE_DENIAL_REASON.PARTICIPANT_TURN };
   if (subject.accessSource === MACHINE_ACCESS_SOURCE.OWNER && subject.accessRole === 'owner') return { allowed: true };

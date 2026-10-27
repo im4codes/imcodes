@@ -11,7 +11,13 @@ const subjects: Array<[string, MachineAccessSubject, boolean, boolean]> = [
 ];
 describe.each(subjects)('%s real access', (_name, subject, mayView, mayExecute) => {
   it.each(Object.values(MACHINE_ACTION))('participant vs owner turn for %s', (action) => {
-    const expected = action === MACHINE_ACTION.EXEC ? false : action === MACHINE_ACTION.LIST || action === MACHINE_ACTION.VIEW ? mayView : mayExecute;
+    const expected = action === MACHINE_ACTION.EXEC
+      ? false
+      : action === MACHINE_ACTION.LIST || action === MACHINE_ACTION.VIEW
+        ? mayView
+        : action === MACHINE_ACTION.FILE_LIST && subject.accessSource === S.GROUP && subject.accessRole === 'participant'
+          ? true
+          : mayExecute;
     expect(evaluateMachineAction(subject, action).allowed).toBe(expected);
     // With provenance absent, grant rules are identical except the exact exec_remote action.
     const ownerTurn = evaluateMachineAction({ ...subject, participantTurn: false }, action);

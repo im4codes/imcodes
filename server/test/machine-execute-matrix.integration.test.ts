@@ -129,8 +129,10 @@ async function admits(name: string, action: MachineAction, token?: string): Prom
   return admission.ok;
 }
 
-/** Who may EXECUTE (exec, shell, GUI input, file send / fetch / list): the owner and the explicit participant WITH the grant. */
+/** Who may EXECUTE (exec, shell, GUI input, file send / fetch): the owner and the explicit participant WITH the grant. */
 const MAY_EXECUTE = ['owner', 'pYes', 'groupAndGrant'];
+/** Directory listing is a bounded shared-picker capability for group participants, not file read/fetch authority. */
+const MAY_LIST = ['owner', 'pYes', 'gMember', 'gAdmin', 'groupAndGrant'];
 /** Who may merely operate (view-class): every access that is not a viewer / nothing. */
 const MAY_VIEW = ['owner', 'pNo', 'pYes', 'gMember', 'gAdmin', 'groupAndGrant'];
 
@@ -151,10 +153,11 @@ describe('role x action matrix (real resolvers, real routes)', () => {
     expect(response.status, name).toBe(MAY_VIEW.includes(name) ? 200 : 403);
   });
 
-  it.each(NAMES)('%s: file send / fetch / list are execute-class too', async (name) => {
-    for (const action of [MACHINE_ACTION.FILE_SEND, MACHINE_ACTION.FILE_FETCH, MACHINE_ACTION.FILE_LIST]) {
+  it.each(NAMES)('%s: file send/fetch stay execute-class while directory list follows bounded picker access', async (name) => {
+    for (const action of [MACHINE_ACTION.FILE_SEND, MACHINE_ACTION.FILE_FETCH]) {
       expect(await admits(name, action), `${name} ${action}`).toBe(MAY_EXECUTE.includes(name));
     }
+    expect(await admits(name, MACHINE_ACTION.FILE_LIST), `${name} file_list`).toBe(MAY_LIST.includes(name));
   });
 
   it.each(NAMES)('%s: controlled discovery includes real live group members without execute', async (name) => {
@@ -220,13 +223,18 @@ describe('only exec_remote is refused on participant-origin turns', () => {
       expect((await attempt(owner, headers)).status).toBe(['owner', 'pYes', 'groupAndGrant'].includes(name) ? 200 : 403);
       expect(guiCalls - calls).toBe(['owner', 'pYes', 'groupAndGrant'].includes(name) ? 1 : 0);
     }
-    for (const action of [MACHINE_ACTION.FILE_SEND, MACHINE_ACTION.FILE_FETCH, MACHINE_ACTION.FILE_LIST]) {
+    for (const action of [MACHINE_ACTION.FILE_SEND, MACHINE_ACTION.FILE_FETCH]) {
       const admission = await admitMachineAction(db, {
         token: headers[SHARED_MACHINE_AUTHORITY_HEADER], signingKey: KEY, authenticatedSourceServerId: owner.serverId,
         sourceOwnerUserId: owner.userId, targetServerId: nodeId, action, now: Date.now(),
       });
       expect(admission.ok, action).toBe(['owner', 'pYes', 'groupAndGrant'].includes(name));
     }
+    const listAdmission = await admitMachineAction(db, {
+      token: headers[SHARED_MACHINE_AUTHORITY_HEADER], signingKey: KEY, authenticatedSourceServerId: owner.serverId,
+      sourceOwnerUserId: owner.userId, targetServerId: nodeId, action: MACHINE_ACTION.FILE_LIST, now: Date.now(),
+    });
+    expect(listAdmission.ok, MACHINE_ACTION.FILE_LIST).toBe(['owner', 'pYes', 'gMember', 'gAdmin', 'groupAndGrant'].includes(name));
   });
 
   it.each(['pNo', 'pYes', 'gMember'])('%s: daemon list keeps the raw switch for non-EXEC consumers without owner-grant substitution', async (name) => {

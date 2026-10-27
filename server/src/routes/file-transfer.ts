@@ -697,8 +697,8 @@ type ControlledTargetGate =
   | { ok: false; reason: 'scoped_auth' | 'target_forbidden' | 'exec_disabled' | 'daemon_offline' | 'capability_unavailable' | 'rate_limited' };
 
 /**
- * What each file capability DOES on the node. Every one of them reads or writes files as the node's account, so every one is
- * EXECUTE-class (shared/machine-access-policy.ts). A capability nobody mapped is treated as the strictest (a write).
+ * What each file capability DOES on the node. Fetch/send/handle capabilities remain EXECUTE-class; directory listing uses the
+ * bounded FILE_LIST policy exception for group participants. A capability nobody mapped is treated as the strictest (a write).
  */
 const FILE_CAPABILITY_ACTION: Readonly<Record<string, MachineAction>> = {
   [FILE_TRANSFER_PATH_HANDLE_CAPABILITY]: MACHINE_ACTION.FILE_FETCH,
