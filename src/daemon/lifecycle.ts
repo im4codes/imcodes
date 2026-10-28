@@ -2123,7 +2123,7 @@ const HEALTH_POLL_MS = 30_000;
 // finalize miss leaves the UI "working" for a whole operator session. Active
 // tool calls still use the runtime's longer tool-aware floor.
 const TRANSPORT_STALE_ACTIVE_TURN_RECOVERY_MS = 12 * 60_000;
-const MEMORY_COMPRESSION_AUTO_CONTINUE_AFTER_MS = 6 * 60_000;
+const MEMORY_COMPRESSION_AUTO_CONTINUE_AFTER_MS = 12 * 60_000;
 const CODEX_STALE_ACTIVE_TURN_AUTO_CONTINUE_AFTER_MS = 12 * 60_000;
 const CODEX_QUOTA_REFRESH_MS = 60_000;
 const CONTEXT_REPLICATION_POLL_MS = 30_000;
@@ -2600,7 +2600,7 @@ export async function recoverMemoryCompressionStalledSession(
     {
       ...attachDaemonUserNotice(
         DAEMON_USER_NOTICE_CODE.MEMORY_WATCHDOG_RECOVERED,
-        '⚠️ Memory compression watchdog stopped a stale turn after 6 minutes and sent `continue`.',
+        '⚠️ Memory compression watchdog stopped a stale turn after 12 minutes and sent `continue`.',
         { minutes: MEMORY_COMPRESSION_AUTO_CONTINUE_AFTER_MS / 60_000 },
       ),
       streaming: false,

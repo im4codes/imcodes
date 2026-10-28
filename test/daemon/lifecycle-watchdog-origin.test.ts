@@ -18,7 +18,9 @@ vi.mock('../../src/daemon/timeline-store.js', () => ({
 }));
 vi.mock('../../src/context/summary-compressor.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../src/context/summary-compressor.js')>()),
-  getStaleSessionCompressionRun: () => ({ runId: 'run-origin-1', trigger: 'test', eventCount: 1, startedAt: 0 }),
+  getStaleSessionCompressionRun: (_sessionName: string, nowMs: number, thresholdMs: number) => (
+    nowMs >= thresholdMs ? { runId: 'run-origin-1', trigger: 'test', eventCount: 1, startedAt: 0 } : null
+  ),
   resolveSessionCompressionWatchRuns: () => undefined,
 }));
 vi.mock('../../src/agent/session-manager.js', async (importOriginal) => ({
@@ -72,6 +74,10 @@ describe('watchdog continue origin', () => {
     expect(await recoverMemoryCompressionStalledSession(SESSION, 7 * 60_000)).toBe(false);
     expect(send).not.toHaveBeenCalled();
     expect(emit).not.toHaveBeenCalled();
+    expect(await recoverMemoryCompressionStalledSession(SESSION, 13 * 60_000)).toBe(true);
+    const notice = emit.mock.calls.find(([session, type]) => session === SESSION && type === 'assistant.text');
+    expect((notice?.[2] as Record<string, unknown>).text).toContain('12 minutes');
+    expectSystemContinue(emit, send);
   });
 
   it('stamps the Codex stale-turn continue as a system message on the row and the queued copy', async () => {
