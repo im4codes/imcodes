@@ -10,7 +10,8 @@
  *   EXECUTE-class needs ALL of:  the node's exec switch is ON  AND  the actor is the device OWNER, or a participant carrying an
  *   explicit execute grant (`execGranted`). The resolver may source that grant from a direct share or a product-controlled group
  *   grant; group membership without the grant, and viewers, remain denied.
- *   Only EXEC (exec_remote) additionally refuses participant-origin turns. Other actions use the actor's real access and grant.
+ *   EXEC (exec_remote) uses the same live actor grant on participant-origin turns. A participant still needs an explicit execute
+ *   grant; the signed authority and canonical target binding prevent owner fallback or cross-target replay.
  *
  * Reading files is EXECUTE-class on purpose: the node's account can read credentials, keys and browser profiles, so "read any path"
  * is a privilege escalation for whoever holds it. Directory listing is the bounded exception for group participants: it powers the
@@ -73,8 +74,6 @@ export const MACHINE_DENIAL_REASON = {
   EXEC_DISABLED: 'exec_disabled',
   /** The actor can operate the device but holds no execute grant (group member, share participant without the grant). */
   EXECUTE_NOT_GRANTED: 'execute_not_granted',
-  /** exec_remote was requested on a share-participant turn: refused even with an execute grant. */
-  PARTICIPANT_TURN: 'participant_turn',
   /** The action is unknown to this table. */
   UNKNOWN_ACTION: 'unknown_action',
 } as const;
@@ -109,7 +108,6 @@ export function evaluateMachineAction(subject: MachineAccessSubject, action: Mac
     return { allowed: true };
   }
   if (!machineActionRequiresExecute(action)) return { allowed: true };
-  if (action === MACHINE_ACTION.EXEC && subject.participantTurn) return { allowed: false, reason: MACHINE_DENIAL_REASON.PARTICIPANT_TURN };
   if (subject.accessSource === MACHINE_ACCESS_SOURCE.OWNER && subject.accessRole === 'owner') return { allowed: true };
   if (subject.accessRole === 'participant' && subject.execGranted === true) {
     return { allowed: true };

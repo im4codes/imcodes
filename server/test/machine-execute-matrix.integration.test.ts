@@ -229,7 +229,7 @@ describe('role x action matrix (real resolvers, real routes)', () => {
   });
 });
 
-describe('only exec_remote is refused on participant-origin turns', () => {
+describe('exec_remote uses the participant grant on participant-origin turns', () => {
   async function delegatedHeader(participant: string): Promise<Record<string, string>> {
     // The owner's FULL daemon runs a shared session; the participant's message drives it (server-minted, signed turn authority).
     const owner = actors.owner!;
@@ -252,12 +252,13 @@ describe('only exec_remote is refused on participant-origin turns', () => {
     };
   }
 
-  it.each(NAMES)('%s: participant-origin refuses only exec_remote; other actions use the participant grant', async (name) => {
+  it.each(NAMES)('%s: participant-origin exec_remote follows the participant grant', async (name) => {
     const headers = await delegatedHeader(name);
     const owner = actors.owner!;
+    const mayExecute = ['owner', 'pYes', 'groupAndGrant'].includes(name);
     const before = execCalls;
-    expect((await EXEC(owner, headers)).status).toBe(403);
-    expect(execCalls).toBe(before);
+    expect((await EXEC(owner, headers)).status).toBe(mayExecute ? 200 : 403);
+    expect(execCalls).toBe(before + (mayExecute ? 1 : 0));
     for (const attempt of [SHELL, CLICK]) {
       const calls = guiCalls;
       expect((await attempt(owner, headers)).status).toBe(['owner', 'pYes', 'groupAndGrant'].includes(name) ? 200 : 403);
@@ -282,7 +283,7 @@ describe('only exec_remote is refused on participant-origin turns', () => {
     const owner = actors.owner!;
     const projected = (await listControlledMachines(db, owner.userId, Date.now(), actors[name]!.userId)).machines.find((m) => m.serverId === nodeId)!;
     if (name === 'gMember') expect(projected).toMatchObject({ execEnabled: true, canExecute: false, execGranted: false, accessSource: 'group' });
-    else expect(projected).toMatchObject({ execEnabled: true, canExecute: false, accessSource: 'share', execGranted: name === 'pYes' });
+    else expect(projected).toMatchObject({ execEnabled: true, canExecute: name === 'pYes', accessSource: 'share', execGranted: name === 'pYes' });
     const response = await execApp().request('/api/machines', {
       headers: { 'X-Server-Id': owner.serverId, authorization: `Bearer ${owner.token}`, ...delegated },
     });

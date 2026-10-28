@@ -68,15 +68,31 @@ export async function resolveMachineTargetServerId(
 ): Promise<string | null> {
   const value = reference.trim();
   if (!value) return null;
-  const row = await db.queryOne<{ id: string }>(
-    `SELECT id FROM servers
-      WHERE revoked_at IS NULL
-        AND (id = $1 OR (node_role = 'controlled' AND node_id = $1))
-      ORDER BY CASE WHEN id = $1 THEN 0 ELSE 1 END
-      LIMIT 1`,
+  const rows = await db.query<{
+    id: string;
+    node_id: string | null;
+    node_role: string | null;
+    revoked_at: number | null;
+  }>(
+    `SELECT id, node_id, node_role, revoked_at
+       FROM servers
+      WHERE id = $1 OR (node_role = 'controlled' AND node_id = $1)
+      ORDER BY CASE WHEN id = $1 THEN 0 ELSE 1 END, id`,
     [value],
   );
-  return row?.id ?? null;
+  const exact = rows.find((row) => row.id === value);
+  // A revoked exact id is never allowed to fall through to a different row
+  // that happens to reuse the same value as a canonical node id.
+  if (exact?.revoked_at != null) return null;
+  const canonical = rows.filter((row) => row.node_role === NODE_ROLE.CONTROLLED
+    && row.node_id === value && row.revoked_at == null);
+  if (exact) {
+    // An active exact id and a distinct canonical alias are ambiguous. Never
+    // let a stale/colliding identity select the wrong daemon or controlled node.
+    if (canonical.some((row) => row.id !== exact.id)) return null;
+    return exact.id;
+  }
+  return canonical.length === 1 ? canonical[0]!.id : null;
 }
 
 /**

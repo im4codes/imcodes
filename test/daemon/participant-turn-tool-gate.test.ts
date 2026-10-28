@@ -14,13 +14,13 @@ const caller: McpRuntimeCaller = {
   projectName: 'project', serverId: 'server-1', providerId: 'codex-sdk', transport: 'in_process',
 };
 
-it('the participant-only deny set is exactly exec_remote, including every registered and future tool', () => {
+it('participant turns retain the original machine admission checks, including exec_remote', () => {
   const server = createMemoryMcpServer(caller, { capabilityService: {} as CapabilityService });
   const registered = Object.keys((server as unknown as { _registeredTools: Record<string, unknown> })._registeredTools);
   expect(registered.length).toBeGreaterThan(60);
-  expect(Object.keys(PARTICIPANT_TURN_TOOL_POLICY)).toEqual([N.EXEC_REMOTE]);
+  expect(Object.keys(PARTICIPANT_TURN_TOOL_POLICY)).toEqual([]);
   for (const name of [...registered, ...Object.values(N), 'future_registered_tool', 'EXEC_REMOTE', 'shell_session1', 'constructor', 'toString', '__proto__']) {
-    expect(isToolAllowedInParticipantTurn(name), name).toBe(name !== N.EXEC_REMOTE);
+    expect(isToolAllowedInParticipantTurn(name), name).toBe(true);
   }
 });
 
@@ -31,8 +31,8 @@ const origins = [
   ['missing turn hook', undefined, false],
 ] as const;
 
-describe.each(origins)('%s origin', (_label, participantTurnRequired, denied) => {
-  it.each([false, true])('only exec_remote is gated (fallback=%s); original schemas and unknown-name rejection remain', async (fallback) => {
+describe.each(origins)('%s origin', (_label, participantTurnRequired, _denied) => {
+  it.each([false, true])('exec_remote reaches machine admission (fallback=%s); original schemas and unknown-name rejection remain', async (fallback) => {
     const resolveAlias = vi.fn(async () => ({ status: 'ok', found: false }));
     const capabilityList = vi.fn(async () => ({ status: 'ok', items: [] }));
     const execRemote = vi.fn(async () => ({ outcome: 'completed', ok: true, exitCode: 0, stdout: '', stderr: '', timedOut: false, truncated: false, durationMs: 1 }));
@@ -66,12 +66,9 @@ describe.each(origins)('%s origin', (_label, participantTurnRequired, denied) =>
       expect(computerUseCall).toHaveBeenCalledTimes(3);
       expect(turn?.mock.calls.length ?? 0).toBe(0);
       const exec = await invoke(N.EXEC_REMOTE, { machine: 'node-1', command: 'id' });
-      if (denied) {
-        expect(exec.isError).toBe(true);
-        expect(mcpToolPayload(exec)).toMatchObject({ reason: PARTICIPANT_TURN_TOOL_REFUSAL });
-      } else expect(exec.isError).not.toBe(true);
-      expect(execRemote).toHaveBeenCalledTimes(denied ? 0 : 1);
-      expect(turn?.mock.calls.length ?? 0).toBe(turn ? 1 : 0);
+      expect(exec.isError).not.toBe(true);
+      expect(execRemote).toHaveBeenCalledTimes(1);
+      expect(turn?.mock.calls.length ?? 0).toBe(0);
       // No policy allow decision may mint a tool, accept a caller schema, or weaken its original schema.
       const unknown = await client.callTool({ name: MCP_TOOL_DISCOVERY_NAME, arguments: { query: 'not_registered', fallbackCall: { name: 'not_registered', arguments: {} } } });
       expect(unknown.isError).toBe(true);
@@ -95,9 +92,9 @@ it('exec_remote rechecks every call as owner and participant turns alternate', a
     for (const origin of [true, false, true, false]) {
       participant = origin;
       const result = await client.callTool({ name: N.EXEC_REMOTE, arguments: { machine: 'node-1', command: 'id' } });
-      expect(mcpToolPayload(result).reason).toBe(origin ? PARTICIPANT_TURN_TOOL_REFUSAL : 'exec_disabled');
+      expect(mcpToolPayload(result).reason).toBe('exec_disabled');
     }
-    expect(execRemote).toHaveBeenCalledTimes(2);
+    expect(execRemote).toHaveBeenCalledTimes(4);
   } finally { await client.close(); await server.close(); }
 });
 
