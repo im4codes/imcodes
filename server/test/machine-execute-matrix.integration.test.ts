@@ -33,13 +33,17 @@ const actors: Record<string, Actor> = {};
 let nodeId = '';
 let execCalls = 0;
 let guiCalls = 0;
+let dispatchedExecTargets: string[] = [];
+let dispatchedComputerTargets: string[] = [];
 
-const execDispatcher: ExecDispatcher = async () => {
+const execDispatcher: ExecDispatcher = async (targetServerId) => {
   execCalls += 1;
+  dispatchedExecTargets.push(targetServerId);
   return { online: true, result: { ok: true, exitCode: 0, stdout: '', stderr: '', truncated: false, timedOut: false, durationMs: 1 } };
 };
-const computerUseDispatcher: ComputerUseDispatcher = async () => {
+const computerUseDispatcher: ComputerUseDispatcher = async (targetServerId) => {
   guiCalls += 1;
+  dispatchedComputerTargets.push(targetServerId);
   return { online: true, result: { ok: true, content: [{ type: 'text', text: 'ok' }] } as never };
 };
 
@@ -72,6 +76,8 @@ beforeEach(async () => {
   resetMachineActionGateForTests();
   execCalls = 0;
   guiCalls = 0;
+  dispatchedExecTargets = [];
+  dispatchedComputerTargets = [];
 });
 
 const NAMES = ['owner', 'pNo', 'pYes', 'viewer', 'gMember', 'gAdmin', 'other', 'revoked', 'expired', 'viewerAndGroup', 'groupAndGrant'] as const;
@@ -108,7 +114,11 @@ function execApp() {
 }
 
 function call(path: string, actor: Actor, body: unknown, headers: Record<string, string> = {}) {
-  return execApp().request(`${path}?serverId=${nodeId}`, {
+  return callTarget(path, actor, nodeId, body, headers);
+}
+
+function callTarget(path: string, actor: Actor, targetReference: string, body: unknown, headers: Record<string, string> = {}) {
+  return execApp().request(`${path}?serverId=${encodeURIComponent(targetReference)}`, {
     method: 'POST',
     headers: { 'content-type': 'application/json', 'X-Server-Id': actor.serverId, authorization: `Bearer ${actor.token}`, ...headers },
     body: JSON.stringify(body),
@@ -137,6 +147,36 @@ const MAY_LIST = ['owner', 'pYes', 'gMember', 'gAdmin', 'groupAndGrant'];
 const MAY_VIEW = ['owner', 'pNo', 'pYes', 'gMember', 'gAdmin', 'groupAndGrant'];
 
 describe('role x action matrix (real resolvers, real routes)', () => {
+  it('resolves canonical node_id aliases before admitting both relay routes', async () => {
+    const row = await db.queryOne<{ node_id: string }>('SELECT node_id FROM servers WHERE id = $1', [nodeId]);
+    const canonicalNodeId = row!.node_id;
+    const allowed = ['owner', 'pYes', 'groupAndGrant'] as const;
+    const denied = ['viewer', 'revoked', 'other'] as const;
+
+    for (const name of allowed) {
+      const actor = actors[name]!;
+      expect((await callTarget('/api/machine/exec', actor, canonicalNodeId, { command: 'echo alias' })).status, `${name} exec`).toBe(200);
+      expect((await callTarget('/api/machine/computer-use', actor, canonicalNodeId, { tool: 'click', arguments: { x: 1, y: 2 } })).status, `${name} computer-use`).toBe(200);
+    }
+    expect(dispatchedExecTargets).toEqual([nodeId, nodeId, nodeId]);
+    expect(dispatchedComputerTargets).toEqual([nodeId, nodeId, nodeId]);
+
+    for (const name of denied) {
+      const actor = actors[name]!;
+      expect((await callTarget('/api/machine/exec', actor, canonicalNodeId, { command: 'echo denied' })).status, `${name} exec`).toBe(403);
+      expect((await callTarget('/api/machine/computer-use', actor, canonicalNodeId, { tool: 'click', arguments: { x: 1, y: 2 } })).status, `${name} computer-use`).toBe(403);
+    }
+    expect(dispatchedExecTargets).toEqual([nodeId, nodeId, nodeId]);
+    expect(dispatchedComputerTargets).toEqual([nodeId, nodeId, nodeId]);
+  });
+
+  it('keeps full-daemon server ids as canonical references', async () => {
+    const full = actors.other!;
+    const response = await callTarget('/api/machine/computer-use', actors.owner!, full.serverId, { tool: 'list_apps', arguments: {} });
+    expect(response.status).toBe(403);
+    expect(dispatchedComputerTargets).toEqual([]);
+  });
+
   it.each(NAMES)('%s: exec_remote / shell_session1 / click -> only the owner and an explicit execute grant run', async (name) => {
     const actor = actors[name]!;
     const mayExecute = MAY_EXECUTE.includes(name);
