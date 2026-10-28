@@ -7,8 +7,9 @@
  *   EXECUTE-class action  = anything that can run code on the device, write to it, or read files off it as the node's account.
  *   VIEW-class action     = list the machine, or look without touching (list_apps, get_app_state, browser_snapshot).
  *
- *   EXECUTE-class needs ALL of:  the node's exec switch is ON  AND  the actor is the device OWNER, or an explicit per-device share row
- *   with role `participant` AND exec_granted (set by the owner only; a group never grants it, a viewer never has it)
+ *   EXECUTE-class needs ALL of:  the node's exec switch is ON  AND  the actor is the device OWNER, or a participant carrying an
+ *   explicit execute grant (`execGranted`). The resolver may source that grant from a direct share or a product-controlled group
+ *   grant; group membership without the grant, and viewers, remain denied.
  *   Only EXEC (exec_remote) additionally refuses participant-origin turns. Other actions use the actor's real access and grant.
  *
  * Reading files is EXECUTE-class on purpose: the node's account can read credentials, keys and browser profiles, so "read any path"
@@ -110,7 +111,7 @@ export function evaluateMachineAction(subject: MachineAccessSubject, action: Mac
   if (!machineActionRequiresExecute(action)) return { allowed: true };
   if (action === MACHINE_ACTION.EXEC && subject.participantTurn) return { allowed: false, reason: MACHINE_DENIAL_REASON.PARTICIPANT_TURN };
   if (subject.accessSource === MACHINE_ACCESS_SOURCE.OWNER && subject.accessRole === 'owner') return { allowed: true };
-  if (subject.accessSource === MACHINE_ACCESS_SOURCE.SHARE && subject.accessRole === 'participant' && subject.execGranted === true) {
+  if (subject.accessRole === 'participant' && subject.execGranted === true) {
     return { allowed: true };
   }
   return { allowed: false, reason: MACHINE_DENIAL_REASON.EXECUTE_NOT_GRANTED };
