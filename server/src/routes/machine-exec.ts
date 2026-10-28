@@ -34,6 +34,7 @@ import { SHARED_MACHINE_AUTHORITY_HEADER } from '../../../shared/shared-machine-
 import { admitMachineAction } from '../share/shared-machine-authority.js';
 import { gateMachineAction } from '../security/machine-action-gate.js';
 import { MACHINE_ACTION, MACHINE_ACTION_RATE_LIMIT, MACHINE_DENIAL_REASON } from '../../../shared/machine-access-policy.js';
+import { resolveMachineTargetServerId } from '../share/machine-access.js';
 
 /** Extra time the relay waits beyond the node's own timeout before giving up (F: deadline ≥ node timeout). */
 const DEFAULT_RELAY_DEADLINE_BUFFER_MS = 30_000;
@@ -177,8 +178,10 @@ export function createMachineExecRoutes(
     const sourceServerId = auth.serverId;
     if (auth.nodeRole !== NODE_ROLE.FULL || !sourceServerId) return c.json(preDispatchEnvelope('scoped_auth'), 403);
 
-    const targetId = c.req.query('serverId');
-    if (!targetId) return c.json(preDispatchEnvelope('invalid_request'), 400);
+    const targetReference = c.req.query('serverId');
+    if (!targetReference) return c.json(preDispatchEnvelope('invalid_request'), 400);
+    const targetId = await resolveMachineTargetServerId(c.env.DB, targetReference);
+    if (!targetId) return c.json(preDispatchEnvelope('target_forbidden'), 403);
     if (targetId === sourceServerId) return c.json(preDispatchEnvelope('scoped_auth'), 403);
 
     const body = (await c.req.json().catch(() => null)) as Record<string, unknown> | null;

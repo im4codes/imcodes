@@ -55,6 +55,31 @@ export type ControlledMachineOperatorAccessRow = ControlledMachineAccessRow & {
 };
 
 /**
+ * Resolve the canonical server id accepted by machine control routes.
+ * MCP callers normally resolve a canonical node id before dispatch, but older
+ * clients and direct integrations can still send that id to the HTTP relay.
+ * Treating it as an opaque server id makes an otherwise authorized target look
+ * absent and produces the misleading `target_forbidden`. Only controlled-node
+ * node ids are aliases; full-daemon ids retain their existing semantics.
+ */
+export async function resolveMachineTargetServerId(
+  db: Database,
+  reference: string,
+): Promise<string | null> {
+  const value = reference.trim();
+  if (!value) return null;
+  const row = await db.queryOne<{ id: string }>(
+    `SELECT id FROM servers
+      WHERE revoked_at IS NULL
+        AND (id = $1 OR (node_role = 'controlled' AND node_id = $1))
+      ORDER BY CASE WHEN id = $1 THEN 0 ELSE 1 END
+      LIMIT 1`,
+    [value],
+  );
+  return row?.id ?? null;
+}
+
+/**
  * Is this caller a member of any group this machine is in?
  *
  * EXISTS rather than a join: a machine can be in several groups, and joining

@@ -30,6 +30,7 @@ import {
   machineActionRequiresExecute,
 } from '../../../shared/machine-access-policy.js';
 import logger from '../util/logger.js';
+import { resolveMachineTargetServerId } from '../share/machine-access.js';
 
 const DEFAULT_RELAY_DEADLINE_BUFFER_MS = 30_000;
 const ALLOWED_BODY_KEYS = new Set(['tool', 'arguments', 'timeoutMs', 'resourceOwner']);
@@ -81,8 +82,10 @@ export function createMachineComputerUseRoutes(dispatcher: ComputerUseDispatcher
     const sourceServerId = auth.serverId;
     if (auth.nodeRole !== NODE_ROLE.FULL || !sourceServerId) return c.json(pre(COMPUTER_USE_HTTP_REASON.SCOPED_AUTH), 403);
 
-    const targetId = c.req.query('serverId');
-    if (!targetId) return c.json(pre(COMPUTER_USE_HTTP_REASON.INVALID_REQUEST), 400);
+    const targetReference = c.req.query('serverId');
+    if (!targetReference) return c.json(pre(COMPUTER_USE_HTTP_REASON.INVALID_REQUEST), 400);
+    const targetId = await resolveMachineTargetServerId(c.env.DB, targetReference);
+    if (!targetId) return c.json(pre(COMPUTER_USE_HTTP_REASON.TARGET_FORBIDDEN), 403);
     if (targetId === sourceServerId) return c.json(pre(COMPUTER_USE_HTTP_REASON.SCOPED_AUTH), 403);
 
     const body = (await c.req.json().catch(() => null)) as Record<string, unknown> | null;
