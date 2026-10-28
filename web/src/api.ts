@@ -1744,6 +1744,11 @@ export async function deletePasskey(credentialId: string): Promise<void> {
  * of a silent, permanent hang.
  */
 const UPLOAD_STALL_TIMEOUT_MS = 20_000;
+// A multipart chunk can still be in flight on a slow mobile/shared link when
+// the WebView emits no upload-progress events. Keep the watchdog bounded, but
+// give an 8 MiB resumable chunk enough time to cross that link before treating
+// the request as dead and retrying it.
+const UPLOAD_NO_EVENT_STALL_TIMEOUT_MS = 120_000;
 
 export interface AttachmentRefResponse {
   id: string;
@@ -1804,6 +1809,12 @@ export async function uploadFile(
         throw new ApiError(409, 'upload_offset_mismatch');
       }
       offset = result.committedBytes;
+      // Some mobile WebViews do not dispatch XHR upload-progress events for
+      // multipart bodies. The server's committed offset is authoritative and
+      // arrives once each resumable chunk is accepted, so use it as the
+      // browser-upload half of progress instead of leaving a relay transfer
+      // at 0% until the final daemon commit line.
+      emitProgress(file.size > 0 ? (offset / file.size) * 50 : 50);
       failuresWithoutProgress = 0;
       if (file.size === 0) throw new ApiError(500, 'upload_incomplete');
     } catch (error) {
@@ -1866,6 +1877,7 @@ async function uploadFileRequest(options: {
   // Use XHR for upload progress reporting
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
+    let uploadProgressObserved = false;
     xhr.open('POST', withSessionName(`${_baseUrl}/api/server/${options.serverId}/upload`, options.sessionName));
     xhr.setRequestHeader('Accept', 'application/x-ndjson, application/json');
 
@@ -1879,6 +1891,7 @@ async function uploadFileRequest(options: {
     }
 
     xhr.upload.onprogress = (e) => {
+      uploadProgressObserved = true;
       armStallTimer();
       if (e.lengthComputable) {
         const chunkRatio = e.total > 0 ? Math.min(1, e.loaded / e.total) : 0;
@@ -1919,7 +1932,7 @@ async function uploadFileRequest(options: {
         // daemon-committed offset.
         reject(new ApiError(0, 'upload_stalled'));
         xhr.abort();
-      }, UPLOAD_STALL_TIMEOUT_MS);
+      }, uploadProgressObserved ? UPLOAD_STALL_TIMEOUT_MS : UPLOAD_NO_EVENT_STALL_TIMEOUT_MS);
     };
 
     const consumeProgressLines = (flush = false) => {

@@ -10,6 +10,9 @@ import {
   formatFileTransferRangeRequest,
   parseFileTransferContentRange,
   parseFileTransferRangeRequest,
+  fileTransferStagedUploadTtlMs,
+  fileTransferUploadTimeoutMs,
+  FILE_TRANSFER_LIMITS,
 } from '../shared/transport/file-transfer.js';
 
 describe('controlled file-transfer trust boundary', () => {
@@ -178,5 +181,16 @@ describe('controlled file-transfer trust boundary', () => {
       .toEqual({ start: 7, end: 19, total: 20 });
     expect(parseFileTransferContentRange('bytes */20')).toBeNull();
     expect(parseFileTransferContentRange('bytes 9-5/20')).toBeNull();
+  });
+
+  it('scales near-limit relay budgets without changing ordinary-file defaults', () => {
+    expect(fileTransferUploadTimeoutMs(5)).toBe(FILE_TRANSFER_LIMITS.UPLOAD_TIMEOUT_MS);
+    expect(fileTransferStagedUploadTtlMs(5)).toBeGreaterThanOrEqual(FILE_TRANSFER_LIMITS.STAGED_UPLOAD_TTL_MS);
+
+    const nearLimit = FILE_TRANSFER_LIMITS.MAX_FILE_SIZE - 1;
+    expect(fileTransferUploadTimeoutMs(nearLimit)).toBeGreaterThan(FILE_TRANSFER_LIMITS.UPLOAD_TIMEOUT_MS);
+    expect(fileTransferStagedUploadTtlMs(nearLimit)).toBeGreaterThan(FILE_TRANSFER_LIMITS.STAGED_UPLOAD_TTL_MS);
+    expect(fileTransferUploadTimeoutMs(nearLimit)).toBeLessThanOrEqual(FILE_TRANSFER_LIMITS.LARGE_UPLOAD_MAX_LIFETIME_MS);
+    expect(fileTransferStagedUploadTtlMs(nearLimit)).toBeLessThanOrEqual(FILE_TRANSFER_LIMITS.LARGE_UPLOAD_MAX_LIFETIME_MS);
   });
 });

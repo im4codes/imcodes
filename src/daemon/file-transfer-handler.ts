@@ -12,6 +12,7 @@ import { pipeline } from 'node:stream/promises';
 import logger from '../util/logger.js';
 import {
   FILE_TRANSFER_LIMITS,
+  fileTransferUploadTimeoutMs,
   fileTransferStorageId,
   FILE_TRANSFER_DIRECTORY_PATH,
   isFileTransferWellKnownDirectoryPath,
@@ -635,7 +636,7 @@ async function fetchRelayUpload(
       const resumeFrom = loaded;
       const response = await withPreConnectRetry(() => fetch(downloadUrl, {
         ...(resumeFrom > 0 ? { headers: { Range: formatFileTransferRangeRequest(resumeFrom) } } : {}),
-        signal: AbortSignal.timeout(FILE_TRANSFER_LIMITS.UPLOAD_TIMEOUT_MS),
+        signal: AbortSignal.timeout(fileTransferUploadTimeoutMs(expectedSize)),
       }));
       if (response.status === 416 && loaded === expectedSize) return loaded;
       if (!response.ok) {

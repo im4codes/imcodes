@@ -12,6 +12,8 @@ import { WsBridge } from '../ws/bridge.js';
 import { randomHex } from '../security/crypto.js';
 import {
   FILE_TRANSFER_LIMITS,
+  fileTransferStagedUploadTtlMs,
+  fileTransferUploadTimeoutMs,
   fileTransferLegacyFilename,
   FILE_TRANSFER_DIRECTORY_CAPABILITY,
   FILE_TRANSFER_DIRECTORY_QUERY_CAPABILITY,
@@ -286,7 +288,7 @@ async function sweepExpiredResumableUploads(now = Date.now()): Promise<void> {
     const expiresAt = await readFile(metaPath, 'utf8')
       .then((raw) => (JSON.parse(raw) as { expiresAt?: unknown }).expiresAt)
       .catch(() => undefined);
-    const fallbackExpiry = await stat(dir).then((entry) => entry.mtimeMs + FILE_TRANSFER_LIMITS.STAGED_UPLOAD_TTL_MS).catch(() => 0);
+    const fallbackExpiry = await stat(dir).then((entry) => entry.mtimeMs + fileTransferStagedUploadTtlMs()).catch(() => 0);
     if ((typeof expiresAt === 'number' ? expiresAt : fallbackExpiry) < now) {
       await rm(dir, { recursive: true, force: true });
     }
@@ -384,7 +386,7 @@ async function acceptResumableBrowserChunk(params: {
         ...(params.destinationDirectory ? { destinationDirectory: params.destinationDirectory } : {}),
         totalSize: params.totalSize,
         lastModified: params.lastModified,
-        expiresAt: Date.now() + FILE_TRANSFER_LIMITS.STAGED_UPLOAD_TTL_MS,
+        expiresAt: Date.now() + fileTransferStagedUploadTtlMs(params.totalSize),
         chunkSha256: {},
       };
       await writeFile(paths.filePath, new Uint8Array(0), { flag: 'wx', mode: 0o600 }).catch(async (error) => {
@@ -436,7 +438,7 @@ async function acceptResumableBrowserChunk(params: {
     await appendFile(paths.filePath, chunkBytes);
     const nextCommitted = committedBytes + chunkBytes.length;
     meta.chunkSha256[String(params.offset)] = chunkHash;
-    meta.expiresAt = Date.now() + FILE_TRANSFER_LIMITS.STAGED_UPLOAD_TTL_MS;
+    meta.expiresAt = Date.now() + fileTransferStagedUploadTtlMs(meta.totalSize);
     await writeResumableUploadMeta(paths.metaPath, meta);
     return {
       complete: nextCommitted === meta.totalSize,
@@ -1483,8 +1485,9 @@ fileTransferRoutes.post('/:id/upload', async (c) => {
   let uploadMsg: FileUploadFetchRequest | FileUploadRequest;
   if (supportsRelayFetch) {
     const token = randomHex(32);
-    const expiresAt = Date.now() + FILE_TRANSFER_LIMITS.STAGED_UPLOAD_TTL_MS;
-    const timer = setTimeout(() => deleteStagedUpload(uploadId), FILE_TRANSFER_LIMITS.STAGED_UPLOAD_TTL_MS);
+    const stagedTtlMs = fileTransferStagedUploadTtlMs(stagedSize);
+    const expiresAt = Date.now() + stagedTtlMs;
+    const timer = setTimeout(() => deleteStagedUpload(uploadId), stagedTtlMs);
     timer.unref?.();
     stagedUploads.set(uploadId, {
       serverId,
@@ -1534,7 +1537,7 @@ fileTransferRoutes.post('/:id/upload', async (c) => {
       const result = await sendControlledFileRequest(c, controlledGate,
         uploadId,
         uploadMsg as unknown as Record<string, unknown>,
-        FILE_TRANSFER_LIMITS.UPLOAD_TIMEOUT_MS,
+        fileTransferUploadTimeoutMs(stagedSize),
         onProgress,
         controlledGate.daemonGeneration,
       );
@@ -1593,7 +1596,7 @@ fileTransferRoutes.post('/:id/upload', async (c) => {
         const result = await sendControlledFileRequest(c, controlledGate,
           uploadId,
           uploadMsg as unknown as Record<string, unknown>,
-          FILE_TRANSFER_LIMITS.UPLOAD_TIMEOUT_MS,
+          fileTransferUploadTimeoutMs(stagedSize),
           (msg) => write(msg),
           controlledGate.daemonGeneration,
         );
