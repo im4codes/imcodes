@@ -60,5 +60,6 @@ describe('provider compact capabilities', () => {
       completion: 'none',
       cancellation: 'none',
     });
+    expect(new AgySdkProvider().capabilities.compact?.reason).toMatch(/compacts its own context automatically/i);
   });
 });

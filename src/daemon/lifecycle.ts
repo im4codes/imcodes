@@ -1,4 +1,5 @@
 import { CHAT_MESSAGE_ORIGINS, USER_MESSAGE_ORIGIN_FIELDS } from '../../shared/chat-message-origin.js';
+import { IMCODES_AUTOMATIC_COMPACTION_ENABLED } from '../../shared/automatic-compaction.js';
 import { taskPairService } from './task-pairs/service.js';
 import { evaluatePairMainCheckoutGitWrite, mainCheckoutWriteRefusal } from './task-pairs/main-checkout-write-guard.js';
 import { setTransportToolExecutionEvaluator } from './transport-relay.js';
@@ -2553,6 +2554,7 @@ export async function recoverMemoryCompressionStalledSession(
   sessionName: string,
   nowMs = Date.now(),
 ): Promise<boolean> {
+  if (!IMCODES_AUTOMATIC_COMPACTION_ENABLED) return false;
   const run = getStaleSessionCompressionRun(
     sessionName,
     nowMs,

@@ -13,6 +13,7 @@ import { MEMORY_MCP_PROVIDER_IDS } from '../../shared/memory-ws.js';
 import { AGY_SDK_PROVIDER_ID } from '../../shared/agy-agent.js';
 import { MEMORY_MCP_ENV_KEYS as E } from '../../shared/memory-mcp-env.js';
 import { IMCODES_SESSION_ENV } from '../../shared/imcodes-send.js';
+import { IMCODES_AUTOMATIC_COMPACTION_ENABLED } from '../../shared/automatic-compaction.js';
 
 const timelineEmitterEmitMock = vi.hoisted(() => vi.fn());
 const searchLocalMemorySemanticMock = vi.hoisted(() => vi.fn());
@@ -117,7 +118,7 @@ describe('TransportSessionRuntime memory provenance', () => {
   });
 
   describe('automatic compaction', () => {
-    // Off by default (ratio above 1); these cases exercise it re-enabled at 0.75.
+    // The policy is permanently disabled; the env override must not re-enable it.
     beforeEach(() => { vi.stubEnv('IMCODES_TRANSPORT_AUTO_COMPACT_RATIO', '0.75'); });
     afterEach(() => { vi.unstubAllEnvs(); });
 
@@ -158,28 +159,14 @@ describe('TransportSessionRuntime memory provenance', () => {
       return { provider, runtime, complete: (m: AgentMessage) => complete?.('provider-session-1', m) };
     }
 
-    it('compacts a nearly full context once the turn ends, through the /compact path', async () => {
+    it('never auto-compacts a nearly full context, even when the env override is set', async () => {
+      expect(IMCODES_AUTOMATIC_COMPACTION_ENABLED).toBe(false);
       const { provider, runtime, complete } = await setup(true);
       runtime.send('keep going', 'work-1');
       await waitForProviderSend(provider);
       complete(turnDone('turn-1', 214_355));
-      await vi.waitFor(() => expect(sentTexts(provider)).toHaveLength(2));
-      expect(sentTexts(provider)[1]).toContain('/compact');
-
-      // The compaction completion re-injects the identity on the next turn.
-      complete({
-        id: 'compact-done', sessionId: 'provider-session-1', kind: 'system', role: 'system',
-        content: 'Codex context compacted.', timestamp: Date.now(), status: 'complete',
-        metadata: { [SESSION_CONTROL_METADATA_COMMAND_FIELD]: 'compact' },
-      });
-      expect(provider.refreshSessionSystemText).toHaveBeenCalledWith('provider-session-1');
-
-      // Still high after a compaction that did not help: no loop.
-      runtime.send('next', 'work-2');
-      await vi.waitFor(() => expect(sentTexts(provider)).toHaveLength(3));
-      complete(turnDone('turn-2', 214_000));
       await new Promise((resolve) => setTimeout(resolve, 20));
-      expect(sentTexts(provider)).toHaveLength(3);
+      expect(sentTexts(provider)).toHaveLength(1);
     });
 
     it('re-injects after an untagged /compact completion, as Claude\'s slash command gives', async () => {
@@ -210,8 +197,8 @@ describe('TransportSessionRuntime memory provenance', () => {
       const usage = { ...(done.metadata!.usage as Record<string, unknown>) };
       delete usage.model_context_window;
       complete({ ...done, metadata: { usage, model: 'claude-sonnet-4-6' } });
-      await vi.waitFor(() => expect(sentTexts(provider)).toHaveLength(2));
-      expect(sentTexts(provider)[1]).toContain('/compact');
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(sentTexts(provider)).toHaveLength(1);
     });
 
     it('leaves a context below the threshold alone', async () => {
@@ -234,7 +221,7 @@ describe('TransportSessionRuntime memory provenance', () => {
       expect(sentTexts(provider)).toHaveLength(1);
     });
 
-    it('waits until 75% of the window before compacting when re-enabled at 0.75', async () => {
+    it('does not compact at 75% even when the env override attempts to re-enable it', async () => {
       const { provider, runtime, complete } = await setup(true);
       runtime.send('keep going', 'work-1');
       await waitForProviderSend(provider);
@@ -243,14 +230,14 @@ describe('TransportSessionRuntime memory provenance', () => {
       expect(sentTexts(provider)).toHaveLength(1);
     });
 
-    it('auto-compacts a slash-command provider that keeps its identity outside the history', async () => {
+    it('does not auto-compact slash-command providers', async () => {
       const { provider, runtime, complete } = await setup(true);
       provider.capabilities.compact = { ...provider.capabilities.compact!, execution: 'slash-command', providerCommand: '/compact' };
       runtime.send('keep going', 'work-1');
       await waitForProviderSend(provider);
       complete(turnDone('turn-1', 190_000, 200_000));
-      await vi.waitFor(() => expect(sentTexts(provider)).toHaveLength(2));
-      expect(sentTexts(provider)[1]).toContain('/compact');
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(sentTexts(provider)).toHaveLength(1);
     });
 
     it('never compacts on its own a provider that does not re-send the identity afterwards', async () => {
