@@ -107,4 +107,33 @@ describe.skipIf(isWin)('provider-hosted MCP reaping through the daemon service (
       outcome: 'released',
     }));
   });
+
+  it('terminal cleanup releases legacy rows through the service fallback without touching another session', async () => {
+    const target = sleeper();
+    const unrelated = sleeper();
+    await service.registerMcpProcessResource(
+      { sessionName: 'deck_legacy_target_w1', sessionInstanceId: 'legacy-instance', runtimeEpoch: 'legacy-epoch' },
+      target.pid!,
+    );
+    await service.registerMcpProcessResource(
+      { sessionName: 'deck_unrelated_w1', sessionInstanceId: 'other-instance', runtimeEpoch: 'other-epoch' },
+      unrelated.pid!,
+    );
+
+    const summary = await service.releaseSessionResources({
+      name: 'deck_legacy_target_w1',
+      projectName: 'legacy',
+      role: 'w1',
+      agentType: 'codex-sdk',
+      projectDir: '/tmp/legacy',
+      state: 'stopped',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: 1,
+      updatedAt: 1,
+    } as unknown as SessionRecord);
+    expect(summary).toEqual({ released: 1, failed: 0 });
+    expect(await exited(target)).toBe(true);
+    expect(alive(unrelated)).toBe(true);
+  });
 });
