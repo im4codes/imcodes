@@ -35,7 +35,7 @@ class FakeQualityLadder final : public common::QualityLadder {
   common::QualitySelection Select(
       const common::QualityTarget& target) const noexcept override {
     return common::QualitySelection{
-        "bounded",
+        target.preference.max_height == 2160 ? "ultra" : "bounded",
         target.source_pixels,
         30,
         target.bitrate_bps,
@@ -740,6 +740,46 @@ int main() {
                 adapter.published_diagnostics.back().path ==
                     common::TransportPath::kRelay,
             "transport diagnostics publish bounded route state");
+  }
+
+  {
+    FakeTransportAdapter adapter_a;
+    FakeTransportAdapter adapter_b;
+    common::TransportSessionCore core_a(adapter_a, ladder, Limits());
+    common::TransportSessionCore core_b(adapter_b, ladder, Limits());
+    common::RouteAuthority authority_a = Authority();
+    authority_a.identity.request_id = "request_a_1234567890";
+    authority_a.identity.session_id = "session_a_1234567890";
+    authority_a.identity.route_generation = 101;
+    common::RouteAuthority authority_b = Authority();
+    authority_b.identity.request_id = "request_b_1234567890";
+    authority_b.identity.session_id = "session_b_1234567890";
+    authority_b.identity.route_generation = 202;
+    const common::TransportCallbackStamp stamp_a{41, 101};
+    const common::TransportCallbackStamp stamp_b{41, 202};
+    const common::QualityTarget baseline{4'000'000, {1920, 1080}};
+    Require(core_a.Start(authority_a, At(0, 0)) &&
+                core_b.Start(authority_b, At(0, 0)) &&
+                core_a.UpdateQualityTarget(stamp_a, baseline) &&
+                core_b.UpdateQualityTarget(stamp_b, baseline),
+            "two independent quality routes start with baselines");
+    const auto b_before = core_b.diagnostics().quality;
+    adapter_a.quality_result = false;
+    imcodes::rd::QualityPreference request_a;
+    request_a.max_height = 2160;
+    Require(!core_a.SetQualityPreference(request_a) && !core_a.terminal() &&
+                adapter_a.close_transport_count == 0,
+            "route A rejects a transient quality refusal without closing");
+    Require(!core_b.terminal() && adapter_b.close_transport_count == 0 &&
+                core_b.diagnostics().quality.has_value() && b_before.has_value() &&
+                core_b.diagnostics().quality->preset_id == b_before->preset_id &&
+                core_b.diagnostics().quality->bitrate_bps == b_before->bitrate_bps,
+            "route B quality and peer remain untouched by route A refusal");
+    adapter_a.quality_result = true;
+    Require(core_a.UpdateQualityTarget(stamp_a, baseline) &&
+                core_a.diagnostics().quality->preset_id == "bounded" &&
+                core_b.diagnostics().quality->preset_id == b_before->preset_id,
+            "route A rolls back while route B keeps its prior selection");
   }
 
   {
