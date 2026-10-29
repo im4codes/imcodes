@@ -1475,7 +1475,7 @@ describe('RemoteDesktopClient', () => {
     client.stop(REMOTE_DESKTOP_STOP_ORIGIN.USER_CLOSE);
   });
 
-  it('eases off only for a live picture that lags beyond its own path, never for a still screen or a steady far link', async () => {
+  it('keeps an explicit preset floor through still, steady, and lagging samples', async () => {
     const intervalSpy = vi.spyOn(globalThis, 'setInterval');
     let socket!: FakeSocket;
     let peer!: FakePeer;
@@ -1494,7 +1494,7 @@ describe('RemoteDesktopClient', () => {
       now: () => now,
       isDocumentVisible: () => true,
     });
-    const smooth = { maxHeight: 1080, maxFps: 30, maxBitrateBps: 0, priority: 'framerate' } as const;
+    const smooth = { maxHeight: 1080, maxFps: 30, maxBitrateBps: 6_000_000, priority: 'framerate' } as const;
     expect(client.setQualityPreference(smooth)).toBe(true);
     expect(client.setQualityPreference({ ...smooth, maxFps: 45 } as never)).toBe(false);
 
@@ -1538,7 +1538,7 @@ describe('RemoteDesktopClient', () => {
     await vi.waitFor(() => expect(qualityControls()).toHaveLength(1));
     expect(qualityControls()[0]).toMatchObject({
       type: REMOTE_DESKTOP_DATA_MSG.CONTROL,
-      maxHeight: 1080, maxFps: 30, maxBitrateBps: 0, priority: 'framerate',
+      maxHeight: 1080, maxFps: 30, maxBitrateBps: 6_000_000, priority: 'framerate',
     });
     // Repeated status frames do not resend an unchanged preference.
     socket.receive({ ...status, qualityPreference: true });
@@ -1573,14 +1573,17 @@ describe('RemoteDesktopClient', () => {
     // The same far link with a moving picture: steady, so still no ceiling.
     for (let i = 9; i <= 16; i += 1) await sample(i, 0.3, 30, 0.02, 250_000);
     expect(qualityControls()).toHaveLength(baseline);
-    // Round trips climb 250 ms above that path's own floor: now it lags.
+    // Round trips climb 250 ms above that path's own floor. The native worker
+    // must report an explicit cannot-satisfy result rather than the browser
+    // silently lowering this named preset's floor.
     for (let i = 17; i <= 20; i += 1) await sample(i, 0.55, 30, 0.02, 250_000);
-    await vi.waitFor(() => expect(qualityControls().length).toBeGreaterThan(baseline));
-    expect(qualityControls().at(-1)!.maxBitrateBps).toBe(1_200_000);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(qualityControls()).toHaveLength(baseline);
+    expect(qualityControls().at(-1)!.maxBitrateBps).toBe(6_000_000);
     client.stop();
   });
 
-  it('sends this viewer\'s quality preference only to a capable worker and eases the bitrate off when the picture lags', async () => {
+  it('sends this viewer\'s quality floor only to a capable worker and never lowers it for latency', async () => {
     const intervalSpy = vi.spyOn(globalThis, 'setInterval');
     let socket!: FakeSocket;
     let peer!: FakePeer;
@@ -1599,7 +1602,7 @@ describe('RemoteDesktopClient', () => {
       now: () => now,
       isDocumentVisible: () => true,
     });
-    const smooth = { maxHeight: 1080, maxFps: 30, maxBitrateBps: 0, priority: 'framerate' } as const;
+    const smooth = { maxHeight: 1080, maxFps: 30, maxBitrateBps: 6_000_000, priority: 'framerate' } as const;
     expect(client.setQualityPreference(smooth)).toBe(true);
     expect(client.setQualityPreference({ ...smooth, maxFps: 45 } as never)).toBe(false);
 
@@ -1643,7 +1646,7 @@ describe('RemoteDesktopClient', () => {
     await vi.waitFor(() => expect(qualityControls()).toHaveLength(1));
     expect(qualityControls()[0]).toMatchObject({
       type: REMOTE_DESKTOP_DATA_MSG.CONTROL,
-      maxHeight: 1080, maxFps: 30, maxBitrateBps: 0, priority: 'framerate',
+      maxHeight: 1080, maxFps: 30, maxBitrateBps: 6_000_000, priority: 'framerate',
     });
     // Repeated status frames do not resend an unchanged preference.
     socket.receive({ ...status, qualityPreference: true });
@@ -1668,10 +1671,11 @@ describe('RemoteDesktopClient', () => {
       await new Promise((resolve) => setTimeout(resolve, 0));
     };
     for (let i = 1; i <= 6; i += 1) await sample(i, 0.4);
-    await vi.waitFor(() => expect(qualityControls().length).toBeGreaterThanOrEqual(2));
-    const eased = qualityControls()[1]!;
-    expect(eased.maxBitrateBps).toBe(1_200_000);
-    expect(eased).toMatchObject({ maxHeight: 1080, maxFps: 30, priority: 'framerate' });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(qualityControls()).toHaveLength(1);
+    expect(qualityControls()[0]).toMatchObject({
+      maxHeight: 1080, maxFps: 30, maxBitrateBps: 6_000_000, priority: 'framerate',
+    });
 
     // A hand-tuned custom preference is respected as is: no guard ceiling.
     const custom = { maxHeight: 1440, maxFps: 60, maxBitrateBps: 8_000_000, priority: 'resolution' } as const;
