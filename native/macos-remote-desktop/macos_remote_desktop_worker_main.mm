@@ -2006,6 +2006,9 @@ void WorkerTransportSink::HandleDataChannelMessage(
           imcodes::rd::QualityPreferenceFromControl(message.control);
       accepted = preference.has_value() &&
                  session_->SetQualityPreference(*preference);
+      if (!accepted) {
+        (void)SendControlRejected(kind, imcodes::rd::kRejectQualityUnavailable);
+      }
     } else if (kind == "frame_presented") {
       const auto topology = session_->topology();
       const rd::common::DisplayTopology* display =

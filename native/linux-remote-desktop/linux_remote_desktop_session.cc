@@ -956,6 +956,8 @@ void LinuxRemoteDesktopSession::HandleDataChannelMessage(
     const std::optional<imcodes::rd::QualityPreference> preference =
         imcodes::rd::QualityPreferenceFromControl(message.control);
     if (!preference || !transport_core_.SetQualityPreference(*preference)) {
+      (void)SendControlRejected("set_quality_preference",
+                                imcodes::rd::kRejectQualityUnavailable);
       return;
     }
     // The builtin encoder takes its bitrate from libwebrtc's estimate, so the

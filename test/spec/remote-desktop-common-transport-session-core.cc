@@ -39,8 +39,12 @@ class FakeQualityLadder final : public common::QualityLadder {
         target.source_pixels,
         30,
         target.bitrate_bps,
+        0,
+        !reject_quality,
     };
   }
+
+  bool reject_quality = false;
 };
 
 class FakeTransportAdapter final : public common::TransportSessionAdapter {
@@ -780,6 +784,29 @@ int main() {
                 core_a.diagnostics().quality->preset_id == "bounded" &&
                 core_b.diagnostics().quality->preset_id == b_before->preset_id,
             "route A rolls back while route B keeps its prior selection");
+  }
+
+  {
+    FakeTransportAdapter adapter;
+    common::TransportSessionCore core(adapter, ladder, Limits());
+    Require(core.Start(Authority(), At(0, 0)),
+            "quality refusal transport starts");
+    Require(core.UpdateQualityTarget(
+                Stamp(), common::QualityTarget{4'000'000, {1920, 1080}}),
+            "quality refusal fixture has an accepted baseline");
+    adapter.quality_result = false;
+    Require(!core.UpdateQualityTarget(
+                Stamp(), common::QualityTarget{5'000'000, {1920, 1080}}) &&
+                !core.terminal() && adapter.close_transport_count == 0,
+            "transient encoder refusal keeps the peer alive");
+    adapter.quality_result = true;
+    ladder.reject_quality = true;
+    imcodes::rd::QualityPreference impossible;
+    impossible.max_height = 2160;
+    impossible.max_bitrate_bps = 30'000'000;
+    Require(!core.SetQualityPreference(impossible) && !core.terminal() &&
+                adapter.close_transport_count == 0,
+            "an impossible quality floor is rejected without reconnecting");
   }
 
   {

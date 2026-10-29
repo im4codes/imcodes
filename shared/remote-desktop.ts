@@ -290,6 +290,8 @@ export const REMOTE_DESKTOP_CONTROL_REJECTION = {
   MODE_UNSUPPORTED: 'mode_unsupported',
   /** The mode tested fine but Windows refused to apply it. */
   MODE_CHANGE_FAILED: 'mode_change_failed',
+  /** The live encoder/relay cannot satisfy the requested quality without a peer restart. */
+  QUALITY_UNAVAILABLE: 'quality_unavailable',
   /** The scale change was refused by Windows. */
   SCALE_CHANGE_FAILED: 'scale_change_failed',
   /** The display exists but capture could not be moved to it. */
