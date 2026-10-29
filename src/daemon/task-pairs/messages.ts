@@ -820,7 +820,7 @@ const OUTPUT_FAILURES: Record<string, string> = {
 /** Brain: DONE asked to keep a deliverable and it could not be copied. */
 export function buildOutputFailedLine(pair: TaskPairState, reason: string): string {
   const output = pair.output ? `${pair.output.path}${pair.output.dest ? ` -> ${pair.output.dest}` : ''}` : '';
-  return `${header(pair)} The deliverable ${output} was not copied into the project: ${OUTPUT_FAILURES[reason] ?? reason}. It stays in ${pair.workspace?.path ?? 'the workspace'} for 7 days; copy it yourself or have the executor fix the path.`;
+  return `${header(pair)} The deliverable ${output} was not copied into the project: ${OUTPUT_FAILURES[reason] ?? reason}. It stays in ${pair.workspace?.path ?? 'the workspace'} for 48 hours; copy it yourself or have the executor fix the path.`;
 }
 
 function readyMarker(pair: TaskPairState): string {

@@ -540,19 +540,19 @@ describe('integration drift', () => {
       expect((await passAt(60)).integrated).toBe(1);
     });
 
-    it('only pairs that ended within the last 7 days are considered, and at most the cap are tracked per pass', async () => {
+    it('only pairs that ended within the last 48 hours are considered, and at most the cap are tracked per pass', async () => {
       const { base } = setUpRepos();
       const wt = addWorktree('w1', base);
       const head = commit(wt, 'w.txt', 'w\n', 'feat: w');
       for (let i = 0; i < 12; i += 1) {
-        donePair(`old${i}`, wt, head, base, { updatedAt: T0 - 8 * 24 * 60 * MIN, workspace: { kind: 'worktree', path: wt, base, lastHead: head, createdAt: 1, endedAt: T0 - 8 * 24 * 60 * MIN, status: 'ended' } as never });
+        donePair(`old${i}`, wt, head, base, { updatedAt: T0 - 49 * 60 * MIN, workspace: { kind: 'worktree', path: wt, base, lastHead: head, createdAt: 1, endedAt: T0 - 49 * 60 * MIN, status: 'ended' } as never });
       }
       for (let i = 0; i < TASK_PAIR_INTEGRATION_REMINDER_MAX_PAIRS + 10; i += 1) donePair(`new${i}`, wt, head, base, { updatedAt: T0 - i });
       const result = await passAt(60);
       expect(result.considered).toBe(TASK_PAIR_INTEGRATION_REMINDER_MAX_PAIRS);
       expect(digests()[0]!.text).not.toContain('old0');
       expect(digests()[0]!.text.split('\n').filter((entry) => entry.startsWith('- ')).length).toBeLessThanOrEqual(TASK_PAIR_INTEGRATION_REMINDER_MAX_PAIRS);
-      expect(TASK_PAIR_INTEGRATION_REMINDER_WINDOW_MS).toBe(7 * 24 * 60 * MIN);
+      expect(TASK_PAIR_INTEGRATION_REMINDER_WINDOW_MS).toBe(48 * 60 * MIN);
     });
 
     it('a daemon restart neither repeats a burst nor restarts the grace (reminder state is persisted)', async () => {

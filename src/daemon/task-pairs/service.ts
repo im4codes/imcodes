@@ -2166,9 +2166,10 @@ export class TaskPairService {
   }
 
   /**
-   * Remove the workspaces of pairs that ended at least the retention period
-   * ago. A worktree that still holds unsaved work is kept (Brain is told once)
-   * and retried on later sweeps. Runs at most hourly unless forced.
+   * Remove safe terminal workspaces: DONE pairs wait out the retention
+   * period, while CANCEL pairs are eligible on the first sweep. A worktree
+   * that still holds unsaved work is kept (Brain is told once) and retried on
+   * later sweeps. Runs at most hourly unless forced.
    */
   async sweepWorkspaces(now: number, options: { force?: boolean } = {}): Promise<void> {
     if (!options.force && now - this.#lastSweepAt < 60 * 60_000) return;
@@ -2184,9 +2185,10 @@ export class TaskPairService {
       const pair = stored.state;
       const workspace = pair.workspace;
       if (!workspace || !isTerminalTaskPairStatus(pair.status)) continue;
-      if (now - (workspace.endedAt ?? pair.updatedAt) < TASK_PAIR_WORKSPACE_RETENTION_MS) continue;
+      const retentionMs = pair.status === 'cancelled' ? 0 : TASK_PAIR_WORKSPACE_RETENTION_MS;
+      if (now - (workspace.endedAt ?? pair.updatedAt) < retentionMs) continue;
       try {
-        const outcome = await this.#releaseEndedWorkspace(stored, now, TASK_PAIR_WORKSPACE_RETENTION_MS, false);
+        const outcome = await this.#releaseEndedWorkspace(stored, now, retentionMs, false);
         if (outcome?.kept) keptThisSweep.push(outcome.kept);
       } catch (error) {
         logger.warn({ err: error, taskId: pair.taskId }, 'task-pair: workspace sweep failed');
@@ -2249,7 +2251,7 @@ export class TaskPairService {
   }
 
   /**
-   * On-demand cleanup of the workspaces of pairs that have ENDED (done / cancelled), without waiting out the seven-day retention.
+   * On-demand cleanup of the workspaces of pairs that have ENDED (done / cancelled), without changing the safety gates.
    * Open pairs are never listed. The checks are the sweep's own (a worktree with uncommitted or untracked files, commits no branch
    * has, a lock, or a non-git pair whose work has not landed is kept and the reason is returned). `dryRun` (the default of the MCP
    * tool) removes nothing. At most `limit` pairs are examined per call, oldest end first.

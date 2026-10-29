@@ -7,7 +7,7 @@
  * Both are advisory: nothing is blocked, nothing is merged.
  *
  * Cost model (heartbeat every 6 min, ~200 closed and ~30 open pairs): the pass starts from a bounded SQL listing of pairs that
- * finished in the last 7 days, and every gate that needs no git runs first (dismissed, not a git worktree, outside the window,
+ * finished in the last 48 hours, and every gate that needs no git runs first (dismissed, not a git worktree, outside the window,
  * already found integrated, grace not over, next reminder not due). Git runs only for a pair whose reminder is due, so a pair costs
  * at most one check per 10-15 minutes, an integrated pair is never checked again, and results are cached per head + integration
  * tip. The integration ref is fetched at most once per repository per 5 minutes (single flight, bounded, a failure backs off and is
