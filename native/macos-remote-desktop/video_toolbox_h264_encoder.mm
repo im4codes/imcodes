@@ -1254,9 +1254,27 @@ class VideoToolboxH264Encoder::Impl {
     // speed governor (capture thread) can both ask for one, and two overlapping
     // rebuilds would race on the backend's session.
     std::lock_guard<std::recursive_mutex> rebuild(rebuild_mutex_);
+    common::EncoderConfiguration requested = configuration;
+    bool fold_pending_selection = false;
+    {
+      std::lock_guard lock(mutex_);
+      // A preference may arrive before VideoToolbox has an active session.
+      // Fold it into the first configuration instead of rejecting it. When a
+      // live reconfigure is already in progress, the caller's clamped
+      // configuration is authoritative and must not be overwritten by the
+      // raw request (which may be below the encoder's minimum bitrate).
+      fold_pending_selection = !configuration_.has_value() || !sink_;
+      if (fold_pending_selection && requested_selection_.has_value()) {
+        requested.encoded_pixels = {
+            static_cast<std::uint32_t>(requested_selection_->width),
+            static_cast<std::uint32_t>(requested_selection_->height)};
+        requested.frame_rate = static_cast<std::uint32_t>(requested_selection_->fps);
+        requested.bitrate_bps = requested_selection_->bitrate_bps;
+      }
+    }
     Stop();
     if (!backend_ || !limits_.IsValid() || !sink ||
-        !IsValidConfiguration(configuration, limits_)) {
+        !IsValidConfiguration(requested, limits_)) {
       std::lock_guard lock(mutex_);
       last_error_ = {VideoToolboxEncoderErrorCode::kInvalidConfiguration,
                      "invalid VideoToolbox encoder configuration"};
@@ -1269,18 +1287,18 @@ class VideoToolboxH264Encoder::Impl {
       generation = ++state_->generation;
       // Latency-first keeps one frame in flight: the encoder always works on
       // the newest frame and never on a queue of stale ones.
-      state_->latency_first = configuration.latency_first;
-      state_->bitrate_bps = configuration.bitrate_bps;
-      state_->expected_pixels = configuration.encoded_pixels;
+      state_->latency_first = requested.latency_first;
+      state_->bitrate_bps = requested.bitrate_bps;
+      state_->expected_pixels = requested.encoded_pixels;
       state_->max_pending_frames =
-          configuration.latency_first ? 1U : limits_.max_pending_frames;
+          requested.latency_first ? 1U : limits_.max_pending_frames;
     }
-    latency_first_.store(configuration.latency_first,
+    latency_first_.store(requested.latency_first,
                          std::memory_order_relaxed);
     // Disarmed until Reconfigure() proves the configuration came from a ladder
     // selection; it re-arms the governor after a successful rebuild.
     speed_->armed.store(false, std::memory_order_relaxed);
-    if (configuration.latency_first) {
+    if (requested.latency_first) {
       // A new session: the old one's timings no longer describe it.
       std::lock_guard lock(speed_->mutex);
       speed_->governor.ClearWindow();
@@ -1300,7 +1318,7 @@ class VideoToolboxH264Encoder::Impl {
     VideoToolboxEncoderKind kind = VideoToolboxEncoderKind::kNone;
     if (backend_->HardwareEncoderAvailable()) {
       configured = backend_->Configure(
-          configuration, VideoToolboxEncoderKind::kHardware, output_sink,
+          requested, VideoToolboxEncoderKind::kHardware, output_sink,
           error_sink, limits_, &hardware_error);
       if (configured) {
         kind = VideoToolboxEncoderKind::kHardware;
@@ -1332,7 +1350,7 @@ class VideoToolboxH264Encoder::Impl {
       }
       VideoToolboxEncoderError software_error;
       configured = backend_->Configure(
-          configuration, VideoToolboxEncoderKind::kQualifiedAppleSoftware,
+          requested, VideoToolboxEncoderKind::kQualifiedAppleSoftware,
           output_sink, error_sink, limits_, &software_error);
       if (!configured) {
         std::lock_guard lock(mutex_);
@@ -1356,7 +1374,7 @@ class VideoToolboxH264Encoder::Impl {
     }
     {
       std::lock_guard lock(mutex_);
-      configuration_ = configuration;
+      configuration_ = requested;
       sink_ = std::move(sink);
       active_kind_ = kind;
       last_error_ = {};
@@ -1391,32 +1409,25 @@ class VideoToolboxH264Encoder::Impl {
 
   bool Reconfigure(const imcodes::rd::QualitySelection& selection) {
     std::lock_guard<std::recursive_mutex> rebuild(rebuild_mutex_);
-    common::H264AccessUnitSink sink;
-    common::H264Profile profile = common::H264Profile::kConstrainedBaseline;
-    bool latency_first = false;
-    {
-      std::lock_guard lock(mutex_);
-      if (!configuration_.has_value() || !sink_) {
-        last_error_ = {VideoToolboxEncoderErrorCode::kInvalidConfiguration,
-                       "quality reconfigure requires an active encoder"};
-        return false;
-      }
-      sink = sink_;
-      profile = configuration_->profile;
-      latency_first = configuration_->latency_first;
-      // What the ladder asked for, before any speed-governor step: the
-      // governor re-applies it with a new level without waiting for the
-      // network estimator to speak again.
-      requested_selection_ = selection;
-      // The caller's id string does not outlive this call; nothing here reads
-      // it, so never keep a pointer to it.
-      requested_selection_->id = "requested";
-    }
     if (selection.width <= 0 || selection.height <= 0 || selection.fps <= 0) {
       std::lock_guard lock(mutex_);
       last_error_ = {VideoToolboxEncoderErrorCode::kInvalidConfiguration,
                      "common quality selection is invalid"};
       return false;
+    }
+    common::H264AccessUnitSink sink;
+    common::H264Profile profile = common::H264Profile::kConstrainedBaseline;
+    bool latency_first = false;
+    {
+      std::lock_guard lock(mutex_);
+      // Keep the request if the peer is still opening; Configure() folds it
+      // into the first live VideoToolbox session.
+      requested_selection_ = selection;
+      requested_selection_->id = "requested";
+      if (!configuration_.has_value() || !sink_) return true;
+      sink = sink_;
+      profile = configuration_->profile;
+      latency_first = configuration_->latency_first;
     }
     // Congestion control chose `selection` from what the NETWORK can carry;
     // it has no visibility into whether THIS encoder can actually keep up

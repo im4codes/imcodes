@@ -675,6 +675,7 @@ export function RemoteDesktopPanel({
   const suppressDisplayTabClickTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const previousInputEnabledRef = useRef(false);
   const mediaPresentedRef = useRef(false);
+  const mediaStreamGenerationRef = useRef<number | null>(null);
   const mediaRecoveringRef = useRef(false);
   const hasCachedFrameRef = useRef(false);
   const lastCachedFrameAtRef = useRef(Number.NEGATIVE_INFINITY);
@@ -1110,12 +1111,23 @@ export function RemoteDesktopPanel({
   }, [displayModeMenu]);
 
   useEffect(() => {
-    // A new MediaStream can represent another execution route. Never carry a
-    // cached screen across that authority boundary, even if both routes point
-    // at the same display.
-    clearCachedFrame();
-    mediaPresentedRef.current = false;
-    setMediaPresented(false);
+    // A new peer/media authority must clear sensitive pixels. An in-place
+    // quality update may replace the receiver's MediaStream object without
+    // changing that authority generation; keep the last frame visible while
+    // the same peer's new encoder output arrives.
+    const streamGeneration = snapshot.streamGeneration;
+    const preserveSamePeerFrame = snapshot.stream !== null
+      && streamGeneration !== undefined
+      && mediaPresentedRef.current
+      && mediaStreamGenerationRef.current === streamGeneration;
+    mediaStreamGenerationRef.current = streamGeneration ?? null;
+    if (preserveSamePeerFrame) {
+      showCachedFrame(REMOTE_DESKTOP_BROWSER_DIAGNOSTIC_EVENT.VIDEO_WAITING);
+    } else {
+      clearCachedFrame();
+      mediaPresentedRef.current = false;
+      setMediaPresented(false);
+    }
     if (videoRef.current && videoRef.current.srcObject !== snapshot.stream) {
       videoRef.current.srcObject = snapshot.stream;
     }
@@ -1132,7 +1144,7 @@ export function RemoteDesktopPanel({
       track.removeEventListener('mute', onMute);
       track.removeEventListener('ended', onEnded);
     };
-  }, [clearCachedFrame, showCachedFrame, snapshot.stream]);
+  }, [clearCachedFrame, showCachedFrame, snapshot.stream, snapshot.streamGeneration]);
 
   useEffect(() => {
     const video = videoRef.current;
@@ -3789,7 +3801,7 @@ export function RemoteDesktopPanel({
               openMobileKeyboard();
             }}
           ><span aria-hidden="true">⌨</span></button>
-          {!currentStreamPresented && (
+          {!currentStreamPresented && !mediaPresented && !hasCachedFrame && (
             <div class="remote-desktop-stage-placeholder" role="status">
               {snapshot.state === REMOTE_DESKTOP_STATE.FAILED ? (
                 <>

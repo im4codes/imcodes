@@ -158,6 +158,8 @@ export interface RemoteDesktopSnapshot {
    *  `quality.encoderClass` text. */
   encoder?: RemoteDesktopEncoderSummary;
   stream: MediaStream | null;
+  /** Monotonic peer/media authority generation; unchanged for in-place quality updates. */
+  streamGeneration?: number;
   terminalReason?: string;
   error?: string;
   /** Server-authoritative retry guidance for an ERROR response. */
@@ -633,6 +635,7 @@ export class RemoteDesktopClient {
     timer: ReturnType<typeof setTimeout>;
   } | null = null;
   private controlRejectionId = 0;
+  private streamGeneration = 0;
   private diagnosticTrackCleanup: (() => void) | null = null;
   private snapshot: RemoteDesktopSnapshot = {
     state: REMOTE_DESKTOP_STATE.AUTHORIZING,
@@ -642,6 +645,7 @@ export class RemoteDesktopClient {
     displays: [],
     layoutRevision: 1,
     stream: null,
+    streamGeneration: 0,
     durationMs: 0,
     reconnectCount: 0,
     capabilityVersion: REMOTE_DESKTOP_CAPABILITY,
@@ -1525,12 +1529,14 @@ export class RemoteDesktopClient {
   }
 
   private async preparePeer(authority: Extract<RemoteDesktopServerMessage, { type: typeof REMOTE_DESKTOP_MSG.AUTHORIZED }>): Promise<void> {
+    this.streamGeneration += 1;
     this.sessionId = authority.sessionId;
     this.capability = authority.capability;
     this.daemonGeneration = authority.daemonGeneration;
     this.expiresAt = this.serverDeadlineToLocal(authority.expiresAt, authority.serverTime);
     this.publish({
       state: REMOTE_DESKTOP_STATE.PREPARING,
+      streamGeneration: this.streamGeneration,
       mode: authority.mode,
       inputEpoch: authority.inputEpoch,
       inputEnabled: false,

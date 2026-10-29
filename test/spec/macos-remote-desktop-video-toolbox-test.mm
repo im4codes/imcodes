@@ -548,6 +548,31 @@ bool TestQualityReconfigureAndAsyncFailure() {
                "asynchronous backend failure must settle and expose the row");
 }
 
+bool TestQualityPreferenceBeforeEncoderStartsIsAppliedOnFirstConfigure() {
+  auto backend = std::make_unique<FakeBackend>();
+  FakeBackend* fake = backend.get();
+  encoder::VideoToolboxH264Encoder adapter(std::move(backend));
+  if (!Check(adapter.ReconfigureFromQualitySelection({.id = "ultra",
+                                                     .width = 2560,
+                                                     .height = 1440,
+                                                     .fps = 30,
+                                                     .bitrate_bps = 12'000'000}),
+             "a quality preference arriving before the encoder starts is deferred") ||
+      !Check(adapter.Configure(Configuration(1920, 1080),
+                               [](common::H264AccessUnit) {}),
+             "the deferred quality preference must not make first configure unavailable")) {
+    return false;
+  }
+  const auto configuration = adapter.Configuration();
+  return Check(configuration.has_value() &&
+                   configuration->encoded_pixels.width == 2560 &&
+                   configuration->encoded_pixels.height == 1440 &&
+                   configuration->frame_rate == 30 &&
+                   configuration->bitrate_bps == 12'000'000 &&
+                   fake->configurations.size() == 1,
+               "the first live encoder session must use the pending quality selection");
+}
+
 bool TestStopIgnoresLateOutput() {
   auto backend = std::make_unique<FakeBackend>();
   FakeBackend* fake = backend.get();
@@ -580,6 +605,7 @@ int main() {
                    TestLowBitrateTargetKeepsEncoderRunning() &&
                    TestLowBitrateTargetWhileBackloggedKeepsEncoderRunning() &&
                    TestQualityReconfigureAndAsyncFailure() &&
+                   TestQualityPreferenceBeforeEncoderStartsIsAppliedOnFirstConfigure() &&
                    TestStopIgnoresLateOutput()
                ? 0
                : 1;
