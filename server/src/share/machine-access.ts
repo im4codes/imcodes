@@ -22,7 +22,7 @@ export interface ControlledMachineAccessRow {
   revoked_at: number | null;
   access_role: MachineAccessRole;
   access_expires_at: number | null;
-  /** Where the access comes from. An EXECUTE grant only counts when this is `share` (shared/machine-access-policy.ts). */
+  /** Where the access comes from; group membership is the product's default execute grant. */
   access_source: MachineAccessSource | null;
   /** The explicit per-device share row's execute grant; false for the owner row, a group member and every pre-grant share. */
   exec_granted: boolean;
@@ -158,8 +158,8 @@ const CONTROLLED_MACHINE_ACCESS_SELECT = `
            WHEN sh.role IS NOT NULL THEN 'share'
            WHEN ${IS_MEMBER_OF_A_MACHINE_GROUP} THEN 'group'
          END AS access_source,
-         -- Only the explicit per-device row can carry an execute grant, and only a participant row (CHECK in migration 100). A group
-         -- membership has no row, so it can never grant it; a missing column reads false.
+         -- The explicit per-device row carries direct execute grants. Group execute is derived from access_source='group';
+         -- its exec_granted projection remains false because no share row exists.
          COALESCE(sh.exec_granted, FALSE) AS exec_granted,
          CASE WHEN s.user_id = $1 THEN TRUE
            WHEN (sh.role IS NULL OR sh.role = 'participant') AND ${machineGroupMembershipSql('$1', true)} THEN TRUE
@@ -175,7 +175,7 @@ const CONTROLLED_MACHINE_ACCESS_SELECT = `
      AND sh.target_user_id = $1
      AND sh.revoked_at IS NULL
      AND (sh.expires_at IS NULL OR sh.expires_at > $2)
-    -- A live group membership grants bounded visibility/read, never execute.
+    -- A live group membership grants participant access; execute policy is applied by the shared action table.
     -- The more specific active direct role still wins over that group default.
 `;
 

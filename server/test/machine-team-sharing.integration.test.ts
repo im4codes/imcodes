@@ -145,7 +145,7 @@ describe('associating a machine with a team', () => {
     expect(await roleFor(stranger)).toBeUndefined();
   });
 
-  it('lists group-only machines and permits bounded reads without an execute grant', async () => {
+  it('lists group-only machines and permits execute without an extra grant', async () => {
     const teamId = await makeTeam(owner);
     await db.execute(
       "INSERT INTO team_members (team_id, user_id, role, joined_at) VALUES ($1, $2, 'member', $3)",

@@ -7,11 +7,10 @@
  *   EXECUTE-class action  = anything that can run code on the device, write to it, or read files off it as the node's account.
  *   VIEW-class action     = list the machine, or look without touching (list_apps, get_app_state, browser_snapshot).
  *
- *   EXECUTE-class needs ALL of:  the node's exec switch is ON  AND  the actor is the device OWNER, or a participant carrying an
- *   explicit execute grant (`execGranted`). The resolver may source that grant from a direct share or a product-controlled group
- *   grant; group membership without the grant, and viewers, remain denied.
- *   EXEC (exec_remote) uses the same live actor grant on participant-origin turns. A participant still needs an explicit execute
- *   grant; the signed authority and canonical target binding prevent owner fallback or cross-target replay.
+ *   EXECUTE-class needs ALL of: the node's exec switch is ON AND the actor is the device OWNER, a participant carrying an
+ *   explicit direct execute grant (`execGranted`), or a valid group participant. Group membership is the product's default
+ *   execute grant; viewers and explicit viewer overrides remain denied. The signed authority and canonical target binding
+ *   prevent owner fallback or cross-target replay.
  *
  * Reading files is EXECUTE-class on purpose: the node's account can read credentials, keys and browser profiles, so "read any path"
  * is a privilege escalation for whoever holds it. Directory listing is the bounded exception for group participants: it powers the
@@ -72,7 +71,7 @@ export const MACHINE_DENIAL_REASON = {
   NO_ACCESS: 'no_access',
   /** The node's exec switch is off. */
   EXEC_DISABLED: 'exec_disabled',
-  /** The actor can operate the device but holds no execute grant (group member, share participant without the grant). */
+  /** The actor can operate the device but holds no execute grant (for example a direct participant without the grant). */
   EXECUTE_NOT_GRANTED: 'execute_not_granted',
   /** The action is unknown to this table. */
   UNKNOWN_ACTION: 'unknown_action',
@@ -83,7 +82,7 @@ export interface MachineAccessSubject {
   /** null = the actor has no operate access (not the owner / participant share / group member). */
   accessRole: 'owner' | 'participant' | 'viewer' | null;
   accessSource: MachineAccessSource | null;
-  /** The share row's exec_granted flag (false when there is no share row; a missing column reads false). */
+  /** The direct share row's exec_granted flag (group access is granted by accessSource=group). */
   execGranted: boolean;
   /** The node's exec switch. */
   execEnabled: boolean;
@@ -109,7 +108,8 @@ export function evaluateMachineAction(subject: MachineAccessSubject, action: Mac
   }
   if (!machineActionRequiresExecute(action)) return { allowed: true };
   if (subject.accessSource === MACHINE_ACCESS_SOURCE.OWNER && subject.accessRole === 'owner') return { allowed: true };
-  if (subject.accessRole === 'participant' && subject.execGranted === true) {
+  if (subject.accessRole === 'participant'
+    && (subject.execGranted === true || subject.accessSource === MACHINE_ACCESS_SOURCE.GROUP)) {
     return { allowed: true };
   }
   return { allowed: false, reason: MACHINE_DENIAL_REASON.EXECUTE_NOT_GRANTED };
