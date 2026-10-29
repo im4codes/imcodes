@@ -33,6 +33,7 @@ import { warnOncePerHour } from '../util/rate-limited-warn.js';
 import { incrementCounter } from '../util/metrics.js';
 import { redactSummaryPreservingPinned } from '../util/redact-with-pinned-region.js';
 import { ensureProjectionEmbeddingForProjection } from './projection-embedding-maintenance.js';
+import { isMemoryDaemonEnabled } from '../store/memory-daemon-switch.js';
 import { timelineEmitter } from '../daemon/timeline-emitter.js';
 import {
   decideSkillReviewSchedule,
@@ -102,6 +103,7 @@ export interface MaterializationResult {
   replicationQueued: boolean;
   compression?: CompressionResult;
   filteredOut?: boolean;
+  disabled?: boolean;
 }
 
 export interface MaterializationSkillReviewJob {
@@ -288,6 +290,7 @@ export class MaterializationCoordinator {
   }
 
   async materializeTarget(target: ContextTargetRef, trigger: ContextJobTrigger, now = Date.now()): Promise<MaterializationResult> {
+    if (!isMemoryDaemonEnabled()) return { replicationQueued: false, disabled: true };
     const memoryConfig = this.configForTarget(target);
     const jobType = target.kind === 'project' ? 'materialize_project' : 'materialize_session';
     // Run the whole job lifecycle (create → running → … → completed) on the
@@ -702,6 +705,7 @@ export class MaterializationCoordinator {
   }
 
   async scheduleDueTargets(now = Date.now()): Promise<ContextJobRecord[]> {
+    if (!isMemoryDaemonEnabled()) return [];
     const client = getContextStoreClient();
     // Best-effort archive prune (a prune failure must never block scheduling).
     // Route via `run` (not `fireAndForget`) so we don't eagerly spawn/warm a

@@ -1002,6 +1002,13 @@ export async function startHookServer(
     if (url === '/daemon/embedding' && req.method === 'POST') {
       try {
         const body = JSON.parse(await readBody(req, 256 * 1024)) as { text?: unknown; texts?: unknown };
+        const { isMemoryDaemonEnabled } = await import('../store/memory-daemon-switch.js');
+        if (!isMemoryDaemonEnabled()) {
+          const count = typeof body.text === 'string' && body.text ? 1 : Array.isArray(body.texts) ? body.texts.filter((t): t is string => typeof t === 'string').length : 0;
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify(Array.isArray(body.texts) ? { ok: true, embeddings: Array.from({ length: count }, () => null) } : { ok: true, embedding: null }));
+          return;
+        }
         const { generateEmbeddingDirect, generateEmbeddingsDirect } = await import('../context/embedding.js');
         if (typeof body.text === 'string' && body.text) {
           const vec = await generateEmbeddingDirect(body.text);

@@ -15,6 +15,7 @@ import { serializeContextNamespace } from './context-keys.js';
 import type { MemoryToolCaller } from './memory-read-tools.js';
 import type { ContextNamespaceRow, ContextObservationRow } from '../store/context-store.js';
 import { getContextStoreClient } from '../store/context-store-worker-client.js';
+import { isMemoryDaemonEnabled } from '../store/memory-daemon-switch.js';
 
 export interface SaveObservationOk {
   status: 'ok';
@@ -67,6 +68,7 @@ function observationNamespaceFor(caller: MemoryToolCaller): ContextNamespace {
 }
 
 export async function saveObservation(input: unknown, caller: MemoryToolCaller, deps: MemoryWriteToolDeps = {}): Promise<SaveObservationResult> {
+  if (!isMemoryDaemonEnabled()) return buildMcpErrorResult(MCP_ERROR_REASONS.FEATURE_DISABLED, 'daemon memory is disabled');
   const args = pickAllowedMcpArgs(input, ['content', 'tags', 'turnId', 'idempotencyKey']);
   const content = readString(args, 'content')?.trim();
   if (!content) {
@@ -127,6 +129,7 @@ export async function saveObservation(input: unknown, caller: MemoryToolCaller, 
 }
 
 export async function savePreference(input: unknown, caller: MemoryToolCaller, deps: MemoryWriteToolDeps = {}): Promise<SavePreferenceResult> {
+  if (!isMemoryDaemonEnabled()) return buildMcpErrorResult(MCP_ERROR_REASONS.FEATURE_DISABLED, 'daemon memory is disabled');
   const args = pickAllowedMcpArgs(input, ['text', 'idempotencyKey']);
   const text = readString(args, 'text')?.trim();
   if (!text) {

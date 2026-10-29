@@ -1304,6 +1304,23 @@ const memoryCmd = program
   .command('memory')
   .description('Search and inspect local agent memory');
 
+for (const [name, enabled, description] of [
+  ['enable', true, 'Enable persistent daemon memory recording and indexing'],
+  ['disable', false, 'Disable persistent daemon memory recording and indexing'],
+] as const) {
+  memoryCmd.command(name).description(description).action(async () => {
+    const { setMemoryDaemonEnabled } = await import('./store/memory-daemon-switch.js');
+    const status = setMemoryDaemonEnabled(enabled);
+    console.log(JSON.stringify({ status: status.enabled ? 'enabled' : 'disabled', enabled: status.enabled }));
+  });
+}
+
+memoryCmd.command('status').description('Show persistent daemon memory switch status').action(async () => {
+  const { getMemoryDaemonSwitchStatus } = await import('./store/memory-daemon-switch.js');
+  const status = getMemoryDaemonSwitchStatus();
+  console.log(JSON.stringify({ status: status.enabled ? 'enabled' : 'disabled', enabled: status.enabled }));
+});
+
 memoryCmd
   .command('mcp')
   .description('Run the daemon memory MCP server over stdio')
