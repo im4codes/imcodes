@@ -449,7 +449,8 @@ bool TransportSessionCore::QualitySelectionIsValid(
   return !selection.preset_id.empty() && selection.preset_id.size() <= 64 &&
          selection.encoded_pixels.IsValid() && selection.frame_rate > 0 &&
          selection.frame_rate <= 240 && selection.bitrate_bps > 0 &&
-         selection.bitrate_bps <= limits_.maximum_quality_target_bps;
+         selection.bitrate_bps <= limits_.maximum_quality_target_bps &&
+         selection.meets_preference_floor;
 }
 
 bool TransportSessionCore::UpdateQualityTarget(
@@ -466,6 +467,10 @@ bool TransportSessionCore::UpdateQualityTarget(
 bool TransportSessionCore::ApplyQualityTarget(const QualityTarget& target) {
   QualityTarget effective = target;
   effective.preference = viewer_preference_;
+  if (effective.preference.minimum_bitrate_bps == 0) {
+    effective.preference.minimum_bitrate_bps =
+        viewer_preference_.max_bitrate_bps;
+  }
   // Until ICE proves the route direct, treat it as relayed: the operator's
   // relay ceiling is exactly what an unproven route must not exceed.
   effective.preference.max_bitrate_bps = imcodes::rd::EffectiveBitrateCap(

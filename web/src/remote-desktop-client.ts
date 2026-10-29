@@ -822,6 +822,12 @@ export class RemoteDesktopClient {
   private effectiveQualityPreference(): RemoteDesktopQualityPreference | null {
     const preference = this.desiredQualityPreference;
     if (!preference) return null;
+    // Every named preset carries an explicit bitrate floor. Latency samples
+    // must not silently lower that floor; the native ladder reports an
+    // explicit cannot-satisfy result when the transport cap is below it.
+    if (preference.maxBitrateBps > 0) {
+      return preference;
+    }
     const guard = this.latencyGuardCapBps;
     if (guard === null) return preference;
     const own = preference.maxBitrateBps;
