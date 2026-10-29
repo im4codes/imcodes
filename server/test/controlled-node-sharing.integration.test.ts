@@ -283,7 +283,7 @@ describe('controlled-node sharing reuses grants without becoming a shared Tab', 
     expect(promote.status).toBe(200);
     const participantList = await app.request('/api/machines', { headers: webAuth(recipientId) });
     expect(await participantList.json()).toEqual({
-      machines: [expect.objectContaining({ serverId, accessRole: 'participant', execEnabled: true })],
+      machines: [expect.objectContaining({ serverId, accessRole: 'participant', execEnabled: false })],
     });
 
     const nonOwnerManage = await app.request(`/api/server/${serverId}/shares`, {

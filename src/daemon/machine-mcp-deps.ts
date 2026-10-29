@@ -13,6 +13,7 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { resolveImcodesHome } from '../util/windows-daemon-lock.js';
 import { MCP_ERROR_REASONS, type MCPErrorReason } from '../../shared/memory-mcp-errors.js';
+import { machineActionForComputerUseTool, machineActionRequiresExecute } from '../../shared/machine-access-policy.js';
 import { NODE_ROLE, type MachineExecHttpReason } from '../../shared/remote-exec.js';
 import type { ComputerUseHttpReason } from '../../shared/computer-use.js';
 import { FS_GENERIC_ERROR_CODES } from '../../shared/fs-error-codes.js';
@@ -333,7 +334,9 @@ export function createDaemonMachineToolDeps(overrides: DaemonMachineToolDepsOver
       if (matches.length === 0) return { outcome: 'not_dispatched', reason: MCP_ERROR_REASONS.MACHINE_NOT_FOUND, error: `no controllable machine named "${machine}"` };
       if (matches.length > 1) return { outcome: 'not_dispatched', reason: MCP_ERROR_REASONS.MACHINE_AMBIGUOUS, error: `more than one machine named "${machine}"` };
       const target = matches[0]!;
-      if (!target.execEnabled) return { outcome: 'not_dispatched', reason: MCP_ERROR_REASONS.EXEC_DISABLED, error: `machine control is disabled for "${machine}"` };
+      if (machineActionRequiresExecute(machineActionForComputerUseTool(tool)) && !target.execEnabled) {
+        return { outcome: 'not_dispatched', reason: MCP_ERROR_REASONS.EXEC_DISABLED, error: `machine control is disabled for "${machine}"` };
+      }
       const remote = await computerUse({
         serverUrl: creds.serverUrl,
         sourceServerId: creds.serverId,
