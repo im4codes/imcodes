@@ -177,48 +177,6 @@ TEST(QualityLadderTest, UltraRaisesTheViewerCeilingAndNothingElseDoes) {
   EXPECT_EQ(SelectQuality(30'000'000, 5120, 2880).bitrate_bps, 15'000'000u);
 }
 
-TEST(QualityLadderTest, ExplicitPresetFloorReportsWhenAHardCapCannotSatisfyIt) {
-  struct PresetFloorCase {
-    int max_height;
-    int max_fps;
-    uint32_t bitrate;
-    QualityPriority priority;
-  };
-  const PresetFloorCase cases[] = {
-      {1080, 30, 6'000'000, QualityPriority::kFramerate},
-      {1440, 30, 10'000'000, QualityPriority::kBalanced},
-      {0, 30, 15'000'000, QualityPriority::kResolution},
-      {2160, 30, 30'000'000, QualityPriority::kResolution},
-      {1080, 15, 1'800'000, QualityPriority::kBalanced},
-  };
-  for (const PresetFloorCase& test : cases) {
-    QualityPreference preference;
-    preference.max_height = test.max_height;
-    preference.max_fps = test.max_fps;
-    preference.max_bitrate_bps = test.bitrate;
-    preference.priority = test.priority;
-    EXPECT_TRUE(SelectQuality(test.bitrate, 5120, 2880, preference)
-                    .meets_preference_floor);
-    EXPECT_FALSE(SelectQuality(test.bitrate - 1, 5120, 2880, preference)
-                     .meets_preference_floor);
-  }
-
-  QualityPreference smooth;
-  smooth.max_height = 1080;
-  smooth.max_fps = 30;
-  smooth.max_bitrate_bps = 6'000'000;
-  smooth.priority = QualityPriority::kFramerate;
-  EXPECT_FALSE(SelectQuality(500'000, 1920, 1080, smooth)
-                   .meets_preference_floor);
-  QualityPreference ultra;
-  ultra.max_height = 2160;
-  ultra.max_fps = 30;
-  ultra.max_bitrate_bps = 30'000'000;
-  ultra.priority = QualityPriority::kResolution;
-  EXPECT_FALSE(SelectQuality(30'000'000, 1920, 1080, ultra)
-                   .meets_preference_floor);
-}
-
 TEST(QualityLadderTest, BacklogPressureLeavesAnUnstrugglingEncoderAlone) {
   EXPECT_EQ(ApplyEncodeBacklogPressure(6'000'000, 0), 6'000'000u);
 }

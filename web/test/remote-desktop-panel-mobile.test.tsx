@@ -627,7 +627,7 @@ describe('RemoteDesktopPanel mobile gestures', () => {
     // Nothing saved yet: the default, and it is what the client is told.
     expect(trigger(first).getAttribute('aria-label')).toContain('quality_short_balanced');
     expect(setQualityPreference).toHaveBeenLastCalledWith(
-      { maxHeight: 1440, maxFps: 30, maxBitrateBps: 10_000_000, priority: 'balanced' },
+      { maxHeight: 1440, maxFps: 30, maxBitrateBps: 0, priority: 'balanced' },
       { latencyGuard: true },
     );
 
@@ -640,7 +640,7 @@ describe('RemoteDesktopPanel mobile gestures', () => {
     expect(first.queryByRole('radio', { name: /quality_short_sharp/ })).toBeNull();
     expect(trigger(first).getAttribute('aria-label')).toContain('quality_short_sharp');
     expect(setQualityPreference).toHaveBeenLastCalledWith(
-      { maxHeight: 0, maxFps: 30, maxBitrateBps: 15_000_000, priority: 'resolution' },
+      { maxHeight: 0, maxFps: 30, maxBitrateBps: 0, priority: 'resolution' },
       { latencyGuard: true },
     );
     first.unmount();
@@ -652,7 +652,7 @@ describe('RemoteDesktopPanel mobile gestures', () => {
     await act(async () => { await Promise.resolve(); });
     expect(trigger(reopened).getAttribute('aria-label')).toContain('quality_short_sharp');
     expect(setQualityPreference).toHaveBeenLastCalledWith(
-      { maxHeight: 0, maxFps: 30, maxBitrateBps: 15_000_000, priority: 'resolution' },
+      { maxHeight: 0, maxFps: 30, maxBitrateBps: 0, priority: 'resolution' },
       { latencyGuard: true },
     );
 
@@ -662,7 +662,7 @@ describe('RemoteDesktopPanel mobile gestures', () => {
     await act(async () => { await Promise.resolve(); });
     expect(trigger(reopened).getAttribute('aria-label')).toContain('quality_short_balanced');
     expect(setQualityPreference).toHaveBeenLastCalledWith(
-      { maxHeight: 1440, maxFps: 30, maxBitrateBps: 10_000_000, priority: 'balanced' },
+      { maxHeight: 1440, maxFps: 30, maxBitrateBps: 0, priority: 'balanced' },
       { latencyGuard: true },
     );
   });

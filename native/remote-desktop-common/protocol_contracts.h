@@ -60,7 +60,6 @@ struct QualitySelection {
   // (ViewerVideoBitrateCeiling), held to the relay ceiling until the route is
   // proven direct. Filled by TransportSessionCore.
   std::uint32_t maximum_bitrate_bps = 0;
-  bool meets_preference_floor = true;
 };
 
 class QualityLadder {
