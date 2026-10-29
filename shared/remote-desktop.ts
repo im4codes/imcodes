@@ -405,16 +405,28 @@ export type RemoteDesktopQualityMode =
 export const DEFAULT_REMOTE_DESKTOP_QUALITY_MODE: RemoteDesktopQualityMode =
   REMOTE_DESKTOP_QUALITY_MODE.BALANCED;
 
+/** The minimum physical rung and target bitrate promised by each quick mode. */
+export const REMOTE_DESKTOP_QUALITY_MODE_FLOORS = Object.freeze({
+  smooth: { minHeight: 1080, targetBitrateBps: 6_000_000 },
+  balanced: { minHeight: 1080, targetBitrateBps: 10_000_000 },
+  sharp: { minHeight: 1080, targetBitrateBps: 15_000_000 },
+  ultra: { minHeight: 2160, targetBitrateBps: 30_000_000 },
+  saver: { minHeight: 1080, targetBitrateBps: 1_800_000 },
+} as const);
+
 /** What each quick mode means on the wire. Custom supplies its own values. */
 export const REMOTE_DESKTOP_QUALITY_MODE_PREFERENCES: Readonly<Record<
   Exclude<RemoteDesktopQualityMode, 'custom'>, RemoteDesktopQualityPreference
 >> = Object.freeze({
-  smooth: { maxHeight: 1080, maxFps: 30, maxBitrateBps: 0, priority: 'framerate' },
-  balanced: { maxHeight: 1440, maxFps: 30, maxBitrateBps: 0, priority: 'balanced' },
-  sharp: { maxHeight: 0, maxFps: 30, maxBitrateBps: 0, priority: 'resolution' },
-  ultra: { maxHeight: 2160, maxFps: 30, maxBitrateBps: 30_000_000, priority: 'resolution' },
+  // The bitrate is an explicit target floor as well as the viewer ceiling;
+  // the native ladder rejects a relayed path that cannot satisfy it instead
+  // of silently selecting a blurry rung.
+  smooth: { maxHeight: REMOTE_DESKTOP_QUALITY_MODE_FLOORS.smooth.minHeight, maxFps: 30, maxBitrateBps: REMOTE_DESKTOP_QUALITY_MODE_FLOORS.smooth.targetBitrateBps, priority: 'framerate' },
+  balanced: { maxHeight: 1440, maxFps: 30, maxBitrateBps: REMOTE_DESKTOP_QUALITY_MODE_FLOORS.balanced.targetBitrateBps, priority: 'balanced' },
+  sharp: { maxHeight: 0, maxFps: 30, maxBitrateBps: REMOTE_DESKTOP_QUALITY_MODE_FLOORS.sharp.targetBitrateBps, priority: 'resolution' },
+  ultra: { maxHeight: REMOTE_DESKTOP_QUALITY_MODE_FLOORS.ultra.minHeight, maxFps: 30, maxBitrateBps: REMOTE_DESKTOP_QUALITY_MODE_FLOORS.ultra.targetBitrateBps, priority: 'resolution' },
   // Saver lowers bitrate and frame rate, never the 1080p resolution floor.
-  saver: { maxHeight: 1080, maxFps: 15, maxBitrateBps: 1_800_000, priority: 'balanced' },
+  saver: { maxHeight: REMOTE_DESKTOP_QUALITY_MODE_FLOORS.saver.minHeight, maxFps: 15, maxBitrateBps: REMOTE_DESKTOP_QUALITY_MODE_FLOORS.saver.targetBitrateBps, priority: 'balanced' },
 });
 
 /** Bounds for a viewer-chosen bitrate cap (matches the native ladder). */

@@ -25,7 +25,6 @@ import {
   REMOTE_DESKTOP_MSG,
   REMOTE_DESKTOP_POINTER_KIND,
   REMOTE_DESKTOP_PROTOCOL_VERSION,
-  REMOTE_DESKTOP_QUALITY_BITRATE_CAP,
   REMOTE_DESKTOP_SERVER_ID_QUERY,
   REMOTE_DESKTOP_SIGNALING_PATH,
   REMOTE_DESKTOP_STATE,
@@ -823,11 +822,10 @@ export class RemoteDesktopClient {
   private effectiveQualityPreference(): RemoteDesktopQualityPreference | null {
     const preference = this.desiredQualityPreference;
     if (!preference) return null;
-    // Ultra is an explicit resolution contract. Latency samples may lower the
-    // transport bitrate, but they must never silently turn a capable 4K source
-    // into a lower-resolution stream.
-    if (preference.maxHeight === 2160
-      && preference.maxBitrateBps >= REMOTE_DESKTOP_QUALITY_BITRATE_CAP.MAX_BPS) {
+    // Every named preset carries an explicit bitrate floor. Latency samples
+    // must not silently lower that floor; the native ladder reports an
+    // explicit cannot-satisfy result when the transport cap is below it.
+    if (preference.maxBitrateBps > 0) {
       return preference;
     }
     const guard = this.latencyGuardCapBps;
