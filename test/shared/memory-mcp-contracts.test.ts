@@ -129,6 +129,10 @@ describe('memory MCP shared contracts', () => {
       'cron_list',
       'cron_update',
       'cron_delete',
+      'cron_pause_self',
+      'cron_resume_self',
+      'cron_pause',
+      'cron_resume',
       // Machine remote-exec surface — FULL-only (controlled-node-remote-exec 10.12).
       'list_machines',
       'exec_remote',

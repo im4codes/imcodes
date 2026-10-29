@@ -85,6 +85,7 @@ export const DAEMON_TOKEN_ROUTES: readonly DaemonTokenRoute[] = [
   ...[`${server}/cron`].flatMap((cron) => [
     full('GET', cron), full('POST', cron),
     full('PUT', `${cron}/:id`), full('DELETE', `${cron}/:id`),
+    full('PATCH', `${cron}/:id/status`),
   ]),
 ];
 
