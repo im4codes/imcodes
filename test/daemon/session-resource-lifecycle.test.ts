@@ -52,6 +52,18 @@ describe('session resource lifecycle', () => {
     expect(cleanup).toHaveBeenCalledTimes(4);
   });
 
+  it('releases legacy rows by exact session name when the persisted owner tuple is missing', async () => {
+    const { registry, cleanup } = await fixture();
+    const legacyOwner = { sessionName: owner().sessionName, sessionInstanceId: 'legacy-instance', runtimeEpoch: 'legacy-epoch' };
+    const unrelatedOwner = { sessionName: 'deck_other_w1', sessionInstanceId: 'other-instance', runtimeEpoch: 'other-epoch' };
+    await registry.register({ resourceId: 'mcp:legacy', kind: 'mcp', owner: legacyOwner, handle: { type: 'pid', pid: 401 } });
+    await registry.register({ resourceId: 'mcp:unrelated', kind: 'mcp', owner: unrelatedOwner, handle: { type: 'pid', pid: 402 } });
+
+    expect(await registry.releaseSessionName(owner().sessionName, 'session_completed')).toMatchObject({ released: 1, failed: 0 });
+    expect((await registry.list()).map((record) => record.resourceId)).toEqual(['mcp:unrelated']);
+    expect(cleanup).toHaveBeenCalledWith(expect.objectContaining({ resourceId: 'mcp:legacy' }), 'session_completed');
+  });
+
   it('startup orphan sweep preserves an exact live owner but cleans crash or owner-reuse leases', async () => {
     const { registry, cleanup } = await fixture();
     await registry.register({ resourceId: 'browser:old', kind: 'browser', owner: owner('old-instance'), handle: { type: 'pid', pid: 301 } });
