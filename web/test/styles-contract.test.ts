@@ -990,6 +990,12 @@ describe('styles.css regression contracts', () => {
     expect(nameRule).not.toBeNull();
     expect(nameRule![0]).toMatch(/text-overflow:\s*ellipsis/);
     expect(nameRule![0]).toMatch(/white-space:\s*nowrap/);
+
+    const menuRule = css.match(/\.mobile-server-menu\s*\{[^}]*\}/);
+    expect(menuRule).not.toBeNull();
+    expect(menuRule![0]).toMatch(/max-height:\s*calc\(var\(--vvh,\s*100dvh\)\s*-\s*var\(--sat,\s*0px\)\s*-\s*68px\s*-\s*env\(safe-area-inset-bottom,\s*0px\)\)/);
+    expect(menuRule![0]).not.toMatch(/max-height:\s*min\(60vh/);
+    expect(menuRule![0]).toMatch(/padding-bottom:\s*max\(16px,\s*env\(safe-area-inset-bottom,\s*0px\)\)/);
   });
 
   it('mobile shell chrome does not depend solely on the narrow viewport breakpoint', () => {

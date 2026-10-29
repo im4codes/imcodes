@@ -227,20 +227,18 @@ describe('RemoteDesktopRouter', () => {
       mode: REMOTE_DESKTOP_ACCESS_MODE.VIEW,
     });
     expect(f.daemonMessages.find((message) => message.type === REMOTE_DESKTOP_MSG.PREPARE))
-      .toMatchObject({ mode: REMOTE_DESKTOP_ACCESS_MODE.VIEW });
+      .toMatchObject({ mode: REMOTE_DESKTOP_ACCESS_MODE.VIEW, inputEpoch: 0 });
   });
 
-  // tsk_9a8c291594: remote-desktop CONTROL injects keyboard/mouse input, which can launch anything as the signed-in user. It is
-  // GUI_INPUT in the one rule table, so operate access alone gets a VIEW-only route.
-  describe('Control is execute-class: operate access alone only watches', () => {
+  describe('shared participants receive remote-desktop Control while exec remains separately gated', () => {
     for (const [label, row] of Object.entries(UNGRANTED_PARTICIPANTS)) {
-      it(`${label}: group/share may View but without an execute grant cannot Control`, async () => {
+      it(`${label}: participant can Control without inheriting machine-exec permission`, async () => {
         const f = fixture({ resolveAccess: async () => ({ ...validAccess(), ...row }) });
         await f.router.handleBrowser(f.browserA, 'someone', start);
         const authority = f.messages(f.browserA).at(-1)!;
-        expect(authority).toMatchObject({ type: REMOTE_DESKTOP_MSG.AUTHORIZED, mode: REMOTE_DESKTOP_ACCESS_MODE.VIEW });
+        expect(authority).toMatchObject({ type: REMOTE_DESKTOP_MSG.AUTHORIZED, mode: REMOTE_DESKTOP_ACCESS_MODE.CONTROL });
         expect(f.daemonMessages.find((message) => message.type === REMOTE_DESKTOP_MSG.PREPARE))
-          .toMatchObject({ mode: REMOTE_DESKTOP_ACCESS_MODE.VIEW });
+          .toMatchObject({ mode: REMOTE_DESKTOP_ACCESS_MODE.CONTROL, inputEpoch: 1 });
 
         await f.router.handleBrowser(f.browserA, 'someone', {
           type: REMOTE_DESKTOP_MSG.MODE_SET,
@@ -249,11 +247,10 @@ describe('RemoteDesktopRouter', () => {
           capability: authority.capability,
           mode: REMOTE_DESKTOP_ACCESS_MODE.CONTROL,
         });
-        expect(f.messages(f.browserA).at(-1)).toMatchObject({ type: REMOTE_DESKTOP_MSG.ERROR, error: REMOTE_DESKTOP_ERROR.ACCESS_DENIED });
         expect(f.daemonMessages.some((message) => (
           message.type === REMOTE_DESKTOP_MSG.MODE_STATE && message.mode === REMOTE_DESKTOP_ACCESS_MODE.CONTROL
-        ))).toBe(false);
-        expect(f.router.stats()).toMatchObject({ active: 1, controlling: 0 });
+        ))).toBe(true);
+        expect(f.router.stats()).toMatchObject({ active: 1, controlling: 1 });
       });
     }
 
@@ -262,22 +259,20 @@ describe('RemoteDesktopRouter', () => {
       await authorize(fixture({ resolveAccess: async () => ({ ...validAccess(), ...GRANTED_PARTICIPANT }) }), undefined, 'granted-user');
     });
 
-    it('revoking the grant (or downgrading the role) while a Control route lives drops it to View at the next revalidation', async () => {
+    it('revoking the grant does not change remote-desktop mode; role downgrade still drops it to View', async () => {
       let row: ControlledMachineAccessRow = { ...validAccess(), ...GRANTED_PARTICIPANT };
       const f = fixture({ resolveAccess: async () => row });
       const authority = await authorize(f, f.browserA, 'granted-user');
       expect(f.router.sessionsForUser('granted-user')[0]).toMatchObject({ mode: REMOTE_DESKTOP_ACCESS_MODE.CONTROL });
       row = { ...validAccess(), ...GRANTED_PARTICIPANT, exec_granted: false };
       await f.router.revalidateUser('granted-user');
-      expect(f.router.sessionsForUser('granted-user')[0]).toMatchObject({ mode: REMOTE_DESKTOP_ACCESS_MODE.VIEW, inputEpoch: 2 });
-      expect(f.daemonMessages.at(-1) && f.daemonMessages.filter((message) => message.type === REMOTE_DESKTOP_MSG.MODE_STATE).at(-1))
-        .toMatchObject({ mode: REMOTE_DESKTOP_ACCESS_MODE.VIEW, sessionId: authority.sessionId });
-      // And it cannot take Control back.
-      await f.router.handleBrowser(f.browserA, 'granted-user', {
-        type: REMOTE_DESKTOP_MSG.MODE_SET, ...authority, mode: REMOTE_DESKTOP_ACCESS_MODE.CONTROL,
-      });
-      expect(f.messages(f.browserA).at(-1)).toMatchObject({ error: REMOTE_DESKTOP_ERROR.ACCESS_DENIED });
-      expect(f.router.stats()).toMatchObject({ controlling: 0 });
+      expect(f.router.sessionsForUser('granted-user')[0]).toMatchObject({ mode: REMOTE_DESKTOP_ACCESS_MODE.CONTROL, inputEpoch: 1 });
+      expect(f.daemonMessages.filter((message) => message.type === REMOTE_DESKTOP_MSG.MODE_STATE)).toHaveLength(0);
+      row = { ...validAccess(), access_role: 'viewer', access_source: 'share', exec_granted: false };
+      await f.router.revalidateUser('granted-user');
+      expect(f.router.sessionsForUser('granted-user')).toHaveLength(0);
+      expect(f.messages(f.browserA).at(-1)).toMatchObject({ type: REMOTE_DESKTOP_MSG.TERMINAL });
+      expect(f.router.stats()).toMatchObject({ active: 0, controlling: 0 });
     });
   });
 
@@ -918,8 +913,72 @@ describe('RemoteDesktopRouter', () => {
     ]));
   });
 
+  it('isolates a shared viewer terminal from another viewer on the same route', async () => {
+    const f = fixture();
+    const first = await authorize(f, f.browserA, 'owner-user', 'request_viewer_a');
+    const second = await authorize(f, f.browserB, 'owner-user', 'request_viewer_b');
+
+    await f.router.handleBrowser(f.browserA, 'owner-user', {
+      type: REMOTE_DESKTOP_MSG.OFFER,
+      ...first,
+      sdp: 'v=0\r\na=ice-ufrag:viewer-a',
+    });
+    await f.router.handleBrowser(f.browserB, 'owner-user', {
+      type: REMOTE_DESKTOP_MSG.OFFER,
+      ...second,
+      sdp: 'v=0\r\na=ice-ufrag:viewer-b',
+    });
+    expect(f.daemonMessages.filter((message) => message.type === REMOTE_DESKTOP_MSG.OFFER))
+      .toHaveLength(2);
+
+    expect(f.router.handleDaemon({
+      type: REMOTE_DESKTOP_MSG.TERMINAL,
+      ...first,
+      reason: REMOTE_DESKTOP_TERMINAL_REASON.PROTOCOL_ERROR,
+    }, 7)).toBe(true);
+
+    // The failed viewer is closed, but the other shared viewer keeps its
+    // authority and remains eligible for signaling.
+    expect(f.messages(f.browserA).at(-1)).toMatchObject({
+      type: REMOTE_DESKTOP_MSG.TERMINAL,
+      reason: REMOTE_DESKTOP_TERMINAL_REASON.PROTOCOL_ERROR,
+    });
+    expect(f.messages(f.browserB).some((message) => message.type === REMOTE_DESKTOP_MSG.TERMINAL))
+      .toBe(false);
+    expect(f.router.handleDaemon({
+      type: REMOTE_DESKTOP_MSG.ICE,
+      ...second,
+      candidate: 'candidate:viewer-b-still-live',
+      mid: '0',
+    }, 7)).toBe(true);
+    expect(f.messages(f.browserB).at(-1)).toMatchObject({
+      type: REMOTE_DESKTOP_MSG.ICE,
+      candidate: 'candidate:viewer-b-still-live',
+    });
+  });
+
   it.each([
-    ['viewer', { access_role: 'viewer' }, REMOTE_DESKTOP_ERROR.ACCESS_DENIED],
+    ['direct owner control', 'owner-user', {}, REMOTE_DESKTOP_ACCESS_MODE.CONTROL],
+    ['direct share viewer', 'share-viewer', { access_role: 'viewer', access_source: 'share', exec_granted: false }, REMOTE_DESKTOP_ACCESS_MODE.VIEW],
+    ['direct share participant', 'share-viewer', { access_role: 'participant', access_source: 'share', exec_granted: false }, REMOTE_DESKTOP_ACCESS_MODE.CONTROL],
+    ['group inherited control', 'group-viewer', { access_role: 'participant', access_source: 'group', exec_granted: false }, REMOTE_DESKTOP_ACCESS_MODE.CONTROL],
+    ['direct share control grant', 'share-controller', { access_role: 'participant', access_source: 'share', exec_granted: true }, REMOTE_DESKTOP_ACCESS_MODE.CONTROL],
+  ] as const)('%s keeps per-viewer authority and mode boundaries', async (_label, userId, access, expectedMode) => {
+    const f = fixture({ resolveAccess: async () => ({ ...validAccess(), ...access }) });
+    await f.router.handleBrowser(f.browserA, userId, { ...start, requestId: 'request_viewer_a' });
+    await f.router.handleBrowser(f.browserB, userId, { ...start, requestId: 'request_viewer_b' });
+    const first = f.messages(f.browserA).at(-1)!;
+    const second = f.messages(f.browserB).at(-1)!;
+    expect(first).toMatchObject({ type: REMOTE_DESKTOP_MSG.AUTHORIZED, mode: expectedMode });
+    expect(second).toMatchObject({ type: REMOTE_DESKTOP_MSG.AUTHORIZED, mode: expectedMode });
+    expect(first.sessionId).not.toBe(second.sessionId);
+    expect(first.capability).not.toBe(second.capability);
+    expect(first.daemonGeneration).toBe(second.daemonGeneration);
+    expect(f.daemonMessages.filter((message) => message.type === REMOTE_DESKTOP_MSG.PREPARE)).toHaveLength(2);
+  });
+
+  it.each([
+    ['viewer with disabled exec', { access_role: 'viewer', exec_enabled: false }, REMOTE_DESKTOP_ERROR.EXECUTION_DISABLED],
     ['disabled', { exec_enabled: false }, REMOTE_DESKTOP_ERROR.EXECUTION_DISABLED],
     // Enrolled as linux but still advertising the bare legacy Windows token
     // (validAccess()'s default capabilities) -- a genuine mismatch, not the
@@ -1766,6 +1825,46 @@ describe('RemoteDesktopRouter', () => {
       stopOrigin: REMOTE_DESKTOP_STOP_ORIGIN.USER_CLOSE,
     });
     expect(f.daemonMessages.filter((message) => message.type === REMOTE_DESKTOP_MSG.STOP)).toHaveLength(stoppedCount);
+  });
+
+  it('resets browser and daemon ICE budgets for each offer generation', async () => {
+    const f = fixture();
+    const authority = await authorize(f);
+    const offer = (sdp: string) => ({
+      type: REMOTE_DESKTOP_MSG.OFFER,
+      ...authority,
+      sdp,
+    } as const);
+    const browserIce = (index: string | number) => ({
+      type: REMOTE_DESKTOP_MSG.ICE,
+      ...authority,
+      candidate: `candidate:browser-${index}`,
+      mid: '0',
+    } as const);
+    const daemonIce = (index: string | number) => ({
+      type: REMOTE_DESKTOP_MSG.ICE,
+      ...authority,
+      candidate: `candidate:daemon-${index}`,
+      mid: '0',
+    } as const);
+
+    await f.router.handleBrowser(f.browserA, 'owner-user', offer('v=0\\r\\na=ice-ufrag:first'));
+    for (let index = 0; index < REMOTE_DESKTOP_LIMITS.MAX_ICE_CANDIDATES - 1; index += 1) {
+      await f.router.handleBrowser(f.browserA, 'owner-user', browserIce(index));
+      expect(f.messages(f.browserA).at(-1)?.type).not.toBe(REMOTE_DESKTOP_MSG.TERMINAL);
+      expect(f.router.handleDaemon(daemonIce(index), 7)).toBe(true);
+    }
+
+    // The second offer starts a new ICE generation on the same shared viewer
+    // route. Two candidates now exceed the old cumulative budget but are legal
+    // in the fresh generation and must not terminate the route.
+    await f.router.handleBrowser(f.browserA, 'owner-user', offer('v=0\\r\\na=ice-ufrag:second'));
+    for (let index = 0; index < 2; index += 1) {
+      await f.router.handleBrowser(f.browserA, 'owner-user', browserIce(`restart-${index}`));
+      expect(f.messages(f.browserA).at(-1)?.type).not.toBe(REMOTE_DESKTOP_MSG.TERMINAL);
+      expect(f.router.handleDaemon(daemonIce(`restart-${index}`), 7)).toBe(true);
+    }
+    expect(f.router.stats().active).toBe(1);
   });
 
   it('bounds per-session mode churn without introducing a global controller lock', async () => {

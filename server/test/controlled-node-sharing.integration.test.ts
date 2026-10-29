@@ -579,13 +579,13 @@ describe('controlled-node shared action admission', () => {
       machines: [expect.objectContaining({ serverId: targetId })],
     });
 
-    // A turn the participant started never EXECUTES (tsk_9a8c291594), even though the participant holds an execute grant of their own:
-    // the owner's agent must not be a confused deputy. Looking (below) still follows the participant's own access.
+    // A participant-origin turn follows the participant's own live execute grant;
+    // the signed authority and canonical target binding prevent owner fallback.
     const exec = await app.request(`/api/machine/exec?serverId=${targetId}`, {
       method: 'POST', headers, body: JSON.stringify({ command: 'echo shared' }),
     });
-    expect(exec.status).toBe(403);
-    expect(await exec.json()).toMatchObject({ outcome: 'not_dispatched', reason: 'target_forbidden' });
+    expect(exec.status).toBe(200);
+    expect(await exec.json()).toMatchObject({ outcome: 'completed' });
 
     const computer = await app.request(`/api/machine/computer-use?serverId=${targetId}`, {
       method: 'POST', headers, body: JSON.stringify({ tool: 'list_apps', arguments: {} }),
@@ -1072,16 +1072,15 @@ describe('a shared-session participant reaches only the machines shared with the
     }
   });
 
-  it('participant-origin exec_remote is refused, while View and file access follow the real grant', async () => {
+  it('participant-origin exec_remote follows the direct execute grant, while group-only access remains denied', async () => {
     const t = await scene();
     for (const target of [t.participantShared, t.grouped]) {
       // Read-only computer use follows the participant's own access (a machine share, or the group)...
       expect((await computerUse(t.app, t.delegated, target)).status, `computer-use ${target}`).toBe(200);
-      // Only exec_remote is participant-gated. A granted file request reaches the offline node (503), not a policy refusal.
+      // A granted direct request reaches the offline node (503), not a policy refusal.
       // A group-only actor still lacks the file grant (403).
-      const execDenied = await exec(t.app, t.delegated, target);
-      expect(execDenied.status, `exec ${target}`).toBe(403);
-      expect(await execDenied.json()).toMatchObject({ outcome: 'not_dispatched', reason: 'target_forbidden' });
+      const execResult = await exec(t.app, t.delegated, target);
+      expect(execResult.status, `exec ${target}`).toBe(target === t.participantShared ? 200 : 403);
       expect((await fileHandle(t.app, t.delegated, target)).status, `file ${target}`).toBe(target === t.participantShared ? 503 : 403);
     }
   });
@@ -1138,7 +1137,7 @@ describe('a shared-session participant reaches only the machines shared with the
     expect((await app403List(t.app, t.delegated))).toBe(403);
   });
 
-  it('audits a refused participant-turn exec with the participant as the delegated actor, and an unshared target as no_access', async () => {
+  it('audits an allowed participant-turn exec with the participant as the delegated actor, and an unshared target as no_access', async () => {
     const t = await scene();
     const audited = new Hono();
     audited.use('*', async (c, next) => {
@@ -1149,14 +1148,21 @@ describe('a shared-session participant reaches only the machines shared with the
       online: true,
       result: { requestId: 'exec', ok: true, exitCode: 0, stdout: 'ok', stderr: '', durationMs: 1 },
     }), machineExecAuditIntentStore));
-    expect((await exec(audited as never, t.delegated, t.participantShared)).status).toBe(403);
-    const refused = await db.queryOne<{ user_id: string; delegated_actor_user_id: string | null; decision: string; reason: string; outcome: string }>(
-      'SELECT user_id, delegated_actor_user_id, decision, reason, outcome FROM machine_exec_audit WHERE source_server_id = $1 AND target_server_id = $2',
-      [t.source.serverId, t.participantShared],
+    expect((await exec(audited as never, t.delegated, t.participantShared)).status).toBe(200);
+    const participantAllowed = await db.queryOne<{ user_id: string; delegated_actor_user_id: string | null; decision: string }>(
+      `SELECT user_id, delegated_actor_user_id, decision FROM machine_exec_audit
+       WHERE source_server_id = $1 AND target_server_id = $2 AND decision = 'allowed'
+         AND delegated_actor_user_id = $3`,
+      [t.source.serverId, t.participantShared, t.participantId],
     );
-    expect(refused).toEqual({
-      user_id: t.ownerId, delegated_actor_user_id: t.participantId, decision: 'denied', reason: 'participant_turn', outcome: 'denied',
-    });
+    expect(participantAllowed).toEqual({ user_id: t.ownerId, delegated_actor_user_id: t.participantId, decision: 'allowed' });
+    const participantAudit = await db.queryOne<{ reason: string | null; outcome: string }>(
+      `SELECT reason, outcome FROM machine_exec_audit
+       WHERE source_server_id = $1 AND target_server_id = $2 AND delegated_actor_user_id = $3
+       ORDER BY created_at DESC LIMIT 1`,
+      [t.source.serverId, t.participantShared, t.participantId],
+    );
+    expect(participantAudit).toEqual({ reason: null, outcome: 'completed' });
     // An owner turn is audited as the owner (allowed), with no delegated actor.
     expect((await exec(audited as never, t.ownerTurn, t.participantShared)).status).toBe(200);
     const allowed = await db.queryOne<{ user_id: string; delegated_actor_user_id: string | null; decision: string }>(

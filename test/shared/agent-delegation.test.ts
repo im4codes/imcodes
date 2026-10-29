@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { CLAUDE_CODE_CLI_SDK_AGENT_TYPE } from '../../shared/agent-types.js';
 import {
   AGENT_DELEGATION_ERROR_CODES,
   AGENT_DELEGATION_BLOCKER_REPORT_FIELDS,
@@ -194,6 +195,7 @@ describe('agent delegation shared contract', () => {
   it('exports reply-capable agent target predicate and rejects non-agent types', () => {
     expect(DELEGATION_REPLY_CAPABLE_AGENT_TYPES).toEqual([
       'claude-code-sdk',
+      CLAUDE_CODE_CLI_SDK_AGENT_TYPE,
       'claude-code',
       'codex-sdk',
       'codex',

@@ -89,4 +89,34 @@ describe('server-link worker reconnect backoff', () => {
     current().emit('close', 1006, Buffer.from(''));
     expect(delays()).toEqual([250, 500, 1000, 250]);
   });
+
+  it('reconnects after a DNS/network error that has no close event', async () => {
+    await loadWorker();
+    const failed = current();
+
+    failed.emit('error', new Error('getaddrinfo ENOTFOUND test.invalid'));
+    expect(delays()).toEqual([250]);
+    expect(h.posted).toContainEqual(expect.objectContaining({ event: 'close', code: 1006 }));
+
+    await vi.advanceTimersByTimeAsync(250);
+    expect(h.FakeSocket.instances).toHaveLength(2);
+    expect(current()).not.toBe(failed);
+  });
+
+  it('reconnects when a connect timeout has no close event', async () => {
+    await loadWorker();
+    const failed = current();
+
+    await vi.advanceTimersByTimeAsync(15_000);
+    expect(h.posted).toContainEqual(expect.objectContaining({
+      event: 'close',
+      code: 1006,
+      reason: 'connect_timeout',
+    }));
+    expect(delays()).toEqual([250]);
+
+    await vi.advanceTimersByTimeAsync(250);
+    expect(h.FakeSocket.instances).toHaveLength(2);
+    expect(current()).not.toBe(failed);
+  });
 });

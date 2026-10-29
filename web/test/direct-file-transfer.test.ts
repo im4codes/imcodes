@@ -180,7 +180,7 @@ function controlBinding(message: Record<string, unknown>) {
 
 function createWs(
   capabilities: string[],
-  mode: 'success' | 'operation_failure' | 'lease_signal_failure' | 'runtime_recovering_once' | 'hold' | 'authorized_hold' | 'status_committed' | 'commit_ack_lost_status_committed' | 'commit_ack_lost_status_committed_late_credit' | 'commit_ack_lost_status_attempting_then_committed' | 'terminal_committed' | 'ack_then_late_terminal' | 'download_hold_rebind' | 'download_size_mismatch' | 'error_after_expiry' | 'drop_first_lease_ready' | 'drop_first_lease_answer' | 'control_socket_closed' | 'lease_init_recovering_once' = 'success',
+  mode: 'success' | 'operation_failure' | 'terminal_failed' | 'lease_signal_failure' | 'runtime_recovering_once' | 'hold' | 'authorized_hold' | 'status_committed' | 'commit_ack_lost_status_committed' | 'commit_ack_lost_status_committed_late_credit' | 'commit_ack_lost_status_attempting_then_committed' | 'terminal_committed' | 'ack_then_late_terminal' | 'download_hold_rebind' | 'download_size_mismatch' | 'error_after_expiry' | 'drop_first_lease_ready' | 'drop_first_lease_answer' | 'control_socket_closed' | 'lease_init_recovering_once' = 'success',
   leaseTiming: { readyDelayMs?: number; idleWindowMs?: number; terminalDelayMs?: number; rebindDaemonGeneration?: number; secondLeaseDaemonGeneration?: number; secondOfferAnswerDelayMs?: number } = {},
 ) {
   const handlers = new Set<(message: ServerMessage) => void>();
@@ -241,6 +241,18 @@ function createWs(
             createdAt: '2026-01-01T00:00:00.000Z', downloadable: true,
           },
         }), leaseTiming.terminalDelayMs ?? 0);
+        return;
+      }
+      if (mode === 'terminal_failed') {
+        const common = controlBinding(payload);
+        queueMicrotask(() => emit({
+          type: DIRECT_FILE_TRANSFER_MSG.TERMINAL,
+          protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+          ...common,
+          state: 'failed',
+          error: DIRECT_FILE_TRANSFER_ERROR.CHECKSUM_MISMATCH,
+          idleExpiresAt: Date.now() + (leaseTiming.idleWindowMs ?? DIRECT_FILE_TRANSFER_LIMITS.LEASE_IDLE_TTL_MS),
+        }));
         return;
       }
       if (mode === 'authorized_hold' || mode === 'status_committed') return;
@@ -2028,6 +2040,8 @@ describe('direct file transfer v2 browser broker', () => {
     expect(destination.handle.createWritable).toHaveBeenCalledTimes(4);
     expect(onMode.mock.calls.map(([mode]) => mode)).toEqual([
       FILE_DOWNLOAD_TRANSPORT_MODE.CONNECTING,
+      FILE_DOWNLOAD_TRANSPORT_MODE.RECOVERING,
+      FILE_DOWNLOAD_TRANSPORT_MODE.RECOVERING,
       FILE_DOWNLOAD_TRANSPORT_MODE.FALLING_BACK,
       FILE_DOWNLOAD_TRANSPORT_MODE.HTTP,
     ]);
@@ -2144,6 +2158,8 @@ describe('direct file transfer v2 browser broker', () => {
 
     expect(onMode.mock.calls.map(([mode]) => mode)).toEqual([
       FILE_DOWNLOAD_TRANSPORT_MODE.CONNECTING,
+      FILE_DOWNLOAD_TRANSPORT_MODE.RECOVERING,
+      FILE_DOWNLOAD_TRANSPORT_MODE.RECOVERING,
       FILE_DOWNLOAD_TRANSPORT_MODE.FALLING_BACK,
       FILE_DOWNLOAD_TRANSPORT_MODE.HTTP,
     ]);
@@ -2228,13 +2244,14 @@ describe('direct file transfer v2 browser broker', () => {
   });
 
   it('retries direct transport three times then performs exactly one relay fallback', async () => {
-    const { uploadFileWithDirectFallback } = await import('../src/direct-file-transfer.js');
+    const { uploadFileWithDirectFallback, FILE_UPLOAD_TRANSPORT_MODE } = await import('../src/direct-file-transfer.js');
     const { ws, sent } = createWs(directCapabilities, 'operation_failure');
     const file = new File(['retry'], 'retry.txt', { type: 'text/plain' });
+    const modes: string[] = [];
     const random = vi.spyOn(Math, 'random').mockReturnValue(0);
     const timeout = vi.spyOn(globalThis, 'setTimeout');
     try {
-      await expect(uploadFileWithDirectFallback({ ws, serverId: 'server-1', file })).resolves.toMatchObject({
+      await expect(uploadFileWithDirectFallback({ ws, serverId: 'server-1', file, onMode: (mode) => modes.push(mode) })).resolves.toMatchObject({
         attachment: { id: 'relay-attachment' },
       });
 
@@ -2243,11 +2260,26 @@ describe('direct file transfer v2 browser broker', () => {
       const delays = timeout.mock.calls.map((call) => call[1]);
       expect(delays).toContain(DIRECT_FILE_TRANSFER_LIMITS.RETRY_BACKOFF_MS[0]);
       expect(delays).toContain(DIRECT_FILE_TRANSFER_LIMITS.RETRY_BACKOFF_MS[1]);
+      expect(modes.filter((mode) => mode === FILE_UPLOAD_TRANSPORT_MODE.RECOVERING)).toHaveLength(2);
     } finally {
       random.mockRestore();
       timeout.mockRestore();
     }
   }, 10_000);
+
+  it('does not retry or relay-fallback a terminal integrity failure', async () => {
+    const { uploadFileWithDirectFallback } = await import('../src/direct-file-transfer.js');
+    const { ws, sent } = createWs(directCapabilities, 'terminal_failed');
+    const file = new File(['invalid'], 'invalid.txt', { type: 'text/plain' });
+
+    await expect(uploadFileWithDirectFallback({ ws, serverId: 'server-1', file }))
+      .rejects.toMatchObject({
+        code: DIRECT_FILE_TRANSFER_ERROR.CHECKSUM_MISMATCH,
+        retryable: false,
+      });
+    expect(apiMocks.uploadFile).not.toHaveBeenCalled();
+    expect(sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.OPERATION_INIT)).toHaveLength(1);
+  });
 
   it('falls back once after three retryable lease-signal races instead of multiplying lease retries', async () => {
     // Only the retry clock is faked; the fake peer/socket plumbing keeps its

@@ -408,6 +408,27 @@ int main() {
                 adapter.local_ice[0].candidate == "candidate:l1" &&
                 adapter.local_ice[1].candidate == "candidate:l2",
             "local ICE flushes FIFO through the signaling adapter");
+
+    // A later offer is a fresh ICE generation on the same logical route. Its
+    // candidate budget and pending queues must not inherit the prior offer's
+    // state, or a healthy shared viewer eventually trips protocol_error after
+    // enough bounded restarts.
+    Require(core.BeginIceRestart(Stamp()) &&
+                core.pending_remote_ice() == 0 &&
+                core.pending_local_ice() == 0,
+            "ICE restart clears the superseded generation queues");
+    Require(core.AddRemoteIceCandidate(Authority().identity,
+                                       Candidate("r3")) &&
+                core.AddRemoteIceCandidate(Authority().identity,
+                                           Candidate("r4")) &&
+                core.OnLocalIceCandidate(Stamp(), Candidate("l3")) &&
+                core.OnLocalIceCandidate(Stamp(), Candidate("l4")),
+            "ICE restart receives a fresh bounded candidate budget");
+    Require(core.SetRemoteDescriptionReady(Stamp()) &&
+                core.SetLocalIceEmissionReady(Stamp()) &&
+                !core.terminal() && adapter.remote_ice.size() == 4 &&
+                adapter.local_ice.size() == 4,
+            "fresh ICE generation remains live at the same per-generation bound");
   }
 
   {

@@ -424,13 +424,15 @@ TEST_F(MfH264EncoderTest, SingleViewerPreferenceAndFeedbackRemainBound) {
             WEBRTC_VIDEO_CODEC_OK);
   ASSERT_EQ(GetMfH264ActiveEncoderCount(), 1u);
   QualityPreference preference;
+  // A per-viewer preference may request a smaller rung, but the encoder's
+  // current contract keeps the negotiated output at the 1080p floor.
   preference.max_height = 360;
   preference.max_fps = 15;
   preference.max_bitrate_bps = 700'000;
   SetMfH264QualityPreferenceForSession("single-viewer", preference);
   const MfH264RuntimeDiagnostics diagnostics =
       encoder.GetRuntimeDiagnostics();
-  EXPECT_EQ(diagnostics.height, 360);
+  EXPECT_EQ(diagnostics.height, 1080);
   EXPECT_LE(diagnostics.fps, 15);
   EXPECT_LE(diagnostics.bitrate_bps, 700'000u);
   EXPECT_EQ(encoder.Release(), WEBRTC_VIDEO_CODEC_OK);

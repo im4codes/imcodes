@@ -3,7 +3,7 @@
 // Dependency-free; unit-testable without the live transport pipeline.
 // See openspec/changes/alias-quick-insert (design D9/D10, tasks 8.1/8.2/8.4).
 
-import { SESSION_AGENT_TYPES, type SessionAgentType } from './agent-types.js';
+import { CLAUDE_CODE_CLI_SDK_AGENT_TYPE, SESSION_AGENT_TYPES, type SessionAgentType } from './agent-types.js';
 import { CODEBUDDY_PROVIDER_IDS } from './codebuddy.js';
 import { AGY_SDK_PROVIDER_ID } from './agy-agent.js';
 import { HERMES_AGENT_PROVIDER_ID } from './hermes-agent.js';
@@ -31,6 +31,7 @@ export type AliasExpansionMode = 'inline' | 'legend';
  */
 export const ALIAS_EXPANSION_MODE_BY_AGENT: Record<SessionAgentType, AliasExpansionMode> = {
   'claude-code-sdk': 'legend',
+  [CLAUDE_CODE_CLI_SDK_AGENT_TYPE]: 'legend',
   'claude-code': 'legend',
   'codex-sdk': 'legend',
   'qoder-sdk': 'legend',

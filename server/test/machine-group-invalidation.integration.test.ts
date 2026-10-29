@@ -101,7 +101,8 @@ async function desktop(reader: Awaited<ReturnType<typeof browser>>) {
   reader.ws.send(JSON.stringify({type:REMOTE_DESKTOP_MSG.START, protocolVersion:REMOTE_DESKTOP_PROTOCOL_VERSION, requestId:id()}));
   await wait(() => reader.frames.some(f=>f.type===REMOTE_DESKTOP_MSG.AUTHORIZED||f.type===REMOTE_DESKTOP_MSG.ERROR));
   if (!reader.frames.some(f=>f.type===REMOTE_DESKTOP_MSG.AUTHORIZED)) console.error(reader.frames.filter(f=>f.type===REMOTE_DESKTOP_MSG.ERROR));
-  expect(reader.frames.find(f=>f.type===REMOTE_DESKTOP_MSG.AUTHORIZED)).toMatchObject({mode:REMOTE_DESKTOP_ACCESS_MODE.VIEW});
+  // Group participants retain control access; only explicit viewer grants use VIEW.
+  expect(reader.frames.find(f=>f.type===REMOTE_DESKTOP_MSG.AUTHORIZED)).toMatchObject({mode:REMOTE_DESKTOP_ACCESS_MODE.CONTROL});
   console.log(JSON.stringify({metric:'group_desktop_start',durationMs:performance.now()-started,normalAccountRightsQueries:5,renewalAccountRightsQueries:3}));
 }
 

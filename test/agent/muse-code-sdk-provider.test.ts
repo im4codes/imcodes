@@ -1,4 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync } from 'node:fs';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
 import {
   DEFAULT_MUSE_MODELS,
   MUSE_CODE_SDK_PROVIDER_ID,
@@ -254,6 +257,123 @@ describe('MuseCodeSdkProvider session and turn lifecycle', () => {
     await provider.endSession(routeId);
   });
 
+  it('re-seeds the versioned IM.codes contract after resume-style clear and changes', async () => {
+    const provider = new MuseCodeSdkProvider();
+    const { sessionObj } = createMockSession();
+    const sendUserTurn = sessionObj.sendUserTurn;
+    (provider as any).client = {
+      startSession: vi.fn().mockResolvedValue(sessionObj),
+      resumeSession: vi.fn().mockResolvedValue(sessionObj),
+    };
+    const routeId = await provider.createSession({ cwd: '/home/k/project', resumeId: 'old-muse-session' });
+    const payload = (sessionSystemText: string, userMessage: string) => ({
+      userMessage,
+      assembledMessage: userMessage,
+      sessionSystemText,
+      context: {
+        sessionSystemText,
+        requiredAuthoredContext: [],
+        advisoryAuthoredContext: [],
+        appliedDocumentVersionIds: [],
+        diagnostics: [],
+      },
+      authority: {},
+      supportClass: 'degraded-message-side-context-mapping',
+      diagnostics: [],
+    });
+    const v1 = 'IM.codes contract v1';
+    const v2 = 'IM.codes contract v2';
+
+    await provider.send(routeId, payload(v1, 'first') as any);
+    await vi.waitFor(() => expect(sendUserTurn).toHaveBeenCalledTimes(1));
+    await vi.waitFor(() => expect((provider as any).sessions.get(routeId).inFlight).toBe(false));
+    expect(sendUserTurn.mock.calls[0][0].input[0].text).toContain(v1);
+    await provider.send(routeId, payload(v1, 'second') as any);
+    await vi.waitFor(() => expect(sendUserTurn).toHaveBeenCalledTimes(2));
+    await vi.waitFor(() => expect((provider as any).sessions.get(routeId).inFlight).toBe(false));
+    expect(sendUserTurn.mock.calls[1][0].input[0].text).not.toContain(v1);
+
+    await provider.send(routeId, payload(v2, 'changed') as any);
+    await vi.waitFor(() => expect(sendUserTurn).toHaveBeenCalledTimes(3));
+    await vi.waitFor(() => expect((provider as any).sessions.get(routeId).inFlight).toBe(false));
+    expect(sendUserTurn.mock.calls[2][0].input[0].text).toContain(v2);
+    provider.refreshSessionSystemText(routeId);
+    await provider.send(routeId, payload(v2, 'reseed') as any);
+    await vi.waitFor(() => expect(sendUserTurn).toHaveBeenCalledTimes(4));
+    await vi.waitFor(() => expect((provider as any).sessions.get(routeId).inFlight).toBe(false));
+    expect(sendUserTurn.mock.calls[3][0].input[0].text).toContain(v2);
+    await provider.endSession(routeId);
+  });
+
+  it('canonicalizes a symlinked workspace root before starting Muse', async () => {
+    const tempRoot = mkdtempSync(join(tmpdir(), 'muse-workspace-'));
+    const realRoot = join(tempRoot, 'real-project');
+    const nestedAlias = join(tempRoot, 'nested-alias');
+    const symlinkRoot = join(tempRoot, 'project-alias');
+    mkdirSync(realRoot);
+    symlinkSync(realRoot, nestedAlias, 'dir');
+    symlinkSync(nestedAlias, symlinkRoot, 'dir');
+
+    try {
+      const provider = new MuseCodeSdkProvider();
+      const { sessionObj } = createMockSession();
+      const startSession = vi.fn().mockResolvedValue(sessionObj);
+      (provider as any).client = { startSession };
+
+      await provider.createSession({ cwd: symlinkRoot, model: 'muse-spark-1.3' });
+
+      expect(startSession).toHaveBeenCalledWith(expect.objectContaining({
+        workspaceRoot: realpathSync.native(realRoot),
+      }));
+    } finally {
+      rmSync(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('canonicalizes the fallback start when a stale resume id is supplied through a symlink', async () => {
+    const tempRoot = mkdtempSync(join(tmpdir(), 'muse-workspace-'));
+    const realRoot = join(tempRoot, 'real-project');
+    const symlinkRoot = join(tempRoot, 'project-alias');
+    mkdirSync(realRoot);
+    symlinkSync(realRoot, symlinkRoot, 'dir');
+
+    try {
+      const provider = new MuseCodeSdkProvider();
+      const { sessionObj } = createMockSession();
+      const resumeSession = vi.fn().mockRejectedValue(new Error('session stale-id not found'));
+      const startSession = vi.fn().mockResolvedValue(sessionObj);
+      (provider as any).client = { resumeSession, startSession };
+
+      await provider.createSession({ cwd: symlinkRoot, resumeId: 'stale-id' });
+
+      expect(startSession).toHaveBeenCalledWith(expect.objectContaining({
+        workspaceRoot: realpathSync.native(realRoot),
+      }));
+    } finally {
+      rmSync(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps a normalized absolute workspace root when the directory does not exist', async () => {
+    const tempRoot = mkdtempSync(join(tmpdir(), 'muse-workspace-'));
+    const missingRoot = join(tempRoot, 'missing-project');
+
+    try {
+      const provider = new MuseCodeSdkProvider();
+      const { sessionObj } = createMockSession();
+      const startSession = vi.fn().mockResolvedValue(sessionObj);
+      (provider as any).client = { startSession };
+
+      await provider.createSession({ cwd: missingRoot, model: 'muse-spark-1.3' });
+
+      expect(startSession).toHaveBeenCalledWith(expect.objectContaining({
+        workspaceRoot: missingRoot,
+      }));
+    } finally {
+      rmSync(tempRoot, { recursive: true, force: true });
+    }
+  });
+
   it('rejects a refused native submission without leaving the session busy or marking system context sent', async () => {
     const provider = new MuseCodeSdkProvider();
     const { sessionObj } = createMockSession();
@@ -264,7 +384,7 @@ describe('MuseCodeSdkProvider session and turn lifecycle', () => {
       code: PROVIDER_ERROR_CODES.PROVIDER_ERROR, message: 'native submission refused', recoverable: true,
     });
     expect(provider.getActiveWorkSnapshot(routeId)?.activeWorkCount).toBe(0);
-    expect((provider as any).sessions.get(routeId).sessionSystemTextSent).toBe(false);
+    expect((provider as any).sessions.get(routeId).sessionSystemTextInjected).toBeUndefined();
   });
 
   it('is already idle inside onComplete so the runtime can flip the session idle (stuck "working" regression)', async () => {
@@ -777,6 +897,46 @@ describe('MuseCodeSdkProvider session and turn lifecycle', () => {
       sessionId: 'muse-sess-resumed-1',
       model: { modelId: 'muse-spark-1.3' },
     }));
+  });
+
+  it('falls back once to a new session when a resume id is explicitly stale', async () => {
+    const provider = new MuseCodeSdkProvider();
+    const { sessionObj } = createMockSession();
+    const resumedSession = {
+      ...sessionObj,
+      sessionId: 'muse-sess-fresh-after-stale-resume',
+    };
+    const resumeSession = vi.fn().mockRejectedValue(new Error('session old-resume-id not found'));
+    const startSession = vi.fn().mockResolvedValue(resumedSession);
+    (provider as any).client = { resumeSession, startSession };
+
+    const routeId = await provider.createSession({
+      cwd: '/home/k/project',
+      resumeId: 'old-resume-id',
+    });
+
+    expect(resumeSession).toHaveBeenCalledTimes(1);
+    expect(startSession).toHaveBeenCalledTimes(1);
+    expect(startSession).toHaveBeenCalledWith(expect.objectContaining({
+      workspaceRoot: '/home/k/project',
+      providerId: 'meta',
+    }));
+    expect((provider as any).sessions.get(routeId).sessionSystemTextInjected).toBeUndefined();
+  });
+
+  it('does not hide unknown resume failures behind a new session', async () => {
+    const provider = new MuseCodeSdkProvider();
+    const resumeSession = vi.fn().mockRejectedValue(new Error('upstream connection reset'));
+    const startSession = vi.fn();
+    (provider as any).client = { resumeSession, startSession };
+
+    await expect(provider.createSession({
+      cwd: '/home/k/project',
+      resumeId: 'resume-id',
+    })).rejects.toMatchObject({
+      message: expect.stringContaining('upstream connection reset'),
+    });
+    expect(startSession).not.toHaveBeenCalled();
   });
 
   describe('maximum-permission posture (--dangerously-skip-permissions equivalent)', () => {

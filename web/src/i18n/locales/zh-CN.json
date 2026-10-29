@@ -34,6 +34,12 @@
       "generic": "出错了，请重试。"
     }
   },
+  "skill": {
+    "category": "技能",
+    "category_desc": "插入技能引用",
+    "empty": "暂无可用技能",
+    "no_results": "没有匹配的技能"
+  },
   "machine": {
     "feature_label": "机器",
     "category": "机器",
@@ -797,6 +803,7 @@
       "openclaw": "OpenClaw",
       "qwen": "Qwen Code",
       "claude_code_sdk": "Claude Code SDK",
+      "cc_cli_sdk": "CC CLI SDK",
       "codex_sdk": "Codex SDK",
       "qoder_sdk": "Qoder SDK",
       "claude_code_cli": "Claude Code CLI",

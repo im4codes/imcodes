@@ -16,9 +16,12 @@ export interface AgentSkillsRunResult {
 }
 
 /** The skills in one machine's `~/.agents/skills`. */
-export async function listAgentSkills(serverId: string): Promise<AgentSkillEntry[]> {
+export async function listAgentSkills(serverId: string, context?: { sessionName?: string; projectDir?: string }): Promise<AgentSkillEntry[]> {
+  const params = new URLSearchParams({ serverId });
+  if (context?.sessionName) params.set('sessionName', context.sessionName);
+  if (context?.projectDir) params.set('projectDir', context.projectDir);
   const response = await apiFetch<{ skills?: AgentSkillEntry[] }>(
-    `/api/agent-skills?serverId=${encodeURIComponent(serverId)}`,
+    `/api/agent-skills?${params.toString()}`,
   );
   return Array.isArray(response.skills) ? response.skills : [];
 }

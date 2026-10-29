@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   REMOTE_DESKTOP_ACCESS_MODE,
   REMOTE_DESKTOP_CAPABILITY,
+  REMOTE_DESKTOP_ERROR,
   REMOTE_DESKTOP_LIMITS,
   REMOTE_DESKTOP_STATE,
   REMOTE_DESKTOP_STOP_ORIGIN,
@@ -591,6 +592,18 @@ describe('RemoteDesktopPanel mobile gestures', () => {
       durationMs: 0,
       reconnectCount: 0,
       terminalReason: REMOTE_DESKTOP_TERMINAL_REASON.AUTHORITY_REVOKED,
+    }));
+    expect(onAuthorityLost).toHaveBeenCalledTimes(1);
+
+    act(() => clientHooks[clientHooks.length - 1]!.onSnapshot({
+      state: REMOTE_DESKTOP_STATE.DIRECT,
+      mode: REMOTE_DESKTOP_ACCESS_MODE.VIEW,
+      inputEpoch: 1,
+      inputEnabled: false,
+      displays: [],
+      layoutRevision: 1,
+      stream: null,
+      error: REMOTE_DESKTOP_ERROR.ACCESS_DENIED,
     }));
     expect(onAuthorityLost).toHaveBeenCalledTimes(1);
   });

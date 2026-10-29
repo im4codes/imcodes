@@ -139,8 +139,24 @@ function connect(): void {
   // forever.
   let serverAnsweredOnAttempt = false;
   const connectTimeout = setTimeout(() => {
-    if (!openedForAttempt && socket === current) current.terminate();
+    if (!openedForAttempt && socket === current) {
+      try { current.terminate(); } catch { /* cleanup below still runs */ }
+      handleClose(1006, 'connect_timeout');
+    }
   }, CONNECT_TIMEOUT_MS);
+  // `ws` does not guarantee that DNS/TLS failures are followed by `close`.
+  // Keep one cleanup path for both events so an error-only attempt cannot
+  // leave the parent facade OPEN with no worker socket or reconnect timer.
+  const handleClose = (code: number, reason: string): void => {
+    if (socket !== current) return;
+    clearTimeout(connectTimeout);
+    socket = null;
+    stopTimers();
+    const wasOpen = opened;
+    opened = false;
+    emit({ event: 'close', code, reason, transient: !stopping && !closing }, undefined, true);
+    if (!stopping && !closing && (wasOpen || !stopping)) scheduleReconnect(code, reason);
+  };
   current.on('open', () => {
     openedForAttempt = true;
     clearTimeout(connectTimeout);
@@ -214,16 +230,17 @@ function connect(): void {
     const copy = Uint8Array.from(bytes);
     emit({ event: 'message', binary: true, data: copy.buffer }, [copy.buffer]);
   });
-  current.on('error', (error: Error) => emit({ event: 'error', message: error.message }));
+  current.on('error', (error: Error) => {
+    emit({ event: 'error', message: error.message });
+    if (socket !== current || stopping || closing) return;
+    // Some DNS/TLS/network errors never produce a close event. Terminate the
+    // failed attempt and enter the same bounded reconnect path as a close;
+    // any late close event is harmless because ownership is cleared first.
+    try { current.terminate(); } catch { /* cleanup below still runs */ }
+    handleClose(1006, error.message);
+  });
   current.on('close', (code: number, reason: Buffer) => {
-    clearTimeout(connectTimeout);
-    if (socket !== current) return;
-    socket = null;
-    stopTimers();
-    const wasOpen = opened;
-    opened = false;
-    emit({ event: 'close', code, reason: reason.toString(), transient: !stopping && !closing }, undefined, true);
-    if (!stopping && !closing && (wasOpen || !stopping)) scheduleReconnect(code, reason.toString());
+    handleClose(code, reason.toString());
   });
 }
 

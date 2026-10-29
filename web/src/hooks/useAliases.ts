@@ -12,7 +12,7 @@
  * immediately, so this uses a plain `createSharedResource` with no debounce or
  * optimistic-add bookkeeping.
  *
- * Filtering by `q` is an in-memory NFC substring match over name + description
+ * Filtering by `q` is an in-memory NFC, case-insensitive substring match over name + description
  * (the server also supports `?q=`; the in-memory filter keeps keystroke
  * filtering instant against the already-loaded list without extra round-trips).
  */
@@ -37,16 +37,16 @@ const aliasResource = createSharedResource<AliasEntry[]>({
   fetcher: (): Promise<AliasEntry[]> => listAliases(),
 });
 
-/** Case-sensitive NFC substring match over name + description. */
+/** Case-insensitive NFC substring match over name + description. */
 function matchesQuery(entry: AliasEntry, needle: string): boolean {
   if (!needle) return true;
-  const haystack = `${nfc(entry.name)}\n${nfc(entry.description ?? '')}`;
+  const haystack = `${nfc(entry.name)}\n${nfc(entry.description ?? '')}`.toLocaleLowerCase();
   return haystack.includes(needle);
 }
 
-/** Filter an alias list in memory by an NFC substring over name + description. */
+/** Filter an alias list in memory by an NFC, case-insensitive substring over name + description. */
 export function filterAliases(list: readonly AliasEntry[], q?: string): AliasEntry[] {
-  const needle = nfc((q ?? '').trim());
+  const needle = nfc((q ?? '').trim()).toLocaleLowerCase();
   if (!needle) return [...list];
   return list.filter((entry) => matchesQuery(entry, needle));
 }

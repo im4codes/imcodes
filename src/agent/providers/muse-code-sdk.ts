@@ -53,8 +53,14 @@ import {
   type TransportEffortLevel,
 } from '../../../shared/effort-levels.js';
 import { NATIVE_AGENT_ADMISSION_MODES } from '../../../shared/native-collaboration-policy.js';
-import { composeMessageSideProviderPrompt } from '../provider-context-routing.js';
-import { normalizeTransportCwd, resolveExecutableForSpawn, resolveMuseCodePathForSdk } from '../transport-paths.js';
+import { composeMessageSideProviderPrompt, getProviderSystemTextParts } from '../provider-context-routing.js';
+import { sessionSystemContractKey, shouldInjectSessionSystemContract } from '../session-system-contract.js';
+import {
+  canonicalizeTransportCwd,
+  normalizeTransportCwd,
+  resolveExecutableForSpawn,
+  resolveMuseCodePathForSdk,
+} from '../transport-paths.js';
 import {
   prepareMuseSessionMcp,
   museMcpEnsureOptionsFromConfig,
@@ -158,7 +164,8 @@ interface MuseSessionState {
   currentText: string;
   reasoningEffort?: TransportEffortLevel;
   pendingApprovals: Map<string, PendingApprovalEntry>;
-  sessionSystemTextSent: boolean;
+  /** Versioned key for the stable contract delivered to this Muse session. */
+  sessionSystemTextInjected?: string;
   toolCalls: Map<string, ToolCallEvent>;
   runtimeSubagentStartedAtByKey?: Map<string, number>;
 }
@@ -171,6 +178,24 @@ function asRecord(value: unknown): Record<string, unknown> {
 
 function asString(value: unknown): string | undefined {
   return typeof value === 'string' ? value : undefined;
+}
+
+/**
+ * Resume failures are only recoverable when the server explicitly says that
+ * the requested session no longer exists.  Do not treat arbitrary "not
+ * found"/transport errors as an expired session: doing so can silently start
+ * a different conversation and hide a real outage.
+ */
+function isMuseSessionNotFoundError(error: unknown): boolean {
+  const record = asRecord(error);
+  const code = String(record.code ?? record.errorCode ?? record.type ?? '').toLowerCase();
+  const message = error instanceof Error
+    ? error.message
+    : typeof error === 'string'
+      ? error
+      : String(record.message ?? record.error ?? '');
+  const detail = `${code} ${message}`.toLowerCase();
+  return /(?:session[\s\S]{0,120}(?:not[\s_-]*found|does[\s_-]*not[\s_-]+exist|unknown|不存在)|(?:not[\s_-]*found|does[\s_-]*not[\s_-]+exist|unknown)[\s\S]{0,120}session|sessionnotfound)/.test(detail);
 }
 
 function isMuseSubagentTool(name?: string): boolean {
@@ -537,7 +562,11 @@ export class MuseCodeSdkProvider implements TransportProvider {
       } satisfies ProviderError;
     }
 
-    const workspaceRoot = normalizeTransportCwd(config.cwd) ?? process.cwd();
+    // Muse's Agent Definitions loader rejects a symlink/reparse-point source
+    // root.  Canonicalize existing directories before handing them to the SDK;
+    // canonicalizeTransportCwd retains the normalized absolute spelling when
+    // the project directory is temporarily unavailable.
+    const workspaceRoot = canonicalizeTransportCwd(config.cwd) ?? process.cwd();
     const requestedModel = normalizeMuseModelId(
       typeof config.agentId === 'string' && config.agentId.trim()
         ? config.agentId.trim()
@@ -546,15 +575,28 @@ export class MuseCodeSdkProvider implements TransportProvider {
           : 'muse-spark-1.3'),
     );
     let session: Session;
+    let resumedSession = false;
     const posture = resolveMusePermissionPosture(this.config as Record<string, unknown> | null);
 
     try {
       if (config.resumeId) {
         const resumeId = config.resumeId;
-        session = await this.withSessionMcp(config, () => this.client!.resumeSession({
-          sessionId: resumeId,
-        }));
-        if (posture.approvalMode && this.spawned) {
+        try {
+          session = await this.withSessionMcp(config, () => this.client!.resumeSession({
+            sessionId: resumeId,
+          }));
+          resumedSession = true;
+        } catch (err) {
+          if (!isMuseSessionNotFoundError(err)) throw err;
+          logger.info({ routeId }, 'Muse resume session is stale; starting a new session');
+          session = await this.withSessionMcp(config, () => this.client!.startSession({
+            workspaceRoot,
+            modelId: requestedModel,
+            providerId: 'meta',
+            ...(posture.approvalMode ? { approvalMode: posture.approvalMode } : {}),
+          }));
+        }
+        if (resumedSession && posture.approvalMode && this.spawned) {
           // `session/resume` has no approvalMode member; select it explicitly.
           await this.spawned.connection
             .command('session/setApprovalMode', {
@@ -566,7 +608,7 @@ export class MuseCodeSdkProvider implements TransportProvider {
               logger.warn({ err, mode: posture.approvalMode }, 'Failed to set approval mode on resumed Muse session');
             });
         }
-        if (requestedModel && this.spawned) {
+        if (resumedSession && requestedModel && this.spawned) {
           void this.spawned.connection
             .command('session/setModel', {
               commandId: randomUUID(),
@@ -609,7 +651,7 @@ export class MuseCodeSdkProvider implements TransportProvider {
       currentText: '',
       reasoningEffort: config.effort ?? existing?.reasoningEffort,
       pendingApprovals: new Map(),
-      sessionSystemTextSent: !!config.resumeId && !config.fresh,
+      sessionSystemTextInjected: undefined,
       toolCalls: new Map(),
     };
 
@@ -687,9 +729,13 @@ export class MuseCodeSdkProvider implements TransportProvider {
     state.currentText = '';
 
     const normalized = normalizeProviderPayload(payload, attachments, extraSystemPrompt);
-    const prompt = composeMessageSideProviderPrompt(normalized, {
-      includeSessionSystemText: !state.sessionSystemTextSent,
-    });
+    const sessionSystemText = getProviderSystemTextParts(normalized).sessionSystemText;
+    const sessionContractKey = sessionSystemContractKey(sessionSystemText);
+    const includeSessionSystemText = shouldInjectSessionSystemContract(
+      state.sessionSystemTextInjected,
+      sessionSystemText,
+    );
+    const prompt = composeMessageSideProviderPrompt(normalized, { includeSessionSystemText });
     const effort = mapEffortLevel(state.reasoningEffort);
 
     let turn: Turn;
@@ -706,7 +752,7 @@ export class MuseCodeSdkProvider implements TransportProvider {
         recoverable: true,
       } satisfies ProviderError;
     }
-    state.sessionSystemTextSent = true;
+    if (includeSessionSystemText) state.sessionSystemTextInjected = sessionContractKey;
     state.activeTurn = turn;
     state.activeTurnId = turn.turnId;
     // send() confirms native admission, not terminal completion. The runtime
@@ -1205,6 +1251,12 @@ export class MuseCodeSdkProvider implements TransportProvider {
           });
       }
     }
+  }
+
+  refreshSessionSystemText(sessionId: string): void {
+    const state = this.sessions.get(sessionId);
+    if (!state) return;
+    state.sessionSystemTextInjected = undefined;
   }
 
   setSessionEffort(sessionId: string, effort: TransportEffortLevel): void {

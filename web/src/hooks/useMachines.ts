@@ -6,7 +6,7 @@
  * single shared resource. Read-only (no CRUD): a machine is enrolled/revoked
  * elsewhere, not created from the composer.
  *
- * Filtering by `q` is an in-memory NFC substring match over refName + display
+ * Filtering by `q` is an in-memory NFC, case-insensitive substring match over refName + display
  * name, keeping keystroke filtering instant against the already-loaded list.
  */
 import { useMemo } from 'preact/hooks';
@@ -23,13 +23,13 @@ const machineResource = createSharedResource<MachineListItem[]>({
 
 function matchesQuery(m: MachineListItem, needle: string): boolean {
   if (!needle) return true;
-  const haystack = `${nfc(m.nodeId ?? '')}\n${nfc(m.refName)}\n${nfc(m.displayName)}`;
+  const haystack = `${nfc(m.nodeId ?? '')}\n${nfc(m.refName)}\n${nfc(m.displayName)}`.toLocaleLowerCase();
   return haystack.includes(needle);
 }
 
-/** Filter a machine list in memory by an NFC substring over refName + displayName. */
+/** Filter a machine list in memory by an NFC, case-insensitive substring over refName + displayName. */
 export function filterMachines(list: readonly MachineListItem[], q?: string): MachineListItem[] {
-  const needle = nfc((q ?? '').trim());
+  const needle = nfc((q ?? '').trim()).toLocaleLowerCase();
   if (!needle) return [...list];
   return list.filter((m) => matchesQuery(m, needle));
 }

@@ -31,6 +31,7 @@ import {
   REMOTE_DESKTOP_TERMINAL_REASON,
   isRemoteDesktopPresentedFrameCompatible,
   isRemoteDesktopQualityPreference,
+  normalizeRemoteDesktopQualityPreference,
   legacyRemoteDesktopQualityPreference,
   validateRemoteDesktopAuthorized,
   validateRemoteDesktopDataMessage,
@@ -161,6 +162,8 @@ export interface RemoteDesktopSnapshot {
   error?: string;
   /** Server-authoritative retry guidance for an ERROR response. */
   retryable?: boolean;
+  /** A requested mode change was rejected while the live session stayed up. */
+  modeError?: string;
   viewerCount?: number;
   controllerCount?: number;
   /** The node is showing the Windows sign-in/lock screen. */
@@ -516,6 +519,10 @@ class RemoteDesktopSignalingSocket {
 export class RemoteDesktopClient {
   private readonly signaling: RemoteDesktopSignalingSocket;
   private readonly pendingRemoteCandidates = new PendingWebRtcCandidates<RTCIceCandidateInit>();
+  /** Candidate keys are tracked so only known stale/duplicate relay frames recover. */
+  private readonly pendingRemoteCandidateKeys = new Set<string>();
+  private readonly appliedRemoteCandidateKeys = new Set<string>();
+  private readonly retiredRemoteCandidateKeys = new Set<string>();
   private peer: RTCPeerConnection | null = null;
   /** The grant this session was authorized with, replayed on a worker handover. */
   private authorized: Extract<RemoteDesktopServerMessage, { type: typeof REMOTE_DESKTOP_MSG.AUTHORIZED }> | null = null;
@@ -543,6 +550,7 @@ export class RemoteDesktopClient {
   private keyboardChannel: RTCDataChannel | null = null;
   private pointerChannel: RTCDataChannel | null = null;
   private requestId: string | null = null;
+  private pendingModeRequest: RemoteDesktopAccessMode | null = null;
   private sessionId: string | null = null;
   private capability: string | null = null;
   private daemonGeneration = 0;
@@ -685,17 +693,23 @@ export class RemoteDesktopClient {
 
   setMode(mode: RemoteDesktopAccessMode): void {
     if (!this.sessionId || !this.capability || this.stopped) return;
+    this.pendingModeRequest = mode;
+    this.publish({ modeError: undefined });
     if (mode === REMOTE_DESKTOP_ACCESS_MODE.VIEW) {
       this.releaseAll();
       this.publish({ inputEnabled: false });
     }
-    this.signaling.send({
+    const sent = this.signaling.send({
       type: REMOTE_DESKTOP_MSG.MODE_SET,
       requestId: this.requestId,
       sessionId: this.sessionId,
       capability: this.capability,
       mode,
     });
+    if (!sent) {
+      this.pendingModeRequest = null;
+      this.publish({ modeError: REMOTE_DESKTOP_ERROR.DAEMON_OFFLINE });
+    }
   }
 
   selectDisplay(displayId: string): boolean {
@@ -790,7 +804,7 @@ export class RemoteDesktopClient {
     options: { latencyGuard?: boolean } = {},
   ): boolean {
     if (!isRemoteDesktopQualityPreference(preference)) return false;
-    this.desiredQualityPreference = { ...preference };
+    this.desiredQualityPreference = normalizeRemoteDesktopQualityPreference(preference);
     this.latencyGuardEnabled = options.latencyGuard !== false;
     if (!this.latencyGuardEnabled) this.resetLatencyGuard();
     this.flushQualityPreference();
@@ -1260,6 +1274,8 @@ export class RemoteDesktopClient {
       this.localIceCandidates = 0;
       this.remoteIceCandidates = 0;
       this.pendingRemoteCandidates.clear();
+      this.pendingRemoteCandidateKeys.clear();
+      this.retireRemoteIceGeneration();
       if (this.statsTimer) clearInterval(this.statsTimer);
       this.statsTimer = null;
       this.previousInboundStats = null;
@@ -1374,6 +1390,11 @@ export class RemoteDesktopClient {
     // ERROR by design. Otherwise the browser waits for its negotiation timeout
     // and loses the Server's retryable guidance.
     if (message.type === REMOTE_DESKTOP_MSG.ERROR) {
+      if (this.pendingModeRequest !== null && message.error === REMOTE_DESKTOP_ERROR.ACCESS_DENIED) {
+        this.pendingModeRequest = null;
+        this.publish({ modeError: message.error, retryable: message.retryable });
+        return;
+      }
       this.fail(message.error, message.retryable);
       return;
     }
@@ -1386,7 +1407,17 @@ export class RemoteDesktopClient {
       if (!this.peer || !this.awaitingAnswer) return;
       await this.peer.setRemoteDescription({ type: 'answer', sdp: message.sdp });
       this.awaitingAnswer = false;
-      await this.pendingRemoteCandidates.flush((candidate) => this.peer?.addIceCandidate(candidate));
+      const peer = this.peer;
+      try {
+        await this.pendingRemoteCandidates.flush(async (candidate) => {
+          const key = this.remoteCandidateKey(candidate);
+          this.pendingRemoteCandidateKeys.delete(key);
+          await this.applyRemoteIceCandidate(peer, candidate, key);
+        });
+      } catch {
+        // applyRemoteIceCandidate has already classified the failure. This
+        // catch only protects the event callback from an unexpected exception.
+      }
       return;
     }
     if (message.type === REMOTE_DESKTOP_MSG.ICE) {
@@ -1397,9 +1428,17 @@ export class RemoteDesktopClient {
       }
       const candidate = { candidate: message.candidate, sdpMid: message.mid };
       if (!this.peer?.remoteDescription || this.awaitingAnswer) {
-        this.pendingRemoteCandidates.push(candidate);
+        const key = this.remoteCandidateKey(candidate);
+        if (!this.appliedRemoteCandidateKeys.has(key)
+          && !this.retiredRemoteCandidateKeys.has(key)
+          && !this.pendingRemoteCandidateKeys.has(key)) {
+          this.pendingRemoteCandidates.push(candidate);
+          this.pendingRemoteCandidateKeys.add(key);
+        }
+      } else {
+        const peer = this.peer;
+        await this.applyRemoteIceCandidate(peer, candidate, this.remoteCandidateKey(candidate));
       }
-      else await this.peer.addIceCandidate(candidate);
       return;
     }
     if (message.type === REMOTE_DESKTOP_MSG.MODE_STATE) {
@@ -1414,7 +1453,9 @@ export class RemoteDesktopClient {
         mode: message.mode,
         inputEpoch: message.inputEpoch,
         inputEnabled: false,
+        modeError: undefined,
       });
+      this.pendingModeRequest = null;
       if (message.mode === REMOTE_DESKTOP_ACCESS_MODE.VIEW) this.releaseAll();
       return;
     }
@@ -2071,6 +2112,9 @@ export class RemoteDesktopClient {
     // into a protocol_error.
     this.localIceCandidates = 0;
     this.remoteIceCandidates = 0;
+    this.retireRemoteIceGeneration();
+    this.pendingRemoteCandidates.clear();
+    this.pendingRemoteCandidateKeys.clear();
     this.releaseAll();
     this.workerInputEnabled = false;
     this.requirePresentedFrameForCurrentTopology();
@@ -2098,6 +2142,56 @@ export class RemoteDesktopClient {
     } catch {
       this.fail(REMOTE_DESKTOP_TERMINAL_REASON.PEER_FAILED);
     }
+  }
+
+  private remoteCandidateKey(candidate: RTCIceCandidateInit): string {
+    // A client instance owns one authenticated session; include that session
+    // identity explicitly so keys cannot cross a reused authority. Generation
+    // is represented by the applied-vs-retired sets below.
+    return `${this.sessionId ?? ''}\u0000${candidate.sdpMid ?? ''}\u0000${candidate.sdpMLineIndex ?? ''}\u0000${candidate.candidate ?? ''}`;
+  }
+
+  private retireRemoteIceGeneration(): void {
+    for (const key of this.appliedRemoteCandidateKeys) this.retiredRemoteCandidateKeys.add(key);
+    this.appliedRemoteCandidateKeys.clear();
+    // Keep the stale-key memory bounded with the wire candidate cap.
+    while (this.retiredRemoteCandidateKeys.size > REMOTE_DESKTOP_LIMITS.MAX_ICE_CANDIDATES) {
+      const oldest = this.retiredRemoteCandidateKeys.values().next().value as string | undefined;
+      if (oldest === undefined) break;
+      this.retiredRemoteCandidateKeys.delete(oldest);
+    }
+  }
+
+  private async applyRemoteIceCandidate(
+    peer: RTCPeerConnection,
+    candidate: RTCIceCandidateInit,
+    key: string,
+  ): Promise<void> {
+    if (this.appliedRemoteCandidateKeys.has(key)) return;
+    if (this.retiredRemoteCandidateKeys.has(key)) {
+      await this.recoverRemoteIceFailure(peer);
+      return;
+    }
+    try {
+      await peer.addIceCandidate(candidate);
+      this.appliedRemoteCandidateKeys.add(key);
+    } catch {
+      // An unknown candidate rejection is not evidence of a stale relay. Keep
+      // strict protocol semantics for malformed/mismatched candidates.
+      this.fail(REMOTE_DESKTOP_TERMINAL_REASON.PROTOCOL_ERROR);
+    }
+  }
+
+  /**
+   * Recover a WebRTC candidate application failure without weakening wire
+   * validation. The signaling frame has already passed the strict protocol
+   * parser; only the browser's peer state rejected it (typically a stale or
+   * duplicate candidate relayed to one shared viewer). A restart is bounded
+   * by the existing ICE-restart budget and reports peer_failed when exhausted.
+   */
+  private async recoverRemoteIceFailure(peer: RTCPeerConnection): Promise<void> {
+    if (this.stopped || this.peer !== peer || this.iceRestartInFlight) return;
+    await this.restartIce(peer);
   }
 
   private handleSignalingClose(): void {

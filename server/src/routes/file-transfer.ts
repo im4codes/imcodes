@@ -12,6 +12,8 @@ import { WsBridge } from '../ws/bridge.js';
 import { randomHex } from '../security/crypto.js';
 import {
   FILE_TRANSFER_LIMITS,
+  fileTransferStagedUploadTtlMs,
+  fileTransferUploadTimeoutMs,
   fileTransferLegacyFilename,
   FILE_TRANSFER_DIRECTORY_CAPABILITY,
   FILE_TRANSFER_DIRECTORY_QUERY_CAPABILITY,
@@ -286,7 +288,7 @@ async function sweepExpiredResumableUploads(now = Date.now()): Promise<void> {
     const expiresAt = await readFile(metaPath, 'utf8')
       .then((raw) => (JSON.parse(raw) as { expiresAt?: unknown }).expiresAt)
       .catch(() => undefined);
-    const fallbackExpiry = await stat(dir).then((entry) => entry.mtimeMs + FILE_TRANSFER_LIMITS.STAGED_UPLOAD_TTL_MS).catch(() => 0);
+    const fallbackExpiry = await stat(dir).then((entry) => entry.mtimeMs + fileTransferStagedUploadTtlMs()).catch(() => 0);
     if ((typeof expiresAt === 'number' ? expiresAt : fallbackExpiry) < now) {
       await rm(dir, { recursive: true, force: true });
     }
@@ -384,7 +386,7 @@ async function acceptResumableBrowserChunk(params: {
         ...(params.destinationDirectory ? { destinationDirectory: params.destinationDirectory } : {}),
         totalSize: params.totalSize,
         lastModified: params.lastModified,
-        expiresAt: Date.now() + FILE_TRANSFER_LIMITS.STAGED_UPLOAD_TTL_MS,
+        expiresAt: Date.now() + fileTransferStagedUploadTtlMs(params.totalSize),
         chunkSha256: {},
       };
       await writeFile(paths.filePath, new Uint8Array(0), { flag: 'wx', mode: 0o600 }).catch(async (error) => {
@@ -436,7 +438,7 @@ async function acceptResumableBrowserChunk(params: {
     await appendFile(paths.filePath, chunkBytes);
     const nextCommitted = committedBytes + chunkBytes.length;
     meta.chunkSha256[String(params.offset)] = chunkHash;
-    meta.expiresAt = Date.now() + FILE_TRANSFER_LIMITS.STAGED_UPLOAD_TTL_MS;
+    meta.expiresAt = Date.now() + fileTransferStagedUploadTtlMs(meta.totalSize);
     await writeResumableUploadMeta(paths.metaPath, meta);
     return {
       complete: nextCommitted === meta.totalSize,
@@ -697,8 +699,8 @@ type ControlledTargetGate =
   | { ok: false; reason: 'scoped_auth' | 'target_forbidden' | 'exec_disabled' | 'daemon_offline' | 'capability_unavailable' | 'rate_limited' };
 
 /**
- * What each file capability DOES on the node. Every one of them reads or writes files as the node's account, so every one is
- * EXECUTE-class (shared/machine-access-policy.ts). A capability nobody mapped is treated as the strictest (a write).
+ * What each file capability DOES on the node. Fetch/send/handle capabilities remain EXECUTE-class; directory listing uses the
+ * bounded FILE_LIST policy exception for group participants. A capability nobody mapped is treated as the strictest (a write).
  */
 const FILE_CAPABILITY_ACTION: Readonly<Record<string, MachineAction>> = {
   [FILE_TRANSFER_PATH_HANDLE_CAPABILITY]: MACHINE_ACTION.FILE_FETCH,
@@ -1483,8 +1485,9 @@ fileTransferRoutes.post('/:id/upload', async (c) => {
   let uploadMsg: FileUploadFetchRequest | FileUploadRequest;
   if (supportsRelayFetch) {
     const token = randomHex(32);
-    const expiresAt = Date.now() + FILE_TRANSFER_LIMITS.STAGED_UPLOAD_TTL_MS;
-    const timer = setTimeout(() => deleteStagedUpload(uploadId), FILE_TRANSFER_LIMITS.STAGED_UPLOAD_TTL_MS);
+    const stagedTtlMs = fileTransferStagedUploadTtlMs(stagedSize);
+    const expiresAt = Date.now() + stagedTtlMs;
+    const timer = setTimeout(() => deleteStagedUpload(uploadId), stagedTtlMs);
     timer.unref?.();
     stagedUploads.set(uploadId, {
       serverId,
@@ -1534,7 +1537,7 @@ fileTransferRoutes.post('/:id/upload', async (c) => {
       const result = await sendControlledFileRequest(c, controlledGate,
         uploadId,
         uploadMsg as unknown as Record<string, unknown>,
-        FILE_TRANSFER_LIMITS.UPLOAD_TIMEOUT_MS,
+        fileTransferUploadTimeoutMs(stagedSize),
         onProgress,
         controlledGate.daemonGeneration,
       );
@@ -1593,7 +1596,7 @@ fileTransferRoutes.post('/:id/upload', async (c) => {
         const result = await sendControlledFileRequest(c, controlledGate,
           uploadId,
           uploadMsg as unknown as Record<string, unknown>,
-          FILE_TRANSFER_LIMITS.UPLOAD_TIMEOUT_MS,
+          fileTransferUploadTimeoutMs(stagedSize),
           (msg) => write(msg),
           controlledGate.daemonGeneration,
         );

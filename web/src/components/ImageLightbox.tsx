@@ -115,16 +115,6 @@ function lightboxViewportGeometry(
   };
 }
 
-function shouldUseMobileImageActions(): boolean {
-  const runtime = globalThis as typeof globalThis & { Capacitor?: { isNativePlatform?: () => boolean } };
-  if (runtime.Capacitor?.isNativePlatform?.() === true) return true;
-  const touchPoints = navigator.maxTouchPoints ?? 0;
-  if (touchPoints <= 0) return false;
-  const coarsePointer = typeof matchMedia === 'function'
-    && matchMedia('(pointer: coarse)').matches;
-  return coarsePointer || innerWidth < 900;
-}
-
 async function downloadImage(src: string, fileName: string) {
   const inferredMimeType = getMimeTypeFromDataUrl(src);
   const blob = await readImageBlob(src);
@@ -268,7 +258,6 @@ export function ImageLightbox({ src, alt = '', fileName, onDownload, onClose, on
   };
 
   const startLongPress = () => {
-    if (!shouldUseMobileImageActions()) return;
     clearLongPressTimer();
     longPressTimerRef.current = setTimeout(() => {
       longPressTimerRef.current = null;
@@ -613,7 +602,6 @@ export function ImageLightbox({ src, alt = '', fileName, onDownload, onClose, on
         onWheel={handleWheel}
         onMouseDown={(e) => {
           e.stopPropagation();
-          startLongPress();
           if (e.button === 0 && viewportRef.current.scale > 1) {
             e.preventDefault();
             mouseDragRef.current = { x: e.clientX, y: e.clientY, viewport: viewportRef.current, moved: false };
@@ -623,12 +611,16 @@ export function ImageLightbox({ src, alt = '', fileName, onDownload, onClose, on
         onMouseLeave={clearLongPressTimer}
         onTouchStart={(e) => {
           e.stopPropagation();
-          startLongPress();
+          // A touch event is already authoritative evidence that the image is
+          // being held on a touch surface. Do not gate this on
+          // maxTouchPoints/pointer media queries: embedded WebViews and a few
+          // mobile browsers report those as zero/unknown. Also avoid
+          // restarting the timer when a second finger starts a pinch.
+          if (e.touches.length < 2) startLongPress();
         }}
         onTouchEnd={clearLongPressTimer}
         onTouchMove={clearLongPressTimer}
         onContextMenu={(e) => {
-          if (!shouldUseMobileImageActions()) return;
           e.preventDefault();
           e.stopPropagation();
           clearLongPressTimer();

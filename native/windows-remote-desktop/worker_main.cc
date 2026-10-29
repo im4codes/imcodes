@@ -843,11 +843,14 @@ class WorkerRuntime {
         writer_->Emit(TerminalEnvelope(signal.authority, "session_limit"));
         return true;
       }
+      // Viewers begin without input authority (epoch zero).  A control route
+      // may be a fresh route (epoch one) or a bounded worker replacement that
+      // preserves a newer input epoch, so only non-zero is required there.
       const bool valid_initial_mode =
           (signal.authority.mode == kViewMode &&
            signal.authority.input_epoch == 0) ||
           (signal.authority.mode == kControlMode &&
-           signal.authority.input_epoch == 1);
+           signal.authority.input_epoch > 0);
       if (!valid_initial_mode ||
           signal.authority.expires_at_ms <
               signal.authority.lease_expires_at_ms) {

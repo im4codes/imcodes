@@ -62,16 +62,15 @@ async function invoke(client: Client, [name, args]: Invocation, fallback: boolea
 }
 
 describe.each([false, true])('real SDK typed-error interoperability (fallback=%s)', (fallback) => {
-  it.each(executeCalls.filter(([name]) => name === MEMORY_MCP_TOOL_NAMES.EXEC_REMOTE))('participant %s refuses cleanly, preserves typed reason, never dispatches (%j)', async (name, args) => {
+  it.each(executeCalls.filter(([name]) => name === MEMORY_MCP_TOOL_NAMES.EXEC_REMOTE))('participant %s reaches server admission with typed result (%j)', async (name, args) => {
     const deps = machineDeps();
     await withClient({ machineDeps: deps, participantTurnRequired: async () => true }, async (client) => {
       const result = await invoke(client, [name, args], fallback);
-      expect(result.isError).toBe(true);
-      expect(result.structuredContent).toBeUndefined();
-      expect(mcpToolPayload(result)).toMatchObject({ status: 'error', reason: PARTICIPANT_TURN_TOOL_REFUSAL });
+      expect(result.isError).not.toBe(true);
+      expect(result.structuredContent).toMatchObject({ status: 'ok', outcome: 'not_dispatched' });
     });
     expect(deps.computerUseCall).not.toHaveBeenCalled();
-    expect(deps.execRemote).not.toHaveBeenCalled();
+    expect(deps.execRemote).toHaveBeenCalledTimes(1);
   });
 
   it.each(executeCalls)('handler dependency error for %s is usable typed JSON, not client -32602 (%j)', async (name, args) => {

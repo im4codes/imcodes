@@ -280,6 +280,25 @@ bool TransportSessionCore::AddRemoteIceCandidate(
   return true;
 }
 
+bool TransportSessionCore::BeginIceRestart(
+    const TransportCallbackStamp& callback_stamp) {
+  if (!CallbackMatches(callback_stamp)) return false;
+  // The first offer can race with early local/remote candidate delivery while
+  // the remote description is still absent. Preserve that initial queue; only
+  // a route that already installed a description is crossing into a new ICE
+  // generation.
+  if (!remote_description_ready_) return true;
+  // A new offer establishes a new candidate generation. Do not carry either
+  // the flood budget or queued candidates from the superseded generation into
+  // it; the route identity stays the same and continues to fence callbacks.
+  accepted_remote_ice_ = 0;
+  accepted_local_ice_ = 0;
+  ClearCandidates();
+  remote_description_ready_ = false;
+  PublishDiagnostics();
+  return true;
+}
+
 bool TransportSessionCore::SetRemoteDescriptionReady(
     const TransportCallbackStamp& callback_stamp) {
   if (!CallbackMatches(callback_stamp)) return false;
@@ -476,7 +495,7 @@ bool TransportSessionCore::ApplyQualityTarget(const QualityTarget& target) {
 bool TransportSessionCore::SetQualityPreference(
     const imcodes::rd::QualityPreference& preference) {
   if (!started_ || terminal_) return false;
-  viewer_preference_ = preference;
+  viewer_preference_ = imcodes::rd::NormalizeQualityPreference(preference);
   if (!last_quality_target_) return true;
   return ApplyQualityTarget(*last_quality_target_);
 }

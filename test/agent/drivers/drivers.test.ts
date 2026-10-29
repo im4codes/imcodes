@@ -89,14 +89,105 @@ describe('ClaudeCodeDriver', () => {
 
     const done = driver.postLaunch!(capturePane, sendKey);
     await vi.advanceTimersByTimeAsync(1_500);
-    await Promise.resolve();
-    await vi.advanceTimersByTimeAsync(700);
-    await Promise.resolve();
-    await vi.advanceTimersByTimeAsync(1_500);
+    await vi.runAllTimersAsync();
     await done;
 
     expect(sendKey).toHaveBeenCalledTimes(1);
     expect(sendKey).toHaveBeenCalledWith('Enter');
+  });
+
+  it('postLaunch selects Yes in the arrow trust-folder menu', async () => {
+    vi.useFakeTimers();
+    const capturePane = vi.fn()
+      .mockResolvedValueOnce([
+        'Security guide',
+        'No, exit',
+        'Yes, I trust this folder',
+        'Enter to confirm',
+      ])
+      .mockResolvedValueOnce(['❯']);
+    const sendKey = vi.fn().mockResolvedValue(undefined);
+
+    const done = driver.postLaunch!(capturePane, sendKey);
+    await vi.advanceTimersByTimeAsync(1_500);
+    await vi.runAllTimersAsync();
+    await done;
+
+    expect(sendKey).toHaveBeenCalledTimes(2);
+    expect(sendKey.mock.calls.map(([key]) => key)).toEqual(['Down', 'Enter']);
+  });
+
+  it('postLaunch keeps the numbered trust-folder compatibility path', async () => {
+    vi.useFakeTimers();
+    const capturePane = vi.fn()
+      .mockResolvedValueOnce([
+        'Do you trust the files in this folder?',
+        '1. Yes, I trust this folder',
+        '2. No, exit',
+      ])
+      .mockResolvedValueOnce(['❯']);
+    const sendKey = vi.fn().mockResolvedValue(undefined);
+
+    const done = driver.postLaunch!(capturePane, sendKey);
+    await vi.advanceTimersByTimeAsync(1_500);
+    await vi.runAllTimersAsync();
+    await done;
+
+    expect(sendKey.mock.calls.map(([key]) => key)).toEqual(['1', 'Enter']);
+  });
+
+  it('postLaunch keeps the explicit legacy default-confirmation path', async () => {
+    vi.useFakeTimers();
+    const capturePane = vi.fn()
+      .mockResolvedValueOnce([
+        'Do you trust the files in this folder?',
+        '[Y/n]',
+      ])
+      .mockResolvedValueOnce(['❯']);
+    const sendKey = vi.fn().mockResolvedValue(undefined);
+
+    const done = driver.postLaunch!(capturePane, sendKey);
+    await vi.advanceTimersByTimeAsync(1_500);
+    await vi.runAllTimersAsync();
+    await done;
+
+    expect(sendKey.mock.calls.map(([key]) => key)).toEqual(['Enter']);
+  });
+
+  it('postLaunch does not authorize unrelated security text or an incomplete menu', async () => {
+    vi.useFakeTimers();
+    const capturePane = vi.fn()
+      .mockResolvedValueOnce(['Security guide', 'Do you trust the files in this folder?', 'No, exit'])
+      .mockResolvedValueOnce(['❯']);
+    const sendKey = vi.fn().mockResolvedValue(undefined);
+
+    const done = driver.postLaunch!(capturePane, sendKey);
+    await vi.advanceTimersByTimeAsync(1_500);
+    await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(1_500);
+    await done;
+
+    expect(sendKey).not.toHaveBeenCalled();
+  });
+
+  it('postLaunch matches arrow trust text across lines and whitespace', async () => {
+    vi.useFakeTimers();
+    const capturePane = vi.fn()
+      .mockResolvedValueOnce([
+        'NO,   EXIT',
+        'Yes, I trust',
+        'this',
+        'folder',
+      ])
+      .mockResolvedValueOnce(['❯']);
+    const sendKey = vi.fn().mockResolvedValue(undefined);
+
+    const done = driver.postLaunch!(capturePane, sendKey);
+    await vi.advanceTimersByTimeAsync(1_500);
+    await vi.runAllTimersAsync();
+    await done;
+
+    expect(sendKey.mock.calls.map(([key]) => key)).toEqual(['Down', 'Enter']);
   });
 });
 

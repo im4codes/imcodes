@@ -33,13 +33,17 @@ const actors: Record<string, Actor> = {};
 let nodeId = '';
 let execCalls = 0;
 let guiCalls = 0;
+let dispatchedExecTargets: string[] = [];
+let dispatchedComputerTargets: string[] = [];
 
-const execDispatcher: ExecDispatcher = async () => {
+const execDispatcher: ExecDispatcher = async (targetServerId) => {
   execCalls += 1;
+  dispatchedExecTargets.push(targetServerId);
   return { online: true, result: { ok: true, exitCode: 0, stdout: '', stderr: '', truncated: false, timedOut: false, durationMs: 1 } };
 };
-const computerUseDispatcher: ComputerUseDispatcher = async () => {
+const computerUseDispatcher: ComputerUseDispatcher = async (targetServerId) => {
   guiCalls += 1;
+  dispatchedComputerTargets.push(targetServerId);
   return { online: true, result: { ok: true, content: [{ type: 'text', text: 'ok' }] } as never };
 };
 
@@ -72,6 +76,8 @@ beforeEach(async () => {
   resetMachineActionGateForTests();
   execCalls = 0;
   guiCalls = 0;
+  dispatchedExecTargets = [];
+  dispatchedComputerTargets = [];
 });
 
 const NAMES = ['owner', 'pNo', 'pYes', 'viewer', 'gMember', 'gAdmin', 'other', 'revoked', 'expired', 'viewerAndGroup', 'groupAndGrant'] as const;
@@ -108,7 +114,11 @@ function execApp() {
 }
 
 function call(path: string, actor: Actor, body: unknown, headers: Record<string, string> = {}) {
-  return execApp().request(`${path}?serverId=${nodeId}`, {
+  return callTarget(path, actor, nodeId, body, headers);
+}
+
+function callTarget(path: string, actor: Actor, targetReference: string, body: unknown, headers: Record<string, string> = {}) {
+  return execApp().request(`${path}?serverId=${encodeURIComponent(targetReference)}`, {
     method: 'POST',
     headers: { 'content-type': 'application/json', 'X-Server-Id': actor.serverId, authorization: `Bearer ${actor.token}`, ...headers },
     body: JSON.stringify(body),
@@ -129,12 +139,44 @@ async function admits(name: string, action: MachineAction, token?: string): Prom
   return admission.ok;
 }
 
-/** Who may EXECUTE (exec, shell, GUI input, file send / fetch / list): the owner and the explicit participant WITH the grant. */
+/** Who may EXECUTE (exec, shell, GUI input, file send / fetch): the owner and the explicit participant WITH the grant. */
 const MAY_EXECUTE = ['owner', 'pYes', 'groupAndGrant'];
+/** Directory listing is a bounded shared-picker capability for group participants, not file read/fetch authority. */
+const MAY_LIST = ['owner', 'pYes', 'gMember', 'gAdmin', 'groupAndGrant'];
 /** Who may merely operate (view-class): every access that is not a viewer / nothing. */
 const MAY_VIEW = ['owner', 'pNo', 'pYes', 'gMember', 'gAdmin', 'groupAndGrant'];
 
 describe('role x action matrix (real resolvers, real routes)', () => {
+  it('resolves canonical node_id aliases before admitting both relay routes', async () => {
+    const row = await db.queryOne<{ node_id: string }>('SELECT node_id FROM servers WHERE id = $1', [nodeId]);
+    const canonicalNodeId = row!.node_id;
+    const allowed = ['owner', 'pYes', 'groupAndGrant'] as const;
+    const denied = ['viewer', 'revoked', 'other'] as const;
+
+    for (const name of allowed) {
+      const actor = actors[name]!;
+      expect((await callTarget('/api/machine/exec', actor, canonicalNodeId, { command: 'echo alias' })).status, `${name} exec`).toBe(200);
+      expect((await callTarget('/api/machine/computer-use', actor, canonicalNodeId, { tool: 'click', arguments: { x: 1, y: 2 } })).status, `${name} computer-use`).toBe(200);
+    }
+    expect(dispatchedExecTargets).toEqual([nodeId, nodeId, nodeId]);
+    expect(dispatchedComputerTargets).toEqual([nodeId, nodeId, nodeId]);
+
+    for (const name of denied) {
+      const actor = actors[name]!;
+      expect((await callTarget('/api/machine/exec', actor, canonicalNodeId, { command: 'echo denied' })).status, `${name} exec`).toBe(403);
+      expect((await callTarget('/api/machine/computer-use', actor, canonicalNodeId, { tool: 'click', arguments: { x: 1, y: 2 } })).status, `${name} computer-use`).toBe(403);
+    }
+    expect(dispatchedExecTargets).toEqual([nodeId, nodeId, nodeId]);
+    expect(dispatchedComputerTargets).toEqual([nodeId, nodeId, nodeId]);
+  });
+
+  it('keeps full-daemon server ids as canonical references', async () => {
+    const full = actors.other!;
+    const response = await callTarget('/api/machine/computer-use', actors.owner!, full.serverId, { tool: 'list_apps', arguments: {} });
+    expect(response.status).toBe(403);
+    expect(dispatchedComputerTargets).toEqual([]);
+  });
+
   it.each(NAMES)('%s: exec_remote / shell_session1 / click -> only the owner and an explicit execute grant run', async (name) => {
     const actor = actors[name]!;
     const mayExecute = MAY_EXECUTE.includes(name);
@@ -151,10 +193,11 @@ describe('role x action matrix (real resolvers, real routes)', () => {
     expect(response.status, name).toBe(MAY_VIEW.includes(name) ? 200 : 403);
   });
 
-  it.each(NAMES)('%s: file send / fetch / list are execute-class too', async (name) => {
-    for (const action of [MACHINE_ACTION.FILE_SEND, MACHINE_ACTION.FILE_FETCH, MACHINE_ACTION.FILE_LIST]) {
+  it.each(NAMES)('%s: file send/fetch stay execute-class while directory list follows bounded picker access', async (name) => {
+    for (const action of [MACHINE_ACTION.FILE_SEND, MACHINE_ACTION.FILE_FETCH]) {
       expect(await admits(name, action), `${name} ${action}`).toBe(MAY_EXECUTE.includes(name));
     }
+    expect(await admits(name, MACHINE_ACTION.FILE_LIST), `${name} file_list`).toBe(MAY_LIST.includes(name));
   });
 
   it.each(NAMES)('%s: controlled discovery includes real live group members without execute', async (name) => {
@@ -186,7 +229,7 @@ describe('role x action matrix (real resolvers, real routes)', () => {
   });
 });
 
-describe('only exec_remote is refused on participant-origin turns', () => {
+describe('exec_remote uses the participant grant on participant-origin turns', () => {
   async function delegatedHeader(participant: string): Promise<Record<string, string>> {
     // The owner's FULL daemon runs a shared session; the participant's message drives it (server-minted, signed turn authority).
     const owner = actors.owner!;
@@ -209,24 +252,30 @@ describe('only exec_remote is refused on participant-origin turns', () => {
     };
   }
 
-  it.each(NAMES)('%s: participant-origin refuses only exec_remote; other actions use the participant grant', async (name) => {
+  it.each(NAMES)('%s: participant-origin exec_remote follows the participant grant', async (name) => {
     const headers = await delegatedHeader(name);
     const owner = actors.owner!;
+    const mayExecute = ['owner', 'pYes', 'groupAndGrant'].includes(name);
     const before = execCalls;
-    expect((await EXEC(owner, headers)).status).toBe(403);
-    expect(execCalls).toBe(before);
+    expect((await EXEC(owner, headers)).status).toBe(mayExecute ? 200 : 403);
+    expect(execCalls).toBe(before + (mayExecute ? 1 : 0));
     for (const attempt of [SHELL, CLICK]) {
       const calls = guiCalls;
       expect((await attempt(owner, headers)).status).toBe(['owner', 'pYes', 'groupAndGrant'].includes(name) ? 200 : 403);
       expect(guiCalls - calls).toBe(['owner', 'pYes', 'groupAndGrant'].includes(name) ? 1 : 0);
     }
-    for (const action of [MACHINE_ACTION.FILE_SEND, MACHINE_ACTION.FILE_FETCH, MACHINE_ACTION.FILE_LIST]) {
+    for (const action of [MACHINE_ACTION.FILE_SEND, MACHINE_ACTION.FILE_FETCH]) {
       const admission = await admitMachineAction(db, {
         token: headers[SHARED_MACHINE_AUTHORITY_HEADER], signingKey: KEY, authenticatedSourceServerId: owner.serverId,
         sourceOwnerUserId: owner.userId, targetServerId: nodeId, action, now: Date.now(),
       });
       expect(admission.ok, action).toBe(['owner', 'pYes', 'groupAndGrant'].includes(name));
     }
+    const listAdmission = await admitMachineAction(db, {
+      token: headers[SHARED_MACHINE_AUTHORITY_HEADER], signingKey: KEY, authenticatedSourceServerId: owner.serverId,
+      sourceOwnerUserId: owner.userId, targetServerId: nodeId, action: MACHINE_ACTION.FILE_LIST, now: Date.now(),
+    });
+    expect(listAdmission.ok, MACHINE_ACTION.FILE_LIST).toBe(['owner', 'pYes', 'gMember', 'gAdmin', 'groupAndGrant'].includes(name));
   });
 
   it.each(['pNo', 'pYes', 'gMember'])('%s: daemon list keeps the raw switch for non-EXEC consumers without owner-grant substitution', async (name) => {
@@ -234,7 +283,7 @@ describe('only exec_remote is refused on participant-origin turns', () => {
     const owner = actors.owner!;
     const projected = (await listControlledMachines(db, owner.userId, Date.now(), actors[name]!.userId)).machines.find((m) => m.serverId === nodeId)!;
     if (name === 'gMember') expect(projected).toMatchObject({ execEnabled: true, canExecute: false, execGranted: false, accessSource: 'group' });
-    else expect(projected).toMatchObject({ execEnabled: true, canExecute: false, accessSource: 'share', execGranted: name === 'pYes' });
+    else expect(projected).toMatchObject({ execEnabled: true, canExecute: name === 'pYes', accessSource: 'share', execGranted: name === 'pYes' });
     const response = await execApp().request('/api/machines', {
       headers: { 'X-Server-Id': owner.serverId, authorization: `Bearer ${owner.token}`, ...delegated },
     });

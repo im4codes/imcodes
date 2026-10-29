@@ -643,6 +643,30 @@ vi.mock('../../src/hooks/usePref.js', () => ({
 }));
 
 describe('ChatView', () => {
+  it('canonicalizes hidden chat paths before dispatching preview reads', () => {
+    const onPreviewFile = vi.fn();
+    const ws = { onMessage: vi.fn(() => () => undefined) };
+    const { container } = render(
+      <ChatView
+        events={[{
+          eventId: 'hidden-preview',
+          type: 'user.message',
+          ts: Date.now(),
+          payload: { text: 'Open ./.hidden/../.config/settings.json' },
+        }] as any}
+        loading={false}
+        sessionId="deck_main_brain"
+        ws={ws as any}
+        workdir="/home/ai/project/"
+        onPreviewFile={onPreviewFile}
+      />,
+    );
+    fireEvent.click(container.querySelector('.chat-path-link') as HTMLElement);
+    expect(onPreviewFile).toHaveBeenCalledWith(expect.objectContaining({
+      path: '/home/ai/project/.config/settings.json',
+    }));
+  });
+
   const originalVisualViewport = window.visualViewport;
   const clipboardWriteText = vi.fn().mockResolvedValue(undefined);
 

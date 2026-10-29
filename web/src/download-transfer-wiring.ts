@@ -40,6 +40,8 @@ export function createDownloadTransferWiring(transferId: string) {
         updateDownloadTransfer(transferId, DOWNLOAD_TRANSFER_ROUTE.PENDING, DOWNLOAD_TRANSFER_STATUS.CONNECTING);
       } else if (mode === FILE_DOWNLOAD_TRANSPORT_MODE.DIRECT) {
         updateDownloadTransfer(transferId, DOWNLOAD_TRANSFER_ROUTE.DIRECT, DOWNLOAD_TRANSFER_STATUS.TRANSFERRING);
+      } else if (mode === FILE_DOWNLOAD_TRANSPORT_MODE.RECOVERING) {
+        updateDownloadTransfer(transferId, DOWNLOAD_TRANSFER_ROUTE.DIRECT, DOWNLOAD_TRANSFER_STATUS.TRANSFERRING);
       } else if (mode === FILE_DOWNLOAD_TRANSPORT_MODE.FALLING_BACK) {
         updateDownloadTransfer(transferId, DOWNLOAD_TRANSFER_ROUTE.HTTP, DOWNLOAD_TRANSFER_STATUS.FALLING_BACK);
       } else if (mode === FILE_DOWNLOAD_TRANSPORT_MODE.HTTP) {

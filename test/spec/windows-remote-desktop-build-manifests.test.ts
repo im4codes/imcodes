@@ -636,6 +636,14 @@ describe('windows remote-desktop privacy dispatcher', () => {
   const ipcHeader = read('privacy_ipc.h');
   const ipc = read('privacy_ipc.cc');
 
+  it('keeps the native PREPARE mode fence compatible with shared viewers and worker replacement', () => {
+    const guard = worker.slice(worker.indexOf('const bool valid_initial_mode'));
+    expect(guard).toContain('signal.authority.mode == kViewMode');
+    expect(guard).toContain('signal.authority.input_epoch == 0');
+    expect(guard).toContain('signal.authority.mode == kControlMode');
+    expect(guard).toContain('signal.authority.input_epoch > 0');
+  });
+
   it('reports a failed peer as reconnecting instead of terminal before ICE recovery', () => {
     const callback = peerSession.slice(peerSession.indexOf('void PeerSession::OnConnectionChange('));
     const body = callback.slice(0, callback.indexOf('\nvoid PeerSession::OnIceSelectedCandidatePairChanged('));

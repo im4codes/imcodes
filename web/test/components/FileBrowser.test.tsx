@@ -11,6 +11,8 @@ import { MINIMAL_DOCX_MIME, MINIMAL_DOCX_TEXT, buildMinimalDocx } from '../fixtu
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { h } from 'preact';
 import { render, screen, fireEvent, act, cleanup, waitFor } from '@testing-library/preact';
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 
 const filePreviewPropsState = vi.hoisted(() => ({
   current: null as null | {
@@ -56,6 +58,7 @@ vi.mock('../../src/components/FilePreviewPane.js', () => ({
 vi.mock('../../src/direct-file-transfer.js', () => directFileTransferMocks);
 
 import { FileBrowser, __resetFileBrowserSharedChangesForTests, mergePreviewState, getParentDir } from '../../src/components/FileBrowser.js';
+import { resolvePreviewPath } from '../../src/components/ChatView.js';
 import type { WsClient, ServerMessage } from '../../src/ws-client.js';
 import { FS_READ_ERROR_CODES } from '../../../shared/fs-read-error-codes.js';
 import { FILE_TRANSFER_DIRECTORY_LIST_ERROR, FILE_TRANSFER_DIRECTORY_PATH } from '../../../shared/transport/file-transfer.js';
@@ -73,6 +76,7 @@ afterEach(() => {
 });
 
 // ── i18n stub ─────────────────────────────────────────────────────────────
+const fileBrowserI18n = vi.hoisted(() => ({ freshTCalls: 0 }));
 vi.mock('react-i18next', () => {
   // t must be reference-stable — a new function ref each render causes
   // fetchPreview to be recreated, triggering infinite re-renders via
@@ -118,7 +122,13 @@ vi.mock('react-i18next', () => {
     return map[key] ?? key;
   };
   const translation = { t };
-  return { useTranslation: () => translation };
+  return { useTranslation: () => {
+    if (fileBrowserI18n.freshTCalls > 0) {
+      fileBrowserI18n.freshTCalls -= 1;
+      return { t: (key: string, opts?: Record<string, unknown>) => t(key, opts) };
+    }
+    return translation;
+  } };
 });
 
 // ── WsClient factory ──────────────────────────────────────────────────────
@@ -207,6 +217,7 @@ describe('FileBrowser', () => {
     directFileTransferMocks.selectPreviewDownloadDestination.mockResolvedValue(null);
     directFileTransferMocks.isDirectFileTransferStaleHandleError.mockReturnValue(false);
     filePreviewPropsState.current = null;
+    fileBrowserI18n.freshTCalls = 0;
     localStorage.clear();
     __resetFileBrowserSharedChangesForTests();
     __resetDownloadTransfersForTests();
@@ -280,6 +291,34 @@ describe('FileBrowser', () => {
       destination: null,
     })));
     expect(directFileTransferMocks.selectPreviewDownloadDestination).toHaveBeenCalledWith('report.pdf');
+  });
+
+  it('keeps preview action buttons in a dedicated responsive container', () => {
+    const { ws } = makeWsFactory();
+    const view = render(
+      <FileBrowser
+        ws={ws}
+        mode="file-single"
+        layout="panel"
+        initialPath="/home/user"
+        initialPreview={{ status: 'ok', path: '/home/user/report.txt', content: 'preview' }}
+        onConfirm={vi.fn()}
+      />,
+    );
+
+    const actions = view.container.querySelector('.fb-preview-actions');
+    expect(actions).not.toBeNull();
+    expect(actions?.querySelectorAll('.fb-diff-toggle').length).toBeGreaterThan(0);
+    expect(actions?.querySelector('.fb-close')).toBeNull();
+  });
+
+  it.each([320, 375, 390])('keeps preview actions usable at %dpx narrow widths', (width) => {
+    const styles = readFileSync(resolve(__dirname, '../../src/styles.css'), 'utf8');
+    const narrowStyles = styles.slice(styles.indexOf('@media (max-width: 640px)'));
+    expect(narrowStyles).toContain('.fb-preview-header { flex-wrap: wrap;');
+    expect(narrowStyles).toContain('.fb-preview-actions { order: 3; flex: 1 1 100%; width: 100%;');
+    expect(styles).toContain('.fb-preview-actions .fb-diff-toggle { margin-left: 0; flex: 0 0 auto; min-height: 32px; white-space: nowrap; }');
+    expect(width).toBeGreaterThanOrEqual(320);
   });
 
   it('treats save-picker cancellation as a no-op before creating a download entry', async () => {
@@ -2503,6 +2542,26 @@ describe('FileBrowser', () => {
     expect((ws.fsGitDiff as any).mock.calls[0]?.[0]).toBe('/home/user/foo.ts');
   });
 
+  it('keeps chat auto-preview bounded when i18n changes t identity', async () => {
+    const { ws, respond } = makeWsFactory();
+    fileBrowserI18n.freshTCalls = Number.POSITIVE_INFINITY;
+    render(
+      <FileBrowser
+        ws={ws}
+        mode="file-single"
+        layout="panel"
+        initialPath="/home/user"
+        autoPreviewPath="/home/user/foo.ts"
+        onConfirm={vi.fn()}
+      />,
+    );
+
+    await act(async () => { respond([{ name: 'foo.ts', isDir: false }], '/home/user'); });
+    await waitFor(() => expect((ws.fsReadFile as any).mock.calls).toHaveLength(1));
+    expect(document.querySelector('.fb-preview-loading')).not.toBeNull();
+    fileBrowserI18n.freshTCalls = 0;
+  });
+
   it('dispatches at most one current read/diff cycle per visible target', async () => {
     const { ws, respond } = makeWsFactory();
     render(
@@ -2726,6 +2785,49 @@ describe('FileBrowser', () => {
     });
   });
 
+  it('does not issue a second read for equivalent hidden chat path aliases', async () => {
+    const { ws, sendMsg } = makeWsFactory();
+    const aliasPath = resolvePreviewPath('./.hidden/../.config/settings.json', '/home/user');
+    const canonicalPath = resolvePreviewPath('./.config/settings.json', '/home/user');
+    const view = render(
+      <FileBrowser
+        ws={ws}
+        mode="file-single"
+        layout="panel"
+        initialPath="/home/user"
+        autoPreviewPath={aliasPath}
+        onConfirm={vi.fn()}
+      />,
+    );
+
+    await waitFor(() => expect(ws.fsReadFile).toHaveBeenCalledTimes(1));
+    view.rerender(
+      <FileBrowser
+        ws={ws}
+        mode="file-single"
+        layout="panel"
+        initialPath="/home/user"
+        autoPreviewPath={canonicalPath}
+        onConfirm={vi.fn()}
+      />,
+    );
+
+    await act(async () => {
+      await Promise.resolve();
+      sendMsg({
+        type: 'fs.read_response',
+        requestId: 'mock-read-id',
+        path: canonicalPath,
+        status: 'error',
+        error: 'not_found',
+      });
+    });
+
+    expect(ws.fsReadFile).toHaveBeenCalledTimes(1);
+    expect(aliasPath).toBe(canonicalPath);
+    expect(view.container.querySelector('.fb-preview-error')).not.toBeNull();
+  });
+
   it.each([
     FS_READ_ERROR_CODES.PREVIEW_WORKER_TIMEOUT,
     FS_READ_ERROR_CODES.PREVIEW_WORKER_UNAVAILABLE,
@@ -2753,6 +2855,46 @@ describe('FileBrowser', () => {
     });
 
     expect(document.querySelector('.fb-preview-error')?.textContent).toBe('file_browser.preview_error');
+  });
+
+  it('retries a cached chat preview error once when the same path is opened again', async () => {
+    const { ws, sendMsg } = makeWsFactory();
+    const view = render(
+      <FileBrowser
+        ws={ws}
+        mode="file-single"
+        layout="panel"
+        initialPath="/home/user"
+        autoPreviewPath="/home/user/missing.ts"
+        initialPreview={{ status: 'error', path: '/home/user/missing.ts', error: 'file_browser.preview_error' }}
+        onConfirm={vi.fn()}
+      />,
+    );
+
+    await waitFor(() => expect(ws.fsReadFile).toHaveBeenCalledTimes(1));
+    expect(view.container.querySelector('.fb-preview-loading')).not.toBeNull();
+
+    await act(async () => {
+      sendMsg({
+        type: 'fs.read_response',
+        requestId: 'mock-read-id',
+        path: '/home/user/missing.ts',
+        status: 'error',
+        error: 'not_found',
+      });
+      // A diff response can arrive after the read failed. It must not revive
+      // the failed chat preview or overwrite its error state.
+      sendMsg({
+        type: 'fs.git_diff_response',
+        requestId: 'mock-git-diff-id',
+        path: '/home/user/missing.ts',
+        status: 'ok',
+        diff: '+late response',
+      });
+    });
+
+    expect(view.container.querySelector('.fb-preview-error')?.textContent).toBe('file_browser.preview_error');
+    expect(ws.fsReadFile).toHaveBeenCalledTimes(1);
   });
 
   it('times out a missing preview read and allows same-file retry', async () => {

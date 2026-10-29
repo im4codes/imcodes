@@ -11,7 +11,11 @@ import { AUTH_IDENTITY_ERRORS } from '../../../shared/auth-identity.js';
 import { EXPECTED_USER_ID_HEADER, SERVER_ID_HEADER } from '../../../shared/http-header-names.js';
 import { NODE_ROLE, type NodeRole, NODE_ROLE_REFUSAL } from '../../../shared/remote-exec.js';
 import {
-  resolveControlledMachineOperatorAccess,
+  // WebSocket admission is the account-side half of remote-desktop admission.
+  // Keep it on the same host resolver as the signaling router so a shared
+  // controlled node cannot be listed by one permission path and rejected by
+  // another one before the router can select View vs Control.
+  resolveRemoteDesktopHostAccess,
 } from '../share/machine-access.js';
 import { resolveEffectiveShareCoverage } from '../db/tab-sharing.js';
 import { isAccountSessionJwt } from './account-session-jwt.js';
@@ -323,7 +327,7 @@ export function requireTeamRole(minRole: 'owner' | 'admin' | 'member' = 'member'
 export type ServerRole = 'owner' | 'admin' | 'member' | 'none';
 export type ServerWebSocketAccess =
   | { kind: 'standard'; role: Exclude<ServerRole, 'none'> }
-  | { kind: 'controlled'; role: 'owner' | 'participant' };
+  | { kind: 'controlled'; role: 'owner' | 'participant' | 'viewer' };
 
 /**
  * Resolve the user's role for a specific server.
@@ -390,8 +394,8 @@ export async function resolveServerRole(
 }
 
 /**
- * WebSocket admission includes active Owner/Participant controlled-machine
- * grants, while keeping Viewers and unrelated users out. Returning the target
+ * WebSocket admission includes every active controlled-machine share grant,
+ * including read-only Viewers, while keeping unrelated users out. Returning the target
  * kind lets WsBridge default-deny every non-remote-desktop browser frame even
  * while the controlled daemon is offline or reconnecting.
  */
@@ -408,9 +412,9 @@ export async function resolveServerWebSocketAccess(
   if (!target) return null;
 
   if (target.node_role === NODE_ROLE.CONTROLLED) {
-    const controlled = await resolveControlledMachineOperatorAccess(db, userId, serverId, now);
-    if (!controlled) return null;
-    return { kind: 'controlled', role: controlled.access_role };
+    const host = await resolveRemoteDesktopHostAccess(db, userId, serverId, now);
+    if (!host) return null;
+    return { kind: 'controlled', role: host.access_role };
   }
   // Shared operators must enter through a share ticket so their provenance is
   // retained and every relayed action is stamped. Never let the ordinary WS

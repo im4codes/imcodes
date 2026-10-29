@@ -5,17 +5,22 @@ const subjects: Array<[string, MachineAccessSubject, boolean, boolean]> = [
   ['owner', { accessRole: 'owner', accessSource: S.OWNER, execGranted: false, execEnabled: true, participantTurn: true }, true, true],
   ['granted', { accessRole: 'participant', accessSource: S.SHARE, execGranted: true, execEnabled: true, participantTurn: true }, true, true],
   ['no grant', { accessRole: 'participant', accessSource: S.SHARE, execGranted: false, execEnabled: true, participantTurn: true }, true, false],
-  ['group', { accessRole: 'participant', accessSource: S.GROUP, execGranted: true, execEnabled: true, participantTurn: true }, true, false],
+  ['group without grant', { accessRole: 'participant', accessSource: S.GROUP, execGranted: false, execEnabled: true, participantTurn: true }, true, false],
+  ['group with execute grant', { accessRole: 'participant', accessSource: S.GROUP, execGranted: true, execEnabled: true, participantTurn: true }, true, true],
   ['viewer', { accessRole: 'viewer', accessSource: S.SHARE, execGranted: false, execEnabled: true, participantTurn: true }, false, false],
   ['revoked', { accessRole: null, accessSource: null, execGranted: true, execEnabled: true, participantTurn: true }, false, false],
 ];
 describe.each(subjects)('%s real access', (_name, subject, mayView, mayExecute) => {
   it.each(Object.values(MACHINE_ACTION))('participant vs owner turn for %s', (action) => {
-    const expected = action === MACHINE_ACTION.EXEC ? false : action === MACHINE_ACTION.LIST || action === MACHINE_ACTION.VIEW ? mayView : mayExecute;
+    const expected = action === MACHINE_ACTION.LIST || action === MACHINE_ACTION.VIEW
+        ? mayView
+        : action === MACHINE_ACTION.FILE_LIST && subject.accessSource === S.GROUP && subject.accessRole === 'participant'
+          ? true
+          : mayExecute;
     expect(evaluateMachineAction(subject, action).allowed).toBe(expected);
     // With provenance absent, grant rules are identical except the exact exec_remote action.
     const ownerTurn = evaluateMachineAction({ ...subject, participantTurn: false }, action);
-    expect(ownerTurn.allowed).toBe(action === MACHINE_ACTION.EXEC ? mayExecute : expected);
+    expect(ownerTurn.allowed).toBe(expected);
     const switchedOff = evaluateMachineAction({ ...subject, execEnabled: false }, action);
     expect(switchedOff.allowed).toBe(action === MACHINE_ACTION.LIST && mayView);
   });

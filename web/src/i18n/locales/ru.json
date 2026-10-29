@@ -34,6 +34,12 @@
       "generic": "Что-то пошло не так. Попробуйте ещё раз."
     }
   },
+  "skill": {
+    "category": "Навыки",
+    "category_desc": "Вставить ссылку на навык",
+    "empty": "Нет доступных навыков",
+    "no_results": "Нет навыков, соответствующих поиску"
+  },
   "machine": {
     "feature_label": "Машина",
     "category": "Машина",
@@ -797,6 +803,7 @@
       "openclaw": "OpenClaw",
       "qwen": "Qwen Code",
       "claude_code_sdk": "Claude Code SDK",
+      "cc_cli_sdk": "CC CLI SDK",
       "codex_sdk": "Codex SDK",
       "qoder_sdk": "Qoder SDK",
       "claude_code_cli": "Claude Code CLI",

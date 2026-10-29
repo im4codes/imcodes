@@ -83,12 +83,29 @@ describe('computer use runner open-computer-use CLI', () => {
   it('forwards bounded get_app_state collection controls without leaking wrapper-only keys', () => {
     expect(openComputerUseCallArgs('get_app_state', '{"app":"chrome"}'))
       .toEqual(['call', 'get_app_state', '--args', JSON.stringify({
-        app: 'chrome', text_limit: 1_000, max_tree_depth: 64,
+        app: 'chrome', text_limit: 1_000, max_tree_nodes: 200, max_tree_depth: 64,
       })]);
     expect(openComputerUseCallArgs('get_app_state', '{"app":"chrome","maxNodes":25,"maxDepth":4}'))
       .toEqual(['call', 'get_app_state', '--args', JSON.stringify({
-        app: 'chrome', text_limit: 1_000, max_tree_depth: 4,
+        app: 'chrome', text_limit: 1_000, max_tree_nodes: 25, max_tree_depth: 4,
       })]);
+  });
+
+  it('maps the explicit accessibility_tree verb to the signed helper tree API', () => {
+    expect(openComputerUseCallArgs('accessibility_tree', '{"app":"Finder","maxNodes":25,"maxDepth":4}'))
+      .toEqual(['call', 'get_app_state', '--args', JSON.stringify({
+        app: 'Finder', text_limit: 1_000, max_tree_nodes: 25, max_tree_depth: 4,
+      })]);
+  });
+
+  it('normalizes accessibility_tree content with the same bounded tree protection', async () => {
+    const tree = Array.from({ length: 205 }, (_, index) => `[${index}] button item`).join('\n');
+    const state = await normalizeOpenComputerUseParsedResult('accessibility_tree', { app: 'Finder' }, {
+      content: [{ type: 'text', text: tree }],
+    });
+    expect(state.isError).toBe(false);
+    expect(state.truncated).toBe(true);
+    expect(state.content[0]).toMatchObject({ type: 'text', text: expect.stringContaining('truncated: 5 nodes omitted') });
   });
 
   it('invalidates the long-lived MCP helper when the sidecar bytes are replaced in place', () => {

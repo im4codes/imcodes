@@ -112,6 +112,7 @@ import logger from '../../util/logger.js';
 import type { TransportEffortLevel } from '../../../shared/effort-levels.js';
 import type { ProviderActiveWorkSnapshot } from '../../../shared/session-activity-types.js';
 import { composeMessageSideProviderPrompt, getProviderSystemTextParts } from '../provider-context-routing.js';
+import { sessionSystemContractKey, shouldInjectSessionSystemContract } from '../session-system-contract.js';
 import {
   canonicalizeTransportCwd,
   normalizeTransportCwd,
@@ -867,6 +868,8 @@ export class KimiSdkProvider implements TransportProvider {
       this.cancelPendingApprovals();
       const sessions = [...this.sessions.keys()];
       for (const sid of sessions) {
+        const state = this.sessions.get(sid);
+        if (state) state.sessionSystemTextInjected = undefined;
         if (this.clearSessionWorkAfterFailure(sid)) {
           this.emitError(sid, this.makeError(PROVIDER_ERROR_CODES.CONNECTION_LOST, err.message, true));
         }
@@ -885,6 +888,8 @@ export class KimiSdkProvider implements TransportProvider {
       this.cancelPendingApprovals();
       const sessions = [...this.sessions.keys()];
       for (const sid of sessions) {
+        const state = this.sessions.get(sid);
+        if (state) state.sessionSystemTextInjected = undefined;
         if (this.clearSessionWorkAfterFailure(sid)) {
           this.emitError(sid, this.makeError(PROVIDER_ERROR_CODES.CONNECTION_LOST, err.message, true));
         }
@@ -1053,7 +1058,11 @@ export class KimiSdkProvider implements TransportProvider {
       state.currentText = '';
       state.currentMessageId = null;
       const sessionSystemText = getProviderSystemTextParts(payload).sessionSystemText;
-      const includeSessionSystemText = !!sessionSystemText && state.sessionSystemTextInjected !== sessionSystemText;
+      const sessionContractKey = sessionSystemContractKey(sessionSystemText);
+      const includeSessionSystemText = shouldInjectSessionSystemContract(
+        state.sessionSystemTextInjected,
+        sessionSystemText,
+      );
       const compactControl = isSessionControlCommandText(payload.userMessage, 'compact');
       const promptBlocks = this.buildPromptContent(payload, includeSessionSystemText);
 
@@ -1073,7 +1082,7 @@ export class KimiSdkProvider implements TransportProvider {
           state,
           generation,
           result.stopReason,
-          includeSessionSystemText ? sessionSystemText : undefined,
+          includeSessionSystemText ? sessionContractKey : undefined,
           compactControl,
         );
       }).catch((err: unknown) => {
@@ -1112,6 +1121,7 @@ export class KimiSdkProvider implements TransportProvider {
     state.cancelled = false;
     state.toolCalls.clear();
     state.emittedToolSignatures.clear();
+    state.sessionSystemTextInjected = undefined;
     this.cancelPendingApprovals(sessionId);
     this.clearStatus(sessionId, state);
     if (this.isDisconnecting) return;

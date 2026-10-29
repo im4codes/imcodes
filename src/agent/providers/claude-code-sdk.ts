@@ -52,6 +52,8 @@ import { getDefaultMcpServers } from './getDefaultMcpServers.js';
 import { claudeRateLimitsToQuotaMeta, type ClaudeRateLimitInfo } from '../claude-rate-limit.js';
 import { formatProviderQuotaLabel } from '../../../shared/provider-quota.js';
 import { claudeRateLimitSignal } from '../claude-rate-limit.js';
+import { buildClaudeAgentEnv } from '../env-isolation.js';
+import { detectLocalAuthContext, hasLocalAuthCandidate, type LocalAuthContext } from '../local-auth-context.js';
 import { IMCODES_MEMORY_MCP_SERVER_NAME } from '../../../shared/memory-mcp-server-name.js';
 import {
   AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES,
@@ -172,6 +174,7 @@ interface ClaudeSdkSessionState {
   serverId?: string;
   cwd: string;
   env?: Record<string, string>;
+  localAuthContext?: LocalAuthContext;
   contextNamespace?: SessionConfig['contextNamespace'];
   model?: string;
   settings?: string | Record<string, unknown>;
@@ -573,10 +576,12 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
       Promise.resolve(getClaudeSdkAvailableModels()),
       getClaudeSdkRuntimeConfig(false),
     ]);
+    const auth = await detectLocalAuthContext(this.id);
     return {
       models: models.map((id) => ({ id })),
       defaultModel: models[0],
-      isAuthenticated: true,
+      isAuthenticated: auth.authenticated && auth.reusable,
+      ...(!(auth.authenticated && auth.reusable) ? { error: `Claude local auth unavailable: ${auth.reason ?? 'unknown reason'}` } : {}),
       ...(cfg.planLabel ? {} : {}), // planLabel lives in session-info, not model list
     };
   }
@@ -602,6 +607,13 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     const routeId = config.bindExistingKey ?? config.sessionKey;
     const existing = config.fresh ? undefined : this.sessions.get(routeId);
     const resumeId = config.resumeId ?? existing?.resumeId ?? routeId;
+    const authEnv = { ...process.env, ...(config.env ?? existing?.env ?? {}) };
+    const localAuthContext = config.authContext
+      ?? (hasLocalAuthCandidate(this.id, authEnv) ? await detectLocalAuthContext(this.id, authEnv) : existing?.localAuthContext);
+    if ((config.authContext !== undefined || hasLocalAuthCandidate(this.id, authEnv))
+      && (!localAuthContext?.authenticated || !localAuthContext.reusable)) {
+      throw this.makeError(PROVIDER_ERROR_CODES.PROVIDER_ERROR, `Claude local auth unavailable: ${localAuthContext?.reason ?? 'authentication context could not be verified'}`, false);
+    }
     this.sessions.set(routeId, {
       routeId,
       sessionName: config.sessionName ?? existing?.sessionName,
@@ -609,6 +621,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
       serverId: config.serverId ?? existing?.serverId,
       cwd: normalizeTransportCwd(config.cwd) ?? existing?.cwd ?? normalizeTransportCwd(process.cwd())!,
       env: config.env ?? existing?.env,
+      localAuthContext,
       contextNamespace: config.contextNamespace ?? existing?.contextNamespace,
       model: typeof config.agentId === 'string' ? config.agentId : existing?.model,
       settings: config.settings ?? existing?.settings,
@@ -1067,7 +1080,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     } : undefined;
     const options: Record<string, unknown> = {
       cwd: payload.turnCwd ?? state.cwd,
-      ...(state.env ? { env: { ...process.env, ...state.env } } : {}),
+      env: buildClaudeAgentEnv({ ...(state.env ?? {}), ...(state.localAuthContext?.env ?? {}) }),
       permissionMode: state.permissionMode,
       disallowedTools: DISALLOWED_NATIVE_TOOLS,
       hooks: {

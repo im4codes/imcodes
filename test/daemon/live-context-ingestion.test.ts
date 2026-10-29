@@ -860,6 +860,36 @@ describe('LiveContextIngestion', () => {
     expect(summary?.summary).not.toContain('fetch failed');
   });
 
+  it('does not carry a provider idle-timeout error into the next context turn', async () => {
+    const ingestion = new LiveContextIngestion({ compressor: echoCompressor,
+      thresholds: { eventCount: 99, idleMs: 60_000, scheduleMs: 60_000 },
+      sessionLookup: () => session,
+      resolveBootstrap: async () => ({ namespace, diagnostics: ['test'] }),
+    });
+
+    await ingestion.handleTimelineEvent(makeEvent('user.message', 100, { text: 'Continue after the failed request' }));
+    // This mirrors the relay's terminal partial-error bubble.  The test omits
+    // memoryExcluded deliberately: old persisted rows may not have carried
+    // that marker, so the provider-error metadata must remain a safe fallback.
+    await ingestion.handleTimelineEvent(makeEvent('assistant.text', 110, {
+      text: 'partial answer\n\n⚠️ Error: API error (attempt 1): request failed: stream idle timeout (5m0s): context deadline exceeded',
+      streaming: false,
+      providerErrorCode: 'PROVIDER_ERROR',
+      providerErrorRecoverable: true,
+    }));
+    await ingestion.handleTimelineEvent(makeEvent('assistant.text', 120, {
+      text: 'normal successful follow-up',
+      streaming: false,
+    }));
+    await ingestion.handleTimelineEvent(makeEvent('session.state', 130, { state: 'idle' }));
+
+    const [summary] = queryProcessedProjections({ scope: 'personal', projectId: namespace.projectId, limit: 10 });
+    expect(summary?.summary).toContain('Continue after the failed request');
+    expect(summary?.summary).toContain('normal successful follow-up');
+    expect(summary?.summary).not.toContain('stream idle timeout');
+    expect(summary?.summary).not.toContain('partial answer');
+  });
+
   it('ignores memory-excluded assistant warnings so runtime errors do not enter processed memory', async () => {
     const ingestion = new LiveContextIngestion({ compressor: localOnlyCompressor,
       thresholds: { eventCount: 99, idleMs: 60_000, scheduleMs: 60_000 },

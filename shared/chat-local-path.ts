@@ -79,6 +79,58 @@ export function normalizeChatFileReference(input: string): string | null {
   return value;
 }
 
+/**
+ * Return a stable spelling for a local chat path after it has been resolved
+ * against a session workdir.  Chat messages commonly mix `./.hidden/file`,
+ * `.hidden/file`, and redundant separators; treating those spellings as
+ * different preview targets lets the floating FileBrowser issue overlapping
+ * reads for the same file.  Keep the original separator family (Windows
+ * callers still receive Windows paths) while folding only lexical `.`/`..`
+ * segments and duplicate separators.
+ */
+export function canonicalizeChatFilePath(input: string): string | null {
+  const normalized = normalizeChatFileReference(input);
+  if (!normalized) return null;
+  // Preserve the established spelling for ordinary paths (notably `./file`),
+  // while giving dotfile/dot-directory references one stable lexical form.
+  // This keeps existing preview/cache keys compatible and only changes the
+  // hidden-path family that needs deduplication.
+  if (!normalized.split(/[/\\]+/u).some((part) => part.startsWith('.') && part !== '.' && part !== '..')) {
+    return normalized;
+  }
+  const windows = /^[A-Za-z]:[/\\]/.test(normalized) || normalized.includes('\\');
+  const separator = windows ? '\\' : '/';
+  const isDrive = /^[A-Za-z]:[/\\]/.test(normalized);
+  const isRooted = normalized.startsWith('/') || isDrive || normalized.startsWith('~/');
+  const prefix = isDrive
+    ? `${normalized.slice(0, 2)}${separator}`
+    : normalized.startsWith('/')
+      ? separator
+      : normalized.startsWith('~/')
+        ? `~${separator}`
+        : '';
+  const body = isDrive
+    ? normalized.slice(2)
+    : normalized.startsWith('/')
+      ? normalized.slice(1)
+      : normalized.startsWith('~/')
+        ? normalized.slice(2)
+        : normalized;
+  const parts: string[] = [];
+  for (const part of body.split(/[/\\]+/u)) {
+    if (!part || part === '.') continue;
+    if (part === '..') {
+      if (parts.length > 0 && parts[parts.length - 1] !== '..') parts.pop();
+      else if (!isRooted) parts.push(part);
+      continue;
+    }
+    parts.push(part);
+  }
+  const joined = parts.join(separator);
+  if (prefix) return `${prefix}${joined}` || prefix;
+  return joined || (isRooted ? prefix : normalized);
+}
+
 export function chatPathHasFileExtension(path: string): boolean {
   const normalized = normalizeChatFileReference(path);
   if (!normalized) return false;

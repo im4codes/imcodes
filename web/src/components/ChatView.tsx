@@ -72,6 +72,7 @@ import {
 import { parseUnifiedDiff } from '@shared/unified-diff.js';
 
 import { isHtmlPreviewPath, type HtmlPreviewViewMode } from '@shared/html-preview.js';
+import { canonicalizeChatFilePath } from '@shared/chat-local-path.js';
 import { FileBrowser, type FileBrowserPreviewRequest } from './file-browser-lazy.js';
 import { ChatMarkdown } from './ChatMarkdown.js';
 import {
@@ -356,14 +357,15 @@ function extractChatEventText(target: HTMLElement): string {
 }
 
 function isAbsolutePreviewPath(path: string): boolean {
-  return path.startsWith('/') || path.startsWith('~') || /^[A-Za-z]:[/\\]/.test(path);
+  return path.startsWith('/') || path === '~' || path.startsWith('~/') || path.startsWith('~\\') || /^[A-Za-z]:[/\\]/.test(path);
 }
 
-function resolvePreviewPath(path: string, workdir: string | null | undefined): string {
+export function resolvePreviewPath(path: string, workdir: string | null | undefined): string {
   const cleaned = path.replace(/^`+|`+$/g, '');
-  if (isAbsolutePreviewPath(cleaned)) return cleaned;
+  if (isAbsolutePreviewPath(cleaned)) return canonicalizeChatFilePath(cleaned) ?? cleaned;
   const root = (workdir && workdir.trim()) || '~';
-  return `${root.replace(/[/\\]+$/, '')}/${cleaned.replace(/^[/\\]+/, '')}`;
+  const joined = `${root.replace(/[/\\]+$/, '')}/${cleaned.replace(/^[/\\]+/, '')}`;
+  return canonicalizeChatFilePath(joined) ?? joined;
 }
 
 function formatMemoryContextScore(score: number | undefined): string | null {

@@ -5,6 +5,7 @@ import {
   REMOTE_DESKTOP_QUALITY_MODE_PREFERENCES,
   isRemoteDesktopQualityPreference,
   legacyRemoteDesktopQualityPreference,
+  normalizeRemoteDesktopQualityPreference,
 } from '@shared/remote-desktop.js';
 import {
   REMOTE_DESKTOP_QUALITY_STORAGE_KEY,
@@ -80,5 +81,13 @@ describe('remote desktop quality choice', () => {
     // Nothing else changes.
     expect(legacyRemoteDesktopQualityPreference(REMOTE_DESKTOP_QUALITY_MODE_PREFERENCES.saver))
       .toEqual(REMOTE_DESKTOP_QUALITY_MODE_PREFERENCES.saver);
+  });
+
+  it('normalizes legacy 720p preferences to the 1080p floor', () => {
+    const legacy = { maxHeight: 720, maxFps: 15, maxBitrateBps: 1_800_000, priority: 'balanced' } as const;
+    expect(normalizeRemoteDesktopQualityPreference(legacy)).toMatchObject({ maxHeight: 1080 });
+    expect(resolveRemoteDesktopQualityPreference({ mode: REMOTE_DESKTOP_QUALITY_MODE.CUSTOM, custom: legacy }))
+      .toMatchObject({ maxHeight: 1080 });
+    expect(legacyRemoteDesktopQualityPreference(legacy)).toMatchObject({ maxHeight: 1080 });
   });
 });

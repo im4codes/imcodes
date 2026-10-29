@@ -5,6 +5,7 @@ import type { TimelineEvent } from '../../src/shared/timeline/types.js';
 import { CODEBUDDY_PROVIDER_IDS } from '@shared/codebuddy.js';
 import { HERMES_AGENT_PROVIDER_ID } from '@shared/hermes-agent.js';
 import { AGY_SDK_PROVIDER_ID } from '@shared/agy-agent.js';
+import { CLAUDE_CODE_CLI_SDK_AGENT_TYPE } from '@shared/agent-types.js';
 import { isRunningTimelineEvent, isSdkSubagentTimelineEvent } from './timeline-running.js';
 import {
   createTransportQueueReducerState,
@@ -175,6 +176,7 @@ const NOISE_PREFIXES = [
 const BADGE_MAP: Record<string, string> = {
   'claude-code': 'cc',
   'claude-code-sdk': 'cc',
+  [CLAUDE_CODE_CLI_SDK_AGENT_TYPE]: 'cc',
   'codex': 'cx',
   'codex-sdk': 'cx',
   'copilot-sdk': 'co',

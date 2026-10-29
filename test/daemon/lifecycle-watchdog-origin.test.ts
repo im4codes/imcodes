@@ -65,12 +65,13 @@ function expectSystemContinue(emit: { mock: { calls: unknown[][] } }, send: Retu
 }
 
 describe('watchdog continue origin', () => {
-  it('stamps the memory-compression watchdog continue as a system message', async () => {
+  it('does not auto-continue a stale memory-compression turn', async () => {
     const send = vi.fn(() => 'sent' as const);
     runtimeRef.current = activeRuntime(send);
     const emit = vi.spyOn(timelineEmitter, 'emit');
-    expect(await recoverMemoryCompressionStalledSession(SESSION, 7 * 60_000)).toBe(true);
-    expectSystemContinue(emit, send);
+    expect(await recoverMemoryCompressionStalledSession(SESSION, 7 * 60_000)).toBe(false);
+    expect(send).not.toHaveBeenCalled();
+    expect(emit).not.toHaveBeenCalled();
   });
 
   it('stamps the Codex stale-turn continue as a system message on the row and the queued copy', async () => {

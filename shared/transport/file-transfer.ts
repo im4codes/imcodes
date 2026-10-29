@@ -83,6 +83,12 @@ export const FILE_TRANSFER_LIMITS = {
   UPLOAD_TIMEOUT_MS: 300_000,
   /** Relay-staged uploads expire after this duration (ms). */
   STAGED_UPLOAD_TTL_MS: 10 * 60 * 1000,
+  /** Upper bound for a size-scaled upload attempt/staged object lifetime. */
+  LARGE_UPLOAD_MAX_LIFETIME_MS: 60 * 60 * 1000,
+  /** Additional budget per MiB for slow but progressing large uploads. */
+  LARGE_UPLOAD_PER_MIB_MS: 1_000,
+  /** Keep ordinary attachments on the established fixed timeout budget. */
+  LARGE_UPLOAD_SCALE_MIN_BYTES: 64 * 1024 * 1024,
   /** Server waits this long for daemon download response (ms). */
   DOWNLOAD_TIMEOUT_MS: 300_000,
   /** Per-attempt wait for the daemon's download stream to START delivering bytes
@@ -119,6 +125,31 @@ export const FILE_TRANSFER_LIMITS = {
   /** Directory for temporary uploads on daemon. */
   UPLOAD_DIR: '/tmp/imcodes-uploads',
 } as const;
+
+/**
+ * Large relay uploads need a budget that grows with the bytes still moving.
+ * Keep the existing five-minute floor for ordinary files, but do not make a
+ * near-limit upload fail solely because its daemon fetch or final copy takes
+ * longer than that fixed floor.
+ */
+export function fileTransferUploadTimeoutMs(sizeBytes?: number): number {
+  const size = Number.isSafeInteger(sizeBytes) && (sizeBytes as number) >= 0 ? sizeBytes as number : 0;
+  const sizeBudget = size >= FILE_TRANSFER_LIMITS.LARGE_UPLOAD_SCALE_MIN_BYTES
+    ? Math.ceil(size / (1024 * 1024)) * FILE_TRANSFER_LIMITS.LARGE_UPLOAD_PER_MIB_MS
+    : 0;
+  return Math.min(
+    FILE_TRANSFER_LIMITS.LARGE_UPLOAD_MAX_LIFETIME_MS,
+    Math.max(FILE_TRANSFER_LIMITS.UPLOAD_TIMEOUT_MS, FILE_TRANSFER_LIMITS.UPLOAD_TIMEOUT_MS + sizeBudget),
+  );
+}
+
+/** The staged callback must outlive the corresponding daemon fetch budget. */
+export function fileTransferStagedUploadTtlMs(sizeBytes?: number): number {
+  return Math.min(
+    FILE_TRANSFER_LIMITS.LARGE_UPLOAD_MAX_LIFETIME_MS,
+    Math.max(FILE_TRANSFER_LIMITS.STAGED_UPLOAD_TTL_MS, fileTransferUploadTimeoutMs(sizeBytes) + 60_000),
+  );
+}
 
 /**
  * The MCP resource guard must not apply the ordinary short request budget to a

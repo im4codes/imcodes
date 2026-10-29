@@ -5,6 +5,7 @@ import { transportQueueSnapshotToPayload } from '../../shared/transport-queue-wi
 import { TRANSPORT_STOP_QUEUE_OUTCOMES, TRANSPORT_STOP_QUEUE_TIMEOUT_MS } from '../../shared/transport-queue-types.js';
 import { TRANSPORT_APPEND_FALLBACK_REASONS, readQueueDeliveryPolicy, type TransportAppendFallbackReason } from '../../shared/session-send-delivery.js';
 import { isChatMessageOrigin, type ChatMessageOrigin } from '../../shared/chat-message-origin.js';
+import { IMCODES_AUTOMATIC_COMPACTION_ENABLED } from '../../shared/automatic-compaction.js';
 import { randomUUID } from 'node:crypto';
 import type { SessionRecord } from '../store/session-store.js';
 import type { AliasSendAudit } from '../../shared/alias-types.js';
@@ -566,19 +567,16 @@ function makeCancelledProviderError(): ProviderError {
  *
  * onStatusChange fires on every transition (deduplicated).
  */
-/**
- * Automatic compaction threshold: share of the model's context window a
- * finished turn may use before the runtime compacts. Above 1 the threshold is
- * unreachable, so the runtime's own automatic compaction is effectively off;
- * that is the default until compaction queueing is proven. 0.75 was the
- * previous default (Codex's own auto-compact fired too late).
- */
+/** Legacy threshold retained for diagnostics and compatibility. Automatic
+ * compaction is disabled centrally by IMCODES_AUTOMATIC_COMPACTION_ENABLED. */
 export const TRANSPORT_AUTO_COMPACT_CONTEXT_RATIO = 1.1;
 
-/** `IMCODES_TRANSPORT_AUTO_COMPACT_RATIO` (0.05-1.5) overrides the ratio; e.g. 0.75 re-enables it. */
-export function transportAutoCompactRatio(env: NodeJS.ProcessEnv = process.env): number {
-  const raw = Number(env.IMCODES_TRANSPORT_AUTO_COMPACT_RATIO);
-  return Number.isFinite(raw) && raw >= 0.05 && raw <= 1.5 ? raw : TRANSPORT_AUTO_COMPACT_CONTEXT_RATIO;
+/**
+ * Legacy threshold accessor retained for diagnostics/tests. Automatic
+ * compaction is policy-disabled, so environment overrides are ignored.
+ */
+export function transportAutoCompactRatio(_env: NodeJS.ProcessEnv = process.env): number {
+  return TRANSPORT_AUTO_COMPACT_CONTEXT_RATIO;
 }
 /** At most one automatic compaction per session in this window. */
 export const TRANSPORT_AUTO_COMPACT_MIN_INTERVAL_MS = 10 * 60 * 1000;
@@ -5415,6 +5413,7 @@ export class TransportSessionRuntime implements SessionRuntime {
    * re-injection in the completion handler above.
    */
   private maybeAutoCompact(completed: AgentMessage): void {
+    if (!IMCODES_AUTOMATIC_COMPACTION_ENABLED) return;
     const compact = this.provider.capabilities.compact;
     if (compact?.execution === 'unsupported' || !compact?.verified || !compact.reassertsSessionSystemText) return;
     if (this._status !== 'idle' || this._pendingMessages.length > 0) return;

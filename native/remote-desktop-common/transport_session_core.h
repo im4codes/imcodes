@@ -193,6 +193,10 @@ class TransportSessionCore final {
 
   bool AddRemoteIceCandidate(const RouteAuthorityIdentity& identity,
                              IceCandidate candidate);
+  // Start a fresh ICE candidate generation for an in-place offer/restart.
+  // Candidate flood limits are per negotiation, not per logical route; the
+  // authority and callback generation remain unchanged across an ICE restart.
+  bool BeginIceRestart(const TransportCallbackStamp& callback_stamp);
   bool SetRemoteDescriptionReady(const TransportCallbackStamp& callback_stamp);
   bool OnLocalIceCandidate(const TransportCallbackStamp& callback_stamp,
                            IceCandidate candidate);

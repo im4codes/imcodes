@@ -177,7 +177,14 @@ class FakePeer extends EventTarget {
     if (this.failRemoteDescription) throw new DOMException('invalid answer', 'OperationError');
     this.remoteDescription = value as RTCSessionDescription;
   }
-  async addIceCandidate(value: RTCIceCandidateInit): Promise<void> { this.candidates.push(value); }
+  failNextIceCandidate = false;
+  async addIceCandidate(value: RTCIceCandidateInit): Promise<void> {
+    if (this.failNextIceCandidate) {
+      this.failNextIceCandidate = false;
+      throw new DOMException('stale candidate', 'OperationError');
+    }
+    this.candidates.push(value);
+  }
   async getStats(): Promise<RTCStatsReport> {
     return {
       forEach: (callback: (value: RTCStats) => void) => {
@@ -1061,6 +1068,18 @@ describe('RemoteDesktopClient', () => {
       reason: REMOTE_DESKTOP_MODE_REASON.USER_SELECTED,
     });
     await vi.waitFor(() => expect(client.current()).toMatchObject({ mode: 'view', inputEpoch: 2, inputEnabled: false }));
+    client.setMode(REMOTE_DESKTOP_ACCESS_MODE.CONTROL);
+    socket.receive({
+      type: REMOTE_DESKTOP_MSG.ERROR,
+      requestId: start.requestId,
+      error: REMOTE_DESKTOP_ERROR.ACCESS_DENIED,
+      retryable: false,
+    });
+    await vi.waitFor(() => expect(client.current()).toMatchObject({
+      mode: REMOTE_DESKTOP_ACCESS_MODE.VIEW,
+      modeError: REMOTE_DESKTOP_ERROR.ACCESS_DENIED,
+    }));
+    expect(client.current().state).not.toBe(REMOTE_DESKTOP_STATE.FAILED);
     expect(snapshots.length).toBeGreaterThan(3);
     control.receive({
       type: REMOTE_DESKTOP_DATA_MSG.QUALITY,
@@ -2304,6 +2323,183 @@ describe('RemoteDesktopClient', () => {
       type: REMOTE_DESKTOP_MSG.ANSWER,
       ...authority,
       sdp: 'v=0\r\n',
+    });
+    await vi.waitFor(() => expect(client.current()).toMatchObject({
+      state: REMOTE_DESKTOP_STATE.FAILED,
+      terminalReason: REMOTE_DESKTOP_TERMINAL_REASON.PROTOCOL_ERROR,
+    }));
+  });
+
+  it('drops a duplicate queued shared-viewer ICE candidate without protocol_error', async () => {
+    let socket!: FakeSocket;
+    let peer!: FakePeer;
+    const client = new RemoteDesktopClient('controlled-win', { onSnapshot: vi.fn() }, {
+      fetchTicket: async () => 'ticket-stale-queued-ice',
+      createSocket: () => {
+        socket = new FakeSocket();
+        queueMicrotask(() => socket.open());
+        return socket as unknown as WebSocket;
+      },
+      createPeer: () => {
+        peer = new FakePeer();
+        return peer as unknown as RTCPeerConnection;
+      },
+    });
+
+    await client.start();
+    const start = JSON.parse(socket.sent[0]!) as { requestId: string };
+    const authority = {
+      requestId: start.requestId,
+      sessionId: 'session_staleq01',
+      capability: 'd'.repeat(43),
+    };
+    socket.receive({
+      type: REMOTE_DESKTOP_MSG.AUTHORIZED,
+      ...authority,
+      expiresAt: Date.now() + 60_000,
+      leaseExpiresAt: Date.now() + 15_000,
+      daemonGeneration: 8,
+      mode: REMOTE_DESKTOP_ACCESS_MODE.VIEW,
+      inputEpoch: 0,
+      iceServers: [],
+    });
+    await vi.waitFor(() => expect(peer).toBeDefined());
+    await vi.waitFor(() => expect(socket.sent.map((raw) => JSON.parse(raw).type))
+      .toContain(REMOTE_DESKTOP_MSG.OFFER));
+
+    // The first candidate is applied for this generation.
+    socket.receive({
+      type: REMOTE_DESKTOP_MSG.ICE,
+      ...authority,
+      candidate: 'candidate:stale-queued',
+      mid: '0',
+    });
+    socket.receive({ type: REMOTE_DESKTOP_MSG.ANSWER, ...authority, sdp: 'v=0\r\n' });
+    await vi.waitFor(() => expect(peer.candidates).toHaveLength(1));
+
+    // A duplicate queued by the relay is known and is ignored, not treated as
+    // evidence of a protocol violation.
+    peer.connectionState = 'failed';
+    peer.dispatchEvent(new Event('connectionstatechange'));
+    await vi.waitFor(() => expect(peer.offerOptions).toHaveLength(2));
+    socket.receive({ type: REMOTE_DESKTOP_MSG.ICE, ...authority, candidate: 'candidate:stale-queued', mid: '0' });
+
+    expect(client.current().terminalReason).toBeUndefined();
+    expect(client.current().state).not.toBe(REMOTE_DESKTOP_STATE.FAILED);
+  });
+
+  it('recovers a late shared-viewer ICE candidate without terminal protocol_error', async () => {
+    let socket!: FakeSocket;
+    let peer!: FakePeer;
+    const client = new RemoteDesktopClient('controlled-win', { onSnapshot: vi.fn() }, {
+      fetchTicket: async () => 'ticket-stale-late-ice',
+      createSocket: () => {
+        socket = new FakeSocket();
+        queueMicrotask(() => socket.open());
+        return socket as unknown as WebSocket;
+      },
+      createPeer: () => {
+        peer = new FakePeer();
+        return peer as unknown as RTCPeerConnection;
+      },
+    });
+
+    await client.start();
+    const start = JSON.parse(socket.sent[0]!) as { requestId: string };
+    const authority = {
+      requestId: start.requestId,
+      sessionId: 'session_stalel01',
+      capability: 'd'.repeat(43),
+    };
+    socket.receive({
+      type: REMOTE_DESKTOP_MSG.AUTHORIZED,
+      ...authority,
+      expiresAt: Date.now() + 60_000,
+      leaseExpiresAt: Date.now() + 15_000,
+      daemonGeneration: 8,
+      mode: REMOTE_DESKTOP_ACCESS_MODE.VIEW,
+      inputEpoch: 0,
+      iceServers: [],
+    });
+    await vi.waitFor(() => expect(peer).toBeDefined());
+    await vi.waitFor(() => expect(socket.sent.map((raw) => JSON.parse(raw).type))
+      .toContain(REMOTE_DESKTOP_MSG.OFFER));
+    socket.receive({ type: REMOTE_DESKTOP_MSG.ANSWER, ...authority, sdp: 'v=0\r\n' });
+    await vi.waitFor(() => expect(peer.remoteDescription?.sdp).toBe('v=0\r\n'));
+
+    // Apply the candidate once, then restart to retire this generation.
+    socket.receive({
+      type: REMOTE_DESKTOP_MSG.ICE,
+      ...authority,
+      candidate: 'candidate:stale-late',
+      mid: '0',
+    });
+    await vi.waitFor(() => expect(peer.candidates).toHaveLength(1));
+    peer.connectionState = 'failed';
+    peer.dispatchEvent(new Event('connectionstatechange'));
+    await vi.waitFor(() => expect(peer.offerOptions).toHaveLength(2));
+    await vi.waitFor(() => expect(socket.sent.filter((raw) => JSON.parse(raw).type === REMOTE_DESKTOP_MSG.OFFER))
+      .toHaveLength(2));
+    socket.receive({ type: REMOTE_DESKTOP_MSG.ANSWER, ...authority, sdp: 'v=0\r\nrestart' });
+    await vi.waitFor(() => expect(peer.remoteDescription?.sdp).toContain('restart'));
+    peer.connect();
+
+    // The same candidate from the superseded shared-viewer generation is
+    // recognized and triggers the bounded recovery path, not protocol_error.
+    socket.receive({
+      type: REMOTE_DESKTOP_MSG.ICE,
+      ...authority,
+      candidate: 'candidate:stale-late',
+      mid: '0',
+    });
+    await vi.waitFor(() => expect(peer.offerOptions).toHaveLength(3));
+    expect(client.current().terminalReason).toBeUndefined();
+    expect(client.current().state).not.toBe(REMOTE_DESKTOP_STATE.FAILED);
+  });
+
+  it('keeps unknown ICE application failures terminal', async () => {
+    let socket!: FakeSocket;
+    let peer!: FakePeer;
+    const client = new RemoteDesktopClient('controlled-win', { onSnapshot: vi.fn() }, {
+      fetchTicket: async () => 'ticket-invalid-ice',
+      createSocket: () => {
+        socket = new FakeSocket();
+        queueMicrotask(() => socket.open());
+        return socket as unknown as WebSocket;
+      },
+      createPeer: () => {
+        peer = new FakePeer();
+        return peer as unknown as RTCPeerConnection;
+      },
+    });
+    await client.start();
+    const start = JSON.parse(socket.sent[0]!) as { requestId: string };
+    const authority = {
+      requestId: start.requestId,
+      sessionId: 'session_invalid01',
+      capability: 'd'.repeat(43),
+    };
+    socket.receive({
+      type: REMOTE_DESKTOP_MSG.AUTHORIZED,
+      ...authority,
+      expiresAt: Date.now() + 60_000,
+      leaseExpiresAt: Date.now() + 15_000,
+      daemonGeneration: 8,
+      mode: REMOTE_DESKTOP_ACCESS_MODE.VIEW,
+      inputEpoch: 0,
+      iceServers: [],
+    });
+    await vi.waitFor(() => expect(peer).toBeDefined());
+    await vi.waitFor(() => expect(socket.sent.map((raw) => JSON.parse(raw).type))
+      .toContain(REMOTE_DESKTOP_MSG.OFFER));
+    socket.receive({ type: REMOTE_DESKTOP_MSG.ANSWER, ...authority, sdp: 'v=0\r\n' });
+    await vi.waitFor(() => expect(peer.remoteDescription?.sdp).toBe('v=0\r\n'));
+    peer.failNextIceCandidate = true;
+    socket.receive({
+      type: REMOTE_DESKTOP_MSG.ICE,
+      ...authority,
+      candidate: 'candidate:unknown-invalid',
+      mid: '0',
     });
     await vi.waitFor(() => expect(client.current()).toMatchObject({
       state: REMOTE_DESKTOP_STATE.FAILED,

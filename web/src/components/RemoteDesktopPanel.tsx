@@ -9,6 +9,7 @@ import {
   REMOTE_DESKTOP_ERROR,
   REMOTE_DESKTOP_QUALITY_MAX_FPS,
   REMOTE_DESKTOP_QUALITY_MAX_HEIGHTS,
+  REMOTE_DESKTOP_QUALITY_MIN_HEIGHT,
   REMOTE_DESKTOP_QUALITY_MODE,
   REMOTE_DESKTOP_QUALITY_PRIORITY,
   REMOTE_DESKTOP_ROUTE,
@@ -1006,8 +1007,7 @@ export function RemoteDesktopPanel({
     const authorityLost = snapshot.terminalReason === REMOTE_DESKTOP_TERMINAL_REASON.AUTHORITY_REVOKED
       || snapshot.terminalReason === REMOTE_DESKTOP_TERMINAL_REASON.AUTHORITY_EXPIRED
       || snapshot.error === REMOTE_DESKTOP_ERROR.INVALID_AUTHORITY
-      || snapshot.error === REMOTE_DESKTOP_ERROR.AUTHORITY_EXPIRED
-      || snapshot.error === REMOTE_DESKTOP_ERROR.ACCESS_DENIED;
+      || snapshot.error === REMOTE_DESKTOP_ERROR.AUTHORITY_EXPIRED;
     if (authorityLost) onAuthorityLost?.();
   }, [onAuthorityLost, snapshot.error, snapshot.terminalReason]);
 
@@ -1060,6 +1060,19 @@ export function RemoteDesktopPanel({
     }, CONTROL_NOTICE_MS);
     return () => clearTimeout(timer);
   }, [snapshot.controlRejection?.id, t]);
+
+  useEffect(() => {
+    if (!snapshot.modeError) return;
+    const id = Date.now();
+    setControlNotice({
+      id,
+      text: t('remote_desktop.failed', { reason: snapshot.modeError }),
+    });
+    const timer = setTimeout(() => {
+      setControlNotice((current) => (current?.id === id ? null : current));
+    }, CONTROL_NOTICE_MS);
+    return () => clearTimeout(timer);
+  }, [snapshot.modeError, t]);
 
   // A finished clipboard action (copied/pasted/empty/failed) is a toast, not a
   // permanent toolbar fixture: fade it back to idle on its own so the button
@@ -3318,7 +3331,9 @@ export function RemoteDesktopPanel({
                           maxHeight: Number((event.target as HTMLSelectElement).value) as RemoteDesktopQualityPreference['maxHeight'],
                         })}
                       >
-                        {REMOTE_DESKTOP_QUALITY_MAX_HEIGHTS.map((height) => (
+                        {REMOTE_DESKTOP_QUALITY_MAX_HEIGHTS.filter((height) => (
+                          height === 0 || height >= REMOTE_DESKTOP_QUALITY_MIN_HEIGHT
+                        )).map((height) => (
                           <option key={height} value={String(height)}>
                             {height === 0
                               ? t('remote_desktop.quality_resolution_native')

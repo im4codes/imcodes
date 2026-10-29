@@ -574,6 +574,11 @@ export function FileBrowser({
   directoryQuery = false,
 }: FileBrowserProps) {
   const { t, i18n } = useTranslation();
+  // react-i18next may provide a new `t` function after every render. Keep
+  // preview callbacks stable: auto-preview effects depend on them, and a
+  // changing callback would re-dispatch the same chat preview indefinitely.
+  const tRef = useRef(t);
+  tRef.current = t;
   const uiLocale = i18n?.language || 'en';
   const includeFiles = mode !== 'dir-only';
   const scopedSessionName = scopeToSessionRoot ? sessionName : undefined;
@@ -730,6 +735,10 @@ export function FileBrowser({
   const previewScrollSnapshotRef = useRef<PreviewScrollSnapshot | null>(null);
   const mountedRef = useRef(true);
   const dismissedAutoPreviewPathRef = useRef<string | null>(null);
+  // A terminal error from the current request must not be treated as a fresh
+  // auto-preview target on every render, but an error supplied as the initial
+  // cached state must get one real retry when the chat opens it again.
+  const previewErrorPathRef = useRef<string | null>(null);
   const autoPreviewPathRef = useRef(autoPreviewPath);
   useEffect(() => { autoPreviewPathRef.current = autoPreviewPath; }, [autoPreviewPath]);
   const previewTabOverridePathRef = useRef<string | null>(null);
@@ -829,6 +838,22 @@ export function FileBrowser({
     pendingPreviewTimersRef.current.clear();
   }, []);
 
+  const finishPreviewError = useCallback((
+    path: string,
+    error: string,
+    downloadId?: string,
+  ) => {
+    previewErrorPathRef.current = path;
+    activePreviewCycleRef.current = null;
+    for (const [requestId, pending] of pendingGitDiffRef.current) {
+      if (pending.path === path) clearPendingPreviewRequest('diff', requestId);
+    }
+    for (const key of pendingPreviewDiffRef.current.keys()) {
+      if (key.endsWith(`\0${path}`)) pendingPreviewDiffRef.current.delete(key);
+    }
+    setPreview({ status: 'error', path, error, ...(downloadId ? { downloadId } : {}) });
+  }, [clearPendingPreviewRequest]);
+
   const handlePreviewRequestTimeout = useCallback((kind: 'read' | 'diff', requestId: string) => {
     const request = clearPendingPreviewRequest(kind, requestId);
     if (!request || !mountedRef.current) return;
@@ -839,9 +864,8 @@ export function FileBrowser({
     if (kind === 'diff') return;
     const active = getActivePreviewCycle();
     if (!active || active.path !== request.path || active.cycleId !== request.cycleId) return;
-    activePreviewCycleRef.current = null;
-    setPreview({ status: 'error', path: request.path, error: t('file_browser.preview_error') });
-  }, [clearPendingPreviewRequest, getActivePreviewCycle, t]);
+    finishPreviewError(request.path, tRef.current('file_browser.preview_error'));
+  }, [clearPendingPreviewRequest, finishPreviewError, getActivePreviewCycle]);
 
   const trackPendingPreviewRequest = useCallback((
     kind: 'read' | 'diff',
@@ -906,11 +930,11 @@ export function FileBrowser({
         // nothing over the wire, guaranteeing the retry also times out.
         ws.forgetOwnedDataRequest(requestId);
         setData((prev) => updateNode(prev, nodePath, { isLoading: false }));
-        setError(t('file_browser.timeout_detail', { defaultValue: t('file_browser.timeout') }));
+        setError(tRef.current('file_browser.timeout_detail', { defaultValue: tRef.current('file_browser.timeout') }));
       }
     }, REQUEST_TIMEOUT_MS);
     timersRef.current.set(requestId, timer);
-  }, [directoryQuery, includeFiles, listView, scopedSessionName, showHidden, t, ws]);
+  }, [directoryQuery, includeFiles, listView, scopedSessionName, showHidden, ws]);
 
   // Ask for a directory again with the sort/filter now in force, replacing a
   // request still in flight for it: only the answer to the LAST ask is ever
@@ -946,7 +970,8 @@ export function FileBrowser({
         const loadingPath = previewRef.current.status === 'loading' ? previewRef.current.path : null;
         activePreviewCycleRef.current = null;
         if (loadingPath) {
-          setPreview({ status: 'error', path: loadingPath, error: t('file_browser.preview_error') });
+          previewErrorPathRef.current = loadingPath;
+          setPreview({ status: 'error', path: loadingPath, error: tRef.current('file_browser.preview_error') });
         }
         // Re-fetch root and changes
         if (mountedRef.current) fetchDir(startPath);
@@ -1093,7 +1118,7 @@ export function FileBrowser({
           const errKey = msg.error === FS_READ_ERROR_CODES.FILE_TOO_LARGE ? 'file_browser.preview_too_large'
             : msg.error === FS_READ_ERROR_CODES.FORBIDDEN_PATH ? 'file_browser.preview_error'
             : 'file_browser.preview_error';
-          setPreview({ status: 'error', path: filePath, error: t(errKey), downloadId: dlId });
+          finishPreviewError(filePath, t(errKey), dlId);
           return;
         }
         previewRefreshBackoffUntilRef.current = 0;
@@ -1121,7 +1146,7 @@ export function FileBrowser({
               if (!mountedRef.current) return;
               const stillActive = getActivePreviewCycle(filePath);
               if (!stillActive || stillActive.cycleId !== pending.cycleId) return;
-              setPreview({ status: 'error', path: filePath, error: t('file_browser.preview_error'), downloadId: dlId });
+              finishPreviewError(filePath, t('file_browser.preview_error'), dlId);
             });
           return;
         }
@@ -1145,7 +1170,7 @@ export function FileBrowser({
               if (!mountedRef.current) return;
               const stillActive = getActivePreviewCycle(filePath);
               if (!stillActive || stillActive.cycleId !== pending.cycleId) return;
-              setPreview({ status: 'error', path: filePath, error: t('file_browser.preview_error'), downloadId: dlId });
+              finishPreviewError(filePath, t('file_browser.preview_error'), dlId);
             });
           return;
         }
@@ -1167,7 +1192,7 @@ export function FileBrowser({
               if (!mountedRef.current) return;
               const stillActive = getActivePreviewCycle(filePath);
               if (!stillActive || stillActive.cycleId !== pending.cycleId) return;
-              setPreview({ status: 'error', path: filePath, error: t('file_browser.preview_error'), downloadId: dlId });
+              finishPreviewError(filePath, t('file_browser.preview_error'), dlId);
             });
           return;
         }
@@ -1193,7 +1218,7 @@ export function FileBrowser({
               if (!mountedRef.current) return;
               const stillActive = getActivePreviewCycle(filePath);
               if (!stillActive || stillActive.cycleId !== pending.cycleId) return;
-              setPreview({ status: 'error', path: filePath, error: t('file_browser.preview_error'), downloadId: dlId });
+              finishPreviewError(filePath, t('file_browser.preview_error'), dlId);
             });
           return;
         }
@@ -1205,13 +1230,13 @@ export function FileBrowser({
         // so any streamed response that reaches here cannot be rendered and must
         // say so instead of pretending to be an empty document.
         if ((msg as { previewMode?: string }).previewMode === 'stream') {
-          setPreview({ status: 'error', path: filePath, error: t('file_browser.preview_error'), downloadId: dlId });
+          finishPreviewError(filePath, t('file_browser.preview_error'), dlId);
           return;
         }
 
         const content = msg.content ?? '';
         if (isBinaryContent(content)) {
-          setPreview({ status: 'error', path: filePath, error: t('file_browser.preview_binary'), downloadId: dlId });
+          finishPreviewError(filePath, t('file_browser.preview_binary'), dlId);
           return;
         }
 
@@ -1386,7 +1411,7 @@ export function FileBrowser({
         return;
       }
     });
-  }, [clearAllPendingPreviewRequests, clearPendingPreviewRequest, fetchDir, getActivePreviewCycle, onDirectoryCreated, sessionName, startPath, showHidden, highlightPath, t, ws]);
+  }, [clearAllPendingPreviewRequests, clearPendingPreviewRequest, fetchDir, finishPreviewError, getActivePreviewCycle, onDirectoryCreated, sessionName, startPath, showHidden, highlightPath, t, ws]);
 
   const fetchPreview = useCallback((
     filePath: string,
@@ -1394,9 +1419,10 @@ export function FileBrowser({
     requestedViewMode?: HtmlPreviewViewMode,
   ) => {
     const nextViewMode = requestedViewMode ?? (preferDiff ? 'diff' : 'source');
+    previewErrorPathRef.current = null;
     const shouldFetchDiff = nextViewMode !== 'html-render';
     if (editDirtyRef.current) {
-      if (!window.confirm(t('fileBrowser.unsavedChanges'))) return;
+      if (!window.confirm(tRef.current('fileBrowser.unsavedChanges'))) return;
     }
     // Keep the left tree in sync with the previewed file without discarding the
     // user's expanded tree. If the file's parent already exists in the current
@@ -1460,7 +1486,7 @@ export function FileBrowser({
       const diffId = scopedSessionName ? ws.fsGitDiff(filePath, scopedSessionName) : ws.fsGitDiff(filePath);
       trackPendingPreviewRequest('diff', diffId, { path: filePath, cycleId, reason: 'interactive' });
     }
-  }, [autoPreviewPath, fetchDir, getActivePreviewCycle, hasPendingPreviewWork, onPreviewFile, onPreviewStateChange, scopedSessionName, t, trackPendingPreviewRequest, ws]);
+  }, [autoPreviewPath, fetchDir, getActivePreviewCycle, hasPendingPreviewWork, onPreviewFile, onPreviewStateChange, scopedSessionName, trackPendingPreviewRequest, ws]);
 
   const [expandedPaths, setExpandedPaths] = useState<Set<string>>(() => new Set([startPath]));
 
@@ -1699,6 +1725,10 @@ export function FileBrowser({
     if (dismissedAutoPreviewPathRef.current === autoPreviewPath) return;
     const currentPreviewPath = preview.status !== 'idle' ? (preview as { path: string }).path : null;
     if (currentPreviewPath === autoPreviewPath && preview.status !== 'idle') {
+      if (preview.status === 'error' && previewErrorPathRef.current !== autoPreviewPath) {
+        fetchPreview(autoPreviewPath, autoPreviewPreferDiff, initialPreviewViewMode);
+        return;
+      }
       if (previewTabOverridePathRef.current !== autoPreviewPath) {
         const nextMode = initialPreviewViewMode ?? (autoPreviewPreferDiff ? 'diff' : 'source');
         setPreviewViewMode(nextMode);
@@ -2271,6 +2301,7 @@ export function FileBrowser({
           dismissPreview();
         }}>←</button>
         <span class="fb-preview-name">{previewPath!.split(/[/\\]/).pop()}</span>
+        <div class="fb-preview-actions">
         {preview.status === 'ok' && !isEditing && !readOnly && (
           <button class="fb-diff-toggle" onClick={() => {
             setIsEditing(true);
@@ -2390,6 +2421,7 @@ export function FileBrowser({
             {t('fileBrowser.insertPath')}
           </button>
         )}
+        </div>
         <button class="fb-close" onClick={() => {
           dismissPreview();
         }}>✕</button>
