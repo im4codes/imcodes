@@ -181,7 +181,7 @@ describe('CronManager', () => {
   });
 
   it('scopes a whole-server participant to the selected server and keeps all controls editable', async () => {
-    apiFetch.mockResolvedValueOnce({ jobs: [cronJob()] });
+    apiFetch.mockResolvedValueOnce({ jobs: [cronJob(), cronJob({ id: 'job-other-project', name: 'Other project job', project_name: 'other' })] });
 
     render(
       <CronManager
@@ -197,11 +197,37 @@ describe('CronManager', () => {
     );
 
     expect(await screen.findByText('Current job')).toBeDefined();
-    expect(apiFetch).toHaveBeenCalledWith('/api/cron?serverId=srv-current&projectName=cd');
+    expect(await screen.findByText('Other project job')).toBeDefined();
+    expect(apiFetch).toHaveBeenCalledWith('/api/cron?serverId=srv-current');
     expect(screen.getByTitle('cron.create')).toBeDefined();
-    for (const label of ['▶', '✎', '✕']) {
-      expect((screen.getByText(label) as HTMLButtonElement).disabled).toBe(false);
-    }
+    expect((screen.getAllByText('▶')[0] as HTMLButtonElement).disabled).toBe(false);
+    expect((screen.getAllByText('✎')[0] as HTMLButtonElement).disabled).toBe(false);
+    expect((screen.getAllByText('✕')[0] as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it('lists whole-server jobs for a shared viewer without inheriting the active session', async () => {
+    apiFetch.mockResolvedValueOnce({ jobs: [cronJob(), cronJob({ id: 'job-other-project', name: 'Other project job', project_name: 'other' })] });
+
+    render(
+      <CronManager
+        serverId="srv-current"
+        projectName="cd"
+        sessions={sessions}
+        subSessions={subSessions}
+        activeSession="deck_cd_brain"
+        sharedScope
+        readOnly
+        onBack={vi.fn()}
+      />,
+    );
+
+    expect(await screen.findByText('Current job')).toBeDefined();
+    expect(await screen.findByText('Other project job')).toBeDefined();
+    expect(apiFetch).toHaveBeenCalledWith('/api/cron?serverId=srv-current');
+    expect(screen.queryByTitle('cron.create')).toBeNull();
+    expect((screen.getAllByText('▶')[0] as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getAllByText('✎')[0] as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getAllByText('✕')[0] as HTMLButtonElement).disabled).toBe(true);
   });
 
   it('renders other-tab jobs as read-only', async () => {

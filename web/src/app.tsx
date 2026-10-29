@@ -3249,7 +3249,7 @@ export function App() {
         ? `deck_sub_${selectedShareTarget.subSessionId}`
         : selectedShareTarget.kind === 'main'
           ? selectedShareTarget.sessionName
-          : (activeSession ?? undefined))
+          : undefined)
     : undefined;
   const { subSessions, visibleSubSessions, loadedServerId, create: createSubSession, close: closeSubSession, restart: restartSubSession, rename: renameSubSession, updateLocal: updateSubLocal, hydrateShared: hydrateSharedSubSessions } = useSubSessions(
     (nativeReady && auth) ? selectedServerId : null,
