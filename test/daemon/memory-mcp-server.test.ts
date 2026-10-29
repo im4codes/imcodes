@@ -766,7 +766,7 @@ describe('memory MCP stdio server', () => {
       });
       expect(replacement.structuredContent).toMatchObject({
         activatedGroups: ['scheduling'],
-        groups: [expect.objectContaining({ id: 'scheduling', toolCount: 7, active: true })],
+        groups: [expect.objectContaining({ id: 'scheduling', toolCount: 11, active: true })],
       });
       expect(publish).toHaveBeenCalledTimes(3);
       const replacementNames = (await client.listTools()).tools.map((tool) => tool.name);
@@ -811,7 +811,7 @@ describe('memory MCP stdio server', () => {
         arguments: { query: 'scheduled work', activate: false },
       });
       expect(phrase.structuredContent).toMatchObject({
-        groups: [expect.objectContaining({ id: 'scheduling', toolCount: 7 })],
+        groups: [expect.objectContaining({ id: 'scheduling', toolCount: 11 })],
       });
 
       const unknown = await client.callTool({
