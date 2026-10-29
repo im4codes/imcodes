@@ -1468,8 +1468,17 @@ class VideoToolboxH264Encoder::Impl {
       int level = 0;
       {
         std::lock_guard lock(speed_->mutex);
+        // Ultra/4K is an explicit resolution contract. It may shed frame rate
+        // or bitrate under pressure, but the encoder backlog governor must not
+        // silently turn it into a 1440p/1080p stream.
+        const bool preserve_ultra_resolution =
+            std::strcmp(effective.id, "2160p30") == 0 ||
+            std::strcmp(effective.id, "2160p15") == 0;
         speed_->governor.SetMaxLevel(
-            imcodes::rd::MaxEncodeSpeedLevel(effective.width, effective.height));
+            preserve_ultra_resolution
+                ? 0
+                : imcodes::rd::MaxEncodeSpeedLevel(effective.width,
+                                                   effective.height));
         level = speed_->governor.level();
         speed_->level.store(level, std::memory_order_relaxed);
       }
