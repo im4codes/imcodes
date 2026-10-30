@@ -1,4 +1,7 @@
 {
+  "task_pair": {
+    "reference_picker": "ペアタスク"
+  },
   "alias": {
     "feature_label": "エイリアス",
     "category": "エイリアス",

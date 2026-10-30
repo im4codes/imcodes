@@ -1,4 +1,7 @@
 {
+  "task_pair": {
+    "reference_picker": "페어 작업"
+  },
   "alias": {
     "feature_label": "별칭",
     "category": "별칭",

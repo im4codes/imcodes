@@ -1,4 +1,7 @@
 {
+  "task_pair": {
+    "reference_picker": "Pair tasks"
+  },
   "alias": {
     "feature_label": "Alias",
     "category": "Alias",

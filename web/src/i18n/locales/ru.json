@@ -1,4 +1,7 @@
 {
+  "task_pair": {
+    "reference_picker": "Задачи пар"
+  },
   "alias": {
     "feature_label": "Псевдоним",
     "category": "Псевдоним",

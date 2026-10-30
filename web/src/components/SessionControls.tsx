@@ -49,6 +49,7 @@ import { buildMachineSendExtra } from '../util/machine-send.js';
 import { matchInlineMachineTrigger, stripInlineMachineTrigger } from '../util/machine-trigger.js';
 import { MACHINE_IDENTITY_UNAVAILABLE } from '@shared/machine-reference.js';
 import { parseAliasMarkers } from '@shared/alias-types.js';
+import { filterTaskPairReferences, matchTaskPairReferenceTrigger, openTaskPairReferences, replaceTaskPairReferenceTrigger, type TaskPairReference } from '../util/task-pair-reference.js';
 import { CODEX_FAST_OFF_COMMAND, isCodexFastServiceTier } from '@shared/codex-service-tier.js';
 import { isInsufficientCapacityError } from '../upload-error.js';
 import { MobileDpad, DPAD_ARROW_SEQUENCES } from './MobileDpad.js';
@@ -1274,6 +1275,12 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   // Set for the input event immediately following a paste so pasted text ending
   // in `^name` never opens the inline machine picker (paste must not trigger).
   const machinePasteSuppressRef = useRef(false);
+  const [taskPairReferences, setTaskPairReferences] = useState<TaskPairReference[]>([]);
+  const [taskPairPickerOpen, setTaskPairPickerOpen] = useState(false);
+  const [taskPairQuery, setTaskPairQuery] = useState('');
+  const [taskPairHighlightIdx, setTaskPairHighlightIdx] = useState(0);
+  const taskPairPickerRef = useRef<HTMLDivElement>(null);
+  const taskPairJustClosedRef = useRef(false);
   // Quick phrases are user-input affordances. Programmatic composer writes and
   // paste may contain attachment-like `#...` text, so suppress their one
   // corresponding input event without disabling later keyboard edits.
@@ -1287,6 +1294,39 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     setQuickSuggestionQuery('');
     setQuickSuggestionHighlightIdx(0);
   }, []);
+  useEffect(() => {
+    const onSnapshot = (event: Event) => {
+      const detail = (event as CustomEvent).detail;
+      if (detail?.scopeReset || detail?.authorityUnavailable) {
+        setTaskPairReferences([]);
+        setTaskPairPickerOpen(false);
+        setTaskPairQuery('');
+        return;
+      }
+      setTaskPairReferences(openTaskPairReferences(detail));
+    };
+    window.addEventListener('supervision:task-pairs', onSnapshot);
+    return () => window.removeEventListener('supervision:task-pairs', onSnapshot);
+  }, []);
+  useEffect(() => {
+    setTaskPairReferences([]);
+    setTaskPairPickerOpen(false);
+    setTaskPairQuery('');
+  }, [serverId, activeSession?.name]);
+  const filteredTaskPairReferences = useMemo(
+    () => filterTaskPairReferences(taskPairReferences, taskPairQuery),
+    [taskPairReferences, taskPairQuery],
+  );
+  const {
+    activeIndex: activeTaskPairIndex,
+    handleNavigationKey: handleTaskPairNavigationKey,
+  } = useListboxNavigation({
+    activeIndex: taskPairHighlightIdx,
+    containerRef: taskPairPickerRef,
+    itemCount: filteredTaskPairReferences.length,
+    open: taskPairPickerOpen,
+    setActiveIndex: setTaskPairHighlightIdx,
+  });
   useEffect(() => {
     if (!serverId) { setAgentSkills([]); return; }
     let cancelled = false;
@@ -3222,6 +3262,12 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     syncMobileComposerMetrics();
   }, [publishComposerText, syncMobileComposerMetrics]);
 
+  const insertTaskPairReference = useCallback((title: string) => {
+    const el = divRef.current;
+    const current = el ? readComposerElementText(el) : '';
+    fillInput(replaceTaskPairReferenceTrigger(current, title));
+  }, [fillInput]);
+
   /**
    * Insert a `^^(nodeId)-(displayName)` machine reference at the caret via the
    * shared helper (stable marker plus render-only note; never resolves or sends),
@@ -5135,6 +5181,28 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       }
     }
 
+    if (taskPairPickerOpen) {
+      if (handleTaskPairNavigationKey(e)) return;
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        e.stopPropagation();
+        setTaskPairPickerOpen(false);
+        setTaskPairQuery('');
+        return;
+      }
+      if ((e.key === 'Tab' || e.key === 'Enter') && filteredTaskPairReferences.length > 0) {
+        e.preventDefault();
+        e.stopPropagation();
+        const chosen = filteredTaskPairReferences[activeTaskPairIndex];
+        setTaskPairPickerOpen(false);
+        setTaskPairQuery('');
+        taskPairJustClosedRef.current = true;
+        setTimeout(() => { taskPairJustClosedRef.current = false; }, 150);
+        if (chosen) insertTaskPairReference(chosen.title);
+        return;
+      }
+    }
+
     if (e.key === 'Escape' && handleTransportEscapeCancel(e)) {
       return;
     }
@@ -5152,6 +5220,11 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     if (e.key === 'Enter' && aliasJustClosedRef.current) {
       e.preventDefault();
       aliasJustClosedRef.current = false;
+      return;
+    }
+    if (e.key === 'Enter' && taskPairJustClosedRef.current) {
+      e.preventDefault();
+      taskPairJustClosedRef.current = false;
       return;
     }
 
@@ -7526,6 +7599,35 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
           );
         })()}
 
+        {taskPairPickerOpen && filteredTaskPairReferences.length > 0 && (
+          <div ref={taskPairPickerRef} class="controls-task-pair-picker" role="listbox" aria-label={t('task_pair.reference_picker')} style={aliasPickerContainerStyle}>
+            <div style={aliasPickerGroupLabelStyle}>{t('task_pair.reference_picker')} {taskPairQuery ? `— "${taskPairQuery}"` : ''}</div>
+            {filteredTaskPairReferences.map((task, idx) => {
+              const highlighted = idx === activeTaskPairIndex;
+              return (
+                <div
+                  key={task.taskId}
+                  role="option"
+                  aria-selected={highlighted ? 'true' : 'false'}
+                  data-task-pair-title={task.title}
+                  style={highlighted ? aliasPickerItemHighlightStyle : aliasPickerItemStyle}
+                  onMouseDown={(event) => {
+                    event.preventDefault();
+                    setTaskPairPickerOpen(false);
+                    setTaskPairQuery('');
+                    taskPairJustClosedRef.current = true;
+                    setTimeout(() => { taskPairJustClosedRef.current = false; }, 150);
+                    insertTaskPairReference(task.title);
+                  }}
+                  onMouseEnter={() => setTaskPairHighlightIdx(idx)}
+                >
+                  <span style={{ fontWeight: 500, color: '#e2e8f0' }}>{task.title}</span>
+                </div>
+              );
+            })}
+          </div>
+        )}
+
         {/*
           contenteditable div — iOS does NOT show the password/keychain autofill bar
           for contenteditable elements, unlike <input> or <textarea>.
@@ -7708,6 +7810,19 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
               } else if (machinePickerOpen) {
                 setMachinePickerOpen(false);
                 setMachineQuery('');
+              }
+
+              const taskPairTrigger = inputIsComposing ? null : matchTaskPairReferenceTrigger(text);
+              const taskPairMatches = taskPairTrigger === null
+                ? []
+                : filterTaskPairReferences(taskPairReferences, taskPairTrigger);
+              if (taskPairTrigger !== null && taskPairMatches.length > 0) {
+                setTaskPairQuery(taskPairTrigger);
+                setTaskPairHighlightIdx(0);
+                setTaskPairPickerOpen(true);
+              } else if (taskPairPickerOpen) {
+                setTaskPairPickerOpen(false);
+                setTaskPairQuery('');
               }
             }}
             onKeyDown={handleKeyDown}

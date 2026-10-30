@@ -1,4 +1,7 @@
 {
+  "task_pair": {
+    "reference_picker": "Pair 任务"
+  },
   "alias": {
     "feature_label": "别名",
     "category": "别名",
