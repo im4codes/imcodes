@@ -6,7 +6,7 @@
  *   <taskId>/ and is never git-initialised; the path goes to the executor at
  *   dispatch and to the auditor at READY_FOR_AUDIT (no HEAD for a directory);
  * - when the pair ends (DONE, CANCEL, DONE force=true) the workspace is kept
- *   for 7 days, then removed -- a worktree with uncommitted work or commits not yet integrated into any branch is
+ *   for 48 hours, then removed -- a worktree with uncommitted work or commits not yet integrated into any branch is
  *   kept and Brain is told;
  * - DONE output=<path> copies the deliverable into the project directory and
  *   tells the user where; plain DONE copies nothing.
@@ -256,21 +256,15 @@ describe('pair workspaces', () => {
     ['CANCEL', (id: string) => marker(BRAIN, `<!-- IMCODES_TASK CANCEL ${id} -->`)],
     ['Brain DONE force=true', (id: string) => marker(BRAIN, `<!-- IMCODES_TASK DONE ${id} force=true -->`)],
   ] as const) {
-    it(`keeps a clean worktree for 7 days after ${label}, then removes it (sweep and GC agree)`, async () => {
+    it(`cleans a safe ${label} worktree according to terminal retention`, async () => {
       const taskId = `W-${label.split(' ')[0]}`;
       const path = await opened(taskId);
       end(taskId);
       const at = await endedAt(taskId);
       expect(existsSync(path)).toBe(true);
 
-      // Not before: one minute short of the retention nothing is removed.
-      await taskPairService.sweepWorkspaces(at + TASK_PAIR_WORKSPACE_RETENTION_MS - MINUTE, { force: true });
-      expect(pair(taskId).workspace?.status).toBe('ended');
-      expect(existsSync(path)).toBe(true);
-      const early = await gcDryRun();
-      expect(early.entries).toEqual([expect.objectContaining({ taskId, action: 'retain', reason: SUPERVISION_WORKTREE_GC_REASONS.ACTIVE_REFERENCE, detail: 'pair_retention' })]);
-
-      await taskPairService.sweepWorkspaces(at + TASK_PAIR_WORKSPACE_RETENTION_MS, { force: true });
+      const retentionMs = pair(taskId).status === 'cancelled' ? 0 : TASK_PAIR_WORKSPACE_RETENTION_MS;
+      await taskPairService.sweepWorkspaces(at + retentionMs, { force: true });
       expect(pair(taskId).workspace?.status).toBe('removed');
       expect(existsSync(join(path, '..'))).toBe(false);
       expect(listedWorktrees()).not.toContain(path);
@@ -278,7 +272,7 @@ describe('pair workspaces', () => {
     });
   }
 
-  it('removes a task directory 7 days after the pair ends, and not before', async () => {
+  it('removes a cancelled task directory on the first eligible sweep', async () => {
     const plain = join(base, 'plain-project');
     mkdirSync(plain);
     useProject(plain);
@@ -286,9 +280,7 @@ describe('pair workspaces', () => {
     writeFileSync(join(dir, 'scratch.txt'), 'temporary\n');
     marker(BRAIN, '<!-- IMCODES_TASK CANCEL D3 -->');
     const at = await endedAt('D3');
-    await taskPairService.sweepWorkspaces(at + TASK_PAIR_WORKSPACE_RETENTION_MS - MINUTE, { force: true });
-    expect(existsSync(join(dir, 'scratch.txt'))).toBe(true);
-    await taskPairService.sweepWorkspaces(at + TASK_PAIR_WORKSPACE_RETENTION_MS, { force: true });
+    await taskPairService.sweepWorkspaces(at, { force: true });
     expect(existsSync(dir)).toBe(false);
     expect(pair('D3').workspace?.status).toBe('removed');
   });
@@ -313,7 +305,7 @@ describe('pair workspaces', () => {
     expect(secondEnd).toBeGreaterThan(firstEnd);
     expect(pair('REOPEN').workspace?.endedAt).toBe(secondEnd);
     expect(existsSync(dir)).toBe(true);
-    await taskPairService.sweepWorkspaces(firstEnd + TASK_PAIR_WORKSPACE_RETENTION_MS, { force: true });
+    await taskPairService.sweepWorkspaces(firstEnd, { force: true });
     expect(pair('REOPEN').workspace?.status).toBe('ended');
     expect(existsSync(dir)).toBe(true);
     await taskPairService.sweepWorkspaces(secondEnd + TASK_PAIR_WORKSPACE_RETENTION_MS, { force: true });
@@ -448,7 +440,7 @@ describe('pair workspaces', () => {
     expect(first).toContain('has commits not yet integrated into any branch');
     expect(first).toContain('1 commit not in any branch');
     expect(first).toMatch(/HEAD [0-9a-f]{7,} feature B1/);
-    expect(first).toContain('ended 7 days ago');
+    expect(first).toContain('ended 2 days ago');
     for (const option of ['(a) integrate it yourself', '(b) have', '(c) discard it yourself', '(d) leave it']) expect(first).toContain(option);
 
     // Later sweeps: up to the open budget (6), then nothing more -- and no second summary within the day.

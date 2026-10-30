@@ -6,6 +6,7 @@ import type { MemorySearchQuery, MemorySearchResultItem } from '../context/memor
 import { searchLocalMemoryForManagement, searchLocalMemorySemanticForManagement } from '../context/memory-recall-client.js';
 import { projectionOwnerCache } from './memory-projection-owner-cache.js';
 import { daemonServerAuthHeaders } from '../../shared/daemon-server-auth.js';
+import { isMemoryDaemonEnabled } from '../store/memory-daemon-switch.js';
 
 export type MemoryMcpListProjectionClass = Extract<ProcessedContextClass, 'recent_summary' | 'durable_memory_candidate'>;
 
@@ -390,6 +391,7 @@ function dedupeSummaryListAndLimit(items: MemoryMcpSearchHit[], limit: number): 
 }
 
 export async function searchMcpMemoryRecall(query: MemorySearchQuery, options: MemoryMcpSearchOptions = {}): Promise<MemoryMcpSearchResult> {
+  if (!isMemoryDaemonEnabled()) return { items: [] };
   const limit = clampLimit(query.limit);
   const requestedProjectId = currentProjectId(query);
   if (!requestedProjectId) return { items: [] };
@@ -437,6 +439,7 @@ export async function searchMcpMemoryRecall(query: MemorySearchQuery, options: M
 }
 
 export async function listMcpMemorySummaries(query: MemoryMcpListSummariesQuery, options: MemoryMcpSearchOptions = {}): Promise<MemoryMcpSearchResult> {
+  if (!isMemoryDaemonEnabled()) return { items: [] };
   const limit = clampListLimit(query.limit);
   const requestedProjectId = currentProjectId(query);
   if (!requestedProjectId) return { items: [] };

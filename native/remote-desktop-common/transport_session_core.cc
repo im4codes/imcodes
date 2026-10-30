@@ -449,7 +449,8 @@ bool TransportSessionCore::QualitySelectionIsValid(
   return !selection.preset_id.empty() && selection.preset_id.size() <= 64 &&
          selection.encoded_pixels.IsValid() && selection.frame_rate > 0 &&
          selection.frame_rate <= 240 && selection.bitrate_bps > 0 &&
-         selection.bitrate_bps <= limits_.maximum_quality_target_bps;
+         selection.bitrate_bps <= limits_.maximum_quality_target_bps &&
+         selection.meets_preference_floor;
 }
 
 bool TransportSessionCore::UpdateQualityTarget(
@@ -466,6 +467,10 @@ bool TransportSessionCore::UpdateQualityTarget(
 bool TransportSessionCore::ApplyQualityTarget(const QualityTarget& target) {
   QualityTarget effective = target;
   effective.preference = viewer_preference_;
+  if (effective.preference.minimum_bitrate_bps == 0) {
+    effective.preference.minimum_bitrate_bps =
+        viewer_preference_.max_bitrate_bps;
+  }
   // Until ICE proves the route direct, treat it as relayed: the operator's
   // relay ceiling is exactly what an unproven route must not exceed.
   effective.preference.max_bitrate_bps = imcodes::rd::EffectiveBitrateCap(
@@ -480,11 +485,17 @@ bool TransportSessionCore::ApplyQualityTarget(const QualityTarget& target) {
           imcodes::rd::ViewerVideoBitrateCeiling(viewer_preference_))
           .max_bps;
   if (!QualitySelectionIsValid(selection)) {
-    Terminate(TransportTerminalReason::kProtocolViolation);
+    // A viewer preference can be impossible under the current relay or
+    // aggregate cap. Reject that preference without tearing down the live
+    // peer; the caller reports a typed control rejection and keeps the last
+    // accepted quality. The same rule covers a transient encoder refusal.
     return false;
   }
   if (!adapter_.ApplyQuality(selection)) {
-    Terminate(TransportTerminalReason::kAdapterFailure);
+    // Reconfiguring an encoder is advisory and may fail transiently while a
+    // hardware session is rebuilding. A quality switch must never become a
+    // peer failure; retain the last applied selection and let a later target
+    // retry on the same route.
     return false;
   }
   quality_ = std::move(selection);
@@ -495,9 +506,14 @@ bool TransportSessionCore::ApplyQualityTarget(const QualityTarget& target) {
 bool TransportSessionCore::SetQualityPreference(
     const imcodes::rd::QualityPreference& preference) {
   if (!started_ || terminal_) return false;
+  const imcodes::rd::QualityPreference previous = viewer_preference_;
   viewer_preference_ = imcodes::rd::NormalizeQualityPreference(preference);
   if (!last_quality_target_) return true;
-  return ApplyQualityTarget(*last_quality_target_);
+  if (ApplyQualityTarget(*last_quality_target_)) return true;
+  // Keep the last known-good preference as well as the last known-good
+  // selection. A rejected request must not poison future congestion updates.
+  viewer_preference_ = previous;
+  return false;
 }
 
 bool TransportSessionCore::RecordActivity(

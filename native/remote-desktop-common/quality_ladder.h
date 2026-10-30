@@ -11,6 +11,10 @@ struct QualitySelection {
   int height;
   int fps;
   uint32_t bitrate_bps;
+  // False when an explicit viewer target floor could not fit the hard
+  // relay/aggregate cap. Consumers must report this instead of silently
+  // selecting a lower-quality rung.
+  bool meets_preference_floor = true;
 };
 
 // What the viewer asked for (per viewer: every viewer has its own encoder).
@@ -35,6 +39,9 @@ struct QualityPreference {
   // kMaxViewerVideoBitrateBps (Ultra: 4K text needs more than the default).
   uint32_t max_bitrate_bps = 0;
   QualityPriority priority = QualityPriority::kBalanced;
+  // Internal floor retained when a relay or aggregate cap tightens the
+  // effective ceiling. It is never serialized; zero derives from max_bitrate.
+  uint32_t minimum_bitrate_bps = 0;
 };
 
 // A normal desktop stream keeps at least one 1080p frame when the physical

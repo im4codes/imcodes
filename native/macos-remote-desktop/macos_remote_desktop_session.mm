@@ -61,6 +61,8 @@ class MacosSessionQualityLadder final : public common::QualityLadder {
                           static_cast<std::uint32_t>(selection.height)},
         static_cast<std::uint32_t>(selection.fps),
         selection.bitrate_bps,
+        0,
+        selection.meets_preference_floor,
     };
   }
 };

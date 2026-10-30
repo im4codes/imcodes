@@ -7,6 +7,7 @@ const mocks = vi.hoisted(() => ({
   ensureSessionFile: vi.fn().mockResolvedValue('/proj/rollout-seeded.jsonl'),
   upsertSession: vi.fn(),
   getSession: vi.fn(),
+  updateSessionState: vi.fn(),
   newSession: vi.fn().mockResolvedValue(undefined),
 }));
 
@@ -22,7 +23,16 @@ vi.mock('../../src/store/session-store.js', () => ({
   listSessions: vi.fn(() => []),
   upsertSession: mocks.upsertSession,
   getSession: mocks.getSession,
+  updateSessionState: mocks.updateSessionState,
 }));
+
+vi.mock('../../src/daemon/session-resource-service.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../src/daemon/session-resource-service.js')>();
+  return {
+    ...actual,
+    releaseSessionResources: vi.fn().mockResolvedValue({ released: 0, failed: 0 }),
+  };
+});
 
 vi.mock('../../src/agent/tmux.js', () => ({
   listSessions: vi.fn().mockResolvedValue([]),

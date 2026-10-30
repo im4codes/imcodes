@@ -100,6 +100,7 @@ export interface CronListInput {
   token?: string;
   actorId?: string;
 }
+export type CronStatus = 'active' | 'paused';
 
 export type CronMcpFailure =
   { status: 'error'; reason: MCPErrorReason; message: string };
@@ -380,3 +381,20 @@ export async function cronMcpList(
   if (result.status !== 'ok') return result;
   return { status: 'ok', body: result.body, limit };
 }
+
+export async function cronMcpSetStatus(
+  id: string,
+  status: CronStatus,
+  options: CronMcpClientOptions = {},
+): Promise<CronMcpResult<{ body: unknown }>> {
+  if (!id.trim()) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'id is required');
+  const identity = await getEndpoint(options);
+  if ('status' in identity) return identity;
+  return requestCron(identity.endpoint, identity.runtimeServerId, `/${encodeURIComponent(id)}/status`, {
+    method: 'PATCH',
+    body: JSON.stringify({ status }),
+  }, options);
+}
+
+export const cronMcpPause = (id: string, options?: CronMcpClientOptions) => cronMcpSetStatus(id, 'paused', options);
+export const cronMcpResume = (id: string, options?: CronMcpClientOptions) => cronMcpSetStatus(id, 'active', options);

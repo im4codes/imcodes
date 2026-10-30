@@ -9,6 +9,7 @@
 import { join } from 'node:path';
 
 import { EMBEDDING_MODEL, EMBEDDING_DTYPE, EMBEDDING_DIM } from '../../shared/embedding-config.js';
+import { isMemoryDaemonEnabled } from '../store/memory-daemon-switch.js';
 import logger from '../util/logger.js';
 import {
   isServerFallbackUnavailable,
@@ -619,6 +620,7 @@ export function getEmbeddingStatus(): import('../../shared/embedding-status.js')
  *   4. Direct generation via server offload or local engine.
  */
 export async function generateEmbedding(text: string): Promise<Float32Array | null> {
+  if (!isMemoryDaemonEnabled()) return null;
   const cached = embeddingCache.get(text);
   if (cached) return cached;
 
@@ -641,6 +643,7 @@ export async function generateEmbedding(text: string): Promise<Float32Array | nu
  */
 export async function generateEmbeddings(texts: string[]): Promise<(Float32Array | null)[]> {
   if (texts.length === 0) return [];
+  if (!isMemoryDaemonEnabled()) return texts.map(() => null);
 
   const results: (Float32Array | null | undefined)[] = texts.map((t) => embeddingCache.get(t));
   const missingIndices: number[] = [];
@@ -677,6 +680,7 @@ export async function generateEmbeddings(texts: string[]): Promise<(Float32Array
  * Check if the embedding model is available (loaded or loadable).
  */
 export async function isEmbeddingAvailable(): Promise<boolean> {
+  if (!isMemoryDaemonEnabled()) return false;
   const mode = getEmbeddingMode();
   if (mode === 'off') return false;
 

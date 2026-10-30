@@ -298,6 +298,26 @@ describe('daemon machine tool deps — fail-closed resolution (10.12 / 10.11)', 
     expect(r).toMatchObject({ outcome: 'completed', result: { ok: true, content: [{ text: 'ran:get_app_state@srv-win' }] } });
   });
 
+  it('group-shared read-only computer use remains available when execute is not granted', async () => {
+    const computerUse = vi.fn(async (opts: { targetServerId: string; tool: string }) => ({
+      outcome: 'completed' as const,
+      result: {
+        correlationId: 'cu-group-12345678', ok: true, tool: opts.tool,
+        content: [{ type: 'text' as const, text: 'ok' }], durationMs: 1,
+      },
+    }));
+    const deps = createDaemonMachineToolDeps({
+      loadCredential: async () => creds,
+      listMachines: async () => [m({ refName: 'group-only', execEnabled: false })],
+      computerUseCall: computerUse as never,
+    });
+    await expect(deps.computerUseCall?.({ machine: 'group-only', tool: 'list_apps' }))
+      .resolves.toMatchObject({ outcome: 'completed' });
+    expect(computerUse).toHaveBeenCalledWith(expect.objectContaining({ targetServerId: 'x', tool: 'list_apps' }));
+    await expect(deps.computerUseCall?.({ machine: 'group-only', tool: 'click', arguments: { x: 1, y: 1 } }))
+      .resolves.toMatchObject({ outcome: 'not_dispatched', reason: MCP_ERROR_REASONS.EXEC_DISABLED });
+  });
+
 
   it('computer-use local target runs on the imcodes daemon host even when unbound', async () => {
     const resourceOwner = {

@@ -215,6 +215,24 @@ beforeEach(() => {
 });
 
 describe('RemoteDesktopClient', () => {
+  it('does not let the latency guard lower an explicit Ultra resolution preference', () => {
+    const client = new RemoteDesktopClient('controlled-mac', { onSnapshot: vi.fn() });
+    const ultra = {
+      maxHeight: 2160,
+      maxFps: 30,
+      maxBitrateBps: 30_000_000,
+      priority: 'resolution',
+    } as const;
+    const internals = client as unknown as {
+      desiredQualityPreference: typeof ultra;
+      latencyGuardCapBps: number | null;
+      effectiveQualityPreference(): typeof ultra;
+    };
+    internals.desiredQualityPreference = ultra;
+    internals.latencyGuardCapBps = 1_200_000;
+    expect(internals.effectiveQualityPreference()).toEqual(ultra);
+  });
+
   it('preserves server retry guidance on an authorization error', async () => {
     let socket!: FakeSocket;
     const client = new RemoteDesktopClient('controlled-win', { onSnapshot: vi.fn() }, {
@@ -439,7 +457,7 @@ describe('RemoteDesktopClient', () => {
 
       expect(peers).toHaveLength(1);
       expect(client.current()).toMatchObject({
-        state: REMOTE_DESKTOP_STATE.RECONNECTING,
+        state: REMOTE_DESKTOP_STATE.DIRECT,
         stream,
         inputEnabled: false,
       });
@@ -1475,7 +1493,7 @@ describe('RemoteDesktopClient', () => {
     client.stop(REMOTE_DESKTOP_STOP_ORIGIN.USER_CLOSE);
   });
 
-  it('eases off only for a live picture that lags beyond its own path, never for a still screen or a steady far link', async () => {
+  it('keeps an explicit preset floor through still, steady, and lagging samples', async () => {
     const intervalSpy = vi.spyOn(globalThis, 'setInterval');
     let socket!: FakeSocket;
     let peer!: FakePeer;
@@ -1494,7 +1512,7 @@ describe('RemoteDesktopClient', () => {
       now: () => now,
       isDocumentVisible: () => true,
     });
-    const smooth = { maxHeight: 1080, maxFps: 30, maxBitrateBps: 0, priority: 'framerate' } as const;
+    const smooth = { maxHeight: 1080, maxFps: 30, maxBitrateBps: 6_000_000, priority: 'framerate' } as const;
     expect(client.setQualityPreference(smooth)).toBe(true);
     expect(client.setQualityPreference({ ...smooth, maxFps: 45 } as never)).toBe(false);
 
@@ -1538,7 +1556,7 @@ describe('RemoteDesktopClient', () => {
     await vi.waitFor(() => expect(qualityControls()).toHaveLength(1));
     expect(qualityControls()[0]).toMatchObject({
       type: REMOTE_DESKTOP_DATA_MSG.CONTROL,
-      maxHeight: 1080, maxFps: 30, maxBitrateBps: 0, priority: 'framerate',
+      maxHeight: 1080, maxFps: 30, maxBitrateBps: 6_000_000, priority: 'framerate',
     });
     // Repeated status frames do not resend an unchanged preference.
     socket.receive({ ...status, qualityPreference: true });
@@ -1573,14 +1591,17 @@ describe('RemoteDesktopClient', () => {
     // The same far link with a moving picture: steady, so still no ceiling.
     for (let i = 9; i <= 16; i += 1) await sample(i, 0.3, 30, 0.02, 250_000);
     expect(qualityControls()).toHaveLength(baseline);
-    // Round trips climb 250 ms above that path's own floor: now it lags.
+    // Round trips climb 250 ms above that path's own floor. The native worker
+    // must report an explicit cannot-satisfy result rather than the browser
+    // silently lowering this named preset's floor.
     for (let i = 17; i <= 20; i += 1) await sample(i, 0.55, 30, 0.02, 250_000);
-    await vi.waitFor(() => expect(qualityControls().length).toBeGreaterThan(baseline));
-    expect(qualityControls().at(-1)!.maxBitrateBps).toBe(1_200_000);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(qualityControls()).toHaveLength(baseline);
+    expect(qualityControls().at(-1)!.maxBitrateBps).toBe(6_000_000);
     client.stop();
   });
 
-  it('sends this viewer\'s quality preference only to a capable worker and eases the bitrate off when the picture lags', async () => {
+  it('sends this viewer\'s quality floor only to a capable worker and never lowers it for latency', async () => {
     const intervalSpy = vi.spyOn(globalThis, 'setInterval');
     let socket!: FakeSocket;
     let peer!: FakePeer;
@@ -1599,7 +1620,7 @@ describe('RemoteDesktopClient', () => {
       now: () => now,
       isDocumentVisible: () => true,
     });
-    const smooth = { maxHeight: 1080, maxFps: 30, maxBitrateBps: 0, priority: 'framerate' } as const;
+    const smooth = { maxHeight: 1080, maxFps: 30, maxBitrateBps: 6_000_000, priority: 'framerate' } as const;
     expect(client.setQualityPreference(smooth)).toBe(true);
     expect(client.setQualityPreference({ ...smooth, maxFps: 45 } as never)).toBe(false);
 
@@ -1643,7 +1664,7 @@ describe('RemoteDesktopClient', () => {
     await vi.waitFor(() => expect(qualityControls()).toHaveLength(1));
     expect(qualityControls()[0]).toMatchObject({
       type: REMOTE_DESKTOP_DATA_MSG.CONTROL,
-      maxHeight: 1080, maxFps: 30, maxBitrateBps: 0, priority: 'framerate',
+      maxHeight: 1080, maxFps: 30, maxBitrateBps: 6_000_000, priority: 'framerate',
     });
     // Repeated status frames do not resend an unchanged preference.
     socket.receive({ ...status, qualityPreference: true });
@@ -1668,10 +1689,11 @@ describe('RemoteDesktopClient', () => {
       await new Promise((resolve) => setTimeout(resolve, 0));
     };
     for (let i = 1; i <= 6; i += 1) await sample(i, 0.4);
-    await vi.waitFor(() => expect(qualityControls().length).toBeGreaterThanOrEqual(2));
-    const eased = qualityControls()[1]!;
-    expect(eased.maxBitrateBps).toBe(1_200_000);
-    expect(eased).toMatchObject({ maxHeight: 1080, maxFps: 30, priority: 'framerate' });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(qualityControls()).toHaveLength(1);
+    expect(qualityControls()[0]).toMatchObject({
+      maxHeight: 1080, maxFps: 30, maxBitrateBps: 6_000_000, priority: 'framerate',
+    });
 
     // A hand-tuned custom preference is respected as is: no guard ceiling.
     const custom = { maxHeight: 1440, maxFps: 60, maxBitrateBps: 8_000_000, priority: 'resolution' } as const;
@@ -3204,7 +3226,7 @@ describe('RemoteDesktopClient translated shortcuts and paste', () => {
       if (message.kind === 'text') return `text ${message.text}`;
       return `${message.kind === 'key_down' ? 'down' : 'up'} ${message.code}`;
     });
-    return { client, control, keyboard, typed };
+    return { client, control, keyboard, typed, socket, peer };
   }
 
   const released = { control: false, alt: false };
@@ -3573,14 +3595,15 @@ describe('RemoteDesktopClient translated shortcuts and paste', () => {
       expect(baseline[0]).toMatchObject({ keys: '', buttons: '', inputEpoch: 1 });
     });
 
-    it('a control channel that closes fails the session; the held set is not re-sent into a dead channel and no timer outlives it', async () => {
-      const { client, control, declarations, ack } = await heldReadyClient();
+    it('recovers a transient control-channel close in place; the held set is not replayed', async () => {
+      const { client, control, declarations, ack, peer } = await heldReadyClient();
       client.key('ShiftLeft', 'Shift', true, false, { control: false, alt: false });
       ack();
       vi.advanceTimersByTime(REMOTE_DESKTOP_HELD_INPUT.SETTLE_MS);
       const before = declarations().length;
       control.close();
-      expect(client.current().state).toBe(REMOTE_DESKTOP_STATE.FAILED);
+      await vi.waitFor(() => expect(peer.offerOptions.at(-1)).toEqual({ iceRestart: true }));
+      expect(client.current().state).not.toBe(REMOTE_DESKTOP_STATE.FAILED);
       vi.advanceTimersByTime(REMOTE_DESKTOP_HELD_INPUT.REFRESH_MS * 10);
       expect(declarations()).toHaveLength(before);
     });
@@ -3614,6 +3637,16 @@ describe('RemoteDesktopClient translated shortcuts and paste', () => {
       vi.advanceTimersByTime(5 * 60_000);
       expect(client.current().state).not.toBe(REMOTE_DESKTOP_STATE.FAILED);
       expect(client.current().terminalReason).toBeUndefined();
+      client.stop(REMOTE_DESKTOP_STOP_ORIGIN.USER_CLOSE);
+    });
+
+    it('does not turn a delayed input ACK into a reconnect; it releases the native ledger instead', async () => {
+      const { client, control } = await heldReadyClient();
+      expect(client.key('KeyA', 'a', true, false, { control: false, alt: false })).toBe(true);
+      vi.advanceTimersByTime(3_001);
+      expect(client.current().state).not.toBe(REMOTE_DESKTOP_STATE.FAILED);
+      expect(control.sent.map((raw) => JSON.parse(raw).type))
+        .toContain(REMOTE_DESKTOP_DATA_MSG.RELEASE_ALL);
       client.stop(REMOTE_DESKTOP_STOP_ORIGIN.USER_CLOSE);
     });
 

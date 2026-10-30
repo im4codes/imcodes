@@ -51,6 +51,9 @@ QualityPreference NormalizeQualityPreference(QualityPreference preference) {
     preference.max_height =
         std::max(preference.max_height, kMinimumVideoHeight);
   }
+  if (preference.minimum_bitrate_bps == 0) {
+    preference.minimum_bitrate_bps = preference.max_bitrate_bps;
+  }
   return preference;
 }
 
@@ -195,6 +198,20 @@ QualitySelection SelectQuality(uint32_t target_bitrate_bps,
     }
   }
   if (preset == nullptr) preset = &kLadder.back();
+  // A non-zero viewer bitrate is an explicit target floor from the shared
+  // preset table. The relay/aggregate cap may make that impossible; preserve
+  // the diagnostic bit so the transport can reject it rather than silently
+  // downgrading the selected rung.
+  const uint32_t requested_bitrate_floor = normalized.minimum_bitrate_bps;
+  const bool bitrate_floor_met = requested_bitrate_floor == 0 ||
+                                 bounded_bitrate >= requested_bitrate_floor;
+  // Ultra is the one named mode whose minimum resolution exceeds the global
+  // 1080p floor. A smaller physical source is not upscaled; report that the
+  // explicit preference cannot be met instead of silently selecting 1080p.
+  const bool resolution_floor_met =
+      normalized.max_height != 2160 ||
+      (source_height >= 2160 && preset->height >= 2160);
+  const bool meets_preference_floor = bitrate_floor_met && resolution_floor_met;
   const double scale = std::min(
       {1.0, static_cast<double>(preset->width) / source_width,
        static_cast<double>(preset->height) / source_height});
@@ -204,6 +221,7 @@ QualitySelection SelectQuality(uint32_t target_bitrate_bps,
       EvenAtLeastTwo(static_cast<int>(std::floor(source_height * scale))),
       preset->fps,
       bounded_bitrate,
+      meets_preference_floor,
   };
 }
 

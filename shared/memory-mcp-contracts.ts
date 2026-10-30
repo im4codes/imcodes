@@ -160,6 +160,10 @@ export const MEMORY_MCP_TOOL_NAMES = {
   CRON_LIST: 'cron_list',
   CRON_UPDATE: 'cron_update',
   CRON_DELETE: 'cron_delete',
+  CRON_PAUSE_SELF: 'cron_pause_self',
+  CRON_RESUME_SELF: 'cron_resume_self',
+  CRON_PAUSE: 'cron_pause',
+  CRON_RESUME: 'cron_resume',
   // Machine remote-exec surface — FULL-only (see FULL_ONLY_MCP_TOOLS).
   LIST_MACHINES: 'list_machines',
   EXEC_REMOTE: 'exec_remote',
@@ -233,6 +237,10 @@ export const MEMORY_MCP_TOOL_NAME_LIST = [
   MEMORY_MCP_TOOL_NAMES.CRON_LIST,
   MEMORY_MCP_TOOL_NAMES.CRON_UPDATE,
   MEMORY_MCP_TOOL_NAMES.CRON_DELETE,
+  MEMORY_MCP_TOOL_NAMES.CRON_PAUSE_SELF,
+  MEMORY_MCP_TOOL_NAMES.CRON_RESUME_SELF,
+  MEMORY_MCP_TOOL_NAMES.CRON_PAUSE,
+  MEMORY_MCP_TOOL_NAMES.CRON_RESUME,
   MEMORY_MCP_TOOL_NAMES.LIST_MACHINES,
   MEMORY_MCP_TOOL_NAMES.EXEC_REMOTE,
   MEMORY_MCP_TOOL_NAMES.SEND_FILE_TO_MACHINE,
@@ -1335,6 +1343,10 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
     }, ['id']),
     outputSchema: statusSchema,
   },
+  [MEMORY_MCP_TOOL_NAMES.CRON_PAUSE_SELF]: { name: MEMORY_MCP_TOOL_NAMES.CRON_PAUSE_SELF, description: 'Pause a current-session cron job.', inputSchema: objectSchema({ id: stringSchema('Current-session job id.') }, ['id']), outputSchema: statusSchema },
+  [MEMORY_MCP_TOOL_NAMES.CRON_RESUME_SELF]: { name: MEMORY_MCP_TOOL_NAMES.CRON_RESUME_SELF, description: 'Resume a current-session cron job.', inputSchema: objectSchema({ id: stringSchema('Current-session job id.') }, ['id']), outputSchema: statusSchema },
+  [MEMORY_MCP_TOOL_NAMES.CRON_PAUSE]: { name: MEMORY_MCP_TOOL_NAMES.CRON_PAUSE, description: 'Pause a scoped cron job.', inputSchema: objectSchema({ id: stringSchema('Job id.') }, ['id']), outputSchema: statusSchema },
+  [MEMORY_MCP_TOOL_NAMES.CRON_RESUME]: { name: MEMORY_MCP_TOOL_NAMES.CRON_RESUME, description: 'Resume a scoped cron job.', inputSchema: objectSchema({ id: stringSchema('Job id.') }, ['id']), outputSchema: statusSchema },
   [MEMORY_MCP_TOOL_NAMES.LIST_MACHINES]: {
     name: MEMORY_MCP_TOOL_NAMES.LIST_MACHINES,
     description:

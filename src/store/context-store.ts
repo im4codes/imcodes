@@ -29,6 +29,7 @@ import { memoryTextMatchesQuery } from '../../shared/memory-search-text.js';
 import { countTokensFallback } from '../context/tokenizer.js';
 import { warnOncePerHour } from '../util/rate-limited-warn.js';
 import { incrementCounter } from '../util/metrics.js';
+import { assertMemoryDaemonEnabled, isMemoryDaemonEnabled } from './memory-daemon-switch.js';
 import { mergeSourceIds } from './source-id-merge.js';
 import { computeProjectionContentHash, projectionSemanticContent } from '../../shared/memory-content-hash.js';
 import {
@@ -3436,6 +3437,7 @@ export function recordContextEvent(input: Omit<LocalContextEvent, 'id' | 'create
     metadata: input.metadata,
     createdAt: input.createdAt ?? Date.now(),
   };
+  if (!isMemoryDaemonEnabled()) return event;
   const namespaceKey = serializeContextNamespace(event.target.namespace);
   const targetKey = serializeContextTarget(event.target);
   const namespaceColumns = namespaceFilterColumnValues(event.target.namespace);
@@ -3538,6 +3540,7 @@ export function ingestContextEvent(
   computeTriggerData: boolean,
 ): IngestContextEventResult {
   const event = recordContextEvent(input);
+  if (!isMemoryDaemonEnabled()) return { event, stagedTokenUpperBound: 0 };
   if (!computeTriggerData) return { event, stagedTokenUpperBound: 0 };
   const dirtyTarget = listDirtyTargets(input.target.namespace).find(
     (entry) => entry.target.kind === input.target.kind && entry.target.sessionName === input.target.sessionName,
@@ -3652,6 +3655,7 @@ export function queryPendingContextEvents(filters: {
 }
 
 export function enqueueContextJob(target: ContextTargetRef, jobType: ContextJobType, trigger: ContextJobTrigger, now = Date.now()): ContextJobRecord {
+  assertMemoryDaemonEnabled();
   clearPanelReadCache();
   const database = ensureDb();
   const targetKey = serializeContextTarget(target);
@@ -3964,6 +3968,7 @@ export function writeProcessedProjectionForDb(
 }
 
 export function writeProcessedProjection(input: WriteProcessedProjectionInput): ProcessedContextProjection {
+  assertMemoryDaemonEnabled();
   const database = ensureDb();
 
   // The explicit-id and fingerprint-upsert paths keep separate busy-retry
@@ -4044,6 +4049,7 @@ export interface MaterializationCommitResult {
  *  no lost/orphaned staged events). `compressWithSdk` runs BEFORE this, outside
  *  any transaction. */
 export function commitMaterialization(input: MaterializationCommitInput): MaterializationCommitResult {
+  assertMemoryDaemonEnabled();
   const database = ensureDb();
   let lastBusyError: unknown;
   for (let attempt = 0; attempt < 3; attempt++) {
@@ -4081,6 +4087,7 @@ export function commitMaterialization(input: MaterializationCommitInput): Materi
 }
 
 export function ensureContextNamespace(input: CanonicalNamespaceInput | ContextNamespace, now = Date.now()): ContextNamespaceRow {
+  assertMemoryDaemonEnabled();
   const database = ensureDb();
   return ensureContextNamespaceForDb(database, input, now);
 }
@@ -4110,6 +4117,7 @@ export function getContextNamespaceById(id: string): ContextNamespaceRow | null 
 }
 
 export function writeContextObservation(input: ContextObservationInput): ContextObservationRow {
+  assertMemoryDaemonEnabled();
   const database = ensureDb();
   database.exec('BEGIN IMMEDIATE');
   try {
@@ -4230,6 +4238,7 @@ export function updateContextObservationText(input: {
   updatedByUserId?: string;
   now?: number;
 }): ContextObservationRow | null {
+  assertMemoryDaemonEnabled();
   const database = ensureDb();
   const now = input.now ?? Date.now();
   const text = input.text.trim();
@@ -4453,6 +4462,7 @@ export function promoteContextObservation(input: {
   expectedFromScope?: MemoryScope;
   now?: number;
 }): ObservationPromotionAuditRow {
+  assertMemoryDaemonEnabled();
   const database = ensureDb();
   const now = input.now ?? Date.now();
   if (!OBSERVATION_PROMOTION_ACTIONS.has(input.action)) {
@@ -4676,6 +4686,7 @@ export function saveProjectionEmbedding(
   embedding: Buffer,
   source: string,
 ): void {
+  if (!isMemoryDaemonEnabled()) return;
   const database = ensureDb();
   database.prepare(
     'UPDATE context_processed_local SET embedding = ?, embedding_source = ? WHERE id = ?',
@@ -5098,7 +5109,7 @@ export function queryProcessedProjections(filters: ProcessedProjectionQuery = {}
 
 /** Increment hit_count and update last_used_at for a list of recalled projection IDs. */
 export function recordMemoryHits(ids: string[]): void {
-  if (ids.length === 0) return;
+  if (ids.length === 0 || !isMemoryDaemonEnabled()) return;
   const database = ensureDb();
   const now = Date.now();
   const stmt = database.prepare('UPDATE context_processed_local SET hit_count = hit_count + 1, last_used_at = ? WHERE id = ?');

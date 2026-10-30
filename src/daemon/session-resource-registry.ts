@@ -633,6 +633,22 @@ export class SessionResourceRegistry {
   }
 
   /**
+   * Terminal cleanup fallback for legacy session rows that predate the
+   * session-instance/runtime-epoch fields.  A terminal session name is an
+   * exact ownership boundary; unlike the age-based orphan sweep this never
+   * touches another session name or an unknown remote owner.
+   */
+  async releaseSessionName(sessionName: string, reason: string): Promise<ReleaseSummary> {
+    if (!boundedString(sessionName) || !boundedString(reason)) {
+      throw new Error('invalid_session_resource_release');
+    }
+    return this.serialized(async () => this.releaseRecords(
+      (await this.listUnlocked()).filter((record) => record.owner.sessionName === sessionName),
+      reason,
+    ));
+  }
+
+  /**
    * Release only `kinds` (child cleanup at relaunch). The caller must say
    * whether the provider host thread continues: KEEP when the new runtime
    * resumes the same, still-loaded thread (its hosted MCP never respawns if

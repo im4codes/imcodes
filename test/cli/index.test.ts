@@ -47,7 +47,7 @@ describe('imcodes CLI program', () => {
     expect(project?.commands.map((command) => command.name()).sort()).toEqual(['start', 'stop']);
 
     const memory = program.commands.find((command) => command.name() === 'memory');
-    expect(memory?.commands.map((command) => command.name()).sort()).toEqual(['list', 'mcp', 'search', 'stats']);
+    expect(memory?.commands.map((command) => command.name()).sort()).toEqual(['disable', 'enable', 'list', 'mcp', 'search', 'stats', 'status']);
   });
 
   it('prints help through commander without invoking command actions', async () => {

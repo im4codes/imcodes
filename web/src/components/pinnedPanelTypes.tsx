@@ -269,7 +269,10 @@ registerPanelType('cronmanager', {
         sessions={(ctx.sessions ?? []) as any}
         subSessions={subSessionsSlim}
         activeSession={ctx.activeSession}
-        sharedSessionName={ctx.sharedSessionName ?? (ctx.sharedAccessRole ? ctx.activeSession ?? undefined : undefined)}
+        sharedSessionName={ctx.shareTargetKind === 'server'
+          ? undefined
+          : ctx.sharedSessionName ?? (ctx.sharedAccessRole ? ctx.activeSession ?? undefined : undefined)}
+        sharedScope={Boolean(ctx.sharedAccessRole)}
         readOnly={ctx.sharedAccessRole === 'viewer'}
         portalSubPanels
         onBack={() => {}}

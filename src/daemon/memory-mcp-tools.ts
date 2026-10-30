@@ -196,7 +196,7 @@ import {
   type SupervisionIntegrationRemoteObservation,
 } from '../../shared/supervision-integration-finalization.js';
 import { advanceSupervisionTaskAfterFinish } from './supervision-convergence-wire.js';
-import { cronMcpCreate, cronMcpCreateSelf, cronMcpDelete, cronMcpList, cronMcpUpdate, cronMcpUpdateSelf, type CronMcpClientOptions } from './cron-mcp-client.js';
+import { cronMcpCreate, cronMcpCreateSelf, cronMcpDelete, cronMcpList, cronMcpPause, cronMcpResume, cronMcpUpdate, cronMcpUpdateSelf, type CronMcpClientOptions } from './cron-mcp-client.js';
 import {
   registerMemoryShortRef,
   resolveMemoryShortRefCandidatesWithStore,
@@ -462,6 +462,8 @@ export interface MemoryMcpToolDeps {
   cronUpdate?: typeof cronMcpUpdate;
   cronDelete?: typeof cronMcpDelete;
   cronList?: typeof cronMcpList;
+  cronPause?: typeof cronMcpPause;
+  cronResume?: typeof cronMcpResume;
   /**
    * Machine remote-exec tools (list_machines / exec_remote). Absent on a node
    * that cannot control machines — the handlers then return a typed
@@ -1947,6 +1949,8 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
   const cronUpdate = deps.cronUpdate ?? cronMcpUpdate;
   const cronDelete = deps.cronDelete ?? cronMcpDelete;
   const cronList = deps.cronList ?? cronMcpList;
+  const pauseCron = deps.cronPause ?? cronMcpPause;
+  const resumeCron = deps.cronResume ?? cronMcpResume;
 
   const memoryCaller = () => deriveMemoryToolCaller(scopedCallerForDeps(caller, deps));
 
@@ -4602,6 +4606,32 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       }
       return { status: 'ok', count: deleted.length, deleted };
     },
+    [MEMORY_MCP_TOOL_NAMES.CRON_PAUSE_SELF]: async (input) => {
+      const args = pickAllowedMcpArgs(input, ['id']);
+      const id = stringArg(args, 'id');
+      if (!id) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'id is required');
+      const binding = resolveCronSelfBinding(caller, deps, MEMORY_MCP_TOOL_NAMES.CRON_PAUSE_SELF);
+      if (!isCronSelfBinding(binding)) return binding;
+      const options = cronOptionsForCaller(binding.scopedCaller, deps);
+      if ('status' in options) return options;
+      const listed = await cronList({ projectName: binding.projectName, limit: MEMORY_MCP_CAPS.CRON_LIST_MAX_LIMIT }, options);
+      if (listed.status !== 'ok') return listed as unknown as ToolResult;
+      if (!cronJobsFromListBody(listed.body).some((job) => job.id === id && cronJobTargetsSelf(job, binding))) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'scheduled job is not available for the current session');
+      return pauseCron(id, options) as unknown as Promise<ToolResult>;
+    },
+    [MEMORY_MCP_TOOL_NAMES.CRON_RESUME_SELF]: async (input) => {
+      const args = pickAllowedMcpArgs(input, ['id']);
+      const id = stringArg(args, 'id');
+      if (!id) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'id is required');
+      const binding = resolveCronSelfBinding(caller, deps, MEMORY_MCP_TOOL_NAMES.CRON_RESUME_SELF);
+      if (!isCronSelfBinding(binding)) return binding;
+      const options = cronOptionsForCaller(binding.scopedCaller, deps);
+      if ('status' in options) return options;
+      const listed = await cronList({ projectName: binding.projectName, limit: MEMORY_MCP_CAPS.CRON_LIST_MAX_LIMIT }, options);
+      if (listed.status !== 'ok') return listed as unknown as ToolResult;
+      if (!cronJobsFromListBody(listed.body).some((job) => job.id === id && cronJobTargetsSelf(job, binding))) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'scheduled job is not available for the current session');
+      return resumeCron(id, options) as unknown as Promise<ToolResult>;
+    },
     [MEMORY_MCP_TOOL_NAMES.CRON_CREATE]: async (input) => {
       const args = pickAllowedMcpArgs(input, ['name', 'cronExpr', 'projectName', 'targetRole', 'targetSessionName', 'action', 'timezone', 'expiresAt', 'completionPolicy']);
       const expiresAt = parseExpiresAt(args.expiresAt);
@@ -4676,6 +4706,22 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       const cronOptions = cronOptionsForCaller(caller, deps);
       if ('status' in cronOptions) return cronOptions;
       return cronDelete(id, cronOptions, boolArg(args, 'force') === true) as unknown as Promise<ToolResult>;
+    },
+    [MEMORY_MCP_TOOL_NAMES.CRON_PAUSE]: async (input) => {
+      const args = pickAllowedMcpArgs(input, ['id']);
+      const id = stringArg(args, 'id');
+      if (!id) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'id is required');
+      const options = cronOptionsForCaller(caller, deps);
+      if ('status' in options) return options;
+      return pauseCron(id, options) as unknown as Promise<ToolResult>;
+    },
+    [MEMORY_MCP_TOOL_NAMES.CRON_RESUME]: async (input) => {
+      const args = pickAllowedMcpArgs(input, ['id']);
+      const id = stringArg(args, 'id');
+      if (!id) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'id is required');
+      const options = cronOptionsForCaller(caller, deps);
+      if ('status' in options) return options;
+      return resumeCron(id, options) as unknown as Promise<ToolResult>;
     },
     [MEMORY_MCP_TOOL_NAMES.LIST_MACHINES]: async (input) => {
       if (!deps.machineDeps) return error(MCP_ERROR_REASONS.FEATURE_DISABLED, 'machine control is not available on this node');
@@ -5252,6 +5298,8 @@ const schemas = {
     all: z.boolean().optional().describe('Cancel all self jobs.'),
     force: z.boolean().optional().describe('Required for recurring jobs.'),
   }),
+  [MEMORY_MCP_TOOL_NAMES.CRON_PAUSE_SELF]: z.object({ id: z.string() }),
+  [MEMORY_MCP_TOOL_NAMES.CRON_RESUME_SELF]: z.object({ id: z.string() }),
   [MEMORY_MCP_TOOL_NAMES.CRON_CREATE]: z.object({
     name: z.string(),
     cronExpr: z.string().describe(`${MEMORY_MCP_CAPS.CRON_MIN_INTERVAL_MINUTES}-minute minimum; every-minute schedules are invalid.`),
@@ -5290,6 +5338,8 @@ const schemas = {
     id: z.string(),
     force: z.boolean().optional().describe('Required for agent deletion of recurring jobs.'),
   }),
+  [MEMORY_MCP_TOOL_NAMES.CRON_PAUSE]: z.object({ id: z.string() }),
+  [MEMORY_MCP_TOOL_NAMES.CRON_RESUME]: z.object({ id: z.string() }),
   [MEMORY_MCP_TOOL_NAMES.LIST_MACHINES]: z.strictObject({
     includeOffline: z.boolean().optional().describe('Include offline/exec-disabled machines; default false, advisory only.'),
   }),

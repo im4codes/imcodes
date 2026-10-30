@@ -1265,7 +1265,10 @@ void PeerSession::HandleControl(const std::string& channel,
                               : priority == "resolution"
                                     ? QualityPriority::kResolution
                                     : QualityPriority::kBalanced;
-    transport_core_.SetQualityPreference(preference);
+    if (!transport_core_.SetQualityPreference(preference)) {
+      (void)SendControlRejected("set_quality_preference", kRejectQualityUnavailable);
+      return;
+    }
     const uint32_t ceiling = ViewerVideoBitrateCeiling(preference);
     if (ceiling != viewer_bitrate_ceiling_bps_) {
       viewer_bitrate_ceiling_bps_ = ceiling;

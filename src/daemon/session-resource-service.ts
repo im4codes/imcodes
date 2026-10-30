@@ -195,7 +195,11 @@ export async function releaseSessionResource(
 
 export async function releaseSessionResources(record: SessionRecord): Promise<ReleaseSummary> {
   const owner = sessionResourceOwner(record);
-  if (!owner) return { released: 0, failed: 0 };
+  // Older persisted records may not carry the owner tuple. The session name
+  // remains an exact terminal ownership boundary, so release those rows when
+  // the session is explicitly being removed instead of leaking their MCP
+  // children until a process-level orphan sweep happens.
+  if (!owner) return registry.releaseSessionName(record.name, SESSION_RESOURCE_RELEASE_REASON.SESSION_COMPLETED);
   return registry.releaseOwner(owner, SESSION_RESOURCE_RELEASE_REASON.SESSION_COMPLETED);
 }
 

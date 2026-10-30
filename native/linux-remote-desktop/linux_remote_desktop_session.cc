@@ -164,6 +164,8 @@ LinuxRemoteDesktopSession::LinuxQualityLadder::Select(
                         static_cast<std::uint32_t>(selection.height)},
       static_cast<std::uint32_t>(selection.fps),
       selection.bitrate_bps,
+      0,
+      selection.meets_preference_floor,
   };
 }
 
@@ -954,6 +956,8 @@ void LinuxRemoteDesktopSession::HandleDataChannelMessage(
     const std::optional<imcodes::rd::QualityPreference> preference =
         imcodes::rd::QualityPreferenceFromControl(message.control);
     if (!preference || !transport_core_.SetQualityPreference(*preference)) {
+      (void)SendControlRejected("set_quality_preference",
+                                imcodes::rd::kRejectQualityUnavailable);
       return;
     }
     // The builtin encoder takes its bitrate from libwebrtc's estimate, so the

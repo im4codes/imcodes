@@ -4323,6 +4323,7 @@
       "mode_change_failed": "節點拒絕：Windows 未能套用該解析度。",
       "scale_change_failed": "節點拒絕：Windows 未能套用該縮放比例。",
       "capture_failed": "節點拒絕：無法將畫面擷取切換到該顯示器。",
+      "quality_unavailable": "節點無法在不中斷目前串流的情況下套用此畫質。",
       "unlock_unavailable": "節點拒絕：未儲存登入密碼，或目前沒有需要解鎖的畫面。",
       "paste_unavailable": "遠端剪貼簿無法使用，已改為輸入文字。",
       "paste_too_large": "文字太大，無法透過一次剪貼簿貼上，已改為輸入文字。"

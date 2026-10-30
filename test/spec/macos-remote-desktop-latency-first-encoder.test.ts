@@ -30,7 +30,7 @@ describe('macOS latency-first encoder mode', () => {
   });
 
   it('keeps one frame in flight and does not turn drops into backlog pressure in that mode only', () => {
-    expect(encoder).toMatch(/configuration\.latency_first \? 1U : limits_\.max_pending_frames/);
+    expect(encoder).toMatch(/requested\.latency_first \? 1U : limits_\.max_pending_frames/);
     // The latency-first drop returns before backlog pressure is touched and is counted apart from faults.
     expect(encoder).toMatch(/if \(latency_first\) \{[\s\S]{0,260}\+\+statistics\.dropped_by_design_frames;\s*return std::nullopt;\s*\}\s*\+\+statistics\.dropped_backpressure_frames;/);
   });
@@ -44,7 +44,7 @@ describe('macOS latency-first encoder mode', () => {
     expect(encoder).toMatch(/frames_since_key = 0;\s*refresh\.Reset\(\);/);
     // The refresh weighs the CURRENT link target, including bitrate-only updates.
     expect(encoder).toContain('state_->bitrate_bps = next.bitrate_bps;');
-    expect(encoder).toContain('state_->bitrate_bps = configuration.bitrate_bps;');
+    expect(encoder).toContain('state_->bitrate_bps = requested.bitrate_bps;');
   });
 
   it('marks a keep-alive re-delivery of the unchanged picture, and no other frame', () => {

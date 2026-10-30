@@ -315,6 +315,8 @@ export async function listMachines(opts: {
   if (machines.length > MACHINE_LIST_MAX_ITEMS) throw new MachineControlPlaneError('malformed', `machines API returned more than ${MACHINE_LIST_MAX_ITEMS} items`);
   if (!machines.every(isValidMachineListItem)) throw new MachineControlPlaneError('malformed', 'machines API returned an item failing strict validation');
   const items = machines as MachineListItem[];
-  // Agent-facing list excludes offline + exec-disabled unless explicitly asked (spec).
-  return opts.includeOffline ? items : items.filter((m) => m.online && m.execEnabled);
+  // Access-scoped list already excludes unauthorized targets. Keep online
+  // read-only/group-shared machines visible even when execEnabled=false; the
+  // action-specific daemon gate and relay admission enforce execute grants.
+  return opts.includeOffline ? items : items.filter((m) => m.online);
 }

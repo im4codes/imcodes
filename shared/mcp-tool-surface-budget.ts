@@ -53,14 +53,17 @@ export const MCP_INJECTED_EXECUTION_BLOCK = Object.freeze({ taskSupport: 'forbid
 // pair_workspace_gc tool another ~0.6 KiB (raw wire payload 57,340 bytes together); neither is part of the bootstrap set, so that
 // ceiling does not move.
 // The session_identity_set append flag, observationId, and replacesRef lifecycle contracts add ~1 KiB of authored schema;
-// the ceilings move deliberately and reviewably to accommodate them.
-export const MCP_TOOL_SURFACE_AUTHORED_BUDGET_BYTES = 53_000;
+// the ceilings move deliberately and reviewably to accommodate them. The
+// pause/resume Cron controls add 503 measured authored bytes to the full
+// catalog, so retain bounded headroom above the resulting 53,503-byte surface.
+export const MCP_TOOL_SURFACE_AUTHORED_BUDGET_BYTES = 55_000;
 // Raw = authored + the MCP SDK framing. The pair-resource-claim tool adds one
 // intentionally discoverable contract and `command` one published parameter;
 // the structured pair_create/pair_dispatch and pair lifecycle contracts add
-// about 4.3 KiB to that wire payload; retain a bounded ceiling for the
-// resulting surface.
-export const MCP_TOOL_SURFACE_RAW_BUDGET_BYTES = 60_000;
+// about 4.3 KiB to that wire payload; the pause/resume Cron controls add two
+// schemas to the scheduling group, bringing the measured raw surface to
+// 60,991 bytes. Retain bounded review headroom above that exact catalog.
+export const MCP_TOOL_SURFACE_RAW_BUDGET_BYTES = 62_000;
 /**
  * Default model-visible surface: one discovery tool plus the stable minimal
  * delegation, supervision-task, basic-memory/source-expansion, scheduling,

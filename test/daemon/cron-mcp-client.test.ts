@@ -4,6 +4,8 @@ import {
   cronMcpCreateSelf,
   cronMcpDelete,
   cronMcpList,
+  cronMcpPause,
+  cronMcpResume,
   cronMcpUpdate,
   cronMcpUpdateSelf,
 } from '../../src/daemon/cron-mcp-client.js';
@@ -251,6 +253,20 @@ describe('cron MCP client', () => {
     expect(updateBody.userId).toBeUndefined();
     expect(updateBody.token).toBeUndefined();
     expect(updateBody.actorId).toBeUndefined();
+  });
+
+  it('uses the status route for pause and resume without changing the job payload', async () => {
+    const fetchImpl = vi.fn(async () => okJson({ id: 'job-1', status: 'paused' }));
+    const paused = await cronMcpPause('job-1', { ...boundIdentity, fetchImpl });
+    const resumed = await cronMcpResume('job-1', { ...boundIdentity, fetchImpl });
+    expect(paused.status).toBe('ok');
+    expect(resumed.status).toBe('ok');
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+    const calls = fetchImpl.mock.calls as Array<[string, RequestInit]>;
+    expect(calls[0]![0]).toBe('https://worker.test/api/server/srv-bound/cron/job-1/status');
+    expect(calls[1]![0]).toBe('https://worker.test/api/server/srv-bound/cron/job-1/status');
+    expect(JSON.parse(String(calls[0]![1].body))).toEqual({ status: 'paused' });
+    expect(JSON.parse(String(calls[1]![1].body))).toEqual({ status: 'active' });
   });
 
   it('preserves the structured send onlyWhenIdle option on updates', async () => {

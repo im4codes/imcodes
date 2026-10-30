@@ -158,6 +158,8 @@ export interface RemoteDesktopSnapshot {
    *  `quality.encoderClass` text. */
   encoder?: RemoteDesktopEncoderSummary;
   stream: MediaStream | null;
+  /** Monotonic peer/media authority generation; unchanged for in-place quality updates. */
+  streamGeneration?: number;
   terminalReason?: string;
   error?: string;
   /** Server-authoritative retry guidance for an ERROR response. */
@@ -633,6 +635,7 @@ export class RemoteDesktopClient {
     timer: ReturnType<typeof setTimeout>;
   } | null = null;
   private controlRejectionId = 0;
+  private streamGeneration = 0;
   private diagnosticTrackCleanup: (() => void) | null = null;
   private snapshot: RemoteDesktopSnapshot = {
     state: REMOTE_DESKTOP_STATE.AUTHORIZING,
@@ -642,6 +645,7 @@ export class RemoteDesktopClient {
     displays: [],
     layoutRevision: 1,
     stream: null,
+    streamGeneration: 0,
     durationMs: 0,
     reconnectCount: 0,
     capabilityVersion: REMOTE_DESKTOP_CAPABILITY,
@@ -822,6 +826,12 @@ export class RemoteDesktopClient {
   private effectiveQualityPreference(): RemoteDesktopQualityPreference | null {
     const preference = this.desiredQualityPreference;
     if (!preference) return null;
+    // Every named preset carries an explicit bitrate floor. Latency samples
+    // must not silently lower that floor; the native ladder reports an
+    // explicit cannot-satisfy result when the transport cap is below it.
+    if (preference.maxBitrateBps > 0) {
+      return preference;
+    }
     const guard = this.latencyGuardCapBps;
     if (guard === null) return preference;
     const own = preference.maxBitrateBps;
@@ -1200,7 +1210,7 @@ export class RemoteDesktopClient {
       const sent = this.sendControl({
         type: REMOTE_DESKTOP_DATA_MSG.RELEASE_ALL,
         ...this.inputBase(),
-      });
+      }, false);
       if (!sent) return;
     }
     this.pressedCodes.clear();
@@ -1519,12 +1529,14 @@ export class RemoteDesktopClient {
   }
 
   private async preparePeer(authority: Extract<RemoteDesktopServerMessage, { type: typeof REMOTE_DESKTOP_MSG.AUTHORIZED }>): Promise<void> {
+    this.streamGeneration += 1;
     this.sessionId = authority.sessionId;
     this.capability = authority.capability;
     this.daemonGeneration = authority.daemonGeneration;
     this.expiresAt = this.serverDeadlineToLocal(authority.expiresAt, authority.serverTime);
     this.publish({
       state: REMOTE_DESKTOP_STATE.PREPARING,
+      streamGeneration: this.streamGeneration,
       mode: authority.mode,
       inputEpoch: authority.inputEpoch,
       inputEnabled: false,
@@ -1686,7 +1698,12 @@ export class RemoteDesktopClient {
         ].includes(channel)) return;
         this.releaseAll();
         this.updateChannelReadiness();
-        if (!this.stopped) this.fail(REMOTE_DESKTOP_TERMINAL_REASON.PEER_FAILED);
+        if (!this.stopped && this.peer === peer) {
+          // SCTP channels can close during a transient ICE flap while the
+          // peer and route remain authorized. Re-establish them in place;
+          // terminal failure remains bounded by the normal ICE budget.
+          void this.restartIce(peer);
+        }
       });
     }
     control.addEventListener('message', (event) => this.handleData(event.data));
@@ -2217,7 +2234,9 @@ export class RemoteDesktopClient {
     this.clearPendingPaste();
     if (this.peer.connectionState !== 'connected') this.pendingIceRestart = true;
     this.publish({
-      state: REMOTE_DESKTOP_STATE.RECONNECTING,
+      ...(this.signalingStableState === null
+        ? { state: REMOTE_DESKTOP_STATE.RECONNECTING }
+        : {}),
       inputEnabled: false,
       reconnectCount: this.signalingReconnectAttempts + 1,
     });
@@ -2354,8 +2373,8 @@ export class RemoteDesktopClient {
     };
   }
 
-  private sendControl(message: object): boolean {
-    return this.sendData(this.controlChannel, message, true);
+  private sendControl(message: object, trackInputAck = true): boolean {
+    return this.sendData(this.controlChannel, message, true, trackInputAck);
   }
 
   private sendKeyTransition(code: string, key: string, down: boolean, repeat: boolean): boolean {
@@ -2462,7 +2481,12 @@ export class RemoteDesktopClient {
     return this.sendData(this.controlChannel, message, false);
   }
 
-  private sendData(channel: RTCDataChannel | null, message: object, reliableTransition: boolean): boolean {
+  private sendData(
+    channel: RTCDataChannel | null,
+    message: object,
+    reliableTransition: boolean,
+    trackInputAck = true,
+  ): boolean {
     if (!isOpen(channel)) return false;
     if (reliableTransition && channel.bufferedAmount > DATA_BUFFER_HIGH_WATER_BYTES) {
       this.fail(REMOTE_DESKTOP_TERMINAL_REASON.PROTOCOL_ERROR);
@@ -2478,7 +2502,7 @@ export class RemoteDesktopClient {
       // authoritative last line of defence against stuck remote input.
       return false;
     }
-    if (reliableTransition && (
+    if (trackInputAck && reliableTransition && (
       parsed.value.type === REMOTE_DESKTOP_DATA_MSG.KEYBOARD
       || parsed.value.type === REMOTE_DESKTOP_DATA_MSG.RELEASE_ALL
       || (parsed.value.type === REMOTE_DESKTOP_DATA_MSG.POINTER
@@ -2491,7 +2515,15 @@ export class RemoteDesktopClient {
       this.inputAckTimer = setTimeout(() => {
         this.inputAckTimer = null;
         if (this.pendingInputAckSequence !== null) {
-          this.fail(REMOTE_DESKTOP_TERMINAL_REASON.PEER_FAILED);
+          // A delayed ACK is not permission to replay a non-idempotent input.
+          // Release the native ledger and keep the authorized peer alive when
+          // this is an already-established session; initial negotiation still
+          // fails closed below its existing startup timeout.
+          const established = this.signalingStableState !== null
+            || this.snapshot.state === REMOTE_DESKTOP_STATE.DIRECT
+            || this.snapshot.state === REMOTE_DESKTOP_STATE.RELAYED;
+          if (established) this.releaseAll();
+          else this.fail(REMOTE_DESKTOP_TERMINAL_REASON.PEER_FAILED);
         }
       }, INPUT_ACK_TIMEOUT_MS);
     }

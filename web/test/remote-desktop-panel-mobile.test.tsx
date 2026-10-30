@@ -562,6 +562,52 @@ describe('RemoteDesktopPanel mobile gestures', () => {
     }
   });
 
+  it('keeps the last frame when the same peer replaces its media stream during a quality switch', async () => {
+    let presentedCallback: VideoFrameRequestCallback | undefined;
+    Object.defineProperties(HTMLVideoElement.prototype, {
+      requestVideoFrameCallback: {
+        configurable: true,
+        value: (callback: VideoFrameRequestCallback) => { presentedCallback = callback; return 82; },
+      },
+      cancelVideoFrameCallback: { configurable: true, value: vi.fn() },
+    });
+    const getContext = vi.spyOn(HTMLCanvasElement.prototype, 'getContext').mockReturnValue({
+      drawImage: vi.fn(), clearRect: vi.fn(),
+    } as unknown as CanvasRenderingContext2D);
+    try {
+      const firstTrack = Object.assign(new EventTarget(), { muted: false, readyState: 'live' });
+      const secondTrack = Object.assign(new EventTarget(), { muted: false, readyState: 'live' });
+      const first = { getVideoTracks: () => [firstTrack] } as unknown as MediaStream;
+      const second = { getVideoTracks: () => [secondTrack] } as unknown as MediaStream;
+      const rendered = await renderPanel();
+      const snapshot = {
+        state: REMOTE_DESKTOP_STATE.DIRECT,
+        mode: REMOTE_DESKTOP_ACCESS_MODE.VIEW,
+        inputEpoch: 0,
+        inputEnabled: false,
+        route: 'direct',
+        displays: [],
+        layoutRevision: 1,
+        streamGeneration: 7,
+      };
+      act(() => clientHooks[0]!.onSnapshot({ ...snapshot, stream: first }));
+      act(() => presentedCallback?.(100, {} as VideoFrameCallbackMetadata));
+      firstTrack.muted = true;
+      act(() => firstTrack.dispatchEvent(new Event('mute')));
+      expect(rendered.container.querySelector('.remote-desktop-last-frame')?.classList
+        .contains('is-visible')).toBe(true);
+
+      act(() => clientHooks[0]!.onSnapshot({ ...snapshot, stream: second }));
+      expect(rendered.container.querySelector('.remote-desktop-last-frame')?.classList
+        .contains('is-visible')).toBe(true);
+      expect(rendered.container.querySelector('.remote-desktop-stage-placeholder')).toBeNull();
+    } finally {
+      getContext.mockRestore();
+      delete (HTMLVideoElement.prototype as Partial<HTMLVideoElement>).requestVideoFrameCallback;
+      delete (HTMLVideoElement.prototype as Partial<HTMLVideoElement>).cancelVideoFrameCallback;
+    }
+  });
+
   it('clears only the affected workspace host when Server authority is terminally lost', async () => {
     const onAuthorityLost = vi.fn();
     render(<RemoteDesktopPanel
@@ -627,7 +673,7 @@ describe('RemoteDesktopPanel mobile gestures', () => {
     // Nothing saved yet: the default, and it is what the client is told.
     expect(trigger(first).getAttribute('aria-label')).toContain('quality_short_balanced');
     expect(setQualityPreference).toHaveBeenLastCalledWith(
-      { maxHeight: 1440, maxFps: 30, maxBitrateBps: 0, priority: 'balanced' },
+      { maxHeight: 1440, maxFps: 30, maxBitrateBps: 10_000_000, priority: 'balanced' },
       { latencyGuard: true },
     );
 
@@ -640,7 +686,7 @@ describe('RemoteDesktopPanel mobile gestures', () => {
     expect(first.queryByRole('radio', { name: /quality_short_sharp/ })).toBeNull();
     expect(trigger(first).getAttribute('aria-label')).toContain('quality_short_sharp');
     expect(setQualityPreference).toHaveBeenLastCalledWith(
-      { maxHeight: 0, maxFps: 30, maxBitrateBps: 0, priority: 'resolution' },
+      { maxHeight: 0, maxFps: 30, maxBitrateBps: 15_000_000, priority: 'resolution' },
       { latencyGuard: true },
     );
     first.unmount();
@@ -652,7 +698,7 @@ describe('RemoteDesktopPanel mobile gestures', () => {
     await act(async () => { await Promise.resolve(); });
     expect(trigger(reopened).getAttribute('aria-label')).toContain('quality_short_sharp');
     expect(setQualityPreference).toHaveBeenLastCalledWith(
-      { maxHeight: 0, maxFps: 30, maxBitrateBps: 0, priority: 'resolution' },
+      { maxHeight: 0, maxFps: 30, maxBitrateBps: 15_000_000, priority: 'resolution' },
       { latencyGuard: true },
     );
 
@@ -662,7 +708,7 @@ describe('RemoteDesktopPanel mobile gestures', () => {
     await act(async () => { await Promise.resolve(); });
     expect(trigger(reopened).getAttribute('aria-label')).toContain('quality_short_balanced');
     expect(setQualityPreference).toHaveBeenLastCalledWith(
-      { maxHeight: 1440, maxFps: 30, maxBitrateBps: 0, priority: 'balanced' },
+      { maxHeight: 1440, maxFps: 30, maxBitrateBps: 10_000_000, priority: 'balanced' },
       { latencyGuard: true },
     );
   });

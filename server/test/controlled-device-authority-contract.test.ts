@@ -95,4 +95,10 @@ describe('controlled-device centralized authority contract', () => {
     expect(sharing).not.toContain('resolveControlledMachineOperatorAccess');
     expect(sharing).toContain('return server.user_id === userId');
   });
+
+  it('keeps every effective-source resolver on the ranked lateral alias', () => {
+    const machineAccess = source('../src/share/machine-access.ts');
+    expect(machineAccess).not.toContain('sh.id IS NOT NULL');
+    expect(machineAccess).toContain('effective_access.role IS NOT NULL');
+  });
 });

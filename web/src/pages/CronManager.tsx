@@ -260,6 +260,7 @@ export function CronManager({ serverId, projectName, sessions, subSessions = [],
     return `${path}${join}sessionName=${encodeURIComponent(sharedSessionName)}`;
   }, [sharedSessionName]);
   const effectiveShowAllServers = !sharedScope && !sharedSessionName && showAllServers;
+  const wholeServerSharedScope = sharedScope && !sharedSessionName;
 
   // Wrap onNavigateSession to close internal panels before navigating
   const handleNavigateSession = useMemo(() => {
@@ -277,7 +278,9 @@ export function CronManager({ serverId, projectName, sessions, subSessions = [],
   // ── Load jobs ──────────────────────────────────────────────────────────
   const loadJobs = useCallback(async (silent = false) => {
     try {
-      const q = effectiveShowAllServers ? '' : `serverId=${encodeURIComponent(serverId)}&projectName=${encodeURIComponent(projectName)}`;
+      const q = effectiveShowAllServers || wholeServerSharedScope
+        ? (effectiveShowAllServers ? '' : `serverId=${encodeURIComponent(serverId)}`)
+        : `serverId=${encodeURIComponent(serverId)}&projectName=${encodeURIComponent(projectName)}`;
       const res = await apiFetch<{ jobs: CronJob[] }>(scopedUrl(`/api/cron?${q}`));
       setJobs(res.jobs);
       setError(null);
@@ -288,7 +291,7 @@ export function CronManager({ serverId, projectName, sessions, subSessions = [],
     } finally {
       setLoading(false);
     }
-  }, [serverId, projectName, effectiveShowAllServers, scopedUrl]);
+  }, [serverId, projectName, effectiveShowAllServers, wholeServerSharedScope, scopedUrl]);
 
   useEffect(() => { loadJobs(); }, [loadJobs]);
 
