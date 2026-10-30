@@ -1122,6 +1122,7 @@ describe('TaskPairStatusPanel', () => {
   it('keeps the desktop collapsed toolbar in titlebar flow while expanding below controls', () => {
     const css = readCss();
     expect(css).toMatch(/\.chat-titlebar > \.task-pair-status-panel\.is-collapsed\s*\{[^}]*position:\s*static/);
+    expect(css).toMatch(/\.chat-titlebar > \.task-pair-status-panel\.is-collapsed\s*\{[^}]*margin:\s*0(?:;|\s)/);
     expect(css).toMatch(/\.chat-titlebar > \.task-pair-status-panel\.is-collapsed\s*\{[^}]*max-width:\s*calc\(48% - var\(--chat-top-actions-reserve/);
     expect(css).toMatch(/\.chat-titlebar > \.task-pair-status-panel:not\(\.is-collapsed\)\s*\{[^}]*position:\s*absolute/);
     expect(css).toMatch(/\.chat-titlebar > \.task-pair-status-panel:not\(\.is-collapsed\)[\s\S]*?top:\s*max\(calc\(100% \+ 4px\), 40px\)/);
