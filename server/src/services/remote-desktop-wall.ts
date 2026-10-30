@@ -74,26 +74,36 @@ async function resolveHost(
     `SELECT h.id AS host_id, endpoint.server_id, s.node_id, s.ref_name, s.display_name,
             s.status, s.last_heartbeat_at, s.exec_enabled, s.os, s.node_role,
             s.controlled_capabilities,
-            CASE
-              WHEN s.user_id = $1 THEN 'owner'
-              WHEN sh.role IS NOT NULL THEN sh.role
-              WHEN ${IS_MEMBER_OF_A_MACHINE_GROUP} THEN 'participant'
-            END AS access_role
+            CASE WHEN s.user_id = $1 THEN 'owner' ELSE effective_access.role END AS access_role
        FROM remote_desktop_hosts h
        JOIN remote_desktop_host_endpoints requested ON requested.host_id = h.id
        JOIN remote_desktop_host_endpoints endpoint ON endpoint.host_id = h.id
        JOIN servers s ON s.id = endpoint.server_id
-       LEFT JOIN server_shares sh
-         ON sh.server_id = s.id
-        AND s.user_id <> $1
-        AND sh.target_user_id = $1
-        AND sh.revoked_at IS NULL
-        AND (sh.expires_at IS NULL OR sh.expires_at > $3)
+       LEFT JOIN LATERAL (
+         SELECT candidate.role
+           FROM (
+             SELECT sh.role,
+                    CASE sh.role WHEN 'participant' THEN 2 ELSE 1 END AS role_rank,
+                    CASE WHEN sh.role = 'participant' AND sh.exec_granted THEN 1 ELSE 0 END AS execute_rank,
+                    1 AS source_rank
+               FROM server_shares sh
+              WHERE s.user_id <> $1
+                AND sh.server_id = s.id
+                AND sh.target_user_id = $1
+                AND sh.revoked_at IS NULL
+                AND (sh.expires_at IS NULL OR sh.expires_at > $3)
+             UNION ALL
+             SELECT 'participant', 2, 1, 0
+              WHERE s.user_id <> $1 AND ${IS_MEMBER_OF_A_MACHINE_GROUP}
+           ) candidate
+          ORDER BY candidate.role_rank DESC, candidate.execute_rank DESC, candidate.source_rank DESC
+          LIMIT 1
+       ) effective_access ON TRUE
       WHERE (h.id = $2 OR requested.server_id = $2)
         AND h.merge_state = 'resolved'
         AND s.revoked_at IS NULL
         AND ${activeUserExistsSql('$1')} AND ${activeUserExistsSql('s.user_id')}
-        AND (s.user_id = $1 OR sh.id IS NOT NULL OR ${IS_MEMBER_OF_A_MACHINE_GROUP})
+        AND (s.user_id = $1 OR effective_access.role IS NOT NULL)
       -- A canonical host may retain stale reinstall endpoints. Prefer any
       -- durable-online endpoint before the controlled-role preference so one
       -- old row cannot make the wall display a live desktop as offline.

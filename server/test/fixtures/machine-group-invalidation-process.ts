@@ -25,10 +25,10 @@ db.query = async <T>(sql: string, parameters: unknown[] = []): Promise<T[]> => {
 const queryOne = db.queryOne.bind(db);
 db.queryOne = async <T>(sql: string, parameters: unknown[] = []): Promise<T | null> => {
   const row = await queryOne<T>(sql, parameters);
-  if (sql.includes('END AS access_role') && heldAccessActor && parameters[0] === heldAccessActor) {
+  if (sql.includes('AS access_role') && heldAccessActor && parameters[0] === heldAccessActor) {
     freshAccessActor = heldAccessActor; heldAccessActor = null;
     await new Promise<void>(resolve => { release = resolve; process.send?.({ type: IPC.HELD, permitted: Boolean(row) }); });
-  } else if (sql.includes('END AS access_role') && freshAccessActor && parameters[0] === freshAccessActor) {
+  } else if (sql.includes('AS access_role') && freshAccessActor && parameters[0] === freshAccessActor) {
     freshAccessActor = null; process.send?.({ type: IPC.FRESH_ACCESS, permitted: Boolean(row) });
   }
   return row;

@@ -4,7 +4,7 @@ import { MACHINE_ACTION, MACHINE_ACCESS_SOURCE as S, MACHINE_DENIAL_REASON as D,
 const subjects: Array<[string, MachineAccessSubject, boolean, boolean]> = [
   ['owner', { accessRole: 'owner', accessSource: S.OWNER, execGranted: false, execEnabled: true, participantTurn: true }, true, true],
   ['granted', { accessRole: 'participant', accessSource: S.SHARE, execGranted: true, execEnabled: true, participantTurn: true }, true, true],
-  ['no grant', { accessRole: 'participant', accessSource: S.SHARE, execGranted: false, execEnabled: true, participantTurn: true }, true, false],
+  ['participant without extra grant', { accessRole: 'participant', accessSource: S.SHARE, execGranted: false, execEnabled: true, participantTurn: true }, true, true],
   ['group without grant', { accessRole: 'participant', accessSource: S.GROUP, execGranted: false, execEnabled: true, participantTurn: true }, true, true],
   ['group with execute grant', { accessRole: 'participant', accessSource: S.GROUP, execGranted: true, execEnabled: true, participantTurn: true }, true, true],
   ['viewer', { accessRole: 'viewer', accessSource: S.SHARE, execGranted: false, execEnabled: true, participantTurn: true }, false, false],

@@ -1018,8 +1018,8 @@ describe('a shared-session participant reaches only the machines shared with the
       const execute = await client.callTool({name:MEMORY_MCP_TOOL_NAMES.EXEC_REMOTE,arguments:{machine:nodeId,command:'echo no-dispatch'}});
       expect(execute.isError,JSON.stringify(execute)).not.toBe(true); // group participants execute without an extra grant
       const viewer = await createMachineGrant({ownerId:peer,recipientId:t.participantId,serverId:node,role:'viewer'});
-      expect((await computerUse(t.app,t.delegated,node)).status).toBe(403);
-      expect(await listed(t.app,t.delegated)).not.toContain(node); // more specific viewer wins
+      expect((await computerUse(t.app,t.delegated,node)).status).toBe(200);
+      expect(await listed(t.app,t.delegated)).toContain(node); // participant group grant outranks direct viewer
       await db.execute('UPDATE server_shares SET expires_at=$2 WHERE id=$1',[viewer.id,Date.now()-1]);
       expect((await computerUse(t.app,t.delegated,node)).status).toBe(200); // falls back to real group
       await db.execute('DELETE FROM team_members WHERE team_id=$1 AND user_id=$2',[group,t.participantId]);
@@ -1035,7 +1035,7 @@ describe('a shared-session participant reaches only the machines shared with the
     } finally { await client.close(); await mcp.close(); }
   });
 
-  it('bounds the actual actor fleet at MAX+1 after excluding direct-viewer overrides, with no source fleet intersection', async () => {
+  it('bounds the actual actor fleet at MAX+1 after applying highest effective roles, with no source fleet intersection', async () => {
     const t = await scene(), peer = `scale-owner-${hex(4)}`; await createUser(db,peer);
     const group = await createDesk(peer); await joinDesk(group,t.participantId);
     // Two existing operable targets plus 200 new group targets exceed the cap; source owner sees none of the new fleet.

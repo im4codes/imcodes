@@ -7,9 +7,8 @@
  *   EXECUTE-class action  = anything that can run code on the device, write to it, or read files off it as the node's account.
  *   VIEW-class action     = list the machine, or look without touching (list_apps, get_app_state, browser_snapshot).
  *
- *   EXECUTE-class needs ALL of: the node's exec switch is ON AND the actor is the device OWNER, a participant carrying an
- *   explicit direct execute grant (`execGranted`), or a valid group participant. Group membership is the product's default
- *   execute grant; viewers and explicit viewer overrides remain denied. The signed authority and canonical target binding
+ *   EXECUTE-class needs ALL of: the node's exec switch is ON AND the actor is the device OWNER or an effective participant
+ *   from any valid direct/group source. Participant access is the product's execute grant; viewers remain denied. The signed authority and canonical target binding
  *   prevent owner fallback or cross-target replay.
  *
  * Reading files is EXECUTE-class on purpose: the node's account can read credentials, keys and browser profiles, so "read any path"
@@ -108,8 +107,7 @@ export function evaluateMachineAction(subject: MachineAccessSubject, action: Mac
   }
   if (!machineActionRequiresExecute(action)) return { allowed: true };
   if (subject.accessSource === MACHINE_ACCESS_SOURCE.OWNER && subject.accessRole === 'owner') return { allowed: true };
-  if (subject.accessRole === 'participant'
-    && (subject.execGranted === true || subject.accessSource === MACHINE_ACCESS_SOURCE.GROUP)) {
+  if (subject.accessRole === 'participant') {
     return { allowed: true };
   }
   return { allowed: false, reason: MACHINE_DENIAL_REASON.EXECUTE_NOT_GRANTED };

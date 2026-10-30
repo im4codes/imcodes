@@ -294,9 +294,9 @@ describe('sharing one machine with one person', () => {
     expect(canOperateControlledMachine(access!.access_role)).toBe(false);
   });
 
-  it('lets an explicit per-machine role override the team default', async () => {
-    // Both grants apply to the same person. The per-machine one is the more
-    // specific statement, so a deliberate downgrade survives.
+  it('chooses the highest effective role across direct and team grants', async () => {
+    // Both grants apply to the same person. A lower direct viewer must not
+    // suppress the effective participant role inherited from the team.
     const teamId = await makeTeam(owner);
     await db.execute(
       "INSERT INTO team_members (team_id, user_id, role, joined_at) VALUES ($1, $2, 'admin', $3)",
@@ -305,7 +305,7 @@ describe('sharing one machine with one person', () => {
     await addToGroup(serverId, teamId);
     await share('viewer');
 
-    expect((await accessFor(colleague))?.access_role).toBe('viewer');
+    expect((await accessFor(colleague))?.access_role).toBe('participant');
   });
 
   it('grants nothing once revoked or expired', async () => {
