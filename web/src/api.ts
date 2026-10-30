@@ -230,33 +230,103 @@ let _refreshRetryAt = 0;
 // Cross-tab mutex: prevent multiple tabs from refreshing simultaneously.
 // Uses BroadcastChannel to coordinate — only one tab refreshes at a time.
 const _refreshChannel = typeof BroadcastChannel !== 'undefined' ? new BroadcastChannel('imcodes-auth-refresh') : null;
+const REFRESH_LOCK_WAIT_MS = 5_000;
+const REFRESH_LOCK_STALE_MS = 15_000;
+const REFRESH_COORDINATION_RETRY_MS = 5_000;
+const _refreshTabId = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
 let _crossTabRefreshLocked = false;
+let _crossTabRefreshStartedAt = 0;
+const _crossTabRefreshWaiters = new Set<(ok: boolean) => void>();
 _refreshChannel?.addEventListener('message', (e) => {
-  if (e.data === 'refresh-start') _crossTabRefreshLocked = true;
-  if (e.data === 'refresh-done') {
+  const message = e.data as { type?: unknown; owner?: unknown; startedAt?: unknown; ok?: unknown } | string;
+  const type = typeof message === 'string' ? message : message?.type;
+  if (type === 'refresh-start') {
+    if (typeof message !== 'string' && message.owner === _refreshTabId) return;
+    _crossTabRefreshLocked = true;
+    _crossTabRefreshStartedAt = typeof message === 'string' || typeof message.startedAt !== 'number'
+      ? Date.now()
+      : message.startedAt;
+  }
+  if (type === 'refresh-done') {
     _crossTabRefreshLocked = false;
-    _lastRefreshAt = Date.now(); // other tab refreshed successfully
+    _crossTabRefreshStartedAt = 0;
+    const ok = typeof message === 'string' || message.ok !== false;
+    if (ok) _lastRefreshAt = Date.now(); // other tab refreshed successfully
+    for (const resolve of _crossTabRefreshWaiters) resolve(ok);
+    _crossTabRefreshWaiters.clear();
   }
 });
 
 // Track the last successful refresh timestamp to rate-limit proactive refreshes.
 let _lastRefreshAt = 0;
 
-async function doRefresh(): Promise<boolean> {
-  // If another tab is refreshing, wait briefly for it to finish
-  if (_crossTabRefreshLocked) {
-    await new Promise((r) => setTimeout(r, 1500));
-    if (_crossTabRefreshLocked) return true; // still locked, assume other tab handled it
-    return true; // other tab finished
+function publishRefreshMessage(message: { type: 'refresh-start'; owner: string; startedAt: number } | { type: 'refresh-done'; owner: string; ok: boolean }): void {
+  try { _refreshChannel?.postMessage(message); } catch { /* a closed channel must not break auth */ }
+}
+
+async function waitForCrossTabRefresh(): Promise<boolean | null> {
+  if (!_crossTabRefreshLocked) return null;
+  return new Promise<boolean | null>((resolve) => {
+    let settled = false;
+    const finish = (value: boolean | null) => {
+      if (settled) return;
+      settled = true;
+      _crossTabRefreshWaiters.delete(onDone);
+      clearTimeout(timer);
+      resolve(value);
+    };
+    const onDone = (ok: boolean) => finish(ok);
+    const timer = setTimeout(() => finish(null), REFRESH_LOCK_WAIT_MS);
+    _crossTabRefreshWaiters.add(onDone);
+    if (!_crossTabRefreshLocked) finish(true);
+  });
+}
+
+async function verifyCurrentSession(): Promise<boolean> {
+  const res = await rawFetch('/api/auth/user/me');
+  if (res.ok) {
+    _lastRefreshAt = Date.now();
+    return true;
   }
-  _refreshChannel?.postMessage('refresh-start');
+  if (res.status >= 500) throw new ApiError(res.status, await res.text().catch(() => 'server_unavailable'));
+  return false;
+}
+
+async function doRefresh(): Promise<boolean> {
+  // If another tab is refreshing, wait for its completion message instead of
+  // assuming success after a fixed delay. A stale lock is only taken over
+  // after a bounded wait and a failed /me confirmation.
+  if (_crossTabRefreshLocked) {
+    const waited = await waitForCrossTabRefresh();
+    if (waited !== null) {
+      if (waited) return verifyCurrentSession();
+      _crossTabRefreshLocked = false;
+      _crossTabRefreshStartedAt = 0;
+    } else {
+      const verified = await verifyCurrentSession();
+      if (verified) return true;
+      if (Date.now() - _crossTabRefreshStartedAt < REFRESH_LOCK_STALE_MS) {
+        _lastRefreshFailure = { status: 503, body: 'auth_refresh_coordination_pending' };
+        _refreshRetryAt = Date.now() + REFRESH_COORDINATION_RETRY_MS;
+        throw new ApiError(503, 'auth_refresh_coordination_pending');
+      }
+      _crossTabRefreshLocked = false;
+      _crossTabRefreshStartedAt = 0;
+    }
+  }
+  const refreshStartedAt = Date.now();
+  _crossTabRefreshLocked = true;
+  _crossTabRefreshStartedAt = refreshStartedAt;
+  publishRefreshMessage({ type: 'refresh-start', owner: _refreshTabId, startedAt: refreshStartedAt });
   const hasCsrf = !!getCsrfToken();
   const hasSession = document.cookie.includes(COOKIE_SESSION);
   const hasRefresh = document.cookie.includes('rcc_refresh');
   console.warn(`[auth] doRefresh: cookies present: session=${hasSession} refresh=${hasRefresh} csrf=${hasCsrf}`);
 
   // Use rawFetch so the CSRF token is automatically attached
-  const res = await rawFetch('/api/auth/refresh', { method: 'POST' });
+  let refreshOk = false;
+  try {
+    const res = await rawFetch('/api/auth/refresh', { method: 'POST' });
   // 5xx means server is temporarily unavailable, not that the session expired.
   // Throw so callers can distinguish "no session" (false) from "server down" (throws).
   if (res.status >= 500) {
@@ -264,7 +334,6 @@ async function doRefresh(): Promise<boolean> {
     console.warn(`[auth] doRefresh: server error ${res.status}: ${body}`);
     _lastRefreshFailure = { status: res.status, body };
     _refreshRetryAt = Date.now() + RETRY_REFRESH_MS;
-    _refreshChannel?.postMessage('refresh-done');
     throw new ApiError(res.status, body);
   }
   if (!res.ok) {
@@ -284,15 +353,25 @@ async function doRefresh(): Promise<boolean> {
       _lastRefreshFailure = null;
       _refreshRetryAt = 0;
     }
-    _refreshChannel?.postMessage('refresh-done');
   } else {
     _lastRefreshFailure = null;
     _refreshRetryAt = 0;
     _lastRefreshAt = Date.now();
     console.warn(`[auth] doRefresh OK — token refreshed`);
-    _refreshChannel?.postMessage('refresh-done');
+    refreshOk = true;
   }
   return res.ok;
+  } catch (error) {
+    if (error instanceof ApiError && error.status >= 500) throw error;
+    const body = error instanceof Error ? error.message : 'server_unavailable';
+    _lastRefreshFailure = { status: 503, body };
+    _refreshRetryAt = Date.now() + RETRY_REFRESH_MS;
+    throw error;
+  } finally {
+    _crossTabRefreshLocked = false;
+    _crossTabRefreshStartedAt = 0;
+    publishRefreshMessage({ type: 'refresh-done', owner: _refreshTabId, ok: refreshOk });
+  }
 }
 
 /** Attempt a token refresh. Returns true if successful. Exported for use by WsClient. */
@@ -333,7 +412,7 @@ export function startProactiveRefresh(): void {
   _refreshTimerId = setInterval(() => {
     void refreshSession().then((ok) => {
       if (!ok) scheduleRetry();
-    });
+    }).catch(() => { scheduleRetry(); });
   }, PROACTIVE_REFRESH_MS);
 }
 

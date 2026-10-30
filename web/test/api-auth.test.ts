@@ -27,9 +27,36 @@ function jsonResponse(body: unknown, status = 200): Response {
   });
 }
 
+class TestRefreshChannel {
+  static instances: TestRefreshChannel[] = [];
+  private readonly listeners = new Set<(event: MessageEvent) => void>();
+  readonly sent: unknown[] = [];
+  get listenerCount(): number { return this.listeners.size; }
+
+  constructor() {
+    TestRefreshChannel.instances.push(this);
+  }
+
+  addEventListener(_type: string, listener: (event: MessageEvent) => void): void {
+    this.listeners.add(listener);
+  }
+
+  postMessage(message: unknown): void {
+    this.sent.push(message);
+  }
+
+  emit(data: unknown): void {
+    const event = { data } as MessageEvent;
+    for (const listener of this.listeners) listener(event);
+  }
+
+  close(): void {}
+}
+
 describe('auth nonce exchange API', () => {
   beforeEach(() => {
     vi.resetModules();
+    TestRefreshChannel.instances = [];
     vi.stubGlobal('fetch', vi.fn());
     vi.stubGlobal('Capacitor', {
       getPlatform: () => 'android',
@@ -113,6 +140,97 @@ describe('auth nonce exchange API', () => {
     configure('');
     await expect(apiFetch('/api/protected')).rejects.toMatchObject({ status: 429 });
     expect(fetchMock.mock.calls.some(([url]) => String(url).endsWith('/api/auth/user/me'))).toBe(false);
+  });
+
+  it('waits for another tab to finish refresh and verifies the session before retrying', async () => {
+    vi.stubGlobal('BroadcastChannel', TestRefreshChannel);
+    const fetchMock = vi.mocked(fetch);
+    fetchMock
+      .mockResolvedValueOnce(new Response('', { status: 401 }))
+      .mockResolvedValueOnce(jsonResponse({ id: 'user-1' }))
+      .mockResolvedValueOnce(jsonResponse({ ok: true }));
+    const expired = vi.fn();
+    const { apiFetch, onAuthExpired } = await import('../src/api.js');
+    onAuthExpired(expired);
+    const channel = TestRefreshChannel.instances.find((candidate) => candidate.listenerCount === 1);
+    expect(channel).not.toBeNull();
+    expect(globalThis.BroadcastChannel).toBe(TestRefreshChannel);
+    expect(channel!.listenerCount).toBe(1);
+    channel!.emit('refresh-start');
+
+    const request = apiFetch('/api/protected');
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    channel!.emit('refresh-done');
+
+    await expect(request).resolves.toEqual({ ok: true });
+    expect(expired).not.toHaveBeenCalled();
+    expect(fetchMock.mock.calls.map(([url]) => String(url))).toEqual([
+      '/api/protected',
+      '/api/auth/user/me',
+      '/api/protected',
+    ]);
+  });
+
+  it('does not assume a stale cross-tab lock succeeded after a fixed delay', async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal('BroadcastChannel', TestRefreshChannel);
+    const fetchMock = vi.mocked(fetch);
+    fetchMock
+      .mockResolvedValueOnce(new Response('', { status: 401 }))
+      .mockResolvedValueOnce(jsonResponse({ id: 'user-1' }))
+      .mockResolvedValueOnce(jsonResponse({ ok: true }));
+    const expired = vi.fn();
+    const { apiFetch, onAuthExpired } = await import('../src/api.js');
+    onAuthExpired(expired);
+    const channel = TestRefreshChannel.instances.find((candidate) => candidate.listenerCount === 1);
+    channel!.emit({ type: 'refresh-start', owner: 'crashed-tab', startedAt: Date.now() });
+
+    const request = apiFetch('/api/protected');
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    await vi.advanceTimersByTimeAsync(5_000);
+    await expect(request).resolves.toEqual({ ok: true });
+    expect(expired).not.toHaveBeenCalled();
+    vi.useRealTimers();
+  });
+
+  it('keeps auth on a transient refresh network failure', async () => {
+    const fetchMock = vi.mocked(fetch);
+    fetchMock
+      .mockResolvedValueOnce(new Response('', { status: 401 }))
+      .mockRejectedValueOnce(new TypeError('network down'));
+    const expired = vi.fn();
+    const { apiFetch, onAuthExpired } = await import('../src/api.js');
+    onAuthExpired(expired);
+    await expect(apiFetch('/api/protected')).rejects.toMatchObject({ status: 503 });
+    expect(expired).not.toHaveBeenCalled();
+  });
+
+  it('only ends auth after invalid refresh and an independently failed /me check', async () => {
+    const fetchMock = vi.mocked(fetch);
+    fetchMock
+      .mockResolvedValueOnce(new Response('', { status: 401 }))
+      .mockResolvedValueOnce(new Response('', { status: 401 }))
+      .mockResolvedValueOnce(new Response('', { status: 401 }))
+      .mockResolvedValueOnce(new Response('', { status: 401 }));
+    const expired = vi.fn();
+    const { apiFetch, onAuthExpired } = await import('../src/api.js');
+    onAuthExpired(expired);
+    await expect(apiFetch('/api/protected')).rejects.toMatchObject({ status: 401 });
+    expect(expired).toHaveBeenCalledOnce();
+  });
+
+  it('does not clear auth when a successful refresh response did not repair the original request', async () => {
+    const fetchMock = vi.mocked(fetch);
+    fetchMock
+      .mockResolvedValueOnce(new Response('', { status: 401 }))
+      .mockResolvedValueOnce(jsonResponse({ ok: true }))
+      .mockResolvedValueOnce(new Response('', { status: 401 }));
+    const expired = vi.fn();
+    const { apiFetch, onAuthExpired } = await import('../src/api.js');
+    onAuthExpired(expired);
+    await expect(apiFetch('/api/protected')).rejects.toMatchObject({ status: 401 });
+    expect(expired).not.toHaveBeenCalled();
   });
 
   it('retries transient failures with exponential backoff', async () => {
