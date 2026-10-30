@@ -48,6 +48,7 @@ import {
   type SharedContextProjectionScope,
 } from '../../../shared/memory-scope.js';
 import { computeProjectionContentHash } from '../memory/citation.js';
+import { sanitizePostgresJson, PostgresJsonSafetyError } from '../../../shared/postgres-json-safe.js';
 import logger from '../util/logger.js';
 import { SUPERVISION_USER_DEFAULT_PREF_KEY, parseSupervisorDefaultConfig, normalizeSupervisorDefaultConfig } from '../../../shared/supervision-config.js';
 import {
@@ -682,10 +683,30 @@ serverRoutes.post('/:id/shared-context/processed', async (c) => {
     const safeEnterpriseId = isPersonal ? null : (serverRow.teamId ?? projection.namespace.enterpriseId ?? null);
     const safeWorkspaceId = isPersonal ? null : (projection.namespace.workspaceId ?? null);
     const safeUserId = isPersonal ? serverRow.userId : (projection.namespace.userId ?? null);
+    let safeContent: unknown;
+    let safeSourceEventIds: unknown;
+    let contentWasSanitized = false;
+    try {
+      const contentResult = sanitizePostgresJson(projection.content);
+      const sourceEventIdsResult = sanitizePostgresJson(projection.sourceEventIds);
+      safeContent = contentResult.value;
+      safeSourceEventIds = sourceEventIdsResult.value;
+      contentWasSanitized = contentResult.changed || sourceEventIdsResult.changed;
+    } catch (error) {
+      if (error instanceof PostgresJsonSafetyError) {
+        logger.warn({ projectionId: projection.id, reason: error.message }, 'Rejected unsafe processed projection JSON');
+        return c.json({ error: error.message, projectionId: projection.id }, 400);
+      }
+      throw error;
+    }
     const safeSummary = stripPostgresNulBytes(projection.summary);
+    if (safeSummary !== projection.summary) contentWasSanitized = true;
+    if (contentWasSanitized) {
+      logger.warn({ projectionId: projection.id }, 'Sanitized NUL bytes from processed projection JSON');
+    }
     const contentHash = computeProjectionContentHash({
-      summary: projection.summary,
-      content: projection.content,
+      summary: safeSummary,
+      content: safeContent,
     });
     // `id` is the table's global key and the daemon chooses it. The update half of the upsert may only touch a row this server (or, for
     // a personal projection, this same user) already owns; without that a daemon that knows another user's projection id rewrote it.
@@ -722,9 +743,9 @@ serverRoutes.post('/:id/shared-context/processed', async (c) => {
         safeUserId,
         projection.namespace.projectId,
         projection.class,
-        JSON.stringify(projection.sourceEventIds),
+        JSON.stringify(safeSourceEventIds),
         safeSummary,
-        JSON.stringify(projection.content),
+        JSON.stringify(safeContent),
         contentHash,
         projection.origin,
         projection.createdAt,
@@ -765,7 +786,7 @@ serverRoutes.post('/:id/shared-context/processed', async (c) => {
           projection.namespace.projectId,
           projection.class,
           safeSummary,
-          JSON.stringify(projection.content),
+          JSON.stringify(safeContent),
           projection.origin,
           projection.createdAt,
           projection.updatedAt,
