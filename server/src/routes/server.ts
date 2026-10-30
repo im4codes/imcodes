@@ -647,13 +647,10 @@ serverRoutes.delete('/:id/bindings', async (c) => {
 });
 
 /**
- * Postgres text/jsonb columns reject a literal NUL byte outright ("invalid
- * byte sequence for encoding UTF8: 0x00"), unlike the daemon's local SQLite
- * store. A single processed summary carrying one — observed from real
- * production replication traffic — permanently failed every retry of this
- * whole batch insert, silently starving memory sync for every project behind
- * that daemon. jsonb fields go through JSON.stringify first, which escapes
- * NUL as \u0000 and is safe; only the raw `summary` text parameter is at risk.
+ * PostgreSQL text/jsonb columns reject literal NUL bytes outright. Processed
+ * replication therefore sanitizes both raw summary text and JSONB values
+ * before persistence; a single malformed projection must not poison retries
+ * for the rest of a daemon's batch.
  */
 function stripPostgresNulBytes(text: string): string {
   return text.replace(/\u0000/g, '�');
@@ -710,7 +707,9 @@ serverRoutes.post('/:id/shared-context/processed', async (c) => {
     });
     // `id` is the table's global key and the daemon chooses it. The update half of the upsert may only touch a row this server (or, for
     // a personal projection, this same user) already owns; without that a daemon that knows another user's projection id rewrote it.
-    const upsert = await c.env.DB.execute(
+    let upsert: { changes: number };
+    try {
+      upsert = await c.env.DB.execute(
       `INSERT INTO shared_context_projections (
         id, server_id, scope, enterprise_id, workspace_id, user_id, project_id,
         projection_class, source_event_ids_json, summary, content_json,
@@ -752,13 +751,18 @@ serverRoutes.post('/:id/shared-context/processed', async (c) => {
         projection.updatedAt,
         now,
       ],
-    );
+      );
+    } catch (error) {
+      logger.error({ projectionId: projection.id, error }, 'Processed projection persistence failed');
+      return c.json({ error: 'processed_replication_failed', projectionId: projection.id }, 503);
+    }
     if (upsert.changes === 0) continue; // an id that belongs to someone else: nothing written, nothing counted
     acceptedCount += 1;
     acceptedProjections.push(projection);
 
     if (projection.class === 'durable_memory_candidate') {
-      await c.env.DB.execute(
+      try {
+        await c.env.DB.execute(
         `INSERT INTO shared_context_records (
           id, projection_id, server_id, scope, enterprise_id, workspace_id, user_id, project_id,
           record_class, summary, content_json, status, origin, created_at, updated_at
@@ -791,7 +795,11 @@ serverRoutes.post('/:id/shared-context/processed', async (c) => {
           projection.createdAt,
           projection.updatedAt,
         ],
-      );
+        );
+      } catch (error) {
+        logger.error({ projectionId: projection.id, error }, 'Processed projection record persistence failed');
+        return c.json({ error: 'processed_replication_failed', projectionId: projection.id }, 503);
+      }
     }
   }
 
@@ -799,10 +807,14 @@ serverRoutes.post('/:id/shared-context/processed', async (c) => {
   import('../util/embedding.js').then(({ storeProjectionEmbedding }) => {
     for (const projection of acceptedProjections) {
       if (projection.summary) {
-        storeProjectionEmbedding(c.env.DB, projection.id, projection.summary).catch(() => {});
+        storeProjectionEmbedding(c.env.DB, projection.id, projection.summary).catch((error) => {
+          logger.warn({ projectionId: projection.id, error }, 'Processed projection embedding persistence failed');
+        });
       }
     }
-  }).catch(() => {});
+  }).catch((error) => {
+    logger.warn({ error }, 'Processed projection embedding module load failed');
+  });
 
   return c.json({
     ok: true,

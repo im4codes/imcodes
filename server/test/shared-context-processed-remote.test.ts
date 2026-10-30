@@ -510,6 +510,47 @@ describe('shared-context processed remote route', () => {
     expect(projectionRows.at(-1)?.content_hash).toBe(persistedProjection.content_hash);
   });
 
+  it('turns a rejected projection write into a 503 and keeps the next request healthy', async () => {
+    const { db, projectionRows } = makeMockDb();
+    const originalExecute = db.execute.bind(db);
+    let rejectNextProjectionWrite = true;
+    (db as unknown as {
+      execute: (sql: string, params?: unknown[]) => Promise<{ changes: number }>;
+    }).execute = async (sql, params = []) => {
+      if (rejectNextProjectionWrite && sql.toLowerCase().includes('insert into shared_context_projections')) {
+        rejectNextProjectionWrite = false;
+        throw new Error('22P05: unsupported Unicode escape sequence');
+      }
+      return originalExecute(sql, params);
+    };
+
+    const app = new Hono<{ Bindings: Env }>();
+    app.route('/api/server', serverRoutes);
+    const request = () => app.request('/api/server/srv-1/shared-context/processed', {
+      method: 'POST',
+      headers: { authorization: 'Bearer daemon-token', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        namespace: { scope: 'project_shared', projectId: 'github.com/acme/repo', enterpriseId: 'ent-1' },
+        projections: [{
+          id: 'proj-db-rejection',
+          namespace: { scope: 'project_shared', projectId: 'github.com/acme/repo', enterpriseId: 'ent-1' },
+          class: 'recent_summary', origin: 'chat_compacted', sourceEventIds: ['evt-1'],
+          summary: 'healthy summary', content: { ok: true }, createdAt: 100, updatedAt: 110,
+        }],
+      }),
+    }, makeEnv(db));
+
+    const failed = await request();
+    expect(failed.status).toBe(503);
+    expect(await failed.json()).toEqual({ error: 'processed_replication_failed', projectionId: 'proj-db-rejection' });
+    expect(projectionRows).toHaveLength(0);
+
+    const recovered = await request();
+    expect(recovered.status).toBe(200);
+    expect(await recovered.json()).toEqual(expect.objectContaining({ ok: true, projectionCount: 1 }));
+    expect(projectionRows).toHaveLength(1);
+  });
+
   it('skips noisy API error projections during remote replication', async () => {
     const { db, projectionRows, recordRows } = makeMockDb();
     const app = new Hono<{ Bindings: Env }>();
