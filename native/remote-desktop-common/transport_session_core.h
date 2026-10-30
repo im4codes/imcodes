@@ -260,7 +260,8 @@ class TransportSessionCore final {
   bool CandidateIsValid(const IceCandidate& candidate) const noexcept;
   bool FlushRemoteIce();
   bool FlushLocalIce();
-  bool ApplyQualityTarget(const QualityTarget& target);
+  bool ApplyQualityTarget(const QualityTarget& target,
+                          bool* deferred = nullptr);
   bool QualitySelectionIsValid(
       const QualitySelection& selection) const noexcept;
   bool ObserveTime(TransportTime now) noexcept;

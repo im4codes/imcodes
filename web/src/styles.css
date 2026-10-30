@@ -10939,11 +10939,11 @@ button.quick-agent-delegation-preset.active {
      popups and text-selection handles mean nothing anywhere in it. Fields that
      are typed into keep selection (below). */
   display: grid;
-  /* The 3rd row only ever gets a grid item (the docked mobile keyboard) while
-     it is open; with no item placed there it collapses to 0 height, so the
-     stage (row 2, 1fr) and footer (last row) are unaffected the rest of the
-     time. */
-  grid-template-rows: auto minmax(0, 1fr) auto auto;
+  /* The control notice gets its own auto row, so it can never consume the
+     stage's 1fr row. The 4th row only gets a grid item (the docked mobile
+     keyboard) while it is open; with no item placed there it collapses to 0
+     height, so the stage (row 3) and footer (last row) keep their space. */
+  grid-template-rows: auto auto minmax(0, 1fr) auto auto;
   overflow: hidden;
   color: var(--text-primary, #eef5ff);
   background: #07101c;
