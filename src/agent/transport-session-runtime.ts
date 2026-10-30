@@ -438,7 +438,7 @@ const CODEX_RUNTIME_ROLLOUT_BACKSTOP_MIN_AGE_MS = 2_000;
 // Env override for tuning: IMCODES_TRANSPORT_STALE_ACTIVE_TURN_WITH_TOOL_MS.
 const TRANSPORT_STALE_ACTIVE_TURN_WITH_TOOL_MS = (() => {
   const raw = Number.parseInt(process.env.IMCODES_TRANSPORT_STALE_ACTIVE_TURN_WITH_TOOL_MS ?? '', 10);
-  return Number.isFinite(raw) && raw >= 60_000 ? raw : 15 * 60_000;
+  return Number.isFinite(raw) && raw >= 60_000 ? raw : 60 * 60_000;
 })();
 const TRANSPORT_STALE_SILENT_ACTIVE_TURN_MS = (() => {
   const raw = Number.parseInt(process.env.IMCODES_TRANSPORT_STALE_SILENT_ACTIVE_TURN_MS ?? '', 10);
