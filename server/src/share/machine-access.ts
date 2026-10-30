@@ -306,7 +306,7 @@ export async function resolveRemoteDesktopHostAccess(
       WHERE s.id = $3
         AND s.revoked_at IS NULL
         AND ${ACTIVE_ACCOUNTS_ACCESS_PREDICATE}
-        AND (s.user_id = $1 OR sh.id IS NOT NULL OR ${IS_MEMBER_OF_A_MACHINE_GROUP})
+        AND (s.user_id = $1 OR effective_access.role IS NOT NULL)
       LIMIT 1`,
     [userId, now, serverId],
   );
