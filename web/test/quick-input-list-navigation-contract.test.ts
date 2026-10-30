@@ -5,16 +5,16 @@ import { moveListboxIndex, normalizeListboxIndex } from '../src/hooks/useListbox
 
 const WEB_ROOT = resolve(__dirname, '..');
 
-describe('# @ ; ^ shared keyboard-list navigation contract', () => {
+describe('# @ ; ^ % shared keyboard-list navigation contract', () => {
   it('routes all four composer shortcut lists through the same hook', () => {
     const controls = readFileSync(resolve(WEB_ROOT, 'src/components/SessionControls.tsx'), 'utf8');
     const atPicker = readFileSync(resolve(WEB_ROOT, 'src/components/AtPicker.tsx'), 'utf8');
     const shared = readFileSync(resolve(WEB_ROOT, 'src/hooks/useListboxNavigation.ts'), 'utf8');
 
-    // SessionControls owns # phrases, ; aliases, and ^ machines. @ is hosted by
+    // SessionControls owns # phrases, ; aliases, ^ machines, and % pair tasks. @ is hosted by
     // AtPicker. Keeping this call-count contract prevents the next shortcut
     // list from quietly returning to one-off Arrow/scroll logic.
-    expect(controls.match(/useListboxNavigation\(\{/g)).toHaveLength(3);
+    expect(controls.match(/useListboxNavigation\(\{/g)).toHaveLength(4);
     expect(atPicker.match(/useListboxNavigation\(\{/g)).toHaveLength(1);
     expect(shared).toContain("scrollIntoView({ block: 'nearest' })");
     expect(shared).toContain("'PageUp'");
