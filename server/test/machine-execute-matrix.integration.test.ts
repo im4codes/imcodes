@@ -142,9 +142,9 @@ async function admits(name: string, action: MachineAction, token?: string): Prom
 /** Who may EXECUTE (exec, shell, GUI input, file send / fetch): the owner, direct grantee, and valid group participants. */
 const MAY_EXECUTE = ['owner', 'pNo', 'pYes', 'gMember', 'gAdmin', 'viewerAndGroup', 'groupAndGrant'];
 /** Directory listing is a bounded shared-picker capability for group participants, not file read/fetch authority. */
-const MAY_LIST = ['owner', 'pYes', 'gMember', 'gAdmin', 'groupAndGrant'];
+const MAY_LIST = ['owner', 'pNo', 'pYes', 'gMember', 'gAdmin', 'viewerAndGroup', 'groupAndGrant'];
 /** Who may merely operate (view-class): every access that is not a viewer / nothing. */
-const MAY_VIEW = ['owner', 'pNo', 'pYes', 'gMember', 'gAdmin', 'groupAndGrant'];
+const MAY_VIEW = ['owner', 'pNo', 'pYes', 'gMember', 'gAdmin', 'viewerAndGroup', 'groupAndGrant'];
 
 describe('role x action matrix (real resolvers, real routes)', () => {
   it('resolves canonical node_id aliases before admitting both relay routes', async () => {

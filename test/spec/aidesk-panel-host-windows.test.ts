@@ -5,6 +5,7 @@
  */
 import { createHash } from 'node:crypto';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -167,6 +168,49 @@ describe('WebView2 SDK pin', () => {
     writeFileSync(lockPath, JSON.stringify({ schemaVersion: 1, package: { ...pin, sha256: createHash('sha256').update(good).digest('hex') } }));
     await expect(fetchSdk.fetchWebview2Sdk({ out, lockPath, fetchBytes: async () => Buffer.from('tampered') })).rejects.toThrow(/sha256 mismatch/u);
     expect(() => readFileSync(join(out, '.cache', `${pin.name}.${pin.version}.nupkg`))).toThrow();
+  });
+
+  it('retries a response-body interruption, then succeeds without an extra request after recovery', async () => {
+    let attempts = 0;
+    const server = createServer((_request, response) => {
+      attempts += 1;
+      if (attempts < 3) {
+        response.writeHead(200, { 'content-length': '10' });
+        response.write('partial');
+        response.destroy();
+        return;
+      }
+      response.end('complete');
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    try {
+      const address = server.address();
+      if (!address || typeof address === 'string') throw new Error('test_server_not_listening');
+      const bytes = await fetchSdk.download(`http://127.0.0.1:${address.port}`);
+      expect(bytes.toString()).toBe('complete');
+      expect(attempts).toBe(3);
+    } finally {
+      await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    }
+  });
+
+  it('stops after the bounded retry budget when every response body is interrupted', async () => {
+    let attempts = 0;
+    const server = createServer((_request, response) => {
+      attempts += 1;
+      response.writeHead(200, { 'content-length': '10' });
+      response.write('partial');
+      response.destroy();
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    try {
+      const address = server.address();
+      if (!address || typeof address === 'string') throw new Error('test_server_not_listening');
+      await expect(fetchSdk.download(`http://127.0.0.1:${address.port}`)).rejects.toThrow();
+      expect(attempts).toBe(3);
+    } finally {
+      await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    }
   });
 });
 
