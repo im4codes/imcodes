@@ -49,6 +49,26 @@ async function spawnWrapperWithGrandchild(): Promise<{ wrapperPid: number; grand
   });
 }
 
+async function spawnDetachedWrapperThatExits(): Promise<{ child: ReturnType<typeof spawn>; wrapperPid: number; grandchildPid: number }> {
+  return await new Promise((resolve, reject) => {
+    const child = spawn('bash', ['-c', 'sleep 60 & child=$!; echo $child; exit 0'], {
+      detached: true,
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    if (child.pid == null) { reject(new Error('spawn returned no pid')); return; }
+    let stdout = '';
+    child.stdout.on('data', (chunk) => {
+      stdout += chunk.toString('utf8');
+      const m = stdout.match(/^(\d+)\s*$/m);
+      if (m) {
+        child.once('exit', () => resolve({ child, wrapperPid: child.pid!, grandchildPid: Number(m[1]) }));
+      }
+    });
+    child.once('error', reject);
+    setTimeout(() => reject(new Error('timed out waiting for detached wrapper')), 5_000).unref?.();
+  });
+}
+
 describeOrSkip('killProcessTree (POSIX)', () => {
   it('collectDescendantPids finds the grandchild of a wrapper', async () => {
     const { wrapperPid, grandchildPid } = await spawnWrapperWithGrandchild();
@@ -77,6 +97,21 @@ describeOrSkip('killProcessTree (POSIX)', () => {
 
     expect(pidAlive(wrapperPid)).toBe(false);
     expect(pidAlive(grandchildPid)).toBe(false);
+  });
+
+  it('reaps a detached grandchild after the wrapper has already exited', async () => {
+    const { child, wrapperPid, grandchildPid } = await spawnDetachedWrapperThatExits();
+    try {
+      expect(pidAlive(wrapperPid)).toBe(false);
+      expect(pidAlive(grandchildPid)).toBe(true);
+      await killProcessTree(child, { ownsProcessGroup: true, gracefulMs: 100 });
+      await new Promise((r) => setTimeout(r, 300));
+      expect(pidAlive(grandchildPid)).toBe(false);
+    } finally {
+      if (pidAlive(grandchildPid)) {
+        try { process.kill(grandchildPid, 'SIGKILL'); } catch { /* already gone */ }
+      }
+    }
   });
 
   it('SIGKILLs the root ChildProcess even after Node marks SIGTERM as sent', async () => {

@@ -1231,6 +1231,9 @@ describe('CodexSdkProvider', () => {
       activeToolCount: 0,
       busyReasons: [],
     });
+    // The leader has already emitted `exit`; cleanup must still reap the
+    // detached generation that can contain Codex-launched MCP stdio children.
+    expect(child.child.killed).toBe(true);
   });
 
   it('terminalizes active current work before reporting app-server stdout EOF', async () => {
@@ -1275,6 +1278,7 @@ describe('CodexSdkProvider', () => {
       activeToolCount: 0,
       busyReasons: [],
     });
+    expect(child.child.killed).toBe(true);
   });
 
   it('terminalizes open provider tools during intentional app-server shutdown without connection error', async () => {
@@ -3993,6 +3997,10 @@ describe('CodexSdkProvider', () => {
       'activeItemIds',
       'activeToolItemCount',
       'activeToolItemIds',
+      'appServerCleanupPending',
+      'appServerGeneration',
+      'appServerPid',
+      'appServerRecoveryPolicy',
       'activeCompactionItemCount',
       'activeReason',
       'cancelTimerArmed',
@@ -4020,6 +4028,12 @@ describe('CodexSdkProvider', () => {
       'threadId',
       'turnStartInFlight',
     ].sort());
+    expect(diagnostics).toMatchObject({
+      appServerGeneration: 1,
+      appServerPid: null,
+      appServerCleanupPending: false,
+      appServerRecoveryPolicy: 'auth-change-or-disconnect-only',
+    });
     expect(JSON.stringify(diagnostics)).not.toContain('secret');
     expect(JSON.stringify(diagnostics)).not.toContain('/tmp/project');
   });

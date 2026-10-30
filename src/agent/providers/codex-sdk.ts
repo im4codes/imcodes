@@ -2699,6 +2699,14 @@ export class CodexSdkProvider implements TransportProvider {
   private pendingRequests = new Map<number, PendingRequest>();
   private appServerAuthFingerprint: string | null = null;
   private appServerRestart: Promise<void> | null = null;
+  /**
+   * Teardown of a disconnected app-server generation may outlive its exit
+   * event: the Codex wrapper can leave MCP stdio descendants behind after the
+   * leader has already exited.  Keep that cleanup promise visible so a new
+   * generation never starts before the old process group has been signalled.
+   */
+  private appServerCleanup: Promise<void> | null = null;
+  private appServerGeneration = 0;
   private imcodesMcpReload: Promise<void> | null = null;
   private rawSpawnAgentCalls = new Map<string, CodexRawSpawnAgentCall>();
   private rawNativeCollabCalls = new Map<string, { sessionId: string; name: string }>();
@@ -2785,6 +2793,12 @@ export class CodexSdkProvider implements TransportProvider {
               : null;
     return {
       provider: this.id,
+      appServerGeneration: this.appServerGeneration,
+      appServerPid: this.child?.pid ?? null,
+      appServerCleanupPending: Boolean(this.appServerCleanup),
+      // RSS is not a safe restart signal: Codex can hold a legitimate large
+      // context and an active turn must never be torn down speculatively.
+      appServerRecoveryPolicy: 'auth-change-or-disconnect-only',
       routeId: state.routeId,
       active: activeReason !== null,
       activeReason,
@@ -3359,6 +3373,19 @@ export class CodexSdkProvider implements TransportProvider {
     this.child = null;
     this.rl = null;
     this.appServerAuthFingerprint = null;
+    void this.reapAppServerGeneration(child);
+  }
+
+  private reapAppServerGeneration(child: ChildProcessWithoutNullStreams): Promise<void> {
+    if (this.appServerCleanup) return this.appServerCleanup;
+    const cleanup = killProcessTree(child, { ownsProcessGroup: true }).catch((error) => {
+      logger.warn({ provider: this.id, err: error }, 'Codex app-server descendant cleanup failed');
+    });
+    const tracked = cleanup.finally(() => {
+      if (this.appServerCleanup === tracked) this.appServerCleanup = null;
+    });
+    this.appServerCleanup = tracked;
+    return tracked;
   }
 
   private async stopAppServer(options: { clearSessions: boolean }): Promise<void> {
@@ -3383,9 +3410,12 @@ export class CodexSdkProvider implements TransportProvider {
     // `child.kill('SIGTERM')` only terminates the node wrapper; the native
     // codex binary it spawned lives on and leaks ~60MB per abandoned pair.
     // Walk the descendant tree and tree-kill instead.
-    if (child && !child.killed) {
-      await killProcessTree(child, { ownsProcessGroup: true });
-    }
+    if (child) await this.reapAppServerGeneration(child);
+    // A prior EOF/crash may have already detached the generation from
+    // `this.child`; wait for its process-tree cleanup before a replacement is
+    // spawned.  This closes the race that otherwise accumulated PPID=1 MCP
+    // children across reconnect/auth-restart loops.
+    if (this.appServerCleanup) await this.appServerCleanup;
     this.threadToSession.clear();
     this.rawSpawnAgentCalls.clear();
     this.rawNativeCollabCalls.clear();
@@ -3565,6 +3595,7 @@ export class CodexSdkProvider implements TransportProvider {
       env: spawnEnv,
       windowsHide: true,
     });
+    this.appServerGeneration += 1;
     this.child = child;
     this.rl = readline.createInterface({ input: gateChildStream(child.stdout) });
     this.rl.on('line', (line) => this.handleLine(child, line));
