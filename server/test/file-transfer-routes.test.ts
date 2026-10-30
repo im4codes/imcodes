@@ -1165,6 +1165,51 @@ describe('file-transfer upload route', () => {
       }),
     ]);
   });
+
+  it('drops daemon progress that arrives after the client cancels the stream', async () => {
+    let onProgress: ((payload: Record<string, unknown>) => void) | undefined;
+    let resolveDaemon!: (result: unknown) => void;
+    sendFileTransferRequestMock.mockImplementationOnce(async (_requestId, _message, _timeoutMs, progress) => {
+      onProgress = progress;
+      return new Promise((resolve) => {
+        resolveDaemon = resolve;
+      });
+    });
+
+    const form = new FormData();
+    form.append('file', new File(['hello!'], 'hello.txt', { type: 'text/plain' }));
+    const response = await makeApp().request('/api/server/srv-1/upload', {
+      method: 'POST',
+      headers: {
+        Authorization: 'Bearer test',
+        Accept: 'application/x-ndjson',
+      },
+      body: form,
+    });
+
+    const reader = response.body!.getReader();
+    await expect(reader.read()).resolves.toMatchObject({ done: false });
+    await reader.cancel();
+
+    expect(() => onProgress?.({
+      type: 'file.upload_progress',
+      uploadId: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+      loaded: 3,
+      total: 6,
+    })).not.toThrow();
+
+    resolveDaemon({
+      type: 'file.upload_done',
+      attachment: {
+        id: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.txt',
+        source: 'upload',
+        daemonPath: '/tmp/upload.txt',
+        downloadable: true,
+      },
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+  });
 });
 
 describe('file-transfer attachment deletion route', () => {
