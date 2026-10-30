@@ -10,9 +10,11 @@ import type { Env } from '../src/env.js';
 import type { Database } from '../src/db/client.js';
 
 const generateEmbeddingMock = vi.hoisted(() => vi.fn());
+const storeProjectionEmbeddingMock = vi.hoisted(() => vi.fn());
 
 vi.mock('../src/util/embedding.js', () => ({
   generateEmbedding: generateEmbeddingMock,
+  storeProjectionEmbedding: storeProjectionEmbeddingMock,
   embeddingToSql: (embedding: Float32Array) => `[${Array.from(embedding).join(',')}]`,
 }));
 
@@ -27,6 +29,8 @@ vi.mock('../src/security/authorization.js', () => ({
 beforeEach(() => {
   generateEmbeddingMock.mockReset();
   generateEmbeddingMock.mockResolvedValue(null);
+  storeProjectionEmbeddingMock.mockReset();
+  storeProjectionEmbeddingMock.mockResolvedValue(undefined);
   process.env.IMCODES_MEM_FEATURE_ORG_SHARED_AUTHORED_STANDARDS = 'true';
 });
 
@@ -549,6 +553,35 @@ describe('shared-context processed remote route', () => {
     expect(recovered.status).toBe(200);
     expect(await recovered.json()).toEqual(expect.objectContaining({ ok: true, projectionCount: 1 }));
     expect(projectionRows).toHaveLength(1);
+  });
+
+  it('contains a rejected embedding promise so a later request remains healthy', async () => {
+    const { db, projectionRows } = makeMockDb();
+    const app = new Hono<{ Bindings: Env }>();
+    app.route('/api/server', serverRoutes);
+    storeProjectionEmbeddingMock.mockRejectedValueOnce(new Error('embedding unavailable'));
+    const request = () => app.request('/api/server/srv-1/shared-context/processed', {
+      method: 'POST',
+      headers: { authorization: 'Bearer daemon-token', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        namespace: { scope: 'project_shared', projectId: 'github.com/acme/repo', enterpriseId: 'ent-1' },
+        projections: [{
+          id: 'proj-embedding-rejection',
+          namespace: { scope: 'project_shared', projectId: 'github.com/acme/repo', enterpriseId: 'ent-1' },
+          class: 'recent_summary', origin: 'chat_compacted', sourceEventIds: ['evt-1'],
+          summary: 'healthy summary', content: { ok: true }, createdAt: 100, updatedAt: 110,
+        }],
+      }),
+    }, makeEnv(db));
+
+    const first = await request();
+    expect(first.status).toBe(200);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const second = await request();
+    expect(second.status).toBe(200);
+    expect(projectionRows).toHaveLength(2);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(storeProjectionEmbeddingMock).toHaveBeenCalledTimes(2);
   });
 
   it('skips noisy API error projections during remote replication', async () => {
