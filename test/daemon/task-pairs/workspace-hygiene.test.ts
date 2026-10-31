@@ -278,6 +278,14 @@ async function closed(taskId: string): Promise<string> {
   await vi.waitFor(() => expect(pair(taskId).workspace?.strippedAt).toBeTypeOf('number'), { timeout: 15_000, interval: 50 });
   return wt;
 }
+async function closedKept(taskId: string): Promise<string> {
+  const wt = await opened(taskId);
+  weigh(wt);
+  put(join(wt, 'notes.txt'), 'unmerged work');
+  marker(BRAIN, `<!-- IMCODES_TASK DONE ${taskId} force=true -->`);
+  await vi.waitFor(() => expect(pair(taskId).workspace?.strippedAt).toBeTypeOf('number'), { timeout: 15_000, interval: 50 });
+  return wt;
+}
 const diskNotices = () => sent.filter((entry) => entry.target === BRAIN && entry.id.includes(':brain-disk-pressure:'));
 
 describe('workspace hygiene through the pair service', () => {
@@ -361,9 +369,9 @@ describe('workspace hygiene through the pair service', () => {
 
   it('low disk: strips finished pairs oldest first, and tells Brain once per threshold crossing', async () => {
     await opened('OPEN2', EXEC2, AUD2); // an open pair makes Brain reachable and must survive
-    const a = await closed('OLD1');
-    const b = await closed('OLD2');
-    const c = await closed('OLD3');
+    const a = await closedKept('OLD1');
+    const b = await closedKept('OLD2');
+    const c = await closedKept('OLD3');
     const store = getTaskPairStore();
     const endedBase = Date.now() - 10 * 60_000;
     // Closed pairs still holding weight (as before stripping existed), with A the oldest.

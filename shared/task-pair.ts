@@ -214,6 +214,8 @@ export const TASK_PAIR_WORKS_DIR = 'works' as const;
 export const TASK_PAIR_WORKS_ROOT_ENV = 'IMCODES_WORKS_ROOT' as const;
 /** A pair's workspace is removed this long after the pair ends (DONE/CANCEL). */
 export const TASK_PAIR_WORKSPACE_RETENTION_MS = 48 * 60 * 60_000;
+/** A clean, merged DONE workspace is eligible for the terminal sweep immediately. */
+export const TASK_PAIR_DONE_WORKSPACE_RETENTION_MS = 0;
 
 /**
  * Brain notices whose SUBJECT is a pair that has already ended (its workspace was kept, its deliverable was not

@@ -108,7 +108,7 @@ async function opened(taskId: string, attrs = `auditor=${AUD}`): Promise<string>
   return pair(taskId).workspace!.path;
 }
 async function endedAt(taskId: string): Promise<number> {
-  await vi.waitFor(() => expect(pair(taskId).workspace?.status).toBe('ended'), { timeout: 15_000, interval: 50 });
+  await vi.waitFor(() => expect(['ended', 'kept']).toContain(pair(taskId).workspace?.status), { timeout: 15_000, interval: 50 });
   return pair(taskId).workspace!.endedAt!;
 }
 /** Move a pair's end back in time (the worktree GC reads the wall clock). */
@@ -245,6 +245,16 @@ describe('pair workspaces', () => {
     expect(dir).toBe(join(worksRoot, PROJECT, 'D2'));
     expect(pair('D2').workspace?.kind).toBe('dir');
     expect(listedWorktrees()).toEqual([realpathSync(project)]);
+  });
+
+  it('immediately sweeps a clean merged DONE workspace after the terminal transition', async () => {
+    const path = await opened('IMMEDIATE');
+    marker(BRAIN, '<!-- IMCODES_TASK DONE IMMEDIATE force=true -->');
+    await vi.waitFor(() => expect(pair('IMMEDIATE').workspace?.status).toBe('removed'), { timeout: 10_000 });
+    expect(existsSync(path)).toBe(false);
+    expect(workspaceEvents('IMMEDIATE')).toEqual(expect.arrayContaining([
+      expect.objectContaining({ effect: TASK_PAIR_WORKSPACE_EFFECTS.REMOVED }),
+    ]));
   });
 
   for (const [label, end] of [
@@ -795,7 +805,9 @@ describe('pair workspaces', () => {
       }) as typeof timelineEmitter.emit);
     });
 
-    const outputEvents = () => timeline.filter((entry) => entry.payload.verb === TASK_PAIR_WORKSPACE_EVENT_VERB);
+    const outputEvents = () => timeline.filter((entry) => entry.payload.verb === TASK_PAIR_WORKSPACE_EVENT_VERB
+      && (entry.payload.effect === TASK_PAIR_WORKSPACE_EFFECTS.OUTPUT_SAVED
+        || entry.payload.effect === TASK_PAIR_WORKSPACE_EFFECTS.OUTPUT_FAILED));
 
     it('copies the deliverable named on DONE into the project directory and tells the user where', async () => {
       const dir = await opened('O1', 'auditor=none workspace=dir');
@@ -808,12 +820,14 @@ describe('pair workspaces', () => {
       const dest = join(realpathSync(plain), 'reports', 'summary.md');
       await vi.waitFor(() => expect(existsSync(dest)).toBe(true), { timeout: 10_000 });
       expect(readFileSync(dest, 'utf8')).toBe('# result\n');
-      expect(existsSync(join(dir, 'reports', 'summary.md'))).toBe(true);
+      expect(existsSync(join(dir, 'reports', 'summary.md'))).toBe(false);
       await vi.waitFor(() => expect(outputEvents().map((entry) => entry.session)).toContain(BRAIN));
       expect(outputEvents().find((entry) => entry.session === BRAIN)!.payload).toMatchObject({
         effect: TASK_PAIR_WORKSPACE_EFFECTS.OUTPUT_SAVED, outputPath: dest,
       });
-      expect(workspaceEvents('O1')).toEqual([expect.objectContaining({ effect: TASK_PAIR_WORKSPACE_EFFECTS.OUTPUT_SAVED, attrs: expect.objectContaining({ dest }) })]);
+      expect(workspaceEvents('O1')).toEqual(expect.arrayContaining([
+        expect.objectContaining({ effect: TASK_PAIR_WORKSPACE_EFFECTS.OUTPUT_SAVED, attrs: expect.objectContaining({ dest }) }),
+      ]));
     });
 
     it('honours dest= and never overwrites an existing file', async () => {
@@ -834,7 +848,9 @@ describe('pair workspaces', () => {
       marker(EXEC, '<!-- IMCODES_TASK DONE O3 output=../../../secret.txt -->');
       marker(BRAIN, '<!-- IMCODES_TASK DONE O3 -->');
       await vi.waitFor(() => expect(sentTo(BRAIN, 'brain-output-failed')).toHaveLength(1), { timeout: 10_000 });
-      expect(workspaceEvents('O3')).toEqual([expect.objectContaining({ effect: TASK_PAIR_WORKSPACE_EFFECTS.OUTPUT_FAILED, attrs: expect.objectContaining({ reason: 'outside_workspace' }) })]);
+      expect(workspaceEvents('O3')).toEqual(expect.arrayContaining([
+        expect.objectContaining({ effect: TASK_PAIR_WORKSPACE_EFFECTS.OUTPUT_FAILED, attrs: expect.objectContaining({ reason: 'outside_workspace' }) }),
+      ]));
 
       const dir = await opened('O4', 'auditor=none workspace=dir');
       writeFileSync(join(dir, 'a.txt'), 'a\n');
@@ -842,7 +858,9 @@ describe('pair workspaces', () => {
       marker(BRAIN, '<!-- IMCODES_TASK DONE O4 -->');
       await vi.waitFor(() => expect(sentTo(BRAIN, 'brain-output-failed')).toHaveLength(2), { timeout: 10_000 });
       expect(existsSync(join(base, 'escaped.txt'))).toBe(false);
-      expect(workspaceEvents('O4')).toEqual([expect.objectContaining({ attrs: expect.objectContaining({ reason: 'outside_project' }) })]);
+      expect(workspaceEvents('O4')).toEqual(expect.arrayContaining([
+        expect.objectContaining({ attrs: expect.objectContaining({ reason: 'outside_project' }) }),
+      ]));
     });
 
     it('refuses a destination whose existing parent symlink escapes the project', async () => {
@@ -860,10 +878,10 @@ describe('pair workspaces', () => {
       marker(BRAIN, '<!-- IMCODES_TASK DONE O-SYMLINK -->');
       await vi.waitFor(() => expect(sentTo(BRAIN, 'brain-output-failed')).toHaveLength(1), { timeout: 10_000 });
       expect(existsSync(join(outside, 'escaped.md'))).toBe(false);
-      expect(workspaceEvents('O-SYMLINK')).toEqual([expect.objectContaining({
+      expect(workspaceEvents('O-SYMLINK')).toEqual(expect.arrayContaining([expect.objectContaining({
         effect: TASK_PAIR_WORKSPACE_EFFECTS.OUTPUT_FAILED,
         attrs: expect.objectContaining({ reason: 'outside_project' }),
-      })]);
+      })]));
     });
 
     it('copies nothing for temporary work (plain DONE, or CANCEL)', async () => {
@@ -882,7 +900,9 @@ describe('pair workspaces', () => {
       marker(BRAIN, '<!-- IMCODES_TASK CANCEL O6 -->');
       await endedAt('O6');
       await new Promise((resolve) => setTimeout(resolve, 50));
-      expect(workspaceEvents('O5')).toEqual([]);
+      expect(workspaceEvents('O5')).toEqual(expect.arrayContaining([
+        expect.objectContaining({ effect: TASK_PAIR_WORKSPACE_EFFECTS.REMOVED }),
+      ]));
       expect(workspaceEvents('O6')).toEqual([]);
       expect(outputEvents()).toEqual([]);
       expect(existsSync(join(plain, 'scratch.md'))).toBe(false);

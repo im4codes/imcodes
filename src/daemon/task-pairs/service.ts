@@ -36,7 +36,7 @@ import {
   TASK_PAIR_WORKSPACE_NONE,
   TASK_PAIR_WORKSPACE_REPAIR_STATUSES,
   TASK_PAIR_WORKSPACE_EVENT_VERB,
-  TASK_PAIR_WORKSPACE_RETENTION_MS,
+  TASK_PAIR_DONE_WORKSPACE_RETENTION_MS,
   TASK_PAIR_WORKSPACE_KEPT_DIGEST_INTERVAL_MS,
   TASK_PAIR_WORKSPACE_KEPT_DIGEST_MAX_LISTED,
   TASK_PAIR_WORKSPACE_KEPT_DIGEST_REASON,
@@ -1944,7 +1944,17 @@ export class TaskPairService {
     await this.finishNonGitWorkspace(project, taskId);
     // After the deliverable copy: an `output=` path may live inside a directory
     // that is about to be stripped.
-    await this.#stripClosedWorkspace(project, taskId);
+    const stripped = await this.#stripClosedWorkspace(project, taskId);
+    // CANCEL keeps its existing first-sweep semantics. If hygiene could not
+    // complete, leave the workspace for the normal retry path rather than
+    // allowing the immediate removal pass to skip that safety signal.
+    const latest = getTaskPairStore().getPair(project, taskId)?.state;
+    if (!stripped || latest?.status !== 'done') return;
+    // A terminal transition is already serialized through the pair store. Run
+    // one bounded, fail-safe sweep now so clean merged worktrees do not wait
+    // for the hourly scheduler. Dirty/unmerged/locked/unknown workspaces still
+    // go through the same release gate and remain retained.
+    await this.sweepWorkspaces(now, { force: true, announceKept: false });
   }
 
   async #endWorkspaceRetention(project: string, taskId: string, now: number): Promise<void> {
@@ -2171,7 +2181,7 @@ export class TaskPairService {
    * that still holds unsaved work is kept (Brain is told once) and retried on
    * later sweeps. Runs at most hourly unless forced.
    */
-  async sweepWorkspaces(now: number, options: { force?: boolean } = {}): Promise<void> {
+  async sweepWorkspaces(now: number, options: { force?: boolean; announceKept?: boolean } = {}): Promise<void> {
     if (!options.force && now - this.#lastSweepAt < 60 * 60_000) return;
     this.#lastSweepAt = now;
     const store = getTaskPairStore();
@@ -2185,7 +2195,7 @@ export class TaskPairService {
       const pair = stored.state;
       const workspace = pair.workspace;
       if (!workspace || !isTerminalTaskPairStatus(pair.status)) continue;
-      const retentionMs = pair.status === 'cancelled' ? 0 : TASK_PAIR_WORKSPACE_RETENTION_MS;
+      const retentionMs = pair.status === 'cancelled' ? 0 : TASK_PAIR_DONE_WORKSPACE_RETENTION_MS;
       if (now - (workspace.endedAt ?? pair.updatedAt) < retentionMs) continue;
       try {
         const outcome = await this.#releaseEndedWorkspace(stored, now, retentionMs, false);
@@ -2194,10 +2204,12 @@ export class TaskPairService {
         logger.warn({ err: error, taskId: pair.taskId }, 'task-pair: workspace sweep failed');
       }
     }
-    try {
-      await this.#announceKeptWorkspaces(keptThisSweep, now);
-    } catch (error) {
-      logger.warn({ err: error }, 'task-pair: kept-workspace announcement failed');
+    if (options.announceKept !== false) {
+      try {
+        await this.#announceKeptWorkspaces(keptThisSweep, now);
+      } catch (error) {
+        logger.warn({ err: error }, 'task-pair: kept-workspace announcement failed');
+      }
     }
   }
 

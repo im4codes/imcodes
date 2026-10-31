@@ -9,7 +9,7 @@
  * bound` -- a feature that looked present and was permanently inert.
  */
 import { getTaskPairStore } from './task-pairs/store.js';
-import { TASK_PAIR_WORKSPACE_RETENTION_MS, isTerminalTaskPairStatus } from '../../shared/task-pair.js';
+import { TASK_PAIR_DONE_WORKSPACE_RETENTION_MS, isTerminalTaskPairStatus } from '../../shared/task-pair.js';
 import { getSupervisionTaskRegistry, SUPERVISION_REVISION_AUTHORITATIVE_INTENTS } from './supervision-state-store.js';
 import { listSessions, type SessionRecord } from '../store/session-store.js';
 import { resolveEffectiveProjectName } from '../../shared/session-scope.js';
@@ -385,7 +385,7 @@ export function createSupervisionWorktreeGcDeps(): SupervisionWorktreeGcDeps {
         const endedAt = owner.state.workspace?.endedAt ?? owner.state.updatedAt;
         return {
           available: true, found: true, projectName: owner.project, terminal,
-          retentionElapsed: terminal && Date.now() - endedAt >= TASK_PAIR_WORKSPACE_RETENTION_MS,
+          retentionElapsed: terminal && Date.now() - endedAt >= TASK_PAIR_DONE_WORKSPACE_RETENTION_MS,
         };
       } catch {
         return { available: false };
