@@ -11050,6 +11050,7 @@ button.quick-agent-delegation-preset.active {
 .remote-desktop-toolbar-shell {
   position: relative;
   min-width: 0;
+  grid-row: 1;
 }
 
 .remote-desktop-toolbar[hidden] {
@@ -11864,6 +11865,7 @@ button.quick-agent-delegation-preset.active {
 }
 
 .remote-desktop-control-notice {
+  grid-row: 2;
   margin: 0 12px 8px;
   padding: 8px 12px;
   border: 1px solid rgba(255, 176, 87, 0.45);
@@ -11875,6 +11877,10 @@ button.quick-agent-delegation-preset.active {
 }
 
 .remote-desktop-stage {
+  /* Keep the optional control notice from changing which track receives the
+     stage.  Without an explicit row, omitting that notice places this item in
+     the second auto track and leaves the footer in the 1fr track. */
+  grid-row: 3;
   position: relative;
   min-width: 0;
   min-height: 0;
@@ -11910,6 +11916,7 @@ button.quick-agent-delegation-preset.active {
   /* A grid row of its own (see .remote-desktop-panel), not an overlay: opening
      it shrinks the video area above instead of covering it. */
   position: relative;
+  grid-row: 4;
   width: 100%;
   max-height: 45vh;
   overflow-y: auto;
@@ -12549,6 +12556,7 @@ button.quick-agent-delegation-preset.active {
 }
 
 .remote-desktop-footer {
+  grid-row: 5;
   justify-content: space-between;
   flex-wrap: wrap;
   border-top: 1px solid rgb(122 178 218 / 14%);
