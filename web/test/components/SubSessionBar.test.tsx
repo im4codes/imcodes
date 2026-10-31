@@ -1359,6 +1359,61 @@ describe('SubSessionBar', () => {
     expect(second.container.querySelector('.subsession-bar')).not.toBeNull();
   });
 
+  it('opens a context menu for compact buttons without opening the sub-session', () => {
+    const onOpen = vi.fn();
+    const onRename = vi.fn();
+    const onTogglePin = vi.fn();
+    const view = render(
+      <SubSessionBar
+        subSessions={[makeSubSession()]}
+        openIds={new Set()}
+        collapsed
+        onOpen={onOpen}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onRenameSubSession={onRename}
+        onToggleSubSessionPin={onTogglePin}
+        pinnedSubSessionIds={new Set()}
+        ws={null}
+        connected
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+      />,
+    );
+    const button = view.container.querySelector('[data-sub-id="sub-1"]') as HTMLButtonElement;
+    fireEvent.contextMenu(button, { clientX: 9999, clientY: 9999 });
+    expect(document.body.querySelector('[data-testid="subsession-context-menu"]')).not.toBeNull();
+    expect(onOpen).not.toHaveBeenCalled();
+    fireEvent.click(document.body.querySelector('[data-testid="subsession-context-pin"]') as HTMLButtonElement);
+    expect(onTogglePin).toHaveBeenCalledWith('sub-1');
+  });
+
+  it('renders pinned compact sessions before unpinned sessions and supports rename', () => {
+    const onRename = vi.fn();
+    vi.stubGlobal('prompt', vi.fn(() => 'renamed'));
+    const view = render(
+      <SubSessionBar
+        subSessions={[makeSubSession({ id: 'sub-a', sessionName: 'deck_sub_a' }), makeSubSession({ id: 'sub-b', sessionName: 'deck_sub_b' })]}
+        openIds={new Set()}
+        collapsed
+        onOpen={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onRenameSubSession={onRename}
+        pinnedSubSessionIds={new Set(['sub-b'])}
+        ws={null}
+        connected
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+      />,
+    );
+    expect(Array.from(view.container.querySelectorAll('[data-sub-id]')).map((node) => (node as HTMLElement).dataset.subId)).toEqual(['sub-b', 'sub-a']);
+    fireEvent.contextMenu(view.container.querySelector('[data-sub-id="sub-b"]') as HTMLButtonElement, { clientX: 20, clientY: 20 });
+    fireEvent.click(document.body.querySelector('[data-testid="subsession-context-rename"]') as HTMLButtonElement);
+    expect(onRename).toHaveBeenCalledWith('sub-b', 'renamed');
+    vi.unstubAllGlobals();
+  });
+
   it('uses saved codex preference as legacy fallback for collapsed model-less codex-sdk sessions', () => {
     localStorage.setItem('imcodes-codex-model:deck_sub_sub-1', 'gpt-5.5');
     const view = render(

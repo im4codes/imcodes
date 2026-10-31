@@ -132,6 +132,8 @@ interface CollapsedSubSessionButtonProps {
   onEntryDragStart: (id: string, event: JSX.TargetedDragEvent<HTMLButtonElement>) => void;
   onEntryDragOver: (id: string, event: JSX.TargetedDragEvent<HTMLButtonElement>) => void;
   onEntryDragEnd: (id: string, event: JSX.TargetedDragEvent<HTMLButtonElement>) => void;
+  onContextMenu: (id: string, event: JSX.TargetedMouseEvent<HTMLButtonElement>) => void;
+  pinned: boolean;
   t: (key: string, vars?: Record<string, unknown>) => string;
 }
 
@@ -160,6 +162,9 @@ interface Props {
   onRestore?: (id: string) => void;
   onRestoreThenClose?: (id: string) => void;
   onRestart: (id: string) => void;
+  onRenameSubSession?: (id: string, label: string | null) => void;
+  pinnedSubSessionIds?: ReadonlySet<string>;
+  onToggleSubSessionPin?: (id: string) => void;
   onNew?: () => void;
   onViewAutoDeliver?: () => void;
   onViewDiscussions?: () => void;
@@ -218,6 +223,7 @@ interface CardSize { w: number; h: number }
 
 const DEFAULT_SIZE: CardSize = { w: 350, h: 250 };
 export const SUBSESSION_BAR_COLLAPSED_STORAGE_KEY = 'rcc_subcard_collapsed';
+export const SUBSESSION_BAR_COLLAPSED_MIGRATION_KEY = 'rcc_subcard_collapsed_default_v2';
 export const SUBSESSION_QUICK_CLOSED_STORAGE_KEY_PREFIX = 'rcc_subcard_quick_closed_v1:';
 const P2P_MOBILE_COMPACT_STORAGE_KEY = 'rcc_subcard_p2p_hidden';
 const P2P_DESKTOP_COMPACT_STORAGE_KEY = 'rcc_subcard_p2p_desktop_compact';
@@ -354,7 +360,7 @@ function renderTechClock(text: string): JSX.Element {
   );
 }
 
-function CollapsedSubSessionButtonImpl({ sub, accentColor, isOpen, isFocused, idleFlashToken, usage, sharedState, inP2p, draggable, onEntryPointerDown, onEntryTouchStart, onEntryClick, onEntryDoubleClick, onEntryDragStart, onEntryDragOver, onEntryDragEnd, t, detectedModel, orientation = 'horizontal' }: CollapsedSubSessionButtonProps) {
+function CollapsedSubSessionButtonImpl({ sub, accentColor, isOpen, isFocused, idleFlashToken, usage, sharedState, inP2p, draggable, onEntryPointerDown, onEntryTouchStart, onEntryClick, onEntryDoubleClick, onEntryDragStart, onEntryDragOver, onEntryDragEnd, onContextMenu, pinned, t, detectedModel, orientation = 'horizontal' }: CollapsedSubSessionButtonProps) {
   const activeIdleFlashToken = useIdleFlashPlayback(idleFlashToken);
   const agentTag = sub.type === 'shell' ? (sub.shellBin?.split(/[/\\]/).pop() ?? 'shell') : sub.type;
   const label = sub.label ? `${formatLabel(sub.label)} · ${agentTag}` : agentTag;
@@ -385,6 +391,7 @@ function CollapsedSubSessionButtonImpl({ sub, accentColor, isOpen, isFocused, id
       onDragStart={(event) => onEntryDragStart(sub.id, event)}
       onDragOver={(event) => onEntryDragOver(sub.id, event)}
       onDragEnd={(event) => onEntryDragEnd(sub.id, event)}
+      onContextMenu={(event) => onContextMenu(sub.id, event)}
       title={label + (model ? ` · ${model}` : '') + (ctxPct > 0 ? ` · ctx ${ctxPct.toFixed(0)}%` : '')}
       style={{ '--subsession-accent-color': accentColor } as JSX.CSSProperties}
     >
@@ -400,6 +407,7 @@ function CollapsedSubSessionButtonImpl({ sub, accentColor, isOpen, isFocused, id
           glance next to idle/starting. */}
       {isVisuallyBusy(sub.state, false) && <span class="subcard-running" aria-hidden="true">●</span>}
       {sub.state === 'starting' && <span class="subsession-card-badge">…</span>}
+      {pinned && <span class="subsession-card-pin" aria-label={t('session.pinned', { defaultValue: 'Pinned' })}>📌</span>}
       {ctxPct > 0 && (
         <span class="subsession-card-ctx" style={{ width: '100%' }}>
           <span class="subsession-card-ctx-fill" style={{ width: `${ctxPct}%` }} />
@@ -441,6 +449,8 @@ const CollapsedSubSessionButton = memo(CollapsedSubSessionButtonImpl, (prev, nex
   && prev.onEntryDragStart === next.onEntryDragStart
   && prev.onEntryDragOver === next.onEntryDragOver
   && prev.onEntryDragEnd === next.onEntryDragEnd
+  && prev.onContextMenu === next.onContextMenu
+  && prev.pinned === next.pinned
   && prev.t === next.t
   && prev.detectedModel === next.detectedModel
   && prev.orientation === next.orientation
@@ -764,7 +774,7 @@ function DaemonStatsModal({
   );
 }
 
-export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayoutCapable = true, desktopLayout = SUBSESSION_DESKTOP_LAYOUT.HORIZONTAL, onDesktopLayoutChange, desktopDockSide = SUBSESSION_DESKTOP_DOCK_SIDE.RIGHT, onDesktopDockSideChange, verticalRailHost, teamDiscussionLayout = TEAM_DISCUSSION_LAYOUT.BOTTOM, onTeamDiscussionLayoutChange, teamDiscussionRailHost, idleFlashTokens, sharedSubSessionStates, onOpen, onFocus, onClose, onCloseAllOpen, onRestoreQuickClosed, onOpenMaximized, onMaximize, onRestore, onRestoreThenClose, onRestart, onNew, onViewAutoDeliver, onViewDiscussions, onViewDiscussion, onViewRepo, onViewCron, openSpecAutoProjection, openSpecAutoStopPending = false, openSpecAutoCompact = false, onOpenSpecAutoView, onOpenSpecAutoStop, onOpenSpecAutoToggleCompact, onOpenSpecAutoHide, discussions = [], totalRunningDiscussions = 0, onStopDiscussion, ws, connected, onDiff, onHistory, serverId, quickClosePersistenceScope, subUsages, detectedModels, focusedSubId, collapsed: controlledCollapsed, onCollapsedChange, onVisualOrderChange, quickData, sessions, allSubSessions, p2pSessionLabels, onSubTransportConfigSaved }: Props) {
+export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayoutCapable = true, desktopLayout = SUBSESSION_DESKTOP_LAYOUT.HORIZONTAL, onDesktopLayoutChange, desktopDockSide = SUBSESSION_DESKTOP_DOCK_SIDE.RIGHT, onDesktopDockSideChange, verticalRailHost, teamDiscussionLayout = TEAM_DISCUSSION_LAYOUT.BOTTOM, onTeamDiscussionLayoutChange, teamDiscussionRailHost, idleFlashTokens, sharedSubSessionStates, onOpen, onFocus, onClose, onCloseAllOpen, onRestoreQuickClosed, onOpenMaximized, onMaximize, onRestore, onRestoreThenClose, onRestart, onRenameSubSession, pinnedSubSessionIds, onToggleSubSessionPin, onNew, onViewAutoDeliver, onViewDiscussions, onViewDiscussion, onViewRepo, onViewCron, openSpecAutoProjection, openSpecAutoStopPending = false, openSpecAutoCompact = false, onOpenSpecAutoView, onOpenSpecAutoStop, onOpenSpecAutoToggleCompact, onOpenSpecAutoHide, discussions = [], totalRunningDiscussions = 0, onStopDiscussion, ws, connected, onDiff, onHistory, serverId, quickClosePersistenceScope, subUsages, detectedModels, focusedSubId, collapsed: controlledCollapsed, onCollapsedChange, onVisualOrderChange, quickData, sessions, allSubSessions, p2pSessionLabels, onSubTransportConfigSaved }: Props) {
   recordPerfRender('SubSessionBar');
   const { t } = useTranslation();
   const isMobile = !desktopLayoutCapable;
@@ -783,6 +793,8 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
   const [stats, setStats] = useState<DaemonStats | null>(null);
   const [directFileConnectionStatus, setDirectFileConnectionStatus] = useState<DirectFileConnectionStatus>(DIRECT_FILE_CONNECTION_STATUS.NONE);
   const [showDaemonDetails, setShowDaemonDetails] = useState(false);
+  const [subSessionContextMenu, setSubSessionContextMenu] = useState<{ id: string; x: number; y: number } | null>(null);
+  const contextMenuRef = useRef<HTMLDivElement | null>(null);
   const localClockNow = useNowTicker(!!stats && (desktopLayoutCapable || showDaemonDetails));
   const localClockText = useMemo(() => formatLocalDateTime(localClockNow), [localClockNow]);
   const quickClosedStorageKey = useMemo(
@@ -983,12 +995,21 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
     }, 150);
   };
 
-  // Use drag order if active, otherwise DB order (subSessions is pre-sorted)
+  // Use drag order if active, otherwise DB order (subSessions is pre-sorted).
+  // Pinning is a stable partition over that authority: it never creates or
+  // drops entries and therefore cannot produce ghost sessions after refresh.
   const orderedSessions = useMemo(() => {
-    if (!dragOrder) return subSessions;
-    const sessionMap = new Map(subSessions.map((s) => [s.id, s]));
-    return dragOrder.map((id) => sessionMap.get(id)).filter(Boolean) as SubSession[];
-  }, [subSessions, dragOrder]);
+    const base = dragOrder
+      ? (() => {
+        const sessionMap = new Map(subSessions.map((s) => [s.id, s]));
+        return dragOrder.map((id) => sessionMap.get(id)).filter(Boolean) as SubSession[];
+      })()
+      : subSessions;
+    if (!pinnedSubSessionIds || pinnedSubSessionIds.size === 0) return base;
+    const pinned = base.filter((sub) => pinnedSubSessionIds.has(sub.id) || pinnedSubSessionIds.has(sub.sessionName));
+    const unpinned = base.filter((sub) => !pinnedSubSessionIds.has(sub.id) && !pinnedSubSessionIds.has(sub.sessionName));
+    return [...pinned, ...unpinned];
+  }, [subSessions, dragOrder, pinnedSubSessionIds]);
   const orderedSessionIds = useMemo(() => orderedSessions.map((sub) => sub.id), [orderedSessions]);
   const orderedSessionIdsKey = orderedSessionIds.join(',');
   // Status/state frames replace the SubSession objects while preserving the
@@ -1141,6 +1162,53 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
     if (controlledCollapsed === undefined) setInternalCollapsed(resolved);
     onCollapsedChange?.(resolved);
   }, [collapsed, controlledCollapsed, onCollapsedChange]);
+
+  const closeSubSessionContextMenu = useCallback(() => {
+    setSubSessionContextMenu(null);
+  }, []);
+
+  useEffect(() => {
+    if (!subSessionContextMenu) return;
+    const close = (event: MouseEvent) => {
+      if (contextMenuRef.current?.contains(event.target as Node)) return;
+      closeSubSessionContextMenu();
+    };
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') closeSubSessionContextMenu();
+    };
+    document.addEventListener('mousedown', close, true);
+    document.addEventListener('contextmenu', close, true);
+    document.addEventListener('keydown', onKeyDown);
+    return () => {
+      document.removeEventListener('mousedown', close, true);
+      document.removeEventListener('contextmenu', close, true);
+      document.removeEventListener('keydown', onKeyDown);
+    };
+  }, [closeSubSessionContextMenu, subSessionContextMenu]);
+
+  const handleSubSessionContextMenu = useCallback((id: string, event: JSX.TargetedMouseEvent<HTMLButtonElement>) => {
+    event.preventDefault();
+    event.stopPropagation();
+    suppressEntryClickRef.current = true;
+    setTimeout(() => { suppressEntryClickRef.current = false; }, 0);
+    const menuWidth = 190;
+    const menuHeight = 180;
+    const x = Math.max(8, Math.min(event.clientX, window.innerWidth - menuWidth - 8));
+    const y = Math.max(8, Math.min(event.clientY, window.innerHeight - menuHeight - 8));
+    setSubSessionContextMenu({ id, x, y });
+  }, []);
+
+  const contextSubSession = subSessionContextMenu
+    ? subSessions.find((sub) => sub.id === subSessionContextMenu.id)
+    : undefined;
+
+  const renameFromContextMenu = useCallback(() => {
+    const sub = contextSubSession;
+    closeSubSessionContextMenu();
+    if (!sub || !onRenameSubSession) return;
+    const label = window.prompt(t('session.rename_plain', 'Rename sub-session'), sub.label ?? '');
+    if (label !== null) onRenameSubSession(sub.id, label.trim() || null);
+  }, [closeSubSessionContextMenu, contextSubSession, onRenameSubSession, t]);
 
   useEffect(() => {
     save(P2P_MOBILE_COMPACT_STORAGE_KEY, p2pHidden);
@@ -1417,6 +1485,8 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
       onEntryDragStart={handleCollapsedEntryDragStart}
       onEntryDragOver={handleCollapsedEntryDragOver}
       onEntryDragEnd={handleCollapsedEntryDragEnd}
+      onContextMenu={handleSubSessionContextMenu}
+      pinned={!!pinnedSubSessionIds?.has(sub.id) || !!pinnedSubSessionIds?.has(sub.sessionName)}
       t={t}
     />
   ));
@@ -2003,6 +2073,43 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
           onClose={() => setShowDaemonDetails(false)}
           t={t}
         />
+      )}
+      {subSessionContextMenu && contextSubSession && createPortal(
+        <div
+          ref={contextMenuRef}
+          class="subsession-context-menu"
+          data-testid="subsession-context-menu"
+          role="menu"
+          style={{ position: 'fixed', left: subSessionContextMenu.x, top: subSessionContextMenu.y, zIndex: 20000 }}
+          onMouseDown={(event) => event.stopPropagation()}
+          onContextMenu={(event) => event.preventDefault()}
+        >
+          <button type="button" role="menuitem" data-testid="subsession-context-rename" onClick={renameFromContextMenu}>
+            {t('session.rename_plain', 'Rename')}
+          </button>
+          {onToggleSubSessionPin && (
+            <button
+              type="button"
+              role="menuitem"
+              data-testid="subsession-context-pin"
+              onClick={() => {
+                onToggleSubSessionPin(contextSubSession.id);
+                closeSubSessionContextMenu();
+              }}
+            >
+              {pinnedSubSessionIds?.has(contextSubSession.id) || pinnedSubSessionIds?.has(contextSubSession.sessionName)
+                ? t('session.unpin_plain', 'Unpin')
+                : t('session.pin_plain', 'Pin')}
+            </button>
+          )}
+          <button type="button" role="menuitem" onClick={() => { closeSubSessionContextMenu(); onRestart(contextSubSession.id); }}>
+            {t('session.restart', 'Restart')}
+          </button>
+          <button type="button" role="menuitem" onClick={() => { closeSubSessionContextMenu(); onClose(contextSubSession.id); }}>
+            {t('session.close', 'Close')}
+          </button>
+        </div>,
+        document.body,
       )}
     </div>
     </>

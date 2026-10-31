@@ -79,7 +79,7 @@ import { SharedStateIndicator } from './components/SharedStateIndicator.js';
 import { applyGlobalFontPrefs, DEFAULT_CHAT_FONT, useFontPrefs } from './components/FontPrefsDropdown.js';
 import { useQuickData } from './components/QuickInputPanel.js';
 import { NewSessionDialog } from './components/NewSessionDialog.js';
-import { SubSessionBar, SUBSESSION_BAR_COLLAPSED_STORAGE_KEY } from './components/SubSessionBar.js';
+import { SubSessionBar, SUBSESSION_BAR_COLLAPSED_MIGRATION_KEY, SUBSESSION_BAR_COLLAPSED_STORAGE_KEY } from './components/SubSessionBar.js';
 import {
   loadSubSessionDesktopDockSide,
   loadSubSessionDesktopLayout,
@@ -998,9 +998,22 @@ export function App() {
   const [subSessionBarCollapsed, setSubSessionBarCollapsed] = useState(() => {
     try {
       const raw = localStorage.getItem(SUBSESSION_BAR_COLLAPSED_STORAGE_KEY);
-      if (raw !== null) return JSON.parse(raw) === true;
+      const migrated = localStorage.getItem(SUBSESSION_BAR_COLLAPSED_MIGRATION_KEY) === '1';
+      if (raw !== null) {
+        const value = JSON.parse(raw) === true;
+        // Before v2, the desktop default was expanded and indistinguishable
+        // from an explicit choice. Migrate that legacy default once; all
+        // subsequent explicit toggles are persisted normally.
+        if (!migrated && value === false) {
+          localStorage.setItem(SUBSESSION_BAR_COLLAPSED_MIGRATION_KEY, '1');
+          return true;
+        }
+        return value;
+      }
+      localStorage.setItem(SUBSESSION_BAR_COLLAPSED_MIGRATION_KEY, '1');
+      return true;
     } catch { /* ignore */ }
-    return /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
+    return true;
   });
   useEffect(() => {
     try {
@@ -2091,6 +2104,15 @@ export function App() {
     0,
   );
   const pinnedTabs = useMemo(() => new Set(pinnedTabsArr), [pinnedTabsArr]);
+  const [pinnedSubSessionArr, setPinnedSubSessionArr] = useSyncedPreference<string[]>('subsession_pinned', [], 0);
+  const pinnedSubSessionIds = useMemo(() => new Set(pinnedSubSessionArr), [pinnedSubSessionArr]);
+  const togglePinnedSubSession = useCallback((id: string) => {
+    setPinnedSubSessionArr((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      return [...next];
+    });
+  }, [setPinnedSubSessionArr]);
   const togglePinnedTab = useCallback((name: string) => {
     setPinnedTabsArr((prev) => {
       const set = new Set(prev);
@@ -7572,6 +7594,9 @@ export function App() {
                 onRestore={restoreSubSession}
                 onRestoreThenClose={minimizeSubSessionWindow}
                 onRestart={restartSubSession}
+                onRenameSubSession={(id, label) => renameSubSession(id, label ?? '')}
+                pinnedSubSessionIds={pinnedSubSessionIds}
+                onToggleSubSessionPin={togglePinnedSubSession}
                 onNew={canCreateSubSession ? () => setShowSubDialog(true) : undefined}
                 onViewAutoDeliver={() => runVersionSensitiveAction(trans('openspec.auto.list_title'), () => { setDiscussionInitialId(null); setDiscussionInitialTab('auto'); setShowDiscussionsPage(true); })}
                 openSpecAutoProjection={appOpenSpecAutoRunbarVisible ? appOpenSpecAutoProjection : null}
