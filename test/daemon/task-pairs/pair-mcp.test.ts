@@ -78,7 +78,7 @@ describe('pair MCP projections', () => {
     const executorHandlers = createMemoryMcpToolHandlers({ ...caller, sessionName: EXEC }, { sendDeps: { listSessions: sessions } });
     await expect(executorHandlers[MEMORY_MCP_TOOL_NAMES.PAIR_HISTORY]({ taskId: 'history-auth' })).resolves.toMatchObject({ status: 'error', reason: 'scope_forbidden' });
     const handlers = createMemoryMcpToolHandlers(caller, { sendDeps: { listSessions: sessions } });
-    await expect(handlers[MEMORY_MCP_TOOL_NAMES.PAIR_HISTORY]({ taskId: 'missing' })).resolves.toMatchObject({ status: 'error', reason: 'projection_unavailable' });
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.PAIR_HISTORY]({ taskId: 'missing' })).resolves.toMatchObject({ status: 'error', reason: MCP_ERROR_REASONS.PROJECTION_UNAVAILABLE });
     await expect(handlers[MEMORY_MCP_TOOL_NAMES.PAIR_HISTORY]({ taskId: 'history-auth', limit: 201 })).resolves.toMatchObject({ status: 'error', reason: 'validation_failed' });
     await expect(handlers[MEMORY_MCP_TOOL_NAMES.PAIR_HISTORY]({ taskId: 'history-auth', kind: 'invalid' })).resolves.toMatchObject({ status: 'error', reason: 'validation_failed' });
   });
