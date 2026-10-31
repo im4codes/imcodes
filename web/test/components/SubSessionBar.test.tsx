@@ -1262,6 +1262,51 @@ describe('SubSessionBar', () => {
     }
   });
 
+  it('fails safe when jsdom does not provide elementFromPoint during touch drag', async () => {
+    vi.useFakeTimers();
+    const onOpen = vi.fn();
+    const subSessions = [
+      makeSubSession({ id: 'sub-a', sessionName: 'deck_sub_sub-a', label: 'a' }),
+      makeSubSession({ id: 'sub-b', sessionName: 'deck_sub_sub-b', label: 'b' }),
+    ];
+    const view = render(
+      <SubSessionBar
+        subSessions={subSessions}
+        openIds={new Set()}
+        collapsed
+        desktopLayoutCapable={false}
+        serverId="srv-1"
+        onVisualOrderChange={vi.fn()}
+        onOpen={onOpen}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onNew={vi.fn()}
+        ws={null}
+        connected
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+      />,
+    );
+    const first = view.container.querySelector('[data-sub-id="sub-a"]') as HTMLElement;
+    const originalElementFromPoint = document.elementFromPoint;
+    Object.defineProperty(document, 'elementFromPoint', { configurable: true, value: undefined });
+    try {
+      fireEvent.touchStart(first, { touches: [{ clientX: 10, clientY: 10 }] });
+      fireEvent.touchMove(first, { touches: [{ clientX: 20, clientY: 10 }] });
+      act(() => { vi.advanceTimersByTime(401); });
+      await act(async () => { await Promise.resolve(); });
+      fireEvent.touchEnd(first);
+      act(() => { vi.advanceTimersByTime(151); });
+      expect(onOpen).not.toHaveBeenCalled();
+      expect(vi.mocked(reorderSubSessions)).toHaveBeenCalledWith('srv-1', ['sub-a', 'sub-b']);
+    } finally {
+      Object.defineProperty(document, 'elementFromPoint', {
+        configurable: true,
+        value: originalElementFromPoint,
+      });
+    }
+  });
+
   it('opens the context menu on a stationary mobile long press without starting a drag', () => {
     vi.useFakeTimers();
     const view = render(

@@ -1288,7 +1288,9 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
       if (!td.active || !td.id) return;
       e.preventDefault(); // works because { passive: false }
       if (!touch) return;
-      const targetEl = document.elementFromPoint(touch.clientX, touch.clientY);
+      const targetEl = typeof document.elementFromPoint === 'function'
+        ? document.elementFromPoint(touch.clientX, touch.clientY)
+        : null;
       const overId = findBtnId(targetEl);
       if (overId && overId !== td.id) {
         moveSubSessionInDragOrder(td.id, overId);
