@@ -1193,6 +1193,14 @@ describe('styles.css regression contracts', () => {
     expect(panelRule).toMatch(/grid-template-rows:\s*auto auto minmax\(0, 1fr\) auto auto/);
   });
 
+  it('keeps the mobile collapsed task strip in normal titlebar flow', () => {
+    const mobileRule = css.match(
+      /@media\s*\(max-width:\s*720px\)[\s\S]*?\.chat-titlebar > \.task-pair-status-panel\.is-mobile\.is-collapsed\s*\{([^}]*)\}/,
+    )?.[1] ?? '';
+    expect(mobileRule).toMatch(/margin:\s*0(?:;|\s)/);
+    expect(mobileRule).not.toMatch(/margin[^;]*auto/);
+  });
+
   // iOS Safari's own long-press callout (the "Copy"/selection loupe) is a
   // separate mechanism from touch-action: none, and fires on the actual
   // touch target -- the input-surface div, since the video itself is

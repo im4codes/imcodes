@@ -14903,7 +14903,7 @@ button.quick-agent-delegation-preset.active {
   }
   .chat-titlebar > .task-pair-status-panel.is-mobile.is-collapsed {
     position: static; flex: 0 1 auto; min-width: 0; max-width: calc(48% - var(--chat-top-actions-reserve, 56px));
-    width: auto; margin: 0 0 0 auto; display: inline-flex; align-self: center;
+    width: auto; margin: 0; display: inline-flex; align-self: center;
   }
   .chat-titlebar > .task-pair-status-panel.is-mobile.is-collapsed .task-pair-status-compact {
     min-width: 0; max-width: 100%; overflow: hidden; display: flex; align-items: center;
