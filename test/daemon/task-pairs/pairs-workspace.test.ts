@@ -820,7 +820,7 @@ describe('pair workspaces', () => {
       const dest = join(realpathSync(plain), 'reports', 'summary.md');
       await vi.waitFor(() => expect(existsSync(dest)).toBe(true), { timeout: 10_000 });
       expect(readFileSync(dest, 'utf8')).toBe('# result\n');
-      expect(existsSync(join(dir, 'reports', 'summary.md'))).toBe(false);
+      expect(existsSync(join(dir, 'reports', 'summary.md'))).toBe(true);
       await vi.waitFor(() => expect(outputEvents().map((entry) => entry.session)).toContain(BRAIN));
       expect(outputEvents().find((entry) => entry.session === BRAIN)!.payload).toMatchObject({
         effect: TASK_PAIR_WORKSPACE_EFFECTS.OUTPUT_SAVED, outputPath: dest,
@@ -900,9 +900,8 @@ describe('pair workspaces', () => {
       marker(BRAIN, '<!-- IMCODES_TASK CANCEL O6 -->');
       await endedAt('O6');
       await new Promise((resolve) => setTimeout(resolve, 50));
-      expect(workspaceEvents('O5')).toEqual(expect.arrayContaining([
-        expect.objectContaining({ effect: TASK_PAIR_WORKSPACE_EFFECTS.REMOVED }),
-      ]));
+      expect(workspaceEvents('O5')).toEqual([]);
+      expect(existsSync(dir)).toBe(true);
       expect(workspaceEvents('O6')).toEqual([]);
       expect(outputEvents()).toEqual([]);
       expect(existsSync(join(plain, 'scratch.md'))).toBe(false);
