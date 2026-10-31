@@ -827,12 +827,10 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
   const touchDragRef = useRef<{
     id: string | null;
     active: boolean;
-    menuOpened: boolean;
-    timer: ReturnType<typeof setTimeout> | null;
     startX: number;
     startY: number;
     moved: boolean;
-  }>({ id: null, active: false, menuOpened: false, timer: null, startX: 0, startY: 0, moved: false });
+  }>({ id: null, active: false, startX: 0, startY: 0, moved: false });
   const expandedTouchRef = useRef<{ id: string | null; startX: number; startY: number; moved: boolean }>({
     id: null,
     startX: 0,
@@ -1200,6 +1198,7 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
   const handleSubSessionContextMenu = useCallback((id: string, event: JSX.TargetedMouseEvent<HTMLButtonElement>) => {
     event.preventDefault();
     event.stopPropagation();
+    if (!desktopLayoutCapableRef.current) return;
     openSubSessionContextMenuAt(id, event.clientX, event.clientY);
     setTimeout(() => { suppressEntryClickRef.current = false; }, 0);
   }, [openSubSessionContextMenuAt]);
@@ -1243,18 +1242,9 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
       const touch = e.touches[0];
       td.id = id;
       td.active = false;
-      td.menuOpened = false;
       td.moved = false;
       td.startX = touch?.clientX ?? 0;
       td.startY = touch?.clientY ?? 0;
-      td.timer = setTimeout(() => {
-        if (td.id !== id || td.moved) return;
-        td.timer = null;
-        td.menuOpened = true;
-        const currentTouch = e.touches[0];
-        openSubSessionContextMenuAt(id, currentTouch?.clientX ?? td.startX, currentTouch?.clientY ?? td.startY);
-        window.getSelection()?.removeAllRanges();
-      }, 400);
     };
 
     const activateDrag = (id: string) => {
@@ -1276,14 +1266,8 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
         const dy = touch.clientY - td.startY;
         if (Math.hypot(dx, dy) > 8) td.moved = true;
       }
-      if (td.timer && !td.active && td.moved) {
-        clearTimeout(td.timer);
-        td.timer = null;
+      if (!td.active && td.moved && td.id) {
         activateDrag(td.id!);
-      }
-      if (td.menuOpened) {
-        e.preventDefault();
-        return;
       }
       if (!td.active || !td.id) return;
       e.preventDefault(); // works because { passive: false }
@@ -1300,7 +1284,6 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
     const resetTouchDrag = () => {
       td.id = null;
       td.active = false;
-      td.menuOpened = false;
       td.moved = false;
       td.startX = 0;
       td.startY = 0;
@@ -1309,12 +1292,8 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
     const onEnd = (e: TouchEvent) => {
       const endedId = td.id ?? findBtnId(e.target);
       const wasActive = td.active;
-      const menuOpened = td.menuOpened;
       const moved = td.moved;
-      if (td.timer) { clearTimeout(td.timer); td.timer = null; }
-      if (menuOpened) {
-        setTimeout(() => { suppressEntryClickRef.current = false; }, 0);
-      } else if (wasActive && td.id) {
+      if (wasActive && td.id) {
         suppressEntryClickRef.current = true;
         setTimeout(() => { suppressEntryClickRef.current = false; }, 0);
         const btn = el.querySelector(`[data-sub-id="${td.id}"]`) as HTMLElement | null;
@@ -1329,7 +1308,6 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
     };
 
     const onCancel = () => {
-      if (td.timer) { clearTimeout(td.timer); td.timer = null; }
       if (td.active && td.id) {
         const btn = el.querySelector(`[data-sub-id="${td.id}"]`) as HTMLElement | null;
         if (btn) { btn.style.transform = ''; btn.style.boxShadow = ''; btn.style.borderColor = ''; btn.style.zIndex = ''; }
@@ -1341,10 +1319,10 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
     };
 
     const onScroll = () => {
-      if (td.timer || td.active) onCancel();
+      if (td.id || td.active) onCancel();
     };
 
-    const onContext = (e: Event) => { if (td.active || td.menuOpened) e.preventDefault(); };
+    const onContext = (e: Event) => { if (td.active) e.preventDefault(); };
 
     el.addEventListener('touchstart', onStart, { passive: true });
     el.addEventListener('touchmove', onMove, { passive: false });
@@ -1353,7 +1331,6 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
     el.addEventListener('scroll', onScroll, { passive: true });
     el.addEventListener('contextmenu', onContext);
     return () => {
-      if (td.timer) { clearTimeout(td.timer); td.timer = null; }
       if (td.active && td.id) {
         const btn = el.querySelector(`[data-sub-id="${td.id}"]`) as HTMLElement | null;
         if (btn) { btn.style.transform = ''; btn.style.boxShadow = ''; btn.style.borderColor = ''; btn.style.zIndex = ''; }
@@ -1361,7 +1338,6 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
       }
       td.id = null;
       td.active = false;
-      td.menuOpened = false;
       td.moved = false;
       el.removeEventListener('touchstart', onStart);
       el.removeEventListener('touchmove', onMove);
@@ -1370,7 +1346,7 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
       el.removeEventListener('scroll', onScroll);
       el.removeEventListener('contextmenu', onContext);
     };
-  }, [collapsed, getEntryGestureController, isVerticalRail, moveSubSessionInDragOrder, openSubSessionContextMenuAt, syncOrderToServer]);
+  }, [collapsed, getEntryGestureController, isVerticalRail, moveSubSessionInDragOrder, syncOrderToServer]);
 
   useEffect(() => {
     const installHorizontalEdgeGuard = (el: HTMLDivElement | null) => {
