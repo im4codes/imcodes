@@ -361,6 +361,7 @@ describe('workspace hygiene through the pair service', () => {
     setTaskPairHygieneDepsForTests({ worktreesRoot, readSpace: async () => ({ freeBytes: 1 * GIB, totalBytes: TOTAL }) });
 
     await taskPairService.checkDiskPressure(Date.now(), { force: true, waitMs: 10_000 });
+    await taskPairService.waitForIdle();
 
     expect(weighed(open)).toHaveLength(3);
     expect(pair('OPEN1').workspace?.strippedAt).toBeUndefined();
@@ -391,6 +392,7 @@ describe('workspace hygiene through the pair service', () => {
     });
 
     await taskPairService.checkDiskPressure(Date.now(), { force: true, waitMs: 20_000 });
+    await taskPairService.waitForIdle();
 
     expect(order.map((target) => [a, b, c].findIndex((wt) => target.startsWith(wt)))).toEqual([0, 1, 2]);
     expect(diskNotices()).toHaveLength(1);
@@ -442,6 +444,7 @@ describe('workspace hygiene through the pair service', () => {
     setTaskPairHygieneDepsForTests({ worktreesRoot, readSpace: async () => ({ freeBytes: free(), totalBytes: TOTAL }) });
 
     const fresh = await opened('FRESH1');
+    await taskPairService.waitForIdle();
 
     expect(weighed(stale)).toEqual([]);
     expect(existsSync(fresh)).toBe(true);
@@ -455,6 +458,7 @@ describe('workspace hygiene through the pair service', () => {
     // A Brain QUEUE is the explicit operation that reopens a finished pair.
     marker(BRAIN, `<!-- IMCODES_TASK QUEUE RE1 executor=${EXEC} auditor=${AUD} -->`);
     await vi.waitFor(() => expect(pair('RE1').workspace?.status).toBe('active'), { timeout: 15_000, interval: 50 });
+    await taskPairService.waitForIdle();
     expect(pair('RE1').workspace?.strippedAt).toBeUndefined();
 
     // The executor reinstalls; a low-disk sweep leaves the open pair alone.

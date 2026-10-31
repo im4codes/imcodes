@@ -274,7 +274,13 @@ describe('pair workspaces', () => {
       expect(existsSync(path)).toBe(true);
 
       const retentionMs = pair(taskId).status === 'cancelled' ? 0 : TASK_PAIR_WORKSPACE_RETENTION_MS;
+      // Terminal markers schedule asynchronous head/ownership probes.  Drain
+      // them before asking the retention sweep to decide whether this clean
+      // worktree is removable; otherwise a late probe can make a clean pair
+      // look like an unpushed one on slower Node/macOS runners.
+      await taskPairService.waitForIdle();
       await taskPairService.sweepWorkspaces(at + retentionMs, { force: true });
+      await taskPairService.waitForIdle();
       expect(pair(taskId).workspace?.status).toBe('removed');
       expect(existsSync(join(path, '..'))).toBe(false);
       expect(listedWorktrees()).not.toContain(path);
