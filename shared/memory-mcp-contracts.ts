@@ -136,6 +136,8 @@ export const MEMORY_MCP_TOOL_NAMES = {
   PAIR_GET_MAX_CONCURRENCY: 'pair_get_max_concurrency',
   PAIR_WORKSPACE_GC: 'pair_workspace_gc',
   PAIR_HISTORY: 'pair_history',
+  PAIR_DECISION_RECORD: 'pair_decision_record',
+  PAIR_DECISION_HISTORY: 'pair_decision_history',
   SESSION_TEXT_HISTORY: 'session_history',
   SESSION_RUNTIME_IDENTITY_GET: 'session_runtime_identity_get',
   SESSION_RESTART: 'session_restart',
@@ -209,6 +211,8 @@ export const MEMORY_MCP_TOOL_NAME_LIST = [
   MEMORY_MCP_TOOL_NAMES.PAIR_LIST,
   MEMORY_MCP_TOOL_NAMES.PAIR_GET,
   MEMORY_MCP_TOOL_NAMES.PAIR_HISTORY,
+  MEMORY_MCP_TOOL_NAMES.PAIR_DECISION_RECORD,
+  MEMORY_MCP_TOOL_NAMES.PAIR_DECISION_HISTORY,
   MEMORY_MCP_TOOL_NAMES.PAIR_CREATE,
   MEMORY_MCP_TOOL_NAMES.PAIR_DISPATCH,
   MEMORY_MCP_TOOL_NAMES.PAIR_CLOSE,
@@ -332,6 +336,7 @@ export const PAIR_BRAIN_ACTION_TOOL_NAMES: readonly string[] = [
   MEMORY_MCP_TOOL_NAMES.PAIR_NEXT_ROUND,
   MEMORY_MCP_TOOL_NAMES.PAIR_TASK_UPDATE,
   MEMORY_MCP_TOOL_NAMES.PAIR_TASK_CHECK,
+  MEMORY_MCP_TOOL_NAMES.PAIR_DECISION_RECORD,
 ];
 
 export const MEMORY_MCP_CAPS = {
@@ -823,6 +828,31 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
       limit: numberSchema('Requested history count per participant; 1..200.'),
     }, ['taskId']),
     outputSchema: objectSchema({ status: stringSchema('ok or error.'), taskId: stringSchema('Resolved task-pair id.'), kind: stringSchema('Requested history kind.'), requested: numberSchema('Requested per-participant limit.'), participants: { type: 'array', items: { type: 'object' } } }),
+  },
+  [MEMORY_MCP_TOOL_NAMES.PAIR_DECISION_RECORD]: {
+    name: MEMORY_MCP_TOOL_NAMES.PAIR_DECISION_RECORD,
+    description: 'Persist one participant or Brain decision for a task-pair round. The caller identity is recorded as author; retries with the same idempotencyKey are idempotent.',
+    inputSchema: objectSchema({
+      taskId: stringSchema('Exact task-pair id.'),
+      kind: { type: 'string', enum: ['request', 'decision'], description: 'request from executor/auditor, or final decision from Brain; defaults to decision.' },
+      round: numberSchema('Audit/decision round (positive integer).'),
+      conclusion: stringSchema('Short decision conclusion.'),
+      summary: stringSchema('Bounded decision summary; do not include the full brief or logs.'),
+      related: { type: 'array', maxItems: 20, items: stringSchema('Optional related task or artifact reference.') },
+      idempotencyKey: stringSchema('Stable retry key for this decision write.'),
+    }, ['taskId', 'round', 'conclusion', 'summary']),
+    outputSchema: objectSchema({ status: stringSchema('ok or error.'), created: { type: 'boolean' }, decision: { type: 'object' } }),
+  },
+  [MEMORY_MCP_TOOL_NAMES.PAIR_DECISION_HISTORY]: {
+    name: MEMORY_MCP_TOOL_NAMES.PAIR_DECISION_HISTORY,
+    description: 'Brain-only: read bounded durable decisions for one task pair, or merge the recent decisions for two task pairs. Results are newest first with a stable timestamp/id tie-break.',
+    inputSchema: objectSchema({
+      taskId: stringSchema('Exact task-pair id.'),
+      relatedTaskId: stringSchema('Optional second task-pair id.'),
+      taskIds: { type: 'array', minItems: 1, maxItems: 2, items: stringSchema('One or two exact task-pair ids.') },
+      limit: numberSchema('Maximum records: 20 for one task, 40 for two.'),
+    }, ['taskId']),
+    outputSchema: objectSchema({ status: stringSchema('ok or error.'), decisions: { type: 'array', items: { type: 'object' } } }),
   },
   [MEMORY_MCP_TOOL_NAMES.PAIR_CREATE]: {
     name: MEMORY_MCP_TOOL_NAMES.PAIR_CREATE,

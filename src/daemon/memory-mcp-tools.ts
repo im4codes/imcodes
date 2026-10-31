@@ -3443,6 +3443,58 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       }
       return { status: 'ok', taskId, kind, requested: limit, participants };
     },
+    [MEMORY_MCP_TOOL_NAMES.PAIR_DECISION_RECORD]: async (input) => {
+      const context = await pairCallerContext();
+      if (context.status === 'error') return context.result;
+      const args = pickAllowedMcpArgs(input, ['taskId', 'kind', 'round', 'conclusion', 'summary', 'related', 'idempotencyKey']);
+      const taskId = stringArg(args, 'taskId')?.trim();
+      if (!taskId) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'taskId is required');
+      const stored = getTaskPairStore().getPair(context.project, taskId);
+      if (!stored) return error(MCP_ERROR_REASONS.PROJECTION_UNAVAILABLE, 'task pair not found');
+      if (!caller.sessionName || ![stored.state.brain, stored.state.executor, stored.state.auditor].includes(caller.sessionName)) {
+        return error(MCP_ERROR_REASONS.SCOPE_FORBIDDEN, 'pair_decision_record requires a current pair participant');
+      }
+      const kind = stringArg(args, 'kind')?.trim() || 'decision';
+      if (kind !== 'request' && kind !== 'decision') return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'kind must be request or decision');
+      if (kind === 'decision' && stored.state.brain !== caller.sessionName) {
+        return error(MCP_ERROR_REASONS.SCOPE_FORBIDDEN, 'only the authoritative project Brain may write a final decision');
+      }
+      const round = numberArg(args, 'round');
+      const conclusion = stringArg(args, 'conclusion')?.trim();
+      const summary = stringArg(args, 'summary')?.trim();
+      if (!Number.isInteger(round) || !round || round < 1) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'round must be a positive integer');
+      if (!conclusion || !summary) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'conclusion and summary are required');
+      if (conclusion.length > 500 || summary.length > 4000) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'conclusion or summary is too long');
+      const related = Array.isArray(args.related) ? args.related.filter((value): value is string => typeof value === 'string' && value.trim().length > 0).map((value) => value.trim()).slice(0, 20) : undefined;
+      const result = taskPairService.recordDecision({
+        project: context.project, taskId, round, kind, conclusion, summary, author: caller.sessionName,
+        ...(related && related.length > 0 ? { related } : {}),
+        ...(stringArg(args, 'idempotencyKey')?.trim() ? { idempotencyKey: stringArg(args, 'idempotencyKey')!.trim() } : {}),
+      });
+      return { status: 'ok', created: result.created, decision: result.record, notified: result.notified };
+    },
+    [MEMORY_MCP_TOOL_NAMES.PAIR_DECISION_HISTORY]: async (input) => {
+      const context = await pairCallerContext();
+      if (context.status === 'error') return context.result;
+      if (!caller.sessionName) return error(MCP_ERROR_REASONS.SCOPE_FORBIDDEN, 'pair_decision_history requires the authoritative project Brain');
+      const args = pickAllowedMcpArgs(input, ['taskId', 'relatedTaskId', 'taskIds', 'limit']);
+      const taskId = stringArg(args, 'taskId')?.trim();
+      const relatedTaskId = stringArg(args, 'relatedTaskId')?.trim();
+      if (!taskId) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'taskId is required');
+      const suppliedTaskIds = Array.isArray(args.taskIds) ? args.taskIds.filter((value): value is string => typeof value === 'string' && value.trim().length > 0).map((value) => value.trim()).slice(0, 2) : [];
+      const taskIds = suppliedTaskIds.length > 0 ? [...new Set(suppliedTaskIds)] : (relatedTaskId ? [taskId, relatedTaskId] : [taskId]);
+      if (taskIds[0] !== taskId) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'taskIds must start with taskId');
+      for (const id of taskIds) {
+        const pair = getTaskPairStore().getPair(context.project, id);
+        if (!pair) return error(MCP_ERROR_REASONS.PROJECTION_UNAVAILABLE, 'task pair not found');
+        if (pair.state.brain !== caller.sessionName) return error(MCP_ERROR_REASONS.SCOPE_FORBIDDEN, 'pair_decision_history requires the authoritative Brain for every task');
+      }
+      const max = taskIds.length > 1 ? 40 : 20;
+      const rawLimit = numberArg(args, 'limit');
+      const limit = rawLimit === undefined ? max : Math.floor(rawLimit);
+      if (!Number.isInteger(limit) || limit < 1 || limit > max) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, `limit must be 1..${max}`);
+      return { status: 'ok', taskIds, requested: limit, decisions: getTaskPairStore().listDecisions(context.project, taskIds, limit) };
+    },
     [MEMORY_MCP_TOOL_NAMES.PAIR_CREATE]: async (input) => {
       const context = await pairCallerContext();
       if (context.status === 'error') return context.result;
@@ -5192,6 +5244,21 @@ const schemas = {
     role: z.enum(['executor', 'auditor']).optional(),
     kind: z.enum(['text', 'tool', 'summary']).optional(),
     limit: z.number().int().min(1).max(200).optional(),
+  }).strict(),
+  [MEMORY_MCP_TOOL_NAMES.PAIR_DECISION_RECORD]: z.object({
+    taskId: z.string().trim().min(1),
+    kind: z.enum(['request', 'decision']).optional(),
+    round: z.number().int().positive(),
+    conclusion: z.string().trim().min(1).max(500),
+    summary: z.string().trim().min(1).max(4000),
+    related: z.array(z.string().trim().min(1).max(200)).max(20).optional(),
+    idempotencyKey: z.string().trim().min(1).max(500).optional(),
+  }).strict(),
+  [MEMORY_MCP_TOOL_NAMES.PAIR_DECISION_HISTORY]: z.object({
+    taskId: z.string().trim().min(1),
+    relatedTaskId: z.string().trim().min(1).optional(),
+    taskIds: z.array(z.string().trim().min(1)).min(1).max(2).optional(),
+    limit: z.number().int().min(1).max(40).optional(),
   }).strict(),
   [MEMORY_MCP_TOOL_NAMES.PAIR_PAUSE]: z.object({ taskId: z.string().min(1), mode: z.enum(TASK_PAIR_PAUSE_MODES).optional(), dependsOn: z.array(z.string().min(1)).max(TASK_PAIR_MAX_DEPENDENCIES).optional(), note: z.string().max(2000).optional() }),
   [MEMORY_MCP_TOOL_NAMES.PAIR_RESUME]: z.object({ taskId: z.string().min(1) }),

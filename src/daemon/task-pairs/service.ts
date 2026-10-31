@@ -72,7 +72,7 @@ import {
 } from '../../../shared/task-pair.js';
 import { parseTaskPairChecklist, updateTaskPairChecklist } from '../../../shared/task-pair-checklist.js';
 import { parseTaskPairAuditDetails } from '../../../shared/task-pair-notification.js';
-import { flushTaskPairStoreLiveness, getTaskPairStore, livenessChangedBeyondActivityTimestamps, type StoredTaskPair, type TaskPairLiveness } from './store.js';
+import { flushTaskPairStoreLiveness, getTaskPairStore, livenessChangedBeyondActivityTimestamps, type StoredTaskPair, type TaskPairDecisionRecord, type TaskPairLiveness } from './store.js';
 import { brainUiLocale, isPairsEngineProject, isTaskPairsAvailable, projectBrainSession, projectOfSession } from './engine.js';
 import { inspectToolCallForPairMainCheckoutWrite } from './main-checkout-write-guard.js';
 import { noteTaskPairFocus, sendTaskPairMessage, taskPairFocusOf, taskPairMessageIdPrefix, type TaskPairDeliveryResult } from './delivery.js';
@@ -522,6 +522,35 @@ export class TaskPairService {
     const result = store.tryClaimResource(input); if (!result.ok) return result;
     const next = { ...pair.state, resourceClaims: store.listResourceClaimsForPair(input.project, input.taskId, input.now), updatedAt: input.now ?? Date.now() };
     store.savePair(input.project, next); return { ok: true, claim: result.claim, pair: next };
+  }
+
+  /** Persist a request/final decision and notify the Brain (and both participants for a final decision). */
+  recordDecision(input: Omit<TaskPairDecisionRecord, 'id' | 'at'> & { at?: number }): { record: TaskPairDecisionRecord; created: boolean; notified: string[] } {
+    const store = getTaskPairStore();
+    const pair = store.getPair(input.project, input.taskId);
+    if (!pair) throw new Error('task pair not found');
+    const result = store.recordDecision({ ...input, at: input.at ?? Date.now() });
+    if (!result.created) return { ...result, notified: [] };
+    const fresh = store.getPair(input.project, input.taskId);
+    if (fresh) {
+      store.saveLiveness(input.project, input.taskId, {
+        ...fresh.liveness,
+        decisionLastAt: result.record.at,
+        decisionReminderAt: undefined,
+      });
+    }
+    const targets = input.kind === 'decision'
+      ? [pair.state.brain, pair.state.executor, pair.state.auditor]
+      : [pair.state.brain];
+    const uniqueTargets = [...new Set(targets.filter((target): target is string => !!target && target !== TASK_PAIR_NO_AUDITOR))];
+    const message = `${input.kind === 'decision' ? 'Final decision' : 'Decision request'} recorded for ${input.taskId} round ${input.round}: ${input.conclusion}. ${input.summary}`;
+    for (const target of uniqueTargets) this.#track(sendTaskPairMessage(target, input.taskId, `decision-${input.kind}`, message));
+    emitTaskPairDaemonEvent(pair.state, {
+      eventId: `decision:${result.record.id}`,
+      verb: input.kind === 'decision' ? 'DECISION' : 'DECISION_REQUEST',
+      effect: 'decision_recorded', source: 'mcp', fromStatus: pair.state.status, toStatus: pair.state.status, unusual: false,
+    });
+    return { ...result, notified: uniqueTargets };
   }
 
   get pendingCount(): number {
