@@ -174,6 +174,9 @@ describe('pairs on a non-git project', () => {
       expect(readFileSync(join(plain, 'src', 'a.ts'), 'utf8')).toBe('export const a = 2;\n');
       expect(readFileSync(join(plain, 'src', 'new.ts'), 'utf8')).toBe('export const n = 1;\n');
       expect(git(plain, 'status', '--porcelain')).toBe('');
+      const gc = await taskPairService.gcWorkspaces(PROJECT, BRAIN, { dryRun: false, minAgeMs: 0 });
+      expect(gc.find((entry) => entry.taskId === 'G3')).toMatchObject({ action: 'too_recent', kind: 'worktree' });
+      expect(existsSync(worktree)).toBe(true);
       await vi.waitFor(() => expect(sentTo(BRAIN, 'brain-non-git-finish')).toHaveLength(1));
       expect(sentTo(BRAIN, 'brain-non-git-finish')[0]!.text).toContain('merge of the pair branch into the project succeeded');
       expect(workspaceEvents('G3').some((event) => event.effect === TASK_PAIR_WORKSPACE_EFFECTS.APPLY_BACK_APPLIED)).toBe(true);
@@ -348,6 +351,9 @@ describe('pairs on a non-git project', () => {
       expect(existsSync(join(plain, 'notes.txt'))).toBe(false);
       expect(readFileSync(join(plain, 'src', 'added.ts'), 'utf8')).toBe('export const added = true;\n');
       expect(readFileSync(join(plain, 'node_modules', 'dep', 'index.js'), 'utf8')).toBe('heavy\n');
+      const gc = await taskPairService.gcWorkspaces(PROJECT, BRAIN, { dryRun: false, minAgeMs: 0 });
+      expect(gc.find((entry) => entry.taskId === 'C2')).toMatchObject({ action: 'too_recent', kind: 'dir' });
+      expect(existsSync(clone)).toBe(true);
       await vi.waitFor(() => expect(sentTo(BRAIN, 'brain-non-git-finish')[0]?.text).toContain('copy-back of the clone into the project succeeded'));
       // Undo from the backup restores the project exactly.
       const undone = await taskPairService.undoNonGitApply(PROJECT, 'C2');

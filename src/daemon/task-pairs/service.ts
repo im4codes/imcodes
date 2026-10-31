@@ -37,6 +37,7 @@ import {
   TASK_PAIR_WORKSPACE_REPAIR_STATUSES,
   TASK_PAIR_WORKSPACE_EVENT_VERB,
   TASK_PAIR_DONE_WORKSPACE_RETENTION_MS,
+  TASK_PAIR_WORKSPACE_RETENTION_MS,
   TASK_PAIR_WORKSPACE_KEPT_DIGEST_INTERVAL_MS,
   TASK_PAIR_WORKSPACE_KEPT_DIGEST_MAX_LISTED,
   TASK_PAIR_WORKSPACE_KEPT_DIGEST_REASON,
@@ -1949,7 +1950,7 @@ export class TaskPairService {
     // complete, leave the workspace for the normal retry path rather than
     // allowing the immediate removal pass to skip that safety signal.
     const latest = getTaskPairStore().getPair(project, taskId)?.state;
-    if (!stripped || latest?.status !== 'done') return;
+    if (!stripped || latest?.status !== 'done' || latest.workspace?.nonGit) return;
     // A terminal transition is already serialized through the pair store. Run
     // one bounded, fail-safe sweep now so clean merged worktrees do not wait
     // for the hourly scheduler. Dirty/unmerged/locked/unknown workspaces still
@@ -2195,7 +2196,12 @@ export class TaskPairService {
       const pair = stored.state;
       const workspace = pair.workspace;
       if (!workspace || !isTerminalTaskPairStatus(pair.status)) continue;
-      const retentionMs = pair.status === 'cancelled' ? 0 : TASK_PAIR_DONE_WORKSPACE_RETENTION_MS;
+      // Immediate DONE retention applies only to git worktrees. COW/dir
+      // workspaces still need their post-terminal copy-back/undo/conflict
+      // evidence window before the normal retention sweep may remove them.
+      const retentionMs = pair.status === 'cancelled' ? 0
+        : workspace.kind === 'worktree' && !workspace.nonGit ? TASK_PAIR_DONE_WORKSPACE_RETENTION_MS
+          : TASK_PAIR_WORKSPACE_RETENTION_MS;
       if (now - (workspace.endedAt ?? pair.updatedAt) < retentionMs) continue;
       try {
         const outcome = await this.#releaseEndedWorkspace(stored, now, retentionMs, false);
@@ -2285,9 +2291,12 @@ export class TaskPairService {
       const workspace = pair.workspace!;
       const endedAt = workspace.endedAt ?? pair.updatedAt;
       const base = { taskId: pair.taskId, title: pair.title ?? null, status: pair.status, kind: workspace.kind, path: workspace.path, endedAt };
-      if (now - endedAt < options.minAgeMs) { entries.push({ ...base, action: 'too_recent' }); continue; }
+      const retentionMs = pair.status === 'cancelled' ? 0
+        : workspace.kind === 'worktree' && !workspace.nonGit ? options.minAgeMs
+          : Math.max(options.minAgeMs, TASK_PAIR_WORKSPACE_RETENTION_MS);
+      if (now - endedAt < retentionMs) { entries.push({ ...base, action: 'too_recent' }); continue; }
       try {
-        const outcome = await this.#releaseEndedWorkspace(stored, now, options.minAgeMs, options.dryRun);
+        const outcome = await this.#releaseEndedWorkspace(stored, now, retentionMs, options.dryRun);
         const released = outcome?.released;
         if (!released) { entries.push({ ...base, action: 'absent' }); continue; }
         entries.push(released.action === 'kept'
