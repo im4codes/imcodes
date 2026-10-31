@@ -7153,7 +7153,7 @@ export function App() {
                       return (
                         <button
                           key={s.id}
-                          class={`mobile-server-menu-item${s.id === selectedServerId ? ' active' : ''}${showSharedReturnGuide && s.id === sharedReturnServer?.id ? ' server-return-hint' : ''}`}
+                          class={`mobile-server-menu-item mobile-server-menu-server${s.id === selectedServerId ? ' active' : ''}${showSharedReturnGuide && s.id === sharedReturnServer?.id ? ' server-return-hint' : ''}`}
                           onClick={() => { handleSelectServer(s.id, s.name); setShowMobileServerMenu(false); }}
                           onContextMenu={(e) => { e.preventDefault(); setShowMobileServerMenu(false); setServerCtxMenu({ server: s, x: e.clientX, y: e.clientY }); }}
                         >
@@ -7176,7 +7176,7 @@ export function App() {
                         onRefresh={() => void refreshSharedEntries()}
                       />
                     )}
-                    <div style={{ padding: '6px 12px', borderTop: '1px solid #334155' }}>
+                    <div class="mobile-server-menu-language" style={{ padding: '6px 12px', borderTop: '1px solid #334155' }}>
                       <LanguageSwitcher />
                     </div>
                   </div>

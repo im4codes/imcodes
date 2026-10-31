@@ -993,9 +993,38 @@ describe('styles.css regression contracts', () => {
 
     const menuRule = css.match(/\.mobile-server-menu\s*\{[^}]*\}/);
     expect(menuRule).not.toBeNull();
+    expect(menuRule![0]).toMatch(/display:\s*grid/);
+    expect(menuRule![0]).toMatch(/grid-template-columns:\s*repeat\(2,\s*minmax\(0,\s*1fr\)\)/);
     expect(menuRule![0]).toMatch(/max-height:\s*calc\(var\(--vvh,\s*100dvh\)\s*-\s*var\(--sat,\s*0px\)\s*-\s*68px\s*-\s*env\(safe-area-inset-bottom,\s*0px\)\)/);
     expect(menuRule![0]).not.toMatch(/max-height:\s*min\(60vh/);
     expect(menuRule![0]).toMatch(/padding-bottom:\s*max\(16px,\s*env\(safe-area-inset-bottom,\s*0px\)\)/);
+
+    const menuItemRule = css.match(/\.mobile-server-menu-item\s*\{[^}]*\}/);
+    expect(menuItemRule).not.toBeNull();
+    expect(menuItemRule![0]).toMatch(/grid-column:\s*1\s*\/\s*-1/);
+    expect(menuItemRule![0]).toMatch(/min-width:\s*0/);
+
+    const serverItemRule = css.match(/\.mobile-server-menu-server\s*\{[^}]*\}/);
+    expect(serverItemRule).not.toBeNull();
+    expect(serverItemRule![0]).toMatch(/grid-column:\s*auto/);
+
+    const sharedEntriesRule = css.match(/\.mobile-server-menu-shared\s*\{[^}]*\}/);
+    expect(sharedEntriesRule).not.toBeNull();
+    expect(sharedEntriesRule![0]).toMatch(/grid-column:\s*1\s*\/\s*-1/);
+
+    const menuNameRule = css.match(/\.mobile-server-menu-name\s*\{[^}]*\}/);
+    expect(menuNameRule).not.toBeNull();
+    expect(menuNameRule![0]).toMatch(/flex:\s*1\s+1\s+auto/);
+    expect(menuNameRule![0]).toMatch(/text-overflow:\s*ellipsis/);
+    expect(menuNameRule![0]).toMatch(/white-space:\s*nowrap/);
+
+    const wideMenuRule = css.match(/@media\s*\(min-width:\s*380px\)\s*\{\s*\.mobile-server-menu\s*\{[^}]*\}\s*\}/);
+    expect(wideMenuRule).not.toBeNull();
+    expect(wideMenuRule![0]).toMatch(/grid-template-columns:\s*repeat\(3,\s*minmax\(0,\s*1fr\)\)/);
+
+    const app = readFileSync(resolve(__dirname, '../src/app.tsx'), 'utf8');
+    expect(app).toContain('mobile-server-menu-server');
+    expect(app).toContain('mobile-server-menu-language');
   });
 
   it('mobile shell chrome does not depend solely on the narrow viewport breakpoint', () => {
