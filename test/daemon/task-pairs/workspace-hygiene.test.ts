@@ -271,11 +271,17 @@ async function opened(taskId: string, executor = EXEC, auditor = AUD): Promise<s
 /** Weight an executor would have installed. */
 const weigh = (wt: string) => { put(join(wt, 'node_modules', 'pkg', 'index.js')); put(join(wt, 'web', 'node_modules', 'pkg', 'index.js')); put(join(wt, 'dist', 'bundle.js')); };
 const weighed = (wt: string) => ['node_modules', 'web/node_modules', 'dist'].filter((dir) => existsSync(join(wt, dir)));
+async function waitForStripped(taskId: string, wt: string): Promise<void> {
+  await vi.waitFor(() => {
+    expect(pair(taskId).workspace?.strippedAt).toBeTypeOf('number');
+    expect(weighed(wt)).toEqual([]);
+  }, { timeout: 15_000, interval: 50 });
+}
 async function closed(taskId: string): Promise<string> {
   const wt = await opened(taskId);
   weigh(wt);
   marker(BRAIN, `<!-- IMCODES_TASK DONE ${taskId} force=true -->`);
-  await vi.waitFor(() => expect(pair(taskId).workspace?.strippedAt).toBeTypeOf('number'), { timeout: 15_000, interval: 50 });
+  await waitForStripped(taskId, wt);
   return wt;
 }
 async function closedKept(taskId: string): Promise<string> {
@@ -283,7 +289,7 @@ async function closedKept(taskId: string): Promise<string> {
   weigh(wt);
   put(join(wt, 'notes.txt'), 'unmerged work');
   marker(BRAIN, `<!-- IMCODES_TASK DONE ${taskId} force=true -->`);
-  await vi.waitFor(() => expect(pair(taskId).workspace?.strippedAt).toBeTypeOf('number'), { timeout: 15_000, interval: 50 });
+  await waitForStripped(taskId, wt);
   return wt;
 }
 const diskNotices = () => sent.filter((entry) => entry.target === BRAIN && entry.id.includes(':brain-disk-pressure:'));
@@ -365,7 +371,7 @@ describe('workspace hygiene through the pair service', () => {
 
     expect(weighed(open)).toHaveLength(3);
     expect(pair('OPEN1').workspace?.strippedAt).toBeUndefined();
-    expect(weighed(done)).toEqual([]);
+    await waitForStripped('DONE1', done);
   });
 
   it('low disk: strips finished pairs oldest first, and tells Brain once per threshold crossing', async () => {
@@ -446,9 +452,8 @@ describe('workspace hygiene through the pair service', () => {
     const fresh = await opened('FRESH1');
     await taskPairService.waitForIdle();
 
-    expect(weighed(stale)).toEqual([]);
+    await waitForStripped('STALE1', stale);
     expect(existsSync(fresh)).toBe(true);
-    expect(pair('STALE1').workspace?.strippedAt).toBeTypeOf('number');
   });
 
   it('a reopened pair is open again: it is not stripped, and it is stripped again when it ends', async () => {
@@ -467,11 +472,14 @@ describe('workspace hygiene through the pair service', () => {
     await taskPairService.checkDiskPressure(Date.now(), { force: true, waitMs: 10_000 });
     await taskPairService.sweepWorkspaces(Date.now(), { force: true });
     await taskPairService.waitForIdle();
-    expect(weighed(wt)).toHaveLength(3);
+    await vi.waitFor(() => {
+      expect(pair('RE1').workspace?.status).toBe('active');
+      expect(pair('RE1').workspace?.strippedAt).toBeUndefined();
+      expect(weighed(wt)).toHaveLength(3);
+    }, { timeout: 15_000, interval: 50 });
 
     marker(BRAIN, '<!-- IMCODES_TASK DONE RE1 force=true -->');
-    await vi.waitFor(() => expect(pair('RE1').workspace?.strippedAt).toBeTypeOf('number'), { timeout: 15_000, interval: 50 });
-    expect(weighed(wt)).toEqual([]);
+    await waitForStripped('RE1', wt);
   });
 
   it('a strip interrupted by a failure leaves the pair unstripped, and the sweep finishes it (restart mid-strip)', async () => {
