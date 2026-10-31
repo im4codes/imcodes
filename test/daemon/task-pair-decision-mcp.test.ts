@@ -90,5 +90,6 @@ describe('pair decision MCP', () => {
     expect(taskPairDecisionReminderDue({ status: 'in_audit', now: base + 600_000, pairUpdatedAt: base, latestRequestAt: requestAt, latestDecisionAt: base + 1 })).toBe(false);
     expect(taskPairDecisionReminderDue({ status: 'working', now: base + 600_000, pairUpdatedAt: base })).toBe(false);
   });
+
 });
 

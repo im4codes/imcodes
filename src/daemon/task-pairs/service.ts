@@ -564,7 +564,9 @@ export class TaskPairService {
       store.markDecisionNotificationAttempt(pending.id, now);
       let status: TaskPairDeliveryResult = 'failed';
       try { status = await sendTaskPairMessage(pending.target, pending.taskId, pending.reason, pending.text); } catch { /* retain the row for the next heartbeat */ }
-      if (status === 'sent' || status === 'queued' || status === 'skipped_pending') store.markDecisionNotificationDelivered(pending.id, now);
+      // skipped_pending can be only the process-local in-flight gate; the
+      // original send may still fail, so keep this row pending for retry.
+      if (status === 'sent' || status === 'queued') store.markDecisionNotificationDelivered(pending.id, now);
     }
   }
 
