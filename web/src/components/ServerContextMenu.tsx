@@ -4,6 +4,8 @@ import { useTranslation } from 'react-i18next';
 interface Props {
   x: number;
   y: number;
+  pinned: boolean;
+  onTogglePin: () => void;
   onRename: () => void;
   onUpgrade: () => void;
   onUpgradeAll?: () => void;
@@ -11,7 +13,7 @@ interface Props {
   onClose: () => void;
 }
 
-export function ServerContextMenu({ x, y, onRename, onUpgrade, onUpgradeAll, onDelete, onClose }: Props) {
+export function ServerContextMenu({ x, y, pinned, onTogglePin, onRename, onUpgrade, onUpgradeAll, onDelete, onClose }: Props) {
   const { t } = useTranslation();
   const ref = useRef<HTMLDivElement>(null);
 
@@ -31,10 +33,13 @@ export function ServerContextMenu({ x, y, onRename, onUpgrade, onUpgradeAll, onD
   // Clamp menu to viewport
   const style: Record<string, string | number> = { position: 'fixed', left: x, top: y };
   if (x + 160 > window.innerWidth) style.left = window.innerWidth - 164;
-  if (y + 100 > window.innerHeight) style.top = y - 100;
+  if (y + 140 > window.innerHeight) style.top = Math.max(4, y - 140);
 
   return (
     <div ref={ref} class="server-ctx-menu" style={style}>
+      <button class="server-ctx-item" onClick={() => { onClose(); onTogglePin(); }}>
+        {t(pinned ? 'server.unpin' : 'server.pin')}
+      </button>
       <button class="server-ctx-item" onClick={() => { onClose(); onRename(); }}>
         {t('session.rename')}
       </button>

@@ -1077,6 +1077,8 @@
     "delete_error": "No se pudo eliminar el servidor: {{error}}",
     "upgrade_daemon": "↑ Actualizar Daemon",
     "upgrade_all": "↑ Actualizar Todos",
+    "pin": "📌 Fijar servidor",
+    "unpin": "Desfijar servidor",
     "delete": "✕ Eliminar servidor",
     "upgrade_sent": "Comando de actualización enviado a \"{{name}}\". El daemon instalará la última versión y se reiniciará.",
     "upgrade_failed": "Error al enviar el comando de actualización. El daemon puede estar desconectado.",

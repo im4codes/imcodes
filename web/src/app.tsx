@@ -207,6 +207,7 @@ import {
 } from './session-list-merge.js';
 import { resolveSessionInfoRuntimeType } from './runtime-type.js';
 import { useSyncedPreference } from './hooks/useSyncedPreference.js';
+import { normalizePinnedServers, normalizeServerOrder, sortServersByPreference } from './server-order.js';
 import { parseString, parseBooleanish, usePref } from './hooks/usePref.js';
 import { CLAUDE_WEEKLY_QUOTA_PREF_KEY } from '@shared/claude-quota.js';
 import type { SharedActorEnvelope } from '@shared/tab-sharing.js';
@@ -2098,6 +2099,43 @@ export function App() {
       return [...set];
     });
   }, [setPinnedTabsArr]);
+  // Server navigation order and pin priority are user preferences, so they
+  // follow the same cross-device sync path as session tabs. Scope the browser
+  // cache by user to avoid briefly showing another account's arrangement.
+  const serverPreferenceScope = auth?.userId ?? 'anonymous';
+  const [serverOrder, setServerOrder, serverOrderHydrated] = useSyncedPreference<string[]>(
+    'server_order',
+    [],
+    0,
+    serverPreferenceScope,
+  );
+  const [serverPinned, setServerPinned, serverPinnedHydrated] = useSyncedPreference<string[]>(
+    'server_pinned',
+    [],
+    0,
+    serverPreferenceScope,
+  );
+  const orderedServers = useMemo(
+    () => sortServersByPreference(servers, serverOrder, serverPinned),
+    [servers, serverOrder, serverPinned],
+  );
+  useEffect(() => {
+    if (!serversLoaded || !serverOrderHydrated || !serverPinnedHydrated) return;
+    const nextOrder = normalizeServerOrder(servers, serverOrder);
+    if (JSON.stringify(nextOrder) !== JSON.stringify(serverOrder)) setServerOrder(nextOrder);
+    const nextPinned = normalizePinnedServers(servers, serverPinned);
+    if (JSON.stringify(nextPinned) !== JSON.stringify(serverPinned)) setServerPinned(nextPinned);
+  // The comparisons above prevent a persistence loop after reconciliation.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [servers, serversLoaded, serverOrder, serverPinned, serverOrderHydrated, serverPinnedHydrated]);
+  const toggleServerPinned = useCallback((serverId: string) => {
+    setServerPinned((previous) => {
+      const current = normalizePinnedServers(servers, previous);
+      return current.includes(serverId)
+        ? current.filter((id) => id !== serverId)
+        : [...current, serverId];
+    });
+  }, [servers, setServerPinned]);
   const [newUserGuidePref, setNewUserGuidePref] = useSyncedPreference<NewUserGuidePref>('new_user_guide', DEFAULT_NEW_USER_GUIDE_PREF, 0);
   const [teamDiscussionGuidePref, setTeamDiscussionGuidePref] = useSyncedPreference<TeamDiscussionGuidePref>('team_discussion_guide', DEFAULT_TEAM_DISCUSSION_GUIDE_PREF, 0);
   const [featureAnnouncementsPending, setFeatureAnnouncementsPending] = useState(true);
@@ -6749,7 +6787,7 @@ export function App() {
       {!isMobile && (
         <>
           <ServerIconBar
-            servers={servers}
+            servers={orderedServers}
             activeServerId={selectedServerId}
             onSelectServer={handleSelectServer}
             onServerContextMenu={(server, x, y) => setServerCtxMenu({ server, x, y })}
@@ -6881,7 +6919,7 @@ export function App() {
                 shareTargetKind: selectedShareTarget?.kind ?? null,
                 sharedSessionName: canonicalSharedSessionName,
                 sessions,
-                servers: servers.map(s => ({ id: s.id, name: s.name })),
+                servers: orderedServers.map(s => ({ id: s.id, name: s.name })),
                 onQuote: (text) => {
                   const inputEl = activeSession ? inputRefsMap.current.get(activeSession) : null;
                   if (inputEl) {
@@ -6927,7 +6965,7 @@ export function App() {
           </span>
         </div>
         <div class="server-list">
-          {servers.map((server) => {
+          {orderedServers.map((server) => {
             const online = isServerOnline(server);
             return (
               <button
@@ -7035,7 +7073,7 @@ export function App() {
             )}
             <Suspense fallback={<div style={{ textAlign: 'center', padding: 48, color: '#64748b' }}>Loading...</div>}>
               <DashboardPage
-                servers={servers}
+                servers={orderedServers}
                 onSelectServer={handleSelectServer}
                 onDeleteServer={(server) => setDeleteTarget(server)}
                 onLogout={handleLogout}
@@ -7088,7 +7126,7 @@ export function App() {
                         ⇄ Switch Cloud Server
                       </button>
                     )}
-                    {servers.map((s) => {
+                    {orderedServers.map((s) => {
                       const online = isServerOnline(s);
                       return (
                         <button
@@ -7655,7 +7693,7 @@ export function App() {
               {/* Server switcher — collapsible via sidebar toggle */}
               {(servers.length > 0 || sharedEntriesLoading || sharedEntriesError !== null || sharedEntries.length > 0) && !mobileHideServerBar && (
                 <div style={{ padding: '8px 12px', borderBottom: '1px solid #1e293b' }}>
-                  {servers.map((s) => {
+                  {orderedServers.map((s) => {
                     const online = isServerOnline(s);
                     return (
                       <button
@@ -7736,7 +7774,7 @@ export function App() {
                   sharedAccessRole,
                   shareTargetKind: selectedShareTarget?.kind ?? null,
                   sessions,
-                  servers: servers.map(s => ({ id: s.id, name: s.name })),
+                  servers: orderedServers.map(s => ({ id: s.id, name: s.name })),
                   onQuote: (text) => {
                     const inputEl = activeSession ? inputRefsMap.current.get(activeSession) : null;
                     if (inputEl) {
@@ -8005,7 +8043,7 @@ export function App() {
               }}
               onBack={() => setShowCronManager(false)}
               onViewDiscussion={(fileId) => runVersionSensitiveAction(trans('p2p.discussions.title'), () => { setDiscussionInitialId(fileId); setShowDiscussionsPage(true); })}
-              servers={servers.map(s => ({ id: s.id, name: s.name }))}
+              servers={orderedServers.map(s => ({ id: s.id, name: s.name }))}
               ws={wsRef.current}
             />
           </FloatingPanel>
@@ -8424,6 +8462,8 @@ export function App() {
         <ServerContextMenu
           x={serverCtxMenu.x}
           y={serverCtxMenu.y}
+          pinned={normalizePinnedServers(servers, serverPinned).includes(serverCtxMenu.server.id)}
+          onTogglePin={() => toggleServerPinned(serverCtxMenu.server.id)}
           onRename={() => handleRenameServer(serverCtxMenu.server)}
           onUpgrade={() => handleUpgradeDaemon(serverCtxMenu.server)}
           onUpgradeAll={servers.length > 1 ? handleUpgradeAll : undefined}

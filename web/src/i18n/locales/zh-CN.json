@@ -1077,6 +1077,8 @@
     "delete_error": "删除服务器失败：{{error}}",
     "upgrade_daemon": "↑ 升级 Daemon",
     "upgrade_all": "↑ 升级全部设备",
+    "pin": "📌 置顶服务器",
+    "unpin": "取消置顶服务器",
     "delete": "✕ 删除 server",
     "upgrade_sent": "升级命令已发送到「{{name}}」，daemon 将自动安装最新版并重启。",
     "upgrade_failed": "发送失败，daemon 可能不在线。",

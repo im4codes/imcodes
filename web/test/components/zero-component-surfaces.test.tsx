@@ -379,10 +379,13 @@ describe('previously uncovered component surfaces', () => {
     const onUpgradeAll = vi.fn();
     const onDelete = vi.fn();
     const onClose = vi.fn();
+    const onTogglePin = vi.fn();
     render(
       <ServerContextMenu
         x={180}
         y={110}
+        pinned={false}
+        onTogglePin={onTogglePin}
         onRename={onRename}
         onUpgrade={onUpgrade}
         onUpgradeAll={onUpgradeAll}
@@ -391,6 +394,8 @@ describe('previously uncovered component surfaces', () => {
       />,
     );
     expect((document.querySelector('.server-ctx-menu') as HTMLElement).style.left).toBe('36px');
+    fireEvent.click(screen.getByText('server.pin'));
+    expect(onTogglePin).toHaveBeenCalled();
     fireEvent.click(screen.getByText('session.rename'));
     expect(onClose).toHaveBeenCalled();
     expect(onRename).toHaveBeenCalled();
@@ -402,7 +407,7 @@ describe('previously uncovered component surfaces', () => {
     expect(onDelete).toHaveBeenCalled();
     fireEvent.mouseDown(document.body);
     fireEvent.keyDown(document, { key: 'Escape' });
-    expect(onClose).toHaveBeenCalledTimes(6);
+    expect(onClose).toHaveBeenCalledTimes(7);
     cleanup();
 
     const onConfirm = vi.fn();

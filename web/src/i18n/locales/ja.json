@@ -1077,6 +1077,8 @@
     "delete_error": "サーバーを削除できませんでした：{{error}}",
     "upgrade_daemon": "↑ Daemonをアップグレード",
     "upgrade_all": "↑ 全デバイス更新",
+    "pin": "📌 サーバーを固定",
+    "unpin": "サーバーの固定を解除",
     "delete": "✕ サーバーを削除",
     "upgrade_sent": "「{{name}}」にアップグレードコマンドを送信しました。Daemonは最新バージョンをインストールして再起動します。",
     "upgrade_failed": "アップグレードコマンドの送信に失敗しました。Daemonがオフラインの可能性があります。",
