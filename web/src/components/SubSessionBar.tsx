@@ -827,11 +827,12 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
   const touchDragRef = useRef<{
     id: string | null;
     active: boolean;
+    menuOpened: boolean;
     timer: ReturnType<typeof setTimeout> | null;
     startX: number;
     startY: number;
     moved: boolean;
-  }>({ id: null, active: false, timer: null, startX: 0, startY: 0, moved: false });
+  }>({ id: null, active: false, menuOpened: false, timer: null, startX: 0, startY: 0, moved: false });
   const expandedTouchRef = useRef<{ id: string | null; startX: number; startY: number; moved: boolean }>({
     id: null,
     startX: 0,
@@ -988,12 +989,12 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
     }
   }, [sessionIdList]);
 
-  const syncOrderToServer = (ids: string[]) => {
+  const syncOrderToServer = useCallback((ids: string[]) => {
     if (reorderTimerRef.current) clearTimeout(reorderTimerRef.current);
     reorderTimerRef.current = setTimeout(() => {
       if (serverId) reorderSubSessions(serverId, ids).catch(() => {});
     }, 150);
-  };
+  }, [serverId]);
 
   // Use drag order if active, otherwise DB order (subSessions is pre-sorted).
   // Pinning is a stable partition over that authority: it never creates or
@@ -1075,13 +1076,14 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
   const moveSubSessionInDragOrder = useCallback((draggedId: string, overId: string) => {
     if (draggedId === overId) return;
     setDragOrder((prev) => {
-      const ids = prev ?? orderedSessionsRef.current.map((s) => s.id);
+      const ids = dragOrderRef.current ?? prev ?? orderedSessionsRef.current.map((s) => s.id);
       const from = ids.indexOf(draggedId);
       const to = ids.indexOf(overId);
       if (from === -1 || to === -1) return prev;
       const next = [...ids];
       next.splice(from, 1);
       next.splice(to, 0, draggedId);
+      dragOrderRef.current = next;
       return next;
     });
   }, []);
@@ -1186,17 +1188,21 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
     };
   }, [closeSubSessionContextMenu, subSessionContextMenu]);
 
+  const openSubSessionContextMenuAt = useCallback((id: string, clientX: number, clientY: number) => {
+    suppressEntryClickRef.current = true;
+    const menuWidth = 190;
+    const menuHeight = 180;
+    const x = Math.max(8, Math.min(clientX, window.innerWidth - menuWidth - 8));
+    const y = Math.max(8, Math.min(clientY, window.innerHeight - menuHeight - 8));
+    setSubSessionContextMenu({ id, x, y });
+  }, []);
+
   const handleSubSessionContextMenu = useCallback((id: string, event: JSX.TargetedMouseEvent<HTMLButtonElement>) => {
     event.preventDefault();
     event.stopPropagation();
-    suppressEntryClickRef.current = true;
+    openSubSessionContextMenuAt(id, event.clientX, event.clientY);
     setTimeout(() => { suppressEntryClickRef.current = false; }, 0);
-    const menuWidth = 190;
-    const menuHeight = 180;
-    const x = Math.max(8, Math.min(event.clientX, window.innerWidth - menuWidth - 8));
-    const y = Math.max(8, Math.min(event.clientY, window.innerHeight - menuHeight - 8));
-    setSubSessionContextMenu({ id, x, y });
-  }, []);
+  }, [openSubSessionContextMenuAt]);
 
   const contextSubSession = subSessionContextMenu
     ? subSessions.find((sub) => sub.id === subSessionContextMenu.id)
@@ -1237,19 +1243,30 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
       const touch = e.touches[0];
       td.id = id;
       td.active = false;
+      td.menuOpened = false;
       td.moved = false;
       td.startX = touch?.clientX ?? 0;
       td.startY = touch?.clientY ?? 0;
       td.timer = setTimeout(() => {
         if (td.id !== id || td.moved) return;
-        td.id = id;
-        td.active = true;
-        setDragOrder(orderedSessionsRef.current.map((s) => s.id));
-        const btn = el.querySelector(`[data-sub-id="${id}"]`) as HTMLElement | null;
-        if (btn) { btn.style.transform = 'scale(1.18)'; btn.style.boxShadow = '0 0 10px rgba(251,191,36,0.6)'; btn.style.borderColor = '#f59e0b'; btn.style.zIndex = '2'; }
-        el.style.overflowX = 'hidden';
+        td.timer = null;
+        td.menuOpened = true;
+        const currentTouch = e.touches[0];
+        openSubSessionContextMenuAt(id, currentTouch?.clientX ?? td.startX, currentTouch?.clientY ?? td.startY);
         window.getSelection()?.removeAllRanges();
       }, 400);
+    };
+
+    const activateDrag = (id: string) => {
+      td.id = id;
+      td.active = true;
+      const initialOrder = orderedSessionsRef.current.map((s) => s.id);
+      dragOrderRef.current = initialOrder;
+      setDragOrder(initialOrder);
+      const btn = el.querySelector(`[data-sub-id="${id}"]`) as HTMLElement | null;
+      if (btn) { btn.style.transform = 'scale(1.18)'; btn.style.boxShadow = '0 0 10px rgba(251,191,36,0.6)'; btn.style.borderColor = '#f59e0b'; btn.style.zIndex = '2'; }
+      el.style.overflowX = 'hidden';
+      window.getSelection()?.removeAllRanges();
     };
 
     const onMove = (e: TouchEvent) => {
@@ -1259,7 +1276,15 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
         const dy = touch.clientY - td.startY;
         if (Math.hypot(dx, dy) > 8) td.moved = true;
       }
-      if (td.timer && !td.active && td.moved) { clearTimeout(td.timer); td.timer = null; return; }
+      if (td.timer && !td.active && td.moved) {
+        clearTimeout(td.timer);
+        td.timer = null;
+        activateDrag(td.id!);
+      }
+      if (td.menuOpened) {
+        e.preventDefault();
+        return;
+      }
       if (!td.active || !td.id) return;
       e.preventDefault(); // works because { passive: false }
       if (!touch) return;
@@ -1273,6 +1298,7 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
     const resetTouchDrag = () => {
       td.id = null;
       td.active = false;
+      td.menuOpened = false;
       td.moved = false;
       td.startX = 0;
       td.startY = 0;
@@ -1281,9 +1307,12 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
     const onEnd = (e: TouchEvent) => {
       const endedId = td.id ?? findBtnId(e.target);
       const wasActive = td.active;
+      const menuOpened = td.menuOpened;
       const moved = td.moved;
       if (td.timer) { clearTimeout(td.timer); td.timer = null; }
-      if (wasActive && td.id) {
+      if (menuOpened) {
+        setTimeout(() => { suppressEntryClickRef.current = false; }, 0);
+      } else if (wasActive && td.id) {
         suppressEntryClickRef.current = true;
         setTimeout(() => { suppressEntryClickRef.current = false; }, 0);
         const btn = el.querySelector(`[data-sub-id="${td.id}"]`) as HTMLElement | null;
@@ -1305,24 +1334,41 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
         el.style.overflowX = '';
       }
       if (td.id) getEntryGestureController(td.id).cancelTouchSequence();
+      suppressEntryClickRef.current = false;
       resetTouchDrag();
     };
 
-    const onContext = (e: Event) => { if (td.active) e.preventDefault(); };
+    const onScroll = () => {
+      if (td.timer || td.active) onCancel();
+    };
+
+    const onContext = (e: Event) => { if (td.active || td.menuOpened) e.preventDefault(); };
 
     el.addEventListener('touchstart', onStart, { passive: true });
     el.addEventListener('touchmove', onMove, { passive: false });
     el.addEventListener('touchend', onEnd);
     el.addEventListener('touchcancel', onCancel);
+    el.addEventListener('scroll', onScroll, { passive: true });
     el.addEventListener('contextmenu', onContext);
     return () => {
+      if (td.timer) { clearTimeout(td.timer); td.timer = null; }
+      if (td.active && td.id) {
+        const btn = el.querySelector(`[data-sub-id="${td.id}"]`) as HTMLElement | null;
+        if (btn) { btn.style.transform = ''; btn.style.boxShadow = ''; btn.style.borderColor = ''; btn.style.zIndex = ''; }
+        el.style.overflowX = '';
+      }
+      td.id = null;
+      td.active = false;
+      td.menuOpened = false;
+      td.moved = false;
       el.removeEventListener('touchstart', onStart);
       el.removeEventListener('touchmove', onMove);
       el.removeEventListener('touchend', onEnd);
       el.removeEventListener('touchcancel', onCancel);
+      el.removeEventListener('scroll', onScroll);
       el.removeEventListener('contextmenu', onContext);
     };
-  }, [collapsed, getEntryGestureController, isVerticalRail, moveSubSessionInDragOrder, syncOrderToServer]);
+  }, [collapsed, getEntryGestureController, isVerticalRail, moveSubSessionInDragOrder, openSubSessionContextMenuAt, syncOrderToServer]);
 
   useEffect(() => {
     const installHorizontalEdgeGuard = (el: HTMLDivElement | null) => {

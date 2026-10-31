@@ -1237,15 +1237,15 @@ describe('SubSessionBar', () => {
 
     try {
       fireEvent.touchStart(first, { touches: [{ clientX: 10, clientY: 10 }] });
+      fireEvent.touchMove(first, { touches: [{ clientX: 20, clientY: 10 }] });
       act(() => {
         vi.advanceTimersByTime(401);
       });
-      fireEvent.touchMove(first, { touches: [{ clientX: 80, clientY: 10 }] });
 
-      await waitFor(() => {
-        expect(Array.from(view.container.querySelectorAll('.subsession-card')).map((node) => (node as HTMLElement).dataset.subId)).toEqual(['sub-b', 'sub-a']);
-        expect(onVisualOrderChange).toHaveBeenLastCalledWith(['sub-b', 'sub-a']);
-      });
+      await act(async () => { await Promise.resolve(); });
+      expect(Array.from(view.container.querySelectorAll('.subsession-card')).map((node) => (node as HTMLElement).dataset.subId)).toEqual(['sub-b', 'sub-a']);
+      expect(onVisualOrderChange).toHaveBeenLastCalledWith(['sub-b', 'sub-a']);
+      expect(document.body.querySelector('[data-testid="subsession-context-menu"]')).toBeNull();
 
       fireEvent.touchEnd(first);
       act(() => {
@@ -1260,6 +1260,63 @@ describe('SubSessionBar', () => {
         value: originalElementFromPoint,
       });
     }
+  });
+
+  it('opens the context menu on a stationary mobile long press without starting a drag', () => {
+    vi.useFakeTimers();
+    const view = render(
+      <SubSessionBar
+        subSessions={[makeSubSession({ id: 'sub-a', sessionName: 'deck_sub_sub-a', label: 'a' })]}
+        openIds={new Set()}
+        collapsed
+        desktopLayoutCapable={false}
+        onOpen={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onRenameSubSession={vi.fn()}
+        onToggleSubSessionPin={vi.fn()}
+        pinnedSubSessionIds={new Set()}
+        ws={null}
+        connected={true}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+      />,
+    );
+    const button = view.container.querySelector('[data-sub-id="sub-a"]') as HTMLElement;
+    fireEvent.touchStart(button, { touches: [{ clientX: 40, clientY: 50 }] });
+    act(() => { vi.advanceTimersByTime(401); });
+    const menu = document.body.querySelector('[data-testid="subsession-context-menu"]');
+    expect(menu).not.toBeNull();
+    expect(menu?.querySelectorAll('[role="menuitem"]')).toHaveLength(4);
+    fireEvent.touchEnd(button);
+    expect(document.body.querySelector('[data-testid="subsession-context-menu"]')).not.toBeNull();
+  });
+
+  it('cancels a pending mobile long press when the bar unmounts', () => {
+    vi.useFakeTimers();
+    const view = render(
+      <SubSessionBar
+        subSessions={[makeSubSession({ id: 'sub-a', sessionName: 'deck_sub_sub-a', label: 'a' })]}
+        openIds={new Set()}
+        collapsed
+        desktopLayoutCapable={false}
+        onOpen={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onRenameSubSession={vi.fn()}
+        onToggleSubSessionPin={vi.fn()}
+        pinnedSubSessionIds={new Set()}
+        ws={null}
+        connected={true}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+      />,
+    );
+    const button = view.container.querySelector('[data-sub-id="sub-a"]') as HTMLElement;
+    fireEvent.touchStart(button, { touches: [{ clientX: 40, clientY: 50 }] });
+    view.unmount();
+    act(() => { vi.advanceTimersByTime(401); });
+    expect(document.body.querySelector('[data-testid="subsession-context-menu"]')).toBeNull();
   });
 
   it('shows idle flash on collapsed buttons only when the token increments after mount', () => {
