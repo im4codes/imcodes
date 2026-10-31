@@ -277,6 +277,18 @@ async function waitForStripped(taskId: string, wt: string): Promise<void> {
     expect(weighed(wt)).toEqual([]);
   }, { timeout: 15_000, interval: 50 });
 }
+async function resetFinishedForReclaim(taskId: string): Promise<void> {
+  const state = pair(taskId);
+  const now = Date.now();
+  getTaskPairStore().savePair(PROJECT, {
+    ...state,
+    updatedAt: now,
+    workspace: { ...state.workspace!, status: 'ended', endedAt: now, strippedAt: undefined },
+  });
+  await vi.waitFor(() => {
+    expect(getTaskPairStore().listEndedWorkspacePairs().some((stored) => stored.project === PROJECT && stored.state.taskId === taskId)).toBe(true);
+  }, { timeout: 15_000, interval: 50 });
+}
 async function closed(taskId: string): Promise<string> {
   const wt = await opened(taskId);
   weigh(wt);
@@ -363,7 +375,7 @@ describe('workspace hygiene through the pair service', () => {
     weigh(open);
     const done = await closed('DONE1');
     weigh(done);
-    getTaskPairStore().savePair(PROJECT, { ...pair('DONE1'), workspace: { ...pair('DONE1').workspace!, strippedAt: undefined } });
+    await resetFinishedForReclaim('DONE1');
     setTaskPairHygieneDepsForTests({ worktreesRoot, readSpace: async () => ({ freeBytes: 1 * GIB, totalBytes: TOTAL }) });
 
     await taskPairService.checkDiskPressure(Date.now(), { force: true, waitMs: 10_000 });
@@ -445,11 +457,12 @@ describe('workspace hygiene through the pair service', () => {
   it('a new pair worktree is preceded by a reclaim when the volume is short', async () => {
     const stale = await closed('STALE1');
     weigh(stale);
-    getTaskPairStore().savePair(PROJECT, { ...pair('STALE1'), workspace: { ...pair('STALE1').workspace!, strippedAt: undefined } });
+    await resetFinishedForReclaim('STALE1');
     const free = () => (existsSync(join(stale, 'node_modules')) ? 4 : 20) * GIB;
     setTaskPairHygieneDepsForTests({ worktreesRoot, readSpace: async () => ({ freeBytes: free(), totalBytes: TOTAL }) });
 
     const fresh = await opened('FRESH1');
+    await taskPairService.checkDiskPressure(Date.now(), { force: true, waitMs: 20_000 });
     await taskPairService.waitForIdle();
 
     await waitForStripped('STALE1', stale);
