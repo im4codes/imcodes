@@ -3481,19 +3481,9 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
 async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
   const { name, projectName, role, agentType, projectDir, skipStore, label, description, bindExistingKey, skipCreate } = opts;
   const existing = getSession(name);
-  // An identity handed in by the caller (a session being created) wins; every other launch -- restart, resume, a sub-session
-  // that carries none -- derives it from the identity store, the same as a restore.
-  const identityPrompt = opts.identityPrompt ?? await resolveEffectiveIdentityPrompt({ name, projectName, contextNamespace: existing?.contextNamespace });
-  const resourceSessionInstanceId = existing?.sessionInstanceId ?? randomUUID();
-  const resourceRuntimeEpoch = randomUUID();
-  if (opts.fresh || !existing) clearSummarySyncHistory(name);
-  const inheritedClaudeResumeId = opts.ccSessionId ?? (!opts.fresh ? existing?.ccSessionId : undefined);
-  const shouldResumeClaudeCliConversation = isClaudeCodeSdkAgentType(agentType)
-    && existing?.agentType === 'claude-code'
-    && existing?.runtimeType !== RUNTIME_TYPES.TRANSPORT
-    && typeof inheritedClaudeResumeId === 'string'
-    && inheritedClaudeResumeId.length > 0;
-
+  // A fresh launch is an explicit replacement. Remove the old runtime before
+  // any asynchronous identity/resource work so callers never observe stale
+  // runtime state while the replacement is starting.
   if (opts.fresh) {
     const existingRuntime = transportRuntimes.get(name);
     if (existingRuntime) {
@@ -3507,6 +3497,18 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
       }
     }
   }
+  // An identity handed in by the caller (a session being created) wins; every other launch -- restart, resume, a sub-session
+  // that carries none -- derives it from the identity store, the same as a restore.
+  const identityPrompt = opts.identityPrompt ?? await resolveEffectiveIdentityPrompt({ name, projectName, contextNamespace: existing?.contextNamespace });
+  const resourceSessionInstanceId = existing?.sessionInstanceId ?? randomUUID();
+  const resourceRuntimeEpoch = randomUUID();
+  if (opts.fresh || !existing) clearSummarySyncHistory(name);
+  const inheritedClaudeResumeId = opts.ccSessionId ?? (!opts.fresh ? existing?.ccSessionId : undefined);
+  const shouldResumeClaudeCliConversation = isClaudeCodeSdkAgentType(agentType)
+    && existing?.agentType === 'claude-code'
+    && existing?.runtimeType !== RUNTIME_TYPES.TRANSPORT
+    && typeof inheritedClaudeResumeId === 'string'
+    && inheritedClaudeResumeId.length > 0;
 
   if (existing && !transportRuntimes.has(name)) {
     // Only a non-fresh relaunch of the same agent resumes the same provider
