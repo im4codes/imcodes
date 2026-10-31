@@ -3383,6 +3383,66 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
         },
       };
     },
+    [MEMORY_MCP_TOOL_NAMES.PAIR_HISTORY]: async (input) => {
+      const context = await pairCallerContext();
+      if (context.status === 'error') return context.result;
+      if (!caller.sessionName) {
+        return error(MCP_ERROR_REASONS.SCOPE_FORBIDDEN, 'pair_history requires the authoritative project Brain');
+      }
+      const args = pickAllowedMcpArgs(input, ['taskId', 'role', 'kind', 'limit']);
+      const taskId = stringArg(args, 'taskId');
+      if (!taskId) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'taskId is required');
+      const stored = getTaskPairStore().getPair(context.project, taskId);
+      if (!stored) return error(MCP_ERROR_REASONS.PROJECTION_UNAVAILABLE, 'task pair not found');
+      if (stored.state.brain !== caller.sessionName) {
+        return error(MCP_ERROR_REASONS.SCOPE_FORBIDDEN, 'pair_history requires the authoritative project Brain');
+      }
+      const kind = args.kind ?? SESSION_HISTORY_KINDS[0];
+      if (!(SESSION_HISTORY_KINDS as readonly unknown[]).includes(kind)) {
+        return error(MCP_ERROR_REASONS.VALIDATION_FAILED, `kind must be ${SESSION_HISTORY_KINDS.join(', ')}`);
+      }
+      const role = args.role;
+      if (role !== undefined && role !== 'executor' && role !== 'auditor') {
+        return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'role must be executor or auditor');
+      }
+      const limit = args.limit ?? SESSION_TEXT_HISTORY_DEFAULT_LIMIT;
+      if (typeof limit !== 'number' || !Number.isInteger(limit) || limit < 1 || limit > SESSION_TEXT_HISTORY_MAX_LIMIT) {
+        return error(MCP_ERROR_REASONS.VALIDATION_FAILED, `limit must be 1..${SESSION_TEXT_HISTORY_MAX_LIMIT}`);
+      }
+      if (kind === 'summary') {
+        const gate = memorySurfaceGate(deps, { items: [] });
+        if (gate) return gate;
+      }
+      const sessionsByName = new Map(context.sessions.map((session) => [session.name, session]));
+      const participantEntries = [
+        { role: 'executor' as const, sessionName: stored.state.executor },
+        { role: 'auditor' as const, sessionName: stored.state.auditor === TASK_PAIR_NO_AUDITOR ? null : stored.state.auditor },
+      ].filter((participant) => role === undefined || participant.role === role);
+      const participants = await Promise.all(participantEntries.map(async ({ role, sessionName }) => {
+        const emptyPayload = kind === 'text' ? { messages: [] } : kind === 'tool' ? { events: [] } : { items: [] };
+        if (!sessionName || !sessionsByName.has(sessionName)) {
+          return { role, session: sessionName, status: 'missing' as const, kind, requested: limit, count: 0, ...emptyPayload };
+        }
+        try {
+          if (kind === 'summary') {
+            const items = await readSessionSummaries(sessionName, sessionsByName.get(sessionName)!.contextNamespace ?? caller.namespace, limit, false);
+            return { role, session: sessionName, status: 'ok' as const, kind, requested: limit, count: items.length, items };
+          }
+          if (kind === 'tool') {
+            const events = await readSessionToolEvents(sessionName, limit);
+            return { role, session: sessionName, status: 'ok' as const, kind, requested: limit, count: events.length, events };
+          }
+          const messages = await readSessionTextMessages(sessionName, limit, undefined, false);
+          return { role, session: sessionName, status: 'ok' as const, kind, requested: limit, count: messages.length, messages };
+        } catch {
+          return { role, session: sessionName, status: 'error' as const, kind, requested: limit, count: 0, ...emptyPayload };
+        }
+      }));
+      if (participants.some((participant) => participant.status === 'error')) {
+        return error(MCP_ERROR_REASONS.CONTROL_PLANE_UNAVAILABLE, 'pair session history is temporarily unavailable; retry, do not infer empty history');
+      }
+      return { status: 'ok', taskId, kind, requested: limit, participants };
+    },
     [MEMORY_MCP_TOOL_NAMES.PAIR_CREATE]: async (input) => {
       const context = await pairCallerContext();
       if (context.status === 'error') return context.result;
@@ -5126,6 +5186,12 @@ const schemas = {
   [MEMORY_MCP_TOOL_NAMES.PAIR_GET]: z.object({
     taskId: z.string().min(1),
     eventLimit: z.number().int().min(1).max(200).optional(),
+  }).strict(),
+  [MEMORY_MCP_TOOL_NAMES.PAIR_HISTORY]: z.object({
+    taskId: z.string().min(1),
+    role: z.enum(['executor', 'auditor']).optional(),
+    kind: z.enum(['text', 'tool', 'summary']).optional(),
+    limit: z.number().int().min(1).max(200).optional(),
   }).strict(),
   [MEMORY_MCP_TOOL_NAMES.PAIR_PAUSE]: z.object({ taskId: z.string().min(1), mode: z.enum(TASK_PAIR_PAUSE_MODES).optional(), dependsOn: z.array(z.string().min(1)).max(TASK_PAIR_MAX_DEPENDENCIES).optional(), note: z.string().max(2000).optional() }),
   [MEMORY_MCP_TOOL_NAMES.PAIR_RESUME]: z.object({ taskId: z.string().min(1) }),

@@ -48,6 +48,41 @@ describe('pair MCP projections', () => {
     });
   });
 
+  it('reads pair_history for both roles or one role and reports a missing auditor', async () => {
+    const taskId = 'history-1';
+    getTaskPairStore().savePair(PROJECT, pair(taskId, 'working'));
+    const sessions = () => [session(BRAIN, 'brain'), session(EXEC, 'w1'), session(AUD, 'w2')];
+    const handlers = createMemoryMcpToolHandlers(caller, { sendDeps: { listSessions: sessions } });
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.PAIR_HISTORY]({ taskId })).resolves.toMatchObject({
+      status: 'ok', taskId, kind: 'text', requested: 20,
+      participants: [
+        { role: 'executor', session: EXEC, status: 'ok', count: 0, messages: [] },
+        { role: 'auditor', session: AUD, status: 'ok', count: 0, messages: [] },
+      ],
+    });
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.PAIR_HISTORY]({ taskId, role: 'executor', kind: 'tool', limit: 3 })).resolves.toMatchObject({
+      status: 'ok', participants: [{ role: 'executor', session: EXEC, kind: 'tool', requested: 3, events: [] }],
+    });
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.PAIR_HISTORY]({ taskId, kind: 'summary', limit: 2 })).resolves.toMatchObject({
+      status: 'ok', participants: [{ role: 'executor', kind: 'summary', requested: 2, items: [] }, { role: 'auditor', kind: 'summary', requested: 2, items: [] }],
+    });
+    getTaskPairStore().savePair(PROJECT, { ...pair('history-none', 'done'), auditor: 'none' });
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.PAIR_HISTORY]({ taskId: 'history-none', role: 'auditor' })).resolves.toMatchObject({
+      status: 'ok', participants: [{ role: 'auditor', session: null, status: 'missing', requested: 20, messages: [] }],
+    });
+  });
+
+  it('keeps pair_history Brain-only and rejects invalid bounds or unknown tasks', async () => {
+    getTaskPairStore().savePair(PROJECT, pair('history-auth', 'working'));
+    const sessions = () => [session(BRAIN, 'brain'), session(EXEC, 'w1'), session(AUD, 'w2')];
+    const executorHandlers = createMemoryMcpToolHandlers({ ...caller, sessionName: EXEC }, { sendDeps: { listSessions: sessions } });
+    await expect(executorHandlers[MEMORY_MCP_TOOL_NAMES.PAIR_HISTORY]({ taskId: 'history-auth' })).resolves.toMatchObject({ status: 'error', reason: 'scope_forbidden' });
+    const handlers = createMemoryMcpToolHandlers(caller, { sendDeps: { listSessions: sessions } });
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.PAIR_HISTORY]({ taskId: 'missing' })).resolves.toMatchObject({ status: 'error', reason: 'projection_unavailable' });
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.PAIR_HISTORY]({ taskId: 'history-auth', limit: 201 })).resolves.toMatchObject({ status: 'error', reason: 'validation_failed' });
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.PAIR_HISTORY]({ taskId: 'history-auth', kind: 'invalid' })).resolves.toMatchObject({ status: 'error', reason: 'validation_failed' });
+  });
+
   it('orders pair_list queue positions urgent-first, matching what the scheduler will start next', async () => {
     getTaskPairStore().savePair(PROJECT, pair('normal-1', 'queued'));
     getTaskPairStore().savePair(PROJECT, pair('normal-2', 'queued'));

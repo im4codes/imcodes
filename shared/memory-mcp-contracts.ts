@@ -135,6 +135,7 @@ export const MEMORY_MCP_TOOL_NAMES = {
   PAIR_SET_MAX_CONCURRENCY: 'pair_set_max_concurrency',
   PAIR_GET_MAX_CONCURRENCY: 'pair_get_max_concurrency',
   PAIR_WORKSPACE_GC: 'pair_workspace_gc',
+  PAIR_HISTORY: 'pair_history',
   SESSION_TEXT_HISTORY: 'session_history',
   SESSION_RUNTIME_IDENTITY_GET: 'session_runtime_identity_get',
   SESSION_RESTART: 'session_restart',
@@ -207,6 +208,7 @@ export const MEMORY_MCP_TOOL_NAME_LIST = [
   MEMORY_MCP_TOOL_NAMES.SEND_LIST_TARGETS,
   MEMORY_MCP_TOOL_NAMES.PAIR_LIST,
   MEMORY_MCP_TOOL_NAMES.PAIR_GET,
+  MEMORY_MCP_TOOL_NAMES.PAIR_HISTORY,
   MEMORY_MCP_TOOL_NAMES.PAIR_CREATE,
   MEMORY_MCP_TOOL_NAMES.PAIR_DISPATCH,
   MEMORY_MCP_TOOL_NAMES.PAIR_CLOSE,
@@ -810,6 +812,17 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
     description: 'Get one caller-Brain task pair with its brief and recent durable events.',
     inputSchema: objectSchema({ taskId: stringSchema('Exact task-pair id.'), eventLimit: numberSchema('Optional maximum recent events.') }, ['taskId']),
     outputSchema: objectSchema({ status: stringSchema('ok or error.'), pair: { type: 'object' } }),
+  },
+  [MEMORY_MCP_TOOL_NAMES.PAIR_HISTORY]: {
+    name: MEMORY_MCP_TOOL_NAMES.PAIR_HISTORY,
+    description: 'Brain-only: read recent text, calls, or summary history for both participants of one task pair. Uses the same bounded readers and redaction rules as session_history; auditor=none is reported as missing.',
+    inputSchema: objectSchema({
+      taskId: stringSchema('Exact task-pair id.'),
+      role: { type: 'string', enum: ['executor', 'auditor'], description: 'Optional participant role; omit to read both.' },
+      kind: { type: 'string', enum: ['text', 'tool', 'summary'], description: 'History kind; defaults to text.' },
+      limit: numberSchema('Requested history count per participant; 1..200.'),
+    }, ['taskId']),
+    outputSchema: objectSchema({ status: stringSchema('ok or error.'), taskId: stringSchema('Resolved task-pair id.'), kind: stringSchema('Requested history kind.'), requested: numberSchema('Requested per-participant limit.'), participants: { type: 'array', items: { type: 'object' } } }),
   },
   [MEMORY_MCP_TOOL_NAMES.PAIR_CREATE]: {
     name: MEMORY_MCP_TOOL_NAMES.PAIR_CREATE,
