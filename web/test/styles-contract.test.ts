@@ -1197,8 +1197,18 @@ describe('styles.css regression contracts', () => {
     const mobileRule = css.match(
       /@media\s*\(max-width:\s*720px\)[\s\S]*?\.chat-titlebar > \.task-pair-status-panel\.is-mobile\.is-collapsed\s*\{([^}]*)\}/,
     )?.[1] ?? '';
-    expect(mobileRule).toMatch(/margin:\s*0(?:;|\s)/);
-    expect(mobileRule).not.toMatch(/margin[^;]*auto/);
+    expect(mobileRule).toMatch(/margin:\s*0 0 0 auto/);
+    expect(mobileRule).toMatch(/max-width:\s*calc\(48% - var\(--chat-top-actions-reserve/);
+    expect(css).toMatch(/@media\s*\(max-width:\s*350px\)[\s\S]*?max-width:\s*calc\(100% - var\(--chat-top-actions-reserve/);
+  });
+
+  it('right-aligns the desktop collapsed task strip inside the reserved action area', () => {
+    const desktopRule = css.match(
+      /\.chat-titlebar > \.task-pair-status-panel\.is-collapsed\s*\{([^}]*)\}/,
+    )?.[1] ?? '';
+    expect(desktopRule).toMatch(/margin:\s*0 0 0 auto/);
+    expect(desktopRule).toMatch(/max-width:\s*calc\(48% - var\(--chat-top-actions-reserve/);
+    expect(css).toMatch(/\.chat-titlebar\s*\{[^}]*padding-right:\s*max\(8px, var\(--chat-top-actions-reserve/);
   });
 
   // iOS Safari's own long-press callout (the "Copy"/selection loupe) is a

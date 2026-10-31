@@ -14820,7 +14820,7 @@ button.quick-agent-delegation-preset.active {
   position: static; z-index: 13; flex: 0 1 auto; min-width: 0;
   height: auto; max-height: none; overflow: visible;
   display: inline-flex; width: auto; max-width: calc(48% - var(--chat-top-actions-reserve, 56px));
-  margin: 0; border: 1px solid color-mix(in srgb, var(--chrome-accent, #38bdf8) 35%, transparent);
+  margin: 0 0 0 auto; border: 1px solid color-mix(in srgb, var(--chrome-accent, #38bdf8) 35%, transparent);
   border-radius: 8px; background: color-mix(in srgb, var(--chrome-panel, #0f172a) 88%, transparent);
   box-shadow: 0 3px 12px color-mix(in srgb, #000 25%, transparent);
 }
@@ -14903,7 +14903,7 @@ button.quick-agent-delegation-preset.active {
   }
   .chat-titlebar > .task-pair-status-panel.is-mobile.is-collapsed {
     position: static; flex: 0 1 auto; min-width: 0; max-width: calc(48% - var(--chat-top-actions-reserve, 56px));
-    width: auto; margin: 0; display: inline-flex; align-self: center;
+    width: auto; margin: 0 0 0 auto; display: inline-flex; align-self: center;
   }
   .chat-titlebar > .task-pair-status-panel.is-mobile.is-collapsed .task-pair-status-compact {
     min-width: 0; max-width: 100%; overflow: hidden; display: flex; align-items: center;
