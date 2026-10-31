@@ -1186,6 +1186,13 @@ describe('styles.css regression contracts', () => {
     expect(surfaceRule).toMatch(/pointer-events:\s*auto/);
   });
 
+  it('keeps remote-desktop footer rows content-sized so the stage owns remaining height', () => {
+    const panelRule = css.match(/\.remote-desktop-panel\s*\{[^}]*\}/)?.[0];
+    expect(panelRule, '.remote-desktop-panel rule missing').toBeTruthy();
+    expect(panelRule).toMatch(/align-content:\s*start/);
+    expect(panelRule).toMatch(/grid-template-rows:\s*auto auto minmax\(0, 1fr\) auto auto/);
+  });
+
   // iOS Safari's own long-press callout (the "Copy"/selection loupe) is a
   // separate mechanism from touch-action: none, and fires on the actual
   // touch target -- the input-surface div, since the video itself is

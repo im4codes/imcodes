@@ -10939,6 +10939,9 @@ button.quick-agent-delegation-preset.active {
      popups and text-selection handles mean nothing anywhere in it. Fields that
      are typed into keep selection (below). */
   display: grid;
+  /* Keep auto-sized footer/toolbar rows content-sized; the stage's 1fr row
+     must receive the remaining height instead of stretching the footer. */
+  align-content: start;
   /* The control notice gets its own auto row, so it can never consume the
      stage's 1fr row. The 4th row only gets a grid item (the docked mobile
      keyboard) while it is open; with no item placed there it collapses to 0
