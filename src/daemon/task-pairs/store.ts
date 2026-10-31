@@ -170,6 +170,19 @@ export interface TaskPairDecisionRecord {
   idempotencyKey?: string;
 }
 
+export interface TaskPairDecisionNotification {
+  id: string;
+  project: string;
+  taskId: string;
+  decisionId: string;
+  target: string;
+  reason: string;
+  text: string;
+  attempts: number;
+  lastAttemptAt?: number;
+  deliveredAt?: number;
+}
+
 function emptyLiveness(now: number): TaskPairLiveness {
   return {
     silenceExecutor: 0,
@@ -349,6 +362,20 @@ export class TaskPairStore {
         UNIQUE (project, task_id, idempotency_key)
       );
       CREATE INDEX IF NOT EXISTS task_pair_decisions_task_idx ON task_pair_decisions (project, task_id, at DESC, id DESC);
+      CREATE TABLE IF NOT EXISTS task_pair_decision_notifications (
+        id TEXT PRIMARY KEY,
+        project TEXT NOT NULL,
+        task_id TEXT NOT NULL,
+        decision_id TEXT NOT NULL,
+        target TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        text TEXT NOT NULL,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        last_attempt_at INTEGER,
+        delivered_at INTEGER,
+        UNIQUE (decision_id, target)
+      );
+      CREATE INDEX IF NOT EXISTS task_pair_decision_notifications_pending_idx ON task_pair_decision_notifications (delivered_at, last_attempt_at);
     `);
   }
 
@@ -803,6 +830,28 @@ export class TaskPairStore {
     return rows.map(decisionFromRow);
   }
 
+  enqueueDecisionNotification(input: Omit<TaskPairDecisionNotification, 'id' | 'attempts' | 'lastAttemptAt' | 'deliveredAt'>): TaskPairDecisionNotification {
+    const id = `${input.decisionId}:${input.target}`;
+    this.#db.prepare(`INSERT OR IGNORE INTO task_pair_decision_notifications (id, project, task_id, decision_id, target, reason, text, attempts) VALUES (?, ?, ?, ?, ?, ?, ?, 0)`).run(
+      id, input.project, input.taskId, input.decisionId, input.target, input.reason, input.text,
+    );
+    const row = this.#db.prepare('SELECT * FROM task_pair_decision_notifications WHERE id = ?').get(id) as Record<string, unknown>;
+    return decisionNotificationFromRow(row);
+  }
+
+  listPendingDecisionNotifications(limit = 100): TaskPairDecisionNotification[] {
+    const rows = this.#db.prepare('SELECT * FROM task_pair_decision_notifications WHERE delivered_at IS NULL ORDER BY COALESCE(last_attempt_at, 0), id LIMIT ?').all(Math.max(1, Math.floor(limit))) as Array<Record<string, unknown>>;
+    return rows.map(decisionNotificationFromRow);
+  }
+
+  markDecisionNotificationAttempt(id: string, at = Date.now()): void {
+    this.#db.prepare('UPDATE task_pair_decision_notifications SET attempts = attempts + 1, last_attempt_at = ? WHERE id = ? AND delivered_at IS NULL').run(at, id);
+  }
+
+  markDecisionNotificationDelivered(id: string, at = Date.now()): void {
+    this.#db.prepare('UPDATE task_pair_decision_notifications SET delivered_at = ? WHERE id = ?').run(at, id);
+  }
+
   getMaxConcurrency(brain: string): number {
     const row = this.#db.prepare('SELECT max_concurrency FROM task_pair_queue_settings WHERE brain = ?').get(brain) as { max_concurrency: number } | undefined;
     return row ? Number(row.max_concurrency) : TASK_PAIR_DEFAULT_MAX_CONCURRENCY;
@@ -944,6 +993,15 @@ function decisionFromRow(row: Record<string, unknown>): TaskPairDecisionRecord {
     at: Number(row.at),
     ...(related && related.length > 0 ? { related } : {}),
     ...(row.idempotency_key != null ? { idempotencyKey: String(row.idempotency_key) } : {}),
+  };
+}
+
+function decisionNotificationFromRow(row: Record<string, unknown>): TaskPairDecisionNotification {
+  return {
+    id: String(row.id), project: String(row.project), taskId: String(row.task_id), decisionId: String(row.decision_id),
+    target: String(row.target), reason: String(row.reason), text: String(row.text), attempts: Number(row.attempts ?? 0),
+    ...(row.last_attempt_at != null ? { lastAttemptAt: Number(row.last_attempt_at) } : {}),
+    ...(row.delivered_at != null ? { deliveredAt: Number(row.delivered_at) } : {}),
   };
 }
 

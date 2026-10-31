@@ -128,6 +128,25 @@ const TASK_PAIR_PARTICIPANT_RECOVERY_WINDOW_MS = 5 * 60_000;
 const TASK_PAIR_EXECUTOR_ESCALATION_REMINDER_MS = [30 * 60_000, 60 * 60_000, 120 * 60_000] as const;
 const TASK_PAIR_DECISION_REMINDER_MS = 5 * 60_000;
 
+/** Pure clock-boundary decision used by the heartbeat and fake-clock tests. */
+export function taskPairDecisionReminderDue(input: {
+  status: string;
+  now: number;
+  pairUpdatedAt: number;
+  latestRequestAt?: number;
+  latestDecisionAt?: number;
+  reminderAt?: number;
+}): boolean {
+  if (!['in_audit', 'awaiting_audit', 'rework'].includes(input.status)) return false;
+  const unanswered = input.latestRequestAt !== undefined
+    ? input.latestDecisionAt === undefined || input.latestDecisionAt < input.latestRequestAt
+    : input.latestDecisionAt === undefined;
+  if (!unanswered) return false;
+  const baseline = input.latestRequestAt ?? input.pairUpdatedAt;
+  if (input.now - baseline < TASK_PAIR_DECISION_REMINDER_MS) return false;
+  return input.reminderAt === undefined || input.now - input.reminderAt >= TASK_PAIR_DECISION_REMINDER_MS;
+}
+
 export function resolveTaskPairParticipantHealthMs(env: NodeJS.ProcessEnv = process.env): number {
   const raw = Number(env[TASK_PAIR_PARTICIPANT_HEALTH_ENV]);
   return Number.isFinite(raw) && raw >= 1_000 ? raw : TASK_PAIR_PARTICIPANT_HEALTH_MS;
@@ -755,11 +774,10 @@ export class TaskPairAutomation implements TaskPairScheduler {
     const records = store.listDecisions(stored.project, [pair.taskId], 100).filter((record) => record.round === pair.round);
     const latestRequest = records.find((record) => record.kind === 'request');
     const latestDecision = records.find((record) => record.kind === 'decision');
-    const unanswered = latestRequest ? (!latestDecision || latestDecision.at < latestRequest.at) : !latestDecision;
-    if (!unanswered) return;
-    const baseline = latestRequest?.at ?? pair.updatedAt;
-    if (now - baseline < TASK_PAIR_DECISION_REMINDER_MS) return;
-    if (stored.liveness.decisionReminderAt !== undefined && now - stored.liveness.decisionReminderAt < TASK_PAIR_DECISION_REMINDER_MS) return;
+    if (!taskPairDecisionReminderDue({
+      status: pair.status, now, pairUpdatedAt: pair.updatedAt,
+      latestRequestAt: latestRequest?.at, latestDecisionAt: latestDecision?.at, reminderAt: stored.liveness.decisionReminderAt,
+    })) return;
     store.saveLiveness(stored.project, pair.taskId, { ...stored.liveness, decisionReminderAt: now });
     this.#queueLineNotice(pair, 'decision-pending', latestRequest
       ? `Pair ${pair.taskId} has an unanswered ${latestRequest.kind} for round ${pair.round} since ${new Date(latestRequest.at).toISOString()}; Brain must record the final decision with pair_decision_record.`
@@ -908,6 +926,7 @@ export class TaskPairAutomation implements TaskPairScheduler {
     await this.reconcileSuspensions();
     const now = this.#now();
     const store = getTaskPairStore();
+    await taskPairService.retryDecisionNotifications(now);
     const activeForGuard = store.listActivePairs().filter((pair) => isPairsEngineProject(pair.project));
     const derivedRoots = [...new Set(activeForGuard.map((pair) => pair.project))].map((project) => {
       const sessions = listSessions();

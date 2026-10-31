@@ -544,13 +544,28 @@ export class TaskPairService {
       : [pair.state.brain];
     const uniqueTargets = [...new Set(targets.filter((target): target is string => !!target && target !== TASK_PAIR_NO_AUDITOR))];
     const message = `${input.kind === 'decision' ? 'Final decision' : 'Decision request'} recorded for ${input.taskId} round ${input.round}: ${input.conclusion}. ${input.summary}`;
-    for (const target of uniqueTargets) this.#track(sendTaskPairMessage(target, input.taskId, `decision-${input.kind}`, message));
+    for (const target of uniqueTargets) store.enqueueDecisionNotification({
+      project: input.project, taskId: input.taskId, decisionId: result.record.id, target,
+      reason: `decision-${input.kind}`, text: message,
+    });
+    this.#track(this.retryDecisionNotifications());
     emitTaskPairDaemonEvent(pair.state, {
       eventId: `decision:${result.record.id}`,
       verb: input.kind === 'decision' ? 'DECISION' : 'DECISION_REQUEST',
       effect: 'decision_recorded', source: 'mcp', fromStatus: pair.state.status, toStatus: pair.state.status, unusual: false,
     });
     return { ...result, notified: uniqueTargets };
+  }
+
+  /** Deliver persisted decision notifications; failed/no-session rows remain for heartbeat retry. */
+  async retryDecisionNotifications(now = Date.now()): Promise<void> {
+    const store = getTaskPairStore();
+    for (const pending of store.listPendingDecisionNotifications(100)) {
+      store.markDecisionNotificationAttempt(pending.id, now);
+      let status: TaskPairDeliveryResult = 'failed';
+      try { status = await sendTaskPairMessage(pending.target, pending.taskId, pending.reason, pending.text); } catch { /* retain the row for the next heartbeat */ }
+      if (status === 'sent' || status === 'queued' || status === 'skipped_pending') store.markDecisionNotificationDelivered(pending.id, now);
+    }
   }
 
   get pendingCount(): number {

@@ -4,6 +4,9 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createMemoryMcpToolHandlers } from '../../src/daemon/memory-mcp-tools.js';
 import { TaskPairStore, getTaskPairStore, setTaskPairStoreForTests } from '../../src/daemon/task-pairs/store.js';
+import { setTaskPairDeliveryDepsForTests } from '../../src/daemon/task-pairs/delivery.js';
+import { taskPairService } from '../../src/daemon/task-pairs/service.js';
+import { taskPairDecisionReminderDue } from '../../src/daemon/task-pairs/scheduler.js';
 import type { McpRuntimeCaller } from '../../src/daemon/memory-mcp-caller.js';
 import type { TaskPairState } from '../../shared/task-pair.js';
 import type { SessionRecord } from '../../src/store/session-store.js';
@@ -23,7 +26,7 @@ const sessions = (['brain', 'exec', 'audit'] as const).map((name) => ({
 
 describe('pair decision MCP', () => {
   beforeEach(() => { const store = new TaskPairStore(':memory:'); setTaskPairStoreForTests(store); store.savePair('p', state); });
-  afterEach(() => setTaskPairStoreForTests(undefined));
+  afterEach(() => { setTaskPairDeliveryDepsForTests(undefined); setTaskPairStoreForTests(undefined); });
 
   it('writes final Brain decisions idempotently and reads bounded stable history', async () => {
     const handlers = createMemoryMcpToolHandlers(caller, { sendDeps: { listSessions: () => sessions } });
@@ -62,6 +65,30 @@ describe('pair decision MCP', () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  it('persists both notification targets and retries a failed delivery without losing the decision', async () => {
+    let attempts = 0;
+    setTaskPairDeliveryDepsForTests({ send: async () => { attempts += 1; if (attempts === 1) throw new Error('temporary'); } });
+    const result = taskPairService.recordDecision({ project: 'p', taskId: state.taskId, round: 1, kind: 'decision', conclusion: 'PASS', summary: 'notify both', author: 'brain', at: 10, idempotencyKey: 'notify-1' });
+    await taskPairService.waitForIdle();
+    expect(result.notified).toEqual(['brain', 'exec', 'audit']);
+    expect(getTaskPairStore().listPendingDecisionNotifications()).toHaveLength(1);
+    await taskPairService.retryDecisionNotifications(20);
+    expect(getTaskPairStore().listPendingDecisionNotifications()).toHaveLength(0);
+    expect(attempts).toBeGreaterThan(3);
+    setTaskPairDeliveryDepsForTests(undefined);
+  });
+
+  it('uses a five-minute fake-clock boundary, throttles reminders, and resets after a decision', () => {
+    const base = 1_000_000;
+    expect(taskPairDecisionReminderDue({ status: 'in_audit', now: base + 299_999, pairUpdatedAt: base })).toBe(false);
+    expect(taskPairDecisionReminderDue({ status: 'in_audit', now: base + 300_000, pairUpdatedAt: base })).toBe(true);
+    expect(taskPairDecisionReminderDue({ status: 'in_audit', now: base + 360_000, pairUpdatedAt: base, reminderAt: base + 300_000 })).toBe(false);
+    expect(taskPairDecisionReminderDue({ status: 'in_audit', now: base + 600_000, pairUpdatedAt: base, reminderAt: base + 300_000 })).toBe(true);
+    const requestAt = base;
+    expect(taskPairDecisionReminderDue({ status: 'in_audit', now: base + 600_000, pairUpdatedAt: base, latestRequestAt: requestAt, latestDecisionAt: base + 1 })).toBe(false);
+    expect(taskPairDecisionReminderDue({ status: 'working', now: base + 600_000, pairUpdatedAt: base })).toBe(false);
   });
 });
 
