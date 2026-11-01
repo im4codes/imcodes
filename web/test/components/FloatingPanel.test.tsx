@@ -242,4 +242,21 @@ describe('FloatingPanel', () => {
     expect(panel.style.left).toBe('140px');
     expect(panel.style.top).toBe('150px');
   });
+
+  it('does not place a hidden drag strip over content when a custom handle is declared', () => {
+    render(
+      <FloatingPanel
+        id="custom-handle"
+        title="Remote"
+        onClose={() => {}}
+        hideTitleBar
+        dragHandleSelector=".remote-desktop-toolbar"
+      >
+        <div class="remote-desktop-toolbar">toolbar</div>
+        <div data-testid="remote-content">content</div>
+      </FloatingPanel>,
+    );
+
+    expect(screen.queryByTestId('floating-bottom-drag')).toBeNull();
+  });
 });

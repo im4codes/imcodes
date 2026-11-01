@@ -80,6 +80,7 @@ inline constexpr char kRejectModeUnsupported[] = "mode_unsupported";
 inline constexpr char kRejectModeChangeFailed[] = "mode_change_failed";
 inline constexpr char kRejectScaleChangeFailed[] = "scale_change_failed";
 inline constexpr char kRejectCaptureFailed[] = "capture_failed";
+inline constexpr char kRejectQualityUnavailable[] = "quality_unavailable";
 inline constexpr char kRejectUnlockUnavailable[] = "unlock_unavailable";
 inline constexpr char kRejectPasteUnavailable[] = "paste_unavailable";
 

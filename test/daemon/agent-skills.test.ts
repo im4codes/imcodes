@@ -2,6 +2,8 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { makeSkillUri } from '../../shared/skill-registry-types.js';
+import { getSkillRegistryPathsForManagement, writeSkillRegistryManagementSnapshot } from '../../src/context/skill-registry.js';
 import {
   AGENT_SKILLS_ACTION,
   AGENT_SKILLS_ERROR,
@@ -12,9 +14,11 @@ import {
 import {
   agentSkillsCliArguments,
   createAgentSkillsRunner,
+  expandAgentSkillReferences,
   handleAgentSkillsCommand,
   hasCommand,
   listAgentSkills,
+  resolveAgentSkillReference,
 } from '../../src/daemon/agent-skills.js';
 
 const cleanup: string[] = [];
@@ -46,7 +50,13 @@ describe('listAgentSkills', () => {
     }));
 
     expect(await listAgentSkills(root)).toEqual([
-      { name: 'handmade', description: 'Made by hand' },
+      {
+        name: 'handmade',
+        description: 'Made by hand',
+        layer: 'user_default',
+        displayPath: '~/.agents/skills/handmade',
+        uri: 'skill://user_default/handmade',
+      },
       {
         name: 'wecomcli-doc',
         // Extra frontmatter keys belong to the skill; they are not a reason to hide it.
@@ -55,6 +65,9 @@ describe('listAgentSkills', () => {
         sourceUrl: 'https://github.com/WeComTeam/wecom-cli.git',
         installedAt: '2026-09-19T03:33:55.955Z',
         updatedAt: '2026-09-19T03:33:55.955Z',
+        layer: 'user_default',
+        displayPath: '~/.agents/skills/wecomcli-doc',
+        uri: 'skill://user_default/wecomcli-doc',
       },
     ]);
   });
@@ -76,7 +89,40 @@ describe('listAgentSkills', () => {
     await writeFile(join(root, '.agents', 'skills', 'stray.txt'), 'x');
     await skill(root, 'Bad Name', 'description: x');
     await skill(root, 'no-frontmatter-description', 'name: x');
-    expect(await listAgentSkills(root)).toEqual([{ name: 'no-frontmatter-description', description: '' }]);
+    expect(await listAgentSkills(root)).toEqual([{
+      name: 'no-frontmatter-description',
+      description: '',
+      layer: 'user_default',
+      displayPath: '~/.agents/skills/no-frontmatter-description',
+      uri: 'skill://user_default/no-frontmatter-description',
+    }]);
+  });
+
+  it('lists only top-level registry payloads while nested references remain expandable', async () => {
+    const root = await home();
+    const project = join(root, '项目 space');
+    const projectRoot = join(project, '.imc', 'skills');
+    await mkdir(join(projectRoot, 'nested'), { recursive: true });
+    const topFile = join(projectRoot, 'top.md');
+    const topDirectory = join(projectRoot, 'directory', 'SKILL.md');
+    const nestedFile = join(projectRoot, 'nested', 'child.md');
+    await mkdir(join(projectRoot, 'directory'), { recursive: true });
+    await writeFile(topFile, '# Top\n');
+    await writeFile(topDirectory, '# Directory\n');
+    await writeFile(nestedFile, '# Child\n');
+    const paths = getSkillRegistryPathsForManagement({ projectDir: project, homeDir: root });
+    writeSkillRegistryManagementSnapshot(paths.project!, [
+      { schemaVersion: 1, key: 'top', layer: 'project_escape_hatch', metadata: { name: 'top' }, path: topFile, displayPath: '.imc/skills/top.md', uri: makeSkillUri('project_escape_hatch', 'top'), fingerprint: 'top', updatedAt: 1 },
+      { schemaVersion: 1, key: 'directory', layer: 'project_escape_hatch', metadata: { name: 'directory' }, path: topDirectory, displayPath: '.imc/skills/directory/SKILL.md', uri: makeSkillUri('project_escape_hatch', 'directory'), fingerprint: 'directory', updatedAt: 2 },
+      { schemaVersion: 1, key: 'nested/child', layer: 'project_escape_hatch', metadata: { name: 'child' }, path: nestedFile, displayPath: '.imc/skills/nested/child.md', uri: makeSkillUri('project_escape_hatch', 'nested/child'), fingerprint: 'nested', updatedAt: 3 },
+    ]);
+
+    expect((await listAgentSkills(root, { projectDir: project })).map((entry) => entry.name).sort()).toEqual(['directory', 'top']);
+    const marker = '$$(child@skill://project_escape_hatch/nested%2Fchild)';
+    await expect(expandAgentSkillReferences(marker, root, { projectDir: project })).resolves.toMatchObject({
+      expanded: ['child@skill://project_escape_hatch/nested%2Fchild'],
+      text: expect.stringContaining('# Child'),
+    });
   });
 });
 
@@ -153,7 +199,17 @@ describe('agent skill requests', () => {
     expect(await run({ action: AGENT_SKILLS_ACTION.UPDATE })).toEqual({ ok: false, error: AGENT_SKILLS_ERROR.BUSY, skills: [] });
     await skill(root, 'fresh', 'description: fresh');
     release();
-    expect(await first).toEqual({ ok: true, output: 'Installed 1 skill', skills: [{ name: 'fresh', description: 'fresh' }] });
+    expect(await first).toEqual({
+      ok: true,
+      output: 'Installed 1 skill',
+      skills: [{
+        name: 'fresh',
+        description: 'fresh',
+        layer: 'user_default',
+        displayPath: '~/.agents/skills/fresh',
+        uri: 'skill://user_default/fresh',
+      }],
+    });
     expect(runCli).toHaveBeenCalledTimes(1);
   });
 
@@ -167,5 +223,67 @@ describe('agent skill requests', () => {
     );
     expect(run).not.toHaveBeenCalled();
     expect(sent).toEqual([{ type: AGENT_SKILLS_MSG.RUN_RESPONSE, requestId: 'r1', ok: false, error: AGENT_SKILLS_ERROR.INVALID_REQUEST }]);
+  });
+});
+
+describe('composer skill references', () => {
+  it('requires a source when duplicate names are present', () => {
+    const entries = [
+      { name: 'writer', description: '', source: 'team/a' },
+      { name: 'writer', description: '', source: 'team/b' },
+    ] as const;
+    expect(resolveAgentSkillReference({ name: 'writer' }, entries)).toBeUndefined();
+    expect(resolveAgentSkillReference({ name: 'writer', source: 'team/b' }, entries)).toEqual(entries[1]);
+  });
+
+  it('expands safe known references, disambiguates source, and removes duplicates', async () => {
+    const root = await home();
+    await skill(root, 'writer', 'description: writer');
+    await writeFile(join(root, '.agents', 'skills', 'writer', 'SKILL.md'), '# Writer\nUse concise prose.\n');
+    await writeFile(join(root, '.agents', '.skill-lock.json'), JSON.stringify({
+      skills: { writer: { source: 'team/skills' } },
+    }));
+
+    const expanded = await expandAgentSkillReferences(
+      'before $$(writer@team/skills) after $$(writer@team/skills) bad $$(writer@other) literal $$(unknown)',
+      root,
+    );
+    expect(expanded.expanded).toEqual(['writer@team/skills']);
+    expect(expanded.unresolved).toEqual(['writer@other', 'unknown']);
+    expect(expanded.text).toContain('[skill: writer]');
+    expect(expanded.text.match(/\[skill: writer\]/gu)).toHaveLength(1);
+    expect(expanded.text).toContain('$$(writer@other)');
+    expect(expanded.text).toContain('$$(unknown)');
+  });
+
+  it('leaves malformed and unclosed markers untouched', async () => {
+    const root = await home();
+    const text = 'cash $5, $$(bad name), $$(writer';
+    await expect(expandAgentSkillReferences(text, root)).resolves.toEqual({ text, unresolved: [], expanded: [] });
+  });
+
+  it('expands a project registry skill only when project context is supplied', async () => {
+    const root = await home();
+    const project = join(root, '项目 space');
+    const payload = join(project, 'skill.md');
+    await mkdir(project, { recursive: true });
+    await writeFile(payload, '# Project writer\n');
+    const paths = getSkillRegistryPathsForManagement({ projectDir: project, homeDir: root });
+    writeSkillRegistryManagementSnapshot(paths.project!, [{
+      schemaVersion: 1,
+      key: 'project-writer',
+      layer: 'project_escape_hatch',
+      metadata: { name: 'project-writer', description: 'project only' },
+      path: payload,
+      displayPath: 'skill://project_escape_hatch/project-writer',
+      uri: makeSkillUri('project_escape_hatch', 'project-writer'),
+      fingerprint: 'fingerprint',
+      updatedAt: Date.now(),
+    }]);
+    const marker = '$$(project-writer@skill://project_escape_hatch/project-writer)';
+    await expect(expandAgentSkillReferences(marker, root)).resolves.toMatchObject({ unresolved: ['project-writer@skill://project_escape_hatch/project-writer'] });
+    const expanded = await expandAgentSkillReferences(marker, root, { projectDir: project });
+    expect(expanded.expanded).toEqual(['project-writer@skill://project_escape_hatch/project-writer']);
+    expect(expanded.text).toContain('# Project writer');
   });
 });

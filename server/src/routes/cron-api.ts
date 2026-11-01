@@ -310,7 +310,12 @@ async function resolveCronScope(
     'SELECT user_id FROM servers WHERE id = $1',
     [params.serverId],
   );
-  if (!server || !projectName) return { ok: false, reason: 'share-target-unavailable' };
+  // A whole-server grant intentionally has no project scope.  Session and
+  // sub-session grants still require a live project so they cannot silently
+  // widen to server visibility.
+  if (!server || (target.kind !== 'server' && !projectName)) {
+    return { ok: false, reason: 'share-target-unavailable' };
+  }
   return {
     ok: true,
     scope: {
@@ -421,9 +426,10 @@ async function cronScopeCoversPayload(
   scope: CronScope,
   payload: { targetRole?: string | null; targetSessionName?: string | null; action?: z.infer<typeof cronActionSchema> },
 ): Promise<boolean> {
-  if (!scope.shared || scope.sharedTargetKind === 'server') return true;
-  if (!scope.projectName) return false;
+  if (!scope.shared) return true;
   if (!payload.action) return false;
+  if (scope.sharedTargetKind === 'server') return true;
+  if (!scope.projectName) return false;
 
   if (payload.targetSessionName) {
     if (!await sessionBelongsToProject(c.env.DB, serverId, payload.targetSessionName, scope.projectName)) {
@@ -456,9 +462,9 @@ async function filterCronRowsForSharedScope<T extends {
   action: string;
 }>(c: Context<CronRouteEnv>, scope: CronScope, rows: T[]): Promise<T[]> {
   if (!scope.shared) return rows;
-  if (!scope.projectName) return [];
+  if (scope.sharedTargetKind !== 'server' && !scope.projectName) return [];
   const checks = await Promise.all(rows.map(async (row) => {
-    if (row.project_name !== scope.projectName) return false;
+    if (scope.sharedTargetKind !== 'server' && row.project_name !== scope.projectName) return false;
     let action: z.infer<typeof cronActionSchema> | undefined;
     try {
       const parsed = cronActionSchema.safeParse(JSON.parse(row.action));
@@ -563,6 +569,12 @@ cronApiRoutes.get('/', requireCronAuth(), async (c) => {
     : { ok: true as const, scope: { ownerUserId: userId, projectName, shared: false, sharedSessionName: null, sharedTargetKind: null } };
   if (!access.ok) return c.json({ error: 'forbidden', reason: access.reason }, 403);
 
+  // A whole-server share is intentionally unscoped, but an explicit project
+  // query still narrows the list. Session-scoped shares must use their
+  // resolved project instead of trusting a forged query value.
+  const queryProjectName = access.scope.sharedTargetKind === 'server'
+    ? projectName
+    : access.scope.projectName;
   const jobs = await c.env.DB.query<DbCronJob>(
     `SELECT * FROM cron_jobs WHERE user_id = $1
        AND ($2::text IS NULL OR server_id = $2)
@@ -571,7 +583,7 @@ cronApiRoutes.get('/', requireCronAuth(), async (c) => {
     [
       access.scope.ownerUserId,
       serverId,
-      access.scope.projectName,
+      queryProjectName,
     ],
   );
   return c.json({ jobs: await filterCronRowsForSharedScope(c, access.scope, jobs) });

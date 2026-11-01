@@ -15,6 +15,7 @@ import {
   COMPUTER_USE_MAX_IMAGE_BASE64_BYTES,
   COMPUTER_USE_MAX_ARGUMENT_BYTES,
   COMPUTER_USE_MIN_TIMEOUT_MS,
+  COMPUTER_USE_ACCESSIBILITY_TREE_TOOL,
   computerUseMaxTimeoutMs,
   type ComputerUseContentItem,
   type ComputerUseRequest,
@@ -362,10 +363,11 @@ function boundedInteger(value: unknown, fallback: number, maximum: number): numb
 
 function forwardedComputerUseArgs(tool: string, args: Record<string, unknown> | null): Record<string, unknown> {
   const forwarded = stripInternalArgs(args) ?? {};
-  if (tool !== 'get_app_state') return forwarded;
+  if (tool !== 'get_app_state' && tool !== COMPUTER_USE_ACCESSIBILITY_TREE_TOOL) return forwarded;
   return {
     ...forwarded,
     text_limit: forwarded.text_limit ?? 1_000,
+    max_tree_nodes: boundedInteger(args?.maxNodes, COMPUTER_USE_STATE_DEFAULT_MAX_NODES, COMPUTER_USE_STATE_MAX_NODES),
     max_tree_depth: boundedInteger(args?.maxDepth, COMPUTER_USE_STATE_DEFAULT_MAX_DEPTH, COMPUTER_USE_STATE_MAX_DEPTH),
   };
 }
@@ -379,6 +381,11 @@ function openComputerUseMcpToolArgs(tool: string, args: Record<string, unknown>)
     delete next.clicks;
   }
   return next;
+}
+
+/** Map the public semantic observation verb to the signed helper's tree API. */
+function helperToolName(tool: string): string {
+  return tool === COMPUTER_USE_ACCESSIBILITY_TREE_TOOL ? 'get_app_state' : tool;
 }
 
 function isNoAppStateError(raw: unknown): boolean {
@@ -417,7 +424,11 @@ class OpenComputerUseMcpClient {
 
   async callTool(tool: string, args: Record<string, unknown>, timeoutMs: number): Promise<unknown> {
     await this.ensureStarted();
-    return await this.request('tools/call', { name: tool, arguments: openComputerUseMcpToolArgs(tool, args) }, timeoutMs);
+    const helperTool = helperToolName(tool);
+    return await this.request('tools/call', {
+      name: helperTool,
+      arguments: openComputerUseMcpToolArgs(helperTool, args),
+    }, timeoutMs);
   }
 
   async close(): Promise<void> {
@@ -645,6 +656,7 @@ export function openComputerUseCallArgs(tool: string, argsJson: string): string[
   } catch {
     args = null;
   }
+  const helperTool = helperToolName(tool);
   const forwardedArgs = forwardedComputerUseArgs(tool, args);
   const forwardedJson = JSON.stringify(forwardedArgs);
   if (isActionTool(tool) && typeof forwardedArgs?.app === 'string' && forwardedArgs.app.trim()) {
@@ -653,7 +665,7 @@ export function openComputerUseCallArgs(tool: string, argsJson: string): string[
       { tool, args: forwardedArgs },
     ])];
   }
-  return ['call', tool, '--args', forwardedJson];
+  return ['call', helperTool, '--args', forwardedJson];
 }
 
 export function openComputerUseEnv(tool: string, baseEnv: NodeJS.ProcessEnv = process.env, platform: NodeJS.Platform = process.platform): NodeJS.ProcessEnv | undefined {
@@ -676,7 +688,7 @@ const ACTION_TOOLS: ReadonlySet<string> = new Set([
   'set_value',
 ]);
 
-function isActionTool(tool: string): tool is Exclude<ComputerUseToolName, 'list_apps' | 'get_app_state' | 'shell_session1'> {
+function isActionTool(tool: string): tool is Exclude<ComputerUseToolName, 'list_apps' | 'get_app_state' | 'accessibility_tree' | 'shell_session1'> {
   return ACTION_TOOLS.has(tool);
 }
 
@@ -1143,7 +1155,7 @@ export async function normalizeOpenComputerUseParsedResult(
   const returnOptions = parseReturnOptions(tool, args);
   const isError = Boolean(parsed && typeof parsed === 'object' && !Array.isArray(parsed) && (parsed as { isError?: unknown }).isError);
   const stateArgs = !isError && (
-    tool === 'get_app_state'
+    (tool === 'get_app_state' || tool === COMPUTER_USE_ACCESSIBILITY_TREE_TOOL)
     || (isActionTool(tool) && returnOptions.includeState)
   )
     ? (args ?? {})

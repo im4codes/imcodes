@@ -528,6 +528,46 @@ describe('file-transfer upload route', () => {
     );
   });
 
+  it('allows a group participant to browse a controlled-node directory without file-fetch authority', async () => {
+    queryOneMock.mockResolvedValue({ user_id: 'owner-1', node_role: 'controlled', exec_enabled: true, revoked_at: null, access_role: 'participant', access_source: 'group', exec_granted: false });
+    sendFileTransferRequestMock.mockResolvedValueOnce({
+      type: FILE_TRANSFER_MSG.DIRECTORY_LIST_DONE,
+      requestId: 'a'.repeat(32),
+      path: ':drives:',
+      resolvedPath: '__imcodes_windows_drives__',
+      entries: [{ name: 'C:\\', path: 'C:\\', isDir: true, hidden: false }],
+    });
+    const res = await makeApp().request('/api/server/controlled-1/machine-file-list', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer browser', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path: ':drives:' }),
+    });
+    expect(res.status).toBe(200);
+    await expect(res.json()).resolves.toEqual({
+      ok: true,
+      resolvedPath: '__imcodes_windows_drives__',
+      entries: [{ name: 'C:\\', path: 'C:\\', isDir: true, hidden: false }],
+    });
+    expect(sendFileTransferRequestMock).toHaveBeenCalledWith(
+      'a'.repeat(32),
+      expect.objectContaining({ type: FILE_TRANSFER_MSG.DIRECTORY_LIST, path: ':drives:' }),
+      FILE_TRANSFER_LIMITS.DOWNLOAD_TIMEOUT_MS,
+      undefined,
+      1,
+    );
+  });
+
+  it('keeps an explicit viewer denied for controlled-node directory browsing', async () => {
+    queryOneMock.mockResolvedValue({ user_id: 'owner-1', node_role: 'controlled', exec_enabled: true, revoked_at: null, access_role: 'viewer', access_source: 'share', exec_granted: false });
+    const res = await makeApp().request('/api/server/controlled-1/machine-file-list', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer browser', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path: ':drives:' }),
+    });
+    expect(res.status).toBe(403);
+    expect(sendFileTransferRequestMock).not.toHaveBeenCalled();
+  });
+
   describe('controlled-node directory listing query', () => {
     const querySort = { key: 'modified', direction: 'desc', dirsFirst: true } as const;
     const listDone = (extra: Record<string, unknown> = {}) => ({
@@ -1124,6 +1164,51 @@ describe('file-transfer upload route', () => {
         }),
       }),
     ]);
+  });
+
+  it('drops daemon progress that arrives after the client cancels the stream', async () => {
+    let onProgress: ((payload: Record<string, unknown>) => void) | undefined;
+    let resolveDaemon!: (result: unknown) => void;
+    sendFileTransferRequestMock.mockImplementationOnce(async (_requestId, _message, _timeoutMs, progress) => {
+      onProgress = progress;
+      return new Promise((resolve) => {
+        resolveDaemon = resolve;
+      });
+    });
+
+    const form = new FormData();
+    form.append('file', new File(['hello!'], 'hello.txt', { type: 'text/plain' }));
+    const response = await makeApp().request('/api/server/srv-1/upload', {
+      method: 'POST',
+      headers: {
+        Authorization: 'Bearer test',
+        Accept: 'application/x-ndjson',
+      },
+      body: form,
+    });
+
+    const reader = response.body!.getReader();
+    await expect(reader.read()).resolves.toMatchObject({ done: false });
+    await reader.cancel();
+
+    expect(() => onProgress?.({
+      type: 'file.upload_progress',
+      uploadId: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+      loaded: 3,
+      total: 6,
+    })).not.toThrow();
+
+    resolveDaemon({
+      type: 'file.upload_done',
+      attachment: {
+        id: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.txt',
+        source: 'upload',
+        daemonPath: '/tmp/upload.txt',
+        downloadable: true,
+      },
+    });
+    await Promise.resolve();
+    await Promise.resolve();
   });
 });
 

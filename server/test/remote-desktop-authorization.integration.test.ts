@@ -11,6 +11,7 @@ import { ensureCanonicalHostForServer } from '../src/services/remote-desktop-hos
 import { createOrUpdateShare } from '../src/db/tab-sharing.js';
 import { RemoteDesktopRouter } from '../src/ws/remote-desktop-router.js';
 import { generateControlledNodeId } from '../src/services/controlled-node-identity.js';
+import { resolveServerWebSocketAccess } from '../src/security/authorization.js';
 
 const hex = (bytes: number) => randomBytes(bytes).toString('hex');
 const sha256 = (value: string) => createHash('sha256').update(value).digest('hex');
@@ -133,6 +134,35 @@ async function start(
 }
 
 describe('remote desktop real-PostgreSQL authorization and teardown', () => {
+  it('uses the same shared host authority for account WebSocket tickets and signaling', async () => {
+    const ownerId = `rd-owner-${hex(5)}`;
+    const directId = `rd-direct-${hex(5)}`;
+    const groupId = `rd-group-${hex(5)}`;
+    const viewerId = `rd-viewer-${hex(5)}`;
+    await Promise.all([createUser(db, ownerId), createUser(db, directId), createUser(db, groupId), createUser(db, viewerId)]);
+    const serverId = await createControlledNode(ownerId);
+    await grant(ownerId, directId, serverId, 'participant');
+    await grant(ownerId, viewerId, serverId, 'viewer');
+    const teamId = await seedDesk(ownerId);
+    await db.execute(
+      'INSERT INTO team_members (team_id, user_id, role, joined_at) VALUES ($1,$2,$3,$4)',
+      [teamId, groupId, 'member', Date.now()],
+    );
+    await db.execute(
+      'INSERT INTO machine_groups (server_id, team_id, added_at) VALUES ($1,$2,$3)',
+      [serverId, teamId, Date.now()],
+    );
+
+    // This is the exact account-ticket gate used before the browser reaches
+    // RemoteDesktopRouter. Owner, participant and read-only Viewer shares,
+    // plus group members, cross it; an unrelated account must not.
+    await expect(resolveServerWebSocketAccess(db, serverId, ownerId)).resolves.toMatchObject({ kind: 'controlled', role: 'owner' });
+    await expect(resolveServerWebSocketAccess(db, serverId, directId)).resolves.toMatchObject({ kind: 'controlled', role: 'participant' });
+    await expect(resolveServerWebSocketAccess(db, serverId, groupId)).resolves.toMatchObject({ kind: 'controlled', role: 'participant' });
+    await expect(resolveServerWebSocketAccess(db, serverId, viewerId)).resolves.toMatchObject({ kind: 'controlled', role: 'viewer' });
+    await expect(resolveServerWebSocketAccess(db, serverId, `rd-outsider-${hex(5)}`)).resolves.toBeNull();
+  });
+
   it('fails active Participant sessions closed after committed downgrade and expiry', async () => {
     const ownerId = `rd-owner-${hex(5)}`;
     const participantId = `rd-participant-${hex(5)}`;
@@ -194,7 +224,7 @@ describe('remote desktop real-PostgreSQL authorization and teardown', () => {
     });
   });
 
-  it('revocation and reconnect retain independent live group View coverage, but losing the final group closes', async () => {
+  it('revocation and reconnect retain independent live group Control coverage, but losing the final group closes', async () => {
     const ownerId = `rd-owner-${hex(5)}`;
     const participantId = `rd-participant-${hex(5)}`;
     await Promise.all([createUser(db, ownerId), createUser(db, participantId)]);
@@ -204,7 +234,7 @@ describe('remote desktop real-PostgreSQL authorization and teardown', () => {
     await db.execute('INSERT INTO machine_groups (server_id, team_id, added_at) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING', [serverId, teamId, Date.now()]);
     const f = fixture(serverId);
     const groupSocket = {} as WebSocket;
-    expect(await start(f, participantId, groupSocket)).toMatchObject({ type: REMOTE_DESKTOP_MSG.AUTHORIZED, mode: REMOTE_DESKTOP_ACCESS_MODE.VIEW });
+    expect(await start(f, participantId, groupSocket)).toMatchObject({ type: REMOTE_DESKTOP_MSG.AUTHORIZED, mode: REMOTE_DESKTOP_ACCESS_MODE.CONTROL });
     f.router.stopAll();
     const share = await grant(ownerId, participantId, serverId, 'participant');
     const socket = {} as WebSocket;
@@ -214,7 +244,7 @@ describe('remote desktop real-PostgreSQL authorization and teardown', () => {
     expect(f.router.stats().active).toBe(1);
     expect(f.messages(socket).at(-1)).not.toMatchObject({ type: REMOTE_DESKTOP_MSG.TERMINAL });
     f.router.stopAll();
-    expect(await start(f, participantId, {} as WebSocket)).toMatchObject({ type: REMOTE_DESKTOP_MSG.AUTHORIZED, mode: REMOTE_DESKTOP_ACCESS_MODE.VIEW });
+    expect(await start(f, participantId, {} as WebSocket)).toMatchObject({ type: REMOTE_DESKTOP_MSG.AUTHORIZED, mode: REMOTE_DESKTOP_ACCESS_MODE.CONTROL });
     await db.execute('DELETE FROM machine_groups WHERE server_id=$1 AND team_id=$2', [serverId, teamId]);
     await f.router.revalidateUser(participantId);
     expect(f.router.stats().active).toBe(0);

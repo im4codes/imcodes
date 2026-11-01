@@ -101,7 +101,7 @@ describe('relay upload settles from a committed payload', () => {
     vi.useFakeTimers();
     const { promise, xhr } = await startUpload({ withClientUploadId: false });
     xhr.stream(DONE_LINE);
-    await vi.advanceTimersByTimeAsync(60_000);
+    await vi.advanceTimersByTimeAsync(120_000);
     await expect(promise).resolves.toMatchObject({ attachment: { id: ATTACHMENT.id } });
     expect(xhr.aborted).toBe(true);
   });
@@ -148,7 +148,7 @@ describe('relay upload settles from a committed payload', () => {
     const { promise, xhr, progress } = await startUpload({ withClientUploadId: true });
     xhr.stream(`${JSON.stringify({ type: 'file.upload_progress', uploadId: 'u1', loaded: 5, total: 5 })}\n`);
     expect(progress.at(-1)).toBe(99);
-    await vi.advanceTimersByTimeAsync(25_000); // stall timer -> upload_stalled -> backoff -> retry
+    await vi.advanceTimersByTimeAsync(125_000); // stall timer -> upload_stalled -> backoff -> retry
     await vi.advanceTimersByTimeAsync(2_000);
     expect(FakeXhr.instances.length).toBe(2);
     const retry = FakeXhr.instances[1]!;
@@ -171,7 +171,7 @@ describe('relay upload settles from a committed payload', () => {
     const { promise, xhr } = await startUpload({ withClientUploadId: false });
     xhr.stream(PROGRESS_LINE);
     const settled = expect(promise).rejects.toMatchObject({ status: 0, message: expect.stringContaining('upload_stalled') });
-    await vi.advanceTimersByTimeAsync(60_000);
+    await vi.advanceTimersByTimeAsync(120_000);
     await settled;
   });
 

@@ -7,6 +7,7 @@ import { render, screen, cleanup, fireEvent, waitFor, act } from '@testing-libra
 import { DEFAULT_CODEX_SESSION_MODEL } from '../../../src/shared/models/options.js';
 import { AGY_SDK_PROVIDER_ID } from '../../../shared/agy-agent.js';
 import { HERMES_AGENT_PROVIDER_ID } from '../../../shared/hermes-agent.js';
+import { CLAUDE_CODE_CLI_SDK_AGENT_TYPE } from '../../../shared/agent-types.js';
 
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({
@@ -59,6 +60,25 @@ describe('StartSubSessionDialog', () => {
     expect(screen.getByRole('button', { name: /hermes_agent/i })).toBeDefined();
     expect(screen.getByRole('button', { name: /deepseek_harness/i })).toBeDefined();
     expect(screen.getByRole('button', { name: /^pi$/i })).toBeDefined();
+    expect(screen.getByRole('button', { name: /cc_cli_sdk/i })).toBeDefined();
+  });
+
+  it('launches the CC CLI SDK choice as its independent agent type', () => {
+    const onStart = vi.fn();
+    render(
+      <StartSubSessionDialog
+        ws={makeWs() as any}
+        defaultCwd="/tmp"
+        isProviderConnected={() => false}
+        getRemoteSessions={() => []}
+        refreshSessions={vi.fn()}
+        onStart={onStart}
+        onClose={vi.fn()}
+      />,
+    );
+    fireEvent.click(screen.getByRole('button', { name: /cc_cli_sdk/i }));
+    fireEvent.click(screen.getByRole('button', { name: /launch/i }));
+    expect(onStart).toHaveBeenCalledWith(CLAUDE_CODE_CLI_SDK_AGENT_TYPE, undefined, '/tmp', undefined, expect.anything());
   });
 
   it('defaults to claude-code-sdk and renders transport/process groups separately', () => {

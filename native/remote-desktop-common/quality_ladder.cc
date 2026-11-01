@@ -20,13 +20,14 @@ struct Preset {
 // "Smooth" keep its frame rate by giving up resolution; the 10 fps rungs keep
 // text legible on a ~500 kbps relay-capped path. Mirrored in
 // shared/remote-desktop.ts (REMOTE_DESKTOP_QUALITY_LADDER).
-constexpr std::array<Preset, 16> kLadder = {{
+constexpr std::array<Preset, 17> kLadder = {{
     {"2160p30", 3840, 2160, 30, 15'000'000},
     {"1440p60", 2560, 1440, 60, 14'000'000},
     {"2160p15", 3840, 2160, 15, 12'000'000},
     {"1440p30", 2560, 1440, 30, 10'000'000},
     {"1080p60", 1920, 1080, 60, 9'000'000},
     {"1080p30", 1920, 1080, 30, 6'000'000},
+    {"1080p15", 1920, 1080, 15, 1'800'000},
     {"720p60", 1280, 720, 60, 4'800'000},
     {"900p30", 1600, 900, 30, 4'500'000},
     {"720p30", 1280, 720, 30, 3'000'000},
@@ -44,6 +45,17 @@ int EvenAtLeastTwo(int value) {
 }
 
 }  // namespace
+
+QualityPreference NormalizeQualityPreference(QualityPreference preference) {
+  if (preference.max_height > 0) {
+    preference.max_height =
+        std::max(preference.max_height, kMinimumVideoHeight);
+  }
+  if (preference.minimum_bitrate_bps == 0) {
+    preference.minimum_bitrate_bps = preference.max_bitrate_bps;
+  }
+  return preference;
+}
 
 TransportBitratePolicy SelectTransportBitratePolicy(bool direct,
                                                     uint32_t relay_cap_bps,
@@ -104,9 +116,10 @@ QualitySelection SelectQuality(uint32_t target_bitrate_bps,
                                int source_width,
                                int source_height,
                                const QualityPreference& preference) {
+  const QualityPreference normalized = NormalizeQualityPreference(preference);
   uint32_t ceiling = kPerPeerVideoBitrateBps;
-  if (preference.max_bitrate_bps > 0) {
-    ceiling = std::clamp(preference.max_bitrate_bps, kMinVideoBitrateBps,
+  if (normalized.max_bitrate_bps > 0) {
+    ceiling = std::clamp(normalized.max_bitrate_bps, kMinVideoBitrateBps,
                          kMaxViewerVideoBitrateBps);
   }
   const uint32_t bounded_bitrate =
@@ -115,17 +128,20 @@ QualitySelection SelectQuality(uint32_t target_bitrate_bps,
   source_height = std::max(2, source_height);
   const uint64_t source_pixels =
       static_cast<uint64_t>(source_width) * source_height;
-  const int max_fps = preference.max_fps > 0 ? preference.max_fps : 30;
+  const int max_fps = normalized.max_fps > 0 ? normalized.max_fps : 30;
+  const bool source_can_hold_floor = source_width >= kMinimumVideoWidth &&
+                                     source_height >= kMinimumVideoHeight;
   const auto affordable = [&](const Preset& candidate) {
     const uint64_t candidate_pixels =
         static_cast<uint64_t>(candidate.width) * candidate.height;
     return bounded_bitrate >= candidate.threshold_bps &&
            candidate_pixels <= source_pixels && candidate.fps <= max_fps &&
-           (preference.max_height <= 0 ||
-            candidate.height <= preference.max_height);
+           (!source_can_hold_floor || candidate.height >= kMinimumVideoHeight) &&
+           (normalized.max_height <= 0 ||
+            candidate.height <= normalized.max_height);
   };
   const Preset* preset = nullptr;
-  switch (preference.priority) {
+  switch (normalized.priority) {
     case QualityPriority::kFramerate: {
       // Keep the frame rate the viewer allows (capped at 30 for this pass;
       // 60 is a ceiling, not a floor), shedding resolution first. Only when
@@ -167,7 +183,35 @@ QualitySelection SelectQuality(uint32_t target_bitrate_bps,
       }
     }
   }
+  // Congestion may leave no rung whose historical bitrate threshold is
+  // affordable. For a capable source, keep the 1080p floor and shed frame
+  // rate instead of dropping to a blurry 720p rung. The fallback is still
+  // bounded by the viewer's FPS ceiling and source dimensions.
+  if (preset == nullptr && source_can_hold_floor) {
+    for (const Preset& candidate : kLadder) {
+      if (candidate.height >= kMinimumVideoHeight &&
+          candidate.height <= source_height && candidate.width <= source_width &&
+          candidate.fps <= max_fps) {
+        preset = &candidate;
+        break;
+      }
+    }
+  }
   if (preset == nullptr) preset = &kLadder.back();
+  // A non-zero viewer bitrate is an explicit target floor from the shared
+  // preset table. The relay/aggregate cap may make that impossible; preserve
+  // the diagnostic bit so the transport can reject it rather than silently
+  // downgrading the selected rung.
+  const uint32_t requested_bitrate_floor = normalized.minimum_bitrate_bps;
+  const bool bitrate_floor_met = requested_bitrate_floor == 0 ||
+                                 bounded_bitrate >= requested_bitrate_floor;
+  // Ultra is the one named mode whose minimum resolution exceeds the global
+  // 1080p floor. A smaller physical source is not upscaled; report that the
+  // explicit preference cannot be met instead of silently selecting 1080p.
+  const bool resolution_floor_met =
+      normalized.max_height != 2160 ||
+      (source_height >= 2160 && preset->height >= 2160);
+  const bool meets_preference_floor = bitrate_floor_met && resolution_floor_met;
   const double scale = std::min(
       {1.0, static_cast<double>(preset->width) / source_width,
        static_cast<double>(preset->height) / source_height});
@@ -177,6 +221,7 @@ QualitySelection SelectQuality(uint32_t target_bitrate_bps,
       EvenAtLeastTwo(static_cast<int>(std::floor(source_height * scale))),
       preset->fps,
       bounded_bitrate,
+      meets_preference_floor,
   };
 }
 

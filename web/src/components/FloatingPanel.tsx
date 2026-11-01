@@ -404,11 +404,13 @@ export function FloatingPanel({
               />
             ))}
           </div>
-          <div
-            data-testid="floating-bottom-drag"
-            onMouseDown={startDrag}
-            style={{ position: 'absolute', left: 24, right: 24, bottom: RESIZE_EDGE_PX, height: 14, cursor: 'grab', zIndex: 2 }}
-          />
+          {!dragHandleSelector && (
+            <div
+              data-testid="floating-bottom-drag"
+              onMouseDown={startDrag}
+              style={{ position: 'absolute', left: 24, right: 24, bottom: RESIZE_EDGE_PX, height: 14, cursor: 'grab', zIndex: 2 }}
+            />
+          )}
         </>
       )}
     </div>

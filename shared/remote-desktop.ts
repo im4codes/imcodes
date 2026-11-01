@@ -290,6 +290,8 @@ export const REMOTE_DESKTOP_CONTROL_REJECTION = {
   MODE_UNSUPPORTED: 'mode_unsupported',
   /** The mode tested fine but Windows refused to apply it. */
   MODE_CHANGE_FAILED: 'mode_change_failed',
+  /** The live encoder/relay cannot satisfy the requested quality without a peer restart. */
+  QUALITY_UNAVAILABLE: 'quality_unavailable',
   /** The scale change was refused by Windows. */
   SCALE_CHANGE_FAILED: 'scale_change_failed',
   /** The display exists but capture could not be moved to it. */
@@ -346,6 +348,7 @@ export const REMOTE_DESKTOP_QUALITY_PRESET = {
   P1440_30: '1440p30',
   P1080_60: '1080p60',
   P1080_30: '1080p30',
+  P1080_15: '1080p15',
   P720_60: '720p60',
   P900_30: '900p30',
   P720_30: '720p30',
@@ -372,6 +375,8 @@ export type RemoteDesktopQualityPriority =
 
 /** Resolution ceilings a viewer may pick; 0 = native, 2160 = 4K. */
 export const REMOTE_DESKTOP_QUALITY_MAX_HEIGHTS = [0, 720, 1080, 1440, 2160] as const;
+/** Minimum encoded height for a source that can provide a full HD frame. */
+export const REMOTE_DESKTOP_QUALITY_MIN_HEIGHT = 1080;
 export const REMOTE_DESKTOP_QUALITY_MAX_FPS = [15, 30, 60] as const;
 
 /** Per-viewer quality preference sent with `set_quality_preference`. */
@@ -402,15 +407,28 @@ export type RemoteDesktopQualityMode =
 export const DEFAULT_REMOTE_DESKTOP_QUALITY_MODE: RemoteDesktopQualityMode =
   REMOTE_DESKTOP_QUALITY_MODE.BALANCED;
 
+/** The minimum physical rung and target bitrate promised by each quick mode. */
+export const REMOTE_DESKTOP_QUALITY_MODE_FLOORS = Object.freeze({
+  smooth: { minHeight: 1080, targetBitrateBps: 6_000_000 },
+  balanced: { minHeight: 1080, targetBitrateBps: 10_000_000 },
+  sharp: { minHeight: 1080, targetBitrateBps: 15_000_000 },
+  ultra: { minHeight: 2160, targetBitrateBps: 30_000_000 },
+  saver: { minHeight: 1080, targetBitrateBps: 1_800_000 },
+} as const);
+
 /** What each quick mode means on the wire. Custom supplies its own values. */
 export const REMOTE_DESKTOP_QUALITY_MODE_PREFERENCES: Readonly<Record<
   Exclude<RemoteDesktopQualityMode, 'custom'>, RemoteDesktopQualityPreference
 >> = Object.freeze({
-  smooth: { maxHeight: 1080, maxFps: 30, maxBitrateBps: 0, priority: 'framerate' },
-  balanced: { maxHeight: 1440, maxFps: 30, maxBitrateBps: 0, priority: 'balanced' },
-  sharp: { maxHeight: 0, maxFps: 30, maxBitrateBps: 0, priority: 'resolution' },
-  ultra: { maxHeight: 2160, maxFps: 30, maxBitrateBps: 30_000_000, priority: 'resolution' },
-  saver: { maxHeight: 720, maxFps: 15, maxBitrateBps: 1_800_000, priority: 'balanced' },
+  // The bitrate is an explicit target floor as well as the viewer ceiling;
+  // the native ladder rejects a relayed path that cannot satisfy it instead
+  // of silently selecting a blurry rung.
+  smooth: { maxHeight: REMOTE_DESKTOP_QUALITY_MODE_FLOORS.smooth.minHeight, maxFps: 30, maxBitrateBps: REMOTE_DESKTOP_QUALITY_MODE_FLOORS.smooth.targetBitrateBps, priority: 'framerate' },
+  balanced: { maxHeight: 1440, maxFps: 30, maxBitrateBps: REMOTE_DESKTOP_QUALITY_MODE_FLOORS.balanced.targetBitrateBps, priority: 'balanced' },
+  sharp: { maxHeight: 0, maxFps: 30, maxBitrateBps: REMOTE_DESKTOP_QUALITY_MODE_FLOORS.sharp.targetBitrateBps, priority: 'resolution' },
+  ultra: { maxHeight: REMOTE_DESKTOP_QUALITY_MODE_FLOORS.ultra.minHeight, maxFps: 30, maxBitrateBps: REMOTE_DESKTOP_QUALITY_MODE_FLOORS.ultra.targetBitrateBps, priority: 'resolution' },
+  // Saver lowers bitrate and frame rate, never the 1080p resolution floor.
+  saver: { maxHeight: REMOTE_DESKTOP_QUALITY_MODE_FLOORS.saver.minHeight, maxFps: 15, maxBitrateBps: REMOTE_DESKTOP_QUALITY_MODE_FLOORS.saver.targetBitrateBps, priority: 'balanced' },
 });
 
 /** Bounds for a viewer-chosen bitrate cap (matches the native ladder). */
@@ -569,6 +587,7 @@ export const REMOTE_DESKTOP_QUALITY_LADDER = [
   { id: REMOTE_DESKTOP_QUALITY_PRESET.P1440_30, width: 2560, height: 1440, fps: 30, targetBitrateBps: 10_000_000 },
   { id: REMOTE_DESKTOP_QUALITY_PRESET.P1080_60, width: 1920, height: 1080, fps: 60, targetBitrateBps: 9_000_000 },
   { id: REMOTE_DESKTOP_QUALITY_PRESET.P1080_30, width: 1920, height: 1080, fps: 30, targetBitrateBps: 6_000_000 },
+  { id: REMOTE_DESKTOP_QUALITY_PRESET.P1080_15, width: 1920, height: 1080, fps: 15, targetBitrateBps: 1_800_000 },
   { id: REMOTE_DESKTOP_QUALITY_PRESET.P720_60, width: 1280, height: 720, fps: 60, targetBitrateBps: 4_800_000 },
   { id: REMOTE_DESKTOP_QUALITY_PRESET.P900_30, width: 1600, height: 900, fps: 30, targetBitrateBps: 4_500_000 },
   { id: REMOTE_DESKTOP_QUALITY_PRESET.P720_30, width: 1280, height: 720, fps: 30, targetBitrateBps: 3_000_000 },
@@ -1117,6 +1136,21 @@ function validateAuthority(value: Record<string, unknown>): boolean {
     && value.iceServers.every(isDirectFileTransferIceServerConfig);
 }
 
+/**
+ * PREPARE establishes the first input fence for a route.  A viewer has no
+ * input authority (epoch zero); a control route may be a fresh route or a
+ * bounded worker replacement carrying a newer, still-live epoch.  Keeping
+ * this rule in the shared validator prevents the TypeScript daemon and the
+ * native worker from disagreeing and turning a valid shared viewer into a
+ * terminal protocol error.
+ */
+function validateInitialAuthority(value: Record<string, unknown>): boolean {
+  if (typeof value.inputEpoch !== 'number') return false;
+  return value.mode === REMOTE_DESKTOP_ACCESS_MODE.VIEW
+    ? value.inputEpoch === 0
+    : value.inputEpoch > 0;
+}
+
 function validateSdp(value: Record<string, unknown>): boolean {
   return hasSessionCorrelation(value) && isBoundedString(value.sdp, REMOTE_DESKTOP_LIMITS.SDP_BYTES);
 }
@@ -1199,6 +1233,7 @@ export function validateRemoteDesktopDaemonCommand(value: unknown): RemoteDeskto
   if (value.type === REMOTE_DESKTOP_MSG.PREPARE) {
     if (!hasExactKeys(value, ['type', 'requestId', 'sessionId', 'capability', 'expiresAt', 'leaseExpiresAt', 'daemonGeneration', 'mode', 'inputEpoch', 'iceServers'], ['routeGeneration', 'reconnectAttempt', 'relayBitrateCapBps'])
       || !validateAuthority(value)
+      || !validateInitialAuthority(value)
       || (value.relayBitrateCapBps !== undefined && !isRelayBitrateCap(value.relayBitrateCapBps))
       || (value.routeGeneration !== undefined && !isSafeNonNegative(value.routeGeneration))
       || (value.reconnectAttempt !== undefined
@@ -1508,6 +1543,20 @@ export function isRemoteDesktopQualityPreference(value: unknown): value is Remot
 }
 
 /**
+ * Normalize a viewer preference before it reaches a worker. A 720p cap was
+ * accepted by older clients, but a capable source must not be instructed to
+ * send below the 1080p floor. Keeping 720 in the wire union preserves decode
+ * compatibility while making new sends safe.
+ */
+export function normalizeRemoteDesktopQualityPreference(
+  preference: RemoteDesktopQualityPreference,
+): RemoteDesktopQualityPreference {
+  return preference.maxHeight > 0 && preference.maxHeight < REMOTE_DESKTOP_QUALITY_MIN_HEIGHT
+    ? { ...preference, maxHeight: REMOTE_DESKTOP_QUALITY_MIN_HEIGHT }
+    : { ...preference };
+}
+
+/**
  * The same preference for a worker that does not advertise `qualityUltra`,
  * which refuses 2160 and a raised ceiling. Its ladder tops out at 2160, so
  * native picks the same rungs; the bitrate falls back to its default ceiling.
@@ -1515,12 +1564,13 @@ export function isRemoteDesktopQualityPreference(value: unknown): value is Remot
 export function legacyRemoteDesktopQualityPreference(
   preference: RemoteDesktopQualityPreference,
 ): RemoteDesktopQualityPreference {
+  const normalized = normalizeRemoteDesktopQualityPreference(preference);
   return {
-    ...preference,
-    maxHeight: preference.maxHeight === 2160 ? 0 : preference.maxHeight,
-    maxBitrateBps: preference.maxBitrateBps > REMOTE_DESKTOP_QUALITY_BITRATE_CAP.MAX_BPS
+    ...normalized,
+    maxHeight: normalized.maxHeight === 2160 ? 0 : normalized.maxHeight,
+    maxBitrateBps: normalized.maxBitrateBps > REMOTE_DESKTOP_QUALITY_BITRATE_CAP.MAX_BPS
       ? 0
-      : preference.maxBitrateBps,
+      : normalized.maxBitrateBps,
   };
 }
 

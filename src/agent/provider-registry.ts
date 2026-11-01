@@ -8,6 +8,7 @@ import { CODEBUDDY_PROVIDER_IDS } from '../../shared/codebuddy.js';
 import { HERMES_AGENT_PROVIDER_ID } from '../../shared/hermes-agent.js';
 import { AGY_SDK_PROVIDER_ID } from '../../shared/agy-agent.js';
 import { clearTransportRestoreBackoffForProvider } from './transport-restore-backoff.js';
+import { CLAUDE_CODE_CLI_SDK_AGENT_TYPE } from '../../shared/agent-types.js';
 
 const providers = new Map<string, TransportProvider>();
 
@@ -117,6 +118,10 @@ async function createProvider(id: string): Promise<TransportProvider> {
     case 'claude-code-sdk': {
       const { ClaudeCodeSdkProvider } = await import('./providers/claude-code-sdk.js');
       return new ClaudeCodeSdkProvider();
+    }
+    case CLAUDE_CODE_CLI_SDK_AGENT_TYPE: {
+      const { ClaudeCodeCliSdkProvider } = await import('./providers/claude-code-cli-sdk.js');
+      return new ClaudeCodeCliSdkProvider();
     }
     case 'codex-sdk': {
       const { CodexSdkProvider } = await import('./providers/codex-sdk.js');

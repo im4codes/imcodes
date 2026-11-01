@@ -63,6 +63,26 @@ describe('notarization gate under CloudKit validation failures', () => {
     return failure;
   }
 
+  function injectStapleFailure(failures: number, transient = true) {
+    const failure = Object.assign(new Error('stapler staple failed'), {
+      status: transient ? 65 : 1,
+      stderr: transient
+        ? 'The staple and validate action failed! Error 65\nNSURLErrorDomain Code=-1005'
+        : 'The disk image is corrupt and cannot be stapled',
+    });
+    let staples = 0;
+    execFileSync.mockImplementation((tool: string, args: string[]) => {
+      if (tool === MACOS_RELEASE_SIGNING_TOOLS.xcrun && args[0] === 'notarytool') {
+        return JSON.stringify({ id: 'test-submission', status: 'Accepted' });
+      }
+      if (tool === MACOS_RELEASE_SIGNING_TOOLS.xcrun && args[1] === 'staple' && staples++ < failures) {
+        throw failure;
+      }
+      return '';
+    });
+    return failure;
+  }
+
   const commands = (subcommand: string) => execFileSync.mock.calls.filter(
     ([tool, args]) => tool === MACOS_RELEASE_SIGNING_TOOLS.xcrun && args[1] === subcommand,
   );
@@ -88,9 +108,35 @@ describe('notarization gate under CloudKit validation failures', () => {
     const failure = injectValidationFailure(Infinity);
     expect(() => notarizeAndStaple(artifact(kind))).toThrow(failure);
     expect(commands('submit')).toHaveLength(1);
-    expect(commands('validate')).toHaveLength(6);
+    expect(commands('validate')).toHaveLength(8);
     expect(execFileSync.mock.calls.filter(([tool]) => tool === 'sleep').map(([, args]) => args))
-      .toEqual([['5'], ['10'], ['15'], ['20'], ['25']]);
+      .toEqual([['5'], ['10'], ['20'], ['30'], ['45'], ['60'], ['60']]);
+  });
+
+  it.each(['app', 'dmg'] as const)('retries transient staple propagation before accepting %s', (kind) => {
+    injectStapleFailure(2);
+    expect(notarizeAndStaple(artifact(kind))).toMatchObject({ status: 'accepted', stapled: true, stapleValidated: true });
+    expect(commands('staple')).toHaveLength(3);
+    expect(commands('validate')).toHaveLength(1);
+    expect(execFileSync.mock.calls.filter(([tool]) => tool === 'sleep').map(([, args]) => args))
+      .toEqual([['5'], ['10']]);
+  });
+
+  it.each(['app', 'dmg'] as const)('fails closed after transient staple retry exhaustion for %s', (kind) => {
+    const failure = injectStapleFailure(Infinity);
+    expect(() => notarizeAndStaple({ ...artifact(kind), stapleAttempts: 3 })).toThrow(failure);
+    expect(commands('staple')).toHaveLength(3);
+    expect(commands('validate')).toHaveLength(0);
+    expect(execFileSync.mock.calls.filter(([tool]) => tool === 'sleep').map(([, args]) => args))
+      .toEqual([['5'], ['10']]);
+  });
+
+  it.each(['app', 'dmg'] as const)('does not retry a permanent staple failure for %s', (kind) => {
+    const failure = injectStapleFailure(1, false);
+    expect(() => notarizeAndStaple(artifact(kind))).toThrow(failure);
+    expect(commands('staple')).toHaveLength(1);
+    expect(commands('validate')).toHaveLength(0);
+    expect(execFileSync.mock.calls.filter(([tool]) => tool === 'sleep')).toHaveLength(0);
   });
 
   it.each(['app', 'dmg'] as const)('does not accept or staple an Apple-rejected %s', (kind) => {

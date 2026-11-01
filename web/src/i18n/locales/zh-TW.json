@@ -1,4 +1,7 @@
 {
+  "task_pair": {
+    "reference_picker": "Pair 任務"
+  },
   "alias": {
     "feature_label": "別名",
     "category": "別名",
@@ -33,6 +36,12 @@
       "list_unavailable": "別名仍在載入或載入失敗，請稍後重試。",
       "generic": "發生錯誤，請重試。"
     }
+  },
+  "skill": {
+    "category": "技能",
+    "category_desc": "插入技能引用",
+    "empty": "目前沒有可用技能",
+    "no_results": "沒有符合搜尋的技能"
   },
   "machine": {
     "feature_label": "機器",
@@ -685,7 +694,7 @@
     "stop_appended_queue": "已追加佇列訊息，本次未停止工作階段。",
     "send_placeholder": "傳送給 {{name}}…",
     "send_placeholder_desktop_upload": "{{placeholder}} 支援多檔案貼上或拖曳快速上傳",
-    "send_placeholder_desktop_shortcuts": "{{placeholder}}\n/ 指令 · # 短語 · @ 檔案/Agent · ; 別名 · ^ 受控節點 · 可貼上或拖入檔案",
+    "send_placeholder_desktop_shortcuts": "{{placeholder}}\n/ 指令 · # 短語 · @ 檔案/Agent · ; 別名 · ^ 受控節點 · % 任務 · 可貼上或拖入檔案",
     "composer_target_label": "傳送至",
     "composer_target_aria": "訊息將傳送至 {{name}}",
     "actions": "Session 操作",
@@ -797,6 +806,7 @@
       "openclaw": "OpenClaw",
       "qwen": "Qwen Code",
       "claude_code_sdk": "Claude Code SDK",
+      "cc_cli_sdk": "CC CLI SDK",
       "codex_sdk": "Codex SDK",
       "qoder_sdk": "Qoder SDK",
       "claude_code_cli": "Claude Code CLI",
@@ -1067,6 +1077,8 @@
     "delete_error": "刪除伺服器失敗：{{error}}",
     "upgrade_daemon": "↑ 升級 Daemon",
     "upgrade_all": "↑ 升級全部裝置",
+    "pin": "📌 置頂伺服器",
+    "unpin": "取消置頂伺服器",
     "delete": "✕ 刪除伺服器",
     "upgrade_sent": "升級指令已傳送至「{{name}}」，Daemon 將安裝最新版本並重新啟動。",
     "upgrade_failed": "傳送升級指令失敗，Daemon 可能已離線。",
@@ -4172,6 +4184,7 @@
     "zoom_out": "縮小",
     "zoom_reset": "重設縮放",
     "touch_hint": "輕點螢幕可在該處按一下；拖曳圓環移動游標；按住圓環再拖曳即為拖放；按住後放開為右鍵",
+    "touch_hint_dismiss": "知道了",
     "touch_right_click": "在上次觸控位置按右鍵",
     "touch_ring": "游標圓環——拖曳可移動，長按變右鍵",
     "mobile_input_mode": "手機輸入模式",
@@ -4316,6 +4329,7 @@
       "mode_change_failed": "節點拒絕：Windows 未能套用該解析度。",
       "scale_change_failed": "節點拒絕：Windows 未能套用該縮放比例。",
       "capture_failed": "節點拒絕：無法將畫面擷取切換到該顯示器。",
+      "quality_unavailable": "節點無法在不中斷目前串流的情況下套用此畫質。",
       "unlock_unavailable": "節點拒絕：未儲存登入密碼，或目前沒有需要解鎖的畫面。",
       "paste_unavailable": "遠端剪貼簿無法使用，已改為輸入文字。",
       "paste_too_large": "文字太大，無法透過一次剪貼簿貼上，已改為輸入文字。"

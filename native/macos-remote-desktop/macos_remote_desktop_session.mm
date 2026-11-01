@@ -61,6 +61,8 @@ class MacosSessionQualityLadder final : public common::QualityLadder {
                           static_cast<std::uint32_t>(selection.height)},
         static_cast<std::uint32_t>(selection.fps),
         selection.bitrate_bps,
+        0,
+        selection.meets_preference_floor,
     };
   }
 };
@@ -656,6 +658,9 @@ class MacosRemoteDesktopSession::Impl final
       }
       stamp.daemon_generation = authority->identity.daemon_generation;
       stamp.route_generation = authority->identity.route_generation;
+      if (!transport_core_.BeginIceRestart(stamp)) {
+        return false;
+      }
       negotiator = dependencies_.negotiate_offer;
     }
 

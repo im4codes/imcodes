@@ -98,8 +98,17 @@ function decodeJwtPayload(token: string | undefined): Record<string, unknown> | 
 async function readCodexPlanTypeFromAuthFile(): Promise<string | undefined> {
   try {
     const raw = await readFile(join(homedir(), '.codex', 'auth.json'), 'utf8');
-    const parsed = JSON.parse(raw) as { access_token?: string; id_token?: string };
-    const candidates = [parsed.access_token, parsed.id_token];
+    const parsed = JSON.parse(raw) as {
+      tokens?: { access_token?: string; id_token?: string };
+      access_token?: string;
+      id_token?: string;
+    };
+    const candidates = [
+      parsed.tokens?.access_token,
+      parsed.tokens?.id_token,
+      parsed.access_token,
+      parsed.id_token,
+    ];
     for (const token of candidates) {
       const payload = decodeJwtPayload(token);
       const auth = payload?.['https://api.openai.com/auth'];

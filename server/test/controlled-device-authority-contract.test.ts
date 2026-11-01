@@ -16,8 +16,8 @@ const AUTHORITY_MATRIX = [
   ['OCU / Computer Use', '../src/routes/machine-computer-use.ts', 'gateMachineAction'],
   ['file operations and transfers', '../src/routes/file-transfer.ts', 'resolveControlledMachineOperatorAccess'],
   ['status and device actions', '../src/routes/machines.ts', 'resolveControlledMachineManagementAccess'],
-  ['controlled-device websocket admission', '../src/security/authorization.ts', 'resolveControlledMachineOperatorAccess'],
-  ['remote desktop and control', '../src/ws/remote-desktop-router.ts', 'resolveRemoteDesktopHostOperatorAccess'],
+  ['controlled-device websocket admission', '../src/security/authorization.ts', 'resolveRemoteDesktopHostAccess'],
+  ['remote desktop and control', '../src/ws/remote-desktop-router.ts', 'resolveRemoteDesktopHostAccess'],
 ] as const;
 
 const MACHINE_ACTION_PATHS = [
@@ -94,5 +94,11 @@ describe('controlled-device centralized authority contract', () => {
     const sharing = source('../src/routes/tab-sharing.ts');
     expect(sharing).not.toContain('resolveControlledMachineOperatorAccess');
     expect(sharing).toContain('return server.user_id === userId');
+  });
+
+  it('keeps every effective-source resolver on the ranked lateral alias', () => {
+    const machineAccess = source('../src/share/machine-access.ts');
+    expect(machineAccess).not.toContain('sh.id IS NOT NULL');
+    expect(machineAccess).toContain('effective_access.role IS NOT NULL');
   });
 });

@@ -196,7 +196,7 @@ import {
   type SupervisionIntegrationRemoteObservation,
 } from '../../shared/supervision-integration-finalization.js';
 import { advanceSupervisionTaskAfterFinish } from './supervision-convergence-wire.js';
-import { cronMcpCreate, cronMcpCreateSelf, cronMcpDelete, cronMcpList, cronMcpUpdate, cronMcpUpdateSelf, type CronMcpClientOptions } from './cron-mcp-client.js';
+import { cronMcpCreate, cronMcpCreateSelf, cronMcpDelete, cronMcpList, cronMcpPause, cronMcpResume, cronMcpUpdate, cronMcpUpdateSelf, type CronMcpClientOptions } from './cron-mcp-client.js';
 import {
   registerMemoryShortRef,
   resolveMemoryShortRefCandidatesWithStore,
@@ -462,6 +462,8 @@ export interface MemoryMcpToolDeps {
   cronUpdate?: typeof cronMcpUpdate;
   cronDelete?: typeof cronMcpDelete;
   cronList?: typeof cronMcpList;
+  cronPause?: typeof cronMcpPause;
+  cronResume?: typeof cronMcpResume;
   /**
    * Machine remote-exec tools (list_machines / exec_remote). Absent on a node
    * that cannot control machines — the handlers then return a typed
@@ -1947,6 +1949,8 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
   const cronUpdate = deps.cronUpdate ?? cronMcpUpdate;
   const cronDelete = deps.cronDelete ?? cronMcpDelete;
   const cronList = deps.cronList ?? cronMcpList;
+  const pauseCron = deps.cronPause ?? cronMcpPause;
+  const resumeCron = deps.cronResume ?? cronMcpResume;
 
   const memoryCaller = () => deriveMemoryToolCaller(scopedCallerForDeps(caller, deps));
 
@@ -3379,6 +3383,118 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
         },
       };
     },
+    [MEMORY_MCP_TOOL_NAMES.PAIR_HISTORY]: async (input) => {
+      const context = await pairCallerContext();
+      if (context.status === 'error') return context.result;
+      if (!caller.sessionName) {
+        return error(MCP_ERROR_REASONS.SCOPE_FORBIDDEN, 'pair_history requires the authoritative project Brain');
+      }
+      const args = pickAllowedMcpArgs(input, ['taskId', 'role', 'kind', 'limit']);
+      const taskId = stringArg(args, 'taskId');
+      if (!taskId) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'taskId is required');
+      const stored = getTaskPairStore().getPair(context.project, taskId);
+      if (!stored) return error(MCP_ERROR_REASONS.PROJECTION_UNAVAILABLE, 'task pair not found');
+      if (stored.state.brain !== caller.sessionName) {
+        return error(MCP_ERROR_REASONS.SCOPE_FORBIDDEN, 'pair_history requires the authoritative project Brain');
+      }
+      const kind = args.kind ?? SESSION_HISTORY_KINDS[0];
+      if (!(SESSION_HISTORY_KINDS as readonly unknown[]).includes(kind)) {
+        return error(MCP_ERROR_REASONS.VALIDATION_FAILED, `kind must be ${SESSION_HISTORY_KINDS.join(', ')}`);
+      }
+      const role = args.role;
+      if (role !== undefined && role !== 'executor' && role !== 'auditor') {
+        return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'role must be executor or auditor');
+      }
+      const limit = args.limit ?? SESSION_TEXT_HISTORY_DEFAULT_LIMIT;
+      if (typeof limit !== 'number' || !Number.isInteger(limit) || limit < 1 || limit > SESSION_TEXT_HISTORY_MAX_LIMIT) {
+        return error(MCP_ERROR_REASONS.VALIDATION_FAILED, `limit must be 1..${SESSION_TEXT_HISTORY_MAX_LIMIT}`);
+      }
+      if (kind === 'summary') {
+        const gate = memorySurfaceGate(deps, { items: [] });
+        if (gate) return gate;
+      }
+      const sessionsByName = new Map(context.sessions.map((session) => [session.name, session]));
+      const participantEntries = [
+        { role: 'executor' as const, sessionName: stored.state.executor },
+        { role: 'auditor' as const, sessionName: stored.state.auditor === TASK_PAIR_NO_AUDITOR ? null : stored.state.auditor },
+      ].filter((participant) => role === undefined || participant.role === role);
+      const participants = await Promise.all(participantEntries.map(async ({ role, sessionName }) => {
+        const emptyPayload = kind === 'text' ? { messages: [] } : kind === 'tool' ? { events: [] } : { items: [] };
+        if (!sessionName || !sessionsByName.has(sessionName)) {
+          return { role, session: sessionName, status: 'missing' as const, kind, requested: limit, count: 0, ...emptyPayload };
+        }
+        try {
+          if (kind === 'summary') {
+            const items = await readSessionSummaries(sessionName, sessionsByName.get(sessionName)!.contextNamespace ?? caller.namespace, limit, false);
+            return { role, session: sessionName, status: 'ok' as const, kind, requested: limit, count: items.length, items };
+          }
+          if (kind === 'tool') {
+            const events = await readSessionToolEvents(sessionName, limit);
+            return { role, session: sessionName, status: 'ok' as const, kind, requested: limit, count: events.length, events };
+          }
+          const messages = await readSessionTextMessages(sessionName, limit, undefined, false);
+          return { role, session: sessionName, status: 'ok' as const, kind, requested: limit, count: messages.length, messages };
+        } catch {
+          return { role, session: sessionName, status: 'error' as const, kind, requested: limit, count: 0, ...emptyPayload };
+        }
+      }));
+      if (participants.some((participant) => participant.status === 'error')) {
+        return error(MCP_ERROR_REASONS.CONTROL_PLANE_UNAVAILABLE, 'pair session history is temporarily unavailable; retry, do not infer empty history');
+      }
+      return { status: 'ok', taskId, kind, requested: limit, participants };
+    },
+    [MEMORY_MCP_TOOL_NAMES.PAIR_DECISION_RECORD]: async (input) => {
+      const context = await pairCallerContext();
+      if (context.status === 'error') return context.result;
+      const args = pickAllowedMcpArgs(input, ['taskId', 'kind', 'round', 'conclusion', 'summary', 'related', 'idempotencyKey']);
+      const taskId = stringArg(args, 'taskId')?.trim();
+      if (!taskId) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'taskId is required');
+      const stored = getTaskPairStore().getPair(context.project, taskId);
+      if (!stored) return error(MCP_ERROR_REASONS.PROJECTION_UNAVAILABLE, 'task pair not found');
+      if (!caller.sessionName || ![stored.state.brain, stored.state.executor, stored.state.auditor].includes(caller.sessionName)) {
+        return error(MCP_ERROR_REASONS.SCOPE_FORBIDDEN, 'pair_decision_record requires a current pair participant');
+      }
+      const kind = stringArg(args, 'kind')?.trim() || 'decision';
+      if (kind !== 'request' && kind !== 'decision') return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'kind must be request or decision');
+      if (kind === 'decision' && stored.state.brain !== caller.sessionName) {
+        return error(MCP_ERROR_REASONS.SCOPE_FORBIDDEN, 'only the authoritative project Brain may write a final decision');
+      }
+      const round = numberArg(args, 'round');
+      const conclusion = stringArg(args, 'conclusion')?.trim();
+      const summary = stringArg(args, 'summary')?.trim();
+      if (!Number.isInteger(round) || !round || round < 1) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'round must be a positive integer');
+      if (!conclusion || !summary) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'conclusion and summary are required');
+      if (conclusion.length > 500 || summary.length > 4000) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'conclusion or summary is too long');
+      const related = Array.isArray(args.related) ? args.related.filter((value): value is string => typeof value === 'string' && value.trim().length > 0).map((value) => value.trim()).slice(0, 20) : undefined;
+      const result = taskPairService.recordDecision({
+        project: context.project, taskId, round, kind, conclusion, summary, author: caller.sessionName,
+        ...(related && related.length > 0 ? { related } : {}),
+        ...(stringArg(args, 'idempotencyKey')?.trim() ? { idempotencyKey: stringArg(args, 'idempotencyKey')!.trim() } : {}),
+      });
+      return { status: 'ok', created: result.created, decision: result.record, notified: result.notified };
+    },
+    [MEMORY_MCP_TOOL_NAMES.PAIR_DECISION_HISTORY]: async (input) => {
+      const context = await pairCallerContext();
+      if (context.status === 'error') return context.result;
+      if (!caller.sessionName) return error(MCP_ERROR_REASONS.SCOPE_FORBIDDEN, 'pair_decision_history requires the authoritative project Brain');
+      const args = pickAllowedMcpArgs(input, ['taskId', 'relatedTaskId', 'taskIds', 'limit']);
+      const taskId = stringArg(args, 'taskId')?.trim();
+      const relatedTaskId = stringArg(args, 'relatedTaskId')?.trim();
+      if (!taskId) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'taskId is required');
+      const suppliedTaskIds = Array.isArray(args.taskIds) ? args.taskIds.filter((value): value is string => typeof value === 'string' && value.trim().length > 0).map((value) => value.trim()).slice(0, 2) : [];
+      const taskIds = suppliedTaskIds.length > 0 ? [...new Set(suppliedTaskIds)] : (relatedTaskId ? [taskId, relatedTaskId] : [taskId]);
+      if (taskIds[0] !== taskId) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'taskIds must start with taskId');
+      for (const id of taskIds) {
+        const pair = getTaskPairStore().getPair(context.project, id);
+        if (!pair) return error(MCP_ERROR_REASONS.PROJECTION_UNAVAILABLE, 'task pair not found');
+        if (pair.state.brain !== caller.sessionName) return error(MCP_ERROR_REASONS.SCOPE_FORBIDDEN, 'pair_decision_history requires the authoritative Brain for every task');
+      }
+      const max = taskIds.length > 1 ? 40 : 20;
+      const rawLimit = numberArg(args, 'limit');
+      const limit = rawLimit === undefined ? max : Math.floor(rawLimit);
+      if (!Number.isInteger(limit) || limit < 1 || limit > max) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, `limit must be 1..${max}`);
+      return { status: 'ok', taskIds, requested: limit, decisions: getTaskPairStore().listDecisions(context.project, taskIds, limit) };
+    },
     [MEMORY_MCP_TOOL_NAMES.PAIR_CREATE]: async (input) => {
       const context = await pairCallerContext();
       if (context.status === 'error') return context.result;
@@ -4602,6 +4718,32 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       }
       return { status: 'ok', count: deleted.length, deleted };
     },
+    [MEMORY_MCP_TOOL_NAMES.CRON_PAUSE_SELF]: async (input) => {
+      const args = pickAllowedMcpArgs(input, ['id']);
+      const id = stringArg(args, 'id');
+      if (!id) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'id is required');
+      const binding = resolveCronSelfBinding(caller, deps, MEMORY_MCP_TOOL_NAMES.CRON_PAUSE_SELF);
+      if (!isCronSelfBinding(binding)) return binding;
+      const options = cronOptionsForCaller(binding.scopedCaller, deps);
+      if ('status' in options) return options;
+      const listed = await cronList({ projectName: binding.projectName, limit: MEMORY_MCP_CAPS.CRON_LIST_MAX_LIMIT }, options);
+      if (listed.status !== 'ok') return listed as unknown as ToolResult;
+      if (!cronJobsFromListBody(listed.body).some((job) => job.id === id && cronJobTargetsSelf(job, binding))) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'scheduled job is not available for the current session');
+      return pauseCron(id, options) as unknown as Promise<ToolResult>;
+    },
+    [MEMORY_MCP_TOOL_NAMES.CRON_RESUME_SELF]: async (input) => {
+      const args = pickAllowedMcpArgs(input, ['id']);
+      const id = stringArg(args, 'id');
+      if (!id) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'id is required');
+      const binding = resolveCronSelfBinding(caller, deps, MEMORY_MCP_TOOL_NAMES.CRON_RESUME_SELF);
+      if (!isCronSelfBinding(binding)) return binding;
+      const options = cronOptionsForCaller(binding.scopedCaller, deps);
+      if ('status' in options) return options;
+      const listed = await cronList({ projectName: binding.projectName, limit: MEMORY_MCP_CAPS.CRON_LIST_MAX_LIMIT }, options);
+      if (listed.status !== 'ok') return listed as unknown as ToolResult;
+      if (!cronJobsFromListBody(listed.body).some((job) => job.id === id && cronJobTargetsSelf(job, binding))) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'scheduled job is not available for the current session');
+      return resumeCron(id, options) as unknown as Promise<ToolResult>;
+    },
     [MEMORY_MCP_TOOL_NAMES.CRON_CREATE]: async (input) => {
       const args = pickAllowedMcpArgs(input, ['name', 'cronExpr', 'projectName', 'targetRole', 'targetSessionName', 'action', 'timezone', 'expiresAt', 'completionPolicy']);
       const expiresAt = parseExpiresAt(args.expiresAt);
@@ -4676,6 +4818,22 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       const cronOptions = cronOptionsForCaller(caller, deps);
       if ('status' in cronOptions) return cronOptions;
       return cronDelete(id, cronOptions, boolArg(args, 'force') === true) as unknown as Promise<ToolResult>;
+    },
+    [MEMORY_MCP_TOOL_NAMES.CRON_PAUSE]: async (input) => {
+      const args = pickAllowedMcpArgs(input, ['id']);
+      const id = stringArg(args, 'id');
+      if (!id) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'id is required');
+      const options = cronOptionsForCaller(caller, deps);
+      if ('status' in options) return options;
+      return pauseCron(id, options) as unknown as Promise<ToolResult>;
+    },
+    [MEMORY_MCP_TOOL_NAMES.CRON_RESUME]: async (input) => {
+      const args = pickAllowedMcpArgs(input, ['id']);
+      const id = stringArg(args, 'id');
+      if (!id) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'id is required');
+      const options = cronOptionsForCaller(caller, deps);
+      if ('status' in options) return options;
+      return resumeCron(id, options) as unknown as Promise<ToolResult>;
     },
     [MEMORY_MCP_TOOL_NAMES.LIST_MACHINES]: async (input) => {
       if (!deps.machineDeps) return error(MCP_ERROR_REASONS.FEATURE_DISABLED, 'machine control is not available on this node');
@@ -5081,6 +5239,27 @@ const schemas = {
     taskId: z.string().min(1),
     eventLimit: z.number().int().min(1).max(200).optional(),
   }).strict(),
+  [MEMORY_MCP_TOOL_NAMES.PAIR_HISTORY]: z.object({
+    taskId: z.string().min(1),
+    role: z.enum(['executor', 'auditor']).optional(),
+    kind: z.enum(['text', 'tool', 'summary']).optional(),
+    limit: z.number().int().min(1).max(200).optional(),
+  }).strict(),
+  [MEMORY_MCP_TOOL_NAMES.PAIR_DECISION_RECORD]: z.object({
+    taskId: z.string().trim().min(1),
+    kind: z.enum(['request', 'decision']).optional(),
+    round: z.number().int().positive(),
+    conclusion: z.string().trim().min(1).max(500),
+    summary: z.string().trim().min(1).max(4000),
+    related: z.array(z.string().trim().min(1).max(200)).max(20).optional(),
+    idempotencyKey: z.string().trim().min(1).max(500).optional(),
+  }).strict(),
+  [MEMORY_MCP_TOOL_NAMES.PAIR_DECISION_HISTORY]: z.object({
+    taskId: z.string().trim().min(1),
+    relatedTaskId: z.string().trim().min(1).optional(),
+    taskIds: z.array(z.string().trim().min(1)).min(1).max(2).optional(),
+    limit: z.number().int().min(1).max(40).optional(),
+  }).strict(),
   [MEMORY_MCP_TOOL_NAMES.PAIR_PAUSE]: z.object({ taskId: z.string().min(1), mode: z.enum(TASK_PAIR_PAUSE_MODES).optional(), dependsOn: z.array(z.string().min(1)).max(TASK_PAIR_MAX_DEPENDENCIES).optional(), note: z.string().max(2000).optional() }),
   [MEMORY_MCP_TOOL_NAMES.PAIR_RESUME]: z.object({ taskId: z.string().min(1) }),
   [MEMORY_MCP_TOOL_NAMES.PAIR_CREATE]: z.object({
@@ -5252,6 +5431,8 @@ const schemas = {
     all: z.boolean().optional().describe('Cancel all self jobs.'),
     force: z.boolean().optional().describe('Required for recurring jobs.'),
   }),
+  [MEMORY_MCP_TOOL_NAMES.CRON_PAUSE_SELF]: z.object({ id: z.string() }),
+  [MEMORY_MCP_TOOL_NAMES.CRON_RESUME_SELF]: z.object({ id: z.string() }),
   [MEMORY_MCP_TOOL_NAMES.CRON_CREATE]: z.object({
     name: z.string(),
     cronExpr: z.string().describe(`${MEMORY_MCP_CAPS.CRON_MIN_INTERVAL_MINUTES}-minute minimum; every-minute schedules are invalid.`),
@@ -5290,6 +5471,8 @@ const schemas = {
     id: z.string(),
     force: z.boolean().optional().describe('Required for agent deletion of recurring jobs.'),
   }),
+  [MEMORY_MCP_TOOL_NAMES.CRON_PAUSE]: z.object({ id: z.string() }),
+  [MEMORY_MCP_TOOL_NAMES.CRON_RESUME]: z.object({ id: z.string() }),
   [MEMORY_MCP_TOOL_NAMES.LIST_MACHINES]: z.strictObject({
     includeOffline: z.boolean().optional().describe('Include offline/exec-disabled machines; default false, advisory only.'),
   }),

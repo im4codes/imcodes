@@ -195,6 +195,13 @@ export async function listControlledMachines(
         ...(r.controlled_upgrade_reason ? { reason: r.controlled_upgrade_reason } : {}),
       }
       : liveUpgrade;
+    const canExecute = evaluateMachineAction({
+      accessRole: r.access_role,
+      accessSource: r.access_source,
+      execGranted: r.exec_granted === true,
+      execEnabled: r.exec_enabled === true,
+      participantTurn: Boolean(delegatedActorUserId),
+    }, MACHINE_ACTION.EXEC).allowed;
     return {
       serverId: r.id,
       nodeId: r.node_id,
@@ -203,20 +210,14 @@ export async function listControlledMachines(
       displayName: r.display_name ?? r.node_id,
       online,
       nodeRole: NODE_ROLE.CONTROLLED,
-      // Viewers may inspect bounded metadata only. Projecting false here also
-      // keeps old MCP resolution logic from presenting a non-operable target.
-      execEnabled: r.exec_enabled === true && r.access_role !== 'viewer',
+      // Actor-facing execute state must match the relay gate: group members,
+      // viewers, and participant shares without an explicit grant are false.
+      execEnabled: canExecute,
       accessRole: r.access_role,
       // Operating is not executing: the browser is told whether THIS actor may run commands / move files on the device (an owner, or a
       // participant share with the owner's execute grant), where the access comes from, and whether a grant is held. A turn that was
       // started by a share participant cannot use exec_remote, but other actions follow its real grant.
-      canExecute: evaluateMachineAction({
-        accessRole: r.access_role,
-        accessSource: r.access_source,
-        execGranted: r.exec_granted === true,
-        execEnabled: r.exec_enabled === true,
-        participantTurn: Boolean(delegatedActorUserId),
-      }, MACHINE_ACTION.EXEC).allowed,
+      canExecute,
       execGranted: r.exec_granted === true,
       ...(r.can_rename === true && r.access_role !== 'owner' ? { canRename: true } : {}),
       ...(r.access_source ? { accessSource: r.access_source } : {}),

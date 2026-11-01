@@ -1,4 +1,7 @@
 {
+  "task_pair": {
+    "reference_picker": "Pair tasks"
+  },
   "alias": {
     "feature_label": "Alias",
     "category": "Alias",
@@ -33,6 +36,12 @@
       "list_unavailable": "Aliases are still loading or failed to load. Please try again in a moment.",
       "generic": "Something went wrong. Please try again."
     }
+  },
+  "skill": {
+    "category": "Skills",
+    "category_desc": "Insert a skill reference",
+    "empty": "No skills available",
+    "no_results": "No skills match your search"
   },
   "machine": {
     "feature_label": "Machine",
@@ -685,7 +694,7 @@
     "stop_appended_queue": "Queued messages appended; the session is still running.",
     "send_placeholder": "Send to {{name}}…",
     "send_placeholder_desktop_upload": "{{placeholder}} Supports fast multi-file paste or drag upload",
-    "send_placeholder_desktop_shortcuts": "{{placeholder}}\n/ commands · # phrases · @ files/agents · ; aliases · ^ nodes · paste or drag files",
+    "send_placeholder_desktop_shortcuts": "{{placeholder}}\n/ commands · # phrases · @ files/agents · ; aliases · ^ nodes · % tasks · paste or drag files",
     "composer_target_label": "Sending to",
     "composer_target_aria": "Message target: {{name}}",
     "actions": "Session actions",
@@ -797,6 +806,7 @@
       "openclaw": "OpenClaw",
       "qwen": "Qwen Code",
       "claude_code_sdk": "Claude Code SDK",
+      "cc_cli_sdk": "CC CLI SDK",
       "codex_sdk": "Codex SDK",
       "qoder_sdk": "Qoder SDK",
       "claude_code_cli": "Claude Code CLI",
@@ -1067,6 +1077,8 @@
     "delete_error": "Failed to delete server: {{error}}",
     "upgrade_daemon": "↑ Upgrade Daemon",
     "upgrade_all": "↑ Upgrade All Devices",
+    "pin": "📌 Pin server",
+    "unpin": "Unpin server",
     "delete": "✕ Delete server",
     "upgrade_sent": "Upgrade command sent to \"{{name}}\". The daemon will install the latest version and restart.",
     "upgrade_failed": "Failed to send upgrade command. The daemon may be offline.",
@@ -4175,6 +4187,7 @@
     "zoom_out": "Zoom out",
     "zoom_reset": "Reset zoom",
     "touch_hint": "Tap the screen to click there, or drag the ring to move the cursor -- hold the ring, then drag to drag; hold and release to right-click",
+    "touch_hint_dismiss": "Got it",
     "touch_right_click": "Right-click at the last touch position",
     "touch_ring": "Cursor ring -- drag to move, long-press to right-click",
     "mobile_input_mode": "Mobile input mode",
@@ -4319,6 +4332,7 @@
       "mode_change_failed": "The node refused: Windows would not apply that resolution.",
       "scale_change_failed": "The node refused: Windows would not apply that scale.",
       "capture_failed": "The node refused: capture could not be moved to that display.",
+      "quality_unavailable": "The node could not apply that quality without interrupting the live stream.",
       "unlock_unavailable": "The node refused: it has no stored sign-in secret, or there is nothing to unlock right now.",
       "paste_unavailable": "Remote clipboard unavailable; the text was typed instead.",
       "paste_too_large": "Text too large for one clipboard paste; the text was typed instead."

@@ -4,13 +4,17 @@ import { Hono } from 'hono';
 import { sha256Hex } from '../src/security/crypto.js';
 import { serverRoutes } from '../src/routes/server.js';
 import { sharedContextRoutes } from '../src/routes/shared-context.js';
+import { computeProjectionContentHash } from '../../shared/memory-content-hash.js';
+import { sanitizePostgresJson } from '../../shared/postgres-json-safe.js';
 import type { Env } from '../src/env.js';
 import type { Database } from '../src/db/client.js';
 
 const generateEmbeddingMock = vi.hoisted(() => vi.fn());
+const storeProjectionEmbeddingMock = vi.hoisted(() => vi.fn());
 
 vi.mock('../src/util/embedding.js', () => ({
   generateEmbedding: generateEmbeddingMock,
+  storeProjectionEmbedding: storeProjectionEmbeddingMock,
   embeddingToSql: (embedding: Float32Array) => `[${Array.from(embedding).join(',')}]`,
 }));
 
@@ -25,6 +29,8 @@ vi.mock('../src/security/authorization.js', () => ({
 beforeEach(() => {
   generateEmbeddingMock.mockReset();
   generateEmbeddingMock.mockResolvedValue(null);
+  storeProjectionEmbeddingMock.mockReset();
+  storeProjectionEmbeddingMock.mockResolvedValue(undefined);
   process.env.IMCODES_MEM_FEATURE_ORG_SHARED_AUTHORED_STANDARDS = 'true';
 });
 
@@ -280,7 +286,10 @@ function makeMockDb() {
           user_id: params[5],
           project_id: params[6],
           projection_class: params[7],
+          source_event_ids_json: params[8],
           summary: params[9],
+          content_json: params[10],
+          content_hash: params[11],
           origin: params[12],
         });
         return { changes: 1 };
@@ -300,6 +309,7 @@ function makeMockDb() {
           project_id: params[7],
           record_class: params[8],
           summary: params[9],
+          content_json: params[10],
           origin: params[11],
         });
         return { changes: 1 };
@@ -447,6 +457,131 @@ describe('shared-context processed remote route', () => {
     expect(projectionRows[0].summary).toBe('decision with an embedded�NUL byte');
     expect(recordRows).toHaveLength(1);
     expect(recordRows[0].summary).toBe('decision with an embedded�NUL byte');
+  });
+
+  it('sanitizes nested NULs before JSONB writes and hashes the persisted content', async () => {
+    const { db, projectionRows, recordRows } = makeMockDb();
+    const app = new Hono<{ Bindings: Env }>();
+    app.route('/api/server', serverRoutes);
+    const content = {
+      nested: { text: 'a\u0000b', 'key\u0000': ['emoji 😀', 'literal\\u0000'] },
+      list: [{ value: '\u0000' }],
+    };
+    const sourceEventIds = ['evt-1', 'evt\u0000-2'];
+    const response = await app.request('/api/server/srv-1/shared-context/processed', {
+      method: 'POST',
+      headers: { authorization: 'Bearer daemon-token', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        namespace: { scope: 'project_shared', projectId: 'github.com/acme/repo', enterpriseId: 'ent-1' },
+        projections: [{
+          id: 'proj-nested-nul',
+          namespace: { scope: 'project_shared', projectId: 'github.com/acme/repo', enterpriseId: 'ent-1' },
+          class: 'durable_memory_candidate', origin: 'chat_compacted', sourceEventIds,
+          summary: 'nested NUL', content, createdAt: 100, updatedAt: 110,
+        }],
+      }),
+    }, makeEnv(db));
+
+    const safeContent = sanitizePostgresJson(content).value;
+    const safeSourceEventIds = sanitizePostgresJson(sourceEventIds).value;
+    const persistedProjection = projectionRows[0];
+    const persistedRecord = recordRows[0];
+    expect(response.status).toBe(200);
+    expect(persistedProjection).toMatchObject({
+      source_event_ids_json: JSON.stringify(safeSourceEventIds),
+      content_json: JSON.stringify(safeContent),
+      content_hash: computeProjectionContentHash({ summary: 'nested NUL', content: safeContent }),
+    });
+    expect(JSON.parse(persistedProjection.content_json as string)).toEqual(safeContent);
+    expect(JSON.parse(persistedRecord.content_json as string)).toEqual(safeContent);
+    expect((persistedProjection.content_json as string).includes('\u0000')).toBe(false);
+
+    // Replaying the same payload remains successful and produces the same hash.
+    const replay = await app.request('/api/server/srv-1/shared-context/processed', {
+      method: 'POST',
+      headers: { authorization: 'Bearer daemon-token', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        namespace: { scope: 'project_shared', projectId: 'github.com/acme/repo', enterpriseId: 'ent-1' },
+        projections: [{
+          id: 'proj-nested-nul',
+          namespace: { scope: 'project_shared', projectId: 'github.com/acme/repo', enterpriseId: 'ent-1' },
+          class: 'durable_memory_candidate', origin: 'chat_compacted', sourceEventIds, summary: 'nested NUL', content,
+          createdAt: 100, updatedAt: 110,
+        }],
+      }),
+    }, makeEnv(db));
+    expect(replay.status).toBe(200);
+    expect(projectionRows.at(-1)?.content_hash).toBe(persistedProjection.content_hash);
+  });
+
+  it('turns a rejected projection write into a 503 and keeps the next request healthy', async () => {
+    const { db, projectionRows } = makeMockDb();
+    const originalExecute = db.execute.bind(db);
+    let rejectNextProjectionWrite = true;
+    (db as unknown as {
+      execute: (sql: string, params?: unknown[]) => Promise<{ changes: number }>;
+    }).execute = async (sql, params = []) => {
+      if (rejectNextProjectionWrite && sql.toLowerCase().includes('insert into shared_context_projections')) {
+        rejectNextProjectionWrite = false;
+        throw new Error('22P05: unsupported Unicode escape sequence');
+      }
+      return originalExecute(sql, params);
+    };
+
+    const app = new Hono<{ Bindings: Env }>();
+    app.route('/api/server', serverRoutes);
+    const request = () => app.request('/api/server/srv-1/shared-context/processed', {
+      method: 'POST',
+      headers: { authorization: 'Bearer daemon-token', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        namespace: { scope: 'project_shared', projectId: 'github.com/acme/repo', enterpriseId: 'ent-1' },
+        projections: [{
+          id: 'proj-db-rejection',
+          namespace: { scope: 'project_shared', projectId: 'github.com/acme/repo', enterpriseId: 'ent-1' },
+          class: 'recent_summary', origin: 'chat_compacted', sourceEventIds: ['evt-1'],
+          summary: 'healthy summary', content: { ok: true }, createdAt: 100, updatedAt: 110,
+        }],
+      }),
+    }, makeEnv(db));
+
+    const failed = await request();
+    expect(failed.status).toBe(503);
+    expect(await failed.json()).toEqual({ error: 'processed_replication_failed', projectionId: 'proj-db-rejection' });
+    expect(projectionRows).toHaveLength(0);
+
+    const recovered = await request();
+    expect(recovered.status).toBe(200);
+    expect(await recovered.json()).toEqual(expect.objectContaining({ ok: true, projectionCount: 1 }));
+    expect(projectionRows).toHaveLength(1);
+  });
+
+  it('contains a rejected embedding promise so a later request remains healthy', async () => {
+    const { db, projectionRows } = makeMockDb();
+    const app = new Hono<{ Bindings: Env }>();
+    app.route('/api/server', serverRoutes);
+    storeProjectionEmbeddingMock.mockRejectedValueOnce(new Error('embedding unavailable'));
+    const request = () => app.request('/api/server/srv-1/shared-context/processed', {
+      method: 'POST',
+      headers: { authorization: 'Bearer daemon-token', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        namespace: { scope: 'project_shared', projectId: 'github.com/acme/repo', enterpriseId: 'ent-1' },
+        projections: [{
+          id: 'proj-embedding-rejection',
+          namespace: { scope: 'project_shared', projectId: 'github.com/acme/repo', enterpriseId: 'ent-1' },
+          class: 'recent_summary', origin: 'chat_compacted', sourceEventIds: ['evt-1'],
+          summary: 'healthy summary', content: { ok: true }, createdAt: 100, updatedAt: 110,
+        }],
+      }),
+    }, makeEnv(db));
+
+    const first = await request();
+    expect(first.status).toBe(200);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const second = await request();
+    expect(second.status).toBe(200);
+    expect(projectionRows).toHaveLength(2);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(storeProjectionEmbeddingMock).toHaveBeenCalledTimes(2);
   });
 
   it('skips noisy API error projections during remote replication', async () => {

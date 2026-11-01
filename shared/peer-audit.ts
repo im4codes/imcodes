@@ -2,6 +2,7 @@ import { redactSensitiveText } from './redact-secrets.js';
 import { CODEBUDDY_PROVIDER_IDS } from './codebuddy.js';
 import { AGY_SDK_PROVIDER_ID } from './agy-agent.js';
 import { HERMES_AGENT_PROVIDER_ID } from './hermes-agent.js';
+import { CLAUDE_CODE_CLI_SDK_AGENT_TYPE } from './agent-types.js';
 
 // Single shared source of truth for the lightweight peer-supervision-audit
 // contract (design "One shared peer-audit contract"). Owns contract/reply
@@ -295,6 +296,7 @@ export function resolvePeerAuditNormalizedModelId(
 const PEER_AUDIT_PROVIDER_FAMILY_BY_ID: Readonly<Record<string, string>> = {
   anthropic: 'anthropic',
   'claude-code-sdk': 'anthropic',
+  [CLAUDE_CODE_CLI_SDK_AGENT_TYPE]: 'anthropic',
   'claude-code': 'anthropic',
   openai: 'openai',
   'codex-sdk': 'openai',

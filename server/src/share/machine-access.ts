@@ -22,7 +22,7 @@ export interface ControlledMachineAccessRow {
   revoked_at: number | null;
   access_role: MachineAccessRole;
   access_expires_at: number | null;
-  /** Where the access comes from. An EXECUTE grant only counts when this is `share` (shared/machine-access-policy.ts). */
+  /** Where the access comes from; group membership is the product's default execute grant. */
   access_source: MachineAccessSource | null;
   /** The explicit per-device share row's execute grant; false for the owner row, a group member and every pre-grant share. */
   exec_granted: boolean;
@@ -53,6 +53,47 @@ export interface ControlledMachineAccessRow {
 export type ControlledMachineOperatorAccessRow = ControlledMachineAccessRow & {
   access_role: Extract<MachineAccessRole, 'owner' | 'participant'>;
 };
+
+/**
+ * Resolve the canonical server id accepted by machine control routes.
+ * MCP callers normally resolve a canonical node id before dispatch, but older
+ * clients and direct integrations can still send that id to the HTTP relay.
+ * Treating it as an opaque server id makes an otherwise authorized target look
+ * absent and produces the misleading `target_forbidden`. Only controlled-node
+ * node ids are aliases; full-daemon ids retain their existing semantics.
+ */
+export async function resolveMachineTargetServerId(
+  db: Database,
+  reference: string,
+): Promise<string | null> {
+  const value = reference.trim();
+  if (!value) return null;
+  const rows = await db.query<{
+    id: string;
+    node_id: string | null;
+    node_role: string | null;
+    revoked_at: number | null;
+  }>(
+    `SELECT id, node_id, node_role, revoked_at
+       FROM servers
+      WHERE id = $1 OR (node_role = 'controlled' AND node_id = $1)
+      ORDER BY CASE WHEN id = $1 THEN 0 ELSE 1 END, id`,
+    [value],
+  );
+  const exact = rows.find((row) => row.id === value);
+  // A revoked exact id is never allowed to fall through to a different row
+  // that happens to reuse the same value as a canonical node id.
+  if (exact?.revoked_at != null) return null;
+  const canonical = rows.filter((row) => row.node_role === NODE_ROLE.CONTROLLED
+    && row.node_id === value && row.revoked_at == null);
+  if (exact) {
+    // An active exact id and a distinct canonical alias are ambiguous. Never
+    // let a stale/colliding identity select the wrong daemon or controlled node.
+    if (canonical.some((row) => row.id !== exact.id)) return null;
+    return exact.id;
+  }
+  return canonical.length === 1 ? canonical[0]!.id : null;
+}
 
 /**
  * Is this caller a member of any group this machine is in?
@@ -103,39 +144,43 @@ const CONTROLLED_MACHINE_ACCESS_SELECT = `
              FROM machine_groups g JOIN teams gt ON gt.id = g.team_id
             WHERE g.server_id = s.id
          ) AS team_names,
-         CASE
-           WHEN s.user_id = $1 THEN 'owner'
-           -- An explicit per-machine grant wins over the team default, in both
-           -- directions. It is the more specific statement of intent, so a
-           -- deliberate downgrade to viewer is not silently undone by the
-           -- grantee also being in the team.
-           WHEN sh.role IS NOT NULL THEN sh.role
-           WHEN ${IS_MEMBER_OF_A_MACHINE_GROUP} THEN 'participant'
-         END AS access_role,
-         CASE
-           WHEN s.user_id = $1 THEN 'owner'
-           WHEN sh.role IS NOT NULL THEN 'share'
-           WHEN ${IS_MEMBER_OF_A_MACHINE_GROUP} THEN 'group'
-         END AS access_source,
-         -- Only the explicit per-device row can carry an execute grant, and only a participant row (CHECK in migration 100). A group
-         -- membership has no row, so it can never grant it; a missing column reads false.
-         COALESCE(sh.exec_granted, FALSE) AS exec_granted,
+         CASE WHEN s.user_id = $1 THEN 'owner' ELSE effective_access.role END AS access_role,
+         CASE WHEN s.user_id = $1 THEN 'owner' ELSE effective_access.access_source END AS access_source,
+         -- Resolve all live sources first, then choose the highest effective
+         -- role. A lower direct row must not mask a participant inherited from
+         -- a team; a direct execute grant wins ties for provenance.
+         CASE WHEN s.user_id = $1 THEN FALSE ELSE COALESCE(effective_access.exec_granted, FALSE) END AS exec_granted,
          CASE WHEN s.user_id = $1 THEN TRUE
-           WHEN (sh.role IS NULL OR sh.role = 'participant') AND ${machineGroupMembershipSql('$1', true)} THEN TRUE
+           WHEN (effective_access.role IS NULL OR effective_access.role = 'participant') AND ${machineGroupMembershipSql('$1', true)} THEN TRUE
            ELSE FALSE END AS can_rename,
-         sh.expires_at AS access_expires_at
+         effective_access.expires_at AS access_expires_at
     FROM servers s
     LEFT JOIN remote_desktop_host_endpoints rdhe
       ON rdhe.server_id = s.id
-    -- Direct node shares stand independently of group metadata and are re-read live.
-    LEFT JOIN server_shares sh
-      ON sh.server_id = s.id
-     AND s.user_id <> $1
-     AND sh.target_user_id = $1
-     AND sh.revoked_at IS NULL
-     AND (sh.expires_at IS NULL OR sh.expires_at > $2)
-    -- A live group membership grants bounded visibility/read, never execute.
-    -- The more specific active direct role still wins over that group default.
+    LEFT JOIN LATERAL (
+      SELECT candidate.role, candidate.access_source, candidate.exec_granted,
+             candidate.expires_at
+        FROM (
+          SELECT sh.role, 'share'::text AS access_source,
+                 COALESCE(sh.exec_granted, FALSE) AS exec_granted,
+                 sh.expires_at,
+                 CASE sh.role WHEN 'participant' THEN 2 ELSE 1 END AS role_rank,
+                 CASE WHEN sh.role = 'participant' AND sh.exec_granted THEN 1 ELSE 0 END AS execute_rank,
+                 1 AS source_rank
+            FROM server_shares sh
+           WHERE s.user_id <> $1
+             AND sh.server_id = s.id
+             AND sh.target_user_id = $1
+             AND sh.revoked_at IS NULL
+             AND (sh.expires_at IS NULL OR sh.expires_at > $2)
+          UNION ALL
+          SELECT 'participant', 'group'::text, FALSE, NULL,
+                 2, 1, 0
+           WHERE s.user_id <> $1 AND ${IS_MEMBER_OF_A_MACHINE_GROUP}
+        ) candidate
+       ORDER BY candidate.role_rank DESC, candidate.execute_rank DESC, candidate.source_rank DESC
+       LIMIT 1
+    ) effective_access ON TRUE
 `;
 
 /**
@@ -157,7 +202,7 @@ export async function resolveControlledMachineAccess(
         AND s.node_role = $4
         AND s.revoked_at IS NULL
         AND ${ACTIVE_ACCOUNTS_ACCESS_PREDICATE}
-        AND (s.user_id = $1 OR sh.id IS NOT NULL OR ${IS_MEMBER_OF_A_MACHINE_GROUP})
+        AND (s.user_id = $1 OR effective_access.role IS NOT NULL)
       LIMIT 1`,
     [userId, now, serverId, NODE_ROLE.CONTROLLED],
   );
@@ -200,7 +245,7 @@ export async function resolveControlledMachineReadActors(
       WHERE s.id = $1 AND s.node_role = $4 AND s.revoked_at IS NULL
         AND ${activeUserExistsSql('s.user_id')} AND ${activeUserExistsSql('actor.id')}
         AND (s.user_id = actor.id OR sh.role = 'participant'
-          OR (sh.id IS NULL AND ${machineGroupMembershipSql('actor.id')}))`,
+          OR ${machineGroupMembershipSql('actor.id')})`,
     [serverId, actors, now, NODE_ROLE.CONTROLLED],
   );
   return new Set(rows.map((row) => row.actor_id));
@@ -261,7 +306,7 @@ export async function resolveRemoteDesktopHostAccess(
       WHERE s.id = $3
         AND s.revoked_at IS NULL
         AND ${ACTIVE_ACCOUNTS_ACCESS_PREDICATE}
-        AND (s.user_id = $1 OR sh.id IS NOT NULL OR ${IS_MEMBER_OF_A_MACHINE_GROUP})
+        AND (s.user_id = $1 OR effective_access.role IS NOT NULL)
       LIMIT 1`,
     [userId, now, serverId],
   );
@@ -293,9 +338,8 @@ export async function listAccessibleControlledMachines(
       WHERE s.node_role = $3
         AND s.revoked_at IS NULL
         AND ${ACTIVE_ACCOUNTS_ACCESS_PREDICATE}
-        AND (s.user_id = $1 OR sh.id IS NOT NULL OR ${IS_MEMBER_OF_A_MACHINE_GROUP})
-        AND (NOT $5::boolean OR s.user_id = $1 OR sh.role = 'participant'
-          OR (sh.id IS NULL AND ${IS_MEMBER_OF_A_MACHINE_GROUP}))
+        AND (s.user_id = $1 OR effective_access.role IS NOT NULL)
+        AND (NOT $5::boolean OR s.user_id = $1 OR effective_access.role = 'participant')
       ORDER BY s.display_name NULLS LAST, s.id
       LIMIT $4`,
     [userId, now, NODE_ROLE.CONTROLLED, limit, operableOnly],

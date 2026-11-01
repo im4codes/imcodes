@@ -35,6 +35,9 @@ import {
   type VoiceNotepadSendRequest,
 } from '../voice-notepad.js';
 import { AtPicker } from './AtPicker.js';
+import { listAgentSkills } from '../api/agent-skills.js';
+import type { AgentSkillEntry } from '@shared/agent-skills.js';
+import { agentSkillSourceLabel, buildAgentSkillMarker } from '@shared/agent-skill-references.js';
 import { FS_SESSION_ROOT_PATH } from '../../../src/shared/transport/fs.js';
 import { QuickAgentDelegationDialog, type QuickAgentDelegationCandidate } from './QuickAgentDelegationDialog.js';
 import { useAliases } from '../hooks/useAliases.js';
@@ -46,6 +49,7 @@ import { buildMachineSendExtra } from '../util/machine-send.js';
 import { matchInlineMachineTrigger, stripInlineMachineTrigger } from '../util/machine-trigger.js';
 import { MACHINE_IDENTITY_UNAVAILABLE } from '@shared/machine-reference.js';
 import { parseAliasMarkers } from '@shared/alias-types.js';
+import { filterTaskPairReferences, matchTaskPairReferenceTrigger, openTaskPairReferences, replaceTaskPairReferenceTrigger, type TaskPairReference } from '../util/task-pair-reference.js';
 import { CODEX_FAST_OFF_COMMAND, isCodexFastServiceTier } from '@shared/codex-service-tier.js';
 import { isInsufficientCapacityError } from '../upload-error.js';
 import { MobileDpad, DPAD_ARROW_SEQUENCES } from './MobileDpad.js';
@@ -654,6 +658,20 @@ export function matchInlineAliasTrigger(text: string): string | null {
   return m[1];
 }
 
+/** Inline `$` skill autocomplete. Numeric-only queries stay ordinary amounts. */
+export function matchInlineSkillTrigger(text: string): string | null {
+  const m = /(?:^|\s)\$([a-z0-9._-]*)$/iu.exec(text);
+  if (!m) return null;
+  const query = m[1] ?? '';
+  // A lone dollar is ordinary prose/currency; autocomplete starts once the
+  // user has typed at least one skill-name character.
+  if (!query) return null;
+  if (query && /^\d[\d._-]*$/u.test(query)) return null;
+  const dollarIdx = text.length - query.length - 1;
+  if (dollarIdx > 0 && text[dollarIdx - 1] === '$') return null;
+  return query;
+}
+
 // Inline `;` alias dropdown styles — mirror the AtPicker dropdown look so the
 // two inline autocompletes feel identical.
 const aliasPickerContainerStyle: Record<string, string | number> = {
@@ -1235,7 +1253,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const [menuOpen, setMenuOpen] = useState(false);
   const [atPickerOpen, setAtPickerOpen] = useState(false);
   const [atQuery, setAtQuery] = useState('');
-  const [atPickerStage, setAtPickerStage] = useState<'choose' | 'files' | 'agents' | 'mode' | 'team' | 'aliases' | 'machines'>('choose');
+  const [atPickerStage, setAtPickerStage] = useState<'choose' | 'files' | 'agents' | 'mode' | 'team' | 'aliases' | 'machines' | 'skills'>('choose');
   const atJustClosedRef = useRef(false);
   const atSelectionLockRef = useRef(false);
   const atSelectionSnapshotRef = useRef('');
@@ -1257,18 +1275,68 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   // Set for the input event immediately following a paste so pasted text ending
   // in `^name` never opens the inline machine picker (paste must not trigger).
   const machinePasteSuppressRef = useRef(false);
+  const [taskPairReferences, setTaskPairReferences] = useState<TaskPairReference[]>([]);
+  const [taskPairPickerOpen, setTaskPairPickerOpen] = useState(false);
+  const [taskPairQuery, setTaskPairQuery] = useState('');
+  const [taskPairHighlightIdx, setTaskPairHighlightIdx] = useState(0);
+  const taskPairPickerRef = useRef<HTMLDivElement>(null);
+  const taskPairJustClosedRef = useRef(false);
   // Quick phrases are user-input affordances. Programmatic composer writes and
   // paste may contain attachment-like `#...` text, so suppress their one
   // corresponding input event without disabling later keyboard edits.
   const quickPhraseInputSuppressRef = useRef(false);
-  const [quickSuggestionKind, setQuickSuggestionKind] = useState<'command' | 'phrase' | 'model' | null>(null);
+  const [quickSuggestionKind, setQuickSuggestionKind] = useState<'command' | 'phrase' | 'model' | 'skill' | null>(null);
   const [quickSuggestionQuery, setQuickSuggestionQuery] = useState('');
   const [quickSuggestionHighlightIdx, setQuickSuggestionHighlightIdx] = useState(0);
+  const [agentSkills, setAgentSkills] = useState<AgentSkillEntry[]>([]);
   const closeQuickSuggestions = useCallback(() => {
     setQuickSuggestionKind(null);
     setQuickSuggestionQuery('');
     setQuickSuggestionHighlightIdx(0);
   }, []);
+  useEffect(() => {
+    const onSnapshot = (event: Event) => {
+      const detail = (event as CustomEvent).detail;
+      if (detail?.scopeReset || detail?.authorityUnavailable) {
+        setTaskPairReferences([]);
+        setTaskPairPickerOpen(false);
+        setTaskPairQuery('');
+        return;
+      }
+      setTaskPairReferences(openTaskPairReferences(detail));
+    };
+    window.addEventListener('supervision:task-pairs', onSnapshot);
+    return () => window.removeEventListener('supervision:task-pairs', onSnapshot);
+  }, []);
+  useEffect(() => {
+    setTaskPairReferences([]);
+    setTaskPairPickerOpen(false);
+    setTaskPairQuery('');
+  }, [serverId, activeSession?.name]);
+  const filteredTaskPairReferences = useMemo(
+    () => filterTaskPairReferences(taskPairReferences, taskPairQuery),
+    [taskPairReferences, taskPairQuery],
+  );
+  const {
+    activeIndex: activeTaskPairIndex,
+    handleNavigationKey: handleTaskPairNavigationKey,
+  } = useListboxNavigation({
+    activeIndex: taskPairHighlightIdx,
+    containerRef: taskPairPickerRef,
+    itemCount: filteredTaskPairReferences.length,
+    open: taskPairPickerOpen,
+    setActiveIndex: setTaskPairHighlightIdx,
+  });
+  useEffect(() => {
+    if (!serverId) { setAgentSkills([]); return; }
+    let cancelled = false;
+    void listAgentSkills(serverId, activeSession ? { sessionName: activeSession.name, projectDir: activeSession.projectDir } : undefined).then((skills) => {
+      if (!cancelled) setAgentSkills(skills);
+    }).catch(() => {
+      if (!cancelled) setAgentSkills([]);
+    });
+    return () => { cancelled = true; };
+  }, [serverId, activeSession?.name, activeSession?.projectDir]);
   const [modelOpen, setModelOpen] = useState(false);
   const [autoOpen, setAutoOpen] = useState(false);
   const [peerAuditOpen, setPeerAuditOpen] = useState(false);
@@ -2271,6 +2339,12 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     quickSuggestionKind,
     quickSuggestionQuery,
   ]);
+  const skillSuggestions = useMemo(() => {
+    if (quickSuggestionKind !== 'skill') return [] as AgentSkillEntry[];
+    const needle = quickSuggestionQuery.trim().toLocaleLowerCase();
+    return agentSkills.filter((skill) => !needle || [skill.name, skill.description, skill.source, skill.sourceUrl]
+      .some((value) => value?.toLocaleLowerCase().includes(needle)));
+  }, [agentSkills, quickSuggestionKind, quickSuggestionQuery]);
   const quickSuggestionPickerRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
     if (quickSuggestionKind === 'phrase' && quickSuggestions.length === 0) {
@@ -2283,7 +2357,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   } = useListboxNavigation({
     activeIndex: quickSuggestionHighlightIdx,
     containerRef: quickSuggestionPickerRef,
-    itemCount: quickSuggestions.length,
+    itemCount: quickSuggestionKind === 'skill' ? skillSuggestions.length : quickSuggestions.length,
     open: quickSuggestionKind !== null,
     setActiveIndex: setQuickSuggestionHighlightIdx,
   });
@@ -3125,6 +3199,13 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     fillInput(quickSuggestionKind === 'model' ? `${SESSION_MODEL_COMMAND} ${value}` : value);
   };
 
+  const selectSkillSuggestion = useCallback((skill: AgentSkillEntry) => {
+    const current = divRef.current ? readComposerElementText(divRef.current) : '';
+    const before = current.replace(/(?:^|\s)\$[a-z0-9._-]*$/iu, (match) => match.startsWith(' ') ? ' ' : '');
+    fillInput(`${before}${before && !before.endsWith(' ') ? ' ' : ''}${buildAgentSkillMarker(skill)} `);
+    closeQuickSuggestions();
+  }, [closeQuickSuggestions]);
+
   const appendToInput = (paths: string[]) => {
     if (!paths.length) return;
     closeQuickSuggestions();
@@ -3180,6 +3261,12 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     publishComposerText(nextText);
     syncMobileComposerMetrics();
   }, [publishComposerText, syncMobileComposerMetrics]);
+
+  const insertTaskPairReference = useCallback((title: string) => {
+    const el = divRef.current;
+    const current = el ? readComposerElementText(el) : '';
+    fillInput(replaceTaskPairReferenceTrigger(current, title));
+  }, [fillInput]);
 
   /**
    * Insert a `^^(nodeId)-(displayName)` machine reference at the caret via the
@@ -5003,6 +5090,18 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         setQuickSuggestionQuery('');
         return;
       }
+      if (quickSuggestionKind === 'skill' && (e.key === 'Tab' || e.key === 'Enter')) {
+        if (skillSuggestions.length > 0) {
+          e.preventDefault();
+          e.stopPropagation();
+          const skill = skillSuggestions[activeQuickSuggestionIndex];
+          if (skill) selectSkillSuggestion(skill);
+          return;
+        }
+        // A failed/empty skill lookup must not consume Enter; it remains the
+        // ordinary send key so typing can continue without a dead composer.
+        if (e.key === 'Tab') return;
+      }
       const exactCommand = quickSuggestionKind === 'command'
         ? quickSuggestions.find(
             (command) => command.toLocaleLowerCase() === `/${quickSuggestionQuery}`.toLocaleLowerCase(),
@@ -5082,6 +5181,28 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       }
     }
 
+    if (taskPairPickerOpen) {
+      if (handleTaskPairNavigationKey(e)) return;
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        e.stopPropagation();
+        setTaskPairPickerOpen(false);
+        setTaskPairQuery('');
+        return;
+      }
+      if ((e.key === 'Tab' || e.key === 'Enter') && filteredTaskPairReferences.length > 0) {
+        e.preventDefault();
+        e.stopPropagation();
+        const chosen = filteredTaskPairReferences[activeTaskPairIndex];
+        setTaskPairPickerOpen(false);
+        setTaskPairQuery('');
+        taskPairJustClosedRef.current = true;
+        setTimeout(() => { taskPairJustClosedRef.current = false; }, 150);
+        if (chosen) insertTaskPairReference(chosen.title);
+        return;
+      }
+    }
+
     if (e.key === 'Escape' && handleTransportEscapeCancel(e)) {
       return;
     }
@@ -5099,6 +5220,11 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     if (e.key === 'Enter' && aliasJustClosedRef.current) {
       e.preventDefault();
       aliasJustClosedRef.current = false;
+      return;
+    }
+    if (e.key === 'Enter' && taskPairJustClosedRef.current) {
+      e.preventDefault();
+      taskPairJustClosedRef.current = false;
       return;
     }
 
@@ -7273,6 +7399,29 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
               setTimeout(() => { atJustClosedRef.current = false; atSelectionLockRef.current = false; }, 150);
               insertMachineMarker(refName, displayName);
             }}
+            onSelectSkill={(skill) => {
+              const text = divRef.current ? readComposerElementText(divRef.current) : '';
+              const before = text.replace(/@[^\s@]*$/, '');
+              const nextText = `${before}${before && !before.endsWith(' ') ? ' ' : ''}${buildAgentSkillMarker(skill)} `;
+              if (divRef.current) setComposerElementText(divRef.current, nextText);
+              atSelectionSnapshotRef.current = nextText;
+              atSelectionLockRef.current = true;
+              setAtPickerOpen(false);
+              setAtPickerStage('choose');
+              atJustClosedRef.current = true;
+              setTimeout(() => { atJustClosedRef.current = false; atSelectionLockRef.current = false; }, 150);
+              setHasText(true);
+              publishComposerText(nextText);
+              try {
+                const sel = window.getSelection();
+                const range = document.createRange();
+                range.selectNodeContents(divRef.current!);
+                range.collapse(false);
+                sel?.removeAllRanges();
+                sel?.addRange(range);
+              } catch { /* jsdom lacks Selection API */ }
+            }}
+            serverId={serverId}
             p2pConfig={p2pSavedConfig}
             onClose={() => { setAtPickerOpen(false); setAtPickerStage('choose'); }}
             onStageChange={setAtPickerStage}
@@ -7282,7 +7431,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
 
         {quickSuggestionKind !== null
           && activeSession
-          && (quickSuggestionKind !== 'phrase' || quickSuggestions.length > 0) && (
+          && (quickSuggestionKind === 'skill' || quickSuggestionKind !== 'phrase' || quickSuggestions.length > 0) && (
           <div
             ref={quickSuggestionPickerRef}
             class="controls-slash-picker"
@@ -7291,7 +7440,9 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
               ? 'quick_input.commands'
               : quickSuggestionKind === 'phrase'
                 ? 'quick_input.phrases'
-                : 'quick_input.models')}
+                : quickSuggestionKind === 'skill'
+                  ? 'skill.category'
+                  : 'quick_input.models')}
             style={aliasPickerContainerStyle}
           >
             <div style={aliasPickerGroupLabelStyle}>
@@ -7299,18 +7450,41 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
                 ? 'quick_input.commands'
                 : quickSuggestionKind === 'phrase'
                   ? 'quick_input.phrases'
-                  : 'quick_input.models')}
+                  : quickSuggestionKind === 'skill'
+                    ? 'skill.category'
+                    : 'quick_input.models')}
             </div>
-            {quickSuggestions.length === 0 && (
+            {((quickSuggestionKind === 'skill' ? skillSuggestions.length : quickSuggestions.length) === 0) && (
               <div style={aliasPickerEmptyStyle}>
                 {t(quickSuggestionKind === 'command'
                   ? 'quick_input.no_command_matches'
                   : quickSuggestionKind === 'phrase'
                     ? 'quick_input.no_phrase_matches'
-                    : 'quick_input.no_model_matches')}
+                    : quickSuggestionKind === 'skill'
+                      ? 'skill.no_results'
+                      : 'quick_input.no_model_matches')}
               </div>
             )}
-            {quickSuggestions.map((suggestion, idx) => {
+            {quickSuggestionKind === 'skill' ? skillSuggestions.map((skill, idx) => {
+              const highlighted = idx === activeQuickSuggestionIndex;
+              return (
+                <div
+                  key={`${skill.name}:${skill.source ?? skill.sourceUrl ?? ''}`}
+                  role="option"
+                  aria-selected={highlighted}
+                  data-hl={highlighted ? 'true' : undefined}
+                  data-skill-name={skill.name}
+                  style={highlighted ? aliasPickerItemHighlightStyle : aliasPickerItemStyle}
+                  onMouseDown={(event) => event.preventDefault()}
+                  onClick={() => selectSkillSuggestion(skill)}
+                  title={skill.description || undefined}
+                >
+                  <code>{buildAgentSkillMarker(skill)}</code>
+                  <span style={aliasPickerDimStyle}>{agentSkillSourceLabel(skill)}</span>
+                  {skill.description ? <span style={aliasPickerDimStyle}>{skill.description}</span> : null}
+                </div>
+              );
+            }) : quickSuggestions.map((suggestion, idx) => {
               const highlighted = idx === activeQuickSuggestionIndex;
               return (
                 <div
@@ -7425,6 +7599,35 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
           );
         })()}
 
+        {taskPairPickerOpen && filteredTaskPairReferences.length > 0 && (
+          <div ref={taskPairPickerRef} class="controls-task-pair-picker" role="listbox" aria-label={t('task_pair.reference_picker')} style={aliasPickerContainerStyle}>
+            <div style={aliasPickerGroupLabelStyle}>{t('task_pair.reference_picker')} {taskPairQuery ? `— "${taskPairQuery}"` : ''}</div>
+            {filteredTaskPairReferences.map((task, idx) => {
+              const highlighted = idx === activeTaskPairIndex;
+              return (
+                <div
+                  key={task.taskId}
+                  role="option"
+                  aria-selected={highlighted ? 'true' : 'false'}
+                  data-task-pair-title={task.title}
+                  style={highlighted ? aliasPickerItemHighlightStyle : aliasPickerItemStyle}
+                  onMouseDown={(event) => {
+                    event.preventDefault();
+                    setTaskPairPickerOpen(false);
+                    setTaskPairQuery('');
+                    taskPairJustClosedRef.current = true;
+                    setTimeout(() => { taskPairJustClosedRef.current = false; }, 150);
+                    insertTaskPairReference(task.title);
+                  }}
+                  onMouseEnter={() => setTaskPairHighlightIdx(idx)}
+                >
+                  <span style={{ fontWeight: 500, color: '#e2e8f0' }}>{task.title}</span>
+                </div>
+              );
+            })}
+          </div>
+        )}
+
         {/*
           contenteditable div — iOS does NOT show the password/keychain autofill bar
           for contenteditable elements, unlike <input> or <textarea>.
@@ -7486,9 +7689,17 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
               const suppressQuickPhrase = quickPhraseInputSuppressRef.current;
               quickPhraseInputSuppressRef.current = false;
 
+              const skillTrigger = inputIsComposing ? null : matchInlineSkillTrigger(text);
               const modelTrigger = inputIsComposing ? null : matchModelCommandTrigger(text);
               const slashTrigger = inputIsComposing ? null : matchSlashCommandTrigger(text);
-              if (modelTrigger !== null) {
+              const hasSkillSuggestions = skillTrigger !== null
+                && agentSkills.some((skill) => !skillTrigger || [skill.name, skill.description, skill.source, skill.sourceUrl]
+                  .some((value) => value?.toLocaleLowerCase().includes(skillTrigger.toLocaleLowerCase())));
+              if (skillTrigger !== null && hasSkillSuggestions) {
+                setQuickSuggestionKind('skill');
+                setQuickSuggestionQuery(skillTrigger);
+                setQuickSuggestionHighlightIdx(0);
+              } else if (modelTrigger !== null) {
                 setQuickSuggestionKind('model');
                 setQuickSuggestionQuery(modelTrigger);
                 setQuickSuggestionHighlightIdx(0);
@@ -7599,6 +7810,19 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
               } else if (machinePickerOpen) {
                 setMachinePickerOpen(false);
                 setMachineQuery('');
+              }
+
+              const taskPairTrigger = inputIsComposing ? null : matchTaskPairReferenceTrigger(text);
+              const taskPairMatches = taskPairTrigger === null
+                ? []
+                : filterTaskPairReferences(taskPairReferences, taskPairTrigger);
+              if (taskPairTrigger !== null && taskPairMatches.length > 0) {
+                setTaskPairQuery(taskPairTrigger);
+                setTaskPairHighlightIdx(0);
+                setTaskPairPickerOpen(true);
+              } else if (taskPairPickerOpen) {
+                setTaskPairPickerOpen(false);
+                setTaskPairQuery('');
               }
             }}
             onKeyDown={handleKeyDown}

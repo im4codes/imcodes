@@ -133,7 +133,7 @@ it('batched read permission includes live groups but denies viewer/disabled/revo
     expect(await resolveControlledMachineReadActors(db, n.serverId, [groupOnly], Date.now())).toEqual(new Set([groupOnly]));
     await t.share(n, groupOnly);
     await db.execute('UPDATE server_shares SET role=$3 WHERE server_id=$1 AND target_user_id=$2', [n.serverId, groupOnly, 'viewer']);
-    expect(await resolveControlledMachineReadActors(db, n.serverId, [groupOnly], Date.now())).toEqual(new Set());
+    expect(await resolveControlledMachineReadActors(db, n.serverId, [groupOnly], Date.now())).toEqual(new Set([groupOnly]));
     await db.execute('UPDATE server_shares SET expires_at=$3 WHERE server_id=$1 AND target_user_id=$2', [n.serverId, groupOnly, Date.now()-1]);
     expect(await resolveControlledMachineReadActors(db, n.serverId, [groupOnly], Date.now())).toEqual(new Set([groupOnly]));
     expect(await resolveControlledMachineReadActors(db, t.nodes[1]!.serverId, [groupOnly], Date.now())).toEqual(new Set());

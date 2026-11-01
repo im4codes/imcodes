@@ -35,12 +35,18 @@ class FakeQualityLadder final : public common::QualityLadder {
   common::QualitySelection Select(
       const common::QualityTarget& target) const noexcept override {
     return common::QualitySelection{
-        "bounded",
+        target.preference.max_height == 2160 ? "ultra" : "bounded",
         target.source_pixels,
         30,
         target.bitrate_bps,
+        0,
+        !reject_quality &&
+            (target.preference.minimum_bitrate_bps == 0 ||
+             target.bitrate_bps >= target.preference.minimum_bitrate_bps),
     };
   }
+
+  bool reject_quality = false;
 };
 
 class FakeTransportAdapter final : public common::TransportSessionAdapter {
@@ -408,6 +414,27 @@ int main() {
                 adapter.local_ice[0].candidate == "candidate:l1" &&
                 adapter.local_ice[1].candidate == "candidate:l2",
             "local ICE flushes FIFO through the signaling adapter");
+
+    // A later offer is a fresh ICE generation on the same logical route. Its
+    // candidate budget and pending queues must not inherit the prior offer's
+    // state, or a healthy shared viewer eventually trips protocol_error after
+    // enough bounded restarts.
+    Require(core.BeginIceRestart(Stamp()) &&
+                core.pending_remote_ice() == 0 &&
+                core.pending_local_ice() == 0,
+            "ICE restart clears the superseded generation queues");
+    Require(core.AddRemoteIceCandidate(Authority().identity,
+                                       Candidate("r3")) &&
+                core.AddRemoteIceCandidate(Authority().identity,
+                                           Candidate("r4")) &&
+                core.OnLocalIceCandidate(Stamp(), Candidate("l3")) &&
+                core.OnLocalIceCandidate(Stamp(), Candidate("l4")),
+            "ICE restart receives a fresh bounded candidate budget");
+    Require(core.SetRemoteDescriptionReady(Stamp()) &&
+                core.SetLocalIceEmissionReady(Stamp()) &&
+                !core.terminal() && adapter.remote_ice.size() == 4 &&
+                adapter.local_ice.size() == 4,
+            "fresh ICE generation remains live at the same per-generation bound");
   }
 
   {
@@ -719,6 +746,91 @@ int main() {
                 adapter.published_diagnostics.back().path ==
                     common::TransportPath::kRelay,
             "transport diagnostics publish bounded route state");
+  }
+
+  {
+    FakeTransportAdapter adapter_a;
+    FakeTransportAdapter adapter_b;
+    common::TransportSessionCore core_a(adapter_a, ladder, Limits());
+    common::TransportSessionCore core_b(adapter_b, ladder, Limits());
+    common::RouteAuthority authority_a = Authority();
+    authority_a.identity.request_id = "request_a_1234567890";
+    authority_a.identity.session_id = "session_a_1234567890";
+    authority_a.identity.route_generation = 101;
+    common::RouteAuthority authority_b = Authority();
+    authority_b.identity.request_id = "request_b_1234567890";
+    authority_b.identity.session_id = "session_b_1234567890";
+    authority_b.identity.route_generation = 202;
+    const common::TransportCallbackStamp stamp_a{41, 101};
+    const common::TransportCallbackStamp stamp_b{41, 202};
+    const common::QualityTarget baseline{4'000'000, {1920, 1080}};
+    Require(core_a.Start(authority_a, At(0, 0)) &&
+                core_b.Start(authority_b, At(0, 0)) &&
+                core_a.UpdateQualityTarget(stamp_a, baseline) &&
+                core_b.UpdateQualityTarget(stamp_b, baseline),
+            "two independent quality routes start with baselines");
+    const auto b_before = core_b.diagnostics().quality;
+    adapter_a.quality_result = false;
+    imcodes::rd::QualityPreference request_a;
+    request_a.max_height = 2160;
+    Require(core_a.SetQualityPreference(request_a) && !core_a.terminal() &&
+                adapter_a.close_transport_count == 0,
+            "route A defers a transient quality refusal without closing");
+    Require(!core_b.terminal() && adapter_b.close_transport_count == 0 &&
+                core_b.diagnostics().quality.has_value() && b_before.has_value() &&
+                core_b.diagnostics().quality->preset_id == b_before->preset_id &&
+                core_b.diagnostics().quality->bitrate_bps == b_before->bitrate_bps,
+            "route B quality and peer remain untouched by route A refusal");
+    adapter_a.quality_result = true;
+    Require(core_a.UpdateQualityTarget(stamp_a, baseline) &&
+                core_a.diagnostics().quality->preset_id == "ultra" &&
+                core_b.diagnostics().quality->preset_id == b_before->preset_id,
+            "route A retries while route B keeps its prior selection");
+  }
+
+  {
+    FakeTransportAdapter adapter;
+    common::TransportSessionCore core(adapter, ladder, Limits());
+    Require(core.Start(Authority(), At(0, 0)),
+            "quality refusal transport starts");
+    Require(core.UpdateQualityTarget(
+                Stamp(), common::QualityTarget{4'000'000, {1920, 1080}}),
+            "quality refusal fixture has an accepted baseline");
+    adapter.quality_result = false;
+    Require(!core.UpdateQualityTarget(
+                Stamp(), common::QualityTarget{5'000'000, {1920, 1080}}) &&
+                !core.terminal() && adapter.close_transport_count == 0,
+            "transient encoder refusal keeps the peer alive");
+    adapter.quality_result = true;
+    ladder.reject_quality = true;
+    imcodes::rd::QualityPreference impossible;
+    impossible.max_height = 2160;
+    impossible.max_bitrate_bps = 30'000'000;
+    Require(!core.SetQualityPreference(impossible) && !core.terminal() &&
+                adapter.close_transport_count == 0,
+            "an impossible quality floor is rejected without reconnecting");
+  }
+
+  {
+    FakeTransportAdapter adapter;
+    common::TransportSessionCore core(adapter, ladder, Limits());
+    Require(core.Start(Authority(), At(0, 0)),
+            "direct quality preference fixture starts");
+    Require(core.OnTransportPath(Stamp(), common::TransportPath::kDirect),
+            "direct quality preference fixture proves its path");
+    ladder.reject_quality = false;
+    const bool low_target = core.UpdateQualityTarget(
+        Stamp(), common::QualityTarget{4'000'000, {1920, 1080}});
+    Require(low_target,
+            "direct quality preference fixture accepts a low estimator target");
+    imcodes::rd::QualityPreference preference;
+    preference.max_height = 1440;
+    preference.max_bitrate_bps = 10'000'000;
+    Require(core.SetQualityPreference(preference),
+            "direct quality preference probes its floor instead of rejecting the live peer");
+    Require(!core.terminal() && adapter.qualities.size() == 2 &&
+                adapter.qualities.back().bitrate_bps >= preference.max_bitrate_bps,
+            "direct quality preference keeps the live peer and applies the requested floor");
   }
 
   {

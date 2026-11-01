@@ -2,10 +2,9 @@ import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypt
 import type WebSocket from 'ws';
 import type { Database } from '../db/client.js';
 import { machineGroupInvalidationReady, machineGroupInvalidationRevision } from '../services/machine-group-invalidation.js';
-import { evaluateMachineAction, MACHINE_ACTION } from '../../../shared/machine-access-policy.js';
 import {
   canOperateControlledMachine,
-  resolveRemoteDesktopHostOperatorAccess,
+  resolveRemoteDesktopHostAccess,
   type ControlledMachineAccessRow,
 } from '../share/machine-access.js';
 import {
@@ -365,21 +364,11 @@ export class RemoteDesktopRouter {
       : REMOTE_DESKTOP_ACCESS_MODE.CONTROL;
   }
 
-  /**
-   * The highest mode an account's ACCESS allows. Remote-desktop CONTROL injects keyboard and mouse input, which can launch anything as
-   * the signed-in user, so it is GUI_INPUT in the one rule table (shared/machine-access-policy.ts): the device owner, or a share
-   * participant holding the owner's execute grant. Everyone else who can operate the device (a group member, a participant without the
-   * grant) may only watch. The exec switch is judged separately by `accessFault`, so it is assumed on here.
-   */
+  /** Explicit viewers are read-only; owner and participants are controllers. */
   private accessModeCeiling(access: ControlledMachineAccessRow): typeof REMOTE_DESKTOP_ACCESS_MODE[keyof typeof REMOTE_DESKTOP_ACCESS_MODE] {
-    const decision = evaluateMachineAction({
-      accessRole: access.access_role,
-      accessSource: access.access_source,
-      execGranted: access.exec_granted === true,
-      execEnabled: true,
-      participantTurn: false,
-    }, MACHINE_ACTION.GUI_INPUT);
-    return decision.allowed ? REMOTE_DESKTOP_ACCESS_MODE.CONTROL : REMOTE_DESKTOP_ACCESS_MODE.VIEW;
+    return access.access_role === 'viewer'
+      ? REMOTE_DESKTOP_ACCESS_MODE.VIEW
+      : REMOTE_DESKTOP_ACCESS_MODE.CONTROL;
   }
 
   handlesType(type: unknown): boolean {
@@ -1256,6 +1245,9 @@ export class RemoteDesktopRouter {
       authorizedAt + REMOTE_DESKTOP_LIMITS.LEASE_DURATION_MS,
       expiresAt,
     );
+    const initialMode = accessModeCeiling === REMOTE_DESKTOP_ACCESS_MODE.VIEW
+      ? REMOTE_DESKTOP_ACCESS_MODE.VIEW
+      : this.admittedMode();
     const route = this.createRoute({
       requestId: start.requestId,
       sessionId,
@@ -1286,8 +1278,12 @@ export class RemoteDesktopRouter {
       // Accessibility is not granted -- refuses a Control PREPARE outright, so
       // admitting it as Control failed every attempt with worker_failed and
       // the browser retried forever. It is admitted to View instead.
-      mode: accessModeCeiling === REMOTE_DESKTOP_ACCESS_MODE.VIEW ? REMOTE_DESKTOP_ACCESS_MODE.VIEW : this.admittedMode(),
-      inputEpoch: 1,
+      mode: initialMode,
+      // A read-only route has no input authority yet.  Windows PREPARE
+      // validates this initial fence as view+0; control routes start at the
+      // first control epoch.  Sending view+1 makes the worker reject an
+      // otherwise authorized shared viewer as protocol_error.
+      inputEpoch: initialMode === REMOTE_DESKTOP_ACCESS_MODE.VIEW ? 0 : 1,
       reconnectAttempt: start.reconnectAttempt ?? 0,
       registryIdentity,
     });
@@ -1433,6 +1429,9 @@ export class RemoteDesktopRouter {
       return;
     }
     const capability = this.deriveCapability(start.requestId, pending.sessionId);
+    const initialMode = pending.actor.modeCeiling === REMOTE_DESKTOP_ACCESS_MODE.VIEW
+      ? REMOTE_DESKTOP_ACCESS_MODE.VIEW
+      : this.admittedMode();
     const route = this.createRoute({
       requestId: start.requestId,
       sessionId: pending.sessionId,
@@ -1444,8 +1443,10 @@ export class RemoteDesktopRouter {
       createdAt: now,
       expiresAt,
       leaseExpiresAt: Math.min(now + REMOTE_DESKTOP_LIMITS.LEASE_DURATION_MS, expiresAt),
-      mode: pending.actor.modeCeiling,
-      inputEpoch: 1,
+      mode: initialMode,
+      // Keep the native PREPARE contract aligned for attended/group viewers:
+      // view starts at epoch zero, while control starts with an owned epoch.
+      inputEpoch: initialMode === REMOTE_DESKTOP_ACCESS_MODE.VIEW ? 0 : 1,
       reconnectAttempt: start.reconnectAttempt ?? 0,
       registryIdentity: pending.registryIdentity,
     });
@@ -1511,7 +1512,13 @@ export class RemoteDesktopRouter {
     access: ControlledMachineAccessRow | null,
     now: number,
   ): RemoteDesktopAccessFault | null {
-    if (!access || !canOperateControlledMachine(access.access_role)) return 'denied';
+    if (!access) return 'denied';
+    // Controlled nodes expose a read-only remote-desktop surface to an
+    // explicit Viewer share. The browser WS is quarantined to the
+    // remote-desktop namespace, and accessModeCeiling() keeps input disabled.
+    // Full daemons retain the older operator-only account path.
+    const controlledNode = access.node_role === NODE_ROLE.CONTROLLED;
+    if (!controlledNode && !canOperateControlledMachine(access.access_role)) return 'denied';
     // A normal (FULL) daemon serves remote control from the same native worker,
     // but the controlled-node columns do not describe it: `exec_enabled` is the
     // controlled-node exec switch (and is false on daemon rows predating its
@@ -1520,7 +1527,6 @@ export class RemoteDesktopRouter {
     // daemon those three facts are instead proven live — it advertises the
     // remote-desktop capability only on win32 with the worker installed, which
     // `daemonSupportsRemoteDesktop()` checks before and after this admission.
-    const controlledNode = access.node_role === NODE_ROLE.CONTROLLED;
     if (access.access_role !== 'owner'
       && access.access_expires_at !== null
       && (typeof access.access_expires_at !== 'number'
@@ -1659,6 +1665,16 @@ export class RemoteDesktopRouter {
         return;
       }
       const iceRestartAttempt = route.offerCount;
+      // ICE candidate budgets are per offer/generation, not per logical
+      // viewer route. Preserve candidates that may have gathered before the
+      // initial offer, but reset both directions before each later offer;
+      // otherwise a healthy shared viewer that recovers through enough ICE
+      // restarts is terminated as protocol_error despite each generation
+      // staying within the bounded flood limit.
+      if (iceRestartAttempt > 0) {
+        route.browserIceCandidates = 0;
+        route.daemonIceCandidates = 0;
+      }
       route.offerCount++;
       if (iceRestartAttempt > 0) {
         await this.renewLease(route);
@@ -1808,6 +1824,14 @@ export class RemoteDesktopRouter {
         this.failRoute(route, terminalReason, true);
         return;
       }
+      // A live session is bound to the role that admitted it. A participant
+      // downgraded to Viewer must reconnect to receive a read-only session;
+      // silently mutating an existing route would retain stale authority and
+      // makes revocation/expiry indistinguishable from a harmless mode change.
+      if (route.accessRole !== undefined && route.accessRole !== access!.access_role) {
+        this.failRoute(route, REMOTE_DESKTOP_TERMINAL_REASON.AUTHORITY_REVOKED, true);
+        return;
+      }
       // The execute grant can be revoked (or the role downgraded) while the route lives: CONTROL ends at this revalidation, exactly as
       // the exec switch ends the route.
       const ceiling = this.accessModeCeiling(access!);
@@ -1884,7 +1908,7 @@ export class RemoteDesktopRouter {
     for (let attempt = 0; attempt < 3; attempt++) {
       const epoch = this.authorizationEpoch;
       const before = await machineGroupInvalidationRevision(db);
-      const access = await (this.hooks.resolveAccess ?? resolveRemoteDesktopHostOperatorAccess)(db, userId, this.hooks.serverId(), now);
+      const access = await (this.hooks.resolveAccess ?? resolveRemoteDesktopHostAccess)(db, userId, this.hooks.serverId(), now);
       const revision = await machineGroupInvalidationRevision(db);
       if (access?.node_role === NODE_ROLE.CONTROLLED && !machineGroupInvalidationReady(db)) {
         return { access: null, epoch, revision };

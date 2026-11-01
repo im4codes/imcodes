@@ -190,9 +190,9 @@ describe('listMachines client — bounded strict, typed control-plane failure', 
   }));
   const list200 = (machines: unknown) => (async () => new Response(JSON.stringify({ machines }), { status: 200 })) as unknown as typeof fetch;
   const opts = { serverUrl: base.serverUrl, sourceServerId: 's1', sourceToken: 't1' };
-  it('excludes offline + exec-disabled by default; forwards canonical os', async () => {
+  it('excludes offline but keeps exec-disabled machines visible; forwards canonical os', async () => {
     const r = await listMachines({ ...opts, fetchImpl: list200(items) });
-    expect(r.map((m) => m.serverId)).toEqual(['a']); expect(r[0]!.os).toBe('linux');
+    expect(r.map((m) => m.serverId)).toEqual(['a', 'c']); expect(r[0]!.os).toBe('linux');
   });
   it('includes all when includeOffline is set', async () => {
     expect((await listMachines({ ...opts, includeOffline: true, fetchImpl: list200(items) })).length).toBe(3);

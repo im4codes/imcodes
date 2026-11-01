@@ -11,13 +11,14 @@ import {
 import type { SessionRecord } from '../store/session-store.js';
 import { incrementCounter } from '../util/metrics.js';
 import { redactSensitiveText } from '../../shared/redact-secrets.js';
+import { isClaudeCodeSdkAgentType } from '../../shared/agent-types.js';
 
 export function shouldCreateCrossVendorHandoff(record: Pick<SessionRecord, 'agentType' | 'runtimeType'>, targetAgentType: string, targetRuntimeType: 'process' | 'transport', fresh: boolean): boolean {
   return !fresh && (record.agentType !== targetAgentType || (record.runtimeType ?? 'process') !== targetRuntimeType);
 }
 
 export function sourceConversationKey(record: Pick<SessionRecord, 'agentType' | 'ccSessionId' | 'codexSessionId' | 'providerResumeId' | 'providerSessionId'>): string | undefined {
-  if (record.agentType === 'claude-code-sdk') return record.ccSessionId;
+  if (isClaudeCodeSdkAgentType(record.agentType)) return record.ccSessionId;
   if (record.agentType === 'codex-sdk') return record.codexSessionId;
   return record.providerResumeId ?? record.providerSessionId ?? record.ccSessionId ?? record.codexSessionId;
 }

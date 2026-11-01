@@ -1,4 +1,7 @@
 {
+  "task_pair": {
+    "reference_picker": "Tareas de pares"
+  },
   "alias": {
     "feature_label": "Alias",
     "category": "Alias",
@@ -33,6 +36,12 @@
       "list_unavailable": "Los alias aún se están cargando o no se pudieron cargar. Inténtalo de nuevo en un momento.",
       "generic": "Algo salió mal. Inténtalo de nuevo."
     }
+  },
+  "skill": {
+    "category": "Habilidades",
+    "category_desc": "Insertar una referencia de habilidad",
+    "empty": "No hay habilidades disponibles",
+    "no_results": "Ninguna habilidad coincide con la búsqueda"
   },
   "machine": {
     "feature_label": "Máquina",
@@ -685,7 +694,7 @@
     "stop_appended_queue": "Los mensajes en cola se añadieron; la sesión sigue en ejecución.",
     "send_placeholder": "Enviar a {{name}}…",
     "send_placeholder_desktop_upload": "{{placeholder}} Admite carga rápida pegando o arrastrando varios archivos",
-    "send_placeholder_desktop_shortcuts": "{{placeholder}}\n/ comandos · # frases · @ archivos/agentes · ; alias · ^ nodos · pega o arrastra archivos",
+    "send_placeholder_desktop_shortcuts": "{{placeholder}}\n/ comandos · # frases · @ archivos/agentes · ; alias · ^ nodos · % tareas · pega o arrastra archivos",
     "composer_target_label": "Enviando a",
     "composer_target_aria": "Destino del mensaje: {{name}}",
     "actions": "Acciones de sesión",
@@ -797,6 +806,7 @@
       "openclaw": "OpenClaw",
       "qwen": "Qwen Code",
       "claude_code_sdk": "Claude Code SDK",
+      "cc_cli_sdk": "CC CLI SDK",
       "codex_sdk": "Codex SDK",
       "qoder_sdk": "Qoder SDK",
       "claude_code_cli": "Claude Code CLI",
@@ -1067,6 +1077,8 @@
     "delete_error": "No se pudo eliminar el servidor: {{error}}",
     "upgrade_daemon": "↑ Actualizar Daemon",
     "upgrade_all": "↑ Actualizar Todos",
+    "pin": "📌 Fijar servidor",
+    "unpin": "Desfijar servidor",
     "delete": "✕ Eliminar servidor",
     "upgrade_sent": "Comando de actualización enviado a \"{{name}}\". El daemon instalará la última versión y se reiniciará.",
     "upgrade_failed": "Error al enviar el comando de actualización. El daemon puede estar desconectado.",
@@ -4172,6 +4184,7 @@
     "zoom_out": "Alejar",
     "zoom_reset": "Restablecer zoom",
     "touch_hint": "Toca la pantalla para hacer clic ahí, o arrastra el anillo para mover el cursor. Mantén pulsado el anillo y arrastra para arrastrar; mantén y suelta para el clic derecho",
+    "touch_hint_dismiss": "Entendido",
     "touch_right_click": "Clic derecho en la última posición táctil",
     "touch_ring": "Anillo del cursor: arrastra para mover, mantén pulsado para el clic derecho",
     "mobile_input_mode": "Modo de entrada móvil",
@@ -4316,6 +4329,7 @@
       "mode_change_failed": "El nodo lo rechazó: Windows no aplicó esa resolución.",
       "scale_change_failed": "El nodo lo rechazó: Windows no aplicó esa escala.",
       "capture_failed": "El nodo lo rechazó: no se pudo mover la captura a esa pantalla.",
+      "quality_unavailable": "El nodo no pudo aplicar esa calidad sin interrumpir la transmisión activa.",
       "unlock_unavailable": "El nodo lo rechazó: no guarda ninguna clave de inicio de sesión, o no hay nada que desbloquear ahora mismo.",
       "paste_unavailable": "Portapapeles remoto no disponible; el texto se escribió en su lugar.",
       "paste_too_large": "El texto es demasiado grande para un único pegado del portapapeles; se escribió en su lugar."

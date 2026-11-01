@@ -7815,9 +7815,18 @@ ${PREFERENCE_CONTEXT_END}`;
     expect(runtime.sending).toBe(true);
     expect(runtime.getDiagnosticSnapshot().busyReasons).toContain('open_tool_call');
 
-    // After silence well past the tool-aware floor (>15min), a genuinely orphaned
+    // Below the 60-minute tool-aware floor, a genuinely orphaned
+    // tool is still protected from recovery.
+    expect(runtime.recoverSilentActiveTurn({
+      reason: 'health-poll-stale-active-turn',
+      nowMs: 1_000 + 59 * 60_000,
+      staleMs: 59 * 60_000,
+    })).toBe(false);
+    expect(runtime.sending).toBe(true);
+
+    // After silence past the 60-minute tool-aware floor, a genuinely orphaned
     // tool is terminalized and queued work drains.
-    const longStaleMs = 16 * 60_000;
+    const longStaleMs = 60 * 60_000;
     const beforeDrainSendCount = (mock.provider.send as ReturnType<typeof vi.fn>).mock.calls.length;
     expect(runtime.recoverSilentActiveTurn({
       reason: 'health-poll-stale-active-turn',

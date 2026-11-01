@@ -280,6 +280,25 @@ bool TransportSessionCore::AddRemoteIceCandidate(
   return true;
 }
 
+bool TransportSessionCore::BeginIceRestart(
+    const TransportCallbackStamp& callback_stamp) {
+  if (!CallbackMatches(callback_stamp)) return false;
+  // The first offer can race with early local/remote candidate delivery while
+  // the remote description is still absent. Preserve that initial queue; only
+  // a route that already installed a description is crossing into a new ICE
+  // generation.
+  if (!remote_description_ready_) return true;
+  // A new offer establishes a new candidate generation. Do not carry either
+  // the flood budget or queued candidates from the superseded generation into
+  // it; the route identity stays the same and continues to fence callbacks.
+  accepted_remote_ice_ = 0;
+  accepted_local_ice_ = 0;
+  ClearCandidates();
+  remote_description_ready_ = false;
+  PublishDiagnostics();
+  return true;
+}
+
 bool TransportSessionCore::SetRemoteDescriptionReady(
     const TransportCallbackStamp& callback_stamp) {
   if (!CallbackMatches(callback_stamp)) return false;
@@ -430,7 +449,8 @@ bool TransportSessionCore::QualitySelectionIsValid(
   return !selection.preset_id.empty() && selection.preset_id.size() <= 64 &&
          selection.encoded_pixels.IsValid() && selection.frame_rate > 0 &&
          selection.frame_rate <= 240 && selection.bitrate_bps > 0 &&
-         selection.bitrate_bps <= limits_.maximum_quality_target_bps;
+         selection.bitrate_bps <= limits_.maximum_quality_target_bps &&
+         selection.meets_preference_floor;
 }
 
 bool TransportSessionCore::UpdateQualityTarget(
@@ -444,9 +464,26 @@ bool TransportSessionCore::UpdateQualityTarget(
   return ApplyQualityTarget(target);
 }
 
-bool TransportSessionCore::ApplyQualityTarget(const QualityTarget& target) {
+bool TransportSessionCore::ApplyQualityTarget(const QualityTarget& target,
+                                              bool* deferred) {
+  if (deferred != nullptr) *deferred = false;
   QualityTarget effective = target;
   effective.preference = viewer_preference_;
+  if (effective.preference.minimum_bitrate_bps == 0) {
+    effective.preference.minimum_bitrate_bps =
+        viewer_preference_.max_bitrate_bps;
+  }
+  // A direct peer (or a relay without an explicit operator ceiling) can probe
+  // up to the viewer's requested floor even when congestion feedback has
+  // temporarily driven the current target lower. This keeps a quality change
+  // on the existing peer and lets later target updates retry after a transient
+  // encoder reconfiguration refusal.
+  const bool canProbeToPreferenceFloor =
+      path_ == TransportPath::kDirect || authority_.relay_bitrate_cap_bps == 0;
+  if (canProbeToPreferenceFloor &&
+      effective.preference.minimum_bitrate_bps > effective.bitrate_bps) {
+    effective.bitrate_bps = effective.preference.minimum_bitrate_bps;
+  }
   // Until ICE proves the route direct, treat it as relayed: the operator's
   // relay ceiling is exactly what an unproven route must not exceed.
   effective.preference.max_bitrate_bps = imcodes::rd::EffectiveBitrateCap(
@@ -461,11 +498,18 @@ bool TransportSessionCore::ApplyQualityTarget(const QualityTarget& target) {
           imcodes::rd::ViewerVideoBitrateCeiling(viewer_preference_))
           .max_bps;
   if (!QualitySelectionIsValid(selection)) {
-    Terminate(TransportTerminalReason::kProtocolViolation);
+    // A viewer preference can be impossible under the current relay or
+    // aggregate cap. Reject that preference without tearing down the live
+    // peer; the caller reports a typed control rejection and keeps the last
+    // accepted quality. The same rule covers a transient encoder refusal.
     return false;
   }
   if (!adapter_.ApplyQuality(selection)) {
-    Terminate(TransportTerminalReason::kAdapterFailure);
+    // Reconfiguring an encoder is advisory and may fail transiently while a
+    // hardware session is rebuilding. A quality switch must never become a
+    // peer failure; retain the last applied selection and let a later target
+    // retry on the same route.
+    if (deferred != nullptr) *deferred = true;
     return false;
   }
   quality_ = std::move(selection);
@@ -476,9 +520,19 @@ bool TransportSessionCore::ApplyQualityTarget(const QualityTarget& target) {
 bool TransportSessionCore::SetQualityPreference(
     const imcodes::rd::QualityPreference& preference) {
   if (!started_ || terminal_) return false;
-  viewer_preference_ = preference;
+  const imcodes::rd::QualityPreference previous = viewer_preference_;
+  viewer_preference_ = imcodes::rd::NormalizeQualityPreference(preference);
   if (!last_quality_target_) return true;
-  return ApplyQualityTarget(*last_quality_target_);
+  bool deferred = false;
+  if (ApplyQualityTarget(*last_quality_target_, &deferred)) return true;
+  // A live encoder can refuse one reconfiguration while rebuilding hardware.
+  // Keep the new preference and report receipt; the next estimator update
+  // retries on the same peer instead of surfacing quality_unavailable.
+  if (deferred) return true;
+  // Keep the last known-good preference as well as the last known-good
+  // selection. A rejected request must not poison future congestion updates.
+  viewer_preference_ = previous;
+  return false;
 }
 
 bool TransportSessionCore::RecordActivity(

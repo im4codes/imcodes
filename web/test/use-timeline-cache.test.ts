@@ -21,6 +21,7 @@ import {
   __getTimelineCacheForTests,
   __getTimelineCacheKeysForTests,
   __getTimelineSnapshotBookkeepingKeysForTests,
+  __mergeTimelineEventsForTests,
   __getSharedTimelineBaseForTests,
   __resetLocalHistoryPruneStateForTests,
   __resetTimelineCacheForTests,
@@ -130,8 +131,45 @@ describe('useTimeline window-isolated cache bounds', () => {
     expect(keys).toContain('server:b');
     expect(keys).toContain('server:c');
     expect(keys).toContain('server:d');
-    expect(__getTimelineCacheForTests('server:a')?.length).toBeLessThanOrEqual(2_061);
-    expect(__getTimelineCacheForTests('server:d')?.length).toBeLessThanOrEqual(2_061);
+    // Text and detail rows have independent bounded tails.  The cache keeps
+    // the 2,000-event detail window plus the 300-event text window and pin
+    // context, so tool bursts cannot evict conversation text.
+    expect(__getTimelineCacheForTests('server:a')?.length).toBeLessThanOrEqual(2_361);
+    expect(__getTimelineCacheForTests('server:d')?.length).toBeLessThanOrEqual(2_361);
+  });
+
+  it('keeps text visible when a 288-event tool burst shares the history window', () => {
+    const text: TimelineEvent = {
+      eventId: 'text-before-tools',
+      sessionId: 'mixed',
+      ts: 1,
+      epoch: 1,
+      seq: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'assistant.text',
+      payload: { text: 'conversation text' },
+    };
+    const tools = Array.from({ length: 288 }, (_, index) => ({
+      eventId: `tool-${index}`,
+      sessionId: 'mixed',
+      ts: index + 2,
+      epoch: 1,
+      seq: index + 2,
+      source: 'daemon' as const,
+      confidence: 'high' as const,
+      type: (index === 287 ? 'tool.call' : 'tool.result') as TimelineEvent['type'],
+      payload: {
+        toolCallId: `call-${index}`,
+        status: index === 287 ? 'running' : 'complete',
+        output: 'x'.repeat(1024),
+      },
+    } satisfies TimelineEvent));
+
+    const merged = __mergeTimelineEventsForTests(tools, [text], 300);
+    expect(merged.some((event) => event.eventId === text.eventId)).toBe(true);
+    expect(merged.filter((event) => event.type === 'tool.call' || event.type === 'tool.result')).toHaveLength(288);
+    expect(merged.find((event) => event.eventId === text.eventId)?.payload.text).toBe('conversation text');
   });
 
   it('keeps snapshot bookkeeping independent when peer-window count exceeds the old cap', () => {
@@ -213,6 +251,53 @@ describe('useTimeline window-isolated cache bounds', () => {
     expect(retained).toHaveLength(601);
     expect(retained?.[0]?.eventId).toBe(`${sessionName}-0`);
     expect(retained?.at(-1)?.eventId).toBe(`${sessionName}-live`);
+  });
+
+  it('keeps every expanded text row when the realtime merge uses the wide detail window', () => {
+    const sessionName = `deck_expanded_text_realtime_${Date.now()}`;
+    const history = makeEvents(sessionName, 600);
+    const live = {
+      eventId: `${sessionName}-live`,
+      sessionId: sessionName,
+      ts: 601,
+      epoch: 1,
+      seq: 601,
+      source: 'daemon' as const,
+      confidence: 'high' as const,
+      type: 'assistant.text' as const,
+      payload: { text: 'new live turn' },
+    } satisfies TimelineEvent;
+
+    // This is the direct counterexample for the P0 regression: a paged
+    // 600-row text window must not be reduced to MAX_TEXT_MEMORY_EVENTS (300)
+    // merely because one realtime row arrives.
+    const merged = __mergeTimelineEventsForTests(history, [live], 2000);
+    expect(merged).toHaveLength(601);
+    expect(merged[0]?.eventId).toBe(`${sessionName}-0`);
+    expect(merged.at(-1)?.eventId).toBe(`${sessionName}-live`);
+  });
+
+  it('keeps the text tail when expanded text and tool detail exceed one window budget', () => {
+    const sessionName = `deck_budgeted_text_priority_${Date.now()}`;
+    const text = makeEvents(sessionName, 2000);
+    const tools = Array.from({ length: 2000 }, (_, index) => ({
+      eventId: `${sessionName}-tool-${index}`,
+      sessionId: sessionName,
+      ts: 3000 + index,
+      epoch: 1,
+      seq: 3000 + index,
+      source: 'daemon' as const,
+      confidence: 'high' as const,
+      type: 'tool.result' as const,
+      payload: { output: `tool-${index}` },
+    } satisfies TimelineEvent));
+
+    const merged = __mergeTimelineEventsForTests(text, tools, 2000);
+    expect(merged).toHaveLength(2361);
+    expect(merged.filter((event) => event.type === 'assistant.text')).toHaveLength(2000);
+    expect(merged.filter((event) => event.type === 'tool.result')).toHaveLength(361);
+    expect(merged[0]?.eventId).toBe(`${sessionName}-0`);
+    expect(merged.at(-1)?.eventId).toBe(`${sessionName}-tool-1999`);
   });
 
   it('pushes cache updates to already-mounted hooks for the same session', async () => {

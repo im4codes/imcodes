@@ -45,12 +45,13 @@ void SizesNeverGrowAndStayEven() {
 }
 
 void FloorKeepsAPictureLegible() {
-  Require(rd::MaxEncodeSpeedLevel(2560, 1350) == rd::kEncodeMaxLevel, "5K-class output can go deep");
-  Require(rd::MaxEncodeSpeedLevel(1280, 720) == 2, "720p stops at 720x405... never below 640x360");
-  const int deepest = rd::MaxEncodeSpeedLevel(1280, 720);
-  const rd::EncodeSize size = rd::ApplyEncodeSpeedLevel(1280, 720, deepest);
+  Require(rd::MaxEncodeSpeedLevel(2560, 1440) == 1, "1440p output may step once to 1080p");
+  Require(rd::MaxEncodeSpeedLevel(2560, 1350) == 0, "non-16:9 output cannot step below 1080p");
+  Require(rd::MaxEncodeSpeedLevel(1280, 720) == 0, "720p source is capability-limited and never downscaled");
+  const int deepest = rd::MaxEncodeSpeedLevel(2560, 1440);
+  const rd::EncodeSize size = rd::ApplyEncodeSpeedLevel(2560, 1440, deepest);
   Require(size.width >= rd::kEncodeMinWidth && size.height >= rd::kEncodeMinHeight, "floor respected");
-  Require(rd::MaxEncodeSpeedLevel(640, 360) == 0, "already at the floor: no levels");
+  Require(rd::MaxEncodeSpeedLevel(640, 360) == 0, "small source has no downscale levels");
 }
 
 void FastEncoderNeverChangesLevel() {

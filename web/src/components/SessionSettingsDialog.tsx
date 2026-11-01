@@ -10,7 +10,7 @@ import { useSupervisorDefaults } from '../hooks/useSupervisorDefaults.js';
 import { supportsDynamicTransportModels, useTransportModels } from '../hooks/useTransportModels.js';
 import type { WsClient } from '../ws-client.js';
 import { DAEMON_MSG } from '@shared/daemon-events.js';
-import { SESSION_AGENT_TYPES, TRANSPORT_SESSION_AGENT_TYPES, getSessionRuntimeType, type SessionAgentType } from '@shared/agent-types.js';
+import { CLAUDE_CODE_CLI_SDK_AGENT_TYPE, SESSION_AGENT_TYPES, TRANSPORT_SESSION_AGENT_TYPES, getSessionRuntimeType, type SessionAgentType } from '@shared/agent-types.js';
 import { CODEBUDDY_PROVIDER_IDS } from '@shared/codebuddy.js';
 import { HERMES_AGENT_PROVIDER_ID } from '@shared/hermes-agent.js';
 import { AGY_SDK_PROVIDER_ID } from '@shared/agy-agent.js';
@@ -879,7 +879,7 @@ export function SessionSettingsDialog({
       return;
     }
     if (agentType === type) return;
-    const newDefault = agentType === 'claude-code' || agentType === 'claude-code-sdk'
+    const newDefault = agentType === 'claude-code' || agentType === 'claude-code-sdk' || agentType === CLAUDE_CODE_CLI_SDK_AGENT_TYPE
       ? (CLAUDE_CODE_MODEL_IDS[0] ?? '')
       : agentType === 'codex' || agentType === 'codex-sdk'
         ? (CODEX_MODEL_IDS[0] ?? '')
@@ -943,7 +943,7 @@ export function SessionSettingsDialog({
         sessionDynamicModels.models.map((entry) => entry.id),
       );
     }
-    const staticOptions = agentType === 'claude-code' || agentType === 'claude-code-sdk'
+    const staticOptions = agentType === 'claude-code' || agentType === 'claude-code-sdk' || agentType === CLAUDE_CODE_CLI_SDK_AGENT_TYPE
       ? [...CLAUDE_CODE_MODEL_IDS]
       : agentType === 'codex' || agentType === 'codex-sdk'
         ? [...CODEX_MODEL_IDS]
@@ -1350,6 +1350,7 @@ export function SessionSettingsDialog({
   const renderTypeLabel = (value: string): string => {
     switch (value) {
       case 'claude-code-sdk': return t('session.agentType.claude_code_sdk');
+      case CLAUDE_CODE_CLI_SDK_AGENT_TYPE: return t('session.agentType.cc_cli_sdk');
       case 'claude-code': return t('session.agentType.claude_code_cli');
       case 'codex-sdk': return t('session.agentType.codex_sdk');
       case 'qoder-sdk': return t('session.agentType.qoder_sdk');

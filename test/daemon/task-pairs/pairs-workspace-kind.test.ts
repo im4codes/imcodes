@@ -420,7 +420,7 @@ describe('pair_workspace_gc (on-demand cleanup of ended pairs)', () => {
   });
 
   it('honours minAgeHours, only serves the project Brain, and a pair of another Brain is not listed', async () => {
-    const recent = await endedPair('dir', 'gc-recent', 'cancel');
+    const recent = await endedPair('dir', 'gc-recent', 'done');
     const tooRecent = await gc({ dryRun: false, minAgeHours: 24 });
     expect(entryOf(tooRecent, recent)).toMatchObject({ action: 'too_recent' });
     expect(existsSync(pair(recent).workspace!.path)).toBe(true);

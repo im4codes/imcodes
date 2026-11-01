@@ -1,4 +1,7 @@
 {
+  "task_pair": {
+    "reference_picker": "ペアタスク"
+  },
   "alias": {
     "feature_label": "エイリアス",
     "category": "エイリアス",
@@ -33,6 +36,12 @@
       "list_unavailable": "エイリアスを読み込み中か、読み込みに失敗しました。しばらくしてからもう一度お試しください。",
       "generic": "問題が発生しました。もう一度お試しください。"
     }
+  },
+  "skill": {
+    "category": "スキル",
+    "category_desc": "スキル参照を挿入",
+    "empty": "利用可能なスキルはありません",
+    "no_results": "検索に一致するスキルはありません"
   },
   "machine": {
     "feature_label": "マシン",
@@ -685,7 +694,7 @@
     "stop_appended_queue": "キューのメッセージを追加しました。セッションは実行中です。",
     "send_placeholder": "{{name}} へ送信…",
     "send_placeholder_desktop_upload": "{{placeholder}} 複数ファイルの貼り付け/ドラッグによる高速アップロードに対応",
-    "send_placeholder_desktop_shortcuts": "{{placeholder}}\n/ コマンド · # フレーズ · @ ファイル/Agent · ; エイリアス · ^ ノード · ファイルを貼り付け/ドラッグ",
+    "send_placeholder_desktop_shortcuts": "{{placeholder}}\n/ コマンド · # フレーズ · @ ファイル/Agent · ; エイリアス · ^ ノード · % タスク · ファイルを貼り付け/ドラッグ",
     "composer_target_label": "送信先",
     "composer_target_aria": "メッセージの送信先: {{name}}",
     "actions": "セッション操作",
@@ -797,6 +806,7 @@
       "openclaw": "OpenClaw",
       "qwen": "Qwen Code",
       "claude_code_sdk": "Claude Code SDK",
+      "cc_cli_sdk": "CC CLI SDK",
       "codex_sdk": "Codex SDK",
       "qoder_sdk": "Qoder SDK",
       "claude_code_cli": "Claude Code CLI",
@@ -1067,6 +1077,8 @@
     "delete_error": "サーバーを削除できませんでした：{{error}}",
     "upgrade_daemon": "↑ Daemonをアップグレード",
     "upgrade_all": "↑ 全デバイス更新",
+    "pin": "📌 サーバーを固定",
+    "unpin": "サーバーの固定を解除",
     "delete": "✕ サーバーを削除",
     "upgrade_sent": "「{{name}}」にアップグレードコマンドを送信しました。Daemonは最新バージョンをインストールして再起動します。",
     "upgrade_failed": "アップグレードコマンドの送信に失敗しました。Daemonがオフラインの可能性があります。",
@@ -4171,6 +4183,7 @@
     "zoom_out": "縮小",
     "zoom_reset": "ズームをリセット",
     "touch_hint": "画面をタップするとその位置でクリック、リングをドラッグするとカーソルが移動します。リングを長押ししてからドラッグするとドラッグ操作、長押しして離すと右クリックになります",
+    "touch_hint_dismiss": "了解",
     "touch_right_click": "最後に触れた位置で右クリック",
     "touch_ring": "カーソルリング:ドラッグで移動、長押しで右クリック",
     "mobile_input_mode": "モバイル入力モード",
@@ -4315,6 +4328,7 @@
       "mode_change_failed": "ノードが拒否しました: Windows がその解像度を適用できませんでした。",
       "scale_change_failed": "ノードが拒否しました: Windows がその拡大率を適用できませんでした。",
       "capture_failed": "ノードが拒否しました: 画面キャプチャをそのディスプレイに移せませんでした。",
+      "quality_unavailable": "ノードはライブ配信を中断せずにこの画質を適用できませんでした。",
       "unlock_unavailable": "ノードが拒否しました: サインインのパスワードが保存されていないか、今解除するものがありません。",
       "paste_unavailable": "リモートクリップボードを利用できないため、テキストを入力しました。",
       "paste_too_large": "1回のクリップボード貼り付けには大きすぎるため、テキストを入力しました。"

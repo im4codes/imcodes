@@ -42,11 +42,13 @@ import { buildMachineSendExtra } from '../util/machine-send.js';
 import { CODEBUDDY_PROVIDER_IDS } from '@shared/codebuddy.js';
 import { HERMES_AGENT_PROVIDER_ID } from '@shared/hermes-agent.js';
 import { AGY_SDK_PROVIDER_ID } from '@shared/agy-agent.js';
+import { CLAUDE_CODE_CLI_SDK_AGENT_TYPE } from '@shared/agent-types.js';
 import { recordPerfRender } from '../perf-render-debug.js';
 
 const TYPE_ICON: Record<string, string> = {
   'claude-code': '⚡',
   'claude-code-sdk': '⚡',
+  [CLAUDE_CODE_CLI_SDK_AGENT_TYPE]: '⚡',
   'codex': '📦',
   'codex-sdk': '📦',
   'copilot-sdk': '🧭',

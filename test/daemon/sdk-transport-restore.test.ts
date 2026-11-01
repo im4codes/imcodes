@@ -624,6 +624,33 @@ describe('sdk transport session restore', () => {
     }
   });
 
+  it('does not restore a stale Muse record while restoring a different provider', async () => {
+    const name = 'deck_ag_fresh_ignores_muse';
+    mocks.store.set(name, {
+      name,
+      projectName: 'ag-fresh',
+      role: 'brain',
+      agentType: 'muse-code-sdk',
+      projectDir: '/tmp/ag-fresh',
+      state: 'idle',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      runtimeType: 'transport',
+      providerId: 'muse-code-sdk',
+      providerSessionId: 'stale-muse-route',
+      providerResumeId: 'stale-muse-session',
+    });
+
+    // AG restoration must filter by providerId before attempting any runtime
+    // initialization, so a stale Muse record cannot emit its error on AG.
+    await restoreTransportSessions('agy-sdk');
+
+    expect(getTransportRuntime(name)).toBeUndefined();
+    expect(mocks.claudeRuns).toHaveLength(0);
+  });
+
   it('restores only the requested persisted transport session on demand', async () => {
     const now = Date.now();
     const makeStoredSession = (name: string, providerSessionId: string, ccSessionId: string) => ({

@@ -41,6 +41,16 @@ describe('computer-use shared protocol', () => {
     expect(computerUseDocs('overview')).toContain('do not probe for or install a separate Playwright runtime');
   });
 
+  it('exposes accessibility_tree as a read-only OCU observation verb', () => {
+    expect(validateComputerUseFrame({
+      type: DAEMON_COMMAND_TYPES.COMPUTER_USE,
+      correlationId,
+      tool: 'accessibility_tree',
+      arguments: { app: 'Finder', maxNodes: 20, maxDepth: 4 },
+    })).toMatchObject({ ok: true });
+    expect(computerUseDocs('tools')).toContain('accessibility_tree');
+  });
+
   it('documents the supported exec_remote timeoutMs while retaining a shell-native command deadline', () => {
     const tools = computerUseDocs('tools');
     const safety = computerUseDocs('safety');

@@ -36,7 +36,7 @@ agentSkillsRoutes.get('/agent-skills', requireAuth(), async (c) => {
   if ('response' in target) return target.response;
   const answer = await askOwnedDaemon(
     target.serverId,
-    { type: AGENT_SKILLS_MSG.LIST_REQUEST, requestId: `agent-skills-${randomUUID()}` },
+    { type: AGENT_SKILLS_MSG.LIST_REQUEST, requestId: `agent-skills-${randomUUID()}`, sessionName: c.req.query('sessionName'), projectDir: c.req.query('projectDir') },
     LIST_TIMEOUT_MS,
   );
   if ('error' in answer) return c.json({ error: answer.error }, 409);

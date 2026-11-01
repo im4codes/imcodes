@@ -25,6 +25,7 @@ import { ensureProjectionEmbeddingForProjection } from './projection-embedding-m
 import { warnOncePerHour } from '../util/rate-limited-warn.js';
 import { incrementCounter } from '../util/metrics.js';
 import { serializeContextNamespace } from './context-keys.js';
+import { isMemoryDaemonEnabled } from '../store/memory-daemon-switch.js';
 
 interface ScheduledMarkdownMemoryIngestInput {
   projectDir: string | undefined;
@@ -81,6 +82,7 @@ export async function runMarkdownMemoryIngest(input: {
   featureEnabled?: boolean;
   now?: number;
 }): Promise<{ filesChecked: number; observationsWritten: number; droppedReason?: 'unsupported_scope' }> {
+  if (!isMemoryDaemonEnabled()) return { filesChecked: 0, observationsWritten: 0 };
   const projectDir = input.projectDir?.trim();
   if (!projectDir) return { filesChecked: 0, observationsWritten: 0 };
   const featureEnabled = input.featureEnabled ?? isMdIngestEnabled();

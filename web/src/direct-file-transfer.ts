@@ -78,6 +78,7 @@ export type FileUploadTransportMode = typeof FILE_UPLOAD_TRANSPORT_MODE[keyof ty
 export const FILE_DOWNLOAD_TRANSPORT_MODE = {
   CONNECTING: 'connecting',
   DIRECT: 'direct',
+  RECOVERING: 'recovering',
   FALLING_BACK: 'falling_back',
   HTTP: 'http',
   BROWSER: 'browser',
@@ -344,6 +345,7 @@ type DirectDownloadAttempt = {
   onDurableProgress?: (committedBytes: number, totalBytes: number) => void;
   onProgress?: (progress: FileDownloadProgress) => void;
   onConnected?: () => void;
+  onMode?: (mode: FileDownloadTransportMode) => void;
   signal?: AbortSignal;
 };
 
@@ -2283,7 +2285,10 @@ async function runAttempt(lease: Lease, op: DirectAttempt, attempt: number): Pro
             op.onProgress?.(100);
             finish(undefined, { kind: 'upload', attachment: message.attachment as AttachmentRefResponse });
           } else if (message.state !== DIRECT_FILE_TRANSFER_OPERATION_STATE.COMMITTED) {
-            fail(directError(message.error ?? DIRECT_FILE_TRANSFER_ERROR.INTERNAL_ERROR));
+            fail(directError(
+              message.error ?? DIRECT_FILE_TRANSFER_ERROR.INTERNAL_ERROR,
+              isRetryableTerminalError(message.error),
+            ));
           }
           return;
         }
@@ -2316,7 +2321,7 @@ async function runAttempt(lease: Lease, op: DirectAttempt, attempt: number): Pro
           fail(directError(DIRECT_FILE_TRANSFER_ERROR.CANCELED, false));
         } else if (message.state === DIRECT_FILE_TRANSFER_OPERATION_STATE.FAILED) {
           refreshLeaseIdleDeadline(lease, message);
-          fail(directError(DIRECT_FILE_TRANSFER_ERROR.INTERNAL_ERROR));
+          fail(directError(DIRECT_FILE_TRANSFER_ERROR.INTERNAL_ERROR, false));
         }
         // AUTHORIZING/ATTEMPTING/STREAMING/awaiting-ack remain in-flight;
         // their existing channel resumes naturally without retransmission.
@@ -2425,6 +2430,19 @@ function failureDisposition(error: unknown, attemptsUsed: number) {
   return classifyDirectFileTransferFailure(directCode, attemptsUsed);
 }
 
+/**
+ * A daemon TERMINAL frame is the last control answer for an attempt and does
+ * not carry the original retryable bit. Recover only transport errors; a
+ * terminal authority/path/integrity result must not become an automatic retry
+ * (or an HTTP fallback that hides the real failure).
+ */
+function isRetryableTerminalError(error: string | undefined): boolean {
+  if (!error) return false;
+  const known = Object.values(DIRECT_FILE_TRANSFER_ERROR).find((value) => value === error);
+  return known !== undefined
+    && classifyDirectFileTransferFailure(known, 1) !== DIRECT_FILE_TRANSFER_FAILURE_DISPOSITION.TERMINAL;
+}
+
 function isTerminalDirectFailure(error: unknown, attemptsUsed = DIRECT_FILE_TRANSFER_LIMITS.MAX_ATTEMPTS): boolean {
   return failureDisposition(error, attemptsUsed) === DIRECT_FILE_TRANSFER_FAILURE_DISPOSITION.TERMINAL;
 }
@@ -2473,6 +2491,8 @@ async function retryDirect<T>(
         }
         throw error;
       }
+      if (operation.kind === 'upload') operation.onMode?.(FILE_UPLOAD_TRANSPORT_MODE.RECOVERING);
+      else operation.onMode?.(FILE_DOWNLOAD_TRANSPORT_MODE.RECOVERING);
     }
   }
   throw last;
@@ -2806,6 +2826,7 @@ export async function downloadPreviewWithDirectFallback(options: {
           writeDownloadResumeState(resumeStorageKey, committedBytes, totalBytes);
         },
         onProgress: options.onProgress,
+        onMode: options.onMode,
         onConnected: () => options.onMode?.(FILE_DOWNLOAD_TRANSPORT_MODE.DIRECT),
         signal: options.signal,
       }), options.signal, initialResume ? {

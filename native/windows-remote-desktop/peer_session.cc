@@ -540,6 +540,7 @@ bool PeerSession::ApplyOffer(const std::string& sdp) {
   std::unique_ptr<webrtc::SessionDescriptionInterface> offer =
       webrtc::CreateSessionDescription(webrtc::SdpType::kOffer, sdp, &error);
   if (!offer) return false;
+  if (!transport_core_.BeginIceRestart(CallbackStamp())) return false;
   setting_remote_description_ = true;
   std::weak_ptr<PeerSession> weak = shared_from_this();
   peer_->SetRemoteDescription(
@@ -1264,7 +1265,10 @@ void PeerSession::HandleControl(const std::string& channel,
                               : priority == "resolution"
                                     ? QualityPriority::kResolution
                                     : QualityPriority::kBalanced;
-    transport_core_.SetQualityPreference(preference);
+    if (!transport_core_.SetQualityPreference(preference)) {
+      (void)SendControlRejected("set_quality_preference", kRejectQualityUnavailable);
+      return;
+    }
     const uint32_t ceiling = ViewerVideoBitrateCeiling(preference);
     if (ceiling != viewer_bitrate_ceiling_bps_) {
       viewer_bitrate_ceiling_bps_ = ceiling;

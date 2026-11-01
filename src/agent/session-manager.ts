@@ -84,7 +84,8 @@ import { peekMuseUsageQuotaCached, getMuseUsageQuota } from './muse-usage-quota.
 import { getCodexRuntimeConfig } from './codex-runtime-config.js';
 import { mergeCodexDisplayMetadata } from './codex-display.js';
 import type { TransportEffortLevel } from '../../shared/effort-levels.js';
-import { getSessionRuntimeType, isClaudeCodeFamily, isCodexFamily } from '../../shared/agent-types.js';
+import { getSessionRuntimeType, isClaudeCodeFamily, isClaudeCodeSdkAgentType, isCodexFamily } from '../../shared/agent-types.js';
+import { detectLocalAuthContext, hasLocalAuthCandidate, isExplicitlyUnsupportedLocalAuthProvider, localAuthContextEnv, type LocalAuthContext } from './local-auth-context.js';
 import { providerQuotaMetaEquals } from '../../shared/provider-quota.js';
 import { DEFAULT_CODEX_SESSION_MODEL } from '../shared/models/options.js';
 import {
@@ -271,7 +272,7 @@ function startStructuredWatcher(
     startOpenCodeWatching(name, projectDir, ids?.opencodeSessionId).catch((e) =>
       logger.warn({ err: e, session: name }, 'opencode-watcher start failed'),
     );
-  } else if (agentType === 'claude-code-sdk' && ids?.ccSessionId) {
+  } else if (isClaudeCodeSdkAgentType(agentType) && ids?.ccSessionId) {
     // claude-code-sdk sessions get their structured events from the provider
     // stream, not from tailing a JSONL file — no jsonl-watcher is started for
     // them. The underlying claude binary still writes a transcript to disk
@@ -676,7 +677,7 @@ export async function restoreFromStore(): Promise<void> {
   // another session's directory-scan/rotation logic (e.g. a stopped
   // sub-session whose watcher gets restarted below) can freely adopt it.
   for (const s of all) {
-    if ((s.agentType === 'claude-code' || s.agentType === 'claude-code-sdk') && s.ccSessionId) {
+    if (isClaudeCodeFamily(s.agentType) && s.ccSessionId) {
       reserveSessionFile(s.name, s.ccSessionId);
     }
   }
@@ -1318,7 +1319,7 @@ export async function relaunchSessionWithSettings(
     // preserve it. Claude/Codex SDKs keep their provider continuity in ccSessionId /
     // codexSessionId; Kimi/Grok use providerResumeId, so these providers use a fresh
     // local route key on relaunch.
-    && targetAgentType !== 'claude-code-sdk'
+    && !isClaudeCodeSdkAgentType(targetAgentType)
     && targetAgentType !== 'codex-sdk'
     && targetAgentType !== 'qoder-sdk'
     && !usesProviderResumeId(targetAgentType)
@@ -1339,7 +1340,7 @@ export async function relaunchSessionWithSettings(
     requestedModel: targetRequestedModel ?? undefined,
     effort: targetEffort ?? undefined,
     transportConfig: targetTransportConfig ?? undefined,
-    ccPreset: (targetAgentType === 'claude-code' || targetAgentType === 'claude-code-sdk' || targetAgentType === 'qwen' || targetAgentType === 'deepseek-harness' || targetAgentType === 'pi')
+    ccPreset: (targetAgentType === 'claude-code' || isClaudeCodeSdkAgentType(targetAgentType) || targetAgentType === 'qwen' || targetAgentType === 'deepseek-harness' || targetAgentType === 'pi')
       ? (targetCcPreset ?? undefined)
       : undefined,
     ...(preserveTransportBinding ? {
@@ -1556,13 +1557,31 @@ function buildTransportSessionEnv(
   sessionName: string,
   label: string | null | undefined,
   extraEnv?: Record<string, string>,
+  providerId?: string,
 ): Record<string, string> {
   return {
+    ...(providerId ? localAuthContextEnv(providerId) : {}),
     ...(extraEnv ?? {}),
     [IMCODES_SESSION_ENV]: sessionName,
     [IMCODES_SESSION_LABEL_ENV]: label?.trim() || sessionName,
     ...imcodesStateDirEnv(),
   };
+}
+
+export async function resolveLaunchAuthContext(providerId: string, extraEnv?: Record<string, string>): Promise<LocalAuthContext | undefined> {
+  const env = { ...process.env, ...(extraEnv ?? {}) };
+  const candidate = hasLocalAuthCandidate(providerId, env);
+  // Known providers without a proven adapter still receive an explicit
+  // unsupported context at launch. This keeps status and runtime behavior
+  // aligned without guessing credentials or blocking providers that own
+  // their native login flow (for example Claude with no UDS candidate).
+  if (!candidate && !isExplicitlyUnsupportedLocalAuthProvider(providerId)) return undefined;
+  const context = await detectLocalAuthContext(providerId, env);
+  if (!context.authenticated || !context.reusable) {
+    if (!candidate && isExplicitlyUnsupportedLocalAuthProvider(providerId)) return context;
+    throw new Error(`Local auth unavailable for ${providerId}: ${context.reason ?? 'authentication context could not be verified'}`);
+  }
+  return context;
 }
 
 async function loadBoundServerIdForManagedMcp(): Promise<string | undefined> {
@@ -1684,13 +1703,13 @@ async function recoverTransportRuntimeAfterError(
       requestedModel: record.requestedModel,
       effort: record.effort,
       transportConfig: record.transportConfig,
-      ccPreset: (record.agentType === 'claude-code-sdk' || record.agentType === 'qwen' || record.agentType === 'deepseek-harness' || record.agentType === 'pi' || record.agentType === 'codex-sdk') ? record.ccPreset : undefined,
+      ccPreset: (isClaudeCodeSdkAgentType(record.agentType) || record.agentType === 'qwen' || record.agentType === 'deepseek-harness' || record.agentType === 'pi' || record.agentType === 'codex-sdk') ? record.ccPreset : undefined,
       // Qwen-compatible API providers can reject a resumed conversation when
       // their persisted tool-call chain is invalid (e.g. "tool call result
       // does not follow tool call"). Auto-recovery must rotate the provider
       // conversation instead of binding the same poisoned qwen session again.
       ...(record.agentType === 'qwen' ? { fresh: true } : {}),
-      ...(record.agentType === 'claude-code-sdk' && record.ccSessionId ? { ccSessionId: record.ccSessionId } : {}),
+      ...(isClaudeCodeSdkAgentType(record.agentType) && record.ccSessionId ? { ccSessionId: record.ccSessionId } : {}),
       ...(record.agentType === 'codex-sdk' && record.codexSessionId ? { codexSessionId: record.codexSessionId } : {}),
       ...(usesProviderResumeId(record.agentType) && record.providerResumeId
         ? { providerResumeId: record.providerResumeId }
@@ -2327,7 +2346,7 @@ function wireTransportSessionInfo(
     let changed = false;
 
     if (typeof info.resumeId === 'string' && info.resumeId) {
-      if (agentType === 'claude-code-sdk' && next.ccSessionId !== info.resumeId) {
+      if (isClaudeCodeSdkAgentType(agentType) && next.ccSessionId !== info.resumeId) {
         reassignSessionFile(sessionName, next.ccSessionId, info.resumeId);
         next.ccSessionId = info.resumeId;
         changed = true;
@@ -2348,7 +2367,7 @@ function wireTransportSessionInfo(
       }
     }
 
-    const presetSelectedModelIsAuthoritative = agentType === 'claude-code-sdk'
+    const presetSelectedModelIsAuthoritative = isClaudeCodeSdkAgentType(agentType)
       && !!next.ccPreset
       && !!next.requestedModel;
     if (typeof info.model === 'string' && info.model && !presetSelectedModelIsAuthoritative) {
@@ -3049,7 +3068,7 @@ export async function restoreTransportSessions(
       let requestedTransportModel = s.requestedModel ?? s.qwenModel;
       if (s.providerId === 'codex-sdk') {
         requestedTransportModel = sanitizeCodexSdkStartupModel(requestedTransportModel);
-      } else if (s.providerId === 'claude-code-sdk' && requestedTransportModel) {
+      } else if (isClaudeCodeSdkAgentType(s.providerId) && requestedTransportModel) {
         // Resolve the picker alias (e.g. "fable") to the documented API id before the
         // SDK sees it — symmetric with the model-change path (command-handler) and the
         // codex branch above. Without this, a restored session passed the raw alias and
@@ -3083,12 +3102,12 @@ export async function restoreTransportSessions(
       // never-materialized history -- and the restored runtime still settles idle.
       const freshQoderRestore = s.providerId === 'qoder-sdk';
       const freshOnRestore = freshAfterCancel || freshQoderRestore;
-      const needsEphemeralRouteKey = s.providerId === 'claude-code-sdk'
+      const needsEphemeralRouteKey = isClaudeCodeSdkAgentType(s.providerId)
         || s.providerId === 'codex-sdk'
         || s.providerId === 'qoder-sdk'
         || usesProviderResumeId(s.providerId);
       const effectiveSessionKey = freshOnRestore || needsEphemeralRouteKey ? randomUUID() : s.providerSessionId;
-      const resumeId = s.providerId === 'claude-code-sdk'
+      const resumeId = isClaudeCodeSdkAgentType(s.providerId)
         ? s.ccSessionId
         : s.providerId === 'codex-sdk'
           ? s.codexSessionId
@@ -3126,7 +3145,7 @@ export async function restoreTransportSessions(
       const { bootstrap: contextBootstrap, deferred: deferredContextBootstrap } = await resolveLaunchContextBootstrap(s.name, resolveRuntimeContextBootstrap);
       runtime.setContextBootstrapResolver(() => resolveRuntimeContextBootstrap());
       if (deferredContextBootstrap) runtime.deferContextBootstrap(deferredContextBootstrap);
-      if (s.providerId === 'claude-code-sdk' && s.ccPreset) {
+      if (isClaudeCodeSdkAgentType(s.providerId) && s.ccPreset) {
         const { resolvePresetEnv, getPresetTransportOverrides } = await import('../daemon/cc-presets.js');
         extraEnv = await resolvePresetEnv(
           s.ccPreset,
@@ -3184,6 +3203,7 @@ export async function restoreTransportSessions(
         await runtime.kill({ detachProviderSession: true }).catch(() => {});
         return;
       }
+      const restoreAuthContext = await resolveLaunchAuthContext(provider.id, extraEnv);
       // The persisted identity is the startup sweep's ownership authority.
       // Omitting it makes `agentResourceOwner()` return null, so a restored
       // per-session provider registers no AGENT lease — and after a daemon
@@ -3208,7 +3228,8 @@ export async function restoreTransportSessions(
         fresh: freshOnRestore,
         bindExistingKey: freshOnRestore ? undefined : (needsEphemeralRouteKey ? s.providerSessionId : s.providerSessionId),
         skipCreate: !freshOnRestore && !!s.providerSessionId,
-        env: buildTransportSessionEnv(s.name, s.label, extraEnv),
+        env: buildTransportSessionEnv(s.name, s.label, { ...(extraEnv ?? {}), ...(restoreAuthContext?.env ?? {}) }, provider.id),
+        authContext: restoreAuthContext,
         // Directory-scoped providers may persist a symlinked path spelling.
         // Reuse the provider's authoritative spelling for the resume RPC while
         // keeping the local projectDir unchanged for product configuration.
@@ -3460,19 +3481,9 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
 async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
   const { name, projectName, role, agentType, projectDir, skipStore, label, description, bindExistingKey, skipCreate } = opts;
   const existing = getSession(name);
-  // An identity handed in by the caller (a session being created) wins; every other launch -- restart, resume, a sub-session
-  // that carries none -- derives it from the identity store, the same as a restore.
-  const identityPrompt = opts.identityPrompt ?? await resolveEffectiveIdentityPrompt({ name, projectName, contextNamespace: existing?.contextNamespace });
-  const resourceSessionInstanceId = existing?.sessionInstanceId ?? randomUUID();
-  const resourceRuntimeEpoch = randomUUID();
-  if (opts.fresh || !existing) clearSummarySyncHistory(name);
-  const inheritedClaudeResumeId = opts.ccSessionId ?? (!opts.fresh ? existing?.ccSessionId : undefined);
-  const shouldResumeClaudeCliConversation = agentType === 'claude-code-sdk'
-    && existing?.agentType === 'claude-code'
-    && existing?.runtimeType !== RUNTIME_TYPES.TRANSPORT
-    && typeof inheritedClaudeResumeId === 'string'
-    && inheritedClaudeResumeId.length > 0;
-
+  // A fresh launch is an explicit replacement. Remove the old runtime before
+  // any asynchronous identity/resource work so callers never observe stale
+  // runtime state while the replacement is starting.
   if (opts.fresh) {
     const existingRuntime = transportRuntimes.get(name);
     if (existingRuntime) {
@@ -3486,6 +3497,18 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
       }
     }
   }
+  // An identity handed in by the caller (a session being created) wins; every other launch -- restart, resume, a sub-session
+  // that carries none -- derives it from the identity store, the same as a restore.
+  const identityPrompt = opts.identityPrompt ?? await resolveEffectiveIdentityPrompt({ name, projectName, contextNamespace: existing?.contextNamespace });
+  const resourceSessionInstanceId = existing?.sessionInstanceId ?? randomUUID();
+  const resourceRuntimeEpoch = randomUUID();
+  if (opts.fresh || !existing) clearSummarySyncHistory(name);
+  const inheritedClaudeResumeId = opts.ccSessionId ?? (!opts.fresh ? existing?.ccSessionId : undefined);
+  const shouldResumeClaudeCliConversation = isClaudeCodeSdkAgentType(agentType)
+    && existing?.agentType === 'claude-code'
+    && existing?.runtimeType !== RUNTIME_TYPES.TRANSPORT
+    && typeof inheritedClaudeResumeId === 'string'
+    && inheritedClaudeResumeId.length > 0;
 
   if (existing && !transportRuntimes.has(name)) {
     // Only a non-fresh relaunch of the same agent resumes the same provider
@@ -3533,7 +3556,7 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
   let requestedTransportModel = opts.requestedModel ?? storedRequestedModel ?? (agentType === 'qwen' ? (opts.qwenModel ?? existing?.qwenModel) : undefined);
   if (agentType === 'codex-sdk') {
     requestedTransportModel = sanitizeCodexSdkStartupModel(requestedTransportModel);
-  } else if (agentType === 'claude-code-sdk' && requestedTransportModel) {
+  } else if (isClaudeCodeSdkAgentType(agentType) && requestedTransportModel) {
     // Resolve the picker alias (e.g. "fable") to the documented API id at launch —
     // symmetric with the restore path and command-handler's model-change path.
     requestedTransportModel = normalizeClaudeSdkModelForProvider(requestedTransportModel);
@@ -3628,7 +3651,7 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
       effectiveBindExistingKey = undefined;
       effectiveSkipCreate = false;
     }
-  } else if (agentType === 'claude-code-sdk') {
+  } else if (isClaudeCodeSdkAgentType(agentType)) {
     effectiveSessionKey = randomUUID();
     effectiveBindExistingKey = undefined;
     transportResumeId = opts.ccSessionId ?? (!opts.fresh ? getSession(name)?.ccSessionId : undefined) ?? randomUUID();
@@ -3641,7 +3664,8 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
     if (shouldResumeClaudeCliConversation) {
       effectiveSkipCreate = true;
     }
-    if (effectiveCcPreset) {
+    const ccPresetAgent = agentType === 'claude-code-sdk' || isClaudeCodeSdkAgentType(agentType);
+    if (ccPresetAgent && effectiveCcPreset) {
       const { resolvePresetEnv, getPresetTransportOverrides } = await import('../daemon/cc-presets.js');
       transportEnv = {
         ...(transportEnv ?? {}),
@@ -3771,6 +3795,7 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
   }
 
   // Create session on provider
+  const launchAuthContext = await resolveLaunchAuthContext(provider.id, transportEnv);
   await runtime.initialize({
     sessionKey: effectiveSessionKey,
     sessionName: name,
@@ -3780,7 +3805,8 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
     serverId: boundServerId,
     providerId: provider.id,
     fresh: !!opts.fresh,
-    env: buildTransportSessionEnv(name, label, transportEnv),
+    env: buildTransportSessionEnv(name, label, { ...(transportEnv ?? {}), ...(launchAuthContext?.env ?? {}) }, agentType),
+    authContext: launchAuthContext,
     cwd: projectDir,
     label: label || name,
     description,
@@ -3837,7 +3863,7 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
         ...(usesProviderResumeId(agentType) && (latestSessionInfo?.resumeId ?? transportResumeId)
           ? { providerResumeId: latestSessionInfo?.resumeId ?? transportResumeId }
           : {}),
-        ...(agentType === 'claude-code-sdk' && transportResumeId ? { ccSessionId: transportResumeId } : {}),
+        ...(isClaudeCodeSdkAgentType(agentType) && transportResumeId ? { ccSessionId: transportResumeId } : {}),
         ...(agentType === 'codex-sdk' && transportResumeId ? { codexSessionId: transportResumeId } : {}),
         contextNamespace: contextBootstrap.namespace,
         contextNamespaceDiagnostics: contextBootstrap.diagnostics,

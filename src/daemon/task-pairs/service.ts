@@ -36,6 +36,7 @@ import {
   TASK_PAIR_WORKSPACE_NONE,
   TASK_PAIR_WORKSPACE_REPAIR_STATUSES,
   TASK_PAIR_WORKSPACE_EVENT_VERB,
+  TASK_PAIR_DONE_WORKSPACE_RETENTION_MS,
   TASK_PAIR_WORKSPACE_RETENTION_MS,
   TASK_PAIR_WORKSPACE_KEPT_DIGEST_INTERVAL_MS,
   TASK_PAIR_WORKSPACE_KEPT_DIGEST_MAX_LISTED,
@@ -71,7 +72,7 @@ import {
 } from '../../../shared/task-pair.js';
 import { parseTaskPairChecklist, updateTaskPairChecklist } from '../../../shared/task-pair-checklist.js';
 import { parseTaskPairAuditDetails } from '../../../shared/task-pair-notification.js';
-import { flushTaskPairStoreLiveness, getTaskPairStore, livenessChangedBeyondActivityTimestamps, type StoredTaskPair, type TaskPairLiveness } from './store.js';
+import { flushTaskPairStoreLiveness, getTaskPairStore, livenessChangedBeyondActivityTimestamps, type StoredTaskPair, type TaskPairDecisionRecord, type TaskPairLiveness } from './store.js';
 import { brainUiLocale, isPairsEngineProject, isTaskPairsAvailable, projectBrainSession, projectOfSession } from './engine.js';
 import { inspectToolCallForPairMainCheckoutWrite } from './main-checkout-write-guard.js';
 import { noteTaskPairFocus, sendTaskPairMessage, taskPairFocusOf, taskPairMessageIdPrefix, type TaskPairDeliveryResult } from './delivery.js';
@@ -521,6 +522,52 @@ export class TaskPairService {
     const result = store.tryClaimResource(input); if (!result.ok) return result;
     const next = { ...pair.state, resourceClaims: store.listResourceClaimsForPair(input.project, input.taskId, input.now), updatedAt: input.now ?? Date.now() };
     store.savePair(input.project, next); return { ok: true, claim: result.claim, pair: next };
+  }
+
+  /** Persist a request/final decision and notify the Brain (and both participants for a final decision). */
+  recordDecision(input: Omit<TaskPairDecisionRecord, 'id' | 'at'> & { at?: number }): { record: TaskPairDecisionRecord; created: boolean; notified: string[] } {
+    const store = getTaskPairStore();
+    const pair = store.getPair(input.project, input.taskId);
+    if (!pair) throw new Error('task pair not found');
+    const result = store.recordDecision({ ...input, at: input.at ?? Date.now() });
+    if (!result.created) return { ...result, notified: [] };
+    const fresh = store.getPair(input.project, input.taskId);
+    if (fresh) {
+      store.saveLiveness(input.project, input.taskId, {
+        ...fresh.liveness,
+        decisionLastAt: result.record.at,
+        decisionReminderAt: undefined,
+      });
+    }
+    const targets = input.kind === 'decision'
+      ? [pair.state.brain, pair.state.executor, pair.state.auditor]
+      : [pair.state.brain];
+    const uniqueTargets = [...new Set(targets.filter((target): target is string => !!target && target !== TASK_PAIR_NO_AUDITOR))];
+    const message = `${input.kind === 'decision' ? 'Final decision' : 'Decision request'} recorded for ${input.taskId} round ${input.round}: ${input.conclusion}. ${input.summary}`;
+    for (const target of uniqueTargets) store.enqueueDecisionNotification({
+      project: input.project, taskId: input.taskId, decisionId: result.record.id, target,
+      reason: `decision-${input.kind}`, text: message,
+    });
+    this.#track(this.retryDecisionNotifications());
+    emitTaskPairDaemonEvent(pair.state, {
+      eventId: `decision:${result.record.id}`,
+      verb: input.kind === 'decision' ? 'DECISION' : 'DECISION_REQUEST',
+      effect: 'decision_recorded', source: 'mcp', fromStatus: pair.state.status, toStatus: pair.state.status, unusual: false,
+    });
+    return { ...result, notified: uniqueTargets };
+  }
+
+  /** Deliver persisted decision notifications; failed/no-session rows remain for heartbeat retry. */
+  async retryDecisionNotifications(now = Date.now()): Promise<void> {
+    const store = getTaskPairStore();
+    for (const pending of store.listPendingDecisionNotifications(100)) {
+      store.markDecisionNotificationAttempt(pending.id, now);
+      let status: TaskPairDeliveryResult = 'failed';
+      try { status = await sendTaskPairMessage(pending.target, pending.taskId, pending.reason, pending.text); } catch { /* retain the row for the next heartbeat */ }
+      // skipped_pending can be only the process-local in-flight gate; the
+      // original send may still fail, so keep this row pending for retry.
+      if (status === 'sent' || status === 'queued') store.markDecisionNotificationDelivered(pending.id, now);
+    }
   }
 
   get pendingCount(): number {
@@ -1944,7 +1991,17 @@ export class TaskPairService {
     await this.finishNonGitWorkspace(project, taskId);
     // After the deliverable copy: an `output=` path may live inside a directory
     // that is about to be stripped.
-    await this.#stripClosedWorkspace(project, taskId);
+    const stripped = await this.#stripClosedWorkspace(project, taskId);
+    // CANCEL keeps its existing first-sweep semantics. If hygiene could not
+    // complete, leave the workspace for the normal retry path rather than
+    // allowing the immediate removal pass to skip that safety signal.
+    const latest = getTaskPairStore().getPair(project, taskId)?.state;
+    if (!stripped || latest?.status !== 'done' || latest.workspace?.nonGit) return;
+    // A terminal transition is already serialized through the pair store. Run
+    // one bounded, fail-safe sweep now so clean merged worktrees do not wait
+    // for the hourly scheduler. Dirty/unmerged/locked/unknown workspaces still
+    // go through the same release gate and remain retained.
+    await this.sweepWorkspaces(now, { force: true, announceKept: false });
   }
 
   async #endWorkspaceRetention(project: string, taskId: string, now: number): Promise<void> {
@@ -2166,11 +2223,12 @@ export class TaskPairService {
   }
 
   /**
-   * Remove the workspaces of pairs that ended at least the retention period
-   * ago. A worktree that still holds unsaved work is kept (Brain is told once)
-   * and retried on later sweeps. Runs at most hourly unless forced.
+   * Remove safe terminal workspaces: DONE pairs wait out the retention
+   * period, while CANCEL pairs are eligible on the first sweep. A worktree
+   * that still holds unsaved work is kept (Brain is told once) and retried on
+   * later sweeps. Runs at most hourly unless forced.
    */
-  async sweepWorkspaces(now: number, options: { force?: boolean } = {}): Promise<void> {
+  async sweepWorkspaces(now: number, options: { force?: boolean; announceKept?: boolean } = {}): Promise<void> {
     if (!options.force && now - this.#lastSweepAt < 60 * 60_000) return;
     this.#lastSweepAt = now;
     const store = getTaskPairStore();
@@ -2184,18 +2242,26 @@ export class TaskPairService {
       const pair = stored.state;
       const workspace = pair.workspace;
       if (!workspace || !isTerminalTaskPairStatus(pair.status)) continue;
-      if (now - (workspace.endedAt ?? pair.updatedAt) < TASK_PAIR_WORKSPACE_RETENTION_MS) continue;
+      // Immediate DONE retention applies only to git worktrees. COW/dir
+      // workspaces still need their post-terminal copy-back/undo/conflict
+      // evidence window before the normal retention sweep may remove them.
+      const retentionMs = pair.status === 'cancelled' ? 0
+        : workspace.kind === 'worktree' && !workspace.nonGit ? TASK_PAIR_DONE_WORKSPACE_RETENTION_MS
+          : TASK_PAIR_WORKSPACE_RETENTION_MS;
+      if (now - (workspace.endedAt ?? pair.updatedAt) < retentionMs) continue;
       try {
-        const outcome = await this.#releaseEndedWorkspace(stored, now, TASK_PAIR_WORKSPACE_RETENTION_MS, false);
+        const outcome = await this.#releaseEndedWorkspace(stored, now, retentionMs, false);
         if (outcome?.kept) keptThisSweep.push(outcome.kept);
       } catch (error) {
         logger.warn({ err: error, taskId: pair.taskId }, 'task-pair: workspace sweep failed');
       }
     }
-    try {
-      await this.#announceKeptWorkspaces(keptThisSweep, now);
-    } catch (error) {
-      logger.warn({ err: error }, 'task-pair: kept-workspace announcement failed');
+    if (options.announceKept !== false) {
+      try {
+        await this.#announceKeptWorkspaces(keptThisSweep, now);
+      } catch (error) {
+        logger.warn({ err: error }, 'task-pair: kept-workspace announcement failed');
+      }
     }
   }
 
@@ -2249,7 +2315,7 @@ export class TaskPairService {
   }
 
   /**
-   * On-demand cleanup of the workspaces of pairs that have ENDED (done / cancelled), without waiting out the seven-day retention.
+   * On-demand cleanup of the workspaces of pairs that have ENDED (done / cancelled), without changing the safety gates.
    * Open pairs are never listed. The checks are the sweep's own (a worktree with uncommitted or untracked files, commits no branch
    * has, a lock, or a non-git pair whose work has not landed is kept and the reason is returned). `dryRun` (the default of the MCP
    * tool) removes nothing. At most `limit` pairs are examined per call, oldest end first.
@@ -2271,9 +2337,12 @@ export class TaskPairService {
       const workspace = pair.workspace!;
       const endedAt = workspace.endedAt ?? pair.updatedAt;
       const base = { taskId: pair.taskId, title: pair.title ?? null, status: pair.status, kind: workspace.kind, path: workspace.path, endedAt };
-      if (now - endedAt < options.minAgeMs) { entries.push({ ...base, action: 'too_recent' }); continue; }
+      const retentionMs = pair.status === 'cancelled' ? 0
+        : workspace.kind === 'worktree' && !workspace.nonGit ? options.minAgeMs
+          : Math.max(options.minAgeMs, TASK_PAIR_WORKSPACE_RETENTION_MS);
+      if (now - endedAt < retentionMs) { entries.push({ ...base, action: 'too_recent' }); continue; }
       try {
-        const outcome = await this.#releaseEndedWorkspace(stored, now, options.minAgeMs, options.dryRun);
+        const outcome = await this.#releaseEndedWorkspace(stored, now, retentionMs, options.dryRun);
         const released = outcome?.released;
         if (!released) { entries.push({ ...base, action: 'absent' }); continue; }
         entries.push(released.action === 'kept'

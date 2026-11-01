@@ -1,4 +1,7 @@
 {
+  "task_pair": {
+    "reference_picker": "Pair 任务"
+  },
   "alias": {
     "feature_label": "别名",
     "category": "别名",
@@ -33,6 +36,12 @@
       "list_unavailable": "别名仍在加载或加载失败，请稍后重试。",
       "generic": "出错了，请重试。"
     }
+  },
+  "skill": {
+    "category": "技能",
+    "category_desc": "插入技能引用",
+    "empty": "暂无可用技能",
+    "no_results": "没有匹配的技能"
   },
   "machine": {
     "feature_label": "机器",
@@ -685,7 +694,7 @@
     "stop_appended_queue": "已追加队列消息，本次未停止会话。",
     "send_placeholder": "发送到 {{name}}…",
     "send_placeholder_desktop_upload": "{{placeholder}} 支持多文件粘贴或拖拽快速上传",
-    "send_placeholder_desktop_shortcuts": "{{placeholder}}\n/ 命令 · # 短语 · @ 文件/Agent · ; 别名 · ^ 受控节点 · 可粘贴或拖入文件",
+    "send_placeholder_desktop_shortcuts": "{{placeholder}}\n/ 命令 · # 短语 · @ 文件/Agent · ; 别名 · ^ 受控节点 · % 任务 · 可粘贴或拖入文件",
     "composer_target_label": "发送至",
     "composer_target_aria": "消息将发送至 {{name}}",
     "actions": "会话操作",
@@ -797,6 +806,7 @@
       "openclaw": "OpenClaw",
       "qwen": "Qwen Code",
       "claude_code_sdk": "Claude Code SDK",
+      "cc_cli_sdk": "CC CLI SDK",
       "codex_sdk": "Codex SDK",
       "qoder_sdk": "Qoder SDK",
       "claude_code_cli": "Claude Code CLI",
@@ -1067,6 +1077,8 @@
     "delete_error": "删除服务器失败：{{error}}",
     "upgrade_daemon": "↑ 升级 Daemon",
     "upgrade_all": "↑ 升级全部设备",
+    "pin": "📌 置顶服务器",
+    "unpin": "取消置顶服务器",
     "delete": "✕ 删除 server",
     "upgrade_sent": "升级命令已发送到「{{name}}」，daemon 将自动安装最新版并重启。",
     "upgrade_failed": "发送失败，daemon 可能不在线。",
@@ -4175,6 +4187,7 @@
     "zoom_out": "缩小",
     "zoom_reset": "重置缩放",
     "touch_hint": "轻点屏幕可在该处单击；拖动圆环移动光标；按住圆环再拖动即为拖拽；按住后松开为右键",
+    "touch_hint_dismiss": "知道了",
     "touch_right_click": "在上次触摸位置右键单击",
     "touch_ring": "光标圆环——拖动可移动，长按变右键",
     "mobile_input_mode": "手机输入模式",
@@ -4319,6 +4332,7 @@
       "mode_change_failed": "节点拒绝：Windows 未能应用该分辨率。",
       "scale_change_failed": "节点拒绝：Windows 未能应用该缩放比例。",
       "capture_failed": "节点拒绝：无法将画面采集切换到该显示器。",
+      "quality_unavailable": "节点无法在不中断当前直播的情况下应用该画质。",
       "unlock_unavailable": "节点拒绝：未保存登录口令，或当前没有需要解锁的界面。",
       "paste_unavailable": "远程剪贴板不可用，已改为输入文本。",
       "paste_too_large": "文本过大，无法通过一次剪贴板粘贴，已改为输入文本。"

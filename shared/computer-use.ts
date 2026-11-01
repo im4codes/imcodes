@@ -6,9 +6,12 @@ import {
 } from './session-resource-lifecycle.js';
 import { REMOTE_EXEC_MAX_TIMEOUT_MS, REMOTE_EXEC_MIN_TIMEOUT_MS } from './remote-exec.js';
 
+export const COMPUTER_USE_ACCESSIBILITY_TREE_TOOL = 'accessibility_tree' as const;
+
 export const COMPUTER_USE_TOOLS = [
   'list_apps',
   'get_app_state',
+  COMPUTER_USE_ACCESSIBILITY_TREE_TOOL,
   'click',
   'perform_secondary_action',
   'scroll',
@@ -43,6 +46,7 @@ export type ComputerUseToolName = (typeof COMPUTER_USE_TOOLS)[number];
 export const COMPUTER_USE_READ_ONLY_TOOLS = [
   'list_apps',
   'get_app_state',
+  COMPUTER_USE_ACCESSIBILITY_TREE_TOOL,
   'browser_snapshot',
 ] as const satisfies readonly ComputerUseToolName[];
 
@@ -310,7 +314,7 @@ export function computerUseDocs(topic: ComputerUseDocTopic): string {
         '2. Classify intent before selecting a tool: executable/CLI/script/terminal work uses exec_remote (SYSTEM/session 0), or shell_session1 only for required active-user semantics. Use OCU only for actual GUI interaction.',
         '3. computer_use_docs for the relevant topic/tool details only.',
         '4. computer_use_call tool=list_apps to discover app ids.',
-        '5. For element/index actions, call computer_use_call tool=get_app_state first to discover stable element indexes; pure coordinate click can use the fast path directly when the target is known.',
+        '5. For semantic observation, call computer_use_call tool=accessibility_tree with an app id. For element/index actions, call tool=get_app_state first to discover stable element indexes; pure coordinate click can use the fast path directly when the target is known.',
         '6. Prefer element/index based actions when precision matters; use coordinate actions for low-latency direct control and verify when needed.',
         '7. For web pages, prefer browser_* tools and pull computer_use_docs topic=browser only when browser automation details are needed.',
       ].join('\n');
@@ -320,9 +324,10 @@ export function computerUseDocs(topic: ComputerUseDocTopic): string {
         'shell_session1: run a bounded shell command in the active logged-in user session through the IPC helper; its requested timeout may be 1,000..900,000 ms. For SYSTEM/session-0 shell use exec_remote instead.',
         'list_apps: enumerate controllable GUI apps.',
         'get_app_state: inspect one app/window accessibility tree. Output shows at most 200 nodes by default; pass maxNodes=1..1500 to bound returned nodes and maxDepth=1..80 to limit collected depth. When bounded, the text ends with "truncated: N nodes omitted".',
+        'accessibility_tree: read-only semantic UI observation through the signed helper accessibility tree (AX on macOS, UI Automation on Windows, AT-SPI when available). It is an explicit alias of get_app_state; permissions or unsupported platforms return an actionable error and do not affect screenshot/input tools.',
         `click, perform_secondary_action, scroll, drag: pointer/UI actions. On Windows, coordinate drag accepts optional duration_ms=${COMPUTER_USE_DRAG_DURATION_MIN_MS}..${COMPUTER_USE_DRAG_DURATION_MAX_MS} for cursor travel duration; omit it for normal speed.`,
         'type_text, press_key, set_value: keyboard/value actions.',
-        'Arguments are open-computer-use-compatible. Call get_app_state first to find app ids and element indexes; only displayed element indexes are safe to reuse. If a target was omitted, narrow the app/window or increase maxNodes and refresh state. Pure coordinate click may skip state and uses a Windows fast path when possible.',
+        'Arguments are open-computer-use-compatible. Call accessibility_tree or get_app_state first to find app ids and element indexes; only displayed element indexes are safe to reuse. If a target was omitted, narrow the app/window or increase maxNodes and refresh state. Pure coordinate click may skip state and uses a Windows fast path when possible.',
         'Action results omit screenshots and full UI state by default for low-latency control. Pass arguments.includeState=true to return state text, or includeImage=true to request a compressed image; optional imageFormat=jpeg|webp|png, imageQuality=1..100, imageMaxWidth=320..3840.',
         'GUI and browser methods keep the 1,000..120,000 ms timeout range; only shell_session1 permits up to 900,000 ms.',
         `exec_remote accepts timeoutMs=${REMOTE_EXEC_MIN_TIMEOUT_MS}..${REMOTE_EXEC_MAX_TIMEOUT_MS} ms and rejects the unknown timeout field. Also self-limit the command inside command with the target shell/platform timeout facility (for example GNU timeout 30s command).`,
@@ -354,7 +359,7 @@ export function computerUseDocs(topic: ComputerUseDocTopic): string {
       return [
         'Ask the user before destructive or externally visible actions such as sending messages, deleting data, purchases, or changing account/security settings.',
         `Shell is intentionally split: exec_remote is session-0/SYSTEM; shell_session1 is active-user/session-1. Both are explicit typed methods with bounded JSON arguments/results. exec_remote accepts timeoutMs=${REMOTE_EXEC_MIN_TIMEOUT_MS}..${REMOTE_EXEC_MAX_TIMEOUT_MS} ms and rejects timeout; also put a shell-native timeout in command so the command self-limits.`,
-        'If the UI state is ambiguous, call get_app_state again instead of guessing.',
+        'If the UI state is ambiguous, call accessibility_tree or get_app_state again instead of guessing.',
       ].join('\n');
   }
 }

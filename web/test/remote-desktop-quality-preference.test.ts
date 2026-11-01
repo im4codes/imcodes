@@ -2,9 +2,11 @@ import { describe, expect, it } from 'vitest';
 import {
   DEFAULT_REMOTE_DESKTOP_QUALITY_MODE,
   REMOTE_DESKTOP_QUALITY_MODE,
+  REMOTE_DESKTOP_QUALITY_MODE_FLOORS,
   REMOTE_DESKTOP_QUALITY_MODE_PREFERENCES,
   isRemoteDesktopQualityPreference,
   legacyRemoteDesktopQualityPreference,
+  normalizeRemoteDesktopQualityPreference,
 } from '@shared/remote-desktop.js';
 import {
   REMOTE_DESKTOP_QUALITY_STORAGE_KEY,
@@ -74,11 +76,29 @@ describe('remote desktop quality choice', () => {
     expect(loadRemoteDesktopQualityChoice('mac', storage)).toEqual({ mode: 'custom', custom });
   });
 
+  it('publishes an explicit resolution and target bitrate floor for every quick mode', () => {
+    for (const mode of Object.keys(REMOTE_DESKTOP_QUALITY_MODE_FLOORS) as Array<keyof typeof REMOTE_DESKTOP_QUALITY_MODE_FLOORS>) {
+      const floor = REMOTE_DESKTOP_QUALITY_MODE_FLOORS[mode];
+      const preference = REMOTE_DESKTOP_QUALITY_MODE_PREFERENCES[mode];
+      expect(preference.maxBitrateBps).toBe(floor.targetBitrateBps);
+      expect(preference.maxHeight === 0 ? 1080 : preference.maxHeight)
+        .toBeGreaterThanOrEqual(floor.minHeight);
+    }
+  });
+
   it('asks a worker without Ultra for the same rungs within its own ceiling', () => {
     expect(legacyRemoteDesktopQualityPreference(REMOTE_DESKTOP_QUALITY_MODE_PREFERENCES.ultra))
       .toEqual({ maxHeight: 0, maxFps: 30, maxBitrateBps: 0, priority: 'resolution' });
     // Nothing else changes.
     expect(legacyRemoteDesktopQualityPreference(REMOTE_DESKTOP_QUALITY_MODE_PREFERENCES.saver))
       .toEqual(REMOTE_DESKTOP_QUALITY_MODE_PREFERENCES.saver);
+  });
+
+  it('normalizes legacy 720p preferences to the 1080p floor', () => {
+    const legacy = { maxHeight: 720, maxFps: 15, maxBitrateBps: 1_800_000, priority: 'balanced' } as const;
+    expect(normalizeRemoteDesktopQualityPreference(legacy)).toMatchObject({ maxHeight: 1080 });
+    expect(resolveRemoteDesktopQualityPreference({ mode: REMOTE_DESKTOP_QUALITY_MODE.CUSTOM, custom: legacy }))
+      .toMatchObject({ maxHeight: 1080 });
+    expect(legacyRemoteDesktopQualityPreference(legacy)).toMatchObject({ maxHeight: 1080 });
   });
 });

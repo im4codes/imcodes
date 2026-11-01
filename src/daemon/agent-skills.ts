@@ -20,10 +20,41 @@ import {
   type AgentSkillsError,
   type AgentSkillsRunRequest,
 } from '../../shared/agent-skills.js';
+import { isTopLevelAgentSkillEntry, parseAgentSkillMarkers, parseAgentSkillReference } from '../../shared/agent-skill-references.js';
 import { resolveNpmCliJs } from '../util/node-datachannel-repair.mjs';
+import { getSkillRegistryManagementSnapshot } from '../context/skill-registry.js';
 
 /** A SKILL.md larger than this is not read for its description. */
 const MAX_SKILL_FILE_BYTES = 256 * 1024;
+
+const SKILL_CONTENT_START = '[skill:';
+
+async function registryPayloadPath(path: string): Promise<string | undefined> {
+  try {
+    if ((await stat(path)).isFile()) return path;
+    const payload = join(path, AGENT_SKILL_FILE_NAME);
+    if ((await stat(payload)).isFile()) return payload;
+  } catch { /* unavailable on this device */ }
+  return undefined;
+}
+
+export interface AgentSkillExpansion {
+  text: string;
+  unresolved: string[];
+  expanded: string[];
+}
+
+/** Resolve a marker without silently choosing between same-name sources. */
+export function resolveAgentSkillReference(
+  reference: { name: string; source?: string },
+  skills: readonly AgentSkillEntry[],
+): AgentSkillEntry | undefined {
+  const candidates = skills.filter((skill) => skill.name === reference.name);
+  if (reference.source) {
+    return candidates.find((skill) => skill.source === reference.source || skill.sourceUrl === reference.source || skill.uri === reference.source || skill.displayPath === reference.source || `${skill.layer ?? ''}:${skill.name}` === reference.source);
+  }
+  return candidates.length === 1 ? candidates[0] : undefined;
+}
 
 function firstString(record: Record<string, unknown>, key: string, max: number): string | undefined {
   const value = record[key];
@@ -111,13 +142,19 @@ async function readLock(homeDir: string): Promise<Record<string, Record<string, 
  * Every skill in `~/.agents/skills`: a directory (or a link to one -- a Windows
  * junction included, which `stat` follows) holding a SKILL.md.
  */
-export async function listAgentSkills(homeDir: string = homedir()): Promise<AgentSkillEntry[]> {
+async function listAgentSkillsInternal(
+  homeDir: string,
+  context: { projectDir?: string },
+  topLevelOnly: boolean,
+): Promise<AgentSkillEntry[]> {
   const root = join(homeDir, ...AGENT_SKILLS_DIRECTORY_SEGMENTS);
   let names: string[];
   try {
     names = await readdir(root);
   } catch {
-    return [];
+    // A project may provide registry skills even when the user's local
+    // ~/.agents/skills root has never been created on this device.
+    names = [];
   }
   const lock = await readLock(homeDir);
   const skills: AgentSkillEntry[] = [];
@@ -140,6 +177,9 @@ export async function listAgentSkills(homeDir: string = homedir()): Promise<Agen
     skills.push({
       name,
       description: frontMatter.description,
+      layer: 'user_default',
+      displayPath: `~/.agents/skills/${name}`,
+      uri: `skill://user_default/${encodeURIComponent(name)}`,
       ...(missingBins.length > 0 ? { missingBins } : {}),
       ...(firstString(locked, 'source', AGENT_SKILLS_LIMITS.SOURCE_CHARS) ? { source: firstString(locked, 'source', AGENT_SKILLS_LIMITS.SOURCE_CHARS) } : {}),
       ...(firstString(locked, 'sourceUrl', AGENT_SKILLS_LIMITS.SOURCE_CHARS) ? { sourceUrl: firstString(locked, 'sourceUrl', AGENT_SKILLS_LIMITS.SOURCE_CHARS) } : {}),
@@ -147,7 +187,89 @@ export async function listAgentSkills(homeDir: string = homedir()): Promise<Agen
       ...(firstString(locked, 'updatedAt', 40) ? { updatedAt: firstString(locked, 'updatedAt', 40) } : {}),
     });
   }
+  try {
+    const snapshot = getSkillRegistryManagementSnapshot({ projectDir: context.projectDir, homeDir });
+    for (const entry of snapshot.entries) {
+      // The picker is device-local: registry metadata without a readable local
+      // payload must not be offered as an installable/expandable skill.
+      if (!entry.path) continue;
+      if (!(await registryPayloadPath(entry.path))) continue;
+      const name = entry.metadata.name?.trim() || entry.key;
+      if (!name || skills.length >= AGENT_SKILLS_LIMITS.SKILLS * 2) break;
+      const listed = { name, description: entry.metadata.description ?? '', layer: entry.layer, displayPath: entry.displayPath, uri: entry.uri } satisfies AgentSkillEntry;
+      if (topLevelOnly && !isTopLevelAgentSkillEntry(listed)) continue;
+      skills.push(listed);
+    }
+  } catch { /* registry is optional; local skills remain available */ }
   return skills;
+}
+
+/** List only the direct skills that the composer should offer. */
+export async function listAgentSkills(homeDir: string = homedir(), context: { projectDir?: string } = {}): Promise<AgentSkillEntry[]> {
+  return listAgentSkillsInternal(homeDir, context, true);
+}
+
+/**
+ * Expand composer `$$()` references using only known entries in this daemon's
+ * own ~/.agents/skills directory. The marker remains in the timeline text;
+ * this copy is provider-bound and never logged. Repeated references are
+ * removed after the first expansion so retries/queue drains cannot duplicate
+ * a skill body in one prompt.
+ */
+export async function expandAgentSkillReferences(
+  text: string,
+  homeDir: string = homedir(),
+  context: { projectDir?: string } = {},
+): Promise<AgentSkillExpansion> {
+  const markers = parseAgentSkillMarkers(text);
+  if (markers.length === 0) return { text, unresolved: [], expanded: [] };
+  // Expansion keeps compatibility with explicit legacy/nested references;
+  // only the picker-facing list is narrowed to top-level entries.
+  const skills = await listAgentSkillsInternal(homeDir, context, false);
+  const root = join(homeDir, ...AGENT_SKILLS_DIRECTORY_SEGMENTS);
+  const unresolved: string[] = [];
+  const expanded: string[] = [];
+  const emitted = new Set<string>();
+  const pattern = /\$\$\(([^()\r\n]{1,300})\)/gu;
+  const result = [] as string[];
+  let last = 0;
+  for (const match of text.matchAll(pattern)) {
+    const index = match.index ?? 0;
+    const body = match[1]?.trim() ?? '';
+    const reference = parseAgentSkillReference(body);
+    if (!reference) continue;
+    result.push(text.slice(last, index));
+    last = index + match[0].length;
+    const skill = resolveAgentSkillReference(reference, skills);
+    if (!skill) {
+      unresolved.push(body);
+      result.push(match[0]);
+      continue;
+    }
+    if (emitted.has(body)) continue;
+    try {
+      let skillPath = join(root, skill.name, AGENT_SKILL_FILE_NAME);
+      if (!skill.displayPath?.startsWith('~/.agents/skills/')) {
+        const registry = getSkillRegistryManagementSnapshot({ projectDir: context.projectDir, homeDir });
+        const entry = registry.entries.find((candidate) => candidate.uri === skill.uri);
+        if (entry?.path) skillPath = (await registryPayloadPath(entry.path)) ?? skillPath;
+      }
+      const content = await readFile(skillPath, 'utf8');
+      if (!content.trim() || Buffer.byteLength(content, 'utf8') > MAX_SKILL_FILE_BYTES) {
+        unresolved.push(body);
+        result.push(match[0]);
+        continue;
+      }
+      emitted.add(body);
+      expanded.push(body);
+      result.push(`\n${SKILL_CONTENT_START} ${skill.name}]\n${content.trim()}\n[/skill: ${skill.name}]`);
+    } catch {
+      unresolved.push(body);
+      result.push(match[0]);
+    }
+  }
+  result.push(text.slice(last));
+  return { text: result.join(''), unresolved: [...new Set(unresolved)], expanded };
 }
 
 /** The CLI arguments for one request; the request is already validated. */
@@ -273,7 +395,8 @@ export async function handleAgentSkillsCommand(
   const requestId = typeof cmd.requestId === 'string' && cmd.requestId.length <= 128 ? cmd.requestId : undefined;
   if (!requestId) return;
   if (cmd.type === AGENT_SKILLS_MSG.LIST_REQUEST) {
-    send({ type: AGENT_SKILLS_MSG.LIST_RESPONSE, requestId, skills: await listAgentSkills() });
+    const projectDir = typeof cmd.projectDir === 'string' && cmd.projectDir.length < 4096 ? cmd.projectDir : undefined;
+    send({ type: AGENT_SKILLS_MSG.LIST_RESPONSE, requestId, skills: await listAgentSkills(homedir(), { projectDir }) });
     return;
   }
   if (cmd.type !== AGENT_SKILLS_MSG.RUN_REQUEST) return;

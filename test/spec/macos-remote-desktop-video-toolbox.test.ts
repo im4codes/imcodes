@@ -66,6 +66,16 @@ describe('macOS VideoToolbox H.264 encoder adapter', () => {
     expect(implementation).toContain('VideoToolboxEncoderKind::kQualifiedAppleSoftware');
   });
 
+  it('keeps an Ultra/4K quality selection at native resolution under encode backlog', async () => {
+    // Ultra is an explicit viewer resolution contract. The latency-first
+    // governor may reduce rate, but it must not apply its downscale levels to
+    // the 2160p ladder rungs.
+    expect(implementation).toContain('preserve_ultra_resolution');
+    expect(implementation).toMatch(
+      /preserve_ultra_resolution\s*\?\s*0\s*:/u,
+    );
+  });
+
   it('defaults Apple software fallback on and qualified, with one source of truth', async () => {
     // Real-hardware counterexample: on a Mac Pro 6,1 the hardware probe returns
     // -12903 (kVTVideoEncoderNotAvailableNow) while a software-only session

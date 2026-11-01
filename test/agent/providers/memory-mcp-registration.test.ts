@@ -2,6 +2,7 @@ import { readFile } from 'node:fs/promises';
 import { parseMcpRuntimeCallerFromEnv } from '../../../src/daemon/memory-mcp-caller.js';
 import { describe, expect, it } from 'vitest';
 import {
+  CLAUDE_CODE_CLI_SDK_AGENT_TYPE,
   PROCESS_SESSION_AGENT_TYPES,
   TRANSPORT_SESSION_AGENT_TYPES,
 } from '../../../shared/agent-types.js';
@@ -113,7 +114,7 @@ describe('managed provider MCP registration helpers', () => {
 
     expect(TRANSPORT_SESSION_AGENT_TYPES.filter((agentType) => (
       !MEMORY_MCP_PROVIDER_IDS.includes(agentType as (typeof MEMORY_MCP_PROVIDER_IDS)[number])
-    ))).toEqual([AGY_SDK_PROVIDER_ID, 'openclaw']);
+    ))).toEqual([AGY_SDK_PROVIDER_ID, CLAUDE_CODE_CLI_SDK_AGENT_TYPE, 'openclaw']);
     expect(PROCESS_SESSION_AGENT_TYPES.some((agentType) => (
       MEMORY_MCP_PROVIDER_IDS.includes(agentType as (typeof MEMORY_MCP_PROVIDER_IDS)[number])
     ))).toBe(false);

@@ -394,6 +394,50 @@ describe('shared-context and file API contracts', () => {
     ))).toEqual(['0', String(FILE_TRANSFER_RESUMABLE_UPLOAD.CHUNK_BYTES)]);
   });
 
+  it('reports server-committed chunk progress when the WebView emits no upload events', async () => {
+    const { FILE_TRANSFER_RESUMABLE_UPLOAD } = await import('@shared/transport/file-transfer.js');
+    const size = FILE_TRANSFER_RESUMABLE_UPLOAD.CHUNK_BYTES + 2;
+    const file = {
+      name: 'webview-large.bin',
+      type: 'application/octet-stream',
+      size,
+      lastModified: 42,
+      slice: (start: number, end: number) => new Blob([new Uint8Array(Math.max(0, end - start))], {
+        type: 'application/octet-stream',
+      }),
+    } as unknown as File;
+    let call = 0;
+    MockXmlHttpRequest.sendHook = (xhr) => {
+      call += 1;
+      // Deliberately do not emit xhr.upload.onprogress: this is the mobile
+      // WebView behavior that left a relay row at 0% while chunks committed.
+      if (call === 1) {
+        xhr.responseText = JSON.stringify({
+          ok: true,
+          complete: false,
+          committedBytes: FILE_TRANSFER_RESUMABLE_UPLOAD.CHUNK_BYTES,
+        });
+      } else {
+        xhr.responseText = JSON.stringify({
+          ok: true,
+          attachment: {
+            id: 'att-webview-large', source: 'upload', serverId: 'srv-1', daemonPath: '/tmp/webview-large.bin',
+            createdAt: '2026-05-11T00:00:00Z', downloadable: true,
+          },
+        });
+      }
+      queueMicrotask(() => xhr.onload?.());
+      return true;
+    };
+    const progress: number[] = [];
+    const { uploadFile } = await import('../src/api.js');
+
+    await expect(uploadFile('srv-1', file, (pct) => progress.push(pct), 'client-webview-large'))
+      .resolves.toMatchObject({ attachment: { id: 'att-webview-large' } });
+    expect(progress).toContain(50);
+    expect(progress.at(-1)).toBe(100);
+  });
+
   it('deletes uploaded attachments through the dedicated server route', async () => {
     const fetchMock = vi.mocked(fetch);
     fetchMock.mockResolvedValueOnce(jsonResponse({ ok: true }));

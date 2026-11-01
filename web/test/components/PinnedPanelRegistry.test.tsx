@@ -90,6 +90,33 @@ describe('pinned cron manager panel', () => {
     expect(cronManagerProps[0].ws).toBe(ws);
     expect(cronManagerProps[0].portalSubPanels).toBe(true);
   });
+
+  it('keeps a whole-server shared Cron panel unscoped to the active session', () => {
+    render(
+      <>{renderPanelContent(
+        { id: 'cronmanager:shared-server', type: 'cronmanager', props: { projectName: 'project' } },
+        {
+          ws: {} as any,
+          connected: true,
+          serverId: 'srv',
+          subSessions: [],
+          activeSession: 'deck_project_brain',
+          sharedAccessRole: 'participant',
+          shareTargetKind: 'server',
+          sessions: [{
+            name: 'deck_project_brain', project: 'project', role: 'main', agentType: 'codex', state: 'idle',
+          }],
+          t: (key: string) => key,
+        },
+      )}</>,
+    );
+
+    expect(cronManagerProps[0]).toMatchObject({
+      sharedSessionName: undefined,
+      sharedScope: true,
+      readOnly: false,
+    });
+  });
 });
 
 describe('pinned file browser panel', () => {

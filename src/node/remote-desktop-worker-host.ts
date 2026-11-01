@@ -1253,11 +1253,25 @@ export class RemoteDesktopWorkerHost {
           void this.retryOnOtherDesktop(event.value, tracked);
           continue;
         }
+        // A worker process/socket is multiplexed across viewers. Retire the
+        // whole generation only when this terminal is its sole tracked
+        // authority; otherwise one viewer's protocol failure must not drop
+        // healthy shared viewers on the same pipe.
+        const soleSession = this.core.size === 1;
         this.untrack(
           event.value.sessionId,
           REMOTE_DESKTOP_WORKER_DECLARED_TERMINAL_CLEANUP_REASON,
           event.value.reason,
         );
+        // A declared protocol/worker terminal is also a process-generation
+        // boundary. Retire the socket only for a sole session so a poisoned
+        // worker cannot be reused for its replacement, while a shared worker
+        // continues serving unrelated viewers.
+        if (soleSession
+          && (event.value.reason === REMOTE_DESKTOP_TERMINAL_REASON.PROTOCOL_ERROR
+            || event.value.reason === REMOTE_DESKTOP_TERMINAL_REASON.WORKER_FAILED)) {
+          socket.destroy();
+        }
       }
       this.onMessage(event.value);
     }
@@ -1350,7 +1364,8 @@ export class RemoteDesktopWorkerHost {
       // the self-declared terminal is reaped the same way. Other cleanup
       // reasons keep the existing behaviour: a controller stop lets the worker
       // exit on its own, and a pipe that already closed proves it is gone.
-      if (cleanupReason === REMOTE_DESKTOP_WORKER_DECLARED_TERMINAL_CLEANUP_REASON) {
+      if (cleanupReason === REMOTE_DESKTOP_WORKER_DECLARED_TERMINAL_CLEANUP_REASON
+        && this.core.size === 1) {
         this.reapWorkerProcess(connection?.workerPid);
       }
     }

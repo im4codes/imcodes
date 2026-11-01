@@ -1,6 +1,7 @@
 import type { LaunchOpts } from './session-manager.js';
 import type { SessionRecord } from '../store/session-store.js';
 import type { AgentType } from './detect.js';
+import { isClaudeCodeSdkAgentType } from '../../shared/agent-types.js';
 import type { RemoteSessionInfo } from './transport-provider.js';
 import { canonicalizeTransportCwd } from './transport-paths.js';
 import { isCodeBuddyProviderId } from '../../shared/codebuddy.js';
@@ -40,7 +41,7 @@ export function resolveTransportConversationKey(
     | undefined,
 ): string | undefined {
   if (!record) return undefined;
-  const key = record.agentType === 'claude-code-sdk'
+  const key = isClaudeCodeSdkAgentType(record.agentType)
     ? record.ccSessionId
     : record.agentType === 'codex-sdk'
       ? record.codexSessionId
@@ -126,9 +127,9 @@ export function buildTransportResumeLaunchOpts(record: SessionRecord): LaunchOpt
     requestedModel: record.requestedModel,
     effort: record.effort,
     transportConfig: record.transportConfig,
-    ccPreset: (record.agentType === 'claude-code-sdk' || record.agentType === 'qwen' || record.agentType === 'deepseek-harness' || record.agentType === 'pi') ? record.ccPreset : undefined,
+    ccPreset: (isClaudeCodeSdkAgentType(record.agentType) || record.agentType === 'qwen' || record.agentType === 'deepseek-harness' || record.agentType === 'pi') ? record.ccPreset : undefined,
     // Thread resume ids back so the provider reuses the same conversation.
-    ...(record.agentType === 'claude-code-sdk' && record.ccSessionId ? { ccSessionId: record.ccSessionId } : {}),
+    ...(isClaudeCodeSdkAgentType(record.agentType) && record.ccSessionId ? { ccSessionId: record.ccSessionId } : {}),
     ...(record.agentType === 'codex-sdk' && record.codexSessionId ? { codexSessionId: record.codexSessionId } : {}),
     ...(usesProviderResumeId(record.agentType) && record.providerResumeId
       ? { providerResumeId: record.providerResumeId } : {}),

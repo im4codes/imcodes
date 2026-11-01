@@ -39,6 +39,19 @@ describe('ServerIconBar labels', () => {
     expect(button.querySelector('.server-icon-letter')?.getAttribute('aria-hidden')).toBe('true');
   });
 
+  it('marks only canonical pinned servers with a compact pin', () => {
+    const { container } = render(
+      <ServerIconBar
+        servers={[server('a', 'vm-124'), server('b', 'vm-125')]}
+        activeServerId={null}
+        pinnedServerIds={new Set(['a'])}
+        onSelectServer={() => {}}
+      />,
+    );
+    expect(container.querySelector('button[aria-label=\"vm-124\"] .server-icon-pin')?.textContent).toBe('📌');
+    expect(container.querySelector('button[aria-label=\"vm-125\"] .server-icon-pin')).toBeNull();
+  });
+
   it('keeps the status dot, the upgrade arrow, selection and the context menu working', () => {
     const onSelect = vi.fn();
     const onMenu = vi.fn();

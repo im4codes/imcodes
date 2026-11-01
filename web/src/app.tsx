@@ -79,7 +79,7 @@ import { SharedStateIndicator } from './components/SharedStateIndicator.js';
 import { applyGlobalFontPrefs, DEFAULT_CHAT_FONT, useFontPrefs } from './components/FontPrefsDropdown.js';
 import { useQuickData } from './components/QuickInputPanel.js';
 import { NewSessionDialog } from './components/NewSessionDialog.js';
-import { SubSessionBar, SUBSESSION_BAR_COLLAPSED_STORAGE_KEY } from './components/SubSessionBar.js';
+import { SubSessionBar, SUBSESSION_BAR_COLLAPSED_MIGRATION_KEY, SUBSESSION_BAR_COLLAPSED_STORAGE_KEY } from './components/SubSessionBar.js';
 import {
   loadSubSessionDesktopDockSide,
   loadSubSessionDesktopLayout,
@@ -207,6 +207,7 @@ import {
 } from './session-list-merge.js';
 import { resolveSessionInfoRuntimeType } from './runtime-type.js';
 import { useSyncedPreference } from './hooks/useSyncedPreference.js';
+import { normalizePinnedServers, normalizeServerOrder, sortServersByPreference } from './server-order.js';
 import { parseString, parseBooleanish, usePref } from './hooks/usePref.js';
 import { CLAUDE_WEEKLY_QUOTA_PREF_KEY } from '@shared/claude-quota.js';
 import type { SharedActorEnvelope } from '@shared/tab-sharing.js';
@@ -997,9 +998,22 @@ export function App() {
   const [subSessionBarCollapsed, setSubSessionBarCollapsed] = useState(() => {
     try {
       const raw = localStorage.getItem(SUBSESSION_BAR_COLLAPSED_STORAGE_KEY);
-      if (raw !== null) return JSON.parse(raw) === true;
+      const migrated = localStorage.getItem(SUBSESSION_BAR_COLLAPSED_MIGRATION_KEY) === '1';
+      if (raw !== null) {
+        const value = JSON.parse(raw) === true;
+        // Before v2, the desktop default was expanded and indistinguishable
+        // from an explicit choice. Migrate that legacy default once; all
+        // subsequent explicit toggles are persisted normally.
+        if (!migrated && value === false) {
+          localStorage.setItem(SUBSESSION_BAR_COLLAPSED_MIGRATION_KEY, '1');
+          return true;
+        }
+        return value;
+      }
+      localStorage.setItem(SUBSESSION_BAR_COLLAPSED_MIGRATION_KEY, '1');
+      return true;
     } catch { /* ignore */ }
-    return /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
+    return true;
   });
   useEffect(() => {
     try {
@@ -2090,6 +2104,15 @@ export function App() {
     0,
   );
   const pinnedTabs = useMemo(() => new Set(pinnedTabsArr), [pinnedTabsArr]);
+  const [pinnedSubSessionArr, setPinnedSubSessionArr] = useSyncedPreference<string[]>('subsession_pinned', [], 0);
+  const pinnedSubSessionIds = useMemo(() => new Set(pinnedSubSessionArr), [pinnedSubSessionArr]);
+  const togglePinnedSubSession = useCallback((id: string) => {
+    setPinnedSubSessionArr((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      return [...next];
+    });
+  }, [setPinnedSubSessionArr]);
   const togglePinnedTab = useCallback((name: string) => {
     setPinnedTabsArr((prev) => {
       const set = new Set(prev);
@@ -2098,6 +2121,47 @@ export function App() {
       return [...set];
     });
   }, [setPinnedTabsArr]);
+  // Server navigation order and pin priority are user preferences, so they
+  // follow the same cross-device sync path as session tabs. Scope the browser
+  // cache by user to avoid briefly showing another account's arrangement.
+  const serverPreferenceScope = auth?.userId ?? 'anonymous';
+  const [serverOrder, setServerOrder, serverOrderHydrated] = useSyncedPreference<string[]>(
+    'server_order',
+    [],
+    0,
+    serverPreferenceScope,
+  );
+  const [serverPinned, setServerPinned, serverPinnedHydrated] = useSyncedPreference<string[]>(
+    'server_pinned',
+    [],
+    0,
+    serverPreferenceScope,
+  );
+  const orderedServers = useMemo(
+    () => sortServersByPreference(servers, serverOrder, serverPinned),
+    [servers, serverOrder, serverPinned],
+  );
+  const pinnedServerIds = useMemo(
+    () => new Set(normalizePinnedServers(servers, serverPinned)),
+    [servers, serverPinned],
+  );
+  useEffect(() => {
+    if (!serversLoaded || !serverOrderHydrated || !serverPinnedHydrated) return;
+    const nextOrder = normalizeServerOrder(servers, serverOrder);
+    if (JSON.stringify(nextOrder) !== JSON.stringify(serverOrder)) setServerOrder(nextOrder);
+    const nextPinned = normalizePinnedServers(servers, serverPinned);
+    if (JSON.stringify(nextPinned) !== JSON.stringify(serverPinned)) setServerPinned(nextPinned);
+  // The comparisons above prevent a persistence loop after reconciliation.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [servers, serversLoaded, serverOrder, serverPinned, serverOrderHydrated, serverPinnedHydrated]);
+  const toggleServerPinned = useCallback((serverId: string) => {
+    setServerPinned((previous) => {
+      const current = normalizePinnedServers(servers, previous);
+      return current.includes(serverId)
+        ? current.filter((id) => id !== serverId)
+        : [...current, serverId];
+    });
+  }, [servers, setServerPinned]);
   const [newUserGuidePref, setNewUserGuidePref] = useSyncedPreference<NewUserGuidePref>('new_user_guide', DEFAULT_NEW_USER_GUIDE_PREF, 0);
   const [teamDiscussionGuidePref, setTeamDiscussionGuidePref] = useSyncedPreference<TeamDiscussionGuidePref>('team_discussion_guide', DEFAULT_TEAM_DISCUSSION_GUIDE_PREF, 0);
   const [featureAnnouncementsPending, setFeatureAnnouncementsPending] = useState(true);
@@ -3249,7 +3313,7 @@ export function App() {
         ? `deck_sub_${selectedShareTarget.subSessionId}`
         : selectedShareTarget.kind === 'main'
           ? selectedShareTarget.sessionName
-          : (activeSession ?? undefined))
+          : undefined)
     : undefined;
   const { subSessions, visibleSubSessions, loadedServerId, create: createSubSession, close: closeSubSession, restart: restartSubSession, rename: renameSubSession, updateLocal: updateSubLocal, hydrateShared: hydrateSharedSubSessions } = useSubSessions(
     (nativeReady && auth) ? selectedServerId : null,
@@ -6118,8 +6182,14 @@ export function App() {
   }
 
   const activeSessionInfo = sessions.find((s) => s.name === activeSession) ?? null;
+  // Session list refreshes can replace the initially hydrated sharedState. Keep
+  // the share entry's role as the durable fallback so a whole-server
+  // participant does not briefly become a viewer (and lose cron controls).
+  const selectedSharedEntry = selectedSharedEntryId
+    ? sharedEntries.find((entry) => entry.id === selectedSharedEntryId)
+    : null;
   const sharedAccessRole = selectedShareTarget
-    ? (activeSessionInfo?.sharedState?.effectiveRole ?? 'viewer')
+    ? (selectedSharedEntry?.role ?? activeSessionInfo?.sharedState?.effectiveRole ?? 'viewer')
     : null;
   const supervisionTaskConsoleVisibility = {
     session: activeSessionInfo,
@@ -6743,7 +6813,7 @@ export function App() {
       {!isMobile && (
         <>
           <ServerIconBar
-            servers={servers}
+            servers={orderedServers}
             activeServerId={selectedServerId}
             onSelectServer={handleSelectServer}
             onServerContextMenu={(server, x, y) => setServerCtxMenu({ server, x, y })}
@@ -6755,6 +6825,7 @@ export function App() {
             onAdmin={() => setShowAdminPage(true)}
             sharedServerStates={managedSharedServerStateById}
             returnHintServerId={showSharedReturnGuide ? sharedReturnServer?.id : null}
+            pinnedServerIds={pinnedServerIds}
           />
           <Sidebar
             collapsed={sidebarCollapsed}
@@ -6875,7 +6946,7 @@ export function App() {
                 shareTargetKind: selectedShareTarget?.kind ?? null,
                 sharedSessionName: canonicalSharedSessionName,
                 sessions,
-                servers: servers.map(s => ({ id: s.id, name: s.name })),
+                servers: orderedServers.map(s => ({ id: s.id, name: s.name })),
                 onQuote: (text) => {
                   const inputEl = activeSession ? inputRefsMap.current.get(activeSession) : null;
                   if (inputEl) {
@@ -6921,7 +6992,7 @@ export function App() {
           </span>
         </div>
         <div class="server-list">
-          {servers.map((server) => {
+          {orderedServers.map((server) => {
             const online = isServerOnline(server);
             return (
               <button
@@ -6933,7 +7004,16 @@ export function App() {
                 <span class="server-item-dot" style={{ color: online ? '#4ade80' : '#475569' }}>
                   {online ? '●' : '○'}
                 </span>
-                {server.name}
+                {pinnedServerIds.has(server.id) && (
+                  <span
+                    class="server-item-pin"
+                    aria-label={trans('session.pinned', { defaultValue: 'Pinned' })}
+                    title={trans('session.pinned', { defaultValue: 'Pinned' })}
+                  >
+                    📌
+                  </span>
+                )}
+                <span class="server-item-name">{server.name}</span>
               </button>
             );
           })}
@@ -7029,7 +7109,7 @@ export function App() {
             )}
             <Suspense fallback={<div style={{ textAlign: 'center', padding: 48, color: '#64748b' }}>Loading...</div>}>
               <DashboardPage
-                servers={servers}
+                servers={orderedServers}
                 onSelectServer={handleSelectServer}
                 onDeleteServer={(server) => setDeleteTarget(server)}
                 onLogout={handleLogout}
@@ -7082,16 +7162,25 @@ export function App() {
                         ⇄ Switch Cloud Server
                       </button>
                     )}
-                    {servers.map((s) => {
+                    {orderedServers.map((s) => {
                       const online = isServerOnline(s);
                       return (
                         <button
                           key={s.id}
-                          class={`mobile-server-menu-item${s.id === selectedServerId ? ' active' : ''}${showSharedReturnGuide && s.id === sharedReturnServer?.id ? ' server-return-hint' : ''}`}
+                          class={`mobile-server-menu-item mobile-server-menu-server${s.id === selectedServerId ? ' active' : ''}${showSharedReturnGuide && s.id === sharedReturnServer?.id ? ' server-return-hint' : ''}`}
                           onClick={() => { handleSelectServer(s.id, s.name); setShowMobileServerMenu(false); }}
                           onContextMenu={(e) => { e.preventDefault(); setShowMobileServerMenu(false); setServerCtxMenu({ server: s, x: e.clientX, y: e.clientY }); }}
                         >
                           <span style={{ color: online ? '#4ade80' : '#475569' }}>{online ? '●' : '○'}</span>
+                          {pinnedServerIds.has(s.id) && (
+                            <span
+                              class="mobile-server-menu-pin"
+                              aria-label={trans('session.pinned', { defaultValue: 'Pinned' })}
+                              title={trans('session.pinned', { defaultValue: 'Pinned' })}
+                            >
+                              📌
+                            </span>
+                          )}
                           <span class="mobile-server-menu-name">{s.name}</span>
                           <SharedStateIndicator state={managedSharedServerStateById.get(s.id) ?? null} iconOnly variant="shared-out" />
                         </button>
@@ -7110,7 +7199,7 @@ export function App() {
                         onRefresh={() => void refreshSharedEntries()}
                       />
                     )}
-                    <div style={{ padding: '6px 12px', borderTop: '1px solid #334155' }}>
+                    <div class="mobile-server-menu-language" style={{ padding: '6px 12px', borderTop: '1px solid #334155' }}>
                       <LanguageSwitcher />
                     </div>
                   </div>
@@ -7528,6 +7617,9 @@ export function App() {
                 onRestore={restoreSubSession}
                 onRestoreThenClose={minimizeSubSessionWindow}
                 onRestart={restartSubSession}
+                onRenameSubSession={(id, label) => renameSubSession(id, label ?? '')}
+                pinnedSubSessionIds={pinnedSubSessionIds}
+                onToggleSubSessionPin={togglePinnedSubSession}
                 onNew={canCreateSubSession ? () => setShowSubDialog(true) : undefined}
                 onViewAutoDeliver={() => runVersionSensitiveAction(trans('openspec.auto.list_title'), () => { setDiscussionInitialId(null); setDiscussionInitialTab('auto'); setShowDiscussionsPage(true); })}
                 openSpecAutoProjection={appOpenSpecAutoRunbarVisible ? appOpenSpecAutoProjection : null}
@@ -7649,7 +7741,7 @@ export function App() {
               {/* Server switcher — collapsible via sidebar toggle */}
               {(servers.length > 0 || sharedEntriesLoading || sharedEntriesError !== null || sharedEntries.length > 0) && !mobileHideServerBar && (
                 <div style={{ padding: '8px 12px', borderBottom: '1px solid #1e293b' }}>
-                  {servers.map((s) => {
+                  {orderedServers.map((s) => {
                     const online = isServerOnline(s);
                     return (
                       <button
@@ -7661,7 +7753,16 @@ export function App() {
                         <span class="server-item-dot" style={{ color: online ? '#4ade80' : '#475569' }}>
                           {online ? '●' : '○'}
                         </span>
-                        {s.name}
+                        {pinnedServerIds.has(s.id) && (
+                          <span
+                            class="server-item-pin"
+                            aria-label={trans('session.pinned', { defaultValue: 'Pinned' })}
+                            title={trans('session.pinned', { defaultValue: 'Pinned' })}
+                          >
+                            📌
+                          </span>
+                        )}
+                        <span class="server-item-name">{s.name}</span>
                       </button>
                     );
                   })}
@@ -7730,7 +7831,7 @@ export function App() {
                   sharedAccessRole,
                   shareTargetKind: selectedShareTarget?.kind ?? null,
                   sessions,
-                  servers: servers.map(s => ({ id: s.id, name: s.name })),
+                  servers: orderedServers.map(s => ({ id: s.id, name: s.name })),
                   onQuote: (text) => {
                     const inputEl = activeSession ? inputRefsMap.current.get(activeSession) : null;
                     if (inputEl) {
@@ -7991,6 +8092,7 @@ export function App() {
               subSessions={subSessionsSlim}
               activeSession={activeSession}
               sharedSessionName={canonicalSharedSessionName}
+              sharedScope={Boolean(selectedShareTarget)}
               readOnly={sharedAccessRole === 'viewer'}
               onNavigateSession={(sessionName, quote) => {
                 setShowCronManager(false);
@@ -7998,7 +8100,7 @@ export function App() {
               }}
               onBack={() => setShowCronManager(false)}
               onViewDiscussion={(fileId) => runVersionSensitiveAction(trans('p2p.discussions.title'), () => { setDiscussionInitialId(fileId); setShowDiscussionsPage(true); })}
-              servers={servers.map(s => ({ id: s.id, name: s.name }))}
+              servers={orderedServers.map(s => ({ id: s.id, name: s.name }))}
               ws={wsRef.current}
             />
           </FloatingPanel>
@@ -8417,6 +8519,8 @@ export function App() {
         <ServerContextMenu
           x={serverCtxMenu.x}
           y={serverCtxMenu.y}
+          pinned={normalizePinnedServers(servers, serverPinned).includes(serverCtxMenu.server.id)}
+          onTogglePin={() => toggleServerPinned(serverCtxMenu.server.id)}
           onRename={() => handleRenameServer(serverCtxMenu.server)}
           onUpgrade={() => handleUpgradeDaemon(serverCtxMenu.server)}
           onUpgradeAll={servers.length > 1 ? handleUpgradeAll : undefined}

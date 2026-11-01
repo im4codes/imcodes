@@ -135,6 +135,9 @@ export const MEMORY_MCP_TOOL_NAMES = {
   PAIR_SET_MAX_CONCURRENCY: 'pair_set_max_concurrency',
   PAIR_GET_MAX_CONCURRENCY: 'pair_get_max_concurrency',
   PAIR_WORKSPACE_GC: 'pair_workspace_gc',
+  PAIR_HISTORY: 'pair_history',
+  PAIR_DECISION_RECORD: 'pair_decision_record',
+  PAIR_DECISION_HISTORY: 'pair_decision_history',
   SESSION_TEXT_HISTORY: 'session_history',
   SESSION_RUNTIME_IDENTITY_GET: 'session_runtime_identity_get',
   SESSION_RESTART: 'session_restart',
@@ -160,6 +163,10 @@ export const MEMORY_MCP_TOOL_NAMES = {
   CRON_LIST: 'cron_list',
   CRON_UPDATE: 'cron_update',
   CRON_DELETE: 'cron_delete',
+  CRON_PAUSE_SELF: 'cron_pause_self',
+  CRON_RESUME_SELF: 'cron_resume_self',
+  CRON_PAUSE: 'cron_pause',
+  CRON_RESUME: 'cron_resume',
   // Machine remote-exec surface — FULL-only (see FULL_ONLY_MCP_TOOLS).
   LIST_MACHINES: 'list_machines',
   EXEC_REMOTE: 'exec_remote',
@@ -203,6 +210,9 @@ export const MEMORY_MCP_TOOL_NAME_LIST = [
   MEMORY_MCP_TOOL_NAMES.SEND_LIST_TARGETS,
   MEMORY_MCP_TOOL_NAMES.PAIR_LIST,
   MEMORY_MCP_TOOL_NAMES.PAIR_GET,
+  MEMORY_MCP_TOOL_NAMES.PAIR_HISTORY,
+  MEMORY_MCP_TOOL_NAMES.PAIR_DECISION_RECORD,
+  MEMORY_MCP_TOOL_NAMES.PAIR_DECISION_HISTORY,
   MEMORY_MCP_TOOL_NAMES.PAIR_CREATE,
   MEMORY_MCP_TOOL_NAMES.PAIR_DISPATCH,
   MEMORY_MCP_TOOL_NAMES.PAIR_CLOSE,
@@ -233,6 +243,10 @@ export const MEMORY_MCP_TOOL_NAME_LIST = [
   MEMORY_MCP_TOOL_NAMES.CRON_LIST,
   MEMORY_MCP_TOOL_NAMES.CRON_UPDATE,
   MEMORY_MCP_TOOL_NAMES.CRON_DELETE,
+  MEMORY_MCP_TOOL_NAMES.CRON_PAUSE_SELF,
+  MEMORY_MCP_TOOL_NAMES.CRON_RESUME_SELF,
+  MEMORY_MCP_TOOL_NAMES.CRON_PAUSE,
+  MEMORY_MCP_TOOL_NAMES.CRON_RESUME,
   MEMORY_MCP_TOOL_NAMES.LIST_MACHINES,
   MEMORY_MCP_TOOL_NAMES.EXEC_REMOTE,
   MEMORY_MCP_TOOL_NAMES.SEND_FILE_TO_MACHINE,
@@ -322,6 +336,7 @@ export const PAIR_BRAIN_ACTION_TOOL_NAMES: readonly string[] = [
   MEMORY_MCP_TOOL_NAMES.PAIR_NEXT_ROUND,
   MEMORY_MCP_TOOL_NAMES.PAIR_TASK_UPDATE,
   MEMORY_MCP_TOOL_NAMES.PAIR_TASK_CHECK,
+  MEMORY_MCP_TOOL_NAMES.PAIR_DECISION_RECORD,
 ];
 
 export const MEMORY_MCP_CAPS = {
@@ -802,6 +817,42 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
     description: 'Get one caller-Brain task pair with its brief and recent durable events.',
     inputSchema: objectSchema({ taskId: stringSchema('Exact task-pair id.'), eventLimit: numberSchema('Optional maximum recent events.') }, ['taskId']),
     outputSchema: objectSchema({ status: stringSchema('ok or error.'), pair: { type: 'object' } }),
+  },
+  [MEMORY_MCP_TOOL_NAMES.PAIR_HISTORY]: {
+    name: MEMORY_MCP_TOOL_NAMES.PAIR_HISTORY,
+    description: 'Brain-only: read recent text, calls, or summary history for both participants of one task pair. Uses the same bounded readers and redaction rules as session_history; auditor=none is reported as missing.',
+    inputSchema: objectSchema({
+      taskId: stringSchema('Exact task-pair id.'),
+      role: { type: 'string', enum: ['executor', 'auditor'], description: 'Optional participant role; omit to read both.' },
+      kind: { type: 'string', enum: ['text', 'tool', 'summary'], description: 'History kind; defaults to text.' },
+      limit: numberSchema('Requested history count per participant; 1..200.'),
+    }, ['taskId']),
+    outputSchema: objectSchema({ status: stringSchema('ok or error.'), taskId: stringSchema('Resolved task-pair id.'), kind: stringSchema('Requested history kind.'), requested: numberSchema('Requested per-participant limit.'), participants: { type: 'array', items: { type: 'object' } } }),
+  },
+  [MEMORY_MCP_TOOL_NAMES.PAIR_DECISION_RECORD]: {
+    name: MEMORY_MCP_TOOL_NAMES.PAIR_DECISION_RECORD,
+    description: 'Persist one participant or Brain decision for a task-pair round. The caller identity is recorded as author; retries with the same idempotencyKey are idempotent.',
+    inputSchema: objectSchema({
+      taskId: stringSchema('Exact task-pair id.'),
+      kind: { type: 'string', enum: ['request', 'decision'], description: 'request from executor/auditor, or final decision from Brain; defaults to decision.' },
+      round: numberSchema('Audit/decision round (positive integer).'),
+      conclusion: stringSchema('Short decision conclusion.'),
+      summary: stringSchema('Bounded decision summary; do not include the full brief or logs.'),
+      related: { type: 'array', maxItems: 20, items: stringSchema('Optional related task or artifact reference.') },
+      idempotencyKey: stringSchema('Stable retry key for this decision write.'),
+    }, ['taskId', 'round', 'conclusion', 'summary']),
+    outputSchema: objectSchema({ status: stringSchema('ok or error.'), created: { type: 'boolean' }, decision: { type: 'object' } }),
+  },
+  [MEMORY_MCP_TOOL_NAMES.PAIR_DECISION_HISTORY]: {
+    name: MEMORY_MCP_TOOL_NAMES.PAIR_DECISION_HISTORY,
+    description: 'Brain-only: read bounded durable decisions for one task pair, or merge the recent decisions for two task pairs. Results are newest first with a stable timestamp/id tie-break.',
+    inputSchema: objectSchema({
+      taskId: stringSchema('Exact task-pair id.'),
+      relatedTaskId: stringSchema('Optional second task-pair id.'),
+      taskIds: { type: 'array', minItems: 1, maxItems: 2, items: stringSchema('One or two exact task-pair ids.') },
+      limit: numberSchema('Maximum records: 20 for one task, 40 for two.'),
+    }, ['taskId']),
+    outputSchema: objectSchema({ status: stringSchema('ok or error.'), decisions: { type: 'array', items: { type: 'object' } } }),
   },
   [MEMORY_MCP_TOOL_NAMES.PAIR_CREATE]: {
     name: MEMORY_MCP_TOOL_NAMES.PAIR_CREATE,
@@ -1335,6 +1386,10 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
     }, ['id']),
     outputSchema: statusSchema,
   },
+  [MEMORY_MCP_TOOL_NAMES.CRON_PAUSE_SELF]: { name: MEMORY_MCP_TOOL_NAMES.CRON_PAUSE_SELF, description: 'Pause a current-session cron job.', inputSchema: objectSchema({ id: stringSchema('Current-session job id.') }, ['id']), outputSchema: statusSchema },
+  [MEMORY_MCP_TOOL_NAMES.CRON_RESUME_SELF]: { name: MEMORY_MCP_TOOL_NAMES.CRON_RESUME_SELF, description: 'Resume a current-session cron job.', inputSchema: objectSchema({ id: stringSchema('Current-session job id.') }, ['id']), outputSchema: statusSchema },
+  [MEMORY_MCP_TOOL_NAMES.CRON_PAUSE]: { name: MEMORY_MCP_TOOL_NAMES.CRON_PAUSE, description: 'Pause a scoped cron job.', inputSchema: objectSchema({ id: stringSchema('Job id.') }, ['id']), outputSchema: statusSchema },
+  [MEMORY_MCP_TOOL_NAMES.CRON_RESUME]: { name: MEMORY_MCP_TOOL_NAMES.CRON_RESUME, description: 'Resume a scoped cron job.', inputSchema: objectSchema({ id: stringSchema('Job id.') }, ['id']), outputSchema: statusSchema },
   [MEMORY_MCP_TOOL_NAMES.LIST_MACHINES]: {
     name: MEMORY_MCP_TOOL_NAMES.LIST_MACHINES,
     description:
@@ -1430,7 +1485,7 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
   },
   [MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_CALL]: {
     name: MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_CALL,
-    description: 'GUI/browser control locally or remotely. Do not use GUI OCU for a shell/CLI/executable request. A helper failure does not mean the machine is unauthorized or uncontrollable. Use shell_session1 only for active-user semantics. Prefer browser_open/browser_snapshot. Pass a canonical 10-digit nodeId or complete ^^(nodeId) marker without calling list_machines first; deprecated noncanonical legacy ref_name is compatibility-only. GUI max 120000, shell_session1 max 900000. FULL nodes only.',
+    description: 'GUI/browser control. Do not use GUI OCU for a shell/CLI/executable request; use exec_remote or shell_session1 only for active-user semantics. A helper failure does not mean the machine is unauthorized or uncontrollable. Prefer browser_open/browser_snapshot. Pass canonical 10-digit nodeId or complete ^^(nodeId) marker without calling list_machines first; deprecated noncanonical legacy ref_name is compatibility-only. accessibility_tree read-only.',
     inputSchema: objectSchema({
       machine: stringSchema('Canonical nodeId, complete ^^(nodeId) marker, deprecated noncanonical legacy ref_name, or local/localhost/self/this.', { minLength: 1, maxLength: MACHINE_TARGET_MAX, pattern: MACHINE_TARGET_PATTERN.source }),
       tool: stringSchema(`Typed method name; one of ${COMPUTER_USE_TOOLS.join(', ')}.`, { enum: [...COMPUTER_USE_TOOLS] }),

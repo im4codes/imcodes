@@ -7,12 +7,13 @@
  *   EXECUTE-class action  = anything that can run code on the device, write to it, or read files off it as the node's account.
  *   VIEW-class action     = list the machine, or look without touching (list_apps, get_app_state, browser_snapshot).
  *
- *   EXECUTE-class needs ALL of:  the node's exec switch is ON  AND  the actor is the device OWNER, or an explicit per-device share row
- *   with role `participant` AND exec_granted (set by the owner only; a group never grants it, a viewer never has it)
- *   Only EXEC (exec_remote) additionally refuses participant-origin turns. Other actions use the actor's real access and grant.
+ *   EXECUTE-class needs ALL of: the node's exec switch is ON AND the actor is the device OWNER or an effective participant
+ *   from any valid direct/group source. Participant access is the product's execute grant; viewers remain denied. The signed authority and canonical target binding
+ *   prevent owner fallback or cross-target replay.
  *
  * Reading files is EXECUTE-class on purpose: the node's account can read credentials, keys and browser profiles, so "read any path"
- * is a privilege escalation for whoever holds it. Loosen it here, in one place, if the owner decides otherwise.
+ * is a privilege escalation for whoever holds it. Directory listing is the bounded exception for group participants: it powers the
+ * shared remote-desktop picker without granting file fetch, upload, or command execution.
  */
 import { COMPUTER_USE_TOOLS, isReadOnlyComputerUseTool, type ComputerUseToolName } from './computer-use.js';
 
@@ -69,10 +70,8 @@ export const MACHINE_DENIAL_REASON = {
   NO_ACCESS: 'no_access',
   /** The node's exec switch is off. */
   EXEC_DISABLED: 'exec_disabled',
-  /** The actor can operate the device but holds no execute grant (group member, share participant without the grant). */
+  /** The actor can operate the device but holds no execute grant (for example a direct participant without the grant). */
   EXECUTE_NOT_GRANTED: 'execute_not_granted',
-  /** exec_remote was requested on a share-participant turn: refused even with an execute grant. */
-  PARTICIPANT_TURN: 'participant_turn',
   /** The action is unknown to this table. */
   UNKNOWN_ACTION: 'unknown_action',
 } as const;
@@ -82,7 +81,7 @@ export interface MachineAccessSubject {
   /** null = the actor has no operate access (not the owner / participant share / group member). */
   accessRole: 'owner' | 'participant' | 'viewer' | null;
   accessSource: MachineAccessSource | null;
-  /** The share row's exec_granted flag (false when there is no share row; a missing column reads false). */
+  /** The direct share row's exec_granted flag (group access is granted by accessSource=group). */
   execGranted: boolean;
   /** The node's exec switch. */
   execEnabled: boolean;
@@ -101,10 +100,14 @@ export function evaluateMachineAction(subject: MachineAccessSubject, action: Mac
   // list_machines does not need the exec switch (a device can be listed while its exec is off).
   if (action === MACHINE_ACTION.LIST) return { allowed: true };
   if (!subject.execEnabled) return { allowed: false, reason: MACHINE_DENIAL_REASON.EXEC_DISABLED };
+  if (action === MACHINE_ACTION.FILE_LIST
+    && subject.accessRole === 'participant'
+    && subject.accessSource === MACHINE_ACCESS_SOURCE.GROUP) {
+    return { allowed: true };
+  }
   if (!machineActionRequiresExecute(action)) return { allowed: true };
-  if (action === MACHINE_ACTION.EXEC && subject.participantTurn) return { allowed: false, reason: MACHINE_DENIAL_REASON.PARTICIPANT_TURN };
   if (subject.accessSource === MACHINE_ACCESS_SOURCE.OWNER && subject.accessRole === 'owner') return { allowed: true };
-  if (subject.accessSource === MACHINE_ACCESS_SOURCE.SHARE && subject.accessRole === 'participant' && subject.execGranted === true) {
+  if (subject.accessRole === 'participant') {
     return { allowed: true };
   }
   return { allowed: false, reason: MACHINE_DENIAL_REASON.EXECUTE_NOT_GRANTED };

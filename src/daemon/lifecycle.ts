@@ -1,4 +1,5 @@
 import { CHAT_MESSAGE_ORIGINS, USER_MESSAGE_ORIGIN_FIELDS } from '../../shared/chat-message-origin.js';
+import { IMCODES_AUTOMATIC_COMPACTION_ENABLED } from '../../shared/automatic-compaction.js';
 import { taskPairService } from './task-pairs/service.js';
 import { evaluatePairMainCheckoutGitWrite, mainCheckoutWriteRefusal } from './task-pairs/main-checkout-write-guard.js';
 import { setTransportToolExecutionEvaluator } from './transport-relay.js';
@@ -112,6 +113,7 @@ import { CapabilitySyncFrameHandler } from '../capability/capability-sync-handle
 import { CapabilitySourceConvergenceStore } from '../capability/capability-source-convergence.js';
 import { cleanupAbandonedCapabilityQuarantine } from '../capability/skill-acquisition.js';
 import { clearResend } from './transport-resend-queue.js';
+import { releaseSessionResources } from './session-resource-service.js';
 import {
   createProductionSupervisionConsoleBinding,
   isAuthorizedSupervisionConsoleScope,
@@ -385,6 +387,10 @@ async function dropLocalSession(session: SessionRecord): Promise<void> {
   } else {
     await killSession(session.name).catch(() => {});
   }
+
+  await releaseSessionResources(session).catch((err) => {
+    logger.warn({ err, session: session.name }, 'dropLocalSession: resource cleanup failed');
+  });
 
   // ONE removal boundary: durable queue work must never outlive its session
   // and become deliverable to a later same-named instance.
@@ -2553,6 +2559,7 @@ export async function recoverMemoryCompressionStalledSession(
   sessionName: string,
   nowMs = Date.now(),
 ): Promise<boolean> {
+  if (!IMCODES_AUTOMATIC_COMPACTION_ENABLED) return false;
   const run = getStaleSessionCompressionRun(
     sessionName,
     nowMs,
