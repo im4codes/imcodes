@@ -358,8 +358,13 @@ describe('workspace hygiene through the pair service', () => {
     expect(readFileSync(join(wt, 'README.md'), 'utf8')).toBe('uncommitted\n');
     expect(existsSync(join(wt, 'notes.txt'))).toBe(true);
     expect(existsSync(join(wt, 'src', 'new.ts'))).toBe(true);
-    // The worktree itself stays for the retention sweep to judge.
-    expect(pair('H1').workspace).toMatchObject({ status: 'ended', path: wt });
+    // The worktree itself stays because untracked/uncommitted content and an
+    // unmerged commit make it unsafe to reclaim immediately. The immediate
+    // hygiene strip records first; wait for its retention sweep to classify it.
+    await vi.waitFor(() => expect(pair('H1').workspace).toMatchObject({ status: 'kept', path: wt }), {
+      timeout: 15_000,
+      interval: 50,
+    });
   });
 
   it('the same happens on CANCEL', async () => {
