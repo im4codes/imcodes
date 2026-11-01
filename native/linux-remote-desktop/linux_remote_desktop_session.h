@@ -32,12 +32,12 @@
 // header's own comment), then routed through this session's own
 // SessionCore/InputLedger, exactly as ApplyPointerMove/ApplyKey/etc.'s own
 // header comment already promised they would be. NOT YET DONE, scoped as a
-// real follow-up: display selection/mode/scale, clipboard, and auto-unlock --
-// Linux has one fixed display and does not advertise
-// REMOTE_DESKTOP_CLIPBOARD_CAPABILITY or CONTROLLED_NODE_AUTO_UNLOCK_CAPABILITY,
-// so those "control" kinds have nothing to route to yet and stay silently
-// ignored (an unknown-but-well-formed control kind), matching this file's own
-// established "never claim readiness this session cannot back" convention.
+// real follow-up: display selection/mode/scale and auto-unlock. Linux now
+// routes bounded clipboard copy/paste through its X11 adapter; it still does
+// not advertise CONTROLLED_NODE_AUTO_UNLOCK_CAPABILITY, so that control kind
+// remains silently ignored (an unknown-but-well-formed control kind), matching
+// this file's established "never claim readiness this session cannot back"
+// convention.
 //
 // DELIBERATELY NOT YET DONE, scoped as follow-up: the daemon-side worker
 // process/challenge/generation protocol.
