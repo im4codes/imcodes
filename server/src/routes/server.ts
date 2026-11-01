@@ -889,7 +889,13 @@ serverRoutes.post('/:id/shared-context/owner-private/search', async (c) => {
   if (!authed.ok) return daemonAuthFailure(c, authed);
   const serverRow = authed.auth;
   const body = await c.req.json().catch(() => null);
-  const parsed = ownerPrivateSearchSchema.safeParse(body);
+  // Empty searches are intentionally a no-op (and must not consult feature
+  // flags or PostgreSQL). Treat an omitted/null query as empty before schema
+  // validation, while retaining 400s for other malformed query values.
+  const normalizedBody = body && typeof body === 'object' && !Array.isArray(body)
+    ? { ...(body as Record<string, unknown>), query: (body as Record<string, unknown>).query ?? '' }
+    : body;
+  const parsed = ownerPrivateSearchSchema.safeParse(normalizedBody);
   if (!parsed.success) return c.json({ error: 'invalid_body' }, 400);
   const query = parsed.data.query?.trim() ?? '';
   if (!query) return c.json(sameShapeSearchEnvelope());
