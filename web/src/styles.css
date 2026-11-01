@@ -13469,9 +13469,14 @@ button.quick-agent-delegation-preset.active {
   }
 
   .remote-desktop-footer {
-    max-height: 30vh;
+    /* Keep status reflow from changing the stage geometry. Long summaries and
+       nerd diagnostics scroll inside this fixed-height footer instead. */
+    height: 44px;
+    min-height: 44px;
+    max-height: 44px;
     padding: 7px 10px;
     overflow-y: auto;
+    box-sizing: border-box;
   }
 
   .remote-desktop-diagnostics {
@@ -13554,9 +13559,7 @@ button.quick-agent-delegation-preset.active {
     min-height: 32px;
   }
 
-  .remote-desktop-footer {
-    max-height: 22vh;
-  }
+  .remote-desktop-footer { height: 44px; min-height: 44px; max-height: 44px; }
 }
 
 @media (pointer: coarse) {

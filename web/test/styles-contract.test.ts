@@ -1222,6 +1222,7 @@ describe('styles.css regression contracts', () => {
     expect(panelRule).toMatch(/grid-template-rows:\s*auto auto minmax\(0, 1fr\) auto auto/);
     expect(css).toMatch(/\.remote-desktop-stage\s*\{[\s\S]*?grid-row:\s*3/);
     expect(css).toMatch(/\.remote-desktop-footer\s*\{[\s\S]*?grid-row:\s*5/);
+    expect(css).toMatch(/@media\s*\(max-width:\s*720px\)[\s\S]*?\.remote-desktop-footer\s*\{[\s\S]*?height:\s*44px;[\s\S]*?min-height:\s*44px;[\s\S]*?max-height:\s*44px;[\s\S]*?overflow-y:\s*auto/);
   });
 
   it('keeps the mobile collapsed task strip in normal titlebar flow', () => {

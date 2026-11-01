@@ -117,6 +117,7 @@ import {
   REMOTE_DESKTOP_POINTER_EDGE_STICKY_RATIO_PRECISE,
   stickRemoteDesktopPointerToEdges,
   viewportFromRemoteDesktopPinch,
+  type RemoteDesktopViewportGeometry,
   type RemoteDesktopViewport,
 } from '../remote-desktop-viewport.js';
 import {
@@ -648,6 +649,7 @@ export function RemoteDesktopPanel({
   const hasInitializedVirtualMouseRef = useRef(false);
   const virtualMouseResetPendingRef = useRef(false);
   const virtualMouseRef = useRef<TouchPoint>({ x: 0, y: 0 });
+  const previousUsableGeometryRef = useRef<RemoteDesktopViewportGeometry | null>(null);
   const virtualMouseDragRef = useRef<VirtualMouseDrag | null>(null);
   const virtualMouseEdgePointRef = useRef<TouchPoint | null>(null);
   const virtualMouseEdgeFrameRef = useRef<number | null>(null);
@@ -1300,7 +1302,18 @@ export function RemoteDesktopPanel({
     // marks initialization done -- only after that does a later run mean a
     // real, later display/mode change that should reset to the default.
     const isMountRun = !hasResetViewportOnMountRef.current;
-    if (display) hasResetViewportOnMountRef.current = true;
+    const hasUsableGeometry = Boolean(
+      geometry
+      && geometry.stageWidth > 0
+      && geometry.stageHeight > 0
+      && geometry.contentWidth > 0
+      && geometry.contentHeight > 0,
+    );
+    if (display && hasUsableGeometry) hasResetViewportOnMountRef.current = true;
+    const previousGeometry = previousUsableGeometryRef.current;
+    const geometryWidthChanged = !previousGeometry
+      || geometry?.stageWidth !== previousGeometry.stageWidth
+      || geometry?.contentWidth !== previousGeometry.contentWidth;
     const resetKey = [
       snapshot.selectedDisplayId ?? '',
       snapshot.layoutRevision,
@@ -1310,8 +1323,10 @@ export function RemoteDesktopPanel({
     const resetTrigger = viewportResetKeyRef.current !== null
       && viewportResetKeyRef.current !== resetKey;
     viewportResetKeyRef.current = resetKey;
-    const nextViewport = mobileInputMode === 'mouse' && geometry && display
-      ? remoteDesktopMouseModeViewport(display, geometry)
+    const nextViewport = mobileInputMode === 'mouse' && geometry && display && hasUsableGeometry
+      ? (isMountRun || resetTrigger || geometryWidthChanged
+        ? remoteDesktopMouseModeViewport(display, geometry)
+        : clampRemoteDesktopViewport(viewportRef.current, geometry))
       // Mount already seeded viewportRef with any remembered scale for this
       // machine; only a later, real display/mode change resets to default --
       // a resize keeps whatever zoom and pan the person set.
@@ -1336,6 +1351,7 @@ export function RemoteDesktopPanel({
       virtualMouseRef.current = nextMouse;
       setVirtualMouse(nextMouse);
     }
+    if (hasUsableGeometry && geometry) previousUsableGeometryRef.current = geometry;
     touchPointsRef.current.clear();
     if (touchGestureRef.current?.kind === 'single' && touchGestureRef.current.longPressTimer) {
       clearTimeout(touchGestureRef.current.longPressTimer);

@@ -3426,6 +3426,22 @@ describe('RemoteDesktopPanel mobile gestures', () => {
     expect(video.style.transform).toContain('scale(2.4)');
   });
 
+  it('keeps the mouse viewport and pointer position across height-only status-bar reflow', async () => {
+    const { stage, video, getByRole } = await renderPanel();
+    act(() => {
+      (getByRole('button', { name: 'remote_desktop.mouse_mode' }) as HTMLButtonElement).click();
+    });
+    expect(video.style.transform).toContain('scale(3.2)');
+    pointerMove.mockClear();
+    Object.defineProperties(stage, {
+      clientWidth: { value: 400, configurable: true },
+      clientHeight: { value: 220, configurable: true },
+    });
+    act(() => window.dispatchEvent(new Event('resize')));
+    expect(video.style.transform).toContain('scale(3.2)');
+    expect(pointerMove).not.toHaveBeenCalled();
+  });
+
   it('bounds transient reconnects and creates a fresh-authority client', async () => {
     vi.useFakeTimers();
     const { container } = await renderPanel();
