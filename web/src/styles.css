@@ -13586,6 +13586,16 @@ button.quick-agent-delegation-preset.active {
   .remote-desktop-stage.is-controlling {
     cursor: default;
   }
+
+  /* Wide mobile WebViews are not covered by the width media query, but their
+     status bar must obey the same fixed-height contract. */
+  .remote-desktop-footer {
+    height: 44px;
+    min-height: 44px;
+    max-height: 44px;
+    overflow-y: auto;
+    box-sizing: border-box;
+  }
 }
 
 @media (prefers-reduced-motion: reduce) {
