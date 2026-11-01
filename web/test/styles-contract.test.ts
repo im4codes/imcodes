@@ -1035,8 +1035,14 @@ describe('styles.css regression contracts', () => {
     expect(serverPinRule![0]).toMatch(/flex:\s*0\s+0\s+auto/);
     const mobilePinnedRule = css.match(/\.mobile-server-menu-server\.pinned\s*\{[^}]*\}/);
     expect(mobilePinnedRule).not.toBeNull();
-    expect(mobilePinnedRule![0]).toMatch(/border:\s*1px\s+solid/);
+    expect(mobilePinnedRule![0]).toMatch(/position:\s*relative/);
+    expect(mobilePinnedRule![0]).toMatch(/box-shadow:\s*inset\s+2px\s+0\s+0/);
+    expect(mobilePinnedRule![0]).not.toMatch(/border:/);
     expect(mobilePinnedRule![0]).toMatch(/rgb\(74 222 128/);
+    const mobilePinnedLineRule = css.match(/\.mobile-server-menu-server\.pinned::after\s*\{[^}]*\}/);
+    expect(mobilePinnedLineRule).not.toBeNull();
+    expect(mobilePinnedLineRule![0]).toMatch(/height:\s*1px/);
+    expect(mobilePinnedLineRule![0]).toMatch(/linear-gradient/);
     const iconPinRule = css.match(/\.server-icon-pin\s*\{[^}]*\}/);
     expect(iconPinRule).not.toBeNull();
     expect(iconPinRule![0]).toMatch(/position:\s*absolute/);

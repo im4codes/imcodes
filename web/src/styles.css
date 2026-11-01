@@ -3441,8 +3441,9 @@ html.native-ios-mac .chat-dl-btn {
 .mobile-server-menu-item > .share-state-indicator { margin-left: auto; flex: 0 0 auto; }
 .mobile-server-menu-item:hover, .mobile-server-menu-item:active { background: #334155; }
 .mobile-server-menu-item.active { color: #93c5fd; background: #1d4ed820; }
-.mobile-server-menu-server.pinned { color: #bbf7d0; border: 1px solid rgb(74 222 128 / 58%); background: rgb(34 197 94 / 10%); box-shadow: inset 0 0 0 1px rgb(74 222 128 / 14%); }
-.mobile-server-menu-server.pinned.active { color: #dcfce7; background: rgb(34 197 94 / 16%); }
+.mobile-server-menu-server.pinned { position: relative; color: #d1fae5; background: linear-gradient(110deg, rgb(34 197 94 / 12%), rgb(34 211 238 / 5%) 58%, transparent); box-shadow: inset 2px 0 0 rgb(74 222 128 / 76%), inset 0 0 14px rgb(34 211 238 / 6%); }
+.mobile-server-menu-server.pinned::after { content: ''; position: absolute; left: 14px; right: 14px; bottom: 0; height: 1px; background: linear-gradient(90deg, rgb(74 222 128 / 72%), rgb(34 211 238 / 42%), transparent); pointer-events: none; }
+.mobile-server-menu-server.pinned.active { color: #ecfdf5; background: linear-gradient(110deg, rgb(34 197 94 / 18%), rgb(34 211 238 / 8%) 58%, transparent); }
 .mobile-server-menu-controlled-nodes { color: #67e8f9; border-top: 1px solid #334155; border-bottom: 1px solid #334155; }
 .mobile-server-menu-change { color: #f59e0b !important; border-top: 1px solid #334155; }
 .mobile-server-menu-language { grid-column: 1 / -1; min-width: 0; }
