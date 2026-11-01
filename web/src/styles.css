@@ -12546,9 +12546,35 @@ button.quick-agent-delegation-preset.active {
   border: 1px solid rgb(99 201 255 / 22%);
   border-radius: 999px;
   backdrop-filter: blur(6px);
+  align-items: center;
+  gap: 8px;
   font-size: 10.5px;
   letter-spacing: .01em;
   pointer-events: none;
+}
+
+.remote-desktop-touch-hint > span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.remote-desktop-touch-hint-dismiss {
+  flex: 0 0 auto;
+  min-height: 22px;
+  padding: 2px 7px;
+  color: #dff4ff;
+  background: rgb(99 201 255 / 14%);
+  border: 1px solid rgb(99 201 255 / 32%);
+  border-radius: 999px;
+  font-size: 10px;
+  line-height: 1.2;
+  white-space: nowrap;
+  cursor: pointer;
+  pointer-events: auto;
+}
+
+.remote-desktop-touch-hint-dismiss:hover {
+  background: rgb(99 201 255 / 24%);
 }
 
 /* The phone keyboard already takes the lower half of the viewport. Remove
@@ -13572,7 +13598,7 @@ button.quick-agent-delegation-preset.active {
   }
 
   .remote-desktop-touch-hint {
-    display: block;
+    display: inline-flex;
   }
 
   .remote-desktop-touch-ring {

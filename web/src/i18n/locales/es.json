@@ -4184,6 +4184,7 @@
     "zoom_out": "Alejar",
     "zoom_reset": "Restablecer zoom",
     "touch_hint": "Toca la pantalla para hacer clic ahí, o arrastra el anillo para mover el cursor. Mantén pulsado el anillo y arrastra para arrastrar; mantén y suelta para el clic derecho",
+    "touch_hint_dismiss": "Entendido",
     "touch_right_click": "Clic derecho en la última posición táctil",
     "touch_ring": "Anillo del cursor: arrastra para mover, mantén pulsado para el clic derecho",
     "mobile_input_mode": "Modo de entrada móvil",

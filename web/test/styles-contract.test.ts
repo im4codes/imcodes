@@ -1226,6 +1226,15 @@ describe('styles.css regression contracts', () => {
     expect(css).toMatch(/@media\s*\(pointer:\s*coarse\)[\s\S]*?\.remote-desktop-footer\s*\{[\s\S]*?height:\s*44px;[\s\S]*?min-height:\s*44px;[\s\S]*?max-height:\s*44px;[\s\S]*?overflow-y:\s*auto/);
   });
 
+  it('keeps the touch hint dismiss action interactive without enabling the overlay itself', () => {
+    const hintRule = css.match(/\.remote-desktop-touch-hint\s*\{[^}]*\}/)?.[0];
+    expect(hintRule).toMatch(/pointer-events:\s*none/);
+    const dismissRule = css.match(/\.remote-desktop-touch-hint-dismiss\s*\{[^}]*\}/)?.[0];
+    expect(dismissRule).toBeTruthy();
+    expect(dismissRule).toMatch(/pointer-events:\s*auto/);
+    expect(dismissRule).toMatch(/white-space:\s*nowrap/);
+  });
+
   it('keeps the mobile collapsed task strip in normal titlebar flow', () => {
     const mobileRule = css.match(
       /@media\s*\(max-width:\s*720px\)[\s\S]*?\.chat-titlebar > \.task-pair-status-panel\.is-mobile\.is-collapsed\s*\{([^}]*)\}/,

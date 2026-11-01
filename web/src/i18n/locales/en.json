@@ -4187,6 +4187,7 @@
     "zoom_out": "Zoom out",
     "zoom_reset": "Reset zoom",
     "touch_hint": "Tap the screen to click there, or drag the ring to move the cursor -- hold the ring, then drag to drag; hold and release to right-click",
+    "touch_hint_dismiss": "Got it",
     "touch_right_click": "Right-click at the last touch position",
     "touch_ring": "Cursor ring -- drag to move, long-press to right-click",
     "mobile_input_mode": "Mobile input mode",

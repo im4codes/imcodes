@@ -4184,6 +4184,7 @@
     "zoom_out": "縮小",
     "zoom_reset": "重設縮放",
     "touch_hint": "輕點螢幕可在該處按一下；拖曳圓環移動游標；按住圓環再拖曳即為拖放；按住後放開為右鍵",
+    "touch_hint_dismiss": "知道了",
     "touch_right_click": "在上次觸控位置按右鍵",
     "touch_ring": "游標圓環——拖曳可移動，長按變右鍵",
     "mobile_input_mode": "手機輸入模式",

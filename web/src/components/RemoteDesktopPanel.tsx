@@ -92,6 +92,7 @@ import type { WsClient } from '../ws-client.js';
 import { openRemoteDesktopWindow } from '../remote-desktop-window.js';
 import { fullscreenContainerFor, useFullscreen } from '../hooks/useFullscreen.js';
 import { keyboardLockSupported, useKeyboardLock } from '../hooks/useKeyboardLock.js';
+import { useSyncedPreference } from '../hooks/useSyncedPreference.js';
 import {
   REMOTE_DESKTOP_BROWSER_DIAGNOSTIC_EVENT,
   recordRemoteDesktopBrowserDiagnostic,
@@ -145,6 +146,8 @@ const QUALITY_PRIORITIES = Object.values(REMOTE_DESKTOP_QUALITY_PRIORITY);
 
 /** A phone-keyboard editing key and its own input event arrive together. */
 const MOBILE_EDITING_KEY_DEDUPE_MS = 150;
+const REMOTE_DESKTOP_TOUCH_HINT_DISMISSED_PREFERENCE = 'remote_desktop_touch_hint_dismissed';
+const REMOTE_DESKTOP_TOUCH_HINT_DISMISSED_EVENT = 'remote-desktop-touch-hint-dismissed';
 
 type ViewScale = 'fit' | 'actual';
 type MobileInputMode = 'touch' | 'mouse';
@@ -454,6 +457,21 @@ export function RemoteDesktopPanel({
   // session doesn't reset to it every time.
   const [viewScale, setViewScale] = useState<ViewScale>(() => storedZoomPreference?.viewScale ?? 'fit');
   const [mobileInputMode, setMobileInputMode] = useState<MobileInputMode>('touch');
+  const [touchHintDismissed, setTouchHintDismissed] = useSyncedPreference<boolean>(
+    REMOTE_DESKTOP_TOUCH_HINT_DISMISSED_PREFERENCE,
+    false,
+    0,
+  );
+  useEffect(() => {
+    const onTouchHintDismissed = () => setTouchHintDismissed(true);
+    window.addEventListener(REMOTE_DESKTOP_TOUCH_HINT_DISMISSED_EVENT, onTouchHintDismissed);
+    return () => window.removeEventListener(REMOTE_DESKTOP_TOUCH_HINT_DISMISSED_EVENT, onTouchHintDismissed);
+  }, [setTouchHintDismissed]);
+
+  const dismissTouchHint = useCallback(() => {
+    setTouchHintDismissed(true);
+    window.dispatchEvent(new Event(REMOTE_DESKTOP_TOUCH_HINT_DISMISSED_EVENT));
+  }, [setTouchHintDismissed]);
   const [viewport, setViewport] = useState<RemoteDesktopViewport>(() => (
     storedZoomPreference
       ? {
@@ -3898,10 +3916,24 @@ export function RemoteDesktopPanel({
               )}
             </div>
           )}
-          <div class="remote-desktop-touch-hint" hidden={mobileTextOpen}>
-            {t(mobileInputMode === 'mouse'
-              ? 'remote_desktop.mouse_hint'
-              : 'remote_desktop.touch_hint')}
+          <div
+            class="remote-desktop-touch-hint"
+            hidden={mobileTextOpen || (mobileInputMode === 'touch' && touchHintDismissed)}
+          >
+            <span>
+              {t(mobileInputMode === 'mouse'
+                ? 'remote_desktop.mouse_hint'
+                : 'remote_desktop.touch_hint')}
+            </span>
+            {mobileInputMode === 'touch' && (
+              <button
+                type="button"
+                class="remote-desktop-touch-hint-dismiss"
+                onClick={dismissTouchHint}
+              >
+                {t('remote_desktop.touch_hint_dismiss')}
+              </button>
+            )}
           </div>
         </div>
 
