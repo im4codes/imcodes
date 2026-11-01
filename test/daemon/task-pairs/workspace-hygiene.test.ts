@@ -285,6 +285,9 @@ async function resetFinishedForReclaim(taskId: string): Promise<void> {
     updatedAt: now,
     workspace: { ...state.workspace!, status: 'ended', endedAt: now, strippedAt: undefined },
   });
+  // Re-arm the candidate before draining any asynchronous DONE sweep. A late
+  // sweep then observes the new endedAt and cannot overwrite this fixture.
+  await taskPairService.waitForIdle();
   await vi.waitFor(() => {
     expect(getTaskPairStore().listEndedWorkspacePairs().some((stored) => stored.project === PROJECT && stored.state.taskId === taskId)).toBe(true);
   }, { timeout: 15_000, interval: 50 });
