@@ -4669,6 +4669,7 @@
       "passed": "Audit passed",
       "done": "Done",
       "cancelled": "Cancelled",
+      "failed": "Failed",
       "rework_round": "Rework round {{round}}",
       "awaiting_brain_decision": "Awaiting Brain decision",
       "paused": "Paused",

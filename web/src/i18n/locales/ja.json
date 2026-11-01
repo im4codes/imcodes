@@ -4656,6 +4656,7 @@
       "passed": "監査合格",
       "done": "完了",
       "cancelled": "キャンセル",
+      "failed": "失敗",
       "rework_round": "再作業 第{{round}}ラウンド",
       "awaiting_brain_decision": "Brain の判断待ち",
       "paused": "一時停止中",

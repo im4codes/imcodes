@@ -4657,6 +4657,7 @@
       "passed": "Auditoría aprobada",
       "done": "Terminada",
       "cancelled": "Cancelada",
+      "failed": "Fallida",
       "rework_round": "Revisión ronda {{round}}",
       "awaiting_brain_decision": "Esperando decisión de Brain",
       "paused": "En pausa",

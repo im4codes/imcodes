@@ -3447,6 +3447,8 @@ html.native-ios-mac .chat-dl-btn {
 .mobile-server-menu-controlled-nodes { color: #67e8f9; border-top: 1px solid #334155; border-bottom: 1px solid #334155; }
 .mobile-server-menu-change { color: #f59e0b !important; border-top: 1px solid #334155; }
 .mobile-server-menu-language { grid-column: 1 / -1; min-width: 0; }
+.controls-task-pair-title { min-width: 0; flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 500; color: #e2e8f0; }
+.controls-task-pair-status-badge { flex: 0 1 auto; min-width: 0; max-width: 42%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding: 1px 6px; border: 1px solid rgb(125 211 252 / 28%); border-radius: 999px; background: rgb(15 23 42 / 64%); color: #bae6fd; font-size: 10px; line-height: 1.35; }
 @media (min-width: 380px) {
   .mobile-server-menu { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 }
