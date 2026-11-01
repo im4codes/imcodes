@@ -490,10 +490,6 @@ sharedContextRoutes.get('/personal-memory', async (c) => {
 });
 
 sharedContextRoutes.post('/memory/search', async (c) => {
-  const featureFlags = await getCurrentUserMemoryFeatureFlags(c);
-  if (!isUserMemoryFeatureEnabled(c, MEMORY_FEATURES.quickSearch, featureFlags)) {
-    return c.json(sameShapeSearchEnvelope());
-  }
   const userId = c.get('userId' as never) as string;
   const body = await readJsonBody<{
     query?: string;
@@ -503,6 +499,13 @@ sharedContextRoutes.post('/memory/search', async (c) => {
     excludeSourceSessionName?: string;
   }>(c);
   const query = body?.query?.trim() ?? '';
+  if (!query) {
+    return c.json(sameShapeSearchEnvelope());
+  }
+  const featureFlags = await getCurrentUserMemoryFeatureFlags(c);
+  if (!isUserMemoryFeatureEnabled(c, MEMORY_FEATURES.quickSearch, featureFlags)) {
+    return c.json(sameShapeSearchEnvelope());
+  }
   const requestedScope = isSearchRequestScope(body?.scope) ? body.scope : 'all_authorized';
   const limit = Math.max(1, Math.min(50, typeof body?.limit === 'number' ? body.limit : 20));
   const excludeSourceSessionName = typeof body?.excludeSourceSessionName === 'string'
