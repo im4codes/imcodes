@@ -888,6 +888,12 @@ serverRoutes.post('/:id/shared-context/owner-private/search', async (c) => {
   const authed = await authenticateDaemonServer(c, c.req.param('id'));
   if (!authed.ok) return daemonAuthFailure(c, authed);
   const serverRow = authed.auth;
+  const body = await c.req.json().catch(() => null);
+  const parsed = ownerPrivateSearchSchema.safeParse(body);
+  if (!parsed.success) return c.json({ error: 'invalid_body' }, 400);
+  const query = parsed.data.query?.trim() ?? '';
+  if (!query) return c.json(sameShapeSearchEnvelope());
+
   const featureFlags = parseMemoryFeatureFlagValuesJson(
     await getUserPref(c.env.DB, serverRow.userId, MEMORY_FEATURE_CONFIG_PREF_KEY),
   );
@@ -895,13 +901,9 @@ serverRoutes.post('/:id/shared-context/owner-private/search', async (c) => {
     return c.json(sameShapeSearchEnvelope());
   }
 
-  const body = await c.req.json().catch(() => null);
-  const parsed = ownerPrivateSearchSchema.safeParse(body);
-  if (!parsed.success) return c.json({ error: 'invalid_body' }, 400);
   const requestScope = isSearchRequestScope(parsed.data.scope) ? parsed.data.scope : 'owner_private';
   const scopes = expandSearchRequestScope(requestScope, { includeOwnerPrivate: true });
   if (!scopes.includes('user_private')) return c.json(sameShapeSearchEnvelope());
-  const query = parsed.data.query.trim();
   const rows = await c.env.DB.query<{
     id: string;
     kind: string;
