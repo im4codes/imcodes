@@ -7167,20 +7167,11 @@ export function App() {
                       return (
                         <button
                           key={s.id}
-                          class={`mobile-server-menu-item mobile-server-menu-server${s.id === selectedServerId ? ' active' : ''}${showSharedReturnGuide && s.id === sharedReturnServer?.id ? ' server-return-hint' : ''}`}
+                          class={`mobile-server-menu-item mobile-server-menu-server${s.id === selectedServerId ? ' active' : ''}${pinnedServerIds.has(s.id) ? ' pinned' : ''}${showSharedReturnGuide && s.id === sharedReturnServer?.id ? ' server-return-hint' : ''}`}
                           onClick={() => { handleSelectServer(s.id, s.name); setShowMobileServerMenu(false); }}
                           onContextMenu={(e) => { e.preventDefault(); setShowMobileServerMenu(false); setServerCtxMenu({ server: s, x: e.clientX, y: e.clientY }); }}
                         >
                           <span style={{ color: online ? '#4ade80' : '#475569' }}>{online ? '●' : '○'}</span>
-                          {pinnedServerIds.has(s.id) && (
-                            <span
-                              class="mobile-server-menu-pin"
-                              aria-label={trans('session.pinned', { defaultValue: 'Pinned' })}
-                              title={trans('session.pinned', { defaultValue: 'Pinned' })}
-                            >
-                              📌
-                            </span>
-                          )}
                           <span class="mobile-server-menu-name">{s.name}</span>
                           <SharedStateIndicator state={managedSharedServerStateById.get(s.id) ?? null} iconOnly variant="shared-out" />
                         </button>

@@ -3438,10 +3438,11 @@ html.native-ios-mac .chat-dl-btn {
 .mobile-server-menu-item { display: flex; align-items: center; gap: 7px; grid-column: 1 / -1; width: 100%; min-width: 0; padding: 10px 14px; background: none; border: none; color: #cbd5e1; font-size: 13px; font-family: inherit; text-align: left; cursor: pointer; }
 .mobile-server-menu-server { grid-column: auto; }
 .mobile-server-menu-name { min-width: 0; flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.mobile-server-menu-pin { flex: 0 0 auto; font-size: 11px; line-height: 1; }
 .mobile-server-menu-item > .share-state-indicator { margin-left: auto; flex: 0 0 auto; }
 .mobile-server-menu-item:hover, .mobile-server-menu-item:active { background: #334155; }
 .mobile-server-menu-item.active { color: #93c5fd; background: #1d4ed820; }
+.mobile-server-menu-server.pinned { color: #bbf7d0; border: 1px solid rgb(74 222 128 / 58%); background: rgb(34 197 94 / 10%); box-shadow: inset 0 0 0 1px rgb(74 222 128 / 14%); }
+.mobile-server-menu-server.pinned.active { color: #dcfce7; background: rgb(34 197 94 / 16%); }
 .mobile-server-menu-controlled-nodes { color: #67e8f9; border-top: 1px solid #334155; border-bottom: 1px solid #334155; }
 .mobile-server-menu-change { color: #f59e0b !important; border-top: 1px solid #334155; }
 .mobile-server-menu-language { grid-column: 1 / -1; min-width: 0; }
