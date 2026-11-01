@@ -29,9 +29,10 @@ interface Props {
   onAdmin?: () => void;
   sharedServerStates?: ReadonlyMap<string, SharedStateSummary>;
   returnHintServerId?: string | null;
+  pinnedServerIds?: ReadonlySet<string>;
 }
 
-export function ServerIconBar({ servers, activeServerId, onSelectServer, onServerContextMenu, sidebarCollapsed, onToggleSidebar, onSettings, onHome, isAdmin, onAdmin, sharedServerStates, returnHintServerId = null }: Props) {
+export function ServerIconBar({ servers, activeServerId, onSelectServer, onServerContextMenu, sidebarCollapsed, onToggleSidebar, onSettings, onHome, isAdmin, onAdmin, sharedServerStates, returnHintServerId = null, pinnedServerIds }: Props) {
   const { t } = useTranslation();
   // One short label per server, unique across the list; recomputed when a server is added, renamed or removed.
   const namesKey = servers.map((server) => server.name).join('\u0000');
@@ -54,6 +55,7 @@ export function ServerIconBar({ servers, activeServerId, onSelectServer, onServe
         const isActive = server.id === activeServerId;
         const isOnline = isServerOnline(server);
         const sharedState = sharedServerStates?.get(server.id) ?? null;
+        const isPinned = pinnedServerIds?.has(server.id) ?? false;
         return (
           <button
             key={server.id}
@@ -67,6 +69,15 @@ export function ServerIconBar({ servers, activeServerId, onSelectServer, onServe
             <span class={`server-icon-letter server-icon-label-${label.size}`} aria-hidden="true">
               {label.lines.map((line, lineIndex) => <span key={lineIndex} class="server-icon-line">{line}</span>)}
             </span>
+            {isPinned && (
+              <span
+                class="server-icon-pin"
+                aria-label={t('session.pinned', { defaultValue: 'Pinned' })}
+                title={t('session.pinned', { defaultValue: 'Pinned' })}
+              >
+                📌
+              </span>
+            )}
             <SharedStateIndicator state={sharedState} iconOnly variant="shared-out" />
             {isDaemonUpgradeAvailable(server.daemonVersion, server.latestDaemonVersion) && (
               <span class="server-icon-upgrade" aria-label={t('server.daemon_upgrade_available')} title={t('server.daemon_upgrade_available')}>↥</span>

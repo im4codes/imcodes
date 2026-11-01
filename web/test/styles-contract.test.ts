@@ -1025,6 +1025,19 @@ describe('styles.css regression contracts', () => {
     const app = readFileSync(resolve(__dirname, '../src/app.tsx'), 'utf8');
     expect(app).toContain('mobile-server-menu-server');
     expect(app).toContain('mobile-server-menu-language');
+    expect(app).toContain('server-item-pin');
+    expect(app).toContain('mobile-server-menu-pin');
+    expect(app).toContain('pinnedServerIds');
+
+    const serverPinRule = css.match(/\.server-item-pin\s*\{[^}]*\}/);
+    expect(serverPinRule).not.toBeNull();
+    expect(serverPinRule![0]).toMatch(/flex:\s*0\s+0\s+auto/);
+    const menuPinRule = css.match(/\.mobile-server-menu-pin\s*\{[^}]*\}/);
+    expect(menuPinRule).not.toBeNull();
+    expect(menuPinRule![0]).toMatch(/flex:\s*0\s+0\s+auto/);
+    const iconPinRule = css.match(/\.server-icon-pin\s*\{[^}]*\}/);
+    expect(iconPinRule).not.toBeNull();
+    expect(iconPinRule![0]).toMatch(/position:\s*absolute/);
   });
 
   it('mobile shell chrome does not depend solely on the narrow viewport breakpoint', () => {

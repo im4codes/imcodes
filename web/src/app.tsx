@@ -2141,6 +2141,10 @@ export function App() {
     () => sortServersByPreference(servers, serverOrder, serverPinned),
     [servers, serverOrder, serverPinned],
   );
+  const pinnedServerIds = useMemo(
+    () => new Set(normalizePinnedServers(servers, serverPinned)),
+    [servers, serverPinned],
+  );
   useEffect(() => {
     if (!serversLoaded || !serverOrderHydrated || !serverPinnedHydrated) return;
     const nextOrder = normalizeServerOrder(servers, serverOrder);
@@ -6821,6 +6825,7 @@ export function App() {
             onAdmin={() => setShowAdminPage(true)}
             sharedServerStates={managedSharedServerStateById}
             returnHintServerId={showSharedReturnGuide ? sharedReturnServer?.id : null}
+            pinnedServerIds={pinnedServerIds}
           />
           <Sidebar
             collapsed={sidebarCollapsed}
@@ -6999,7 +7004,16 @@ export function App() {
                 <span class="server-item-dot" style={{ color: online ? '#4ade80' : '#475569' }}>
                   {online ? '●' : '○'}
                 </span>
-                {server.name}
+                {pinnedServerIds.has(server.id) && (
+                  <span
+                    class="server-item-pin"
+                    aria-label={trans('session.pinned', { defaultValue: 'Pinned' })}
+                    title={trans('session.pinned', { defaultValue: 'Pinned' })}
+                  >
+                    📌
+                  </span>
+                )}
+                <span class="server-item-name">{server.name}</span>
               </button>
             );
           })}
@@ -7158,6 +7172,15 @@ export function App() {
                           onContextMenu={(e) => { e.preventDefault(); setShowMobileServerMenu(false); setServerCtxMenu({ server: s, x: e.clientX, y: e.clientY }); }}
                         >
                           <span style={{ color: online ? '#4ade80' : '#475569' }}>{online ? '●' : '○'}</span>
+                          {pinnedServerIds.has(s.id) && (
+                            <span
+                              class="mobile-server-menu-pin"
+                              aria-label={trans('session.pinned', { defaultValue: 'Pinned' })}
+                              title={trans('session.pinned', { defaultValue: 'Pinned' })}
+                            >
+                              📌
+                            </span>
+                          )}
                           <span class="mobile-server-menu-name">{s.name}</span>
                           <SharedStateIndicator state={managedSharedServerStateById.get(s.id) ?? null} iconOnly variant="shared-out" />
                         </button>
@@ -7730,7 +7753,16 @@ export function App() {
                         <span class="server-item-dot" style={{ color: online ? '#4ade80' : '#475569' }}>
                           {online ? '●' : '○'}
                         </span>
-                        {s.name}
+                        {pinnedServerIds.has(s.id) && (
+                          <span
+                            class="server-item-pin"
+                            aria-label={trans('session.pinned', { defaultValue: 'Pinned' })}
+                            title={trans('session.pinned', { defaultValue: 'Pinned' })}
+                          >
+                            📌
+                          </span>
+                        )}
+                        <span class="server-item-name">{s.name}</span>
                       </button>
                     );
                   })}

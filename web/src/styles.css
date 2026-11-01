@@ -392,6 +392,8 @@ html.native-ios-mac .chat-dl-btn {
 .server-item.active { background: linear-gradient(90deg, rgba(34,211,238,0.18), rgba(15,23,42,0.30)); border-left-color: var(--chrome-accent); color: #bfdbfe; box-shadow: inset 0 0 18px rgba(34,211,238,0.08); }
 .server-item.offline { color: #64748b; }
 .server-item-dot { font-size: 8px; flex-shrink: 0; }
+.server-item-pin { flex: 0 0 auto; font-size: 11px; line-height: 1; }
+.server-item-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .server-ctx-menu { background: linear-gradient(180deg, rgba(17,27,45,0.98), rgba(8,13,22,0.98)); border: 1px solid rgba(125,211,252,0.18); border-radius: 7px; min-width: 148px; box-shadow: 0 12px 28px rgba(0,0,0,0.44), inset 0 1px 0 rgba(255,255,255,0.04); z-index: 200; overflow: hidden; }
 .server-ctx-item { display: block; width: 100%; padding: 9px 14px; background: none; border: none; color: #cbd5e1; font-size: 13px; font-family: inherit; text-align: left; cursor: pointer; }
 .server-ctx-item:hover { background: rgba(8,145,178,0.16); color: #eff6ff; }
@@ -3436,6 +3438,7 @@ html.native-ios-mac .chat-dl-btn {
 .mobile-server-menu-item { display: flex; align-items: center; gap: 7px; grid-column: 1 / -1; width: 100%; min-width: 0; padding: 10px 14px; background: none; border: none; color: #cbd5e1; font-size: 13px; font-family: inherit; text-align: left; cursor: pointer; }
 .mobile-server-menu-server { grid-column: auto; }
 .mobile-server-menu-name { min-width: 0; flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mobile-server-menu-pin { flex: 0 0 auto; font-size: 11px; line-height: 1; }
 .mobile-server-menu-item > .share-state-indicator { margin-left: auto; flex: 0 0 auto; }
 .mobile-server-menu-item:hover, .mobile-server-menu-item:active { background: #334155; }
 .mobile-server-menu-item.active { color: #93c5fd; background: #1d4ed820; }
@@ -8881,6 +8884,7 @@ html.native-ios-mac .chat-dl-btn {
 .server-icon-active { background: linear-gradient(180deg, rgba(34,211,238,0.28), rgba(29,78,216,0.30)); color: #fff; border-color: rgba(34,211,238,0.68); border-radius: 11px; box-shadow: 0 0 0 1px rgba(34,211,238,0.16), 0 0 18px rgba(34,211,238,0.22), inset 0 1px 0 rgba(255,255,255,0.08); }
 .server-icon-active:hover { background: linear-gradient(180deg, rgba(34,211,238,0.32), rgba(29,78,216,0.34)); border-radius: 11px; }
 .server-icon-letter { display: flex; flex-direction: column; align-items: center; justify-content: center; max-width: 100%; line-height: 1; pointer-events: none; }
+.server-icon-pin { position: absolute; left: 2px; top: 2px; z-index: 2; font-size: 9px; line-height: 1; pointer-events: none; }
 /* Servers carry a short one- or two-line label (see shared/server-icon-label.ts) instead of one letter; the room is a little taller than the utility icons. */
 .server-icon.server-icon-server { height: 40px; }
 .server-icon-line { display: block; max-width: 34px; overflow: hidden; text-overflow: clip; white-space: nowrap; font-variant-numeric: tabular-nums; }
