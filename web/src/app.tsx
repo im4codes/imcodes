@@ -2045,7 +2045,7 @@ export function App() {
   const openSubIdsRef = useRef(openSubIds);
   openSubIdsRef.current = openSubIds;
   const activeSplitPairRef = useRef<{ taskId: string; executorSubId: string; auditorSubId: string } | null>(null);
-  const [, setActiveSplitPairTaskId] = useState<string | null>(null);
+  const [activeSplitPairTaskId, setActiveSplitPairTaskId] = useState<string | null>(null);
   const persistOpenSubIds = useCallback((next: Set<string>) => {
     const mainSession = openSubPersistenceSessionRef.current;
     if (!mainSession) return;
@@ -8374,6 +8374,7 @@ export function App() {
               remoteDesktopCanSetUp={!selectedShareTarget}
               active={windowVisible && (isMobile || focusedSubId === sub.id)}
               visible={windowVisible}
+              showTaskPairPanel={!activeSplitPairTaskId || activeSplitPairRef.current?.auditorSubId === sub.id}
               onPendingQuestion={surfaceAskQuestionFromHistory}
               idleFlashToken={idleFlashTokens.get(sub.sessionName) ?? 0}
               onDiff={registerDiffApplyer}
