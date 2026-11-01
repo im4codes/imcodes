@@ -2316,6 +2316,72 @@ describe('RemoteDesktopPanel mobile gestures', () => {
     expect(video.style.transform).toContain('scale(1.5)');
   });
 
+  it('keeps the touch ring position across geometry-only resizes and clamps it to the stage', async () => {
+    const { stage, getByLabelText } = await renderPanel();
+    const ring = getByLabelText('remote_desktop.touch_ring');
+
+    // The first resize after the test harness supplies usable stage geometry
+    // completes the same initial-centre pass that ResizeObserver performs in
+    // a browser.
+    act(() => { window.dispatchEvent(new Event('resize')); });
+    expect(ring.style.left).toBe('200px');
+    expect(ring.style.top).toBe(`${150 + 72}px`);
+
+    // Move the ring away from centre, then resize without changing display,
+    // layout, scale or input mode. The position must survive unchanged.
+    act(() => {
+      pointer(stage, 'pointerdown', { pointerId: 301, clientX: 320, clientY: 120 });
+      pointer(stage, 'pointerup', { pointerId: 301, clientX: 320, clientY: 120 });
+    });
+    expect(ring.style.left).toBe('320px');
+    expect(ring.style.top).toBe(`${120 + 72}px`);
+
+    // Minimizing a floating panel can briefly report a zero-sized stage. That
+    // transient geometry must not overwrite the last usable ring coordinate;
+    // restoring the panel should paint it back at the same place.
+    Object.defineProperties(stage, {
+      clientWidth: { value: 0, configurable: true },
+      clientHeight: { value: 0, configurable: true },
+    });
+    act(() => { window.dispatchEvent(new Event('resize')); });
+    expect(ring.style.left).toBe('320px');
+    expect(ring.style.top).toBe(`${120 + 72}px`);
+
+    Object.defineProperties(stage, {
+      clientWidth: { value: 400, configurable: true },
+      clientHeight: { value: 300, configurable: true },
+    });
+    act(() => { window.dispatchEvent(new Event('resize')); });
+    expect(ring.style.left).toBe('320px');
+    expect(ring.style.top).toBe(`${120 + 72}px`);
+
+    Object.defineProperties(stage, {
+      clientWidth: { value: 240, configurable: true },
+      clientHeight: { value: 180, configurable: true },
+    });
+    act(() => { window.dispatchEvent(new Event('resize')); });
+    expect(ring.style.left).toBe('240px');
+    expect(ring.style.top).toBe(`${120 + 72}px`);
+
+    // A still smaller stage clamps both coordinates, and growing it again
+    // does not recenter the user's ring.
+    Object.defineProperties(stage, {
+      clientWidth: { value: 100, configurable: true },
+      clientHeight: { value: 80, configurable: true },
+    });
+    act(() => { window.dispatchEvent(new Event('resize')); });
+    expect(ring.style.left).toBe('100px');
+    expect(ring.style.top).toBe(`${80 + 72}px`);
+
+    Object.defineProperties(stage, {
+      clientWidth: { value: 600, configurable: true },
+      clientHeight: { value: 500, configurable: true },
+    });
+    act(() => { window.dispatchEvent(new Event('resize')); });
+    expect(ring.style.left).toBe('100px');
+    expect(ring.style.top).toBe(`${80 + 72}px`);
+  });
+
   it('remembers a new zoom ratio for this machine once it settles, without saving on every intermediate change', async () => {
     vi.useFakeTimers();
     const { getByLabelText } = await renderPanel();

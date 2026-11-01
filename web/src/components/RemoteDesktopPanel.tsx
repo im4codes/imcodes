@@ -641,6 +641,12 @@ export function RemoteDesktopPanel({
    * is about.
    */
   const viewportResetKeyRef = useRef<string | null>(null);
+  // The first usable stage geometry is the virtual mouse's initial mount. A
+  // later geometry-only refresh must keep the user's ring position, while a
+  // real reset trigger (display/layout/scale/input mode) starts it over at
+  // the new stage's centre.
+  const hasInitializedVirtualMouseRef = useRef(false);
+  const virtualMouseResetPendingRef = useRef(false);
   const virtualMouseRef = useRef<TouchPoint>({ x: 0, y: 0 });
   const virtualMouseDragRef = useRef<VirtualMouseDrag | null>(null);
   const virtualMouseEdgePointRef = useRef<TouchPoint | null>(null);
@@ -1312,8 +1318,21 @@ export function RemoteDesktopPanel({
       : isMountRun || !resetTrigger ? viewportRef.current : INITIAL_REMOTE_DESKTOP_VIEWPORT;
     viewportRef.current = nextViewport;
     setViewport(nextViewport);
-    if (stage) {
-      const nextMouse = { x: stage.clientWidth / 2, y: stage.clientHeight / 2 };
+    const shouldResetVirtualMouse = resetTrigger || !hasInitializedVirtualMouseRef.current;
+    if (shouldResetVirtualMouse) virtualMouseResetPendingRef.current = true;
+    if (stage && stage.clientWidth > 0 && stage.clientHeight > 0) {
+      const center = { x: stage.clientWidth / 2, y: stage.clientHeight / 2 };
+      const clampCoordinate = (value: number, max: number, fallback: number) => (
+        Number.isFinite(value) ? Math.max(0, Math.min(max, value)) : fallback
+      );
+      const nextMouse = virtualMouseResetPendingRef.current
+        ? center
+        : {
+          x: clampCoordinate(virtualMouseRef.current.x, stage.clientWidth, center.x),
+          y: clampCoordinate(virtualMouseRef.current.y, stage.clientHeight, center.y),
+        };
+      virtualMouseResetPendingRef.current = false;
+      hasInitializedVirtualMouseRef.current = true;
       virtualMouseRef.current = nextMouse;
       setVirtualMouse(nextMouse);
     }
