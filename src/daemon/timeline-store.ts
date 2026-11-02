@@ -333,14 +333,22 @@ class TimelineStore {
     sessionName: string,
     opts?: { afterTs?: number; afterSeq?: number; epoch?: number; beforeTs?: number; limit?: number },
   ): Promise<TimelineEvent[]> {
-    const events = await timelineProjection.queryHistory({
-      sessionId: sessionName,
-      afterTs: opts?.afterTs,
-      afterSeq: opts?.afterSeq,
-      epoch: opts?.epoch,
-      beforeTs: opts?.beforeTs,
-      limit: opts?.limit,
-    });
+    let events: TimelineEvent[] | null;
+    try {
+      events = await timelineProjection.queryHistory({
+        sessionId: sessionName,
+        afterTs: opts?.afterTs,
+        afterSeq: opts?.afterSeq,
+        epoch: opts?.epoch,
+        beforeTs: opts?.beforeTs,
+        limit: opts?.limit,
+      });
+    } catch (err) {
+      if (err instanceof TimelineProjectionBusyError) {
+        throw new TimelinePreferredReadError(TIMELINE_HISTORY_ERROR_REASONS.PROJECTION_BUSY);
+      }
+      throw err;
+    }
     if (events === null) throw new TimelinePreferredReadError(TIMELINE_HISTORY_ERROR_REASONS.PROJECTION_UNAVAILABLE);
     return events;
   }
@@ -374,7 +382,15 @@ class TimelineStore {
   }
 
   async readCompletedTextTail(sessionName: string, limit = 50, options?: TimelineTextTailOptions): Promise<TimelineEvent[]> {
-    const events = await timelineProjection.queryCompletedTextTail(sessionName, limit, options);
+    let events: TimelineEvent[] | null;
+    try {
+      events = await timelineProjection.queryCompletedTextTail(sessionName, limit, options);
+    } catch (err) {
+      if (err instanceof TimelineProjectionBusyError) {
+        throw new TimelinePreferredReadError(TIMELINE_HISTORY_ERROR_REASONS.PROJECTION_BUSY);
+      }
+      throw err;
+    }
     if (events === null) throw new TimelinePreferredReadError(TIMELINE_HISTORY_ERROR_REASONS.PROJECTION_UNAVAILABLE);
     return events;
   }

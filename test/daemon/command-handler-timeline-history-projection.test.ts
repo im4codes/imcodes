@@ -836,10 +836,12 @@ describe('command-handler timeline history with SQLite-preferred reads', () => {
     }));
   });
 
-  it('returns recoverable ERROR/projection_busy when the main-thread read hits projection saturation', async () => {
+  it('returns recoverable ERROR/projection_busy when the main-thread read hits projection saturation (content or state read) and recovers without restart', async () => {
     getSessionMock.mockReturnValue({ name: 'deck_proj_busy_main', agentType: 'codex' });
     shouldUseHistoryWorkerMock.mockReturnValue(false);
-    readByTypesPreferredMock.mockRejectedValue(
+
+    // 1. Content-read saturation
+    readByTypesPreferredMock.mockRejectedValueOnce(
       new TimelinePreferredReadError(
         TIMELINE_HISTORY_ERROR_REASONS.PROJECTION_BUSY,
         'main_sqlite',
@@ -849,7 +851,7 @@ describe('command-handler timeline history with SQLite-preferred reads', () => {
     handleWebCommand({
       type: TIMELINE_MESSAGES.HISTORY_REQUEST,
       sessionName: 'deck_proj_busy_main',
-      requestId: 'hist-proj-busy-main',
+      requestId: 'hist-proj-busy-content',
       limit: 50,
     }, serverLink as any);
     await flushAsync();
@@ -857,7 +859,7 @@ describe('command-handler timeline history with SQLite-preferred reads', () => {
     expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
       type: TIMELINE_MESSAGES.HISTORY,
       sessionName: 'deck_proj_busy_main',
-      requestId: 'hist-proj-busy-main',
+      requestId: 'hist-proj-busy-content',
       status: TIMELINE_RESPONSE_STATUS.ERROR,
       errorReason: TIMELINE_HISTORY_ERROR_REASONS.PROJECTION_BUSY,
       source: 'main_sqlite',
@@ -865,10 +867,12 @@ describe('command-handler timeline history with SQLite-preferred reads', () => {
       recoverable: true,
       hasMore: false,
     }));
-  });
 
-  it('returns recoverable ERROR/projection_busy when epoch-reset replay hits projection saturation', async () => {
-    readPreferredMock.mockRejectedValue(
+    // 2. State-read saturation: content read succeeds, state read hits saturation
+    readByTypesPreferredMock.mockResolvedValueOnce([
+      { eventId: 'u-main', sessionId: 'deck_proj_busy_main', ts: 1000, seq: 1, epoch: 1, source: 'daemon', confidence: 'high', type: 'user.message', payload: { text: 'content' } },
+    ]);
+    readByTypesPreferredMock.mockRejectedValueOnce(
       new TimelinePreferredReadError(
         TIMELINE_HISTORY_ERROR_REASONS.PROJECTION_BUSY,
         'main_sqlite',
@@ -876,24 +880,107 @@ describe('command-handler timeline history with SQLite-preferred reads', () => {
     );
 
     handleWebCommand({
-      type: TIMELINE_MESSAGES.REPLAY_REQUEST,
-      sessionName: 'deck_replay_busy',
-      requestId: 'replay-proj-busy',
-      afterSeq: 10,
-      epoch: 1,
+      type: TIMELINE_MESSAGES.HISTORY_REQUEST,
+      sessionName: 'deck_proj_busy_main',
+      requestId: 'hist-proj-busy-state',
+      limit: 50,
     }, serverLink as any);
     await flushAsync();
 
     expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
-      type: TIMELINE_MESSAGES.REPLAY,
-      sessionName: 'deck_replay_busy',
-      requestId: 'replay-proj-busy',
+      type: TIMELINE_MESSAGES.HISTORY,
+      sessionName: 'deck_proj_busy_main',
+      requestId: 'hist-proj-busy-state',
       status: TIMELINE_RESPONSE_STATUS.ERROR,
       errorReason: TIMELINE_HISTORY_ERROR_REASONS.PROJECTION_BUSY,
-      source: 'error',
+      source: 'main_sqlite',
       events: [],
       recoverable: true,
+      hasMore: false,
     }));
+
+    // 3. Recovery without restart: once saturation clears, same session succeeds
+    readByTypesPreferredMock.mockResolvedValueOnce([
+      { eventId: 'u-main-2', sessionId: 'deck_proj_busy_main', ts: 1010, seq: 2, epoch: 1, source: 'daemon', confidence: 'high', type: 'user.message', payload: { text: 'recovered content' } },
+    ]);
+    readByTypesPreferredMock.mockResolvedValueOnce([
+      { eventId: 's-main', sessionId: 'deck_proj_busy_main', ts: 1020, seq: 3, epoch: 1, source: 'daemon', confidence: 'high', type: 'session.state', payload: { state: 'idle' } },
+    ]);
+
+    handleWebCommand({
+      type: TIMELINE_MESSAGES.HISTORY_REQUEST,
+      sessionName: 'deck_proj_busy_main',
+      requestId: 'hist-proj-busy-recovered',
+      limit: 50,
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: TIMELINE_MESSAGES.HISTORY,
+      sessionName: 'deck_proj_busy_main',
+      requestId: 'hist-proj-busy-recovered',
+      status: TIMELINE_RESPONSE_STATUS.OK,
+      source: 'main_sqlite',
+      events: [
+        expect.objectContaining({ eventId: 'u-main-2' }),
+        expect.objectContaining({ eventId: 's-main' }),
+      ],
+    }));
+  });
+
+  it('returns recoverable ERROR/projection_busy when epoch-reset replay hits projection saturation and recovers without restart', async () => {
+    const actualStore = await vi.importActual<any>('../../src/daemon/timeline-store.js');
+    const { timelineProjection, TimelineProjectionBusyError } = await import('../../src/daemon/timeline-projection.js');
+
+    const querySpy = vi.spyOn(timelineProjection, 'queryHistory')
+      .mockRejectedValueOnce(new TimelineProjectionBusyError())
+      .mockResolvedValueOnce([
+        { eventId: 'r-success', sessionId: 'deck_replay_busy', ts: 1000, seq: 11, epoch: 1, source: 'daemon', confidence: 'high', type: 'user.message', payload: { text: 'replay ok' } },
+      ]);
+    readPreferredMock.mockImplementation(actualStore.timelineStore.readPreferred.bind(actualStore.timelineStore));
+
+    try {
+      handleWebCommand({
+        type: TIMELINE_MESSAGES.REPLAY_REQUEST,
+        sessionName: 'deck_replay_busy',
+        requestId: 'replay-proj-busy-1',
+        afterSeq: 10,
+        epoch: 1,
+      }, serverLink as any);
+      await flushAsync();
+
+      expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+        type: TIMELINE_MESSAGES.REPLAY,
+        sessionName: 'deck_replay_busy',
+        requestId: 'replay-proj-busy-1',
+        status: TIMELINE_RESPONSE_STATUS.ERROR,
+        errorReason: TIMELINE_HISTORY_ERROR_REASONS.PROJECTION_BUSY,
+        source: 'error',
+        events: [],
+        recoverable: true,
+      }));
+
+      handleWebCommand({
+        type: TIMELINE_MESSAGES.REPLAY_REQUEST,
+        sessionName: 'deck_replay_busy',
+        requestId: 'replay-proj-busy-2',
+        afterSeq: 10,
+        epoch: 1,
+      }, serverLink as any);
+      await flushAsync();
+
+      expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+        type: TIMELINE_MESSAGES.REPLAY,
+        sessionName: 'deck_replay_busy',
+        requestId: 'replay-proj-busy-2',
+        status: TIMELINE_RESPONSE_STATUS.OK,
+        events: [
+          expect.objectContaining({ eventId: 'r-success' }),
+        ],
+      }));
+    } finally {
+      querySpy.mockRestore();
+    }
   });
 
   it('returns OK/empty when there genuinely is no history — distinct from projection failure', async () => {

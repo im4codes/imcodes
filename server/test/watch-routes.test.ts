@@ -4,6 +4,7 @@ import type { Env } from '../src/env.js';
 import { IMCODES_POD_HEADER } from '../../shared/http-header-names.js';
 import { TIMELINE_PAYLOAD_BUDGET_BYTES } from '../../shared/timeline-payload-budget.js';
 import { TIMELINE_DETAIL_FIELD_PATHS } from '../../shared/timeline-protocol.js';
+import { runNewestWindowBackfill } from '../../web/src/timeline/catchup/backfill-pager.js';
 
 const mockResolveServerRole = vi.fn<() => Promise<string>>().mockResolvedValue('owner');
 const mockGetFullServersByUserId = vi.fn();
@@ -568,8 +569,11 @@ describe('Watch routes', () => {
     }));
   });
 
-  it('GET /api/server/:id/timeline/history/full preserves recoverable flag for transient error responses', async () => {
-    mockRequestTimelineHistory.mockResolvedValue({
+  it('GET /api/server/:id/timeline/history/full handles recoverable flags and infers it for older daemons', async () => {
+    const app = await buildTestApp();
+
+    // 1. Explicit recoverable: true is preserved
+    mockRequestTimelineHistory.mockResolvedValueOnce({
       epoch: 11,
       events: [],
       hasMore: false,
@@ -578,15 +582,139 @@ describe('Watch routes', () => {
       recoverable: true,
       payloadBytes: 2,
     });
+    let res = await app.request('/api/server/srv-1/timeline/history/full?sessionName=deck_proj_brain&limit=50');
+    expect(res.status).toBe(200);
+    let body = await res.json() as Record<string, unknown>;
+    expect(body.status).toBe('error');
+    expect(body.errorReason).toBe('projection_busy');
+    expect(body.recoverable).toBe(true);
 
+    // 2. Older daemon without recoverable field: inferred as recoverable: true for projection_busy
+    mockRequestTimelineHistory.mockResolvedValueOnce({
+      epoch: 11,
+      events: [],
+      hasMore: false,
+      status: 'error',
+      errorReason: 'projection_busy',
+      payloadBytes: 2,
+    });
+    res = await app.request('/api/server/srv-1/timeline/history/full?sessionName=deck_proj_brain&limit=50');
+    expect(res.status).toBe(200);
+    body = await res.json() as Record<string, unknown>;
+    expect(body.status).toBe('error');
+    expect(body.errorReason).toBe('projection_busy');
+    expect(body.recoverable).toBe(true);
+
+    // 3. Explicit recoverable: false is strictly preserved
+    mockRequestTimelineHistory.mockResolvedValueOnce({
+      epoch: 11,
+      events: [],
+      hasMore: false,
+      status: 'error',
+      errorReason: 'projection_busy',
+      recoverable: false,
+      payloadBytes: 2,
+    });
+    res = await app.request('/api/server/srv-1/timeline/history/full?sessionName=deck_proj_brain&limit=50');
+    expect(res.status).toBe(200);
+    body = await res.json() as Record<string, unknown>;
+    expect(body.recoverable).toBe(false);
+
+    // 4. Genuine empty OK does not get recoverable
+    mockRequestTimelineHistory.mockResolvedValueOnce({
+      epoch: 11,
+      events: [],
+      hasMore: false,
+      status: 'ok',
+      payloadBytes: 2,
+    });
+    res = await app.request('/api/server/srv-1/timeline/history/full?sessionName=deck_proj_brain&limit=50');
+    expect(res.status).toBe(200);
+    body = await res.json() as Record<string, unknown>;
+    expect(body.status).toBe('ok');
+    expect(body.recoverable).toBeUndefined();
+
+    // 5. Non-recoverable error (e.g. internal_error) does not get recoverable
+    mockRequestTimelineHistory.mockResolvedValueOnce({
+      epoch: 11,
+      events: [],
+      hasMore: false,
+      status: 'error',
+      errorReason: 'internal_error',
+      payloadBytes: 2,
+    });
+    res = await app.request('/api/server/srv-1/timeline/history/full?sessionName=deck_proj_brain&limit=50');
+    expect(res.status).toBe(200);
+    body = await res.json() as Record<string, unknown>;
+    expect(body.status).toBe('error');
+    expect(body.recoverable).toBeUndefined();
+  });
+
+  it('GET /api/server/:id/timeline/history infers recoverable flag for older daemon busy responses', async () => {
     const app = await buildTestApp();
-    const res = await app.request('/api/server/srv-1/timeline/history/full?sessionName=deck_proj_brain&limit=50');
 
+    // Older daemon without recoverable field on /timeline/history endpoint
+    mockRequestTimelineHistory.mockResolvedValueOnce({
+      epoch: 11,
+      events: [],
+      hasMore: false,
+      status: 'error',
+      errorReason: 'projection_busy',
+      payloadBytes: 2,
+    });
+    const res = await app.request('/api/server/srv-1/timeline/history?sessionName=deck_proj_brain&limit=50');
     expect(res.status).toBe(200);
     const body = await res.json() as Record<string, unknown>;
     expect(body.status).toBe('error');
     expect(body.errorReason).toBe('projection_busy');
     expect(body.recoverable).toBe(true);
+  });
+
+  it('connects older-daemon HTTP error response to production pager and recovers without restart', async () => {
+    const app = await buildTestApp();
+
+    // 1. Initial attempt: older daemon emits projection_busy without recoverable
+    mockRequestTimelineHistory.mockResolvedValueOnce({
+      epoch: 11,
+      events: [],
+      hasMore: false,
+      status: 'error',
+      errorReason: 'projection_busy',
+      payloadBytes: 2,
+    });
+
+    const errorRes = await app.request('/api/server/srv-1/timeline/history/full?sessionName=deck_proj_brain&limit=200');
+    const errorPage = await errorRes.json() as any;
+
+    // Verify pager marks page incomplete (terminal: 'truncated', NOT 'caught_up')
+    const pagerResult1 = await runNewestWindowBackfill(100, {
+      limit: 200,
+      fetchPage: async () => errorPage,
+      mergePage: async () => ({ candidateCount: 0, minTs: null, maxTs: null }),
+    });
+    expect(pagerResult1.terminal).toBe('truncated');
+
+    // 2. Recovery: subsequent attempt succeeds once projection warms up
+    mockRequestTimelineHistory.mockResolvedValueOnce({
+      epoch: 11,
+      events: [
+        { eventId: 'e-rec-1', sessionId: 'deck_proj_brain', ts: 1050, type: 'user.message' },
+      ],
+      hasMore: false,
+      status: 'ok',
+      payloadBytes: 100,
+    });
+
+    const successRes = await app.request('/api/server/srv-1/timeline/history/full?sessionName=deck_proj_brain&limit=200');
+    const successPage = await successRes.json() as any;
+
+    const pagerResult2 = await runNewestWindowBackfill(100, {
+      limit: 200,
+      fetchPage: async () => successPage,
+      mergePage: async () => ({ candidateCount: 1, minTs: 1050, maxTs: 1050 }),
+    });
+    expect(pagerResult2.terminal).toBe('caught_up');
+    expect(pagerResult2.totalNew).toBe(1);
   });
 
   it('GET /api/server/:id/timeline/history/full clamps oversized pages to 200 events', async () => {

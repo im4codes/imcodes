@@ -18,6 +18,7 @@ import { IMCODES_POD_HEADER } from '../../../shared/http-header-names.js';
 import { TIMELINE_PAYLOAD_BUDGET_BYTES } from '../../../shared/timeline-payload-budget.js';
 import { TIMELINE_RESPONSE_STATUS } from '../../../shared/timeline-protocol.js';
 import { TIMELINE_HISTORY_LIMITS, clampTimelineHistoryLimit } from '../../../shared/timeline-history-limits.js';
+import { isRecoverableTimelineRequestErrorReason } from '../../../shared/timeline-history-errors.js';
 import { getPodIdentity } from '../util/pod-identity.js';
 import logger from '../util/logger.js';
 // Shared so the daemon (command-handler.ts) and server emit the SAME log
@@ -293,8 +294,16 @@ function timelineResponseMetadata(response: Record<string, unknown>, visibleEven
   for (const key of ['payloadBytes', 'actualPayloadBytes', 'droppedEvents', 'truncatedEvents'] as const) {
     if (typeof response[key] === 'number' && Number.isFinite(response[key])) metadata[key] = response[key];
   }
-  for (const key of ['payloadTruncated', 'cursorReset', 'recoverable'] as const) {
+  for (const key of ['payloadTruncated', 'cursorReset'] as const) {
     if (typeof response[key] === 'boolean') metadata[key] = response[key];
+  }
+  if (typeof response.recoverable === 'boolean') {
+    metadata.recoverable = response.recoverable;
+  } else if (
+    response.status === TIMELINE_RESPONSE_STATUS.ERROR
+    && isRecoverableTimelineRequestErrorReason(response.errorReason)
+  ) {
+    metadata.recoverable = true;
   }
   if (Array.isArray(response.detailRefs)) {
     metadata.detailRefs = visibleEventIds

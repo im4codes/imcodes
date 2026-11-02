@@ -56,6 +56,7 @@ import {
   traceWebCommandReceived,
 } from './latency-tracer.js';
 import { getDefaultTimelineHistoryWorkerPool, shouldUseTimelineHistoryWorkerPool, TimelineHistoryPoolError } from './timeline-history-pool.js';
+import { TimelineProjectionBusyError } from './timeline-projection.js';
 import { FsListPoolError, getDefaultFsListWorkerPool, shouldUseFsListWorkerPool } from './fs-list-pool.js';
 import { scanFsListSnapshot } from './fs-list-worker.js';
 import { FsGitStatusPoolError, getDefaultFsGitStatusWorkerPool, shouldUseFsGitStatusWorkerPool, __resetFsGitStatusWorkerPoolForTests } from './fs-git-status-pool.js';
@@ -6977,6 +6978,16 @@ async function handleTimelineReplay(cmd: Record<string, unknown>, serverLink: Se
       );
       return;
     }
+    if (err instanceof TimelineProjectionBusyError) {
+      sendTimelineReplayError(
+        serverLink,
+        sessionName,
+        requestId,
+        TIMELINE_HISTORY_ERROR_REASONS.PROJECTION_BUSY,
+        { recoverable: true },
+      );
+      return;
+    }
     sendTimelineReplayError(serverLink, sessionName, requestId, TIMELINE_REQUEST_ERROR_REASONS.INTERNAL_ERROR);
   }
 }
@@ -7309,6 +7320,9 @@ async function buildTimelineHistoryOnMain(params: TimelineHistoryRequestParams):
       const isRecoverable = TIMELINE_HISTORY_TRANSIENT_REASONS.has(err.reason) || isRecoverableTimelineRequestErrorReason(err.reason);
       return timelineHistoryErrorResult(err.source, err.reason, isRecoverable ? { recoverable: true } : undefined);
     }
+    if (err instanceof TimelineProjectionBusyError) {
+      return timelineHistoryErrorResult('main_sqlite', TIMELINE_HISTORY_ERROR_REASONS.PROJECTION_BUSY, { recoverable: true });
+    }
     throw err;
   }
   if (substantive.length > 0 && historyTypes.stateTypes.length > 0) {
@@ -7330,6 +7344,9 @@ async function buildTimelineHistoryOnMain(params: TimelineHistoryRequestParams):
       if (err instanceof TimelinePreferredReadError) {
         const isRecoverable = TIMELINE_HISTORY_TRANSIENT_REASONS.has(err.reason) || isRecoverableTimelineRequestErrorReason(err.reason);
         return timelineHistoryErrorResult(err.source, err.reason, isRecoverable ? { recoverable: true } : undefined);
+      }
+      if (err instanceof TimelineProjectionBusyError) {
+        return timelineHistoryErrorResult('main_sqlite', TIMELINE_HISTORY_ERROR_REASONS.PROJECTION_BUSY, { recoverable: true });
       }
       throw err;
     }
