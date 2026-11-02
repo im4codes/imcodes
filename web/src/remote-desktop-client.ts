@@ -532,6 +532,8 @@ export class RemoteDesktopClient {
   private desiredQualityPreference: RemoteDesktopQualityPreference | null = null;
   /** The preference the current worker session already has. */
   private sentQualityPreferenceKey: string | null = null;
+  /** A worker refusal suppresses automatic STATUS-triggered re-sends until the user chooses again. */
+  private rejectedQualityPreferenceKey: string | null = null;
   /**
    * Latency guard: an extra, temporary bitrate ceiling the browser applies on
    * top of the viewer's own choice when the stream shows up late (round trip
@@ -809,6 +811,10 @@ export class RemoteDesktopClient {
   ): boolean {
     if (!isRemoteDesktopQualityPreference(preference)) return false;
     this.desiredQualityPreference = normalizeRemoteDesktopQualityPreference(preference);
+    // An explicit user choice is a new attempt, even when it repeats the same
+    // preset that the worker refused previously.
+    this.rejectedQualityPreferenceKey = null;
+    this.sentQualityPreferenceKey = null;
     this.latencyGuardEnabled = options.latencyGuard !== false;
     if (!this.latencyGuardEnabled) this.resetLatencyGuard();
     this.flushQualityPreference();
@@ -888,7 +894,7 @@ export class RemoteDesktopClient {
       ? effective
       : legacyRemoteDesktopQualityPreference(effective);
     const key = JSON.stringify(preference);
-    if (key === this.sentQualityPreferenceKey) return;
+    if (key === this.sentQualityPreferenceKey || key === this.rejectedQualityPreferenceKey) return;
     if (this.sendControl({
       type: REMOTE_DESKTOP_DATA_MSG.CONTROL,
       ...this.inputBase(),
@@ -1782,6 +1788,23 @@ export class RemoteDesktopClient {
         this.clearPendingPaste();
         this.sendTypedText(pending.text);
       }
+      if (parsed.value.kind === REMOTE_DESKTOP_CONTROL_KIND.SET_QUALITY_PREFERENCE
+        && parsed.value.reason === REMOTE_DESKTOP_CONTROL_REJECTION.QUALITY_UNAVAILABLE) {
+        // Older/current workers do not echo a request id. The last sent key is
+        // therefore the only safe correlation available to this wire version;
+        // remember it so repeated STATUS frames cannot replay the refusal.
+        const effective = this.effectiveQualityPreference();
+        const key = effective ? JSON.stringify(
+          this.snapshot.qualityUltraSupported
+            ? effective
+            : legacyRemoteDesktopQualityPreference(effective),
+        ) : null;
+        if (key !== null) {
+          if (key === this.rejectedQualityPreferenceKey) return;
+          this.rejectedQualityPreferenceKey = key;
+          this.sentQualityPreferenceKey = key;
+        }
+      }
       this.publishControlRejection(
         parsed.value.kind,
         parsed.value.reason,
@@ -1874,7 +1897,10 @@ export class RemoteDesktopClient {
       && isOpen(this.pointerChannel);
     if (!this.channelsReady) this.clearPendingPaste();
     // A reopened channel is a new worker session: it has no preference yet.
-    if (!isOpen(this.controlChannel)) this.sentQualityPreferenceKey = null;
+    if (!isOpen(this.controlChannel)) {
+      this.sentQualityPreferenceKey = null;
+      this.rejectedQualityPreferenceKey = null;
+    }
     else this.flushQualityPreference();
     if (this.channelsReady && !this.dataKeepaliveTimer) {
       this.dataKeepaliveTimer = setInterval(() => {

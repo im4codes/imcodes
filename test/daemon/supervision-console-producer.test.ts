@@ -52,6 +52,7 @@ function producer(over: Partial<{
     observedAt: number;
   } | undefined;
   snapshotCacheTtlMs: number;
+  monotonicNowMs: () => number;
 }> = {}) {
   return new SupervisionConsoleProducer(asDb(), {
     projectionEpoch: over.epoch ?? EPOCH,
@@ -60,6 +61,7 @@ function producer(over: Partial<{
     broadcast: over.broadcast === false ? undefined : (frame) => { sent.push(frame); },
     resolveSessionPresentation: over.resolveSessionPresentation,
     snapshotCacheTtlMs: over.snapshotCacheTtlMs ?? 0,
+    monotonicNowMs: over.monotonicNowMs,
   });
 }
 
@@ -190,6 +192,27 @@ describe('bounded projection cost on a large backlog', () => {
     expect(calls).toBe(1);
     p.invalidateSnapshot(SCOPE);
     p.buildSnapshot(SCOPE, 'sub-cache-c');
+    expect(calls).toBe(2);
+  });
+
+  it('uses the monotonic clock for cache expiry', () => {
+    seedTask('implementing');
+    let monotonic = 0;
+    let calls = 0;
+    const p = producer({
+      snapshotCacheTtlMs: 1_000,
+      monotonicNowMs: () => monotonic,
+      resolveSessionPresentation: (_sessionName, observedAt) => {
+        calls += 1;
+        return { state: 'idle', source: 'runtime', observedAt };
+      },
+    });
+    p.buildSnapshot(SCOPE, 'sub-monotonic-a');
+    monotonic = 999;
+    p.buildSnapshot(SCOPE, 'sub-monotonic-b');
+    expect(calls).toBe(1);
+    monotonic = 1_000;
+    p.buildSnapshot(SCOPE, 'sub-monotonic-c');
     expect(calls).toBe(2);
   });
 
