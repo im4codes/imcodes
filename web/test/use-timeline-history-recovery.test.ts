@@ -85,7 +85,7 @@ describe('useTimeline — history recovery and error clearing contract', () => {
     // Simulate server bridge sending request_canceled (e.g. mobile client backgrounded or timed out)
     await act(async () => {
       handler?.({
-        type: 'timeline.history',
+        type: TIMELINE_MESSAGES.HISTORY,
         sessionName,
         requestId: 'req-cancel-1',
         epoch: 1,
@@ -134,7 +134,7 @@ describe('useTimeline — history recovery and error clearing contract', () => {
     // First: a real error occurs
     await act(async () => {
       handler?.({
-        type: 'timeline.history',
+        type: TIMELINE_MESSAGES.HISTORY,
         sessionName,
         requestId: 'req-error-1',
         epoch: 1,
@@ -220,7 +220,7 @@ describe('useTimeline — history recovery and error clearing contract', () => {
     // Induce error state on timeline
     await act(async () => {
       handler?.({
-        type: 'timeline.history',
+        type: TIMELINE_MESSAGES.HISTORY,
         sessionName,
         requestId: 'req-err-recover',
         epoch: 1,
@@ -392,7 +392,7 @@ describe('useTimeline — history recovery and error clearing contract', () => {
     // Sub-session encounters a transient error
     await act(async () => {
       handler?.({
-        type: 'timeline.history',
+        type: TIMELINE_MESSAGES.HISTORY,
         sessionName: subSession,
         requestId: 'req-sub-err',
         epoch: 1,
@@ -469,7 +469,7 @@ describe('useTimeline — history recovery and error clearing contract', () => {
     // Set error on timeline
     await act(async () => {
       handler?.({
-        type: 'timeline.history',
+        type: TIMELINE_MESSAGES.HISTORY,
         sessionName,
         requestId: 'req-retry-err',
         epoch: 1,
@@ -557,7 +557,7 @@ describe('useTimeline — history recovery and error clearing contract', () => {
       const f = auditFixture(s);
       await waitFor(() => expect(f.ws.sendTimelineHistoryRequest).toHaveBeenCalled());
       await act(async () => {
-        f.handler({ type: 'timeline.history', sessionName: s, requestId: f.rid, epoch: 1, events: [auditEvent(s)] });
+        f.handler({ type: TIMELINE_MESSAGES.HISTORY, sessionName: s, requestId: f.rid, epoch: 1, events: [auditEvent(s)] });
         await vi.advanceTimersByTimeAsync(300);
       });
       await act(async () => {
@@ -566,7 +566,7 @@ describe('useTimeline — history recovery and error clearing contract', () => {
       });
       await act(async () => {
         f.handler({
-          type: 'timeline.history',
+          type: TIMELINE_MESSAGES.HISTORY,
           sessionName: s,
           requestId: f.rid,
           epoch: 1,
@@ -589,7 +589,7 @@ describe('useTimeline — history recovery and error clearing contract', () => {
       await waitFor(() => expect(f.ws.sendTimelineHistoryRequest).toHaveBeenCalled());
       await act(async () => {
         f.handler({
-          type: 'timeline.history',
+          type: TIMELINE_MESSAGES.HISTORY,
           sessionName: s,
           requestId: f.rid,
           epoch: 1,
@@ -634,7 +634,7 @@ describe('useTimeline — history recovery and error clearing contract', () => {
         await vi.advanceTimersByTimeAsync(50);
       });
       await act(async () => {
-        f.handler({ type: 'timeline.history', sessionName: b, requestId: f.rid, epoch: 1, events: [auditEvent(b)] });
+        f.handler({ type: TIMELINE_MESSAGES.HISTORY, sessionName: b, requestId: f.rid, epoch: 1, events: [auditEvent(b)] });
         await vi.advanceTimersByTimeAsync(20);
       });
       expect(f.tl.refreshing).toBe(true);
@@ -692,7 +692,7 @@ describe('useTimeline — history recovery and error clearing contract', () => {
 
       // A's generation 3 WS completes, but A's generation 3 HTTP is still pending
       await act(async () => {
-        f.handler({ type: 'timeline.history', sessionName: a, requestId: f.rid, epoch: 1, events: [auditEvent(a)] });
+        f.handler({ type: TIMELINE_MESSAGES.HISTORY, sessionName: a, requestId: f.rid, epoch: 1, events: [auditEvent(a)] });
         await vi.advanceTimersByTimeAsync(20);
       });
       expect(f.tl.refreshing).toBe(true);
@@ -879,7 +879,7 @@ describe('useTimeline — history recovery and error clearing contract', () => {
 
       // Settle B's WS and HTTP request
       await act(async () => {
-        f.handler({ type: 'timeline.history', sessionName: b, requestId: f.rid, epoch: 1, events: [auditEvent(b)] });
+        f.handler({ type: TIMELINE_MESSAGES.HISTORY, sessionName: b, requestId: f.rid, epoch: 1, events: [auditEvent(b)] });
         pendingB.resolve({ events: [], epoch: 1, hasMore: false, nextCursor: null });
         await vi.advanceTimersByTimeAsync(100);
       });

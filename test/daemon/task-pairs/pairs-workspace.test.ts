@@ -530,7 +530,11 @@ describe('pair workspaces', () => {
     git(project, 'push', '-q', 'origin', 'HEAD:refs/heads/dev');
     marker(BRAIN, '<!-- IMCODES_TASK DONE CHERRY force=true -->');
     const ended = await endedAt('CHERRY');
+    // DONE schedules its own asynchronous immediate sweep. Observe completion,
+    // not just the earlier ended marker, before starting the retention sweep.
+    await taskPairService.waitForIdle();
     await taskPairService.sweepWorkspaces(ended + TASK_PAIR_WORKSPACE_RETENTION_MS, { force: true });
+    await taskPairService.waitForIdle();
     expect(existsSync(join(path, '..'))).toBe(false);
   });
 
@@ -546,7 +550,11 @@ describe('pair workspaces', () => {
     git(project, 'branch', 'release/pair-integrated', commit);
     marker(BRAIN, '<!-- IMCODES_TASK DONE BRANCH_INTEGRATED force=true -->');
     const ended = await endedAt('BRANCH_INTEGRATED');
+    // DONE schedules its own asynchronous immediate sweep. Observe completion,
+    // not just the earlier ended marker, before starting the retention sweep.
+    await taskPairService.waitForIdle();
     await taskPairService.sweepWorkspaces(ended + TASK_PAIR_WORKSPACE_RETENTION_MS, { force: true });
+    await taskPairService.waitForIdle();
     expect(existsSync(join(path, '..'))).toBe(false);
   });
 
