@@ -9,9 +9,12 @@ import {
   DEFAULT_SHARED_ENTRY_OPEN_TIMEOUT_MS,
   configureApiKey,
   clearApiKey,
+  resetRefreshStateForTesting,
+  onAuthExpired,
   type OpenSharedEntryResponse,
   type SharedEntrySummary,
 } from '../src/api.js';
+import { AUTH_IDENTITY_ERRORS } from '../../shared/auth-identity.js';
 import { SharedEntriesPanel } from '../src/components/SharedEntriesPanel.js';
 import type { ShareTarget } from '../src/tab-sharing-ui.js';
 
@@ -29,7 +32,12 @@ const LOCALES = ['en', 'zh-CN', 'zh-TW', 'es', 'ru', 'ja', 'ko'] as const;
 describe('shared entry open bounded timeout & cancellation (api contract)', () => {
   const originalFetch = globalThis.fetch;
 
+  beforeEach(() => {
+    resetRefreshStateForTesting();
+  });
+
   afterEach(() => {
+    resetRefreshStateForTesting();
     globalThis.fetch = originalFetch;
     vi.restoreAllMocks();
   });
@@ -154,6 +162,163 @@ describe('shared entry open bounded timeout & cancellation (api contract)', () =
     expect(settled, 'open must settle at its deadline even when cookie refresh is hung').toBe('SharedOpenTimeoutError');
     vi.unstubAllGlobals();
     vi.useRealTimers();
+  });
+
+  it('audit r2: default deadline includes cold auth telemetry before a dedicated native verifier', async () => {
+    vi.useFakeTimers();
+    configureApiKey('isolated-fixture-key');
+    vi.stubGlobal('fetch', vi.fn((url: string) => {
+      if (String(url).includes('/api/shares/open')) {
+        return new Promise((resolve) => setTimeout(() => resolve(new Response('', { status: 401 })), 14990));
+      }
+      return Promise.resolve(new Response('{}', { status: 200 }));
+    }));
+    let result = 'pending';
+    void openSharedEntry({ kind: 'server', serverId: 'fixture' }).then(() => { result = 'opened'; }, (e) => { result = e.name; });
+    await vi.advanceTimersByTimeAsync(15001);
+    expect(result, '15s deadline must not wait another cold-telemetry interval').toBe('SharedOpenTimeoutError');
+    clearApiKey();
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+  });
+
+  it('audit r2: canceled operation cannot expire auth from a late identity-error body', async () => {
+    vi.useFakeTimers();
+    const expired = vi.fn();
+    onAuthExpired(expired);
+    const ctrl = new AbortController();
+    let release!: (s: string) => void;
+    vi.stubGlobal('fetch', vi.fn(async () => ({
+      status: 409,
+      ok: false,
+      headers: new Headers(),
+      text: () => new Promise<string>((resolve) => { release = resolve; }),
+    })));
+    const done = openSharedEntry({ kind: 'server', serverId: 'fixture' }, { signal: ctrl.signal }).catch((e) => e);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(release).toBeTypeOf('function');
+    ctrl.abort(new DOMException('navigation superseded', 'AbortError'));
+    release(JSON.stringify({ error: AUTH_IDENTITY_ERRORS.CHANGED }));
+    await done;
+    expect(expired, 'late body after caller cancel must not clear the newer route/login').not.toHaveBeenCalled();
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+  });
+
+  it('audit r2: successful response body wait is also bounded by the open deadline', async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal('fetch', vi.fn(async () => ({
+      status: 200,
+      ok: true,
+      headers: new Headers(),
+      json: () => new Promise(() => {}),
+    })));
+    let result = 'pending';
+    void openSharedEntry({ kind: 'server', serverId: 'fixture' }, { timeoutMs: 30 }).then(() => { result = 'opened'; }, (e) => { result = e.name; });
+    await vi.advanceTimersByTimeAsync(50);
+    expect(result, 'headers are not completed shared-open data; body must remain cancelable').toBe('SharedOpenTimeoutError');
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+  });
+
+  it('positive control: shared refresh allows Caller B to succeed when concurrent Caller A is canceled', async () => {
+    clearApiKey();
+    let refreshCalls = 0;
+    let resolveRefresh!: (res: Response) => void;
+    const refreshPromise = new Promise<Response>((resolve) => { resolveRefresh = resolve; });
+
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+      const u = String(url);
+      if (u.includes('/api/auth/refresh')) {
+        refreshCalls++;
+        return refreshPromise;
+      }
+      if (u.includes('/api/shares/open')) {
+        if (refreshCalls === 0) {
+          return new Response('', { status: 401 });
+        }
+        return new Response(JSON.stringify({
+          server: { id: 'srv-b', name: 'Server B', status: 'online', lastHeartbeatAt: Date.now() },
+          target: { kind: 'server', serverId: 'srv-b' },
+          coverage: {
+            effectiveRole: 'participant',
+            historyCutoffAt: 0,
+            nextCoverageRecheckAt: null,
+            coveringShareIds: ['share-b'],
+            primaryShareId: 'share-b',
+            authorizedAt: Date.now(),
+          },
+          sessions: [],
+          subSessions: [],
+        }), { status: 200, headers: { 'content-type': 'application/json' } });
+      }
+      return new Response('', { status: 404 });
+    }));
+
+    const ctrlA = new AbortController();
+    const promiseA = openSharedEntry({ kind: 'server', serverId: 'srv-a' }, { signal: ctrlA.signal });
+    const promiseB = openSharedEntry({ kind: 'server', serverId: 'srv-b' });
+
+    // Wait until refresh is triggered
+    await vi.waitFor(() => expect(refreshCalls).toBe(1));
+
+    // Cancel Caller A while refresh is in flight
+    ctrlA.abort(new DOMException('User changed mind', 'AbortError'));
+    await expect(promiseA).rejects.toThrow();
+
+    // Now resolve the shared refresh successfully for Caller B
+    resolveRefresh(new Response(JSON.stringify({ ok: true }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    }));
+
+    const resB = await promiseB;
+    expect(resB.server.id).toBe('srv-b');
+    vi.unstubAllGlobals();
+  });
+
+  it('positive control: live request with 409 identity changed properly triggers onAuthExpired', async () => {
+    const expired = vi.fn();
+    onAuthExpired(expired);
+    vi.stubGlobal('fetch', vi.fn(async () => ({
+      status: 409,
+      ok: false,
+      headers: new Headers(),
+      text: async () => JSON.stringify({ error: AUTH_IDENTITY_ERRORS.CHANGED }),
+    })));
+    await expect(openSharedEntry({ kind: 'server', serverId: 'srv-live' })).rejects.toThrow();
+    expect(expired).toHaveBeenCalledWith(AUTH_IDENTITY_ERRORS.CHANGED);
+    vi.unstubAllGlobals();
+  });
+
+  it('positive control: normal successful shared open completes in a single request with no extra polling', async () => {
+    let fetchCount = 0;
+    const mockResponse: OpenSharedEntryResponse = {
+      server: { id: 'srv-direct', name: 'Server Direct', status: 'online', lastHeartbeatAt: Date.now() },
+      target: { kind: 'server', serverId: 'srv-direct' },
+      coverage: {
+        effectiveRole: 'participant',
+        historyCutoffAt: 0,
+        nextCoverageRecheckAt: null,
+        coveringShareIds: ['share-direct'],
+        primaryShareId: 'share-direct',
+        authorizedAt: Date.now(),
+      },
+      sessions: [],
+      subSessions: [],
+    };
+    vi.stubGlobal('fetch', vi.fn(async () => {
+      fetchCount++;
+      return new Response(JSON.stringify(mockResponse), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    }));
+
+    const res = await openSharedEntry({ kind: 'server', serverId: 'srv-direct' });
+    expect(res.server.id).toBe('srv-direct');
+    expect(fetchCount).toBe(1);
+    vi.unstubAllGlobals();
   });
 });
 
