@@ -2059,9 +2059,14 @@ function getTimelineNoticeKey(msg: TimelinePayloadMetadata, state: TimelineHisto
 function getTimelineResponseState(
   msg: TimelineProtocolServerMessage,
 ): TimelineHistoryResponseState {
+  if (
+    msg.status === TIMELINE_RESPONSE_STATUS.CANCELED
+    || msg.errorReason === TIMELINE_HISTORY_ERROR_REASONS.REQUEST_CANCELED
+  ) {
+    return 'canceled';
+  }
   if (msg.status === TIMELINE_RESPONSE_STATUS.ERROR || msg.errorReason) return 'error';
   if (msg.status === TIMELINE_RESPONSE_STATUS.DEFERRED) return 'deferred';
-  if (msg.status === TIMELINE_RESPONSE_STATUS.CANCELED) return 'canceled';
   if (msg.status === TIMELINE_RESPONSE_STATUS.PARTIAL || msg.payloadTruncated) return 'partial';
   if (msg.type === TIMELINE_MESSAGES.DETAIL) return 'detail';
   return getTimelineEvents(msg).length === 0 ? 'empty' : 'ok';
@@ -4473,12 +4478,13 @@ export function useTimeline(
       // local tail base); that needs the deferred verified/forward cursor.
       void (async () => {
         let terminal: 'caught_up' | 'cap_hit' | 'truncated' | 'transient_null' | 'error' | null = null;
+        let outcome: Awaited<ReturnType<typeof runNewestWindowBackfill>> | null = null;
         try {
           // The page currently being fetched: `undefined` = the newest window, else a step down the hole.
           let pageBeforeTs: number | undefined;
           // Whether that page arrived payload-trimmed/dropped/reset (the pager ends such a round `truncated`).
           let pageIncomplete = false;
-          const outcome = await runNewestWindowBackfill(afterTs, {
+          outcome = await runNewestWindowBackfill(afterTs, {
             limit: MAX_FORWARD_PAGE_EVENTS,
             maxPages,
             // Only the hole's own round resumes at its stitched top; a manual newest-window refresh starts at the newest.
@@ -4627,23 +4633,24 @@ export function useTimeline(
           // While a hole is recorded, ITS filler owns the walk down: an unbounded newest-window refresh must not
           // chain a second walker past the hole's floor.
           const manualRoundDuringHole = mode === 'manualLatestWindow' && !!backfillCacheKey && !!getTimelineGap(backfillCacheKey);
-          if (outcome.terminal === 'cap_hit' && outcome.resumeBeforeTs !== undefined
+          const nextResumeBeforeTs = outcome.resumeBeforeTs;
+          if (outcome.terminal === 'cap_hit' && nextResumeBeforeTs !== undefined
             && hadLocalEvents
             && !manualRoundDuringHole
             && roundsChained < CATCHUP_TAIL_MAX_ROUNDS) {
             backfillDebug('fireHttpBackfill: cap_hit → chaining next round', {
-              sessionId: backfillSessionId, roundsChained: roundsChained + 1, resumeBeforeTs: outcome.resumeBeforeTs,
+              sessionId: backfillSessionId, roundsChained: roundsChained + 1, resumeBeforeTs: nextResumeBeforeTs,
             });
             setTimeout(() => {
               fireHttpBackfillRef.current(0, {
                 ...opts,
                 visible: false,
-                _resumeBeforeTs: outcome.resumeBeforeTs,
+                _resumeBeforeTs: nextResumeBeforeTs,
                 _roundsChained: roundsChained + 1,
                 _retryAttempt: 0,
               });
             }, CATCHUP_TAIL_CHAIN_DELAY_MS);
-          } else if (outcome.terminal === 'cap_hit' && outcome.resumeBeforeTs !== undefined) {
+          } else if (outcome.terminal === 'cap_hit' && nextResumeBeforeTs !== undefined) {
             backfillDebug('fireHttpBackfill: cap_hit → round budget exhausted, giving up for now', {
               sessionId: backfillSessionId, roundsChained,
             });
@@ -4671,15 +4678,47 @@ export function useTimeline(
               gate.nextAllowedAt = 0;
             }
           }
-          if (foregroundRound) {
+          if (cacheKeyRef.current === backfillCacheKey) {
+            if (foregroundRound) {
+              httpBackfillInFlightRef.current[mode] = Math.max(0, httpBackfillInFlightRef.current[mode] - 1);
+              // The foreground contract ends when the newest page settles.
+              // Continuation rounds are intentionally invisible and must not
+              // leave a permanent spinner on a chat that already has content.
+              const foregroundState = terminal === 'transient_null'
+                ? (retryAttempt >= HTTP_BACKFILL_RETRY_DELAYS_MS.length ? 'offline' : 'pending')
+                : terminal === 'error' ? 'offline' : 'done';
+              updateHistoryStep('http', foregroundState, phase);
+              if (terminal === 'caught_up' || (outcome && outcome.totalNew > 0)) {
+                // Succeeded: clear any stale error notice
+                setHistoryStatus((prev) => (prev.response?.state === 'error' ? { ...prev, response: null } : prev));
+              } else if (
+                terminal === 'error'
+                || (terminal === 'transient_null' && retryAttempt >= HTTP_BACKFILL_RETRY_DELAYS_MS.length)
+              ) {
+                // Failed: if the daemon is not currently done / healthy, record the error notice so
+                // true un-synced state is visible to the user rather than falsely cleared or hidden.
+                setHistoryStatus((prev) => {
+                  if (prev.steps.daemon === 'done' && prev.response?.state !== 'error') return prev;
+                  return {
+                    ...prev,
+                    response: {
+                      state: 'error',
+                      i18nKey: 'chat.timelineStatus.error',
+                      localizedMessage: localizedTimelineNotice('chat.timelineStatus.error'),
+                      recoverable: true,
+                      source: 'http',
+                    },
+                  };
+                });
+              }
+              if (totalHttpBackfillInFlight(httpBackfillInFlightRef.current) === 0) setHttpRefreshing(false);
+            } else if (terminal === 'caught_up' || (outcome && outcome.totalNew > 0)) {
+              // Background round caught up or merged: also clear stale error notice
+              setHistoryStatus((prev) => (prev.response?.state === 'error' ? { ...prev, response: null } : prev));
+            }
+          } else if (foregroundRound) {
+            // Scope switched mid-flight: clean up in-flight counters without corrupting the new session's state
             httpBackfillInFlightRef.current[mode] = Math.max(0, httpBackfillInFlightRef.current[mode] - 1);
-            // The foreground contract ends when the newest page settles.
-            // Continuation rounds are intentionally invisible and must not
-            // leave a permanent spinner on a chat that already has content.
-            const foregroundState = terminal === 'transient_null'
-              ? (retryAttempt >= HTTP_BACKFILL_RETRY_DELAYS_MS.length ? 'offline' : 'pending')
-              : terminal === 'error' ? 'offline' : 'done';
-            updateHistoryStep('http', foregroundState, phase);
             if (totalHttpBackfillInFlight(httpBackfillInFlightRef.current) === 0) setHttpRefreshing(false);
           }
         }
@@ -4801,6 +4840,8 @@ export function useTimeline(
     // i.e. when the HTTP path is a no-op), then opportunistically catch up
     // over HTTP.
     void reloadLocalTimeline();
+    // Explicit manual retry resets any previous error notice so the user sees a clean refresh attempt:
+    setHistoryStatus((prev) => (prev.response ? { ...prev, response: null } : prev));
     // HTTP may be unavailable while the live daemon socket is healthy (for
     // example before serverId resolution). Force a newest-window daemon read
     // too; deliberately omit afterTs so one newly-sent/live event cannot hide
@@ -5695,7 +5736,11 @@ export function useTimeline(
       // request will be made), because a blanket `skipped` cannot tell a
       // waiting timeline from one that was never going to fetch.
       if (prev.steps.daemon === 'pending' || prev.steps.daemon === 'offline') return prev;
-      return { ...createIdleHistoryStatus(), response: prev.response };
+      const hasSuccessfulSync = prev.steps.daemon === 'done' || prev.steps.http === 'done';
+      const responseToKeep = hasSuccessfulSync && prev.response?.state === 'error' && prev.steps.http === 'done'
+        ? null
+        : prev.response;
+      return { ...createIdleHistoryStatus(), response: responseToKeep };
     });
   }, [httpRefreshing, loading, loadingOlder, refreshing]);
 
