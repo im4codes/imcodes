@@ -1579,12 +1579,37 @@ fileTransferRoutes.post('/:id/upload', async (c) => {
   }
 
   const encoder = new TextEncoder();
+  let streamTerminated = false;
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
-      let closed = false;
+      const isInvalidStateError = (err: unknown): boolean => {
+        if (!(err instanceof Error)) return false;
+        return err.name === 'InvalidStateError'
+          || (err as Error & { code?: unknown }).code === 'ERR_INVALID_STATE';
+      };
+      const terminate = (): void => {
+        if (streamTerminated) return;
+        streamTerminated = true;
+        cleanupUploadStage();
+        try {
+          controller.close();
+        } catch (err) {
+          // A consumer may cancel the stream between the state check and close().
+          // Treat the resulting controller race as an already-terminated stream.
+          if (!isInvalidStateError(err)) throw err;
+        }
+      };
       const write = (payload: unknown) => {
-        if (closed) return;
-        controller.enqueue(encoder.encode(jsonLine(payload)));
+        if (streamTerminated) return;
+        try {
+          controller.enqueue(encoder.encode(jsonLine(payload)));
+        } catch (err) {
+          // cancel() and an in-flight daemon callback can interleave. Never let
+          // an enqueue against an externally closed controller escape to Node.
+          if (!isInvalidStateError(err)) throw err;
+          streamTerminated = true;
+          cleanupUploadStage();
+        }
       };
       try {
         write({
@@ -1623,12 +1648,13 @@ fileTransferRoutes.post('/:id/upload', async (c) => {
           write({ type: 'file.upload_error', uploadId, error: 'upload_failed' });
         }
       } finally {
-        cleanupUploadStage();
-        closed = true;
-        controller.close();
+        terminate();
       }
     },
     cancel() {
+      // Set the shared terminal state before cleanup so late daemon progress
+      // callbacks are discarded even while the async upload is still pending.
+      streamTerminated = true;
       cleanupUploadStage();
     }
   });

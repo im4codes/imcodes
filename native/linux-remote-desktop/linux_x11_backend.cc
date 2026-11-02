@@ -830,10 +830,13 @@ void X11ClipboardAdapter::PumpSelectionRequests(int max_events) {
   const Atom utf8 = XInternAtom(display, "UTF8_STRING", False);
   const Atom targets = XInternAtom(display, "TARGETS", False);
 
-  for (int i = 0; i < max_events && XPending(display) > 0; ++i) {
+  for (int i = 0; i < max_events; ++i) {
     XEvent event;
-    XNextEvent(display, &event);
-    if (event.type != SelectionRequest) continue;
+    // The Display is shared with capture, input, and disclosure.  Filter by
+    // event type instead of draining the global queue: XNextEvent/XPending
+    // would consume events owned by those adapters and can strand a second
+    // selection request behind an unrelated event.
+    if (!XCheckTypedEvent(display, SelectionRequest, &event)) break;
     const XSelectionRequestEvent& request = event.xselectionrequest;
 
     XSelectionEvent response{};

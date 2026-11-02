@@ -1,4 +1,7 @@
 {
+  "task_pair": {
+    "reference_picker": "Pair 任務"
+  },
   "alias": {
     "feature_label": "別名",
     "category": "別名",
@@ -691,7 +694,7 @@
     "stop_appended_queue": "已追加佇列訊息，本次未停止工作階段。",
     "send_placeholder": "傳送給 {{name}}…",
     "send_placeholder_desktop_upload": "{{placeholder}} 支援多檔案貼上或拖曳快速上傳",
-    "send_placeholder_desktop_shortcuts": "{{placeholder}}\n/ 指令 · # 短語 · @ 檔案/Agent · ; 別名 · ^ 受控節點 · 可貼上或拖入檔案",
+    "send_placeholder_desktop_shortcuts": "{{placeholder}}\n/ 指令 · # 短語 · @ 檔案/Agent · ; 別名 · ^ 受控節點 · % 任務 · 可貼上或拖入檔案",
     "composer_target_label": "傳送至",
     "composer_target_aria": "訊息將傳送至 {{name}}",
     "actions": "Session 操作",
@@ -1074,6 +1077,8 @@
     "delete_error": "刪除伺服器失敗：{{error}}",
     "upgrade_daemon": "↑ 升級 Daemon",
     "upgrade_all": "↑ 升級全部裝置",
+    "pin": "📌 置頂伺服器",
+    "unpin": "取消置頂伺服器",
     "delete": "✕ 刪除伺服器",
     "upgrade_sent": "升級指令已傳送至「{{name}}」，Daemon 將安裝最新版本並重新啟動。",
     "upgrade_failed": "傳送升級指令失敗，Daemon 可能已離線。",
@@ -4179,6 +4184,7 @@
     "zoom_out": "縮小",
     "zoom_reset": "重設縮放",
     "touch_hint": "輕點螢幕可在該處按一下；拖曳圓環移動游標；按住圓環再拖曳即為拖放；按住後放開為右鍵",
+    "touch_hint_dismiss": "知道了",
     "touch_right_click": "在上次觸控位置按右鍵",
     "touch_ring": "游標圓環——拖曳可移動，長按變右鍵",
     "mobile_input_mode": "手機輸入模式",
@@ -4651,6 +4657,7 @@
       "passed": "審核通過",
       "done": "已完成",
       "cancelled": "已取消",
+      "failed": "已失敗",
       "rework_round": "返工第{{round}}輪",
       "awaiting_brain_decision": "等待 Brain 決定",
       "paused": "已暫停",

@@ -26,6 +26,7 @@ import {
 } from '../../../shared/task-pair.js';
 import { assertNotRealImcodesPathInTests } from '../../util/test-home-guard.js';
 import { imcodesStateDir } from '../../util/imcodes-state-dir.js';
+import { randomUUID } from 'node:crypto';
 
 const require = createRequire(import.meta.url);
 const { DatabaseSync } = require('node:sqlite') as typeof import('node:sqlite');
@@ -121,6 +122,9 @@ export interface TaskPairLiveness {
   workspaceKeptReminderCount?: number;
   workspaceKeptReminderLastAt?: number;
   workspaceKeptReminderDeliveredAt?: number;
+  /** Latest durable decision and the last Brain reminder for an unanswered request. */
+  decisionLastAt?: number;
+  decisionReminderAt?: number;
 }
 
 export interface StoredTaskPair {
@@ -149,6 +153,34 @@ export interface TaskPairEventRecord {
 
 export interface TaskPairProjectSettings {
   engine?: TaskPairEngine;
+}
+
+/** Durable Brain decisions attached to one task-pair round. */
+export interface TaskPairDecisionRecord {
+  id: string;
+  project: string;
+  taskId: string;
+  round: number;
+  kind: 'request' | 'decision';
+  conclusion: string;
+  summary: string;
+  author: string;
+  at: number;
+  related?: string[];
+  idempotencyKey?: string;
+}
+
+export interface TaskPairDecisionNotification {
+  id: string;
+  project: string;
+  taskId: string;
+  decisionId: string;
+  target: string;
+  reason: string;
+  text: string;
+  attempts: number;
+  lastAttemptAt?: number;
+  deliveredAt?: number;
 }
 
 function emptyLiveness(now: number): TaskPairLiveness {
@@ -315,6 +347,35 @@ export class TaskPairStore {
         claim_id TEXT PRIMARY KEY, project TEXT NOT NULL, task_id TEXT NOT NULL, owner TEXT NOT NULL, resource TEXT NOT NULL, mode TEXT NOT NULL, claimed_at INTEGER NOT NULL, renewed_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, released_at INTEGER
       );
       CREATE INDEX IF NOT EXISTS task_pair_resource_active_idx ON task_pair_resource_claims (resource, expires_at, released_at);
+      CREATE TABLE IF NOT EXISTS task_pair_decisions (
+        id TEXT PRIMARY KEY,
+        project TEXT NOT NULL,
+        task_id TEXT NOT NULL,
+        round INTEGER NOT NULL,
+        kind TEXT NOT NULL DEFAULT 'decision',
+        conclusion TEXT NOT NULL,
+        summary TEXT NOT NULL,
+        author TEXT NOT NULL,
+        related_json TEXT,
+        idempotency_key TEXT,
+        at INTEGER NOT NULL,
+        UNIQUE (project, task_id, idempotency_key)
+      );
+      CREATE INDEX IF NOT EXISTS task_pair_decisions_task_idx ON task_pair_decisions (project, task_id, at DESC, id DESC);
+      CREATE TABLE IF NOT EXISTS task_pair_decision_notifications (
+        id TEXT PRIMARY KEY,
+        project TEXT NOT NULL,
+        task_id TEXT NOT NULL,
+        decision_id TEXT NOT NULL,
+        target TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        text TEXT NOT NULL,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        last_attempt_at INTEGER,
+        delivered_at INTEGER,
+        UNIQUE (decision_id, target)
+      );
+      CREATE INDEX IF NOT EXISTS task_pair_decision_notifications_pending_idx ON task_pair_decision_notifications (delivered_at, last_attempt_at);
     `);
   }
 
@@ -723,6 +784,74 @@ export class TaskPairStore {
     }));
   }
 
+  /**
+   * Append one durable decision. A supplied idempotency key is unique per
+   * project/task, so a retried write returns the original record unchanged.
+   */
+  recordDecision(input: Omit<TaskPairDecisionRecord, 'id'> & { id?: string }): { record: TaskPairDecisionRecord; created: boolean } {
+    if (input.idempotencyKey) {
+      const existing = this.#db.prepare('SELECT * FROM task_pair_decisions WHERE project = ? AND task_id = ? AND idempotency_key = ?').get(input.project, input.taskId, input.idempotencyKey) as Record<string, unknown> | undefined;
+      if (existing) return { record: decisionFromRow(existing), created: false };
+    }
+    const id = input.id ?? randomUUID();
+    const result = this.#db.prepare(`
+      INSERT OR IGNORE INTO task_pair_decisions (id, project, task_id, round, kind, conclusion, summary, author, related_json, idempotency_key, at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      id, input.project, input.taskId, input.round, input.kind, input.conclusion, input.summary, input.author,
+      input.related ? JSON.stringify(input.related) : null, input.idempotencyKey ?? null, input.at,
+    );
+    const row = this.#db.prepare('SELECT * FROM task_pair_decisions WHERE id = ?').get(id) as Record<string, unknown> | undefined;
+    if (row) return { record: decisionFromRow(row), created: Number(result.changes) > 0 };
+    // Another writer may have won the unique idempotency key between the
+    // initial lookup and INSERT OR IGNORE. Re-read by the logical key rather
+    // than treating that normal race as a failed write.
+    if (input.idempotencyKey) {
+      const raced = this.#db.prepare('SELECT * FROM task_pair_decisions WHERE project = ? AND task_id = ? AND idempotency_key = ?').get(input.project, input.taskId, input.idempotencyKey) as Record<string, unknown> | undefined;
+      if (raced) return { record: decisionFromRow(raced), created: false };
+    }
+    throw new Error('failed to persist task pair decision');
+  }
+
+  latestDecision(project: string, taskId: string, round?: number): TaskPairDecisionRecord | undefined {
+    const row = this.#db.prepare(
+      `SELECT * FROM task_pair_decisions WHERE project = ? AND task_id = ? ${round === undefined ? '' : 'AND round = ?'} ORDER BY at DESC, id DESC LIMIT 1`,
+    ).get(...(round === undefined ? [project, taskId] : [project, taskId, round])) as Record<string, unknown> | undefined;
+    return row ? decisionFromRow(row) : undefined;
+  }
+
+  listDecisions(project: string, taskIds: readonly string[], limit = 20): TaskPairDecisionRecord[] {
+    const ids = [...new Set(taskIds)];
+    if (ids.length === 0) return [];
+    const placeholders = ids.map(() => '?').join(',');
+    const rows = this.#db.prepare(
+      `SELECT * FROM task_pair_decisions WHERE project = ? AND task_id IN (${placeholders}) ORDER BY at DESC, id DESC LIMIT ?`,
+    ).all(project, ...ids, Math.max(1, Math.floor(limit))) as Array<Record<string, unknown>>;
+    return rows.map(decisionFromRow);
+  }
+
+  enqueueDecisionNotification(input: Omit<TaskPairDecisionNotification, 'id' | 'attempts' | 'lastAttemptAt' | 'deliveredAt'>): TaskPairDecisionNotification {
+    const id = `${input.decisionId}:${input.target}`;
+    this.#db.prepare(`INSERT OR IGNORE INTO task_pair_decision_notifications (id, project, task_id, decision_id, target, reason, text, attempts) VALUES (?, ?, ?, ?, ?, ?, ?, 0)`).run(
+      id, input.project, input.taskId, input.decisionId, input.target, input.reason, input.text,
+    );
+    const row = this.#db.prepare('SELECT * FROM task_pair_decision_notifications WHERE id = ?').get(id) as Record<string, unknown>;
+    return decisionNotificationFromRow(row);
+  }
+
+  listPendingDecisionNotifications(limit = 100): TaskPairDecisionNotification[] {
+    const rows = this.#db.prepare('SELECT * FROM task_pair_decision_notifications WHERE delivered_at IS NULL ORDER BY COALESCE(last_attempt_at, 0), id LIMIT ?').all(Math.max(1, Math.floor(limit))) as Array<Record<string, unknown>>;
+    return rows.map(decisionNotificationFromRow);
+  }
+
+  markDecisionNotificationAttempt(id: string, at = Date.now()): void {
+    this.#db.prepare('UPDATE task_pair_decision_notifications SET attempts = attempts + 1, last_attempt_at = ? WHERE id = ? AND delivered_at IS NULL').run(at, id);
+  }
+
+  markDecisionNotificationDelivered(id: string, at = Date.now()): void {
+    this.#db.prepare('UPDATE task_pair_decision_notifications SET delivered_at = ? WHERE id = ?').run(at, id);
+  }
+
   getMaxConcurrency(brain: string): number {
     const row = this.#db.prepare('SELECT max_concurrency FROM task_pair_queue_settings WHERE brain = ?').get(brain) as { max_concurrency: number } | undefined;
     return row ? Number(row.max_concurrency) : TASK_PAIR_DEFAULT_MAX_CONCURRENCY;
@@ -837,6 +966,8 @@ function rowToPair(row: Record<string, unknown>): StoredTaskPair {
     ...(Number.isFinite(Number(raw.workspaceKeptReminderCount)) ? { workspaceKeptReminderCount: Number(raw.workspaceKeptReminderCount) } : {}),
     ...(Number.isFinite(Number(raw.workspaceKeptReminderLastAt)) ? { workspaceKeptReminderLastAt: Number(raw.workspaceKeptReminderLastAt) } : {}),
     ...(Number.isFinite(Number(raw.workspaceKeptReminderDeliveredAt)) ? { workspaceKeptReminderDeliveredAt: Number(raw.workspaceKeptReminderDeliveredAt) } : {}),
+    ...(Number.isFinite(Number(raw.decisionLastAt)) ? { decisionLastAt: Number(raw.decisionLastAt) } : {}),
+    ...(Number.isFinite(Number(raw.decisionReminderAt)) ? { decisionReminderAt: Number(raw.decisionReminderAt) } : {}),
   };
   return {
     project: String(row.project),
@@ -844,6 +975,33 @@ function rowToPair(row: Record<string, unknown>): StoredTaskPair {
     liveness,
     queueOrder: Number(row.queue_order),
     ...(row.legacy_task_id ? { legacyTaskId: String(row.legacy_task_id) } : {}),
+  };
+}
+
+function decisionFromRow(row: Record<string, unknown>): TaskPairDecisionRecord {
+  const rawRelated = row.related_json == null ? undefined : JSON.parse(String(row.related_json)) as unknown;
+  const related = Array.isArray(rawRelated) ? rawRelated.map(String) : undefined;
+  return {
+    id: String(row.id),
+    project: String(row.project),
+    taskId: String(row.task_id),
+    round: Number(row.round),
+    kind: row.kind === 'request' ? 'request' : 'decision',
+    conclusion: String(row.conclusion),
+    summary: String(row.summary),
+    author: String(row.author),
+    at: Number(row.at),
+    ...(related && related.length > 0 ? { related } : {}),
+    ...(row.idempotency_key != null ? { idempotencyKey: String(row.idempotency_key) } : {}),
+  };
+}
+
+function decisionNotificationFromRow(row: Record<string, unknown>): TaskPairDecisionNotification {
+  return {
+    id: String(row.id), project: String(row.project), taskId: String(row.task_id), decisionId: String(row.decision_id),
+    target: String(row.target), reason: String(row.reason), text: String(row.text), attempts: Number(row.attempts ?? 0),
+    ...(row.last_attempt_at != null ? { lastAttemptAt: Number(row.last_attempt_at) } : {}),
+    ...(row.delivered_at != null ? { deliveredAt: Number(row.delivered_at) } : {}),
   };
 }
 

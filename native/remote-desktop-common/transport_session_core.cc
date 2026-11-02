@@ -464,12 +464,25 @@ bool TransportSessionCore::UpdateQualityTarget(
   return ApplyQualityTarget(target);
 }
 
-bool TransportSessionCore::ApplyQualityTarget(const QualityTarget& target) {
+bool TransportSessionCore::ApplyQualityTarget(const QualityTarget& target,
+                                              bool* deferred) {
+  if (deferred != nullptr) *deferred = false;
   QualityTarget effective = target;
   effective.preference = viewer_preference_;
   if (effective.preference.minimum_bitrate_bps == 0) {
     effective.preference.minimum_bitrate_bps =
         viewer_preference_.max_bitrate_bps;
+  }
+  // A direct peer (or a relay without an explicit operator ceiling) can probe
+  // up to the viewer's requested floor even when congestion feedback has
+  // temporarily driven the current target lower. This keeps a quality change
+  // on the existing peer and lets later target updates retry after a transient
+  // encoder reconfiguration refusal.
+  const bool canProbeToPreferenceFloor =
+      path_ == TransportPath::kDirect || authority_.relay_bitrate_cap_bps == 0;
+  if (canProbeToPreferenceFloor &&
+      effective.preference.minimum_bitrate_bps > effective.bitrate_bps) {
+    effective.bitrate_bps = effective.preference.minimum_bitrate_bps;
   }
   // Until ICE proves the route direct, treat it as relayed: the operator's
   // relay ceiling is exactly what an unproven route must not exceed.
@@ -496,6 +509,7 @@ bool TransportSessionCore::ApplyQualityTarget(const QualityTarget& target) {
     // hardware session is rebuilding. A quality switch must never become a
     // peer failure; retain the last applied selection and let a later target
     // retry on the same route.
+    if (deferred != nullptr) *deferred = true;
     return false;
   }
   quality_ = std::move(selection);
@@ -509,7 +523,12 @@ bool TransportSessionCore::SetQualityPreference(
   const imcodes::rd::QualityPreference previous = viewer_preference_;
   viewer_preference_ = imcodes::rd::NormalizeQualityPreference(preference);
   if (!last_quality_target_) return true;
-  if (ApplyQualityTarget(*last_quality_target_)) return true;
+  bool deferred = false;
+  if (ApplyQualityTarget(*last_quality_target_, &deferred)) return true;
+  // A live encoder can refuse one reconfiguration while rebuilding hardware.
+  // Keep the new preference and report receipt; the next estimator update
+  // retries on the same peer instead of surfacing quality_unavailable.
+  if (deferred) return true;
   // Keep the last known-good preference as well as the last known-good
   // selection. A rejected request must not poison future congestion updates.
   viewer_preference_ = previous;

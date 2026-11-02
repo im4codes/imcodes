@@ -993,9 +993,59 @@ describe('styles.css regression contracts', () => {
 
     const menuRule = css.match(/\.mobile-server-menu\s*\{[^}]*\}/);
     expect(menuRule).not.toBeNull();
+    expect(menuRule![0]).toMatch(/display:\s*grid/);
+    expect(menuRule![0]).toMatch(/grid-template-columns:\s*repeat\(2,\s*minmax\(0,\s*1fr\)\)/);
     expect(menuRule![0]).toMatch(/max-height:\s*calc\(var\(--vvh,\s*100dvh\)\s*-\s*var\(--sat,\s*0px\)\s*-\s*68px\s*-\s*env\(safe-area-inset-bottom,\s*0px\)\)/);
     expect(menuRule![0]).not.toMatch(/max-height:\s*min\(60vh/);
     expect(menuRule![0]).toMatch(/padding-bottom:\s*max\(16px,\s*env\(safe-area-inset-bottom,\s*0px\)\)/);
+
+    const menuItemRule = css.match(/\.mobile-server-menu-item\s*\{[^}]*\}/);
+    expect(menuItemRule).not.toBeNull();
+    expect(menuItemRule![0]).toMatch(/grid-column:\s*1\s*\/\s*-1/);
+    expect(menuItemRule![0]).toMatch(/min-width:\s*0/);
+
+    const serverItemRule = css.match(/\.mobile-server-menu-server\s*\{[^}]*\}/);
+    expect(serverItemRule).not.toBeNull();
+    expect(serverItemRule![0]).toMatch(/grid-column:\s*auto/);
+
+    const sharedEntriesRule = css.match(/\.mobile-server-menu-shared\s*\{[^}]*\}/);
+    expect(sharedEntriesRule).not.toBeNull();
+    expect(sharedEntriesRule![0]).toMatch(/grid-column:\s*1\s*\/\s*-1/);
+
+    const menuNameRule = css.match(/\.mobile-server-menu-name\s*\{[^}]*\}/);
+    expect(menuNameRule).not.toBeNull();
+    expect(menuNameRule![0]).toMatch(/flex:\s*1\s+1\s+auto/);
+    expect(menuNameRule![0]).toMatch(/text-overflow:\s*ellipsis/);
+    expect(menuNameRule![0]).toMatch(/white-space:\s*nowrap/);
+
+    const wideMenuRule = css.match(/@media\s*\(min-width:\s*380px\)\s*\{\s*\.mobile-server-menu\s*\{[^}]*\}\s*\}/);
+    expect(wideMenuRule).not.toBeNull();
+    expect(wideMenuRule![0]).toMatch(/grid-template-columns:\s*repeat\(3,\s*minmax\(0,\s*1fr\)\)/);
+
+    const app = readFileSync(resolve(__dirname, '../src/app.tsx'), 'utf8');
+    expect(app).toContain('mobile-server-menu-server');
+    expect(app).toContain('mobile-server-menu-language');
+    expect(app).toContain('server-item-pin');
+    expect(app).not.toContain('mobile-server-menu-pin');
+    expect(app).toContain("? ' pinned'");
+    expect(app).toContain('pinnedServerIds');
+
+    const serverPinRule = css.match(/\.server-item-pin\s*\{[^}]*\}/);
+    expect(serverPinRule).not.toBeNull();
+    expect(serverPinRule![0]).toMatch(/flex:\s*0\s+0\s+auto/);
+    const mobilePinnedRule = css.match(/\.mobile-server-menu-server\.pinned\s*\{[^}]*\}/);
+    expect(mobilePinnedRule).not.toBeNull();
+    expect(mobilePinnedRule![0]).toMatch(/position:\s*relative/);
+    expect(mobilePinnedRule![0]).toMatch(/box-shadow:\s*inset\s+2px\s+0\s+0/);
+    expect(mobilePinnedRule![0]).not.toMatch(/border:/);
+    expect(mobilePinnedRule![0]).toMatch(/rgb\(74 222 128/);
+    const mobilePinnedLineRule = css.match(/\.mobile-server-menu-server\.pinned::after\s*\{[^}]*\}/);
+    expect(mobilePinnedLineRule).not.toBeNull();
+    expect(mobilePinnedLineRule![0]).toMatch(/height:\s*1px/);
+    expect(mobilePinnedLineRule![0]).toMatch(/linear-gradient/);
+    const iconPinRule = css.match(/\.server-icon-pin\s*\{[^}]*\}/);
+    expect(iconPinRule).not.toBeNull();
+    expect(iconPinRule![0]).toMatch(/position:\s*absolute/);
   });
 
   it('mobile shell chrome does not depend solely on the narrow viewport breakpoint', () => {
@@ -1184,6 +1234,44 @@ describe('styles.css regression contracts', () => {
     expect(surfaceRule, '.remote-desktop-input-surface rule missing').toBeTruthy();
     expect(surfaceRule).toMatch(/background:\s*rgb\(0 0 0 \/ 0\.1%\)/);
     expect(surfaceRule).toMatch(/pointer-events:\s*auto/);
+  });
+
+  it('keeps remote-desktop footer rows content-sized so the stage owns remaining height', () => {
+    const panelRule = css.match(/\.remote-desktop-panel\s*\{[^}]*\}/)?.[0];
+    expect(panelRule, '.remote-desktop-panel rule missing').toBeTruthy();
+    expect(panelRule).toMatch(/align-content:\s*start/);
+    expect(panelRule).toMatch(/grid-template-rows:\s*auto auto minmax\(0, 1fr\) auto auto/);
+    expect(css).toMatch(/\.remote-desktop-stage\s*\{[\s\S]*?grid-row:\s*3/);
+    expect(css).toMatch(/\.remote-desktop-footer\s*\{[\s\S]*?grid-row:\s*5/);
+    expect(css).toMatch(/@media\s*\(max-width:\s*720px\)[\s\S]*?\.remote-desktop-footer\s*\{[\s\S]*?height:\s*44px;[\s\S]*?min-height:\s*44px;[\s\S]*?max-height:\s*44px;[\s\S]*?overflow-y:\s*auto/);
+    expect(css).toMatch(/@media\s*\(pointer:\s*coarse\)[\s\S]*?\.remote-desktop-footer\s*\{[\s\S]*?height:\s*44px;[\s\S]*?min-height:\s*44px;[\s\S]*?max-height:\s*44px;[\s\S]*?overflow-y:\s*auto/);
+  });
+
+  it('keeps the touch hint dismiss action interactive without enabling the overlay itself', () => {
+    const hintRule = css.match(/\.remote-desktop-touch-hint\s*\{[^}]*\}/)?.[0];
+    expect(hintRule).toMatch(/pointer-events:\s*none/);
+    const dismissRule = css.match(/\.remote-desktop-touch-hint-dismiss\s*\{[^}]*\}/)?.[0];
+    expect(dismissRule).toBeTruthy();
+    expect(dismissRule).toMatch(/pointer-events:\s*auto/);
+    expect(dismissRule).toMatch(/white-space:\s*nowrap/);
+  });
+
+  it('keeps the mobile collapsed task strip in normal titlebar flow', () => {
+    const mobileRule = css.match(
+      /@media\s*\(max-width:\s*720px\)[\s\S]*?\.chat-titlebar > \.task-pair-status-panel\.is-mobile\.is-collapsed\s*\{([^}]*)\}/,
+    )?.[1] ?? '';
+    expect(mobileRule).toMatch(/margin:\s*0 0 0 auto/);
+    expect(mobileRule).toMatch(/max-width:\s*calc\(48% - var\(--chat-top-actions-reserve/);
+    expect(css).toMatch(/@media\s*\(max-width:\s*350px\)[\s\S]*?max-width:\s*calc\(100% - var\(--chat-top-actions-reserve/);
+  });
+
+  it('right-aligns the desktop collapsed task strip inside the reserved action area', () => {
+    const desktopRule = css.match(
+      /\.chat-titlebar > \.task-pair-status-panel\.is-collapsed\s*\{([^}]*)\}/,
+    )?.[1] ?? '';
+    expect(desktopRule).toMatch(/margin:\s*0 0 0 auto/);
+    expect(desktopRule).toMatch(/max-width:\s*calc\(48% - var\(--chat-top-actions-reserve/);
+    expect(css).toMatch(/\.chat-titlebar\s*\{[^}]*padding-right:\s*max\(8px, var\(--chat-top-actions-reserve/);
   });
 
   // iOS Safari's own long-press callout (the "Copy"/selection loupe) is a

@@ -48,6 +48,7 @@ import {
   type SharedContextProjectionScope,
 } from '../../../shared/memory-scope.js';
 import { computeProjectionContentHash } from '../memory/citation.js';
+import { sanitizePostgresJson, PostgresJsonSafetyError } from '../../../shared/postgres-json-safe.js';
 import logger from '../util/logger.js';
 import { SUPERVISION_USER_DEFAULT_PREF_KEY, parseSupervisorDefaultConfig, normalizeSupervisorDefaultConfig } from '../../../shared/supervision-config.js';
 import {
@@ -646,13 +647,10 @@ serverRoutes.delete('/:id/bindings', async (c) => {
 });
 
 /**
- * Postgres text/jsonb columns reject a literal NUL byte outright ("invalid
- * byte sequence for encoding UTF8: 0x00"), unlike the daemon's local SQLite
- * store. A single processed summary carrying one — observed from real
- * production replication traffic — permanently failed every retry of this
- * whole batch insert, silently starving memory sync for every project behind
- * that daemon. jsonb fields go through JSON.stringify first, which escapes
- * NUL as \u0000 and is safe; only the raw `summary` text parameter is at risk.
+ * PostgreSQL text/jsonb columns reject literal NUL bytes outright. Processed
+ * replication therefore sanitizes both raw summary text and JSONB values
+ * before persistence; a single malformed projection must not poison retries
+ * for the rest of a daemon's batch.
  */
 function stripPostgresNulBytes(text: string): string {
   return text.replace(/\u0000/g, '�');
@@ -682,14 +680,36 @@ serverRoutes.post('/:id/shared-context/processed', async (c) => {
     const safeEnterpriseId = isPersonal ? null : (serverRow.teamId ?? projection.namespace.enterpriseId ?? null);
     const safeWorkspaceId = isPersonal ? null : (projection.namespace.workspaceId ?? null);
     const safeUserId = isPersonal ? serverRow.userId : (projection.namespace.userId ?? null);
+    let safeContent: unknown;
+    let safeSourceEventIds: unknown;
+    let contentWasSanitized = false;
+    try {
+      const contentResult = sanitizePostgresJson(projection.content);
+      const sourceEventIdsResult = sanitizePostgresJson(projection.sourceEventIds);
+      safeContent = contentResult.value;
+      safeSourceEventIds = sourceEventIdsResult.value;
+      contentWasSanitized = contentResult.changed || sourceEventIdsResult.changed;
+    } catch (error) {
+      if (error instanceof PostgresJsonSafetyError) {
+        logger.warn({ projectionId: projection.id, reason: error.message }, 'Rejected unsafe processed projection JSON');
+        return c.json({ error: error.message, projectionId: projection.id }, 400);
+      }
+      throw error;
+    }
     const safeSummary = stripPostgresNulBytes(projection.summary);
+    if (safeSummary !== projection.summary) contentWasSanitized = true;
+    if (contentWasSanitized) {
+      logger.warn({ projectionId: projection.id }, 'Sanitized NUL bytes from processed projection JSON');
+    }
     const contentHash = computeProjectionContentHash({
-      summary: projection.summary,
-      content: projection.content,
+      summary: safeSummary,
+      content: safeContent,
     });
     // `id` is the table's global key and the daemon chooses it. The update half of the upsert may only touch a row this server (or, for
     // a personal projection, this same user) already owns; without that a daemon that knows another user's projection id rewrote it.
-    const upsert = await c.env.DB.execute(
+    let upsert: { changes: number };
+    try {
+      upsert = await c.env.DB.execute(
       `INSERT INTO shared_context_projections (
         id, server_id, scope, enterprise_id, workspace_id, user_id, project_id,
         projection_class, source_event_ids_json, summary, content_json,
@@ -722,22 +742,27 @@ serverRoutes.post('/:id/shared-context/processed', async (c) => {
         safeUserId,
         projection.namespace.projectId,
         projection.class,
-        JSON.stringify(projection.sourceEventIds),
+        JSON.stringify(safeSourceEventIds),
         safeSummary,
-        JSON.stringify(projection.content),
+        JSON.stringify(safeContent),
         contentHash,
         projection.origin,
         projection.createdAt,
         projection.updatedAt,
         now,
       ],
-    );
+      );
+    } catch (error) {
+      logger.error({ projectionId: projection.id, error }, 'Processed projection persistence failed');
+      return c.json({ error: 'processed_replication_failed', projectionId: projection.id }, 503);
+    }
     if (upsert.changes === 0) continue; // an id that belongs to someone else: nothing written, nothing counted
     acceptedCount += 1;
     acceptedProjections.push(projection);
 
     if (projection.class === 'durable_memory_candidate') {
-      await c.env.DB.execute(
+      try {
+        await c.env.DB.execute(
         `INSERT INTO shared_context_records (
           id, projection_id, server_id, scope, enterprise_id, workspace_id, user_id, project_id,
           record_class, summary, content_json, status, origin, created_at, updated_at
@@ -765,12 +790,16 @@ serverRoutes.post('/:id/shared-context/processed', async (c) => {
           projection.namespace.projectId,
           projection.class,
           safeSummary,
-          JSON.stringify(projection.content),
+          JSON.stringify(safeContent),
           projection.origin,
           projection.createdAt,
           projection.updatedAt,
         ],
-      );
+        );
+      } catch (error) {
+        logger.error({ projectionId: projection.id, error }, 'Processed projection record persistence failed');
+        return c.json({ error: 'processed_replication_failed', projectionId: projection.id }, 503);
+      }
     }
   }
 
@@ -778,10 +807,14 @@ serverRoutes.post('/:id/shared-context/processed', async (c) => {
   import('../util/embedding.js').then(({ storeProjectionEmbedding }) => {
     for (const projection of acceptedProjections) {
       if (projection.summary) {
-        storeProjectionEmbedding(c.env.DB, projection.id, projection.summary).catch(() => {});
+        storeProjectionEmbedding(c.env.DB, projection.id, projection.summary).catch((error) => {
+          logger.warn({ projectionId: projection.id, error }, 'Processed projection embedding persistence failed');
+        });
       }
     }
-  }).catch(() => {});
+  }).catch((error) => {
+    logger.warn({ error }, 'Processed projection embedding module load failed');
+  });
 
   return c.json({
     ok: true,
@@ -855,6 +888,18 @@ serverRoutes.post('/:id/shared-context/owner-private/search', async (c) => {
   const authed = await authenticateDaemonServer(c, c.req.param('id'));
   if (!authed.ok) return daemonAuthFailure(c, authed);
   const serverRow = authed.auth;
+  const body = await c.req.json().catch(() => null);
+  // Empty searches are intentionally a no-op (and must not consult feature
+  // flags or PostgreSQL). Treat an omitted/null query as empty before schema
+  // validation, while retaining 400s for other malformed query values.
+  const normalizedBody = body && typeof body === 'object' && !Array.isArray(body)
+    ? { ...(body as Record<string, unknown>), query: (body as Record<string, unknown>).query ?? '' }
+    : body;
+  const parsed = ownerPrivateSearchSchema.safeParse(normalizedBody);
+  if (!parsed.success) return c.json({ error: 'invalid_body' }, 400);
+  const query = parsed.data.query?.trim() ?? '';
+  if (!query) return c.json(sameShapeSearchEnvelope());
+
   const featureFlags = parseMemoryFeatureFlagValuesJson(
     await getUserPref(c.env.DB, serverRow.userId, MEMORY_FEATURE_CONFIG_PREF_KEY),
   );
@@ -862,13 +907,9 @@ serverRoutes.post('/:id/shared-context/owner-private/search', async (c) => {
     return c.json(sameShapeSearchEnvelope());
   }
 
-  const body = await c.req.json().catch(() => null);
-  const parsed = ownerPrivateSearchSchema.safeParse(body);
-  if (!parsed.success) return c.json({ error: 'invalid_body' }, 400);
   const requestScope = isSearchRequestScope(parsed.data.scope) ? parsed.data.scope : 'owner_private';
   const scopes = expandSearchRequestScope(requestScope, { includeOwnerPrivate: true });
   if (!scopes.includes('user_private')) return c.json(sameShapeSearchEnvelope());
-  const query = parsed.data.query.trim();
   const rows = await c.env.DB.query<{
     id: string;
     kind: string;

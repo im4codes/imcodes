@@ -392,6 +392,8 @@ html.native-ios-mac .chat-dl-btn {
 .server-item.active { background: linear-gradient(90deg, rgba(34,211,238,0.18), rgba(15,23,42,0.30)); border-left-color: var(--chrome-accent); color: #bfdbfe; box-shadow: inset 0 0 18px rgba(34,211,238,0.08); }
 .server-item.offline { color: #64748b; }
 .server-item-dot { font-size: 8px; flex-shrink: 0; }
+.server-item-pin { flex: 0 0 auto; font-size: 11px; line-height: 1; }
+.server-item-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .server-ctx-menu { background: linear-gradient(180deg, rgba(17,27,45,0.98), rgba(8,13,22,0.98)); border: 1px solid rgba(125,211,252,0.18); border-radius: 7px; min-width: 148px; box-shadow: 0 12px 28px rgba(0,0,0,0.44), inset 0 1px 0 rgba(255,255,255,0.04); z-index: 200; overflow: hidden; }
 .server-ctx-item { display: block; width: 100%; padding: 9px 14px; background: none; border: none; color: #cbd5e1; font-size: 13px; font-family: inherit; text-align: left; cursor: pointer; }
 .server-ctx-item:hover { background: rgba(8,145,178,0.16); color: #eff6ff; }
@@ -645,7 +647,7 @@ html.native-ios-mac .chat-dl-btn {
   .shared-return-guide { top: calc(env(safe-area-inset-top, 0px) + 50px); left: 10px; right: auto; width: min(270px, calc(100vw - 20px)); }
   .shared-return-guide::before { top: -8px; left: 24px; transform: rotate(135deg); }
 }
-.mobile-server-menu-shared { min-width: 0; border-top: 1px solid #334155; padding: 6px 0; overflow: hidden; }
+.mobile-server-menu-shared { grid-column: 1 / -1; min-width: 0; border-top: 1px solid #334155; padding: 6px 0; overflow: hidden; }
 .mobile-server-menu-shared .shared-entries-list { max-height: none; overflow-y: visible; }
 .mobile-server-menu-shared .shared-entries-panel { min-width: 0; margin: 0; border: 0; border-radius: 0; background: transparent; }
 .chat-shared-actor-label,
@@ -3430,17 +3432,27 @@ html.native-ios-mac .chat-dl-btn {
 .mobile-server-btn-chevron { width: 24px; height: 24px; border-radius: 8px; display: inline-flex; align-items: center; justify-content: center; flex: 0 0 auto; color: #67e8f9; background: rgba(15,23,42,0.52); }
 .mobile-server-actions { display: flex; gap: 5px; align-items: center; flex: 0 0 auto; }
 .mobile-server-backdrop { position: fixed; inset: 0; z-index: 6499; }
-.mobile-server-menu { position: absolute; top: calc(100% + 8px); left: 0; width: min(300px, calc(100vw - 18px)); height: calc(var(--mobile-server-menu-available-height, calc(100vh - 72px)) - 8px - env(safe-area-inset-bottom, 0px)); height: calc(var(--mobile-server-menu-available-height, calc(100dvh - 72px)) - 8px - env(safe-area-inset-bottom, 0px)); box-sizing: border-box; max-height: calc(var(--vvh, 100dvh) - var(--sat, 0px) - 68px - env(safe-area-inset-bottom, 0px)); padding-bottom: max(16px, env(safe-area-inset-bottom, 0px)); background: #1e293b; border: 1px solid rgba(125,211,252,0.20); border-radius: 12px; min-width: min(240px, calc(100vw - 18px)); box-shadow: 0 14px 34px #00000090, 0 0 20px rgba(34,211,238,0.10); z-index: 50; overflow-x: hidden; overflow-y: auto; -webkit-overflow-scrolling: touch; overscroll-behavior: contain; scrollbar-width: thin; scrollbar-color: rgba(125, 211, 252, 0.28) transparent; }
+.mobile-server-menu { position: absolute; top: calc(100% + 8px); left: 0; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); width: min(300px, calc(100vw - 18px)); height: calc(var(--mobile-server-menu-available-height, calc(100vh - 72px)) - 8px - env(safe-area-inset-bottom, 0px)); height: calc(var(--mobile-server-menu-available-height, calc(100dvh - 72px)) - 8px - env(safe-area-inset-bottom, 0px)); box-sizing: border-box; max-height: calc(var(--vvh, 100dvh) - var(--sat, 0px) - 68px - env(safe-area-inset-bottom, 0px)); padding-bottom: max(16px, env(safe-area-inset-bottom, 0px)); background: #1e293b; border: 1px solid rgba(125,211,252,0.20); border-radius: 12px; min-width: min(240px, calc(100vw - 18px)); box-shadow: 0 14px 34px #00000090, 0 0 20px rgba(34,211,238,0.10); z-index: 50; overflow-x: hidden; overflow-y: auto; -webkit-overflow-scrolling: touch; overscroll-behavior: contain; scrollbar-width: thin; scrollbar-color: rgba(125, 211, 252, 0.28) transparent; }
 .mobile-server-menu::-webkit-scrollbar { width: 5px; }
 .mobile-server-menu::-webkit-scrollbar-track { background: transparent; }
 .mobile-server-menu::-webkit-scrollbar-thumb { background: rgba(125, 211, 252, 0.28); border-radius: 999px; }
-.mobile-server-menu-item { display: flex; align-items: center; gap: 7px; width: 100%; padding: 10px 14px; background: none; border: none; color: #cbd5e1; font-size: 13px; font-family: inherit; text-align: left; cursor: pointer; }
-.mobile-server-menu-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mobile-server-menu-item { display: flex; align-items: center; gap: 7px; grid-column: 1 / -1; width: 100%; min-width: 0; padding: 10px 14px; background: none; border: none; color: #cbd5e1; font-size: 13px; font-family: inherit; text-align: left; cursor: pointer; }
+.mobile-server-menu-server { grid-column: auto; }
+.mobile-server-menu-name { min-width: 0; flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .mobile-server-menu-item > .share-state-indicator { margin-left: auto; flex: 0 0 auto; }
 .mobile-server-menu-item:hover, .mobile-server-menu-item:active { background: #334155; }
 .mobile-server-menu-item.active { color: #93c5fd; background: #1d4ed820; }
+.mobile-server-menu-server.pinned { position: relative; color: #d1fae5; background: linear-gradient(110deg, rgb(34 197 94 / 12%), rgb(34 211 238 / 5%) 58%, transparent); box-shadow: inset 2px 0 0 rgb(74 222 128 / 76%), inset 0 0 14px rgb(34 211 238 / 6%); }
+.mobile-server-menu-server.pinned::after { content: ''; position: absolute; left: 14px; right: 14px; bottom: 0; height: 1px; background: linear-gradient(90deg, rgb(74 222 128 / 72%), rgb(34 211 238 / 42%), transparent); pointer-events: none; }
+.mobile-server-menu-server.pinned.active { color: #ecfdf5; background: linear-gradient(110deg, rgb(34 197 94 / 18%), rgb(34 211 238 / 8%) 58%, transparent); }
 .mobile-server-menu-controlled-nodes { color: #67e8f9; border-top: 1px solid #334155; border-bottom: 1px solid #334155; }
 .mobile-server-menu-change { color: #f59e0b !important; border-top: 1px solid #334155; }
+.mobile-server-menu-language { grid-column: 1 / -1; min-width: 0; }
+.controls-task-pair-title { min-width: 0; flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 500; color: #e2e8f0; }
+.controls-task-pair-status-badge { flex: 0 1 auto; min-width: 0; max-width: 42%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding: 1px 6px; border: 1px solid rgb(125 211 252 / 28%); border-radius: 999px; background: rgb(15 23 42 / 64%); color: #bae6fd; font-size: 10px; line-height: 1.35; }
+@media (min-width: 380px) {
+  .mobile-server-menu { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+}
 .layout-mobile .sidebar { display: none; }
 .layout-mobile .mobile-server-bar { display: flex; }
 .layout-mobile .mobile-sidebar-toggle { display: block; }
@@ -6984,6 +6996,10 @@ html.native-ios-mac .chat-dl-btn {
 .shell-quick-trigger { display: none !important; }
 .kb-open .shell-terminal-pane .shell-quick-trigger { display: inline-flex !important; color: #fbbf24 !important; }
 .subsession-card { display: flex; width: var(--subsession-compact-card-width); min-width: var(--subsession-compact-card-width); flex-direction: column; align-items: center; justify-content: center; gap: 2px; min-height: 54px; padding: 6px 1px; background: linear-gradient(180deg, rgba(17,27,45,0.92), rgba(10,16,27,0.92)); border: 1px solid rgba(125,211,252,0.16); border-top: 3px solid var(--subsession-accent-color, #38bdf8); border-radius: 8px; color: #94a3b8; cursor: pointer; font-family: inherit; font-size: 11px; transition: transform 0.15s, border-color 0.15s, background 0.15s, color 0.15s, box-shadow 0.15s; flex-shrink: 0; position: relative; isolation: isolate; overflow: hidden; box-shadow: inset 0 1px 0 rgba(255,255,255,0.035); }
+.subsession-card-pin { position: absolute; top: 2px; left: 3px; font-size: 9px; line-height: 1; z-index: 3; }
+.subsession-context-menu { min-width: 180px; padding: 5px; border: 1px solid rgba(125,211,252,0.28); border-radius: 9px; background: rgba(15,23,42,0.98); box-shadow: 0 12px 30px rgba(0,0,0,0.45); display: flex; flex-direction: column; gap: 2px; }
+.subsession-context-menu button { appearance: none; border: 0; border-radius: 6px; background: transparent; color: #dbeafe; cursor: pointer; font: inherit; padding: 8px 10px; text-align: left; white-space: nowrap; }
+.subsession-context-menu button:hover, .subsession-context-menu button:focus-visible { background: rgba(56,189,248,0.16); outline: none; }
 .subsession-card > .share-state-indicator { position: absolute; top: 2px; right: 2px; z-index: 2; margin-left: 0; }
 .subsession-card::before { content: ''; position: absolute; inset: 0; background: linear-gradient(135deg, rgba(34,211,238,0.12), transparent 38%, rgba(52,211,153,0.08)); opacity: 0; transition: opacity 0.15s; pointer-events: none; }
 .subsession-card:hover, .subsession-card.open { border-color: rgba(34,211,238,0.44); background: linear-gradient(180deg, rgba(15,40,62,0.92), rgba(10,20,34,0.94)); color: #dbeafe; }
@@ -8873,6 +8889,7 @@ html.native-ios-mac .chat-dl-btn {
 .server-icon-active { background: linear-gradient(180deg, rgba(34,211,238,0.28), rgba(29,78,216,0.30)); color: #fff; border-color: rgba(34,211,238,0.68); border-radius: 11px; box-shadow: 0 0 0 1px rgba(34,211,238,0.16), 0 0 18px rgba(34,211,238,0.22), inset 0 1px 0 rgba(255,255,255,0.08); }
 .server-icon-active:hover { background: linear-gradient(180deg, rgba(34,211,238,0.32), rgba(29,78,216,0.34)); border-radius: 11px; }
 .server-icon-letter { display: flex; flex-direction: column; align-items: center; justify-content: center; max-width: 100%; line-height: 1; pointer-events: none; }
+.server-icon-pin { position: absolute; left: 2px; top: 2px; z-index: 2; font-size: 9px; line-height: 1; pointer-events: none; }
 /* Servers carry a short one- or two-line label (see shared/server-icon-label.ts) instead of one letter; the room is a little taller than the utility icons. */
 .server-icon.server-icon-server { height: 40px; }
 .server-icon-line { display: block; max-width: 34px; overflow: hidden; text-overflow: clip; white-space: nowrap; font-variant-numeric: tabular-nums; }
@@ -10940,11 +10957,14 @@ button.quick-agent-delegation-preset.active {
      popups and text-selection handles mean nothing anywhere in it. Fields that
      are typed into keep selection (below). */
   display: grid;
-  /* The 3rd row only ever gets a grid item (the docked mobile keyboard) while
-     it is open; with no item placed there it collapses to 0 height, so the
-     stage (row 2, 1fr) and footer (last row) are unaffected the rest of the
-     time. */
-  grid-template-rows: auto minmax(0, 1fr) auto auto;
+  /* Keep auto-sized footer/toolbar rows content-sized; the stage's 1fr row
+     must receive the remaining height instead of stretching the footer. */
+  align-content: start;
+  /* The control notice gets its own auto row, so it can never consume the
+     stage's 1fr row. The 4th row only gets a grid item (the docked mobile
+     keyboard) while it is open; with no item placed there it collapses to 0
+     height, so the stage (row 3) and footer (last row) keep their space. */
+  grid-template-rows: auto auto minmax(0, 1fr) auto auto;
   overflow: hidden;
   color: var(--text-primary, #eef5ff);
   background: #07101c;
@@ -11044,6 +11064,7 @@ button.quick-agent-delegation-preset.active {
 .remote-desktop-toolbar-shell {
   position: relative;
   min-width: 0;
+  grid-row: 1;
 }
 
 .remote-desktop-toolbar[hidden] {
@@ -11858,6 +11879,7 @@ button.quick-agent-delegation-preset.active {
 }
 
 .remote-desktop-control-notice {
+  grid-row: 2;
   margin: 0 12px 8px;
   padding: 8px 12px;
   border: 1px solid rgba(255, 176, 87, 0.45);
@@ -11869,6 +11891,10 @@ button.quick-agent-delegation-preset.active {
 }
 
 .remote-desktop-stage {
+  /* Keep the optional control notice from changing which track receives the
+     stage.  Without an explicit row, omitting that notice places this item in
+     the second auto track and leaves the footer in the 1fr track. */
+  grid-row: 3;
   position: relative;
   min-width: 0;
   min-height: 0;
@@ -11904,6 +11930,7 @@ button.quick-agent-delegation-preset.active {
   /* A grid row of its own (see .remote-desktop-panel), not an overlay: opening
      it shrinks the video area above instead of covering it. */
   position: relative;
+  grid-row: 4;
   width: 100%;
   max-height: 45vh;
   overflow-y: auto;
@@ -12528,9 +12555,35 @@ button.quick-agent-delegation-preset.active {
   border: 1px solid rgb(99 201 255 / 22%);
   border-radius: 999px;
   backdrop-filter: blur(6px);
+  align-items: center;
+  gap: 8px;
   font-size: 10.5px;
   letter-spacing: .01em;
   pointer-events: none;
+}
+
+.remote-desktop-touch-hint > span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.remote-desktop-touch-hint-dismiss {
+  flex: 0 0 auto;
+  min-height: 22px;
+  padding: 2px 7px;
+  color: #dff4ff;
+  background: rgb(99 201 255 / 14%);
+  border: 1px solid rgb(99 201 255 / 32%);
+  border-radius: 999px;
+  font-size: 10px;
+  line-height: 1.2;
+  white-space: nowrap;
+  cursor: pointer;
+  pointer-events: auto;
+}
+
+.remote-desktop-touch-hint-dismiss:hover {
+  background: rgb(99 201 255 / 24%);
 }
 
 /* The phone keyboard already takes the lower half of the viewport. Remove
@@ -12543,6 +12596,7 @@ button.quick-agent-delegation-preset.active {
 }
 
 .remote-desktop-footer {
+  grid-row: 5;
   justify-content: space-between;
   flex-wrap: wrap;
   border-top: 1px solid rgb(122 178 218 / 14%);
@@ -13450,9 +13504,14 @@ button.quick-agent-delegation-preset.active {
   }
 
   .remote-desktop-footer {
-    max-height: 30vh;
+    /* Keep status reflow from changing the stage geometry. Long summaries and
+       nerd diagnostics scroll inside this fixed-height footer instead. */
+    height: 44px;
+    min-height: 44px;
+    max-height: 44px;
     padding: 7px 10px;
     overflow-y: auto;
+    box-sizing: border-box;
   }
 
   .remote-desktop-diagnostics {
@@ -13535,9 +13594,7 @@ button.quick-agent-delegation-preset.active {
     min-height: 32px;
   }
 
-  .remote-desktop-footer {
-    max-height: 22vh;
-  }
+  .remote-desktop-footer { height: 44px; min-height: 44px; max-height: 44px; }
 }
 
 @media (pointer: coarse) {
@@ -13550,7 +13607,7 @@ button.quick-agent-delegation-preset.active {
   }
 
   .remote-desktop-touch-hint {
-    display: block;
+    display: inline-flex;
   }
 
   .remote-desktop-touch-ring {
@@ -13563,6 +13620,16 @@ button.quick-agent-delegation-preset.active {
 
   .remote-desktop-stage.is-controlling {
     cursor: default;
+  }
+
+  /* Wide mobile WebViews are not covered by the width media query, but their
+     status bar must obey the same fixed-height contract. */
+  .remote-desktop-footer {
+    height: 44px;
+    min-height: 44px;
+    max-height: 44px;
+    overflow-y: auto;
+    box-sizing: border-box;
   }
 }
 

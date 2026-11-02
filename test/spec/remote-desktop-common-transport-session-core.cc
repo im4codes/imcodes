@@ -40,7 +40,9 @@ class FakeQualityLadder final : public common::QualityLadder {
         30,
         target.bitrate_bps,
         0,
-        !reject_quality,
+        !reject_quality &&
+            (target.preference.minimum_bitrate_bps == 0 ||
+             target.bitrate_bps >= target.preference.minimum_bitrate_bps),
     };
   }
 
@@ -771,9 +773,9 @@ int main() {
     adapter_a.quality_result = false;
     imcodes::rd::QualityPreference request_a;
     request_a.max_height = 2160;
-    Require(!core_a.SetQualityPreference(request_a) && !core_a.terminal() &&
+    Require(core_a.SetQualityPreference(request_a) && !core_a.terminal() &&
                 adapter_a.close_transport_count == 0,
-            "route A rejects a transient quality refusal without closing");
+            "route A defers a transient quality refusal without closing");
     Require(!core_b.terminal() && adapter_b.close_transport_count == 0 &&
                 core_b.diagnostics().quality.has_value() && b_before.has_value() &&
                 core_b.diagnostics().quality->preset_id == b_before->preset_id &&
@@ -781,9 +783,9 @@ int main() {
             "route B quality and peer remain untouched by route A refusal");
     adapter_a.quality_result = true;
     Require(core_a.UpdateQualityTarget(stamp_a, baseline) &&
-                core_a.diagnostics().quality->preset_id == "bounded" &&
+                core_a.diagnostics().quality->preset_id == "ultra" &&
                 core_b.diagnostics().quality->preset_id == b_before->preset_id,
-            "route A rolls back while route B keeps its prior selection");
+            "route A retries while route B keeps its prior selection");
   }
 
   {
@@ -807,6 +809,28 @@ int main() {
     Require(!core.SetQualityPreference(impossible) && !core.terminal() &&
                 adapter.close_transport_count == 0,
             "an impossible quality floor is rejected without reconnecting");
+  }
+
+  {
+    FakeTransportAdapter adapter;
+    common::TransportSessionCore core(adapter, ladder, Limits());
+    Require(core.Start(Authority(), At(0, 0)),
+            "direct quality preference fixture starts");
+    Require(core.OnTransportPath(Stamp(), common::TransportPath::kDirect),
+            "direct quality preference fixture proves its path");
+    ladder.reject_quality = false;
+    const bool low_target = core.UpdateQualityTarget(
+        Stamp(), common::QualityTarget{4'000'000, {1920, 1080}});
+    Require(low_target,
+            "direct quality preference fixture accepts a low estimator target");
+    imcodes::rd::QualityPreference preference;
+    preference.max_height = 1440;
+    preference.max_bitrate_bps = 10'000'000;
+    Require(core.SetQualityPreference(preference),
+            "direct quality preference probes its floor instead of rejecting the live peer");
+    Require(!core.terminal() && adapter.qualities.size() == 2 &&
+                adapter.qualities.back().bitrate_bps >= preference.max_bitrate_bps,
+            "direct quality preference keeps the live peer and applies the requested floor");
   }
 
   {

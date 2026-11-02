@@ -1,4 +1,7 @@
 {
+  "task_pair": {
+    "reference_picker": "Pair 任务"
+  },
   "alias": {
     "feature_label": "别名",
     "category": "别名",
@@ -691,7 +694,7 @@
     "stop_appended_queue": "已追加队列消息，本次未停止会话。",
     "send_placeholder": "发送到 {{name}}…",
     "send_placeholder_desktop_upload": "{{placeholder}} 支持多文件粘贴或拖拽快速上传",
-    "send_placeholder_desktop_shortcuts": "{{placeholder}}\n/ 命令 · # 短语 · @ 文件/Agent · ; 别名 · ^ 受控节点 · 可粘贴或拖入文件",
+    "send_placeholder_desktop_shortcuts": "{{placeholder}}\n/ 命令 · # 短语 · @ 文件/Agent · ; 别名 · ^ 受控节点 · % 任务 · 可粘贴或拖入文件",
     "composer_target_label": "发送至",
     "composer_target_aria": "消息将发送至 {{name}}",
     "actions": "会话操作",
@@ -1074,6 +1077,8 @@
     "delete_error": "删除服务器失败：{{error}}",
     "upgrade_daemon": "↑ 升级 Daemon",
     "upgrade_all": "↑ 升级全部设备",
+    "pin": "📌 置顶服务器",
+    "unpin": "取消置顶服务器",
     "delete": "✕ 删除 server",
     "upgrade_sent": "升级命令已发送到「{{name}}」，daemon 将自动安装最新版并重启。",
     "upgrade_failed": "发送失败，daemon 可能不在线。",
@@ -4182,6 +4187,7 @@
     "zoom_out": "缩小",
     "zoom_reset": "重置缩放",
     "touch_hint": "轻点屏幕可在该处单击；拖动圆环移动光标；按住圆环再拖动即为拖拽；按住后松开为右键",
+    "touch_hint_dismiss": "知道了",
     "touch_right_click": "在上次触摸位置右键单击",
     "touch_ring": "光标圆环——拖动可移动，长按变右键",
     "mobile_input_mode": "手机输入模式",
@@ -4663,6 +4669,7 @@
       "passed": "审核通过",
       "done": "已完成",
       "cancelled": "已取消",
+      "failed": "已失败",
       "rework_round": "返工第{{round}}轮",
       "awaiting_brain_decision": "等待 Brain 决定",
       "paused": "已暂停",

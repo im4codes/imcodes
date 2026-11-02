@@ -17,6 +17,8 @@ import { fileURLToPath } from 'node:url';
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 export const WEBVIEW2_SDK_LOCK = join(root, 'native', 'aidesk-panel-host-windows', 'webview2.lock.json');
 const SHA256_RE = /^[a-f0-9]{64}$/u;
+const WEBVIEW2_DOWNLOAD_ATTEMPTS = 3;
+class NonRetryableDownloadError extends Error {}
 
 export function parseWebview2Lock(text) {
   const lock = JSON.parse(text);
@@ -46,10 +48,27 @@ export function assertRequiredFiles(packageRoot, pin) {
   if (missing.length > 0) throw new Error(`${pin.name} ${pin.version} is missing ${missing.join(', ')}`);
 }
 
-async function download(url) {
-  const response = await fetch(url, { redirect: 'follow', signal: AbortSignal.timeout(180_000) });
-  if (!response.ok) throw new Error(`download failed (${response.status}): ${url}`);
-  return Buffer.from(await response.arrayBuffer());
+export async function download(url) {
+  let lastError;
+  for (let attempt = 1; attempt <= WEBVIEW2_DOWNLOAD_ATTEMPTS; attempt += 1) {
+    try {
+      const response = await fetch(url, { redirect: 'follow', signal: AbortSignal.timeout(180_000) });
+      if (!response.ok) {
+        const error = new Error(`download failed (${response.status}): ${url}`);
+        if (response.status < 500) throw new NonRetryableDownloadError(error.message);
+        lastError = error;
+      } else {
+        return Buffer.from(await response.arrayBuffer());
+      }
+    } catch (error) {
+      if (error instanceof NonRetryableDownloadError) throw error;
+      lastError = error;
+    }
+    if (attempt < WEBVIEW2_DOWNLOAD_ATTEMPTS) {
+      await new Promise((resolve) => setTimeout(resolve, attempt * 250));
+    }
+  }
+  throw lastError;
 }
 
 /** A .nupkg is a zip: bsdtar (Windows, macOS) reads it with `tar`, Linux runners have `unzip`. */

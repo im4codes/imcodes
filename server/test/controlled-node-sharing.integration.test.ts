@@ -283,7 +283,7 @@ describe('controlled-node sharing reuses grants without becoming a shared Tab', 
     expect(promote.status).toBe(200);
     const participantList = await app.request('/api/machines', { headers: webAuth(recipientId) });
     expect(await participantList.json()).toEqual({
-      machines: [expect.objectContaining({ serverId, accessRole: 'participant', execEnabled: false })],
+      machines: [expect.objectContaining({ serverId, accessRole: 'participant', execEnabled: true })],
     });
 
     const nonOwnerManage = await app.request(`/api/server/${serverId}/shares`, {
@@ -1223,7 +1223,7 @@ describe('a shared-session participant reaches only the machines shared with the
       expect(await good.text()).toBe('payload');
       expect((await t.app.request(`/api/server/${t.unshared}/uploads/${n.attachmentId}/download?token=${token}`)).status).toBe(403);
       if (revocation === 'device-grant') {
-        await db.execute('UPDATE server_shares SET exec_granted = false WHERE server_id = $1 AND target_user_id = $2', [t.participantShared, t.participantId]);
+        await db.execute('UPDATE server_shares SET revoked_at = $3 WHERE server_id = $1 AND target_user_id = $2', [t.participantShared, t.participantId, Date.now()]);
       } else {
         await db.execute('UPDATE server_shares SET expires_at = $3 WHERE server_id = $1 AND target_user_id = $2', [t.participantShared, t.participantId, Date.now() - 1]);
       }
@@ -1279,7 +1279,7 @@ describe('a shared-session participant reaches only the machines shared with the
         if (Date.now() > deadline) throw new Error('admission_audit_timeout');
         await new Promise((resolve) => setTimeout(resolve, 5));
       }
-      await db.execute('UPDATE server_shares SET exec_granted = false WHERE server_id = $1 AND target_user_id = $2', [t.participantShared, t.participantId]);
+      await db.execute('UPDATE server_shares SET revoked_at = $3 WHERE server_id = $1 AND target_user_id = $2', [t.participantShared, t.participantId, Date.now()]);
       complete();
       expect((await pending).status).toBe(403);
       expect(n.socket.sent.filter((raw) => JSON.parse(raw).type === FILE_TRANSFER_MSG.PATH_HANDLE)).toHaveLength(0);
@@ -1309,7 +1309,7 @@ describe('a shared-session participant reaches only the machines shared with the
         if (Date.now() > deadline) throw new Error('admission_audit_timeout');
         await new Promise((resolve) => setTimeout(resolve, 5));
       }
-      await db.execute('UPDATE server_shares SET exec_granted = false WHERE server_id = $1 AND target_user_id = $2', [t.participantShared, t.participantId]);
+      await db.execute('UPDATE server_shares SET revoked_at = $3 WHERE server_id = $1 AND target_user_id = $2', [t.participantShared, t.participantId, Date.now()]);
       release();
       expect((await pending).status).toBe(403);
       expect(n.socket.sent.filter((raw) => JSON.parse(raw).type === FILE_TRANSFER_MSG.UPLOAD_FETCH)).toHaveLength(0);
@@ -1347,7 +1347,7 @@ describe('a shared-session participant reaches only the machines shared with the
       expect((await chunk(t.ownerTurn, 3)).status).toBe(409);
       expect(await (await chunk(t.delegated, 3)).json()).toMatchObject({ complete: false, committedBytes: 6 });
       expect(n.socket.sent.filter((raw) => JSON.parse(raw).type === FILE_TRANSFER_MSG.UPLOAD_FETCH)).toHaveLength(0);
-      await db.execute('UPDATE server_shares SET exec_granted = false WHERE server_id = $1 AND target_user_id = $2', [t.participantShared, t.participantId]);
+      await db.execute('UPDATE server_shares SET revoked_at = $3 WHERE server_id = $1 AND target_user_id = $2', [t.participantShared, t.participantId, Date.now()]);
       expect((await chunk(t.delegated, 6)).status).toBe(403);
     } finally { n.socket.close(); }
   });
@@ -1385,7 +1385,7 @@ describe('a shared-session participant reaches only the machines shared with the
       const url = new URL(String(message.downloadUrl));
       void (async () => {
         if (revokeBeforeRedeem) {
-          await db.execute('UPDATE server_shares SET exec_granted = false WHERE server_id = $1 AND target_user_id = $2', [t.participantShared, t.participantId]);
+          await db.execute('UPDATE server_shares SET revoked_at = $3 WHERE server_id = $1 AND target_user_id = $2', [t.participantShared, t.participantId, Date.now()]);
         }
         const staged = await redeemApp.request(`${url.pathname}${url.search}`);
         redeemed.push(staged.status);

@@ -1,4 +1,7 @@
 {
+  "task_pair": {
+    "reference_picker": "ペアタスク"
+  },
   "alias": {
     "feature_label": "エイリアス",
     "category": "エイリアス",
@@ -691,7 +694,7 @@
     "stop_appended_queue": "キューのメッセージを追加しました。セッションは実行中です。",
     "send_placeholder": "{{name}} へ送信…",
     "send_placeholder_desktop_upload": "{{placeholder}} 複数ファイルの貼り付け/ドラッグによる高速アップロードに対応",
-    "send_placeholder_desktop_shortcuts": "{{placeholder}}\n/ コマンド · # フレーズ · @ ファイル/Agent · ; エイリアス · ^ ノード · ファイルを貼り付け/ドラッグ",
+    "send_placeholder_desktop_shortcuts": "{{placeholder}}\n/ コマンド · # フレーズ · @ ファイル/Agent · ; エイリアス · ^ ノード · % タスク · ファイルを貼り付け/ドラッグ",
     "composer_target_label": "送信先",
     "composer_target_aria": "メッセージの送信先: {{name}}",
     "actions": "セッション操作",
@@ -1074,6 +1077,8 @@
     "delete_error": "サーバーを削除できませんでした：{{error}}",
     "upgrade_daemon": "↑ Daemonをアップグレード",
     "upgrade_all": "↑ 全デバイス更新",
+    "pin": "📌 サーバーを固定",
+    "unpin": "サーバーの固定を解除",
     "delete": "✕ サーバーを削除",
     "upgrade_sent": "「{{name}}」にアップグレードコマンドを送信しました。Daemonは最新バージョンをインストールして再起動します。",
     "upgrade_failed": "アップグレードコマンドの送信に失敗しました。Daemonがオフラインの可能性があります。",
@@ -4178,6 +4183,7 @@
     "zoom_out": "縮小",
     "zoom_reset": "ズームをリセット",
     "touch_hint": "画面をタップするとその位置でクリック、リングをドラッグするとカーソルが移動します。リングを長押ししてからドラッグするとドラッグ操作、長押しして離すと右クリックになります",
+    "touch_hint_dismiss": "了解",
     "touch_right_click": "最後に触れた位置で右クリック",
     "touch_ring": "カーソルリング:ドラッグで移動、長押しで右クリック",
     "mobile_input_mode": "モバイル入力モード",
@@ -4650,6 +4656,7 @@
       "passed": "監査合格",
       "done": "完了",
       "cancelled": "キャンセル",
+      "failed": "失敗",
       "rework_round": "再作業 第{{round}}ラウンド",
       "awaiting_brain_decision": "Brain の判断待ち",
       "paused": "一時停止中",

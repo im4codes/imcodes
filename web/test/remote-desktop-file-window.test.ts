@@ -35,6 +35,25 @@ function ruleBody(selector: string): string {
   return styles.slice(start + 1, end);
 }
 
+describe('remote desktop control notices stay non-blocking', () => {
+  it('keeps the notice in an auto row and the stage as the only 1fr row', () => {
+    const panel = ruleBody('.remote-desktop-panel');
+    expect(panel).toMatch(/grid-template-rows:\s*auto\s+auto\s+minmax\(0,\s*1fr\)\s+auto\s+auto/);
+    expect(panel).not.toMatch(/grid-template-rows:\s*auto\s+minmax\(0,\s*1fr\)/);
+    expect(ruleBody('.remote-desktop-control-notice')).toMatch(/grid-row:\s*2/);
+    expect(ruleBody('.remote-desktop-stage')).toMatch(/grid-row:\s*3/);
+    expect(ruleBody('.remote-desktop-mobile-keyboard')).toMatch(/grid-row:\s*4/);
+    expect(styles).toContain('.remote-desktop-footer {\n  grid-row: 5;');
+    expect(remoteDesktop).toContain('class="remote-desktop-control-notice"');
+    expect(remoteDesktop).toContain('class={`remote-desktop-stage is-${viewScale}');
+  });
+
+  it('keeps the quality rejection message and its auto-dismiss behavior', () => {
+    expect(remoteDesktop).toContain("remote_desktop.control_rejected.${rejection.reason}");
+    expect(remoteDesktop).toMatch(/setTimeout\(\(\) => \{[\s\S]*?setControlNotice\(\(current\)/);
+  });
+});
+
 describe('the file drawer scrolls instead of clipping', () => {
   /**
    * The reported bug: the directory tree would not scroll, and once it grew

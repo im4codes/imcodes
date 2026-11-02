@@ -1,4 +1,7 @@
 {
+  "task_pair": {
+    "reference_picker": "Tareas de pares"
+  },
   "alias": {
     "feature_label": "Alias",
     "category": "Alias",
@@ -691,7 +694,7 @@
     "stop_appended_queue": "Los mensajes en cola se añadieron; la sesión sigue en ejecución.",
     "send_placeholder": "Enviar a {{name}}…",
     "send_placeholder_desktop_upload": "{{placeholder}} Admite carga rápida pegando o arrastrando varios archivos",
-    "send_placeholder_desktop_shortcuts": "{{placeholder}}\n/ comandos · # frases · @ archivos/agentes · ; alias · ^ nodos · pega o arrastra archivos",
+    "send_placeholder_desktop_shortcuts": "{{placeholder}}\n/ comandos · # frases · @ archivos/agentes · ; alias · ^ nodos · % tareas · pega o arrastra archivos",
     "composer_target_label": "Enviando a",
     "composer_target_aria": "Destino del mensaje: {{name}}",
     "actions": "Acciones de sesión",
@@ -1074,6 +1077,8 @@
     "delete_error": "No se pudo eliminar el servidor: {{error}}",
     "upgrade_daemon": "↑ Actualizar Daemon",
     "upgrade_all": "↑ Actualizar Todos",
+    "pin": "📌 Fijar servidor",
+    "unpin": "Desfijar servidor",
     "delete": "✕ Eliminar servidor",
     "upgrade_sent": "Comando de actualización enviado a \"{{name}}\". El daemon instalará la última versión y se reiniciará.",
     "upgrade_failed": "Error al enviar el comando de actualización. El daemon puede estar desconectado.",
@@ -4179,6 +4184,7 @@
     "zoom_out": "Alejar",
     "zoom_reset": "Restablecer zoom",
     "touch_hint": "Toca la pantalla para hacer clic ahí, o arrastra el anillo para mover el cursor. Mantén pulsado el anillo y arrastra para arrastrar; mantén y suelta para el clic derecho",
+    "touch_hint_dismiss": "Entendido",
     "touch_right_click": "Clic derecho en la última posición táctil",
     "touch_ring": "Anillo del cursor: arrastra para mover, mantén pulsado para el clic derecho",
     "mobile_input_mode": "Modo de entrada móvil",
@@ -4651,6 +4657,7 @@
       "passed": "Auditoría aprobada",
       "done": "Terminada",
       "cancelled": "Cancelada",
+      "failed": "Fallida",
       "rework_round": "Revisión ronda {{round}}",
       "awaiting_brain_decision": "Esperando decisión de Brain",
       "paused": "En pausa",

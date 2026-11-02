@@ -214,6 +214,8 @@ export const TASK_PAIR_WORKS_DIR = 'works' as const;
 export const TASK_PAIR_WORKS_ROOT_ENV = 'IMCODES_WORKS_ROOT' as const;
 /** A pair's workspace is removed this long after the pair ends (DONE/CANCEL). */
 export const TASK_PAIR_WORKSPACE_RETENTION_MS = 48 * 60 * 60_000;
+/** A clean, merged DONE workspace is eligible for the terminal sweep immediately. */
+export const TASK_PAIR_DONE_WORKSPACE_RETENTION_MS = 0;
 
 /**
  * Brain notices whose SUBJECT is a pair that has already ended (its workspace was kept, its deliverable was not
@@ -904,6 +906,8 @@ export const TASK_PAIR_VERBS = [
 export type TaskPairVerb = typeof TASK_PAIR_VERBS[number];
 
 export const TASK_PAIR_STATUS_AWAITING_BRAIN_DECISION = 'awaiting_brain_decision' as const;
+/** Display-only failure status used by task reference projections. */
+export const TASK_PAIR_STATUS_FAILED = 'failed' as const;
 /** Local-storage namespace for the web task-pair status panel (layout suffix is added by the UI). */
 export const TASK_PAIR_STATUS_PANEL_STORAGE_KEY = 'imcodes.task-pair-status-panel.collapsed' as const;
 export const TASK_PAIR_STATUSES = [

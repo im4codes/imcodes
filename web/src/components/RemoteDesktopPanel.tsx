@@ -92,6 +92,7 @@ import type { WsClient } from '../ws-client.js';
 import { openRemoteDesktopWindow } from '../remote-desktop-window.js';
 import { fullscreenContainerFor, useFullscreen } from '../hooks/useFullscreen.js';
 import { keyboardLockSupported, useKeyboardLock } from '../hooks/useKeyboardLock.js';
+import { useSyncedPreference } from '../hooks/useSyncedPreference.js';
 import {
   REMOTE_DESKTOP_BROWSER_DIAGNOSTIC_EVENT,
   recordRemoteDesktopBrowserDiagnostic,
@@ -117,6 +118,7 @@ import {
   REMOTE_DESKTOP_POINTER_EDGE_STICKY_RATIO_PRECISE,
   stickRemoteDesktopPointerToEdges,
   viewportFromRemoteDesktopPinch,
+  type RemoteDesktopViewportGeometry,
   type RemoteDesktopViewport,
 } from '../remote-desktop-viewport.js';
 import {
@@ -144,6 +146,8 @@ const QUALITY_PRIORITIES = Object.values(REMOTE_DESKTOP_QUALITY_PRIORITY);
 
 /** A phone-keyboard editing key and its own input event arrive together. */
 const MOBILE_EDITING_KEY_DEDUPE_MS = 150;
+const REMOTE_DESKTOP_TOUCH_HINT_DISMISSED_PREFERENCE = 'remote_desktop_touch_hint_dismissed';
+const REMOTE_DESKTOP_TOUCH_HINT_DISMISSED_EVENT = 'remote-desktop-touch-hint-dismissed';
 
 type ViewScale = 'fit' | 'actual';
 type MobileInputMode = 'touch' | 'mouse';
@@ -453,6 +457,21 @@ export function RemoteDesktopPanel({
   // session doesn't reset to it every time.
   const [viewScale, setViewScale] = useState<ViewScale>(() => storedZoomPreference?.viewScale ?? 'fit');
   const [mobileInputMode, setMobileInputMode] = useState<MobileInputMode>('touch');
+  const [touchHintDismissed, setTouchHintDismissed] = useSyncedPreference<boolean>(
+    REMOTE_DESKTOP_TOUCH_HINT_DISMISSED_PREFERENCE,
+    false,
+    0,
+  );
+  useEffect(() => {
+    const onTouchHintDismissed = () => setTouchHintDismissed(true);
+    window.addEventListener(REMOTE_DESKTOP_TOUCH_HINT_DISMISSED_EVENT, onTouchHintDismissed);
+    return () => window.removeEventListener(REMOTE_DESKTOP_TOUCH_HINT_DISMISSED_EVENT, onTouchHintDismissed);
+  }, [setTouchHintDismissed]);
+
+  const dismissTouchHint = useCallback(() => {
+    setTouchHintDismissed(true);
+    window.dispatchEvent(new Event(REMOTE_DESKTOP_TOUCH_HINT_DISMISSED_EVENT));
+  }, [setTouchHintDismissed]);
   const [viewport, setViewport] = useState<RemoteDesktopViewport>(() => (
     storedZoomPreference
       ? {
@@ -641,7 +660,14 @@ export function RemoteDesktopPanel({
    * is about.
    */
   const viewportResetKeyRef = useRef<string | null>(null);
+  // The first usable stage geometry is the virtual mouse's initial mount. A
+  // later geometry-only refresh must keep the user's ring position, while a
+  // real reset trigger (display/layout/scale/input mode) starts it over at
+  // the new stage's centre.
+  const hasInitializedVirtualMouseRef = useRef(false);
+  const virtualMouseResetPendingRef = useRef(false);
   const virtualMouseRef = useRef<TouchPoint>({ x: 0, y: 0 });
+  const previousUsableGeometryRef = useRef<RemoteDesktopViewportGeometry | null>(null);
   const virtualMouseDragRef = useRef<VirtualMouseDrag | null>(null);
   const virtualMouseEdgePointRef = useRef<TouchPoint | null>(null);
   const virtualMouseEdgeFrameRef = useRef<number | null>(null);
@@ -1294,7 +1320,18 @@ export function RemoteDesktopPanel({
     // marks initialization done -- only after that does a later run mean a
     // real, later display/mode change that should reset to the default.
     const isMountRun = !hasResetViewportOnMountRef.current;
-    if (display) hasResetViewportOnMountRef.current = true;
+    const hasUsableGeometry = Boolean(
+      geometry
+      && geometry.stageWidth > 0
+      && geometry.stageHeight > 0
+      && geometry.contentWidth > 0
+      && geometry.contentHeight > 0,
+    );
+    if (display && hasUsableGeometry) hasResetViewportOnMountRef.current = true;
+    const previousGeometry = previousUsableGeometryRef.current;
+    const geometryWidthChanged = !previousGeometry
+      || geometry?.stageWidth !== previousGeometry.stageWidth
+      || geometry?.contentWidth !== previousGeometry.contentWidth;
     const resetKey = [
       snapshot.selectedDisplayId ?? '',
       snapshot.layoutRevision,
@@ -1304,19 +1341,35 @@ export function RemoteDesktopPanel({
     const resetTrigger = viewportResetKeyRef.current !== null
       && viewportResetKeyRef.current !== resetKey;
     viewportResetKeyRef.current = resetKey;
-    const nextViewport = mobileInputMode === 'mouse' && geometry && display
-      ? remoteDesktopMouseModeViewport(display, geometry)
+    const nextViewport = mobileInputMode === 'mouse' && geometry && display && hasUsableGeometry
+      ? (isMountRun || resetTrigger || geometryWidthChanged
+        ? remoteDesktopMouseModeViewport(display, geometry)
+        : clampRemoteDesktopViewport(viewportRef.current, geometry))
       // Mount already seeded viewportRef with any remembered scale for this
       // machine; only a later, real display/mode change resets to default --
       // a resize keeps whatever zoom and pan the person set.
       : isMountRun || !resetTrigger ? viewportRef.current : INITIAL_REMOTE_DESKTOP_VIEWPORT;
     viewportRef.current = nextViewport;
     setViewport(nextViewport);
-    if (stage) {
-      const nextMouse = { x: stage.clientWidth / 2, y: stage.clientHeight / 2 };
+    const shouldResetVirtualMouse = resetTrigger || !hasInitializedVirtualMouseRef.current;
+    if (shouldResetVirtualMouse) virtualMouseResetPendingRef.current = true;
+    if (stage && stage.clientWidth > 0 && stage.clientHeight > 0) {
+      const center = { x: stage.clientWidth / 2, y: stage.clientHeight / 2 };
+      const clampCoordinate = (value: number, max: number, fallback: number) => (
+        Number.isFinite(value) ? Math.max(0, Math.min(max, value)) : fallback
+      );
+      const nextMouse = virtualMouseResetPendingRef.current
+        ? center
+        : {
+          x: clampCoordinate(virtualMouseRef.current.x, stage.clientWidth, center.x),
+          y: clampCoordinate(virtualMouseRef.current.y, stage.clientHeight, center.y),
+        };
+      virtualMouseResetPendingRef.current = false;
+      hasInitializedVirtualMouseRef.current = true;
       virtualMouseRef.current = nextMouse;
       setVirtualMouse(nextMouse);
     }
+    if (hasUsableGeometry && geometry) previousUsableGeometryRef.current = geometry;
     touchPointsRef.current.clear();
     if (touchGestureRef.current?.kind === 'single' && touchGestureRef.current.longPressTimer) {
       clearTimeout(touchGestureRef.current.longPressTimer);
@@ -3863,10 +3916,24 @@ export function RemoteDesktopPanel({
               )}
             </div>
           )}
-          <div class="remote-desktop-touch-hint" hidden={mobileTextOpen}>
-            {t(mobileInputMode === 'mouse'
-              ? 'remote_desktop.mouse_hint'
-              : 'remote_desktop.touch_hint')}
+          <div
+            class="remote-desktop-touch-hint"
+            hidden={mobileTextOpen || (mobileInputMode === 'touch' && touchHintDismissed)}
+          >
+            <span>
+              {t(mobileInputMode === 'mouse'
+                ? 'remote_desktop.mouse_hint'
+                : 'remote_desktop.touch_hint')}
+            </span>
+            {mobileInputMode === 'touch' && (
+              <button
+                type="button"
+                class="remote-desktop-touch-hint-dismiss"
+                onClick={dismissTouchHint}
+              >
+                {t('remote_desktop.touch_hint_dismiss')}
+              </button>
+            )}
           </div>
         </div>
 

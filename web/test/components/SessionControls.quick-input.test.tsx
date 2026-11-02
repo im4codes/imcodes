@@ -12,7 +12,7 @@ vi.mock('react-i18next', () => ({
       if (key === 'quick_input.title') return 'Quick input';
       if (key === 'session.send_placeholder') return `Send to ${String(opts?.name ?? 'session')}…`;
       if (key === 'session.send_placeholder_desktop_upload') return String(opts?.placeholder ?? '');
-      if (key === 'session.send_placeholder_desktop_shortcuts') return `${String(opts?.placeholder ?? '')}\n/ ! @ ; ^ shortcuts`;
+      if (key === 'session.send_placeholder_desktop_shortcuts') return `${String(opts?.placeholder ?? '')}\n/ ! @ ; ^ % shortcuts`;
       const parts = key.split('.');
       return parts[parts.length - 1];
     },
@@ -166,7 +166,7 @@ describe('SessionControls quick input integration', () => {
       />,
     );
     expect(screen.getByRole('textbox').getAttribute('data-placeholder'))
-      .toContain('\n/ ! @ ; ^ shortcuts');
+      .toContain('\n/ ! @ ; ^ % shortcuts');
   });
 
   it('preserves visual newlines from the composer when sending and recording history', () => {
