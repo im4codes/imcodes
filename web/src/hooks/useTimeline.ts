@@ -4564,6 +4564,12 @@ export function useTimeline(
                 if (recoveredEvent.ts < minTs) minTs = recoveredEvent.ts;
                 if (recoveredEvent.ts > maxTs) maxTs = recoveredEvent.ts;
               }
+              if (
+                scopeGenerationRef.current !== roundGeneration
+                || cacheKeyRef.current !== backfillCacheKey
+              ) {
+                return { candidateCount: 0, minTs: null, maxTs: null };
+              }
               if (backfillCacheKey && Number.isFinite(minTs) && Number.isFinite(maxTs)) {
                 const currentGap = getTimelineGap(backfillCacheKey);
                 if (currentGap) {
@@ -4599,6 +4605,12 @@ export function useTimeline(
               };
             },
           });
+          if (
+            scopeGenerationRef.current !== roundGeneration
+            || cacheKeyRef.current !== backfillCacheKey
+          ) {
+            return;
+          }
           terminal = outcome.terminal;
           // The window down to the floor is exhausted: the hole is filled.
           if (terminal === 'caught_up' && backfillCacheKey && mode !== 'manualLatestWindow') {
@@ -4690,15 +4702,20 @@ export function useTimeline(
           }
           if (gate) {
             gate.inFlight = Math.max(0, gate.inFlight - 1);
-            if (terminal === 'error' || terminal === 'transient_null') {
-              gate.failureStreak += 1;
-              gate.nextAllowedAt = Date.now() + Math.min(
-                BACKGROUND_BACKFILL_FAILURE_BACKOFF_BASE_MS * 2 ** (gate.failureStreak - 1),
-                BACKGROUND_BACKFILL_FAILURE_BACKOFF_MAX_MS,
-              );
-            } else if (terminal === 'caught_up') {
-              gate.failureStreak = 0;
-              gate.nextAllowedAt = 0;
+            if (
+              scopeGenerationRef.current === roundGeneration
+              && cacheKeyRef.current === backfillCacheKey
+            ) {
+              if (terminal === 'error' || terminal === 'transient_null') {
+                gate.failureStreak += 1;
+                gate.nextAllowedAt = Date.now() + Math.min(
+                  BACKGROUND_BACKFILL_FAILURE_BACKOFF_BASE_MS * 2 ** (gate.failureStreak - 1),
+                  BACKGROUND_BACKFILL_FAILURE_BACKOFF_MAX_MS,
+                );
+              } else if (terminal === 'caught_up') {
+                gate.failureStreak = 0;
+                gate.nextAllowedAt = 0;
+              }
             }
           }
           if (foregroundRound) {

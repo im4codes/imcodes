@@ -766,5 +766,126 @@ describe('useTimeline — history recovery and error clearing contract', () => {
       expect(aCalls).toBeGreaterThan(1);
       expect(f.tl.events.some((e: any) => e.eventId === a + 'recovered-gap')).toBe(true);
     });
+
+    it('audit r3: stale caught_up must not clear a newly established gap or overwrite success baseline across scopes', async () => {
+      const a = 'audit-gap-stale-a';
+      const b = 'audit-gap-stale-b';
+      for (const x of [a, b]) ingestTimelineEventForCache(auditEvent(x, 'head', 2000), 'audit-server');
+      setTimelineGap('audit-server:' + a, { lowerTs: 0, upperTs: 900, createdAt: Date.now() });
+
+      const pendingOldA = deferred<any>();
+      const pendingNewA = deferred<any>();
+      let aCalls = 0;
+      fetchSpy.mockImplementation((_server: any, s: any) => {
+        if (s === a) {
+          aCalls++;
+          return aCalls === 1 ? pendingOldA.promise : pendingNewA.promise;
+        }
+        return Promise.resolve({ events: [], epoch: 1, hasMore: false, nextCursor: null });
+      });
+
+      // Generation 1: session A starts with initial gap (0, 900)
+      const f = auditFixture(a);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(250);
+      });
+      expect(aCalls).toBe(1);
+
+      // Generation 2: switch to session B
+      f.switchTo(b);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(250);
+      });
+
+      // Generation 3: switch back to session A
+      f.switchTo(a);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(250);
+      });
+
+      // While generation 3 is active, establish a new legitimate gap for session A (0, 1900)
+      setTimelineGap('audit-server:' + a, { lowerTs: 0, upperTs: 1900, createdAt: Date.now() });
+
+      // Old request from generation 1 returns empty page (would be caught_up in old round)
+      await act(async () => {
+        pendingOldA.resolve({ events: [], epoch: 1, hasMore: false, nextCursor: null });
+        await vi.advanceTimersByTimeAsync(100);
+      });
+
+      // Generation 1 must NOT clear the new gap
+      expect(getTimelineGap('audit-server:' + a)).not.toBeNull();
+      expect(getTimelineGap('audit-server:' + a)?.upperTs).toBe(1900);
+      expect(f.tl.historyGap?.upperTs).toBe(1900);
+
+      // Now that generation 1 released ownership, generation 3 can backfill its own gap
+      await act(async () => {
+        f.tl.forceRefresh();
+        await vi.advanceTimersByTimeAsync(100);
+      });
+      expect(aCalls).toBe(2);
+
+      // Settle generation 3's backfill
+      await act(async () => {
+        pendingNewA.resolve({
+          events: [auditEvent(a, 'tail', 500)],
+          epoch: 1,
+          hasMore: false,
+          nextCursor: null,
+        });
+        await vi.advanceTimersByTimeAsync(200);
+      });
+
+      // Now generation 3 has caught up, properly clearing the gap
+      expect(getTimelineGap('audit-server:' + a)).toBeNull();
+      expect(f.tl.historyGap).toBeNull();
+    });
+
+    it('audit r3: stale error must not contaminate new session failure status but still releases in-flight counters', async () => {
+      const a = 'audit-error-stale-a';
+      const b = 'audit-error-stale-b';
+      for (const x of [a, b]) ingestTimelineEventForCache(auditEvent(x, 'head', 2000), 'audit-server');
+
+      const pendingOldA = deferred<any>();
+      const pendingB = deferred<any>();
+      fetchSpy.mockImplementation((_server: any, s: any) => {
+        if (s === a) return pendingOldA.promise;
+        return pendingB.promise;
+      });
+
+      const f = auditFixture(a);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(50);
+        f.tl.forceRefresh();
+        await vi.advanceTimersByTimeAsync(50);
+      });
+
+      // Switch to B
+      f.switchTo(b);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(50);
+        f.tl.forceRefresh();
+        await vi.advanceTimersByTimeAsync(50);
+      });
+
+      // Session A's old HTTP rejects/throws error
+      await act(async () => {
+        pendingOldA.reject(new Error('connection reset by peer'));
+        await vi.advanceTimersByTimeAsync(100);
+      });
+
+      // Session B's status must NOT be set to error
+      expect(f.tl.historyStatus.response?.state).not.toBe('error');
+      expect(f.tl.refreshing).toBe(true);
+
+      // Settle B's WS and HTTP request
+      await act(async () => {
+        f.handler({ type: 'timeline.history', sessionName: b, requestId: f.rid, epoch: 1, events: [auditEvent(b)] });
+        pendingB.resolve({ events: [], epoch: 1, hasMore: false, nextCursor: null });
+        await vi.advanceTimersByTimeAsync(100);
+      });
+
+      expect(f.tl.refreshing).toBe(false);
+      expect(f.tl.historyStatus.response?.state).not.toBe('error');
+    });
   });
 });
