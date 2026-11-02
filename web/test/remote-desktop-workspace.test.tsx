@@ -1,4 +1,5 @@
 /** @vitest-environment jsdom */
+import { inlineStyleValues } from './support/inline-style.js';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/preact';
@@ -147,19 +148,19 @@ describe('RemoteDesktopWorkspace', () => {
     />);
     const panel = screen.getByTestId(`floating-panel-${REMOTE_DESKTOP_WORKSPACE_WINDOW_ID}`);
     const chrome = result.container.querySelector('.remote-desktop-workspace-tabbar')!;
-    const normalStyle = panel.getAttribute('style');
+    const normalStyle = inlineStyleValues(panel);
     const savedGeometry = localStorage.getItem(key);
     fireEvent.dblClick(screen.getByRole('tab', { name: 'A' }));
     fireEvent.dblClick(screen.getByTestId('panel-a'));
-    expect(panel.getAttribute('style')).toBe(normalStyle);
+    expect(inlineStyleValues(panel)).toEqual(normalStyle);
     fireEvent.dblClick(chrome);
     expect(panel.style.borderWidth).toBe('2px');
-    expect(panel.getAttribute('style')).not.toBe(normalStyle);
+    expect(inlineStyleValues(panel)).not.toEqual(normalStyle);
     expect(onFocus).toHaveBeenCalledTimes(1);
     expect(localStorage.getItem(key)).toBe(savedGeometry);
     expect(fullscreen.requests).toEqual([]);
     fireEvent.dblClick(chrome);
-    expect(panel.getAttribute('style')).toBe(normalStyle);
+    expect(inlineStyleValues(panel)).toEqual(normalStyle);
     expect(localStorage.getItem(key)).toBe(savedGeometry);
   });
 

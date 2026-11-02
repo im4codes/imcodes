@@ -1,4 +1,5 @@
 /** @vitest-environment jsdom */
+import { inlineStyleValues } from './support/inline-style.js';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/preact';
@@ -107,18 +108,18 @@ describe('RemoteDesktopWall', () => {
     await waitFor(() => expect(screen.getAllByRole('button', { name: 'remote_desktop.wall_add' })).toHaveLength(4));
     const panel = screen.getByTestId(`floating-panel-${REMOTE_DESKTOP_WALL_WINDOW_ID}`);
     const chrome = result.container.querySelector('.remote-desktop-wall-header')!;
-    const normalStyle = panel.getAttribute('style');
+    const normalStyle = inlineStyleValues(panel);
     const savedGeometry = localStorage.getItem(key);
     fireEvent.dblClick(chrome.querySelector('button')!);
     fireEvent.dblClick(result.container.querySelector('.remote-desktop-wall-grid')!);
-    expect(panel.getAttribute('style')).toBe(normalStyle);
+    expect(inlineStyleValues(panel)).toEqual(normalStyle);
     fireEvent.dblClick(chrome);
     expect(panel.style.borderWidth).toBe('2px');
-    expect(panel.getAttribute('style')).not.toBe(normalStyle);
+    expect(inlineStyleValues(panel)).not.toEqual(normalStyle);
     expect(onFocus).toHaveBeenCalledTimes(1);
     expect(localStorage.getItem(key)).toBe(savedGeometry);
     fireEvent.dblClick(chrome);
-    expect(panel.getAttribute('style')).toBe(normalStyle);
+    expect(inlineStyleValues(panel)).toEqual(normalStyle);
     expect(localStorage.getItem(key)).toBe(savedGeometry);
   });
 
