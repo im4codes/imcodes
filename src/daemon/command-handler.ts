@@ -116,7 +116,7 @@ import type { SharedActorEnvelope } from '../../shared/tab-sharing.js';
 import { TIMELINE_PAYLOAD_BUDGET_BYTES } from '../../shared/timeline-payload-budget.js';
 import { TIMELINE_HISTORY_LIMITS, clampTimelineHistoryLimit, clampTimelineHistoryBudget } from '../../shared/timeline-history-limits.js';
 import { hashSessionName } from '../../shared/session-hash.js';
-import { TIMELINE_DETAIL_ERROR_REASONS, TIMELINE_HISTORY_ERROR_REASONS, TIMELINE_REQUEST_ERROR_REASONS, type TimelineRequestErrorReason } from '../../shared/timeline-history-errors.js';
+import { TIMELINE_DETAIL_ERROR_REASONS, TIMELINE_HISTORY_ERROR_REASONS, TIMELINE_REQUEST_ERROR_REASONS, type TimelineRequestErrorReason, isRecoverableTimelineRequestErrorReason } from '../../shared/timeline-history-errors.js';
 import {
   TIMELINE_CURSOR_DIRECTIONS,
   TIMELINE_TEXT_HISTORY_EVENT_TYPES,
@@ -6808,6 +6808,7 @@ function sendTimelineReplayError(
   sessionName: string | undefined,
   requestId: string | undefined,
   errorReason: TimelineRequestErrorReason,
+  options?: { recoverable?: boolean },
 ): void {
   try {
     sendTimelineMessage(serverLink, {
@@ -6825,6 +6826,7 @@ function sendTimelineReplayError(
       hasMore: false,
       droppedEvents: 0,
       truncatedEvents: 0,
+      ...(options?.recoverable ? { recoverable: true } : {}),
     });
   } catch { /* not connected */ }
 }
@@ -6964,6 +6966,17 @@ async function handleTimelineReplay(cmd: Record<string, unknown>, serverLink: Se
     });
   } catch (err) {
     logger.warn({ err, sessionName, requestId }, 'timeline.replay_request failed');
+    if (err instanceof TimelinePreferredReadError) {
+      const isRecoverable = TIMELINE_HISTORY_TRANSIENT_REASONS.has(err.reason) || isRecoverableTimelineRequestErrorReason(err.reason);
+      sendTimelineReplayError(
+        serverLink,
+        sessionName,
+        requestId,
+        err.reason as TimelineRequestErrorReason,
+        isRecoverable ? { recoverable: true } : undefined,
+      );
+      return;
+    }
     sendTimelineReplayError(serverLink, sessionName, requestId, TIMELINE_REQUEST_ERROR_REASONS.INTERNAL_ERROR);
   }
 }
@@ -7293,7 +7306,8 @@ async function buildTimelineHistoryOnMain(params: TimelineHistoryRequestParams):
     );
   } catch (err) {
     if (err instanceof TimelinePreferredReadError) {
-      return timelineHistoryErrorResult(err.source, err.reason);
+      const isRecoverable = TIMELINE_HISTORY_TRANSIENT_REASONS.has(err.reason) || isRecoverableTimelineRequestErrorReason(err.reason);
+      return timelineHistoryErrorResult(err.source, err.reason, isRecoverable ? { recoverable: true } : undefined);
     }
     throw err;
   }
@@ -7314,7 +7328,8 @@ async function buildTimelineHistoryOnMain(params: TimelineHistoryRequestParams):
       );
     } catch (err) {
       if (err instanceof TimelinePreferredReadError) {
-        return timelineHistoryErrorResult(err.source, err.reason);
+        const isRecoverable = TIMELINE_HISTORY_TRANSIENT_REASONS.has(err.reason) || isRecoverableTimelineRequestErrorReason(err.reason);
+        return timelineHistoryErrorResult(err.source, err.reason, isRecoverable ? { recoverable: true } : undefined);
       }
       throw err;
     }

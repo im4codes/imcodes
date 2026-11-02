@@ -293,7 +293,7 @@ function timelineResponseMetadata(response: Record<string, unknown>, visibleEven
   for (const key of ['payloadBytes', 'actualPayloadBytes', 'droppedEvents', 'truncatedEvents'] as const) {
     if (typeof response[key] === 'number' && Number.isFinite(response[key])) metadata[key] = response[key];
   }
-  for (const key of ['payloadTruncated', 'cursorReset'] as const) {
+  for (const key of ['payloadTruncated', 'cursorReset', 'recoverable'] as const) {
     if (typeof response[key] === 'boolean') metadata[key] = response[key];
   }
   if (Array.isArray(response.detailRefs)) {

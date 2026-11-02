@@ -568,6 +568,27 @@ describe('Watch routes', () => {
     }));
   });
 
+  it('GET /api/server/:id/timeline/history/full preserves recoverable flag for transient error responses', async () => {
+    mockRequestTimelineHistory.mockResolvedValue({
+      epoch: 11,
+      events: [],
+      hasMore: false,
+      status: 'error',
+      errorReason: 'projection_busy',
+      recoverable: true,
+      payloadBytes: 2,
+    });
+
+    const app = await buildTestApp();
+    const res = await app.request('/api/server/srv-1/timeline/history/full?sessionName=deck_proj_brain&limit=50');
+
+    expect(res.status).toBe(200);
+    const body = await res.json() as Record<string, unknown>;
+    expect(body.status).toBe('error');
+    expect(body.errorReason).toBe('projection_busy');
+    expect(body.recoverable).toBe(true);
+  });
+
   it('GET /api/server/:id/timeline/history/full clamps oversized pages to 200 events', async () => {
     mockRequestTimelineHistory.mockResolvedValue({
       epoch: 1,

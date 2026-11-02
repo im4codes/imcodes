@@ -836,6 +836,66 @@ describe('command-handler timeline history with SQLite-preferred reads', () => {
     }));
   });
 
+  it('returns recoverable ERROR/projection_busy when the main-thread read hits projection saturation', async () => {
+    getSessionMock.mockReturnValue({ name: 'deck_proj_busy_main', agentType: 'codex' });
+    shouldUseHistoryWorkerMock.mockReturnValue(false);
+    readByTypesPreferredMock.mockRejectedValue(
+      new TimelinePreferredReadError(
+        TIMELINE_HISTORY_ERROR_REASONS.PROJECTION_BUSY,
+        'main_sqlite',
+      ),
+    );
+
+    handleWebCommand({
+      type: TIMELINE_MESSAGES.HISTORY_REQUEST,
+      sessionName: 'deck_proj_busy_main',
+      requestId: 'hist-proj-busy-main',
+      limit: 50,
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: TIMELINE_MESSAGES.HISTORY,
+      sessionName: 'deck_proj_busy_main',
+      requestId: 'hist-proj-busy-main',
+      status: TIMELINE_RESPONSE_STATUS.ERROR,
+      errorReason: TIMELINE_HISTORY_ERROR_REASONS.PROJECTION_BUSY,
+      source: 'main_sqlite',
+      events: [],
+      recoverable: true,
+      hasMore: false,
+    }));
+  });
+
+  it('returns recoverable ERROR/projection_busy when epoch-reset replay hits projection saturation', async () => {
+    readPreferredMock.mockRejectedValue(
+      new TimelinePreferredReadError(
+        TIMELINE_HISTORY_ERROR_REASONS.PROJECTION_BUSY,
+        'main_sqlite',
+      ),
+    );
+
+    handleWebCommand({
+      type: TIMELINE_MESSAGES.REPLAY_REQUEST,
+      sessionName: 'deck_replay_busy',
+      requestId: 'replay-proj-busy',
+      afterSeq: 10,
+      epoch: 1,
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: TIMELINE_MESSAGES.REPLAY,
+      sessionName: 'deck_replay_busy',
+      requestId: 'replay-proj-busy',
+      status: TIMELINE_RESPONSE_STATUS.ERROR,
+      errorReason: TIMELINE_HISTORY_ERROR_REASONS.PROJECTION_BUSY,
+      source: 'error',
+      events: [],
+      recoverable: true,
+    }));
+  });
+
   it('returns OK/empty when there genuinely is no history — distinct from projection failure', async () => {
     getSessionMock.mockReturnValue({ name: 'deck_empty', agentType: 'codex' });
     shouldUseHistoryWorkerMock.mockReturnValue(false);
