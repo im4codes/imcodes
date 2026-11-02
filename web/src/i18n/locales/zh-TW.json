@@ -202,6 +202,8 @@
       "count": "{{count}} 個分享項目",
       "guideReturn": "返回 {{server}}",
       "guideDismiss": "知道了",
+      "openTimeout": "開啟分享存取逾時，請重試。",
+      "openFailed": "開啟分享存取失敗，請重試。",
       "kind": {
         "server": "伺服器",
         "tab": "標籤",

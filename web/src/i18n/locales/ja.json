@@ -202,6 +202,8 @@
       "count": "共有 {{count}} 件",
       "guideReturn": "{{server}} に戻る",
       "guideDismiss": "了解",
+      "openTimeout": "共有アクセスの開始がタイムアウトしました。もう一度お試しください。",
+      "openFailed": "共有アクセスを開けませんでした。もう一度お試しください。",
       "kind": {
         "server": "サーバー",
         "tab": "タブ",

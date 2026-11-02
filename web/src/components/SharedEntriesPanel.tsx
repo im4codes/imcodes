@@ -88,7 +88,10 @@ export function SharedEntriesPanel({ entries, loading = false, error = null, ope
                 key={entry.id}
                 class="shared-entry-row"
                 type="button"
-                onClick={() => onOpen(entry)}
+                onClick={() => {
+                  if (openingEntryId === entry.id) return;
+                  onOpen(entry);
+                }}
                 disabled={openingEntryId === entry.id}
               >
                 <span class="shared-entry-main">

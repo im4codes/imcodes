@@ -202,6 +202,8 @@
       "count": "공유 항목 {{count}}개",
       "guideReturn": "{{server}}로 돌아가기",
       "guideDismiss": "확인",
+      "openTimeout": "공유 접근 열기 시간이 초과되었습니다. 다시 시도해 주세요.",
+      "openFailed": "공유 접근을 열지 못했습니다. 다시 시도해 주세요.",
       "kind": {
         "server": "서버",
         "tab": "탭",

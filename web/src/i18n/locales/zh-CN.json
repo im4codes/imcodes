@@ -202,6 +202,8 @@
       "count": "{{count}} 项共享",
       "guideReturn": "返回 {{server}}",
       "guideDismiss": "知道了",
+      "openTimeout": "打开共享访问超时，请重试。",
+      "openFailed": "打开共享访问失败，请重试。",
       "kind": {
         "server": "服务器",
         "tab": "标签",

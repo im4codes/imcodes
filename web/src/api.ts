@@ -996,11 +996,67 @@ export interface OpenSharedEntryResponse {
   }>;
 }
 
-export async function openSharedEntry(target: ShareTarget): Promise<OpenSharedEntryResponse> {
-  return apiFetch<OpenSharedEntryResponse>('/api/shares/open', {
-    method: 'POST',
-    body: JSON.stringify({ target }),
-  });
+export class SharedOpenTimeoutError extends Error {
+  constructor(message = 'Shared entry open timed out') {
+    super(message);
+    this.name = 'SharedOpenTimeoutError';
+  }
+}
+
+export interface OpenSharedEntryOptions {
+  signal?: AbortSignal;
+  timeoutMs?: number;
+}
+
+export const DEFAULT_SHARED_ENTRY_OPEN_TIMEOUT_MS = 15_000;
+
+export async function openSharedEntry(
+  target: ShareTarget,
+  opts?: OpenSharedEntryOptions,
+): Promise<OpenSharedEntryResponse> {
+  const timeoutMs = opts?.timeoutMs ?? DEFAULT_SHARED_ENTRY_OPEN_TIMEOUT_MS;
+  const controller = new AbortController();
+  let timedOut = false;
+  let timer: ReturnType<typeof setTimeout> | null = null;
+
+  if (timeoutMs > 0 && Number.isFinite(timeoutMs)) {
+    timer = setTimeout(() => {
+      timedOut = true;
+      controller.abort(new SharedOpenTimeoutError());
+    }, timeoutMs);
+  }
+
+  const parentSignal = opts?.signal;
+  let onParentAbort: (() => void) | null = null;
+  if (parentSignal) {
+    if (parentSignal.aborted) {
+      if (timer !== null) clearTimeout(timer);
+      controller.abort(parentSignal.reason);
+      throw parentSignal.reason ?? new DOMException('This operation was aborted', 'AbortError');
+    }
+    onParentAbort = () => {
+      controller.abort(parentSignal.reason);
+    };
+    parentSignal.addEventListener('abort', onParentAbort, { once: true });
+  }
+
+  try {
+    return await apiFetch<OpenSharedEntryResponse>('/api/shares/open', {
+      method: 'POST',
+      body: JSON.stringify({ target }),
+      signal: controller.signal,
+    });
+  } catch (err) {
+    if (timedOut) {
+      throw new SharedOpenTimeoutError();
+    }
+    throw err;
+  } finally {
+    if (timer !== null) clearTimeout(timer);
+    if (parentSignal && onParentAbort) {
+      parentSignal.removeEventListener('abort', onParentAbort);
+    }
+  }
 }
 
 function isRetryableNonceExchangeError(error: unknown): boolean {

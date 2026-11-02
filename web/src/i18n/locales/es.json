@@ -202,6 +202,8 @@
       "count": "{{count}} elementos compartidos",
       "guideReturn": "Volver a {{server}}",
       "guideDismiss": "Entendido",
+      "openTimeout": "Se agotó el tiempo para abrir el acceso compartido. Inténtalo de nuevo.",
+      "openFailed": "No se pudo abrir el acceso compartido. Inténtalo de nuevo.",
       "kind": {
         "server": "Servidor",
         "tab": "Pestaña",
