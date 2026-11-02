@@ -647,8 +647,11 @@ html.native-ios-mac .chat-dl-btn {
   .shared-return-guide { top: calc(env(safe-area-inset-top, 0px) + 50px); left: 10px; right: auto; width: min(270px, calc(100vw - 20px)); }
   .shared-return-guide::before { top: -8px; left: 24px; transform: rotate(135deg); }
 }
-.mobile-server-menu-shared { grid-column: 1 / -1; min-width: 0; border-top: 1px solid #334155; padding: 6px 0; overflow: hidden; }
-.mobile-server-menu-shared .shared-entries-list { max-height: none; overflow-y: visible; }
+.mobile-server-menu-shared { grid-column: 1 / -1; min-width: 0; border-top: 1px solid #334155; padding: 6px 0; overflow: visible; }
+/* One scroll owner: shared entries must contribute their full height to the menu. */
+.mobile-server-menu-shared .shared-entries-list { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); max-height: none; overflow: visible; scrollbar-gutter: auto; padding-inline-end: 0; }
+.mobile-server-menu-shared .shared-entry-row { flex-direction: column; align-items: stretch; justify-content: flex-start; gap: 4px; padding: 7px 6px; }
+.mobile-server-menu-shared .shared-entry-meta { flex-direction: row; flex-wrap: wrap; align-items: center; gap: 2px 5px; max-width: 100%; font-size: 9px; }
 .mobile-server-menu-shared .shared-entries-panel { min-width: 0; margin: 0; border: 0; border-radius: 0; background: transparent; }
 .chat-shared-actor-label,
 .controls-queued-item-actor { display: inline-flex; align-items: center; max-width: 100%; color: #67e8f9; font-size: 10px; font-weight: 700; line-height: 1.2; letter-spacing: 0; opacity: 0.86; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -3432,12 +3435,12 @@ html.native-ios-mac .chat-dl-btn {
 .mobile-server-btn-chevron { width: 24px; height: 24px; border-radius: 8px; display: inline-flex; align-items: center; justify-content: center; flex: 0 0 auto; color: #67e8f9; background: rgba(15,23,42,0.52); }
 .mobile-server-actions { display: flex; gap: 5px; align-items: center; flex: 0 0 auto; }
 .mobile-server-backdrop { position: fixed; inset: 0; z-index: 6499; }
-.mobile-server-menu { position: absolute; top: calc(100% + 8px); left: 0; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); width: min(300px, calc(100vw - 18px)); height: calc(var(--mobile-server-menu-available-height, calc(100vh - 72px)) - 8px - env(safe-area-inset-bottom, 0px)); height: calc(var(--mobile-server-menu-available-height, calc(100dvh - 72px)) - 8px - env(safe-area-inset-bottom, 0px)); box-sizing: border-box; max-height: calc(var(--vvh, 100dvh) - var(--sat, 0px) - 68px - env(safe-area-inset-bottom, 0px)); padding-bottom: max(16px, env(safe-area-inset-bottom, 0px)); background: #1e293b; border: 1px solid rgba(125,211,252,0.20); border-radius: 12px; min-width: min(240px, calc(100vw - 18px)); box-shadow: 0 14px 34px #00000090, 0 0 20px rgba(34,211,238,0.10); z-index: 50; overflow-x: hidden; overflow-y: auto; -webkit-overflow-scrolling: touch; overscroll-behavior: contain; scrollbar-width: thin; scrollbar-color: rgba(125, 211, 252, 0.28) transparent; }
+.mobile-server-menu { position: absolute; top: calc(100% + 8px); left: 0; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); grid-auto-rows: max-content; align-content: start; width: min(300px, calc(100vw - 18px)); height: calc(var(--mobile-server-menu-available-height, calc(100vh - 72px)) - 8px - env(safe-area-inset-bottom, 0px)); height: calc(var(--mobile-server-menu-available-height, calc(100dvh - 72px)) - 8px - env(safe-area-inset-bottom, 0px)); box-sizing: border-box; max-height: calc(var(--vvh, 100dvh) - var(--sat, 0px) - 68px - env(safe-area-inset-bottom, 0px)); padding-bottom: max(16px, env(safe-area-inset-bottom, 0px)); background: #1e293b; border: 1px solid rgba(125,211,252,0.20); border-radius: 12px; min-width: min(240px, calc(100vw - 18px)); box-shadow: 0 14px 34px #00000090, 0 0 20px rgba(34,211,238,0.10); z-index: 50; overflow-x: hidden; overflow-y: auto; -webkit-overflow-scrolling: touch; overscroll-behavior: contain; scrollbar-width: thin; scrollbar-color: rgba(125, 211, 252, 0.28) transparent; }
 .mobile-server-menu::-webkit-scrollbar { width: 5px; }
 .mobile-server-menu::-webkit-scrollbar-track { background: transparent; }
 .mobile-server-menu::-webkit-scrollbar-thumb { background: rgba(125, 211, 252, 0.28); border-radius: 999px; }
 .mobile-server-menu-item { display: flex; align-items: center; gap: 7px; grid-column: 1 / -1; width: 100%; min-width: 0; padding: 10px 14px; background: none; border: none; color: #cbd5e1; font-size: 13px; font-family: inherit; text-align: left; cursor: pointer; }
-.mobile-server-menu-server { grid-column: auto; }
+.mobile-server-menu-server { grid-column: auto; padding-inline: 6px; gap: 5px; }
 .mobile-server-menu-name { min-width: 0; flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .mobile-server-menu-item > .share-state-indicator { margin-left: auto; flex: 0 0 auto; }
 .mobile-server-menu-item:hover, .mobile-server-menu-item:active { background: #334155; }
@@ -3450,9 +3453,6 @@ html.native-ios-mac .chat-dl-btn {
 .mobile-server-menu-language { grid-column: 1 / -1; min-width: 0; }
 .controls-task-pair-title { min-width: 0; flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 500; color: #e2e8f0; }
 .controls-task-pair-status-badge { flex: 0 1 auto; min-width: 0; max-width: 42%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding: 1px 6px; border: 1px solid rgb(125 211 252 / 28%); border-radius: 999px; background: rgb(15 23 42 / 64%); color: #bae6fd; font-size: 10px; line-height: 1.35; }
-@media (min-width: 380px) {
-  .mobile-server-menu { grid-template-columns: repeat(3, minmax(0, 1fr)); }
-}
 .layout-mobile .sidebar { display: none; }
 .layout-mobile .mobile-server-bar { display: flex; }
 .layout-mobile .mobile-sidebar-toggle { display: block; }
