@@ -150,12 +150,12 @@ describe('useTimeline — history recovery and error clearing contract', () => {
     const inFlightFetch = deferred<unknown>();
     fetchSpy.mockImplementation(() => inFlightFetch.promise);
 
-    // User taps ↻ (forceRefresh). The previous error MUST be cleared immediately during refresh
+    // User taps ↻ (forceRefresh). Refresh is initiated.
     await act(async () => {
       timeline!.forceRefresh();
     });
 
-    expect(timeline!.historyStatus.response).toBeNull();
+    expect(timeline!.refreshing).toBe(true);
 
     // Now resolve the refresh successfully
     await act(async () => {
@@ -493,5 +493,224 @@ describe('useTimeline — history recovery and error clearing contract', () => {
 
     expect(timeline!.events.some((e) => e.eventId === event.eventId)).toBe(true);
     expect(timeline!.historyStatus.response?.state).not.toBe('error');
+  });
+
+  describe('audit regression & boundary invariants', () => {
+    beforeEach(() => {
+      __resetTimelineCacheForTests();
+      cleanup();
+      fetchSpy.mockReset();
+      vi.useFakeTimers({ shouldAdvanceTime: true });
+    });
+
+    afterEach(() => {
+      cleanup();
+      vi.useRealTimers();
+      vi.restoreAllMocks();
+    });
+
+    function auditEvent(session: string, id = 'good', ts = 1000) {
+      return {
+        eventId: session + id,
+        sessionId: session,
+        ts,
+        epoch: 1,
+        seq: 1,
+        source: 'daemon',
+        confidence: 'high',
+        type: 'assistant.text',
+        payload: { text: id },
+      } as any;
+    }
+
+    function auditFixture(session: string) {
+      let timeline: any;
+      let handler: any;
+      let n = 0;
+      const ws: any = {
+        connected: true,
+        onMessage: (cb: any) => {
+          handler = cb;
+          return () => { handler = null; };
+        },
+        sendTimelineHistoryRequest: vi.fn(() => `r${++n}`),
+      };
+      function Probe(props: { session: string }) {
+        timeline = useTimeline(props.session, ws, 'audit-server');
+        return h('div', null, props.session);
+      }
+      const rendered = render(h(Probe, { session }));
+      return {
+        get tl() { return timeline; },
+        get handler() { return handler; },
+        get rid() { return `r${n}`; },
+        ws,
+        switchTo: (s: string) => rendered.rerender(h(Probe, { session: s })),
+      };
+    }
+
+    it('audit: a newer daemon error must not be cleared by an earlier successful HTTP round', async () => {
+      const s = 'audit-newer-error';
+      ingestTimelineEventForCache(auditEvent(s), 'audit-server');
+      fetchSpy.mockResolvedValue({ events: [], epoch: 1, hasMore: false, nextCursor: null });
+      const f = auditFixture(s);
+      await waitFor(() => expect(f.ws.sendTimelineHistoryRequest).toHaveBeenCalled());
+      await act(async () => {
+        f.handler({ type: 'timeline.history', sessionName: s, requestId: f.rid, epoch: 1, events: [auditEvent(s)] });
+        await vi.advanceTimersByTimeAsync(300);
+      });
+      await act(async () => {
+        f.tl.forceRefresh();
+        await vi.advanceTimersByTimeAsync(100);
+      });
+      await act(async () => {
+        f.handler({
+          type: 'timeline.history',
+          sessionName: s,
+          requestId: f.rid,
+          epoch: 1,
+          events: [],
+          status: 'error',
+          errorReason: TIMELINE_HISTORY_ERROR_REASONS.QUEUE_FULL,
+          recoverable: false,
+        });
+        await vi.advanceTimersByTimeAsync(50);
+      });
+      expect(f.tl.historyStatus.response?.state).toBe('error');
+    });
+
+    it('audit: a payload-truncated HTTP page must not clear a real history error as recovered', async () => {
+      const s = 'audit-incomplete';
+      ingestTimelineEventForCache(auditEvent(s), 'audit-server');
+      const pending = deferred<any>();
+      fetchSpy.mockImplementation(() => pending.promise);
+      const f = auditFixture(s);
+      await waitFor(() => expect(f.ws.sendTimelineHistoryRequest).toHaveBeenCalled());
+      await act(async () => {
+        f.handler({
+          type: 'timeline.history',
+          sessionName: s,
+          requestId: f.rid,
+          epoch: 1,
+          events: [],
+          status: 'error',
+          errorReason: TIMELINE_HISTORY_ERROR_REASONS.DEADLINE_EXCEEDED,
+          recoverable: false,
+        });
+        await vi.advanceTimersByTimeAsync(250);
+      });
+      expect(f.tl.historyStatus.response?.state).toBe('error');
+      await act(async () => {
+        pending.resolve({
+          events: [auditEvent(s, 'partial', 2000)],
+          epoch: 1,
+          hasMore: true,
+          payloadTruncated: true,
+          nextCursor: null,
+        });
+        await vi.advanceTimersByTimeAsync(50);
+      });
+      expect(f.tl.historyStatus.response?.state).toBe('error');
+    });
+
+    it('audit: old-scope completion must not end the current foreground HTTP refresh', async () => {
+      const a = 'audit-scope-a';
+      const b = 'audit-scope-b';
+      for (const s of [a, b]) ingestTimelineEventForCache(auditEvent(s), 'audit-server');
+      const pa = deferred<any>();
+      const pb = deferred<any>();
+      fetchSpy.mockImplementation((_server: any, s: any) => (s === a ? pa.promise : pb.promise));
+      const f = auditFixture(a);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(50);
+        f.tl.forceRefresh();
+        await vi.advanceTimersByTimeAsync(50);
+      });
+      f.switchTo(b);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(50);
+        f.tl.forceRefresh();
+        await vi.advanceTimersByTimeAsync(50);
+      });
+      await act(async () => {
+        f.handler({ type: 'timeline.history', sessionName: b, requestId: f.rid, epoch: 1, events: [auditEvent(b)] });
+        await vi.advanceTimersByTimeAsync(20);
+      });
+      expect(f.tl.refreshing).toBe(true);
+      await act(async () => {
+        pa.resolve({ events: [], epoch: 1, hasMore: false, nextCursor: null });
+        await vi.advanceTimersByTimeAsync(50);
+      });
+      expect(f.tl.refreshing).toBe(true);
+
+      // Settle B's HTTP fetch
+      await act(async () => {
+        pb.resolve({ events: [], epoch: 1, hasMore: false, nextCursor: null });
+        await vi.advanceTimersByTimeAsync(50);
+      });
+      expect(f.tl.refreshing).toBe(false);
+    });
+
+    it('audit: A -> B -> A navigation isolates old generation from current session', async () => {
+      const a = 'audit-scope-revisit-a';
+      const b = 'audit-scope-revisit-b';
+      for (const s of [a, b]) ingestTimelineEventForCache(auditEvent(s), 'audit-server');
+      const paOld = deferred<any>();
+      const pb = deferred<any>();
+      const paNew = deferred<any>();
+      let aCallCount = 0;
+      fetchSpy.mockImplementation((_server: any, s: any) => {
+        if (s === a) {
+          aCallCount++;
+          return aCallCount === 1 ? paOld.promise : paNew.promise;
+        }
+        return pb.promise;
+      });
+
+      // Generation 1: A
+      const f = auditFixture(a);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(50);
+        f.tl.forceRefresh();
+        await vi.advanceTimersByTimeAsync(50);
+      });
+
+      // Generation 2: B
+      f.switchTo(b);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(50);
+      });
+
+      // Generation 3: Back to A
+      f.switchTo(a);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(50);
+        f.tl.forceRefresh();
+        await vi.advanceTimersByTimeAsync(50);
+      });
+
+      // A's generation 3 WS completes, but A's generation 3 HTTP is still pending
+      await act(async () => {
+        f.handler({ type: 'timeline.history', sessionName: a, requestId: f.rid, epoch: 1, events: [auditEvent(a)] });
+        await vi.advanceTimersByTimeAsync(20);
+      });
+      expect(f.tl.refreshing).toBe(true);
+
+      // Now generation 1 of A finally resolves late
+      await act(async () => {
+        paOld.resolve({ events: [], epoch: 1, hasMore: false, nextCursor: null });
+        await vi.advanceTimersByTimeAsync(50);
+      });
+
+      // Must NOT terminate generation 3's in-flight refresh!
+      expect(f.tl.refreshing).toBe(true);
+
+      // Settle generation 3's HTTP
+      await act(async () => {
+        paNew.resolve({ events: [], epoch: 1, hasMore: false, nextCursor: null });
+        await vi.advanceTimersByTimeAsync(50);
+      });
+      expect(f.tl.refreshing).toBe(false);
+    });
   });
 });

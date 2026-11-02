@@ -2478,6 +2478,8 @@ export function useTimeline(
   ));
   const loadingOlderRef = useRef(false); // Synchronous guard against duplicate pagination requests
   const httpBackfillInFlightRef = useRef<Record<HttpBackfillMode, number>>(createHttpBackfillCountState());
+  const scopeGenerationRef = useRef<number>(0);
+  const errorSequenceRef = useRef<number>(0);
   const httpBackfillTimerRef = useRef<Record<HttpBackfillMode, ReturnType<typeof setTimeout> | null>>(createHttpBackfillTimerState());
   const httpBackfillTimerDueAtRef = useRef<Record<HttpBackfillMode, number>>(createHttpBackfillDueAtState());
   const epochRef = useRef<number>(0);
@@ -2556,6 +2558,9 @@ export function useTimeline(
     phase?: Exclude<TimelineHistoryPhase, 'idle'>,
   ) => {
     const response = createTimelineHistoryResponseNotice(msg);
+    if (response?.state === 'error') {
+      errorSequenceRef.current += 1;
+    }
     setHistoryStatus((prev) => ({
       ...prev,
       phase: phase ?? prev.phase,
@@ -2796,6 +2801,7 @@ export function useTimeline(
     // history branch).
     newerCursorKeyRef.current = null;
     if (!sessionId) {
+      scopeGenerationRef.current += 1;
       setLoading(false);
       setHttpRefreshing(false);
       setHistoryStatus(createIdleHistoryStatus());
@@ -2809,6 +2815,7 @@ export function useTimeline(
       return;
     }
     if (disableHistory) {
+      scopeGenerationRef.current += 1;
       setEvents([]);
       setLoading(false);
       setRefreshing(false);
@@ -2826,6 +2833,7 @@ export function useTimeline(
       return;
     }
 
+    scopeGenerationRef.current += 1;
     setRefreshing(false);
     setHttpRefreshing(false);
     // A new cacheKey means a new local store to account for, so the ledger must
@@ -4364,6 +4372,9 @@ export function useTimeline(
     const foregroundRound = visible && roundsChained === 0 && resumeBeforeTs === undefined;
     const backfillSessionId = sessionId;
     const backfillCacheKey = cacheKey;
+    const roundGeneration = scopeGenerationRef.current;
+    const roundStartedErrorSeq = errorSequenceRef.current;
+    const inFlightCounts = httpBackfillInFlightRef.current;
     const dueAt = Date.now() + Math.max(0, delayMs);
     if (mode === 'manualLatestWindow') clearHttpBackfillTimer('tail');
     if (httpBackfillTimerRef.current[mode] && httpBackfillTimerDueAtRef.current[mode] <= dueAt) {
@@ -4371,18 +4382,18 @@ export function useTimeline(
         sessionId: backfillSessionId,
         mode,
         hasTimer: true,
-        inFlight: httpBackfillInFlightRef.current[mode],
+        inFlight: inFlightCounts[mode],
       });
       if (foregroundRound) updateHistoryStep('http', 'running', phase);
       return;
     }
     if (httpBackfillTimerRef.current[mode]) clearHttpBackfillTimer(mode);
-    if (httpBackfillInFlightRef.current[mode] > 0) {
+    if (inFlightCounts[mode] > 0) {
       backfillDebug('fireHttpBackfill: coalesced', {
         sessionId: backfillSessionId,
         mode,
         hasTimer: false,
-        inFlight: httpBackfillInFlightRef.current[mode],
+        inFlight: inFlightCounts[mode],
       });
       if (foregroundRound) updateHistoryStep('http', 'running', phase);
       return;
@@ -4391,7 +4402,7 @@ export function useTimeline(
     httpBackfillTimerRef.current[mode] = setTimeout(() => {
       httpBackfillTimerRef.current[mode] = null;
       httpBackfillTimerDueAtRef.current[mode] = 0;
-      if (cacheKeyRef.current !== backfillCacheKey) return;
+      if (scopeGenerationRef.current !== roundGeneration || cacheKeyRef.current !== backfillCacheKey) return;
       // A recorded hole is unfinished work, whatever the last successful catch-up says.
       if (backfillCacheKey && cooldownMs > 0 && !getTimelineGap(backfillCacheKey)) {
         const lastOk = lastHttpBackfillResponseAt.get(backfillCacheKey);
@@ -4460,7 +4471,7 @@ export function useTimeline(
       const maxPages = foregroundRound || mode === 'manualLatestWindow' || !hadLocalEvents ? 1 : undefined;
       backfillDebug('fireHttpBackfill: requesting', { sessionId: backfillSessionId, phase, mode, afterTs, retryAttempt });
       if (foregroundRound) {
-        httpBackfillInFlightRef.current[mode] += 1;
+        inFlightCounts[mode] += 1;
         updateHistoryStep('http', 'running', phase);
         setHttpRefreshing(true);
       }
@@ -4501,7 +4512,7 @@ export function useTimeline(
               return page;
             },
             mergePage: async (events) => {
-              if (cacheKeyRef.current !== backfillCacheKey) return { candidateCount: 0, minTs: null, maxTs: null };
+              if (scopeGenerationRef.current !== roundGeneration || cacheKeyRef.current !== backfillCacheKey) return { candidateCount: 0, minTs: null, maxTs: null };
               const recovered = events.filter(
                 (ev): ev is TimelineEvent => !!ev && typeof ev === 'object'
                   && typeof (ev as TimelineEvent).eventId === 'string'
@@ -4530,7 +4541,7 @@ export function useTimeline(
               // blocks input and first paint across every mounted pane.
               const APPLY_CHUNK = 20;
               for (let offset = 0; offset < recovered.length; offset += APPLY_CHUNK) {
-                if (cacheKeyRef.current !== backfillCacheKey) return { candidateCount: 0, minTs: null, maxTs: null };
+                if (scopeGenerationRef.current !== roundGeneration || cacheKeyRef.current !== backfillCacheKey) return { candidateCount: 0, minTs: null, maxTs: null };
                 const chunk = recovered.slice(offset, offset + APPLY_CHUNK);
                 mergeEvents(chunk, wideMerge ? MAX_HISTORY_EVENTS : undefined);
                 for (const recoveredEvent of chunk) {
@@ -4598,6 +4609,7 @@ export function useTimeline(
               sessionId: backfillSessionId, roundsChained: roundsChained + 1,
             });
             setTimeout(() => {
+              if (scopeGenerationRef.current !== roundGeneration || cacheKeyRef.current !== backfillCacheKey) return;
               fireHttpBackfillRef.current(0, {
                 ...opts,
                 visible: false,
@@ -4615,6 +4627,7 @@ export function useTimeline(
               const delay = HTTP_BACKFILL_RETRY_DELAYS_MS[retryAttempt];
               backfillDebug('fireHttpBackfill: null result → retry', { sessionId: backfillSessionId, retryAttempt: retryAttempt + 1, delayMs: delay });
               setTimeout(() => {
+                if (scopeGenerationRef.current !== roundGeneration || cacheKeyRef.current !== backfillCacheKey) return;
                 fireHttpBackfillRef.current(0, { ...opts, _retryAttempt: retryAttempt + 1 });
               }, delay);
             } else {
@@ -4642,6 +4655,7 @@ export function useTimeline(
               sessionId: backfillSessionId, roundsChained: roundsChained + 1, resumeBeforeTs: nextResumeBeforeTs,
             });
             setTimeout(() => {
+              if (scopeGenerationRef.current !== roundGeneration || cacheKeyRef.current !== backfillCacheKey) return;
               fireHttpBackfillRef.current(0, {
                 ...opts,
                 visible: false,
@@ -4664,7 +4678,9 @@ export function useTimeline(
           /* opportunistic — WS path is primary */
         }
         finally {
-          if (holdsGapFiller && backfillCacheKey) gapBackfillInFlight.delete(backfillCacheKey);
+          if (holdsGapFiller && backfillCacheKey && scopeGenerationRef.current === roundGeneration) {
+            gapBackfillInFlight.delete(backfillCacheKey);
+          }
           if (gate) {
             gate.inFlight = Math.max(0, gate.inFlight - 1);
             if (terminal === 'error' || terminal === 'transient_null') {
@@ -4673,53 +4689,57 @@ export function useTimeline(
                 BACKGROUND_BACKFILL_FAILURE_BACKOFF_BASE_MS * 2 ** (gate.failureStreak - 1),
                 BACKGROUND_BACKFILL_FAILURE_BACKOFF_MAX_MS,
               );
-            } else if (terminal !== null) {
+            } else if (terminal === 'caught_up') {
               gate.failureStreak = 0;
               gate.nextAllowedAt = 0;
             }
           }
-          if (cacheKeyRef.current === backfillCacheKey) {
-            if (foregroundRound) {
-              httpBackfillInFlightRef.current[mode] = Math.max(0, httpBackfillInFlightRef.current[mode] - 1);
-              // The foreground contract ends when the newest page settles.
-              // Continuation rounds are intentionally invisible and must not
-              // leave a permanent spinner on a chat that already has content.
-              const foregroundState = terminal === 'transient_null'
-                ? (retryAttempt >= HTTP_BACKFILL_RETRY_DELAYS_MS.length ? 'offline' : 'pending')
-                : terminal === 'error' ? 'offline' : 'done';
-              updateHistoryStep('http', foregroundState, phase);
-              if (terminal === 'caught_up' || (outcome && outcome.totalNew > 0)) {
-                // Succeeded: clear any stale error notice
+          if (foregroundRound) {
+            inFlightCounts[mode] = Math.max(0, inFlightCounts[mode] - 1);
+            if (
+              scopeGenerationRef.current === roundGeneration
+              && httpBackfillInFlightRef.current === inFlightCounts
+            ) {
+              if (totalHttpBackfillInFlight(inFlightCounts) === 0) setHttpRefreshing(false);
+            }
+          }
+        }
+        if (
+          scopeGenerationRef.current === roundGeneration
+          && cacheKeyRef.current === backfillCacheKey
+        ) {
+          if (foregroundRound) {
+            const foregroundState = terminal === 'transient_null'
+              ? (retryAttempt >= HTTP_BACKFILL_RETRY_DELAYS_MS.length ? 'offline' : 'pending')
+              : terminal === 'error' ? 'offline' : 'done';
+            updateHistoryStep('http', foregroundState, phase);
+            if (terminal === 'caught_up') {
+              if (errorSequenceRef.current === roundStartedErrorSeq) {
                 setHistoryStatus((prev) => (prev.response?.state === 'error' ? { ...prev, response: null } : prev));
-              } else if (
-                terminal === 'error'
-                || (terminal === 'transient_null' && retryAttempt >= HTTP_BACKFILL_RETRY_DELAYS_MS.length)
-              ) {
-                // Failed: if the daemon is not currently done / healthy, record the error notice so
-                // true un-synced state is visible to the user rather than falsely cleared or hidden.
-                setHistoryStatus((prev) => {
-                  if (prev.steps.daemon === 'done' && prev.response?.state !== 'error') return prev;
-                  return {
-                    ...prev,
-                    response: {
-                      state: 'error',
-                      i18nKey: 'chat.timelineStatus.error',
-                      localizedMessage: localizedTimelineNotice('chat.timelineStatus.error'),
-                      recoverable: true,
-                      source: 'http',
-                    },
-                  };
-                });
               }
-              if (totalHttpBackfillInFlight(httpBackfillInFlightRef.current) === 0) setHttpRefreshing(false);
-            } else if (terminal === 'caught_up' || (outcome && outcome.totalNew > 0)) {
-              // Background round caught up or merged: also clear stale error notice
+            } else if (
+              terminal === 'error'
+              || (terminal === 'transient_null' && retryAttempt >= HTTP_BACKFILL_RETRY_DELAYS_MS.length)
+            ) {
+              errorSequenceRef.current += 1;
+              setHistoryStatus((prev) => {
+                if (prev.steps.daemon === 'done' && prev.response?.state !== 'error') return prev;
+                return {
+                  ...prev,
+                  response: {
+                    state: 'error',
+                    i18nKey: 'chat.timelineStatus.error',
+                    localizedMessage: localizedTimelineNotice('chat.timelineStatus.error'),
+                    recoverable: true,
+                    source: 'http',
+                  },
+                };
+              });
+            }
+          } else if (terminal === 'caught_up') {
+            if (errorSequenceRef.current === roundStartedErrorSeq) {
               setHistoryStatus((prev) => (prev.response?.state === 'error' ? { ...prev, response: null } : prev));
             }
-          } else if (foregroundRound) {
-            // Scope switched mid-flight: clean up in-flight counters without corrupting the new session's state
-            httpBackfillInFlightRef.current[mode] = Math.max(0, httpBackfillInFlightRef.current[mode] - 1);
-            if (totalHttpBackfillInFlight(httpBackfillInFlightRef.current) === 0) setHttpRefreshing(false);
           }
         }
       })();
@@ -4840,8 +4860,6 @@ export function useTimeline(
     // i.e. when the HTTP path is a no-op), then opportunistically catch up
     // over HTTP.
     void reloadLocalTimeline();
-    // Explicit manual retry resets any previous error notice so the user sees a clean refresh attempt:
-    setHistoryStatus((prev) => (prev.response ? { ...prev, response: null } : prev));
     // HTTP may be unavailable while the live daemon socket is healthy (for
     // example before serverId resolution). Force a newest-window daemon read
     // too; deliberately omit afterTs so one newly-sent/live event cannot hide
@@ -5736,16 +5754,13 @@ export function useTimeline(
       // request will be made), because a blanket `skipped` cannot tell a
       // waiting timeline from one that was never going to fetch.
       if (prev.steps.daemon === 'pending' || prev.steps.daemon === 'offline') return prev;
-      const hasSuccessfulSync = prev.steps.daemon === 'done' || prev.steps.http === 'done';
-      const responseToKeep = hasSuccessfulSync && prev.response?.state === 'error' && prev.steps.http === 'done'
-        ? null
-        : prev.response;
-      return { ...createIdleHistoryStatus(), response: responseToKeep };
+      return { ...createIdleHistoryStatus(), response: prev.response };
     });
   }, [httpRefreshing, loading, loadingOlder, refreshing]);
 
   useEffect(() => {
     return () => {
+      scopeGenerationRef.current += 1;
       if (daemonWaitTimerRef.current) {
         clearTimeout(daemonWaitTimerRef.current);
         daemonWaitTimerRef.current = null;
