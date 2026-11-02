@@ -1,3 +1,4 @@
+import { TASK_PAIR_DECISION_BRAIN_NOTICE_REASON } from '../../../shared/task-pair-decision.js';
 import { isTerminalTaskPairStatus, TASK_PAIR_ENDED_PAIR_NOTICE_REASONS, TASK_PAIR_NUDGE_ID_PREFIX } from '../../../shared/task-pair.js';
 import { isTaskPairSuspended, TASK_PAIR_DEPENDENCY_FAILURE_REASON, TASK_PAIR_RESUME_REASON, TASK_PAIR_WAKE_BINDING_TAG, type TaskPairWakeBinding } from '../../../shared/task-pair-suspension.js';
 import { getTaskPairStore } from './store.js';
@@ -7,12 +8,14 @@ export function pairWakeBindings(target: string, taskId: string): TaskPairWakeBi
     .filter((p) => taskId.startsWith('__') ? p.state.brain === target && !isTerminalTaskPairStatus(p.state.status) && !isTaskPairSuspended(p.state) : p.state.taskId === taskId)
     .map((p) => ({ project: p.project, taskId: p.state.taskId, epoch: p.state.scheduling?.epoch ?? 0 }));
 }
-export function pairWakeAllowed(bindings: TaskPairWakeBinding[], reason: string): boolean {
+export function pairWakeAllowed(bindings: TaskPairWakeBinding[], reason: string, target?: string): boolean {
   return bindings.every((b) => {
     const state = getTaskPairStore().getPair(b.project, b.taskId)?.state;
     if (!state || (state.scheduling?.epoch ?? 0) !== b.epoch) return false;
     if (TASK_PAIR_ENDED_PAIR_NOTICE_REASONS.includes(reason)) return true;
     if (isTerminalTaskPairStatus(state.status)) return false;
+    // Explicit human/decision input may reach Brain while workers stay suspended.
+    if (reason === TASK_PAIR_DECISION_BRAIN_NOTICE_REASON) return target === state.brain;
     if (reason === TASK_PAIR_DEPENDENCY_FAILURE_REASON) return true;
     if (reason === TASK_PAIR_RESUME_REASON) return !state.scheduling?.manual && !state.scheduling?.dependsOn.length;
     return !isTaskPairSuspended(state);
@@ -35,6 +38,6 @@ export function queuedPairWakeAllowed(sessionName: string, id: string): boolean 
       const s = getTaskPairStore().getPair(binding.project, binding.taskId)?.state;
       if (!s || ![s.brain, s.executor, s.auditor].includes(sessionName)) return false;
     }
-    return pairWakeAllowed(data.bindings, data.reason);
+    return pairWakeAllowed(data.bindings, data.reason, sessionName);
   } catch { return false; }
 }

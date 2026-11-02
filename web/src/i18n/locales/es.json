@@ -4758,6 +4758,32 @@
     "card_next_step": "Next step",
     "card_details_unavailable": "Detailed information was not provided; see the original notice below.",
     "card_no_blocking": "No blocking findings.",
-    "waiting_for_tasks": "Esperando: {{tasks}}"
+    "waiting_for_tasks": "Esperando: {{tasks}}",
+    "decision": {
+      "ask": "Pedir explicación a Brain",
+      "ask_message": "Explica el bloqueo, las opciones y la recomendación como solicitud de decisión.",
+      "ready": "Condiciones listas: revisar",
+      "ready_message": "Las condiciones están listas. Brain debe verificar y decidir si reanudar sin omitir dependencias ni auditoría.",
+      "wait": "Seguir esperando",
+      "wait_message": "Seguir esperando y conservar la pausa y las dependencias actuales.",
+      "title": "Decisión / bloqueo",
+      "missing": "No hay detalles del bloqueo. Añade información o pide a Brain la pregunta y las opciones.",
+      "recommendation": "Recomendación",
+      "feedback": "Comentarios",
+      "placeholder": "Añade condiciones, motivos o una pregunta para Brain…",
+      "send": "Enviar a Brain",
+      "sending": "Guardando…",
+      "sent": "Comentarios guardados y aviso en cola para Brain. Pendiente de decisión; la tarea no se reanuda automáticamente.",
+      "failed": "Error al enviar; puedes reintentar",
+      "history": "Historial de decisiones",
+      "ruling": "Decisión de Brain",
+      "resolved": "Resuelto",
+      "upgrade": "Actualiza o reconecta el daemon antes de enviar.",
+      "kind": {
+        "request": "Solicitud de decisión",
+        "feedback": "Comentarios humanos",
+        "decision": "Decisión de Brain"
+      }
+    }
   }
 }

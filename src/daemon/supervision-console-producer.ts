@@ -972,6 +972,8 @@ export class SupervisionConsoleProducer {
     for (const stored of pairs) {
       const entry = buildPairConsoleRow(stored, {
         inlineBrief,
+        latestDecision: getTaskPairStore().latestDecision(projectName, stored.state.taskId),
+        decisionRequest: getTaskPairStore().latestDecisionRequest(projectName, stored.state.taskId, Math.max(1, stored.state.round), stored.state.deliveryRound ?? 1),
         queuePosition: queuePositions.get(stored.state.taskId),
         resolvePresentation: this.#resolveSessionPresentation,
       });
@@ -1066,6 +1068,8 @@ export class SupervisionConsoleProducer {
         }
         const upsert = buildPairConsoleRow(stored, {
           inlineBrief: false,
+          latestDecision: store.latestDecision(scope.projectName, taskId),
+          decisionRequest: store.latestDecisionRequest(scope.projectName, taskId, Math.max(1, stored.state.round), stored.state.deliveryRound ?? 1),
           queuePosition: queuePositions.get(taskId),
           resolvePresentation: this.#resolveSessionPresentation,
         });

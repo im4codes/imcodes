@@ -1,3 +1,5 @@
+import { TASK_PAIR_DECISION_MSG } from '@shared/task-pair-decision.js';
+import { bindTaskPairDecisions, receiveTaskPairDecision } from './task-pair-decisions.js';
 import { DAEMON_MSG } from '@shared/daemon-events.js';
 import {
   SUPERVISION_CONSOLE_RESYNC_REASONS,
@@ -138,6 +140,7 @@ export class SupervisionTaskConsoleController {
   private automaticResyncs: number[] = [];
   /** Set at the cap; only an explicit Retry re-enables automatic resyncs. */
   private automaticResyncExhausted = false;
+  private unregisterDecisions: (() => void) | null = null;
   private unregisterBriefRequester: (() => void) | null = null;
 
   constructor(
@@ -180,6 +183,8 @@ export class SupervisionTaskConsoleController {
     this.clearResyncTimer();
     this.unregisterBriefRequester?.();
     this.unregisterBriefRequester = null;
+    this.unregisterDecisions?.();
+    this.unregisterDecisions = null;
     this.unsubscribeMessage?.();
     this.unsubscribeMessage = null;
   }
@@ -196,6 +201,7 @@ export class SupervisionTaskConsoleController {
     }
     this.connected = connected;
     if (!connected) {
+      this.unregisterDecisions?.(); this.unregisterDecisions = null;
       this.clearSubscribeTimeout();
       this.clearResyncTimer();
       this.apply({ type: 'transport_disconnected' });
@@ -346,6 +352,12 @@ export class SupervisionTaskConsoleController {
     // the newest subscription is the one brief requests must go through.
     this.unregisterBriefRequester?.();
     this.unregisterBriefRequester = setTaskPairBriefRequester((taskId) => this.requestBrief(taskId));
+    this.unregisterDecisions?.();
+    this.unregisterDecisions = bindTaskPairDecisions((input) => {
+      if (!this.connected || !this.state.subscriptionId) throw new Error('Decision connection unavailable');
+      this.socket.send({ ...input, scope: this.scope, subscriptionId: this.state.subscriptionId,
+        sessionName: this.scope.coordinatorSessionName });
+    });
     this.socket.send(frame);
     this.armSubscribeTimeout(subscriptionId);
   }
@@ -403,6 +415,11 @@ export class SupervisionTaskConsoleController {
     }
     if (message.type === SUPERVISION_TASK_CONSOLE_MSG.PAIR_DELTA) {
       this.apply({ type: 'pair_delta_received', payload: message, receivedAt: Date.now() });
+      return;
+    }
+    if (message.type === TASK_PAIR_DECISION_MSG.RESPONSE) {
+      if (message.subscriptionId !== this.state.subscriptionId || !isRecord(message.scope) || !sameScope(message.scope as unknown as SupervisionTaskConsoleScope, this.scope)) return;
+      if (typeof message.requestId === 'string') receiveTaskPairDecision(message.requestId, message.result);
       return;
     }
     if (message.type === SUPERVISION_TASK_CONSOLE_MSG.BRIEF_RESPONSE) {

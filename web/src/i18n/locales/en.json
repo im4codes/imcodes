@@ -4770,6 +4770,32 @@
     "card_next_step": "Next step",
     "card_details_unavailable": "Detailed information was not provided; see the original notice below.",
     "card_no_blocking": "No blocking findings.",
-    "waiting_for_tasks": "Waiting for: {{tasks}}"
+    "waiting_for_tasks": "Waiting for: {{tasks}}",
+    "decision": {
+      "ask": "Ask Brain to explain",
+      "ask_message": "State this task’s blocker, options and recommendation as a decision request.",
+      "ready": "Conditions ready: please review",
+      "ready_message": "Conditions are ready. Brain should verify and decide whether to resume, without bypassing dependencies or audit.",
+      "wait": "Keep waiting",
+      "wait_message": "Keep waiting and preserve the current pause and dependencies.",
+      "title": "Decision / blocker",
+      "missing": "No blocker details yet. Add feedback or ask Brain to state the question and options.",
+      "recommendation": "Recommendation",
+      "feedback": "Feedback",
+      "placeholder": "Add conditions, reasons, or a question for Brain…",
+      "send": "Send to Brain",
+      "sending": "Saving…",
+      "sent": "Feedback saved and notification queued for Brain. Awaiting a ruling; the task is not automatically resumed.",
+      "failed": "Feedback failed; retry is available",
+      "history": "Decision history",
+      "ruling": "Brain ruling",
+      "resolved": "Resolved",
+      "upgrade": "Upgrade or reconnect the daemon before sending feedback.",
+      "kind": {
+        "request": "Decision request",
+        "feedback": "Human feedback",
+        "decision": "Brain ruling"
+      }
+    }
   }
 }

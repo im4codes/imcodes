@@ -1,3 +1,4 @@
+import { TASK_PAIR_DECISION_LIMITS, validateTaskPairDecisionDetails, type TaskPairDecisionDetails } from '../../shared/task-pair-decision.js';
 import { readSessionTextMessages, readSessionSummaries, readSessionToolEvents, resolveHistorySession, canReadSessionHistory } from './session-history.js';
 import { SESSION_TEXT_HISTORY_DEFAULT_LIMIT, SESSION_TEXT_HISTORY_MAX_LIMIT, SESSION_HISTORY_KINDS } from '../../shared/session-history.js';
 import { pausePair, resumePair, initialPairWait, validatePairDependencies } from './task-pairs/suspension.js';
@@ -3446,7 +3447,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
     [MEMORY_MCP_TOOL_NAMES.PAIR_DECISION_RECORD]: async (input) => {
       const context = await pairCallerContext();
       if (context.status === 'error') return context.result;
-      const args = pickAllowedMcpArgs(input, ['taskId', 'kind', 'round', 'conclusion', 'summary', 'related', 'idempotencyKey']);
+      const args = pickAllowedMcpArgs(input, ['taskId', 'kind', 'round', 'conclusion', 'summary', 'related', 'idempotencyKey', 'question', 'options', 'recommendation', 'requestId', 'selectedOptionId', 'deliveryRound']);
       const taskId = stringArg(args, 'taskId')?.trim();
       if (!taskId) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'taskId is required');
       const stored = getTaskPairStore().getPair(context.project, taskId);
@@ -3466,12 +3467,20 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       if (!conclusion || !summary) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'conclusion and summary are required');
       if (conclusion.length > 500 || summary.length > 4000) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'conclusion or summary is too long');
       const related = Array.isArray(args.related) ? args.related.filter((value): value is string => typeof value === 'string' && value.trim().length > 0).map((value) => value.trim()).slice(0, 20) : undefined;
-      const result = taskPairService.recordDecision({
-        project: context.project, taskId, round, kind, conclusion, summary, author: caller.sessionName,
-        ...(related && related.length > 0 ? { related } : {}),
-        ...(stringArg(args, 'idempotencyKey')?.trim() ? { idempotencyKey: stringArg(args, 'idempotencyKey')!.trim() } : {}),
-      });
-      return { status: 'ok', created: result.created, decision: result.record, notified: result.notified };
+      const details = Object.fromEntries(['question', 'options', 'recommendation', 'requestId', 'selectedOptionId', 'deliveryRound']
+        .filter((key) => args[key] !== undefined).map((key) => [key, args[key]])) as TaskPairDecisionDetails;
+      try { validateTaskPairDecisionDetails(details); } catch (cause) {
+        return error(MCP_ERROR_REASONS.VALIDATION_FAILED, String(cause));
+      }
+      try {
+        const result = taskPairService.recordDecision({
+          ...details,
+          project: context.project, taskId, round, kind, conclusion, summary, author: caller.sessionName,
+          ...(related && related.length > 0 ? { related } : {}),
+          ...(stringArg(args, 'idempotencyKey')?.trim() ? { idempotencyKey: stringArg(args, 'idempotencyKey')!.trim() } : {}),
+        });
+        return { status: 'ok', created: result.created, decision: result.record, notified: result.notified };
+      } catch (cause) { return error(MCP_ERROR_REASONS.VALIDATION_FAILED, String(cause)); }
     },
     [MEMORY_MCP_TOOL_NAMES.PAIR_DECISION_HISTORY]: async (input) => {
       const context = await pairCallerContext();
@@ -5249,6 +5258,15 @@ const schemas = {
     taskId: z.string().trim().min(1),
     kind: z.enum(['request', 'decision']).optional(),
     round: z.number().int().positive(),
+    deliveryRound: z.number().int().positive().optional(),
+    question: z.string().max(TASK_PAIR_DECISION_LIMITS.QUESTION).optional(),
+    options: z.array(z.object({
+      id: z.string().min(1).max(100),
+      label: z.string().min(1).max(TASK_PAIR_DECISION_LIMITS.LABEL),
+    }).strict()).max(TASK_PAIR_DECISION_LIMITS.OPTIONS).optional(),
+    recommendation: z.string().max(TASK_PAIR_DECISION_LIMITS.QUESTION).optional(),
+    requestId: z.string().min(1).max(300).optional(),
+    selectedOptionId: z.string().min(1).max(100).optional(),
     conclusion: z.string().trim().min(1).max(500),
     summary: z.string().trim().min(1).max(4000),
     related: z.array(z.string().trim().min(1).max(200)).max(20).optional(),

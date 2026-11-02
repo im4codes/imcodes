@@ -1,3 +1,5 @@
+import { TASK_PAIR_DECISION_KIND, type TaskPairDecisionRecord } from '../../../shared/task-pair-decision.js';
+export type { TaskPairDecisionRecord } from '../../../shared/task-pair-decision.js';
 import { TASK_PAIR_SCHEDULING_FIELD, type TaskPairScheduling } from '../../../shared/task-pair-suspension.js';
 import { TASK_PAIR_TITLE_ACCESS_FIELD, type TaskPairTitleAccess } from '../../../shared/task-pair-title-access.js';
 /**
@@ -156,19 +158,6 @@ export interface TaskPairProjectSettings {
 }
 
 /** Durable Brain decisions attached to one task-pair round. */
-export interface TaskPairDecisionRecord {
-  id: string;
-  project: string;
-  taskId: string;
-  round: number;
-  kind: 'request' | 'decision';
-  conclusion: string;
-  summary: string;
-  author: string;
-  at: number;
-  related?: string[];
-  idempotencyKey?: string;
-}
 
 export interface TaskPairDecisionNotification {
   id: string;
@@ -377,6 +366,15 @@ export class TaskPairStore {
       );
       CREATE INDEX IF NOT EXISTS task_pair_decision_notifications_pending_idx ON task_pair_decision_notifications (delivered_at, last_attempt_at);
     `);
+    // Additive and restart-safe for databases created by older daemons.
+    const decisionColumns = this.#db.prepare('PRAGMA table_info(task_pair_decisions)').all() as Array<{ name: string }>;
+    if (!decisionColumns.some((column) => column.name === 'details_json')) {
+      try { this.#db.exec('ALTER TABLE task_pair_decisions ADD COLUMN details_json TEXT'); }
+      catch (error) {
+        const columns = this.#db.prepare('PRAGMA table_info(task_pair_decisions)').all() as Array<{ name: string }>;
+        if (!columns.some((column) => column.name === 'details_json')) throw error;
+      }
+    }
   }
 
   close(): void {
@@ -795,11 +793,13 @@ export class TaskPairStore {
     }
     const id = input.id ?? randomUUID();
     const result = this.#db.prepare(`
-      INSERT OR IGNORE INTO task_pair_decisions (id, project, task_id, round, kind, conclusion, summary, author, related_json, idempotency_key, at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT OR IGNORE INTO task_pair_decisions (id, project, task_id, round, kind, conclusion, summary, author, related_json, idempotency_key, at, details_json)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       id, input.project, input.taskId, input.round, input.kind, input.conclusion, input.summary, input.author,
       input.related ? JSON.stringify(input.related) : null, input.idempotencyKey ?? null, input.at,
+      JSON.stringify({ deliveryRound: input.deliveryRound, question: input.question, options: input.options, recommendation: input.recommendation,
+        requestId: input.requestId, selectedOptionId: input.selectedOptionId }),
     );
     const row = this.#db.prepare('SELECT * FROM task_pair_decisions WHERE id = ?').get(id) as Record<string, unknown> | undefined;
     if (row) return { record: decisionFromRow(row), created: Number(result.changes) > 0 };
@@ -811,6 +811,26 @@ export class TaskPairStore {
       if (raced) return { record: decisionFromRow(raced), created: false };
     }
     throw new Error('failed to persist task pair decision');
+  }
+
+  decisionById(project: string, taskId: string, id: string): TaskPairDecisionRecord | undefined {
+    const row = this.#db.prepare('SELECT * FROM task_pair_decisions WHERE project = ? AND task_id = ? AND id = ?').get(project, taskId, id) as Record<string, unknown> | undefined;
+    return row ? decisionFromRow(row) : undefined;
+  }
+
+  decisionByRetryKey(project: string, taskId: string, key: string): TaskPairDecisionRecord | undefined {
+    const row = this.#db.prepare('SELECT * FROM task_pair_decisions WHERE project = ? AND task_id = ? AND idempotency_key = ?').get(project, taskId, key) as Record<string, unknown> | undefined;
+    return row ? decisionFromRow(row) : undefined;
+  }
+
+  latestDecisionRequest(project: string, taskId: string, round: number, deliveryRound = 1): TaskPairDecisionRecord | undefined {
+    const row = this.#db.prepare("SELECT * FROM task_pair_decisions WHERE project = ? AND task_id = ? AND round = ? AND kind = 'request' AND COALESCE(json_extract(details_json, '$.deliveryRound'), 1) = ? ORDER BY at DESC, id DESC LIMIT 1").get(project, taskId, round, deliveryRound) as Record<string, unknown> | undefined;
+    return row ? decisionFromRow(row) : undefined;
+  }
+
+  isDecisionResolved(question: TaskPairDecisionRecord): boolean {
+    return !!this.#db.prepare("SELECT id FROM task_pair_decisions WHERE project = ? AND task_id = ? AND kind = 'decision' AND COALESCE(json_extract(details_json, '$.deliveryRound'), 1) = ? AND (json_extract(details_json, '$.requestId') = ? OR (round = ? AND at >= ?)) LIMIT 1")
+      .get(question.project, question.taskId, question.deliveryRound ?? 1, question.id, question.round, question.at);
   }
 
   latestDecision(project: string, taskId: string, round?: number): TaskPairDecisionRecord | undefined {
@@ -986,7 +1006,8 @@ function decisionFromRow(row: Record<string, unknown>): TaskPairDecisionRecord {
     project: String(row.project),
     taskId: String(row.task_id),
     round: Number(row.round),
-    kind: row.kind === 'request' ? 'request' : 'decision',
+    kind: row.kind === TASK_PAIR_DECISION_KIND.REQUEST ? TASK_PAIR_DECISION_KIND.REQUEST : row.kind === TASK_PAIR_DECISION_KIND.FEEDBACK ? TASK_PAIR_DECISION_KIND.FEEDBACK : TASK_PAIR_DECISION_KIND.DECISION,
+    ...(row.details_json ? JSON.parse(String(row.details_json)) : {}),
     conclusion: String(row.conclusion),
     summary: String(row.summary),
     author: String(row.author),

@@ -1,3 +1,4 @@
+import { TaskPairDecisionPanel } from './TaskPairDecisionPanel.js';
 import { taskPairWaitKind } from '@shared/task-pair-suspension.js';
 import { taskPairDisplayTitle, taskPairDisplaySessionLabel } from '@shared/task-pair-display.js';
 import type { ComponentChildren, RefObject } from 'preact';
@@ -141,7 +142,7 @@ export function SupervisionTaskPairSnapshotBridge(props: {
     // Cached projections are marked STALE and must not silently replace the
     // daemon's authoritative list.  Publish only a live, fully synced snapshot.
     if (state.hasAuthoritativeSnapshot && state.syncState === SUPERVISION_TASK_CONSOLE_SYNC_STATE.SYNCED) {
-      const detail = taskConsoleStateToPairSnapshot(state);
+      const detail = { ...taskConsoleStateToPairSnapshot(state), serverId: props.serverId };
       (window as Window & { __imcodesTaskPairSnapshot?: unknown }).__imcodesTaskPairSnapshot = detail;
       window.dispatchEvent(new CustomEvent('supervision:task-pairs', { detail }));
       return;
@@ -470,6 +471,7 @@ function TaskCard(props: {
           {auditor && <SessionButton assignment={auditor} taskStatus={props.task.status} taskTab={taskTab} lane="auditor" onNavigateSession={props.onNavigateSession} />}
         </div>
       </div>
+      {props.task.pair && <TaskPairDecisionPanel taskId={props.task.taskId} pair={props.task.pair} />}
       {props.task.pair && <TaskPairConsoleDetails pair={props.task.pair} taskId={props.task.taskId} />}
       {!props.task.pair && (props.task.blocker || props.task.currentAction || props.task.nextAction) && <div class="supervision-task-console-task-meta">
         {props.task.blocker && <span class="is-blocker">{props.task.blocker}</span>}

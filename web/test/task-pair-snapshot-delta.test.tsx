@@ -1,3 +1,8 @@
+// Daemon modules are exercised below: isolate all import-time logs and state.
+import '../../test/setup/isolated-home.js';
+import { taskPairService } from '../../src/daemon/task-pairs/service.js';
+import { setTaskPairDeliveryDepsForTests } from '../../src/daemon/task-pairs/delivery.js';
+import { TaskPairDecisionPanel } from '../src/components/TaskPairDecisionPanel.js';
 /**
  * @vitest-environment jsdom
  *
@@ -455,5 +460,36 @@ describe('TaskPairStatusPanel with revision-only briefs', () => {
     receiveTaskPairBrief('mine', 'rev-m', '- [x][ ] Mine it');
     await waitFor(() => expect(view.container.querySelector('.task-pair-brief-content')?.textContent).toContain('Mine it'));
     delete (window as any).__imcodesTaskPairSnapshot;
+  });
+});
+
+describe('task-bound human decision round trip', () => {
+  it('carries a card choice through the real controller/registry, persists it, and notifies the paused task Brain only', async () => {
+    const store = newStore(); setTaskPairStoreForTests(store);
+    save(store, 'decision-ui', { round: 1, flags: ['needs_input'], blockedNote: 'Which data source?',
+      scheduling: { epoch: 1, manual: true, dependsOn: ['predecessor'], writer: BRAIN, since: 1 } });
+    const notices: Array<{ target: string; text: string }> = [];
+    setTaskPairDeliveryDepsForTests({ send: async (target, text) => { notices.push({ target, text }); } });
+    const request = taskPairService.recordDecision({ project: PROJECT, taskId: 'decision-ui', round: 1,
+      kind: 'request', conclusion: 'Choose source', summary: 'Need approval', question: 'Which data source?',
+      options: [{ id: 'test', label: 'Approved test fixture' }], author: 'deck_sub_decision-ui_x' }).record;
+    const daemon = newDaemon(); const controller = viewer(daemon);
+    try {
+      const pair = controller.getState().tasks['decision-ui']!.pair!;
+      expect(pair.decisionRequest?.id).toBe(request.id);
+      render(<TaskPairDecisionPanel taskId="decision-ui" pair={pair} />);
+      fireEvent.input(screen.getByRole('textbox'), { target: { value: 'Test data only; do not touch real data' } });
+      fireEvent.click(screen.getByRole('button', { name: 'Approved test fixture' }));
+      await waitFor(() => expect(screen.getByRole('status')).toBeTruthy());
+      await taskPairService.waitForIdle();
+      expect(store.listDecisions(PROJECT, ['decision-ui'])[0]).toMatchObject({ kind: 'feedback', requestId: request.id,
+        selectedOptionId: 'test', summary: 'Test data only; do not touch real data' });
+      expect(notices.filter((notice) => notice.text.includes('Human feedback'))).toEqual([
+        expect.objectContaining({ target: BRAIN, text: expect.stringContaining('Which data source?') }),
+      ]);
+      expect(store.getPair(PROJECT, 'decision-ui')!.state.scheduling).toMatchObject({ manual: true, dependsOn: ['predecessor'] });
+    } finally {
+      controller.stop(); await taskPairService.waitForIdle(); setTaskPairDeliveryDepsForTests(undefined); daemon.db.close();
+    }
   });
 });

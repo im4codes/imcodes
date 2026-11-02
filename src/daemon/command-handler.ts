@@ -1,3 +1,4 @@
+import { TASK_PAIR_DECISION_MSG } from '../../shared/task-pair-decision.js';
 import { queuedUserMessageAttribution } from '../agent/transport-queued-user-message.js';
 /**
  * Handle commands from the web UI and inbound chat messages via ServerLink.
@@ -2463,6 +2464,8 @@ function dispatchWebCommand(cmd: Record<string, unknown>, serverLink: ServerLink
     case SUPERVISION_TASK_CONSOLE_MSG.SUBSCRIBE:
     case SUPERVISION_TASK_CONSOLE_MSG.UNSUBSCRIBE:
     case SUPERVISION_TASK_CONSOLE_MSG.ACK:
+    case TASK_PAIR_DECISION_MSG.HISTORY:
+    case TASK_PAIR_DECISION_MSG.FEEDBACK:
     case SUPERVISION_TASK_CONSOLE_MSG.BRIEF_REQUEST:
       // Already handled: createProductionSupervisionConsoleBinding (wired in
       // lifecycle.ts) registers its OWN serverLink.onMessage handler, and

@@ -1,3 +1,5 @@
+import { TaskPairDecisionPanel } from './TaskPairDecisionPanel.js';
+import type { SupervisionConsolePairInfo } from '@shared/supervision-task-console.js';
 import { taskPairWaitKind, readPairScheduling, TASK_PAIR_WAIT_KINDS, type TaskPairScheduling } from '@shared/task-pair-suspension.js';
 import { taskPairDisplayTitle, taskPairResolveDisplaySessionLabel } from '@shared/task-pair-display.js';
 import { isMobileLayout } from '../mobile-device.js';
@@ -325,6 +327,9 @@ export function TaskPairStatusPanel({ events, sessions, serverId, scopeSessionId
           </div>
           <strong class="task-pair-status-row-title">{queued && <em>#{Number(payload.queuePosition ?? index + 1)} </em>}{title}</strong>
           {waitKind(payload) && <small class="task-pair-status-row-meta">{(payload.scheduling as TaskPairScheduling).note}{(payload.scheduling as TaskPairScheduling).dependsOn.length > 0 && t('taskPair.waiting_for_tasks', { tasks: (payload.scheduling as TaskPairScheduling).dependsOn.map((id) => String(latest.get(id)?.payload.title ?? id)).join(', ') })}</small>}
+          <TaskPairDecisionPanel taskId={String(payload.taskId)} pair={{ ...payload,
+            status: payload.toStatus, flags: payload.flags ?? [], round: payload.round ?? 0,
+          } as SupervisionConsolePairInfo} />
           <TaskPairBrief brief={typeof payload.brief === 'string' ? payload.brief : undefined} briefRevision={typeof payload.briefRevision === 'string' ? payload.briefRevision : undefined} checklist={payload.checklist as { total: number; implemented: number; audited: number } | undefined} taskId={String(payload.taskId)} defaultOpen={String(payload.taskId) === String(scopedDefaultTaskId)} />
           {duration !== undefined && <small class="task-pair-status-row-meta"><span class="task-pair-status-row-meta-icon" aria-hidden="true">⏱</span>{Number.isFinite(row.startedAt) && <>{t('taskPair.panel_started', { time: new Date(row.startedAt).toLocaleTimeString() })} · </>}{queued ? t('taskPair.panel_queued', { duration }) : t('taskPair.panel_elapsed', { duration })}</small>}
           <div class="task-pair-status-row-roles">

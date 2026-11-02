@@ -1,3 +1,4 @@
+import { TASK_PAIR_DECISION_MSG, type TaskPairDecisionRecord } from './task-pair-decision.js';
 import type { TaskPairScheduling } from './task-pair-suspension.js';
 import type { TaskPairTitleWireAccess } from './task-pair-title-access.js';
 /**
@@ -66,6 +67,7 @@ export const SUPERVISION_TASK_CONSOLE_MSG = {
    */
   PAIR_DELTA: 'supervision.task_console.pair_delta',
   /** Browser -> daemon: fetch one pair's brief (the snapshot rows no longer embed it). */
+  ...TASK_PAIR_DECISION_MSG,
   BRIEF_REQUEST: 'supervision.task_console.brief_request',
   BRIEF_RESPONSE: 'supervision.task_console.brief_response',
 } as const;
@@ -475,6 +477,12 @@ export interface SupervisionTaskConsoleProgress {
 
 /** Pair details on a console row of a `pairs`-engine project. */
 export interface SupervisionConsolePairInfo {
+  deliveryRound?: number;
+  brain?: string;
+  blockedNote?: string;
+  decisionRevision?: string;
+  decisionRequest?: TaskPairDecisionRecord;
+  latestDecision?: TaskPairDecisionRecord;
   scheduling?: TaskPairScheduling;
   status: TaskPairStatus;
   flags: TaskPairFlag[];

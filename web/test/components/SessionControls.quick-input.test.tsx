@@ -806,3 +806,24 @@ describe('SessionControls quick input integration', () => {
     expect(container.querySelector('.controls-slash-picker')).toBeNull();
   });
 });
+
+it('hydrates percent task status badges from an already-published snapshot and clears them on server switch', () => {
+  const snapshot = { serverId: 'srv-1', authoritative: true, tasks: [
+    { taskId: 'working', title: 'Working task', pair: { status: 'working' } },
+    { taskId: 'paused', title: 'Paused task', pair: { status: 'working', scheduling: { epoch: 1, manual: true, dependsOn: [], since: 1, writer: 'brain' } } },
+    { taskId: 'dependency', title: 'Dependency task', pair: { status: 'working', scheduling: { epoch: 1, manual: false, dependsOn: ['other'], since: 1, writer: 'brain' } } },
+    { taskId: 'decision', title: 'Decision task', pair: { status: 'awaiting_brain_decision' } },
+  ] };
+  (window as any).__imcodesTaskPairSnapshot = snapshot;
+  const props = { ws: { connected: true, send: vi.fn(), sendSessionCommand: vi.fn(), onMessage: vi.fn(() => () => {}) } as any,
+    activeSession: makeSession(), quickData: makeQuickData(), sessions: [], subSessions: [], serverId: 'srv-1' };
+  try {
+    const view = render(<SessionControls {...props} />);
+    const input = screen.getByRole('textbox'); input.textContent = '%'; fireEvent.input(input);
+    expect(Array.from(view.container.querySelectorAll('[data-task-pair-status]')).map((node) => node.getAttribute('data-task-pair-status')))
+      .toEqual(['working', 'paused', 'waiting_dependencies', 'awaiting_brain_decision']);
+    view.rerender(<SessionControls {...props} serverId="srv-2" />);
+    input.textContent = '%'; fireEvent.input(input);
+    expect(view.container.querySelector('[data-task-pair-status]')).toBeNull();
+  } finally { delete (window as any).__imcodesTaskPairSnapshot; }
+});

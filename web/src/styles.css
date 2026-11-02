@@ -15422,3 +15422,15 @@ button.quick-agent-delegation-preset.active {
   cursor: pointer;
 }
 .remote-desktop-window-blocked .remote-desktop-install-guide { top: auto; bottom: calc(100% + 8px); right: auto; left: 0; }
+
+/* Task-bound decisions remain readable in narrow cards and never overflow the task pane. */
+.task-pair-decision { margin: 8px 0; padding: 9px; min-width: 0; border: 1px solid rgb(251 191 36 / 35%); border-radius: 8px; background: rgb(120 53 15 / 12%); font-size: 12px; overflow-wrap: anywhere; }
+.task-pair-decision p { margin: 6px 0; white-space: pre-wrap; }
+.task-pair-decision small { color: #94a3b8; }
+.task-pair-decision textarea { display: block; width: 100%; min-height: 64px; max-height: 200px; margin: 7px 0; resize: vertical; box-sizing: border-box; border: 1px solid #475569; border-radius: 6px; padding: 7px; background: #0f172a; color: #e2e8f0; font: inherit; }
+.task-pair-decision-options { display: flex; flex-wrap: wrap; gap: 6px; }
+.task-pair-decision button { max-width: 100%; white-space: normal; overflow-wrap: anywhere; border: 1px solid #475569; border-radius: 6px; padding: 6px 8px; color: #e0f2fe; background: #1e293b; cursor: pointer; font: inherit; }
+.task-pair-decision button:disabled { opacity: .5; cursor: default; }
+.task-pair-decision details { margin-top: 8px; }
+.task-pair-decision details > summary { cursor: pointer; color: #7dd3fc; }
+.task-pair-decision article { margin-top: 8px; padding-top: 6px; border-top: 1px solid #334155; }

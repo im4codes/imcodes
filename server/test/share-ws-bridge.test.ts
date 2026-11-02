@@ -1,3 +1,4 @@
+import { TASK_PAIR_DECISION_MSG } from '../../shared/task-pair-decision.js';
 import { EventEmitter } from 'node:events';
 import { ASK_ANSWER_COMMAND } from '../../shared/ask-answer.js';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -881,7 +882,11 @@ describe('WsBridge share-scoped sockets', () => {
   it('bridges task-console reads to shared MAIN and whole-server viewers/participants, never to sub-session or other-tab shares', async () => {
     const bridge = WsBridge.get(serverId);
     const mainTarget: ShareTarget = { kind: 'main', serverId, sessionName: 'deck_proj_brain' };
-    bridge.setShareCoverageResolverForTests(async ({ target }) => coverage(target, 'viewer', now));
+    bridge.setShareCoverageResolverForTests(async ({ userId, target }) => coverage(
+      target,
+      userId === 'participant-user' || userId === 'server-participant-user' ? 'participant' : 'viewer',
+      now,
+    ));
     const daemon = new MockWs();
     const db = makeDb();
     bridge.handleDaemonConnection(daemon as never, db, { JWT_SIGNING_KEY: 'share-ws-test-signing-key' } as never);
@@ -957,6 +962,15 @@ describe('WsBridge share-scoped sockets', () => {
     expect(daemon.sentJson.some((msg) => (
       msg.subscriptionId === 'subsession-subscription' || msg.subscriptionId === 'other-main-subscription'
     ))).toBe(false);
+
+    const feedback = { type: TASK_PAIR_DECISION_MSG.FEEDBACK, sessionName: 'deck_proj_brain',
+      scope: subscribe.scope, taskId: 'blocked-pair', requestId: 'human-reply', feedback: 'Approved fixture only' };
+    viewer.emit('message', JSON.stringify({ ...feedback, requestId: 'viewer-reply' }));
+    participant.emit('message', JSON.stringify(feedback));
+    otherMain.emit('message', JSON.stringify({ ...feedback, requestId: 'foreign-reply' }));
+    await flushAsync();
+    expect(daemon.sentJson.filter((msg) => msg.type === TASK_PAIR_DECISION_MSG.FEEDBACK))
+      .toEqual([expect.objectContaining({ requestId: 'human-reply' })]);
 
     const frames = [
       { type: SUPERVISION_TASK_CONSOLE_MSG.SNAPSHOT, tasks: [], assignments: [], pools: [] },

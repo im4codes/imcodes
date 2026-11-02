@@ -1,3 +1,5 @@
+import { taskPairDecisionRevision } from './task-pairs/decision-context.js';
+import type { TaskPairDecisionRecord } from '../../shared/task-pair-decision.js';
 import { projectPairScheduling } from '../../shared/task-pair-suspension.js';
 import { taskPairTitleWireAccess } from '../../shared/task-pair-title-access.js';
 /**
@@ -66,7 +68,7 @@ export function computePairQueuePositions(pairs: readonly StoredTaskPair[]): Map
  */
 export function buildPairConsoleRow(
   stored: StoredTaskPair,
-  options: { queuePosition?: number; inlineBrief: boolean; resolvePresentation?: PairPresentationResolver },
+  options: { queuePosition?: number; inlineBrief: boolean; resolvePresentation?: PairPresentationResolver; decisionRequest?: TaskPairDecisionRecord; latestDecision?: TaskPairDecisionRecord },
 ): SupervisionTaskConsolePairUpsert {
   const pair = stored.state;
   const status = TASK_PAIR_CONSOLE_LEGACY_STATUS[pair.status];
@@ -89,6 +91,12 @@ export function buildPairConsoleRow(
     updatedAt: pair.updatedAt,
     lastEventId: 0,
     pair: {
+      brain: pair.brain,
+      deliveryRound: pair.deliveryRound ?? 1,
+      ...(pair.blockedNote ? { blockedNote: pair.blockedNote } : {}),
+      decisionRevision: taskPairDecisionRevision(pair),
+      ...(options.latestDecision ? { latestDecision: options.latestDecision } : {}),
+      ...(options.decisionRequest ? { decisionRequest: options.decisionRequest } : {}),
       ...(pair.scheduling ? { scheduling: projectPairScheduling(pair.scheduling) } : {}),
       status: pair.status,
       flags: [...pair.flags],

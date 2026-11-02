@@ -105,7 +105,7 @@ async function deliverTaskPairMessage(
   wakeBindings?: TaskPairWakeBinding[],
 ): Promise<TaskPairDeliveryResult> {
   const bindings = wakeBindings ?? pairWakeBindings(target, taskId);
-  if (!pairWakeAllowed(bindings, reason)) return 'suspended';
+  if (!pairWakeAllowed(bindings, reason, target)) return 'suspended';
   // Empty aggregate means every covered pair is paused: there is no work to chase.
   if (taskId.startsWith('__') && getTaskPairStore().pairsForSession(target).some((p) => p.state.brain === target) && !bindings.length) return 'suspended';
   const binding = bindings.length ? encodePairWake(bindings, reason) : '';

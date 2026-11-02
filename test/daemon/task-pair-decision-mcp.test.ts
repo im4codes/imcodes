@@ -1,3 +1,7 @@
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
+import { createMemoryMcpServer } from '../../src/daemon/memory-mcp-server.js';
+import { MEMORY_MCP_TOOL_NAMES } from '../../shared/memory-mcp-contracts.js';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
@@ -26,7 +30,7 @@ const sessions = (['brain', 'exec', 'audit'] as const).map((name) => ({
 
 describe('pair decision MCP', () => {
   beforeEach(() => { const store = new TaskPairStore(':memory:'); setTaskPairStoreForTests(store); store.savePair('p', state); });
-  afterEach(() => { setTaskPairDeliveryDepsForTests(undefined); setTaskPairStoreForTests(undefined); });
+  afterEach(async () => { await taskPairService.waitForIdle(); setTaskPairDeliveryDepsForTests(undefined); setTaskPairStoreForTests(undefined); });
 
   it('writes final Brain decisions idempotently and reads bounded stable history', async () => {
     const handlers = createMemoryMcpToolHandlers(caller, { sendDeps: { listSessions: () => sessions } });
@@ -37,6 +41,39 @@ describe('pair decision MCP', () => {
     const history = await handlers.pair_decision_history!({ taskId: state.taskId });
     expect(history).toMatchObject({ status: 'ok', requested: 20, decisions: [{ conclusion: 'PASS' }] });
     expect(getTaskPairStore().listDecisions('p', [state.taskId], 20)).toHaveLength(1);
+  });
+
+  it('accepts structured question fields through the actual MCP wire schema', async () => {
+    const server = createMemoryMcpServer(caller, { sendDeps: { listSessions: () => sessions } }, {}, {}, { toolCatalogMode: 'static_full' });
+    const client = new Client({ name: 'decision-schema-test', version: '1' });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await Promise.all([client.connect(clientTransport), server.connect(serverTransport)]);
+    try {
+      const result = await client.callTool({ name: MEMORY_MCP_TOOL_NAMES.PAIR_DECISION_RECORD, arguments: {
+        taskId: state.taskId, kind: 'request', round: 1, deliveryRound: 1,
+        conclusion: 'Choose source', summary: 'Use a fixture?', question: 'Which source?',
+        options: [{ id: 'test', label: 'Use test data' }], recommendation: 'Use test data',
+      } });
+      expect(result.isError).not.toBe(true);
+      expect(getTaskPairStore().listDecisions('p', [state.taskId])[0]).toMatchObject({
+        question: 'Which source?', options: [{ id: 'test', label: 'Use test data' }], recommendation: 'Use test data',
+      });
+    } finally { await client.close(); }
+  });
+
+  it('preserves structured questions/options and links the Brain ruling to the exact question', async () => {
+    const worker = createMemoryMcpToolHandlers({ ...caller, sessionName: 'exec' }, { sendDeps: { listSessions: () => sessions } });
+    const request = await worker.pair_decision_record!({ taskId: state.taskId, kind: 'request', round: 1,
+      conclusion: 'Choose source', summary: 'Approval needed', question: 'Use test data?',
+      options: [{ id: 'test', label: 'Use test fixture' }], recommendation: 'Use test fixture' }) as any;
+    expect(request).toMatchObject({ status: 'ok', decision: { question: 'Use test data?', options: [{ id: 'test', label: 'Use test fixture' }] } });
+    const brain = createMemoryMcpToolHandlers(caller, { sendDeps: { listSessions: () => sessions } });
+    expect(await brain.pair_decision_record!({ taskId: state.taskId, kind: 'decision', round: 1,
+      conclusion: 'Approved', summary: 'Fixture only', requestId: request.decision.id, selectedOptionId: 'test' }))
+      .toMatchObject({ status: 'ok', decision: { requestId: request.decision.id, selectedOptionId: 'test' } });
+    expect(await brain.pair_decision_record!({ taskId: state.taskId, kind: 'decision', round: 1,
+      conclusion: 'Wrong', summary: 'Wrong question', requestId: 'missing', selectedOptionId: 'test' }))
+      .toMatchObject({ status: 'error' });
   });
 
   it('allows participant requests but refuses participant final decisions', async () => {

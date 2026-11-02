@@ -1,3 +1,4 @@
+import { TASK_PAIR_DECISION_BRAIN_NOTICE_REASON, TASK_PAIR_DECISION_KIND, validateTaskPairDecisionDetails } from '../../../shared/task-pair-decision.js';
 import { projectPairScheduling, type TaskPairScheduling } from '../../../shared/task-pair-suspension.js';
 import { TASK_PAIR_TITLE_ACCESS_MAX_USERS, TASK_PAIR_TITLE_ACCESS_VERSION, taskPairTitleWireAccess, isTaskPairTitleAccess } from '../../../shared/task-pair-title-access.js';
 /**
@@ -529,7 +530,15 @@ export class TaskPairService {
     const store = getTaskPairStore();
     const pair = store.getPair(input.project, input.taskId);
     if (!pair) throw new Error('task pair not found');
-    const result = store.recordDecision({ ...input, at: input.at ?? Date.now() });
+    validateTaskPairDecisionDetails(input);
+    const deliveryRound = input.deliveryRound ?? pair.state.deliveryRound ?? 1;
+    if (input.selectedOptionId && !input.requestId) throw new Error('A selected option requires a question reference');
+    if (input.requestId) {
+      const parent = store.decisionById(input.project, input.taskId, input.requestId);
+      if (!parent || parent.kind !== TASK_PAIR_DECISION_KIND.REQUEST || parent.round !== input.round || (parent.deliveryRound ?? 1) !== deliveryRound) throw new Error('Decision request does not match this task round');
+      if (input.selectedOptionId && !parent.options?.some((option) => option.id === input.selectedOptionId)) throw new Error('Unknown decision option');
+    }
+    const result = store.recordDecision({ ...input, deliveryRound, at: input.at ?? Date.now() });
     if (!result.created) return { ...result, notified: [] };
     const fresh = store.getPair(input.project, input.taskId);
     if (fresh) {
@@ -543,10 +552,15 @@ export class TaskPairService {
       ? [pair.state.brain, pair.state.executor, pair.state.auditor]
       : [pair.state.brain];
     const uniqueTargets = [...new Set(targets.filter((target): target is string => !!target && target !== TASK_PAIR_NO_AUDITOR))];
-    const message = `${input.kind === 'decision' ? 'Final decision' : 'Decision request'} recorded for ${input.taskId} round ${input.round}: ${input.conclusion}. ${input.summary}`;
+    const message = `${input.kind === TASK_PAIR_DECISION_KIND.DECISION ? 'Final decision' : input.kind === TASK_PAIR_DECISION_KIND.FEEDBACK ? 'Human feedback' : 'Decision request'} recorded for ${input.taskId} (${pair.state.title ?? input.taskId}) round ${input.round}: ${input.conclusion}. ${input.summary}`
+      + (input.question ? `\nQuestion: ${input.question}` : '')
+      + (input.options?.length ? `\nOptions: ${input.options.map((option) => `${option.id}: ${option.label}`).join('; ')}` : '')
+      + (input.recommendation ? `\nRecommendation: ${input.recommendation}` : '')
+      + (input.requestId ? `\nRelated question: ${input.requestId}` : '')
+      + (input.kind === TASK_PAIR_DECISION_KIND.FEEDBACK ? '\nThis is human feedback, not an audit verdict or automatic resume. Record your ruling and use the existing pair resume/next-round APIs as appropriate.' : '');
     for (const target of uniqueTargets) store.enqueueDecisionNotification({
       project: input.project, taskId: input.taskId, decisionId: result.record.id, target,
-      reason: `decision-${input.kind}`, text: message,
+      reason: target === pair.state.brain ? TASK_PAIR_DECISION_BRAIN_NOTICE_REASON : `decision-${input.kind}`, text: message,
     });
     this.#track(this.retryDecisionNotifications());
     emitTaskPairDaemonEvent(pair.state, {
@@ -558,12 +572,24 @@ export class TaskPairService {
   }
 
   /** Deliver persisted decision notifications; failed/no-session rows remain for heartbeat retry. */
-  async retryDecisionNotifications(now = Date.now()): Promise<void> {
+  #decisionFlush?: Promise<void>;
+  #decisionFlushAgain = false;
+  retryDecisionNotifications(now = Date.now()): Promise<void> {
+    this.#decisionFlushAgain = true;
+    if (this.#decisionFlush) return this.#decisionFlush;
+    this.#decisionFlush = (async () => {
+      do { this.#decisionFlushAgain = false; await this.#flushDecisionNotifications(now); }
+      while (this.#decisionFlushAgain);
+    })().finally(() => { this.#decisionFlush = undefined; });
+    return this.#decisionFlush;
+  }
+
+  async #flushDecisionNotifications(now: number): Promise<void> {
     const store = getTaskPairStore();
     for (const pending of store.listPendingDecisionNotifications(100)) {
       store.markDecisionNotificationAttempt(pending.id, now);
       let status: TaskPairDeliveryResult = 'failed';
-      try { status = await sendTaskPairMessage(pending.target, pending.taskId, pending.reason, pending.text); } catch { /* retain the row for the next heartbeat */ }
+      try { status = await sendTaskPairMessage(pending.target, pending.taskId, pending.reason, pending.text, pending.decisionId); } catch { /* retain the row for the next heartbeat */ }
       // skipped_pending can be only the process-local in-flight gate; the
       // original send may still fail, so keep this row pending for retry.
       if (status === 'sent' || status === 'queued') store.markDecisionNotificationDelivered(pending.id, now);

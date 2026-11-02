@@ -4757,6 +4757,32 @@
     "card_next_step": "Next step",
     "card_details_unavailable": "Detailed information was not provided; see the original notice below.",
     "card_no_blocking": "No blocking findings.",
-    "waiting_for_tasks": "待機中: {{tasks}}"
+    "waiting_for_tasks": "待機中: {{tasks}}",
+    "decision": {
+      "ask": "Brain に詳細を依頼",
+      "ask_message": "このタスクの障害、選択肢、推奨案を判断依頼として記録してください。",
+      "ready": "条件整備済み：要確認",
+      "ready_message": "条件が整いました。依存関係や監査を省略せず、Brain が確認して再開を判断してください。",
+      "wait": "待機を継続",
+      "wait_message": "現在の一時停止と依存条件を維持して待機を続けてください。",
+      "title": "判断待ち / 障害",
+      "missing": "障害の詳細は未記載です。情報を追加するか、Brain に質問と選択肢を求めてください。",
+      "recommendation": "推奨",
+      "feedback": "フィードバック",
+      "placeholder": "条件、選択理由、Brain への質問を入力…",
+      "send": "Brain に送信",
+      "sending": "保存中…",
+      "sent": "フィードバックを保存し、Brain への通知を予約しました。判断待ちであり、タスクは自動再開されません。",
+      "failed": "送信失敗。再試行できます",
+      "history": "判断履歴",
+      "ruling": "Brain の判断",
+      "resolved": "判断済み",
+      "upgrade": "送信前に daemon を更新または再接続してください。",
+      "kind": {
+        "request": "判断依頼",
+        "feedback": "ユーザーの回答",
+        "decision": "Brain の判断"
+      }
+    }
   }
 }

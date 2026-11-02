@@ -4757,6 +4757,32 @@
     "card_next_step": "Next step",
     "card_details_unavailable": "Detailed information was not provided; see the original notice below.",
     "card_no_blocking": "No blocking findings.",
-    "waiting_for_tasks": "대기 중: {{tasks}}"
+    "waiting_for_tasks": "대기 중: {{tasks}}",
+    "decision": {
+      "ask": "Brain에 설명 요청",
+      "ask_message": "이 작업의 장애, 선택지 및 권장안을 결정 요청으로 기록하세요.",
+      "ready": "조건 준비됨: 검토 요청",
+      "ready_message": "조건이 준비되었습니다. 의존 관계나 감사를 우회하지 말고 Brain이 확인 후 재개 여부를 결정하세요.",
+      "wait": "계속 대기",
+      "wait_message": "현재 일시 중지와 의존 조건을 유지하고 계속 기다리세요.",
+      "title": "결정 대기 / 장애",
+      "missing": "아직 장애 설명이 없습니다. 정보를 추가하거나 Brain에 질문과 선택지를 요청하세요.",
+      "recommendation": "권장 사항",
+      "feedback": "피드백",
+      "placeholder": "조건, 선택 이유 또는 Brain에 요청할 사항을 입력하세요…",
+      "send": "Brain에 보내기",
+      "sending": "저장 중…",
+      "sent": "피드백을 저장하고 Brain 알림을 대기열에 넣었습니다. 결정 대기 중이며 작업은 자동으로 재개되지 않습니다.",
+      "failed": "전송 실패. 다시 시도할 수 있습니다",
+      "history": "결정 기록",
+      "ruling": "Brain 결정",
+      "resolved": "결정 완료",
+      "upgrade": "피드백을 보내기 전에 daemon을 업그레이드하거나 다시 연결하세요.",
+      "kind": {
+        "request": "결정 요청",
+        "feedback": "사용자 피드백",
+        "decision": "Brain 결정"
+      }
+    }
   }
 }

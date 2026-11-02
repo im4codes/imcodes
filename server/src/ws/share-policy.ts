@@ -1,3 +1,4 @@
+import { TASK_PAIR_DECISION_MSG } from '../../../shared/task-pair-decision.js';
 import { TASK_PAIR_SCHEDULING_FIELD } from '../../../shared/task-pair-suspension.js';
 import { TASK_PAIR_TITLE_ACCESS_FIELD } from '../../../shared/task-pair-title-access.js';
 import type { Database } from '../db/client.js';
@@ -193,6 +194,8 @@ export const SHARE_WS_COMMAND_POLICY_INVENTORY: readonly ShareBridgeCommandInven
   { bridgeCommand: SUPERVISION_TASK_CONSOLE_MSG.SUBSCRIBE, sharedCommand: SHARE_BROWSER_COMMANDS.SUPERVISION_TASK_CONSOLE_READ, policy: { kind: 'allow-main-covered-read' } },
   { bridgeCommand: SUPERVISION_TASK_CONSOLE_MSG.UNSUBSCRIBE, sharedCommand: SHARE_BROWSER_COMMANDS.SUPERVISION_TASK_CONSOLE_READ, policy: { kind: 'allow-main-covered-read' } },
   { bridgeCommand: SUPERVISION_TASK_CONSOLE_MSG.ACK, sharedCommand: SHARE_BROWSER_COMMANDS.SUPERVISION_TASK_CONSOLE_READ, policy: { kind: 'allow-main-covered-read' } },
+  { bridgeCommand: TASK_PAIR_DECISION_MSG.HISTORY, sharedCommand: SHARE_BROWSER_COMMANDS.SUPERVISION_TASK_CONSOLE_READ, policy: { kind: 'allow-main-covered-read' } },
+  { bridgeCommand: TASK_PAIR_DECISION_MSG.FEEDBACK, sharedCommand: SHARE_BROWSER_COMMANDS.SESSION_SEND, policy: { kind: 'participant-covered-action' } },
   { bridgeCommand: SUPERVISION_TASK_CONSOLE_MSG.BRIEF_REQUEST, sharedCommand: SHARE_BROWSER_COMMANDS.SUPERVISION_TASK_CONSOLE_READ, policy: { kind: 'allow-main-covered-read' } },
   { bridgeCommand: DAEMON_COMMAND_TYPES.SESSION_CANCEL, sharedCommand: SHARE_BROWSER_COMMANDS.SESSION_CANCEL, policy: { kind: 'participant-cancel' } },
   { bridgeCommand: SESSION_IDENTITY_WS.RESOLVE_QUERY, sharedCommand: SHARE_BROWSER_COMMANDS.SESSION_IDENTITY_REFRESH, policy: { kind: 'participant-covered-action' } },
@@ -364,6 +367,7 @@ export const SHARE_SCOPED_DAEMON_MESSAGE_POLICY = new Map<string, DaemonMessageP
   [SUPERVISION_TASK_CONSOLE_MSG.RESYNC_REQUIRED, { target: supervisionTaskConsoleTarget, mainOrServerShareOnly: true }],
   [SUPERVISION_TASK_CONSOLE_MSG.UNAVAILABLE, { target: supervisionTaskConsoleTarget, mainOrServerShareOnly: true }],
   [SUPERVISION_TASK_CONSOLE_MSG.PAIR_DELTA, { target: supervisionTaskConsoleTarget, mainOrServerShareOnly: true, redact: redactPairInfoDeep }],
+  [TASK_PAIR_DECISION_MSG.RESPONSE, { target: supervisionTaskConsoleTarget, mainOrServerShareOnly: true, redact: redactPairInfoDeep }],
   [SUPERVISION_TASK_CONSOLE_MSG.BRIEF_RESPONSE, { target: supervisionTaskConsoleTarget, mainOrServerShareOnly: true, redact: redactBriefResponse }],
   [TRANSPORT_MSG.CHAT_HISTORY, {
     target: sessionIdFieldTarget,
@@ -1370,7 +1374,7 @@ const SHARE_HIDDEN_PAIR_KEYS: ReadonlySet<string> = new Set([
   TASK_PAIR_SCHEDULING_FIELD,
   'executorModel', 'auditorModel', 'executorThinking', 'auditorThinking',
   'observedModel', 'observedThinking',
-  'brief', 'briefRevision', 'objective',
+  'brief', 'briefRevision', 'objective', 'blockedNote', 'decisionRequest', 'latestDecision', 'decisions',
 ]);
 
 function redactPairValue(value: unknown, state: ShareScopedSocketState): unknown {

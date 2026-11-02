@@ -1,3 +1,4 @@
+import { TASK_PAIR_DECISION_MSG } from '../../shared/task-pair-decision.js';
 /**
  * Supervision console subscription handling over the existing authenticated WS.
  *
@@ -224,6 +225,8 @@ export class SupervisionConsoleSessionRegistry {
       case SUPERVISION_TASK_CONSOLE_MSG.SUBSCRIBE: return this.#handleSubscribe(record);
       case SUPERVISION_TASK_CONSOLE_MSG.ACK: return this.#handleAck(record);
       case SUPERVISION_TASK_CONSOLE_MSG.UNSUBSCRIBE: return this.#handleUnsubscribe(record);
+      case TASK_PAIR_DECISION_MSG.HISTORY:
+      case TASK_PAIR_DECISION_MSG.FEEDBACK: return this.#handleDecisionRequest(record);
       case SUPERVISION_TASK_CONSOLE_MSG.BRIEF_REQUEST: return this.#handleBriefRequest(record);
       default:
         // SNAPSHOT/DELTA/RESYNC_REQUIRED are daemon->browser only. Receiving one
@@ -463,6 +466,23 @@ export class SupervisionConsoleSessionRegistry {
   }
 
   /** On-demand brief for one pair of the caller's authorized, currently subscribed scope. */
+  #handleDecisionRequest(record: Record<string, unknown>): boolean {
+    const scope = readScope(record.scope);
+    if (!scope || typeof record.taskId !== 'string' || typeof record.requestId !== 'string') return true;
+    if (!this.#deps.authorize(scope)) { this.#refused += 1; return true; }
+    const active = this.#findSubscription(scope, record.subscriptionId);
+    if (!active || record.sessionName !== scope.coordinatorSessionName) return true;
+    void import('./task-pairs/decision-api.js').then(({ taskPairDecisionApi }) => {
+      if (!this.#findSubscription(scope, active.subscriptionId) || !this.#deps.authorize(scope)) return;
+      let result: unknown;
+      try { result = { ok: true, ...taskPairDecisionApi(scope, record) }; }
+      catch (error) { result = { ok: false, error: error instanceof Error ? error.message : String(error) }; }
+      this.#deps.send({ type: TASK_PAIR_DECISION_MSG.RESPONSE, scope,
+        subscriptionId: active.subscriptionId, requestId: record.requestId, taskId: record.taskId, result });
+    }).catch((error) => { this.#deps.onError?.(error); });
+    return true;
+  }
+
   #handleBriefRequest(record: Record<string, unknown>): boolean {
     const scope = readScope(record.scope);
     const taskId = record.taskId;

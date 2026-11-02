@@ -4758,6 +4758,32 @@
     "card_next_step": "Next step",
     "card_details_unavailable": "Detailed information was not provided; see the original notice below.",
     "card_no_blocking": "No blocking findings.",
-    "waiting_for_tasks": "等待任務：{{tasks}}"
+    "waiting_for_tasks": "等待任務：{{tasks}}",
+    "decision": {
+      "ask": "請 Brain 說明卡點",
+      "ask_message": "請說明本任務的具體卡點、可選方案及建議，記錄為待決策問題。",
+      "ready": "條件已具備，請核查",
+      "ready_message": "條件已具備，請 Brain 核查並裁決是否恢復；請勿略過依賴或審計。",
+      "wait": "繼續等待",
+      "wait_message": "繼續等待，保留現有暫停及依賴條件。",
+      "title": "待決策 / 卡點",
+      "missing": "尚未說明卡點，可補充回饋或請 Brain 提供問題與選項。",
+      "recommendation": "建議",
+      "feedback": "補充回饋",
+      "placeholder": "輸入條件、選擇理由或需要 Brain 裁決的事項…",
+      "send": "傳送給 Brain",
+      "sending": "儲存中…",
+      "sent": "已儲存回饋並排程通知 Brain；等待裁決，任務不會自動恢復。",
+      "failed": "回饋失敗，可重試",
+      "history": "決策紀錄",
+      "ruling": "Brain 裁決",
+      "resolved": "已裁決",
+      "upgrade": "請升級或重新連線 daemon 後再提交回饋。",
+      "kind": {
+        "request": "待決策問題",
+        "feedback": "人工回饋",
+        "decision": "Brain 裁決"
+      }
+    }
   }
 }
