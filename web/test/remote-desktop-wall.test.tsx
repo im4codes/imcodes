@@ -2,7 +2,6 @@
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/preact';
-import type { ComponentChildren } from 'preact';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { REMOTE_DESKTOP_INPUT_CAPABILITY, REMOTE_DESKTOP_LOCAL_DISCLOSURE_CAPABILITY } from '@shared/remote-desktop-access.js';
 import {
@@ -35,9 +34,7 @@ vi.mock('../src/api/remote-desktop-wall.js', async (importOriginal) => ({
   getRemoteDesktopWall: api.getRemoteDesktopWall,
   mutateRemoteDesktopWall: api.mutateRemoteDesktopWall,
 }));
-vi.mock('../src/components/FloatingPanel.js', () => ({
-  FloatingPanel: ({ id, children }: { id: string; children: ComponentChildren }) => <div data-testid={id}>{children}</div>,
-}));
+
 vi.mock('../src/components/RemoteDesktopWallTile.js', () => ({
   RemoteDesktopWallTile: ({ host, retryGeneration, onRetryableChange, onOpen, onRemove }: {
     host: { hostId: string; displayName: string };
@@ -53,7 +50,7 @@ vi.mock('../src/components/RemoteDesktopWallTile.js', () => ({
   </div>,
 }));
 
-import { RemoteDesktopWall } from '../src/components/RemoteDesktopWall.js';
+import { REMOTE_DESKTOP_WALL_WINDOW_ID, RemoteDesktopWall } from '../src/components/RemoteDesktopWall.js';
 import { stubDisplayMode } from './support/display-mode.js';
 import type { RemoteDesktopConnectionManager } from '../src/remote-desktop-connection-manager.js';
 
@@ -94,7 +91,36 @@ describe('RemoteDesktopWall', () => {
     api.getRemoteDesktopWall.mockResolvedValue({ revision: 0, layout: 'grid', hostIds: [], hosts: [] });
     api.listControllableMachines.mockResolvedValue([machine('a'), machine('b')]);
   });
-  afterEach(() => { cleanup(); vi.clearAllMocks(); });
+  afterEach(() => {
+    cleanup();
+    localStorage.removeItem(`rcc_float_${REMOTE_DESKTOP_WALL_WINDOW_ID}`);
+    vi.clearAllMocks();
+  });
+
+  it('double-clicks the wall chrome to maximize in-page and restores normal geometry', async () => {
+    const key = `rcc_float_${REMOTE_DESKTOP_WALL_WINDOW_ID}`;
+    localStorage.setItem(key, JSON.stringify({ x: 80, y: 90, w: 700, h: 500 }));
+    const onFocus = vi.fn();
+    const manager = { stop: vi.fn() } as unknown as RemoteDesktopConnectionManager;
+    const result = render(<RemoteDesktopWall manager={manager} retainedHostKeys={new Set()}
+      onOpenHost={vi.fn()} onHostKeysChange={vi.fn()} onClose={vi.fn()} onFocus={onFocus} />);
+    await waitFor(() => expect(screen.getAllByRole('button', { name: 'remote_desktop.wall_add' })).toHaveLength(4));
+    const panel = screen.getByTestId(`floating-panel-${REMOTE_DESKTOP_WALL_WINDOW_ID}`);
+    const chrome = result.container.querySelector('.remote-desktop-wall-header')!;
+    const normalStyle = panel.getAttribute('style');
+    const savedGeometry = localStorage.getItem(key);
+    fireEvent.dblClick(chrome.querySelector('button')!);
+    fireEvent.dblClick(result.container.querySelector('.remote-desktop-wall-grid')!);
+    expect(panel.getAttribute('style')).toBe(normalStyle);
+    fireEvent.dblClick(chrome);
+    expect(panel.style.borderWidth).toBe('2px');
+    expect(panel.getAttribute('style')).not.toBe(normalStyle);
+    expect(onFocus).toHaveBeenCalledTimes(1);
+    expect(localStorage.getItem(key)).toBe(savedGeometry);
+    fireEvent.dblClick(chrome);
+    expect(panel.getAttribute('style')).toBe(normalStyle);
+    expect(localStorage.getItem(key)).toBe(savedGeometry);
+  });
 
   it('puts the install-as-app entry in the wall header (icon only), and drops it inside the installed app', async () => {
     const manager = { stop: vi.fn() } as unknown as RemoteDesktopConnectionManager;

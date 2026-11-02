@@ -77,6 +77,7 @@ export function RemoteDesktopWall({
   onClose,
 }: RemoteDesktopWallProps) {
   const { t } = useTranslation();
+  const [maximized, setMaximized] = useState(false);
   const [snapshot, setSnapshot] = useState<RemoteDesktopWallSnapshot | null>(null);
   const [wallError, setWallError] = useState<string | null>(null);
   const [pickerOpen, setPickerOpen] = useState(false);
@@ -328,6 +329,9 @@ export function RemoteDesktopWall({
           minW={540}
           minH={360}
           className="remote-desktop-wall-shell"
+          enableMaximize
+          isMaximized={maximized}
+          onToggleMaximized={() => setMaximized((current) => !current)}
           hideTitleBar
           dragHandleSelector=".remote-desktop-wall-header"
         >{content}</FloatingPanel>

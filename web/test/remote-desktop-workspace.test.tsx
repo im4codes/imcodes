@@ -3,7 +3,6 @@ import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/preact';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import type { ComponentChildren } from 'preact';
 import { REMOTE_DESKTOP_INPUT_CAPABILITY, REMOTE_DESKTOP_LOCAL_DISCLOSURE_CAPABILITY } from '@shared/remote-desktop-access.js';
 import {
   REMOTE_DESKTOP_CAPABILITY,
@@ -48,12 +47,6 @@ vi.mock('../src/components/RemoteDesktopWallTile.js', () => ({
   RemoteDesktopWallTile: ({ host }: {
     host: { hostId: string; displayName: string };
   }) => <div>{`wall:${host.displayName}`}</div>,
-}));
-
-vi.mock('../src/components/FloatingPanel.js', () => ({
-  FloatingPanel: ({ id, children }: { id: string; children: ComponentChildren }) => (
-    <div data-testid={id}>{children}</div>
-  ),
 }));
 
 vi.mock('../src/components/RemoteDesktopPanel.js', () => ({
@@ -130,6 +123,7 @@ function setupManager() {
 
 afterEach(() => {
   cleanup();
+  localStorage.removeItem(`rcc_float_${REMOTE_DESKTOP_WORKSPACE_WINDOW_ID}`);
   vi.clearAllMocks();
   window.confirm = originalConfirm;
   removeFullscreenStub();
@@ -139,6 +133,36 @@ afterEach(() => {
 api.getRemoteDesktopWall.mockResolvedValue({ revision: 0, layout: 'grid', hostIds: [], hosts: [] });
 
 describe('RemoteDesktopWorkspace', () => {
+  it('double-clicks the workspace chrome to maximize in-page and restores normal geometry', () => {
+    const key = `rcc_float_${REMOTE_DESKTOP_WORKSPACE_WINDOW_ID}`;
+    localStorage.setItem(key, JSON.stringify({ x: 80, y: 90, w: 700, h: 500 }));
+    const fullscreen = installFullscreenStub();
+    const { manager } = setupManager();
+    const onFocus = vi.fn();
+    const result = render(<RemoteDesktopWorkspace
+      state={openRemoteDesktopWorkspaceHost(createRemoteDesktopWorkspaceState(), machine('a'))}
+      manager={manager}
+      onOpenHost={vi.fn()} onActivateTab={vi.fn()} onCloseHost={vi.fn()}
+      onReorderHost={vi.fn()} onCloseWorkspace={vi.fn()} onFocus={onFocus}
+    />);
+    const panel = screen.getByTestId(`floating-panel-${REMOTE_DESKTOP_WORKSPACE_WINDOW_ID}`);
+    const chrome = result.container.querySelector('.remote-desktop-workspace-tabbar')!;
+    const normalStyle = panel.getAttribute('style');
+    const savedGeometry = localStorage.getItem(key);
+    fireEvent.dblClick(screen.getByRole('tab', { name: 'A' }));
+    fireEvent.dblClick(screen.getByTestId('panel-a'));
+    expect(panel.getAttribute('style')).toBe(normalStyle);
+    fireEvent.dblClick(chrome);
+    expect(panel.style.borderWidth).toBe('2px');
+    expect(panel.getAttribute('style')).not.toBe(normalStyle);
+    expect(onFocus).toHaveBeenCalledTimes(1);
+    expect(localStorage.getItem(key)).toBe(savedGeometry);
+    expect(fullscreen.requests).toEqual([]);
+    fireEvent.dblClick(chrome);
+    expect(panel.getAttribute('style')).toBe(normalStyle);
+    expect(localStorage.getItem(key)).toBe(savedGeometry);
+  });
+
   it('keeps sibling presentations mounted and releases active input before tab transfer', () => {
     let state = createRemoteDesktopWorkspaceState();
     state = openRemoteDesktopWorkspaceHost(state, machine('a'));
@@ -258,12 +282,12 @@ describe('RemoteDesktopWorkspace', () => {
       onCloseWorkspace: vi.fn(),
     };
     const floating = render(<RemoteDesktopWorkspace {...props} />);
-    expect(floating.queryByTestId(REMOTE_DESKTOP_WORKSPACE_WINDOW_ID)).not.toBeNull();
+    expect(floating.queryByTestId(`floating-panel-${REMOTE_DESKTOP_WORKSPACE_WINDOW_ID}`)).not.toBeNull();
     expect(floating.container.querySelector('.remote-desktop-workspace-standalone')).toBeNull();
     floating.unmount();
 
     const standalone = render(<RemoteDesktopWorkspace {...props} standalone />);
-    expect(standalone.queryByTestId(REMOTE_DESKTOP_WORKSPACE_WINDOW_ID)).toBeNull();
+    expect(standalone.queryByTestId(`floating-panel-${REMOTE_DESKTOP_WORKSPACE_WINDOW_ID}`)).toBeNull();
     const shell = standalone.container.querySelector('.remote-desktop-workspace-standalone');
     expect(shell?.querySelector(':scope > .remote-desktop-workspace')).not.toBeNull();
     expect(screen.getByTestId('panel-a')).not.toBeNull();

@@ -79,6 +79,7 @@ export function RemoteDesktopWorkspace({
   quickData,
 }: RemoteDesktopWorkspaceProps) {
   const { t } = useTranslation();
+  const [maximized, setMaximized] = useState(false);
   const workspaceRef = useRef<HTMLDivElement | null>(null);
   const minimizeOriginRef = useRef<RemoteDesktopMinimizeOrigin | null>(null);
   // Fullscreen on the workspace, not on the active panel: the tab bar has to
@@ -334,6 +335,9 @@ export function RemoteDesktopWorkspace({
           minW={680}
           minH={460}
           className="remote-desktop-workspace-shell"
+          enableMaximize
+          isMaximized={maximized}
+          onToggleMaximized={() => setMaximized((current) => !current)}
           hideTitleBar
           dragHandleSelector=".remote-desktop-workspace-tabbar"
         >{content}</FloatingPanel>
