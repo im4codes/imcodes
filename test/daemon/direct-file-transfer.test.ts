@@ -22,6 +22,16 @@ import {
 } from '../../shared/direct-file-transfer.js';
 import { decodeSessionIdentityDirectHandle, encodeSessionIdentityDirectHandle } from '../../shared/session-identity.js';
 
+// These callbacks await real filesystem work (partial open, sidecar fsync and
+// capacity eviction). Vitest's implicit 1s wait is not a transfer deadline and
+// flakes under macOS suite load. Keep every assertion, but give this file's
+// asynchronous I/O one explicit bounded budget; normal passes still return early.
+// A short poll also avoids adding ~25s of polling sleeps to the 256-entry
+// capacity scenarios, which keep an older transfer live while filling the ledger.
+function waitForTransfer<T>(assertion: () => T, options: { timeout?: number; interval?: number } = {}): Promise<T> {
+  return vi.waitFor(assertion, { timeout: 10_000, interval: 10, ...options });
+}
+
 class FakeDataChannel {
   private messageHandler: ((message: string | Buffer | ArrayBuffer) => void) | null = null;
   private closedHandler: (() => void) | null = null;
@@ -305,7 +315,7 @@ describe('daemon direct file transfer v2 lease broker', () => {
       serverId, browserTabId, leaseId, leaseGeneration: 1, daemonGeneration: 1,
       nonce: 'probe-nonce-0001',
     }));
-    await vi.waitFor(() => expect(health.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.HEALTH_PONG)));
+    await waitForTransfer(() => expect(health.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.HEALTH_PONG)));
     const pong = JSON.parse(health.sent[0] as string);
     expect(pong).toMatchObject({ nonce: 'probe-nonce-0001', localCandidate: { address: '192.168.1.2' } });
     health.emit(JSON.stringify({
@@ -314,7 +324,7 @@ describe('daemon direct file transfer v2 lease broker', () => {
       serverId, browserTabId, leaseId, leaseGeneration: 1, daemonGeneration: 1,
       nonce: 'probe-nonce-0002',
     }));
-    await vi.waitFor(() => expect(health.sent).toHaveLength(2));
+    await waitForTransfer(() => expect(health.sent).toHaveLength(2));
     expect(JSON.parse(health.sent[1] as string)).toMatchObject({ nonce: 'probe-nonce-0002' });
     expect(health.close, 'a successful probe must keep the bounded bootstrap channel alive').not.toHaveBeenCalled();
     const extraHealth = new FakeDataChannel('imcodes-health-extra');
@@ -538,7 +548,7 @@ describe('daemon direct file transfer v2 lease broker', () => {
     }));
 
     await direct.handleDirectFileTransferCommand(authority, sender);
-    await vi.waitFor(() => expect(channel.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.ACCEPTED)));
+    await waitForTransfer(() => expect(channel.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.ACCEPTED)));
     expect(channel.close).not.toHaveBeenCalled();
     await direct.shutdownDirectFileTransfers();
   });
@@ -720,7 +730,7 @@ describe('daemon direct file transfer v2 lease broker', () => {
       protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
       ...binding(), authority: authority.authority,
     }));
-    await vi.waitFor(() => expect(channel.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.ACCEPTED)));
+    await waitForTransfer(() => expect(channel.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.ACCEPTED)));
 
     const committedOffsets = () => channel.sent
       .filter((m): m is string => typeof m === 'string')
@@ -731,9 +741,9 @@ describe('daemon direct file transfer v2 lease broker', () => {
       .map((m) => m.committedBytes as number);
 
     channel.emit(Buffer.alloc(chunk, 1));
-    await vi.waitFor(() => expect(committedOffsets().length).toBeGreaterThanOrEqual(1));
+    await waitForTransfer(() => expect(committedOffsets().length).toBeGreaterThanOrEqual(1));
     channel.emit(Buffer.alloc(chunk, 2));
-    await vi.waitFor(() => expect(committedOffsets().length).toBeGreaterThanOrEqual(2));
+    await waitForTransfer(() => expect(committedOffsets().length).toBeGreaterThanOrEqual(2));
 
     const offsets = committedOffsets();
     // Reported only after the write resolves, so it is a commit point.
@@ -761,9 +771,9 @@ describe('daemon direct file transfer v2 lease broker', () => {
       protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
       ...binding(), authority: first.authority,
     }));
-    await vi.waitFor(() => expect(firstChannel.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.ACCEPTED)));
+    await waitForTransfer(() => expect(firstChannel.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.ACCEPTED)));
     firstChannel.emit(Buffer.alloc(chunk, 7));
-    await vi.waitFor(() => expect(firstChannel.sent.some((m) => typeof m === 'string' && m.includes('"committedBytes"'))).toBe(true));
+    await waitForTransfer(() => expect(firstChannel.sent.some((m) => typeof m === 'string' && m.includes('"committedBytes"'))).toBe(true));
 
     // Transient loss: the channel goes away with half the file committed.
     firstChannel.close();
@@ -784,7 +794,7 @@ describe('daemon direct file transfer v2 lease broker', () => {
       authority: second.authority,
       resumeOffset: chunk,
     }));
-    await vi.waitFor(() => expect(secondChannel.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.ACCEPTED)));
+    await waitForTransfer(() => expect(secondChannel.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.ACCEPTED)));
 
     // The replacement must already be credited with the committed prefix.
     const committed = secondChannel.sent
@@ -802,7 +812,7 @@ describe('daemon direct file transfer v2 lease broker', () => {
       ...binding({ requestId: 'resume-request-2', attemptId: 'resume-attempt-2' }),
       totalBytes: total,
     }));
-    await vi.waitFor(() => expect(secondChannel.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.UPLOAD_COMMITTED)));
+    await waitForTransfer(() => expect(secondChannel.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.UPLOAD_COMMITTED)));
   });
 
   /**
@@ -830,9 +840,9 @@ describe('daemon direct file transfer v2 lease broker', () => {
       protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
       ...binding(), authority: first.authority,
     }));
-    await vi.waitFor(() => expect(firstChannel.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.ACCEPTED)));
+    await waitForTransfer(() => expect(firstChannel.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.ACCEPTED)));
     firstChannel.emit(Buffer.alloc(chunk, 7));
-    await vi.waitFor(() => expect(firstChannel.sent.some((m) => typeof m === 'string' && m.includes('"committedBytes"'))).toBe(true));
+    await waitForTransfer(() => expect(firstChannel.sent.some((m) => typeof m === 'string' && m.includes('"committedBytes"'))).toBe(true));
 
     // Transient loss, same as the scenario above...
     firstChannel.close();
@@ -859,7 +869,7 @@ describe('daemon direct file transfer v2 lease broker', () => {
     }));
     // Without the sidecar, this would instead receive an INVALID_AUTHORITY
     // TERMINAL error and never see ACCEPTED.
-    await vi.waitFor(() => expect(secondChannel.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.ACCEPTED)));
+    await waitForTransfer(() => expect(secondChannel.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.ACCEPTED)));
 
     const committed = secondChannel.sent
       .filter((m): m is string => typeof m === 'string')
@@ -875,7 +885,7 @@ describe('daemon direct file transfer v2 lease broker', () => {
       ...binding({ requestId: 'sidecar-resume-request-2', attemptId: 'sidecar-resume-attempt-2' }),
       totalBytes: total,
     }));
-    await vi.waitFor(() => expect(secondChannel.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.UPLOAD_COMMITTED)));
+    await waitForTransfer(() => expect(secondChannel.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.UPLOAD_COMMITTED)));
   });
 
   it('rejects a resume offset when no sidecar exists either (genuinely unknown operation)', async () => {
@@ -892,7 +902,7 @@ describe('daemon direct file transfer v2 lease broker', () => {
       ...binding(), authority: attempt.authority,
       resumeOffset: chunk,
     }));
-    await vi.waitFor(() => expect(channel.sent.length).toBeGreaterThan(0));
+    await waitForTransfer(() => expect(channel.sent.length).toBeGreaterThan(0));
     expect(channel.sent.some((m) => typeof m === 'string' && m.includes(DIRECT_FILE_TRANSFER_DATA_MSG.ACCEPTED))).toBe(false);
     expect(channel.sent.some((m) => typeof m === 'string' && m.includes(DIRECT_FILE_TRANSFER_ERROR.INVALID_AUTHORITY))).toBe(true);
   });
@@ -910,9 +920,9 @@ describe('daemon direct file transfer v2 lease broker', () => {
       protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
       ...binding(), authority: first.authority,
     }));
-    await vi.waitFor(() => expect(firstChannel.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.ACCEPTED)));
+    await waitForTransfer(() => expect(firstChannel.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.ACCEPTED)));
     firstChannel.emit(Buffer.alloc(chunk, 7));
-    await vi.waitFor(() => expect(firstChannel.sent.some((m) => typeof m === 'string' && m.includes('"committedBytes"'))).toBe(true));
+    await waitForTransfer(() => expect(firstChannel.sent.some((m) => typeof m === 'string' && m.includes('"committedBytes"'))).toBe(true));
     firstChannel.close();
 
     const uploadDir = path.dirname(storedPath);
@@ -936,7 +946,7 @@ describe('daemon direct file transfer v2 lease broker', () => {
       // Claims more than was actually committed.
       resumeOffset: chunk + 1,
     }));
-    await vi.waitFor(() => expect(secondChannel.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.ERROR)));
+    await waitForTransfer(() => expect(secondChannel.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.ERROR)));
     expect(secondChannel.sent).not.toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.ACCEPTED));
 
     // A wrong or hostile offset must not be able to destroy data a legitimate
@@ -966,10 +976,10 @@ describe('daemon direct file transfer v2 lease broker', () => {
       protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
       ...binding(), authority: first.authority,
     }));
-    await vi.waitFor(() => expect(firstChannel.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.ACCEPTED)));
+    await waitForTransfer(() => expect(firstChannel.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.ACCEPTED)));
     firstChannel.emit(Buffer.alloc(chunk, 7));
     firstChannel.emit(Buffer.alloc(chunk, 9));
-    await vi.waitFor(() => expect(
+    await waitForTransfer(() => expect(
       firstChannel.sent.filter((m) => typeof m === 'string' && m.includes('"committedBytes"')).length,
     ).toBeGreaterThanOrEqual(2));
     firstChannel.close();
@@ -995,7 +1005,7 @@ describe('daemon direct file transfer v2 lease broker', () => {
       // Two chunks are on disk; this claims only one.
       resumeOffset: chunk,
     }));
-    await vi.waitFor(() => expect(secondChannel.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.ERROR)));
+    await waitForTransfer(() => expect(secondChannel.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.ERROR)));
     expect(
       secondChannel.sent,
       'a resume offset that disagrees with the partial on disk must never be accepted',
@@ -1021,6 +1031,7 @@ describe('daemon direct file transfer v2 lease broker', () => {
     tag: string,
     label: string,
     size: number,
+    onChannel?: (channel: FakeDataChannel) => void,
   ): Promise<void> {
     const prepare = uploadPrepare({
       ...binding({ requestId: `${tag}-req`, attemptId: `${tag}-att`, operationId: `${tag}-op` }),
@@ -1031,6 +1042,7 @@ describe('daemon direct file transfer v2 lease broker', () => {
     });
     await direct.handleDirectFileTransferCommand(prepare, sender);
     const channel = new FakeDataChannel(label);
+    onChannel?.(channel);
     FakePeerConnection.latest!.emitDataChannel(channel);
     channel.emit(JSON.stringify({
       type: DIRECT_FILE_TRANSFER_DATA_MSG.START,
@@ -1038,9 +1050,9 @@ describe('daemon direct file transfer v2 lease broker', () => {
       ...binding({ requestId: `${tag}-req`, attemptId: `${tag}-att`, operationId: `${tag}-op` }),
       authority: prepare.authority,
     }));
-    await vi.waitFor(() => expect(channel.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.ACCEPTED)));
+    await waitForTransfer(() => expect(channel.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.ACCEPTED)));
     channel.emit(Buffer.alloc(DIRECT_FILE_TRANSFER_LIMITS.DATA_CHUNK_BYTES, 3));
-    await vi.waitFor(() => expect(channel.sent.some((m) => typeof m === 'string' && m.includes('"committedBytes"'))).toBe(true));
+    await waitForTransfer(() => expect(channel.sent.some((m) => typeof m === 'string' && m.includes('"committedBytes"'))).toBe(true));
     channel.close();
   }
 
@@ -1069,7 +1081,7 @@ describe('daemon direct file transfer v2 lease broker', () => {
     if (mode === 'close') channel.close();
     else if (mode === 'channel-error') channel.emitError('ice-transport-failure');
     else FakePeerConnection.latest!.emitState(mode === 'peer-failed' ? 'failed' : 'disconnected');
-    await vi.waitFor(() => expect(
+    await waitForTransfer(() => expect(
       sent.filter((m) => m.type === DIRECT_FILE_TRANSFER_MSG.TERMINAL).length,
     ).toBeGreaterThan(before));
     await new Promise((resolve) => setTimeout(resolve, 50));
@@ -1106,9 +1118,9 @@ describe('daemon direct file transfer v2 lease broker', () => {
       ...binding({ requestId: `${tag}-req`, attemptId: `${tag}-att`, operationId: `${tag}-op` }),
       authority: prepare.authority,
     }));
-    await vi.waitFor(() => expect(channel.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.ACCEPTED)));
+    await waitForTransfer(() => expect(channel.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.ACCEPTED)));
     channel.emit(Buffer.alloc(DIRECT_FILE_TRANSFER_LIMITS.DATA_CHUNK_BYTES, 5));
-    await vi.waitFor(() => expect(committedFrom(channel)).toBeGreaterThan(0));
+    await waitForTransfer(() => expect(committedFrom(channel)).toBeGreaterThan(0));
     return { channel, authority: prepare.authority as string };
   }
 
@@ -1138,7 +1150,7 @@ describe('daemon direct file transfer v2 lease broker', () => {
       authority: prepare.authority,
       resumeOffset: offset,
     }));
-    await vi.waitFor(() => expect(channel.sent.length).toBeGreaterThan(0));
+    await waitForTransfer(() => expect(channel.sent.length).toBeGreaterThan(0));
     return channel;
   }
 
@@ -1165,7 +1177,7 @@ describe('daemon direct file transfer v2 lease broker', () => {
       // resuming at the confirmed offset is accepted. A surviving file with a
       // dropped map entry fails here, and so does a dropped file.
       const resumed = await resumeAttempt(direct, sender, tag, 'imcodes-file-upload-0302', total, committed);
-      await vi.waitFor(() => expect(resumed.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.ACCEPTED)));
+      await waitForTransfer(() => expect(resumed.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.ACCEPTED)));
       expect(
         resumed.sent,
         'a retryable transport loss must not turn the next attempt into a whole-file restart or a hard failure',
@@ -1196,12 +1208,30 @@ describe('daemon direct file transfer v2 lease broker', () => {
     // Now lose the transport the ordinary way and retry.
     await interrupt(channel, 'close', sent);
     const resumed = await resumeAttempt(direct, sender, 'liveoldest', 'imcodes-file-upload-0402', total, committed);
-    await vi.waitFor(() => expect(resumed.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.ACCEPTED)));
+    await waitForTransfer(() => expect(resumed.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.ACCEPTED)));
     expect(
       resumed.sent,
       'capacity pressure must never evict a live upload out of its own resume state',
     ).not.toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.ERROR));
   }, 300_000);
+
+  it('waits for slow upload preflight instead of assuming local I/O finishes within one second', async () => {
+    const { direct, sender } = await readyLease();
+    const handler = await import('../../src/daemon/file-transfer-handler.js');
+    // Reproduce the busy macOS runner without a CPU/disk stress process.
+    const preflight = new Promise<void>(resolve => setTimeout(resolve, 1_100));
+    vi.mocked(handler.ensureUploadDirectory).mockImplementationOnce(() => preflight);
+    let channel: FakeDataChannel | undefined;
+    try {
+      await leavePartial(direct, sender, 'slowpreflight', 'imcodes-file-upload-0901', DIRECT_FILE_TRANSFER_LIMITS.DATA_CHUNK_BYTES * 2, value => { channel = value; });
+    } finally {
+      // The injected operation is ours; finish it before removing its temp dir,
+      // including when running this counterexample against the old wait policy.
+      await preflight;
+      await waitForTransfer(() => expect(channel?.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.ACCEPTED)), { timeout: 10_000 });
+      await direct.shutdownDirectFileTransfers();
+    }
+  });
 
 
   it('unlinks the partial when its resume state expires, instead of orphaning it', async () => {
@@ -1298,14 +1328,14 @@ describe('daemon direct file transfer v2 lease broker', () => {
       protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
       ...binding(), authority: authority.authority,
     }));
-    await vi.waitFor(() => expect(channel.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.ACCEPTED)));
+    await waitForTransfer(() => expect(channel.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.ACCEPTED)));
     channel.emit(Buffer.from('hello'));
     channel.emit(JSON.stringify({
       type: DIRECT_FILE_TRANSFER_DATA_MSG.FINISH,
       protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
       ...binding(), totalBytes: 5,
     }));
-    await vi.waitFor(() => expect(finalizeDirectUploadedFile).toHaveBeenCalledTimes(1));
+    await waitForTransfer(() => expect(finalizeDirectUploadedFile).toHaveBeenCalledTimes(1));
     expect(finalizeDirectUploadedFile).toHaveBeenCalledWith(expect.objectContaining({
       destinationDirectory: 'C:\\Users\\admin\\Desktop',
     }));
@@ -1314,7 +1344,7 @@ describe('daemon direct file transfer v2 lease broker', () => {
     // commit-intent, and the ledger state) only holds once it has actually
     // settled. Wait for the terminal COMMITTED message — the one observable
     // signal that the commit landed — before asserting any of it.
-    await vi.waitFor(() => expect(sent).toContainEqual(expect.objectContaining({
+    await waitForTransfer(() => expect(sent).toContainEqual(expect.objectContaining({
       type: DIRECT_FILE_TRANSFER_MSG.TERMINAL,
       state: DIRECT_FILE_TRANSFER_TERMINAL_STATE.COMMITTED,
     })));
@@ -1360,7 +1390,7 @@ describe('daemon direct file transfer v2 lease broker', () => {
       ...binding(),
       authority: authority.authority,
     }));
-    await vi.waitFor(() => expect(channel.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.ACCEPTED)));
+    await waitForTransfer(() => expect(channel.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.ACCEPTED)));
     channel.emit(Buffer.from('hello'));
     channel.emit(JSON.stringify({
       type: DIRECT_FILE_TRANSFER_DATA_MSG.FINISH,
@@ -1369,7 +1399,7 @@ describe('daemon direct file transfer v2 lease broker', () => {
       totalBytes: 5,
     }));
 
-    await vi.waitFor(() => expect(sent).toContainEqual(expect.objectContaining({
+    await waitForTransfer(() => expect(sent).toContainEqual(expect.objectContaining({
       type: DIRECT_FILE_TRANSFER_MSG.TERMINAL,
       state: DIRECT_FILE_TRANSFER_TERMINAL_STATE.FAILED,
       error: DIRECT_FILE_TRANSFER_ERROR.WRITE_FAILED,
@@ -1378,7 +1408,7 @@ describe('daemon direct file transfer v2 lease broker', () => {
     // resource cleanup finishes. Under the full macOS suite the unlink can
     // therefore complete a few ticks after the terminal becomes observable.
     // Wait for the cleanup postcondition instead of racing that unlink.
-    await vi.waitFor(() => expect(existsSync(storedPath)).toBe(false));
+    await waitForTransfer(() => expect(existsSync(storedPath)).toBe(false));
     await expect(readFile(storedPath)).rejects.toMatchObject({ code: 'ENOENT' });
     await direct.shutdownDirectFileTransfers();
   });
@@ -1429,14 +1459,14 @@ describe('daemon direct file transfer v2 lease broker', () => {
       v: DIRECT_FILE_TRANSFER_WORKER_PROTOCOL_VERSION, generation: 1, ...envelope,
     });
     const typesPosted = () => posted.map((p) => p.type);
-    await vi.waitFor(() => expect(typesPosted()).toContain(DIRECT_FILE_TRANSFER_WORKER_MSG.READY));
+    await waitForTransfer(() => expect(typesPosted()).toContain(DIRECT_FILE_TRANSFER_WORKER_MSG.READY));
     expect(
       typesPosted().indexOf(DIRECT_FILE_TRANSFER_WORKER_MSG.STATUS_REPLY),
       'availability is published before ready, so no caller sees a stale projection',
     ).toBeLessThan(typesPosted().indexOf(DIRECT_FILE_TRANSFER_WORKER_MSG.READY));
 
     emit({ type: DIRECT_FILE_TRANSFER_WORKER_MSG.COMMAND, senderId: 'dft-sender-1', command: leasePrepare() });
-    await vi.waitFor(() => expect(posted.some((p) => (p.message as Record<string, unknown>)?.type === DIRECT_FILE_TRANSFER_MSG.LEASE_PREPARED)).toBe(true));
+    await waitForTransfer(() => expect(posted.some((p) => (p.message as Record<string, unknown>)?.type === DIRECT_FILE_TRANSFER_MSG.LEASE_PREPARED)).toBe(true));
     emit({
       type: DIRECT_FILE_TRANSFER_WORKER_MSG.COMMAND, senderId: 'dft-sender-1',
       command: {
@@ -1446,17 +1476,17 @@ describe('daemon direct file transfer v2 lease broker', () => {
         requestId, sdp: 'browser-lease-offer',
       },
     });
-    await vi.waitFor(() => expect(posted.some((p) => (p.message as Record<string, unknown>)?.type === DIRECT_FILE_TRANSFER_MSG.LEASE_ANSWER)).toBe(true));
+    await waitForTransfer(() => expect(posted.some((p) => (p.message as Record<string, unknown>)?.type === DIRECT_FILE_TRANSFER_MSG.LEASE_ANSWER)).toBe(true));
     emit({ type: DIRECT_FILE_TRANSFER_WORKER_MSG.COMMAND, senderId: 'dft-sender-1', command: uploadPrepare() });
     // The upload attempt is live once it holds the single client-upload claim.
-    await vi.waitFor(() => expect(claimCalls, 'the upload attempt is prepared and holds its claim').toBe(1));
+    await waitForTransfer(() => expect(claimCalls, 'the upload attempt is prepared and holds its claim').toBe(1));
 
     // The boundary breaks while the worker is quiescing, so cancelling the live
     // attempt cannot be delivered and cleanup does not complete.
     controlPostsFail = true;
     emit({ type: DIRECT_FILE_TRANSFER_WORKER_MSG.SHUTDOWN });
 
-    await vi.waitFor(() => expect(typesPosted()).toContain(DIRECT_FILE_TRANSFER_WORKER_MSG.SHUTDOWN_ACK));
+    await waitForTransfer(() => expect(typesPosted()).toContain(DIRECT_FILE_TRANSFER_WORKER_MSG.SHUTDOWN_ACK));
     const ack = posted.find((p) => p.type === DIRECT_FILE_TRANSFER_WORKER_MSG.SHUTDOWN_ACK)!;
     expect(ack.cleanupOk, 'the ack states the outcome instead of implying success').toBe(false);
     expect(String(ack.detail), 'and says what went wrong').toContain('DataCloneError');
@@ -1475,7 +1505,7 @@ describe('daemon direct file transfer v2 lease broker', () => {
       authority: authority.authority,
     }));
 
-    await vi.waitFor(() => expect(sent).toContainEqual(expect.objectContaining({
+    await waitForTransfer(() => expect(sent).toContainEqual(expect.objectContaining({
       type: DIRECT_FILE_TRANSFER_MSG.ERROR,
       attemptId,
       error: DIRECT_FILE_TRANSFER_ERROR.INVALID_AUTHORITY,
@@ -1497,7 +1527,7 @@ describe('daemon direct file transfer v2 lease broker', () => {
       ...binding(),
       authority: authority.authority,
     }));
-    await vi.waitFor(() => expect(channel.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.ACCEPTED)));
+    await waitForTransfer(() => expect(channel.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.ACCEPTED)));
     channel.emit(Buffer.from('hello'));
     channel.emit(JSON.stringify({
       type: DIRECT_FILE_TRANSFER_DATA_MSG.FINISH,
@@ -1506,7 +1536,7 @@ describe('daemon direct file transfer v2 lease broker', () => {
       totalBytes: 4,
     }));
 
-    await vi.waitFor(() => expect(sent).toContainEqual(expect.objectContaining({
+    await waitForTransfer(() => expect(sent).toContainEqual(expect.objectContaining({
       type: DIRECT_FILE_TRANSFER_MSG.ERROR,
       attemptId,
       error: DIRECT_FILE_TRANSFER_ERROR.SIZE_MISMATCH,
@@ -1529,7 +1559,7 @@ describe('daemon direct file transfer v2 lease broker', () => {
       ...binding(),
       authority: uploadAuthority.authority,
     }));
-    await vi.waitFor(() => expect(uploadChannel.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.ACCEPTED)));
+    await waitForTransfer(() => expect(uploadChannel.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.ACCEPTED)));
     uploadChannel.emit(Buffer.from('hello'));
     uploadChannel.emit(JSON.stringify({
       type: DIRECT_FILE_TRANSFER_DATA_MSG.FINISH,
@@ -1537,7 +1567,7 @@ describe('daemon direct file transfer v2 lease broker', () => {
       ...binding(),
       totalBytes: 5,
     }));
-    await vi.waitFor(() => expect(finalizeDirectUploadedFile).toHaveBeenCalledOnce());
+    await waitForTransfer(() => expect(finalizeDirectUploadedFile).toHaveBeenCalledOnce());
 
     const downloadAuthority = downloadPrepare();
     await direct.handleDirectFileTransferCommand(downloadAuthority, sender);
@@ -1555,21 +1585,21 @@ describe('daemon direct file transfer v2 lease broker', () => {
       ...downloadBinding,
       authority: downloadAuthority.authority,
     }));
-    await vi.waitFor(() => expect(downloadChannel.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.ACCEPTED)));
+    await waitForTransfer(() => expect(downloadChannel.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.ACCEPTED)));
     downloadChannel.emit(JSON.stringify({
       type: DIRECT_FILE_TRANSFER_DATA_MSG.CREDIT,
       protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
       ...downloadBinding,
       creditBytes: 8,
     }));
-    await vi.waitFor(() => expect(downloadChannel.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.FINISH)));
+    await waitForTransfer(() => expect(downloadChannel.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.FINISH)));
     downloadChannel.emit(JSON.stringify({
       type: DIRECT_FILE_TRANSFER_DATA_MSG.DOWNLOAD_COMMITTED,
       protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
       ...downloadBinding,
       totalBytes: 8,
     }));
-    await vi.waitFor(() => expect(sent).toContainEqual(expect.objectContaining({
+    await waitForTransfer(() => expect(sent).toContainEqual(expect.objectContaining({
       type: DIRECT_FILE_TRANSFER_MSG.TERMINAL,
       operationId: downloadAuthority.operationId,
       state: DIRECT_FILE_TRANSFER_TERMINAL_STATE.COMMITTED,
@@ -1597,7 +1627,7 @@ describe('daemon direct file transfer v2 lease broker', () => {
         ...binding(),
         authority: uploadAuthority.authority,
       }));
-      await vi.waitFor(() => expect(uploadChannel.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.ACCEPTED)));
+      await waitForTransfer(() => expect(uploadChannel.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.ACCEPTED)));
       uploadChannel.emit(Buffer.from(content, 'utf8'));
       uploadChannel.emit(JSON.stringify({
         type: DIRECT_FILE_TRANSFER_DATA_MSG.FINISH,
@@ -1605,7 +1635,7 @@ describe('daemon direct file transfer v2 lease broker', () => {
         ...binding(),
         totalBytes: contentBytes,
       }));
-      await vi.waitFor(() => expect(uploadChannel.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.UPLOAD_COMMITTED)));
+      await waitForTransfer(() => expect(uploadChannel.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.UPLOAD_COMMITTED)));
       const committed = JSON.parse(uploadChannel.sent.find(
         (value) => typeof value === 'string' && value.includes(DIRECT_FILE_TRANSFER_DATA_MSG.UPLOAD_COMMITTED),
       ) as string);
@@ -1633,7 +1663,7 @@ describe('daemon direct file transfer v2 lease broker', () => {
         ...downloadBinding,
         authority: downloadAuthority.authority,
       }));
-      await vi.waitFor(() => expect(downloadChannel.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.ACCEPTED)));
+      await waitForTransfer(() => expect(downloadChannel.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.ACCEPTED)));
       const accepted = JSON.parse(downloadChannel.sent.find(
         (value) => typeof value === 'string' && value.includes(DIRECT_FILE_TRANSFER_DATA_MSG.ACCEPTED),
       ) as string);
@@ -1644,20 +1674,20 @@ describe('daemon direct file transfer v2 lease broker', () => {
         ...downloadBinding,
         creditBytes: contentBytes,
       }));
-      await vi.waitFor(() => expect(downloadChannel.sent.some((value) => value instanceof Uint8Array)).toBe(true));
+      await waitForTransfer(() => expect(downloadChannel.sent.some((value) => value instanceof Uint8Array)).toBe(true));
       // The bytes sent must decode back to the exact original content.
       const receivedBytes = Buffer.concat(downloadChannel.sent.filter(
         (value): value is Uint8Array => value instanceof Uint8Array,
       ).map((value) => Buffer.from(value)));
       expect(receivedBytes.toString('utf8')).toBe(content);
-      await vi.waitFor(() => expect(downloadChannel.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.FINISH)));
+      await waitForTransfer(() => expect(downloadChannel.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.FINISH)));
       downloadChannel.emit(JSON.stringify({
         type: DIRECT_FILE_TRANSFER_DATA_MSG.DOWNLOAD_COMMITTED,
         protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
         ...downloadBinding,
         totalBytes: contentBytes,
       }));
-      await vi.waitFor(() => expect(sent).toContainEqual(expect.objectContaining({
+      await waitForTransfer(() => expect(sent).toContainEqual(expect.objectContaining({
         type: DIRECT_FILE_TRANSFER_MSG.TERMINAL,
         operationId: downloadAuthority.operationId,
         state: DIRECT_FILE_TRANSFER_TERMINAL_STATE.COMMITTED,
@@ -1681,7 +1711,7 @@ describe('daemon direct file transfer v2 lease broker', () => {
         ...binding(),
         authority: uploadAuthority.authority,
       }));
-      await vi.waitFor(() => expect(uploadChannel.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.ACCEPTED)));
+      await waitForTransfer(() => expect(uploadChannel.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.ACCEPTED)));
       uploadChannel.emit(Buffer.from(content, 'utf8'));
       uploadChannel.emit(JSON.stringify({
         type: DIRECT_FILE_TRANSFER_DATA_MSG.FINISH,
@@ -1689,7 +1719,7 @@ describe('daemon direct file transfer v2 lease broker', () => {
         ...binding(),
         totalBytes: contentBytes,
       }));
-      await vi.waitFor(() => expect(uploadChannel.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_ERROR.CHECKSUM_MISMATCH)));
+      await waitForTransfer(() => expect(uploadChannel.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_ERROR.CHECKSUM_MISMATCH)));
       expect(identityStore.size).toBe(0);
       await direct.shutdownDirectFileTransfers();
     });
@@ -1713,7 +1743,7 @@ describe('daemon direct file transfer v2 lease broker', () => {
         ...downloadBinding,
         authority: downloadAuthority.authority,
       }));
-      await vi.waitFor(() => expect(sent).toContainEqual(expect.objectContaining({
+      await waitForTransfer(() => expect(sent).toContainEqual(expect.objectContaining({
         type: DIRECT_FILE_TRANSFER_MSG.ERROR,
         error: DIRECT_FILE_TRANSFER_ERROR.PREVIEW_HANDLE_INVALID,
         retryable: false,
@@ -1738,7 +1768,7 @@ describe('daemon direct file transfer v2 lease broker', () => {
         ...binding(),
         authority: uploadAuthority.authority,
       }));
-      await vi.waitFor(() => expect(uploadChannel.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_ERROR.INVALID_AUTHORITY)));
+      await waitForTransfer(() => expect(uploadChannel.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_ERROR.INVALID_AUTHORITY)));
       expect(identityStore.size).toBe(0);
       await direct.shutdownDirectFileTransfers();
     });
@@ -1766,7 +1796,7 @@ describe('daemon direct file transfer v2 lease broker', () => {
         ...downloadBinding,
         authority: downloadAuthority.authority,
       }));
-      await vi.waitFor(() => expect(sent).toContainEqual(expect.objectContaining({
+      await waitForTransfer(() => expect(sent).toContainEqual(expect.objectContaining({
         type: DIRECT_FILE_TRANSFER_MSG.ERROR,
         error: DIRECT_FILE_TRANSFER_ERROR.INVALID_AUTHORITY,
       })));
@@ -1789,7 +1819,7 @@ describe('daemon direct file transfer v2 lease broker', () => {
       ...binding(),
       authority: first.authority,
     }));
-    await vi.waitFor(() => expect(channel.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.ACCEPTED)));
+    await waitForTransfer(() => expect(channel.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.ACCEPTED)));
     channel.emit(Buffer.from('hello'));
     channel.emit(JSON.stringify({
       type: DIRECT_FILE_TRANSFER_DATA_MSG.FINISH,
@@ -1797,7 +1827,7 @@ describe('daemon direct file transfer v2 lease broker', () => {
       ...binding(),
       totalBytes: 5,
     }));
-    await vi.waitFor(() => expect(finalizeDirectUploadedFile).toHaveBeenCalledOnce());
+    await waitForTransfer(() => expect(finalizeDirectUploadedFile).toHaveBeenCalledOnce());
     const committedTerminals = () => sent.filter((message) => (
       message.type === DIRECT_FILE_TRANSFER_MSG.TERMINAL
       && message.operationId === operationId
@@ -1805,7 +1835,7 @@ describe('daemon direct file transfer v2 lease broker', () => {
     ));
     // The first terminal is emitted after the finalize promise settles; wait
     // for it so the duplicate is judged against a fully committed upload.
-    await vi.waitFor(() => expect(committedTerminals()).toHaveLength(1));
+    await waitForTransfer(() => expect(committedTerminals()).toHaveLength(1));
 
     const existing = await finalizeDirectUploadedFile.mock.results[0]!.value;
     lookupAttachmentByClientUploadId.mockReturnValue(existing);
@@ -1817,7 +1847,7 @@ describe('daemon direct file transfer v2 lease broker', () => {
     await direct.handleDirectFileTransferCommand(duplicate, sender);
 
     expect(finalizeDirectUploadedFile).toHaveBeenCalledOnce();
-    await vi.waitFor(() => expect(committedTerminals()).toHaveLength(2));
+    await waitForTransfer(() => expect(committedTerminals()).toHaveLength(2));
     await direct.shutdownDirectFileTransfers();
   });
 
@@ -1847,10 +1877,10 @@ describe('daemon direct file transfer v2 lease broker', () => {
       protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
       ...binding(), authority: authority.authority,
     }));
-    await vi.waitFor(() => expect(channel.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.ACCEPTED)));
+    await waitForTransfer(() => expect(channel.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.ACCEPTED)));
     channel.emit(Buffer.from('hello'));
     channel.emit(JSON.stringify(frame));
-    await vi.waitFor(() => expect(finalizeDirectUploadedFile).toHaveBeenCalledOnce());
+    await waitForTransfer(() => expect(finalizeDirectUploadedFile).toHaveBeenCalledOnce());
 
     // The browser/RTC layer may retransmit FINISH while the host registry call
     // is still in flight. It must join the first commit, not race rename and
@@ -1860,7 +1890,7 @@ describe('daemon direct file transfer v2 lease broker', () => {
     expect(finalizeDirectUploadedFile).toHaveBeenCalledOnce();
     releaseCommit();
 
-    await vi.waitFor(() => expect(sent).toContainEqual(expect.objectContaining({
+    await waitForTransfer(() => expect(sent).toContainEqual(expect.objectContaining({
       type: DIRECT_FILE_TRANSFER_MSG.TERMINAL,
       operationId,
       state: DIRECT_FILE_TRANSFER_TERMINAL_STATE.COMMITTED,
@@ -1898,7 +1928,7 @@ describe('daemon direct file transfer v2 lease broker', () => {
       ...binding(),
       authority: authority.authority,
     }));
-    await vi.waitFor(() => expect(channel.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.ACCEPTED)));
+    await waitForTransfer(() => expect(channel.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.ACCEPTED)));
 
     const rebindRequestId = 'rebind-request-0001';
     await direct.handleDirectFileTransferCommand(leasePrepare({ requestId: rebindRequestId, daemonGeneration: 2 }), sender);
@@ -1919,8 +1949,8 @@ describe('daemon direct file transfer v2 lease broker', () => {
       ...binding(),
       totalBytes: 5,
     }));
-    await vi.waitFor(() => expect(finalizeDirectUploadedFile).toHaveBeenCalledTimes(1));
-    await vi.waitFor(() => expect(sent).toContainEqual(expect.objectContaining({
+    await waitForTransfer(() => expect(finalizeDirectUploadedFile).toHaveBeenCalledTimes(1));
+    await waitForTransfer(() => expect(sent).toContainEqual(expect.objectContaining({
       type: DIRECT_FILE_TRANSFER_MSG.TERMINAL,
       operationId,
       state: DIRECT_FILE_TRANSFER_TERMINAL_STATE.COMMITTED,
@@ -1992,13 +2022,13 @@ describe('daemon direct file transfer v2 lease broker', () => {
     FakePeerConnection.latest!.emitDataChannel(channel);
     const downloadBinding = binding({ direction: DIRECT_FILE_TRANSFER_DIRECTION.DOWNLOAD, operationId: 'download-op-0001', attemptId: 'download-attempt-0001' });
     channel.emit(JSON.stringify({ type: DIRECT_FILE_TRANSFER_DATA_MSG.START, protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION, ...downloadBinding, authority: authority.authority }));
-    await vi.waitFor(() => expect(channel.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.ACCEPTED)));
+    await waitForTransfer(() => expect(channel.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.ACCEPTED)));
     expect(channel.sent.some((message) => message instanceof Uint8Array)).toBe(false);
     channel.emit(JSON.stringify({ type: DIRECT_FILE_TRANSFER_DATA_MSG.CREDIT, protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION, ...downloadBinding, creditBytes: 8 }));
-    await vi.waitFor(() => expect(channel.sent.some((message) => message instanceof Uint8Array && Buffer.from(message).toString() === 'download')).toBe(true));
-    await vi.waitFor(() => expect(channel.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.FINISH)));
+    await waitForTransfer(() => expect(channel.sent.some((message) => message instanceof Uint8Array && Buffer.from(message).toString() === 'download')).toBe(true));
+    await waitForTransfer(() => expect(channel.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.FINISH)));
     channel.emit(JSON.stringify({ type: DIRECT_FILE_TRANSFER_DATA_MSG.DOWNLOAD_COMMITTED, protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION, ...downloadBinding, totalBytes: 8 }));
-    await vi.waitFor(() => expect(sent).toContainEqual(expect.objectContaining({ type: DIRECT_FILE_TRANSFER_MSG.TERMINAL, operationId: 'download-op-0001', state: DIRECT_FILE_TRANSFER_TERMINAL_STATE.COMMITTED })));
+    await waitForTransfer(() => expect(sent).toContainEqual(expect.objectContaining({ type: DIRECT_FILE_TRANSFER_MSG.TERMINAL, operationId: 'download-op-0001', state: DIRECT_FILE_TRANSFER_TERMINAL_STATE.COMMITTED })));
     expect(resolveDirectFileDownloadSource).toHaveBeenCalledWith('preview-handle-0001');
     await direct.shutdownDirectFileTransfers();
   });
@@ -2031,17 +2061,17 @@ describe('daemon direct file transfer v2 lease broker', () => {
       authority: authority.authority,
       resumeOffset: 3,
     }));
-    await vi.waitFor(() => expect(channel.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.ACCEPTED)));
+    await waitForTransfer(() => expect(channel.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.ACCEPTED)));
     channel.emit(JSON.stringify({
       type: DIRECT_FILE_TRANSFER_DATA_MSG.CREDIT,
       protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
       ...downloadBinding,
       creditBytes: 8,
     }));
-    await vi.waitFor(() => expect(channel.sent.some(
+    await waitForTransfer(() => expect(channel.sent.some(
       (message) => message instanceof Uint8Array && Buffer.from(message).toString() === 'nload',
     )).toBe(true));
-    await vi.waitFor(() => expect(channel.sent).toContainEqual(expect.stringContaining('"totalBytes":8')));
+    await waitForTransfer(() => expect(channel.sent).toContainEqual(expect.stringContaining('"totalBytes":8')));
     await direct.shutdownDirectFileTransfers();
   });
 
@@ -2068,21 +2098,21 @@ describe('daemon direct file transfer v2 lease broker', () => {
       ...downloadBinding,
       authority: authority.authority,
     }));
-    await vi.waitFor(() => expect(channel.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.ACCEPTED)));
+    await waitForTransfer(() => expect(channel.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.ACCEPTED)));
     channel.emit(JSON.stringify({
       type: DIRECT_FILE_TRANSFER_DATA_MSG.CREDIT,
       protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
       ...downloadBinding,
       creditBytes: DIRECT_FILE_TRANSFER_LIMITS.DATA_CREDIT_BYTES,
     }));
-    await vi.waitFor(() => expect(channel.setBufferedAmountLowThreshold).toHaveBeenCalledWith(
+    await waitForTransfer(() => expect(channel.setBufferedAmountLowThreshold).toHaveBeenCalledWith(
       DIRECT_FILE_TRANSFER_LIMITS.DOWNLOAD_CHANNEL_BUFFER_LOW_WATER_BYTES,
     ));
     expect(channel.sent.some((message) => message instanceof Uint8Array)).toBe(false);
 
     channel.releaseBufferedAmount();
-    await vi.waitFor(() => expect(channel.sent.some((message) => message instanceof Uint8Array)).toBe(true));
-    await vi.waitFor(() => expect(channel.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.FINISH)));
+    await waitForTransfer(() => expect(channel.sent.some((message) => message instanceof Uint8Array)).toBe(true));
+    await waitForTransfer(() => expect(channel.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.FINISH)));
     channel.emit(JSON.stringify({
       type: DIRECT_FILE_TRANSFER_DATA_MSG.DOWNLOAD_COMMITTED,
       protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
@@ -2129,14 +2159,14 @@ describe('daemon direct file transfer v2 lease broker', () => {
       ...downloadBinding,
       authority: download.authority,
     }));
-    await vi.waitFor(() => expect(downloadChannel.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.ACCEPTED)));
+    await waitForTransfer(() => expect(downloadChannel.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.ACCEPTED)));
     downloadChannel.emit(JSON.stringify({
       type: DIRECT_FILE_TRANSFER_DATA_MSG.CREDIT,
       protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
       ...downloadBinding,
       creditBytes: DIRECT_FILE_TRANSFER_LIMITS.DATA_CREDIT_BYTES,
     }));
-    await vi.waitFor(() => expect(downloadChannel.setBufferedAmountLowThreshold).toHaveBeenCalledWith(
+    await waitForTransfer(() => expect(downloadChannel.setBufferedAmountLowThreshold).toHaveBeenCalledWith(
       DIRECT_FILE_TRANSFER_LIMITS.DOWNLOAD_CHANNEL_BUFFER_LOW_WATER_BYTES,
     ));
 
@@ -2172,7 +2202,7 @@ describe('daemon direct file transfer v2 lease broker', () => {
       }),
       authority: upload.authority,
     }));
-    await vi.waitFor(() => expect(uploadChannel.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.ACCEPTED)));
+    await waitForTransfer(() => expect(uploadChannel.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.ACCEPTED)));
     expect(downloadChannel.bufferedAmountValue).toBeGreaterThan(
       DIRECT_FILE_TRANSFER_LIMITS.DOWNLOAD_CHANNEL_BUFFER_HIGH_WATER_BYTES,
     );
@@ -2191,7 +2221,7 @@ describe('daemon direct file transfer v2 lease broker', () => {
     await direct.handleDirectFileTransferCommand(authority, sender);
 
     await vi.advanceTimersByTimeAsync(DIRECT_FILE_TRANSFER_LIMITS.NO_PROGRESS_TIMEOUT_MS);
-    await vi.waitFor(() => expect(sent).toContainEqual(expect.objectContaining({
+    await waitForTransfer(() => expect(sent).toContainEqual(expect.objectContaining({
       type: DIRECT_FILE_TRANSFER_MSG.ERROR,
       attemptId: 'timeout-attempt-0001',
       error: DIRECT_FILE_TRANSFER_ERROR.NO_PROGRESS_TIMEOUT,
@@ -2313,7 +2343,7 @@ describe('daemon direct file transfer v2 lease broker', () => {
       authority: authority.authority,
     }));
 
-    await vi.waitFor(() => expect(sent).toContainEqual(expect.objectContaining({
+    await waitForTransfer(() => expect(sent).toContainEqual(expect.objectContaining({
       type: DIRECT_FILE_TRANSFER_MSG.TERMINAL,
       state: DIRECT_FILE_TRANSFER_TERMINAL_STATE.FAILED,
       error: DIRECT_FILE_TRANSFER_ERROR.INSUFFICIENT_CAPACITY,
@@ -2415,7 +2445,7 @@ describe('daemon direct file transfer v2 lease broker', () => {
 
     // A channel that then goes quiet is still a stall, and still fails.
     await vi.advanceTimersByTimeAsync(DIRECT_FILE_TRANSFER_LIMITS.NO_PROGRESS_TIMEOUT_MS);
-    await vi.waitFor(() => expect(sent).toContainEqual(expect.objectContaining({
+    await waitForTransfer(() => expect(sent).toContainEqual(expect.objectContaining({
       type: DIRECT_FILE_TRANSFER_MSG.ERROR,
       attemptId: 'slow-attempt-00000001',
       error: DIRECT_FILE_TRANSFER_ERROR.NO_PROGRESS_TIMEOUT,
@@ -2445,7 +2475,7 @@ describe('daemon direct file transfer v2 lease broker', () => {
       ...firstBinding,
       authority: first.authority,
     }));
-    await vi.waitFor(() => expect(firstChannel.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.ACCEPTED)));
+    await waitForTransfer(() => expect(firstChannel.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.ACCEPTED)));
     // The partial's path is server-generated and deliberately unpredictable —
     // interpolating a client-supplied operationId/attemptId/filename into a
     // path is a traversal and collision surface. So discover it rather than
@@ -2491,7 +2521,7 @@ describe('daemon direct file transfer v2 lease broker', () => {
       ...secondBinding,
       authority: second.authority,
     }));
-    await vi.waitFor(() => expect(secondChannel.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.ACCEPTED)));
+    await waitForTransfer(() => expect(secondChannel.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.ACCEPTED)));
 
     firstChannel.emit(JSON.stringify({
       type: DIRECT_FILE_TRANSFER_DATA_MSG.FINISH,
@@ -2506,7 +2536,7 @@ describe('daemon direct file transfer v2 lease broker', () => {
       ...secondBinding,
       totalBytes: 5,
     }));
-    await vi.waitFor(() => expect(finalizeDirectUploadedFile).toHaveBeenCalledOnce());
+    await waitForTransfer(() => expect(finalizeDirectUploadedFile).toHaveBeenCalledOnce());
     await expect(readFile(storedPath, 'utf8')).resolves.toBe('hello');
     await direct.shutdownDirectFileTransfers();
   });
@@ -2537,7 +2567,7 @@ describe('daemon direct file transfer v2 lease broker', () => {
       ...downloadBinding,
       authority: authority.authority,
     }));
-    await vi.waitFor(() => expect(sent).toContainEqual(expect.objectContaining({
+    await waitForTransfer(() => expect(sent).toContainEqual(expect.objectContaining({
       type: DIRECT_FILE_TRANSFER_MSG.ERROR,
       error: DIRECT_FILE_TRANSFER_ERROR.PREVIEW_HANDLE_INVALID,
       retryable: false,
@@ -2573,7 +2603,7 @@ describe('daemon direct file transfer v2 lease broker', () => {
       authority: authority.authority,
     }));
 
-    await vi.waitFor(() => expect(sent).toContainEqual(expect.objectContaining({
+    await waitForTransfer(() => expect(sent).toContainEqual(expect.objectContaining({
       type: DIRECT_FILE_TRANSFER_MSG.ERROR,
       error: DIRECT_FILE_TRANSFER_ERROR.PREVIEW_POLICY_DENIED,
       retryable: false,
