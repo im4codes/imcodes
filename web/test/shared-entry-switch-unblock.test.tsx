@@ -7,6 +7,8 @@ import {
   openSharedEntry,
   SharedOpenTimeoutError,
   DEFAULT_SHARED_ENTRY_OPEN_TIMEOUT_MS,
+  configureApiKey,
+  clearApiKey,
   type OpenSharedEntryResponse,
   type SharedEntrySummary,
 } from '../src/api.js';
@@ -109,6 +111,49 @@ describe('shared entry open bounded timeout & cancellation (api contract)', () =
     const res = await openSharedEntry({ kind: 'server', serverId: 'srv-1' }, { timeoutMs: 5000 });
     expect(res.server.id).toBe('srv-1');
     expect(res.sessions[0].sessionName).toBe('deck_beta_brain');
+  });
+
+  it('shared open deadline bounds hanging native 401 /me verification', async () => {
+    vi.useFakeTimers();
+    configureApiKey('isolated-test-key-not-real');
+    let firstSignal: AbortSignal | null = null;
+    vi.stubGlobal('fetch', vi.fn((url: string, opts: any) => {
+      if (String(url).includes('/api/shares/open')) {
+        firstSignal = opts.signal;
+        return Promise.resolve({ status: 401, ok: false, text: async () => '', headers: new Headers() });
+      }
+      return new Promise(() => {});
+    }));
+    let settled = 'pending';
+    const promise = openSharedEntry({ kind: 'server', serverId: 'fixture-server' }, { timeoutMs: 30 });
+    void promise.then(() => { settled = 'success'; }, (e) => { settled = e.name; });
+    await vi.advanceTimersByTimeAsync(2200);
+    expect(firstSignal?.aborted).toBe(true);
+    expect(settled, 'open must settle at its deadline even when auth verification is hung').toBe('SharedOpenTimeoutError');
+    clearApiKey();
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+  });
+
+  it('shared open deadline bounds hanging cookie 401 refresh coordination', async () => {
+    vi.useFakeTimers();
+    clearApiKey();
+    let firstSignal: AbortSignal | null = null;
+    vi.stubGlobal('fetch', vi.fn((url: string, opts: any) => {
+      if (String(url).includes('/api/shares/open')) {
+        firstSignal = opts.signal;
+        return Promise.resolve({ status: 401, ok: false, text: async () => '', headers: new Headers() });
+      }
+      return new Promise(() => {});
+    }));
+    let settled = 'pending';
+    const promise = openSharedEntry({ kind: 'server', serverId: 'fixture-server' }, { timeoutMs: 30 });
+    void promise.then(() => { settled = 'success'; }, (e) => { settled = e.name; });
+    await vi.advanceTimersByTimeAsync(2200);
+    expect(firstSignal?.aborted).toBe(true);
+    expect(settled, 'open must settle at its deadline even when cookie refresh is hung').toBe('SharedOpenTimeoutError');
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
   });
 });
 

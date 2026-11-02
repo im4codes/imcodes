@@ -6735,4 +6735,53 @@ describe('App shell', () => {
     fireEvent.click(screen.getByRole('button', { name: 'server-select' }));
     await waitFor(() => expect(signal1?.aborted).toBe(true));
   }, 20_000);
+
+  it('a late external-route result cannot undo a newer shared menu choice', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    const a = { id: 'share-audit-a', serverId: 'srv-slow', serverName: 'Slow Server', role: 'participant', status: 'active', targetLabel: 'Audit Slow A', target: { kind: 'main', serverId: 'srv-slow', sessionName: 'deck_slow_brain' } } as const;
+    const b = { id: 'share-audit-b', serverId: 'srv-shared', serverName: 'Shared Server', role: 'participant', status: 'active', targetLabel: 'Audit Fast B', target: { kind: 'main', serverId: 'srv-shared', sessionName: 'deck_beta_brain' } } as const;
+    discoverSharedEntriesMock.mockResolvedValue([a, b]);
+    let finishA!: (x: unknown) => void;
+    openSharedEntryMock.mockImplementation((t: any) => t.serverId === 'srv-slow' ? new Promise(r => { finishA = r; }) : Promise.resolve(sharedMainOpenResult(b.id, 'dispatch-b')));
+    const { App } = await importApp();
+    render(<App />);
+    await screen.findByText('Audit Fast B');
+    await navigateExternally('/#/srv-slow/deck_slow_brain?shared=share-audit-a');
+    expect(openSharedEntryMock).toHaveBeenCalledWith(a.target);
+    fireEvent.click(screen.getByText('Audit Fast B').closest('button')!);
+    await screen.findByTestId('session-pane-deck_beta_brain');
+    await act(async () => {
+      finishA({
+        server: { id: 'srv-slow', name: 'Slow Server' },
+        target: a.target,
+        coverage: { effectiveRole: 'participant', historyCutoffAt: 0, nextCoverageRecheckAt: null, coveringShareIds: [a.id], primaryShareId: a.id, authorizedAt: Date.now() },
+        sessions: [{ sessionName: 'deck_slow_brain', state: 'running', agentType: 'codex-sdk' }],
+        subSessions: [],
+      });
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(window.location.hash, 'new explicit B selection must survive old A completion').toBe('#/srv-shared/deck_beta_brain?shared=share-audit-b');
+    expect(screen.queryByTestId('session-pane-deck_beta_brain')).not.toBeNull();
+  }, 20_000);
+
+  it('same share id with a different preferred session is a new route intent', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    const a = { id: 'share-audit-whole', serverId: 'srv-shared', serverName: 'Shared Server', role: 'participant', status: 'active', targetLabel: 'Audit Whole Server', target: { kind: 'server', serverId: 'srv-shared' } } as const;
+    discoverSharedEntriesMock.mockResolvedValue([a]);
+    openSharedEntryMock.mockImplementation(() => new Promise(() => {}));
+    const { App } = await importApp();
+    render(<App />);
+    await screen.findByText('Audit Whole Server');
+    await navigateExternally('/#/srv-shared/deck_beta_brain?shared=share-audit-whole');
+    expect(openSharedEntryMock).toHaveBeenCalledTimes(1);
+    const firstSignal = (openSharedEntryOptionsMock.mock.calls[0][1] as any).signal;
+    await navigateExternally('/#/srv-shared/deck_gamma_brain?shared=share-audit-whole');
+    expect(firstSignal.aborted).toBe(true);
+    expect(openSharedEntryMock, 'different preferred session must start its own authorized open').toHaveBeenCalledTimes(2);
+  }, 20_000);
 });
