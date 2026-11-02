@@ -1,4 +1,15 @@
 import { ProviderStopConfirmation } from '../provider-stop-confirmation.js';
+import { PendingQuestionRegistry } from '../pending-question-registry.js';
+import { ASK_QUESTION_WAIT_MS } from '../../../shared/ask-question-timing.js';
+import {
+  CODEX_USER_INPUT_METHOD,
+  CODEX_USER_INPUT_INVALID_PARAMS,
+  CODEX_USER_INPUT_GUIDANCE,
+  INTERACTIVE_QUESTION_TOOL_NAME,
+  codexUserInputResponse,
+  type CodexUserInputQuestion,
+  type CodexUserInputResponse,
+} from '../../../shared/codex-user-input.js';
 import { createHash } from 'node:crypto';
 import { gateChildStream } from '../../util/event-loop-backpressure.js';
 import { capContextPreservingPriority, joinSpanned, type PriorityPreservingCapMarkers, type SpannedText } from '../priority-preserving-context-cap.js';
@@ -916,7 +927,7 @@ function appendImcodesBaseInstructions(baseInstructions: string, payload: Provid
   // up by Codex prefix cache, NOT re-rendered every turn, and zero cost
   // for non-Codex providers. See p2p audit 37bfbb85-430 N-A follow-up.
   const imageReporting = buildGeneratedImageReportingPrompt();
-  const tail = joinSpanned([sessionSystemText, imageReporting], '\n\n');
+  const tail = joinSpanned([sessionSystemText, imageReporting, CODEX_USER_INPUT_GUIDANCE], '\n\n');
   if (!tail) return baseInstructions;
   if (baseInstructions.includes(IMCODES_CODEX_BASE_INSTRUCTIONS_MARKER)) return baseInstructions;
   return `${baseInstructions.trimEnd()}\n\n${IMCODES_CODEX_BASE_INSTRUCTIONS_MARKER}\n\n${capCodexSdkContextInjection(tail)}`;
@@ -981,7 +992,7 @@ async function resolveBaseInstructionsOverride(model: string | undefined): Promi
 }
 
 type JsonRpcResponse = {
-  id?: number;
+  id?: number | string;
   result?: Record<string, any>;
   error?: { code?: number; message?: string; data?: unknown };
   method?: string;
@@ -2684,6 +2695,8 @@ export class CodexSdkProvider implements TransportProvider {
 
   private config: ProviderConfig | null = null;
   private sessions = new Map<string, CodexSdkSessionState>();
+  private readonly questions = new PendingQuestionRegistry<CodexUserInputResponse>();
+  private readonly questionInputs = new Map<string, { requestId: number | string; turnId: string; questions: CodexUserInputQuestion[] }>();
   private readonly nativeAgentFence = new NativeAgentFenceSlot('codex-sdk');
   private threadToSession = new Map<string, string>();
   private deltaCallbacks: Array<(sessionId: string, delta: MessageDelta) => void> = [];
@@ -2951,6 +2964,7 @@ export class CodexSdkProvider implements TransportProvider {
   async endSession(sessionId: string): Promise<void> {
     const state = this.sessions.get(sessionId);
     if (!state) return;
+    this.questions.release(sessionId);
     this.clearActiveTurnLease(state);
     this.clearCancelTimer(state);
     this.clearCompactTimers(state);
@@ -3210,6 +3224,7 @@ export class CodexSdkProvider implements TransportProvider {
     // carries the request across those async boundaries so startTurn() issues
     // turn/interrupt as soon as Codex exposes the id.
     state.cancelled = true;
+    this.questions.release(sessionId);
     this.clearActiveTurnLease(state);
     if (!state.threadId) return;
     if (state.runningCompact && state.compactCommandInFlight) {
@@ -3362,6 +3377,7 @@ export class CodexSdkProvider implements TransportProvider {
     err: Error,
   ): void {
     if (this.child !== child) return;
+    this.questions.releaseAll();
     this.rejectPending(err);
     let emittedError = false;
     for (const [sessionId, state] of this.sessions) {
@@ -3389,6 +3405,7 @@ export class CodexSdkProvider implements TransportProvider {
   }
 
   private async stopAppServer(options: { clearSessions: boolean }): Promise<void> {
+    this.questions.releaseAll();
     this.rejectPending(new Error('Codex app-server disconnected'));
     const child = this.child;
     this.child = null;
@@ -4380,7 +4397,14 @@ export class CodexSdkProvider implements TransportProvider {
       return;
     }
 
-    if (typeof msg.id === 'number') {
+    // Server-originated requests have their OWN id namespace. Check method
+    // first or a question can consume an unrelated outbound RPC with that id.
+    if (msg.method === CODEX_USER_INPUT_METHOD && (typeof msg.id === 'number' || typeof msg.id === 'string')) {
+      this.handleUserInputRequest(child, msg.id, msg.params ?? {});
+      return;
+    }
+
+    if (typeof msg.id === 'number' && !msg.method) {
       const pending = this.pendingRequests.get(msg.id);
       if (!pending) return;
       this.pendingRequests.delete(msg.id);
@@ -4395,6 +4419,46 @@ export class CodexSdkProvider implements TransportProvider {
     if (!msg.method) return;
     void this.handleNotification(msg.method, msg.params ?? {}).catch((err) => {
       logger.warn({ provider: this.id, method: msg.method, err }, 'Codex app-server notification handler failed');
+    });
+  }
+
+  answerPendingQuestion(sessionName: string, answer: string): boolean {
+    for (const [sessionId, input] of this.questionInputs) {
+      const state = this.sessions.get(sessionId);
+      if ((state?.imcodesSessionName ?? sessionId) !== sessionName) continue;
+      return this.questions.resolve(sessionId, codexUserInputResponse(input.questions, answer));
+    }
+    return false;
+  }
+
+  private handleUserInputRequest(child: ChildProcessWithoutNullStreams, id: number | string, params: Record<string, any>): void {
+    const sessionId = this.threadToSession.get(params.threadId);
+    const state = sessionId ? this.sessions.get(sessionId) : undefined;
+    const questions: CodexUserInputQuestion[] = Array.isArray(params.questions) ? params.questions : [];
+    const validQuestions = questions.length > 0 && questions.every(q => q && typeof q.id === 'string' && q.id.length > 0
+      && typeof q.header === 'string' && typeof q.question === 'string');
+    if (!sessionId || !state || state.cancelled || typeof params.turnId !== 'string'
+      || typeof params.itemId !== 'string' || !validQuestions
+      || new Set(questions.map(q => q.id)).size !== questions.length
+      || this.isClosedCodexTurn(state, params.turnId)
+      || (state.runningTurnId && state.runningTurnId !== params.turnId)) {
+      child.stdin.write(`${JSON.stringify({ id, error: { code: CODEX_USER_INPUT_INVALID_PARAMS, message: 'Question does not belong to a live session turn or has invalid questions' } })}\n`);
+      return;
+    }
+    if (this.questionInputs.get(sessionId)?.requestId === id && this.questions.has(sessionId)) return;
+    const input = { requestId: id, turnId: params.turnId, questions };
+    const waiting = this.questions.wait(sessionId, { timeoutMs: ASK_QUESTION_WAIT_MS, fallback: { answers: {} } });
+    this.questionInputs.set(sessionId, input);
+    state.authRecoveryReplayUnsafe = true;
+    this.recordStrongActivity(sessionId, state, params.turnId);
+    void waiting.then(result => {
+      if (this.questionInputs.get(sessionId) === input) this.questionInputs.delete(sessionId);
+      // A response must never leak into a replacement app-server generation.
+      if (this.child === child && child.stdin.writable) child.stdin.write(`${JSON.stringify({ id, result })}\n`);
+    });
+    // Reuse the existing question-card relay and ask.answer control path.
+    for (const cb of this.toolCallCallbacks) cb(sessionId, {
+      id: params.itemId, name: INTERACTIVE_QUESTION_TOOL_NAME, status: 'complete', input: { questions },
     });
   }
 
@@ -6899,6 +6963,7 @@ export class CodexSdkProvider implements TransportProvider {
     terminalStatus: ToolTerminalStatus = status === 'complete' ? 'succeeded' : 'errored',
     terminalReason: ToolTerminalReason = status === 'complete' ? 'provider_result' : 'provider_error',
   ): void {
+    this.questions.release(sessionId);
     if (state.openProviderToolCalls.size === 0) return;
     for (const [toolId, runningTool] of [...state.openProviderToolCalls]) {
       this.closeOneOpenProviderToolCall(sessionId, state, toolId, runningTool, status, terminalStatus, terminalReason);

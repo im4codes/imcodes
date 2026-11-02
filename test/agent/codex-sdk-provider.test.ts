@@ -482,6 +482,93 @@ function expectCodexSubagentDetail(
 }
 
 describe('CodexSdkProvider', () => {
+  describe('native interactive questions', () => {
+    const params = {
+      threadId: 'thread-1', turnId: 'turn-1', itemId: 'ask-1',
+      questions: [
+        { id: 'color', header: 'Color', question: 'Which color?', isOther: true, isSecret: false, options: [{ label: 'Blue', description: 'Blue theme' }] },
+        { id: 'notes', header: 'Notes', question: 'Any notes?', isOther: true, isSecret: false, options: null },
+      ],
+    };
+    async function setupQuestion() {
+      const provider = createCodexProvider();
+      await provider.connect({ binaryPath: 'codex' });
+      const sid = await provider.createSession({ sessionKey: 'route-questions', sessionName: 'test-questions-main', cwd: '/tmp/project' });
+      await provider.send(sid, 'hello');
+      const child = childProcessMock.children[0];
+      await waitForCondition(() => (provider as any).sessions.get(sid)?.runningTurnId === 'turn-1');
+      const tools: any[] = [];
+      provider.onToolCall((_sid, tool) => tools.push(tool));
+      const answer = (text: string) => (provider as any).answerPendingQuestion('test-questions-main', text);
+      return { provider, sid, child, tools, answer };
+    }
+
+    it.each([700, 'native-question'])('surfaces native request %s and replies on the same RPC without a new turn', async (id) => {
+      const { child, tools, answer } = await setupQuestion();
+      child.emits({ id, method: 'item/tool/requestUserInput', params });
+      await flush();
+      expect(tools).toEqual([expect.objectContaining({ name: 'AskUserQuestion', status: 'complete', input: { questions: params.questions } })]);
+      expect(answer('[Color] Blue\n[Notes] line one\nline two')).toBe(true);
+      await flush();
+      expect(child.requests).toContainEqual({ id, result: { answers: { color: { answers: ['Blue'] }, notes: { answers: ['line one\nline two'] } } } });
+      expect(child.requests.filter(r => r.method === 'turn/start')).toHaveLength(1);
+      expect(answer('duplicate')).toBe(false);
+    });
+
+    it('does not consume an outbound RPC when the server request has the same numeric id', async () => {
+      const { provider, child, tools, answer } = await setupQuestion();
+      const pending = (provider as any).request('thread/read', { threadId: 'thread-1', includeTurns: true });
+      const request = child.requests.at(-1)!;
+      child.emits({ id: request.id, method: 'item/tool/requestUserInput', params });
+      await flush();
+      expect(tools).toHaveLength(1);
+      expect((provider as any).pendingRequests.has(request.id)).toBe(true);
+      expect(answer('[Color] Blue\n[Notes] skip')).toBe(true);
+      child.emits({ id: request.id, result: { thread: { id: 'thread-1' } } });
+      await expect(pending).resolves.toMatchObject({ thread: { id: 'thread-1' } });
+    });
+
+    it('expires an unanswered question without fabricating a user choice', async () => {
+      const { child, answer } = await setupQuestion();
+      vi.useFakeTimers();
+      child.emits({ id: 'expires', method: 'item/tool/requestUserInput', params });
+      await vi.advanceTimersByTimeAsync(120_000);
+      expect(child.requests).toContainEqual({ id: 'expires', result: { answers: {} } });
+      expect(answer('late')).toBe(false);
+    });
+
+    it.each(['cancel', 'endSession', 'disconnect'] as const)('releases a pending question on %s', async (operation) => {
+      const { provider, sid, child, answer } = await setupQuestion();
+      child.emits({ id: 'teardown', method: 'item/tool/requestUserInput', params });
+      await flush();
+      if (operation === 'disconnect') await provider.disconnect();
+      else await provider[operation](sid);
+      expect(answer('late')).toBe(false);
+      expect((provider as any).questions.has(sid)).toBe(false);
+    });
+
+    it('rejects stale turns and unknown threads instead of opening an unanswerable card', async () => {
+      const { child, tools } = await setupQuestion();
+      for (const [id, patch] of [['stale', { turnId: 'old-turn' }], ['unknown', { threadId: 'unknown-thread' }]] as const) {
+        child.emits({ id, method: 'item/tool/requestUserInput', params: { ...params, ...patch } });
+        await flush();
+        expect(child.requests).toContainEqual(expect.objectContaining({ id, error: expect.objectContaining({ code: -32602 }) }));
+      }
+      expect(tools).toHaveLength(0);
+    });
+
+    it('keeps sibling session answers isolated and releases pending input when its turn completes', async () => {
+      const { provider, sid, child, answer } = await setupQuestion();
+      child.emits({ id: 'completed', method: 'item/tool/requestUserInput', params });
+      await flush();
+      expect((provider as any).answerPendingQuestion('other-session', 'Blue')).toBe(false);
+      child.emits({ method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed', items: [], error: null } } });
+      await flush();
+      expect(answer('late')).toBe(false);
+      expect((provider as any).questions.has(sid)).toBe(false);
+    });
+  });
+
   beforeEach(() => {
     mcpStatusPages = [];
     mcpToolCallErrors = [];

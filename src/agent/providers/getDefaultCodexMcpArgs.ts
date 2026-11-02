@@ -2,6 +2,7 @@ import { IMCODES_MEMORY_MCP_LAUNCH_ARGS, IMCODES_MEMORY_MCP_LAUNCH_COMMAND } fro
 import { IMCODES_MEMORY_MCP_SERVER_NAME } from '../../../shared/memory-mcp-server-name.js';
 import { IMCODES_MCP_TOOL_CATALOG_MODE_ENV } from '../../../shared/memory-mcp-env.js';
 import { MCP_TOOL_CATALOG_MODES } from '../../../shared/mcp-tool-discovery.js';
+import { CODEX_DEFAULT_USER_INPUT_CONFIG } from '../../../shared/codex-user-input.js';
 
 function tomlString(value: string): string {
   return JSON.stringify(value);
@@ -26,7 +27,7 @@ export function getDefaultCodexMcpArgs(): string[] {
 /**
  * Full argv for the IM.codes-managed Codex app-server.
  *
- * No process-wide feature flag here. The app-server is ONE process for every
+ * No process-wide native-agent disabling flag here. The app-server is ONE process for every
  * session, so a flag could only remove native multi-agent from all sessions at
  * once, genuinely unmanaged ones included. The fence is per session instead:
  * `CodexSdkProvider.startNewThread` creates a managed session's thread with
@@ -39,5 +40,7 @@ export function getDefaultCodexMcpArgs(): string[] {
  * so IM send_message and the supervision tools remain the authoritative route.
  */
 export function getCodexAppServerArgs(): string[] {
-  return [...getDefaultCodexMcpArgs(), 'app-server'];
+  // Native questions are otherwise Plan-only. Enable the actual Codex tool in
+  // Default mode too; do not invent or override its provider-owned schema.
+  return [...getDefaultCodexMcpArgs(), '-c', CODEX_DEFAULT_USER_INPUT_CONFIG, 'app-server'];
 }
