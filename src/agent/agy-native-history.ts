@@ -5,7 +5,7 @@ import {
   AGY_HISTORY_LIMIT as LIMIT, AGY_NATIVE_FIELD as FIELD, AGY_NATIVE_STEP as STEP, AGY_NATIVE_DONE, AGY_NATIVE_ERROR,
   type AgyHistoryRequest, type AgyRecoveredResponse,
 } from '../../shared/agy-native-history.js';
-import { AGY_INDIVIDUAL_QUOTA_ERROR_PREFIX } from '../../shared/agy-agent.js';
+import { isAgyHistoricalErrorCandidate } from '../../shared/agy-agent.js';
 import { spawnChildProcessWorker, type ChildProcessWorkerHandle } from '../util/child-process-worker.js';
 import { resolveWorkerRuntime } from '../util/worker-runtime-port.js';
 import { suppressSqliteExperimentalWarning } from '../util/suppress-sqlite-warning.js';
@@ -72,7 +72,7 @@ interface Row {
  * One SQLite snapshot, read-only, bounded tail. Never retries or alters a turn. */
 export function recoverAgyResponseSync(request: AgyHistoryRequest): AgyRecoveredResponse | undefined {
   if (!path.isAbsolute(request.home) || !validConversationId(request.conversationId)
-    || !/^[a-f\d]{64}$/.test(request.promptHash) || !request.error.startsWith(AGY_INDIVIDUAL_QUOTA_ERROR_PREFIX)
+    || !/^[a-f\d]{64}$/.test(request.promptHash) || !isAgyHistoricalErrorCandidate(request.error)
     || !Number.isFinite(request.sentAt) || !Number.isFinite(request.resultAt) || request.resultAt < request.sentAt) return;
   let db: import('node:sqlite').DatabaseSync | undefined;
   try {
@@ -114,10 +114,18 @@ export function recoverAgyResponseSync(request: AgyHistoryRequest): AgyRecovered
     // The old error must be an ACTUAL native system-error step, not quoted text.
     const history = db.prepare(`SELECT status, metadata, step_payload FROM steps WHERE step_type=? AND idx<?
       AND length(step_payload)+COALESCE(length(metadata),0)<=? ORDER BY idx DESC LIMIT 1`).get(STEP.SYSTEM_ERROR, user.idx, LIMIT.ROW_BYTES);
-    if (!history || history.status !== AGY_NATIVE_ERROR || timestamp(history.metadata as Uint8Array, FIELD.CREATED_AT) >= request.sentAt
-      || !Buffer.from(history.step_payload as Uint8Array).includes(Buffer.from(request.error))) return;
+    // Native system_error records can themselves be marked DONE (observed on
+    // 215 for API EOF), not only ERROR. Their type and exact error body are proof,
+    // never a matching substring in an assistant quote or metadata.
+    if (!history || (history.status !== AGY_NATIVE_ERROR && history.status !== AGY_NATIVE_DONE)
+      || timestamp(history.metadata as Uint8Array, FIELD.CREATED_AT) >= request.sentAt) return;
     const historicalStep = fields(history.step_payload as Uint8Array);
-    if (historicalStep.get(FIELD.TYPE) !== STEP.SYSTEM_ERROR || historicalStep.get(FIELD.STATUS) !== AGY_NATIVE_ERROR) return;
+    if (historicalStep.get(FIELD.TYPE) !== STEP.SYSTEM_ERROR || historicalStep.get(FIELD.STATUS) !== history.status) return;
+    const historicalError = fields(blob(historicalStep.get(FIELD.SYSTEM_ERROR)));
+    const errorText = historicalError.has(FIELD.ERROR_DETAILS)
+      ? fields(blob(historicalError.get(FIELD.ERROR_DETAILS))).get(FIELD.ERROR_MESSAGE)
+      : historicalError.get(FIELD.ERROR_TEXT);
+    if (text(errorText) !== request.error) return;
     const endedAt = timestamp(last.metadata, FIELD.ENDED_AT);
     if (endedAt < request.sentAt || endedAt > request.resultAt) return;
     const response = fields(payload(last));

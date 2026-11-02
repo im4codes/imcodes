@@ -36,6 +36,24 @@ describe('AG native completed-turn proof (read-only)', () => {
   it.each(['partial','currentError','laterTool','errorDetails','mismatch','noHistory'])('does not recover without complete proof: %s', key => {
     expect(recoverAgyResponseSync(setup({ [key]:true }))).toBeUndefined();
   });
+  it.each([3, 5])('recovers historical API EOF from a native system_error with status %s', historicalStatus => {
+    const request = { ...setup({ error:fixture.API_ERROR, historicalStatus }), error:fixture.API_ERROR };
+    expect(recoverAgyResponseSync(request)?.text).toBe('The actual current answer');
+    expect(recoverAgyResponseSync({ ...request, error:fixture.API_ERROR + ' different' })).toBeUndefined();
+  });
+  it.each(['partial','currentError','laterTool','errorDetails','mismatch','noHistory'])('preserves API failure when native proof is missing: %s', key => {
+    const request = { ...setup({ error:fixture.API_ERROR, historicalStatus:3, [key]:true }), error:fixture.API_ERROR };
+    expect(recoverAgyResponseSync(request)).toBeUndefined();
+  });
+  it('rejects API text appearing outside an actual historical system_error body', () => {
+    const request = { ...setup({ error:fixture.API_ERROR, historicalStatus:3 }), error:fixture.API_ERROR };
+    const db = fixture.open(request.home);
+    const body = fixture.message(fixture.field(1,17), fixture.field(4,3),
+      fixture.field(5,fixture.API_ERROR), fixture.field(24,fixture.field(1,'different diagnostic')));
+    db.prepare('UPDATE steps SET step_payload=? WHERE idx=11927').run(body);
+    db.close();
+    expect(recoverAgyResponseSync(request)).toBeUndefined();
+  });
   it('rejects stale and future input/output timestamps, mismatched input/error/conversation and path traversal', () => {
     const request = setup();
     for (const delta of [

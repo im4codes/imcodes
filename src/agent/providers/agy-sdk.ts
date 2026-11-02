@@ -41,7 +41,7 @@ import {
   AGY_CLI_FLAG,
   AGY_CLI_PATH_ENV,
   AGY_DEFAULT_MODEL_ID,
-  AGY_INDIVIDUAL_QUOTA_ERROR_PREFIX,
+  isAgyHistoricalErrorCandidate,
   AGY_RESULT_STATUS,
   AGY_SDK_PROVIDER_ID,
   AGY_STEP_STATE,
@@ -105,8 +105,8 @@ interface AgySessionState {
   sessionSystemTextInjected?: string;
   stderrTail: string;
   toolSteps: Map<number, string>;
-  mayHaveHistoricalQuota: boolean;
-  /** A quota result is being checked against durable history; cancellation wins over this read. */
+  mayHaveHistoricalError: boolean;
+  /** An error result is being checked against durable history; cancellation wins over this read. */
   historyReadInFlight: boolean;
   pendingInputs: Array<{ promptHash: string; sentAt: number }>;
   /** Evidence is reset by the streamed user_input boundary, not send(): inputs can queue. */
@@ -351,7 +351,7 @@ export class AgySdkProvider implements TransportProvider {
       sessionSystemTextInjected: existing?.sessionSystemTextInjected,
       stderrTail: '',
       toolSteps: new Map(),
-      mayHaveHistoricalQuota: !!(config.resumeId ?? existing?.conversationId) && !config.fresh,
+      mayHaveHistoricalError: !!(config.resumeId ?? existing?.conversationId) && !config.fresh,
       historyReadInFlight: existing?.historyReadInFlight ?? false,
       pendingInputs: [],
     };
@@ -1092,7 +1092,7 @@ export class AgySdkProvider implements TransportProvider {
     let recovered = false;
     const error = asString(result.error) ?? '';
     if (input && !state.cancelled && result.status === AGY_RESULT_STATUS.ERROR
-      && error.startsWith(AGY_INDIVIDUAL_QUOTA_ERROR_PREFIX) && !asString(result.response)?.trim()
+      && isAgyHistoricalErrorCandidate(error) && !asString(result.response)?.trim()
       && state.conversationId && state.conversationId === asString(result.conversation_id)
       && !state.turnEvidence?.sawError && state.toolSteps.size === 0) {
       const env = this.spawnEnv(state.env, state.mcpEnv);
@@ -1120,15 +1120,15 @@ export class AgySdkProvider implements TransportProvider {
     const streamed = state.currentText;
     const response = asString(result.response)?.trimEnd();
     const evidence = state.turnEvidence;
-    // AG can aggregate a quota error from an older conversation step into the
+    // AG can aggregate a quota/API error from an older conversation step into the
     // terminal result of a later successful turn (upstream #1048). Do not trust
     // nonempty response text alone: partial output on a real failure is common.
     // Require a new user boundary, a matching final DONE response, no subsequent
     // step/open tool or current error, and the same conversation. No replay,
     // conversation reset, quota probe or suppression of an unproven error.
-    const historicalQuotaResult = recovered || result.status === AGY_RESULT_STATUS.ERROR
-      && state.mayHaveHistoricalQuota
-      && (asString(result.error) ?? '').startsWith(AGY_INDIVIDUAL_QUOTA_ERROR_PREFIX)
+    const historicalErrorResult = recovered || result.status === AGY_RESULT_STATUS.ERROR
+      && state.mayHaveHistoricalError
+      && isAgyHistoricalErrorCandidate(error)
       && !!response?.trim()
       && !!evidence
       && (response === streamed.trimEnd() || response === evidence.responseText.trimEnd())
@@ -1164,9 +1164,9 @@ export class AgySdkProvider implements TransportProvider {
 
     this.emitUsage(sessionId, state, messageId, turnUsage, true);
 
-    if (result.status !== AGY_RESULT_STATUS.SUCCESS && !historicalQuotaResult) {
+    if (result.status !== AGY_RESULT_STATUS.SUCCESS && !historicalErrorResult) {
       const message = asString(result.error) ?? 'agy turn failed';
-      if (message.startsWith(AGY_INDIVIDUAL_QUOTA_ERROR_PREFIX)) state.mayHaveHistoricalQuota = true;
+      if (isAgyHistoricalErrorCandidate(message)) state.mayHaveHistoricalError = true;
       const code = AUTH_FAILURE_PATTERN.test(message)
         ? PROVIDER_ERROR_CODES.AUTH_FAILED
         : RATE_LIMIT_PATTERN.test(message)
