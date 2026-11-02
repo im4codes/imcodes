@@ -1562,6 +1562,30 @@ describe('RemoteDesktopClient', () => {
     socket.receive({ ...status, qualityPreference: true });
     expect(qualityControls()).toHaveLength(1);
 
+    // A quality refusal is surfaced once, then repeated STATUS frames must not
+    // replay the same request or keep the notice alive indefinitely.
+    control.receive({
+      type: REMOTE_DESKTOP_DATA_MSG.CONTROL_REJECTED,
+      protocolVersion: REMOTE_DESKTOP_PROTOCOL_VERSION,
+      sessionId: authority.sessionId,
+      sequence: 7,
+      kind: REMOTE_DESKTOP_CONTROL_KIND.SET_QUALITY_PREFERENCE,
+      reason: REMOTE_DESKTOP_CONTROL_REJECTION.QUALITY_UNAVAILABLE,
+    });
+    expect(client.current().controlRejection).toMatchObject({
+      id: 1,
+      kind: REMOTE_DESKTOP_CONTROL_KIND.SET_QUALITY_PREFERENCE,
+      reason: REMOTE_DESKTOP_CONTROL_REJECTION.QUALITY_UNAVAILABLE,
+    });
+    socket.receive({ ...status, qualityPreference: true });
+    socket.receive({ ...status, qualityPreference: true });
+    expect(qualityControls()).toHaveLength(1);
+    expect(client.current().controlRejection?.id).toBe(1);
+
+    // An explicit retry is a new user action and is still sent/announced.
+    expect(client.setQualityPreference(smooth)).toBe(true);
+    expect(qualityControls()).toHaveLength(2);
+
     peer.connect();
     const statsTick = intervalSpy.mock.calls.find((call) => call[1] === 1_000)?.[0] as (() => void);
     expect(statsTick).toBeTypeOf('function');
