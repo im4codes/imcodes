@@ -255,6 +255,27 @@ describe('SubSessionWindow metadata wiring', () => {
     }
   });
 
+  it('shows task-pair details by default and suppresses them for the split executor window', () => {
+    const baseProps = {
+      sub: makeSubSession({ type: 'codex-sdk' }),
+      ws,
+      connected: true,
+      active: true,
+      onDiff: vi.fn(),
+      onHistory: vi.fn(),
+      onMinimize: vi.fn(),
+      onClose: vi.fn(),
+      onRestart: vi.fn(),
+      onRename: vi.fn(),
+      zIndex: 1,
+      onFocus: vi.fn(),
+    };
+    const view = render(<SubSessionWindow {...baseProps} />);
+    expect(chatViewPropsSpy.mock.calls.at(-1)?.[0].scopeTaskPairs).toBe(true);
+    view.rerender(<SubSessionWindow {...baseProps} showTaskPairPanel={false} />);
+    expect(chatViewPropsSpy.mock.calls.at(-1)?.[0].scopeTaskPairs).toBe(false);
+  });
+
   it('projects canonical peer-audit identity/model metadata into SessionControls', () => {
     render(
       <SubSessionWindow

@@ -4656,6 +4656,7 @@
       "passed": "감사 통과",
       "done": "완료",
       "cancelled": "취소됨",
+      "failed": "실패",
       "rework_round": "재작업 {{round}}차",
       "awaiting_brain_decision": "Brain 결정 대기",
       "paused": "일시 중지됨",

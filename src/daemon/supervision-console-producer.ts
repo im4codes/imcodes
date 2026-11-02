@@ -1111,7 +1111,9 @@ export class SupervisionConsoleProducer {
     if (pairDelta && this.#showsPairs(scope.projectName)) {
       return this.#withAssignmentPass(() => this.#buildSnapshotParts(scope, cursor, true));
     }
-    const now = Date.now();
+    // TTL comparisons must use a monotonic clock. Wall-clock adjustments on a
+    // busy runner can make an otherwise fresh snapshot appear expired.
+    const now = this.#monotonicNowMs();
     const dataVersion = this.#readDataVersion();
     const cached = this.#snapshotCache.get(key);
     if (cached

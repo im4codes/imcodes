@@ -74,6 +74,18 @@ describe('AskQuestionDialog', () => {
     expect(screen.queryByText(/Review the failure/)).toBeNull();
   });
 
+  it('does not submit while an IME is composing, but submits on a normal Enter afterward', () => {
+    const onSubmit = vi.fn();
+    render(<AskQuestionDialog pending={makePending()} onDismiss={vi.fn()} onSubmit={onSubmit} />);
+    const input = screen.getByPlaceholderText('自定义/补充（可选）');
+
+    fireEvent.keyDown(input, { key: 'Enter', code: 'Enter', keyCode: 229, isComposing: true });
+    expect(onSubmit).not.toHaveBeenCalled();
+
+    fireEvent.keyDown(input, { key: 'Enter', code: 'Enter', keyCode: 13, isComposing: false });
+    expect(onSubmit).toHaveBeenCalledWith('[OpenSpec 自动交付] skip');
+  });
+
   it('submits the localized option text shown to the user', () => {
     const onSubmit = vi.fn();
     render(<AskQuestionDialog pending={makePending()} onDismiss={vi.fn()} onSubmit={onSubmit} />);

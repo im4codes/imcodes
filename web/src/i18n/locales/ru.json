@@ -4656,6 +4656,7 @@
       "passed": "Аудит пройден",
       "done": "Готово",
       "cancelled": "Отменена",
+      "failed": "Не выполнено",
       "rework_round": "Доработка, раунд {{round}}",
       "awaiting_brain_decision": "Ожидает решения Brain",
       "paused": "Приостановлено",

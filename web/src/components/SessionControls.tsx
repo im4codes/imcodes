@@ -49,7 +49,7 @@ import { buildMachineSendExtra } from '../util/machine-send.js';
 import { matchInlineMachineTrigger, stripInlineMachineTrigger } from '../util/machine-trigger.js';
 import { MACHINE_IDENTITY_UNAVAILABLE } from '@shared/machine-reference.js';
 import { parseAliasMarkers } from '@shared/alias-types.js';
-import { filterTaskPairReferences, matchTaskPairReferenceTrigger, openTaskPairReferences, replaceTaskPairReferenceTrigger, type TaskPairReference } from '../util/task-pair-reference.js';
+import { filterTaskPairReferences, matchTaskPairReferenceTrigger, openTaskPairReferences, replaceTaskPairReferenceTrigger, taskPairReferenceStatusKey, type TaskPairReference } from '../util/task-pair-reference.js';
 import { CODEX_FAST_OFF_COMMAND, isCodexFastServiceTier } from '@shared/codex-service-tier.js';
 import { isInsufficientCapacityError } from '../upload-error.js';
 import { MobileDpad, DPAD_ARROW_SEQUENCES } from './MobileDpad.js';
@@ -7609,6 +7609,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
                   key={task.taskId}
                   role="option"
                   aria-selected={highlighted ? 'true' : 'false'}
+                  data-task-pair-id={task.taskId}
                   data-task-pair-title={task.title}
                   style={highlighted ? aliasPickerItemHighlightStyle : aliasPickerItemStyle}
                   onMouseDown={(event) => {
@@ -7621,7 +7622,15 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
                   }}
                   onMouseEnter={() => setTaskPairHighlightIdx(idx)}
                 >
-                  <span style={{ fontWeight: 500, color: '#e2e8f0' }}>{task.title}</span>
+                  <span class="controls-task-pair-title">{task.title}</span>
+                  <span
+                    class="controls-task-pair-status-badge"
+                    data-task-pair-status={task.status}
+                    aria-label={t(taskPairReferenceStatusKey(task.status))}
+                    title={t(taskPairReferenceStatusKey(task.status))}
+                  >
+                    {t(taskPairReferenceStatusKey(task.status))}
+                  </span>
                 </div>
               );
             })}

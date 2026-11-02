@@ -271,7 +271,17 @@ async function opened(taskId: string, executor = EXEC, auditor = AUD): Promise<s
 /** Weight an executor would have installed. */
 const weigh = (wt: string) => { put(join(wt, 'node_modules', 'pkg', 'index.js')); put(join(wt, 'web', 'node_modules', 'pkg', 'index.js')); put(join(wt, 'dist', 'bundle.js')); };
 const weighed = (wt: string) => ['node_modules', 'web/node_modules', 'dist'].filter((dir) => existsSync(join(wt, dir)));
+async function waitForTerminalWorkspace(taskId: string): Promise<void> {
+  await vi.waitFor(() => {
+    expect(['ended', 'kept']).toContain(pair(taskId).workspace?.status);
+  }, { timeout: 15_000, interval: 50 });
+  // The terminal transition records the ended workspace before the asynchronous
+  // output copy and hygiene strip. Drain that operation before inspecting
+  // strippedAt or a deliverable below an ignored directory.
+  await taskPairService.waitForIdle();
+}
 async function waitForStripped(taskId: string, wt: string): Promise<void> {
+  await waitForTerminalWorkspace(taskId);
   await vi.waitFor(() => {
     expect(pair(taskId).workspace?.strippedAt).toBeTypeOf('number');
     expect(weighed(wt)).toEqual([]);
@@ -285,6 +295,9 @@ async function resetFinishedForReclaim(taskId: string): Promise<void> {
     updatedAt: now,
     workspace: { ...state.workspace!, status: 'ended', endedAt: now, strippedAt: undefined },
   });
+  // Re-arm the candidate before draining any asynchronous DONE sweep. A late
+  // sweep then observes the new endedAt and cannot overwrite this fixture.
+  await taskPairService.waitForIdle();
   await vi.waitFor(() => {
     expect(getTaskPairStore().listEndedWorkspacePairs().some((stored) => stored.project === PROJECT && stored.state.taskId === taskId)).toBe(true);
   }, { timeout: 15_000, interval: 50 });
@@ -292,6 +305,15 @@ async function resetFinishedForReclaim(taskId: string): Promise<void> {
 async function closed(taskId: string): Promise<string> {
   const wt = await opened(taskId);
   weigh(wt);
+  marker(BRAIN, `<!-- IMCODES_TASK DONE ${taskId} force=true -->`);
+  await waitForStripped(taskId, wt);
+  return wt;
+}
+/** Keep the fixture worktree registered while a later test re-arms it. */
+async function closedForReclaim(taskId: string): Promise<string> {
+  const wt = await opened(taskId);
+  weigh(wt);
+  put(join(wt, '.reclaim-fixture'), 'keep this test worktree registered\n');
   marker(BRAIN, `<!-- IMCODES_TASK DONE ${taskId} force=true -->`);
   await waitForStripped(taskId, wt);
   return wt;
@@ -378,14 +400,13 @@ describe('workspace hygiene through the pair service', () => {
   it('never touches an open pair, even under critical disk pressure', async () => {
     const open = await opened('OPEN1', EXEC2, AUD2);
     weigh(open);
-    const done = await closed('DONE1');
+    const done = await closedForReclaim('DONE1');
     weigh(done);
     await resetFinishedForReclaim('DONE1');
     setTaskPairHygieneDepsForTests({ worktreesRoot, readSpace: async () => ({ freeBytes: 1 * GIB, totalBytes: TOTAL }) });
 
     await taskPairService.checkDiskPressure(Date.now(), { force: true, waitMs: 10_000 });
     await taskPairService.waitForIdle();
-
     expect(weighed(open)).toHaveLength(3);
     expect(pair('OPEN1').workspace?.strippedAt).toBeUndefined();
     await waitForStripped('DONE1', done);
@@ -460,7 +481,7 @@ describe('workspace hygiene through the pair service', () => {
   });
 
   it('a new pair worktree is preceded by a reclaim when the volume is short', async () => {
-    const stale = await closed('STALE1');
+    const stale = await closedForReclaim('STALE1');
     weigh(stale);
     await resetFinishedForReclaim('STALE1');
     const free = () => (existsSync(join(stale, 'node_modules')) ? 4 : 20) * GIB;
@@ -475,7 +496,7 @@ describe('workspace hygiene through the pair service', () => {
   });
 
   it('a reopened pair is open again: it is not stripped, and it is stripped again when it ends', async () => {
-    const wt = await closed('RE1');
+    const wt = await closedForReclaim('RE1');
     expect(weighed(wt)).toEqual([]);
 
     // A Brain QUEUE is the explicit operation that reopens a finished pair.
@@ -543,13 +564,16 @@ describe('workspace hygiene through the pair service', () => {
     expect(pair('KEPT1').workspace?.status).toBe('kept');
   });
 
-  it('keeps a deliverable that still lives in a build directory', async () => {
+  it('copies a deliverable out of a build directory before stripping the source workspace', async () => {
     const wt = await opened('OUT1');
     weigh(wt);
     put(join(wt, 'dist', 'report.md'), 'the result');
     marker(BRAIN, '<!-- IMCODES_TASK DONE OUT1 force=true output=dist/report.md -->');
-    await vi.waitFor(() => expect(pair('OUT1').workspace?.strippedAt).toBeTypeOf('number'), { timeout: 15_000, interval: 50 });
-    expect(existsSync(join(wt, 'dist', 'report.md'))).toBe(true);
+    await waitForTerminalWorkspace('OUT1');
+    expect(pair('OUT1').output?.path).toBe('dist/report.md');
+    expect(pair('OUT1').workspace?.strippedAt).toBeTypeOf('number');
+    expect(readFileSync(join(project, 'dist', 'report.md'), 'utf8')).toBe('the result');
+    expect(existsSync(join(wt, 'dist', 'report.md'))).toBe(false);
     expect(existsSync(join(wt, 'node_modules'))).toBe(false);
   });
 });
