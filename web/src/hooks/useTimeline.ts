@@ -231,7 +231,7 @@ const BACKGROUND_BACKFILL_FAILURE_BACKOFF_BASE_MS = 5_000;
 const BACKGROUND_BACKFILL_FAILURE_BACKOFF_MAX_MS = 60_000;
 const backgroundBackfillGateByCacheKey = new Map<string, { inFlight: number; failureStreak: number; nextAllowedAt: number }>();
 /** Sessions whose stale-window hole is being filled right now (any window): one filler per session. */
-const gapBackfillInFlight = new Set<string>();
+const gapBackfillInFlight = new Map<string, symbol>();
 /**
  * A hole page the daemon keeps trimming to its payload budget is refetched (the dropped events lie inside its
  * range), at most this many times at the same stitched top; after that the filler descends past it so one
@@ -4440,7 +4440,11 @@ export function useTimeline(
         return;
       }
       let holdsGapFiller = isGapFiller;
-      if (isGapFiller) gapBackfillInFlight.add(backfillCacheKey!);
+      let heldFillerToken: symbol | null = null;
+      if (isGapFiller && backfillCacheKey) {
+        heldFillerToken = Symbol('gapFiller');
+        gapBackfillInFlight.set(backfillCacheKey, heldFillerToken);
+      }
       if (gate) gate.inFlight += 1;
       // The lower bound of a catch-up is normally the newest ts the cache holds. While a hole is recorded
       // (or the reopen has not yet decided whether there is one) that would be wrong: the merged tail has
@@ -4532,9 +4536,10 @@ export function useTimeline(
               // While a hole is open the window must keep what it fills in, not only the newest 300.
               const wideMerge = !!backfillCacheKey && !!getTimelineGap(backfillCacheKey);
               // This very page just revealed the hole: from here on this round is its filler.
-              if (wideMerge && !holdsGapFiller && mode !== 'manualLatestWindow') {
+              if (wideMerge && !holdsGapFiller && mode !== 'manualLatestWindow' && backfillCacheKey) {
                 holdsGapFiller = true;
-                gapBackfillInFlight.add(backfillCacheKey!);
+                heldFillerToken = Symbol('gapFiller');
+                gapBackfillInFlight.set(backfillCacheKey, heldFillerToken);
               }
               // Apply large pages in small turns.  A 200-event page can carry
               // megabytes of markdown/tool payload; merging it synchronously
@@ -4678,8 +4683,10 @@ export function useTimeline(
           /* opportunistic — WS path is primary */
         }
         finally {
-          if (holdsGapFiller && backfillCacheKey && scopeGenerationRef.current === roundGeneration) {
-            gapBackfillInFlight.delete(backfillCacheKey);
+          if (holdsGapFiller && backfillCacheKey && heldFillerToken) {
+            if (gapBackfillInFlight.get(backfillCacheKey) === heldFillerToken) {
+              gapBackfillInFlight.delete(backfillCacheKey);
+            }
           }
           if (gate) {
             gate.inFlight = Math.max(0, gate.inFlight - 1);
@@ -4703,42 +4710,42 @@ export function useTimeline(
               if (totalHttpBackfillInFlight(inFlightCounts) === 0) setHttpRefreshing(false);
             }
           }
-        }
-        if (
-          scopeGenerationRef.current === roundGeneration
-          && cacheKeyRef.current === backfillCacheKey
-        ) {
-          if (foregroundRound) {
-            const foregroundState = terminal === 'transient_null'
-              ? (retryAttempt >= HTTP_BACKFILL_RETRY_DELAYS_MS.length ? 'offline' : 'pending')
-              : terminal === 'error' ? 'offline' : 'done';
-            updateHistoryStep('http', foregroundState, phase);
-            if (terminal === 'caught_up') {
+          if (
+            scopeGenerationRef.current === roundGeneration
+            && cacheKeyRef.current === backfillCacheKey
+          ) {
+            if (foregroundRound) {
+              const foregroundState = terminal === 'transient_null'
+                ? (retryAttempt >= HTTP_BACKFILL_RETRY_DELAYS_MS.length ? 'offline' : 'pending')
+                : terminal === 'error' ? 'offline' : 'done';
+              updateHistoryStep('http', foregroundState, phase);
+              if (terminal === 'caught_up') {
+                if (errorSequenceRef.current === roundStartedErrorSeq) {
+                  setHistoryStatus((prev) => (prev.response?.state === 'error' ? { ...prev, response: null } : prev));
+                }
+              } else if (
+                terminal === 'error'
+                || (terminal === 'transient_null' && retryAttempt >= HTTP_BACKFILL_RETRY_DELAYS_MS.length)
+              ) {
+                errorSequenceRef.current += 1;
+                setHistoryStatus((prev) => {
+                  if (prev.steps.daemon === 'done' && prev.response?.state !== 'error') return prev;
+                  return {
+                    ...prev,
+                    response: {
+                      state: 'error',
+                      i18nKey: 'chat.timelineStatus.error',
+                      localizedMessage: localizedTimelineNotice('chat.timelineStatus.error'),
+                      recoverable: true,
+                      source: 'http',
+                    },
+                  };
+                });
+              }
+            } else if (terminal === 'caught_up') {
               if (errorSequenceRef.current === roundStartedErrorSeq) {
                 setHistoryStatus((prev) => (prev.response?.state === 'error' ? { ...prev, response: null } : prev));
               }
-            } else if (
-              terminal === 'error'
-              || (terminal === 'transient_null' && retryAttempt >= HTTP_BACKFILL_RETRY_DELAYS_MS.length)
-            ) {
-              errorSequenceRef.current += 1;
-              setHistoryStatus((prev) => {
-                if (prev.steps.daemon === 'done' && prev.response?.state !== 'error') return prev;
-                return {
-                  ...prev,
-                  response: {
-                    state: 'error',
-                    i18nKey: 'chat.timelineStatus.error',
-                    localizedMessage: localizedTimelineNotice('chat.timelineStatus.error'),
-                    recoverable: true,
-                    source: 'http',
-                  },
-                };
-              });
-            }
-          } else if (terminal === 'caught_up') {
-            if (errorSequenceRef.current === roundStartedErrorSeq) {
-              setHistoryStatus((prev) => (prev.response?.state === 'error' ? { ...prev, response: null } : prev));
             }
           }
         }

@@ -26,6 +26,7 @@ import {
   ingestTimelineEventForCache,
   useTimeline,
 } from '../src/hooks/useTimeline.js';
+import { setTimelineGap, getTimelineGap } from '../src/timeline/catchup/gap-store.js';
 
 function deferred<T>() {
   let resolve!: (value: T | PromiseLike<T>) => void;
@@ -523,12 +524,12 @@ describe('useTimeline — history recovery and error clearing contract', () => {
       } as any;
     }
 
-    function auditFixture(session: string) {
+    function auditFixture(session: string, connected = true) {
       let timeline: any;
       let handler: any;
       let n = 0;
       const ws: any = {
-        connected: true,
+        connected,
         onMessage: (cb: any) => {
           handler = cb;
           return () => { handler = null; };
@@ -711,6 +712,59 @@ describe('useTimeline — history recovery and error clearing contract', () => {
         await vi.advanceTimersByTimeAsync(50);
       });
       expect(f.tl.refreshing).toBe(false);
+    });
+
+    it('audit r2: exhausted null retries surface real offline HTTP failure', async () => {
+      const s = 'audit-null-exhausted';
+      ingestTimelineEventForCache(auditEvent(s), 'audit-server');
+      fetchSpy.mockResolvedValue(null);
+      const f = auditFixture(s, false);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(50);
+        f.tl.forceRefresh();
+        await vi.advanceTimersByTimeAsync(3500);
+      });
+      expect(fetchSpy.mock.calls.length).toBeGreaterThanOrEqual(3);
+      expect(f.tl.historyStatus.response?.state).toBe('error');
+      expect(f.tl.historyStatus.steps.http).toBe('offline');
+    });
+
+    it('audit r2: abandoned gap filler releases ownership so automatic revisit can fill the hole', async () => {
+      const a = 'audit-gap-revisit-a';
+      const b = 'audit-gap-revisit-b';
+      for (const x of [a, b]) ingestTimelineEventForCache(auditEvent(x), 'audit-server');
+      setTimelineGap('audit-server:' + a, { lowerTs: 0, upperTs: 900, createdAt: Date.now() });
+      const pending = deferred<any>();
+      let aCalls = 0;
+      fetchSpy.mockImplementation((_server: any, s: any) => {
+        if (s === a) {
+          aCalls++;
+          return aCalls === 1
+            ? pending.promise
+            : Promise.resolve({ events: [auditEvent(a, 'recovered-gap', 500)], epoch: 1, hasMore: false, nextCursor: null });
+        }
+        return Promise.resolve({ events: [], epoch: 1, hasMore: false, nextCursor: null });
+      });
+      const f = auditFixture(a);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(250);
+      });
+      expect(aCalls).toBe(1);
+      f.switchTo(b);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(250);
+      });
+      await act(async () => {
+        pending.resolve(null);
+        await vi.advanceTimersByTimeAsync(6000);
+      });
+      expect(getTimelineGap('audit-server:' + a)).not.toBeNull();
+      f.switchTo(a);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(500);
+      });
+      expect(aCalls).toBeGreaterThan(1);
+      expect(f.tl.events.some((e: any) => e.eventId === a + 'recovered-gap')).toBe(true);
     });
   });
 });
