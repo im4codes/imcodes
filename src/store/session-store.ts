@@ -1,3 +1,4 @@
+import { AGY_SDK_PROVIDER_ID, AGY_NATIVE_SESSION_STATE, type AgyNativeSessionState } from '../../shared/agy-agent.js';
 import { statSync } from 'node:fs';
 import { Worker } from 'node:worker_threads';
 import { mkdir, readFile, rename, rm } from 'node:fs/promises';
@@ -236,6 +237,8 @@ export interface SessionRecord extends SessionContextBootstrapState {
   providerSessionId?: string;
   /** Provider-side durable resume/session identifier for shared local-sdk providers. */
   providerResumeId?: string;
+  /** AG lazy-create evidence; absent legacy state is unknown, never implicitly fresh. */
+  agyNativeSessionState?: AgyNativeSessionState;
   /** Session description — used for persona/system prompt injection. */
   description?: string;
   /**
@@ -1450,8 +1453,20 @@ export function upsertSession(record: SessionRecord): void {
   const nativeAgentLaunchFence = [record.nativeAgentLaunchFence, existing?.nativeAgentLaunchFence]
     .find((proof) => proof?.sessionInstanceId === sessionInstanceId && proof.runtimeEpoch === runtimeEpoch);
   const { nativeAgentFenceRequired: _requestedMarker, nativeAgentLaunchFence: _requestedProof, ...incoming } = record;
+  const sameAgyRoute = record.agentType === AGY_SDK_PROVIDER_ID
+    && existing?.agentType === AGY_SDK_PROVIDER_ID
+    && !!record.providerSessionId && record.providerSessionId === existing.providerSessionId;
+  // A metadata rebuild must never resurrect an unused proof after native start
+  // or erase its learned id. A new/fresh route is a different conversation.
+  const agyResumeId = sameAgyRoute ? record.providerResumeId || existing.providerResumeId : record.providerResumeId;
+  const agyNativeSessionState = record.agentType === AGY_SDK_PROVIDER_ID
+    ? agyResumeId || (sameAgyRoute && existing.agyNativeSessionState === AGY_NATIVE_SESSION_STATE.STARTED)
+      ? AGY_NATIVE_SESSION_STATE.STARTED
+      : record.agyNativeSessionState ?? (sameAgyRoute ? existing.agyNativeSessionState : undefined)
+    : undefined;
   store.sessions[record.name] = {
     ...incoming,
+    ...(record.agentType === AGY_SDK_PROVIDER_ID ? { providerResumeId: agyResumeId, agyNativeSessionState } : {}),
     sessionInstanceId,
     runtimeEpoch,
     ...(nativeAgentFenceRequired ? { nativeAgentFenceRequired } : {}),
@@ -1587,12 +1602,16 @@ export function updateSessionState(name: string, state: SessionState, error?: st
   scheduleWrite();
 }
 
-export async function flushStore(): Promise<void> {
+export async function flushStore(options: { requireWrite?: boolean } = {}): Promise<void> {
   // A CLI stop/status process can import lifecycle.shutdown without ever
   // loading the daemon store or acquiring its lock. It must not flush the
   // initial empty in-memory value over the live daemon's sessions.
-  if (!storeLoaded && !isUnderTestRunner()) return;
+  if (!storeLoaded && !isUnderTestRunner()) {
+    if (options.requireWrite) throw new Error('session store is not loaded');
+    return;
+  }
   const targetPath = writeTimerPath ?? dbPath();
+  if (options.requireWrite && !hasWriteAuthority(targetPath)) throw new Error('session store write authority unavailable');
   if (writeTimer) {
     clearTimeout(writeTimer);
     writeTimer = null;

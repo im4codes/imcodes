@@ -1,3 +1,5 @@
+import { AGY_NATIVE_SESSION_STATE, AGY_SDK_PROVIDER_ID } from '../../shared/agy-agent.js';
+import { persistAgyNativeSessionStart } from './agy-session-persistence.js';
 import { queuedUserMessageAttribution } from './transport-queued-user-message.js';
 import { paceByEventLoopHealth } from '../util/event-loop-backpressure.js';
 import { RESTORE_PACING_MIN_GAP_MS, RESTORE_PACING_TOTAL_WAIT_BUDGET_MS } from '../../shared/event-loop-backpressure.js';
@@ -1239,7 +1241,20 @@ function stopStructuredWatchers(sessionName: string): void {
   stopOpenCodeWatching(sessionName);
 }
 
+const cancelledTransportStarts = new WeakSet<Promise<void>>();
+
 export async function stopTransportRuntimeSession(
+  sessionName: string,
+  options: { preserveTransportQueue?: boolean } = {},
+): Promise<void> {
+  // Stop must also fence a launch/restore whose provider id has not bound yet.
+  for (const pending of [transportLaunchInFlight.get(sessionName), transportSessionRestoreInFlight.get(sessionName)]) {
+    if (pending) cancelledTransportStarts.add(pending);
+  }
+  await detachTransportRuntimeSession(sessionName, options);
+}
+
+async function detachTransportRuntimeSession(
   sessionName: string,
   options: { preserveTransportQueue?: boolean } = {},
 ): Promise<void> {
@@ -2327,6 +2342,18 @@ function mergeSessionContextBootstrap(next: SessionRecord, info: SessionInfoUpda
   return changed;
 }
 
+function agyNativeStartBarrier(runtime: TransportSessionRuntime, sessionName: string): () => Promise<void> {
+  return async () => {
+    const record = getSession(sessionName);
+    const owner = runtime.recipientIdentity;
+    if (!record || (owner && (record.sessionInstanceId !== owner.sessionInstanceId || record.runtimeEpoch !== owner.runtimeEpoch))
+      || record.providerSessionId !== runtime.providerSessionId) {
+      throw Object.assign(new Error('AG start owner changed'), { code: PROVIDER_ERROR_CODES.CANCELLED, recoverable: false });
+    }
+    await persistAgyNativeSessionStart(sessionName, { ...record }, () => transportRuntimes.get(sessionName) === runtime);
+  };
+}
+
 function wireTransportSessionInfo(
   runtime: TransportSessionRuntime,
   sessionName: string,
@@ -2342,6 +2369,12 @@ function wireTransportSessionInfo(
     if (persistence && (!existing || !persistence.canPersist(existing))) return;
     latestInfo = { ...(latestInfo ?? {}), ...info };
     if (!existing) return;
+    if (!persistence) {
+      const owner = runtime.recipientIdentity;
+      if (owner && (existing.sessionInstanceId !== owner.sessionInstanceId || existing.runtimeEpoch !== owner.runtimeEpoch)) return;
+      if (existing.agentType !== agentType) return;
+      if (runtime.providerSessionId && existing.providerSessionId !== runtime.providerSessionId) return;
+    }
     const next: SessionRecord = { ...existing };
     let changed = false;
 
@@ -2792,6 +2825,7 @@ export async function restoreTransportSessions(
   // the main thread anyway; every store write is keyed by session name.
   type Restorable = SessionRecord & { providerId: string; providerSessionId: string };
   type RestoreAuthority = {
+    agyNativeSessionState: string;
     sessionInstanceId: string;
     createdAt: number;
     runtimeEpoch: string;
@@ -2810,6 +2844,7 @@ export async function restoreTransportSessions(
     transportConfig: string;
   };
   const buildRestoreAuthority = (record: SessionRecord): RestoreAuthority => ({
+    agyNativeSessionState: record.agyNativeSessionState ?? '',
     sessionInstanceId: record.sessionInstanceId?.trim() ?? '',
     createdAt: record.createdAt,
     runtimeEpoch: record.runtimeEpoch?.trim() ?? '',
@@ -2841,6 +2876,7 @@ export async function restoreTransportSessions(
       && actual.agentType === expected.agentType
       && actual.providerSessionId === expected.providerSessionId
       && actual.providerResumeId === expected.providerResumeId
+      && actual.agyNativeSessionState === expected.agyNativeSessionState
       && actual.projectDirectory === expected.projectDirectory
       && actual.label === expected.label
       && actual.requestedModel === expected.requestedModel
@@ -2897,7 +2933,9 @@ export async function restoreTransportSessions(
     };
     const rejectStaleRestoreInstance = (stage: string): boolean => {
       const current = getSession(s.name);
-      if (current && matchesRestoreAuthority(current, expectedAuthority)) return false;
+      const pending = transportSessionRestoreInFlight.get(s.name);
+      if (current && matchesRestoreAuthority(current, expectedAuthority)
+        && !(s.providerId === AGY_SDK_PROVIDER_ID && pending && cancelledTransportStarts.has(pending))) return false;
       logger.warn({
         session: s.name,
         providerId: s.providerId,
@@ -2928,7 +2966,7 @@ export async function restoreTransportSessions(
       if (preservation.preservedCount > 0) {
         logger.info({ sessionName: s.name, ...preservation }, 'preserved unbound transport runtime queues before restore');
       }
-      await stopTransportRuntimeSession(s.name, { preserveTransportQueue: preservation.preservedCount > 0 }).catch((err) => {
+      await detachTransportRuntimeSession(s.name, { preserveTransportQueue: preservation.preservedCount > 0 }).catch((err) => {
         logger.warn({ err, session: s.name }, 'Failed to stop unbound transport runtime before restore');
       });
       if (rejectStaleRestoreInstance('after_existing_runtime_stop')) return;
@@ -2936,7 +2974,9 @@ export async function restoreTransportSessions(
     try {
       const provider = getProvider(s.providerId);
       if (!provider) return;
-      if (usesProviderResumeId(s.providerId) && !s.providerResumeId) {
+      const unusedAgy = s.providerId === AGY_SDK_PROVIDER_ID
+        && s.agyNativeSessionState === AGY_NATIVE_SESSION_STATE.UNSTARTED;
+      if (usesProviderResumeId(s.providerId) && !s.providerResumeId && !unusedAgy) {
         if (!provider.listSessions) {
           noteUnboundRestore(s, 'provider_cannot_list_sessions', 'Transport restore requires a durable provider id but the provider cannot list sessions');
           return;
@@ -3086,11 +3126,16 @@ export async function restoreTransportSessions(
       // until the runtime is committed below.
       wireTransportCallbacks(runtime, s.name, { deferProviderReadyDrain: true });
       const getLatestSessionInfo = wireTransportSessionInfo(runtime, s.name, s.agentType, {
-        canPersist: (record) => (
-          restoreCommitted
+        canPersist: (record) => {
+          if (s.providerId === AGY_SDK_PROVIDER_ID) {
+            const pending = transportSessionRestoreInFlight.get(s.name);
+            if ((pending && cancelledTransportStarts.has(pending))
+              || (restoreCommitted && transportRuntimes.get(s.name) !== runtime)) return false;
+          }
+          return restoreCommitted
             ? matchesRestoreRuntimeIdentity(record, expectedAuthority)
-            : matchesRestoreAuthority(record, expectedAuthority)
-        ),
+            : matchesRestoreAuthority(record, expectedAuthority);
+        },
         onPersisted: refreshRestoreAuthority,
       });
       // After cancel, qwenFreshOnResume is set — don't resume the stuck conversation.
@@ -3216,7 +3261,8 @@ export async function restoreTransportSessions(
       // process we are about to start.
       const restoreIdentity = getSession(s.name) ?? s;
       const restoredSessionInstanceId = restoreIdentity.sessionInstanceId?.trim();
-      const restoredRuntimeEpoch = restoreIdentity.runtimeEpoch?.trim();
+      const restoredRuntimeEpoch = s.providerId === AGY_SDK_PROVIDER_ID
+        ? randomUUID() : restoreIdentity.runtimeEpoch?.trim();
       await runtime.initialize({
         sessionKey: effectiveSessionKey,
         sessionName: s.name,
@@ -3255,6 +3301,7 @@ export async function restoreTransportSessions(
         ...(dshLlmConfig ? { llm: dshLlmConfig } : {}),
         ...(piLlmConfig ? { piLlm: piLlmConfig } : {}),
         resumeId,
+        ...(s.providerId === AGY_SDK_PROVIDER_ID ? { beforeNativeSessionStart: agyNativeStartBarrier(runtime, s.name) } : {}),
         effort: s.effort,
         // Restore path: only re-inject startup memory if the prior run hadn't
         // yet delivered it (e.g. daemon crashed mid-first-turn). Otherwise the
@@ -3280,11 +3327,18 @@ export async function restoreTransportSessions(
       runtime.setSessionIdentity(s.name, currentForFinalize.label, currentForFinalize.role);
       if (effectiveRequestedModel) runtime.setAgentId(effectiveRequestedModel);
       if (currentForFinalize.effort) runtime.setEffort(currentForFinalize.effort);
+      // AG's first native spawn is fenced by the persisted epoch. Bind the
+      // old queue owner before rotating, then move it to the committed epoch.
+      if (s.providerId === AGY_SDK_PROVIDER_ID && runtime.recipientIdentity && !runtime.adoptOrRebindQueueRecipient()) {
+        await runtime.kill({ detachProviderSession: true, preserveTransportQueue: true });
+        return;
+      }
       transportRuntimes.set(s.name, runtime);
       const actualProviderSid = runtime.providerSessionId ?? effectiveSessionKey;
       registerProviderRoute(actualProviderSid, s.name);
       const restoredRecord: SessionRecord = {
         ...currentForFinalize,
+        ...(s.providerId === AGY_SDK_PROVIDER_ID ? { runtimeEpoch: restoredRuntimeEpoch } : {}),
         state: 'idle',
         updatedAt: Date.now(),
         ...(freshOnRestore ? { summarySyncFingerprints: undefined } : {}),
@@ -3337,6 +3391,14 @@ export async function restoreTransportSessions(
       };
       upsertSession(restoredRecord);
       const persistedRestoredRecord = getSession(s.name) ?? restoredRecord;
+      const oldRecipient = runtime.recipientIdentity;
+      const newRecipient = recipientFromSessionRecord(persistedRestoredRecord);
+      if (s.providerId === AGY_SDK_PROVIDER_ID && oldRecipient && newRecipient
+        && !runtime.rebindQueueRecipient(oldRecipient, newRecipient)) {
+        transportRuntimes.delete(s.name); unregisterProviderRoute(actualProviderSid);
+        await runtime.kill({ detachProviderSession: true, preserveTransportQueue: true });
+        return;
+      }
       refreshRestoreAuthority(persistedRestoredRecord);
       restoreCommitted = true;
       emitTransportSessionRestored(s.name);
@@ -3536,8 +3598,23 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
     launchRecipient,
     launchRecord ? { sessionCreatedAt: launchRecord.createdAt } : undefined,
   );
-  wireTransportCallbacks(runtime, name);
-  const getLatestSessionInfo = wireTransportSessionInfo(runtime, name, agentType);
+  wireTransportCallbacks(runtime, name, { deferProviderReadyDrain: agentType === AGY_SDK_PROVIDER_ID });
+  let agyLaunchCommitted = false;
+  const ownsAgyLaunch = (record: SessionRecord | null | undefined): boolean => {
+    const pending = transportLaunchInFlight.get(name);
+    if (pending && cancelledTransportStarts.has(pending)) return false;
+    if (agyLaunchCommitted) {
+      const owner = runtime.recipientIdentity;
+      return !!record && transportRuntimes.get(name) === runtime && record.providerSessionId === runtime.providerSessionId
+        && (!owner || (record.sessionInstanceId === owner.sessionInstanceId && record.runtimeEpoch === owner.runtimeEpoch));
+    }
+    return existing ? !!record && record.sessionInstanceId === existing.sessionInstanceId
+      && record.runtimeEpoch === existing.runtimeEpoch && record.providerSessionId === existing.providerSessionId
+      && record.providerResumeId === existing.providerResumeId && record.createdAt === existing.createdAt
+      && record.agentType === existing.agentType : !record;
+  };
+  const getLatestSessionInfo = wireTransportSessionInfo(runtime, name, agentType,
+    agentType === AGY_SDK_PROVIDER_ID ? { canPersist: record => agyLaunchCommitted && ownsAgyLaunch(record) } : undefined);
   let effectiveSessionKey = name;
   let effectiveBindExistingKey = bindExistingKey;
   let effectiveSkipCreate = skipCreate;
@@ -3549,6 +3626,11 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
   let transportSettings: string | Record<string, unknown> | undefined;
   let dshLlmConfig: DshLlmConfig | undefined;
   let piLlmConfig: PiLlmConfig | undefined;
+  if (agentType === AGY_SDK_PROVIDER_ID && existing?.agentType === AGY_SDK_PROVIDER_ID
+    && !opts.fresh && !opts.providerResumeId && !existing.providerResumeId
+    && existing.agyNativeSessionState !== AGY_NATIVE_SESSION_STATE.UNSTARTED) {
+    throw new Error('AG conversation requires a trusted resume id; refusing an implicit fresh launch');
+  }
   const storedRequestedModel = !opts.fresh ? existing?.requestedModel : undefined;
   const storedProviderResumeId = (!opts.fresh && (existing?.providerId ?? existing?.agentType) === agentType)
     ? existing?.providerResumeId
@@ -3830,12 +3912,17 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
     bindExistingKey: effectiveBindExistingKey,
     skipCreate: effectiveSkipCreate,
     resumeId: transportResumeId,
+    ...(agentType === AGY_SDK_PROVIDER_ID && (!skipStore || existing) ? { beforeNativeSessionStart: agyNativeStartBarrier(runtime, name) } : {}),
     effort: effectiveEffort,
     ...(existing?.crossVendorHandoff?.pending && !opts.fresh
       ? { pendingHandoff: existing.crossVendorHandoff.pending }
       : {}),
     startupMemoryAlreadyInjected: preserveStartupMemoryInject,
   });
+  if (agentType === AGY_SDK_PROVIDER_ID && !ownsAgyLaunch(getSession(name))) {
+    await runtime.kill({ detachProviderSession: true });
+    throw Object.assign(new Error('AG launch owner changed'), { code: PROVIDER_ERROR_CODES.CANCELLED, recoverable: false });
+  }
   const latestSessionInfo = getLatestSessionInfo();
   // Atomic: store runtime + register provider route + persist — rollback all on failure
   const providerSid = runtime.providerSessionId;
@@ -3860,6 +3947,10 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
         runtimeType: RUNTIME_TYPES.TRANSPORT,
         providerId: provider.id,
         providerSessionId: runtime.providerSessionId ?? undefined,
+        ...(agentType === AGY_SDK_PROVIDER_ID ? {
+          agyNativeSessionState: transportResumeId || latestSessionInfo?.resumeId
+            ? AGY_NATIVE_SESSION_STATE.STARTED : AGY_NATIVE_SESSION_STATE.UNSTARTED,
+        } : {}),
         ...(usesProviderResumeId(agentType) && (latestSessionInfo?.resumeId ?? transportResumeId)
           ? { providerResumeId: latestSessionInfo?.resumeId ?? transportResumeId }
           : {}),
@@ -3952,6 +4043,18 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
       emitSessionPersist(persistedRecord ?? record, name);
     }
 
+    if (skipStore && agentType === AGY_SDK_PROVIDER_ID && existing) {
+      const current = getSession(name);
+      if (!current || current.sessionInstanceId !== existing.sessionInstanceId) throw new Error('AG launch owner changed');
+      upsertSession({ ...current, providerSessionId: providerSid ?? undefined,
+        providerResumeId: latestSessionInfo?.resumeId ?? transportResumeId,
+        agyNativeSessionState: latestSessionInfo?.resumeId || transportResumeId
+          ? AGY_NATIVE_SESSION_STATE.STARTED : AGY_NATIVE_SESSION_STATE.UNSTARTED });
+      const recipient = recipientFromSessionRecord(getSession(name));
+      if (recipient && runtime.recipientIdentity && !runtime.adoptOrRebindQueueRecipient()) throw new Error('AG launch recipient changed');
+    }
+    agyLaunchCommitted = true;
+    if (agentType === AGY_SDK_PROVIDER_ID) wireTransportProviderReadyDrain(runtime, name);
     emitSessionEvent('started', name, 'idle');
     logger.info({ session: name, agentType, providerId: provider.id }, 'Launched transport session');
   } catch (err) {

@@ -40,7 +40,8 @@ const resumeIdx = args.indexOf('--conversation');
 if (process.env.FAKE_AGY_IDENTITY_FILE) fs.appendFileSync(process.env.FAKE_AGY_IDENTITY_FILE, JSON.stringify({ resumeId: resumeIdx >= 0 ? args[resumeIdx + 1] : null, ...Object.fromEntries(${JSON.stringify([IMCODES_SESSION_ENV,E.SESSION_NAME,E.SESSION_INSTANCE_ID,E.RUNTIME_EPOCH,E.PROVIDER_ID])}.map(k => [k, process.env[k]])) }) + '\\n');
 const convId = resumeIdx >= 0 ? args[resumeIdx + 1] : 'conv-' + process.pid;
 const emit = (o) => process.stdout.write(JSON.stringify(o) + '\\n');
-emit({ event: 'init', conversation_id: convId, init: { cwd: process.cwd(), tools: [], permission_mode: 'always-proceed' } });
+const init=()=>emit({ event: 'init', conversation_id: convId, init: { cwd: process.cwd(), tools: [], permission_mode: 'always-proceed' } });
+if(process.env.FAKE_AGY_DELAY_INIT) setTimeout(init,200); else init();
 let step = 0;
 let buf = '';
 process.stdin.on('data', (d) => {
@@ -334,6 +335,61 @@ describe('AgySdkProvider (fake agy process)', () => {
     await provider.send(sid, contextPayload(contractV2, 'after process restart'));
     await waitFor(() => completes.length === 5);
     expect(inputs()[5]).toContain(contractV2);
+  });
+
+  it('never spawns before the start barrier commits, and a failed barrier cannot start a child', async () => {
+    let resolve!: () => void;
+    const barrier = vi.fn(() => new Promise<void>(r => { resolve = r; }));
+    const sid = await provider.createSession({ sessionKey: 'barrier', cwd: dir, beforeNativeSessionStart: barrier });
+    const send = provider.send(sid, 'hello');
+    await waitFor(() => barrier.mock.calls.length === 1);
+    expect(launches()).toEqual([]);
+    resolve(); await send; await waitFor(() => completes.length === 1);
+    expect(launches()).toHaveLength(1);
+    const failed = await provider.createSession({ sessionKey: 'failed-barrier', cwd: dir,
+      beforeNativeSessionStart: async () => { throw new Error('disk full'); } });
+    await expect(provider.send(failed, 'hello')).rejects.toThrow('disk full');
+    expect(launches()).toHaveLength(1);
+  });
+
+  it('shares a pending start commit across concurrent inputs without duplicate children', async () => {
+    let resolve!: () => void;
+    const barrier = vi.fn(() => new Promise<void>(r => { resolve = r; }));
+    const sid = await provider.createSession({ sessionKey: 'concurrent-start', cwd: dir, beforeNativeSessionStart: barrier });
+    const first = provider.send(sid, 'first'); const second = provider.send(sid, 'second');
+    await waitFor(() => barrier.mock.calls.length > 0);
+    expect(barrier).toHaveBeenCalledTimes(1); expect(launches()).toEqual([]);
+    resolve(); await Promise.all([first, second]); await waitFor(() => completes.length === 2);
+    expect(launches()).toHaveLength(1); expect(inputs()).toEqual(['first','second']);
+  });
+
+  it.each(['stop', 'stopAndWait', 'end', 'rebind', 'disconnect'])('does not spawn after %s supersedes a pending start commit', async action => {
+    let resolve!: () => void;
+    let entered = false;
+    const sid = await provider.createSession({ sessionKey: 'pending-start', cwd: dir,
+      beforeNativeSessionStart: () => new Promise<void>(r => { entered = true; resolve = r; }) });
+    const send = provider.send(sid, 'hello');
+    const rejected = expect(send).rejects.toMatchObject({ code: PROVIDER_ERROR_CODES.CANCELLED });
+    await waitFor(() => entered);
+    if (action === 'stop') await provider.cancel(sid);
+    else if (action === 'stopAndWait') await provider.cancelAndWait(sid);
+    else if (action === 'end') await provider.endSession(sid);
+    else if (action === 'rebind') await provider.createSession({ sessionKey: sid, cwd: dir, fresh: true });
+    else await provider.disconnect();
+    resolve(); await rejected;
+    expect(launches()).toEqual([]);
+    expect(inputs()).toEqual([]);
+  });
+
+  it.each(['stop','end','rebind','disconnect'])('drops a delayed native init after %s',async action=>{
+    const sid=await provider.createSession({sessionKey:'delayed-init',cwd:dir,env:{FAKE_AGY_DELAY_INIT:'1'}});
+    await provider.send(sid,'HANG');await waitFor(()=>launches().length===1);
+    if(action==='stop')await provider.cancelAndWait(sid);
+    else if(action==='end')await provider.endSession(sid);
+    else if(action==='rebind')await provider.createSession({sessionKey:sid,cwd:dir,fresh:true});
+    else await provider.disconnect();
+    await new Promise(r=>setTimeout(r,250));
+    expect(infos).toEqual([]);expect(completes).toEqual([]);
   });
 
   it('streams deltas, completes the turn and reports the conversation id for resume', async () => {

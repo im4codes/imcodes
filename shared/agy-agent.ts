@@ -94,3 +94,14 @@ export const AGY_FALLBACK_MODEL_IDS = [
 ] as const;
 
 export const AGY_DEFAULT_MODEL_ID = 'gemini-3.8-flash-high' as const;
+
+/** Persisted evidence for AG's lazy native-conversation creation. Missing means
+ * unknown, NOT unused. STARTED is monotone for one provider route. */
+export const AGY_NATIVE_SESSION_STATE = {
+  UNSTARTED: 'unstarted',
+  STARTED: 'started',
+} as const;
+export type AgyNativeSessionState = typeof AGY_NATIVE_SESSION_STATE[keyof typeof AGY_NATIVE_SESSION_STATE];
+
+/** Local adapter evidence: persistence failed before any native process/input. */
+export const AGY_NATIVE_START_NOT_ATTEMPTED = 'agyNativeStartNotAttempted' as const;
