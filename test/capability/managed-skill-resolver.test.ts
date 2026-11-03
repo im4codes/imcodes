@@ -21,7 +21,7 @@ import { collectSkillStartupCandidates } from '../../src/context/skill-startup-c
 import { readManagedSkillResource, resolveSkillByKey } from '../../src/context/skill-resolver.js';
 import { activateCapabilitySkill } from '../../src/capability/capability-skill-activation.js';
 import { createDefaultCapabilityService } from '../../src/capability/capability-service-adapter.js';
-import { CAPABILITY_KIND, CAPABILITY_READINESS, CAPABILITY_SCOPE, CAPABILITY_STATE } from '../../shared/capability-management.js';
+import { CAPABILITY_CANONICAL_INSTALL_POLICY, CAPABILITY_KIND, CAPABILITY_READINESS, CAPABILITY_SCOPE, CAPABILITY_STATE } from '../../shared/capability-management.js';
 import { authorizedManagedBindings } from './capability-authorization-fixture.js';
 
 const namespace = { scope: 'personal' as const, userId: 'owner', projectId: 'project-1' };
@@ -108,11 +108,17 @@ describe('managed Skill resolver and provider projection', () => {
     }, homeDir);
 
     const startup = collectSkillStartupCandidates({ namespace, homeDir, serverId: 'server-1', featureEnabled: true });
-    expect(startup.map((entry) => entry.text).join('\n')).toContain('managed/portable');
-    expect(startup.map((entry) => entry.text).join('\n')).not.toContain('Full managed instructions.');
-    expect(startup.map((entry) => entry.text).join('\n')).toContain('capability_status');
-    expect(startup.map((entry) => entry.text).join('\n')).toContain('resources: Additional package resources are unavailable');
-    expect(startup.map((entry) => entry.text).join('\n')).toContain('~/.agents/skills');
+    const startupText = startup.map((entry) => entry.text).join('\n');
+    expect(startupText).toContain('managed/portable');
+    expect(startupText).not.toContain('Full managed instructions.');
+    expect(startupText).toContain('capability_status');
+    expect(startupText).toContain('resources: Additional package resources are unavailable');
+    expect(startupText).toContain(CAPABILITY_CANONICAL_INSTALL_POLICY);
+    expect(startupText).toContain('npx skills add <source>');
+    expect(startupText).toContain('project-local default');
+    expect(startupText).toContain('add --global only when the user requests');
+    expect(startupText).toContain('Do not use IM.codes capability tools, its managed-package registry');
+    expect(startupText).toContain('Manage MCP services through IM.codes capability tools.');
 
     const resolved = resolveSkillByKey({ namespace, homeDir, serverId: 'server-1', key: 'managed/portable' });
     expect(resolved).toMatchObject({ ok: true, layer: 'managed_registry', registryId: 'portable-registry' });
