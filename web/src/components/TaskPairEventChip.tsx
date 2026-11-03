@@ -384,7 +384,7 @@ export function TaskPairEventChip({ eventId, payload, timestamp, sessions }: { e
           {brainNoticeText && <span class={`task-pair-card-brain-notice is-${brainNotice!.status}`} data-brain-notice={brainNotice!.status}>{brainNoticeText}</span>}
         </button>
       </header>
-      <div class="task-pair-card-overview">
+      {!isMobile && <div class="task-pair-card-overview">
         <span class="task-pair-card-event-meta">{verb}</span>
         <div class="task-pair-card-overview-roles">
           {roleLabel(event.executor, event.executorLabel, event.executorModel, event.executorThinking, 'executor', !expanded)}
@@ -392,7 +392,7 @@ export function TaskPairEventChip({ eventId, payload, timestamp, sessions }: { e
         </div>
         {!expanded && overviewNoticeText && <p class="task-pair-card-overview-note" title={overviewNoticeText}>{overviewNoticeText}{noticeText.length > 320 ? '…' : ''}</p>}
         {!expanded && isCancelledEvent && <p class="task-pair-card-overview-note" title={cancelReason}>{t('taskPair.card_cancel_reason', { value: cancelReason })}</p>}
-      </div>
+      </div>}
       {expanded && <>
         <div class="task-pair-card-body">
           <span class="task-pair-chip-text">
@@ -403,6 +403,8 @@ export function TaskPairEventChip({ eventId, payload, timestamp, sessions }: { e
           {renderAuditDetails()}
           {noticeText && <pre class="task-pair-card-notice">{safeDetailText(noticeText)}</pre>}
           <span class="task-pair-card-event-meta"><span>{t('taskPair.card_event')}</span>{verb}</span>
+          {isMobile && roleLabel(event.executor, event.executorLabel, event.executorModel, event.executorThinking, 'executor')}
+          {isMobile && roleLabel(event.auditor, event.auditorLabel, event.auditorModel, event.auditorThinking, 'auditor')}
           {isStatus(event.toStatus) && <TaskPairEventDecisions key={taskId} taskId={taskId} status={event.toStatus} />}
           {!isMobile && typeof event.executor === 'string' && event.executor && event.executor !== 'none' && typeof event.auditor === 'string' && event.auditor && event.auditor !== 'none' && (() => {
             const taskIdStr = String(taskId);

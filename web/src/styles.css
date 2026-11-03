@@ -14996,22 +14996,11 @@ button.quick-agent-delegation-preset.active {
 .task-pair-event-card .task-pair-chip-verdict { color: #c4b5fd; background: rgba(30, 41, 59, 0.72); }
 .task-pair-event-card .task-pair-chip-held { color: #fde68a; border-color: rgba(251, 191, 36, 0.5); background: rgba(120, 53, 15, 0.24); }
 .task-pair-event-card .task-pair-chip-unusual { color: #fca5a5; border-color: rgba(248, 113, 113, 0.42); background: rgba(127, 29, 29, 0.2); opacity: 1; }
-@media (max-width: 720px) {
-  .task-pair-event-card { padding: 4px 7px; gap: 2px; }
-  .task-pair-card-toggle { align-items: center; gap: 2px 6px; }
-  .task-pair-event-card .task-pair-chip-task { order: 6; flex: 1 1 100%; min-width: 0; }
-  .task-pair-event-card:not(.is-expanded) .task-pair-chip-task strong {
-    display: -webkit-box;
-    -webkit-box-orient: vertical;
-    -webkit-line-clamp: 2;
-    line-clamp: 2;
-    white-space: normal;
-    overflow: hidden;
-    text-overflow: ellipsis;
-  }
-  .task-pair-card-chevron { order: 5; margin-left: auto; }
-  .task-pair-card-brain-notice { order: 7; }
-  .task-pair-event-card .task-pair-chip-status { align-self: center; }
+@media (max-width: 640px) {
+  .task-pair-event-card { padding: 9px 10px; }
+  .task-pair-card-toggle { align-items: center; gap: 7px; }
+  .task-pair-card-heading { gap: 4px 6px; }
+  .task-pair-event-card .task-pair-chip-status { align-self: flex-start; }
   .task-pair-card-body { align-items: flex-start; flex-direction: column; gap: 5px; }
 }
 @media (prefers-reduced-motion: reduce) {
@@ -15651,12 +15640,13 @@ button.quick-agent-delegation-preset.active {
 .task-pair-card-overview {
   min-width: 0;
   display: flex;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
   align-items: center;
   gap: 3px 10px;
   font-size: 11px;
   line-height: 1.35;
   margin: 0;
+  overflow: hidden;
 }
 .task-pair-card-overview .task-pair-card-event-meta {
   font-size: 10px;
@@ -15669,21 +15659,26 @@ button.quick-agent-delegation-preset.active {
 .task-pair-card-overview-roles {
   min-width: 0;
   display: inline-flex;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
   align-items: center;
   gap: 3px 10px;
+  overflow: hidden;
+  flex: 0 1 auto;
 }
 .task-pair-card-overview .task-pair-card-role {
   display: inline-flex;
   align-items: center;
   gap: 4px;
   white-space: nowrap;
+  flex: 0 1 auto;
+  min-width: 0;
 }
 .task-pair-card-overview .task-pair-card-role-label {
   font-size: 10px;
   font-weight: 700;
   color: #64748b;
   text-transform: uppercase;
+  flex: 0 0 auto;
 }
 .task-pair-card-overview .task-pair-chip-session {
   font-size: 11px;
@@ -15693,6 +15688,7 @@ button.quick-agent-delegation-preset.active {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+  flex: 0 1 auto;
 }
 .task-pair-card-overview .task-pair-card-role-model {
   font-size: 11px;
@@ -15702,20 +15698,18 @@ button.quick-agent-delegation-preset.active {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+  flex: 0 1 auto;
 }
 .task-pair-card-overview-note {
   min-width: 0;
-  flex: 1 1 100%;
+  flex: 0 1 auto;
+  max-width: 260px;
   margin: 0;
   color: #cbd5e1;
   font-size: 11px;
-  display: -webkit-box;
-  -webkit-line-clamp: 1;
-  line-clamp: 1;
-  -webkit-box-orient: vertical;
+  white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-  white-space: normal;
 }
 .task-pair-card-decision-loading { color: #94a3b8; }
 .task-pair-card-decision-error { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; font-size: 12px; }
@@ -15737,14 +15731,4 @@ button.quick-agent-delegation-preset.active {
     text-overflow: ellipsis;
   }
   .task-pair-event-card:not(.is-expanded) .task-pair-card-chevron { order: 5; flex: 0 0 auto; margin-left: auto; }
-}
-@media (max-width: 720px) {
-  .task-pair-card-overview { gap: 2px 6px; font-size: 10px; line-height: 1.25; }
-  .task-pair-card-overview-roles { display: contents; }
-  .task-pair-card-overview .task-pair-chip-session { font-size: 10px; padding: 1px 4px; min-height: 16px; max-width: 90px; }
-  .task-pair-card-overview .task-pair-card-role { gap: 3px; }
-  .task-pair-card-overview .task-pair-card-role-model { font-size: 10px; max-width: 110px; }
-  .task-pair-card-overview .task-pair-card-role-label { font-size: 9px; }
-  .task-pair-card-overview .task-pair-card-event-meta { font-size: 9px; }
-  .task-pair-card-overview-note { font-size: 10px; }
 }

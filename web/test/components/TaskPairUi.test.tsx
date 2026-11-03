@@ -1545,8 +1545,8 @@ describe('TaskPairEventChip status colours', () => {
     }
   });
 
-  it('renders compact overview with roles, models, notices, and cancel reasons across mobile and desktop without expanding', () => {
-    // 1. Cancelled event with cancelReason, roles, and models
+  it('renders compact overview on desktop without increasing height, while keeping mobile collapsed overview null and accessible on expansion', () => {
+    // 1. Cancelled event with cancelReason, roles, and models on desktop
     const { container: cancelView } = render(<TaskPairEventChip eventId="e-mobile-cancel" payload={{
       taskId: 'cancel-m', title: 'Cancelled boundary', writer: 'daemon',
       verb: 'CANCEL', toStatus: 'cancelled',
