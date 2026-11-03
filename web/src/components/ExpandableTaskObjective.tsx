@@ -20,6 +20,8 @@ export function ExpandableTaskObjective(props: {
   text: string;
   className?: string;
   textClassName?: string;
+  /** Opt-in accessible name for a CSS-scrollable text area; absent for ordinary clamped objectives. */
+  scrollLabel?: string;
   id?: string;
   measureOverflow?: TaskObjectiveOverflowMeasure;
   measureMultiline?: TaskObjectiveMultilineMeasure;
@@ -83,6 +85,9 @@ export function ExpandableTaskObjective(props: {
       ref={textRef}
       id={textId}
       class={`expandable-task-objective-text ${props.textClassName ?? ''}${!expanded ? ' is-clamped' : ' is-expanded'}${!expanded && multiline ? ' is-multiline' : ''}`.trim()}
+      tabIndex={props.scrollLabel && overflowing ? 0 : undefined}
+      role={props.scrollLabel && overflowing ? 'region' : undefined}
+      aria-label={overflowing ? props.scrollLabel : undefined}
       data-testid="expandable-task-objective-text"
     >
       {props.text}

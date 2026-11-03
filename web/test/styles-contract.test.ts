@@ -84,6 +84,20 @@ describe('styles.css regression contracts', () => {
     : '';
   const cssWithoutComments = css.replace(/\/\*[\s\S]*?\*\//g, '');
 
+  it('keeps compact decision copy a native five-line scrollport and contains only overflowing copy', () => {
+    const text = css.match(/\.task-pair-decision-copy \.expandable-task-objective-text\s*\{[^}]*\}/)?.[0];
+    expect(text).toMatch(/overflow-y:\s*auto/);
+    expect(text).toMatch(/user-select:\s*text/);
+    const compact = css.match(/\.task-pair-decision-copy \.expandable-task-objective-text\.is-measuring-clamped\s*\{[^}]*\}/)?.[0];
+    expect(compact).toMatch(/display:\s*block/);
+    expect(compact).toMatch(/max-height:\s*7\.5em/);
+    expect(compact).toMatch(/min-height:\s*0/);
+    expect(compact).toMatch(/-webkit-line-clamp:\s*unset/);
+    const contained = css.match(/\.task-pair-decision-copy\[data-objective-overflow="true"\] \.expandable-task-objective-text\s*\{[^}]*\}/)?.[0];
+    expect(contained).toMatch(/overscroll-behavior-y:\s*contain/);
+    expect(css).not.toMatch(/\.task-pair-decision-copy \.expandable-task-objective-text\s*\{[^}]*overscroll-behavior[^}]*contain/);
+  });
+
   it('keeps the desktop rail exactly one bottom card wide and its vertical cards compact and scrollable', () => {
     const rootRule = cssWithoutComments.match(/:root\s*\{[^}]*\}/)?.[0];
     expect(rootRule).toMatch(/--subsession-compact-card-width:\s*54px/);

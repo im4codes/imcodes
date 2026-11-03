@@ -70,7 +70,7 @@ function DecisionPanel({ taskId, pair, context }: { taskId: string; pair: Superv
     {latest?.kind === TASK_PAIR_DECISION_KIND.DECISION && <small class="task-pair-decision-time">
       {t('taskPair.decision.time')}: <time dateTime={new Date(latest.at).toISOString()}>{new Date(latest.at).toLocaleString()}</time>
     </small>}
-    <ExpandableTaskObjective key={`${context}:${latest?.id ?? ''}`} text={decisionText} className="task-pair-decision-copy" />
+    <ExpandableTaskObjective key={`${context}:${latest?.id ?? ''}`} text={decisionText} className="task-pair-decision-copy" scrollLabel={t('taskPair.decision.title')} />
     {waiting && !resolved && <>
       <div class="task-pair-decision-options">{question?.options?.map((option) => <button type="button" key={option.id}
         disabled={pending || !pair.decisionRevision} onClick={() => void submit(option.id)}>{option.label}</button>)}</div>

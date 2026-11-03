@@ -19,6 +19,9 @@ describe('TaskPairDecisionPanel', () => {
     render(<TaskPairDecisionPanel taskId="task" pair={long} />);
     const copy = screen.getByTestId('expandable-task-objective-text');
     expect(copy.closest('.task-pair-decision-copy')).toBeTruthy();
+    expect(copy.getAttribute('role')).toBe('region');
+    expect(copy.getAttribute('aria-label')).toBe('taskPair.decision.title');
+    expect(copy.tabIndex).toBe(0);
     expect(screen.getByRole('button', { name: 'delegation.objective_expand' }).getAttribute('aria-expanded')).toBe('false');
     expect(copy.contains(screen.getByRole('button', { name: 'Use test data' }))).toBe(false);
     expect(copy.contains(screen.getByRole('textbox'))).toBe(false);
@@ -30,6 +33,7 @@ describe('TaskPairDecisionPanel', () => {
   it('does not add an expansion control to short copy', () => {
     render(<TaskPairDecisionPanel taskId="task" pair={pair} />);
     expect(screen.queryByRole('button', { name: 'delegation.objective_expand' })).toBeNull();
+    expect(screen.getByTestId('expandable-task-objective-text').hasAttribute('tabindex')).toBe(false);
   });
   it('starts a new ruling collapsed and shows its decision time outside the folded text', () => {
     vi.spyOn(HTMLElement.prototype, 'scrollHeight', 'get').mockReturnValue(180);
