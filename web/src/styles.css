@@ -10819,33 +10819,109 @@ button.quick-agent-delegation-preset.active {
 .cron-execution-detail {
   display: flex;
   flex-direction: column;
+  overflow: auto;
+  min-height: 0;
+}
+
+.cron-execution-detail-header {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 12px;
+  padding: 10px 12px;
+  border: 1px solid rgba(34, 211, 238, 0.18);
+  border-radius: 10px;
+  background: linear-gradient(135deg, rgba(8, 28, 48, 0.45), rgba(10, 20, 34, 0.7));
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.035), 0 4px 16px rgba(0, 0, 0, 0.2);
+}
+
+.cron-execution-detail-title-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  min-width: 0;
+}
+
+.cron-execution-detail-job-name {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
   overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: #e2e8f0;
+  font-size: 14px;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+}
+
+.cron-execution-status-dot {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  margin-right: 5px;
+  box-shadow: 0 0 6px currentColor;
+}
+
+.cron-execution-target-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  border: 1px solid rgba(34, 211, 238, 0.22);
+  border-radius: 6px;
+  background: rgba(8, 47, 73, 0.35);
+  color: #7dd3fc;
+  font-size: 11px;
+  font-family: inherit;
+  max-width: 260px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .cron-execution-detail-toolbar {
-  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
   min-height: 28px;
-  margin-bottom: 12px;
 }
 
 .cron-execution-detail-action {
   margin-left: auto;
   padding: 5px 10px;
-  border: 1px solid rgba(34, 211, 238, 0.25);
+  border: 1px solid rgba(34, 211, 238, 0.35);
   border-radius: 8px;
-  background: rgba(8, 145, 178, 0.1);
+  background: rgba(8, 145, 178, 0.15);
+  color: #38bdf8;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.cron-execution-detail-action:hover {
+  background: rgba(8, 145, 178, 0.3);
+  border-color: rgba(34, 211, 238, 0.6);
+  color: #67e8f9;
+  box-shadow: 0 0 12px rgba(34, 211, 238, 0.25);
 }
 
 .cron-execution-output {
   display: flex;
   min-height: 0;
-  flex: 1;
+  flex: 0 1 auto;
   flex-direction: column;
   overflow: hidden;
-  border: 1px solid rgba(51, 65, 85, 0.76);
-  border-radius: 13px;
-  background: rgba(8, 15, 29, 0.82);
-  box-shadow: inset 0 1px rgba(255, 255, 255, 0.025), 0 16px 38px rgba(0, 0, 0, 0.16);
+  border: 1px solid rgba(34, 211, 238, 0.2);
+  border-radius: 12px;
+  background: rgba(8, 15, 29, 0.88);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.03), 0 16px 38px rgba(0, 0, 0, 0.22);
 }
 
 .cron-execution-output-heading {
@@ -10853,22 +10929,23 @@ button.quick-agent-delegation-preset.active {
   flex: 0 0 auto;
   align-items: center;
   gap: 8px;
-  padding: 9px 12px;
-  border-bottom: 1px solid rgba(51, 65, 85, 0.62);
-  background: linear-gradient(90deg, rgba(6, 78, 59, 0.18), rgba(15, 23, 42, 0.68));
+  padding: 8px 12px;
+  border-bottom: 1px solid rgba(34, 211, 238, 0.16);
+  background: linear-gradient(90deg, rgba(6, 78, 59, 0.22), rgba(8, 28, 48, 0.72));
   color: #d1fae5;
-  font-size: 10px;
+  font-size: 11px;
   font-weight: 700;
-  letter-spacing: 0.06em;
+  letter-spacing: 0.05em;
   text-transform: uppercase;
 }
 
 .cron-execution-output-heading small {
   margin-left: auto;
-  color: #475569;
-  font-size: 8px;
+  color: #64748b;
+  font-size: 9px;
   font-weight: 600;
   letter-spacing: 0.04em;
+  text-transform: none;
 }
 
 .cron-execution-output-pulse {
@@ -10880,25 +10957,132 @@ button.quick-agent-delegation-preset.active {
 }
 
 .cron-execution-output-body {
+  box-sizing: border-box;
   min-height: 0;
-  flex: 1;
-  overflow: auto;
-  padding: 15px 17px 24px;
+  flex: 0 1 auto;
+  padding: 12px 14px;
   color: #cbd5e1;
   font-size: 13px;
   line-height: 1.65;
   overflow-wrap: anywhere;
-  scrollbar-color: rgba(52, 211, 153, 0.3) transparent;
+  scrollbar-color: rgba(34, 211, 238, 0.35) transparent;
+  scrollbar-width: thin;
+}
+
+/* Collapsed: default max 5 lines (13px * 1.65 * 5 ≈ 107px text + 24px padding ≈ 131px) */
+.cron-execution-output--collapsed .cron-execution-output-body {
+  max-height: calc(5 * 1.65em + 24px);
+  overflow: hidden;
+}
+
+/* If overflowing 5 lines when collapsed, apply subtle bottom fade */
+.cron-execution-output--collapsed .cron-execution-output-body[data-overflows="true"] {
+  mask-image: linear-gradient(180deg, #000 0%, #000 calc(100% - 24px), transparent 100%);
+  -webkit-mask-image: linear-gradient(180deg, #000 0%, #000 calc(100% - 24px), transparent 100%);
+}
+
+/* Expanded: max 15 lines (13px * 1.65 * 15 ≈ 322px text + 24px padding ≈ 346px), native scroll */
+.cron-execution-output--expanded .cron-execution-output-body {
+  max-height: calc(15 * 1.65em + 24px);
+  overflow-y: auto;
+  mask-image: none;
+  -webkit-mask-image: none;
 }
 
 .cron-execution-output-body .chat-rich-text { white-space: pre-wrap; }
 
-.cron-floating-panel .floating-panel-titlebar {
+.cron-execution-expand-bar {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 6px 12px;
+  border-top: 1px solid rgba(34, 211, 238, 0.14);
+  background: linear-gradient(180deg, rgba(8, 20, 36, 0.75) 0%, rgba(6, 14, 26, 0.95) 100%);
+  flex-shrink: 0;
+}
+
+.cron-execution-expand-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 14px;
+  background: rgba(34, 211, 238, 0.08);
+  border: 1px solid rgba(34, 211, 238, 0.28);
+  border-radius: 6px;
+  color: #38bdf8;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.cron-execution-expand-btn:hover {
+  background: rgba(34, 211, 238, 0.18);
+  border-color: rgba(34, 211, 238, 0.55);
+  color: #67e8f9;
+  box-shadow: 0 0 10px rgba(34, 211, 238, 0.2);
+}
+
+.cron-execution-expand-hint {
+  color: #64748b;
+  font-size: 10px;
+  font-weight: 400;
+}
+
+.cron-auto-textarea {
+  box-sizing: border-box;
+  width: 100%;
+  font-family: inherit;
+  font-size: 14px;
+  line-height: 1.5;
+  padding: 10px 12px;
+  background: #0f172a;
+  border: 1px solid #334155;
+  border-radius: 8px;
+  color: #e2e8f0;
+  outline: none;
+  min-height: calc(5 * 1.5em + 22px);
+  max-height: calc(15 * 1.5em + 22px);
+  overflow-y: auto;
+  resize: vertical;
+  scrollbar-color: rgba(34, 211, 238, 0.3) transparent;
+  scrollbar-width: thin;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.cron-auto-textarea:focus {
+  border-color: rgba(34, 211, 238, 0.55) !important;
+  box-shadow: 0 0 0 1px rgba(34, 211, 238, 0.25), inset 0 1px 0 rgba(255, 255, 255, 0.04);
+}
+
+.cron-execution-detail-panel {
+  background: linear-gradient(180deg, #07111e 0%, #060c16 100%) !important;
+  border-color: rgba(34, 211, 238, 0.3) !important;
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.65), 0 0 32px rgba(34, 211, 238, 0.08) !important;
+}
+
+.cron-floating-panel .floating-panel-titlebar,
+.cron-execution-detail-panel .floating-panel-titlebar {
   background: linear-gradient(90deg, rgba(8, 47, 73, 0.88), rgba(15, 23, 42, 0.96)) !important;
   border-bottom-color: rgba(34, 211, 238, 0.22) !important;
 }
 
+.cron-execution-detail-panel .floating-panel-content {
+  background: #07111d !important;
+  min-height: 0;
+}
+
 @media (max-width: 640px) {
+  .cron-execution-detail-panel {
+    left: 0 !important;
+    top: 0 !important;
+    width: 100vw !important;
+    max-width: 100vw !important;
+    height: 100% !important;
+    max-height: 100% !important;
+    border-radius: 0 !important;
+    box-sizing: border-box !important;
+  }
   .cron-manager--history {
     width: calc(100% - 18px) !important;
   }
@@ -10920,7 +11104,11 @@ button.quick-agent-delegation-preset.active {
   .cron-history-panel,
   .cron-execution-detail { padding: 10px; }
   .cron-history-summary-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .cron-execution-output-body { padding: 13px 12px 22px; font-size: 12px; }
+  .cron-execution-detail-header { padding: 8px 10px; }
+  .cron-execution-detail-toolbar { flex-wrap: wrap; gap: 6px; }
+  .cron-execution-detail-action { width: 100%; justify-content: center; text-align: center; min-height: 36px; }
+  .cron-execution-output-body { padding: 10px 12px; font-size: 12px; }
+  .cron-execution-expand-btn { width: 100%; justify-content: center; padding: 7px 12px; }
 }
 /* Production remote desktop keeps native video as the live path. A bounded
    last-presented-frame canvas is used only during an explicit media gap. */
