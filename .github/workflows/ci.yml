@@ -94,13 +94,16 @@ jobs:
   # ── Daemon unit tests ─────────────────────────────────────────────────────
 
   unit-tests:
-    name: Unit Tests (Node ${{ matrix.node }})
+    name: Unit Tests (Node ${{ matrix.node }}, shard ${{ matrix.shard }}/2)
     runs-on: ubuntu-latest
-    # Ends a hung job itself instead of holding the concurrency group for the 6 h default (normal 10 min, max 11.5).
+    # Keep both Node versions and every daemon test; split across runners instead of increasing per-runner workers.
     timeout-minutes: 30
     strategy:
+      fail-fast: false
+      max-parallel: 4
       matrix:
         node: ['22', '24']
+        shard: [1, 2]
     steps:
       - name: Checkout
         id: checkout_1
@@ -146,7 +149,7 @@ jobs:
           cache: 'npm'
       - run: ./scripts/ci-npm-ci.sh .
       - run: npm run build
-      - run: npm run test:unit
+      - run: npm run test:unit -- --shard=${{ matrix.shard }}/2
 
   preview-dist-smoke:
     name: Preview Dist Smoke
@@ -188,10 +191,15 @@ jobs:
   # ── macOS daemon unit tests ─────────────────────────────────────────────
 
   macos-unit-tests:
-    name: Unit Tests (macOS)
+    name: Unit Tests (macOS, shard ${{ matrix.shard }}/3)
     runs-on: macos-latest
-    # Ends a hung job itself instead of holding the concurrency group for the 6 h default (normal 17 min, max 19.3).
+    # The measured 15–19 minute critical path is three disjoint shards, with all platform tests retained.
     timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        shard: [1, 2, 3]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -204,7 +212,7 @@ jobs:
         run: tmux new-session -d -s init && tmux kill-session -t init
       - run: ./scripts/ci-npm-ci.sh .
       - run: npm run build
-      - run: npm run test:unit
+      - run: npm run test:unit -- --shard=${{ matrix.shard }}/3
 
   # ── macOS remote-desktop components (built from the immutable SDK) ────────
 
@@ -570,7 +578,8 @@ jobs:
     runs-on: ubuntu-latest
     # Ends a hung job itself instead of holding the concurrency group for the 6 h default (normal 2.2 min, max 2.7).
     timeout-minutes: 15
-    needs: [unit-tests]
+    # Self-contained runner: no unit-test artifacts are consumed. Release jobs
+    # still require BOTH matrices; run E2E alongside units, not after them.
     steps:
       - name: Checkout
         id: checkout_1
