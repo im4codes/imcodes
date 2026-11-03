@@ -634,12 +634,24 @@ export class TaskPairStore {
 
   savePair(project: string, state: TaskPairState, options: { liveness?: TaskPairLiveness; legacyTaskId?: string } = {}): StoredTaskPair {
     const existing = this.getPair(project, state.taskId);
-    const existingBlocked = existing?.state.flags.some((f) => f === 'blocked' || f === 'needs_input') ?? false;
-    const nextBlocked = state.flags?.some((f) => f === 'blocked' || f === 'needs_input') ?? false;
-    if (!existingBlocked && nextBlocked) {
-      state.episodeGeneration = Math.max(state.episodeGeneration ?? 0, (existing?.state.episodeGeneration ?? 0) + 1);
+    const existingGen = existing?.state.episodeGeneration ?? 0;
+    const incomingGen = state.episodeGeneration ?? 0;
+    if (existing && incomingGen < existingGen) {
+      state.episodeGeneration = existing.state.episodeGeneration;
+      state.blockedNote = existing.state.blockedNote;
+      state.lastWaitResolution = existing.state.lastWaitResolution;
+      const nonBlockerFlags = (state.flags ?? []).filter((f) => f !== 'blocked' && f !== 'needs_input');
+      const existingBlockerFlags = existing.state.flags.filter((f) => f === 'blocked' || f === 'needs_input');
+      state.flags = [...nonBlockerFlags, ...existingBlockerFlags];
+      state.flagSides = {
+        ...state.flagSides,
+        ...(existing.state.flagSides?.blocked ? { blocked: existing.state.flagSides.blocked } : {}),
+        ...(existing.state.flagSides?.needs_input ? { needs_input: existing.state.flagSides.needs_input } : {}),
+      };
+      if (!existing.state.flagSides?.blocked) delete state.flagSides.blocked;
+      if (!existing.state.flagSides?.needs_input) delete state.flagSides.needs_input;
     } else if (existing?.state.episodeGeneration !== undefined) {
-      state.episodeGeneration = Math.max(state.episodeGeneration ?? 0, existing.state.episodeGeneration);
+      state.episodeGeneration = Math.max(incomingGen, existingGen);
     }
     const liveness = options.liveness ?? existing?.liveness ?? emptyLiveness(state.updatedAt);
     const queueOrder = existing?.queueOrder ?? this.#nextQueueOrder();

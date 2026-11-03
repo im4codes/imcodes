@@ -742,5 +742,118 @@ describe('TaskPairDecisionPanel', () => {
       await waitFor(() => expect(liveTextbox.disabled).toBe(false));
       expect(liveTextbox.value).toBe('');
     });
+
+    it('preserves live-before-ACK submission lock even when 201 other cards are mounted', async () => {
+      const oldRuling: TaskPairDecisionRecord = {
+        id: 'old-ruling',
+        project: 'p',
+        taskId: 'task',
+        round: 1,
+        deliveryRound: 1,
+        kind: 'decision',
+        conclusion: 'Old approval',
+        summary: 'Old',
+        author: 'brain',
+        at: 20,
+      };
+
+      const current: SupervisionConsolePairInfo = {
+        status: 'working',
+        round: 1,
+        deliveryRound: 1,
+        flags: ['blocked'],
+        blocking: ['P0'],
+        blockedNote: 'Current NEW blocker',
+        decisionRevision: 'rev-current-eviction',
+        decisionRequest: undefined,
+        latestDecision: oldRuling,
+        brain: 'brain',
+      };
+
+      const capturedFrames: any[] = [];
+      unbind = bindTaskPairDecisions((frame) => {
+        capturedFrames.push(frame);
+      });
+
+      const view = render(<TaskPairDecisionPanel taskId="task" pair={current} />);
+      const textbox = screen.getByRole('textbox') as HTMLTextAreaElement;
+      expect(textbox.disabled).toBe(false);
+
+      fireEvent.input(textbox, { target: { value: 'Current explanation response' } });
+      fireEvent.click(screen.getByRole('button', { name: 'taskPair.decision.send' }));
+
+      await waitFor(() => expect(capturedFrames).toHaveLength(1));
+      expect((screen.getByRole('textbox') as HTMLTextAreaElement).disabled).toBe(true);
+
+      // Render 201 other real cards to test cache eviction boundary
+      render(
+        <>
+          {Array.from({ length: 201 }, (_, i) => (
+            <TaskPairDecisionPanel
+              key={i}
+              taskId={`other-${i}`}
+              readOnly
+              pair={{
+                ...current,
+                latestDecision: {
+                  ...oldRuling,
+                  id: `other-ruling-${i}`,
+                  taskId: `other-${i}`,
+                },
+              }}
+            />
+          ))}
+        </>
+      );
+
+      // Live projection arrives before ACK: latestDecision becomes FEEDBACK
+      view.rerender(
+        <TaskPairDecisionPanel
+          taskId="task"
+          pair={{
+            ...current,
+            latestDecision: {
+              id: 'live-feedback',
+              project: 'p',
+              taskId: 'task',
+              round: 1,
+              deliveryRound: 1,
+              kind: 'feedback',
+              conclusion: 'Human feedback',
+              summary: 'Current explanation response',
+              author: 'human',
+              at: 30,
+            },
+          }}
+        />
+      );
+
+      // Lock and draft must survive cache eviction from unrelated cards
+      const liveTextbox = screen.getByRole('textbox') as HTMLTextAreaElement;
+      expect(liveTextbox.disabled).toBe(true);
+      expect(liveTextbox.value).toBe('Current explanation response');
+
+      // Now settle the ACK: form cleans up and clears text
+      receiveTaskPairDecision(capturedFrames[0].requestId, {
+        ok: true,
+        decisions: [
+          {
+            id: 'live-feedback',
+            project: 'p',
+            taskId: 'task',
+            round: 1,
+            deliveryRound: 1,
+            kind: 'feedback',
+            conclusion: 'Human feedback',
+            summary: 'Current explanation response',
+            author: 'human',
+            at: 30,
+          },
+        ],
+      });
+
+      await waitFor(() => expect(liveTextbox.disabled).toBe(false));
+      expect(liveTextbox.value).toBe('');
+    });
   });
 });

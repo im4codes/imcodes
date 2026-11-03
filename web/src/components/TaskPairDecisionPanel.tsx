@@ -87,7 +87,27 @@ export function TaskPairDecisionPanel(props: { taskId: string; pair: Supervision
   // Remount all local state on a new task/question/ruling. A string comparison
   // alone cannot isolate late replies when navigation goes A → B → A.
   // A live feedback event may precede its ack: keep that in-flight reply locked.
-  const rulingId = getScopedRulingId(taskId, pair.decisionRevision, pair.decisionRequest?.id, pair.latestDecision);
+  const scopeKey = `${taskId}:${pair.decisionRevision ?? ''}:${pair.decisionRequest?.id ?? ''}`;
+  const lastRulingRef = useRef<{ scope: string; rulingId: string | undefined } | null>(null);
+
+  let rulingId: string | undefined;
+  if (lastRulingRef.current?.scope === scopeKey) {
+    if (pair.latestDecision?.kind === TASK_PAIR_DECISION_KIND.DECISION) {
+      rulingId = pair.latestDecision.id;
+      lastRulingRef.current.rulingId = rulingId;
+      if (activeRulingCache.size > 200) {
+        const oldestKey = activeRulingCache.keys().next().value;
+        if (oldestKey) activeRulingCache.delete(oldestKey);
+      }
+      activeRulingCache.set(scopeKey, rulingId);
+    } else {
+      rulingId = lastRulingRef.current.rulingId;
+    }
+  } else {
+    rulingId = getScopedRulingId(taskId, pair.decisionRevision, pair.decisionRequest?.id, pair.latestDecision);
+    lastRulingRef.current = { scope: scopeKey, rulingId };
+  }
+
   const context = JSON.stringify([taskId, pair.decisionRevision, pair.decisionRequest?.id, rulingId]);
   return <DecisionPanel key={context} {...props} context={context} />;
 }

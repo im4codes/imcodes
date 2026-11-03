@@ -13,6 +13,7 @@ import { taskPairService } from '../../src/daemon/task-pairs/service.js';
 import { taskPairDecisionReminderDue, checkTaskPairMissingExplanation, TaskPairAutomation } from '../../src/daemon/task-pairs/scheduler.js';
 import { buildPairConsoleRow } from '../../src/daemon/supervision-console-pair-projection.js';
 import { queuedPairWakeAllowed } from '../../src/daemon/task-pairs/wake-authority.js';
+import { taskPairMissingExplanationKey } from '../../src/daemon/task-pairs/decision-context.js';
 import type { McpRuntimeCaller } from '../../src/daemon/memory-mcp-caller.js';
 import { applyTaskPairMarker, type TaskPairState } from '../../shared/task-pair.js';
 import type { SessionRecord } from '../../src/store/session-store.js';
@@ -660,6 +661,65 @@ describe('pair decision MCP', () => {
     expect(checkTaskPairMissingExplanation(store.getPair('p', 'f3-episode-stability')!, 501)).toBe(true);
     await taskPairService.retryDecisionNotifications(501);
     expect(sent).toHaveLength(2);
+  });
+
+  it('F3: an older full-state writer cannot replace a newer explained episode with its old unknown blocker', async () => {
+    const store = getTaskPairStore();
+    const sent: string[] = [];
+    setTaskPairDeliveryDepsForTests({
+      send: async (_target, text) => {
+        sent.push(text);
+      },
+    });
+
+    const taskBase: TaskPairState = {
+      taskId: 'f3-stale-writer-slice',
+      title: 'Stale writer slice test',
+      flags: [],
+      flagSides: {},
+      blocking: ['P0'],
+      status: 'working',
+      executor: 'exec',
+      brain: 'brain',
+      round: 1,
+      deliveryRound: 1,
+      createdAt: 100,
+      updatedAt: 100,
+      previousAuditors: [],
+      capCounts: {},
+      resourceClaims: [],
+    } as unknown as TaskPairState;
+    store.savePair('p', taskBase);
+
+    // 1. Initial BLOCKED without note (gen 1)
+    const initial = applyTaskPairMarker(taskBase, {
+      knownVerb: 'BLOCKED', taskId: 'f3-stale-writer-slice', attrs: {},
+    }, { writer: 'exec', fallbackBrain: 'brain', now: 100, source: 'marker' } as any);
+    store.savePair('p', initial.pair!);
+    const staleSnapshot = structuredClone(store.getPair('p', 'f3-stale-writer-slice')!.state);
+
+    // 2. Authoritative note arrives (gen 2)
+    const explained = applyTaskPairMarker(store.getPair('p', 'f3-stale-writer-slice')!.state, {
+      knownVerb: 'BLOCKED', taskId: 'f3-stale-writer-slice', attrs: { note: 'Current authoritative explanation' },
+    }, { writer: 'exec', fallbackBrain: 'brain', now: 200, source: 'marker' } as any);
+    store.savePair('p', explained.pair!);
+
+    const current = store.getPair('p', 'f3-stale-writer-slice')!;
+    const currentKey = taskPairMissingExplanationKey(current);
+    expect(current.state.episodeGeneration).toBeGreaterThan(staleSnapshot.episodeGeneration!);
+    expect(checkTaskPairMissingExplanation(current, 201)).toBe(false);
+
+    // 3. Stale full-state writer writes back older gen 1 snapshot with unrelated housekeeping changes
+    store.savePair('p', { ...staleSnapshot, brief: 'housekeeping checklist progress', updatedAt: 300 });
+
+    const after = store.getPair('p', 'f3-stale-writer-slice')!;
+    expect(after.state.episodeGeneration).toBe(current.state.episodeGeneration);
+    expect(after.state.blockedNote).toBe('Current authoritative explanation');
+    expect(taskPairMissingExplanationKey(after)).toBe(currentKey);
+    expect(checkTaskPairMissingExplanation(after, 301)).toBe(false);
+
+    await taskPairService.retryDecisionNotifications(301);
+    expect(sent).toHaveLength(0);
   });
 
   it('F3-R4: queued explanation notification is admitted while missing and rejected after note arrives', async () => {
