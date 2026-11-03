@@ -5969,7 +5969,7 @@ const ChatEvent = memo(function ChatEvent({
       const stateClass = isPending ? ' chat-pending' : isFailed ? ' chat-failed' : '';
       const sharedActorLabel = formatSharedActorLabel(t, event.payload.sharedActor);
       const isAgent = origin === CHAT_MESSAGE_ORIGINS.AGENT;
-      const hasTime = typeof event.ts === 'number' && Number.isFinite(event.ts) && event.ts > 0;
+      const hasTime = showTime !== false && typeof event.ts === 'number' && Number.isFinite(event.ts) && event.ts > 0;
       const hasStatusOrTime = isPending || isQueued || isFailed || (!isPending && !isFailed && hasTime);
       const timeAndStatus = hasStatusOrTime ? (
         <>
@@ -6931,7 +6931,11 @@ function UserMessageText({
                 {expanded ? t('chat.user_message_collapse') : t('chat.user_message_expand')}
               </button>
             )}
-            {footerRight}
+            {footerRight && (
+              <span class="chat-user-footer-right">
+                {footerRight}
+              </span>
+            )}
           </div>
         )
       ) : (

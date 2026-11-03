@@ -122,7 +122,25 @@ describe('Incoming agent message card compression & footer merge', () => {
     expect(footer?.querySelector('.chat-user-message-fold-toggle')).toBeNull();
   });
 
-  it('preserves pending, queued, and failed retry states in the agent footer', () => {
+  it('renders no empty footer when showTime is false for short agent message without status', () => {
+    const { container } = render(
+      <ChatView
+        events={[{
+          ...makeMessage({ text: agentReportWithSender('Short message with showTime=false') }),
+          ts: 0,
+        }]}
+        loading={false}
+        hasOlderHistory={false}
+        sessionId="s4-notime"
+      />,
+    );
+    const bubble = container.querySelector('.chat-user.chat-user-origin-agent');
+    expect(bubble).toBeTruthy();
+    // No time and not folded -> no .chat-user-footer rendered at all
+    expect(bubble?.querySelector('.chat-user-footer')).toBeNull();
+  });
+
+  it('preserves pending, queued with time, and failed retry states in the agent footer', () => {
     const onResend = vi.fn();
     const { container } = render(
       <ChatView
@@ -143,8 +161,11 @@ describe('Incoming agent message card compression & footer merge', () => {
     // Pending bubble
     expect(bubbles[0].querySelector('.chat-user-footer .chat-user-status-pending')).toBeTruthy();
 
-    // Queued bubble
-    expect(bubbles[1].querySelector('.chat-user-footer .chat-user-status-queued')).toBeTruthy();
+    // Queued bubble: contains both queued label and time
+    const queuedFooter = bubbles[1].querySelector('.chat-user-footer .chat-user-footer-right');
+    expect(queuedFooter).toBeTruthy();
+    expect(queuedFooter?.querySelector('.chat-user-status-queued')).toBeTruthy();
+    expect(queuedFooter?.querySelector('.chat-bubble-time')).toBeTruthy();
 
     // Failed bubble with retry button
     const retryBtn = bubbles[2].querySelector('.chat-user-footer .chat-user-retry-btn') as HTMLButtonElement | null;
