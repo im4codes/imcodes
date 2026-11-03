@@ -1,5 +1,6 @@
 import { TASK_PAIR_TERMINAL_STATUSES } from '../../../shared/task-pair.js';
 import { TASK_PAIR_DECISION_KIND, TASK_PAIR_DECISION_MSG, TASK_PAIR_DECISION_LIMITS } from '../../../shared/task-pair-decision.js';
+import { readPairScheduling } from '../../../shared/task-pair-suspension.js';
 import type { SupervisionTaskConsoleScope } from '../../../shared/supervision-task-console.js';
 import { getTaskPairStore } from './store.js';
 import { taskPairService } from './service.js';
@@ -25,7 +26,7 @@ export function taskPairDecisionApi(scope: SupervisionTaskConsoleScope, input: R
       const choice = typeof input.optionId === 'string' ? question?.options?.find((option) => option.id === input.optionId) : undefined;
       if (input.optionId && !choice) throw new Error('Unknown choice');
       if ((!feedback && !choice) || feedback.length > TASK_PAIR_DECISION_LIMITS.SUMMARY) throw new Error('Feedback is empty or too long');
-      const reason = question?.question || question?.summary || pair.blockedNote || pair.scheduling?.note || 'Please clarify the blocking condition and available options.';
+      const reason = question?.question || question?.summary || pair.blockedNote || readPairScheduling(pair.scheduling)?.note || 'Please clarify the blocking condition and available options.';
       taskPairService.recordDecision({
         project: scope.projectName, taskId, round: Math.max(1, pair.round), kind: TASK_PAIR_DECISION_KIND.FEEDBACK,
         conclusion: choice?.label || 'Human feedback', summary: feedback || choice!.label,

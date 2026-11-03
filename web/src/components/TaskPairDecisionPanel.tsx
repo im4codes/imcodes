@@ -7,6 +7,47 @@ import type { SupervisionConsolePairInfo } from '@shared/supervision-task-consol
 import { requestTaskPairDecision } from '../task-pair-decisions.js';
 import { ExpandableTaskObjective } from './ExpandableTaskObjective.js';
 
+export type TaskPairDecisionCategory =
+  | 'request'
+  | 'blocked'
+  | 'wait_dependencies'
+  | 'paused'
+  | 'waiting_capacity'
+  | 'completed_awaiting_brain'
+  | 'legacy_unknown';
+
+export function resolveDecisionCategory(
+  pair: SupervisionConsolePairInfo,
+  question?: TaskPairDecisionRecord,
+  resolved?: boolean,
+): TaskPairDecisionCategory {
+  if (question && !resolved) {
+    return 'request';
+  }
+  if (pair.flags?.some((flag) => flag === 'waiting_for_capacity' || flag === 'needs_auditor')) {
+    return 'waiting_capacity';
+  }
+  const wait = taskPairWaitKind(pair);
+  if (wait === 'waiting_dependencies') {
+    return 'wait_dependencies';
+  }
+  if (wait === 'paused') {
+    return 'paused';
+  }
+  const isBlocked = pair.flags?.some((flag) => flag === 'blocked' || flag === 'needs_input');
+  if (
+    pair.status === 'passed' ||
+    pair.lastVerdict === 'PASS' ||
+    (pair.status === 'awaiting_brain_decision' && !isBlocked)
+  ) {
+    return 'completed_awaiting_brain';
+  }
+  if (isBlocked && pair.blockedNote) {
+    return 'blocked';
+  }
+  return 'legacy_unknown';
+}
+
 /** A reply is persisted feedback to Brain, never PASS, resume or a lifecycle transition. */
 export function TaskPairDecisionPanel(props: { taskId: string; pair: SupervisionConsolePairInfo; readOnly?: boolean }) {
   const { taskId, pair } = props;
@@ -33,15 +74,105 @@ function DecisionPanel({ taskId, pair, context, readOnly }: { taskId: string; pa
   const question = pair.decisionRequest;
   const latest = (readOnly ? history?.find((entry) => entry.kind === TASK_PAIR_DECISION_KIND.DECISION) : history?.[0]) ?? pair.latestDecision;
   const resolved = !!question && latest?.kind === TASK_PAIR_DECISION_KIND.DECISION && (latest.requestId === question.id || latest.round === question.round && latest.at >= question.at);
-  const waiting = !TASK_PAIR_TERMINAL_STATUSES.includes(pair.status) && !!(taskPairWaitKind(pair)
-    || (question && !resolved) || pair.status === 'awaiting_brain_decision' || pair.flags?.some((flag) => flag === 'blocked' || flag === 'needs_input'));
-  const reason = question?.question || question?.summary || pair.blockedNote || readPairScheduling(pair.scheduling)?.note;
+  const waiting = !TASK_PAIR_TERMINAL_STATUSES.includes(pair.status) && !!(
+    taskPairWaitKind(pair)
+    || (question && !resolved)
+    || pair.status === 'awaiting_brain_decision'
+    || pair.status === 'passed'
+    || pair.flags?.some((flag) => flag === 'blocked' || flag === 'needs_input' || flag === 'waiting_for_capacity' || flag === 'needs_auditor')
+  );
+
+  const category = resolveDecisionCategory(pair, question, resolved);
+
+  const titleKey = resolved
+    ? 'taskPair.decision.resolved'
+    : category === 'request'
+    ? 'taskPair.decision.title_request'
+    : category === 'blocked'
+    ? 'taskPair.decision.title_blocked'
+    : category === 'wait_dependencies'
+    ? 'taskPair.decision.title_dependencies'
+    : category === 'paused'
+    ? 'taskPair.decision.title_paused'
+    : category === 'waiting_capacity'
+    ? 'taskPair.decision.title_capacity'
+    : category === 'completed_awaiting_brain'
+    ? 'taskPair.decision.title_completed'
+    : 'taskPair.decision.title';
+
+  let reason = '';
+  let responsible = '';
+
+  switch (category) {
+    case 'request': {
+      reason = question?.question || question?.summary || '';
+      if (question?.author) {
+        responsible = t('taskPair.decision.responsible_executor', { name: question.author });
+      }
+      break;
+    }
+    case 'blocked': {
+      reason = pair.blockedNote || '';
+      const side = pair.flagSides?.blocked || pair.flagSides?.needs_input;
+      const author = (side && (side === 'executor' ? pair.executor : pair.auditor)) || pair.executor || pair.auditor;
+      if (author) {
+        responsible = t('taskPair.decision.responsible_executor', { name: author });
+      }
+      break;
+    }
+    case 'wait_dependencies': {
+      const scheduling = readPairScheduling(pair.scheduling);
+      const note = scheduling?.note;
+      const dependsOn = scheduling?.dependsOn ?? pair.scheduling?.dependsOn ?? [];
+      const waitingTasksText = dependsOn.length > 0
+        ? t('taskPair.decision.waiting_for_tasks', { tasks: dependsOn.join(', ') })
+        : '';
+      reason = [note, waitingTasksText].filter(Boolean).join('\n');
+      responsible = t('taskPair.decision.responsible_brain');
+      break;
+    }
+    case 'paused': {
+      const scheduling = readPairScheduling(pair.scheduling);
+      reason = scheduling?.note || t('taskPair.decision.paused_reason');
+      responsible = t('taskPair.decision.responsible_brain');
+      break;
+    }
+    case 'waiting_capacity': {
+      reason = pair.waitingReason
+        || (pair.flags?.includes('needs_auditor')
+          ? t('taskPair.decision.needs_auditor_reason')
+          : t('taskPair.decision.waiting_capacity_reason'));
+      responsible = t('taskPair.decision.responsible_scheduler');
+      break;
+    }
+    case 'completed_awaiting_brain': {
+      reason = t('taskPair.decision.completed_awaiting_brain_reason', {
+        executor: pair.executor || 'executor',
+        brain: pair.brain || 'Brain',
+      });
+      responsible = t('taskPair.decision.responsible_brain');
+      break;
+    }
+    case 'legacy_unknown':
+    default: {
+      reason = readOnly ? '' : t('taskPair.decision.missing');
+      break;
+    }
+  }
+
   const decisionText = [
-    reason || (readOnly ? '' : t('taskPair.decision.missing')),
+    reason,
+    responsible,
     question?.recommendation ? `${t('taskPair.decision.recommendation')}: ${question.recommendation}` : '',
     latest?.kind === TASK_PAIR_DECISION_KIND.DECISION ? `${t('taskPair.decision.ruling')}: ${latest.conclusion} — ${latest.summary}` : '',
   ].filter(Boolean).join('\n');
+
   if (!waiting && !question && !latest) return null;
+
+  const showFallbackOptions = category === 'legacy_unknown' || category === 'blocked' || category === 'paused' || category === 'wait_dependencies';
+  const showAskButton = category === 'legacy_unknown';
+  const showDirectFeedback = category !== 'completed_awaiting_brain' && category !== 'waiting_capacity';
+
   const submit = async (optionId?: string, feedbackOverride?: string) => {
     const feedback = feedbackOverride ? [feedbackOverride, text].filter(Boolean).join('\n') : text;
     if (busy.current) return;
@@ -58,6 +189,7 @@ function DecisionPanel({ taskId, pair, context, readOnly }: { taskId: string; pa
     } catch (cause) { if (active.current) setError(String(cause)); }
     finally { if (active.current) { busy.current = false; setPending(false); } }
   };
+
   const loadHistory = async () => {
     setError('');
     try {
@@ -65,28 +197,102 @@ function DecisionPanel({ taskId, pair, context, readOnly }: { taskId: string; pa
       if (active.current) setHistory(result.decisions);
     } catch (cause) { if (active.current) setError(String(cause)); }
   };
+
   return <section class="task-pair-decision" aria-label={t('taskPair.decision.title')}>
-    <strong>{t(resolved ? 'taskPair.decision.resolved' : 'taskPair.decision.title')}</strong>
+    <strong>{t(titleKey)}</strong>
     {latest?.kind === TASK_PAIR_DECISION_KIND.DECISION && <small class="task-pair-decision-time">
       {t('taskPair.decision.time')}: <time dateTime={new Date(latest.at).toISOString()}>{new Date(latest.at).toLocaleString()}</time>
     </small>}
     <ExpandableTaskObjective key={`${context}:${latest?.id ?? ''}`} text={decisionText} className="task-pair-decision-copy" scrollLabel={t('taskPair.decision.title')} />
     {!readOnly && waiting && !resolved && <>
-      <div class="task-pair-decision-options">{question?.options?.map((option) => <button type="button" key={option.id}
-        disabled={pending || !pair.decisionRevision} onClick={() => void submit(option.id)}>{option.label}</button>)}</div>
-      {!question?.options?.length && <div class="task-pair-decision-options">
-        {!reason && <button type="button" disabled={pending || !pair.decisionRevision}
-          onClick={() => void submit(undefined, t('taskPair.decision.ask_message'))}>{t('taskPair.decision.ask')}</button>}
-        <button type="button" disabled={pending || !pair.decisionRevision}
-          onClick={() => void submit(undefined, t('taskPair.decision.ready_message'))}>{t('taskPair.decision.ready')}</button>
-        <button type="button" disabled={pending || !pair.decisionRevision}
-          onClick={() => void submit(undefined, t('taskPair.decision.wait_message'))}>{t('taskPair.decision.wait')}</button>
-      </div>}
-      <textarea value={text} maxLength={TASK_PAIR_DECISION_LIMITS.SUMMARY} disabled={pending}
-        aria-label={t('taskPair.decision.feedback')} placeholder={t('taskPair.decision.placeholder')}
-        onInput={(event) => { setText(event.currentTarget.value); retryId.current = null; setSent(false); }} />
-      <button type="button" disabled={pending || !text.trim() || !pair.decisionRevision} onClick={() => void submit()}>
-        {t(pending ? 'taskPair.decision.sending' : 'taskPair.decision.send')}</button>
+      {question?.options && question.options.length > 0 && (
+        <div class="task-pair-decision-options">
+          {question.options.map((option) => (
+            <button
+              type="button"
+              key={option.id}
+              disabled={pending || !pair.decisionRevision}
+              onClick={() => void submit(option.id)}
+            >
+              {option.label}
+            </button>
+          ))}
+        </div>
+      )}
+      {!question?.options?.length && showFallbackOptions && (
+        <div class="task-pair-decision-options">
+          {showAskButton && (
+            <button
+              type="button"
+              disabled={pending || !pair.decisionRevision}
+              onClick={() => void submit(undefined, t('taskPair.decision.ask_message'))}
+            >
+              {t('taskPair.decision.ask')}
+            </button>
+          )}
+          <button
+            type="button"
+            disabled={pending || !pair.decisionRevision}
+            onClick={() => void submit(undefined, t('taskPair.decision.ready_message'))}
+          >
+            {t('taskPair.decision.ready')}
+          </button>
+          <button
+            type="button"
+            disabled={pending || !pair.decisionRevision}
+            onClick={() => void submit(undefined, t('taskPair.decision.wait_message'))}
+          >
+            {t('taskPair.decision.wait')}
+          </button>
+        </div>
+      )}
+      {showDirectFeedback && (
+        <>
+          <textarea
+            value={text}
+            maxLength={TASK_PAIR_DECISION_LIMITS.SUMMARY}
+            disabled={pending}
+            aria-label={t('taskPair.decision.feedback')}
+            placeholder={t('taskPair.decision.placeholder')}
+            onInput={(event) => {
+              setText(event.currentTarget.value);
+              retryId.current = null;
+              setSent(false);
+            }}
+          />
+          <button
+            type="button"
+            disabled={pending || !text.trim() || !pair.decisionRevision}
+            onClick={() => void submit()}
+          >
+            {t(pending ? 'taskPair.decision.sending' : 'taskPair.decision.send')}
+          </button>
+        </>
+      )}
+      {!showDirectFeedback && (
+        <details class="task-pair-decision-feedback-toggle">
+          <summary>{t('taskPair.decision.feedback')}</summary>
+          <textarea
+            value={text}
+            maxLength={TASK_PAIR_DECISION_LIMITS.SUMMARY}
+            disabled={pending}
+            aria-label={t('taskPair.decision.feedback')}
+            placeholder={t('taskPair.decision.placeholder')}
+            onInput={(event) => {
+              setText(event.currentTarget.value);
+              retryId.current = null;
+              setSent(false);
+            }}
+          />
+          <button
+            type="button"
+            disabled={pending || !text.trim() || !pair.decisionRevision}
+            onClick={() => void submit()}
+          >
+            {t(pending ? 'taskPair.decision.sending' : 'taskPair.decision.send')}
+          </button>
+        </details>
+      )}
       {!pair.decisionRevision && <small>{t('taskPair.decision.upgrade')}</small>}
     </>}
     {!readOnly && (sent || latest?.kind === TASK_PAIR_DECISION_KIND.FEEDBACK) && <p role="status">{t('taskPair.decision.sent')}</p>}

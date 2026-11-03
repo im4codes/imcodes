@@ -100,6 +100,7 @@ export function buildPairConsoleRow(
       ...(pair.scheduling ? { scheduling: projectPairScheduling(pair.scheduling) } : {}),
       status: pair.status,
       flags: [...pair.flags],
+      ...(pair.flagSides ? { flagSides: { ...pair.flagSides } } : {}),
       ...(pair.executor ? { executor: pair.executor } : {}),
       ...(pair.auditor ? { auditor: pair.auditor } : {}),
       round: pair.round,

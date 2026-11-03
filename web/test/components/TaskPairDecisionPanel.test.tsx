@@ -199,4 +199,140 @@ describe('TaskPairDecisionPanel', () => {
     expect(screen.getByRole('status')).toBeTruthy();
   });
 
+  describe('category classification and wait reasons (tsk_af1a123756)', () => {
+    it('shows completed_awaiting_brain when executor reported done without blocker (counterexample to base)', () => {
+      // In base, pair.status === 'awaiting_brain_decision' fell into generic 'taskPair.decision.title',
+      // rendered 'taskPair.decision.missing', fake buttons ('ask', 'ready', 'wait'), and open textarea.
+      const completedPair: SupervisionConsolePairInfo = {
+        status: 'awaiting_brain_decision',
+        round: 1,
+        flags: [],
+        blocking: [],
+        executor: 'Ag1',
+        brain: 'BrainChief',
+        decisionRevision: 'rev-1',
+      };
+      render(<TaskPairDecisionPanel taskId="task" pair={completedPair} />);
+
+      expect(screen.getByText('taskPair.decision.title_completed')).toBeTruthy();
+      expect(screen.queryByText('taskPair.decision.title')).toBeNull();
+      expect(screen.queryByText('taskPair.decision.missing')).toBeNull();
+      // No fake blocker buttons
+      expect(screen.queryByRole('button', { name: 'taskPair.decision.ask' })).toBeNull();
+      expect(screen.queryByRole('button', { name: 'taskPair.decision.ready' })).toBeNull();
+      expect(screen.queryByRole('button', { name: 'taskPair.decision.wait' })).toBeNull();
+      // Feedback is tucked inside collapsed details, not directly dominating card
+      const details = screen.getByText('taskPair.decision.feedback').closest('details') as HTMLDetailsElement;
+      expect(details).toBeTruthy();
+      expect(details.open).toBe(false);
+    });
+
+    it('shows wait_dependencies with dependency task list and note, omitting ask button', () => {
+      const depPair: SupervisionConsolePairInfo = {
+        status: 'working',
+        round: 1,
+        flags: [],
+        blocking: [],
+        scheduling: {
+          dependsOn: ['tsk_backend', 'tsk_auth'],
+          note: 'Waiting for auth migration',
+        },
+        decisionRevision: 'rev-1',
+      };
+      render(<TaskPairDecisionPanel taskId="task" pair={depPair} />);
+
+      expect(screen.getByText('taskPair.decision.title_dependencies')).toBeTruthy();
+      const objective = screen.getByTestId('expandable-task-objective-text');
+      expect(objective.textContent).toContain('Waiting for auth migration');
+      expect(objective.textContent).toContain('taskPair.decision.waiting_for_tasks');
+      expect(objective.textContent).toContain('taskPair.decision.responsible_brain');
+      // No ask button because reason is known, but ready and wait buttons exist
+      expect(screen.queryByRole('button', { name: 'taskPair.decision.ask' })).toBeNull();
+      expect(screen.getByRole('button', { name: 'taskPair.decision.ready' })).toBeTruthy();
+      expect(screen.getByRole('button', { name: 'taskPair.decision.wait' })).toBeTruthy();
+    });
+
+    it('shows paused with scheduling note', () => {
+      const pausedPair: SupervisionConsolePairInfo = {
+        status: 'working',
+        round: 1,
+        flags: [],
+        blocking: [],
+        scheduling: {
+          manual: true,
+          dependsOn: [],
+          pausedAt: 1793700000000,
+          note: 'Paused for database backup',
+        },
+        decisionRevision: 'rev-1',
+      };
+      render(<TaskPairDecisionPanel taskId="task" pair={pausedPair} />);
+
+      expect(screen.getByText('taskPair.decision.title_paused')).toBeTruthy();
+      const objective = screen.getByTestId('expandable-task-objective-text');
+      expect(objective.textContent).toContain('Paused for database backup');
+      expect(objective.textContent).toContain('taskPair.decision.responsible_brain');
+    });
+
+    it('shows waiting_capacity when waiting_for_capacity or needs_auditor flag is set', () => {
+      const capPair: SupervisionConsolePairInfo = {
+        status: 'working',
+        round: 1,
+        flags: ['waiting_for_capacity'],
+        blocking: [],
+        waitingReason: 'Concurrency limit reached: 4/4 workers active',
+        decisionRevision: 'rev-1',
+      };
+      render(<TaskPairDecisionPanel taskId="task" pair={capPair} />);
+
+      expect(screen.getByText('taskPair.decision.title_capacity')).toBeTruthy();
+      const objective = screen.getByTestId('expandable-task-objective-text');
+      expect(objective.textContent).toContain('Concurrency limit reached: 4/4 workers active');
+      expect(objective.textContent).toContain('taskPair.decision.responsible_scheduler');
+      // No blocker buttons
+      expect(screen.queryByRole('button', { name: 'taskPair.decision.ask' })).toBeNull();
+      expect(screen.queryByRole('button', { name: 'taskPair.decision.ready' })).toBeNull();
+      expect(screen.queryByRole('button', { name: 'taskPair.decision.wait' })).toBeNull();
+    });
+
+    it('shows blocked with specific note and identified executor author', () => {
+      const blockedPair: SupervisionConsolePairInfo = {
+        status: 'working',
+        round: 1,
+        flags: ['blocked'],
+        blocking: ['P0'],
+        blockedNote: 'Third-party API rate limited (HTTP 429)',
+        flagSides: { blocked: 'executor' },
+        executor: 'Ag1',
+        decisionRevision: 'rev-1',
+      };
+      render(<TaskPairDecisionPanel taskId="task" pair={blockedPair} />);
+
+      expect(screen.getByText('taskPair.decision.title_blocked')).toBeTruthy();
+      const objective = screen.getByTestId('expandable-task-objective-text');
+      expect(objective.textContent).toContain('Third-party API rate limited (HTTP 429)');
+      expect(objective.textContent).toContain('taskPair.decision.responsible_executor');
+      // Does not ask Brain to explain since blockedNote is already clear
+      expect(screen.queryByRole('button', { name: 'taskPair.decision.ask' })).toBeNull();
+      expect(screen.getByRole('button', { name: 'taskPair.decision.ready' })).toBeTruthy();
+      expect(screen.getByRole('button', { name: 'taskPair.decision.wait' })).toBeTruthy();
+    });
+
+    it('shows legacy_unknown with missing notice and ask button for truly unrecorded blocker', () => {
+      const unknownPair: SupervisionConsolePairInfo = {
+        status: 'working',
+        round: 1,
+        flags: ['blocked'],
+        blocking: ['P0'],
+        decisionRevision: 'rev-1',
+      };
+      render(<TaskPairDecisionPanel taskId="task" pair={unknownPair} />);
+
+      expect(screen.getByText('taskPair.decision.title')).toBeTruthy();
+      expect(screen.getByText('taskPair.decision.missing')).toBeTruthy();
+      expect(screen.getByRole('button', { name: 'taskPair.decision.ask' })).toBeTruthy();
+      expect(screen.getByRole('button', { name: 'taskPair.decision.ready' })).toBeTruthy();
+      expect(screen.getByRole('button', { name: 'taskPair.decision.wait' })).toBeTruthy();
+    });
+  });
 });

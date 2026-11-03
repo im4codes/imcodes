@@ -52,7 +52,7 @@ const FOCUSABLE_SELECTOR = [
   '[tabindex]:not([tabindex="-1"])',
 ].join(',');
 
-const BRAIN_DECISION_FLAGS = new Set(['blocked', 'needs_input', 'waiting_for_capacity']);
+const BRAIN_DECISION_FLAGS = new Set(['blocked', 'needs_input']);
 const TASK_PAIR_PANEL_VISIBLE_STATUSES: readonly TaskPairStatus[] = [
   ...TASK_PAIR_OPEN_STATUSES,
   'queued',
