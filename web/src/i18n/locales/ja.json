@@ -2583,6 +2583,8 @@
     "pathHistoryLabel": "最近のパス"
   },
   "cron": {
+    "send_only_when_idle_help": "対象がビジーなら今回の実行をスキップ（すべての頻度で既定オン）",
+    "send_only_when_idle": "ビジー時は追加しない",
     "title": "スケジュールタスク",
     "create": "新規タスク",
     "edit": "タスクを編集",

@@ -230,7 +230,8 @@ describe('cron API structured send actions', () => {
   it.each([
     ['14-minute', '*/14 * * * *', true],
     ['15-minute', '*/15 * * * *', true],
-    ['just-over-15-minute', '*/16 * * * *', false],
+    ['just-over-15-minute', '*/16 * * * *', true],
+    ['daily', '0 9 * * *', true],
   ])('normalizes omitted idle-only policy for %s structured sends', async (_label, cronExpr, expected) => {
     const res = await app.request('/api/cron', jsonReq('POST', {
       name: `Short ${_label}`,
@@ -286,6 +287,22 @@ describe('cron API structured send actions', () => {
     const legacyUpdate = await app.request(`/api/cron/${legacyRow.id}`, jsonReq('PUT', { cronExpr: '*/14 * * * *' }));
     expect(legacyUpdate.status).toBe(200);
     expect(JSON.parse(String(legacyRow.action)).onlyWhenIdle).toBe(true);
+  });
+
+  it.each([false, true])('preserves manual-command idle policy %s through create, partial edit and replacement', async (onlyWhenIdle) => {
+    const action = { type: 'command', command: 'daily check', onlyWhenIdle };
+    const created = await app.request('/api/cron', jsonReq('POST', {
+      name: 'Manual policy', cronExpr: '0 9 * * *', serverId: 'srv-1', projectName: 'proj', targetRole: 'brain', action,
+    }));
+    expect(created.status).toBe(201);
+    const row = Array.from(dbState.cronJobs.values())[0]!;
+    expect(JSON.parse(String(row.action)).onlyWhenIdle).toBe(onlyWhenIdle);
+    const partial = await app.request(`/api/cron/${row.id}`, jsonReq('PUT', { name: 'Renamed' }));
+    expect(partial.status).toBe(200);
+    expect(JSON.parse(String(row.action)).onlyWhenIdle).toBe(onlyWhenIdle);
+    const changed = await app.request(`/api/cron/${row.id}`, jsonReq('PUT', { action: { ...action, onlyWhenIdle: !onlyWhenIdle } }));
+    expect(changed.status).toBe(200);
+    expect(JSON.parse(String(row.action)).onlyWhenIdle).toBe(!onlyWhenIdle);
   });
 
   it('rejects invalid structured send actions', async () => {

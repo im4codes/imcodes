@@ -2583,6 +2583,8 @@
     "pathHistoryLabel": "최근 경로"
   },
   "cron": {
+    "send_only_when_idle_help": "대상이 사용 중이면 이번 실행 건너뛰기 (모든 주기에서 기본 켜짐)",
+    "send_only_when_idle": "사용 중이면 추가하지 않기",
     "title": "예약 작업",
     "create": "새 작업",
     "edit": "작업 편집",

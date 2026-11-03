@@ -30,23 +30,11 @@ import type { ServerLink } from './server-link.js';
 import logger from '../util/logger.js';
 import { MCP_ERROR_REASONS } from '../../shared/memory-mcp-errors.js';
 import { authorizedDelegationCandidates } from './delegation-admission.js';
-import { Cron } from 'croner';
 import { normalizeCronSendActionForInterval } from '../../shared/cron-types.js';
 import { getTransportQueueStore } from './transport-queue-store.js';
 
 /** Default retry budget when daemon admission returns `daemon_busy`. */
 const CRON_DAEMON_BUSY_DEFAULT_ATTEMPTS = 3;
-function cronIntervalMs(cronExpr?: string, timezone?: string | null): number | null {
-  if (!cronExpr) return null;
-  try {
-    const schedule = new Cron(cronExpr, timezone ? { timezone } : undefined);
-    const first = schedule.nextRun();
-    const second = first ? schedule.nextRun(first) : null;
-    return first && second ? second.getTime() - first.getTime() : null;
-  } catch {
-    return null;
-  }
-}
 const CRON_DAEMON_BUSY_DEFAULT_DELAY_MS = 5_000;
 const CRON_TRANSIENT_RETRY_DELAY_MS = 60_000;
 const CRON_TRANSIENT_MAX_ATTEMPTS = 3;
@@ -182,9 +170,7 @@ export async function executeCronJob(msg: CronDispatchMessage, serverLink: Serve
     });
     return;
   }
-  const action = msg.action.type === 'send'
-    ? normalizeCronSendActionForInterval(msg.action, cronIntervalMs(msg.cronExpr, msg.timezone))
-    : msg.action;
+  const action = normalizeCronSendActionForInterval(msg.action);
 
   // Resolve target session: prefer direct session name, fall back to role-based construction
   let name: string;
@@ -235,9 +221,16 @@ export async function executeCronJob(msg: CronDispatchMessage, serverLink: Serve
   }
 
   // Busy check — skip tmux detection for transport sessions
-  if (session.runtimeType === 'transport') {
-    logger.debug({ jobId, sessionName: name }, 'Cron: transport session, skipping busy check');
-  } else {
+  if (action.type === 'command' && action.onlyWhenIdle === true && session.runtimeType === 'transport') {
+    const status = getTransportRuntime(name)?.getStatus?.();
+    if (status && status !== 'idle') {
+      sendCommandResult(serverLink, {
+        type: CRON_MSG.COMMAND_RESULT, jobId, executionId, status: 'skipped_busy',
+        detail: `Cron target session is busy: ${name} (${status})`,
+      });
+      return;
+    }
+  } else if (session.runtimeType !== 'transport' && !(action.type === 'command' && action.onlyWhenIdle === false)) {
     try {
       const status = await detectStatusAsync(name, session.agentType as AgentType);
       if (BUSY_STATES.has(status)) {

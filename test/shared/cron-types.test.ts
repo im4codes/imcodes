@@ -55,12 +55,20 @@ describe('cron idle-only schedule default', () => {
   it.each([
     ['14:59', 14 * 60_000 + 59_000, true],
     ['15:00', 15 * 60_000, true],
-    ['15:01', 15 * 60_000 + 1_000, false],
+    ['15:01', 15 * 60_000 + 1_000, true],
+    ['daily', 86400_000, true],
+    ['unknown', null, true],
   ])('defaults omitted onlyWhenIdle at the %s boundary', (_label, intervalMs, expected) => {
     expect(normalizeCronSendActionForInterval(send, intervalMs)).toMatchObject(
       expected ? { onlyWhenIdle: true } : { type: 'send', target: 'w1', message: 'review' },
     );
     if (!expected) expect(normalizeCronSendActionForInterval(send, intervalMs)).not.toHaveProperty('onlyWhenIdle');
+  });
+
+  it('also defaults manual commands without rewriting discussion actions', () => {
+    expect(normalizeCronSendActionForInterval({ type: 'command', command: 'check' })).toMatchObject({ onlyWhenIdle: true });
+    const discussion = { type: 'p2p', topic: 'check', mode: 'discuss' } as const;
+    expect(normalizeCronSendActionForInterval(discussion)).toBe(discussion);
   });
 
   it('never overrides an explicit true or false choice', () => {

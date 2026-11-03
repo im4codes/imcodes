@@ -5457,7 +5457,7 @@ const schemas = {
     projectName: z.string().optional().describe('Project; defaults to caller project.'),
     targetRole: z.string().optional().describe('Source role; defaults to project brain.'),
     targetSessionName: z.string().nullable().optional().describe('Source session; target resolves among its siblings and cannot be itself.'),
-    action: z.record(z.string(), z.unknown()).describe('Send action {type:"send", ...} with optional onlyWhenIdle; omitted defaults true for intervals <=15m.'),
+    action: z.record(z.string(), z.unknown()).describe('Send action {type:"send", ...} with optional onlyWhenIdle; omitted defaults true at every frequency.'),
     timezone: z.string().optional(),
     expiresAt: z.union([z.number(), z.string(), z.null()]).optional().describe('Epoch-ms/offset-ISO, ≤90 days; affects future sends only.'),
     completionPolicy: z.enum([
@@ -5476,7 +5476,7 @@ const schemas = {
     projectName: z.string().optional().describe('Replacement project.'),
     targetRole: z.string().optional().describe('Replacement source role.'),
     targetSessionName: z.string().nullable().optional().describe('Replacement source session; target resolves among its siblings.'),
-    action: z.record(z.string(), z.unknown()).optional().describe('Replacement send action; onlyWhenIdle skips busy recipients; omitted defaults true for intervals <=15m.'),
+    action: z.record(z.string(), z.unknown()).optional().describe('Replacement send action; onlyWhenIdle skips busy recipients; omitted defaults true at every frequency.'),
     timezone: z.string().optional().describe('Replacement schedule timezone only.'),
     expiresAt: z.union([z.number(), z.string(), z.null()]).optional().describe('Replacement epoch-ms/offset-ISO; affects future sends only.'),
     completionPolicy: z.enum([

@@ -84,6 +84,7 @@ const cronControlRegistrationSchema = z.union([
 const cronActionSchemaRaw = z.discriminatedUnion('type', [
   z.object({
     type: z.literal('command'), command: z.string().min(1), selfManaged: z.boolean().optional(),
+    onlyWhenIdle: z.boolean().optional(),
     cronControl: cronControlRegistrationSchema.optional(),
   }),
   z.object({
@@ -234,10 +235,16 @@ async function resolveCronScope(
     userId: params.userId,
   });
   if (member.ok) {
+    // Operational authority includes server Participants and group members;
+    // jobs belong to the server owner, not the visiting actor.
+    const server = await c.env.DB.queryOne<{ user_id: string }>(
+      'SELECT user_id FROM servers WHERE id = $1', [params.serverId],
+    );
+    if (!server) return { ok: false, reason: 'share-target-unavailable' };
     return {
       ok: true,
       scope: {
-        ownerUserId: params.userId,
+        ownerUserId: server.user_id,
         projectName: params.requestedProjectName ?? null,
         shared: false,
         sharedSessionName: null,
@@ -250,7 +257,8 @@ async function resolveCronScope(
   let target = shareTargetFromSessionName(params.serverId, sessionName);
   if (!target) {
     const userShares = await listActiveSharesForUser(c.env.DB, params.userId, Date.now()).catch(() => []);
-    const serverShare = userShares.find((s) => s.serverId === params.serverId);
+    const serverShare = userShares.find((s) => s.serverId === params.serverId && s.target.kind === 'server')
+      ?? userShares.find((s) => s.serverId === params.serverId);
     if (serverShare) {
       target = serverShare.target;
       sessionName = shareTargetSessionName(serverShare.target) ?? '';
@@ -735,9 +743,9 @@ cronApiRoutes.put('/:id', requireCronAuth(), async (c) => {
   }
 
   // When an action is omitted, keep the existing action but still apply the
-  // schedule default to legacy rows that predate onlyWhenIdle. Explicit true
+  // idle-only default to legacy rows that predate onlyWhenIdle. Explicit true
   // and false values remain untouched by the shared normalizer.
-  if (updates.action === undefined && existingAction?.type === 'send') {
+  if (updates.action === undefined && existingAction && existingAction.type !== 'p2p') {
     const normalizedExistingAction = normalizeCronSendActionForInterval(existingAction, effectiveIntervalMs);
     if (normalizedExistingAction !== existingAction) {
       sets.push(`action = $${idx++}`);

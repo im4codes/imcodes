@@ -2584,6 +2584,8 @@
     "pathHistoryLabel": "Rutas recientes"
   },
   "cron": {
+    "send_only_when_idle_help": "Omitir esta ejecución si el destino está ocupado (activado por defecto con cualquier frecuencia)",
+    "send_only_when_idle": "Omitir si está ocupado",
     "title": "Tareas programadas",
     "create": "Nueva tarea",
     "edit": "Editar tarea",

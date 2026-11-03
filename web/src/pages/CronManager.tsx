@@ -7,7 +7,6 @@ import type { CronAction, CronCompletionPolicy, CronJobStatus } from '@shared/cr
 import {
   CRON_COMPLETION_POLICY,
   CRON_STATUS,
-  isCronExprShortInterval,
   normalizeCronCompletionPolicy,
   normalizeCronExecutionDetail,
 } from '@shared/cron-types';
@@ -497,7 +496,7 @@ export function CronManager({ serverId, projectName, sessions, subSessions = [],
               {action?.type === 'p2p' && <span style={{ opacity: 0.6 }}>Team {action.mode}</span>}
               {action?.type === 'command' && <span style={{ opacity: 0.6, maxWidth: '200px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{action.command}</span>}
               {action?.type === 'send' && <span title={sendActionSummary(action, t)} style={{ opacity: 0.6, maxWidth: '260px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{sendActionSummary(action, t)}</span>}
-              {action?.type === 'send' && (action.onlyWhenIdle !== undefined ? action.onlyWhenIdle : isCronExprShortInterval(job.cron_expr)) && (
+              {action && action.type !== 'p2p' && action.onlyWhenIdle !== false && (
                 <span
                   title={t('cron.send_only_when_idle_help')}
                   style={{
@@ -1056,11 +1055,11 @@ function CronForm({ serverId, projectName, sessions, subSessions = [], activeSes
   const [sendMessage, setSendMessage] = useState(existingAction?.type === 'send' ? existingAction.message : '');
   const [sendReply, setSendReply] = useState(existingAction?.type === 'send' ? existingAction.reply === true : false);
   const [sendBroadcast, setSendBroadcast] = useState(existingAction?.type === 'send' ? existingAction.broadcast === true : false);
-  const [sendOnlyWhenIdle, setSendOnlyWhenIdle] = useState<boolean>(() => {
-    if (existingAction?.type === 'send' && existingAction.onlyWhenIdle !== undefined) {
+  const [onlyWhenIdle, setOnlyWhenIdle] = useState<boolean>(() => {
+    if (existingAction && existingAction.type !== 'p2p' && existingAction.onlyWhenIdle !== undefined) {
       return existingAction.onlyWhenIdle;
     }
-    return isCronExprShortInterval(job?.cron_expr ?? (cronExpr || '*/5 * * * *'));
+    return true;
   });
   const [expiresAt, setExpiresAt] = useState(formatDateTimeLocalInput(job?.expires_at));
   const [completionPolicy, setCompletionPolicy] = useState<CronCompletionPolicy>(
@@ -1107,6 +1106,7 @@ function CronForm({ serverId, projectName, sessions, subSessions = [], activeSes
       ? {
         type: 'command',
         command,
+        onlyWhenIdle,
         ...(
           completionPolicy === CRON_COMPLETION_POLICY.UNTIL_COMPLETE
           || (existingAction?.type === 'command' && existingAction.selfManaged)
@@ -1125,7 +1125,7 @@ function CronForm({ serverId, projectName, sessions, subSessions = [], activeSes
           type: 'send',
           target: sendTarget.trim(),
           message: sendMessage,
-          onlyWhenIdle: sendOnlyWhenIdle,
+          onlyWhenIdle,
           ...(sendReply ? { reply: true } : {}),
           ...(sendBroadcast ? { broadcast: true } : {}),
           ...(existingAction?.type === 'send' && existingAction.idempotencyKey ? { idempotencyKey: existingAction.idempotencyKey } : {}),
@@ -1376,17 +1376,19 @@ function CronForm({ serverId, projectName, sessions, subSessions = [], activeSes
               />
               {t('cron.send_reply')}
             </label>
-
-            <label style={{ color: '#e2e8f0', fontSize: '13px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '6px', margin: '-2px 0 10px' }}>
-              <input
-                type="checkbox"
-                checked={sendOnlyWhenIdle}
-                onChange={e => setSendOnlyWhenIdle((e.target as HTMLInputElement).checked)}
-              />
-              <span>{t('cron.send_only_when_idle')}</span>
-              <span style={{ color: '#64748b', fontSize: '11px' }}>({t('cron.send_only_when_idle_help')})</span>
-            </label>
           </>
+        )}
+
+        {actionType !== 'p2p' && (
+          <label style={{ color: '#e2e8f0', fontSize: '13px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '6px', margin: '-2px 0 10px' }}>
+            <input
+              type="checkbox"
+              checked={onlyWhenIdle}
+              onChange={e => setOnlyWhenIdle((e.target as HTMLInputElement).checked)}
+            />
+            <span>{t('cron.send_only_when_idle')}</span>
+            <span style={{ color: '#64748b', fontSize: '11px' }}>({t('cron.send_only_when_idle_help')})</span>
+          </label>
         )}
 
         <label style={labelStyle}>{t('cron.expires_at')}</label>

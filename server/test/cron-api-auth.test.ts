@@ -155,6 +155,36 @@ describe('cron API authentication (real auth middleware)', () => {
     app = await buildApp(state.db);
   });
 
+  it.each(['participant', 'viewer'] as const)('whole-server %s sees owner jobs across projects, not a private other server', async (role) => {
+    const originalQuery = state.db.query.bind(state.db);
+    state.db.query = async <T>(sql: string, params: unknown[] = []): Promise<T[]> => {
+      if (sql.includes('FROM server_shares') && params[1] === ATTACKER) {
+        return [{ target_kind: 'server', id: 'share-1', server_id: VICTIM_SERVER, target_user_id: ATTACKER,
+          role, created_by: OWNER, created_at: 1, updated_at: 1, expires_at: null, revoked_at: null }] as T[];
+      }
+      return originalQuery<T>(sql, params);
+    };
+    state.cronJobs.set('other-project', { ...state.cronJobs.get('job-1'), id: 'other-project', project_name: 'second' });
+    // The query fixture applies the same server/project predicates as SQL.
+    const sharedQuery = state.db.query.bind(state.db);
+    state.db.query = async <T>(sql: string, params: unknown[] = []): Promise<T[]> => {
+      const rows = await sharedQuery<T>(sql, params);
+      return sql.includes('FROM cron_jobs') ? rows.filter((row) => {
+        const job = row as MockRow;
+        return (!params[1] || job.server_id === params[1]) && (!params[2] || job.project_name === params[2]);
+      }) : rows;
+    };
+    const cookie = await signJwt({ sub: ATTACKER, role: 'member' }, SIGNING_KEY, 3600);
+    const headers = { Cookie: `${COOKIE_SESSION}=${cookie}` };
+    const list = await app.request(`/api/cron?serverId=${VICTIM_SERVER}`, { headers });
+    expect(list.status).toBe(200);
+    expect((await list.json() as { jobs: MockRow[] }).jobs.map(j => j.id).sort()).toEqual(['job-1', 'other-project']);
+    const update = await app.request('/api/cron/job-1', { method: 'PUT', headers: { ...headers, 'Content-Type': 'application/json' }, body: JSON.stringify({ name: 'updated' }) });
+    expect(update.status).toBe(role === 'participant' ? 200 : 403);
+    const denied = await app.request(`/api/cron?serverId=${CONTROLLED_SERVER}`, { headers });
+    expect(denied.status).toBe(403);
+  });
+
   describe.each([
     ['pod-sticky mount (the exploit)', `/api/server/${VICTIM_SERVER}/cron`],
     ['plain mount', '/api/cron'],

@@ -292,7 +292,7 @@ describe('Cron API routes', () => {
       expect(body.name).toBe('Daily report');
       expect(body.status).toBe(CRON_STATUS.ACTIVE);
       expect(body.nextRunAt).toBeTypeOf('number');
-      expect(body.action).toEqual({ type: 'command', command: '/status' });
+      expect(body.action).toEqual({ type: 'command', command: '/status', onlyWhenIdle: true });
       expect(body.completionPolicy).toBe(CRON_COMPLETION_POLICY.RECURRING);
     });
 
@@ -304,7 +304,7 @@ describe('Cron API routes', () => {
       expect(res.status).toBe(201);
       const body = await res.json() as Record<string, unknown>;
       expect(body.action).toEqual({
-        type: 'command', command: 'check progress', selfManaged: true,
+        type: 'command', command: 'check progress', selfManaged: true, onlyWhenIdle: true,
         cronControl: {
           contractId: CRON_CONTROL_CONTRACT.contractId,
           version: CRON_CONTROL_CONTRACT.version,
@@ -433,7 +433,7 @@ describe('Cron API routes', () => {
       }));
       expect(res.status).toBe(201);
       const body = await res.json() as Record<string, any>;
-      expect(body.action).toEqual({ type: 'command', command: longCommand });
+      expect(body.action).toEqual({ type: 'command', command: longCommand, onlyWhenIdle: true });
     });
 
     it('command action missing `command` field returns 400', async () => {
@@ -607,12 +607,16 @@ describe('Cron API routes', () => {
       expect(body.jobs.map((job) => job.id).sort()).toEqual(['deck_sub_other', 'deck_sub_shared', 'main-role'].sort());
     });
 
-    it('lets a whole-server share see jobs across projects without a session filter', async () => {
+    it('prefers whole-server viewer coverage over an older session grant across projects', async () => {
       mockServerOwnerUserId = 'owner-1';
       mockResolveServerMemberAccessOrShareDeny.mockResolvedValue({ ok: false, reason: 'share-direct-surface-denied' });
       mockResolveHttpShareAccessForCoveredSession.mockResolvedValue({
         membership: 'none',
         actor: { kind: 'share', effectiveActorRole: 'viewer' },
+      });
+      mockDb.sharedShares.push({
+        target_kind: 'main', server_id: 'srv-1', session_name: 'deck_myapp_brain',
+        target_user_id: 'user-1', role: 'viewer', id: 'older-session-share',
       });
       mockDb.sharedShares.push({
         target_kind: 'server',

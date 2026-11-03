@@ -2584,6 +2584,8 @@
     "pathHistoryLabel": "最近使用的路徑"
   },
   "cron": {
+    "send_only_when_idle_help": "目標忙碌時略過本次執行（所有頻率預設開啟）",
+    "send_only_when_idle": "忙碌時不追加",
     "title": "排程任務",
     "create": "新增任務",
     "edit": "編輯任務",
