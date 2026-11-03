@@ -5219,13 +5219,57 @@ html.native-ios-mac .chat-dl-btn {
 .message-pins-error {
   width: 100%; border: 0; background: rgba(127, 29, 29, 0.28); color: #fecaca; cursor: pointer;
 }
-.chat-user { background: #1e3a5f; border-radius: 8px; padding: 6px 12px; align-self: flex-end; max-width: 80%; width: fit-content; text-align: left; word-break: break-all; overflow-wrap: break-word; position: relative; }
+.chat-virtual-item {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+}
+.chat-linked-event-group {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  gap: 2px;
+}
+.chat-user {
+  background: #1e3a5f;
+  border-radius: 8px;
+  padding: 6px 12px;
+  align-self: flex-end;
+  margin-left: auto;
+  margin-inline-start: auto;
+  max-width: 80%;
+  width: fit-content;
+  text-align: left;
+  word-break: break-all;
+  overflow-wrap: break-word;
+  position: relative;
+}
+.chat-user.chat-user-origin-user {
+  align-self: flex-end;
+  margin-left: auto;
+  margin-inline-start: auto;
+}
 /* Only the human's own input is right-aligned (shared/chat-message-origin.ts):
    agent deliveries and daemon injections are incoming, so they sit on the left
    in the incoming-bubble tone. */
 .chat-user.chat-user-origin-agent,
-.chat-user.chat-user-origin-system { align-self: flex-start; background: #161b22; border: 1px solid rgba(148, 163, 184, 0.16); }
+.chat-user.chat-user-origin-system {
+  align-self: flex-start;
+  margin-left: 0;
+  margin-inline-start: 0;
+  background: #161b22;
+  border: 1px solid rgba(148, 163, 184, 0.16);
+}
 .chat-user.chat-user-origin-agent { align-self: stretch; width: 100%; max-width: 100%; box-sizing: border-box; }
+.chat-user-supervision-prompt {
+  align-self: flex-start;
+  margin-left: 0;
+  margin-inline-start: 0;
+  width: fit-content;
+  max-width: 100%;
+  padding: 0;
+  background: transparent;
+}
 .chat-user.chat-user-supervision-prompt.chat-user-origin-system { background: transparent; border: 0; }
 .chat-user.chat-pending { background: #1e3a5f80; color: #94a3b8; }
 .chat-user.chat-failed { background: #3a1a1a; color: #fca5a5; border: 1px solid #7f1d1d; }
