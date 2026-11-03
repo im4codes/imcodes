@@ -15429,9 +15429,12 @@ button.quick-agent-delegation-preset.active {
 .task-pair-decision small { color: #94a3b8; }
 .task-pair-decision-time { display: block; margin: 4px 0; }
 .task-pair-decision-copy { margin: 6px 0; }
-.task-pair-decision-copy .expandable-task-objective-text { font-weight: normal; line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere; }
+.task-pair-decision-copy .expandable-task-objective-text { display: block; width: 100%; font-weight: normal; line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere; overflow-y: auto; scrollbar-width: thin; user-select: text; -webkit-user-select: text; }
 .task-pair-decision-copy .expandable-task-objective-text.is-clamped,
-.task-pair-decision-copy .expandable-task-objective-text.is-measuring-clamped { -webkit-line-clamp: 5; }
+.task-pair-decision-copy .expandable-task-objective-text.is-measuring-clamped { display: block; max-height: 7.5em; min-height: 0; -webkit-line-clamp: unset; overflow-y: auto; }
+/* Contain only overflowing copy, not short text: outside gestures must still reach the task list. */
+.task-pair-decision-copy[data-objective-overflow="true"] .expandable-task-objective-text { overscroll-behavior-y: contain; }
+.task-pair-decision-copy .expandable-task-objective-text:focus-visible { outline: 1px solid currentColor; outline-offset: 2px; }
 .task-pair-decision-records { margin: 0; padding-left: 22px; }
 .task-pair-decision textarea { display: block; width: 100%; min-height: 64px; max-height: 200px; margin: 7px 0; resize: vertical; box-sizing: border-box; border: 1px solid #475569; border-radius: 6px; padding: 7px; background: #0f172a; color: #e2e8f0; font: inherit; }
 .task-pair-decision-options { display: flex; flex-wrap: wrap; gap: 6px; }
