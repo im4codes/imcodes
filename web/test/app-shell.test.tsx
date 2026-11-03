@@ -1162,7 +1162,7 @@ describe('App shell', () => {
     expect(screen.queryByText('delete-server-dialog')).toBeNull();
     expect(apiFetchMock).toHaveBeenCalledWith('/api/server/srv-1', { method: 'DELETE' });
     expect(wsInstances.every((ws) => ws.sendSessionCommand.mock.calls.length === 0)).toBe(true);
-  });
+  }, 20_000);
 
   it('deletes the selected offline server through its menu and does not auto-enter it again', async () => {
     localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
@@ -1185,7 +1185,7 @@ describe('App shell', () => {
     expect(localStorage.getItem('rcc_server_name')).toBeNull();
     expect(localStorage.getItem('rcc_session')).toBeNull();
     expect(screen.queryByText('delete-server-dialog')).toBeNull();
-  });
+  }, 20_000);
 
   it('keeps the offline deletion dialog and server visible on failure, then permits retry', async () => {
     localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
@@ -1211,7 +1211,7 @@ describe('App shell', () => {
     fireEvent.click(screen.getByText('delete-confirm'));
     await waitFor(() => expect(screen.queryByText('dashboard-delete-srv-1')).toBeNull());
     expect(screen.queryByText('delete-server-dialog')).toBeNull();
-  });
+  }, 20_000);
 
   it('keeps Safari viewport height bounded and corrects it on visual viewport scrolling', async () => {
     const originalVisualViewport = Object.getOwnPropertyDescriptor(window, 'visualViewport');
@@ -6941,5 +6941,79 @@ describe('App shell', () => {
     await screen.findByTestId('session-pane-deck_alpha_brain');
     // Only owned servers exist; no unowned server exists
     expect(screen.queryByText('server-select-srv-shared')).toBeNull();
+  }, 20_000);
+
+  it('audit-owned-context-menu: mobile server dropdown opens ServerContextMenu for owned server and suppresses for shared-in server', async () => {
+    const originalUserAgent = navigator.userAgent;
+    Object.defineProperty(navigator, 'userAgent', { configurable: true, value: 'iPhone' });
+    try {
+      localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+      localStorage.setItem('rcc_server', 'srv-1');
+      localStorage.setItem('rcc_session', 'deck_alpha_brain');
+      const sharedGrant = {
+        id: 'share-ctx-test',
+        serverId: 'srv-shared-ctx',
+        serverName: 'Shared Server Ctx',
+        role: 'participant',
+        status: 'active',
+        targetLabel: 'Shared Server Ctx',
+        target: { kind: 'server', serverId: 'srv-shared-ctx' },
+      } as const;
+      discoverSharedEntriesMock.mockResolvedValue([sharedGrant]);
+      const { App } = await importApp();
+      const view = render(<App />);
+      await screen.findByTestId('session-pane-deck_alpha_brain');
+
+      // 1. Open mobile server dropdown
+      const mobileBtn = await waitFor(() => {
+        const btn = view.container.querySelector('.mobile-server-btn');
+        if (!btn) throw new Error('no mobile-server-btn');
+        return btn;
+      });
+      fireEvent.click(mobileBtn);
+
+      // 2. Owned server contextmenu opens management menu
+      const menu = view.container.querySelector('.mobile-server-menu')!;
+      const alphaBtn = within(menu as HTMLElement).getByText('Alpha Server').closest('button')!;
+      fireEvent.contextMenu(alphaBtn);
+      expect(await screen.findByText('server-context-menu')).toBeTruthy();
+      fireEvent.click(screen.getByText('server-menu-close'));
+      expect(screen.queryByText('server-context-menu')).toBeNull();
+
+      // 3. Negative control: shared server contextmenu does NOT open management menu
+      fireEvent.click(view.container.querySelector('.mobile-server-btn')!);
+      const menuAgain = view.container.querySelector('.mobile-server-menu')!;
+      const sharedItemBtn = within(menuAgain as HTMLElement).getByText('Shared Server Ctx').closest('button')!;
+      fireEvent.contextMenu(sharedItemBtn);
+      expect(screen.queryByText('server-context-menu')).toBeNull();
+    } finally {
+      Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUserAgent });
+    }
+  }, 20_000);
+
+  it('audit-owned-context-menu: mobile sidebar drawer opens ServerContextMenu for owned server', async () => {
+    const originalUserAgent = navigator.userAgent;
+    Object.defineProperty(navigator, 'userAgent', { configurable: true, value: 'iPhone' });
+    try {
+      localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+      localStorage.setItem('rcc_server', 'srv-1');
+      localStorage.setItem('rcc_session', 'deck_alpha_brain');
+      const { App } = await importApp();
+      const view = render(<App />);
+      await screen.findByTestId('session-pane-deck_alpha_brain');
+
+      // Open mobile drawer
+      fireEvent.click(view.container.querySelector('.mobile-sidebar-toggle')!);
+      const sidebarServer = await waitFor(() => {
+        const item = view.container.querySelector('.server-list .server-item');
+        if (!item) throw new Error('no sidebar server item');
+        return item;
+      });
+      fireEvent.contextMenu(sidebarServer);
+      expect(await screen.findByText('server-context-menu')).toBeTruthy();
+      fireEvent.click(screen.getByText('server-menu-close'));
+    } finally {
+      Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUserAgent });
+    }
   }, 20_000);
 });

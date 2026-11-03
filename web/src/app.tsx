@@ -7358,7 +7358,12 @@ export function App() {
                           key={s.id}
                           class={`mobile-server-menu-item mobile-server-menu-server${s.id === selectedServerId ? ' active' : ''}${pinnedServerIds.has(s.id) ? ' pinned' : ''}${showSharedReturnGuide && s.id === sharedReturnServer?.id ? ' server-return-hint' : ''}`}
                           onClick={() => { handleUnifiedServerSelect(s); setShowMobileServerMenu(false); }}
-                          onContextMenu={s.isSharedIn ? (e) => e.preventDefault() : (e) => { e.preventDefault(); setShowMobileServerMenu(false); if (s.server) setServerCtxMenu({ server: s.server as ServerInfo, x: e.clientX, y: e.clientY }); }}
+                          onContextMenu={s.isSharedIn ? (e) => e.preventDefault() : (e) => {
+                            e.preventDefault();
+                            setShowMobileServerMenu(false);
+                            const ownedServer = s.server || servers.find((srv) => srv.id === s.id && ownedServerIdsRef.current.has(srv.id));
+                            if (ownedServer) setServerCtxMenu({ server: ownedServer as ServerInfo, x: e.clientX, y: e.clientY });
+                          }}
                         >
                           <span style={{ color: online ? '#4ade80' : '#475569' }}>{online ? '●' : '○'}</span>
                           <span class="mobile-server-menu-name">{s.name}</span>
@@ -7929,7 +7934,12 @@ export function App() {
                         key={s.id}
                         class={`server-item${s.id === selectedServerId ? ' active' : ''}${online ? '' : ' offline'}${showSharedReturnGuide && s.id === sharedReturnServer?.id ? ' server-return-hint' : ''}`}
                         onClick={() => { handleUnifiedServerSelect(s); closeSidebar(); }}
-                        onContextMenu={s.isSharedIn ? (e) => e.preventDefault() : (e) => { e.preventDefault(); closeSidebar(); if (s.server) setServerCtxMenu({ server: s.server as ServerInfo, x: e.clientX, y: e.clientY }); }}
+                        onContextMenu={s.isSharedIn ? (e) => e.preventDefault() : (e) => {
+                          e.preventDefault();
+                          closeSidebar();
+                          const ownedServer = s.server || servers.find((srv) => srv.id === s.id && ownedServerIdsRef.current.has(srv.id));
+                          if (ownedServer) setServerCtxMenu({ server: ownedServer as ServerInfo, x: e.clientX, y: e.clientY });
+                        }}
                       >
                         <span class="server-item-dot" style={{ color: online ? '#4ade80' : '#475569' }}>
                           {online ? '●' : '○'}

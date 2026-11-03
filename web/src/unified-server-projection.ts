@@ -74,6 +74,7 @@ export function projectUnifiedServerList<T extends OnlineServerInfo>(
         createdAt: server.createdAt,
         isSharedIn: false,
         sharedEntry: undefined,
+        server,
         online: isServerOnline(server),
       });
     } else {

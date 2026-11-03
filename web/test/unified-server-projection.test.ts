@@ -41,6 +41,7 @@ describe('projectUnifiedServerList', () => {
       online: true,
       sharedEntry: undefined,
     });
+    expect(result[0].server).toBe(mockOwnedServer1);
     expect(result[1]).toMatchObject({
       id: 'server-owned-2',
       name: 'Backup Node',
@@ -48,6 +49,7 @@ describe('projectUnifiedServerList', () => {
       online: true,
       sharedEntry: undefined,
     });
+    expect(result[1].server).toBe(mockOwnedServer2);
   });
 
   it('projects active whole-server shares into unified list with isSharedIn: true and online: false', () => {
@@ -79,6 +81,7 @@ describe('projectUnifiedServerList', () => {
       online: false, // Unknown discovery heartbeat must not fake green dot
       sharedEntry,
     });
+    expect(result[1].server).toBeUndefined();
   });
 
   it('gives ownership precedence when the same serverId is both owned and received as a share', () => {
