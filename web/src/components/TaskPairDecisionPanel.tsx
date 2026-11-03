@@ -2,7 +2,13 @@ import { useEffect, useRef, useState } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import { TASK_PAIR_TERMINAL_STATUSES } from '@shared/task-pair.js';
 import { readPairScheduling, taskPairWaitKind } from '@shared/task-pair-suspension.js';
-import { TASK_PAIR_DECISION_KIND, TASK_PAIR_DECISION_MSG, TASK_PAIR_DECISION_LIMITS, type TaskPairDecisionRecord } from '@shared/task-pair-decision.js';
+import {
+  TASK_PAIR_DECISION_KIND,
+  TASK_PAIR_DECISION_MSG,
+  TASK_PAIR_DECISION_LIMITS,
+  type TaskPairDecisionRecord,
+  isDecisionResolvingQuestion,
+} from '@shared/task-pair-decision.js';
 import type { SupervisionConsolePairInfo } from '@shared/supervision-task-console.js';
 import { requestTaskPairDecision } from '../task-pair-decisions.js';
 import { ExpandableTaskObjective } from './ExpandableTaskObjective.js';
@@ -24,22 +30,22 @@ export function resolveDecisionCategory(
   if (question && !resolved) {
     return 'request';
   }
-  if (pair.blockedNote) {
-    return 'blocked';
-  }
-  const isBlocked = pair.flags?.some((flag) => flag === 'blocked' || flag === 'needs_input');
-  if (isBlocked) {
-    return 'legacy_unknown';
-  }
-  if (pair.flags?.some((flag) => flag === 'waiting_for_capacity' || flag === 'needs_auditor')) {
-    return 'waiting_capacity';
-  }
   const wait = taskPairWaitKind(pair);
   if (wait === 'waiting_dependencies') {
     return 'wait_dependencies';
   }
   if (wait === 'paused') {
     return 'paused';
+  }
+  if (pair.flags?.some((flag) => flag === 'waiting_for_capacity' || flag === 'needs_auditor')) {
+    return 'waiting_capacity';
+  }
+  if (pair.blockedNote) {
+    return 'blocked';
+  }
+  const isBlocked = pair.flags?.some((flag) => flag === 'blocked' || flag === 'needs_input');
+  if (isBlocked) {
+    return 'legacy_unknown';
   }
   if (
     pair.status === 'passed' ||
@@ -76,9 +82,7 @@ function DecisionPanel({ taskId, pair, context, readOnly }: { taskId: string; pa
   useEffect(() => () => { active.current = false; }, []);
   const question = pair.decisionRequest;
   const latest = (readOnly ? history?.find((entry) => entry.kind === TASK_PAIR_DECISION_KIND.DECISION) : history?.[0]) ?? pair.latestDecision;
-  const resolved = !!question && latest?.kind === TASK_PAIR_DECISION_KIND.DECISION && (
-    latest.requestId ? latest.requestId === question.id : (latest.round === question.round && latest.at >= question.at)
-  );
+  const resolved = isDecisionResolvingQuestion(latest, question);
   const waiting = !TASK_PAIR_TERMINAL_STATUSES.includes(pair.status) && !!(
     taskPairWaitKind(pair)
     || (question && !resolved)
@@ -118,7 +122,8 @@ function DecisionPanel({ taskId, pair, context, readOnly }: { taskId: string; pa
       break;
     }
     case 'blocked': {
-      reason = pair.blockedNote || '';
+      const scheduling = readPairScheduling(pair.scheduling);
+      reason = [pair.blockedNote, scheduling?.note].filter(Boolean).join('\n');
       const side = pair.flagSides?.blocked || pair.flagSides?.needs_input;
       const author = (side && (side === 'executor' ? pair.executor : pair.auditor)) || pair.executor || pair.auditor;
       if (author) {
@@ -133,21 +138,23 @@ function DecisionPanel({ taskId, pair, context, readOnly }: { taskId: string; pa
       const waitingTasksText = dependsOn.length > 0
         ? t('taskPair.decision.waiting_for_tasks', { tasks: dependsOn.join(', ') })
         : '';
-      reason = [note, waitingTasksText].filter(Boolean).join('\n');
+      reason = [note, pair.blockedNote, waitingTasksText].filter(Boolean).join('\n');
       responsible = t('taskPair.decision.responsible_brain');
       break;
     }
     case 'paused': {
       const scheduling = readPairScheduling(pair.scheduling);
-      reason = scheduling?.note || t('taskPair.decision.paused_reason');
+      const pauseReason = scheduling?.note || t('taskPair.decision.paused_reason');
+      reason = [pauseReason, pair.blockedNote].filter(Boolean).join('\n');
       responsible = t('taskPair.decision.responsible_brain');
       break;
     }
     case 'waiting_capacity': {
-      reason = pair.waitingReason
+      const capReason = pair.waitingReason
         || (pair.flags?.includes('needs_auditor')
           ? t('taskPair.decision.needs_auditor_reason')
           : t('taskPair.decision.waiting_capacity_reason'));
+      reason = [capReason, pair.blockedNote].filter(Boolean).join('\n');
       responsible = t('taskPair.decision.responsible_scheduler');
       break;
     }
@@ -170,7 +177,9 @@ function DecisionPanel({ taskId, pair, context, readOnly }: { taskId: string; pa
     reason,
     responsible,
     question?.recommendation ? `${t('taskPair.decision.recommendation')}: ${question.recommendation}` : '',
-    latest?.kind === TASK_PAIR_DECISION_KIND.DECISION && (!question || (latest.requestId ? latest.requestId === question.id : resolved)) ? `${t('taskPair.decision.ruling')}: ${latest.conclusion} — ${latest.summary}` : '',
+    latest?.kind === TASK_PAIR_DECISION_KIND.DECISION && (resolved || (!question && (latest.deliveryRound ?? 1) === (pair.deliveryRound ?? 1) && latest.round === pair.round))
+      ? `${t('taskPair.decision.ruling')}: ${latest.conclusion} — ${latest.summary}`
+      : '',
   ].filter(Boolean).join('\n');
 
   if (!waiting && !question && !latest) return null;

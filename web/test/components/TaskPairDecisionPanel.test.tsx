@@ -399,5 +399,136 @@ describe('TaskPairDecisionPanel', () => {
       expect(screen.getByTestId('expandable-task-objective-text').textContent).toContain('Current issue B?');
       expect(screen.getByText('taskPair.decision.title_request')).toBeTruthy();
     });
+
+    it('F1-R2: a known manual pause note is not replaced with unknown because a blocked flag remains', () => {
+      render(
+        <TaskPairDecisionPanel
+          taskId="task"
+          pair={{
+            status: 'working',
+            round: 1,
+            flags: ['blocked'],
+            flagSides: { blocked: 'executor' },
+            blocking: ['P0'],
+            executor: 'Ag1',
+            brain: 'BrainChief',
+            scheduling: {
+              epoch: 1,
+              manual: true,
+              dependsOn: [],
+              since: 1,
+              writer: 'BrainChief',
+              note: 'Approved maintenance window',
+            },
+            decisionRevision: 'rev-1',
+          }}
+        />,
+      );
+      expect(screen.getByTestId('expandable-task-objective-text').textContent).toContain('Approved maintenance window');
+      expect(screen.queryByText('taskPair.decision.missing')).toBeNull();
+      expect(screen.getByText('taskPair.decision.title_paused')).toBeTruthy();
+    });
+
+    it('F1-R2: a known dependency wait is not replaced with unknown because a blocked flag remains', () => {
+      render(
+        <TaskPairDecisionPanel
+          taskId="task"
+          pair={{
+            status: 'working',
+            round: 1,
+            flags: ['blocked'],
+            flagSides: { blocked: 'executor' },
+            blocking: ['P0'],
+            executor: 'Ag1',
+            brain: 'BrainChief',
+            scheduling: {
+              epoch: 1,
+              manual: false,
+              dependsOn: ['tsk_dep1'],
+              since: 1,
+              writer: 'BrainChief',
+              note: 'Waiting for dep1',
+            },
+            decisionRevision: 'rev-1',
+          }}
+        />,
+      );
+      expect(screen.getByTestId('expandable-task-objective-text').textContent).toContain('Waiting for dep1');
+      expect(screen.queryByText('taskPair.decision.missing')).toBeNull();
+      expect(screen.getByText('taskPair.decision.title_dependencies')).toBeTruthy();
+    });
+
+    it('F1-R2: a known capacity wait is not replaced with unknown because a blocked flag remains', () => {
+      render(
+        <TaskPairDecisionPanel
+          taskId="task"
+          pair={{
+            status: 'working',
+            round: 1,
+            flags: ['blocked', 'waiting_for_capacity'],
+            waitingReason: 'Pool exhausted',
+            decisionRevision: 'rev-1',
+          }}
+        />,
+      );
+      expect(screen.getByTestId('expandable-task-objective-text').textContent).toContain('Pool exhausted');
+      expect(screen.queryByText('taskPair.decision.missing')).toBeNull();
+      expect(screen.getByText('taskPair.decision.title_capacity')).toBeTruthy();
+    });
+
+    it('F2-R2: an unbound late ruling from delivery 1 does not resolve a delivery 2 request', () => {
+      const questionDeliv2: any = {
+        id: 'q-delivery-2', project: 'p', taskId: 'task', round: 1, deliveryRound: 2,
+        kind: 'request', conclusion: 'Current', summary: 'Current B', question: 'Current delivery B?', author: 'Ag1', at: 20,
+      };
+      const rulingDeliv1: any = {
+        id: 'old-ruling', project: 'p', taskId: 'task', round: 1, deliveryRound: 1,
+        kind: 'decision', conclusion: 'Old delivery', summary: 'Old', author: 'BrainChief', at: 30,
+      };
+      render(
+        <TaskPairDecisionPanel
+          taskId="task"
+          pair={{
+            status: 'working',
+            round: 1,
+            deliveryRound: 2,
+            flags: ['blocked'],
+            decisionRevision: 'rev-2',
+            decisionRequest: questionDeliv2,
+            latestDecision: rulingDeliv1,
+          }}
+        />,
+      );
+      expect(screen.queryByText('taskPair.decision.resolved')).toBeNull();
+      expect(screen.getByTestId('expandable-task-objective-text').textContent).toContain('Current delivery B?');
+      expect(screen.getByText('taskPair.decision.title_request')).toBeTruthy();
+    });
+
+    it('F2-R2: a ruling matching delivery 2 resolves delivery 2 request (positive control)', () => {
+      const questionDeliv2: any = {
+        id: 'q-delivery-2', project: 'p', taskId: 'task', round: 1, deliveryRound: 2,
+        kind: 'request', conclusion: 'Current', summary: 'Current B', question: 'Current delivery B?', author: 'Ag1', at: 20,
+      };
+      const rulingDeliv2: any = {
+        id: 'ruling-deliv-2', project: 'p', taskId: 'task', round: 1, deliveryRound: 2,
+        kind: 'decision', conclusion: 'Approved B', summary: 'Go ahead with B', author: 'BrainChief', at: 30,
+      };
+      render(
+        <TaskPairDecisionPanel
+          taskId="task"
+          pair={{
+            status: 'working',
+            round: 1,
+            deliveryRound: 2,
+            flags: ['blocked'],
+            decisionRevision: 'rev-2',
+            decisionRequest: questionDeliv2,
+            latestDecision: rulingDeliv2,
+          }}
+        />,
+      );
+      expect(screen.getByText('taskPair.decision.resolved')).toBeTruthy();
+      expect(screen.getByTestId('expandable-task-objective-text').textContent).toContain('Go ahead with B');
+    });
   });
 });

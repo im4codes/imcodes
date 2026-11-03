@@ -78,6 +78,7 @@ import { brainUiLocale, isPairsEngineProject, isTaskPairsAvailable, projectBrain
 import { inspectToolCallForPairMainCheckoutWrite } from './main-checkout-write-guard.js';
 import { noteTaskPairFocus, sendTaskPairMessage, taskPairFocusOf, taskPairMessageIdPrefix, type TaskPairDeliveryResult } from './delivery.js';
 import { brainNoticeForCard } from './brain-notice.js';
+import { isTaskPairMissingExplanation } from './decision-context.js';
 import type { ArmBrainDecisionFollowUp } from './brain-decision-followup.js';
 import { checkStaleBaseNotice } from './integration-drift.js';
 import { resolveTaskPairMaterial, verifyTaskPairRoundBase } from './material.js';
@@ -589,6 +590,21 @@ export class TaskPairService {
     let pendingList: ReturnType<typeof store.listPendingDecisionNotifications> = [];
     try { pendingList = store.listPendingDecisionNotifications(100); } catch { return; }
     for (const pending of pendingList) {
+      if (pending.reason === 'missing-explanation-request') {
+        const stored = store.getPair(pending.project, pending.taskId);
+        if (!stored || !isTaskPairMissingExplanation(stored)) {
+          // The blocker is no longer missing an explanation (e.g. note provided, resolved, unblocked).
+          // Retire this obsolete outbox row without delivering.
+          try { store.markDecisionNotificationDelivered(pending.id, now); } catch { return; }
+          continue;
+        }
+        const side = stored.state.flagSides?.blocked || stored.state.flagSides?.needs_input;
+        const currentTarget = (side === 'auditor' ? stored.state.auditor : stored.state.executor) || stored.state.executor || stored.state.brain;
+        if (currentTarget !== pending.target) {
+          try { store.markDecisionNotificationDelivered(pending.id, now); } catch { return; }
+          continue;
+        }
+      }
       try { store.markDecisionNotificationAttempt(pending.id, now); } catch { return; }
       let status: TaskPairDeliveryResult = 'failed';
       try { status = await sendTaskPairMessage(pending.target, pending.taskId, pending.reason, pending.text, pending.decisionId); } catch { /* retain the row for the next heartbeat */ }

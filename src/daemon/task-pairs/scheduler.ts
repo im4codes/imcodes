@@ -47,6 +47,7 @@ import {
   type TaskPairState,
 } from '../../../shared/task-pair.js';
 import { getTaskPairStore, type StoredTaskPair, type TaskPairLiveness } from './store.js';
+import { taskPairDecisionRevision, isTaskPairMissingExplanation } from './decision-context.js';
 import { isPairsEngineProject, projectBrainSession, projectOfSession, resolveTaskPairMaxConcurrency } from './engine.js';
 import { runIntegrationDriftPass } from './integration-drift.js';
 import { sendTaskPairMessage, taskPairMessageIdPrefix } from './delivery.js';
@@ -147,33 +148,22 @@ export function taskPairDecisionReminderDue(input: {
   return input.reminderAt === undefined || input.now - input.reminderAt >= TASK_PAIR_DECISION_REMINDER_MS;
 }
 
+export { isTaskPairMissingExplanation };
+
 /**
  * Request the responsible participant/Brain to provide problem, options,
  * and recommendation when a task is blocked without an authoritative note or request.
  * Uses the durable SQLite decision notification queue with a stable per-context key.
  */
 export function checkTaskPairMissingExplanation(stored: StoredTaskPair, now = Date.now()): boolean {
+  if (!isTaskPairMissingExplanation(stored)) return false;
+
   const pair = stored.state;
-  if (isTerminalTaskPairStatus(pair.status)) return false;
-  // Exclude completed acceptance awaiting Brain.
-  if (pair.status === 'passed' || pair.lastVerdict?.verb === 'PASS' || pair.status === TASK_PAIR_STATUS_AWAITING_BRAIN_DECISION) return false;
-  // Exclude capacity or auditor waits.
-  if (pair.flags.some((flag) => flag === 'waiting_for_capacity' || flag === 'needs_auditor')) return false;
-  // Exclude scheduling waits (dependencies, manual pause).
-  if (isTaskPairSuspended(pair)) return false;
-  // Authoritative note already exists: no explanation missing.
-  if (pair.blockedNote) return false;
-
-  // Must have an active blocker flag (blocked / needs_input).
-  const isBlocked = pair.flags.some((flag) => flag === 'blocked' || flag === 'needs_input');
-  if (!isBlocked) return false;
-
   const store = getTaskPairStore();
-  const records = store.listDecisions(stored.project, [pair.taskId], 100).filter((record) => record.round === pair.round);
-  if (records.some((record) => record.kind === 'request')) return false;
-
   const flagsKey = pair.flags.filter((flag) => flag === 'blocked' || flag === 'needs_input').sort().join(',') || pair.status;
-  const stableKey = `missing-explanation:${stored.project}:${pair.taskId}:${pair.deliveryRound ?? 1}:${pair.round}:${flagsKey}`;
+  const rev = taskPairDecisionRevision(pair);
+  const lastEvent = store.listEvents(stored.project, pair.taskId, 1)[0]?.id ?? '';
+  const stableKey = `missing-explanation:${stored.project}:${pair.taskId}:${pair.deliveryRound ?? 1}:${pair.round}:${flagsKey}:${rev}${lastEvent ? ':' + lastEvent : ''}`;
 
   const side = pair.flagSides?.blocked || pair.flagSides?.needs_input;
   const target = (side === 'auditor' ? pair.auditor : pair.executor) || pair.executor || pair.brain;

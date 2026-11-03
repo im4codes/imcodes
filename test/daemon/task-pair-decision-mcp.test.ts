@@ -243,5 +243,148 @@ describe('pair decision MCP', () => {
       rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  it('F3-R2: bounded in-process feature integration test (tick, failure, reopen, old delivery, note arrival, retirement, 20+ card check)', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'feature-e2e-'));
+    const path = join(dir, 'pairs.sqlite');
+    try {
+      let store = new TaskPairStore(path);
+      setTaskPairStoreForTests(store);
+
+      const sent: string[] = [];
+      let failDelivery = true;
+      setTaskPairDeliveryDepsForTests({
+        send: async (_target, text) => {
+          sent.push(text);
+          if (failDelivery) throw new Error('simulated network transport failure');
+        },
+      });
+
+      const blockedBase: TaskPairState = {
+        taskId: 'tsk-e2e',
+        title: 'integration test',
+        brain: 'brain',
+        executor: 'exec',
+        auditor: 'audit',
+        status: 'working',
+        round: 1,
+        deliveryRound: 1,
+        flags: ['blocked'],
+        flagSides: { blocked: 'executor' },
+        blocking: ['P0'],
+        createdAt: 100,
+        updatedAt: 100,
+        previousAuditors: [],
+      } as unknown as TaskPairState;
+
+      store.savePair('p', blockedBase);
+
+      // Step 1: Initial automation tick enqueues notification and attempts delivery (which fails)
+      const firstTick = checkTaskPairMissingExplanation(store.getPair('p', 'tsk-e2e')!, 200);
+      expect(firstTick).toBe(true);
+      await taskPairService.waitForIdle();
+
+      // Delivery failed: exactly 1 pending notification in SQLite outbox with 1 attempt
+      const pendingBeforeReopen = store.listPendingDecisionNotifications();
+      expect(pendingBeforeReopen).toHaveLength(1);
+      expect(pendingBeforeReopen[0].attempts).toBe(1);
+      expect(pendingBeforeReopen[0].reason).toBe('missing-explanation-request');
+      expect(sent).toHaveLength(1);
+
+      // Step 2: Store reopen across restart preserves the pending notification
+      store.close();
+      store = new TaskPairStore(path);
+      setTaskPairStoreForTests(store);
+
+      const pendingAfterReopen = store.listPendingDecisionNotifications();
+      expect(pendingAfterReopen).toHaveLength(1);
+      expect(pendingAfterReopen[0].id).toBe(pendingBeforeReopen[0].id);
+
+      // Step 3: Unchanged repeated tick does not re-enqueue duplicate (deduped by stable key)
+      const repeatedTick = checkTaskPairMissingExplanation(store.getPair('p', 'tsk-e2e')!, 300);
+      expect(repeatedTick).toBe(false);
+      expect(store.listPendingDecisionNotifications()).toHaveLength(1);
+
+      // Step 4: Old delivery request does not suppress missing-explanation notice in new delivery round
+      store.savePair('p', { ...blockedBase, deliveryRound: 2 });
+      store.recordDecision({
+        id: 'old-request',
+        project: 'p',
+        taskId: 'tsk-e2e',
+        round: 1,
+        deliveryRound: 1,
+        kind: 'request',
+        conclusion: 'Old question',
+        summary: 'From delivery 1',
+        author: 'exec',
+        at: 50,
+      });
+      // In delivery 2, old request does NOT suppress
+      expect(checkTaskPairMissingExplanation(store.getPair('p', 'tsk-e2e')!, 350)).toBe(true);
+      expect(store.listPendingDecisionNotifications()).toHaveLength(2);
+
+      // Step 5: Explanation arrival causes retry/flush to retire the obsolete row without sending
+      sent.length = 0;
+      failDelivery = false;
+      // Add blockedNote to resolve the blocker
+      store.savePair('p', { ...blockedBase, blockedNote: 'Database migration in progress' });
+      await taskPairService.retryDecisionNotifications(400);
+
+      // The obsolete notification for delivery 1 was retired without sending anything!
+      expect(sent).toEqual([]);
+      // Delivery 1 notification is marked delivered (retired)
+      const pendingAfterRetire = store.listPendingDecisionNotifications();
+      expect(pendingAfterRetire.every((row) => row.decisionId.includes('missing-explanation:p:tsk-e2e:2:'))).toBe(true);
+
+      // Step 6: Negative controls
+      // Ordinary completed acceptance (passed, no blocker flags)
+      store.savePair('p', { ...blockedBase, status: 'passed', flags: [] });
+      expect(checkTaskPairMissingExplanation(store.getPair('p', 'tsk-e2e')!, 500)).toBe(false);
+
+      // Capacity wait
+      store.savePair('p', { ...blockedBase, flags: ['waiting_for_capacity'] as any });
+      expect(checkTaskPairMissingExplanation(store.getPair('p', 'tsk-e2e')!, 510)).toBe(false);
+
+      // Manual pause
+      store.savePair('p', { ...blockedBase, flags: [], scheduling: { manual: true, note: 'Paused for maintenance' } as any });
+      expect(checkTaskPairMissingExplanation(store.getPair('p', 'tsk-e2e')!, 520)).toBe(false);
+
+      // Dependency wait
+      store.savePair('p', { ...blockedBase, flags: [], scheduling: { dependsOn: ['tsk-dep-1'], note: 'Waiting' } as any });
+      expect(checkTaskPairMissingExplanation(store.getPair('p', 'tsk-e2e')!, 530)).toBe(false);
+
+      // Post-PASS unknown blocker is a positive control
+      store.savePair('p', {
+        ...blockedBase,
+        status: 'passed',
+        round: 3,
+        flags: ['blocked'],
+        lastVerdict: { verb: 'PASS', round: 2, counts: {}, judgement: 'pass' } as any,
+      });
+      expect(checkTaskPairMissingExplanation(store.getPair('p', 'tsk-e2e')!, 540)).toBe(true);
+
+      // Step 7: Bounded-cost check over 25 cards
+      const t0 = Date.now();
+      for (let i = 0; i < 25; i++) {
+        const cardState: TaskPairState = {
+          ...blockedBase,
+          taskId: `card-${i}`,
+          round: 1,
+          flags: i % 2 === 0 ? ['blocked'] : [],
+          status: i % 3 === 0 ? 'passed' : 'working',
+          blockedNote: i % 4 === 0 ? 'Has note' : undefined,
+        } as unknown as TaskPairState;
+        store.savePair('p', cardState);
+        checkTaskPairMissingExplanation(store.getPair('p', `card-${i}`)!, 600 + i);
+      }
+      const elapsed = Date.now() - t0;
+      expect(elapsed).toBeLessThan(1000); // 25 card evaluations must be under 1s
+
+      await taskPairService.waitForIdle();
+      store.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });
 

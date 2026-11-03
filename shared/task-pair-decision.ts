@@ -39,3 +39,29 @@ export function validateTaskPairDecisionDetails(input: TaskPairDecisionDetails):
     }
   }
 }
+
+/**
+ * Checks whether a ruling decision record resolves a specific question record.
+ * Rulings must match the project, task, delivery round (defaulting to 1),
+ * audit round, and either have an explicit matching requestId or an unbound
+ * timestamp greater than or equal to the question timestamp.
+ */
+export function isDecisionResolvingQuestion(
+  decision?: TaskPairDecisionRecord | null,
+  question?: TaskPairDecisionRecord | null,
+): boolean {
+  if (!decision || !question) return false;
+  if (decision.kind !== TASK_PAIR_DECISION_KIND.DECISION) return false;
+  if (decision.project && question.project && decision.project !== question.project) return false;
+  if (decision.taskId && question.taskId && decision.taskId !== question.taskId) return false;
+  const decisionDelivery = decision.deliveryRound ?? 1;
+  const questionDelivery = question.deliveryRound ?? 1;
+  if (decisionDelivery !== questionDelivery) return false;
+  if (decision.round !== question.round) return false;
+
+  if (decision.requestId) {
+    return decision.requestId === question.id;
+  }
+  return decision.at >= question.at;
+}
+
