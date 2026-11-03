@@ -1,3 +1,4 @@
+import { putTaskPairFixture } from '../../helpers/task-pair-fixture.js';
 /**
  * Causal tests for the 2026-09-25 incident on 215 / jdzj: pairs that stopped
  * driving themselves after the legacy import.
@@ -251,7 +252,7 @@ describe('pairs that stopped driving themselves (215 / jdzj)', () => {
     await flush();
     const first = getTaskPairStore().getPair(PROJECT, ids[0]!)!;
     for (const id of ids.slice(1)) {
-      getTaskPairStore().savePair(PROJECT, { ...first.state, taskId: id, title: id, createdAt: now, updatedAt: now });
+      putTaskPairFixture(getTaskPairStore(), PROJECT, { ...first.state, taskId: id, title: id, createdAt: now, updatedAt: now });
     }
     await flush();
     sent = [];
@@ -309,7 +310,7 @@ describe('pairs that stopped driving themselves (215 / jdzj)', () => {
     // the startup-repair path. New dispatches correctly remain queued when a
     // participant is already reserved, so they cannot create this state.
     const q1 = getTaskPairStore().getPair(PROJECT, 'Q1')!;
-    getTaskPairStore().savePair(PROJECT, {
+    putTaskPairFixture(getTaskPairStore(), PROJECT, {
       ...q1.state,
       taskId: 'Q2',
       title: 'Q2',
@@ -414,7 +415,7 @@ describe('pairs that stopped driving themselves (215 / jdzj)', () => {
       flagSides: {}, round: 1, passRound: 1, blocking: ['P0'], previousAuditors: [], capCounts: {}, capRound: 1,
       createdAt: 10, updatedAt: 10, ...extra,
     };
-    getTaskPairStore().savePair(PROJECT, state, {
+    putTaskPairFixture(getTaskPairStore(), PROJECT, state, {
       legacyTaskId: taskId,
       liveness: { silenceExecutor: 0, silenceAuditor: 0, progressExecutorAt: 0, progressAuditorAt: 0, lastTickAt: 10, notified: [] },
     });

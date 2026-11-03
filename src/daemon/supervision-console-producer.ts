@@ -970,10 +970,12 @@ export class SupervisionConsoleProducer {
     const assignments: SupervisionTaskConsoleAssignmentRow[] = [];
     const entries: SupervisionTaskConsolePairUpsert[] = [];
     for (const stored of pairs) {
+      const rawRequest = getTaskPairStore().latestDecisionRequest(projectName, stored.state.taskId, Math.max(1, stored.state.round), stored.state.deliveryRound ?? 1);
+      const activeRequest = (rawRequest && !getTaskPairStore().isDecisionResolved(rawRequest)) ? rawRequest : undefined;
       const entry = buildPairConsoleRow(stored, {
         inlineBrief,
         latestDecision: getTaskPairStore().latestDecision(projectName, stored.state.taskId),
-        decisionRequest: getTaskPairStore().latestDecisionRequest(projectName, stored.state.taskId, Math.max(1, stored.state.round), stored.state.deliveryRound ?? 1),
+        decisionRequest: activeRequest,
         queuePosition: queuePositions.get(stored.state.taskId),
         resolvePresentation: this.#resolveSessionPresentation,
       });
@@ -1066,10 +1068,12 @@ export class SupervisionConsoleProducer {
           if (view.rows.has(taskId)) removes.push(taskId);
           continue;
         }
+        const rawRequest = store.latestDecisionRequest(scope.projectName, taskId, Math.max(1, stored.state.round), stored.state.deliveryRound ?? 1);
+        const activeRequest = (rawRequest && !store.isDecisionResolved(rawRequest)) ? rawRequest : undefined;
         const upsert = buildPairConsoleRow(stored, {
           inlineBrief: false,
           latestDecision: store.latestDecision(scope.projectName, taskId),
-          decisionRequest: store.latestDecisionRequest(scope.projectName, taskId, Math.max(1, stored.state.round), stored.state.deliveryRound ?? 1),
+          decisionRequest: activeRequest,
           queuePosition: queuePositions.get(taskId),
           resolvePresentation: this.#resolveSessionPresentation,
         });

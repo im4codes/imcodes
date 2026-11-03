@@ -1,3 +1,4 @@
+import { putTaskPairFixture } from '../../test/helpers/task-pair-fixture.js';
 // Daemon modules are exercised below: isolate all import-time logs and state.
 import '../../test/setup/isolated-home.js';
 import { taskPairService } from '../../src/daemon/task-pairs/service.js';
@@ -73,7 +74,7 @@ function newStore(): TaskPairStore {
 
 function save(store: TaskPairStore, taskId: string, over: Record<string, unknown> = {}) {
   clock += 1;
-  return store.savePair(PROJECT, {
+  return putTaskPairFixture(store, PROJECT, {
     taskId, brain: BRAIN, executor: `deck_sub_${taskId}_x`, auditor: `deck_sub_${taskId}_a`,
     title: `Pair ${taskId}`, status: 'working', flags: [], flagSides: {}, round: 0, blocking: ['P0'],
     previousAuditors: [], createdAt: 1, updatedAt: 1_000 + clock, brief: BRIEF(taskId), executorPool: 'primary',

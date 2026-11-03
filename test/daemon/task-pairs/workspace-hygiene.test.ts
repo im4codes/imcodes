@@ -1,3 +1,4 @@
+import { putTaskPairFixture } from '../../helpers/task-pair-fixture.js';
 /**
  * Disk hygiene for pair worktrees (tsk_cd_worktree_disk_hygiene).
  *
@@ -290,7 +291,7 @@ async function waitForStripped(taskId: string, wt: string): Promise<void> {
 async function resetFinishedForReclaim(taskId: string): Promise<void> {
   const state = pair(taskId);
   const now = Date.now();
-  getTaskPairStore().savePair(PROJECT, {
+  putTaskPairFixture(getTaskPairStore(), PROJECT, {
     ...state,
     updatedAt: now,
     workspace: { ...state.workspace!, status: 'ended', endedAt: now, strippedAt: undefined },
@@ -423,7 +424,7 @@ describe('workspace hygiene through the pair service', () => {
     [['OLD1', a, 0], ['OLD2', b, 1_000], ['OLD3', c, 2_000]].forEach(([id, wt, offset]) => {
       weigh(wt as string);
       const state = pair(id as string);
-      store.savePair(PROJECT, { ...state, workspace: { ...state.workspace!, endedAt: endedBase + (offset as number), strippedAt: undefined } });
+      putTaskPairFixture(store, PROJECT, { ...state, workspace: { ...state.workspace!, endedAt: endedBase + (offset as number), strippedAt: undefined } });
     });
     const order: string[] = [];
     const { removeTree: realRemove } = await import('../../../src/daemon/task-pairs/workspace-hygiene.js');
@@ -554,7 +555,7 @@ describe('workspace hygiene through the pair service', () => {
     await vi.waitFor(() => expect(pair('KEPT1').workspace?.strippedAt).toBeTypeOf('number'), { timeout: 15_000, interval: 50 });
     weigh(wt);
     const state = pair('KEPT1');
-    getTaskPairStore().savePair(PROJECT, { ...state, workspace: { ...state.workspace!, status: 'kept', keptReason: 'unpushed', strippedAt: undefined } });
+    putTaskPairFixture(getTaskPairStore(), PROJECT, { ...state, workspace: { ...state.workspace!, status: 'kept', keptReason: 'unpushed', strippedAt: undefined } });
 
     await taskPairService.sweepWorkspaces(Date.now(), { force: true });
     await vi.waitFor(() => expect(pair('KEPT1').workspace?.strippedAt).toBeTypeOf('number'), { timeout: 15_000, interval: 50 });

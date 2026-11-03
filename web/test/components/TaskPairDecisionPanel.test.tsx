@@ -199,4 +199,661 @@ describe('TaskPairDecisionPanel', () => {
     expect(screen.getByRole('status')).toBeTruthy();
   });
 
+  describe('category classification and wait reasons (tsk_af1a123756)', () => {
+    it('shows completed_awaiting_brain when executor reported done without blocker (counterexample to base)', () => {
+      // In base, pair.status === 'awaiting_brain_decision' fell into generic 'taskPair.decision.title',
+      // rendered 'taskPair.decision.missing', fake buttons ('ask', 'ready', 'wait'), and open textarea.
+      const completedPair: SupervisionConsolePairInfo = {
+        status: 'awaiting_brain_decision',
+        round: 1,
+        flags: [],
+        blocking: [],
+        executor: 'Ag1',
+        brain: 'BrainChief',
+        decisionRevision: 'rev-1',
+      };
+      render(<TaskPairDecisionPanel taskId="task" pair={completedPair} />);
+
+      expect(screen.getByText('taskPair.decision.title_completed')).toBeTruthy();
+      expect(screen.queryByText('taskPair.decision.title')).toBeNull();
+      expect(screen.queryByText('taskPair.decision.missing')).toBeNull();
+      // No fake blocker buttons
+      expect(screen.queryByRole('button', { name: 'taskPair.decision.ask' })).toBeNull();
+      expect(screen.queryByRole('button', { name: 'taskPair.decision.ready' })).toBeNull();
+      expect(screen.queryByRole('button', { name: 'taskPair.decision.wait' })).toBeNull();
+      // Feedback is tucked inside collapsed details, not directly dominating card
+      const details = screen.getByText('taskPair.decision.feedback').closest('details') as HTMLDetailsElement;
+      expect(details).toBeTruthy();
+      expect(details.open).toBe(false);
+    });
+
+    it('shows wait_dependencies with dependency task list and note, omitting ask button', () => {
+      const depPair: SupervisionConsolePairInfo = {
+        status: 'working',
+        round: 1,
+        flags: [],
+        blocking: [],
+        scheduling: {
+          dependsOn: ['tsk_backend', 'tsk_auth'],
+          note: 'Waiting for auth migration',
+        },
+        decisionRevision: 'rev-1',
+      };
+      render(<TaskPairDecisionPanel taskId="task" pair={depPair} />);
+
+      expect(screen.getByText('taskPair.decision.title_dependencies')).toBeTruthy();
+      const objective = screen.getByTestId('expandable-task-objective-text');
+      expect(objective.textContent).toContain('Waiting for auth migration');
+      expect(objective.textContent).toContain('taskPair.decision.waiting_for_tasks');
+      expect(objective.textContent).toContain('taskPair.decision.responsible_brain');
+      // No ask button because reason is known, but ready and wait buttons exist
+      expect(screen.queryByRole('button', { name: 'taskPair.decision.ask' })).toBeNull();
+      expect(screen.getByRole('button', { name: 'taskPair.decision.ready' })).toBeTruthy();
+      expect(screen.getByRole('button', { name: 'taskPair.decision.wait' })).toBeTruthy();
+    });
+
+    it('shows paused with scheduling note', () => {
+      const pausedPair: SupervisionConsolePairInfo = {
+        status: 'working',
+        round: 1,
+        flags: [],
+        blocking: [],
+        scheduling: {
+          manual: true,
+          dependsOn: [],
+          pausedAt: 1793700000000,
+          note: 'Paused for database backup',
+        },
+        decisionRevision: 'rev-1',
+      };
+      render(<TaskPairDecisionPanel taskId="task" pair={pausedPair} />);
+
+      expect(screen.getByText('taskPair.decision.title_paused')).toBeTruthy();
+      const objective = screen.getByTestId('expandable-task-objective-text');
+      expect(objective.textContent).toContain('Paused for database backup');
+      expect(objective.textContent).toContain('taskPair.decision.responsible_brain');
+    });
+
+    it('shows waiting_capacity when waiting_for_capacity or needs_auditor flag is set', () => {
+      const capPair: SupervisionConsolePairInfo = {
+        status: 'working',
+        round: 1,
+        flags: ['waiting_for_capacity'],
+        blocking: [],
+        waitingReason: 'Concurrency limit reached: 4/4 workers active',
+        decisionRevision: 'rev-1',
+      };
+      render(<TaskPairDecisionPanel taskId="task" pair={capPair} />);
+
+      expect(screen.getByText('taskPair.decision.title_capacity')).toBeTruthy();
+      const objective = screen.getByTestId('expandable-task-objective-text');
+      expect(objective.textContent).toContain('Concurrency limit reached: 4/4 workers active');
+      expect(objective.textContent).toContain('taskPair.decision.responsible_scheduler');
+      // No blocker buttons
+      expect(screen.queryByRole('button', { name: 'taskPair.decision.ask' })).toBeNull();
+      expect(screen.queryByRole('button', { name: 'taskPair.decision.ready' })).toBeNull();
+      expect(screen.queryByRole('button', { name: 'taskPair.decision.wait' })).toBeNull();
+    });
+
+    it('shows blocked with specific note and identified executor author', () => {
+      const blockedPair: SupervisionConsolePairInfo = {
+        status: 'working',
+        round: 1,
+        flags: ['blocked'],
+        blocking: ['P0'],
+        blockedNote: 'Third-party API rate limited (HTTP 429)',
+        flagSides: { blocked: 'executor' },
+        executor: 'Ag1',
+        decisionRevision: 'rev-1',
+      };
+      render(<TaskPairDecisionPanel taskId="task" pair={blockedPair} />);
+
+      expect(screen.getByText('taskPair.decision.title_blocked')).toBeTruthy();
+      const objective = screen.getByTestId('expandable-task-objective-text');
+      expect(objective.textContent).toContain('Third-party API rate limited (HTTP 429)');
+      expect(objective.textContent).toContain('taskPair.decision.responsible_executor');
+      // Does not ask Brain to explain since blockedNote is already clear
+      expect(screen.queryByRole('button', { name: 'taskPair.decision.ask' })).toBeNull();
+      expect(screen.getByRole('button', { name: 'taskPair.decision.ready' })).toBeTruthy();
+      expect(screen.getByRole('button', { name: 'taskPair.decision.wait' })).toBeTruthy();
+    });
+
+    it('shows legacy_unknown with missing notice and ask button for truly unrecorded blocker', () => {
+      const unknownPair: SupervisionConsolePairInfo = {
+        status: 'working',
+        round: 1,
+        flags: ['blocked'],
+        blocking: ['P0'],
+        decisionRevision: 'rev-1',
+      };
+      render(<TaskPairDecisionPanel taskId="task" pair={unknownPair} />);
+
+      expect(screen.getByText('taskPair.decision.title')).toBeTruthy();
+      expect(screen.getByText('taskPair.decision.missing')).toBeTruthy();
+      expect(screen.getByRole('button', { name: 'taskPair.decision.ask' })).toBeTruthy();
+      expect(screen.getByRole('button', { name: 'taskPair.decision.ready' })).toBeTruthy();
+      expect(screen.getByRole('button', { name: 'taskPair.decision.wait' })).toBeTruthy();
+    });
+
+    it('a current BLOCKED note after PASS must not become completed-awaiting-Brain (F1)', () => {
+      render(
+        <TaskPairDecisionPanel
+          taskId="task"
+          pair={{
+            status: 'passed',
+            round: 1,
+            lastVerdict: 'PASS',
+            flags: ['blocked'],
+            flagSides: { blocked: 'executor' },
+            blockedNote: 'Current merge conflict needs input',
+            executor: 'Ag1',
+            brain: 'BrainChief',
+            decisionRevision: 'rev-1',
+          }}
+        />,
+      );
+      expect(screen.getByTestId('expandable-task-objective-text').textContent).toContain('Current merge conflict needs input');
+      expect(screen.queryByText('taskPair.decision.title_completed')).toBeNull();
+      expect(screen.getByText('taskPair.decision.title_blocked')).toBeTruthy();
+    });
+
+    it('a pair with only an authoritative blockedNote still explains the blocker (F1)', () => {
+      render(
+        <TaskPairDecisionPanel
+          taskId="task"
+          pair={{
+            status: 'working',
+            round: 1,
+            flags: [],
+            blockedNote: 'Approval source has not been provided',
+            decisionRevision: 'rev-1',
+          }}
+        />,
+      );
+      const copy = screen.queryByTestId('expandable-task-objective-text');
+      expect(copy).not.toBeNull();
+      expect(copy!.textContent).toContain('Approval source has not been provided');
+      expect(screen.getByText('taskPair.decision.title_blocked')).toBeTruthy();
+    });
+
+    it('a late ruling for old question A must not resolve new same-round question B (F2)', () => {
+      const a: any = {
+        id: 'a', project: 'p', taskId: 'task', round: 1, kind: 'request',
+        conclusion: 'Old', summary: 'Old issue', question: 'Old issue?', author: 'exec', at: 10,
+      };
+      const b: any = { ...a, id: 'b', question: 'Current issue B?', summary: 'Current issue B', at: 20 };
+      render(
+        <TaskPairDecisionPanel
+          taskId="task"
+          pair={{
+            status: 'working',
+            round: 1,
+            flags: ['needs_input'],
+            decisionRevision: 'rev-1',
+            decisionRequest: b,
+            latestDecision: { ...a, id: 'ruling-a', kind: 'decision', requestId: 'a', conclusion: 'Resolved A', at: 30 },
+          }}
+        />,
+      );
+      expect(screen.queryByText('taskPair.decision.resolved')).toBeNull();
+      expect(screen.getByTestId('expandable-task-objective-text').textContent).toContain('Current issue B?');
+      expect(screen.getByText('taskPair.decision.title_request')).toBeTruthy();
+    });
+
+    it('F1-R2: a known manual pause note is not replaced with unknown because a blocked flag remains', () => {
+      render(
+        <TaskPairDecisionPanel
+          taskId="task"
+          pair={{
+            status: 'working',
+            round: 1,
+            flags: ['blocked'],
+            flagSides: { blocked: 'executor' },
+            blocking: ['P0'],
+            executor: 'Ag1',
+            brain: 'BrainChief',
+            scheduling: {
+              epoch: 1,
+              manual: true,
+              dependsOn: [],
+              since: 1,
+              writer: 'BrainChief',
+              note: 'Approved maintenance window',
+            },
+            decisionRevision: 'rev-1',
+          }}
+        />,
+      );
+      expect(screen.getByTestId('expandable-task-objective-text').textContent).toContain('Approved maintenance window');
+      expect(screen.queryByText('taskPair.decision.missing')).toBeNull();
+      expect(screen.getByText('taskPair.decision.title_paused')).toBeTruthy();
+    });
+
+    it('F1-R2: a known dependency wait is not replaced with unknown because a blocked flag remains', () => {
+      render(
+        <TaskPairDecisionPanel
+          taskId="task"
+          pair={{
+            status: 'working',
+            round: 1,
+            flags: ['blocked'],
+            flagSides: { blocked: 'executor' },
+            blocking: ['P0'],
+            executor: 'Ag1',
+            brain: 'BrainChief',
+            scheduling: {
+              epoch: 1,
+              manual: false,
+              dependsOn: ['tsk_dep1'],
+              since: 1,
+              writer: 'BrainChief',
+              note: 'Waiting for dep1',
+            },
+            decisionRevision: 'rev-1',
+          }}
+        />,
+      );
+      expect(screen.getByTestId('expandable-task-objective-text').textContent).toContain('Waiting for dep1');
+      expect(screen.queryByText('taskPair.decision.missing')).toBeNull();
+      expect(screen.getByText('taskPair.decision.title_dependencies')).toBeTruthy();
+    });
+
+    it('F1-R2: a known capacity wait is not replaced with unknown because a blocked flag remains', () => {
+      render(
+        <TaskPairDecisionPanel
+          taskId="task"
+          pair={{
+            status: 'working',
+            round: 1,
+            flags: ['blocked', 'waiting_for_capacity'],
+            waitingReason: 'Pool exhausted',
+            decisionRevision: 'rev-1',
+          }}
+        />,
+      );
+      expect(screen.getByTestId('expandable-task-objective-text').textContent).toContain('Pool exhausted');
+      expect(screen.queryByText('taskPair.decision.missing')).toBeNull();
+      expect(screen.getByText('taskPair.decision.title_capacity')).toBeTruthy();
+    });
+
+    it('F2-R2: an unbound late ruling from delivery 1 does not resolve a delivery 2 request', () => {
+      const questionDeliv2: any = {
+        id: 'q-delivery-2', project: 'p', taskId: 'task', round: 1, deliveryRound: 2,
+        kind: 'request', conclusion: 'Current', summary: 'Current B', question: 'Current delivery B?', author: 'Ag1', at: 20,
+      };
+      const rulingDeliv1: any = {
+        id: 'old-ruling', project: 'p', taskId: 'task', round: 1, deliveryRound: 1,
+        kind: 'decision', conclusion: 'Old delivery', summary: 'Old', author: 'BrainChief', at: 30,
+      };
+      render(
+        <TaskPairDecisionPanel
+          taskId="task"
+          pair={{
+            status: 'working',
+            round: 1,
+            deliveryRound: 2,
+            flags: ['blocked'],
+            decisionRevision: 'rev-2',
+            decisionRequest: questionDeliv2,
+            latestDecision: rulingDeliv1,
+          }}
+        />,
+      );
+      expect(screen.queryByText('taskPair.decision.resolved')).toBeNull();
+      expect(screen.getByTestId('expandable-task-objective-text').textContent).toContain('Current delivery B?');
+      expect(screen.getByText('taskPair.decision.title_request')).toBeTruthy();
+    });
+
+    it('F2-R2: a ruling matching delivery 2 resolves delivery 2 request (positive control)', () => {
+      const questionDeliv2: any = {
+        id: 'q-delivery-2', project: 'p', taskId: 'task', round: 1, deliveryRound: 2,
+        kind: 'request', conclusion: 'Current', summary: 'Current B', question: 'Current delivery B?', author: 'Ag1', at: 20,
+      };
+      const rulingDeliv2: any = {
+        id: 'ruling-deliv-2', project: 'p', taskId: 'task', round: 1, deliveryRound: 2,
+        kind: 'decision', conclusion: 'Approved B', summary: 'Go ahead with B', author: 'BrainChief', at: 30,
+      };
+      render(
+        <TaskPairDecisionPanel
+          taskId="task"
+          pair={{
+            status: 'working',
+            round: 1,
+            deliveryRound: 2,
+            flags: ['blocked'],
+            decisionRevision: 'rev-2',
+            decisionRequest: questionDeliv2,
+            latestDecision: rulingDeliv2,
+          }}
+        />,
+      );
+      expect(screen.getByText('taskPair.decision.resolved')).toBeTruthy();
+      expect(screen.getByTestId('expandable-task-objective-text').textContent).toContain('Go ahead with B');
+    });
+
+    it('F1-R3: an old resolved question must not suppress a new blocker title or free feedback, and old option reply remains rejected', async () => {
+      const questionA: any = {
+        id: 'q-old', project: 'p', taskId: 'task', round: 1, deliveryRound: 1,
+        kind: 'request', conclusion: 'Old approval', summary: 'Old source?', question: 'Old source?',
+        options: [{ id: 'opt-a', label: 'Option A' }], author: 'executor', at: 10,
+      };
+      const rulingA: any = {
+        ...questionA, id: 'ruling-old', kind: 'decision', requestId: questionA.id, author: 'brain',
+        conclusion: 'Old source approved', at: 20,
+      };
+      const currentWithNewBlocker: SupervisionConsolePairInfo = {
+        status: 'working',
+        round: 1,
+        deliveryRound: 1,
+        flags: ['blocked'],
+        flagSides: { blocked: 'executor' },
+        blocking: ['P0'],
+        blockedNote: 'NEW blocker: current credentials are unavailable',
+        decisionRevision: 'rev-current',
+        decisionRequest: questionA,
+        latestDecision: rulingA,
+        brain: 'brain',
+      };
+
+      const frames: any[] = [];
+      unbind = bindTaskPairDecisions((frame) => {
+        frames.push(frame);
+        receiveTaskPairDecision(frame.requestId, { ok: true, decisions: [] });
+      });
+
+      render(<TaskPairDecisionPanel taskId="task" pair={currentWithNewBlocker} />);
+
+      // Blocker note is visible
+      expect(screen.getByTestId('expandable-task-objective-text').textContent).toContain('NEW blocker: current credentials are unavailable');
+      // Title reflects current blocker category, NOT resolved
+      expect(screen.queryByText('taskPair.decision.title_blocked')).not.toBeNull();
+      expect(screen.queryByText('taskPair.decision.resolved')).toBeNull();
+      // Free feedback textarea is accessible
+      const textarea = screen.queryByRole('textbox');
+      expect(textarea).not.toBeNull();
+      // Old question options are NOT shown
+      expect(screen.queryByRole('button', { name: 'Option A' })).toBeNull();
+
+      // Submitting free feedback passes questionId: null
+      fireEvent.input(textarea!, { target: { value: 'Credentials are now available' } });
+      fireEvent.click(screen.getByRole('button', { name: 'taskPair.decision.send' }));
+
+      await waitFor(() => expect(frames).toHaveLength(1));
+      expect(frames[0]).toMatchObject({
+        type: 'supervision.task_console.decision_feedback',
+        taskId: 'task',
+        questionId: null,
+        feedback: 'Credentials are now available',
+      });
+    });
+
+    it('F1-R4: current free feedback ACK does not resurrect old resolved question/options, and live reload/projection suppresses resolved request', async () => {
+      const questionOld: any = {
+        id: 'q-old', project: 'p', taskId: 'task', round: 1, deliveryRound: 1,
+        kind: 'request', conclusion: 'Old conclusion', summary: 'Old question summary',
+        question: 'Old question?', options: [{ id: 'old-opt', label: 'OLD CHOICE' }],
+        author: 'executor', at: 10,
+      };
+      const rulingOld: any = {
+        ...questionOld,
+        id: 'ruling-old', kind: 'decision', requestId: questionOld.id,
+        author: 'brain', conclusion: 'Approved Old', at: 20,
+      };
+      const current: SupervisionConsolePairInfo = {
+        status: 'working',
+        round: 1,
+        deliveryRound: 1,
+        flags: ['blocked'],
+        blocking: ['P0'],
+        blockedNote: 'NEW blocker: credentials unavailable',
+        decisionRevision: 'rev-current',
+        decisionRequest: questionOld,
+        latestDecision: rulingOld,
+        brain: 'brain',
+      };
+
+      unbind = bindTaskPairDecisions((frame) => {
+        const feedbackRecord = {
+          id: 'feedback-1', project: 'p', taskId: 'task', round: 1, deliveryRound: 1,
+          kind: 'feedback' as const, summary: 'Feedback text', author: 'brain', at: 30,
+        };
+        receiveTaskPairDecision(frame.requestId, {
+          ok: true,
+          decisions: [feedbackRecord, rulingOld, questionOld],
+        });
+      });
+
+      render(<TaskPairDecisionPanel taskId="task" pair={current} />);
+
+      expect(screen.queryByRole('button', { name: 'OLD CHOICE' })).toBeNull();
+      expect(screen.getByTestId('expandable-task-objective-text').textContent).toContain('NEW blocker: credentials unavailable');
+
+      fireEvent.input(screen.getByRole('textbox'), { target: { value: 'Current credentials are now available' } });
+      fireEvent.click(screen.getByRole('button', { name: 'taskPair.decision.send' }));
+
+      await waitFor(() => expect(screen.getByRole('status')).toBeTruthy());
+
+      expect(screen.queryByRole('button', { name: 'OLD CHOICE' })).toBeNull();
+      expect(screen.getByTestId('expandable-task-objective-text').textContent).toContain('NEW blocker: credentials unavailable');
+
+      cleanup();
+      const reloadedPair: SupervisionConsolePairInfo = {
+        ...current,
+        decisionRequest: undefined,
+        latestDecision: {
+          id: 'feedback-1', project: 'p', taskId: 'task', round: 1, deliveryRound: 1,
+          kind: 'feedback' as const, summary: 'Feedback text', author: 'brain', at: 30,
+        },
+      };
+      render(<TaskPairDecisionPanel taskId="task" pair={reloadedPair} />);
+
+      expect(screen.queryByRole('button', { name: 'OLD CHOICE' })).toBeNull();
+      expect(screen.getByTestId('expandable-task-objective-text').textContent).toContain('NEW blocker: credentials unavailable');
+    });
+
+    it('F1-R5: live feedback before ACK retains new-note submission lock after an older ruling, and settling ACK releases lock and clears draft', async () => {
+      const oldRuling: any = {
+        id: 'old-ruling',
+        project: 'p',
+        taskId: 'task',
+        round: 1,
+        deliveryRound: 1,
+        kind: 'decision',
+        conclusion: 'Old ruling',
+        summary: 'Old summary',
+        author: 'brain',
+        at: 20,
+      };
+      const current: SupervisionConsolePairInfo = {
+        status: 'working',
+        round: 1,
+        deliveryRound: 1,
+        flags: ['blocked'],
+        blocking: ['P0'],
+        blockedNote: 'Current NEW blocker',
+        decisionRevision: 'rev-current-2',
+        decisionRequest: undefined,
+        latestDecision: oldRuling,
+        brain: 'brain',
+      };
+
+      const capturedFrames: any[] = [];
+      unbind = bindTaskPairDecisions((frame) => {
+        capturedFrames.push(frame);
+      });
+
+      const view = render(<TaskPairDecisionPanel taskId="task" pair={current} />);
+      const textbox = screen.getByRole('textbox') as HTMLTextAreaElement;
+      expect(textbox.disabled).toBe(false);
+
+      // Submit new-note feedback
+      fireEvent.input(textbox, { target: { value: 'Current explanation response' } });
+      fireEvent.click(screen.getByRole('button', { name: 'taskPair.decision.send' }));
+
+      await waitFor(() => expect(capturedFrames).toHaveLength(1));
+      expect((screen.getByRole('textbox') as HTMLTextAreaElement).disabled).toBe(true);
+
+      // Live projection arrives before ACK: latestDecision becomes FEEDBACK
+      view.rerender(
+        <TaskPairDecisionPanel
+          taskId="task"
+          pair={{
+            ...current,
+            latestDecision: {
+              id: 'live-feedback',
+              project: 'p',
+              taskId: 'task',
+              round: 1,
+              deliveryRound: 1,
+              kind: 'feedback',
+              conclusion: 'Human feedback',
+              summary: 'Current explanation response',
+              author: 'human',
+              at: 30,
+            },
+          }}
+        />
+      );
+
+      // Submission lock and draft text MUST be retained
+      const liveTextbox = screen.getByRole('textbox') as HTMLTextAreaElement;
+      expect(liveTextbox.disabled).toBe(true);
+      expect(liveTextbox.value).toBe('Current explanation response');
+
+      // Now settle the ACK: form cleans up and clears text
+      receiveTaskPairDecision(capturedFrames[0].requestId, {
+        ok: true,
+        decisions: [
+          {
+            id: 'live-feedback',
+            project: 'p',
+            taskId: 'task',
+            round: 1,
+            deliveryRound: 1,
+            kind: 'feedback',
+            conclusion: 'Human feedback',
+            summary: 'Current explanation response',
+            author: 'human',
+            at: 30,
+          },
+        ],
+      });
+
+      await waitFor(() => expect(liveTextbox.disabled).toBe(false));
+      expect(liveTextbox.value).toBe('');
+    });
+
+    it('preserves live-before-ACK submission lock even when 201 other cards are mounted', async () => {
+      const oldRuling: TaskPairDecisionRecord = {
+        id: 'old-ruling',
+        project: 'p',
+        taskId: 'task',
+        round: 1,
+        deliveryRound: 1,
+        kind: 'decision',
+        conclusion: 'Old approval',
+        summary: 'Old',
+        author: 'brain',
+        at: 20,
+      };
+
+      const current: SupervisionConsolePairInfo = {
+        status: 'working',
+        round: 1,
+        deliveryRound: 1,
+        flags: ['blocked'],
+        blocking: ['P0'],
+        blockedNote: 'Current NEW blocker',
+        decisionRevision: 'rev-current-eviction',
+        decisionRequest: undefined,
+        latestDecision: oldRuling,
+        brain: 'brain',
+      };
+
+      const capturedFrames: any[] = [];
+      unbind = bindTaskPairDecisions((frame) => {
+        capturedFrames.push(frame);
+      });
+
+      const view = render(<TaskPairDecisionPanel taskId="task" pair={current} />);
+      const textbox = screen.getByRole('textbox') as HTMLTextAreaElement;
+      expect(textbox.disabled).toBe(false);
+
+      fireEvent.input(textbox, { target: { value: 'Current explanation response' } });
+      fireEvent.click(screen.getByRole('button', { name: 'taskPair.decision.send' }));
+
+      await waitFor(() => expect(capturedFrames).toHaveLength(1));
+      expect((screen.getByRole('textbox') as HTMLTextAreaElement).disabled).toBe(true);
+
+      // Render 201 other real cards to test cache eviction boundary
+      render(
+        <>
+          {Array.from({ length: 201 }, (_, i) => (
+            <TaskPairDecisionPanel
+              key={i}
+              taskId={`other-${i}`}
+              readOnly
+              pair={{
+                ...current,
+                latestDecision: {
+                  ...oldRuling,
+                  id: `other-ruling-${i}`,
+                  taskId: `other-${i}`,
+                },
+              }}
+            />
+          ))}
+        </>
+      );
+
+      // Live projection arrives before ACK: latestDecision becomes FEEDBACK
+      view.rerender(
+        <TaskPairDecisionPanel
+          taskId="task"
+          pair={{
+            ...current,
+            latestDecision: {
+              id: 'live-feedback',
+              project: 'p',
+              taskId: 'task',
+              round: 1,
+              deliveryRound: 1,
+              kind: 'feedback',
+              conclusion: 'Human feedback',
+              summary: 'Current explanation response',
+              author: 'human',
+              at: 30,
+            },
+          }}
+        />
+      );
+
+      // Lock and draft must survive cache eviction from unrelated cards
+      const liveTextbox = screen.getByRole('textbox') as HTMLTextAreaElement;
+      expect(liveTextbox.disabled).toBe(true);
+      expect(liveTextbox.value).toBe('Current explanation response');
+
+      // Now settle the ACK: form cleans up and clears text
+      receiveTaskPairDecision(capturedFrames[0].requestId, {
+        ok: true,
+        decisions: [
+          {
+            id: 'live-feedback',
+            project: 'p',
+            taskId: 'task',
+            round: 1,
+            deliveryRound: 1,
+            kind: 'feedback',
+            conclusion: 'Human feedback',
+            summary: 'Current explanation response',
+            author: 'human',
+            at: 30,
+          },
+        ],
+      });
+
+      await waitFor(() => expect(liveTextbox.disabled).toBe(false));
+      expect(liveTextbox.value).toBe('');
+    });
+  });
 });

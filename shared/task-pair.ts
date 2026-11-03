@@ -1253,6 +1253,8 @@ export interface TaskPairState {
   blockingSource?: TaskPairBlockingSource;
   lastVerdict?: TaskPairLastVerdict;
   previousAuditors: string[];
+  /** Blocker / decision explanation episode generation. Monotonically advanced on genuine entry or context change. */
+  episodeGeneration?: number;
   /** Auditor explicitly selected by Brain; heartbeat replacement must keep it
    * unless the session is genuinely unavailable. */
   auditorPinned?: string;
@@ -1649,11 +1651,15 @@ export function resolveTaskPairBrainWait(
   now: number,
   resolution?: { writer: string; note?: string },
 ): void {
+  const hadBlocker = pair.flags.includes('blocked') || pair.flags.includes('needs_input') || pair.flagSides.blocked !== undefined || pair.flagSides.needs_input !== undefined;
   removeFlag(pair, 'blocked');
   removeFlag(pair, 'needs_input');
   delete pair.flagSides.blocked;
   delete pair.flagSides.needs_input;
   pair.blockedNote = undefined;
+  if (hadBlocker) {
+    pair.episodeGeneration = (pair.episodeGeneration ?? 0) + 1;
+  }
   if (resolution) {
     pair.lastWaitResolution = {
       writer: resolution.writer,
@@ -1764,12 +1770,19 @@ function namedParticipantIsBusy(attrs: Record<string, string>, busySessions: Rea
 const PROGRESS_VERBS: readonly TaskPairVerb[] = ['DISPATCH', 'STARTED', 'WORKING', 'READY_FOR_AUDIT', 'PASS', 'REWORK', 'DONE'];
 
 function clearSideFlags(pair: TaskPairState, role: TaskPairRole, all = false): void {
+  let cleared = false;
   for (const flag of ['blocked', 'needs_input'] as const) {
     if (all || pair.flagSides[flag] === role) {
+      if (pair.flags.includes(flag) || pair.flagSides[flag] !== undefined) {
+        cleared = true;
+      }
       removeFlag(pair, flag);
       delete pair.flagSides[flag];
       pair.blockedNote = undefined;
     }
+  }
+  if (cleared) {
+    pair.episodeGeneration = (pair.episodeGeneration ?? 0) + 1;
   }
 }
 
@@ -2318,10 +2331,16 @@ export function applyTaskPairMarker(
       if (terminal) return recorded(existing, false);
       if (roleAuthority) return done('brain_resolved');
       const flag = verb === 'BLOCKED' ? 'blocked' : 'needs_input';
+      const priorNote = pair.blockedNote;
+      const nextNote = attrs.note?.trim() || undefined;
       const freshlyFlagged = !pair.flags.includes(flag) || pair.flagSides[flag] !== role;
+      const noteChanged = priorNote !== nextNote;
+      if (freshlyFlagged || noteChanged) {
+        pair.episodeGeneration = (pair.episodeGeneration ?? 0) + 1;
+      }
       addFlag(pair, flag);
       pair.flagSides[flag] = role;
-      pair.blockedNote = attrs.note?.trim() || undefined;
+      pair.blockedNote = nextNote;
       pair.lastWaitResolution = undefined;
       // Owner evidence: an executor's question left only in its own reply,
       // never sent anywhere, stalled a pair until the owner happened to

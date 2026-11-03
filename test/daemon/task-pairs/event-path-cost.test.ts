@@ -1,3 +1,4 @@
+import { putTaskPairFixture } from '../../helpers/task-pair-fixture.js';
 import { expectFastPerEvent, expectMuchSlowerThan, measure } from '../../perf/per-event-bounds.js';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { DatabaseSync } from 'node:sqlite';
@@ -81,9 +82,9 @@ describe('task-pair per-event paths', () => {
     upsertSession(session(BRAIN, 'brain'));
     for (const name of [...WORKERS, OUTSIDER]) upsertSession(session(name, 'w1'));
     const store = getTaskPairStore();
-    for (let i = 0; i < OPEN_PAIRS; i += 1) store.savePair(PROJECT, pairState(i));
+    for (let i = 0; i < OPEN_PAIRS; i += 1) putTaskPairFixture(store, PROJECT, pairState(i));
     // Terminal history a real database carries: never part of the open index.
-    for (let i = OPEN_PAIRS; i < OPEN_PAIRS + 300; i += 1) store.savePair(PROJECT, pairState(i, 'done'));
+    for (let i = OPEN_PAIRS; i < OPEN_PAIRS + 300; i += 1) putTaskPairFixture(store, PROJECT, pairState(i, 'done'));
     service = new TaskPairService();
     automation = new TaskPairAutomation({
       now: () => Date.now(),
@@ -212,10 +213,10 @@ describe('task-pair per-event paths', () => {
     const viaIndex = (name: string) => store.pairsForSession(name).map((pair) => pair.state.taskId).sort();
     for (const name of [BRAIN, OUTSIDER, ...WORKERS]) expect(viaIndex(name)).toEqual(viaDb(name));
 
-    store.savePair(PROJECT, { ...first, executor: OUTSIDER, updatedAt: first.updatedAt + 1 });
+    putTaskPairFixture(store, PROJECT, { ...first, executor: OUTSIDER, updatedAt: first.updatedAt + 1 });
     expect(viaIndex(OUTSIDER)).toEqual([first.taskId]);
     expect(viaIndex(WORKERS[0]!)).toEqual(viaDb(WORKERS[0]!));
-    store.savePair(PROJECT, { ...first, executor: OUTSIDER, status: 'done', updatedAt: first.updatedAt + 2 });
+    putTaskPairFixture(store, PROJECT, { ...first, executor: OUTSIDER, status: 'done', updatedAt: first.updatedAt + 2 });
     expect(viaIndex(OUTSIDER)).toEqual([]);
     for (const name of [BRAIN, OUTSIDER, ...WORKERS]) expect(viaIndex(name)).toEqual(viaDb(name));
     store.prune(Date.now() + 365 * 24 * 60 * 60_000);

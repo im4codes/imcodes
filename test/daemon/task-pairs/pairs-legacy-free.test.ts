@@ -1,3 +1,4 @@
+import { putTaskPairFixture } from '../../helpers/task-pair-fixture.js';
 /**
  * 215 / jdzj (2026-09-25 evening): every pair stalled because executors and
  * auditors were still working by the legacy engine's rules. Executors would not
@@ -341,7 +342,7 @@ describe('pairs run without legacy supervision artifacts', () => {
     marker(BRAIN, `<!-- IMCODES_TASK DISPATCH recovery-state executor=${EXEC} auditor=${AUD} -->`);
     await flush();
     const current = getTaskPairStore().getPair(PROJECT, 'recovery-state')!;
-    getTaskPairStore().savePair(PROJECT, {
+    putTaskPairFixture(getTaskPairStore(), PROJECT, {
       ...current.state,
       brief: '- [ ] recover the pair\n',
       workspace: { kind: 'worktree', path: repo, base: 'base-sha', lastHead: 'head-sha', createdAt: now, status: 'active' },
@@ -382,7 +383,7 @@ describe('pairs run without legacy supervision artifacts', () => {
     marker(BRAIN, `<!-- IMCODES_TASK DISPATCH external-restart-state executor=${EXEC} auditor=${AUD} -->`);
     await flush();
     const current = getTaskPairStore().getPair(PROJECT, 'external-restart-state')!;
-    getTaskPairStore().savePair(PROJECT, {
+    putTaskPairFixture(getTaskPairStore(), PROJECT, {
       ...current.state,
       brief: '- [ ] continue after external restart\n',
       workspace: { kind: 'worktree', path: repo, base: 'base-sha', lastHead: 'head-sha', createdAt: now, status: 'active' },
@@ -405,7 +406,7 @@ describe('pairs run without legacy supervision artifacts', () => {
     await flush();
     const stored = getTaskPairStore().getPair(PROJECT, 'escalation-followup')!;
     const escalatedAt = now;
-    getTaskPairStore().savePair(PROJECT, {
+    putTaskPairFixture(getTaskPairStore(), PROJECT, {
       ...stored.state,
       flags: [...stored.state.flags, 'executor_silent'],
       updatedAt: escalatedAt,

@@ -1,3 +1,4 @@
+import { putTaskPairFixture } from '../../helpers/task-pair-fixture.js';
 /**
  * A pair participant's git write in the main checkout is refused before it runs
  * where the provider has a pre-tool hook, and reported at once otherwise
@@ -38,7 +39,7 @@ function session(name: string, role: SessionRecord['role'], agentType = 'codex-s
 }
 function openPair(status: TaskPairStatus = 'working'): void {
   const now = Date.now();
-  getTaskPairStore().savePair(PROJECT, {
+  putTaskPairFixture(getTaskPairStore(), PROJECT, {
     taskId: 'T1', status, brain: BRAIN, executor: EXEC, auditor: AUD, round: 1, blocking: ['P0'], title: 'demo',
     workspace: { kind: 'worktree', path: WS, createdAt: now, status: 'active' },
     createdAt: now, updatedAt: now,

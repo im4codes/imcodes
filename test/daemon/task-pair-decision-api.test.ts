@@ -1,3 +1,4 @@
+import { putTaskPairFixture } from '../helpers/task-pair-fixture.js';
 import { DatabaseSync } from 'node:sqlite';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -20,7 +21,7 @@ const state = { taskId: 'blocked-task', title: 'Blocked task', brain: scope.coor
   previousAuditors: [], createdAt: 1, updatedAt: 1 } as TaskPairState;
 const notifications: string[] = [];
 beforeEach(() => {
-  const store = new TaskPairStore(':memory:'); setTaskPairStoreForTests(store); store.savePair(scope.projectName, state);
+  const store = new TaskPairStore(':memory:'); setTaskPairStoreForTests(store); putTaskPairFixture(store, scope.projectName, state);
   notifications.length = 0;
   setTaskPairDeliveryDepsForTests({ send: async (_target, text) => { notifications.push(String(text)); } });
 });
@@ -52,7 +53,7 @@ describe('durable task decisions and human feedback', () => {
   it('deduplicates a retry even if the task changed after the persisted feedback', () => {
     ask(); const input = reply();
     taskPairDecisionApi(scope, input);
-    getTaskPairStore().savePair(scope.projectName, { ...state, status: 'done' });
+    putTaskPairFixture(getTaskPairStore(), scope.projectName, { ...state, status: 'done' });
     expect(taskPairDecisionApi(scope, input).decisions.filter((row) => row.kind === 'feedback')).toHaveLength(1);
   });
   it.each([{ optionId: 'unknown' }, { questionId: 'another-task-question' }, { round: 2 }, { revision: 'stale' }])('rejects stale/cross-question feedback %j', (over) => {
@@ -115,7 +116,7 @@ describe('durable task decisions and human feedback', () => {
   it('does not reuse an old delivery round question when audit numbering restarts', () => {
     const oldQuestion = ask();
     const next = { ...state, deliveryRound: 2 };
-    getTaskPairStore().savePair(scope.projectName, next);
+    putTaskPairFixture(getTaskPairStore(), scope.projectName, next);
     expect(() => taskPairDecisionApi(scope, reply({ revision: taskPairDecisionRevision(next), questionId: oldQuestion.id }))).toThrow(/changed/);
     expect(getTaskPairStore().latestDecisionRequest(scope.projectName, state.taskId, 1, 2)).toBeUndefined();
     const nextQuestion = taskPairService.recordDecision({ project: scope.projectName, taskId: state.taskId, round: 1, kind: 'request',

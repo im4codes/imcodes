@@ -1,3 +1,4 @@
+import { putTaskPairFixture } from '../helpers/task-pair-fixture.js';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { createMemoryMcpToolHandlers } from '../../src/daemon/memory-mcp-tools.js';
 import { MCP_ERROR_REASONS } from '../../shared/memory-mcp-errors.js';
@@ -25,7 +26,7 @@ const sessions: SessionRecord[] = [
 const deps = { sendDeps: { listSessions: () => sessions } };
 
 describe('pair checklist MCP tools', () => {
-  beforeEach(() => { const store = new TaskPairStore(':memory:'); setTaskPairStoreForTests(store); store.savePair('p', state); });
+  beforeEach(() => { const store = new TaskPairStore(':memory:'); setTaskPairStoreForTests(store); putTaskPairFixture(store, 'p', state); });
   afterEach(() => setTaskPairStoreForTests(undefined));
   it('gets, updates and checks the whole Markdown brief', async () => {
     const handlers = createMemoryMcpToolHandlers(caller, deps);

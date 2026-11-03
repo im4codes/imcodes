@@ -134,7 +134,17 @@ export interface StoredTaskPair {
   state: TaskPairState;
   liveness: TaskPairLiveness;
   queueOrder: number;
+  /** Opaque, store-local CAS token: the exact persisted state_json, never a wire field. */
+  revision?: string;
   legacyTaskId?: string;
+}
+
+/** A full-state write was based on an authority snapshot that no longer exists. */
+export class TaskPairWriteConflictError extends Error {
+  constructor(readonly project: string, readonly taskId: string) {
+    super(`Task pair changed while applying update: ${project}/${taskId}`);
+    this.name = 'TaskPairWriteConflictError';
+  }
 }
 
 export interface TaskPairEventRecord {
@@ -632,7 +642,14 @@ export class TaskPairStore {
     ));
   }
 
-  savePair(project: string, state: TaskPairState, options: { liveness?: TaskPairLiveness; legacyTaskId?: string } = {}): StoredTaskPair {
+  /** Full-state compare-and-update. No token means INSERT ONLY, never an unguarded overwrite. */
+  savePair(project: string, state: TaskPairState, options: {
+    expectedRevision?: string;
+    liveness?: TaskPairLiveness;
+    legacyTaskId?: string;
+    /** Lifecycle marker receipt and its state transition commit together. */
+    event?: TaskPairEventRecord;
+  } = {}): StoredTaskPair {
     const existing = this.getPair(project, state.taskId);
     const liveness = options.liveness ?? existing?.liveness ?? emptyLiveness(state.updatedAt);
     const queueOrder = existing?.queueOrder ?? this.#nextQueueOrder();
@@ -640,9 +657,14 @@ export class TaskPairStore {
     const titleState = `CASE WHEN json_type(task_pairs.state_json, '$.${TASK_PAIR_TITLE_ACCESS_FIELD}') IS NOT NULL
       THEN json_set(excluded.state_json, '$.${TASK_PAIR_TITLE_ACCESS_FIELD}', json_extract(task_pairs.state_json, '$.${TASK_PAIR_TITLE_ACCESS_FIELD}'))
       ELSE json_remove(excluded.state_json, '$.${TASK_PAIR_TITLE_ACCESS_FIELD}') END`;
-    const saved = this.#db.prepare(`
+    const expected = options.expectedRevision ?? null;
+    if (options.event) this.#db.exec('BEGIN IMMEDIATE');
+    let saved: Record<string, unknown>;
+    try {
+      const row = this.#db.prepare(`
       INSERT INTO task_pairs (project, task_id, status, brain, executor, auditor, queue_order, legacy_task_id, state_json, liveness_json, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+      WHERE ? IS NULL OR EXISTS (SELECT 1 FROM task_pairs WHERE project = ? AND task_id = ? AND state_json = ?)
       ON CONFLICT (project, task_id) DO UPDATE SET
         status = excluded.status, brain = excluded.brain, executor = excluded.executor, auditor = excluded.auditor,
         legacy_task_id = excluded.legacy_task_id,
@@ -651,23 +673,29 @@ export class TaskPairStore {
           THEN json_set(${titleState}, '$.${TASK_PAIR_SCHEDULING_FIELD}', json_extract(task_pairs.state_json, '$.${TASK_PAIR_SCHEDULING_FIELD}'))
           ELSE json_remove(${titleState}, '$.${TASK_PAIR_SCHEDULING_FIELD}') END,
         liveness_json = excluded.liveness_json, updated_at = excluded.updated_at
-      RETURNING json_quote(json_extract(state_json, '$.${TASK_PAIR_TITLE_ACCESS_FIELD}')) AS title_access_json, json_quote(json_extract(state_json, '$.${TASK_PAIR_SCHEDULING_FIELD}')) AS scheduling_json
+      WHERE task_pairs.state_json = ?
+      RETURNING *
     `).get(
       project, state.taskId, state.status, state.brain, state.executor ?? null, state.auditor ?? null,
       queueOrder, legacyTaskId ?? null, JSON.stringify(state), JSON.stringify(liveness), state.updatedAt,
-    ) as { title_access_json: string | null; scheduling_json: string | null };
-    const savedState = { ...state };
-    if (!saved.scheduling_json || saved.scheduling_json === 'null') delete savedState.scheduling;
-    else savedState.scheduling = JSON.parse(saved.scheduling_json) as TaskPairScheduling;
-    if (saved.title_access_json === null || saved.title_access_json === 'null') delete savedState.titleAccess;
-    else savedState.titleAccess = JSON.parse(saved.title_access_json) as TaskPairTitleAccess;
+      expected, project, state.taskId, expected, expected,
+    ) as Record<string, unknown> | undefined;
+      if (!row || (options.event && !this.recordEvent(options.event))) {
+        throw new TaskPairWriteConflictError(project, state.taskId);
+      }
+      saved = row;
+      if (options.event) this.#db.exec('COMMIT');
+    } catch (error) {
+      if (options.event) this.#db.exec('ROLLBACK');
+      throw error;
+    }
     this.#pendingLiveness.delete(pairKey(project, state.taskId));
     this.#livenessDbWriteAt.delete(pairKey(project, state.taskId));
     this.#refreshIndexEntry(project, state.taskId);
     for (const listener of this.#listeners) {
       try { listener(project, state.taskId); } catch { /* observers never break a write */ }
     }
-    return { project, state: savedState, liveness, queueOrder, ...(legacyTaskId ? { legacyTaskId } : {}) };
+    return rowToPair(saved);
   }
 
   /** Atomic metadata patch: never replace lifecycle, liveness or another MCP writer's unrelated fields. */
@@ -829,8 +857,17 @@ export class TaskPairStore {
   }
 
   isDecisionResolved(question: TaskPairDecisionRecord): boolean {
-    return !!this.#db.prepare("SELECT id FROM task_pair_decisions WHERE project = ? AND task_id = ? AND kind = 'decision' AND COALESCE(json_extract(details_json, '$.deliveryRound'), 1) = ? AND (json_extract(details_json, '$.requestId') = ? OR (round = ? AND at >= ?)) LIMIT 1")
-      .get(question.project, question.taskId, question.deliveryRound ?? 1, question.id, question.round, question.at);
+    return !!this.#db.prepare(`
+      SELECT id FROM task_pair_decisions
+      WHERE project = ? AND task_id = ? AND kind = 'decision'
+        AND COALESCE(json_extract(details_json, '$.deliveryRound'), 1) = ?
+        AND round = ?
+        AND (
+          json_extract(details_json, '$.requestId') = ?
+          OR (json_extract(details_json, '$.requestId') IS NULL AND at >= ?)
+        )
+      LIMIT 1
+    `).get(question.project, question.taskId, question.deliveryRound ?? 1, question.round, question.id, question.at);
   }
 
   latestDecision(project: string, taskId: string, round?: number): TaskPairDecisionRecord | undefined {
@@ -850,13 +887,13 @@ export class TaskPairStore {
     return rows.map(decisionFromRow);
   }
 
-  enqueueDecisionNotification(input: Omit<TaskPairDecisionNotification, 'id' | 'attempts' | 'lastAttemptAt' | 'deliveredAt'>): TaskPairDecisionNotification {
+  enqueueDecisionNotification(input: Omit<TaskPairDecisionNotification, 'id' | 'attempts' | 'lastAttemptAt' | 'deliveredAt'>): TaskPairDecisionNotification & { inserted: boolean } {
     const id = `${input.decisionId}:${input.target}`;
-    this.#db.prepare(`INSERT OR IGNORE INTO task_pair_decision_notifications (id, project, task_id, decision_id, target, reason, text, attempts) VALUES (?, ?, ?, ?, ?, ?, ?, 0)`).run(
+    const result = this.#db.prepare(`INSERT OR IGNORE INTO task_pair_decision_notifications (id, project, task_id, decision_id, target, reason, text, attempts) VALUES (?, ?, ?, ?, ?, ?, ?, 0)`).run(
       id, input.project, input.taskId, input.decisionId, input.target, input.reason, input.text,
     );
     const row = this.#db.prepare('SELECT * FROM task_pair_decision_notifications WHERE id = ?').get(id) as Record<string, unknown>;
-    return decisionNotificationFromRow(row);
+    return Object.assign(decisionNotificationFromRow(row), { inserted: result.changes > 0 });
   }
 
   listPendingDecisionNotifications(limit = 100): TaskPairDecisionNotification[] {
@@ -991,6 +1028,7 @@ function rowToPair(row: Record<string, unknown>): StoredTaskPair {
   };
   return {
     project: String(row.project),
+    revision: String(row.state_json),
     state: JSON.parse(String(row.state_json)) as TaskPairState,
     liveness,
     queueOrder: Number(row.queue_order),
@@ -1043,6 +1081,6 @@ export function flushTaskPairStoreLiveness(): void {
 }
 
 export function setTaskPairStoreForTests(store: TaskPairStore | undefined): void {
-  singleton?.close?.();
+  try { singleton?.close?.(); } catch { /* database may already be closed */ }
   singleton = store;
 }

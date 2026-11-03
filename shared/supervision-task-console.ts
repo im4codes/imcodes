@@ -486,6 +486,8 @@ export interface SupervisionConsolePairInfo {
   scheduling?: TaskPairScheduling;
   status: TaskPairStatus;
   flags: TaskPairFlag[];
+  flagSides?: Partial<Record<TaskPairFlag, string>>;
+  waitingReason?: string | null;
   executor?: string;
   auditor?: string;
   round: number;

@@ -1,3 +1,4 @@
+import { putTaskPairFixture } from '../../helpers/task-pair-fixture.js';
 /**
  * The working directory of a pair participant's turn (tsk_cd_executor_default_cwd).
  * A sub-session starts in the project's main checkout, so a tool call that omits
@@ -39,7 +40,7 @@ function session(name: string, role: SessionRecord['role'], project = PROJECT): 
 
 function savePair(taskId: string, path: string | undefined, over: Partial<TaskPairState> = {}, status: TaskPairStatus = 'working'): void {
   const now = Date.now();
-  getTaskPairStore().savePair(PROJECT, {
+  putTaskPairFixture(getTaskPairStore(), PROJECT, {
     taskId, status, brain: BRAIN, executor: EXEC, auditor: AUD, round: 1, blocking: ['P0'], title: taskId,
     ...(path ? { workspace: { kind: 'worktree', path, createdAt: now, status: 'active' } } : {}),
     createdAt: now, updatedAt: now,

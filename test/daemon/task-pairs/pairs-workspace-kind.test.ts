@@ -1,3 +1,4 @@
+import { putTaskPairFixture } from '../../helpers/task-pair-fixture.js';
 /**
  * `pair_create workspace=auto|worktree|dir|none` (owner requirement: a worktree is created only when the task changes tracked files
  * that will be merged; everything else uses a small task directory or no workspace at all).
@@ -232,7 +233,7 @@ describe('pair_create workspace=…', () => {
     await taskPairService.waitForIdle();
     const stored = getTaskPairStore().getPair(PROJECT, taskId)!;
     const reopened = new TaskPairStore(':memory:');
-    reopened.savePair(PROJECT, JSON.parse(JSON.stringify(stored.state)));
+    putTaskPairFixture(reopened, PROJECT, JSON.parse(JSON.stringify(stored.state)));
     expect(reopened.getPair(PROJECT, taskId)!.state.workspaceKind).toBe('none');
     const got = await handlers()[MEMORY_MCP_TOOL_NAMES.PAIR_GET]({ taskId });
     expect(got).toMatchObject({ pair: { workspace: { requested: 'none', kind: null, path: null, status: null } } });

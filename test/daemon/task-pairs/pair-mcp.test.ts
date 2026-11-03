@@ -1,3 +1,4 @@
+import { putTaskPairFixture } from '../../helpers/task-pair-fixture.js';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { ContextNamespace } from '../../../shared/context-types.js';
 import type { TaskPairState } from '../../../shared/task-pair.js';
@@ -34,8 +35,8 @@ describe('pair MCP projections', () => {
   afterEach(() => setTaskPairStoreForTests(undefined));
 
   it('lists running and queued pairs and gets one pair with recent events', async () => {
-    getTaskPairStore().savePair(PROJECT, pair('running-1', 'working'));
-    getTaskPairStore().savePair(PROJECT, pair('queued-1', 'queued'));
+    putTaskPairFixture(getTaskPairStore(), PROJECT, pair('running-1', 'working'));
+    putTaskPairFixture(getTaskPairStore(), PROJECT, pair('queued-1', 'queued'));
     getTaskPairStore().recordEvent({ id: 'evt-1', project: PROJECT, taskId: 'running-1', writer: BRAIN, role: 'brain', verb: 'DISPATCH', attrs: {}, effect: 'created', unusual: false, source: 'marker', at: 20 });
     const handlers = createMemoryMcpToolHandlers(caller, { sendDeps: { listSessions: () => [session(BRAIN, 'brain'), session(EXEC, 'w1'), session(AUD, 'w2')] } });
     const listed = await handlers[MEMORY_MCP_TOOL_NAMES.PAIR_LIST]({});
@@ -50,7 +51,7 @@ describe('pair MCP projections', () => {
 
   it('reads pair_history for both roles or one role and reports a missing auditor', async () => {
     const taskId = 'history-1';
-    getTaskPairStore().savePair(PROJECT, pair(taskId, 'working'));
+    putTaskPairFixture(getTaskPairStore(), PROJECT, pair(taskId, 'working'));
     const sessions = () => [session(BRAIN, 'brain'), session(EXEC, 'w1'), session(AUD, 'w2')];
     const handlers = createMemoryMcpToolHandlers(caller, { sendDeps: { listSessions: sessions } });
     await expect(handlers[MEMORY_MCP_TOOL_NAMES.PAIR_HISTORY]({ taskId })).resolves.toMatchObject({
@@ -66,14 +67,14 @@ describe('pair MCP projections', () => {
     await expect(handlers[MEMORY_MCP_TOOL_NAMES.PAIR_HISTORY]({ taskId, kind: 'summary', limit: 2 })).resolves.toMatchObject({
       status: 'ok', participants: [{ role: 'executor', kind: 'summary', requested: 2, items: [] }, { role: 'auditor', kind: 'summary', requested: 2, items: [] }],
     });
-    getTaskPairStore().savePair(PROJECT, { ...pair('history-none', 'done'), auditor: 'none' });
+    putTaskPairFixture(getTaskPairStore(), PROJECT, { ...pair('history-none', 'done'), auditor: 'none' });
     await expect(handlers[MEMORY_MCP_TOOL_NAMES.PAIR_HISTORY]({ taskId: 'history-none', role: 'auditor' })).resolves.toMatchObject({
       status: 'ok', participants: [{ role: 'auditor', session: null, status: 'missing', requested: 20, messages: [] }],
     });
   });
 
   it('keeps pair_history Brain-only and rejects invalid bounds or unknown tasks', async () => {
-    getTaskPairStore().savePair(PROJECT, pair('history-auth', 'working'));
+    putTaskPairFixture(getTaskPairStore(), PROJECT, pair('history-auth', 'working'));
     const sessions = () => [session(BRAIN, 'brain'), session(EXEC, 'w1'), session(AUD, 'w2')];
     const executorHandlers = createMemoryMcpToolHandlers({ ...caller, sessionName: EXEC }, { sendDeps: { listSessions: sessions } });
     await expect(executorHandlers[MEMORY_MCP_TOOL_NAMES.PAIR_HISTORY]({ taskId: 'history-auth' })).resolves.toMatchObject({ status: 'error', reason: 'scope_forbidden' });
@@ -84,9 +85,9 @@ describe('pair MCP projections', () => {
   });
 
   it('orders pair_list queue positions urgent-first, matching what the scheduler will start next', async () => {
-    getTaskPairStore().savePair(PROJECT, pair('normal-1', 'queued'));
-    getTaskPairStore().savePair(PROJECT, pair('normal-2', 'queued'));
-    getTaskPairStore().savePair(PROJECT, { ...pair('urgent-1', 'queued'), urgent: true });
+    putTaskPairFixture(getTaskPairStore(), PROJECT, pair('normal-1', 'queued'));
+    putTaskPairFixture(getTaskPairStore(), PROJECT, pair('normal-2', 'queued'));
+    putTaskPairFixture(getTaskPairStore(), PROJECT, { ...pair('urgent-1', 'queued'), urgent: true });
     const handlers = createMemoryMcpToolHandlers(caller, { sendDeps: { listSessions: () => [session(BRAIN, 'brain'), session(EXEC, 'w1'), session(AUD, 'w2')] } });
 
     const listed = await handlers[MEMORY_MCP_TOOL_NAMES.PAIR_LIST]({});
@@ -110,7 +111,7 @@ describe('pair MCP projections', () => {
   });
 
   it('projects requested role models and the explicit no-audit value for queued work', async () => {
-    getTaskPairStore().savePair(PROJECT, {
+    putTaskPairFixture(getTaskPairStore(), PROJECT, {
       ...pair('models-1', 'queued'), executor: undefined, auditor: 'none',
       executorModel: 'gpt-6-luna', auditorModel: undefined,
     });
@@ -120,7 +121,7 @@ describe('pair MCP projections', () => {
   });
 
   it('lets the project Brain set a title without replacing the brief', async () => {
-    getTaskPairStore().savePair(PROJECT, { ...pair('title-1', 'queued'), title: '(untitled task)', brief: 'Fix the retry path.' });
+    putTaskPairFixture(getTaskPairStore(), PROJECT, { ...pair('title-1', 'queued'), title: '(untitled task)', brief: 'Fix the retry path.' });
     const handlers = createMemoryMcpToolHandlers(caller, { sendDeps: { listSessions: () => [session(BRAIN, 'brain'), session(EXEC, 'w1'), session(AUD, 'w2')] } });
     await expect(handlers[MEMORY_MCP_TOOL_NAMES.PAIR_TASK_UPDATE]({ taskId: 'title-1', title: 'Fix retry backoff' })).resolves.toMatchObject({
       taskId: 'title-1', title: 'Fix retry backoff', markdown: 'Fix the retry path.',
@@ -129,7 +130,7 @@ describe('pair MCP projections', () => {
   });
 
   it('lets current executor and auditor read pair_get while rejecting same-project nonparticipants explicitly', async () => {
-    getTaskPairStore().savePair(PROJECT, pair('participant-read', 'working'));
+    putTaskPairFixture(getTaskPairStore(), PROJECT, pair('participant-read', 'working'));
     const sessions = () => [session(BRAIN, 'brain'), session(EXEC, 'w1'), session(AUD, 'w2'), session('sibling', 'w3')];
     const executorHandlers = createMemoryMcpToolHandlers({ ...caller, sessionName: EXEC }, { sendDeps: { listSessions: sessions } });
     await expect(executorHandlers[MEMORY_MCP_TOOL_NAMES.PAIR_GET]({ taskId: 'participant-read' })).resolves.toMatchObject({
@@ -190,7 +191,7 @@ describe('pair MCP projections', () => {
     upsertSession(brain); upsertSession(exec); upsertSession(aud);
     setTaskPairDeliveryDepsForTests({ send: async () => undefined });
     const taskId = 'queued-structured-dispatch';
-    getTaskPairStore().savePair(PROJECT, { ...pair(taskId, 'queued'), brief: 'queued brief' });
+    putTaskPairFixture(getTaskPairStore(), PROJECT, { ...pair(taskId, 'queued'), brief: 'queued brief' });
     try {
       const handlers = createMemoryMcpToolHandlers(caller, { sendDeps: { listSessions: () => [brain, exec, aud] } });
       const first = await handlers[MEMORY_MCP_TOOL_NAMES.PAIR_DISPATCH]({ taskId, idempotencyKey: 'dispatch-once' });
@@ -227,7 +228,7 @@ describe('pair MCP projections', () => {
   it('closes through the shared marker state machine and replays idempotently', async () => {
     const taskId = 'structured-close';
     upsertSession(session(BRAIN, 'brain')); upsertSession(session(EXEC, 'w1'));
-    getTaskPairStore().savePair(PROJECT, { ...pair(taskId, 'working'), auditor: 'none' });
+    putTaskPairFixture(getTaskPairStore(), PROJECT, { ...pair(taskId, 'working'), auditor: 'none' });
     const handlers = createMemoryMcpToolHandlers(caller, { sendDeps: { listSessions: () => [session(BRAIN, 'brain'), session(EXEC, 'w1')] } });
     const first = await handlers[MEMORY_MCP_TOOL_NAMES.PAIR_CLOSE]({ taskId, action: 'done', idempotencyKey: 'close-once' });
     expect(first).toMatchObject({ status: 'ok', taskId, state: 'done', effect: 'status', idempotentReplay: false });
@@ -241,7 +242,7 @@ describe('pair MCP projections', () => {
     const taskId = 'structured-reassign';
     const replacement = 'deck_sub_pair_mcp_exec2';
     upsertSession(session(BRAIN, 'brain')); upsertSession(session(EXEC, 'w1')); upsertSession(session(AUD, 'w2')); upsertSession(session(replacement, 'w3'));
-    getTaskPairStore().savePair(PROJECT, pair(taskId, 'working'));
+    putTaskPairFixture(getTaskPairStore(), PROJECT, pair(taskId, 'working'));
     const sessions = () => [session(BRAIN, 'brain'), session(EXEC, 'w1'), session(AUD, 'w2'), session(replacement, 'w3')];
     const executorHandlers = createMemoryMcpToolHandlers({ ...caller, sessionName: EXEC }, { sendDeps: { listSessions: sessions } });
     await expect(executorHandlers[MEMORY_MCP_TOOL_NAMES.PAIR_REASSIGN]({ taskId, executor: replacement })).resolves.toMatchObject({ status: 'error', reason: 'scope_forbidden' });
@@ -254,12 +255,12 @@ describe('pair MCP projections', () => {
   it('opens only a passed next round and applies auditor verdicts to material-backed rounds', async () => {
     const nextRoundId = 'structured-next-round';
     upsertSession(session(BRAIN, 'brain')); upsertSession(session(EXEC, 'w1')); upsertSession(session(AUD, 'w2'));
-    getTaskPairStore().savePair(PROJECT, { ...pair(nextRoundId, 'passed'), material: { path: '/tmp/pair-mcp', head: 'abcdef1', at: 30 }, passRound: 1 });
+    putTaskPairFixture(getTaskPairStore(), PROJECT, { ...pair(nextRoundId, 'passed'), material: { path: '/tmp/pair-mcp', head: 'abcdef1', at: 30 }, passRound: 1 });
     const handlers = createMemoryMcpToolHandlers(caller, { sendDeps: { listSessions: () => [session(BRAIN, 'brain'), session(EXEC, 'w1'), session(AUD, 'w2')] } });
     const next = await handlers[MEMORY_MCP_TOOL_NAMES.PAIR_NEXT_ROUND]({ taskId: nextRoundId, base: 'abcdef1', note: 'round two', idempotencyKey: 'next-once' }); expect(next).toMatchObject({ status: 'ok', taskId: nextRoundId, state: 'working', effect: 'next_round' });
 
     const verdictId = 'structured-verdict';
-    getTaskPairStore().savePair(PROJECT, { ...pair(verdictId, 'in_audit'), material: { path: '/tmp/pair-mcp', head: 'abcdef1', at: 30 }, round: 1 });
+    putTaskPairFixture(getTaskPairStore(), PROJECT, { ...pair(verdictId, 'in_audit'), material: { path: '/tmp/pair-mcp', head: 'abcdef1', at: 30 }, round: 1 });
     const auditorHandlers = createMemoryMcpToolHandlers({ ...caller, sessionName: AUD }, { sendDeps: { listSessions: () => [session(BRAIN, 'brain'), session(EXEC, 'w1'), session(AUD, 'w2')] } });
     await expect(auditorHandlers[MEMORY_MCP_TOOL_NAMES.PAIR_VERDICT]({ taskId: verdictId, verdict: 'PASS', idempotencyKey: 'verdict-once' })).resolves.toMatchObject({ status: 'ok', taskId: verdictId, state: 'passed', effect: 'verdict', judgement: 'implicit_zero', counts: { P0: 0 } });
     const replay = await auditorHandlers[MEMORY_MCP_TOOL_NAMES.PAIR_VERDICT]({ taskId: verdictId, verdict: 'PASS', idempotencyKey: 'verdict-once' });
@@ -274,14 +275,14 @@ describe('pair MCP projections', () => {
     upsertSession(session(replacement, 'w3'));
     try {
       const reassignId = 'structured-reassign-terminal-replay';
-      getTaskPairStore().savePair(PROJECT, pair(reassignId, 'working'));
+      putTaskPairFixture(getTaskPairStore(), PROJECT, pair(reassignId, 'working'));
       await expect(handlers[MEMORY_MCP_TOOL_NAMES.PAIR_REASSIGN]({ taskId: reassignId, executor: replacement, idempotencyKey: 'reassign-terminal-replay' })).resolves.toMatchObject({ status: 'ok', effect: 'reassigned', idempotentReplay: false });
       await expect(handlers[MEMORY_MCP_TOOL_NAMES.PAIR_CLOSE]({ taskId: reassignId, action: 'done', force: true, idempotencyKey: 'close-after-reassign' })).resolves.toMatchObject({ status: 'ok', state: 'done' });
       await expect(handlers[MEMORY_MCP_TOOL_NAMES.PAIR_REASSIGN]({ taskId: reassignId, executor: replacement, idempotencyKey: 'reassign-terminal-replay' })).resolves.toMatchObject({ status: 'ok', state: 'done', idempotentReplay: true });
       expect(getTaskPairStore().listEvents(PROJECT, reassignId).filter((event) => event.verb === 'REASSIGN')).toHaveLength(1);
 
       const nextRoundId = 'structured-next-round-terminal-replay';
-      getTaskPairStore().savePair(PROJECT, { ...pair(nextRoundId, 'passed'), material: { path: '/tmp/pair-mcp', head: 'abcdef1', at: 30 }, passRound: 1 });
+      putTaskPairFixture(getTaskPairStore(), PROJECT, { ...pair(nextRoundId, 'passed'), material: { path: '/tmp/pair-mcp', head: 'abcdef1', at: 30 }, passRound: 1 });
       await expect(handlers[MEMORY_MCP_TOOL_NAMES.PAIR_NEXT_ROUND]({ taskId: nextRoundId, base: 'abcdef1', note: 'round two', idempotencyKey: 'next-terminal-replay' })).resolves.toMatchObject({ status: 'ok', effect: 'next_round', idempotentReplay: false });
       await expect(handlers[MEMORY_MCP_TOOL_NAMES.PAIR_CLOSE]({ taskId: nextRoundId, action: 'done', force: true, idempotencyKey: 'close-after-next-round' })).resolves.toMatchObject({ status: 'ok', state: 'done' });
       await expect(handlers[MEMORY_MCP_TOOL_NAMES.PAIR_NEXT_ROUND]({ taskId: nextRoundId, base: 'abcdef1', note: 'round two', idempotencyKey: 'next-terminal-replay' })).resolves.toMatchObject({ status: 'ok', state: 'done', idempotentReplay: true });
@@ -294,7 +295,7 @@ describe('pair MCP projections', () => {
   it('rejects unknown/terminal or wrong-state lifecycle requests and releases claims once on cancel', async () => {
     upsertSession(session(BRAIN, 'brain')); upsertSession(session(EXEC, 'w1')); upsertSession(session(AUD, 'w2'));
     const cancelId = 'structured-cancel';
-    getTaskPairStore().savePair(PROJECT, pair(cancelId, 'working'));
+    putTaskPairFixture(getTaskPairStore(), PROJECT, pair(cancelId, 'working'));
     expect(taskPairService.claimResource({ project: PROJECT, taskId: cancelId, owner: EXEC, resource: 'port:43123', mode: 'exclusive', ttlMs: 60000 }).ok).toBe(true);
     const handlers = createMemoryMcpToolHandlers(caller, { sendDeps: { listSessions: () => [session(BRAIN, 'brain'), session(EXEC, 'w1'), session(AUD, 'w2')] } });
     await expect(handlers[MEMORY_MCP_TOOL_NAMES.PAIR_CLOSE]({ taskId: 'missing', action: 'cancel' })).resolves.toMatchObject({ status: 'error', reason: MCP_ERROR_REASONS.PROJECTION_UNAVAILABLE });
@@ -304,7 +305,7 @@ describe('pair MCP projections', () => {
     await expect(handlers[MEMORY_MCP_TOOL_NAMES.PAIR_CLOSE]({ taskId: cancelId, action: 'cancel', idempotencyKey: 'cancel-again' })).resolves.toMatchObject({ status: 'error', reason: 'validation_failed' });
 
     const wrongState = 'structured-wrong-state';
-    getTaskPairStore().savePair(PROJECT, pair(wrongState, 'working'));
+    putTaskPairFixture(getTaskPairStore(), PROJECT, pair(wrongState, 'working'));
     const auditorHandlers = createMemoryMcpToolHandlers({ ...caller, sessionName: AUD }, { sendDeps: { listSessions: () => [session(BRAIN, 'brain'), session(EXEC, 'w1'), session(AUD, 'w2')] } });
     await expect(auditorHandlers[MEMORY_MCP_TOOL_NAMES.PAIR_VERDICT]({ taskId: wrongState, verdict: 'PASS' })).resolves.toMatchObject({ status: 'error', reason: 'validation_failed' });
     await expect(handlers[MEMORY_MCP_TOOL_NAMES.PAIR_NEXT_ROUND]({ taskId: wrongState })).resolves.toMatchObject({ status: 'error', reason: 'validation_failed' });

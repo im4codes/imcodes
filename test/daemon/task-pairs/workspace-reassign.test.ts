@@ -1,3 +1,4 @@
+import { putTaskPairFixture } from '../../helpers/task-pair-fixture.js';
 /**
  * Executor change (tsk_cd_reassigned_executor_workspace): the pair's worktree
  * used to stay under the PREVIOUS executor's session directory, and a rebuild
@@ -178,7 +179,7 @@ describe('pair workspace follows an executor change', () => {
   it('material naming the old path is rewritten at the move and redirected when a later READY still names it', async () => {
     const oldPath = await openedByOld('R2');
     const state = pair('R2');
-    getTaskPairStore().savePair(PROJECT, { ...state, material: { worktree: oldPath, head: 'a'.repeat(40), at: 1 } });
+    putTaskPairFixture(getTaskPairStore(), PROJECT, { ...state, material: { worktree: oldPath, head: 'a'.repeat(40), at: 1 } });
     await reassignExecutor('R2');
     const newPath = pathOf(NEW, 'R2');
     expect(pair('R2').material?.worktree).toBe(newPath);
@@ -309,7 +310,7 @@ describe('pair workspace follows an executor change', () => {
     const newPath = pathOf(NEW, 'R9');
     mkdirSync(join(newPath, '..'), { recursive: true });
     git(project, 'worktree', 'move', oldPath, newPath);
-    getTaskPairStore().savePair(PROJECT, { ...pair('R9'), executor: NEW });
+    putTaskPairFixture(getTaskPairStore(), PROJECT, { ...pair('R9'), executor: NEW });
 
     await ensureTaskPairWorkspaceAvailable(PROJECT, 'R9');
     expect(pair('R9').workspace).toMatchObject({ path: newPath, previousPaths: [oldPath] });

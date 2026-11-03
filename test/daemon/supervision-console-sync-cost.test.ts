@@ -1,3 +1,4 @@
+import { putTaskPairFixture } from '../helpers/task-pair-fixture.js';
 /**
  * tsk_58c8fb1b73 per-call cost of the code that now runs per poll tick / per
  * legacy delta: the engine check. Production-shaped: 600 stored sessions, one
@@ -99,7 +100,7 @@ describe('engine-check cost at production shape', () => {
     process.env[TASK_PAIR_ENGINE_ENV] = 'pairs';
     const store = new TaskPairStore(':memory:');
     setTaskPairStoreForTests(store);
-    const save = (taskId: string, over: Record<string, unknown> = {}) => store.savePair('cd', {
+    const save = (taskId: string, over: Record<string, unknown> = {}) => putTaskPairFixture(store, 'cd', {
       taskId, brain: 'deck_cd_brain', executor: `deck_sub_${taskId}_x`, auditor: `deck_sub_${taskId}_a`,
       title: `Pair ${taskId}`, status: 'working', flags: [], flagSides: {}, round: 0, blocking: ['P0'],
       previousAuditors: [], createdAt: 1, updatedAt: 1_000, brief: `# brief\n${'- [ ][ ] item\n'.repeat(60)}`, executorPool: 'primary',

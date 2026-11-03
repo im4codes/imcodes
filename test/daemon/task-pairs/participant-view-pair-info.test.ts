@@ -1,3 +1,4 @@
+import { putTaskPairFixture } from '../../helpers/task-pair-fixture.js';
 /** Shared participants use the same Pair projections and authority as owners. */
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
@@ -43,8 +44,8 @@ function handlers(sessionName = BRAIN, participantTurnRequired: () => Promise<bo
 
 beforeEach(() => {
   setTaskPairStoreForTests(new TaskPairStore(':memory:'));
-  getTaskPairStore().savePair(PROJECT, pair('legacy-task'));
-  getTaskPairStore().savePair(PROJECT, { ...pair('old-grant-task'), titleAccess: { version: 1, serverId: 'other-server', userIds: ['someone-else'] } });
+  putTaskPairFixture(getTaskPairStore(), PROJECT, pair('legacy-task'));
+  putTaskPairFixture(getTaskPairStore(), PROJECT, { ...pair('old-grant-task'), titleAccess: { version: 1, serverId: 'other-server', userIds: ['someone-else'] } });
   getTaskPairStore().recordEvent({
     id: 'event-1', project: PROJECT, taskId: 'legacy-task', writer: BRAIN, role: 'brain', verb: 'DISPATCH',
     attrs: { title: TITLE, executorModel: MODEL, brief: BRIEF }, effect: 'recorded', unusual: false,
@@ -75,8 +76,8 @@ for (const [origin, turn] of turns) describe(`Pair access from ${origin}`, () =>
 });
 
 it.each([BRAIN, EXEC, AUD])('does not expand project/task membership (%s)', async (sessionName) => {
-  getTaskPairStore().savePair(PROJECT, { ...pair('outside-task'), brain: 'other-brain', executor: 'other-executor', auditor: 'other-auditor', title: 'Outside title' });
-  getTaskPairStore().savePair('other-project', { ...pair('other-project-task'), title: 'Other project title' });
+  putTaskPairFixture(getTaskPairStore(), PROJECT, { ...pair('outside-task'), brain: 'other-brain', executor: 'other-executor', auditor: 'other-auditor', title: 'Outside title' });
+  putTaskPairFixture(getTaskPairStore(), 'other-project', { ...pair('other-project-task'), title: 'Other project title' });
   for (const taskId of ['outside-task', 'other-project-task']) {
     expect(await handlers(sessionName).pair_get!({ taskId })).toMatchObject({ status: 'error' });
     expect(await handlers(sessionName).pair_task_get!({ taskId })).toMatchObject({ status: 'error' });
