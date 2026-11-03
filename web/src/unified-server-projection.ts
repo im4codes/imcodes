@@ -86,17 +86,35 @@ export function projectUnifiedServerList<T extends OnlineServerInfo>(
         const displayName = (grant.target.kind === 'server' && grant.targetLabel && grant.targetLabel.trim())
           ? grant.targetLabel.trim()
           : (server.name || grant.serverName);
+
+        // Effective heartbeat: prefer freshest authoritative timestamp between cached server snapshot and active grant
+        const effectiveHeartbeat = typeof grant.lastHeartbeatAt === 'number'
+          ? (typeof server.lastHeartbeatAt === 'number' ? Math.max(server.lastHeartbeatAt, grant.lastHeartbeatAt) : grant.lastHeartbeatAt)
+          : server.lastHeartbeatAt;
+
+        // Effective status: if explicitly offline, keep offline; else prefer grant status, fallback to server status
+        const effectiveStatus = (server.status === 'offline' || grant.serverStatus === 'offline')
+          ? 'offline'
+          : (grant.serverStatus ?? server.status ?? 'active');
+
+        const effectiveOnline = isServerOnline({ status: effectiveStatus, lastHeartbeatAt: effectiveHeartbeat });
+
         unifiedItems.push({
           id: server.id,
           name: displayName,
-          status: server.status,
-          lastHeartbeatAt: server.lastHeartbeatAt,
+          status: effectiveStatus,
+          lastHeartbeatAt: effectiveHeartbeat,
           daemonVersion: (server as { daemonVersion?: string | null }).daemonVersion,
           latestDaemonVersion: (server as { latestDaemonVersion?: string | null }).latestDaemonVersion,
           createdAt: server.createdAt,
           isSharedIn: true,
           sharedEntry: grant,
-          online: isServerOnline(server),
+          server: {
+            ...server,
+            status: effectiveStatus,
+            lastHeartbeatAt: effectiveHeartbeat,
+          },
+          online: effectiveOnline,
         });
       }
     }
@@ -111,14 +129,19 @@ export function projectUnifiedServerList<T extends OnlineServerInfo>(
     const displayName = (grant.targetLabel && grant.targetLabel.trim())
       ? grant.targetLabel.trim()
       : grant.serverName;
+
+    const effectiveStatus = grant.serverStatus ?? 'active';
+    const effectiveHeartbeat = typeof grant.lastHeartbeatAt === 'number' ? grant.lastHeartbeatAt : null;
+    const effectiveOnline = isServerOnline({ status: effectiveStatus, lastHeartbeatAt: effectiveHeartbeat });
+
     unifiedItems.push({
       id: grant.serverId,
       name: displayName,
-      status: 'active',
-      lastHeartbeatAt: null,
+      status: effectiveStatus,
+      lastHeartbeatAt: effectiveHeartbeat,
       isSharedIn: true,
       sharedEntry: grant,
-      online: false, // Unknown heartbeat, do not fake green dot
+      online: effectiveOnline,
     });
   }
 

@@ -1742,38 +1742,78 @@ export function App() {
   }, [auth, clearAuthState, selectedServerId, servers, serversLoaded]);
 
   // Periodically refresh server list so lastHeartbeatAt stays current
-  useEffect(() => {
-    if (!auth) return;
-    const id = setInterval(() => { loadServers(); }, 30_000);
-    return () => clearInterval(id);
-  }, [auth, loadServers]);
+  const lastSharedAuthUserIdRef = useRef<string | null>(null);
 
-  const refreshSharedEntries = useCallback(async () => {
+  const refreshSharedEntries = useCallback(async (options?: { silent?: boolean }) => {
     if (!auth) {
+      lastSharedAuthUserIdRef.current = null;
       setSharedEntries([]);
       setSharedEntriesError(null);
       setSharedEntriesLoaded(false);
       return;
     }
-    setSharedEntriesLoading(true);
-    setSharedEntriesLoaded(false);
-    setSharedEntriesError(null);
+    // Account switch boundary: if switching users, immediately clear prior user's shared entries
+    if (lastSharedAuthUserIdRef.current !== auth.userId) {
+      lastSharedAuthUserIdRef.current = auth.userId;
+      setSharedEntries([]);
+    }
+    if (!options?.silent) {
+      setSharedEntriesLoading(true);
+      setSharedEntriesLoaded(false);
+      setSharedEntriesError(null);
+    }
     try {
       const entries = await discoverSharedEntries();
       const activeIds = new Set(entries.filter((entry) => entry.status === 'active').map((entry) => entry.serverId));
       sharedNavigationServerIdsRef.current = activeIds;
       setSharedEntries(entries);
-      // A successful refresh can revoke a previous shortcut; failed requests
-      // leave the last known navigation intact, never granting route authority.
-      setServers((previous) => previous.filter((server) => ownedServerIdsRef.current.has(server.id) || activeIds.has(server.id)));
+
+      // Build mapping of freshest known heartbeat per serverId from active grants
+      const grantMap = new Map<string, SharedEntrySummary>();
+      for (const entry of entries) {
+        if (entry.status === 'active' && typeof entry.lastHeartbeatAt === 'number') {
+          const cur = grantMap.get(entry.serverId);
+          if (!cur || (typeof cur.lastHeartbeatAt === 'number' && entry.lastHeartbeatAt > cur.lastHeartbeatAt)) {
+            grantMap.set(entry.serverId, entry);
+          }
+        }
+      }
+
+      // Update visited shared server heartbeat snapshots so leaving them >60s does not falsely grey them out
+      setServers((previous) => previous.map((server) => {
+        if (ownedServerIdsRef.current.has(server.id)) return server;
+        const grant = grantMap.get(server.id);
+        if (!grant || typeof grant.lastHeartbeatAt !== 'number') return server;
+        if (!server.lastHeartbeatAt || grant.lastHeartbeatAt > server.lastHeartbeatAt) {
+          return {
+            ...server,
+            status: grant.serverStatus ?? server.status,
+            lastHeartbeatAt: grant.lastHeartbeatAt,
+          };
+        }
+        return server;
+      }).filter((server) => ownedServerIdsRef.current.has(server.id) || activeIds.has(server.id)));
     } catch (err) {
-      setSharedEntries([]);
-      setSharedEntriesError(formatSharedAccessError(err, trans));
+      // On network failure during refresh: preserve existing entries; do not clear to []
+      if (!options?.silent) {
+        setSharedEntriesError(formatSharedAccessError(err, trans));
+      }
     } finally {
-      setSharedEntriesLoading(false);
-      setSharedEntriesLoaded(true);
+      if (!options?.silent) {
+        setSharedEntriesLoading(false);
+        setSharedEntriesLoaded(true);
+      }
     }
-  }, [auth]);
+  }, [auth, trans]);
+
+  useEffect(() => {
+    if (!auth) return;
+    const id = setInterval(() => {
+      void loadServers();
+      void refreshSharedEntries({ silent: true });
+    }, 30_000);
+    return () => clearInterval(id);
+  }, [auth, loadServers, refreshSharedEntries]);
 
   useEffect(() => {
     void refreshSharedEntries();
@@ -7333,9 +7373,22 @@ export function App() {
                 {showMobileServerMenu && (
                   <>
                   <MobileServerMenu footer={<LanguageSwitcher />}>
-                    <button class="mobile-server-menu-item" onClick={() => { setShowMobileServerMenu(false); handleBackToDashboard(); }}>
-                      ← Home
-                    </button>
+                    <div class="mobile-server-menu-top-row">
+                      <button
+                        class="mobile-server-menu-item mobile-server-menu-home"
+                        onClick={() => { setShowMobileServerMenu(false); handleBackToDashboard(); }}
+                      >
+                        ← Home
+                      </button>
+                      {isNative() && (
+                        <button
+                          class="mobile-server-menu-item mobile-server-menu-change"
+                          onClick={() => { setShowMobileServerMenu(false); handleChangeServer(); }}
+                        >
+                          ⇄ Switch Cloud Server
+                        </button>
+                      )}
+                    </div>
                     <button
                       class="mobile-server-menu-item mobile-server-menu-controlled-nodes"
                       onClick={() => {
@@ -7346,11 +7399,6 @@ export function App() {
                       <span aria-hidden="true">🖥</span>
                       <span>{trans('controlled_nodes.title')}</span>
                     </button>
-                    {isNative() && (
-                      <button class="mobile-server-menu-item mobile-server-menu-change" onClick={() => { setShowMobileServerMenu(false); handleChangeServer(); }}>
-                        ⇄ Switch Cloud Server
-                      </button>
-                    )}
                     {unifiedServers.map((s) => {
                       const online = s.online;
                       return (

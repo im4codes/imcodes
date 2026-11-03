@@ -1091,6 +1091,8 @@ export interface SharedEntrySummary {
   status: 'active' | 'revoked' | 'expired' | 'target-unavailable';
   target: ShareTarget;
   targetLabel: string;
+  serverStatus?: string | null;
+  lastHeartbeatAt?: number | null;
 }
 
 function shareTargetFallbackLabel(target: ShareTarget): string {
@@ -1119,6 +1121,8 @@ function normalizeSharedEntrySummary(value: unknown): SharedEntrySummary {
     status: typeof raw.status === 'string' ? raw.status as SharedEntrySummary['status'] : 'active',
     target,
     targetLabel,
+    serverStatus: typeof raw.serverStatus === 'string' ? raw.serverStatus : null,
+    lastHeartbeatAt: typeof raw.lastHeartbeatAt === 'number' && Number.isFinite(raw.lastHeartbeatAt) ? raw.lastHeartbeatAt : null,
   };
 }
 

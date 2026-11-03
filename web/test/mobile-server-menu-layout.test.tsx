@@ -19,21 +19,61 @@ const entries: SharedEntrySummary[] = Array.from({ length: 36 }, (_, index) => (
 
 afterEach(() => { cleanup(); localStorage.clear(); });
 
-function menu(onOpen = vi.fn(), onSelectServer = vi.fn(), onClose = vi.fn()) {
+function menu(
+  onOpen = vi.fn(),
+  onSelectServer = vi.fn(),
+  onClose = vi.fn(),
+  options: {
+    isNative?: boolean;
+    onChangeServer?: () => void;
+    onOpenControlledNodes?: () => void;
+    servers?: Array<{ id: string; name: string; online: boolean; isSharedIn?: boolean }>;
+  } = {},
+) {
+  const {
+    isNative = false,
+    onChangeServer = vi.fn(),
+    onOpenControlledNodes = vi.fn(),
+    servers = Array.from({ length: 12 }, (_, index) => ({
+      id: `owned-${index}`,
+      name: `Owned ${index}`,
+      online: true,
+      isSharedIn: false,
+    })),
+  } = options;
+
   return render(
     <div class="layout-mobile">
       <div class="mobile-server-bar">
         <div class="mobile-server-switcher-wrap">
           <button class="mobile-server-btn">Servers</button>
           <MobileServerMenu footer={<button>Language</button>}>
-            <button class="mobile-server-menu-item" onClick={onClose}>Home</button>
-            {Array.from({ length: 12 }, (_, index) => (
+            <div class="mobile-server-menu-top-row">
+              <button class="mobile-server-menu-item mobile-server-menu-home" onClick={onClose}>← Home</button>
+              {isNative && (
+                <button
+                  class="mobile-server-menu-item mobile-server-menu-change"
+                  onClick={onChangeServer}
+                >
+                  ⇄ Switch Cloud Server
+                </button>
+              )}
+            </div>
+            <button
+              class="mobile-server-menu-item mobile-server-menu-controlled-nodes"
+              onClick={onOpenControlledNodes}
+            >
+              <span>🖥</span>
+              <span>AI Desk</span>
+            </button>
+            {servers.map((s) => (
               <button
-                key={index}
-                class="mobile-server-menu-item mobile-server-menu-server"
-                onClick={() => onSelectServer(index)}
+                key={s.id}
+                class={`mobile-server-menu-item mobile-server-menu-server${s.isSharedIn ? ' mobile-shared-in' : ''}`}
+                onClick={() => onSelectServer(s.id)}
               >
-                <span>●</span><span class="mobile-server-menu-name">{`Owned ${index}`}</span>
+                <span style={{ color: s.online ? '#4ade80' : '#475569' }}>{s.online ? '●' : '○'}</span>
+                <span class="mobile-server-menu-name">{s.name}</span>
               </button>
             ))}
             <MobileSharedEntriesMenu entries={entries} onOpen={onOpen} onRefresh={vi.fn()} />
@@ -85,6 +125,86 @@ describe('mobile server menu shared-entry reachability', () => {
     fireEvent.click(screen.getByRole('button', { name: /Shared 35/ }));
     expect(onOpen).toHaveBeenCalledOnce();
     expect(onOpen).toHaveBeenCalledWith(entries[35]);
+  });
+
+  it('compresses mobile server menu top-row: Home on left, Switch Cloud Server on right in native mode, AI Desk on row 2', () => {
+    const onClose = vi.fn();
+    const onChangeServer = vi.fn();
+    const onOpenControlledNodes = vi.fn();
+    const view = menu(vi.fn(), vi.fn(), onClose, {
+      isNative: true,
+      onChangeServer,
+      onOpenControlledNodes,
+    });
+
+    const topRow = view.container.querySelector('.mobile-server-menu-top-row')!;
+    expect(topRow).toBeTruthy();
+    const buttons = topRow.querySelectorAll('button');
+    expect(buttons).toHaveLength(2);
+    expect(buttons[0].classList.contains('mobile-server-menu-home')).toBe(true);
+    expect(buttons[0].textContent).toContain('Home');
+    expect(buttons[1].classList.contains('mobile-server-menu-change')).toBe(true);
+    expect(buttons[1].textContent).toContain('Switch Cloud Server');
+
+    const aiDesk = view.container.querySelector('.mobile-server-menu-controlled-nodes')!;
+    expect(aiDesk).toBeTruthy();
+    expect(aiDesk.textContent).toContain('AI Desk');
+    expect(aiDesk.previousElementSibling).toBe(topRow);
+
+    fireEvent.click(buttons[0]);
+    expect(onClose).toHaveBeenCalledOnce();
+
+    fireEvent.click(buttons[1]);
+    expect(onChangeServer).toHaveBeenCalledOnce();
+
+    fireEvent.click(aiDesk);
+    expect(onOpenControlledNodes).toHaveBeenCalledOnce();
+  });
+
+  it('suppresses Switch Cloud Server button in non-native web mode while retaining Home and AI Desk', () => {
+    const view = menu(vi.fn(), vi.fn(), vi.fn(), {
+      isNative: false,
+    });
+
+    const topRow = view.container.querySelector('.mobile-server-menu-top-row')!;
+    expect(topRow).toBeTruthy();
+    expect(topRow.querySelector('.mobile-server-menu-home')).toBeTruthy();
+    expect(topRow.querySelector('.mobile-server-menu-change')).toBeNull();
+
+    const aiDesk = view.container.querySelector('.mobile-server-menu-controlled-nodes')!;
+    expect(aiDesk).toBeTruthy();
+    expect(aiDesk.previousElementSibling).toBe(topRow);
+  });
+
+  it('renders authoritative online (●) and offline (○) dots with consistent color coding across owned and shared servers', () => {
+    const servers = [
+      { id: 'owned-1', name: 'Owned Online', online: true, isSharedIn: false },
+      { id: 'owned-2', name: 'Owned Offline', online: false, isSharedIn: false },
+      { id: 'shared-1', name: 'Shared Online', online: true, isSharedIn: true },
+      { id: 'shared-2', name: 'Shared Offline', online: false, isSharedIn: true },
+    ];
+    const view = menu(vi.fn(), vi.fn(), vi.fn(), { servers });
+
+    const serverBtns = view.container.querySelectorAll('.mobile-server-menu-server');
+    expect(serverBtns).toHaveLength(4);
+
+    expect(serverBtns[0].textContent).toContain('●');
+    expect(serverBtns[0].textContent).toContain('Owned Online');
+    expect(serverBtns[0].querySelector('span')!.style.color).toBe('rgb(74, 222, 128)'); // #4ade80
+
+    expect(serverBtns[1].textContent).toContain('○');
+    expect(serverBtns[1].textContent).toContain('Owned Offline');
+    expect(serverBtns[1].querySelector('span')!.style.color).toBe('rgb(71, 85, 105)'); // #475569
+
+    expect(serverBtns[2].textContent).toContain('●');
+    expect(serverBtns[2].textContent).toContain('Shared Online');
+    expect(serverBtns[2].classList.contains('mobile-shared-in')).toBe(true);
+    expect(serverBtns[2].querySelector('span')!.style.color).toBe('rgb(74, 222, 128)'); // #4ade80
+
+    expect(serverBtns[3].textContent).toContain('○');
+    expect(serverBtns[3].textContent).toContain('Shared Offline');
+    expect(serverBtns[3].classList.contains('mobile-shared-in')).toBe(true);
+    expect(serverBtns[3].querySelector('span')!.style.color).toBe('rgb(71, 85, 105)'); // #475569
   });
 
   it('runs desktop smoke verifying mobile bar is hidden and sidebar shared entries are interactive', async () => {

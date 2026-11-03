@@ -338,6 +338,134 @@ describe('projectUnifiedServerList', () => {
     expect(result[1].id).toBe('server-owned-1');
     expect(result[2].id).toBe('server-owned-2');
   });
+
+  it('projects discovered whole-server share as online: true when grant carries fresh authoritative heartbeat (<60s)', () => {
+    const ownedIds = new Set(['server-owned-1']);
+    const now = Date.now();
+    const freshSharedEntry: SharedEntrySummary = {
+      id: 'grant-shared-online',
+      serverId: 'server-ai-207',
+      serverName: 'ai-207',
+      role: 'participant',
+      status: 'active',
+      target: { kind: 'server', serverId: 'server-ai-207' },
+      targetLabel: 'ai-207',
+      serverStatus: 'online',
+      lastHeartbeatAt: now - 5_000,
+    };
+
+    const result = projectUnifiedServerList(
+      [mockOwnedServer1],
+      [freshSharedEntry],
+      ownedIds,
+    );
+
+    expect(result).toHaveLength(2);
+    const item = result.find((s) => s.id === 'server-ai-207')!;
+    expect(item).toBeDefined();
+    expect(item.isSharedIn).toBe(true);
+    expect(item.online).toBe(true);
+    expect(item.lastHeartbeatAt).toBe(now - 5_000);
+  });
+
+  it('projects discovered whole-server share as online: false when grant heartbeat is stale or serverStatus is offline', () => {
+    const ownedIds = new Set(['server-owned-1']);
+    const now = Date.now();
+    const staleSharedEntry: SharedEntrySummary = {
+      id: 'grant-stale',
+      serverId: 'server-ai-208',
+      serverName: 'ai-208',
+      role: 'participant',
+      status: 'active',
+      target: { kind: 'server', serverId: 'server-ai-208' },
+      targetLabel: 'ai-208',
+      serverStatus: 'online',
+      lastHeartbeatAt: now - 70_000,
+    };
+    const offlineSharedEntry: SharedEntrySummary = {
+      id: 'grant-offline',
+      serverId: 'server-ai-209',
+      serverName: 'ai-209',
+      role: 'participant',
+      status: 'active',
+      target: { kind: 'server', serverId: 'server-ai-209' },
+      targetLabel: 'ai-209',
+      serverStatus: 'offline',
+      lastHeartbeatAt: now - 1_000,
+    };
+
+    const result = projectUnifiedServerList(
+      [mockOwnedServer1],
+      [staleSharedEntry, offlineSharedEntry],
+      ownedIds,
+    );
+
+    const staleItem = result.find((s) => s.id === 'server-ai-208')!;
+    expect(staleItem.online).toBe(false);
+
+    const offlineItem = result.find((s) => s.id === 'server-ai-209')!;
+    expect(offlineItem.online).toBe(false);
+  });
+
+  it('visited shared server left for >60s stays online when active grant provides fresh heartbeat, and follows online -> offline -> recovery', () => {
+    const ownedIds = new Set(['server-owned-1']);
+    const now = Date.now();
+    const visitedSharedServer = {
+      id: 'server-visited-shared',
+      name: 'Visited Server',
+      status: 'online',
+      lastHeartbeatAt: now - 120_000, // 2 minutes ago — stale snapshot in inventory
+    };
+
+    // 1. Fresh grant heartbeat keeps it online
+    const freshGrant: SharedEntrySummary = {
+      id: 'grant-visited',
+      serverId: 'server-visited-shared',
+      serverName: 'Visited Server',
+      role: 'participant',
+      status: 'active',
+      target: { kind: 'server', serverId: 'server-visited-shared' },
+      targetLabel: 'Visited Server',
+      serverStatus: 'online',
+      lastHeartbeatAt: now - 5_000,
+    };
+
+    let result = projectUnifiedServerList(
+      [mockOwnedServer1, visitedSharedServer],
+      [freshGrant],
+      ownedIds,
+    );
+    let item = result.find((s) => s.id === 'server-visited-shared')!;
+    expect(item.online).toBe(true);
+    expect(item.lastHeartbeatAt).toBe(now - 5_000);
+
+    // 2. Grant heartbeat becomes stale -> turns offline
+    const staleGrant: SharedEntrySummary = {
+      ...freshGrant,
+      lastHeartbeatAt: now - 80_000,
+    };
+    result = projectUnifiedServerList(
+      [mockOwnedServer1, visitedSharedServer],
+      [staleGrant],
+      ownedIds,
+    );
+    item = result.find((s) => s.id === 'server-visited-shared')!;
+    expect(item.online).toBe(false);
+
+    // 3. Grant receives recovery heartbeat -> returns online
+    const recoveredGrant: SharedEntrySummary = {
+      ...freshGrant,
+      lastHeartbeatAt: now - 2_000,
+    };
+    result = projectUnifiedServerList(
+      [mockOwnedServer1, visitedSharedServer],
+      [recoveredGrant],
+      ownedIds,
+    );
+    item = result.find((s) => s.id === 'server-visited-shared')!;
+    expect(item.online).toBe(true);
+    expect(item.lastHeartbeatAt).toBe(now - 2_000);
+  });
 });
 
 describe('filterRestrictedSharedEntries', () => {

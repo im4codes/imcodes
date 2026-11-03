@@ -356,7 +356,23 @@ describe('Chromium responsive layout and interaction verification', () => {
                       }
                     }, lang)
                   },
-                    h('button', { class: 'mobile-server-menu-item' }, '← Home'),
+                    h('div', { class: 'mobile-server-menu-top-row' },
+                      h('button', {
+                        id: 'mobile-home-btn',
+                        class: 'mobile-server-menu-item mobile-server-menu-home',
+                        onClick: () => log('click-home', null)
+                      }, '← Home'),
+                      h('button', {
+                        id: 'mobile-change-btn',
+                        class: 'mobile-server-menu-item mobile-server-menu-change',
+                        onClick: () => log('click-change-server', null)
+                      }, '⇄ Switch Cloud Server')
+                    ),
+                    h('button', {
+                      id: 'mobile-ai-desk-btn',
+                      class: 'mobile-server-menu-item mobile-server-menu-controlled-nodes',
+                      onClick: () => log('click-ai-desk', null)
+                    }, '🖥 AI Desk'),
                     unified.map(s => h('button', {
                       key: s.id,
                       'data-server-id': s.id,
@@ -489,6 +505,25 @@ describe('Chromium responsive layout and interaction verification', () => {
           expect(footerBox).not.toBeNull();
           expect(footerBox!.y + footerBox!.height).toBeLessThanOrEqual(vp.height);
 
+          // Top row layout: Home on left, Switch Cloud Server on right
+          const homeBox = await page.locator('#mobile-home-btn').boundingBox();
+          const changeBox = await page.locator('#mobile-change-btn').boundingBox();
+          const aiDeskBox = await page.locator('#mobile-ai-desk-btn').boundingBox();
+          expect(homeBox).not.toBeNull();
+          expect(changeBox).not.toBeNull();
+          expect(aiDeskBox).not.toBeNull();
+          // Home is to the left of Switch Cloud Server
+          expect(homeBox!.x).toBeLessThan(changeBox!.x);
+          // Both buttons sit on the same top row
+          expect(Math.abs(homeBox!.y - changeBox!.y)).toBeLessThanOrEqual(5);
+          // AI Desk is on dedicated second row below top row
+          expect(aiDeskBox!.y).toBeGreaterThanOrEqual(homeBox!.y + homeBox!.height - 2);
+
+          // Taps on Home, Switch Cloud Server, AI Desk
+          await page.locator('#mobile-home-btn').tap({ timeout: 2000 });
+          await page.locator('#mobile-change-btn').tap({ timeout: 2000 });
+          await page.locator('#mobile-ai-desk-btn').tap({ timeout: 2000 });
+
           // 4. Perform genuine vertical scrolling inside the container
           await page.locator('.mobile-server-menu-body').evaluate((el) => { el.scrollTop = 300; });
           const scrollPos = await page.locator('.mobile-server-menu-body').evaluate((el) => el.scrollTop);
@@ -518,6 +553,9 @@ describe('Chromium responsive layout and interaction verification', () => {
 
           // Verify production application log
           const logs = await page.evaluate(() => (window as any).__appLog);
+          expect(logs.some((l: any) => l.action === 'click-home')).toBe(true);
+          expect(logs.some((l: any) => l.action === 'click-change-server')).toBe(true);
+          expect(logs.some((l: any) => l.action === 'click-ai-desk')).toBe(true);
           expect(logs.some((l: any) => l.action === 'open-shared-entry')).toBe(true);
           expect(logs.some((l: any) => l.action === 'change-lang' && l.payload === '中文')).toBe(true);
           expect(logs.some((l: any) => l.action === 'open-owned-contextmenu')).toBe(true);

@@ -528,6 +528,36 @@ describe('tab sharing APIs', () => {
     })]));
   });
 
+  it('includes authoritative serverStatus and lastHeartbeatAt presence in share discovery', async () => {
+    const app = makeApp();
+    const { ownerId, recipientId, serverId } = await seedShareTarget();
+    await createOrUpdateShare(db, {
+      id: id('share'),
+      target: { kind: 'server', serverId },
+      targetUserId: recipientId,
+      role: 'viewer',
+      createdBy: ownerId,
+      now: 5_000,
+    });
+
+    // Initial state: server has status 'offline' and null heartbeat
+    let discover = await app.request('/api/shares', { headers: authHeaders(recipientId) });
+    expect(discover.status).toBe(200);
+    let body = await discover.json() as { shares: Array<{ serverId: string; serverStatus: string | null; lastHeartbeatAt: number | null }> };
+    expect(body.shares[0]?.serverStatus).toBe('offline');
+    expect(body.shares[0]?.lastHeartbeatAt).toBeNull();
+
+    // Server daemon reports active heartbeat
+    const heartbeatTimestamp = Date.now();
+    await db.execute('UPDATE servers SET status = $1, last_heartbeat_at = $2 WHERE id = $3', ['online', heartbeatTimestamp, serverId]);
+
+    discover = await app.request('/api/shares', { headers: authHeaders(recipientId) });
+    expect(discover.status).toBe(200);
+    body = await discover.json() as { shares: Array<{ serverId: string; serverStatus: string | null; lastHeartbeatAt: number | null }> };
+    expect(body.shares[0]?.serverStatus).toBe('online');
+    expect(body.shares[0]?.lastHeartbeatAt).toBe(heartbeatTimestamp);
+  });
+
   it('opens a shared sub-session with its parent main session for tree rendering', async () => {
     const app = makeApp();
     const { ownerId, recipientId, serverId, sessionName, subSessionId } = await seedShareTarget();
