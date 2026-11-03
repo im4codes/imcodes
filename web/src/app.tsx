@@ -6147,9 +6147,11 @@ export function App() {
       return;
     }
 
-    if (activeSplitPairRef.current && activeSplitPairRef.current.taskId !== taskId) {
-      minimizeSubSessionWindow(activeSplitPairRef.current.executorSubId);
-      minimizeSubSessionWindow(activeSplitPairRef.current.auditorSubId);
+    // Minimizing the first pane clears activeSplitPairRef: capture both ids before that callback.
+    const previousSplit = activeSplitPairRef.current;
+    if (previousSplit && previousSplit.taskId !== taskId) {
+      minimizeSubSessionWindow(previousSplit.executorSubId);
+      minimizeSubSessionWindow(previousSplit.auditorSubId);
     }
 
     const bounds = getDesktopMaximizeBounds() ?? reserveWorkspaceBottom(viewportWorkspaceBelowSessionTabs({
@@ -8518,7 +8520,7 @@ export function App() {
               remoteDesktopCanSetUp={!selectedShareTarget}
               active={windowVisible && (isMobile || focusedSubId === sub.id)}
               visible={windowVisible}
-              showTaskPairPanel={!activeSplitPairTaskId || activeSplitPairRef.current?.auditorSubId === sub.id}
+              taskPairPanelVisitKey={activeSplitPairRef.current?.executorSubId === sub.id ? activeSplitPairTaskId ?? undefined : undefined}
               onPendingQuestion={surfaceAskQuestionFromHistory}
               idleFlashToken={idleFlashTokens.get(sub.sessionName) ?? 0}
               onDiff={registerDiffApplyer}

@@ -716,7 +716,7 @@ vi.mock('../src/components/SubSessionBar.js', () => ({
   ),
 }));
 vi.mock('../src/components/SubSessionWindow.js', () => ({
-  SubSessionWindow: ({ sub, ws, active, visible, zIndex, maximized, onToggleMaximized, onFocus, onViewRepo, onShareSession, onSettings, sharedState }: any) => {
+  SubSessionWindow: ({ sub, ws, active, visible, zIndex, maximized, onToggleMaximized, onFocus, onViewRepo, onShareSession, onSettings, sharedState, taskPairPanelVisitKey }: any) => {
     const incomingViewer = !!sharedState
       && sharedState.outgoing !== true
       && sharedState.effectiveRole !== 'participant';
@@ -726,6 +726,7 @@ vi.mock('../src/components/SubSessionWindow.js', () => ({
       data-active={String(active)}
       data-visible={String(visible)}
       data-maximized={String(Boolean(maximized))}
+      data-task-pair-visit={taskPairPanelVisitKey ?? ''}
       data-shared-outgoing={String(sharedState?.outgoing === true)}
       data-share-role={sharedState?.effectiveRole ?? ''}
       style={{ zIndex }}
@@ -4863,6 +4864,36 @@ describe('App shell', () => {
       expect(secondA.getAttribute('data-visible')).toBe('true');
     });
   }, 20_000);
+
+  it('isolates split executor panel visits from auditor, third window, task switches and split exit', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    useSubSessionsState.subSessions = ['a', 'b', 'c'].map((suffix, index) => ({
+      id: `sub-${index + 1}`, sessionName: `deck_sub_alpha_${suffix}`, parentSession: 'deck_alpha_brain',
+      label: 'Same label', description: '', cwd: '/work/alpha', type: 'codex-sdk', runtimeType: 'transport', state: 'idle', serverId: 'srv-1',
+    }));
+    useSubSessionsState.visibleSubSessions = useSubSessionsState.subSessions;
+    const { App } = await importApp(); render(<App />);
+    await waitFor(() => expect(wsInstances.length).toBe(1));
+    await screen.findByText('session-tabs');
+    for (const id of ['sub-1', 'sub-2', 'sub-3']) fireEvent.click(screen.getByText(`subbar-open-${id}`));
+    await screen.findByTestId('sub-session-window-sub-3');
+    const visit = (id: string) => screen.getByTestId(`sub-session-window-${id}`).getAttribute('data-task-pair-visit');
+    const split = (taskId: string, action = 'open') => act(() => window.dispatchEvent(new CustomEvent('deck:pair-split', {
+      detail: { taskId, executor: 'deck_sub_alpha_a', auditor: 'deck_sub_alpha_b', action },
+    })));
+    for (const taskId of ['task-A', 'task-B', 'task-A']) {
+      split(taskId);
+      await waitFor(() => expect(visit('sub-1')).toBe(taskId));
+      expect(visit('sub-2')).toBe(''); expect(visit('sub-3')).toBe('');
+      act(() => window.dispatchEvent(new Event('resize')));
+      expect(visit('sub-1')).toBe(taskId);
+    }
+    split('task-A', 'close');
+    await waitFor(() => expect(visit('sub-1')).toBe(''));
+    expect(visit('sub-2')).toBe(''); expect(visit('sub-3')).toBe('');
+  });
 
   it('marks the most-recently opened sub-session window active, regardless of how many are open', async () => {
     // Regression: opening a 3rd (or Nth) window left it inactive (dashed accent,
