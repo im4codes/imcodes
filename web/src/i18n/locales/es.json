@@ -4762,6 +4762,8 @@
     "card_no_blocking": "No blocking findings.",
     "waiting_for_tasks": "Esperando: {{tasks}}",
     "decision": {
+      "history_failed": "No se pudo cargar el historial de decisiones.",
+      "retry": "Reintentar",
       "ask": "Pedir explicación a Brain",
       "ask_message": "Explica el bloqueo, las opciones y la recomendación como solicitud de decisión.",
       "ready": "Condiciones listas: revisar",

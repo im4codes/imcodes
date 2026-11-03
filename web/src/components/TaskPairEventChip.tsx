@@ -1,3 +1,4 @@
+import { TaskPairEventDecisions } from './TaskPairEventDecisions.js';
 import { taskPairDisplayTitle, taskPairResolveDisplaySessionLabel } from '@shared/task-pair-display.js';
 import { useTranslation } from 'react-i18next';
 import { useEffect, useRef, useState } from 'preact/hooks';
@@ -187,6 +188,7 @@ export function TaskPairEventChip({ eventId, payload, timestamp, sessions }: { e
     && findings.length === 0
     && (event.severityCounts ? blockingLevels.every((level) => (event.severityCounts?.[level] ?? 0) === 0) : true);
   const previewNoticeText = safeDetailText(noticeText).slice(0, 320);
+  const overviewNoticeText = writer === 'daemon' && (event.verb === 'DISPATCH' || event.verb === 'QUEUE') ? safeDetailText(auditDetails?.reason).slice(0, 320) : previewNoticeText;
   // One colour per status (styles.css `.task-pair-chip--<status>`).
   const statusClass = isStatus(event.toStatus) ? ` task-pair-chip--${event.toStatus}` : '';
   const statusBadgeClass = isStatus(event.toStatus) ? event.toStatus : 'unknown';
@@ -225,6 +227,7 @@ export function TaskPairEventChip({ eventId, payload, timestamp, sessions }: { e
     if (hoverCloseTimerRef.current) clearTimeout(hoverCloseTimerRef.current);
     hoverCloseTimerRef.current = setTimeout(() => {
       hoverCloseTimerRef.current = null;
+      if (document.getElementById(hoverPreviewId)?.contains(document.activeElement)) return;
       setHoverPreviewAnchor(null);
     }, HOVER_PREVIEW_CLOSE_DELAY_MS);
   };
@@ -282,7 +285,7 @@ export function TaskPairEventChip({ eventId, payload, timestamp, sessions }: { e
   const renderHoverPreview = () => {
     if (!hoverPreviewAnchor || typeof document === 'undefined' || expanded) return null;
     const margin = 10;
-    const width = Math.min(440, Math.max(180, window.innerWidth - margin * 2));
+    const width = Math.min(960, Math.max(180, window.innerWidth - margin * 2));
     const spaceAbove = hoverPreviewAnchor.top;
     const placeBelow = spaceAbove < 250 && window.innerHeight - hoverPreviewAnchor.bottom > spaceAbove;
     const maxHeight = Math.max(150, (placeBelow ? window.innerHeight - hoverPreviewAnchor.bottom : hoverPreviewAnchor.top) - margin * 2);
@@ -293,7 +296,11 @@ export function TaskPairEventChip({ eventId, payload, timestamp, sessions }: { e
     return createPortal(<div
       id={hoverPreviewId}
       class="task-pair-card-hover-preview"
-      role="tooltip"
+      role="dialog"
+      aria-label={title}
+      onFocusIn={() => { if (hoverCloseTimerRef.current) clearTimeout(hoverCloseTimerRef.current); hoverCloseTimerRef.current = null; }}
+      onFocusOut={(focus) => { if (!focus.currentTarget.contains(focus.relatedTarget as Node | null)) scheduleHoverPreviewClose(); }}
+      onKeyDown={(key) => { if (key.key === 'Escape') closeHoverPreview(); }}
       style={{ left: `${left}px`, width: `${width}px`, maxHeight: `${maxHeight}px`, ...position }}
       onPointerEnter={() => { if (hoverCloseTimerRef.current) clearTimeout(hoverCloseTimerRef.current); hoverCloseTimerRef.current = null; }}
       onPointerLeave={scheduleHoverPreviewClose}
@@ -309,6 +316,7 @@ export function TaskPairEventChip({ eventId, payload, timestamp, sessions }: { e
         {previewRole(event.auditor, event.auditorLabel, event.auditorModel, event.auditorThinking, 'auditor')}
         {previewNoticeText && <p>{previewNoticeText}{noticeText.length > 320 ? '…' : ''}</p>}
         {isCancelledEvent && <p>{t('taskPair.card_cancel_reason', { value: cancelReason })}</p>}
+        {isStatus(event.toStatus) && <TaskPairEventDecisions key={taskId} taskId={taskId} status={event.toStatus} />}
       </div>
     </div>, document.body);
   };
@@ -375,6 +383,15 @@ export function TaskPairEventChip({ eventId, payload, timestamp, sessions }: { e
           {brainNoticeText && <span class={`task-pair-card-brain-notice is-${brainNotice!.status}`} data-brain-notice={brainNotice!.status}>{brainNoticeText}</span>}
         </button>
       </header>
+      {!isMobile && <div class="task-pair-card-overview">
+        <span class="task-pair-card-event-meta">{verb}</span>
+        <div class="task-pair-card-overview-roles">
+          {roleLabel(event.executor, event.executorLabel, event.executorModel, event.executorThinking, 'executor')}
+          {roleLabel(event.auditor, event.auditorLabel, event.auditorModel, event.auditorThinking, 'auditor')}
+        </div>
+        {!expanded && overviewNoticeText && <p class="task-pair-card-overview-note">{overviewNoticeText}{noticeText.length > 320 ? '…' : ''}</p>}
+        {!expanded && isCancelledEvent && <p class="task-pair-card-overview-note">{t('taskPair.card_cancel_reason', { value: cancelReason })}</p>}
+      </div>}
       {expanded && <>
         <div class="task-pair-card-body">
           <span class="task-pair-chip-text">
@@ -385,8 +402,9 @@ export function TaskPairEventChip({ eventId, payload, timestamp, sessions }: { e
           {renderAuditDetails()}
           {noticeText && <pre class="task-pair-card-notice">{safeDetailText(noticeText)}</pre>}
           <span class="task-pair-card-event-meta"><span>{t('taskPair.card_event')}</span>{verb}</span>
-          {roleLabel(event.executor, event.executorLabel, event.executorModel, event.executorThinking, 'executor')}
-          {roleLabel(event.auditor, event.auditorLabel, event.auditorModel, event.auditorThinking, 'auditor')}
+          {isMobile && roleLabel(event.executor, event.executorLabel, event.executorModel, event.executorThinking, 'executor')}
+          {isMobile && roleLabel(event.auditor, event.auditorLabel, event.auditorModel, event.auditorThinking, 'auditor')}
+          {isStatus(event.toStatus) && <TaskPairEventDecisions key={taskId} taskId={taskId} status={event.toStatus} />}
           {!isMobile && typeof event.executor === 'string' && event.executor && event.executor !== 'none' && typeof event.auditor === 'string' && event.auditor && event.auditor !== 'none' && (() => {
             const taskIdStr = String(taskId);
             const isSplitOpen = activeSplitTaskId === taskIdStr;

@@ -4761,6 +4761,8 @@
     "card_no_blocking": "No blocking findings.",
     "waiting_for_tasks": "대기 중: {{tasks}}",
     "decision": {
+      "history_failed": "결정 기록을 불러오지 못했습니다.",
+      "retry": "다시 시도",
       "ask": "Brain에 설명 요청",
       "ask_message": "이 작업의 장애, 선택지 및 권장안을 결정 요청으로 기록하세요.",
       "ready": "조건 준비됨: 검토 요청",

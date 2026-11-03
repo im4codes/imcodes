@@ -8,7 +8,7 @@ import { requestTaskPairDecision } from '../task-pair-decisions.js';
 import { ExpandableTaskObjective } from './ExpandableTaskObjective.js';
 
 /** A reply is persisted feedback to Brain, never PASS, resume or a lifecycle transition. */
-export function TaskPairDecisionPanel(props: { taskId: string; pair: SupervisionConsolePairInfo }) {
+export function TaskPairDecisionPanel(props: { taskId: string; pair: SupervisionConsolePairInfo; readOnly?: boolean }) {
   const { taskId, pair } = props;
   // Remount all local state on a new task/question/ruling. A string comparison
   // alone cannot isolate late replies when navigation goes A → B → A.
@@ -18,7 +18,7 @@ export function TaskPairDecisionPanel(props: { taskId: string; pair: Supervision
   return <DecisionPanel key={context} {...props} context={context} />;
 }
 
-function DecisionPanel({ taskId, pair, context }: { taskId: string; pair: SupervisionConsolePairInfo; context: string }) {
+function DecisionPanel({ taskId, pair, context, readOnly }: { taskId: string; pair: SupervisionConsolePairInfo; context: string; readOnly?: boolean }) {
   const { t } = useTranslation();
   const [text, setText] = useState('');
   const [history, setHistory] = useState<TaskPairDecisionRecord[] | null>(null);
@@ -31,13 +31,13 @@ function DecisionPanel({ taskId, pair, context }: { taskId: string; pair: Superv
   const active = useRef(true);
   useEffect(() => () => { active.current = false; }, []);
   const question = pair.decisionRequest;
-  const latest = history?.[0] ?? pair.latestDecision;
+  const latest = (readOnly ? history?.find((entry) => entry.kind === TASK_PAIR_DECISION_KIND.DECISION) : history?.[0]) ?? pair.latestDecision;
   const resolved = !!question && latest?.kind === TASK_PAIR_DECISION_KIND.DECISION && (latest.requestId === question.id || latest.round === question.round && latest.at >= question.at);
   const waiting = !TASK_PAIR_TERMINAL_STATUSES.includes(pair.status) && !!(taskPairWaitKind(pair)
     || (question && !resolved) || pair.status === 'awaiting_brain_decision' || pair.flags?.some((flag) => flag === 'blocked' || flag === 'needs_input'));
   const reason = question?.question || question?.summary || pair.blockedNote || readPairScheduling(pair.scheduling)?.note;
   const decisionText = [
-    reason || t('taskPair.decision.missing'),
+    reason || (readOnly ? '' : t('taskPair.decision.missing')),
     question?.recommendation ? `${t('taskPair.decision.recommendation')}: ${question.recommendation}` : '',
     latest?.kind === TASK_PAIR_DECISION_KIND.DECISION ? `${t('taskPair.decision.ruling')}: ${latest.conclusion} — ${latest.summary}` : '',
   ].filter(Boolean).join('\n');
@@ -71,7 +71,7 @@ function DecisionPanel({ taskId, pair, context }: { taskId: string; pair: Superv
       {t('taskPair.decision.time')}: <time dateTime={new Date(latest.at).toISOString()}>{new Date(latest.at).toLocaleString()}</time>
     </small>}
     <ExpandableTaskObjective key={`${context}:${latest?.id ?? ''}`} text={decisionText} className="task-pair-decision-copy" scrollLabel={t('taskPair.decision.title')} />
-    {waiting && !resolved && <>
+    {!readOnly && waiting && !resolved && <>
       <div class="task-pair-decision-options">{question?.options?.map((option) => <button type="button" key={option.id}
         disabled={pending || !pair.decisionRevision} onClick={() => void submit(option.id)}>{option.label}</button>)}</div>
       {!question?.options?.length && <div class="task-pair-decision-options">
@@ -89,8 +89,8 @@ function DecisionPanel({ taskId, pair, context }: { taskId: string; pair: Superv
         {t(pending ? 'taskPair.decision.sending' : 'taskPair.decision.send')}</button>
       {!pair.decisionRevision && <small>{t('taskPair.decision.upgrade')}</small>}
     </>}
-    {(sent || latest?.kind === TASK_PAIR_DECISION_KIND.FEEDBACK) && <p role="status">{t('taskPair.decision.sent')}</p>}
-    {error && <p role="alert">{t('taskPair.decision.failed')}: {error}</p>}
+    {!readOnly && (sent || latest?.kind === TASK_PAIR_DECISION_KIND.FEEDBACK) && <p role="status">{t('taskPair.decision.sent')}</p>}
+    {error && <p role="alert">{t(readOnly ? 'taskPair.decision.history_failed' : 'taskPair.decision.failed')}: {error}</p>}
     <details onToggle={(event) => { if (event.currentTarget.open && history === null) void loadHistory(); }}>
       <summary>{t('taskPair.decision.history')}</summary>
       <ol class="task-pair-decision-records">{history?.map((entry, index) => <li key={entry.id} value={index + 1}><article><b>{t(`taskPair.decision.kind.${entry.kind}`)}</b>

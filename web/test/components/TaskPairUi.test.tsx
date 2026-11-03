@@ -187,7 +187,7 @@ describe('TaskPairEventChip', () => {
     window.removeEventListener('deck:navigate', listener);
   });
 
-  it('shows session identities and models in the expanded card', () => {
+  it('shows desktop identities and models without expanding and keeps them visible when expanded', () => {
     const { container } = render(<TaskPairEventChip eventId="e-models" sessions={[
       { name: 'deck_sub_exec', activeModel: 'provider/active-executor', effort: 'high' },
       { name: 'deck_sub_aud', requestedModel: 'provider/requested-auditor', effort: 'medium' },
@@ -196,7 +196,7 @@ describe('TaskPairEventChip', () => {
       executor: 'deck_sub_exec', executorLabel: 'Executor', auditor: 'deck_sub_aud', auditorLabel: 'Auditor', unusual: false,
     }} />);
     const card = container.querySelector('.task-pair-event-card')!;
-    expect(card.textContent).not.toContain('provider/active-executor');
+    expect(card.querySelector('.task-pair-card-overview')?.textContent).toContain('provider/active-executor');
     fireEvent.click(card.querySelector('.task-pair-card-toggle')!);
     expect(card.textContent).toContain('taskPair.card_model:{"value":"provider/active-executor"}');
     expect(card.textContent).toContain('taskPair.card_model:{"value":"provider/requested-auditor"}');
@@ -243,13 +243,13 @@ describe('TaskPairEventChip', () => {
     expect(card.querySelector('.task-pair-card-payload pre')?.textContent).toContain('2026-01-02T03:04:05.000Z');
   });
 
-  it('renders a task notice reason only after expanding the same card', () => {
+  it('shows a desktop notice preview immediately and the full reason after expanding', () => {
     const { container } = render(<TaskPairEventChip eventId="e-notice" payload={{
       taskId: 'T-notice', title: 'Needs input', writer: 'daemon', verb: 'NEEDS_INPUT', toStatus: 'rework',
       noticeText: 'Needs your decision: an executor is waiting. Why: verify the exact head.', unusual: false,
     }} />);
     const card = container.querySelector('.task-pair-event-card')!;
-    expect(card.textContent).not.toContain('verify the exact head');
+    expect(card.querySelector('.task-pair-card-overview')?.textContent).toContain('verify the exact head');
     fireEvent.click(card.querySelector('.task-pair-card-toggle')!);
     expect(card.querySelector('.task-pair-card-notice')?.textContent).toContain('verify the exact head');
   });

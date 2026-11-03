@@ -4761,6 +4761,8 @@
     "card_no_blocking": "No blocking findings.",
     "waiting_for_tasks": "待機中: {{tasks}}",
     "decision": {
+      "history_failed": "判断履歴を読み込めませんでした。",
+      "retry": "再試行",
       "ask": "Brain に詳細を依頼",
       "ask_message": "このタスクの障害、選択肢、推奨案を判断依頼として記録してください。",
       "ready": "条件整備済み：要確認",

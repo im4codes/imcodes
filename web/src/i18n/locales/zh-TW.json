@@ -4762,6 +4762,8 @@
     "card_no_blocking": "No blocking findings.",
     "waiting_for_tasks": "等待任務：{{tasks}}",
     "decision": {
+      "history_failed": "決策記錄載入失敗。",
+      "retry": "重試",
       "ask": "請 Brain 說明卡點",
       "ask_message": "請說明本任務的具體卡點、可選方案及建議，記錄為待決策問題。",
       "ready": "條件已具備，請核查",

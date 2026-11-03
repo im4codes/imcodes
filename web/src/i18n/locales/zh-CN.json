@@ -4774,6 +4774,8 @@
     "card_no_blocking": "No blocking findings.",
     "waiting_for_tasks": "等待任务：{{tasks}}",
     "decision": {
+      "history_failed": "决策记录加载失败。",
+      "retry": "重试",
       "ask": "请 Brain 说明卡点",
       "ask_message": "请说明本任务具体卡点、可选方案和建议，记录为待决策问题。",
       "ready": "条件已具备，请核查",

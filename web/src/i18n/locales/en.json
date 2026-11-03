@@ -4774,6 +4774,8 @@
     "card_no_blocking": "No blocking findings.",
     "waiting_for_tasks": "Waiting for: {{tasks}}",
     "decision": {
+      "history_failed": "Could not load decision history.",
+      "retry": "Retry",
       "ask": "Ask Brain to explain",
       "ask_message": "State this task’s blocker, options and recommendation as a decision request.",
       "ready": "Conditions ready: please review",

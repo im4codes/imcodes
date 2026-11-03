@@ -4761,6 +4761,8 @@
     "card_no_blocking": "No blocking findings.",
     "waiting_for_tasks": "Ожидание: {{tasks}}",
     "decision": {
+      "history_failed": "Не удалось загрузить историю решений.",
+      "retry": "Повторить",
       "ask": "Уточнить у Brain",
       "ask_message": "Опишите препятствие, варианты и рекомендацию как запрос решения по этой задаче.",
       "ready": "Условия готовы: проверить",
