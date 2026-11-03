@@ -41,7 +41,9 @@ if (process.env.FAKE_AGY_IDENTITY_FILE) fs.appendFileSync(process.env.FAKE_AGY_I
 const convId = resumeIdx >= 0 ? args[resumeIdx + 1] : 'conv-' + process.pid;
 const emit = (o) => process.stdout.write(JSON.stringify(o) + '\\n');
 const init=()=>emit({ event: 'init', conversation_id: convId, init: { cwd: process.cwd(), tools: [], permission_mode: 'always-proceed' } });
-if(process.env.FAKE_AGY_DELAY_INIT) setTimeout(init,200); else init();
+if(process.env.FAKE_AGY_INIT_GATE) {
+ const gate=setInterval(()=>{if(fs.existsSync(process.env.FAKE_AGY_INIT_GATE)){clearInterval(gate);init();}},5);
+} else init();
 let step = 0;
 let buf = '';
 process.stdin.on('data', (d) => {
@@ -59,6 +61,7 @@ process.stdin.on('data', (d) => {
       setTimeout(() => process.exit(1), 100);
       return;
     }
+    if (text.includes('HANG')) return;
     const scenario = text.replace(/^API_/, 'QUOTA_');
     if (text.includes('NATIVE_LOST')) {
       const fixture = require(process.env.FAKE_AGY_NATIVE_FIXTURE);
@@ -100,7 +103,6 @@ process.stdin.on('data', (d) => {
       if (scenario.includes('QUOTA_EMPTY_EXIT')) process.exit(0);
       continue;
     }
-    if (text.includes('HANG')) return;
     if (text.includes('FAIL')) {
       emit({ event: 'result', result: { conversation_id: convId, status: 'ERROR', response: '', error: 'boom unauthorized', num_turns: 0, usage: {} } });
       continue;
@@ -381,14 +383,19 @@ describe('AgySdkProvider (fake agy process)', () => {
     expect(inputs()).toEqual([]);
   });
 
-  it.each(['stop','end','rebind','disconnect'])('drops a delayed native init after %s',async action=>{
-    const sid=await provider.createSession({sessionKey:'delayed-init',cwd:dir,env:{FAKE_AGY_DELAY_INIT:'1'}});
+  it.each(['stop','end','rebind','disconnect'])('does not publish a pending native init after %s',async action=>{
+    // Hold every native ID until cancellation: HANG must not emit a
+    // conversation-bearing user_input before this deliberately pending init.
+    const gate=path.join(dir,'release-init');
+    const sid=await provider.createSession({sessionKey:'delayed-init',cwd:dir,env:{FAKE_AGY_INIT_GATE:gate}});
     await provider.send(sid,'HANG');await waitFor(()=>launches().length===1);
+    expect(infos).toEqual([]);
     if(action==='stop')await provider.cancelAndWait(sid);
     else if(action==='end')await provider.endSession(sid);
     else if(action==='rebind')await provider.createSession({sessionKey:sid,cwd:dir,fresh:true});
     else await provider.disconnect();
-    await new Promise(r=>setTimeout(r,250));
+    writeFileSync(gate,'release');
+    await new Promise(r=>setImmediate(r));
     expect(infos).toEqual([]);expect(completes).toEqual([]);
   });
 

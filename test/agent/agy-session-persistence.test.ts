@@ -9,6 +9,7 @@ import { AgySdkProvider } from '../../src/agent/providers/agy-sdk.js';
 import { persistAgyNativeSessionStart } from '../../src/agent/agy-session-persistence.js';
 import * as store from '../../src/store/session-store.js';
 import { setSessionDbFailAfterRowWritesForTests } from '../../src/store/session-store-db.js';
+import { currentDaemonProcessIdentity } from '../../src/daemon/instance-lock.js';
 import { persistedSessions } from '../helpers/session-store-db.js';
 
 // Persistence fixtures are not live sessions: use production-shaped records
@@ -99,6 +100,40 @@ describe('AG native start durable evidence (real SQLite and SDK child fixture)',
     expect(readFileSync(path.join(home,'launches'),'utf8')).toBe('');
     expect(readFileSync(path.join(home,'inputs'),'utf8')).toBe('');
     expect(persistedSessions(home)[main].agyNativeSessionState).toBe(AG.UNSTARTED);
+  });
+
+  it.each(['before','queued','sweep'])('never spawns when write authority is lost %s the strict commit',async stage=>{
+    store.upsertSession(record());await store.flushStore();
+    vi.stubEnv('VITEST','');vi.stubEnv('NODE_ENV','production');
+    const identity=currentDaemonProcessIdentity();
+    const metadataPath=path.join(home,'.imcodes','daemon.lock.json');
+    const metadata={version:1,...identity,acquiredAt:Date.now(),socketPath:path.join(home,'.imcodes','daemon.sock'),sessionIds:[],residualResources:[]};
+    writeFileSync(metadataPath,JSON.stringify(metadata));
+    store.configureSessionStoreWriteAuthority(identity,metadataPath);
+    const revoke=()=>writeFileSync(metadataPath,JSON.stringify({...metadata,pid:identity.pid+1,startToken:'foreign'}));
+    if(stage==='before')revoke();
+    if(stage==='sweep'){store.setSessionStoreSweepSliceMsForTests(0);setImmediate(revoke);}
+    const sid=await provider.createSession({sessionKey:'authority-failure',cwd:home,beforeNativeSessionStart:()=>start()});
+    const pending=provider.send(sid,'must stay unaccepted');
+    if(stage==='queued')revoke();
+    await expect(pending).rejects.toMatchObject({recoverable:false});
+    expect(readFileSync(path.join(home,'launches'),'utf8')).toBe('');
+    expect(readFileSync(path.join(home,'inputs'),'utf8')).toBe('');
+    expect(persistedSessions(home)[main].agyNativeSessionState).toBe(AG.UNSTARTED);
+  });
+
+  it('strict flush rejects an unloaded store instead of treating a skipped write as committed',async()=>{
+    vi.stubEnv('VITEST','');vi.stubEnv('NODE_ENV','production');store.resetSessionStoreAuthorityForTests();
+    await expect(store.flushStore({requireWrite:true})).rejects.toThrow('not loaded');
+    await expect(store.flushStore()).resolves.toBeUndefined();
+  });
+
+  it('strict flush rejects empty-store refusal without changing the old default behavior',async()=>{
+    store.upsertSession(record());await store.flushStore();store.removeSession(main);
+    await expect(store.flushStore({requireWrite:true})).rejects.toThrow();
+    expect(persistedSessions(home)[main]).toBeDefined();
+    await expect(store.flushStore()).resolves.toBeUndefined();
+    expect(persistedSessions(home)[main]).toBeDefined();
   });
 
   it('a committed start without an init cannot turn back into an unused record across reload',async()=>{

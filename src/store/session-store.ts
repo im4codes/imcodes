@@ -977,15 +977,21 @@ async function findChangedSessions(): Promise<Set<string>> {
  * an in-place mutation is never lost -- the sweep is what an explicit
  * flushStore() (shutdown) and the periodic full check use.
  */
-async function writeStoreToDisk(bestEffort: boolean, targetPath = dbPath(), forceSweep = false): Promise<void> {
+async function writeStoreToDisk(bestEffort: boolean, targetPath = dbPath(), forceSweep = false, requireWrite = false): Promise<void> {
   // Outside the best-effort catch on purpose: a test reaching the real store
   // must fail loudly, never be swallowed as a lost write.
-  if (!hasWriteAuthority(targetPath)) return;
+  if (!hasWriteAuthority(targetPath)) {
+    if (requireWrite) throw new Error('session store write authority unavailable');
+    return;
+  }
   const sweep = forceSweep || fullSweepRequested || Date.now() - lastFullSweepAt >= FULL_SWEEP_INTERVAL_MS;
   const drained = new Set<string>();
   try {
     const handle = writerHandle(targetPath);
     const swept = sweep ? await findChangedSessions() : new Set<string>();
+    // A strict native-start barrier must not mistake a queued/skipped write
+    // for a commit. The sweep can yield while the daemon loses its lock.
+    if (requireWrite && !hasWriteAuthority(targetPath)) throw new Error('session store write authority changed before commit');
 
     // From here to the commit nothing awaits: the rows reflect one instant, and a
     // mutation made while the sweep yielded is in `dirtyNames` and is included.
@@ -1045,7 +1051,7 @@ async function writeStoreToDisk(bestEffort: boolean, targetPath = dbPath(), forc
   } catch (error) {
     if (error instanceof EmptyStoreRefusal) {
       logger.error({ targetPath, sessions: committedPayloads.size }, 'Refusing to overwrite a non-empty session store with an empty snapshot');
-      return;
+      if (!requireWrite) return;
     }
     // Nothing was committed: keep the rows dirty so the next flush retries them.
     for (const name of drained) dirtyNames.add(name);
@@ -1331,10 +1337,10 @@ async function waitForSessionStoreSnapshot(): Promise<void> {
   while (backupInFlight) await backupInFlight;
 }
 
-function enqueueWrite(bestEffort: boolean, targetPath = dbPath(), forceSweep = false): Promise<void> {
+function enqueueWrite(bestEffort: boolean, targetPath = dbPath(), forceSweep = false, requireWrite = false): Promise<void> {
   const queued = writeQueue.then(
-    () => writeStoreToDisk(bestEffort, targetPath, forceSweep),
-    () => writeStoreToDisk(bestEffort, targetPath, forceSweep),
+    () => writeStoreToDisk(bestEffort, targetPath, forceSweep, requireWrite),
+    () => writeStoreToDisk(bestEffort, targetPath, forceSweep, requireWrite),
   );
   const tracked = queued.finally(() => {
     if (pendingWrite === tracked) pendingWrite = null;
@@ -1617,7 +1623,7 @@ export async function flushStore(options: { requireWrite?: boolean } = {}): Prom
     writeTimer = null;
     writeTimerPath = null;
   }
-  await enqueueWrite(false, targetPath, true);
+  await enqueueWrite(false, targetPath, true, options.requireWrite);
   await flushCompatExport(targetPath);
   // flushStore() is the explicit lifecycle barrier used by shutdown and test
   // teardown. Do not return while the snapshot started by the write is still
