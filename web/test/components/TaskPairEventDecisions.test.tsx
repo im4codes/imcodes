@@ -31,7 +31,8 @@ describe('event decision details are on demand and read only', () => {
     const send = vi.fn((frame) => receiveTaskPairDecision(frame.requestId, { ok: true, revision: 'r', decisions: [ruling, question] }));
     unbind = bindTaskPairDecisions(send);
     const { container } = render(<TaskPairEventChip eventId="phone" payload={payload} />);
-    expect(container.querySelector('.task-pair-card-overview')).toBeNull();
+    expect(container.querySelector('.task-pair-card-overview')?.textContent).toContain('Worker');
+    expect(container.querySelector('.task-pair-card-overview')?.textContent).toContain('taskPair.card_model');
     expect(send).not.toHaveBeenCalled();
     fireEvent.click(container.querySelector('.task-pair-card-toggle')!);
     await waitFor(() => expect(container.textContent).toContain('Use the test fixture'));

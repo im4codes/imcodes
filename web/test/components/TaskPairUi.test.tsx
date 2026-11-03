@@ -1544,6 +1544,53 @@ describe('TaskPairEventChip status colours', () => {
       for (const source of sourceKeys) expect(taskPair.cancel_source?.[source], `${locale}.cancel_source.${source}`).toBeTruthy();
     }
   });
+
+  it('renders compact overview with roles, models, notices, and cancel reasons across mobile and desktop without expanding', () => {
+    // 1. Cancelled event with cancelReason, roles, and models
+    const { container: cancelView } = render(<TaskPairEventChip eventId="e-mobile-cancel" payload={{
+      taskId: 'cancel-m', title: 'Cancelled boundary', writer: 'daemon',
+      verb: 'CANCEL', toStatus: 'cancelled',
+      executor: 'deck_sub_w1', executorLabel: 'Worker', executorModel: 'gpt-6.1-sol',
+      auditor: 'deck_sub_a1', auditorLabel: 'Auditor', auditorModel: 'MiniMax-M3',
+      cancelReason: 'Explicit cancel reason for boundary check',
+    }} />);
+    const cancelOverview = cancelView.querySelector('.task-pair-card-overview')!;
+    expect(cancelOverview).toBeTruthy();
+    expect(cancelOverview.textContent).toContain('Worker');
+    expect(cancelOverview.textContent).toContain('gpt-6.1-sol');
+    expect(cancelOverview.textContent).toContain('Auditor');
+    expect(cancelOverview.textContent).toContain('MiniMax-M3');
+    expect(cancelOverview.textContent).toContain('Explicit cancel reason for boundary check');
+    expect(cancelOverview.querySelector('.task-pair-card-overview-note')?.getAttribute('title')).toBe('Explicit cancel reason for boundary check');
+    cleanup();
+
+    // 2. Active working event with notice text and auditor='none'
+    const { container: noticeView } = render(<TaskPairEventChip eventId="e-notice-none" payload={{
+      taskId: 'notice-none', title: 'Notice with no auditor', writer: 'daemon',
+      verb: 'WORKING', toStatus: 'working',
+      executor: 'deck_sub_w2', executorLabel: 'SoloWorker', executorModel: 'claude-3-7-sonnet',
+      auditor: 'none',
+      noticeText: 'A concise notice for compact chip display',
+    }} />);
+    const noticeOverview = noticeView.querySelector('.task-pair-card-overview')!;
+    expect(noticeOverview).toBeTruthy();
+    expect(noticeOverview.textContent).toContain('SoloWorker');
+    expect(noticeOverview.textContent).toContain('taskPair.panel_no_audit');
+    expect(noticeOverview.textContent).toContain('A concise notice for compact chip display');
+    cleanup();
+
+    // 3. Role with unassigned auditor and long model title
+    const { container: unassignedView } = render(<TaskPairEventChip eventId="e-unassigned" payload={{
+      taskId: 'unassigned-aud', title: 'Unassigned check', writer: 'brain',
+      verb: 'DISPATCH', toStatus: 'queued',
+      executor: 'deck_sub_w3', executorModel: 'anthropic/claude-3-7-sonnet-20250219-thought',
+      auditor: undefined,
+    }} />);
+    const unassignedOverview = unassignedView.querySelector('.task-pair-card-overview')!;
+    expect(unassignedOverview).toBeTruthy();
+    expect(unassignedOverview.textContent).toContain('taskPair.card_unassigned');
+    expect(unassignedOverview.querySelector('.task-pair-card-role-model')?.getAttribute('title')).toBe('anthropic/claude-3-7-sonnet-20250219-thought');
+  });
 });
 
 describe('TaskPairSettingsSection', () => {

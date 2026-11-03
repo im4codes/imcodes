@@ -14997,8 +14997,8 @@ button.quick-agent-delegation-preset.active {
 .task-pair-event-card .task-pair-chip-held { color: #fde68a; border-color: rgba(251, 191, 36, 0.5); background: rgba(120, 53, 15, 0.24); }
 .task-pair-event-card .task-pair-chip-unusual { color: #fca5a5; border-color: rgba(248, 113, 113, 0.42); background: rgba(127, 29, 29, 0.2); opacity: 1; }
 @media (max-width: 720px) {
-  .task-pair-event-card { padding: 6px 8px; gap: 4px; }
-  .task-pair-card-toggle { align-items: center; gap: 4px 6px; }
+  .task-pair-event-card { padding: 4px 7px; gap: 2px; }
+  .task-pair-card-toggle { align-items: center; gap: 2px 6px; }
   .task-pair-event-card .task-pair-chip-task { order: 6; flex: 1 1 100%; min-width: 0; }
   .task-pair-event-card:not(.is-expanded) .task-pair-chip-task strong {
     display: -webkit-box;
@@ -15698,7 +15698,10 @@ button.quick-agent-delegation-preset.active {
   font-size: 11px;
   color: #a5f3fc;
   flex-basis: auto;
+  max-width: 140px;
   white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .task-pair-card-overview-note {
   min-width: 0;
@@ -15734,4 +15737,14 @@ button.quick-agent-delegation-preset.active {
     text-overflow: ellipsis;
   }
   .task-pair-event-card:not(.is-expanded) .task-pair-card-chevron { order: 5; flex: 0 0 auto; margin-left: auto; }
+}
+@media (max-width: 720px) {
+  .task-pair-card-overview { gap: 2px 6px; font-size: 10px; line-height: 1.25; }
+  .task-pair-card-overview-roles { display: contents; }
+  .task-pair-card-overview .task-pair-chip-session { font-size: 10px; padding: 1px 4px; min-height: 16px; max-width: 90px; }
+  .task-pair-card-overview .task-pair-card-role { gap: 3px; }
+  .task-pair-card-overview .task-pair-card-role-model { font-size: 10px; max-width: 110px; }
+  .task-pair-card-overview .task-pair-card-role-label { font-size: 9px; }
+  .task-pair-card-overview .task-pair-card-event-meta { font-size: 9px; }
+  .task-pair-card-overview-note { font-size: 10px; }
 }
