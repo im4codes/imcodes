@@ -5,6 +5,7 @@ import { readPairScheduling, taskPairWaitKind } from '@shared/task-pair-suspensi
 import { TASK_PAIR_DECISION_KIND, TASK_PAIR_DECISION_MSG, TASK_PAIR_DECISION_LIMITS, type TaskPairDecisionRecord } from '@shared/task-pair-decision.js';
 import type { SupervisionConsolePairInfo } from '@shared/supervision-task-console.js';
 import { requestTaskPairDecision } from '../task-pair-decisions.js';
+import { ExpandableTaskObjective } from './ExpandableTaskObjective.js';
 
 /** A reply is persisted feedback to Brain, never PASS, resume or a lifecycle transition. */
 export function TaskPairDecisionPanel({ taskId, pair }: { taskId: string; pair: SupervisionConsolePairInfo }) {
@@ -27,6 +28,11 @@ export function TaskPairDecisionPanel({ taskId, pair }: { taskId: string; pair: 
   const waiting = !TASK_PAIR_TERMINAL_STATUSES.includes(pair.status) && !!(taskPairWaitKind(pair)
     || (question && !resolved) || pair.status === 'awaiting_brain_decision' || pair.flags?.some((flag) => flag === 'blocked' || flag === 'needs_input'));
   const reason = question?.question || question?.summary || pair.blockedNote || readPairScheduling(pair.scheduling)?.note;
+  const decisionText = [
+    reason || t('taskPair.decision.missing'),
+    question?.recommendation ? `${t('taskPair.decision.recommendation')}: ${question.recommendation}` : '',
+    latest?.kind === TASK_PAIR_DECISION_KIND.DECISION ? `${t('taskPair.decision.ruling')}: ${latest.conclusion} — ${latest.summary}` : '',
+  ].filter(Boolean).join('\n');
   if (!waiting && !question && !latest) return null;
   const submit = async (optionId?: string, feedbackOverride?: string) => {
     const feedback = feedbackOverride ? [feedbackOverride, text].filter(Boolean).join('\n') : text;
@@ -55,8 +61,10 @@ export function TaskPairDecisionPanel({ taskId, pair }: { taskId: string; pair: 
   };
   return <section class="task-pair-decision" aria-label={t('taskPair.decision.title')}>
     <strong>{t(resolved ? 'taskPair.decision.resolved' : 'taskPair.decision.title')}</strong>
-    <p class="task-pair-decision-question">{reason || t('taskPair.decision.missing')}</p>
-    {question?.recommendation && <p>{t('taskPair.decision.recommendation')}: {question.recommendation}</p>}
+    {latest?.kind === TASK_PAIR_DECISION_KIND.DECISION && <small class="task-pair-decision-time">
+      {t('taskPair.decision.time')}: <time dateTime={new Date(latest.at).toISOString()}>{new Date(latest.at).toLocaleString()}</time>
+    </small>}
+    <ExpandableTaskObjective key={`${context}:${latest?.id ?? ''}`} text={decisionText} className="task-pair-decision-copy" />
     {waiting && !resolved && <>
       <div class="task-pair-decision-options">{question?.options?.map((option) => <button type="button" key={option.id}
         disabled={pending || !pair.decisionRevision} onClick={() => void submit(option.id)}>{option.label}</button>)}</div>
@@ -77,14 +85,13 @@ export function TaskPairDecisionPanel({ taskId, pair }: { taskId: string; pair: 
     </>}
     {(sent || latest?.kind === TASK_PAIR_DECISION_KIND.FEEDBACK) && <p role="status">{t('taskPair.decision.sent')}</p>}
     {error && <p role="alert">{t('taskPair.decision.failed')}: {error}</p>}
-    {latest?.kind === TASK_PAIR_DECISION_KIND.DECISION && <p>{t('taskPair.decision.ruling')}: {latest.conclusion} — {latest.summary}</p>}
     <details onToggle={(event) => { if (event.currentTarget.open && history === null) void loadHistory(); }}>
       <summary>{t('taskPair.decision.history')}</summary>
-      {history?.map((entry) => <article key={entry.id}><b>{t(`taskPair.decision.kind.${entry.kind}`)}</b>
-        <small> {entry.author} · {new Date(entry.at).toLocaleString()} · #{entry.round}</small>
+      <ol class="task-pair-decision-records">{history?.map((entry, index) => <li key={entry.id} value={index + 1}><article><b>{t(`taskPair.decision.kind.${entry.kind}`)}</b>
+        <small> {entry.author} · <time dateTime={new Date(entry.at).toISOString()}>{new Date(entry.at).toLocaleString()}</time> · {t('taskPair.round', { round: entry.round })}</small>
         <p>{entry.conclusion} — {entry.summary}</p>
         {entry.question && <p>{entry.question}</p>}
-      </article>)}
+      </article></li>)}</ol>
     </details>
   </section>;
 }

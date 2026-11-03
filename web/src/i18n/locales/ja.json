@@ -4779,6 +4779,7 @@
       "history": "判断履歴",
       "ruling": "Brain の判断",
       "resolved": "判断済み",
+      "time": "裁定日時",
       "upgrade": "送信前に daemon を更新または再接続してください。",
       "kind": {
         "request": "判断依頼",

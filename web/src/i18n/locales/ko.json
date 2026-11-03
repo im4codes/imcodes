@@ -4779,6 +4779,7 @@
       "history": "결정 기록",
       "ruling": "Brain 결정",
       "resolved": "결정 완료",
+      "time": "결정 시간",
       "upgrade": "피드백을 보내기 전에 daemon을 업그레이드하거나 다시 연결하세요.",
       "kind": {
         "request": "결정 요청",

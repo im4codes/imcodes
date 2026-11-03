@@ -4780,6 +4780,7 @@
       "history": "決策紀錄",
       "ruling": "Brain 裁決",
       "resolved": "已裁決",
+      "time": "裁決時間",
       "upgrade": "請升級或重新連線 daemon 後再提交回饋。",
       "kind": {
         "request": "待決策問題",
