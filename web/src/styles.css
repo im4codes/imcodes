@@ -15644,7 +15644,8 @@ button.quick-agent-delegation-preset.active {
   align-items: center;
   gap: 3px 10px;
   font-size: 11px;
-  line-height: 1.35;
+  line-height: 20px;
+  min-height: 20px;
   margin: 0;
   overflow: hidden;
 }
@@ -15655,6 +15656,7 @@ button.quick-agent-delegation-preset.active {
   text-transform: uppercase;
   color: #c4b5fd;
   flex: 0 0 auto;
+  line-height: 20px;
 }
 .task-pair-card-overview-roles {
   min-width: 0;
@@ -15664,6 +15666,7 @@ button.quick-agent-delegation-preset.active {
   gap: 3px 10px;
   overflow: hidden;
   flex: 0 1 auto;
+  min-height: 20px;
 }
 .task-pair-card-overview .task-pair-card-role {
   display: inline-flex;
@@ -15672,6 +15675,8 @@ button.quick-agent-delegation-preset.active {
   white-space: nowrap;
   flex: 0 1 auto;
   min-width: 0;
+  min-height: 20px;
+  line-height: 20px;
 }
 .task-pair-card-overview .task-pair-card-role-label {
   font-size: 10px;
@@ -15679,16 +15684,26 @@ button.quick-agent-delegation-preset.active {
   color: #64748b;
   text-transform: uppercase;
   flex: 0 0 auto;
+  line-height: 20px;
 }
 .task-pair-card-overview .task-pair-chip-session {
   font-size: 11px;
   padding: 1px 6px;
   min-height: 20px;
+  height: 20px;
+  box-sizing: border-box;
   max-width: 140px;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
   flex: 0 1 auto;
+}
+.task-pair-card-overview .task-pair-card-unassigned {
+  display: inline-flex;
+  align-items: center;
+  min-height: 20px;
+  line-height: 20px;
+  font-size: 11px;
 }
 .task-pair-card-overview .task-pair-card-role-model {
   font-size: 11px;
@@ -15699,6 +15714,7 @@ button.quick-agent-delegation-preset.active {
   overflow: hidden;
   text-overflow: ellipsis;
   flex: 0 1 auto;
+  line-height: 20px;
 }
 .task-pair-card-overview-note {
   min-width: 0;
@@ -15707,6 +15723,7 @@ button.quick-agent-delegation-preset.active {
   margin: 0;
   color: #cbd5e1;
   font-size: 11px;
+  line-height: 20px;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
