@@ -47,7 +47,7 @@ import {
   type TaskPairState,
 } from '../../../shared/task-pair.js';
 import { getTaskPairStore, type StoredTaskPair, type TaskPairLiveness } from './store.js';
-import { taskPairDecisionRevision, isTaskPairMissingExplanation } from './decision-context.js';
+import { taskPairDecisionRevision, isTaskPairMissingExplanation, taskPairMissingExplanationKey } from './decision-context.js';
 import { isPairsEngineProject, projectBrainSession, projectOfSession, resolveTaskPairMaxConcurrency } from './engine.js';
 import { runIntegrationDriftPass } from './integration-drift.js';
 import { sendTaskPairMessage, taskPairMessageIdPrefix } from './delivery.js';
@@ -160,15 +160,13 @@ export function checkTaskPairMissingExplanation(stored: StoredTaskPair, now = Da
 
   const pair = stored.state;
   const store = getTaskPairStore();
-  const flagsKey = pair.flags.filter((flag) => flag === 'blocked' || flag === 'needs_input').sort().join(',') || pair.status;
-  const rev = taskPairDecisionRevision(pair);
-  const lastEvent = store.listEvents(stored.project, pair.taskId, 1)[0]?.id ?? '';
-  const stableKey = `missing-explanation:${stored.project}:${pair.taskId}:${pair.deliveryRound ?? 1}:${pair.round}:${flagsKey}:${rev}${lastEvent ? ':' + lastEvent : ''}`;
+  const stableKey = taskPairMissingExplanationKey(stored);
 
   const side = pair.flagSides?.blocked || pair.flagSides?.needs_input;
   const target = (side === 'auditor' ? pair.auditor : pair.executor) || pair.executor || pair.brain;
   if (!target || target === TASK_PAIR_NO_AUDITOR) return false;
 
+  const flagsKey = pair.flags.filter((flag) => flag === 'blocked' || flag === 'needs_input').sort().join(',') || pair.status;
   const text = `Pair ${pair.taskId} (round ${pair.round}) is flagged ${flagsKey} without a blocker note or decision request. Please supply the specific problem, options, and recommendation via pair_decision_record or update the blocker note.`;
 
   const result = store.enqueueDecisionNotification({

@@ -78,7 +78,7 @@ import { brainUiLocale, isPairsEngineProject, isTaskPairsAvailable, projectBrain
 import { inspectToolCallForPairMainCheckoutWrite } from './main-checkout-write-guard.js';
 import { noteTaskPairFocus, sendTaskPairMessage, taskPairFocusOf, taskPairMessageIdPrefix, type TaskPairDeliveryResult } from './delivery.js';
 import { brainNoticeForCard } from './brain-notice.js';
-import { isTaskPairMissingExplanation } from './decision-context.js';
+import { isTaskPairMissingExplanation, taskPairMissingExplanationKey } from './decision-context.js';
 import type { ArmBrainDecisionFollowUp } from './brain-decision-followup.js';
 import { checkStaleBaseNotice } from './integration-drift.js';
 import { resolveTaskPairMaterial, verifyTaskPairRoundBase } from './material.js';
@@ -594,6 +594,13 @@ export class TaskPairService {
         const stored = store.getPair(pending.project, pending.taskId);
         if (!stored || !isTaskPairMissingExplanation(stored)) {
           // The blocker is no longer missing an explanation (e.g. note provided, resolved, unblocked).
+          // Retire this obsolete outbox row without delivering.
+          try { store.markDecisionNotificationDelivered(pending.id, now); } catch { return; }
+          continue;
+        }
+        const currentKey = taskPairMissingExplanationKey(stored);
+        if (pending.decisionId !== currentKey) {
+          // The pending notification belongs to a stale context/episode (e.g. earlier delivery round or different revision).
           // Retire this obsolete outbox row without delivering.
           try { store.markDecisionNotificationDelivered(pending.id, now); } catch { return; }
           continue;

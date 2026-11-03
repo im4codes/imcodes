@@ -10,7 +10,8 @@ import { createMemoryMcpToolHandlers } from '../../src/daemon/memory-mcp-tools.j
 import { TaskPairStore, getTaskPairStore, setTaskPairStoreForTests } from '../../src/daemon/task-pairs/store.js';
 import { setTaskPairDeliveryDepsForTests } from '../../src/daemon/task-pairs/delivery.js';
 import { taskPairService } from '../../src/daemon/task-pairs/service.js';
-import { taskPairDecisionReminderDue, checkTaskPairMissingExplanation } from '../../src/daemon/task-pairs/scheduler.js';
+import { taskPairDecisionReminderDue, checkTaskPairMissingExplanation, TaskPairAutomation } from '../../src/daemon/task-pairs/scheduler.js';
+import { buildPairConsoleRow } from '../../src/daemon/supervision-console-pair-projection.js';
 import type { McpRuntimeCaller } from '../../src/daemon/memory-mcp-caller.js';
 import type { TaskPairState } from '../../shared/task-pair.js';
 import type { SessionRecord } from '../../src/store/session-store.js';
@@ -384,6 +385,190 @@ describe('pair decision MCP', () => {
       store.close();
     } finally {
       rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('F3-R3: a liveness-only heartbeat event must not create duplicate explanation episode, while genuine new episode triggers notification', async () => {
+    const store = getTaskPairStore();
+    const sent: string[] = [];
+    setTaskPairDeliveryDepsForTests({ send: async (_target, text) => { sent.push(text); } });
+
+    const pairState: TaskPairState = {
+      ...state,
+      taskId: 'f3-liveness',
+      status: 'working',
+      round: 1,
+      deliveryRound: 1,
+      flags: ['blocked'],
+      flagSides: { blocked: 'executor' },
+      createdAt: 100,
+      updatedAt: 100,
+    } as unknown as TaskPairState;
+    store.savePair('p', pairState);
+
+    expect(checkTaskPairMissingExplanation(store.getPair('p', 'f3-liveness')!, 100)).toBe(true);
+    await taskPairService.retryDecisionNotifications(100);
+    expect(sent).toHaveLength(1);
+
+    // Record routine liveness-only NUDGE heartbeat event
+    store.recordEvent({
+      id: 'heartbeat:nudge:p:f3-liveness:200:idle',
+      project: 'p',
+      taskId: 'f3-liveness',
+      writer: 'daemon',
+      role: 'daemon',
+      verb: 'NUDGE',
+      attrs: { reason: 'idle' },
+      effect: 'sent',
+      unusual: false,
+      source: 'heartbeat',
+      fromStatus: 'working',
+      toStatus: 'working',
+      at: 200,
+    });
+
+    // Check on subsequent tick must not re-enqueue or duplicate
+    const insertedAgain = checkTaskPairMissingExplanation(store.getPair('p', 'f3-liveness')!, 201);
+    await taskPairService.retryDecisionNotifications(201);
+    expect(insertedAgain).toBe(false);
+    expect(sent).toHaveLength(1);
+
+    // A genuine new episode transition (e.g. participant BLOCKED marker event) triggers a new notification
+    store.recordEvent({
+      id: 'marker:blocked:p:f3-liveness:300',
+      project: 'p',
+      taskId: 'f3-liveness',
+      writer: 'exec',
+      role: 'executor',
+      verb: 'BLOCKED',
+      attrs: {},
+      effect: 'blocked',
+      unusual: false,
+      source: 'marker',
+      fromStatus: 'working',
+      toStatus: 'working',
+      at: 300,
+    });
+    const genuineNewEpisode = checkTaskPairMissingExplanation(store.getPair('p', 'f3-liveness')!, 301);
+    await taskPairService.retryDecisionNotifications(301);
+    expect(genuineNewEpisode).toBe(true);
+    expect(sent).toHaveLength(2);
+  });
+
+  it('F3-R3: a failed delivery-1 row must not be sent when delivery 2 is the current unknown context', async () => {
+    const store = getTaskPairStore();
+    let fail = true;
+    const sent: string[] = [];
+    setTaskPairDeliveryDepsForTests({
+      send: async (_target, text) => {
+        sent.push(text);
+        if (fail) throw new Error('transport failure');
+      },
+    });
+
+    const pairState: TaskPairState = {
+      ...state,
+      taskId: 'f3-cross-delivery',
+      status: 'working',
+      round: 1,
+      deliveryRound: 1,
+      flags: ['blocked'],
+      flagSides: { blocked: 'executor' },
+      createdAt: 100,
+      updatedAt: 100,
+    } as unknown as TaskPairState;
+    store.savePair('p', pairState);
+
+    expect(checkTaskPairMissingExplanation(store.getPair('p', 'f3-cross-delivery')!, 100)).toBe(true);
+    await taskPairService.retryDecisionNotifications(100);
+    expect(store.listPendingDecisionNotifications().filter((n) => n.taskId === 'f3-cross-delivery')).toHaveLength(1);
+
+    // Advances to delivery 2
+    store.savePair('p', { ...pairState, deliveryRound: 2, updatedAt: 200 });
+    expect(checkTaskPairMissingExplanation(store.getPair('p', 'f3-cross-delivery')!, 201)).toBe(true);
+    await taskPairService.retryDecisionNotifications(201);
+
+    // Fail cleared, retry at 300: stale delivery 1 must be retired without sending, only delivery 2 sent
+    sent.length = 0;
+    fail = false;
+    await taskPairService.retryDecisionNotifications(300);
+    expect(sent).toHaveLength(1);
+    expect(store.listPendingDecisionNotifications().filter((n) => n.taskId === 'f3-cross-delivery')).toHaveLength(0);
+  });
+
+  it('F3-R3: bounded manual tick drives admission, outbox, delivery, dedup over heartbeats, and note retirement into console projection', async () => {
+    const prevEngine = process.env.IMCODES_SUPERVISION_ENGINE;
+    process.env.IMCODES_SUPERVISION_ENGINE = 'pairs';
+    try {
+      const store = getTaskPairStore();
+      const sent: { target: string; text: string; id: string }[] = [];
+      setTaskPairDeliveryDepsForTests({
+        send: async (target, text, id) => {
+          sent.push({ target, text, id });
+        },
+      });
+
+      let clock = 1000;
+      const automation = new TaskPairAutomation({
+        now: () => clock,
+        isBusy: () => false,
+        importLegacy: () => undefined,
+        mainCheckoutRoots: () => [{ project: 'p', root: '/tmp/p' }],
+        brainMainCheckoutActive: () => false,
+      });
+      taskPairService.setScheduler(automation);
+
+      const pairState: TaskPairState = {
+        ...state,
+        taskId: 'f3-tick-projection',
+        status: 'working',
+        round: 1,
+        deliveryRound: 1,
+        flags: ['blocked'],
+        flagSides: { blocked: 'executor' },
+        createdAt: 1000,
+        updatedAt: 1000,
+      } as unknown as TaskPairState;
+      store.savePair('p', pairState);
+
+      const explanationNotices = () => sent.filter((s) => s.id.includes('f3-tick-projection') && s.id.includes('missing-explanation-request'));
+
+      // 1. Initial manual tick drives admission, outbox, and delivery
+      await automation.tick();
+      await taskPairService.waitForIdle();
+      expect(explanationNotices()).toHaveLength(1);
+
+      // 2. Subsequent manual tick with heartbeat liveness events does not duplicate
+      clock += 6 * 60_000;
+      await automation.tick();
+      await taskPairService.waitForIdle();
+      expect(explanationNotices()).toHaveLength(1);
+
+      // 3. Blocker note arrives
+      clock += 1000;
+      const updatedState: TaskPairState = {
+        ...pairState,
+        blockedNote: 'Root cause identified: missing auth header',
+        updatedAt: clock,
+      };
+      store.savePair('p', updatedState);
+
+      // Next tick retires outbox row without re-sending
+      clock += 6 * 60_000;
+      await automation.tick();
+      await taskPairService.waitForIdle();
+      expect(explanationNotices()).toHaveLength(1);
+      expect(store.listPendingDecisionNotifications().filter((n) => n.taskId === 'f3-tick-projection')).toHaveLength(0);
+
+      // 4. Verify console row projection contract reflects updated blockerNote and context
+      const stored = store.getPair('p', 'f3-tick-projection')!;
+      const row = buildPairConsoleRow(stored, { inlineBrief: false });
+      expect(row.task.pair.blockedNote).toBe('Root cause identified: missing auth header');
+      expect(row.task.pair.decisionRevision).toBeDefined();
+      expect(row.task.blocker).toBe('blocked');
+    } finally {
+      if (prevEngine === undefined) delete process.env.IMCODES_SUPERVISION_ENGINE;
+      else process.env.IMCODES_SUPERVISION_ENGINE = prevEngine;
     }
   });
 });

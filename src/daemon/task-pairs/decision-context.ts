@@ -7,9 +7,10 @@ import { getTaskPairStore, type StoredTaskPair } from './store.js';
 /** Changes when the question/wait changes, not on liveness heartbeats. */
 export function taskPairDecisionRevision(pair: TaskPairState): string {
   const wait = readPairScheduling(pair.scheduling);
+  const flagsKey = pair.flags.filter((flag) => flag === 'blocked' || flag === 'needs_input').sort().join(',') || pair.status;
   return createHash('sha256').update(JSON.stringify([
     pair.taskId, pair.deliveryRound ?? 1, pair.round, pair.status, pair.blockedNote ?? '',
-    wait?.manual, wait?.note, wait?.dependsOn,
+    flagsKey, wait?.manual, wait?.note, wait?.dependsOn,
   ])).digest('hex').slice(0, 24);
 }
 
@@ -41,5 +42,25 @@ export function isTaskPairMissingExplanation(stored: StoredTaskPair): boolean {
   if (!target || target === TASK_PAIR_NO_AUDITOR) return false;
 
   return true;
+}
+
+/**
+ * Canonical context key for a missing-explanation episode.
+ * Derived from semantic state (project, task, delivery round, round, flags, revision, latest semantic transition event);
+ * routine heartbeats/nudge/remind/checklist ticks are excluded so liveness sweeps never mutate the key.
+ */
+export function taskPairMissingExplanationKey(stored: StoredTaskPair): string {
+  const pair = stored.state;
+  const flagsKey = pair.flags.filter((flag) => flag === 'blocked' || flag === 'needs_input').sort().join(',') || pair.status;
+  const rev = taskPairDecisionRevision(pair);
+  let semanticEvent = '';
+  try {
+    const store = getTaskPairStore();
+    const events = store.listEvents(stored.project, pair.taskId, 50);
+    semanticEvent = events.find((e) => e.source !== 'heartbeat' && e.verb !== 'NUDGE' && e.verb !== 'REMIND' && e.verb !== 'CHECKLIST_TICK')?.id ?? '';
+  } catch {
+    // ignore
+  }
+  return `missing-explanation:${stored.project}:${pair.taskId}:${pair.deliveryRound ?? 1}:${pair.round}:${flagsKey}:${rev}${semanticEvent ? ':' + semanticEvent : ''}`;
 }
 

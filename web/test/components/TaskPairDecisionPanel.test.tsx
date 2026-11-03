@@ -530,5 +530,61 @@ describe('TaskPairDecisionPanel', () => {
       expect(screen.getByText('taskPair.decision.resolved')).toBeTruthy();
       expect(screen.getByTestId('expandable-task-objective-text').textContent).toContain('Go ahead with B');
     });
+
+    it('F1-R3: an old resolved question must not suppress a new blocker title or free feedback, and old option reply remains rejected', async () => {
+      const questionA: any = {
+        id: 'q-old', project: 'p', taskId: 'task', round: 1, deliveryRound: 1,
+        kind: 'request', conclusion: 'Old approval', summary: 'Old source?', question: 'Old source?',
+        options: [{ id: 'opt-a', label: 'Option A' }], author: 'executor', at: 10,
+      };
+      const rulingA: any = {
+        ...questionA, id: 'ruling-old', kind: 'decision', requestId: questionA.id, author: 'brain',
+        conclusion: 'Old source approved', at: 20,
+      };
+      const currentWithNewBlocker: SupervisionConsolePairInfo = {
+        status: 'working',
+        round: 1,
+        deliveryRound: 1,
+        flags: ['blocked'],
+        flagSides: { blocked: 'executor' },
+        blocking: ['P0'],
+        blockedNote: 'NEW blocker: current credentials are unavailable',
+        decisionRevision: 'rev-current',
+        decisionRequest: questionA,
+        latestDecision: rulingA,
+        brain: 'brain',
+      };
+
+      const frames: any[] = [];
+      unbind = bindTaskPairDecisions((frame) => {
+        frames.push(frame);
+        receiveTaskPairDecision(frame.requestId, { ok: true, decisions: [] });
+      });
+
+      render(<TaskPairDecisionPanel taskId="task" pair={currentWithNewBlocker} />);
+
+      // Blocker note is visible
+      expect(screen.getByTestId('expandable-task-objective-text').textContent).toContain('NEW blocker: current credentials are unavailable');
+      // Title reflects current blocker category, NOT resolved
+      expect(screen.queryByText('taskPair.decision.title_blocked')).not.toBeNull();
+      expect(screen.queryByText('taskPair.decision.resolved')).toBeNull();
+      // Free feedback textarea is accessible
+      const textarea = screen.queryByRole('textbox');
+      expect(textarea).not.toBeNull();
+      // Old question options are NOT shown
+      expect(screen.queryByRole('button', { name: 'Option A' })).toBeNull();
+
+      // Submitting free feedback passes questionId: null
+      fireEvent.input(textarea!, { target: { value: 'Credentials are now available' } });
+      fireEvent.click(screen.getByRole('button', { name: 'taskPair.decision.send' }));
+
+      await waitFor(() => expect(frames).toHaveLength(1));
+      expect(frames[0]).toMatchObject({
+        type: 'supervision.task_console.decision_feedback',
+        taskId: 'task',
+        questionId: null,
+        feedback: 'Credentials are now available',
+      });
+    });
   });
 });

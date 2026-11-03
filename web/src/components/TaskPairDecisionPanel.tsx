@@ -83,18 +83,23 @@ function DecisionPanel({ taskId, pair, context, readOnly }: { taskId: string; pa
   const question = pair.decisionRequest;
   const latest = (readOnly ? history?.find((entry) => entry.kind === TASK_PAIR_DECISION_KIND.DECISION) : history?.[0]) ?? pair.latestDecision;
   const resolved = isDecisionResolvingQuestion(latest, question);
-  const waiting = !TASK_PAIR_TERMINAL_STATUSES.includes(pair.status) && !!(
-    taskPairWaitKind(pair)
-    || (question && !resolved)
+  const hasActiveQuestion = !!(question && !resolved);
+  const hasNewBlocker = !!(
+    pair.blockedNote
+    || taskPairWaitKind(pair)
+    || pair.flags?.some((flag) => flag === 'waiting_for_capacity' || flag === 'needs_auditor')
     || pair.status === 'awaiting_brain_decision'
     || pair.status === 'passed'
-    || !!pair.blockedNote
-    || pair.flags?.some((flag) => flag === 'blocked' || flag === 'needs_input' || flag === 'waiting_for_capacity' || flag === 'needs_auditor')
+  );
+  const waiting = !TASK_PAIR_TERMINAL_STATUSES.includes(pair.status) && (
+    hasActiveQuestion
+    || hasNewBlocker
+    || (!resolved && !!pair.flags?.some((flag) => flag === 'blocked' || flag === 'needs_input'))
   );
 
   const category = resolveDecisionCategory(pair, question, resolved);
 
-  const titleKey = resolved
+  const titleKey = (resolved && !hasNewBlocker)
     ? 'taskPair.decision.resolved'
     : category === 'request'
     ? 'taskPair.decision.title_request'
@@ -108,6 +113,8 @@ function DecisionPanel({ taskId, pair, context, readOnly }: { taskId: string; pa
     ? 'taskPair.decision.title_capacity'
     : category === 'completed_awaiting_brain'
     ? 'taskPair.decision.title_completed'
+    : (!waiting && (resolved || latest?.kind === TASK_PAIR_DECISION_KIND.DECISION))
+    ? 'taskPair.decision.resolved'
     : 'taskPair.decision.title';
 
   let reason = '';
@@ -176,7 +183,7 @@ function DecisionPanel({ taskId, pair, context, readOnly }: { taskId: string; pa
   const decisionText = [
     reason,
     responsible,
-    question?.recommendation ? `${t('taskPair.decision.recommendation')}: ${question.recommendation}` : '',
+    hasActiveQuestion && question?.recommendation ? `${t('taskPair.decision.recommendation')}: ${question.recommendation}` : '',
     latest?.kind === TASK_PAIR_DECISION_KIND.DECISION && (resolved || (!question && (latest.deliveryRound ?? 1) === (pair.deliveryRound ?? 1) && latest.round === pair.round))
       ? `${t('taskPair.decision.ruling')}: ${latest.conclusion} — ${latest.summary}`
       : '',
@@ -198,7 +205,7 @@ function DecisionPanel({ taskId, pair, context, readOnly }: { taskId: string; pa
     try {
       const result = await requestTaskPairDecision({ type: TASK_PAIR_DECISION_MSG.FEEDBACK,
         taskId, round: Math.max(1, pair.round), revision: pair.decisionRevision,
-        questionId: question?.id ?? null, ...(optionId ? { optionId } : {}), feedback }, retryId.current);
+        questionId: hasActiveQuestion ? (question?.id ?? null) : null, ...(optionId ? { optionId } : {}), feedback }, retryId.current);
       if (!active.current) return;
       setHistory(result.decisions); setSent(true); setText(''); retryId.current = null;
     } catch (cause) { if (active.current) setError(String(cause)); }
@@ -219,8 +226,8 @@ function DecisionPanel({ taskId, pair, context, readOnly }: { taskId: string; pa
       {t('taskPair.decision.time')}: <time dateTime={new Date(latest.at).toISOString()}>{new Date(latest.at).toLocaleString()}</time>
     </small>}
     <ExpandableTaskObjective key={`${context}:${latest?.id ?? ''}`} text={decisionText} className="task-pair-decision-copy" scrollLabel={t('taskPair.decision.title')} />
-    {!readOnly && waiting && !resolved && <>
-      {question?.options && question.options.length > 0 && (
+    {!readOnly && waiting && <>
+      {hasActiveQuestion && question?.options && question.options.length > 0 && (
         <div class="task-pair-decision-options">
           {question.options.map((option) => (
             <button
@@ -234,7 +241,7 @@ function DecisionPanel({ taskId, pair, context, readOnly }: { taskId: string; pa
           ))}
         </div>
       )}
-      {!question?.options?.length && showFallbackOptions && (
+      {(!hasActiveQuestion || !question?.options?.length) && showFallbackOptions && (
         <div class="task-pair-decision-options">
           {showAskButton && (
             <button

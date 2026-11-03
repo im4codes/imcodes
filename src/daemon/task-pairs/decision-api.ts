@@ -19,21 +19,28 @@ export function taskPairDecisionApi(scope: SupervisionTaskConsoleScope, input: R
     if (!retry) {
       if (TASK_PAIR_TERMINAL_STATUSES.includes(pair.status) || input.round !== Math.max(1, pair.round)
         || input.revision !== taskPairDecisionRevision(pair)) throw new Error('The task question changed; refresh before replying');
-      const question = store.latestDecisionRequest(scope.projectName, taskId, Math.max(1, pair.round), pair.deliveryRound ?? 1);
-      if (input.questionId !== (question?.id ?? null)) throw new Error('The decision question changed; refresh before replying');
-      if (question && store.isDecisionResolved(question)) throw new Error('This question is already resolved');
+      const rawQuestion = store.latestDecisionRequest(scope.projectName, taskId, Math.max(1, pair.round), pair.deliveryRound ?? 1);
+      const isResolved = rawQuestion ? store.isDecisionResolved(rawQuestion) : false;
+      if (rawQuestion && input.questionId === rawQuestion.id) {
+        if (isResolved) throw new Error('This question is already resolved');
+      } else if (input.questionId !== null && input.questionId !== undefined) {
+        throw new Error('The decision question changed; refresh before replying');
+      } else if (rawQuestion && !isResolved) {
+        throw new Error('The decision question changed; refresh before replying');
+      }
+      const activeQuestion = (rawQuestion && !isResolved) ? rawQuestion : undefined;
       const feedback = typeof input.feedback === 'string' ? input.feedback.trim() : '';
-      const choice = typeof input.optionId === 'string' ? question?.options?.find((option) => option.id === input.optionId) : undefined;
+      const choice = typeof input.optionId === 'string' ? activeQuestion?.options?.find((option) => option.id === input.optionId) : undefined;
       if (input.optionId && !choice) throw new Error('Unknown choice');
       if ((!feedback && !choice) || feedback.length > TASK_PAIR_DECISION_LIMITS.SUMMARY) throw new Error('Feedback is empty or too long');
-      const reason = question?.question || question?.summary || pair.blockedNote || readPairScheduling(pair.scheduling)?.note || 'Please clarify the blocking condition and available options.';
+      const reason = activeQuestion?.question || activeQuestion?.summary || pair.blockedNote || readPairScheduling(pair.scheduling)?.note || 'Please clarify the blocking condition and available options.';
       taskPairService.recordDecision({
         project: scope.projectName, taskId, round: Math.max(1, pair.round), kind: TASK_PAIR_DECISION_KIND.FEEDBACK,
         conclusion: choice?.label || 'Human feedback', summary: feedback || choice!.label,
-        question: reason.slice(0, TASK_PAIR_DECISION_LIMITS.QUESTION), ...(question ? { requestId: question.id } : {}),
+        question: reason.slice(0, TASK_PAIR_DECISION_LIMITS.QUESTION), ...(activeQuestion ? { requestId: activeQuestion.id } : {}),
         ...(choice ? { selectedOptionId: choice.id } : {}),
         author: 'human', idempotencyKey: `human:${input.requestId}`,
-        at: Math.max(Date.now(), (question?.at ?? 0) + 1),
+        at: Math.max(Date.now(), (rawQuestion?.at ?? 0) + 1),
       });
     }
   }
