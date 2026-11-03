@@ -7321,7 +7321,7 @@ async function buildTimelineHistoryOnMain(params: TimelineHistoryRequestParams):
       return timelineHistoryErrorResult(err.source, err.reason, isRecoverable ? { recoverable: true } : undefined);
     }
     if (err instanceof TimelineProjectionBusyError) {
-      return timelineHistoryErrorResult('main_sqlite', TIMELINE_HISTORY_ERROR_REASONS.PROJECTION_BUSY, { recoverable: true });
+      return timelineHistoryErrorResult(TIMELINE_RESPONSE_SOURCES.MAIN_SQLITE, TIMELINE_HISTORY_ERROR_REASONS.PROJECTION_BUSY, { recoverable: true });
     }
     throw err;
   }
@@ -7346,7 +7346,7 @@ async function buildTimelineHistoryOnMain(params: TimelineHistoryRequestParams):
         return timelineHistoryErrorResult(err.source, err.reason, isRecoverable ? { recoverable: true } : undefined);
       }
       if (err instanceof TimelineProjectionBusyError) {
-        return timelineHistoryErrorResult('main_sqlite', TIMELINE_HISTORY_ERROR_REASONS.PROJECTION_BUSY, { recoverable: true });
+        return timelineHistoryErrorResult(TIMELINE_RESPONSE_SOURCES.MAIN_SQLITE, TIMELINE_HISTORY_ERROR_REASONS.PROJECTION_BUSY, { recoverable: true });
       }
       throw err;
     }

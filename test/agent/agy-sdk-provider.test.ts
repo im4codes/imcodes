@@ -383,6 +383,7 @@ describe('AgySdkProvider (fake agy process)', () => {
     const conversation = '11111111-1111-4111-8111-111111111111';
     let sid = await provider.createSession({sessionKey:key,cwd:dir,resumeId:conversation});
     await provider.send(sid,'NATIVE_LOST first');
+    await waitFor(() => completes.length + errors.length === 1);
     await provider.send(sid,'NATIVE_LOST second');
     await waitFor(() => completes.length+errors.length===2);
     expect(errors).toHaveLength(0);
@@ -427,8 +428,15 @@ describe('AgySdkProvider (fake agy process)', () => {
     await provider.connect({ binaryPath:path.join(dir,'agy'), env:{ HOME:dir, FAKE_AGY_ARGS_FILE:argsFile,
       FAKE_AGY_NATIVE_FIXTURE:path.resolve('test/fixtures/agy-native-history/fixture.cjs') } });
     const sid = await provider.createSession({ sessionKey:'api-native', cwd:dir, resumeId:'11111111-1111-4111-8111-111111111111' });
+    // These cases require a stable native snapshot. Preparing the next fake
+    // SQLite turn concurrently may correctly make the fail-closed reader
+    // decline recovery; queued-turn binding is covered by the history suite.
     await provider.send(sid, 'NATIVE_LOST_API first');
+    await waitFor(() => completes.length + errors.length === 1);
+    expect(errors).toHaveLength(0);
     await provider.send(sid, 'NATIVE_LOST_API second');
+    await waitFor(() => completes.length + errors.length === 2);
+    expect(errors).toHaveLength(0);
     await provider.send(sid, 'NATIVE_LOST_API_REAL_ERROR');
     await waitFor(() => completes.length + errors.length === 3);
     expect(completes.map(([,m]) => m.content)).toEqual(['NATIVE_LOST_API first', 'NATIVE_LOST_API second']);
